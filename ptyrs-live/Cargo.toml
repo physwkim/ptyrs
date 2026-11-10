@@ -4,3 +4,13 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+# Local epics-rs checkout, absolute like the cuda-rust paths in the workspace manifest.
+epics-pva-rs = { path = "/home/stevek/work/epics-rs/crates/epics-pva-rs" }
+cuda-core = { workspace = true }
+cuda-bindings = { workspace = true }
+# Unsafe (fast) block codec, still bounds-checked on decode.
+lz4_flex = { version = "0.11", default-features = false, features = ["std", "checked-decode"] }
+bytes = "1"
+crossbeam-channel = "0.5"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+libc = "0.2"
