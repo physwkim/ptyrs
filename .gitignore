@@ -4,3 +4,7 @@
 *.ltoir
 *.cubin
 *.fatbin
+# cargo oxide writes per-binary codegen intermediates to the workspace root.
+/*.ll
+/*.options
+/*.target
