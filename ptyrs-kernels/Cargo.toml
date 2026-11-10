@@ -1,0 +1,11 @@
+[package]
+name = "ptyrs-kernels"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+cuda-device = { workspace = true }
+cuda-host = { workspace = true, features = ["async"] }
+cuda-core = { workspace = true }
+cuda-async = { workspace = true }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }

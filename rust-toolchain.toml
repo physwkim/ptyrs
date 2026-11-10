@@ -1,0 +1,5 @@
+# Same pin as cuda-oxide: the SIMT codegen backend is a rustc plugin and only
+# loads into the toolchain that built it.
+[toolchain]
+channel = "1.99.1"
+components = ["rust-src", "rustc-dev", "rust-analyzer", "clippy", "rustfmt", "llvm-tools"]

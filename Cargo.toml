@@ -1,0 +1,16 @@
+[workspace]
+resolver = "3"
+members = ["ptyrs-fft", "ptyrs-kernels", "ptyrs-live"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+
+[workspace.dependencies]
+# Local cuda-rust checkout, absolute so git worktrees resolve it too. cargo-oxide builds its backend
+# from the same checkout, so host crates and backend stay on one commit.
+cuda-bindings = { path = "/home/stevek/work/cuda-rust/cuda-bindings" }
+cuda-core = { path = "/home/stevek/work/cuda-rust/cuda-core" }
+cuda-async = { path = "/home/stevek/work/cuda-rust/cuda-async" }
+cuda-device = { path = "/home/stevek/work/cuda-rust/cuda-oxide/crates/cuda-device" }
+cuda-host = { path = "/home/stevek/work/cuda-rust/cuda-oxide/crates/cuda-host" }
