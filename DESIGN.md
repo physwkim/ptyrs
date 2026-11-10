@@ -57,16 +57,17 @@
 | 항목 | 사실 | 설계상 결론 |
 |---|---|---|
 | GPU | RTX 5000 Ada ×4 (sm_89, 32 GB, 메모리 대역폭 576 GB/s, FP32 65.3 TFLOPS(사양), NVLink 없음). P2P는 모든 쌍 OK. GPU0–1, GPU2–3이 같은 NUMA 노드, 쌍 사이는 소켓 간 링크(SYS) 경유 | 대역폭이 계산보다 귀한 카드 → 메모리 왕복 감소가 최우선. 분할은 NUMA 쌍을 인지 |
-| 툴킷 | nvcc 13.0, 드라이버 590 (CUDA 13.1) | — |
-| cutile-rs (Tile) | sm_89에는 Tile IR 13.2 이상의 `tileiras` 필요 (`cutile-rs/README.md:92-97`). 13.0에는 없음. gather/scatter·atomic view는 13.3+. complex·FFT·shared memory 직접 제어 없음. 같은 연산을 CUDA graph 재생으로도 실행 가능(`README.md:15-16`) | **cuda-oxide와 커널 단위로 공존.** 13.2+ 설치 전에는 사용 불가 → 그동안은 cuda-oxide가 전부 담당 |
+| 툴킷 | nvcc 13.5.37, 드라이버 620.70.06 (CUDA 13.5), `tileiras` 있음 | — |
+| cutile-rs (Tile) | sm_89에는 Tile IR 13.2 이상의 `tileiras` 필요 (`cutile-rs/README.md:92-97`). 13.5에서 sm_89 실행 확인(M0). gather/scatter·atomic view는 13.3+. complex·FFT·shared memory 직접 제어 없음. 같은 연산을 CUDA graph 재생으로도 실행 가능(`README.md:15-16`) | **cuda-oxide와 커널 단위로 공존.** §4의 Tile 후보 커널에 쓸 수 있음 |
 | cuda-oxide (SIMT) | CUDA 13.0+, SM floor 80 → sm_89 가능. float atomic, shared memory, warp/block reduce 지원 | **주력 커널 언어.** FFT 융합·불규칙 접근 커널은 항상 여기 |
-| Tile ↔ SIMT 공존 | 한 프로세스, 같은 스트림에서 같은 GPU 버퍼를 넘기며 차례로 실행 가능(`cuda-oxide-book/appendix/supported-features.md:163`). 예제 `examples/cutile_inter_kernel`: Tile softmax → `Tensor::into_buffer` → SIMT 커널 → `Tensor::from_buffer`, `DeviceOp::then`으로 연결. **한 커널 안에서 섞기는 미지원**(이슈 #96). 예제 README는 CUDA 13.1+라 적었지만 sm_89 기준은 13.2 | 모델 경계는 원래 커널 경계인 곳에만 둔다(§4 커널 배치, §5 불변식 6) |
+| Tile ↔ SIMT 공존 | 한 프로세스, 같은 스트림에서 같은 GPU 버퍼를 넘기며 차례로 실행 가능(`cuda-oxide-book/appendix/supported-features.md:163`). 예제 `examples/cutile_inter_kernel`: Tile softmax → `Tensor::into_buffer` → SIMT 커널 → `Tensor::from_buffer`, `DeviceOp::then`으로 연결. **한 커널 안에서 섞기는 미지원**(이슈 #96). 예제 README는 CUDA 13.1+라 적었지만 sm_89 기준은 13.2. 13.5·sm_89에서 예제 `PASS` 확인(M0) | 모델 경계는 원래 커널 경계인 곳에만 둔다(§4 커널 배치, §5 불변식 6) |
 | 복소수 | 두 모델 모두 complex 타입 없음 | 자체 `c32`(interleaved f32 쌍) 정의 |
-| FFT | cuFFT 바인딩 없음 (`cuda-bindings/build.rs:57-83`은 driver·cuRAND만). 단, cuda-oxide가 **cuFFTDx를 LTOIR로 링크하는 예제**를 가짐 (`examples/mathdx_ffi_test`, 8/16/32점) | cuFFTDx를 커널 안 FFT로, cuFFT는 대안 경로로 |
-| cuFFT LTO 콜백 | CUDA 13.0 `cufftXt.h:223`에 `cufftXtSetJITCallback` 존재. cuda-oxide는 `cargo oxide emit-ltoir`로 LTOIR 생성 가능 | Rust로 쓴 FFT 콜백이 가능할 것으로 보임(미검증) |
+| FFT | cuda-bindings에 cuFFT 바인딩 없음(`cuda-bindings/build.rs:57-83`은 driver·cuRAND만) → ptyrs-fft에 직접 쓴 FFI로 추가, 256² 배치 C2C가 numpy와 2.5e-7 이내(M0). CUDA 13.5 libcufft에 **실험 단계의 장치 API**(`cufft_device.h` 0.6.0)가 있어 블록 FFT를 LTOIR로 내줌. cuda-oxide 커널에서 호출해 128·256점과 256² 2D(행 패스→열 패스)가 f64 기준과 2.7e-7 이내(M0). cuda-oxide에는 cuFFTDx를 LTOIR로 링크하는 예제도 있음(`examples/mathdx_ffi_test`, 8/16/32점). MathDx는 이 머신에 없음 | 커널 안 FFT는 cuFFT 장치 API로. 막히면 cuFFTDx, 그다음 cuFFT 배치(대안 경로) |
+| cuFFT LTO 콜백 | CUDA 13.5 `cufftXt.h:223`에 `cufftXtSetJITCallback` 존재. cuda-oxide는 `cargo oxide emit-ltoir`로 LTOIR 생성 가능 | Rust로 쓴 FFT 콜백이 가능할 것으로 보임(미검증) |
 | 런타임 | 스트림·이벤트·pinned memory·async 복사·메모리 풀·CUDA graph(`cuda-async/src/cuda_graph.rs`: capture/update/replay)·VMM(`cuda-core/src/vmm.rs`: 예약+물리할당+매핑)·peer access | 그래프 실행, 성장형 버퍼, P2P 경계 교환에 그대로 사용 |
 | 멀티 GPU | `cuda-async` 멀티 디바이스는 미완성 표시(`device_context.rs:140`). NCCL 바인딩·설치 없음 | 디바이스별 스레드 + P2P 직접 접근으로 자체 구현 |
-| 툴체인 | cuda-oxide는 Rust 1.99.1(+rustc-dev, llvm-tools)과 nvptx 지원 llc 필요. 시스템에는 LLVM 18만 있음. cutile-rs는 stable 1.89+. SIMT 커널은 별도 device crate를 `cargo oxide`가 PTX로 만들고 호스트가 실행 중에 읽음(예제 `Cargo.toml`의 `package.metadata.cuda-oxide.device-crates`) | Rust 동봉 llc로 되는지 M0에서 확인. 작업 공간 전체를 1.99.1 하나로 빌드(예제도 cuda-oxide의 1.99.1 고정 아래에 있음) |
+| 호스트 입력 경로 (M0 측정) | ptyrs-live 시제품: epics-pva-rs 시뮬레이터 → 수신 → 해제 → 위치 매칭 → 256² 크롭 → pinned 링 → GPU, 별도 프로세스 두 개. 1028×1062 u16 합성 프레임을 3 kHz로 30,000장 보내 손실 0(lz4 7회, bslz4 6회). 수신→GPU p99 약 4.7 ms. 수신 쪽 CPU 코어는 lz4 약 7, bslz4 약 5(크롭 행만 해제), bslz4 전체 해제 약 12. 손실 없는 최대 속도는 lz4 4 kHz(연결 하나 약 1.8 GB/s에서 포화), bslz4 6 kHz | 3 kHz는 통과. lz4는 연결 하나의 수신 한계 가까이에서 돌아 발행→GPU 지연이 실행마다 크게 흔들림(§8) |
+| 툴체인 | cuda-oxide는 Rust 1.99.1(+rustc-dev, llvm-tools)과 nvptx 지원 llc 필요. Rust 동봉 llc(LLVM 23.1.1)로 sm_89 빌드·실행 확인(M0). cutile-rs는 stable 1.89+. SIMT 커널은 별도 device crate를 `cargo oxide`가 PTX로 만들고 호스트가 실행 중에 읽음(예제 `Cargo.toml`의 `package.metadata.cuda-oxide.device-crates`) | 작업 공간 전체를 1.99.1 하나로 빌드(`rust-toolchain.toml`). `cargo oxide`는 의존성이 가리키는 cuda-rust 체크아웃의 것을 실행(`.cargo/config.toml` 별칭) |
 | Rust 딥러닝 프레임워크 (2026-11 웹 검색) | burn은 학습·추론·자동 미분·CUDA를 지원하지만 복소수 완전 지원은 추적 이슈(#5366), FFT는 2의 거듭제곱 길이만(#4865). candle은 추론 위주. numr은 복소수·FFT·자동 미분을 표방하나 신생이고 자체 GPU 런타임을 가짐 | 물리 계산은 cuda-rust로만. burn은 신경망 부분(ptyrs-nn)에만. numr은 cuda-rust와 역할이 겹쳐 쓰지 않음. PyTorch는 쓰지 않음 |
 
 ---
@@ -103,9 +104,9 @@ ptyrs는 2D FFT가 "행 FFT + 열 FFT"로 쪼개진다는 점을 이용해 화�
 | C. 역행 패스 | 행 역FFT → 물체·프로브 기울기 → 물체 누적(B3) + 프로브 부분합 | 중간값 읽기, 기울기 누적 |
 
 - 커널 B는 한 블록이 같은 열 묶음의 **모든 모드**를 가지므로 모드합이 블록 안에서 끝납니다. cuFFT 콜백 방식으로는 모드가 서로 다른 변환이라 이것이 불가능합니다.
-- 블록 단위 FFT는 cuFFTDx를 LTOIR로 링크해 cuda-oxide 커널에서 호출합니다(예제가 링크 경로를 증명함, 블록 FFT 크기는 미검증).
+- 블록 단위 FFT는 cuFFT 장치 API(CUDA 13.5, 실험 단계)가 내주는 LTOIR을 cuda-oxide 커널에 링크해 호출합니다. 128·256점과 256² 2D(행 패스→열 패스)를 M0에서 확인했습니다. FFT 함수는 레지스터에 든 값만 받으므로, 커널이 어떤 간격의 줄이든 읽어 와서 변환할 수 있습니다.
 - Ada의 SM당 shared memory(약 100 KB)로는 256² complex64 한 장(512 KB)을 한 블록에 못 담기 때문에 단일 커널 완전 융합은 64²~96²에서만 가능합니다. X선 원거리 프레임(128²~512²)은 128²도 한 장 128 KB라 모두 3-커널 경로입니다. 1-커널 경로는 두지 않습니다(전자 대상이 생기면 추가).
-- 대안 경로: cuFFT 배치 + PyNX 수준 화소 융합 + LTO 콜백(콜백을 Rust로 작성해 `emit-ltoir`). cuFFTDx가 막히면 이 경로로 내려갑니다.
+- 대안 경로: cuFFT 배치 + PyNX 수준 화소 융합 + LTO 콜백(콜백을 Rust로 작성해 `emit-ltoir`). 커널 안 FFT가 cuFFT 장치 API와 cuFFTDx 모두로 막히면 이 경로로 내려갑니다.
 - 기대: 대역폭 제한 구간에서 메모리 왕복이 1/3 수준. 실제 배수는 M2 벤치마크로 확정합니다.
 
 ### B2. 에폭 = CUDA graph 한 번, 반복 중 호스트 동기 0회
@@ -174,7 +175,7 @@ X선에서 GPU 4장을 쓰는 경우는 셋이고, 분할 방식이 다릅니다
 | 기능 폭: 위치 보정, OPR, 다층, 배경, 강도 변동 보정이 pty-chi·PtychoShelves·PtyPy에 수년간 쌓여 있음 | X선 필수 기능을 M3까지 앞당김: 프로브 모드, 위치 보정, OPR(스캔 중 바뀌는 프로브), 플라이 스캔(연속 이동 흐림을 프로브 모드로), 강도 변동(I0 정규화 또는 프레임별 배율), 배경. 각 기능은 pty-chi 수식을 비융합 연산자(순·역 + 내적 테스트)로 먼저 옮기고, 매 반복 경로에 있는 것만 융합 |
 | 새 물리 모델 실험: 자동 미분 코드(pty-chi AD, PtyRAD)는 모델만 바꾸면 돌아감 | 새 모델 추가 비용을 순·역 연산자 두 개로 제한(B7 확장 규칙). 유한차분 검사를 내적 테스트와 함께 자동 실행. std::autodiff가 cuda-oxide와 동작하면 역방향도 자동(§8) |
 | 사용자 환경: 빔라인 과학자는 Jupyter, APS는 Ptychodus GUI | 결과를 PV로 내보내 기존 뷰어·Ptychodus가 그대로 봄. 파일은 CXI(PyNX 호환)로 써서 기존 도구로 후처리. 계획은 PyNX식 문자열 문법 유지 |
-| 핵심 장점 B1이 초기 단계 cuda-oxide의 cuFFTDx 블록 FFT에 달림 | 실패해도 대안 경로(cuFFT + 화소 융합 + LTO 콜백)로 PyNX 수준은 확보. §0 근거 중 호스트 입력 경로·graph·공간 분할·BH는 B1과 무관 |
+| 핵심 장점 B1이 초기 단계 cuda-oxide와 실험 단계 cuFFT 장치 API에 달림 | 장치 API가 바뀌거나 빠지면 cuFFTDx(MathDx)로 바꿈. 그것도 실패하면 대안 경로(cuFFT + 화소 융합 + LTO 콜백)로 PyNX 수준은 확보. §0 근거 중 호스트 입력 경로·graph·공간 분할·BH는 B1과 무관 |
 
 ---
 
@@ -184,7 +185,7 @@ X선에서 GPU 4장을 쓰는 경우는 셋이고, 분할 방식이 다릅니다
 ptyrs/
 ├── ptyrs-core      데이터 모델: Scan, Positions, Probe(모드, OPR), Object(층), Geometry,
 │                   주소표(PtyPy addr 개념), 공간 bin, DisjointBatch
-├── ptyrs-fft       cuFFT 바인딩(cuda-bindings ApiSpec 추가) + cuFFTDx LTOIR shim
+├── ptyrs-fft       cuFFT 바인딩(직접 쓴 FFI) + cuFFT 장치 API 조회·LTOIR 생성
 ├── ptyrs-kernels   cuda-oxide SIMT device crate(`cargo oxide`로 PTX 생성): A/B/C 패스, 공간 bin 색인,
 │                   위치 기울기. Tile 전환 전에는 아래 Tile 후보 커널의 SIMT 판도 여기
 ├── ptyrs-tile      cutile-rs 커널(실행 중 JIT, CUDA 13.2+): 타일 소유 누적, 물체·프로브 갱신, 리덕션
@@ -214,7 +215,7 @@ ptyrs/
 
 | 커널 | 모델 | 이유 |
 |---|---|---|
-| A/B/C 패스 | SIMT | 커널 안 FFT(cuFFTDx)와 shared memory 직접 제어가 필요. Tile에는 FFT, complex, shared memory 제어가 없음 |
+| A/B/C 패스 | SIMT | 커널 안 FFT(cuFFT 장치 API)와 shared memory 직접 제어가 필요. Tile에는 FFT, complex, shared memory 제어가 없음 |
 | 공간 bin 색인 재구성, 위치 기울기 | SIMT | 불규칙 접근, 분기, warp 리덕션 |
 | 타일 소유 누적 | Tile 후보 | 물체 타일이 곧 cutile-rs의 "겹치지 않는 출력 조각"이라 불변식 2가 관례가 아니라 타입으로 강제됨. 타일마다 겹치는 프레임 수가 다른 gather를 표현할 수 있는지는 미검증(gather view는 Tile IR 13.3+). 안 되면 SIMT |
 | 물체·프로브 갱신(정규화, 나눗셈), LLK 부분합의 최종 합, CG/BH 스칼라용 합계·내적 | Tile 후보 | 밀집 화소 연산과 리덕션. 원래 독립 커널이라 경계 비용이 늘지 않음 |
@@ -259,29 +260,28 @@ ptyrs/
 
 | 단계 | 내용 | 성공 기준(확인 가능한 형태) |
 |---|---|---|
-| M0 툴체인·근거 검증 | cuda-oxide sm_89 빌드(Rust 동봉 llc), cuFFT 바인딩, cuFFTDx 블록 FFT 128/256점 LTOIR 링크. 호스트 입력 경로 시제품(PVA 압축 프레임 수신 → 해제 → 크롭 → pinned → GPU)과 Python 기준선. CUDA 13.2+ 설치 시 `cutile_inter_kernel` 예제 | 256² 배치 FFT가 numpy와 1e-5 이내 일치. 실패 시 B1을 대안 경로로 확정. 입력 경로는 3 kHz에서 프레임 손실 0, Python 기준선 대비 처리량·CPU 코어 수 기록(§0 접는 조건 1). 예제는 `PASS` 출력 |
+| M0 툴체인·근거 검증 | cuda-oxide sm_89 빌드(Rust 동봉 llc), cuFFT 바인딩, 커널 안 블록 FFT 128/256점 LTOIR 링크(cuFFT 장치 API, 막히면 cuFFTDx). 호스트 입력 경로 시제품(PVA 압축 프레임 수신 → 해제 → 크롭 → pinned → GPU)과 Python 기준선. `cutile_inter_kernel` 예제 | 256² 배치 FFT가 numpy와 1e-5 이내 일치. 실패 시 B1을 대안 경로로 확정. 입력 경로는 3 kHz에서 프레임 손실 0, Python 기준선 대비 처리량·CPU 코어 수 기록(§0 접는 조건 1). 예제는 `PASS` 출력 |
 | M1 단일 GPU 기준선 | 데이터 모델, CXI 입력, rPIE·DM을 비융합 커널(cuFFT + 화소 커널)로 | 시뮬레이션에서 PyNX DM과 LLK 곡선 일치 |
 | M2 융합 | A/B/C 3-커널, 타일 누적, 그래프 실행 | M1 대비 반복당 시간과 메모리 왕복(Nsight) 비교. 결과는 M1과 허용오차 내 일치. 같은 GPU·데이터에서 PyNX 대비 반복당 시간과 PyNX의 반복당 메모리 왕복 수(§0 접는 조건 2) |
 | M3 2차 방법·X선 필수 기능 | ML-CG, LSQML, BH-CG, 위치 보정, 프로브 모드, OPR, 플라이 스캔, 강도 변동, 배경 | pty-chi LSQML/BH와 LLK 곡선 비교, 목표 LLK 도달 시간 측정. 최적 배치 크기 측정 |
 | M4 멀티 GPU | 공간 분할 + P2P halo(라이브 띠·부채꼴 분할 포함), 각도 병렬 ptycho-tomography | 1→2→4 GPU 강확장 효율. 1·2·4 GPU 결과 비트 일치. 라이브 분할에서 측정 중 GPU별 새 프레임 수 차이. 4장 초당 프레임-반복을 A100 또는 H100 1장 위 PyNX·pty-chi와 비교(§0 접는 조건 3) |
 | M5 라이브 | PVA/ZMQ 입력, VMM 성장형 물체, PV 출력 | 시뮬레이터 3 kHz 스트림(256², 모드 2개)을 프레임 손실 없이 따라잡으며 재구성, 측정 중 graph 재캡처 0회. 스캔 종료부터 수렴 결과(같은 알고리즘 오프라인 결과와 FRC 일치)까지 시간 — 대표 수치(§0 접는 조건 4) |
-| M6 확장 | 다층(multislice), 근접장, PyO3(검증용), Tile 전환(§4 커널 배치의 Tile 후보, CUDA 13.2+ 설치 시), 신경망 연동(ptyrs-nn: 라이브 초기값 예측, DIP) | 기능별 기존 패키지 대비 비교. Tile 전환 커널은 SIMT 판과 허용오차 내 일치, 반복당 시간 같거나 짧음, 에폭이 graph 1개로 캡처됨. 예측 초기값 출발 시 평평한 초기값 대비 목표 LLK 도달 반복 수 비교. DIP 기울기 전달은 유한차분과 일치 |
+| M6 확장 | 다층(multislice), 근접장, PyO3(검증용), Tile 전환(§4 커널 배치의 Tile 후보), 신경망 연동(ptyrs-nn: 라이브 초기값 예측, DIP) | 기능별 기존 패키지 대비 비교. Tile 전환 커널은 SIMT 판과 허용오차 내 일치, 반복당 시간 같거나 짧음, 에폭이 graph 1개로 캡처됨. 예측 초기값 출발 시 평평한 초기값 대비 목표 LLK 도달 반복 수 비교. DIP 기울기 전달은 유한차분과 일치 |
 
 ---
 
 ## 8. 열린 결정과 미검증 사항
 
-- **CUDA 13.2+(권장 13.5) 설치 여부**: 설치하면 §4의 Tile 후보 커널을 cutile-rs로 옮길 수 있고 다음 세대 GPU로 옮기기 쉬워집니다. 드라이버 590이 Tile IR 13.2+ 바이트코드를 받는지는 미검증입니다.
 - **Tile로 옮긴 커널의 SIMT 판을 남길지**: 남기면 13.2 미만 환경에서도 돌고 결과 비교 기준이 되지만, 같은 커널을 두 벌 관리해야 합니다.
 - **Tile·SIMT 혼합 에폭의 graph 캡처**: 두 모델 모두 `DeviceOp`이고 cutile-rs는 graph 재생을 지원하지만, 섞인 체인을 graph 하나로 캡처하는 것은 미검증입니다. Tile 커널은 첫 실행 때 JIT 컴파일되므로 캡처 전에 한 번 돌려 두는 것을 전제로 합니다.
 - **타일 소유 누적의 Tile 표현**: 타일마다 겹치는 프레임 수가 달라 반복 횟수가 데이터에 따라 바뀌는 gather를 cutile-rs로 쓸 수 있는지 미검증입니다.
 - **burn ↔ cuda-rust 메모리 공유**: burn CUDA 백엔드가 외부 GPU 포인터를 복사 없이 받을 수 있는지 미검증입니다.
 - **std::autodiff(Rust 컴파일러 내장 자동 미분, nightly)**: cuda-oxide 커널에 쓸 수 있다면 역방향 연산자를 손으로 쓰지 않아도 됩니다. cuda-oxide는 별도 컴파일 백엔드라 함께 동작하는지 미검증이며, 지켜볼 항목입니다.
-- **cuFFTDx 블록 FFT를 cuda-oxide에서 호출하는 것**: 예제는 스레드 단위 8/16/32점만 보였습니다. 블록 단위(shared memory 전달)는 M0에서 확인해야 합니다. MathDx는 이 머신에 없고 별도 다운로드가 필요합니다.
+- **cuFFT 장치 API의 안정성**: 실험 API(`cufft_device.h` 0.6.0)입니다. 커널이 부르는 함수 이름(`cufftdx_private_lto_function<600, ID, float, 1>`)은 공개 문서에 없고, ID가 크기·방향·SM마다 정해져 지금 코드는 sm_89에 고정입니다. CUDA를 올리면 깨질 수 있습니다. 이름을 libcufft가 주는 database 문자열에서 만들어 버전 변화를 따라갈 수 있는지는 미검증입니다. 열 패스가 256 간격으로 읽는 비용도 미측정입니다(M2).
 - **Rust로 쓴 cuFFT LTO 콜백**: API는 있으나 cuda-oxide LTOIR과 cuFFT JIT 링크의 호환성은 미검증입니다.
-- **cuda-oxide의 nvptx llc**: 시스템 LLVM 18은 부족할 수 있고, Rust 동봉 llc가 되는지 미검증입니다.
 - **u16 데이터·f16 Ψ의 정밀도 영향**: u16은 정수 광자수라 손실이 없지만, 전처리(배경 차감, 평탄화)를 거친 데이터는 f32 경로가 필요합니다.
-- **Python 기준선 수치**: NSLS-II·Diamond 등 Python 라이브 재구성이 몇 kHz까지 따라가는지 공개 수치를 확인 못 했습니다. §0의 비교는 M0에서 같은 기계에 기준선을 직접 만들어 잽니다.
-- **압축 해제 속도**: bslz4·lz4를 Rust에서 해제하는 코어당 속도와 3 kHz에 필요한 코어 수는 미측정입니다.
+- **Python 기준선 수치**: NSLS-II·Diamond 등 Python 라이브 재구성이 몇 kHz까지 따라가는지 공개 수치를 확인 못 했습니다. §0의 비교는 M0에서 같은 기계에 기준선을 직접 만들어 잽니다. 아직 안 했습니다. p4p는 있지만 Python용 lz4·bitshuffle 패키지가 설치돼 있지 않습니다.
+- **입력 경로의 여유**: lz4 3 kHz에서 발행→GPU 지연이 실행마다 p50 6~73 ms, 최대 46~245 ms로 흔들립니다. 수신 뒤 처리(수신→GPU p99 약 4.7 ms)가 아니라 수신 소켓 앞에서 쌓이는 지연이고, 1024장 깊이의 PVA 파이프라인이 받아 줘서 손실은 0이지만 남는 여유는 수백 장입니다. 원인은 epics-pva-rs 클라이언트의 연결 하나당 수신 한계(약 1.8 GB/s)로 추정하며 프로파일은 안 했습니다. 실행 한 번이 약 10초라 장시간 실행도 안 했습니다.
+- **bslz4 형식**: ADEiger(`streamApi.cpp:395-403`)처럼 12바이트 헤더를 뗀 bitshuffle-lz4 블록 열로 해제합니다. 실제 C bitshuffle 출력과 교차 해제는 안 했습니다(C 라이브러리가 이 머신에 없음).
 - **§0 어림 계산**: 대역폭 70% 사용, 왕복 10회 대 3회, 대안 경로 5회는 가정입니다. 실제 값은 M2의 Nsight 측정(ptyrs와 같은 카드의 PyNX)으로 바꿉니다.
 - **데이터센터 GPU 확보**: §0 접는 조건 3에는 A100 또는 H100 1장이 필요합니다. 어디서 빌릴지 정해야 합니다.
