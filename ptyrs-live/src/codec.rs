@@ -9,7 +9,9 @@
 //! `n % 8` elements raw. There is no 12-byte `[u64 total][u32 block]` header;
 //! that one belongs to the HDF5 chunk and the Eiger stream, not to the
 //! NDArray. Layout taken from epics-rs `ad-plugins-rs` `codec.rs`, the port
-//! of ADCore `NDPluginCodec.cpp` (ADCore C is not checked out on this host).
+//! of ADCore `NDPluginCodec.cpp` (ADCore C is not checked out on this host);
+//! `scripts/codec_cross.py` checks both codecs against C liblz4 and C
+//! bitshuffle in both directions.
 
 use std::fmt;
 
