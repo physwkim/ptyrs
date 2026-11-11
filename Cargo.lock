@@ -1616,6 +1616,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ptyrs-dist"
+version = "0.0.1"
+dependencies = [
+ "ptyrs-core",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "ptyrs-fft"
 version = "0.0.1"
 dependencies = [
