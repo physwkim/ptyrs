@@ -3,6 +3,8 @@ use ptyrs_engine::{
     Algorithm, ApParams, DmParams, Ptycho, RpieParams, obj_probe_to_psi, quad_phase,
 };
 
+mod common;
+
 const PHOTONS: f64 = 1e5;
 
 struct Case {
@@ -133,6 +135,36 @@ fn dm_converges_and_records_on_schedule() {
     // DM is not an LLK minimiser and settles above the noise floor, as PyNX DM does; only
     // the progress from the start is asserted
     assert!(end < start / 10.0, "start {start} end {end} truth {truth}");
+}
+
+/// DM against PyNX `cpu_operator` promoted to f64 (`scripts/compare_pynx_dm.py`), cycles
+/// 0-19 of `cargo run --release -p ptyrs-engine --example dm_llk -- <dir> 20 1 32 40`, saved
+/// from `<dir>/llk_pynx_f64.txt` to `tests/data/dm_pynx_f64.txt`.
+#[test]
+fn dm_llk_matches_pynx() {
+    let (scan, object, probe) = common::dm_scenario(32, 40, 1, 2e5);
+    let mut p = Ptycho::new(&scan, object, probe).unwrap();
+    p.scale_obj_probe();
+    let params = DmParams {
+        calc_llk: 1,
+        ..DmParams::default()
+    };
+    p.dm(&params, 20);
+    let pynx: Vec<Vec<f64>> = include_str!("data/dm_pynx_f64.txt")
+        .lines()
+        .map(|l| l.split_whitespace().map(|v| v.parse().unwrap()).collect())
+        .collect();
+    assert_eq!(p.history().len(), pynx.len());
+    for (r, row) in p.history().iter().zip(&pynx) {
+        assert_eq!(r.cycle as f64, row[0]);
+        let l = r.llk;
+        for (a, b) in [l.poisson, l.gaussian, l.euclidian, l.nb_photons_calc]
+            .into_iter()
+            .zip(&row[1..])
+        {
+            assert!(rel(a, *b) < 1e-9, "cycle {}: rust {a} pynx {b}", r.cycle);
+        }
+    }
 }
 
 #[test]
