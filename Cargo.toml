@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["ptyrs-fft", "ptyrs-kernels", "ptyrs-live"]
+members = ["ptyrs-fft", "ptyrs-gpu", "ptyrs-kernels", "ptyrs-live"]
 
 [workspace.package]
 version = "0.0.1"

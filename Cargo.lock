@@ -1553,6 +1553,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "ptyrs-gpu"
+version = "0.0.1"
+dependencies = [
+ "cuda-artifact-finalizer",
+ "cuda-core",
+ "libloading",
+ "nvjitlink-sys",
+ "oxide-artifacts",
+ "ptyrs-fft",
+ "ptyrs-kernels",
+]
+
+[[package]]
 name = "ptyrs-kernels"
 version = "0.0.1"
 dependencies = [
