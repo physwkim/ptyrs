@@ -15,7 +15,7 @@
 
 use std::fmt::{self, Write as _};
 use std::net::SocketAddr;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -77,7 +77,7 @@ pub struct RecvCfg {
     /// Device store capacity; `frames` when unset.
     pub store_frames: Option<usize>,
     pub store_chunk_mib: usize,
-    pub graph_batch: u32,
+    pub graph_batch: NonZeroU32,
     pub rt_threads: usize,
     /// CPU list (`2-23,48-71`) the threads are pinned to; unpinned when unset.
     pub cpus: Option<String>,
@@ -113,7 +113,7 @@ impl Default for RecvCfg {
             ring_slots: 1024,
             store_frames: None,
             store_chunk_mib: 32,
-            graph_batch: 32,
+            graph_batch: NonZeroU32::new(32).unwrap(),
             rt_threads: 1,
             cpus: None,
             util_min: 1024,
@@ -803,7 +803,7 @@ mod tests {
             ring_slots: 256,
             store_frames: Some(2000),
             store_chunk_mib: 16,
-            graph_batch: 8,
+            graph_batch: NonZeroU32::new(8).unwrap(),
             rt_threads: 2,
             cpus: Some("2-5".into()),
             util_min: 0,
@@ -1018,6 +1018,7 @@ mod tests {
             ("[model.ptycho]\npath = \"spiral\"", "spiral"),
             ("source = \"udp\"", "udp"),
             ("workers = 0", "workers"),
+            ("graph-batch = 0", "graph-batch"),
             ("[source.zmq]\n[source.h5]\npath = \"a.h5\"", "source"),
         ] {
             let e = ::toml::from_str::<RecvCfg>(t).unwrap_err().to_string();

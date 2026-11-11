@@ -18,6 +18,7 @@ pub mod pva_source;
 pub mod recv;
 pub mod ring;
 pub mod sched;
+pub mod stack;
 pub mod stats;
 pub mod swmr;
 pub mod synth;

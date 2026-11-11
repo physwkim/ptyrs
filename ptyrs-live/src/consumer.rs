@@ -1,14 +1,16 @@
 //! Stand-in for the engine's live graph (DESIGN.md §3 B2, §5 invariant 9):
 //! one CUDA graph, captured before the first frame, consumes the device
-//! store batch by batch while it grows. Which frames a replay covers is
-//! read on the GPU from a counter the graph advances itself; the host only
-//! writes how many frames have landed and launches the same graph again.
+//! store batch by batch while it grows. Each replay starts with
+//! [`NextStack`], so which frames it covers is read on the GPU from the
+//! [`StackCtl`] the graph advances itself; the host only writes how many
+//! frames have landed and launches the same graph again.
 //!
 //! The per-frame work is a position-weighted checksum, so an end-of-run
 //! check covers every stored frame.
 
 use std::ffi::c_void;
 use std::mem::MaybeUninit;
+use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use crossbeam_channel::Receiver;
@@ -18,16 +20,17 @@ use cuda_core::{Context, DriverError, IntoResult, Stream, launch_kernel_on_strea
 
 use crate::grow::{GrowBuf, GrowError};
 use crate::ring::{DeviceStore, FrameBatch};
+use crate::stack::{NextStack, StackCtl};
 
 const PTX: &str = r#"
 .version 8.0
 .target sm_89
 .address_size 64
 
-// ctl = [done, avail]. Block b sums frame done + b if it is below
-// min(done + batch, avail): out[f] = sum_j frame[j] * (j + 1).
+// ctl = StackCtl {f0, nf}. Block b < nf sums frame f0 + b:
+// out[f] = sum_j frame[j] * (j + 1).
 .visible .entry checksum(.param .u64 frames, .param .u32 elems, .param .u64 ctl,
-                         .param .u32 batch, .param .u64 out)
+                         .param .u64 out)
 {
     .reg .pred p, q;
     .reg .b32 r<12>;
@@ -36,19 +39,16 @@ const PTX: &str = r#"
     ld.param.u64 rd1, [frames];
     ld.param.u32 r1, [elems];
     ld.param.u64 rd2, [ctl];
-    ld.param.u32 r2, [batch];
     ld.param.u64 rd3, [out];
     cvta.to.global.u64 rd1, rd1;
     cvta.to.global.u64 rd2, rd2;
     cvta.to.global.u64 rd3, rd3;
     ld.global.u32 r3, [rd2];
     ld.global.u32 r4, [rd2+4];
-    add.u32 r5, r3, r2;
-    min.u32 r5, r5, r4;
     mov.u32 r6, %ctaid.x;
-    add.u32 r6, r6, r3;
-    setp.ge.u32 p, r6, r5;
+    setp.ge.u32 p, r6, r4;
     @p bra DONE;
+    add.u32 r6, r6, r3;
     mov.u32 r7, %tid.x;
     setp.eq.u32 q, r7, 0;
     mov.u64 rd4, 0;
@@ -79,22 +79,6 @@ REDUCE:
     add.s64 rd10, rd3, rd10;
     st.global.u64 [rd10], rd9;
 DONE:
-    ret;
-}
-
-// done = min(done + batch, avail)
-.visible .entry advance(.param .u64 ctl, .param .u32 batch)
-{
-    .reg .b32 r<5>;
-    .reg .b64 rd<2>;
-    ld.param.u64 rd1, [ctl];
-    ld.param.u32 r1, [batch];
-    cvta.to.global.u64 rd1, rd1;
-    ld.global.u32 r2, [rd1];
-    ld.global.u32 r3, [rd1+4];
-    add.u32 r2, r2, r1;
-    min.u32 r2, r2, r3;
-    st.global.u32 [rd1], r2;
     ret;
 }
 "#;
@@ -187,49 +171,47 @@ pub struct ConsumerReport {
 pub fn run_checksum_consumer(
     ctx: Arc<Context>,
     store: Arc<DeviceStore>,
-    batch: u32,
+    batch: NonZeroU32,
     batches: Receiver<FrameBatch>,
 ) -> Result<ConsumerReport, GrowError> {
     ctx.bind_to_thread()?;
     let stream = ctx.new_stream()?;
-    let module = ctx.load_module_from_ptx_src(PTX)?;
-    let (sum, advance) = (
-        module.load_function("checksum")?,
-        module.load_function("advance")?,
-    );
-    let mut ctl = GrowBuf::new(&ctx, 8, 1)?;
-    ctl.map(0..8)?;
-    memset32(ctl.ptr(), 0, 2, &stream)?;
+    let sum = ctx
+        .load_module_from_ptx_src(PTX)?
+        .load_function("checksum")?;
+    let step = NextStack::load(&ctx, batch, store.max_frames() as u32)?;
+    // The StackCtl, then the landed count.
+    let mut ctl = GrowBuf::new(&ctx, 12, 1)?;
+    ctl.map(0..12)?;
+    let landed_ptr = ctl.ptr() + 8;
+    memset32(ctl.ptr(), 0, 3, &stream)?;
     let mut out = GrowBuf::new(&ctx, store.max_frames() as usize * 8, 1)?;
-    let (mut p_frames, mut p_elems, mut p_ctl, mut p_batch, mut p_out) = (
+    let (mut p_frames, mut p_elems, mut p_ctl, mut p_out) = (
         store.frames_ptr(),
         store.frame_elems() as u32,
         ctl.ptr(),
-        batch,
         out.ptr(),
     );
     let mut sum_params = [
         (&raw mut p_frames).cast::<c_void>(),
         (&raw mut p_elems).cast(),
         (&raw mut p_ctl).cast(),
-        (&raw mut p_batch).cast(),
         (&raw mut p_out).cast(),
     ];
-    let (mut a_ctl, mut a_batch) = (ctl.ptr(), batch);
-    let mut adv_params = [(&raw mut a_ctl).cast::<c_void>(), (&raw mut a_batch).cast()];
     let graph = Graph::capture(&stream, || {
-        // SAFETY: the parameter arrays match the kernels' signatures and
-        // point at locals that outlive the capture.
+        // SAFETY: `ctl` backs the StackCtl and the count while the graph
+        // lives; the parameter array matches `checksum` and outlives the
+        // capture.
         unsafe {
+            step.queue(&stream, ctl.ptr(), landed_ptr)?;
             launch_kernel_on_stream(
                 &sum,
-                (batch, 1, 1),
+                (batch.get(), 1, 1),
                 (256, 1, 1),
                 0,
                 &stream,
                 &mut sum_params,
-            )?;
-            launch_kernel_on_stream(&advance, (1, 1, 1), (1, 1, 1), 0, &stream, &mut adv_params)
+            )
         }
     })?;
 
@@ -239,11 +221,11 @@ pub fn run_checksum_consumer(
             assert_eq!(b.seq0, landed, "batches arrive in order and without gaps");
             landed += b.n;
             out.map(0..landed as usize * 8)?;
-            memset32(ctl.ptr() + 4, landed as u32, 1, &stream)?;
+            memset32(landed_ptr, landed as u32, 1, &stream)?;
             while covered < landed {
                 graph.launch(&stream)?;
                 launches += 1;
-                covered = (covered + u64::from(batch)).min(landed);
+                covered = (covered + u64::from(batch.get())).min(landed);
             }
         }
         Ok(())
@@ -252,12 +234,12 @@ pub fn run_checksum_consumer(
     stream.synchronize()?;
     fed?;
 
-    let mut done = 0u32;
+    let mut done = StackCtl::default();
     let mut checksums = vec![0u64; landed as usize];
     // SAFETY: the stream is idle; both sources are mapped and hold at least
     // the bytes copied.
     unsafe {
-        sys::cuMemcpyDtoH_v2((&raw mut done).cast(), ctl.ptr(), 4).result()?;
+        sys::cuMemcpyDtoH_v2((&raw mut done).cast(), ctl.ptr(), 8).result()?;
         sys::cuMemcpyDtoH_v2(
             checksums.as_mut_ptr().cast(),
             out.ptr(),
@@ -267,7 +249,7 @@ pub fn run_checksum_consumer(
     }
     Ok(ConsumerReport {
         launches,
-        consumed: u64::from(done),
+        consumed: u64::from(done.f0 + done.nf),
         checksums,
         out_mapped_bytes: out.mapped_bytes(),
     })
@@ -287,7 +269,7 @@ mod tests {
     #[test]
     fn one_graph_consumes_every_frame_while_the_store_grows() {
         let ctx = Context::new(0).expect("GPU 0");
-        let (se, total, batch) = (65536, 203u64, 7u32);
+        let (se, total, batch) = (65536, 203u64, NonZeroU32::new(7).unwrap());
         let ring = Arc::new(Ring::new(&ctx, 16, se).unwrap());
         let store = Arc::new(DeviceStore::new(&ctx, total as usize, se, 1).unwrap());
         let stop = Arc::new(AtomicBool::new(false));
@@ -324,7 +306,7 @@ mod tests {
 
         assert_eq!(up.frames, total);
         assert_eq!(rep.consumed, total);
-        assert!(rep.launches >= total.div_ceil(u64::from(batch)));
+        assert!(rep.launches >= total.div_ceil(u64::from(batch.get())));
         let bad = (0..total)
             .filter(|&s| rep.checksums[s as usize] != checksum(&frame(s)))
             .count();
