@@ -1,20 +1,22 @@
-//! Receiver: PVA monitor of `<prefix>FRAME` and `<prefix>POS` → decode
-//! workers → uniqueId position match → crop → pinned ring → async H2D on
-//! GPU `--gpu`.
+//! Receiver: frames from a PVA monitor of `<prefix>FRAME` or, with
+//! `--source zmq`, an Eiger stream v1 PULL socket; positions from a PVA
+//! monitor of `<prefix>POS` → decode workers → uniqueId position match →
+//! crop → pinned ring → async H2D on GPU `--gpu`.
 //!
-//! The monitor callback only parses the NTNDArray head and hands a
-//! zero-copy slice of the body to the workers. Workers reuse one image-sized
+//! The source only parses the frame metadata and hands a zero-copy slice
+//! of the received buffer to the workers. Workers reuse one image-sized
 //! scratch each; the ring, its device mirror and the events are allocated
 //! before the first frame.
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use cuda_core::Context;
 use epics_pva_rs::client_native::PvaClient;
 use ptyrs_live::args::Args;
+use ptyrs_live::eiger::{EigerFrames, Progress, PullReport, run_pull};
 use ptyrs_live::pipeline::{
     Geometry, Placement, SourceStats, Truth, Work, WorkerCfg, WorkerReport, worker,
 };
@@ -61,6 +63,15 @@ fn main() {
         idle: Duration::from_micros(a.get("idle-us", 50)),
         events: 64,
     };
+    let zmq_ep = match a.str("source", "pva").as_str() {
+        "pva" => None,
+        "zmq" => Some(a.str(
+            "zmq",
+            &format!("tcp://127.0.0.1:{}", ptyrs_live::eiger::PORT),
+        )),
+        s => panic!("--source {s}: expected pva or zmq"),
+    };
+    let rcvhwm: i32 = a.get("rcvhwm", 10_000);
     let prefix = a.str("prefix", "PTY:");
     let idle_ms: i64 = a.get("idle-ms", 3000);
     let connect_s: i64 = a.get("connect-timeout-s", 120);
@@ -106,8 +117,7 @@ fn main() {
     drop(rx);
 
     let state = Arc::new(Mutex::new(SourceStats::new(frames)));
-    let unique = Arc::new(AtomicU64::new(0));
-    let last_rx = Arc::new(AtomicI64::new(0));
+    let progress = Arc::new(Progress::default());
     let pos_stats = Arc::new(Mutex::new(PosStats::default()));
     let rt = {
         let place = place.clone();
@@ -118,8 +128,9 @@ fn main() {
             .build()
             .unwrap()
     };
+    let pull_stop = Arc::new(AtomicBool::new(false));
     let t_start = mono_ns();
-    rt.block_on(async {
+    let pulled: Option<PullReport> = rt.block_on(async {
         let client = PvaClient::builder()
             .server_addr(addr)
             .timeout(Duration::from_secs(10))
@@ -141,25 +152,50 @@ fn main() {
         )
         .await
         .expect("POS monitor");
-        let (st, un, lr) = (state.clone(), unique.clone(), last_rx.clone());
-        let mut src = NtndFrames::new(geom);
-        let frame_sub = client
-            .pvmonitor_raw_frames_handle(
-                &format!("{prefix}FRAME"),
-                move |desc, body, order| {
-                    let mut s = st.lock().unwrap();
-                    src.on_update(&mut s, desc, body, order, &tx);
-                    un.store(s.unique, Ordering::Relaxed);
-                    lr.store(s.last_rx, Ordering::Relaxed);
-                },
-                |ev| eprintln!("recv FRAME {ev:?}"),
-            )
-            .await
-            .expect("FRAME monitor");
+        // Frames from exactly one source; the other holds no Sender.
+        let (frame_sub, pull) = match &zmq_ep {
+            None => {
+                let (st, pr) = (state.clone(), progress.clone());
+                let mut src = NtndFrames::new(geom);
+                let sub = client
+                    .pvmonitor_raw_frames_handle(
+                        &format!("{prefix}FRAME"),
+                        move |desc, body, order| {
+                            let mut s = st.lock().unwrap();
+                            src.on_update(&mut s, desc, body, order, &tx);
+                            pr.unique.store(s.unique, Ordering::Relaxed);
+                            pr.last_rx.store(s.last_rx, Ordering::Relaxed);
+                        },
+                        |ev| eprintln!("recv FRAME {ev:?}"),
+                    )
+                    .await
+                    .expect("FRAME monitor");
+                (Some(sub), None)
+            }
+            Some(ep) => {
+                let (st, pr, ep) = (state.clone(), progress.clone(), ep.clone());
+                let (stop, place) = (pull_stop.clone(), place.clone());
+                let h = std::thread::Builder::new()
+                    .name("zmq-pull".into())
+                    .spawn(move || {
+                        // libzmq's I/O thread starts with the first socket
+                        // and inherits this thread's CPUs.
+                        place.enter(place.rt.as_deref());
+                        run_pull(&ep, rcvhwm, EigerFrames::new(geom), st, tx, &stop, &pr)
+                    })
+                    .unwrap();
+                (None, Some(h))
+            }
+        };
         loop {
             tokio::time::sleep(Duration::from_millis(20)).await;
-            let lr = last_rx.load(Ordering::Relaxed);
-            if unique.load(Ordering::Relaxed) >= frames {
+            let lr = progress.last_rx.load(Ordering::Relaxed);
+            // A ZMQ series ends with dseries_end; PVA has no end marker.
+            if zmq_ep.is_none() && progress.unique.load(Ordering::Relaxed) >= frames {
+                break;
+            }
+            if progress.series_end.load(Ordering::Acquire) {
+                eprintln!("recv series end");
                 break;
             }
             if lr != 0 && wall_ns() - lr > idle_ms * 1_000_000 {
@@ -171,8 +207,11 @@ fn main() {
                 break;
             }
         }
+        pull_stop.store(true, Ordering::Release);
+        let pulled = pull.map(|h| h.join().unwrap().expect("ZMQ PULL"));
         drop(frame_sub);
         drop(pos_sub);
+        pulled
     });
     // Dropping the runtime drops the monitor callbacks and with them the
     // only Sender, so the workers drain the queue and return.
@@ -256,6 +295,12 @@ fn main() {
         ps.updates,
         ps.rejected,
     );
+    if let Some(p) = &pulled {
+        println!(
+            "recv zmq messages={} headers={} series_end={} rejected={}",
+            p.messages, p.headers, p.ends, p.rejected
+        );
+    }
     if let Some(e) = st.first_error.as_ref().or(ps.first_error.as_ref()) {
         println!("recv first_error={e}");
     }

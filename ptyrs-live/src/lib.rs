@@ -1,7 +1,9 @@
-//! ptyrs-live: host input path from a compressed PVA detector stream to a
-//! GPU ring (DESIGN.md §3 B6, §7 M0).
+//! ptyrs-live: host input path from a compressed detector stream (PVA
+//! NTNDArray or Eiger stream v1 over ZMQ) to a GPU ring (DESIGN.md §3 B6,
+//! §7 M0, M5).
 
 pub mod codec;
+pub mod eiger;
 pub mod ntnd;
 pub mod pipeline;
 pub mod pos;
