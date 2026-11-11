@@ -7,3 +7,4 @@ description = "ptyrs spatial multi-GPU split: object tile partition with halos, 
 [dependencies]
 ptyrs-core.workspace = true
 thiserror.workspace = true
+cuda-core.workspace = true

@@ -2,6 +2,7 @@
 //! partitioned into one region per GPU plus a one-probe halo.
 
 pub mod partition;
+pub mod topo;
 
 pub use partition::{Csr, DEFAULT_TILE, Partition, Region, Scheme, TileGrid};
 
@@ -9,4 +10,10 @@ pub use partition::{Csr, DEFAULT_TILE, Partition, Region, Scheme, TileGrid};
 pub enum DistError {
     #[error("invalid partition: {0}")]
     Partition(String),
+    #[error("CUDA: {0}")]
+    Driver(#[from] cuda_core::DriverError),
+    #[error("topology: {0}")]
+    Topology(String),
+    #[error("GPU {from} cannot access GPU {to} peer-to-peer")]
+    NoPeerAccess { from: usize, to: usize },
 }

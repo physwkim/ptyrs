@@ -1619,6 +1619,7 @@ dependencies = [
 name = "ptyrs-dist"
 version = "0.0.1"
 dependencies = [
+ "cuda-core",
  "ptyrs-core",
  "thiserror 2.0.21",
 ]
