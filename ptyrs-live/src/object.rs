@@ -12,10 +12,11 @@
 //! appends, and is 0 for every tile whose slab or pixels are not backed.
 
 use std::fmt;
+use std::ops::Range;
 use std::sync::Arc;
 
 use cuda_bindings::{self as sys, CUdeviceptr};
-use cuda_core::{IntoResult, PinnedHostBuffer, Stream};
+use cuda_core::{DriverError, Event, IntoResult, PinnedHostBuffer, Stream};
 
 use crate::grow::{GrowBuf, GrowError};
 
@@ -194,12 +195,121 @@ impl LiveObject {
         }
         Ok(())
     }
+
+    /// Queues a copy of every backed object row into `snap` on the stream,
+    /// behind the work already queued there, and returns without waiting
+    /// for it; [`Snapshot::wait`] reads the result.
+    pub fn snapshot(&self, snap: &mut Snapshot) -> Result<(), DriverError> {
+        assert_eq!(
+            (snap.nobj, snap.shape),
+            (self.nobj, self.shape),
+            "snapshot of a differently shaped object"
+        );
+        let [nyo, nxo] = self.shape;
+        let row = nxo * 8;
+        let mut bands: Vec<Range<usize>> = Vec::new();
+        for r in (0..self.nobj * nyo).filter(|r| self.obj.is_mapped(r * row..(r + 1) * row)) {
+            match bands.last_mut() {
+                Some(b) if b.end == r * nxo => b.end += nxo,
+                _ => bands.push(r * nxo..(r + 1) * nxo),
+            }
+        }
+        snap.copied.clear();
+        let queued = self.queue_copy(&bands, snap);
+        if queued.is_err() {
+            // Copies queued before the failure may still be writing `snap`.
+            self.stream.synchronize()?;
+        }
+        queued?;
+        snap.copied = bands;
+        Ok(())
+    }
+
+    fn queue_copy(&self, bands: &[Range<usize>], snap: &mut Snapshot) -> Result<(), DriverError> {
+        self.stream.context().bind_to_thread()?;
+        let (s, dst) = (self.stream.cu_stream(), snap.buf.as_mut_ptr());
+        for b in bands {
+            // SAFETY: `b` is backed and stays so while `self` lives; `snap`
+            // holds the whole object and is neither read nor freed before
+            // `done`, recorded below, completes.
+            unsafe {
+                sys::cuMemcpyDtoHAsync_v2(
+                    dst.add(b.start).cast(),
+                    self.obj.ptr() + (b.start * 8) as u64,
+                    b.len() * 8,
+                    s,
+                )
+            }
+            .result()?;
+        }
+        snap.done.record(&self.stream)
+    }
 }
 
 impl Drop for LiveObject {
     fn drop(&mut self) {
-        // Queued fills write into the mappings the fields' drops release.
+        // Queued fills and snapshot copies use the mappings the fields'
+        // drops release.
         let _ = self.stream.synchronize();
+    }
+}
+
+/// A host copy of a [`LiveObject`], filled by [`LiveObject::snapshot`] and
+/// read only through [`wait`](Self::wait); dropping it also waits, so a
+/// queued copy never writes freed memory.
+pub struct Snapshot {
+    buf: PinnedHostBuffer<[f32; 2]>,
+    done: Event,
+    /// Pixel ranges the last queued copy writes, ascending.
+    copied: Vec<Range<usize>>,
+    fill: [f32; 2],
+    nobj: usize,
+    shape: [usize; 2],
+}
+
+impl Snapshot {
+    pub fn new(o: &LiveObject) -> Result<Self, DriverError> {
+        let ctx = o.stream.context();
+        let [nyo, nxo] = o.shape;
+        Ok(Self {
+            buf: PinnedHostBuffer::zeroed(ctx, o.nobj * nyo * nxo)?,
+            done: ctx.new_event_with_flags(None)?,
+            copied: Vec::new(),
+            fill: o.fill,
+            nobj: o.nobj,
+            shape: o.shape,
+        })
+    }
+
+    /// Waits for the last queued copy and returns the object's pixels in its
+    /// layout. Rows the device has not backed read as the flat fill value,
+    /// which is what backing them would have given.
+    pub fn wait(&mut self) -> Result<&[[f32; 2]], DriverError> {
+        self.done.synchronize()?;
+        let px = self.buf.as_mut_slice();
+        let end = px.len()..px.len();
+        let mut at = 0;
+        for b in self.copied.iter().chain([&end]) {
+            px[at..b.start].fill(self.fill);
+            at = b.end;
+        }
+        Ok(self.buf.as_slice())
+    }
+
+    pub fn nobj(&self) -> usize {
+        self.nobj
+    }
+
+    /// `[nyo, nxo]`.
+    pub fn shape(&self) -> [usize; 2] {
+        self.shape
+    }
+}
+
+impl Drop for Snapshot {
+    fn drop(&mut self) {
+        // A queued copy writes `buf` until `done` completes.
+        let _ = self.done.synchronize();
     }
 }
 
@@ -616,5 +726,85 @@ OEND:
             o.obj.mapped_bytes() >> 20,
             o.lists.mapped_bytes() >> 20
         );
+    }
+
+    /// A snapshot is queued behind work the stream has not reached, without
+    /// waiting for it, copies backed rows only and reads the rest as fill.
+    #[test]
+    fn snapshot_copies_backed_rows_behind_queued_work() {
+        let ctx = Context::new(0).expect("GPU 0");
+        let s = ctx.new_stream().unwrap();
+        let (n, fill) = (1024usize, [1.0f32, 0.5]);
+        let mut o = LiveObject::new(&s, 2, [n, n], 16, 4, fill, 1).unwrap();
+        let mut snap = Snapshot::new(&o).unwrap();
+        o.snapshot(&mut snap).unwrap();
+        assert!(snap.copied.is_empty());
+        assert!(snap.wait().unwrap().iter().all(|&p| p == fill));
+
+        // 2 MiB chunks back 256 rows of a plane: rows 256..512.
+        let win = |oy| Window {
+            oy,
+            ox: 40,
+            ny: 40,
+            nx: 64,
+        };
+        o.ensure(win(300)).unwrap();
+        let mut gate = PinnedHostBuffer::<u32>::zeroed(&ctx, 1).unwrap();
+        let mark = 7.0f32.to_bits();
+        unsafe {
+            sys::cuStreamWaitValue32_v2(
+                s.cu_stream(),
+                gate.as_ptr() as u64,
+                1,
+                sys::CUstreamWaitValue_flags_enum_CU_STREAM_WAIT_VALUE_GEQ,
+            )
+            .result()
+            .unwrap();
+            // Plane 1, rows 300..340: real part 7.
+            let at = o.ptr() + ((n + 300) * n * 8) as u64;
+            sys::cuMemsetD2D32Async(at, 8, mark, 1, 40 * n, s.cu_stream())
+                .result()
+                .unwrap();
+        }
+        // Opens the gate after 10 s, so a snapshot that waits on the stream
+        // fails the check below instead of hanging.
+        let (release, rx) = std::sync::mpsc::channel::<()>();
+        let g = gate.as_mut_ptr() as usize;
+        let watchdog = std::thread::spawn(move || {
+            let _ = rx.recv_timeout(std::time::Duration::from_secs(10));
+            // SAFETY: `gate` outlives the thread, which is joined below.
+            unsafe { (g as *mut u32).write_volatile(1) };
+        });
+        o.snapshot(&mut snap).unwrap();
+        let pending = !snap.done.query().unwrap();
+        release.send(()).unwrap();
+        watchdog.join().unwrap();
+        assert!(
+            pending,
+            "the copy ran before the queued memset was released"
+        );
+        assert_eq!(
+            snap.copied,
+            vec![256 * n..512 * n, (n + 256) * n..(n + 512) * n]
+        );
+        let px = snap.wait().unwrap();
+        let marked = (n + 300) * n..(n + 340) * n;
+        let bad = (0..px.len())
+            .filter(|i| px[*i] != if marked.contains(i) { [7.0, 0.5] } else { fill })
+            .count();
+        assert_eq!(bad, 0);
+
+        // Growth adds rows 512..768; touching bands merge.
+        o.ensure(win(700)).unwrap();
+        o.snapshot(&mut snap).unwrap();
+        assert_eq!(
+            snap.copied,
+            vec![256 * n..768 * n, (n + 256) * n..(n + 768) * n]
+        );
+        let px = snap.wait().unwrap();
+        let bad = (0..px.len())
+            .filter(|i| px[*i] != if marked.contains(i) { [7.0, 0.5] } else { fill })
+            .count();
+        assert_eq!(bad, 0);
     }
 }
