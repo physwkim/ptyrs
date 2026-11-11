@@ -5,7 +5,9 @@
 pub mod codec;
 pub mod consumer;
 pub mod eiger;
+pub mod farfield;
 pub mod grow;
+pub mod model;
 pub mod ntnd;
 pub mod object;
 pub mod pipeline;

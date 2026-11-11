@@ -1632,6 +1632,7 @@ dependencies = [
  "epics-pva-rs",
  "libc",
  "lz4_flex",
+ "rustfft",
  "serde",
  "serde_json",
  "tokio",

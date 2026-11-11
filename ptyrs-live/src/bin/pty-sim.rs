@@ -3,9 +3,10 @@
 //! NDPluginCodec payload) or, with `--out zmq`, as an Eiger stream v1
 //! series on a ZMQ PUSH socket bound to `--zmq-port`.
 //!
-//! Frames come from a pool of synthetic diffraction patterns compressed once
-//! up front; frame `uid` carries pool entry `uid % pool`. The position of
-//! trigger `uid` is posted just before its frame.
+//! Frames come from the `--model` (synth or the M5 ptycho scan, see
+//! `model.rs`), each distinct frame compressed once up front; frame `uid`
+//! carries entry `uid % period`. The position of trigger `uid` is posted
+//! just before its frame.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,9 +22,11 @@ use ptyrs_live::codec::{Codec, bslz4_compress_u16, bytemuck_u16, lz4_compress};
 use ptyrs_live::eiger::{
     ImageMeta, SeriesConfig, blob_prefix, end_message, header_message, image_parts,
 };
+use ptyrs_live::model::Model;
 use ptyrs_live::ntnd::position_desc;
+use ptyrs_live::pipeline::Truth;
 use ptyrs_live::stats::{Histogram, mono_ns, process_cpu_ns, wall_ns};
-use ptyrs_live::synth::{Synth, position};
+use ptyrs_live::synth::Region;
 
 #[derive(Clone)]
 enum Payload {
@@ -104,7 +107,7 @@ impl ZmqOut {
         sndhwm: i32,
         pool: &[Payload],
         codec: Codec,
-        s: &Synth,
+        (w, h): (usize, usize),
         frames: u64,
         rate: f64,
     ) -> Self {
@@ -116,15 +119,15 @@ impl ZmqOut {
         let blobs = pool
             .iter()
             .map(|p| {
-                let mut b = blob_prefix(codec, s.width, s.height);
+                let mut b = blob_prefix(codec, w, h);
                 b.extend_from_slice(p.bytes());
                 b
             })
             .collect();
         let t0 = wall_ns();
         let config = SeriesConfig {
-            x_pixels_in_detector: s.width as u64,
-            y_pixels_in_detector: s.height as u64,
+            x_pixels_in_detector: w as u64,
+            y_pixels_in_detector: h as u64,
             nimages: frames,
             ntrigger: 1,
             frame_time: 1.0 / rate,
@@ -179,15 +182,18 @@ impl ZmqOut {
     }
 }
 
-fn build_pool(s: &Synth, codec: Codec) -> Vec<Payload> {
+fn build_pool(m: &Model, codec: Codec) -> Vec<Payload> {
     let threads = std::thread::available_parallelism().map_or(8, |n| n.get());
-    let mut pool: Vec<Option<Payload>> = vec![None; s.pool];
+    let (w, h) = m.frame_size();
+    let mut pool: Vec<Option<Payload>> = vec![None; m.period()];
+    let per = m.period().div_ceil(threads);
     std::thread::scope(|sc| {
-        for (t, chunk) in pool.chunks_mut(s.pool.div_ceil(threads)).enumerate() {
-            let base = t * s.pool.div_ceil(threads);
+        for (t, chunk) in pool.chunks_mut(per).enumerate() {
             sc.spawn(move || {
                 for (k, slot) in chunk.iter_mut().enumerate() {
-                    let raw = s.frame((base + k) as u64);
+                    let mut raw = vec![0u16; w * h];
+                    let all = Region { x0: 0, y0: 0, w, h };
+                    m.fill((t * per + k) as i32, all, &mut raw);
                     *slot = Some(match codec {
                         Codec::None => Payload::Raw(raw.into()),
                         Codec::Lz4 => Payload::Compressed(lz4_compress(bytemuck_u16(&raw)).into()),
@@ -213,13 +219,7 @@ async fn main() {
     };
     let rate: f64 = a.get("rate", 3000.0);
     let frames: u64 = a.get("frames", 30_000);
-    let synth = Synth {
-        width: a.get("width", 1028),
-        height: a.get("height", 1062),
-        seed: a.get("seed", 1),
-        flux: a.get("flux", 1.0),
-        pool: a.get("pool", 64),
-    };
+    let model = Arc::new(Model::from_args(&a));
     let port: u16 = a.get("port", 15075);
     let queue: usize = a.get("server-queue", 4);
     let prefix = a.str("prefix", "PTY:");
@@ -231,10 +231,10 @@ async fn main() {
     };
     let zmq_port: u16 = a.get("zmq-port", ptyrs_live::eiger::PORT);
     let sndhwm: i32 = a.get("sndhwm", 10_000);
-    let (w, h) = (synth.width, synth.height);
+    let (w, h) = model.frame_size();
 
     let t = mono_ns();
-    let pool = build_pool(&synth, codec);
+    let pool = build_pool(&model, codec);
     let raw_bytes = (w * h * 2) as f64;
     let sizes: Vec<usize> = pool
         .iter()
@@ -244,13 +244,15 @@ async fn main() {
         })
         .collect();
     let mean = sizes.iter().sum::<usize>() as f64 / sizes.len() as f64;
-    let f0 = synth.frame(0);
+    let mut f0 = vec![0u16; w * h];
+    model.fill(0, Region { x0: 0, y0: 0, w, h }, &mut f0);
     let zeros = f0.iter().filter(|&&v| v == 0).count() as f64 / f0.len() as f64;
     let photons: u64 = f0.iter().map(|&v| v as u64).sum();
     println!(
-        "sim pool={} codec={} frame={}x{} gen_ms={} mean_bytes={:.0} ratio_mean={:.2} \
+        "sim {} pool={} codec={} frame={}x{} gen_ms={} mean_bytes={:.0} ratio_mean={:.2} \
          ratio_min={:.2} ratio_max={:.2} zero_frac={:.3} photons_frame0={} max_count_frame0={}",
-        synth.pool,
+        model.describe(),
+        pool.len(),
         codec.name(),
         w,
         h,
@@ -300,7 +302,7 @@ async fn main() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     let zmq = zmq_out.then(|| {
-        let z = ZmqOut::start(zmq_port, sndhwm, &pool, codec, &synth, frames, rate);
+        let z = ZmqOut::start(zmq_port, sndhwm, &pool, codec, (w, h), frames, rate);
         println!(
             "sim zmq_port={zmq_port} sndhwm={sndhwm} series={}",
             z.series
@@ -333,7 +335,7 @@ async fn main() {
             max_lag = max_lag.max(lag);
             late += (lag as f64 > period) as u64;
             let uid = i as i32;
-            let (x, y) = position(uid);
+            let (x, y) = model.position(uid);
             pos_pv.try_post(pos_value(uid, x, y));
             if let Some(z) = &zmq {
                 unsent += !z.send(i, codec, w, h) as u64;

@@ -4,7 +4,8 @@
 # CPUs 0-1 are left out: the runtime thread on CPU 0 received ~6% slower.
 #   m0_input_bench.sh CODEC RATE FRAMES [extra pty-recv args...]
 # SOURCE=zmq sends frames as an Eiger stream v1 series over ZMQ instead of
-# PVA (positions stay on PVA).
+# PVA (positions stay on PVA). MODEL_ARGS go to both processes, e.g.
+# MODEL_ARGS="--model ptycho --path fermat --points 30000" for the M5 scan.
 # Build first: cargo build --release -p ptyrs-live --bins
 set -uo pipefail
 codec=${1:?codec}
@@ -21,11 +22,11 @@ if [ "${SOURCE:-pva}" = zmq ]; then
 fi
 
 taskset -c "${SIM_CPUS:-24-47}" "$bin/pty-sim" --codec "$codec" --rate "$rate" \
-    --frames "$frames" --port "$port" "${sim_src[@]}" &
+    --frames "$frames" --port "$port" "${sim_src[@]}" ${MODEL_ARGS:-} &
 sim=$!
 trap 'kill $sim 2>/dev/null' EXIT
 "$bin/pty-recv" --addr "127.0.0.1:$port" --frames "$frames" --cpus "${RECV_CPUS:-2-23}" \
-    "${recv_src[@]}" "$@"
+    "${recv_src[@]}" ${MODEL_ARGS:-} "$@"
 rc=$?
 wait $sim
 exit $rc

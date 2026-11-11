@@ -36,6 +36,10 @@ pub trait Truth: Send + Sync {
     fn fill(&self, uid: i32, r: Region, out: &mut [u16]);
     /// Scan position of trigger `uid`, metres.
     fn position(&self, uid: i32) -> (f64, f64);
+    /// `(width, height)` of a frame.
+    fn frame_size(&self) -> (usize, usize);
+    /// Distinct frames: trigger `uid` repeats frame `uid % period`.
+    fn period(&self) -> usize;
 }
 
 impl Truth for Synth {
@@ -45,6 +49,14 @@ impl Truth for Synth {
 
     fn position(&self, uid: i32) -> (f64, f64) {
         crate::synth::position(uid)
+    }
+
+    fn frame_size(&self) -> (usize, usize) {
+        (self.width, self.height)
+    }
+
+    fn period(&self) -> usize {
+        self.pool
     }
 }
 

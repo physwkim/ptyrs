@@ -22,6 +22,7 @@ use epics_pva_rs::client_native::PvaClient;
 use ptyrs_live::args::Args;
 use ptyrs_live::consumer::{checksum, run_checksum_consumer};
 use ptyrs_live::eiger::{EigerFrames, Progress, PullReport, run_pull};
+use ptyrs_live::model::Model;
 use ptyrs_live::pipeline::{
     Geometry, Placement, SourceStats, Truth, Work, WorkerCfg, WorkerReport, worker,
 };
@@ -29,28 +30,22 @@ use ptyrs_live::pos::PosTable;
 use ptyrs_live::pva_source::{NtndFrames, PosStats, monitor_positions};
 use ptyrs_live::ring::{DeviceStore, Ring, UploaderConfig, run_uploader};
 use ptyrs_live::stats::{mono_ns, process_cpu_ns, wall_ns};
-use ptyrs_live::synth::Synth;
 
 fn main() {
     let a = Args::parse();
     let addr: SocketAddr = a.str("addr", "127.0.0.1:15075").parse().expect("--addr");
     let frames: u64 = a.get("frames", 30_000);
     let workers: usize = a.get("workers", 16);
-    let synth = Synth {
-        width: a.get("width", 1028),
-        height: a.get("height", 1062),
-        seed: a.get("seed", 1),
-        flux: a.get("flux", 1.0),
-        pool: a.get("pool", 64),
-    };
+    // The same model arguments as pty-sim's.
+    let model = Model::from_args(&a);
+    let (width, height) = model.frame_size();
     let crop: usize = a.get("crop", 256);
-    let (cx, cy) = synth.centre();
     let mut geom = Geometry::centred(
-        synth.width,
-        synth.height,
+        width,
+        height,
         crop,
-        a.get("cx", cx),
-        a.get("cy", cy),
+        a.get("cx", width / 2),
+        a.get("cy", height / 2),
     );
     // Only the crop rows reach the GPU; bslz4 blocks outside them are skipped.
     geom.crop_decode = a.get::<u8>("crop-decode", 1) != 0;
@@ -61,7 +56,7 @@ fn main() {
         // worker throughout; arrival lag on its own connection is < 1 ms.
         pos_wait_ns: a.get::<i64>("pos-wait-ms", 1000) * 1_000_000,
     };
-    let truth: Arc<dyn Truth> = Arc::new(synth);
+    let truth: Arc<dyn Truth> = Arc::new(model);
     let ucfg = UploaderConfig {
         batch: a.get("batch", 16),
         flush_ns: a.get::<i64>("flush-us", 500) * 1000,
