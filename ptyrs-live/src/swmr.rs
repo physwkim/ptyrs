@@ -188,7 +188,6 @@ pub struct SwmrReport {
 struct Job {
     index: u64,
     uid: i32,
-    t_rx: i64,
     t_pub: i64,
 }
 
@@ -349,7 +348,6 @@ fn index(
             let job = Job {
                 index: next + j as u64,
                 uid,
-                t_rx: t,
                 t_pub,
             };
             // Every reader gone means one failed; its error is reported.
@@ -387,14 +385,17 @@ fn read_frames(
             r.read_slice_raw(DATA, &[job.index, 0, 0], &[1, h, w])
         })?;
         hist.record(mono_ns() - t);
+        let mut s = st.lock().unwrap();
+        // Received once read, not once visible: a finished file's whole
+        // backlog is visible at once. Stamped under the lock, so receive
+        // times keep the queue's order.
         let work = Work {
             payload: Bytes::from(b),
             codec: Codec::None,
             uid: job.uid,
-            t_rx: job.t_rx,
+            t_rx: wall_ns(),
             t_pub: job.t_pub,
         };
-        let mut s = st.lock().unwrap();
         s.accept(work, &tx);
         progress.unique.store(s.unique, Ordering::Relaxed);
         progress.last_rx.store(s.last_rx, Ordering::Relaxed);
@@ -500,8 +501,12 @@ mod tests {
             assert_eq!(w.t_pub, wall_of(w.uid));
             let p = pos.get(w.uid).expect("position posted");
             assert_eq!((p.x, p.y), pos_of(w.uid));
-            assert_eq!(p.t_rx, w.t_rx);
+            assert!(p.t_rx <= w.t_rx, "uid {}: frame before position", w.uid);
         }
+        // One stamp per read, in queue order: a closed file's frames are
+        // all visible at one instant but are not received at one.
+        assert!(got.windows(2).all(|p| p[0].t_rx <= p[1].t_rx));
+        assert!(got[0].t_rx < got[got.len() - 1].t_rx);
     }
 
     #[test]
