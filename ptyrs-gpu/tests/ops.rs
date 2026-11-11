@@ -5,18 +5,25 @@ use std::f64::consts::PI;
 use std::ops::Range;
 use std::sync::Arc;
 
-use cuda_core::{CudaContext, CudaStream, DeviceBuffer, DeviceCopy};
+use cuda_async::cuda_graph::CudaGraph;
+use cuda_async::device_operation::{DeviceOp, ExecutionContext};
+use cuda_async::error::DeviceError;
+use cuda_core::{CudaContext, CudaStream, DeviceBuffer, DeviceCopy, DriverError};
 use ptyrs_fft::Plan2d;
 use ptyrs_gpu::{
-    C32, Error, Kernels, LlkPartial, LlkSums, MASKED, UpdateSums, ViewAddr, ViewDims, Views,
+    C32, Error, Kernels, Lines, LlkPartial, LlkSums, MASKED, UpdateSums, ViewAddr, ViewDims, Views,
+    record,
 };
 
 type Z = (f64, f64);
 
-fn setup() -> (Arc<CudaStream>, Kernels) {
+/// A stream, an eager execution context on it (its leases end when the test drops it) and
+/// the kernels.
+fn setup() -> (Arc<CudaStream>, ExecutionContext, Kernels) {
     let ctx = CudaContext::new(0).expect("CUDA device 0");
     let kernels = Kernels::load(&ctx).expect("load ptyrs-gpu kernels");
-    (ctx.default_stream(), kernels)
+    let stream = ctx.default_stream();
+    (stream.clone(), ExecutionContext::new(stream), kernels)
 }
 
 /// Deterministic values in `[-scale, scale)`.
@@ -278,13 +285,13 @@ fn assert_llk(what: &str, got: &[LlkPartial], want: &[[f64; 4]]) {
 
 #[test]
 fn obj_probe_to_psi_matches_f64() {
-    let (stream, k) = setup();
+    let (stream, ex, k) = setup();
     let s = scan();
     let views = Views::new(&stream, s.d, &s.views).unwrap();
     let (obj, probe) = (up(&stream, &s.obj), up(&stream, &s.probe));
     for frames in [0..5, 2..5] {
         let mut psi = DeviceBuffer::<C32>::zeroed(&stream, s.nk(&frames) * s.n()).unwrap();
-        k.obj_probe_to_psi(&stream, &views, frames.clone(), &obj, &probe, &mut psi)
+        k.obj_probe_to_psi(&ex, &views, frames.clone(), &obj, &probe, &mut psi)
             .unwrap();
         let err = rel_l2(
             &psi.to_host_vec(&stream).unwrap(),
@@ -297,10 +304,7 @@ fn obj_probe_to_psi_matches_f64() {
 
 /// Uploads `num`, `den` as sums.
 fn sums(stream: &CudaStream, start: &(Vec<C32>, Vec<f32>)) -> UpdateSums {
-    UpdateSums {
-        num: up(stream, &start.0),
-        den: up(stream, &start.1),
-    }
+    UpdateSums::new(up(stream, &start.0), up(stream, &start.1), stream).unwrap()
 }
 
 /// `whole` matches the f64 sums, and `parts` (the same frames in two stacks) matches
@@ -337,7 +341,7 @@ fn check_sums(
 
 #[test]
 fn update_sums_match_f64_and_ignore_stack_split() {
-    let (stream, k) = setup();
+    let (stream, ex, k) = setup();
     let s = scan();
     let n = s.n();
     let views = Views::new(&stream, s.d, &s.views).unwrap();
@@ -366,11 +370,11 @@ fn update_sums_match_f64_and_ignore_stack_split() {
 
     let st = start(s.obj.len(), 10);
     let (mut whole, mut parts) = (sums(&stream, &st), sums(&stream, &st));
-    k.psi_to_obj(&stream, &views, 0..5, &psi, &probe, &mut whole)
+    k.psi_to_obj(&ex, &views, 0..5, &psi, &probe, &mut whole)
         .unwrap();
-    k.psi_to_obj(&stream, &views, 0..2, &psi_parts[0], &probe, &mut parts)
+    k.psi_to_obj(&ex, &views, 0..2, &psi_parts[0], &probe, &mut parts)
         .unwrap();
-    k.psi_to_obj(&stream, &views, 2..5, &psi_parts[1], &probe, &mut parts)
+    k.psi_to_obj(&ex, &views, 2..5, &psi_parts[1], &probe, &mut parts)
         .unwrap();
     let (mut num, mut den) = f64_start(&st);
     s.obj_sums(0..5, &psi_host, &mut num, &mut den);
@@ -378,11 +382,11 @@ fn update_sums_match_f64_and_ignore_stack_split() {
 
     let st = start(s.probe.len(), 20);
     let (mut whole, mut parts) = (sums(&stream, &st), sums(&stream, &st));
-    k.psi_to_probe(&stream, &views, 0..5, &psi, &obj, &mut whole)
+    k.psi_to_probe(&ex, &views, 0..5, &psi, &obj, &mut whole)
         .unwrap();
-    k.psi_to_probe(&stream, &views, 0..2, &psi_parts[0], &obj, &mut parts)
+    k.psi_to_probe(&ex, &views, 0..2, &psi_parts[0], &obj, &mut parts)
         .unwrap();
-    k.psi_to_probe(&stream, &views, 2..5, &psi_parts[1], &obj, &mut parts)
+    k.psi_to_probe(&ex, &views, 2..5, &psi_parts[1], &obj, &mut parts)
         .unwrap();
     let (mut num, mut den) = f64_start(&st);
     s.probe_sums(0..5, &psi_host, &mut num, &mut den);
@@ -391,17 +395,17 @@ fn update_sums_match_f64_and_ignore_stack_split() {
 
 #[test]
 fn psi_to_obj_is_the_adjoint_of_obj_probe_to_psi() {
-    let (stream, k) = setup();
+    let (stream, ex, k) = setup();
     let s = scan();
     let views = Views::new(&stream, s.d, &s.views).unwrap();
     let probe = up(&stream, &s.probe);
     let o = noise(s.obj.len(), 7, 1.0);
     // <A o, A o> = <o, A^H A o>: no cancellation, so f32 rounding stays small.
     let mut a_o = DeviceBuffer::<C32>::zeroed(&stream, s.nk(&(0..5)) * s.n()).unwrap();
-    k.obj_probe_to_psi(&stream, &views, 0..5, &up(&stream, &o), &probe, &mut a_o)
+    k.obj_probe_to_psi(&ex, &views, 0..5, &up(&stream, &o), &probe, &mut a_o)
         .unwrap();
     let mut ah = UpdateSums::zeroed(&stream, o.len()).unwrap();
-    k.psi_to_obj(&stream, &views, 0..5, &a_o, &probe, &mut ah)
+    k.psi_to_obj(&ex, &views, 0..5, &a_o, &probe, &mut ah)
         .unwrap();
     let dot = |a: &[C32], b: &[C32]| {
         a.iter().zip(b).fold((0.0, 0.0), |s, (&a, &b)| {
@@ -430,7 +434,7 @@ fn counts(len: usize) -> Vec<u16> {
 
 #[test]
 fn intensity_amplitude_and_llk_match_f64() {
-    let (stream, k) = setup();
+    let (stream, ex, k) = setup();
     let s = scan();
     let (d, n, nm) = (s.d, s.n(), s.d.nmode as usize);
     let frames = 1..4;
@@ -467,12 +471,12 @@ fn intensity_amplitude_and_llk_match_f64() {
     let counts = up(&stream, &counts_host);
     let mut psi = up(&stream, &psi_host);
     let mut icalc = DeviceBuffer::<f32>::zeroed(&stream, nf * n).unwrap();
-    k.mode_intensity(&stream, &d, frames.clone(), &psi, &mut icalc)
+    k.mode_intensity(&ex, &d, frames.clone(), &psi, &mut icalc)
         .unwrap();
     let mut llk = DeviceBuffer::<LlkPartial>::zeroed(&stream, nf).unwrap();
-    k.llk(&stream, &d, frames.clone(), &counts, &psi, &mut llk)
+    k.llk(&ex, &d, frames.clone(), &counts, &psi, &mut llk)
         .unwrap();
-    k.apply_amplitude(&stream, &d, frames.clone(), &counts, &mut psi)
+    k.apply_amplitude(&ex, &d, frames.clone(), &counts, &mut psi)
         .unwrap();
 
     let err = rel_l2_re(&icalc.to_host_vec(&stream).unwrap(), &icalc_ref);
@@ -486,7 +490,7 @@ fn intensity_amplitude_and_llk_match_f64() {
 
 #[test]
 fn update_from_sums_matches_f64() {
-    let (stream, k) = setup();
+    let (stream, ex, k) = setup();
     let inertia = 0.01f32;
     // 300_001 values make each block of the max pass stride; its maximum is the last value.
     for (len, seed) in [(6000usize, 20u64), (300_001, 30)] {
@@ -506,11 +510,9 @@ fn update_from_sums_matches_f64() {
             })
             .collect();
         let mut x = up(&stream, &x_host);
-        let sums = UpdateSums {
-            num: up(&stream, &num_host),
-            den: up(&stream, &den_host),
-        };
-        k.update_from_sums(&stream, &mut x, &sums, len as u32, inertia)
+        let mut sums =
+            UpdateSums::new(up(&stream, &num_host), up(&stream, &den_host), &stream).unwrap();
+        k.update_from_sums(&ex, &mut x, &mut sums, len as u32, inertia)
             .unwrap();
         let got = x.to_host_vec(&stream).unwrap();
         let err = rel_l2(&got, &want);
@@ -538,7 +540,7 @@ fn update_from_sums_matches_f64() {
 
 #[test]
 fn dm_reflect_and_add_match_f64() {
-    let (stream, k) = setup();
+    let (stream, ex, k) = setup();
     let (len, alpha) = (5000usize, 0.02f32);
     let a = alpha as f64;
     let (psi_host, po_host) = (noise(len, 40, 1.0), noise(len, 41, 1.0));
@@ -570,18 +572,18 @@ fn dm_reflect_and_add_match_f64() {
         .collect();
 
     let (mut psi, mut po) = (up(&stream, &psi_host), up(&stream, &po_host));
-    k.dm_reflect(&stream, &mut psi, &mut po, len as u32, alpha)
+    k.dm_reflect(&ex, &mut psi, &mut po, len as u32, alpha)
         .unwrap();
     let e_psi = rel_l2(&psi.to_host_vec(&stream).unwrap(), &psi1);
     let e_po = rel_l2(&po.to_host_vec(&stream).unwrap(), &po1);
-    k.add_c32(&stream, &mut psi, &po, len as u32).unwrap();
+    k.add_c32(&ex, &mut psi, &po, len as u32).unwrap();
     let e_sum = rel_l2(&psi.to_host_vec(&stream).unwrap(), &sum);
     println!("dm_reflect: psi {e_psi:.2e}, po {e_po:.2e}; add_c32 {e_sum:.2e}");
     assert!(e_psi < 1e-6 && e_po < 1e-6 && e_sum < 1e-6);
 
     // First DM cycle: psi = PO is a fixed point, and the add-back term vanishes.
     let (mut psi, mut po) = (up(&stream, &po_host), up(&stream, &po_host));
-    k.dm_reflect(&stream, &mut psi, &mut po, len as u32, alpha)
+    k.dm_reflect(&ex, &mut psi, &mut po, len as u32, alpha)
         .unwrap();
     let want: Vec<Z> = po_host.iter().map(|&c| z(c)).collect();
     let e_fix = rel_l2(&psi.to_host_vec(&stream).unwrap(), &want);
@@ -630,7 +632,7 @@ fn dft2_ortho(plane: &[Z], n: usize, inverse: bool) -> Vec<Z> {
 #[test]
 fn fourier_projection_matches_pynx_orthonormal_f64() {
     const N: usize = 32;
-    let (stream, k) = setup();
+    let (stream, ex, k) = setup();
     let d = ViewDims {
         nframe: 3,
         nmode: 2,
@@ -684,7 +686,7 @@ fn fourier_projection_matches_pynx_orthonormal_f64() {
     let counts = up(&stream, &counts_host);
     let mut psi = DeviceBuffer::<C32>::zeroed(&stream, nf * nm * n).unwrap();
     k.obj_probe_to_psi(
-        &stream,
+        &ex,
         &views,
         0..3,
         &up(&stream, &s.obj),
@@ -694,9 +696,8 @@ fn fourier_projection_matches_pynx_orthonormal_f64() {
     .unwrap();
     plan.forward_inplace(&mut psi).unwrap();
     let mut llk = DeviceBuffer::<LlkPartial>::zeroed(&stream, nf).unwrap();
-    k.llk(&stream, &d, 0..3, &counts, &psi, &mut llk).unwrap();
-    k.apply_amplitude(&stream, &d, 0..3, &counts, &mut psi)
-        .unwrap();
+    k.llk(&ex, &d, 0..3, &counts, &psi, &mut llk).unwrap();
+    k.apply_amplitude(&ex, &d, 0..3, &counts, &mut psi).unwrap();
     plan.inverse_inplace(&mut psi).unwrap();
 
     assert_llk("chain llk", &llk.to_host_vec(&stream).unwrap(), &llk_ref);
@@ -707,7 +708,7 @@ fn fourier_projection_matches_pynx_orthonormal_f64() {
 
 #[test]
 fn views_and_frame_ranges_are_checked() {
-    let (stream, k) = setup();
+    let (stream, ex, k) = setup();
     let s = scan();
     let shape_err = |r: Result<Views, Error>| matches!(r, Err(Error::Shape(_)));
     assert!(
@@ -744,10 +745,227 @@ fn views_and_frame_ranges_are_checked() {
     let (obj, probe) = (up(&stream, &s.obj), up(&stream, &s.probe));
     let mut psi = DeviceBuffer::<C32>::zeroed(&stream, s.nk(&(0..5)) * s.n()).unwrap();
     for frames in [3..3, 4..6] {
-        let r = k.obj_probe_to_psi(&stream, &views, frames.clone(), &obj, &probe, &mut psi);
+        let r = k.obj_probe_to_psi(&ex, &views, frames.clone(), &obj, &probe, &mut psi);
         assert!(matches!(r, Err(Error::Shape(_))), "frames {frames:?}");
     }
     let mut short = DeviceBuffer::<C32>::zeroed(&stream, s.nk(&(0..5)) * s.n() - 1).unwrap();
-    let r = k.obj_probe_to_psi(&stream, &views, 0..5, &obj, &probe, &mut short);
+    let r = k.obj_probe_to_psi(&ex, &views, 0..5, &obj, &probe, &mut short);
     assert!(matches!(r, Err(Error::Shape(_))), "short psi");
+}
+
+/// Side of the square image the line FFTs of [`Iteration`] round-trip.
+const AUX: u32 = 128;
+
+/// State that one call of every launch method updates in place.
+struct Iteration {
+    obj: DeviceBuffer<C32>,
+    probe: DeviceBuffer<C32>,
+    psi: DeviceBuffer<C32>,
+    po: DeviceBuffer<C32>,
+    icalc: DeviceBuffer<f32>,
+    llk: DeviceBuffer<LlkPartial>,
+    obj_sums: UpdateSums,
+    probe_sums: UpdateSums,
+    aux: DeviceBuffer<C32>,
+    tmp: DeviceBuffer<C32>,
+}
+
+impl Iteration {
+    fn new(stream: &CudaStream, s: &Scan) -> Self {
+        let (nf, n) = (s.d.nframe as usize, s.n());
+        let nk = s.nk(&(0..s.d.nframe)) * n;
+        let aux = (AUX * AUX) as usize;
+        Self {
+            obj: up(stream, &s.obj),
+            probe: up(stream, &s.probe),
+            psi: up(stream, &noise(nk, 50, 1.0)),
+            po: DeviceBuffer::zeroed(stream, nk).unwrap(),
+            icalc: DeviceBuffer::zeroed(stream, nf * n).unwrap(),
+            llk: DeviceBuffer::zeroed(stream, nf).unwrap(),
+            obj_sums: UpdateSums::zeroed(stream, s.obj.len()).unwrap(),
+            probe_sums: UpdateSums::zeroed(stream, s.probe.len()).unwrap(),
+            aux: up(stream, &noise(aux, 51, 1.0)),
+            tmp: DeviceBuffer::zeroed(stream, aux).unwrap(),
+        }
+    }
+
+    /// A DM iteration without the FFTs (`Plan2d` launches are not leased), then a 2D FFT
+    /// round trip of `aux` through the line kernels.
+    fn run(
+        &mut self,
+        ctx: &ExecutionContext,
+        k: &Kernels,
+        views: &Views,
+        counts: &DeviceBuffer<u16>,
+    ) -> Result<(), Error> {
+        let d = *views.dims();
+        let frames = 0..d.nframe;
+        let nk = self.psi.len() as u32;
+        self.obj_sums.zero(ctx)?;
+        self.probe_sums.zero(ctx)?;
+        k.obj_probe_to_psi(
+            ctx,
+            views,
+            frames.clone(),
+            &self.obj,
+            &self.probe,
+            &mut self.po,
+        )?;
+        k.dm_reflect(ctx, &mut self.psi, &mut self.po, nk, 0.02)?;
+        k.mode_intensity(ctx, &d, frames.clone(), &self.psi, &mut self.icalc)?;
+        k.llk(ctx, &d, frames.clone(), counts, &self.psi, &mut self.llk)?;
+        k.apply_amplitude(ctx, &d, frames.clone(), counts, &mut self.psi)?;
+        k.add_c32(ctx, &mut self.psi, &self.po, nk)?;
+        k.psi_to_obj(
+            ctx,
+            views,
+            frames.clone(),
+            &self.psi,
+            &self.probe,
+            &mut self.obj_sums,
+        )?;
+        k.psi_to_probe(
+            ctx,
+            views,
+            frames,
+            &self.psi,
+            &self.obj,
+            &mut self.probe_sums,
+        )?;
+        let (no, np) = (self.obj.len() as u32, self.probe.len() as u32);
+        k.update_from_sums(ctx, &mut self.obj, &mut self.obj_sums, no, 0.01)?;
+        k.update_from_sums(ctx, &mut self.probe, &mut self.probe_sums, np, 0.01)?;
+
+        let rows = Lines {
+            n: AUX,
+            count: AUX,
+            line_stride: AUX,
+            elem_stride: 1,
+        };
+        let cols = Lines {
+            line_stride: 1,
+            elem_stride: AUX,
+            ..rows
+        };
+        k.fft_lines(ctx, &self.aux, &mut self.tmp, rows, false)?;
+        k.fft_lines_inplace(ctx, &mut self.tmp, cols, false)?;
+        k.fft_lines(ctx, &self.tmp, &mut self.aux, rows, true)?;
+        k.fft_lines_inplace(ctx, &mut self.aux, cols, true)?;
+        k.scale_c32(ctx, &mut self.aux, AUX * AUX, 1.0 / (AUX * AUX) as f32)
+    }
+
+    /// The bits of every buffer `run` writes.
+    fn bits(&self, stream: &CudaStream) -> Vec<Vec<u32>> {
+        let c = |b: &DeviceBuffer<C32>| {
+            b.to_host_vec(stream)
+                .unwrap()
+                .iter()
+                .flat_map(|c| [c.re.to_bits(), c.im.to_bits()])
+                .collect()
+        };
+        let f = |b: &DeviceBuffer<f32>| {
+            b.to_host_vec(stream)
+                .unwrap()
+                .iter()
+                .map(|x| x.to_bits())
+                .collect()
+        };
+        let llk = self.llk.to_host_vec(stream).unwrap();
+        vec![
+            c(&self.obj),
+            c(&self.probe),
+            c(&self.psi),
+            c(&self.po),
+            f(&self.icalc),
+            llk.iter()
+                .flat_map(|p| [p.poisson, p.gaussian, p.euclidean, p.icalc].map(f32::to_bits))
+                .collect(),
+            c(&self.obj_sums.num),
+            f(&self.obj_sums.den),
+            c(&self.probe_sums.num),
+            f(&self.probe_sums.den),
+            c(&self.aux),
+            c(&self.tmp),
+        ]
+    }
+}
+
+#[test]
+fn captured_iteration_replays_bitwise_like_eager() {
+    let (stream, _, k) = setup();
+    let s = scan();
+    let views = Views::new(&stream, s.d, &s.views).unwrap();
+    let counts = up(&stream, &counts(s.d.nframe as usize * s.n()));
+
+    let mut eager = Iteration::new(&stream, &s);
+    let start = eager.bits(&stream);
+    let want: Vec<_> = (0..4)
+        .map(|_| {
+            record(|ctx| eager.run(ctx, &k, &views, &counts))
+                .sync_on(&stream)
+                .unwrap();
+            eager.bits(&stream)
+        })
+        .collect();
+    assert!(
+        want.iter()
+            .flatten()
+            .flatten()
+            .all(|&b| f32::from_bits(b).is_finite()),
+        "eager state went non-finite"
+    );
+    assert!(
+        want[0][0] != want[1][0],
+        "a second iteration must move the object"
+    );
+
+    let mut it = Iteration::new(&stream, &s);
+    let side = k.context().new_stream().unwrap();
+    let graph =
+        CudaGraph::capture(side.clone(), record(|ctx| it.run(ctx, &k, &views, &counts))).unwrap();
+    assert!(
+        it.bits(&stream) == start,
+        "capture must not execute the work"
+    );
+    for (replay, want) in want[..2].iter().enumerate() {
+        graph.launch().sync_on(&side).unwrap();
+        assert!(
+            it.bits(&stream) == *want,
+            "replay {replay} differs from eager"
+        );
+    }
+
+    // A replay holds its accesses until it completes: another stream can neither write
+    // `obj`, which the graph reads, nor read `icalc`, which it only writes.
+    let replay = ExecutionContext::new(side.clone());
+    // SAFETY: `replay` keeps the launch's leases until `side` is synchronized below, and
+    // those leases refuse every other access to the buffers until then.
+    unsafe { graph.launch().execute(&replay) }.unwrap();
+    let other = ExecutionContext::new(stream.clone());
+    let not_ready = cuda_core::sys::cudaError_enum_CUDA_ERROR_NOT_READY;
+    let refused = k.scale_c32(&other, &mut it.obj, 1, 1.0);
+    assert!(
+        matches!(refused, Err(Error::Device(DeviceError::Driver(DriverError(e)))) if e == not_ready),
+        "{refused:?}"
+    );
+    let refused = it.icalc.to_host_vec(&stream);
+    assert!(
+        matches!(refused, Err(DriverError(e)) if e == not_ready),
+        "{refused:?}"
+    );
+    side.synchronize().unwrap();
+    drop(replay);
+    assert!(
+        it.bits(&stream) == want[2],
+        "in-flight replay differs from eager"
+    );
+
+    // After the replays, the buffers are ordinary eager buffers again.
+    record(|ctx| it.run(ctx, &k, &views, &counts))
+        .sync_on(&stream)
+        .unwrap();
+    assert!(
+        it.bits(&stream) == want[3],
+        "eager run after replays differs"
+    );
 }

@@ -1639,6 +1639,7 @@ name = "ptyrs-gpu"
 version = "0.0.1"
 dependencies = [
  "cuda-artifact-finalizer",
+ "cuda-async",
  "cuda-core",
  "libloading",
  "nvjitlink-sys",
