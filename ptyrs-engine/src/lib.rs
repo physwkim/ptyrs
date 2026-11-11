@@ -4,7 +4,8 @@
 //! The operators follow PyNX `ptycho/cpu_operator.py` (far field, no background, no
 //! multibeam, no direct-beam frames) and run in `f64` / complex `f64` in one fixed order; rPIE
 //! follows pty-chi `reconstructors/pie.py`. [`Ptycho`] chains them into AP, DM and rPIE. A
-//! [`Plan`] runs a sequence of those loops on either backend.
+//! [`Plan`] runs a sequence of those loops on either backend. Their linear operators are
+//! admitted as [`LinearOp`]s through [`register`]'s dot test.
 //!
 //! Contract shared by every operator (the GPU kernels implement the same one):
 //! - An exit-wave stack `psi` is `[nview, ny, nx]` with view `k` taken from the
@@ -19,6 +20,7 @@
 
 mod fft;
 mod gpu;
+mod linop;
 mod obs;
 mod ops;
 mod plan;
@@ -27,6 +29,7 @@ pub mod sim;
 
 pub use fft::Fft2;
 pub use gpu::{GpuOptions, GpuPtycho};
+pub use linop::{DOT_TOL, FarField, LinearOp, ObjectToPsi, ProbeToPsi, Registered, register};
 pub use obs::{Observed, shift};
 pub use ops::{
     Llk, accumulate_obj, accumulate_probe, apply_amplitude, llk, obj_probe_to_psi,

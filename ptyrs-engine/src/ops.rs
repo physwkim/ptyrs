@@ -263,10 +263,7 @@ mod tests {
     use ptyrs_core::{AddrTable, Counts, MASKED, Positions};
 
     use super::*;
-
-    fn dot(a: &[C64], b: &[C64]) -> C64 {
-        a.iter().zip(b).map(|(x, y)| x * y.conj()).sum()
-    }
+    use crate::{ObjectToPsi, ProbeToPsi, register};
 
     fn wave(n: usize, seed: f64) -> Vec<C64> {
         (0..n)
@@ -299,21 +296,23 @@ mod tests {
     }
 
     #[test]
-    fn back_projections_are_adjoints_of_obj_probe_to_psi() {
+    fn back_projections_register_as_adjoints_of_obj_probe_to_psi() {
         let (addr, o, p, q) = setup();
         let views = addr.views();
-        let psi_r = wave(views.len() * 48, 4.4);
-        let mut a = vec![C64::default(); psi_r.len()];
-        obj_probe_to_psi(views, &o, &p, &q, &mut a);
-        let lhs = dot(&a, &psi_r);
-        // object-linear: <A_P O, r> = <O, A_P* r>
-        let (num, _) = accumulate_obj(views, o.dims(), &p, &q, &psi_r);
-        let rhs = dot(o.as_slice(), num.as_slice());
-        assert!((lhs - rhs).norm() < 1e-12 * lhs.norm(), "{lhs} vs {rhs}");
-        // probe-linear: <A_O P, r> = <P, A_O* r>
-        let (num, _) = accumulate_probe(views, &o, p.dims(), &q, &psi_r);
-        let rhs = dot(p.as_slice(), num.as_slice());
-        assert!((lhs - rhs).norm() < 1e-12 * lhs.norm(), "{lhs} vs {rhs}");
+        register(ObjectToPsi {
+            views,
+            obj_dims: o.dims(),
+            probe: &p,
+            quad: &q,
+        })
+        .unwrap();
+        register(ProbeToPsi {
+            views,
+            object: &o,
+            probe_dims: p.dims(),
+            quad: &q,
+        })
+        .unwrap();
     }
 
     #[test]
