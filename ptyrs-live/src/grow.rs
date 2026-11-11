@@ -232,7 +232,7 @@ mod tests {
     use std::ffi::c_void;
     use std::time::Instant;
 
-    use cuda_core::launch_kernel_on_stream;
+    use cuda_core::{Function, launch_kernel_on_stream};
 
     use super::*;
     use crate::consumer::Graph;
@@ -273,20 +273,23 @@ DONE:
     ret;
 }
 
-// One thread re-reads buf[0..n) for `ns` nanoseconds, then stores the sum of
-// buf[0..n) to out[0]. %globaltimer, not the per-SM %clock64: a preempted
-// kernel may resume on an SM whose clock is far behind the one it started on.
-.visible .entry spin_sum(.param .u64 buf, .param .u32 n, .param .u64 ns, .param .u64 out)
+// One thread sets gate[1], then re-reads buf[0..n) until the host sets
+// gate[0] or 20 s pass, then stores the sum of buf[0..n) to out[0] and
+// whether it was released to out[1]. gate is pinned host memory.
+.visible .entry hold_sum(.param .u64 buf, .param .u32 n, .param .u64 gate, .param .u64 out)
 {
-    .reg .pred p;
-    .reg .b32 r<8>;
+    .reg .pred p, q;
+    .reg .b32 r<9>;
     .reg .b64 rd<10>;
     ld.param.u64 rd1, [buf];
     ld.param.u32 r1, [n];
-    ld.param.u64 rd2, [ns];
+    ld.param.u64 rd2, [gate];
     ld.param.u64 rd3, [out];
     cvta.to.global.u64 rd1, rd1;
+    cvta.to.global.u64 rd2, rd2;
     cvta.to.global.u64 rd3, rd3;
+    mov.u32 r7, 1;
+    st.volatile.global.u32 [rd2+4], r7;
     mov.u64 rd4, %globaltimer;
     mov.u32 r2, 0;
     mov.u32 r3, 0;
@@ -298,10 +301,15 @@ SPIN:
     add.u32 r2, r2, 1;
     setp.ge.u32 p, r2, r1;
     @p mov.u32 r2, 0;
+    ld.volatile.global.u32 r8, [rd2];
+    setp.ne.u32 q, r8, 0;
+    @q bra SUMS;
     mov.u64 rd7, %globaltimer;
     sub.s64 rd8, rd7, rd4;
-    setp.lt.s64 p, rd8, rd2;
+    setp.lt.s64 p, rd8, 20000000000;
     @p bra SPIN;
+SUMS:
+    selp.u32 r7, 1, 0, q;
     mov.u32 r5, 0;
     mov.u32 r6, 0;
 SUM:
@@ -315,7 +323,7 @@ SUM:
     bra SUM;
 END:
     st.global.u32 [rd3], r6;
-    st.global.u32 [rd3+4], r3;
+    st.global.u32 [rd3+4], r7;
     ret;
 }
 
@@ -401,6 +409,38 @@ RDONE:
         crate::consumer::memset32(dst, v, n, s).unwrap();
     }
 
+    /// `hold_sum` running on a stream until [`Hold::release`]. Released by
+    /// the host, not by a timer, so a driver call delayed by other processes
+    /// on the GPU cannot outlast it; only a call that waits for it can.
+    struct Hold {
+        gate: PinnedHostBuffer<u32>,
+    }
+
+    impl Hold {
+        fn launch(f: &Function, s: &Stream, buf: CUdeviceptr, n: u32, out: CUdeviceptr) -> Self {
+            let gate = PinnedHostBuffer::<u32>::zeroed(s.context(), 2).unwrap();
+            // Pinned memory has one address for host and device (UVA).
+            let (mut p_buf, mut p_n, mut p_gate, mut p_out) = (buf, n, gate.as_ptr() as u64, out);
+            let mut params = [
+                (&raw mut p_buf).cast::<c_void>(),
+                (&raw mut p_n).cast(),
+                (&raw mut p_gate).cast(),
+                (&raw mut p_out).cast(),
+            ];
+            unsafe { launch_kernel_on_stream(f, (1, 1, 1), (1, 1, 1), 0, s, &mut params) }.unwrap();
+            let t = Instant::now();
+            while unsafe { std::ptr::read_volatile(gate.as_ptr().add(1)) } == 0 {
+                assert!(t.elapsed().as_secs() < 30, "hold_sum did not start");
+                std::thread::yield_now();
+            }
+            Self { gate }
+        }
+
+        fn release(&self) {
+            unsafe { std::ptr::write_volatile(self.gate.as_ptr().cast_mut(), 1) }
+        }
+    }
+
     #[test]
     fn growth_keeps_the_address_and_the_mapped_bytes() {
         let ctx = ctx();
@@ -443,14 +483,14 @@ RDONE:
         assert!(!b.is_mapped(cap - 4..cap));
     }
 
-    /// Chunks are mapped while a kernel keeps reading the mapped part; the
-    /// mapping must not wait for the kernel, and the kernel's reads stay
-    /// correct.
+    /// Chunks are mapped while a running kernel keeps reading the mapped
+    /// part; the mapping must not wait for the kernel, and the kernel's reads
+    /// stay correct.
     #[test]
     fn mapping_does_not_wait_for_a_kernel_reading_the_buffer() {
         let ctx = ctx();
         let m = ctx.load_module_from_ptx_src(PTX).unwrap();
-        let spin = m.load_function("spin_sum").unwrap();
+        let hold = m.load_function("hold_sum").unwrap();
         let s = ctx.new_stream().unwrap();
         let mut b = GrowBuf::new(&ctx, 256 << 20, 2 << 20).unwrap();
         let ck = b.chunk_bytes();
@@ -461,31 +501,22 @@ RDONE:
         let mut out = GrowBuf::new(&ctx, 1, 1).unwrap();
         out.map(0..8).unwrap();
         let done = ctx.new_event_with_flags(None).unwrap();
-        let (mut p_buf, mut p_n, mut p_ns, mut p_out) =
-            (b.ptr(), n as u32, 400_000_000u64, out.ptr());
-        let mut params = [
-            (&raw mut p_buf).cast::<c_void>(),
-            (&raw mut p_n).cast(),
-            (&raw mut p_ns).cast(),
-            (&raw mut p_out).cast(),
-        ];
-        let t = Instant::now();
-        unsafe { launch_kernel_on_stream(&spin, (1, 1, 1), (1, 1, 1), 0, &s, &mut params) }
-            .unwrap();
+        let h = Hold::launch(&hold, &s, b.ptr(), n as u32, out.ptr());
         done.record(&s).unwrap();
+        let t = Instant::now();
         let fresh = b.map(ck..b.capacity()).unwrap();
         let map_ms = t.elapsed().as_secs_f64() * 1e3;
         let running = !done.query().unwrap();
+        h.release();
         s.synchronize().unwrap();
-        let kernel_ms = t.elapsed().as_secs_f64() * 1e3;
         eprintln!(
-            "grow: mapped {} MiB in {map_ms:.1} ms while the kernel ran {kernel_ms:.1} ms",
+            "grow: mapped {} MiB in {map_ms:.1} ms under a running kernel",
             fresh[0].len() >> 20
         );
         assert_eq!(fresh, vec![ck..b.capacity()]);
         assert!(running, "mapping returned only after the kernel finished");
         let want = vals.iter().fold(0u32, |a, &v| a.wrapping_add(v));
-        assert_eq!(dtoh(out.ptr(), 1)[0], want);
+        assert_eq!(dtoh(out.ptr(), 2), vec![want, 1]);
         let tail: Vec<u32> = (0..1024).collect();
         let at = b.ptr() + (b.capacity() - 4096) as u64;
         htod(at, &tail);
@@ -534,14 +565,14 @@ RDONE:
 
     /// Records are pushed in uneven batches across chunk boundaries while one
     /// graph, captured before the first push, sums every new record. A kernel
-    /// queued ahead on the same stream outlasts all the pushes: none waits
-    /// for it.
+    /// running ahead on the same stream is held until all the pushes return:
+    /// none waits for it.
     #[test]
     fn a_table_grows_while_one_graph_reads_it() {
         let ctx = ctx();
         let m = ctx.load_module_from_ptx_src(PTX).unwrap();
-        let (spin, sum, adv) = (
-            m.load_function("spin_sum").unwrap(),
+        let (hold, sum, adv) = (
+            m.load_function("hold_sum").unwrap(),
             m.load_function("rec_sum").unwrap(),
             m.load_function("advance").unwrap(),
         );
@@ -569,21 +600,12 @@ RDONE:
         })
         .unwrap();
 
-        // Spin 0.4 s on a mapped chunk of its own, ahead of every push.
+        // Hold the stream on a mapped chunk of its own, ahead of every push.
         let mut scratch = GrowBuf::new(&ctx, 1, 1).unwrap();
         scratch.map(0..4096).unwrap();
-        let (mut p_buf, mut p_n, mut p_ns, mut p_sout) =
-            (scratch.ptr(), 1000u32, 400_000_000u64, scratch.ptr() + 4000);
-        let mut spin_params = [
-            (&raw mut p_buf).cast::<c_void>(),
-            (&raw mut p_n).cast(),
-            (&raw mut p_ns).cast(),
-            (&raw mut p_sout).cast(),
-        ];
-        unsafe { launch_kernel_on_stream(&spin, (1, 1, 1), (1, 1, 1), 0, &s, &mut spin_params) }
-            .unwrap();
-        let spun = ctx.new_event_with_flags(None).unwrap();
-        spun.record(&s).unwrap();
+        let h = Hold::launch(&hold, &s, scratch.ptr(), 1000, scratch.ptr() + 4000);
+        let held = ctx.new_event_with_flags(None).unwrap();
+        held.record(&s).unwrap();
 
         let rec = |i: usize| {
             let i = i as u32;
@@ -602,10 +624,16 @@ RDONE:
             graph.launch(&s).unwrap();
         }
         let push_ms = t0.elapsed().as_secs_f64() * 1e3;
-        let spinning = !spun.query().unwrap();
+        let holding = !held.query().unwrap();
+        h.release();
         s.synchronize().unwrap();
-        eprintln!("grow: {k} pushes of {total} records in {push_ms:.1} ms behind a 400 ms kernel");
-        assert!(spinning, "a push waited for the kernel ahead of it");
+        eprintln!("grow: {k} pushes of {total} records in {push_ms:.1} ms behind a running kernel");
+        assert!(holding, "a push waited for the kernel ahead of it");
+        assert_eq!(
+            dtoh(scratch.ptr() + 4004, 1),
+            vec![1],
+            "the held kernel timed out"
+        );
         let got = dtoh(out.ptr(), total);
         let bad = (0..total)
             .filter(|&i| got[i] != rec(i).iter().fold(0u32, |a, &v| a.wrapping_add(v)))
