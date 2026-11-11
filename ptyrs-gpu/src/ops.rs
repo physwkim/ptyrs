@@ -186,6 +186,22 @@ impl Views {
     pub fn dims(&self) -> &ViewDims {
         &self.dims
     }
+
+    /// The `nframe * nmode` view records, view `k` at index `k`.
+    pub fn addr(&self) -> &DeviceBuffer<ViewAddr> {
+        &self.addr
+    }
+
+    /// `ntiles + 1` CSR offsets into [`Self::tile_views`]; object tile `ty * ntx + tx`
+    /// covers `OBJ_TILE` pixels per side, `ntx = nxo.div_ceil(OBJ_TILE)`.
+    pub fn tile_start(&self) -> &DeviceBuffer<u32> {
+        &self.tile_start
+    }
+
+    /// Per object tile, the ascending indices of the views whose samples may touch it.
+    pub fn tile_views(&self) -> &DeviceBuffer<u32> {
+        &self.tile_views
+    }
 }
 
 /// Object tiles (of `OBJ_TILE` pixels per side) that a view's samples may touch along one
