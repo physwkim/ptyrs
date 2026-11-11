@@ -122,16 +122,25 @@ pub(crate) fn verify_reads(ctxs: &[Arc<Context>]) -> Result<(), DistError> {
         .zip(&streams)
         .map(|(c, s)| DeviceBuffer::from_host(s, &pattern(c.ordinal(), PROBE_WORDS)))
         .collect::<Result<Vec<_>, _>>()?;
-    let mut bad = Vec::new();
+    let mut reads = Vec::new();
     for (a, s) in streams.iter().enumerate() {
         for b in (0..ctxs.len()).filter(|&b| b != a) {
-            let (owner, reader) = (ctxs[b].ordinal(), ctxs[a].ordinal());
             // SAFETY: access a -> b is enabled.
-            if !unsafe { pull_matches(&kernels[a], s, &src[b], owner, PROBE_WORDS)? } {
-                bad.push((reader, owner));
-            }
+            let got = unsafe { pull_words(&kernels[a], s, &src[b], PROBE_WORDS)? };
+            reads.push((ctxs[a].ordinal(), ctxs[b].ordinal(), got));
         }
     }
+    read_faults(&reads)
+}
+
+/// `PeerReadFault` naming every (reader, owner) of `reads` whose readback is not the owner's
+/// [`pattern`].
+fn read_faults(reads: &[(usize, usize, Vec<u32>)]) -> Result<(), DistError> {
+    let bad: Vec<_> = reads
+        .iter()
+        .filter(|(_, owner, got)| !arrived(got, *owner))
+        .map(|&(reader, owner, _)| (reader, owner))
+        .collect();
     if bad.is_empty() {
         Ok(())
     } else {
@@ -139,18 +148,22 @@ pub(crate) fn verify_reads(ctxs: &[Arc<Context>]) -> Result<(), DistError> {
     }
 }
 
-/// The device of `stream` loads the first `words` words of `src` with a kernel and compares
-/// them with `owner`'s [`pattern`].
+/// Whether `got` is `owner`'s [`pattern`].
+fn arrived(got: &[u32], owner: usize) -> bool {
+    got == pattern(owner, got.len())
+}
+
+/// The device of `stream` loads the first `words` words of `src` with a kernel; returns what
+/// it loaded.
 ///
 /// # Safety
 /// Access from the device of `stream` to the device holding `src` must be enabled.
-unsafe fn pull_matches(
+unsafe fn pull_words(
     kernels: &Kernels,
     stream: &Stream,
     src: &DeviceBuffer<u32>,
-    owner: usize,
     words: usize,
-) -> Result<bool, DistError> {
+) -> Result<Vec<u32>, DistError> {
     assert!(words <= src.len() && words.is_multiple_of(4));
     let dst = DeviceBuffer::<u32>::zeroed(stream, words)?;
     // SAFETY: both buffers hold at least `words` words; the caller enabled access.
@@ -163,18 +176,17 @@ unsafe fn pull_matches(
             64,
         )?
     };
-    Ok(dst.to_host_vec(stream)? == pattern(owner, words))
+    Ok(dst.to_host_vec(stream)?)
 }
 
 /// The copy engine of the device holding `src` pushes its first `words` words into a new
-/// buffer on the device of `dst_stream`, and the result is compared with `owner`'s [`pattern`].
-fn push_matches(
+/// buffer on the device of `dst_stream`; returns what arrived.
+fn push_words(
     src_stream: &Stream,
     dst_stream: &Stream,
     src: &DeviceBuffer<u32>,
-    owner: usize,
     words: usize,
-) -> Result<bool, DistError> {
+) -> Result<Vec<u32>, DistError> {
     assert!(words <= src.len());
     let dst = DeviceBuffer::<u32>::zeroed(dst_stream, words)?;
     // SAFETY: both buffers hold at least `words` words in their own contexts.
@@ -190,7 +202,7 @@ fn push_matches(
         .result()?
     };
     src_stream.synchronize()?;
-    Ok(dst.to_host_vec(dst_stream)? == pattern(owner, words))
+    Ok(dst.to_host_vec(dst_stream)?)
 }
 
 /// What [`bench`] found for one ordered pair: data moves from device `src` to device `dst`.
@@ -222,6 +234,36 @@ pub struct Timings {
     pub pull_gbps: f64,
     /// One dependent 8-byte load by `dst` from `src`'s memory (pointer chase), µs.
     pub load_latency_us: f64,
+}
+
+/// Readbacks of a pair's bulk traffic.
+struct Bulk {
+    copied: Vec<u32>,
+    pulled: Vec<u32>,
+    /// Where the pointer chase stopped, and where it stops when every hop arrives intact.
+    chase_end: u64,
+    chase_want: u64,
+}
+
+/// Outcome of a pair moving `owner`'s [`pattern`], from what it read back. `bulk` carries the
+/// bulk traffic and returns its readbacks and timings; it runs only when both probe
+/// readbacks (engine copy, SM pull) arrived intact.
+fn classify(
+    owner: usize,
+    probe: [&[u32]; 2],
+    bulk: impl FnOnce() -> Result<(Bulk, Timings), DistError>,
+) -> Result<Outcome, DistError> {
+    if !probe.iter().all(|got| arrived(got, owner)) {
+        return Ok(Outcome::ProbeFailed);
+    }
+    let (b, t) = bulk()?;
+    Ok(
+        if arrived(&b.copied, owner) && arrived(&b.pulled, owner) && b.chase_end == b.chase_want {
+            Outcome::Intact(t)
+        } else {
+            Outcome::Corrupt(t)
+        },
+    )
 }
 
 const LATENCY_COPIES: u32 = 1000;
@@ -285,103 +327,98 @@ pub fn bench(ctxs: &[Arc<Context>], bytes: usize, reps: u32) -> Result<Vec<PairR
             cuda_core::peer::enable_peer_access(b, a)?;
             let (ss, ds) = (&streams[i], &streams[j]);
             let probe = words.min(PROBE_WORDS);
+            let pushed = push_words(ss, ds, &src[i], probe)?;
             // SAFETY: access j -> i is enabled.
-            if !(push_matches(ss, ds, &src[i], a.ordinal(), probe)?
-                && unsafe { pull_matches(&kernels[j], ds, &src[i], a.ordinal(), probe)? })
-            {
-                out.push(PairResult {
-                    src: a.ordinal(),
-                    dst: b.ordinal(),
-                    outcome: Outcome::ProbeFailed,
-                });
-                continue;
-            }
-            let want = pattern(a.ordinal(), words);
-            let peer_copy = |n: usize| {
-                // SAFETY: both buffers hold `words >= n / 4` words in their own contexts.
-                unsafe {
-                    sys::cuMemcpyPeerAsync(
-                        dst[j].cu_deviceptr(),
-                        b.cu_ctx(),
-                        src[i].cu_deviceptr(),
-                        a.cu_ctx(),
-                        n,
-                        ss.cu_stream(),
-                    )
-                    .result()
-                }
-            };
+            let pulled = unsafe { pull_words(&kernels[j], ds, &src[i], probe)? };
+            let outcome = classify(a.ordinal(), [&pushed, &pulled], || {
+                let peer_copy = |n: usize| {
+                    // SAFETY: both buffers hold `words >= n / 4` words in their own contexts.
+                    unsafe {
+                        sys::cuMemcpyPeerAsync(
+                            dst[j].cu_deviceptr(),
+                            b.cu_ctx(),
+                            src[i].cu_deviceptr(),
+                            a.cu_ctx(),
+                            n,
+                            ss.cu_stream(),
+                        )
+                        .result()
+                    }
+                };
 
-            peer_copy(bytes)?;
-            let copy_ms = timed(ss, || {
-                for _ in 0..reps {
-                    peer_copy(bytes)?;
-                }
-                Ok(())
-            })?;
-            let copy_ok = dst[j].to_host_vec(ds)? == want;
-            let lat_ms = timed(ss, || {
-                for _ in 0..LATENCY_COPIES {
-                    peer_copy(4)?;
-                }
-                Ok(())
-            })?;
+                peer_copy(bytes)?;
+                let copy_ms = timed(ss, || {
+                    for _ in 0..reps {
+                        peer_copy(bytes)?;
+                    }
+                    Ok(())
+                })?;
+                let copied = dst[j].to_host_vec(ds)?;
+                let lat_ms = timed(ss, || {
+                    for _ in 0..LATENCY_COPIES {
+                        peer_copy(4)?;
+                    }
+                    Ok(())
+                })?;
 
-            let mut d = DeviceBuffer::<u32>::zeroed(ds, words)?;
-            let pull = |d: &mut DeviceBuffer<u32>| {
-                // SAFETY: both buffers hold `words` words; access j -> i is enabled.
-                unsafe {
-                    kernels[j].copy(
+                let mut d = DeviceBuffer::<u32>::zeroed(ds, words)?;
+                let pull = |d: &mut DeviceBuffer<u32>| {
+                    // SAFETY: both buffers hold `words` words; access j -> i is enabled.
+                    unsafe {
+                        kernels[j].copy(
+                            ds,
+                            d.cu_deviceptr(),
+                            src[i].cu_deviceptr(),
+                            (bytes / 16) as u64,
+                            PULL_BLOCKS,
+                        )
+                    }
+                };
+                pull(&mut d)?;
+                let pulled = d.to_host_vec(ds)?;
+                d.zero_async(ds)?;
+                let pull_ms = timed(ds, || {
+                    for _ in 0..reps {
+                        pull(&mut d)?;
+                    }
+                    Ok(())
+                })?;
+
+                let base = chain[i].cu_deviceptr();
+                // SAFETY: `chain[i]` holds CHASE_SLOTS * CHASE_STRIDE bytes on device i,
+                // `ends[j]` one u64 on device j.
+                let chase = || unsafe {
+                    kernels[j].chase(
                         ds,
-                        d.cu_deviceptr(),
-                        src[i].cu_deviceptr(),
-                        (bytes / 16) as u64,
-                        PULL_BLOCKS,
+                        base,
+                        chain[i].num_bytes() as u64,
+                        CHASE_HOPS,
+                        ends[j].cu_deviceptr(),
                     )
-                }
-            };
-            pull(&mut d)?;
-            let pull_ok = d.to_host_vec(ds)? == want;
-            d.zero_async(ds)?;
-            let pull_ms = timed(ds, || {
-                for _ in 0..reps {
-                    pull(&mut d)?;
-                }
-                Ok(())
+                };
+                chase()?;
+                let chase_ms = timed(ds, chase)?;
+                let chase_end = ends[j].to_host_vec(ds)?[0];
+
+                let gbps = |ms: f32| (bytes as f64 * reps as f64) / (ms as f64 * 1e-3) / 1e9;
+                let bulk = Bulk {
+                    copied,
+                    pulled,
+                    chase_end,
+                    chase_want: base + (CHASE_HOPS as usize % CHASE_SLOTS * CHASE_STRIDE) as u64,
+                };
+                let timings = Timings {
+                    copy_gbps: gbps(copy_ms),
+                    copy_latency_us: lat_ms as f64 * 1e3 / LATENCY_COPIES as f64,
+                    pull_gbps: gbps(pull_ms),
+                    load_latency_us: chase_ms as f64 * 1e3 / CHASE_HOPS as f64,
+                };
+                Ok((bulk, timings))
             })?;
-
-            let base = chain[i].cu_deviceptr();
-            // SAFETY: `chain[i]` holds CHASE_SLOTS * CHASE_STRIDE bytes on device i, `ends[j]`
-            // one u64 on device j.
-            let chase = || unsafe {
-                kernels[j].chase(
-                    ds,
-                    base,
-                    chain[i].num_bytes() as u64,
-                    CHASE_HOPS,
-                    ends[j].cu_deviceptr(),
-                )
-            };
-            chase()?;
-            let chase_ms = timed(ds, chase)?;
-            let end = base + (CHASE_HOPS as usize % CHASE_SLOTS * CHASE_STRIDE) as u64;
-            let chase_ok = ends[j].to_host_vec(ds)? == [end];
-
-            let gbps = |ms: f32| (bytes as f64 * reps as f64) / (ms as f64 * 1e-3) / 1e9;
-            let timings = Timings {
-                copy_gbps: gbps(copy_ms),
-                copy_latency_us: lat_ms as f64 * 1e3 / LATENCY_COPIES as f64,
-                pull_gbps: gbps(pull_ms),
-                load_latency_us: chase_ms as f64 * 1e3 / CHASE_HOPS as f64,
-            };
             out.push(PairResult {
                 src: a.ordinal(),
                 dst: b.ordinal(),
-                outcome: if copy_ok && pull_ok && chase_ok {
-                    Outcome::Intact(timings)
-                } else {
-                    Outcome::Corrupt(timings)
-                },
+                outcome,
             });
         }
     }
@@ -474,6 +511,104 @@ DONE:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const OWNER: usize = 2;
+    const WORDS: usize = 64;
+
+    fn timings() -> Timings {
+        Timings {
+            copy_gbps: 1.0,
+            copy_latency_us: 2.0,
+            pull_gbps: 3.0,
+            load_latency_us: 4.0,
+        }
+    }
+
+    /// The fault the read checks exist for: an IOMMU without the peer mapping loads all-ones.
+    fn all_ones() -> Vec<u32> {
+        vec![u32::MAX; WORDS]
+    }
+
+    fn one_flipped() -> Vec<u32> {
+        let mut v = pattern(OWNER, WORDS);
+        v[WORDS / 2] ^= 1;
+        v
+    }
+
+    /// A buffer still holding the previous source's data.
+    fn stale() -> Vec<u32> {
+        pattern(OWNER + 1, WORDS)
+    }
+
+    fn bulk(copied: Vec<u32>, pulled: Vec<u32>, chase_end: u64) -> Bulk {
+        Bulk {
+            copied,
+            pulled,
+            chase_end,
+            chase_want: 7,
+        }
+    }
+
+    #[test]
+    fn intact_readbacks_keep_their_timings() {
+        let good = pattern(OWNER, WORDS);
+        let o = classify(OWNER, [&good, &good], || {
+            Ok((bulk(good.clone(), good.clone(), 7), timings()))
+        })
+        .unwrap();
+        assert!(matches!(o, Outcome::Intact(t) if t.copy_gbps == 1.0 && t.load_latency_us == 4.0));
+    }
+
+    #[test]
+    fn a_corrupt_probe_fails_without_bulk_traffic() {
+        let good = pattern(OWNER, WORDS);
+        for bad in [all_ones(), one_flipped(), stale()] {
+            let (good, bad) = (good.as_slice(), bad.as_slice());
+            for probe in [[bad, good], [good, bad]] {
+                let o = classify(OWNER, probe, || {
+                    unreachable!("bulk ran after a corrupt probe")
+                })
+                .unwrap();
+                assert!(matches!(o, Outcome::ProbeFailed), "{o:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn corrupt_bulk_traffic_is_reported_with_its_timings() {
+        let good = pattern(OWNER, WORDS);
+        let cases = [
+            bulk(all_ones(), good.clone(), 7),
+            bulk(one_flipped(), good.clone(), 7),
+            bulk(good.clone(), all_ones(), 7),
+            bulk(good.clone(), stale(), 7),
+            bulk(good.clone(), good.clone(), 6),
+        ];
+        for b in cases {
+            let o = classify(OWNER, [&good, &good], || Ok((b, timings()))).unwrap();
+            assert!(
+                matches!(o, Outcome::Corrupt(t) if t.pull_gbps == 3.0),
+                "{o:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn read_faults_names_every_corrupt_reader_owner_pair() {
+        let reads = [
+            (0, 1, pattern(1, WORDS)),
+            (1, 0, all_ones()),
+            (2, 3, pattern(3, WORDS)),
+            (3, 2, one_flipped()),
+            (0, 3, pattern(1, WORDS)),
+        ];
+        assert!(read_faults(&reads[..1]).is_ok());
+        let err = read_faults(&reads).unwrap_err();
+        assert!(
+            matches!(&err, DistError::PeerReadFault(bad) if *bad == [(1, 0), (3, 2), (0, 3)]),
+            "{err}"
+        );
+    }
 
     #[test]
     fn bench_times_every_ordered_pair_and_checks_the_data() {
