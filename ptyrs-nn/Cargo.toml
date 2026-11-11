@@ -25,3 +25,8 @@ thiserror = { workspace = true }
 [build-dependencies]
 cudarc = { version = "0.19.10", default-features = false, features = ["cuda-13040"] }
 
+
+[dev-dependencies]
+# Training scans come from the engine's simulator. Only as a dev-dependency: the engine will call
+# the predictor, and invariant 7 keeps the boundary to arrays.
+ptyrs-engine = { path = "../ptyrs-engine" }

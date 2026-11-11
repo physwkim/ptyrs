@@ -5598,6 +5598,7 @@ dependencies = [
  "cudarc",
  "num-complex",
  "ptyrs-core",
+ "ptyrs-engine",
  "rand 0.8.8",
  "rand_chacha 0.3.1",
  "thiserror 2.0.21",
