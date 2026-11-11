@@ -1,5 +1,5 @@
-//! Pinned host ring of cropped frames and the thread that streams it to the
-//! GPU.
+//! Pinned host ring of cropped frames and the thread that streams it into
+//! the device store.
 //!
 //! Sequence numbers are handed out by [`Ring::reserve`]; a slot is written
 //! only by the holder of its reservation and becomes visible to the uploader
@@ -7,14 +7,22 @@
 //! `released`, and advances it only after the event recorded behind that
 //! slot's H2D copy has completed, so a worker never overwrites host memory
 //! the copy engine may still be reading.
+//!
+//! On the device every sequence number has its own place in a
+//! [`DeviceStore`], so an uploaded frame is never overwritten (invariant 3)
+//! and its address is fixed before the first frame (invariant 9).
 
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use cuda_core::{Context, DeviceBuffer, DriverError, Event, PinnedHostBuffer};
+use crossbeam_channel::Sender;
+use cuda_bindings::CUdeviceptr;
+use cuda_core::{Context, DriverError, Event, IntoResult, PinnedHostBuffer};
 
+use crate::grow::{GrowBuf, GrowError};
 use crate::stats::{Histogram, thread_cpu_ns, wall_ns};
 
 #[derive(Default)]
@@ -139,11 +147,138 @@ impl Ring {
         self.pos.as_slice()
     }
 
-    /// `(uid, ever written)` of slot `i`, for end-of-run checks.
-    pub fn slot_uid(&self, i: usize) -> Option<i32> {
-        (self.done[i].load(Ordering::Acquire) != 0)
-            .then(|| self.meta[i].uid.load(Ordering::Relaxed))
+    /// `(seq, uid)` last committed to slot `i`, for end-of-run checks.
+    pub fn slot(&self, i: usize) -> Option<(u64, i32)> {
+        let d = self.done[i].load(Ordering::Acquire);
+        (d != 0).then(|| (d - 1, self.meta[i].uid.load(Ordering::Relaxed)))
     }
+}
+
+/// Device side of the input: frame `seq` at `frames_ptr() + seq * frame
+/// bytes`, its `(x, y)` as two f64 at `positions_ptr() + seq * 16`. Both
+/// grow in place, `chunk` bytes of frames at a time, up to `max_frames`.
+///
+/// Shared through an `Arc`: whoever holds a pointer into the store holds
+/// the store, so no mapping is released under a reader. Only
+/// [`run_uploader`] maps.
+pub struct DeviceStore {
+    frames_ptr: CUdeviceptr,
+    positions_ptr: CUdeviceptr,
+    frame_elems: usize,
+    max_frames: u64,
+    bufs: Mutex<Bufs>,
+    ctx: Arc<Context>,
+}
+
+struct Bufs {
+    frames: GrowBuf,
+    positions: GrowBuf,
+}
+
+impl DeviceStore {
+    pub fn new(
+        ctx: &Arc<Context>,
+        max_frames: usize,
+        frame_elems: usize,
+        chunk: usize,
+    ) -> Result<Self, DriverError> {
+        let frames = GrowBuf::new(ctx, max_frames * frame_elems * 2, chunk)?;
+        // One granule holds 131072 positions.
+        let positions = GrowBuf::new(ctx, max_frames * 16, 1)?;
+        Ok(Self {
+            frames_ptr: frames.ptr(),
+            positions_ptr: positions.ptr(),
+            frame_elems,
+            max_frames: max_frames as u64,
+            bufs: Mutex::new(Bufs { frames, positions }),
+            ctx: ctx.clone(),
+        })
+    }
+
+    pub fn frames_ptr(&self) -> CUdeviceptr {
+        self.frames_ptr
+    }
+
+    pub fn positions_ptr(&self) -> CUdeviceptr {
+        self.positions_ptr
+    }
+
+    pub fn frame_elems(&self) -> usize {
+        self.frame_elems
+    }
+
+    pub fn max_frames(&self) -> u64 {
+        self.max_frames
+    }
+
+    /// Bytes of device memory backing the store.
+    pub fn mapped_bytes(&self) -> usize {
+        let b = self.bufs.lock().unwrap();
+        b.frames.mapped_bytes() + b.positions.mapped_bytes()
+    }
+
+    /// Backs frames `seqs`; with `ahead`, also one chunk past them, so the
+    /// copy of the next batch rarely waits for a mapping.
+    fn ensure(&self, seqs: Range<u64>, ahead: bool) -> Result<(), GrowError> {
+        let fb = (self.frame_elems * 2) as u64;
+        let mut bufs = self.bufs.lock().unwrap();
+        let Bufs { frames, positions } = &mut *bufs;
+        for (b, stride) in [(frames, fb), (positions, 16)] {
+            let (start, mut end) = ((seqs.start * stride) as usize, (seqs.end * stride) as usize);
+            if ahead {
+                end = (end + b.chunk_bytes()).min(b.capacity().max(end));
+            }
+            b.map(start..end)?;
+        }
+        Ok(())
+    }
+
+    /// Synchronous copy of frames `seqs` to `out`, for checks.
+    pub fn read_frames(&self, seqs: Range<u64>, out: &mut [u16]) -> Result<(), DriverError> {
+        let n = (seqs.end - seqs.start) as usize * self.frame_elems;
+        assert_eq!(out.len(), n);
+        let fb = (self.frame_elems * 2) as u64;
+        let range = (seqs.start * fb) as usize..(seqs.end * fb) as usize;
+        assert!(self.bufs.lock().unwrap().frames.is_mapped(range));
+        self.ctx.bind_to_thread()?;
+        // SAFETY: the source range is mapped (checked above; mappings are only
+        // added while the store lives) and `out` holds its element count.
+        unsafe {
+            cuda_bindings::cuMemcpyDtoH_v2(
+                out.as_mut_ptr().cast(),
+                self.frames_ptr + seqs.start * fb,
+                n * 2,
+            )
+        }
+        .result()
+    }
+
+    /// Synchronous copy of the positions of frames `0..n`, for checks.
+    pub fn read_positions(&self, n: u64) -> Result<Vec<f64>, DriverError> {
+        let mut v = vec![0f64; 2 * n as usize];
+        assert!(
+            self.bufs
+                .lock()
+                .unwrap()
+                .positions
+                .is_mapped(0..16 * n as usize)
+        );
+        self.ctx.bind_to_thread()?;
+        // SAFETY: as in `read_frames`.
+        unsafe {
+            cuda_bindings::cuMemcpyDtoH_v2(v.as_mut_ptr().cast(), self.positions_ptr, v.len() * 8)
+        }
+        .result()?;
+        Ok(v)
+    }
+}
+
+/// Frames `seq0..seq0 + n` are in the [`DeviceStore`]. Batches are sent in
+/// sequence order and without gaps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameBatch {
+    pub seq0: u64,
+    pub n: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -170,24 +305,26 @@ pub struct UploadReport {
     /// Worker commit → H2D completion (batching + copy + poll).
     pub commit_to_gpu: Histogram,
     pub cpu_ns: i64,
-    /// Device ring and positions read back after the last copy.
-    pub device_frames: Vec<u16>,
-    pub device_positions: Vec<f64>,
+    /// uid of every uploaded frame, by sequence number.
+    pub uids: Vec<i32>,
 }
 
-/// Run until `stop` is set and everything reserved has landed on the device.
+/// Run until `stop` is set and everything reserved has landed in `store`;
+/// each landed batch is sent to `batches` if given, which should be
+/// unbounded: a full channel stalls the uploader.
 pub fn run_uploader(
     ring: Arc<Ring>,
     ctx: Arc<Context>,
+    store: Arc<DeviceStore>,
     cfg: UploaderConfig,
     stop: Arc<AtomicBool>,
-) -> Result<UploadReport, DriverError> {
+    batches: Option<Sender<FrameBatch>>,
+) -> Result<UploadReport, GrowError> {
     ctx.bind_to_thread()?;
     let stream = ctx.new_stream()?;
     let slots = ring.slots;
     let se = ring.slot_elems;
-    let dev_frames = DeviceBuffer::<u16>::zeroed(&stream, slots * se)?;
-    let dev_pos = DeviceBuffer::<f64>::zeroed(&stream, slots * 2)?;
+    assert_eq!(store.frame_elems, se);
     let events: Vec<Event> = (0..cfg.events)
         .map(|_| ctx.new_event_with_flags(None))
         .collect::<Result<_, _>>()?;
@@ -202,8 +339,7 @@ pub fn run_uploader(
         pub_to_gpu: Histogram::new(200_000),
         commit_to_gpu: Histogram::new(200_000),
         cpu_ns: 0,
-        device_frames: Vec::new(),
-        device_positions: Vec::new(),
+        uids: Vec::new(),
     };
     let cpu0 = thread_cpu_ns();
     let (mut issued, mut frontier) = (0u64, 0u64);
@@ -223,18 +359,20 @@ pub fn run_uploader(
                 break;
             }
             let n = (pending as usize).min(cfg.batch).min(slots - s0);
+            let seqs = issued..issued + n as u64;
+            store.ensure(seqs.clone(), false)?;
             // SAFETY: slots `s0..s0 + n` are committed and not yet released,
-            // so no worker writes them until the event below completes; both
-            // device buffers cover `slots` slots.
+            // so no worker writes them until the event below completes; the
+            // store backs sequence numbers `issued..issued + n`.
             unsafe {
                 cuda_core::memcpy_htod_async(
-                    dev_frames.cu_deviceptr() + (s0 * se * 2) as u64,
+                    store.frames_ptr() + issued * (se * 2) as u64,
                     ring.frames_ptr.add(s0 * se),
                     n * se,
                     &stream,
                 )?;
                 cuda_core::memcpy_htod_async(
-                    dev_pos.cu_deviceptr() + (s0 * 16) as u64,
+                    store.positions_ptr() + issued * 16,
                     ring.pos_ptr.add(s0 * 2),
                     n * 2,
                     &stream,
@@ -242,6 +380,8 @@ pub fn run_uploader(
             }
             let ev = free.pop().expect("checked non-empty");
             events[ev].record(&stream)?;
+            // Mapping does not wait for the copies just queued.
+            store.ensure(seqs, true)?;
             inflight.push_back((ev, issued, n as u64));
             rep.max_inflight = rep.max_inflight.max(inflight.len());
             issued += n as u64;
@@ -260,9 +400,14 @@ pub fn run_uploader(
                 rep.pub_to_gpu.record(t - m.t_pub.load(Ordering::Relaxed));
                 rep.commit_to_gpu
                     .record(t - m.t_commit.load(Ordering::Relaxed));
+                rep.uids.push(m.uid.load(Ordering::Relaxed));
             }
             rep.frames += n;
             ring.released.store(seq0 + n, Ordering::Release);
+            if let Some(tx) = &batches {
+                // A consumer that has gone away does not stop the input.
+                let _ = tx.send(FrameBatch { seq0, n });
+            }
             inflight.pop_front();
             free.push(ev);
             progressed = true;
@@ -279,23 +424,109 @@ pub fn run_uploader(
         }
     }
     rep.cpu_ns = thread_cpu_ns() - cpu0;
-    rep.device_frames = vec![0u16; slots * se];
-    rep.device_positions = vec![0f64; slots * 2];
-    // SAFETY: the host vectors hold exactly the device buffers' element counts.
-    unsafe {
-        cuda_core::memcpy_dtoh_async(
-            rep.device_frames.as_mut_ptr(),
-            dev_frames.cu_deviceptr(),
-            slots * se,
-            &stream,
-        )?;
-        cuda_core::memcpy_dtoh_async(
-            rep.device_positions.as_mut_ptr(),
-            dev_pos.cu_deviceptr(),
-            slots * 2,
-            &stream,
-        )?;
-    }
-    stream.synchronize()?;
     Ok(rep)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg() -> UploaderConfig {
+        UploaderConfig {
+            batch: 5,
+            flush_ns: 100_000,
+            idle: Duration::from_micros(20),
+            events: 4,
+        }
+    }
+
+    fn produce(ring: &Ring, n: usize) {
+        for _ in 0..n {
+            let mut s = ring.reserve();
+            let seq = s.seq();
+            for (j, v) in s.frame().iter_mut().enumerate() {
+                *v = (seq as usize * 7 + j) as u16;
+            }
+            s.commit(1000 + seq as i32, seq as f64, -(seq as f64), 0, 0);
+        }
+    }
+
+    #[test]
+    fn frames_land_at_their_sequence_number_across_growth() {
+        let ctx = Context::new(0).expect("GPU 0");
+        let (se, total) = (65536, 200u64);
+        // 8 slots wrap 25 times; 25 MiB of frames map 2 MiB at a time.
+        let ring = Arc::new(Ring::new(&ctx, 8, se).unwrap());
+        let store = Arc::new(DeviceStore::new(&ctx, total as usize, se, 1).unwrap());
+        let ptr = store.frames_ptr();
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let up = {
+            let (ring, ctx, stop, store) = (ring.clone(), ctx.clone(), stop.clone(), store.clone());
+            std::thread::spawn(move || run_uploader(ring, ctx, store, cfg(), stop, Some(tx)))
+        };
+        // Four producers commit out of order.
+        std::thread::scope(|sc| {
+            for _ in 0..4 {
+                sc.spawn(|| produce(&ring, total as usize / 4));
+            }
+        });
+        stop.store(true, Ordering::Release);
+        let rep = up.join().unwrap().unwrap();
+
+        assert_eq!(rep.frames, total);
+        assert_eq!(store.bufs.lock().unwrap().frames.ptr(), ptr);
+        let mut next = 0;
+        for b in rx.iter() {
+            assert_eq!(b.seq0, next);
+            next += b.n;
+        }
+        assert_eq!(next, total);
+        let uids: Vec<i32> = (0..total as i32).map(|s| 1000 + s).collect();
+        assert_eq!(rep.uids, uids);
+        let mut dev = vec![0u16; total as usize * se];
+        store.read_frames(0..total, &mut dev).unwrap();
+        for (seq, f) in dev.chunks(se).enumerate() {
+            assert!(
+                f.iter()
+                    .enumerate()
+                    .all(|(j, &v)| v == (seq * 7 + j) as u16),
+                "frame {seq}"
+            );
+        }
+        let pos = store.read_positions(total).unwrap();
+        for seq in 0..total as usize {
+            assert_eq!(
+                (pos[2 * seq], pos[2 * seq + 1]),
+                (seq as f64, -(seq as f64))
+            );
+        }
+        // Mapped one chunk ahead of the last frame, clipped to the capacity.
+        let b = store.bufs.lock().unwrap();
+        assert_eq!(b.frames.mapped_bytes(), b.frames.capacity());
+    }
+
+    #[test]
+    fn a_frame_past_the_store_fails_the_uploader() {
+        let ctx = Context::new(0).expect("GPU 0");
+        let se = 65536;
+        let ring = Arc::new(Ring::new(&ctx, 64, se).unwrap());
+        // 32 frames fill exactly two 2 MiB chunks; the 33rd has no place.
+        let store = Arc::new(DeviceStore::new(&ctx, 32, se, 1).unwrap());
+        let stop = Arc::new(AtomicBool::new(false));
+        let up = {
+            let (ring, ctx, stop) = (ring.clone(), ctx.clone(), stop.clone());
+            std::thread::spawn(move || run_uploader(ring, ctx, store, cfg(), stop, None))
+        };
+        produce(&ring, 33);
+        stop.store(true, Ordering::Release);
+        match up.join().unwrap() {
+            Err(GrowError::Capacity { end, capacity }) => {
+                assert_eq!(capacity, 32 * se * 2);
+                assert!(end > capacity);
+            }
+            Err(e) => panic!("{e}"),
+            Ok(r) => panic!("stored {} frames", r.frames),
+        }
+    }
 }

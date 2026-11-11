@@ -1,380 +1,97 @@
-//! Receiver: PVA monitor of `<prefix>FRAME` and `<prefix>POS` → decode
-//! workers → uniqueId position match → crop → pinned ring → async H2D on
-//! GPU `--gpu`.
+//! Receiver: frames from a PVA monitor of `<prefix>FRAME` or, with
+//! `--source zmq`, an Eiger stream v1 PULL socket, positions from a PVA
+//! monitor of `<prefix>POS`; or, with `--source h5`, frames and positions
+//! from the HDF5 SWMR file `--h5` → decode workers → uniqueId position
+//! match → crop → pinned ring → async H2D on GPU `--gpu` into a device
+//! store indexed by sequence number.
 //!
-//! The monitor callback only parses the NTNDArray head and hands a
-//! zero-copy slice of the body to the workers. Workers reuse one image-sized
-//! scratch each; the ring, its device mirror and the events are allocated
-//! before the first frame.
+//! The source only parses the frame metadata and hands a zero-copy slice
+//! of the received buffer to the workers. Workers reuse one image-sized
+//! scratch each; the ring, the store's address range and the events are
+//! allocated before the first frame, and the store maps device memory in
+//! `--store-chunk-mib` steps as frames arrive. A graph captured once before
+//! the first frame stands in for the engine and checksums every stored
+//! frame, `--graph-batch` frames per replay.
 
 use std::net::SocketAddr;
-use std::ops::Range;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::num::NonZeroUsize;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use bytes::Bytes;
-use crossbeam_channel::{Receiver, TrySendError};
 use cuda_core::Context;
 use epics_pva_rs::client_native::PvaClient;
-use epics_pva_rs::pv_request::PvRequestBuilder;
-use epics_pva_rs::pvdata::FieldDesc;
 use ptyrs_live::args::Args;
-use ptyrs_live::codec::{
-    Bslz4Scratch, Codec, bslz4_decompress_into_u16, bslz4_decompress_range_u16, bytemuck_u16,
-    bytemuck_u16_mut, lz4_decompress_into,
+use ptyrs_live::consumer::{checksum, run_checksum_consumer};
+use ptyrs_live::eiger::{EigerFrames, Progress, PullReport, run_pull};
+use ptyrs_live::handoff::work_queue;
+use ptyrs_live::model::Model;
+use ptyrs_live::pipeline::{
+    Geometry, Placement, SourceStats, Truth, WorkerCfg, WorkerReport, worker,
 };
-use ptyrs_live::ntnd::{FrameLayout, check_position_layout, parse_frame_head, parse_position};
-use ptyrs_live::pos::{Pos, PosTable};
-use ptyrs_live::ring::{Ring, UploaderConfig, run_uploader};
-use ptyrs_live::sched::{parse_cpu_list, pin_current, set_util_min};
-use ptyrs_live::stats::{Histogram, mono_ns, process_cpu_ns, thread_cpu_ns, wall_ns};
-use ptyrs_live::synth::{Region, Synth, SynthScratch, position};
+use ptyrs_live::pos::PosTable;
+use ptyrs_live::pva_source::{NtndFrames, PosStats, monitor_positions};
+use ptyrs_live::ring::{DeviceStore, Ring, UploaderConfig, run_uploader};
+use ptyrs_live::stats::{mono_ns, process_cpu_ns, wall_ns};
+use ptyrs_live::swmr::{SwmrCfg, SwmrReport, run_swmr};
 
-#[derive(Clone, Copy)]
-struct Cfg {
-    width: usize,
-    height: usize,
-    crop: usize,
-    x0: usize,
-    y0: usize,
-    crop_decode: bool,
-    verify_every: i32,
-    pos_wait_ns: i64,
-    synth: Synth,
-}
-
-impl Cfg {
-    fn crop_region(&self) -> Region {
-        Region {
-            x0: self.x0,
-            y0: self.y0,
-            w: self.crop,
-            h: self.crop,
-        }
-    }
-}
-
-struct Work {
-    payload: Bytes,
-    codec: Codec,
-    uid: i32,
-    t_rx: i64,
-    t_pub: i64,
-}
-
-/// Monitor-callback bookkeeping; owned by the callback, read after shutdown.
-#[derive(Default)]
-struct RxState {
-    layout: Option<(usize, FrameLayout)>,
-    codec: Option<Codec>,
-    codec_param: Option<i32>,
-    uncompressed: i64,
-    ts: (i64, i32),
-    seen: Vec<u64>,
-    unique: u64,
-    dup: u64,
-    beyond: u64,
-    last_uid: i64,
-    gap_events: u64,
-    gap_frames: u64,
-    out_of_order: u64,
-    queue_full: u64,
-    rejected: u64,
-    placeholders: u64,
-    first_rx: Option<i64>,
-    last_rx: i64,
-    cpu_first: i64,
-    cpu_sample: (i64, i64),
-    first_error: Option<String>,
-}
-
-impl RxState {
-    fn reject(&mut self, why: String) {
-        self.rejected += 1;
-        self.first_error.get_or_insert(why);
-    }
-}
-
-#[derive(Default)]
-struct WorkerReport {
-    frames: u64,
-    decode_err: u64,
-    pos_missing: u64,
-    pos_waited: u64,
-    pos_mismatch: u64,
-    verified: u64,
-    verify_bad: u64,
-    cpu_ns: i64,
-    decode: Option<Histogram>,
-    /// Frames whose position had already arrived when the frame did.
-    pos_first: u64,
-    /// Frame arrival → position arrival, for the rest.
-    pos_after_frame: Option<Histogram>,
-}
-
-/// Where each receive-path thread runs: the runtime threads share `rt`, the
-/// uploader and every worker get a CPU of their own. Empty without `--cpus`.
-struct Placement {
-    rt: Option<Vec<usize>>,
-    h2d: Option<usize>,
-    workers: Vec<Option<usize>>,
-    util_min: u32,
-}
-
-impl Placement {
-    fn new(cpus: &str, rt_threads: usize, workers: usize, util_min: u32) -> Self {
-        if cpus.is_empty() {
-            return Self {
-                rt: None,
-                h2d: None,
-                workers: vec![None; workers],
-                util_min,
-            };
-        }
-        let c = parse_cpu_list(cpus).unwrap_or_else(|e| panic!("--cpus: {e}"));
-        let need = rt_threads + 1 + workers;
-        assert!(
-            c.len() >= need,
-            "--cpus {cpus}: {need} needed ({rt_threads} runtime, 1 h2d, {workers} workers)"
-        );
-        Self {
-            rt: Some(c[..rt_threads].to_vec()),
-            h2d: Some(c[rt_threads]),
-            workers: c[rt_threads + 1..need].iter().map(|&x| Some(x)).collect(),
-            util_min,
-        }
-    }
-
-    /// Apply to the calling thread.
-    fn enter(&self, cpus: Option<&[usize]>) {
-        if let Some(c) = cpus {
-            pin_current(c).unwrap_or_else(|e| panic!("pin to {c:?}: {e}"));
-        }
-        if self.util_min > 0 {
-            set_util_min(self.util_min).unwrap_or_else(|e| {
-                panic!("uclamp min {}: {e} (--util-min 0 skips it)", self.util_min)
-            });
-        }
-    }
-}
-
-fn worker(rx: Receiver<Work>, ring: Arc<Ring>, pos: Arc<PosTable>, cfg: Cfg) -> WorkerReport {
-    let mut r = WorkerReport {
-        decode: Some(Histogram::new(100_000)),
-        pos_after_frame: Some(Histogram::new(1_000_000)),
-        ..Default::default()
-    };
-    let n = cfg.width * cfg.height;
-    let mut img = vec![0u16; n];
-    let mut bs = Bslz4Scratch::default();
-    let mut ss = SynthScratch::default();
-    let mut vbuf = vec![0u16; cfg.crop * cfg.crop];
-    let rows = cfg.y0 * cfg.width..(cfg.y0 + cfg.crop) * cfg.width;
-    let cpu0 = thread_cpu_ns();
-    'frames: for w in rx.iter() {
-        let t = mono_ns();
-        let res = match w.codec {
-            Codec::None => Ok(()),
-            Codec::Lz4 => lz4_decompress_into(&w.payload, bytemuck_u16_mut(&mut img)),
-            Codec::Bslz4 if cfg.crop_decode => {
-                bslz4_decompress_range_u16(&w.payload, &mut img, &mut bs, rows.clone())
-            }
-            Codec::Bslz4 => bslz4_decompress_into_u16(&w.payload, &mut img, &mut bs),
-        };
-        if res.is_err() {
-            r.decode_err += 1;
-            continue;
-        }
-        let src: &[u8] = match w.codec {
-            Codec::None => &w.payload,
-            _ => bytemuck_u16(&img),
-        };
-        r.decode.as_mut().unwrap().record(mono_ns() - t);
-        let deadline = mono_ns() + cfg.pos_wait_ns;
-        let p = loop {
-            if let Some(p) = pos.get(w.uid) {
-                break p;
-            }
-            if mono_ns() > deadline {
-                r.pos_missing += 1;
-                continue 'frames;
-            }
-            r.pos_waited += 1;
-            std::thread::sleep(Duration::from_micros(20));
-        };
-        match p.t_rx - w.t_rx {
-            lag if lag > 0 => r.pos_after_frame.as_mut().unwrap().record(lag),
-            _ => r.pos_first += 1,
-        }
-        let (x, y) = (p.x, p.y);
-        r.pos_mismatch += ((x, y) != position(w.uid)) as u64;
-        let mut slot = ring.reserve();
-        let dst = bytemuck_u16_mut(slot.frame());
-        let row_bytes = cfg.crop * 2;
-        for (i, d) in dst.chunks_exact_mut(row_bytes).enumerate() {
-            let off = ((cfg.y0 + i) * cfg.width + cfg.x0) * 2;
-            d.copy_from_slice(&src[off..off + row_bytes]);
-        }
-        slot.commit(w.uid, x, y, w.t_rx, w.t_pub);
-        r.frames += 1;
-        if cfg.verify_every > 0 && w.uid % cfg.verify_every == 0 {
-            let s = cfg.synth;
-            s.fill_region(s.pool_index(w.uid), cfg.crop_region(), &mut vbuf, &mut ss);
-            r.verified += 1;
-            let crop_ok = (0..cfg.crop).all(|i| {
-                let off = ((cfg.y0 + i) * cfg.width + cfg.x0) * 2;
-                src[off..off + row_bytes] == *bytemuck_u16(&vbuf[i * cfg.crop..(i + 1) * cfg.crop])
-            });
-            r.verify_bad += (!crop_ok) as u64;
-        }
-    }
-    r.cpu_ns = thread_cpu_ns() - cpu0;
-    r
-}
-
-fn on_frame(
-    st: &mut RxState,
-    desc: &FieldDesc,
-    body: Bytes,
-    order: epics_pva_rs::proto::ByteOrder,
-    tx: &crossbeam_channel::Sender<Work>,
-    cfg: &Cfg,
-) {
-    let t_rx = wall_ns();
-    let key = desc as *const FieldDesc as usize;
-    if st.layout.as_ref().map(|l| l.0) != Some(key) {
-        match FrameLayout::from_desc(desc) {
-            Ok(l) => st.layout = Some((key, l)),
-            Err(e) => return st.reject(e.to_string()),
-        }
-    }
-    let layout = &st.layout.as_ref().unwrap().1;
-    let h = match parse_frame_head(layout, &body, order) {
-        Ok(h) => h,
-        Err(e) => return st.reject(e.to_string()),
-    };
-    let (ubyte, ushort) = (layout.ubyte_sel, layout.ushort_sel);
-    if let Some(c) = h.codec {
-        st.codec = c;
-    }
-    if let Some(p) = h.codec_param {
-        st.codec_param = p;
-    }
-    if let Some(u) = h.uncompressed_size {
-        st.uncompressed = u;
-    }
-    if let Some((s, ns)) = h.data_time_stamp {
-        st.ts = (s.unwrap_or(st.ts.0), ns.unwrap_or(st.ts.1));
-    }
-    let Some(uid) = h.unique_id else {
-        return st.reject("update without uniqueId".into());
-    };
-    if uid < 0 {
-        st.placeholders += 1;
-        return;
-    }
-    let Some((sel, n, range)) = h.value else {
-        return st.reject("update without value".into());
-    };
-    let Some(codec) = st.codec else {
-        return st.reject("unknown codec.name".into());
-    };
-    let image = (cfg.width * cfg.height) as i64;
-    let ok = match codec {
-        Codec::None => sel == ushort && n as i64 == image,
-        _ => sel == ubyte && st.codec_param == Some(6) && st.uncompressed == 2 * image,
-    };
-    if !ok {
-        return st.reject(format!(
-            "payload does not match a {}x{} u16 image",
-            cfg.width, cfg.height
-        ));
-    }
-    if st.first_rx.is_none() {
-        st.first_rx = Some(t_rx);
-        st.cpu_first = process_cpu_ns();
-    }
-    st.last_rx = t_rx;
-    let u = uid as usize;
-    if u / 64 >= st.seen.len() {
-        st.beyond += 1;
-        return;
-    }
-    let (word, b) = (&mut st.seen[u / 64], 1u64 << (u % 64));
-    if *word & b != 0 {
-        st.dup += 1;
-        return;
-    }
-    *word |= b;
-    st.unique += 1;
-    if st.unique.is_multiple_of(1024) {
-        st.cpu_sample = (t_rx, process_cpu_ns());
-    }
-    let next = st.last_uid + 1;
-    match (uid as i64).cmp(&next) {
-        std::cmp::Ordering::Greater => {
-            st.gap_events += 1;
-            st.gap_frames += uid as u64 - next as u64;
-        }
-        std::cmp::Ordering::Less => st.out_of_order += 1,
-        std::cmp::Ordering::Equal => {}
-    }
-    st.last_uid = st.last_uid.max(uid as i64);
-    let t_pub = st.ts.0 * 1_000_000_000 + st.ts.1 as i64;
-    let payload = body.slice(range as Range<usize>);
-    match tx.try_send(Work {
-        payload,
-        codec,
-        uid,
-        t_rx,
-        t_pub,
-    }) {
-        Ok(()) => {}
-        Err(TrySendError::Full(_)) => st.queue_full += 1,
-        Err(TrySendError::Disconnected(_)) => {}
-    }
+enum Source {
+    Pva,
+    Zmq(String),
+    H5(PathBuf),
 }
 
 fn main() {
     let a = Args::parse();
     let addr: SocketAddr = a.str("addr", "127.0.0.1:15075").parse().expect("--addr");
     let frames: u64 = a.get("frames", 30_000);
-    let workers: usize = a.get("workers", 16);
-    let synth = Synth {
-        width: a.get("width", 1028),
-        height: a.get("height", 1062),
-        seed: a.get("seed", 1),
-        flux: a.get("flux", 1.0),
-        pool: a.get("pool", 64),
-    };
+    // With no worker every queued frame is dropped, so 0 fails here.
+    let workers = a.get("workers", NonZeroUsize::new(16).unwrap()).get();
+    // The same model arguments as pty-sim's.
+    let model = Model::from_args(&a);
+    let (width, height) = model.frame_size();
     let crop: usize = a.get("crop", 256);
-    let (cx, cy) = synth.centre();
-    let (cx, cy): (usize, usize) = (a.get("cx", cx), a.get("cy", cy));
-    let cfg = Cfg {
-        width: synth.width,
-        height: synth.height,
+    let mut geom = Geometry::centred(
+        width,
+        height,
         crop,
-        x0: cx - crop / 2,
-        y0: cy - crop / 2,
-        // Only the crop rows reach the GPU; bslz4 blocks outside them are skipped.
-        crop_decode: a.get::<u8>("crop-decode", 1) != 0,
+        a.get("cx", width / 2),
+        a.get("cy", height / 2),
+    );
+    // Only the crop rows reach the GPU; bslz4 blocks outside them are skipped.
+    geom.crop_decode = a.get::<u8>("crop-decode", 1) != 0;
+    let wcfg = WorkerCfg {
+        geom,
         verify_every: a.get("verify-every", 0),
         // Only a position that never comes waits this long, holding one
         // worker throughout; arrival lag on its own connection is < 1 ms.
         pos_wait_ns: a.get::<i64>("pos-wait-ms", 1000) * 1_000_000,
-        synth,
     };
-    assert!(
-        cfg.x0 + crop <= cfg.width && cfg.y0 + crop <= cfg.height,
-        "crop outside the frame"
-    );
+    let truth: Arc<dyn Truth> = Arc::new(model);
     let ucfg = UploaderConfig {
         batch: a.get("batch", 16),
         flush_ns: a.get::<i64>("flush-us", 500) * 1000,
         idle: Duration::from_micros(a.get("idle-us", 50)),
         events: 64,
     };
+    let source = match a.str("source", "pva").as_str() {
+        "pva" => Source::Pva,
+        "zmq" => Source::Zmq(a.str(
+            "zmq",
+            &format!("tcp://127.0.0.1:{}", ptyrs_live::eiger::PORT),
+        )),
+        "h5" => Source::H5(a.str("h5", "").into()),
+        s => panic!("--source {s}: expected pva, zmq or h5"),
+    };
+    let h5_readers = match &source {
+        Source::H5(p) => {
+            assert!(!p.as_os_str().is_empty(), "--source h5 needs --h5 PATH");
+            a.get("h5-readers", 4)
+        }
+        _ => 0,
+    };
+    let rcvhwm: i32 = a.get("rcvhwm", 10_000);
     let prefix = a.str("prefix", "PTY:");
     let idle_ms: i64 = a.get("idle-ms", 3000);
     let connect_s: i64 = a.get("connect-timeout-s", 120);
@@ -383,6 +100,7 @@ fn main() {
         &a.str("cpus", ""),
         rt_threads,
         workers,
+        h5_readers,
         a.get("util-min", 1024),
     ));
     // The main thread only polls for completion; it shares the runtime CPUs.
@@ -391,41 +109,59 @@ fn main() {
     let ctx = Context::new(a.get("gpu", 0)).expect("CUDA context");
     let ring =
         Arc::new(Ring::new(&ctx, a.get("ring-slots", 1024), crop * crop).expect("pinned ring"));
+    let store = Arc::new(
+        DeviceStore::new(
+            &ctx,
+            a.get("store-frames", frames as usize),
+            crop * crop,
+            a.get::<usize>("store-chunk-mib", 32) << 20,
+        )
+        .expect("device store"),
+    );
+    let (btx, brx) = crossbeam_channel::unbounded();
+    let consumer = {
+        let (ctx, store, place) = (ctx.clone(), store.clone(), place.clone());
+        let batch = a.get("graph-batch", 32);
+        std::thread::Builder::new()
+            .name("graph".into())
+            .spawn(move || {
+                place.enter(place.rt.as_deref());
+                run_checksum_consumer(ctx, store, batch, brx)
+            })
+            .unwrap()
+    };
     let stop = Arc::new(AtomicBool::new(false));
     let uploader = {
         let (ring, ctx, stop, place) = (ring.clone(), ctx.clone(), stop.clone(), place.clone());
+        let store = store.clone();
         std::thread::Builder::new()
             .name("h2d".into())
             .spawn(move || {
                 place.enter(place.h2d.as_ref().map(std::slice::from_ref));
-                run_uploader(ring, ctx, ucfg, stop)
+                run_uploader(ring, ctx, store, ucfg, stop, Some(btx))
             })
             .unwrap()
     };
-    let (tx, rx) = crossbeam_channel::bounded::<Work>(a.get("queue", 256));
+    let (tx, rx) = work_queue(a.get("queue", NonZeroUsize::new(256).unwrap()));
     let pos = Arc::new(PosTable::new(1 << 16));
     let handles: Vec<_> = (0..workers)
         .map(|i| {
             let (rx, ring, pos, place) = (rx.clone(), ring.clone(), pos.clone(), place.clone());
+            let truth = truth.clone();
             std::thread::Builder::new()
                 .name(format!("decode{i}"))
                 .spawn(move || {
                     place.enter(place.workers[i].as_ref().map(std::slice::from_ref));
-                    worker(rx, ring, pos, cfg)
+                    worker(rx, ring, pos, wcfg, truth)
                 })
                 .unwrap()
         })
         .collect();
     drop(rx);
 
-    let state = Arc::new(Mutex::new(RxState {
-        seen: vec![0; (frames as usize).div_ceil(64)],
-        last_uid: -1,
-        ..Default::default()
-    }));
-    let unique = Arc::new(AtomicU64::new(0));
-    let last_rx = Arc::new(AtomicI64::new(0));
-    let pos_stats = Arc::new(Mutex::new((0u64, 0u64, None::<String>)));
+    let state = Arc::new(Mutex::new(SourceStats::new(frames)));
+    let progress = Arc::new(Progress::default());
+    let pos_stats = Arc::new(Mutex::new(PosStats::default()));
     let rt = {
         let place = place.clone();
         tokio::runtime::Builder::new_multi_thread()
@@ -435,17 +171,9 @@ fn main() {
             .build()
             .unwrap()
     };
-    // POS gets a client, hence a TCP connection, of its own, as it would
-    // from a separate motion IOC: on FRAME's connection it queued behind
-    // the frame backlog and trailed frames by up to 0.9 s. The deep
-    // pipelined queue keeps the server from squashing it during stalls.
-    let pos_request = PvRequestBuilder::new()
-        .record("pipeline", true)
-        .record("queueSize", a.get::<u32>("pos-queue", 4096))
-        .build()
-        .to_pv_field();
+    let pull_stop = Arc::new(AtomicBool::new(false));
     let t_start = mono_ns();
-    rt.block_on(async {
+    let (pulled, followed): (Option<PullReport>, Option<SwmrReport>) = rt.block_on(async {
         let client = PvaClient::builder()
             .server_addr(addr)
             .timeout(Duration::from_secs(10))
@@ -458,60 +186,88 @@ fn main() {
             .server_addr(addr)
             .timeout(Duration::from_secs(10))
             .build();
-        let pt = pos.clone();
-        let ps = pos_stats.clone();
-        let pos_sub = pos_client
-            .pvmonitor_raw_frames_handle_with_request(
-                &format!("{prefix}POS"),
-                pos_request,
-                move |desc, body, order| {
-                    let mut s = ps.lock().unwrap();
-                    let r = check_position_layout(desc).and_then(|()| parse_position(&body, order));
-                    match r {
-                        Ok((Some(uid), Some(x), Some(y))) if uid >= 0 => {
-                            pt.insert(
-                                uid,
-                                Pos {
-                                    x,
-                                    y,
-                                    t_rx: wall_ns(),
-                                },
-                            );
-                            s.0 += 1;
-                        }
-                        Ok((Some(uid), ..)) if uid < 0 => {}
-                        Ok(_) => {
-                            s.1 += 1;
-                            s.2.get_or_insert("partial position update".into());
-                        }
-                        Err(e) => {
-                            s.1 += 1;
-                            s.2.get_or_insert(e.to_string());
-                        }
-                    }
-                },
-                |ev| eprintln!("recv POS {ev:?}"),
-            )
-            .await
-            .expect("POS monitor");
-        let (st, un, lr) = (state.clone(), unique.clone(), last_rx.clone());
-        let frame_sub = client
-            .pvmonitor_raw_frames_handle(
-                &format!("{prefix}FRAME"),
-                move |desc, body, order| {
-                    let mut s = st.lock().unwrap();
-                    on_frame(&mut s, desc, body, order, &tx, &cfg);
-                    un.store(s.unique, Ordering::Relaxed);
-                    lr.store(s.last_rx, Ordering::Relaxed);
-                },
-                |ev| eprintln!("recv FRAME {ev:?}"),
-            )
-            .await
-            .expect("FRAME monitor");
+        // The file carries its own positions.
+        let pos_sub = match &source {
+            Source::H5(_) => None,
+            _ => Some(
+                monitor_positions(
+                    &pos_client,
+                    &format!("{prefix}POS"),
+                    a.get("pos-queue", 4096),
+                    pos.clone(),
+                    pos_stats.clone(),
+                )
+                .await
+                .expect("POS monitor"),
+            ),
+        };
+        // Frames from exactly one source; the others hold no Sender.
+        let (frame_sub, pull, follow) = match &source {
+            Source::Pva => {
+                let (st, pr) = (state.clone(), progress.clone());
+                let mut src = NtndFrames::new(geom);
+                let sub = client
+                    .pvmonitor_raw_frames_handle(
+                        &format!("{prefix}FRAME"),
+                        move |desc, body, order| {
+                            let mut s = st.lock().unwrap();
+                            src.on_update(&mut s, desc, body, order, &tx);
+                            pr.unique.store(s.unique, Ordering::Relaxed);
+                            pr.last_rx.store(s.last_rx, Ordering::Relaxed);
+                        },
+                        |ev| eprintln!("recv FRAME {ev:?}"),
+                    )
+                    .await
+                    .expect("FRAME monitor");
+                (Some(sub), None, None)
+            }
+            Source::Zmq(ep) => {
+                let (st, pr, ep) = (state.clone(), progress.clone(), ep.clone());
+                let (stop, place) = (pull_stop.clone(), place.clone());
+                let h = std::thread::Builder::new()
+                    .name("zmq-pull".into())
+                    .spawn(move || {
+                        // libzmq's I/O thread starts with the first socket
+                        // and inherits this thread's CPUs.
+                        place.enter(place.rt.as_deref());
+                        run_pull(&ep, rcvhwm, EigerFrames::new(geom), st, tx, &stop, &pr)
+                    })
+                    .unwrap();
+                (None, Some(h), None)
+            }
+            Source::H5(path) => {
+                let cfg = SwmrCfg {
+                    path: path.clone(),
+                    readers: h5_readers,
+                    width,
+                    height,
+                    poll: Duration::from_micros(a.get("h5-poll-us", 200)),
+                    queue: a.get("h5-queue", 1024),
+                };
+                let (st, pr, pos) = (state.clone(), progress.clone(), pos.clone());
+                let (stop, place) = (pull_stop.clone(), place.clone());
+                let h = std::thread::Builder::new()
+                    .name("h5-index".into())
+                    .spawn(move || {
+                        place.enter(place.rt.as_deref());
+                        run_swmr(&cfg, &st, &pos, tx, &place, &stop, &pr)
+                    })
+                    .unwrap();
+                (None, None, Some(h))
+            }
+        };
         loop {
             tokio::time::sleep(Duration::from_millis(20)).await;
-            let lr = last_rx.load(Ordering::Relaxed);
-            if unique.load(Ordering::Relaxed) >= frames {
+            let lr = progress.last_rx.load(Ordering::Relaxed);
+            // A ZMQ series ends with dseries_end; PVA and the file have no
+            // end marker.
+            if !matches!(source, Source::Zmq(_))
+                && progress.unique.load(Ordering::Relaxed) >= frames
+            {
+                break;
+            }
+            if progress.series_end.load(Ordering::Acquire) {
+                eprintln!("recv series end");
                 break;
             }
             if lr != 0 && wall_ns() - lr > idle_ms * 1_000_000 {
@@ -523,8 +279,12 @@ fn main() {
                 break;
             }
         }
+        pull_stop.store(true, Ordering::Release);
+        let pulled = pull.map(|h| h.join().unwrap().expect("ZMQ PULL"));
+        let followed = follow.map(|h| h.join().unwrap().expect("HDF5 SWMR"));
         drop(frame_sub);
         drop(pos_sub);
+        (pulled, followed)
     });
     // Dropping the runtime drops the monitor callbacks and with them the
     // only Sender, so the workers drain the queue and return.
@@ -532,64 +292,76 @@ fn main() {
     let reports: Vec<WorkerReport> = handles.into_iter().map(|h| h.join().unwrap()).collect();
     stop.store(true, Ordering::Release);
     let up = uploader.join().unwrap().expect("uploader");
+    let cons = consumer.join().unwrap().expect("graph consumer");
     let t_end = wall_ns();
     let cpu_end = process_cpu_ns();
 
     let st = state.lock().unwrap();
     let ps = pos_stats.lock().unwrap();
-    let mut wr = WorkerReport::default();
-    let mut decode = Histogram::new(100_000);
-    let mut pos_after = Histogram::new(1_000_000);
-    for r in &reports {
-        wr.pos_first += r.pos_first;
-        wr.frames += r.frames;
-        wr.decode_err += r.decode_err;
-        wr.pos_missing += r.pos_missing;
-        wr.pos_waited += r.pos_waited;
-        wr.pos_mismatch += r.pos_mismatch;
-        wr.verified += r.verified;
-        wr.verify_bad += r.verify_bad;
-        wr.cpu_ns += r.cpu_ns;
-    }
-    for r in reports {
-        if let Some(h) = r.decode {
-            decode.merge(&h);
-        }
-        if let Some(h) = r.pos_after_frame {
-            pos_after.merge(&h);
-        }
-    }
+    let (wr, decode, pos_after) = WorkerReport::merge(reports);
+    // The checks below spread over every listed CPU, not the runtime's.
+    place.enter(place.all.as_deref());
 
-    // End-to-end check of whatever the ring holds now: device copy against
-    // the host ring, and against a fresh synthesis of the same crop.
+    // End-to-end check of the frames the ring still holds: their place in
+    // the device store against the host ring slot and against a fresh
+    // synthesis of the same crop; the position and uid of every stored frame.
     let se = crop * crop;
-    let slots = ring.slots();
     let host = ring.host_frames();
-    let h2d_bad = (0..slots)
-        .filter(|&i| host[i * se..(i + 1) * se] != up.device_frames[i * se..(i + 1) * se])
-        .count();
-    let filled: Vec<(usize, i32)> = (0..slots)
-        .filter_map(|i| ring.slot_uid(i).map(|u| (i, u)))
+    let filled: Vec<(usize, u64, i32)> = (0..ring.slots())
+        .filter_map(|i| ring.slot(i).map(|(seq, uid)| (i, seq, uid)))
         .collect();
+    let mut dev = vec![0u16; filled.len() * se];
+    for (k, &(_, seq, _)) in filled.iter().enumerate() {
+        store
+            .read_frames(seq..seq + 1, &mut dev[k * se..(k + 1) * se])
+            .expect("store readback");
+    }
     let threads = std::thread::available_parallelism().map_or(8, |n| n.get());
-    let e2e_bad: usize = std::thread::scope(|sc| {
+    let per = filled.len().div_ceil(threads).max(1);
+    let (h2d_bad, e2e_bad): (usize, usize) = std::thread::scope(|sc| {
         filled
-            .chunks(filled.len().div_ceil(threads).max(1))
-            .map(|chunk| {
-                let dev = &up.device_frames;
-                let dpos = &up.device_positions;
+            .chunks(per)
+            .zip(dev.chunks(per * se))
+            .map(|(chunk, dev)| {
+                let truth = &truth;
                 sc.spawn(move || {
                     let mut buf = vec![0u16; se];
-                    let mut ss = SynthScratch::default();
-                    let s = cfg.synth;
-                    chunk
-                        .iter()
-                        .filter(|&&(i, uid)| {
-                            s.fill_region(s.pool_index(uid), cfg.crop_region(), &mut buf, &mut ss);
-                            let (x, y) = position(uid);
-                            dev[i * se..(i + 1) * se] != buf[..]
-                                || dpos[2 * i] != x
-                                || dpos[2 * i + 1] != y
+                    let (mut h2d, mut e2e) = (0, 0);
+                    for (&(i, _, uid), d) in chunk.iter().zip(dev.chunks(se)) {
+                        h2d += usize::from(host[i * se..(i + 1) * se] != *d);
+                        truth.fill(uid, geom.crop_region(), &mut buf);
+                        e2e += usize::from(buf[..] != *d);
+                    }
+                    (h2d, e2e)
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1))
+    });
+    let dpos = store.read_positions(up.frames).expect("store readback");
+    let store_pos_bad = up
+        .uids
+        .iter()
+        .enumerate()
+        .filter(|&(s, &uid)| (dpos[2 * s], dpos[2 * s + 1]) != truth.position(uid))
+        .count();
+    // Every stored frame as the graph saw it, against its synthesis.
+    let per = up.uids.len().div_ceil(threads).max(1);
+    let sum_bad: usize = std::thread::scope(|sc| {
+        up.uids
+            .chunks(per)
+            .zip(cons.checksums.chunks(per))
+            .map(|(uids, sums)| {
+                let truth = &truth;
+                sc.spawn(move || {
+                    let mut buf = vec![0u16; se];
+                    uids.iter()
+                        .zip(sums)
+                        .filter(|&(&uid, &sum)| {
+                            truth.fill(uid, geom.crop_region(), &mut buf);
+                            checksum(&buf) != sum
                         })
                         .count()
                 })
@@ -599,6 +371,10 @@ fn main() {
             .map(|h| h.join().unwrap())
             .sum()
     });
+    let mut sorted = up.uids.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let store_dup_uids = up.uids.len() - sorted.len();
 
     let first = st.first_rx.unwrap_or(t_end);
     let rx_span = (st.last_rx - first).max(1) as f64 / 1e9;
@@ -627,10 +403,24 @@ fn main() {
         wr.pos_missing,
         wr.pos_mismatch,
         wr.pos_waited,
-        ps.0,
-        ps.1,
+        ps.updates,
+        ps.rejected,
     );
-    if let Some(e) = st.first_error.as_ref().or(ps.2.as_ref()) {
+    if let Some(p) = &pulled {
+        println!(
+            "recv zmq messages={} headers={} series_end={} rejected={}",
+            p.messages, p.headers, p.ends, p.rejected
+        );
+    }
+    if let Some(f) = &followed {
+        println!(
+            "recv h5 readers={h5_readers} open_ms={} refreshes={} retries={} frames={} \
+             max_backlog={}",
+            f.open_ms, f.refreshes, f.retries, f.frames, f.max_backlog
+        );
+        println!("recv h5_read {}", f.read.summary());
+    }
+    if let Some(e) = st.first_error.as_ref().or(ps.first_error.as_ref()) {
         println!("recv first_error={e}");
     }
     println!(
@@ -660,14 +450,35 @@ fn main() {
     );
     println!(
         "recv verify sampled={} sampled_bad={} ring_slots_checked={} h2d_mismatch_slots={h2d_bad} \
-         e2e_mismatch_slots={e2e_bad}",
+         e2e_mismatch_slots={e2e_bad} store_frames={} store_mapped_MiB={} store_pos_bad={store_pos_bad} \
+         store_dup_uids={store_dup_uids}",
         wr.verified,
         wr.verify_bad,
-        filled.len()
+        filled.len(),
+        up.uids.len(),
+        store.mapped_bytes() >> 20,
     );
+    println!(
+        "recv graph launches={} consumed={} checksummed={} checksum_bad={sum_bad} out_mapped_MiB={}",
+        cons.launches,
+        cons.consumed,
+        cons.checksums.len(),
+        cons.out_mapped_bytes >> 20,
+    );
+    let bad = wr.verify_bad + wr.pos_mismatch;
+    let consumed_bad =
+        usize::from(cons.consumed != up.frames || cons.checksums.len() != up.uids.len());
     let code = if lost > 0 {
         2
-    } else if wr.verify_bad + h2d_bad as u64 + e2e_bad as u64 + wr.pos_mismatch > 0 {
+    } else if bad as usize
+        + h2d_bad
+        + e2e_bad
+        + store_pos_bad
+        + store_dup_uids
+        + sum_bad
+        + consumed_bad
+        > 0
+    {
         3
     } else {
         0
