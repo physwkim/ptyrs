@@ -1,0 +1,14 @@
+[package]
+name = "ptyrs-cli"
+version.workspace = true
+edition.workspace = true
+description = "ptyrs: the single binary, configured by a TOML file"
+
+[[bin]]
+name = "ptyrs"
+path = "src/main.rs"
+
+[dependencies]
+ptyrs-live = { path = "../ptyrs-live" }
+serde = { version = "1", features = ["derive"] }
+toml = "1"

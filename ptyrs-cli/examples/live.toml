@@ -1,0 +1,75 @@
+# `ptyrs live live.toml`: every key at its default (a unit test holds it so).
+
+[recv]
+# Triggers in the scan, uids 0..frames.
+frames = 30000
+# CUDA device ordinal among CUDA_VISIBLE_DEVICES.
+gpu = 0
+# PVA server of <prefix>FRAME (source "pva") and <prefix>POS (pva, zmq).
+addr = "127.0.0.1:15075"
+prefix = "PTY:"
+# FRAME updates the server may send unacknowledged; it squashes the rest.
+pipeline = 1024
+pos-queue = 4096
+crop = 256
+# Crop centre in frame pixels; the frame centre when unset.
+# cx = 514
+# cy = 531
+# Decode only the bslz4 blocks overlapping the crop rows.
+crop-decode = true
+workers = 16
+# Frames between the source and the workers; a full queue drops.
+queue = 256
+# Regenerate and compare the crop of every uid divisible by this; 0 off.
+verify-every = 0
+pos-wait-ms = 1000
+batch = 16
+flush-us = 500
+idle-us = 50
+ring-slots = 1024
+# Device store capacity; `frames` when unset.
+# store-frames = 30000
+store-chunk-mib = 32
+graph-batch = 32
+rt-threads = 1
+# CPUs the threads are pinned to; unpinned when unset.
+# cpus = "2-23"
+util-min = 1024
+# Stop once no frame arrived for this long.
+idle-ms = 3000
+# Stop if no frame arrived within this long.
+connect-timeout-s = 120
+# A PVA monitor of <prefix>FRAME, or one of the two tables below in its place.
+source = "pva"
+
+# Eiger stream v1; positions still from <prefix>POS.
+# [recv.source.zmq]
+# endpoint = "tcp://127.0.0.1:9999"
+# rcvhwm = 10000
+
+# An HDF5 SWMR file, which carries its own positions; `path` is required.
+# [recv.source.h5]
+# path = "scan.h5"
+# readers = 4
+# poll-us = 200
+# queue = 1024
+
+# What the frames and positions are checked against; its frame size is the
+# detector's. In its place, the M5 scan simulator:
+# [recv.model.ptycho]
+# n = 256
+# path = "fermat"   # or "raster"
+# points = 4096
+# cols = 64         # raster row length; ceil(sqrt(points)) when unset
+# step-px = 20.0
+# photons = 1e6
+# seed = 1
+# wavelength-m = 1.5498e-10
+# distance-m = 5.0
+# det-pixel-m = 75e-6
+[recv.model.synth]
+width = 1028
+height = 1062
+seed = 1
+flux = 1.0
+pool = 64
