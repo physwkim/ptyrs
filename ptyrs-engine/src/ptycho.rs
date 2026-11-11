@@ -386,9 +386,10 @@ impl Ptycho {
     ///   summed over the batch;
     /// - probe: `P_m += probe_step · mean_batch conj(O_win q) Δ_m / ((1 − α_p)|O_win|² + α_p·max|O_win|²)`.
     ///
-    /// The FFT is unitary where pty-chi's is unnormalised; the iterates agree with the probe
-    /// scaled by `sqrt(ny·nx)` apart from the `1e-7` guards. One LLK record (of the estimate
-    /// after the epoch) every `calc_llk` epochs and after the last.
+    /// pty-chi has no `q` and an unnormalised FFT: its probe `P·q / sqrt(ny·nx)` gives the same
+    /// far-field moduli, so the `1e-7` guards act alike and the iterates correspond exactly
+    /// (`scripts/compare_ptychi_rpie.py`). One LLK record (of the estimate after the epoch)
+    /// every `calc_llk` epochs and after the last.
     pub fn rpie(&mut self, params: &RpieParams, nepoch: usize) -> Result<(), EngineError> {
         if self.addr.nobj() != 1 {
             return Err(EngineError::Invalid(
