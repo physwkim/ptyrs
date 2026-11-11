@@ -1833,6 +1833,7 @@ dependencies = [
  "cuda-async",
  "cuda-core",
  "cutile",
+ "ptyrs-gpu",
 ]
 
 [[package]]
