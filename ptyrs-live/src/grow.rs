@@ -9,9 +9,9 @@ use std::fmt;
 use std::ops::Range;
 use std::sync::Arc;
 
-use cuda_bindings::CUdeviceptr;
+use cuda_bindings::{self as sys, CUdeviceptr};
 use cuda_core::vmm::{self, Mapping, PhysicalAllocation, VirtualReservation};
-use cuda_core::{Context, DriverError};
+use cuda_core::{Context, DeviceCopy, DriverError, IntoResult, PinnedHostBuffer, Stream};
 
 #[derive(Debug)]
 pub enum GrowError {
@@ -142,13 +142,97 @@ impl Drop for GrowBuf {
     }
 }
 
+/// Append-only device table of `T`, such as the live address table
+/// (DESIGN.md §3 B6): record `i` stays at `ptr() + i * size_of::<T>()`.
+/// Records are copied from a pinned mirror they never leave, so a push
+/// never waits for the stream and no queued copy outlives its source.
+pub struct GrowTable<T: DeviceCopy> {
+    buf: GrowBuf,
+    mirror: PinnedHostBuffer<T>,
+    len: usize,
+    stream: Arc<Stream>,
+}
+
+impl<T: DeviceCopy> GrowTable<T> {
+    /// Room for `max_len` records, backed `chunk` bytes at a time and
+    /// copied on `stream`.
+    pub fn new(stream: &Arc<Stream>, max_len: usize, chunk: usize) -> Result<Self, DriverError> {
+        let ctx = stream.context();
+        Ok(Self {
+            buf: GrowBuf::new(ctx, max_len * size_of::<T>(), chunk)?,
+            mirror: PinnedHostBuffer::zeroed(ctx, max_len)?,
+            len: 0,
+            stream: stream.clone(),
+        })
+    }
+
+    pub fn ptr(&self) -> CUdeviceptr {
+        self.buf.ptr()
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn max_len(&self) -> usize {
+        self.mirror.len()
+    }
+
+    pub fn mapped_bytes(&self) -> usize {
+        self.buf.mapped_bytes()
+    }
+
+    /// Appends `recs` and queues their copy on the table's stream, so
+    /// kernels queued there afterwards see them. Returns their indices.
+    pub fn push(&mut self, recs: &[T]) -> Result<Range<usize>, GrowError> {
+        let sz = size_of::<T>();
+        let idx = self.len..self.len + recs.len();
+        if idx.end > self.max_len() {
+            return Err(GrowError::Capacity {
+                end: idx.end * sz,
+                capacity: self.max_len() * sz,
+            });
+        }
+        self.buf.map(idx.start * sz..idx.end * sz)?;
+        if recs.is_empty() {
+            return Ok(idx);
+        }
+        self.mirror[idx.clone()].copy_from_slice(recs);
+        self.stream.context().bind_to_thread()?;
+        // SAFETY: the destination was mapped above; the source is the
+        // mirror's slots `idx`, never written again while the table lives
+        // (Drop waits for the stream before the mirror is freed).
+        unsafe {
+            sys::cuMemcpyHtoDAsync_v2(
+                self.ptr() + (idx.start * sz) as u64,
+                self.mirror[idx.clone()].as_ptr().cast(),
+                size_of_val(recs),
+                self.stream.cu_stream(),
+            )
+        }
+        .result()?;
+        self.len = idx.end;
+        Ok(idx)
+    }
+}
+
+impl<T: DeviceCopy> Drop for GrowTable<T> {
+    fn drop(&mut self) {
+        // The mirror and the mapping go next; no queued copy may still use them.
+        let _ = self.stream.synchronize();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::ffi::c_void;
     use std::time::Instant;
 
-    use cuda_bindings as sys;
-    use cuda_core::{IntoResult, Stream, launch_kernel_on_stream};
+    use cuda_core::launch_kernel_on_stream;
 
     use super::*;
     use crate::consumer::Graph;
@@ -232,6 +316,65 @@ SUM:
 END:
     st.global.u32 [rd3], r6;
     st.global.u32 [rd3+4], r3;
+    ret;
+}
+
+// ctl = [done, avail]. out[i] = sum of the six u32 of record i, for i in
+// done..avail, grid-stride.
+.visible .entry rec_sum(.param .u64 recs, .param .u64 ctl, .param .u64 out)
+{
+    .reg .pred p;
+    .reg .b32 r<10>;
+    .reg .b64 rd<6>;
+    ld.param.u64 rd1, [recs];
+    ld.param.u64 rd2, [ctl];
+    ld.param.u64 rd3, [out];
+    cvta.to.global.u64 rd1, rd1;
+    cvta.to.global.u64 rd2, rd2;
+    cvta.to.global.u64 rd3, rd3;
+    ld.global.u32 r1, [rd2];
+    ld.global.u32 r2, [rd2+4];
+    mov.u32 r3, %ctaid.x;
+    mov.u32 r4, %ntid.x;
+    mov.u32 r5, %tid.x;
+    mad.lo.u32 r3, r3, r4, r5;
+    add.u32 r3, r3, r1;
+    mov.u32 r6, %nctaid.x;
+    mul.lo.u32 r6, r6, r4;
+RLOOP:
+    setp.ge.u32 p, r3, r2;
+    @p bra RDONE;
+    mul.wide.u32 rd4, r3, 24;
+    add.s64 rd4, rd1, rd4;
+    ld.global.u32 r7, [rd4];
+    ld.global.u32 r8, [rd4+4];
+    add.u32 r7, r7, r8;
+    ld.global.u32 r8, [rd4+8];
+    add.u32 r7, r7, r8;
+    ld.global.u32 r8, [rd4+12];
+    add.u32 r7, r7, r8;
+    ld.global.u32 r8, [rd4+16];
+    add.u32 r7, r7, r8;
+    ld.global.u32 r8, [rd4+20];
+    add.u32 r7, r7, r8;
+    mul.wide.u32 rd5, r3, 4;
+    add.s64 rd5, rd3, rd5;
+    st.global.u32 [rd5], r7;
+    add.u32 r3, r3, r6;
+    bra RLOOP;
+RDONE:
+    ret;
+}
+
+// ctl[0] = ctl[1].
+.visible .entry advance(.param .u64 ctl)
+{
+    .reg .b32 r1;
+    .reg .b64 rd1;
+    ld.param.u64 rd1, [ctl];
+    cvta.to.global.u64 rd1, rd1;
+    ld.global.u32 r1, [rd1+4];
+    st.global.u32 [rd1], r1;
     ret;
 }
 "#;
@@ -387,5 +530,94 @@ END:
             .filter(|&(i, &v)| v != rounds.iter().filter(|&&n| i < n).count() as u32)
             .count();
         assert_eq!(bad, 0, "elements with a wrong replay count");
+    }
+
+    /// Records are pushed in uneven batches across chunk boundaries while one
+    /// graph, captured before the first push, sums every new record. A kernel
+    /// queued ahead on the same stream outlasts all the pushes: none waits
+    /// for it.
+    #[test]
+    fn a_table_grows_while_one_graph_reads_it() {
+        let ctx = ctx();
+        let m = ctx.load_module_from_ptx_src(PTX).unwrap();
+        let (spin, sum, adv) = (
+            m.load_function("spin_sum").unwrap(),
+            m.load_function("rec_sum").unwrap(),
+            m.load_function("advance").unwrap(),
+        );
+        let s = ctx.new_stream().unwrap();
+        let total = 300_000usize;
+        let mut t = GrowTable::<[u32; 6]>::new(&s, total, 1).unwrap();
+        let ck = t.buf.chunk_bytes();
+        assert!(total * 24 > 3 * ck, "the table spans several chunks");
+        let mut out = GrowBuf::new(&ctx, total * 4, 1).unwrap();
+        out.map(0..total * 4).unwrap();
+        let mut ctl = GrowBuf::new(&ctx, 8, 1).unwrap();
+        ctl.map(0..8).unwrap();
+        memset32(ctl.ptr(), 0, 2, &s);
+        let (mut p_recs, mut p_ctl, mut p_out) = (t.ptr(), ctl.ptr(), out.ptr());
+        let mut sum_params = [
+            (&raw mut p_recs).cast::<c_void>(),
+            (&raw mut p_ctl).cast(),
+            (&raw mut p_out).cast(),
+        ];
+        let mut a_ctl = ctl.ptr();
+        let mut adv_params = [(&raw mut a_ctl).cast::<c_void>()];
+        let graph = Graph::capture(&s, || unsafe {
+            launch_kernel_on_stream(&sum, (64, 1, 1), (256, 1, 1), 0, &s, &mut sum_params)?;
+            launch_kernel_on_stream(&adv, (1, 1, 1), (1, 1, 1), 0, &s, &mut adv_params)
+        })
+        .unwrap();
+
+        // Spin 0.4 s on a mapped chunk of its own, ahead of every push.
+        let mut scratch = GrowBuf::new(&ctx, 1, 1).unwrap();
+        scratch.map(0..4096).unwrap();
+        let (mut p_buf, mut p_n, mut p_ns, mut p_sout) =
+            (scratch.ptr(), 1000u32, 400_000_000u64, scratch.ptr() + 4000);
+        let mut spin_params = [
+            (&raw mut p_buf).cast::<c_void>(),
+            (&raw mut p_n).cast(),
+            (&raw mut p_ns).cast(),
+            (&raw mut p_sout).cast(),
+        ];
+        unsafe { launch_kernel_on_stream(&spin, (1, 1, 1), (1, 1, 1), 0, &s, &mut spin_params) }
+            .unwrap();
+        let spun = ctx.new_event_with_flags(None).unwrap();
+        spun.record(&s).unwrap();
+
+        let rec = |i: usize| {
+            let i = i as u32;
+            [i, i.wrapping_mul(3), i ^ 0x5555, 7, i >> 3, 1]
+        };
+        let sizes = [1usize, 7, 5000, 33, 60_000, 2, 100_000, 999];
+        let (mut n, mut k) = (0usize, 0usize);
+        let t0 = Instant::now();
+        while n < total {
+            let b = sizes[k % sizes.len()].min(total - n);
+            k += 1;
+            let recs: Vec<[u32; 6]> = (n..n + b).map(rec).collect();
+            assert_eq!(t.push(&recs).unwrap(), n..n + b);
+            n += b;
+            memset32(ctl.ptr() + 4, n as u32, 1, &s);
+            graph.launch(&s).unwrap();
+        }
+        let push_ms = t0.elapsed().as_secs_f64() * 1e3;
+        let spinning = !spun.query().unwrap();
+        s.synchronize().unwrap();
+        eprintln!("grow: {k} pushes of {total} records in {push_ms:.1} ms behind a 400 ms kernel");
+        assert!(spinning, "a push waited for the kernel ahead of it");
+        let got = dtoh(out.ptr(), total);
+        let bad = (0..total)
+            .filter(|&i| got[i] != rec(i).iter().fold(0u32, |a, &v| a.wrapping_add(v)))
+            .count();
+        assert_eq!(bad, 0, "records summed wrong");
+        assert_eq!(dtoh(ctl.ptr(), 2), vec![total as u32; 2]);
+        assert_eq!(t.len(), total);
+        assert_eq!(t.mapped_bytes(), (total * 24).div_ceil(ck) * ck);
+        assert!(matches!(
+            t.push(&[rec(0)]),
+            Err(GrowError::Capacity { end, capacity }) if end == (total + 1) * 24 && capacity == total * 24
+        ));
+        assert_eq!(t.len(), total);
     }
 }
