@@ -14,8 +14,8 @@
 
 use std::collections::VecDeque;
 use std::ops::Range;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crossbeam_channel::Sender;
@@ -157,11 +157,22 @@ impl Ring {
 /// Device side of the input: frame `seq` at `frames_ptr() + seq * frame
 /// bytes`, its `(x, y)` as two f64 at `positions_ptr() + seq * 16`. Both
 /// grow in place, `chunk` bytes of frames at a time, up to `max_frames`.
+///
+/// Shared through an `Arc`: whoever holds a pointer into the store holds
+/// the store, so no mapping is released under a reader. Only
+/// [`run_uploader`] maps.
 pub struct DeviceStore {
+    frames_ptr: CUdeviceptr,
+    positions_ptr: CUdeviceptr,
+    frame_elems: usize,
+    max_frames: u64,
+    bufs: Mutex<Bufs>,
+    ctx: Arc<Context>,
+}
+
+struct Bufs {
     frames: GrowBuf,
     positions: GrowBuf,
-    frame_elems: usize,
-    ctx: Arc<Context>,
 }
 
 impl DeviceStore {
@@ -171,37 +182,48 @@ impl DeviceStore {
         frame_elems: usize,
         chunk: usize,
     ) -> Result<Self, DriverError> {
+        let frames = GrowBuf::new(ctx, max_frames * frame_elems * 2, chunk)?;
+        // One granule holds 131072 positions.
+        let positions = GrowBuf::new(ctx, max_frames * 16, 1)?;
         Ok(Self {
-            frames: GrowBuf::new(ctx, max_frames * frame_elems * 2, chunk)?,
-            // One granule holds 131072 positions.
-            positions: GrowBuf::new(ctx, max_frames * 16, 1)?,
+            frames_ptr: frames.ptr(),
+            positions_ptr: positions.ptr(),
             frame_elems,
+            max_frames: max_frames as u64,
+            bufs: Mutex::new(Bufs { frames, positions }),
             ctx: ctx.clone(),
         })
     }
 
     pub fn frames_ptr(&self) -> CUdeviceptr {
-        self.frames.ptr()
+        self.frames_ptr
     }
 
     pub fn positions_ptr(&self) -> CUdeviceptr {
-        self.positions.ptr()
+        self.positions_ptr
     }
 
     pub fn frame_elems(&self) -> usize {
         self.frame_elems
     }
 
+    pub fn max_frames(&self) -> u64 {
+        self.max_frames
+    }
+
     /// Bytes of device memory backing the store.
     pub fn mapped_bytes(&self) -> usize {
-        self.frames.mapped_bytes() + self.positions.mapped_bytes()
+        let b = self.bufs.lock().unwrap();
+        b.frames.mapped_bytes() + b.positions.mapped_bytes()
     }
 
     /// Backs frames `seqs`; with `ahead`, also one chunk past them, so the
     /// copy of the next batch rarely waits for a mapping.
-    fn ensure(&mut self, seqs: Range<u64>, ahead: bool) -> Result<(), GrowError> {
+    fn ensure(&self, seqs: Range<u64>, ahead: bool) -> Result<(), GrowError> {
         let fb = (self.frame_elems * 2) as u64;
-        for (b, stride) in [(&mut self.frames, fb), (&mut self.positions, 16)] {
+        let mut bufs = self.bufs.lock().unwrap();
+        let Bufs { frames, positions } = &mut *bufs;
+        for (b, stride) in [(frames, fb), (positions, 16)] {
             let (start, mut end) = ((seqs.start * stride) as usize, (seqs.end * stride) as usize);
             if ahead {
                 end = (end + b.chunk_bytes()).min(b.capacity().max(end));
@@ -216,17 +238,15 @@ impl DeviceStore {
         let n = (seqs.end - seqs.start) as usize * self.frame_elems;
         assert_eq!(out.len(), n);
         let fb = (self.frame_elems * 2) as u64;
-        assert!(
-            self.frames
-                .is_mapped((seqs.start * fb) as usize..(seqs.end * fb) as usize)
-        );
+        let range = (seqs.start * fb) as usize..(seqs.end * fb) as usize;
+        assert!(self.bufs.lock().unwrap().frames.is_mapped(range));
         self.ctx.bind_to_thread()?;
-        // SAFETY: the source range is mapped (checked above) and `out` holds
-        // exactly its element count.
+        // SAFETY: the source range is mapped (checked above; mappings are only
+        // added while the store lives) and `out` holds its element count.
         unsafe {
             cuda_bindings::cuMemcpyDtoH_v2(
                 out.as_mut_ptr().cast(),
-                self.frames.ptr() + seqs.start * fb,
+                self.frames_ptr + seqs.start * fb,
                 n * 2,
             )
         }
@@ -236,11 +256,17 @@ impl DeviceStore {
     /// Synchronous copy of the positions of frames `0..n`, for checks.
     pub fn read_positions(&self, n: u64) -> Result<Vec<f64>, DriverError> {
         let mut v = vec![0f64; 2 * n as usize];
-        assert!(self.positions.is_mapped(0..16 * n as usize));
+        assert!(
+            self.bufs
+                .lock()
+                .unwrap()
+                .positions
+                .is_mapped(0..16 * n as usize)
+        );
         self.ctx.bind_to_thread()?;
         // SAFETY: as in `read_frames`.
         unsafe {
-            cuda_bindings::cuMemcpyDtoH_v2(v.as_mut_ptr().cast(), self.positions.ptr(), v.len() * 8)
+            cuda_bindings::cuMemcpyDtoH_v2(v.as_mut_ptr().cast(), self.positions_ptr, v.len() * 8)
         }
         .result()?;
         Ok(v)
@@ -281,8 +307,6 @@ pub struct UploadReport {
     pub cpu_ns: i64,
     /// uid of every uploaded frame, by sequence number.
     pub uids: Vec<i32>,
-    /// The store, handed back for end-of-run checks.
-    pub store: DeviceStore,
 }
 
 /// Run until `stop` is set and everything reserved has landed in `store`;
@@ -291,7 +315,7 @@ pub struct UploadReport {
 pub fn run_uploader(
     ring: Arc<Ring>,
     ctx: Arc<Context>,
-    store: DeviceStore,
+    store: Arc<DeviceStore>,
     cfg: UploaderConfig,
     stop: Arc<AtomicBool>,
     batches: Option<Sender<FrameBatch>>,
@@ -316,7 +340,6 @@ pub fn run_uploader(
         commit_to_gpu: Histogram::new(200_000),
         cpu_ns: 0,
         uids: Vec::new(),
-        store,
     };
     let cpu0 = thread_cpu_ns();
     let (mut issued, mut frontier) = (0u64, 0u64);
@@ -337,19 +360,19 @@ pub fn run_uploader(
             }
             let n = (pending as usize).min(cfg.batch).min(slots - s0);
             let seqs = issued..issued + n as u64;
-            rep.store.ensure(seqs.clone(), false)?;
+            store.ensure(seqs.clone(), false)?;
             // SAFETY: slots `s0..s0 + n` are committed and not yet released,
             // so no worker writes them until the event below completes; the
             // store backs sequence numbers `issued..issued + n`.
             unsafe {
                 cuda_core::memcpy_htod_async(
-                    rep.store.frames_ptr() + issued * (se * 2) as u64,
+                    store.frames_ptr() + issued * (se * 2) as u64,
                     ring.frames_ptr.add(s0 * se),
                     n * se,
                     &stream,
                 )?;
                 cuda_core::memcpy_htod_async(
-                    rep.store.positions_ptr() + issued * 16,
+                    store.positions_ptr() + issued * 16,
                     ring.pos_ptr.add(s0 * 2),
                     n * 2,
                     &stream,
@@ -358,7 +381,7 @@ pub fn run_uploader(
             let ev = free.pop().expect("checked non-empty");
             events[ev].record(&stream)?;
             // Mapping does not wait for the copies just queued.
-            rep.store.ensure(seqs, true)?;
+            store.ensure(seqs, true)?;
             inflight.push_back((ev, issued, n as u64));
             rep.max_inflight = rep.max_inflight.max(inflight.len());
             issued += n as u64;
@@ -434,12 +457,12 @@ mod tests {
         let (se, total) = (65536, 200u64);
         // 8 slots wrap 25 times; 25 MiB of frames map 2 MiB at a time.
         let ring = Arc::new(Ring::new(&ctx, 8, se).unwrap());
-        let store = DeviceStore::new(&ctx, total as usize, se, 1).unwrap();
+        let store = Arc::new(DeviceStore::new(&ctx, total as usize, se, 1).unwrap());
         let ptr = store.frames_ptr();
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, rx) = crossbeam_channel::unbounded();
         let up = {
-            let (ring, ctx, stop) = (ring.clone(), ctx.clone(), stop.clone());
+            let (ring, ctx, stop, store) = (ring.clone(), ctx.clone(), stop.clone(), store.clone());
             std::thread::spawn(move || run_uploader(ring, ctx, store, cfg(), stop, Some(tx)))
         };
         // Four producers commit out of order.
@@ -452,7 +475,7 @@ mod tests {
         let rep = up.join().unwrap().unwrap();
 
         assert_eq!(rep.frames, total);
-        assert_eq!(rep.store.frames_ptr(), ptr);
+        assert_eq!(store.bufs.lock().unwrap().frames.ptr(), ptr);
         let mut next = 0;
         for b in rx.iter() {
             assert_eq!(b.seq0, next);
@@ -462,7 +485,7 @@ mod tests {
         let uids: Vec<i32> = (0..total as i32).map(|s| 1000 + s).collect();
         assert_eq!(rep.uids, uids);
         let mut dev = vec![0u16; total as usize * se];
-        rep.store.read_frames(0..total, &mut dev).unwrap();
+        store.read_frames(0..total, &mut dev).unwrap();
         for (seq, f) in dev.chunks(se).enumerate() {
             assert!(
                 f.iter()
@@ -471,7 +494,7 @@ mod tests {
                 "frame {seq}"
             );
         }
-        let pos = rep.store.read_positions(total).unwrap();
+        let pos = store.read_positions(total).unwrap();
         for seq in 0..total as usize {
             assert_eq!(
                 (pos[2 * seq], pos[2 * seq + 1]),
@@ -479,7 +502,8 @@ mod tests {
             );
         }
         // Mapped one chunk ahead of the last frame, clipped to the capacity.
-        assert_eq!(rep.store.frames.mapped_bytes(), rep.store.frames.capacity());
+        let b = store.bufs.lock().unwrap();
+        assert_eq!(b.frames.mapped_bytes(), b.frames.capacity());
     }
 
     #[test]
@@ -488,7 +512,7 @@ mod tests {
         let se = 65536;
         let ring = Arc::new(Ring::new(&ctx, 64, se).unwrap());
         // 32 frames fill exactly two 2 MiB chunks; the 33rd has no place.
-        let store = DeviceStore::new(&ctx, 32, se, 1).unwrap();
+        let store = Arc::new(DeviceStore::new(&ctx, 32, se, 1).unwrap());
         let stop = Arc::new(AtomicBool::new(false));
         let up = {
             let (ring, ctx, stop) = (ring.clone(), ctx.clone(), stop.clone());

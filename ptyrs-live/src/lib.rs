@@ -3,6 +3,7 @@
 //! §7 M0, M5).
 
 pub mod codec;
+pub mod consumer;
 pub mod eiger;
 pub mod grow;
 pub mod ntnd;

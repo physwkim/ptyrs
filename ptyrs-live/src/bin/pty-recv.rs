@@ -8,7 +8,9 @@
 //! of the received buffer to the workers. Workers reuse one image-sized
 //! scratch each; the ring, the store's address range and the events are
 //! allocated before the first frame, and the store maps device memory in
-//! `--store-chunk-mib` steps as frames arrive.
+//! `--store-chunk-mib` steps as frames arrive. A graph captured once before
+//! the first frame stands in for the engine and checksums every stored
+//! frame, `--graph-batch` frames per replay.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,6 +20,7 @@ use std::time::Duration;
 use cuda_core::Context;
 use epics_pva_rs::client_native::PvaClient;
 use ptyrs_live::args::Args;
+use ptyrs_live::consumer::{checksum, run_checksum_consumer};
 use ptyrs_live::eiger::{EigerFrames, Progress, PullReport, run_pull};
 use ptyrs_live::pipeline::{
     Geometry, Placement, SourceStats, Truth, Work, WorkerCfg, WorkerReport, worker,
@@ -90,21 +93,36 @@ fn main() {
     let ctx = Context::new(a.get("gpu", 0)).expect("CUDA context");
     let ring =
         Arc::new(Ring::new(&ctx, a.get("ring-slots", 1024), crop * crop).expect("pinned ring"));
-    let store = DeviceStore::new(
-        &ctx,
-        a.get("store-frames", frames as usize),
-        crop * crop,
-        a.get::<usize>("store-chunk-mib", 32) << 20,
-    )
-    .expect("device store");
+    let store = Arc::new(
+        DeviceStore::new(
+            &ctx,
+            a.get("store-frames", frames as usize),
+            crop * crop,
+            a.get::<usize>("store-chunk-mib", 32) << 20,
+        )
+        .expect("device store"),
+    );
+    let (btx, brx) = crossbeam_channel::unbounded();
+    let consumer = {
+        let (ctx, store, place) = (ctx.clone(), store.clone(), place.clone());
+        let batch = a.get("graph-batch", 32);
+        std::thread::Builder::new()
+            .name("graph".into())
+            .spawn(move || {
+                place.enter(place.rt.as_deref());
+                run_checksum_consumer(ctx, store, batch, brx)
+            })
+            .unwrap()
+    };
     let stop = Arc::new(AtomicBool::new(false));
     let uploader = {
         let (ring, ctx, stop, place) = (ring.clone(), ctx.clone(), stop.clone(), place.clone());
+        let store = store.clone();
         std::thread::Builder::new()
             .name("h2d".into())
             .spawn(move || {
                 place.enter(place.h2d.as_ref().map(std::slice::from_ref));
-                run_uploader(ring, ctx, store, ucfg, stop, None)
+                run_uploader(ring, ctx, store, ucfg, stop, Some(btx))
             })
             .unwrap()
     };
@@ -228,6 +246,7 @@ fn main() {
     let reports: Vec<WorkerReport> = handles.into_iter().map(|h| h.join().unwrap()).collect();
     stop.store(true, Ordering::Release);
     let up = uploader.join().unwrap().expect("uploader");
+    let cons = consumer.join().unwrap().expect("graph consumer");
     let t_end = wall_ns();
     let cpu_end = process_cpu_ns();
 
@@ -245,7 +264,7 @@ fn main() {
         .collect();
     let mut dev = vec![0u16; filled.len() * se];
     for (k, &(_, seq, _)) in filled.iter().enumerate() {
-        up.store
+        store
             .read_frames(seq..seq + 1, &mut dev[k * se..(k + 1) * se])
             .expect("store readback");
     }
@@ -273,13 +292,37 @@ fn main() {
             .map(|h| h.join().unwrap())
             .fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1))
     });
-    let dpos = up.store.read_positions(up.frames).expect("store readback");
+    let dpos = store.read_positions(up.frames).expect("store readback");
     let store_pos_bad = up
         .uids
         .iter()
         .enumerate()
         .filter(|&(s, &uid)| (dpos[2 * s], dpos[2 * s + 1]) != truth.position(uid))
         .count();
+    // Every stored frame as the graph saw it, against its synthesis.
+    let per = up.uids.len().div_ceil(threads).max(1);
+    let sum_bad: usize = std::thread::scope(|sc| {
+        up.uids
+            .chunks(per)
+            .zip(cons.checksums.chunks(per))
+            .map(|(uids, sums)| {
+                let truth = &truth;
+                sc.spawn(move || {
+                    let mut buf = vec![0u16; se];
+                    uids.iter()
+                        .zip(sums)
+                        .filter(|&(&uid, &sum)| {
+                            truth.fill(uid, geom.crop_region(), &mut buf);
+                            checksum(&buf) != sum
+                        })
+                        .count()
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .sum()
+    });
     let mut sorted = up.uids.clone();
     sorted.sort_unstable();
     sorted.dedup();
@@ -357,12 +400,29 @@ fn main() {
         wr.verify_bad,
         filled.len(),
         up.uids.len(),
-        up.store.mapped_bytes() >> 20,
+        store.mapped_bytes() >> 20,
+    );
+    println!(
+        "recv graph launches={} consumed={} checksummed={} checksum_bad={sum_bad} out_mapped_MiB={}",
+        cons.launches,
+        cons.consumed,
+        cons.checksums.len(),
+        cons.out_mapped_bytes >> 20,
     );
     let bad = wr.verify_bad + wr.pos_mismatch;
+    let consumed_bad =
+        usize::from(cons.consumed != up.frames || cons.checksums.len() != up.uids.len());
     let code = if lost > 0 {
         2
-    } else if bad as usize + h2d_bad + e2e_bad + store_pos_bad + store_dup_uids > 0 {
+    } else if bad as usize
+        + h2d_bad
+        + e2e_bad
+        + store_pos_bad
+        + store_dup_uids
+        + sum_bad
+        + consumed_bad
+        > 0
+    {
         3
     } else {
         0

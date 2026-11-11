@@ -145,13 +145,13 @@ impl Drop for GrowBuf {
 #[cfg(test)]
 mod tests {
     use std::ffi::c_void;
-    use std::mem::MaybeUninit;
     use std::time::Instant;
 
     use cuda_bindings as sys;
     use cuda_core::{IntoResult, Stream, launch_kernel_on_stream};
 
     use super::*;
+    use crate::consumer::Graph;
 
     const PTX: &str = r#"
 .version 8.0
@@ -254,9 +254,7 @@ END:
     }
 
     fn memset32(dst: CUdeviceptr, v: u32, n: usize, s: &Stream) {
-        unsafe { sys::cuMemsetD32Async(dst, v, n, s.cu_stream()) }
-            .result()
-            .unwrap();
+        crate::consumer::memset32(dst, v, n, s).unwrap();
     }
 
     #[test]
@@ -350,18 +348,6 @@ END:
         assert_eq!(dtoh(at, 1024), tail);
     }
 
-    /// RAII for a captured graph and its executable.
-    struct Graph(sys::CUgraph, sys::CUgraphExec);
-
-    impl Drop for Graph {
-        fn drop(&mut self) {
-            unsafe {
-                let _ = sys::cuGraphExecDestroy(self.1);
-                let _ = sys::cuGraphDestroy(self.0);
-            }
-        }
-    }
-
     /// One graph, captured once with the base pointer and a device-side
     /// count, is replayed while the buffer grows underneath it; nothing is
     /// recaptured, updated or synchronised between rounds.
@@ -376,17 +362,10 @@ END:
         count.map(0..4).unwrap();
         let (mut p_buf, mut p_cnt) = (b.ptr(), count.ptr());
         let mut params = [(&raw mut p_buf).cast::<c_void>(), (&raw mut p_cnt).cast()];
-        let graph = unsafe {
-            s.begin_capture(sys::CUstreamCaptureMode_enum_CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
-                .unwrap();
-            launch_kernel_on_stream(&bump, (128, 1, 1), (256, 1, 1), 0, &s, &mut params).unwrap();
-            let g = s.end_capture().unwrap();
-            let mut exec = MaybeUninit::uninit();
-            sys::cuGraphInstantiateWithFlags(exec.as_mut_ptr(), g, 0)
-                .result()
-                .unwrap();
-            Graph(g, exec.assume_init())
-        };
+        let graph = Graph::capture(&s, || unsafe {
+            launch_kernel_on_stream(&bump, (128, 1, 1), (256, 1, 1), 0, &s, &mut params)
+        })
+        .unwrap();
         // Element counts per round: growth by uneven steps, a round with no
         // growth, and a final step to the whole reservation.
         let cap_elems = b.capacity() / 4;
@@ -396,9 +375,7 @@ END:
                 memset32(b.ptr() + r.start as u64, 0, r.len() / 4, &s);
             }
             memset32(count.ptr(), n as u32, 1, &s);
-            unsafe { sys::cuGraphLaunch(graph.1, s.cu_stream()) }
-                .result()
-                .unwrap();
+            graph.launch(&s).unwrap();
         }
         s.synchronize().unwrap();
         assert_eq!(b.ptr(), p_buf);
