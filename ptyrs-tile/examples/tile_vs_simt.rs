@@ -127,6 +127,8 @@ fn main() {
     let mut probe_sums = UpdateSums::zeroed(&stream, probe_len).unwrap();
     let mut max_bits = DeviceBuffer::<u32>::zeroed(&stream, 1).unwrap();
     let mut llk = DeviceBuffer::<f64>::zeroed(&stream, 4).unwrap();
+    let mut llk_scratch =
+        DeviceBuffer::<f64>::zeroed(&stream, ptyrs_tile::llk_sums_scratch_len(d.nframe)).unwrap();
     stream.synchronize().unwrap();
     println!(
         "{} {}: {} frames x {} modes of {N}x{N}, object {}x{}, {reps} reps",
@@ -182,7 +184,7 @@ fn main() {
         stream.synchronize().unwrap();
         let t = Instant::now();
         let totals = if tile {
-            ptyrs_tile::llk_sums(&stream, &partials, d.nframe, &mut llk).unwrap();
+            ptyrs_tile::llk_sums(&stream, &partials, d.nframe, &mut llk_scratch, &mut llk).unwrap();
             llk.to_host_vec(&stream).unwrap()
         } else {
             let s = LlkSums::from_partials(&partials.to_host_vec(&stream).unwrap());

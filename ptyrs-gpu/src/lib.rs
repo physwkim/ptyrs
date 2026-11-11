@@ -20,7 +20,9 @@ use ptyrs_kernels::kernels::LoadedModule;
 
 mod ops;
 
-pub use ops::{LlkPartial, LlkSums, MASKED, OBJ_TILE, UpdateSums, ViewAddr, ViewDims, Views};
+pub use ops::{
+    LLK_TREE_LEAVES, LlkPartial, LlkSums, MASKED, OBJ_TILE, UpdateSums, ViewAddr, ViewDims, Views,
+};
 pub use ptyrs_fft::C32;
 
 /// The linked device code: every `ptyrs-kernels` kernel plus the cuFFT functions they call.

@@ -239,7 +239,10 @@ fn tile_lists(dims: &ViewDims, addr: &[ViewAddr]) -> Result<(Vec<u32>, Vec<u32>)
     Ok((start, flat))
 }
 
-/// Frame-ordered `f64` totals of [`LlkPartial`]s.
+/// Leaves of one level of the [`LlkSums`] tree: each level sums blocks of this many nodes.
+pub const LLK_TREE_LEAVES: usize = 256;
+
+/// `f64` totals of [`LlkPartial`]s over a tree fixed by frame index.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct LlkSums {
     pub poisson: f64,
@@ -250,15 +253,46 @@ pub struct LlkSums {
 }
 
 impl LlkSums {
-    /// Sums in slice order, so a fixed frame order gives a fixed result.
+    /// Pairwise sums, adjacent nodes first, over the partials padded with `+0.0` to
+    /// `LLK_TREE_LEAVES^L` (smallest `L >= 1`). The tree depends only on frame indices, not
+    /// on how frames are split across launches or GPUs, so each level is one program per
+    /// block of [`LLK_TREE_LEAVES`] nodes.
     pub fn from_partials(partials: &[LlkPartial]) -> Self {
-        partials.iter().fold(Self::default(), |s, p| Self {
-            poisson: s.poisson + p.poisson as f64,
-            gaussian: s.gaussian + p.gaussian as f64,
-            euclidean: s.euclidean + p.euclidean as f64,
-            icalc: s.icalc + p.icalc as f64,
-        })
+        let mut level: Vec<[f64; 4]> = partials
+            .iter()
+            .map(|p| [p.poisson, p.gaussian, p.euclidean, p.icalc].map(f64::from))
+            .collect();
+        loop {
+            level = if level.is_empty() {
+                vec![[0.0; 4]]
+            } else {
+                level.chunks(LLK_TREE_LEAVES).map(pair_tree).collect()
+            };
+            if level.len() == 1 {
+                let [poisson, gaussian, euclidean, icalc] = level[0];
+                return Self {
+                    poisson,
+                    gaussian,
+                    euclidean,
+                    icalc,
+                };
+            }
+        }
     }
+}
+
+/// Pairwise total of `block` padded with `+0.0` to [`LLK_TREE_LEAVES`] nodes.
+fn pair_tree(block: &[[f64; 4]]) -> [f64; 4] {
+    let mut node = [[0.0; 4]; LLK_TREE_LEAVES];
+    node[..block.len()].copy_from_slice(block);
+    let mut width = LLK_TREE_LEAVES;
+    while width > 1 {
+        width /= 2;
+        for i in 0..width {
+            node[i] = std::array::from_fn(|t| node[2 * i][t] + node[2 * i + 1][t]);
+        }
+    }
+    node[0]
 }
 
 /// `PIXEL_THREADS`-thread blocks covering `total` elements.

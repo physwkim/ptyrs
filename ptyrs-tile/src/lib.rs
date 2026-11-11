@@ -11,7 +11,7 @@ use cuda_async::device_buffer::DevicePointer;
 use cuda_async::error::DeviceError;
 use cuda_core::{AllocationLease, CudaStream, DeviceBuffer, DeviceCopy, RawDeviceBuffer};
 use cutile::prelude::*;
-use ptyrs_gpu::{C32, LlkPartial, OBJ_TILE, UpdateSums, Views};
+use ptyrs_gpu::{C32, LLK_TREE_LEAVES, LlkPartial, OBJ_TILE, UpdateSums, Views};
 
 #[cutile::module]
 mod device {
@@ -485,41 +485,66 @@ mod device {
         };
     }
 
-    /// `LlkSums::from_partials` over `partials[0 .. n]` (four `f32` each: Poisson, Gaussian,
-    /// Euclidean, calculated intensity): lane `t` adds term `t` of each partial in `f64`,
-    /// in slice order, from zero, and `out[t]` takes the total.
-    #[cutile::entry()]
-    unsafe fn llk_sums(partials: *const f32, n: i32, out: *mut f64) {
+    /// Element offsets `4 (256 p + row) + term` of program `p`'s block of four-term nodes,
+    /// and which rows lie below `n`.
+    fn llk_block(n: i32) -> (Tile<i32, { [256, 4] }>, Tile<bool, { [256, 4] }>) {
+        let pid: (i32, i32, i32) = get_tile_block_id();
+        let row: Tile<i32, { [256] }> = iota(shape![256]);
+        let row: Tile<i32, { [256, 1] }> = row.reshape(shape![256, 1]);
+        let row: Tile<i32, { [256, 4] }> = row.broadcast(shape![256, 4]);
+        let node: Tile<i32, { [256, 4] }> = row + broadcast_scalar(pid.0 * 256i32, shape![256, 4]);
         let term: Tile<i32, { [4] }> = iota(shape![4]);
-        let base: PointerTile<*const f32, { [] }> = pointer_to_tile(partials);
-        let base: PointerTile<*const f32, { [1] }> = base.reshape(shape![1]);
-        let base: PointerTile<*const f32, { [4] }> = base.broadcast(shape![4]);
-        let mut acc: Tile<f64, { [4] }> = constant(0.0f64, shape![4]);
-        for f in 0i32..n {
-            let at: Tile<i32, { [4] }> = term + broadcast_scalar(4i32 * f, shape![4]);
-            let ptrs: PointerTile<*const f32, { [4] }> = base.offset_tile(at);
-            let (v, _t): (Tile<f32, { [4] }>, Token) = unsafe {
-                load_ptr_tko(
-                    ptrs,
-                    ordering::Weak,
-                    None::<scope::TileBlock>,
-                    None,
-                    None,
-                    None,
-                    Latency::<0>,
-                )
-            };
-            let v: Tile<f64, { [4] }> = convert_tile(v);
-            acc = acc + v;
-        }
+        let term: Tile<i32, { [1, 4] }> = term.reshape(shape![1, 4]);
+        let term: Tile<i32, { [256, 4] }> = term.broadcast(shape![256, 4]);
+        let inside: Tile<bool, { [256, 4] }> = lt_tile(node, broadcast_scalar(n, shape![256, 4]));
+        (node * broadcast_scalar(4i32, shape![256, 4]) + term, inside)
+    }
+
+    /// Pairwise total over the 256 rows, adjacent rows first (`LlkSums`' tree).
+    fn llk_pairs(x: Tile<f64, { [256, 4] }>) -> Tile<f64, { [4] }> {
+        let z: Tile<i32, { [] }> = scalar_to_tile(0i32);
+        let o: Tile<i32, { [] }> = scalar_to_tile(1i32);
+        let x: Tile<f64, { [128, 2, 4] }> = x.reshape(shape![128, 2, 4]);
+        let a: Tile<f64, { [128, 1, 4] }> = extract(x, [z, z, z]);
+        let b: Tile<f64, { [128, 1, 4] }> = extract(x, [z, o, z]);
+        let x: Tile<f64, { [64, 2, 4] }> = (a + b).reshape(shape![64, 2, 4]);
+        let a: Tile<f64, { [64, 1, 4] }> = extract(x, [z, z, z]);
+        let b: Tile<f64, { [64, 1, 4] }> = extract(x, [z, o, z]);
+        let x: Tile<f64, { [32, 2, 4] }> = (a + b).reshape(shape![32, 2, 4]);
+        let a: Tile<f64, { [32, 1, 4] }> = extract(x, [z, z, z]);
+        let b: Tile<f64, { [32, 1, 4] }> = extract(x, [z, o, z]);
+        let x: Tile<f64, { [16, 2, 4] }> = (a + b).reshape(shape![16, 2, 4]);
+        let a: Tile<f64, { [16, 1, 4] }> = extract(x, [z, z, z]);
+        let b: Tile<f64, { [16, 1, 4] }> = extract(x, [z, o, z]);
+        let x: Tile<f64, { [8, 2, 4] }> = (a + b).reshape(shape![8, 2, 4]);
+        let a: Tile<f64, { [8, 1, 4] }> = extract(x, [z, z, z]);
+        let b: Tile<f64, { [8, 1, 4] }> = extract(x, [z, o, z]);
+        let x: Tile<f64, { [4, 2, 4] }> = (a + b).reshape(shape![4, 2, 4]);
+        let a: Tile<f64, { [4, 1, 4] }> = extract(x, [z, z, z]);
+        let b: Tile<f64, { [4, 1, 4] }> = extract(x, [z, o, z]);
+        let x: Tile<f64, { [2, 2, 4] }> = (a + b).reshape(shape![2, 2, 4]);
+        let a: Tile<f64, { [2, 1, 4] }> = extract(x, [z, z, z]);
+        let b: Tile<f64, { [2, 1, 4] }> = extract(x, [z, o, z]);
+        let x: Tile<f64, { [1, 2, 4] }> = (a + b).reshape(shape![1, 2, 4]);
+        let a: Tile<f64, { [1, 1, 4] }> = extract(x, [z, z, z]);
+        let b: Tile<f64, { [1, 1, 4] }> = extract(x, [z, o, z]);
+        let x: Tile<f64, { [4] }> = (a + b).reshape(shape![4]);
+        x
+    }
+
+    /// `out[4 p ..][.. 4] = v` for program `p`.
+    unsafe fn llk_store(out: *mut f64, v: Tile<f64, { [4] }>) {
+        let pid: (i32, i32, i32) = get_tile_block_id();
+        let term: Tile<i32, { [4] }> = iota(shape![4]);
+        let at: Tile<i32, { [4] }> = term + broadcast_scalar(pid.0 * 4i32, shape![4]);
         let dst: PointerTile<*mut f64, { [] }> = pointer_to_tile(out);
         let dst: PointerTile<*mut f64, { [1] }> = dst.reshape(shape![1]);
         let dst: PointerTile<*mut f64, { [4] }> = dst.broadcast(shape![4]);
-        let dst: PointerTile<*mut f64, { [4] }> = dst.offset_tile(term);
+        let dst: PointerTile<*mut f64, { [4] }> = dst.offset_tile(at);
         let _t: Token = unsafe {
             store_ptr_tko(
                 dst,
-                acc,
+                v,
                 ordering::Weak,
                 None::<scope::TileBlock>,
                 None,
@@ -527,6 +552,56 @@ mod device {
                 Latency::<0>,
             )
         };
+    }
+
+    /// First `LlkSums` tree level: program `p` stores the pairwise total of the four-term
+    /// `f32` partials `256 p ..` (`+0.0` from `n` on) as `f64` in `out[4 p ..][.. 4]`.
+    #[cutile::entry()]
+    unsafe fn llk_leaves(partials: *const f32, n: i32, out: *mut f64) {
+        let (at, inside): (Tile<i32, { [256, 4] }>, Tile<bool, { [256, 4] }>) = llk_block(n);
+        let src: PointerTile<*const f32, { [] }> = pointer_to_tile(partials);
+        let src: PointerTile<*const f32, { [1, 1] }> = src.reshape(shape![1, 1]);
+        let src: PointerTile<*const f32, { [256, 4] }> = src.broadcast(shape![256, 4]);
+        let src: PointerTile<*const f32, { [256, 4] }> = src.offset_tile(at);
+        let (v, _t): (Tile<f32, { [256, 4] }>, Token) = unsafe {
+            load_ptr_tko(
+                src,
+                ordering::Weak,
+                None::<scope::TileBlock>,
+                Some(inside),
+                None,
+                None,
+                Latency::<0>,
+            )
+        };
+        let v: Tile<f64, { [256, 4] }> = convert_tile(v);
+        let zero: Tile<f64, { [256, 4] }> = constant(0.0f64, shape![256, 4]);
+        let v: Tile<f64, { [256, 4] }> = select(inside, v, zero);
+        unsafe { llk_store(out, llk_pairs(v)) };
+    }
+
+    /// A later `LlkSums` tree level: as `llk_leaves` over `n` four-term `f64` nodes.
+    #[cutile::entry()]
+    unsafe fn llk_nodes(nodes: *const f64, n: i32, out: *mut f64) {
+        let (at, inside): (Tile<i32, { [256, 4] }>, Tile<bool, { [256, 4] }>) = llk_block(n);
+        let src: PointerTile<*const f64, { [] }> = pointer_to_tile(nodes);
+        let src: PointerTile<*const f64, { [1, 1] }> = src.reshape(shape![1, 1]);
+        let src: PointerTile<*const f64, { [256, 4] }> = src.broadcast(shape![256, 4]);
+        let src: PointerTile<*const f64, { [256, 4] }> = src.offset_tile(at);
+        let (v, _t): (Tile<f64, { [256, 4] }>, Token) = unsafe {
+            load_ptr_tko(
+                src,
+                ordering::Weak,
+                None::<scope::TileBlock>,
+                Some(inside),
+                None,
+                None,
+                Latency::<0>,
+            )
+        };
+        let zero: Tile<f64, { [256, 4] }> = constant(0.0f64, shape![256, 4]);
+        let v: Tile<f64, { [256, 4] }> = select(inside, v, zero);
+        unsafe { llk_store(out, llk_pairs(v)) };
     }
 }
 
@@ -588,9 +663,14 @@ fn offset(what: &str, v: usize) -> Result<i32, Error> {
 
 /// Device address of `buf` as a kernel pointer to `U`.
 fn dptr<T: DeviceCopy, U>(buf: &DeviceBuffer<T>) -> DevicePointer<U> {
+    dptr_at(buf, 0)
+}
+
+/// Device address of `buf[at]` as a kernel pointer to `U`.
+fn dptr_at<T: DeviceCopy, U>(buf: &DeviceBuffer<T>, at: usize) -> DevicePointer<U> {
     // SAFETY: a launch hands the kernel this address with a contract that keeps every
     // access inside `buf` (checked by its caller).
-    unsafe { DevicePointer::from_cu_deviceptr(buf.cu_deviceptr()) }
+    unsafe { DevicePointer::from_cu_deviceptr(buf.cu_deviceptr() + (at * size_of::<T>()) as u64) }
 }
 
 /// Leases `reads` and `writes` on `stream`, runs `enqueue`, and keeps the leases until the
@@ -813,26 +893,72 @@ pub fn update_from_sums(
     })
 }
 
+/// Node counts of the [`ptyrs_gpu::LlkSums`] tree levels above `n` leaves, the root last.
+fn llk_levels(n: u32) -> Vec<usize> {
+    let mut levels = Vec::new();
+    let mut m = n as usize;
+    loop {
+        m = m.div_ceil(LLK_TREE_LEAVES).max(1);
+        levels.push(m);
+        if m == 1 {
+            return levels;
+        }
+    }
+}
+
+/// `f64`s of scratch [`llk_sums`] needs for `n` frames: the tree levels below the root.
+pub fn llk_sums_scratch_len(n: u32) -> usize {
+    let levels = llk_levels(n);
+    4 * levels[..levels.len() - 1].iter().sum::<usize>()
+}
+
 /// [`ptyrs_gpu::LlkSums::from_partials`] of `partials[0 .. n]` on the device, into `out` as
-/// `[poisson, gaussian, euclidean, icalc]`: the same `f64` adds in the same (slice) order,
-/// so the totals equal the host's bit for bit. One program; `n` is a frame count.
+/// `[poisson, gaussian, euclidean, icalc]`, bit for bit: one launch per tree level, the
+/// levels below the root in `scratch` ([`llk_sums_scratch_len`] long).
 pub fn llk_sums(
     stream: &Arc<CudaStream>,
     partials: &DeviceBuffer<LlkPartial>,
     n: u32,
+    scratch: &mut DeviceBuffer<f64>,
     out: &mut DeviceBuffer<f64>,
 ) -> Result<(), Error> {
     check_len("partials", partials, n as usize)?;
+    check_len("scratch", scratch, llk_sums_scratch_len(n))?;
     check_len("out", out, 4)?;
-    // The kernel indexes the partials' floats, `4 n` of them, as i32.
-    let n = offset("n", n as usize)?;
-    offset("4 n", 4 * n as usize)?;
-    launch(stream, &[partials.storage()], &[out.storage()], || {
-        // SAFETY: `partials` holds `n` records of four f32, `out` four f64.
-        unsafe {
-            device::llk_sums(dptr(partials), n, dptr(out))
-                .grid((1, 1, 1))
-                .async_on(stream)?;
+    let levels = llk_levels(n);
+    // The first level's programs index 256 four-term nodes each, as i32.
+    offset("leaf offsets", 4 * LLK_TREE_LEAVES * levels[0])?;
+    let n = n as i32;
+    let reads = [partials.storage()];
+    launch(stream, &reads, &[scratch.storage(), out.storage()], || {
+        // Scratch offset and node count of the level below.
+        let mut below: Option<(usize, i32)> = None;
+        let mut at = 0;
+        for (l, &m) in levels.iter().enumerate() {
+            let dst = if l + 1 == levels.len() {
+                dptr(out)
+            } else {
+                dptr_at(scratch, at)
+            };
+            // SAFETY: `partials` holds `n` records of four f32 and `scratch` every level
+            // below the root, each of `m` four-f64 nodes at `at`; program `p` reads nodes
+            // `256 p ..` below `n` (or the level's count) and writes node `p`.
+            unsafe {
+                match below {
+                    None => {
+                        device::llk_leaves(dptr(partials), n, dst)
+                            .grid((m as u32, 1, 1))
+                            .async_on(stream)?;
+                    }
+                    Some((src, count)) => {
+                        device::llk_nodes(dptr_at(scratch, src), count, dst)
+                            .grid((m as u32, 1, 1))
+                            .async_on(stream)?;
+                    }
+                }
+            }
+            below = Some((at, m as i32));
+            at += 4 * m;
         }
         Ok(())
     })
