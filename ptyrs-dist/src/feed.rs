@@ -2,7 +2,36 @@
 //! each goes to the region that computes it, so the new frames a GPU gets in a stretch of the
 //! measurement are the counts per region over consecutive arrivals.
 
+use std::num::NonZeroUsize;
+
 use crate::Partition;
+
+/// How frames arrive in a live scan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scan {
+    /// Row-major raster, every row `row` points long and scanned in the same direction.
+    Raster { row: NonZeroUsize },
+    /// Fermat spiral, or any scan without rows.
+    Spiral,
+}
+
+/// End (exclusive) of the live batch that starts at arrival `start` and holds at least `want`
+/// frames, clamped to the frames of `part`. On a raster it is the next row end, so batches are
+/// whole rows and each strip gets its row share every batch (a shorter batch can leave GPUs
+/// idle, see [`windows`]); otherwise it is `start + want`.
+///
+/// # Panics
+/// If `start` is past the last frame of `part`.
+pub fn batch_end(part: &Partition, scan: Scan, start: usize, want: NonZeroUsize) -> usize {
+    let n = part.nframe();
+    assert!(start <= n, "batch starts at {start}, scan has {n} frames");
+    let end = start + want.get();
+    match scan {
+        Scan::Raster { row } => end.next_multiple_of(row.get()),
+        Scan::Spiral => end,
+    }
+    .min(n)
+}
 
 /// New frames per region in every window of `len` consecutive arrivals, one window per start
 /// `0..=nframe - len`; empty when the scan is shorter than `len`. Windows start at every
@@ -41,6 +70,48 @@ mod tests {
     use crate::partition::tests::addr;
     use crate::{DEFAULT_TILE, Scheme};
     use ptyrs_core::sim;
+
+    /// A 16-frame request on a 100-wide raster becomes one row, a batch starting mid-row ends
+    /// at that row's end, and every batch from the scan start gives each strip whole rows of
+    /// its share.
+    #[test]
+    fn raster_batches_are_whole_rows() {
+        let (ny, nx) = (6, 100);
+        let p = Partition::from_addr(
+            &addr(sim::raster(ny, nx, 8e-8), 32),
+            DEFAULT_TILE,
+            Scheme::Strips,
+            4,
+        )
+        .unwrap();
+        let n = ny * nx;
+        let k = |v| NonZeroUsize::new(v).unwrap();
+        let raster = Scan::Raster { row: k(nx) };
+        assert_eq!(batch_end(&p, raster, 0, k(16)), nx);
+        assert_eq!(batch_end(&p, raster, 150, k(16)), 200);
+        assert_eq!(batch_end(&p, raster, 100, k(100)), 200);
+        assert_eq!(batch_end(&p, raster, 100, k(101)), 300);
+        assert_eq!(batch_end(&p, raster, 0, k(10 * nx)), n);
+        assert_eq!(batch_end(&p, raster, n, k(16)), n);
+        let mut share = vec![0; 4];
+        for f in 0..nx {
+            share[p.computed_by(f)] += 1;
+        }
+        let mut start = 0;
+        while start < n {
+            let end = batch_end(&p, raster, start, k(16));
+            let mut c = vec![0; 4];
+            for f in start..end {
+                c[p.computed_by(f)] += 1;
+            }
+            let rows = (end - start) / nx;
+            assert_eq!(rows, 1, "batch {start}..{end}");
+            assert_eq!(c, share, "batch {start}..{end}");
+            start = end;
+        }
+        assert_eq!(batch_end(&p, Scan::Spiral, 0, k(16)), 16);
+        assert_eq!(batch_end(&p, Scan::Spiral, n - 5, k(16)), n);
+    }
 
     #[test]
     fn windows_count_each_stretch_of_arrivals() {
