@@ -11,7 +11,7 @@ use cuda_async::device_buffer::DevicePointer;
 use cuda_async::error::DeviceError;
 use cuda_core::{AllocationLease, CudaStream, DeviceBuffer, DeviceCopy, RawDeviceBuffer};
 use cutile::prelude::*;
-use ptyrs_gpu::{C32, OBJ_TILE, UpdateSums, Views};
+use ptyrs_gpu::{C32, LlkPartial, OBJ_TILE, UpdateSums, Views};
 
 #[cutile::module]
 mod device {
@@ -354,6 +354,50 @@ mod device {
             )
         };
     }
+
+    /// `LlkSums::from_partials` over `partials[0 .. n]` (four `f32` each: Poisson, Gaussian,
+    /// Euclidean, calculated intensity): lane `t` adds term `t` of each partial in `f64`,
+    /// in slice order, from zero, and `out[t]` takes the total.
+    #[cutile::entry()]
+    unsafe fn llk_sums(partials: *const f32, n: i32, out: *mut f64) {
+        let term: Tile<i32, { [4] }> = iota(shape![4]);
+        let base: PointerTile<*const f32, { [] }> = pointer_to_tile(partials);
+        let base: PointerTile<*const f32, { [1] }> = base.reshape(shape![1]);
+        let base: PointerTile<*const f32, { [4] }> = base.broadcast(shape![4]);
+        let mut acc: Tile<f64, { [4] }> = constant(0.0f64, shape![4]);
+        for f in 0i32..n {
+            let at: Tile<i32, { [4] }> = term + broadcast_scalar(4i32 * f, shape![4]);
+            let ptrs: PointerTile<*const f32, { [4] }> = base.offset_tile(at);
+            let (v, _t): (Tile<f32, { [4] }>, Token) = unsafe {
+                load_ptr_tko(
+                    ptrs,
+                    ordering::Weak,
+                    None::<scope::TileBlock>,
+                    None,
+                    None,
+                    None,
+                    Latency::<0>,
+                )
+            };
+            let v: Tile<f64, { [4] }> = convert_tile(v);
+            acc = acc + v;
+        }
+        let dst: PointerTile<*mut f64, { [] }> = pointer_to_tile(out);
+        let dst: PointerTile<*mut f64, { [1] }> = dst.reshape(shape![1]);
+        let dst: PointerTile<*mut f64, { [4] }> = dst.broadcast(shape![4]);
+        let dst: PointerTile<*mut f64, { [4] }> = dst.offset_tile(term);
+        let _t: Token = unsafe {
+            store_ptr_tko(
+                dst,
+                acc,
+                ordering::Weak,
+                None::<scope::TileBlock>,
+                None,
+                None,
+                Latency::<0>,
+            )
+        };
+    }
 }
 
 #[derive(Debug)]
@@ -558,6 +602,31 @@ pub fn update_from_sums(
         unsafe {
             device::normalize_update(dptr(x), dptr(num), dptr(den), n, dptr(&max_bits), inertia)
                 .grid(((2 * n as u32).div_ceil(1024), 1, 1))
+                .async_on(stream)?;
+        }
+        Ok(())
+    })
+}
+
+/// [`ptyrs_gpu::LlkSums::from_partials`] of `partials[0 .. n]` on the device, into `out` as
+/// `[poisson, gaussian, euclidean, icalc]`: the same `f64` adds in the same (slice) order,
+/// so the totals equal the host's bit for bit. One program; `n` is a frame count.
+pub fn llk_sums(
+    stream: &Arc<CudaStream>,
+    partials: &DeviceBuffer<LlkPartial>,
+    n: u32,
+    out: &mut DeviceBuffer<f64>,
+) -> Result<(), Error> {
+    check_len("partials", partials, n as usize)?;
+    check_len("out", out, 4)?;
+    // The kernel indexes the partials' floats, `4 n` of them, as i32.
+    let n = offset("n", n as usize)?;
+    offset("4 n", 4 * n as usize)?;
+    launch(stream, &[partials.storage()], &[out.storage()], || {
+        // SAFETY: `partials` holds `n` records of four f32, `out` four f64.
+        unsafe {
+            device::llk_sums(dptr(partials), n, dptr(out))
+                .grid((1, 1, 1))
                 .async_on(stream)?;
         }
         Ok(())
