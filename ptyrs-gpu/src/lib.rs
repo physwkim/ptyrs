@@ -18,6 +18,9 @@ use cuda_core::{
 };
 use ptyrs_kernels::kernels::LoadedModule;
 
+mod ops;
+
+pub use ops::{LlkPartial, LlkSums, MASKED, OBJ_TILE, UpdateSums, ViewAddr, ViewDims, Views};
 pub use ptyrs_fft::C32;
 
 /// The linked device code: every `ptyrs-kernels` kernel plus the cuFFT functions they call.
@@ -127,9 +130,9 @@ fn check_len<T: DeviceCopy>(what: &str, buf: &DeviceBuffer<T>, need: usize) -> R
     Ok(())
 }
 
-/// Device address of a buffer as the kernels take it.
-fn dptr<T: DeviceCopy>(buf: &DeviceBuffer<T>) -> *mut f32 {
-    buf.cu_deviceptr() as *mut f32
+/// Device address of a buffer as the kernels take it (complex buffers as `*mut f32`).
+fn dptr<T: DeviceCopy, U>(buf: &DeviceBuffer<T>) -> *mut U {
+    buf.cu_deviceptr() as *mut U
 }
 
 /// The loaded kernels of [`CUBIN`] in one context.
