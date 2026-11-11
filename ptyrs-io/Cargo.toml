@@ -1,0 +1,10 @@
+[package]
+name = "ptyrs-io"
+version.workspace = true
+edition.workspace = true
+description = "ptyrs file I/O: PyNX-layout CXI scans and object/probe files on the pure-Rust rust-hdf5 crate"
+
+[dependencies]
+ptyrs-core.workspace = true
+rust-hdf5.workspace = true
+thiserror.workspace = true
