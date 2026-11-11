@@ -137,9 +137,9 @@ fn dm_converges_and_records_on_schedule() {
     assert!(end < start / 10.0, "start {start} end {end} truth {truth}");
 }
 
-/// DM against PyNX `cpu_operator` promoted to f64 (`scripts/compare_pynx_dm.py`), cycles
-/// 0-19 of `cargo run --release -p ptyrs-engine --example dm_llk -- <dir> 20 1 32 40`, saved
-/// from `<dir>/llk_pynx_f64.txt` to `tests/data/dm_pynx_f64.txt`.
+/// DM against PyNX `cpu_operator` promoted to f64 (`scripts/compare_pynx.py <dir> dm`),
+/// cycles 0-19 of `cargo run --release -p ptyrs-engine --example llk_trace -- <dir> dm 20 1 32
+/// 40`, saved from `<dir>/llk_pynx_dm_f64.txt` to `tests/data/dm_pynx_f64.txt`.
 #[test]
 fn dm_llk_matches_pynx() {
     let (scan, object, probe) = common::dm_scenario(32, 40, 1, 2e5);

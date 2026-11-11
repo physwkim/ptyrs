@@ -1,4 +1,4 @@
-//! The DM parity scenario, shared by `tests/reconstruct.rs` and `examples/dm_llk.rs` so the
+//! The parity scenario, shared by `tests/reconstruct.rs` and `examples/llk_trace.rs` so the
 //! PyNX values in `tests/data` stay reproducible from the example.
 
 use ptyrs_core::{C64, Geometry, Object, Positions, Probe, Scan, Stack, required_obj_shape};

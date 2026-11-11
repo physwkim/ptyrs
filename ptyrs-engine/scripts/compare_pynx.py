@@ -1,9 +1,9 @@
-"""PyNX DM on the scan and starting point written by `cargo run --example dm_llk`.
+"""PyNX DM or AP on the scan and starting point written by `cargo run --example llk_trace`.
 
-Usage: python -I compare_pynx_dm.py <dir> [--cuda]
+Usage: python -I compare_pynx.py <dir> <dm|ap> [--cuda]
 
-Reads <dir>/scan.cxi, init.h5, llk_rust.txt and final_rust.h5. Runs DM(calc_llk=1) for
-as many cycles as the Rust run with
+Reads <dir>/scan.cxi, init.h5, llk_rust.txt and final_rust.h5. Runs DM(calc_llk=1), or
+AP(update_probe=True, calc_llk=1), for as many cycles as the Rust run with
   - f64: PyNX cpu_operator with every complex64/float32 promoted to complex128/float64,
   - f32: the stock PyNX cpu_operator,
   - cuda (with --cuda): the PyNX CUDA operator,
@@ -79,7 +79,9 @@ def rel_l2(a, b):
 
 
 def main():
-    d = sys.argv[1]
+    d, algo = sys.argv[1], sys.argv[2]
+    make = {"dm": lambda op: op.DM(calc_llk=1),
+            "ap": lambda op: op.AP(update_object=True, update_probe=True, calc_llk=1)}[algo]
     rust = np.loadtxt(f"{d}/llk_rust.txt", ndmin=2)
     ncycle = len(rust)
     assert (rust[:, 0] == np.arange(ncycle)).all(), "llk_rust.txt must hold every cycle"
@@ -92,16 +94,17 @@ def main():
     # before the cycle's object/probe update, so its record at cycle c + 1 is the CPU's at c.
     # Its ScaleObjProbe(absolute=False) after each LLK only trades scale between object and
     # probe, which DM is covariant under; the final arrays are compared up to a complex scale.
+    # AP records the LLK of the estimate before the update on both CPU and CUDA.
     runs = [("f64", cpu_operator_f64(), True, 0), ("f32", cpu32, False, 0)]
-    if "--cuda" in sys.argv[2:]:
+    if "--cuda" in sys.argv[3:]:
         import pynx.ptycho.cu_operator as cuop
-        runs.append(("cuda", cuop, False, 1))
+        runs.append(("cuda", cuop, False, 1 if algo == "dm" else 0))
 
     for name, op, f64, lag in runs:
         p = build(*args, f64=f64)
-        p = op.DM(calc_llk=1) ** ncycle * p
+        p = make(op) ** ncycle * p
         h = history(p, ncycle)
-        np.savetxt(f"{d}/llk_pynx_{name}.txt",
+        np.savetxt(f"{d}/llk_pynx_{algo}_{name}.txt",
                    np.column_stack([np.arange(ncycle), h]), fmt=["%d"] + ["%.17e"] * 4)
         h, ref = h[lag:], rust[:ncycle - lag]
         r = np.abs(h - ref) / np.abs(ref)
