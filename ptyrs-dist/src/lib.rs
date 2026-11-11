@@ -7,6 +7,7 @@ pub mod p2p;
 pub mod partition;
 #[cfg(test)]
 mod synth;
+pub mod tomo;
 pub mod topo;
 pub mod worker;
 
@@ -32,4 +33,10 @@ pub enum DistError {
     Aborted,
     #[error("workers met a different number of fences")]
     FenceMismatch,
+    #[error("angle {angle}: {source}")]
+    Angle {
+        angle: usize,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
