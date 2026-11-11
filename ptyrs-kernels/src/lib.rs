@@ -142,6 +142,7 @@ pub mod kernels {
     use crate::pixel::*;
     use cuda_device::SharedArray;
     use cuda_device::atomic::{AtomicOrdering, DeviceAtomicU32};
+    use cuda_device::float::{add_rn_f32, div_rn_f32, mul_rn_f32};
 
     // M1 pixel kernels. Shapes, orders and the FFT scaling convention are documented on the
     // ptyrs-gpu wrappers, which check them; `pixel` documents the index maps. A "stack" is
@@ -475,7 +476,8 @@ pub mod kernels {
     }
 
     /// PyNX `ObjNorm`: `x = (num + reg x) / max(den + reg, 1e-12)` with
-    /// `reg = inertia * f32::from_bits(*max_bits)`, for `n` elements.
+    /// `reg = inertia * f32::from_bits(*max_bits)`, for `n` elements. Every operation is
+    /// rounded on its own (no FMA contraction), so the result is the plain f32 formula.
     ///
     /// # Safety
     ///
@@ -494,10 +496,11 @@ pub mod kernels {
             return;
         }
         unsafe {
-            let reg = inertia * f32::from_bits(*max_bits);
-            let d = (*den.add(g) + reg).max(1e-12);
+            let reg = mul_rn_f32(inertia, f32::from_bits(*max_bits));
+            let d = add_rn_f32(*den.add(g), reg).max(1e-12);
             let (a, b) = (load_c(num, g), load_c(x, g));
-            store_c(x, g, ((a.0 + reg * b.0) / d, (a.1 + reg * b.1) / d));
+            let part = |a: f32, b: f32| div_rn_f32(add_rn_f32(a, mul_rn_f32(reg, b)), d);
+            store_c(x, g, (part(a.0, b.0), part(a.1, b.1)));
         }
     }
 

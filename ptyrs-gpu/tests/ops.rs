@@ -512,9 +512,27 @@ fn update_from_sums_matches_f64() {
         };
         k.update_from_sums(&stream, &mut x, &sums, len as u32, inertia)
             .unwrap();
-        let err = rel_l2(&x.to_host_vec(&stream).unwrap(), &want);
+        let got = x.to_host_vec(&stream).unwrap();
+        let err = rel_l2(&got, &want);
         println!("update_from_sums n={len}: rel L2 {err:.2e}");
         assert!(err < 1e-6, "n={len}: rel L2 {err:.2e}");
+
+        // Bit for bit the plain f32 formula, each operation rounded on its own (what a Tile
+        // or CPU port computes), not a mix of fused and separate roundings.
+        let reg = inertia * den_host.iter().fold(0.0f32, |m, &v| m.max(v));
+        let mismatches = (0..len)
+            .filter(|&i| {
+                let d = (den_host[i] + reg).max(1e-12);
+                let part = |a: f32, b: f32| (a + reg * b) / d;
+                let (a, b) = (num_host[i], x_host[i]);
+                let w = (part(a.re, b.re), part(a.im, b.im));
+                (got[i].re.to_bits(), got[i].im.to_bits()) != (w.0.to_bits(), w.1.to_bits())
+            })
+            .count();
+        assert_eq!(
+            mismatches, 0,
+            "n={len}: {mismatches} values differ from plain f32"
+        );
     }
 }
 
