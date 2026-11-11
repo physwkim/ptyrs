@@ -15,6 +15,8 @@
 //! completes: dropping a buffer early is safe, and a conflicting access to it from another
 //! stream fails with `CUDA_ERROR_NOT_READY` until then. A captured graph instead keeps the
 //! accesses and reacquires them on every replay. Work on one stream runs in order.
+//! `ptyrs_fft::Plan2d` transforms take the same context and lease the same way, so they mix
+//! freely with the launches here, in a `record` closure or a capture.
 
 use std::future::IntoFuture;
 use std::sync::Arc;
@@ -26,6 +28,7 @@ use cuda_async::error::DeviceError;
 use cuda_core::{
     CudaContext, CudaStream, DeviceBuffer, DeviceCopy, DriverError, LaunchConfig, RawDeviceBuffer,
 };
+use ptyrs_fft::FftError;
 use ptyrs_kernels::kernels::LoadedModule;
 
 mod ops;
@@ -76,6 +79,8 @@ pub enum Error {
     ContextMismatch,
     /// A size is zero or out of range, a layout overlaps, or a buffer is too short.
     Shape(String),
+    /// Non-zero `cufftResult` from a `ptyrs_fft::Plan2d` call.
+    Cufft(i32),
 }
 
 impl std::fmt::Display for Error {
@@ -91,6 +96,7 @@ impl std::fmt::Display for Error {
             ),
             Self::ContextMismatch => write!(f, "buffers, stream and kernels span contexts"),
             Self::Shape(what) => write!(f, "bad shape: {what}"),
+            Self::Cufft(r) => write!(f, "cuFFT error {r}"),
         }
     }
 }
@@ -109,6 +115,21 @@ impl From<DeviceError> for Error {
     }
 }
 
+impl From<FftError> for Error {
+    fn from(e: FftError) -> Self {
+        match e {
+            FftError::Cufft(r) => Self::Cufft(r),
+            FftError::Driver(e) => Self::Driver(e),
+            FftError::Device(e) => Self::Device(e),
+            FftError::BufferTooSmall { need, have } => {
+                Self::Shape(format!("FFT buffer holds {have} elements, needs {need}"))
+            }
+            FftError::ContextMismatch => Self::ContextMismatch,
+            FftError::BadShape => Self::Shape("FFT side or batch is zero or exceeds i32".into()),
+        }
+    }
+}
+
 impl From<Error> for DeviceError {
     fn from(e: Error) -> Self {
         match e {
@@ -119,27 +140,13 @@ impl From<Error> for DeviceError {
     }
 }
 
-/// Registers `reads` and `writes` with `ctx` before work touching them is enqueued on its
-/// stream. Eagerly, each is leased until `ctx`'s work completes; while `ctx` records a
-/// capture, the graph keeps the access and reacquires it on every replay.
+/// [`ptyrs_fft::lease`], the one access rule of every launch, with this crate's [`Error`].
 pub fn lease(
     ctx: &ExecutionContext,
     reads: &[&RawDeviceBuffer],
     writes: &[&RawDeviceBuffer],
 ) -> Result<(), Error> {
-    let all = || {
-        reads
-            .iter()
-            .map(|b| (b, false))
-            .chain(writes.iter().map(|b| (b, true)))
-    };
-    if all().any(|(b, _)| b.context().as_ref() != ctx.context().as_ref()) {
-        return Err(Error::ContextMismatch);
-    }
-    for (buf, write) in all() {
-        ctx.retain_buffer((*buf).clone(), write)?;
-    }
-    Ok(())
+    Ok(ptyrs_fft::lease(ctx, reads, writes)?)
 }
 
 /// Zeroes `buf` on `ctx`'s stream (a memset node under capture), leased like a launch.

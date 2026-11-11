@@ -9,7 +9,7 @@ use cuda_async::cuda_graph::CudaGraph;
 use cuda_async::device_operation::{DeviceOp, ExecutionContext};
 use cuda_async::error::DeviceError;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, DeviceCopy, DriverError};
-use ptyrs_fft::Plan2d;
+use ptyrs_fft::{FftError, Plan2d};
 use ptyrs_gpu::{
     C32, Error, Kernels, Lines, LlkPartial, LlkSums, MASKED, UpdateSums, ViewAddr, ViewDims, Views,
     record,
@@ -682,7 +682,7 @@ fn fourier_projection_matches_pynx_orthonormal_f64() {
     let want: Vec<Z> = far.chunks(n).flat_map(|p| dft2_ortho(p, N, true)).collect();
 
     let views = Views::new(&stream, d, &s.views).unwrap();
-    let plan = Plan2d::new(&stream, N, nf * nm).unwrap();
+    let mut plan = Plan2d::new(&stream, N, nf * nm).unwrap();
     let counts = up(&stream, &counts_host);
     let mut psi = DeviceBuffer::<C32>::zeroed(&stream, nf * nm * n).unwrap();
     k.obj_probe_to_psi(
@@ -694,11 +694,11 @@ fn fourier_projection_matches_pynx_orthonormal_f64() {
         &mut psi,
     )
     .unwrap();
-    plan.forward_inplace(&mut psi).unwrap();
+    plan.forward_inplace(&ex, &mut psi).unwrap();
     let mut llk = DeviceBuffer::<LlkPartial>::zeroed(&stream, nf).unwrap();
     k.llk(&ex, &d, 0..3, &counts, &psi, &mut llk).unwrap();
     k.apply_amplitude(&ex, &d, 0..3, &counts, &mut psi).unwrap();
-    plan.inverse_inplace(&mut psi).unwrap();
+    plan.inverse_inplace(&ex, &mut psi).unwrap();
 
     assert_llk("chain llk", &llk.to_host_vec(&stream).unwrap(), &llk_ref);
     let err = rel_l2(&psi.to_host_vec(&stream).unwrap(), &want);
@@ -753,7 +753,7 @@ fn views_and_frame_ranges_are_checked() {
     assert!(matches!(r, Err(Error::Shape(_))), "short psi");
 }
 
-/// Side of the square image the line FFTs of [`Iteration`] round-trip.
+/// Side of the square image the line FFTs and the `Plan2d` of [`Iteration`] round-trip.
 const AUX: u32 = 128;
 
 /// State that one call of every launch method updates in place.
@@ -768,6 +768,7 @@ struct Iteration {
     probe_sums: UpdateSums,
     aux: DeviceBuffer<C32>,
     tmp: DeviceBuffer<C32>,
+    plan: Plan2d,
 }
 
 impl Iteration {
@@ -786,11 +787,12 @@ impl Iteration {
             probe_sums: UpdateSums::zeroed(stream, s.probe.len()).unwrap(),
             aux: up(stream, &noise(aux, 51, 1.0)),
             tmp: DeviceBuffer::zeroed(stream, aux).unwrap(),
+            plan: Plan2d::new(stream, AUX as usize, 1).unwrap(),
         }
     }
 
-    /// A DM iteration without the FFTs (`Plan2d` launches are not leased), then a 2D FFT
-    /// round trip of `aux` through the line kernels.
+    /// A DM iteration, then 2D FFT round trips of `aux` through the line kernels and through
+    /// every `Plan2d` transform.
     fn run(
         &mut self,
         ctx: &ExecutionContext,
@@ -851,7 +853,14 @@ impl Iteration {
         k.fft_lines_inplace(ctx, &mut self.tmp, cols, false)?;
         k.fft_lines(ctx, &self.tmp, &mut self.aux, rows, true)?;
         k.fft_lines_inplace(ctx, &mut self.aux, cols, true)?;
-        k.scale_c32(ctx, &mut self.aux, AUX * AUX, 1.0 / (AUX * AUX) as f32)
+        k.scale_c32(ctx, &mut self.aux, AUX * AUX, 1.0 / (AUX * AUX) as f32)?;
+
+        self.plan.forward(ctx, &self.aux, &mut self.tmp)?;
+        self.plan.inverse_inplace(ctx, &mut self.tmp)?;
+        self.plan.forward_inplace(ctx, &mut self.tmp)?;
+        self.plan.inverse(ctx, &self.tmp, &mut self.aux)?;
+        let n4 = ((AUX * AUX) as f32).powi(2);
+        k.scale_c32(ctx, &mut self.aux, AUX * AUX, 1.0 / n4)
     }
 
     /// The bits of every buffer `run` writes.
@@ -936,7 +945,8 @@ fn captured_iteration_replays_bitwise_like_eager() {
     }
 
     // A replay holds its accesses until it completes: another stream can neither write
-    // `obj`, which the graph reads, nor read `icalc`, which it only writes.
+    // `obj`, which the graph reads, nor read `icalc`, which it only writes, nor run the
+    // plan, whose work area the graph writes.
     let replay = ExecutionContext::new(side.clone());
     // SAFETY: `replay` keeps the launch's leases until `side` is synchronized below, and
     // those leases refuse every other access to the buffers until then.
@@ -951,6 +961,15 @@ fn captured_iteration_replays_bitwise_like_eager() {
     let refused = it.icalc.to_host_vec(&stream);
     assert!(
         matches!(refused, Err(DriverError(e)) if e == not_ready),
+        "{refused:?}"
+    );
+    let (a, mut b) = (
+        DeviceBuffer::<C32>::zeroed(&stream, it.aux.len()).unwrap(),
+        DeviceBuffer::<C32>::zeroed(&stream, it.aux.len()).unwrap(),
+    );
+    let refused = it.plan.forward(&other, &a, &mut b);
+    assert!(
+        matches!(refused, Err(FftError::Device(DeviceError::Driver(DriverError(e)))) if e == not_ready),
         "{refused:?}"
     );
     side.synchronize().unwrap();
