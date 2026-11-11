@@ -1616,6 +1616,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ptyrs-engine"
+version = "0.0.1"
+dependencies = [
+ "num-complex",
+ "ptyrs-core",
+ "ptyrs-io",
+ "rustfft",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "ptyrs-fft"
 version = "0.0.1"
 dependencies = [

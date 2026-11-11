@@ -1,0 +1,14 @@
+[package]
+name = "ptyrs-engine"
+version.workspace = true
+edition.workspace = true
+description = "ptyrs CPU f64 reference engine: PyNX operators, AP, DM and rPIE, the oracle for the GPU kernels"
+
+[dependencies]
+ptyrs-core.workspace = true
+num-complex.workspace = true
+rustfft.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+ptyrs-io.workspace = true
