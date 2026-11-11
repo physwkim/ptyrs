@@ -3,7 +3,9 @@
 
 pub mod codec;
 pub mod ntnd;
+pub mod pipeline;
 pub mod pos;
+pub mod pva_source;
 pub mod ring;
 pub mod sched;
 pub mod stats;
