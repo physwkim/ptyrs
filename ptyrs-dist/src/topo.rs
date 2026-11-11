@@ -109,8 +109,10 @@ pub fn links(devs: &[Device]) -> Result<Vec<PeerLink>, DistError> {
     Ok(out)
 }
 
-/// Enables peer access in both directions for every pair of `ctxs`. A pair without P2P is an
+/// Enables peer access in both directions for every pair of `ctxs`, then has every device
+/// read every peer with a kernel. A pair without P2P, or whose reads arrive corrupted, is an
 /// error: halo exchange reads neighbour memory directly and has no host-staged fallback.
+/// Access stays enabled when the read check fails.
 pub fn enable_all_pairs(ctxs: &[Arc<Context>]) -> Result<(), DistError> {
     for a in ctxs {
         for b in ctxs.iter().filter(|b| b.ordinal() != a.ordinal()) {
@@ -123,7 +125,7 @@ pub fn enable_all_pairs(ctxs: &[Arc<Context>]) -> Result<(), DistError> {
             peer::enable_peer_access(a, b)?;
         }
     }
-    Ok(())
+    crate::p2p::verify_reads(ctxs)
 }
 
 #[cfg(test)]

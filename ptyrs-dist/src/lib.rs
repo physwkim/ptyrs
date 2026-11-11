@@ -2,6 +2,7 @@
 //! partitioned into one region per GPU plus a one-probe halo.
 
 pub mod exchange;
+pub mod p2p;
 pub mod partition;
 #[cfg(test)]
 mod synth;
@@ -22,6 +23,8 @@ pub enum DistError {
     Topology(String),
     #[error("GPU {from} cannot access GPU {to} peer-to-peer")]
     NoPeerAccess { from: usize, to: usize },
+    #[error("peer reads return wrong data for (reader, owner) GPUs {0:?}")]
+    PeerReadFault(Vec<(usize, usize)>),
     #[error("region {region} panicked: {msg}")]
     Panic { region: usize, msg: String },
     #[error("another worker failed")]
