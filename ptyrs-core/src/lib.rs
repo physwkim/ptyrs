@@ -11,6 +11,7 @@ mod addr;
 mod array;
 mod counts;
 mod error;
+pub mod frc;
 mod geometry;
 mod positions;
 mod scan;

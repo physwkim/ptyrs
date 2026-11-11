@@ -1670,6 +1670,7 @@ dependencies = [
  "rand",
  "rand_chacha",
  "rand_distr",
+ "rustfft",
  "thiserror 2.0.21",
 ]
 
