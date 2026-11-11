@@ -4,6 +4,7 @@
 
 pub mod codec;
 pub mod eiger;
+pub mod grow;
 pub mod ntnd;
 pub mod pipeline;
 pub mod pos;
