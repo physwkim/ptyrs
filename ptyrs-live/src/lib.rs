@@ -10,6 +10,7 @@ pub mod ntnd;
 pub mod object;
 pub mod pipeline;
 pub mod pos;
+pub mod pv_out;
 pub mod pva_source;
 pub mod ring;
 pub mod sched;
