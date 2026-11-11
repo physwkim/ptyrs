@@ -25,9 +25,10 @@ use epics_pva_rs::client_native::PvaClient;
 use ptyrs_live::args::Args;
 use ptyrs_live::consumer::{checksum, run_checksum_consumer};
 use ptyrs_live::eiger::{EigerFrames, Progress, PullReport, run_pull};
+use ptyrs_live::handoff::work_queue;
 use ptyrs_live::model::Model;
 use ptyrs_live::pipeline::{
-    Geometry, Placement, SourceStats, Truth, Work, WorkerCfg, WorkerReport, worker,
+    Geometry, Placement, SourceStats, Truth, WorkerCfg, WorkerReport, worker,
 };
 use ptyrs_live::pos::PosTable;
 use ptyrs_live::pva_source::{NtndFrames, PosStats, monitor_positions};
@@ -141,7 +142,7 @@ fn main() {
             })
             .unwrap()
     };
-    let (tx, rx) = crossbeam_channel::bounded::<Work>(a.get("queue", 256));
+    let (tx, rx) = work_queue(a.get("queue", NonZeroUsize::new(256).unwrap()));
     let pos = Arc::new(PosTable::new(1 << 16));
     let handles: Vec<_> = (0..workers)
         .map(|i| {

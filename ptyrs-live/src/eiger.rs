@@ -12,10 +12,10 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
-use crossbeam_channel::Sender;
 use serde::{Deserialize, Serialize};
 
 use crate::codec::{Codec, bshuf_block_elems};
+use crate::handoff::WorkTx;
 use crate::pipeline::{Geometry, SourceStats, Work};
 use crate::stats::wall_ns;
 
@@ -195,7 +195,7 @@ impl EigerFrames {
         }
     }
 
-    pub fn on_message(&mut self, parts: &[Bytes], st: &mut SourceStats, tx: &Sender<Work>) -> Kind {
+    pub fn on_message(&mut self, parts: &[Bytes], st: &mut SourceStats, tx: &WorkTx) -> Kind {
         let t_rx = wall_ns();
         match self.classify(parts, t_rx) {
             Ok(Msg::Image(w)) => {
@@ -341,7 +341,7 @@ pub fn run_pull(
     rcvhwm: i32,
     mut frames: EigerFrames,
     st: Arc<Mutex<SourceStats>>,
-    tx: Sender<Work>,
+    tx: WorkTx,
     stop: &AtomicBool,
     progress: &Progress,
 ) -> zmq::Result<PullReport> {
@@ -388,6 +388,11 @@ pub fn run_pull(
 mod tests {
     use super::*;
     use crate::codec::{bslz4_compress_u16, bytemuck_u16, lz4_compress};
+    use crate::handoff::{WorkRx, work_queue};
+
+    fn queue() -> (WorkTx, WorkRx) {
+        work_queue(std::num::NonZeroUsize::new(16).unwrap())
+    }
 
     fn geom(w: usize, h: usize) -> Geometry {
         Geometry::centred(w, h, 16, w / 2, h / 2)
@@ -422,7 +427,7 @@ mod tests {
     fn series_round_trips_every_encoding() {
         let (w, h) = (40, 30);
         let img: Vec<u16> = (0..w * h).map(|i| (i % 97) as u16).collect();
-        let (tx, rx) = crossbeam_channel::unbounded();
+        let (tx, rx) = queue();
         let mut st = SourceStats::new(3);
         let mut f = EigerFrames::new(geom(w, h));
         let cfg = SeriesConfig {
@@ -475,7 +480,7 @@ mod tests {
     fn rejects_what_adeiger_would_misread() {
         let (w, h) = (40, 30);
         let img = vec![1u16; w * h];
-        let (tx, _rx) = crossbeam_channel::unbounded();
+        let (tx, _rx) = queue();
         let mut st = SourceStats::new(10);
         let mut f = EigerFrames::new(geom(w, h));
         // Image before any header.
@@ -501,7 +506,7 @@ mod tests {
         p[2] = p[2].slice(2..);
         assert_eq!(f.on_message(&p, &mut st, &tx), Kind::Rejected);
         // Without the simulator clock, publish time falls back to arrival.
-        let (tx2, rx2) = crossbeam_channel::unbounded();
+        let (tx2, rx2) = queue();
         assert_eq!(
             f.on_message(&image(Codec::None, 4, &img, w, h), &mut st, &tx2),
             Kind::Image

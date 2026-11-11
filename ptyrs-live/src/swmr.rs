@@ -21,6 +21,7 @@ use rust_hdf5::swmr::{SwmrFileReader, SwmrFileWriter};
 
 use crate::codec::{Codec, bslz4_compress_u16, bytemuck_u16, lz4_compress};
 use crate::eiger::{Progress, blob_prefix};
+use crate::handoff::WorkTx;
 use crate::pipeline::{Placement, SourceStats, Work};
 use crate::pos::{Pos, PosTable};
 use crate::stats::{Histogram, mono_ns, wall_ns};
@@ -248,7 +249,7 @@ pub fn run_swmr(
     cfg: &SwmrCfg,
     st: &Mutex<SourceStats>,
     pos: &PosTable,
-    tx: Sender<Work>,
+    tx: WorkTx,
     place: &Placement,
     stop: &AtomicBool,
     progress: &Progress,
@@ -365,7 +366,7 @@ fn read_frames(
     cfg: &SwmrCfg,
     jobs: Receiver<Job>,
     st: &Mutex<SourceStats>,
-    tx: Sender<Work>,
+    tx: WorkTx,
     progress: &Progress,
 ) -> Result<(Histogram, u64), String> {
     let mut retries = 0;
@@ -472,7 +473,7 @@ mod tests {
     ) -> (Vec<Work>, PosTable, Result<SwmrReport, String>) {
         let st = Mutex::new(SourceStats::new(frames));
         let pos = PosTable::new(1 << 12);
-        let (tx, rx) = crossbeam_channel::bounded(frames as usize);
+        let (tx, rx) = crate::handoff::work_queue((frames as usize).try_into().unwrap());
         let place = Placement::new("", 1, 0, cfg.readers, 0);
         let (stop, progress) = (AtomicBool::new(false), Progress::default());
         let mut got = Vec::new();
@@ -481,8 +482,8 @@ mod tests {
             let src = sc.spawn(|| run_swmr(cfg, &st, &pos, tx, &place, &stop, &progress));
             while (got.len() as u64) < frames {
                 match rx.recv_timeout(Duration::from_secs(20)) {
-                    Ok(w) => got.push(w),
-                    Err(_) => break,
+                    Some(w) => got.push(w),
+                    None => break,
                 }
             }
             stop.store(true, Ordering::Relaxed);

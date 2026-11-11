@@ -5,7 +5,6 @@ use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
-use crossbeam_channel::Sender;
 use epics_pva_rs::PvaResult;
 use epics_pva_rs::client_native::PvaClient;
 use epics_pva_rs::client_native::ops_v2::SubscriptionHandle;
@@ -14,6 +13,7 @@ use epics_pva_rs::pv_request::PvRequestBuilder;
 use epics_pva_rs::pvdata::FieldDesc;
 
 use crate::codec::Codec;
+use crate::handoff::WorkTx;
 use crate::ntnd::{FrameLayout, check_position_layout, parse_frame_head, parse_position};
 use crate::pipeline::{Geometry, SourceStats, Work};
 use crate::pos::{Pos, PosTable};
@@ -51,7 +51,7 @@ impl NtndFrames {
         desc: &FieldDesc,
         body: Bytes,
         order: ByteOrder,
-        tx: &Sender<Work>,
+        tx: &WorkTx,
     ) {
         let t_rx = wall_ns();
         let key = desc as *const FieldDesc as usize;

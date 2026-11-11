@@ -7,12 +7,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use crossbeam_channel::{Receiver, Sender, TrySendError};
 
 use crate::codec::{
     Bslz4Scratch, Codec, bslz4_decompress_into_u16, bslz4_decompress_range_u16, bytemuck_u16,
     bytemuck_u16_mut, lz4_decompress_into,
 };
+use crate::handoff::{WorkRx, WorkTx};
 use crate::pos::PosTable;
 use crate::ring::Ring;
 use crate::sched::{parse_cpu_list, pin_current, set_util_min};
@@ -160,7 +160,7 @@ impl WorkerReport {
 /// Decode → position match → crop → ring, until every sender is gone.
 /// One image-sized scratch per worker, allocated once.
 pub fn worker(
-    rx: Receiver<Work>,
+    rx: WorkRx,
     ring: Arc<Ring>,
     pos: Arc<PosTable>,
     cfg: WorkerCfg,
@@ -178,7 +178,7 @@ pub fn worker(
     let rows = g.y0 * g.width..(g.y0 + g.crop) * g.width;
     let row_bytes = g.crop * 2;
     let cpu0 = thread_cpu_ns();
-    'frames: for w in rx.iter() {
+    'frames: while let Some(w) = rx.recv() {
         let t = mono_ns();
         let res = match w.codec {
             Codec::None if w.payload.len() == g.pixels() * 2 => Ok(()),
@@ -279,7 +279,7 @@ impl SourceStats {
 
     /// Count `w` and pass it to the workers unless it repeats a uid or lies
     /// past the run. A full queue drops it (counted, never blocks the source).
-    pub fn accept(&mut self, w: Work, tx: &Sender<Work>) {
+    pub fn accept(&mut self, w: Work, tx: &WorkTx) {
         let (uid, t_rx) = (w.uid, w.t_rx);
         if self.first_rx.is_none() {
             self.first_rx = Some(t_rx);
@@ -311,10 +311,8 @@ impl SourceStats {
             std::cmp::Ordering::Equal => {}
         }
         self.last_uid = self.last_uid.max(uid as i64);
-        match tx.try_send(w) {
-            Ok(()) => {}
-            Err(TrySendError::Full(_)) => self.queue_full += 1,
-            Err(TrySendError::Disconnected(_)) => {}
+        if tx.try_send(w).is_err() {
+            self.queue_full += 1;
         }
     }
 }
@@ -398,7 +396,7 @@ mod tests {
 
     #[test]
     fn accounting_classifies_gaps_repeats_and_strays() {
-        let (tx, rx) = crossbeam_channel::bounded(2);
+        let (tx, rx) = crate::handoff::work_queue(std::num::NonZeroUsize::new(2).unwrap());
         let mut s = SourceStats::new(10);
         for uid in [0, 1, 4, 3, 3, 12, -1] {
             s.accept(work(uid), &tx);

@@ -7,6 +7,7 @@ pub mod consumer;
 pub mod eiger;
 pub mod farfield;
 pub mod grow;
+pub mod handoff;
 pub mod model;
 pub mod ntnd;
 pub mod object;
