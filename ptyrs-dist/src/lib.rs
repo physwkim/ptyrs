@@ -2,6 +2,7 @@
 //! partitioned into one region per GPU plus a one-probe halo.
 
 pub mod exchange;
+pub mod feed;
 pub mod p2p;
 pub mod partition;
 #[cfg(test)]
