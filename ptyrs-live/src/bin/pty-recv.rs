@@ -1,8 +1,9 @@
 //! Receiver: frames from a PVA monitor of `<prefix>FRAME` or, with
-//! `--source zmq`, an Eiger stream v1 PULL socket; positions from a PVA
-//! monitor of `<prefix>POS` → decode workers → uniqueId position match →
-//! crop → pinned ring → async H2D on GPU `--gpu` into a device store
-//! indexed by sequence number.
+//! `--source zmq`, an Eiger stream v1 PULL socket, positions from a PVA
+//! monitor of `<prefix>POS`; or, with `--source h5`, frames and positions
+//! from the HDF5 SWMR file `--h5` → decode workers → uniqueId position
+//! match → crop → pinned ring → async H2D on GPU `--gpu` into a device
+//! store indexed by sequence number.
 //!
 //! The source only parses the frame metadata and hands a zero-copy slice
 //! of the received buffer to the workers. Workers reuse one image-sized
@@ -13,6 +14,7 @@
 //! frame, `--graph-batch` frames per replay.
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -30,6 +32,13 @@ use ptyrs_live::pos::PosTable;
 use ptyrs_live::pva_source::{NtndFrames, PosStats, monitor_positions};
 use ptyrs_live::ring::{DeviceStore, Ring, UploaderConfig, run_uploader};
 use ptyrs_live::stats::{mono_ns, process_cpu_ns, wall_ns};
+use ptyrs_live::swmr::{SwmrCfg, SwmrReport, run_swmr};
+
+enum Source {
+    Pva,
+    Zmq(String),
+    H5(PathBuf),
+}
 
 fn main() {
     let a = Args::parse();
@@ -63,13 +72,21 @@ fn main() {
         idle: Duration::from_micros(a.get("idle-us", 50)),
         events: 64,
     };
-    let zmq_ep = match a.str("source", "pva").as_str() {
-        "pva" => None,
-        "zmq" => Some(a.str(
+    let source = match a.str("source", "pva").as_str() {
+        "pva" => Source::Pva,
+        "zmq" => Source::Zmq(a.str(
             "zmq",
             &format!("tcp://127.0.0.1:{}", ptyrs_live::eiger::PORT),
         )),
-        s => panic!("--source {s}: expected pva or zmq"),
+        "h5" => Source::H5(a.str("h5", "").into()),
+        s => panic!("--source {s}: expected pva, zmq or h5"),
+    };
+    let h5_readers = match &source {
+        Source::H5(p) => {
+            assert!(!p.as_os_str().is_empty(), "--source h5 needs --h5 PATH");
+            a.get("h5-readers", 4)
+        }
+        _ => 0,
     };
     let rcvhwm: i32 = a.get("rcvhwm", 10_000);
     let prefix = a.str("prefix", "PTY:");
@@ -80,6 +97,7 @@ fn main() {
         &a.str("cpus", ""),
         rt_threads,
         workers,
+        h5_readers,
         a.get("util-min", 1024),
     ));
     // The main thread only polls for completion; it shares the runtime CPUs.
@@ -152,7 +170,7 @@ fn main() {
     };
     let pull_stop = Arc::new(AtomicBool::new(false));
     let t_start = mono_ns();
-    let pulled: Option<PullReport> = rt.block_on(async {
+    let (pulled, followed): (Option<PullReport>, Option<SwmrReport>) = rt.block_on(async {
         let client = PvaClient::builder()
             .server_addr(addr)
             .timeout(Duration::from_secs(10))
@@ -165,18 +183,24 @@ fn main() {
             .server_addr(addr)
             .timeout(Duration::from_secs(10))
             .build();
-        let pos_sub = monitor_positions(
-            &pos_client,
-            &format!("{prefix}POS"),
-            a.get("pos-queue", 4096),
-            pos.clone(),
-            pos_stats.clone(),
-        )
-        .await
-        .expect("POS monitor");
-        // Frames from exactly one source; the other holds no Sender.
-        let (frame_sub, pull) = match &zmq_ep {
-            None => {
+        // The file carries its own positions.
+        let pos_sub = match &source {
+            Source::H5(_) => None,
+            _ => Some(
+                monitor_positions(
+                    &pos_client,
+                    &format!("{prefix}POS"),
+                    a.get("pos-queue", 4096),
+                    pos.clone(),
+                    pos_stats.clone(),
+                )
+                .await
+                .expect("POS monitor"),
+            ),
+        };
+        // Frames from exactly one source; the others hold no Sender.
+        let (frame_sub, pull, follow) = match &source {
+            Source::Pva => {
                 let (st, pr) = (state.clone(), progress.clone());
                 let mut src = NtndFrames::new(geom);
                 let sub = client
@@ -192,9 +216,9 @@ fn main() {
                     )
                     .await
                     .expect("FRAME monitor");
-                (Some(sub), None)
+                (Some(sub), None, None)
             }
-            Some(ep) => {
+            Source::Zmq(ep) => {
                 let (st, pr, ep) = (state.clone(), progress.clone(), ep.clone());
                 let (stop, place) = (pull_stop.clone(), place.clone());
                 let h = std::thread::Builder::new()
@@ -206,14 +230,37 @@ fn main() {
                         run_pull(&ep, rcvhwm, EigerFrames::new(geom), st, tx, &stop, &pr)
                     })
                     .unwrap();
-                (None, Some(h))
+                (None, Some(h), None)
+            }
+            Source::H5(path) => {
+                let cfg = SwmrCfg {
+                    path: path.clone(),
+                    readers: h5_readers,
+                    width,
+                    height,
+                    poll: Duration::from_micros(a.get("h5-poll-us", 200)),
+                    queue: a.get("h5-queue", 1024),
+                };
+                let (st, pr, pos) = (state.clone(), progress.clone(), pos.clone());
+                let (stop, place) = (pull_stop.clone(), place.clone());
+                let h = std::thread::Builder::new()
+                    .name("h5-index".into())
+                    .spawn(move || {
+                        place.enter(place.rt.as_deref());
+                        run_swmr(&cfg, &st, &pos, tx, &place, &stop, &pr)
+                    })
+                    .unwrap();
+                (None, None, Some(h))
             }
         };
         loop {
             tokio::time::sleep(Duration::from_millis(20)).await;
             let lr = progress.last_rx.load(Ordering::Relaxed);
-            // A ZMQ series ends with dseries_end; PVA has no end marker.
-            if zmq_ep.is_none() && progress.unique.load(Ordering::Relaxed) >= frames {
+            // A ZMQ series ends with dseries_end; PVA and the file have no
+            // end marker.
+            if !matches!(source, Source::Zmq(_))
+                && progress.unique.load(Ordering::Relaxed) >= frames
+            {
                 break;
             }
             if progress.series_end.load(Ordering::Acquire) {
@@ -231,9 +278,10 @@ fn main() {
         }
         pull_stop.store(true, Ordering::Release);
         let pulled = pull.map(|h| h.join().unwrap().expect("ZMQ PULL"));
+        let followed = follow.map(|h| h.join().unwrap().expect("HDF5 SWMR"));
         drop(frame_sub);
         drop(pos_sub);
-        pulled
+        (pulled, followed)
     });
     // Dropping the runtime drops the monitor callbacks and with them the
     // only Sender, so the workers drain the queue and return.
@@ -360,6 +408,14 @@ fn main() {
             "recv zmq messages={} headers={} series_end={} rejected={}",
             p.messages, p.headers, p.ends, p.rejected
         );
+    }
+    if let Some(f) = &followed {
+        println!(
+            "recv h5 readers={h5_readers} open_ms={} refreshes={} retries={} frames={} \
+             max_backlog={}",
+            f.open_ms, f.refreshes, f.retries, f.frames, f.max_backlog
+        );
+        println!("recv h5_read {}", f.read.summary());
     }
     if let Some(e) = st.first_error.as_ref().or(ps.first_error.as_ref()) {
         println!("recv first_error={e}");

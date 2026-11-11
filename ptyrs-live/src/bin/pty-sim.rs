@@ -1,13 +1,16 @@
 //! Detector simulator: publishes `<prefix>POS` (`{uniqueId, x, y}`) over PVA
 //! and frames at a fixed rate, either as `<prefix>FRAME` (NTNDArray,
 //! NDPluginCodec payload) or, with `--out zmq`, as an Eiger stream v1
-//! series on a ZMQ PUSH socket bound to `--zmq-port`.
+//! series on a ZMQ PUSH socket bound to `--zmq-port`. With `--out h5` it
+//! writes frames and positions to the HDF5 SWMR file `--h5` instead, as
+//! NDFileHDF5 does, flushing every `--h5-flush` frames.
 //!
 //! Frames come from the `--model` (synth or the M5 ptycho scan, see
 //! `model.rs`), each distinct frame compressed once up front; frame `uid`
 //! carries entry `uid % period`. The position of trigger `uid` is posted
 //! just before its frame.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -26,6 +29,7 @@ use ptyrs_live::model::Model;
 use ptyrs_live::ntnd::position_desc;
 use ptyrs_live::pipeline::Truth;
 use ptyrs_live::stats::{Histogram, mono_ns, process_cpu_ns, wall_ns};
+use ptyrs_live::swmr::{SwmrOut, filtered_chunk};
 use ptyrs_live::synth::Region;
 
 #[derive(Clone)]
@@ -182,7 +186,8 @@ impl ZmqOut {
     }
 }
 
-fn build_pool(m: &Model, codec: Codec) -> Vec<Payload> {
+/// With `h5`, each compressed payload is the HDF5 filter's stored chunk.
+fn build_pool(m: &Model, codec: Codec, h5: bool) -> Vec<Payload> {
     let threads = std::thread::available_parallelism().map_or(8, |n| n.get());
     let (w, h) = m.frame_size();
     let mut pool: Vec<Option<Payload>> = vec![None; m.period()];
@@ -196,6 +201,7 @@ fn build_pool(m: &Model, codec: Codec) -> Vec<Payload> {
                     m.fill((t * per + k) as i32, all, &mut raw);
                     *slot = Some(match codec {
                         Codec::None => Payload::Raw(raw.into()),
+                        _ if h5 => Payload::Compressed(filtered_chunk(codec, &raw, w, h).into()),
                         Codec::Lz4 => Payload::Compressed(lz4_compress(bytemuck_u16(&raw)).into()),
                         Codec::Bslz4 => Payload::Compressed(bslz4_compress_u16(&raw).into()),
                     });
@@ -224,17 +230,23 @@ async fn main() {
     let queue: usize = a.get("server-queue", 4);
     let prefix = a.str("prefix", "PTY:");
     let linger_ms: u64 = a.get("linger-ms", 3000);
-    let zmq_out = match a.str("out", "pva").as_str() {
-        "pva" => false,
-        "zmq" => true,
-        o => panic!("--out {o}: expected pva or zmq"),
+    let (zmq_out, h5) = match a.str("out", "pva").as_str() {
+        "pva" => (false, None),
+        "zmq" => (true, None),
+        "h5" => {
+            let p = a.str("h5", "");
+            assert!(!p.is_empty(), "--out h5 needs --h5 PATH");
+            (false, Some(PathBuf::from(p)))
+        }
+        o => panic!("--out {o}: expected pva, zmq or h5"),
     };
+    let h5_flush: u64 = a.get("h5-flush", 16);
     let zmq_port: u16 = a.get("zmq-port", ptyrs_live::eiger::PORT);
     let sndhwm: i32 = a.get("sndhwm", 10_000);
     let (w, h) = model.frame_size();
 
     let t = mono_ns();
-    let pool = build_pool(&model, codec);
+    let pool = build_pool(&model, codec, h5.is_some());
     let raw_bytes = (w * h * 2) as f64;
     let sizes: Vec<usize> = pool
         .iter()
@@ -284,23 +296,33 @@ async fn main() {
     let mut cfg = PvaServerConfig::isolated();
     cfg.tcp_port = port;
     cfg.monitor_queue_depth = queue;
-    let server = PvaServer::start(Arc::new(source), cfg).expect("start PVA server");
-    println!(
-        "sim listening={} server_queue={queue} rate={rate} frames={frames} out={}",
-        server.tcp_addr(),
-        if zmq_out { "zmq" } else { "pva" }
-    );
-
-    // A post reports the subscriber count; re-post the uid -1 placeholder
-    // (ignored by the receiver) until both monitors are attached.
-    loop {
-        let f = frame_pv.try_post(init_frame.clone());
-        let p = pos_pv.try_post(init_pos.clone());
-        if (f >= 1 || zmq_out) && p >= 1 {
-            break;
+    // The file carries the positions too; no PVA then.
+    let server = if let Some(p) = &h5 {
+        println!(
+            "sim rate={rate} frames={frames} out=h5 file={} flush_every={h5_flush}",
+            p.display()
+        );
+        None
+    } else {
+        let server = PvaServer::start(Arc::new(source), cfg).expect("start PVA server");
+        println!(
+            "sim listening={} server_queue={queue} rate={rate} frames={frames} out={}",
+            server.tcp_addr(),
+            if zmq_out { "zmq" } else { "pva" }
+        );
+        // A post reports the subscriber count; re-post the uid -1
+        // placeholder (ignored by the receiver) until both monitors are
+        // attached.
+        loop {
+            let f = frame_pv.try_post(init_frame.clone());
+            let p = pos_pv.try_post(init_pos.clone());
+            if (f >= 1 || zmq_out) && p >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+        Some(server)
+    };
     let zmq = zmq_out.then(|| {
         let z = ZmqOut::start(zmq_port, sndhwm, &pool, codec, (w, h), frames, rate);
         println!(
@@ -309,9 +331,20 @@ async fn main() {
         );
         z
     });
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Time for the receiver to attach; a file reader attaches only once
+    // the file exists.
+    let settle = Duration::from_millis(500);
+    if h5.is_none() {
+        tokio::time::sleep(settle).await;
+    }
 
     let publisher = std::thread::spawn(move || {
+        // The writer is not Send, so it is made here.
+        let mut h5 = h5.map(|p| {
+            let f = SwmrOut::create(&p, codec, (w, h)).expect("create HDF5 file");
+            std::thread::sleep(settle);
+            f
+        });
         let period = 1e9 / rate;
         let mut post_ns = Histogram::new(100_000);
         let (mut max_lag, mut late, mut unsent) = (0i64, 0u64, 0u64);
@@ -336,10 +369,18 @@ async fn main() {
             late += (lag as f64 > period) as u64;
             let uid = i as i32;
             let (x, y) = model.position(uid);
-            pos_pv.try_post(pos_value(uid, x, y));
-            if let Some(z) = &zmq {
+            if let Some(f) = &mut h5 {
+                let p = &pool[(i % pool.len() as u64) as usize];
+                f.append(p.bytes(), uid, (x, y), wall_ns())
+                    .expect("HDF5 append");
+                if (i + 1) % h5_flush == 0 {
+                    f.flush().expect("HDF5 flush");
+                }
+            } else if let Some(z) = &zmq {
+                pos_pv.try_post(pos_value(uid, x, y));
                 unsent += !z.send(i, codec, w, h) as u64;
             } else {
+                pos_pv.try_post(pos_value(uid, x, y));
                 let v = frame_value(
                     &pool[(i % pool.len() as u64) as usize],
                     codec,
@@ -354,6 +395,9 @@ async fn main() {
         }
         if let Some(z) = &zmq {
             z.end();
+        }
+        if let Some(f) = h5 {
+            f.close().expect("HDF5 close");
         }
         let wall = mono_ns() - t0;
         let cpu = process_cpu_ns() - cpu0;

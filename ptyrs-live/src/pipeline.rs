@@ -320,38 +320,51 @@ impl SourceStats {
 }
 
 /// Where each receive-path thread runs: the runtime threads share `rt`, the
-/// uploader and every worker get a CPU of their own. Empty without a list.
+/// uploader, every worker and every file reader get a CPU of their own.
+/// Empty without a list.
 pub struct Placement {
     /// The whole list, for work after the run.
     pub all: Option<Vec<usize>>,
     pub rt: Option<Vec<usize>>,
     pub h2d: Option<usize>,
     pub workers: Vec<Option<usize>>,
+    pub readers: Vec<Option<usize>>,
     pub util_min: u32,
 }
 
 impl Placement {
-    pub fn new(cpus: &str, rt_threads: usize, workers: usize, util_min: u32) -> Self {
+    pub fn new(
+        cpus: &str,
+        rt_threads: usize,
+        workers: usize,
+        readers: usize,
+        util_min: u32,
+    ) -> Self {
         if cpus.is_empty() {
             return Self {
                 all: None,
                 rt: None,
                 h2d: None,
                 workers: vec![None; workers],
+                readers: vec![None; readers],
                 util_min,
             };
         }
         let c = parse_cpu_list(cpus).unwrap_or_else(|e| panic!("--cpus: {e}"));
-        let need = rt_threads + 1 + workers;
+        let w0 = rt_threads + 1;
+        let need = w0 + workers + readers;
         assert!(
             c.len() >= need,
-            "--cpus {cpus}: {need} needed ({rt_threads} runtime, 1 h2d, {workers} workers)"
+            "--cpus {cpus}: {need} needed ({rt_threads} runtime, 1 h2d, {workers} workers, \
+             {readers} readers)"
         );
+        let some = |s: &[usize]| s.iter().map(|&x| Some(x)).collect();
         Self {
             all: Some(c.clone()),
             rt: Some(c[..rt_threads].to_vec()),
             h2d: Some(c[rt_threads]),
-            workers: c[rt_threads + 1..need].iter().map(|&x| Some(x)).collect(),
+            workers: some(&c[w0..w0 + workers]),
+            readers: some(&c[w0 + workers..need]),
             util_min,
         }
     }

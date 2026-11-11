@@ -17,6 +17,7 @@ pub mod pva_source;
 pub mod ring;
 pub mod sched;
 pub mod stats;
+pub mod swmr;
 pub mod synth;
 
 /// Small `--key value` command-line reader shared by the bins.
