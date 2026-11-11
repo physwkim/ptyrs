@@ -310,6 +310,8 @@ impl SourceStats {
 /// Where each receive-path thread runs: the runtime threads share `rt`, the
 /// uploader and every worker get a CPU of their own. Empty without a list.
 pub struct Placement {
+    /// The whole list, for work after the run.
+    pub all: Option<Vec<usize>>,
     pub rt: Option<Vec<usize>>,
     pub h2d: Option<usize>,
     pub workers: Vec<Option<usize>>,
@@ -320,6 +322,7 @@ impl Placement {
     pub fn new(cpus: &str, rt_threads: usize, workers: usize, util_min: u32) -> Self {
         if cpus.is_empty() {
             return Self {
+                all: None,
                 rt: None,
                 h2d: None,
                 workers: vec![None; workers],
@@ -333,6 +336,7 @@ impl Placement {
             "--cpus {cpus}: {need} needed ({rt_threads} runtime, 1 h2d, {workers} workers)"
         );
         Self {
+            all: Some(c.clone()),
             rt: Some(c[..rt_threads].to_vec()),
             h2d: Some(c[rt_threads]),
             workers: c[rt_threads + 1..need].iter().map(|&x| Some(x)).collect(),

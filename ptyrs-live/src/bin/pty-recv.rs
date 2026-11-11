@@ -253,6 +253,8 @@ fn main() {
     let st = state.lock().unwrap();
     let ps = pos_stats.lock().unwrap();
     let (wr, decode, pos_after) = WorkerReport::merge(reports);
+    // The checks below spread over every listed CPU, not the runtime's.
+    place.enter(place.all.as_deref());
 
     // End-to-end check of the frames the ring still holds: their place in
     // the device store against the host ring slot and against a fresh
