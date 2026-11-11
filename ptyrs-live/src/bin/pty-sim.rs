@@ -25,7 +25,7 @@ use ptyrs_live::codec::{Codec, bslz4_compress_u16, bytemuck_u16, lz4_compress};
 use ptyrs_live::eiger::{
     ImageMeta, SeriesConfig, blob_prefix, end_message, header_message, image_parts,
 };
-use ptyrs_live::model::Model;
+use ptyrs_live::model::{Model, ModelCfg};
 use ptyrs_live::ntnd::position_desc;
 use ptyrs_live::pipeline::Truth;
 use ptyrs_live::stats::{Histogram, mono_ns, process_cpu_ns, wall_ns};
@@ -225,7 +225,7 @@ async fn main() {
     };
     let rate: f64 = a.get("rate", 3000.0);
     let frames: u64 = a.get("frames", 30_000);
-    let model = Arc::new(Model::from_args(&a));
+    let model = Arc::new(ModelCfg::from_args(&a).build());
     let port: u16 = a.get("port", 15075);
     let queue: usize = a.get("server-queue", 4);
     let prefix = a.str("prefix", "PTY:");

@@ -15,6 +15,7 @@ pub mod pipeline;
 pub mod pos;
 pub mod pv_out;
 pub mod pva_source;
+pub mod recv;
 pub mod ring;
 pub mod sched;
 pub mod stats;
@@ -30,8 +31,39 @@ pub mod args {
 
     impl Args {
         pub fn parse() -> Self {
+            std::env::args().skip(1).collect()
+        }
+
+        pub fn get<T: FromStr>(&self, k: &str, default: T) -> T
+        where
+            T::Err: std::fmt::Debug,
+        {
+            self.opt(k).unwrap_or(default)
+        }
+
+        /// `--k` if given.
+        pub fn opt<T: FromStr>(&self, k: &str) -> Option<T>
+        where
+            T::Err: std::fmt::Debug,
+        {
+            self.0
+                .get(k)
+                .map(|v| v.parse().unwrap_or_else(|e| panic!("--{k} {v}: {e:?}")))
+        }
+
+        pub fn str(&self, k: &str, default: &str) -> String {
+            self.0
+                .get(k)
+                .cloned()
+                .unwrap_or_else(|| default.to_string())
+        }
+    }
+
+    /// `--key value` pairs.
+    impl FromIterator<String> for Args {
+        fn from_iter<I: IntoIterator<Item = String>>(it: I) -> Self {
             let mut m = HashMap::new();
-            let mut it = std::env::args().skip(1);
+            let mut it = it.into_iter();
             while let Some(k) = it.next() {
                 let Some(k) = k.strip_prefix("--") else {
                     panic!("unexpected argument {k}");
@@ -40,22 +72,6 @@ pub mod args {
                 m.insert(k.to_string(), v);
             }
             Self(m)
-        }
-
-        pub fn get<T: FromStr>(&self, k: &str, default: T) -> T
-        where
-            T::Err: std::fmt::Debug,
-        {
-            self.0.get(k).map_or(default, |v| {
-                v.parse().unwrap_or_else(|e| panic!("--{k} {v}: {e:?}"))
-            })
-        }
-
-        pub fn str(&self, k: &str, default: &str) -> String {
-            self.0
-                .get(k)
-                .cloned()
-                .unwrap_or_else(|| default.to_string())
         }
     }
 }

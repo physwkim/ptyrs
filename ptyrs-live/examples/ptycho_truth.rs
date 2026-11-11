@@ -6,13 +6,13 @@ use std::path::Path;
 use std::time::Instant;
 
 use ptyrs_live::args::Args;
-use ptyrs_live::model::ptycho_from_args;
+use ptyrs_live::model::PtychoCfg;
 
 fn main() {
     let a = Args::parse();
     let dir = a.str("truth", "ptycho-truth");
     let t = Instant::now();
-    let p = ptycho_from_args(&a);
+    let p = PtychoCfg::from_args(&a).build();
     let built = t.elapsed();
     p.dump(Path::new(&dir)).expect("dump");
     println!(

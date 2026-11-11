@@ -71,13 +71,27 @@ pub fn position(uid: i32) -> (f64, f64) {
     (x, y)
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct Synth {
     pub width: usize,
     pub height: usize,
     pub seed: u64,
     pub flux: f64,
     pub pool: usize,
+}
+
+impl Default for Synth {
+    /// An Eiger 1M frame.
+    fn default() -> Self {
+        Self {
+            width: 1028,
+            height: 1062,
+            seed: 1,
+            flux: 1.0,
+            pool: 64,
+        }
+    }
 }
 
 /// `[x0, x0 + w) x [y0, y0 + h)` in frame pixels.
