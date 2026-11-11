@@ -19,9 +19,11 @@ use cuda_core::{
 use ptyrs_kernels::kernels::LoadedModule;
 
 mod ops;
+mod rpie;
 
 pub use ops::{LlkPartial, LlkSums, MASKED, OBJ_TILE, UpdateSums, ViewAddr, ViewDims, Views};
 pub use ptyrs_fft::C32;
+pub use rpie::{RpieKernels, Weight};
 
 /// The linked device code: every `ptyrs-kernels` kernel plus the cuFFT functions they call.
 pub const CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ptyrs_kernels.cubin"));

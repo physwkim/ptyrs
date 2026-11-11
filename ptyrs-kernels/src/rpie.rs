@@ -1,0 +1,134 @@
+//! rPIE kernels (pty-chi `RPIEReconstructor`), on the layouts of [`crate::pixel`]. The
+//! object and probe steps reuse `psi_to_obj` / `psi_to_probe` with weighted inputs built
+//! here, so these kernels need no view addresses.
+
+use cuda_host::cuda_module;
+
+/// Planes and regulariser of `rpie_weight`: `nk` planes of `n` complex values; plane `k`
+/// reads its max at `mx[k * mstride]` (`mstride` 0 or 1).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct WeightGeom {
+    pub nk: u32,
+    pub n: u32,
+    pub mstride: u32,
+    pub alpha: f32,
+}
+
+#[cuda_module]
+pub mod rpie_kernels {
+    use crate::pixel::*;
+    use crate::*;
+    use cuda_device::SharedArray;
+
+    /// pty-chi's modulus constraint on the forward-FFT'd stack, with the `1 / (ny * nx)` of
+    /// the unnormalized round trip folded in: each pixel's modes are scaled by
+    /// `sqrt(obs + 1e-7) / (sqrt(icalc) + 1e-7) / n` with `icalc = sum_m |psi|^2 / n`, or by
+    /// `1 / n` where `obs` is `MASKED`. One thread per element of `[nf, ny, nx]`.
+    ///
+    /// # Safety
+    ///
+    /// `psi` `[nf * nmode, ny, nx]`, `counts` `[f0 + nf, ny, nx]`.
+    #[kernel]
+    pub unsafe fn rpie_amplitude(
+        psi: *mut f32,
+        counts: *const u16,
+        f0: u32,
+        nf: u32,
+        nmode: u32,
+        ny: u32,
+        nx: u32,
+    ) {
+        let n = ny as usize * nx as usize;
+        let g = global_index();
+        if g >= nf as usize * n {
+            return;
+        }
+        let (fl, d) = (g / n, g % n);
+        let at = psi_index((d / nx as usize) as u32, (d % nx as usize) as u32, ny, nx);
+        let inv_n = 1.0 / n as f32;
+        let plane0 = fl * nmode as usize;
+        unsafe {
+            let obs = *counts.add(f0 as usize * n + g);
+            let s = if obs == MASKED {
+                inv_n
+            } else {
+                let calc = (mode_power(psi, plane0, nmode, n, at) * inv_n).sqrt();
+                (obs as f32 + 1e-7).sqrt() / (calc + 1e-7) * inv_n
+            };
+            for m in 0..nmode as usize {
+                let j = (plane0 + m) * n + at;
+                let v = load_c(psi, j);
+                store_c(psi, j, (v.0 * s, v.1 * s));
+            }
+        }
+    }
+
+    /// `out[b] = max_i sum_{m < nsum} |x[(b * nsum + m) * n + i]|^2`: the largest summed
+    /// power of each group of `nsum` planes. One `PIXEL_THREADS` block per group, a fixed
+    /// reduction order.
+    ///
+    /// # Safety
+    ///
+    /// `x` holds `gridDim.x * nsum` planes of `n` complex values, `out` `gridDim.x` floats;
+    /// block `(PIXEL_THREADS, 1, 1)`.
+    #[kernel]
+    pub unsafe fn rpie_power_max(x: *const f32, nsum: u32, n: u32, out: *mut f32) {
+        static mut RED: SharedArray<f32, 256> = SharedArray::UNINIT;
+        let b = thread::blockIdx_x() as usize;
+        let t = thread::threadIdx_x() as usize;
+        let mut m = 0.0f32;
+        let mut i = t;
+        while i < n as usize {
+            let p = unsafe { mode_power(x, b * nsum as usize, nsum, n as usize, i) };
+            if p > m {
+                m = p;
+            }
+            i += PIXEL_THREADS as usize;
+        }
+        let s = (&raw mut RED).cast::<f32>();
+        unsafe {
+            *s.add(t) = m;
+            let mut half = PIXEL_THREADS as usize / 2;
+            while half > 0 {
+                thread::sync_threads();
+                if t < half && *s.add(t + half) > *s.add(t) {
+                    *s.add(t) = *s.add(t + half);
+                }
+                half /= 2;
+            }
+            if t == 0 {
+                *out.add(b) = *s;
+            }
+        }
+    }
+
+    /// The rPIE step weights: `out[k, i] = x[k, i] / ((1 - alpha) |w[k, i]|^2 + alpha
+    /// mx[k * mstride])` over the `[nk, n]` of `g` (`mstride` 0 shares `mx[0]` between
+    /// planes). `out` may be `x`. One thread per element.
+    ///
+    /// # Safety
+    ///
+    /// `x`, `w`, `out` hold `nk * n` complex values, `mx` `(nk - 1) * mstride + 1` floats.
+    #[kernel]
+    pub unsafe fn rpie_weight(
+        x: *const f32,
+        w: *const f32,
+        mx: *const f32,
+        out: *mut f32,
+        g: super::WeightGeom,
+    ) {
+        let t = global_index();
+        if t >= g.nk as usize * g.n as usize {
+            return;
+        }
+        let k = t / g.n as usize;
+        unsafe {
+            let wv = load_c(w, t);
+            let m = *mx.add(k * g.mstride as usize);
+            let d = (1.0 - g.alpha) * (wv.0 * wv.0 + wv.1 * wv.1) + g.alpha * m;
+            let v = load_c(x, t);
+            store_c(out, t, (v.0 / d, v.1 / d));
+        }
+    }
+}
