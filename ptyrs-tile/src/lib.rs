@@ -568,29 +568,34 @@ pub fn psi_to_obj(
 
 /// [`ptyrs_gpu::Kernels::update_from_sums`] as Tile kernels: `x = (num + reg x) /
 /// max(den + reg, 1e-12)` for the first `n` values, `reg = inertia * max(0, den[0 .. n]
-/// ...)` over the non-NaN values of `den`.
+/// ...)` over the non-NaN values of `den`. `max_bits` (one `u32`) is the caller's scratch
+/// for that maximum; it is zeroed on `stream` here, so the call allocates nothing and
+/// never synchronizes.
 pub fn update_from_sums(
     stream: &Arc<CudaStream>,
     x: &mut DeviceBuffer<C32>,
     sums: &UpdateSums,
     n: u32,
     inertia: f32,
+    max_bits: &mut DeviceBuffer<u32>,
 ) -> Result<(), Error> {
     check_len("x", x, n as usize)?;
     check_len("sums.num", &sums.num, n as usize)?;
     check_len("sums.den", &sums.den, n as usize)?;
+    check_len("max_bits", max_bits, 1)?;
     // The kernels index interleaved floats, `2 n` of them, as i32.
     let n = offset("n", n as usize)?;
     offset("2 n", 2 * n as usize)?;
     if n == 0 {
         return Ok(());
     }
-    let max_bits = DeviceBuffer::<u32>::zeroed(stream, 1)?;
     let UpdateSums { num, den } = sums;
     launch(stream, &[den.storage()], &[max_bits.storage()], || {
-        // SAFETY: `den` holds `n` floats, `max_bits` one zeroed u32.
+        // SAFETY: `max_bits` holds at least one u32 and is leased for writing on `stream`;
+        // `den` holds `n` floats.
         unsafe {
-            device::max_nonneg_f32(dptr(den), n, dptr(&max_bits))
+            cuda_core::memory::memset_d8_async(max_bits.cu_deviceptr(), 0, 4, stream.cu_stream())?;
+            device::max_nonneg_f32(dptr(den), n, dptr(max_bits))
                 .grid(((n as u32).div_ceil(1024), 1, 1))
                 .async_on(stream)?;
         }
@@ -600,7 +605,7 @@ pub fn update_from_sums(
     launch(stream, &reads, &[x.storage()], || {
         // SAFETY: `x`, `num` hold `n` complex values, `den` `n` floats, `max_bits` one.
         unsafe {
-            device::normalize_update(dptr(x), dptr(num), dptr(den), n, dptr(&max_bits), inertia)
+            device::normalize_update(dptr(x), dptr(num), dptr(den), n, dptr(max_bits), inertia)
                 .grid(((2 * n as u32).div_ceil(1024), 1, 1))
                 .async_on(stream)?;
         }

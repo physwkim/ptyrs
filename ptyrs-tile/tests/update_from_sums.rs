@@ -89,9 +89,19 @@ fn update_from_sums_matches_simt() {
         k.update_from_sums(&stream, &mut simt, &sums, len as u32, inertia)
             .unwrap();
         let simt = flat(&simt.to_host_vec(&stream).unwrap());
-        let run = || {
+        // Stale scratch above every `den`: the op must zero it itself.
+        let mut max_bits = up(&stream, &[1e30f32.to_bits()]);
+        let mut run = || {
             let mut x = up(&stream, &x_host);
-            ptyrs_tile::update_from_sums(&stream, &mut x, &sums, len as u32, inertia).unwrap();
+            ptyrs_tile::update_from_sums(
+                &stream,
+                &mut x,
+                &sums,
+                len as u32,
+                inertia,
+                &mut max_bits,
+            )
+            .unwrap();
             flat(&x.to_host_vec(&stream).unwrap())
         };
         let tile = run();
