@@ -7,6 +7,7 @@ pub mod consumer;
 pub mod eiger;
 pub mod grow;
 pub mod ntnd;
+pub mod object;
 pub mod pipeline;
 pub mod pos;
 pub mod pva_source;
