@@ -139,7 +139,7 @@ fn dm_converges_and_records_on_schedule() {
 
 /// The parity scenario at 32 pixels and 40 positions, scaled.
 fn parity_start() -> Ptycho {
-    let (scan, object, probe) = common::dm_scenario(32, 40, 1, 2e5);
+    let (scan, object, probe) = common::dm_scenario(32, 40, 1, 2e5, 4.0);
     let mut p = Ptycho::new(&scan, object, probe).unwrap();
     p.scale_obj_probe();
     p

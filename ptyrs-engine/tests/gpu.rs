@@ -20,7 +20,7 @@ fn ctx() -> Arc<CudaContext> {
 /// The parity scenario at 32 pixels, scaled on the CPU; `masked` masks row 3 and column 20
 /// of every frame.
 fn start(nprobe: usize, masked: bool) -> (Scan, Object, Probe) {
-    let (mut scan, object, probe) = common::dm_scenario(32, NPOS, nprobe, 2e5);
+    let (mut scan, object, probe) = common::dm_scenario(32, NPOS, nprobe, 2e5, 4.0);
     if masked {
         let dims = scan.counts.dims();
         let data = scan
