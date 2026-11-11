@@ -2,13 +2,16 @@
 name = "ptyrs-engine"
 version.workspace = true
 edition.workspace = true
-description = "ptyrs CPU f64 reference engine: PyNX operators, AP, DM and rPIE, the oracle for the GPU kernels"
+description = "ptyrs engine: the CPU f64 reference (PyNX operators, AP, DM, rPIE) and the GPU backend checked against it"
 
 [dependencies]
 ptyrs-core.workspace = true
 num-complex.workspace = true
 rustfft.workspace = true
 thiserror.workspace = true
+cuda-core.workspace = true
+ptyrs-fft = { path = "../ptyrs-fft" }
+ptyrs-gpu = { path = "../ptyrs-gpu" }
 
 [dev-dependencies]
 ptyrs-io.workspace = true

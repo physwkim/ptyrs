@@ -1,4 +1,5 @@
-//! ptyrs CPU f64 reference engine: the oracle the GPU kernels are tested against (DESIGN §7 M1).
+//! ptyrs engine: the CPU f64 reference, the oracle the GPU kernels are tested against, and the
+//! GPU backend [`GpuPtycho`] checked against it (DESIGN §7 M1).
 //!
 //! The operators follow PyNX `ptycho/cpu_operator.py` (far field, no background, no
 //! multibeam, no direct-beam frames) and run in `f64` / complex `f64` in one fixed order; rPIE
@@ -16,12 +17,14 @@
 //!   PyNX loop order.
 
 mod fft;
+mod gpu;
 mod obs;
 mod ops;
 mod ptycho;
 pub mod sim;
 
 pub use fft::Fft2;
+pub use gpu::{GpuOptions, GpuPtycho};
 pub use obs::{Observed, shift};
 pub use ops::{
     Llk, accumulate_obj, accumulate_probe, apply_amplitude, llk, obj_probe_to_psi,
@@ -36,4 +39,14 @@ pub enum EngineError {
     Core(#[from] ptyrs_core::CoreError),
     #[error("invalid input: {0}")]
     Invalid(String),
+    #[error("GPU: {0}")]
+    Gpu(#[from] ptyrs_gpu::Error),
+    #[error("cuFFT: {0}")]
+    Fft(#[from] ptyrs_fft::FftError),
+}
+
+impl From<cuda_core::DriverError> for EngineError {
+    fn from(e: cuda_core::DriverError) -> Self {
+        Self::Gpu(e.into())
+    }
 }

@@ -28,7 +28,7 @@ pub struct LlkRecord {
 }
 
 /// Every `calc_llk`-th cycle and the last one record an LLK; 0 never does (PyNX `calc_llk`).
-fn llk_due(calc_llk: usize, ic: usize, ncycle: usize) -> bool {
+pub(crate) fn llk_due(calc_llk: usize, ic: usize, ncycle: usize) -> bool {
     calc_llk > 0 && (ic.is_multiple_of(calc_llk) || ic + 1 == ncycle)
 }
 
@@ -235,48 +235,9 @@ impl Ptycho {
         self.object.as_mut_slice().iter_mut().for_each(|c| *c *= fo);
     }
 
-    /// PyNX `ZeroPhaseRamp`: centre the probe's far field. With `(cy, cx)` the centre of mass
-    /// of `Σ_modes |fftshift(FT(fftshift(P)))|²`, `dx = cx − nx/2`, `dy = cy − ny/2`:
-    /// `P *= exp(−2πi(dx·(x − nx/2)/nx + dy·(y − ny/2)/ny))` and
-    /// `O *= exp(+2πi(dx·(x − nxo/2)/nx + dy·(y − nyo/2)/ny))` (integer halves). The two
-    /// ramps cancel in every view up to a constant phase, so the LLK is unchanged.
+    /// [`zero_phase_ramp`] of the object and probe.
     pub fn zero_phase_ramp(&mut self) {
-        let [ny, nx] = self.probe.plane_shape();
-        let n = ny * nx;
-        let mut far = vec![C64::default(); self.probe.as_slice().len()];
-        for (m, out) in far.chunks_exact_mut(n).enumerate() {
-            let p = self.probe.plane(m);
-            for (j, out) in out.iter_mut().enumerate() {
-                *out = p[shift(j, ny, nx)];
-            }
-        }
-        self.fft.forward(&mut far);
-        let (mut w, mut wy, mut wx) = (0.0, 0.0, 0.0);
-        for i in 0..n {
-            let j = shift(i, ny, nx);
-            let v: f64 = far.chunks_exact(n).map(|f| f[j].norm_sqr()).sum();
-            w += v;
-            wy += v * (i / nx) as f64;
-            wx += v * (i % nx) as f64;
-        }
-        let dy = wy / w - (ny / 2) as f64;
-        let dx = wx / w - (nx / 2) as f64;
-        let ramp = |len: usize, half: usize, scale: usize, d: f64, sign: f64| -> Vec<f64> {
-            (0..len)
-                .map(|i| sign * 2.0 * PI * d * (i as f64 - half as f64) / scale as f64)
-                .collect()
-        };
-        let (ry, rx) = (
-            ramp(ny, ny / 2, ny, dy, -1.0),
-            ramp(nx, nx / 2, nx, dx, -1.0),
-        );
-        apply_ramp(&mut self.probe, &ry, &rx);
-        let [nyo, nxo] = self.object.plane_shape();
-        let (ry, rx) = (
-            ramp(nyo, nyo / 2, ny, dy, 1.0),
-            ramp(nxo, nxo / 2, nx, dx, 1.0),
-        );
-        apply_ramp(&mut self.object, &ry, &rx);
+        zero_phase_ramp(&self.fft, &mut self.object, &mut self.probe);
     }
 
     /// PyNX `AP(...)**ncycle`: per cycle, exit waves from the current estimate, Fourier
@@ -504,6 +465,50 @@ impl Ptycho {
             }
         }
     }
+}
+
+/// PyNX `ZeroPhaseRamp`: centre the probe's far field. With `(cy, cx)` the centre of mass
+/// of `Σ_modes |fftshift(FT(fftshift(P)))|²`, `dx = cx − nx/2`, `dy = cy − ny/2`:
+/// `P *= exp(−2πi(dx·(x − nx/2)/nx + dy·(y − ny/2)/ny))` and
+/// `O *= exp(+2πi(dx·(x − nxo/2)/nx + dy·(y − nyo/2)/ny))` (integer halves). The two
+/// ramps cancel in every view up to a constant phase, so the LLK is unchanged.
+pub(crate) fn zero_phase_ramp(fft: &Fft2, object: &mut Object, probe: &mut Probe) {
+    let [ny, nx] = probe.plane_shape();
+    let n = ny * nx;
+    let mut far = vec![C64::default(); probe.as_slice().len()];
+    for (m, out) in far.chunks_exact_mut(n).enumerate() {
+        let p = probe.plane(m);
+        for (j, out) in out.iter_mut().enumerate() {
+            *out = p[shift(j, ny, nx)];
+        }
+    }
+    fft.forward(&mut far);
+    let (mut w, mut wy, mut wx) = (0.0, 0.0, 0.0);
+    for i in 0..n {
+        let j = shift(i, ny, nx);
+        let v: f64 = far.chunks_exact(n).map(|f| f[j].norm_sqr()).sum();
+        w += v;
+        wy += v * (i / nx) as f64;
+        wx += v * (i % nx) as f64;
+    }
+    let dy = wy / w - (ny / 2) as f64;
+    let dx = wx / w - (nx / 2) as f64;
+    let ramp = |len: usize, half: usize, scale: usize, d: f64, sign: f64| -> Vec<f64> {
+        (0..len)
+            .map(|i| sign * 2.0 * PI * d * (i as f64 - half as f64) / scale as f64)
+            .collect()
+    };
+    let (ry, rx) = (
+        ramp(ny, ny / 2, ny, dy, -1.0),
+        ramp(nx, nx / 2, nx, dx, -1.0),
+    );
+    apply_ramp(probe, &ry, &rx);
+    let [nyo, nxo] = object.plane_shape();
+    let (ry, rx) = (
+        ramp(nyo, nyo / 2, ny, dy, 1.0),
+        ramp(nxo, nxo / 2, nx, dx, 1.0),
+    );
+    apply_ramp(object, &ry, &rx);
 }
 
 /// `a[k, y, x] *= exp(i·(ry[y] + rx[x]))` for every mode `k`.
