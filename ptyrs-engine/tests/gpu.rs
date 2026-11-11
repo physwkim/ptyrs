@@ -5,7 +5,9 @@ use std::sync::Arc;
 
 use cuda_core::CudaContext;
 use ptyrs_core::{C64, Counts, MASKED, Object, Probe, Scan, Stack};
-use ptyrs_engine::{ApParams, DmParams, GpuOptions, GpuPtycho, LlkRecord, Ptycho, RpieParams};
+use ptyrs_engine::{
+    ApParams, Backend, DmParams, GpuOptions, GpuPtycho, LlkRecord, Params, Ptycho, RpieParams, Step,
+};
 
 mod common;
 
@@ -41,13 +43,6 @@ fn start(nprobe: usize, masked: bool) -> (Scan, Object, Probe) {
     (scan, object, probe)
 }
 
-#[derive(Clone, Copy, Debug)]
-enum Run {
-    Ap(ApParams),
-    Dm(DmParams),
-    Rpie(RpieParams),
-}
-
 /// `|a - b| / |b|` over the whole array.
 fn rel_l2(a: &Stack<C64>, b: &Stack<C64>) -> f64 {
     let (mut e, mut t) = (0.0, 0.0);
@@ -75,26 +70,18 @@ fn llk_rel(g: &[LlkRecord], c: &[LlkRecord]) -> f64 {
     worst
 }
 
-/// Runs `run` for `ncycle` on both backends and returns the worst LLK and the object and probe
-/// relative errors.
-fn compare(nprobe: usize, masked: bool, run: Run, ncycle: usize) -> [f64; 3] {
+/// Runs `params` for `ncycle` on both backends and returns the worst LLK and the object and
+/// probe relative errors.
+fn compare(nprobe: usize, masked: bool, params: Params, ncycle: usize) -> [f64; 3] {
     let (scan, object, probe) = start(nprobe, masked);
     let mut cpu = Ptycho::new(&scan, object.clone(), probe.clone()).unwrap();
     let mut gpu = GpuPtycho::new(&ctx(), &scan, object, probe, STACK).unwrap();
-    match run {
-        Run::Ap(p) => {
-            cpu.ap(&p, ncycle);
-            gpu.ap(&p, ncycle).unwrap();
-        }
-        Run::Dm(p) => {
-            cpu.dm(&p, ncycle);
-            gpu.dm(&p, ncycle).unwrap();
-        }
-        Run::Rpie(p) => {
-            cpu.rpie(&p, ncycle).unwrap();
-            gpu.rpie(&p, ncycle).unwrap();
-        }
-    }
+    let step = Step {
+        params,
+        count: ncycle,
+    };
+    cpu.run(&step).unwrap();
+    gpu.run(&step).unwrap();
     assert_eq!(gpu.cycle(), cpu.cycle());
     let errs = [
         llk_rel(gpu.history(), cpu.history()),
@@ -102,7 +89,7 @@ fn compare(nprobe: usize, masked: bool, run: Run, ncycle: usize) -> [f64; 3] {
         rel_l2(&gpu.probe().unwrap(), cpu.probe()),
     ];
     eprintln!(
-        "{run:?}: llk {:.2e} object {:.2e} probe {:.2e}",
+        "{params:?}: llk {:.2e} object {:.2e} probe {:.2e}",
         errs[0], errs[1], errs[2]
     );
     errs
@@ -130,7 +117,7 @@ fn ap_matches_cpu() {
             calc_llk: 1,
             zero_phase_ramp: true,
         };
-        check(compare(2, true, Run::Ap(params), 10), [1e-4, 1e-4, 1e-4]);
+        check(compare(2, true, Params::Ap(params), 10), [1e-4, 1e-4, 1e-4]);
     }
 }
 
@@ -143,7 +130,7 @@ fn dm_matches_cpu() {
             calc_llk: 1,
             ..DmParams::default()
         };
-        check(compare(2, true, Run::Dm(params), 10), [1e-4, 1e-4, 1e-4]);
+        check(compare(2, true, Params::Dm(params), 10), [1e-4, 1e-4, 1e-4]);
     }
     // two object-then-probe rounds per cycle, one mode, no mask
     let params = DmParams {
@@ -151,7 +138,7 @@ fn dm_matches_cpu() {
         calc_llk: 3,
         ..DmParams::default()
     };
-    check(compare(1, false, Run::Dm(params), 7), [1e-4, 1e-4, 1e-4]);
+    check(compare(1, false, Params::Dm(params), 7), [1e-4, 1e-4, 1e-4]);
 }
 
 #[test]
@@ -162,7 +149,10 @@ fn rpie_matches_cpu() {
             probe_step: p.map(|_| 1.0),
             ..common::RPIE
         };
-        check(compare(2, true, Run::Rpie(params), 10), [1e-4, 1e-4, 1e-4]);
+        check(
+            compare(2, true, Params::Rpie(params), 10),
+            [1e-4, 1e-4, 1e-4],
+        );
     }
 }
 

@@ -3,7 +3,8 @@
 //!
 //! The operators follow PyNX `ptycho/cpu_operator.py` (far field, no background, no
 //! multibeam, no direct-beam frames) and run in `f64` / complex `f64` in one fixed order; rPIE
-//! follows pty-chi `reconstructors/pie.py`. [`Ptycho`] chains them into AP, DM and rPIE.
+//! follows pty-chi `reconstructors/pie.py`. [`Ptycho`] chains them into AP, DM and rPIE. A
+//! [`Plan`] runs a sequence of those loops on either backend.
 //!
 //! Contract shared by every operator (the GPU kernels implement the same one):
 //! - An exit-wave stack `psi` is `[nview, ny, nx]` with view `k` taken from the
@@ -20,6 +21,7 @@ mod fft;
 mod gpu;
 mod obs;
 mod ops;
+mod plan;
 mod ptycho;
 pub mod sim;
 
@@ -30,6 +32,7 @@ pub use ops::{
     Llk, accumulate_obj, accumulate_probe, apply_amplitude, llk, obj_probe_to_psi,
     psi_to_obj_probe, quad_phase,
 };
+pub use plan::{Backend, Params, Plan, Step};
 pub use ptycho::{Algorithm, ApParams, DmParams, LlkRecord, Ptycho, RpieParams};
 
 /// Errors from building or running the engine.
