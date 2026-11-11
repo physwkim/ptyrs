@@ -1,12 +1,14 @@
 //! Receiver: frames from a PVA monitor of `<prefix>FRAME` or, with
 //! `--source zmq`, an Eiger stream v1 PULL socket; positions from a PVA
 //! monitor of `<prefix>POS` → decode workers → uniqueId position match →
-//! crop → pinned ring → async H2D on GPU `--gpu`.
+//! crop → pinned ring → async H2D on GPU `--gpu` into a device store
+//! indexed by sequence number.
 //!
 //! The source only parses the frame metadata and hands a zero-copy slice
 //! of the received buffer to the workers. Workers reuse one image-sized
-//! scratch each; the ring, its device mirror and the events are allocated
-//! before the first frame.
+//! scratch each; the ring, the store's address range and the events are
+//! allocated before the first frame, and the store maps device memory in
+//! `--store-chunk-mib` steps as frames arrive.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,7 +24,7 @@ use ptyrs_live::pipeline::{
 };
 use ptyrs_live::pos::PosTable;
 use ptyrs_live::pva_source::{NtndFrames, PosStats, monitor_positions};
-use ptyrs_live::ring::{Ring, UploaderConfig, run_uploader};
+use ptyrs_live::ring::{DeviceStore, Ring, UploaderConfig, run_uploader};
 use ptyrs_live::stats::{mono_ns, process_cpu_ns, wall_ns};
 use ptyrs_live::synth::Synth;
 
@@ -88,6 +90,13 @@ fn main() {
     let ctx = Context::new(a.get("gpu", 0)).expect("CUDA context");
     let ring =
         Arc::new(Ring::new(&ctx, a.get("ring-slots", 1024), crop * crop).expect("pinned ring"));
+    let store = DeviceStore::new(
+        &ctx,
+        a.get("store-frames", frames as usize),
+        crop * crop,
+        a.get::<usize>("store-chunk-mib", 32) << 20,
+    )
+    .expect("device store");
     let stop = Arc::new(AtomicBool::new(false));
     let uploader = {
         let (ring, ctx, stop, place) = (ring.clone(), ctx.clone(), stop.clone(), place.clone());
@@ -95,7 +104,7 @@ fn main() {
             .name("h2d".into())
             .spawn(move || {
                 place.enter(place.h2d.as_ref().map(std::slice::from_ref));
-                run_uploader(ring, ctx, ucfg, stop)
+                run_uploader(ring, ctx, store, ucfg, stop, None)
             })
             .unwrap()
     };
@@ -226,44 +235,55 @@ fn main() {
     let ps = pos_stats.lock().unwrap();
     let (wr, decode, pos_after) = WorkerReport::merge(reports);
 
-    // End-to-end check of whatever the ring holds now: device copy against
-    // the host ring, and against a fresh synthesis of the same crop.
+    // End-to-end check of the frames the ring still holds: their place in
+    // the device store against the host ring slot and against a fresh
+    // synthesis of the same crop; the position and uid of every stored frame.
     let se = crop * crop;
-    let slots = ring.slots();
     let host = ring.host_frames();
-    let h2d_bad = (0..slots)
-        .filter(|&i| host[i * se..(i + 1) * se] != up.device_frames[i * se..(i + 1) * se])
-        .count();
-    let filled: Vec<(usize, i32)> = (0..slots)
-        .filter_map(|i| ring.slot_uid(i).map(|u| (i, u)))
+    let filled: Vec<(usize, u64, i32)> = (0..ring.slots())
+        .filter_map(|i| ring.slot(i).map(|(seq, uid)| (i, seq, uid)))
         .collect();
+    let mut dev = vec![0u16; filled.len() * se];
+    for (k, &(_, seq, _)) in filled.iter().enumerate() {
+        up.store
+            .read_frames(seq..seq + 1, &mut dev[k * se..(k + 1) * se])
+            .expect("store readback");
+    }
     let threads = std::thread::available_parallelism().map_or(8, |n| n.get());
-    let e2e_bad: usize = std::thread::scope(|sc| {
+    let per = filled.len().div_ceil(threads).max(1);
+    let (h2d_bad, e2e_bad): (usize, usize) = std::thread::scope(|sc| {
         filled
-            .chunks(filled.len().div_ceil(threads).max(1))
-            .map(|chunk| {
-                let dev = &up.device_frames;
-                let dpos = &up.device_positions;
+            .chunks(per)
+            .zip(dev.chunks(per * se))
+            .map(|(chunk, dev)| {
                 let truth = &truth;
                 sc.spawn(move || {
                     let mut buf = vec![0u16; se];
-                    chunk
-                        .iter()
-                        .filter(|&&(i, uid)| {
-                            truth.fill(uid, geom.crop_region(), &mut buf);
-                            let (x, y) = truth.position(uid);
-                            dev[i * se..(i + 1) * se] != buf[..]
-                                || dpos[2 * i] != x
-                                || dpos[2 * i + 1] != y
-                        })
-                        .count()
+                    let (mut h2d, mut e2e) = (0, 0);
+                    for (&(i, _, uid), d) in chunk.iter().zip(dev.chunks(se)) {
+                        h2d += usize::from(host[i * se..(i + 1) * se] != *d);
+                        truth.fill(uid, geom.crop_region(), &mut buf);
+                        e2e += usize::from(buf[..] != *d);
+                    }
+                    (h2d, e2e)
                 })
             })
             .collect::<Vec<_>>()
             .into_iter()
             .map(|h| h.join().unwrap())
-            .sum()
+            .fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1))
     });
+    let dpos = up.store.read_positions(up.frames).expect("store readback");
+    let store_pos_bad = up
+        .uids
+        .iter()
+        .enumerate()
+        .filter(|&(s, &uid)| (dpos[2 * s], dpos[2 * s + 1]) != truth.position(uid))
+        .count();
+    let mut sorted = up.uids.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let store_dup_uids = up.uids.len() - sorted.len();
 
     let first = st.first_rx.unwrap_or(t_end);
     let rx_span = (st.last_rx - first).max(1) as f64 / 1e9;
@@ -331,14 +351,18 @@ fn main() {
     );
     println!(
         "recv verify sampled={} sampled_bad={} ring_slots_checked={} h2d_mismatch_slots={h2d_bad} \
-         e2e_mismatch_slots={e2e_bad}",
+         e2e_mismatch_slots={e2e_bad} store_frames={} store_mapped_MiB={} store_pos_bad={store_pos_bad} \
+         store_dup_uids={store_dup_uids}",
         wr.verified,
         wr.verify_bad,
-        filled.len()
+        filled.len(),
+        up.uids.len(),
+        up.store.mapped_bytes() >> 20,
     );
+    let bad = wr.verify_bad + wr.pos_mismatch;
     let code = if lost > 0 {
         2
-    } else if wr.verify_bad + h2d_bad as u64 + e2e_bad as u64 + wr.pos_mismatch > 0 {
+    } else if bad as usize + h2d_bad + e2e_bad + store_pos_bad + store_dup_uids > 0 {
         3
     } else {
         0
