@@ -14,6 +14,7 @@
 //! frame, `--graph-batch` frames per replay.
 
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -44,7 +45,8 @@ fn main() {
     let a = Args::parse();
     let addr: SocketAddr = a.str("addr", "127.0.0.1:15075").parse().expect("--addr");
     let frames: u64 = a.get("frames", 30_000);
-    let workers: usize = a.get("workers", 16);
+    // With no worker every queued frame is dropped, so 0 fails here.
+    let workers = a.get("workers", NonZeroUsize::new(16).unwrap()).get();
     // The same model arguments as pty-sim's.
     let model = Model::from_args(&a);
     let (width, height) = model.frame_size();
