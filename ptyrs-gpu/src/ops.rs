@@ -6,9 +6,11 @@
 //!   even; `n = ny * nx`. `probe` is `[nprobe, ny, nx]`, `obj` `[nobj, nyo, nxo]`, both in
 //!   natural order (no shift). Complex values are [`C32`].
 //! * Views are frame-major, `k = frame * nmode + mode`; [`ViewAddr`] says which probe and
-//!   object mode a view multiplies and where it samples the object. A stack is a frame range
-//!   `f0 .. f1`; its exit-wave buffer `psi` holds planes `0 .. (f1 - f0) * nmode`, plane `kl`
-//!   being view `f0 * nmode + kl`.
+//!   object mode a view multiplies and where it samples the object. A stack is frames
+//!   `f0 .. f0 + nf`, a [`StackCtl`] entry of a [`StackTable`] that the kernels read when they
+//!   run, not when they are launched or captured. Per-stack buffers are sized by the table's
+//!   `nf_max`: `psi` holds `nf_max * nmode` planes, plane `kl < nf * nmode` being view
+//!   `f0 * nmode + kl`; planes and records past the stack are left as they are.
 //! * Real-space exit waves have their origin at `[0, 0]`: probe pixel `(y, x)` is stored at
 //!   `((y + ny/2) % ny, (x + nx/2) % nx)`. So a plain 2D FFT of each plane
 //!   (`ptyrs_fft::Plan2d`, unnormalized, forward `exp(-2 pi i jk / n)`) gives the far field in
@@ -44,9 +46,10 @@
 use std::ops::Range;
 
 use cuda_async::device_operation::ExecutionContext;
-use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig};
-pub use ptyrs_kernels::pixel::{LlkPartial, MASKED, OBJ_TILE, ViewAddr};
-use ptyrs_kernels::pixel::{PIXEL_THREADS, StackGeom, SumPtrs};
+use cuda_core::sys::CUdeviceptr;
+use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig, RawDeviceBuffer};
+pub use ptyrs_kernels::pixel::{LlkPartial, MASKED, OBJ_TILE, StackCtl, ViewAddr};
+use ptyrs_kernels::pixel::{PIXEL_THREADS, StackGeom, SumPtrs, TilePtrs};
 
 use crate::{C32, Error, Kernels, check_len, dptr};
 
@@ -64,14 +67,6 @@ pub struct ViewDims {
     pub obj: [u32; 2],
     /// `pi * px^2 / (lambda * z)`, radians per squared object pixel; 0 for near field.
     pub quad_phase: f32,
-}
-
-/// A frame range resolved against [`ViewDims`].
-struct Stack {
-    f0: u32,
-    nf: u32,
-    k0: u32,
-    nk: u32,
 }
 
 impl ViewDims {
@@ -109,35 +104,135 @@ impl ViewDims {
         Ok(())
     }
 
-    fn stack(&self, frames: &Range<u32>) -> Result<Stack, Error> {
+    /// The stack kernels' geometry for `stack`, whose table must have been made for a scan
+    /// of `nframe` frames.
+    fn geom(&self, stack: StackRef<'_>) -> Result<StackGeom, Error> {
         self.check()?;
-        if frames.start >= frames.end || frames.end > self.nframe {
+        let t = stack.table;
+        if t.nframe != self.nframe {
             return Err(Error::Shape(format!(
-                "frames {frames:?} is not a non-empty part of 0..{}",
-                self.nframe
+                "stack table made for {} frames, dims have {}",
+                t.nframe, self.nframe
             )));
         }
-        let nf = frames.end - frames.start;
-        Ok(Stack {
-            f0: frames.start,
-            nf,
-            k0: frames.start * self.nmode,
-            nk: nf * self.nmode,
-        })
-    }
-
-    /// The view kernels' geometry for stack `s`.
-    fn geom(&self, s: &Stack) -> StackGeom {
-        StackGeom {
-            k0: s.k0,
-            nk: s.nk,
+        Ok(StackGeom {
+            nframe: self.nframe,
+            nf_max: t.nf_max,
+            nmode: self.nmode,
             nprobe: self.nprobe,
             ny: self.frame[0],
             nx: self.frame[1],
             nyo: self.obj[0],
             nxo: self.obj[1],
             quad: self.quad_phase,
+        })
+    }
+}
+
+/// [`StackCtl`] entries on the device, for a scan of `nframe` frames, each stack at most
+/// `nf_max` frames. A kernel reads its entry when it runs and clamps it to `nf <= nf_max`,
+/// `f0 + nf <= nframe`.
+pub struct StackTable {
+    ctl: DeviceBuffer<StackCtl>,
+    nframe: u32,
+    nf_max: u32,
+}
+
+impl StackTable {
+    /// One entry per range, each a non-empty part of `0 .. dims.nframe`; `nf_max` is the
+    /// longest.
+    pub fn new(stream: &CudaStream, dims: &ViewDims, stacks: &[Range<u32>]) -> Result<Self, Error> {
+        dims.check()?;
+        let mut ctl = Vec::with_capacity(stacks.len());
+        for r in stacks {
+            if r.start >= r.end || r.end > dims.nframe {
+                return Err(Error::Shape(format!(
+                    "stack {r:?} is not a non-empty part of 0..{}",
+                    dims.nframe
+                )));
+            }
+            ctl.push(StackCtl {
+                f0: r.start,
+                nf: r.end - r.start,
+            });
         }
+        let nf_max = ctl
+            .iter()
+            .map(|c| c.nf)
+            .max()
+            .ok_or_else(|| Error::Shape("no stacks".into()))?;
+        Ok(Self {
+            ctl: DeviceBuffer::from_host(stream, &ctl)?,
+            nframe: dims.nframe,
+            nf_max,
+        })
+    }
+
+    /// One entry, `{ f0: 0, nf: 0 }`, for the caller's own device code to rewrite between
+    /// runs (through [`Self::ptr`], leased through [`Self::storage`]); `nf_max` in
+    /// `1 ..= dims.nframe`.
+    pub fn device(stream: &CudaStream, dims: &ViewDims, nf_max: u32) -> Result<Self, Error> {
+        dims.check()?;
+        if nf_max == 0 || nf_max > dims.nframe {
+            return Err(Error::Shape(format!(
+                "nf_max {nf_max} is not in 1..={}",
+                dims.nframe
+            )));
+        }
+        Ok(Self {
+            ctl: DeviceBuffer::zeroed(stream, 1)?,
+            nframe: dims.nframe,
+            nf_max,
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        self.ctl.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ctl.is_empty()
+    }
+
+    pub fn nf_max(&self) -> u32 {
+        self.nf_max
+    }
+
+    /// Entry `s`; panics if `s >= self.len()`.
+    pub fn at(&self, s: usize) -> StackRef<'_> {
+        assert!(s < self.len(), "stack {s} of a {}-entry table", self.len());
+        StackRef { table: self, s }
+    }
+
+    /// Device address of entry 0; entry `s` is `s * size_of::<StackCtl>()` bytes on.
+    pub fn ptr(&self) -> CUdeviceptr {
+        self.ctl.cu_deviceptr()
+    }
+
+    /// The entries' storage, for leasing a write to them.
+    pub fn storage(&self) -> &RawDeviceBuffer {
+        self.ctl.storage()
+    }
+}
+
+/// Entry `s` of a [`StackTable`], what a stack launch takes.
+#[derive(Clone, Copy)]
+pub struct StackRef<'a> {
+    table: &'a StackTable,
+    s: usize,
+}
+
+impl StackRef<'_> {
+    pub fn nf_max(&self) -> u32 {
+        self.table.nf_max
+    }
+
+    fn ctl(&self) -> *const StackCtl {
+        (self.table.ptr() + (self.s * size_of::<StackCtl>()) as CUdeviceptr) as *const StackCtl
+    }
+
+    fn storage(&self) -> &RawDeviceBuffer {
+        self.table.ctl.storage()
     }
 }
 
@@ -277,26 +372,31 @@ fn grid_1d(total: usize) -> Result<LaunchConfig, Error> {
 }
 
 impl Kernels {
-    /// Exit waves of `frames`: `psi[kl] = shift(O_v * P_v * exp(i quad r^2))` for view
-    /// `v = frames.start * nmode + kl`, `O_v` the object bilinearly sampled at the view's
-    /// offset (PyNX `ObjProbe2Psi`). `psi` holds `frames.len() * nmode` planes.
+    /// Exit waves of the stack: `psi[kl] = shift(O_v * P_v * exp(i quad r^2))` for view
+    /// `v = f0 * nmode + kl`, `O_v` the object bilinearly sampled at the view's offset (PyNX
+    /// `ObjProbe2Psi`). `psi` holds `nf_max * nmode` planes.
     pub fn obj_probe_to_psi(
         &self,
         ctx: &ExecutionContext,
         views: &Views,
-        frames: Range<u32>,
+        stack: StackRef<'_>,
         obj: &DeviceBuffer<C32>,
         probe: &DeviceBuffer<C32>,
         psi: &mut DeviceBuffer<C32>,
     ) -> Result<(), Error> {
         let d = &views.dims;
-        let s = d.stack(&frames)?;
-        let n = d.n();
+        let g = d.geom(stack)?;
+        let (n, nk_max) = (d.n(), g.nf_max as usize * d.nmode as usize);
         check_len("obj", obj, d.obj_len())?;
         check_len("probe", probe, d.nprobe as usize * n)?;
-        check_len("psi", psi, s.nk as usize * n)?;
-        let config = grid_1d(s.nk as usize * n)?;
-        let reads = [views.addr.storage(), obj.storage(), probe.storage()];
+        check_len("psi", psi, nk_max * n)?;
+        let config = grid_1d(nk_max * n)?;
+        let reads = [
+            views.addr.storage(),
+            obj.storage(),
+            probe.storage(),
+            stack.storage(),
+        ];
         self.launch(ctx, &reads, &[psi.storage()], |stream| {
             // SAFETY: lengths checked above; `Views::new` checked every view lies inside the
             // object with valid mode indices.
@@ -308,41 +408,35 @@ impl Kernels {
                     dptr(probe),
                     dptr(&views.addr),
                     dptr(psi),
-                    d.geom(&s),
+                    stack.ctl(),
+                    g,
                 )
             }
         })
     }
 
-    /// Calculated intensity of `frames` in detector order: `icalc[fl, d] = sum_m
+    /// Calculated intensity of the stack in detector order: `icalc[fl, d] = sum_m
     /// |psi[fl * nmode + m, fft(d)]|^2 / n` from the forward-FFT'd stack (PyNX `Calc2Obs`,
-    /// no background). `icalc` holds `frames.len()` frames.
+    /// no background). `icalc` holds `nf_max` frames.
     pub fn mode_intensity(
         &self,
         ctx: &ExecutionContext,
         dims: &ViewDims,
-        frames: Range<u32>,
+        stack: StackRef<'_>,
         psi: &DeviceBuffer<C32>,
         icalc: &mut DeviceBuffer<f32>,
     ) -> Result<(), Error> {
-        let s = dims.stack(&frames)?;
-        let n = dims.n();
-        check_len("psi", psi, s.nk as usize * n)?;
-        check_len("icalc", icalc, s.nf as usize * n)?;
-        let config = grid_1d(s.nf as usize * n)?;
-        self.launch(ctx, &[psi.storage()], &[icalc.storage()], |stream| {
+        let g = dims.geom(stack)?;
+        let (n, nf_max) = (dims.n(), g.nf_max as usize);
+        check_len("psi", psi, nf_max * dims.nmode as usize * n)?;
+        check_len("icalc", icalc, nf_max * n)?;
+        let config = grid_1d(nf_max * n)?;
+        let reads = [psi.storage(), stack.storage()];
+        self.launch(ctx, &reads, &[icalc.storage()], |stream| {
             // SAFETY: lengths checked above.
             unsafe {
-                self.module.mode_intensity(
-                    stream,
-                    config,
-                    dptr(psi),
-                    dptr(icalc),
-                    s.nf,
-                    dims.nmode,
-                    dims.frame[0],
-                    dims.frame[1],
-                )
+                self.module
+                    .mode_intensity(stream, config, dptr(psi), dptr(icalc), stack.ctl(), g)
             }
         })
     }
@@ -356,79 +450,65 @@ impl Kernels {
         &self,
         ctx: &ExecutionContext,
         dims: &ViewDims,
-        frames: Range<u32>,
+        stack: StackRef<'_>,
         counts: &DeviceBuffer<u16>,
         psi: &mut DeviceBuffer<C32>,
     ) -> Result<(), Error> {
-        let s = dims.stack(&frames)?;
-        let n = dims.n();
+        let g = dims.geom(stack)?;
+        let (n, nf_max) = (dims.n(), g.nf_max as usize);
         check_len("counts", counts, dims.nframe as usize * n)?;
-        check_len("psi", psi, s.nk as usize * n)?;
-        let config = grid_1d(s.nf as usize * n)?;
-        self.launch(ctx, &[counts.storage()], &[psi.storage()], |stream| {
+        check_len("psi", psi, nf_max * dims.nmode as usize * n)?;
+        let config = grid_1d(nf_max * n)?;
+        let reads = [counts.storage(), stack.storage()];
+        self.launch(ctx, &reads, &[psi.storage()], |stream| {
             // SAFETY: lengths checked above.
             unsafe {
-                self.module.apply_amplitude(
-                    stream,
-                    config,
-                    dptr(psi),
-                    dptr(counts),
-                    s.f0,
-                    s.nf,
-                    dims.nmode,
-                    dims.frame[0],
-                    dims.frame[1],
-                )
+                self.module
+                    .apply_amplitude(stream, config, dptr(psi), dptr(counts), stack.ctl(), g)
             }
         })
     }
 
     /// Per-frame log-likelihood sums of the forward-FFT'd stack against the counts (PyNX
-    /// `LLKAll`, no background): `out[fl]` gets, over the unmasked pixels of frame
-    /// `frames.start + fl`, with `calc = sum_m |Psi_m|^2 / n`: Poisson `calc` if `obs == 0`
+    /// `LLKAll`, no background): `out[fl]`, `fl < nf`, gets, over the unmasked pixels of
+    /// frame `f0 + fl`, with `calc = sum_m |Psi_m|^2 / n`: Poisson `calc` if `obs == 0`
     /// else `calc - obs + obs ln(obs / calc)`; Gaussian `(obs - calc)^2 / (obs + 1)`;
     /// Euclidean `4 (sqrt obs - sqrt calc)^2`; and `calc`. Each frame's sum is a fixed-order
-    /// block reduction; total with [`LlkSums::from_partials`].
+    /// block reduction; total with [`LlkSums::from_partials`]. `out` holds `nf_max` records.
     pub fn llk(
         &self,
         ctx: &ExecutionContext,
         dims: &ViewDims,
-        frames: Range<u32>,
+        stack: StackRef<'_>,
         counts: &DeviceBuffer<u16>,
         psi: &DeviceBuffer<C32>,
         out: &mut DeviceBuffer<LlkPartial>,
     ) -> Result<(), Error> {
-        let s = dims.stack(&frames)?;
+        let g = dims.geom(stack)?;
         let n = dims.n();
         check_len("counts", counts, dims.nframe as usize * n)?;
-        check_len("psi", psi, s.nk as usize * n)?;
-        check_len("out", out, s.nf as usize)?;
+        check_len("psi", psi, g.nf_max as usize * dims.nmode as usize * n)?;
+        check_len("out", out, g.nf_max as usize)?;
         let config = LaunchConfig {
-            grid_dim: (s.nf, 1, 1),
+            grid_dim: (g.nf_max, 1, 1),
             block_dim: (PIXEL_THREADS, 1, 1),
             shared_mem_bytes: 0,
         };
-        self.launch(
-            ctx,
-            &[counts.storage(), psi.storage()],
-            &[out.storage()],
-            |stream| {
-                // SAFETY: lengths checked above; one block of PIXEL_THREADS per frame.
-                unsafe {
-                    self.module.llk(
-                        stream,
-                        config,
-                        dptr(psi),
-                        dptr(counts),
-                        dptr(out),
-                        s.f0,
-                        dims.nmode,
-                        dims.frame[0],
-                        dims.frame[1],
-                    )
-                }
-            },
-        )
+        let reads = [counts.storage(), psi.storage(), stack.storage()];
+        self.launch(ctx, &reads, &[out.storage()], |stream| {
+            // SAFETY: lengths checked above; one block of PIXEL_THREADS per frame.
+            unsafe {
+                self.module.llk(
+                    stream,
+                    config,
+                    dptr(psi),
+                    dptr(counts),
+                    dptr(out),
+                    stack.ctl(),
+                    g,
+                )
+            }
+        })
     }
 
     /// Adds the stack's object-update sums (PyNX `Psi2Obj`) to `sums` `[nobj, nyo, nxo]`:
@@ -440,15 +520,15 @@ impl Kernels {
         &self,
         ctx: &ExecutionContext,
         views: &Views,
-        frames: Range<u32>,
+        stack: StackRef<'_>,
         psi: &DeviceBuffer<C32>,
         probe: &DeviceBuffer<C32>,
         sums: &mut UpdateSums,
     ) -> Result<(), Error> {
         let d = &views.dims;
-        let s = d.stack(&frames)?;
+        let g = d.geom(stack)?;
         let n = d.n();
-        check_len("psi", psi, s.nk as usize * n)?;
+        check_len("psi", psi, g.nf_max as usize * d.nmode as usize * n)?;
         check_len("probe", probe, d.nprobe as usize * n)?;
         sums.check(d.obj_len())?;
         let config = LaunchConfig {
@@ -466,6 +546,7 @@ impl Kernels {
             views.addr.storage(),
             views.tile_start.storage(),
             views.tile_views.storage(),
+            stack.storage(),
         ];
         self.launch(ctx, &reads, &sums.storages(), |stream| {
             // SAFETY: lengths checked above; the tile lists were built from these views.
@@ -476,10 +557,13 @@ impl Kernels {
                     dptr(psi),
                     dptr(probe),
                     dptr(&views.addr),
-                    dptr(&views.tile_start),
-                    dptr(&views.tile_views),
+                    TilePtrs {
+                        start: dptr(&views.tile_start),
+                        views: dptr(&views.tile_views),
+                    },
                     sums.ptrs(),
-                    d.geom(&s),
+                    stack.ctl(),
+                    g,
                 )
             }
         })
@@ -493,19 +577,24 @@ impl Kernels {
         &self,
         ctx: &ExecutionContext,
         views: &Views,
-        frames: Range<u32>,
+        stack: StackRef<'_>,
         psi: &DeviceBuffer<C32>,
         obj: &DeviceBuffer<C32>,
         sums: &mut UpdateSums,
     ) -> Result<(), Error> {
         let d = &views.dims;
-        let s = d.stack(&frames)?;
+        let g = d.geom(stack)?;
         let n = d.n();
-        check_len("psi", psi, s.nk as usize * n)?;
+        check_len("psi", psi, g.nf_max as usize * d.nmode as usize * n)?;
         check_len("obj", obj, d.obj_len())?;
         sums.check(d.nprobe as usize * n)?;
         let config = grid_1d(d.nprobe as usize * n)?;
-        let reads = [psi.storage(), obj.storage(), views.addr.storage()];
+        let reads = [
+            psi.storage(),
+            obj.storage(),
+            views.addr.storage(),
+            stack.storage(),
+        ];
         self.launch(ctx, &reads, &sums.storages(), |stream| {
             // SAFETY: lengths checked above; `Views::new` checked every view.
             unsafe {
@@ -516,7 +605,8 @@ impl Kernels {
                     dptr(obj),
                     dptr(&views.addr),
                     sums.ptrs(),
-                    d.geom(&s),
+                    stack.ctl(),
+                    g,
                 )
             }
         })

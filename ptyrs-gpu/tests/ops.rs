@@ -11,8 +11,8 @@ use cuda_async::error::DeviceError;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, DeviceCopy, DriverError};
 use ptyrs_fft::{FftError, Plan2d};
 use ptyrs_gpu::{
-    C32, Error, Kernels, Lines, LlkPartial, LlkSums, MASKED, UpdateSums, ViewAddr, ViewDims, Views,
-    record,
+    C32, Error, Kernels, Lines, LlkPartial, LlkSums, MASKED, StackCtl, StackRef, StackTable,
+    UpdateSums, ViewAddr, ViewDims, Views, record,
 };
 
 type Z = (f64, f64);
@@ -45,6 +45,18 @@ fn noise(len: usize, seed: u64, scale: f32) -> Vec<C32> {
 
 fn up<T: DeviceCopy>(stream: &CudaStream, host: &[T]) -> DeviceBuffer<T> {
     DeviceBuffer::from_host(stream, host).unwrap()
+}
+
+/// A table of the one stack `frames`.
+fn one_stack(stream: &CudaStream, d: &ViewDims, frames: Range<u32>) -> StackTable {
+    StackTable::new(stream, d, std::slice::from_ref(&frames)).unwrap()
+}
+
+/// `host` followed by zeros up to `len` values.
+fn up_padded(stream: &CudaStream, host: &[C32], len: usize) -> DeviceBuffer<C32> {
+    let mut v = host.to_vec();
+    v.resize(len, C32::default());
+    up(stream, &v)
 }
 
 fn z(c: C32) -> Z {
@@ -289,16 +301,21 @@ fn obj_probe_to_psi_matches_f64() {
     let s = scan();
     let views = Views::new(&stream, s.d, &s.views).unwrap();
     let (obj, probe) = (up(&stream, &s.obj), up(&stream, &s.probe));
-    for frames in [0..5, 2..5] {
-        let mut psi = DeviceBuffer::<C32>::zeroed(&stream, s.nk(&frames) * s.n()).unwrap();
-        k.obj_probe_to_psi(&ex, &views, frames.clone(), &obj, &probe, &mut psi)
+    let stacks = [0..5, 2..5];
+    let table = StackTable::new(&stream, &s.d, &stacks).unwrap();
+    for (i, frames) in stacks.into_iter().enumerate() {
+        let mut psi = DeviceBuffer::<C32>::zeroed(&stream, s.nk(&(0..5)) * s.n()).unwrap();
+        k.obj_probe_to_psi(&ex, &views, table.at(i), &obj, &probe, &mut psi)
             .unwrap();
-        let err = rel_l2(
-            &psi.to_host_vec(&stream).unwrap(),
-            &s.psi(frames.clone(), &s.obj),
-        );
+        let got = psi.to_host_vec(&stream).unwrap();
+        let (stack, rest) = got.split_at(s.nk(&frames) * s.n());
+        let err = rel_l2(stack, &s.psi(frames.clone(), &s.obj));
         println!("obj_probe_to_psi {frames:?}: rel L2 {err:.2e}");
         assert!(err < 2e-6, "frames {frames:?}: rel L2 {err:.2e}");
+        assert!(
+            rest.iter().all(|c| *c == C32::default()),
+            "frames {frames:?}: planes past the stack written"
+        );
     }
 }
 
@@ -348,9 +365,11 @@ fn update_sums_match_f64_and_ignore_stack_split() {
     let (obj, probe) = (up(&stream, &s.obj), up(&stream, &s.probe));
     let psi_host = noise(s.nk(&(0..5)) * n, 3, 1.0);
     let psi = up(&stream, &psi_host);
-    let split = s.nk(&(0..2)) * n;
+    let whole_stack = one_stack(&stream, &s.d, 0..5);
+    let part_stacks = StackTable::new(&stream, &s.d, &[0..2, 2..5]).unwrap();
+    let (split, part_len) = (s.nk(&(0..2)) * n, s.nk(&(2..5)) * n);
     let psi_parts = [
-        up(&stream, &psi_host[..split]),
+        up_padded(&stream, &psi_host[..split], part_len),
         up(&stream, &psi_host[split..]),
     ];
     // Non-zero starting sums: the kernels add to what is there.
@@ -370,24 +389,24 @@ fn update_sums_match_f64_and_ignore_stack_split() {
 
     let st = start(s.obj.len(), 10);
     let (mut whole, mut parts) = (sums(&stream, &st), sums(&stream, &st));
-    k.psi_to_obj(&ex, &views, 0..5, &psi, &probe, &mut whole)
+    k.psi_to_obj(&ex, &views, whole_stack.at(0), &psi, &probe, &mut whole)
         .unwrap();
-    k.psi_to_obj(&ex, &views, 0..2, &psi_parts[0], &probe, &mut parts)
-        .unwrap();
-    k.psi_to_obj(&ex, &views, 2..5, &psi_parts[1], &probe, &mut parts)
-        .unwrap();
+    for (i, part) in psi_parts.iter().enumerate() {
+        k.psi_to_obj(&ex, &views, part_stacks.at(i), part, &probe, &mut parts)
+            .unwrap();
+    }
     let (mut num, mut den) = f64_start(&st);
     s.obj_sums(0..5, &psi_host, &mut num, &mut den);
     check_sums("object", &stream, &whole, &parts, (&num, &den));
 
     let st = start(s.probe.len(), 20);
     let (mut whole, mut parts) = (sums(&stream, &st), sums(&stream, &st));
-    k.psi_to_probe(&ex, &views, 0..5, &psi, &obj, &mut whole)
+    k.psi_to_probe(&ex, &views, whole_stack.at(0), &psi, &obj, &mut whole)
         .unwrap();
-    k.psi_to_probe(&ex, &views, 0..2, &psi_parts[0], &obj, &mut parts)
-        .unwrap();
-    k.psi_to_probe(&ex, &views, 2..5, &psi_parts[1], &obj, &mut parts)
-        .unwrap();
+    for (i, part) in psi_parts.iter().enumerate() {
+        k.psi_to_probe(&ex, &views, part_stacks.at(i), part, &obj, &mut parts)
+            .unwrap();
+    }
     let (mut num, mut den) = f64_start(&st);
     s.probe_sums(0..5, &psi_host, &mut num, &mut den);
     check_sums("probe", &stream, &whole, &parts, (&num, &den));
@@ -398,14 +417,15 @@ fn psi_to_obj_is_the_adjoint_of_obj_probe_to_psi() {
     let (stream, ex, k) = setup();
     let s = scan();
     let views = Views::new(&stream, s.d, &s.views).unwrap();
+    let all = one_stack(&stream, &s.d, 0..5);
     let probe = up(&stream, &s.probe);
     let o = noise(s.obj.len(), 7, 1.0);
     // <A o, A o> = <o, A^H A o>: no cancellation, so f32 rounding stays small.
     let mut a_o = DeviceBuffer::<C32>::zeroed(&stream, s.nk(&(0..5)) * s.n()).unwrap();
-    k.obj_probe_to_psi(&ex, &views, 0..5, &up(&stream, &o), &probe, &mut a_o)
+    k.obj_probe_to_psi(&ex, &views, all.at(0), &up(&stream, &o), &probe, &mut a_o)
         .unwrap();
     let mut ah = UpdateSums::zeroed(&stream, o.len()).unwrap();
-    k.psi_to_obj(&ex, &views, 0..5, &a_o, &probe, &mut ah)
+    k.psi_to_obj(&ex, &views, all.at(0), &a_o, &probe, &mut ah)
         .unwrap();
     let dot = |a: &[C32], b: &[C32]| {
         a.iter().zip(b).fold((0.0, 0.0), |s, (&a, &b)| {
@@ -469,14 +489,14 @@ fn intensity_amplitude_and_llk_match_f64() {
     }
 
     let counts = up(&stream, &counts_host);
+    let table = one_stack(&stream, &d, frames);
+    let stack = table.at(0);
     let mut psi = up(&stream, &psi_host);
     let mut icalc = DeviceBuffer::<f32>::zeroed(&stream, nf * n).unwrap();
-    k.mode_intensity(&ex, &d, frames.clone(), &psi, &mut icalc)
-        .unwrap();
+    k.mode_intensity(&ex, &d, stack, &psi, &mut icalc).unwrap();
     let mut llk = DeviceBuffer::<LlkPartial>::zeroed(&stream, nf).unwrap();
-    k.llk(&ex, &d, frames.clone(), &counts, &psi, &mut llk)
-        .unwrap();
-    k.apply_amplitude(&ex, &d, frames.clone(), &counts, &mut psi)
+    k.llk(&ex, &d, stack, &counts, &psi, &mut llk).unwrap();
+    k.apply_amplitude(&ex, &d, stack, &counts, &mut psi)
         .unwrap();
 
     let err = rel_l2_re(&icalc.to_host_vec(&stream).unwrap(), &icalc_ref);
@@ -682,13 +702,14 @@ fn fourier_projection_matches_pynx_orthonormal_f64() {
     let want: Vec<Z> = far.chunks(n).flat_map(|p| dft2_ortho(p, N, true)).collect();
 
     let views = Views::new(&stream, d, &s.views).unwrap();
+    let table = one_stack(&stream, &d, 0..3);
     let mut plan = Plan2d::new(&stream, N, nf * nm).unwrap();
     let counts = up(&stream, &counts_host);
     let mut psi = DeviceBuffer::<C32>::zeroed(&stream, nf * nm * n).unwrap();
     k.obj_probe_to_psi(
         &ex,
         &views,
-        0..3,
+        table.at(0),
         &up(&stream, &s.obj),
         &up(&stream, &s.probe),
         &mut psi,
@@ -696,8 +717,10 @@ fn fourier_projection_matches_pynx_orthonormal_f64() {
     .unwrap();
     plan.forward_inplace(&ex, &mut psi).unwrap();
     let mut llk = DeviceBuffer::<LlkPartial>::zeroed(&stream, nf).unwrap();
-    k.llk(&ex, &d, 0..3, &counts, &psi, &mut llk).unwrap();
-    k.apply_amplitude(&ex, &d, 0..3, &counts, &mut psi).unwrap();
+    k.llk(&ex, &d, table.at(0), &counts, &psi, &mut llk)
+        .unwrap();
+    k.apply_amplitude(&ex, &d, table.at(0), &counts, &mut psi)
+        .unwrap();
     plan.inverse_inplace(&ex, &mut psi).unwrap();
 
     assert_llk("chain llk", &llk.to_host_vec(&stream).unwrap(), &llk_ref);
@@ -741,16 +764,157 @@ fn views_and_frame_ranges_are_checked() {
         "odd frame side"
     );
 
+    let table_err = |r: Result<StackTable, Error>| matches!(r, Err(Error::Shape(_)));
+    for stacks in [&[0..2, 3..3][..], &[0..1, 4..6], &[]] {
+        assert!(
+            table_err(StackTable::new(&stream, &s.d, stacks)),
+            "stacks {stacks:?}"
+        );
+    }
+    for nf_max in [0, 6] {
+        assert!(
+            table_err(StackTable::device(&stream, &s.d, nf_max)),
+            "nf_max {nf_max}"
+        );
+    }
+
     let views = Views::new(&stream, s.d, &s.views).unwrap();
     let (obj, probe) = (up(&stream, &s.obj), up(&stream, &s.probe));
+    let table = StackTable::new(&stream, &s.d, &[0..2, 1..5]).unwrap();
+    let mut short = DeviceBuffer::<C32>::zeroed(&stream, s.nk(&(0..4)) * s.n() - 1).unwrap();
+    let r = k.obj_probe_to_psi(&ex, &views, table.at(0), &obj, &probe, &mut short);
+    assert!(
+        matches!(r, Err(Error::Shape(_))),
+        "psi shorter than nf_max frames"
+    );
+    let other = one_stack(&stream, &ViewDims { nframe: 4, ..s.d }, 0..4);
     let mut psi = DeviceBuffer::<C32>::zeroed(&stream, s.nk(&(0..5)) * s.n()).unwrap();
-    for frames in [3..3, 4..6] {
-        let r = k.obj_probe_to_psi(&ex, &views, frames.clone(), &obj, &probe, &mut psi);
-        assert!(matches!(r, Err(Error::Shape(_))), "frames {frames:?}");
+    let r = k.obj_probe_to_psi(&ex, &views, other.at(0), &obj, &probe, &mut psi);
+    assert!(
+        matches!(r, Err(Error::Shape(_))),
+        "table made for another frame count"
+    );
+}
+
+/// Every stack launch over one stack, on buffers it zeroes first.
+struct StackRun {
+    obj: DeviceBuffer<C32>,
+    probe: DeviceBuffer<C32>,
+    psi: DeviceBuffer<C32>,
+    icalc: DeviceBuffer<f32>,
+    llk: DeviceBuffer<LlkPartial>,
+    obj_sums: UpdateSums,
+    probe_sums: UpdateSums,
+}
+
+impl StackRun {
+    fn new(stream: &CudaStream, s: &Scan, nf_max: u32) -> Self {
+        let (nf, n) = (nf_max as usize, s.n());
+        Self {
+            obj: up(stream, &s.obj),
+            probe: up(stream, &s.probe),
+            psi: DeviceBuffer::zeroed(stream, s.nk(&(0..nf_max)) * n).unwrap(),
+            icalc: DeviceBuffer::zeroed(stream, nf * n).unwrap(),
+            llk: DeviceBuffer::zeroed(stream, nf).unwrap(),
+            obj_sums: UpdateSums::zeroed(stream, s.obj.len()).unwrap(),
+            probe_sums: UpdateSums::zeroed(stream, s.probe.len()).unwrap(),
+        }
     }
-    let mut short = DeviceBuffer::<C32>::zeroed(&stream, s.nk(&(0..5)) * s.n() - 1).unwrap();
-    let r = k.obj_probe_to_psi(&ex, &views, 0..5, &obj, &probe, &mut short);
-    assert!(matches!(r, Err(Error::Shape(_))), "short psi");
+
+    fn run(
+        &mut self,
+        ctx: &ExecutionContext,
+        k: &Kernels,
+        views: &Views,
+        stack: StackRef<'_>,
+        counts: &DeviceBuffer<u16>,
+    ) -> Result<(), Error> {
+        let (obj, probe) = (&self.obj, &self.probe);
+        let d = *views.dims();
+        ptyrs_gpu::zero(ctx, &mut self.psi)?;
+        ptyrs_gpu::zero(ctx, &mut self.icalc)?;
+        ptyrs_gpu::zero(ctx, &mut self.llk)?;
+        self.obj_sums.zero(ctx)?;
+        self.probe_sums.zero(ctx)?;
+        k.obj_probe_to_psi(ctx, views, stack, obj, probe, &mut self.psi)?;
+        k.mode_intensity(ctx, &d, stack, &self.psi, &mut self.icalc)?;
+        k.llk(ctx, &d, stack, counts, &self.psi, &mut self.llk)?;
+        k.psi_to_obj(ctx, views, stack, &self.psi, probe, &mut self.obj_sums)?;
+        k.psi_to_probe(ctx, views, stack, &self.psi, obj, &mut self.probe_sums)?;
+        k.apply_amplitude(ctx, &d, stack, counts, &mut self.psi)
+    }
+
+    fn bits(&self, stream: &CudaStream) -> Vec<u32> {
+        let c = |b: &DeviceBuffer<C32>| -> Vec<u32> {
+            let v = b.to_host_vec(stream).unwrap();
+            v.iter()
+                .flat_map(|c| [c.re, c.im])
+                .map(f32::to_bits)
+                .collect()
+        };
+        let f = |b: &DeviceBuffer<f32>| -> Vec<u32> {
+            let v = b.to_host_vec(stream).unwrap();
+            v.iter().map(|x| x.to_bits()).collect()
+        };
+        let llk = self.llk.to_host_vec(stream).unwrap();
+        let llk = llk
+            .iter()
+            .flat_map(|p| [p.poisson, p.gaussian, p.euclidean, p.icalc].map(f32::to_bits));
+        [
+            c(&self.psi),
+            f(&self.icalc),
+            llk.collect(),
+            c(&self.obj_sums.num),
+            f(&self.obj_sums.den),
+            c(&self.probe_sums.num),
+            f(&self.probe_sums.den),
+        ]
+        .concat()
+    }
+}
+
+/// A graph captured once on a device-written entry runs whichever stack the entry holds when
+/// it replays, bit for bit like eager launches on a host-made table, and an entry past
+/// `nf_max` or the scan is clamped.
+#[test]
+fn one_graph_runs_whichever_stack_its_entry_holds() {
+    let (stream, _, k) = setup();
+    let s = scan();
+    let views = Views::new(&stream, s.d, &s.views).unwrap();
+    let counts = up(&stream, &counts(s.d.nframe as usize * s.n()));
+    let host = StackTable::new(&stream, &s.d, &[0..3, 3..5, 1..4, 4..5]).unwrap();
+    let mut eager = StackRun::new(&stream, &s, host.nf_max());
+    let mut want: Vec<_> = (0..host.len())
+        .map(|i| {
+            record(|ctx| eager.run(ctx, &k, &views, host.at(i), &counts))
+                .sync_on(&stream)
+                .unwrap();
+            eager.bits(&stream)
+        })
+        .collect();
+    // f0 past the scan: no frames.
+    want.push(vec![0; want[0].len()]);
+
+    let dev = StackTable::device(&stream, &s.d, 3).unwrap();
+    let mut it = StackRun::new(&stream, &s, dev.nf_max());
+    let side = k.context().new_stream().unwrap();
+    let graph = CudaGraph::capture(
+        side.clone(),
+        record(|ctx| it.run(ctx, &k, &views, dev.at(0), &counts)),
+    )
+    .unwrap();
+    let entries = [(0, 3), (3, 2), (1, 3), (4, 3), (9, 2)];
+    for ((f0, nf), want) in entries.into_iter().zip(&want) {
+        let ctl = [StackCtl { f0, nf }];
+        k.context().bind_to_thread().unwrap();
+        // SAFETY: `dev` holds one entry; no work on it is in flight.
+        unsafe { cuda_core::memory::memcpy_htod_sync(dev.ptr(), ctl.as_ptr(), 8) }.unwrap();
+        graph.launch().sync_on(&side).unwrap();
+        assert!(
+            it.bits(&stream) == *want,
+            "entry {{ f0: {f0}, nf: {nf} }} differs from eager"
+        );
+    }
 }
 
 /// Side of the square image the line FFTs and the `Plan2d` of [`Iteration`] round-trip.
@@ -769,6 +933,7 @@ struct Iteration {
     aux: DeviceBuffer<C32>,
     tmp: DeviceBuffer<C32>,
     plan: Plan2d,
+    stacks: StackTable,
 }
 
 impl Iteration {
@@ -788,6 +953,7 @@ impl Iteration {
             aux: up(stream, &noise(aux, 51, 1.0)),
             tmp: DeviceBuffer::zeroed(stream, aux).unwrap(),
             plan: Plan2d::new(stream, AUX as usize, 1).unwrap(),
+            stacks: one_stack(stream, &s.d, 0..s.d.nframe),
         }
     }
 
@@ -801,27 +967,20 @@ impl Iteration {
         counts: &DeviceBuffer<u16>,
     ) -> Result<(), Error> {
         let d = *views.dims();
-        let frames = 0..d.nframe;
+        let stack = self.stacks.at(0);
         let nk = self.psi.len() as u32;
         self.obj_sums.zero(ctx)?;
         self.probe_sums.zero(ctx)?;
-        k.obj_probe_to_psi(
-            ctx,
-            views,
-            frames.clone(),
-            &self.obj,
-            &self.probe,
-            &mut self.po,
-        )?;
+        k.obj_probe_to_psi(ctx, views, stack, &self.obj, &self.probe, &mut self.po)?;
         k.dm_reflect(ctx, &mut self.psi, &mut self.po, nk, 0.02)?;
-        k.mode_intensity(ctx, &d, frames.clone(), &self.psi, &mut self.icalc)?;
-        k.llk(ctx, &d, frames.clone(), counts, &self.psi, &mut self.llk)?;
-        k.apply_amplitude(ctx, &d, frames.clone(), counts, &mut self.psi)?;
+        k.mode_intensity(ctx, &d, stack, &self.psi, &mut self.icalc)?;
+        k.llk(ctx, &d, stack, counts, &self.psi, &mut self.llk)?;
+        k.apply_amplitude(ctx, &d, stack, counts, &mut self.psi)?;
         k.add_c32(ctx, &mut self.psi, &self.po, nk)?;
         k.psi_to_obj(
             ctx,
             views,
-            frames.clone(),
+            stack,
             &self.psi,
             &self.probe,
             &mut self.obj_sums,
@@ -829,7 +988,7 @@ impl Iteration {
         k.psi_to_probe(
             ctx,
             views,
-            frames,
+            stack,
             &self.psi,
             &self.obj,
             &mut self.probe_sums,

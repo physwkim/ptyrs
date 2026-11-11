@@ -32,20 +32,48 @@ pub struct ViewAddr {
 // SAFETY: repr(C) of four u32 and two f32, no padding; every bit pattern is a valid value.
 unsafe impl cuda_core::DeviceCopy for ViewAddr {}
 
-/// What a view kernel needs besides its buffers, passed by value: the stack's views
-/// `k0 .. k0 + nk`, the frame `[ny, nx]`, the object `[nyo, nxo]`, the probe mode count and
-/// the far-field phase `quad` (radians per squared pixel).
+/// The frames `f0 .. f0 + nf` of one stack. A kernel reads it from device memory when it
+/// runs, so one launch, or one captured graph, serves whichever stack the entry holds then.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct StackCtl {
+    pub f0: u32,
+    pub nf: u32,
+}
+
+// SAFETY: repr(C) of two u32, no padding; every bit pattern is a valid value.
+unsafe impl cuda_core::DeviceCopy for StackCtl {}
+
+/// What a stack kernel needs besides its buffers and [`StackCtl`], passed by value: the
+/// scan's `nframe` and `nmode`, `nf_max` (the most frames a stack may have, which sizes the
+/// launch and the per-stack buffers), the probe mode count, the frame `[ny, nx]`, the object
+/// `[nyo, nxo]` and the far-field phase `quad` (radians per squared pixel).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct StackGeom {
-    pub k0: u32,
-    pub nk: u32,
+    pub nframe: u32,
+    pub nf_max: u32,
+    pub nmode: u32,
     pub nprobe: u32,
     pub ny: u32,
     pub nx: u32,
     pub nyo: u32,
     pub nxo: u32,
     pub quad: f32,
+}
+
+/// `(f0, nf)` of the stack `ctl` holds, clamped to `nf <= nf_max` and `f0 + nf <= nframe`:
+/// the one place a kernel reads a [`StackCtl`], so no entry, however written, makes a launch
+/// address past its per-stack buffers or the scan.
+///
+/// # Safety
+///
+/// `ctl` must point to a readable `StackCtl`.
+#[device]
+pub unsafe fn stack_frames(ctl: *const StackCtl, g: StackGeom) -> (u32, u32) {
+    let c = unsafe { *ctl };
+    let f0 = c.f0.min(g.nframe);
+    (f0, c.nf.min(g.nf_max).min(g.nframe - f0))
 }
 
 /// Device addresses of an update's numerator (complex, interleaved) and denominator (real);
@@ -55,6 +83,15 @@ pub struct StackGeom {
 pub struct SumPtrs {
     pub num: *mut f32,
     pub den: *mut f32,
+}
+
+/// Device addresses of the per-object-tile view lists: tile `t`'s run is
+/// `views[start[t] .. start[t + 1]]`, ascending view indices.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct TilePtrs {
+    pub start: *const u32,
+    pub views: *const u32,
 }
 
 /// Per-frame log-likelihood sums over the frame's unmasked pixels (PyNX `LLKAll`).

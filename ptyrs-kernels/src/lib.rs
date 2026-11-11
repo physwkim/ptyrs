@@ -145,35 +145,39 @@ pub mod kernels {
     use cuda_device::float::{add_rn_f32, div_rn_f32, mul_rn_f32};
 
     // M1 pixel kernels. Shapes, orders and the FFT scaling convention are documented on the
-    // ptyrs-gpu wrappers, which check them; `pixel` documents the index maps. A "stack" is
-    // views `k0 .. k0 + nk` (frame-major, `k = frame * nmode + mode`) or frames
-    // `f0 .. f0 + nf`; its exit waves are planes `0 .. nk` of `psi`. 1D kernels are launched
-    // with `PIXEL_THREADS` threads per block over the stated element count.
+    // ptyrs-gpu wrappers, which check them; `pixel` documents the index maps. A stack is
+    // frames `f0 .. f0 + nf` from `stack_frames(ctl, g)`, so views `k0 .. k0 + nk` with
+    // `k0 = f0 * nmode`, `nk = nf * nmode` (frame-major, `k = frame * nmode + mode`); its exit
+    // waves are planes `0 .. nk` of `psi`, which holds `nf_max * nmode`. Launches are sized
+    // by `nf_max`; threads and blocks past the stack exit. 1D kernels are launched with
+    // `PIXEL_THREADS` threads per block over the stated element count.
 
     /// `psi[kl, psi_index(y, x)] = O_v(y, x) * P_v(y, x) * exp(i quad r^2)` for every view
-    /// `v = views[k0 + kl]` of `g`, one thread per element of `[nk, ny, nx]`.
+    /// `v = views[k0 + kl]` of the stack, one thread per element of `[nf_max * nmode, ny, nx]`.
     ///
     /// # Safety
     ///
-    /// `obj` `[nobj, nyo, nxo]`, `probe` `[nprobe, ny, nx]`, `views` `k0 + nk` records in
-    /// range for those shapes, `psi` `[nk, ny, nx]`.
+    /// `obj` `[nobj, nyo, nxo]`, `probe` `[nprobe, ny, nx]`, `views` `nframe * nmode` records
+    /// in range for those shapes, `psi` `[nf_max * nmode, ny, nx]`, `ctl` one entry.
     #[kernel]
     pub unsafe fn obj_probe_to_psi(
         obj: *const f32,
         probe: *const f32,
         views: *const ViewAddr,
         psi: *mut f32,
+        ctl: *const StackCtl,
         g: StackGeom,
     ) {
+        let (f0, nf) = unsafe { stack_frames(ctl, g) };
         let n = g.ny as usize * g.nx as usize;
         let t = global_index();
-        if t >= g.nk as usize * n {
+        if t >= nf as usize * g.nmode as usize * n {
             return;
         }
         let (kl, i) = (t / n, t % n);
         let (y, x) = ((i / g.nx as usize) as u32, (i % g.nx as usize) as u32);
         unsafe {
-            let v = *views.add(g.k0 as usize + kl);
+            let v = *views.add(f0 as usize * g.nmode as usize + kl);
             let o = sample_obj(obj, v, y, x, g.nyo, g.nxo);
             let p = load_c(probe, v.probe as usize * n + i);
             let q = quad_phase(g.quad, y, x, g.ny, g.nx);
@@ -186,61 +190,61 @@ pub mod kernels {
     }
 
     /// `icalc[fl, d] = sum_m |psi[fl * nmode + m, psi_index(d)]|^2 / (ny * nx)` for every
-    /// frame `fl < nf` and detector pixel `d`, one thread per element of `[nf, ny, nx]`.
+    /// frame `fl < nf` and detector pixel `d`, one thread per element of `[nf_max, ny, nx]`.
     ///
     /// # Safety
     ///
-    /// `psi` `[nf * nmode, ny, nx]`, `icalc` `[nf, ny, nx]`.
+    /// `psi` `[nf_max * nmode, ny, nx]`, `icalc` `[nf_max, ny, nx]`, `ctl` one entry.
     #[kernel]
     pub unsafe fn mode_intensity(
         psi: *const f32,
         icalc: *mut f32,
-        nf: u32,
-        nmode: u32,
-        ny: u32,
-        nx: u32,
+        ctl: *const StackCtl,
+        g: StackGeom,
     ) {
+        let (_, nf) = unsafe { stack_frames(ctl, g) };
+        let (ny, nx, nmode) = (g.ny, g.nx, g.nmode);
         let n = ny as usize * nx as usize;
-        let g = global_index();
-        if g >= nf as usize * n {
+        let t = global_index();
+        if t >= nf as usize * n {
             return;
         }
-        let (fl, d) = (g / n, g % n);
+        let (fl, d) = (t / n, t % n);
         let at = psi_index((d / nx as usize) as u32, (d % nx as usize) as u32, ny, nx);
         unsafe {
-            *icalc.add(g) = mode_power(psi, fl * nmode as usize, nmode, n, at) / n as f32;
+            *icalc.add(t) = mode_power(psi, fl * nmode as usize, nmode, n, at) / n as f32;
         }
     }
 
     /// Replaces the modulus of every mode with the observed amplitude (PyNX
     /// `ProjectionAmplitude`, no background), folding in the `1 / (ny * nx)` an unnormalized
     /// FFT round trip needs: `psi *= sqrt(obs / max(icalc, 1e-12)) / (ny * nx)`, or
-    /// `psi /= ny * nx` where `obs` is `MASKED`. One thread per element of `[nf, ny, nx]`.
+    /// `psi /= ny * nx` where `obs` is `MASKED`. One thread per element of
+    /// `[nf_max, ny, nx]`.
     ///
     /// # Safety
     ///
-    /// `psi` `[nf * nmode, ny, nx]`, `counts` `[f0 + nf, ny, nx]`.
+    /// `psi` `[nf_max * nmode, ny, nx]`, `counts` `[nframe, ny, nx]`, `ctl` one entry.
     #[kernel]
     pub unsafe fn apply_amplitude(
         psi: *mut f32,
         counts: *const u16,
-        f0: u32,
-        nf: u32,
-        nmode: u32,
-        ny: u32,
-        nx: u32,
+        ctl: *const StackCtl,
+        g: StackGeom,
     ) {
+        let (f0, nf) = unsafe { stack_frames(ctl, g) };
+        let (ny, nx, nmode) = (g.ny, g.nx, g.nmode);
         let n = ny as usize * nx as usize;
-        let g = global_index();
-        if g >= nf as usize * n {
+        let t = global_index();
+        if t >= nf as usize * n {
             return;
         }
-        let (fl, d) = (g / n, g % n);
+        let (fl, d) = (t / n, t % n);
         let at = psi_index((d / nx as usize) as u32, (d % nx as usize) as u32, ny, nx);
         let inv_n = 1.0 / n as f32;
         let plane0 = fl * nmode as usize;
         unsafe {
-            let obs = *counts.add(f0 as usize * n + g);
+            let obs = *counts.add(f0 as usize * n + t);
             let s = if obs == MASKED {
                 inv_n
             } else {
@@ -259,26 +263,31 @@ pub mod kernels {
     /// pixels of frame `f0 + fl`, with `calc = sum_m |psi|^2 / (ny * nx)` and `obs` the
     /// count, Poisson `calc` if `obs <= 0.1` else `calc - obs + obs ln(obs / calc)`,
     /// Gaussian `(obs - calc)^2 / (obs + 1)`, Euclidean `4 (sqrt obs - sqrt calc)^2`, and
-    /// `calc`. One `PIXEL_THREADS` block per frame; `out[fl]` gets the frame's sums.
+    /// `calc`. One `PIXEL_THREADS` block per frame; `out[fl]` gets the sums of frame
+    /// `fl < nf`, entries past `nf` are not written.
     ///
     /// # Safety
     ///
-    /// `psi` `[nf * nmode, ny, nx]`, `counts` `[f0 + nf, ny, nx]`, `out` `nf` records; grid
-    /// `(nf, 1, 1)`, block `(PIXEL_THREADS, 1, 1)`.
+    /// `psi` `[nf_max * nmode, ny, nx]`, `counts` `[nframe, ny, nx]`, `out` `nf_max` records,
+    /// `ctl` one entry; grid `(nf_max, 1, 1)`, block `(PIXEL_THREADS, 1, 1)`.
     #[kernel]
     pub unsafe fn llk(
         psi: *const f32,
         counts: *const u16,
         out: *mut LlkPartial,
-        f0: u32,
-        nmode: u32,
-        ny: u32,
-        nx: u32,
+        ctl: *const StackCtl,
+        g: StackGeom,
     ) {
         // Four `PIXEL_THREADS` segments: Poisson, Gaussian, Euclidean, calc.
         static mut RED: SharedArray<f32, 1024> = SharedArray::UNINIT;
+        let (f0, nf) = unsafe { stack_frames(ctl, g) };
+        let (ny, nx, nmode) = (g.ny, g.nx, g.nmode);
         let n = ny as usize * nx as usize;
         let fl = thread::blockIdx_x() as usize;
+        // The whole block leaves together, before its first barrier.
+        if fl >= nf as usize {
+            return;
+        }
         let t = thread::threadIdx_x() as usize;
         let plane0 = fl * nmode as usize;
         let inv_n = 1.0 / n as f32;
@@ -331,7 +340,7 @@ pub mod kernels {
     /// # Safety
     ///
     /// As [`obj_probe_to_psi`] with `psi` read; `sums` hold `[nobj, nyo, nxo]`;
-    /// `tile_start` holds `ntiles + 1` ascending offsets into `tile_views` (tile
+    /// `tiles.start` holds `ntiles + 1` ascending offsets into `tiles.views` (tile
     /// `ty * gridDim.x + tx`), whose runs are ascending view indices covering every view
     /// that samples the tile.
     #[kernel]
@@ -339,9 +348,9 @@ pub mod kernels {
         psi: *const f32,
         probe: *const f32,
         views: *const ViewAddr,
-        tile_start: *const u32,
-        tile_views: *const u32,
+        tiles: TilePtrs,
         sums: SumPtrs,
+        ctl: *const StackCtl,
         g: StackGeom,
     ) {
         let x = thread::blockIdx_x() * OBJ_TILE + thread::threadIdx_x();
@@ -354,12 +363,14 @@ pub mod kernels {
         let tile = (thread::blockIdx_y() * thread::gridDim_x() + thread::blockIdx_x()) as usize;
         let px = (iobj as usize * g.nyo as usize + y as usize) * g.nxo as usize + x as usize;
         unsafe {
-            let (mut lo, end) = (*tile_start.add(tile), *tile_start.add(tile + 1));
+            let (f0, nf) = stack_frames(ctl, g);
+            let (k0, k1) = (f0 * g.nmode, (f0 + nf) * g.nmode);
+            let (mut lo, end) = (*tiles.start.add(tile), *tiles.start.add(tile + 1));
             // First entry >= k0.
             let mut hi = end;
             while lo < hi {
                 let mid = lo + (hi - lo) / 2;
-                if *tile_views.add(mid as usize) < g.k0 {
+                if *tiles.views.add(mid as usize) < k0 {
                     lo = mid + 1;
                 } else {
                     hi = mid;
@@ -369,8 +380,8 @@ pub mod kernels {
             let mut norm = *sums.den.add(px);
             let mut j = lo;
             while j < end {
-                let k = *tile_views.add(j as usize);
-                if k >= g.k0 + g.nk {
+                let k = *tiles.views.add(j as usize);
+                if k >= k1 {
                     break;
                 }
                 j += 1;
@@ -378,7 +389,7 @@ pub mod kernels {
                 if v.obj != iobj {
                     continue;
                 }
-                let plane = (k - g.k0) as usize * n;
+                let plane = (k - k0) as usize * n;
                 let src = obj_pixel_sources(v, y, x, g.ny, g.nx, g.nyo, g.nxo);
                 for &(pry, prx, w) in src.iter().flatten() {
                     let p = load_c(probe, v.probe as usize * n + (pry * g.nx + prx) as usize);
@@ -407,8 +418,10 @@ pub mod kernels {
         obj: *const f32,
         views: *const ViewAddr,
         sums: SumPtrs,
+        ctl: *const StackCtl,
         g: StackGeom,
     ) {
+        let (f0, nf) = unsafe { stack_frames(ctl, g) };
         let n = g.ny as usize * g.nx as usize;
         let t = global_index();
         if t >= g.nprobe as usize * n {
@@ -421,8 +434,9 @@ pub mod kernels {
         unsafe {
             let mut acc = load_c(sums.num, t);
             let mut norm = *sums.den.add(t);
-            for kl in 0..g.nk as usize {
-                let v = *views.add(g.k0 as usize + kl);
+            let k0 = f0 as usize * g.nmode as usize;
+            for kl in 0..nf as usize * g.nmode as usize {
+                let v = *views.add(k0 + kl);
                 if v.probe != mode {
                     continue;
                 }
