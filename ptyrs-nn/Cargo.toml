@@ -1,0 +1,28 @@
+[package]
+name = "ptyrs-nn"
+version.workspace = true
+edition.workspace = true
+description = "ptyrs neural-network boundary on burn: PtychoNN-style initial-value predictor and DIP weight gradients from an object gradient"
+
+[dependencies]
+burn = { version = "0.22.1", default-features = false, features = ["std", "cuda", "autodiff", "optim"] }
+# Named for the CubeCL tensor primitive the cuda-rust boundary reads. Fusion stays off: with it
+# the primitive would be a fusion handle instead of a buffer.
+burn-cubecl = { version = "0.22.1", default-features = false, features = ["std", "cuda"] }
+# cudarc 0.19.10 knows CUDA up to 13.4 and panics on nvcc 13.5. Pinning its newest bindings here
+# (driver API calls are forward compatible) unifies the feature into cubecl-cuda's copies; the
+# build-dependency entry reaches the build-script graph, which resolver 2+ keeps separate.
+cudarc = { version = "0.19.10", default-features = false, features = ["cuda-13040"] }
+cuda-core = { workspace = true }
+# For the `Runtime` trait that names cubecl's CUDA server; cubecl does not re-export it.
+cubecl-runtime = { version = "0.11.4", default-features = false }
+num-complex = { workspace = true }
+ptyrs-core = { workspace = true }
+rand = { workspace = true }
+rand_chacha = { workspace = true }
+rand_distr = { workspace = true }
+rustfft = { workspace = true }
+thiserror = { workspace = true }
+
+[build-dependencies]
+cudarc = { version = "0.19.10", default-features = false, features = ["cuda-13040"] }
