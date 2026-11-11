@@ -252,6 +252,108 @@ mod device {
         unsafe { scatter(num, px_im, acc_im, owned) };
         unsafe { scatter(den, px, norm, owned) };
     }
+
+    /// `p[at]` where `m`; other lanes are unspecified.
+    unsafe fn gather_1d(
+        p: *const f32,
+        at: Tile<i32, { [1024] }>,
+        m: Tile<bool, { [1024] }>,
+    ) -> Tile<f32, { [1024] }> {
+        let base: PointerTile<*const f32, { [] }> = pointer_to_tile(p);
+        let base: PointerTile<*const f32, { [1] }> = base.reshape(shape![1]);
+        let base: PointerTile<*const f32, { [1024] }> = base.broadcast(shape![1024]);
+        let ptrs: PointerTile<*const f32, { [1024] }> = base.offset_tile(at);
+        let (v, _t): (Tile<f32, { [1024] }>, Token) = unsafe {
+            load_ptr_tko(
+                ptrs,
+                ordering::Weak,
+                None::<scope::TileBlock>,
+                Some(m),
+                None,
+                None,
+                Latency::<0>,
+            )
+        };
+        v
+    }
+
+    /// `ptyrs_kernels::max_nonneg_f32`: `*out = max(*out, x[0 .. n] ...)` as `f32` bits
+    /// over the non-negative values (negatives and NaN skipped), `*out` starting as a
+    /// non-negative float. Program `i` takes `x[1024 i ..][.. 1024]`.
+    #[cutile::entry()]
+    unsafe fn max_nonneg_f32(x: *const f32, n: i32, out: *mut i32) {
+        let pid: (i32, i32, i32) = get_tile_block_id();
+        let lane: Tile<i32, { [1024] }> = iota(shape![1024]);
+        let at: Tile<i32, { [1024] }> = lane + broadcast_scalar(pid.0 * 1024i32, shape![1024]);
+        let inside: Tile<bool, { [1024] }> = lt_tile(at, broadcast_scalar(n, shape![1024]));
+        let v: Tile<f32, { [1024] }> = unsafe { gather_1d(x, at, inside) };
+        let zero: Tile<f32, { [1024] }> = constant(0.0f32, shape![1024]);
+        // Lane-wise `if v > m { m = v }` from `m = 0`, as the SIMT loop: no NaN or negative
+        // value survives, so the max-reduce below is exact in any order.
+        let m: Tile<f32, { [1024] }> = select(inside & gt_tile(v, zero), v, zero);
+        let top: Tile<f32, { [] }> = reduce_max(m, 0i32);
+        // Non-negative floats order like their bit patterns.
+        let bits: Tile<i32, { [] }> = bitcast(top);
+        let bits: Tile<i32, { [1] }> = bits.reshape(shape![1]);
+        let ptr: PointerTile<*mut i32, { [] }> = pointer_to_tile(out);
+        let ptr: PointerTile<*mut i32, { [1] }> = ptr.reshape(shape![1]);
+        let _r: (Tile<i32, { [1] }>, Token) = unsafe {
+            atomic_rmw_tko(
+                ptr,
+                bits,
+                atomic::Max,
+                ordering::Relaxed,
+                scope::Device,
+                None,
+                None,
+            )
+        };
+    }
+
+    /// `ptyrs_kernels::normalize_update`: `x = (num + reg x) / max(den + reg, 1e-12)` with
+    /// `reg = inertia * *max`, for `n` complex values. Program `i` takes the interleaved
+    /// floats `[1024 i ..][.. 1024]` of `x` and `num`.
+    #[cutile::entry()]
+    unsafe fn normalize_update(
+        x: *mut f32,
+        num: *const f32,
+        den: *const f32,
+        n: i32,
+        max: *const f32,
+        inertia: f32,
+    ) {
+        let pid: (i32, i32, i32) = get_tile_block_id();
+        let reg: f32 = inertia * unsafe { load_f32(max, 0i32) };
+        let lane: Tile<i32, { [1024] }> = iota(shape![1024]);
+        let at: Tile<i32, { [1024] }> = lane + broadcast_scalar(pid.0 * 1024i32, shape![1024]);
+        let inside: Tile<bool, { [1024] }> = lt_tile(at, broadcast_scalar(2i32 * n, shape![1024]));
+        let e: Tile<i32, { [1024] }> = at / constant(2i32, shape![1024]);
+        let x_in: *const f32 = cast_const(x);
+        let a: Tile<f32, { [1024] }> = unsafe { gather_1d(num, at, inside) };
+        let b: Tile<f32, { [1024] }> = unsafe { gather_1d(x_in, at, inside) };
+        let dv: Tile<f32, { [1024] }> = unsafe { gather_1d(den, e, inside) };
+        let reg_t: Tile<f32, { [1024] }> = broadcast_scalar(reg, shape![1024]);
+        let eps: Tile<f32, { [1024] }> = constant(1e-12f32, shape![1024]);
+        // `f32::max` keeps the non-NaN operand: a NaN `den + reg` becomes `1e-12`.
+        let s: Tile<f32, { [1024] }> = dv + reg_t;
+        let d: Tile<f32, { [1024] }> = select(gt_tile(s, eps), s, eps);
+        let r: Tile<f32, { [1024] }> = divf(a + reg_t * b, d, rounding::NearestEven, ftz::Disabled);
+        let base: PointerTile<*mut f32, { [] }> = pointer_to_tile(x);
+        let base: PointerTile<*mut f32, { [1] }> = base.reshape(shape![1]);
+        let base: PointerTile<*mut f32, { [1024] }> = base.broadcast(shape![1024]);
+        let ptrs: PointerTile<*mut f32, { [1024] }> = base.offset_tile(at);
+        let _t: Token = unsafe {
+            store_ptr_tko(
+                ptrs,
+                r,
+                ordering::Weak,
+                None::<scope::TileBlock>,
+                Some(inside),
+                None,
+                Latency::<0>,
+            )
+        };
+    }
 }
 
 #[derive(Debug)]
@@ -415,6 +517,48 @@ pub fn psi_to_obj(
             )
             .grid(grid)
             .async_on(stream)?;
+        }
+        Ok(())
+    })
+}
+
+/// [`ptyrs_gpu::Kernels::update_from_sums`] as Tile kernels: `x = (num + reg x) /
+/// max(den + reg, 1e-12)` for the first `n` values, `reg = inertia * max(0, den[0 .. n]
+/// ...)` over the non-NaN values of `den`.
+pub fn update_from_sums(
+    stream: &Arc<CudaStream>,
+    x: &mut DeviceBuffer<C32>,
+    sums: &UpdateSums,
+    n: u32,
+    inertia: f32,
+) -> Result<(), Error> {
+    check_len("x", x, n as usize)?;
+    check_len("sums.num", &sums.num, n as usize)?;
+    check_len("sums.den", &sums.den, n as usize)?;
+    // The kernels index interleaved floats, `2 n` of them, as i32.
+    let n = offset("n", n as usize)?;
+    offset("2 n", 2 * n as usize)?;
+    if n == 0 {
+        return Ok(());
+    }
+    let max_bits = DeviceBuffer::<u32>::zeroed(stream, 1)?;
+    let UpdateSums { num, den } = sums;
+    launch(stream, &[den.storage()], &[max_bits.storage()], || {
+        // SAFETY: `den` holds `n` floats, `max_bits` one zeroed u32.
+        unsafe {
+            device::max_nonneg_f32(dptr(den), n, dptr(&max_bits))
+                .grid(((n as u32).div_ceil(1024), 1, 1))
+                .async_on(stream)?;
+        }
+        Ok(())
+    })?;
+    let reads = [num.storage(), den.storage(), max_bits.storage()];
+    launch(stream, &reads, &[x.storage()], || {
+        // SAFETY: `x`, `num` hold `n` complex values, `den` `n` floats, `max_bits` one.
+        unsafe {
+            device::normalize_update(dptr(x), dptr(num), dptr(den), n, dptr(&max_bits), inertia)
+                .grid(((2 * n as u32).div_ceil(1024), 1, 1))
+                .async_on(stream)?;
         }
         Ok(())
     })
