@@ -20,6 +20,8 @@ pub enum GrowError {
         end: usize,
         capacity: usize,
     },
+    /// An earlier chunk's initialisation failed; the buffer maps no more.
+    Failed,
     Driver(DriverError),
 }
 
@@ -29,6 +31,7 @@ impl fmt::Display for GrowError {
             Self::Capacity { end, capacity } => {
                 write!(f, "range end {end} past the {capacity}-byte reservation")
             }
+            Self::Failed => write!(f, "an earlier chunk initialisation failed"),
             Self::Driver(e) => write!(f, "{e}"),
         }
     }
@@ -51,6 +54,7 @@ pub struct GrowBuf {
     va: VirtualReservation,
     chunk: usize,
     mapped: usize,
+    failed: bool,
     ctx: Arc<Context>,
 }
 
@@ -68,6 +72,7 @@ impl GrowBuf {
             va,
             chunk,
             mapped: 0,
+            failed: false,
             ctx: ctx.clone(),
         })
     }
@@ -94,17 +99,33 @@ impl GrowBuf {
         r.end <= self.capacity() && self.chunk_span(&r).all(|c| self.chunks[c].is_some())
     }
 
-    /// Backs every chunk that overlaps `r`. Returns the byte ranges that were
-    /// newly mapped (coalesced, ascending); their contents are undefined
-    /// until the caller writes them.
-    pub fn map(&mut self, r: Range<usize>) -> Result<Vec<Range<usize>>, GrowError> {
+    /// [`map_with`](Self::map_with) without initialisation, for buffers whose
+    /// new bytes are written before anything reads them.
+    pub fn map(&mut self, r: Range<usize>) -> Result<(), GrowError> {
+        self.map_with(r, |_| Ok(()))
+    }
+
+    /// Backs every chunk that overlaps `r`, ascending, and hands each newly
+    /// backed chunk's byte range to `init` (to queue its first contents)
+    /// before the next. A chunk that fails to back stays unbacked and the
+    /// buffer usable. A chunk whose `init` fails stays backed, since work
+    /// `init` queued may target it, and fails the buffer: every later call
+    /// returns [`GrowError::Failed`], so no chunk is ever skipped as backed
+    /// without having been initialised.
+    pub fn map_with(
+        &mut self,
+        r: Range<usize>,
+        mut init: impl FnMut(Range<usize>) -> Result<(), DriverError>,
+    ) -> Result<(), GrowError> {
+        if self.failed {
+            return Err(GrowError::Failed);
+        }
         if r.end > self.capacity() {
             return Err(GrowError::Capacity {
                 end: r.end,
                 capacity: self.capacity(),
             });
         }
-        let mut fresh: Vec<Range<usize>> = Vec::new();
         for c in self.chunk_span(&r) {
             if self.chunks[c].is_some() {
                 continue;
@@ -118,13 +139,12 @@ impl GrowBuf {
             vmm::set_access(va, self.chunk, &[dev])?;
             self.chunks[c] = Some(m);
             self.mapped += 1;
-            let b = c * self.chunk..(c + 1) * self.chunk;
-            match fresh.last_mut() {
-                Some(l) if l.end == b.start => l.end = b.end,
-                _ => fresh.push(b),
+            if let Err(e) = init(c * self.chunk..(c + 1) * self.chunk) {
+                self.failed = true;
+                return Err(e.into());
             }
         }
-        Ok(fresh)
+        Ok(())
     }
 
     fn chunk_span(&self, r: &Range<usize>) -> Range<usize> {
@@ -409,6 +429,16 @@ RDONE:
         crate::consumer::memset32(dst, v, n, s).unwrap();
     }
 
+    /// Maps `r` and returns the chunk ranges `init` saw.
+    fn fresh(b: &mut GrowBuf, r: Range<usize>) -> Result<Vec<Range<usize>>, GrowError> {
+        let mut seen = Vec::new();
+        b.map_with(r, |c| {
+            seen.push(c);
+            Ok(())
+        })?;
+        Ok(seen)
+    }
+
     /// `hold_sum` running on a stream until [`Hold::release`]. Released by
     /// the host, not by a timer, so a driver call delayed by other processes
     /// on the GPU cannot outlast it; only a call that waits for it can.
@@ -454,19 +484,22 @@ RDONE:
         let base = b.ptr();
         assert_eq!(b.capacity() % ck, 0);
         assert_eq!(b.capacity(), 6 * ck);
-        assert!(b.map(0..0).unwrap().is_empty());
-        assert_eq!(b.map(0..1).unwrap(), vec![0..ck]);
+        assert!(fresh(&mut b, 0..0).unwrap().is_empty());
+        assert_eq!(fresh(&mut b, 0..1).unwrap(), vec![0..ck]);
         let pat: Vec<u32> = (0..(ck / 4) as u32)
             .map(|i| i.wrapping_mul(2654435761))
             .collect();
         htod(base, &pat);
-        // A sparse chunk, then the gap and one more: coalesced, ascending.
-        assert_eq!(b.map(3 * ck..3 * ck + 8).unwrap(), vec![3 * ck..4 * ck]);
+        // A sparse chunk, then the gap and one more, ascending.
         assert_eq!(
-            b.map(ck / 2..5 * ck).unwrap(),
-            vec![ck..3 * ck, 4 * ck..5 * ck]
+            fresh(&mut b, 3 * ck..3 * ck + 8).unwrap(),
+            vec![3 * ck..4 * ck]
         );
-        assert!(b.map(0..5 * ck).unwrap().is_empty());
+        assert_eq!(
+            fresh(&mut b, ck / 2..5 * ck).unwrap(),
+            vec![ck..2 * ck, 2 * ck..3 * ck, 4 * ck..5 * ck]
+        );
+        assert!(fresh(&mut b, 0..5 * ck).unwrap().is_empty());
         assert!(b.is_mapped(0..5 * ck));
         assert!(!b.is_mapped(4 * ck..5 * ck + 1));
         assert_eq!(b.mapped_bytes(), 5 * ck);
@@ -481,6 +514,15 @@ RDONE:
             Err(GrowError::Capacity { end, capacity }) if end == cap + 1 && capacity == cap
         ));
         assert!(!b.is_mapped(cap - 4..cap));
+        // A failed init leaves its chunk backed and the buffer failed.
+        let bad = DriverError(sys::cudaError_enum_CUDA_ERROR_INVALID_VALUE);
+        assert!(matches!(
+            b.map_with(5 * ck..5 * ck + 1, |_| Err(bad)),
+            Err(GrowError::Driver(e)) if e == bad
+        ));
+        assert!(b.is_mapped(5 * ck..6 * ck));
+        assert_eq!(b.mapped_bytes(), 6 * ck);
+        assert!(matches!(b.map(0..1), Err(GrowError::Failed)));
     }
 
     /// Chunks are mapped while a running kernel keeps reading the mapped
@@ -504,16 +546,20 @@ RDONE:
         let h = Hold::launch(&hold, &s, b.ptr(), n as u32, out.ptr());
         done.record(&s).unwrap();
         let t = Instant::now();
-        let fresh = b.map(ck..b.capacity()).unwrap();
+        let cap = b.capacity();
+        let fresh = fresh(&mut b, ck..cap).unwrap();
         let map_ms = t.elapsed().as_secs_f64() * 1e3;
         let running = !done.query().unwrap();
         h.release();
         s.synchronize().unwrap();
         eprintln!(
             "grow: mapped {} MiB in {map_ms:.1} ms under a running kernel",
-            fresh[0].len() >> 20
+            (fresh.len() * ck) >> 20
         );
-        assert_eq!(fresh, vec![ck..b.capacity()]);
+        let want: Vec<_> = (1..b.capacity() / ck)
+            .map(|c| c * ck..(c + 1) * ck)
+            .collect();
+        assert_eq!(fresh, want);
         assert!(running, "mapping returned only after the kernel finished");
         let want = vals.iter().fold(0u32, |a, &v| a.wrapping_add(v));
         assert_eq!(dtoh(out.ptr(), 2), vec![want, 1]);
@@ -546,9 +592,11 @@ RDONE:
         let cap_elems = b.capacity() / 4;
         let rounds = [1000, 300_000, 300_000, 1_000_000, 4_000_000, cap_elems];
         for &n in &rounds {
-            for r in b.map(0..n * 4).unwrap() {
-                memset32(b.ptr() + r.start as u64, 0, r.len() / 4, &s);
-            }
+            let base = b.ptr();
+            b.map_with(0..n * 4, |r| {
+                crate::consumer::memset32(base + r.start as u64, 0, r.len() / 4, &s)
+            })
+            .unwrap();
             memset32(count.ptr(), n as u32, 1, &s);
             graph.launch(&s).unwrap();
         }
