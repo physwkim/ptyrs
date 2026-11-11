@@ -1,10 +1,14 @@
 //! Spatial multi-GPU split (DESIGN B3, B4): an object tile grid fixed in object coordinates,
 //! partitioned into one region per GPU plus a one-probe halo.
 
+pub mod exchange;
 pub mod partition;
+#[cfg(test)]
+mod synth;
 pub mod topo;
 pub mod worker;
 
+pub use exchange::{Exchange, Layout};
 pub use partition::{Csr, DEFAULT_TILE, Partition, Region, Scheme, TileGrid};
 pub use worker::{Gpu, Workers};
 

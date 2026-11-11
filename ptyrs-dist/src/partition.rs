@@ -429,13 +429,13 @@ fn dilate(mask: &[bool], dims: [usize; 2], reach: [usize; 2]) -> Vec<bool> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use ptyrs_core::{AddrTable, sim};
 
     const PIXEL: [f64; 2] = [1e-8, 1e-8];
 
-    fn addr(pos: ptyrs_core::Positions, frame: usize) -> AddrTable {
+    pub(crate) fn addr(pos: ptyrs_core::Positions, frame: usize) -> AddrTable {
         let pos = pos.pynx_preprocess(PIXEL);
         let obj = ptyrs_core::required_obj_shape(&pos, PIXEL, [frame, frame], 0);
         AddrTable::new(&pos, PIXEL, [frame, frame], obj, 1, 1).unwrap()

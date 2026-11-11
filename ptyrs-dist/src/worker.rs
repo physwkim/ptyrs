@@ -166,7 +166,8 @@ impl Rendezvous {
 
 type Job<S> = Box<dyn FnOnce(&mut Gpu, &mut S) + Send>;
 
-/// Worker threads, region `r` on `ordinals[r]`. Peer access is enabled for every pair.
+/// Worker threads, region `r` on `ordinals[r]`. Regions may share a GPU, each with its own
+/// thread and stream; peer access is enabled for every pair of distinct GPUs.
 pub struct Workers<S: Send + 'static> {
     shared: Arc<Shared>,
     senders: Vec<Sender<Job<S>>>,
@@ -182,16 +183,17 @@ impl<S: Send + 'static> Workers<S> {
         if ordinals.is_empty() {
             return Err(DistError::Partition("no GPUs".into()));
         }
-        for (i, o) in ordinals.iter().enumerate() {
-            if ordinals[..i].contains(o) {
-                return Err(DistError::Partition(format!("GPU {o} listed twice")));
-            }
-        }
         let ctxs = ordinals
             .iter()
             .map(|&o| Context::new(o))
             .collect::<Result<Vec<_>, _>>()?;
-        enable_all_pairs(&ctxs)?;
+        let distinct: Vec<_> = ctxs
+            .iter()
+            .enumerate()
+            .filter(|(i, c)| !ordinals[..*i].contains(&c.ordinal()))
+            .map(|(_, c)| c.clone())
+            .collect();
+        enable_all_pairs(&distinct)?;
         let shared = Arc::new(Shared {
             rendezvous: Rendezvous {
                 n: ordinals.len(),
@@ -211,7 +213,7 @@ impl<S: Send + 'static> Workers<S> {
             let (tx, rx) = channel::<Job<S>>();
             let (init, shared, ready) = (init.clone(), shared.clone(), ready_tx.clone());
             let handle = std::thread::Builder::new()
-                .name(format!("ptyrs-gpu{}", ctx.ordinal()))
+                .name(format!("ptyrs-r{region}-gpu{}", ctx.ordinal()))
                 .spawn(move || worker(region, ctx, shared, init, ready, rx))
                 .map_err(|e| DistError::Topology(format!("spawn worker: {e}")))?;
             workers.senders.push(tx);
@@ -374,13 +376,13 @@ fn panic_msg(p: &Box<dyn std::any::Any + Send>) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::topo;
     use cuda_core::DeviceBuffer;
 
     /// The four RTX 5000 Ada of the target machine, NUMA-grouped.
-    fn gpus(n: usize) -> Vec<usize> {
+    pub(crate) fn gpus(n: usize) -> Vec<usize> {
         let order = topo::numa_grouped(&topo::devices().unwrap());
         assert!(
             order.len() >= n,
@@ -486,6 +488,7 @@ mod tests {
         .err()
         .unwrap();
         assert!(matches!(err, DistError::Topology(_)), "{err}");
-        assert!(Workers::<()>::spawn(&[0, 0], |_| Ok(())).is_err());
+        let err = Workers::<()>::spawn(&[], |_| Ok(())).err().unwrap();
+        assert!(matches!(err, DistError::Partition(_)), "{err}");
     }
 }
