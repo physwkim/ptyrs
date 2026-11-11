@@ -649,10 +649,13 @@ dependencies = [
 name = "ptyrs-kernels"
 version = "0.0.1"
 dependencies = [
+ "cuda-artifact-finalizer",
  "cuda-async",
  "cuda-core",
  "cuda-device",
  "cuda-host",
+ "libloading",
+ "nvjitlink-sys",
  "tokio",
 ]
 
