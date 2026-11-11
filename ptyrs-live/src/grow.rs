@@ -189,20 +189,21 @@ DONE:
     ret;
 }
 
-// One thread re-reads buf[0..n) until `cycles` clocks have passed, then
-// stores the sum of buf[0..n) to out[0].
-.visible .entry spin_sum(.param .u64 buf, .param .u32 n, .param .u64 cycles, .param .u64 out)
+// One thread re-reads buf[0..n) for `ns` nanoseconds, then stores the sum of
+// buf[0..n) to out[0]. %globaltimer, not the per-SM %clock64: a preempted
+// kernel may resume on an SM whose clock is far behind the one it started on.
+.visible .entry spin_sum(.param .u64 buf, .param .u32 n, .param .u64 ns, .param .u64 out)
 {
     .reg .pred p;
     .reg .b32 r<8>;
     .reg .b64 rd<10>;
     ld.param.u64 rd1, [buf];
     ld.param.u32 r1, [n];
-    ld.param.u64 rd2, [cycles];
+    ld.param.u64 rd2, [ns];
     ld.param.u64 rd3, [out];
     cvta.to.global.u64 rd1, rd1;
     cvta.to.global.u64 rd3, rd3;
-    mov.u64 rd4, %clock64;
+    mov.u64 rd4, %globaltimer;
     mov.u32 r2, 0;
     mov.u32 r3, 0;
 SPIN:
@@ -213,7 +214,7 @@ SPIN:
     add.u32 r2, r2, 1;
     setp.ge.u32 p, r2, r1;
     @p mov.u32 r2, 0;
-    mov.u64 rd7, %clock64;
+    mov.u64 rd7, %globaltimer;
     sub.s64 rd8, rd7, rd4;
     setp.lt.s64 p, rd8, rd2;
     @p bra SPIN;
@@ -317,12 +318,12 @@ END:
         let mut out = GrowBuf::new(&ctx, 1, 1).unwrap();
         out.map(0..8).unwrap();
         let done = ctx.new_event_with_flags(None).unwrap();
-        let (mut p_buf, mut p_n, mut p_cyc, mut p_out) =
-            (b.ptr(), n as u32, 1_000_000_000u64, out.ptr());
+        let (mut p_buf, mut p_n, mut p_ns, mut p_out) =
+            (b.ptr(), n as u32, 400_000_000u64, out.ptr());
         let mut params = [
             (&raw mut p_buf).cast::<c_void>(),
             (&raw mut p_n).cast(),
-            (&raw mut p_cyc).cast(),
+            (&raw mut p_ns).cast(),
             (&raw mut p_out).cast(),
         ];
         let t = Instant::now();
