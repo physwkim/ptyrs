@@ -61,7 +61,7 @@ impl From<DriverError> for GrowError {
 
 /// A fixed device address range whose chunks are backed on demand. Chunks
 /// are never unmapped before drop, so every byte of a mapped chunk keeps its
-/// address and contents.
+/// address and contents; drop waits for all work queued on the context.
 pub struct GrowBuf {
     // Declaration order is drop order: mappings before the reservation.
     chunks: Vec<Option<Mapping>>,
@@ -171,8 +171,10 @@ impl GrowBuf {
 
 impl Drop for GrowBuf {
     fn drop(&mut self) {
-        // The fields' own drops unmap and free; they need the context current.
-        let _ = self.ctx.bind_to_thread();
+        // The fields' own drops unmap and free, with the context current. Unlike
+        // cuMemFree, cuMemUnmap does not wait for queued work, and a copy or kernel
+        // reaching an unmapped chunk is an MMU fault (Xid 31); no stream is known here.
+        let _ = self.ctx.synchronize();
     }
 }
 

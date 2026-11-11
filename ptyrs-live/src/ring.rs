@@ -154,13 +154,20 @@ impl Ring {
     }
 }
 
+impl Drop for Ring {
+    fn drop(&mut self) {
+        // An uploader that returned an error left its copies out of the slots queued.
+        let _ = self.frames.context().synchronize();
+    }
+}
+
 /// Device side of the input: frame `seq` at `frames_ptr() + seq * frame
 /// bytes`, its `(x, y)` as two f64 at `positions_ptr() + seq * 16`. Both
 /// grow in place, `chunk` bytes of frames at a time, up to `max_frames`.
 ///
 /// Shared through an `Arc`: whoever holds a pointer into the store holds
-/// the store, so no mapping is released under a reader. Only
-/// [`run_uploader`] maps.
+/// the store, and its drop waits for queued work ([`GrowBuf`]), so no
+/// mapping is released under a reader. Only [`run_uploader`] maps.
 pub struct DeviceStore {
     frames_ptr: CUdeviceptr,
     positions_ptr: CUdeviceptr,
@@ -528,5 +535,47 @@ mod tests {
             Err(e) => panic!("{e}"),
             Ok(r) => panic!("stored {} frames", r.frames),
         }
+        // The uploader dropped the store with batches still queued.
+        ctx.synchronize().expect("a queued copy faulted");
+    }
+
+    /// The uploader's own copy, held behind a gate while the ring and the store
+    /// are dropped: the drop must wait for it, not unmap or free under it.
+    #[test]
+    fn dropping_the_ring_and_store_waits_for_a_queued_copy() {
+        let ctx = Context::new(0).expect("GPU 0");
+        let se = 65536;
+        let ring = Ring::new(&ctx, 4, se).unwrap();
+        let store = DeviceStore::new(&ctx, 4, se, 1).unwrap();
+        store.ensure(0..4, false).unwrap();
+        let s = ctx.new_stream().unwrap();
+        let mut gate = PinnedHostBuffer::<u32>::zeroed(&ctx, 1).unwrap();
+        // SAFETY: the gate and both ranges outlive the copy (the point of the test).
+        unsafe {
+            cuda_bindings::cuStreamWaitValue32_v2(
+                s.cu_stream(),
+                gate.as_ptr() as u64,
+                1,
+                cuda_bindings::CUstreamWaitValue_flags_enum_CU_STREAM_WAIT_VALUE_GEQ,
+            )
+            .result()
+            .unwrap();
+            cuda_core::memcpy_htod_async(store.frames_ptr(), ring.frames_ptr, 4 * se, &s).unwrap();
+        }
+        let dropped = AtomicBool::new(false);
+        let early = std::thread::scope(|sc| {
+            let dropped = &dropped;
+            sc.spawn(move || {
+                drop((ring, store));
+                dropped.store(true, Ordering::Release);
+            });
+            std::thread::sleep(Duration::from_millis(200));
+            let early = dropped.load(Ordering::Acquire);
+            // SAFETY: the gate lives until the end of the test.
+            unsafe { gate.as_mut_ptr().write_volatile(1) };
+            early
+        });
+        assert!(!early, "dropped while a copy between them was queued");
+        ctx.synchronize().expect("the queued copy faulted");
     }
 }
