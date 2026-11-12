@@ -176,6 +176,29 @@ pub(crate) unsafe fn block_fft<const N: u32, const INV: bool>(
     }
 }
 
+/// Bytes a column pass gives each FFT past the FFT's own `smem_per_fft`. A warp holds
+/// `FUSED_COLS` FFTs at one thread index each, so unskewed their exchange addresses repeat
+/// at the FFT stride, a multiple of 128 bytes, and collide in one bank.
+pub const COL_FFT_SKEW: u32 = 16;
+
+/// [`block_fft`] of a column pass, FFT `b` at `b * (smem_per_fft + COL_FFT_SKEW)` bytes
+/// into `s`.
+///
+/// # Safety
+///
+/// As [`block_fft`], `s` holding `bpb` such column FFTs.
+#[device]
+unsafe fn col_fft<const N: u32, const INV: bool>(
+    r: &mut [f32; 2 * FFT_EPT as usize],
+    s: *mut u8,
+    b: u32,
+    f: u32,
+    bpb: u32,
+) {
+    // `block_fft` places FFT `b` at `b * smem_per_fft`; the shift adds the skew.
+    unsafe { block_fft::<N, INV>(r, s.add((b * COL_FFT_SKEW) as usize), b, f, bpb) }
+}
+
 /// [`block_fft`] of a row pass: blockDim `(NX / FFT_EPT, rows)`, one row per FFT.
 #[device]
 pub(crate) unsafe fn row_fft<const NX: u32, const INV: bool>(r: &mut [f32; 2 * FFT_EPT as usize]) {
@@ -309,8 +332,8 @@ unsafe fn rows_fwd_with<const NX: u32, const SHIFT: bool>(
 /// FUSED_COLS`, `m = tid / (FUSED_COLS * tpf)`, so a warp's loads and stores cover whole
 /// row segments. Grid `(nx / FUSED_COLS, nf_max)`; dynamic shared memory
 /// `col_slot_bytes(flags, ny)` bytes of reduction slots, `2 * FUSED_COLS * ny` bytes of
-/// counts, then the larger of `nmode * FUSED_COLS` column FFTs and `4 * nmode * ny *
-/// FUSED_COLS` bytes.
+/// counts, then the larger of `nmode * FUSED_COLS` column FFTs ([`COL_FFT_SKEW`]) and
+/// `4 * nmode * ny * FUSED_COLS` bytes.
 /// `counts` must be 16-byte aligned.
 ///
 /// # Safety
@@ -371,7 +394,7 @@ pub unsafe fn cols<const NY: u32>(p: FusedPtrs, ctl: *const StackCtl, g: StackGe
             r[2 * i as usize] = v.0;
             r[2 * i as usize + 1] = v.1;
         }
-        block_fft::<NY, false>(&mut r, fft_smem, b, f, bpb);
+        col_fft::<NY, false>(&mut r, fft_smem, b, f, bpb);
         thread::sync_threads();
         #[unroll]
         for i in 0..FFT_EPT {
@@ -499,7 +522,7 @@ pub unsafe fn cols<const NY: u32>(p: FusedPtrs, ctl: *const StackCtl, g: StackGe
         if project || grad {
             // Every power is read before the inverse FFT reuses the region.
             thread::sync_threads();
-            block_fft::<NY, true>(&mut r, fft_smem, b, f, bpb);
+            col_fft::<NY, true>(&mut r, fft_smem, b, f, bpb);
             #[unroll]
             for i in 0..FFT_EPT {
                 let k = 2 * i as usize;
@@ -747,7 +770,7 @@ unsafe fn gather_with<const SHIFT: bool>(
 ///
 /// One 1D block of `nprobe * FUSED_COLS * tpf` threads mapped as [`cols`] maps modes, with
 /// probe modes for modes; grid `(nx / FUSED_COLS, nf_max)`; dynamic shared memory `8 * ny`
-/// bytes of `e_y`, then `nprobe * FUSED_COLS` column FFTs.
+/// bytes of `e_y`, then `nprobe * FUSED_COLS` column FFTs ([`COL_FFT_SKEW`]).
 ///
 /// # Safety
 ///
@@ -803,7 +826,7 @@ pub unsafe fn shift_pre<const NY: u32>(
                 r[2 * i as usize] = a.1 * w;
                 r[2 * i as usize + 1] = -a.0 * w;
             }
-            block_fft::<NY, true>(&mut r, fft_smem, b, f, bpb);
+            col_fft::<NY, true>(&mut r, fft_smem, b, f, bpb);
             #[unroll]
             for i in 0..FFT_EPT {
                 let k = 2 * i as usize;
@@ -820,7 +843,7 @@ pub unsafe fn shift_pre<const NY: u32>(
             r[2 * i as usize] = a.0;
             r[2 * i as usize + 1] = a.1;
         }
-        block_fft::<NY, true>(&mut r, fft_smem, b, f, bpb);
+        col_fft::<NY, true>(&mut r, fft_smem, b, f, bpb);
         #[unroll]
         for i in 0..FFT_EPT {
             let k = 2 * i as usize;
@@ -1064,7 +1087,8 @@ unsafe fn obj_weighted(
 /// `FUSED_SHIFT_POSITION`; writes what the flags name.
 ///
 /// Block and grid as [`shift_pre`]; dynamic shared memory `8 * ny` bytes of `e_y`, `8 *
-/// nprobe * FUSED_COLS * tpf` bytes of slots, then `nprobe * FUSED_COLS` column FFTs.
+/// nprobe * FUSED_COLS * tpf` bytes of slots, then `nprobe * FUSED_COLS` column FFTs
+/// ([`COL_FFT_SKEW`]).
 ///
 /// # Safety
 ///
@@ -1116,7 +1140,7 @@ pub unsafe fn shift_post<const NY: u32>(
             r[2 * i as usize] = v.0;
             r[2 * i as usize + 1] = v.1;
         }
-        block_fft::<NY, false>(&mut r, fft_smem, b, f, bpb);
+        col_fft::<NY, false>(&mut r, fft_smem, b, f, bpb);
         let ex = ramp(dx, kx, nx);
         let tau = 2.0 * core::f32::consts::PI;
         let wx = tau * freq(kx, nx);
@@ -1259,7 +1283,8 @@ pub unsafe fn spectrum_rows<const NX: u32>(
 /// In-place column FFT of every plane `blockIdx.y` of `[nplane, NY, nx]`, inverse when
 /// `inverse != 0`, times `scale`. One 1D block of `FUSED_COLS * NY / FFT_EPT` threads over
 /// columns `blockIdx.x * FUSED_COLS ..` (thread map of [`cols`] for one mode); grid `(nx /
-/// FUSED_COLS, nplane)`; dynamic shared memory `FUSED_COLS` column FFTs.
+/// FUSED_COLS, nplane)`; dynamic shared memory `FUSED_COLS` column FFTs
+/// ([`COL_FFT_SKEW`]).
 ///
 /// # Safety
 ///
@@ -1282,9 +1307,9 @@ pub unsafe fn shift_cols<const NY: u32>(buf: *mut f32, nx: u32, inverse: u32, sc
             r[2 * i as usize + 1] = v.1;
         }
         if inverse != 0 {
-            block_fft::<NY, true>(&mut r, smem, c, f, FUSED_COLS);
+            col_fft::<NY, true>(&mut r, smem, c, f, FUSED_COLS);
         } else {
-            block_fft::<NY, false>(&mut r, smem, c, f, FUSED_COLS);
+            col_fft::<NY, false>(&mut r, smem, c, f, FUSED_COLS);
         }
         #[unroll]
         for i in 0..FFT_EPT {

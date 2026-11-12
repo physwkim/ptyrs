@@ -20,10 +20,10 @@ use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig};
 use ptyrs_kernels::FFT_EPT;
 use ptyrs_kernels::fused::{
-    FUSED_BACKGROUND, FUSED_BACKGROUND_SUMS, FUSED_COL_THREADS, FUSED_COLS, FUSED_DM, FUSED_GRAD,
-    FUSED_LLK, FUSED_PROJECT, FUSED_ROW_THREADS, FUSED_SCALE, FUSED_SCALE_SUMS, FUSED_SHIFT_DEN,
-    FUSED_SHIFT_OBJ, FUSED_SHIFT_POSITION, FUSED_SHIFT_PROBE, FUSED_TO_PSI, FusedCfg, FusedPtrs,
-    col_slot_bytes,
+    COL_FFT_SKEW, FUSED_BACKGROUND, FUSED_BACKGROUND_SUMS, FUSED_COL_THREADS, FUSED_COLS, FUSED_DM,
+    FUSED_GRAD, FUSED_LLK, FUSED_PROJECT, FUSED_ROW_THREADS, FUSED_SCALE, FUSED_SCALE_SUMS,
+    FUSED_SHIFT_DEN, FUSED_SHIFT_OBJ, FUSED_SHIFT_POSITION, FUSED_SHIFT_PROBE, FUSED_TO_PSI,
+    FusedCfg, FusedPtrs, col_slot_bytes,
 };
 use ptyrs_kernels::pixel::SumPtrs;
 
@@ -78,7 +78,7 @@ pub(crate) struct Shape {
     pub(crate) col_threads: u32,
     /// Column-pass shared memory past the reduction slots: counts tile and FFTs.
     pub(crate) col_tile_fft: u32,
-    /// Shared memory of one column FFT.
+    /// Shared memory of one column FFT, its skew included.
     pub(crate) col_fft: u32,
 }
 
@@ -112,14 +112,16 @@ impl Shape {
             return Err(bad(format!("{col_threads} threads per column block")));
         }
         let col_threads = col_threads as u32;
+        let col_fft = sy + COL_FFT_SKEW;
         let s = Self {
             ny: side_y,
             nx: side_x,
             rows,
             row_smem: rows * sx,
             col_threads,
-            col_tile_fft: 2 * FUSED_COLS * ny + (col_threads / (ny / FFT_EPT)) * sy.max(4 * ny),
-            col_fft: sy,
+            col_tile_fft: 2 * FUSED_COLS * ny
+                + (col_threads / (ny / FFT_EPT)) * col_fft.max(4 * ny),
+            col_fft,
         };
         // The column pass's most shared memory is under every flag that adds to it.
         if s.col_smem(FUSED_SCALE_SUMS) > SMEM_MAX || s.row_smem > SMEM_MAX {
