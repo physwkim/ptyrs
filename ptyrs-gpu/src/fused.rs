@@ -6,8 +6,8 @@
 //! not, so results agree with M1 to rounding, not bit for bit.
 //!
 //! Frame sides are 128 or 256 each; views must be canonical, which [`Views::new`] checks.
-//! The probe update stays M1: [`Kernels::psi_to_probe`] on [`FusedBufs::work`] after an AP
-//! projection, or on `psi` after a DM one.
+//! The probe sums are M1's [`Kernels::psi_to_probe`], run by [`Kernels::fused_project`] on
+//! the waves it leaves before the object gather can push them out of L2.
 
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig};
@@ -196,6 +196,15 @@ pub struct FusedInputs<'a> {
     pub probe: &'a DeviceBuffer<C32>,
 }
 
+/// The update sums [`Kernels::fused_project`] adds to; `Default` adds to neither.
+#[derive(Default)]
+pub struct FusedSums<'a> {
+    /// `[nobj, nyo, nxo]`, added as [`Kernels::psi_to_obj`] adds them.
+    pub obj: Option<&'a mut UpdateSums>,
+    /// `[nprobe, ny, nx]`, added by [`Kernels::psi_to_probe`] against the object read.
+    pub probe: Option<&'a mut UpdateSums>,
+}
+
 /// Which iteration [`Kernels::fused_project`] runs and where its new exit waves go. `psi`
 /// is a DM stack's exit waves, `[nf_max * nmode, ny, nx]` in the M1 layout.
 pub enum Exit<'a> {
@@ -208,8 +217,8 @@ pub enum Exit<'a> {
     /// The Poisson LLK gradient, for ML: the far field of `PO` scaled at every pixel by
     /// `2 (1 - obs / max(calc, 1e-12))`, 0 where masked, as engine's `poisson_grad`, goes
     /// back to the detector plane in [`FusedBufs::work`]. The object sums' `num` then gets
-    /// the object gradient `2 dL/dO*` of `Ptycho::obj_grad`, and [`Kernels::psi_to_probe`]
-    /// on `work` the probe's. `llk` as for [`Exit::Ap`].
+    /// the object gradient `2 dL/dO*` of `Ptycho::obj_grad`, and the probe sums' `num` the
+    /// probe's, `Ptycho::probe_grad`. `llk` as for [`Exit::Ap`].
     Grad {
         llk: Option<&'a mut DeviceBuffer<LlkPartial>>,
     },
@@ -225,11 +234,11 @@ pub enum Exit<'a> {
 
 impl Kernels {
     /// One stack's projection: from the current object and probe, the step `exit` names,
-    /// then with `obj_sums` the object-update sums of the waves it leaves added as
-    /// [`Self::psi_to_obj`] adds them (each object pixel over the stack's frames in
-    /// ascending order, so the split into stacks does not change a bit; only tiles the
-    /// stack touches are read and written). Up to six launches; a stack with `nf == 0`
-    /// writes nothing but `bufs`.
+    /// then the update sums of the waves it leaves: the probe's as [`Self::psi_to_probe`]
+    /// adds them, against `inputs.obj`, and the object's as [`Self::psi_to_obj`] does (each
+    /// object pixel over the stack's frames in ascending order, so the split into stacks does
+    /// not change a bit; only tiles the stack touches are read and written). Up to seven
+    /// launches; a stack with `nf == 0` writes nothing but `bufs`.
     pub fn fused_project(
         &self,
         ctx: &ExecutionContext,
@@ -237,7 +246,7 @@ impl Kernels {
         stack: StackRef<'_>,
         exit: Exit<'_>,
         bufs: &mut FusedBufs,
-        obj_sums: Option<&mut UpdateSums>,
+        sums: FusedSums<'_>,
     ) -> Result<(), Error> {
         let run = Run::new(self, ctx, *inputs, stack, bufs)?;
         let d = inputs.views.dims();
@@ -254,8 +263,15 @@ impl Kernels {
         if let Some(out) = &llk {
             check_len("llk", out, run.g.nf_max as usize)?;
         }
+        let FusedSums {
+            obj: obj_sums,
+            probe: probe_sums,
+        } = sums;
         if let Some(sums) = &obj_sums {
             sums.check(d.obj_len())?;
+        }
+        if let Some(sums) = &probe_sums {
+            sums.check(d.nprobe as usize * d.n())?;
         }
         let psi = psi.as_deref();
         let p = FusedPtrs {
@@ -292,6 +308,10 @@ impl Kernels {
             alpha,
         };
         run.rows_inv(bufs, psi, p, cfg)?;
+        if let Some(sums) = probe_sums {
+            let waves = psi.unwrap_or(&bufs.work);
+            self.psi_to_probe(ctx, inputs.views, stack, waves, inputs.obj, sums)?;
+        }
         if let Some(sums) = obj_sums {
             run.gather(bufs, p, sums)?;
         }

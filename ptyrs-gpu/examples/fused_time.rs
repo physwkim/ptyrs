@@ -19,8 +19,8 @@ use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 use ptyrs_core::{AddrTable, Geometry, Positions, required_obj_shape};
 use ptyrs_fft::Plan2d;
 use ptyrs_gpu::{
-    C32, Error, Exit, FusedBufs, FusedInputs, Kernels, StackTable, UpdateSums, ViewAddr, ViewDims,
-    Views, record,
+    C32, Error, Exit, FusedBufs, FusedInputs, FusedSums, Kernels, StackTable, UpdateSums, ViewAddr,
+    ViewDims, Views, record,
 };
 
 const WARMUP: usize = 5;
@@ -129,7 +129,7 @@ impl Run {
         self.update_probe(ctx, k)
     }
 
-    /// The AP cycle with `fused_project`; the probe sums from its projected waves.
+    /// The AP cycle with `fused_project`, which adds both sums.
     fn fused_ap(&mut self, ctx: &ExecutionContext, k: &Kernels, sc: &Scene) -> Result<(), Error> {
         for s in 0..self.table.len() {
             let stack = self.table.at(s);
@@ -140,10 +140,11 @@ impl Run {
                 probe: &self.probe,
             };
             let exit = Exit::Ap { llk: None };
-            let sums = Some(&mut self.obj_sums);
+            let sums = FusedSums {
+                obj: Some(&mut self.obj_sums),
+                probe: Some(&mut self.probe_sums),
+            };
             k.fused_project(ctx, &inputs, stack, exit, &mut self.bufs, sums)?;
-            let work = self.bufs.work();
-            k.psi_to_probe(ctx, &sc.views, stack, work, &self.obj, &mut self.probe_sums)?;
         }
         self.update_obj(ctx, k, sc)?;
         self.update_probe(ctx, k)
@@ -202,7 +203,10 @@ impl Run {
             } else {
                 Exit::Dm { psi, alpha: ALPHA }
             };
-            let sums = Some(&mut self.obj_sums);
+            let sums = FusedSums {
+                obj: Some(&mut self.obj_sums),
+                probe: None,
+            };
             k.fused_project(ctx, &inputs, self.table.at(s), exit, &mut self.bufs, sums)?;
         }
         self.update_obj(ctx, k, sc)?;

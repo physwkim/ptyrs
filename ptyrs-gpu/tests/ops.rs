@@ -11,9 +11,9 @@ use cuda_async::error::DeviceError;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, DeviceCopy, DriverError};
 use ptyrs_fft::{FftError, Plan2d};
 use ptyrs_gpu::{
-    C32, Error, Exit, FUSED_SIDES, FusedBufs, FusedInputs, Kernels, Lines, LlkPartial, LlkScratch,
-    LlkSums, MASKED, OBJ_TILE, StackCtl, StackRef, StackTable, UpdateSums, ViewAddr, ViewDims,
-    Views, record, view_tiles,
+    C32, Error, Exit, FUSED_SIDES, FusedBufs, FusedInputs, FusedSums, Kernels, Lines, LlkPartial,
+    LlkScratch, LlkSums, MASKED, OBJ_TILE, StackCtl, StackRef, StackTable, UpdateSums, ViewAddr,
+    ViewDims, Views, record, view_tiles,
 };
 
 type Z = (f64, f64);
@@ -1965,9 +1965,8 @@ impl FusedScan {
     }
 }
 
-/// AP: the projected exit waves, LLK partials and object sums of `fused_project`, the probe
-/// sums `psi_to_probe` takes from its work buffer, and `fused_llk`, against the f64 M1
-/// chain, on both frame orientations.
+/// AP: the projected exit waves, LLK partials and object and probe sums of `fused_project`,
+/// and `fused_llk`, against the f64 M1 chain, on both frame orientations.
 #[test]
 fn fused_ap_matches_f64() {
     let (stream, ex, k) = setup();
@@ -1994,12 +1993,13 @@ fn fused_ap_matches_f64() {
                     llk: Some(&mut llk),
                 },
                 &mut bufs,
-                Some(&mut obj_sums),
+                FusedSums {
+                    obj: Some(&mut obj_sums),
+                    probe: Some(&mut probe_sums),
+                },
             )
             .unwrap();
             let work = bufs.work().to_host_vec(&stream).unwrap();
-            k.psi_to_probe(&ex, &fs.views, stack, bufs.work(), &fs.obj, &mut probe_sums)
-                .unwrap();
             k.fused_llk(&ex, &fs.inputs(), stack, &mut bufs, &mut llk_only)
                 .unwrap();
 
@@ -2040,8 +2040,8 @@ fn fused_ap_matches_f64() {
     }
 }
 
-/// ML: `Exit::Grad`'s gradient waves, its object sums (engine's `Ptycho::obj_grad`) and the
-/// probe sums `psi_to_probe` takes from them (`Ptycho::probe_grad`), against engine's
+/// ML: `Exit::Grad`'s gradient waves and its object and probe sums (engine's
+/// `Ptycho::obj_grad` and `Ptycho::probe_grad`), against engine's
 /// `poisson_grad` chain in f64; its LLK partials bit for bit against `Exit::Ap`'s.
 #[test]
 fn fused_grad_matches_f64() {
@@ -2069,7 +2069,7 @@ fn fused_grad_matches_f64() {
                     llk: Some(&mut llk_ap),
                 },
                 &mut bufs,
-                None,
+                FusedSums::default(),
             )
             .unwrap();
             k.fused_project(
@@ -2080,12 +2080,13 @@ fn fused_grad_matches_f64() {
                     llk: Some(&mut llk),
                 },
                 &mut bufs,
-                Some(&mut obj_sums),
+                FusedSums {
+                    obj: Some(&mut obj_sums),
+                    probe: Some(&mut probe_sums),
+                },
             )
             .unwrap();
             let work = bufs.work().to_host_vec(&stream).unwrap();
-            k.psi_to_probe(&ex, &fs.views, stack, bufs.work(), &fs.obj, &mut probe_sums)
-                .unwrap();
 
             let po = s.psi(frames.clone(), &s.obj);
             let (want, llk_ref) = grad_f64(s, frames.clone(), &po, &fs.counts_host);
@@ -2124,7 +2125,8 @@ fn fused_grad_matches_f64() {
 }
 
 /// DM: the first cycle's `psi = P(PO)` and a later cycle's `P(R) + (1 - alpha)(PO - R)` with
-/// its object sums, against f64, the later cycle starting from the first one's output.
+/// its object and probe sums, against f64, the later cycle starting from the first one's
+/// output.
 #[test]
 fn fused_dm_matches_f64() {
     let (stream, ex, k) = setup();
@@ -2137,7 +2139,9 @@ fn fused_dm_matches_f64() {
         let table = StackTable::new(&stream, &s.d, &stacks).unwrap();
         let mut bufs = FusedBufs::new(&stream, &s.d, table.nf_max()).unwrap();
         let mut obj_sums = UpdateSums::zeroed(&stream, s.obj.len()).unwrap();
+        let mut probe_sums = UpdateSums::zeroed(&stream, s.probe.len()).unwrap();
         let (mut num, mut den) = (vec![(0.0, 0.0); s.obj.len()], vec![0.0; s.obj.len()]);
+        let (mut pnum, mut pden) = (vec![(0.0, 0.0); s.probe.len()], vec![0.0; s.probe.len()]);
         for (i, frames) in stacks.into_iter().enumerate() {
             let (stack, len) = (table.at(i), s.nk(&frames) * n);
             let mut psi = DeviceBuffer::<C32>::zeroed(&stream, s.nk(&(0..3)) * n).unwrap();
@@ -2148,7 +2152,7 @@ fn fused_dm_matches_f64() {
                 stack,
                 Exit::DmFirst { psi: &mut psi },
                 &mut bufs,
-                None,
+                FusedSums::default(),
             )
             .unwrap();
             let first = psi.to_host_vec(&stream).unwrap();
@@ -2166,7 +2170,10 @@ fn fused_dm_matches_f64() {
                     alpha,
                 },
                 &mut bufs,
-                Some(&mut obj_sums),
+                FusedSums {
+                    obj: Some(&mut obj_sums),
+                    probe: Some(&mut probe_sums),
+                },
             )
             .unwrap();
             let refl: Vec<Z> = po
@@ -2187,17 +2194,27 @@ fn fused_dm_matches_f64() {
             let err = rel_l2(&got[..len], &want);
             println!("fused DM {frame:?} {frames:?}: rel L2 {err:.2e}");
             assert!(err < 1e-5, "{frame:?} {frames:?}: rel L2 {err:.2e}");
-            s.obj_sums(frames, &to_c32(&want), &mut num, &mut den);
+            let want = to_c32(&want);
+            s.obj_sums(frames.clone(), &want, &mut num, &mut den);
+            s.probe_sums(frames, &want, &mut pnum, &mut pden);
         }
-        let en = rel_l2(&obj_sums.num.to_host_vec(&stream).unwrap(), &num);
-        let ed = rel_l2_re(&obj_sums.den.to_host_vec(&stream).unwrap(), &den);
-        println!("fused DM {frame:?} object sums: num rel L2 {en:.2e}, den {ed:.2e}");
-        assert!(en < 1e-5 && ed < 1e-5, "{frame:?}: {en:.2e}, {ed:.2e}");
+        for (what, sums, num, den) in [
+            ("object", &obj_sums, &num, &den),
+            ("probe", &probe_sums, &pnum, &pden),
+        ] {
+            let en = rel_l2(&sums.num.to_host_vec(&stream).unwrap(), num);
+            let ed = rel_l2_re(&sums.den.to_host_vec(&stream).unwrap(), den);
+            println!("fused DM {frame:?} {what} sums: num rel L2 {en:.2e}, den {ed:.2e}");
+            assert!(
+                en < 1e-5 && ed < 1e-5,
+                "{frame:?} {what}: {en:.2e}, {ed:.2e}"
+            );
+        }
     }
 }
 
-/// Every frame's AP waves, LLK partials and DM waves, and the object sums of both, are the
-/// same bits whatever stacks the frames are split into.
+/// Every frame's AP waves, LLK partials and DM waves, and the object and probe sums of both,
+/// are the same bits whatever stacks the frames are split into.
 #[test]
 fn fused_results_do_not_depend_on_the_stack_split() {
     let (stream, ex, k) = setup();
@@ -2220,6 +2237,8 @@ fn fused_results_do_not_depend_on_the_stack_split() {
         let table = StackTable::new(&stream, &s.d, split).unwrap();
         let mut ap_sums = UpdateSums::zeroed(&stream, s.obj.len()).unwrap();
         let mut dm_sums = UpdateSums::zeroed(&stream, s.obj.len()).unwrap();
+        let mut ap_probe = UpdateSums::zeroed(&stream, s.probe.len()).unwrap();
+        let mut dm_probe = UpdateSums::zeroed(&stream, s.probe.len()).unwrap();
         let mut llk = DeviceBuffer::<LlkPartial>::zeroed(&stream, 5).unwrap();
         let (mut ap, mut dm, mut partials) = (vec![], vec![], vec![]);
         for (i, frames) in split.iter().enumerate() {
@@ -2233,7 +2252,10 @@ fn fused_results_do_not_depend_on_the_stack_split() {
                     llk: Some(&mut llk),
                 },
                 &mut bufs,
-                Some(&mut ap_sums),
+                FusedSums {
+                    obj: Some(&mut ap_sums),
+                    probe: Some(&mut ap_probe),
+                },
             )
             .unwrap();
             ap.extend(c32_bits(&bufs.work().to_host_vec(&stream).unwrap()[..len]));
@@ -2255,7 +2277,10 @@ fn fused_results_do_not_depend_on_the_stack_split() {
                     alpha: 0.02,
                 },
                 &mut bufs,
-                Some(&mut dm_sums),
+                FusedSums {
+                    obj: Some(&mut dm_sums),
+                    probe: Some(&mut dm_probe),
+                },
             )
             .unwrap();
             dm.extend(c32_bits(&psi.to_host_vec(&stream).unwrap()[..len]));
@@ -2271,20 +2296,30 @@ fn fused_results_do_not_depend_on_the_stack_split() {
                 .collect();
             (num, den)
         };
-        results.push((ap, partials, dm, sums(&ap_sums), sums(&dm_sums)));
+        results.push((
+            ap,
+            partials,
+            dm,
+            [&ap_sums, &dm_sums, &ap_probe, &dm_probe].map(sums),
+        ));
     }
     for (split, r) in splits.iter().zip(&results).skip(1) {
         let w = &results[0];
         assert!(r.0 == w.0, "{split:?}: AP waves differ");
         assert!(r.1 == w.1, "{split:?}: LLK partials differ");
         assert!(r.2 == w.2, "{split:?}: DM waves differ");
-        assert!(r.3 == w.3, "{split:?}: AP object sums differ");
-        assert!(r.4 == w.4, "{split:?}: DM object sums differ");
+        for (i, what) in ["AP object", "DM object", "AP probe", "DM probe"]
+            .iter()
+            .enumerate()
+        {
+            assert!(r.3[i] == w.3[i], "{split:?}: {what} sums differ");
+        }
     }
 }
 
 /// A captured AP and DM stack replayed against an entry with `nf == 0` leaves `psi`, the
-/// LLK partials and both object sums as they were, bit for bit; with `nf == 1` it does not.
+/// LLK partials and the object and probe sums of both as they were, bit for bit; with
+/// `nf == 1` it does not.
 #[test]
 fn fused_empty_stack_replay_writes_nothing() {
     let (stream, _, k) = setup();
@@ -2303,19 +2338,18 @@ fn fused_empty_stack_replay_writes_nothing() {
         })
         .collect();
     let mut llk = up(&stream, &llk_start);
-    let noisy_sums = |seed| {
-        let den: Vec<f32> = noise(s.obj.len(), seed + 1, 1.0)
-            .iter()
-            .map(|c| c.re)
-            .collect();
+    let noisy_sums = |len, seed| {
+        let den: Vec<f32> = noise(len, seed + 1, 1.0).iter().map(|c| c.re).collect();
         UpdateSums::new(
-            up(&stream, &noise(s.obj.len(), seed, 1.0)),
+            up(&stream, &noise(len, seed, 1.0)),
             up(&stream, &den),
             &stream,
         )
         .unwrap()
     };
-    let (mut ap_sums, mut dm_sums) = (noisy_sums(72), noisy_sums(74));
+    let (mut ap_sums, mut dm_sums) = (noisy_sums(s.obj.len(), 72), noisy_sums(s.obj.len(), 74));
+    let mut ap_probe = noisy_sums(s.probe.len(), 76);
+    let mut dm_probe = noisy_sums(s.probe.len(), 78);
     let side = k.context().new_stream().unwrap();
     let inputs = fs.inputs();
     let graph = CudaGraph::capture(
@@ -2324,18 +2358,26 @@ fn fused_empty_stack_replay_writes_nothing() {
             let ap = Exit::Ap {
                 llk: Some(&mut llk),
             };
-            k.fused_project(ctx, &inputs, dev.at(0), ap, &mut bufs, Some(&mut ap_sums))?;
+            let sums = FusedSums {
+                obj: Some(&mut ap_sums),
+                probe: Some(&mut ap_probe),
+            };
+            k.fused_project(ctx, &inputs, dev.at(0), ap, &mut bufs, sums)?;
             let dm = Exit::Dm {
                 psi: &mut psi,
                 alpha: 0.02,
             };
-            k.fused_project(ctx, &inputs, dev.at(0), dm, &mut bufs, Some(&mut dm_sums))
+            let sums = FusedSums {
+                obj: Some(&mut dm_sums),
+                probe: Some(&mut dm_probe),
+            };
+            k.fused_project(ctx, &inputs, dev.at(0), dm, &mut bufs, sums)
         }),
     )
     .unwrap();
     let bits = |psi: &DeviceBuffer<C32>,
                 llk: &DeviceBuffer<LlkPartial>,
-                sums: [&UpdateSums; 2]|
+                sums: [&UpdateSums; 4]|
      -> Vec<u32> {
         let mut c: Vec<C32> = psi.to_host_vec(&stream).unwrap();
         for u in sums {
@@ -2363,7 +2405,7 @@ fn fused_empty_stack_replay_writes_nothing() {
         );
         out
     };
-    let start = bits(&psi, &llk, [&ap_sums, &dm_sums]);
+    let start = bits(&psi, &llk, [&ap_sums, &dm_sums, &ap_probe, &dm_probe]);
     for (f0, nf, empty) in [(2, 0, true), (0, 0, true), (4, 0, true), (2, 1, false)] {
         let ctl = [StackCtl { f0, nf }];
         k.context().bind_to_thread().unwrap();
@@ -2371,7 +2413,7 @@ fn fused_empty_stack_replay_writes_nothing() {
         unsafe { cuda_core::memory::memcpy_htod_sync(dev.ptr(), ctl.as_ptr(), 8) }.unwrap();
         graph.launch().sync_on(&side).unwrap();
         assert_eq!(
-            bits(&psi, &llk, [&ap_sums, &dm_sums]) == start,
+            bits(&psi, &llk, [&ap_sums, &dm_sums, &ap_probe, &dm_probe]) == start,
             empty,
             "entry {{ f0: {f0}, nf: {nf} }}"
         );
@@ -2439,10 +2481,23 @@ fn fused_shapes_are_checked() {
         table.at(0),
         Exit::DmFirst { psi: &mut psi },
         &mut bufs,
-        None,
+        FusedSums::default(),
     );
     assert!(
         matches!(r, Err(Error::Shape(_))),
         "psi short of nf_max frames"
     );
+    let mut probe_sums = UpdateSums::zeroed(&stream, fs.s.probe.len() - 1).unwrap();
+    let r = k.fused_project(
+        &ex,
+        &fs.inputs(),
+        table.at(0),
+        Exit::Ap { llk: None },
+        &mut bufs,
+        FusedSums {
+            obj: None,
+            probe: Some(&mut probe_sums),
+        },
+    );
+    assert!(matches!(r, Err(Error::Shape(_))), "probe sums short");
 }
