@@ -1,0 +1,20 @@
+[package]
+name = "ptyrs-engine"
+version.workspace = true
+edition.workspace = true
+description = "ptyrs engine: the CPU f64 reference (PyNX operators, AP, DM, rPIE) and the GPU backend checked against it"
+
+[dependencies]
+ptyrs-core.workspace = true
+num-complex.workspace = true
+rustfft.workspace = true
+thiserror.workspace = true
+cuda-core.workspace = true
+cuda-async.workspace = true
+ptyrs-fft = { path = "../ptyrs-fft" }
+ptyrs-gpu = { path = "../ptyrs-gpu" }
+ptyrs-tile = { path = "../ptyrs-tile" }
+
+[dev-dependencies]
+cutile = { path = "/home/stevek/work/cuda-rust/cutile-rs/cutile" }
+ptyrs-io.workspace = true

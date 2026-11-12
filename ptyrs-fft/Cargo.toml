@@ -4,3 +4,8 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+cuda-core.workspace = true
+cuda-async.workspace = true
+
+[dev-dependencies]
+rustfft = "6"
