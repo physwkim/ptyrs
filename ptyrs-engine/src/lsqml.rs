@@ -143,6 +143,11 @@ impl<'a> LsqmlBatch<'a> {
         &self.a_far
     }
 
+    /// `chi`, one shifted object-plane plane per view.
+    pub(crate) fn chi(&self) -> &[C64] {
+        &self.chi
+    }
+
     /// pty-chi `delta_o_comb`, the object direction before preconditioning:
     /// `Σ_views conj(P_m·q)·chi_m` scattered onto the object ([`accumulate_obj`] of `chi`).
     pub fn obj_direction(&self) -> Stack<C64> {

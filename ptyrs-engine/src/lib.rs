@@ -25,6 +25,7 @@ mod gpu;
 mod linop;
 mod lsqml;
 mod obs;
+mod opr;
 mod ops;
 mod plan;
 mod ptycho;
@@ -40,6 +41,7 @@ pub use gpu::{GpuOptions, GpuPtycho};
 pub use linop::{DOT_TOL, FarField, LinearOp, ObjectToPsi, ProbeToPsi, Registered, register};
 pub use lsqml::{Lsqml, LsqmlBatch, LsqmlParams, LsqmlStep, illumination, lsqml_step};
 pub use obs::{Observed, shift};
+pub use opr::{OprStep, ProbeVariation, opr_step, opr_weight_grad};
 pub use ops::{
     Llk, accumulate_obj, accumulate_probe, apply_amplitude, cg_poisson_gamma, llk,
     obj_probe_to_psi, poisson_grad, psi_to_obj_probe, quad_phase,
