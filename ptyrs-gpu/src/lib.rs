@@ -31,10 +31,12 @@ use cuda_core::{
 use ptyrs_fft::FftError;
 use ptyrs_kernels::kernels::LoadedModule;
 
+mod fused;
 mod ops;
 mod ring;
 mod rpie;
 
+pub use fused::{Exit, FusedBufs, FusedInputs};
 pub use ops::{
     LLK_TREE_LEAVES, LlkPartial, LlkSums, MASKED, OBJ_TILE, StackCtl, StackGeom, StackRef,
     StackTable, UpdateSums, ViewAddr, ViewDims, Views, view_tiles,
