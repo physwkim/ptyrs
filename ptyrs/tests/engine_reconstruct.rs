@@ -262,7 +262,7 @@ fn ml_after_ap_descends_below_the_truth() {
         calc_llk: 1,
         ..MlParams::default()
     };
-    p.ml(&params, 40);
+    p.ml(&params, 40).unwrap();
     let h = p.history();
     assert_eq!(
         h.iter().map(|r| r.cycle).collect::<Vec<_>>(),

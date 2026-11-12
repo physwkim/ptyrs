@@ -420,7 +420,7 @@ impl BhKernels {
     }
 
     /// The step of `batch` along `d` into its record of `steps` (`(β, α, top, bottom)`,
-    /// [`BH_STEP`] floats each) from the partials `ptyrs_tile::TileDots::dots` and
+    /// [`BH_STEP`] floats each) from the partials [`crate::tile::TileDots::dots`] and
     /// [`Self::hess_frames`] left in `parts`: `β = H(u, v) / H(v, v)` with `d.v`, else 0;
     /// `top = ⟨u, Pu⟩ − β ⟨u, v⟩ = −⟨g, D⟩` and `bottom = H(D, D)` for `D = β v − Pu`;
     /// `α = top / bottom * frac`.

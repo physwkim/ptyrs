@@ -303,11 +303,15 @@ fn lsqml_restarts_and_rejects() {
     for features in [
         Features {
             scale: Some(vec![1.0; NPOS]),
-            background: None,
+            ..Features::default()
         },
         Features {
-            scale: None,
             background: Some(vec![1.0; frame * frame]),
+            ..Features::default()
+        },
+        Features {
+            position: Some(vec![[0.0; 2]; NPOS]),
+            ..Features::default()
         },
     ] {
         gpu.set_features(&features).unwrap();
