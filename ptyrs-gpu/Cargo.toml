@@ -7,9 +7,13 @@ edition.workspace = true
 ptyrs-kernels = { path = "../ptyrs-kernels" }
 ptyrs-fft = { path = "../ptyrs-fft" }
 cuda-core = { workspace = true }
+cuda-async = { workspace = true }
 
 [build-dependencies]
 cuda-artifact-finalizer = { path = "/home/stevek/work/cuda-rust/cuda-oxide/crates/cuda-artifact-finalizer" }
 nvjitlink-sys = { path = "/home/stevek/work/cuda-rust/cuda-oxide/crates/nvjitlink-sys" }
 oxide-artifacts = "0.2.1"
 libloading = "0.8"
+
+[dev-dependencies]
+ptyrs-core = { path = "../ptyrs-core" }

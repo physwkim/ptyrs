@@ -5522,8 +5522,12 @@ dependencies = [
 name = "ptyrs-engine"
 version = "0.0.1"
 dependencies = [
+ "cuda-async",
+ "cuda-core",
  "num-complex",
  "ptyrs-core",
+ "ptyrs-fft",
+ "ptyrs-gpu",
  "ptyrs-io",
  "rustfft",
  "thiserror 2.0.21",
@@ -5533,6 +5537,7 @@ dependencies = [
 name = "ptyrs-fft"
 version = "0.0.1"
 dependencies = [
+ "cuda-async",
  "cuda-core",
  "rustfft",
 ]
@@ -5542,10 +5547,12 @@ name = "ptyrs-gpu"
 version = "0.0.1"
 dependencies = [
  "cuda-artifact-finalizer",
+ "cuda-async",
  "cuda-core",
  "libloading 0.8.9",
  "nvjitlink-sys",
  "oxide-artifacts",
+ "ptyrs-core",
  "ptyrs-fft",
  "ptyrs-kernels",
 ]
@@ -5601,6 +5608,20 @@ dependencies = [
  "ptyrs-engine",
  "rand 0.8.8",
  "rand_chacha 0.3.1",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "ptyrs-refgen"
+version = "0.0.1"
+dependencies = [
+ "ptyrs-core",
+ "ptyrs-io",
+ "rand 0.8.8",
+ "rand_chacha 0.3.1",
+ "rand_distr 0.4.3",
+ "rustfft",
+ "serde_json",
  "thiserror 2.0.21",
 ]
 

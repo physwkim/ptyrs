@@ -88,10 +88,6 @@ mod tests {
             .collect()
     }
 
-    fn dot(a: &[C64], b: &[C64]) -> C64 {
-        a.iter().zip(b).map(|(x, y)| x * y.conj()).sum()
-    }
-
     #[test]
     fn matches_direct_dft_with_ortho_scale() {
         let (ny, nx) = (4, 6);
@@ -116,18 +112,12 @@ mod tests {
     }
 
     #[test]
-    fn inverse_is_adjoint_of_forward() {
-        // <F a, b> = <a, F^-1 b> for a unitary F; checked over two planes at once.
-        let shape = [8, 6];
-        let f = Fft2::new(shape);
+    fn inverse_undoes_forward() {
+        // The adjoint pairing is checked by registering `FarField`.
+        let f = Fft2::new([8, 6]);
         let a = signal(96, 0.0);
-        let b = signal(96, 5.5);
-        let (mut fa, mut ib) = (a.clone(), b.clone());
-        f.forward(&mut fa);
-        f.inverse(&mut ib);
-        let (l, r) = (dot(&fa, &b), dot(&a, &ib));
-        assert!((l - r).norm() < 1e-12 * l.norm().max(1.0), "{l} vs {r}");
-        let mut back = fa.clone();
+        let mut back = a.clone();
+        f.forward(&mut back);
         f.inverse(&mut back);
         for (u, v) in back.iter().zip(&a) {
             assert!((u - v).norm() < 1e-13);
