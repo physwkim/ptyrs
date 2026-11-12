@@ -472,14 +472,39 @@ mod tests {
     }
 
     /// The sums are backed with the object rows a tile needs and nowhere
-    /// else, and read zero (as fresh driver memory does even unfilled).
+    /// else, and read zero although the fresh backing is dirtied before the
+    /// zeroing runs (fresh driver memory reads zero even unfilled).
     #[test]
     fn the_sums_are_backed_and_zeroed_with_the_object_rows() {
         let ctx = Context::new(0).expect("GPU 0");
         let s = ctx.new_stream().unwrap();
         let (n, mib) = (1024usize, 1usize << 20);
         let mut o = LiveObject::new(&s, 2, [n, n], 4, [1.0, 0.5], 1).unwrap();
+        let mut gate = PinnedHostBuffer::<u32>::zeroed(&ctx, 1).unwrap();
+        // SAFETY: the gate outlives the stream's work, which is synchronized
+        // below.
+        unsafe {
+            sys::cuStreamWaitValue32_v2(
+                s.cu_stream(),
+                gate.as_ptr() as u64,
+                1,
+                sys::CUstreamWaitValue_flags_enum_CU_STREAM_WAIT_VALUE_GEQ,
+            )
+            .result()
+            .unwrap();
+        }
+        // Opens the gate after 10 s, so an `ensure` that waits on the stream
+        // fails the check below instead of hanging.
+        let (release, rx) = std::sync::mpsc::channel::<()>();
+        let g = gate.as_mut_ptr() as usize;
+        let watchdog = std::thread::spawn(move || {
+            let _ = rx.recv_timeout(std::time::Duration::from_secs(10));
+            // SAFETY: `gate` outlives the thread, which is joined below.
+            unsafe { (g as *mut u32).write_volatile(1) };
+        });
         o.ensure((300 / 16..=339 / 16).map(|ty| [ty, 2])).unwrap();
+        let zeroed = ctx.new_event_with_flags(None).unwrap();
+        zeroed.record(&s).unwrap();
         // 2 MiB chunks: rows 256..512 of each plane of the object and
         // `num`, rows 0..512 of `den`.
         assert_eq!(o.mapped_bytes(), 4 * mib);
@@ -487,31 +512,49 @@ mod tests {
             (o.num.mapped_bytes(), o.den.mapped_bytes()),
             (4 * mib, 4 * mib)
         );
-        s.synchronize().unwrap();
-        for z in 0..2 {
-            let rows =
-                |r: Range<usize>, b: usize| (z * n + r.start) * n * b..(z * n + r.end) * n * b;
-            for (buf, r, b) in [(&o.num, 256..512, 8), (&o.den, 0..512, 4)] {
-                let r = rows(r, b);
-                assert!(buf.is_mapped(r.clone()) && !buf.is_mapped(r.end..r.end + 4));
-                let mut got = vec![1u32; r.len() / 4];
-                // SAFETY: the stream is idle and `r` is backed.
-                unsafe {
-                    sys::cuMemcpyDtoH_v2(
-                        got.as_mut_ptr().cast(),
-                        buf.ptr() + r.start as u64,
-                        r.len(),
-                    )
-                }
-                .result()
-                .unwrap();
-                assert!(
-                    got.iter().all(|&w| w == 0),
-                    "plane {z}, {} bytes from {}",
-                    r.len(),
-                    r.start
-                );
+        let fresh: Vec<_> = (0..2)
+            .flat_map(|z| {
+                let rows = move |r: Range<usize>, b: usize| {
+                    (z * n + r.start) * n * b..(z * n + r.end) * n * b
+                };
+                [(&o.num, rows(256..512, 8)), (&o.den, rows(0..512, 4))]
+            })
+            .collect();
+        let dirt = ctx.new_stream().unwrap();
+        for (buf, r) in &fresh {
+            assert!(buf.is_mapped(r.clone()) && !buf.is_mapped(r.end..r.end + 4));
+            // SAFETY: `r` is backed; the object's stream is held at the gate.
+            unsafe {
+                sys::cuMemsetD32Async(
+                    buf.ptr() + r.start as u64,
+                    !0,
+                    r.len() / 4,
+                    dirt.cu_stream(),
+                )
             }
+            .result()
+            .unwrap();
+        }
+        dirt.synchronize().unwrap();
+        let held = !zeroed.query().unwrap();
+        release.send(()).unwrap();
+        watchdog.join().unwrap();
+        assert!(held, "the zeroing ran before the backing was dirtied");
+        s.synchronize().unwrap();
+        for (buf, r) in fresh {
+            let mut got = vec![1u32; r.len() / 4];
+            // SAFETY: the stream is idle and `r` is backed.
+            unsafe {
+                sys::cuMemcpyDtoH_v2(got.as_mut_ptr().cast(), buf.ptr() + r.start as u64, r.len())
+            }
+            .result()
+            .unwrap();
+            assert!(
+                got.iter().all(|&w| w == 0),
+                "{} bytes from {}",
+                r.len(),
+                r.start
+            );
         }
     }
 }
