@@ -40,6 +40,13 @@ pub struct Features {
     /// pixels, `Δ = 0.3·Re Σ conj(c)·O·∂W / (Σ |O·∂W|² + max_f Σ |O·∂W|²)` (0 where that is
     /// 0) clipped to ±0.1, then `d += Δ − mean_f Δ`, which keeps the mean offset. pty-chi's
     /// clip at 10 MADs of `Δ` is left out. ML and rPIE refuse it.
+    ///
+    /// [`crate::engine::Lsqml`] models it on every slice through the moved probe and steps it
+    /// as pty-chi's LSQML does, after each batch's object and probe update:
+    /// [`crate::engine::LsqmlBatch::position_directions`] times 0.3 at the batch's frames, 0
+    /// at the others, each axis clipped to `min(10·mean_f |dx − mean dx|, 0.1)` over all
+    /// frames, with no mean subtracted. Both models are pty-chi's while every `|d| ≤ 1/2`,
+    /// past which pty-chi moves the window to the nearest pixel.
     pub position: Option<Vec<[f64; 2]>>,
 }
 
@@ -293,7 +300,7 @@ impl Cost {
 }
 
 /// numpy `fftfreq`: cycles per pixel of DFT index `k` on an axis of `n`, Nyquist at −1/2.
-fn freq(k: usize, n: usize) -> f64 {
+pub(crate) fn freq(k: usize, n: usize) -> f64 {
     let k = if k < n / 2 {
         k as f64
     } else {
@@ -343,6 +350,34 @@ fn translate(a: &[C64], offset: [f64; 2], axis: Option<usize>, fft: &Fft2) -> Ve
         .collect();
     fft.inverse(&mut w);
     w
+}
+
+/// Natural-layout probe planes `p` moved by `offset` as pty-chi LSQML moves its probe,
+/// `conj(q)·T(q·p)` per plane, with `q` the object-plane phase the slice the planes enter
+/// applies after them (`None` for none) and `T` [`translate`]'s move on the plane's periodic
+/// grid, which commutes with fftshift. The adjoint is the move by `−offset`.
+pub(crate) fn move_planes(p: &mut [C64], quad: Option<&[C64]>, offset: [f64; 2], fft: &Fft2) {
+    let shape = fft.shape();
+    let n = shape[0] * shape[1];
+    let phase = |p: &mut [C64], conj: bool| {
+        if let Some(q) = quad {
+            for plane in p.chunks_exact_mut(n) {
+                for (p, q) in plane.iter_mut().zip(q) {
+                    *p *= if conj { q.conj() } else { *q };
+                }
+            }
+        }
+    };
+    phase(p, false);
+    fft.forward(p);
+    for plane in p.chunks_exact_mut(n) {
+        plane
+            .iter_mut()
+            .enumerate()
+            .for_each(|(j, p)| *p *= ramp(j, shape, offset).1);
+    }
+    fft.inverse(p);
+    phase(p, true);
 }
 
 /// [`crate::engine::obj_probe_to_psi`] with frame `f` at its view corner plus `offsets[f]` (`[dy, dx]`

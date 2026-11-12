@@ -87,13 +87,16 @@ impl<'a> SliceWaves<'a> {
         &self.psi
     }
 
-    /// The object-plane phase slice `s` applies: [`Optics::quad`] on the last, 1 elsewhere.
+    /// The object-plane phase slice `s` applies ([`Optics::slice_quad`]), 1 where it applies
+    /// none.
     pub fn quad(&self, s: usize) -> &[C64] {
-        if s + 1 == self.objects.len() {
-            self.optics.quad()
-        } else {
-            &self.unit
-        }
+        self.optics.slice_quad(s).unwrap_or(&self.unit)
+    }
+
+    /// The wave entering slice `s`, one natural-layout plane per view; slice 0's is the views'
+    /// probe planes.
+    pub fn incident(&self, s: usize) -> &Probe {
+        &self.incident[s]
     }
 
     /// `chi` (one shifted plane per view, a change of the exit waves) taken back through the

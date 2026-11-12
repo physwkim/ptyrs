@@ -68,6 +68,12 @@ impl Optics {
         &self.quad
     }
 
+    /// The object-plane phase slice `s` applies: [`Self::quad`] on the last slice, none on
+    /// the others.
+    pub fn slice_quad(&self, s: usize) -> Option<&[C64]> {
+        (s + 1 == self.nslice()).then_some(&self.quad[..])
+    }
+
     pub fn propagator(&self) -> &Propagator {
         &self.propagator
     }

@@ -2,22 +2,31 @@
 //! CPU f64 operators over the arrays and layout of [`crate::engine::ops`]: [`LsqmlBatch`] holds one
 //! batch's update directions at one state, and [`Lsqml`], holding pty-chi's object
 //! preconditioner, takes the step with pty-chi's per-frame 2×2 step sizes and the
-//! [`ProbeVariation`] step ([`Lsqml::step`]) and runs the epochs.
+//! [`ProbeVariation`] step ([`Lsqml::step`]) and runs the epochs. Of the [`Features`], pty-chi's
+//! LSQML refines the positions alone ([`Lsqml::with_features`]).
 //!
 //! The noise model is a [`Cost`]: [`Cost::Amplitude`] is pty-chi's Gaussian model with weight
 //! `1/(2σ)² = 1`. The exit waves reach the detector through an [`Optics`]; pty-chi's probe is
 //! the engine's over `√k`, `k` the propagator's [`crate::engine::Propagator::intensity_scale`].
 
+use std::f64::consts::PI;
+
 use crate::base::{AddrTable, C64, Object, Probe, Stack, View};
 
-use crate::engine::ops::obj_probe_to_psi;
-use crate::engine::{Cost, Observed, Optics, ProbeVariation, SliceWaves, random_batches};
+use crate::engine::features::{POSITION_LIMIT, POSITION_STEP, freq, move_planes};
+use crate::engine::ops::{natural, obj_probe_to_psi};
+use crate::engine::{
+    Cost, EngineError, Features, Fft2, Observed, Optics, ProbeVariation, SliceWaves, random_batches,
+};
 
 /// pty-chi's offsets: on `√icalc` in the Gaussian residual, on `icalc` in the Poisson
 /// residual and in the Poisson `xi`.
 const EPS_AMPLITUDE: f64 = 1e-9;
 const EPS_POISSON: f64 = 1e-6;
 const EPS_XI: f64 = 1e-5;
+/// pty-chi's floor on the position direction's denominator, `1e-6` on pty-chi's probe, times
+/// `k` on the engine's.
+const EPS_POSITION: f64 = 1e-6;
 /// pty-chi's `λ0` per pixel and mode in the step-size system times the probe's pixel count:
 /// `λ0 = 1.2e-7/(ny·nx)` on pty-chi's probe, `1.2e-7·k/(ny·nx)` on the engine's.
 const LAMBDA0: f64 = 1.2e-7;
@@ -46,7 +55,8 @@ pub struct LsqmlStep {
 
 /// The update directions of a batch of views at one object (one per slice of the [`Optics`]),
 /// probe and [`ProbeVariation`]. With `psi` the exit waves of [`SliceWaves`] at each frame's
-/// own probe ([`ProbeVariation::unique`]), `U` the propagator, `icalc = Σ_m |U psi_m|²` and `c`
+/// own probe ([`ProbeVariation::unique`]), moved by the frame's [`Features::position`] offset
+/// as [`Features::position`] says, `U` the propagator, `icalc = Σ_m |U psi_m|²` and `c`
 /// the cost's residual (Gaussian `2(1 − √iobs/(√icalc + 1e-9))`, Poisson
 /// `1 − iobs/(icalc + 1e-6)`, 0 where masked), the exit-wave update is pty-chi's Eq. 19
 /// `chi_m = Uᴴ((1 − a_far·c)·U psi_m) − psi_m`, which also drops the part of `psi` on angular
@@ -61,6 +71,8 @@ pub struct LsqmlBatch<'a> {
     objects: &'a [Object],
     optics: &'a Optics,
     frames: Vec<usize>,
+    /// The batch's [`Features::position`] offsets, by frame of the batch.
+    offsets: Option<Vec<[f64; 2]>>,
     nmode: usize,
     a_far: Vec<f64>,
     /// Per slice, its `chi`: one shifted plane per view.
@@ -97,7 +109,16 @@ impl<'a> LsqmlBatch<'a> {
                 fv[0].frame as usize
             })
             .collect();
-        let (uviews, uprobe) = var.unique(views, probe);
+        let (uviews, mut uprobe) = var.unique(views, probe);
+        let offsets = (run.features.position.as_ref())
+            .map(|d| frames.iter().map(|&f| d[f]).collect::<Vec<_>>());
+        if let Some(offsets) = &offsets {
+            let fft = Fft2::new(probe.plane_shape());
+            let q = optics.slice_quad(0);
+            for (p, &d) in (uprobe.as_mut_slice().chunks_exact_mut(probe.len() * n)).zip(offsets) {
+                move_planes(p, q, d, &fft);
+            }
+        }
         let waves = SliceWaves::new(optics, &uviews, objects, &uprobe);
         let prop = optics.propagator();
         let mut chi = waves.psi().to_vec();
@@ -154,6 +175,7 @@ impl<'a> LsqmlBatch<'a> {
             objects,
             optics,
             frames,
+            offsets,
             nmode,
             a_far,
             chi,
@@ -179,16 +201,85 @@ impl<'a> LsqmlBatch<'a> {
             .collect()
     }
 
-    /// pty-chi `delta_p_i` and `|O_view|²` on slice 0: plane `b·nprobe + m` holds
-    /// `conj(q·O_view)·chi_m` of the batch's `b`-th frame and probe mode `m`
-    /// ([`SliceWaves::probe_adjoint`] over the [`ProbeVariation::unique`] views).
+    /// pty-chi `delta_p_i` before its adjoint move and `|O_view|²` on slice 0: plane
+    /// `b·nprobe + m` holds `conj(q·O_view)·chi_m` of the batch's `b`-th frame and probe mode
+    /// `m` ([`SliceWaves::probe_adjoint`] over the [`ProbeVariation::unique`] views).
     pub fn frame_probe_directions(&self) -> (Stack<C64>, Stack<f64>) {
         self.waves.probe_adjoint(&self.chi[0])
     }
 
-    /// pty-chi `delta_p_hat`: the frame mean of [`Self::frame_probe_directions`] per mode.
+    /// pty-chi `delta_p_i`: `d` of [`Self::frame_probe_directions`] with frame `b`'s planes
+    /// taken back through its probe move, the move by `−offset` ([`Features::position`]);
+    /// `d` itself without positions.
+    pub fn adjoint_move(&self, d: &Stack<C64>) -> Stack<C64> {
+        let mut out = d.clone();
+        if let Some(offsets) = &self.offsets {
+            let fft = Fft2::new(self.probe.plane_shape());
+            let q = self.optics.slice_quad(0);
+            let block = self.probe.len() * self.probe.plane_len();
+            for (p, d) in out.as_mut_slice().chunks_exact_mut(block).zip(offsets) {
+                move_planes(p, q, d.map(|d| -d), &fft);
+            }
+        }
+        out
+    }
+
+    /// pty-chi `delta_p_hat`: the frame mean of [`Self::adjoint_move`] of
+    /// [`Self::frame_probe_directions`] per mode.
     pub fn probe_direction(&self) -> Stack<C64> {
-        frame_mean(&self.frame_probe_directions().0, self.probe.len())
+        let moved = self.adjoint_move(&self.frame_probe_directions().0);
+        frame_mean(&moved, self.probe.len())
+    }
+
+    /// pty-chi LSQML's gradient position direction `[Δy, Δx]` per frame of the batch, on
+    /// slice `s = nslice/2` (pty-chi's `slice_for_correction`): with `w` the wave entering
+    /// the slice at the frame's first view (probe and object mode 0) times the slice's phase,
+    /// `∂O` the Fourier derivative along the axis of that view's object window on the slice,
+    /// taken as periodic, and `chi` the view's `chi_s`,
+    /// `Δ = Re Σ conj(∂O·w)·chi / (Σ |∂O·w|² + max(max_b Σ |∂O·w|², 1e-6·k))`.
+    pub fn position_directions(&self) -> Vec<[f64; 2]> {
+        let s = self.objects.len() / 2;
+        let [ny, nx] = self.probe.plane_shape();
+        let n = ny * nx;
+        let nxo = self.objects[s].plane_shape()[1];
+        let fft = Fft2::new([ny, nx]);
+        let (q, incident) = (self.waves.quad(s), self.waves.incident(s));
+        let sums: Vec<[[f64; 2]; 2]> = (0..self.frames.len())
+            .map(|b| {
+                let k = b * self.nmode;
+                let v = self.views[k];
+                let o = self.objects[s].plane(v.obj as usize);
+                let patch: Vec<C64> = (0..n)
+                    .map(|i| o[(v.oy as usize + i / nx) * nxo + v.ox as usize + i % nx])
+                    .collect();
+                let grad = [0, 1].map(|axis| {
+                    let mut g = patch.clone();
+                    fft.forward(&mut g);
+                    for (j, g) in g.iter_mut().enumerate() {
+                        let f = [j / nx, j % nx];
+                        *g *= C64::new(0.0, 2.0 * PI * freq(f[axis], [ny, nx][axis]));
+                    }
+                    fft.inverse(&mut g);
+                    g
+                });
+                let (w, chi) = (incident.plane(k), &self.chi[s][k * n..(k + 1) * n]);
+                let mut sums = [[0.0; 2]; 2];
+                for (j, c) in chi.iter().enumerate() {
+                    let (i, _, _) = natural(j, ny, nx);
+                    for (axis, g) in grad.iter().enumerate() {
+                        let u = g[i] * w[i] * q[i];
+                        sums[0][axis] += (u.conj() * c).re;
+                        sums[1][axis] += u.norm_sqr();
+                    }
+                }
+                sums
+            })
+            .collect();
+        let eps = EPS_POSITION * self.optics.propagator().intensity_scale();
+        let max = [0, 1].map(|axis| sums.iter().map(|s| s[1][axis]).fold(eps, f64::max));
+        sums.iter()
+            .map(|[num, den]| [0, 1].map(|axis| num[axis] / (den[axis] + max[axis])))
+            .collect()
     }
 
     /// Per slice and frame `a_obj`, and per frame `a_probe`, along the object directions
@@ -307,6 +398,26 @@ pub fn illumination(views: &[View], obj_dims: [usize; 3], probe: &Probe) -> Stac
     out
 }
 
+/// pty-chi's position step from the batch `frames`' [`LsqmlBatch::position_directions`]
+/// `delta` on the offsets `d` of every frame: its SGD step `dx = 0.3·delta` at the batch's
+/// frames, 0 at the others, then each axis clipped to `min(10·mean |dx − mean dx|, 0.1)`
+/// over every frame.
+fn position_step(d: &mut [[f64; 2]], frames: &[usize], delta: &[[f64; 2]]) {
+    let mut dx = vec![[0.0; 2]; d.len()];
+    for (&f, delta) in frames.iter().zip(delta) {
+        dx[f] = delta.map(|v| POSITION_STEP * v);
+    }
+    let n = d.len() as f64;
+    for axis in 0..2 {
+        let mean = dx.iter().map(|x| x[axis]).sum::<f64>() / n;
+        let mad = dx.iter().map(|x| (x[axis] - mean).abs()).sum::<f64>() / n;
+        let limit = (10.0 * mad).min(POSITION_LIMIT);
+        for (d, x) in d.iter_mut().zip(&dx) {
+            d[axis] += x[axis].clamp(-limit, limit);
+        }
+    }
+}
+
 /// MATLAB `trimmean(x, 10)` as pty-chi's `trim_mean`: the mean without the
 /// `ceil(n·0.05 − 0.5)` smallest and largest values.
 fn trim_mean(x: &[f64]) -> f64 {
@@ -318,7 +429,7 @@ fn trim_mean(x: &[f64]) -> f64 {
 }
 
 /// LSQML state across epochs: the parameters, the epoch count, pty-chi's object
-/// preconditioner and every frame's `a_far` from its last step.
+/// preconditioner, every frame's `a_far` from its last step and the features it refines.
 #[derive(Clone)]
 pub struct Lsqml {
     params: LsqmlParams,
@@ -326,6 +437,7 @@ pub struct Lsqml {
     preconditioner: Option<Stack<f64>>,
     /// pty-chi `alpha_psi_far_all_pos`, by frame; frames past its end have not been stepped.
     a_far: Vec<f64>,
+    features: Features,
 }
 
 impl Lsqml {
@@ -336,7 +448,32 @@ impl Lsqml {
             epochs: 0,
             preconditioner: None,
             a_far: Vec::new(),
+            features: Features::default(),
         }
+    }
+
+    /// This run modelling and refining `features`, which hold one entry per frame of the scan
+    /// it runs on. pty-chi's LSQML refines the positions alone; it has neither a per-frame
+    /// intensity scale nor a detector background, and those are refused.
+    pub fn with_features(self, features: Features) -> Result<Self, EngineError> {
+        if features.scale.is_some() || features.background.is_some() {
+            return Err(EngineError::Invalid(
+                "LSQML refines no intensity scale or background, as pty-chi's".into(),
+            ));
+        }
+        if let Some(d) = &features.position
+            && !d.iter().flatten().all(|d| d.is_finite())
+        {
+            return Err(EngineError::Invalid(
+                "position offsets must be finite".into(),
+            ));
+        }
+        Ok(Self { features, ..self })
+    }
+
+    /// The features as the last step left them.
+    pub fn features(&self) -> &Features {
+        &self.features
     }
 
     /// Frame `f`'s `a_far` from its last [`Self::step`], 1/2 before its first.
@@ -359,7 +496,9 @@ impl Lsqml {
     /// √(pre² + (0.1·max pre)²)` and `dP = probe_direction`, `O_s += trim_mean(a_obj_s)·dO_s`,
     /// `P += mean(a_probe)·dP` and `var`'s eigenmodes and batch weights by [`ProbeVariation`]'s
     /// OPR step on slice 0, all from the state on entry; the frames' [`Self::a_far`] become the
-    /// batch's.
+    /// batch's. With [`Features::position`], `dP` is the mean of the adjoint-moved frame
+    /// directions ([`LsqmlBatch::adjoint_move`]), and the offsets take pty-chi's position step
+    /// after the object and probe ([`Features::position`]).
     pub fn step(
         &mut self,
         views: &[View],
@@ -387,8 +526,14 @@ impl Lsqml {
             .collect();
         let np = probe.len();
         let (d, vv) = b.frame_probe_directions();
-        let d_probe = Probe::new(frame_mean(&d, np));
+        let moved = b.adjoint_move(&d);
+        let d_probe = Probe::new(frame_mean(&moved, np));
         let (a_obj, a_probe) = b.step_sizes(&d_obj, &d_probe);
+        let d_pos = self
+            .features
+            .position
+            .as_ref()
+            .map(|_| b.position_directions());
         let (a_far, frames) = (b.a_far().to_vec(), b.frames().to_vec());
         for (&f, &a) in frames.iter().zip(&a_far) {
             if self.a_far.len() <= f {
@@ -396,7 +541,7 @@ impl Lsqml {
             }
             self.a_far[f] = a;
         }
-        var.step(&frames, &d, &vv, np);
+        var.step(&frames, &moved, &d, &vv, np);
         for ((o, d), a) in objects.iter_mut().zip(&d_obj).zip(&a_obj) {
             let so = trim_mean(a);
             o.as_mut_slice()
@@ -410,6 +555,9 @@ impl Lsqml {
             .iter_mut()
             .zip(d_probe.as_slice())
             .for_each(|(x, d)| *x += sp * d);
+        if let (Some(d), Some(delta)) = (&mut self.features.position, d_pos) {
+            position_step(d, &frames, &delta);
+        }
         LsqmlStep {
             frames,
             a_far,
@@ -446,6 +594,9 @@ impl Lsqml {
         var: &mut ProbeVariation,
     ) -> Vec<LsqmlStep> {
         let (nframe, nmode) = (addr.nframe(), addr.nmode());
+        if let Some(d) = &self.features.position {
+            assert_eq!(d.len(), nframe, "one position offset per frame");
+        }
         if self.epochs < 10 || self.epochs.is_multiple_of(10) {
             let illum = illumination(addr.views(), objects[0].dims(), probe);
             let pre = self.preconditioner.take().unwrap_or_else(|| {
