@@ -4407,6 +4407,45 @@ fn shifted_psi_sums_match_fused_project() {
     }
 }
 
+/// `shifted_rows_fwd`'s `work` is `fused_llk`'s row pass bit for bit, and the row IDFT of
+/// its `t` the f64 shifted probe at [`SHIFTS`], on [`FUSED_CASES`].
+#[test]
+fn shifted_rows_fwd_matches_fused_llk_and_f64() {
+    let (stream, ex, k) = setup();
+    for (frame, modes) in FUSED_CASES {
+        let (fs, sh) = FusedScan::shifted(&stream, frame, modes);
+        let (s, n) = (&fs.s, fs.s.n());
+        let (np, nx) = (s.d.nprobe as usize, frame[1] as usize);
+        let offsets = up(&stream, SHIFTS.as_flattened());
+        let mut spec = SpectrumBuf::zeroed(&stream, &s.d).unwrap();
+        let spectrum = k.probe_spectrum(&ex, &s.d, &fs.probe, &mut spec).unwrap();
+        let inputs = shifted_inputs(&fs, &offsets, spectrum);
+        let stacks = [0..3, 3..5];
+        let table = StackTable::new(&stream, &s.d, &stacks).unwrap();
+        let mut bufs = FusedBufs::with_shift(&stream, &s.d, 3).unwrap();
+        let mut t = DeviceBuffer::<C32>::zeroed(&stream, 3 * np * n).unwrap();
+        let mut work = DeviceBuffer::<C32>::zeroed(&stream, s.nk(&(0..3)) * n).unwrap();
+        for (i, frames) in stacks.into_iter().enumerate() {
+            let (stack, len) = (table.at(i), s.nk(&frames) * n);
+            k.fused_llk(&ex, &inputs, stack, &mut bufs, FarSums::default())
+                .unwrap();
+            k.shifted_rows_fwd(&ex, &inputs, stack, &mut t, &mut work)
+                .unwrap();
+            let want = c32_bits(&bufs.work().to_host_vec(&stream).unwrap()[..len]);
+            let got = c32_bits(&work.to_host_vec(&stream).unwrap()[..len]);
+            assert!(got == want, "{frame:?} {frames:?}: work differs");
+            let t = t.to_host_vec(&stream).unwrap();
+            for (fl, f) in frames.enumerate() {
+                let mut w: Vec<Z> = t[fl * np * n..][..np * n].iter().map(|&v| z(v)).collect();
+                w.chunks_exact_mut(nx).for_each(|row| fft_f64(row, true));
+                let err = rel_l2(&to_c32(&w), &sh.w[f as usize][0]);
+                println!("shifted_rows_fwd W {frame:?} frame {f}: rel L2 {err:.2e}");
+                assert!(err < 1e-5, "{frame:?} frame {f}: W rel L2 {err:.2e}");
+            }
+        }
+    }
+}
+
 /// A captured shifted AP and DM stack replayed against an entry with `nf == 0` leaves `psi`,
 /// the LLK partials and every sum of both as they were, bit for bit; with `nf == 1` it does
 /// not.
@@ -4515,7 +4554,8 @@ fn refused<T>(what: &str, r: Result<T, Error>) {
 
 /// A shift is refused with the spectrum of another probe buffer or frame geometry, short
 /// offsets, or bufs without its scratch; its sums without a shift, the plain probe sums with
-/// one, and sums or spectra short of their lengths.
+/// one, and sums or spectra short of their lengths; `shifted_rows_fwd` without a shift and
+/// with a short `t` or `work`.
 #[test]
 fn fused_shift_combinations_are_checked() {
     let (stream, ex, k) = setup();
@@ -4716,4 +4756,35 @@ fn fused_shift_combinations_are_checked() {
         let r = k.shifted_psi_sums(&ex, &inputs, stack, &psi, &mut bufs, sums);
         refused(&format!("shifted_psi_sums, {what}"), r);
     }
+
+    let (np, n) = (d.nprobe as usize, s.n());
+    let [mut t, mut short_t] =
+        [3 * np * n, 3 * np * n - 1].map(|len| DeviceBuffer::<C32>::zeroed(&stream, len).unwrap());
+    let [mut work, mut short_work] =
+        [len, len - 1].map(|len| DeviceBuffer::<C32>::zeroed(&stream, len).unwrap());
+    k.shifted_rows_fwd(&ex, &inputs, stack, &mut t, &mut work)
+        .unwrap();
+    for (what, inputs) in [
+        ("without a Model::shift", plain_inputs),
+        (
+            "another probe's spectrum",
+            shifted_inputs(&fs, &offsets, other),
+        ),
+        (
+            "another quad_phase's spectrum",
+            shifted_inputs(&fs, &offsets, quad),
+        ),
+        ("offsets of 9 values", shifted_inputs(&fs, &short, spectrum)),
+    ] {
+        let r = k.shifted_rows_fwd(&ex, &inputs, stack, &mut t, &mut work);
+        refused(&format!("shifted_rows_fwd, {what}"), r);
+    }
+    refused(
+        "shifted_rows_fwd, short t",
+        k.shifted_rows_fwd(&ex, &inputs, stack, &mut short_t, &mut work),
+    );
+    refused(
+        "shifted_rows_fwd, short work",
+        k.shifted_rows_fwd(&ex, &inputs, stack, &mut t, &mut short_work),
+    );
 }
