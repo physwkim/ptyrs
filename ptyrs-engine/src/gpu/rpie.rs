@@ -20,6 +20,9 @@ impl GpuPtycho {
         if params.batch_size == 0 {
             return Err(EngineError::Invalid("rPIE batch_size must be >= 1".into()));
         }
+        if self.dev.has_features() {
+            return Err(EngineError::Invalid("rPIE models no features".into()));
+        }
         for ic in 0..nepoch {
             self.dev.steady(Epoch::Rpie(*params), self.cycle)?;
             if llk_due(params.calc_llk, ic, nepoch) {

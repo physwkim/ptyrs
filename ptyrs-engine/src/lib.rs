@@ -35,8 +35,8 @@ pub mod sim;
 pub use batch::random_batches;
 pub use bh::{Bh, BhBatch, BhParams, BhStep};
 pub use features::{
-    Cost, background_cost, background_grad, intensity_grad, obj_probe_shift_to_psi, position_grad,
-    scale_psi,
+    Cost, Features, background_cost, background_grad, intensity_grad, obj_probe_shift_to_psi,
+    position_grad, scale_psi,
 };
 pub use fft::Fft2;
 pub use gpu::{GpuOptions, GpuPtycho};

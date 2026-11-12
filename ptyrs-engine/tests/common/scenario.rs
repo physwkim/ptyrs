@@ -4,6 +4,7 @@
 
 use ptyrs_core::{C64, Geometry, Object, Positions, Probe, Scan, Stack, required_obj_shape};
 use ptyrs_engine::Llk;
+use ptyrs_engine::sim::Simulation;
 
 /// A simulated scan (`npos` Fermat positions `step` object pixels apart, `photons` per frame,
 /// seed 1, no mask), its starting object and probe, before `scale_obj_probe`, and the LLK of
@@ -23,18 +24,7 @@ pub fn dm_scenario_truth(
     photons: f64,
     step: f64,
 ) -> (Scan, Object, Probe, Llk) {
-    let g = Geometry::new(1.5e-10, 1.0, 75e-6, [frame, frame]).unwrap();
-    let pixel = g.pixel_size_object();
-    // CXI stores translations as f32: round first so a CXI round trip keeps them exactly
-    let f = ptyrs_core::sim::fermat(npos, step * pixel[1]);
-    let round = |v: Vec<f64>| v.into_iter().map(|x| x as f32 as f64).collect();
-    let positions = Positions::new(round(f.y), round(f.x)).unwrap();
-    let shape = required_obj_shape(&positions.pynx_preprocess(pixel), pixel, g.frame, 16);
-    let truth_obj = ptyrs_core::sim::object(shape);
-    let truth_probe = ptyrs_core::sim::probe(g.frame, nprobe).unwrap();
-    let sim =
-        ptyrs_engine::sim::simulate_truth(g, positions, &truth_obj, &truth_probe, photons, None, 1)
-            .unwrap();
+    let (sim, truth_obj, truth_probe) = truth(frame, npos, nprobe, photons, step);
 
     let mut state = 0x9e37_79b9_7f4a_7c15_u64;
     let mut uniform = move || {
@@ -57,4 +47,26 @@ pub fn dm_scenario_truth(
         }
     }
     (sim.scan, object, probe, sim.truth_llk)
+}
+
+/// [`dm_scenario_truth`]'s simulation and the object and probe its counts were drawn from.
+pub fn truth(
+    frame: usize,
+    npos: usize,
+    nprobe: usize,
+    photons: f64,
+    step: f64,
+) -> (Simulation, Object, Probe) {
+    let g = Geometry::new(1.5e-10, 1.0, 75e-6, [frame, frame]).unwrap();
+    let pixel = g.pixel_size_object();
+    // CXI stores translations as f32: round first so a CXI round trip keeps them exactly
+    let f = ptyrs_core::sim::fermat(npos, step * pixel[1]);
+    let round = |v: Vec<f64>| v.into_iter().map(|x| x as f32 as f64).collect();
+    let positions = Positions::new(round(f.y), round(f.x)).unwrap();
+    let shape = required_obj_shape(&positions.pynx_preprocess(pixel), pixel, g.frame, 16);
+    let object = ptyrs_core::sim::object(shape);
+    let probe = ptyrs_core::sim::probe(g.frame, nprobe).unwrap();
+    let sim =
+        ptyrs_engine::sim::simulate_truth(g, positions, &object, &probe, photons, None, 1).unwrap();
+    (sim, object, probe)
 }

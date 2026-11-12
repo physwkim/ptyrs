@@ -5,11 +5,12 @@ use std::ops::Range;
 
 use ptyrs_core::{AddrTable, C64, Object, Probe, Scan, Stack};
 
+use crate::features::Model;
 use crate::ops::{
-    Llk, accumulate_obj, accumulate_probe, apply_amplitude, cg_poisson_gamma, llk, natural,
-    obj_probe_to_psi, poisson_grad, psi_to_obj_probe, quad_phase,
+    Llk, accumulate_obj, accumulate_probe, apply_amplitude_with, cg_poisson_gamma_with, llk_with,
+    natural, obj_probe_to_psi, poisson_grad_with, psi_to_obj_probe, quad_phase,
 };
-use crate::{EngineError, Fft2, Observed, shift};
+use crate::{EngineError, Features, Fft2, Observed, shift};
 
 /// Which loop recorded an [`LlkRecord`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -140,6 +141,7 @@ impl Default for RpieParams {
 /// Positions go through [`ptyrs_core::Positions::pynx_preprocess`] and become an
 /// [`AddrTable`] once; the probe frame must match the detector frame. Object mode `m / nprobe`
 /// and probe mode `m % nprobe` make view mode `m` (PyNX `_obj_psidx`, `_probe_psidx`).
+/// The model intensity, every LLK and gradient included, is that of [`Ptycho::features`].
 pub struct Ptycho {
     addr: AddrTable,
     quad: Vec<C64>,
@@ -149,6 +151,7 @@ pub struct Ptycho {
     probe: Probe,
     /// Object-plane exit waves, one shifted plane per view; DM carries it across cycles.
     psi: Vec<C64>,
+    features: Features,
     cycle: usize,
     history: Vec<LlkRecord>,
 }
@@ -182,9 +185,21 @@ impl Ptycho {
             object,
             probe,
             psi,
+            features: Features::default(),
             cycle: 0,
             history: Vec::new(),
         })
+    }
+
+    pub fn features(&self) -> &Features {
+        &self.features
+    }
+
+    /// Models and refines `features` from here on; an error leaves the current ones.
+    pub fn set_features(&mut self, features: Features) -> Result<(), EngineError> {
+        features.check(self.addr.nframe())?;
+        self.features = features;
+        Ok(())
     }
 
     pub fn object(&self) -> &Object {
@@ -241,13 +256,26 @@ impl Ptycho {
     pub fn llk(&self) -> Llk {
         let mut psi = self.calc_psi();
         self.fft.forward(&mut psi);
-        llk(&self.obs, 0..self.addr.nframe(), self.addr.nmode(), &psi).normalised(self.obs.nb_obs())
+        let (nframe, nmode) = (self.addr.nframe(), self.addr.nmode());
+        llk_with(&self.obs, 0..nframe, nmode, &psi, Model::of(&self.features))
+            .normalised(self.obs.nb_obs())
     }
 
-    /// Gradient of the Poisson LLK sum ([`llk`], not normalised) of the current object and probe
-    /// over the object's real and imaginary parts, packed as
-    /// `∂L/∂Re O + i·∂L/∂Im O = 2·∂L/∂O*`: [`poisson_grad`] of the far field, inverse FFT, then
-    /// [`accumulate_obj`]'s numerator. PyNX `ML`'s `obj_grad` is half of it.
+    /// [`Features::step`] from the far field of the current object and probe, if some
+    /// feature takes one.
+    fn step_features(&mut self) {
+        if !self.features.stepped() {
+            return;
+        }
+        let mut psi = self.calc_psi();
+        self.fft.forward(&mut psi);
+        self.features.step(&self.obs, self.addr.nmode(), &psi);
+    }
+
+    /// Gradient of the Poisson LLK sum ([`crate::llk`], not normalised) of the current object
+    /// and probe over the object's real and imaginary parts, packed as
+    /// `∂L/∂Re O + i·∂L/∂Im O = 2·∂L/∂O*`: [`crate::poisson_grad`] of the far field, inverse
+    /// FFT, then [`accumulate_obj`]'s numerator. PyNX `ML`'s `obj_grad` is half of it.
     pub fn obj_grad(&self) -> Stack<C64> {
         let psi = self.grad_psi();
         accumulate_obj(
@@ -292,7 +320,8 @@ impl Ptycho {
         ]
     }
 
-    /// [`cg_poisson_gamma`] of the current object and probe along `(d_obj, d_probe)`.
+    /// [`crate::cg_poisson_gamma`] of the current object and probe along `(d_obj, d_probe)`,
+    /// under the features' model.
     pub fn cg_gamma(&self, d_obj: &Stack<C64>, d_probe: &Stack<C64>) -> (f64, f64) {
         let (views, quad) = (self.addr.views(), &self.quad[..]);
         let (d_obj, d_probe) = (Object::new(d_obj.clone()), Probe::new(d_probe.clone()));
@@ -307,18 +336,21 @@ impl Ptycho {
             self.fft.forward(x);
         }
         let (nframe, nmode) = (self.addr.nframe(), self.addr.nmode());
-        cg_poisson_gamma(&self.obs, 0..nframe, nmode, &po, &a, &b)
+        let model = Model::of(&self.features);
+        cg_poisson_gamma_with(&self.obs, 0..nframe, nmode, [&po, &a, &b], model)
     }
 
     /// The object-plane `2·∂L/∂psi*` both gradients back-project.
     fn grad_psi(&self) -> Vec<C64> {
         let mut psi = self.calc_psi();
         self.fft.forward(&mut psi);
-        poisson_grad(
+        let (nframe, nmode) = (self.addr.nframe(), self.addr.nmode());
+        poisson_grad_with(
             &self.obs,
-            0..self.addr.nframe(),
-            self.addr.nmode(),
+            0..nframe,
+            nmode,
             &mut psi,
+            Model::of(&self.features),
         );
         self.fft.inverse(&mut psi);
         psi
@@ -374,9 +406,13 @@ impl Ptycho {
                 &mut self.psi,
             );
             self.fft.forward(&mut self.psi);
-            let l = llk_due(params.calc_llk, ic, ncycle)
-                .then(|| llk(&self.obs, 0..nframe, nmode, &self.psi).normalised(nb_obs));
-            apply_amplitude(&self.obs, 0..nframe, nmode, &mut self.psi);
+            let l = llk_due(params.calc_llk, ic, ncycle).then(|| {
+                let model = Model::of(&self.features);
+                llk_with(&self.obs, 0..nframe, nmode, &self.psi, model).normalised(nb_obs)
+            });
+            self.features.step(&self.obs, nmode, &self.psi);
+            let model = Model::of(&self.features);
+            apply_amplitude_with(&self.obs, 0..nframe, nmode, &mut self.psi, model);
             self.fft.inverse(&mut self.psi);
             psi_to_obj_probe(
                 self.addr.views(),
@@ -413,6 +449,7 @@ impl Ptycho {
         let mut refl = vec![C64::default(); self.psi.len()];
         for ic in 0..ncycle {
             let l = llk_due(params.calc_llk, ic, ncycle).then(|| self.llk());
+            self.step_features();
             obj_probe_to_psi(
                 self.addr.views(),
                 &self.object,
@@ -429,7 +466,8 @@ impl Ptycho {
                 }
             }
             self.fft.forward(&mut self.psi);
-            apply_amplitude(&self.obs, 0..nframe, nmode, &mut self.psi);
+            let model = Model::of(&self.features);
+            apply_amplitude_with(&self.obs, 0..nframe, nmode, &mut self.psi, model);
             self.fft.inverse(&mut self.psi);
             if ic > 0 {
                 for ((s, r), p) in self.psi.iter_mut().zip(&refl).zip(&po) {
@@ -483,6 +521,7 @@ impl Ptycho {
         ];
         for ic in 0..ncycle {
             let l = llk_due(params.calc_llk, ic, ncycle).then(|| self.llk());
+            self.step_features();
             let g = self.grads(uo, up);
             let beta = match &last {
                 None => 0.0,
@@ -557,6 +596,9 @@ impl Ptycho {
         }
         if params.batch_size == 0 {
             return Err(EngineError::Invalid("rPIE batch_size must be >= 1".into()));
+        }
+        if self.features != Features::default() {
+            return Err(EngineError::Invalid("rPIE models no features".into()));
         }
         let nframe = self.addr.nframe();
         for ic in 0..nepoch {
@@ -721,6 +763,7 @@ mod tests {
     use ptyrs_core::{Geometry, required_obj_shape};
 
     use super::*;
+    use crate::llk;
 
     fn poisson_sum(p: &Ptycho) -> f64 {
         let mut psi = p.calc_psi();

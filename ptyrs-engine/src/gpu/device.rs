@@ -1,10 +1,12 @@
 //! The device state a captured cycle addresses, and the graph captured from it, under one
 //! owner. Nothing outside this module can reach a field of [`Device`] or of a stack's
-//! buffers, and nothing here replaces one after [`Device::new`]: a graph replays on the
-//! buffers the eager cycle would use, and other buffers mean another `Device`, which starts
-//! with no graph. The device also owns the LLK ring and its count of records: a record is
-//! counted once per enqueued run of a cycle or pass that ended it, as the [`Ended`] its body
-//! returned shows, eagerly or kept from the capture of its graph.
+//! buffers, and nothing here replaces one after [`Device::new`] but
+//! [`Device::set_features`], which drops every graph before and recaptures the LLK pass's
+//! after: a graph replays on the buffers the eager cycle would use, and other buffers mean
+//! another `Device`, or other features, which start with no graph. The device also owns the
+//! LLK ring and its count of records: a record is counted once per enqueued run of a cycle
+//! or pass that ended it, as the [`Ended`] its body returned shows, eagerly or kept from the
+//! capture of its graph.
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -14,9 +16,10 @@ use cuda_async::device_operation::{DeviceOp, ExecutionContext};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 use ptyrs_fft::Plan2d;
 use ptyrs_gpu::{
-    BH_STEP, BhKernels, C32, CG_BLOCKS, Ended, EpochOrder, Error as GpuError, FusedBufs,
-    GammaStacks, GradKernels, Kernels, LlkPartial, LlkRing, LlkScratch, LlkTotals, ObjProbeScale,
-    PowerMax, RingDevice, RpieKernels, StackTable, UpdateSums, ViewAddr, ViewDims, Views,
+    BH_STEP, BhKernels, C32, CG_BLOCKS, Ended, EpochOrder, Error as GpuError, FarSums, FusedBufs,
+    GammaStacks, GradKernels, Kernels, LlkPartial, LlkRing, LlkScratch, LlkTotals, Model,
+    ObjProbeScale, PowerMax, RingDevice, RpieKernels, ScalePartial, StackTable, UpdateSums,
+    ViewAddr, ViewDims, Views,
 };
 use ptyrs_tile::TileDots;
 
@@ -24,7 +27,7 @@ use super::{
     Epoch, Frames, GpuOptions, Tag, batch_stacks, plane_len, plans, split, stack_buf_len, stacks,
     to_u32,
 };
-use crate::{ApParams, BhParams, BhStep, DmParams, EngineError, MlParams, RpieParams};
+use crate::{ApParams, BhParams, BhStep, DmParams, EngineError, Features, MlParams, RpieParams};
 
 /// Every buffer, module and plan a cycle launches on, and the graphs captured from them.
 pub(super) struct Device {
@@ -63,6 +66,75 @@ pub(super) struct Device {
     ml: Option<Box<MlState>>,
     /// BH's state, built by the first BH call and replaced only for another batch size.
     bh_state: Option<Box<BhState>>,
+    features: FeatureBufs,
+}
+
+/// The features' device state as [`Device::set_features`] last set it: each modelled
+/// feature's values and the far sums its step reads.
+#[derive(Default)]
+struct FeatureBufs {
+    scale: Option<ScaleBufs>,
+}
+
+/// A per-frame intensity scale `[nframe]` and its far sums `[nframe]`.
+struct ScaleBufs {
+    values: DeviceBuffer<f32>,
+    sums: DeviceBuffer<ScalePartial>,
+}
+
+/// [`FeatureBufs`] lent to a cycle.
+pub(super) struct FeaturesMut<'a> {
+    scale: Option<ScaleMut<'a>>,
+}
+
+/// [`ScaleBufs`] lent to a cycle.
+struct ScaleMut<'a> {
+    values: &'a mut DeviceBuffer<f32>,
+    sums: &'a mut DeviceBuffer<ScalePartial>,
+}
+
+impl FeaturesMut<'_> {
+    /// Whether some feature takes a step from far sums.
+    pub fn stepped(&self) -> bool {
+        self.scale.is_some()
+    }
+
+    /// The model intensity the features set.
+    pub fn model(&self) -> Model<'_> {
+        Model {
+            scale: self.scale.as_ref().map(|s| &*s.values),
+            ..Model::default()
+        }
+    }
+
+    /// The model intensity, and far sums of `llk` and of every stepped feature.
+    pub fn far<'b>(
+        &'b mut self,
+        llk: Option<&'b mut DeviceBuffer<LlkPartial>>,
+    ) -> (Model<'b>, FarSums<'b>) {
+        let (scale, scale_sums) = match &mut self.scale {
+            Some(s) => (Some(&*s.values), Some(&mut *s.sums)),
+            None => (None, None),
+        };
+        let model = Model {
+            scale,
+            ..Model::default()
+        };
+        let far = FarSums {
+            llk,
+            scale: scale_sums,
+            ..FarSums::default()
+        };
+        (model, far)
+    }
+
+    /// Every stepped feature's step from the far sums [`Self::far`] lent the passes before.
+    pub fn step(&mut self, ctx: &ExecutionContext, grad: &GradKernels) -> Result<(), GpuError> {
+        if let Some(s) = &mut self.scale {
+            grad.scale_step(ctx, s.values, s.sums)?;
+        }
+        Ok(())
+    }
 }
 
 /// How AP and DM project a stack and the LLK pass takes its partials, with the buffers only
@@ -453,6 +525,7 @@ pub(super) struct Bufs<'a> {
     pub ml: Option<MlBufs<'a>>,
     /// BH's state, once a BH call has built it.
     pub bh_state: Option<BhBufs<'a>>,
+    pub features: FeaturesMut<'a>,
 }
 
 /// The stacks lent to a cycle, one at a time.
@@ -565,17 +638,75 @@ impl Device {
             llk_graph: None,
             ml: None,
             bh_state: None,
+            features: FeatureBufs::default(),
             stack_size: to_u32("stack_size", options.stack_size)?,
             stream,
         };
         let ctx = dev.context();
         dev.ring.device().count(&ctx, 0..dims.nframe, &dev.counts)?;
-        if dev.use_graph {
-            dev.llk_graph = Some(dev.capture(|bufs, passes, ring, ctx| {
+        dev.capture_llk()?;
+        Ok(dev)
+    }
+
+    /// With graphs, captures the LLK pass's graph.
+    fn capture_llk(&mut self) -> Result<(), EngineError> {
+        if self.use_graph {
+            self.llk_graph = Some(self.capture(|bufs, passes, ring, ctx| {
                 bufs.forward_llk(ctx, passes, ring.record()).map(Some)
             })?);
         }
-        Ok(dev)
+        Ok(())
+    }
+
+    /// Models `features`, which the caller checked against the scan, from here on: the
+    /// values of the features already set are written in place; other features replace the
+    /// buffers, and so first drop every graph, which addresses them, and then recapture the
+    /// LLK pass's. Only the fused passes model features.
+    pub fn set_features(&mut self, features: &Features) -> Result<(), EngineError> {
+        if matches!(self.passes, Passes::M1 { .. }) && *features != Features::default() {
+            return Err(EngineError::Invalid(
+                "features need GpuOptions { fused: true, .. }".into(),
+            ));
+        }
+        let scale: Option<Vec<f32>> = features
+            .scale
+            .as_ref()
+            .map(|s| s.iter().map(|&s| s as f32).collect());
+        match (&mut self.features.scale, scale) {
+            (Some(b), Some(v)) => b.values.copy_from_host(&self.stream, &v)?,
+            (None, None) => {}
+            (_, scale) => {
+                let scale = scale
+                    .map(|v| {
+                        Ok::<_, EngineError>(ScaleBufs {
+                            values: DeviceBuffer::from_host(&self.stream, &v)?,
+                            sums: DeviceBuffer::zeroed(&self.stream, v.len())?,
+                        })
+                    })
+                    .transpose()?;
+                self.runs.clear();
+                self.llk_graph = None;
+                self.features.scale = scale;
+                self.capture_llk()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The modelled features, read back.
+    pub fn features(&self) -> Result<Features, EngineError> {
+        let scale = match &self.features.scale {
+            Some(b) => Some(b.values.to_host_vec(&self.stream)?),
+            None => None,
+        };
+        Ok(Features {
+            scale: scale.map(|v| v.into_iter().map(f64::from).collect()),
+        })
+    }
+
+    /// Whether some feature is modelled.
+    pub fn has_features(&self) -> bool {
+        self.features.scale.is_some()
     }
 
     pub fn stream(&self) -> &Arc<CudaStream> {
@@ -635,6 +766,12 @@ impl Device {
             norms: &mut self.norms,
             ml: self.ml.as_deref_mut().map(MlState::lend),
             bh_state: self.bh_state.as_deref_mut().map(BhState::lend),
+            features: FeaturesMut {
+                scale: self.features.scale.as_mut().map(|s| ScaleMut {
+                    values: &mut s.values,
+                    sums: &mut s.sums,
+                }),
+            },
         };
         let passes = match &mut self.passes {
             Passes::M1 { plans, scratch } => PassesMut::M1(M1Bufs {

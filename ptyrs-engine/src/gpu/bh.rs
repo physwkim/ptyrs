@@ -22,6 +22,9 @@ impl GpuPtycho {
         if params.batch_size == 0 {
             return Err(EngineError::Invalid("BH batch_size must be >= 1".into()));
         }
+        if self.dev.has_features() {
+            return Err(EngineError::Invalid("BH models no features".into()));
+        }
         let nframe = self.dev.dims().nframe as usize;
         let full = params.batch_size >= nframe;
         for ic in 0..nepoch {

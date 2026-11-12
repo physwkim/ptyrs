@@ -22,8 +22,8 @@ use ptyrs_kernels::pixel::{PIXEL_THREADS, SumPtrs};
 
 use crate::ops::grid_1d;
 use crate::{
-    C32, Error, Kernels, LlkPartial, StackCtl, StackRef, UpdateSums, ViewDims, Views, check_len,
-    dptr,
+    C32, Error, Kernels, LlkPartial, Model, ScalePartial, StackCtl, StackRef, UpdateSums, ViewDims,
+    Views, check_len, dptr,
 };
 
 /// The line-search exit-wave stacks of [`GradKernels::gamma_fields`], each of `nf_max *
@@ -33,6 +33,14 @@ pub struct GammaStacks {
     pub po: DeviceBuffer<C32>,
     pub a: DeviceBuffer<C32>,
     pub b: DeviceBuffer<C32>,
+}
+
+/// The counts `[nframe, ny, nx]` that [`GradKernels::gamma_frames`] compares the line
+/// search's far fields with, and their model intensity as the fused passes take it.
+#[derive(Clone, Copy)]
+pub struct GammaCounts<'a> {
+    pub counts: &'a DeviceBuffer<u16>,
+    pub model: Model<'a>,
 }
 
 impl GammaStacks {
@@ -188,25 +196,31 @@ impl GradKernels {
     }
 
     /// Adds the calculated photons of the stack's frames, the `icalc` of the `partials`
-    /// [`Kernels::llk`] wrote for it, to `out[0]`; zero `out` to start a scan, then add its
-    /// stacks in order. Masked pixels are left out, as in the LLK.
+    /// [`Kernels::llk`] wrote for it, each frame's times its intensity `scale` (`[nframe]`)
+    /// if given, to `out[0]`; zero `out` to start a scan, then add its stacks in order.
+    /// Masked pixels are left out, as in the LLK.
     pub fn icalc_add(
         &self,
         ctx: &ExecutionContext,
         dims: &ViewDims,
         stack: StackRef<'_>,
         partials: &DeviceBuffer<LlkPartial>,
+        scale: Option<&DeviceBuffer<f32>>,
         out: &mut DeviceBuffer<f32>,
     ) -> Result<(), Error> {
         let g = dims.geom(stack)?;
         check_len("partials", partials, g.nf_max as usize)?;
+        if let Some(scale) = scale {
+            check_len("scale", scale, dims.nframe as usize)?;
+        }
         check_len("out", out, 1)?;
         let config = LaunchConfig {
             grid_dim: (1, 1, 1),
             block_dim: (PIXEL_THREADS, 1, 1),
             shared_mem_bytes: 0,
         };
-        let reads = [partials.storage(), stack.storage()];
+        let mut reads = vec![partials.storage(), stack.storage()];
+        reads.extend(scale.map(|b| b.storage()));
         self.base.launch(ctx, &reads, &[out.storage()], |stream| {
             // SAFETY: lengths checked above; one PIXEL_THREADS block.
             unsafe {
@@ -214,6 +228,7 @@ impl GradKernels {
                     stream,
                     config,
                     dptr(partials),
+                    scale.map_or(std::ptr::null(), |b| dptr::<f32, f32>(b).cast_const()),
                     stack.ctl() as *const StackCtl,
                     g,
                     dptr(out),
@@ -404,20 +419,31 @@ impl GradKernels {
     /// [`GammaStacks`]: PyNX `CG_Poisson_Gamma`'s numerator and denominator (no background,
     /// its cross-term slip corrected) over each chunk of [`GAMMA_CHUNK`] pixels, a fixed-order
     /// block sum, at pair `f * nchunk + c` of `out` for chunk `c` of frame `f`; other frames'
-    /// pairs are left as they are. `out` holds the scan's [`gamma_parts`] pairs, which
+    /// pairs are left as they are. The model intensity is `obs`'s, which takes a
+    /// [`Model::scale`] only. `out` holds the scan's [`gamma_parts`] pairs, which
     /// [`Self::sum_parts`] totals into `γ`.
     pub fn gamma_frames(
         &self,
         ctx: &ExecutionContext,
         dims: &ViewDims,
         stack: StackRef<'_>,
-        counts: &DeviceBuffer<u16>,
+        obs: GammaCounts<'_>,
         x: &GammaStacks,
         out: &mut DeviceBuffer<f32>,
     ) -> Result<(), Error> {
         let g = dims.geom(stack)?;
         let n = dims.n();
+        let GammaCounts { counts, model } = obs;
         check_len("counts", counts, dims.nframe as usize * n)?;
+        if model.background.is_some() || model.shift.is_some() {
+            return Err(Error::Shape(
+                "the line search models a per-frame scale only".into(),
+            ));
+        }
+        let scale = model.scale;
+        if let Some(scale) = scale {
+            check_len("scale", scale, dims.nframe as usize)?;
+        }
         x.check(g.nf_max as usize * dims.nmode as usize * n)?;
         check_len("out", out, 2 * gamma_parts(dims)? as usize)?;
         if g.nf_max > u16::MAX as u32 {
@@ -428,13 +454,14 @@ impl GradKernels {
             block_dim: (PIXEL_THREADS, 1, 1),
             shared_mem_bytes: 0,
         };
-        let reads = [
+        let mut reads = vec![
             counts.storage(),
             x.po.storage(),
             x.a.storage(),
             x.b.storage(),
             stack.storage(),
         ];
+        reads.extend(scale.map(|b| b.storage()));
         self.base.launch(ctx, &reads, &[out.storage()], |stream| {
             // SAFETY: lengths checked above; one block of PIXEL_THREADS per chunk and frame.
             unsafe {
@@ -443,6 +470,7 @@ impl GradKernels {
                     config,
                     x.ptrs(),
                     dptr(counts),
+                    scale.map_or(std::ptr::null(), |b| dptr::<f32, f32>(b).cast_const()),
                     dptr(out),
                     stack.ctl() as *const StackCtl,
                     g,
@@ -479,5 +507,34 @@ impl GradKernels {
                     .cg_step(stream, config, dptr(x), dptr(d), dptr(h), n, dptr(gamma))
             }
         })
+    }
+
+    /// Poisson's fixed-point step of the per-frame intensity scale `s` (`[nframe]`, as
+    /// [`Model::scale`]) from the frames' far sums ([`crate::FarSums::scale`]):
+    /// `s[f] *= sums[f].ratio / sums[f].intensity` where the intensity is above 0, then divided
+    /// by its mean.
+    pub fn scale_step(
+        &self,
+        ctx: &ExecutionContext,
+        scale: &mut DeviceBuffer<f32>,
+        sums: &DeviceBuffer<ScalePartial>,
+    ) -> Result<(), Error> {
+        let nframe = scale.len();
+        check_len("sums", sums, nframe)?;
+        let n = u32::try_from(nframe)
+            .map_err(|_| Error::Shape(format!("{nframe} frames exceed u32")))?;
+        let config = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (PIXEL_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        self.base
+            .launch(ctx, &[sums.storage()], &[scale.storage()], |stream| {
+                // SAFETY: both hold `nframe` entries; one PIXEL_THREADS block.
+                unsafe {
+                    self.module
+                        .cg_scale_step(stream, config, dptr(scale), dptr(sums), n)
+                }
+            })
     }
 }

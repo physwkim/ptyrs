@@ -36,14 +36,16 @@ use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 use ptyrs_core::{AddrTable, C64, Object, Probe, Scan, Stack};
 use ptyrs_fft::Plan2d;
 use ptyrs_gpu::{
-    C32, CG_BLOCKS, Ended, Error as GpuError, FarSums, FusedInputs, Model, ObjProbeScale,
+    C32, CG_BLOCKS, Ended, Error as GpuError, FarSums, FusedBufs, FusedInputs, ObjProbeScale,
     RecordWriter, StackTable, ViewAddr, ViewDims,
 };
 
 use device::{Bufs, Device, M1Bufs, NormBufs, PassesMut};
 
 use crate::ptycho::{Algorithm, LlkRecord, zero_phase_ramp};
-use crate::{ApParams, BhParams, DmParams, EngineError, Fft2, Llk, MlParams, Observed, RpieParams};
+use crate::{
+    ApParams, BhParams, DmParams, EngineError, Features, Fft2, Llk, MlParams, Observed, RpieParams,
+};
 
 /// How [`GpuPtycho`] batches its work.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -419,6 +421,18 @@ impl GpuPtycho {
         &self.history
     }
 
+    /// The features modelled, read back from the device.
+    pub fn features(&self) -> Result<Features, EngineError> {
+        self.dev.features()
+    }
+
+    /// Models and refines `features` from here on, as [`crate::Ptycho::set_features`], in
+    /// `f32` on the device; with [`GpuOptions::fused`] only. An error leaves the current ones.
+    pub fn set_features(&mut self, features: &Features) -> Result<(), EngineError> {
+        features.check(self.dev.dims().nframe as usize)?;
+        self.dev.set_features(features)
+    }
+
     /// Cycles (AP, DM, ML) and epochs (rPIE) run so far.
     pub fn cycle(&self) -> usize {
         self.cycle
@@ -509,7 +523,7 @@ impl Bufs<'_> {
                         counts: self.counts,
                         obj: self.obj,
                         probe: self.probe,
-                        model: Model::default(),
+                        model: self.features.model(),
                     };
                     let far = FarSums {
                         llk: Some(&mut *self.llk),
@@ -521,6 +535,36 @@ impl Bufs<'_> {
             rec.push(ctx, &dims, stack, self.llk)?;
         }
         rec.end(ctx)
+    }
+
+    /// The features' step before a cycle models them: stack by stack, the far sums of the
+    /// current estimate under the current model by the fused LLK pass (with `llk`, its LLK
+    /// partials too, pushed into that record and ended after the last stack), then the step.
+    pub(super) fn step_features(
+        &mut self,
+        ctx: &ExecutionContext,
+        f: &mut FusedBufs,
+        mut llk: Option<RecordWriter<'_>>,
+    ) -> Result<Option<Ended>, GpuError> {
+        let dims = *self.views.dims();
+        for s in 0..self.stacks.len() {
+            let stack = self.table.at(s);
+            let (model, far) = self.features.far(llk.is_some().then_some(&mut *self.llk));
+            let inputs = FusedInputs {
+                views: self.views,
+                counts: self.counts,
+                obj: self.obj,
+                probe: self.probe,
+                model,
+            };
+            self.kernels.fused_llk(ctx, &inputs, stack, f, far)?;
+            if let Some(rec) = &mut llk {
+                rec.push(ctx, &dims, stack, self.llk)?;
+            }
+        }
+        let ended = llk.map(|w| w.end(ctx)).transpose()?;
+        self.features.step(ctx, self.grad)?;
+        Ok(ended)
     }
 
     /// M1 Fourier-modulus projection of stack `s`'s exit waves in place: FFT,

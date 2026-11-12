@@ -45,7 +45,9 @@ pub use fused::{
     BackgroundSums, Exit, FUSED_SIDES, FarSums, FusedBufs, FusedInputs, FusedSums, Model,
     ProbeSpectrum, Shift, ShiftSums, ShiftedProbeSums, SpectrumBuf,
 };
-pub use grad::{CG_BLOCKS, GAMMA_CHUNK, GammaStacks, GradKernels, ObjProbeScale, gamma_parts};
+pub use grad::{
+    CG_BLOCKS, GAMMA_CHUNK, GammaCounts, GammaStacks, GradKernels, ObjProbeScale, gamma_parts,
+};
 pub use ops::{
     LLK_TREE_LEAVES, LlkPartial, LlkScratch, LlkSums, MASKED, OBJ_TILE, Permutation,
     PositionPartial, ScalePartial, StackCtl, StackGeom, StackRef, StackTable, UpdateSums, ViewAddr,

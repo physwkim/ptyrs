@@ -1,4 +1,5 @@
-//! The scan features LSQML refines beside the object and probe, as CPU f64 operators over the
+//! The scan features refined beside the object and probe: [`Features`], which [`Ptycho`]'s
+//! AP, DM and ML loops model and update, and the CPU f64 operators LSQML builds on, over the
 //! arrays of [`crate::ops`] and its layout contract: each a forward map and the gradient of a
 //! [`Cost`] with respect to the feature.
 
@@ -8,7 +9,133 @@ use std::ops::Range;
 use ptyrs_core::{C64, Probe, View};
 
 use crate::ops::natural;
-use crate::{Fft2, Observed, Ptycho};
+use crate::{EngineError, Fft2, Observed, Ptycho};
+
+/// The features of a reconstruction's model intensity, each modelled and refined while set;
+/// `Default` sets none and leaves every loop's arithmetic as it is without features.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Features {
+    /// Per-frame intensity scale `s`, `[nframe]`: frame `f`'s model intensity is
+    /// `s[f]·Σ_m |psi_m|²`. Each AP, DM and ML cycle starts with Poisson's fixed-point step
+    /// `s[f] *= Σ iobs·I / max(icalc, 1e-12) / Σ I` over the frame's unmasked pixels, with
+    /// `I = Σ_m |psi_m|²` and `icalc = s[f]·I` of the estimate the cycle starts from (kept
+    /// where `Σ I` is 0), then `s /= mean(s)`: the object and probe carry the mean flux. The
+    /// cycle's LLK record is under the scale before the step, the rest of it models the
+    /// stepped scale.
+    pub scale: Option<Vec<f64>>,
+}
+
+impl Features {
+    /// Checks the features against a scan of `nframe` frames.
+    pub(crate) fn check(&self, nframe: usize) -> Result<(), EngineError> {
+        if let Some(s) = &self.scale {
+            if s.len() != nframe {
+                return Err(EngineError::Invalid(format!(
+                    "{} intensity scales for {nframe} frames",
+                    s.len()
+                )));
+            }
+            if !s.iter().all(|s| s.is_finite() && *s > 0.0) {
+                return Err(EngineError::Invalid(
+                    "intensity scales must be finite and positive".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether some feature takes a step before each cycle.
+    pub(crate) fn stepped(&self) -> bool {
+        self.scale.is_some()
+    }
+
+    /// Every feature's step before a cycle models it, from the far field `psi` of the
+    /// estimate the cycle starts from (all frames, as [`scale_sums`] takes it) under the
+    /// current model: [`scale_step`] of the scale.
+    pub(crate) fn step(&mut self, obs: &Observed, nmode: usize, psi: &[C64]) {
+        let model = Model::of(self);
+        let sums = (self.scale.as_ref()).map(|s| scale_sums(obs, 0..s.len(), nmode, psi, model));
+        if let (Some(scale), Some(sums)) = (&mut self.scale, sums) {
+            scale_step(scale, &sums);
+        }
+    }
+}
+
+/// The model intensity `icalc` of a frame's `I = Σ_m |psi_m|²` under [`Features`]:
+/// `Default` is `icalc = I`, bit for bit.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Model<'a> {
+    scale: Option<&'a [f64]>,
+}
+
+impl<'a> Model<'a> {
+    pub(crate) fn of(features: &'a Features) -> Self {
+        Self {
+            scale: features.scale.as_deref(),
+        }
+    }
+
+    /// `x` times frame `f`'s intensity scale, `x` itself without one.
+    #[inline]
+    pub(crate) fn scaled(&self, f: usize, x: f64) -> f64 {
+        match self.scale {
+            Some(s) => s[f] * x,
+            None => x,
+        }
+    }
+
+    /// `icalc` of frame `f` at a pixel of intensity `i`.
+    #[inline]
+    pub(crate) fn calc(&self, f: usize, i: f64) -> f64 {
+        self.scaled(f, i)
+    }
+}
+
+/// Per frame of `frames`, `[Σ I, Σ iobs·I / max(icalc, 1e-12)]` over its unmasked pixels of the
+/// far field `psi` (`frames.len() * nmode` planes, frame-major), `I = Σ_m |psi_m|²` and `icalc`
+/// of `model`: the sums of [`scale_step`].
+pub(crate) fn scale_sums(
+    obs: &Observed,
+    frames: Range<usize>,
+    nmode: usize,
+    psi: &[C64],
+    model: Model<'_>,
+) -> Vec<[f64; 2]> {
+    let n = obs.plane_len();
+    assert_eq!(psi.len(), frames.len() * nmode * n);
+    frames
+        .clone()
+        .zip(obs.frames(frames).chunks_exact(n))
+        .zip(psi.chunks_exact(nmode * n))
+        .map(|((f, o), block)| {
+            let mut sums = [0.0; 2];
+            for (j, iobs) in o.iter().enumerate() {
+                if let Some(iobs) = *iobs {
+                    let i: f64 = (0..nmode).map(|m| block[m * n + j].norm_sqr()).sum();
+                    sums[0] += i;
+                    sums[1] += iobs * i / model.calc(f, i).max(1e-12);
+                }
+            }
+            sums
+        })
+        .collect()
+}
+
+/// Poisson's fixed-point step of the intensity scale, `scale[f] *= ratio / intensity` for each
+/// frame's `[intensity, ratio]` of [`scale_sums`] where the intensity is above 0, then
+/// `scale /= mean(scale)`.
+pub(crate) fn scale_step(scale: &mut [f64], sums: &[[f64; 2]]) {
+    assert_eq!(scale.len(), sums.len());
+    for (s, [intensity, ratio]) in scale.iter_mut().zip(sums) {
+        if *intensity > 0.0 {
+            *s *= ratio / intensity;
+        }
+    }
+    let mean = scale.iter().sum::<f64>() / scale.len() as f64;
+    for s in scale {
+        *s /= mean;
+    }
+}
 
 /// A cost of the modelled intensity `icalc` against `iobs`, summed over unmasked pixels.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
