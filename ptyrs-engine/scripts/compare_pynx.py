@@ -1,14 +1,17 @@
-"""PyNX DM on the scan and starting point written by `cargo run --example dm_llk`.
+"""PyNX DM or AP on the scan and starting point written by `cargo run --example llk_trace`.
 
-Usage: python -I compare_pynx_dm.py <dir> [--cuda]
+Usage: python -I compare_pynx.py <dir> <dm|ap> [--cuda] [--no-cpu] [--time N]
 
-Reads <dir>/scan.cxi, init.h5, llk_rust.txt and final_rust.h5. Runs DM(calc_llk=1) for
-as many cycles as the Rust run with
+Reads <dir>/scan.cxi, init.h5, llk_rust.txt and final_rust.h5. Runs DM(calc_llk=1), or
+AP(update_probe=True, calc_llk=1), for as many cycles as the Rust run with
   - f64: PyNX cpu_operator with every complex64/float32 promoted to complex128/float64,
   - f32: the stock PyNX cpu_operator,
   - cuda (with --cuda): the PyNX CUDA operator,
 and prints per-cycle normalised LLK (Poisson, Gaussian, Euclidian, photon count) relative
 differences against Rust, and the relative L2 difference of the final object and probe.
+--no-cpu drops the two cpu_operator runs. --time N then times N cycles of the CUDA operator
+without LLK or phase-ramp removal, after 5 untimed ones, as `cargo run --example gpu_time`
+times ptyrs.
 """
 import sys
 import types
@@ -79,7 +82,9 @@ def rel_l2(a, b):
 
 
 def main():
-    d = sys.argv[1]
+    d, algo = sys.argv[1], sys.argv[2]
+    make = {"dm": lambda op: op.DM(calc_llk=1),
+            "ap": lambda op: op.AP(update_object=True, update_probe=True, calc_llk=1)}[algo]
     rust = np.loadtxt(f"{d}/llk_rust.txt", ndmin=2)
     ncycle = len(rust)
     assert (rust[:, 0] == np.arange(ncycle)).all(), "llk_rust.txt must hold every cycle"
@@ -92,16 +97,19 @@ def main():
     # before the cycle's object/probe update, so its record at cycle c + 1 is the CPU's at c.
     # Its ScaleObjProbe(absolute=False) after each LLK only trades scale between object and
     # probe, which DM is covariant under; the final arrays are compared up to a complex scale.
-    runs = [("f64", cpu_operator_f64(), True, 0), ("f32", cpu32, False, 0)]
-    if "--cuda" in sys.argv[2:]:
+    # AP records the LLK of the estimate before the update on both CPU and CUDA.
+    flags = sys.argv[3:]
+    runs = [] if "--no-cpu" in flags else [("f64", cpu_operator_f64(), True, 0),
+                                           ("f32", cpu32, False, 0)]
+    if "--cuda" in flags:
         import pynx.ptycho.cu_operator as cuop
-        runs.append(("cuda", cuop, False, 1))
+        runs.append(("cuda", cuop, False, 1 if algo == "dm" else 0))
 
     for name, op, f64, lag in runs:
         p = build(*args, f64=f64)
-        p = op.DM(calc_llk=1) ** ncycle * p
+        p = make(op) ** ncycle * p
         h = history(p, ncycle)
-        np.savetxt(f"{d}/llk_pynx_{name}.txt",
+        np.savetxt(f"{d}/llk_pynx_{algo}_{name}.txt",
                    np.column_stack([np.arange(ncycle), h]), fmt=["%d"] + ["%.17e"] * 4)
         h, ref = h[lag:], rust[:ncycle - lag]
         r = np.abs(h - ref) / np.abs(ref)
@@ -115,6 +123,22 @@ def main():
         for c in sorted({0, 1, 2, 5, 10, len(h) // 2, len(h) - 1}):
             if c < len(h):
                 print(f"  cycle {c:4d} poisson rust {ref[c, 0]:.10e} pynx {h[c, 0]:.10e}")
+
+    if "--time" in flags:
+        import time
+        import pynx.ptycho.cu_operator as cuop
+        ntime = int(flags[flags.index("--time") + 1])
+        algo_op = {"dm": lambda: cuop.DM(calc_llk=0, zero_phase_ramp=False),
+                   "ap": lambda: cuop.AP(update_object=True, update_probe=True, calc_llk=0,
+                                         zero_phase_ramp=False)}[algo]
+        p = build(*args, f64=False)
+        p = algo_op() ** 5 * p
+        cuop.default_processing_unit.finish()
+        t = time.perf_counter()
+        p = algo_op() ** ntime * p
+        cuop.default_processing_unit.finish()
+        dt = (time.perf_counter() - t) / ntime
+        print(f"--- PyNX CUDA {algo}: {1e3 * dt:.3f} ms/cycle over {ntime} cycles")
 
 
 if __name__ == "__main__":

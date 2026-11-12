@@ -51,8 +51,14 @@ impl AddrTable {
         let nmode = nprobe * nobj;
         let mut views = Vec::with_capacity(positions.len() * nmode);
         for (f, [dy, dx]) in positions.in_pixels(pixel).into_iter().enumerate() {
-            let oy = view_corner(obj[0], frame[0], dy) as u32;
-            let ox = view_corner(obj[1], frame[1], dx) as u32;
+            let corner = |axis: usize, d: f64| view_corner(obj[axis], frame[axis], d);
+            let (Some(oy), Some(ox)) = (corner(0, dy), corner(1, dx)) else {
+                return Err(CoreError::Shape(format!(
+                    "frame {f} at ({dy:.2}, {dx:.2}) object pixels leaves object {obj:?}; \
+                     size it with required_obj_shape"
+                )));
+            };
+            let (oy, ox) = (oy as u32, ox as u32);
             for m in 0..nmode {
                 views.push(View {
                     frame: f as u32,
@@ -110,17 +116,14 @@ impl AddrTable {
 }
 
 /// Corner of the illuminated window along one axis (PyNX `shape.get_view_coord`):
-/// `(obj - frame) // 2 + shift` rounded half-to-even, then clamped into the object.
-/// `shift` is the position in object pixels relative to the object centre.
-pub fn view_corner(obj: usize, frame: usize, shift: f64) -> usize {
-    let c = (((obj - frame) / 2) as f64 + shift).round_ties_even();
-    if c <= 0.0 {
-        0
-    } else if c as usize + frame >= obj {
-        obj - frame
-    } else {
-        c as usize
-    }
+/// `(obj - frame) // 2 + shift` rounded half-to-even, or `None` when the window leaves the
+/// object. `shift` is the position in object pixels relative to the object centre. PyNX
+/// clamps such a window into the object, which illuminates the wrong place; an object sized
+/// by [`required_obj_shape`] holds every window.
+pub fn view_corner(obj: usize, frame: usize, shift: f64) -> Option<usize> {
+    let span = obj.checked_sub(frame)?;
+    let c = ((span / 2) as f64 + shift).round_ties_even();
+    (0.0..=span as f64).contains(&c).then_some(c as usize)
 }
 
 /// Object shape covering the scan (PyNX `calc_obj_shape(..., margin, multiple=4)`), from
@@ -150,15 +153,46 @@ mod tests {
     use super::*;
 
     #[test]
-    fn corner_rounds_half_even_and_clamps() {
+    fn corner_rounds_half_even_and_rejects_windows_outside() {
         // (40 - 16) // 2 = 12
-        assert_eq!(view_corner(40, 16, 0.5), 12);
-        assert_eq!(view_corner(40, 16, 1.5), 14);
-        assert_eq!(view_corner(40, 16, -0.4), 12);
-        assert_eq!(view_corner(40, 16, -20.0), 0);
-        assert_eq!(view_corner(40, 16, 30.0), 24);
-        // c + frame == obj clamps to the same value
-        assert_eq!(view_corner(40, 16, 12.0), 24);
+        assert_eq!(view_corner(40, 16, 0.5), Some(12));
+        assert_eq!(view_corner(40, 16, 1.5), Some(14));
+        assert_eq!(view_corner(40, 16, -0.4), Some(12));
+        // both edges: c == 0 and c + frame == obj
+        assert_eq!(view_corner(40, 16, -12.5), Some(0));
+        assert_eq!(view_corner(40, 16, 12.0), Some(24));
+        assert_eq!(view_corner(40, 16, -12.6), None);
+        assert_eq!(view_corner(40, 16, 12.6), None);
+        assert_eq!(view_corner(40, 16, -20.0), None);
+        assert_eq!(view_corner(40, 16, 30.0), None);
+        assert_eq!(view_corner(40, 16, f64::NAN), None);
+        assert_eq!(view_corner(15, 16, 0.0), None);
+    }
+
+    #[test]
+    fn table_rejects_a_frame_outside_the_object() {
+        // (20 - 8) // 2 = 6: a shift of 6 puts the window on the last row
+        let p = Positions::new(vec![0.0, 6.0], vec![0.0, 0.0]).unwrap();
+        assert!(AddrTable::new(&p, [1.0, 1.0], [8, 8], [20, 20], 1, 1).is_ok());
+        let p = Positions::new(vec![0.0, 6.6], vec![0.0, 0.0]).unwrap();
+        assert!(matches!(
+            AddrTable::new(&p, [1.0, 1.0], [8, 8], [20, 20], 1, 1),
+            Err(CoreError::Shape(_))
+        ));
+    }
+
+    #[test]
+    fn required_shape_holds_every_view_and_its_neighbour() {
+        let p = Positions::new(vec![-3.2, 1.0, 9.49], vec![0.0, 5.1, -7.5]).unwrap();
+        for margin in [0, 1, 4, 16] {
+            let obj = required_obj_shape(&p, [1.0, 1.0], [16, 16], margin);
+            for (y, x) in p.y.iter().zip(&p.x) {
+                for (axis, d) in [(0, *y), (1, *x)] {
+                    let c = view_corner(obj[axis], 16, d).unwrap();
+                    assert!(c + 16 < obj[axis], "margin {margin} axis {axis} shift {d}");
+                }
+            }
+        }
     }
 
     #[test]

@@ -33,6 +33,8 @@ use ptyrs_kernels::kernels::LoadedModule;
 
 mod fused;
 mod ops;
+mod ring;
+mod rpie;
 
 pub use fused::{Exit, FusedBufs, FusedInputs};
 pub use ops::{
@@ -40,6 +42,8 @@ pub use ops::{
     StackTable, UpdateSums, ViewAddr, ViewDims, Views, view_tiles,
 };
 pub use ptyrs_fft::C32;
+pub use ring::{Ended, LlkRing, RecordWriter, RingDevice, RingError};
+pub use rpie::{RpieKernels, Weight};
 
 /// The linked device code: every `ptyrs-kernels` kernel plus the cuFFT functions they call.
 pub const CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ptyrs_kernels.cubin"));

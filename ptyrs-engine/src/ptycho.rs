@@ -6,7 +6,8 @@ use std::ops::Range;
 use ptyrs_core::{AddrTable, C64, Object, Probe, Scan, Stack};
 
 use crate::ops::{
-    Llk, apply_amplitude, llk, natural, obj_probe_to_psi, psi_to_obj_probe, quad_phase,
+    Llk, accumulate_obj, apply_amplitude, llk, natural, obj_probe_to_psi, poisson_grad,
+    psi_to_obj_probe, quad_phase,
 };
 use crate::{EngineError, Fft2, Observed, shift};
 
@@ -28,7 +29,7 @@ pub struct LlkRecord {
 }
 
 /// Every `calc_llk`-th cycle and the last one record an LLK; 0 never does (PyNX `calc_llk`).
-fn llk_due(calc_llk: usize, ic: usize, ncycle: usize) -> bool {
+pub(crate) fn llk_due(calc_llk: usize, ic: usize, ncycle: usize) -> bool {
     calc_llk > 0 && (ic.is_multiple_of(calc_llk) || ic + 1 == ncycle)
 }
 
@@ -213,6 +214,24 @@ impl Ptycho {
         llk(&self.obs, 0..self.addr.nframe(), self.addr.nmode(), &psi).normalised(self.obs.nb_obs())
     }
 
+    /// Gradient of the Poisson LLK sum ([`llk`], not normalised) of the current object and probe
+    /// over the object's real and imaginary parts, packed as
+    /// `∂L/∂Re O + i·∂L/∂Im O = 2·∂L/∂O*`: [`poisson_grad`] of the far field, inverse FFT, then
+    /// [`accumulate_obj`]'s numerator. PyNX `ML`'s `obj_grad` is half of it.
+    pub fn obj_grad(&self) -> Stack<C64> {
+        let mut psi = self.calc_psi();
+        self.fft.forward(&mut psi);
+        poisson_grad(
+            &self.obs,
+            0..self.addr.nframe(),
+            self.addr.nmode(),
+            &mut psi,
+        );
+        self.fft.inverse(&mut psi);
+        let views = self.addr.views();
+        accumulate_obj(views, self.object.dims(), &self.probe, &self.quad, &psi).0
+    }
+
     fn record(&mut self, algorithm: Algorithm, llk: Llk) {
         self.history.push(LlkRecord {
             cycle: self.cycle,
@@ -235,48 +254,9 @@ impl Ptycho {
         self.object.as_mut_slice().iter_mut().for_each(|c| *c *= fo);
     }
 
-    /// PyNX `ZeroPhaseRamp`: centre the probe's far field. With `(cy, cx)` the centre of mass
-    /// of `Σ_modes |fftshift(FT(fftshift(P)))|²`, `dx = cx − nx/2`, `dy = cy − ny/2`:
-    /// `P *= exp(−2πi(dx·(x − nx/2)/nx + dy·(y − ny/2)/ny))` and
-    /// `O *= exp(+2πi(dx·(x − nxo/2)/nx + dy·(y − nyo/2)/ny))` (integer halves). The two
-    /// ramps cancel in every view up to a constant phase, so the LLK is unchanged.
+    /// [`zero_phase_ramp`] of the object and probe.
     pub fn zero_phase_ramp(&mut self) {
-        let [ny, nx] = self.probe.plane_shape();
-        let n = ny * nx;
-        let mut far = vec![C64::default(); self.probe.as_slice().len()];
-        for (m, out) in far.chunks_exact_mut(n).enumerate() {
-            let p = self.probe.plane(m);
-            for (j, out) in out.iter_mut().enumerate() {
-                *out = p[shift(j, ny, nx)];
-            }
-        }
-        self.fft.forward(&mut far);
-        let (mut w, mut wy, mut wx) = (0.0, 0.0, 0.0);
-        for i in 0..n {
-            let j = shift(i, ny, nx);
-            let v: f64 = far.chunks_exact(n).map(|f| f[j].norm_sqr()).sum();
-            w += v;
-            wy += v * (i / nx) as f64;
-            wx += v * (i % nx) as f64;
-        }
-        let dy = wy / w - (ny / 2) as f64;
-        let dx = wx / w - (nx / 2) as f64;
-        let ramp = |len: usize, half: usize, scale: usize, d: f64, sign: f64| -> Vec<f64> {
-            (0..len)
-                .map(|i| sign * 2.0 * PI * d * (i as f64 - half as f64) / scale as f64)
-                .collect()
-        };
-        let (ry, rx) = (
-            ramp(ny, ny / 2, ny, dy, -1.0),
-            ramp(nx, nx / 2, nx, dx, -1.0),
-        );
-        apply_ramp(&mut self.probe, &ry, &rx);
-        let [nyo, nxo] = self.object.plane_shape();
-        let (ry, rx) = (
-            ramp(nyo, nyo / 2, ny, dy, 1.0),
-            ramp(nxo, nxo / 2, nx, dx, 1.0),
-        );
-        apply_ramp(&mut self.object, &ry, &rx);
+        zero_phase_ramp(&self.fft, &mut self.object, &mut self.probe);
     }
 
     /// PyNX `AP(...)**ncycle`: per cycle, exit waves from the current estimate, Fourier
@@ -386,9 +366,10 @@ impl Ptycho {
     ///   summed over the batch;
     /// - probe: `P_m += probe_step · mean_batch conj(O_win q) Δ_m / ((1 − α_p)|O_win|² + α_p·max|O_win|²)`.
     ///
-    /// The FFT is unitary where pty-chi's is unnormalised; the iterates agree with the probe
-    /// scaled by `sqrt(ny·nx)` apart from the `1e-7` guards. One LLK record (of the estimate
-    /// after the epoch) every `calc_llk` epochs and after the last.
+    /// pty-chi has no `q` and an unnormalised FFT: its probe `P·q / sqrt(ny·nx)` gives the same
+    /// far-field moduli, so the `1e-7` guards act alike and the iterates correspond exactly
+    /// (`scripts/compare_ptychi_rpie.py`). One LLK record (of the estimate after the epoch)
+    /// every `calc_llk` epochs and after the last.
     pub fn rpie(&mut self, params: &RpieParams, nepoch: usize) -> Result<(), EngineError> {
         if self.addr.nobj() != 1 {
             return Err(EngineError::Invalid(
@@ -505,6 +486,50 @@ impl Ptycho {
     }
 }
 
+/// PyNX `ZeroPhaseRamp`: centre the probe's far field. With `(cy, cx)` the centre of mass
+/// of `Σ_modes |fftshift(FT(fftshift(P)))|²`, `dx = cx − nx/2`, `dy = cy − ny/2`:
+/// `P *= exp(−2πi(dx·(x − nx/2)/nx + dy·(y − ny/2)/ny))` and
+/// `O *= exp(+2πi(dx·(x − nxo/2)/nx + dy·(y − nyo/2)/ny))` (integer halves). The two
+/// ramps cancel in every view up to a constant phase, so the LLK is unchanged.
+pub(crate) fn zero_phase_ramp(fft: &Fft2, object: &mut Object, probe: &mut Probe) {
+    let [ny, nx] = probe.plane_shape();
+    let n = ny * nx;
+    let mut far = vec![C64::default(); probe.as_slice().len()];
+    for (m, out) in far.chunks_exact_mut(n).enumerate() {
+        let p = probe.plane(m);
+        for (j, out) in out.iter_mut().enumerate() {
+            *out = p[shift(j, ny, nx)];
+        }
+    }
+    fft.forward(&mut far);
+    let (mut w, mut wy, mut wx) = (0.0, 0.0, 0.0);
+    for i in 0..n {
+        let j = shift(i, ny, nx);
+        let v: f64 = far.chunks_exact(n).map(|f| f[j].norm_sqr()).sum();
+        w += v;
+        wy += v * (i / nx) as f64;
+        wx += v * (i % nx) as f64;
+    }
+    let dy = wy / w - (ny / 2) as f64;
+    let dx = wx / w - (nx / 2) as f64;
+    let ramp = |len: usize, half: usize, scale: usize, d: f64, sign: f64| -> Vec<f64> {
+        (0..len)
+            .map(|i| sign * 2.0 * PI * d * (i as f64 - half as f64) / scale as f64)
+            .collect()
+    };
+    let (ry, rx) = (
+        ramp(ny, ny / 2, ny, dy, -1.0),
+        ramp(nx, nx / 2, nx, dx, -1.0),
+    );
+    apply_ramp(probe, &ry, &rx);
+    let [nyo, nxo] = object.plane_shape();
+    let (ry, rx) = (
+        ramp(nyo, nyo / 2, ny, dy, 1.0),
+        ramp(nxo, nxo / 2, nx, dx, 1.0),
+    );
+    apply_ramp(object, &ry, &rx);
+}
+
 /// `a[k, y, x] *= exp(i·(ry[y] + rx[x]))` for every mode `k`.
 fn apply_ramp(a: &mut Stack<C64>, ry: &[f64], rx: &[f64]) {
     let nx = rx.len();
@@ -512,5 +537,81 @@ fn apply_ramp(a: &mut Stack<C64>, ry: &[f64], rx: &[f64]) {
         for (i, c) in c.iter_mut().enumerate() {
             *c *= C64::from_polar(1.0, ry[i / nx] + rx[i % nx]);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ptyrs_core::{Geometry, required_obj_shape};
+
+    use super::*;
+
+    fn poisson_sum(p: &Ptycho) -> f64 {
+        let mut psi = p.calc_psi();
+        p.fft.forward(&mut psi);
+        llk(&p.obs, 0..p.addr.nframe(), p.addr.nmode(), &psi).poisson
+    }
+
+    /// [`Ptycho::obj_grad`] against central differences of the Poisson LLK sum in the real and
+    /// imaginary part of every object pixel, away from the truth, with two object and two probe
+    /// modes, masked detector pixels and pixels with zero counts.
+    #[test]
+    fn obj_grad_matches_central_differences() {
+        let g = Geometry::new(1.5e-10, 1.0, 75e-6, [16, 16]).unwrap();
+        let pixel = g.pixel_size_object();
+        let positions = ptyrs_core::sim::fermat(5, 3.0 * pixel[1]);
+        let shape = required_obj_shape(&positions.pynx_preprocess(pixel), pixel, g.frame, 0);
+        let one = ptyrs_core::sim::object(shape);
+        let second = one.as_slice().iter().map(|v| v.conj() * 0.3);
+        let truth: Vec<C64> = one.as_slice().iter().copied().chain(second).collect();
+        let truth = Object::new(Stack::from_vec([2, shape[0], shape[1]], truth).unwrap());
+        let probe = ptyrs_core::sim::probe(g.frame, 2).unwrap();
+        let mut mask = vec![false; 256];
+        mask[8 * 16 + 9] = true;
+        mask[3 * 16 + 5] = true;
+        let scan = crate::sim::simulate(g, positions, &truth, &probe, 2e3, Some(&mask), 3).unwrap();
+        let start = truth
+            .as_slice()
+            .iter()
+            .enumerate()
+            .map(|(i, v)| v * C64::from_polar(0.9, 0.4 * (0.37 * i as f64).sin()))
+            .collect();
+        let start = Object::new(Stack::from_vec(truth.dims(), start).unwrap());
+        let mut p = Ptycho::new(&scan, start, probe).unwrap();
+        p.scale_obj_probe();
+        let obs = p.obs.frames(0..p.addr.nframe());
+        assert!(obs.contains(&None) && obs.contains(&Some(0.0)));
+
+        let grad = p.obj_grad();
+        let gmax = grad.as_slice().iter().map(|v| v.norm()).fold(0.0, f64::max);
+        let len = grad.as_slice().len();
+        let rms = (p
+            .object
+            .as_slice()
+            .iter()
+            .map(|v| v.norm_sqr())
+            .sum::<f64>()
+            / len as f64)
+            .sqrt();
+        let h = 1e-6 * rms;
+        let mut err = 0.0f64;
+        for k in 0..len {
+            let o = p.object.as_slice()[k];
+            for (dir, want) in [
+                (C64::new(h, 0.0), grad.as_slice()[k].re),
+                (C64::new(0.0, h), grad.as_slice()[k].im),
+            ] {
+                p.object.as_mut_slice()[k] = o + dir;
+                let lp = poisson_sum(&p);
+                p.object.as_mut_slice()[k] = o - dir;
+                let lm = poisson_sum(&p);
+                p.object.as_mut_slice()[k] = o;
+                err = err.max(((lp - lm) / (2.0 * h) - want).abs());
+            }
+        }
+        assert!(
+            err < 1e-6 * gmax,
+            "max |fd - grad| {err:e}, max |grad| {gmax:e}"
+        );
     }
 }

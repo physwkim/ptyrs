@@ -1,8 +1,11 @@
-//! ptyrs CPU f64 reference engine: the oracle the GPU kernels are tested against (DESIGN §7 M1).
+//! ptyrs engine: the CPU f64 reference, the oracle the GPU kernels are tested against, and the
+//! GPU backend [`GpuPtycho`] checked against it (DESIGN §7 M1).
 //!
 //! The operators follow PyNX `ptycho/cpu_operator.py` (far field, no background, no
 //! multibeam, no direct-beam frames) and run in `f64` / complex `f64` in one fixed order; rPIE
-//! follows pty-chi `reconstructors/pie.py`. [`Ptycho`] chains them into AP, DM and rPIE.
+//! follows pty-chi `reconstructors/pie.py`. [`Ptycho`] chains them into AP, DM and rPIE. A
+//! [`Plan`] runs a sequence of those loops on either backend. Their linear operators are
+//! admitted as [`LinearOp`]s through [`register`]'s dot test.
 //!
 //! Contract shared by every operator (the GPU kernels implement the same one):
 //! - An exit-wave stack `psi` is `[nview, ny, nx]` with view `k` taken from the
@@ -16,17 +19,23 @@
 //!   PyNX loop order.
 
 mod fft;
+mod gpu;
+mod linop;
 mod obs;
 mod ops;
+mod plan;
 mod ptycho;
 pub mod sim;
 
 pub use fft::Fft2;
+pub use gpu::{GpuOptions, GpuPtycho};
+pub use linop::{DOT_TOL, FarField, LinearOp, ObjectToPsi, ProbeToPsi, Registered, register};
 pub use obs::{Observed, shift};
 pub use ops::{
-    Llk, accumulate_obj, accumulate_probe, apply_amplitude, llk, obj_probe_to_psi,
+    Llk, accumulate_obj, accumulate_probe, apply_amplitude, llk, obj_probe_to_psi, poisson_grad,
     psi_to_obj_probe, quad_phase,
 };
+pub use plan::{Backend, Params, Plan, Step};
 pub use ptycho::{Algorithm, ApParams, DmParams, LlkRecord, Ptycho, RpieParams};
 
 /// Errors from building or running the engine.
@@ -36,4 +45,16 @@ pub enum EngineError {
     Core(#[from] ptyrs_core::CoreError),
     #[error("invalid input: {0}")]
     Invalid(String),
+    #[error("GPU: {0}")]
+    Gpu(#[from] ptyrs_gpu::Error),
+    #[error("GPU LLK ring: {0}")]
+    Ring(#[from] ptyrs_gpu::RingError),
+    #[error("cuFFT: {0}")]
+    Fft(#[from] ptyrs_fft::FftError),
+}
+
+impl From<cuda_core::DriverError> for EngineError {
+    fn from(e: cuda_core::DriverError) -> Self {
+        Self::Gpu(e.into())
+    }
 }

@@ -130,6 +130,34 @@ pub fn llk(obs: &Observed, frames: Range<usize>, nmode: usize, psi: &[C64]) -> L
     s
 }
 
+/// PyNX `GradPoissonFourier` (no background, and without the CUDA operator's Hann filter) on
+/// detector-plane `psi`: at every unmasked pixel `psi *= 2·(1 − iobs / max(1e-12, icalc))`
+/// with `icalc = Σ_modes |psi|²`; masked pixels become 0. The result is the gradient of
+/// [`llk`]'s Poisson sum over `(Re psi, Im psi)`, packed as `∂L/∂Re + i·∂L/∂Im = 2·∂L/∂psi*`;
+/// PyNX keeps `∂L/∂psi*`, half of it.
+pub fn poisson_grad(obs: &Observed, frames: Range<usize>, nmode: usize, psi: &mut [C64]) {
+    let n = obs.plane_len();
+    assert_eq!(psi.len(), frames.len() * nmode * n);
+    for (o, block) in obs
+        .frames(frames)
+        .chunks_exact(n)
+        .zip(psi.chunks_exact_mut(nmode * n))
+    {
+        for (j, iobs) in o.iter().enumerate() {
+            let r = match *iobs {
+                Some(iobs) => {
+                    let icalc: f64 = (0..nmode).map(|m| block[m * n + j].norm_sqr()).sum();
+                    2.0 * (1.0 - iobs / icalc.max(1e-12))
+                }
+                None => 0.0,
+            };
+            for m in 0..nmode {
+                block[m * n + j] *= r;
+            }
+        }
+    }
+}
+
 /// Log-likelihood values: sums from [`llk`], or per-observation values from
 /// [`Llk::normalised`].
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -263,10 +291,7 @@ mod tests {
     use ptyrs_core::{AddrTable, Counts, MASKED, Positions};
 
     use super::*;
-
-    fn dot(a: &[C64], b: &[C64]) -> C64 {
-        a.iter().zip(b).map(|(x, y)| x * y.conj()).sum()
-    }
+    use crate::{ObjectToPsi, ProbeToPsi, register};
 
     fn wave(n: usize, seed: f64) -> Vec<C64> {
         (0..n)
@@ -299,21 +324,23 @@ mod tests {
     }
 
     #[test]
-    fn back_projections_are_adjoints_of_obj_probe_to_psi() {
+    fn back_projections_register_as_adjoints_of_obj_probe_to_psi() {
         let (addr, o, p, q) = setup();
         let views = addr.views();
-        let psi_r = wave(views.len() * 48, 4.4);
-        let mut a = vec![C64::default(); psi_r.len()];
-        obj_probe_to_psi(views, &o, &p, &q, &mut a);
-        let lhs = dot(&a, &psi_r);
-        // object-linear: <A_P O, r> = <O, A_P* r>
-        let (num, _) = accumulate_obj(views, o.dims(), &p, &q, &psi_r);
-        let rhs = dot(o.as_slice(), num.as_slice());
-        assert!((lhs - rhs).norm() < 1e-12 * lhs.norm(), "{lhs} vs {rhs}");
-        // probe-linear: <A_O P, r> = <P, A_O* r>
-        let (num, _) = accumulate_probe(views, &o, p.dims(), &q, &psi_r);
-        let rhs = dot(p.as_slice(), num.as_slice());
-        assert!((lhs - rhs).norm() < 1e-12 * lhs.norm(), "{lhs} vs {rhs}");
+        register(ObjectToPsi {
+            views,
+            obj_dims: o.dims(),
+            probe: &p,
+            quad: &q,
+        })
+        .unwrap();
+        register(ProbeToPsi {
+            views,
+            object: &o,
+            probe_dims: p.dims(),
+            quad: &q,
+        })
+        .unwrap();
     }
 
     #[test]

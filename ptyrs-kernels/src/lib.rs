@@ -15,6 +15,8 @@ use cuda_host::cuda_module;
 
 pub mod fused;
 pub mod pixel;
+pub mod ring;
+pub mod rpie;
 
 /// Complex elements per thread of every in-kernel FFT (cuFFT device API, BY_COMPONENT).
 pub const FFT_EPT: u32 = 16;
