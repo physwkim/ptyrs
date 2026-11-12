@@ -393,6 +393,70 @@ pub mod kernels {
         }
     }
 
+    /// Appends the stack's views to the tile slabs: view `k` of the stack goes, in ascending
+    /// `k`, after the run of every tile [`axis_tiles`] puts it in. A view whose tile's slab
+    /// is full is not written and adds 1 to `*overflow`; a run's length is written only if
+    /// the stack has a view of the tile. One warp per tile `ty * ntx + tx`, a 1D launch of
+    /// `ntiles * WARP` threads.
+    ///
+    /// # Safety
+    ///
+    /// `views` holds `nframe * nmode` records, each inside the object; `slabs` as
+    /// [`TileSlabs`] says for `ntiles` tiles, with `len[t] <= start[t + 1] - start[t]`;
+    /// `overflow` one `u32`; `ctl` a readable entry.
+    #[kernel]
+    pub unsafe fn bin_views(
+        views: *const ViewAddr,
+        slabs: TileSlabs,
+        overflow: *mut u32,
+        ctl: *const StackCtl,
+        g: StackGeom,
+    ) {
+        use cuda_device::atomic::{AtomicOrdering, DeviceAtomicU32};
+        use cuda_device::warp;
+        let ntx = g.nxo.div_ceil(OBJ_TILE);
+        let t = global_index() / WARP as usize;
+        // Whole warps leave together, so every lane left reaches each ballot.
+        if t >= g.nyo.div_ceil(OBJ_TILE) as usize * ntx as usize {
+            return;
+        }
+        let (ty, tx) = ((t / ntx as usize) as u32, (t % ntx as usize) as u32);
+        let lane = warp::lane_id();
+        unsafe {
+            let (f0, nf) = stack_frames(ctl, g);
+            let (k0, nk) = (f0 * g.nmode, nf * g.nmode);
+            let lo = *slabs.start.add(t);
+            let cap = *slabs.start.add(t + 1) - lo;
+            let len0 = *slabs.len.add(t);
+            let mut added = 0u32;
+            let mut base = 0u32;
+            while base < nk {
+                let kl = base + lane;
+                let hit = kl < nk && {
+                    let v = *views.add((k0 + kl) as usize);
+                    let (y0, y1) = axis_tiles(v.oy, g.ny, v.fy);
+                    let (x0, x1) = axis_tiles(v.ox, g.nx, v.fx);
+                    y0 <= ty && ty <= y1 && x0 <= tx && tx <= x1
+                };
+                let hits = warp::ballot(hit);
+                let slot = len0 + added + (hits & warp::lanemask_lt()).count_ones();
+                if hit && slot < cap {
+                    *slabs.views.add((lo + slot) as usize) = k0 + kl;
+                }
+                added += hits.count_ones();
+                base += WARP;
+            }
+            if lane == 0 && added > 0 {
+                let want = len0 + added;
+                *slabs.len.add(t) = want.min(cap);
+                if want > cap {
+                    DeviceAtomicU32::from_ptr(overflow)
+                        .fetch_add(want - cap, AtomicOrdering::Relaxed);
+                }
+            }
+        }
+    }
+
     /// Adds the stack's object-update sums to `sums` `[nobj, nyo, nxo]`: the exact
     /// transpose of [`obj_probe_to_psi`] applied to `psi`, `num += sum_v B_v^T (conj(P_v q)
     /// psi_v)`, and `den += sum_v B_v^T |P_v|^2` with `B_v` the bilinear sampling of view

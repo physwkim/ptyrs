@@ -50,7 +50,9 @@ use cuda_async::device_operation::ExecutionContext;
 use cuda_core::sys::CUdeviceptr;
 use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig, RawDeviceBuffer};
 pub use ptyrs_kernels::pixel::{LlkPartial, MASKED, OBJ_TILE, StackCtl, ViewAddr};
-use ptyrs_kernels::pixel::{PIXEL_THREADS, StackGeom, SumPtrs, TilePtrs};
+use ptyrs_kernels::pixel::{
+    PIXEL_THREADS, StackGeom, SumPtrs, TilePtrs, TileSlabs, WARP, axis_tiles,
+};
 
 use crate::{C32, Error, Kernels, check_len, dptr};
 
@@ -314,8 +316,9 @@ impl Views {
         })
     }
 
-    /// Views over device storage the caller keeps filling, e.g. with a slab of `tile_cap`
-    /// slots per tile (`tile_start[t] = t * tile_cap`) and `tile_len` zeroed. Checks `dims`
+    /// Views over device storage the caller keeps filling, e.g. through
+    /// [`Kernels::bin_views`] into a slab of `tile_cap` slots per tile (`tile_start[t] = t *
+    /// tile_cap`) with `tile_len` starting zeroed. Checks `dims`
     /// and that `addr` holds `nframe * nmode` records, `tile_start` `ntiles + 1` and
     /// `tile_len` `ntiles` entries.
     ///
@@ -389,19 +392,14 @@ impl Views {
     }
 }
 
-/// Object tiles (of `OBJ_TILE` pixels per side) a view's samples read along one axis:
-/// offsets `o .. o + len`, plus the bilinear `+ 1` neighbour of the last when `f > 0`.
-fn axis_tiles(o: u32, len: u32, f: f32) -> std::ops::RangeInclusive<u32> {
-    o / OBJ_TILE..=(o + len - (f == 0.0) as u32) / OBJ_TILE
-}
-
 /// The object tiles `[ty, tx]` holding the object pixels that the samples of view `v` read,
 /// ascending (ty-major); for a view [`ViewDims::check_view`] accepts, all inside the object.
-/// [`Views::new`] lists view `v` in exactly these tiles' runs.
+/// [`Views::new`] and [`Kernels::bin_views`] list view `v` in exactly these tiles' runs.
 pub fn view_tiles(dims: &ViewDims, v: &ViewAddr) -> impl Iterator<Item = [u32; 2]> + use<> {
     let [ny, nx] = dims.frame;
-    let xs = axis_tiles(v.ox, nx, v.fx);
-    axis_tiles(v.oy, ny, v.fy).flat_map(move |ty| xs.clone().map(move |tx| [ty, tx]))
+    let (x0, x1) = axis_tiles(v.ox, nx, v.fx);
+    let (y0, y1) = axis_tiles(v.oy, ny, v.fy);
+    (y0..=y1).flat_map(move |ty| (x0..=x1).map(move |tx| [ty, tx]))
 }
 
 /// Host form of the [`Views`] tile lists.
@@ -607,6 +605,55 @@ impl Kernels {
                     dptr(psi),
                     dptr(counts),
                     dptr(out),
+                    stack.ctl(),
+                    g,
+                )
+            }
+        })
+    }
+
+    /// Appends the stack's views to the tile lists: each view of frames `f0 .. f0 + nf` goes
+    /// after the run of every tile [`view_tiles`] lists it in, in ascending view order, so
+    /// runs stay ascending while stacks are binned once each in ascending frame order (the
+    /// order [`Views::from_parts`] requires of them). A view whose tile's slab
+    /// `tile_start[t] .. tile_start[t + 1]` is full is not written and adds 1 to
+    /// `overflow[0]`. A stack with `nf == 0` writes nothing.
+    pub fn bin_views(
+        &self,
+        ctx: &ExecutionContext,
+        views: &mut Views,
+        stack: StackRef<'_>,
+        overflow: &mut DeviceBuffer<u32>,
+    ) -> Result<(), Error> {
+        let d = &views.dims;
+        let g = d.geom(stack)?;
+        check_len("overflow", overflow, 1)?;
+        let config = grid_1d(d.ntiles() * WARP as usize)?;
+        let reads = [
+            views.addr.storage(),
+            views.tile_start.storage(),
+            stack.storage(),
+        ];
+        let writes = [
+            views.tile_len.storage(),
+            views.tile_views.storage(),
+            overflow.storage(),
+        ];
+        let slabs = TileSlabs {
+            start: dptr(&views.tile_start),
+            len: dptr(&views.tile_len),
+            views: dptr(&views.tile_views),
+        };
+        self.launch(ctx, &reads, &writes, |stream| {
+            // SAFETY: `Views::new` or the `from_parts` contract keeps the views inside the
+            // object and each run within its slab; `overflow` holds one u32.
+            unsafe {
+                self.module.bin_views(
+                    stream,
+                    config,
+                    dptr(&views.addr),
+                    slabs,
+                    dptr(overflow),
                     stack.ctl(),
                     g,
                 )

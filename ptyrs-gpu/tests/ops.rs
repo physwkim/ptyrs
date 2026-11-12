@@ -1203,6 +1203,112 @@ fn empty_stack_replay_writes_nothing() {
     }
 }
 
+/// One graph of `bin_views`, replayed over a device entry holding the stacks in ascending
+/// frame order, leaves in each tile slab the packed run of `Views::new` cut to the slab's
+/// capacity, with the cut views counted in `overflow` and the slots past the run untouched;
+/// a replay with `nf == 0` changes nothing.
+#[test]
+fn bin_views_appends_each_stack_to_the_tile_slabs() {
+    let (stream, _, k) = setup();
+    // 12 frames of 4 views: the 9-frame stack has 36, more than one warp ballot.
+    let base = scan();
+    let d = ViewDims {
+        nframe: 12,
+        ..base.d
+    };
+    let offsets: Vec<_> = (0..12)
+        .map(|f| {
+            let (oy, ox, fy, fx): (u32, u32, f32, f32) = [
+                (0, 0, 0.0, 0.0),
+                (25, 28, 0.25, 0.0),
+                (13, 7, 0.0, 0.7),
+                (26, 27, 0.0, 0.9),
+                (5, 20, 0.5, 0.5),
+            ][f % 5];
+            let back = (f / 5) as u32;
+            (
+                oy.saturating_sub(3 * back),
+                ox.saturating_sub(4 * back),
+                fy,
+                fx,
+            )
+        })
+        .collect();
+    let s = Scan::new(d, &offsets, 1.0);
+    let packed = Views::new(&stream, d, &s.views).unwrap();
+    let pstart = packed.tile_start().to_host_vec(&stream).unwrap();
+    let plen = packed.tile_len().to_host_vec(&stream).unwrap();
+    let plist = packed.tile_views().to_host_vec(&stream).unwrap();
+    let ntiles = plen.len();
+    let full = *plen.iter().max().unwrap();
+    let dev = StackTable::device(&stream, &d, 9).unwrap();
+    let side = k.context().new_stream().unwrap();
+    for cap in [full, full - 1] {
+        let slot_start: Vec<u32> = (0..=ntiles as u32).map(|t| t * cap).collect();
+        let unset = vec![u32::MAX; ntiles * cap as usize];
+        // SAFETY: empty runs; `bin_views` fills them in ascending frame order.
+        let mut views = unsafe {
+            Views::from_parts(
+                d,
+                up(&stream, &s.views),
+                up(&stream, &slot_start),
+                up(&stream, &unset),
+                up(&stream, &vec![0u32; ntiles]),
+            )
+        }
+        .unwrap();
+        let mut overflow = up(&stream, &[0u32]);
+        let graph = CudaGraph::capture(
+            side.clone(),
+            record(|ctx| k.bin_views(ctx, &mut views, dev.at(0), &mut overflow)),
+        )
+        .unwrap();
+        let state = |views: &Views, overflow: &DeviceBuffer<u32>| {
+            (
+                views.tile_len().to_host_vec(&stream).unwrap(),
+                views.tile_views().to_host_vec(&stream).unwrap(),
+                overflow.to_host_vec(&stream).unwrap()[0],
+            )
+        };
+        let mut before = state(&views, &overflow);
+        let mut kend = 0;
+        // (12, 3) clamps to no frames.
+        for (f0, nf) in [(0, 0), (0, 2), (5, 0), (2, 9), (11, 0), (11, 1), (12, 3)] {
+            let ctl = [StackCtl { f0, nf }];
+            k.context().bind_to_thread().unwrap();
+            // SAFETY: `dev` holds one entry; no work on it is in flight.
+            unsafe { cuda_core::memory::memcpy_htod_sync(dev.ptr(), ctl.as_ptr(), 8) }.unwrap();
+            graph.launch().sync_on(&side).unwrap();
+            let got = state(&views, &overflow);
+            let what = format!("cap {cap}, entry {{ f0: {f0}, nf: {nf} }}");
+            if nf == 0 || f0 >= d.nframe {
+                assert!(got == before, "{what} changed the slabs");
+                continue;
+            }
+            kend = (f0 + nf) * d.nmode;
+            let (len, list, cut) = &got;
+            let mut want_cut = 0;
+            for t in 0..ntiles {
+                let run = &plist[pstart[t] as usize..][..plen[t] as usize];
+                let want: Vec<u32> = run.iter().copied().filter(|&v| v < kend).collect();
+                let kept = want.len().min(cap as usize);
+                want_cut += want.len() - kept;
+                let slab = &list[t * cap as usize..][..cap as usize];
+                assert_eq!(len[t] as usize, kept, "{what}: tile {t} length");
+                assert_eq!(&slab[..kept], &want[..kept], "{what}: tile {t} run");
+                assert!(
+                    slab[kept..].iter().all(|&v| v == u32::MAX),
+                    "{what}: tile {t} wrote past its run"
+                );
+            }
+            assert_eq!(*cut as usize, want_cut, "{what}: overflow");
+            before = got;
+        }
+        assert_eq!(kend, d.nframe * d.nmode, "every frame binned");
+        assert_eq!(before.2 > 0, cap < full, "cap {cap}: overflow");
+    }
+}
+
 /// Side of the square image the line FFTs and the `Plan2d` of [`Iteration`] round-trip.
 const AUX: u32 = 128;
 

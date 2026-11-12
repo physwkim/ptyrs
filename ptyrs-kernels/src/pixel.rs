@@ -90,6 +90,11 @@ pub struct SumPtrs {
 // An object tile is one block of the object kernels and of the reductions.
 const _: () = assert!(OBJ_TILE * OBJ_TILE == PIXEL_THREADS);
 
+/// Threads of a warp; `bin_views` runs one warp per object tile.
+pub const WARP: u32 = 32;
+// A 1D launch's warps lie whole in its blocks.
+const _: () = assert!(PIXEL_THREADS.is_multiple_of(WARP));
+
 /// Device addresses of the per-object-tile view lists: tile `t`'s run is
 /// `views[start[t] .. start[t] + len[t]]`, ascending view indices, `len[t] <=
 /// start[t + 1] - start[t]`. No kernel reads or writes the object or sum pixels of a tile
@@ -111,6 +116,25 @@ pub struct TilePtrs {
 pub unsafe fn tile_run(tiles: TilePtrs, t: usize) -> (u32, u32) {
     let lo = unsafe { *tiles.start.add(t) };
     (lo, lo + unsafe { *tiles.len.add(t) })
+}
+
+/// [`TilePtrs`] with the runs writable, for `bin_views` to append to: tile `t`'s slab is
+/// `views[start[t] .. start[t + 1]]`, its run the first `len[t]` slots.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct TileSlabs {
+    pub start: *const u32,
+    pub len: *mut u32,
+    pub views: *mut u32,
+}
+
+/// First and last object tile, of `OBJ_TILE` pixels, holding an object pixel that a view's
+/// samples read along one axis: offsets `o .. o + len`, and the bilinear `+ 1` neighbour of
+/// the last when `f > 0`. The host tile lists and `bin_views` both bin by this rule.
+#[device]
+pub fn axis_tiles(o: u32, len: u32, f: f32) -> (u32, u32) {
+    let last = if f > 0.0 { o + len } else { o + len - 1 };
+    (o / OBJ_TILE, last / OBJ_TILE)
 }
 
 /// Per-frame log-likelihood sums over the frame's unmasked pixels (PyNX `LLKAll`).
