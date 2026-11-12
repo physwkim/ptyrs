@@ -13,8 +13,9 @@ use ptyrs::fft::{FftError, Plan2d};
 use ptyrs::gpu::{
     BackgroundSums, C32, Error, Exit, FUSED_SIDES, FarSums, FusedBufs, FusedInputs, FusedSums,
     Kernels, Lines, LlkPartial, LlkScratch, LlkSums, MASKED, Model, OBJ_TILE, Permutation,
-    PositionPartial, ProbeSpectrum, ScalePartial, Shift, ShiftSums, ShiftedProbeSums, SpectrumBuf,
-    StackCtl, StackRef, StackTable, UpdateSums, ViewAddr, ViewDims, Views, record, view_tiles,
+    PositionPartial, ProbeSpectrum, PsiSums, ScalePartial, Shift, ShiftSums, ShiftedProbeSums,
+    SpectrumBuf, StackCtl, StackRef, StackTable, UpdateSums, ViewAddr, ViewDims, Views, record,
+    view_tiles,
 };
 
 type Z = (f64, f64);
@@ -4061,6 +4062,25 @@ impl ShiftOut {
         }
     }
 
+    /// The bits of the object's update sums and of the probe's, turned into update sums by
+    /// `run`.
+    fn update_bits(
+        &mut self,
+        stream: &CudaStream,
+        s: &Scan,
+        run: impl FnOnce(&mut ShiftedProbeSums, &mut UpdateSums),
+    ) -> [Vec<u32>; 2] {
+        let probe = self.probe_sums(stream, s, run);
+        [&self.obj, &probe].map(|u| {
+            let mut out: Vec<u32> = c32_bits(&u.num.to_host_vec(stream).unwrap())
+                .into_iter()
+                .flat_map(|(re, im)| [re, im])
+                .collect();
+            out.extend(f32_bits(&u.den.to_host_vec(stream).unwrap()));
+            out
+        })
+    }
+
     /// The bits of every sum, the probe's turned into update sums by `run`.
     fn bits(
         &mut self,
@@ -4068,16 +4088,7 @@ impl ShiftOut {
         s: &Scan,
         run: impl FnOnce(&mut ShiftedProbeSums, &mut UpdateSums),
     ) -> Vec<u32> {
-        let probe = self.probe_sums(stream, s, run);
-        let mut out = vec![];
-        for u in [&self.obj, &probe] {
-            out.extend(
-                c32_bits(&u.num.to_host_vec(stream).unwrap())
-                    .into_iter()
-                    .flat_map(|(re, im)| [re, im]),
-            );
-            out.extend(f32_bits(&u.den.to_host_vec(stream).unwrap()));
-        }
+        let mut out = self.update_bits(stream, s, run).concat();
         for p in [&self.pos, &self.den] {
             let p = p.to_host_vec(stream).unwrap();
             out.extend(p.iter().flat_map(|p| [p.dy, p.dx].map(f32::to_bits)));
@@ -4282,6 +4293,105 @@ fn fused_shift_results_do_not_depend_on_the_stack_split() {
         for (i, what) in ["AP", "grad", "DM"].iter().enumerate() {
             assert!(r.0[i] == w.0[i], "{split:?}: {what} waves differ");
             assert!(r.2[i] == w.2[i], "{split:?}: {what} sums differ");
+        }
+    }
+}
+
+/// `shifted_psi_sums` of the waves DM leaves: the object and shifted probe sums
+/// `fused_project`'s DM adds, to rounding (another build: FMA contraction and the 512-point
+/// row transform round differently), and the same bits with either sum alone or both and
+/// whatever stacks the frames are split into, on [`FUSED_CASES`].
+#[test]
+fn shifted_psi_sums_match_fused_project() {
+    let (stream, ex, k) = setup();
+    let lens: [&[u32]; 3] = [&[5], &[2, 3], &[1; 5]];
+    // `num` and `den` of update-sum bits.
+    let parts = |v: &[u32]| {
+        let v: Vec<f32> = v.iter().map(|&b| f32::from_bits(b)).collect();
+        let num = v.len() / 3 * 2;
+        [v[..num].to_vec(), v[num..].to_vec()]
+    };
+    let rel = |got: &[f32], want: &[f32]| {
+        rel_l2_re(got, &want.iter().map(|&w| w as f64).collect::<Vec<_>>())
+    };
+    for (frame, modes) in FUSED_CASES {
+        let fs = FusedScan::new(&stream, frame, modes);
+        let (s, n, nm) = (&fs.s, fs.s.n(), fs.s.d.nmode as usize);
+        let offsets = up(&stream, SHIFTS.as_flattened());
+        let mut spec = SpectrumBuf::zeroed(&stream, &s.d).unwrap();
+        let spectrum = k.probe_spectrum(&ex, &s.d, &fs.probe, &mut spec).unwrap();
+        let inputs = shifted_inputs(&fs, &offsets, spectrum);
+        let mut bufs = FusedBufs::with_shift(&stream, &s.d, 5).unwrap();
+        let start_psi = noise(5 * nm * n, 80, 1.0);
+        let mut first: Option<[Vec<u32>; 2]> = None;
+        for lens in lens {
+            let split: Vec<_> = lens
+                .iter()
+                .scan(0, |f0, &nf| {
+                    *f0 += nf;
+                    Some(*f0 - nf..*f0)
+                })
+                .collect();
+            let table = StackTable::new(&stream, &s.d, &split).unwrap();
+            let [mut dm, mut both, mut obj, mut probe] =
+                [(); 4].map(|_| ShiftOut::zeroed(&stream, s));
+            for (i, frames) in split.iter().enumerate() {
+                let stack = table.at(i);
+                let at = frames.start as usize * nm * n;
+                let mut psi = up_padded(&stream, &start_psi[at..], start_psi.len());
+                let exit = Exit::Dm {
+                    psi: &mut psi,
+                    alpha: 0.02,
+                };
+                k.fused_project(&ex, &inputs, stack, exit, &mut bufs, dm.sums(false))
+                    .unwrap();
+                for (out, o, p) in [
+                    (&mut both, true, true),
+                    (&mut obj, true, false),
+                    (&mut probe, false, true),
+                ] {
+                    let sums = PsiSums {
+                        obj: o.then_some(&mut out.obj),
+                        probe: p.then_some(&mut out.probe),
+                    };
+                    k.shifted_psi_sums(&ex, &inputs, stack, &psi, &mut bufs, sums)
+                        .unwrap();
+                }
+            }
+            let bits = |o: &mut ShiftOut| {
+                o.update_bits(&stream, s, |sums, out| {
+                    k.shifted_probe_sums(&ex, &s.d, sums, out).unwrap()
+                })
+            };
+            let want = bits(&mut dm);
+            let [both, obj, probe] = [&mut both, &mut obj, &mut probe].map(bits);
+            for (who, i) in [("object", 0), ("probe", 1)] {
+                let [num, den] = parts(&both[i]);
+                let [wnum, wden] = parts(&want[i]);
+                let (en, ed) = (rel(&num, &wnum), rel(&den, &wden));
+                println!(
+                    "{frame:?} {lens:?} {who} sums vs DM's: num rel L2 {en:.2e}, den {ed:.2e}"
+                );
+                assert!(
+                    en < 1e-6 && ed < 1e-6,
+                    "{frame:?} {lens:?} {who}: {en:.2e}, {ed:.2e}"
+                );
+            }
+            assert!(
+                obj[0] == both[0],
+                "{frame:?} {lens:?}: object sums alone differ"
+            );
+            assert!(
+                probe[1] == both[1],
+                "{frame:?} {lens:?}: probe sums alone differ"
+            );
+            let first = first.get_or_insert(both.clone());
+            for (who, i) in [("object", 0), ("probe", 1)] {
+                assert!(
+                    both[i] == first[i],
+                    "{frame:?} {lens:?}: {who} sums depend on the split"
+                );
+            }
         }
     }
 }
@@ -4557,4 +4667,45 @@ fn fused_shift_combinations_are_checked() {
         "shifted_probe_sums, short out",
         k.shifted_probe_sums(&ex, &d, &mut out.probe, &mut short_out),
     );
+
+    let len = 3 * d.nmode as usize * s.n();
+    let psi = DeviceBuffer::<C32>::zeroed(&stream, len).unwrap();
+    let short_psi = DeviceBuffer::<C32>::zeroed(&stream, len - 1).unwrap();
+    let mut short_obj = UpdateSums::zeroed(&stream, s.obj.len() - 1).unwrap();
+    for (what, inputs, psi, unshifted_bufs) in [
+        ("without a Model::shift", &plain_inputs, &psi, false),
+        ("short psi", &inputs, &short_psi, false),
+        ("bufs without the shift's scratch", &inputs, &psi, true),
+    ] {
+        let bufs = if unshifted_bufs {
+            &mut plain
+        } else {
+            &mut bufs
+        };
+        let sums = PsiSums {
+            obj: Some(&mut out.obj),
+            probe: Some(&mut out.probe),
+        };
+        let r = k.shifted_psi_sums(&ex, inputs, stack, psi, bufs, sums);
+        refused(&format!("shifted_psi_sums, {what}"), r);
+    }
+    for (what, sums) in [
+        (
+            "short object sums",
+            PsiSums {
+                obj: Some(&mut short_obj),
+                probe: None,
+            },
+        ),
+        (
+            "probe sums of one probe",
+            PsiSums {
+                obj: None,
+                probe: Some(&mut short_sums),
+            },
+        ),
+    ] {
+        let r = k.shifted_psi_sums(&ex, &inputs, stack, &psi, &mut bufs, sums);
+        refused(&format!("shifted_psi_sums, {what}"), r);
+    }
 }

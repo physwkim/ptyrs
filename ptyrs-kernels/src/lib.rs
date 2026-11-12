@@ -1466,6 +1466,62 @@ pub mod kernels {
     ) {
         unsafe { crate::fused::shift_rows_inv::<512>(p, ctl, g, cfg) }
     }
+    /// [`crate::fused::shift_sums`] for 64-point rows.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::shift_sums`].
+    #[kernel]
+    pub unsafe fn fused_shift_sums_64(
+        p: FusedPtrs,
+        ctl: *const StackCtl,
+        g: StackGeom,
+        cfg: FusedCfg,
+    ) {
+        unsafe { crate::fused::shift_sums::<64>(p, ctl, g, cfg) }
+    }
+    /// [`crate::fused::shift_sums`] for 128-point rows.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::shift_sums`].
+    #[kernel]
+    pub unsafe fn fused_shift_sums_128(
+        p: FusedPtrs,
+        ctl: *const StackCtl,
+        g: StackGeom,
+        cfg: FusedCfg,
+    ) {
+        unsafe { crate::fused::shift_sums::<128>(p, ctl, g, cfg) }
+    }
+    /// [`crate::fused::shift_sums`] for 256-point rows.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::shift_sums`].
+    #[kernel]
+    pub unsafe fn fused_shift_sums_256(
+        p: FusedPtrs,
+        ctl: *const StackCtl,
+        g: StackGeom,
+        cfg: FusedCfg,
+    ) {
+        unsafe { crate::fused::shift_sums::<256>(p, ctl, g, cfg) }
+    }
+    /// [`crate::fused::shift_sums`] for 512-point rows.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::shift_sums`].
+    #[kernel]
+    pub unsafe fn fused_shift_sums_512(
+        p: FusedPtrs,
+        ctl: *const StackCtl,
+        g: StackGeom,
+        cfg: FusedCfg,
+    ) {
+        unsafe { crate::fused::shift_sums::<512>(p, ctl, g, cfg) }
+    }
     /// [`crate::fused::shift_post`] for 64-point columns.
     ///
     /// # Safety

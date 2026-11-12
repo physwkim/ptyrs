@@ -17,7 +17,7 @@
 //! carries across stacks until [`Kernels::shifted_probe_sums`] turns them into probe sums.
 
 use cuda_async::device_operation::ExecutionContext;
-use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig};
+use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig, RawDeviceBuffer};
 use ptyrs_kernels::fft_ept;
 use ptyrs_kernels::fused::{
     FFT_SKEW, FUSED_BACKGROUND, FUSED_BACKGROUND_SUMS, FUSED_COLS, FUSED_DM, FUSED_GRAD, FUSED_LLK,
@@ -504,6 +504,16 @@ pub struct FusedSums<'a> {
     pub shift: ShiftSums<'a>,
 }
 
+/// The update sums [`Kernels::shifted_psi_sums`] adds to; `Default` adds to neither.
+#[derive(Default)]
+pub struct PsiSums<'a> {
+    /// `[nobj, nyo, nxo]`, as [`FusedSums::obj`] under a [`Model::shift`]: `num += sum_p
+    /// conj(W_p) x` and `den += sum_p |W_p|^2`, spread to the object.
+    pub obj: Option<&'a mut UpdateSums>,
+    /// As [`ShiftSums::probe`], against [`FusedInputs::obj`].
+    pub probe: Option<&'a mut ShiftedProbeSums>,
+}
+
 /// Which iteration [`Kernels::fused_project`] runs and where its new exit waves go. `psi`
 /// is a DM stack's exit waves, `[nf_max * nmode, ny, nx]` in the M1 layout.
 pub enum Exit<'a> {
@@ -672,6 +682,56 @@ impl Kernels {
                     run.gather(bufs, waves, p, cfg, sums)?;
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// The update sums of a stack's exit waves `psi` (`[nf_max * nmode, ny, nx]`, as
+    /// [`Exit::Dm`] leaves them) under the [`Model::shift`] of `inputs`, with no projection:
+    /// what [`Self::fused_project`] adds to [`FusedSums::obj`] and [`ShiftSums::probe`] from
+    /// the waves it leaves, in its order, so that the split into stacks does not change a
+    /// bit. Another kernel build: the sums match `fused_project`'s to rounding, not bit for
+    /// bit. Up to five launches; writes nothing but `sums` and `bufs`.
+    pub fn shifted_psi_sums(
+        &self,
+        ctx: &ExecutionContext,
+        inputs: &FusedInputs<'_>,
+        stack: StackRef<'_>,
+        psi: &DeviceBuffer<C32>,
+        bufs: &mut FusedBufs,
+        sums: PsiSums<'_>,
+    ) -> Result<(), Error> {
+        let bufs = &*bufs;
+        let run = Run::new(self, ctx, *inputs, stack, bufs)?;
+        let Some(sh) = &run.shift else {
+            return Err(Error::Shape("shifted_psi_sums needs a Model::shift".into()));
+        };
+        let d = inputs.views.dims();
+        check_len("psi", psi, run.g.nf_max as usize * d.nmode as usize * d.n())?;
+        let PsiSums { obj, probe } = sums;
+        if let Some(sums) = &obj {
+            sums.check(d.obj_len())?;
+        }
+        if let Some(sums) = &probe {
+            sums.check(d)?;
+        }
+        let p = FusedPtrs {
+            psi: dptr(psi),
+            ..run.ptrs(bufs, &FarSums::default())
+        };
+        let flag = |on: bool, flag: u32| if on { flag } else { 0 };
+        let cfg = FusedCfg {
+            flags: flag(obj.is_some(), FUSED_SHIFT_OBJ) | flag(probe.is_some(), FUSED_SHIFT_PROBE),
+            alpha: 0.0,
+        };
+        run.shift_pre(sh, p, 0)?;
+        run.shift_sums(sh, psi, p, cfg)?;
+        if let Some(sums) = probe {
+            run.shift_post(sh, p)?;
+            run.shift_probe_sums(sh, p, sums)?;
+        }
+        if let Some(sums) = obj {
+            run.gather_shifted(sh, p, cfg, sums)?;
         }
         Ok(())
     }
@@ -1368,12 +1428,7 @@ impl<'a> Run<'a> {
             ..self.sh.rows(&self.g, false)?
         };
         let f = cfg.flags;
-        let mut reads = vec![
-            self.inputs.views.addr().storage(),
-            self.stack.storage(),
-            self.inputs.obj.storage(),
-        ];
-        let mut writes = vec![];
+        let (mut reads, mut writes) = self.shift_terms(sh, f);
         match psi {
             Some(psi) if f & FUSED_TO_PSI != 0 => {
                 reads.push(bufs.work.storage());
@@ -1382,13 +1437,6 @@ impl<'a> Run<'a> {
             _ => writes.push(bufs.work.storage()),
         }
         let s = sh.scratch;
-        reads.push(s.t.storage());
-        if f & FUSED_SHIFT_PROBE != 0 {
-            writes.push(s.adj.storage());
-        }
-        if f & FUSED_SHIFT_OBJ != 0 {
-            writes.extend([s.obj.storage(), s.power.storage()]);
-        }
         if f & (FUSED_SHIFT_DEN | FUSED_SHIFT_POSITION) != 0 {
             reads.push(s.t_dy.storage());
         }
@@ -1421,6 +1469,58 @@ impl<'a> Run<'a> {
                         .k
                         .module
                         .fused_shift_rows_inv_512(stream, config, p, ctl, g, cfg),
+                }
+            }
+        })
+    }
+
+    /// What a pass C of the shift reads and writes for its object and probe terms under
+    /// `flags`: the views, the object and `T`, and the terms' scratch.
+    fn shift_terms<'s>(
+        &'s self,
+        sh: &'s Shifted<'_>,
+        flags: u32,
+    ) -> (Vec<&'s RawDeviceBuffer>, Vec<&'s RawDeviceBuffer>) {
+        let s = sh.scratch;
+        let reads = vec![
+            self.inputs.views.addr().storage(),
+            self.stack.storage(),
+            self.inputs.obj.storage(),
+            s.t.storage(),
+        ];
+        let mut writes = vec![];
+        if flags & FUSED_SHIFT_PROBE != 0 {
+            writes.push(s.adj.storage());
+        }
+        if flags & FUSED_SHIFT_OBJ != 0 {
+            writes.extend([s.obj.storage(), s.power.storage()]);
+        }
+        (reads, writes)
+    }
+
+    /// The object and probe terms `cfg` names of the waves `psi` holds, with the shifted
+    /// probe.
+    fn shift_sums(
+        &self,
+        sh: &Shifted<'_>,
+        psi: &DeviceBuffer<C32>,
+        p: FusedPtrs,
+        cfg: FusedCfg,
+    ) -> Result<(), Error> {
+        let config = self.sh.rows(&self.g, false)?;
+        let (mut reads, writes) = self.shift_terms(sh, cfg.flags);
+        reads.push(psi.storage());
+        let (ctl, g) = (self.ctl(), self.g);
+        self.k.launch(self.ctx, &reads, &writes, |stream| {
+            let m = &self.k.module;
+            // SAFETY: as in `shift_rows_inv`, with `psi` checked to hold the stack's waves;
+            // the launch is the one `shift_sums` documents.
+            unsafe {
+                match self.sh.nx {
+                    Side::N64 => m.fused_shift_sums_64(stream, config, p, ctl, g, cfg),
+                    Side::N128 => m.fused_shift_sums_128(stream, config, p, ctl, g, cfg),
+                    Side::N256 => m.fused_shift_sums_256(stream, config, p, ctl, g, cfg),
+                    Side::N512 => m.fused_shift_sums_512(stream, config, p, ctl, g, cfg),
                 }
             }
         })
