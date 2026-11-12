@@ -7,16 +7,55 @@
 //! [`GradKernels::beta_parts`] of every array into its own `CG_BLOCKS` pairs of one parts
 //! buffer, then [`GradKernels::sum_parts`] of them all gives the Polak–Ribière pair; it is
 //! `(sum |g|^2, 0)` on the first cycle, so `β = 0`. [`GradKernels::direction`] per array,
-//! then the line-search pair `γ`, then [`GradKernels::step`] per array. The coefficients
-//! never leave the device, so a cycle is one host-sync-free sequence.
+//! then the line-search pair `γ`: per stack [`GradKernels::gamma_fields`], a forward FFT of
+//! each of its three stacks and [`GradKernels::gamma_frames`], then
+//! [`GradKernels::sum_parts`] of the `nframe` frame pairs. Then [`GradKernels::step`] per
+//! array. The coefficients never leave the device, so a cycle is one host-sync-free sequence.
 
 use cuda_async::device_operation::ExecutionContext;
-use cuda_core::{DeviceBuffer, LaunchConfig};
+use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig};
 pub use ptyrs_kernels::grad::CG_BLOCKS;
-use ptyrs_kernels::grad::grad_kernels;
+use ptyrs_kernels::grad::{GammaPtrs, ObjProbePtrs, grad_kernels};
 use ptyrs_kernels::pixel::{PIXEL_THREADS, SumPtrs};
 
-use crate::{C32, Error, Kernels, UpdateSums, check_len, dptr};
+use crate::ops::grid_1d;
+use crate::{
+    C32, Error, Kernels, StackCtl, StackRef, UpdateSums, ViewDims, Views, check_len, dptr,
+};
+
+/// The line-search exit-wave stacks of [`GradKernels::gamma_fields`], each of `nf_max *
+/// nmode` planes like a stack's `psi`: `po = O P`, `a = dO P + O dP`, `b = dO dP` (times the
+/// far-field phase).
+pub struct GammaStacks {
+    pub po: DeviceBuffer<C32>,
+    pub a: DeviceBuffer<C32>,
+    pub b: DeviceBuffer<C32>,
+}
+
+impl GammaStacks {
+    /// Three zeroed stacks of `len` values.
+    pub fn zeroed(stream: &CudaStream, len: usize) -> Result<Self, Error> {
+        Ok(Self {
+            po: DeviceBuffer::zeroed(stream, len)?,
+            a: DeviceBuffer::zeroed(stream, len)?,
+            b: DeviceBuffer::zeroed(stream, len)?,
+        })
+    }
+
+    fn check(&self, len: usize) -> Result<(), Error> {
+        check_len("po", &self.po, len)?;
+        check_len("a", &self.a, len)?;
+        check_len("b", &self.b, len)
+    }
+
+    fn ptrs(&self) -> GammaPtrs {
+        GammaPtrs {
+            po: dptr(&self.po),
+            a: dptr(&self.a),
+            b: dptr(&self.b),
+        }
+    }
+}
 
 /// The CG kernels, bound to the module a [`Kernels`] loaded.
 #[derive(Clone, Debug)]
@@ -118,6 +157,107 @@ impl GradKernels {
             unsafe {
                 self.module
                     .cg_direction(stream, config, dptr(d), g, n, dptr(beta))
+            }
+        })
+    }
+
+    /// The stack's line-search exit waves along `d = [dO, dP]` from `x = [O, P]` into `out`,
+    /// as [`Kernels::obj_probe_to_psi`] lays out and computes `psi`: `po` is its `psi` of
+    /// `(O, P)` bit for bit, `b` of `(dO, dP)`, and `a = (dO P + O dP) q`.
+    pub fn gamma_fields(
+        &self,
+        ctx: &ExecutionContext,
+        views: &Views,
+        stack: StackRef<'_>,
+        x: [&DeviceBuffer<C32>; 2],
+        d: [&DeviceBuffer<C32>; 2],
+        out: &mut GammaStacks,
+    ) -> Result<(), Error> {
+        let dims = views.dims();
+        let g = dims.geom(stack)?;
+        let (n, nk_max) = (dims.n(), g.nf_max as usize * dims.nmode as usize);
+        let [obj, probe] = x;
+        let [d_obj, d_probe] = d;
+        check_len("obj", obj, dims.obj_len())?;
+        check_len("d_obj", d_obj, dims.obj_len())?;
+        check_len("probe", probe, dims.nprobe as usize * n)?;
+        check_len("d_probe", d_probe, dims.nprobe as usize * n)?;
+        out.check(nk_max * n)?;
+        let config = grid_1d(nk_max * n)?;
+        let reads = [
+            views.addr().storage(),
+            obj.storage(),
+            d_obj.storage(),
+            probe.storage(),
+            d_probe.storage(),
+            stack.storage(),
+        ];
+        let writes = [out.po.storage(), out.a.storage(), out.b.storage()];
+        self.base.launch(ctx, &reads, &writes, |stream| {
+            // SAFETY: lengths checked above; `Views::new` checked every view lies inside the
+            // object with valid mode indices.
+            unsafe {
+                let pair = |obj, probe| ObjProbePtrs {
+                    obj: dptr(obj),
+                    probe: dptr(probe),
+                };
+                self.module.cg_gamma_fields(
+                    stream,
+                    config,
+                    pair(obj, probe),
+                    pair(d_obj, d_probe),
+                    dptr(views.addr()),
+                    out.ptrs(),
+                    stack.ctl() as *const StackCtl,
+                    g,
+                )
+            }
+        })
+    }
+
+    /// Per-frame line-search pairs of the stack from its forward-FFT'd (unnormalized)
+    /// [`GammaStacks`]: `out[2 f .. 2 f + 2]` for each frame `f` of the stack gets PyNX
+    /// `CG_Poisson_Gamma`'s numerator and denominator (no background, its cross-term slip
+    /// corrected), each a fixed-order block sum; other frames' pairs are left as they are.
+    /// `out` holds `2 * nframe` floats, which [`Self::sum_parts`] totals into `γ`.
+    pub fn gamma_frames(
+        &self,
+        ctx: &ExecutionContext,
+        dims: &ViewDims,
+        stack: StackRef<'_>,
+        counts: &DeviceBuffer<u16>,
+        x: &GammaStacks,
+        out: &mut DeviceBuffer<f32>,
+    ) -> Result<(), Error> {
+        let g = dims.geom(stack)?;
+        let n = dims.n();
+        check_len("counts", counts, dims.nframe as usize * n)?;
+        x.check(g.nf_max as usize * dims.nmode as usize * n)?;
+        check_len("out", out, 2 * dims.nframe as usize)?;
+        let config = LaunchConfig {
+            grid_dim: (g.nf_max, 1, 1),
+            block_dim: (PIXEL_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let reads = [
+            counts.storage(),
+            x.po.storage(),
+            x.a.storage(),
+            x.b.storage(),
+            stack.storage(),
+        ];
+        self.base.launch(ctx, &reads, &[out.storage()], |stream| {
+            // SAFETY: lengths checked above; one block of PIXEL_THREADS per frame.
+            unsafe {
+                self.module.cg_gamma_frames(
+                    stream,
+                    config,
+                    x.ptrs(),
+                    dptr(counts),
+                    dptr(out),
+                    stack.ctl() as *const StackCtl,
+                    g,
+                )
             }
         })
     }

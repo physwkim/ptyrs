@@ -1,7 +1,8 @@
 //! Poisson ML conjugate-gradient kernels (PyNX `ML`): the Polak–Ribière `β`, the search
-//! direction and the step, on arrays of complex values (object or probe). A CG coefficient
-//! lives on the device as a pair `(num, den)` of floats whose quotient it is; partial pairs
-//! are reduced in a fixed order, so coefficients and iterates are bitwise reproducible.
+//! direction, the line-search step `γ` and the step, on arrays of complex values (object or
+//! probe). A CG coefficient lives on the device as a pair `(num, den)` of floats whose
+//! quotient it is; partial pairs are reduced in a fixed order, so coefficients and iterates
+//! are bitwise reproducible.
 
 use cuda_device::{device, thread};
 use cuda_host::cuda_module;
@@ -11,8 +12,27 @@ use crate::pixel::PIXEL_THREADS;
 /// Blocks of every `cg_beta_parts` launch, and so the partial pairs each launch writes.
 pub const CG_BLOCKS: u32 = 1024;
 
+/// The three exit-wave stacks of the line search, each `[nf_max * nmode, ny, nx]` in
+/// `obj_probe_to_psi`'s layout: `po` along nothing, `a` linear and `b` quadratic in the step.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct GammaPtrs {
+    pub po: *mut f32,
+    pub a: *mut f32,
+    pub b: *mut f32,
+}
+
+/// An object `[nobj, nyo, nxo]` and a probe `[nprobe, ny, nx]`, or a direction for both.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ObjProbePtrs {
+    pub obj: *const f32,
+    pub probe: *const f32,
+}
+
 #[cuda_module]
 pub mod grad_kernels {
+    use super::{GammaPtrs, ObjProbePtrs};
     use crate::pixel::*;
     use crate::*;
     use cuda_device::SharedArray;
@@ -87,6 +107,105 @@ pub mod grad_kernels {
             store_c(g.num, i, (0.0, 0.0));
             *g.den.add(i) = 0.0;
         }
+    }
+
+    /// The line-search exit waves of `x = (O, P)` along `d = (dO, dP)`, in
+    /// `obj_probe_to_psi`'s layout and order of operations: for view `v = views[f0 * nmode +
+    /// kl]`, `q = exp(i quad r^2)`, `po = O_v P_v q`, `a = (dO_v P_v + O_v dP_v) q`, `b = dO_v
+    /// dP_v q` at plane `kl`. One thread per element of `[nf_max * nmode, ny, nx]`.
+    ///
+    /// # Safety
+    ///
+    /// `x`, `d` as [`ObjProbePtrs`] says, `views` `nframe * nmode` records in range for
+    /// those shapes, each of `out` `[nf_max * nmode, ny, nx]`, `ctl` one entry.
+    #[kernel]
+    pub unsafe fn cg_gamma_fields(
+        x: ObjProbePtrs,
+        d: ObjProbePtrs,
+        views: *const ViewAddr,
+        out: GammaPtrs,
+        ctl: *const StackCtl,
+        g: StackGeom,
+    ) {
+        let (f0, nf) = unsafe { stack_frames(ctl, g) };
+        let n = g.ny as usize * g.nx as usize;
+        let t = global_index();
+        if t >= nf as usize * g.nmode as usize * n {
+            return;
+        }
+        let (kl, i) = (t / n, t % n);
+        let (py, px) = ((i / g.nx as usize) as u32, (i % g.nx as usize) as u32);
+        unsafe {
+            let v = *views.add(f0 as usize * g.nmode as usize + kl);
+            let o = sample_obj(x.obj, v, py, px, g.nyo, g.nxo);
+            let d_o = sample_obj(d.obj, v, py, px, g.nyo, g.nxo);
+            let at = v.probe as usize * n + i;
+            let (p, d_p) = (load_c(x.probe, at), load_c(d.probe, at));
+            let q = quad_phase(g.quad, py, px, g.ny, g.nx);
+            let (a0, a1) = (cmul(d_o, p), cmul(o, d_p));
+            let j = kl * n + psi_index(py, px, g.ny, g.nx);
+            store_c(out.po, j, cmul(cmul(o, p), q));
+            store_c(out.a, j, cmul((a0.0 + a1.0, a0.1 + a1.1), q));
+            store_c(out.b, j, cmul(cmul(d_o, d_p), q));
+        }
+    }
+
+    /// PyNX `CG_Poisson_Gamma` (no background) per frame, on the forward-FFT'd (unnormalized)
+    /// line-search stacks: over the unmasked pixels of frame `f0 + fl`, with `calc =
+    /// max(sum_m |po|^2 / n, 1e-12)`, `r = sum_m Re(conj(po) a) / n`, `s = sum_m (|a|^2 +
+    /// 2 Re(conj(po) b)) / n` and `f = 1 - obs / calc`, `out[2 (f0 + fl)] = sum -2 r f` and
+    /// `out[2 (f0 + fl) + 1] = sum 2 s f + obs (2 r / calc)^2`, the numerator and denominator
+    /// of `γ = -L'(0) / L''(0)` (ptyrs-engine `cg_poisson_gamma`, which has the cross term
+    /// right where PyNX's has not). One `PIXEL_THREADS` block per frame; pairs of frames
+    /// outside the stack are not written.
+    ///
+    /// # Safety
+    ///
+    /// Each of `x` `[nf_max * nmode, ny, nx]`, `counts` `[nframe, ny, nx]`, `out` `2 *
+    /// nframe` floats, `ctl` one entry; grid `(nf_max, 1, 1)`, block `(PIXEL_THREADS, 1, 1)`.
+    #[kernel]
+    pub unsafe fn cg_gamma_frames(
+        x: GammaPtrs,
+        counts: *const u16,
+        out: *mut f32,
+        ctl: *const StackCtl,
+        g: StackGeom,
+    ) {
+        static mut RED: SharedArray<f32, 512> = SharedArray::UNINIT;
+        let (f0, nf) = unsafe { stack_frames(ctl, g) };
+        let (ny, nx, nmode) = (g.ny, g.nx, g.nmode as usize);
+        let n = ny as usize * nx as usize;
+        let fl = thread::blockIdx_x() as usize;
+        // The whole block leaves together, before its first barrier.
+        if fl >= nf as usize {
+            return;
+        }
+        let inv_n = 1.0 / n as f32;
+        let mut acc = [0.0f32; 2];
+        let mut d = thread::threadIdx_x() as usize;
+        while d < n {
+            let obs = unsafe { *counts.add((f0 as usize + fl) * n + d) };
+            if obs != MASKED {
+                let at = psi_index((d / nx as usize) as u32, (d % nx as usize) as u32, ny, nx);
+                let (mut calc, mut r, mut s) = (0.0f32, 0.0f32, 0.0f32);
+                for m in 0..nmode {
+                    let j = (fl * nmode + m) * n + at;
+                    let (p, a, b) = unsafe { (load_c(x.po, j), load_c(x.a, j), load_c(x.b, j)) };
+                    calc += p.0 * p.0 + p.1 * p.1;
+                    r += cmul_conj(p, a).0;
+                    s += a.0 * a.0 + a.1 * a.1 + 2.0 * cmul_conj(p, b).0;
+                }
+                let calc = (calc * inv_n).max(1e-12);
+                let (r, s, obs) = (r * inv_n, s * inv_n, obs as f32);
+                let f = 1.0 - obs / calc;
+                let rc = 2.0 * r / calc;
+                acc[0] -= 2.0 * r * f;
+                acc[1] += 2.0 * s * f + obs * rc * rc;
+            }
+            d += PIXEL_THREADS as usize;
+        }
+        let o = unsafe { out.add(2 * (f0 as usize + fl)) };
+        unsafe { super::block_pair((&raw mut RED).cast::<f32>(), acc, o) }
     }
 
     /// PyNX `cu_linear_comb_fcfc_gamma`: with `gamma = gamma_pair[0] / gamma_pair[1]`,
