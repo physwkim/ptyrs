@@ -5,10 +5,11 @@
 //! planes: [`rows_fwd`] builds each view's exit wave row by row and row-FFTs it, [`cols`]
 //! column-FFTs every mode of a frame's column group together, takes the LLK partials and
 //! the modulus projection, and inverse column-FFTs, and [`rows_inv`] inverse row-FFTs,
-//! applies the DM update, stores the new exit waves and writes per-frame object
-//! contributions. Object sums are written only by [`gather`], which owns its object pixel
-//! and adds the stack's frames in ascending order. Index conventions are those of
-//! [`crate::pixel`].
+//! applies the DM update and stores the new exit waves. Object sums are written only by
+//! [`gather`], which owns its object pixel, adds the stack's frames in ascending order and
+//! reads the stored exit waves themselves: a per-frame contribution plane written by
+//! [`rows_inv`] would push the object windows the probe sums read out of L2. Index
+//! conventions are those of [`crate::pixel`].
 //!
 //! Every pass assumes canonical views: view `f * nmode + m` multiplies probe mode
 //! `m % nprobe` and object mode `m / nprobe` (`nmode == nprobe * nobj`), and all views of a
@@ -20,7 +21,7 @@ use cuda_device::{async_copy, device, shared::DynamicSharedArray, thread};
 use crate::FFT_EPT;
 use crate::pixel::{
     LlkPartial, MASKED, StackCtl, StackGeom, SumPtrs, TilePtrs, ViewAddr, cmul, cmul_conj, load_c,
-    obj_pixel_sources, quad_phase, sample_obj, stack_frames, store_c, tile_stack_run,
+    obj_pixel_sources, psi_index, quad_phase, sample_obj, stack_frames, store_c,
 };
 
 /// [`rows_fwd`] builds the DM reflection `R = (2 - alpha) PO - (1 - alpha) psi` instead of
@@ -32,8 +33,6 @@ pub const FUSED_TO_PSI: u32 = 2;
 pub const FUSED_LLK: u32 = 4;
 /// [`cols`] applies the modulus projection and the inverse column FFT.
 pub const FUSED_PROJECT: u32 = 8;
-/// [`rows_inv`] writes the per-frame object contributions.
-pub const FUSED_CONTRIB: u32 = 16;
 /// [`cols`] applies the Poisson LLK gradient scale and the inverse column FFT; never with
 /// `FUSED_PROJECT`.
 pub const FUSED_GRAD: u32 = 32;
@@ -76,9 +75,8 @@ pub struct FusedPtrs {
     pub psi: *mut f32,
     /// The stack's transforms, `[nf_max * nmode, ny, nx]`.
     pub work: *mut f32,
-    /// Per-frame object contributions `sum_p conj(P_p q) psi_(o, p)`, `[nf_max * nobj, ny,
-    /// nx]`, natural order.
-    pub contrib: *mut f32,
+    /// `P_p q`, `[nprobe, ny, nx]`, natural order.
+    pub probe_q: *mut f32,
     /// `sum_p |P_p|^2`, `[ny, nx]`.
     pub probe_power: *mut f32,
     /// LLK partials of each frame's column groups, `[nf_max, nx / FUSED_COLS]`.
@@ -356,15 +354,24 @@ pub unsafe fn cols<const NY: u32>(p: FusedPtrs, ctl: *const StackCtl, g: StackGe
     }
 }
 
+/// Where [`rows_inv`] stores the new exit waves and [`gather`] reads them: `psi` under
+/// `FUSED_TO_PSI`, else `work`.
+#[device]
+fn new_waves(p: FusedPtrs, cfg: FusedCfg) -> *mut f32 {
+    if cfg.flags & FUSED_TO_PSI != 0 {
+        p.psi
+    } else {
+        p.work
+    }
+}
+
 /// Pass C: for frame `fl = blockIdx.y` of the stack and stored row `ys`, the inverse row FFT
-/// of every mode `m = o * nprobe + pm` in ascending order gives the projected exit wave
-/// `proj`. The new exit wave is `proj`, or under `FUSED_DM` `proj + (1 - a) (PO - R)` with
-/// `R = (2 - a) PO - (1 - a) psi` (the arithmetic of `kernels::dm_reflect` then
-/// `kernels::add_c32`); it is stored back to `work`, or under `FUSED_TO_PSI` to `psi`.
-/// Under `FUSED_CONTRIB`, `contrib[fl * nobj + o] = sum_pm conj(P_pm q) psi_new` in
-/// ascending `pm`. Reads `work`, `probe`, `views`, and under `FUSED_DM` `obj` and `psi`;
-/// writes `work` or `psi`, and `contrib`. Grid `(ny / rows, nf_max)`, block `(nx / FFT_EPT,
-/// rows)`, dynamic shared memory `rows` row FFTs.
+/// of every mode `m` gives the projected exit wave `proj`. The new exit wave is `proj`, or
+/// under `FUSED_DM` `proj + (1 - a) (PO - R)` with `R = (2 - a) PO - (1 - a) psi` (the
+/// arithmetic of `kernels::dm_reflect` then `kernels::add_c32`); it goes to
+/// [`new_waves`]. Reads `work`, `views`, and under `FUSED_DM` `obj`, `probe` and `psi`;
+/// writes `work` or `psi`. Grid `(ny / rows, nf_max)`, block `(nx / FFT_EPT, rows)`, dynamic
+/// shared memory `rows` row FFTs.
 ///
 /// # Safety
 ///
@@ -389,121 +396,104 @@ pub unsafe fn rows_inv<const NX: u32>(
     let tpf = nx / FFT_EPT;
     let y = (ys + ny / 2) % ny;
     let dm = cfg.flags & FUSED_DM != 0;
-    let contrib = cfg.flags & FUSED_CONTRIB != 0;
-    let out = if cfg.flags & FUSED_TO_PSI != 0 {
-        p.psi
-    } else {
-        p.work
-    };
+    let out = new_waves(p, cfg);
     let (a, b) = (2.0 - cfg.alpha, 1.0 - cfg.alpha);
-    let nobj = g.nmode / g.nprobe;
     let k0 = (f0 + fl) * g.nmode;
     let mut r = [0.0f32; 2 * FFT_EPT as usize];
     unsafe {
-        for o in 0..nobj {
-            let mut acc = [0.0f32; 2 * FFT_EPT as usize];
-            for pm in 0..g.nprobe {
-                let m = o * g.nprobe + pm;
-                let row = (fl * g.nmode + m) as usize * n + (ys * nx) as usize;
-                #[unroll]
-                for i in 0..FFT_EPT {
-                    let v = load_c(p.work, row + (t + i * tpf) as usize);
-                    r[2 * i as usize] = v.0;
-                    r[2 * i as usize + 1] = v.1;
-                }
-                row_fft::<NX, true>(&mut r);
-                let v = *p.views.add((k0 + m) as usize);
-                #[unroll]
-                for i in 0..FFT_EPT {
-                    let k = 2 * i as usize;
-                    let xs = t + i * tpf;
+        for m in 0..g.nmode {
+            let row = (fl * g.nmode + m) as usize * n + (ys * nx) as usize;
+            #[unroll]
+            for i in 0..FFT_EPT {
+                let v = load_c(p.work, row + (t + i * tpf) as usize);
+                r[2 * i as usize] = v.0;
+                r[2 * i as usize + 1] = v.1;
+            }
+            row_fft::<NX, true>(&mut r);
+            let v = *p.views.add((k0 + m) as usize);
+            #[unroll]
+            for i in 0..FFT_EPT {
+                let k = 2 * i as usize;
+                let xs = t + i * tpf;
+                let mut s = (r[k], r[k + 1]);
+                let at = row + xs as usize;
+                if dm {
                     let x = (xs + nx / 2) % nx;
                     let pr = load_c(p.probe, v.probe as usize * n + (y * nx + x) as usize);
                     let q = quad_phase(g.quad, y, x, ny, nx);
-                    let mut s = (r[k], r[k + 1]);
-                    let at = row + xs as usize;
-                    if dm {
-                        let po = cmul(cmul(sample_obj(p.obj, v, y, x, g.nyo, g.nxo), pr), q);
-                        let old = load_c(p.psi, at);
-                        let refl = (a * po.0 - b * old.0, a * po.1 - b * old.1);
-                        let d = (b * (po.0 - refl.0), b * (po.1 - refl.1));
-                        s = (s.0 + d.0, s.1 + d.1);
-                    }
-                    store_c(out, at, s);
-                    if contrib {
-                        let u = cmul_conj(cmul(pr, q), s);
-                        acc[k] += u.0;
-                        acc[k + 1] += u.1;
-                    }
+                    let po = cmul(cmul(sample_obj(p.obj, v, y, x, g.nyo, g.nxo), pr), q);
+                    let old = load_c(p.psi, at);
+                    let refl = (a * po.0 - b * old.0, a * po.1 - b * old.1);
+                    let d = (b * (po.0 - refl.0), b * (po.1 - refl.1));
+                    s = (s.0 + d.0, s.1 + d.1);
                 }
-            }
-            if contrib {
-                let plane = (fl * nobj + o) as usize * n + (y * nx) as usize;
-                #[unroll]
-                for i in 0..FFT_EPT {
-                    let k = 2 * i as usize;
-                    let x = (t + i * tpf + nx / 2) % nx;
-                    store_c(p.contrib, plane + x as usize, (acc[k], acc[k + 1]));
-                }
+                store_c(out, at, s);
             }
         }
     }
 }
 
-/// `pp[i] = sum_p |probe[p, i]|^2` in ascending `p`, one thread per pixel of `n`.
+/// The probe terms of [`gather`], one thread per natural pixel `(y, x)` of the frame:
+/// `probe_power = sum_p |P_p|^2` in ascending `p`, and `probe_q[p] = P_p q`. Reads `probe`;
+/// writes `probe_q` and `probe_power`.
 ///
 /// # Safety
 ///
-/// `probe` holds `[nprobe, n]` complex values, `pp` `n` floats.
+/// `probe`, `probe_q` and `probe_power` hold their shapes for `g`.
 #[device]
-pub unsafe fn probe_power(probe: *const f32, pp: *mut f32, nprobe: u32, n: u32) {
+pub unsafe fn probe_terms(p: FusedPtrs, g: StackGeom) {
+    let (ny, nx) = (g.ny, g.nx);
+    let n = ny as usize * nx as usize;
     let i = crate::global_index();
-    if i >= n as usize {
+    if i >= n {
         return;
     }
+    let (y, x) = ((i / nx as usize) as u32, (i % nx as usize) as u32);
+    let q = quad_phase(g.quad, y, x, ny, nx);
     let mut s = 0.0f32;
-    for pm in 0..nprobe as usize {
-        let v = unsafe { load_c(probe, pm * n as usize + i) };
+    for pm in 0..g.nprobe as usize {
+        let v = unsafe { load_c(p.probe, pm * n + i) };
         s += v.0 * v.0 + v.1 * v.1;
+        unsafe { store_c(p.probe_q, pm * n + i, cmul(v, q)) };
     }
-    unsafe { *pp.add(i) = s };
+    unsafe { *p.probe_power.add(i) = s };
 }
 
-/// Adds the stack's object-update sums from pass C's contributions: `num += sum_f B_f^T
-/// contrib[fl, o]` and `den += sum_f B_f^T probe_power` over the stack's frames in
+/// Adds the stack's object-update sums from the exit waves pass C left in [`new_waves`]:
+/// `num += sum_f B_f^T c_(f, o)` with `c_(f, o) = sum_pm conj(probe_q[pm]) psi_(f, o, pm)`
+/// in ascending `pm`, and `den += sum_f B_f^T probe_power`, over the stack's frames in
 /// ascending order, `B_f` the bilinear sampling of frame `f` (read from its view of mode
 /// `o * nprobe`). Each object pixel is owned by one thread, which reads and writes its sums
 /// only if its tile's run holds a view of the stack, as `kernels::psi_to_obj`; so the
-/// result does not depend on how frames are split into stacks. Reads `contrib`,
-/// `probe_power`, `views`; writes `sums`. Grid `(ntx, nty, nobj)` of `OBJ_TILE` tiles, block
-/// `(OBJ_TILE, OBJ_TILE, 1)`.
+/// result does not depend on how frames are split into stacks. Reads the new waves,
+/// `probe_q`, `probe_power`, `views`; writes `sums`. A stack-tile launch, as
+/// `kernels::psi_to_obj`.
 ///
 /// # Safety
 ///
-/// As `kernels::psi_to_obj`, with `contrib` `[nf_max * nobj, ny, nx]` and `probe_power`
-/// `[ny, nx]` in place of `psi` and `probe`.
+/// As `kernels::psi_to_obj`, with the new waves in place of `psi`, and `probe_q` and
+/// `probe_power` as [`probe_terms`] wrote them for this probe in place of `probe`; `shared`
+/// as `for_each_stack_tile` needs.
 #[device]
 pub unsafe fn gather(
     p: FusedPtrs,
     tiles: TilePtrs,
     sums: SumPtrs,
+    shared: *mut u32,
     ctl: *const StackCtl,
     g: StackGeom,
+    cfg: FusedCfg,
 ) {
-    let (tile, y, x) = crate::tile_and_pixel();
-    if x >= g.nxo || y >= g.nyo {
-        return;
-    }
     let iobj = thread::blockIdx_z();
-    let nobj = g.nmode / g.nprobe;
     let n = g.ny as usize * g.nx as usize;
-    let px = (iobj as usize * g.nyo as usize + y as usize) * g.nxo as usize + x as usize;
-    unsafe {
-        let (f0, nf) = stack_frames(ctl, g);
-        let (k0, k1) = (f0 * g.nmode, (f0 + nf) * g.nmode);
-        let Some((lo, end)) = tile_stack_run(tiles, tile, k0, k1) else {
+    let waves = new_waves(p, cfg);
+    let (f0, nf) = unsafe { stack_frames(ctl, g) };
+    let (k0, k1) = (f0 * g.nmode, (f0 + nf) * g.nmode);
+    let pixel = |lo: u32, end: u32, y: u32, x: u32| unsafe {
+        if x >= g.nxo || y >= g.nyo {
             return;
-        };
+        }
+        let px = (iobj as usize * g.nyo as usize + y as usize) * g.nxo as usize + x as usize;
         let mut acc = load_c(sums.num, px);
         let mut norm = *sums.den.add(px);
         for j in lo..end {
@@ -515,15 +505,25 @@ pub unsafe fn gather(
             if v.obj != iobj || v.probe != 0 {
                 continue;
             }
-            let plane = ((k / g.nmode - f0) * nobj + iobj) as usize * n;
+            // Mode `o * nprobe + pm` of the frame is view `k + pm`, plane `k - k0 + pm`.
+            let plane = (k - k0) as usize * n;
             obj_pixel_sources(v, y, x, g.ny, g.nx, |pry, prx, w| {
                 let at = (pry * g.nx + prx) as usize;
-                let c = load_c(p.contrib, plane + at);
+                let ps = psi_index(pry, prx, g.ny, g.nx);
+                let mut c = (0.0f32, 0.0f32);
+                for pm in 0..g.nprobe as usize {
+                    let u = cmul_conj(
+                        load_c(p.probe_q, pm * n + at),
+                        load_c(waves, plane + pm * n + ps),
+                    );
+                    c = (c.0 + u.0, c.1 + u.1);
+                }
                 acc = (acc.0 + w * c.0, acc.1 + w * c.1);
                 norm += w * *p.probe_power.add(at);
             });
         }
         store_c(sums.num, px, acc);
         *sums.den.add(px) = norm;
-    }
+    };
+    unsafe { crate::for_each_stack_tile(p.views, tiles, shared, ctl, g, pixel) }
 }

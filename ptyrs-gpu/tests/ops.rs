@@ -429,6 +429,69 @@ fn update_sums_match_f64_and_ignore_stack_split() {
     check_sums("probe", &stream, &whole, &parts, (&num, &den));
 }
 
+/// A tile's owner block looks for an earlier frame of the stack covering it with a block's
+/// worth of threads at a time: frames `256..NF` share a tile no frame before 256 touches,
+/// so only the second stride finds their earlier frames. More blocks would wrongly own that
+/// tile than the GPU holds at once, so late ones would add to sums already written.
+#[test]
+fn psi_to_obj_owns_each_tile_once_past_a_block_of_frames() {
+    const NF: u32 = 2000;
+    let (stream, ex, k) = setup();
+    let d = ViewDims {
+        nframe: NF,
+        nmode: 1,
+        nprobe: 1,
+        nobj: 1,
+        frame: [2, 2],
+        obj: [64, 64],
+        quad_phase: 0.003,
+    };
+    let offsets: Vec<_> = (0..NF)
+        .map(|f| {
+            let at = if f < 256 { 0 } else { 32 };
+            (at + f % 7, at + f / 7 % 7, 0.0, 0.0)
+        })
+        .collect();
+    let s = Scan::new(d, &offsets, 1.0);
+    let views = Views::new(&stream, s.d, &s.views).unwrap();
+    let probe = up(&stream, &s.probe);
+    let psi_host = noise(s.nk(&(0..NF)) * s.n(), 3, 1.0);
+    let st = (
+        noise(s.obj.len(), 10, 1.0),
+        noise(s.obj.len(), 11, 1.0)
+            .iter()
+            .map(|c| c.re.abs())
+            .collect::<Vec<_>>(),
+    );
+    let (mut whole, mut parts) = (sums(&stream, &st), sums(&stream, &st));
+    k.psi_to_obj(
+        &ex,
+        &views,
+        one_stack(&stream, &s.d, 0..NF).at(0),
+        &up(&stream, &psi_host),
+        &probe,
+        &mut whole,
+    )
+    .unwrap();
+    let split = StackTable::new(&stream, &s.d, &[0..NF / 2, NF / 2..NF]).unwrap();
+    let half = s.nk(&(0..NF / 2)) * s.n();
+    for (i, part) in psi_host.chunks_exact(half).enumerate() {
+        k.psi_to_obj(
+            &ex,
+            &views,
+            split.at(i),
+            &up(&stream, part),
+            &probe,
+            &mut parts,
+        )
+        .unwrap();
+    }
+    let mut num: Vec<Z> = st.0.iter().map(|&c| z(c)).collect();
+    let mut den: Vec<f64> = st.1.iter().map(|&v| v as f64).collect();
+    s.obj_sums(0..NF, &psi_host, &mut num, &mut den);
+    check_sums("object", &stream, &whole, &parts, (&num, &den));
+}
+
 #[test]
 fn psi_to_obj_is_the_adjoint_of_obj_probe_to_psi() {
     let (stream, ex, k) = setup();
@@ -1434,10 +1497,8 @@ fn empty_stack_replay_writes_nothing() {
 /// frame order, leaves in each tile slab the packed run of `Views::new` cut to the slab's
 /// capacity, with the cut views counted in `overflow` and the slots past the run untouched;
 /// a replay with `nf == 0` changes nothing.
-#[test]
-fn bin_views_appends_each_stack_to_the_tile_slabs() {
-    let (stream, _, k) = setup();
-    // 12 frames of 4 views: the 9-frame stack has 36, more than one warp ballot.
+/// 12 frames of 4 views: [`scan`]'s offsets, each repeat shifted up and left.
+fn scan12() -> Scan {
     let base = scan();
     let d = ViewDims {
         nframe: 12,
@@ -1461,7 +1522,15 @@ fn bin_views_appends_each_stack_to_the_tile_slabs() {
             )
         })
         .collect();
-    let s = Scan::new(d, &offsets, 1.0);
+    Scan::new(d, &offsets, 1.0)
+}
+
+#[test]
+fn bin_views_appends_each_stack_to_the_tile_slabs() {
+    let (stream, _, k) = setup();
+    // The 9-frame stack has 36 views, more than one warp ballot.
+    let s = scan12();
+    let d = s.d;
     let packed = Views::new(&stream, d, &s.views).unwrap();
     let pstart = packed.tile_start().to_host_vec(&stream).unwrap();
     let plen = packed.tile_len().to_host_vec(&stream).unwrap();
@@ -1533,6 +1602,135 @@ fn bin_views_appends_each_stack_to_the_tile_slabs() {
         }
         assert_eq!(kend, d.nframe * d.nmode, "every frame binned");
         assert_eq!(before.2 > 0, cap < full, "cap {cap}: overflow");
+    }
+}
+
+/// An order of [`scan12`]'s frames that moves every frame.
+const ORDER12: [u32; 12] = [7, 2, 11, 0, 5, 9, 1, 10, 3, 8, 6, 4];
+
+/// `s`'s views with frame `p` taken from frame `order[p]`.
+fn reordered_views(s: &Scan, order: &[u32]) -> Vec<ViewAddr> {
+    order
+        .iter()
+        .flat_map(|&q| s.views_of(&(q..q + 1)).iter().copied())
+        .collect()
+}
+
+type HostViews = (Vec<ViewAddr>, Vec<u32>, Vec<u32>, Vec<u32>);
+
+/// `v`'s records, tile starts, run lengths and tile slots.
+fn host_views(stream: &CudaStream, v: &Views) -> HostViews {
+    (
+        v.addr().to_host_vec(stream).unwrap(),
+        v.tile_start().to_host_vec(stream).unwrap(),
+        v.tile_len().to_host_vec(stream).unwrap(),
+        v.tile_views().to_host_vec(stream).unwrap(),
+    )
+}
+
+/// `reorder_views` by a permutation, captured once and replayed twice, leaves the records
+/// and tile lists `Views::new` makes of the frames in that order, from packed lists and from
+/// padded slabs alike; the inverse permutation then gives back the source exactly.
+#[test]
+fn reorder_views_by_a_permutation_and_its_inverse_restores_the_views() {
+    let (stream, _, k) = setup();
+    let s = scan12();
+    let d = s.d;
+    let mut inv = [0u32; 12];
+    for (p, &q) in (0..).zip(&ORDER12) {
+        inv[q as usize] = p;
+    }
+    let src = Views::new(&stream, d, &s.views).unwrap();
+    let packed = Views::new(&stream, d, &reordered_views(&s, &ORDER12)).unwrap();
+    let want = host_views(&stream, &packed);
+    let order = up(&stream, &ORDER12);
+    let mut mid = Views::reordered(&stream, &src).unwrap();
+    let side = k.context().new_stream().unwrap();
+    let graph = CudaGraph::capture(
+        side.clone(),
+        record(|ctx| k.reorder_views(ctx, &src, &order, &mut mid)),
+    )
+    .unwrap();
+    for replay in 0..2 {
+        graph.launch().sync_on(&side).unwrap();
+        assert!(host_views(&stream, &mid) == want, "replay {replay}");
+    }
+    let mut back = Views::reordered(&stream, &mid).unwrap();
+    let inv = up(&stream, &inv);
+    record(|ctx| k.reorder_views(ctx, &mid, &inv, &mut back))
+        .sync_on(&stream)
+        .unwrap();
+    assert!(host_views(&stream, &back) == host_views(&stream, &src));
+
+    // Slabs with spare slots, filled by `bin_views`: a reorder keeps their capacities and
+    // replaces the runs an earlier reorder left.
+    let (wstart, wlen, wlist) = (&want.1, &want.2, &want.3);
+    let ntiles = wlen.len();
+    let cap = wlen.iter().max().unwrap() + 3;
+    let start: Vec<u32> = (0..=ntiles as u32).map(|t| t * cap).collect();
+    // SAFETY: empty runs, which `bin_views` fills with the one stack of every frame.
+    let mut slab = unsafe {
+        Views::from_parts(
+            d,
+            up(&stream, &s.views),
+            up(&stream, &start),
+            up(&stream, &vec![u32::MAX; ntiles * cap as usize]),
+            up(&stream, &vec![0u32; ntiles]),
+        )
+    }
+    .unwrap();
+    let all = one_stack(&stream, &d, 0..d.nframe);
+    let mut overflow = up(&stream, &[0u32]);
+    record(|ctx| k.bin_views(ctx, &mut slab, all.at(0), &mut overflow))
+        .sync_on(&stream)
+        .unwrap();
+    let mut slab_mid = Views::reordered(&stream, &slab).unwrap();
+    for order in [&inv, &order] {
+        record(|ctx| k.reorder_views(ctx, &slab, order, &mut slab_mid))
+            .sync_on(&stream)
+            .unwrap();
+    }
+    let (addr, got_start, len, list) = host_views(&stream, &slab_mid);
+    assert!(addr == want.0, "slab records");
+    assert_eq!(got_start, start, "slab starts");
+    assert_eq!(&len, wlen, "slab run lengths");
+    for t in 0..ntiles {
+        let run = |list: &[u32], at: u32| list[at as usize..][..wlen[t] as usize].to_vec();
+        assert_eq!(run(&list, start[t]), run(wlist, wstart[t]), "slab tile {t}");
+    }
+}
+
+/// The stack launches over reordered views match, bit for bit, the same launches over
+/// `Views::new` of the frames in that order, stack after stack.
+#[test]
+fn stack_pass_over_reordered_views_matches_the_frames_in_that_order() {
+    let (stream, _, k) = setup();
+    let s = scan12();
+    let (d, n) = (s.d, s.n());
+    let src = Views::new(&stream, d, &s.views).unwrap();
+    let order = up(&stream, &ORDER12);
+    let mut dst = Views::reordered(&stream, &src).unwrap();
+    record(|ctx| k.reorder_views(ctx, &src, &order, &mut dst))
+        .sync_on(&stream)
+        .unwrap();
+    let host = Views::new(&stream, d, &reordered_views(&s, &ORDER12)).unwrap();
+    let c = counts(d.nframe as usize * n);
+    let c: Vec<u16> = ORDER12
+        .iter()
+        .flat_map(|&q| c[q as usize * n..][..n].iter().copied())
+        .collect();
+    let counts = up(&stream, &c);
+    let table = StackTable::new(&stream, &d, &[0..5, 5..9, 9..12]).unwrap();
+    let mut got = StackRun::new(&stream, &s, table.nf_max());
+    let mut want = StackRun::new(&stream, &s, table.nf_max());
+    for i in 0..table.len() {
+        record(|ctx| got.run(ctx, &k, &dst, table.at(i), &counts))
+            .sync_on(&stream)
+            .unwrap();
+        record(|ctx| want.run(ctx, &k, &host, table.at(i), &counts))
+            .sync_on(&stream)
+            .unwrap();
+        assert!(got.bits(&stream) == want.bits(&stream), "stack {i}");
     }
 }
 

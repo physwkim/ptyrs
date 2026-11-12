@@ -14,7 +14,7 @@ use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig};
 use ptyrs_kernels::FFT_EPT;
 use ptyrs_kernels::fused::{
-    FUSED_COL_THREADS, FUSED_COLS, FUSED_CONTRIB, FUSED_DM, FUSED_GRAD, FUSED_LLK, FUSED_PROJECT,
+    FUSED_COL_THREADS, FUSED_COLS, FUSED_DM, FUSED_GRAD, FUSED_LLK, FUSED_PROJECT,
     FUSED_ROW_THREADS, FUSED_TO_PSI, FusedCfg, FusedPtrs,
 };
 
@@ -146,8 +146,8 @@ impl Shape {
 pub struct FusedBufs {
     /// `[nf_max * nmode, ny, nx]`.
     work: DeviceBuffer<C32>,
-    /// `[nf_max * nobj, ny, nx]`.
-    contrib: DeviceBuffer<C32>,
+    /// `[nprobe, ny, nx]`.
+    probe_q: DeviceBuffer<C32>,
     /// `[ny, nx]`.
     probe_power: DeviceBuffer<f32>,
     /// `[nf_max, nx / FUSED_COLS]`.
@@ -165,7 +165,7 @@ impl FusedBufs {
         let (n, nf) = (dims.n(), nf_max as usize);
         Ok(Self {
             work: DeviceBuffer::zeroed(stream, nf * dims.nmode as usize * n)?,
-            contrib: DeviceBuffer::zeroed(stream, nf * dims.nobj as usize * n)?,
+            probe_q: DeviceBuffer::zeroed(stream, dims.nprobe as usize * n)?,
             probe_power: DeviceBuffer::zeroed(stream, n)?,
             groups: DeviceBuffer::zeroed(stream, nf * (dims.frame[1] / FUSED_COLS) as usize)?,
         })
@@ -181,7 +181,7 @@ impl FusedBufs {
     fn check(&self, d: &ViewDims, g: &StackGeom) -> Result<(), Error> {
         let (n, nf) = (d.n(), g.nf_max as usize);
         check_len("work", &self.work, nf * d.nmode as usize * n)?;
-        check_len("contrib", &self.contrib, nf * d.nobj as usize * n)?;
+        check_len("probe_q", &self.probe_q, d.nprobe as usize * n)?;
         check_len("probe_power", &self.probe_power, n)?;
         check_len("groups", &self.groups, nf * (g.nx / FUSED_COLS) as usize)
     }
@@ -282,7 +282,7 @@ impl Kernels {
         let dm_flag = if dm { FUSED_DM } else { 0 };
 
         if obj_sums.is_some() {
-            run.probe_power(bufs)?;
+            run.probe_terms(bufs, p)?;
         }
         run.rows_fwd(
             bufs,
@@ -303,18 +303,17 @@ impl Kernels {
             run.llk_groups(bufs, out)?;
         }
         let to_psi = if psi.is_some() { FUSED_TO_PSI } else { 0 };
-        let contrib = if obj_sums.is_some() { FUSED_CONTRIB } else { 0 };
         let cfg = FusedCfg {
-            flags: dm_flag | to_psi | contrib,
+            flags: dm_flag | to_psi,
             alpha,
         };
         run.rows_inv(bufs, psi, p, cfg)?;
+        let waves = psi.unwrap_or(&bufs.work);
         if let Some(sums) = probe_sums {
-            let waves = psi.unwrap_or(&bufs.work);
             self.psi_to_probe(ctx, inputs.views, stack, waves, inputs.obj, sums)?;
         }
         if let Some(sums) = obj_sums {
-            run.gather(bufs, p, sums)?;
+            run.gather(bufs, waves, p, cfg, sums)?;
         }
         Ok(())
     }
@@ -388,7 +387,7 @@ impl<'a> Run<'a> {
             counts: dptr(self.inputs.counts),
             psi: std::ptr::null_mut(),
             work: dptr(&bufs.work),
-            contrib: dptr(&bufs.contrib),
+            probe_q: dptr(&bufs.probe_q),
             probe_power: dptr(&bufs.probe_power),
             groups: dptr(&bufs.groups),
         }
@@ -398,25 +397,16 @@ impl<'a> Run<'a> {
         self.stack.ctl() as *const StackCtl
     }
 
-    fn probe_power(&self, bufs: &FusedBufs) -> Result<(), Error> {
-        let d = self.inputs.views.dims();
-        let config = grid_1d(d.n())?;
-        let (probe, pp) = (self.inputs.probe, &bufs.probe_power);
-        let (nprobe, n) = (d.nprobe, d.n() as u32);
-        self.k
-            .launch(self.ctx, &[probe.storage()], &[pp.storage()], |stream| {
-                // SAFETY: `probe` holds `nprobe` planes of `n`, `pp` one.
-                unsafe {
-                    self.k.module.fused_probe_power(
-                        stream,
-                        config,
-                        dptr(probe),
-                        dptr(pp),
-                        nprobe,
-                        n,
-                    )
-                }
-            })
+    /// `bufs.probe_q` and `bufs.probe_power` from the probe.
+    fn probe_terms(&self, bufs: &FusedBufs, p: FusedPtrs) -> Result<(), Error> {
+        let config = grid_1d(self.inputs.views.dims().n())?;
+        let reads = [self.inputs.probe.storage()];
+        let writes = [bufs.probe_q.storage(), bufs.probe_power.storage()];
+        let g = self.g;
+        self.k.launch(self.ctx, &reads, &writes, |stream| {
+            // SAFETY: `Run::new` checked `probe` and `bufs` against `g`.
+            unsafe { self.k.module.fused_probe_terms(stream, config, p, g) }
+        })
     }
 
     /// Pass A into `bufs.work`; reads `psi` under `FUSED_DM`.
@@ -504,8 +494,7 @@ impl<'a> Run<'a> {
     }
 
     /// Pass C from `bufs.work` to `psi` (under `FUSED_TO_PSI`) or back to `bufs.work`;
-    /// reads `psi` and the object under `FUSED_DM`, writes `bufs.contrib` under
-    /// `FUSED_CONTRIB`.
+    /// reads `psi`, the probe and the object under `FUSED_DM`.
     fn rows_inv(
         &self,
         bufs: &FusedBufs,
@@ -514,11 +503,7 @@ impl<'a> Run<'a> {
         cfg: FusedCfg,
     ) -> Result<(), Error> {
         let config = self.sh.rows(&self.g, false)?;
-        let mut reads = vec![
-            self.inputs.probe.storage(),
-            self.inputs.views.addr().storage(),
-            self.stack.storage(),
-        ];
+        let mut reads = vec![self.inputs.views.addr().storage(), self.stack.storage()];
         let mut writes = vec![];
         match psi {
             Some(psi) if cfg.flags & FUSED_TO_PSI != 0 => {
@@ -529,9 +514,7 @@ impl<'a> Run<'a> {
         }
         if cfg.flags & FUSED_DM != 0 {
             reads.push(self.inputs.obj.storage());
-        }
-        if cfg.flags & FUSED_CONTRIB != 0 {
-            writes.push(bufs.contrib.storage());
+            reads.push(self.inputs.probe.storage());
         }
         let (ctl, g) = (self.ctl(), self.g);
         self.k.launch(self.ctx, &reads, &writes, |stream| {
@@ -559,12 +542,21 @@ impl<'a> Run<'a> {
         })
     }
 
-    /// The object sums from `bufs.contrib` and `bufs.probe_power`.
-    fn gather(&self, bufs: &FusedBufs, p: FusedPtrs, sums: &mut UpdateSums) -> Result<(), Error> {
+    /// The object sums from `waves`, the new exit waves pass C stored under `cfg`, and
+    /// `bufs.probe_q` and `bufs.probe_power`.
+    fn gather(
+        &self,
+        bufs: &FusedBufs,
+        waves: &DeviceBuffer<C32>,
+        p: FusedPtrs,
+        cfg: FusedCfg,
+        sums: &mut UpdateSums,
+    ) -> Result<(), Error> {
         let views = self.inputs.views;
         let [start, len, list] = views.tile_storages();
         let reads = [
-            bufs.contrib.storage(),
+            waves.storage(),
+            bufs.probe_q.storage(),
             bufs.probe_power.storage(),
             views.addr().storage(),
             start,
@@ -572,15 +564,16 @@ impl<'a> Run<'a> {
             list,
             self.stack.storage(),
         ];
-        let config = views.dims().tile_grid();
+        let config = views.dims().stack_tile_grid(self.g.nf_max)?;
         let (tiles, ctl, g) = (views.tile_ptrs(), self.ctl(), self.g);
         self.k.launch(self.ctx, &reads, &sums.storages(), |stream| {
-            // SAFETY: as `psi_to_obj`, with `contrib` and `probe_power` checked with the
-            // rest of `bufs`; the tile lists were built from these views.
+            // SAFETY: as `psi_to_obj`, with `waves` where `cfg` has pass C store them and
+            // `probe_q` and `probe_power` checked with the rest of `bufs`; the tile lists
+            // were built from these views.
             unsafe {
                 self.k
                     .module
-                    .fused_gather(stream, config, p, tiles, sums.ptrs(), ctl, g)
+                    .fused_gather(stream, config, p, tiles, sums.ptrs(), ctl, g, cfg)
             }
         })
     }
