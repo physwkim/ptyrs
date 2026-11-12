@@ -1,8 +1,7 @@
-//! The M6 measure on the engine's rPIE (CPU), with the true object standing in for a perfect
-//! prediction.
+//! The M6 measure on the LLK history of the engine's rPIE (CPU).
 
 use ptyrs_core::{AddrTable, Geometry, Object, Probe, Scan, required_obj_shape, sim};
-use ptyrs_engine::{EngineError, Ptycho, RpieParams};
+use ptyrs_engine::{Ptycho, RpieParams};
 use ptyrs_nn::data::random_object;
 use ptyrs_nn::metric::iterations_to_llk;
 use ptyrs_nn::predictor::flat_object;
@@ -27,41 +26,39 @@ fn scan() -> (Scan, Object, AddrTable, Probe) {
     (scan, object, addr, probe)
 }
 
-/// rPIE epochs, probe fixed, from `start` to the Poisson LLK `target`. Single-frame batches: the
-/// summed updates of 10 overlapping frames diverge on this scan.
-fn epochs(
-    scan: &Scan,
-    start: Object,
-    probe: &Probe,
-    target: f64,
-    max: usize,
-) -> Result<Option<usize>, EngineError> {
+/// The LLK of `start` and after each of `epochs` rPIE epochs, probe fixed. Single-frame
+/// batches: the summed updates of 10 overlapping frames diverge on this scan.
+fn rpie(scan: &Scan, start: Object, probe: &Probe, epochs: usize) -> (f64, Vec<f64>) {
     let params = RpieParams {
         probe_step: None,
         batch_size: 1,
+        calc_llk: 1,
         ..RpieParams::default()
     };
-    let mut p = Ptycho::new(scan, start, probe.clone())?;
-    iterations_to_llk(p.llk().poisson, target, max, || {
-        p.rpie(&params, 1)?;
-        Ok(p.llk().poisson)
-    })
+    let mut p = Ptycho::new(scan, start, probe.clone()).unwrap();
+    let start = p.llk().poisson;
+    p.rpie(&params, epochs).unwrap();
+    let history: Vec<f64> = p.history().iter().map(|r| r.llk.poisson).collect();
+    assert_eq!(history.len(), epochs);
+    (start, history)
 }
 
 #[test]
-fn flat_start_needs_epochs_the_true_object_does_not() {
+fn the_flat_start_reaches_a_target_near_the_truth_after_epochs() {
     let (scan, truth, addr, probe) = scan();
-    let llk = |o: Object| Ptycho::new(&scan, o, probe.clone()).unwrap().llk().poisson;
-    let (at_truth, at_flat) = (llk(truth.clone()), llk(flat_object(&addr)));
+    let at_truth = Ptycho::new(&scan, truth, probe.clone())
+        .unwrap()
+        .llk()
+        .poisson;
+    let (at_flat, flat) = rpie(&scan, flat_object(&addr), &probe, 50);
     // From flat, rPIE stalls near 1.45 times the truth's LLK and passes 1.75 times it in a few
     // epochs.
     let target = 1.75 * at_truth;
-    let flat = epochs(&scan, flat_object(&addr), &probe, target, 50).unwrap();
-    let k = flat.unwrap_or_else(|| panic!("LLK truth {at_truth}, flat {at_flat}: never {target}"));
+    let k = iterations_to_llk(at_flat, target, flat.iter().copied())
+        .unwrap_or_else(|| panic!("LLK truth {at_truth}, flat {at_flat} then {flat:?}"));
     assert!(k >= 2, "flat start reached the target in {k} epoch");
-    assert_eq!(epochs(&scan, truth, &probe, target, 50).unwrap(), Some(0));
     assert_eq!(
-        epochs(&scan, flat_object(&addr), &probe, target, k - 1).unwrap(),
+        iterations_to_llk(at_flat, target, flat[..k - 1].iter().copied()),
         None
     );
 }
