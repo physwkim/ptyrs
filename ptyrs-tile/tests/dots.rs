@@ -1,16 +1,14 @@
-//! `ptyrs_tile::TileDots` against the SIMT `ptyrs_gpu::GradKernels` and `BhKernels` dot
-//! products, bit for bit, at the ML timing case's sizes: an object of 636x632 values, two
-//! grid strides with the last block partial, and a probe of 2x256x256, which leaves half the
-//! blocks without an element.
+//! `ptyrs_tile::TileDots` against the SIMT `ptyrs_gpu::GradKernels` dot products, bit for
+//! bit, at the ML timing case's sizes: an object of 636x632 values, two grid strides with
+//! the last block partial, and a probe of 2x256x256, which leaves half the blocks without an
+//! element.
 
 use std::sync::Arc;
 
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, DeviceCopy};
 use cutile::tile_kernel::jit_compile_count;
-use ptyrs_gpu::{
-    BhDisp, BhKernels, C32, CG_BLOCKS, GradKernels, Kernels, ViewDims, bh_parts, gamma_parts,
-};
+use ptyrs_gpu::{C32, CG_BLOCKS, GradKernels, Kernels, ViewDims, gamma_parts};
 use ptyrs_tile::TileDots;
 
 /// Deterministic values in `[-scale, scale)`.
@@ -70,7 +68,6 @@ struct Gpu {
     stream: Arc<CudaStream>,
     ex: ExecutionContext,
     grad: GradKernels,
-    bh: BhKernels,
     tile: TileDots,
     dims: ViewDims,
     lens: [u32; 2],
@@ -85,7 +82,6 @@ fn gpu() -> Gpu {
     Gpu {
         ex: ExecutionContext::new(stream.clone()),
         grad: GradKernels::load(&k).unwrap(),
-        bh: BhKernels::load(&k).unwrap(),
         tile,
         lens: [636 * 632, 2 * 256 * 256],
         dims,
@@ -152,32 +148,6 @@ fn cg_dots_match_simt_bitwise() {
         .unwrap();
     let [want, got] = pair.map(|b| down(s, &b));
     assert_bits("sum_parts of CG_BLOCKS", &got, &want);
-    assert_eq!(jit_compile_count(), jit, "a launch compiled");
-}
-
-/// `BhKernels::dots` with and without `v`, the probe's `u` scaled.
-#[test]
-fn bh_dots_match_simt_bitwise() {
-    let g = gpu();
-    let s = &g.stream;
-    let [u, v] = [0u64, 1].map(|j| g.lens.map(|n| up(s, &noise(n as usize, 30 + j, 1.0))));
-    let jit = jit_compile_count();
-    for cg in [false, true] {
-        let d = BhDisp {
-            u: [&u[0], &u[1]],
-            u_scale: 0.37,
-            v: cg.then(|| [&v[0], &v[1]]),
-        };
-        let sentinel = vec![f32::NAN; bh_parts(&g.dims)];
-        let mut parts = [up(s, &sentinel), up(s, &sentinel)];
-        g.bh.dots(&g.ex, &g.dims, &d, &mut parts[0]).unwrap();
-        g.tile.dots(&g.ex, &d, &mut parts[1]).unwrap();
-        let [want, got] = [&parts[0], &parts[1]].map(|b| down(s, b));
-        assert_bits(&format!("dots, cg {cg}"), &got, &want);
-        let pairs = &want[..4 * CG_BLOCKS as usize];
-        assert!(pairs.iter().all(|x| x.is_finite()));
-        assert_eq!(pairs.iter().skip(1).step_by(2).any(|&x| x != 0.0), cg);
-    }
     assert_eq!(jit_compile_count(), jit, "a launch compiled");
 }
 

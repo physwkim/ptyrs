@@ -1,18 +1,13 @@
-//! M6: the CG and BH dot products in their SIMT (`ptyrs-gpu`) and Tile (`ptyrs-tile`) forms.
-//! Every call is first checked bit for bit, Tile against SIMT from the same inputs. Each
-//! call is then captured as a graph of `reps` calls, one graph per form; each round replays
-//! every graph once, in an order rotated per round, between two timing events, and the
-//! report is µs per call (median, min, max over the rounds).
+//! M6: the CG dot products in their SIMT (`ptyrs-gpu`) and Tile (`ptyrs-tile`) forms, on
+//! `gpu_time ml`'s scan (400 frames of 256x256, 2 probe modes, one 636x632 object): a CG
+//! cycle's `beta_parts` of the object and of the probe and its sums of `2 CG_BLOCKS` and of
+//! `gamma_parts` pairs; the start's `norm_parts` of each array and their sum of `CG_BLOCKS`
+//! pairs. Every call is first checked bit for bit, Tile against SIMT from the same inputs.
+//! Each call is then captured as a graph of `reps` calls, one graph per form; each round
+//! replays every graph once, in an order rotated per round, between two timing events, and
+//! the report is µs per call (median, min, max over the rounds).
 //!
-//! `ml`: `gpu_time ml`'s scan (400 frames of 256x256, 2 probe modes, one 636x632 object): a
-//! CG cycle's `beta_parts` of the object and of the probe and its sums of `2 CG_BLOCKS` and
-//! of `gamma_parts` pairs; the start's `norm_parts` of each array and their sum of
-//! `CG_BLOCKS` pairs.
-//! `bh`: M3's BH scan (1024 frames of 256x256, 2 probe modes, one 852x852 object): `dots`
-//! without `v` (batch 96, steepest descent) and with it (full batch, CG), each one launch
-//! for the object and one for the probe.
-//!
-//! `cargo run --release -p ptyrs-tile --example dots_time -- <ml|bh> [reps] [rounds]`
+//! `cargo run --release -p ptyrs-tile --example dots_time -- [reps] [rounds]`
 
 use std::sync::Arc;
 
@@ -20,10 +15,7 @@ use cuda_async::cuda_graph::CudaGraph;
 use cuda_async::device_operation::{DeviceOp, ExecutionContext};
 use cuda_core::sys::CUevent_flags_enum_CU_EVENT_DEFAULT as TIMED;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
-use ptyrs_gpu::{
-    BhDisp, BhKernels, C32, CG_BLOCKS, Error, GradKernels, Kernels, ViewDims, bh_parts,
-    gamma_parts, record,
-};
+use ptyrs_gpu::{C32, CG_BLOCKS, Error, GradKernels, Kernels, ViewDims, gamma_parts, record};
 use ptyrs_tile::TileDots;
 
 /// Deterministic values in `[-scale, scale)`.
@@ -55,8 +47,6 @@ enum Op {
     Sum(u32),
     /// `norm_parts` of array `i`.
     Norm(usize),
-    /// `dots`, with `v` when true.
-    Dots(bool),
 }
 
 impl Op {
@@ -67,25 +57,21 @@ impl Op {
             Op::Sum(n) if n == gamma => format!("sum_parts {n} (gamma)"),
             Op::Sum(n) => format!("sum_parts {n}"),
             Op::Norm(i) => format!("norm_parts {}", ARRAY[i]),
-            Op::Dots(false) => "dots batch 96 (no v)".into(),
-            Op::Dots(true) => "dots full batch (v)".into(),
         }
     }
 }
 
 struct Impls {
     grad: GradKernels,
-    bh: BhKernels,
     tile: TileDots,
-    dims: ViewDims,
     lens: [u32; 2],
 }
 
-/// Every buffer a call reads or writes; `h` doubles as BH's `v`.
+/// Every buffer a call reads or writes.
 struct Bufs {
     g: [DeviceBuffer<C32>; 2],
     h: [DeviceBuffer<C32>; 2],
-    /// `max(bh_parts, 4 CG_BLOCKS)` floats, `CG_BLOCKS`-pair partials in front.
+    /// `2 CG_BLOCKS` pairs.
     parts: DeviceBuffer<f32>,
     /// `gamma_parts` pairs.
     gamma: DeviceBuffer<f32>,
@@ -129,18 +115,6 @@ impl Op {
                     k.grad.norm_parts(ctx, &b.g[i], k.lens[i], &mut b.parts)
                 }
             }
-            Op::Dots(cg) => {
-                let d = BhDisp {
-                    u: [&b.g[0], &b.g[1]],
-                    u_scale: 0.37,
-                    v: cg.then_some([&b.h[0], &b.h[1]]),
-                };
-                if tile {
-                    k.tile.dots(ctx, &d, &mut b.parts)
-                } else {
-                    k.bh.dots(ctx, &k.dims, &d, &mut b.parts)
-                }
-            }
         }
     }
 
@@ -154,7 +128,7 @@ impl Op {
                 v
             }
             Op::Sum(_) => b.pair.to_host_vec(stream).unwrap(),
-            Op::Norm(_) | Op::Dots(_) => parts[..4 * CG_BLOCKS as usize].to_vec(),
+            Op::Norm(_) => parts[..4 * CG_BLOCKS as usize].to_vec(),
         }
     }
 }
@@ -166,16 +140,11 @@ fn median_spread(v: &mut [f64]) -> (f64, f64, f64) {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let case = args.get(1).map_or("ml", String::as_str);
-    let reps: usize = args.get(2).map_or(100, |s| s.parse().unwrap());
-    let rounds: usize = args.get(3).map_or(21, |s| s.parse().unwrap());
-    let (frames, obj) = match case {
-        "ml" => (400, [636, 632]),
-        "bh" => (1024, [852, 852]),
-        c => panic!("case {c:?} is not ml|bh"),
-    };
+    let reps: usize = args.get(1).map_or(100, |s| s.parse().unwrap());
+    let rounds: usize = args.get(2).map_or(21, |s| s.parse().unwrap());
+    let obj = [636, 632];
     let dims = ViewDims {
-        nframe: frames,
+        nframe: 400,
         nmode: 2,
         nprobe: 2,
         nobj: 1,
@@ -185,18 +154,15 @@ fn main() {
     };
     let lens = [obj[0] * obj[1], 2 * 256 * 256];
     let gamma = gamma_parts(&dims).unwrap();
-    let ops: Vec<Op> = match case {
-        "ml" => vec![
-            Op::Beta(0),
-            Op::Beta(1),
-            Op::Sum(2 * CG_BLOCKS),
-            Op::Sum(gamma),
-            Op::Norm(0),
-            Op::Norm(1),
-            Op::Sum(CG_BLOCKS),
-        ],
-        _ => vec![Op::Dots(false), Op::Dots(true)],
-    };
+    let ops = [
+        Op::Beta(0),
+        Op::Beta(1),
+        Op::Sum(2 * CG_BLOCKS),
+        Op::Sum(gamma),
+        Op::Norm(0),
+        Op::Norm(1),
+        Op::Sum(CG_BLOCKS),
+    ];
 
     let dev = CudaContext::new(0).expect("CUDA device 0");
     let k = Kernels::load(&dev).expect("load ptyrs-gpu kernels");
@@ -206,7 +172,7 @@ fn main() {
     let t = std::time::Instant::now();
     let tile = TileDots::new(&stream, &dims).unwrap();
     println!(
-        "{case}: object {} and probe {} values, gamma {gamma} pairs; TileDots::new compiled {} \
+        "object {} and probe {} values, gamma {gamma} pairs; TileDots::new compiled {} \
          kernels in {:.2} s",
         lens[0],
         lens[1],
@@ -215,20 +181,14 @@ fn main() {
     );
     let k = Impls {
         grad: GradKernels::load(&k).unwrap(),
-        bh: BhKernels::load(&k).unwrap(),
         tile,
-        dims,
         lens,
     };
 
     let up = |v: &[C32]| DeviceBuffer::from_host(&stream, v).unwrap();
     let g0 = lens.map(|n| noise(n as usize, 10 + n as u64, 1.0));
     let h0 = lens.map(|n| noise(n as usize, 20 + n as u64, 1.0));
-    let parts0 = flat(&noise(
-        bh_parts(&dims).max(4 * CG_BLOCKS as usize) / 2,
-        1,
-        3.0,
-    ));
+    let parts0 = flat(&noise(2 * CG_BLOCKS as usize, 1, 3.0));
     let mut b = Bufs {
         g: [up(&g0[0]), up(&g0[1])],
         h: [up(&h0[0]), up(&h0[1])],
