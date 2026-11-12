@@ -103,10 +103,10 @@ impl Bufs<'_> {
                 plan.forward_inplace(ctx, f)?;
             }
             self.grad
-                .gamma_frames(ctx, &dims, stack, self.counts, ml.fields, ml.frame_pairs)?;
+                .gamma_frames(ctx, &dims, stack, self.counts, ml.fields, ml.gamma_parts)?;
         }
-        self.grad
-            .sum_parts(ctx, ml.frame_pairs, dims.nframe, ml.gamma)?;
+        let npart = ptyrs_gpu::gamma_parts(&dims)?;
+        self.grad.sum_parts(ctx, ml.gamma_parts, npart, ml.gamma)?;
         for (i, x) in [&mut *self.obj, &mut *self.probe].into_iter().enumerate() {
             if update[i] {
                 self.grad

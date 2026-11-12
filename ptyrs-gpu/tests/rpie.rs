@@ -4,7 +4,10 @@ use std::sync::Arc;
 
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, DeviceCopy};
-use ptyrs_gpu::{C32, Kernels, MASKED, RpieKernels, StackTable, UpdateSums, ViewDims, Weight};
+use ptyrs_gpu::{
+    C32, Kernels, MASKED, POWER_CHUNK, PowerMax, RpieKernels, StackTable, UpdateSums, ViewDims,
+    Weight,
+};
 
 /// A stream, an eager execution context on it and the rPIE kernels.
 fn setup() -> (Arc<CudaStream>, ExecutionContext, RpieKernels) {
@@ -114,9 +117,14 @@ fn amplitude_matches_ptychi_formula() {
 #[test]
 fn power_max_and_weights_match_f64() {
     let (stream, ctx, k) = setup();
-    let (nk, n) = (3usize, 300usize);
+    // Two chunks per plane, the last one short; plane 0's max in the short chunk, plane 2's
+    // in the first.
+    let (nk, n) = (3usize, 3072usize);
+    assert_eq!(n.div_ceil(POWER_CHUNK as usize), 2);
     let x = noise(nk * n, 3, 1.0);
-    let w = noise(nk * n, 5, 1.5);
+    let mut w = noise(nk * n, 5, 1.5);
+    w[n - 1] = C32 { re: 4.0, im: 3.0 };
+    w[2 * n + 7] = C32 { re: -3.0, im: 4.5 };
     // Summed over all planes, and per plane.
     let pw = |p: &[C32], k0: usize, nsum: usize| {
         (0..n)
@@ -126,11 +134,25 @@ fn power_max_and_weights_match_f64() {
     let all = pw(&w, 0, nk);
     let per: Vec<f64> = (0..nk).map(|b| pw(&w, b, 1)).collect();
     let dw = up(&stream, &w);
+    let (all_groups, per_groups) = (
+        PowerMax {
+            ngroup: 1,
+            nsum: nk as u32,
+            n: n as u32,
+        },
+        PowerMax {
+            ngroup: nk as u32,
+            nsum: 1,
+            n: n as u32,
+        },
+    );
+    assert_eq!(per_groups.chunks(), 2 * nk);
+    let mut chunks = DeviceBuffer::<f32>::zeroed(&stream, per_groups.chunks()).unwrap();
     let mut m_all = DeviceBuffer::<f32>::zeroed(&stream, 1).unwrap();
     let mut m_per = DeviceBuffer::<f32>::zeroed(&stream, nk).unwrap();
-    k.power_max(&ctx, &dw, 1, nk as u32, n as u32, &mut m_all)
+    k.power_max(&ctx, &dw, all_groups, &mut chunks, &mut m_all)
         .unwrap();
-    k.power_max(&ctx, &dw, nk as u32, 1, n as u32, &mut m_per)
+    k.power_max(&ctx, &dw, per_groups, &mut chunks, &mut m_per)
         .unwrap();
     let got_all = m_all.to_host_vec(&stream).unwrap()[0] as f64;
     assert!((got_all - all).abs() < 1e-6 * all, "{got_all} vs {all}");
@@ -217,6 +239,20 @@ fn rpie_shapes_are_checked() {
     };
     // `per_plane` needs one max per plane.
     assert!(k.weight(&ctx, &w, &w, &mx, &mut out, spec).is_err());
+    let groups = PowerMax {
+        ngroup: 2,
+        nsum: 1,
+        n: 4,
+    };
+    let mut chunks = DeviceBuffer::<f32>::zeroed(&stream, groups.chunks()).unwrap();
     let mut short = DeviceBuffer::<f32>::zeroed(&stream, 1).unwrap();
-    assert!(k.power_max(&ctx, &w, 2, 1, 8, &mut short).is_err());
+    let mut two = DeviceBuffer::<f32>::zeroed(&stream, 2).unwrap();
+    // One max per group, one chunk max per group.
+    assert!(
+        k.power_max(&ctx, &w, groups, &mut chunks, &mut short)
+            .is_err()
+    );
+    assert!(k.power_max(&ctx, &w, groups, &mut short, &mut two).is_err());
+    k.power_max(&ctx, &w, groups, &mut chunks, &mut two)
+        .unwrap();
 }

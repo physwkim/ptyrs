@@ -12,6 +12,10 @@ use crate::pixel::PIXEL_THREADS;
 /// Blocks of every `cg_beta_parts` launch, and so the partial pairs each launch writes.
 pub const CG_BLOCKS: u32 = 1024;
 
+/// Pixels per block of `cg_gamma_frames`: a frame of `n` pixels is `ceil(n / GAMMA_CHUNK)`
+/// contiguous chunks, the last one short, each writing one pair.
+pub const GAMMA_CHUNK: u32 = 2048;
+
 /// The three exit-wave stacks of the line search, each `[nf_max * nmode, ny, nx]` in
 /// `obj_probe_to_psi`'s layout: `po` along nothing, `a` linear and `b` quadratic in the step.
 #[repr(C)]
@@ -42,7 +46,7 @@ pub struct NormPtrs {
 
 #[cuda_module]
 pub mod grad_kernels {
-    use super::{GammaPtrs, NormPtrs, ObjProbePtrs};
+    use super::{GAMMA_CHUNK, GammaPtrs, NormPtrs, ObjProbePtrs};
     use crate::pixel::*;
     use crate::*;
     use cuda_device::SharedArray;
@@ -300,19 +304,21 @@ pub mod grad_kernels {
         }
     }
 
-    /// PyNX `CG_Poisson_Gamma` (no background) per frame, on the forward-FFT'd (unnormalized)
-    /// line-search stacks: over the unmasked pixels of frame `f0 + fl`, with `calc =
+    /// PyNX `CG_Poisson_Gamma` (no background) per chunk `c = blockIdx.x` of frame `f0 + fl`,
+    /// `fl = blockIdx.y`, on the forward-FFT'd (unnormalized) line-search stacks: over the
+    /// unmasked pixels `d` in `c * GAMMA_CHUNK .. min((c + 1) * GAMMA_CHUNK, n)`, with `calc =
     /// max(sum_m |po|^2 / n, 1e-12)`, `r = sum_m Re(conj(po) a) / n`, `s = sum_m (|a|^2 +
-    /// 2 Re(conj(po) b)) / n` and `f = 1 - obs / calc`, `out[2 (f0 + fl)] = sum -2 r f` and
-    /// `out[2 (f0 + fl) + 1] = sum 2 s f + obs (2 r / calc)^2`, the numerator and denominator
-    /// of `γ = -L'(0) / L''(0)` (ptyrs-engine `cg_poisson_gamma`, which has the cross term
-    /// right where PyNX's has not). One `PIXEL_THREADS` block per frame; pairs of frames
-    /// outside the stack are not written.
+    /// 2 Re(conj(po) b)) / n` and `f = 1 - obs / calc`, pair `p = (f0 + fl) * nchunk + c`,
+    /// `nchunk = ceil(n / GAMMA_CHUNK)`, gets `out[2 p] = sum -2 r f` and `out[2 p + 1] =
+    /// sum 2 s f + obs (2 r / calc)^2`, the numerator and denominator of `γ = -L'(0) /
+    /// L''(0)` (ptyrs-engine `cg_poisson_gamma`, which has the cross term right where PyNX's
+    /// has not). Pairs of frames outside the stack are not written.
     ///
     /// # Safety
     ///
-    /// Each of `x` `[nf_max * nmode, ny, nx]`, `counts` `[nframe, ny, nx]`, `out` `2 *
-    /// nframe` floats, `ctl` one entry; grid `(nf_max, 1, 1)`, block `(PIXEL_THREADS, 1, 1)`.
+    /// Each of `x` `[nf_max * nmode, ny, nx]`, `counts` `[nframe, ny, nx]`, `out`
+    /// `2 * nframe * nchunk` floats, `ctl` one entry; grid `(nchunk, nf_max, 1)`, block
+    /// `(PIXEL_THREADS, 1, 1)`.
     #[kernel]
     pub unsafe fn cg_gamma_frames(
         x: GammaPtrs,
@@ -325,15 +331,18 @@ pub mod grad_kernels {
         let (f0, nf) = unsafe { stack_frames(ctl, g) };
         let (ny, nx, nmode) = (g.ny, g.nx, g.nmode as usize);
         let n = ny as usize * nx as usize;
-        let fl = thread::blockIdx_x() as usize;
+        let fl = thread::blockIdx_y() as usize;
         // The whole block leaves together, before its first barrier.
         if fl >= nf as usize {
             return;
         }
+        let c = thread::blockIdx_x() as usize;
+        let chunk = GAMMA_CHUNK as usize;
+        let end = n.min((c + 1) * chunk);
         let inv_n = 1.0 / n as f32;
         let mut acc = [0.0f32; 2];
-        let mut d = thread::threadIdx_x() as usize;
-        while d < n {
+        let mut d = c * chunk + thread::threadIdx_x() as usize;
+        while d < end {
             let obs = unsafe { *counts.add((f0 as usize + fl) * n + d) };
             if obs != MASKED {
                 let at = psi_index((d / nx as usize) as u32, (d % nx as usize) as u32, ny, nx);
@@ -354,7 +363,7 @@ pub mod grad_kernels {
             }
             d += PIXEL_THREADS as usize;
         }
-        let o = unsafe { out.add(2 * (f0 as usize + fl)) };
+        let o = unsafe { out.add(2 * ((f0 as usize + fl) * n.div_ceil(chunk) + c)) };
         unsafe { super::store_pair((&raw mut RED).cast::<f32>(), acc, o) }
     }
 

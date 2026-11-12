@@ -11,12 +11,12 @@
 //! `(sum |g|^2, 0)` on the first cycle, so `β = 0`. [`GradKernels::direction`] per array,
 //! then the line-search pair `γ`: per stack [`GradKernels::gamma_fields`], a forward FFT of
 //! each of its three stacks and [`GradKernels::gamma_frames`], then
-//! [`GradKernels::sum_parts`] of the `nframe` frame pairs. Then [`GradKernels::step`] per
+//! [`GradKernels::sum_parts`] of the [`gamma_parts`] pairs. Then [`GradKernels::step`] per
 //! array. The coefficients never leave the device, so a cycle is one host-sync-free sequence.
 
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig};
-pub use ptyrs_kernels::grad::CG_BLOCKS;
+pub use ptyrs_kernels::grad::{CG_BLOCKS, GAMMA_CHUNK};
 use ptyrs_kernels::grad::{GammaPtrs, NormPtrs, ObjProbePtrs, grad_kernels};
 use ptyrs_kernels::pixel::{PIXEL_THREADS, SumPtrs};
 
@@ -65,6 +65,20 @@ impl GammaStacks {
 pub struct GradKernels {
     base: Kernels,
     module: grad_kernels::LoadedModule,
+}
+
+/// The line-search pairs [`GradKernels::gamma_frames`] writes over a scan of `dims`, one per
+/// chunk of [`GAMMA_CHUNK`] pixels of each frame: its `out` holds twice as many floats, and
+/// [`GradKernels::sum_parts`] of this many pairs is `γ`.
+pub fn gamma_parts(dims: &ViewDims) -> Result<u32, Error> {
+    let npart = dims.nframe as usize * gamma_chunks(dims.n()) as usize;
+    u32::try_from(npart).map_err(|_| Error::Shape(format!("{npart} line-search pairs exceed u32")))
+}
+
+/// Chunks of [`GAMMA_CHUNK`] pixels per frame of `n` pixels.
+fn gamma_chunks(n: usize) -> u32 {
+    // `n <= 32768^2`, so at most 2^19 chunks.
+    n.div_ceil(GAMMA_CHUNK as usize) as u32
 }
 
 impl GradKernels {
@@ -365,11 +379,12 @@ impl GradKernels {
         })
     }
 
-    /// Per-frame line-search pairs of the stack from its forward-FFT'd (unnormalized)
-    /// [`GammaStacks`]: `out[2 f .. 2 f + 2]` for each frame `f` of the stack gets PyNX
-    /// `CG_Poisson_Gamma`'s numerator and denominator (no background, its cross-term slip
-    /// corrected), each a fixed-order block sum; other frames' pairs are left as they are.
-    /// `out` holds `2 * nframe` floats, which [`Self::sum_parts`] totals into `γ`.
+    /// Line-search pairs of the stack's frames from its forward-FFT'd (unnormalized)
+    /// [`GammaStacks`]: PyNX `CG_Poisson_Gamma`'s numerator and denominator (no background,
+    /// its cross-term slip corrected) over each chunk of [`GAMMA_CHUNK`] pixels, a fixed-order
+    /// block sum, at pair `f * nchunk + c` of `out` for chunk `c` of frame `f`; other frames'
+    /// pairs are left as they are. `out` holds the scan's [`gamma_parts`] pairs, which
+    /// [`Self::sum_parts`] totals into `γ`.
     pub fn gamma_frames(
         &self,
         ctx: &ExecutionContext,
@@ -383,9 +398,12 @@ impl GradKernels {
         let n = dims.n();
         check_len("counts", counts, dims.nframe as usize * n)?;
         x.check(g.nf_max as usize * dims.nmode as usize * n)?;
-        check_len("out", out, 2 * dims.nframe as usize)?;
+        check_len("out", out, 2 * gamma_parts(dims)? as usize)?;
+        if g.nf_max > u16::MAX as u32 {
+            return Err(Error::Shape(format!("{} frames exceed grid y", g.nf_max)));
+        }
         let config = LaunchConfig {
-            grid_dim: (g.nf_max, 1, 1),
+            grid_dim: (gamma_chunks(n), g.nf_max, 1),
             block_dim: (PIXEL_THREADS, 1, 1),
             shared_mem_bytes: 0,
         };
@@ -397,7 +415,7 @@ impl GradKernels {
             stack.storage(),
         ];
         self.base.launch(ctx, &reads, &[out.storage()], |stream| {
-            // SAFETY: lengths checked above; one block of PIXEL_THREADS per frame.
+            // SAFETY: lengths checked above; one block of PIXEL_THREADS per chunk and frame.
             unsafe {
                 self.module.cg_gamma_frames(
                     stream,

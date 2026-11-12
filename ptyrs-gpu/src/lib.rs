@@ -38,14 +38,14 @@ mod ring;
 mod rpie;
 
 pub use fused::{Exit, FUSED_SIDES, FusedBufs, FusedInputs, FusedSums};
-pub use grad::{CG_BLOCKS, GammaStacks, GradKernels};
+pub use grad::{CG_BLOCKS, GAMMA_CHUNK, GammaStacks, GradKernels, gamma_parts};
 pub use ops::{
     LLK_TREE_LEAVES, LlkPartial, LlkScratch, LlkSums, MASKED, OBJ_TILE, StackCtl, StackGeom,
     StackRef, StackTable, UpdateSums, ViewAddr, ViewDims, Views, view_tiles,
 };
 pub use ptyrs_fft::C32;
 pub use ring::{Ended, LlkRing, LlkTotals, RecordWriter, RingDevice, RingError};
-pub use rpie::{RpieKernels, Weight};
+pub use rpie::{POWER_CHUNK, PowerMax, RpieKernels, Weight};
 
 /// The linked device code: every `ptyrs-kernels` kernel plus the cuFFT functions they call.
 pub const CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ptyrs_kernels.cubin"));

@@ -14,8 +14,8 @@ use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 use ptyrs_fft::Plan2d;
 use ptyrs_gpu::{
     C32, CG_BLOCKS, Ended, Error as GpuError, FusedBufs, GammaStacks, GradKernels, Kernels,
-    LlkPartial, LlkRing, LlkScratch, LlkTotals, RingDevice, RpieKernels, StackTable, UpdateSums,
-    ViewAddr, ViewDims, Views,
+    LlkPartial, LlkRing, LlkScratch, LlkTotals, PowerMax, RingDevice, RpieKernels, StackTable,
+    UpdateSums, ViewAddr, ViewDims, Views,
 };
 
 use super::{
@@ -136,8 +136,8 @@ struct MlState {
     /// Block partial pairs: the β sums of the object then the probe, or one norm sum.
     parts: DeviceBuffer<f32>,
     beta: DeviceBuffer<f32>,
-    /// The line-search pair of every frame.
-    frame_pairs: DeviceBuffer<f32>,
+    /// The line-search pairs of every frame's pixel chunks ([`ptyrs_gpu::gamma_parts`]).
+    gamma_parts: DeviceBuffer<f32>,
     gamma: DeviceBuffer<f32>,
     /// `(sum |x|, sum |x|^2)` of the object and the probe.
     norms: [DeviceBuffer<f32>; 2],
@@ -153,7 +153,7 @@ pub(super) struct MlBufs<'a> {
     pub d: &'a mut [DeviceBuffer<C32>; 2],
     pub parts: &'a mut DeviceBuffer<f32>,
     pub beta: &'a mut DeviceBuffer<f32>,
-    pub frame_pairs: &'a mut DeviceBuffer<f32>,
+    pub gamma_parts: &'a mut DeviceBuffer<f32>,
     pub gamma: &'a mut DeviceBuffer<f32>,
     pub norms: &'a mut [DeviceBuffer<f32>; 2],
     pub icalc: &'a mut DeviceBuffer<f32>,
@@ -179,7 +179,7 @@ impl MlState {
             d: [zeroed(lens[0])?, zeroed(lens[1])?],
             parts: DeviceBuffer::zeroed(stream, 4 * CG_BLOCKS as usize)?,
             beta: pair()?,
-            frame_pairs: DeviceBuffer::zeroed(stream, 2 * dims.nframe as usize)?,
+            gamma_parts: DeviceBuffer::zeroed(stream, 2 * ptyrs_gpu::gamma_parts(dims)? as usize)?,
             gamma: pair()?,
             norms: [pair()?, pair()?],
             icalc: DeviceBuffer::zeroed(stream, 1)?,
@@ -194,7 +194,7 @@ impl MlState {
             d: &mut self.d,
             parts: &mut self.parts,
             beta: &mut self.beta,
-            frame_pairs: &mut self.frame_pairs,
+            gamma_parts: &mut self.gamma_parts,
             gamma: &mut self.gamma,
             norms: &mut self.norms,
             icalc: &mut self.icalc,
@@ -214,6 +214,7 @@ struct RpieScratch {
     plans: Vec<Plan2d>,
     psi: DeviceBuffer<C32>,
     dlt: DeviceBuffer<C32>,
+    max_chunks: DeviceBuffer<f32>,
     omax: DeviceBuffer<f32>,
     ptilde: DeviceBuffer<C32>,
     pmax: DeviceBuffer<f32>,
@@ -231,6 +232,8 @@ pub(super) struct RpieBufs<'a> {
     pub psi: &'a mut DeviceBuffer<C32>,
     /// pty-chi's `Δ`, then the probe step's weighted `Δ`.
     pub dlt: &'a mut DeviceBuffer<C32>,
+    /// [`ptyrs_gpu::RpieKernels::power_max`]'s per-chunk maxes, for up to `nk_max` groups.
+    pub max_chunks: &'a mut DeviceBuffer<f32>,
     /// Per-view `max |O_v|^2`.
     pub omax: &'a mut DeviceBuffer<f32>,
     /// `P / ((1 - a_o) |P|^2 + a_o max_i sum_m |P_m|^2)`.
@@ -251,13 +254,20 @@ impl RpieScratch {
             stacks(stream, dims, to_u32("batch_size", params.batch_size)?)?;
         let len = stack_buf_len(dims, &table);
         let nk_max = table.nf_max() as usize * dims.nmode as usize;
+        let n = to_u32("frame size", plane_len(dims))?;
+        let max_groups = PowerMax {
+            ngroup: to_u32("planes per batch", nk_max)?,
+            nsum: 1,
+            n,
+        };
         Ok(Self {
             batches,
-            n: to_u32("frame size", plane_len(dims))?,
+            n,
             table,
             plans: plans(stream, dims, &lens)?,
             psi: DeviceBuffer::zeroed(stream, len)?,
             dlt: DeviceBuffer::zeroed(stream, len)?,
+            max_chunks: DeviceBuffer::zeroed(stream, max_groups.chunks())?,
             omax: DeviceBuffer::zeroed(stream, nk_max)?,
             ptilde: DeviceBuffer::zeroed(stream, nprobe_values)?,
             pmax: DeviceBuffer::zeroed(stream, 1)?,
@@ -273,6 +283,7 @@ impl RpieScratch {
             plans: Plans(&mut self.plans),
             psi: &mut self.psi,
             dlt: &mut self.dlt,
+            max_chunks: &mut self.max_chunks,
             omax: &mut self.omax,
             ptilde: &mut self.ptilde,
             pmax: &mut self.pmax,

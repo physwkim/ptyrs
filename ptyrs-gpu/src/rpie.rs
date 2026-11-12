@@ -17,6 +17,8 @@ use cuda_core::{DeviceBuffer, LaunchConfig};
 use ptyrs_kernels::pixel::{PIXEL_THREADS, SumPtrs};
 use ptyrs_kernels::rpie::{WeightGeom, rpie_kernels};
 
+pub use ptyrs_kernels::rpie::POWER_CHUNK;
+
 use crate::{C32, Error, Kernels, StackCtl, StackRef, UpdateSums, ViewDims, check_len, dptr};
 
 /// The rPIE kernels, bound to the module a [`Kernels`] loaded.
@@ -76,35 +78,50 @@ impl RpieKernels {
         })
     }
 
-    /// `out[b] = max_i sum_{m < nsum} |x[b * nsum + m, i]|^2` for `ngroup` groups of `nsum`
-    /// planes of `n` values.
+    /// `out[b] = max_i sum_{m < nsum} |x[b * nsum + m, i]|^2` over the groups of `spec`,
+    /// through the per-chunk maxes in `chunks` ([`PowerMax::chunks`] floats).
     pub fn power_max(
         &self,
         ctx: &ExecutionContext,
         x: &DeviceBuffer<C32>,
-        ngroup: u32,
-        nsum: u32,
-        n: u32,
+        spec: PowerMax,
+        chunks: &mut DeviceBuffer<f32>,
         out: &mut DeviceBuffer<f32>,
     ) -> Result<(), Error> {
-        if ngroup == 0 || nsum == 0 || n == 0 {
-            return Err(Error::Shape(format!(
-                "power_max of {ngroup} x {nsum} planes of {n}"
-            )));
+        let PowerMax { ngroup, nsum, n } = spec;
+        if ngroup == 0 || nsum == 0 || n == 0 || ngroup > u16::MAX as u32 {
+            return Err(Error::Shape(format!("empty or too many groups {spec:?}")));
         }
         check_len("x", x, ngroup as usize * nsum as usize * n as usize)?;
+        check_len("chunks", chunks, spec.chunks())?;
         check_len("out", out, ngroup as usize)?;
+        let nchunk = n.div_ceil(POWER_CHUNK);
         let config = LaunchConfig {
-            grid_dim: (ngroup, 1, 1),
+            grid_dim: (nchunk, ngroup, 1),
             block_dim: (PIXEL_THREADS, 1, 1),
             shared_mem_bytes: 0,
         };
         self.base
-            .launch(ctx, &[x.storage()], &[out.storage()], |stream| {
-                // SAFETY: lengths checked above; one PIXEL_THREADS block per group.
+            .launch(ctx, &[x.storage()], &[chunks.storage()], |stream| {
+                // SAFETY: lengths checked above; one PIXEL_THREADS block per (chunk, group).
                 unsafe {
                     self.module
-                        .rpie_power_max(stream, config, dptr(x), nsum, n, dptr(out))
+                        .rpie_power_max(stream, config, dptr(x), nsum, n, dptr(chunks))
+                }
+            })?;
+        let config = LaunchConfig::for_num_elems(ngroup);
+        self.base
+            .launch(ctx, &[chunks.storage()], &[out.storage()], |stream| {
+                // SAFETY: lengths checked above; one thread per group.
+                unsafe {
+                    self.module.rpie_max_chunks(
+                        stream,
+                        config,
+                        dptr(chunks),
+                        nchunk,
+                        ngroup,
+                        dptr(out),
+                    )
                 }
             })
     }
@@ -202,6 +219,21 @@ impl RpieKernels {
                 )
             }
         })
+    }
+}
+
+/// Groups of [`RpieKernels::power_max`]: `ngroup` groups of `nsum` planes of `n` values.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PowerMax {
+    pub ngroup: u32,
+    pub nsum: u32,
+    pub n: u32,
+}
+
+impl PowerMax {
+    /// The floats of the `chunks` scratch: one per group and `POWER_CHUNK` values of a plane.
+    pub fn chunks(&self) -> usize {
+        self.ngroup as usize * self.n.div_ceil(POWER_CHUNK) as usize
     }
 }
 

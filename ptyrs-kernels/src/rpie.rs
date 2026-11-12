@@ -4,6 +4,10 @@
 
 use cuda_host::cuda_module;
 
+/// Values per block of `rpie_power_max`: a plane of `n` values is `ceil(n / POWER_CHUNK)`
+/// contiguous chunks, the last one short.
+pub const POWER_CHUNK: u32 = 2048;
+
 /// Planes and regulariser of `rpie_weight`: `nk` planes of `n` complex values; plane `k`
 /// reads its max at `mx[k * mstride]` (`mstride` 0 or 1).
 #[repr(C)]
@@ -17,6 +21,7 @@ pub struct WeightGeom {
 
 #[cuda_module]
 pub mod rpie_kernels {
+    use super::POWER_CHUNK;
     use crate::pixel::*;
     use crate::*;
     use cuda_device::SharedArray;
@@ -63,22 +68,26 @@ pub mod rpie_kernels {
         }
     }
 
-    /// `out[b] = max_i sum_{m < nsum} |x[(b * nsum + m) * n + i]|^2`: the largest summed
-    /// power of each group of `nsum` planes. One `PIXEL_THREADS` block per group, a fixed
-    /// reduction order.
+    /// `chunks[b * nchunk + c] = max(0, max_i sum_{m < nsum} |x[(b * nsum + m) * n + i]|^2)`
+    /// over `i` in chunk `c = blockIdx.x`, `c * POWER_CHUNK .. min((c + 1) * POWER_CHUNK,
+    /// n)`, of group `b = blockIdx.y` of `nsum` planes, `nchunk = ceil(n / POWER_CHUNK)`;
+    /// [`rpie_max_chunks`] takes each group's max over its chunks.
     ///
     /// # Safety
     ///
-    /// `x` holds `gridDim.x * nsum` planes of `n` complex values, `out` `gridDim.x` floats;
-    /// block `(PIXEL_THREADS, 1, 1)`.
+    /// `x` holds `gridDim.y * nsum` planes of `n` complex values, `chunks` `gridDim.y *
+    /// nchunk` floats; grid `(nchunk, ngroup, 1)`, block `(PIXEL_THREADS, 1, 1)`.
     #[kernel]
-    pub unsafe fn rpie_power_max(x: *const f32, nsum: u32, n: u32, out: *mut f32) {
+    pub unsafe fn rpie_power_max(x: *const f32, nsum: u32, n: u32, chunks: *mut f32) {
         static mut RED: SharedArray<f32, 256> = SharedArray::UNINIT;
-        let b = thread::blockIdx_x() as usize;
+        let b = thread::blockIdx_y() as usize;
+        let c = thread::blockIdx_x() as usize;
         let t = thread::threadIdx_x() as usize;
+        let chunk = POWER_CHUNK as usize;
+        let end = (n as usize).min((c + 1) * chunk);
         let mut m = 0.0f32;
-        let mut i = t;
-        while i < n as usize {
+        let mut i = c * chunk + t;
+        while i < end {
             let p = unsafe { mode_power(x, b * nsum as usize, nsum, n as usize, i) };
             if p > m {
                 m = p;
@@ -97,9 +106,31 @@ pub mod rpie_kernels {
                 half /= 2;
             }
             if t == 0 {
-                *out.add(b) = *s;
+                *chunks.add(b * (n as usize).div_ceil(chunk) + c) = *s;
             }
         }
+    }
+
+    /// `out[b] = max(0, max_c chunks[b * nchunk + c])` for each of `ngroup` groups, one thread
+    /// per group: with [`rpie_power_max`]'s chunks, the largest summed power of each group.
+    ///
+    /// # Safety
+    ///
+    /// `chunks` holds `ngroup * nchunk` floats, `out` `ngroup`.
+    #[kernel]
+    pub unsafe fn rpie_max_chunks(chunks: *const f32, nchunk: u32, ngroup: u32, out: *mut f32) {
+        let b = global_index();
+        if b >= ngroup as usize {
+            return;
+        }
+        let mut m = 0.0f32;
+        for c in 0..nchunk as usize {
+            let p = unsafe { *chunks.add(b * nchunk as usize + c) };
+            if p > m {
+                m = p;
+            }
+        }
+        unsafe { *out.add(b) = m };
     }
 
     /// The rPIE step weights: `out[k, i] = x[k, i] / ((1 - alpha) |w[k, i]|^2 + alpha
