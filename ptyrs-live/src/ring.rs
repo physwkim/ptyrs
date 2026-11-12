@@ -13,6 +13,7 @@
 //! and its address is fixed before the first frame (invariant 9).
 
 use std::collections::VecDeque;
+use std::num::NonZeroUsize;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -291,7 +292,7 @@ pub struct FrameBatch {
 #[derive(Debug, Clone, Copy)]
 pub struct UploaderConfig {
     /// Flush as soon as this many contiguous slots are committed.
-    pub batch: usize,
+    pub batch: NonZeroUsize,
     /// Flush a smaller batch once its oldest slot has waited this long.
     pub flush_ns: i64,
     /// Sleep when a pass did nothing.
@@ -362,10 +363,10 @@ pub fn run_uploader(
             let pending = frontier - issued;
             let s0 = (issued % slots as u64) as usize;
             let waited = wall_ns() - ring.meta[s0].t_commit.load(Ordering::Relaxed);
-            if pending < cfg.batch as u64 && !stopping && waited < cfg.flush_ns {
+            if pending < cfg.batch.get() as u64 && !stopping && waited < cfg.flush_ns {
                 break;
             }
-            let n = (pending as usize).min(cfg.batch).min(slots - s0);
+            let n = (pending as usize).min(cfg.batch.get()).min(slots - s0);
             let seqs = issued..issued + n as u64;
             store.ensure(seqs.clone(), false)?;
             // SAFETY: slots `s0..s0 + n` are committed and not yet released,
@@ -440,7 +441,7 @@ mod tests {
 
     fn cfg() -> UploaderConfig {
         UploaderConfig {
-            batch: 5,
+            batch: NonZeroUsize::new(5).unwrap(),
             flush_ns: 100_000,
             idle: Duration::from_micros(20),
             events: 4,

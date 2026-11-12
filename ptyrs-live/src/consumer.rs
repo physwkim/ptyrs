@@ -262,6 +262,7 @@ mod tests {
 
     use super::*;
     use crate::ring::{Ring, UploaderConfig, run_uploader};
+    use std::num::NonZeroUsize;
 
     /// The input path feeds a graph captured before the first frame: the
     /// store grows 2 MiB at a time under it and every frame is consumed
@@ -281,7 +282,7 @@ mod tests {
         let uploader = {
             let (ring, ctx, stop, store) = (ring.clone(), ctx.clone(), stop.clone(), store.clone());
             let cfg = UploaderConfig {
-                batch: 5,
+                batch: NonZeroUsize::new(5).unwrap(),
                 flush_ns: 100_000,
                 idle: Duration::from_micros(20),
                 events: 4,

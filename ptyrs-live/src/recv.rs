@@ -70,7 +70,7 @@ pub struct RecvCfg {
     /// Only a position that never comes waits this long, holding one worker
     /// throughout; arrival lag on its own connection is < 1 ms.
     pub pos_wait_ms: i64,
-    pub batch: usize,
+    pub batch: NonZeroUsize,
     pub flush_us: i64,
     pub idle_us: u64,
     pub ring_slots: usize,
@@ -107,7 +107,7 @@ impl Default for RecvCfg {
             queue: NonZeroUsize::new(256).unwrap(),
             verify_every: 0,
             pos_wait_ms: 1000,
-            batch: 16,
+            batch: NonZeroUsize::new(16).unwrap(),
             flush_us: 500,
             idle_us: 50,
             ring_slots: 1024,
@@ -820,7 +820,7 @@ mod tests {
             queue: NonZeroUsize::new(64).unwrap(),
             verify_every: 10,
             pos_wait_ms: 50,
-            batch: 8,
+            batch: NonZeroUsize::new(8).unwrap(),
             flush_us: 250,
             idle_us: 20,
             ring_slots: 256,
@@ -1041,6 +1041,7 @@ mod tests {
             ("[model.ptycho]\npath = \"spiral\"", "spiral"),
             ("source = \"udp\"", "udp"),
             ("workers = 0", "workers"),
+            ("batch = 0", "batch"),
             ("graph-batch = 0", "graph-batch"),
             ("[source.zmq]\n[source.h5]\npath = \"a.h5\"", "source"),
         ] {
