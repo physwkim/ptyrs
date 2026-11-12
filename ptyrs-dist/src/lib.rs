@@ -12,7 +12,7 @@ pub mod tomo;
 pub mod topo;
 pub mod worker;
 
-pub use ap::{ApConfig, ApProblem, DistAp, NLEAF};
+pub use ap::{ApConfig, ApProblem, DistAp, NLEAF, RegionLoad};
 pub use exchange::{Exchange, Layout};
 pub use partition::{Csr, DEFAULT_TILE, Partition, Region, Scheme, TileGrid};
 pub use worker::{Gpu, Workers};

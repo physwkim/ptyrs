@@ -567,6 +567,17 @@ impl State {
     }
 }
 
+/// What one region computes and exchanges each cycle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RegionLoad {
+    /// Frames whose exit waves it computes.
+    pub computed: usize,
+    /// Other regions' frames whose exit waves it copies for its object sums.
+    pub copied: usize,
+    /// Halo tiles it pulls after the object update.
+    pub halo_tiles: usize,
+}
+
 /// AP over 1, 2 or 4 GPUs, one region each.
 pub struct DistAp {
     workers: Workers<State>,
@@ -633,6 +644,22 @@ impl DistAp {
 
     pub fn ngpu(&self) -> usize {
         self.workers.len()
+    }
+
+    /// Per region, in region order.
+    pub fn loads(&self) -> Vec<RegionLoad> {
+        self.plan
+            .regions
+            .iter()
+            .map(|rp| {
+                let computed = rp.own.iter().map(|&s| rp.stacks[s].frames.len()).sum();
+                RegionLoad {
+                    computed,
+                    copied: rp.global.len() - computed,
+                    halo_tiles: rp.halo_read.len(),
+                }
+            })
+            .collect()
     }
 
     /// Runs `ncycle` cycles and returns once they are complete.
