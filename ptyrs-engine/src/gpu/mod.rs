@@ -56,10 +56,9 @@ pub struct GpuOptions {
     /// this many records ahead of it, or at the end of an algorithm call.
     pub llk_slots: usize,
     /// Project AP and DM stacks, take ML's gradients and the LLK pass's partials by M2's fused
-    /// passes
-    /// ([`ptyrs_gpu::Kernels::fused_project`]; frame sides 128 or 256, and [`GpuPtycho::new`]
-    /// fails on others) instead of M1's launch sequence. The two agree to rounding, not bit
-    /// for bit.
+    /// passes ([`ptyrs_gpu::Kernels::fused_project`]; frame sides in
+    /// [`ptyrs_gpu::FUSED_SIDES`], and [`GpuPtycho::new`] fails on others) instead of M1's
+    /// launch sequence. The two agree to rounding, not bit for bit.
     pub fused: bool,
 }
 

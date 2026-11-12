@@ -362,7 +362,13 @@ impl Device {
             stacks(&stream, &dims, to_u32("stack_size", options.stack_size)?)?;
         let len = stack_buf_len(&dims, &table);
         let passes = if options.fused {
-            Passes::Fused(FusedBufs::new(&stream, &dims, table.nf_max())?)
+            let f = FusedBufs::new(&stream, &dims, table.nf_max()).map_err(|e| match e {
+                GpuError::Shape(m) => EngineError::Invalid(format!(
+                    "{m}; GpuOptions {{ fused: false, .. }} runs M1's launches instead"
+                )),
+                e => e.into(),
+            })?;
+            Passes::Fused(f)
         } else {
             Passes::M1 {
                 plans: plans(&stream, &dims, &lens)?,

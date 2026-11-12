@@ -7,7 +7,7 @@
 //! Euclidian LLK and photon count per cycle), `llk_truth.txt` (the same four for the truth the
 //! counts were drawn from, [`ptyrs_engine::sim::Simulation::truth_llk`]) and `final_rust.h5`,
 //! from the CPU oracle or, with `--gpu`, from [`GpuPtycho`] on CUDA device 0 with the default
-//! stacks, by the fused passes on 128- or 256-pixel frames and by M1's launches on others. ML
+//! stacks, by the fused passes on [`ptyrs_gpu::FUSED_SIDES`] frames, M1's launches on others. ML
 //! updates object and probe from the end of `ML_WARMUP` AP cycles, which `init.h5` holds.
 //! rPIE also writes
 //! `views.txt` (object window corner `oy ox` per frame), `quad.txt` (`re im` of the quadratic
@@ -112,7 +112,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let ctx = CudaContext::new(0).map_err(EngineError::from)?;
         let (object, probe) = p.into_modes();
         let options = GpuOptions {
-            fused: matches!(frame, 128 | 256),
+            fused: ptyrs_gpu::FUSED_SIDES.contains(&(frame as u32)),
             ..GpuOptions::default()
         };
         eprintln!("GPU passes: {}", if options.fused { "fused" } else { "m1" });

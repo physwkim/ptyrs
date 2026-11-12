@@ -10,6 +10,7 @@ use ptyrs_engine::{
     ApParams, Backend, DmParams, GpuOptions, GpuPtycho, Llk, LlkRecord, MlParams, Params, Ptycho,
     RpieParams, Step,
 };
+use ptyrs_gpu::FUSED_SIDES;
 
 mod common;
 mod ptychi;
@@ -36,9 +37,9 @@ const M1: Setup = Setup {
     },
 };
 
-/// The fused passes on 128-pixel frames, the smallest side they run.
+/// The fused passes on the smallest side they run.
 const FUSED: Setup = Setup {
-    frame: 128,
+    frame: FUSED_SIDES[0] as usize,
     options: GpuOptions {
         fused: true,
         ..M1.options
@@ -373,8 +374,17 @@ fn gpu_rejects_what_it_cannot_run() {
         ..M1.options
     };
     assert!(GpuPtycho::new(&ctx(), &scan, object.clone(), probe.clone(), no_ring).is_err());
-    // the fused passes have no 32-point FFT
-    assert!(GpuPtycho::new(&ctx(), &scan, object, probe, FUSED.options).is_err());
+    // the fused passes have no 32-point FFT; the error says which sides they take and how
+    // to run without them
+    assert!(!FUSED_SIDES.contains(&(M1.frame as u32)));
+    let err = GpuPtycho::new(&ctx(), &scan, object, probe, FUSED.options)
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(
+        err.contains(&format!("{FUSED_SIDES:?}")) && err.contains("fused: false"),
+        "{err}"
+    );
 }
 
 /// AP, DM and ML cycles (AP's and ML's with an LLK, DM's and ML's first included), rPIE
