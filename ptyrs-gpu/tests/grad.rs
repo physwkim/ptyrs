@@ -395,3 +395,70 @@ fn poisson_grad_matches_f64() {
         }
     }
 }
+
+/// Two arrays added into one zeroed parts buffer, the larger past `CG_BLOCKS *
+/// PIXEL_THREADS` so threads stride: the summed pair is `(sum |x|, sum |x|^2)` of both.
+#[test]
+fn norm_parts_add_up_both_arrays() {
+    let (stream, ctx, _, k) = setup();
+    let mut parts = DeviceBuffer::<f32>::zeroed(&stream, 2 * CG_BLOCKS as usize).unwrap();
+    let mut pair = DeviceBuffer::<f32>::zeroed(&stream, 2).unwrap();
+    let mut want = [0.0f64; 2];
+    for (seed, n) in [(23u64, 1000usize), (29, 300_000)] {
+        let x = noise(n, seed, 2.0);
+        for c in &x {
+            let s = (c.re as f64).powi(2) + (c.im as f64).powi(2);
+            want[0] += s.sqrt();
+            want[1] += s;
+        }
+        k.norm_parts(&ctx, &up(&stream, &x), n as u32, &mut parts)
+            .unwrap();
+    }
+    k.sum_parts(&ctx, &parts, CG_BLOCKS, &mut pair).unwrap();
+    let got = pair.to_host_vec(&stream).unwrap();
+    for (g, w) in got.iter().zip(want) {
+        assert!(((*g as f64) - w).abs() < 1e-5 * w, "{got:?} vs {want:?}");
+    }
+}
+
+/// The object and probe scale factors of `ScaleObjProbe` from given norm pairs, with the
+/// object longer than the probe and the other way round.
+#[test]
+fn scale_obj_probe_matches_f64() {
+    let (stream, ctx, _, k) = setup();
+    let (os, ps, psi2, total) = (300.0f32, 40.0f32, 5.0e4f32, 2.0e6f32);
+    let norms = [
+        up(&stream, &[os, 0.0]),
+        up(&stream, &[ps, 0.0]),
+        up(&stream, &[0.0, psi2]),
+    ];
+    let s = (total as f64 / psi2 as f64).sqrt();
+    let fo = (ps as f64 / os as f64 * s).sqrt();
+    let fp = (os as f64 / ps as f64 * s).sqrt();
+    for (nobj, nprobe) in [(2000usize, 300usize), (100, 700)] {
+        let (o0, p0) = (noise(nobj, 31, 1.0), noise(nprobe, 37, 3.0));
+        let (mut obj, mut probe) = (up(&stream, &o0), up(&stream, &p0));
+        k.scale_obj_probe(
+            &ctx,
+            &mut obj,
+            &mut probe,
+            [&norms[0], &norms[1], &norms[2]],
+            total,
+        )
+        .unwrap();
+        for (x0, got, f) in [
+            (&o0, obj.to_host_vec(&stream).unwrap(), fo),
+            (&p0, probe.to_host_vec(&stream).unwrap(), fp),
+        ] {
+            assert_eq!(got.len(), x0.len());
+            for (g, x) in got.iter().zip(x0) {
+                let want = (x.re as f64 * f, x.im as f64 * f);
+                let err = (g.re as f64 - want.0).hypot(g.im as f64 - want.1);
+                assert!(
+                    err < 1e-6 * want.0.hypot(want.1).max(1e-3),
+                    "{g:?} vs {want:?}"
+                );
+            }
+        }
+    }
+}

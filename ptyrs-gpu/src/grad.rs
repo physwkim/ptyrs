@@ -17,7 +17,7 @@
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig};
 pub use ptyrs_kernels::grad::CG_BLOCKS;
-use ptyrs_kernels::grad::{GammaPtrs, ObjProbePtrs, grad_kernels};
+use ptyrs_kernels::grad::{GammaPtrs, NormPtrs, ObjProbePtrs, grad_kernels};
 use ptyrs_kernels::pixel::{PIXEL_THREADS, SumPtrs};
 
 use crate::ops::grid_1d;
@@ -129,6 +129,79 @@ impl GradKernels {
                         .cg_sum_parts(stream, config, dptr(parts), npart, dptr(pair))
                 }
             })
+    }
+
+    /// Adds `(sum |x|, sum |x|^2)` over the first `n` values of `x` to the first `CG_BLOCKS`
+    /// pairs of `parts`, as block partials that [`Self::sum_parts`] totals; zero `parts` to
+    /// start a sum, then add arrays or stacks in a fixed order.
+    pub fn norm_parts(
+        &self,
+        ctx: &ExecutionContext,
+        x: &DeviceBuffer<C32>,
+        n: u32,
+        parts: &mut DeviceBuffer<f32>,
+    ) -> Result<(), Error> {
+        check_len("x", x, n as usize)?;
+        check_len("parts", parts, 2 * CG_BLOCKS as usize)?;
+        let config = LaunchConfig {
+            grid_dim: (CG_BLOCKS, 1, 1),
+            block_dim: (PIXEL_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        self.base
+            .launch(ctx, &[x.storage()], &[parts.storage()], |stream| {
+                // SAFETY: lengths checked above; CG_BLOCKS blocks of PIXEL_THREADS.
+                unsafe {
+                    self.module
+                        .cg_norm_parts(stream, config, dptr(x), n, dptr(parts))
+                }
+            })
+    }
+
+    /// PyNX `ScaleObjProbe(absolute=True)` of `obj` and `probe` from the [`Self::sum_parts`]
+    /// totals of [`Self::norm_parts`] `norms = [object, probe, exit waves of every view]`
+    /// and the unmasked observed photons `total`: with `s = sqrt(total / sum |psi|^2)`,
+    /// `obj *= sqrt(sum |P| / sum |O| * s)` and `probe *= sqrt(sum |O| / sum |P| * s)`.
+    pub fn scale_obj_probe(
+        &self,
+        ctx: &ExecutionContext,
+        obj: &mut DeviceBuffer<C32>,
+        probe: &mut DeviceBuffer<C32>,
+        norms: [&DeviceBuffer<f32>; 3],
+        total: f32,
+    ) -> Result<(), Error> {
+        for (what, pair) in ["obj", "probe", "psi"].into_iter().zip(norms) {
+            check_len(what, pair, 2)?;
+        }
+        let len = |what: &str, b: &DeviceBuffer<C32>| {
+            u32::try_from(b.len())
+                .map_err(|_| Error::Shape(format!("{what} holds {} values, over u32", b.len())))
+        };
+        let (nobj, nprobe) = (len("obj", obj)?, len("probe", probe)?);
+        let config = grid_1d(nobj.max(nprobe) as usize)?;
+        let reads = norms.map(|b| b.storage());
+        let writes = [obj.storage(), probe.storage()];
+        self.base.launch(ctx, &reads, &writes, |stream| {
+            let [o, p, psi] = norms.map(dptr::<f32, f32>);
+            let norms = NormPtrs {
+                obj: o,
+                probe: p,
+                psi,
+            };
+            // SAFETY: each pair holds two floats; one thread per element of the longer array.
+            unsafe {
+                self.module.cg_scale_obj_probe(
+                    stream,
+                    config,
+                    dptr(obj),
+                    nobj,
+                    dptr(probe),
+                    nprobe,
+                    norms,
+                    total,
+                )
+            }
+        })
     }
 
     /// `d = β d - g` with `β = beta[0] / beta[1]`, or 0 where that is negative or not finite;

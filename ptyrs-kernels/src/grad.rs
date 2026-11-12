@@ -30,9 +30,18 @@ pub struct ObjProbePtrs {
     pub probe: *const f32,
 }
 
+/// The `(sum |x|, sum |x|^2)` pairs of the object, the probe and every view's exit wave.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct NormPtrs {
+    pub obj: *const f32,
+    pub probe: *const f32,
+    pub psi: *const f32,
+}
+
 #[cuda_module]
 pub mod grad_kernels {
-    use super::{GammaPtrs, ObjProbePtrs};
+    use super::{GammaPtrs, NormPtrs, ObjProbePtrs};
     use crate::pixel::*;
     use crate::*;
     use cuda_device::SharedArray;
@@ -62,7 +71,7 @@ pub mod grad_kernels {
             i += stride;
         }
         let out = unsafe { part.add(2 * thread::blockIdx_x() as usize) };
-        unsafe { super::block_pair((&raw mut RED).cast::<f32>(), acc, out) }
+        unsafe { super::store_pair((&raw mut RED).cast::<f32>(), acc, out) }
     }
 
     /// `out[0..2] = sum_b part[2b .. 2b + 2]` over `npart` pairs.
@@ -83,7 +92,70 @@ pub mod grad_kernels {
             }
             b += PIXEL_THREADS as usize;
         }
-        unsafe { super::block_pair((&raw mut RED).cast::<f32>(), acc, out) }
+        unsafe { super::store_pair((&raw mut RED).cast::<f32>(), acc, out) }
+    }
+
+    /// Adds one array's block sums `(sum |x|, sum |x|^2)` to the `CG_BLOCKS` pairs of `part`:
+    /// block `b` over the elements `i ≡ b * PIXEL_THREADS + t (mod CG_BLOCKS * PIXEL_THREADS)`.
+    ///
+    /// # Safety
+    ///
+    /// `x` holds `n` complex values, `part` `2 * CG_BLOCKS` floats; grid `(CG_BLOCKS, 1, 1)`,
+    /// block `(PIXEL_THREADS, 1, 1)`.
+    #[kernel]
+    pub unsafe fn cg_norm_parts(x: *const f32, n: u32, part: *mut f32) {
+        static mut RED: SharedArray<f32, 512> = SharedArray::UNINIT;
+        let stride = thread::gridDim_x() as usize * PIXEL_THREADS as usize;
+        let mut acc = [0.0f32; 2];
+        let mut i = global_index();
+        while i < n as usize {
+            let v = unsafe { load_c(x, i) };
+            let s = v.0 * v.0 + v.1 * v.1;
+            acc[0] += s.sqrt();
+            acc[1] += s;
+            i += stride;
+        }
+        let sum = unsafe { super::block_pair((&raw mut RED).cast::<f32>(), acc) };
+        if thread::threadIdx_x() == 0 {
+            unsafe {
+                let out = part.add(2 * thread::blockIdx_x() as usize);
+                *out += sum[0];
+                *out.add(1) += sum[1];
+            }
+        }
+    }
+
+    /// PyNX `ScaleObjProbe(absolute=True)` from the pairs `(sum |x|, sum |x|^2)` of the
+    /// object, the probe and the exit waves of every view: with `s = sqrt(total / psi[1])`,
+    /// `obj *= sqrt(probe[0] / obj[0] * s)` and `probe *= sqrt(obj[0] / probe[0] * s)`.
+    ///
+    /// # Safety
+    ///
+    /// `obj` holds `nobj` complex values, `probe` `nprobe`, each of `norms` two floats; one
+    /// thread per element of the longer array.
+    #[kernel]
+    pub unsafe fn cg_scale_obj_probe(
+        obj: *mut f32,
+        nobj: u32,
+        probe: *mut f32,
+        nprobe: u32,
+        norms: NormPtrs,
+        total: f32,
+    ) {
+        let i = global_index();
+        unsafe {
+            let (os, ps) = (*norms.obj, *norms.probe);
+            let s = (total / *norms.psi.add(1)).sqrt();
+            for (x, len, f) in [
+                (obj, nobj, (ps / os * s).sqrt()),
+                (probe, nprobe, (os / ps * s).sqrt()),
+            ] {
+                if i < len as usize {
+                    let v = load_c(x, i);
+                    store_c(x, i, (v.0 * f, v.1 * f));
+                }
+            }
+        }
     }
 
     /// PyNX `cu_linear_comb_fcfc_beta`: `d = beta d - g` with `beta = beta_pair[0] /
@@ -248,7 +320,7 @@ pub mod grad_kernels {
             d += PIXEL_THREADS as usize;
         }
         let o = unsafe { out.add(2 * (f0 as usize + fl)) };
-        unsafe { super::block_pair((&raw mut RED).cast::<f32>(), acc, o) }
+        unsafe { super::store_pair((&raw mut RED).cast::<f32>(), acc, o) }
     }
 
     /// PyNX `cu_linear_comb_fcfc_gamma`: with `gamma = gamma_pair[0] / gamma_pair[1]`,
@@ -277,15 +349,14 @@ pub mod grad_kernels {
     }
 }
 
-/// Block sums of each thread's `acc`, written by thread 0 to `out[0..2]`; `s` is two
-/// `PIXEL_THREADS` segments of shared memory. Every thread of the block must call it.
+/// Block sums of each thread's `acc`, returned to every thread; `s` is two `PIXEL_THREADS`
+/// segments of shared memory. Every thread of the block must call it.
 ///
 /// # Safety
 ///
-/// `s` holds `2 * PIXEL_THREADS` shared floats, `out` two floats; block
-/// `(PIXEL_THREADS, 1, 1)`.
+/// `s` holds `2 * PIXEL_THREADS` shared floats; block `(PIXEL_THREADS, 1, 1)`.
 #[device]
-unsafe fn block_pair(s: *mut f32, acc: [f32; 2], out: *mut f32) {
+unsafe fn block_pair(s: *mut f32, acc: [f32; 2]) -> [f32; 2] {
     let t = thread::threadIdx_x() as usize;
     let seg = PIXEL_THREADS as usize;
     unsafe {
@@ -293,9 +364,22 @@ unsafe fn block_pair(s: *mut f32, acc: [f32; 2], out: *mut f32) {
             *s.add(j * seg + t) = a;
             crate::block_sum(s.add(j * seg));
         }
-        if t == 0 {
-            *out = *s;
-            *out.add(1) = *s.add(seg);
+        [*s, *s.add(seg)]
+    }
+}
+
+/// [`block_pair`] of `acc`, which thread 0 writes to `out[0..2]`.
+///
+/// # Safety
+///
+/// As [`block_pair`]; `out` holds two floats.
+#[device]
+unsafe fn store_pair(s: *mut f32, acc: [f32; 2], out: *mut f32) {
+    let sum = unsafe { block_pair(s, acc) };
+    if thread::threadIdx_x() == 0 {
+        unsafe {
+            *out = sum[0];
+            *out.add(1) = sum[1];
         }
     }
 }
