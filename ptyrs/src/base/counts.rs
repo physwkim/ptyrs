@@ -105,6 +105,17 @@ impl Counts {
         self.data.iter().filter(|&&v| v != MASKED).count()
     }
 
+    /// Sum of the unmasked counts, added as integers, so exact in any order below 2^53.
+    pub fn total(&self) -> f64 {
+        let sum: u64 = self
+            .data
+            .iter()
+            .filter(|&&v| v != MASKED)
+            .map(|&v| u64::from(v))
+            .sum();
+        sum as f64
+    }
+
     /// `[ny, nx]` pixels masked in every frame (the part a CXI `detector_1/mask` can carry).
     pub fn detector_mask(&self) -> Vec<bool> {
         let plane = self.dims[1] * self.dims[2];

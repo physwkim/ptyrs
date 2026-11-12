@@ -66,7 +66,7 @@ impl Observed {
 
 #[cfg(test)]
 mod tests {
-    use crate::base::MASKED;
+    use crate::base::{MASKED, MAX_COUNT};
 
     use super::*;
 
@@ -80,5 +80,23 @@ mod tests {
         assert_eq!(o.frames(0..1)[0], None);
         assert_eq!(o.frames(0..1)[1], Some(16.0));
         assert_eq!(o.nb_obs(), 23);
+    }
+
+    /// The direct sum of the counts is the total bit for bit, with masked pixels and full
+    /// counts taking it past 2^24.
+    #[test]
+    fn counts_total_is_observed_total() {
+        let dims = [64, 32, 32];
+        let raw = (0..dims.iter().product::<usize>())
+            .map(|i| match i % 7 {
+                0 => MASKED,
+                1 => MAX_COUNT,
+                _ => (i % 4093) as u16,
+            })
+            .collect();
+        let counts = Counts::from_raw(dims, raw).unwrap();
+        let total = Observed::from_counts(&counts).total();
+        assert!(total > f64::from(1 << 24));
+        assert_eq!(counts.total().to_bits(), total.to_bits());
     }
 }
