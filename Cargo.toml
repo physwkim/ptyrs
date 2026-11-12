@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["ptyrs-core", "ptyrs-fft", "ptyrs-io", "ptyrs-kernels", "ptyrs-live", "ptyrs-refgen"]
+members = ["ptyrs-core", "ptyrs-engine", "ptyrs-fft", "ptyrs-gpu", "ptyrs-io", "ptyrs-kernels", "ptyrs-live", "ptyrs-refgen"]
 
 [workspace.package]
 version = "0.0.1"
@@ -24,3 +24,4 @@ rand_distr = "0.4"
 rustfft = "6"
 rust-hdf5 = "0.7.10"
 ptyrs-core = { path = "ptyrs-core" }
+ptyrs-io = { path = "ptyrs-io" }

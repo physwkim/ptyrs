@@ -3,6 +3,7 @@
 #[path = "../tests/common.rs"]
 mod common;
 
+use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{Context, DeviceBuffer};
 use ptyrs_fft::{C32, Plan2d};
 
@@ -17,18 +18,19 @@ fn main() {
     let (n, batch) = (256, 64);
     let ctx = Context::new(0).unwrap();
     let stream = ctx.new_stream().unwrap();
-    let plan = Plan2d::new(&stream, n, batch).unwrap();
+    let mut plan = Plan2d::new(&stream, n, batch).unwrap();
+    let ex = ExecutionContext::new(stream.clone());
     let host = common::random_c32(n * n * batch, 0x5eed);
     let d_in = DeviceBuffer::from_host(&stream, &host).unwrap();
     let mut d_out = DeviceBuffer::<C32>::zeroed(&stream, host.len()).unwrap();
     std::fs::write(dir.join("in.f32"), bytes(&host)).unwrap();
-    plan.forward(&d_in, &mut d_out).unwrap();
+    plan.forward(&ex, &d_in, &mut d_out).unwrap();
     std::fs::write(
         dir.join("fwd.f32"),
         bytes(&d_out.to_host_vec(&stream).unwrap()),
     )
     .unwrap();
-    plan.inverse(&d_in, &mut d_out).unwrap();
+    plan.inverse(&ex, &d_in, &mut d_out).unwrap();
     std::fs::write(
         dir.join("inv.f32"),
         bytes(&d_out.to_host_vec(&stream).unwrap()),
