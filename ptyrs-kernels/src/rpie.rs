@@ -131,4 +131,27 @@ pub mod rpie_kernels {
             store_c(out, t, (v.0 / d, v.1 / d));
         }
     }
+
+    /// The rPIE step, consuming its sums: `x[i] += s * num[i]`, then `num[i] = den[i] = 0`.
+    /// Product and sum round separately, as `scale_c32` then `add_c32` did. One thread per
+    /// element.
+    ///
+    /// # Safety
+    ///
+    /// `x` and `sums.num` hold `n` complex values, `sums.den` `n` floats.
+    #[kernel]
+    pub unsafe fn rpie_step(x: *mut f32, sums: SumPtrs, n: u32, s: f32) {
+        use cuda_device::float::{add_rn_f32, mul_rn_f32};
+        let g = global_index();
+        if g >= n as usize {
+            return;
+        }
+        unsafe {
+            let (a, d) = (load_c(x, g), load_c(sums.num, g));
+            let step = |a: f32, d: f32| add_rn_f32(a, mul_rn_f32(d, s));
+            store_c(x, g, (step(a.0, d.0), step(a.1, d.1)));
+            store_c(sums.num, g, (0.0, 0.0));
+            *sums.den.add(g) = 0.0;
+        }
+    }
 }

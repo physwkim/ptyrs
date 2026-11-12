@@ -36,7 +36,6 @@ impl GpuPtycho {
         llk: bool,
     ) -> Result<(), GpuError> {
         let (o, p) = (params.obj_inertia, params.probe_inertia);
-        self.zero_sums(ctx, o, p)?;
         for s in 0..self.stacks.len() {
             self.kernels.obj_probe_to_psi(
                 ctx,

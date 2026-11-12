@@ -141,7 +141,6 @@ impl GpuPtycho {
                 &mut bufs.ptilde,
                 spec,
             )?;
-            self.obj_sums.zero(ctx)?;
             k.psi_to_obj(
                 ctx,
                 &self.views,
@@ -168,7 +167,6 @@ impl GpuPtycho {
                 alpha: params.probe_alpha as f32,
             };
             rk.weight_inplace(ctx, &mut bufs.dlt, &bufs.psi, &bufs.omax, spec)?;
-            self.probe_sums.zero(ctx)?;
             k.psi_to_probe(
                 ctx,
                 &self.views,
@@ -179,13 +177,18 @@ impl GpuPtycho {
             )?;
         }
         if let Some(step) = params.obj_step {
-            k.scale_c32(ctx, &mut self.obj_sums.num, self.obj_len, step as f32)?;
-            k.add_c32(ctx, &mut self.obj, &self.obj_sums.num, self.obj_len)?;
+            let s = step as f32;
+            rk.step(ctx, &mut self.obj, &mut self.obj_sums, self.obj_len, s)?;
         }
         if let Some(step) = params.probe_step {
-            let s = step / frames.nf() as f64;
-            k.scale_c32(ctx, &mut self.probe_sums.num, self.probe_len, s as f32)?;
-            k.add_c32(ctx, &mut self.probe, &self.probe_sums.num, self.probe_len)?;
+            let s = (step / frames.nf() as f64) as f32;
+            rk.step(
+                ctx,
+                &mut self.probe,
+                &mut self.probe_sums,
+                self.probe_len,
+                s,
+            )?;
         }
         Ok(())
     }

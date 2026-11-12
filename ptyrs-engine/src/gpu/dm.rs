@@ -71,7 +71,6 @@ impl GpuPtycho {
                 if o.is_none() && p.is_none() {
                     continue;
                 }
-                self.zero_sums(ctx, o, p)?;
                 for s in 0..self.stacks.len() {
                     self.accumulate(ctx, s, o.is_some(), p.is_some())?;
                 }

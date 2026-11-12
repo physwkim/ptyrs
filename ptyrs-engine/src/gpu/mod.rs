@@ -506,24 +506,8 @@ impl GpuPtycho {
         Ok(())
     }
 
-    /// Zeroes the sums of the arrays that have an inertia.
-    fn zero_sums(
-        &mut self,
-        ctx: &ExecutionContext,
-        obj: Option<f64>,
-        probe: Option<f64>,
-    ) -> Result<(), GpuError> {
-        if obj.is_some() {
-            self.obj_sums.zero(ctx)?;
-        }
-        if probe.is_some() {
-            self.probe_sums.zero(ctx)?;
-        }
-        Ok(())
-    }
-
-    /// PyNX `ObjNorm` / `ProbeNorm` from the accumulated sums, for the arrays that have an
-    /// inertia; the object only on the tiles some view reaches.
+    /// PyNX `ObjNorm` / `ProbeNorm` from the accumulated sums, consuming them, for the arrays
+    /// that have an inertia; the object only on the tiles some view reaches.
     fn apply_sums(
         &mut self,
         ctx: &ExecutionContext,

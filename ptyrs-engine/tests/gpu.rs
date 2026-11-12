@@ -159,6 +159,45 @@ fn rpie_matches_cpu() {
     }
 }
 
+/// Every update consumes its sums, so each algorithm starts from zero sums whatever ran
+/// before: rPIE's steps, then AP's and DM's updates, against the CPU.
+#[test]
+fn algorithm_switches_match_cpu() {
+    let (scan, object, probe) = start(2, true);
+    let mut cpu = Ptycho::new(&scan, object.clone(), probe.clone()).unwrap();
+    let mut gpu = GpuPtycho::new(&ctx(), &scan, object, probe, STACK).unwrap();
+    let (o, p) = UPDATES[2];
+    let steps = [
+        Params::Rpie(common::RPIE),
+        Params::Ap(ApParams {
+            obj_inertia: o,
+            probe_inertia: p,
+            calc_llk: 1,
+            zero_phase_ramp: false,
+        }),
+        Params::Dm(DmParams {
+            obj_inertia: o,
+            probe_inertia: p,
+            calc_llk: 1,
+            ..DmParams::default()
+        }),
+        Params::Rpie(common::RPIE),
+    ];
+    for params in steps {
+        let step = Step { params, count: 3 };
+        cpu.run(&step).unwrap();
+        gpu.run(&step).unwrap();
+    }
+    check(
+        [
+            llk_rel(gpu.history(), cpu.history()),
+            rel_l2(&gpu.object().unwrap(), cpu.object()),
+            rel_l2(&gpu.probe().unwrap(), cpu.probe()),
+        ],
+        [1e-4, 1e-4, 1e-4],
+    );
+}
+
 #[test]
 fn gpu_rejects_what_it_cannot_run() {
     let (scan, object, probe) = start(1, false);

@@ -6,20 +6,20 @@
 //! inverse FFT; `dlt -= psi` (`scale_c32(psi, -1)`, `add_c32`), so `dlt` is pty-chi's
 //! `Δ`. Object step: [`RpieKernels::power_max`] of the probe (all modes summed) and
 //! [`RpieKernels::weight`] of the probe by itself give `P~ = P / ((1 - a) |P|^2 + a max)`,
-//! and `psi_to_obj(dlt, P~)` into zeroed sums yields the object step's direction in `num`.
-//! Probe step: `obj_probe_to_psi` with a probe of ones gives the windows `O_v q`;
-//! [`RpieKernels::power_max`] per plane and [`RpieKernels::weight_inplace`] of `dlt` by them,
-//! then `psi_to_probe(dlt, O)` into zeroed sums. Both steps read the batch-start arrays:
-//! add the scaled `num`s to the object and probe only after both sums are taken.
+//! and `psi_to_obj(dlt, P~)` into the (consumed, so zero) sums yields the object step's
+//! direction in `num`. Probe step: `obj_probe_to_psi` with a probe of ones gives the windows
+//! `O_v q`; [`RpieKernels::power_max`] per plane and [`RpieKernels::weight_inplace`] of `dlt`
+//! by them, then `psi_to_probe(dlt, O)`. Both steps read the batch-start arrays: apply
+//! [`RpieKernels::step`], which consumes the sums, only after both sums are taken.
 
 use std::ops::Range;
 
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{DeviceBuffer, LaunchConfig};
-use ptyrs_kernels::pixel::PIXEL_THREADS;
+use ptyrs_kernels::pixel::{PIXEL_THREADS, SumPtrs};
 use ptyrs_kernels::rpie::{WeightGeom, rpie_kernels};
 
-use crate::{C32, Error, Kernels, Views, check_len, dptr};
+use crate::{C32, Error, Kernels, UpdateSums, Views, check_len, dptr};
 
 /// The rPIE kernels, bound to the module a [`Kernels`] loaded.
 #[derive(Clone, Debug)]
@@ -154,6 +154,34 @@ impl RpieKernels {
         let reads = [w.storage(), mx.storage()];
         let ptrs = [dptr(x), dptr(w), dptr(mx), dptr(x)];
         self.launch_weight(ctx, spec, ptrs, &reads, &[x.storage()])
+    }
+
+    /// The rPIE step of the `n` values of `x` from `sums`, consuming them: `x += s * num`,
+    /// then `num` and `den` are zero.
+    pub fn step(
+        &self,
+        ctx: &ExecutionContext,
+        x: &mut DeviceBuffer<C32>,
+        sums: &mut UpdateSums,
+        n: u32,
+        s: f32,
+    ) -> Result<(), Error> {
+        check_len("x", x, n as usize)?;
+        check_len("sums.num", &sums.num, n as usize)?;
+        check_len("sums.den", &sums.den, n as usize)?;
+        if n == 0 {
+            return Ok(());
+        }
+        let (_, config) = elems(n as usize)?;
+        let writes = [x.storage(), sums.num.storage(), sums.den.storage()];
+        self.base.launch(ctx, &[], &writes, |stream| {
+            let sums = SumPtrs {
+                num: dptr(&sums.num),
+                den: dptr(&sums.den),
+            };
+            // SAFETY: lengths checked above.
+            unsafe { self.module.rpie_step(stream, config, dptr(x), sums, n, s) }
+        })
     }
 
     /// Launches `rpie_weight` on `[x, w, mx, out]`, which [`Weight::check`] and the caller
