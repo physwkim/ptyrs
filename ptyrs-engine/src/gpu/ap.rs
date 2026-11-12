@@ -13,13 +13,14 @@ impl GpuPtycho {
     /// last stack, both updates from the sums, which read only the old arrays.
     pub fn ap(&mut self, params: &ApParams, ncycle: usize) -> Result<(), EngineError> {
         for ic in 0..ncycle {
-            if llk_due(params.calc_llk, ic, ncycle) {
-                let ctx = self.dev.context();
-                self.dev.lend().ap_cycle(&ctx, params, true)?;
+            let llk = llk_due(params.calc_llk, ic, ncycle);
+            self.dev.steady(Epoch::Ap {
+                params: *params,
+                llk,
+            })?;
+            if llk {
                 let l = self.read_llk()?;
                 self.record(Algorithm::Ap, l);
-            } else {
-                self.dev.steady(Epoch::Ap(*params))?;
             }
             self.cycle += 1;
         }

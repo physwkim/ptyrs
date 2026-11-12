@@ -18,8 +18,7 @@ use ptyrs_gpu::{
 use super::{Epoch, Frames, GpuOptions, plane_len, stack_buf_len, stacks, to_u32};
 use crate::{ApParams, DmParams, EngineError, RpieParams};
 
-/// Every buffer, module and plan a cycle launches on, and the graph of the last steady
-/// cycle captured from them.
+/// Every buffer, module and plan a cycle launches on, and the graphs captured from them.
 pub(super) struct Device {
     stream: Arc<CudaStream>,
     kernels: Kernels,
@@ -39,29 +38,32 @@ pub(super) struct Device {
     /// One stack's worth of exit waves: DM's `PO`, the LLK pass's forward stack.
     scratch: DeviceBuffer<C32>,
     use_graph: bool,
-    run: Option<EpochRun>,
+    /// The epochs run since the parameters last changed, all of one [`Epoch::run`].
+    runs: Vec<EpochRun>,
+    /// With graphs, the LLK pass's graph.
+    llk_graph: Option<CudaGraph<()>>,
 }
 
-/// A steady cycle with the buffers only it uses, and with graphs the graph captured for it.
+/// A cycle with the buffers only it uses, and with graphs the graph captured for it.
 struct EpochRun {
     cycle: Cycle,
     graph: Option<CudaGraph<()>>,
 }
 
-/// A steady cycle's parameters and the buffers only it uses, built together, so a graph
-/// captured from it bakes in sizes that match its buffers.
+/// A cycle's [`Epoch`] and the buffers only it uses, built together, so a graph captured
+/// from it bakes in sizes that match its buffers.
 enum Cycle {
-    Ap(ApParams),
-    Dm(DmParams),
+    Ap { params: ApParams, llk: bool },
+    Dm { params: DmParams, first: bool },
     Rpie(RpieParams, Box<RpieScratch>),
 }
 
 impl Cycle {
     fn epoch(&self) -> Epoch {
-        match self {
-            Self::Ap(p) => Epoch::Ap(*p),
-            Self::Dm(p) => Epoch::Dm(*p),
-            Self::Rpie(p, _) => Epoch::Rpie(*p),
+        match *self {
+            Self::Ap { params, llk } => Epoch::Ap { params, llk },
+            Self::Dm { params, first } => Epoch::Dm { params, first },
+            Self::Rpie(p, _) => Epoch::Rpie(p),
         }
     }
 }
@@ -234,7 +236,7 @@ impl Device {
                 })
             })
             .collect::<Result<Vec<_>, EngineError>>()?;
-        Ok(Self {
+        let mut dev = Self {
             obj_len: to_u32("object length", obj.len())?,
             probe_len: to_u32("probe length", probe.len())?,
             scratch: DeviceBuffer::zeroed(&stream, len)?,
@@ -250,9 +252,14 @@ impl Device {
             stacks,
             plans,
             use_graph: options.graph,
-            run: None,
+            runs: Vec::new(),
+            llk_graph: None,
             stream,
-        })
+        };
+        if dev.use_graph {
+            dev.llk_graph = Some(dev.capture(|bufs, ctx| bufs.forward_llk(ctx))?);
+        }
+        Ok(dev)
     }
 
     pub fn stream(&self) -> &Arc<CudaStream> {
@@ -308,53 +315,87 @@ impl Device {
         }
     }
 
-    /// Enqueues one `epoch` cycle: replays the graph captured for it (on a side stream, so
-    /// nothing runs), or launches it eagerly without graphs. The cycle's buffers and graph
-    /// are kept until another epoch replaces them.
+    /// Enqueues one `epoch` cycle: replays the graph captured for it, or launches it eagerly
+    /// without graphs. The epochs of one [`Epoch::run`] keep their buffers and graphs until
+    /// an epoch of another run replaces them.
     pub fn steady(&mut self, epoch: Epoch) -> Result<(), EngineError> {
-        let mut run = match self.run.take() {
-            Some(run) if run.cycle.epoch() == epoch => run,
-            _ => self.new_run(epoch)?,
+        let mut runs = std::mem::take(&mut self.runs);
+        runs.retain(|r| r.cycle.epoch().run() == epoch.run());
+        let at = match runs.iter().position(|r| r.cycle.epoch() == epoch) {
+            Some(at) => at,
+            None => {
+                runs.push(self.new_run(epoch)?);
+                runs.len() - 1
+            }
         };
-        let ctx = self.context();
+        let run = &mut runs[at];
         let done = match &run.graph {
-            // SAFETY: `ctx` holds the replay's leases on every captured buffer until the
-            // stream has run it, so no other stream can touch them meanwhile.
-            Some(graph) => unsafe { graph.launch().execute(&ctx) }.map_err(GpuError::from),
-            None => self.lend().cycle(&ctx, &mut run.cycle),
+            Some(graph) => self.replay(graph),
+            None => {
+                let ctx = self.context();
+                self.lend().cycle(&ctx, &mut run.cycle)
+            }
         };
-        self.run = Some(run);
+        self.runs = runs;
+        Ok(done?)
+    }
+
+    /// Enqueues the LLK partials of the current estimate into every stack's `llk`, from the
+    /// graph captured in [`Self::new`] or eagerly without graphs.
+    pub fn llk_pass(&mut self) -> Result<(), EngineError> {
+        let done = match &self.llk_graph {
+            Some(graph) => self.replay(graph),
+            None => {
+                let ctx = self.context();
+                self.lend().forward_llk(&ctx)
+            }
+        };
         Ok(done?)
     }
 
     /// The buffers of `epoch`'s cycle, and with graphs its graph, captured from them.
     fn new_run(&mut self, epoch: Epoch) -> Result<EpochRun, EngineError> {
         let mut cycle = match epoch {
-            Epoch::Ap(p) => Cycle::Ap(p),
-            Epoch::Dm(p) => Cycle::Dm(p),
+            Epoch::Ap { params, llk } => Cycle::Ap { params, llk },
+            Epoch::Dm { params, first } => Cycle::Dm { params, first },
             Epoch::Rpie(p) => {
                 let scratch = RpieScratch::new(&self.stream, &self.dims(), &p, self.probe.len())?;
                 Cycle::Rpie(p, Box::new(scratch))
             }
         };
         let graph = if self.use_graph {
-            let side = self.kernels.context().new_stream()?;
-            let mut bufs = self.lend();
-            let op = ptyrs_gpu::record(|ctx| bufs.cycle(ctx, &mut cycle));
-            Some(CudaGraph::capture(side, op).map_err(GpuError::from)?)
+            Some(self.capture(|bufs, ctx| bufs.cycle(ctx, &mut cycle))?)
         } else {
             None
         };
         Ok(EpochRun { cycle, graph })
     }
+
+    /// `f` on the lent buffers, captured on a side stream, so nothing runs.
+    fn capture(
+        &mut self,
+        f: impl FnOnce(&mut Bufs<'_>, &ExecutionContext) -> Result<(), GpuError> + Send,
+    ) -> Result<CudaGraph<()>, EngineError> {
+        let side = self.kernels.context().new_stream()?;
+        let mut bufs = self.lend();
+        let op = ptyrs_gpu::record(|ctx| f(&mut bufs, ctx));
+        Ok(CudaGraph::capture(side, op).map_err(GpuError::from)?)
+    }
+
+    /// Enqueues `graph` on the stream.
+    fn replay(&self, graph: &CudaGraph<()>) -> Result<(), GpuError> {
+        // SAFETY: the context holds the replay's leases on every captured buffer until the
+        // stream has run it, so no other stream can touch them meanwhile.
+        Ok(unsafe { graph.launch().execute(&self.context()) }?)
+    }
 }
 
 impl Bufs<'_> {
-    /// One steady cycle of `cycle` enqueued on `ctx`.
+    /// One cycle of `cycle` enqueued on `ctx`.
     fn cycle(&mut self, ctx: &ExecutionContext, cycle: &mut Cycle) -> Result<(), GpuError> {
         match cycle {
-            Cycle::Ap(p) => self.ap_cycle(ctx, p, false),
-            Cycle::Dm(p) => self.dm_cycle(ctx, p, false),
+            Cycle::Ap { params, llk } => self.ap_cycle(ctx, params, *llk),
+            Cycle::Dm { params, first } => self.dm_cycle(ctx, params, *first),
             Cycle::Rpie(p, scratch) => self.rpie_epoch(ctx, p, &mut scratch.lend()),
         }
     }

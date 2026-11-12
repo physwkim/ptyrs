@@ -219,10 +219,10 @@ fn gpu_rejects_what_it_cannot_run() {
     assert!(GpuPtycho::new(&ctx(), &scan, object, probe, zero).is_err());
 }
 
-/// Steady-state AP and DM cycles and rPIE epochs replayed from captured graphs give the
-/// eager bits: the object, the probe and every LLK record, across the parameter and
-/// algorithm switches that make a new capture and calls that reuse the last one, with a
-/// short last stack and batch.
+/// AP and DM cycles (AP's with an LLK and DM's first included), rPIE epochs and LLK passes
+/// replayed from captured graphs give the eager bits: the object, the probe and every LLK
+/// record, across the parameter and algorithm switches that make a new capture and calls
+/// that reuse the last one, with a short last stack and batch.
 #[test]
 fn graph_replays_bitwise_like_eager() {
     let (scan, object, probe) = start(2, true);

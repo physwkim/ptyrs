@@ -9,11 +9,12 @@
 //! all, and stacks of one length share a cuFFT plan, which transforms only their frames.
 //! Each cycle enqueues through its own `ExecutionContext`, dropped when the cycle has been
 //! enqueued. Within a cycle nothing reads back to the host: LLK partials are downloaded only
-//! in the cycles that record one, and the arrays only when asked for. An AP or DM cycle that
-//! records no LLK in-cycle, and every rPIE epoch, replays one captured CUDA graph (DESIGN B2,
-//! [`GpuOptions::graph`]), kept with the buffers it captured until another algorithm or other
-//! parameters need new ones. Each algorithm is its own module over the per-stack steps here,
-//! so M2's fused passes can replace those steps one algorithm at a time.
+//! after the cycles that record one, and the arrays only when asked for. Every cycle, AP's
+//! with an LLK and DM's first included, and the LLK pass replay a captured CUDA graph (DESIGN
+//! B2, [`GpuOptions::graph`]): one per [`Epoch`], kept with the buffers it captured until
+//! another algorithm or other parameters need new ones, and the LLK pass's for the life of
+//! the device state. Each algorithm is its own module over the per-stack steps here, so M2's
+//! fused passes can replace those steps one algorithm at a time.
 
 mod ap;
 mod device;
@@ -40,8 +41,8 @@ use crate::{ApParams, DmParams, EngineError, Fft2, Llk, RpieParams};
 pub struct GpuOptions {
     /// Frames per stack (the last stack may be shorter); PyNX's default is 16.
     pub stack_size: usize,
-    /// Replay steady-state AP and DM cycles and rPIE epochs as one captured CUDA graph each
-    /// instead of launching them kernel by kernel; both give the same bits.
+    /// Replay every AP and DM cycle, rPIE epoch and LLK pass from a CUDA graph captured once
+    /// per kind of cycle instead of launching it kernel by kernel; both give the same bits.
     pub graph: bool,
 }
 
@@ -54,16 +55,30 @@ impl Default for GpuOptions {
     }
 }
 
-/// A steady-state cycle with its parameters, which cover every value its launches bake in:
-/// the key of a captured graph.
+/// A cycle with its parameters, which cover every value its launches bake in: the key of a
+/// captured graph. Epochs that differ only in their flag share one [`Epoch::run`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Epoch {
-    /// An AP cycle that takes no LLK.
-    Ap(ApParams),
-    /// A DM cycle after the first of a call.
-    Dm(DmParams),
+    /// An AP cycle; with `llk`, it takes the LLK of the estimate it starts from.
+    Ap { params: ApParams, llk: bool },
+    /// A DM cycle; `first` for cycle 0 of a call.
+    Dm { params: DmParams, first: bool },
     /// An rPIE epoch.
     Rpie(RpieParams),
+}
+
+impl Epoch {
+    /// The epoch with its flag cleared: the parameters a run's buffers are built for.
+    fn run(self) -> Self {
+        match self {
+            Self::Ap { params, .. } => Self::Ap { params, llk: false },
+            Self::Dm { params, .. } => Self::Dm {
+                params,
+                first: false,
+            },
+            Self::Rpie(p) => Self::Rpie(p),
+        }
+    }
 }
 
 /// One stack (or rPIE batch): the frames its table entry holds, for what the host needs of
@@ -305,8 +320,7 @@ impl GpuPtycho {
     /// Normalised LLK of the current object and probe, as [`crate::Ptycho::llk`]; the
     /// exit-wave stacks are left as they are.
     pub fn llk(&mut self) -> Result<Llk, EngineError> {
-        let ctx = self.dev.context();
-        self.dev.lend().forward_llk(&ctx)?;
+        self.dev.llk_pass()?;
         self.read_llk()
     }
 

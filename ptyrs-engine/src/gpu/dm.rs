@@ -15,12 +15,10 @@ impl GpuPtycho {
     /// updates, the probe one from the new object.
     pub fn dm(&mut self, params: &DmParams, ncycle: usize) -> Result<(), EngineError> {
         for ic in 0..ncycle {
-            if ic == 0 {
-                let ctx = self.dev.context();
-                self.dev.lend().dm_cycle(&ctx, params, true)?;
-            } else {
-                self.dev.steady(Epoch::Dm(*params))?;
-            }
+            self.dev.steady(Epoch::Dm {
+                params: *params,
+                first: ic == 0,
+            })?;
             if llk_due(params.calc_llk, ic, ncycle) {
                 let l = self.llk()?;
                 self.record(Algorithm::Dm, l);
