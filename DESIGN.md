@@ -77,7 +77,7 @@
 
 | | 가져올 장점 (근거) | 구조적 한계 (근거) |
 |---|---|---|
-| **pty-chi** (Argonne, PyTorch, 약 2만 줄) | LSQML 해석적 스텝(위치별 2×2 해, `lsqml.py:~720`); BH 정확 line search(`bh.py:406-589`); 위치 보정(gradient/상관, affine 제약); OPR; 다층(slice 간격까지 최적화); compact(k-means) 배치 | 커스텀 GPU 코드는 Triton scatter 2개뿐이고 매 실행 후 `synchronize`(`triton/patches.py:71`); 배치마다 loss를 호스트로 읽음(`base.py:129`); 융합·graph 없음; 멀티 GPU는 매 배치 물체 전체 all-reduce(`lsqml.py:1697-1710`); 결정적 scatter는 픽셀당 O(N) |
+| **pty-chi** (Argonne, PyTorch, 약 2만 줄) | LSQML 해석적 스텝(위치별 2×2 해, `lsqml.py:~720`); BH 정확 line search(`bh.py:406-589`); 위치 보정(gradient/상관, affine 제약); OPR; 다층(slice 간격 최적화는 AD 재구성기에서만, `api/options/base.py:421-427`); compact(k-means) 배치 | 커스텀 GPU 코드는 Triton scatter 2개뿐이고 매 실행 후 `synchronize`(`triton/patches.py:71`); 배치마다 loss를 호스트로 읽음(`base.py:129`); 융합·graph 없음; 멀티 GPU는 매 배치 물체 전체 all-reduce(`lsqml.py:1697-1710`); 결정적 scatter는 픽셀당 O(N) |
 | **PtyPy** (Diamond) | 주소표 `addr[frame, mode, {pr,ob,ex,di,ma}, (layer,y,x)]`로 커널과 데이터 모델 분리(`projectional_serial.py:51-96`); 3-스트림 페이징(`projectional_cupy_stream.py`); cuFFT 콜백으로 전·후 필터 융합 → 388 → 223 ms(128²×2000, `optimisation_log.md`); 라이브 스캔(`min_frames_for_recon`) | 융합 시도가 경쟁 조건과 속도 저하로 실패(`fourier_update.cu:120`); MPI allreduce가 최대 병목이라고 로그에 명시; 새 데이터가 오면 물체·프로브 전체 재업로드(`engine_prepare`); GPU ML은 Gaussian만 |
 | **PyNX** (ESRF) | 화소 단위 융합(모드합+배경+마스크+FFT 스케일을 한 패스, `projection_amplitude_elw.cu`); ML-CG의 β·γ를 GPU에 두어 호스트 동기 없음(`cu_operator.py:3225-3330`); 연산자 대수 `DM**100*ML**40`; 음수 iobs 마스크 규약; CXI I/O | 전체 데이터 GPU 상주 필수, DM/RAAR는 Ψ 전체 보관 → VRAM 초과 시 실패; FFT는 별도 패스; 스트림 1개; 멀티 GPU는 MPI 호스트 경유 Send/Recv; atomic 때문에 결과 비결정적; float32 고정 |
 | **PtyRAD** (Cornell, 논문) | PyTorch AD로 기존 대비 최대 24배, 다층 깊이 정규화 | 저자들이 JIT 프레임워크로 더 빨라질 여지를 언급 |
