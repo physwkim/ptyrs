@@ -1,7 +1,7 @@
 """Float64 reference of one pty-chi LSQML minibatch with orthogonal probe relaxation (OPR) of
 K = 3 eigenmodes of probe mode 0: the object, probe, eigenmode and weight step at a fixed state.
 
-    <engine>/target/release/examples/llk_trace <dir> dm 1 2 32 40 4
+    <engine>/target/release/examples/engine_llk_trace <dir> dm 1 2 32 40 4
     micromamba run -n ptyrs-ref python -I refs/f64/lsqml_opr_step.py <dir>
 
 The state is the one ml_grad.py reads (object [1, 76, 80], probe [2, 32, 32], 40 frames, no

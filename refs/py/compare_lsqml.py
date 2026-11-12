@@ -4,7 +4,7 @@ init as it is, both sides over the engine's random_batches order, PyNX LLK per e
     python -I compare_lsqml.py DATA_DIR [--name fermat_clean] [--noise gaussian|poisson]
         [--batch 32] [--epochs 40] [--seed 7] [--module DIR]
 
-DATA_DIR is gen_m3's output (ptyrs-refgen), DIR holds the module ptyrs-py/scripts/build.sh
+DATA_DIR is refgen_gen_m3's output (ptyrs::refgen), DIR holds the module ptyrs-py/scripts/build.sh
 installs. Prints the start's far-field intensity difference (Ptycho.forward against pty-chi's
 forward model), each epoch's LLK of the noise model on both sides, and the first epoch each side
 reaches 1.01, 1.02 and 1.05 times the truth; exits 1 if those epochs differ. pty-chi's Gaussian

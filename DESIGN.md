@@ -168,6 +168,7 @@ X선에서 GPU 4장을 쓰는 경우는 셋이고, 분할 방식이 다릅니다
 - 엔진: rPIE/ePIE, DM, RAAR, ML-CG(Poisson/Gaussian, PyNX식 해석적 γ), LSQML(pty-chi 기준), BH-CG(pty-chi `bh.py` 기준, OPR 확장은 ptyrs가 추가할 여지).
 - BH-CG는 Hessian-벡터 곱이 같은 순·역 연산자 조합이라 B1 커널을 그대로 재사용합니다. 반복 수 감소와 반복당 비용 감소(B1·B2)가 곱해지는 지점이 ptyrs의 대표 수치가 될 후보입니다.
   - M3 측정(pty-chi, fermat_clean, 참값 LLK의 1% 이내까지 에포크 수): 미니배치 BH(배치 96) 20, 전체 배치 BH-CG 47, LSQML Gaussian(배치 32) 36, LSQML Poisson(배치 64) 164. 원거리 데이터의 반복 수로는 논문의 약 10배(근거리 데이터, 계산 시간)에 해당하는 이득이 나오지 않았고, 기준 BH 설정은 미니배치 96(LSQML 대비 1.8배)입니다. pty-chi의 BH는 Gaussian 모델이라 반복 수 비교 기준은 같은 모델의 LSQML입니다.
+  - 근거리 측정(`refs/ptychi/run_near.py`, pty-chi f32 GPU2, 같은 1% 기준): 논문의 근거리 데이터가 로컬에 없어 angular spectrum 전파 사례(24² 프레임 16장, 프로브 모드 2)로 쟀고, 30개 설정 모두 ptyrs CPU f64와 에포크 수가 같습니다. 방법마다 가장 좋은 배치끼리 비교하면 LSQML 대비 전체 배치 BH-CG는 시간 2.08배·에포크 1.13배, 미니배치 BH는 시간 1.26배·에포크 1.42배 적어, 근거리에서도 약 10배는 나오지 않았습니다. BH 프로브 rho는 모든 배치에서 10이 가장 좋습니다(pty-chi 권장값 1은 전체 배치에서만 78 에포크에 도달). 이 크기에서 벽시계 시간은 계산이 아니라 배치당 고정 비용이라, 에포크당 배치가 적은 쪽이 유리합니다.
   - 미니배치 BH는 CG를 쓰지 않고 배치 기울기 방향의 최급강하에 Hessian 걸음 크기를 씁니다. pty-chi의 미니배치 BH-CG는 이전 배치에서 캐시한 프레임별 조각으로 방향을 만들어, 걸음 크기를 계산한 방향과 실제 이동 방향이 다릅니다(한 걸음에 배치 손실 4.10e5 → 5.45e5). 배치 96에서 최급강하와 CG는 둘 다 20 에포크이고 최급강하가 약 2배 빠릅니다. CG는 전체 배치에서만 씁니다.
 - 계획 언어: PyNX의 `ML**40 * DM**100`을 문자열 `eval` 대신 타입이 있는 문법으로(`plan = "dm:100 -> ml:40"` 또는 TOML 배열), 엔진별 옵션은 스키마 검증.
 - 확장 규칙: 모든 순방향 연산자는 adjoint와 쌍으로 정의하고, 내적 테스트(⟨Ax, y⟩ = ⟨x, Aᴴy⟩)를 통과해야 등록됩니다. 자동미분이 없는 대신 이 불변식으로 기울기 정확성을 보장합니다. 새 연산자는 이것만 쓰면 연산자별 커널 경로로 바로 동작하고, 빨라야 할 때 융합 커널을 추가합니다. PyTorch식 자동 미분을 엔진에 쓰지 않는 이유는 복소수·FFT 지원 부족(§1)과 FFT 융합·graph 실행(B1, B2)을 잃기 때문입니다.
@@ -186,20 +187,28 @@ X선에서 GPU 4장을 쓰는 경우는 셋이고, 분할 방식이 다릅니다
 ## 4. 구조
 
 ```
-ptyrs/
-├── ptyrs-core      데이터 모델: Scan, Positions, Probe(모드, OPR), Object(층), Geometry,
-│                   주소표(PtyPy addr 개념), 공간 bin, DisjointBatch
-├── ptyrs-fft       cuFFT 바인딩(직접 쓴 FFI) + cuFFT 장치 API 조회·LTOIR 생성
+ptyrs/                  작업공간: 패키지 3개
+├── ptyrs           호스트 크레이트 하나(lib + 바이너리). 옛 크레이트마다 모듈 하나(ptyrs::engine 등),
+│   │               tests/·examples/는 `<모듈>_<파일>.rs`로 평탄(cargo 자동 탐색), 공용 도우미는 common/,
+│   │               데이터와 scripts/는 모듈별 하위 디렉터리. build.rs가 cuFFT 링크와 커널 빌드
+│   ├── src/base    데이터 모델: Scan, Positions, Probe(모드, OPR), Object(층), Geometry,
+│   │               주소표(PtyPy addr 개념), 공간 bin, DisjointBatch. `core`는 내장 크레이트를 가려서 base
+│   ├── src/fft     cuFFT 바인딩(직접 쓴 FFI) + cuFFT 장치 API 조회·LTOIR 생성
+│   ├── src/gpu     ptyrs-kernels를 cubin 하나로 빌드(cuFFT 장치 코드와 링크)·로드, 커널 호출 래퍼
+│   ├── src/tile    cutile-rs 커널(실행 중 JIT, CUDA 13.2+): 타일 소유 누적, 물체·프로브 갱신, 리덕션
+│   ├── src/engine  엔진(rPIE, DM, RAAR, ML-CG, LSQML, BH-CG), 계획 언어, 그래프 캡처
+│   ├── src/dist    공간 분할(라이브 띠·부채꼴, 대면적 격자), halo P2P 교환, 각도 병렬, 디바이스별 워커 스레드
+│   ├── src/io      CXI/HDF5 입출력(PyNX CXI 배치와 호환), PtyPy .ptyr 읽기
+│   ├── src/live    PVA / ZMQ / SWMR 입력(해제·위치 매칭·크롭 작업 스레드 → pinned 링버퍼), VMM 성장형 물체, PV 출력.
+│   │               바이너리 pty-recv, pty-sim은 src/bin
+│   ├── src/nn      (선택, feature `nn`일 때만 burn 빌드) burn 신경망: 라이브 초기값 예측, DIP·PINN.
+│   │               본체와는 배열·기울기 전달로만 연결
+│   ├── src/refgen  M3 참조 데이터셋 시뮬레이션(위치 오차, 세기 변화, 배경, 플라이 스캔, OPR)
+│   └── src/main.rs 단일 바이너리 ptyrs(옛 ptyrs-cli), TOML 설정
 ├── ptyrs-kernels   cuda-oxide SIMT device crate(`cargo oxide`로 PTX 생성): A/B/C 패스, 공간 bin 색인,
 │                   위치 기울기. Tile 전환 전에는 아래 Tile 후보 커널의 SIMT 판도 여기
-├── ptyrs-tile      cutile-rs 커널(실행 중 JIT, CUDA 13.2+): 타일 소유 누적, 물체·프로브 갱신, 리덕션
-├── ptyrs-engine    엔진(rPIE, DM, RAAR, ML-CG, LSQML, BH-CG), 계획 언어, 그래프 캡처
-├── ptyrs-dist      공간 분할(라이브 띠·부채꼴, 대면적 격자), halo P2P 교환, 각도 병렬, 디바이스별 워커 스레드
-├── ptyrs-io        CXI/HDF5 입출력(PyNX CXI 배치와 호환), PtyPy .ptyr 읽기
-├── ptyrs-live      PVA / ZMQ / SWMR 입력(해제·위치 매칭·크롭 작업 스레드 → pinned 링버퍼), VMM 성장형 물체, PV 출력
-├── ptyrs-nn        (선택) burn 신경망: 라이브 초기값 예측, DIP·PINN. 본체와는 배열·기울기 전달로만 연결
-├── ptyrs-py        PyO3 바인딩(numpy 입출력) — 검증 전용(pty-chi·PyNX·PtyPy와 결과 비교). 재구성 실행 경로에는 쓰지 않음
-└── ptyrs-cli       단일 바이너리, TOML 설정
+└── ptyrs-py        PyO3 바인딩(numpy 입출력, ptyrs에 의존하는 cdylib) — 검증 전용(pty-chi·PyNX·PtyPy와 결과 비교).
+                    재구성 실행 경로에는 쓰지 않음
 ```
 
 데이터 흐름(한 GPU):
@@ -228,7 +237,7 @@ ptyrs/
 
 M6 측정(GPU2, 스택 16): 물체 갱신은 Tile 24–26 µs, SIMT 10–11 µs라 SIMT에 남고, 프로브 갱신은 비트 단위로 같고 사이클 시간 차이 0.000 ms로 동률이라 SIMT에 남습니다. 물체 합(타일 소유 누적)도 Tile이 사이클당 0.22–0.25 ms 느렸습니다. BH 내적은 Tile로 옮겼습니다. 한 프로세스 안에서 두 판을 번갈아 잰 A/B(BH 배치 96, 커널 빌드 순서를 앞뒤로 바꾼 깨끗한 실행 6회)에서 Tile이 에폭당 0.036–0.043 ms 빨랐고 결과는 비트 단위로 같습니다. 전체 배치에서는 차이를 가르지 못했습니다. 따로 빌드한 두 바이너리를 번갈아 재는 방식은 빌드마다 약 0.2 ms씩 흔들려 이 차이를 가르지 못합니다. CG β·노름 부분합은 동률이라 SIMT에 남습니다. LLK 부분합의 최종 합은 에폭마다 합계를 읽을 때만 Tile이 빠른데 엔진은 그렇게 읽지 않으므로 SIMT에 남습니다. Tile 커널은 하나에 약 0.45 s씩 프로세스의 첫 장치 생성 때 컴파일됩니다. Tile 커널을 섞은 ML 사이클과 BH 에폭은 각각 graph 하나로 캡처됩니다(nsys 확인). Tile 커널은 장치를 만들 때 컴파일해 두므로 캡처 중에 JIT가 일어나지 않습니다.
 
-### 신경망 경계 (ptyrs-nn)
+### 신경망 경계 (ptyrs::nn)
 
 - 예측: 새 프레임 묶음 → burn CNN → 물체 조각 → 해당 영역 초기값. 프레임 묶음마다 한 번 넘깁니다.
 - 학습(DIP·PINN): 신경망이 물체를 진폭·위상(실수)으로 출력 → ptyrs 순·역방향 연산자로 물체 기울기 g 계산 → burn에서 손실을 ⟨출력, g⟩(g는 상수 취급)로 두고 역전파하면 신경망 가중치의 기울기가 정확히 나옵니다. burn에 복소수·FFT가 필요 없습니다.
