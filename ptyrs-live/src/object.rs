@@ -4,12 +4,13 @@
 //!
 //! The object is `[nobj, nyo, nxo]` interleaved complex f32, row-major, the
 //! kernels' layout; rows are backed in whole tile rows as views reach them,
-//! and fresh pixels start at a flat value. The bins are the `tile_start`,
-//! `tile_views` and `tile_len` of [`ptyrs_gpu::Views`], in storage the live
-//! side owns: tile `t = ty * ntx + tx` of [`OBJ_TILE`] pixels per side has
-//! the `cap` slots `tile_views[t * cap..]`, and its run is the first
-//! `tile_len[t]` of them, appended on the device by `bin_views`. Slots past
-//! the run are never read. [`LiveObject::ensure`] backs a tile before any
+//! and fresh pixels start at a flat value. Its update sums, pixel for pixel
+//! in the same layout, are backed with those rows and start at zero. The
+//! bins are the `tile_start`, `tile_views` and `tile_len` of
+//! [`ptyrs_gpu::Views`], in storage the live side owns: tile
+//! `t = ty * ntx + tx` of [`OBJ_TILE`] pixels per side has the `cap` slots
+//! `tile_views[t * cap..]`, and its run is the first `tile_len[t]` of them,
+//! appended on the device by `bin_views`. Slots past the run are never read. [`LiveObject::ensure`] backs a tile before any
 //! view on it is binned, so `tile_len[t] > 0` only for backed tiles.
 //!
 //! Every access goes through the storage's lease, on the object's stream.
@@ -20,7 +21,7 @@ use std::sync::Arc;
 use cuda_async::device_operation::ExecutionContext;
 use cuda_bindings::{self as sys, CUdeviceptr};
 use cuda_core::{Context, DeviceBuffer, DriverError, Event, IntoResult, PinnedHostBuffer, Stream};
-use ptyrs_gpu::{C32, OBJ_TILE};
+use ptyrs_gpu::{C32, OBJ_TILE, UpdateSums};
 
 use crate::grow::{GrowBuf, GrowError};
 
@@ -35,6 +36,11 @@ pub struct LiveObject {
     obj: GrowBuf,
     /// `obj` as the kernels take it, on the same tracker.
     pixels: DeviceBuffer<C32>,
+    /// The object's update sums, backed row for row with `obj`.
+    num: GrowBuf,
+    den: GrowBuf,
+    /// `num` and `den` as the kernels take them.
+    sums: UpdateSums,
     tile_views: GrowBuf,
     tile_len: GrowBuf,
     tile_start: GrowBuf,
@@ -47,9 +53,10 @@ pub struct LiveObject {
 }
 
 impl LiveObject {
-    /// Reserves `nobj` planes of `shape` pixels and `cap` view slots per
-    /// tile, backed `chunk` bytes at a time; fills and copies run on
-    /// `stream`. Nothing of the object or the slabs is backed yet.
+    /// Reserves `nobj` planes of `shape` pixels, their update sums and `cap`
+    /// view slots per tile, backed `chunk` bytes at a time; fills and copies
+    /// run on `stream`. Nothing of the object, the sums or the slabs is
+    /// backed yet.
     pub fn new(
         stream: &Arc<Stream>,
         nobj: usize,
@@ -67,13 +74,20 @@ impl LiveObject {
             ntiles * cap <= u32::MAX as usize,
             "{ntiles} tiles of {cap} slots pass u32 offsets"
         );
-        let obj = GrowBuf::new(ctx, nobj * nyo * nxo * 8, chunk)?;
-        // SAFETY: kernels reach the pixels of tiles with views only, and
-        // `ensure` backs those before a view on them is binned.
-        let pixels = unsafe { obj.typed(nobj * nyo * nxo) }?;
+        let len = nobj * nyo * nxo;
+        let obj = GrowBuf::new(ctx, len * 8, chunk)?;
+        let num = GrowBuf::new(ctx, len * 8, chunk)?;
+        let den = GrowBuf::new(ctx, len * 4, chunk)?;
+        // SAFETY: kernels reach the pixels and sums of tiles with views
+        // only, and `ensure` backs those before a view on them is binned.
+        let (pixels, n, d) = unsafe { (obj.typed(len)?, num.typed(len)?, den.typed(len)?) };
+        let sums = UpdateSums::new(n, d, stream)?;
         let mut o = Self {
             obj,
             pixels,
+            num,
+            den,
+            sums,
             tile_views: GrowBuf::new(ctx, ntiles * cap * 4, chunk)?,
             tile_len: GrowBuf::new(ctx, ntiles * 4, 1)?,
             tile_start: GrowBuf::new(ctx, (ntiles + 1) * 4, 1)?,
@@ -118,8 +132,13 @@ impl LiveObject {
         &self.pixels
     }
 
-    pub fn pixels_mut(&mut self) -> &mut DeviceBuffer<C32> {
-        &mut self.pixels
+    /// The object and its update sums, for the kernels that write them.
+    pub fn pixels_and_sums_mut(&mut self) -> (&mut DeviceBuffer<C32>, &mut UpdateSums) {
+        (&mut self.pixels, &mut self.sums)
+    }
+
+    pub fn sums(&self) -> &UpdateSums {
+        &self.sums
     }
 
     /// Typed views of the bins for `Views::from_parts`: `tile_start[t] = t *
@@ -168,23 +187,41 @@ impl LiveObject {
         &self.stream
     }
 
-    /// Backs the object rows and the slab of each tile `[ty, tx]` of `tiles`,
-    /// in every plane, and queues the fill of fresh pixels on the stream, so
-    /// kernels queued there afterwards may read the pixels and append to the
-    /// slabs. Call it with [`ptyrs_gpu::view_tiles`] of a view before the
+    /// Backs the object rows with their sums and the slab of each tile
+    /// `[ty, tx]` of `tiles`, in every plane, and queues the fill of fresh
+    /// pixels and the zeroing of fresh sums on the stream, so kernels queued
+    /// there afterwards may read the pixels, add to the sums and append to
+    /// the slabs. Call it with [`ptyrs_gpu::view_tiles`] of a view before the
     /// view enters the address table: those are the slabs `bin_views`
     /// writes it into and the tiles whose pixels the kernels touch for it.
     pub fn ensure(&mut self, tiles: impl IntoIterator<Item = [u32; 2]>) -> Result<(), GrowError> {
         let [nyo, nxo] = self.shape;
         let [nty, ntx] = self.tiles;
-        let (t, row, plane, slab) = (OBJ_TILE as usize, nxo * 8, nyo * nxo * 8, self.cap * 4);
+        let (t, slab) = (OBJ_TILE as usize, self.cap * 4);
         self.stream.context().bind_to_thread()?;
         let s = self.stream.cu_stream();
         let [re, im] = self.fill.map(f32::to_bits);
-        let base = self.obj.ptr();
-        let (stream, pixels) = (&self.stream, &self.pixels);
+        let (obj, num, den) = (self.obj.ptr(), self.num.ptr(), self.den.ptr());
+        let stream = &self.stream;
+        let writes = [
+            self.pixels.storage(),
+            self.sums.num.storage(),
+            self.sums.den.storage(),
+        ];
         // Leased once, at the first fresh chunk.
         let mut lease: Option<ExecutionContext> = None;
+        let mut leased = || -> Result<(), GrowError> {
+            if lease.is_none() {
+                let c = ExecutionContext::new(stream.clone());
+                ptyrs_gpu::lease(&c, &[], &writes)?;
+                lease = Some(c);
+            }
+            Ok(())
+        };
+        // SAFETY: callers pass a chunk `map_with` just backed.
+        let zero = |at: CUdeviceptr, r: Range<usize>| unsafe {
+            sys::cuMemsetD32Async(at + r.start as u64, 0, r.len() / 4, s).result()
+        };
         let mut last_row = None;
         for [ty, tx] in tiles {
             let (y, x) = (ty as usize, tx as usize);
@@ -197,23 +234,25 @@ impl LiveObject {
             if last_row != Some(y) {
                 let rows = y * t..((y + 1) * t).min(nyo);
                 for z in 0..self.nobj {
-                    let at = z * plane;
-                    self.obj
-                        .map_with(at + rows.start * row..at + rows.end * row, |r| {
-                            if lease.is_none() {
-                                let c = ExecutionContext::new(stream.clone());
-                                ptyrs_gpu::lease(&c, &[], &[pixels.storage()])?;
-                                lease = Some(c);
-                            }
-                            let dst = base + r.start as u64;
-                            // SAFETY: `r` was just mapped; chunks are 8-byte aligned.
-                            unsafe {
-                                sys::cuMemsetD2D32Async(dst, 8, re, 1, r.len() / 8, s).result()?;
-                                sys::cuMemsetD2D32Async(dst + 4, 8, im, 1, r.len() / 8, s)
-                                    .result()?;
-                            }
-                            Ok(())
-                        })?;
+                    let px = (z * nyo + rows.start) * nxo..(z * nyo + rows.end) * nxo;
+                    self.obj.map_with(px.start * 8..px.end * 8, |r| {
+                        leased()?;
+                        let dst = obj + r.start as u64;
+                        // SAFETY: `r` was just mapped; chunks are 8-byte aligned.
+                        unsafe {
+                            sys::cuMemsetD2D32Async(dst, 8, re, 1, r.len() / 8, s).result()?;
+                            sys::cuMemsetD2D32Async(dst + 4, 8, im, 1, r.len() / 8, s).result()?;
+                        }
+                        Ok(())
+                    })?;
+                    self.num.map_with(px.start * 8..px.end * 8, |r| {
+                        leased()?;
+                        Ok(zero(num, r)?)
+                    })?;
+                    self.den.map_with(px.start * 4..px.end * 4, |r| {
+                        leased()?;
+                        Ok(zero(den, r)?)
+                    })?;
                 }
                 last_row = Some(y);
             }
@@ -430,5 +469,49 @@ mod tests {
             .filter(|i| px[*i] != if marked.contains(i) { [7.0, 0.5] } else { fill })
             .count();
         assert_eq!(bad, 0);
+    }
+
+    /// The sums are backed with the object rows a tile needs and nowhere
+    /// else, and read zero (as fresh driver memory does even unfilled).
+    #[test]
+    fn the_sums_are_backed_and_zeroed_with_the_object_rows() {
+        let ctx = Context::new(0).expect("GPU 0");
+        let s = ctx.new_stream().unwrap();
+        let (n, mib) = (1024usize, 1usize << 20);
+        let mut o = LiveObject::new(&s, 2, [n, n], 4, [1.0, 0.5], 1).unwrap();
+        o.ensure((300 / 16..=339 / 16).map(|ty| [ty, 2])).unwrap();
+        // 2 MiB chunks: rows 256..512 of each plane of the object and
+        // `num`, rows 0..512 of `den`.
+        assert_eq!(o.mapped_bytes(), 4 * mib);
+        assert_eq!(
+            (o.num.mapped_bytes(), o.den.mapped_bytes()),
+            (4 * mib, 4 * mib)
+        );
+        s.synchronize().unwrap();
+        for z in 0..2 {
+            let rows =
+                |r: Range<usize>, b: usize| (z * n + r.start) * n * b..(z * n + r.end) * n * b;
+            for (buf, r, b) in [(&o.num, 256..512, 8), (&o.den, 0..512, 4)] {
+                let r = rows(r, b);
+                assert!(buf.is_mapped(r.clone()) && !buf.is_mapped(r.end..r.end + 4));
+                let mut got = vec![1u32; r.len() / 4];
+                // SAFETY: the stream is idle and `r` is backed.
+                unsafe {
+                    sys::cuMemcpyDtoH_v2(
+                        got.as_mut_ptr().cast(),
+                        buf.ptr() + r.start as u64,
+                        r.len(),
+                    )
+                }
+                .result()
+                .unwrap();
+                assert!(
+                    got.iter().all(|&w| w == 0),
+                    "plane {z}, {} bytes from {}",
+                    r.len(),
+                    r.start
+                );
+            }
+        }
     }
 }

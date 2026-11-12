@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{DeviceBuffer, Stream};
-use ptyrs_gpu::{C32, Kernels, StackRef, ViewAddr, ViewDims, Views, view_tiles};
+use ptyrs_gpu::{C32, Kernels, StackRef, UpdateSums, ViewAddr, ViewDims, Views, view_tiles};
 
 use crate::grow::{GrowError, GrowTable};
 use crate::object::LiveObject;
@@ -67,6 +67,14 @@ impl ScanShape {
         }
         n.into_iter().max().unwrap_or(0)
     }
+}
+
+/// A [`LiveScan`] split for the kernels that sweep it and update its object.
+pub struct ScanParts<'a> {
+    pub views: &'a Views,
+    pub frames: &'a LiveFrames,
+    pub pixels: &'a mut DeviceBuffer<C32>,
+    pub sums: &'a mut UpdateSums,
 }
 
 /// The first frame a scan refused; it closed the scan.
@@ -252,14 +260,15 @@ impl LiveScan {
         &self.frames
     }
 
-    /// The object as the kernels read it.
-    pub fn pixels(&self) -> &DeviceBuffer<C32> {
-        self.obj.pixels()
-    }
-
-    /// The views with the object, for the object update.
-    pub fn object_mut(&mut self) -> (&Views, &mut DeviceBuffer<C32>) {
-        (&self.views, self.obj.pixels_mut())
+    /// The views and frames with the object and its update sums.
+    pub fn parts_mut(&mut self) -> ScanParts<'_> {
+        let (pixels, sums) = self.obj.pixels_and_sums_mut();
+        ScanParts {
+            views: &self.views,
+            frames: &self.frames,
+            pixels,
+            sums,
+        }
     }
 
     pub fn obj(&self) -> &LiveObject {
@@ -297,7 +306,7 @@ impl LiveScan {
 mod tests {
     use cuda_bindings as sys;
     use cuda_core::{Context, IntoResult};
-    use ptyrs_gpu::{StackCtl, UpdateSums};
+    use ptyrs_gpu::StackCtl;
 
     use super::*;
     use crate::graph::LiveGraph;
@@ -366,12 +375,12 @@ mod tests {
         let probe = DeviceBuffer::from_host(&s, &vec![one; 2 * n]).unwrap();
         let mut psi = DeviceBuffer::<C32>::zeroed(&s, 4 * 2 * n).unwrap();
         let npx = (dims.obj[0] * dims.obj[1]) as usize;
-        let mut sums = UpdateSums::zeroed(&s, npx).unwrap();
         let graph = LiveGraph::capture(&s, |c| {
             scan.advance(&k, c)?;
-            let st = scan.stack();
-            k.obj_probe_to_psi(c, scan.views(), st, scan.pixels(), &probe, &mut psi)?;
-            k.psi_to_obj(c, scan.views(), st, &psi, &probe, &mut sums)
+            let p = scan.parts_mut();
+            let st = p.frames.stack();
+            k.obj_probe_to_psi(c, p.views, st, p.pixels, &probe, &mut psi)?;
+            k.psi_to_obj(c, p.views, st, &psi, &probe, p.sums)
         })
         .unwrap();
 
@@ -447,6 +456,8 @@ mod tests {
             }
         }
         assert!(read[npx - 1], "a landed view reads the far corner pixel");
+        // Every tile row has a view, so the sums are backed whole.
+        let sums = scan.obj().sums();
         let den = sums.den.to_host_vec(&s).unwrap();
         let num = sums.num.to_host_vec(&s).unwrap();
         for p in 0..npx {

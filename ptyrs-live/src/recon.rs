@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use cuda_core::{DeviceBuffer, Stream};
 use ptyrs_fft::Plan2d;
-use ptyrs_gpu::{C32, Kernels, UpdateSums, ViewAddr};
+use ptyrs_gpu::{C32, Kernels, ViewAddr};
 
 use crate::graph::LiveGraph;
 use crate::grow::GrowError;
@@ -49,7 +49,6 @@ pub struct LiveAp {
     _probe: DeviceBuffer<C32>,
     _psi: DeviceBuffer<C32>,
     _plan: Plan2d,
-    _sums: UpdateSums,
     _counts: DeviceBuffer<u16>,
     /// Frames the ingest graph has binned.
     binned: u32,
@@ -84,35 +83,31 @@ impl LiveAp {
         let mut psi = DeviceBuffer::<C32>::zeroed(stream, planes * n)?;
         let mut plan =
             Plan2d::new(stream, d.frame[0] as usize, planes).map_err(ptyrs_gpu::Error::from)?;
-        let mut sums = UpdateSums::zeroed(
-            stream,
-            d.nobj as usize * d.obj[0] as usize * d.obj[1] as usize,
-        )?;
         let k = &kernels;
         let ingest = {
             let s = &mut scan;
             LiveGraph::capture(stream, move |c| s.advance(k, c))?
         };
         let sweep = {
-            let (s, psi, plan, sums) = (&scan, &mut psi, &mut plan, &mut sums);
+            let (s, psi, plan) = (&mut scan, &mut psi, &mut plan);
             let (probe, counts) = (&probe, &counts);
             LiveGraph::capture(stream, move |c| {
-                let (views, f) = (s.views(), s.frames());
-                f.sweep_step(c)?;
-                let st = f.sweep();
-                k.obj_probe_to_psi(c, views, st, s.pixels(), probe, psi)?;
+                let p = s.parts_mut();
+                p.frames.sweep_step(c)?;
+                let st = p.frames.sweep();
+                k.obj_probe_to_psi(c, p.views, st, p.pixels, probe, psi)?;
                 plan.forward_inplace(c, psi)?;
                 k.apply_amplitude(c, &d, st, counts, psi)?;
                 plan.inverse_inplace(c, psi)?;
-                k.psi_to_obj(c, views, st, psi, probe, sums)
+                k.psi_to_obj(c, p.views, st, psi, probe, p.sums)
             })?
         };
         let update = {
-            let (s, sums, inertia) = (&mut scan, &mut sums, cfg.inertia);
+            let (s, inertia) = (&mut scan, cfg.inertia);
             LiveGraph::capture(stream, move |c| {
-                let (views, obj) = s.object_mut();
-                k.update_obj_from_sums(c, views, obj, sums, inertia)?;
-                s.frames().rewind(c)
+                let p = s.parts_mut();
+                k.update_obj_from_sums(c, p.views, p.pixels, p.sums, inertia)?;
+                p.frames.rewind(c)
             })?
         };
         Ok(Self {
@@ -124,7 +119,6 @@ impl LiveAp {
             _probe: probe,
             _psi: psi,
             _plan: plan,
-            _sums: sums,
             _counts: counts,
             binned: 0,
             epochs: 0,
