@@ -45,13 +45,13 @@ pub struct BhScan<'a> {
 }
 
 impl BhScan<'_> {
-    fn check(&self) -> Result<&ViewDims, Error> {
+    pub(crate) fn check(&self) -> Result<&ViewDims, Error> {
         let dims = self.order.views.dims();
         check_len("counts", self.counts, dims.nframe as usize * dims.n())?;
         Ok(dims)
     }
 
-    fn obs(&self) -> BhObs {
+    pub(crate) fn obs(&self) -> BhObs {
         BhObs {
             counts: dptr(self.counts),
             order: dptr(self.order.ids.order()),

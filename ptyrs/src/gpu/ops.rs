@@ -191,7 +191,7 @@ impl ViewDims {
     }
 
     /// The geometry of the whole scan as one stack, for checked dims.
-    fn scan_geom(&self) -> StackGeom {
+    pub(crate) fn scan_geom(&self) -> StackGeom {
         StackGeom {
             nframe: self.nframe,
             nf_max: self.nframe,

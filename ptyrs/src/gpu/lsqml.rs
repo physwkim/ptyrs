@@ -19,7 +19,6 @@ use std::ops::Range;
 
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig, RawDeviceBuffer};
-use ptyrs_kernels::bh::BhObs;
 use ptyrs_kernels::fused::{FUSED_COLS, FusedCfg, FusedPtrs};
 use ptyrs_kernels::grad::{GAMMA_CHUNK, ObjProbePtrs};
 pub use ptyrs_kernels::lsqml::LSQML_REC;
@@ -142,35 +141,9 @@ fn chunks(n: usize) -> usize {
     n.div_ceil(GAMMA_CHUNK as usize)
 }
 
-/// The geometry of the whole scan as one stack.
-fn scan_geom(d: &ViewDims) -> StackGeom {
-    StackGeom {
-        nframe: d.nframe,
-        nf_max: d.nframe,
-        nmode: d.nmode,
-        nprobe: d.nprobe,
-        ny: d.frame[0],
-        nx: d.frame[1],
-        nyo: d.obj[0],
-        nxo: d.obj[1],
-        quad: d.quad_phase,
-    }
-}
-
 /// Values of the object and of the probe.
 fn lens(dims: &ViewDims) -> [usize; 2] {
     [dims.obj_len(), dims.nprobe as usize * dims.n()]
-}
-
-/// The counts and frame ids of `scan`, checked against its views.
-fn obs(scan: &BhScan<'_>) -> Result<(BhObs, ViewDims), Error> {
-    let dims = *scan.order.views().dims();
-    check_len("counts", scan.counts, dims.nframe as usize * dims.n())?;
-    let obs = BhObs {
-        counts: dptr(scan.counts),
-        order: dptr(scan.order.ids()),
-    };
-    Ok((obs, dims))
 }
 
 /// One block of [`PIXEL_THREADS`] per chunk of each of the stack's frames.
@@ -307,7 +280,7 @@ impl LsqmlKernels {
                     views.tile_ptrs(),
                     pre,
                     init.into(),
-                    scan_geom(&d),
+                    d.scan_geom(),
                 )
             }
         })
@@ -370,7 +343,8 @@ impl LsqmlKernels {
         work: &DeviceBuffer<C32>,
         icalc: &mut DeviceBuffer<f32>,
     ) -> Result<(), Error> {
-        let (obs, d) = obs(&scan)?;
+        let d = *scan.check()?;
+        let obs = scan.obs();
         let g = d.geom(stack)?;
         check_len("icalc", icalc, g.nf_max as usize * d.n())?;
         let p = LsqmlCols {
@@ -397,7 +371,8 @@ impl LsqmlKernels {
         st: &LsqmlScan,
         work: &mut DeviceBuffer<C32>,
     ) -> Result<(), Error> {
-        let (obs, d) = obs(&scan)?;
+        let d = *scan.check()?;
+        let obs = scan.obs();
         st.check(&d)?;
         let l = ColsLaunch::new(&d, stack, work)?;
         let p = LsqmlCols {
@@ -452,7 +427,8 @@ impl LsqmlKernels {
         batch: Range<u32>,
         st: &mut LsqmlScan,
     ) -> Result<(), Error> {
-        let (obs, d) = obs(&scan)?;
+        let d = *scan.check()?;
+        let obs = scan.obs();
         st.check(&d)?;
         let span = st.span(&batch)?;
         let ids = scan.order.ids();
@@ -604,7 +580,7 @@ impl LsqmlKernels {
         let span = st.span(&batch)?;
         // pty-chi's `trim_mean`, the cut saturating at 0 for small batches.
         let trim = (span.nb as f64 * 0.1 / 2.0 - 0.5).ceil() as u32;
-        let g = scan_geom(&st.dims);
+        let g = st.dims.scan_geom();
         let writes = [st.dots.storage(), st.rec.storage(), st.step.storage()];
         self.base
             .launch(ctx, &[st.a_pos.storage()], &writes, |stream| {

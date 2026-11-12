@@ -198,7 +198,7 @@ pub const FFT_SKEW: u32 = 16;
 ///
 /// As [`block_fft`], `s` holding `bpb` such column FFTs.
 #[device]
-unsafe fn col_fft<const N: u32, const INV: bool>(
+pub(crate) unsafe fn col_fft<const N: u32, const INV: bool>(
     r: &mut [f32; 2 * FFT_EPT_MAX as usize],
     s: *mut u8,
     b: u32,

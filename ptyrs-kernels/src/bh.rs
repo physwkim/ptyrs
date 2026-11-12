@@ -358,7 +358,7 @@ pub mod bh_kernels {
 /// `s` holds `K * PIXEL_THREADS` shared floats, `out` `K` floats; block `(PIXEL_THREADS, 1,
 /// 1)`.
 #[device]
-unsafe fn store_sums<const K: usize>(s: *mut f32, acc: [f32; K], out: *mut f32) {
+pub(crate) unsafe fn store_sums<const K: usize>(s: *mut f32, acc: [f32; K], out: *mut f32) {
     let t = thread::threadIdx_x() as usize;
     let seg = PIXEL_THREADS as usize;
     unsafe {

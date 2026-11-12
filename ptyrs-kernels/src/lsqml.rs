@@ -13,9 +13,9 @@
 use cuda_device::{async_copy, device, shared::DynamicSharedArray, thread};
 use cuda_host::cuda_module;
 
-use crate::bh::BhObs;
-use crate::fused::{FFT_SKEW, FUSED_COLS, block_fft};
-use crate::pixel::{MASKED, PIXEL_THREADS, StackCtl, StackGeom, load_c, stack_frames, store_c};
+use crate::bh::{BhObs, store_sums};
+use crate::fused::{FUSED_COLS, col_fft};
+use crate::pixel::{MASKED, StackCtl, StackGeom, load_c, stack_frames, store_c};
 use crate::{FFT_EPT_MAX, fft_ept};
 
 /// [`lsqml_kernels::LoadedModule::lsqml_cols_64`] writes `icalc`.
@@ -95,15 +95,15 @@ pub struct LsqmlPre {
 /// `obs` and `icalc`, 0 where masked, inverse column-FFT'd and stored; without it nothing is
 /// stored, so `work` keeps its row transforms. Grid `(nx / FUSED_COLS, nf_max)`,
 /// block `nmode * FUSED_COLS * ny / fft_ept(ny)`, dynamic shared memory `2 * FUSED_COLS * ny`
-/// bytes of counts, then the larger of `nmode * FUSED_COLS` column FFTs ([`FFT_SKEW`]) and
-/// `4 * nmode * ny * FUSED_COLS` bytes. `counts` must be 16-byte aligned; it and `a_far` are
-/// read only under [`LSQML_CHI`].
+/// bytes of counts, then the larger of `nmode * FUSED_COLS` column FFTs
+/// ([`crate::fused::FFT_SKEW`]) and `4 * nmode * ny * FUSED_COLS` bytes. `counts` must be
+/// 16-byte aligned; it and `a_far` are read only under [`LSQML_CHI`].
 ///
 /// # Safety
 ///
 /// `NY == g.ny`; `p` as [`LsqmlCols`] says for `g`; `ctl` one entry; launch as above.
 #[device]
-unsafe fn cols<const NY: u32>(p: LsqmlCols, ctl: *const StackCtl, g: StackGeom, flags: u32) {
+pub unsafe fn cols<const NY: u32>(p: LsqmlCols, ctl: *const StackCtl, g: StackGeom, flags: u32) {
     let (f0, nf) = unsafe { stack_frames(ctl, g) };
     let fl = thread::blockIdx_y();
     if fl >= nf {
@@ -150,9 +150,7 @@ unsafe fn cols<const NY: u32>(p: LsqmlCols, ctl: *const StackCtl, g: StackGeom, 
             r[2 * i as usize] = v.0;
             r[2 * i as usize + 1] = v.1;
         }
-        // FFT `b` at `b * (smem_per_fft + FFT_SKEW)`, the host's `Shape::col_fft` layout.
-        let skewed = fft_smem.add((b * FFT_SKEW) as usize);
-        block_fft::<NY, false>(&mut r, skewed, b, f, bpb);
+        col_fft::<NY, false>(&mut r, fft_smem, b, f, bpb);
         thread::sync_threads();
         #[unroll]
         for i in 0..ept {
@@ -195,7 +193,7 @@ unsafe fn cols<const NY: u32>(p: LsqmlCols, ctl: *const StackCtl, g: StackGeom, 
         if chi {
             // Every power is read before the inverse FFT reuses the region.
             thread::sync_threads();
-            block_fft::<NY, true>(&mut r, skewed, b, f, bpb);
+            col_fft::<NY, true>(&mut r, fft_smem, b, f, bpb);
             #[unroll]
             for i in 0..ept {
                 let k = 2 * i as usize;
@@ -478,6 +476,8 @@ pub mod lsqml_kernels {
     ///
     /// `sums` holds `2 * span.nchunk` floats per position, `far` as [`LsqmlFar`] says, `order`
     /// over the span; grid `(1, 1, 1)`, block `(PIXEL_THREADS, 1, 1)`.
+    ///
+    /// [`lsqml_xi`]: LoadedModule::lsqml_xi
     #[kernel]
     pub unsafe fn lsqml_far_step(sums: *const f32, span: LsqmlSpan, far: LsqmlFar, last: u32) {
         static mut RED: SharedArray<f32, 256> = SharedArray::UNINIT;
@@ -597,6 +597,8 @@ pub mod lsqml_kernels {
     /// `sums` holds `6 * span.nchunk` floats per position, `a_far` `nframe`, `rec` `3 *
     /// nframe`, `step` two; `2 * trim < span.nb`; grid `(1, 1, 1)`, block `(PIXEL_THREADS, 1,
     /// 1)`.
+    ///
+    /// [`lsqml_dots`]: LoadedModule::lsqml_dots
     #[kernel]
     pub unsafe fn lsqml_step(
         sums: *mut f32,
@@ -708,30 +710,6 @@ pub mod lsqml_kernels {
             store_c(x, i, (v.0 + s * d.0, v.1 + s * d.1));
             store_c(sums.num, i, (0.0, 0.0));
             *sums.den.add(i) = 0.0;
-        }
-    }
-}
-
-/// Thread 0 writes the block sums of each thread's `acc` to `out[0..K]`; `s` is `K`
-/// `PIXEL_THREADS` segments of shared memory. Every thread of the block must call it.
-///
-/// # Safety
-///
-/// `s` holds `K * PIXEL_THREADS` shared floats, `out` `K` floats; block `(PIXEL_THREADS, 1,
-/// 1)`.
-#[device]
-unsafe fn store_sums<const K: usize>(s: *mut f32, acc: [f32; K], out: *mut f32) {
-    let t = thread::threadIdx_x() as usize;
-    let seg = PIXEL_THREADS as usize;
-    unsafe {
-        for (j, &a) in acc.iter().enumerate() {
-            *s.add(j * seg + t) = a;
-        }
-        crate::block_sum::<K>(s);
-        if t == 0 {
-            for j in 0..K {
-                *out.add(j) = *s.add(j * seg);
-            }
         }
     }
 }
