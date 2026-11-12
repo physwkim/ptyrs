@@ -440,10 +440,11 @@ fn recon_line(
         _ => None,
     };
     let mut l = format!(
-        "recv recon algo=ap nf_max={} tile_cap={} stored={} landed={} scan_epochs={scan_epochs} \
+        "recv recon algo=ap nf_max={} stacks={} tile_cap={} stored={} landed={} scan_epochs={scan_epochs} \
          epochs={} snap_every={} kept={} epoch_ms={} object={ny}x{nx} obj_mapped_MiB={} \
          plan_ms={:.1} plan_MiB={} crop=window_centre_bbox region_rows={}..{} region_cols={}..{}",
         follow.ap.nf_max,
+        follow.ap.stacks,
         follow.ap.cap,
         rep.stored,
         rep.landed,
@@ -1211,6 +1212,7 @@ mod tests {
             recon: Some(ReconCfg {
                 algo: Algo::Ap,
                 nf_max: NonZeroU32::new(8).unwrap(),
+                stacks: NonZeroU32::new(4).unwrap(),
                 inertia: 0.05,
                 chunk_mib: 4,
                 snap_every: NonZeroU32::new(3).unwrap(),
@@ -1311,6 +1313,8 @@ mod tests {
             "ap",
             "--recon-nf-max",
             "8",
+            "--recon-stacks",
+            "4",
             "--recon-inertia",
             "0.05",
             "--recon-chunk-mib",
@@ -1379,6 +1383,7 @@ mod tests {
             [recon]
             algo = "ap"
             nf-max = 8
+            stacks = 4
             inertia = 0.05
             chunk-mib = 4
             snap-every = 3

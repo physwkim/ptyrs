@@ -50,6 +50,8 @@ pub struct ReconCfg {
     pub algo: Algo,
     /// Frames per stack; at most the scan's.
     pub nf_max: NonZeroU32,
+    /// Stacks per sweep replay ([`ApConfig::stacks`]).
+    pub stacks: NonZeroU32,
     /// PyNX `ObjNorm` inertia.
     pub inertia: f32,
     /// The object is backed this many MiB at a time.
@@ -69,6 +71,7 @@ impl Default for ReconCfg {
         Self {
             algo: Algo::Ap,
             nf_max: NonZeroU32::new(32).unwrap(),
+            stacks: NonZeroU32::new(16).unwrap(),
             inertia: 0.01,
             chunk_mib: 2,
             snap_every: NonZeroU32::new(5).unwrap(),
@@ -80,7 +83,7 @@ impl Default for ReconCfg {
 }
 
 impl ReconCfg {
-    /// `--recon ALGO --recon-nf-max --recon-inertia --recon-chunk-mib
+    /// `--recon ALGO --recon-nf-max --recon-stacks --recon-inertia --recon-chunk-mib
     /// --recon-snap-every --recon-snaps --recon-settle-max`, and
     /// `--recon-pv PREFIX --recon-pv-bin --recon-pv-period-ms
     /// --recon-pv-llk-period-ms`; `None` without `--recon`.
@@ -90,6 +93,7 @@ impl ReconCfg {
         Some(Self {
             algo,
             nf_max: a.get("recon-nf-max", d.nf_max),
+            stacks: a.get("recon-stacks", d.stacks),
             inertia: a.get("recon-inertia", d.inertia),
             chunk_mib: a.get("recon-chunk-mib", d.chunk_mib),
             snap_every: a.get("recon-snap-every", d.snap_every),
@@ -172,6 +176,7 @@ impl FollowCfg {
             fill: [1.0, 0.0],
             chunk: rc.chunk_mib << 20,
             inertia: rc.inertia,
+            stacks: rc.stacks,
         };
         ap.cap = shape.tile_cap(&views_of(&ap, &place, &pos));
         Self {

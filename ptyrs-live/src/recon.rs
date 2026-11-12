@@ -4,11 +4,14 @@
 //!
 //! An epoch is one AP cycle over every landed frame: the ingest graph bins
 //! the frames landed since the last epoch, the sweep graph takes the next
-//! stack of the sweep entry through the engine's fused AP pass (exit waves,
-//! amplitude projection and object sums, as [`Kernels::fused_project`]) and
-//! the update graph applies the sums to the object and rewinds the sweep. Frames land only between
-//! epochs, so an epoch's sweep covers exactly the frames landed when it was
-//! queued, as the engine's AP cycle covers its scan.
+//! [`ApConfig::stacks`] stacks of the sweep entry through the engine's fused
+//! AP pass (exit waves, amplitude projection and object sums, as
+//! [`Kernels::fused_project`]) and the update graph applies the sums to the
+//! object and rewinds the sweep. Frames land only between epochs, so an
+//! epoch's sweep covers exactly the frames landed when it was queued, as the
+//! engine's AP cycle covers its scan. A step past the last landed stack
+//! leaves the entry at `nf == 0`, on which the fused pass and the LLK push
+//! write nothing, so the sweep's last replay may run short.
 //!
 //! With LLK recording, each epoch is also one record of an [`LlkRing`]: one
 //! launch outside the graphs counts the unmasked pixels of the frames binned
@@ -45,6 +48,9 @@ pub struct ApConfig {
     pub chunk: usize,
     /// PyNX `ObjNorm` inertia (the engine's AP default is 0.01).
     pub inertia: f32,
+    /// Stacks each sweep replay takes, cut to the scan's: an epoch over `s`
+    /// landed stacks replays the sweep graph `ceil(s / stacks)` times.
+    pub stacks: NonZeroU32,
 }
 
 /// The LLK records the ring holds; each batch of half of them is copied to
@@ -76,6 +82,8 @@ pub struct LiveAp {
     counts: DeviceBuffer<u16>,
     /// Frames the ingest graph has binned.
     binned: u32,
+    /// Stacks per sweep replay.
+    stacks: u32,
     epochs: u64,
 }
 
@@ -96,6 +104,7 @@ impl LiveAp {
         let kernels = Kernels::load(ctx)?;
         let mut scan = LiveScan::new(stream, &cfg.shape, cfg.nf_max, cfg.cap, cfg.fill, cfg.chunk)?;
         let d = *scan.dims();
+        let stacks = cfg.stacks.get().min(d.nframe.div_ceil(cfg.nf_max.get()));
         let probe = DeviceBuffer::from_host(stream, probe)?;
         let mut fused = FusedBufs::new(stream, &d, cfg.nf_max.get())?;
         let mut bufs = if llk {
@@ -121,22 +130,24 @@ impl LiveAp {
             let (probe, counts) = (&probe, &counts);
             LiveGraph::capture(stream, move |c| {
                 let p = s.parts_mut();
-                p.frames.sweep_step(c)?;
-                let st = p.frames.sweep();
-                let inputs = FusedInputs {
-                    views: p.views,
-                    counts,
-                    obj: p.pixels,
-                    probe,
-                };
-                let llk = rec.as_mut().map(|(_, partials)| &mut **partials);
-                let sums = FusedSums {
-                    obj: Some(p.sums),
-                    probe: None,
-                };
-                k.fused_project(c, &inputs, st, Exit::Ap { llk }, fused, sums)?;
-                if let Some((w, partials)) = rec {
-                    w.push(c, &d, st, partials)?;
+                for _ in 0..stacks {
+                    p.frames.sweep_step(c)?;
+                    let st = p.frames.sweep();
+                    let inputs = FusedInputs {
+                        views: p.views,
+                        counts,
+                        obj: p.pixels,
+                        probe,
+                    };
+                    let llk = rec.as_mut().map(|(_, partials)| &mut **partials);
+                    let sums = FusedSums {
+                        obj: Some(&mut *p.sums),
+                        probe: None,
+                    };
+                    k.fused_project(c, &inputs, st, Exit::Ap { llk }, fused, sums)?;
+                    if let Some((w, partials)) = rec.as_mut() {
+                        w.push(c, &d, st, partials)?;
+                    }
                 }
                 Ok(())
             })?
@@ -170,6 +181,7 @@ impl LiveAp {
             _fused: fused,
             counts,
             binned: 0,
+            stacks,
             epochs: 0,
         })
     }
@@ -202,7 +214,7 @@ impl LiveAp {
                 .device()
                 .count(&ctx, binned..landed, &self.counts)?;
         }
-        for _ in 0..landed.div_ceil(nf) {
+        for _ in 0..landed.div_ceil(nf).div_ceil(self.stacks) {
             self.sweep.replay()?;
         }
         self.update.replay()?;
@@ -386,6 +398,7 @@ mod tests {
             fill: FILL,
             chunk: 1,
             inertia: 0.01,
+            stacks: NonZeroU32::new(2).unwrap(),
         }
     }
 
@@ -431,7 +444,9 @@ mod tests {
     /// Epochs over every frame landed at once are the engine's AP cycles
     /// with the probe fixed: same views, stacks, frames and start, so the
     /// same object after each of a few cycles, and each epoch's LLK the
-    /// engine's history record of that cycle.
+    /// engine's history record of that cycle, with sweep replays of 1, 2
+    /// and 3 of the scan's 3 stacks; with 2, each sweep ends on a step past
+    /// the last stack.
     #[test]
     fn epochs_over_a_whole_scan_are_the_engine_ap_cycles() {
         let (n, nf_max) = (64usize, 16u32);
@@ -467,78 +482,84 @@ mod tests {
             (std::f64::consts::PI * pixel[1] * pixel[1] / (g.wavelength * g.distance)) as f32;
 
         let ctx = Context::new(0).expect("GPU 0");
-        let start = Object::new(Stack::filled([1, obj[0], obj[1]], C64::new(1.0, 0.0)));
-        let truth = Probe::new(
-            Stack::from_vec(
-                [2, n, n],
-                p.probe()
-                    .iter()
-                    .map(|c| C64::new(c.re.into(), c.im.into()))
-                    .collect(),
-            )
-            .unwrap(),
-        );
-        let opts = GpuOptions {
-            stack_size: nf_max as usize,
-            graph: true,
-            llk_slots: 8,
-            fused: true,
-        };
-        let mut engine = GpuPtycho::new(&ctx, &scan, start, truth, opts).unwrap();
-        let params = ApParams {
-            obj_inertia: Some(0.01),
-            probe_inertia: None,
-            calc_llk: 1,
-            zero_phase_ramp: false,
-        };
-
-        let st = ctx.new_stream().unwrap();
-        let shape = ScanShape {
-            nframe: p.points() as u32,
-            nmode: 2,
-            nprobe: 2,
-            nobj: 1,
-            frame: [n as u32; 2],
-            reach,
-            quad_phase,
-        };
-        let dev = DeviceBuffer::from_host(&st, &counts).unwrap();
-        let mut live = LiveAp::new(&st, &config(shape, nf_max), &probe(&p), dev, true).unwrap();
-        live.backer().back(&views).unwrap();
-        assert_eq!(live.push(&views).unwrap(), p.points() as u32);
-        let mut snap = live.new_snapshot().unwrap();
-        let [ly, lx] = snap.shape();
-        // Every window lies inside both objects' common corner.
-        let [cy, cx] = [ly.min(obj[0]), lx.min(obj[1])];
-        assert!(reach[0] as usize + n <= cy && reach[1] as usize + n <= cx);
-        for cycles in [1, 2, 5] {
-            for _ in 0..cycles {
-                live.epoch().unwrap();
-            }
-            engine.ap(&params, cycles).unwrap();
-            live.snapshot(&mut snap).unwrap();
-            let (got, _) = plane(&mut snap, 0);
-            let want = engine.object().unwrap();
-            let want = want.as_slice();
-            let mut worst = 0f64;
-            for y in 0..cy {
-                for x in 0..cx {
-                    let (a, b) = (got[y * lx + x], want[y * obj[1] + x]);
-                    worst = worst.max((a - b).norm() / b.norm().max(1e-3));
-                }
-            }
-            assert_eq!(worst, 0.0, "after {} epochs", live.epochs());
-            let llk = live.llk().unwrap().unwrap();
-            let history = engine.history();
-            let want = &history[history.len() - cycles..];
-            let first = live.epochs() - cycles as u64;
-            assert!(llk.iter().map(|&(e, _)| e).eq(first..live.epochs()));
-            assert!(
-                llk.iter()
-                    .zip(want)
-                    .all(|(&(_, l), r)| l.to_bits() == r.llk.poisson.to_bits()),
-                "{llk:?} against {want:?}"
+        for stacks in [1, 2, 3] {
+            let start = Object::new(Stack::filled([1, obj[0], obj[1]], C64::new(1.0, 0.0)));
+            let truth = Probe::new(
+                Stack::from_vec(
+                    [2, n, n],
+                    p.probe()
+                        .iter()
+                        .map(|c| C64::new(c.re.into(), c.im.into()))
+                        .collect(),
+                )
+                .unwrap(),
             );
+            let opts = GpuOptions {
+                stack_size: nf_max as usize,
+                graph: true,
+                llk_slots: 8,
+                fused: true,
+            };
+            let mut engine = GpuPtycho::new(&ctx, &scan, start, truth, opts).unwrap();
+            let params = ApParams {
+                obj_inertia: Some(0.01),
+                probe_inertia: None,
+                calc_llk: 1,
+                zero_phase_ramp: false,
+            };
+
+            let st = ctx.new_stream().unwrap();
+            let shape = ScanShape {
+                nframe: p.points() as u32,
+                nmode: 2,
+                nprobe: 2,
+                nobj: 1,
+                frame: [n as u32; 2],
+                reach,
+                quad_phase,
+            };
+            let dev = DeviceBuffer::from_host(&st, &counts).unwrap();
+            let cfg = ApConfig {
+                stacks: NonZeroU32::new(stacks).unwrap(),
+                ..config(shape, nf_max)
+            };
+            let mut live = LiveAp::new(&st, &cfg, &probe(&p), dev, true).unwrap();
+            live.backer().back(&views).unwrap();
+            assert_eq!(live.push(&views).unwrap(), p.points() as u32);
+            let mut snap = live.new_snapshot().unwrap();
+            let [ly, lx] = snap.shape();
+            // Every window lies inside both objects' common corner.
+            let [cy, cx] = [ly.min(obj[0]), lx.min(obj[1])];
+            assert!(reach[0] as usize + n <= cy && reach[1] as usize + n <= cx);
+            for cycles in [1, 2, 5] {
+                for _ in 0..cycles {
+                    live.epoch().unwrap();
+                }
+                engine.ap(&params, cycles).unwrap();
+                live.snapshot(&mut snap).unwrap();
+                let (got, _) = plane(&mut snap, 0);
+                let want = engine.object().unwrap();
+                let want = want.as_slice();
+                let mut worst = 0f64;
+                for y in 0..cy {
+                    for x in 0..cx {
+                        let (a, b) = (got[y * lx + x], want[y * obj[1] + x]);
+                        worst = worst.max((a - b).norm() / b.norm().max(1e-3));
+                    }
+                }
+                assert_eq!(worst, 0.0, "after {} epochs of {stacks}", live.epochs());
+                let llk = live.llk().unwrap().unwrap();
+                let history = engine.history();
+                let want = &history[history.len() - cycles..];
+                let first = live.epochs() - cycles as u64;
+                assert!(llk.iter().map(|&(e, _)| e).eq(first..live.epochs()));
+                assert!(
+                    llk.iter()
+                        .zip(want)
+                        .all(|(&(_, l), r)| l.to_bits() == r.llk.poisson.to_bits()),
+                    "{llk:?} against {want:?}"
+                );
+            }
         }
     }
 
