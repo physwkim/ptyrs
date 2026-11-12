@@ -15,15 +15,15 @@ use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 use ptyrs_fft::Plan2d;
 use ptyrs_gpu::{
     BH_STEP, BhKernels, C32, CG_BLOCKS, Ended, EpochOrder, Error as GpuError, FusedBufs,
-    GammaStacks, GradKernels, Kernels, LlkPartial, LlkRing, LlkScratch, LlkTotals, PowerMax,
-    RingDevice, RpieKernels, StackTable, UpdateSums, ViewAddr, ViewDims, Views,
+    GammaStacks, GradKernels, Kernels, LlkPartial, LlkRing, LlkScratch, LlkTotals, ObjProbeScale,
+    PowerMax, RingDevice, RpieKernels, StackTable, UpdateSums, ViewAddr, ViewDims, Views,
 };
 
 use super::{
     Epoch, Frames, GpuOptions, Tag, batch_stacks, plane_len, plans, split, stack_buf_len, stacks,
     to_u32,
 };
-use crate::{ApParams, BhParams, DmParams, EngineError, MlParams, RpieParams};
+use crate::{ApParams, BhParams, BhStep, DmParams, EngineError, MlParams, RpieParams};
 
 /// Every buffer, module and plan a cycle launches on, and the graphs captured from them.
 pub(super) struct Device {
@@ -47,6 +47,7 @@ pub(super) struct Device {
     llk: DeviceBuffer<LlkPartial>,
     /// The chunk sums M1's [`Kernels::llk`] reduces a stack's frames through.
     llk_scratch: LlkScratch,
+    norms: NormBufs,
     ring: LlkRing<Tag>,
     use_graph: bool,
     /// The epochs run since the parameters last changed, all of one [`Epoch::run`].
@@ -145,14 +146,12 @@ struct MlState {
     h: [DeviceBuffer<C32>; 2],
     /// The search direction, object then probe.
     d: [DeviceBuffer<C32>; 2],
-    /// Block partial pairs: the β sums of the object then the probe, or one norm sum.
+    /// Block partial pairs: the β sums of the object then the probe.
     parts: DeviceBuffer<f32>,
     beta: DeviceBuffer<f32>,
     /// The line-search pairs of every frame's pixel chunks ([`ptyrs_gpu::gamma_parts`]).
     gamma_parts: DeviceBuffer<f32>,
     gamma: DeviceBuffer<f32>,
-    /// `(sum |x|, sum |x|^2)` of the object and the probe.
-    norms: [DeviceBuffer<f32>; 2],
     /// The calculated photons over the unmasked pixels of every frame.
     icalc: DeviceBuffer<f32>,
     fields: GammaStacks,
@@ -167,7 +166,6 @@ pub(super) struct MlBufs<'a> {
     pub beta: &'a mut DeviceBuffer<f32>,
     pub gamma_parts: &'a mut DeviceBuffer<f32>,
     pub gamma: &'a mut DeviceBuffer<f32>,
-    pub norms: &'a mut [DeviceBuffer<f32>; 2],
     pub icalc: &'a mut DeviceBuffer<f32>,
     pub fields: &'a mut GammaStacks,
 }
@@ -193,7 +191,6 @@ impl MlState {
             beta: pair()?,
             gamma_parts: DeviceBuffer::zeroed(stream, 2 * ptyrs_gpu::gamma_parts(dims)? as usize)?,
             gamma: pair()?,
-            norms: [pair()?, pair()?],
             icalc: DeviceBuffer::zeroed(stream, 1)?,
             fields: GammaStacks::zeroed(stream, stack_len)?,
         })
@@ -208,10 +205,26 @@ impl MlState {
             beta: &mut self.beta,
             gamma_parts: &mut self.gamma_parts,
             gamma: &mut self.gamma,
-            norms: &mut self.norms,
             icalc: &mut self.icalc,
             fields: &mut self.fields,
         }
+    }
+}
+
+/// The `(sum |x|, sum |x|^2)` pairs of the object and the probe that
+/// [`Bufs::scale_obj_probe`] scales them by, and the block partials it sums them through.
+pub(super) struct NormBufs {
+    pub parts: DeviceBuffer<f32>,
+    pub pairs: [DeviceBuffer<f32>; 2],
+}
+
+impl NormBufs {
+    fn zeroed(stream: &CudaStream) -> Result<Self, EngineError> {
+        let pair = || DeviceBuffer::<f32>::zeroed(stream, 2);
+        Ok(Self {
+            parts: DeviceBuffer::zeroed(stream, 2 * CG_BLOCKS as usize)?,
+            pairs: [pair()?, pair()?],
+        })
     }
 }
 
@@ -431,6 +444,7 @@ pub(super) struct Bufs<'a> {
     pub llk: &'a mut DeviceBuffer<LlkPartial>,
     /// The chunk sums of M1's [`Kernels::llk`].
     pub llk_scratch: &'a mut LlkScratch,
+    pub norms: &'a mut NormBufs,
     /// ML's state, once an ML call has built it.
     pub ml: Option<MlBufs<'a>>,
     /// BH's state, once a BH call has built it.
@@ -520,10 +534,11 @@ impl Device {
             probe_len: to_u32("probe length", probe.len())?,
             llk: DeviceBuffer::zeroed(&stream, table.nf_max() as usize)?,
             llk_scratch: LlkScratch::new(&stream, &dims, table.nf_max())?,
+            norms: NormBufs::zeroed(&stream)?,
             ring: LlkRing::new(
                 &kernels,
                 &stream,
-                dims.nframe,
+                &dims,
                 to_u32("llk_slots", options.llk_slots)?,
             )?,
             counts: DeviceBuffer::from_host(&stream, counts)?,
@@ -614,6 +629,7 @@ impl Device {
             stacks: Stacks(&mut self.stacks),
             llk: &mut self.llk,
             llk_scratch: &mut self.llk_scratch,
+            norms: &mut self.norms,
             ml: self.ml.as_deref_mut().map(MlState::lend),
             bh_state: self.bh_state.as_deref_mut().map(BhState::lend),
         };
@@ -652,6 +668,34 @@ impl Device {
                 .expect("new_run built the BH state");
             Ok(bh.order.set(&ctx, &dev.kernels, &dev.views, order)?)
         })
+    }
+
+    /// The last BH epoch's steps, one per batch, read back: each batch's frames from the
+    /// device's epoch order and its `(β, α, top, bottom)` record; none before a BH call.
+    pub fn bh_steps(&self) -> Result<Vec<BhStep>, EngineError> {
+        let Some(bh) = self.bh_state.as_deref() else {
+            return Ok(Vec::new());
+        };
+        let ids = bh.order.ids().to_host_vec(&self.stream)?;
+        let records = bh.steps.to_host_vec(&self.stream)?;
+        let steps = bh
+            .batches
+            .iter()
+            .zip(records.as_chunks::<{ BH_STEP as usize }>().0);
+        Ok(steps
+            .map(|(b, r)| {
+                let at = bh.stacks[b.start].range.start as usize
+                    ..bh.stacks[b.end - 1].range.end as usize;
+                let [beta, alpha, top, bottom] = r.map(f64::from);
+                BhStep {
+                    frames: ids[at].iter().map(|&f| f as usize).collect(),
+                    beta,
+                    alpha,
+                    top,
+                    bottom,
+                }
+            })
+            .collect())
     }
 
     /// [`Self::steady`] with `stage` enqueued just before the cycle, once its buffers are
@@ -774,12 +818,20 @@ impl Device {
         Ok(())
     }
 
-    /// [`Bufs::scale_obj_probe`] enqueued eagerly, with `total` the unmasked observed photons.
-    pub fn scale_obj_probe(&mut self, total: f32) -> Result<(), EngineError> {
+    /// [`Bufs::scale_to_photons`] enqueued eagerly, with `total` the unmasked observed photons.
+    pub fn scale_to_photons(&mut self, total: f32) -> Result<(), EngineError> {
         self.build_ml()?;
         let ctx = self.context();
         let (mut bufs, _, _) = self.lend();
-        Ok(bufs.with_ml(|b, ml| b.scale_obj_probe(&ctx, ml, total))?)
+        Ok(bufs.with_ml(|b, ml| b.scale_to_photons(&ctx, ml, total))?)
+    }
+
+    /// PyNX `ScaleObjProbe(absolute=False)` enqueued eagerly: `Σ|O|` and `Σ|P|` balanced,
+    /// `O P` unchanged.
+    pub fn balance_obj_probe(&mut self) -> Result<(), EngineError> {
+        let ctx = self.context();
+        let (mut bufs, _, _) = self.lend();
+        Ok(bufs.scale_obj_probe(&ctx, ObjProbeScale::Relative)?)
     }
 
     /// The ML gradients of the current estimate, object then probe, as

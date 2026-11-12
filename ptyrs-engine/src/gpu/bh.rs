@@ -7,7 +7,7 @@ use ptyrs_gpu::{BhBatch, BhDisp, BhFieldsRef, BhScan, BhVar, Error as GpuError};
 use super::device::BhBufs;
 use super::{Bufs, GpuPtycho, plane_len};
 use crate::ptycho::{Algorithm, llk_due};
-use crate::{BhParams, EngineError, random_batches};
+use crate::{BhParams, BhStep, EngineError, random_batches};
 
 impl GpuPtycho {
     /// [`crate::Bh::epoch`] `nepoch` times from a fresh [`crate::Bh`], over the same
@@ -39,6 +39,12 @@ impl GpuPtycho {
         }
         self.collect()?;
         Ok(())
+    }
+
+    /// The steps of the last BH epoch, as [`crate::Bh::epoch`] returns them, read back from
+    /// the device; none before a BH call.
+    pub fn bh_steps(&self) -> Result<Vec<BhStep>, EngineError> {
+        self.dev.bh_steps()
     }
 }
 

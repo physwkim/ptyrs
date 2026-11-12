@@ -100,6 +100,11 @@ impl EpochOrder {
         &self.views
     }
 
+    /// The scan frame at each epoch position.
+    pub fn ids(&self) -> &DeviceBuffer<u32> {
+        &self.ids
+    }
+
     /// Enqueues on `ctx` the upload of `ids`, the scan frame at each epoch position, and the
     /// reorder of `src`, the views this order was made from, by them; nothing when the
     /// device already holds `ids`. Waits only for the copy [`ORDER_SLOTS`] uploads back.

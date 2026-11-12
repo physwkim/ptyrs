@@ -36,10 +36,11 @@ use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 use ptyrs_core::{AddrTable, C64, Object, Probe, Scan, Stack};
 use ptyrs_fft::Plan2d;
 use ptyrs_gpu::{
-    C32, Ended, Error as GpuError, FusedInputs, RecordWriter, StackTable, ViewAddr, ViewDims,
+    C32, CG_BLOCKS, Ended, Error as GpuError, FusedInputs, ObjProbeScale, RecordWriter, StackTable,
+    ViewAddr, ViewDims,
 };
 
-use device::{Bufs, Device, M1Bufs, PassesMut};
+use device::{Bufs, Device, M1Bufs, NormBufs, PassesMut};
 
 use crate::ptycho::{Algorithm, LlkRecord, zero_phase_ramp};
 use crate::{ApParams, BhParams, DmParams, EngineError, Fft2, Llk, MlParams, Observed, RpieParams};
@@ -592,5 +593,29 @@ impl Bufs<'_> {
             )?;
         }
         Ok(())
+    }
+
+    /// PyNX `ScaleObjProbe` by `scale`: the norms of the object and the probe, then the
+    /// scaling, without a host sync.
+    fn scale_obj_probe(
+        &mut self,
+        ctx: &ExecutionContext,
+        scale: ObjProbeScale<'_>,
+    ) -> Result<(), GpuError> {
+        let NormBufs {
+            parts,
+            pairs: [obj_norm, probe_norm],
+        } = &mut *self.norms;
+        for (x, n, out) in [
+            (&*self.obj, self.obj_len, &mut *obj_norm),
+            (&*self.probe, self.probe_len, &mut *probe_norm),
+        ] {
+            ptyrs_gpu::zero(ctx, parts)?;
+            self.grad.norm_parts(ctx, x, n, parts)?;
+            self.grad.sum_parts(ctx, parts, CG_BLOCKS, out)?;
+        }
+        let norms = [&*obj_norm, &*probe_norm];
+        self.grad
+            .scale_obj_probe(ctx, self.obj, self.probe, norms, scale)
     }
 }

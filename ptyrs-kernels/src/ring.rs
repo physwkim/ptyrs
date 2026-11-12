@@ -1,7 +1,8 @@
 //! The LLK ring: per-frame LLK partials of successive records, each stamped with its record's
 //! sequence number, in a device ring the host downloads after the epochs that wrote it.
 //! Record `k` lives in slot `k % nslot`; only `ring_advance` moves the cursor that numbers it.
-//! Each frame's unmasked pixels, counted once by `ring_count`, ride along with its partials.
+//! Each frame's unmasked pixels, counted once by `ring_count`, ride along with its partials;
+//! the same count adds the frame to each of its unmasked pixels' frame counts.
 
 use cuda_host::cuda_module;
 
@@ -34,35 +35,45 @@ pub mod ring_kernels {
     use crate::*;
     use cuda_device::SharedArray;
 
-    use super::RingRecord;
+    use super::{RingRecord, UNCOUNTED};
 
-    /// `nobs[f0 + fl]` = the unmasked pixels of frame `f0 + fl`, `fl < nf`, in `counts`. One
-    /// block of `PIXEL_THREADS` per frame, `nf_max` blocks.
+    /// For each frame `f = f0 + fl`, `fl < nf`, not counted yet (`nobs[f] == UNCOUNTED`):
+    /// `nobs[f]` = its unmasked pixels in `counts`, and `pixel_frames[p] += 1` for each of
+    /// them. A frame already counted is left as it is, so each frame is in `pixel_frames` at
+    /// most once. One block of `PIXEL_THREADS` per frame, `nf_max` blocks.
     ///
     /// # Safety
     ///
-    /// `counts` `nframe * ny * nx`, `nobs` `nframe`, `ctl` one entry.
+    /// `counts` `nframe * ny * nx`, `nobs` `nframe`, `pixel_frames` `ny * nx`, `ctl` one
+    /// entry.
     #[kernel]
     pub unsafe fn ring_count(
         counts: *const u16,
         nobs: *mut u32,
+        pixel_frames: *mut u32,
         ctl: *const StackCtl,
         g: StackGeom,
     ) {
+        use cuda_device::atomic::{AtomicOrdering, DeviceAtomicU32};
         static mut RED: SharedArray<u32, 256> = SharedArray::UNINIT;
         let (f0, nf) = unsafe { stack_frames(ctl, g) };
         let fl = thread::blockIdx_x() as usize;
-        // The whole block leaves together, before its first barrier.
-        if fl >= nf as usize {
+        let f = f0 as usize + fl;
+        // The whole block leaves together, before its first barrier; thread 0 writes
+        // `nobs[f]` only after every thread has passed one.
+        if fl >= nf as usize || unsafe { *nobs.add(f) } != UNCOUNTED {
             return;
         }
         let n = g.ny as usize * g.nx as usize;
-        let f = f0 as usize + fl;
         let t = thread::threadIdx_x() as usize;
         let mut acc = 0u32;
         let mut p = t;
         while p < n {
-            acc += (unsafe { *counts.add(f * n + p) } != MASKED) as u32;
+            if unsafe { *counts.add(f * n + p) } != MASKED {
+                acc += 1;
+                unsafe { DeviceAtomicU32::from_ptr(pixel_frames.add(p)) }
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+            }
             p += PIXEL_THREADS as usize;
         }
         let s = (&raw mut RED).cast::<u32>();

@@ -1,15 +1,14 @@
 //! GPU BH on a measured scan (the M3 case), on CUDA device 0: time per epoch and epochs to
 //! 1.01× the true LLK.
 //!
-//! `cargo run --release -p ptyrs-engine --example bh_m3 -- <cxi> <init.h5> <truth_poisson> <truth_gaussian> <truth_euclidian> [scaled|init] [batches] [ntime] [nepoch] [stack_size] [fused|m1]`
-//! (defaults `scaled`, `96,1024`, 20, 300, 16, `fused`) starts from `init.h5` after
-//! [`Ptycho::scale_obj_probe`] as solve's CPU M3 curves do, or with `init` from `init.h5` as
-//! it is, as the pty-chi M3 runs do; probe rho 0.01 and seed 7. For each comma-separated
-//! batch size it times `ntime` epochs after 5 untimed ones with no LLK, then runs `nepoch`
-//! epochs from the start with an LLK after every epoch and prints the curve and, per LLK
-//! kind, the first epoch at or below 1.01× the truth. Its seconds are epochs × the timed
-//! ms/epoch, which leaves out the LLK passes, as pty-chi's `time_to_target` leaves out its
-//! evaluation.
+//! `cargo run --release -p ptyrs-engine --example bh_m3 -- <cxi> <init.h5> <truth_poisson> <truth_gaussian> <truth_euclidian> [init|scaled] [batches] [ntime] [nepoch] [stack_size] [fused|m1]`
+//! (defaults `init`, `96,1024`, 20, 300, 16, `fused`) starts from `init.h5` as it is, as
+//! pty-chi's BH does, or with `scaled` after [`Ptycho::scale_obj_probe`]; probe rho 0.01 and
+//! seed 7. For each comma-separated batch size it times `ntime` epochs after 5 untimed ones
+//! with no LLK, then runs `nepoch` epochs from the start with an LLK after every epoch and
+//! prints the curve and, per LLK kind, the first epoch at or below 1.01× the truth. Its
+//! seconds are epochs × the timed ms/epoch, which leaves out the LLK passes, as pty-chi's
+//! `time_to_target` leaves out its evaluation.
 
 use std::time::Instant;
 
@@ -24,7 +23,7 @@ fn kinds(l: &Llk) -> [f64; 3] {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let usage = "usage: bh_m3 <cxi> <init.h5> <truth_poisson> <truth_gaussian> <truth_euclidian> [scaled|init] [batches] [ntime] [nepoch] [stack_size] [fused|m1]";
+    let usage = "usage: bh_m3 <cxi> <init.h5> <truth_poisson> <truth_gaussian> <truth_euclidian> [init|scaled] [batches] [ntime] [nepoch] [stack_size] [fused|m1]";
     let mut args = std::env::args().skip(1);
     let (cxi, init) = (args.next().ok_or(usage)?, args.next().ok_or(usage)?);
     let mut truth = [0.0; 3];
@@ -32,8 +31,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         *t = args.next().ok_or(usage)?.parse()?;
     }
     let scaled = match args.next().as_deref() {
-        None | Some("scaled") => true,
-        Some("init") => false,
+        Some("scaled") => true,
+        None | Some("init") => false,
         Some(_) => return Err(usage.into()),
     };
     let batches = args.next().unwrap_or_else(|| "96,1024".into());

@@ -15,17 +15,22 @@ impl GpuPtycho {
     /// the scratch stack, `add_c32`). Then `loop_obj_probe` object-only and probe-only
     /// updates, the probe one from the new object; the fused projection adds the first
     /// object-only update's sums itself. The LLK record is of the estimate the cycle starts
-    /// from.
+    /// from; after the update of each cycle that records one, `Σ|O|` and `Σ|P|` are balanced
+    /// with `O P` unchanged (PyNX `ScaleObjProbe(absolute=False)`).
     pub fn dm(&mut self, params: &DmParams, ncycle: usize) -> Result<(), EngineError> {
         for ic in 0..ncycle {
             let epoch = Epoch::Dm {
                 params: *params,
                 first: ic == 0,
             };
-            if llk_due(params.calc_llk, ic, ncycle) {
+            let llk = llk_due(params.calc_llk, ic, ncycle);
+            if llk {
                 self.dev.llk_pass(Some((self.cycle, Algorithm::Dm)))?;
             }
             self.dev.steady(epoch, self.cycle)?;
+            if llk {
+                self.dev.balance_obj_probe()?;
+            }
             self.cycle += 1;
         }
         self.collect()?;

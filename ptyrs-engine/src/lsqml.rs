@@ -65,12 +65,14 @@ pub struct LsqmlBatch<'a> {
 }
 
 impl<'a> LsqmlBatch<'a> {
-    /// `a_far` is 1/2 for the Gaussian model and PtychoShelves' `xi` solver for the Poisson
-    /// one: two passes from 1/2 of `a = clip(a′/2 + Σ xi·(icalc − iobs/(1 − a′·xi)) /
-    /// Σ xi²·icalc / 2, 0, 1)` per frame, with `xi = 1 − iobs/(icalc + 1e-5)` and `a′` the batch
-    /// mean of the last pass (pty-chi's per-frame jitter of `1e-2·randn` left out).
+    /// The batch of `run`, with its cost. `a_far` is 1/2 for the Gaussian model and
+    /// PtychoShelves' `xi` solver for the Poisson one: two passes of `a = clip(a′/2 +
+    /// Σ xi·(icalc − iobs/(1 − a′·xi)) / Σ xi²·icalc / 2, 0, 1)` per frame, with
+    /// `xi = 1 − iobs/(icalc + 1e-5)` and `a′` the batch mean of the last pass, the first pass
+    /// from [`Lsqml::a_far`] of the batch's frames (pty-chi's per-frame jitter of `1e-2·randn`
+    /// left out).
     pub fn new(
-        cost: Cost,
+        run: &Lsqml,
         views: &'a [View],
         obs: &Observed,
         quad: &'a [C64],
@@ -78,6 +80,7 @@ impl<'a> LsqmlBatch<'a> {
         probe: &'a Probe,
         var: &ProbeVariation,
     ) -> Self {
+        let cost = run.params.cost;
         let n = probe.plane_len();
         let nmode = views
             .iter()
@@ -103,7 +106,10 @@ impl<'a> LsqmlBatch<'a> {
                 (0..n).map(move |j| (0..nmode).map(|m| block[m * n + j].norm_sqr()).sum())
             })
             .collect();
-        let mut a_far = vec![0.5; frames.len()];
+        let mut a_far: Vec<f64> = match cost {
+            Cost::Poisson => frames.iter().map(|&f| run.a_far(f)).collect(),
+            _ => vec![0.5; frames.len()],
+        };
         if cost == Cost::Poisson {
             for _ in 0..2 {
                 let prev = a_far.iter().sum::<f64>() / a_far.len() as f64;
@@ -287,12 +293,15 @@ fn trim_mean(x: &[f64]) -> f64 {
     kept.iter().sum::<f64>() / kept.len() as f64
 }
 
-/// LSQML state across epochs: the parameters, the epoch count and pty-chi's object
-/// preconditioner.
+/// LSQML state across epochs: the parameters, the epoch count, pty-chi's object
+/// preconditioner and every frame's `a_far` from its last step.
+#[derive(Clone)]
 pub struct Lsqml {
     params: LsqmlParams,
     epochs: usize,
     preconditioner: Option<Stack<f64>>,
+    /// pty-chi `alpha_psi_far_all_pos`, by frame; frames past its end have not been stepped.
+    a_far: Vec<f64>,
 }
 
 impl Lsqml {
@@ -302,15 +311,21 @@ impl Lsqml {
             params,
             epochs: 0,
             preconditioner: None,
+            a_far: Vec::new(),
         }
     }
 
-    /// A run whose preconditioner starts at `preconditioner` (shaped as the object) in place of
-    /// the renormalised probe's illumination, as on resuming one.
-    pub fn with_preconditioner(params: LsqmlParams, preconditioner: Stack<f64>) -> Self {
+    /// Frame `f`'s `a_far` from its last [`Self::step`], 1/2 before its first.
+    pub fn a_far(&self, f: usize) -> f64 {
+        self.a_far.get(f).copied().unwrap_or(0.5)
+    }
+
+    /// This run with its preconditioner set to `preconditioner` (shaped as the object), which on
+    /// a new run replaces the renormalised probe's illumination, as on resuming one.
+    pub fn with_preconditioner(self, preconditioner: Stack<f64>) -> Self {
         Self {
             preconditioner: Some(preconditioner),
-            ..Self::new(params)
+            ..self
         }
     }
 
@@ -318,9 +333,10 @@ impl Lsqml {
     /// variation) with the params' cost and the current preconditioner `pre`: with
     /// [`LsqmlBatch`]'s directions, `dO = obj_direction / √(pre² + (0.1·max pre)²)` and
     /// `dP = probe_direction`, `O += trim_mean(a_obj)·dO`, `P += mean(a_probe)·dP` and `var`'s
-    /// eigenmodes and batch weights by [`ProbeVariation`]'s OPR step, all from the state on entry.
+    /// eigenmodes and batch weights by [`ProbeVariation`]'s OPR step, all from the state on entry;
+    /// the frames' [`Self::a_far`] become the batch's.
     pub fn step(
-        &self,
+        &mut self,
         views: &[View],
         obs: &Observed,
         quad: &[C64],
@@ -333,7 +349,7 @@ impl Lsqml {
             .expect("no preconditioner before the first epoch")
             .as_slice();
         let floor = (0.1 * pre.iter().fold(0.0, |a: f64, &b| a.max(b))).powi(2);
-        let b = LsqmlBatch::new(self.params.cost, views, obs, quad, object, probe, var);
+        let b = LsqmlBatch::new(self, views, obs, quad, object, probe, var);
         let mut d_obj = b.obj_direction();
         for (d, p) in d_obj.as_mut_slice().iter_mut().zip(pre) {
             *d /= (p * p + floor).sqrt();
@@ -343,6 +359,12 @@ impl Lsqml {
         let (d_obj, d_probe) = (Object::new(d_obj), Probe::new(frame_mean(&d, np)));
         let [a_obj, a_probe] = b.step_sizes(&d_obj, &d_probe);
         let (a_far, frames) = (b.a_far().to_vec(), b.frames().to_vec());
+        for (&f, &a) in frames.iter().zip(&a_far) {
+            if self.a_far.len() <= f {
+                self.a_far.resize(f + 1, 0.5);
+            }
+            self.a_far[f] = a;
+        }
         var.step(&frames, &d, &vv, np);
         let (so, sp) = (
             trim_mean(&a_obj),

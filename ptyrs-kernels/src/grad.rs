@@ -35,7 +35,7 @@ pub struct ObjProbePtrs {
 }
 
 /// The `(sum |x|, sum |x|^2)` pairs of the object and the probe, and the calculated photons
-/// over the unmasked pixels of every frame (one float).
+/// over the unmasked pixels of every frame (one float), or null to keep `O P`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct NormPtrs {
@@ -163,15 +163,16 @@ pub mod grad_kernels {
         }
     }
 
-    /// PyNX `ScaleObjProbe(absolute=True)` from the pairs `(sum |x|, sum |x|^2)` of the
-    /// object and the probe and the unmasked calculated photons `icalc`: with
-    /// `s = sqrt(total / icalc)`, `obj *= sqrt(probe[0] / obj[0] * s)` and
+    /// PyNX `ScaleObjProbe` from the pairs `(sum |x|, sum |x|^2)` of the object and the
+    /// probe: with `s = sqrt(total / icalc)` (`absolute=True`), or 1 if `norms.icalc` is null
+    /// (`absolute=False`), `obj *= sqrt(probe[0] / obj[0] * s)` and
     /// `probe *= sqrt(obj[0] / probe[0] * s)`.
     ///
     /// # Safety
     ///
     /// `obj` holds `nobj` complex values, `probe` `nprobe`, `norms.obj` and `norms.probe` two
-    /// floats each and `norms.icalc` one; one thread per element of the longer array.
+    /// floats each and `norms.icalc` one or is null; one thread per element of the longer
+    /// array.
     #[kernel]
     pub unsafe fn cg_scale_obj_probe(
         obj: *mut f32,
@@ -184,7 +185,11 @@ pub mod grad_kernels {
         let i = global_index();
         unsafe {
             let (os, ps) = (*norms.obj, *norms.probe);
-            let s = (total / *norms.icalc).sqrt();
+            let s = if norms.icalc.is_null() {
+                1.0
+            } else {
+                (total / *norms.icalc).sqrt()
+            };
             for (x, len, f) in [
                 (obj, nobj, (ps / os * s).sqrt()),
                 (probe, nprobe, (os / ps * s).sqrt()),

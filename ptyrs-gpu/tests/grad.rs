@@ -6,8 +6,8 @@ use std::sync::Arc;
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, DeviceCopy};
 use ptyrs_gpu::{
-    C32, CG_BLOCKS, GAMMA_CHUNK, GammaStacks, GradKernels, Kernels, LlkPartial, MASKED, StackTable,
-    UpdateSums, ViewAddr, ViewDims, Views, gamma_parts,
+    C32, CG_BLOCKS, GAMMA_CHUNK, GammaStacks, GradKernels, Kernels, LlkPartial, MASKED,
+    ObjProbeScale, StackTable, UpdateSums, ViewAddr, ViewDims, Views, gamma_parts,
 };
 
 /// A stream, an eager execution context on it, the M1 kernels and the CG kernels.
@@ -471,29 +471,33 @@ fn icalc_add_sums_each_stacks_frames() {
     assert_eq!(out.to_host_vec(&stream).unwrap(), [31.0]);
 }
 
-/// The object and probe scale factors of `ScaleObjProbe` from given norm pairs and
-/// calculated photons, with the object longer than the probe and the other way round.
+/// The object and probe scale factors of `ScaleObjProbe` from given norm pairs, absolute
+/// (from given calculated photons) and relative, with the object longer than the probe and
+/// the other way round.
 #[test]
 fn scale_obj_probe_matches_f64() {
     let (stream, ctx, _, k) = setup();
     let (os, ps, icalc, total) = (300.0f32, 40.0f32, 5.0e4f32, 2.0e6f32);
     let norms = [up(&stream, &[os, 0.0]), up(&stream, &[ps, 0.0])];
     let icalc_buf = up(&stream, &[icalc]);
-    let s = (total as f64 / icalc as f64).sqrt();
-    let fo = (ps as f64 / os as f64 * s).sqrt();
-    let fp = (os as f64 / ps as f64 * s).sqrt();
-    for (nobj, nprobe) in [(2000usize, 300usize), (100, 700)] {
+    let absolute = ObjProbeScale::Absolute {
+        icalc: &icalc_buf,
+        total,
+    };
+    let cases = [
+        (absolute, (total as f64 / icalc as f64).sqrt()),
+        (ObjProbeScale::Relative, 1.0),
+    ];
+    for ((scale, s), (nobj, nprobe)) in cases
+        .into_iter()
+        .flat_map(|c| [(c, (2000usize, 300usize)), (c, (100, 700))])
+    {
+        let fo = (ps as f64 / os as f64 * s).sqrt();
+        let fp = (os as f64 / ps as f64 * s).sqrt();
         let (o0, p0) = (noise(nobj, 31, 1.0), noise(nprobe, 37, 3.0));
         let (mut obj, mut probe) = (up(&stream, &o0), up(&stream, &p0));
-        k.scale_obj_probe(
-            &ctx,
-            &mut obj,
-            &mut probe,
-            [&norms[0], &norms[1]],
-            &icalc_buf,
-            total,
-        )
-        .unwrap();
+        k.scale_obj_probe(&ctx, &mut obj, &mut probe, [&norms[0], &norms[1]], scale)
+            .unwrap();
         for (x0, got, f) in [
             (&o0, obj.to_host_vec(&stream).unwrap(), fo),
             (&p0, probe.to_host_vec(&stream).unwrap(), fp),

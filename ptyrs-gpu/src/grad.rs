@@ -60,6 +60,20 @@ impl GammaStacks {
     }
 }
 
+/// The factor `s` by which [`GradKernels::scale_obj_probe`] scales `O P`.
+#[derive(Clone, Copy)]
+pub enum ObjProbeScale<'a> {
+    /// PyNX `ScaleObjProbe(absolute=False)`: `s = 1`.
+    Relative,
+    /// PyNX `ScaleObjProbe(absolute=True)`: `s = sqrt(total / icalc)`, with `icalc` the
+    /// unmasked calculated photons of [`GradKernels::icalc_add`] and `total` the unmasked
+    /// observed photons.
+    Absolute {
+        icalc: &'a DeviceBuffer<f32>,
+        total: f32,
+    },
+}
+
 /// The CG kernels, bound to the module a [`Kernels`] loaded.
 #[derive(Clone, Debug)]
 pub struct GradKernels {
@@ -208,41 +222,48 @@ impl GradKernels {
         })
     }
 
-    /// PyNX `ScaleObjProbe(absolute=True)` of `obj` and `probe` from the [`Self::sum_parts`]
-    /// totals of [`Self::norm_parts`] `norms = [object, probe]`, the unmasked calculated
-    /// photons `icalc` of [`Self::icalc_add`] and the unmasked observed photons `total`: with
-    /// `s = sqrt(total / icalc)`, `obj *= sqrt(sum |P| / sum |O| * s)` and
-    /// `probe *= sqrt(sum |O| / sum |P| * s)`.
+    /// PyNX `ScaleObjProbe` of `obj` and `probe` from the [`Self::sum_parts`] totals of
+    /// [`Self::norm_parts`] `norms = [object, probe]`: with `s` of `scale`,
+    /// `obj *= sqrt(sum |P| / sum |O| * s)` and `probe *= sqrt(sum |O| / sum |P| * s)`.
     pub fn scale_obj_probe(
         &self,
         ctx: &ExecutionContext,
         obj: &mut DeviceBuffer<C32>,
         probe: &mut DeviceBuffer<C32>,
         norms: [&DeviceBuffer<f32>; 2],
-        icalc: &DeviceBuffer<f32>,
-        total: f32,
+        scale: ObjProbeScale<'_>,
     ) -> Result<(), Error> {
         for (what, pair) in ["obj", "probe"].into_iter().zip(norms) {
             check_len(what, pair, 2)?;
         }
-        check_len("icalc", icalc, 1)?;
+        let (icalc, total) = match scale {
+            ObjProbeScale::Relative => (None, 0.0),
+            ObjProbeScale::Absolute { icalc, total } => {
+                check_len("icalc", icalc, 1)?;
+                (Some(icalc), total)
+            }
+        };
         let len = |what: &str, b: &DeviceBuffer<C32>| {
             u32::try_from(b.len())
                 .map_err(|_| Error::Shape(format!("{what} holds {} values, over u32", b.len())))
         };
         let (nobj, nprobe) = (len("obj", obj)?, len("probe", probe)?);
         let config = grid_1d(nobj.max(nprobe) as usize)?;
-        let reads = [norms[0].storage(), norms[1].storage(), icalc.storage()];
+        let reads: Vec<_> = norms
+            .iter()
+            .chain(icalc.as_slice())
+            .map(|b| b.storage())
+            .collect();
         let writes = [obj.storage(), probe.storage()];
         self.base.launch(ctx, &reads, &writes, |stream| {
             let [o, p] = norms.map(dptr::<f32, f32>);
             let norms = NormPtrs {
                 obj: o,
                 probe: p,
-                icalc: dptr(icalc),
+                icalc: icalc.map_or(std::ptr::null(), |b| dptr::<f32, f32>(b).cast_const()),
             };
-            // SAFETY: each pair holds two floats and `icalc` one; one thread per element of
-            // the longer array.
+            // SAFETY: each pair holds two floats and `icalc` one or is null; one thread per
+            // element of the longer array.
             unsafe {
                 self.module.cg_scale_obj_probe(
                     stream,
