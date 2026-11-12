@@ -1,0 +1,14 @@
+# In live, every graph is captured through ptyrs::live::graph::LiveGraph::capture,
+# which counts it: a capture during a measurement breaks it (DESIGN.md §5 inv. 9).
+# Cargo.toml allows the lint; the live module and live's binaries, examples and
+# test warn on it again.
+disallowed-methods = [
+    { path = "cuda_async::cuda_graph::CudaGraph::capture", reason = "capture through LiveGraph::capture, which counts it" },
+    { path = "cuda_async::cuda_graph::CudaGraph::scope", reason = "capture through LiveGraph::capture, which counts it" },
+    { path = "cuda_core::Stream::begin_capture", reason = "capture through LiveGraph::capture, which counts it" },
+    { path = "cuda_bindings::cuStreamBeginCapture_v2", reason = "capture through LiveGraph::capture, which counts it" },
+    { path = "cuda_bindings::cuStreamBeginCaptureToGraph", reason = "capture through LiveGraph::capture, which counts it" },
+    { path = "cuda_bindings::cuStreamBeginCaptureToCig", reason = "capture through LiveGraph::capture, which counts it" },
+    { path = "cuda_bindings::cuGraphInstantiateWithFlags", reason = "capture through LiveGraph::capture, which counts it" },
+    { path = "cuda_bindings::cuGraphInstantiateWithParams", reason = "capture through LiveGraph::capture, which counts it" },
+]

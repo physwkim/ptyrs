@@ -1,0 +1,14 @@
+[package]
+name = "ptyrs-py"
+version.workspace = true
+edition.workspace = true
+description = "ptyrs Python bindings (numpy in and out), for validating against pty-chi, PyNX and PtyPy only"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+ptyrs = { path = "../ptyrs" }
+cuda-core.workspace = true
+numpy = "0.28"
+pyo3 = "0.28"

@@ -13,8 +13,12 @@
 use cuda_device::{device, kernel, launch_bounds, shared::DynamicSharedArray, thread};
 use cuda_host::cuda_module;
 
+pub mod bh;
 pub mod fused;
+pub mod grad;
 pub mod pixel;
+pub mod ring;
+pub mod rpie;
 
 /// Complex elements per thread of the in-kernel FFT of `n` points (cuFFT device API,
 /// BY_COMPONENT), which runs on `n / fft_ept(n)` threads. Sides to 256 take 8: at 16, a fused
