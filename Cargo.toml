@@ -22,6 +22,6 @@ rand = "0.8"
 rand_chacha = "0.3"
 rand_distr = "0.4"
 rustfft = "6"
-rust-hdf5 = "0.7.12"
+rust-hdf5 = "0.7.13"
 ptyrs-core = { path = "ptyrs-core" }
 ptyrs-io = { path = "ptyrs-io" }
