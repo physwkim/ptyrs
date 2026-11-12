@@ -36,6 +36,8 @@ rt-threads = 1
 util-min = 1024
 # EEVDF slice of the pinned threads; 0 keeps the kernel's.
 slice-us = 100
+# SCHED_FIFO priority of the uploader (needs RLIMIT_RTPRIO); 0 keeps it fair.
+h2d-rtprio = 10
 # Stop once no frame arrived for this long.
 idle-ms = 3000
 # Stop if no frame arrived within this long.

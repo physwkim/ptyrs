@@ -14,7 +14,7 @@ use crate::live::codec::{
 };
 use crate::live::handoff::{WorkRx, WorkTx};
 use crate::live::ring::Ring;
-use crate::live::sched::{FairSched, parse_cpu_list, pin_current, set_fair};
+use crate::live::sched::{FairSched, parse_cpu_list, pin_current, set_fair, set_fifo};
 use crate::live::stats::{Histogram, mono_ns, process_cpu_ns, thread_cpu_ns};
 use crate::live::synth::{Region, Synth, SynthScratch};
 
@@ -339,6 +339,8 @@ pub struct Placement {
     pub workers: Vec<Option<usize>>,
     pub readers: Vec<Option<usize>>,
     pub sched: FairSched,
+    /// SCHED_FIFO priority of the uploader; 0 keeps it in `sched` with the rest.
+    pub h2d_rtprio: u32,
 }
 
 impl Placement {
@@ -348,6 +350,7 @@ impl Placement {
         workers: usize,
         readers: usize,
         sched: FairSched,
+        h2d_rtprio: u32,
     ) -> Self {
         if cpus.is_empty() {
             return Self {
@@ -357,6 +360,7 @@ impl Placement {
                 workers: vec![None; workers],
                 readers: vec![None; readers],
                 sched,
+                h2d_rtprio,
             };
         }
         let c = parse_cpu_list(cpus).unwrap_or_else(|e| panic!("--cpus: {e}"));
@@ -375,20 +379,40 @@ impl Placement {
             workers: some(&c[w0..w0 + workers]),
             readers: some(&c[w0 + workers..need]),
             sched,
+            h2d_rtprio,
         }
     }
 
     /// Apply to the calling thread.
     pub fn enter(&self, cpus: Option<&[usize]>) {
-        if let Some(c) = cpus {
-            pin_current(c).unwrap_or_else(|e| panic!("pin to {c:?}: {e}"));
-        }
+        pin(cpus);
         set_fair(self.sched).unwrap_or_else(|e| {
             panic!(
                 "sched_setattr {:?}: {e} (--util-min 0 --slice-us 0 skip it)",
                 self.sched
             )
         });
+    }
+
+    /// Apply the uploader's place to the calling thread.
+    pub fn enter_h2d(&self) {
+        let cpu = self.h2d.as_ref().map(std::slice::from_ref);
+        if self.h2d_rtprio == 0 {
+            return self.enter(cpu);
+        }
+        pin(cpu);
+        set_fifo(self.h2d_rtprio).unwrap_or_else(|e| {
+            panic!(
+                "SCHED_FIFO {}: {e} (RLIMIT_RTPRIO too low? --h2d-rtprio 0 skips it)",
+                self.h2d_rtprio
+            )
+        });
+    }
+}
+
+fn pin(cpus: Option<&[usize]>) {
+    if let Some(c) = cpus {
+        pin_current(c).unwrap_or_else(|e| panic!("pin to {c:?}: {e}"));
     }
 }
 

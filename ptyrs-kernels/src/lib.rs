@@ -16,6 +16,7 @@ use cuda_host::cuda_module;
 pub mod bh;
 pub mod fused;
 pub mod grad;
+pub mod lsqml;
 pub mod pixel;
 pub mod ring;
 pub mod rpie;

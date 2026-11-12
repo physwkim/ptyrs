@@ -98,6 +98,17 @@ fn get_attr() -> io::Result<SchedAttr> {
     Ok(attr)
 }
 
+fn set_attr(attr: &SchedAttr) -> io::Result<()> {
+    // SAFETY: pid 0 is the calling thread; `attr` is a valid VER1 sched_attr
+    // whose size field matches its layout.
+    let r = unsafe { libc::syscall(libc::SYS_sched_setattr, 0, attr as *const SchedAttr, 0) };
+    if r == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
 /// Apply `s` to the calling thread, keeping its policy and nice.
 pub fn set_fair(s: FairSched) -> io::Result<()> {
     if s.util_min == 0 && s.slice_ns == 0 {
@@ -113,14 +124,24 @@ pub fn set_fair(s: FairSched) -> io::Result<()> {
         attr.flags |= libc::SCHED_FLAG_UTIL_CLAMP_MIN as u64;
         attr.util_min = s.util_min;
     }
-    // SAFETY: pid 0 is the calling thread; `attr` is a valid VER1 sched_attr
-    // whose size field matches its layout.
-    let r = unsafe { libc::syscall(libc::SYS_sched_setattr, 0, &attr as *const SchedAttr, 0) };
-    if r == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
+    set_attr(&attr)
+}
+
+/// Move the calling thread to SCHED_FIFO at `prio`; threads it spawns start
+/// back in the fair class. Unprivileged, `prio` must not exceed
+/// RLIMIT_RTPRIO.
+///
+/// A waking fair-class thread that has run more than its share waits for
+/// the next tick or the running task's slice, and any task on its CPU can
+/// preempt it mid-pass; an RT thread runs on wakeup and to its next sleep.
+pub fn set_fifo(prio: u32) -> io::Result<()> {
+    set_attr(&SchedAttr {
+        size: std::mem::size_of::<SchedAttr>() as u32,
+        policy: libc::SCHED_FIFO as u32,
+        flags: libc::SCHED_FLAG_RESET_ON_FORK as u64,
+        priority: prio,
+        ..SchedAttr::default()
+    })
 }
 
 #[cfg(test)]
@@ -164,6 +185,35 @@ mod tests {
             })
             .unwrap();
             assert_eq!(fields(get_attr().unwrap()), (base.policy, 5, 200_000, 512));
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn set_fifo_does_not_pass_to_spawned_threads() {
+        std::thread::spawn(|| {
+            let mut lim = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            // SAFETY: `lim` is a valid rlimit to write into.
+            assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_RTPRIO, &mut lim) }, 0);
+            if let Err(e) = set_fifo(10) {
+                assert_eq!(e.kind(), io::ErrorKind::PermissionDenied, "{e}");
+                assert!(
+                    lim.rlim_cur < 10,
+                    "refused under RLIMIT_RTPRIO {}",
+                    lim.rlim_cur
+                );
+                return;
+            }
+            let a = get_attr().unwrap();
+            assert_eq!((a.policy, a.priority), (libc::SCHED_FIFO as u32, 10));
+            let child = std::thread::spawn(|| get_attr().unwrap().policy)
+                .join()
+                .unwrap();
+            assert_eq!(child, libc::SCHED_OTHER as u32);
         })
         .join()
         .unwrap();
