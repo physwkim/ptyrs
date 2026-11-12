@@ -8,3 +8,9 @@ description = "ptyrs spatial multi-GPU split: object tile partition with halos, 
 ptyrs-core.workspace = true
 thiserror.workspace = true
 cuda-core.workspace = true
+cuda-async.workspace = true
+ptyrs-gpu = { path = "../ptyrs-gpu" }
+ptyrs-fft = { path = "../ptyrs-fft" }
+
+[dev-dependencies]
+ptyrs-engine = { path = "../ptyrs-engine" }

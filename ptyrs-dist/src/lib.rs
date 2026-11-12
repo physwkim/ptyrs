@@ -1,6 +1,7 @@
 //! Spatial multi-GPU split (DESIGN B3, B4): an object tile grid fixed in object coordinates,
 //! partitioned into one region per GPU plus a one-probe halo.
 
+pub mod ap;
 pub mod exchange;
 pub mod feed;
 pub mod p2p;
@@ -11,6 +12,7 @@ pub mod tomo;
 pub mod topo;
 pub mod worker;
 
+pub use ap::{ApConfig, ApProblem, DistAp, NLEAF};
 pub use exchange::{Exchange, Layout};
 pub use partition::{Csr, DEFAULT_TILE, Partition, Region, Scheme, TileGrid};
 pub use worker::{Gpu, Workers};
@@ -21,6 +23,8 @@ pub enum DistError {
     Partition(String),
     #[error("CUDA: {0}")]
     Driver(#[from] cuda_core::DriverError),
+    #[error("GPU: {0}")]
+    Gpu(#[from] ptyrs_gpu::Error),
     #[error("topology: {0}")]
     Topology(String),
     #[error("GPU {from} cannot access GPU {to} peer-to-peer")]
