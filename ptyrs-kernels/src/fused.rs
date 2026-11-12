@@ -14,9 +14,9 @@
 //! The position model shifts the probe of frame `f` by `e_f` in Fourier space: [`shift_pre`]
 //! writes the column half `T = IDFT_y(A e_f)` of the probe spectrum `A`, [`shift_rows_fwd`]
 //! and [`shift_rows_inv`] stand in for [`rows_fwd`] and [`rows_inv`] with `W = IDFT_x(T)` for
-//! `P q`, and [`shift_post`] column-FFTs the `X` that [`shift_rows_inv`] leaves in `T`'s
-//! place into the position partials and the probe's `G`. [`gather_shifted`] and
-//! [`shift_probe_sums`] then take the object and probe sums.
+//! `P q`, [`shift_rows_inv`] also taking the position partials, and [`shift_post`]
+//! column-FFTs the `X` that [`shift_rows_inv`] leaves in `T`'s place into the probe's `G`.
+//! [`gather_shifted`] and [`shift_probe_sums`] then take the object and probe sums.
 //!
 //! Every pass assumes canonical views: view `f * nmode + m` multiplies probe mode
 //! `m % nprobe` and object mode `m / nprobe` (`nmode == nprobe * nobj`), and all views of a
@@ -42,7 +42,8 @@ pub const FUSED_LLK: u32 = 4;
 /// [`cols`] applies the modulus projection and the inverse column FFT.
 pub const FUSED_PROJECT: u32 = 8;
 /// [`cols`] applies the Poisson LLK gradient scale and the inverse column FFT; never with
-/// `FUSED_PROJECT`.
+/// `FUSED_PROJECT`. [`shift_rows_inv`]'s position sums then take the new waves as the
+/// exit-wave correction, in place of `x - O W`.
 pub const FUSED_GRAD: u32 = 32;
 /// [`cols`] compares the counts with `calc = s[f] I` instead of `I = sum_m |Psi_m|^2 / n`.
 pub const FUSED_SCALE: u32 = 64;
@@ -58,7 +59,7 @@ pub const FUSED_BACKGROUND_SUMS: u32 = 512;
 pub const FUSED_SHIFT_OBJ: u32 = 1024;
 /// [`shift_rows_inv`] writes `X` and [`shift_post`] the probe adjoint's `G`.
 pub const FUSED_SHIFT_PROBE: u32 = 2048;
-/// [`shift_rows_inv`] writes `X` and [`shift_post`] the position sums `shift_grad`.
+/// [`shift_pre`] writes `T_y` and [`shift_rows_inv`] the position sums `shift_grad`.
 pub const FUSED_SHIFT_POSITION: u32 = 4096;
 /// [`shift_pre`] writes `T_y` and [`shift_rows_inv`] the denominator sums `shift_den`.
 pub const FUSED_SHIFT_DEN: u32 = 8192;
@@ -129,7 +130,7 @@ pub struct FusedPtrs {
     pub shift_obj: *mut f32,
     /// `sum_p |W_p|^2` of each frame, `[nf_max, ny, nx]`, origin at `[0, 0]`.
     pub shift_power: *mut f32,
-    /// Position sums of each frame's column groups, `[nf_max, nx / FUSED_COLS]`.
+    /// Position sums of each frame's row blocks, `[nf_max, ny / rows]`.
     pub shift_grad: *mut PositionPartial,
     /// Denominator sums of each frame's row blocks, `[nf_max, ny / rows]`.
     pub shift_den: *mut PositionPartial,
@@ -783,15 +784,15 @@ unsafe fn gather_with<const SHIFT: bool>(
 // as everywhere else. [`shift_pre`] column-transforms `A_p e_f` to `T`, [`shift_rows_fwd`]
 // row-transforms `T` to `W` per view, [`cols`] is unchanged, and [`shift_rows_inv`] takes
 // the new waves `x` (`psi_new`, or the gradient waves under `FUSED_GRAD`) to the object
-// terms, to `X = DFT_x(Y_p)` with `Y_p = sum_o conj(O_o) x_(o, p)`, and to the denominator
-// sums; [`shift_post`] column-transforms `X` to `H = DFT(Y_p)`, from which it takes the
-// position sums `sum_p sum_k 2 pi freq_ax Im(conj(H) A_p e_f)` (Parseval of `sum Re(conj(x)
-// O dW / d_ax)`) and the probe adjoint's `G = conj(e_f) H`.
+// terms, to `X = DFT_x(Y_p)` with `Y_p = sum_o conj(O_o) x_(o, p)`, and with the slope rows
+// `dW / d_ax` to the denominator and position sums; [`shift_post`] column-transforms `X` to
+// `H = DFT(Y_p)` and the probe adjoint's `G = conj(e_f) H`.
 
 /// Each frame's column half of the shifted probe: `T[fl * nprobe + p, ys, kx] =
-/// IDFT_y(A_p e_f)` over `ky` for `f = f0 + fl`, and under `FUSED_SHIFT_DEN` `T_y` the same
-/// of `A_p e_f (-2 pi i freq(ky, ny))` into `shift_dy`. Reads `offsets` and `spectrum`;
-/// writes `shift`, and `shift_dy` under its flag.
+/// IDFT_y(A_p e_f)` over `ky` for `f = f0 + fl`, and under `FUSED_SHIFT_DEN` or
+/// `FUSED_SHIFT_POSITION` `T_y` the same of `A_p e_f (-2 pi i freq(ky, ny))` into
+/// `shift_dy`. Reads `offsets` and `spectrum`; writes `shift`, and `shift_dy` under those
+/// flags.
 ///
 /// One 1D block of `nprobe * FUSED_COLS * tpf` threads mapped as [`cols`] maps modes, with
 /// probe modes for modes; grid `(nx / FUSED_COLS, nf_max)`; dynamic shared memory `8 * ny`
@@ -799,7 +800,7 @@ unsafe fn gather_with<const SHIFT: bool>(
 ///
 /// # Safety
 ///
-/// `NY == g.ny`; `offsets`, `spectrum`, `shift` and under its flag `shift_dy` hold their
+/// `NY == g.ny`; `offsets`, `spectrum`, `shift` and under those flags `shift_dy` hold their
 /// shapes for `g`; `ctl` one entry; launch as above.
 #[device]
 pub unsafe fn shift_pre<const NY: u32>(
@@ -839,7 +840,7 @@ pub unsafe fn shift_pre<const NY: u32>(
         }
         thread::sync_threads();
         let ex = ramp(dx, kx, nx);
-        if cfg.flags & FUSED_SHIFT_DEN != 0 {
+        if cfg.flags & (FUSED_SHIFT_DEN | FUSED_SHIFT_POSITION) != 0 {
             let tau = 2.0 * core::f32::consts::PI;
             #[unroll]
             for i in 0..FFT_EPT {
@@ -885,19 +886,23 @@ pub unsafe fn shift_pre<const NY: u32>(
 /// mode `p` outermost: `W_p` from the `T` row, then for each object mode `o` the new wave `x`
 /// of mode `o * nprobe + p` as [`rows_inv`] stores it (the DM add-back with `O W_p`). Under
 /// `FUSED_SHIFT_OBJ` `shift_power[fl] = sum_p |W_p|^2` and `shift_obj[fl * nobj + o] = sum_p
-/// conj(W_p) x`, both in ascending `p`. Under `FUSED_SHIFT_PROBE` or `FUSED_SHIFT_POSITION`
-/// the `T` row becomes `X = DFT_x(sum_o conj(O_o) x)`, `o` ascending. Under `FUSED_SHIFT_DEN`
-/// `shift_den[fl, blockIdx.x]` gets the block's `sum |O_o|^2 |dW_p / d_ax|^2` over its pixels,
-/// `o` and `p` (`dW / dx = IDFT_x(T (-2 pi i freq(kx, nx)))`, `dW / dy = IDFT_x(T_y)`), a
-/// fixed tree over the block. Reads `work`, `views`, `obj`, `shift`, `shift_dy` under
-/// `FUSED_SHIFT_DEN`, and `psi` under `FUSED_DM`; writes the new waves and what the flags
-/// name. Grid `(ny / rows, nf_max)`, block `FUSED_ROW_THREADS`, dynamic shared memory the
-/// larger of `rows` row FFTs ([`FFT_SKEW`]) and `8 * FUSED_ROW_THREADS` bytes.
+/// conj(W_p) x`, both in ascending `p`. Under `FUSED_SHIFT_PROBE` the `T` row becomes `X =
+/// DFT_x(sum_o conj(O_o) x)`, `o` ascending. With the slopes `dW / dx = IDFT_x(T (-2 pi i
+/// freq(kx, nx)))` and `dW / dy = IDFT_x(T_y)`, under `FUSED_SHIFT_DEN` `shift_den[fl,
+/// blockIdx.x]` gets the block's `sum |O_o|^2 |dW_p / d_ax|^2` over its pixels, `o` and `p`,
+/// and under `FUSED_SHIFT_POSITION` `shift_grad[fl, blockIdx.x]` the block's `Re sum conj(x -
+/// O_o W_p) O_o dW_p / d_ax`, `x` alone under `FUSED_GRAD`; the difference is taken per pixel
+/// as `sum_o conj(O_o) x - sum_o |O_o|^2 W_p`, and each sum is a fixed tree over the block.
+/// Reads `work`, `views`, `obj`, `shift`, `shift_dy` under either sum's flag, and `psi` under
+/// `FUSED_DM`; writes the new waves and what the flags name. Grid `(ny / rows, nf_max)`,
+/// block `FUSED_ROW_THREADS`, dynamic shared memory the larger of `rows` row FFTs
+/// ([`FFT_SKEW`]) and `16 * FUSED_ROW_THREADS` bytes.
 ///
 /// # Safety
 ///
 /// As [`rows_inv`], `shift` holding [`shift_pre`]'s `T` (and `shift_dy` its `T_y` under
-/// `FUSED_SHIFT_DEN`) of this stack, and the buffers the flags name holding their shapes.
+/// `FUSED_SHIFT_DEN` or `FUSED_SHIFT_POSITION`) of this stack, and the buffers the flags name
+/// holding their shapes.
 #[device]
 pub unsafe fn shift_rows_inv<const NX: u32>(
     p: FusedPtrs,
@@ -919,8 +924,12 @@ pub unsafe fn shift_rows_inv<const NX: u32>(
     let nobj = g.nmode / g.nprobe;
     let dm = cfg.flags & FUSED_DM != 0;
     let obj_terms = cfg.flags & FUSED_SHIFT_OBJ != 0;
-    let adjoint = cfg.flags & (FUSED_SHIFT_PROBE | FUSED_SHIFT_POSITION) != 0;
+    let probe = cfg.flags & FUSED_SHIFT_PROBE != 0;
+    let position = cfg.flags & FUSED_SHIFT_POSITION != 0;
     let den = cfg.flags & FUSED_SHIFT_DEN != 0;
+    let grad = cfg.flags & FUSED_GRAD != 0;
+    let adjoint = probe || position;
+    let slopes = den || position;
     let out = new_waves(p, cfg);
     let (a, b) = (2.0 - cfg.alpha, 1.0 - cfg.alpha);
     let k0 = (f0 + fl) * g.nmode;
@@ -928,6 +937,7 @@ pub unsafe fn shift_rows_inv<const NX: u32>(
     let mut w = [0.0f32; 2 * FFT_EPT as usize];
     let mut r = [0.0f32; 2 * FFT_EPT as usize];
     let (mut den_y, mut den_x) = (0.0f32, 0.0f32);
+    let (mut pos_y, mut pos_x) = (0.0f32, 0.0f32);
     unsafe {
         for pm in 0..g.nprobe {
             let trow = (fl * g.nprobe + pm) as usize * n + srow;
@@ -1006,7 +1016,27 @@ pub unsafe fn shift_rows_inv<const NX: u32>(
                     }
                 }
             }
-            if den {
+            if slopes {
+                // This thread's `sum vn |r|^2` and `sum Re conj(c) r` over a slope row `r`,
+                // `vn = sum_o |O_o|^2` and `c = acc - vn W` the correction's `sum_o conj(O_o)
+                // (x - O_o W)`.
+                let terms = |r: &[f32; 2 * FFT_EPT as usize]| {
+                    let (mut d, mut q) = (0.0f32, 0.0f32);
+                    #[unroll]
+                    for i in 0..FFT_EPT {
+                        let k = 2 * i as usize;
+                        let x = (t + i * tpf + nx / 2) % nx;
+                        let vn = obj_norm(p, g, k0 + pm, y, x);
+                        d += vn * (r[k] * r[k] + r[k + 1] * r[k + 1]);
+                        let c = if grad {
+                            (acc[k], acc[k + 1])
+                        } else {
+                            (acc[k] - vn * w[k], acc[k + 1] - vn * w[k + 1])
+                        };
+                        q += c.0 * r[k] + c.1 * r[k + 1];
+                    }
+                    (d, q)
+                };
                 let tau = 2.0 * core::f32::consts::PI;
                 #[unroll]
                 for i in 0..FFT_EPT {
@@ -1019,7 +1049,9 @@ pub unsafe fn shift_rows_inv<const NX: u32>(
                 }
                 row_fft::<NX, true>(&mut r, lane);
                 thread::sync_threads();
-                den_x += obj_weighted(p, g, k0 + pm, y, t, tpf, &r);
+                let (d, q) = terms(&r);
+                den_x += d;
+                pos_x += q;
                 #[unroll]
                 for i in 0..FFT_EPT {
                     let v = load_c(p.shift_dy, trow + (t + i * tpf) as usize);
@@ -1028,9 +1060,11 @@ pub unsafe fn shift_rows_inv<const NX: u32>(
                 }
                 row_fft::<NX, true>(&mut r, lane);
                 thread::sync_threads();
-                den_y += obj_weighted(p, g, k0 + pm, y, t, tpf, &r);
+                let (d, q) = terms(&r);
+                den_y += d;
+                pos_y += q;
             }
-            if adjoint {
+            if probe {
                 // Every read of the `T` row above is this thread's own elements, so `X` may
                 // overwrite them.
                 row_fft::<NX, false>(&mut acc, lane);
@@ -1042,19 +1076,20 @@ pub unsafe fn shift_rows_inv<const NX: u32>(
                 }
             }
         }
-        if den {
+        if slopes {
             let slots = DynamicSharedArray::<u8, 16>::get().cast::<f32>();
             let nt = FUSED_ROW_THREADS;
             // Slot of pixel `(b, f)`: the tree's order is the block's pixels', not its lanes'.
             let at = lane.b * tpf + t;
-            *slots.add(at as usize) = den_y;
-            *slots.add((nt + at) as usize) = den_x;
+            for (j, v) in [den_y, den_x, pos_y, pos_x].into_iter().enumerate() {
+                *slots.add(j * nt as usize + at as usize) = v;
+            }
             let tid = thread::threadIdx_x();
             let mut half = nt / 2;
             while half > 0 {
                 thread::sync_threads();
                 if tid < half {
-                    for j in [0, nt] {
+                    for j in [0, nt, 2 * nt, 3 * nt] {
                         let s = slots.add((j + tid) as usize);
                         *s += *s.add(half as usize);
                     }
@@ -1064,69 +1099,50 @@ pub unsafe fn shift_rows_inv<const NX: u32>(
             thread::sync_threads();
             if tid == 0 {
                 let at = (fl * thread::gridDim_x() + thread::blockIdx_x()) as usize;
-                *p.shift_den.add(at) = PositionPartial {
-                    dy: *slots,
-                    dx: *slots.add(nt as usize),
+                let sum = |j: u32| PositionPartial {
+                    dy: *slots.add((j * nt) as usize),
+                    dx: *slots.add(((j + 1) * nt) as usize),
                 };
+                if den {
+                    *p.shift_den.add(at) = sum(0);
+                }
+                if position {
+                    *p.shift_grad.add(at) = sum(2);
+                }
             }
         }
     }
 }
 
-/// `sum_i sum_o |O_o|^2 |r_i|^2` over this thread's elements `i` of stored row `y`'s
-/// natural row, `O_o` the object view `k + o * nprobe` samples.
+/// `sum_o |O_o|^2` at natural pixel `(y, x)`, `O_o` the object view `k + o * nprobe`
+/// samples.
 ///
 /// # Safety
 ///
 /// `obj` and `views` hold their shapes for `g` and view `k + (nobj - 1) * nprobe` exists.
 #[device]
-unsafe fn obj_weighted(
-    p: FusedPtrs,
-    g: StackGeom,
-    k: u32,
-    y: u32,
-    t: u32,
-    tpf: u32,
-    r: &[f32; 2 * FFT_EPT as usize],
-) -> f32 {
-    let nx = g.nx;
-    let mut s = 0.0f32;
-    #[unroll]
-    for i in 0..FFT_EPT {
-        let x = (t + i * tpf + nx / 2) % nx;
-        let mut vn = 0.0f32;
-        for o in 0..g.nmode / g.nprobe {
-            let v = unsafe { *p.views.add((k + o * g.nprobe) as usize) };
-            let vo = unsafe { sample_obj(p.obj, v, y, x, g.nyo, g.nxo) };
-            vn += vo.0 * vo.0 + vo.1 * vo.1;
-        }
-        let k = 2 * i as usize;
-        s += vn * (r[k] * r[k] + r[k + 1] * r[k + 1]);
+unsafe fn obj_norm(p: FusedPtrs, g: StackGeom, k: u32, y: u32, x: u32) -> f32 {
+    let mut vn = 0.0f32;
+    for o in 0..g.nmode / g.nprobe {
+        let v = unsafe { *p.views.add((k + o * g.nprobe) as usize) };
+        let vo = unsafe { sample_obj(p.obj, v, y, x, g.nyo, g.nxo) };
+        vn += vo.0 * vo.0 + vo.1 * vo.1;
     }
-    s
+    vn
 }
 
 /// The column FFT of [`shift_rows_inv`]'s `X`: `H = DFT_y(X)` over `ys` for frame `fl =
-/// blockIdx.y`, probe mode `p`. Under `FUSED_SHIFT_POSITION` `shift_grad[fl, blockIdx.x]`
-/// gets the block's `sum_p sum 2 pi freq_ax Im(conj(H) A_p e_f)` (a fixed order: each
-/// thread's elements, then `p` ascending, then a tree); under `FUSED_SHIFT_PROBE` the plane
-/// becomes `G = conj(e_f) H`. Reads `offsets`, `shift`, and `spectrum` under
-/// `FUSED_SHIFT_POSITION`; writes what the flags name.
+/// blockIdx.y`, probe mode `p`, and the plane becomes the probe adjoint's `G = conj(e_f) H`.
+/// Reads `offsets` and `shift`; writes `shift`.
 ///
-/// Block and grid as [`shift_pre`]; dynamic shared memory `8 * ny` bytes of `e_y`, `8 *
-/// nprobe * FUSED_COLS * tpf` bytes of slots, then `nprobe * FUSED_COLS` column FFTs
-/// ([`FFT_SKEW`]).
+/// Block and grid as [`shift_pre`]; dynamic shared memory `8 * ny` bytes of `e_y`, then
+/// `nprobe * FUSED_COLS` column FFTs ([`FFT_SKEW`]).
 ///
 /// # Safety
 ///
 /// As [`shift_pre`], `shift` holding [`shift_rows_inv`]'s `X` of this stack.
 #[device]
-pub unsafe fn shift_post<const NY: u32>(
-    p: FusedPtrs,
-    ctl: *const StackCtl,
-    g: StackGeom,
-    cfg: FusedCfg,
-) {
+pub unsafe fn shift_post<const NY: u32>(p: FusedPtrs, ctl: *const StackCtl, g: StackGeom) {
     let (f0, nf) = unsafe { stack_frames(ctl, g) };
     let fl = thread::blockIdx_y();
     if fl >= nf {
@@ -1136,7 +1152,6 @@ pub unsafe fn shift_post<const NY: u32>(
     let n = ny as usize * nx as usize;
     let tpf = ny / FFT_EPT;
     let nslot = FUSED_COLS * tpf;
-    let nt = g.nprobe * nslot;
     let tid = thread::threadIdx_x();
     let c = tid % FUSED_COLS;
     let f = (tid / FUSED_COLS) % tpf;
@@ -1144,21 +1159,17 @@ pub unsafe fn shift_post<const NY: u32>(
     let (b, bpb) = (pm * FUSED_COLS + c, g.nprobe * FUSED_COLS);
     let kx = thread::blockIdx_x() * FUSED_COLS + c;
     let plane = (fl * g.nprobe + pm) as usize * n;
-    let spectrum = pm as usize * n;
-    let position = cfg.flags & FUSED_SHIFT_POSITION != 0;
-    let probe = cfg.flags & FUSED_SHIFT_PROBE != 0;
     let mut r = [0.0f32; 2 * FFT_EPT as usize];
     unsafe {
         let smem = DynamicSharedArray::<u8, 16>::get();
         let ey = smem.cast::<f32>();
-        let slots = smem.add(8 * ny as usize).cast::<f32>();
-        let fft_smem = smem.add(8 * (ny + nt) as usize);
+        let fft_smem = smem.add(8 * ny as usize);
         let at = 2 * (f0 + fl) as usize;
         let (dy, dx) = (*p.offsets.add(at), *p.offsets.add(at + 1));
         let mut k = tid;
         while k < ny {
             store_c(ey, k as usize, ramp(dy, k, ny));
-            k += nt;
+            k += g.nprobe * nslot;
         }
         thread::sync_threads();
         #[unroll]
@@ -1169,58 +1180,16 @@ pub unsafe fn shift_post<const NY: u32>(
         }
         col_fft::<NY, false>(&mut r, fft_smem, b, f, bpb);
         let ex = ramp(dx, kx, nx);
-        let tau = 2.0 * core::f32::consts::PI;
-        let wx = tau * freq(kx, nx);
-        let (mut gy, mut gx) = (0.0f32, 0.0f32);
         #[unroll]
         for i in 0..FFT_EPT {
             let k = 2 * i as usize;
             let ky = f + i * tpf;
-            let h = (r[k], r[k + 1]);
             let e = cmul(load_c(ey, ky as usize), ex);
-            let at = (ky * nx + kx) as usize;
-            if position {
-                let z = cmul_conj(h, cmul(load_c(p.spectrum, spectrum + at), e));
-                gy += tau * freq(ky, ny) * z.1;
-                gx += wx * z.1;
-            }
-            if probe {
-                store_c(p.shift, plane + at, cmul_conj(e, h));
-            }
-        }
-        if position {
-            *slots.add(tid as usize) = gy;
-            *slots.add((nt + tid) as usize) = gx;
-            thread::sync_threads();
-            if tid < nslot {
-                for j in [0, nt] {
-                    let s = slots.add((j + tid) as usize);
-                    let mut v = *s;
-                    for q in 1..g.nprobe {
-                        v += *s.add((q * nslot) as usize);
-                    }
-                    *s = v;
-                }
-            }
-            let mut half = nslot / 2;
-            while half > 0 {
-                thread::sync_threads();
-                if tid < half {
-                    for j in [0, nt] {
-                        let s = slots.add((j + tid) as usize);
-                        *s += *s.add(half as usize);
-                    }
-                }
-                half /= 2;
-            }
-            thread::sync_threads();
-            if tid == 0 {
-                let at = (fl * (nx / FUSED_COLS) + thread::blockIdx_x()) as usize;
-                *p.shift_grad.add(at) = PositionPartial {
-                    dy: *slots,
-                    dx: *slots.add(nt as usize),
-                };
-            }
+            store_c(
+                p.shift,
+                plane + (ky * nx + kx) as usize,
+                cmul_conj(e, (r[k], r[k + 1])),
+            );
         }
     }
 }

@@ -12,9 +12,9 @@
 //!
 //! With a [`Model::shift`] each frame's probe modes are moved by the frame's offsets through
 //! the probe spectra of [`Kernels::probe_spectrum`]: a column pass of the spectra per frame
-//! runs before pass A, which then row-transforms them, and a column pass after pass C takes
-//! the position sums and the probe sums' spectral terms, which [`ShiftedProbeSums`] carries
-//! across stacks until [`Kernels::shifted_probe_sums`] turns them into probe sums.
+//! runs before pass A, which then row-transforms them, pass C takes the position sums, and a
+//! column pass after it takes the probe sums' spectral terms, which [`ShiftedProbeSums`]
+//! carries across stacks until [`Kernels::shifted_probe_sums`] turns them into probe sums.
 
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig};
@@ -158,12 +158,11 @@ impl Shape {
         })
     }
 
-    /// `shift_pre` (`slots` false) or `shift_post` for `nprobe` probe modes.
-    fn shift_cols(&self, nprobe: u32, nf_max: u32, slots: bool) -> Result<LaunchConfig, Error> {
+    /// `shift_pre` or `shift_post` for `nprobe` probe modes.
+    fn shift_cols(&self, nprobe: u32, nf_max: u32) -> Result<LaunchConfig, Error> {
         let (ny, nx) = (self.ny as u32, self.nx as u32);
         let threads = nprobe * FUSED_COLS * (ny / FFT_EPT);
-        let slots = if slots { 8 * threads } else { 0 };
-        let smem = 8 * ny + slots + nprobe * FUSED_COLS * self.col_fft;
+        let smem = 8 * ny + nprobe * FUSED_COLS * self.col_fft;
         if smem > SMEM_MAX {
             return Err(Error::Shape(format!(
                 "shift column pass: {smem} bytes of shared memory exceed 48 KiB"
@@ -227,7 +226,7 @@ struct ShiftScratch {
     obj: DeviceBuffer<C32>,
     /// `[nf_max, ny, nx]`.
     power: DeviceBuffer<f32>,
-    /// `[nf_max, nx / FUSED_COLS]`.
+    /// `[nf_max, ny / rows]`.
     grad_groups: DeviceBuffer<PositionPartial>,
     /// `[nf_max, ny / rows]`.
     den_groups: DeviceBuffer<PositionPartial>,
@@ -240,16 +239,9 @@ impl ShiftScratch {
         check_len("shift_dy", &self.t_dy, nf * d.nprobe as usize * n)?;
         check_len("shift_obj", &self.obj, nf * d.nobj as usize * n)?;
         check_len("shift_power", &self.power, nf * n)?;
-        check_len(
-            "shift_grad",
-            &self.grad_groups,
-            nf * (g.nx / FUSED_COLS) as usize,
-        )?;
-        check_len(
-            "shift_den",
-            &self.den_groups,
-            nf * (g.ny / sh.rows) as usize,
-        )
+        let ngroup = nf * (g.ny / sh.rows) as usize;
+        check_len("shift_grad", &self.grad_groups, ngroup)?;
+        check_len("shift_den", &self.den_groups, ngroup)
     }
 }
 
@@ -278,16 +270,16 @@ impl FusedBufs {
     pub fn with_shift(stream: &CudaStream, dims: &ViewDims, nf_max: u32) -> Result<Self, Error> {
         let mut bufs = Self::new(stream, dims, nf_max)?;
         let sh = Shape::of(dims)?;
-        sh.shift_cols(dims.nprobe, nf_max, true)?;
+        sh.shift_cols(dims.nprobe, nf_max)?;
         let (n, nf) = (dims.n(), nf_max as usize);
-        let [ny, nx] = dims.frame;
+        let ngroup = nf * (dims.frame[0] / sh.rows) as usize;
         bufs.shift = Some(ShiftScratch {
             t: DeviceBuffer::zeroed(stream, nf * dims.nprobe as usize * n)?,
             t_dy: DeviceBuffer::zeroed(stream, nf * dims.nprobe as usize * n)?,
             obj: DeviceBuffer::zeroed(stream, nf * dims.nobj as usize * n)?,
             power: DeviceBuffer::zeroed(stream, nf * n)?,
-            grad_groups: DeviceBuffer::zeroed(stream, nf * (nx / FUSED_COLS) as usize)?,
-            den_groups: DeviceBuffer::zeroed(stream, nf * (ny / sh.rows) as usize)?,
+            grad_groups: DeviceBuffer::zeroed(stream, ngroup)?,
+            den_groups: DeviceBuffer::zeroed(stream, ngroup)?,
         });
         Ok(bufs)
     }
@@ -428,15 +420,17 @@ impl ShiftedProbeSums {
 }
 
 /// The sums of a [`Model::shift`] that [`Kernels::fused_project`] writes, with `x` the new
-/// exit waves of every view (under [`Exit::Grad`] the gradient waves); `Default` writes none.
-/// Each needs the shift model.
+/// exit waves of every view (under [`Exit::Grad`] the gradient waves) and `W` the shifted
+/// probe; `Default` writes none. Each needs the shift model.
 #[derive(Default)]
 pub struct ShiftSums<'a> {
     /// The probe sums, in place of [`FusedSums::probe`].
     pub probe: Option<&'a mut ShiftedProbeSums>,
-    /// `position[f0 + fl] = Re sum conj(x) dpsi / d(dy, dx)` over the frame's views and
-    /// pixels, for `fl < nf`; `[nframe]`, no other entry written. Under [`Exit::Grad`] the
-    /// LLK's derivative along the frame's offsets.
+    /// The position sums of the exit-wave correction `c`: `position[f0 + fl] = Re sum
+    /// conj(c) O dW / d(dy, dx)` over the frame's views and pixels, for `fl < nf`;
+    /// `[nframe]`, no other entry written. `c = x - O W`, the step from the waves the pass
+    /// started from, taken per pixel; under [`Exit::Grad`] `c = x`, and the sum is the LLK's
+    /// derivative along the frame's offsets.
     pub position: Option<&'a mut DeviceBuffer<PositionPartial>>,
     /// `position_den[f0 + fl] = sum |O|^2 |dW / d(dy, dx)|^2` over the frame's views and
     /// pixels, as `position`.
@@ -611,6 +605,7 @@ impl Kernels {
                     | flag(shift_probe.is_some(), FUSED_SHIFT_PROBE)
                     | flag(position.is_some(), FUSED_SHIFT_POSITION)
                     | flag(position_den.is_some(), FUSED_SHIFT_DEN)
+                    | (pass & FUSED_GRAD)
             }
             None => 0,
         };
@@ -621,7 +616,8 @@ impl Kernels {
         };
         match &run.shift {
             Some(sh) => {
-                run.shift_pre(sh, p, shift_flags & FUSED_SHIFT_DEN)?;
+                let slopes = FUSED_SHIFT_DEN | FUSED_SHIFT_POSITION;
+                run.shift_pre(sh, p, shift_flags & slopes)?;
                 run.shift_rows_fwd(sh, bufs, psi, p, cfg)?;
             }
             None => {
@@ -646,15 +642,14 @@ impl Kernels {
         match &run.shift {
             Some(sh) => {
                 run.shift_rows_inv(sh, bufs, psi, p, cfg)?;
-                if cfg.flags & (FUSED_SHIFT_PROBE | FUSED_SHIFT_POSITION) != 0 {
-                    run.shift_post(sh, p, cfg)?;
+                if shift_probe.is_some() {
+                    run.shift_post(sh, p)?;
                 }
+                let ngroup = run.g.ny / run.sh.rows;
                 if let Some(out) = position {
-                    let ngroup = run.g.nx / FUSED_COLS;
                     run.position_groups(&sh.scratch.grad_groups, ngroup, out)?;
                 }
                 if let Some(out) = position_den {
-                    let ngroup = run.g.ny / run.sh.rows;
                     run.position_groups(&sh.scratch.den_groups, ngroup, out)?;
                 }
                 if let Some(sums) = shift_probe {
@@ -941,7 +936,7 @@ impl<'a> Run<'a> {
                     ));
                 };
                 scratch.check(d, &g, &sh)?;
-                sh.shift_cols(d.nprobe, g.nf_max, true)?;
+                sh.shift_cols(d.nprobe, g.nf_max)?;
                 Some(Shifted { model, scratch })
             }
         };
@@ -1260,16 +1255,17 @@ impl<'a> Run<'a> {
         })
     }
 
-    /// `T`, and `T_y` under `FUSED_SHIFT_DEN` in `flags`, of the stack's frames.
+    /// `T`, and `T_y` under `FUSED_SHIFT_DEN` or `FUSED_SHIFT_POSITION` in `flags`, of the
+    /// stack's frames.
     fn shift_pre(&self, sh: &Shifted<'_>, p: FusedPtrs, flags: u32) -> Result<(), Error> {
-        let config = self.sh.shift_cols(self.g.nprobe, self.g.nf_max, false)?;
+        let config = self.sh.shift_cols(self.g.nprobe, self.g.nf_max)?;
         let reads = [
             sh.model.offsets.storage(),
             sh.model.spectrum.a.storage(),
             self.stack.storage(),
         ];
         let mut writes = vec![sh.scratch.t.storage()];
-        if flags & FUSED_SHIFT_DEN != 0 {
+        if flags & (FUSED_SHIFT_DEN | FUSED_SHIFT_POSITION) != 0 {
             writes.push(sh.scratch.t_dy.storage());
         }
         let (ctl, g, cfg) = (self.ctl(), self.g, FusedCfg { flags, alpha: 0.0 });
@@ -1356,11 +1352,10 @@ impl<'a> Run<'a> {
         cfg: FusedCfg,
     ) -> Result<(), Error> {
         let config = LaunchConfig {
-            shared_mem_bytes: self.sh.row_smem.max(8 * FUSED_ROW_THREADS),
+            shared_mem_bytes: self.sh.row_smem.max(16 * FUSED_ROW_THREADS),
             ..self.sh.rows(&self.g, false)?
         };
         let f = cfg.flags;
-        let adjoint = f & (FUSED_SHIFT_PROBE | FUSED_SHIFT_POSITION) != 0;
         let mut reads = vec![
             self.inputs.views.addr().storage(),
             self.stack.storage(),
@@ -1375,7 +1370,7 @@ impl<'a> Run<'a> {
             _ => writes.push(bufs.work.storage()),
         }
         let s = sh.scratch;
-        if adjoint {
+        if f & FUSED_SHIFT_PROBE != 0 {
             writes.push(s.t.storage());
         } else {
             reads.push(s.t.storage());
@@ -1383,15 +1378,20 @@ impl<'a> Run<'a> {
         if f & FUSED_SHIFT_OBJ != 0 {
             writes.extend([s.obj.storage(), s.power.storage()]);
         }
-        if f & FUSED_SHIFT_DEN != 0 {
+        if f & (FUSED_SHIFT_DEN | FUSED_SHIFT_POSITION) != 0 {
             reads.push(s.t_dy.storage());
+        }
+        if f & FUSED_SHIFT_DEN != 0 {
             writes.push(s.den_groups.storage());
+        }
+        if f & FUSED_SHIFT_POSITION != 0 {
+            writes.push(s.grad_groups.storage());
         }
         let (ctl, g) = (self.ctl(), self.g);
         self.k.launch(self.ctx, &reads, &writes, |stream| {
             // SAFETY: as in `rows_inv`, and `shift_pre` wrote `T` (and `T_y` under
-            // `FUSED_SHIFT_DEN`) of this stack; the launch is the one `shift_rows_inv`
-            // documents.
+            // `FUSED_SHIFT_DEN` or `FUSED_SHIFT_POSITION`) of this stack; the launch is the
+            // one `shift_rows_inv` documents.
             unsafe {
                 match self.sh.nx {
                     Side::N64 => self
@@ -1415,44 +1415,30 @@ impl<'a> Run<'a> {
         })
     }
 
-    /// `H` of the `X` that [`Self::shift_rows_inv`] left, to the position groups and `G`
-    /// under their flags.
-    fn shift_post(&self, sh: &Shifted<'_>, p: FusedPtrs, cfg: FusedCfg) -> Result<(), Error> {
-        let config = self.sh.shift_cols(self.g.nprobe, self.g.nf_max, true)?;
-        let mut reads = vec![sh.model.offsets.storage(), self.stack.storage()];
-        let mut writes = vec![];
-        let s = sh.scratch;
-        if cfg.flags & FUSED_SHIFT_PROBE != 0 {
-            writes.push(s.t.storage());
-        } else {
-            reads.push(s.t.storage());
-        }
-        if cfg.flags & FUSED_SHIFT_POSITION != 0 {
-            reads.push(sh.model.spectrum.a.storage());
-            writes.push(s.grad_groups.storage());
-        }
+    /// `G` from the `X` that [`Self::shift_rows_inv`] left.
+    fn shift_post(&self, sh: &Shifted<'_>, p: FusedPtrs) -> Result<(), Error> {
+        let config = self.sh.shift_cols(self.g.nprobe, self.g.nf_max)?;
+        let reads = [sh.model.offsets.storage(), self.stack.storage()];
+        let writes = [sh.scratch.t.storage()];
         let (ctl, g) = (self.ctl(), self.g);
         self.k.launch(self.ctx, &reads, &writes, |stream| {
             // SAFETY: as in `shift_pre`, and `shift_rows_inv` wrote `X` of this stack; the
             // launch is the one `shift_post` documents.
             unsafe {
                 match self.sh.ny {
-                    Side::N64 => self
-                        .k
-                        .module
-                        .fused_shift_post_64(stream, config, p, ctl, g, cfg),
+                    Side::N64 => self.k.module.fused_shift_post_64(stream, config, p, ctl, g),
                     Side::N128 => self
                         .k
                         .module
-                        .fused_shift_post_128(stream, config, p, ctl, g, cfg),
+                        .fused_shift_post_128(stream, config, p, ctl, g),
                     Side::N256 => self
                         .k
                         .module
-                        .fused_shift_post_256(stream, config, p, ctl, g, cfg),
+                        .fused_shift_post_256(stream, config, p, ctl, g),
                     Side::N512 => self
                         .k
                         .module
-                        .fused_shift_post_512(stream, config, p, ctl, g, cfg),
+                        .fused_shift_post_512(stream, config, p, ctl, g),
                 }
             }
         })

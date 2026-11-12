@@ -3822,8 +3822,8 @@ struct ShiftRef {
     spec: Vec<Z>,
     /// The probe's `den`, `sum |O|^2`.
     pden: Vec<f64>,
-    /// Per frame and axis: `Re sum conj(x) O dW`, the sum of its terms' magnitudes, and
-    /// `sum |O|^2 |dW|^2`.
+    /// Per frame and axis: `Re sum conj(c) O dW` over the exit-wave correction `c`, the sum
+    /// of its terms' magnitudes, and `sum |O|^2 |dW|^2`.
     pos: Vec<[f64; 2]>,
     pos_abs: Vec<[f64; 2]>,
     pos_den: Vec<[f64; 2]>,
@@ -3843,14 +3843,17 @@ impl ShiftRef {
         }
     }
 
-    /// Adds the sums of `frames`' new exit waves `x` (M1 layout).
-    fn add(&mut self, s: &Scan, sh: &ShiftF64, frames: Range<u32>, x: &[Z]) {
+    /// Adds the sums of `frames`' new exit waves `x`, with the correction `c = x - base` (`x`
+    /// without `base`); both M1 layout.
+    fn add(&mut self, s: &Scan, sh: &ShiftF64, frames: Range<u32>, x: &[Z], base: Option<&[Z]>) {
         let (n, nm) = (s.n(), s.d.nmode as usize);
         for (fl, views) in s.views_of(&frames).chunks_exact(nm).enumerate() {
             let f = frames.start as usize + fl;
             let mut y = vec![(0.0, 0.0); s.probe.len()];
             for (m, v) in views.iter().enumerate() {
-                let x = &x[(fl * nm + m) * n..][..n];
+                let at = (fl * nm + m) * n;
+                let x = &x[at..][..n];
+                let base = base.map(|b| &b[at..][..n]);
                 let pn = v.probe as usize * n;
                 let [w, wy, wx] = sh.w[f].each_ref().map(|w| &w[pn..pn + n]);
                 for (py, px, i) in s.pixels() {
@@ -3864,8 +3867,9 @@ impl ShiftRef {
                     let t = cmul_conj(o, xv);
                     y[pn + st] = (y[pn + st].0 + t.0, y[pn + st].1 + t.1);
                     self.pden[pn + i] += norm2(o);
+                    let c = base.map_or(xv, |b| (xv.0 - b[st].0, xv.1 - b[st].1));
                     for (ax, dw) in [wy, wx].into_iter().enumerate() {
-                        let t = cmul_conj(xv, mul(o, dw[st])).0;
+                        let t = cmul_conj(c, mul(o, dw[st])).0;
                         self.pos[f][ax] += t;
                         self.pos_abs[f][ax] += t.abs();
                         self.pos_den[f][ax] += norm2(o) * norm2(dw[st]);
@@ -3936,7 +3940,7 @@ fn shift_f64_reference_is_self_consistent() {
     let psi = shifted_psi(&s, &sh, 0..2, &s.obj);
     let (g, _) = grad_f64(&s, 0..2, &psi, &counts);
     let mut r = ShiftRef::new(&s);
-    r.add(&s, &sh, 0..2, &g);
+    r.add(&s, &sh, 0..2, &g, None);
     let h = 1e-4;
     for f in 0..2 {
         for ax in 0..2 {
@@ -4124,7 +4128,7 @@ fn fused_shift_matches_f64() {
             assert!(err < 1e-5, "{frame:?} {frames:?}: AP rel L2 {err:.2e}");
             let got = llk.to_host_vec(&stream).unwrap();
             assert_llk("shifted AP llk", &got[..nf], &llk_ref);
-            ap_ref.add(s, &sh, frames.clone(), &want);
+            ap_ref.add(s, &sh, frames.clone(), &want, Some(&po));
             let far = FarSums {
                 llk: Some(&mut llk_other),
                 ..FarSums::default()
@@ -4154,7 +4158,7 @@ fn fused_shift_matches_f64() {
                 llk_bits(&got[..nf]),
                 "{frame:?} {frames:?}: grad LLK partials differ from AP's"
             );
-            grad_ref.add(s, &sh, frames.clone(), &want);
+            grad_ref.add(s, &sh, frames.clone(), &want, None);
 
             let mut psi = DeviceBuffer::<C32>::zeroed(&stream, s.nk(&(0..3)) * n).unwrap();
             let first = Exit::DmFirst { psi: &mut psi };
@@ -4192,7 +4196,7 @@ fn fused_shift_matches_f64() {
             let err = rel_l2(&got[..len], &want);
             println!("shifted DM {frame:?} {frames:?}: rel L2 {err:.2e}");
             assert!(err < 1e-5, "{frame:?} {frames:?}: DM rel L2 {err:.2e}");
-            dm_ref.add(s, &sh, frames, &want);
+            dm_ref.add(s, &sh, frames, &want, Some(&po));
         }
         for (what, out, r, den) in [
             ("shifted AP", &mut ap, &ap_ref, true),
