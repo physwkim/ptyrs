@@ -732,36 +732,87 @@ pub mod kernels {
         }
     }
 
-    // M2 fused stack passes; `crate::fused` documents each body and its launch.
+    // M2 fused stack passes; `crate::fused` documents each body and its launch. The FFT passes
+    // have one entry per FFT side, which must be the frame's side along the transformed axis.
 
-    /// [`crate::fused::rows_fwd`].
+    /// [`crate::fused::rows_fwd`] for 128-point rows.
     ///
     /// # Safety
     ///
     /// As [`crate::fused::rows_fwd`].
     #[kernel]
-    pub unsafe fn fused_rows_fwd(p: FusedPtrs, ctl: *const StackCtl, g: StackGeom, cfg: FusedCfg) {
-        unsafe { crate::fused::rows_fwd(p, ctl, g, cfg) }
+    pub unsafe fn fused_rows_fwd_128(
+        p: FusedPtrs,
+        ctl: *const StackCtl,
+        g: StackGeom,
+        cfg: FusedCfg,
+    ) {
+        unsafe { crate::fused::rows_fwd::<128>(p, ctl, g, cfg) }
     }
 
-    /// [`crate::fused::cols`].
+    /// [`crate::fused::rows_fwd`] for 256-point rows.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::rows_fwd`].
+    #[kernel]
+    pub unsafe fn fused_rows_fwd_256(
+        p: FusedPtrs,
+        ctl: *const StackCtl,
+        g: StackGeom,
+        cfg: FusedCfg,
+    ) {
+        unsafe { crate::fused::rows_fwd::<256>(p, ctl, g, cfg) }
+    }
+
+    /// [`crate::fused::cols`] for 128-point columns.
     ///
     /// # Safety
     ///
     /// As [`crate::fused::cols`].
     #[kernel]
-    pub unsafe fn fused_cols(p: FusedPtrs, ctl: *const StackCtl, g: StackGeom, cfg: FusedCfg) {
-        unsafe { crate::fused::cols(p, ctl, g, cfg) }
+    pub unsafe fn fused_cols_128(p: FusedPtrs, ctl: *const StackCtl, g: StackGeom, cfg: FusedCfg) {
+        unsafe { crate::fused::cols::<128>(p, ctl, g, cfg) }
     }
 
-    /// [`crate::fused::rows_inv`].
+    /// [`crate::fused::cols`] for 256-point columns.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::cols`].
+    #[kernel]
+    pub unsafe fn fused_cols_256(p: FusedPtrs, ctl: *const StackCtl, g: StackGeom, cfg: FusedCfg) {
+        unsafe { crate::fused::cols::<256>(p, ctl, g, cfg) }
+    }
+
+    /// [`crate::fused::rows_inv`] for 128-point rows.
     ///
     /// # Safety
     ///
     /// As [`crate::fused::rows_inv`].
     #[kernel]
-    pub unsafe fn fused_rows_inv(p: FusedPtrs, ctl: *const StackCtl, g: StackGeom, cfg: FusedCfg) {
-        unsafe { crate::fused::rows_inv(p, ctl, g, cfg) }
+    pub unsafe fn fused_rows_inv_128(
+        p: FusedPtrs,
+        ctl: *const StackCtl,
+        g: StackGeom,
+        cfg: FusedCfg,
+    ) {
+        unsafe { crate::fused::rows_inv::<128>(p, ctl, g, cfg) }
+    }
+
+    /// [`crate::fused::rows_inv`] for 256-point rows.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::rows_inv`].
+    #[kernel]
+    pub unsafe fn fused_rows_inv_256(
+        p: FusedPtrs,
+        ctl: *const StackCtl,
+        g: StackGeom,
+        cfg: FusedCfg,
+    ) {
+        unsafe { crate::fused::rows_inv::<256>(p, ctl, g, cfg) }
     }
 
     /// [`crate::fused::gather`].

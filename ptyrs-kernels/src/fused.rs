@@ -75,45 +75,45 @@ pub struct FusedPtrs {
     pub groups: *mut LlkPartial,
 }
 
-/// Unnormalized in-register FFT of `n` (128 or 256) points as FFT `b` of `bpb` in the block,
-/// this thread being its thread `f`. Every thread of the block must call it with the same
-/// `n`, `inverse` and `bpb`: it synchronizes the block.
+/// Unnormalized in-register FFT of `N` points (128 or 256), inverse under `INV`, as FFT `b`
+/// of `bpb` in the block, this thread being its thread `f`. Every thread of the block must
+/// call it with the same `bpb`: it synchronizes the block. Each pass is generic in its FFT
+/// side so that this resolves to one direct call and `r` stays in registers.
 ///
 /// # Safety
 ///
 /// `s` is block shared memory holding `bpb` FFTs of this size; the `(b, f)` pairs of the
 /// block's threads are distinct and cover every thread of every FFT.
 #[device]
-unsafe fn block_fft(
+unsafe fn block_fft<const N: u32, const INV: bool>(
     r: &mut [f32; 2 * FFT_EPT as usize],
     s: *mut u8,
-    n: u32,
-    inverse: bool,
     b: u32,
     f: u32,
     bpb: u32,
 ) {
+    const { assert!(N == 128 || N == 256) };
     let r = r.as_mut_ptr();
     unsafe {
-        match (n, inverse) {
+        match (N, INV) {
             (128, false) => crate::ptyrs_cufft_c2c_f32_n128_e16_fwd(r, s, b, f, bpb),
             (128, true) => crate::ptyrs_cufft_c2c_f32_n128_e16_inv(r, s, b, f, bpb),
-            (256, false) => crate::ptyrs_cufft_c2c_f32_n256_e16_fwd(r, s, b, f, bpb),
-            _ => crate::ptyrs_cufft_c2c_f32_n256_e16_inv(r, s, b, f, bpb),
+            (_, false) => crate::ptyrs_cufft_c2c_f32_n256_e16_fwd(r, s, b, f, bpb),
+            (_, true) => crate::ptyrs_cufft_c2c_f32_n256_e16_inv(r, s, b, f, bpb),
         }
     }
 }
 
-/// [`block_fft`] of a row pass: blockDim `(nx / FFT_EPT, rows)`, one row per FFT.
+/// [`block_fft`] of a row pass: blockDim `(NX / FFT_EPT, rows)`, one row per FFT.
 #[device]
-unsafe fn row_fft(r: &mut [f32; 2 * FFT_EPT as usize], n: u32, inverse: bool) {
+unsafe fn row_fft<const NX: u32, const INV: bool>(r: &mut [f32; 2 * FFT_EPT as usize]) {
     let s = DynamicSharedArray::<u8, 16>::get();
     let (b, f, bpb) = (
         thread::threadIdx_y(),
         thread::threadIdx_x(),
         thread::blockDim_y(),
     );
-    unsafe { block_fft(r, s, n, inverse, b, f, bpb) }
+    unsafe { block_fft::<NX, INV>(r, s, b, f, bpb) }
 }
 
 /// Pass A: `work[kl, ys, :] = FFT_x(w[ys, :])` for view `k0 + kl` of the stack and stored
@@ -124,16 +124,21 @@ unsafe fn row_fft(r: &mut [f32; 2 * FFT_EPT as usize], n: u32, inverse: bool) {
 ///
 /// # Safety
 ///
-/// The buffers it reads and writes hold their shapes for `g`; `ctl` one entry; launch as
-/// above.
+/// `NX == g.nx`; the buffers it reads and writes hold their shapes for `g`; `ctl` one entry;
+/// launch as above.
 #[device]
-pub unsafe fn rows_fwd(p: FusedPtrs, ctl: *const StackCtl, g: StackGeom, cfg: FusedCfg) {
+pub unsafe fn rows_fwd<const NX: u32>(
+    p: FusedPtrs,
+    ctl: *const StackCtl,
+    g: StackGeom,
+    cfg: FusedCfg,
+) {
     let (f0, nf) = unsafe { stack_frames(ctl, g) };
     let kl = thread::blockIdx_y();
     if kl >= nf * g.nmode {
         return;
     }
-    let (ny, nx) = (g.ny, g.nx);
+    let (ny, nx) = (g.ny, NX);
     let n = ny as usize * nx as usize;
     let ys = thread::blockIdx_x() * thread::blockDim_y() + thread::threadIdx_y();
     let t = thread::threadIdx_x();
@@ -146,6 +151,7 @@ pub unsafe fn rows_fwd(p: FusedPtrs, ctl: *const StackCtl, g: StackGeom, cfg: Fu
     let mut r = [0.0f32; 2 * FFT_EPT as usize];
     unsafe {
         let v = *p.views.add((f0 * g.nmode + kl) as usize);
+        #[unroll]
         for i in 0..FFT_EPT {
             let xs = t + i * tpf;
             let x = (xs + nx / 2) % nx;
@@ -159,7 +165,8 @@ pub unsafe fn rows_fwd(p: FusedPtrs, ctl: *const StackCtl, g: StackGeom, cfg: Fu
             r[2 * i as usize] = w.0;
             r[2 * i as usize + 1] = w.1;
         }
-        row_fft(&mut r, nx, false);
+        row_fft::<NX, false>(&mut r);
+        #[unroll]
         for i in 0..FFT_EPT {
             let k = 2 * i as usize;
             store_c(p.work, row + (t + i * tpf) as usize, (r[k], r[k + 1]));
@@ -183,16 +190,16 @@ pub unsafe fn rows_fwd(p: FusedPtrs, ctl: *const StackCtl, g: StackGeom, cfg: Fu
 ///
 /// # Safety
 ///
-/// `work`, `counts` and under `FUSED_LLK` `groups` hold their shapes for `g`; `ctl` one
-/// entry; launch as above.
+/// `NY == g.ny`; `work`, `counts` and under `FUSED_LLK` `groups` hold their shapes for `g`;
+/// `ctl` one entry; launch as above.
 #[device]
-pub unsafe fn cols(p: FusedPtrs, ctl: *const StackCtl, g: StackGeom, cfg: FusedCfg) {
+pub unsafe fn cols<const NY: u32>(p: FusedPtrs, ctl: *const StackCtl, g: StackGeom, cfg: FusedCfg) {
     let (f0, nf) = unsafe { stack_frames(ctl, g) };
     let fl = thread::blockIdx_y();
     if fl >= nf {
         return;
     }
-    let (ny, nx, nmode) = (g.ny, g.nx, g.nmode);
+    let (ny, nx, nmode) = (NY, g.nx, g.nmode);
     let n = ny as usize * nx as usize;
     let tpf = ny / FFT_EPT;
     // Threads per mode, and LLK slots per term.
@@ -214,13 +221,15 @@ pub unsafe fn cols(p: FusedPtrs, ctl: *const StackCtl, g: StackGeom, cfg: FusedC
         let fft_smem = smem.add(16 * nslot as usize);
         // `|Psi_m(v, u)|^2` at `(m * ny + v) * FUSED_COLS + c`, over the FFTs' region.
         let power = fft_smem.cast::<f32>();
+        #[unroll]
         for i in 0..FFT_EPT {
             let v = load_c(p.work, plane + ((f + i * tpf) * nx + u) as usize);
             r[2 * i as usize] = v.0;
             r[2 * i as usize + 1] = v.1;
         }
-        block_fft(&mut r, fft_smem, ny, false, b, f, bpb);
+        block_fft::<NY, false>(&mut r, fft_smem, b, f, bpb);
         thread::sync_threads();
+        #[unroll]
         for i in 0..FFT_EPT {
             let (re, im) = (r[2 * i as usize], r[2 * i as usize + 1]);
             let v = f + i * tpf;
@@ -230,6 +239,7 @@ pub unsafe fn cols(p: FusedPtrs, ctl: *const StackCtl, g: StackGeom, cfg: FusedC
         let inv_n = 1.0 / n as f32;
         let counts = p.counts.add((f0 + fl) as usize * n);
         let mut acc = [0.0f32; 4];
+        #[unroll]
         for i in 0..FFT_EPT {
             let v = f + i * tpf;
             let mut s = 0.0f32;
@@ -292,7 +302,8 @@ pub unsafe fn cols(p: FusedPtrs, ctl: *const StackCtl, g: StackGeom, cfg: FusedC
         if project {
             // Every power is read before the inverse FFT reuses the region.
             thread::sync_threads();
-            block_fft(&mut r, fft_smem, ny, true, b, f, bpb);
+            block_fft::<NY, true>(&mut r, fft_smem, b, f, bpb);
+            #[unroll]
             for i in 0..FFT_EPT {
                 let k = 2 * i as usize;
                 let at = plane + ((f + i * tpf) * nx + u) as usize;
@@ -345,16 +356,21 @@ pub unsafe fn llk_groups(
 ///
 /// # Safety
 ///
-/// The buffers it reads and writes hold their shapes for `g`; `ctl` one entry; launch as
-/// above.
+/// `NX == g.nx`; the buffers it reads and writes hold their shapes for `g`; `ctl` one entry;
+/// launch as above.
 #[device]
-pub unsafe fn rows_inv(p: FusedPtrs, ctl: *const StackCtl, g: StackGeom, cfg: FusedCfg) {
+pub unsafe fn rows_inv<const NX: u32>(
+    p: FusedPtrs,
+    ctl: *const StackCtl,
+    g: StackGeom,
+    cfg: FusedCfg,
+) {
     let (f0, nf) = unsafe { stack_frames(ctl, g) };
     let fl = thread::blockIdx_y();
     if fl >= nf {
         return;
     }
-    let (ny, nx) = (g.ny, g.nx);
+    let (ny, nx) = (g.ny, NX);
     let n = ny as usize * nx as usize;
     let ys = thread::blockIdx_x() * thread::blockDim_y() + thread::threadIdx_y();
     let t = thread::threadIdx_x();
@@ -377,13 +393,15 @@ pub unsafe fn rows_inv(p: FusedPtrs, ctl: *const StackCtl, g: StackGeom, cfg: Fu
             for pm in 0..g.nprobe {
                 let m = o * g.nprobe + pm;
                 let row = (fl * g.nmode + m) as usize * n + (ys * nx) as usize;
+                #[unroll]
                 for i in 0..FFT_EPT {
                     let v = load_c(p.work, row + (t + i * tpf) as usize);
                     r[2 * i as usize] = v.0;
                     r[2 * i as usize + 1] = v.1;
                 }
-                row_fft(&mut r, nx, true);
+                row_fft::<NX, true>(&mut r);
                 let v = *p.views.add((k0 + m) as usize);
+                #[unroll]
                 for i in 0..FFT_EPT {
                     let k = 2 * i as usize;
                     let xs = t + i * tpf;
@@ -409,6 +427,7 @@ pub unsafe fn rows_inv(p: FusedPtrs, ctl: *const StackCtl, g: StackGeom, cfg: Fu
             }
             if contrib {
                 let plane = (fl * nobj + o) as usize * n + (y * nx) as usize;
+                #[unroll]
                 for i in 0..FFT_EPT {
                     let k = 2 * i as usize;
                     let x = (t + i * tpf + nx / 2) % nx;

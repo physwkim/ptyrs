@@ -28,9 +28,19 @@ const SMEM_MAX: u32 = 48 * 1024;
 /// Most blocks along grid y.
 const GRID_Y_MAX: u64 = 65535;
 
+/// A frame side the fused FFT passes have kernels for.
+#[derive(Clone, Copy)]
+enum Side {
+    N128,
+    N256,
+}
+
 /// Launch shapes of the fused passes for one frame and mode count.
 #[derive(Clone, Copy)]
 struct Shape {
+    /// Sides along y (the column pass) and x (the row passes).
+    ny: Side,
+    nx: Side,
     /// Rows per row-pass block, of `nx / FFT_EPT` threads each.
     rows: u32,
     row_smem: u32,
@@ -43,18 +53,24 @@ impl Shape {
         d.check()?;
         let [ny, nx] = d.frame;
         let bad = |what: String| Error::Shape(format!("fused passes, {d:?}: {what}"));
-        // Shared memory per FFT, the larger of the two directions; the device dispatch
-        // covers exactly these sides.
-        let smem = |n: u32| match (n, block_fft(n, false), block_fft(n, true)) {
-            (128 | 256, Some(f), Some(i))
-                if [f.ept, i.ept] == [FFT_EPT; 2]
-                    && [f.threads_per_fft, i.threads_per_fft] == [n / FFT_EPT; 2] =>
-            {
-                Ok(f.smem_per_fft.max(i.smem_per_fft))
+        // The side's kernels and its shared memory per FFT, the larger of the two directions.
+        let side = |n: u32| {
+            let side = match n {
+                128 => Some(Side::N128),
+                256 => Some(Side::N256),
+                _ => None,
+            };
+            match (side, block_fft(n, false), block_fft(n, true)) {
+                (Some(side), Some(f), Some(i))
+                    if [f.ept, i.ept] == [FFT_EPT; 2]
+                        && [f.threads_per_fft, i.threads_per_fft] == [n / FFT_EPT; 2] =>
+                {
+                    Ok((side, f.smem_per_fft.max(i.smem_per_fft)))
+                }
+                _ => Err(bad(format!("no {n}-point in-kernel FFT"))),
             }
-            _ => Err(bad(format!("no {n}-point in-kernel FFT"))),
         };
-        let (sy, sx) = (smem(ny)?, smem(nx)?);
+        let ((side_y, sy), (side_x, sx)) = (side(ny)?, side(nx)?);
         let rows = FUSED_ROW_THREADS / (nx / FFT_EPT);
         let nslot = FUSED_COLS * (ny / FFT_EPT);
         let col_threads = d.nmode as u64 * nslot as u64;
@@ -63,6 +79,8 @@ impl Shape {
         }
         let col_threads = col_threads as u32;
         let s = Self {
+            ny: side_y,
+            nx: side_x,
             rows,
             row_smem: rows * sx,
             col_threads,
@@ -371,7 +389,18 @@ impl<'a> Run<'a> {
                 // SAFETY: `Run::new` and the caller checked every buffer the flags name;
                 // `Views::new` checked the views are canonical and inside the object; the
                 // launch is the one `rows_fwd` documents.
-                unsafe { self.k.module.fused_rows_fwd(stream, config, p, ctl, g, cfg) }
+                unsafe {
+                    match self.sh.nx {
+                        Side::N128 => self
+                            .k
+                            .module
+                            .fused_rows_fwd_128(stream, config, p, ctl, g, cfg),
+                        Side::N256 => self
+                            .k
+                            .module
+                            .fused_rows_fwd_256(stream, config, p, ctl, g, cfg),
+                    }
+                }
             })
     }
 
@@ -391,7 +420,12 @@ impl<'a> Run<'a> {
         let (ctl, g) = (self.ctl(), self.g);
         self.k.launch(self.ctx, &reads, &writes, |stream| {
             // SAFETY: as in `rows_fwd`; the launch is the one `cols` documents.
-            unsafe { self.k.module.fused_cols(stream, config, p, ctl, g, cfg) }
+            unsafe {
+                match self.sh.ny {
+                    Side::N128 => self.k.module.fused_cols_128(stream, config, p, ctl, g, cfg),
+                    Side::N256 => self.k.module.fused_cols_256(stream, config, p, ctl, g, cfg),
+                }
+            }
         })
     }
 
@@ -451,7 +485,18 @@ impl<'a> Run<'a> {
         let (ctl, g) = (self.ctl(), self.g);
         self.k.launch(self.ctx, &reads, &writes, |stream| {
             // SAFETY: as in `rows_fwd`; the launch is the one `rows_inv` documents.
-            unsafe { self.k.module.fused_rows_inv(stream, config, p, ctl, g, cfg) }
+            unsafe {
+                match self.sh.nx {
+                    Side::N128 => self
+                        .k
+                        .module
+                        .fused_rows_inv_128(stream, config, p, ctl, g, cfg),
+                    Side::N256 => self
+                        .k
+                        .module
+                        .fused_rows_inv_256(stream, config, p, ctl, g, cfg),
+                }
+            }
         })
     }
 
