@@ -534,7 +534,8 @@ impl Kernels {
     /// then the update sums of the waves it leaves: the probe's as [`Self::psi_to_probe`]
     /// adds them, against `inputs.obj`, and the object's as [`Self::psi_to_obj`] does (each
     /// object pixel over the stack's frames in ascending order, so the split into stacks does
-    /// not change a bit; only tiles the stack touches are read and written). With a
+    /// not change a bit; only tiles whose run holds a view of the stack are read and
+    /// written). With a
     /// [`Model::shift`], the shifted probe takes the place of `P_p q` and `sums.shift` gets
     /// its sums. Up to nine launches, twelve with a shift; a stack with `nf == 0` writes
     /// nothing but `bufs`.

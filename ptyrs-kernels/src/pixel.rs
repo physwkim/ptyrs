@@ -100,8 +100,9 @@ const _: () = assert!(PIXEL_THREADS.is_multiple_of(WARP));
 
 /// Device addresses of the per-object-tile view lists: tile `t`'s run is
 /// `views[start[t] .. start[t] + len[t]]`, ascending view indices, `len[t] <=
-/// start[t + 1] - start[t]`. No kernel reads or writes the object or sum pixels of a tile
-/// with `len[t] == 0`, nor its run.
+/// start[t + 1] - start[t]`. No kernel writes the object pixels of a tile with `len[t] ==
+/// 0`, nor reads or writes its sums or run; kernels that sample the object per view read
+/// its object pixels.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct TilePtrs {

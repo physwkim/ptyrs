@@ -704,6 +704,268 @@ fn object_update_split_takes_the_max_it_is_given() {
     );
 }
 
+/// [`Views::owned`] of the left tile columns: after `psi_to_obj`, the fused gathers with and
+/// without a shift and `update_obj_from_sums`, every other tile keeps its object pixels and
+/// sums while the owned ones get the bits [`Views::new`] gives them; the forward and probe
+/// passes sample every tile as under `Views::new`. Binning and reordering keep the owned
+/// set, counting no overflow for the tiles outside it.
+#[test]
+fn owned_views_update_only_the_owned_tiles() {
+    let (stream, ex, k) = setup();
+    let fs = FusedScan::new(&stream, [128, 256], [2, 2]);
+    let (s, n, len) = (&fs.s, fs.s.n(), fs.s.obj.len());
+    let [nty, ntx] = s.d.tiles().map(|v| v as usize);
+    let (nxo, t) = (s.d.obj[1] as usize, OBJ_TILE as usize);
+    // Tile column 8 is owned and its neighbour 9 not; tile 0 is listed twice.
+    let own: Vec<u32> = (0..nty * ntx)
+        .filter(|i| i % ntx < 9)
+        .chain([0])
+        .map(|i| i as u32)
+        .collect();
+    let col = |i: usize| i % nxo / t;
+    let owned = |i: usize| col(i) < 9;
+    let mine = Views::owned(&stream, s.d, &s.views, &own).unwrap();
+    let past = [(nty * ntx) as u32];
+    assert!(
+        matches!(
+            Views::owned(&stream, s.d, &s.views, &past),
+            Err(Error::Shape(_))
+        ),
+        "a tile past the object"
+    );
+    let all = host_views(&stream, &fs.views);
+    let got_views = host_views(&stream, &mine);
+    let run = |v: &HostViews, tile: usize| v.3[v.1[tile] as usize..][..v.2[tile] as usize].to_vec();
+    for tile in 0..nty * ntx {
+        let want = if tile % ntx < 9 {
+            run(&all, tile)
+        } else {
+            vec![]
+        };
+        if tile % ntx == 8 || tile % ntx == 9 {
+            assert!(all.2[tile] > 0, "no view reaches tile {tile}");
+        }
+        assert_eq!(run(&got_views, tile), want, "tile {tile} run");
+        let slab = got_views.1[tile + 1] - got_views.1[tile];
+        assert_eq!(slab, want.len() as u32, "tile {tile} slab");
+    }
+
+    let stacks = [0..3, 3..5];
+    let table = StackTable::new(&stream, &s.d, &stacks).unwrap();
+    let whole = one_stack(&stream, &s.d, 0..5);
+    let psi = up(&stream, &noise(s.nk(&(0..5)) * n, 7, 1.0));
+    let offsets = up(&stream, SHIFTS.as_flattened());
+    let mut spec = SpectrumBuf::zeroed(&stream, &s.d).unwrap();
+    let spectrum = k.probe_spectrum(&ex, &s.d, &fs.probe, &mut spec).unwrap();
+    let mut plain = FusedBufs::new(&stream, &s.d, table.nf_max()).unwrap();
+    let mut with_shift = FusedBufs::with_shift(&stream, &s.d, table.nf_max()).unwrap();
+    // The waves of `obj_probe_to_psi`, the fused AP and the shifted one; the probe and
+    // position sums; the object sums of `psi_to_obj`, the fused gather and the shifted one,
+    // each from `start`.
+    let mut pass = |views: &Views, obj: &DeviceBuffer<C32>, start: &(Vec<C32>, Vec<f32>)| {
+        let inputs = FusedInputs {
+            views,
+            obj,
+            ..fs.inputs()
+        };
+        let shifted = FusedInputs {
+            model: Model {
+                shift: Some(Shift {
+                    offsets: &offsets,
+                    spectrum,
+                }),
+                ..Model::default()
+            },
+            ..inputs
+        };
+        let mut waves = [(); 3].map(|_| vec![]);
+        let mut fwd = DeviceBuffer::<C32>::zeroed(&stream, s.nk(&(0..5)) * n).unwrap();
+        k.obj_probe_to_psi(&ex, views, whole.at(0), obj, &fs.probe, &mut fwd)
+            .unwrap();
+        waves[0] = c32_bits(&fwd.to_host_vec(&stream).unwrap());
+        let mut obj_sums = [(); 3].map(|_| sums(&stream, start));
+        k.psi_to_obj(&ex, views, whole.at(0), &psi, &fs.probe, &mut obj_sums[0])
+            .unwrap();
+        let mut probe = UpdateSums::zeroed(&stream, s.probe.len()).unwrap();
+        let mut sh = ShiftOut::zeroed(&stream, s);
+        let [_, ap, shift] = &mut obj_sums;
+        for (i, frames) in stacks.iter().enumerate() {
+            let ap_far = || Exit::Ap {
+                far: FarSums::default(),
+            };
+            let sums = FusedSums {
+                obj: Some(&mut *ap),
+                probe: Some(&mut probe),
+                ..Default::default()
+            };
+            k.fused_project(&ex, &inputs, table.at(i), ap_far(), &mut plain, sums)
+                .unwrap();
+            let work = plain.work().to_host_vec(&stream).unwrap();
+            waves[1].extend(c32_bits(&work[..s.nk(frames) * n]));
+            let sums = FusedSums {
+                obj: Some(&mut *shift),
+                probe: None,
+                shift: ShiftSums {
+                    probe: Some(&mut sh.probe),
+                    position: Some(&mut sh.pos),
+                    position_den: Some(&mut sh.den),
+                },
+            };
+            k.fused_project(&ex, &shifted, table.at(i), ap_far(), &mut with_shift, sums)
+                .unwrap();
+            let work = with_shift.work().to_host_vec(&stream).unwrap();
+            waves[2].extend(c32_bits(&work[..s.nk(frames) * n]));
+        }
+        // `sh.obj` stays zero; the shifted gather went to `shift`.
+        let mut side = sh.bits(&stream, s, |p, u| {
+            k.shifted_probe_sums(&ex, &s.d, p, u).unwrap()
+        });
+        let num = c32_bits(&probe.num.to_host_vec(&stream).unwrap());
+        side.extend(num.into_iter().flat_map(|(re, im)| [re, im]));
+        side.extend(f32_bits(&probe.den.to_host_vec(&stream).unwrap()));
+        (waves, side, obj_sums)
+    };
+
+    let obj = up(&stream, &s.obj);
+    let zero = (vec![C32::default(); len], vec![0.0f32; len]);
+    let nan = C32 {
+        re: f32::NAN,
+        im: f32::NAN,
+    };
+    // Read or added to, the poison would reach the bits that depend on it.
+    let poison: (Vec<C32>, Vec<f32>) = (
+        (0..len)
+            .map(|i| if owned(i) { C32::default() } else { nan })
+            .collect(),
+        (0..len)
+            .map(|i| if owned(i) { 0.0 } else { 1e30 })
+            .collect(),
+    );
+    let (want_waves, want_side, want_sums) = pass(&fs.views, &obj, &zero);
+    let (waves, side, mut got_sums) = pass(&mine, &obj, &poison);
+    let passes = ["obj_probe_to_psi", "fused AP", "shifted AP"];
+    for (what, (got, want)) in passes.iter().zip(waves.iter().zip(&want_waves)) {
+        assert!(got == want, "{what} waves differ from Views::new's");
+    }
+    assert!(
+        side == want_side,
+        "probe and position sums differ from Views::new's"
+    );
+    let host = |u: &UpdateSums| {
+        (
+            c32_bits(&u.num.to_host_vec(&stream).unwrap()),
+            f32_bits(&u.den.to_host_vec(&stream).unwrap()),
+        )
+    };
+    let poison_bits = (c32_bits(&poison.0), f32_bits(&poison.1));
+    for (what, got, want) in [
+        ("psi_to_obj", &got_sums[0], &want_sums[0]),
+        ("fused", &got_sums[1], &want_sums[1]),
+        ("shifted", &got_sums[2], &want_sums[2]),
+    ] {
+        let (got, want) = (host(got), host(want));
+        let mut added = 0;
+        for i in 0..len {
+            let w = if owned(i) {
+                added += usize::from(col(i) == 8 && want.1[i] != 0);
+                (want.0[i], want.1[i])
+            } else {
+                (poison_bits.0[i], poison_bits.1[i])
+            };
+            assert_eq!(
+                (got.0[i], got.1[i]),
+                w,
+                "{what} sums at {i}, owned {}",
+                owned(i)
+            );
+        }
+        assert!(added > 0, "{what}: nothing added to tile column 8");
+    }
+
+    let (num, den) = (
+        got_sums[1].num.to_host_vec(&stream).unwrap(),
+        got_sums[1].den.to_host_vec(&stream).unwrap(),
+    );
+    let mut updated = up(&stream, &s.obj);
+    k.update_obj_from_sums(&ex, &mine, &mut updated, &mut got_sums[1], 0.01)
+        .unwrap();
+    // Owned tiles no view reaches have an empty run too, so they keep their pixels as well.
+    let plane = s.d.obj[0] as usize * nxo;
+    let runs = |i: usize| got_views.2[i % plane / nxo / t * ntx + col(i)] > 0;
+    let max = (0..len)
+        .filter(|&i| runs(i))
+        .fold(0.0f32, |m, i| m.max(den[i]));
+    let word = got_sums[1].max_bits.to_host_vec(&stream).unwrap()[0];
+    assert_eq!(
+        f32::from_bits(word),
+        max,
+        "max of den over the tiles with a run"
+    );
+    let reg = 0.01f32 * max;
+    let got = c32_bits(&updated.to_host_vec(&stream).unwrap());
+    let start = c32_bits(&s.obj);
+    let after = host(&got_sums[1]);
+    for i in 0..len {
+        let (want, want_sums) = if runs(i) {
+            let d = (den[i] + reg).max(1e-12);
+            let part = |a: f32, b: f32| ((a + reg * b) / d).to_bits();
+            let (a, b) = (num[i], s.obj[i]);
+            ((part(a.re, b.re), part(a.im, b.im)), ((0, 0), 0))
+        } else {
+            (start[i], (poison_bits.0[i], poison_bits.1[i]))
+        };
+        assert_eq!(got[i], want, "pixel {i}, owned {}", owned(i));
+        assert_eq!(
+            (after.0[i], after.1[i]),
+            want_sums,
+            "sums at {i} after the update"
+        );
+    }
+    let next = || (0..len).filter(|&i| col(i) == 8);
+    let moved = next().filter(|&i| got[i] != start[i]).count();
+    assert!(
+        moved > next().count() / 2,
+        "{moved} of {} pixels of tile column 8 updated",
+        next().count()
+    );
+
+    // The forward passes read tile column 9: turning it by `i` changes every pass's waves.
+    let mut turned = s.obj.clone();
+    for i in (0..len).filter(|&i| col(i) == 9) {
+        turned[i] = C32 {
+            re: -turned[i].im,
+            im: turned[i].re,
+        };
+    }
+    let (turned_waves, ..) = pass(&mine, &up(&stream, &turned), &poison);
+    for (what, (got, before)) in passes.iter().zip(turned_waves.iter().zip(&waves)) {
+        assert!(got != before, "{what} waves ignore tile column 9");
+    }
+
+    // A tile without a slot gets no view and no overflow from binning or reordering.
+    let mut binned = Views::reordered(&stream, &mine).unwrap();
+    let mut overflow = up(&stream, &[0u32]);
+    record(|ctx| k.bin_views(ctx, &mut binned, whole.at(0), &mut overflow))
+        .sync_on(&stream)
+        .unwrap();
+    assert_eq!(overflow.to_host_vec(&stream).unwrap(), [0], "overflow");
+    assert!(
+        host_views(&stream, &binned) == got_views,
+        "bin_views of every frame"
+    );
+    let order = [3, 0, 4, 1, 2];
+    let perm = Permutation::new(&stream, &order).unwrap();
+    let mut mid = Views::reordered(&stream, &mine).unwrap();
+    record(|ctx| k.reorder_views(ctx, &mine, &perm, &mut mid))
+        .sync_on(&stream)
+        .unwrap();
+    let want = Views::owned(&stream, s.d, &reordered_views(s, &order), &own).unwrap();
+    assert!(
+        host_views(&stream, &mid) == host_views(&stream, &want),
+        "reorder_views"
+    );
+}
+
 /// [`Views::from_parts`] over slabs with spare slots past each run (the live layout), its
 /// runs empty until `bin_views` fills them stack by stack, gets the runs and the bits of the
 /// packed lists: a run ends at its length, not at the next tile's start.

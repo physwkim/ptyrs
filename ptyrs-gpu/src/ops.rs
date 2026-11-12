@@ -317,24 +317,63 @@ impl StackRef<'_> {
 
 /// The views of a scan on the device, with the per-object-tile view lists the object
 /// gather walks: tile `t`'s run is `tile_views[tile_start[t] .. tile_start[t] + tile_len[t]]`.
+///
+/// The owned tiles are those whose slab `tile_start[t] .. tile_start[t + 1]` has a slot;
+/// binning lists views in them only. A tile outside the owned set has an empty run: the
+/// launches may sample its object pixels, which the forward and probe passes read through
+/// each view, but never write them or its sums.
 pub struct Views {
     dims: ViewDims,
     addr: DeviceBuffer<ViewAddr>,
     /// `ntiles + 1` ascending offsets into `tile_views`; tile `ty * ntx + tx` of `OBJ_TILE`
     /// pixels.
     tile_start: DeviceBuffer<u32>,
-    /// Per tile, ascending indices of the views whose samples may touch it.
+    /// Per owned tile, ascending indices of the views whose samples may touch it.
     tile_views: DeviceBuffer<u32>,
-    /// `ntiles` run lengths, at most `tile_start[t + 1] - tile_start[t]`. No launch reads or
-    /// writes the object or sum pixels of a tile whose run is empty.
+    /// `ntiles` run lengths, at most `tile_start[t + 1] - tile_start[t]`. No launch writes
+    /// the object pixels of a tile whose run is empty, nor reads or writes its sums; the
+    /// passes that sample the object per view read its object pixels.
     tile_len: DeviceBuffer<u32>,
 }
 
 impl Views {
     /// Checks `addr` (`nframe * nmode` canonical views, each inside the object with `fy`,
-    /// `fx` in `[0, 1)`) and uploads it with its tile lists.
+    /// `fx` in `[0, 1)`) and uploads it with its tile lists; it owns every tile a view
+    /// touches.
     pub fn new(stream: &CudaStream, dims: ViewDims, addr: &[ViewAddr]) -> Result<Self, Error> {
         dims.check()?;
+        Self::build(stream, dims, addr, &vec![true; dims.ntiles()])
+    }
+
+    /// [`Self::new`] owning only the tiles of `own` (`ty * ntx + tx`, any order, repeats
+    /// allowed), a region's tiles: each gets the run `new` gives it, every other tile an
+    /// empty slab and run. The update launches leave the other tiles' object pixels and sums
+    /// as they are, for their owner to write; the forward and probe passes still sample
+    /// them. A tile index past the object's tiles is an error.
+    pub fn owned(
+        stream: &CudaStream,
+        dims: ViewDims,
+        addr: &[ViewAddr],
+        own: &[u32],
+    ) -> Result<Self, Error> {
+        dims.check()?;
+        let mut owned = vec![false; dims.ntiles()];
+        for &t in own {
+            let ntiles = owned.len();
+            *owned
+                .get_mut(t as usize)
+                .ok_or_else(|| Error::Shape(format!("owned tile {t} of {ntiles}")))? = true;
+        }
+        Self::build(stream, dims, addr, &owned)
+    }
+
+    /// [`Self::owned`] of the tiles `owned` marks, `dims` checked.
+    fn build(
+        stream: &CudaStream,
+        dims: ViewDims,
+        addr: &[ViewAddr],
+        owned: &[bool],
+    ) -> Result<Self, Error> {
         let nview = dims.nframe as usize * dims.nmode as usize;
         if addr.len() != nview {
             return Err(Error::Shape(format!(
@@ -360,7 +399,7 @@ impl Views {
                 }
             }
         }
-        let t = tile_lists(&dims, addr)?;
+        let t = tile_lists(&dims, addr, owned)?;
         Ok(Self {
             dims,
             addr: DeviceBuffer::from_host(stream, addr)?,
@@ -372,9 +411,10 @@ impl Views {
 
     /// Views over device storage the caller keeps filling and backing: `addr` takes the
     /// records of frames as they land, and `tile_views` holds `ntiles` slabs of `cap` slots,
-    /// tile `t`'s from slot `t * cap`. Every run starts empty; only binning
-    /// ([`Kernels::bin_views`], [`Kernels::reorder_views`]) writes runs. Checks `dims`, that
-    /// `addr` holds `nframe * nmode` records and `tile_views` `ntiles * cap` slots.
+    /// tile `t`'s from slot `t * cap`, so it owns every tile, or none when `cap` is 0. Every
+    /// run starts empty; only binning ([`Kernels::bin_views`], [`Kernels::reorder_views`])
+    /// writes runs. Checks `dims`, that `addr` holds `nframe * nmode` records and
+    /// `tile_views` `ntiles * cap` slots.
     ///
     /// # Safety
     ///
@@ -406,7 +446,8 @@ impl Views {
     }
 
     /// Views for [`Kernels::reorder_views`] of `src`: its dims, frames and tile slabs, so
-    /// each tile's capacity, with every run empty until a reorder fills them.
+    /// each tile's capacity and the owned set, with every run empty until a reorder fills
+    /// them.
     pub fn reordered(stream: &CudaStream, src: &Views) -> Result<Self, Error> {
         fn copy<T: DeviceCopy>(
             stream: &CudaStream,
@@ -504,7 +545,8 @@ impl Permutation {
 
 /// The object tiles `[ty, tx]` holding the object pixels that the samples of view `v` read,
 /// ascending (ty-major); for a view [`ViewDims::check_view`] accepts, all inside the object.
-/// [`Views::new`] and [`Kernels::bin_views`] list view `v` in exactly these tiles' runs.
+/// [`Views::new`] lists view `v` in exactly these tiles' runs; [`Views::owned`] and
+/// [`Kernels::bin_views`] in those of the owned ones.
 pub fn view_tiles(dims: &ViewDims, v: &ViewAddr) -> impl Iterator<Item = [u32; 2]> + use<> {
     let [ny, nx] = dims.frame;
     let (x0, x1) = axis_tiles(v.ox, nx, v.fx);
@@ -519,13 +561,17 @@ struct TileLists {
     views: Vec<u32>,
 }
 
-/// CSR lists of the views touching each object tile, ascending per tile.
-fn tile_lists(dims: &ViewDims, addr: &[ViewAddr]) -> Result<TileLists, Error> {
+/// CSR lists of the views touching each object tile `owned` marks, ascending per tile; every
+/// other tile gets an empty slab.
+fn tile_lists(dims: &ViewDims, addr: &[ViewAddr], owned: &[bool]) -> Result<TileLists, Error> {
     let ntx = dims.tiles()[1] as usize;
     let mut lists = vec![Vec::new(); dims.ntiles()];
     for (k, v) in addr.iter().enumerate() {
         for [ty, tx] in view_tiles(dims, v) {
-            lists[ty as usize * ntx + tx as usize].push(k as u32);
+            let t = ty as usize * ntx + tx as usize;
+            if owned[t] {
+                lists[t].push(k as u32);
+            }
         }
     }
     let mut start = Vec::with_capacity(lists.len() + 1);
@@ -842,12 +888,14 @@ impl Kernels {
     }
 
     /// Appends the stack's views to the tile lists: each view of frames `f0 .. f0 + nf` goes
-    /// after the run of every tile [`view_tiles`] lists it in, in ascending view order.
-    /// Stacks binned once each in ascending frame order leave the runs [`Views::new`] makes
-    /// of the frames binned; in any other order the launches stay in bounds, but the runs
-    /// and what the passes add over them are unspecified. A view whose tile's slab
-    /// `tile_start[t] .. tile_start[t + 1]` is full is not written and adds 1 to
-    /// `overflow[0]`. A stack with `nf == 0` writes nothing.
+    /// after the run of every owned tile [`view_tiles`] lists it in, in ascending view order.
+    /// Stacks binned once each in ascending frame order leave the runs [`Views::new`] (or
+    /// [`Views::owned`] of the same owned set) makes of the frames binned; in any other
+    /// order the launches stay in bounds, but the runs and what the passes add over them are
+    /// unspecified. It keeps the owned set: a tile without a slot gets no view and counts
+    /// none in `overflow`. A view whose owned tile's slab `tile_start[t] .. tile_start[t +
+    /// 1]` is full is not written and adds 1 to `overflow[0]`. A stack with `nf == 0` writes
+    /// nothing.
     pub fn bin_views(
         &self,
         ctx: &ExecutionContext,
@@ -890,11 +938,12 @@ impl Kernels {
 
     /// Fills `dst` with `src`'s frames in `order`, frame `p` of `dst` being frame `order[p]`
     /// of `src`, and rebuilds every run of `dst` as [`Self::bin_views`] over all frames
-    /// would, so they are the runs [`Views::new`] makes of the reordered frames. A gather, a
-    /// memset and a bin launch, stream-ordered with no host sync, so a graph can capture
-    /// them. When they run, `dst`'s slabs hold every tile's views, as [`Views::reordered`]
-    /// of `src` gives when `src`'s runs hold all its views; otherwise the launches stay in
-    /// bounds but `dst`'s runs are unspecified.
+    /// would, so they are the runs [`Views::new`] (or [`Views::owned`] of `dst`'s owned set)
+    /// makes of the reordered frames. It keeps `dst`'s owned set, which [`Views::reordered`]
+    /// takes from `src`. A gather, a memset and a bin launch, stream-ordered with no host
+    /// sync, so a graph can capture them. When they run, `dst`'s slabs hold every owned
+    /// tile's views, as [`Views::reordered`] of `src` gives when `src`'s runs hold all its
+    /// views; otherwise the launches stay in bounds but `dst`'s runs are unspecified.
     pub fn reorder_views(
         &self,
         ctx: &ExecutionContext,
@@ -948,7 +997,8 @@ impl Kernels {
     /// into `num` the exact adjoint of [`Self::obj_probe_to_psi`] applied to `psi`, into
     /// `den` the same bilinear spread of `|P_v|^2`. Each object pixel adds its views in
     /// ascending view order, so splitting the frames into stacks does not change a bit of
-    /// the result. Only the pixels of tiles the stack's views touch are read and written.
+    /// the result. Only the pixels of tiles whose run holds a view of the stack are read and
+    /// written.
     pub fn psi_to_obj(
         &self,
         ctx: &ExecutionContext,
@@ -1089,8 +1139,8 @@ impl Kernels {
         })
     }
 
-    /// [`Self::update_from_sums`] of the object `[nobj, nyo, nxo]` on the object tiles with
-    /// views only: `reg = inertia * max(den)` over their pixels, then the update of each,
+    /// [`Self::update_from_sums`] of the object `[nobj, nyo, nxo]` on the object tiles with a
+    /// non-empty run only: `reg = inertia * max(den)` over their pixels, then the update of each,
     /// zeroing its sums. A tile whose run is empty is neither read nor written, in `obj` or
     /// `sums`, so it keeps its bits; when its `den` is zero, as in sums built zeroed (no stack
     /// adds to such a tile), every other pixel gets the bits `update_from_sums` gives it.
@@ -1109,7 +1159,7 @@ impl Kernels {
     }
 
     /// The first step of [`Self::update_obj_from_sums`]: the bits of `max(den)` over the
-    /// pixels of the object tiles with views into `sums.max_bits`. The max is exact and
+    /// pixels of the object tiles with a non-empty run into `sums.max_bits`. The max is exact and
     /// independent of order, so the largest of several devices' words is the max over the
     /// union of their tiles.
     pub fn obj_den_max(
@@ -1145,7 +1195,8 @@ impl Kernels {
     /// The second step of [`Self::update_obj_from_sums`], with `reg = inertia *
     /// f32::from_bits(max_bits[0])` read on the device when it runs (a captured graph reads
     /// whatever an exchange of [`Self::obj_den_max`] words left there): the update of each
-    /// pixel of the object tiles with views, zeroing its sums. `sums.max_bits` is not used.
+    /// pixel of the object tiles with a non-empty run, zeroing its sums. `sums.max_bits` is
+    /// not used.
     pub fn normalize_obj(
         &self,
         ctx: &ExecutionContext,

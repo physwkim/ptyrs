@@ -129,9 +129,11 @@ const STACK_TILE_SHARED: usize = 3 * pixel::STACK_TILE_CANDIDATES as usize + 1;
 /// `fpx` the [`pixel::axis_tiles_max`] of the frame sides and `per = fpy * fpx`. Thread `t
 /// < STACK_TILE_CANDIDATES` tests candidate `blockIdx.x + t * gridDim.x`, which its block
 /// owns if the tile is in the box and the run's first view of the stack is frame `fl`'s.
-/// No tile gets two owner blocks; when the stack's views in each run are exactly those
-/// [`pixel::axis_tiles`] bins to it, each tile some frame of the stack is binned to gets
-/// one, and no other tile does.
+/// No tile gets two owner blocks, and a tile whose run holds no view of the stack gets
+/// none; when the stack's views in each run are exactly those [`pixel::axis_tiles`] bins to
+/// it, each tile some frame of the stack is binned to gets one. A tile outside the owned
+/// set (its slab has no slot) has an empty run: launches may sample its object pixels,
+/// since `sample_obj` is not gated by runs, but never write them or its sums.
 ///
 /// # Safety
 ///
@@ -292,7 +294,8 @@ unsafe fn block_sum<const K: usize>(s: *mut f32) {
 /// Appends views `k0 .. k0 + nk` to the slab of this warp's tile `ty * ntx + tx`, in
 /// ascending `k`, each view after the run of every tile [`pixel::axis_tiles`] puts it in. A
 /// run's length is written only if the range has a view of the tile. Returns, the same on
-/// every lane, how many of the tile's views the slab could not hold. One warp per tile, a 1D
+/// every lane, how many of the tile's views the slab could not hold. A tile whose slab has
+/// no slot is outside the owned set: it gets no view and returns 0. One warp per tile, a 1D
 /// launch of `ntiles * WARP` threads; warps past the tiles return 0.
 ///
 /// # Safety
@@ -319,6 +322,10 @@ unsafe fn bin_tile_views(
     unsafe {
         let lo = *slabs.start.add(t);
         let cap = *slabs.start.add(t + 1) - lo;
+        // An unowned tile; `cap` is the warp's, so the whole warp leaves.
+        if cap == 0 {
+            return 0;
+        }
         let len0 = *slabs.len.add(t);
         let mut added = 0u32;
         let mut base = 0u32;
@@ -661,8 +668,8 @@ pub mod kernels {
         }
     }
 
-    /// `bin_tile_views` of the stack's views, the views a slab cannot hold added to
-    /// `*overflow`.
+    /// `bin_tile_views` of the stack's views, the views an owned tile's slab cannot hold
+    /// added to `*overflow`.
     ///
     /// # Safety
     ///
@@ -864,7 +871,8 @@ pub mod kernels {
     }
 
     /// [`max_nonneg_f32`] of `den` `[nobj, nyo, nxo]` over the pixels of the object tiles
-    /// with views, merged into `*out`. A block whose tile has none returns without reading.
+    /// with a non-empty run, merged into `*out`. A block whose tile's run is empty returns
+    /// without reading.
     /// Grid `(ntx, nty, nobj)` of `OBJ_TILE` tiles, block `(OBJ_TILE, OBJ_TILE, 1)`.
     ///
     /// # Safety
@@ -922,8 +930,9 @@ pub mod kernels {
     }
 
     /// [`normalize_update`] of `x` `[nobj, nyo, nxo]` on the pixels of the object tiles with
-    /// views, zeroing their sums; a block whose tile has none returns without reading or
-    /// writing. Grid `(ntx, nty, nobj)` of `OBJ_TILE` tiles, block `(OBJ_TILE, OBJ_TILE, 1)`.
+    /// a non-empty run, zeroing their sums; a block whose tile's run is empty returns without
+    /// reading or writing. Grid `(ntx, nty, nobj)` of `OBJ_TILE` tiles, block `(OBJ_TILE,
+    /// OBJ_TILE, 1)`.
     ///
     /// # Safety
     ///
