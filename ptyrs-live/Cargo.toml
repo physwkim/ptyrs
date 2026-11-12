@@ -10,6 +10,7 @@ cuda-core = { workspace = true }
 cuda-bindings = { workspace = true }
 cuda-async = { workspace = true }
 ptyrs-gpu = { path = "../ptyrs-gpu" }
+ptyrs-core = { workspace = true }
 # Unsafe (fast) block codec, still bounds-checked on decode.
 lz4_flex = { version = "0.11", default-features = false, features = ["std", "checked-decode"] }
 bytes = "1"

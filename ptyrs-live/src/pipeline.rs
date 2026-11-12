@@ -291,6 +291,9 @@ pub struct SourceStats {
     pub placeholders: u64,
     /// `None` until the first frame arrives.
     pub rx: Option<RxSpan>,
+    /// Arrival of the last of the run's frames, wall ns: the scan's end for
+    /// [`crate::converge::Clock`]. `None` while any is missing.
+    pub scan_end: Option<i64>,
     pub first_error: Option<String>,
 }
 
@@ -344,6 +347,9 @@ impl SourceStats {
         }
         *word |= b;
         self.unique += 1;
+        if self.unique == self.frames {
+            self.scan_end = Some(t_rx);
+        }
         if self.unique.is_multiple_of(1024) {
             rx.cpu_sample = Some((t_rx, process_cpu_ns()));
         }
@@ -431,13 +437,35 @@ mod tests {
     use super::*;
 
     fn work(uid: i32) -> Work {
+        at(uid, 1)
+    }
+
+    fn at(uid: i32, t_rx: i64) -> Work {
         Work {
             payload: Bytes::new(),
             codec: Codec::None,
             uid,
-            t_rx: 1,
+            t_rx,
             t_pub: 0,
         }
+    }
+
+    /// The scan ends at the arrival that completes it, out of order here;
+    /// repeats and strays before or after it move nothing.
+    #[test]
+    fn the_scan_ends_when_its_last_missing_frame_arrives() {
+        let (tx, _rx) = crate::handoff::work_queue(std::num::NonZeroUsize::new(8).unwrap());
+        let mut s = SourceStats::new(3);
+        for (uid, t) in [(0, 10), (2, 20), (2, 25), (3, 27)] {
+            s.accept(at(uid, t), &tx);
+            assert_eq!(s.scan_end, None, "after uid {uid}");
+        }
+        s.accept(at(1, 30), &tx);
+        assert_eq!(s.scan_end, Some(30));
+        for (uid, t) in [(1, 40), (5, 41)] {
+            s.accept(at(uid, t), &tx);
+        }
+        assert_eq!(s.scan_end, Some(30));
     }
 
     #[test]

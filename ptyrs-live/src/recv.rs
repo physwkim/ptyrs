@@ -725,7 +725,7 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
     line(format_args!(
         "recv rx_rate_hz={} cpu_cores_steady={} cpu_cores_total={} workers={} \
          worker_cpu_cores={} h2d_cpu_cores={} ring_stalls={} batches={} mean_batch={} \
-         max_inflight={} h2d_MBps={}",
+         max_inflight={} h2d_MBps={} scan_end_ms={}",
         Fig(rx_span(st.unique as f64), 1),
         Fig(steady, 2),
         Fig(
@@ -743,6 +743,11 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
         ),
         up.max_inflight,
         Fig(rx_span(up.bytes as f64 / 1e6), 1),
+        // From the first arrival.
+        Fig(
+            rx.zip(st.scan_end).map(|(r, e)| (e - r.first) as f64 / 1e6),
+            1
+        ),
     ));
     line(format_args!("recv rx_to_gpu {}", up.rx_to_gpu.summary()));
     line(format_args!("recv pub_to_gpu {}", up.pub_to_gpu.summary()));

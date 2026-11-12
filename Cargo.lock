@@ -1752,6 +1752,7 @@ dependencies = [
  "epics-pva-rs",
  "libc",
  "lz4_flex",
+ "ptyrs-core",
  "ptyrs-gpu",
  "rust-hdf5",
  "rustfft",

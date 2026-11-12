@@ -4,6 +4,7 @@
 
 pub mod codec;
 pub mod consumer;
+pub mod converge;
 pub mod eiger;
 pub mod farfield;
 pub mod graph;
