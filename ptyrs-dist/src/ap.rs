@@ -8,16 +8,18 @@
 //! are one per leaf, added through a fixed pair tree; the regulariser's `max(den)` is an exact
 //! max over regions; the LLK is [`LlkSums::from_partials`] over frames by global index.
 //!
-//! Per cycle, with [`Gpu::fence`] between the steps: A exit waves, LLK, projection and the
-//! leaf probe sums of the own stacks; B gather of foreign exit waves, object sums and their
-//! max, probe pair tree; C object and probe updates, then each owner packs the updated rows
-//! its neighbours read; D each receiver pulls them by copy engine and unpacks its halo.
+//! Per cycle, with [`Gpu::fence`] between the steps: A exit waves, LLK, projection, the leaf
+//! probe sums of the own stacks and their subtree; B gather of foreign exit waves, object sums
+//! and their max, the other regions' subtree roots pulled by copy engine and the pair tree
+//! above them; C the other regions' max words pulled by copy engine, object and probe
+//! updates, then each owner packs the updated rows its neighbours read; D each receiver pulls
+//! them by copy engine and unpacks its halo.
 
 use std::ops::Range;
 use std::sync::Arc;
 
 use cuda_async::device_operation::ExecutionContext;
-use cuda_core::{Context, DeviceBuffer};
+use cuda_core::{Context, DeviceBuffer, Stream};
 use ptyrs_core::{AddrTable, View};
 use ptyrs_fft::Plan2d;
 use ptyrs_gpu::{
@@ -431,24 +433,121 @@ struct Ptrs {
     halo_send: u64,
     halo_recv: u64,
     max_bits: u64,
-    /// `(num, den)` of each own leaf's probe sums.
-    leaf: Vec<(u64, u64)>,
+    /// [`Tree::top`], when the probe updates.
+    tree_top: Option<Node>,
 }
 
 /// What a region's exchange reads, built once all regions exist.
 struct Links {
     gather: Runs,
     halo: Vec<Pull>,
+    /// The other regions' probe subtree roots into [`Tree::pulled`].
+    tree: Vec<Pull>,
+    /// The other regions' `max_bits` words into [`State::maxes`].
+    max: Vec<Pull>,
+    /// Every region's `max_bits` word, all local.
     max_srcs: DeviceBuffer<u64>,
-    /// `(num, den)` of every leaf's probe sums, by leaf.
-    leaf: [(u64, u64); NLEAF],
 }
 
-/// Probe pair tree over the leaf sums: `node[0] = L0 + L1`, `node[1] = L2 + L3`,
-/// `root = node[0] + node[1]`.
+/// `(num, den)` addresses of one node's probe sums.
+type Node = (u64, u64);
+
+/// `dst = a + b` over the probe sums of tree nodes.
+struct Add {
+    dst: Node,
+    a: Node,
+    b: Node,
+}
+
+impl Add {
+    /// # Safety
+    /// The nodes must hold `np` probe elements on the stream's device, `a` and `b` written
+    /// before this launch.
+    unsafe fn run(&self, ex: &Exchange, stream: &Stream, np: u32) -> Result<(), DistError> {
+        // SAFETY: as the caller guarantees; `num` holds two floats per element.
+        unsafe {
+            ex.add_f32(stream, self.dst.0, self.a.0, self.b.0, 2 * np)?;
+            ex.add_f32(stream, self.dst.1, self.a.1, self.b.1, np)
+        }
+    }
+}
+
+/// The probe pair tree over the leaf sums, level by level: node `(h, i)` adds nodes
+/// `(h - 1, 2i)` and `(h - 1, 2i + 1)` up to the root. A region adds the subtree of its own
+/// leaves, pulls the other regions' subtree roots and adds the levels above them, so every
+/// region adds the same nodes in the same order on 1, 2 and 4 GPUs.
 struct Tree {
-    node: [(DeviceBuffer<C32>, DeviceBuffer<f32>); 2],
+    /// Inner nodes and pulled subtree roots.
+    _nodes: Vec<UpdateSums>,
+    /// Adds of the own subtree, after the own leaf sums.
+    own: Vec<Add>,
+    /// Adds above the subtree roots, after the pulls.
+    upper: Vec<Add>,
+    /// The own subtree root, which the other regions pull.
+    top: Node,
+    /// Where each other region's subtree root is pulled to, by region.
+    pulled: Vec<Option<Node>>,
     root: UpdateSums,
+}
+
+impl Tree {
+    /// Tree of region `r` of `NLEAF / k`, whose own leaf sums are `leaves`.
+    fn new(
+        stream: &Stream,
+        r: usize,
+        k: usize,
+        np: usize,
+        leaves: &[UpdateSums],
+    ) -> Result<Self, DistError> {
+        let node = |s: &UpdateSums| (s.num.cu_deviceptr(), s.den.cu_deviceptr());
+        // Levels inside a region's subtree, and to the root.
+        let (h, height) = (k.trailing_zeros(), NLEAF.trailing_zeros());
+        let root = UpdateSums::zeroed(stream, np)?;
+        let mut nodes = Vec::new();
+        let mut alloc = || -> Result<Node, DistError> {
+            nodes.push(UpdateSums::zeroed(stream, np)?);
+            Ok(node(nodes.last().expect("just pushed")))
+        };
+        let (mut own, mut upper) = (Vec::new(), Vec::new());
+        let (mut top, mut pulled) = (None, vec![None; NLEAF / k]);
+        // Nodes of the current level; `None` inside another region's subtree.
+        let mut cur: Vec<Option<Node>> = (0..NLEAF)
+            .map(|l| (l / k == r).then(|| node(&leaves[l - r * k])))
+            .collect();
+        for lvl in 0..=height {
+            if lvl > 0 {
+                let mut next = Vec::with_capacity(cur.len() / 2);
+                for pair in cur.chunks(2) {
+                    let (Some(a), Some(b)) = (pair[0], pair[1]) else {
+                        next.push(None);
+                        continue;
+                    };
+                    let dst = if lvl == height { node(&root) } else { alloc()? };
+                    let add = Add { dst, a, b };
+                    if lvl <= h { &mut own } else { &mut upper }.push(add);
+                    next.push(Some(dst));
+                }
+                cur = next;
+            }
+            if lvl == h {
+                top = cur[r];
+                for (o, c) in cur.iter_mut().enumerate() {
+                    if o != r {
+                        let p = alloc()?;
+                        (*c, pulled[o]) = (Some(p), Some(p));
+                    }
+                }
+            }
+        }
+        Ok(Self {
+            _nodes: nodes,
+            own,
+            upper,
+            top: top.expect("a region holds its subtree root"),
+            pulled,
+            root,
+        })
+    }
 }
 
 /// A region's side of the halo exchange: it packs what others read of its tiles into `send`
@@ -478,6 +577,8 @@ struct State {
     /// Per own leaf, when the probe updates.
     leaf_sums: Vec<UpdateSums>,
     tree: Option<Tree>,
+    /// Every region's `max_bits` word, the others' pulled.
+    maxes: DeviceBuffer<u32>,
     gmax: DeviceBuffer<u32>,
     links: Option<Links>,
 }
@@ -503,8 +604,18 @@ impl State {
         let ranges: Vec<Range<u32>> = rp.stacks.iter().map(|s| s.frames.clone()).collect();
         let nk = plan.stack * rp.dims.nmode as usize;
         let zeroed = |len| DeviceBuffer::zeroed(stream, len);
-        let probe_sums = plan.probe_inertia.is_some();
         let np = plan.np();
+        let leaf_sums: Vec<UpdateSums> = (0..if plan.probe_inertia.is_some() {
+            plan.k
+        } else {
+            0
+        })
+            .map(|_| UpdateSums::zeroed(stream, np))
+            .collect::<Result<_, _>>()?;
+        let tree = plan
+            .probe_inertia
+            .map(|_| Tree::new(stream, gpu.region(), plan.k, np, &leaf_sums))
+            .transpose()?;
         let obj = DeviceBuffer::from_host(stream, &data.object)?;
         let halo = {
             let r = gpu.region();
@@ -541,20 +652,9 @@ impl State {
                 .obj_inertia
                 .map(|_| UpdateSums::zeroed(stream, data.object.len()))
                 .transpose()?,
-            leaf_sums: (0..if probe_sums { plan.k } else { 0 })
-                .map(|_| UpdateSums::zeroed(stream, np))
-                .collect::<Result<_, _>>()?,
-            tree: probe_sums
-                .then(|| -> Result<Tree, DistError> {
-                    let node = || -> Result<_, DistError> {
-                        Ok((zeroed(np)?, DeviceBuffer::zeroed(stream, np)?))
-                    };
-                    Ok(Tree {
-                        node: [node()?, node()?],
-                        root: UpdateSums::zeroed(stream, np)?,
-                    })
-                })
-                .transpose()?,
+            leaf_sums,
+            tree,
+            maxes: DeviceBuffer::zeroed(stream, gpu.nregion())?,
             gmax: DeviceBuffer::zeroed(stream, 1)?,
             links: None,
         })
@@ -570,12 +670,56 @@ impl State {
                 .obj_sums
                 .as_ref()
                 .map_or(0, |s| s.max_bits.cu_deviceptr()),
-            leaf: self
-                .leaf_sums
-                .iter()
-                .map(|s| (s.num.cu_deviceptr(), s.den.cu_deviceptr()))
-                .collect(),
+            tree_top: self.tree.as_ref().map(|t| t.top),
         }
+    }
+
+    /// Region `r`'s exchange with the regions exposing `ptrs`.
+    fn links(&self, gpu: &Gpu, plan: &Plan, ptrs: &[Ptrs]) -> Result<Links, DistError> {
+        let (r, s) = (gpu.region(), gpu.stream());
+        let others = || ptrs.iter().enumerate().filter(move |(o, _)| *o != r);
+        let np = plan.np();
+        let tree = match &self.tree {
+            Some(t) => others()
+                .flat_map(|(o, p)| {
+                    let (dst, src) = (t.pulled[o].expect("pulled"), p.tree_top.expect("top"));
+                    [
+                        (dst.0, src.0, np * size_of::<C32>()),
+                        (dst.1, src.1, np * 4),
+                    ]
+                    .map(|(dst, src, bytes)| Pull {
+                        dst,
+                        src,
+                        bytes,
+                        from: p.ctx.clone(),
+                    })
+                })
+                .collect(),
+            None => Vec::new(),
+        };
+        let word = |o: usize| self.maxes.cu_deviceptr() + 4 * o as u64;
+        let max = others()
+            .map(|(o, p)| Pull {
+                dst: word(o),
+                src: p.max_bits,
+                bytes: 4,
+                from: p.ctx.clone(),
+            })
+            .collect();
+        let max_srcs: Vec<u64> = (0..ptrs.len())
+            .map(|o| if o == r { ptrs[r].max_bits } else { word(o) })
+            .collect();
+        Ok(Links {
+            gather: Runs::new(s, &plan.gather(r, ptrs))?,
+            halo: plan.halo_pulls(r, ptrs),
+            tree,
+            max: if self.obj_sums.is_some() {
+                max
+            } else {
+                Vec::new()
+            },
+            max_srcs: DeviceBuffer::from_host(s, &max_srcs)?,
+        })
     }
 
     /// One AP cycle; with `due`, the LLK partials of the own frames as `(global frame, sums)`.
@@ -604,6 +748,7 @@ impl State {
             obj_sums,
             leaf_sums,
             tree,
+            maxes: _,
             gmax,
             links,
         } = self;
@@ -632,9 +777,16 @@ impl State {
                 k.psi_to_probe(&ctx, views, at, psi, obj, sums)?;
             }
         }
+        if let Some(t) = tree.as_ref() {
+            for a in &t.own {
+                // SAFETY: the own subtree's nodes are local, its leaves written above.
+                unsafe { a.run(ex, &stream, np)? };
+            }
+        }
         gpu.fence()?;
 
-        // B: foreign exit waves, object sums and their max, probe pair tree.
+        // B: foreign exit waves, object sums and their max, probe pair tree above the
+        // subtree roots.
         if let Some(sums) = obj_sums.as_mut() {
             // SAFETY: the runs address live exit-wave stacks, written before the fence and
             // rewritten by their owners only after the next.
@@ -644,30 +796,26 @@ impl State {
             }
             k.obj_den_max(&ctx, views, sums)?;
         }
-        if let Some(t) = tree.as_mut() {
-            let l = &links.leaf;
-            let [(n0, d0), (n1, d1)] = &mut t.node;
-            let (nn, nd) = (2 * np, np);
-            // SAFETY: every leaf buffer holds the probe's `np` sums, written before the fence
-            // and zeroed by its owner only after the next; the nodes and root are local.
+        if let Some(t) = tree.as_ref() {
+            // SAFETY: each pull reads an owner's subtree root, added before the fence and
+            // rewritten only after the third; the pulled copies and the upper nodes are local.
             unsafe {
-                ex.add_f32(&stream, n0.cu_deviceptr(), l[0].0, l[1].0, nn)?;
-                ex.add_f32(&stream, d0.cu_deviceptr(), l[0].1, l[1].1, nd)?;
-                ex.add_f32(&stream, n1.cu_deviceptr(), l[2].0, l[3].0, nn)?;
-                ex.add_f32(&stream, d1.cu_deviceptr(), l[2].1, l[3].1, nd)?;
-                let root = &t.root;
-                let (rn, rd) = (root.num.cu_deviceptr(), root.den.cu_deviceptr());
-                ex.add_f32(&stream, rn, n0.cu_deviceptr(), n1.cu_deviceptr(), nn)?;
-                ex.add_f32(&stream, rd, d0.cu_deviceptr(), d1.cu_deviceptr(), nd)?;
+                exchange::pull(&stream, &links.tree)?;
+                for a in &t.upper {
+                    a.run(ex, &stream, np)?;
+                }
             }
         }
         gpu.fence()?;
 
         // C: updates.
         if let (Some(sums), Some(inertia)) = (obj_sums.as_mut(), plan.obj_inertia) {
-            // SAFETY: every source is a region's `max_bits` word, written before the fence and
-            // rewritten only after the next.
-            unsafe { ex.max_u32(&stream, gmax.cu_deviceptr(), &links.max_srcs)? };
+            // SAFETY: each pull reads a region's `max_bits` word, written before the fence and
+            // rewritten only after the next; every source of the max is then local.
+            unsafe {
+                exchange::pull(&stream, &links.max)?;
+                ex.max_u32(&stream, gmax.cu_deviceptr(), &links.max_srcs)?;
+            }
             k.normalize_obj(&ctx, views, obj, sums, gmax, inertia)?;
             // SAFETY: the runs address this region's object and send buffer, which its peers
             // last pulled before this cycle's first fence.
@@ -752,27 +900,10 @@ impl DistAp {
         });
         let p = plan.clone();
         let workers = Workers::spawn(ordinals, move |gpu| State::new(gpu, &p, &data))?;
-        let ptrs = workers.run(|_, st| Ok(st.ptrs()))?;
-        let links: Vec<_> = (0..ordinals.len())
-            .map(|r| {
-                let leaf = std::array::from_fn(|l| {
-                    let o = l / plan.k;
-                    ptrs[o].leaf.get(l - o * plan.k).copied().unwrap_or((0, 0))
-                });
-                (plan.gather(r, &ptrs), plan.halo_pulls(r, &ptrs), leaf)
-            })
-            .collect();
-        let max_srcs: Vec<u64> = ptrs.iter().map(|p| p.max_bits).collect();
-        let links = Arc::new(links);
+        let ptrs = Arc::new(workers.run(|_, st| Ok(st.ptrs()))?);
+        let p = plan.clone();
         workers.run(move |gpu, st| {
-            let (gather, halo, leaf) = &links[gpu.region()];
-            let s = gpu.stream();
-            st.links = Some(Links {
-                gather: Runs::new(s, gather)?,
-                halo: halo.clone(),
-                max_srcs: DeviceBuffer::from_host(s, &max_srcs)?,
-                leaf: *leaf,
-            });
+            st.links = Some(st.links(gpu, &p, &ptrs)?);
             Ok(())
         })?;
         Ok(Self {
