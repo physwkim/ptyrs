@@ -1,10 +1,18 @@
 //! The M5 clock (DESIGN.md §7 M5, §0 condition 4): from the scan's end, the
 //! arrival of its last frame ([`SourceStats::scan_end`]), to the first live
 //! object that matches the offline run of the same algorithm on the same
-//! frames in Fourier ring correlation.
+//! frames in Fourier ring correlation over the scanned region.
+//!
+//! The region is the bounding box of the window centres, from the scan
+//! positions alone. Outside it pixels are lit only by the probe's edges,
+//! which constrain them in neither run: on a 6×6 raster landed in batches,
+//! the live object holds the whole array's outer rings at 0.95 against the
+//! offline one, the scanned region's at 0.992. [`Clock::whole`] gives the
+//! whole array's figure, to report beside the clock.
 //!
 //! [`SourceStats::scan_end`]: crate::pipeline::SourceStats::scan_end
 
+use std::ops::Range;
 use std::time::Duration;
 
 use ptyrs_core::frc::Frc;
@@ -21,22 +29,44 @@ pub const MATCH: f64 = 0.99;
 /// One scan's clock, started at its end.
 pub struct Clock {
     offline: Vec<C64>,
+    /// `offline` over the region.
+    cropped: Vec<C64>,
     shape: [usize; 2],
+    region: [Range<usize>; 2],
     scan_end: i64,
 }
 
 impl Clock {
-    /// Against `offline`, the offline run's object, `[ny, nx]` row-major.
+    /// Against `offline`, the offline run's object, `[ny, nx]` = `shape`
+    /// row-major, compared over the rows and columns of `region`.
     /// `earlier`, a snapshot of that run some iterations before, must match
     /// it to [`MATCH`] in every ring: a run still moving is no reference.
     /// `scan_end` is wall ns, as frame arrivals are.
     pub fn new(
-        offline: Vec<C64>,
+        offline: &[C64],
         earlier: &[C64],
         shape: [usize; 2],
+        region: [Range<usize>; 2],
         scan_end: i64,
     ) -> Result<Self, CoreError> {
-        let f = Frc::compute(&offline, earlier, shape)?;
+        if region
+            .iter()
+            .zip(shape)
+            .any(|(r, n)| r.is_empty() || r.end > n)
+        {
+            return Err(CoreError::Invalid(format!(
+                "region {region:?} is empty or leaves the {shape:?} object"
+            )));
+        }
+        let clock = Self {
+            offline: offline.to_vec(),
+            cropped: Vec::new(),
+            shape,
+            region,
+            scan_end,
+        };
+        let cropped = clock.crop(offline)?;
+        let f = Frc::compute(&cropped, &clock.crop(earlier)?, clock.region_shape())?;
         if let Some(r) = below(&f) {
             return Err(CoreError::Invalid(format!(
                 "the offline run is still moving: ring {r} of {} at FRC {:.4} against its \
@@ -45,23 +75,48 @@ impl Clock {
                 f.rings[r].frc
             )));
         }
-        Ok(Self {
-            offline,
-            shape,
-            scan_end,
-        })
+        Ok(Self { cropped, ..clock })
     }
 
     /// Time from the scan's end to `taken` (wall ns) if the live object
-    /// taken then matches the offline one to [`MATCH`] in every ring; `None`
-    /// below that or before the end, when frames are still missing. The
-    /// first snapshot with a time is the converged one.
+    /// taken then, of the offline one's shape, matches it to [`MATCH`] in
+    /// every ring; `None` below that or before the end, when frames are
+    /// still missing. The first snapshot with a time is the converged one.
     pub fn check(&self, live: &[C64], taken: i64) -> Result<Option<Duration>, CoreError> {
         let Ok(after) = u64::try_from(taken - self.scan_end) else {
             return Ok(None);
         };
-        let f = Frc::compute(&self.offline, live, self.shape)?;
+        let f = Frc::compute(&self.cropped, &self.crop(live)?, self.region_shape())?;
         Ok(below(&f).is_none().then(|| Duration::from_nanos(after)))
+    }
+
+    /// The lowest ring's FRC of `live` against the offline object over the
+    /// whole array, region or not.
+    pub fn whole(&self, live: &[C64]) -> Result<f64, CoreError> {
+        let f = Frc::compute(&self.offline, live, self.shape)?;
+        Ok(f.rings.iter().map(|r| r.frc).fold(f64::INFINITY, f64::min))
+    }
+
+    /// The region's pixels of an object of the clock's shape.
+    fn crop(&self, obj: &[C64]) -> Result<Vec<C64>, CoreError> {
+        let [ny, nx] = self.shape;
+        if obj.len() != ny * nx {
+            return Err(CoreError::Invalid(format!(
+                "{} pixels for a {:?} object",
+                obj.len(),
+                self.shape
+            )));
+        }
+        let [rows, cols] = &self.region;
+        Ok(rows
+            .clone()
+            .flat_map(|y| &obj[y * nx..][cols.clone()])
+            .copied()
+            .collect())
+    }
+
+    fn region_shape(&self) -> [usize; 2] {
+        self.region.clone().map(|r| r.len())
     }
 }
 
@@ -77,6 +132,7 @@ mod tests {
     use super::*;
 
     const SHAPE: [usize; 2] = [64, 64];
+    const ALL: [Range<usize>; 2] = [0..64, 0..64];
 
     /// White complex noise: every ring holds the same power.
     fn noise(seed: u64) -> Vec<C64> {
@@ -101,7 +157,7 @@ mod tests {
     fn a_live_object_converges_once_every_ring_matches_after_the_scan_end() {
         let offline = noise(1);
         let earlier = plus(&offline, 0.02, 2);
-        let clock = Clock::new(offline.clone(), &earlier, SHAPE, 1_000).unwrap();
+        let clock = Clock::new(&offline, &earlier, SHAPE, ALL, 1_000).unwrap();
         let rot = C64::from_polar(1.0, 0.7);
         let close: Vec<C64> = plus(&offline, 0.05, 3).iter().map(|z| z * rot).collect();
         let far = plus(&offline, 0.5, 4);
@@ -123,10 +179,51 @@ mod tests {
     fn an_offline_run_still_moving_is_no_reference() {
         let offline = noise(1);
         let earlier = plus(&offline, 0.5, 5);
-        let err = Clock::new(offline, &earlier, SHAPE, 0).err().unwrap();
+        let err = Clock::new(&offline, &earlier, SHAPE, ALL, 0).err().unwrap();
         assert!(
             matches!(&err, CoreError::Invalid(m) if m.contains("still moving")),
             "{err}"
         );
+    }
+
+    /// `b` inside rows and columns 16..48, `a` outside.
+    fn inside(a: &[C64], b: &[C64]) -> Vec<C64> {
+        let core = 16..48;
+        (0..SHAPE[0] * SHAPE[1])
+            .map(|i| {
+                let (y, x) = (i / SHAPE[1], i % SHAPE[1]);
+                if core.contains(&y) && core.contains(&x) {
+                    b[i]
+                } else {
+                    a[i]
+                }
+            })
+            .collect()
+    }
+
+    /// Over the region 16..48 the clock sees only its pixels: an offline run
+    /// still moving outside it is settled, and a live object 0.5 away
+    /// outside it converges, while [`Clock::whole`] shows the gap. A region
+    /// that is empty or leaves the object, or an object of another size, is
+    /// refused.
+    #[test]
+    fn only_the_region_counts_and_the_whole_array_is_reported_beside_it() {
+        let offline = noise(1);
+        let region = [16..48, 16..48];
+        let far = plus(&offline, 0.5, 6);
+        let earlier = inside(&far, &offline);
+        let clock = Clock::new(&offline, &earlier, SHAPE, region.clone(), 0).unwrap();
+        let live = inside(&far, &plus(&offline, 0.05, 7));
+        assert_eq!(
+            clock.check(&live, 10).unwrap(),
+            Some(Duration::from_nanos(10))
+        );
+        assert!(clock.whole(&live).unwrap() < MATCH);
+        assert!(clock.whole(&offline).unwrap() > 0.999_999);
+        assert_eq!(clock.check(&inside(&live, &far), 10).unwrap(), None);
+        assert!(clock.check(&live[1..], 10).is_err());
+        for bad in [[16..48, 16..65], [16..16, 16..48]] {
+            assert!(Clock::new(&offline, &offline, SHAPE, bad, 0).is_err());
+        }
     }
 }
