@@ -9,7 +9,7 @@
 use ptyrs_core::{AddrTable, C64, Object, Probe, Stack, View};
 
 use crate::ops::{accumulate_obj, accumulate_probe, obj_probe_to_psi};
-use crate::{Cost, Fft2, Observed};
+use crate::{Cost, Fft2, Observed, random_batches};
 
 /// pty-chi's offsets: on `√icalc` in the Gaussian residual, on `icalc` in the Poisson
 /// residual and in the Poisson `xi`.
@@ -22,16 +22,17 @@ const LAMBDA0: f64 = 1.2e-7;
 /// LSQML parameters.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LsqmlParams {
-    /// Frames per batch, consecutive in scan order, capped at the scan's frame count.
+    /// Frames per batch, capped at the scan's frame count.
     pub batch_size: usize,
     pub cost: Cost,
+    /// The seed of every epoch's [`random_batches`].
+    pub seed: u64,
 }
 
-/// One batch's step sizes, per frame of the batch in scan order.
+/// One batch's step sizes, per frame of the batch in its order.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LsqmlStep {
-    pub first: usize,
-    pub count: usize,
+    pub frames: Vec<usize>,
     /// pty-chi `alpha_psi_far`: the far-field step of the exit-wave update.
     pub a_far: Vec<f64>,
     /// Object and probe step sizes from the 2×2 systems; the object moves by their trimmed
@@ -44,7 +45,7 @@ pub struct LsqmlStep {
 /// field of [`obj_probe_to_psi`], `icalc = Σ_m |psi_m|²` and `c` the cost's residual
 /// (Gaussian `2(1 − √iobs/(√icalc + 1e-9))`, Poisson `1 − iobs/(icalc + 1e-6)`, 0 where
 /// masked), the exit-wave update is `chi_m = F⁻¹(−a_far·c·psi_m)`. `views` are whole frames of
-/// an [`AddrTable`] in its order.
+/// an [`AddrTable`], each frame's views in its order.
 pub struct LsqmlBatch<'a> {
     views: &'a [View],
     quad: &'a [C64],
@@ -283,6 +284,10 @@ pub fn lsqml_step(
     let (d_obj, d_probe) = (Object::new(d_obj), Probe::new(b.probe_direction()));
     let [a_obj, a_probe] = b.step_sizes(&d_obj, &d_probe);
     let a_far = b.a_far().to_vec();
+    let frames = views
+        .chunks_exact(b.nmode)
+        .map(|v| v[0].frame as usize)
+        .collect();
     let (so, sp) = (
         trim_mean(&a_obj),
         a_probe.iter().sum::<f64>() / a_probe.len() as f64,
@@ -294,8 +299,7 @@ pub fn lsqml_step(
         x.iter_mut().zip(d).for_each(|(x, d)| *x += s * d);
     }
     LsqmlStep {
-        first: views[0].frame as usize,
-        count: a_far.len(),
+        frames,
         a_far,
         a_obj,
         a_probe,
@@ -325,16 +329,18 @@ impl Lsqml {
         self.preconditioner.as_ref()
     }
 
-    /// One epoch of [`lsqml_step`] over consecutive batches of `addr`'s frames in scan order.
-    /// The preconditioner is updated first, on pty-chi's schedule with the probe optimised
-    /// from epoch 0 (`Object.update_preconditioner`, epochs 0–9 and every tenth): `pre =
-    /// (pre + I)/2` with `I` the [`illumination`] of every view, starting from `I` of the probe
-    /// PtychoShelves renormalises from the data, `I·max_f Σ iobs_f / (4·(ny·nx)²)` in the
-    /// engine's units.
+    /// One epoch of [`lsqml_step`] over [`random_batches`] of `addr`'s frames, from the
+    /// params' seed and this epoch's index. The preconditioner is updated first, on pty-chi's
+    /// schedule with the probe optimised from epoch 0 (`Object.update_preconditioner`, epochs
+    /// 0–9 and every tenth): `pre = (pre + I)/2` with `I` the [`illumination`] of every view,
+    /// starting from `I` of the probe PtychoShelves renormalises from the data,
+    /// `I·max_f Σ iobs_f / (4·(ny·nx)²)` in the engine's units.
     ///
-    /// Departures from a pty-chi epoch: batches are consecutive (pty-chi's default draws them
-    /// at random); the first epoch updates the object and probe (pty-chi's default only
-    /// rescales the probe); no Poisson `a_far` jitter; no post-epoch hook.
+    /// The start is the caller's object and probe, rescaled as for every algorithm by
+    /// [`crate::Ptycho::scale_obj_probe`]. Departures from a pty-chi epoch: the batches come from
+    /// [`random_batches`]' generator, not torch's, each in scan order; the first epoch updates
+    /// the object and probe (pty-chi's default only rescales the probe); no Poisson `a_far`
+    /// jitter; no post-epoch hook.
     pub fn epoch(
         &mut self,
         addr: &AddrTable,
@@ -365,15 +371,19 @@ impl Lsqml {
                 .collect();
             self.preconditioner = Some(Stack::from_vec(illum.dims(), data).unwrap());
         }
+        let epoch = self.epochs as u64;
         self.epochs += 1;
         let pre = self.preconditioner.as_ref().unwrap();
         let size = self.params.batch_size.min(nframe);
-        (0..nframe)
-            .step_by(size)
-            .map(|first| {
-                let count = size.min(nframe - first);
-                let views = &addr.views()[first * nmode..(first + count) * nmode];
-                lsqml_step(self.params.cost, views, obs, quad, pre, object, probe)
+        random_batches(nframe, size, self.params.seed, epoch)
+            .iter()
+            .map(|frames| {
+                let views: Vec<View> = frames
+                    .iter()
+                    .flat_map(|&f| &addr.views()[f * nmode..(f + 1) * nmode])
+                    .copied()
+                    .collect();
+                lsqml_step(self.params.cost, &views, obs, quad, pre, object, probe)
             })
             .collect()
     }

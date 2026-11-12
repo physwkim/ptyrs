@@ -9,6 +9,7 @@ use std::ops::Range;
 use ptyrs_core::{C64, Object, Probe, Stack, View};
 use ptyrs_engine::{
     Cost, Fft2, Lsqml, LsqmlBatch, LsqmlParams, Ptycho, illumination, lsqml_step, obj_probe_to_psi,
+    random_batches,
 };
 
 mod common;
@@ -183,7 +184,7 @@ fn assert_ref(cost: Cost, obj: &str, probe: &str, steps: &str) {
         &mut object,
         &mut pr,
     );
-    assert_eq!((s.first, s.count), (FRAMES.start, FRAMES.len()));
+    assert_eq!(s.frames, FRAMES.collect::<Vec<_>>());
     let rows = table(steps);
     assert_eq!(rows.len(), FRAMES.len());
     for (k, r) in rows.iter().enumerate() {
@@ -236,7 +237,8 @@ fn poisson_step_matches_lsqml_ref() {
 
 /// [`Lsqml::epoch`] over 12 epochs of two batches: the preconditioner starts from the
 /// renormalised probe's illumination, averages in the epoch's illumination at epochs 0–10 and
-/// stays at epoch 11, and every step is [`lsqml_step`] with it.
+/// stays at epoch 11, and every step is [`lsqml_step`] with it on the epoch's
+/// [`random_batches`].
 #[test]
 fn epoch_follows_ptychi_preconditioner_schedule() {
     let p = state();
@@ -244,6 +246,7 @@ fn epoch_follows_ptychi_preconditioner_schedule() {
     let mut lsqml = Lsqml::new(LsqmlParams {
         batch_size: 20,
         cost: Cost::Poisson,
+        seed: 7,
     });
     assert!(lsqml.preconditioner().is_none());
     let (mut object, mut pr) = (p.object().clone(), p.probe().clone());
@@ -273,20 +276,19 @@ fn epoch_follows_ptychi_preconditioner_schedule() {
         let steps = lsqml.epoch(addr, obs, quad, &mut object, &mut pr);
         let pre = lsqml.preconditioner().unwrap();
         assert_eq!(pre.as_slice(), &next[..], "epoch {e}");
+        let batches = random_batches(40, 20, 7, e);
         assert_eq!(
-            steps.iter().map(|s| (s.first, s.count)).collect::<Vec<_>>(),
-            [(0, 20), (20, 20)]
+            steps.iter().map(|s| &s.frames).collect::<Vec<_>>(),
+            batches.iter().collect::<Vec<_>>(),
+            "epoch {e}"
         );
-        for (s, frames) in steps.iter().zip([0..20, 20..40]) {
-            let r = lsqml_step(
-                Cost::Poisson,
-                batch(&p, frames),
-                obs,
-                quad,
-                pre,
-                &mut o2,
-                &mut p2,
-            );
+        for (s, frames) in steps.iter().zip(&batches) {
+            let views: Vec<View> = frames
+                .iter()
+                .flat_map(|&f| batch(&p, f..f + 1))
+                .copied()
+                .collect();
+            let r = lsqml_step(Cost::Poisson, &views, obs, quad, pre, &mut o2, &mut p2);
             assert_eq!(&r, s, "epoch {e}");
         }
         assert_eq!(o2.as_slice(), object.as_slice(), "epoch {e}");
