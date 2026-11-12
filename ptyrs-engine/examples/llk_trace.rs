@@ -10,7 +10,7 @@
 //! updates object and probe from the end of `ML_WARMUP` AP cycles, which `init.h5` holds.
 //! rPIE also writes
 //! `views.txt` (object window corner `oy ox` per frame), `quad.txt` (`re im` of the quadratic
-//! phase, natural order), which pty-chi has no notion of, and `rpie.txt` (`common::RPIE`,
+//! phase, natural order), which pty-chi has no notion of, and `rpie.txt` (`ptychi::RPIE`,
 //! step 0 for a fixed array).
 
 use std::fmt::Write as _;
@@ -24,6 +24,8 @@ use ptyrs_engine::{
 
 #[path = "../tests/common/mod.rs"]
 mod common;
+#[path = "../tests/ptychi/mod.rs"]
+mod ptychi;
 
 /// AP updates the probe too, so both halves of `psi_to_obj_probe` are compared.
 const AP: ApParams = ApParams {
@@ -43,7 +45,7 @@ const ML: MlParams = MlParams {
 /// AP cycles before ML, whose end is ML's `init.h5`.
 const ML_WARMUP: usize = 20;
 
-const RPIE: RpieParams = common::RPIE;
+const RPIE: RpieParams = ptychi::RPIE;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let usage = "usage: llk_trace <out_dir> <dm|ap|ml|rpie> [ncycle] [nprobe] [frame] [npos] [step] [--gpu]";

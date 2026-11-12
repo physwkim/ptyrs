@@ -2,19 +2,6 @@
 //! PyNX and pty-chi values in `tests/data` stay reproducible from the example.
 
 use ptyrs_core::{C64, Geometry, Object, Positions, Probe, Scan, Stack, required_obj_shape};
-use ptyrs_engine::RpieParams;
-
-/// rPIE parameters of the pty-chi comparison. Alpha below 1 keeps the `(1 − α)|·|²` term of
-/// both step denominators in play; batches of 4 sum overlapping updates and still converge
-/// (10 diverge on the 64-pixel scan, on both sides).
-pub const RPIE: RpieParams = RpieParams {
-    obj_step: Some(1.0),
-    probe_step: Some(1.0),
-    obj_alpha: 0.5,
-    probe_alpha: 0.5,
-    batch_size: 4,
-    calc_llk: 1,
-};
 
 /// A simulated scan (`npos` Fermat positions `step` object pixels apart, `photons` per frame,
 /// seed 1, no mask) and its starting object and probe, before `scale_obj_probe`. The probe's

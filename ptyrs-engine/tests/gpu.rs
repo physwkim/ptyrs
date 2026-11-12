@@ -12,6 +12,7 @@ use ptyrs_engine::{
 };
 
 mod common;
+mod ptychi;
 
 /// 30 positions: stacks of 7 and batches of 4 both leave a shorter last one. Three LLK
 /// slots: the ring wraps within every LLK-taking call.
@@ -186,7 +187,7 @@ fn rpie_matches_cpu() {
         let params = RpieParams {
             obj_step: o.map(|_| 1.0),
             probe_step: p.map(|_| 1.0),
-            ..common::RPIE
+            ..ptychi::RPIE
         };
         check(
             compare(M1, 2, true, Params::Rpie(params), 10),
@@ -262,7 +263,7 @@ fn switches_match_cpu(setup: Setup) {
     let mut gpu = GpuPtycho::new(&ctx(), &scan, object, probe, setup.options).unwrap();
     let (o, p) = UPDATES[2];
     let steps = [
-        Params::Rpie(common::RPIE),
+        Params::Rpie(ptychi::RPIE),
         Params::Ap(ApParams {
             obj_inertia: o,
             probe_inertia: p,
@@ -275,10 +276,10 @@ fn switches_match_cpu(setup: Setup) {
             calc_llk: 1,
             ..DmParams::default()
         }),
-        Params::Rpie(common::RPIE),
+        Params::Rpie(ptychi::RPIE),
         Params::Rpie(RpieParams {
             batch_size: 3,
-            ..common::RPIE
+            ..ptychi::RPIE
         }),
     ];
     for params in steps {
@@ -326,7 +327,7 @@ fn gpu_rejects_what_it_cannot_run() {
         C64::new(1.0, 0.0),
     ));
     let mut g = GpuPtycho::new(&ctx(), &scan, two, probe.clone(), M1.options).unwrap();
-    assert!(g.rpie(&common::RPIE, 1).is_err());
+    assert!(g.rpie(&ptychi::RPIE, 1).is_err());
     let zero = GpuOptions {
         stack_size: 0,
         ..M1.options
@@ -374,7 +375,7 @@ fn graph_like_eager(setup: Setup) {
         };
         let rpie = RpieParams {
             calc_llk: 3,
-            ..common::RPIE
+            ..ptychi::RPIE
         };
         // new capture, new parameters, new algorithm, the same graph in a second call
         g.dm(&dm, 7).unwrap();

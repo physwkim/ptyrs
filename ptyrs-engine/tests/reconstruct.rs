@@ -4,6 +4,7 @@ use ptyrs_engine::{
 };
 
 mod common;
+mod ptychi;
 
 const PHOTONS: f64 = 1e5;
 
@@ -188,7 +189,7 @@ fn dm_llk_matches_pynx() {
 #[test]
 fn rpie_llk_matches_ptychi() {
     let mut p = parity_start();
-    p.rpie(&common::RPIE, 20).unwrap();
+    p.rpie(&ptychi::RPIE, 20).unwrap();
     assert_history_matches(&p, include_str!("data/rpie_ptychi_f64.txt"));
 }
 
