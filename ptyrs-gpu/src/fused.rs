@@ -218,10 +218,12 @@ pub struct FusedBufs {
 
 /// [`FusedBufs`]' scratch of the position model.
 struct ShiftScratch {
-    /// `T`, then `X`, then `G` of the shift passes, `[nf_max * nprobe, ny, nx]`.
+    /// `T` of the shift passes, `[nf_max * nprobe, ny, nx]`.
     t: DeviceBuffer<C32>,
     /// `T_y`, as `t`.
     t_dy: DeviceBuffer<C32>,
+    /// `X`, then `G`, of the probe adjoint, as `t`.
+    adj: DeviceBuffer<C32>,
     /// `[nf_max * nobj, ny, nx]`.
     obj: DeviceBuffer<C32>,
     /// `[nf_max, ny, nx]`.
@@ -237,6 +239,7 @@ impl ShiftScratch {
         let (n, nf) = (d.n(), g.nf_max as usize);
         check_len("shift", &self.t, nf * d.nprobe as usize * n)?;
         check_len("shift_dy", &self.t_dy, nf * d.nprobe as usize * n)?;
+        check_len("shift_adj", &self.adj, nf * d.nprobe as usize * n)?;
         check_len("shift_obj", &self.obj, nf * d.nobj as usize * n)?;
         check_len("shift_power", &self.power, nf * n)?;
         let ngroup = nf * (g.ny / sh.rows) as usize;
@@ -265,7 +268,7 @@ impl FusedBufs {
         })
     }
 
-    /// [`Self::new`] with the scratch of a [`Model::shift`]: `(2 nprobe + nobj) nf_max`
+    /// [`Self::new`] with the scratch of a [`Model::shift`]: `(3 nprobe + nobj) nf_max`
     /// complex frames more, and `nf_max` real ones.
     pub fn with_shift(stream: &CudaStream, dims: &ViewDims, nf_max: u32) -> Result<Self, Error> {
         let mut bufs = Self::new(stream, dims, nf_max)?;
@@ -276,6 +279,7 @@ impl FusedBufs {
         bufs.shift = Some(ShiftScratch {
             t: DeviceBuffer::zeroed(stream, nf * dims.nprobe as usize * n)?,
             t_dy: DeviceBuffer::zeroed(stream, nf * dims.nprobe as usize * n)?,
+            adj: DeviceBuffer::zeroed(stream, nf * dims.nprobe as usize * n)?,
             obj: DeviceBuffer::zeroed(stream, nf * dims.nobj as usize * n)?,
             power: DeviceBuffer::zeroed(stream, nf * n)?,
             grad_groups: DeviceBuffer::zeroed(stream, ngroup)?,
@@ -983,6 +987,7 @@ impl<'a> Run<'a> {
             }),
             shift: scratch(|b| dptr(&b.t)),
             shift_dy: scratch(|b| dptr(&b.t_dy)),
+            shift_adj: scratch(|b| dptr(&b.adj)),
             shift_obj: scratch(|b| dptr(&b.obj)),
             shift_power: scratch(|b| dptr(&b.power)),
             shift_grad: groups(|b| dptr(&b.grad_groups)),
@@ -1370,10 +1375,9 @@ impl<'a> Run<'a> {
             _ => writes.push(bufs.work.storage()),
         }
         let s = sh.scratch;
+        reads.push(s.t.storage());
         if f & FUSED_SHIFT_PROBE != 0 {
-            writes.push(s.t.storage());
-        } else {
-            reads.push(s.t.storage());
+            writes.push(s.adj.storage());
         }
         if f & FUSED_SHIFT_OBJ != 0 {
             writes.extend([s.obj.storage(), s.power.storage()]);
@@ -1419,7 +1423,7 @@ impl<'a> Run<'a> {
     fn shift_post(&self, sh: &Shifted<'_>, p: FusedPtrs) -> Result<(), Error> {
         let config = self.sh.shift_cols(self.g.nprobe, self.g.nf_max)?;
         let reads = [sh.model.offsets.storage(), self.stack.storage()];
-        let writes = [sh.scratch.t.storage()];
+        let writes = [sh.scratch.adj.storage()];
         let (ctl, g) = (self.ctl(), self.g);
         self.k.launch(self.ctx, &reads, &writes, |stream| {
             // SAFETY: as in `shift_pre`, and `shift_rows_inv` wrote `X` of this stack; the
@@ -1474,7 +1478,7 @@ impl<'a> Run<'a> {
     ) -> Result<(), Error> {
         let config = grid_1d(self.g.nprobe as usize * self.inputs.views.dims().n())?;
         let reads = [
-            sh.scratch.t.storage(),
+            sh.scratch.adj.storage(),
             self.inputs.views.addr().storage(),
             self.inputs.obj.storage(),
             self.stack.storage(),

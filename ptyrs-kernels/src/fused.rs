@@ -15,7 +15,7 @@
 //! writes the column half `T = IDFT_y(A e_f)` of the probe spectrum `A`, [`shift_rows_fwd`]
 //! and [`shift_rows_inv`] stand in for [`rows_fwd`] and [`rows_inv`] with `W = IDFT_x(T)` for
 //! `P q`, [`shift_rows_inv`] also taking the position partials, and [`shift_post`]
-//! column-FFTs the `X` that [`shift_rows_inv`] leaves in `T`'s place into the probe's `G`.
+//! column-FFTs the `X` that [`shift_rows_inv`] leaves in `shift_adj` into the probe's `G`.
 //! [`gather_shifted`] and [`shift_probe_sums`] then take the object and probe sums.
 //!
 //! Every pass assumes canonical views: view `f * nmode + m` multiplies probe mode
@@ -121,10 +121,12 @@ pub struct FusedPtrs {
     /// The probe spectra `A_p = DFT(stored(P_p q)) / n`, `[nprobe, ny, nx]`, FFT order.
     pub spectrum: *const f32,
     /// One plane per frame and probe mode, `fl * nprobe + p`, `[nf_max * nprobe, ny, nx]`:
-    /// `T`, then `X`, then `G` of the shift passes.
+    /// `T` of the shift passes.
     pub shift: *mut f32,
     /// `T_y` of the shift passes, as `shift`.
     pub shift_dy: *mut f32,
+    /// `X`, then `G`, of the probe adjoint, as `shift`.
+    pub shift_adj: *mut f32,
     /// `c = sum_p conj(W_p) psi_(o, p)` of each frame and object mode, `fl * nobj + o`,
     /// `[nf_max * nobj, ny, nx]`, origin at `[0, 0]`.
     pub shift_obj: *mut f32,
@@ -886,8 +888,8 @@ pub unsafe fn shift_pre<const NY: u32>(
 /// mode `p` outermost: `W_p` from the `T` row, then for each object mode `o` the new wave `x`
 /// of mode `o * nprobe + p` as [`rows_inv`] stores it (the DM add-back with `O W_p`). Under
 /// `FUSED_SHIFT_OBJ` `shift_power[fl] = sum_p |W_p|^2` and `shift_obj[fl * nobj + o] = sum_p
-/// conj(W_p) x`, both in ascending `p`. Under `FUSED_SHIFT_PROBE` the `T` row becomes `X =
-/// DFT_x(sum_o conj(O_o) x)`, `o` ascending. With the slopes `dW / dx = IDFT_x(T (-2 pi i
+/// conj(W_p) x`, both in ascending `p`. Under `FUSED_SHIFT_PROBE` `shift_adj`'s row gets `X
+/// = DFT_x(sum_o conj(O_o) x)`, `o` ascending. With the slopes `dW / dx = IDFT_x(T (-2 pi i
 /// freq(kx, nx)))` and `dW / dy = IDFT_x(T_y)`, under `FUSED_SHIFT_DEN` `shift_den[fl,
 /// blockIdx.x]` gets the block's `sum |O_o|^2 |dW_p / d_ax|^2` over its pixels, `o` and `p`,
 /// and under `FUSED_SHIFT_POSITION` `shift_grad[fl, blockIdx.x]` the block's `Re sum conj(x -
@@ -1016,24 +1018,53 @@ pub unsafe fn shift_rows_inv<const NX: u32>(
                     }
                 }
             }
+            let mut vn = [0.0f32; FFT_EPT as usize];
             if slopes {
-                // This thread's `sum vn |r|^2` and `sum Re conj(c) r` over a slope row `r`,
-                // `vn = sum_o |O_o|^2` and `c = acc - vn W` the correction's `sum_o conj(O_o)
-                // (x - O_o W)`.
+                for o in 0..nobj {
+                    let v = *p.views.add((k0 + o * g.nprobe + pm) as usize);
+                    #[unroll]
+                    for i in 0..FFT_EPT {
+                        let x = (t + i * tpf + nx / 2) % nx;
+                        let vo = sample_obj(p.obj, v, y, x, g.nyo, g.nxo);
+                        vn[i as usize] += vo.0 * vo.0 + vo.1 * vo.1;
+                    }
+                }
+            }
+            if position {
+                // `W` is dead past here: it becomes the correction `c = sum_o conj(O_o) (x -
+                // O_o W) = acc - vn W`, `vn = sum_o |O_o|^2`.
+                #[unroll]
+                for k in 0..2 * FFT_EPT as usize {
+                    w[k] = if grad {
+                        acc[k]
+                    } else {
+                        acc[k] - vn[k / 2] * w[k]
+                    };
+                }
+            }
+            if probe {
+                // `X` has its own plane, so `acc` is dead before the slope rows.
+                row_fft::<NX, false>(&mut acc, lane);
+                thread::sync_threads();
+                #[unroll]
+                for i in 0..FFT_EPT {
+                    let k = 2 * i as usize;
+                    store_c(
+                        p.shift_adj,
+                        trow + (t + i * tpf) as usize,
+                        (acc[k], acc[k + 1]),
+                    );
+                }
+            }
+            if slopes {
+                // This thread's `sum vn |r|^2` and `sum Re conj(c) r` over a slope row `r`.
                 let terms = |r: &[f32; 2 * FFT_EPT as usize]| {
                     let (mut d, mut q) = (0.0f32, 0.0f32);
                     #[unroll]
                     for i in 0..FFT_EPT {
                         let k = 2 * i as usize;
-                        let x = (t + i * tpf + nx / 2) % nx;
-                        let vn = obj_norm(p, g, k0 + pm, y, x);
-                        d += vn * (r[k] * r[k] + r[k + 1] * r[k + 1]);
-                        let c = if grad {
-                            (acc[k], acc[k + 1])
-                        } else {
-                            (acc[k] - vn * w[k], acc[k + 1] - vn * w[k + 1])
-                        };
-                        q += c.0 * r[k] + c.1 * r[k + 1];
+                        d += vn[i as usize] * (r[k] * r[k] + r[k + 1] * r[k + 1]);
+                        q += w[k] * r[k] + w[k + 1] * r[k + 1];
                     }
                     (d, q)
                 };
@@ -1063,17 +1094,6 @@ pub unsafe fn shift_rows_inv<const NX: u32>(
                 let (d, q) = terms(&r);
                 den_y += d;
                 pos_y += q;
-            }
-            if probe {
-                // Every read of the `T` row above is this thread's own elements, so `X` may
-                // overwrite them.
-                row_fft::<NX, false>(&mut acc, lane);
-                thread::sync_threads();
-                #[unroll]
-                for i in 0..FFT_EPT {
-                    let k = 2 * i as usize;
-                    store_c(p.shift, trow + (t + i * tpf) as usize, (acc[k], acc[k + 1]));
-                }
             }
         }
         if slopes {
@@ -1114,33 +1134,16 @@ pub unsafe fn shift_rows_inv<const NX: u32>(
     }
 }
 
-/// `sum_o |O_o|^2` at natural pixel `(y, x)`, `O_o` the object view `k + o * nprobe`
-/// samples.
-///
-/// # Safety
-///
-/// `obj` and `views` hold their shapes for `g` and view `k + (nobj - 1) * nprobe` exists.
-#[device]
-unsafe fn obj_norm(p: FusedPtrs, g: StackGeom, k: u32, y: u32, x: u32) -> f32 {
-    let mut vn = 0.0f32;
-    for o in 0..g.nmode / g.nprobe {
-        let v = unsafe { *p.views.add((k + o * g.nprobe) as usize) };
-        let vo = unsafe { sample_obj(p.obj, v, y, x, g.nyo, g.nxo) };
-        vn += vo.0 * vo.0 + vo.1 * vo.1;
-    }
-    vn
-}
-
 /// The column FFT of [`shift_rows_inv`]'s `X`: `H = DFT_y(X)` over `ys` for frame `fl =
 /// blockIdx.y`, probe mode `p`, and the plane becomes the probe adjoint's `G = conj(e_f) H`.
-/// Reads `offsets` and `shift`; writes `shift`.
+/// Reads `offsets` and `shift_adj`; writes `shift_adj`.
 ///
 /// Block and grid as [`shift_pre`]; dynamic shared memory `8 * ny` bytes of `e_y`, then
 /// `nprobe * FUSED_COLS` column FFTs ([`FFT_SKEW`]).
 ///
 /// # Safety
 ///
-/// As [`shift_pre`], `shift` holding [`shift_rows_inv`]'s `X` of this stack.
+/// As [`shift_pre`], `shift_adj` holding [`shift_rows_inv`]'s `X` of this stack.
 #[device]
 pub unsafe fn shift_post<const NY: u32>(p: FusedPtrs, ctl: *const StackCtl, g: StackGeom) {
     let (f0, nf) = unsafe { stack_frames(ctl, g) };
@@ -1174,7 +1177,7 @@ pub unsafe fn shift_post<const NY: u32>(p: FusedPtrs, ctl: *const StackCtl, g: S
         thread::sync_threads();
         #[unroll]
         for i in 0..FFT_EPT {
-            let v = load_c(p.shift, plane + ((f + i * tpf) * nx + kx) as usize);
+            let v = load_c(p.shift_adj, plane + ((f + i * tpf) * nx + kx) as usize);
             r[2 * i as usize] = v.0;
             r[2 * i as usize + 1] = v.1;
         }
@@ -1186,7 +1189,7 @@ pub unsafe fn shift_post<const NY: u32>(p: FusedPtrs, ctl: *const StackCtl, g: S
             let ky = f + i * tpf;
             let e = cmul(load_c(ey, ky as usize), ex);
             store_c(
-                p.shift,
+                p.shift_adj,
                 plane + (ky * nx + kx) as usize,
                 cmul_conj(e, (r[k], r[k + 1])),
             );
@@ -1198,11 +1201,12 @@ pub unsafe fn shift_post<const NY: u32>(p: FusedPtrs, ctl: *const StackCtl, g: S
 /// and `sums.den[p, i] += |O_o(i)|^2` for natural pixel `i`, over the stack's frames `fl` in
 /// ascending order and, for the denominator, object modes `o` ascending within a frame, so
 /// that stacks taken in scan order give every pixel one sum whatever the split. Reads
-/// `shift`, `views` and `obj`; writes `sums`. One thread per pixel of `[nprobe, ny, nx]`.
+/// `shift_adj`, `views` and `obj`; writes `sums`. One thread per pixel of `[nprobe, ny,
+/// nx]`.
 ///
 /// # Safety
 ///
-/// `shift` holds [`shift_post`]'s `G` of this stack; `sums` `[nprobe, ny, nx]`; `views` and
+/// `shift_adj` holds [`shift_post`]'s `G` of this stack; `sums` `[nprobe, ny, nx]`; `views` and
 /// `obj` their shapes for `g`; `ctl` one entry.
 #[device]
 pub unsafe fn shift_probe_sums(p: FusedPtrs, sums: SumPtrs, ctl: *const StackCtl, g: StackGeom) {
@@ -1219,7 +1223,7 @@ pub unsafe fn shift_probe_sums(p: FusedPtrs, sums: SumPtrs, ctl: *const StackCtl
         let mut a = load_c(sums.num, t);
         let mut d = *sums.den.add(t);
         for fl in 0..nf {
-            let u = load_c(p.shift, (fl as usize * nprobe + pm as usize) * n + i);
+            let u = load_c(p.shift_adj, (fl as usize * nprobe + pm as usize) * n + i);
             a = (a.0 + u.0, a.1 + u.1);
             for o in 0..g.nmode / g.nprobe {
                 let v = *p
