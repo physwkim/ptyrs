@@ -90,12 +90,7 @@ impl Patches {
 /// Mean over frames of the unmasked counts per frame: the scale [`diffraction_input`] divides
 /// out, so the predictor reads amplitude relative to the scan rather than the beam flux.
 pub fn mean_frame_total(frames: &Counts) -> f64 {
-    let total: f64 = frames
-        .as_slice()
-        .iter()
-        .filter_map(|&v| Counts::intensity(v))
-        .sum();
-    total / frames.nframe() as f64
+    frames.total() / frames.nframe() as f64
 }
 
 /// Network input `[nframe, ny/bin, nx/bin]` from detector-order frames: each `bin × bin` block
