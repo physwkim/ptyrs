@@ -14,7 +14,7 @@ use burn::tensor::ops::{InterpolateMode, InterpolateOptions, MaxPoolOptions};
 /// normalisation training sits for tens of epochs at the mean patch: the object shows only as a
 /// small modulation of the probe's far field.
 #[derive(Module, Debug)]
-struct Block {
+pub(crate) struct Block {
     a: Conv2d,
     na: BatchNorm,
     b: Conv2d,
@@ -22,7 +22,7 @@ struct Block {
 }
 
 impl Block {
-    fn new(cin: usize, cout: usize, device: &Device) -> Self {
+    pub(crate) fn new(cin: usize, cout: usize, device: &Device) -> Self {
         let conv = |cin, cout| {
             Conv2dConfig::new([cin, cout], [3, 3])
                 .with_padding(PaddingConfig2d::Same)
@@ -36,7 +36,7 @@ impl Block {
         }
     }
 
-    fn forward(&self, x: Tensor<4>) -> Tensor<4> {
+    pub(crate) fn forward(&self, x: Tensor<4>) -> Tensor<4> {
         let x = relu(self.na.forward(self.a.forward(x)));
         relu(self.nb.forward(self.b.forward(x)))
     }

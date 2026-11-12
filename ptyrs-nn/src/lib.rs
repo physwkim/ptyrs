@@ -3,6 +3,7 @@
 //! invariant 7.
 
 pub mod data;
+pub mod dip;
 pub mod interop;
 pub mod predictor;
 pub mod ptychonn;
