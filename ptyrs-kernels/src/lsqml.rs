@@ -14,7 +14,7 @@ use cuda_device::{async_copy, device, shared::DynamicSharedArray, thread};
 use cuda_host::cuda_module;
 
 use crate::bh::BhObs;
-use crate::fused::{FUSED_COLS, block_fft};
+use crate::fused::{FFT_SKEW, FUSED_COLS, block_fft};
 use crate::pixel::{MASKED, PIXEL_THREADS, StackCtl, StackGeom, load_c, stack_frames, store_c};
 use crate::{FFT_EPT_MAX, fft_ept};
 
@@ -95,9 +95,9 @@ pub struct LsqmlPre {
 /// `obs` and `icalc`, 0 where masked, inverse column-FFT'd and stored; without it nothing is
 /// stored, so `work` keeps its row transforms. Grid `(nx / FUSED_COLS, nf_max)`,
 /// block `nmode * FUSED_COLS * ny / fft_ept(ny)`, dynamic shared memory `2 * FUSED_COLS * ny`
-/// bytes of counts, then the larger of `nmode * FUSED_COLS` column FFTs and `4 * nmode * ny
-/// * FUSED_COLS` bytes. `counts` must be 16-byte aligned; it and `a_far` are read only under
-/// [`LSQML_CHI`].
+/// bytes of counts, then the larger of `nmode * FUSED_COLS` column FFTs ([`FFT_SKEW`]) and
+/// `4 * nmode * ny * FUSED_COLS` bytes. `counts` must be 16-byte aligned; it and `a_far` are
+/// read only under [`LSQML_CHI`].
 ///
 /// # Safety
 ///
@@ -150,7 +150,9 @@ unsafe fn cols<const NY: u32>(p: LsqmlCols, ctl: *const StackCtl, g: StackGeom, 
             r[2 * i as usize] = v.0;
             r[2 * i as usize + 1] = v.1;
         }
-        block_fft::<NY, false>(&mut r, fft_smem, b, f, bpb);
+        // FFT `b` at `b * (smem_per_fft + FFT_SKEW)`, the host's `Shape::col_fft` layout.
+        let skewed = fft_smem.add((b * FFT_SKEW) as usize);
+        block_fft::<NY, false>(&mut r, skewed, b, f, bpb);
         thread::sync_threads();
         #[unroll]
         for i in 0..ept {
@@ -193,7 +195,7 @@ unsafe fn cols<const NY: u32>(p: LsqmlCols, ctl: *const StackCtl, g: StackGeom, 
         if chi {
             // Every power is read before the inverse FFT reuses the region.
             thread::sync_threads();
-            block_fft::<NY, true>(&mut r, fft_smem, b, f, bpb);
+            block_fft::<NY, true>(&mut r, skewed, b, f, bpb);
             #[unroll]
             for i in 0..ept {
                 let k = 2 * i as usize;
