@@ -158,6 +158,46 @@ pub fn poisson_grad(obs: &Observed, frames: Range<usize>, nmode: usize, psi: &mu
     }
 }
 
+/// PyNX `CG_Poisson_Gamma` (no background) on detector-plane `po = FT(P·O·q)`,
+/// `a = FT(dP·O·q + P·dO·q)` and `b = FT(dP·dO·q)`: the numerator and denominator of the
+/// step `γ = −L′(0) / L″(0)` of the Poisson sum `L(γ)` of [`llk`] at `O + γ·dO`, `P + γ·dP`.
+/// Over unmasked pixels, with `icalc = max(Σ_modes |po|², 1e-12)`, `r = Σ Re(conj(po)·a)`,
+/// `s = Σ (|a|² + 2·Re(conj(po)·b))` and `f = 1 − iobs / icalc`:
+/// `num = Σ −2·r·f`, `den = Σ 2·s·f + iobs·(2·r / icalc)²`. The `1e-12` floor is
+/// [`poisson_grad`]'s, so `num = −Re Σ conj(g)·d` for the gradient `g` it yields; PyNX floors at
+/// `1e-32`, and its `s` has `Re(PdO)·Im(dPO)` where `Im(PdO)·Im(dPO)` belongs.
+pub fn cg_poisson_gamma(
+    obs: &Observed,
+    frames: Range<usize>,
+    nmode: usize,
+    po: &[C64],
+    a: &[C64],
+    b: &[C64],
+) -> (f64, f64) {
+    let n = obs.plane_len();
+    let len = frames.len() * nmode * n;
+    assert!(po.len() == len && a.len() == len && b.len() == len);
+    let (mut num, mut den) = (0.0, 0.0);
+    for (k, o) in obs.frames(frames).chunks_exact(n).enumerate() {
+        let at = |m: usize, j: usize| (k * nmode + m) * n + j;
+        for (j, iobs) in o.iter().enumerate() {
+            let Some(iobs) = *iobs else { continue };
+            let (mut calc, mut r, mut s) = (0.0, 0.0, 0.0);
+            for m in 0..nmode {
+                let (p, a, b) = (po[at(m, j)], a[at(m, j)], b[at(m, j)]);
+                calc += p.norm_sqr();
+                r += (p.conj() * a).re;
+                s += a.norm_sqr() + 2.0 * (p.conj() * b).re;
+            }
+            let calc = calc.max(1e-12);
+            let f = 1.0 - iobs / calc;
+            num -= 2.0 * r * f;
+            den += 2.0 * s * f + iobs * (2.0 * r / calc).powi(2);
+        }
+    }
+    (num, den)
+}
+
 /// Log-likelihood values: sums from [`llk`], or per-observation values from
 /// [`Llk::normalised`].
 #[derive(Clone, Copy, Debug, Default, PartialEq)]

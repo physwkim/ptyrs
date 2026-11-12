@@ -1,6 +1,6 @@
 use ptyrs_core::{C64, Geometry, Object, Probe, Scan, Stack, required_obj_shape};
 use ptyrs_engine::{
-    Algorithm, ApParams, DmParams, Ptycho, RpieParams, obj_probe_to_psi, quad_phase,
+    Algorithm, ApParams, DmParams, MlParams, Ptycho, RpieParams, obj_probe_to_psi, quad_phase,
 };
 
 mod common;
@@ -249,6 +249,38 @@ fn ap_object_only_converges() {
     assert!(h[0].llk.poisson > h[1].llk.poisson && h[1].llk.poisson > h[2].llk.poisson);
     let end = p.llk().poisson;
     assert!(end < 1.2 * truth, "end {end} truth {truth}");
+}
+
+#[test]
+fn ml_after_ap_descends_below_the_truth() {
+    let c = case(2, true);
+    let truth = truth_llk(&c);
+    let mut p = Ptycho::new(&c.scan, flat_object(&c.object), c.probe.clone()).unwrap();
+    p.scale_obj_probe();
+    p.ap(&ApParams::default(), 20);
+    let params = MlParams {
+        update_probe: true,
+        calc_llk: 1,
+        ..MlParams::default()
+    };
+    p.ml(&params, 40);
+    let h = p.history();
+    assert_eq!(
+        h.iter().map(|r| r.cycle).collect::<Vec<_>>(),
+        (20..60).collect::<Vec<_>>()
+    );
+    assert!(h.iter().all(|r| r.algorithm == Algorithm::Ml));
+    // ML records the LLK before each update
+    for w in h.windows(2) {
+        assert!(w[1].llk.poisson < w[0].llk.poisson, "{w:?}");
+    }
+    // the noise is fitted too, so ML ends below the LLK of the truth
+    let end = p.llk().poisson;
+    assert!(
+        end < truth,
+        "start {} end {end} truth {truth}",
+        h[0].llk.poisson
+    );
 }
 
 #[test]

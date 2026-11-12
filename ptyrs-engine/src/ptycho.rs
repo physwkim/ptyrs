@@ -6,8 +6,8 @@ use std::ops::Range;
 use ptyrs_core::{AddrTable, C64, Object, Probe, Scan, Stack};
 
 use crate::ops::{
-    Llk, accumulate_obj, accumulate_probe, apply_amplitude, llk, natural, obj_probe_to_psi,
-    poisson_grad, psi_to_obj_probe, quad_phase,
+    Llk, accumulate_obj, accumulate_probe, apply_amplitude, cg_poisson_gamma, llk, natural,
+    obj_probe_to_psi, poisson_grad, psi_to_obj_probe, quad_phase,
 };
 use crate::{EngineError, Fft2, Observed, shift};
 
@@ -17,6 +17,7 @@ pub enum Algorithm {
     Ap,
     Dm,
     Rpie,
+    Ml,
 }
 
 /// One LLK measurement (PyNX `history`): normalised LLK ([`Llk::normalised`]) taken at
@@ -76,6 +77,28 @@ impl Default for DmParams {
             probe_inertia: Some(0.001),
             alpha: 0.02,
             loop_obj_probe: 1,
+            calc_llk: 0,
+            zero_phase_ramp: true,
+        }
+    }
+}
+
+/// PyNX `ML` parameters, Poisson noise without regularisation, background or position
+/// updates.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MlParams {
+    pub update_object: bool,
+    /// PyNX default `update_probe=False`.
+    pub update_probe: bool,
+    pub calc_llk: usize,
+    pub zero_phase_ramp: bool,
+}
+
+impl Default for MlParams {
+    fn default() -> Self {
+        Self {
+            update_object: true,
+            update_probe: false,
             calc_llk: 0,
             zero_phase_ramp: true,
         }
@@ -244,6 +267,42 @@ impl Ptycho {
         .0
     }
 
+    /// [`Ptycho::obj_grad`] and [`Ptycho::probe_grad`] from one far field; an array not asked
+    /// for gets zeros.
+    fn grads(&self, object: bool, probe: bool) -> [Stack<C64>; 2] {
+        let psi = self.grad_psi();
+        let views = self.addr.views();
+        let (od, pd) = (self.object.dims(), self.probe.dims());
+        [
+            match object {
+                true => accumulate_obj(views, od, &self.probe, &self.quad, &psi).0,
+                false => Stack::filled(od, C64::default()),
+            },
+            match probe {
+                true => accumulate_probe(views, &self.object, pd, &self.quad, &psi).0,
+                false => Stack::filled(pd, C64::default()),
+            },
+        ]
+    }
+
+    /// [`cg_poisson_gamma`] of the current object and probe along `(d_obj, d_probe)`.
+    pub fn cg_gamma(&self, d_obj: &Stack<C64>, d_probe: &Stack<C64>) -> (f64, f64) {
+        let (views, quad) = (self.addr.views(), &self.quad[..]);
+        let (d_obj, d_probe) = (Object::new(d_obj.clone()), Probe::new(d_probe.clone()));
+        let mut po = self.calc_psi();
+        let mut a = vec![C64::default(); po.len()];
+        let mut b = a.clone();
+        obj_probe_to_psi(views, &d_obj, &self.probe, quad, &mut a);
+        obj_probe_to_psi(views, &self.object, &d_probe, quad, &mut b);
+        a.iter_mut().zip(&b).for_each(|(a, b)| *a += b);
+        obj_probe_to_psi(views, &d_obj, &d_probe, quad, &mut b);
+        for x in [&mut po, &mut a, &mut b] {
+            self.fft.forward(x);
+        }
+        let (nframe, nmode) = (self.addr.nframe(), self.addr.nmode());
+        cg_poisson_gamma(&self.obs, 0..nframe, nmode, &po, &a, &b)
+    }
+
     /// The object-plane `2·∂L/∂psi*` both gradients back-project.
     fn grad_psi(&self) -> Vec<C64> {
         let mut psi = self.calc_psi();
@@ -375,6 +434,78 @@ impl Ptycho {
             if llk_due(params.calc_llk, ic, ncycle) {
                 let l = self.llk();
                 self.record(Algorithm::Dm, l);
+            }
+            self.cycle += 1;
+        }
+        if params.zero_phase_ramp {
+            self.zero_phase_ramp();
+        }
+    }
+
+    /// PyNX `ML(...)**ncycle`, Poisson conjugate gradient, after [`Ptycho::scale_obj_probe`]
+    /// (PyNX `ScaleObjProbe(absolute=True)`). Per cycle, with `g` the gradients
+    /// ([`Ptycho::obj_grad`], [`Ptycho::probe_grad`]) of the arrays it updates (the recorded
+    /// LLK is of the estimate before the update): the direction `d = −g` on the first cycle and
+    /// `d = β·d − g` after, Polak–Ribière `β = Σ Re(conj(g)·(g − g_last)) / Σ|g_last|²` over
+    /// both arrays (0 if negative or not finite); then `γ = num / den` of
+    /// [`Ptycho::cg_gamma`] and `O += γ·d_O`, `P += γ·d_P`, or, for a `γ` that is not
+    /// finite, no update and `d = −g` (PyNX `cu_linear_comb_fcfc_gamma`). PyNX CUDA keeps
+    /// `−g / 2`, which changes neither `β` nor the step, and Hann-filters it in the far field;
+    /// this does not filter. As in PyNX, a negative curvature `den` is not guarded: far from
+    /// the solution (a flat object) the step can climb, so ML follows DM or AP.
+    pub fn ml(&mut self, params: &MlParams, ncycle: usize) {
+        let (uo, up) = (params.update_object, params.update_probe);
+        self.scale_obj_probe();
+        let mut last: Option<[Stack<C64>; 2]> = None;
+        let mut dir: [Stack<C64>; 2] = [
+            Stack::filled(self.object.dims(), C64::default()),
+            Stack::filled(self.probe.dims(), C64::default()),
+        ];
+        for ic in 0..ncycle {
+            let l = llk_due(params.calc_llk, ic, ncycle).then(|| self.llk());
+            let g = self.grads(uo, up);
+            let beta = match &last {
+                None => 0.0,
+                Some(last) => {
+                    let (mut num, mut den) = (0.0, 0.0);
+                    for (g, h) in g.iter().zip(last) {
+                        for (g, h) in g.as_slice().iter().zip(h.as_slice()) {
+                            num += (g.conj() * (g - h)).re;
+                            den += h.norm_sqr();
+                        }
+                    }
+                    let b = num / den;
+                    if b.is_finite() && b >= 0.0 { b } else { 0.0 }
+                }
+            };
+            for (d, g) in dir.iter_mut().zip(&g) {
+                for (d, g) in d.as_mut_slice().iter_mut().zip(g.as_slice()) {
+                    *d = *d * beta - g;
+                }
+            }
+            let (num, den) = self.cg_gamma(&dir[0], &dir[1]);
+            let gamma = num / den;
+            if gamma.is_finite() {
+                let [d_obj, d_probe] = &dir;
+                for (x, d) in [
+                    (self.object.as_mut_slice(), d_obj),
+                    (self.probe.as_mut_slice(), d_probe),
+                ] {
+                    x.iter_mut()
+                        .zip(d.as_slice())
+                        .for_each(|(x, d)| *x += d * gamma);
+                }
+            } else {
+                for (d, g) in dir.iter_mut().zip(&g) {
+                    d.as_mut_slice()
+                        .iter_mut()
+                        .zip(g.as_slice())
+                        .for_each(|(d, g)| *d = -g);
+                }
+            }
+            last = Some(g);
+            if let Some(l) = l {
+                self.record(Algorithm::Ml, l);
             }
             self.cycle += 1;
         }
@@ -649,5 +780,56 @@ mod tests {
         let mut p = grad_start();
         let grad = p.probe_grad();
         assert_central(&mut p, &grad, |p| p.probe.as_mut_slice());
+    }
+
+    /// `cg_gamma` along a direction that is not the gradient's: its numerator is `−Re⟨g, d⟩`,
+    /// and `num / den` is the Newton step `−φ′(0) / φ″(0)` of `φ(t)`, the Poisson sum at
+    /// `O + t·d_O`, `P + t·d_P`, by central differences at 1e-4 of the step.
+    #[test]
+    fn cg_gamma_is_the_newton_step_of_the_llk() {
+        let mut p = grad_start();
+        let g = p.grads(true, true);
+        let d = g.clone().map(|mut d| {
+            let w = d.as_mut_slice();
+            w.iter_mut().enumerate().for_each(|(k, v)| {
+                *v *= -C64::from_polar(
+                    1.0 + 0.5 * (0.7 * k as f64).sin(),
+                    0.3 * (1.3 * k as f64).cos(),
+                );
+            });
+            d
+        });
+        let (num, den) = p.cg_gamma(&d[0], &d[1]);
+        let dot: f64 = g
+            .iter()
+            .zip(&d)
+            .flat_map(|(g, d)| g.as_slice().iter().zip(d.as_slice()))
+            .map(|(g, d)| (g.conj() * d).re)
+            .sum();
+        assert!(
+            (num + dot).abs() < 1e-12 * dot.abs(),
+            "num {num} −Re⟨g, d⟩ {}",
+            -dot
+        );
+        let gamma = num / den;
+        let h = 1e-4 * gamma;
+        let (o0, p0) = (p.object.clone(), p.probe.clone());
+        let mut phi = |t: f64| {
+            for (x, (x0, d)) in [
+                (p.object.as_mut_slice(), (o0.as_slice(), &d[0])),
+                (p.probe.as_mut_slice(), (p0.as_slice(), &d[1])),
+            ] {
+                for ((x, x0), d) in x.iter_mut().zip(x0).zip(d.as_slice()) {
+                    *x = x0 + d * t;
+                }
+            }
+            poisson_sum(&p)
+        };
+        let (lm, l0, lp) = (phi(-h), phi(0.0), phi(h));
+        let newton = -((lp - lm) / (2.0 * h)) / ((lp - 2.0 * l0 + lm) / (h * h));
+        assert!(
+            (gamma - newton).abs() < 1e-5 * gamma.abs(),
+            "gamma {gamma} newton {newton}"
+        );
     }
 }
