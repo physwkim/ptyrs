@@ -9,8 +9,8 @@ use cuda_async::cuda_graph::CudaGraph;
 use cuda_async::device_operation::{DeviceOp, ExecutionContext};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 use ptyrs_gpu::{
-    C32, Error, Kernels, Lines, LlkPartial, StackTable, UpdateSums, ViewAddr, ViewDims, Views,
-    record,
+    C32, Error, Kernels, Lines, LlkPartial, LlkScratch, StackTable, UpdateSums, ViewAddr, ViewDims,
+    Views, record,
 };
 use ptyrs_tile::{TileKernels, llk_sums_scratch_len};
 
@@ -135,6 +135,7 @@ struct State {
     psi: DeviceBuffer<C32>,
     obj_sums: UpdateSums,
     probe_sums: UpdateSums,
+    llk_chunks: LlkScratch,
     partials: DeviceBuffer<LlkPartial>,
     llk_scratch: DeviceBuffer<f64>,
     llk: DeviceBuffer<f64>,
@@ -147,7 +148,14 @@ fn epoch(ctx: &ExecutionContext, scan: &Scan, s: &mut State) -> Result<(), Error
     let nk = d.nframe * d.nmode;
     k.obj_probe_to_psi(ctx, scan.views, table.at(0), &s.obj, &s.probe, &mut s.psi)?;
     fft2(k, ctx, &mut s.psi, nk, false)?;
-    k.llk(ctx, d, table.at(0), scan.counts, &s.psi, &mut s.partials)?;
+    k.llk(
+        ctx,
+        table.at(0),
+        scan.counts,
+        &s.psi,
+        &mut s.llk_chunks,
+        &mut s.partials,
+    )?;
     k.apply_amplitude(ctx, d, table.at(0), scan.counts, &mut s.psi)?;
     fft2(k, ctx, &mut s.psi, nk, true)?;
     tk.psi_to_obj(ctx, table.at(0), &s.psi, &s.probe, &mut s.obj_sums)?;
@@ -228,6 +236,7 @@ fn ap_epoch_graph_replays_bit_for_bit() {
         psi,
         obj_sums: UpdateSums::zeroed(&stream, obj_len).unwrap(),
         probe_sums: UpdateSums::zeroed(&stream, probe0.len()).unwrap(),
+        llk_chunks: LlkScratch::new(&stream, &d, d.nframe).unwrap(),
         partials: DeviceBuffer::zeroed(&stream, d.nframe as usize).unwrap(),
         llk_scratch: DeviceBuffer::zeroed(&stream, llk_sums_scratch_len(d.nframe)).unwrap(),
         llk: DeviceBuffer::zeroed(&stream, 4).unwrap(),
