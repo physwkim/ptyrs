@@ -473,6 +473,33 @@ impl Views {
     }
 }
 
+/// A permutation of the frames `0 .. n` on the device, the order
+/// [`Kernels::reorder_views`] takes.
+pub struct Permutation {
+    order: DeviceBuffer<u32>,
+}
+
+impl Permutation {
+    /// Checks that `order` holds each of `0 .. order.len()` once and uploads it.
+    pub fn new(stream: &CudaStream, order: &[u32]) -> Result<Self, Error> {
+        let mut seen = vec![false; order.len()];
+        for (p, &q) in order.iter().enumerate() {
+            match seen.get_mut(q as usize) {
+                Some(s) if !*s => *s = true,
+                _ => {
+                    return Err(Error::Shape(format!(
+                        "order[{p}] = {q} repeats a frame or is past 0..{}",
+                        order.len()
+                    )));
+                }
+            }
+        }
+        Ok(Self {
+            order: DeviceBuffer::from_host(stream, order)?,
+        })
+    }
+}
+
 /// The object tiles `[ty, tx]` holding the object pixels that the samples of view `v` read,
 /// ascending (ty-major); for a view [`ViewDims::check_view`] accepts, all inside the object.
 /// [`Views::new`] and [`Kernels::bin_views`] list view `v` in exactly these tiles' runs.
@@ -863,25 +890,25 @@ impl Kernels {
     /// of `src`, and rebuilds every run of `dst` as [`Self::bin_views`] over all frames
     /// would, so they are the runs [`Views::new`] makes of the reordered frames. A gather, a
     /// memset and a bin launch, stream-ordered with no host sync, so a graph can capture
-    /// them. When they run, `order` holds a permutation of `0 .. nframe` and `dst`'s slabs
-    /// hold every tile's views, as [`Views::reordered`] of `src` gives when `src`'s runs hold
-    /// all its views; otherwise the launches stay in bounds but `dst`'s frames and runs are
-    /// unspecified.
+    /// them. When they run, `dst`'s slabs hold every tile's views, as [`Views::reordered`]
+    /// of `src` gives when `src`'s runs hold all its views; otherwise the launches stay in
+    /// bounds but `dst`'s runs are unspecified.
     pub fn reorder_views(
         &self,
         ctx: &ExecutionContext,
         src: &Views,
-        order: &DeviceBuffer<u32>,
+        order: &Permutation,
         dst: &mut Views,
     ) -> Result<(), Error> {
         let d = &src.dims;
-        if dst.dims != *d {
+        if dst.dims != *d || order.order.len() != d.nframe as usize {
             return Err(Error::Shape(format!(
-                "reorder of {d:?} into {:?}",
+                "reorder of {d:?} by {} frames into {:?}",
+                order.order.len(),
                 dst.dims
             )));
         }
-        check_len("order", order, d.nframe as usize)?;
+        let order = &order.order;
         let config = grid_1d(d.nframe as usize * d.nmode as usize)?;
         let reads = [src.addr.storage(), order.storage()];
         self.launch(ctx, &reads, &[dst.addr.storage()], |stream| {

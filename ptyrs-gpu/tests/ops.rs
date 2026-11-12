@@ -12,8 +12,8 @@ use cuda_core::{CudaContext, CudaStream, DeviceBuffer, DeviceCopy, DriverError};
 use ptyrs_fft::{FftError, Plan2d};
 use ptyrs_gpu::{
     C32, Error, Exit, FUSED_SIDES, FusedBufs, FusedInputs, FusedSums, Kernels, Lines, LlkPartial,
-    LlkScratch, LlkSums, MASKED, OBJ_TILE, StackCtl, StackRef, StackTable, UpdateSums, ViewAddr,
-    ViewDims, Views, record, view_tiles,
+    LlkScratch, LlkSums, MASKED, OBJ_TILE, Permutation, StackCtl, StackRef, StackTable, UpdateSums,
+    ViewAddr, ViewDims, Views, record, view_tiles,
 };
 
 type Z = (f64, f64);
@@ -1658,7 +1658,7 @@ fn reorder_views_by_a_permutation_and_its_inverse_restores_the_views() {
     let src = Views::new(&stream, d, &s.views).unwrap();
     let packed = Views::new(&stream, d, &reordered_views(&s, &ORDER12)).unwrap();
     let want = host_views(&stream, &packed);
-    let order = up(&stream, &ORDER12);
+    let order = Permutation::new(&stream, &ORDER12).unwrap();
     let mut mid = Views::reordered(&stream, &src).unwrap();
     let side = k.context().new_stream().unwrap();
     let graph = CudaGraph::capture(
@@ -1671,7 +1671,7 @@ fn reorder_views_by_a_permutation_and_its_inverse_restores_the_views() {
         assert!(host_views(&stream, &mid) == want, "replay {replay}");
     }
     let mut back = Views::reordered(&stream, &mid).unwrap();
-    let inv = up(&stream, &inv);
+    let inv = Permutation::new(&stream, &inv).unwrap();
     record(|ctx| k.reorder_views(ctx, &mid, &inv, &mut back))
         .sync_on(&stream)
         .unwrap();
@@ -1715,6 +1715,31 @@ fn reorder_views_by_a_permutation_and_its_inverse_restores_the_views() {
     }
 }
 
+/// A [`Permutation`] holds each frame once, and `reorder_views` takes one of the scan's
+/// frame count only.
+#[test]
+fn reorder_order_is_a_permutation_of_the_frames() {
+    let (stream, ex, k) = setup();
+    for (what, order) in [
+        ("repeat", &[0, 2, 2][..]),
+        ("past the end", &[0, 3, 1]),
+        ("past u32 range", &[u32::MAX]),
+    ] {
+        assert!(
+            matches!(Permutation::new(&stream, order), Err(Error::Shape(_))),
+            "{what}"
+        );
+    }
+    let s = scan12();
+    let src = Views::new(&stream, s.d, &s.views).unwrap();
+    let mut dst = Views::reordered(&stream, &src).unwrap();
+    for n in [11, 13] {
+        let order = Permutation::new(&stream, &(0..n).rev().collect::<Vec<u32>>()).unwrap();
+        let r = k.reorder_views(&ex, &src, &order, &mut dst);
+        assert!(matches!(r, Err(Error::Shape(_))), "{n} frames for 12");
+    }
+}
+
 /// The stack launches over reordered views match, bit for bit, the same launches over
 /// `Views::new` of the frames in that order, stack after stack.
 #[test]
@@ -1723,7 +1748,7 @@ fn stack_pass_over_reordered_views_matches_the_frames_in_that_order() {
     let s = scan12();
     let (d, n) = (s.d, s.n());
     let src = Views::new(&stream, d, &s.views).unwrap();
-    let order = up(&stream, &ORDER12);
+    let order = Permutation::new(&stream, &ORDER12).unwrap();
     let mut dst = Views::reordered(&stream, &src).unwrap();
     record(|ctx| k.reorder_views(ctx, &src, &order, &mut dst))
         .sync_on(&stream)
