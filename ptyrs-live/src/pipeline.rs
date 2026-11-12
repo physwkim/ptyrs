@@ -238,6 +238,42 @@ pub fn worker(
     r
 }
 
+/// Frames received that never reached the GPU, by where they dropped out;
+/// a run counts only without any (DESIGN.md §7 M5). Past the source's
+/// rejects, the loss is a difference, frames received minus frames the GPU
+/// consumed, so a drop no counter sees still shows, as `unaccounted`.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct FrameLoss {
+    /// Updates the source could not read as a frame.
+    pub rejected: u64,
+    /// Frames the full work queue turned away.
+    pub queue_full: u64,
+    pub decode_err: u64,
+    /// Frames whose position did not arrive in time.
+    pub pos_missing: u64,
+    /// Received, not consumed on the GPU and in none of the counts above.
+    pub unaccounted: u64,
+}
+
+impl FrameLoss {
+    /// From the source's and the workers' counts and the frames the GPU
+    /// consumed, once every worker and the uploader have drained.
+    pub fn new(st: &SourceStats, wr: &WorkerReport, on_gpu: u64) -> Self {
+        let counted = st.queue_full + wr.decode_err + wr.pos_missing;
+        Self {
+            rejected: st.rejected,
+            queue_full: st.queue_full,
+            decode_err: wr.decode_err,
+            pos_missing: wr.pos_missing,
+            unaccounted: st.unique.saturating_sub(on_gpu).saturating_sub(counted),
+        }
+    }
+
+    pub fn total(&self) -> u64 {
+        self.rejected + self.queue_full + self.decode_err + self.pos_missing + self.unaccounted
+    }
+}
+
 /// Per-source accounting of what arrived, shared by every input kind.
 #[derive(Default)]
 pub struct SourceStats {
@@ -417,5 +453,35 @@ mod tests {
         );
         assert_eq!((s.out_of_order, s.queue_full), (1, 2));
         assert_eq!(rx.try_iter().map(|w| w.uid).collect::<Vec<_>>(), [0, 1]);
+    }
+
+    /// 10 unique frames received: every counted drop shows at its stage,
+    /// a frame missing from the GPU with no count shows as unaccounted, and
+    /// a reject alone is a loss though every frame reached the GPU.
+    #[test]
+    fn frame_loss_is_received_minus_consumed_by_stage() {
+        let st = |queue_full, rejected| SourceStats {
+            unique: 10,
+            queue_full,
+            rejected,
+            ..SourceStats::new(10)
+        };
+        let wr = |decode_err, pos_missing| WorkerReport {
+            decode_err,
+            pos_missing,
+            ..Default::default()
+        };
+        let none = FrameLoss::new(&st(0, 0), &wr(0, 0), 10);
+        assert_eq!((none, none.total()), (FrameLoss::default(), 0));
+        let counted = FrameLoss::new(&st(1, 0), &wr(2, 3), 4);
+        assert_eq!(
+            (counted.queue_full, counted.decode_err, counted.pos_missing),
+            (1, 2, 3)
+        );
+        assert_eq!((counted.unaccounted, counted.total()), (0, 6));
+        let silent = FrameLoss::new(&st(1, 0), &wr(0, 0), 7);
+        assert_eq!((silent.unaccounted, silent.total()), (2, 3));
+        let rejected = FrameLoss::new(&st(0, 1), &wr(0, 0), 10);
+        assert_eq!((rejected.rejected, rejected.total()), (1, 1));
     }
 }

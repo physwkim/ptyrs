@@ -31,7 +31,9 @@ use crate::eiger::{EigerFrames, Progress, PullReport, run_pull};
 use crate::graph::WarmUp;
 use crate::handoff::work_queue;
 use crate::model::ModelCfg;
-use crate::pipeline::{Geometry, Placement, SourceStats, Truth, WorkerCfg, WorkerReport, worker};
+use crate::pipeline::{
+    FrameLoss, Geometry, Placement, SourceStats, Truth, WorkerCfg, WorkerReport, worker,
+};
 use crate::pos::PosTable;
 use crate::pva_source::{NtndFrames, PosStats, monitor_positions};
 use crate::ring::{DeviceStore, Ring, UploaderConfig, run_uploader};
@@ -288,8 +290,10 @@ impl fmt::Display for Fig {
 }
 
 pub struct RecvReport {
-    /// Triggers that never reached the device store.
+    /// Triggers that never reached the device store, received or not.
     pub lost: u64,
+    /// Frames received that the GPU never consumed.
+    pub rx_lost: FrameLoss,
     /// Graphs captured after the warm-up.
     pub recaptures: u64,
     /// Frames, positions and checksums that reached the GPU wrong, all checks.
@@ -301,7 +305,7 @@ pub struct RecvReport {
 impl RecvReport {
     /// 2 lost, 3 wrong, 4 a graph captured after the warm-up, else 0.
     pub fn exit_code(&self) -> u8 {
-        if self.lost > 0 {
+        if self.lost > 0 || self.rx_lost.total() > 0 {
             2
         } else if self.bad > 0 {
             3
@@ -670,6 +674,7 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
         rate((cpu - r.cpu_first) as f64, t - r.first)
     });
     let lost = frames - up.frames.min(frames);
+    let rx_lost = FrameLoss::new(&st, &wr, cons.consumed);
     let mut s = String::new();
     // Writing to a String cannot fail.
     let mut line = |args: fmt::Arguments| {
@@ -677,11 +682,14 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
         s.push('\n');
     };
     line(format_args!(
-        "recv expected={frames} received_unique={} gpu_frames={} lost={lost} dup={} beyond={} \
+        "recv expected={frames} received_unique={} gpu_frames={} lost={lost} rx_lost={} \
+         unaccounted={} dup={} beyond={} \
          gap_events={} gap_frames={} out_of_order={} queue_full={} rejected={} placeholders={} \
          decode_err={} pos_missing={} pos_mismatch={} pos_waits={} pos_updates={} pos_rejected={}",
         st.unique,
         up.frames,
+        rx_lost.total(),
+        rx_lost.unaccounted,
         st.dup,
         st.beyond,
         st.gap_events,
@@ -777,6 +785,7 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
         + consumed_bad;
     Ok(RecvReport {
         lost,
+        rx_lost,
         recaptures,
         bad,
         lines: s,
