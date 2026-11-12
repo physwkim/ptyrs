@@ -1,43 +1,28 @@
 //! pty-chi rPIE on the GPU, in the call sequence of `ptyrs_gpu::RpieKernels`.
 
-use std::sync::Arc;
-
-use cuda_core::{CudaStream, DeviceBuffer};
+use cuda_async::device_operation::ExecutionContext;
+use cuda_core::DeviceBuffer;
 use ptyrs_fft::Plan2d;
-use ptyrs_gpu::{C32, ViewDims, Weight};
+use ptyrs_gpu::{C32, Error as GpuError, StackTable, Weight};
 
-use super::{GpuPtycho, Span, plane_len, split, to_u32};
+use super::{Frames, GpuPtycho, plane_len, stack_buf_len, stacks, to_u32};
 use crate::ptycho::{Algorithm, llk_due};
 use crate::{EngineError, RpieParams};
 
-/// What the batches of one frame count share.
-struct BatchBufs {
-    plan: Plan2d,
+/// The device buffers of one [`GpuPtycho::rpie`] call, sized for the longest batch.
+struct RpieBufs {
+    batches: Vec<Frames>,
+    /// Values per frame plane.
+    n: u32,
+    table: StackTable,
+    /// One plan per batch length, indexed by [`Frames::plan`].
+    plans: Vec<Plan2d>,
     /// The batch's exit waves, then its object windows `O_v q`.
     psi: DeviceBuffer<C32>,
     /// pty-chi's `Δ`, then the probe step's weighted `Δ`.
     dlt: DeviceBuffer<C32>,
     /// Per-view `max |O_v|^2`.
     omax: DeviceBuffer<f32>,
-}
-
-impl BatchBufs {
-    fn new(stream: &Arc<CudaStream>, dims: &ViewDims, nf: u32) -> Result<Self, EngineError> {
-        let nk = nf as usize * dims.nmode as usize;
-        let len = nk * plane_len(dims);
-        Ok(Self {
-            plan: Plan2d::new(stream, dims.frame[0] as usize, nk)?,
-            psi: DeviceBuffer::zeroed(stream, len)?,
-            dlt: DeviceBuffer::zeroed(stream, len)?,
-            omax: DeviceBuffer::zeroed(stream, nk)?,
-        })
-    }
-}
-
-/// The device buffers of one [`GpuPtycho::rpie`] call.
-struct RpieBufs {
-    batches: Vec<(Span, usize)>,
-    sizes: Vec<BatchBufs>,
     /// `P / ((1 - a_o) |P|^2 + a_o max_i sum_m |P_m|^2)`.
     ptilde: DeviceBuffer<C32>,
     pmax: DeviceBuffer<f32>,
@@ -58,14 +43,19 @@ impl GpuPtycho {
         if params.batch_size == 0 {
             return Err(EngineError::Invalid("rPIE batch_size must be >= 1".into()));
         }
-        let (batches, lens) = split(dims.nframe, to_u32("batch_size", params.batch_size)?);
         let stream = &self.stream;
+        let (batches, table, plans) =
+            stacks(stream, &dims, to_u32("batch_size", params.batch_size)?)?;
+        let len = stack_buf_len(&dims, &table);
+        let nk_max = table.nf_max() as usize * dims.nmode as usize;
         let mut bufs = RpieBufs {
             batches,
-            sizes: lens
-                .iter()
-                .map(|&nf| BatchBufs::new(stream, &dims, nf))
-                .collect::<Result<Vec<_>, _>>()?,
+            n: to_u32("frame size", plane_len(&dims))?,
+            table,
+            plans,
+            psi: DeviceBuffer::zeroed(stream, len)?,
+            dlt: DeviceBuffer::zeroed(stream, len)?,
+            omax: DeviceBuffer::zeroed(stream, nk_max)?,
             ptilde: DeviceBuffer::zeroed(stream, self.probe.len())?,
             pmax: DeviceBuffer::zeroed(stream, 1)?,
             ones: DeviceBuffer::from_host(
@@ -74,9 +64,7 @@ impl GpuPtycho {
             )?,
         };
         for ic in 0..nepoch {
-            for b in 0..bufs.batches.len() {
-                self.rpie_batch(params, &mut bufs, b)?;
-            }
+            self.rpie_epoch(&self.context(), params, &mut bufs)?;
             if llk_due(params.calc_llk, ic, nepoch) {
                 let l = self.llk()?;
                 self.record(Algorithm::Rpie, l);
@@ -86,38 +74,59 @@ impl GpuPtycho {
         Ok(())
     }
 
+    /// One epoch enqueued on `ctx`.
+    fn rpie_epoch(
+        &mut self,
+        ctx: &ExecutionContext,
+        params: &RpieParams,
+        bufs: &mut RpieBufs,
+    ) -> Result<(), GpuError> {
+        for b in 0..bufs.batches.len() {
+            self.rpie_batch(ctx, params, bufs, b)?;
+        }
+        Ok(())
+    }
+
+    /// One batch of an epoch enqueued on `ctx`.
     fn rpie_batch(
         &mut self,
+        ctx: &ExecutionContext,
         params: &RpieParams,
         bufs: &mut RpieBufs,
         b: usize,
-    ) -> Result<(), EngineError> {
-        let (span, size) = bufs.batches[b].clone();
-        let bb = &mut bufs.sizes[size];
+    ) -> Result<(), GpuError> {
+        let frames = &bufs.batches[b];
+        let stack = bufs.table.at(b);
+        let plan = &mut bufs.plans[frames.plan];
         let dims = *self.views.dims();
-        let n = to_u32("frame size", plane_len(&dims))?;
-        let nk = span.nf() * dims.nmode;
-        let len = to_u32("batch length", bb.psi.len())?;
-        let (k, rk, stream) = (&self.kernels, &self.rpie, &*self.stream);
+        let n = bufs.n;
+        let nk = frames.nf() * dims.nmode;
+        let len = frames.len;
+        let (k, rk) = (&self.kernels, &self.rpie);
 
         // Δ = IFT(ψ') − ψ.
         k.obj_probe_to_psi(
-            stream,
+            ctx,
             &self.views,
-            span.arg(),
+            stack,
             &self.obj,
             &self.probe,
-            &mut bb.psi,
+            &mut bufs.psi,
         )?;
-        bb.dlt.copy_from_device_async(&bb.psi, stream)?;
-        bb.plan.forward_inplace(&mut bb.dlt)?;
-        rk.amplitude(stream, &self.views, span.arg(), &self.counts, &mut bb.dlt)?;
-        bb.plan.inverse_inplace(&mut bb.dlt)?;
-        k.scale_c32(stream, &mut bb.psi, len, -1.0)?;
-        k.add_c32(stream, &mut bb.dlt, &bb.psi, len)?;
+        plan.forward(ctx, &bufs.psi, &mut bufs.dlt)?;
+        rk.amplitude(
+            ctx,
+            &self.views,
+            frames.range.clone(),
+            &self.counts,
+            &mut bufs.dlt,
+        )?;
+        plan.inverse_inplace(ctx, &mut bufs.dlt)?;
+        k.scale_c32(ctx, &mut bufs.psi, len, -1.0)?;
+        k.add_c32(ctx, &mut bufs.dlt, &bufs.psi, len)?;
 
         if params.obj_step.is_some() {
-            rk.power_max(stream, &self.probe, 1, dims.nprobe, n, &mut bufs.pmax)?;
+            rk.power_max(ctx, &self.probe, 1, dims.nprobe, n, &mut bufs.pmax)?;
             let spec = Weight {
                 nk: dims.nprobe,
                 n,
@@ -125,60 +134,58 @@ impl GpuPtycho {
                 alpha: params.obj_alpha as f32,
             };
             rk.weight(
-                stream,
+                ctx,
                 &self.probe,
                 &self.probe,
                 &bufs.pmax,
                 &mut bufs.ptilde,
                 spec,
             )?;
-            self.obj_sums.zero(stream)?;
+            self.obj_sums.zero(ctx)?;
             k.psi_to_obj(
-                stream,
+                ctx,
                 &self.views,
-                span.arg(),
-                &bb.dlt,
+                stack,
+                &bufs.dlt,
                 &bufs.ptilde,
                 &mut self.obj_sums,
             )?;
         }
         if params.probe_step.is_some() {
             k.obj_probe_to_psi(
-                stream,
+                ctx,
                 &self.views,
-                span.arg(),
+                stack,
                 &self.obj,
                 &bufs.ones,
-                &mut bb.psi,
+                &mut bufs.psi,
             )?;
-            rk.power_max(stream, &bb.psi, nk, 1, n, &mut bb.omax)?;
+            rk.power_max(ctx, &bufs.psi, nk, 1, n, &mut bufs.omax)?;
             let spec = Weight {
                 nk,
                 n,
                 per_plane: true,
                 alpha: params.probe_alpha as f32,
             };
-            rk.weight_inplace(stream, &mut bb.dlt, &bb.psi, &bb.omax, spec)?;
-            self.probe_sums.zero(stream)?;
+            rk.weight_inplace(ctx, &mut bufs.dlt, &bufs.psi, &bufs.omax, spec)?;
+            self.probe_sums.zero(ctx)?;
             k.psi_to_probe(
-                stream,
+                ctx,
                 &self.views,
-                span.arg(),
-                &bb.dlt,
+                stack,
+                &bufs.dlt,
                 &self.obj,
                 &mut self.probe_sums,
             )?;
         }
         if let Some(step) = params.obj_step {
-            let n = to_u32("object length", self.obj.len())?;
-            k.scale_c32(stream, &mut self.obj_sums.num, n, step as f32)?;
-            k.add_c32(stream, &mut self.obj, &self.obj_sums.num, n)?;
+            k.scale_c32(ctx, &mut self.obj_sums.num, self.obj_len, step as f32)?;
+            k.add_c32(ctx, &mut self.obj, &self.obj_sums.num, self.obj_len)?;
         }
         if let Some(step) = params.probe_step {
-            let n = to_u32("probe length", self.probe.len())?;
-            let s = step / span.nf() as f64;
-            k.scale_c32(stream, &mut self.probe_sums.num, n, s as f32)?;
-            k.add_c32(stream, &mut self.probe, &self.probe_sums.num, n)?;
+            let s = step / frames.nf() as f64;
+            k.scale_c32(ctx, &mut self.probe_sums.num, self.probe_len, s as f32)?;
+            k.add_c32(ctx, &mut self.probe, &self.probe_sums.num, self.probe_len)?;
         }
         Ok(())
     }

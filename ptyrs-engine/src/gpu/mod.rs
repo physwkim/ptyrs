@@ -2,12 +2,16 @@
 //! stream with the `ptyrs-gpu` pixel kernels and `ptyrs-fft` plans, in the call sequences the
 //! `ptyrs_gpu` ops and rPIE docs give, and is checked against [`crate::Ptycho`].
 //!
-//! The scan's frames are cut into stacks of [`GpuOptions::stack_size`] consecutive frames.
-//! Each stack keeps its own exit waves (DM carries them across cycles) and LLK partials;
-//! stacks of one length share a cuFFT plan and a scratch stack. Within a cycle nothing reads
-//! back to the host: LLK partials are downloaded only in the cycles that record one, and the
-//! arrays only when asked for. Each algorithm is its own module over the per-stack steps here,
-//! so M2's fused passes can replace those steps one algorithm at a time.
+//! The scan's frames are cut into stacks of [`GpuOptions::stack_size`] consecutive frames,
+//! one [`StackTable`] entry each: every launch reads its stack's frames from the entry on the
+//! device. Each stack keeps its own exit waves (DM carries them across cycles) and LLK
+//! partials, sized like PyNX's fixed stack for the longest stack; one scratch stack serves
+//! all, and stacks of one length share a cuFFT plan, which transforms only their frames.
+//! Each cycle enqueues through its own `ExecutionContext`, dropped when the cycle has been
+//! enqueued. Within a cycle nothing reads back to the host: LLK partials are downloaded only
+//! in the cycles that record one, and the arrays only when asked for. Each algorithm is its
+//! own module over the per-stack steps here, so M2's fused passes can replace those steps one
+//! algorithm at a time.
 
 mod ap;
 mod dm;
@@ -17,11 +21,13 @@ use std::f64::consts::PI;
 use std::ops::Range;
 use std::sync::Arc;
 
+use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 use ptyrs_core::{AddrTable, C64, Object, Probe, Scan, Stack};
 use ptyrs_fft::Plan2d;
 use ptyrs_gpu::{
-    C32, Kernels, LlkPartial, LlkSums, RpieKernels, UpdateSums, ViewAddr, ViewDims, Views,
+    C32, Error as GpuError, Kernels, LlkPartial, LlkSums, RpieKernels, StackTable, UpdateSums,
+    ViewAddr, ViewDims, Views,
 };
 
 use crate::ptycho::{Algorithm, LlkRecord, zero_phase_ramp};
@@ -40,55 +46,72 @@ impl Default for GpuOptions {
     }
 }
 
-/// Consecutive frames of one stack or rPIE batch. Every launch takes its frame argument from
-/// [`Span::arg`], the one place to change when the kernels read their stack on the device.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct Span(Range<u32>);
+/// One stack (or rPIE batch): the frames its table entry holds, for what the host needs of
+/// them (which plan, how many LLK partials, rPIE's `1 / nf`); the kernels read the entry.
+#[derive(Clone, Debug)]
+struct Frames {
+    range: Range<u32>,
+    /// Index of the stack's length, and so of its cuFFT plan.
+    plan: usize,
+    /// `nf * nmode * n`: the values of the stack's exit waves, what the element-wise steps
+    /// and its plan cover.
+    len: u32,
+}
 
-impl Span {
-    fn arg(&self) -> Range<u32> {
-        self.0.clone()
-    }
-
+impl Frames {
     fn nf(&self) -> u32 {
-        self.0.end - self.0.start
+        self.range.end - self.range.start
     }
 }
 
-/// One stack of consecutive frames.
+/// One stack's buffers, sized like every stack's for the table's `nf_max` frames.
 struct StackBufs {
-    span: Span,
-    /// Index into [`GpuPtycho::sizes`].
-    size: usize,
-    /// Exit waves of the stack's views (planes `0 .. nf * nmode`).
+    frames: Frames,
+    /// Exit waves of the stack's views; planes past `nf * nmode` stay zero.
     psi: DeviceBuffer<C32>,
     llk: DeviceBuffer<LlkPartial>,
 }
 
-/// What the stacks of one frame count share.
-struct SizeBufs {
-    plan: Plan2d,
-    /// One stack's worth of exit waves: DM's `PO`, the LLK pass's forward stack.
-    scratch: DeviceBuffer<C32>,
+/// `0 .. nframe` cut into consecutive ranges of `size` frames, the last one shorter when
+/// `size` does not divide `nframe`; the table of their entries and one plan per length.
+fn stacks(
+    stream: &Arc<CudaStream>,
+    dims: &ViewDims,
+    size: u32,
+) -> Result<(Vec<Frames>, StackTable, Vec<Plan2d>), EngineError> {
+    let (ranges, lens) = split(dims.nframe, size);
+    let table = StackTable::new(
+        stream,
+        dims,
+        &ranges.iter().map(|(r, _)| r.clone()).collect::<Vec<_>>(),
+    )?;
+    let nmode = dims.nmode as usize;
+    let plans = lens
+        .iter()
+        .map(|&nf| Plan2d::new(stream, dims.frame[0] as usize, nf as usize * nmode))
+        .collect::<Result<Vec<_>, _>>()?;
+    let frames = ranges
+        .into_iter()
+        .map(|(range, plan)| {
+            let len = (range.end - range.start) as usize * nmode * plane_len(dims);
+            Ok(Frames {
+                range,
+                plan,
+                len: to_u32("stack length", len)?,
+            })
+        })
+        .collect::<Result<Vec<_>, EngineError>>()?;
+    Ok((frames, table, plans))
 }
 
-impl SizeBufs {
-    fn new(stream: &Arc<CudaStream>, dims: &ViewDims, nf: u32) -> Result<Self, EngineError> {
-        let len = nf as usize * dims.nmode as usize * plane_len(dims);
-        Ok(Self {
-            plan: Plan2d::new(
-                stream,
-                dims.frame[0] as usize,
-                nf as usize * dims.nmode as usize,
-            )?,
-            scratch: DeviceBuffer::zeroed(stream, len)?,
-        })
-    }
+/// Values of `nf_max` frames' exit waves, what every stack buffer holds.
+fn stack_buf_len(dims: &ViewDims, table: &StackTable) -> usize {
+    table.nf_max() as usize * dims.nmode as usize * plane_len(dims)
 }
 
 /// `0 .. nframe` in consecutive ranges of `size` frames, the last one shorter when `size`
 /// does not divide `nframe`, each with the index of its length in the returned lengths.
-fn split(nframe: u32, size: u32) -> (Vec<(Span, usize)>, Vec<u32>) {
+fn split(nframe: u32, size: u32) -> (Vec<(Range<u32>, usize)>, Vec<u32>) {
     let mut lens: Vec<u32> = Vec::new();
     let mut ranges = Vec::new();
     let mut f0 = 0;
@@ -101,7 +124,7 @@ fn split(nframe: u32, size: u32) -> (Vec<(Span, usize)>, Vec<u32>) {
                 lens.len() - 1
             }
         };
-        ranges.push((Span(f0..f1), idx));
+        ranges.push((f0..f1, idx));
         f0 = f1;
     }
     (ranges, lens)
@@ -157,8 +180,14 @@ pub struct GpuPtycho {
     probe_dims: [usize; 3],
     obj_sums: UpdateSums,
     probe_sums: UpdateSums,
+    obj_len: u32,
+    probe_len: u32,
+    table: StackTable,
     stacks: Vec<StackBufs>,
-    sizes: Vec<SizeBufs>,
+    /// One plan per stack length, indexed by [`Frames::plan`].
+    plans: Vec<Plan2d>,
+    /// One stack's worth of exit waves: DM's `PO`, the LLK pass's forward stack.
+    scratch: DeviceBuffer<C32>,
     nb_obs: usize,
     /// The probe-frame FFT of [`zero_phase_ramp`], which runs on the host.
     fft: Fft2,
@@ -233,25 +262,23 @@ impl GpuPtycho {
         let kernels = Kernels::load(ctx)?;
         let rpie = RpieKernels::load(&kernels)?;
         let views = Views::new(stream, dims, &addrs)?;
-        let (ranges, lens) = split(dims.nframe, to_u32("stack_size", options.stack_size)?);
-        let sizes = lens
-            .iter()
-            .map(|&nf| SizeBufs::new(stream, &dims, nf))
-            .collect::<Result<Vec<_>, _>>()?;
-        let n = plane_len(&dims);
-        let stacks = ranges
+        let (frames, table, plans) =
+            stacks(stream, &dims, to_u32("stack_size", options.stack_size)?)?;
+        let len = stack_buf_len(&dims, &table);
+        let stacks = frames
             .into_iter()
-            .map(|(span, size)| {
-                let nf = span.nf() as usize;
+            .map(|frames| {
                 Ok(StackBufs {
-                    span,
-                    size,
-                    psi: DeviceBuffer::zeroed(stream, nf * dims.nmode as usize * n)?,
-                    llk: DeviceBuffer::zeroed(stream, nf)?,
+                    frames,
+                    psi: DeviceBuffer::zeroed(stream, len)?,
+                    llk: DeviceBuffer::zeroed(stream, table.nf_max() as usize)?,
                 })
             })
             .collect::<Result<Vec<_>, EngineError>>()?;
         Ok(Self {
+            obj_len: to_u32("object length", object.as_slice().len())?,
+            probe_len: to_u32("probe length", probe.as_slice().len())?,
+            scratch: DeviceBuffer::zeroed(stream, len)?,
             counts: DeviceBuffer::from_host(stream, scan.counts.as_slice())?,
             obj: upload(stream, &object)?,
             probe: upload(stream, &probe)?,
@@ -265,8 +292,9 @@ impl GpuPtycho {
             kernels,
             rpie,
             views,
+            table,
             stacks,
-            sizes,
+            plans,
             cycle: 0,
             history: Vec::new(),
         })
@@ -308,8 +336,13 @@ impl GpuPtycho {
     /// Normalised LLK of the current object and probe, as [`crate::Ptycho::llk`]; the
     /// exit-wave stacks are left as they are.
     pub fn llk(&mut self) -> Result<Llk, EngineError> {
-        self.forward_llk()?;
+        self.forward_llk(&self.context())?;
         self.read_llk()
+    }
+
+    /// A fresh eager context on the stream: one per cycle, so leases end with its work.
+    fn context(&self) -> ExecutionContext {
+        ExecutionContext::new(self.stream.clone())
     }
 
     fn record(&mut self, algorithm: Algorithm, llk: Llk) {
@@ -321,28 +354,22 @@ impl GpuPtycho {
     }
 
     /// LLK partials of the current estimate into every stack's `llk`, through the scratch
-    /// stacks.
-    fn forward_llk(&mut self) -> Result<(), EngineError> {
+    /// stack.
+    fn forward_llk(&mut self, ctx: &ExecutionContext) -> Result<(), GpuError> {
         let dims = *self.views.dims();
-        for st in &mut self.stacks {
-            let sz = &mut self.sizes[st.size];
+        for (s, st) in self.stacks.iter_mut().enumerate() {
+            let stack = self.table.at(s);
             self.kernels.obj_probe_to_psi(
-                &self.stream,
+                ctx,
                 &self.views,
-                st.span.arg(),
+                stack,
                 &self.obj,
                 &self.probe,
-                &mut sz.scratch,
+                &mut self.scratch,
             )?;
-            sz.plan.forward_inplace(&mut sz.scratch)?;
-            self.kernels.llk(
-                &self.stream,
-                &dims,
-                st.span.arg(),
-                &self.counts,
-                &sz.scratch,
-                &mut st.llk,
-            )?;
+            self.plans[st.frames.plan].forward_inplace(ctx, &mut self.scratch)?;
+            self.kernels
+                .llk(ctx, &dims, stack, &self.counts, &self.scratch, &mut st.llk)?;
         }
         Ok(())
     }
@@ -352,7 +379,8 @@ impl GpuPtycho {
     fn read_llk(&self) -> Result<Llk, EngineError> {
         let mut partials = Vec::with_capacity(self.views.dims().nframe as usize);
         for st in &self.stacks {
-            partials.extend(st.llk.to_host_vec(&self.stream)?);
+            let llk = st.llk.to_host_vec(&self.stream)?;
+            partials.extend_from_slice(&llk[..st.frames.nf() as usize]);
         }
         let s = LlkSums::from_partials(&partials);
         Ok(Llk {
@@ -366,52 +394,49 @@ impl GpuPtycho {
 
     /// Fourier-modulus projection of stack `s`'s exit waves in place: FFT, `apply_amplitude`,
     /// inverse FFT. With `llk`, the stack's LLK partials of the forward stack are taken first.
-    fn project(&mut self, s: usize, llk: bool) -> Result<(), EngineError> {
+    fn project(&mut self, ctx: &ExecutionContext, s: usize, llk: bool) -> Result<(), GpuError> {
         let dims = *self.views.dims();
+        let stack = self.table.at(s);
         let st = &mut self.stacks[s];
-        let plan = &self.sizes[st.size].plan;
-        plan.forward_inplace(&mut st.psi)?;
+        let plan = &mut self.plans[st.frames.plan];
+        plan.forward_inplace(ctx, &mut st.psi)?;
         if llk {
-            self.kernels.llk(
-                &self.stream,
-                &dims,
-                st.span.arg(),
-                &self.counts,
-                &st.psi,
-                &mut st.llk,
-            )?;
+            self.kernels
+                .llk(ctx, &dims, stack, &self.counts, &st.psi, &mut st.llk)?;
         }
-        self.kernels.apply_amplitude(
-            &self.stream,
-            &dims,
-            st.span.arg(),
-            &self.counts,
-            &mut st.psi,
-        )?;
-        plan.inverse_inplace(&mut st.psi)?;
+        self.kernels
+            .apply_amplitude(ctx, &dims, stack, &self.counts, &mut st.psi)?;
+        plan.inverse_inplace(ctx, &mut st.psi)?;
         Ok(())
     }
 
     /// Adds stack `s`'s object and/or probe update sums (PyNX `Psi2Obj`, `Psi2Probe`) from its
     /// exit waves and the current arrays.
-    fn accumulate(&mut self, s: usize, obj: bool, probe: bool) -> Result<(), EngineError> {
-        let st = &self.stacks[s];
+    fn accumulate(
+        &mut self,
+        ctx: &ExecutionContext,
+        s: usize,
+        obj: bool,
+        probe: bool,
+    ) -> Result<(), GpuError> {
+        let stack = self.table.at(s);
+        let psi = &self.stacks[s].psi;
         if obj {
             self.kernels.psi_to_obj(
-                &self.stream,
+                ctx,
                 &self.views,
-                st.span.arg(),
-                &st.psi,
+                stack,
+                psi,
                 &self.probe,
                 &mut self.obj_sums,
             )?;
         }
         if probe {
             self.kernels.psi_to_probe(
-                &self.stream,
+                ctx,
                 &self.views,
-                st.span.arg(),
-                &st.psi,
+                stack,
+                psi,
                 &self.obj,
                 &mut self.probe_sums,
             )?;
@@ -420,36 +445,44 @@ impl GpuPtycho {
     }
 
     /// Zeroes the sums of the arrays that have an inertia.
-    fn zero_sums(&mut self, obj: Option<f64>, probe: Option<f64>) -> Result<(), EngineError> {
+    fn zero_sums(
+        &mut self,
+        ctx: &ExecutionContext,
+        obj: Option<f64>,
+        probe: Option<f64>,
+    ) -> Result<(), GpuError> {
         if obj.is_some() {
-            self.obj_sums.zero(&self.stream)?;
+            self.obj_sums.zero(ctx)?;
         }
         if probe.is_some() {
-            self.probe_sums.zero(&self.stream)?;
+            self.probe_sums.zero(ctx)?;
         }
         Ok(())
     }
 
     /// PyNX `ObjNorm` / `ProbeNorm` from the accumulated sums, for the arrays that have an
-    /// inertia.
-    fn apply_sums(&mut self, obj: Option<f64>, probe: Option<f64>) -> Result<(), EngineError> {
+    /// inertia; the object only on the tiles some view reaches.
+    fn apply_sums(
+        &mut self,
+        ctx: &ExecutionContext,
+        obj: Option<f64>,
+        probe: Option<f64>,
+    ) -> Result<(), GpuError> {
         if let Some(inertia) = obj {
-            let n = to_u32("object length", self.obj.len())?;
-            self.kernels.update_from_sums(
-                &self.stream,
+            self.kernels.update_obj_from_sums(
+                ctx,
+                &self.views,
                 &mut self.obj,
-                &self.obj_sums,
-                n,
+                &mut self.obj_sums,
                 inertia as f32,
             )?;
         }
         if let Some(inertia) = probe {
-            let n = to_u32("probe length", self.probe.len())?;
             self.kernels.update_from_sums(
-                &self.stream,
+                ctx,
                 &mut self.probe,
-                &self.probe_sums,
-                n,
+                &mut self.probe_sums,
+                self.probe_len,
                 inertia as f32,
             )?;
         }

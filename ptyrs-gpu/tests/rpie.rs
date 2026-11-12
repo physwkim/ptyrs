@@ -2,14 +2,17 @@
 
 use std::sync::Arc;
 
+use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, DeviceCopy};
 use ptyrs_gpu::{C32, Kernels, MASKED, RpieKernels, ViewAddr, ViewDims, Views, Weight};
 
-fn setup() -> (Arc<CudaStream>, RpieKernels) {
+/// A stream, an eager execution context on it and the rPIE kernels.
+fn setup() -> (Arc<CudaStream>, ExecutionContext, RpieKernels) {
     let ctx = CudaContext::new(0).expect("CUDA device 0");
     let kernels = Kernels::load(&ctx).expect("load ptyrs-gpu kernels");
     let rpie = RpieKernels::load(&kernels).expect("bind the rPIE kernels");
-    (ctx.default_stream(), rpie)
+    let stream = ctx.default_stream();
+    (stream.clone(), ExecutionContext::new(stream), rpie)
 }
 
 /// Deterministic values in `[-scale, scale)`.
@@ -51,7 +54,7 @@ fn max_rel(got: &[C32], want: &[(f64, f64)], floor: f64) -> f64 {
 
 #[test]
 fn amplitude_matches_ptychi_formula() {
-    let (stream, k) = setup();
+    let (stream, ctx, k) = setup();
     let (ny, nx, nmode, nframe) = (8usize, 8usize, 2usize, 3usize);
     let n = ny * nx;
     let dims = ViewDims {
@@ -106,7 +109,7 @@ fn amplitude_matches_ptychi_formula() {
     }
     let c = up(&stream, &counts);
     let mut p = up(&stream, &psi);
-    k.amplitude(&stream, &views, f0 as u32..f1 as u32, &c, &mut p)
+    k.amplitude(&ctx, &views, f0 as u32..f1 as u32, &c, &mut p)
         .unwrap();
     let got = p.to_host_vec(&stream).unwrap();
     let err = max_rel(&got, &want, 1e-6);
@@ -115,7 +118,7 @@ fn amplitude_matches_ptychi_formula() {
 
 #[test]
 fn power_max_and_weights_match_f64() {
-    let (stream, k) = setup();
+    let (stream, ctx, k) = setup();
     let (nk, n) = (3usize, 300usize);
     let x = noise(nk * n, 3, 1.0);
     let w = noise(nk * n, 5, 1.5);
@@ -130,9 +133,9 @@ fn power_max_and_weights_match_f64() {
     let dw = up(&stream, &w);
     let mut m_all = DeviceBuffer::<f32>::zeroed(&stream, 1).unwrap();
     let mut m_per = DeviceBuffer::<f32>::zeroed(&stream, nk).unwrap();
-    k.power_max(&stream, &dw, 1, nk as u32, n as u32, &mut m_all)
+    k.power_max(&ctx, &dw, 1, nk as u32, n as u32, &mut m_all)
         .unwrap();
-    k.power_max(&stream, &dw, nk as u32, 1, n as u32, &mut m_per)
+    k.power_max(&ctx, &dw, nk as u32, 1, n as u32, &mut m_per)
         .unwrap();
     let got_all = m_all.to_host_vec(&stream).unwrap()[0] as f64;
     assert!((got_all - all).abs() < 1e-6 * all, "{got_all} vs {all}");
@@ -157,20 +160,19 @@ fn power_max_and_weights_match_f64() {
         };
         let dx = up(&stream, &x);
         let mut out = DeviceBuffer::<C32>::zeroed(&stream, nk * n).unwrap();
-        k.weight(&stream, &dx, &dw, mx, &mut out, spec).unwrap();
+        k.weight(&ctx, &dx, &dw, mx, &mut out, spec).unwrap();
         let got = out.to_host_vec(&stream).unwrap();
         let err = max_rel(&got, &want, 0.0);
         assert!(err < 1e-5, "weight per_plane={per_plane}: {err:e}");
         let mut inplace = up(&stream, &x);
-        k.weight_inplace(&stream, &mut inplace, &dw, mx, spec)
-            .unwrap();
+        k.weight_inplace(&ctx, &mut inplace, &dw, mx, spec).unwrap();
         assert_eq!(inplace.to_host_vec(&stream).unwrap(), got);
     }
 }
 
 #[test]
 fn rpie_shapes_are_checked() {
-    let (stream, k) = setup();
+    let (stream, ctx, k) = setup();
     let w = up(&stream, &noise(8, 1, 1.0));
     let mx = DeviceBuffer::<f32>::zeroed(&stream, 1).unwrap();
     let mut out = DeviceBuffer::<C32>::zeroed(&stream, 8).unwrap();
@@ -181,7 +183,7 @@ fn rpie_shapes_are_checked() {
         alpha: 0.1,
     };
     // `per_plane` needs one max per plane.
-    assert!(k.weight(&stream, &w, &w, &mx, &mut out, spec).is_err());
+    assert!(k.weight(&ctx, &w, &w, &mx, &mut out, spec).is_err());
     let mut short = DeviceBuffer::<f32>::zeroed(&stream, 1).unwrap();
-    assert!(k.power_max(&stream, &w, 2, 1, 8, &mut short).is_err());
+    assert!(k.power_max(&ctx, &w, 2, 1, 8, &mut short).is_err());
 }

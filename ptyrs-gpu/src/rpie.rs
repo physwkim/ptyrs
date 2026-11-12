@@ -14,7 +14,8 @@
 
 use std::ops::Range;
 
-use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig};
+use cuda_async::device_operation::ExecutionContext;
+use cuda_core::{DeviceBuffer, LaunchConfig};
 use ptyrs_kernels::pixel::PIXEL_THREADS;
 use ptyrs_kernels::rpie::{WeightGeom, rpie_kernels};
 
@@ -50,7 +51,7 @@ impl RpieKernels {
     /// FFT then yields pty-chi's corrected exit wave. `counts` holds the whole scan.
     pub fn amplitude(
         &self,
-        stream: &CudaStream,
+        ctx: &ExecutionContext,
         views: &Views,
         frames: Range<u32>,
         counts: &DeviceBuffer<u16>,
@@ -69,7 +70,7 @@ impl RpieKernels {
         check_len("psi", psi, nf as usize * d.nmode as usize * n)?;
         let (_, config) = elems(nf as usize * n)?;
         self.base
-            .launch(stream, &[counts.storage()], &[psi.storage()], || {
+            .launch(ctx, &[counts.storage()], &[psi.storage()], |stream| {
                 // SAFETY: lengths checked above; `Views::new` checked the frame shape.
                 unsafe {
                     self.module.rpie_amplitude(
@@ -91,7 +92,7 @@ impl RpieKernels {
     /// planes of `n` values.
     pub fn power_max(
         &self,
-        stream: &CudaStream,
+        ctx: &ExecutionContext,
         x: &DeviceBuffer<C32>,
         ngroup: u32,
         nsum: u32,
@@ -111,7 +112,7 @@ impl RpieKernels {
             shared_mem_bytes: 0,
         };
         self.base
-            .launch(stream, &[x.storage()], &[out.storage()], || {
+            .launch(ctx, &[x.storage()], &[out.storage()], |stream| {
                 // SAFETY: lengths checked above; one PIXEL_THREADS block per group.
                 unsafe {
                     self.module
@@ -124,7 +125,7 @@ impl RpieKernels {
     /// `spec`.
     pub fn weight(
         &self,
-        stream: &CudaStream,
+        ctx: &ExecutionContext,
         x: &DeviceBuffer<C32>,
         w: &DeviceBuffer<C32>,
         mx: &DeviceBuffer<f32>,
@@ -136,13 +137,13 @@ impl RpieKernels {
         check_len("out", out, total)?;
         let reads = [x.storage(), w.storage(), mx.storage()];
         let ptrs = [dptr(x), dptr(w), dptr(mx), dptr(out)];
-        self.launch_weight(stream, spec, ptrs, &reads, &[out.storage()])
+        self.launch_weight(ctx, spec, ptrs, &reads, &[out.storage()])
     }
 
     /// [`Self::weight`] in place on `x`.
     pub fn weight_inplace(
         &self,
-        stream: &CudaStream,
+        ctx: &ExecutionContext,
         x: &mut DeviceBuffer<C32>,
         w: &DeviceBuffer<C32>,
         mx: &DeviceBuffer<f32>,
@@ -152,21 +153,21 @@ impl RpieKernels {
         check_len("x", x, total)?;
         let reads = [w.storage(), mx.storage()];
         let ptrs = [dptr(x), dptr(w), dptr(mx), dptr(x)];
-        self.launch_weight(stream, spec, ptrs, &reads, &[x.storage()])
+        self.launch_weight(ctx, spec, ptrs, &reads, &[x.storage()])
     }
 
     /// Launches `rpie_weight` on `[x, w, mx, out]`, which [`Weight::check`] and the caller
     /// checked; `out` may be `x`, since each thread reads and writes only its own element.
     fn launch_weight(
         &self,
-        stream: &CudaStream,
+        ctx: &ExecutionContext,
         spec: Weight,
         [x, w, mx, out]: [*mut f32; 4],
         reads: &[&cuda_core::RawDeviceBuffer],
         writes: &[&cuda_core::RawDeviceBuffer],
     ) -> Result<(), Error> {
         let (_, config) = elems(spec.nk as usize * spec.n as usize)?;
-        self.base.launch(stream, reads, writes, || {
+        self.base.launch(ctx, reads, writes, |stream| {
             // SAFETY: the buffers behind the pointers hold what the callers checked.
             unsafe {
                 self.module.rpie_weight(

@@ -10,6 +10,7 @@ num-complex.workspace = true
 rustfft.workspace = true
 thiserror.workspace = true
 cuda-core.workspace = true
+cuda-async.workspace = true
 ptyrs-fft = { path = "../ptyrs-fft" }
 ptyrs-gpu = { path = "../ptyrs-gpu" }
 
