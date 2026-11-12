@@ -103,7 +103,7 @@ pub struct LsqmlPre {
 ///
 /// `NY == g.ny`; `p` as [`LsqmlCols`] says for `g`; `ctl` one entry; launch as above.
 #[device]
-unsafe fn cols<const NY: u32>(p: LsqmlCols, ctl: *const StackCtl, g: StackGeom, flags: u32) {
+pub unsafe fn cols<const NY: u32>(p: LsqmlCols, ctl: *const StackCtl, g: StackGeom, flags: u32) {
     let (f0, nf) = unsafe { stack_frames(ctl, g) };
     let fl = thread::blockIdx_y();
     if fl >= nf {
@@ -476,6 +476,8 @@ pub mod lsqml_kernels {
     ///
     /// `sums` holds `2 * span.nchunk` floats per position, `far` as [`LsqmlFar`] says, `order`
     /// over the span; grid `(1, 1, 1)`, block `(PIXEL_THREADS, 1, 1)`.
+    ///
+    /// [`lsqml_xi`]: LoadedModule::lsqml_xi
     #[kernel]
     pub unsafe fn lsqml_far_step(sums: *const f32, span: LsqmlSpan, far: LsqmlFar, last: u32) {
         static mut RED: SharedArray<f32, 256> = SharedArray::UNINIT;
@@ -595,6 +597,8 @@ pub mod lsqml_kernels {
     /// `sums` holds `6 * span.nchunk` floats per position, `a_far` `nframe`, `rec` `3 *
     /// nframe`, `step` two; `2 * trim < span.nb`; grid `(1, 1, 1)`, block `(PIXEL_THREADS, 1,
     /// 1)`.
+    ///
+    /// [`lsqml_dots`]: LoadedModule::lsqml_dots
     #[kernel]
     pub unsafe fn lsqml_step(
         sums: *mut f32,
