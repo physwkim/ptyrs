@@ -1,5 +1,5 @@
-//! pty-chi BH on the GPU ([`crate::Bh`]), in the call sequence of `ptyrs_gpu::BhKernels`;
-//! the step's scalars stay on the device.
+//! pty-chi BH on the GPU ([`crate::Bh`]), in the call sequence of `ptyrs_gpu::BhKernels`, its
+//! dot products by `ptyrs_tile::TileDots`; the step's scalars stay on the device.
 
 use cuda_async::device_operation::ExecutionContext;
 use ptyrs_gpu::{BhBatch, BhDisp, BhFieldsRef, BhScan, BhVar, Error as GpuError};

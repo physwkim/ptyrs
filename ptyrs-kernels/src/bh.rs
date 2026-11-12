@@ -107,41 +107,6 @@ pub mod bh_kernels {
         }
     }
 
-    /// One array's block partials of a step's dot products: block `b` writes `part[2b] =
-    /// scale Σ |g|²` and `part[2b + 1] = Σ Re(conj(g) prev)` (0 without `cg`, and `prev`
-    /// unread) over the elements `i ≡ b * PIXEL_THREADS + t (mod CG_BLOCKS *
-    /// PIXEL_THREADS)`.
-    ///
-    /// # Safety
-    ///
-    /// `g`, `prev` hold `n` complex values, `part` `2 * gridDim.x` floats; block
-    /// `(PIXEL_THREADS, 1, 1)`.
-    #[kernel]
-    pub unsafe fn bh_dots(
-        g: *const f32,
-        prev: *const f32,
-        n: u32,
-        scale: f32,
-        cg: u32,
-        part: *mut f32,
-    ) {
-        static mut RED: SharedArray<f32, 512> = SharedArray::UNINIT;
-        let stride = thread::gridDim_x() as usize * PIXEL_THREADS as usize;
-        let mut acc = [0.0f32; 2];
-        let mut i = global_index();
-        while i < n as usize {
-            let a = unsafe { load_c(g, i) };
-            acc[0] += a.0 * a.0 + a.1 * a.1;
-            if cg != 0 {
-                acc[1] += cmul_conj(a, unsafe { load_c(prev, i) }).0;
-            }
-            i += stride;
-        }
-        acc[0] *= scale;
-        let out = unsafe { part.add(2 * thread::blockIdx_x() as usize) };
-        unsafe { super::store_sums::<2>((&raw mut RED).cast::<f32>(), acc, out) }
-    }
-
     /// The stack's far-field derivatives before their forward FFT, in `obj_probe_to_psi`'s
     /// layout: for view `w = views[f0 * nmode + kl]` and `q = exp(i quad r²)`, `lu = q (u_P
     /// O_w + P u_O,w)` with `u_P = u_scale * u.probe`, and with `cg`, `lv = q (v_P O_w + P
@@ -285,11 +250,11 @@ pub mod bh_kernels {
         unsafe { super::store_sums::<3>((&raw mut RED).cast::<f32>(), acc, o) }
     }
 
-    /// One batch's step from the `ndots` pairs of `dots` ([`bh_dots`]: `(⟨g, Pg⟩, ⟨g, D′⟩)`)
-    /// and the `nhess` triples of `hess` ([`bh_hess_frames`] with `u = Pg`, `v = D′`), each
-    /// summed in a fixed order: `β = H(u, v) / H(v, v)` with `cg`, else 0; `top = ⟨g, Pg⟩ −
-    /// β ⟨g, D′⟩ = −⟨g, D⟩` and `bottom = H(u, u) − 2β H(u, v) + β² H(v, v) = H(D, D)` for
-    /// `D = β D′ − Pg`; `α = top / bottom * frac`. Writes `out[0..4] = (β, α, top,
+    /// One batch's step from the `ndots` pairs of `dots` (`ptyrs_tile::TileDots::dots`: `(⟨g,
+    /// Pg⟩, ⟨g, D′⟩)`) and the `nhess` triples of `hess` ([`bh_hess_frames`] with `u = Pg`, `v =
+    /// D′`), each summed in a fixed order: `β = H(u, v) / H(v, v)` with `cg`, else 0; `top =
+    /// ⟨g, Pg⟩ − β ⟨g, D′⟩ = −⟨g, D⟩` and `bottom = H(u, u) − 2β H(u, v) + β² H(v, v) = H(D,
+    /// D)` for `D = β D′ − Pg`; `α = top / bottom * frac`. Writes `out[0..4] = (β, α, top,
     /// bottom)`.
     ///
     /// # Safety

@@ -8,10 +8,10 @@
 //! sums, per stack: [`Kernels::obj_probe_to_psi`] into its `psi`, forward FFT,
 //! [`BhKernels::residual`] into its `r`, inverse FFT of `r`, [`Kernels::psi_to_obj`] and
 //! [`Kernels::psi_to_probe`] of `r`: the sums' `num` is the gradient `g`. Then, with `u = g`
-//! scaled by `ρ²` on the probe and for CG `v` the last direction, [`BhKernels::dots`]; per
-//! stack [`BhKernels::far`], forward FFTs of `lu` (and `lv`) and [`BhKernels::hess_frames`];
-//! [`BhKernels::step`], then [`BhKernels::update`] of each array, which consumes the sums.
-//! The step never leaves the device.
+//! scaled by `ρ²` on the probe and for CG `v` the last direction, `ptyrs_tile::TileDots::dots`;
+//! per stack [`BhKernels::far`], forward FFTs of `lu` (and `lv`) and
+//! [`BhKernels::hess_frames`]; [`BhKernels::step`], then [`BhKernels::update`] of each array,
+//! which consumes the sums. The step never leaves the device.
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -313,52 +313,6 @@ impl BhKernels {
                 )
             }
         })
-    }
-
-    /// The dot products of the step along `d`, `⟨u, Pu⟩` and (CG) `⟨u, v⟩`, as block partials
-    /// into the first `2 * CG_BLOCKS` pairs of `parts`, object then probe.
-    pub fn dots(
-        &self,
-        ctx: &ExecutionContext,
-        dims: &ViewDims,
-        d: &BhDisp<'_>,
-        parts: &mut DeviceBuffer<f32>,
-    ) -> Result<(), Error> {
-        d.check(dims)?;
-        check_len("parts", parts, bh_parts(dims))?;
-        let config = LaunchConfig {
-            grid_dim: (CG_BLOCKS, 1, 1),
-            block_dim: (PIXEL_THREADS, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        let scales = [1.0, d.u_scale];
-        for (i, n) in lens(dims).into_iter().enumerate() {
-            let (g, prev) = (d.u[i], d.v.map(|v| v[i]));
-            let out = dptr::<f32, f32>(parts).wrapping_add(2 * i * CG_BLOCKS as usize);
-            let reads: Vec<_> = [Some(g), prev]
-                .into_iter()
-                .flatten()
-                .map(|b| b.storage())
-                .collect();
-            self.base
-                .launch(ctx, &reads, &[parts.storage()], |stream| {
-                    // SAFETY: lengths checked above; CG_BLOCKS blocks of PIXEL_THREADS write the
-                    // array's CG_BLOCKS pairs; `prev` is read only when given.
-                    unsafe {
-                        self.module.bh_dots(
-                            stream,
-                            config,
-                            dptr(g),
-                            dptr(prev.unwrap_or(g)),
-                            n,
-                            scales[i],
-                            prev.is_some().into(),
-                            out,
-                        )
-                    }
-                })?;
-        }
-        Ok(())
     }
 
     /// The stack's far-field derivatives before their forward FFT, in
