@@ -2,19 +2,21 @@
 //!
 //! The scan is cut once into [`NLEAF`] leaf regions and a run on `g` GPUs merges them
 //! ([`Partition::merge`]), so every order fixed per leaf is the same on 1, 2 and 4 GPUs:
-//! exit waves are computed by their leaf's owner in stacks of `stack` frames per leaf; each
-//! object pixel adds its views in (leaf, frame) order, a region holding its own leaves' frames
-//! and, copied from their owners, the other leaves' frames that touch its tiles; the probe sums
-//! are one per leaf, added through a fixed pair tree; the regulariser's `max(den)` is an exact
-//! max over regions; the LLK is [`LlkSums::from_partials`] over frames by global index.
+//! a region computes the exit waves of its own leaves' frames and recomputes those of the other
+//! leaves' frames that touch its tiles, in stacks of `stack` frames per leaf; each object pixel
+//! adds its views in (leaf, frame) order; the probe sums are one per leaf, added through a
+//! fixed pair tree; the regulariser's `max(den)` is an exact max over regions; the LLK is
+//! [`LlkSums::from_partials`] over frames by global index. A recomputed exit wave has its
+//! owner's bits: the halo holds the owner's object under the whole footprint, the probe and
+//! counts are the same, and cuFFT gives a transform the same bits at any position of a batch.
 //!
 //! Per cycle, with [`Gpu::fence`] between the steps: A exit waves, LLK, projection, the leaf
-//! probe sums of the own stacks and their subtree; B gather of foreign exit waves, object sums
-//! and their max, the other regions' subtree roots pulled by copy engine and the pair tree
-//! above them; C the other regions' max words pulled by copy engine, object and probe
-//! updates, then each owner packs the updated rows its neighbours read; D each receiver pulls
-//! them by copy engine and unpacks its halo. The pair tree in B and all of D run on the side
-//! stream ([`Gpu::side`]), beside the object sums and the next A's stacks before the halo.
+//! probe sums of the own stacks and their subtree; B object sums and their max, the other
+//! regions' subtree roots pulled by copy engine and the pair tree above them; C the other
+//! regions' max words pulled by copy engine, object and probe updates, then each owner packs
+//! the updated rows its neighbours read; D each receiver pulls them by copy engine and unpacks
+//! its halo. The pair tree in B and all of D run on the side stream ([`Gpu::side`]), beside the
+//! object sums and the next A's stacks before the halo.
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -78,10 +80,8 @@ struct RegionPlan {
     /// Global frame of each local frame, in (leaf, frame) order.
     global: Vec<u32>,
     stacks: Vec<Stack>,
-    /// Stacks of the own leaves, ascending.
+    /// Stacks of the own leaves, ascending; the others' frames are recomputed.
     own: Vec<usize>,
-    /// First stack of each leaf with local frames.
-    leaf_stack0: [Option<usize>; NLEAF],
     /// Halo tiles some local view reads.
     halo_read: Vec<u32>,
 }
@@ -102,8 +102,6 @@ struct Plan {
     run: Partition,
     /// Leaves per region.
     k: usize,
-    /// Global frames of each leaf, ascending.
-    leaf_frames: Vec<Vec<u32>>,
     stack: usize,
     obj_inertia: Option<f32>,
     probe_inertia: Option<f32>,
@@ -183,7 +181,6 @@ impl Plan {
             let mut global = Vec::new();
             let mut stacks = Vec::new();
             let mut own = Vec::new();
-            let mut leaf_stack0 = [None; NLEAF];
             for (l, all) in leaf_frames.iter().enumerate() {
                 let mine = l / k == r;
                 let frames: Vec<u32> = if mine {
@@ -197,7 +194,6 @@ impl Plan {
                 if frames.is_empty() {
                     continue;
                 }
-                leaf_stack0[l] = Some(stacks.len());
                 let mut before_halo = true;
                 for chunk in frames.chunks(cfg.stack) {
                     let start = u(global.len())?;
@@ -248,14 +244,12 @@ impl Plan {
                 global,
                 stacks,
                 own,
-                leaf_stack0,
             });
         }
         let halo = halo_segs(&run, &regions, dims.nobj as usize);
         Ok(Self {
             run,
             k,
-            leaf_frames,
             stack: cfg.stack,
             obj_inertia: cfg.obj_inertia,
             probe_inertia: cfg.probe_inertia,
@@ -277,37 +271,6 @@ impl Plan {
     /// Probe elements.
     fn np(&self) -> usize {
         self.dims().nprobe as usize * self.n()
-    }
-
-    /// 64-bit words (one [`C32`] each) of one frame's exit waves.
-    fn plane(&self) -> usize {
-        self.dims().nmode as usize * self.n()
-    }
-
-    /// Exit-wave gather runs of region `r`: every foreign local frame from its owner's stack.
-    fn gather(&self, r: usize, ptrs: &[Ptrs]) -> Vec<Run> {
-        let rp = &self.regions[r];
-        let bytes = (self.plane() * size_of::<C32>()) as u64;
-        let mut runs = Vec::new();
-        for (s, st) in rp.stacks.iter().enumerate() {
-            let o = st.leaf / self.k;
-            if o == r {
-                continue;
-            }
-            let o0 = self.regions[o].leaf_stack0[st.leaf].expect("owner holds its leaf");
-            for j in st.frames.clone() {
-                let f = rp.global[j as usize];
-                let i = self.leaf_frames[st.leaf]
-                    .binary_search(&f)
-                    .expect("foreign frame of its leaf");
-                runs.push(Run {
-                    dst: ptrs[r].psi[s] + (j - st.frames.start) as u64 * bytes,
-                    src: ptrs[o].psi[o0 + i / self.stack] + (i % self.stack) as u64 * bytes,
-                    len: self.plane() as u64,
-                });
-            }
-        }
-        runs
     }
 
     /// Words of region `r`'s halo send and receive buffers.
@@ -438,7 +401,6 @@ fn halo_segs(run: &Partition, regions: &[RegionPlan], nobj: usize) -> Vec<HaloSe
 /// Device addresses a region exposes to its peers.
 struct Ptrs {
     ctx: Arc<Context>,
-    psi: Vec<u64>,
     halo_send: u64,
     halo_recv: u64,
     max_bits: u64,
@@ -448,7 +410,6 @@ struct Ptrs {
 
 /// What a region's exchange reads, built once all regions exist.
 struct Links {
-    gather: Runs,
     halo: Vec<Pull>,
     /// The other regions' probe subtree roots into [`Tree::pulled`].
     tree: Vec<Pull>,
@@ -672,7 +633,6 @@ impl State {
     fn ptrs(&self) -> Ptrs {
         Ptrs {
             ctx: self.obj.context().clone(),
-            psi: self.psi.iter().map(|b| b.cu_deviceptr()).collect(),
             halo_send: self.halo.send.cu_deviceptr(),
             halo_recv: self.halo.recv.cu_deviceptr(),
             max_bits: self
@@ -719,7 +679,6 @@ impl State {
             .map(|o| if o == r { ptrs[r].max_bits } else { word(o) })
             .collect();
         Ok(Links {
-            gather: Runs::new(s, &plan.gather(r, ptrs))?,
             halo: plan.halo_pulls(r, ptrs),
             tree,
             max: if self.obj_sums.is_some() {
@@ -765,8 +724,9 @@ impl State {
         let dims = *views.dims();
         let np = plan.np() as u32;
 
-        // A: own stacks, those before the halo while the side stream unpacks it. Each probe
-        // sum follows its stack's projection, whose exit waves are then still in L2.
+        // A: exit waves, those before the halo while the side stream unpacks it; the other
+        // leaves' stacks all read the halo. An own stack's probe sum follows its projection,
+        // whose exit waves are then still in L2.
         for s in leaf_sums.iter_mut() {
             ptyrs_gpu::zero(&ctx, &mut s.num)?;
             ptyrs_gpu::zero(&ctx, &mut s.den)?;
@@ -775,22 +735,23 @@ impl State {
             if !early {
                 gpu.join_side()?;
             }
-            for (i, &s) in rp.own.iter().enumerate() {
-                if rp.stacks[s].before_halo != early {
+            for (s, st) in rp.stacks.iter().enumerate() {
+                if st.before_halo != early {
                     continue;
                 }
+                let mine = rp.own.binary_search(&s).ok();
                 let at = table.at(s);
                 let psi = &mut psi[s];
                 k.obj_probe_to_psi(&ctx, views, at, obj, probe, psi)?;
                 fft.forward_inplace(&ctx, psi)
                     .map_err(ptyrs_gpu::Error::from)?;
-                if due {
+                if let (true, Some(i)) = (due, mine) {
                     k.llk(&ctx, &dims, at, counts, psi, &mut llk[i])?;
                 }
                 k.apply_amplitude(&ctx, &dims, at, counts, psi)?;
                 fft.inverse_inplace(&ctx, psi)
                     .map_err(ptyrs_gpu::Error::from)?;
-                if let Some(sums) = leaf_sums.get_mut(rp.stacks[s].leaf - r * plan.k) {
+                if let Some(sums) = mine.and_then(|_| leaf_sums.get_mut(st.leaf - r * plan.k)) {
                     k.psi_to_probe(&ctx, views, at, psi, obj, sums)?;
                 }
             }
@@ -803,8 +764,8 @@ impl State {
         }
         gpu.fence()?;
 
-        // B: probe pair tree above the subtree roots on the side stream; foreign exit waves,
-        // object sums and their max.
+        // B: probe pair tree above the subtree roots on the side stream; object sums and their
+        // max.
         if let Some(t) = tree.as_ref() {
             gpu.side(|x| {
                 // SAFETY: each pull reads an owner's subtree root, added before the fence and
@@ -820,9 +781,6 @@ impl State {
             })?;
         }
         if let Some(sums) = obj_sums.as_mut() {
-            // SAFETY: the runs address live exit-wave stacks, written before the fence and
-            // rewritten by their owners only after the next.
-            unsafe { ex.copy_runs(&stream, &links.gather)? };
             for (s, psi) in psi.iter().enumerate() {
                 k.psi_to_obj(&ctx, views, table.at(s), psi, probe, sums)?;
             }
@@ -884,10 +842,11 @@ impl State {
 /// What one region computes and exchanges each cycle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RegionLoad {
-    /// Frames whose exit waves it computes.
+    /// Frames of its own leaves: exit waves, LLK and probe sums.
     pub computed: usize,
-    /// Other regions' frames whose exit waves it copies for its object sums.
-    pub copied: usize,
+    /// Other regions' frames touching its tiles, whose exit waves it recomputes for its object
+    /// sums.
+    pub recomputed: usize,
     /// Halo tiles it pulls after the object update.
     pub halo_tiles: usize,
 }
@@ -952,7 +911,7 @@ impl DistAp {
                 let computed = rp.own.iter().map(|&s| rp.stacks[s].frames.len()).sum();
                 RegionLoad {
                     computed,
-                    copied: rp.global.len() - computed,
+                    recomputed: rp.global.len() - computed,
                     halo_tiles: rp.halo_read.len(),
                 }
             })

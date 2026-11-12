@@ -148,8 +148,8 @@ fn run(dir: &Path, pattern: &str, args: &[String]) -> Result<(), Box<dyn Error>>
     );
     for (r, (l, o)) in ap.loads().iter().zip(&ordinals).enumerate() {
         println!(
-            "  region {r} on {} ({}): computes {} frames, copies {}, pulls {} halo tiles",
-            devs[*o].pci_bus_id, devs[*o].name, l.computed, l.copied, l.halo_tiles
+            "  region {r} on {} ({}): computes {} frames, recomputes {}, pulls {} halo tiles",
+            devs[*o].pci_bus_id, devs[*o].name, l.computed, l.recomputed, l.halo_tiles
         );
     }
     println!(
