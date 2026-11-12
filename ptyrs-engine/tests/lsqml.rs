@@ -1,7 +1,8 @@
 //! LSQML against central differences and the float64 reference `refs/f64/lsqml_step.py`, run on
 //! the state it reads: `cargo run --release -p ptyrs-engine --example llk_trace -- <dir> dm 1 2
 //! 32 40 4`, i.e. `common::dm_scenario(32, 40, 2, 2e5, 4.0)` after `scale_obj_probe`. The
-//! reference writes `<dir>/lsqml_{gaussian,poisson}_{obj,probe,steps}_f64.txt`, saved to
+//! reference writes `<dir>/lsqml_{gaussian,poisson}_{obj,probe,steps}_f64.txt`, and
+//! `refs/f64/lsqml_epochs.py` on the same state `<dir>/lsqml_epochs_*_f64.txt`, saved to
 //! `tests/data`. Without eigenmodes ([`ProbeVariation::none`]) every frame sees the shared probe;
 //! `tests/opr.rs` checks the step with them.
 
@@ -142,8 +143,13 @@ fn directions_match_central_differences() {
     let (o, pr) = (p.object(), p.probe());
     for (cost, scale) in [(Cost::Amplitude, 2.0), (Cost::Poisson, 1.0)] {
         let none = ProbeVariation::none(pr.plane_shape());
-        let b = LsqmlBatch::new(
+        let run = Lsqml::new(LsqmlParams {
+            batch_size: FRAMES.len(),
             cost,
+            seed: 0,
+        });
+        let b = LsqmlBatch::new(
+            &run,
             batch(&p, FRAMES),
             p.observed(),
             p.quad(),
@@ -191,7 +197,7 @@ fn assert_ref(cost: Cost, obj: &str, probe: &str, steps: &str) {
         cost,
         seed: 0,
     };
-    let s = Lsqml::with_preconditioner(params, pre).step(
+    let s = Lsqml::new(params).with_preconditioner(pre).step(
         batch(&p, FRAMES),
         p.observed(),
         p.quad(),
@@ -216,9 +222,23 @@ fn assert_ref(cost: Cost, obj: &str, probe: &str, steps: &str) {
         eprintln!("{cost:?} {name}: max rel {err:.3e}");
         assert!(err < tol, "{cost:?} {name}: max rel {err:.3e}");
     }
-    for (name, text, lead, got, before, tol) in [
-        ("object", obj, 2, &*object, &**p.object(), 1e-12),
-        ("probe", probe, 3, &*pr, &**p.probe(), 1e-12),
+    assert_changes(cost, &p, &object, &pr, obj, probe, 1e-12);
+}
+
+/// The changes of `object` and `pr` from `p`'s against the reference's object (`iy ix re im`)
+/// and probe (`m iy ix re im`) ones, each to `tol` of its largest.
+fn assert_changes(
+    cost: Cost,
+    p: &Ptycho,
+    object: &Object,
+    pr: &Probe,
+    obj: &str,
+    probe: &str,
+    tol: f64,
+) {
+    for (name, text, lead, got, before) in [
+        ("object", obj, 2, &**object, &**p.object()),
+        ("probe", probe, 3, &**pr, &**p.probe()),
     ] {
         let got = re_im(&moved(got, -1.0, before));
         let want: Vec<f64> = table(text)
@@ -251,10 +271,70 @@ fn poisson_step_matches_lsqml_ref() {
     );
 }
 
+/// Three [`Lsqml::epoch`]s of batches of 16 (seed 7) against pty-chi's own run of them,
+/// `refs/f64/lsqml_epochs.py`: every step's `epoch frame a_far a_o a_p`, then the object and
+/// probe changes over the run. Epoch 0 is each frame's first visit, a Poisson `a_far` solved
+/// from 1/2; epochs 1–2 revisit every frame, from its `a_far` of the epoch before.
+fn assert_epochs_ref(cost: Cost, obj: &str, probe: &str, steps: &str) {
+    let p = state();
+    let (addr, obs, quad) = (p.addr(), p.observed(), p.quad());
+    let (mut object, mut pr) = (p.object().clone(), p.probe().clone());
+    let mut var = ProbeVariation::none(pr.plane_shape());
+    let mut lsqml = Lsqml::new(LsqmlParams {
+        batch_size: 16,
+        cost,
+        seed: 7,
+    });
+    let rows = table(steps);
+    let mut next = 0;
+    for e in 0..3 {
+        for s in lsqml.epoch(addr, obs, quad, &mut object, &mut pr, &mut var) {
+            let want = &rows[next..next + s.frames.len()];
+            next += s.frames.len();
+            let frames: Vec<usize> = want.iter().map(|r| r[1] as usize).collect();
+            assert!(want.iter().all(|r| r[0] == e as f64), "epoch {e}");
+            assert_eq!(s.frames, frames, "epoch {e}");
+            for (name, got, col, tol) in [
+                ("a_far", &s.a_far, 2, 1e-13),
+                ("a_o", &s.a_obj, 3, 1e-12),
+                ("a_p", &s.a_probe, 4, 1e-12),
+            ] {
+                let want: Vec<f64> = want.iter().map(|r| r[col]).collect();
+                let err = max_rel(got, &want);
+                eprintln!("{cost:?} epoch {e} {name}: max rel {err:.3e}");
+                assert!(err < tol, "{cost:?} epoch {e} {name}: max rel {err:.3e}");
+            }
+        }
+    }
+    assert_eq!(next, rows.len());
+    assert_changes(cost, &p, &object, &pr, obj, probe, 1e-12);
+}
+
+#[test]
+fn gaussian_epochs_match_lsqml_ref() {
+    assert_epochs_ref(
+        Cost::Amplitude,
+        include_str!("data/lsqml_epochs_gaussian_obj_f64.txt"),
+        include_str!("data/lsqml_epochs_gaussian_probe_f64.txt"),
+        include_str!("data/lsqml_epochs_gaussian_steps_f64.txt"),
+    );
+}
+
+#[test]
+fn poisson_epochs_match_lsqml_ref() {
+    assert_epochs_ref(
+        Cost::Poisson,
+        include_str!("data/lsqml_epochs_poisson_obj_f64.txt"),
+        include_str!("data/lsqml_epochs_poisson_probe_f64.txt"),
+        include_str!("data/lsqml_epochs_poisson_steps_f64.txt"),
+    );
+}
+
 /// [`Lsqml::epoch`] over 12 epochs of two batches with three eigenmodes of probe mode 0: the
 /// preconditioner starts from the renormalised shared probe's illumination, averages in the
-/// epoch's illumination at epochs 0–10 and stays at epoch 11, and every step is [`Lsqml::step`]
-/// with it on the epoch's [`random_batches`].
+/// epoch's illumination at epochs 0–10 and stays at epoch 11, and the epoch's steps are
+/// [`Lsqml::step`] of the run as it entered the epoch, with that preconditioner, on the epoch's
+/// [`random_batches`].
 #[test]
 fn epoch_follows_ptychi_preconditioner_schedule() {
     let p = state();
@@ -295,9 +375,11 @@ fn epoch_follows_ptychi_preconditioner_schedule() {
             prev
         };
         let (mut o2, mut p2, mut v2) = (object.clone(), pr.clone(), var.clone());
+        let replay = lsqml.clone();
         let steps = lsqml.epoch(addr, obs, quad, &mut object, &mut pr, &mut var);
         let pre = lsqml.preconditioner().unwrap();
         assert_eq!(pre.as_slice(), &next[..], "epoch {e}");
+        let mut replay = replay.with_preconditioner(pre.clone());
         let batches = random_batches(40, 20, 7, e);
         assert_eq!(
             steps.iter().map(|s| &s.frames).collect::<Vec<_>>(),
@@ -310,7 +392,7 @@ fn epoch_follows_ptychi_preconditioner_schedule() {
                 .flat_map(|&f| batch(&p, f..f + 1))
                 .copied()
                 .collect();
-            let r = lsqml.step(&views, obs, quad, &mut o2, &mut p2, &mut v2);
+            let r = replay.step(&views, obs, quad, &mut o2, &mut p2, &mut v2);
             assert_eq!(&r, s, "epoch {e}");
         }
         assert_eq!(o2.as_slice(), object.as_slice(), "epoch {e}");

@@ -226,8 +226,14 @@ fn step(
         cost,
         seed: 0,
     };
-    let lsqml = Lsqml::with_preconditioner(params, pre);
-    let s = lsqml.step(&views, obs, quad, &mut object, &mut probe, var);
+    let s = Lsqml::new(params).with_preconditioner(pre).step(
+        &views,
+        obs,
+        quad,
+        &mut object,
+        &mut probe,
+        var,
+    );
     assert_eq!(s.frames, frames);
     let d_obj = change(&object, p.object());
     let d_probe = change(&probe, p.probe());
