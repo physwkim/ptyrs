@@ -2,9 +2,11 @@
 //! unmasked pixels of their frames, across wraps and copies that overlap later records; a
 //! record of the first frames reads only those; a record with a frame not written for it is
 //! a stamp error, as is one ended a number of times other than the host counts it, and one
-//! with a frame never counted is an uncounted error.
+//! with a frame never counted is an uncounted error. A poll returns the records whose copies
+//! have completed without waiting for the rest.
 
 use std::sync::Arc;
+use std::sync::mpsc::{self, Sender};
 
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
@@ -134,8 +136,15 @@ impl Fixture {
     /// Enqueues `records` as numbered from `r0`, with no host sync between them: each stack's
     /// partials from its own staging buffer (uploaded first), then the ends, then the count.
     fn enqueue(&mut self, r0: usize, records: &[Record]) {
+        let staged = self.stage(r0, records.len());
+        self.enqueue_staged(r0, records, &staged);
+    }
+
+    /// Each stack's partials of records `r0 .. r0 + n` in their own staging buffers, uploaded
+    /// with a host sync.
+    fn stage(&self, r0: usize, n: usize) -> Vec<Vec<DeviceBuffer<LlkPartial>>> {
         let nf_max = self.table.nf_max() as usize;
-        let staged: Vec<Vec<DeviceBuffer<LlkPartial>>> = (r0..r0 + records.len())
+        (r0..r0 + n)
             .map(|r| {
                 let p = partials(r);
                 STACKS
@@ -147,7 +156,16 @@ impl Fixture {
                     })
                     .collect()
             })
-            .collect();
+            .collect()
+    }
+
+    /// [`Self::enqueue`] from partials [`Self::stage`] uploaded.
+    fn enqueue_staged(
+        &mut self,
+        r0: usize,
+        records: &[Record],
+        staged: &[Vec<DeviceBuffer<LlkPartial>>],
+    ) {
         for (i, rec) in records.iter().enumerate() {
             let dev = self.ring.device();
             let mut writer = dev.record();
@@ -176,6 +194,33 @@ impl Fixture {
     fn flush(&mut self) -> Result<Vec<(usize, LlkTotals)>, RingError> {
         self.ring.flush(&self.ctx)
     }
+
+    fn poll(&mut self) -> Vec<(usize, LlkTotals)> {
+        self.ring.poll(&self.ctx).unwrap()
+    }
+
+    /// Holds the stream at this point until the returned sender sends or drops.
+    fn hold(&self) -> Sender<()> {
+        let (release, held) = mpsc::channel();
+        self.stream
+            .launch_host_function(move || {
+                let _ = held.recv();
+            })
+            .unwrap();
+        release
+    }
+}
+
+fn check_whole(got: &[(usize, LlkTotals)], tags: std::ops::Range<usize>) {
+    assert_eq!(
+        got.iter().map(|(t, _)| *t).collect::<Vec<_>>(),
+        Vec::from_iter(tags)
+    );
+    for (r, t) in got {
+        let want = LlkSums::from_partials(&partials(*r));
+        assert_eq!(bits(&t.sums), bits(&want), "record {r}");
+        assert_eq!((t.nframe, t.nb_obs), (NFRAME, nb_obs(NFRAME)));
+    }
 }
 
 /// Flushes give each record once, in order, with the bits of `LlkSums::from_partials` of its
@@ -203,6 +248,25 @@ fn records_come_back_in_order_with_their_own_totals() {
             assert_eq!((t.nframe, t.nb_obs), (NFRAME, nb_obs(NFRAME)));
         }
     }
+}
+
+/// A poll never waits. With the stream held before every copy it returns nothing, and with
+/// record 4 counted onto record 0's unread slot it leaves record 4 uncopied. Released, it
+/// returns records 0 .. 4, whose copies completed, and enqueues record 4's, which the next
+/// poll returns; the flush after has nothing left.
+#[test]
+fn poll_returns_completed_copies_without_waiting() {
+    let mut f = fixture(4);
+    let staged = f.stage(0, 5);
+    let release = f.hold();
+    f.enqueue_staged(0, &[WHOLE, WHOLE, WHOLE, WHOLE, WHOLE], &staged);
+    assert!(f.poll().is_empty(), "every copy is held");
+    release.send(()).unwrap();
+    f.stream.synchronize().unwrap();
+    check_whole(&f.poll(), 0..4);
+    f.stream.synchronize().unwrap();
+    check_whole(&f.poll(), 4..5);
+    assert!(f.flush().unwrap().is_empty());
 }
 
 /// A record of frames `0 .. n` reads only those, whatever the later frames hold: at a stack's

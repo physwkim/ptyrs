@@ -6,8 +6,9 @@
 //! [`RecordWriter::end`], the only advance of the cursor, which consumes the writer and
 //! returns the [`Ended`] the host count takes. These are ordinary launches, legal in a
 //! capture. The host counts each record with [`LlkRing::enqueued`], giving its `n`, once its
-//! launches, or the graph holding them, are enqueued, and [`LlkRing::flush`] returns the
-//! [`LlkTotals`] of every record counted since the last flush, in order, each from
+//! launches, or the graph holding them, are enqueued. [`LlkRing::flush`] waits for and returns
+//! the [`LlkTotals`] of every record counted since the last read, in order, and
+//! [`LlkRing::poll`], without waiting, those of them whose copies have completed; each from
 //! [`LlkSums::from_partials`] over its frames with their unmasked pixels, which
 //! [`RingDevice::count`] counts once per frame. Every frame of record `k` must carry stamp
 //! `k`: a frame not pushed, a record ended but not counted or counted but not ended, or a
@@ -188,10 +189,10 @@ pub struct Ended(());
 
 /// An LLK ring of `nslot` records: the [`RingDevice`] the epochs write and its pinned host
 /// mirror, read in record order. The copy of record `k` is enqueued at most
-/// `max(nslot / 2, 1)` records after it, and the host waits for it only when it would
-/// otherwise overwrite `k`'s host slot, `nslot` records on, or on [`Self::flush`]; until
-/// then epochs keep enqueueing while earlier records download. `T` is the caller's tag of a
-/// record.
+/// `max(nslot / 2, 1)` records after it, or by an earlier [`Self::poll`], and the host waits
+/// for it only when it would otherwise overwrite `k`'s host slot, `nslot` records on, or on
+/// [`Self::flush`]; until then epochs keep enqueueing while earlier records download. `T` is
+/// the caller's tag of a record.
 pub struct LlkRing<T> {
     dev: RingDevice,
     /// Slot `k % nslot` holds record `k` once its copy has completed.
@@ -207,7 +208,7 @@ pub struct LlkRing<T> {
     /// The copies not yet read, oldest first: each one's end record and the event after it;
     /// their ranges tile `read .. copied`.
     copies: VecDeque<(u64, Event)>,
-    /// Records read since the last flush.
+    /// Records read since the last flush or poll.
     done: Vec<(T, LlkTotals)>,
 }
 
@@ -285,13 +286,30 @@ impl<T> LlkRing<T> {
         Ok(())
     }
 
-    /// The tags and totals of every record counted since the last flush, in order: enqueues
-    /// the copy of the records not yet copied and waits for every copy.
+    /// The tags and totals of every record counted since the last flush or poll, in order:
+    /// enqueues the copy of the records not yet copied and waits for every copy.
     pub fn flush(&mut self, ctx: &ExecutionContext) -> Result<Vec<(T, LlkTotals)>, RingError> {
         if self.copied < self.next {
             self.copy_out(ctx)?;
         }
         self.read_until(self.next)?;
+        Ok(std::mem::take(&mut self.done))
+    }
+
+    /// The tags and totals of the records counted since the last flush or poll whose copies
+    /// have completed, in order, without waiting for any copy. Then enqueues the copy of the
+    /// records not yet copied if their host slots hold no record left to read, so that a later
+    /// poll returns them however few records follow.
+    pub fn poll(&mut self, ctx: &ExecutionContext) -> Result<Vec<(T, LlkTotals)>, RingError> {
+        while let Some((_, event)) = self.copies.front() {
+            if !event.query()? {
+                break;
+            }
+            self.read_front()?;
+        }
+        if self.copied < self.next && self.next - self.read <= self.dev.nslot as u64 {
+            self.copy_out(ctx)?;
+        }
         Ok(std::mem::take(&mut self.done))
     }
 
@@ -338,24 +356,30 @@ impl<T> LlkRing<T> {
         Ok(())
     }
 
-    /// Reads every copy holding a record before `k`, oldest first; `k <= copied`. A stamp
-    /// error drops every record read since the last flush: a record whose slot a later one
-    /// of the same copy overwrote carries its own stamp, and only the later one's shows it.
+    /// Waits for and reads every copy holding a record before `k`, oldest first; `k <= copied`.
     fn read_until(&mut self, k: u64) -> Result<(), RingError> {
         while self.read < k {
-            let (end, event) = self.copies.front().expect("copies tile read .. copied");
+            let (_, event) = self.copies.front().expect("copies tile read .. copied");
             event.synchronize()?;
-            let (first, end) = (self.read, *end);
-            self.copies.pop_front();
-            self.read = end;
-            let tags: Vec<(T, u32)> = self.tags.drain(..(end - first) as usize).collect();
-            for (k, (tag, nframe)) in (first..end).zip(tags) {
-                match self.parse(k, nframe) {
-                    Ok(totals) => self.done.push((tag, totals)),
-                    Err(e) => {
-                        self.done.clear();
-                        return Err(e);
-                    }
+            self.read_front()?;
+        }
+        Ok(())
+    }
+
+    /// Reads the oldest copy not read, whose event has completed. A stamp error drops every
+    /// record read since the last flush or poll: a record whose slot a later one of the same
+    /// copy overwrote carries its own stamp, and only the later one's shows it.
+    fn read_front(&mut self) -> Result<(), RingError> {
+        let (end, _) = self.copies.pop_front().expect("a copy not read");
+        let first = self.read;
+        self.read = end;
+        let tags: Vec<(T, u32)> = self.tags.drain(..(end - first) as usize).collect();
+        for (k, (tag, nframe)) in (first..end).zip(tags) {
+            match self.parse(k, nframe) {
+                Ok(totals) => self.done.push((tag, totals)),
+                Err(e) => {
+                    self.done.clear();
+                    return Err(e);
                 }
             }
         }
