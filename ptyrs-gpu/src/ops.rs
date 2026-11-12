@@ -31,8 +31,8 @@
 //! # PyNX AP / DM in these calls (per stack, then per cycle)
 //!
 //! AP: `obj_probe_to_psi`, FFT, `apply_amplitude`, inverse FFT, `psi_to_obj` and/or
-//! `psi_to_probe` into zeroed sums; after the last stack, `update_obj_from_sums` with inertia
-//! 0.01 (object) or `update_from_sums` with 0.001 (probe).
+//! `psi_to_probe` into the sums; after the last stack, `update_obj_from_sums` with inertia
+//! 0.01 (object) or `update_from_sums` with 0.001 (probe), which consume the sums.
 //!
 //! DM (`alpha` 0.02, `psi` kept per stack across cycles): `obj_probe_to_psi` into a scratch
 //! `po`, then on the first cycle copy `po` into `psi` (PyNX starts from `psi = PO`, which
@@ -666,7 +666,6 @@ impl Kernels {
     /// `den` the same bilinear spread of `|P_v|^2`. Each object pixel adds its views in
     /// ascending view order, so splitting the frames into stacks does not change a bit of
     /// the result. Only the pixels of tiles the stack's views touch are read and written.
-    /// Zero `sums` before the first stack.
     pub fn psi_to_obj(
         &self,
         ctx: &ExecutionContext,
@@ -714,7 +713,7 @@ impl Kernels {
     /// Adds the stack's probe-update sums (PyNX `Psi2Probe`) to `sums` `[nprobe, ny, nx]`:
     /// `num += conj(O_v exp(i quad r^2)) psi_v` and `den += |O_v|^2` over the views of each
     /// probe mode, in ascending view order (stack-split invariant); a mode without a view in
-    /// the stack is not written. Zero `sums` before the first stack.
+    /// the stack is not written.
     pub fn psi_to_probe(
         &self,
         ctx: &ExecutionContext,
@@ -756,7 +755,8 @@ impl Kernels {
 
     /// Applies accumulated sums to the first `n` elements of `x` (PyNX `ObjNorm`):
     /// `x = (num + reg x) / max(den + reg, 1e-12)` with `reg = inertia * max(den[..n])`,
-    /// every operation rounded on its own. `sums.max_bits` is its scratch.
+    /// every operation rounded on its own; then zeroes `sums` over `..n`, which it consumed.
+    /// `sums.max_bits` is its scratch.
     pub fn update_from_sums(
         &self,
         ctx: &ExecutionContext,
@@ -785,16 +785,19 @@ impl Kernels {
                     .max_nonneg_f32(stream, max_config, dptr(den), n, dptr(max_bits))
             }
         })?;
-        let reads = [num.storage(), den.storage(), max_bits.storage()];
-        self.launch(ctx, &reads, &[x.storage()], |stream| {
+        let writes = [x.storage(), num.storage(), den.storage()];
+        let ptrs = SumPtrs {
+            num: dptr(num),
+            den: dptr(den),
+        };
+        self.launch(ctx, &[max_bits.storage()], &writes, |stream| {
             // SAFETY: all lengths checked above.
             unsafe {
                 self.module.normalize_update(
                     stream,
                     config,
                     dptr(x),
-                    dptr(num),
-                    dptr(den),
+                    ptrs,
                     n,
                     dptr(max_bits),
                     inertia,
@@ -804,10 +807,10 @@ impl Kernels {
     }
 
     /// [`Self::update_from_sums`] of the object `[nobj, nyo, nxo]` on the object tiles with
-    /// views only: `reg = inertia * max(den)` over their pixels, then the update of each. A
-    /// tile whose run is empty is neither read nor written, in `obj` or `sums`, so it keeps
-    /// its bits; with `den` zero there, as after [`UpdateSums::zero`], every other pixel
-    /// gets the bits `update_from_sums` gives it.
+    /// views only: `reg = inertia * max(den)` over their pixels, then the update of each,
+    /// zeroing its sums. A tile whose run is empty is neither read nor written, in `obj` or
+    /// `sums`, so it keeps its bits; when its `den` is zero, as in sums built zeroed (no stack
+    /// adds to such a tile), every other pixel gets the bits `update_from_sums` gives it.
     pub fn update_obj_from_sums(
         &self,
         ctx: &ExecutionContext,
@@ -839,17 +842,13 @@ impl Kernels {
                 )
             }
         })?;
-        let reads = [
-            num.storage(),
-            den.storage(),
-            tile_len.storage(),
-            max_bits.storage(),
-        ];
+        let reads = [tile_len.storage(), max_bits.storage()];
+        let writes = [obj.storage(), num.storage(), den.storage()];
         let ptrs = SumPtrs {
             num: dptr(num),
             den: dptr(den),
         };
-        self.launch(ctx, &reads, &[obj.storage()], |stream| {
+        self.launch(ctx, &reads, &writes, |stream| {
             // SAFETY: all lengths checked above.
             unsafe {
                 self.module.normalize_tiles(
@@ -918,7 +917,9 @@ impl Kernels {
 
 /// Numerator and denominator of an object or probe update (PyNX `obj_new`, `obj_norm`),
 /// element `i` of `den` belonging to element `i` of `num`, with the scratch the update
-/// needs, so that no launch allocates.
+/// needs, so that no launch allocates. They hold what was accumulated since the last
+/// [`Kernels::update_from_sums`] or [`Kernels::update_obj_from_sums`] consumed them; the
+/// only other reset is construction.
 pub struct UpdateSums {
     pub num: DeviceBuffer<C32>,
     pub den: DeviceBuffer<f32>,
@@ -946,12 +947,6 @@ impl UpdateSums {
             den,
             max_bits: DeviceBuffer::zeroed(stream, 1)?,
         })
-    }
-
-    /// Zeroes `num` and `den` on `ctx`'s stream.
-    pub fn zero(&mut self, ctx: &ExecutionContext) -> Result<(), Error> {
-        crate::zero(ctx, &mut self.num)?;
-        crate::zero(ctx, &mut self.den)
     }
 
     fn check(&self, need: usize) -> Result<(), Error> {

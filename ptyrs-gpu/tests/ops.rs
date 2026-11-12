@@ -511,13 +511,26 @@ fn object_update_skips_tiles_without_views() {
         c32_bits(&flat_obj.to_host_vec(&stream).unwrap()),
         c32_bits(&s.obj),
     );
-    let den = tiled.den.to_host_vec(&stream).unwrap();
+    let (num, den) = (
+        c32_bits(&tiled.num.to_host_vec(&stream).unwrap()),
+        tiled.den.to_host_vec(&stream).unwrap(),
+    );
     for i in 0..len {
         let want = if lit(i) { flat[i] } else { start[i] };
         assert_eq!(got[i], want, "pixel {i}, tile with views: {}", lit(i));
-        if !lit(i) {
-            assert_eq!(den[i].to_bits(), den0[i].to_bits(), "den {i} written");
-        }
+        // The update consumes the sums of the tiles with views and touches no other.
+        let (num_want, den_want) = if lit(i) {
+            ((0, 0), 0)
+        } else {
+            (c32_bits(&[nan])[0], den0[i].to_bits())
+        };
+        assert_eq!(num[i], num_want, "num {i}, tile with views: {}", lit(i));
+        assert_eq!(
+            den[i].to_bits(),
+            den_want,
+            "den {i}, tile with views: {}",
+            lit(i)
+        );
     }
     let moved = (0..len).filter(|&i| got[i] != start[i]).count();
     assert!(moved > nlit / 2, "only {moved} of {nlit} pixels updated");
@@ -676,12 +689,30 @@ fn update_from_sums_matches_f64() {
                 ((a.0 + reg * b.0) / d, (a.1 + reg * b.1) / d)
             })
             .collect();
+        // A tail past `n` the update must neither use nor consume.
+        let tail = (C32 { re: 5.0, im: -5.0 }, 1e30f32);
+        let (mut num_t, mut den_t) = (num_host.clone(), den_host.clone());
+        num_t.push(tail.0);
+        den_t.push(tail.1);
         let mut x = up(&stream, &x_host);
-        let mut sums =
-            UpdateSums::new(up(&stream, &num_host), up(&stream, &den_host), &stream).unwrap();
+        let mut sums = UpdateSums::new(up(&stream, &num_t), up(&stream, &den_t), &stream).unwrap();
         k.update_from_sums(&ex, &mut x, &mut sums, len as u32, inertia)
             .unwrap();
         let got = x.to_host_vec(&stream).unwrap();
+        let (num_after, den_after) = (
+            sums.num.to_host_vec(&stream).unwrap(),
+            sums.den.to_host_vec(&stream).unwrap(),
+        );
+        assert!(
+            num_after[..len] == vec![C32::default(); len][..]
+                && den_after[..len] == vec![0.0; len][..],
+            "n={len}: consumed sums not zeroed"
+        );
+        assert_eq!(
+            (num_after[len], den_after[len]),
+            tail,
+            "n={len}: tail written"
+        );
         let err = rel_l2(&got, &want);
         println!("update_from_sums n={len}: rel L2 {err:.2e}");
         assert!(err < 1e-6, "n={len}: rel L2 {err:.2e}");
@@ -1011,7 +1042,8 @@ fn view_tiles_cover_the_pixels_each_view_reads() {
     }
 }
 
-/// Every stack launch over one stack, on buffers it zeroes first.
+/// Every stack launch over one stack, on per-stack outputs it zeroes first; the update sums
+/// accumulate across runs.
 struct StackRun {
     obj: DeviceBuffer<C32>,
     probe: DeviceBuffer<C32>,
@@ -1044,12 +1076,15 @@ impl StackRun {
         stack: StackRef<'_>,
         counts: &DeviceBuffer<u16>,
     ) -> Result<(), Error> {
+        self.clear(ctx)?;
+        self.ops(ctx, k, views, stack, counts)
+    }
+
+    /// Zeroes the per-stack outputs.
+    fn clear(&mut self, ctx: &ExecutionContext) -> Result<(), Error> {
         ptyrs_gpu::zero(ctx, &mut self.psi)?;
         ptyrs_gpu::zero(ctx, &mut self.icalc)?;
-        ptyrs_gpu::zero(ctx, &mut self.llk)?;
-        self.obj_sums.zero(ctx)?;
-        self.probe_sums.zero(ctx)?;
-        self.ops(ctx, k, views, stack, counts)
+        ptyrs_gpu::zero(ctx, &mut self.llk)
     }
 
     /// The stack launches alone, onto whatever the buffers hold.
@@ -1128,8 +1163,8 @@ impl StackRun {
 }
 
 /// A graph captured once on a device-written entry runs whichever stack the entry holds when
-/// it replays, bit for bit like eager launches on a host-made table, and an entry past
-/// `nf_max` or the scan is clamped.
+/// it replays, bit for bit like eager launches on a host-made table, sums accumulating over
+/// the replays, and an entry past `nf_max` or the scan is clamped.
 #[test]
 fn one_graph_runs_whichever_stack_its_entry_holds() {
     let (stream, _, k) = setup();
@@ -1146,8 +1181,9 @@ fn one_graph_runs_whichever_stack_its_entry_holds() {
             eager.bits(&stream)
         })
         .collect();
-    // f0 past the scan: no frames.
-    want.push(vec![0; want[0].len()]);
+    // f0 past the scan: no frames, so the outputs stay zeroed and the sums as they were.
+    record(|ctx| eager.clear(ctx)).sync_on(&stream).unwrap();
+    want.push(eager.bits(&stream));
 
     let dev = StackTable::device(&stream, &s.d, 3).unwrap();
     let mut it = StackRun::new(&stream, &s, dev.nf_max());
@@ -1361,8 +1397,6 @@ impl Iteration {
         let d = *views.dims();
         let stack = self.stacks.at(0);
         let nk = self.psi.len() as u32;
-        self.obj_sums.zero(ctx)?;
-        self.probe_sums.zero(ctx)?;
         k.obj_probe_to_psi(ctx, views, stack, &self.obj, &self.probe, &mut self.po)?;
         k.dm_reflect(ctx, &mut self.psi, &mut self.po, nk, 0.02)?;
         k.mode_intensity(ctx, &d, stack, &self.psi, &mut self.icalc)?;
