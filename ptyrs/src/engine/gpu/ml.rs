@@ -4,7 +4,7 @@
 use crate::base::{C64, Stack};
 use crate::gpu::{
     CG_BLOCKS, Ended, Error as GpuError, Exit, FarSums, FusedBufs, FusedInputs, FusedSums,
-    GammaCounts, ObjProbeScale, RecordWriter,
+    GammaCounts, RecordWriter,
 };
 use cuda_async::device_operation::ExecutionContext;
 
@@ -249,7 +249,6 @@ impl Bufs<'_> {
             self.grad
                 .icalc_add(ctx, &dims, stack, self.llk, scale, ml.icalc)?;
         }
-        let icalc = &*ml.icalc;
-        self.scale_obj_probe(ctx, ObjProbeScale::Absolute { icalc, total })
+        self.scale_obj_probe(ctx, Some((&*ml.icalc, total)))
     }
 }

@@ -73,12 +73,14 @@ impl GammaStacks {
 pub enum ObjProbeScale<'a> {
     /// PyNX `ScaleObjProbe(absolute=False)`: `s = 1`.
     Relative,
-    /// PyNX `ScaleObjProbe(absolute=True)`: `s = sqrt(total / icalc)`, with `icalc` the
-    /// unmasked calculated photons of [`GradKernels::icalc_add`] and `total` the unmasked
-    /// observed photons.
+    /// PyNX `ScaleObjProbe(absolute=True)`: `s = sqrt((total - background) / icalc)`, with
+    /// `icalc` the unmasked calculated photons of [`GradKernels::icalc_add`], `total` the
+    /// unmasked observed photons and `background` the background's of
+    /// [`GradKernels::background_photons`] (0 for `None`).
     Absolute {
         icalc: &'a DeviceBuffer<f32>,
         total: f32,
+        background: Option<&'a DeviceBuffer<f32>>,
     },
 }
 
@@ -237,6 +239,41 @@ impl GradKernels {
         })
     }
 
+    /// The background's photons over the unmasked pixels of every frame into `out[0]`,
+    /// `sum_j b[j] nobs[j]` in a fixed order, `nobs[j]` the frames where detector pixel `j`
+    /// is unmasked, for [`ObjProbeScale::Absolute`].
+    pub fn background_photons(
+        &self,
+        ctx: &ExecutionContext,
+        b: &DeviceBuffer<f32>,
+        nobs: &DeviceBuffer<u32>,
+        out: &mut DeviceBuffer<f32>,
+    ) -> Result<(), Error> {
+        let n = u32::try_from(b.len())
+            .map_err(|_| Error::Shape(format!("{} background pixels exceed u32", b.len())))?;
+        check_len("nobs", nobs, b.len())?;
+        check_len("out", out, 1)?;
+        let config = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (PIXEL_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let reads = [b.storage(), nobs.storage()];
+        self.base.launch(ctx, &reads, &[out.storage()], |stream| {
+            // SAFETY: `b` and `nobs` hold `n` values, `out` one; one PIXEL_THREADS block.
+            unsafe {
+                self.module.cg_background_photons(
+                    stream,
+                    config,
+                    dptr::<f32, f32>(b).cast_const(),
+                    dptr::<u32, u32>(nobs).cast_const(),
+                    n,
+                    dptr(out),
+                )
+            }
+        })
+    }
+
     /// PyNX `ScaleObjProbe` of `obj` and `probe` from the [`Self::sum_parts`] totals of
     /// [`Self::norm_parts`] `norms = [object, probe]`: with `s` of `scale`,
     /// `obj *= sqrt(sum |P| / sum |O| * s)` and `probe *= sqrt(sum |O| / sum |P| * s)`.
@@ -251,11 +288,18 @@ impl GradKernels {
         for (what, pair) in ["obj", "probe"].into_iter().zip(norms) {
             check_len(what, pair, 2)?;
         }
-        let (icalc, total) = match scale {
-            ObjProbeScale::Relative => (None, 0.0),
-            ObjProbeScale::Absolute { icalc, total } => {
+        let (icalc, total, background) = match scale {
+            ObjProbeScale::Relative => (None, 0.0, None),
+            ObjProbeScale::Absolute {
+                icalc,
+                total,
+                background,
+            } => {
                 check_len("icalc", icalc, 1)?;
-                (Some(icalc), total)
+                if let Some(b) = background {
+                    check_len("background photons", b, 1)?;
+                }
+                (Some(icalc), total, background)
             }
         };
         let len = |what: &str, b: &DeviceBuffer<C32>| {
@@ -267,6 +311,7 @@ impl GradKernels {
         let reads: Vec<_> = norms
             .iter()
             .chain(icalc.as_slice())
+            .chain(background.as_slice())
             .map(|b| b.storage())
             .collect();
         let writes = [obj.storage(), probe.storage()];
@@ -276,9 +321,11 @@ impl GradKernels {
                 obj: o,
                 probe: p,
                 icalc: icalc.map_or(std::ptr::null(), |b| dptr::<f32, f32>(b).cast_const()),
+                background: (background)
+                    .map_or(std::ptr::null(), |b| dptr::<f32, f32>(b).cast_const()),
             };
-            // SAFETY: each pair holds two floats and `icalc` one or is null; one thread per
-            // element of the longer array.
+            // SAFETY: each pair holds two floats, `icalc` and `background` one or are null; one
+            // thread per element of the longer array.
             unsafe {
                 self.module.cg_scale_obj_probe(
                     stream,
@@ -416,12 +463,12 @@ impl GradKernels {
     }
 
     /// Line-search pairs of the stack's frames from its forward-FFT'd (unnormalized)
-    /// [`GammaStacks`]: PyNX `CG_Poisson_Gamma`'s numerator and denominator (no background,
-    /// its cross-term slip corrected) over each chunk of [`GAMMA_CHUNK`] pixels, a fixed-order
-    /// block sum, at pair `f * nchunk + c` of `out` for chunk `c` of frame `f`; other frames'
-    /// pairs are left as they are. The model intensity is `obs`'s, which takes a
-    /// [`Model::scale`] only. `out` holds the scan's [`gamma_parts`] pairs, which
-    /// [`Self::sum_parts`] totals into `γ`.
+    /// [`GammaStacks`]: PyNX `CG_Poisson_Gamma`'s numerator and denominator (its cross-term
+    /// slip corrected) over each chunk of [`GAMMA_CHUNK`] pixels, a fixed-order block sum, at
+    /// pair `f * nchunk + c` of `out` for chunk `c` of frame `f`; other frames' pairs are left
+    /// as they are. The model intensity is `obs`'s, which takes a [`Model::scale`] and a
+    /// [`Model::background`] but no [`Model::shift`]. `out` holds the scan's [`gamma_parts`]
+    /// pairs, which [`Self::sum_parts`] totals into `γ`.
     pub fn gamma_frames(
         &self,
         ctx: &ExecutionContext,
@@ -435,14 +482,17 @@ impl GradKernels {
         let n = dims.n();
         let GammaCounts { counts, model } = obs;
         check_len("counts", counts, dims.nframe as usize * n)?;
-        if model.background.is_some() || model.shift.is_some() {
+        if model.shift.is_some() {
             return Err(Error::Shape(
-                "the line search models a per-frame scale only".into(),
+                "the line search does not model position shifts".into(),
             ));
         }
-        let scale = model.scale;
+        let (scale, background) = (model.scale, model.background);
         if let Some(scale) = scale {
             check_len("scale", scale, dims.nframe as usize)?;
+        }
+        if let Some(b) = background {
+            check_len("background", b, n)?;
         }
         x.check(g.nf_max as usize * dims.nmode as usize * n)?;
         check_len("out", out, 2 * gamma_parts(dims)? as usize)?;
@@ -462,6 +512,10 @@ impl GradKernels {
             stack.storage(),
         ];
         reads.extend(scale.map(|b| b.storage()));
+        reads.extend(background.map(|b| b.storage()));
+        let opt = |b: Option<&DeviceBuffer<f32>>| {
+            b.map_or(std::ptr::null(), |b| dptr::<f32, f32>(b).cast_const())
+        };
         self.base.launch(ctx, &reads, &[out.storage()], |stream| {
             // SAFETY: lengths checked above; one block of PIXEL_THREADS per chunk and frame.
             unsafe {
@@ -470,7 +524,8 @@ impl GradKernels {
                     config,
                     x.ptrs(),
                     dptr(counts),
-                    scale.map_or(std::ptr::null(), |b| dptr::<f32, f32>(b).cast_const()),
+                    opt(scale),
+                    opt(background),
                     dptr(out),
                     stack.ctl() as *const StackCtl,
                     g,
