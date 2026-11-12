@@ -24,7 +24,8 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use crate::gpu::{
-    C32, Ended, Exit, FusedBufs, FusedInputs, FusedSums, Kernels, LlkPartial, LlkRing, ViewAddr,
+    C32, Ended, Exit, FarSums, FusedBufs, FusedInputs, FusedSums, Kernels, LlkPartial, LlkRing,
+    Model, ViewAddr,
 };
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{DeviceBuffer, Stream};
@@ -138,13 +139,17 @@ impl LiveAp {
                         counts,
                         obj: p.pixels,
                         probe,
+                        model: Model::default(),
                     };
-                    let llk = rec.as_mut().map(|(_, partials)| &mut **partials);
+                    let far = FarSums {
+                        llk: rec.as_mut().map(|(_, partials)| &mut **partials),
+                        ..FarSums::default()
+                    };
                     let sums = FusedSums {
                         obj: Some(&mut *p.sums),
-                        probe: None,
+                        ..FusedSums::default()
                     };
-                    k.fused_project(c, &inputs, st, Exit::Ap { llk }, fused, sums)?;
+                    k.fused_project(c, &inputs, st, Exit::Ap { far }, fused, sums)?;
                     if let Some((w, partials)) = rec.as_mut() {
                         w.push(c, &d, st, partials)?;
                     }

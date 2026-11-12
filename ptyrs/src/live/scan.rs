@@ -186,12 +186,11 @@ impl LiveScan {
         let frames = LiveFrames::new(stream, &dims, nf_max)?;
         // SAFETY: the kernels read the views and slabs of landed frames only
         // (the stack entry stays within them), and `push` lands a frame
-        // after its records are queued and its tiles backed; `tile_start`
-        // and `tile_len` are as `from_parts` requires from `LiveObject::new`
-        // on, and `bin_views` appends each stack once, in frame order.
+        // after its records are queued and its tiles backed, and `bin_views`
+        // appends each stack once, in frame order.
         let views = unsafe {
-            let b = obj.bins()?;
-            Views::from_parts(dims, addr.typed(nview)?, b.start, b.views, b.len)?
+            let slabs = obj.tile_views()?;
+            Views::from_parts(stream, dims, addr.typed(nview)?, slabs, cap)?
         };
         let ntiles = obj.tiles()[0] * obj.tiles()[1];
         Ok(Self {

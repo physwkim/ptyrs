@@ -8,8 +8,8 @@
 //! the rest on a thread of its own as views reach them, and fresh pixels
 //! start at a flat value. Its update sums, pixel for pixel in the same
 //! layout, are backed with those rows and start at zero. The
-//! bins are the `tile_start`, `tile_views` and `tile_len` of
-//! [`crate::gpu::Views`], in storage the live side owns: tile
+//! `tile_views` slabs of [`crate::gpu::Views`] are in storage the live side
+//! owns: tile
 //! `t = ty * ntx + tx` of [`OBJ_TILE`] pixels per side has the `cap` slots
 //! `tile_views[t * cap..]`, and its run is the first `tile_len[t]` of them,
 //! appended on the device by `bin_views`. Slots past the run are never read.
@@ -27,13 +27,6 @@ use cuda_bindings::{self as sys, CUdeviceptr};
 use cuda_core::{Context, DeviceBuffer, DriverError, Event, IntoResult, PinnedHostBuffer, Stream};
 
 use crate::live::grow::{Backer, GrowBuf, GrowError};
-
-/// The `tile_start`, `tile_views` and `tile_len` of [`crate::gpu::Views`].
-pub struct Bins {
-    pub start: DeviceBuffer<u32>,
-    pub views: DeviceBuffer<u32>,
-    pub len: DeviceBuffer<u32>,
-}
 
 /// Where a [`LiveObject`]'s tiles sit in its buffers.
 #[derive(Clone, Copy)]
@@ -122,8 +115,6 @@ pub struct LiveObject {
     /// `num` and `den` as the kernels take them.
     sums: UpdateSums,
     tile_views: GrowBuf,
-    tile_len: GrowBuf,
-    tile_start: GrowBuf,
     layout: Layout,
     fill: [f32; 2],
     stream: Arc<Stream>,
@@ -160,15 +151,13 @@ impl LiveObject {
         // binned.
         let (pixels, n, d) = unsafe { (obj.typed(len)?, num.typed(len)?, den.typed(len)?) };
         let sums = UpdateSums::new(n, d, stream)?;
-        let mut o = Self {
+        Ok(Self {
             obj,
             pixels,
             num,
             den,
             sums,
             tile_views: GrowBuf::new(ctx, ntiles * cap * 4, chunk)?,
-            tile_len: GrowBuf::new(ctx, ntiles * 4, 1)?,
-            tile_start: GrowBuf::new(ctx, (ntiles + 1) * 4, 1)?,
             layout: Layout {
                 nobj,
                 shape,
@@ -177,29 +166,7 @@ impl LiveObject {
             },
             fill,
             stream: stream.clone(),
-        };
-        o.tile_len.map(0..ntiles * 4)?;
-        o.tile_start.map(0..(ntiles + 1) * 4)?;
-        let starts: Vec<u32> = (0..=ntiles).map(|t| (t * cap) as u32).collect();
-        let starts = PinnedHostBuffer::from_slice(ctx, &starts)?;
-        let lease = ExecutionContext::new(stream.clone());
-        crate::gpu::lease(&lease, &[], &[o.tile_len.storage(), o.tile_start.storage()])?;
-        ctx.bind_to_thread()?;
-        let s = stream.cu_stream();
-        // SAFETY: both destinations were mapped above with these sizes; the
-        // stream is synchronised before `starts` is freed.
-        unsafe {
-            sys::cuMemsetD32Async(o.tile_len.ptr(), 0, ntiles, s).result()?;
-            sys::cuMemcpyHtoDAsync_v2(
-                o.tile_start.ptr(),
-                starts.as_ptr().cast(),
-                starts.len() * 4,
-                s,
-            )
-            .result()?;
-        }
-        stream.synchronize()?;
-        Ok(o)
+        })
     }
 
     /// A backer of this object's tiles, for another thread.
@@ -235,23 +202,15 @@ impl LiveObject {
         &self.sums
     }
 
-    /// Typed views of the bins for `Views::from_parts`: `tile_start[t] = t *
-    /// cap` and `tile_len` zeroed at [`Self::new`].
+    /// The slabs, typed for `Views::from_parts` with [`Self::cap`].
     ///
     /// # Safety
     /// Work through the views may only touch the slab of a tile
     /// [`Self::init_tiles`] readied.
-    pub unsafe fn bins(&self) -> Result<Bins, DriverError> {
+    pub unsafe fn tile_views(&self) -> Result<DeviceBuffer<u32>, DriverError> {
         let ntiles = self.layout.tiles[0] * self.layout.tiles[1];
-        // SAFETY: `tile_start` and `tile_len` are backed whole; the slabs
-        // are forwarded to the caller.
-        unsafe {
-            Ok(Bins {
-                start: self.tile_start.typed(ntiles + 1)?,
-                views: self.tile_views.typed(ntiles * self.layout.cap)?,
-                len: self.tile_len.typed(ntiles)?,
-            })
-        }
+        // SAFETY: forwarded to the caller.
+        unsafe { self.tile_views.typed(ntiles * self.layout.cap) }
     }
 
     pub fn nobj(&self) -> usize {
