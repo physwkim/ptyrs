@@ -12,4 +12,5 @@ cuda-core = { workspace = true }
 ptyrs-gpu = { path = "../ptyrs-gpu" }
 
 [dev-dependencies]
+ptyrs-core = { path = "../ptyrs-core" }
 ptyrs-fft = { path = "../ptyrs-fft" }

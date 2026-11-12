@@ -1,8 +1,9 @@
 //! M6: time per graph-replayed AP epoch with each Tile candidate in its SIMT or Tile form, on
 //! the M1 timing scan (`ptyrs-engine` example `gpu_time ap`: 400 frames of 256x256 on a
-//! Fermat spiral of step 16 pixels, 2 probe modes, stacks of 16). An epoch is the engine's
-//! steady AP cycle: per stack, exit waves, FFT, amplitude projection, inverse FFT and both
-//! update sums from the old arrays; then the object (inertia 0.01) and probe (0.001) updates.
+//! Fermat spiral of step 16 pixels, 2 probe modes, stacks of 16), with its views and object.
+//! An epoch is the engine's steady AP cycle: per stack, exit waves, FFT, amplitude
+//! projection, inverse FFT and both update sums from the old arrays; then the object
+//! (inertia 0.01) and probe (0.001) updates.
 //! With `llk`, each stack also takes the LLK partials of its forward stack and every epoch
 //! ends with the totals on the host: Tile `llk_sums` in the graph and a copy of its 4 f64,
 //! or SIMT's copy of the partials and `LlkSums::from_partials`.
@@ -24,6 +25,8 @@ use std::time::Instant;
 use cuda_async::cuda_graph::CudaGraph;
 use cuda_async::device_operation::{DeviceOp, ExecutionContext};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
+use ptyrs_core::sim::fermat;
+use ptyrs_core::{AddrTable, Geometry, Positions, required_obj_shape};
 use ptyrs_fft::Plan2d;
 use ptyrs_gpu::{
     C32, Error, Kernels, LlkPartial, LlkSums, StackTable, UpdateSums, ViewAddr, ViewDims, Views,
@@ -79,57 +82,38 @@ fn unit(len: usize, seed: u64) -> Vec<f32> {
         .collect()
 }
 
-/// Whole pixel and fraction in `[0, 1)` of a non-negative offset.
-fn split(v: f64) -> (u32, f32) {
-    let o = v.floor();
-    match (v - o) as f32 {
-        f if f >= 1.0 => (o as u32 + 1, 0.0),
-        f => (o as u32, f),
-    }
-}
-
-/// `ptyrs_core::sim::fermat(NPOS, STEP)` in pixels, moved to non-negative offsets, two probe
-/// modes per frame on an object of whole 16-pixel tiles.
+/// The views of `gpu_time ap` (`dm_scenario`): `ptyrs_core::sim::fermat(NPOS, STEP)` object
+/// pixels apart, rounded to f32 metres, through `pynx_preprocess`, on the object
+/// `required_obj_shape` gives (`[636, 632]`) at whole-pixel corners, two probe modes per frame.
 fn scan() -> (ViewDims, Vec<ViewAddr>) {
-    let golden = PI * (3.0 - 5f64.sqrt());
-    let c = STEP / PI.sqrt();
-    let pos: Vec<[f64; 2]> = (0..NPOS)
-        .map(|k| {
-            let (r, t) = (c * (k as f64).sqrt(), k as f64 * golden);
-            [r * t.sin(), r * t.cos()]
-        })
-        .collect();
-    let lo = |a: usize| pos.iter().map(|p| p[a]).fold(f64::MAX, f64::min);
-    let (y0, x0) = (lo(0), lo(1));
-    let at: Vec<[(u32, f32); 2]> = pos
-        .iter()
-        .map(|&[y, x]| [split(y - y0), split(x - x0)])
-        .collect();
-    // Whole tiles holding every sample's pixel and its `+ 1` neighbour.
-    let side = |a: usize| {
-        let need = at.iter().map(|p| p[a].0 + N + u32::from(p[a].1 > 0.0));
-        need.max().unwrap().div_ceil(16) * 16
-    };
+    let g = Geometry::new(1.5e-10, 1.0, 75e-6, [N as usize; 2]).unwrap();
+    let pixel = g.pixel_size_object();
+    let f = fermat(NPOS as usize, STEP * pixel[1]);
+    let round = |v: Vec<f64>| v.into_iter().map(|x| x as f32 as f64).collect();
+    let pos = Positions::new(round(f.y), round(f.x))
+        .unwrap()
+        .pynx_preprocess(pixel);
+    let obj = required_obj_shape(&pos, pixel, g.frame, 16);
+    let addr = AddrTable::new(&pos, pixel, g.frame, obj, 2, 1).unwrap();
     let d = ViewDims {
         nframe: NPOS,
         nmode: 2,
         nprobe: 2,
         nobj: 1,
         frame: [N, N],
-        obj: [side(0), side(1)],
-        quad_phase: 0.0,
+        obj: [obj[0] as u32, obj[1] as u32],
+        quad_phase: (PI * pixel[1] * pixel[1] / (g.wavelength * g.distance)) as f32,
     };
-    let views = at
+    let views = addr
+        .views()
         .iter()
-        .flat_map(|&[(oy, fy), (ox, fx)]| {
-            (0..d.nmode).map(move |m| ViewAddr {
-                oy,
-                ox,
-                fy,
-                fx,
-                probe: m,
-                obj: 0,
-            })
+        .map(|v| ViewAddr {
+            oy: v.oy,
+            ox: v.ox,
+            fy: 0.0,
+            fx: 0.0,
+            probe: v.probe,
+            obj: v.obj,
         })
         .collect();
     (d, views)
