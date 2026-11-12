@@ -171,6 +171,10 @@ pub fn axis_tiles_max(len: u32) -> u32 {
     len.div_ceil(OBJ_TILE) + 1
 }
 
+/// Candidate tiles each block of a stack-tile launch tests: with overlapping frames most
+/// candidates are not owners, so few per block keeps most blocks at one owned tile or none.
+pub const STACK_TILE_CANDIDATES: u32 = 2;
+
 /// Whether [`axis_tiles`] puts view `v` of `[ny, nx]` pixels in object tile `(ty, tx)`.
 #[device]
 pub fn view_in_tile(v: ViewAddr, ty: u32, tx: u32, ny: u32, nx: u32) -> bool {
