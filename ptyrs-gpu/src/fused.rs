@@ -18,12 +18,12 @@
 
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig};
-use ptyrs_kernels::FFT_EPT;
+use ptyrs_kernels::fft_ept;
 use ptyrs_kernels::fused::{
-    FFT_SKEW, FUSED_BACKGROUND, FUSED_BACKGROUND_SUMS, FUSED_COL_THREADS, FUSED_COLS, FUSED_DM,
-    FUSED_GRAD, FUSED_LLK, FUSED_PROJECT, FUSED_ROW_THREADS, FUSED_SCALE, FUSED_SCALE_SUMS,
-    FUSED_SHIFT_DEN, FUSED_SHIFT_OBJ, FUSED_SHIFT_POSITION, FUSED_SHIFT_PROBE, FUSED_TO_PSI,
-    FusedCfg, FusedPtrs, col_slot_bytes,
+    FFT_SKEW, FUSED_BACKGROUND, FUSED_BACKGROUND_SUMS, FUSED_COLS, FUSED_DM, FUSED_GRAD, FUSED_LLK,
+    FUSED_PROJECT, FUSED_ROW_THREADS, FUSED_SCALE, FUSED_SCALE_SUMS, FUSED_SHIFT_DEN,
+    FUSED_SHIFT_OBJ, FUSED_SHIFT_POSITION, FUSED_SHIFT_PROBE, FUSED_TO_PSI, FusedCfg, FusedPtrs,
+    col_slot_bytes, fused_col_threads,
 };
 use ptyrs_kernels::pixel::SumPtrs;
 
@@ -72,7 +72,7 @@ pub(crate) struct Shape {
     /// Sides along y (the column pass) and x (the row passes).
     pub(crate) ny: Side,
     pub(crate) nx: Side,
-    /// Rows per row-pass block, of `nx / FFT_EPT` threads each.
+    /// Rows per row-pass block, of `nx / fft_ept(nx)` threads each.
     pub(crate) rows: u32,
     pub(crate) row_smem: u32,
     pub(crate) col_threads: u32,
@@ -96,8 +96,8 @@ impl Shape {
             };
             match (block_fft(n, false), block_fft(n, true)) {
                 (Some(f), Some(i))
-                    if [f.ept, i.ept] == [FFT_EPT; 2]
-                        && [f.threads_per_fft, i.threads_per_fft] == [n / FFT_EPT; 2] =>
+                    if [f.ept, i.ept] == [fft_ept(n); 2]
+                        && [f.threads_per_fft, i.threads_per_fft] == [n / fft_ept(n); 2] =>
                 {
                     Ok((side, f.smem_per_fft.max(i.smem_per_fft)))
                 }
@@ -105,10 +105,10 @@ impl Shape {
             }
         };
         let ((side_y, sy), (side_x, sx)) = (side(ny)?, side(nx)?);
-        let rows = FUSED_ROW_THREADS / (nx / FFT_EPT);
-        let nslot = FUSED_COLS * (ny / FFT_EPT);
+        let rows = FUSED_ROW_THREADS / (nx / fft_ept(nx));
+        let nslot = FUSED_COLS * (ny / fft_ept(ny));
         let col_threads = d.nmode as u64 * nslot as u64;
-        if col_threads > FUSED_COL_THREADS as u64 {
+        if col_threads > fused_col_threads(ny) as u64 {
             return Err(bad(format!("{col_threads} threads per column block")));
         }
         let col_threads = col_threads as u32;
@@ -120,7 +120,7 @@ impl Shape {
             row_smem: rows * (sx + FFT_SKEW),
             col_threads,
             col_tile_fft: 2 * FUSED_COLS * ny
-                + (col_threads / (ny / FFT_EPT)) * col_fft.max(4 * ny),
+                + (col_threads / (ny / fft_ept(ny))) * col_fft.max(4 * ny),
             col_fft,
         };
         // The column pass's most shared memory is under every flag that adds to it.
@@ -161,7 +161,7 @@ impl Shape {
     /// `shift_pre` or `shift_post` for `nprobe` probe modes.
     fn shift_cols(&self, nprobe: u32, nf_max: u32) -> Result<LaunchConfig, Error> {
         let (ny, nx) = (self.ny as u32, self.nx as u32);
-        let threads = nprobe * FUSED_COLS * (ny / FFT_EPT);
+        let threads = nprobe * FUSED_COLS * (ny / fft_ept(ny));
         let smem = 8 * ny + nprobe * FUSED_COLS * self.col_fft;
         if smem > SMEM_MAX {
             return Err(Error::Shape(format!(
@@ -193,7 +193,7 @@ impl Shape {
         let (ny, nx) = (self.ny as u32, self.nx as u32);
         LaunchConfig {
             grid_dim: (nx / FUSED_COLS, nplane, 1),
-            block_dim: (FUSED_COLS * (ny / FFT_EPT), 1, 1),
+            block_dim: (FUSED_COLS * (ny / fft_ept(ny)), 1, 1),
             shared_mem_bytes: FUSED_COLS * self.col_fft,
         }
     }
@@ -250,7 +250,7 @@ impl ShiftScratch {
 
 impl FusedBufs {
     /// Scratch for `dims`, whose frame sides must be in [`FUSED_SIDES`] and whose modes must
-    /// fit one column block of [`FUSED_COL_THREADS`] threads: at most `1024 / ny` of them.
+    /// fit one column block of [`fused_col_threads`] threads: at most `1024 / ny` of them.
     pub fn new(stream: &CudaStream, dims: &ViewDims, nf_max: u32) -> Result<Self, Error> {
         Shape::of(dims)?;
         if nf_max == 0 {

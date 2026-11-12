@@ -16,23 +16,38 @@ use cuda_host::cuda_module;
 pub mod fused;
 pub mod pixel;
 
-/// Complex elements per thread of every in-kernel FFT (cuFFT device API, BY_COMPONENT).
-pub const FFT_EPT: u32 = 16;
+/// Complex elements per thread of the in-kernel FFT of `n` points (cuFFT device API,
+/// BY_COMPONENT), which runs on `n / fft_ept(n)` threads. Sides to 256 take 8: at 16, a fused
+/// pass over 64-point frames had too few threads to hide its loads' latency.
+#[device]
+pub const fn fft_ept(n: u32) -> u32 {
+    if n <= 256 { 8 } else { 16 }
+}
+
+/// The largest [`fft_ept`]: a thread holds its FFT in `[f32; 2 * FFT_EPT_MAX]`, the first `2 *
+/// fft_ept(n)` used.
+pub const FFT_EPT_MAX: u32 = 16;
+const _: () = assert!(
+    fft_ept(64) <= FFT_EPT_MAX
+        && fft_ept(128) <= FFT_EPT_MAX
+        && fft_ept(256) <= FFT_EPT_MAX
+        && fft_ept(512) <= FFT_EPT_MAX
+);
 
 // In-kernel FFT entry points. Each name spells size, elements per thread and direction;
 // ptyrs-gpu's build script defines it as a call to the libcufft function with exactly
-// those traits for the target architecture. Arguments: registers (`2 * FFT_EPT` floats,
-// re/im interleaved; thread `t` holds elements `t + i * N / FFT_EPT`), dynamic shared
+// those traits for the target architecture. Arguments: registers (`2 * EPT` floats,
+// re/im interleaved; thread `t` holds elements `t + i * N / EPT`), dynamic shared
 // memory, FFT index within the block, thread index within the FFT, FFTs per block. Every
 // thread of the block must call it: it synchronizes the block.
 #[device]
 unsafe extern "C" {
-    fn ptyrs_cufft_c2c_f32_n64_e16_fwd(r: *mut f32, s: *mut u8, b: u32, f: u32, bpb: u32);
-    fn ptyrs_cufft_c2c_f32_n64_e16_inv(r: *mut f32, s: *mut u8, b: u32, f: u32, bpb: u32);
-    fn ptyrs_cufft_c2c_f32_n128_e16_fwd(r: *mut f32, s: *mut u8, b: u32, f: u32, bpb: u32);
-    fn ptyrs_cufft_c2c_f32_n128_e16_inv(r: *mut f32, s: *mut u8, b: u32, f: u32, bpb: u32);
-    fn ptyrs_cufft_c2c_f32_n256_e16_fwd(r: *mut f32, s: *mut u8, b: u32, f: u32, bpb: u32);
-    fn ptyrs_cufft_c2c_f32_n256_e16_inv(r: *mut f32, s: *mut u8, b: u32, f: u32, bpb: u32);
+    fn ptyrs_cufft_c2c_f32_n64_e8_fwd(r: *mut f32, s: *mut u8, b: u32, f: u32, bpb: u32);
+    fn ptyrs_cufft_c2c_f32_n64_e8_inv(r: *mut f32, s: *mut u8, b: u32, f: u32, bpb: u32);
+    fn ptyrs_cufft_c2c_f32_n128_e8_fwd(r: *mut f32, s: *mut u8, b: u32, f: u32, bpb: u32);
+    fn ptyrs_cufft_c2c_f32_n128_e8_inv(r: *mut f32, s: *mut u8, b: u32, f: u32, bpb: u32);
+    fn ptyrs_cufft_c2c_f32_n256_e8_fwd(r: *mut f32, s: *mut u8, b: u32, f: u32, bpb: u32);
+    fn ptyrs_cufft_c2c_f32_n256_e8_inv(r: *mut f32, s: *mut u8, b: u32, f: u32, bpb: u32);
     fn ptyrs_cufft_c2c_f32_n512_e16_fwd(r: *mut f32, s: *mut u8, b: u32, f: u32, bpb: u32);
     fn ptyrs_cufft_c2c_f32_n512_e16_inv(r: *mut f32, s: *mut u8, b: u32, f: u32, bpb: u32);
 }
@@ -56,12 +71,12 @@ unsafe fn load_line(
     nline: u32,
     line_stride: u32,
     elem_stride: u32,
-) -> [f32; 2 * FFT_EPT as usize] {
-    let mut r = [0.0f32; 2 * FFT_EPT as usize];
+) -> [f32; 2 * FFT_EPT_MAX as usize] {
+    let mut r = [0.0f32; 2 * FFT_EPT_MAX as usize];
     let l = line_index();
     if l < nline {
-        for i in 0..FFT_EPT {
-            let j = thread::threadIdx_x() + i * (n / FFT_EPT);
+        for i in 0..fft_ept(n) {
+            let j = thread::threadIdx_x() + i * (n / fft_ept(n));
             let at = l as usize * line_stride as usize + j as usize * elem_stride as usize;
             let k = 2 * i as usize;
             (r[k], r[k + 1]) = unsafe { pixel::load_c(input, at) };
@@ -78,7 +93,7 @@ unsafe fn load_line(
 #[device]
 unsafe fn store_line(
     output: *mut f32,
-    r: &[f32; 2 * FFT_EPT as usize],
+    r: &[f32; 2 * FFT_EPT_MAX as usize],
     n: u32,
     nline: u32,
     line_stride: u32,
@@ -86,8 +101,8 @@ unsafe fn store_line(
 ) {
     let l = line_index();
     if l < nline {
-        for i in 0..FFT_EPT {
-            let j = thread::threadIdx_x() + i * (n / FFT_EPT);
+        for i in 0..fft_ept(n) {
+            let j = thread::threadIdx_x() + i * (n / fft_ept(n));
             let at = l as usize * line_stride as usize + j as usize * elem_stride as usize;
             let k = 2 * i as usize;
             unsafe { pixel::store_c(output, at, (r[k], r[k + 1])) };
@@ -1083,7 +1098,7 @@ pub mod kernels {
     ///
     /// As [`crate::fused::cols`].
     #[kernel]
-    #[launch_bounds(crate::fused::FUSED_COL_THREADS)]
+    #[launch_bounds(crate::fused::fused_col_threads(64))]
     pub unsafe fn fused_cols_64(p: FusedPtrs, ctl: *const StackCtl, g: StackGeom, cfg: FusedCfg) {
         unsafe { crate::fused::cols::<64>(p, ctl, g, cfg) }
     }
@@ -1094,7 +1109,7 @@ pub mod kernels {
     ///
     /// As [`crate::fused::cols`].
     #[kernel]
-    #[launch_bounds(crate::fused::FUSED_COL_THREADS)]
+    #[launch_bounds(crate::fused::fused_col_threads(128))]
     pub unsafe fn fused_cols_128(p: FusedPtrs, ctl: *const StackCtl, g: StackGeom, cfg: FusedCfg) {
         unsafe { crate::fused::cols::<128>(p, ctl, g, cfg) }
     }
@@ -1105,7 +1120,7 @@ pub mod kernels {
     ///
     /// As [`crate::fused::cols`].
     #[kernel]
-    #[launch_bounds(crate::fused::FUSED_COL_THREADS)]
+    #[launch_bounds(crate::fused::fused_col_threads(256))]
     pub unsafe fn fused_cols_256(p: FusedPtrs, ctl: *const StackCtl, g: StackGeom, cfg: FusedCfg) {
         unsafe { crate::fused::cols::<256>(p, ctl, g, cfg) }
     }
@@ -1116,7 +1131,7 @@ pub mod kernels {
     ///
     /// As [`crate::fused::cols`].
     #[kernel]
-    #[launch_bounds(crate::fused::FUSED_COL_THREADS)]
+    #[launch_bounds(crate::fused::fused_col_threads(512))]
     pub unsafe fn fused_cols_512(p: FusedPtrs, ctl: *const StackCtl, g: StackGeom, cfg: FusedCfg) {
         unsafe { crate::fused::cols::<512>(p, ctl, g, cfg) }
     }
@@ -1216,7 +1231,7 @@ pub mod kernels {
     ///
     /// As [`crate::fused::shift_pre`].
     #[kernel]
-    #[launch_bounds(crate::fused::FUSED_COL_THREADS)]
+    #[launch_bounds(crate::fused::fused_col_threads(64))]
     pub unsafe fn fused_shift_pre_64(
         p: FusedPtrs,
         ctl: *const StackCtl,
@@ -1231,7 +1246,7 @@ pub mod kernels {
     ///
     /// As [`crate::fused::shift_pre`].
     #[kernel]
-    #[launch_bounds(crate::fused::FUSED_COL_THREADS)]
+    #[launch_bounds(crate::fused::fused_col_threads(128))]
     pub unsafe fn fused_shift_pre_128(
         p: FusedPtrs,
         ctl: *const StackCtl,
@@ -1246,7 +1261,7 @@ pub mod kernels {
     ///
     /// As [`crate::fused::shift_pre`].
     #[kernel]
-    #[launch_bounds(crate::fused::FUSED_COL_THREADS)]
+    #[launch_bounds(crate::fused::fused_col_threads(256))]
     pub unsafe fn fused_shift_pre_256(
         p: FusedPtrs,
         ctl: *const StackCtl,
@@ -1261,7 +1276,7 @@ pub mod kernels {
     ///
     /// As [`crate::fused::shift_pre`].
     #[kernel]
-    #[launch_bounds(crate::fused::FUSED_COL_THREADS)]
+    #[launch_bounds(crate::fused::fused_col_threads(512))]
     pub unsafe fn fused_shift_pre_512(
         p: FusedPtrs,
         ctl: *const StackCtl,
@@ -1388,7 +1403,7 @@ pub mod kernels {
     ///
     /// As [`crate::fused::shift_post`].
     #[kernel]
-    #[launch_bounds(crate::fused::FUSED_COL_THREADS)]
+    #[launch_bounds(crate::fused::fused_col_threads(64))]
     pub unsafe fn fused_shift_post_64(p: FusedPtrs, ctl: *const StackCtl, g: StackGeom) {
         unsafe { crate::fused::shift_post::<64>(p, ctl, g) }
     }
@@ -1398,7 +1413,7 @@ pub mod kernels {
     ///
     /// As [`crate::fused::shift_post`].
     #[kernel]
-    #[launch_bounds(crate::fused::FUSED_COL_THREADS)]
+    #[launch_bounds(crate::fused::fused_col_threads(128))]
     pub unsafe fn fused_shift_post_128(p: FusedPtrs, ctl: *const StackCtl, g: StackGeom) {
         unsafe { crate::fused::shift_post::<128>(p, ctl, g) }
     }
@@ -1408,7 +1423,7 @@ pub mod kernels {
     ///
     /// As [`crate::fused::shift_post`].
     #[kernel]
-    #[launch_bounds(crate::fused::FUSED_COL_THREADS)]
+    #[launch_bounds(crate::fused::fused_col_threads(256))]
     pub unsafe fn fused_shift_post_256(p: FusedPtrs, ctl: *const StackCtl, g: StackGeom) {
         unsafe { crate::fused::shift_post::<256>(p, ctl, g) }
     }
@@ -1418,7 +1433,7 @@ pub mod kernels {
     ///
     /// As [`crate::fused::shift_post`].
     #[kernel]
-    #[launch_bounds(crate::fused::FUSED_COL_THREADS)]
+    #[launch_bounds(crate::fused::fused_col_threads(512))]
     pub unsafe fn fused_shift_post_512(p: FusedPtrs, ctl: *const StackCtl, g: StackGeom) {
         unsafe { crate::fused::shift_post::<512>(p, ctl, g) }
     }
@@ -1617,7 +1632,7 @@ pub mod kernels {
     // Unnormalized C2C FFT of `nline` strided lines (see `load_line`); forward uses
     // exp(-2 pi i jk / N). `input` may equal `output`: a thread reads all its elements
     // before the FFT's block barrier and writes after it, and lines must not overlap.
-    // Launch: blockDim = (N / FFT_EPT, bpb), gridDim.x = ceil(nline / bpb), dynamic shared
+    // Launch: blockDim = (N / fft_ept(N), bpb), gridDim.x = ceil(nline / bpb), dynamic shared
     // memory = bpb * smem_per_fft bytes (ptyrs-gpu's BLOCK_FFTS).
 
     /// 128-point forward line FFT.
@@ -1635,7 +1650,7 @@ pub mod kernels {
     ) {
         unsafe {
             let mut r = load_line(input, 128, nline, line_stride, elem_stride);
-            ptyrs_cufft_c2c_f32_n128_e16_fwd(
+            ptyrs_cufft_c2c_f32_n128_e8_fwd(
                 r.as_mut_ptr(),
                 DynamicSharedArray::<u8, 16>::get(),
                 thread::threadIdx_y(),
@@ -1663,7 +1678,7 @@ pub mod kernels {
     ) {
         unsafe {
             let mut r = load_line(input, 128, nline, line_stride, elem_stride);
-            ptyrs_cufft_c2c_f32_n128_e16_inv(
+            ptyrs_cufft_c2c_f32_n128_e8_inv(
                 r.as_mut_ptr(),
                 DynamicSharedArray::<u8, 16>::get(),
                 thread::threadIdx_y(),
@@ -1691,7 +1706,7 @@ pub mod kernels {
     ) {
         unsafe {
             let mut r = load_line(input, 256, nline, line_stride, elem_stride);
-            ptyrs_cufft_c2c_f32_n256_e16_fwd(
+            ptyrs_cufft_c2c_f32_n256_e8_fwd(
                 r.as_mut_ptr(),
                 DynamicSharedArray::<u8, 16>::get(),
                 thread::threadIdx_y(),
@@ -1719,7 +1734,7 @@ pub mod kernels {
     ) {
         unsafe {
             let mut r = load_line(input, 256, nline, line_stride, elem_stride);
-            ptyrs_cufft_c2c_f32_n256_e16_inv(
+            ptyrs_cufft_c2c_f32_n256_e8_inv(
                 r.as_mut_ptr(),
                 DynamicSharedArray::<u8, 16>::get(),
                 thread::threadIdx_y(),
