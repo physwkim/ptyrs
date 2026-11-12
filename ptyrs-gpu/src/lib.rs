@@ -44,7 +44,7 @@ pub use ops::{
     StackRef, StackTable, UpdateSums, ViewAddr, ViewDims, Views, view_tiles,
 };
 pub use ptyrs_fft::C32;
-pub use ring::{Ended, LlkRing, RecordWriter, RingDevice, RingError};
+pub use ring::{Ended, LlkRing, LlkTotals, RecordWriter, RingDevice, RingError};
 pub use rpie::{RpieKernels, Weight};
 
 /// The linked device code: every `ptyrs-kernels` kernel plus the cuFFT functions they call.

@@ -248,7 +248,6 @@ pub struct GpuPtycho {
     dev: Device,
     obj_dims: [usize; 3],
     probe_dims: [usize; 3],
-    nb_obs: usize,
     /// Sum of the unmasked observed counts, for ML's [`crate::Ptycho::scale_obj_probe`].
     total_obs: f64,
     /// The probe-frame FFT of [`zero_phase_ramp`], which runs on the host.
@@ -332,7 +331,6 @@ impl GpuPtycho {
             dev,
             obj_dims: object.dims(),
             probe_dims: probe.dims(),
-            nb_obs: scan.counts.nb_obs(),
             total_obs: Observed::from_counts(&scan.counts).total(),
             fft: Fft2::new(g.frame),
             cycle: 0,
@@ -401,14 +399,15 @@ impl GpuPtycho {
     /// the untagged one.
     fn collect(&mut self) -> Result<Option<Llk>, EngineError> {
         let mut untagged = None;
-        for (tag, s) in self.dev.flush()? {
+        for (tag, t) in self.dev.flush()? {
+            let s = t.sums;
             let llk = Llk {
                 poisson: s.poisson,
                 gaussian: s.gaussian,
                 euclidian: s.euclidean,
                 nb_photons_calc: s.icalc,
             }
-            .normalised(self.nb_obs);
+            .normalised(t.nb_obs);
             match tag {
                 Some((cycle, algorithm)) => self.history.push(LlkRecord {
                     cycle,

@@ -1,16 +1,18 @@
 //! The GPU backend against the CPU oracle: per-record LLK and the final object and probe of AP,
 //! DM, rPIE and ML updating the object, the probe or both, from the same scaled start; AP and
-//! DM by M1's launches and by the fused passes; and the ML gradients.
+//! DM by M1's launches and by the fused passes; the ML gradients; and the LLK ring's record
+//! of a scan's first frames.
 
 use std::sync::Arc;
 
-use cuda_core::CudaContext;
+use cuda_async::device_operation::ExecutionContext;
+use cuda_core::{CudaContext, DeviceBuffer};
 use ptyrs_core::{C64, Counts, MASKED, Object, Probe, Scan, Stack};
 use ptyrs_engine::{
-    ApParams, Backend, DmParams, GpuOptions, GpuPtycho, Llk, LlkRecord, MlParams, Params, Ptycho,
-    RpieParams, Step,
+    ApParams, Backend, DmParams, GpuOptions, GpuPtycho, Llk, LlkRecord, MlParams, Observed, Params,
+    Ptycho, RpieParams, Step, llk,
 };
-use ptyrs_gpu::FUSED_SIDES;
+use ptyrs_gpu::{C32, FUSED_SIDES, Kernels, LlkPartial, LlkRing, LlkScratch, StackTable, ViewDims};
 
 mod common;
 mod ptychi;
@@ -501,4 +503,127 @@ fn graph_like_eager(setup: Setup) {
     assert!(eager.2 == graph.2, "{setup:?}: LLK records differ");
     assert!(eager.0 == graph.0, "{setup:?}: object differs");
     assert!(eager.1 == graph.1, "{setup:?}: probe differs");
+}
+
+/// A ring record of the frames a live scan has landed, `0 .. n`, against the CPU LLK over the
+/// same frames: the GPU's LLK partials stack by stack, the frames counted as their stacks land
+/// and pushed by every stack that holds one below `n`, read back with `n` and the frames'
+/// unmasked pixels; `n` inside a stack (10) and the whole scan. The mask differs from frame to
+/// frame, so the count is the frames' own.
+#[test]
+fn ring_record_of_the_first_frames_matches_the_cpu_llk() {
+    let (scan, _, _) = start(M1.frame, 2, false);
+    let [nframe, ny, nx] = scan.counts.dims();
+    let (nmode, npix) = (2, ny * nx);
+    let data = scan.counts.as_slice().iter().enumerate();
+    let data = data.map(|(i, &c)| if (i + i / npix) % 9 == 0 { MASKED } else { c });
+    let counts = Counts::from_raw([nframe, ny, nx], data.collect()).unwrap();
+    // Far fields in the GPU's scaling, `sum |psi|^2 / npix` per pixel, and the same for the CPU.
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        0.5 + (seed >> 40) as f32 / (1u64 << 23) as f32
+    };
+    let amp = (npix as f32 / nmode as f32).sqrt();
+    let psi: Vec<C32> = (0..nframe * nmode * npix)
+        .map(|_| C32 {
+            re: amp * next(),
+            im: amp * next(),
+        })
+        .collect();
+    let root = (npix as f64).sqrt();
+    let psi64: Vec<C64> = psi
+        .iter()
+        .map(|c| C64::new(f64::from(c.re) / root, f64::from(c.im) / root))
+        .collect();
+
+    let cuda = ctx();
+    let kernels = Kernels::load(&cuda).unwrap();
+    let stream = cuda.new_stream().unwrap();
+    let ex = ExecutionContext::new(stream.clone());
+    let side = [ny as u32, nx as u32];
+    let dims = ViewDims {
+        nframe: nframe as u32,
+        nmode: nmode as u32,
+        nprobe: nmode as u32,
+        nobj: 1,
+        frame: side,
+        obj: side,
+        quad_phase: 0.0,
+    };
+    let stacks: Vec<_> = (0..nframe as u32)
+        .step_by(7)
+        .map(|f| f..(f + 7).min(nframe as u32))
+        .collect();
+    let table = StackTable::new(&stream, &dims, &stacks).unwrap();
+    let plane = table.nf_max() as usize * nmode * npix;
+    let staged: Vec<DeviceBuffer<C32>> = stacks
+        .iter()
+        .map(|r| {
+            let mut v =
+                psi[r.start as usize * nmode * npix..r.end as usize * nmode * npix].to_vec();
+            v.resize(plane, C32::default());
+            DeviceBuffer::from_host(&stream, &v).unwrap()
+        })
+        .collect();
+    let dev_counts = DeviceBuffer::from_host(&stream, counts.as_slice()).unwrap();
+    let mut scratch = LlkScratch::new(&stream, &dims, table.nf_max()).unwrap();
+    let mut partials =
+        DeviceBuffer::<LlkPartial>::zeroed(&stream, table.nf_max() as usize).unwrap();
+    let mut ring = LlkRing::new(&kernels, &stream, nframe as u32, 2).unwrap();
+
+    let ns = [10, nframe as u32];
+    let mut counted = 0;
+    for (r, &n) in ns.iter().enumerate() {
+        let landed: Vec<usize> = (0..stacks.len()).filter(|&s| stacks[s].start < n).collect();
+        for &s in &landed[counted..] {
+            ring.device()
+                .count(&ex, &dims, table.at(s), &dev_counts)
+                .unwrap();
+        }
+        counted = landed.len();
+        let mut rec = ring.device().record();
+        for &s in &landed {
+            let stack = table.at(s);
+            kernels
+                .llk(
+                    &ex,
+                    stack,
+                    &dev_counts,
+                    &staged[s],
+                    &mut scratch,
+                    &mut partials,
+                )
+                .unwrap();
+            rec.push(&ex, &dims, stack, &partials).unwrap();
+        }
+        let ended = rec.end(&ex).unwrap();
+        ring.enqueued(&ex, &ended, r, n).unwrap();
+    }
+
+    let obs = Observed::from_counts(&counts);
+    let got = ring.flush(&ex).unwrap();
+    assert_eq!(got.len(), ns.len());
+    for (r, t) in got {
+        let n = ns[r] as usize;
+        let cpu = llk(&obs, 0..n, nmode, &psi64[..n * nmode * npix]);
+        let nb_obs = counts.as_slice()[..n * npix]
+            .iter()
+            .filter(|&&c| c != MASKED)
+            .count();
+        assert_eq!((t.nframe as usize, t.nb_obs), (n, nb_obs), "record {r}");
+        let s = t.sums;
+        for (what, g, c) in [
+            ("poisson", s.poisson, cpu.poisson),
+            ("gaussian", s.gaussian, cpu.gaussian),
+            ("euclidean", s.euclidean, cpu.euclidian),
+            ("icalc", s.icalc, cpu.nb_photons_calc),
+        ] {
+            let rel = (g - c).abs() / c.abs();
+            println!("record {r} (n {n}) {what}: rel {rel:.2e}");
+            assert!(rel < 1e-5, "record {r} (n {n}) {what}: {g} vs {c}");
+        }
+    }
 }

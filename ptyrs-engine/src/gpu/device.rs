@@ -14,7 +14,7 @@ use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 use ptyrs_fft::Plan2d;
 use ptyrs_gpu::{
     C32, CG_BLOCKS, Ended, Error as GpuError, FusedBufs, GammaStacks, GradKernels, Kernels,
-    LlkPartial, LlkRing, LlkScratch, LlkSums, RingDevice, RpieKernels, StackTable, UpdateSums,
+    LlkPartial, LlkRing, LlkScratch, LlkTotals, RingDevice, RpieKernels, StackTable, UpdateSums,
     ViewAddr, ViewDims, Views,
 };
 
@@ -348,7 +348,8 @@ impl Plans<'_> {
 impl Device {
     /// Loads the kernels and uploads the views, counts and starting arrays on a new stream of
     /// `ctx`; the stacks cut `0 .. nframe` into `options.stack_size` frames, the LLK ring
-    /// holds `options.llk_slots` records, and `options.fused` picks the [`Passes`].
+    /// holds `options.llk_slots` records of every frame, its unmasked pixels counted here, and
+    /// `options.fused` picks the [`Passes`].
     pub fn new(
         ctx: &Arc<CudaContext>,
         dims: ViewDims,
@@ -419,6 +420,12 @@ impl Device {
             stack_size: to_u32("stack_size", options.stack_size)?,
             stream,
         };
+        let ctx = dev.context();
+        for s in 0..dev.stacks.len() {
+            dev.ring
+                .device()
+                .count(&ctx, &dims, dev.table.at(s), &dev.counts)?;
+        }
         if dev.use_graph {
             dev.llk_graph = Some(dev.capture(|bufs, passes, ring, ctx| {
                 bufs.forward_llk(ctx, passes, ring.record()).map(Some)
@@ -542,7 +549,7 @@ impl Device {
     }
 
     /// The LLK records counted since the last flush, in order; waits for their copies.
-    pub fn flush(&mut self) -> Result<Vec<(Tag, LlkSums)>, EngineError> {
+    pub fn flush(&mut self) -> Result<Vec<(Tag, LlkTotals)>, EngineError> {
         Ok(self.ring.flush(&self.context())?)
     }
 
@@ -644,7 +651,8 @@ impl Device {
     /// Counts under `tag` the record a run just enqueued ended, if it ended one.
     fn count(&mut self, ended: Option<&Ended>, tag: Tag) -> Result<(), EngineError> {
         if let Some(ended) = ended {
-            self.ring.enqueued(&self.context(), ended, tag)?;
+            let nframe = self.dims().nframe;
+            self.ring.enqueued(&self.context(), ended, tag, nframe)?;
         }
         Ok(())
     }
