@@ -1,6 +1,8 @@
 //! The live AP consumer (DESIGN.md §3 B6, §7 M5): lands each frame batch
 //! the uploader sends into a [`LiveAp`] and runs epochs over the landed
 //! frames between batches, from graphs captured before the first frame.
+//! A mapper thread backs each batch's object tiles and view records before
+//! handing it on, so growing the object never stalls the epochs.
 //!
 //! Once every frame of the scan has landed, or the uploader stopped with
 //! some missing, it goes on iterating and keeps a host copy of the object
@@ -17,6 +19,7 @@
 use std::num::NonZeroU32;
 use std::ops::Range;
 use std::sync::Arc;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError};
@@ -33,7 +36,7 @@ use crate::object::{Snapshot, sleeping_event};
 use crate::pv_out::PvCfg;
 use crate::recon::{ApConfig, LiveAp, ViewPlacement};
 use crate::ring::{DeviceStore, FrameBatch};
-use crate::scan::ScanShape;
+use crate::scan::{ScanBacker, ScanShape};
 use crate::stats::wall_ns;
 
 /// The reconstruction run on the received frames: `pty-recv --recon ap`
@@ -239,6 +242,42 @@ fn views_of(cfg: &ApConfig, place: &ViewPlacement, positions: &[(f64, f64)]) -> 
     out
 }
 
+/// Backs each batch's frames through `backer`, then hands the batch on with
+/// its views, until `batches` closes or `ahead`'s receiver goes.
+fn back_ahead(
+    backer: ScanBacker,
+    ap: ApConfig,
+    place: ViewPlacement,
+    batches: Receiver<FrameBatch>,
+    ahead: Sender<(FrameBatch, Vec<ViewAddr>)>,
+) -> Result<(), GrowError> {
+    // Dropped once the scan's last frame is backed: frames past it never
+    // land, and the consumer may finish before `batches` closes.
+    let mut backer = Some(backer);
+    for b in batches {
+        let views = views_of(&ap, &place, &b.positions);
+        if let Some(k) = &mut backer {
+            k.back(&views)?;
+            if b.seq0 + b.n >= u64::from(ap.shape.nframe) {
+                backer = None;
+            }
+        }
+        if ahead.send((b, views)).is_err() {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// The mapper's outcome, once it stopped handing batches on.
+fn joined(mapper: &mut Option<JoinHandle<Result<(), GrowError>>>) -> Result<(), GrowError> {
+    match mapper.take().map(JoinHandle::join) {
+        Some(Ok(r)) => r,
+        Some(Err(panic)) => std::panic::resume_unwind(panic),
+        None => Ok(()),
+    }
+}
+
 /// Live AP on `store`'s frames as `batches` say they landed, until the
 /// uploader drops its sender and `cfg.snaps` snapshots are kept, with
 /// copies to `preview` if given. Sends on `captured` once its graphs are
@@ -269,6 +308,17 @@ pub fn run_ap_consumer(
     // store completed before the uploader sent their batch.
     let counts = unsafe { store.frames_view()? };
     let mut live = LiveAp::new(&stream, &cfg.ap, &cfg.probe, counts, preview.is_some())?;
+    // Only the mapper grows device memory from here on.
+    let (fwd, ahead) = crossbeam_channel::unbounded();
+    let mut mapper = {
+        let (b, ap, place) = (live.backer(), cfg.ap, cfg.place);
+        Some(
+            std::thread::Builder::new()
+                .name("backer".into())
+                .spawn(move || back_ahead(b, ap, place, batches, fwd))
+                .expect("spawn the backer"),
+        )
+    };
     let mut snaps = [live.new_snapshot()?, live.new_snapshot()?];
     let fence = [sleeping_event(&ctx)?, sleeping_event(&ctx)?];
     let mut view = match preview {
@@ -294,25 +344,31 @@ pub fn run_ap_consumer(
         while kept.len() + usize::from(pending.is_some()) < cfg.snaps {
             // Block for frames only while none has come.
             if open && positions.is_empty() {
-                match batches.recv() {
+                match ahead.recv() {
                     Ok(b) => got.push(b),
-                    Err(_) => open = false,
+                    Err(_) => {
+                        open = false;
+                        joined(&mut mapper)?;
+                    }
                 }
             }
             while open {
-                match batches.try_recv() {
+                match ahead.try_recv() {
                     Ok(b) => got.push(b),
                     Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => open = false,
+                    Err(TryRecvError::Disconnected) => {
+                        open = false;
+                        joined(&mut mapper)?;
+                    }
                 }
             }
-            for b in got.drain(..) {
+            for (b, views) in got.drain(..) {
                 assert_eq!(
                     b.seq0,
                     positions.len() as u64,
                     "batches arrive in order and without gaps"
                 );
-                live.push(&views_of(&cfg.ap, &cfg.place, &b.positions))?;
+                live.push(&views)?;
                 positions.extend(b.positions);
                 landings.push((live.epochs(), positions.len() as u64));
             }
@@ -464,7 +520,9 @@ pub fn offline_ap(
     // SAFETY: every frame read is stored, and nothing writes the store now.
     let counts = unsafe { store.frames_view()? };
     let mut run = LiveAp::new(&stream, &ap, &cfg.probe, counts, false)?;
-    run.push(&views_of(&ap, &cfg.place, positions))?;
+    let views = views_of(&ap, &cfg.place, positions);
+    run.backer().back(&views)?;
+    run.push(&views)?;
     settle(&mut run, region, scan_end, max_epochs)
 }
 
@@ -700,6 +758,7 @@ mod tests {
         // SAFETY: the consumer has returned; nothing writes the store.
         let counts = unsafe { store.frames_view().unwrap() };
         let mut run = LiveAp::new(&st, &cfg.ap, &cfg.probe, counts, true).unwrap();
+        let mut backer = run.backer();
         assert!(views.len() > 2, "{} views", views.len());
         assert!(views.windows(2).all(|w| w[0].epochs < w[1].epochs));
         assert_eq!(views[0].epochs, 1);
@@ -727,8 +786,13 @@ mod tests {
                 step(&mut run);
                 st.synchronize().unwrap();
             }
-            let p = &rep.positions[at as usize..upto as usize];
-            run.push(&views_of(&cfg.ap, &cfg.place, p)).unwrap();
+            let views = views_of(
+                &cfg.ap,
+                &cfg.place,
+                &rep.positions[at as usize..upto as usize],
+            );
+            backer.back(&views).unwrap();
+            run.push(&views).unwrap();
             st.synchronize().unwrap();
             at = upto;
         }
@@ -752,7 +816,10 @@ mod tests {
             llk.len(),
             replayed.len()
         );
-        assert!(llk.iter().all(|l| l.is_finite() && *l > 0.0));
+        // +inf where the flat start object predicts no photons where some
+        // landed, as PyNX gives it: an epoch-0 value whenever epoch 0
+        // covers such a frame, which depends on how many it covers.
+        assert!(llk.iter().all(|l| *l > 0.0), "{llk:?}");
     }
 
     /// The offline run settles at a doubling of its epochs within the cap,

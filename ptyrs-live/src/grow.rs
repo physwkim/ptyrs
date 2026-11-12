@@ -4,10 +4,16 @@
 //! in a CUDA graph stays valid for the whole measurement. Mapping a chunk
 //! touches no mapped chunk, so kernels and graph replays reading the mapped
 //! part keep running.
+//!
+//! Backing a chunk is a driver call that can take far longer than an epoch
+//! (cuMemCreate stalls about 130 ms every ~900 MiB a process allocates), so
+//! during a scan a [`Backer`] does it on a thread of its own, and the thread
+//! that queues work on the buffer only queues each chunk's first contents
+//! ([`GrowBuf::init_with`]), which never backs.
 
 use std::fmt;
 use std::ops::Range;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use cuda_async::device_operation::ExecutionContext;
 use cuda_bindings::{self as sys, CUdeviceptr};
@@ -32,6 +38,12 @@ pub enum GrowError {
     },
     /// An earlier chunk's initialisation failed; the buffer maps no more.
     Failed,
+    /// Bytes `start..end` were to be initialised but a chunk of them was
+    /// not backed: no [`Backer`] ran ahead of the push.
+    Unbacked {
+        start: usize,
+        end: usize,
+    },
     /// A landed count below the last one or past the scan's `nframe`
     /// ([`LiveFrames::land`](crate::stack::LiveFrames::land)).
     Land {
@@ -56,6 +68,9 @@ impl fmt::Display for GrowError {
                 write!(f, "tile {tile:?} past the {}x{} tiles", tiles[0], tiles[1])
             }
             Self::Failed => write!(f, "an earlier chunk initialisation failed"),
+            Self::Unbacked { start, end } => {
+                write!(f, "bytes {start}..{end} were not backed ahead of their use")
+            }
             Self::Land { n, landed, nframe } => write!(
                 f,
                 "landing {n} frames: {landed} already landed, the scan has {nframe}"
@@ -101,9 +116,59 @@ impl From<cuda_async::error::DeviceError> for GrowError {
 /// this, so a mapping lives while any work queued through it may reach it.
 struct Reserved {
     // Declaration order is drop order: mappings before the reservation.
-    chunks: Mutex<Vec<Option<Mapping>>>,
+    /// Each chunk's mapping, set once by a holder of `backing`; reading it
+    /// never waits for a chunk being backed.
+    chunks: Vec<OnceLock<Mapping>>,
+    /// Held while backing, so no chunk is mapped twice.
+    backing: Mutex<()>,
+    chunk: usize,
     va: VirtualReservation,
     ctx: Arc<Context>,
+}
+
+impl Reserved {
+    fn span(&self, r: &Range<usize>) -> Range<usize> {
+        if r.is_empty() {
+            return 0..0;
+        }
+        r.start / self.chunk..r.end.div_ceil(self.chunk)
+    }
+
+    fn check(&self, r: &Range<usize>) -> Result<(), GrowError> {
+        if r.end > self.va.size() {
+            return Err(GrowError::Capacity {
+                end: r.end,
+                capacity: self.va.size(),
+            });
+        }
+        Ok(())
+    }
+
+    fn is_backed(&self, c: usize) -> bool {
+        self.chunks[c].get().is_some()
+    }
+
+    /// Backs every chunk overlapping `r` that is not backed yet, ascending.
+    /// A chunk that fails to back stays unbacked.
+    fn back(&self, r: Range<usize>) -> Result<(), GrowError> {
+        self.check(&r)?;
+        let span = self.span(&r);
+        if span.clone().all(|c| self.is_backed(c)) {
+            return Ok(());
+        }
+        let _backing = self.backing.lock().unwrap();
+        self.ctx.bind_to_thread()?;
+        let dev = self.ctx.cu_device();
+        for c in span.filter(|&c| !self.is_backed(c)) {
+            let va = self.va.base() + (c * self.chunk) as u64;
+            // The mapping retains the physical memory; the handle can go.
+            let phys = PhysicalAllocation::new(dev, self.chunk)?;
+            let m = Mapping::new(va, self.chunk, &phys, 0)?;
+            vmm::set_access(va, self.chunk, &[dev])?;
+            assert!(self.chunks[c].set(m).is_ok(), "chunk {c} backed twice");
+        }
+        Ok(())
+    }
 }
 
 // SAFETY: the base and size are the reservation's, fixed for its life, in
@@ -132,16 +197,30 @@ impl Drop for Reserved {
     }
 }
 
+/// Backs chunks of a [`GrowBuf`] on any thread; its owner then queues
+/// their first contents with [`GrowBuf::init_with`] before using them.
+#[derive(Clone)]
+pub struct Backer(Arc<Reserved>);
+
+impl Backer {
+    /// Backs every chunk that overlaps `r` and is not backed yet, ascending.
+    /// A chunk that fails to back stays unbacked and the buffer usable.
+    pub fn back(&self, r: Range<usize>) -> Result<(), GrowError> {
+        self.0.back(r)
+    }
+}
+
 /// A fixed device address range whose chunks are backed on demand. Chunks
 /// are never unmapped before the last holder of [`Self::storage`] (a view,
 /// a lease, a captured graph) is gone, so every byte of a mapped chunk keeps
-/// its address and contents.
+/// its address and contents. A chunk is ready once backed and its first
+/// contents queued; only ready chunks are the owner's to use.
 pub struct GrowBuf {
     alloc: Arc<Reserved>,
     /// The one access tracker over the whole reservation.
     storage: RawDeviceBuffer,
-    chunk: usize,
-    mapped: usize,
+    /// Per chunk, whether it is ready; set by the owner only.
+    ready: Vec<bool>,
     failed: bool,
 }
 
@@ -155,7 +234,9 @@ impl GrowBuf {
         let chunk = vmm::align_size(chunk.max(1), granule);
         let n = capacity.div_ceil(chunk).max(1);
         let alloc = Arc::new(Reserved {
-            chunks: Mutex::new((0..n).map(|_| None).collect()),
+            chunks: (0..n).map(|_| OnceLock::new()).collect(),
+            backing: Mutex::new(()),
+            chunk,
             // Mapping needs granule alignment only, and the driver refuses
             // an alignment that is not a power of two, as a chunk may be.
             va: VirtualReservation::new(n * chunk, granule)?,
@@ -164,10 +245,14 @@ impl GrowBuf {
         Ok(Self {
             storage: RawDeviceBuffer::foreign(alloc.clone(), n * chunk),
             alloc,
-            chunk,
-            mapped: 0,
+            ready: vec![false; n],
             failed: false,
         })
+    }
+
+    /// A handle that backs this buffer's chunks from another thread.
+    pub fn backer(&self) -> Backer {
+        Backer(self.alloc.clone())
     }
 
     /// Base address; the same for the buffer's whole life.
@@ -180,11 +265,13 @@ impl GrowBuf {
     }
 
     pub fn chunk_bytes(&self) -> usize {
-        self.chunk
+        self.alloc.chunk
     }
 
+    /// Bytes backed so far, ready or not.
     pub fn mapped_bytes(&self) -> usize {
-        self.mapped * self.chunk
+        let a = &self.alloc;
+        (0..a.chunks.len()).filter(|&c| a.is_backed(c)).count() * a.chunk
     }
 
     /// The whole reservation, for leasing every access to it.
@@ -204,26 +291,27 @@ impl GrowBuf {
         unsafe { DeviceBuffer::from_storage(bytes, len) }
     }
 
-    /// Whether every byte of `r` is backed.
-    pub fn is_mapped(&self, r: Range<usize>) -> bool {
-        let chunks = self.alloc.chunks.lock().unwrap();
-        r.end <= self.capacity() && self.chunk_span(&r).all(|c| chunks[c].is_some())
+    /// Whether every byte of `r` is ready.
+    pub fn is_ready(&self, r: Range<usize>) -> bool {
+        r.end <= self.capacity() && self.alloc.span(&r).all(|c| self.ready[c])
     }
 
-    /// [`map_with`](Self::map_with) without initialisation, for buffers whose
-    /// new bytes are written before anything reads them.
+    /// Backs `r` on this thread and readies it without initialisation, for
+    /// buffers set up before a scan and buffers whose new bytes are written
+    /// before anything reads them.
     pub fn map(&mut self, r: Range<usize>) -> Result<(), GrowError> {
-        self.map_with(r, |_| Ok(()))
+        self.alloc.back(r.clone())?;
+        self.init_with(r, |_| Ok(()))
     }
 
-    /// Backs every chunk that overlaps `r`, ascending, and hands each newly
-    /// backed chunk's byte range to `init` (to queue its first contents)
-    /// before the next. A chunk that fails to back stays unbacked and the
-    /// buffer usable. A chunk whose `init` fails stays backed, since work
-    /// `init` queued may target it, and fails the buffer: every later call
-    /// returns [`GrowError::Failed`], so no chunk is ever skipped as backed
-    /// without having been initialised.
-    pub fn map_with(
+    /// Readies every chunk that overlaps `r`, ascending, handing each one
+    /// not ready yet to `init` (to queue its first contents) before the
+    /// next. Never backs: a chunk no [`Backer`] backed fails the call with
+    /// [`GrowError::Unbacked`] and leaves the buffer usable. A chunk whose
+    /// `init` fails fails the buffer: every later call returns
+    /// [`GrowError::Failed`], so no chunk is ever used without its first
+    /// contents.
+    pub fn init_with(
         &mut self,
         r: Range<usize>,
         mut init: impl FnMut(Range<usize>) -> Result<(), GrowError>,
@@ -231,46 +319,33 @@ impl GrowBuf {
         if self.failed {
             return Err(GrowError::Failed);
         }
-        if r.end > self.capacity() {
-            return Err(GrowError::Capacity {
-                end: r.end,
-                capacity: self.capacity(),
-            });
-        }
-        for c in self.chunk_span(&r) {
-            if self.alloc.chunks.lock().unwrap()[c].is_some() {
+        self.alloc.check(&r)?;
+        let ck = self.alloc.chunk;
+        for c in self.alloc.span(&r) {
+            if self.ready[c] {
                 continue;
             }
-            let ctx = &self.alloc.ctx;
-            ctx.bind_to_thread()?;
-            let dev = ctx.cu_device();
-            let va = self.ptr() + (c * self.chunk) as u64;
-            // The mapping retains the physical memory; the handle can go.
-            let phys = PhysicalAllocation::new(dev, self.chunk)?;
-            let m = Mapping::new(va, self.chunk, &phys, 0)?;
-            vmm::set_access(va, self.chunk, &[dev])?;
-            self.alloc.chunks.lock().unwrap()[c] = Some(m);
-            self.mapped += 1;
-            if let Err(e) = init(c * self.chunk..(c + 1) * self.chunk) {
+            if !self.alloc.is_backed(c) {
+                return Err(GrowError::Unbacked {
+                    start: r.start,
+                    end: r.end,
+                });
+            }
+            if let Err(e) = init(c * ck..(c + 1) * ck) {
                 self.failed = true;
                 return Err(e);
             }
+            self.ready[c] = true;
         }
         Ok(())
-    }
-
-    fn chunk_span(&self, r: &Range<usize>) -> Range<usize> {
-        if r.is_empty() {
-            return 0..0;
-        }
-        r.start / self.chunk..r.end.div_ceil(self.chunk)
     }
 }
 
 /// Append-only device table of `T`, such as the live address table
 /// (DESIGN.md §3 B6): record `i` stays at `ptr() + i * size_of::<T>()`.
 /// Records are copied from a pinned mirror they never leave, so a push
-/// never waits for the stream and no queued copy outlives its source.
+/// never waits for the stream and no queued copy outlives its source. A
+/// [`Self::backer`] backs their bytes before they are pushed.
 pub struct GrowTable<T: DeviceCopy> {
     buf: GrowBuf,
     mirror: PinnedHostBuffer<T>,
@@ -311,6 +386,11 @@ impl<T: DeviceCopy> GrowTable<T> {
         self.buf.mapped_bytes()
     }
 
+    /// Backs the bytes of records, record `i` at `i * size_of::<T>()`.
+    pub fn backer(&self) -> Backer {
+        self.buf.backer()
+    }
+
     /// The whole reservation, for leasing reads of the records.
     pub fn storage(&self) -> &RawDeviceBuffer {
         self.buf.storage()
@@ -326,9 +406,9 @@ impl<T: DeviceCopy> GrowTable<T> {
         unsafe { self.buf.typed(len) }
     }
 
-    /// Appends `recs` and queues their copy on the table's stream, leased as
-    /// a write, so kernels queued there afterwards see them. Returns their
-    /// indices.
+    /// Appends `recs`, which a [`Self::backer`] backed, and queues their
+    /// copy on the table's stream, leased as a write, so kernels queued
+    /// there afterwards see them. Returns their indices.
     pub fn push(&mut self, recs: &[T]) -> Result<Range<usize>, GrowError> {
         let sz = size_of::<T>();
         let idx = self.len..self.len + recs.len();
@@ -338,7 +418,8 @@ impl<T: DeviceCopy> GrowTable<T> {
                 capacity: self.max_len() * sz,
             });
         }
-        self.buf.map(idx.start * sz..idx.end * sz)?;
+        self.buf
+            .init_with(idx.start * sz..idx.end * sz, |_| Ok(()))?;
         if recs.is_empty() {
             return Ok(idx);
         }
@@ -346,7 +427,7 @@ impl<T: DeviceCopy> GrowTable<T> {
         let ctx = ExecutionContext::new(self.stream.clone());
         ptyrs_gpu::lease(&ctx, &[], &[self.buf.storage()])?;
         self.stream.context().bind_to_thread()?;
-        // SAFETY: the destination was mapped above; the source is the
+        // SAFETY: the destination is ready, checked above; the source is the
         // mirror's slots `idx`, never written again while the table lives
         // (Drop waits for the stream before the mirror is freed).
         unsafe {
@@ -556,10 +637,11 @@ RDONE:
         memset32_async(dst, v, n, s).unwrap();
     }
 
-    /// Maps `r` and returns the chunk ranges `init` saw.
+    /// Backs and readies `r` and returns the chunk ranges `init` saw.
     fn fresh(b: &mut GrowBuf, r: Range<usize>) -> Result<Vec<Range<usize>>, GrowError> {
         let mut seen = Vec::new();
-        b.map_with(r, |c| {
+        b.backer().back(r.clone())?;
+        b.init_with(r, |c| {
             seen.push(c);
             Ok(())
         })?;
@@ -627,8 +709,8 @@ RDONE:
             vec![ck..2 * ck, 2 * ck..3 * ck, 4 * ck..5 * ck]
         );
         assert!(fresh(&mut b, 0..5 * ck).unwrap().is_empty());
-        assert!(b.is_mapped(0..5 * ck));
-        assert!(!b.is_mapped(4 * ck..5 * ck + 1));
+        assert!(b.is_ready(0..5 * ck));
+        assert!(!b.is_ready(4 * ck..5 * ck + 1));
         assert_eq!(b.mapped_bytes(), 5 * ck);
         assert_eq!(b.ptr(), base);
         assert_eq!(dtoh(base, pat.len()), pat);
@@ -640,14 +722,28 @@ RDONE:
             b.map(cap - 4..cap + 1),
             Err(GrowError::Capacity { end, capacity }) if end == cap + 1 && capacity == cap
         ));
-        assert!(!b.is_mapped(cap - 4..cap));
-        // A failed init leaves its chunk backed and the buffer failed.
-        let bad = DriverError(sys::cudaError_enum_CUDA_ERROR_INVALID_VALUE);
+        assert!(!b.is_ready(cap - 4..cap));
+        // Initialising never backs: an unbacked chunk fails the call, hands
+        // `init` nothing and leaves the buffer usable.
+        let mut seen = 0;
         assert!(matches!(
-            b.map_with(5 * ck..5 * ck + 1, |_| Err(bad.into())),
+            b.init_with(4 * ck..6 * ck, |_| {
+                seen += 1;
+                Ok(())
+            }),
+            Err(GrowError::Unbacked { start, end }) if (start, end) == (4 * ck, 6 * ck)
+        ));
+        assert_eq!((seen, b.mapped_bytes()), (0, 5 * ck));
+        assert!(!b.is_ready(5 * ck..6 * ck));
+        // A failed init leaves its chunk backed, not ready, and the buffer
+        // failed.
+        let bad = DriverError(sys::cudaError_enum_CUDA_ERROR_INVALID_VALUE);
+        b.backer().back(5 * ck..5 * ck + 1).unwrap();
+        assert!(matches!(
+            b.init_with(5 * ck..5 * ck + 1, |_| Err(bad.into())),
             Err(GrowError::Driver(e)) if e == bad
         ));
-        assert!(b.is_mapped(5 * ck..6 * ck));
+        assert!(!b.is_ready(5 * ck..6 * ck));
         assert_eq!(b.mapped_bytes(), 6 * ck);
         assert!(matches!(b.map(0..1), Err(GrowError::Failed)));
     }
@@ -741,7 +837,8 @@ RDONE:
         let rounds = [1000, 300_000, 300_000, 1_000_000, 4_000_000, cap_elems];
         for &n in &rounds {
             let base = b.ptr();
-            b.map_with(0..n * 4, |r| {
+            b.backer().back(0..n * 4).unwrap();
+            b.init_with(0..n * 4, |r| {
                 Ok(memset32_async(base + r.start as u64, 0, r.len() / 4, &s)?)
             })
             .unwrap();
@@ -815,10 +912,27 @@ RDONE:
             [i, i.wrapping_mul(3), i ^ 0x5555, 7, i >> 3, 1]
         };
         let sizes = [1usize, 7, 5000, 33, 60_000, 2, 100_000, 999];
+        // Pushing never backs: records no backer reached are refused.
+        assert!(matches!(
+            t.push(&[rec(0)]),
+            Err(GrowError::Unbacked { start: 0, end: 24 })
+        ));
+        assert_eq!((t.len(), t.mapped_bytes()), (0, 0));
+        // Another thread backs each batch before it is pushed.
+        let (backer, (tx, rx)) = (t.backer(), std::sync::mpsc::channel());
+        let ahead = std::thread::spawn(move || {
+            let (mut n, mut k) = (0usize, 0usize);
+            while n < total {
+                let b = sizes[k % sizes.len()].min(total - n);
+                k += 1;
+                backer.back(n * 24..(n + b) * 24).unwrap();
+                tx.send(b).unwrap();
+                n += b;
+            }
+        });
         let (mut n, mut k) = (0usize, 0usize);
         let t0 = Instant::now();
-        while n < total {
-            let b = sizes[k % sizes.len()].min(total - n);
+        for b in rx.iter() {
             k += 1;
             let recs: Vec<[u32; 6]> = (n..n + b).map(rec).collect();
             assert_eq!(t.push(&recs).unwrap(), n..n + b);
@@ -828,6 +942,7 @@ RDONE:
         }
         let push_ms = t0.elapsed().as_secs_f64() * 1e3;
         let holding = !held.query().unwrap();
+        ahead.join().unwrap();
         h.release();
         s.synchronize().unwrap();
         eprintln!("grow: {k} pushes of {total} records in {push_ms:.1} ms behind a running kernel");

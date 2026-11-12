@@ -27,7 +27,7 @@ use ptyrs_gpu::{C32, Ended, Kernels, LlkPartial, LlkRing, LlkScratch, ViewAddr};
 use crate::graph::LiveGraph;
 use crate::grow::GrowError;
 use crate::object::Snapshot;
-use crate::scan::{LiveScan, ScanShape};
+use crate::scan::{LiveScan, ScanBacker, ScanShape};
 
 /// A live AP run's fixed parameters.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -187,9 +187,15 @@ impl LiveAp {
         })
     }
 
+    /// A backer of the scan's frames, for another thread
+    /// ([`LiveScan::backer`]).
+    pub fn backer(&self) -> ScanBacker {
+        self.scan.backer()
+    }
+
     /// Lands the frames whose views are `views` as the next frames of the
-    /// scan ([`LiveScan::push`]); their counts must be in `counts` when the
-    /// next epoch runs.
+    /// scan ([`LiveScan::push`]), once [`Self::backer`] backed them; their
+    /// counts must be in `counts` when the next epoch runs.
     pub fn push(&mut self, views: &[ViewAddr]) -> Result<u32, GrowError> {
         self.scan.push(views)
     }
@@ -506,6 +512,7 @@ mod tests {
         };
         let dev = DeviceBuffer::from_host(&st, &counts).unwrap();
         let mut live = LiveAp::new(&st, &config(shape, nf_max), &probe(&p), dev, true).unwrap();
+        live.backer().back(&views).unwrap();
         assert_eq!(live.push(&views).unwrap(), p.points() as u32);
         let mut snap = live.new_snapshot().unwrap();
         let [ly, lx] = snap.shape();
@@ -588,10 +595,12 @@ mod tests {
         let warm = WarmUp::end();
         let (mut sg, mut sw) = (grown.new_snapshot().unwrap(), whole.new_snapshot().unwrap());
         let mut mapped = vec![grown.scan().obj().mapped_bytes()];
+        let (mut bg, mut bw) = (grown.backer(), whole.backer());
         let mut at = 0;
         for batch in [40, 7, 130, 0, 90, 233] {
             let v = &views[2 * at..2 * (at + batch)];
-            for live in [&mut grown, &mut whole] {
+            for (live, b) in [(&mut grown, &mut bg), (&mut whole, &mut bw)] {
+                b.back(v).unwrap();
                 assert_eq!(live.push(v).unwrap(), batch as u32);
                 for _ in 0..3 {
                     live.epoch().unwrap();
@@ -631,6 +640,7 @@ mod tests {
         };
 
         let mut offline = run();
+        offline.backer().back(&views).unwrap();
         offline.push(&views).unwrap();
         // Epochs after the scan's end stand in for wall time.
         let settled = crate::follow::settle(&mut offline, region, 0, 1 << 14).unwrap();
@@ -639,12 +649,11 @@ mod tests {
 
         let mut live = run();
         let warm = WarmUp::end();
-        let mut at = 0;
+        let (mut at, mut b) = (0, live.backer());
         for batch in [5, 1, 13, 0, 17] {
-            assert_eq!(
-                live.push(&views[2 * at..2 * (at + batch)]).unwrap(),
-                batch as u32
-            );
+            let v = &views[2 * at..2 * (at + batch)];
+            b.back(v).unwrap();
+            assert_eq!(live.push(v).unwrap(), batch as u32);
             at += batch;
             for _ in 0..3 {
                 live.epoch().unwrap();

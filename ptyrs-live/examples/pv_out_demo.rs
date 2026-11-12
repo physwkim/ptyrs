@@ -56,8 +56,9 @@ async fn main() {
     let s = ctx.new_stream().expect("stream");
     let mut o = LiveObject::new(&s, 2, [n, n], 4, FILL, 1).expect("LiveObject");
     // A tile backs its object rows across the whole width.
-    o.ensure((row0 / 16..=(row1 - 1) / 16).map(|ty| [ty as u32, 0]))
-        .expect("ensure");
+    let tiles = || (row0 / 16..=(row1 - 1) / 16).map(|ty| [ty as u32, 0]);
+    o.backer().back(tiles()).expect("back");
+    o.init_tiles(tiles()).expect("init_tiles");
     let mut snap = Snapshot::new(&o).expect("Snapshot");
     let band = (row1 - row0) * n;
     let mut stage = PinnedHostBuffer::<[f32; 2]>::zeroed(&ctx, 2 * band).expect("staging");

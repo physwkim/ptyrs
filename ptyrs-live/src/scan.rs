@@ -6,10 +6,14 @@
 //! `push` is the one write site of frames into the scan. It lands a frame
 //! only if its index is inside the scan, every view of it passes
 //! [`ViewDims::check_view`] and every object tile it touches has a free
-//! slot in its slab; it backs those tiles first. So every view the device
+//! slot in its slab; it readies those tiles first. So every view the device
 //! reads is in range, `bin_views` never overflows a slab and the stack entry
 //! never needs the kernels' clamp. Frames land in order: the first frame
 //! refused closes the scan, and it and every frame after it count as lost.
+//!
+//! `push` never backs device memory: a [`ScanBacker`], on a thread of its
+//! own, backs the tiles and address records of frames before they are
+//! pushed, and a frame pushed unbacked fails.
 
 use std::num::NonZeroU32;
 use std::sync::Arc;
@@ -18,8 +22,8 @@ use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{DeviceBuffer, Stream};
 use ptyrs_gpu::{C32, Kernels, StackRef, UpdateSums, ViewAddr, ViewDims, Views, view_tiles};
 
-use crate::grow::{GrowError, GrowTable};
-use crate::object::LiveObject;
+use crate::grow::{Backer, GrowError, GrowTable};
+use crate::object::{LiveObject, ObjectBacker};
 use crate::stack::LiveFrames;
 
 /// A scan's geometry with the object sized from the largest view offset.
@@ -90,6 +94,43 @@ pub enum Refusal {
     Failed { frame: u32 },
 }
 
+/// Backs a [`LiveScan`]'s memory for frames ahead of [`LiveScan::push`],
+/// on any thread.
+pub struct ScanBacker {
+    dims: ViewDims,
+    obj: ObjectBacker,
+    addr: Backer,
+    /// Frames backed so far, in push order.
+    next: u64,
+}
+
+impl ScanBacker {
+    /// Backs what pushing `views`, `nmode` per frame, as the frames after
+    /// those already backed needs: the object tiles of every view that
+    /// passes [`ViewDims::check_view`] and the address records of the
+    /// frames inside the scan. Frames land in push order, so backing every
+    /// batch here before pushing it backs every frame that lands.
+    pub fn back(&mut self, views: &[ViewAddr]) -> Result<(), GrowError> {
+        let d = self.dims;
+        let nmode = d.nmode as usize;
+        let n = (views.len() / nmode) as u64;
+        let inside = u64::from(d.nframe).clamp(self.next, self.next + n);
+        let ins = &views[..(inside - self.next) as usize * nmode];
+        self.obj.back(
+            ins.iter()
+                .filter(|v| d.check_view(v).is_ok())
+                .flat_map(|v| view_tiles(&d, v)),
+        )?;
+        if inside > self.next {
+            let sz = size_of::<ViewAddr>() * nmode;
+            self.addr
+                .back(self.next as usize * sz..inside as usize * sz)?;
+        }
+        self.next += n;
+        Ok(())
+    }
+}
+
 pub struct LiveScan {
     dims: ViewDims,
     views: Views,
@@ -152,9 +193,21 @@ impl LiveScan {
         })
     }
 
+    /// A backer of this scan's frames, for another thread. Back each batch
+    /// through it before pushing the batch.
+    pub fn backer(&self) -> ScanBacker {
+        ScanBacker {
+            dims: self.dims,
+            obj: self.obj.backer(),
+            addr: self.addr.backer(),
+            next: u64::from(self.frames.landed()),
+        }
+    }
+
     /// Lands the frames whose views are `views`, `nmode` per frame, as the
     /// next frames of the scan, up to the first one refused; returns how
-    /// many landed. Kernels queued on the stream afterwards see them.
+    /// many landed. Kernels queued on the stream afterwards see them. A
+    /// [`ScanBacker`] must have backed them first.
     pub fn push(&mut self, views: &[ViewAddr]) -> Result<u32, GrowError> {
         let nmode = self.dims.nmode as usize;
         if !views.len().is_multiple_of(nmode) {
@@ -191,7 +244,7 @@ impl LiveScan {
             let dims = self.dims;
             if let Err(e) = self
                 .obj
-                .ensure(frame.iter().flat_map(|v| view_tiles(&dims, v)))
+                .init_tiles(frame.iter().flat_map(|v| view_tiles(&dims, v)))
             {
                 self.closed = Some(Refusal::Failed { frame: f });
                 return Err(e);
@@ -341,6 +394,12 @@ mod tests {
         [v, ViewAddr { probe: 1, ..v }]
     }
 
+    /// Backs `views`, then pushes them.
+    fn push(scan: &mut LiveScan, b: &mut ScanBacker, views: &[ViewAddr]) -> Result<u32, GrowError> {
+        b.back(views)?;
+        scan.push(views)
+    }
+
     fn read_ctl(scan: &LiveScan) -> StackCtl {
         let mut got = StackCtl { f0: 0, nf: 0 };
         scan.stream().synchronize().unwrap();
@@ -390,9 +449,9 @@ mod tests {
             ox: reach[1] + 1,
             ..bad[2 * 27]
         };
-        let (mut f, mut covered) = (0usize, 0u32);
+        let (mut f, mut covered, mut backer) = (0usize, 0u32, scan.backer());
         for b in [1usize, 7, 3, 9, 5, 4, 3] {
-            let got = scan.push(&bad[2 * f..2 * (f + b)]).unwrap();
+            let got = push(&mut scan, &mut backer, &bad[2 * f..2 * (f + b)]).unwrap();
             f += b;
             while covered < scan.landed() {
                 graph.replay().unwrap();
@@ -472,8 +531,8 @@ mod tests {
         }
     }
 
-    /// A frame past the scan or one with no free slab slot closes the scan
-    /// the same way; nothing lands afterwards.
+    /// A frame past the scan, one with no free slab slot or one pushed
+    /// unbacked closes the scan the same way; nothing lands afterwards.
     #[test]
     fn a_full_slab_or_a_frame_past_the_scan_closes_it() {
         let ctx = Context::new(0).expect("GPU 0");
@@ -483,18 +542,34 @@ mod tests {
         let three: Vec<ViewAddr> = (0..3).flat_map(|_| v).collect();
 
         let mut scan = LiveScan::new(&s, &shape(2, [16, 16]), one, 64, [1.0, 0.0], 1).unwrap();
-        assert_eq!(scan.push(&three).unwrap(), 2);
+        let mut b = scan.backer();
+        assert_eq!(push(&mut scan, &mut b, &three).unwrap(), 2);
         assert_eq!(scan.closed(), Some(Refusal::PastScan { frame: 2 }));
         assert_eq!((scan.landed(), scan.lost()), (2, 1));
+        // Backing past the scan backs nothing more.
+        assert_eq!(push(&mut scan, &mut b, &three).unwrap(), 0);
 
         // Both modes of a frame take a slot each: two frames fill a 4-slot slab.
         let mut scan = LiveScan::new(&s, &shape(5, [16, 16]), one, 4, [1.0, 0.0], 1).unwrap();
-        assert_eq!(scan.push(&three).unwrap(), 2);
+        let mut b = scan.backer();
+        assert_eq!(push(&mut scan, &mut b, &three).unwrap(), 2);
         let tile = view_tiles(scan.dims(), &v[0]).next().unwrap();
         assert_eq!(scan.closed(), Some(Refusal::Slab { frame: 2, tile }));
-        assert_eq!(scan.push(&three[..2]).unwrap(), 0);
+        assert_eq!(push(&mut scan, &mut b, &three[..2]).unwrap(), 0);
         assert_eq!((scan.landed(), scan.lost()), (2, 2));
-        assert!(matches!(scan.push(&three[..1]), Err(GrowError::Gpu(_))));
+        assert!(matches!(
+            push(&mut scan, &mut b, &three[..1]),
+            Err(GrowError::Gpu(_))
+        ));
+
+        let mut scan = LiveScan::new(&s, &shape(5, [16, 16]), one, 64, [1.0, 0.0], 1).unwrap();
+        assert!(matches!(
+            scan.push(&three[..2]),
+            Err(GrowError::Unbacked { .. })
+        ));
+        assert_eq!(scan.closed(), Some(Refusal::Failed { frame: 0 }));
+        assert_eq!((scan.landed(), scan.lost()), (0, 1));
+        assert_eq!(scan.obj().mapped_bytes(), 0);
     }
 
     /// A slab of `tile_cap` slots takes every view; one slot fewer refuses
@@ -515,10 +590,12 @@ mod tests {
         };
         assert_eq!(sh.tile_cap(&[three.as_slice(), &[off, off]].concat()), cap);
         let mut scan = LiveScan::new(&s, &sh, one, cap, [1.0, 0.0], 1).unwrap();
-        assert_eq!(scan.push(&three).unwrap(), 3);
+        let mut b = scan.backer();
+        assert_eq!(push(&mut scan, &mut b, &three).unwrap(), 3);
         assert_eq!(scan.closed(), None);
         let mut scan = LiveScan::new(&s, &sh, one, cap - 1, [1.0, 0.0], 1).unwrap();
-        assert_eq!(scan.push(&three).unwrap(), 2);
+        let mut b = scan.backer();
+        assert_eq!(push(&mut scan, &mut b, &three).unwrap(), 2);
         assert!(matches!(
             scan.closed(),
             Some(Refusal::Slab { frame: 2, .. })

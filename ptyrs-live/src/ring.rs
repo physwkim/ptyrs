@@ -254,7 +254,7 @@ impl DeviceStore {
         assert_eq!(out.len(), n);
         let fb = (self.frame_elems * 2) as u64;
         let range = (seqs.start * fb) as usize..(seqs.end * fb) as usize;
-        assert!(self.frames.is_mapped(range));
+        assert!(self.frames.is_ready(range));
         self.ctx.bind_to_thread()?;
         // SAFETY: the source range is mapped (checked above; mappings are only
         // added while the store lives) and `out` holds its element count.
@@ -271,7 +271,7 @@ impl DeviceStore {
     /// Synchronous copy of the positions of frames `0..n`, for checks.
     pub fn read_positions(&self, n: u64) -> Result<Vec<f64>, DriverError> {
         let mut v = vec![0f64; 2 * n as usize];
-        assert!(self.positions.is_mapped(0..16 * n as usize));
+        assert!(self.positions.is_ready(0..16 * n as usize));
         self.ctx.bind_to_thread()?;
         // SAFETY: as in `read_frames`.
         unsafe {

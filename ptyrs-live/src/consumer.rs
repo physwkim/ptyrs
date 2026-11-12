@@ -121,8 +121,10 @@ pub fn run_checksum_consumer(
     let nf_max = NonZeroU32::new(batch.get().min(nframe)).unwrap_or(batch);
     let mut frames = LiveFrames::new(&stream, &frames_only(nframe), nf_max)?;
     let mut out = GrowBuf::new(&ctx, nframe as usize * 8, 1)?;
+    // Whole, now: the loop below must not wait for the driver to grow it.
+    out.map(0..nframe as usize * 8)?;
     // SAFETY: a replay reads only landed frames, which the uploader sent,
-    // and writes their checksums, which `out` backs before they land.
+    // and writes their checksums, which `out` backs whole.
     let (counts, sums) = unsafe { (store.frames_view()?, out.typed::<u64>(nframe as usize)?) };
     let elems = store.frame_elems() as u32;
     let graph = LiveGraph::capture(&stream, |ctx| {
@@ -153,7 +155,6 @@ pub fn run_checksum_consumer(
         for b in batches.iter() {
             assert_eq!(b.seq0, landed, "batches arrive in order and without gaps");
             landed += b.n;
-            out.map(0..landed as usize * 8)?;
             frames.land(u32::try_from(landed).unwrap_or(u32::MAX))?;
             while covered < landed {
                 graph.replay()?;
