@@ -79,9 +79,23 @@ impl ViewDims {
         self.nobj as usize * self.obj[0] as usize * self.obj[1] as usize
     }
 
-    /// `[nty, ntx]` object tiles of `OBJ_TILE` pixels per side.
-    fn tiles(&self) -> [u32; 2] {
+    /// `[nty, ntx]` object tiles of `OBJ_TILE` pixels per side; tile `[ty, tx]` is entry
+    /// `ty * ntx + tx` of the [`Views`] tile lists.
+    pub fn tiles(&self) -> [u32; 2] {
         self.obj.map(|n| n.div_ceil(OBJ_TILE))
+    }
+
+    /// The per-view check of [`Views::new`]: `v` lies inside the object, `fy` and `fx` are in
+    /// `[0, 1)` and its probe and object modes exist.
+    pub fn check_view(&self, v: &ViewAddr) -> Result<(), Error> {
+        let [ny, nx] = self.frame;
+        let [nyo, nxo] = self.obj;
+        let frac = |f: f32| (0.0..1.0).contains(&f);
+        let inside = v.oy as u64 + ny as u64 <= nyo as u64 && v.ox as u64 + nx as u64 <= nxo as u64;
+        if !inside || !frac(v.fy) || !frac(v.fx) || v.probe >= self.nprobe || v.obj >= self.nobj {
+            return Err(Error::Shape(format!("{v:?} is outside {self:?}")));
+        }
+        Ok(())
     }
 
     fn ntiles(&self) -> usize {
@@ -284,16 +298,9 @@ impl Views {
                 addr.len()
             )));
         }
-        let [ny, nx] = dims.frame;
-        let [nyo, nxo] = dims.obj;
-        let frac = |f: f32| (0.0..1.0).contains(&f);
         for (k, v) in addr.iter().enumerate() {
-            let inside =
-                v.oy as u64 + ny as u64 <= nyo as u64 && v.ox as u64 + nx as u64 <= nxo as u64;
-            if !inside || !frac(v.fy) || !frac(v.fx) || v.probe >= dims.nprobe || v.obj >= dims.nobj
-            {
-                return Err(Error::Shape(format!("view {k}: {v:?} is outside {dims:?}")));
-            }
+            dims.check_view(v)
+                .map_err(|e| Error::Shape(format!("view {k}: {e}")))?;
         }
         let t = tile_lists(&dims, addr)?;
         Ok(Self {
@@ -388,6 +395,14 @@ fn axis_tiles(o: u32, len: u32, n: u32) -> impl Iterator<Item = u32> {
     (first..=last).chain((wrap < first || wrap > last).then_some(wrap))
 }
 
+/// The object tiles `[ty, tx]` that the samples of view `v` may touch, ty-major; along each
+/// axis ascending, then the tile of the wrapped `+ 1` neighbour if it is not among them.
+/// [`Views::new`] lists view `v` in exactly these tiles' runs.
+pub fn view_tiles(dims: &ViewDims, v: &ViewAddr) -> impl Iterator<Item = [u32; 2]> + use<> {
+    let ([ny, nx], [nyo, nxo], ox) = (dims.frame, dims.obj, v.ox);
+    axis_tiles(v.oy, ny, nyo).flat_map(move |ty| axis_tiles(ox, nx, nxo).map(move |tx| [ty, tx]))
+}
+
 /// Host form of the [`Views`] tile lists.
 struct TileLists {
     start: Vec<u32>,
@@ -397,15 +412,11 @@ struct TileLists {
 
 /// CSR lists of the views touching each object tile, ascending per tile.
 fn tile_lists(dims: &ViewDims, addr: &[ViewAddr]) -> Result<TileLists, Error> {
-    let [ny, nx] = dims.frame;
-    let [nyo, nxo] = dims.obj;
     let ntx = dims.tiles()[1] as usize;
     let mut lists = vec![Vec::new(); dims.ntiles()];
     for (k, v) in addr.iter().enumerate() {
-        for ty in axis_tiles(v.oy, ny, nyo) {
-            for tx in axis_tiles(v.ox, nx, nxo) {
-                lists[ty as usize * ntx + tx as usize].push(k as u32);
-            }
+        for [ty, tx] in view_tiles(dims, v) {
+            lists[ty as usize * ntx + tx as usize].push(k as u32);
         }
     }
     let mut start = Vec::with_capacity(lists.len() + 1);

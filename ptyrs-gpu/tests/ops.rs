@@ -12,7 +12,7 @@ use cuda_core::{CudaContext, CudaStream, DeviceBuffer, DeviceCopy, DriverError};
 use ptyrs_fft::{FftError, Plan2d};
 use ptyrs_gpu::{
     C32, Error, Kernels, Lines, LlkPartial, LlkSums, MASKED, OBJ_TILE, StackCtl, StackRef,
-    StackTable, UpdateSums, ViewAddr, ViewDims, Views, record,
+    StackTable, UpdateSums, ViewAddr, ViewDims, Views, record, view_tiles,
 };
 
 type Z = (f64, f64);
@@ -930,6 +930,46 @@ fn views_and_frame_ranges_are_checked() {
         matches!(r, Err(Error::Shape(_))),
         "table made for another frame count"
     );
+}
+
+/// `view_tiles` lists, once each, every tile holding an object pixel a view's samples read,
+/// and `Views::new` lists each view in exactly those tiles' runs.
+#[test]
+fn view_tiles_cover_the_pixels_each_view_reads() {
+    let (stream, _, _) = setup();
+    let s = scan();
+    let [nyo, nxo] = s.d.obj.map(|n| n as usize);
+    let [nty, ntx] = s.d.tiles().map(|n| n as usize);
+    let side = OBJ_TILE as usize;
+    let mut runs = vec![Vec::new(); nty * ntx];
+    for (k, v) in s.views.iter().enumerate() {
+        let tiles: Vec<_> = view_tiles(&s.d, v).collect();
+        let mut once = tiles.clone();
+        once.sort();
+        once.dedup();
+        assert_eq!(once.len(), tiles.len(), "view {k} lists a tile twice");
+        for (y, x, _) in s.pixels() {
+            for (i, w) in s.corners(v, y, x) {
+                let (oy, ox) = (i / nxo % nyo, i % nxo);
+                let tile = [(oy / side) as u32, (ox / side) as u32];
+                assert!(
+                    w == 0.0 || tiles.contains(&tile),
+                    "view {k} reads ({oy}, {ox}) outside {tiles:?}"
+                );
+            }
+        }
+        for [ty, tx] in tiles {
+            runs[ty as usize * ntx + tx as usize].push(k as u32);
+        }
+    }
+    let views = Views::new(&stream, s.d, &s.views).unwrap();
+    let start = views.tile_start().to_host_vec(&stream).unwrap();
+    let list = views.tile_views().to_host_vec(&stream).unwrap();
+    let len = views.tile_len().to_host_vec(&stream).unwrap();
+    for (t, run) in runs.iter().enumerate() {
+        let lo = start[t] as usize;
+        assert_eq!(&list[lo..lo + len[t] as usize], run, "tile {t}");
+    }
 }
 
 /// Every stack launch over one stack, on buffers it zeroes first.
