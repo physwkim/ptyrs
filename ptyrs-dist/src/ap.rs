@@ -14,11 +14,11 @@
 //!
 //! Per cycle, with [`Gpu::fence`] between the steps: A per stack one fused pass (exit waves,
 //! LLK, projection, an own stack's leaf probe sums, object sums), the border stacks only once
-//! the halo has landed, then the probe subtree; B the object sums' max, the other regions'
-//! subtree roots pulled by copy engine and the pair tree above them; C the other regions' max
-//! words pulled by copy engine, object and probe updates, then each owner packs the updated
-//! rows its neighbours read; D each receiver pulls them by copy engine and unpacks its halo on
-//! its side stream, under the next cycle's interior stacks.
+//! the halo has landed, then the probe subtree and the object sums' max; B the other regions'
+//! max words pulled by copy engine, the object update, then each owner packs the updated rows
+//! its neighbours read, while the side stream pulls the other regions' subtree roots and adds
+//! the pair tree above them, then the probe update; C each receiver pulls the packed rows by
+//! copy engine and unpacks its halo on its side stream, under the next cycle's interior stacks.
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -759,25 +759,22 @@ impl State {
                 unsafe { a.run(ex, &stream, np)? };
             }
         }
-        gpu.fence()?;
-
-        // B: the object sums' max, probe pair tree above the subtree roots.
         if let Some(sums) = obj_sums.as_mut() {
             k.obj_den_max(&ctx, views, sums)?;
         }
-        if let Some(t) = tree.as_ref() {
-            // SAFETY: each pull reads an owner's subtree root, added before the fence and
-            // rewritten only after the third; the pulled copies and the upper nodes are local.
-            unsafe {
-                exchange::pull(&stream, &links.tree)?;
-                for a in &t.upper {
-                    a.run(ex, &stream, np)?;
-                }
-            }
-        }
         gpu.fence()?;
 
-        // C: updates.
+        // B: the probe pair tree above the subtree roots on the side stream, under the object
+        // update; then the probe update.
+        if let Some(t) = tree.as_ref() {
+            // SAFETY: each pull reads an owner's subtree root, added before the fence and
+            // rewritten only after the next; the pulled copies and the upper nodes are local,
+            // last read by the previous cycle's adds on this same stream.
+            gpu.side(|s| unsafe {
+                exchange::pull(s, &links.tree)?;
+                t.upper.iter().try_for_each(|a| a.run(ex, s, np))
+            })?;
+        }
         if let (Some(sums), Some(inertia)) = (obj_sums.as_mut(), plan.obj_inertia) {
             // SAFETY: each pull reads a region's `max_bits` word, written before the fence and
             // rewritten only after the next; every source of the max is then local.
@@ -787,15 +784,16 @@ impl State {
             }
             k.normalize_obj(&ctx, views, obj, sums, gmax, inertia)?;
             // SAFETY: the runs address this region's object and send buffer, which its peers
-            // last pulled before this cycle's first fence.
+            // last pulled on their side streams, joined before the fence.
             unsafe { ex.copy_runs(&stream, &halo.pack)? };
         }
         if let (Some(t), Some(inertia)) = (tree.as_mut(), plan.probe_inertia) {
+            gpu.join()?;
             k.update_from_sums(&ctx, probe, &mut t.root, np, inertia)?;
         }
         gpu.fence()?;
 
-        // D: halo pull from the owners' send buffers; the unpack overwrites what
+        // C: halo pull from the owners' send buffers; the unpack overwrites what
         // `normalize_obj` left in the halo tiles it read.
         if obj_sums.is_some() {
             // SAFETY: each pull reads the part of an owner's send buffer packed for this
