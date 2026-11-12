@@ -3,7 +3,9 @@
 //! Cross-GPU ordering has one owner, [`Gpu::fence`]: work any GPU enqueued before a fence is
 //! complete before work any GPU enqueues after it. Peers only read each other's memory
 //! (invariant 5), so a fence between a producer step and its readers, and another before the
-//! producer overwrites, is all the exchange needs.
+//! producer overwrites, is all the exchange needs. Work on a GPU's side stream ([`Gpu::side`])
+//! starts after its main stream's earlier work and the next fence waits for it, so it lies
+//! between the same two fences as if it ran on the main stream.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -20,8 +22,18 @@ pub struct Gpu {
     region: usize,
     ctx: Arc<Context>,
     stream: Arc<Stream>,
+    side: Side,
     shared: Arc<Shared>,
     fences: usize,
+}
+
+/// A second stream for peer copies that overlap the main stream's compute.
+struct Side {
+    stream: Arc<Stream>,
+    /// Recorded on the main stream where side work starts.
+    go: Event,
+    /// Recorded on the side stream after each piece of side work.
+    done: Event,
 }
 
 impl Gpu {
@@ -45,6 +57,31 @@ impl Gpu {
         &self.stream
     }
 
+    /// Enqueues `f`'s work on the side stream, after the work enqueued on the main stream so
+    /// far. The main stream waits for it at [`Gpu::join_side`] or the next fence.
+    pub fn side<R>(
+        &mut self,
+        f: impl FnOnce(&Stream) -> Result<R, DistError>,
+    ) -> Result<R, DistError> {
+        let side = &self.side;
+        side.go.record(&self.stream)?;
+        side.stream.wait(&side.go)?;
+        let out = f(&side.stream);
+        side.done.record(&side.stream)?;
+        out
+    }
+
+    /// Main-stream work enqueued after this waits for all side work enqueued before it.
+    pub fn join_side(&self) -> Result<(), DistError> {
+        Ok(self.stream.wait(&self.side.done)?)
+    }
+
+    /// Blocks until both streams are drained.
+    pub fn synchronize(&self) -> Result<(), DistError> {
+        self.side.stream.synchronize()?;
+        Ok(self.stream.synchronize()?)
+    }
+
     /// Orders every GPU's prior stream work before every GPU's later stream work, without a
     /// host sync: record this GPU's event, meet the other workers on the host so every record
     /// is enqueued, then make this stream wait on every peer's event. All workers of a run
@@ -55,6 +92,7 @@ impl Gpu {
         // rendezvous, which this worker reaches only after enqueuing its waits on parity p.
         let p = self.fences % 2;
         self.fences += 1;
+        self.join_side()?;
         events[self.region][p].record(&self.stream)?;
         self.shared.rendezvous.wait()?;
         for (r, e) in events.iter().enumerate() {
@@ -303,7 +341,7 @@ impl<S: Send + 'static> Drop for Workers<S> {
     /// Peers may still be reading any worker's buffers, so every stream drains before any
     /// thread drops its state.
     fn drop(&mut self) {
-        let _ = self.run(|gpu, _| Ok(gpu.stream.synchronize()?));
+        let _ = self.run(|gpu, _| gpu.synchronize());
         self.senders.clear();
         for h in self.handles.drain(..) {
             let _ = h.join();
@@ -330,10 +368,16 @@ fn worker<S, I>(
             ctx.new_event_with_flags(None)?,
             ctx.new_event_with_flags(None)?,
         ];
+        let side = Side {
+            stream: ctx.new_stream()?,
+            go: ctx.new_event_with_flags(None)?,
+            done: ctx.new_event_with_flags(None)?,
+        };
         let gpu = Gpu {
             region,
             ctx: ctx.clone(),
             stream,
+            side,
             shared,
             fences: 0,
         };
@@ -364,7 +408,7 @@ fn worker<S, I>(
     for job in jobs {
         job(&mut gpu, &mut state);
     }
-    let _ = gpu.stream.synchronize();
+    let _ = gpu.synchronize();
     drop(state);
 }
 
@@ -399,10 +443,19 @@ pub(crate) mod tests {
 
     const LEN: usize = 1 << 22;
 
+    /// Where the peer copies run and what orders the main stream's read after them.
+    #[derive(Clone, Copy)]
+    enum Copier {
+        Main,
+        /// Side stream, read after the fence.
+        Side,
+        /// Side stream, read after [`Gpu::join_side`] and before the fence.
+        SideJoined,
+    }
+
     /// Each round every GPU overwrites its buffer, fences, then copies every peer's buffer;
-    /// after the fence it must see that round's value from every peer, never the previous.
-    #[test]
-    fn fence_orders_peer_writes_before_peer_reads() {
+    /// reading the copies it must see that round's value from every peer, never the previous.
+    fn fence_round_trip(how: Copier) {
         let w = Workers::spawn(&gpus(4), |g| {
             Ok(Bufs {
                 own: DeviceBuffer::zeroed(g.stream(), LEN)?,
@@ -420,14 +473,33 @@ pub(crate) mod tests {
                     // SAFETY: `own` holds LEN u32 on this device; `seen` holds 4 * LEN.
                     unsafe { sys::cuMemsetD32Async(b.own.cu_deviceptr(), value, LEN, s).result()? };
                     g.fence()?;
-                    for (r, &p) in ptrs.iter().enumerate() {
-                        let dst = b.seen.cu_deviceptr() + (r * LEN * 4) as u64;
-                        // SAFETY: peer access is enabled; both ranges hold LEN u32.
-                        unsafe { sys::cuMemcpyDtoDAsync_v2(dst, p, LEN * 4, s).result()? };
-                    }
+                    let seen = b.seen.cu_deviceptr();
+                    let copy = |s: &Stream| -> Result<(), DistError> {
+                        for (r, &p) in ptrs.iter().enumerate() {
+                            let dst = seen + (r * LEN * 4) as u64;
+                            // SAFETY: peer access is enabled; both ranges hold LEN u32.
+                            unsafe {
+                                sys::cuMemcpyDtoDAsync_v2(dst, p, LEN * 4, s.cu_stream())
+                                    .result()?
+                            };
+                        }
+                        Ok(())
+                    };
+                    let early = match how {
+                        Copier::Main => copy(g.stream()).map(|_| None)?,
+                        Copier::Side => g.side(copy).map(|_| None)?,
+                        Copier::SideJoined => {
+                            g.side(copy)?;
+                            g.join_side()?;
+                            Some(b.seen.to_host_vec(g.stream())?)
+                        }
+                    };
                     // Nobody overwrites `own` until every peer's copy is done.
                     g.fence()?;
-                    let seen = b.seen.to_host_vec(g.stream())?;
+                    let seen = match early {
+                        Some(seen) => seen,
+                        None => b.seen.to_host_vec(g.stream())?,
+                    };
                     Ok((0..4).all(|r| {
                         seen[r * LEN..(r + 1) * LEN]
                             .iter()
@@ -437,6 +509,21 @@ pub(crate) mod tests {
                 .unwrap();
             assert_eq!(got, [true; 4], "round {round}");
         }
+    }
+
+    #[test]
+    fn fence_orders_peer_writes_before_peer_reads() {
+        fence_round_trip(Copier::Main);
+    }
+
+    #[test]
+    fn fence_orders_side_stream_peer_reads() {
+        fence_round_trip(Copier::Side);
+    }
+
+    #[test]
+    fn join_side_orders_side_work_before_later_main_work() {
+        fence_round_trip(Copier::SideJoined);
     }
 
     #[test]
