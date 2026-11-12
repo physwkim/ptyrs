@@ -46,7 +46,7 @@ use device::{Bufs, Device, M1Bufs, NormBufs, PassesMut};
 use crate::engine::ptycho::{Algorithm, LlkRecord, zero_phase_ramp};
 use crate::engine::{
     ApParams, BhParams, DmParams, EngineError, Features, Fft2, Llk, LsqmlParams, MlParams,
-    Observed, RpieParams,
+    RpieParams,
 };
 
 /// How [`GpuPtycho`] batches its work.
@@ -389,7 +389,7 @@ impl GpuPtycho {
             dev,
             obj_dims: object.dims(),
             probe_dims: probe.dims(),
-            total_obs: Observed::from_counts(&scan.counts).total(),
+            total_obs: scan.counts.total(),
             fft: Fft2::new(g.frame),
             cycle: 0,
             history: Vec::new(),
