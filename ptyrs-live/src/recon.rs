@@ -111,7 +111,7 @@ impl LiveAp {
             Plan2d::new(stream, d.frame[0] as usize, planes).map_err(ptyrs_gpu::Error::from)?;
         let mut bufs = if llk {
             Some(LlkBufs {
-                ring: LlkRing::new(&kernels, stream, d.nframe, LLK_SLOTS)?,
+                ring: LlkRing::new(&kernels, stream, &d, LLK_SLOTS)?,
                 scratch: LlkScratch::new(stream, &d, cfg.nf_max.get())?,
                 partials: DeviceBuffer::zeroed(stream, cfg.nf_max.get() as usize)?,
             })

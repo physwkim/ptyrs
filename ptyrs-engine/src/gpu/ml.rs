@@ -4,7 +4,8 @@
 use cuda_async::device_operation::ExecutionContext;
 use ptyrs_core::{C64, Stack};
 use ptyrs_gpu::{
-    CG_BLOCKS, Ended, Error as GpuError, Exit, FusedBufs, FusedInputs, FusedSums, RecordWriter,
+    CG_BLOCKS, Ended, Error as GpuError, Exit, FusedBufs, FusedInputs, FusedSums, ObjProbeScale,
+    RecordWriter,
 };
 
 use super::device::{MlBufs, PassesMut};
@@ -18,7 +19,7 @@ impl GpuPtycho {
     /// Polak–Ribière direction and the Poisson quadratic step along it; each cycle is one
     /// graph and nothing reads back until the call's end.
     pub fn ml(&mut self, params: &MlParams, ncycle: usize) -> Result<(), EngineError> {
-        self.dev.scale_obj_probe(self.total_obs as f32)?;
+        self.dev.scale_to_photons(self.total_obs as f32)?;
         for ic in 0..ncycle {
             let epoch = Epoch::Ml {
                 params: *params,
@@ -103,10 +104,10 @@ impl Bufs<'_> {
                 plan.forward_inplace(ctx, f)?;
             }
             self.grad
-                .gamma_frames(ctx, &dims, stack, self.counts, ml.fields, ml.frame_pairs)?;
+                .gamma_frames(ctx, &dims, stack, self.counts, ml.fields, ml.gamma_parts)?;
         }
-        self.grad
-            .sum_parts(ctx, ml.frame_pairs, dims.nframe, ml.gamma)?;
+        let npart = ptyrs_gpu::gamma_parts(&dims)?;
+        self.grad.sum_parts(ctx, ml.gamma_parts, npart, ml.gamma)?;
         for (i, x) in [&mut *self.obj, &mut *self.probe].into_iter().enumerate() {
             if update[i] {
                 self.grad
@@ -207,24 +208,15 @@ impl Bufs<'_> {
     }
 
     /// [`crate::Ptycho::scale_obj_probe`] on the device, `total` being the unmasked observed
-    /// photons: the norms of the object and the probe, the calculated photons over the same
-    /// unmasked pixels (stack by stack, by the LLK kernel on the far field in `ml.fields.po`),
-    /// then the scaling, all without a host sync.
-    pub(super) fn scale_obj_probe(
+    /// photons: the calculated photons over the same unmasked pixels (stack by stack, by the
+    /// LLK kernel on the far field in `ml.fields.po`), then [`Bufs::scale_obj_probe`], all
+    /// without a host sync.
+    pub(super) fn scale_to_photons(
         &mut self,
         ctx: &ExecutionContext,
         ml: &mut MlBufs<'_>,
         total: f32,
     ) -> Result<(), GpuError> {
-        let [obj_norm, probe_norm] = &mut *ml.norms;
-        for (x, n, out) in [
-            (&*self.obj, self.obj_len, &mut *obj_norm),
-            (&*self.probe, self.probe_len, &mut *probe_norm),
-        ] {
-            ptyrs_gpu::zero(ctx, ml.parts)?;
-            self.grad.norm_parts(ctx, x, n, ml.parts)?;
-            self.grad.sum_parts(ctx, ml.parts, CG_BLOCKS, out)?;
-        }
         ptyrs_gpu::zero(ctx, ml.icalc)?;
         let dims = *self.views.dims();
         let psi = &mut ml.fields.po;
@@ -239,13 +231,7 @@ impl Bufs<'_> {
                 .llk(ctx, stack, self.counts, psi, self.llk_scratch, self.llk)?;
             self.grad.icalc_add(ctx, &dims, stack, self.llk, ml.icalc)?;
         }
-        self.grad.scale_obj_probe(
-            ctx,
-            self.obj,
-            self.probe,
-            [obj_norm, probe_norm],
-            ml.icalc,
-            total,
-        )
+        let icalc = &*ml.icalc;
+        self.scale_obj_probe(ctx, ObjProbeScale::Absolute { icalc, total })
     }
 }

@@ -1,0 +1,15 @@
+[package]
+name = "ptyrs-refgen"
+version.workspace = true
+edition.workspace = true
+description = "Simulated M3 reference datasets (position errors, intensity variation, background, fly scan, OPR) through the PyNX far-field model"
+
+[dependencies]
+ptyrs-core.workspace = true
+ptyrs-io = { path = "../ptyrs-io" }
+thiserror.workspace = true
+rustfft.workspace = true
+rand.workspace = true
+rand_chacha.workspace = true
+rand_distr.workspace = true
+serde_json = { version = "1", features = ["float_roundtrip"] }

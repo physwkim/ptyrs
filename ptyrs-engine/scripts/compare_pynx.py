@@ -93,17 +93,20 @@ def main():
         obj_r, probe_r = f["object"][()], f["probe"][()]
     args = load(d)
 
-    # (name, operator module, f64, lag). The CUDA DM computes the LLK inside the stack loop,
-    # before the cycle's object/probe update, so its record at cycle c + 1 is the CPU's at c.
-    # Its ScaleObjProbe(absolute=False) after each LLK only trades scale between object and
-    # probe, which DM is covariant under; the final arrays are compared up to a complex scale.
-    # AP records the LLK of the estimate before the update on both CPU and CUDA.
+    # (name, operator module, f64, lag). Rust and the CUDA DM record the LLK of the estimate
+    # the cycle starts from; the cpu_operator DM takes it after the cycle's object/probe
+    # update, so its record at cycle c is Rust's at c + 1. Rust and the CUDA DM run
+    # ScaleObjProbe(absolute=False) after each LLK and the cpu_operator DM does not; it only
+    # trades scale between object and probe, which DM is covariant under, so the final arrays
+    # are compared up to a complex scale. AP records the LLK of the estimate before the update
+    # on both CPU and CUDA.
     flags = sys.argv[3:]
-    runs = [] if "--no-cpu" in flags else [("f64", cpu_operator_f64(), True, 0),
-                                           ("f32", cpu32, False, 0)]
+    cpu_lag = 1 if algo == "dm" else 0
+    runs = [] if "--no-cpu" in flags else [("f64", cpu_operator_f64(), True, cpu_lag),
+                                           ("f32", cpu32, False, cpu_lag)]
     if "--cuda" in flags:
         import pynx.ptycho.cu_operator as cuop
-        runs.append(("cuda", cuop, False, 1 if algo == "dm" else 0))
+        runs.append(("cuda", cuop, False, 0))
 
     for name, op, f64, lag in runs:
         p = build(*args, f64=f64)
@@ -111,9 +114,9 @@ def main():
         h = history(p, ncycle)
         np.savetxt(f"{d}/llk_pynx_{algo}_{name}.txt",
                    np.column_stack([np.arange(ncycle), h]), fmt=["%d"] + ["%.17e"] * 4)
-        h, ref = h[lag:], rust[:ncycle - lag]
+        h, ref = h[:ncycle - lag], rust[lag:]
         r = np.abs(h - ref) / np.abs(ref)
-        print(f"--- {name}: max |rel diff| vs Rust over {len(h)} cycles (PyNX lag {lag})")
+        print(f"--- {name}: max |rel diff| vs Rust over {len(h)} cycles (Rust lead {lag})")
         for k, v in zip(KEYS, r.T):
             i = int(v.argmax())
             print(f"  {k:16s} {v.max():.3e} (cycle {i})")

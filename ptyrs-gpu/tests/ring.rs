@@ -2,9 +2,12 @@
 //! unmasked pixels of their frames, across wraps and copies that overlap later records; a
 //! record of the first frames reads only those; a record with a frame not written for it is
 //! a stamp error, as is one ended a number of times other than the host counts it, and one
-//! with a frame never counted is an uncounted error.
+//! with a frame never counted is an uncounted error. A poll returns the records whose copies
+//! have completed without waiting for the rest. Each detector pixel's frame count holds the
+//! counted frames unmasked there, each once, in any stack layout and order.
 
 use std::sync::Arc;
+use std::sync::mpsc::{self, Sender};
 
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
@@ -42,11 +45,42 @@ fn first(push: [bool; 3], nframe: u32) -> Record {
     }
 }
 
-/// 8x8 frames with a mask that differs from frame to frame.
+/// 8x8 frames with a mask that differs from frame to frame and from pixel to pixel.
 fn counts() -> Vec<u16> {
-    (0..NFRAME as usize * 64)
-        .map(|i| if (i + i / 64 * 3) % 5 == 0 { MASKED } else { 1 })
+    (0..NFRAME as u64 * 64)
+        .map(|i| {
+            if (i.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 61) % 3 == 0 {
+                MASKED
+            } else {
+                1
+            }
+        })
         .collect()
+}
+
+/// Each pixel's unmasked frames among `frames` of [`counts`].
+fn pixel_frames(frames: impl Iterator<Item = u32> + Clone) -> Vec<u32> {
+    let c = counts();
+    (0..64)
+        .map(|p| {
+            frames
+                .clone()
+                .filter(|&f| c[f as usize * 64 + p] != MASKED)
+                .count() as u32
+        })
+        .collect()
+}
+
+fn dims() -> ViewDims {
+    ViewDims {
+        nframe: NFRAME,
+        nmode: 1,
+        nprobe: 1,
+        nobj: 1,
+        frame: [8, 8],
+        obj: [8, 8],
+        quad_phase: 0.0,
+    }
 }
 
 /// The unmasked pixels of frames `0 .. n` of [`counts`].
@@ -89,7 +123,7 @@ struct Fixture {
     table: StackTable,
     ring: LlkRing<usize>,
     ended: Option<Ended>,
-    _counts: DeviceBuffer<u16>,
+    counts: DeviceBuffer<u16>,
 }
 
 fn fixture(nslot: u32) -> Fixture {
@@ -101,17 +135,9 @@ fn fixture_counting(nslot: u32, counted: [bool; 3]) -> Fixture {
     let cuda = CudaContext::new(0).expect("CUDA device 0");
     let kernels = Kernels::load(&cuda).expect("load ptyrs-gpu kernels");
     let stream = cuda.new_stream().unwrap();
-    let dims = ViewDims {
-        nframe: NFRAME,
-        nmode: 1,
-        nprobe: 1,
-        nobj: 1,
-        frame: [8, 8],
-        obj: [8, 8],
-        quad_phase: 0.0,
-    };
+    let dims = dims();
     let table = StackTable::new(&stream, &dims, &STACKS).unwrap();
-    let mut ring = LlkRing::new(&kernels, &stream, NFRAME, nslot).unwrap();
+    let mut ring = LlkRing::new(&kernels, &stream, &dims, nslot).unwrap();
     let ctx = ExecutionContext::new(stream.clone());
     let dev_counts = DeviceBuffer::from_host(&stream, &counts()).unwrap();
     for (s, _) in counted.iter().enumerate().filter(|(_, c)| **c) {
@@ -126,7 +152,7 @@ fn fixture_counting(nslot: u32, counted: [bool; 3]) -> Fixture {
         table,
         ring,
         ended: None,
-        _counts: dev_counts,
+        counts: dev_counts,
     }
 }
 
@@ -134,8 +160,15 @@ impl Fixture {
     /// Enqueues `records` as numbered from `r0`, with no host sync between them: each stack's
     /// partials from its own staging buffer (uploaded first), then the ends, then the count.
     fn enqueue(&mut self, r0: usize, records: &[Record]) {
+        let staged = self.stage(r0, records.len());
+        self.enqueue_staged(r0, records, &staged);
+    }
+
+    /// Each stack's partials of records `r0 .. r0 + n` in their own staging buffers, uploaded
+    /// with a host sync.
+    fn stage(&self, r0: usize, n: usize) -> Vec<Vec<DeviceBuffer<LlkPartial>>> {
         let nf_max = self.table.nf_max() as usize;
-        let staged: Vec<Vec<DeviceBuffer<LlkPartial>>> = (r0..r0 + records.len())
+        (r0..r0 + n)
             .map(|r| {
                 let p = partials(r);
                 STACKS
@@ -147,7 +180,16 @@ impl Fixture {
                     })
                     .collect()
             })
-            .collect();
+            .collect()
+    }
+
+    /// [`Self::enqueue`] from partials [`Self::stage`] uploaded.
+    fn enqueue_staged(
+        &mut self,
+        r0: usize,
+        records: &[Record],
+        staged: &[Vec<DeviceBuffer<LlkPartial>>],
+    ) {
         for (i, rec) in records.iter().enumerate() {
             let dev = self.ring.device();
             let mut writer = dev.record();
@@ -176,6 +218,46 @@ impl Fixture {
     fn flush(&mut self) -> Result<Vec<(usize, LlkTotals)>, RingError> {
         self.ring.flush(&self.ctx)
     }
+
+    fn poll(&mut self) -> Vec<(usize, LlkTotals)> {
+        self.ring.poll(&self.ctx).unwrap()
+    }
+
+    /// Counts stack `s` on the ring's device.
+    fn count(&mut self, s: usize) {
+        self.ring
+            .device()
+            .count(&self.ctx, &self.dims, self.table.at(s), &self.counts)
+            .unwrap();
+    }
+
+    fn pixel_frames(&mut self) -> Vec<u32> {
+        let dev = self.ring.device();
+        dev.pixel_frames().to_host_vec(&self.stream).unwrap()
+    }
+
+    /// Holds the stream at this point until the returned sender sends or drops.
+    fn hold(&self) -> Sender<()> {
+        let (release, held) = mpsc::channel();
+        self.stream
+            .launch_host_function(move || {
+                let _ = held.recv();
+            })
+            .unwrap();
+        release
+    }
+}
+
+fn check_whole(got: &[(usize, LlkTotals)], tags: std::ops::Range<usize>) {
+    assert_eq!(
+        got.iter().map(|(t, _)| *t).collect::<Vec<_>>(),
+        Vec::from_iter(tags)
+    );
+    for (r, t) in got {
+        let want = LlkSums::from_partials(&partials(*r));
+        assert_eq!(bits(&t.sums), bits(&want), "record {r}");
+        assert_eq!((t.nframe, t.nb_obs), (NFRAME, nb_obs(NFRAME)));
+    }
 }
 
 /// Flushes give each record once, in order, with the bits of `LlkSums::from_partials` of its
@@ -203,6 +285,25 @@ fn records_come_back_in_order_with_their_own_totals() {
             assert_eq!((t.nframe, t.nb_obs), (NFRAME, nb_obs(NFRAME)));
         }
     }
+}
+
+/// A poll never waits. With the stream held before every copy it returns nothing, and with
+/// record 4 counted onto record 0's unread slot it leaves record 4 uncopied. Released, it
+/// returns records 0 .. 4, whose copies completed, and enqueues record 4's, which the next
+/// poll returns; the flush after has nothing left.
+#[test]
+fn poll_returns_completed_copies_without_waiting() {
+    let mut f = fixture(4);
+    let staged = f.stage(0, 5);
+    let release = f.hold();
+    f.enqueue_staged(0, &[WHOLE, WHOLE, WHOLE, WHOLE, WHOLE], &staged);
+    assert!(f.poll().is_empty(), "every copy is held");
+    release.send(()).unwrap();
+    f.stream.synchronize().unwrap();
+    check_whole(&f.poll(), 0..4);
+    f.stream.synchronize().unwrap();
+    check_whole(&f.poll(), 4..5);
+    assert!(f.flush().unwrap().is_empty());
 }
 
 /// A record of frames `0 .. n` reads only those, whatever the later frames hold: at a stack's
@@ -311,4 +412,67 @@ fn ends_out_of_step_with_counts_are_a_stamp_error() {
     f.enqueue(0, &[WHOLE, none, WHOLE]);
     assert_eq!(stamp(f.flush().unwrap_err()), (2, 0, u64::MAX));
     assert!(f.flush().unwrap().is_empty());
+}
+
+/// Counting adds each frame to its unmasked pixels' frame counts once: the first two stacks'
+/// frames, then all of them with the first stack counted again, which leaves both its pixels'
+/// frame counts and its frames' unmasked pixels as they were. A count with a detector of
+/// other shape than the ring's is refused, though its counts fit.
+#[test]
+fn pixel_frames_count_each_frame_once() {
+    let mut f = fixture_counting(2, [true, true, false]);
+    let want = pixel_frames(0..8);
+    assert_ne!(want.iter().min(), want.iter().max(), "pixels differ");
+    assert_eq!(f.pixel_frames(), want);
+    f.count(0);
+    f.count(2);
+    assert_eq!(f.pixel_frames(), pixel_frames(0..NFRAME));
+    f.enqueue(0, &[WHOLE]);
+    check_whole(&f.flush().unwrap(), 0..1);
+
+    let half = ViewDims {
+        frame: [8, 4],
+        ..f.dims
+    };
+    let half_counts =
+        DeviceBuffer::from_host(&f.stream, &counts()[..NFRAME as usize * 32]).unwrap();
+    let table = StackTable::new(&f.stream, &half, &STACKS).unwrap();
+    let e = f
+        .ring
+        .device()
+        .count(&f.ctx, &half, table.at(0), &half_counts)
+        .unwrap_err();
+    assert!(matches!(e, Error::Shape(_)), "{e}");
+}
+
+/// The frame counts come out the same whatever stacks count the frames and in whatever
+/// order: three stacks forward and backward, one frame per stack backward, and one stack.
+#[test]
+fn pixel_frames_are_the_same_in_any_frame_order() {
+    let cuda = CudaContext::new(0).expect("CUDA device 0");
+    let kernels = Kernels::load(&cuda).expect("load ptyrs-gpu kernels");
+    let stream = cuda.new_stream().unwrap();
+    let ctx = ExecutionContext::new(stream.clone());
+    let dims = dims();
+    let dev_counts = DeviceBuffer::from_host(&stream, &counts()).unwrap();
+    let singles: Vec<_> = (0..NFRAME).map(|f| f..f + 1).collect();
+    let all = 0..NFRAME;
+    let layouts: [(&[std::ops::Range<u32>], Vec<usize>); 4] = [
+        (&STACKS, vec![0, 1, 2]),
+        (&STACKS, vec![2, 1, 0]),
+        (&singles, (0..NFRAME as usize).rev().collect()),
+        (std::slice::from_ref(&all), vec![0]),
+    ];
+    let want = pixel_frames(0..NFRAME);
+    for (stacks, order) in layouts {
+        let table = StackTable::new(&stream, &dims, stacks).unwrap();
+        let mut ring = LlkRing::<()>::new(&kernels, &stream, &dims, 1).unwrap();
+        for &s in &order {
+            ring.device()
+                .count(&ctx, &dims, table.at(s), &dev_counts)
+                .unwrap();
+        }
+        let got = ring.device().pixel_frames().to_host_vec(&stream).unwrap();
+        assert_eq!(got, want, "stacks {stacks:?} in order {order:?}");
+    }
 }

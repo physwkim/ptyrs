@@ -1,4 +1,4 @@
-//! The GPU backend (DESIGN §7 M1): [`GpuPtycho`] runs AP, DM, rPIE and ML in `f32` on one CUDA
+//! The GPU backend (DESIGN §7 M1): [`GpuPtycho`] runs AP, DM, rPIE, ML and BH in `f32` on one CUDA
 //! stream with the `ptyrs-gpu` pixel kernels and `ptyrs-fft` plans, in the call sequences the
 //! `ptyrs_gpu` ops and rPIE docs give, and is checked against [`crate::Ptycho`].
 //!
@@ -9,7 +9,7 @@
 //! gradient, and the LLK pass takes its partials, either by M2's fused passes over one
 //! scratch set or by the M1 launch sequence ([`GpuOptions::fused`]), whose one scratch stack
 //! serves all and whose stacks of one length share a cuFFT plan, which transforms only their
-//! frames; rPIE and ML's line search always run M1's launches. Each cycle enqueues through its own `ExecutionContext`, dropped when the cycle
+//! frames; rPIE, BH and ML's line search always run M1's launches. Each cycle enqueues through its own `ExecutionContext`, dropped when the cycle
 //! has been enqueued. Nothing in a cycle
 //! reads back to the host: an LLK record goes, stack by stack, into the device's
 //! [`ptyrs_gpu::LlkRing`], whose copies download while later cycles run, and the host reads
@@ -21,6 +21,7 @@
 //! the per-stack steps here.
 
 mod ap;
+mod bh;
 mod device;
 mod dm;
 mod ml;
@@ -35,13 +36,14 @@ use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 use ptyrs_core::{AddrTable, C64, Object, Probe, Scan, Stack};
 use ptyrs_fft::Plan2d;
 use ptyrs_gpu::{
-    C32, Ended, Error as GpuError, FusedInputs, RecordWriter, StackTable, ViewAddr, ViewDims,
+    C32, CG_BLOCKS, Ended, Error as GpuError, FusedInputs, ObjProbeScale, RecordWriter, StackTable,
+    ViewAddr, ViewDims,
 };
 
-use device::{Bufs, Device, M1Bufs, PassesMut};
+use device::{Bufs, Device, M1Bufs, NormBufs, PassesMut};
 
 use crate::ptycho::{Algorithm, LlkRecord, zero_phase_ramp};
-use crate::{ApParams, DmParams, EngineError, Fft2, Llk, MlParams, Observed, RpieParams};
+use crate::{ApParams, BhParams, DmParams, EngineError, Fft2, Llk, MlParams, Observed, RpieParams};
 
 /// How [`GpuPtycho`] batches its work.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -90,6 +92,8 @@ enum Epoch {
         first: bool,
         llk: bool,
     },
+    /// A BH epoch; with `cg` it continues the last epoch's direction.
+    Bh { params: BhParams, cg: bool },
 }
 
 impl Epoch {
@@ -99,6 +103,7 @@ impl Epoch {
             Self::Dm { .. } => Algorithm::Dm,
             Self::Rpie(_) => Algorithm::Rpie,
             Self::Ml { .. } => Algorithm::Ml,
+            Self::Bh { .. } => Algorithm::Bh,
         }
     }
 
@@ -116,6 +121,7 @@ impl Epoch {
                 first: false,
                 llk: false,
             },
+            Self::Bh { params, .. } => Self::Bh { params, cg: false },
         }
     }
 }
@@ -142,15 +148,53 @@ impl Frames {
     }
 }
 
+/// Stacks, the table of their entries and their distinct lengths, in the order
+/// [`Frames::plan`] indexes them.
+type Stacked = (Vec<Frames>, StackTable, Vec<u32>);
+
 /// `0 .. nframe` cut into consecutive ranges of `size` frames, the last one shorter when
-/// `size` does not divide `nframe`; the table of their entries and the distinct lengths, in
-/// the order [`Frames::plan`] indexes them.
-fn stacks(
+/// `size` does not divide `nframe`.
+fn stacks(stream: &Arc<CudaStream>, dims: &ViewDims, size: u32) -> Result<Stacked, EngineError> {
+    let (ranges, lens) = split(dims.nframe, size);
+    let (frames, table) = table_of(stream, dims, ranges)?;
+    Ok((frames, table, lens))
+}
+
+/// The epoch positions `0 .. nframe` in batches of `size`, each cut into stacks of
+/// `stack_size` (the last batch, and a batch's last stack, may be shorter), and each batch's
+/// range of stack indices.
+fn batch_stacks(
     stream: &Arc<CudaStream>,
     dims: &ViewDims,
     size: u32,
-) -> Result<(Vec<Frames>, StackTable, Vec<u32>), EngineError> {
-    let (ranges, lens) = split(dims.nframe, size);
+    stack_size: u32,
+) -> Result<(Stacked, Vec<Range<usize>>), EngineError> {
+    let (mut ranges, mut lens, mut batches) = (Vec::new(), Vec::<u32>::new(), Vec::new());
+    for (b, _) in split(dims.nframe, size).0 {
+        let first = ranges.len();
+        let (sub, sub_lens) = split(b.end - b.start, stack_size);
+        for (r, i) in sub {
+            let plan = match lens.iter().position(|&l| l == sub_lens[i]) {
+                Some(plan) => plan,
+                None => {
+                    lens.push(sub_lens[i]);
+                    lens.len() - 1
+                }
+            };
+            ranges.push((b.start + r.start..b.start + r.end, plan));
+        }
+        batches.push(first..ranges.len());
+    }
+    let (frames, table) = table_of(stream, dims, ranges)?;
+    Ok(((frames, table, lens), batches))
+}
+
+/// The table of `ranges` and their [`Frames`], each range with its plan index.
+fn table_of(
+    stream: &Arc<CudaStream>,
+    dims: &ViewDims,
+    ranges: Vec<(Range<u32>, usize)>,
+) -> Result<(Vec<Frames>, StackTable), EngineError> {
     let table = StackTable::new(
         stream,
         dims,
@@ -168,7 +212,7 @@ fn stacks(
             })
         })
         .collect::<Result<Vec<_>, EngineError>>()?;
-    Ok((frames, table, lens))
+    Ok((frames, table))
 }
 
 /// One cuFFT plan per stack length of [`stacks`].
@@ -549,5 +593,29 @@ impl Bufs<'_> {
             )?;
         }
         Ok(())
+    }
+
+    /// PyNX `ScaleObjProbe` by `scale`: the norms of the object and the probe, then the
+    /// scaling, without a host sync.
+    fn scale_obj_probe(
+        &mut self,
+        ctx: &ExecutionContext,
+        scale: ObjProbeScale<'_>,
+    ) -> Result<(), GpuError> {
+        let NormBufs {
+            parts,
+            pairs: [obj_norm, probe_norm],
+        } = &mut *self.norms;
+        for (x, n, out) in [
+            (&*self.obj, self.obj_len, &mut *obj_norm),
+            (&*self.probe, self.probe_len, &mut *probe_norm),
+        ] {
+            ptyrs_gpu::zero(ctx, parts)?;
+            self.grad.norm_parts(ctx, x, n, parts)?;
+            self.grad.sum_parts(ctx, parts, CG_BLOCKS, out)?;
+        }
+        let norms = [&*obj_norm, &*probe_norm];
+        self.grad
+            .scale_obj_probe(ctx, self.obj, self.probe, norms, scale)
     }
 }

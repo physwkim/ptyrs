@@ -1,7 +1,7 @@
 //! The GPU backend against the CPU oracle: per-record LLK and the final object and probe of AP,
-//! DM, rPIE and ML updating the object, the probe or both, from the same scaled start; AP and
-//! DM by M1's launches and by the fused passes; the ML gradients; and the LLK ring's record
-//! of a scan's first frames.
+//! DM, rPIE and ML updating the object, the probe or both, and of BH in one or more batches, from the
+//! same scaled start; AP and DM by M1's launches and by the fused passes; the ML gradients;
+//! and the LLK ring's record of a scan's first frames.
 
 use std::sync::Arc;
 
@@ -9,8 +9,8 @@ use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaContext, DeviceBuffer};
 use ptyrs_core::{C64, Counts, MASKED, Object, Probe, Scan, Stack};
 use ptyrs_engine::{
-    ApParams, Backend, DmParams, GpuOptions, GpuPtycho, Llk, LlkRecord, MlParams, Observed, Params,
-    Ptycho, RpieParams, Step, llk,
+    Algorithm, ApParams, Backend, Bh, BhParams, BhStep, DmParams, GpuOptions, GpuPtycho, Llk,
+    LlkRecord, MlParams, Observed, Params, Ptycho, RpieParams, Step, llk,
 };
 use ptyrs_gpu::{C32, FUSED_SIDES, Kernels, LlkPartial, LlkRing, LlkScratch, StackTable, ViewDims};
 
@@ -284,6 +284,120 @@ fn ml_matches_cpu() {
             setup.options.fused, errs[0], errs[1], errs[2]
         );
         check(errs, [1e-4, 1e-4, 1e-4]);
+    }
+}
+
+/// BH against the CPU's `f64` BH from the same start: the LLK after each of 20 epochs and the
+/// final arrays, by M1's launches and on the fused passes' frame side. One batch of every
+/// frame (CG after the first epoch); batches of 12, two stacks each in M1 but the last; and
+/// batches of 4, the last of 2.
+#[test]
+fn bh_matches_cpu() {
+    const NEPOCH: usize = 20;
+    for (setup, batch_size) in [M1, FUSED]
+        .into_iter()
+        .flat_map(|s| [NPOS, 12, 4].map(|b| (s, b)))
+    {
+        let params = BhParams {
+            batch_size,
+            probe_rho: 0.01,
+            seed: 7,
+        };
+        let (scan, object, probe) = start(setup.frame, 2, true);
+        let at = Ptycho::new(&scan, object.clone(), probe.clone()).unwrap();
+        let (mut o, mut p) = (object.clone(), probe.clone());
+        let mut bh = Bh::new(params);
+        let want: Vec<_> = (0..NEPOCH)
+            .map(|cycle| {
+                bh.epoch(at.addr(), at.observed(), at.quad(), &mut o, &mut p);
+                let llk = Ptycho::new(&scan, o.clone(), p.clone()).unwrap().llk();
+                LlkRecord {
+                    cycle,
+                    algorithm: Algorithm::Bh,
+                    llk,
+                }
+            })
+            .collect();
+        let mut gpu = GpuPtycho::new(&ctx(), &scan, object, probe, setup.options).unwrap();
+        gpu.bh(&params, NEPOCH, 1).unwrap();
+        let errs = [
+            llk_rel(gpu.history(), &want),
+            rel_l2(&gpu.object().unwrap(), &o),
+            rel_l2(&gpu.probe().unwrap(), &p),
+        ];
+        eprintln!(
+            "bh fused {} batch {batch_size}: llk {:.2e} object {:.2e} probe {:.2e}, llk {:.4e} -> {:.4e}",
+            setup.options.fused,
+            errs[0],
+            errs[1],
+            errs[2],
+            want[0].llk.poisson,
+            want[NEPOCH - 1].llk.poisson
+        );
+        check(errs, [1e-4, 1e-4, 1e-4]);
+    }
+}
+
+/// BH step by step against the CPU's `f64` BH, eagerly and from graphs: after a fresh GPU
+/// run of each of the first epochs, the last epoch's steps (frames, `β`, `α`, `top`,
+/// `bottom`) and the arrays. One batch of every frame (CG from the second epoch) and batches
+/// of 4, the last of 2.
+#[test]
+fn bh_steps_match_cpu() {
+    const NEPOCH: usize = 3;
+    let runs = [M1, FUSED]
+        .into_iter()
+        .flat_map(|s| [false, true].map(|graph| (s, graph)))
+        .flat_map(|(s, graph)| [NPOS, 4].map(|b| (s, graph, b)));
+    for (setup, graph, batch_size) in runs {
+        let options = GpuOptions {
+            graph,
+            ..setup.options
+        };
+        let params = BhParams {
+            batch_size,
+            probe_rho: 0.01,
+            seed: 7,
+        };
+        let (scan, object, probe) = start(setup.frame, 2, true);
+        let at = Ptycho::new(&scan, object.clone(), probe.clone()).unwrap();
+        let (mut o, mut p) = (object.clone(), probe.clone());
+        let mut bh = Bh::new(params);
+        let mut worst = [0.0f64; 3];
+        for nepoch in 1..=NEPOCH {
+            let want = bh.epoch(at.addr(), at.observed(), at.quad(), &mut o, &mut p);
+            let mut gpu =
+                GpuPtycho::new(&ctx(), &scan, object.clone(), probe.clone(), options).unwrap();
+            gpu.bh(&params, nepoch, 0).unwrap();
+            let got = gpu.bh_steps().unwrap();
+            let frames =
+                |s: &[BhStep]| -> Vec<Vec<usize>> { s.iter().map(|s| s.frames.clone()).collect() };
+            assert_eq!(frames(&got), frames(&want), "epoch {nepoch}");
+            for (g, w) in got.iter().zip(&want) {
+                for (a, b) in [
+                    (g.beta, w.beta),
+                    (g.alpha, w.alpha),
+                    (g.top, w.top),
+                    (g.bottom, w.bottom),
+                ] {
+                    // a CPU 0 (β in steepest descent) must be an exact GPU 0
+                    worst[0] = worst[0].max(if b == 0.0 {
+                        a.abs()
+                    } else {
+                        (a - b).abs() / b.abs()
+                    });
+                }
+            }
+            worst[1] = worst[1].max(rel_l2(&gpu.object().unwrap(), &o));
+            worst[2] = worst[2].max(rel_l2(&gpu.probe().unwrap(), &p));
+        }
+        eprintln!(
+            "bh steps fused {} graph {graph} batch {batch_size}: step {:.2e} object {:.2e} probe {:.2e}",
+            setup.options.fused, worst[0], worst[1], worst[2]
+        );
+        for (what, e) in ["step", "object", "probe"].into_iter().zip(worst) {
+            assert!(e < 1e-4, "{what}: {e:e}");
+        }
     }
 }
 
@@ -572,7 +686,7 @@ fn ring_record_of_the_first_frames_matches_the_cpu_llk() {
     let mut scratch = LlkScratch::new(&stream, &dims, table.nf_max()).unwrap();
     let mut partials =
         DeviceBuffer::<LlkPartial>::zeroed(&stream, table.nf_max() as usize).unwrap();
-    let mut ring = LlkRing::new(&kernels, &stream, nframe as u32, 2).unwrap();
+    let mut ring = LlkRing::new(&kernels, &stream, &dims, 2).unwrap();
 
     let ns = [10, nframe as u32];
     let mut counted = 0;

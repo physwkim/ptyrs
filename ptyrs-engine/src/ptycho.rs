@@ -18,6 +18,7 @@ pub enum Algorithm {
     Dm,
     Rpie,
     Ml,
+    Bh,
 }
 
 /// One LLK measurement (PyNX `history`): normalised LLK ([`Llk::normalised`]) taken at
@@ -337,7 +338,12 @@ impl Ptycho {
     /// `P *= sqrt(Σ|O| / Σ|P| · s)`, `O *= sqrt(Σ|P| / Σ|O| · s)`. Masked pixels are in
     /// neither sum, as in PyNX CUDA's `scale_intensity`.
     pub fn scale_obj_probe(&mut self) {
-        let s = (self.obs.total() / self.llk().nb_photons_calc).sqrt();
+        self.split_scale((self.obs.total() / self.llk().nb_photons_calc).sqrt());
+    }
+
+    /// Scales `O P` by `s` and balances `Σ|O|` and `Σ|P|`: `P *= sqrt(Σ|O| / Σ|P| · s)`,
+    /// `O *= sqrt(Σ|P| / Σ|O| · s)`. With `s = 1` it is PyNX `ScaleObjProbe(absolute=False)`.
+    fn split_scale(&mut self, s: f64) {
         let os: f64 = self.object.as_slice().iter().map(|c| c.norm()).sum();
         let ps: f64 = self.probe.as_slice().iter().map(|c| c.norm()).sum();
         let (fp, fo) = ((os / ps * s).sqrt(), (ps / os * s).sqrt());
@@ -396,13 +402,17 @@ impl Ptycho {
     /// `psi ← (2 − a)·PO − (1 − a)·psi`, then magnitude projection `Π_F`, then
     /// `psi ← Π_F(psi) + (1 − a)·(PO − refl)` with `refl` the reflected `psi`. Then
     /// `loop_obj_probe` times an object-only and a probe-only [`psi_to_obj_probe`] (the probe
-    /// update sees the new object). The recorded LLK is of the updated estimate.
+    /// update sees the new object). The recorded LLK is of the estimate the cycle starts from,
+    /// as PyNX's CUDA DM takes it; its `cpu_operator` DM takes the updated one. After the update
+    /// of each cycle that records one, PyNX's CUDA DM balances `Σ|O|` and `Σ|P|` with `O P`
+    /// unchanged (`ScaleObjProbe(absolute=False)`), and so does this.
     pub fn dm(&mut self, params: &DmParams, ncycle: usize) {
         let (nframe, nmode) = (self.addr.nframe(), self.addr.nmode());
         let a = params.alpha;
         let mut po = vec![C64::default(); self.psi.len()];
         let mut refl = vec![C64::default(); self.psi.len()];
         for ic in 0..ncycle {
+            let l = llk_due(params.calc_llk, ic, ncycle).then(|| self.llk());
             obj_probe_to_psi(
                 self.addr.views(),
                 &self.object,
@@ -441,9 +451,9 @@ impl Ptycho {
                     }
                 }
             }
-            if llk_due(params.calc_llk, ic, ncycle) {
-                let l = self.llk();
+            if let Some(l) = l {
                 self.record(Algorithm::Dm, l);
+                self.split_scale(1.0);
             }
             self.cycle += 1;
         }

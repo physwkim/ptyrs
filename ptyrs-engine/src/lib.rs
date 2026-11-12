@@ -18,19 +18,32 @@
 //! - Every object/probe sum runs over views in table order (frame-major, mode-minor), the
 //!   PyNX loop order.
 
+mod batch;
+mod bh;
+mod features;
 mod fft;
 mod gpu;
 mod linop;
+mod lsqml;
 mod obs;
+mod opr;
 mod ops;
 mod plan;
 mod ptycho;
 pub mod sim;
 
+pub use batch::random_batches;
+pub use bh::{Bh, BhBatch, BhParams, BhStep};
+pub use features::{
+    Cost, background_cost, background_grad, intensity_grad, obj_probe_shift_to_psi, position_grad,
+    scale_psi,
+};
 pub use fft::Fft2;
 pub use gpu::{GpuOptions, GpuPtycho};
 pub use linop::{DOT_TOL, FarField, LinearOp, ObjectToPsi, ProbeToPsi, Registered, register};
+pub use lsqml::{Lsqml, LsqmlBatch, LsqmlParams, LsqmlStep, illumination};
 pub use obs::{Observed, shift};
+pub use opr::{ProbeVariation, opr_weight_grad};
 pub use ops::{
     Llk, accumulate_obj, accumulate_probe, apply_amplitude, cg_poisson_gamma, llk,
     obj_probe_to_psi, poisson_grad, psi_to_obj_probe, quad_phase,
