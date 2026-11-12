@@ -207,15 +207,16 @@ impl Bufs<'_> {
     }
 
     /// [`crate::Ptycho::scale_obj_probe`] on the device, `total` being the unmasked observed
-    /// photons: the norms of the object, the probe and every view's exit wave (stack by
-    /// stack in `ml.fields.po`), then the scaling, all without a host sync.
+    /// photons: the norms of the object and the probe, the calculated photons over the same
+    /// unmasked pixels (stack by stack, by the LLK kernel on the far field in `ml.fields.po`),
+    /// then the scaling, all without a host sync.
     pub(super) fn scale_obj_probe(
         &mut self,
         ctx: &ExecutionContext,
         ml: &mut MlBufs<'_>,
         total: f32,
     ) -> Result<(), GpuError> {
-        let [obj_norm, probe_norm, psi_norm] = &mut *ml.norms;
+        let [obj_norm, probe_norm] = &mut *ml.norms;
         for (x, n, out) in [
             (&*self.obj, self.obj_len, &mut *obj_norm),
             (&*self.probe, self.probe_len, &mut *probe_norm),
@@ -224,23 +225,27 @@ impl Bufs<'_> {
             self.grad.norm_parts(ctx, x, n, ml.parts)?;
             self.grad.sum_parts(ctx, ml.parts, CG_BLOCKS, out)?;
         }
-        ptyrs_gpu::zero(ctx, ml.parts)?;
+        ptyrs_gpu::zero(ctx, ml.icalc)?;
+        let dims = *self.views.dims();
         let psi = &mut ml.fields.po;
         for s in 0..self.stacks.len() {
-            self.kernels.obj_probe_to_psi(
-                ctx,
-                self.views,
-                self.table.at(s),
-                self.obj,
-                self.probe,
-                psi,
-            )?;
-            let n = self.stacks.get(s).frames.len;
-            self.grad.norm_parts(ctx, psi, n, ml.parts)?;
+            let stack = self.table.at(s);
+            self.kernels
+                .obj_probe_to_psi(ctx, self.views, stack, self.obj, self.probe, psi)?;
+            ml.plans
+                .get(self.stacks.get(s).frames.plan)
+                .forward_inplace(ctx, psi)?;
+            self.kernels
+                .llk(ctx, stack, self.counts, psi, self.llk_scratch, self.llk)?;
+            self.grad.icalc_add(ctx, &dims, stack, self.llk, ml.icalc)?;
         }
-        self.grad.sum_parts(ctx, ml.parts, CG_BLOCKS, psi_norm)?;
-        let norms = [&*obj_norm, &*probe_norm, &*psi_norm];
-        self.grad
-            .scale_obj_probe(ctx, self.obj, self.probe, norms, total)
+        self.grad.scale_obj_probe(
+            ctx,
+            self.obj,
+            self.probe,
+            [obj_norm, probe_norm],
+            ml.icalc,
+            total,
+        )
     }
 }

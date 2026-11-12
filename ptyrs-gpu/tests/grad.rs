@@ -6,8 +6,8 @@ use std::sync::Arc;
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, DeviceCopy};
 use ptyrs_gpu::{
-    C32, CG_BLOCKS, GammaStacks, GradKernels, Kernels, MASKED, StackTable, UpdateSums, ViewAddr,
-    ViewDims, Views,
+    C32, CG_BLOCKS, GammaStacks, GradKernels, Kernels, LlkPartial, MASKED, StackTable, UpdateSums,
+    ViewAddr, ViewDims, Views,
 };
 
 /// A stream, an eager execution context on it, the M1 kernels and the CG kernels.
@@ -421,18 +421,39 @@ fn norm_parts_add_up_both_arrays() {
     }
 }
 
-/// The object and probe scale factors of `ScaleObjProbe` from given norm pairs, with the
-/// object longer than the probe and the other way round.
+/// The stacks' frame partials add up into one total, each stack's `icalc` over its own `nf`
+/// records only (stack `3..5` leaves its third record out).
+#[test]
+fn icalc_add_sums_each_stacks_frames() {
+    let (stream, ctx, _, k) = setup();
+    let (views, table) = scan(&stream);
+    let rec = |icalc| LlkPartial {
+        poisson: 100.0,
+        gaussian: 200.0,
+        euclidean: 300.0,
+        icalc,
+    };
+    let mut out = up(&stream, &[0.0f32]);
+    for (s, icalc) in [[1.0, 2.0, 4.0], [8.0, 16.0, 1000.0]]
+        .into_iter()
+        .enumerate()
+    {
+        let partials = up(&stream, &icalc.map(rec));
+        k.icalc_add(&ctx, views.dims(), table.at(s), &partials, &mut out)
+            .unwrap();
+    }
+    assert_eq!(out.to_host_vec(&stream).unwrap(), [31.0]);
+}
+
+/// The object and probe scale factors of `ScaleObjProbe` from given norm pairs and
+/// calculated photons, with the object longer than the probe and the other way round.
 #[test]
 fn scale_obj_probe_matches_f64() {
     let (stream, ctx, _, k) = setup();
-    let (os, ps, psi2, total) = (300.0f32, 40.0f32, 5.0e4f32, 2.0e6f32);
-    let norms = [
-        up(&stream, &[os, 0.0]),
-        up(&stream, &[ps, 0.0]),
-        up(&stream, &[0.0, psi2]),
-    ];
-    let s = (total as f64 / psi2 as f64).sqrt();
+    let (os, ps, icalc, total) = (300.0f32, 40.0f32, 5.0e4f32, 2.0e6f32);
+    let norms = [up(&stream, &[os, 0.0]), up(&stream, &[ps, 0.0])];
+    let icalc_buf = up(&stream, &[icalc]);
+    let s = (total as f64 / icalc as f64).sqrt();
     let fo = (ps as f64 / os as f64 * s).sqrt();
     let fp = (os as f64 / ps as f64 * s).sqrt();
     for (nobj, nprobe) in [(2000usize, 300usize), (100, 700)] {
@@ -442,7 +463,8 @@ fn scale_obj_probe_matches_f64() {
             &ctx,
             &mut obj,
             &mut probe,
-            [&norms[0], &norms[1], &norms[2]],
+            [&norms[0], &norms[1]],
+            &icalc_buf,
             total,
         )
         .unwrap();

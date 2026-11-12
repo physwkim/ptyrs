@@ -331,13 +331,13 @@ impl Ptycho {
         });
     }
 
-    /// PyNX `ScaleObjProbe(absolute=True)`: scale so `Σ|P·O·q|²` over all views equals the
-    /// total unmasked observed intensity, then balance `Σ|O|` and `Σ|P|`:
-    /// `s = sqrt(Σ iobs / Σ|psi|²)`, `P *= sqrt(Σ|O| / Σ|P| · s)`, `O *= sqrt(Σ|P| / Σ|O| · s)`.
-    /// PyNX sums `iobs` including its negative masked values; here masked pixels are left out.
+    /// PyNX `ScaleObjProbe(absolute=True)`: scale so the calculated intensity over the
+    /// unmasked pixels of every frame ([`Llk::nb_photons_calc`]) equals the observed one
+    /// there, then balance `Σ|O|` and `Σ|P|`: `s = sqrt(Σ iobs / Σ icalc)`,
+    /// `P *= sqrt(Σ|O| / Σ|P| · s)`, `O *= sqrt(Σ|P| / Σ|O| · s)`. Masked pixels are in
+    /// neither sum, as in PyNX CUDA's `scale_intensity`.
     pub fn scale_obj_probe(&mut self) {
-        let calc: f64 = self.calc_psi().iter().map(|c| c.norm_sqr()).sum();
-        let s = (self.obs.total() / calc).sqrt();
+        let s = (self.obs.total() / self.llk().nb_photons_calc).sqrt();
         let os: f64 = self.object.as_slice().iter().map(|c| c.norm()).sum();
         let ps: f64 = self.probe.as_slice().iter().map(|c| c.norm()).sum();
         let (fp, fo) = ((os / ps * s).sqrt(), (ps / os * s).sqrt());

@@ -56,23 +56,33 @@ fn start(frame: usize, nprobe: usize, masked: bool) -> (Scan, Object, Probe) {
     let (mut scan, object, probe) =
         common::dm_scenario(frame, NPOS, nprobe, 2e5, frame as f64 / 8.0);
     if masked {
-        let dims = scan.counts.dims();
-        let data = scan
-            .counts
-            .as_slice()
-            .iter()
-            .enumerate()
-            .map(|(i, &c)| {
-                let (y, x) = ((i / frame) % frame, i % frame);
-                if y == 3 || x == 20 { MASKED } else { c }
-            })
-            .collect();
-        scan.counts = Counts::from_raw(dims, data).unwrap();
+        scan = mask(scan, |y, x| y == 3 || x == 20);
     }
     let mut p = Ptycho::new(&scan, object, probe).unwrap();
     p.scale_obj_probe();
     let (object, probe) = p.into_modes();
     (scan, object, probe)
+}
+
+/// `scan` with pixel `(y, x)` of every frame masked where `masked(y, x)`.
+fn mask(mut scan: Scan, masked: impl Fn(usize, usize) -> bool) -> Scan {
+    let dims = scan.counts.dims();
+    let [_, ny, nx] = dims;
+    let data = scan
+        .counts
+        .as_slice()
+        .iter()
+        .enumerate()
+        .map(|(i, &c)| {
+            if masked((i / nx) % ny, i % nx) {
+                MASKED
+            } else {
+                c
+            }
+        })
+        .collect();
+    scan.counts = Counts::from_raw(dims, data).unwrap();
+    scan
 }
 
 /// `|a - b| / |b|` over the whole array.
@@ -216,6 +226,29 @@ fn ml_grads_match_cpu() {
         let [go2, gp2] = gpu.ml_grads().unwrap();
         assert_eq!((go2, gp2), (go, gp));
     }
+}
+
+/// ML's starting scale counts the calculated photons over the unmasked pixels only, as the
+/// observed total does: with the bright centre of every frame masked, holding over a tenth of
+/// the calculated photons, the first LLK record's photon count is the observed total.
+#[test]
+fn ml_scale_leaves_masked_pixels_out() {
+    let (frame, c) = (M1.frame, M1.frame / 2);
+    let (scan, object, probe) = common::dm_scenario(frame, NPOS, 2, 2e5, frame as f64 / 8.0);
+    let open = Ptycho::new(&scan, object.clone(), probe.clone()).unwrap();
+    let scan = mask(scan, |y, x| y.abs_diff(c) < 3 && x.abs_diff(c) < 3);
+    let cpu = Ptycho::new(&scan, object.clone(), probe.clone()).unwrap();
+    let share = 1.0 - cpu.llk().nb_photons_calc / open.llk().nb_photons_calc;
+    assert!(share > 0.1, "masked share {share}");
+    let total = cpu.observed().total();
+    let mut gpu = GpuPtycho::new(&ctx(), &scan, object, probe, M1.options).unwrap();
+    let params = MlParams {
+        calc_llk: 1,
+        ..MlParams::default()
+    };
+    gpu.ml(&params, 1).unwrap();
+    let got = gpu.history()[0].llk.nb_photons_calc;
+    assert!((got - total).abs() < 1e-5 * total, "{got} vs {total}");
 }
 
 /// ML's direction (β from the last gradient across both arrays) and Poisson quadratic step

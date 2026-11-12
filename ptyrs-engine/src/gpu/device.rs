@@ -139,8 +139,10 @@ struct MlState {
     /// The line-search pair of every frame.
     frame_pairs: DeviceBuffer<f32>,
     gamma: DeviceBuffer<f32>,
-    /// `(sum |x|, sum |x|^2)` of the object, the probe and every view's exit wave.
-    norms: [DeviceBuffer<f32>; 3],
+    /// `(sum |x|, sum |x|^2)` of the object and the probe.
+    norms: [DeviceBuffer<f32>; 2],
+    /// The calculated photons over the unmasked pixels of every frame.
+    icalc: DeviceBuffer<f32>,
     fields: GammaStacks,
 }
 
@@ -153,7 +155,8 @@ pub(super) struct MlBufs<'a> {
     pub beta: &'a mut DeviceBuffer<f32>,
     pub frame_pairs: &'a mut DeviceBuffer<f32>,
     pub gamma: &'a mut DeviceBuffer<f32>,
-    pub norms: &'a mut [DeviceBuffer<f32>; 3],
+    pub norms: &'a mut [DeviceBuffer<f32>; 2],
+    pub icalc: &'a mut DeviceBuffer<f32>,
     pub fields: &'a mut GammaStacks,
 }
 
@@ -178,7 +181,8 @@ impl MlState {
             beta: pair()?,
             frame_pairs: DeviceBuffer::zeroed(stream, 2 * dims.nframe as usize)?,
             gamma: pair()?,
-            norms: [pair()?, pair()?, pair()?],
+            norms: [pair()?, pair()?],
+            icalc: DeviceBuffer::zeroed(stream, 1)?,
             fields: GammaStacks::zeroed(stream, stack_len)?,
         })
     }
@@ -193,6 +197,7 @@ impl MlState {
             frame_pairs: &mut self.frame_pairs,
             gamma: &mut self.gamma,
             norms: &mut self.norms,
+            icalc: &mut self.icalc,
             fields: &mut self.fields,
         }
     }

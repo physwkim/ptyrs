@@ -30,13 +30,14 @@ pub struct ObjProbePtrs {
     pub probe: *const f32,
 }
 
-/// The `(sum |x|, sum |x|^2)` pairs of the object, the probe and every view's exit wave.
+/// The `(sum |x|, sum |x|^2)` pairs of the object and the probe, and the calculated photons
+/// over the unmasked pixels of every frame (one float).
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct NormPtrs {
     pub obj: *const f32,
     pub probe: *const f32,
-    pub psi: *const f32,
+    pub icalc: *const f32,
 }
 
 #[cuda_module]
@@ -125,14 +126,48 @@ pub mod grad_kernels {
         }
     }
 
-    /// PyNX `ScaleObjProbe(absolute=True)` from the pairs `(sum |x|, sum |x|^2)` of the
-    /// object, the probe and the exit waves of every view: with `s = sqrt(total / psi[1])`,
-    /// `obj *= sqrt(probe[0] / obj[0] * s)` and `probe *= sqrt(obj[0] / probe[0] * s)`.
+    /// Adds the calculated photons of the stack's frames, `sum_fl partials[fl].icalc` over
+    /// `fl < nf` in a fixed order, to `out[0]`.
     ///
     /// # Safety
     ///
-    /// `obj` holds `nobj` complex values, `probe` `nprobe`, each of `norms` two floats; one
-    /// thread per element of the longer array.
+    /// `partials` holds `nf_max` records, `out` and `ctl` one entry each; grid `(1, 1, 1)`,
+    /// block `(PIXEL_THREADS, 1, 1)`.
+    #[kernel]
+    pub unsafe fn cg_icalc_add(
+        partials: *const LlkPartial,
+        ctl: *const StackCtl,
+        g: StackGeom,
+        out: *mut f32,
+    ) {
+        static mut RED: SharedArray<f32, 256> = SharedArray::UNINIT;
+        let (_, nf) = unsafe { stack_frames(ctl, g) };
+        let t = thread::threadIdx_x() as usize;
+        let mut acc = 0.0f32;
+        let mut fl = t;
+        while fl < nf as usize {
+            acc += unsafe { (*partials.add(fl)).icalc };
+            fl += PIXEL_THREADS as usize;
+        }
+        let s = (&raw mut RED).cast::<f32>();
+        unsafe {
+            *s.add(t) = acc;
+            crate::block_sum::<1>(s);
+            if t == 0 {
+                *out += *s;
+            }
+        }
+    }
+
+    /// PyNX `ScaleObjProbe(absolute=True)` from the pairs `(sum |x|, sum |x|^2)` of the
+    /// object and the probe and the unmasked calculated photons `icalc`: with
+    /// `s = sqrt(total / icalc)`, `obj *= sqrt(probe[0] / obj[0] * s)` and
+    /// `probe *= sqrt(obj[0] / probe[0] * s)`.
+    ///
+    /// # Safety
+    ///
+    /// `obj` holds `nobj` complex values, `probe` `nprobe`, `norms.obj` and `norms.probe` two
+    /// floats each and `norms.icalc` one; one thread per element of the longer array.
     #[kernel]
     pub unsafe fn cg_scale_obj_probe(
         obj: *mut f32,
@@ -145,7 +180,7 @@ pub mod grad_kernels {
         let i = global_index();
         unsafe {
             let (os, ps) = (*norms.obj, *norms.probe);
-            let s = (total / *norms.psi.add(1)).sqrt();
+            let s = (total / *norms.icalc).sqrt();
             for (x, len, f) in [
                 (obj, nobj, (ps / os * s).sqrt()),
                 (probe, nprobe, (os / ps * s).sqrt()),

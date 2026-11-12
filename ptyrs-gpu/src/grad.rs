@@ -22,7 +22,8 @@ use ptyrs_kernels::pixel::{PIXEL_THREADS, SumPtrs};
 
 use crate::ops::grid_1d;
 use crate::{
-    C32, Error, Kernels, StackCtl, StackRef, UpdateSums, ViewDims, Views, check_len, dptr,
+    C32, Error, Kernels, LlkPartial, StackCtl, StackRef, UpdateSums, ViewDims, Views, check_len,
+    dptr,
 };
 
 /// The line-search exit-wave stacks of [`GradKernels::gamma_fields`], each of `nf_max *
@@ -158,37 +159,76 @@ impl GradKernels {
             })
     }
 
+    /// Adds the calculated photons of the stack's frames, the `icalc` of the `partials`
+    /// [`Kernels::llk`] wrote for it, to `out[0]`; zero `out` to start a scan, then add its
+    /// stacks in order. Masked pixels are left out, as in the LLK.
+    pub fn icalc_add(
+        &self,
+        ctx: &ExecutionContext,
+        dims: &ViewDims,
+        stack: StackRef<'_>,
+        partials: &DeviceBuffer<LlkPartial>,
+        out: &mut DeviceBuffer<f32>,
+    ) -> Result<(), Error> {
+        let g = dims.geom(stack)?;
+        check_len("partials", partials, g.nf_max as usize)?;
+        check_len("out", out, 1)?;
+        let config = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (PIXEL_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let reads = [partials.storage(), stack.storage()];
+        self.base.launch(ctx, &reads, &[out.storage()], |stream| {
+            // SAFETY: lengths checked above; one PIXEL_THREADS block.
+            unsafe {
+                self.module.cg_icalc_add(
+                    stream,
+                    config,
+                    dptr(partials),
+                    stack.ctl() as *const StackCtl,
+                    g,
+                    dptr(out),
+                )
+            }
+        })
+    }
+
     /// PyNX `ScaleObjProbe(absolute=True)` of `obj` and `probe` from the [`Self::sum_parts`]
-    /// totals of [`Self::norm_parts`] `norms = [object, probe, exit waves of every view]`
-    /// and the unmasked observed photons `total`: with `s = sqrt(total / sum |psi|^2)`,
-    /// `obj *= sqrt(sum |P| / sum |O| * s)` and `probe *= sqrt(sum |O| / sum |P| * s)`.
+    /// totals of [`Self::norm_parts`] `norms = [object, probe]`, the unmasked calculated
+    /// photons `icalc` of [`Self::icalc_add`] and the unmasked observed photons `total`: with
+    /// `s = sqrt(total / icalc)`, `obj *= sqrt(sum |P| / sum |O| * s)` and
+    /// `probe *= sqrt(sum |O| / sum |P| * s)`.
     pub fn scale_obj_probe(
         &self,
         ctx: &ExecutionContext,
         obj: &mut DeviceBuffer<C32>,
         probe: &mut DeviceBuffer<C32>,
-        norms: [&DeviceBuffer<f32>; 3],
+        norms: [&DeviceBuffer<f32>; 2],
+        icalc: &DeviceBuffer<f32>,
         total: f32,
     ) -> Result<(), Error> {
-        for (what, pair) in ["obj", "probe", "psi"].into_iter().zip(norms) {
+        for (what, pair) in ["obj", "probe"].into_iter().zip(norms) {
             check_len(what, pair, 2)?;
         }
+        check_len("icalc", icalc, 1)?;
         let len = |what: &str, b: &DeviceBuffer<C32>| {
             u32::try_from(b.len())
                 .map_err(|_| Error::Shape(format!("{what} holds {} values, over u32", b.len())))
         };
         let (nobj, nprobe) = (len("obj", obj)?, len("probe", probe)?);
         let config = grid_1d(nobj.max(nprobe) as usize)?;
-        let reads = norms.map(|b| b.storage());
+        let reads = [norms[0].storage(), norms[1].storage(), icalc.storage()];
         let writes = [obj.storage(), probe.storage()];
         self.base.launch(ctx, &reads, &writes, |stream| {
-            let [o, p, psi] = norms.map(dptr::<f32, f32>);
+            let [o, p] = norms.map(dptr::<f32, f32>);
             let norms = NormPtrs {
                 obj: o,
                 probe: p,
-                psi,
+                icalc: dptr(icalc),
             };
-            // SAFETY: each pair holds two floats; one thread per element of the longer array.
+            // SAFETY: each pair holds two floats and `icalc` one; one thread per element of
+            // the longer array.
             unsafe {
                 self.module.cg_scale_obj_probe(
                     stream,
