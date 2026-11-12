@@ -32,17 +32,19 @@ use ptyrs_fft::FftError;
 use ptyrs_kernels::kernels::LoadedModule;
 
 mod fused;
+mod grad;
 mod ops;
 mod ring;
 mod rpie;
 
 pub use fused::{Exit, FUSED_SIDES, FusedBufs, FusedInputs, FusedSums};
+pub use grad::{CG_BLOCKS, GammaStacks, GradKernels};
 pub use ops::{
     LLK_TREE_LEAVES, LlkPartial, LlkScratch, LlkSums, MASKED, OBJ_TILE, StackCtl, StackGeom,
     StackRef, StackTable, UpdateSums, ViewAddr, ViewDims, Views, view_tiles,
 };
 pub use ptyrs_fft::C32;
-pub use ring::{LlkRing, RingDevice, RingError};
+pub use ring::{Ended, LlkRing, LlkTotals, RecordWriter, RingDevice, RingError};
 pub use rpie::{RpieKernels, Weight};
 
 /// The linked device code: every `ptyrs-kernels` kernel plus the cuFFT functions they call.

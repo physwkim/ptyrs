@@ -14,6 +14,7 @@ use cuda_device::{device, kernel, launch_bounds, shared::DynamicSharedArray, thr
 use cuda_host::cuda_module;
 
 pub mod fused;
+pub mod grad;
 pub mod pixel;
 pub mod ring;
 pub mod rpie;
