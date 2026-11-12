@@ -764,9 +764,20 @@ impl State {
         }
         gpu.fence()?;
 
-        // B: the probe pair tree above the subtree roots on the side stream, under the object
-        // update; then the probe update.
+        // B: the object update, with the probe pair tree above the subtree roots on the side
+        // stream under it; then the probe update.
+        let obj_update = obj_sums.as_mut().zip(plan.obj_inertia);
+        if obj_update.is_some() {
+            // SAFETY: each pull reads a region's `max_bits` word, written before the fence and
+            // rewritten only after the next; every source of the max is then local.
+            unsafe {
+                exchange::pull(&stream, &links.max)?;
+                ex.max_u32(&stream, gmax.cu_deviceptr(), &links.max_srcs)?;
+            }
+        }
         if let Some(t) = tree.as_ref() {
+            // Forked after the max words: copies share the copy engines in order, and the
+            // tree's 1.5 MB pulls ahead of them would hold back the object update.
             // SAFETY: each pull reads an owner's subtree root, added before the fence and
             // rewritten only after the next; the pulled copies and the upper nodes are local,
             // last read by the previous cycle's adds on this same stream.
@@ -775,13 +786,7 @@ impl State {
                 t.upper.iter().try_for_each(|a| a.run(ex, s, np))
             })?;
         }
-        if let (Some(sums), Some(inertia)) = (obj_sums.as_mut(), plan.obj_inertia) {
-            // SAFETY: each pull reads a region's `max_bits` word, written before the fence and
-            // rewritten only after the next; every source of the max is then local.
-            unsafe {
-                exchange::pull(&stream, &links.max)?;
-                ex.max_u32(&stream, gmax.cu_deviceptr(), &links.max_srcs)?;
-            }
+        if let Some((sums, inertia)) = obj_update {
             k.normalize_obj(&ctx, views, obj, sums, gmax, inertia)?;
             // SAFETY: the runs address this region's object and send buffer, which its peers
             // last pulled on their side streams, joined before the fence.
