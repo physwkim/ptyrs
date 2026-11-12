@@ -429,6 +429,69 @@ fn update_sums_match_f64_and_ignore_stack_split() {
     check_sums("probe", &stream, &whole, &parts, (&num, &den));
 }
 
+/// A tile's owner block looks for an earlier frame of the stack covering it with a block's
+/// worth of threads at a time: frames `256..NF` share a tile no frame before 256 touches,
+/// so only the second stride finds their earlier frames. More blocks would wrongly own that
+/// tile than the GPU holds at once, so late ones would add to sums already written.
+#[test]
+fn psi_to_obj_owns_each_tile_once_past_a_block_of_frames() {
+    const NF: u32 = 2000;
+    let (stream, ex, k) = setup();
+    let d = ViewDims {
+        nframe: NF,
+        nmode: 1,
+        nprobe: 1,
+        nobj: 1,
+        frame: [2, 2],
+        obj: [64, 64],
+        quad_phase: 0.003,
+    };
+    let offsets: Vec<_> = (0..NF)
+        .map(|f| {
+            let at = if f < 256 { 0 } else { 32 };
+            (at + f % 7, at + f / 7 % 7, 0.0, 0.0)
+        })
+        .collect();
+    let s = Scan::new(d, &offsets, 1.0);
+    let views = Views::new(&stream, s.d, &s.views).unwrap();
+    let probe = up(&stream, &s.probe);
+    let psi_host = noise(s.nk(&(0..NF)) * s.n(), 3, 1.0);
+    let st = (
+        noise(s.obj.len(), 10, 1.0),
+        noise(s.obj.len(), 11, 1.0)
+            .iter()
+            .map(|c| c.re.abs())
+            .collect::<Vec<_>>(),
+    );
+    let (mut whole, mut parts) = (sums(&stream, &st), sums(&stream, &st));
+    k.psi_to_obj(
+        &ex,
+        &views,
+        one_stack(&stream, &s.d, 0..NF).at(0),
+        &up(&stream, &psi_host),
+        &probe,
+        &mut whole,
+    )
+    .unwrap();
+    let split = StackTable::new(&stream, &s.d, &[0..NF / 2, NF / 2..NF]).unwrap();
+    let half = s.nk(&(0..NF / 2)) * s.n();
+    for (i, part) in psi_host.chunks_exact(half).enumerate() {
+        k.psi_to_obj(
+            &ex,
+            &views,
+            split.at(i),
+            &up(&stream, part),
+            &probe,
+            &mut parts,
+        )
+        .unwrap();
+    }
+    let mut num: Vec<Z> = st.0.iter().map(|&c| z(c)).collect();
+    let mut den: Vec<f64> = st.1.iter().map(|&v| v as f64).collect();
+    s.obj_sums(0..NF, &psi_host, &mut num, &mut den);
+    check_sums("object", &stream, &whole, &parts, (&num, &den));
+}
+
 #[test]
 fn psi_to_obj_is_the_adjoint_of_obj_probe_to_psi() {
     let (stream, ex, k) = setup();
