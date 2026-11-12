@@ -1,14 +1,14 @@
 //! The GPU backend against the CPU oracle: per-record LLK and the final object and probe of AP,
-//! DM and rPIE updating the object, the probe or both, from the same scaled start; AP and DM
-//! by M1's launches and by the fused passes.
+//! DM, rPIE and ML updating the object, the probe or both, from the same scaled start; AP and
+//! DM by M1's launches and by the fused passes; and the ML gradients.
 
 use std::sync::Arc;
 
 use cuda_core::CudaContext;
 use ptyrs_core::{C64, Counts, MASKED, Object, Probe, Scan, Stack};
 use ptyrs_engine::{
-    ApParams, Backend, DmParams, GpuOptions, GpuPtycho, Llk, LlkRecord, Params, Ptycho, RpieParams,
-    Step,
+    ApParams, Backend, DmParams, GpuOptions, GpuPtycho, Llk, LlkRecord, MlParams, Params, Ptycho,
+    RpieParams, Step,
 };
 
 mod common;
@@ -195,6 +195,57 @@ fn rpie_matches_cpu() {
     }
 }
 
+/// ML's gradients of the same estimate, in `f32` against `f64`, on M1's and the fused passes'
+/// setups (ML itself always runs M1's launches).
+#[test]
+fn ml_grads_match_cpu() {
+    for setup in [M1, FUSED] {
+        let (scan, object, probe) = start(setup.frame, 2, true);
+        let cpu = Ptycho::new(&scan, object.clone(), probe.clone()).unwrap();
+        let mut gpu = GpuPtycho::new(&ctx(), &scan, object, probe, setup.options).unwrap();
+        let [go, gp] = gpu.ml_grads().unwrap();
+        let errs = [rel_l2(&go, &cpu.obj_grad()), rel_l2(&gp, &cpu.probe_grad())];
+        eprintln!(
+            "ml grads {setup:?}: object {:.2e} probe {:.2e}",
+            errs[0], errs[1]
+        );
+        assert!(errs[0] < 1e-5 && errs[1] < 1e-5, "{errs:?}");
+        // the sums are consumed: a second call gives the same gradients
+        let [go2, gp2] = gpu.ml_grads().unwrap();
+        assert_eq!((go2, gp2), (go, gp));
+    }
+}
+
+/// ML's direction (β from the last gradient across both arrays) and Poisson quadratic step
+/// against the CPU, for each pair of updated arrays.
+#[test]
+fn ml_matches_cpu() {
+    for (o, p) in UPDATES {
+        let params = MlParams {
+            update_object: o.is_some(),
+            update_probe: p.is_some(),
+            calc_llk: 1,
+            zero_phase_ramp: true,
+        };
+        let (scan, object, probe) = start(M1.frame, 2, true);
+        let mut cpu = Ptycho::new(&scan, object.clone(), probe.clone()).unwrap();
+        let mut gpu = GpuPtycho::new(&ctx(), &scan, object, probe, M1.options).unwrap();
+        cpu.ml(&params, 10);
+        gpu.ml(&params, 10).unwrap();
+        assert_eq!(gpu.cycle(), cpu.cycle());
+        let errs = [
+            llk_rel(gpu.history(), cpu.history()),
+            rel_l2(&gpu.object().unwrap(), cpu.object()),
+            rel_l2(&gpu.probe().unwrap(), cpu.probe()),
+        ];
+        eprintln!(
+            "ml {params:?}: llk {:.2e} object {:.2e} probe {:.2e}",
+            errs[0], errs[1], errs[2]
+        );
+        check(errs, [1e-4, 1e-4, 1e-4]);
+    }
+}
+
 /// Every update consumes its sums, so each algorithm starts from zero sums whatever ran
 /// before: rPIE's steps, then AP's and DM's updates, against the CPU. The last rPIE batch
 /// size differs, so its epochs get their own batches and graph.
@@ -235,6 +286,28 @@ fn switches_match_cpu(setup: Setup) {
         cpu.run(&step).unwrap();
         gpu.run(&step).unwrap();
     }
+    // ML's state outlives the AP between two ML calls, the second of which starts its
+    // direction afresh with the probe no longer updated
+    let ml = MlParams {
+        update_object: true,
+        update_probe: true,
+        calc_llk: 1,
+        zero_phase_ramp: false,
+    };
+    let only_obj = MlParams {
+        update_probe: false,
+        ..ml
+    };
+    cpu.ml(&ml, 3);
+    gpu.ml(&ml, 3).unwrap();
+    let step = Step {
+        params: steps[1],
+        count: 3,
+    };
+    cpu.run(&step).unwrap();
+    gpu.run(&step).unwrap();
+    cpu.ml(&only_obj, 3);
+    gpu.ml(&only_obj, 3).unwrap();
     check(
         [
             llk_rel(gpu.history(), cpu.history()),
@@ -268,11 +341,11 @@ fn gpu_rejects_what_it_cannot_run() {
     assert!(GpuPtycho::new(&ctx(), &scan, object, probe, FUSED.options).is_err());
 }
 
-/// AP and DM cycles (AP's with an LLK and DM's first included), rPIE epochs and LLK passes
-/// replayed from captured graphs give the eager bits: the object, the probe and every LLK
-/// record read from the ring, across the parameter and algorithm switches that make a new
-/// capture and calls that reuse the last one, with a short last stack and batch, and the
-/// public LLK query between calls.
+/// AP, DM and ML cycles (AP's and ML's with an LLK, DM's and ML's first included), rPIE
+/// epochs and LLK passes replayed from captured graphs give the eager bits: the object, the
+/// probe and every LLK record read from the ring, across the parameter and algorithm switches
+/// that make a new capture and calls that reuse the last one, with a short last stack and
+/// batch, and the public LLK query between calls.
 #[test]
 fn graph_replays_bitwise_like_eager() {
     for setup in [M1, FUSED] {
@@ -320,6 +393,14 @@ fn graph_like_eager(setup: Setup) {
             4,
         )
         .unwrap();
+        let ml = MlParams {
+            update_object: true,
+            update_probe: true,
+            calc_llk: 3,
+            zero_phase_ramp: false,
+        };
+        g.ml(&ml, 7).unwrap();
+        g.ml(&ml, 4).unwrap();
         let bits = |s: &Stack<C64>| -> Vec<[u64; 2]> {
             s.as_slice()
                 .iter()
@@ -337,7 +418,7 @@ fn graph_like_eager(setup: Setup) {
         (bits(&g.object().unwrap()), bits(&g.probe().unwrap()), llk)
     };
     let (eager, graph) = (run(false), run(true));
-    assert_eq!(eager.2.len(), 3 + 3 + 2 + 2 + 3 + 2 + 2 + 1);
+    assert_eq!(eager.2.len(), 3 + 3 + 2 + 2 + 3 + 2 + 2 + 3 + 2 + 1);
     assert!(eager.2 == graph.2, "{setup:?}: LLK records differ");
     assert!(eager.0 == graph.0, "{setup:?}: object differs");
     assert!(eager.1 == graph.1, "{setup:?}: probe differs");

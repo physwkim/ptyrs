@@ -1,4 +1,4 @@
-//! The GPU backend (DESIGN §7 M1): [`GpuPtycho`] runs AP, DM and rPIE in `f32` on one CUDA
+//! The GPU backend (DESIGN §7 M1): [`GpuPtycho`] runs AP, DM, rPIE and ML in `f32` on one CUDA
 //! stream with the `ptyrs-gpu` pixel kernels and `ptyrs-fft` plans, in the call sequences the
 //! `ptyrs_gpu` ops and rPIE docs give, and is checked against [`crate::Ptycho`].
 //!
@@ -8,8 +8,8 @@
 //! PyNX's fixed stack for the longest stack. AP and DM project a stack, and the LLK pass
 //! takes its partials, either by M2's fused passes over one scratch set or by the M1 launch
 //! sequence ([`GpuOptions::fused`]), whose one scratch stack serves all and whose stacks of
-//! one length share a cuFFT plan, which transforms only their frames; rPIE always runs M1's
-//! launches. Each cycle enqueues through its own `ExecutionContext`, dropped when the cycle
+//! one length share a cuFFT plan, which transforms only their frames; rPIE and ML always run
+//! M1's launches. Each cycle enqueues through its own `ExecutionContext`, dropped when the cycle
 //! has been enqueued. Nothing in a cycle
 //! reads back to the host: an LLK record goes, stack by stack, into the device's
 //! [`ptyrs_gpu::LlkRing`], whose copies download while later cycles run, and the host reads
@@ -23,6 +23,7 @@
 mod ap;
 mod device;
 mod dm;
+mod ml;
 mod rpie;
 
 use std::f64::consts::PI;
@@ -40,14 +41,14 @@ use ptyrs_gpu::{
 use device::{Bufs, Device, M1Bufs, PassesMut};
 
 use crate::ptycho::{Algorithm, LlkRecord, zero_phase_ramp};
-use crate::{ApParams, DmParams, EngineError, Fft2, Llk, RpieParams};
+use crate::{ApParams, DmParams, EngineError, Fft2, Llk, MlParams, Observed, RpieParams};
 
 /// How [`GpuPtycho`] batches its work.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GpuOptions {
     /// Frames per stack (the last stack may be shorter); PyNX's default is 16.
     pub stack_size: usize,
-    /// Replay every AP and DM cycle, rPIE epoch and LLK pass from a CUDA graph captured once
+    /// Replay every AP, DM and ML cycle, rPIE epoch and LLK pass from a CUDA graph captured once
     /// per kind of cycle instead of launching it kernel by kernel; both give the same bits.
     pub graph: bool,
     /// LLK records the device ring holds, at least 1: a record's download is enqueued at
@@ -82,6 +83,13 @@ enum Epoch {
     Dm { params: DmParams, first: bool },
     /// An rPIE epoch.
     Rpie(RpieParams),
+    /// An ML cycle; `first` for cycle 0 of a call, with `llk` it takes the LLK of the
+    /// estimate it starts from.
+    Ml {
+        params: MlParams,
+        first: bool,
+        llk: bool,
+    },
 }
 
 impl Epoch {
@@ -90,6 +98,7 @@ impl Epoch {
             Self::Ap { .. } => Algorithm::Ap,
             Self::Dm { .. } => Algorithm::Dm,
             Self::Rpie(_) => Algorithm::Rpie,
+            Self::Ml { .. } => Algorithm::Ml,
         }
     }
 
@@ -102,6 +111,11 @@ impl Epoch {
                 first: false,
             },
             Self::Rpie(p) => Self::Rpie(p),
+            Self::Ml { params, .. } => Self::Ml {
+                params,
+                first: false,
+                llk: false,
+            },
         }
     }
 }
@@ -235,6 +249,8 @@ pub struct GpuPtycho {
     obj_dims: [usize; 3],
     probe_dims: [usize; 3],
     nb_obs: usize,
+    /// Sum of the unmasked observed counts, for ML's [`crate::Ptycho::scale_obj_probe`].
+    total_obs: f64,
     /// The probe-frame FFT of [`zero_phase_ramp`], which runs on the host.
     fft: Fft2,
     cycle: usize,
@@ -317,6 +333,7 @@ impl GpuPtycho {
             obj_dims: object.dims(),
             probe_dims: probe.dims(),
             nb_obs: scan.counts.nb_obs(),
+            total_obs: Observed::from_counts(&scan.counts).total(),
             fft: Fft2::new(g.frame),
             cycle: 0,
             history: Vec::new(),
@@ -346,7 +363,7 @@ impl GpuPtycho {
         &self.history
     }
 
-    /// Cycles (AP, DM) and epochs (rPIE) run so far.
+    /// Cycles (AP, DM, ML) and epochs (rPIE) run so far.
     pub fn cycle(&self) -> usize {
         self.cycle
     }
