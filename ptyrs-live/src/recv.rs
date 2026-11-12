@@ -274,6 +274,18 @@ fn fail<E: fmt::Display>(what: &'static str) -> impl FnOnce(E) -> RecvError {
     }
 }
 
+/// A report figure to the given decimals, or `none` when it is undefined.
+struct Fig(Option<f64>, usize);
+
+impl fmt::Display for Fig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            Some(v) => write!(f, "{v:.*}", self.1),
+            None => f.write_str("none"),
+        }
+    }
+}
+
 pub struct RecvReport {
     /// Triggers that never reached the device store.
     pub lost: u64,
@@ -445,8 +457,7 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
                             move |desc, body, order| {
                                 let mut s = st.lock().unwrap();
                                 src.on_update(&mut s, desc, body, order, &tx);
-                                pr.unique.store(s.unique, Ordering::Relaxed);
-                                pr.last_rx.store(s.last_rx, Ordering::Relaxed);
+                                pr.publish(&s);
                             },
                             |ev| eprintln!("recv FRAME {ev:?}"),
                         )
@@ -626,14 +637,16 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
     sorted.dedup();
     let store_dup_uids = up.uids.len() - sorted.len();
 
-    let first = st.first_rx.unwrap_or(t_end);
-    let rx_span = (st.last_rx - first).max(1) as f64 / 1e9;
-    let (cs_t, cs_cpu) = st.cpu_sample;
-    let steady = if cs_t > first {
-        (cs_cpu - st.cpu_first) as f64 / (cs_t - first) as f64
-    } else {
-        f64::NAN
-    };
+    // Rates over the receive span; none before a frame arrived or over an
+    // empty span.
+    let rate = |x: f64, dt: i64| (dt > 0).then(|| x / dt as f64);
+    let rx = st.rx;
+    let rx_span = |x: f64| rx.and_then(|r| rate(x * 1e9, r.last - r.first));
+    let since_first = |x: f64| rx.and_then(|r| rate(x, t_end - r.first));
+    let steady = rx.and_then(|r| {
+        let (t, cpu) = r.cpu_sample?;
+        rate((cpu - r.cpu_first) as f64, t - r.first)
+    });
     let lost = frames - up.frames.min(frames);
     let mut s = String::new();
     // Writing to a String cannot fail.
@@ -680,20 +693,26 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
         line(format_args!("recv first_error={e}"));
     }
     line(format_args!(
-        "recv rx_rate_hz={:.1} cpu_cores_steady={:.2} cpu_cores_total={:.2} workers={} \
-         worker_cpu_cores={:.2} h2d_cpu_cores={:.2} ring_stalls={} batches={} mean_batch={:.2} \
-         max_inflight={} h2d_MBps={:.1}",
-        st.unique as f64 / rx_span,
-        steady,
-        (cpu_end - st.cpu_first) as f64 / (t_end - first).max(1) as f64,
+        "recv rx_rate_hz={} cpu_cores_steady={} cpu_cores_total={} workers={} \
+         worker_cpu_cores={} h2d_cpu_cores={} ring_stalls={} batches={} mean_batch={} \
+         max_inflight={} h2d_MBps={}",
+        Fig(rx_span(st.unique as f64), 1),
+        Fig(steady, 2),
+        Fig(
+            rx.and_then(|r| rate((cpu_end - r.cpu_first) as f64, t_end - r.first)),
+            2
+        ),
         workers,
-        wr.cpu_ns as f64 / (t_end - first).max(1) as f64,
-        up.cpu_ns as f64 / (t_end - first).max(1) as f64,
+        Fig(since_first(wr.cpu_ns as f64), 2),
+        Fig(since_first(up.cpu_ns as f64), 2),
         ring.stalls(),
         up.batches,
-        up.frames as f64 / up.batches.max(1) as f64,
+        Fig(
+            (up.batches > 0).then(|| up.frames as f64 / up.batches as f64),
+            2
+        ),
         up.max_inflight,
-        up.bytes as f64 / rx_span / 1e6,
+        Fig(rx_span(up.bytes as f64 / 1e6), 1),
     ));
     line(format_args!("recv rx_to_gpu {}", up.rx_to_gpu.summary()));
     line(format_args!("recv pub_to_gpu {}", up.pub_to_gpu.summary()));

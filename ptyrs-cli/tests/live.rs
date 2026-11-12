@@ -38,6 +38,31 @@ fn zero_workers_is_refused_before_any_frame() {
     assert!(err.contains("workers"), "{err}");
 }
 
+/// Needs a GPU. Nothing serves `addr`, so no frame arrives: every rate
+/// over the receive span is reported as none, not as a number.
+#[test]
+fn a_run_without_frames_reports_no_rates() {
+    let p = config(
+        "no_frames",
+        "[recv]\nframes = 10\naddr = \"127.0.0.1:15999\"\nconnect-timeout-s = 1\nring-slots = 16\n",
+    );
+    let out = ptyrs(&["live", p.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(2), "every trigger is lost");
+    let text = String::from_utf8_lossy(&out.stdout);
+    let rates = [
+        "rx_rate_hz",
+        "cpu_cores_steady",
+        "cpu_cores_total",
+        "worker_cpu_cores",
+        "h2d_cpu_cores",
+        "mean_batch",
+        "h2d_MBps",
+    ];
+    for k in rates {
+        assert!(text.contains(&format!(" {k}=none")), "{k}: {text}");
+    }
+}
+
 #[test]
 fn a_missing_file_or_command_is_refused() {
     let err = refused(&ptyrs(&["live", "/nonexistent/live.toml"]));

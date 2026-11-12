@@ -253,12 +253,20 @@ pub struct SourceStats {
     pub queue_full: u64,
     pub rejected: u64,
     pub placeholders: u64,
-    pub first_rx: Option<i64>,
-    pub last_rx: i64,
-    pub cpu_first: i64,
-    /// `(t, process cpu)` every 1024 unique frames, for the steady CPU rate.
-    pub cpu_sample: (i64, i64),
+    /// `None` until the first frame arrives.
+    pub rx: Option<RxSpan>,
     pub first_error: Option<String>,
+}
+
+/// Receive times and process CPU from the first frame on, in ns.
+#[derive(Clone, Copy, Debug)]
+pub struct RxSpan {
+    pub first: i64,
+    pub last: i64,
+    pub cpu_first: i64,
+    /// `(t, process cpu)` at the latest multiple of 1024 unique frames, for
+    /// the steady CPU rate.
+    pub cpu_sample: Option<(i64, i64)>,
 }
 
 impl SourceStats {
@@ -281,11 +289,13 @@ impl SourceStats {
     /// past the run. A full queue drops it (counted, never blocks the source).
     pub fn accept(&mut self, w: Work, tx: &WorkTx) {
         let (uid, t_rx) = (w.uid, w.t_rx);
-        if self.first_rx.is_none() {
-            self.first_rx = Some(t_rx);
-            self.cpu_first = process_cpu_ns();
-        }
-        self.last_rx = t_rx;
+        let rx = self.rx.get_or_insert_with(|| RxSpan {
+            first: t_rx,
+            last: t_rx,
+            cpu_first: process_cpu_ns(),
+            cpu_sample: None,
+        });
+        rx.last = t_rx;
         if uid < 0 || uid as u64 >= self.frames {
             self.beyond += 1;
             return;
@@ -299,7 +309,7 @@ impl SourceStats {
         *word |= b;
         self.unique += 1;
         if self.unique.is_multiple_of(1024) {
-            self.cpu_sample = (t_rx, process_cpu_ns());
+            rx.cpu_sample = Some((t_rx, process_cpu_ns()));
         }
         let next = self.last_uid + 1;
         match (uid as i64).cmp(&next) {

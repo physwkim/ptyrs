@@ -398,8 +398,7 @@ fn read_frames(
             t_pub: job.t_pub,
         };
         s.accept(work, &tx);
-        progress.unique.store(s.unique, Ordering::Relaxed);
-        progress.last_rx.store(s.last_rx, Ordering::Relaxed);
+        progress.publish(&s);
     }
     Ok((hist, retries))
 }

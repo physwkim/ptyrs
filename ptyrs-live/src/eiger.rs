@@ -333,6 +333,16 @@ pub struct Progress {
     pub series_end: AtomicBool,
 }
 
+impl Progress {
+    /// What the polling thread reads of `s`; `last_rx` stays 0 until a
+    /// frame arrives.
+    pub fn publish(&self, s: &SourceStats) {
+        self.unique.store(s.unique, Ordering::Relaxed);
+        self.last_rx
+            .store(s.rx.map_or(0, |r| r.last), Ordering::Relaxed);
+    }
+}
+
 /// PULL from `endpoint` until the series ends or `stop` is set. Every part
 /// is moved into a [`Bytes`] without copying, so the workers decode
 /// straight out of the ZMQ receive buffers.
@@ -367,8 +377,7 @@ pub fn run_pull(
         rep.messages += 1;
         let mut s = st.lock().unwrap();
         let kind = frames.on_message(&parts, &mut s, &tx);
-        progress.unique.store(s.unique, Ordering::Relaxed);
-        progress.last_rx.store(s.last_rx, Ordering::Relaxed);
+        progress.publish(&s);
         drop(s);
         match kind {
             Kind::Rejected => rep.rejected += 1,
