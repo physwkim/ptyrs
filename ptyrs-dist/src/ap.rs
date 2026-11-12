@@ -1139,6 +1139,55 @@ mod tests {
         }
     }
 
+    /// A region recomputes its neighbours' border frames in its own stacks, so a frame's exit
+    /// wave is the owner's only if cuFFT gives a transform the same bits at any position of a
+    /// fixed-size batch, whatever the other transforms hold. Checked at this module's test
+    /// shape and at `ap_scaling`'s, each transform at every position.
+    #[test]
+    fn fft_bits_do_not_depend_on_batch_position() {
+        let ctx = cuda_core::Context::new(gpus(1)[0]).unwrap();
+        let stream = ctx.new_stream().unwrap();
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        let mut rand = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x >> 40) as f32 / (1u64 << 24) as f32 - 0.5
+        };
+        for (n, batch) in [(32, 7 * 2), (256, 32 * 2)] {
+            let len = n * n;
+            let data: Vec<C32> = (0..batch * len)
+                .map(|_| C32 {
+                    re: rand(),
+                    im: rand(),
+                })
+                .collect();
+            let mut plan = Plan2d::new(&stream, n, batch).unwrap();
+            // Bits after the forward transform and after the inverse that follows it.
+            let mut run = |host: &[C32]| {
+                let mut buf = DeviceBuffer::from_host(&stream, host).unwrap();
+                let ec = ExecutionContext::new(stream.clone());
+                plan.forward_inplace(&ec, &mut buf).unwrap();
+                drop(ec);
+                let fwd = bits(&buf.to_host_vec(&stream).unwrap());
+                let ec = ExecutionContext::new(stream.clone());
+                plan.inverse_inplace(&ec, &mut buf).unwrap();
+                drop(ec);
+                [fwd, bits(&buf.to_host_vec(&stream).unwrap())]
+            };
+            let base = run(&data);
+            for k in 1..batch {
+                let mut rot = data.clone();
+                rot.rotate_left(k * len);
+                for (got, base) in run(&rot).iter().zip(&base) {
+                    let mut want = base.clone();
+                    want.rotate_left(k * len);
+                    assert!(*got == want, "{n}x{n} batch {batch}: rotated by {k}");
+                }
+            }
+        }
+    }
+
     fn rel_l2(a: &[C32], b: &[C64]) -> f64 {
         let (mut d, mut n) = (0.0, 0.0);
         for (a, b) in a.iter().zip(b) {
