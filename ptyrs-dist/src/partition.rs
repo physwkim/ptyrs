@@ -211,34 +211,11 @@ impl Partition {
             .map(|c| grid.of_pixel(c[0] + frame[0] / 2, c[1] + frame[1] / 2) as u32)
             .collect();
 
-        let reach = [
-            frame[0].div_ceil(grid.tile()),
-            frame[1].div_ceil(grid.tile()),
-        ];
-        let mut regions: Vec<Region> = (0..nregion)
-            .map(|r| {
-                let mine: Vec<bool> = owner.iter().map(|&o| o as usize == r).collect();
-                let near = dilate(&mine, grid.dims(), reach);
-                Region {
-                    own: (0..grid.len())
-                        .filter(|&t| mine[t])
-                        .map(|t| t as u32)
-                        .collect(),
-                    halo: (0..grid.len())
-                        .filter(|&t| near[t] && !mine[t])
-                        .map(|t| t as u32)
-                        .collect(),
-                    frames: Vec::new(),
-                }
-            })
-            .collect();
+        let regions = regions(&grid, frame, &owner, &home, nregion);
         if let Some(r) = regions.iter().position(|g| g.own.is_empty()) {
             return Err(DistError::Partition(format!(
                 "{scheme:?} over {nregion} regions leaves region {r} without tiles"
             )));
-        }
-        for (f, &h) in home.iter().enumerate() {
-            regions[owner[h as usize] as usize].frames.push(f as u32);
         }
 
         let tile_frames = Csr::build(grid.len(), || {
@@ -335,6 +312,61 @@ impl Partition {
     pub fn home_frames(&self) -> &Csr {
         &self.home_frames
     }
+
+    /// This partition with regions `r * k .. (r + 1) * k` merged into region `r`, where
+    /// `k = nregion / n`. Grid, frames and addition orders are unchanged, so a run on `n` GPUs
+    /// cut from fixed leaf regions keeps every leaf's tiles and frames whatever `n` is.
+    pub fn merge(&self, n: usize) -> Result<Self, DistError> {
+        if n == 0 || !self.nregion().is_multiple_of(n) {
+            return Err(DistError::Partition(format!(
+                "{} regions do not merge into {n}",
+                self.nregion()
+            )));
+        }
+        let k = (self.nregion() / n) as u32;
+        let owner: Vec<u32> = self.owner.iter().map(|&o| o / k).collect();
+        Ok(Self {
+            regions: regions(&self.grid, self.frame, &owner, &self.home, n),
+            owner,
+            ..self.clone()
+        })
+    }
+}
+
+/// Owned tiles, halo tiles (foreign tiles within one frame width, in whole tiles, of an owned
+/// tile) and computed frames of each of `n` regions.
+fn regions(
+    grid: &TileGrid,
+    frame: [usize; 2],
+    owner: &[u32],
+    home: &[u32],
+    n: usize,
+) -> Vec<Region> {
+    let reach = [
+        frame[0].div_ceil(grid.tile()),
+        frame[1].div_ceil(grid.tile()),
+    ];
+    let mut regions: Vec<Region> = (0..n)
+        .map(|r| {
+            let mine: Vec<bool> = owner.iter().map(|&o| o as usize == r).collect();
+            let near = dilate(&mine, grid.dims(), reach);
+            Region {
+                own: (0..grid.len())
+                    .filter(|&t| mine[t])
+                    .map(|t| t as u32)
+                    .collect(),
+                halo: (0..grid.len())
+                    .filter(|&t| near[t] && !mine[t])
+                    .map(|t| t as u32)
+                    .collect(),
+                frames: Vec::new(),
+            }
+        })
+        .collect();
+    for (f, &h) in home.iter().enumerate() {
+        regions[owner[h as usize] as usize].frames.push(f as u32);
+    }
+    regions
 }
 
 /// Region of every tile, decided by the tile centre against cuts over the frame-centre extent.
@@ -681,6 +713,36 @@ pub(crate) mod tests {
             .filter(|&(a, b)| c[a][b] > 0)
             .collect();
         assert_eq!(touching, [(0, 1), (1, 2), (2, 3)]);
+    }
+
+    /// Halving the cut count maps slice `i` of 4 to slice `i / 2` of 2 exactly (the scale is a
+    /// power of two), so merged leaves equal a direct partition, and merging keeps every leaf
+    /// whole.
+    #[test]
+    fn merged_leaves_equal_a_direct_partition() {
+        for (name, a, scheme) in cases() {
+            let leaves = Partition::from_addr(&a, DEFAULT_TILE, scheme, 4).unwrap();
+            assert_eq!(leaves.merge(4).unwrap(), leaves, "{name}");
+            for n in [1, 2] {
+                let merged = leaves.merge(n).unwrap();
+                let direct = Partition::from_addr(&a, DEFAULT_TILE, scheme, n).unwrap();
+                assert_eq!(merged, direct, "{name}/{n}");
+                for (l, leaf) in leaves.regions().iter().enumerate() {
+                    let r = &merged.regions()[l / (4 / n)];
+                    assert!(
+                        leaf.own.iter().all(|t| r.own.contains(t)),
+                        "{name}/{n} leaf {l}"
+                    );
+                    assert!(
+                        leaf.frames.iter().all(|f| r.frames.contains(f)),
+                        "{name}/{n} leaf {l}"
+                    );
+                }
+            }
+            assert!(
+                leaves.merge(0).is_err() && leaves.merge(3).is_err() && leaves.merge(8).is_err()
+            );
+        }
     }
 
     #[test]
