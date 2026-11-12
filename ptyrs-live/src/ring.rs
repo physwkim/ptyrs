@@ -295,10 +295,13 @@ impl DeviceStore {
 
 /// Frames `seq0..seq0 + n` are in the [`DeviceStore`]. Batches are sent in
 /// sequence order and without gaps.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FrameBatch {
     pub seq0: u64,
     pub n: u64,
+    /// `(x, y)` of each frame, m, read from the ring before its slots were
+    /// released: the host's copy of what the store holds on the device.
+    pub positions: Vec<(f64, f64)>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -414,8 +417,20 @@ pub fn run_uploader(
                 break;
             }
             let t = wall_ns();
+            let at = |seq: u64| (seq % slots as u64) as usize;
+            let positions = match batches {
+                // SAFETY: the slots are committed and not yet released, so
+                // no worker writes their positions (see `Ring`).
+                Some(_) => (seq0..seq0 + n)
+                    .map(|seq| unsafe {
+                        let p = ring.pos_ptr.add(2 * at(seq));
+                        (*p, *p.add(1))
+                    })
+                    .collect(),
+                None => Vec::new(),
+            };
             for seq in seq0..seq0 + n {
-                let m = &ring.meta[(seq % slots as u64) as usize];
+                let m = &ring.meta[at(seq)];
                 rep.rx_to_gpu.record(t - m.t_rx.load(Ordering::Relaxed));
                 rep.pub_to_gpu.record(t - m.t_pub.load(Ordering::Relaxed));
                 rep.commit_to_gpu
@@ -426,7 +441,7 @@ pub fn run_uploader(
             ring.released.store(seq0 + n, Ordering::Release);
             if let Some(tx) = &batches {
                 // A consumer that has gone away does not stop the input.
-                let _ = tx.send(FrameBatch { seq0, n });
+                let _ = tx.send(FrameBatch { seq0, n, positions });
             }
             inflight.pop_front();
             free.push(ev);
@@ -499,6 +514,10 @@ mod tests {
         let mut next = 0;
         for b in rx.iter() {
             assert_eq!(b.seq0, next);
+            let want: Vec<(f64, f64)> = (next..next + b.n)
+                .map(|s| (s as f64, -(s as f64)))
+                .collect();
+            assert_eq!(b.positions, want);
             next += b.n;
         }
         assert_eq!(next, total);
