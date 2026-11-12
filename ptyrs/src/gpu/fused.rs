@@ -21,9 +21,9 @@ use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig};
 use ptyrs_kernels::fft_ept;
 use ptyrs_kernels::fused::{
     FFT_SKEW, FUSED_BACKGROUND, FUSED_BACKGROUND_SUMS, FUSED_COLS, FUSED_DM, FUSED_GRAD, FUSED_LLK,
-    FUSED_PROJECT, FUSED_ROW_THREADS, FUSED_SCALE, FUSED_SCALE_SUMS, FUSED_SHIFT_DEN,
-    FUSED_SHIFT_OBJ, FUSED_SHIFT_POSITION, FUSED_SHIFT_PROBE, FUSED_TO_PSI, FusedCfg, FusedPtrs,
-    col_slot_bytes, fused_col_threads,
+    FUSED_MODEL_TERMS, FUSED_PROJECT, FUSED_ROW_THREADS, FUSED_SCALE, FUSED_SCALE_SUMS,
+    FUSED_SHIFT_DEN, FUSED_SHIFT_OBJ, FUSED_SHIFT_POSITION, FUSED_SHIFT_PROBE, FUSED_TO_PSI,
+    FusedCfg, FusedPtrs, col_slot_bytes, fused_col_threads,
 };
 use ptyrs_kernels::pixel::SumPtrs;
 
@@ -1113,14 +1113,21 @@ impl<'a> Run<'a> {
             writes.extend(far.background.as_deref().map(|b| b.ratio.storage()));
         }
         let (ctl, g) = (self.ctl(), self.g);
+        let model = cfg.flags & FUSED_MODEL_TERMS != 0;
         self.k.launch(self.ctx, &reads, &writes, |stream| {
-            // SAFETY: as in `rows_fwd`; the launch is the one `cols` documents.
+            let m = &self.k.module;
+            // SAFETY: as in `rows_fwd`; the launch is the one `cols` documents, of the build
+            // whose terms cover `cfg.flags`.
             unsafe {
-                match self.sh.ny {
-                    Side::N64 => self.k.module.fused_cols_64(stream, config, p, ctl, g, cfg),
-                    Side::N128 => self.k.module.fused_cols_128(stream, config, p, ctl, g, cfg),
-                    Side::N256 => self.k.module.fused_cols_256(stream, config, p, ctl, g, cfg),
-                    Side::N512 => self.k.module.fused_cols_512(stream, config, p, ctl, g, cfg),
+                match (self.sh.ny, model) {
+                    (Side::N64, false) => m.fused_cols_64(stream, config, p, ctl, g, cfg),
+                    (Side::N128, false) => m.fused_cols_128(stream, config, p, ctl, g, cfg),
+                    (Side::N256, false) => m.fused_cols_256(stream, config, p, ctl, g, cfg),
+                    (Side::N512, false) => m.fused_cols_512(stream, config, p, ctl, g, cfg),
+                    (Side::N64, true) => m.fused_cols_model_64(stream, config, p, ctl, g, cfg),
+                    (Side::N128, true) => m.fused_cols_model_128(stream, config, p, ctl, g, cfg),
+                    (Side::N256, true) => m.fused_cols_model_256(stream, config, p, ctl, g, cfg),
+                    (Side::N512, true) => m.fused_cols_model_512(stream, config, p, ctl, g, cfg),
                 }
             }
         })

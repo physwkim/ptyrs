@@ -54,6 +54,10 @@ pub const FUSED_BACKGROUND: u32 = 256;
 /// [`cols`] writes each frame's background ratio `obs / max(calc, 1e-12)` of the forward far
 /// field.
 pub const FUSED_BACKGROUND_SUMS: u32 = 512;
+/// The model terms of [`cols`]: a build compiles in those of its `TERMS`, so that a pass
+/// without them runs a build without their per-pixel work.
+pub const FUSED_MODEL_TERMS: u32 =
+    FUSED_SCALE | FUSED_SCALE_SUMS | FUSED_BACKGROUND | FUSED_BACKGROUND_SUMS;
 /// [`shift_rows_inv`] writes each frame's object terms of the shifted probe, `shift_obj` and
 /// `shift_power`, for [`gather_shifted`].
 pub const FUSED_SHIFT_OBJ: u32 = 1024;
@@ -371,14 +375,20 @@ unsafe fn rows_fwd_with<const NX: u32, const SHIFT: bool>(
 /// `col_slot_bytes(flags, ny)` bytes of reduction slots, `2 * FUSED_COLS * ny` bytes of
 /// counts, then the larger of `nmode * FUSED_COLS` column FFTs ([`FFT_SKEW`]) and
 /// `4 * nmode * ny * FUSED_COLS` bytes.
-/// `counts` must be 16-byte aligned.
+/// `counts` must be 16-byte aligned. Of the [`FUSED_MODEL_TERMS`], the build honours those
+/// in `TERMS` and ignores the rest of `cfg.flags`.
 ///
 /// # Safety
 ///
 /// `NY == g.ny`; `work`, `counts` and the buffers the flags name hold their shapes for `g`;
 /// `ctl` one entry; launch as above.
 #[device]
-pub unsafe fn cols<const NY: u32>(p: FusedPtrs, ctl: *const StackCtl, g: StackGeom, cfg: FusedCfg) {
+pub unsafe fn cols<const NY: u32, const TERMS: u32>(
+    p: FusedPtrs,
+    ctl: *const StackCtl,
+    g: StackGeom,
+    cfg: FusedCfg,
+) {
     let (f0, nf) = unsafe { stack_frames(ctl, g) };
     let fl = thread::blockIdx_y();
     if fl >= nf {
@@ -398,19 +408,21 @@ pub unsafe fn cols<const NY: u32>(p: FusedPtrs, ctl: *const StackCtl, g: StackGe
     let bpb = nmode * FUSED_COLS;
     let u = thread::blockIdx_x() * FUSED_COLS + c;
     let plane = (fl * nmode + m) as usize * n;
-    let llk = cfg.flags & FUSED_LLK != 0;
-    let sums = cfg.flags & FUSED_SCALE_SUMS != 0;
-    let background = cfg.flags & FUSED_BACKGROUND != 0;
-    let bg_ratio = cfg.flags & FUSED_BACKGROUND_SUMS != 0;
-    let project = cfg.flags & FUSED_PROJECT != 0;
-    let grad = cfg.flags & FUSED_GRAD != 0;
+    // A constant mask: a term outside `TERMS` folds away with its per-pixel work.
+    let flags = cfg.flags & (TERMS | !FUSED_MODEL_TERMS);
+    let llk = flags & FUSED_LLK != 0;
+    let sums = flags & FUSED_SCALE_SUMS != 0;
+    let background = flags & FUSED_BACKGROUND != 0;
+    let bg_ratio = flags & FUSED_BACKGROUND_SUMS != 0;
+    let project = flags & FUSED_PROJECT != 0;
+    let grad = flags & FUSED_GRAD != 0;
     let mut r = [0.0f32; 2 * FFT_EPT_MAX as usize];
     unsafe {
         let smem = DynamicSharedArray::<u8, 16>::get();
         let slots = smem.cast::<f32>();
         // The frame's counts under this block's columns, by stored row, copied while the
         // forward FFT runs: read per pixel after it, they stalled the pass.
-        let tile = smem.add(col_slot_bytes(cfg.flags, ny) as usize);
+        let tile = smem.add(col_slot_bytes(flags, ny) as usize);
         let fft_smem = tile.add(2 * (FUSED_COLS * ny) as usize);
         // `|Psi_m(v, u)|^2` at `(m * ny + v) * FUSED_COLS + c`, over the FFTs' region.
         let power = fft_smem.cast::<f32>();
@@ -445,7 +457,7 @@ pub unsafe fn cols<const NY: u32>(p: FusedPtrs, ctl: *const StackCtl, g: StackGe
         let inv_n = 1.0 / n as f32;
         let tile = tile.cast::<u16>();
         // `1 * I == I`: without `FUSED_SCALE` every result is the unscaled pass's, bit for bit.
-        let sf = if cfg.flags & FUSED_SCALE != 0 {
+        let sf = if flags & FUSED_SCALE != 0 {
             *p.scale.add((f0 + fl) as usize)
         } else {
             1.0
