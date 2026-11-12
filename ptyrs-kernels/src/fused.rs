@@ -21,7 +21,7 @@ use cuda_device::{async_copy, device, shared::DynamicSharedArray, thread};
 use crate::FFT_EPT;
 use crate::pixel::{
     LlkPartial, MASKED, StackCtl, StackGeom, SumPtrs, TilePtrs, ViewAddr, cmul, cmul_conj, load_c,
-    obj_pixel_sources, psi_index, quad_phase, sample_obj, stack_frames, store_c, tile_stack_run,
+    obj_pixel_sources, psi_index, quad_phase, sample_obj, stack_frames, store_c,
 };
 
 /// [`rows_fwd`] builds the DM reflection `R = (2 - alpha) PO - (1 - alpha) psi` instead of
@@ -472,34 +472,28 @@ pub unsafe fn probe_terms(p: FusedPtrs, g: StackGeom) {
 /// # Safety
 ///
 /// As `kernels::psi_to_obj`, with the new waves in place of `psi`, and `probe_q` and
-/// `probe_power` as [`probe_terms`] wrote them for this probe in place of `probe`; `seen`
-/// as `stack_tile_and_pixel` needs.
+/// `probe_power` as [`probe_terms`] wrote them for this probe in place of `probe`; `shared`
+/// as `for_each_stack_tile` needs.
 #[device]
 pub unsafe fn gather(
     p: FusedPtrs,
     tiles: TilePtrs,
     sums: SumPtrs,
-    seen: *mut u32,
+    shared: *mut u32,
     ctl: *const StackCtl,
     g: StackGeom,
     cfg: FusedCfg,
 ) {
-    let Some((tile, y, x)) = (unsafe { crate::stack_tile_and_pixel(p.views, seen, ctl, g) }) else {
-        return;
-    };
-    if x >= g.nxo || y >= g.nyo {
-        return;
-    }
     let iobj = thread::blockIdx_z();
     let n = g.ny as usize * g.nx as usize;
     let waves = new_waves(p, cfg);
-    let px = (iobj as usize * g.nyo as usize + y as usize) * g.nxo as usize + x as usize;
-    unsafe {
-        let (f0, nf) = stack_frames(ctl, g);
-        let (k0, k1) = (f0 * g.nmode, (f0 + nf) * g.nmode);
-        let Some((lo, end)) = tile_stack_run(tiles, tile, k0, k1) else {
+    let (f0, nf) = unsafe { stack_frames(ctl, g) };
+    let (k0, k1) = (f0 * g.nmode, (f0 + nf) * g.nmode);
+    let pixel = |lo: u32, end: u32, y: u32, x: u32| unsafe {
+        if x >= g.nxo || y >= g.nyo {
             return;
-        };
+        }
+        let px = (iobj as usize * g.nyo as usize + y as usize) * g.nxo as usize + x as usize;
         let mut acc = load_c(sums.num, px);
         let mut norm = *sums.den.add(px);
         for j in lo..end {
@@ -530,5 +524,6 @@ pub unsafe fn gather(
         }
         store_c(sums.num, px, acc);
         *sums.den.add(px) = norm;
-    }
+    };
+    unsafe { crate::for_each_stack_tile(p.views, tiles, shared, ctl, g, pixel) }
 }
