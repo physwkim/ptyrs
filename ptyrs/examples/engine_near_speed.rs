@@ -104,7 +104,7 @@ fn llk_of(s: &State, object: &Object, probe: &Probe) -> Llk {
 }
 
 enum Method {
-    Lsqml(Lsqml, ProbeVariation),
+    Lsqml(Box<Lsqml>, ProbeVariation),
     Bh(Bh),
 }
 
@@ -117,11 +117,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     for run in args {
         let mut method = match run.split(':').collect::<Vec<_>>()[..] {
             ["lsqml", batch] => Method::Lsqml(
-                Lsqml::new(LsqmlParams {
+                Box::new(Lsqml::new(LsqmlParams {
                     batch_size: batch.parse()?,
                     cost: Cost::Amplitude,
                     seed: SEED,
-                }),
+                })),
                 ProbeVariation::none(s.probe.plane_shape()),
             ),
             ["bh", batch, rho] => Method::Bh(Bh::new(BhParams {

@@ -1,6 +1,6 @@
 //! PyNX DM on the GPU.
 
-use crate::gpu::{Error as GpuError, Exit, FusedInputs, FusedSums};
+use crate::gpu::{Error as GpuError, Exit, FusedBufs, FusedInputs, FusedSums};
 use cuda_async::device_operation::ExecutionContext;
 
 use super::device::{M1Bufs, PassesMut};
@@ -18,14 +18,12 @@ impl GpuPtycho {
     /// from; after the update of each cycle that records one, `Σ|O|` and `Σ|P|` are balanced
     /// with `O P` unchanged (PyNX `ScaleObjProbe(absolute=False)`). With stepped features, a
     /// pass of their own first takes the far sums of `PO` under the cycle-start model and
-    /// steps them, and the projection models the stepped values. Refuses a position: the
-    /// fused DM projection takes no sums under one yet.
+    /// steps them, and the projection models the stepped values. With a position, every pass
+    /// models the probe moved by each frame's offsets, the projection also takes each frame's
+    /// position sums of the waves it leaves against the arrays it read, the later updates
+    /// take their sums of the carried waves by `shifted_psi_sums`, and the offsets step after
+    /// the updates.
     pub fn dm(&mut self, params: &DmParams, ncycle: usize) -> Result<(), EngineError> {
-        if self.dev.has_position() {
-            return Err(EngineError::Invalid(
-                "DM refines no positions on the GPU yet".into(),
-            ));
-        }
         for ic in 0..ncycle {
             let epoch = Epoch::Dm {
                 params: *params,
@@ -75,7 +73,7 @@ impl Bufs<'_> {
                     let _ = self.step_features(ctx, f, None)?;
                 }
                 let dims = *self.views.dims();
-                let m = self.features.lend(ctx, self.kernels, &dims, self.probe)?;
+                let mut m = self.features.lend(ctx, self.kernels, &dims, self.probe)?;
                 for s in 0..self.stacks.len() {
                     let stack = self.table.at(s);
                     let psi = self.stacks.get(s).psi;
@@ -93,6 +91,7 @@ impl Bufs<'_> {
                     };
                     let sums = FusedSums {
                         obj: summed.then_some(&mut *self.obj_sums),
+                        shift: m.shift_sums(false),
                         ..FusedSums::default()
                     };
                     self.kernels
@@ -106,12 +105,51 @@ impl Bufs<'_> {
                     continue;
                 }
                 if !std::mem::take(&mut summed) {
-                    for s in 0..self.stacks.len() {
-                        self.accumulate(ctx, s, o.is_some(), p.is_some())?;
+                    match passes {
+                        PassesMut::Fused(f) if self.features.shifted() => {
+                            self.shifted_sums(ctx, f, o.is_some(), p.is_some())?;
+                        }
+                        _ => {
+                            for s in 0..self.stacks.len() {
+                                self.accumulate(ctx, s, o.is_some(), p.is_some())?;
+                            }
+                        }
                     }
                 }
                 self.apply_sums(ctx, o, p)?;
             }
+        }
+        self.features.position_step(ctx, self.grad)?;
+        Ok(())
+    }
+
+    /// The object and/or probe update sums of every stack's carried exit waves under the
+    /// position model, against the current arrays: the probe moved anew, since an update
+    /// may have changed it; the shifted probe's sums become probe sums after the last stack.
+    fn shifted_sums(
+        &mut self,
+        ctx: &ExecutionContext,
+        f: &mut FusedBufs,
+        obj: bool,
+        probe: bool,
+    ) -> Result<(), GpuError> {
+        let dims = *self.views.dims();
+        let mut m = self.features.lend(ctx, self.kernels, &dims, self.probe)?;
+        for s in 0..self.stacks.len() {
+            let inputs = FusedInputs {
+                views: self.views,
+                counts: self.counts,
+                obj: self.obj,
+                probe: self.probe,
+                model: m.model,
+            };
+            let sums = m.psi_sums(obj.then_some(&mut *self.obj_sums), probe);
+            let psi = self.stacks.get(s).psi;
+            self.kernels
+                .shifted_psi_sums(ctx, &inputs, self.table.at(s), psi, f, sums)?;
+        }
+        if probe {
+            m.probe_sums(ctx, self.kernels, &dims, self.probe_sums)?;
         }
         Ok(())
     }

@@ -95,9 +95,12 @@ def mnorm(a):
     return np.sqrt(np.mean(np.abs(a) ** 2))
 
 
-def probes(probe, u, w):
-    """P_km per frame, [len(w), nm, ny, nx], P_0 + w_k0 U_0 + w_k1 U_1 + ... in that order."""
+def probes(probe, u, w, w0=None):
+    """P_km per frame, [len(w), nm, ny, nx], P_0 + w_k0 U_0 + w_k1 U_1 + ... in that order;
+    with w0, the main mode's weights, w0_k P_0 + ...."""
     p = np.repeat(probe[None], len(w), axis=0)
+    if w0 is not None:
+        p[:, 0] *= w0[:, None, None]
     for i in range(len(u)):
         p[:, 0] += w[:, i, None, None] * u[i]
     return p
@@ -107,13 +110,13 @@ def far(pq, v):
     return fft2(fftshift(pq * v[:, None], axes=AX), norm="ortho")
 
 
-def icalc(m, v, probe, u, w):
-    return (np.abs(far(probes(probe, u, w) * m.q, v)) ** 2).sum(1)
+def icalc(m, v, probe, u, w, w0=None):
+    return (np.abs(far(probes(probe, u, w, w0) * m.q, v)) ** 2).sum(1)
 
 
-def w_grads(m, v, u, w):
-    """dL/dw_ki and dF/dw_ki, [2, nf, K]."""
-    psi = far(probes(m.probe, u, w) * m.q, v)
+def w_grads(m, v, u, w, w0=None):
+    """dL/dw_ki and dF/dw_ki, [2, nf, K]; with w0, at those main-mode weights."""
+    psi = far(probes(m.probe, u, w, w0) * m.q, v)
     ic, t = (np.abs(psi) ** 2).sum(1), m.iobs
     g = np.zeros((2, len(w), len(u)))
     for i, ui in enumerate(u):
@@ -123,12 +126,13 @@ def w_grads(m, v, u, w):
     return g
 
 
-def step(m, obj, probe, u, w, idx, noise):
-    """One LSQML minibatch with OPR (module docstring)."""
+def step(m, obj, probe, u, w, idx, noise, w0=None):
+    """One LSQML minibatch with OPR (module docstring); with w0, the main mode's weights,
+    refined as lsqml_opr_int_step.py says."""
     nm, n = probe.shape[0], u[0].size
     corners = m.corners[idx]
     v = ls.views(obj, corners, m.n)
-    pq = probes(probe, u, w[idx]) * m.q
+    pq = probes(probe, u, w[idx], None if w0 is None else w0[idx]) * m.q
     psi = far(pq, v)
     yp = (np.abs(psi) ** 2).sum(1)
     yt, ok = m.iobs[idx], m.valid[idx]
@@ -182,12 +186,19 @@ def step(m, obj, probe, u, w, idx, noise):
         if i < len(u) - 1:
             r = r - ((r * np.conj(u2[i])).sum(AX, keepdims=True)
                      / (np.abs(u2[i]) ** 2).sum()) * u2[i]
-    return dict(a_far=a_far, a_o=a_o, a_p=a_p, illum=illum, u=u2, w=w2,
-                d_obj=ls.trim_mean(a_o) * do_hat, d_probe=a_p.mean() * np.conj(m.q) * dp_q)
+    out = dict(a_far=a_far, a_o=a_o, a_p=a_p, illum=illum, u=u2, w=w2,
+               d_obj=ls.trim_mean(a_o) * do_hat, d_probe=a_p.mean() * np.conj(m.q) * dp_q)
+    if w0 is not None:
+        op = v * probe[0] * m.q
+        delta = np.real(np.conj(op) * chi[:, 0]).sum(AX) / (np.abs(op) ** 2).sum(AX)
+        out["w0"] = w0.copy()
+        out["w0"][idx] = w0[idx] + 0.1 * delta
+    return out
 
 
-def ptychi(m, iobs, wavelength, obj, u, w, idx):
-    """pty-chi's step per noise model, in the engine's convention."""
+def ptychi(m, iobs, wavelength, obj, u, w, idx, w0=None):
+    """pty-chi's step per noise model, in the engine's convention; with w0, the main mode's
+    weights, refined (optimize_intensity_variation)."""
     import torch
     from torch.utils.data import DataLoader, Subset
     import ptychi.api as api
@@ -218,7 +229,7 @@ def ptychi(m, iobs, wavelength, obj, u, w, idx):
         opts.probe_position_options.optimizable = False
         ow = opts.opr_mode_weight_options
         ow.optimizable = True
-        ow.optimize_intensity_variation = False
+        ow.optimize_intensity_variation = w0 is not None
         ow.optimize_eigenmode_weights = True
         r = opts.reconstructor_options
         r.noise_model = {"poisson": api.NoiseModels.POISSON,
@@ -238,7 +249,7 @@ def ptychi(m, iobs, wavelength, obj, u, w, idx):
             probe_data=np.concatenate([p[None], eig]),
             probe_position_y_px=m.corners[:, 0].astype(np.float64),
             probe_position_x_px=m.corners[:, 1].astype(np.float64),
-            opr_mode_weights_data=np.column_stack([np.ones(len(w)), w]),
+            opr_mode_weights_data=np.column_stack([np.ones(len(w)) if w0 is None else w0, w]),
         )
         rec = task.reconstructor
         pg = rec.parameter_group
@@ -274,7 +285,7 @@ def ptychi(m, iobs, wavelength, obj, u, w, idx):
             illum=pg.object.preconditioner.cpu().numpy() * ny * nx,
             d_obj=pg.object.data.detach().cpu().numpy()[0] - obj[0],
             d_probe=probe[0] * back - m.probe,
-            u=probe[1:, 0] * back, w=wt[:, 1:], main=np.abs(wt[:, 0] - 1).max(),
+            u=probe[1:, 0] * back, w=wt[:, 1:], w0=wt[:, 0], main=np.abs(wt[:, 0] - 1).max(),
             other=np.abs(probe[1:, 1:]).max())
     return out
 
