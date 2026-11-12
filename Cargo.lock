@@ -1835,6 +1835,7 @@ dependencies = [
  "cuda-async",
  "cuda-core",
  "cutile",
+ "ptyrs-fft",
  "ptyrs-gpu",
 ]
 

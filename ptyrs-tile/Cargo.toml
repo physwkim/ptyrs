@@ -10,3 +10,6 @@ cutile = { path = "/home/stevek/work/cuda-rust/cutile-rs/cutile" }
 cuda-async = { workspace = true }
 cuda-core = { workspace = true }
 ptyrs-gpu = { path = "../ptyrs-gpu" }
+
+[dev-dependencies]
+ptyrs-fft = { path = "../ptyrs-fft" }
