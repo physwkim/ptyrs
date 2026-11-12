@@ -1,7 +1,5 @@
 use ptyrs_core::{C64, Geometry, Object, Probe, Scan, Stack, required_obj_shape};
-use ptyrs_engine::{
-    Algorithm, ApParams, DmParams, MlParams, Ptycho, RpieParams, obj_probe_to_psi, quad_phase,
-};
+use ptyrs_engine::{Algorithm, ApParams, DmParams, MlParams, Ptycho, RpieParams};
 
 mod common;
 mod ptychi;
@@ -12,6 +10,8 @@ struct Case {
     scan: Scan,
     object: Object,
     probe: Probe,
+    /// Poisson LLK of the truth at the photon scale of the counts: the noise floor.
+    truth: f64,
 }
 
 /// 40 Fermat positions, 32x32 frames, `PHOTONS` per frame.
@@ -31,34 +31,19 @@ fn case_with(frame: usize, nmode: usize, masked: bool) -> Case {
             .map(|i| i % frame == 20 || i / frame == 3)
             .collect()
     });
-    let scan =
-        ptyrs_engine::sim::simulate(g, pos, &object, &probe, PHOTONS, mask.as_deref(), 7).unwrap();
+    let sim =
+        ptyrs_engine::sim::simulate_truth(g, pos, &object, &probe, PHOTONS, mask.as_deref(), 7)
+            .unwrap();
     Case {
-        scan,
+        scan: sim.scan,
         object,
         probe,
+        truth: sim.truth_llk.poisson,
     }
 }
 
 fn flat_object(o: &Object) -> Object {
     Object::new(Stack::filled(o.dims(), C64::new(1.0, 0.0)))
-}
-
-/// Poisson LLK of the truth at the photon scale `simulate` used: the noise floor.
-fn truth_llk(c: &Case) -> f64 {
-    let p = Ptycho::new(&c.scan, c.object.clone(), c.probe.clone()).unwrap();
-    let views = p.addr().views();
-    let mut psi = vec![C64::default(); views.len() * c.probe.plane_len()];
-    let q = quad_phase(&c.scan.geometry);
-    obj_probe_to_psi(views, &c.object, &c.probe, &q, &mut psi);
-    let calc: f64 = psi.iter().map(|v| v.norm_sqr()).sum();
-    let s = (PHOTONS * p.addr().nframe() as f64 / calc).sqrt();
-    let mut probe = c.probe.clone();
-    probe.as_mut_slice().iter_mut().for_each(|v| *v *= s);
-    Ptycho::new(&c.scan, c.object.clone(), probe)
-        .unwrap()
-        .llk()
-        .poisson
 }
 
 fn rel(a: f64, b: f64) -> f64 {
@@ -119,7 +104,7 @@ fn zero_phase_ramp_keeps_llk_and_removes_a_probe_tilt() {
 #[test]
 fn dm_converges_and_records_on_schedule() {
     let c = case(1, false);
-    let truth = truth_llk(&c);
+    let truth = c.truth;
     let mut p = Ptycho::new(&c.scan, flat_object(&c.object), c.probe.clone()).unwrap();
     p.scale_obj_probe();
     let start = p.llk().poisson;
@@ -236,7 +221,7 @@ fn obj_grad_matches_ml_grad_reference() {
 #[test]
 fn ap_object_only_converges() {
     let c = case(2, true);
-    let truth = truth_llk(&c);
+    let truth = c.truth;
     let mut p = Ptycho::new(&c.scan, flat_object(&c.object), c.probe.clone()).unwrap();
     p.scale_obj_probe();
     let params = ApParams {
@@ -255,7 +240,7 @@ fn ap_object_only_converges() {
 #[test]
 fn ml_after_ap_descends_below_the_truth() {
     let c = case(2, true);
-    let truth = truth_llk(&c);
+    let truth = c.truth;
     let mut p = Ptycho::new(&c.scan, flat_object(&c.object), c.probe.clone()).unwrap();
     p.scale_obj_probe();
     p.ap(&ApParams::default(), 20);
@@ -287,7 +272,7 @@ fn ml_after_ap_descends_below_the_truth() {
 #[test]
 fn rpie_converges() {
     let c = case(1, true);
-    let truth = truth_llk(&c);
+    let truth = c.truth;
     let mut p = Ptycho::new(&c.scan, flat_object(&c.object), c.probe.clone()).unwrap();
     p.scale_obj_probe();
     // pty-chi sums overlapping updates in a batch, so the default step 1 / alpha 0.1 diverges
