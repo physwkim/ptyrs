@@ -13,6 +13,7 @@
 use cuda_device::{device, kernel, shared::DynamicSharedArray, thread};
 use cuda_host::cuda_module;
 
+pub mod fused;
 pub mod pixel;
 
 /// Complex elements per thread of every in-kernel FFT (cuFFT device API, BY_COMPONENT).
@@ -200,6 +201,7 @@ unsafe fn block_sum(s: *mut f32) {
 #[cuda_module]
 pub mod kernels {
     use super::*;
+    use crate::fused::{FusedCfg, FusedPtrs};
     use crate::pixel::*;
     use cuda_device::SharedArray;
 
@@ -486,20 +488,9 @@ pub mod kernels {
         unsafe {
             let (f0, nf) = stack_frames(ctl, g);
             let (k0, k1) = (f0 * g.nmode, (f0 + nf) * g.nmode);
-            let (mut lo, end) = tile_run(tiles, tile);
-            // First entry >= k0.
-            let mut hi = end;
-            while lo < hi {
-                let mid = lo + (hi - lo) / 2;
-                if *tiles.views.add(mid as usize) < k0 {
-                    lo = mid + 1;
-                } else {
-                    hi = mid;
-                }
-            }
-            if lo == end || *tiles.views.add(lo as usize) >= k1 {
+            let Some((lo, end)) = tile_stack_run(tiles, tile, k0, k1) else {
                 return;
-            }
+            };
             let mut acc = load_c(sums.num, px);
             let mut norm = *sums.den.add(px);
             let mut j = lo;
@@ -739,6 +730,79 @@ pub mod kernels {
                 *x.add(2 * i + 1) *= s;
             }
         }
+    }
+
+    // M2 fused stack passes; `crate::fused` documents each body and its launch.
+
+    /// [`crate::fused::rows_fwd`].
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::rows_fwd`].
+    #[kernel]
+    pub unsafe fn fused_rows_fwd(p: FusedPtrs, ctl: *const StackCtl, g: StackGeom, cfg: FusedCfg) {
+        unsafe { crate::fused::rows_fwd(p, ctl, g, cfg) }
+    }
+
+    /// [`crate::fused::cols`].
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::cols`].
+    #[kernel]
+    pub unsafe fn fused_cols(p: FusedPtrs, ctl: *const StackCtl, g: StackGeom, cfg: FusedCfg) {
+        unsafe { crate::fused::cols(p, ctl, g, cfg) }
+    }
+
+    /// [`crate::fused::rows_inv`].
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::rows_inv`].
+    #[kernel]
+    pub unsafe fn fused_rows_inv(p: FusedPtrs, ctl: *const StackCtl, g: StackGeom, cfg: FusedCfg) {
+        unsafe { crate::fused::rows_inv(p, ctl, g, cfg) }
+    }
+
+    /// [`crate::fused::gather`].
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::gather`].
+    #[kernel]
+    pub unsafe fn fused_gather(
+        p: FusedPtrs,
+        tiles: TilePtrs,
+        sums: SumPtrs,
+        ctl: *const StackCtl,
+        g: StackGeom,
+    ) {
+        unsafe { crate::fused::gather(p, tiles, sums, ctl, g) }
+    }
+
+    /// [`crate::fused::probe_power`].
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::probe_power`].
+    #[kernel]
+    pub unsafe fn fused_probe_power(probe: *const f32, pp: *mut f32, nprobe: u32, n: u32) {
+        unsafe { crate::fused::probe_power(probe, pp, nprobe, n) }
+    }
+
+    /// [`crate::fused::llk_groups`].
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::llk_groups`].
+    #[kernel]
+    pub unsafe fn fused_llk_groups(
+        groups: *const LlkPartial,
+        out: *mut LlkPartial,
+        ctl: *const StackCtl,
+        g: StackGeom,
+    ) {
+        unsafe { crate::fused::llk_groups(groups, out, ctl, g) }
     }
 
     // Unnormalized C2C FFT of `nline` strided lines (see `load_line`); forward uses

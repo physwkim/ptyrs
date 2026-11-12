@@ -75,11 +75,11 @@ pub struct ViewDims {
 }
 
 impl ViewDims {
-    fn n(&self) -> usize {
+    pub(crate) fn n(&self) -> usize {
         self.frame[0] as usize * self.frame[1] as usize
     }
 
-    fn obj_len(&self) -> usize {
+    pub(crate) fn obj_len(&self) -> usize {
         self.nobj as usize * self.obj[0] as usize * self.obj[1] as usize
     }
 
@@ -110,7 +110,7 @@ impl ViewDims {
     }
 
     /// One `(OBJ_TILE, OBJ_TILE)` block per object tile and object mode.
-    fn tile_grid(&self) -> LaunchConfig {
+    pub(crate) fn tile_grid(&self) -> LaunchConfig {
         let [nty, ntx] = self.tiles();
         LaunchConfig {
             grid_dim: (ntx, nty, self.nobj),
@@ -119,7 +119,7 @@ impl ViewDims {
         }
     }
 
-    fn check(&self) -> Result<(), Error> {
+    pub(crate) fn check(&self) -> Result<(), Error> {
         let [ny, nx] = self.frame;
         let [nyo, nxo] = self.obj;
         let bad = |what: &str| Err(Error::Shape(format!("{self:?}: {what}")));
@@ -396,7 +396,7 @@ impl Views {
         &self.tile_len
     }
 
-    fn tile_ptrs(&self) -> TilePtrs {
+    pub(crate) fn tile_ptrs(&self) -> TilePtrs {
         TilePtrs {
             start: dptr(&self.tile_start),
             len: dptr(&self.tile_len),
@@ -404,7 +404,7 @@ impl Views {
         }
     }
 
-    fn tile_storages(&self) -> [&RawDeviceBuffer; 3] {
+    pub(crate) fn tile_storages(&self) -> [&RawDeviceBuffer; 3] {
         [
             self.tile_start.storage(),
             self.tile_len.storage(),
@@ -514,7 +514,7 @@ fn pair_tree(block: &[[f64; 4]]) -> [f64; 4] {
 }
 
 /// `PIXEL_THREADS`-thread blocks covering `total` elements.
-fn grid_1d(total: usize) -> Result<LaunchConfig, Error> {
+pub(crate) fn grid_1d(total: usize) -> Result<LaunchConfig, Error> {
     let blocks = total.div_ceil(PIXEL_THREADS as usize);
     let blocks = u32::try_from(blocks)
         .ok()
@@ -1070,17 +1070,17 @@ impl UpdateSums {
         })
     }
 
-    fn check(&self, need: usize) -> Result<(), Error> {
+    pub(crate) fn check(&self, need: usize) -> Result<(), Error> {
         check_len("sums.num", &self.num, need)?;
         check_len("sums.den", &self.den, need)?;
         check_len("sums.max_bits", &self.max_bits, 1)
     }
 
-    fn storages(&self) -> [&cuda_core::RawDeviceBuffer; 2] {
+    pub(crate) fn storages(&self) -> [&cuda_core::RawDeviceBuffer; 2] {
         [self.num.storage(), self.den.storage()]
     }
 
-    fn ptrs(&self) -> SumPtrs {
+    pub(crate) fn ptrs(&self) -> SumPtrs {
         SumPtrs {
             num: dptr(&self.num),
             den: dptr(&self.den),
