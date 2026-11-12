@@ -44,6 +44,9 @@ const _: () = assert!(
     2 * FUSED_COLS == 16,
     "a cols counts row is one 16-byte async copy"
 );
+/// Most threads of a [`cols`] block, `nmode * FUSED_COLS * ny / FFT_EPT`. Its kernels are
+/// built with this launch bound, so their registers cannot cap a block below it.
+pub const FUSED_COL_THREADS: u32 = 512;
 /// Threads of a [`rows_fwd`] or [`rows_inv`] block: `FUSED_ROW_THREADS / (nx / FFT_EPT)`
 /// rows of `nx / FFT_EPT` threads each.
 pub const FUSED_ROW_THREADS: u32 = 128;
@@ -82,10 +85,10 @@ pub struct FusedPtrs {
     pub groups: *mut LlkPartial,
 }
 
-/// Unnormalized in-register FFT of `N` points (128 or 256), inverse under `INV`, as FFT `b`
-/// of `bpb` in the block, this thread being its thread `f`. Every thread of the block must
-/// call it with the same `bpb`: it synchronizes the block. Each pass is generic in its FFT
-/// side so that this resolves to one direct call and `r` stays in registers.
+/// Unnormalized in-register FFT of `N` points (64, 128, 256 or 512), inverse under `INV`, as
+/// FFT `b` of `bpb` in the block, this thread being its thread `f`. Every thread of the block
+/// must call it with the same `bpb`: it synchronizes the block. Each pass is generic in its
+/// FFT side so that this resolves to one direct call and `r` stays in registers.
 ///
 /// # Safety
 ///
@@ -99,14 +102,18 @@ pub(crate) unsafe fn block_fft<const N: u32, const INV: bool>(
     f: u32,
     bpb: u32,
 ) {
-    const { assert!(N == 128 || N == 256) };
+    const { assert!(N == 64 || N == 128 || N == 256 || N == 512) };
     let r = r.as_mut_ptr();
     unsafe {
         match (N, INV) {
+            (64, false) => crate::ptyrs_cufft_c2c_f32_n64_e16_fwd(r, s, b, f, bpb),
+            (64, true) => crate::ptyrs_cufft_c2c_f32_n64_e16_inv(r, s, b, f, bpb),
             (128, false) => crate::ptyrs_cufft_c2c_f32_n128_e16_fwd(r, s, b, f, bpb),
             (128, true) => crate::ptyrs_cufft_c2c_f32_n128_e16_inv(r, s, b, f, bpb),
-            (_, false) => crate::ptyrs_cufft_c2c_f32_n256_e16_fwd(r, s, b, f, bpb),
-            (_, true) => crate::ptyrs_cufft_c2c_f32_n256_e16_inv(r, s, b, f, bpb),
+            (256, false) => crate::ptyrs_cufft_c2c_f32_n256_e16_fwd(r, s, b, f, bpb),
+            (256, true) => crate::ptyrs_cufft_c2c_f32_n256_e16_inv(r, s, b, f, bpb),
+            (_, false) => crate::ptyrs_cufft_c2c_f32_n512_e16_fwd(r, s, b, f, bpb),
+            (_, true) => crate::ptyrs_cufft_c2c_f32_n512_e16_inv(r, s, b, f, bpb),
         }
     }
 }

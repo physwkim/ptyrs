@@ -10,7 +10,7 @@
 //! Buffers are raw device pointers. A complex value is two interleaved `f32` (re, im), the
 //! layout of `ptyrs_fft::C32`.
 
-use cuda_device::{device, kernel, shared::DynamicSharedArray, thread};
+use cuda_device::{device, kernel, launch_bounds, shared::DynamicSharedArray, thread};
 use cuda_host::cuda_module;
 
 pub mod fused;
@@ -27,10 +27,14 @@ pub const FFT_EPT: u32 = 16;
 // thread of the block must call it: it synchronizes the block.
 #[device]
 unsafe extern "C" {
+    fn ptyrs_cufft_c2c_f32_n64_e16_fwd(r: *mut f32, s: *mut u8, b: u32, f: u32, bpb: u32);
+    fn ptyrs_cufft_c2c_f32_n64_e16_inv(r: *mut f32, s: *mut u8, b: u32, f: u32, bpb: u32);
     fn ptyrs_cufft_c2c_f32_n128_e16_fwd(r: *mut f32, s: *mut u8, b: u32, f: u32, bpb: u32);
     fn ptyrs_cufft_c2c_f32_n128_e16_inv(r: *mut f32, s: *mut u8, b: u32, f: u32, bpb: u32);
     fn ptyrs_cufft_c2c_f32_n256_e16_fwd(r: *mut f32, s: *mut u8, b: u32, f: u32, bpb: u32);
     fn ptyrs_cufft_c2c_f32_n256_e16_inv(r: *mut f32, s: *mut u8, b: u32, f: u32, bpb: u32);
+    fn ptyrs_cufft_c2c_f32_n512_e16_fwd(r: *mut f32, s: *mut u8, b: u32, f: u32, bpb: u32);
+    fn ptyrs_cufft_c2c_f32_n512_e16_inv(r: *mut f32, s: *mut u8, b: u32, f: u32, bpb: u32);
 }
 
 /// Line handled by this thread's FFT: blockDim = (threads per FFT, FFTs per block).
@@ -770,6 +774,21 @@ pub mod kernels {
     // M2 fused stack passes; `crate::fused` documents each body and its launch. The FFT passes
     // have one entry per FFT side, which must be the frame's side along the transformed axis.
 
+    /// [`crate::fused::rows_fwd`] for 64-point rows.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::rows_fwd`].
+    #[kernel]
+    pub unsafe fn fused_rows_fwd_64(
+        p: FusedPtrs,
+        ctl: *const StackCtl,
+        g: StackGeom,
+        cfg: FusedCfg,
+    ) {
+        unsafe { crate::fused::rows_fwd::<64>(p, ctl, g, cfg) }
+    }
+
     /// [`crate::fused::rows_fwd`] for 128-point rows.
     ///
     /// # Safety
@@ -800,12 +819,39 @@ pub mod kernels {
         unsafe { crate::fused::rows_fwd::<256>(p, ctl, g, cfg) }
     }
 
+    /// [`crate::fused::rows_fwd`] for 512-point rows.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::rows_fwd`].
+    #[kernel]
+    pub unsafe fn fused_rows_fwd_512(
+        p: FusedPtrs,
+        ctl: *const StackCtl,
+        g: StackGeom,
+        cfg: FusedCfg,
+    ) {
+        unsafe { crate::fused::rows_fwd::<512>(p, ctl, g, cfg) }
+    }
+
+    /// [`crate::fused::cols`] for 64-point columns.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::cols`].
+    #[kernel]
+    #[launch_bounds(crate::fused::FUSED_COL_THREADS)]
+    pub unsafe fn fused_cols_64(p: FusedPtrs, ctl: *const StackCtl, g: StackGeom, cfg: FusedCfg) {
+        unsafe { crate::fused::cols::<64>(p, ctl, g, cfg) }
+    }
+
     /// [`crate::fused::cols`] for 128-point columns.
     ///
     /// # Safety
     ///
     /// As [`crate::fused::cols`].
     #[kernel]
+    #[launch_bounds(crate::fused::FUSED_COL_THREADS)]
     pub unsafe fn fused_cols_128(p: FusedPtrs, ctl: *const StackCtl, g: StackGeom, cfg: FusedCfg) {
         unsafe { crate::fused::cols::<128>(p, ctl, g, cfg) }
     }
@@ -816,8 +862,35 @@ pub mod kernels {
     ///
     /// As [`crate::fused::cols`].
     #[kernel]
+    #[launch_bounds(crate::fused::FUSED_COL_THREADS)]
     pub unsafe fn fused_cols_256(p: FusedPtrs, ctl: *const StackCtl, g: StackGeom, cfg: FusedCfg) {
         unsafe { crate::fused::cols::<256>(p, ctl, g, cfg) }
+    }
+
+    /// [`crate::fused::cols`] for 512-point columns.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::cols`].
+    #[kernel]
+    #[launch_bounds(crate::fused::FUSED_COL_THREADS)]
+    pub unsafe fn fused_cols_512(p: FusedPtrs, ctl: *const StackCtl, g: StackGeom, cfg: FusedCfg) {
+        unsafe { crate::fused::cols::<512>(p, ctl, g, cfg) }
+    }
+
+    /// [`crate::fused::rows_inv`] for 64-point rows.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::rows_inv`].
+    #[kernel]
+    pub unsafe fn fused_rows_inv_64(
+        p: FusedPtrs,
+        ctl: *const StackCtl,
+        g: StackGeom,
+        cfg: FusedCfg,
+    ) {
+        unsafe { crate::fused::rows_inv::<64>(p, ctl, g, cfg) }
     }
 
     /// [`crate::fused::rows_inv`] for 128-point rows.
@@ -848,6 +921,21 @@ pub mod kernels {
         cfg: FusedCfg,
     ) {
         unsafe { crate::fused::rows_inv::<256>(p, ctl, g, cfg) }
+    }
+
+    /// [`crate::fused::rows_inv`] for 512-point rows.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::rows_inv`].
+    #[kernel]
+    pub unsafe fn fused_rows_inv_512(
+        p: FusedPtrs,
+        ctl: *const StackCtl,
+        g: StackGeom,
+        cfg: FusedCfg,
+    ) {
+        unsafe { crate::fused::rows_inv::<512>(p, ctl, g, cfg) }
     }
 
     /// [`crate::fused::gather`].

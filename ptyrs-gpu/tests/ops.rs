@@ -1880,14 +1880,14 @@ fn far_f64(
     (far, llk)
 }
 
-/// Five frames of `frame` on two object modes 40 pixels larger and two probe modes; frames
+/// Five frames of `frame` with `[nprobe, nobj]` modes on an object 40 pixels larger; frames
 /// 1 and 3 reach the object's last row and column as in [`scan_in`].
-fn fused_scan(frame: [u32; 2]) -> Scan {
+fn fused_scan(frame: [u32; 2], [nprobe, nobj]: [u32; 2]) -> Scan {
     let d = ViewDims {
         nframe: 5,
-        nmode: 4,
-        nprobe: 2,
-        nobj: 2,
+        nmode: nprobe * nobj,
+        nprobe,
+        nobj,
         frame,
         obj: [frame[0] + 40, frame[1] + 40],
         quad_phase: 0.0002,
@@ -1942,8 +1942,8 @@ struct FusedScan {
 }
 
 impl FusedScan {
-    fn new(stream: &CudaStream, frame: [u32; 2]) -> Self {
-        let s = fused_scan(frame);
+    fn new(stream: &CudaStream, frame: [u32; 2], modes: [u32; 2]) -> Self {
+        let s = fused_scan(frame, modes);
         let counts_host = fused_counts(&s);
         Self {
             views: Views::new(stream, s.d, &s.views).unwrap(),
@@ -1965,13 +1965,24 @@ impl FusedScan {
     }
 }
 
+/// Frames and `[nprobe, nobj]` modes of the f64 fused tests: every side along both axes,
+/// and every side's column block at the most modes it takes.
+const FUSED_CASES: [([u32; 2], [u32; 2]); 6] = [
+    ([128, 256], [2, 2]),
+    ([256, 128], [2, 2]),
+    ([64, 512], [2, 2]),
+    ([512, 64], [2, 1]),
+    ([64, 128], [16, 1]),
+    ([128, 64], [8, 1]),
+];
+
 /// AP: the projected exit waves, LLK partials and object and probe sums of `fused_project`,
-/// and `fused_llk`, against the f64 M1 chain, on both frame orientations.
+/// and `fused_llk`, against the f64 M1 chain, on [`FUSED_CASES`].
 #[test]
 fn fused_ap_matches_f64() {
     let (stream, ex, k) = setup();
-    for frame in [[128, 256], [256, 128]] {
-        let fs = FusedScan::new(&stream, frame);
+    for (frame, modes) in FUSED_CASES {
+        let fs = FusedScan::new(&stream, frame, modes);
         let (s, n) = (&fs.s, fs.s.n());
         let stacks = [0..3, 3..5];
         let table = StackTable::new(&stream, &s.d, &stacks).unwrap();
@@ -2046,8 +2057,8 @@ fn fused_ap_matches_f64() {
 #[test]
 fn fused_grad_matches_f64() {
     let (stream, ex, k) = setup();
-    for frame in [[128, 256], [256, 128]] {
-        let fs = FusedScan::new(&stream, frame);
+    for (frame, modes) in FUSED_CASES {
+        let fs = FusedScan::new(&stream, frame, modes);
         let (s, n) = (&fs.s, fs.s.n());
         let stacks = [0..3, 3..5];
         let table = StackTable::new(&stream, &s.d, &stacks).unwrap();
@@ -2132,8 +2143,8 @@ fn fused_dm_matches_f64() {
     let (stream, ex, k) = setup();
     let alpha = 0.02f32;
     let (a, b) = (2.0 - alpha as f64, 1.0 - alpha as f64);
-    for frame in [[128, 256], [256, 128]] {
-        let fs = FusedScan::new(&stream, frame);
+    for (frame, modes) in FUSED_CASES {
+        let fs = FusedScan::new(&stream, frame, modes);
         let (s, n) = (&fs.s, fs.s.n());
         let stacks = [0..3, 3..5];
         let table = StackTable::new(&stream, &s.d, &stacks).unwrap();
@@ -2218,7 +2229,7 @@ fn fused_dm_matches_f64() {
 #[test]
 fn fused_results_do_not_depend_on_the_stack_split() {
     let (stream, ex, k) = setup();
-    let fs = FusedScan::new(&stream, [128, 256]);
+    let fs = FusedScan::new(&stream, [128, 256], [2, 2]);
     let (s, n, nm) = (&fs.s, fs.s.n(), fs.s.d.nmode as usize);
     let mut bufs = FusedBufs::new(&stream, &s.d, 5).unwrap();
     let start_psi = noise(5 * nm * n, 60, 1.0);
@@ -2323,7 +2334,7 @@ fn fused_results_do_not_depend_on_the_stack_split() {
 #[test]
 fn fused_empty_stack_replay_writes_nothing() {
     let (stream, _, k) = setup();
-    let fs = FusedScan::new(&stream, [256, 128]);
+    let fs = FusedScan::new(&stream, [256, 128], [2, 2]);
     let (s, n) = (&fs.s, fs.s.n());
     let dev = StackTable::device(&stream, &s.d, 3).unwrap();
     let mut bufs = FusedBufs::new(&stream, &s.d, 3).unwrap();
@@ -2425,7 +2436,7 @@ fn fused_empty_stack_replay_writes_nothing() {
 #[test]
 fn fused_shapes_are_checked() {
     let (stream, ex, k) = setup();
-    let base = fused_scan([128, 256]).d;
+    let base = fused_scan([128, 256], [2, 2]).d;
     let dims = |frame: [u32; 2], nprobe| ViewDims {
         frame,
         nprobe,
@@ -2435,13 +2446,18 @@ fn fused_shapes_are_checked() {
         ..base
     };
     for (frame, nprobe, ok) in [
+        ([64, 128], 16, true),
+        ([64, 128], 17, false),
         ([128, 128], 8, true),
+        ([128, 128], 9, false),
         ([256, 128], 4, true),
-        ([256, 128], 8, false),
-        ([128, 128], 16, false),
+        ([256, 128], 5, false),
+        ([512, 128], 2, true),
+        ([512, 128], 3, false),
+        ([128, 512], 1, true),
         ([24, 32], 1, false),
-        ([128, 512], 1, false),
-        ([64, 128], 1, false),
+        ([1024, 128], 1, false),
+        ([128, 32], 1, false),
     ] {
         let r = FusedBufs::new(&stream, &dims(frame, nprobe), 2);
         assert_eq!(
@@ -2467,7 +2483,7 @@ fn fused_shapes_are_checked() {
         "nf_max 0"
     );
 
-    let fs = FusedScan::new(&stream, [128, 256]);
+    let fs = FusedScan::new(&stream, [128, 256], [2, 2]);
     let table = one_stack(&stream, &fs.s.d, 0..3);
     let mut short = FusedBufs::new(&stream, &fs.s.d, 2).unwrap();
     let mut out = DeviceBuffer::<LlkPartial>::zeroed(&stream, 3).unwrap();

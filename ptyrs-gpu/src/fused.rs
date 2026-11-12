@@ -5,7 +5,8 @@
 //! the arithmetic per pixel is theirs, the FFTs and the sum order of the object update are
 //! not, so results agree with M1 to rounding, not bit for bit.
 //!
-//! Frame sides are 128 or 256 each; views must be canonical, which [`Views::new`] checks.
+//! Frame sides are any of [`FUSED_SIDES`]; views must be canonical, which [`Views::new`]
+//! checks.
 //! The probe sums are M1's [`Kernels::psi_to_probe`], run by [`Kernels::fused_project`] on
 //! the waves it leaves before the object gather can push them out of L2.
 
@@ -13,8 +14,8 @@ use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig};
 use ptyrs_kernels::FFT_EPT;
 use ptyrs_kernels::fused::{
-    FUSED_COLS, FUSED_CONTRIB, FUSED_DM, FUSED_GRAD, FUSED_LLK, FUSED_PROJECT, FUSED_ROW_THREADS,
-    FUSED_TO_PSI, FusedCfg, FusedPtrs,
+    FUSED_COL_THREADS, FUSED_COLS, FUSED_CONTRIB, FUSED_DM, FUSED_GRAD, FUSED_LLK, FUSED_PROJECT,
+    FUSED_ROW_THREADS, FUSED_TO_PSI, FusedCfg, FusedPtrs,
 };
 
 use crate::ops::grid_1d;
@@ -43,7 +44,7 @@ macro_rules! sides {
         }
     };
 }
-sides!(N128 = 128, N256 = 256);
+sides!(N64 = 64, N128 = 128, N256 = 256, N512 = 512);
 
 /// Frame sides the fused passes take along either axis, ascending.
 pub const FUSED_SIDES: &[u32] = &{
@@ -95,7 +96,7 @@ impl Shape {
         let rows = FUSED_ROW_THREADS / (nx / FFT_EPT);
         let nslot = FUSED_COLS * (ny / FFT_EPT);
         let col_threads = d.nmode as u64 * nslot as u64;
-        if col_threads > 1024 {
+        if col_threads > FUSED_COL_THREADS as u64 {
             return Err(bad(format!("{col_threads} threads per column block")));
         }
         let col_threads = col_threads as u32;
@@ -154,8 +155,8 @@ pub struct FusedBufs {
 }
 
 impl FusedBufs {
-    /// Scratch for `dims`, whose frame sides must be 128 or 256 and whose mode count must fit
-    /// one column block (8 modes of 128 rows, 4 of 256).
+    /// Scratch for `dims`, whose frame sides must be in [`FUSED_SIDES`] and whose modes must
+    /// fit one column block of [`FUSED_COL_THREADS`] threads: at most `1024 / ny` of them.
     pub fn new(stream: &CudaStream, dims: &ViewDims, nf_max: u32) -> Result<Self, Error> {
         Shape::of(dims)?;
         if nf_max == 0 {
@@ -444,6 +445,10 @@ impl<'a> Run<'a> {
                 // launch is the one `rows_fwd` documents.
                 unsafe {
                     match self.sh.nx {
+                        Side::N64 => self
+                            .k
+                            .module
+                            .fused_rows_fwd_64(stream, config, p, ctl, g, cfg),
                         Side::N128 => self
                             .k
                             .module
@@ -452,6 +457,10 @@ impl<'a> Run<'a> {
                             .k
                             .module
                             .fused_rows_fwd_256(stream, config, p, ctl, g, cfg),
+                        Side::N512 => self
+                            .k
+                            .module
+                            .fused_rows_fwd_512(stream, config, p, ctl, g, cfg),
                     }
                 }
             })
@@ -475,8 +484,10 @@ impl<'a> Run<'a> {
             // SAFETY: as in `rows_fwd`; the launch is the one `cols` documents.
             unsafe {
                 match self.sh.ny {
+                    Side::N64 => self.k.module.fused_cols_64(stream, config, p, ctl, g, cfg),
                     Side::N128 => self.k.module.fused_cols_128(stream, config, p, ctl, g, cfg),
                     Side::N256 => self.k.module.fused_cols_256(stream, config, p, ctl, g, cfg),
+                    Side::N512 => self.k.module.fused_cols_512(stream, config, p, ctl, g, cfg),
                 }
             }
         })
@@ -527,6 +538,10 @@ impl<'a> Run<'a> {
             // SAFETY: as in `rows_fwd`; the launch is the one `rows_inv` documents.
             unsafe {
                 match self.sh.nx {
+                    Side::N64 => self
+                        .k
+                        .module
+                        .fused_rows_inv_64(stream, config, p, ctl, g, cfg),
                     Side::N128 => self
                         .k
                         .module
@@ -535,6 +550,10 @@ impl<'a> Run<'a> {
                         .k
                         .module
                         .fused_rows_inv_256(stream, config, p, ctl, g, cfg),
+                    Side::N512 => self
+                        .k
+                        .module
+                        .fused_rows_inv_512(stream, config, p, ctl, g, cfg),
                 }
             }
         })
