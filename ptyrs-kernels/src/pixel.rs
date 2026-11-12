@@ -198,6 +198,22 @@ pub struct LlkPartial {
 // SAFETY: repr(C) of four f32, no padding; every bit pattern is a valid value.
 unsafe impl cuda_core::DeviceCopy for LlkPartial {}
 
+/// Adds an unmasked pixel of count `obs` and calculated intensity `calc >= 0` to `acc`:
+/// Poisson `calc` if `obs <= 0.1` else `calc - obs + obs ln(obs / calc)`, Gaussian
+/// `(obs - calc)^2 / (obs + 1)`, Euclidean `4 (sqrt obs - sqrt calc)^2`, and `calc`.
+#[device]
+pub fn llk_add(acc: &mut LlkPartial, obs: f32, calc: f32) {
+    acc.poisson += if obs <= 0.1 {
+        calc
+    } else {
+        calc - obs + obs * (obs / calc).ln()
+    };
+    acc.gaussian += (obs - calc) * (obs - calc) / (obs + 1.0);
+    let e = obs.sqrt() - calc.sqrt();
+    acc.euclidean += 4.0 * e * e;
+    acc.icalc += calc;
+}
+
 /// Offset in an origin-at-`[0, 0]` plane of natural pixel `(y, x)`.
 #[device]
 pub fn psi_index(y: u32, x: u32, ny: u32, nx: u32) -> usize {

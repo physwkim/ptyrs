@@ -465,11 +465,9 @@ pub mod kernels {
 
     /// Log-likelihood sums (PyNX `LLKAll`, no background) of chunk `c = blockIdx.x` of
     /// frame `f0 + fl`, `fl = blockIdx.y`: over its unmasked pixels `d` in `c * LLK_CHUNK ..
-    /// min((c + 1) * LLK_CHUNK, n)`, with `calc = sum_m |psi|^2 / (ny * nx)` and `obs` the
-    /// count, Poisson `calc` if `obs <= 0.1` else `calc - obs + obs ln(obs / calc)`,
-    /// Gaussian `(obs - calc)^2 / (obs + 1)`, Euclidean `4 (sqrt obs - sqrt calc)^2`, and
-    /// `calc`, into `chunks[fl * nchunk + c]`, `nchunk = ceil(n / LLK_CHUNK)`, for `fl < nf`;
-    /// entries past `nf` are not written. [`llk_groups`] sums each frame's chunks.
+    /// min((c + 1) * LLK_CHUNK, n)`, the [`llk_add`] terms of `calc = sum_m |psi|^2 / (ny *
+    /// nx)` and the count, into `chunks[fl * nchunk + c]`, `nchunk = ceil(n / LLK_CHUNK)`,
+    /// for `fl < nf`; entries past `nf` are not written. [`llk_groups`] sums each frame's chunks.
     ///
     /// # Safety
     ///
@@ -506,17 +504,8 @@ pub mod kernels {
             let at = psi_index((d / nx as usize) as u32, (d % nx as usize) as u32, ny, nx);
             let obs = unsafe { *counts.add((f0 as usize + fl) * n + d) };
             if obs != MASKED {
-                let obs = obs as f32;
                 let calc = (unsafe { mode_power(psi, plane0, nmode, n, at) } * inv_n).max(0.0);
-                acc.poisson += if obs <= 0.1 {
-                    calc
-                } else {
-                    calc - obs + obs * (obs / calc).ln()
-                };
-                acc.gaussian += (obs - calc) * (obs - calc) / (obs + 1.0);
-                let e = obs.sqrt() - calc.sqrt();
-                acc.euclidean += 4.0 * e * e;
-                acc.icalc += calc;
+                llk_add(&mut acc, obs as f32, calc);
             }
             d += PIXEL_THREADS as usize;
         }

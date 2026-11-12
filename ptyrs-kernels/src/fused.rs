@@ -20,8 +20,8 @@ use cuda_device::{async_copy, device, shared::DynamicSharedArray, thread};
 
 use crate::FFT_EPT;
 use crate::pixel::{
-    LlkPartial, MASKED, StackCtl, StackGeom, SumPtrs, TilePtrs, ViewAddr, cmul, cmul_conj, load_c,
-    obj_pixel_sources, psi_index, quad_phase, sample_obj, stack_frames, store_c,
+    LlkPartial, MASKED, StackCtl, StackGeom, SumPtrs, TilePtrs, ViewAddr, cmul, cmul_conj, llk_add,
+    load_c, obj_pixel_sources, psi_index, quad_phase, sample_obj, stack_frames, store_c,
 };
 
 /// [`rows_fwd`] builds the DM reflection `R = (2 - alpha) PO - (1 - alpha) psi` instead of
@@ -270,7 +270,7 @@ pub unsafe fn cols<const NY: u32>(p: FusedPtrs, ctl: *const StackCtl, g: StackGe
         thread::sync_threads();
         let inv_n = 1.0 / n as f32;
         let tile = tile.cast::<u16>();
-        let mut acc = [0.0f32; 4];
+        let mut acc = LlkPartial::default();
         #[unroll]
         for i in 0..FFT_EPT {
             let v = f + i * tpf;
@@ -280,17 +280,7 @@ pub unsafe fn cols<const NY: u32>(p: FusedPtrs, ctl: *const StackCtl, g: StackGe
             }
             let obs = *tile.add((((v + ny / 2) % ny) * FUSED_COLS + c) as usize);
             if llk && m == 0 && obs != MASKED {
-                let obs = obs as f32;
-                let calc = (s * inv_n).max(0.0);
-                acc[0] += if obs <= 0.1 {
-                    calc
-                } else {
-                    calc - obs + obs * (obs / calc).ln()
-                };
-                acc[1] += (obs - calc) * (obs - calc) / (obs + 1.0);
-                let e = obs.sqrt() - calc.sqrt();
-                acc[2] += 4.0 * e * e;
-                acc[3] += calc;
+                llk_add(&mut acc, obs as f32, (s * inv_n).max(0.0));
             }
             if project {
                 let scale = if obs == MASKED {
@@ -314,7 +304,8 @@ pub unsafe fn cols<const NY: u32>(p: FusedPtrs, ctl: *const StackCtl, g: StackGe
         if llk {
             // Mode 0's threads are `tid < nslot`; a fixed tree over them per term.
             if m == 0 {
-                for (j, &a) in acc.iter().enumerate() {
+                let terms = [acc.poisson, acc.gaussian, acc.euclidean, acc.icalc];
+                for (j, &a) in terms.iter().enumerate() {
                     *slots.add(j * nslot as usize + tid as usize) = a;
                 }
             }
