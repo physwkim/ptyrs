@@ -1,9 +1,8 @@
 use ptyrs_core::{C64, Geometry, Object, Probe, Scan, Stack, required_obj_shape};
-use ptyrs_engine::{
-    Algorithm, ApParams, DmParams, Ptycho, RpieParams, obj_probe_to_psi, quad_phase,
-};
+use ptyrs_engine::{Algorithm, ApParams, DmParams, LlkRecord, MlParams, Ptycho, RpieParams};
 
 mod common;
+mod ptychi;
 
 const PHOTONS: f64 = 1e5;
 
@@ -11,6 +10,8 @@ struct Case {
     scan: Scan,
     object: Object,
     probe: Probe,
+    /// Poisson LLK of the truth at the photon scale of the counts: the noise floor.
+    truth: f64,
 }
 
 /// 40 Fermat positions, 32x32 frames, `PHOTONS` per frame.
@@ -30,12 +31,14 @@ fn case_with(frame: usize, nmode: usize, masked: bool) -> Case {
             .map(|i| i % frame == 20 || i / frame == 3)
             .collect()
     });
-    let scan =
-        ptyrs_engine::sim::simulate(g, pos, &object, &probe, PHOTONS, mask.as_deref(), 7).unwrap();
+    let sim =
+        ptyrs_engine::sim::simulate_truth(g, pos, &object, &probe, PHOTONS, mask.as_deref(), 7)
+            .unwrap();
     Case {
-        scan,
+        scan: sim.scan,
         object,
         probe,
+        truth: sim.truth_llk.poisson,
     }
 }
 
@@ -43,43 +46,27 @@ fn flat_object(o: &Object) -> Object {
     Object::new(Stack::filled(o.dims(), C64::new(1.0, 0.0)))
 }
 
-/// Poisson LLK of the truth at the photon scale `simulate` used: the noise floor.
-fn truth_llk(c: &Case) -> f64 {
-    let p = Ptycho::new(&c.scan, c.object.clone(), c.probe.clone()).unwrap();
-    let views = p.addr().views();
-    let mut psi = vec![C64::default(); views.len() * c.probe.plane_len()];
-    let q = quad_phase(&c.scan.geometry);
-    obj_probe_to_psi(views, &c.object, &c.probe, &q, &mut psi);
-    let calc: f64 = psi.iter().map(|v| v.norm_sqr()).sum();
-    let s = (PHOTONS * p.addr().nframe() as f64 / calc).sqrt();
-    let mut probe = c.probe.clone();
-    probe.as_mut_slice().iter_mut().for_each(|v| *v *= s);
-    Ptycho::new(&c.scan, c.object.clone(), probe)
-        .unwrap()
-        .llk()
-        .poisson
-}
-
 fn rel(a: f64, b: f64) -> f64 {
     (a - b).abs() / b.abs()
 }
 
+/// With and without masked pixels, the scaled calculated photons over the unmasked pixels
+/// are the observed ones there.
 #[test]
 fn scale_obj_probe_matches_observed_photons() {
-    let c = case(1, true);
-    let mut p = Ptycho::new(&c.scan, flat_object(&c.object), c.probe.clone()).unwrap();
-    p.scale_obj_probe();
-    // the scale matches every calculated pixel to the unmasked observations; the LLK photon
-    // sum leaves the masked pixels out, so it falls short
-    assert!(p.llk().nb_photons_calc < p.observed().total());
-    let c0 = case(1, false);
-    let mut p = Ptycho::new(&c0.scan, flat_object(&c0.object), c0.probe.clone()).unwrap();
-    p.scale_obj_probe();
-    let l = p.llk();
-    assert!(rel(l.nb_photons_calc, p.observed().total()) < 1e-12);
-    let os: f64 = p.object().as_slice().iter().map(|c| c.norm()).sum();
-    let ps: f64 = p.probe().as_slice().iter().map(|c| c.norm()).sum();
-    assert!(rel(os, ps) < 1e-12);
+    for masked in [true, false] {
+        let c = case(1, masked);
+        let mut p = Ptycho::new(&c.scan, flat_object(&c.object), c.probe.clone()).unwrap();
+        p.scale_obj_probe();
+        let got = p.llk().nb_photons_calc;
+        assert!(
+            rel(got, p.observed().total()) < 1e-12,
+            "masked {masked}: {got}"
+        );
+        let os: f64 = p.object().as_slice().iter().map(|c| c.norm()).sum();
+        let ps: f64 = p.probe().as_slice().iter().map(|c| c.norm()).sum();
+        assert!(rel(os, ps) < 1e-12);
+    }
 }
 
 #[test]
@@ -118,7 +105,7 @@ fn zero_phase_ramp_keeps_llk_and_removes_a_probe_tilt() {
 #[test]
 fn dm_converges_and_records_on_schedule() {
     let c = case(1, false);
-    let truth = truth_llk(&c);
+    let truth = c.truth;
     let mut p = Ptycho::new(&c.scan, flat_object(&c.object), c.probe.clone()).unwrap();
     p.scale_obj_probe();
     let start = p.llk().poisson;
@@ -145,15 +132,16 @@ fn parity_start() -> Ptycho {
     p
 }
 
-/// `table` rows: cycle, then the normalised Poisson, Gaussian, Euclidian LLK and photon count.
-fn assert_history_matches(p: &Ptycho, table: &str) {
+/// `table` rows: cycle, then the normalised Poisson, Gaussian, Euclidian LLK and photon count;
+/// record `k` of `history` against row `k`, at the row's cycle + `lag`.
+fn assert_history_matches(history: &[LlkRecord], lag: usize, table: &str) {
     let rows: Vec<Vec<f64>> = table
         .lines()
         .map(|l| l.split_whitespace().map(|v| v.parse().unwrap()).collect())
         .collect();
-    assert_eq!(p.history().len(), rows.len());
-    for (r, row) in p.history().iter().zip(&rows) {
-        assert_eq!(r.cycle as f64, row[0]);
+    assert_eq!(history.len(), rows.len());
+    for (r, row) in history.iter().zip(&rows) {
+        assert_eq!(r.cycle as f64, row[0] + lag as f64);
         let l = r.llk;
         for (a, b) in [l.poisson, l.gaussian, l.euclidian, l.nb_photons_calc]
             .into_iter()
@@ -170,16 +158,21 @@ fn assert_history_matches(p: &Ptycho, table: &str) {
 
 /// DM against PyNX `cpu_operator` promoted to f64 (`scripts/compare_pynx.py <dir> dm`),
 /// cycles 0-19 of `cargo run --release -p ptyrs-engine --example llk_trace -- <dir> dm 20 1 32
-/// 40`, saved from `<dir>/llk_pynx_dm_f64.txt` to `tests/data/dm_pynx_f64.txt`.
+/// 40`, saved from `<dir>/llk_pynx_dm_f64.txt` to `tests/data/dm_pynx_f64.txt`. That DM
+/// records the estimate after the cycle's update, so its cycle `c` is the record of `c + 1`
+/// here, and record 0 is the start.
 #[test]
 fn dm_llk_matches_pynx() {
     let mut p = parity_start();
+    let start = p.llk();
     let params = DmParams {
         calc_llk: 1,
         ..DmParams::default()
     };
-    p.dm(&params, 20);
-    assert_history_matches(&p, include_str!("data/dm_pynx_f64.txt"));
+    p.dm(&params, 21);
+    let (first, rest) = p.history().split_first().unwrap();
+    assert_eq!((first.cycle, first.llk), (0, start));
+    assert_history_matches(rest, 1, include_str!("data/dm_pynx_f64.txt"));
 }
 
 /// rPIE against pty-chi `RPIEReconstructor` in f64 (`scripts/compare_ptychi_rpie.py <dir>`),
@@ -188,14 +181,54 @@ fn dm_llk_matches_pynx() {
 #[test]
 fn rpie_llk_matches_ptychi() {
     let mut p = parity_start();
-    p.rpie(&common::RPIE, 20).unwrap();
-    assert_history_matches(&p, include_str!("data/rpie_ptychi_f64.txt"));
+    p.rpie(&ptychi::RPIE, 20).unwrap();
+    assert_history_matches(p.history(), 0, include_str!("data/rpie_ptychi_f64.txt"));
+}
+
+/// [`Ptycho::obj_grad`] and the LLK against the float64 model written independently in
+/// m3/solve's `refs/f64/ml_grad.py <dir>` (checked there by central differences, PyNX
+/// `cpu_operator` and pty-chi autograd) on the scaled start of `llk_trace -- <dir> dm 1 2 32 40
+/// 4`, saved from `<dir>/ml_grad_f64.txt` (`iy ix re im` per object pixel) and
+/// `<dir>/ml_grad_values_f64.txt` (`nb_obs` and the unnormalised Poisson sum).
+#[test]
+fn obj_grad_matches_ml_grad_reference() {
+    let (scan, object, probe) = common::dm_scenario(32, 40, 2, 2e5, 4.0);
+    let mut p = Ptycho::new(&scan, object, probe).unwrap();
+    p.scale_obj_probe();
+    let values: Vec<f64> = include_str!("data/ml_grad_values_f64.txt")
+        .split_whitespace()
+        .map(|v| v.parse().unwrap())
+        .collect();
+    let [nb_obs, sum] = values[..] else {
+        panic!("values: {values:?}")
+    };
+    let llk = p.llk().poisson * nb_obs;
+    assert!(rel(llk, sum) < 1e-12, "LLK sum: rust {llk} reference {sum}");
+
+    let g = p.obj_grad();
+    let [_, ny, nx] = g.dims();
+    let mut rows = 0;
+    let (mut err, mut max) = (0f64, 0f64);
+    for l in include_str!("data/ml_grad_f64.txt").lines() {
+        let v: Vec<f64> = l.split_whitespace().map(|v| v.parse().unwrap()).collect();
+        let want = C64::new(v[2], v[3]);
+        let got = g.as_slice()[v[0] as usize * nx + v[1] as usize];
+        err = err.max((got - want).norm());
+        max = max.max(want.norm());
+        rows += 1;
+    }
+    assert_eq!((g.dims()[0], rows), (1, ny * nx));
+    eprintln!(
+        "obj_grad: max |rust - reference| / max |reference| {:.2e}",
+        err / max
+    );
+    assert!(err < 1e-12 * max, "{err:e} of {max:e}");
 }
 
 #[test]
 fn ap_object_only_converges() {
     let c = case(2, true);
-    let truth = truth_llk(&c);
+    let truth = c.truth;
     let mut p = Ptycho::new(&c.scan, flat_object(&c.object), c.probe.clone()).unwrap();
     p.scale_obj_probe();
     let params = ApParams {
@@ -212,9 +245,41 @@ fn ap_object_only_converges() {
 }
 
 #[test]
+fn ml_after_ap_descends_below_the_truth() {
+    let c = case(2, true);
+    let truth = c.truth;
+    let mut p = Ptycho::new(&c.scan, flat_object(&c.object), c.probe.clone()).unwrap();
+    p.scale_obj_probe();
+    p.ap(&ApParams::default(), 20);
+    let params = MlParams {
+        update_probe: true,
+        calc_llk: 1,
+        ..MlParams::default()
+    };
+    p.ml(&params, 40);
+    let h = p.history();
+    assert_eq!(
+        h.iter().map(|r| r.cycle).collect::<Vec<_>>(),
+        (20..60).collect::<Vec<_>>()
+    );
+    assert!(h.iter().all(|r| r.algorithm == Algorithm::Ml));
+    // ML records the LLK before each update
+    for w in h.windows(2) {
+        assert!(w[1].llk.poisson < w[0].llk.poisson, "{w:?}");
+    }
+    // the noise is fitted too, so ML ends below the LLK of the truth
+    let end = p.llk().poisson;
+    assert!(
+        end < truth,
+        "start {} end {end} truth {truth}",
+        h[0].llk.poisson
+    );
+}
+
+#[test]
 fn rpie_converges() {
     let c = case(1, true);
-    let truth = truth_llk(&c);
+    let truth = c.truth;
     let mut p = Ptycho::new(&c.scan, flat_object(&c.object), c.probe.clone()).unwrap();
     p.scale_obj_probe();
     // pty-chi sums overlapping updates in a batch, so the default step 1 / alpha 0.1 diverges

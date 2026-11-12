@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["ptyrs-core", "ptyrs-engine", "ptyrs-fft", "ptyrs-gpu", "ptyrs-io", "ptyrs-kernels", "ptyrs-live", "ptyrs-tile"]
+members = ["ptyrs-core", "ptyrs-engine", "ptyrs-fft", "ptyrs-gpu", "ptyrs-io", "ptyrs-kernels", "ptyrs-live", "ptyrs-refgen", "ptyrs-tile"]
 
 [workspace.package]
 version = "0.0.1"

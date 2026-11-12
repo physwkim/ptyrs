@@ -52,9 +52,12 @@ use std::ops::Range;
 
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::sys::CUdeviceptr;
-use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig, RawDeviceBuffer};
+use cuda_core::{CudaStream, DeviceBuffer, DeviceCopy, LaunchConfig, RawDeviceBuffer};
+use ptyrs_kernels::pixel::{
+    LLK_CHUNK, PIXEL_THREADS, STACK_TILE_CANDIDATES, SumPtrs, TilePtrs, TileSlabs, WARP,
+    axis_tiles, axis_tiles_max,
+};
 pub use ptyrs_kernels::pixel::{LlkPartial, MASKED, OBJ_TILE, StackCtl, StackGeom, ViewAddr};
-use ptyrs_kernels::pixel::{PIXEL_THREADS, SumPtrs, TilePtrs, TileSlabs, WARP, axis_tiles};
 
 use crate::{C32, Error, Kernels, check_len, dptr};
 
@@ -119,6 +122,26 @@ impl ViewDims {
         }
     }
 
+    /// The launch of the per-stack object kernels for stacks of at most `nf_max` frames:
+    /// [`STACK_TILE_CANDIDATES`] tiles of the frames' [`axis_tiles`] boxes per
+    /// `(OBJ_TILE, OBJ_TILE)` block and object mode, so the grid scales with the stack, not
+    /// with the object.
+    pub(crate) fn stack_tile_grid(&self, nf_max: u32) -> Result<LaunchConfig, Error> {
+        let [ny, nx] = self.frame;
+        let ncand = u64::from(nf_max) * u64::from(axis_tiles_max(ny) * axis_tiles_max(nx));
+        let gx = ncand.div_ceil(STACK_TILE_CANDIDATES.into());
+        if ncand > u64::from(u32::MAX) || gx > i32::MAX as u64 {
+            return Err(Error::Shape(format!(
+                "{self:?}: {nf_max} frames per stack exceed the object-gather grid"
+            )));
+        }
+        Ok(LaunchConfig {
+            grid_dim: (gx as u32, 1, self.nobj),
+            block_dim: (OBJ_TILE, OBJ_TILE, 1),
+            shared_mem_bytes: 0,
+        })
+    }
+
     pub(crate) fn check(&self) -> Result<(), Error> {
         let [ny, nx] = self.frame;
         let [nyo, nxo] = self.obj;
@@ -160,8 +183,16 @@ impl ViewDims {
             )));
         }
         Ok(StackGeom {
-            nframe: self.nframe,
             nf_max: t.nf_max,
+            ..self.scan_geom()
+        })
+    }
+
+    /// The geometry of the whole scan as one stack, for checked dims.
+    fn scan_geom(&self) -> StackGeom {
+        StackGeom {
+            nframe: self.nframe,
+            nf_max: self.nframe,
             nmode: self.nmode,
             nprobe: self.nprobe,
             ny: self.frame[0],
@@ -169,7 +200,7 @@ impl ViewDims {
             nyo: self.obj[0],
             nxo: self.obj[1],
             quad: self.quad_phase,
-        })
+        }
     }
 }
 
@@ -371,6 +402,26 @@ impl Views {
         })
     }
 
+    /// Views for [`Kernels::reorder_views`] of `src`: its dims, frames and tile slabs, so
+    /// each tile's capacity, with every run empty until a reorder fills them.
+    pub fn reordered(stream: &CudaStream, src: &Views) -> Result<Self, Error> {
+        fn copy<T: DeviceCopy>(
+            stream: &CudaStream,
+            from: &DeviceBuffer<T>,
+        ) -> Result<DeviceBuffer<T>, Error> {
+            let mut to = DeviceBuffer::zeroed(stream, from.len())?;
+            to.copy_from_device_async(from, stream)?;
+            Ok(to)
+        }
+        Ok(Self {
+            dims: src.dims,
+            addr: copy(stream, &src.addr)?,
+            tile_start: copy(stream, &src.tile_start)?,
+            tile_views: DeviceBuffer::zeroed(stream, src.tile_views.len())?,
+            tile_len: DeviceBuffer::zeroed(stream, src.tile_len.len())?,
+        })
+    }
+
     pub fn dims(&self) -> &ViewDims {
         &self.dims
     }
@@ -398,6 +449,14 @@ impl Views {
 
     pub(crate) fn tile_ptrs(&self) -> TilePtrs {
         TilePtrs {
+            start: dptr(&self.tile_start),
+            len: dptr(&self.tile_len),
+            views: dptr(&self.tile_views),
+        }
+    }
+
+    fn tile_slabs(&self) -> TileSlabs {
+        TileSlabs {
             start: dptr(&self.tile_start),
             len: dptr(&self.tile_len),
             views: dptr(&self.tile_views),
@@ -497,6 +556,34 @@ impl LlkSums {
             }
         }
     }
+}
+
+/// The per-chunk sums [`Kernels::llk`] reduces each frame through, for stacks of up to
+/// `nf_max` frames of one scan's [`ViewDims`]; one serves every stack in turn.
+pub struct LlkScratch {
+    dims: ViewDims,
+    /// `[nf_max, llk_chunks(n)]`.
+    chunks: DeviceBuffer<LlkPartial>,
+}
+
+impl LlkScratch {
+    pub fn new(stream: &CudaStream, dims: &ViewDims, nf_max: u32) -> Result<Self, Error> {
+        dims.check()?;
+        if nf_max == 0 {
+            return Err(Error::Shape("nf_max is zero".into()));
+        }
+        let len = nf_max as usize * llk_chunks(dims.n()) as usize;
+        Ok(Self {
+            dims: *dims,
+            chunks: DeviceBuffer::zeroed(stream, len)?,
+        })
+    }
+}
+
+/// Chunks of [`LLK_CHUNK`] pixels per frame of `n` pixels.
+fn llk_chunks(n: usize) -> u32 {
+    // `n <= 32768^2`, so at most 2^19 chunks.
+    n.div_ceil(LLK_CHUNK as usize) as u32
 }
 
 /// Pairwise total of `block` padded with `+0.0` to [`LLK_TREE_LEAVES`] nodes.
@@ -641,36 +728,81 @@ impl Kernels {
     /// `LLKAll`, no background): `out[fl]`, `fl < nf`, gets, over the unmasked pixels of
     /// frame `f0 + fl`, with `calc = sum_m |Psi_m|^2 / n`: Poisson `calc` if `obs == 0`
     /// else `calc - obs + obs ln(obs / calc)`; Gaussian `(obs - calc)^2 / (obs + 1)`;
-    /// Euclidean `4 (sqrt obs - sqrt calc)^2`; and `calc`. Each frame's sum is a fixed-order
-    /// block reduction; total with [`LlkSums::from_partials`]. `out` holds `nf_max` records.
+    /// Euclidean `4 (sqrt obs - sqrt calc)^2`; and `calc`. Each frame's sum is fixed-order:
+    /// one block reduction per chunk of `LLK_CHUNK` contiguous pixels into `scratch`, then
+    /// the chunks in ascending order; total with [`LlkSums::from_partials`]. The scan's
+    /// dims are the ones `scratch` was made for; `out` holds `nf_max` records. Two launches.
     pub fn llk(
         &self,
         ctx: &ExecutionContext,
-        dims: &ViewDims,
         stack: StackRef<'_>,
         counts: &DeviceBuffer<u16>,
         psi: &DeviceBuffer<C32>,
+        scratch: &mut LlkScratch,
         out: &mut DeviceBuffer<LlkPartial>,
     ) -> Result<(), Error> {
+        let dims = &scratch.dims;
         let g = dims.geom(stack)?;
         let n = dims.n();
+        let nchunk = llk_chunks(n);
         check_len("counts", counts, dims.nframe as usize * n)?;
         check_len("psi", psi, g.nf_max as usize * dims.nmode as usize * n)?;
+        check_len(
+            "scratch",
+            &scratch.chunks,
+            g.nf_max as usize * nchunk as usize,
+        )?;
         check_len("out", out, g.nf_max as usize)?;
+        if g.nf_max > u16::MAX as u32 {
+            return Err(Error::Shape(format!("{} frames exceed grid y", g.nf_max)));
+        }
         let config = LaunchConfig {
-            grid_dim: (g.nf_max, 1, 1),
+            grid_dim: (nchunk, g.nf_max, 1),
             block_dim: (PIXEL_THREADS, 1, 1),
             shared_mem_bytes: 0,
         };
         let reads = [counts.storage(), psi.storage(), stack.storage()];
-        self.launch(ctx, &reads, &[out.storage()], |stream| {
-            // SAFETY: lengths checked above; one block of PIXEL_THREADS per frame.
+        self.launch(ctx, &reads, &[scratch.chunks.storage()], |stream| {
+            // SAFETY: lengths checked above; one block of PIXEL_THREADS per chunk and frame.
             unsafe {
                 self.module.llk(
                     stream,
                     config,
                     dptr(psi),
                     dptr(counts),
+                    dptr(&scratch.chunks),
+                    stack.ctl() as *const StackCtl,
+                    g,
+                )
+            }
+        })?;
+        self.llk_groups(ctx, stack, g, &scratch.chunks, nchunk, out)
+    }
+
+    /// `out[fl]`, `fl < nf`, gets the sum of `groups[fl * ngroup .. (fl + 1) * ngroup]` in
+    /// ascending order.
+    pub(crate) fn llk_groups(
+        &self,
+        ctx: &ExecutionContext,
+        stack: StackRef<'_>,
+        g: StackGeom,
+        groups: &DeviceBuffer<LlkPartial>,
+        ngroup: u32,
+        out: &mut DeviceBuffer<LlkPartial>,
+    ) -> Result<(), Error> {
+        let nf_max = g.nf_max as usize;
+        check_len("groups", groups, nf_max * ngroup as usize)?;
+        check_len("out", out, nf_max)?;
+        let config = grid_1d(nf_max)?;
+        let reads = [groups.storage(), stack.storage()];
+        self.launch(ctx, &reads, &[out.storage()], |stream| {
+            // SAFETY: `groups` holds `nf_max * ngroup` records, `out` `nf_max`.
+            unsafe {
+                self.module.llk_groups(
+                    stream,
+                    config,
+                    dptr(groups),
+                    ngroup,
                     dptr(out),
                     stack.ctl() as *const StackCtl,
                     g,
@@ -706,11 +838,7 @@ impl Kernels {
             views.tile_views.storage(),
             overflow.storage(),
         ];
-        let slabs = TileSlabs {
-            start: dptr(&views.tile_start),
-            len: dptr(&views.tile_len),
-            views: dptr(&views.tile_views),
-        };
+        let slabs = views.tile_slabs();
         self.launch(ctx, &reads, &writes, |stream| {
             // SAFETY: `Views::new` or the `from_parts` contract keeps the views inside the
             // object and each run within its slab; `overflow` holds one u32.
@@ -724,6 +852,62 @@ impl Kernels {
                     stack.ctl() as *const StackCtl,
                     g,
                 )
+            }
+        })
+    }
+
+    /// Fills `dst` with `src`'s frames in `order`, frame `p` of `dst` being frame `order[p]`
+    /// of `src`, and rebuilds every run of `dst` as [`Self::bin_views`] over all frames
+    /// would, so they are the runs [`Views::new`] makes of the reordered frames. A gather, a
+    /// memset and a bin launch, stream-ordered with no host sync, so a graph can capture
+    /// them. When they run, `order` holds a permutation of `0 .. nframe` and `dst`'s slabs
+    /// hold every tile's views, as [`Views::reordered`] of `src` gives when `src`'s runs hold
+    /// all its views; otherwise the launches stay in bounds but `dst`'s frames and runs are
+    /// unspecified.
+    pub fn reorder_views(
+        &self,
+        ctx: &ExecutionContext,
+        src: &Views,
+        order: &DeviceBuffer<u32>,
+        dst: &mut Views,
+    ) -> Result<(), Error> {
+        let d = &src.dims;
+        if dst.dims != *d {
+            return Err(Error::Shape(format!(
+                "reorder of {d:?} into {:?}",
+                dst.dims
+            )));
+        }
+        check_len("order", order, d.nframe as usize)?;
+        let config = grid_1d(d.nframe as usize * d.nmode as usize)?;
+        let reads = [src.addr.storage(), order.storage()];
+        self.launch(ctx, &reads, &[dst.addr.storage()], |stream| {
+            // SAFETY: `src` and `dst` own separate `nframe * nmode` records; `order` holds
+            // `nframe` entries.
+            unsafe {
+                self.module.gather_frames(
+                    stream,
+                    config,
+                    dptr(&src.addr),
+                    dptr(order),
+                    dptr(&dst.addr),
+                    d.nframe,
+                    d.nmode,
+                )
+            }
+        })?;
+        crate::zero(ctx, &mut dst.tile_len)?;
+        let config = grid_1d(d.ntiles() * WARP as usize)?;
+        let reads = [dst.addr.storage(), dst.tile_start.storage()];
+        let writes = [dst.tile_len.storage(), dst.tile_views.storage()];
+        let (slabs, g) = (dst.tile_slabs(), d.scan_geom());
+        self.launch(ctx, &reads, &writes, |stream| {
+            // SAFETY: every view of `dst` is one it held or one of `src`'s, each of the same
+            // dims and inside the object by `Views::new` or the `from_parts` contract; the
+            // runs start empty, each within its slab.
+            unsafe {
+                self.module
+                    .bin_all_views(stream, config, dptr(&dst.addr), slabs, g)
             }
         })
     }
@@ -748,7 +932,7 @@ impl Kernels {
         check_len("psi", psi, g.nf_max as usize * d.nmode as usize * n)?;
         check_len("probe", probe, d.nprobe as usize * n)?;
         sums.check(d.obj_len())?;
-        let config = d.tile_grid();
+        let config = d.stack_tile_grid(g.nf_max)?;
         let [start, len, list] = views.tile_storages();
         let reads = [
             psi.storage(),

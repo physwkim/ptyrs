@@ -1834,6 +1834,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "ptyrs-refgen"
+version = "0.0.1"
+dependencies = [
+ "ptyrs-core",
+ "ptyrs-io",
+ "rand",
+ "rand_chacha",
+ "rand_distr",
+ "rustfft",
+ "serde_json",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "ptyrs-tile"
 version = "0.0.1"
 dependencies = [

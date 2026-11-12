@@ -1,4 +1,7 @@
 //! M0 smoke: a cuda-oxide kernel built from a ptyrs workspace member runs on this GPU.
+//!
+//! Run with `cargo oxide run --arch=sm_89 --bin m0_smoke`; a plain cargo build embeds no
+//! module to load.
 
 use cuda_async::device_context::{init_device_contexts, with_cuda_context};
 use cuda_async::device_operation::DeviceOperation;
@@ -27,7 +30,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use std::mem;
 
     init_device_contexts(0, 1)?;
-    let module = kernels::load_async(0)?;
+    // Not `kernels::load_async`: it finds the bundle through an anchor symbol that only the
+    // cuda-oxide backend defines, so a plain cargo build of the workspace could not link.
+    let module = cuda_host::load_cuda_module_from_async_context(0, |ctx| {
+        let module = cuda_host::load_embedded_module(ctx, env!("CARGO_PKG_NAME"))?;
+        kernels::from_module(module).map_err(cuda_host::EmbeddedModuleError::Driver)
+    })?;
 
     const N: usize = 1024;
     let a_host: Vec<f32> = (0..N).map(|i| i as f32).collect();

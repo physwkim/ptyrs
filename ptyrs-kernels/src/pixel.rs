@@ -14,6 +14,9 @@ pub const OBJ_TILE: u32 = 16;
 pub const PIXEL_THREADS: u32 = 256;
 /// Count value of a masked pixel (`ptyrs-core` `MASKED`).
 pub const MASKED: u16 = u16::MAX;
+/// Pixels per block of the M1 LLK kernel: a frame of `n` pixels is `ceil(n / LLK_CHUNK)`
+/// contiguous chunks, the last one short.
+pub const LLK_CHUNK: u32 = 2048;
 
 /// One exit-wave view (PyNX `cx, cy` + `_obj_psidx`, `_probe_psidx`): probe mode `probe`
 /// times object mode `obj` sampled at `(oy + fy + pry, ox + fx + prx)` for probe pixel
@@ -162,7 +165,26 @@ pub fn axis_tiles(o: u32, len: u32, f: f32) -> (u32, u32) {
     (o / OBJ_TILE, last / OBJ_TILE)
 }
 
-/// Per-frame log-likelihood sums over the frame's unmasked pixels (PyNX `LLKAll`).
+/// The most tiles [`axis_tiles`] gives a view of `len` pixels along one axis.
+#[device]
+pub fn axis_tiles_max(len: u32) -> u32 {
+    len.div_ceil(OBJ_TILE) + 1
+}
+
+/// Candidate tiles each block of a stack-tile launch tests: with overlapping frames most
+/// candidates are not owners, so few per block keeps most blocks at one owned tile or none.
+pub const STACK_TILE_CANDIDATES: u32 = 2;
+
+/// Whether [`axis_tiles`] puts view `v` of `[ny, nx]` pixels in object tile `(ty, tx)`.
+#[device]
+pub fn view_in_tile(v: ViewAddr, ty: u32, tx: u32, ny: u32, nx: u32) -> bool {
+    let (y0, y1) = axis_tiles(v.oy, ny, v.fy);
+    let (x0, x1) = axis_tiles(v.ox, nx, v.fx);
+    y0 <= ty && ty <= y1 && x0 <= tx && tx <= x1
+}
+
+/// Log-likelihood sums over unmasked pixels of one frame, or of a chunk or column group of
+/// one (PyNX `LLKAll`).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct LlkPartial {
@@ -202,25 +224,28 @@ pub fn cmul_conj(a: (f32, f32), b: (f32, f32)) -> (f32, f32) {
     (a.0 * b.0 + a.1 * b.1, a.0 * b.1 - a.1 * b.0)
 }
 
+/// One interleaved complex value, so that it moves as one 8-byte access, not two.
+#[repr(C, align(8))]
+#[derive(Clone, Copy)]
+struct F2(f32, f32);
+
 /// Complex value `i` of an interleaved buffer.
 ///
 /// # Safety
 ///
-/// `p` must hold `i + 1` complex values.
+/// `p` must hold `i + 1` complex values and be 8-byte aligned.
 #[device]
 pub unsafe fn load_c(p: *const f32, i: usize) -> (f32, f32) {
-    unsafe { (*p.add(2 * i), *p.add(2 * i + 1)) }
+    let v = unsafe { *p.cast::<F2>().add(i) };
+    (v.0, v.1)
 }
 
 /// # Safety
 ///
-/// `p` must hold `i + 1` complex values.
+/// `p` must hold `i + 1` complex values and be 8-byte aligned.
 #[device]
 pub unsafe fn store_c(p: *mut f32, i: usize, v: (f32, f32)) {
-    unsafe {
-        *p.add(2 * i) = v.0;
-        *p.add(2 * i + 1) = v.1;
-    }
+    unsafe { *p.cast::<F2>().add(i) = F2(v.0, v.1) };
 }
 
 /// Bilinear weights of the four object pixels a sample reads, in the order
@@ -277,17 +302,19 @@ pub unsafe fn sample_obj(
     }
 }
 
-/// The probe pixels of view `v` whose bilinear sample reads object pixel `(y, x)`, as
-/// `(pry, prx, weight)` in [`bilinear_weights`] order; `None` where no such pixel exists or
-/// the weight is zero. This is the exact transpose of [`sample_obj`].
+/// Calls `f(pry, prx, weight)` for each probe pixel of view `v` whose bilinear sample reads
+/// object pixel `(y, x)`, in [`bilinear_weights`] order, skipping corners outside the frame
+/// or of zero weight. This is the exact transpose of [`sample_obj`]. A visitor, not an
+/// array of sources: kernels kept such an array in local memory.
 #[device]
-pub fn obj_pixel_sources(
+pub fn obj_pixel_sources<F: FnMut(u32, u32, f32)>(
     v: ViewAddr,
     y: u32,
     x: u32,
     ny: u32,
     nx: u32,
-) -> [Option<(u32, u32, f32)>; 4] {
+    mut f: F,
+) {
     // Row offset of `y` in the view (`y0 = oy + pry`), and of the row whose `+ 1`
     // neighbour is `y`; likewise for columns. An offset below zero wraps past every frame
     // side, so `pick` drops it.
@@ -295,17 +322,13 @@ pub fn obj_pixel_sources(
     let c = x.wrapping_sub(v.ox);
     let (rm, cm) = (r.wrapping_sub(1), c.wrapping_sub(1));
     let w = bilinear_weights(v.fy, v.fx);
-    let pick = |pry: u32, prx: u32, wt: f32, used: bool| {
+    let mut pick = |pry: u32, prx: u32, wt: f32, used: bool| {
         if used && pry < ny && prx < nx {
-            Some((pry, prx, wt))
-        } else {
-            None
+            f(pry, prx, wt);
         }
     };
-    [
-        pick(r, c, w[0], true),
-        pick(r, cm, w[1], v.fx != 0.0),
-        pick(rm, c, w[2], v.fy != 0.0),
-        pick(rm, cm, w[3], v.fy != 0.0 && v.fx != 0.0),
-    ]
+    pick(r, c, w[0], true);
+    pick(r, cm, w[1], v.fx != 0.0);
+    pick(rm, c, w[2], v.fy != 0.0);
+    pick(rm, cm, w[3], v.fy != 0.0 && v.fx != 0.0);
 }

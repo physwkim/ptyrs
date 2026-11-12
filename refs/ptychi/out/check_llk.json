@@ -1,0 +1,194 @@
+{
+ "tol": 1e-05,
+ "worst_rel": 9.526369370122007e-07,
+ "environment": {
+  "ptychi": "0.0.0",
+  "torch": "2.14.1+cu130",
+  "gpu": "NVIDIA RTX 5000 Ada Generation",
+  "gpu_uuid": "GPU-fdf6033d-b702-4876-ce32-4b60eba986ef",
+  "cuda_visible_devices": "GPU-fdf6033d-b702-4876-ce32-4b60eba986ef",
+  "host": "sm-gpu"
+ },
+ "checks": [
+  {
+   "dataset": "fermat_clean",
+   "state": "truth",
+   "pynx_cpu_f32": {
+    "poisson": 0.30676621198654175,
+    "gaussian": 0.22107264399528503,
+    "euclidian": 0.8035963773727417
+   },
+   "numpy_f64": {
+    "poisson": 0.306766211518611,
+    "gaussian": 0.22107267010397919,
+    "euclidian": 0.8035964490034645
+   },
+   "ptychi_eval": {
+    "poisson": 0.30676621197077075,
+    "gaussian": 0.22107255502049603,
+    "euclidian": 0.8035962705010087,
+    "poisson_floor_share": 0.0,
+    "native_mse_sqrt": 0.20073306813105107,
+    "native_poisson_nll": -99.62344604261061,
+    "nb_obs": 67108864
+   },
+   "asserted": [
+    "poisson",
+    "gaussian",
+    "euclidian"
+   ],
+   "rel_ptychi_vs_f64": {
+    "poisson": 1.473955530645325e-09,
+    "gaussian": 5.205685673660045e-07,
+    "euclidian": 2.2212947311785708e-07
+   },
+   "rel_pynx_vs_f64": {
+    "poisson": 1.5253660022956543e-09,
+    "gaussian": 1.1810005342955635e-07,
+    "euclidian": 8.913767959842111e-08
+   },
+   "rel_4mse_sqrt_vs_euclidian": 0.0008262830493108336,
+   "generator_llk_truth": {
+    "euclidian": 0.8035964490037332,
+    "gaussian": 0.2210726701039632,
+    "nb_obs": 67108864,
+    "poisson": 0.30676621151857625
+   },
+   "rel_f64_vs_generator": {
+    "poisson": 1.1327838388310608e-13,
+    "gaussian": 7.231654436110983e-14,
+    "euclidian": 3.3433942159945973e-13
+   },
+   "worst_asserted_rel": 5.205685673660045e-07
+  },
+  {
+   "dataset": "fermat_clean",
+   "state": "init",
+   "pynx_cpu_f32": {
+    "poisson": null,
+    "gaussian": 4.235622882843018,
+    "euclidian": 6.165374755859375
+   },
+   "numpy_f64": {
+    "poisson": 21.675078890234836,
+    "gaussian": 4.23562360123725,
+    "euclidian": 6.165375686201613
+   },
+   "ptychi_eval": {
+    "poisson": 18.293952378482743,
+    "gaussian": 4.235619566225756,
+    "euclidian": 6.165373512401194,
+    "poisson_floor_share": 0.7363148505324432,
+    "native_mse_sqrt": 1.5411450510043956,
+    "native_poisson_nll": -85.78713854544479,
+    "nb_obs": 67108864
+   },
+   "asserted": [
+    "gaussian",
+    "euclidian"
+   ],
+   "rel_ptychi_vs_f64": {
+    "poisson": 0.15599142816847486,
+    "gaussian": 9.526369370122007e-07,
+    "euclidian": 3.5258198841736057e-07
+   },
+   "rel_pynx_vs_f64": {
+    "poisson": null,
+    "gaussian": 1.696076657737538e-07,
+    "euclidian": 1.5089789905210797e-07
+   },
+   "rel_4mse_sqrt_vs_euclidian": 0.0001286715852682924,
+   "worst_asserted_rel": 9.526369370122007e-07
+  },
+  {
+   "dataset": "raster_clean",
+   "state": "truth",
+   "pynx_cpu_f32": {
+    "poisson": 0.3112596273422241,
+    "gaussian": 0.22520211338996887,
+    "euclidian": 0.8171814680099487
+   },
+   "numpy_f64": {
+    "poisson": 0.31125963927605477,
+    "gaussian": 0.22520213179039802,
+    "euclidian": 0.8171814997408786
+   },
+   "ptychi_eval": {
+    "poisson": 0.3112596396172505,
+    "gaussian": 0.22520201367221954,
+    "euclidian": 0.8171813144268979,
+    "poisson_floor_share": 0.0,
+    "native_mse_sqrt": 0.2041277883390155,
+    "native_poisson_nll": -99.49835319017672,
+    "nb_obs": 67108864
+   },
+   "asserted": [
+    "poisson",
+    "gaussian",
+    "euclidian"
+   ],
+   "rel_ptychi_vs_f64": {
+    "poisson": 1.096177259354344e-09,
+    "gaussian": 5.244984918619909e-07,
+    "euclidian": 2.2677211950461032e-07
+   },
+   "rel_pynx_vs_f64": {
+    "poisson": 3.834043717862456e-08,
+    "gaussian": 8.170628317898046e-08,
+    "euclidian": 3.882972129653418e-08
+   },
+   "rel_4mse_sqrt_vs_euclidian": 0.0008200885886701229,
+   "generator_llk_truth": {
+    "euclidian": 0.8171814997406963,
+    "gaussian": 0.22520213179034904,
+    "nb_obs": 67108864,
+    "poisson": 0.31125963927611705
+   },
+   "rel_f64_vs_generator": {
+    "poisson": 2.0010147099804306e-13,
+    "gaussian": 2.1753164844456602e-13,
+    "euclidian": 2.2308216803892003e-13
+   },
+   "worst_asserted_rel": 5.244984918619909e-07
+  },
+  {
+   "dataset": "raster_clean",
+   "state": "init",
+   "pynx_cpu_f32": {
+    "poisson": 18.814077377319336,
+    "gaussian": 3.9257750511169434,
+    "euclidian": 5.981966972351074
+   },
+   "numpy_f64": {
+    "poisson": 22.086893118127737,
+    "gaussian": 3.9257758817812936,
+    "euclidian": 5.981968066958827
+   },
+   "ptychi_eval": {
+    "poisson": 18.583524603347364,
+    "gaussian": 3.9257722888898425,
+    "euclidian": 5.981965991861814,
+    "poisson_floor_share": 0.7453974390903225,
+    "native_mse_sqrt": 1.4952884610599664,
+    "native_poisson_nll": -85.49301722224108,
+    "nb_obs": 67108864
+   },
+   "asserted": [
+    "gaussian",
+    "euclidian"
+   ],
+   "rel_ptychi_vs_f64": {
+    "poisson": 0.15861753375829016,
+    "gaussian": 9.152054419852845e-07,
+    "euclidian": 3.4689202451510947e-07
+   },
+   "rel_pynx_vs_f64": {
+    "poisson": 0.14817909079852654,
+    "gaussian": 2.1159240242116943e-07,
+    "euclidian": 1.8298455301506224e-07
+   },
+   "rel_4mse_sqrt_vs_euclidian": 0.00013576600452980592,
+   "worst_asserted_rel": 9.152054419852845e-07
+  }
+ ]
+}

@@ -1,35 +1,42 @@
 //! The LLK ring (`ptyrs_kernels::ring`): LLK records written on the device by the epochs that
 //! take them, read on the host after those epochs, with no host sync in between.
 //!
-//! A record is one LLK of the whole scan, written through one [`RecordWriter`]: per stack,
-//! [`Kernels::llk`] into a staging buffer and [`RecordWriter::push`] of it, then
+//! A record is one LLK of frames `0 .. n` of the scan, written through one [`RecordWriter`]:
+//! per stack, [`Kernels::llk`] into a staging buffer and [`RecordWriter::push`] of it, then
 //! [`RecordWriter::end`], the only advance of the cursor, which consumes the writer and
 //! returns the [`Ended`] the host count takes. These are ordinary launches, legal in a
-//! capture. The host counts each record with [`LlkRing::enqueued`] once its launches, or the
-//! graph holding them, are enqueued, and [`LlkRing::flush`] returns the totals of every
-//! record counted since the last flush, in order, each from [`LlkSums::from_partials`] over
-//! its frames. Every frame of record `k` must carry stamp `k`: a frame not pushed, a record
-//! ended but not counted or counted but not ended, or a slot overwritten before its copy, is
-//! a [`RingError::Stamp`], not a value.
+//! capture. The host counts each record with [`LlkRing::enqueued`], giving its `n`, once its
+//! launches, or the graph holding them, are enqueued. [`LlkRing::flush`] waits for and returns
+//! the [`LlkTotals`] of every record counted since the last read, in order, and
+//! [`LlkRing::poll`], without waiting, those of them whose copies have completed; each from
+//! [`LlkSums::from_partials`] over its frames with their unmasked pixels, which
+//! [`RingDevice::count`] counts once per frame. Every frame of record `k` must carry stamp
+//! `k`: a frame not pushed, a record ended but not counted or counted but not ended, or a
+//! slot overwritten before its copy, is a [`RingError::Stamp`], not a value; a frame pushed
+//! before it was counted is a [`RingError::Uncounted`].
 
 use std::collections::VecDeque;
 
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaStream, DeviceBuffer, DriverError, Event, LaunchConfig, PinnedHostBuffer};
-use ptyrs_kernels::ring::{RingRecord, ring_kernels};
+use ptyrs_kernels::pixel::PIXEL_THREADS;
+use ptyrs_kernels::ring::{RingRecord, UNCOUNTED, ring_kernels};
 
 use crate::{
-    Error, Kernels, LlkPartial, LlkSums, StackCtl, StackRef, ViewDims, check_len, dptr, lease,
+    Error, Kernels, LlkPartial, LlkSums, StackCtl, StackGeom, StackRef, ViewDims, check_len, dptr,
+    lease,
 };
 
 /// The ring's device half, what a cycle launches on: `nslot` records of `nframe` stamped
-/// partials and the cursor numbering the current record. Only [`LlkRing::new`] builds one,
-/// and only a [`RecordWriter`] writes it.
+/// partials, the cursor numbering the current record, and each frame's unmasked pixels. Only
+/// [`LlkRing::new`] builds one, and only a [`RecordWriter`] writes its records.
 pub struct RingDevice {
     base: Kernels,
     module: ring_kernels::LoadedModule,
     records: DeviceBuffer<RingRecord>,
     cursor: DeviceBuffer<u64>,
+    /// Frame `f`'s unmasked pixels once [`Self::count`] ran on it, [`UNCOUNTED`] before.
+    nobs: DeviceBuffer<u32>,
     nframe: u32,
     nslot: u32,
 }
@@ -40,13 +47,43 @@ impl RingDevice {
         RecordWriter { dev: self }
     }
 
-    fn push(
+    /// Counts the unmasked pixels of the stack's frames in `counts` (`nframe` frames of the
+    /// scan), which every later push of those frames carries; once per frame, after its
+    /// counts are in place and before its first push.
+    pub fn count(
         &mut self,
         ctx: &ExecutionContext,
         dims: &ViewDims,
         stack: StackRef<'_>,
-        partials: &DeviceBuffer<LlkPartial>,
+        counts: &DeviceBuffer<u16>,
     ) -> Result<(), Error> {
+        let g = self.geom(dims, stack)?;
+        check_len("counts", counts, dims.nframe as usize * dims.n())?;
+        let config = LaunchConfig {
+            grid_dim: (g.nf_max, 1, 1),
+            block_dim: (PIXEL_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let reads = [counts.storage(), stack.storage()];
+        self.base
+            .launch(ctx, &reads, &[self.nobs.storage()], |stream| {
+                // SAFETY: `counts` checked above; `nobs` holds `nframe` since `LlkRing::new`;
+                // one block of PIXEL_THREADS per frame.
+                unsafe {
+                    self.module.ring_count(
+                        stream,
+                        config,
+                        dptr(counts),
+                        dptr(&self.nobs),
+                        stack.ctl() as *const StackCtl,
+                        g,
+                    )
+                }
+            })
+    }
+
+    /// The stack's geometry, checked against the ring's frames.
+    fn geom(&self, dims: &ViewDims, stack: StackRef<'_>) -> Result<StackGeom, Error> {
         let g = dims.geom(stack)?;
         if g.nframe != self.nframe {
             return Err(Error::Shape(format!(
@@ -54,18 +91,35 @@ impl RingDevice {
                 g.nframe, self.nframe
             )));
         }
+        Ok(g)
+    }
+
+    fn push(
+        &mut self,
+        ctx: &ExecutionContext,
+        dims: &ViewDims,
+        stack: StackRef<'_>,
+        partials: &DeviceBuffer<LlkPartial>,
+    ) -> Result<(), Error> {
+        let g = self.geom(dims, stack)?;
         check_len("partials", partials, g.nf_max as usize)?;
         let config = LaunchConfig::for_num_elems(g.nf_max);
-        let reads = [partials.storage(), self.cursor.storage(), stack.storage()];
+        let reads = [
+            partials.storage(),
+            self.nobs.storage(),
+            self.cursor.storage(),
+            stack.storage(),
+        ];
         self.base
             .launch(ctx, &reads, &[self.records.storage()], |stream| {
-                // SAFETY: `partials` checked above; `records` holds `nslot * nframe` and
-                // `cursor` one entry since `LlkRing::new`.
+                // SAFETY: `partials` checked above; `records` holds `nslot * nframe`, `nobs`
+                // `nframe` and `cursor` one entry since `LlkRing::new`.
                 unsafe {
                     self.module.llk_push(
                         stream,
                         config,
                         dptr(partials),
+                        dptr(&self.nobs),
                         dptr(&self.records),
                         dptr(&self.cursor),
                         stack.ctl() as *const StackCtl,
@@ -99,7 +153,7 @@ pub struct RecordWriter<'r> {
 
 impl RecordWriter<'_> {
     /// Copies the stack's partials, as [`Kernels::llk`] writes them (`nf_max` records), into
-    /// the record, stamped with it.
+    /// the record with each frame's unmasked pixels, stamped with it.
     pub fn push(
         &mut self,
         ctx: &ExecutionContext,
@@ -117,6 +171,15 @@ impl RecordWriter<'_> {
     }
 }
 
+/// One record read back: the totals of its frames `0 .. nframe` and their unmasked pixels,
+/// so `sums / nb_obs` is a per-pixel LLK that compares across records of different `nframe`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LlkTotals {
+    pub sums: LlkSums,
+    pub nframe: u32,
+    pub nb_obs: usize,
+}
+
 /// What [`RecordWriter::end`] returns: the launches that wrote it end one record each time
 /// they run, eagerly or as a graph captured from them, and [`LlkRing::enqueued`] counts one
 /// record per run.
@@ -126,10 +189,10 @@ pub struct Ended(());
 
 /// An LLK ring of `nslot` records: the [`RingDevice`] the epochs write and its pinned host
 /// mirror, read in record order. The copy of record `k` is enqueued at most
-/// `max(nslot / 2, 1)` records after it, and the host waits for it only when it would
-/// otherwise overwrite `k`'s host slot, `nslot` records on, or on [`Self::flush`]; until
-/// then epochs keep enqueueing while earlier records download. `T` is the caller's tag of a
-/// record.
+/// `max(nslot / 2, 1)` records after it, or by an earlier [`Self::poll`], and the host waits
+/// for it only when it would otherwise overwrite `k`'s host slot, `nslot` records on, or on
+/// [`Self::flush`]; until then epochs keep enqueueing while earlier records download. `T` is
+/// the caller's tag of a record.
 pub struct LlkRing<T> {
     dev: RingDevice,
     /// Slot `k % nslot` holds record `k` once its copy has completed.
@@ -140,13 +203,13 @@ pub struct LlkRing<T> {
     next: u64,
     copied: u64,
     read: u64,
-    /// The tags of records `read .. next`.
-    tags: VecDeque<T>,
+    /// The tags and frame counts of records `read .. next`.
+    tags: VecDeque<(T, u32)>,
     /// The copies not yet read, oldest first: each one's end record and the event after it;
     /// their ranges tile `read .. copied`.
     copies: VecDeque<(u64, Event)>,
-    /// Records read since the last flush.
-    done: Vec<(T, LlkSums)>,
+    /// Records read since the last flush or poll.
+    done: Vec<(T, LlkTotals)>,
 }
 
 impl<T> LlkRing<T> {
@@ -169,8 +232,8 @@ impl<T> LlkRing<T> {
         let len = nslot as usize * nframe as usize;
         // A stamp no record has, so a slot never pushed reads as not written.
         let unwritten = RingRecord {
-            llk: LlkPartial::default(),
             seq: u64::MAX,
+            ..RingRecord::default()
         };
         let module = ring_kernels::from_module(kernels.module.as_cuda_module().clone())?;
         Ok(Self {
@@ -179,6 +242,7 @@ impl<T> LlkRing<T> {
                 module,
                 records: DeviceBuffer::from_host(stream, &vec![unwritten; len])?,
                 cursor: DeviceBuffer::from_host(stream, &[0u64])?,
+                nobs: DeviceBuffer::from_host(stream, &vec![UNCOUNTED; nframe as usize])?,
                 nframe,
                 nslot,
             },
@@ -197,26 +261,34 @@ impl<T> LlkRing<T> {
         &mut self.dev
     }
 
-    /// Counts the next record under `tag`, once per run of the launches that returned
-    /// `ended`, after that run is enqueued on `ctx`'s stream; enqueues the copy of the records
-    /// not yet copied when they make a batch.
+    /// Counts the next record, of frames `0 .. nframe`, under `tag`, once per run of the
+    /// launches that returned `ended`, after that run is enqueued on `ctx`'s stream; enqueues
+    /// the copy of the records not yet copied when they make a batch.
     pub fn enqueued(
         &mut self,
         ctx: &ExecutionContext,
         _ended: &Ended,
         tag: T,
+        nframe: u32,
     ) -> Result<(), RingError> {
+        if nframe > self.dev.nframe {
+            return Err(Error::Shape(format!(
+                "a record of {nframe} frames, the ring holds {}",
+                self.dev.nframe
+            ))
+            .into());
+        }
         self.next += 1;
-        self.tags.push_back(tag);
+        self.tags.push_back((tag, nframe));
         if self.next - self.copied >= self.batch() {
             self.copy_out(ctx)?;
         }
         Ok(())
     }
 
-    /// The tags and totals of every record counted since the last flush, in order: enqueues
-    /// the copy of the records not yet copied and waits for every copy.
-    pub fn flush(&mut self, ctx: &ExecutionContext) -> Result<Vec<(T, LlkSums)>, RingError> {
+    /// The tags and totals of every record counted since the last flush or poll, in order:
+    /// enqueues the copy of the records not yet copied and waits for every copy.
+    pub fn flush(&mut self, ctx: &ExecutionContext) -> Result<Vec<(T, LlkTotals)>, RingError> {
         if self.copied < self.next {
             self.copy_out(ctx)?;
         }
@@ -224,12 +296,29 @@ impl<T> LlkRing<T> {
         Ok(std::mem::take(&mut self.done))
     }
 
+    /// The tags and totals of the records counted since the last flush or poll whose copies
+    /// have completed, in order, without waiting for any copy. Then enqueues the copy of the
+    /// records not yet copied if their host slots hold no record left to read, so that a later
+    /// poll returns them however few records follow.
+    pub fn poll(&mut self, ctx: &ExecutionContext) -> Result<Vec<(T, LlkTotals)>, RingError> {
+        while let Some((_, event)) = self.copies.front() {
+            if !event.query()? {
+                break;
+            }
+            self.read_front()?;
+        }
+        if self.copied < self.next && self.next - self.read <= self.dev.nslot as u64 {
+            self.copy_out(ctx)?;
+        }
+        Ok(std::mem::take(&mut self.done))
+    }
+
     fn batch(&self) -> u64 {
         (self.dev.nslot as u64 / 2).max(1)
     }
 
-    /// Enqueues the copy of records `copied .. next` to their host slots, after reading the
-    /// records those slots hold.
+    /// Enqueues the copy of records `copied .. next`, each of its frames `0 .. n`, to their host
+    /// slots, after reading the records those slots hold.
     fn copy_out(&mut self, ctx: &ExecutionContext) -> Result<(), RingError> {
         let (start, end) = (self.copied, self.next);
         let nslot = self.dev.nslot as u64;
@@ -240,24 +329,21 @@ impl<T> LlkRing<T> {
         lease(ctx, &[self.dev.records.storage()], &[])?;
         ctx.context().bind_to_thread()?;
         let stream = ctx.get_cuda_stream();
-        let nframe = self.dev.nframe as usize;
         let size = size_of::<RingRecord>();
-        let s0 = (start % nslot) as usize;
-        let count = (end - start) as usize;
-        let first = count.min(nslot as usize - s0);
-        for (slot, n) in [(s0, first), (0, count - first)] {
+        let pending = self.tags.range((start - self.read) as usize..);
+        for (k, &(_, n)) in (start..end).zip(pending) {
             if n == 0 {
                 continue;
             }
-            let at = slot * nframe;
-            // SAFETY: slots `slot .. slot + n` lie in both buffers; the host ones hold no
-            // record left to read (read_until above), and none is read before this copy's
-            // event completes.
+            let at = (k % nslot) as usize * self.dev.nframe as usize;
+            // SAFETY: frames `0 .. n <= nframe` of slot `k % nslot` lie in both buffers; the
+            // host slot holds no record left to read (read_until above), and it is not read
+            // before this copy's event completes.
             unsafe {
                 cuda_core::memory::memcpy_dtoh_async(
                     self.host.as_mut_ptr().add(at),
                     self.dev.records.cu_deviceptr() + (at * size) as u64,
-                    n * nframe * size,
+                    n as usize * size,
                     stream.cu_stream(),
                 )?
             };
@@ -267,39 +353,46 @@ impl<T> LlkRing<T> {
         Ok(())
     }
 
-    /// Reads every copy holding a record before `k`, oldest first; `k <= copied`. A stamp
-    /// error drops every record read since the last flush: a record whose slot a later one
-    /// of the same copy overwrote carries its own stamp, and only the later one's shows it.
+    /// Waits for and reads every copy holding a record before `k`, oldest first; `k <= copied`.
     fn read_until(&mut self, k: u64) -> Result<(), RingError> {
         while self.read < k {
-            let (end, event) = self.copies.front().expect("copies tile read .. copied");
+            let (_, event) = self.copies.front().expect("copies tile read .. copied");
             event.synchronize()?;
-            let (first, end) = (self.read, *end);
-            self.copies.pop_front();
-            self.read = end;
-            let tags: Vec<T> = self.tags.drain(..(end - first) as usize).collect();
-            for (k, tag) in (first..end).zip(tags) {
-                match self.parse(k) {
-                    Ok(sums) => self.done.push((tag, sums)),
-                    Err(e) => {
-                        self.done.clear();
-                        return Err(e);
-                    }
+            self.read_front()?;
+        }
+        Ok(())
+    }
+
+    /// Reads the oldest copy not read, whose event has completed. A stamp error drops every
+    /// record read since the last flush or poll: a record whose slot a later one of the same
+    /// copy overwrote carries its own stamp, and only the later one's shows it.
+    fn read_front(&mut self) -> Result<(), RingError> {
+        let (end, _) = self.copies.pop_front().expect("a copy not read");
+        let first = self.read;
+        self.read = end;
+        let tags: Vec<(T, u32)> = self.tags.drain(..(end - first) as usize).collect();
+        for (k, (tag, nframe)) in (first..end).zip(tags) {
+            match self.parse(k, nframe) {
+                Ok(totals) => self.done.push((tag, totals)),
+                Err(e) => {
+                    self.done.clear();
+                    return Err(e);
                 }
             }
         }
         Ok(())
     }
 
-    /// Record `k`'s totals from its host slot, whose copy has completed.
-    fn parse(&self, k: u64) -> Result<LlkSums, RingError> {
-        let nframe = self.dev.nframe as usize;
-        let slot = (k % self.dev.nslot as u64) as usize;
+    /// Record `k`'s totals over frames `0 .. nframe` from its host slot, whose copy has
+    /// completed.
+    fn parse(&self, k: u64, nframe: u32) -> Result<LlkTotals, RingError> {
+        let at = (k % self.dev.nslot as u64) as usize * self.dev.nframe as usize;
         // SAFETY: the slot lies in `host`, its copy has completed, and no later copy into it
-        // is enqueued before it is read.
+        // is enqueued before it is read; `nframe` is at most the slot's frames.
         let recs =
-            unsafe { std::slice::from_raw_parts(self.host.as_ptr().add(slot * nframe), nframe) };
-        let mut partials = Vec::with_capacity(nframe);
+            unsafe { std::slice::from_raw_parts(self.host.as_ptr().add(at), nframe as usize) };
+        let mut partials = Vec::with_capacity(recs.len());
+        let mut nb_obs = 0;
         for (frame, r) in recs.iter().enumerate() {
             if r.seq != k {
                 return Err(RingError::Stamp {
@@ -308,9 +401,17 @@ impl<T> LlkRing<T> {
                     found: r.seq,
                 });
             }
+            if r.nobs == UNCOUNTED {
+                return Err(RingError::Uncounted { record: k, frame });
+            }
             partials.push(r.llk);
+            nb_obs += r.nobs as usize;
         }
-        Ok(LlkSums::from_partials(&partials))
+        Ok(LlkTotals {
+            sums: LlkSums::from_partials(&partials),
+            nframe,
+            nb_obs,
+        })
     }
 }
 
@@ -334,6 +435,11 @@ pub enum RingError {
         frame: usize,
         found: u64,
     },
+    /// Frame `frame` of record `record` was pushed before [`RingDevice::count`] counted it.
+    Uncounted {
+        record: u64,
+        frame: usize,
+    },
 }
 
 impl std::fmt::Display for RingError {
@@ -348,6 +454,10 @@ impl std::fmt::Display for RingError {
                 f,
                 "LLK record {record}, frame {frame}: stamp {found}, so not written for it"
             ),
+            Self::Uncounted { record, frame } => write!(
+                f,
+                "LLK record {record}, frame {frame}: pushed before its unmasked pixels were counted"
+            ),
         }
     }
 }
@@ -356,7 +466,7 @@ impl std::error::Error for RingError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Gpu(e) => Some(e),
-            Self::Stamp { .. } => None,
+            Self::Stamp { .. } | Self::Uncounted { .. } => None,
         }
     }
 }
@@ -370,5 +480,38 @@ impl From<Error> for RingError {
 impl From<DriverError> for RingError {
     fn from(e: DriverError) -> Self {
         Self::Gpu(e.into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use cuda_core::CudaContext;
+
+    use super::*;
+
+    /// A record of 4 frames copies those into its host slot and leaves the slot's other 6 as
+    /// they were.
+    #[test]
+    fn a_record_copies_only_its_frames() {
+        let cuda = CudaContext::new(0).expect("CUDA device 0");
+        let kernels = Kernels::load(&cuda).expect("load ptyrs-gpu kernels");
+        let stream = cuda.new_stream().unwrap();
+        let ctx = ExecutionContext::new(stream.clone());
+        let mut ring = LlkRing::new(&kernels, &stream, 10, 1).unwrap();
+        stream.synchronize().unwrap();
+        let old = RingRecord {
+            seq: 7,
+            ..RingRecord::default()
+        };
+        ring.host.as_mut_slice().fill(old);
+        ring.enqueued(&ctx, &Ended(()), (), 4).unwrap();
+        stream.synchronize().unwrap();
+        let seqs: Vec<u64> = ring.host.as_slice().iter().map(|r| r.seq).collect();
+        assert_eq!(
+            seqs[..4],
+            [u64::MAX; 4],
+            "copied from the unwritten device slot"
+        );
+        assert_eq!(seqs[4..], [7; 6], "left as they were");
     }
 }

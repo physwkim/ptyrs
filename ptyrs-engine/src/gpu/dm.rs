@@ -1,7 +1,7 @@
 //! PyNX DM on the GPU.
 
 use cuda_async::device_operation::ExecutionContext;
-use ptyrs_gpu::{Error as GpuError, Exit, FusedInputs};
+use ptyrs_gpu::{Error as GpuError, Exit, FusedInputs, FusedSums};
 
 use super::device::{M1Bufs, PassesMut};
 use super::{Bufs, Epoch, GpuPtycho};
@@ -14,17 +14,18 @@ impl GpuPtycho {
     /// exit waves against `PO`, project, and add the remainder back (M1: `dm_reflect` into
     /// the scratch stack, `add_c32`). Then `loop_obj_probe` object-only and probe-only
     /// updates, the probe one from the new object; the fused projection adds the first
-    /// object-only update's sums itself.
+    /// object-only update's sums itself. The LLK record is of the estimate the cycle starts
+    /// from.
     pub fn dm(&mut self, params: &DmParams, ncycle: usize) -> Result<(), EngineError> {
         for ic in 0..ncycle {
             let epoch = Epoch::Dm {
                 params: *params,
                 first: ic == 0,
             };
-            self.dev.steady(epoch, self.cycle)?;
             if llk_due(params.calc_llk, ic, ncycle) {
                 self.dev.llk_pass(Some((self.cycle, Algorithm::Dm)))?;
             }
+            self.dev.steady(epoch, self.cycle)?;
             self.cycle += 1;
         }
         self.collect()?;
@@ -70,7 +71,10 @@ impl Bufs<'_> {
                     } else {
                         Exit::Dm { psi, alpha }
                     };
-                    let sums = summed.then_some(&mut *self.obj_sums);
+                    let sums = FusedSums {
+                        obj: summed.then_some(&mut *self.obj_sums),
+                        probe: None,
+                    };
                     self.kernels
                         .fused_project(ctx, &inputs, stack, exit, f, sums)?;
                 }
