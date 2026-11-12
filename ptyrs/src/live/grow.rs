@@ -615,17 +615,23 @@ RDONE:
         Context::new(0).expect("GPU 0")
     }
 
-    fn htod(dst: CUdeviceptr, src: &[u32]) {
-        unsafe { sys::cuMemcpyHtoD_v2(dst, src.as_ptr().cast(), src.len() * 4) }
-            .result()
-            .unwrap();
+    /// Copies on `s`, the stream that reads `dst`: `s` is non-blocking, so a
+    /// copy on the legacy stream would not be ordered before its kernels.
+    fn htod(dst: CUdeviceptr, src: &[u32], s: &Stream) {
+        // SAFETY: the driver stages the pageable source before returning.
+        unsafe {
+            sys::cuMemcpyHtoDAsync_v2(dst, src.as_ptr().cast(), src.len() * 4, s.cu_stream())
+        }
+        .result()
+        .unwrap();
     }
 
-    fn dtoh(src: CUdeviceptr, n: usize) -> Vec<u32> {
+    fn dtoh(src: CUdeviceptr, n: usize, s: &Stream) -> Vec<u32> {
         let mut v = vec![0u32; n];
-        unsafe { sys::cuMemcpyDtoH_v2(v.as_mut_ptr().cast(), src, n * 4) }
+        unsafe { sys::cuMemcpyDtoHAsync_v2(v.as_mut_ptr().cast(), src, n * 4, s.cu_stream()) }
             .result()
             .unwrap();
+        s.synchronize().unwrap();
         v
     }
 
@@ -683,6 +689,7 @@ RDONE:
     #[test]
     fn growth_keeps_the_address_and_the_mapped_bytes() {
         let ctx = ctx();
+        let s = ctx.new_stream().unwrap();
         let mut b = GrowBuf::new(
             &ctx,
             6 * vmm::allocation_granularity(ctx.cu_device()).unwrap(),
@@ -698,7 +705,7 @@ RDONE:
         let pat: Vec<u32> = (0..(ck / 4) as u32)
             .map(|i| i.wrapping_mul(2654435761))
             .collect();
-        htod(base, &pat);
+        htod(base, &pat, &s);
         // A sparse chunk, then the gap and one more, ascending.
         assert_eq!(
             fresh(&mut b, 3 * ck..3 * ck + 8).unwrap(),
@@ -713,10 +720,10 @@ RDONE:
         assert!(!b.is_ready(4 * ck..5 * ck + 1));
         assert_eq!(b.mapped_bytes(), 5 * ck);
         assert_eq!(b.ptr(), base);
-        assert_eq!(dtoh(base, pat.len()), pat);
+        assert_eq!(dtoh(base, pat.len(), &s), pat);
         let tail: Vec<u32> = (0..(4 * ck / 4) as u32).collect();
-        htod(base + ck as u64, &tail);
-        assert_eq!(dtoh(base + ck as u64, tail.len()), tail);
+        htod(base + ck as u64, &tail, &s);
+        assert_eq!(dtoh(base + ck as u64, tail.len(), &s), tail);
         let cap = b.capacity();
         assert!(matches!(
             b.map(cap - 4..cap + 1),
@@ -753,6 +760,7 @@ RDONE:
     #[test]
     fn a_chunk_need_not_be_a_power_of_two() {
         let ctx = ctx();
+        let s = ctx.new_stream().unwrap();
         let g = vmm::allocation_granularity(ctx.cu_device()).unwrap();
         let mut b = GrowBuf::new(&ctx, 4 * g, 3 * g).unwrap();
         assert_eq!((b.chunk_bytes(), b.capacity()), (3 * g, 6 * g));
@@ -760,8 +768,8 @@ RDONE:
         assert_eq!(b.mapped_bytes(), 6 * g);
         let pat: Vec<u32> = (0..(2 * g / 4) as u32).collect();
         let at = b.ptr() + (2 * g) as u64;
-        htod(at, &pat);
-        assert_eq!(dtoh(at, pat.len()), pat);
+        htod(at, &pat, &s);
+        assert_eq!(dtoh(at, pat.len(), &s), pat);
     }
 
     /// Chunks are mapped while a running kernel keeps reading the mapped
@@ -778,7 +786,7 @@ RDONE:
         b.map(0..ck).unwrap();
         let n = ck / 4;
         let vals: Vec<u32> = (0..n as u32).map(|i| i % 1000).collect();
-        htod(b.ptr(), &vals);
+        htod(b.ptr(), &vals, &s);
         let mut out = GrowBuf::new(&ctx, 1, 1).unwrap();
         out.map(0..8).unwrap();
         let done = ctx.new_event_with_flags(None).unwrap();
@@ -801,11 +809,11 @@ RDONE:
         assert_eq!(fresh, want);
         assert!(running, "mapping returned only after the kernel finished");
         let want = vals.iter().fold(0u32, |a, &v| a.wrapping_add(v));
-        assert_eq!(dtoh(out.ptr(), 2), vec![want, 1]);
+        assert_eq!(dtoh(out.ptr(), 2, &s), vec![want, 1]);
         let tail: Vec<u32> = (0..1024).collect();
         let at = b.ptr() + (b.capacity() - 4096) as u64;
-        htod(at, &tail);
-        assert_eq!(dtoh(at, 1024), tail);
+        htod(at, &tail, &s);
+        assert_eq!(dtoh(at, 1024, &s), tail);
     }
 
     /// One graph, captured once with the base pointer and a device-side
@@ -847,7 +855,7 @@ RDONE:
         }
         s.synchronize().unwrap();
         assert_eq!(b.ptr(), p_buf);
-        let got = dtoh(b.ptr(), cap_elems);
+        let got = dtoh(b.ptr(), cap_elems, &s);
         let bad = got
             .iter()
             .enumerate()
@@ -948,16 +956,16 @@ RDONE:
         eprintln!("grow: {k} pushes of {total} records in {push_ms:.1} ms behind a running kernel");
         assert!(holding, "a push waited for the kernel ahead of it");
         assert_eq!(
-            dtoh(scratch.ptr() + 4004, 1),
+            dtoh(scratch.ptr() + 4004, 1, &s),
             vec![1],
             "the held kernel timed out"
         );
-        let got = dtoh(out.ptr(), total);
+        let got = dtoh(out.ptr(), total, &s);
         let bad = (0..total)
             .filter(|&i| got[i] != rec(i).iter().fold(0u32, |a, &v| a.wrapping_add(v)))
             .count();
         assert_eq!(bad, 0, "records summed wrong");
-        assert_eq!(dtoh(ctl.ptr(), 2), vec![total as u32; 2]);
+        assert_eq!(dtoh(ctl.ptr(), 2, &s), vec![total as u32; 2]);
         assert_eq!(t.len(), total);
         assert_eq!(t.mapped_bytes(), (total * 24).div_ceil(ck) * ck);
         assert!(matches!(
