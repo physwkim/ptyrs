@@ -313,37 +313,6 @@ pub unsafe fn cols<const NY: u32>(p: FusedPtrs, ctl: *const StackCtl, g: StackGe
     }
 }
 
-/// Per-frame LLK partials from pass B's column groups: `out[fl]` is the sum of
-/// `groups[fl, 0 .. nx / FUSED_COLS]` in ascending group order, for every frame `fl < nf`;
-/// entries past `nf` are not written. One thread per frame of `nf_max`.
-///
-/// # Safety
-///
-/// `groups` holds `[nf_max, nx / FUSED_COLS]` records, `out` `nf_max`, `ctl` one entry.
-#[device]
-pub unsafe fn llk_groups(
-    groups: *const LlkPartial,
-    out: *mut LlkPartial,
-    ctl: *const StackCtl,
-    g: StackGeom,
-) {
-    let (_, nf) = unsafe { stack_frames(ctl, g) };
-    let fl = crate::global_index();
-    if fl >= nf as usize {
-        return;
-    }
-    let ngroup = (g.nx / FUSED_COLS) as usize;
-    let mut s = LlkPartial::default();
-    for j in 0..ngroup {
-        let a = unsafe { *groups.add(fl * ngroup + j) };
-        s.poisson += a.poisson;
-        s.gaussian += a.gaussian;
-        s.euclidean += a.euclidean;
-        s.icalc += a.icalc;
-    }
-    unsafe { *out.add(fl) = s };
-}
-
 /// Pass C: for frame `fl = blockIdx.y` of the stack and stored row `ys`, the inverse row FFT
 /// of every mode `m = o * nprobe + pm` in ascending order gives the projected exit wave
 /// `proj`. The new exit wave is `proj`, or under `FUSED_DM` `proj + (1 - a) (PO - R)` with

@@ -36,8 +36,8 @@ mod ops;
 
 pub use fused::{Exit, FusedBufs, FusedInputs};
 pub use ops::{
-    LLK_TREE_LEAVES, LlkPartial, LlkSums, MASKED, OBJ_TILE, StackCtl, StackGeom, StackRef,
-    StackTable, UpdateSums, ViewAddr, ViewDims, Views, view_tiles,
+    LLK_TREE_LEAVES, LlkPartial, LlkScratch, LlkSums, MASKED, OBJ_TILE, StackCtl, StackGeom,
+    StackRef, StackTable, UpdateSums, ViewAddr, ViewDims, Views, view_tiles,
 };
 pub use ptyrs_fft::C32;
 

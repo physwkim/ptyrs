@@ -11,9 +11,9 @@ use cuda_async::error::DeviceError;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, DeviceCopy, DriverError};
 use ptyrs_fft::{FftError, Plan2d};
 use ptyrs_gpu::{
-    C32, Error, Exit, FusedBufs, FusedInputs, Kernels, Lines, LlkPartial, LlkSums, MASKED,
-    OBJ_TILE, StackCtl, StackRef, StackTable, UpdateSums, ViewAddr, ViewDims, Views, record,
-    view_tiles,
+    C32, Error, Exit, FusedBufs, FusedInputs, Kernels, Lines, LlkPartial, LlkScratch, LlkSums,
+    MASKED, OBJ_TILE, StackCtl, StackRef, StackTable, UpdateSums, ViewAddr, ViewDims, Views,
+    record, view_tiles,
 };
 
 type Z = (f64, f64);
@@ -759,7 +759,9 @@ fn intensity_amplitude_and_llk_match_f64() {
     let mut icalc = DeviceBuffer::<f32>::zeroed(&stream, nf * n).unwrap();
     k.mode_intensity(&ex, &d, stack, &psi, &mut icalc).unwrap();
     let mut llk = DeviceBuffer::<LlkPartial>::zeroed(&stream, nf).unwrap();
-    k.llk(&ex, &d, stack, &counts, &psi, &mut llk).unwrap();
+    let mut scratch = LlkScratch::new(&stream, &d, table.nf_max()).unwrap();
+    k.llk(&ex, stack, &counts, &psi, &mut scratch, &mut llk)
+        .unwrap();
     k.apply_amplitude(&ex, &d, stack, &counts, &mut psi)
         .unwrap();
 
@@ -770,6 +772,65 @@ fn intensity_amplitude_and_llk_match_f64() {
     let err = rel_l2(&psi.to_host_vec(&stream).unwrap(), &proj_ref);
     println!("apply_amplitude: rel L2 {err:.2e}");
     assert!(err < 2e-6, "apply_amplitude rel L2 {err:.2e}");
+}
+
+/// `llk` over frames of 48 x 98 pixels, three chunks of which the last is short, on a
+/// stack starting at frame 1 of a table whose `nf_max` exceeds the stack: each frame
+/// against f64, the record past the stack untouched, and a scratch made for fewer frames
+/// than the table refused.
+#[test]
+fn llk_sums_frames_over_several_chunks() {
+    let (stream, ex, k) = setup();
+    let d = ViewDims {
+        nframe: 4,
+        nmode: 2,
+        nprobe: 2,
+        nobj: 1,
+        frame: [48, 98],
+        obj: [64, 128],
+        quad_phase: 0.0,
+    };
+    let s = Scan::new(d, &[(0, 0, 0.0, 0.0); 4], 1.0);
+    let (n, nm) = (s.n(), d.nmode as usize);
+    let table = StackTable::new(&stream, &d, &[0..3, 1..3]).unwrap();
+    let (frames, nf_max) = (1..3, table.nf_max() as usize);
+    let psi_host = noise(nf_max * nm * n, 7, 50.0);
+    let counts_host = counts(d.nframe as usize * n);
+    let mut want = vec![[0.0; 4]; 2];
+    for (fl, w) in want.iter_mut().enumerate() {
+        for (y, x, i) in s.pixels() {
+            let at = s.shifted(y, x);
+            let calc = (0..nm)
+                .map(|m| norm2(z(psi_host[(fl * nm + m) * n + at])))
+                .sum::<f64>()
+                / n as f64;
+            let obs = counts_host[(frames.start as usize + fl) * n + i];
+            if obs != MASKED {
+                for (l, t) in w.iter_mut().zip(llk_terms(obs as f64, calc)) {
+                    *l += t;
+                }
+            }
+        }
+    }
+    let counts = up(&stream, &counts_host);
+    let psi = up(&stream, &psi_host);
+    let sentinel = LlkPartial {
+        poisson: -1.0,
+        gaussian: -2.0,
+        euclidean: -3.0,
+        icalc: -4.0,
+    };
+    let mut llk = up(&stream, &[sentinel; 3]);
+    let mut scratch = LlkScratch::new(&stream, &d, table.nf_max()).unwrap();
+    k.llk(&ex, table.at(1), &counts, &psi, &mut scratch, &mut llk)
+        .unwrap();
+    let got = llk.to_host_vec(&stream).unwrap();
+    assert_llk("llk", &got[..2], &want);
+    assert_eq!(got[2], sentinel, "record past the stack written");
+
+    let mut short = LlkScratch::new(&stream, &d, 2).unwrap();
+    let r = k.llk(&ex, table.at(1), &counts, &psi, &mut short, &mut llk);
+    assert!(matches!(r, Err(Error::Shape(_))), "{r:?}");
 }
 
 #[test]
@@ -999,7 +1060,8 @@ fn fourier_projection_matches_pynx_orthonormal_f64() {
     .unwrap();
     plan.forward_inplace(&ex, &mut psi).unwrap();
     let mut llk = DeviceBuffer::<LlkPartial>::zeroed(&stream, nf).unwrap();
-    k.llk(&ex, &d, table.at(0), &counts, &psi, &mut llk)
+    let mut scratch = LlkScratch::new(&stream, &d, table.nf_max()).unwrap();
+    k.llk(&ex, table.at(0), &counts, &psi, &mut scratch, &mut llk)
         .unwrap();
     k.apply_amplitude(&ex, &d, table.at(0), &counts, &mut psi)
         .unwrap();
@@ -1170,6 +1232,7 @@ struct StackRun {
     psi: DeviceBuffer<C32>,
     icalc: DeviceBuffer<f32>,
     llk: DeviceBuffer<LlkPartial>,
+    llk_scratch: LlkScratch,
     obj_sums: UpdateSums,
     probe_sums: UpdateSums,
 }
@@ -1183,6 +1246,7 @@ impl StackRun {
             psi: DeviceBuffer::zeroed(stream, s.nk(&(0..nf_max)) * n).unwrap(),
             icalc: DeviceBuffer::zeroed(stream, nf * n).unwrap(),
             llk: DeviceBuffer::zeroed(stream, nf).unwrap(),
+            llk_scratch: LlkScratch::new(stream, &s.d, nf_max).unwrap(),
             obj_sums: UpdateSums::zeroed(stream, s.obj.len()).unwrap(),
             probe_sums: UpdateSums::zeroed(stream, s.probe.len()).unwrap(),
         }
@@ -1220,7 +1284,14 @@ impl StackRun {
         let d = *views.dims();
         k.obj_probe_to_psi(ctx, views, stack, obj, probe, &mut self.psi)?;
         k.mode_intensity(ctx, &d, stack, &self.psi, &mut self.icalc)?;
-        k.llk(ctx, &d, stack, counts, &self.psi, &mut self.llk)?;
+        k.llk(
+            ctx,
+            stack,
+            counts,
+            &self.psi,
+            &mut self.llk_scratch,
+            &mut self.llk,
+        )?;
         k.psi_to_obj(ctx, views, stack, &self.psi, probe, &mut self.obj_sums)?;
         k.psi_to_probe(ctx, views, stack, &self.psi, obj, &mut self.probe_sums)?;
         k.apply_amplitude(ctx, &d, stack, counts, &mut self.psi)
@@ -1476,6 +1547,7 @@ struct Iteration {
     po: DeviceBuffer<C32>,
     icalc: DeviceBuffer<f32>,
     llk: DeviceBuffer<LlkPartial>,
+    llk_scratch: LlkScratch,
     obj_sums: UpdateSums,
     probe_sums: UpdateSums,
     aux: DeviceBuffer<C32>,
@@ -1496,6 +1568,7 @@ impl Iteration {
             po: DeviceBuffer::zeroed(stream, nk).unwrap(),
             icalc: DeviceBuffer::zeroed(stream, nf * n).unwrap(),
             llk: DeviceBuffer::zeroed(stream, nf).unwrap(),
+            llk_scratch: LlkScratch::new(stream, &s.d, s.d.nframe).unwrap(),
             obj_sums: UpdateSums::zeroed(stream, s.obj.len()).unwrap(),
             probe_sums: UpdateSums::zeroed(stream, s.probe.len()).unwrap(),
             aux: up(stream, &noise(aux, 51, 1.0)),
@@ -1520,7 +1593,14 @@ impl Iteration {
         k.obj_probe_to_psi(ctx, views, stack, &self.obj, &self.probe, &mut self.po)?;
         k.dm_reflect(ctx, &mut self.psi, &mut self.po, nk, 0.02)?;
         k.mode_intensity(ctx, &d, stack, &self.psi, &mut self.icalc)?;
-        k.llk(ctx, &d, stack, counts, &self.psi, &mut self.llk)?;
+        k.llk(
+            ctx,
+            stack,
+            counts,
+            &self.psi,
+            &mut self.llk_scratch,
+            &mut self.llk,
+        )?;
         k.apply_amplitude(ctx, &d, stack, counts, &mut self.psi)?;
         k.add_c32(ctx, &mut self.psi, &self.po, nk)?;
         k.psi_to_obj(

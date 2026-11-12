@@ -14,6 +14,9 @@ pub const OBJ_TILE: u32 = 16;
 pub const PIXEL_THREADS: u32 = 256;
 /// Count value of a masked pixel (`ptyrs-core` `MASKED`).
 pub const MASKED: u16 = u16::MAX;
+/// Pixels per block of the M1 LLK kernel: a frame of `n` pixels is `ceil(n / LLK_CHUNK)`
+/// contiguous chunks, the last one short.
+pub const LLK_CHUNK: u32 = 2048;
 
 /// One exit-wave view (PyNX `cx, cy` + `_obj_psidx`, `_probe_psidx`): probe mode `probe`
 /// times object mode `obj` sampled at `(oy + fy + pry, ox + fx + prx)` for probe pixel
@@ -162,7 +165,8 @@ pub fn axis_tiles(o: u32, len: u32, f: f32) -> (u32, u32) {
     (o / OBJ_TILE, last / OBJ_TILE)
 }
 
-/// Per-frame log-likelihood sums over the frame's unmasked pixels (PyNX `LLKAll`).
+/// Log-likelihood sums over unmasked pixels of one frame, or of a chunk or column group of
+/// one (PyNX `LLKAll`).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct LlkPartial {

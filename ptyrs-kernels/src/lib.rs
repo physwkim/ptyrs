@@ -321,22 +321,24 @@ pub mod kernels {
         }
     }
 
-    /// Per-frame log-likelihood sums (PyNX `LLKAll`, no background): over the unmasked
-    /// pixels of frame `f0 + fl`, with `calc = sum_m |psi|^2 / (ny * nx)` and `obs` the
+    /// Log-likelihood sums (PyNX `LLKAll`, no background) of chunk `c = blockIdx.x` of
+    /// frame `f0 + fl`, `fl = blockIdx.y`: over its unmasked pixels `d` in `c * LLK_CHUNK ..
+    /// min((c + 1) * LLK_CHUNK, n)`, with `calc = sum_m |psi|^2 / (ny * nx)` and `obs` the
     /// count, Poisson `calc` if `obs <= 0.1` else `calc - obs + obs ln(obs / calc)`,
     /// Gaussian `(obs - calc)^2 / (obs + 1)`, Euclidean `4 (sqrt obs - sqrt calc)^2`, and
-    /// `calc`. One `PIXEL_THREADS` block per frame; `out[fl]` gets the sums of frame
-    /// `fl < nf`, entries past `nf` are not written.
+    /// `calc`, into `chunks[fl * nchunk + c]`, `nchunk = ceil(n / LLK_CHUNK)`, for `fl < nf`;
+    /// entries past `nf` are not written. [`llk_groups`] sums each frame's chunks.
     ///
     /// # Safety
     ///
-    /// `psi` `[nf_max * nmode, ny, nx]`, `counts` `[nframe, ny, nx]`, `out` `nf_max` records,
-    /// `ctl` one entry; grid `(nf_max, 1, 1)`, block `(PIXEL_THREADS, 1, 1)`.
+    /// `psi` `[nf_max * nmode, ny, nx]`, `counts` `[nframe, ny, nx]`, `chunks` `[nf_max,
+    /// nchunk]` records, `ctl` one entry; grid `(nchunk, nf_max, 1)`, block `(PIXEL_THREADS,
+    /// 1, 1)`.
     #[kernel]
     pub unsafe fn llk(
         psi: *const f32,
         counts: *const u16,
-        out: *mut LlkPartial,
+        chunks: *mut LlkPartial,
         ctl: *const StackCtl,
         g: StackGeom,
     ) {
@@ -345,17 +347,20 @@ pub mod kernels {
         let (f0, nf) = unsafe { stack_frames(ctl, g) };
         let (ny, nx, nmode) = (g.ny, g.nx, g.nmode);
         let n = ny as usize * nx as usize;
-        let fl = thread::blockIdx_x() as usize;
+        let fl = thread::blockIdx_y() as usize;
         // The whole block leaves together, before its first barrier.
         if fl >= nf as usize {
             return;
         }
+        let c = thread::blockIdx_x() as usize;
+        let chunk = LLK_CHUNK as usize;
+        let end = n.min((c + 1) * chunk);
         let t = thread::threadIdx_x() as usize;
         let plane0 = fl * nmode as usize;
         let inv_n = 1.0 / n as f32;
         let mut acc = [0.0f32; 4];
-        let mut d = t;
-        while d < n {
+        let mut d = c * chunk + t;
+        while d < end {
             let at = psi_index((d / nx as usize) as u32, (d % nx as usize) as u32, ny, nx);
             let obs = unsafe { *counts.add((f0 as usize + fl) * n + d) };
             if obs != MASKED {
@@ -381,7 +386,7 @@ pub mod kernels {
                 block_sum(s.add(j * seg));
             }
             if t == 0 {
-                *out.add(fl) = LlkPartial {
+                *chunks.add(fl * n.div_ceil(chunk) + c) = LlkPartial {
                     poisson: *s,
                     gaussian: *s.add(seg),
                     euclidean: *s.add(2 * seg),
@@ -389,6 +394,38 @@ pub mod kernels {
                 };
             }
         }
+    }
+
+    /// Per-frame LLK sums from `ngroup` partials per frame: `out[fl]` is the sum of
+    /// `groups[fl * ngroup .. (fl + 1) * ngroup]` in ascending order, for every frame
+    /// `fl < nf`; entries past `nf` are not written. One thread per frame of `nf_max`.
+    ///
+    /// # Safety
+    ///
+    /// `groups` holds `nf_max * ngroup` records, `out` `nf_max`, `ctl` one entry.
+    #[kernel]
+    pub unsafe fn llk_groups(
+        groups: *const LlkPartial,
+        ngroup: u32,
+        out: *mut LlkPartial,
+        ctl: *const StackCtl,
+        g: StackGeom,
+    ) {
+        let (_, nf) = unsafe { stack_frames(ctl, g) };
+        let fl = global_index();
+        if fl >= nf as usize {
+            return;
+        }
+        let ngroup = ngroup as usize;
+        let mut s = LlkPartial::default();
+        for j in 0..ngroup {
+            let a = unsafe { *groups.add(fl * ngroup + j) };
+            s.poisson += a.poisson;
+            s.gaussian += a.gaussian;
+            s.euclidean += a.euclidean;
+            s.icalc += a.icalc;
+        }
+        unsafe { *out.add(fl) = s };
     }
 
     /// Appends the stack's views to the tile slabs: view `k` of the stack goes, in ascending
@@ -839,21 +876,6 @@ pub mod kernels {
     #[kernel]
     pub unsafe fn fused_probe_power(probe: *const f32, pp: *mut f32, nprobe: u32, n: u32) {
         unsafe { crate::fused::probe_power(probe, pp, nprobe, n) }
-    }
-
-    /// [`crate::fused::llk_groups`].
-    ///
-    /// # Safety
-    ///
-    /// As [`crate::fused::llk_groups`].
-    #[kernel]
-    pub unsafe fn fused_llk_groups(
-        groups: *const LlkPartial,
-        out: *mut LlkPartial,
-        ctl: *const StackCtl,
-        g: StackGeom,
-    ) {
-        unsafe { crate::fused::llk_groups(groups, out, ctl, g) }
     }
 
     // Unnormalized C2C FFT of `nline` strided lines (see `load_line`); forward uses

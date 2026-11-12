@@ -434,22 +434,9 @@ impl<'a> Run<'a> {
         bufs: &FusedBufs,
         out: &mut DeviceBuffer<LlkPartial>,
     ) -> Result<(), Error> {
-        let config = grid_1d(self.g.nf_max as usize)?;
-        let reads = [bufs.groups.storage(), self.stack.storage()];
-        let (ctl, g) = (self.ctl(), self.g);
-        self.k.launch(self.ctx, &reads, &[out.storage()], |stream| {
-            // SAFETY: `groups` holds `[nf_max, nx / FUSED_COLS]` records, `out` `nf_max`.
-            unsafe {
-                self.k.module.fused_llk_groups(
-                    stream,
-                    config,
-                    dptr(&bufs.groups),
-                    dptr(out),
-                    ctl,
-                    g,
-                )
-            }
-        })
+        let ngroup = self.g.nx / FUSED_COLS;
+        self.k
+            .llk_groups(self.ctx, self.stack, self.g, &bufs.groups, ngroup, out)
     }
 
     /// Pass C from `bufs.work` to `psi` (under `FUSED_TO_PSI`) or back to `bufs.work`;
