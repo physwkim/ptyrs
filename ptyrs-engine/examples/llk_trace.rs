@@ -6,7 +6,7 @@
 //! starting object and probe), `llk_rust.txt` (cycle and the normalised Poisson, Gaussian,
 //! Euclidian LLK and photon count per cycle) and `final_rust.h5`, from the CPU oracle or, with
 //! `--gpu`, from [`GpuPtycho`] on CUDA device 0 with the default stacks, by the fused passes
-//! on 128- or 256-pixel frames and by M1's launches on others (ML has no GPU path yet). ML
+//! on 128- or 256-pixel frames and by M1's launches on others (ML always by M1's). ML
 //! updates object and probe from the end of `ML_WARMUP` AP cycles, which `init.h5` holds.
 //! rPIE also writes
 //! `views.txt` (object window corner `oy ox` per frame), `quad.txt` (`re im` of the quadratic
@@ -61,9 +61,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !["dm", "ap", "ml", "rpie"].contains(&algo.as_str()) {
         return Err(usage.into());
     }
-    if gpu && algo == "ml" {
-        return Err("ML has no GPU path yet".into());
-    }
     let mut next = |default: usize| args.next().map_or(Ok(default), |s| s.parse());
     let (ncycle, nprobe, frame, npos) = (next(50)?, next(1)?, next(64)?, next(100)?);
     let step = args.next().map_or(Ok(4.0), |s| s.parse::<f64>())?;
@@ -113,7 +110,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let ctx = CudaContext::new(0).map_err(EngineError::from)?;
         let (object, probe) = p.into_modes();
         let options = GpuOptions {
-            fused: matches!(frame, 128 | 256),
+            fused: algo != "ml" && matches!(frame, 128 | 256),
             ..GpuOptions::default()
         };
         eprintln!("GPU passes: {}", if options.fused { "fused" } else { "m1" });
@@ -122,6 +119,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         match algo.as_str() {
             "dm" => g.dm(&dm, ncycle)?,
             "ap" => g.ap(&AP, ncycle)?,
+            "ml" => g.ml(&ML, ncycle)?,
             _ => g.rpie(&RPIE, ncycle)?,
         }
         g.synchronize()?;
