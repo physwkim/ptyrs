@@ -4,38 +4,17 @@
 //! `cargo run --release -p ptyrs-nn --example train_ptychonn -- <out_dir> [frame] [bin] [nscan] [epochs] [width]`
 //! (defaults 256, 4, 200, 30, 32). Writes the predictor to `out_dir`.
 
+mod common;
+
 use std::path::PathBuf;
 use std::time::Instant;
 
 use burn::prelude::*;
-use ptyrs_core::{AddrTable, Geometry, Object, Probe, Scan, required_obj_shape, sim};
-use ptyrs_nn::data::random_object;
+use common::scan;
+use ptyrs_core::{Probe, sim};
 use ptyrs_nn::predictor::{
     PredictorConfig, Samples, TrainOptions, mean_frame_total, object_patches, train,
 };
-
-/// The engine's parity geometry (`ptyrs-engine/tests/common`).
-fn geometry(frame: usize) -> Geometry {
-    Geometry::new(1.5e-10, 1.0, 75e-6, [frame, frame]).unwrap()
-}
-
-/// A 100-point Fermat scan, 4 object pixels apart, of `object` (random when `None`).
-fn scan(
-    frame: usize,
-    probe: &Probe,
-    seed: u64,
-    object: Option<Object>,
-) -> (Scan, Object, AddrTable) {
-    let g = geometry(frame);
-    let pixel = g.pixel_size_object();
-    let positions = sim::fermat(100, 4.0 * pixel[1]);
-    let pre = positions.pynx_preprocess(pixel);
-    let shape = required_obj_shape(&pre, pixel, g.frame, 8);
-    let object = object.unwrap_or_else(|| random_object(shape, seed));
-    let addr = AddrTable::new(&pre, pixel, g.frame, object.plane_shape(), 1, 1).unwrap();
-    let scan = ptyrs_engine::sim::simulate(g, positions, &object, probe, 1e6, None, seed).unwrap();
-    (scan, object, addr)
-}
 
 /// Samples of the scans `seeds`, simulated on all host threads.
 fn samples(config: &PredictorConfig, probe: &Probe, seeds: Vec<u64>) -> Samples {
@@ -118,17 +97,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     predictor.save(&out)?;
 
-    // Held-out scans: random objects and the engine's test object.
-    let shape = {
-        let (_, o, _) = scan(frame, &probe, 0, None);
-        o.plane_shape()
-    };
-    let held: Vec<(&str, Option<Object>, u64)> = vec![
-        ("random", None, 2_000_000),
-        ("random", None, 2_000_001),
-        ("sim::object", Some(sim::object(shape)), 2_000_002),
-    ];
-    for (name, object, seed) in held {
+    for (name, object, seed) in common::held_out(frame, &probe) {
         let (scan, truth, addr) = scan(frame, &probe, seed, object);
         let patches = predictor.predict(&scan.counts, mean_frame_total(&scan.counts))?;
         let want = object_patches(&truth, &addr, config.patch());
