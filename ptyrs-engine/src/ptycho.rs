@@ -345,7 +345,11 @@ impl Ptycho {
         self.object.as_mut_slice().iter_mut().for_each(|c| *c *= fo);
     }
 
-    /// [`zero_phase_ramp`] of the object and probe.
+    /// PyNX `ZeroPhaseRamp`: centre the probe's far field. With `(cy, cx)` the centre of mass
+    /// of `Σ_modes |fftshift(FT(fftshift(P)))|²`, `dx = cx − nx/2`, `dy = cy − ny/2`:
+    /// `P *= exp(−2πi(dx·(x − nx/2)/nx + dy·(y − ny/2)/ny))` and
+    /// `O *= exp(+2πi(dx·(x − nxo/2)/nx + dy·(y − nyo/2)/ny))` (integer halves). The two
+    /// ramps cancel in every view up to a constant phase, so the LLK is unchanged.
     pub fn zero_phase_ramp(&mut self) {
         zero_phase_ramp(&self.fft, &mut self.object, &mut self.probe);
     }
@@ -651,11 +655,8 @@ impl Ptycho {
     }
 }
 
-/// PyNX `ZeroPhaseRamp`: centre the probe's far field. With `(cy, cx)` the centre of mass
-/// of `Σ_modes |fftshift(FT(fftshift(P)))|²`, `dx = cx − nx/2`, `dy = cy − ny/2`:
-/// `P *= exp(−2πi(dx·(x − nx/2)/nx + dy·(y − ny/2)/ny))` and
-/// `O *= exp(+2πi(dx·(x − nxo/2)/nx + dy·(y − nyo/2)/ny))` (integer halves). The two
-/// ramps cancel in every view up to a constant phase, so the LLK is unchanged.
+/// [`Ptycho::zero_phase_ramp`] of the given arrays, which the GPU backend also runs on its
+/// downloads.
 pub(crate) fn zero_phase_ramp(fft: &Fft2, object: &mut Object, probe: &mut Probe) {
     let [ny, nx] = probe.plane_shape();
     let n = ny * nx;
