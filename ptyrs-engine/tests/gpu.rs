@@ -160,7 +160,8 @@ fn rpie_matches_cpu() {
 }
 
 /// Every update consumes its sums, so each algorithm starts from zero sums whatever ran
-/// before: rPIE's steps, then AP's and DM's updates, against the CPU.
+/// before: rPIE's steps, then AP's and DM's updates, against the CPU. The last rPIE batch
+/// size differs, so its epochs get their own batches and graph.
 #[test]
 fn algorithm_switches_match_cpu() {
     let (scan, object, probe) = start(2, true);
@@ -182,6 +183,10 @@ fn algorithm_switches_match_cpu() {
             ..DmParams::default()
         }),
         Params::Rpie(common::RPIE),
+        Params::Rpie(RpieParams {
+            batch_size: 3,
+            ..common::RPIE
+        }),
     ];
     for params in steps {
         let step = Step { params, count: 3 };
@@ -214,9 +219,10 @@ fn gpu_rejects_what_it_cannot_run() {
     assert!(GpuPtycho::new(&ctx(), &scan, object, probe, zero).is_err());
 }
 
-/// Steady-state AP and DM cycles replayed from captured graphs give the eager bits: the
-/// object, the probe and every LLK record, across the parameter and algorithm switches that
-/// make a new capture and a call that reuses the last one, with a short last stack.
+/// Steady-state AP and DM cycles and rPIE epochs replayed from captured graphs give the
+/// eager bits: the object, the probe and every LLK record, across the parameter and
+/// algorithm switches that make a new capture and calls that reuse the last one, with a
+/// short last stack and batch.
 #[test]
 fn graph_replays_bitwise_like_eager() {
     let (scan, object, probe) = start(2, true);
@@ -234,11 +240,26 @@ fn graph_replays_bitwise_like_eager() {
             calc_llk: 3,
             zero_phase_ramp: false,
         };
+        let rpie = RpieParams {
+            calc_llk: 3,
+            ..common::RPIE
+        };
         // new capture, new parameters, new algorithm, the same graph in a second call
         g.dm(&dm, 7).unwrap();
         g.dm(&DmParams { alpha: 0.1, ..dm }, 4).unwrap();
         g.ap(&ap, 7).unwrap();
         g.ap(&ap, 4).unwrap();
+        // batches of 4 leave a short last one; batches of 3 are new buffers and a new graph
+        g.rpie(&rpie, 7).unwrap();
+        g.rpie(&rpie, 4).unwrap();
+        g.rpie(
+            &RpieParams {
+                batch_size: 3,
+                ..rpie
+            },
+            4,
+        )
+        .unwrap();
         let bits = |s: &Stack<C64>| -> Vec<[u64; 2]> {
             s.as_slice()
                 .iter()
@@ -257,7 +278,7 @@ fn graph_replays_bitwise_like_eager() {
         (bits(&g.object().unwrap()), bits(&g.probe().unwrap()), llk)
     };
     let (eager, graph) = (run(false), run(true));
-    assert_eq!(eager.2.len(), 3 + 3 + 2 + 2);
+    assert_eq!(eager.2.len(), 3 + 3 + 2 + 2 + 3 + 2 + 2);
     assert!(eager.2 == graph.2, "LLK records differ");
     assert!(eager.0 == graph.0, "object differs");
     assert!(eager.1 == graph.1, "probe differs");

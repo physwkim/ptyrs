@@ -15,8 +15,8 @@ use ptyrs_gpu::{
     ViewDims, Views,
 };
 
-use super::{Epoch, Frames, GpuOptions, stack_buf_len, stacks, to_u32};
-use crate::EngineError;
+use super::{Epoch, Frames, GpuOptions, plane_len, stack_buf_len, stacks, to_u32};
+use crate::{ApParams, DmParams, EngineError, RpieParams};
 
 /// Every buffer, module and plan a cycle launches on, and the graph of the last steady
 /// cycle captured from them.
@@ -42,10 +42,106 @@ pub(super) struct Device {
     run: Option<EpochRun>,
 }
 
-/// A steady cycle and the graph captured for it.
+/// A steady cycle with the buffers only it uses, and with graphs the graph captured for it.
 struct EpochRun {
-    epoch: Epoch,
-    graph: CudaGraph<()>,
+    cycle: Cycle,
+    graph: Option<CudaGraph<()>>,
+}
+
+/// A steady cycle's parameters and the buffers only it uses, built together, so a graph
+/// captured from it bakes in sizes that match its buffers.
+enum Cycle {
+    Ap(ApParams),
+    Dm(DmParams),
+    Rpie(RpieParams, Box<RpieScratch>),
+}
+
+impl Cycle {
+    fn epoch(&self) -> Epoch {
+        match self {
+            Self::Ap(p) => Epoch::Ap(*p),
+            Self::Dm(p) => Epoch::Dm(*p),
+            Self::Rpie(p, _) => Epoch::Rpie(*p),
+        }
+    }
+}
+
+/// rPIE's batches (one table entry and plan length each) and buffers, sized for the longest
+/// batch.
+struct RpieScratch {
+    batches: Vec<Frames>,
+    /// Values per frame plane.
+    n: u32,
+    table: StackTable,
+    /// One plan per batch length, indexed by [`Frames::plan`].
+    plans: Vec<Plan2d>,
+    psi: DeviceBuffer<C32>,
+    dlt: DeviceBuffer<C32>,
+    omax: DeviceBuffer<f32>,
+    ptilde: DeviceBuffer<C32>,
+    pmax: DeviceBuffer<f32>,
+    ones: DeviceBuffer<C32>,
+}
+
+/// An [`RpieScratch`] lent to an epoch.
+pub(super) struct RpieBufs<'a> {
+    pub batches: &'a [Frames],
+    /// Values per frame plane.
+    pub n: u32,
+    pub table: &'a StackTable,
+    pub plans: Plans<'a>,
+    /// The batch's exit waves, then its object windows `O_v q`.
+    pub psi: &'a mut DeviceBuffer<C32>,
+    /// pty-chi's `Δ`, then the probe step's weighted `Δ`.
+    pub dlt: &'a mut DeviceBuffer<C32>,
+    /// Per-view `max |O_v|^2`.
+    pub omax: &'a mut DeviceBuffer<f32>,
+    /// `P / ((1 - a_o) |P|^2 + a_o max_i sum_m |P_m|^2)`.
+    pub ptilde: &'a mut DeviceBuffer<C32>,
+    pub pmax: &'a mut DeviceBuffer<f32>,
+    /// A probe of ones, so `obj_probe_to_psi` yields the object windows.
+    pub ones: &'a DeviceBuffer<C32>,
+}
+
+impl RpieScratch {
+    fn new(
+        stream: &Arc<CudaStream>,
+        dims: &ViewDims,
+        params: &RpieParams,
+        nprobe_values: usize,
+    ) -> Result<Self, EngineError> {
+        let (batches, table, plans) =
+            stacks(stream, dims, to_u32("batch_size", params.batch_size)?)?;
+        let len = stack_buf_len(dims, &table);
+        let nk_max = table.nf_max() as usize * dims.nmode as usize;
+        Ok(Self {
+            batches,
+            n: to_u32("frame size", plane_len(dims))?,
+            table,
+            plans,
+            psi: DeviceBuffer::zeroed(stream, len)?,
+            dlt: DeviceBuffer::zeroed(stream, len)?,
+            omax: DeviceBuffer::zeroed(stream, nk_max)?,
+            ptilde: DeviceBuffer::zeroed(stream, nprobe_values)?,
+            pmax: DeviceBuffer::zeroed(stream, 1)?,
+            ones: DeviceBuffer::from_host(stream, &vec![C32 { re: 1.0, im: 0.0 }; nprobe_values])?,
+        })
+    }
+
+    fn lend(&mut self) -> RpieBufs<'_> {
+        RpieBufs {
+            batches: &self.batches,
+            n: self.n,
+            table: &self.table,
+            plans: Plans(&mut self.plans),
+            psi: &mut self.psi,
+            dlt: &mut self.dlt,
+            omax: &mut self.omax,
+            ptilde: &mut self.ptilde,
+            pmax: &mut self.pmax,
+            ones: &self.ones,
+        }
+    }
 }
 
 /// One stack's buffers, sized like every stack's for the table's `nf_max` frames.
@@ -212,30 +308,54 @@ impl Device {
         }
     }
 
-    /// Enqueues one `epoch` cycle: replays its graph, captured (on a side stream, so nothing
-    /// runs) when the cached one is for another epoch, or launches it eagerly without graphs.
-    pub fn steady(&mut self, epoch: Epoch) -> Result<(), GpuError> {
-        if !self.use_graph {
-            let ctx = self.context();
-            return self.lend().epoch_cycle(&ctx, epoch);
-        }
-        let run = match self.run.take() {
-            Some(run) if run.epoch == epoch => run,
-            _ => {
-                let side = self.kernels.context().new_stream()?;
-                let mut bufs = self.lend();
-                let op = ptyrs_gpu::record(|ctx| bufs.epoch_cycle(ctx, epoch));
-                EpochRun {
-                    epoch,
-                    graph: CudaGraph::capture(side, op)?,
-                }
-            }
+    /// Enqueues one `epoch` cycle: replays the graph captured for it (on a side stream, so
+    /// nothing runs), or launches it eagerly without graphs. The cycle's buffers and graph
+    /// are kept until another epoch replaces them.
+    pub fn steady(&mut self, epoch: Epoch) -> Result<(), EngineError> {
+        let mut run = match self.run.take() {
+            Some(run) if run.cycle.epoch() == epoch => run,
+            _ => self.new_run(epoch)?,
         };
         let ctx = self.context();
-        // SAFETY: `ctx` holds the replay's leases on every captured buffer until the stream
-        // has run it, so no other stream can touch them meanwhile.
-        let launched = unsafe { run.graph.launch().execute(&ctx) };
+        let done = match &run.graph {
+            // SAFETY: `ctx` holds the replay's leases on every captured buffer until the
+            // stream has run it, so no other stream can touch them meanwhile.
+            Some(graph) => unsafe { graph.launch().execute(&ctx) }.map_err(GpuError::from),
+            None => self.lend().cycle(&ctx, &mut run.cycle),
+        };
         self.run = Some(run);
-        Ok(launched?)
+        Ok(done?)
+    }
+
+    /// The buffers of `epoch`'s cycle, and with graphs its graph, captured from them.
+    fn new_run(&mut self, epoch: Epoch) -> Result<EpochRun, EngineError> {
+        let mut cycle = match epoch {
+            Epoch::Ap(p) => Cycle::Ap(p),
+            Epoch::Dm(p) => Cycle::Dm(p),
+            Epoch::Rpie(p) => {
+                let scratch = RpieScratch::new(&self.stream, &self.dims(), &p, self.probe.len())?;
+                Cycle::Rpie(p, Box::new(scratch))
+            }
+        };
+        let graph = if self.use_graph {
+            let side = self.kernels.context().new_stream()?;
+            let mut bufs = self.lend();
+            let op = ptyrs_gpu::record(|ctx| bufs.cycle(ctx, &mut cycle));
+            Some(CudaGraph::capture(side, op).map_err(GpuError::from)?)
+        } else {
+            None
+        };
+        Ok(EpochRun { cycle, graph })
+    }
+}
+
+impl Bufs<'_> {
+    /// One steady cycle of `cycle` enqueued on `ctx`.
+    fn cycle(&mut self, ctx: &ExecutionContext, cycle: &mut Cycle) -> Result<(), GpuError> {
+        match cycle {
+            Cycle::Ap(p) => self.ap_cycle(ctx, p, false),
+            Cycle::Dm(p) => self.dm_cycle(ctx, p, false),
+            Cycle::Rpie(p, scratch) => self.rpie_epoch(ctx, p, &mut scratch.lend()),
+        }
     }
 }

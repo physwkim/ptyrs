@@ -5,7 +5,7 @@
 //! and for each comma-separated size (frames per stack; rPIE frames per batch) runs 5 untimed
 //! cycles, then times `ncycle` cycles without LLK or phase-ramp removal, as
 //! `scripts/compare_pynx.py --time` times PyNX. `graph` replays steady-state AP and DM cycles
-//! from the graph the untimed cycles captured ([`GpuOptions::graph`]); rPIE runs eagerly.
+//! and rPIE epochs from the graph the untimed cycles captured ([`GpuOptions::graph`]).
 
 use std::time::Instant;
 

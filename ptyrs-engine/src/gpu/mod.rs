@@ -10,10 +10,10 @@
 //! Each cycle enqueues through its own `ExecutionContext`, dropped when the cycle has been
 //! enqueued. Within a cycle nothing reads back to the host: LLK partials are downloaded only
 //! in the cycles that record one, and the arrays only when asked for. An AP or DM cycle that
-//! records no LLK in-cycle replays one captured CUDA graph (DESIGN B2, [`GpuOptions::graph`]),
-//! kept until another algorithm or other parameters need a new one. Each algorithm is its
-//! own module over the per-stack steps here, so M2's fused passes can replace those steps one
-//! algorithm at a time.
+//! records no LLK in-cycle, and every rPIE epoch, replays one captured CUDA graph (DESIGN B2,
+//! [`GpuOptions::graph`]), kept with the buffers it captured until another algorithm or other
+//! parameters need new ones. Each algorithm is its own module over the per-stack steps here,
+//! so M2's fused passes can replace those steps one algorithm at a time.
 
 mod ap;
 mod device;
@@ -33,15 +33,15 @@ use ptyrs_gpu::{C32, Error as GpuError, LlkSums, StackTable, ViewAddr, ViewDims}
 use device::{Bufs, Device};
 
 use crate::ptycho::{Algorithm, LlkRecord, zero_phase_ramp};
-use crate::{ApParams, DmParams, EngineError, Fft2, Llk};
+use crate::{ApParams, DmParams, EngineError, Fft2, Llk, RpieParams};
 
 /// How [`GpuPtycho`] batches its work.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GpuOptions {
     /// Frames per stack (the last stack may be shorter); PyNX's default is 16.
     pub stack_size: usize,
-    /// Replay steady-state AP and DM cycles as one captured CUDA graph each instead of
-    /// launching them kernel by kernel; both give the same bits.
+    /// Replay steady-state AP and DM cycles and rPIE epochs as one captured CUDA graph each
+    /// instead of launching them kernel by kernel; both give the same bits.
     pub graph: bool,
 }
 
@@ -62,6 +62,8 @@ enum Epoch {
     Ap(ApParams),
     /// A DM cycle after the first of a call.
     Dm(DmParams),
+    /// An rPIE epoch.
+    Rpie(RpieParams),
 }
 
 /// One stack (or rPIE batch): the frames its table entry holds, for what the host needs of
@@ -347,13 +349,6 @@ impl GpuPtycho {
 
 /// The per-stack steps of every algorithm, on the lent device state.
 impl Bufs<'_> {
-    fn epoch_cycle(&mut self, ctx: &ExecutionContext, epoch: Epoch) -> Result<(), GpuError> {
-        match epoch {
-            Epoch::Ap(params) => self.ap_cycle(ctx, &params, false),
-            Epoch::Dm(params) => self.dm_cycle(ctx, &params, false),
-        }
-    }
-
     /// LLK partials of the current estimate into every stack's `llk`, through the scratch
     /// stack.
     fn forward_llk(&mut self, ctx: &ExecutionContext) -> Result<(), GpuError> {
