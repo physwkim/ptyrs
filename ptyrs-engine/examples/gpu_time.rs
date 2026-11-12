@@ -1,18 +1,22 @@
 //! Per-cycle time of [`GpuPtycho`] on CUDA device 0, the M1 baseline for M2.
 //!
-//! `cargo run --release -p ptyrs-engine --example gpu_time -- <dm|ap|rpie> [ncycle] [nprobe] [frame] [npos] [step] [sizes] [graph|eager] [calc_llk] [fused|m1]`
+//! `cargo run --release -p ptyrs-engine --example gpu_time -- <dm|ap|ml|rpie> [ncycle] [nprobe] [frame] [npos] [step] [sizes] [graph|eager] [calc_llk] [fused|m1]`
 //! (defaults 50, 2, 256, 400, 16 object pixels, `16`, `graph`, 0, `fused`) builds the
 //! `llk_trace` scan, and for each comma-separated size (frames per stack; rPIE frames per
 //! batch) runs 5 untimed cycles, then times `ncycle` cycles without phase-ramp removal, with
 //! an LLK record every `calc_llk` cycles (0: none, as `scripts/compare_pynx.py --time` times
-//! PyNX). `graph` replays steady-state AP and DM cycles, rPIE epochs and LLK passes from the
-//! graphs the untimed cycles captured ([`GpuOptions::graph`]); `fused` runs AP and DM stacks
-//! and the LLK pass by the fused passes, `m1` by M1's launches ([`GpuOptions::fused`]).
+//! PyNX, and `scripts/compare_pynx_ml.py --time` PyNX ML). `graph` replays steady-state AP,
+//! DM and ML cycles, rPIE epochs and LLK passes from the graphs the untimed cycles captured
+//! ([`GpuOptions::graph`]); `fused` runs AP and DM stacks and the LLK pass by the fused
+//! passes, `m1` by M1's launches ([`GpuOptions::fused`]). ML updates object and probe and
+//! always runs M1's launches.
 
 use std::time::Instant;
 
 use cuda_core::CudaContext;
-use ptyrs_engine::{ApParams, DmParams, EngineError, GpuOptions, GpuPtycho, Ptycho, RpieParams};
+use ptyrs_engine::{
+    ApParams, DmParams, EngineError, GpuOptions, GpuPtycho, MlParams, Ptycho, RpieParams,
+};
 
 #[path = "../tests/common/mod.rs"]
 mod common;
@@ -22,10 +26,10 @@ mod ptychi;
 const WARMUP: usize = 5;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let usage = "usage: gpu_time <dm|ap|rpie> [ncycle] [nprobe] [frame] [npos] [step] [sizes] [graph|eager] [calc_llk] [fused|m1]";
+    let usage = "usage: gpu_time <dm|ap|ml|rpie> [ncycle] [nprobe] [frame] [npos] [step] [sizes] [graph|eager] [calc_llk] [fused|m1]";
     let mut args = std::env::args().skip(1);
     let algo = args.next().ok_or(usage)?;
-    if !["dm", "ap", "rpie"].contains(&algo.as_str()) {
+    if !["dm", "ap", "ml", "rpie"].contains(&algo.as_str()) {
         return Err(usage.into());
     }
     let mut next = |default: usize| args.next().map_or(Ok(default), |s| s.parse());
@@ -46,7 +50,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None | Some("fused") => true,
         Some("m1") => false,
         Some(_) => return Err(usage.into()),
-    };
+    } && algo != "ml";
 
     let (scan, object, probe) = common::dm_scenario(frame, npos, nprobe, 2e5, step);
     let mut p = Ptycho::new(&scan, object, probe)?;
@@ -69,6 +73,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         zero_phase_ramp: false,
         ..DmParams::default()
     };
+    let ml = MlParams {
+        update_object: true,
+        update_probe: true,
+        calc_llk,
+        zero_phase_ramp: false,
+    };
     for size in sizes {
         let stack_size = if algo == "rpie" { 16 } else { size };
         let options = GpuOptions {
@@ -87,6 +97,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             match algo.as_str() {
                 "dm" => g.dm(&dm, n),
                 "ap" => g.ap(&ap, n),
+                "ml" => g.ml(&ml, n),
                 _ => g.rpie(&rpie, n),
             }
         };
