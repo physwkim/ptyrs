@@ -17,6 +17,7 @@ pub mod pipeline;
 pub mod pos;
 pub mod pv_out;
 pub mod pva_source;
+pub mod recon;
 pub mod recv;
 pub mod ring;
 pub mod scan;

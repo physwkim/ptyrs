@@ -159,6 +159,11 @@ impl LiveObject {
         self.cap
     }
 
+    /// Object bytes backed so far, every plane.
+    pub fn mapped_bytes(&self) -> usize {
+        self.obj.mapped_bytes()
+    }
+
     pub fn stream(&self) -> &Arc<Stream> {
         &self.stream
     }

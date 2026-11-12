@@ -1757,6 +1757,8 @@ dependencies = [
  "libc",
  "lz4_flex",
  "ptyrs-core",
+ "ptyrs-engine",
+ "ptyrs-fft",
  "ptyrs-gpu",
  "rust-hdf5",
  "rustfft",
