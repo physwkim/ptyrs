@@ -20,7 +20,7 @@ use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig};
 use ptyrs_kernels::FFT_EPT;
 use ptyrs_kernels::fused::{
-    COL_FFT_SKEW, FUSED_BACKGROUND, FUSED_BACKGROUND_SUMS, FUSED_COL_THREADS, FUSED_COLS, FUSED_DM,
+    FFT_SKEW, FUSED_BACKGROUND, FUSED_BACKGROUND_SUMS, FUSED_COL_THREADS, FUSED_COLS, FUSED_DM,
     FUSED_GRAD, FUSED_LLK, FUSED_PROJECT, FUSED_ROW_THREADS, FUSED_SCALE, FUSED_SCALE_SUMS,
     FUSED_SHIFT_DEN, FUSED_SHIFT_OBJ, FUSED_SHIFT_POSITION, FUSED_SHIFT_PROBE, FUSED_TO_PSI,
     FusedCfg, FusedPtrs, col_slot_bytes,
@@ -112,12 +112,12 @@ impl Shape {
             return Err(bad(format!("{col_threads} threads per column block")));
         }
         let col_threads = col_threads as u32;
-        let col_fft = sy + COL_FFT_SKEW;
+        let col_fft = sy + FFT_SKEW;
         let s = Self {
             ny: side_y,
             nx: side_x,
             rows,
-            row_smem: rows * sx,
+            row_smem: rows * (sx + FFT_SKEW),
             col_threads,
             col_tile_fft: 2 * FUSED_COLS * ny
                 + (col_threads / (ny / FFT_EPT)) * col_fft.max(4 * ny),
@@ -142,7 +142,7 @@ impl Shape {
         }
         Ok(LaunchConfig {
             grid_dim: (g.ny / self.rows, planes as u32, 1),
-            block_dim: (g.nx / FFT_EPT, self.rows, 1),
+            block_dim: (FUSED_ROW_THREADS, 1, 1),
             shared_mem_bytes: self.row_smem,
         })
     }
@@ -181,10 +181,10 @@ impl Shape {
 
     /// A row pass over `nplane` planes `[ny, nx]`: `spectrum_rows`, `shift_probe_rows`.
     fn plane_rows(&self, nplane: u32) -> LaunchConfig {
-        let (ny, nx) = (self.ny as u32, self.nx as u32);
+        let ny = self.ny as u32;
         LaunchConfig {
             grid_dim: (ny / self.rows, nplane, 1),
-            block_dim: (nx / FFT_EPT, self.rows, 1),
+            block_dim: (FUSED_ROW_THREADS, 1, 1),
             shared_mem_bytes: self.row_smem,
         }
     }

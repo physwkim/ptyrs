@@ -28,8 +28,8 @@ use cuda_device::{async_copy, device, shared::DynamicSharedArray, thread};
 use crate::FFT_EPT;
 use crate::pixel::{
     LlkPartial, MASKED, PositionPartial, ScalePartial, StackCtl, StackGeom, SumPtrs, TilePtrs,
-    ViewAddr, cmul, cmul_conj, freq, llk_add, load_c, obj_pixel_sources, psi_index, quad_phase,
-    ramp, sample_obj, stack_frames, store_c,
+    ViewAddr, WARP, cmul, cmul_conj, freq, llk_add, load_c, obj_pixel_sources, psi_index,
+    quad_phase, ramp, sample_obj, stack_frames, store_c,
 };
 
 /// [`rows_fwd`] builds the DM reflection `R = (2 - alpha) PO - (1 - alpha) psi` instead of
@@ -176,13 +176,12 @@ pub(crate) unsafe fn block_fft<const N: u32, const INV: bool>(
     }
 }
 
-/// Bytes a column pass gives each FFT past the FFT's own `smem_per_fft`. A warp holds
-/// `FUSED_COLS` FFTs at one thread index each, so unskewed their exchange addresses repeat
-/// at the FFT stride, a multiple of 128 bytes, and collide in one bank.
-pub const COL_FFT_SKEW: u32 = 16;
+/// Bytes a column or row pass gives each FFT past the FFT's own `smem_per_fft`: unskewed, the
+/// exchange addresses of FFTs that consecutive lanes hold at one thread index repeat at the
+/// FFT stride, a multiple of 128 bytes, and collide in one bank.
+pub const FFT_SKEW: u32 = 16;
 
-/// [`block_fft`] of a column pass, FFT `b` at `b * (smem_per_fft + COL_FFT_SKEW)` bytes
-/// into `s`.
+/// [`block_fft`] of a column pass, FFT `b` at `b * (smem_per_fft + FFT_SKEW)` bytes into `s`.
 ///
 /// # Safety
 ///
@@ -196,26 +195,52 @@ unsafe fn col_fft<const N: u32, const INV: bool>(
     bpb: u32,
 ) {
     // `block_fft` places FFT `b` at `b * smem_per_fft`; the shift adds the skew.
-    unsafe { block_fft::<N, INV>(r, s.add((b * COL_FFT_SKEW) as usize), b, f, bpb) }
+    unsafe { block_fft::<N, INV>(r, s.add((b * FFT_SKEW) as usize), b, f, bpb) }
 }
 
-/// [`block_fft`] of a row pass: blockDim `(NX / FFT_EPT, rows)`, one row per FFT.
+/// This thread of a row pass of `NX`: thread `f` of block row `b`, stored row `ys`. The 1D
+/// block of `FUSED_ROW_THREADS` threads holds `FUSED_ROW_THREADS / tpf` rows (`tpf = NX /
+/// FFT_EPT`), each warp `group = WARP / tpf` whole rows with lane `l` thread `l / group` of
+/// row `l % group`: the warp touches global memory as in row-major lane order, while its
+/// lanes' exchange addresses spread over the rows' [`FFT_SKEW`].
+#[derive(Clone, Copy)]
+struct RowLane {
+    ys: u32,
+    b: u32,
+    f: u32,
+}
+
 #[device]
-pub(crate) unsafe fn row_fft<const NX: u32, const INV: bool>(r: &mut [f32; 2 * FFT_EPT as usize]) {
+fn row_lane<const NX: u32>() -> RowLane {
+    let tpf = NX / FFT_EPT;
+    let group = WARP / tpf;
+    let tid = thread::threadIdx_x();
+    let (w, l) = (tid / WARP, tid % WARP);
+    let b = w * group + l % group;
+    RowLane {
+        ys: thread::blockIdx_x() * (FUSED_ROW_THREADS / tpf) + b,
+        b,
+        f: l / group,
+    }
+}
+
+/// [`block_fft`] of a row pass, one row per FFT at `lane`.
+#[device]
+unsafe fn row_fft<const NX: u32, const INV: bool>(
+    r: &mut [f32; 2 * FFT_EPT as usize],
+    lane: RowLane,
+) {
     let s = DynamicSharedArray::<u8, 16>::get();
-    let (b, f, bpb) = (
-        thread::threadIdx_y(),
-        thread::threadIdx_x(),
-        thread::blockDim_y(),
-    );
-    unsafe { block_fft::<NX, INV>(r, s, b, f, bpb) }
+    let skew = lane.b * FFT_SKEW;
+    let rows = FUSED_ROW_THREADS / (NX / FFT_EPT);
+    unsafe { block_fft::<NX, INV>(r, s.add(skew as usize), lane.b, lane.f, rows) }
 }
 
 /// Pass A: `work[kl, ys, :] = FFT_x(w[ys, :])` for view `k0 + kl` of the stack and stored
 /// row `ys`, with `w = PO` as `kernels::obj_probe_to_psi` stores it or, under `FUSED_DM`,
 /// `w = (2 - a) PO - (1 - a) psi` as `kernels::dm_reflect` computes it. Reads `obj`,
 /// `probe`, `views` and under `FUSED_DM` `psi`; writes `work`. Grid `(ny / rows, nf_max *
-/// nmode)`, block `(nx / FFT_EPT, rows)`, dynamic shared memory `rows` row FFTs.
+/// nmode)`, block `FUSED_ROW_THREADS`, dynamic shared memory `rows` row FFTs ([`FFT_SKEW`]).
 ///
 /// # Safety
 ///
@@ -263,8 +288,8 @@ unsafe fn rows_fwd_with<const NX: u32, const SHIFT: bool>(
     }
     let (ny, nx) = (g.ny, NX);
     let n = ny as usize * nx as usize;
-    let ys = thread::blockIdx_x() * thread::blockDim_y() + thread::threadIdx_y();
-    let t = thread::threadIdx_x();
+    let lane = row_lane::<NX>();
+    let (ys, t) = (lane.ys, lane.f);
     let tpf = nx / FFT_EPT;
     // Natural row stored at row `ys` (the shift is its own inverse).
     let y = (ys + ny / 2) % ny;
@@ -282,7 +307,7 @@ unsafe fn rows_fwd_with<const NX: u32, const SHIFT: bool>(
                 r[2 * i as usize] = w.0;
                 r[2 * i as usize + 1] = w.1;
             }
-            row_fft::<NX, true>(&mut r);
+            row_fft::<NX, true>(&mut r, lane);
             thread::sync_threads();
         }
         #[unroll]
@@ -303,7 +328,7 @@ unsafe fn rows_fwd_with<const NX: u32, const SHIFT: bool>(
             r[2 * i as usize] = w.0;
             r[2 * i as usize + 1] = w.1;
         }
-        row_fft::<NX, false>(&mut r);
+        row_fft::<NX, false>(&mut r, lane);
         #[unroll]
         for i in 0..FFT_EPT {
             let k = 2 * i as usize;
@@ -332,7 +357,7 @@ unsafe fn rows_fwd_with<const NX: u32, const SHIFT: bool>(
 /// FUSED_COLS`, `m = tid / (FUSED_COLS * tpf)`, so a warp's loads and stores cover whole
 /// row segments. Grid `(nx / FUSED_COLS, nf_max)`; dynamic shared memory
 /// `col_slot_bytes(flags, ny)` bytes of reduction slots, `2 * FUSED_COLS * ny` bytes of
-/// counts, then the larger of `nmode * FUSED_COLS` column FFTs ([`COL_FFT_SKEW`]) and
+/// counts, then the larger of `nmode * FUSED_COLS` column FFTs ([`FFT_SKEW`]) and
 /// `4 * nmode * ny * FUSED_COLS` bytes.
 /// `counts` must be 16-byte aligned.
 ///
@@ -549,8 +574,8 @@ fn new_waves(p: FusedPtrs, cfg: FusedCfg) -> *mut f32 {
 /// under `FUSED_DM` `proj + (1 - a) (PO - R)` with `R = (2 - a) PO - (1 - a) psi` (the
 /// arithmetic of `kernels::dm_reflect` then `kernels::add_c32`); it goes to
 /// `new_waves`. Reads `work`, `views`, and under `FUSED_DM` `obj`, `probe` and `psi`;
-/// writes `work` or `psi`. Grid `(ny / rows, nf_max)`, block `(nx / FFT_EPT, rows)`, dynamic
-/// shared memory `rows` row FFTs.
+/// writes `work` or `psi`. Grid `(ny / rows, nf_max)`, block `FUSED_ROW_THREADS`, dynamic
+/// shared memory `rows` row FFTs ([`FFT_SKEW`]).
 ///
 /// # Safety
 ///
@@ -570,8 +595,8 @@ pub unsafe fn rows_inv<const NX: u32>(
     }
     let (ny, nx) = (g.ny, NX);
     let n = ny as usize * nx as usize;
-    let ys = thread::blockIdx_x() * thread::blockDim_y() + thread::threadIdx_y();
-    let t = thread::threadIdx_x();
+    let lane = row_lane::<NX>();
+    let (ys, t) = (lane.ys, lane.f);
     let tpf = nx / FFT_EPT;
     let y = (ys + ny / 2) % ny;
     let dm = cfg.flags & FUSED_DM != 0;
@@ -588,7 +613,7 @@ pub unsafe fn rows_inv<const NX: u32>(
                 r[2 * i as usize] = v.0;
                 r[2 * i as usize + 1] = v.1;
             }
-            row_fft::<NX, true>(&mut r);
+            row_fft::<NX, true>(&mut r, lane);
             let v = *p.views.add((k0 + m) as usize);
             #[unroll]
             for i in 0..FFT_EPT {
@@ -770,7 +795,7 @@ unsafe fn gather_with<const SHIFT: bool>(
 ///
 /// One 1D block of `nprobe * FUSED_COLS * tpf` threads mapped as [`cols`] maps modes, with
 /// probe modes for modes; grid `(nx / FUSED_COLS, nf_max)`; dynamic shared memory `8 * ny`
-/// bytes of `e_y`, then `nprobe * FUSED_COLS` column FFTs ([`COL_FFT_SKEW`]).
+/// bytes of `e_y`, then `nprobe * FUSED_COLS` column FFTs ([`FFT_SKEW`]).
 ///
 /// # Safety
 ///
@@ -866,8 +891,8 @@ pub unsafe fn shift_pre<const NY: u32>(
 /// `o` and `p` (`dW / dx = IDFT_x(T (-2 pi i freq(kx, nx)))`, `dW / dy = IDFT_x(T_y)`), a
 /// fixed tree over the block. Reads `work`, `views`, `obj`, `shift`, `shift_dy` under
 /// `FUSED_SHIFT_DEN`, and `psi` under `FUSED_DM`; writes the new waves and what the flags
-/// name. Grid `(ny / rows, nf_max)`, block `(nx / FFT_EPT, rows)` of `FUSED_ROW_THREADS`,
-/// dynamic shared memory the larger of `rows` row FFTs and `8 * FUSED_ROW_THREADS` bytes.
+/// name. Grid `(ny / rows, nf_max)`, block `FUSED_ROW_THREADS`, dynamic shared memory the
+/// larger of `rows` row FFTs ([`FFT_SKEW`]) and `8 * FUSED_ROW_THREADS` bytes.
 ///
 /// # Safety
 ///
@@ -887,8 +912,8 @@ pub unsafe fn shift_rows_inv<const NX: u32>(
     }
     let (ny, nx) = (g.ny, NX);
     let n = ny as usize * nx as usize;
-    let ys = thread::blockIdx_x() * thread::blockDim_y() + thread::threadIdx_y();
-    let t = thread::threadIdx_x();
+    let lane = row_lane::<NX>();
+    let (ys, t) = (lane.ys, lane.f);
     let tpf = nx / FFT_EPT;
     let y = (ys + ny / 2) % ny;
     let nobj = g.nmode / g.nprobe;
@@ -912,7 +937,7 @@ pub unsafe fn shift_rows_inv<const NX: u32>(
                 w[2 * i as usize] = v.0;
                 w[2 * i as usize + 1] = v.1;
             }
-            row_fft::<NX, true>(&mut w);
+            row_fft::<NX, true>(&mut w, lane);
             thread::sync_threads();
             if obj_terms {
                 #[unroll]
@@ -938,7 +963,7 @@ pub unsafe fn shift_rows_inv<const NX: u32>(
                     r[2 * i as usize] = v.0;
                     r[2 * i as usize + 1] = v.1;
                 }
-                row_fft::<NX, true>(&mut r);
+                row_fft::<NX, true>(&mut r, lane);
                 thread::sync_threads();
                 let v = *p.views.add((k0 + m) as usize);
                 let cplane = (fl * nobj + o) as usize * n + srow;
@@ -992,7 +1017,7 @@ pub unsafe fn shift_rows_inv<const NX: u32>(
                     r[2 * i as usize] = v.1 * wf;
                     r[2 * i as usize + 1] = -v.0 * wf;
                 }
-                row_fft::<NX, true>(&mut r);
+                row_fft::<NX, true>(&mut r, lane);
                 thread::sync_threads();
                 den_x += obj_weighted(p, g, k0 + pm, y, t, tpf, &r);
                 #[unroll]
@@ -1001,14 +1026,14 @@ pub unsafe fn shift_rows_inv<const NX: u32>(
                     r[2 * i as usize] = v.0;
                     r[2 * i as usize + 1] = v.1;
                 }
-                row_fft::<NX, true>(&mut r);
+                row_fft::<NX, true>(&mut r, lane);
                 thread::sync_threads();
                 den_y += obj_weighted(p, g, k0 + pm, y, t, tpf, &r);
             }
             if adjoint {
                 // Every read of the `T` row above is this thread's own elements, so `X` may
                 // overwrite them.
-                row_fft::<NX, false>(&mut acc);
+                row_fft::<NX, false>(&mut acc, lane);
                 thread::sync_threads();
                 #[unroll]
                 for i in 0..FFT_EPT {
@@ -1020,9 +1045,11 @@ pub unsafe fn shift_rows_inv<const NX: u32>(
         if den {
             let slots = DynamicSharedArray::<u8, 16>::get().cast::<f32>();
             let nt = FUSED_ROW_THREADS;
-            let tid = thread::threadIdx_y() * thread::blockDim_x() + t;
-            *slots.add(tid as usize) = den_y;
-            *slots.add((nt + tid) as usize) = den_x;
+            // Slot of pixel `(b, f)`: the tree's order is the block's pixels', not its lanes'.
+            let at = lane.b * tpf + t;
+            *slots.add(at as usize) = den_y;
+            *slots.add((nt + at) as usize) = den_x;
+            let tid = thread::threadIdx_x();
             let mut half = nt / 2;
             while half > 0 {
                 thread::sync_threads();
@@ -1088,7 +1115,7 @@ unsafe fn obj_weighted(
 ///
 /// Block and grid as [`shift_pre`]; dynamic shared memory `8 * ny` bytes of `e_y`, `8 *
 /// nprobe * FUSED_COLS * tpf` bytes of slots, then `nprobe * FUSED_COLS` column FFTs
-/// ([`COL_FFT_SKEW`]).
+/// ([`FFT_SKEW`]).
 ///
 /// # Safety
 ///
@@ -1253,9 +1280,10 @@ pub unsafe fn spectrum_rows<const NX: u32>(
 ) {
     let nx = NX;
     let n = ny as usize * nx as usize;
-    let ys = thread::blockIdx_x() * thread::blockDim_y() + thread::threadIdx_y();
+    let lane = row_lane::<NX>();
+    let ys = lane.ys;
     let plane = thread::blockIdx_y() as usize * n;
-    let t = thread::threadIdx_x();
+    let t = lane.f;
     let tpf = nx / FFT_EPT;
     let y = (ys + ny / 2) % ny;
     let mut r = [0.0f32; 2 * FFT_EPT as usize];
@@ -1270,7 +1298,7 @@ pub unsafe fn spectrum_rows<const NX: u32>(
             r[2 * i as usize] = v.0;
             r[2 * i as usize + 1] = v.1;
         }
-        row_fft::<NX, false>(&mut r);
+        row_fft::<NX, false>(&mut r, lane);
         #[unroll]
         for i in 0..FFT_EPT {
             let k = 2 * i as usize;
@@ -1284,7 +1312,7 @@ pub unsafe fn spectrum_rows<const NX: u32>(
 /// `inverse != 0`, times `scale`. One 1D block of `FUSED_COLS * NY / FFT_EPT` threads over
 /// columns `blockIdx.x * FUSED_COLS ..` (thread map of [`cols`] for one mode); grid `(nx /
 /// FUSED_COLS, nplane)`; dynamic shared memory `FUSED_COLS` column FFTs
-/// ([`COL_FFT_SKEW`]).
+/// ([`FFT_SKEW`]).
 ///
 /// # Safety
 ///
@@ -1333,9 +1361,10 @@ pub unsafe fn shift_cols<const NY: u32>(buf: *mut f32, nx: u32, inverse: u32, sc
 pub unsafe fn shift_probe_rows<const NX: u32>(sums: SumPtrs, out: SumPtrs, ny: u32, quad: f32) {
     let nx = NX;
     let n = ny as usize * nx as usize;
-    let ys = thread::blockIdx_x() * thread::blockDim_y() + thread::threadIdx_y();
+    let lane = row_lane::<NX>();
+    let ys = lane.ys;
     let plane = thread::blockIdx_y() as usize * n;
-    let t = thread::threadIdx_x();
+    let t = lane.f;
     let tpf = nx / FFT_EPT;
     let y = (ys + ny / 2) % ny;
     let inv_n = 1.0 / n as f32;
@@ -1347,7 +1376,7 @@ pub unsafe fn shift_probe_rows<const NX: u32>(sums: SumPtrs, out: SumPtrs, ny: u
             r[2 * i as usize] = v.0;
             r[2 * i as usize + 1] = v.1;
         }
-        row_fft::<NX, true>(&mut r);
+        row_fft::<NX, true>(&mut r, lane);
         #[unroll]
         for i in 0..FFT_EPT {
             let k = 2 * i as usize;
