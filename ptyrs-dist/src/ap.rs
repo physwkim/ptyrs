@@ -125,6 +125,14 @@ impl Window {
         out
     }
 
+    /// Index of `grid` tile `t` among the window's tiles, numbered as the kernels number the
+    /// tiles of an object of the window's shape.
+    fn tile(&self, grid: &TileGrid, t: usize) -> u32 {
+        let tile = grid.tile();
+        let ([ty, tx], [y0, x0]) = (grid.coords(t), self.at.map(|p| p / tile));
+        ((ty - y0) * self.shape[1].div_ceil(tile) + tx - x0) as u32
+    }
+
     /// `v` with offsets into the window.
     fn view(&self, v: &View) -> ViewAddr {
         let shift = |o: u32, a: usize| o - self.at[a] as u32;
@@ -152,6 +160,8 @@ struct RegionPlan {
     own: Vec<usize>,
     /// Halo tiles some local view reads.
     halo_read: Vec<u32>,
+    /// The region's tiles, numbered in the window: the only ones its updates write.
+    owned: Vec<u32>,
 }
 
 /// `len` object pixels of mode `m` from `(y, x)` on.
@@ -322,6 +332,11 @@ impl Plan {
                     .flat_map(|&f| addr.frame_views(f as usize).iter().map(|v| window.view(v)))
                     .collect(),
                 halo_read,
+                owned: region
+                    .own
+                    .iter()
+                    .map(|&t| window.tile(grid, t as usize))
+                    .collect(),
                 global,
                 stacks,
                 interior: ninterior,
@@ -714,7 +729,7 @@ impl State {
         Ok(Self {
             k: Kernels::load(gpu.ctx())?,
             ex: Exchange::load(gpu.ctx())?,
-            views: Views::new(stream, rp.dims, &rp.views)?,
+            views: Views::owned(stream, rp.dims, &rp.views, &rp.owned)?,
             bufs: FusedBufs::new(stream, &rp.dims, table.nf_max())?,
             table,
             counts: DeviceBuffer::from_host(stream, &counts)?,
@@ -1239,7 +1254,9 @@ mod tests {
 
     /// On the cases above at 2 and 4 GPUs every region's window holds its own tiles and the
     /// halo tiles it reads and is smaller than the object, and some start inside it, so the
-    /// bit-identity test runs windows with shifted offsets and their own row strides.
+    /// bit-identity test runs windows with shifted offsets and their own row strides. Each
+    /// window view touches the kernels' window tiles that `Window::tile` gives for the object
+    /// tiles its view touches, so the owned set `Views::owned` gets is the region's tiles.
     #[test]
     fn windows_hold_own_and_read_tiles_only() {
         let fermat = case(128, 2, |px| sim::fermat(200, 10.0 * px));
@@ -1272,6 +1289,26 @@ mod tests {
                         w.index(0, ty * tile, tx * tile);
                         w.index(0, end(ty, 0), end(tx, 1));
                     }
+                    let gdims = ViewDims {
+                        obj: obj.map(|n| n as u32),
+                        ..rp.dims
+                    };
+                    let ntx = |d: &ViewDims| d.tiles()[1];
+                    let global = rp
+                        .global
+                        .iter()
+                        .flat_map(|&f| p.addr().frame_views(f as usize));
+                    for (v, g) in rp.views.iter().zip(global) {
+                        let local: Vec<u32> = view_tiles(&rp.dims, v)
+                            .map(|[y, x]| y * ntx(&rp.dims) + x)
+                            .collect();
+                        let mapped: Vec<u32> = view_tiles(&gdims, &view_addr(g))
+                            .map(|[y, x]| w.tile(grid, (y * ntx(&gdims) + x) as usize))
+                            .collect();
+                        assert_eq!(local, mapped, "{scheme:?} on {ngpu}: {g:?}");
+                    }
+                    let [nty, ntx] = rp.dims.tiles();
+                    assert!(rp.owned.iter().all(|&t| t < nty * ntx));
                     shifted |= w.at != [0, 0];
                 }
                 assert!(shifted, "{scheme:?} on {ngpu}: every window starts at 0");
