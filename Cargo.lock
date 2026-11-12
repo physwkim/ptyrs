@@ -1871,6 +1871,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ptyrs-dist"
+version = "0.0.1"
+dependencies = [
+ "cuda-async",
+ "cuda-core",
+ "ptyrs-core",
+ "ptyrs-engine",
+ "ptyrs-gpu",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "ptyrs-engine"
 version = "0.0.1"
 dependencies = [
