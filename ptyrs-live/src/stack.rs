@@ -14,10 +14,8 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use cuda_async::device_operation::ExecutionContext;
-use cuda_bindings::{self as sys, CUdeviceptr};
-use cuda_core::{
-    DeviceBuffer, Function, IntoResult, RawDeviceBuffer, Stream, launch_kernel_on_stream,
-};
+use cuda_bindings as sys;
+use cuda_core::{DeviceBuffer, Function, IntoResult, Stream, launch_kernel_on_stream};
 use ptyrs_gpu::{StackRef, StackTable, ViewDims};
 
 use crate::grow::GrowError;
@@ -104,17 +102,6 @@ impl LiveFrames {
 
     pub fn nf_max(&self) -> u32 {
         self.table.nf_max()
-    }
-
-    /// The entry's [`StackCtl`](ptyrs_gpu::StackCtl), for kernels of the
-    /// caller's own that read it; they lease it through
-    /// [`Self::ctl_storage`].
-    pub fn ctl_ptr(&self) -> CUdeviceptr {
-        self.table.ptr()
-    }
-
-    pub fn ctl_storage(&self) -> &RawDeviceBuffer {
-        self.table.storage()
     }
 
     /// Lands frames `landed()..n`: steps queued afterwards cover them. The

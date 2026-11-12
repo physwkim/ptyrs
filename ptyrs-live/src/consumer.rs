@@ -125,17 +125,10 @@ pub fn run_checksum_consumer(
     let elems = store.frame_elems() as u32;
     let graph = LiveGraph::capture(&stream, |ctx| {
         frames.step(ctx)?;
-        ptyrs_gpu::lease(
-            ctx,
-            &[counts.storage(), frames.ctl_storage()],
-            &[sums.storage()],
-        )?;
-        let (mut p_frames, mut p_elems, mut p_ctl, mut p_out) = (
-            counts.cu_deviceptr(),
-            elems,
-            frames.ctl_ptr(),
-            sums.cu_deviceptr(),
-        );
+        let st = frames.stack();
+        ptyrs_gpu::lease(ctx, &[counts.storage(), st.storage()], &[sums.storage()])?;
+        let (mut p_frames, mut p_elems, mut p_ctl, mut p_out) =
+            (counts.cu_deviceptr(), elems, st.ctl(), sums.cu_deviceptr());
         let mut params = [
             (&raw mut p_frames).cast::<c_void>(),
             (&raw mut p_elems).cast(),
@@ -175,7 +168,7 @@ pub fn run_checksum_consumer(
     // SAFETY: the stream is idle; both sources are mapped and hold at least
     // the bytes copied.
     unsafe {
-        sys::cuMemcpyDtoH_v2((&raw mut done).cast(), frames.ctl_ptr(), 8).result()?;
+        sys::cuMemcpyDtoH_v2((&raw mut done).cast(), frames.stack().ctl(), 8).result()?;
         sys::cuMemcpyDtoH_v2(
             checksums.as_mut_ptr().cast(),
             out.ptr(),

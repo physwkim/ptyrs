@@ -321,7 +321,7 @@ mod tests {
         let mut got = StackCtl { f0: 0, nf: 0 };
         scan.stream().synchronize().unwrap();
         // SAFETY: the stream is idle and the entry is one StackCtl.
-        unsafe { sys::cuMemcpyDtoH_v2((&raw mut got).cast(), scan.frames().ctl_ptr(), 8) }
+        unsafe { sys::cuMemcpyDtoH_v2((&raw mut got).cast(), scan.stack().ctl(), 8) }
             .result()
             .unwrap();
         got
