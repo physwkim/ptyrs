@@ -13,10 +13,10 @@
 use cuda_device::{async_copy, device, shared::DynamicSharedArray, thread};
 use cuda_host::cuda_module;
 
-use crate::FFT_EPT;
 use crate::bh::BhObs;
 use crate::fused::{FUSED_COLS, block_fft};
 use crate::pixel::{MASKED, PIXEL_THREADS, StackCtl, StackGeom, load_c, stack_frames, store_c};
+use crate::{FFT_EPT_MAX, fft_ept};
 
 /// [`lsqml_kernels::LoadedModule::lsqml_cols_64`] writes `icalc`.
 pub const LSQML_ICALC: u32 = 1;
@@ -94,7 +94,7 @@ pub struct LsqmlPre {
 /// [`LSQML_CHI`] every mode is scaled by `−a_far[f0 + fl] c / n`, `c` the cost's residual of
 /// `obs` and `icalc`, 0 where masked, inverse column-FFT'd and stored; without it nothing is
 /// stored, so `work` keeps its row transforms. Grid `(nx / FUSED_COLS, nf_max)`,
-/// block `nmode * FUSED_COLS * ny / FFT_EPT`, dynamic shared memory `2 * FUSED_COLS * ny`
+/// block `nmode * FUSED_COLS * ny / fft_ept(ny)`, dynamic shared memory `2 * FUSED_COLS * ny`
 /// bytes of counts, then the larger of `nmode * FUSED_COLS` column FFTs and `4 * nmode * ny
 /// * FUSED_COLS` bytes. `counts` must be 16-byte aligned; it and `a_far` are read only under
 /// [`LSQML_CHI`].
@@ -111,7 +111,8 @@ unsafe fn cols<const NY: u32>(p: LsqmlCols, ctl: *const StackCtl, g: StackGeom, 
     }
     let (ny, nx, nmode) = (NY, g.nx, g.nmode);
     let n = ny as usize * nx as usize;
-    let tpf = ny / FFT_EPT;
+    let ept = const { fft_ept(NY) };
+    let tpf = ny / ept;
     let nslot = FUSED_COLS * tpf;
     let tid = thread::threadIdx_x();
     let c = tid % FUSED_COLS;
@@ -124,7 +125,7 @@ unsafe fn cols<const NY: u32>(p: LsqmlCols, ctl: *const StackCtl, g: StackGeom, 
     let chi = flags & LSQML_CHI != 0;
     let poisson = flags & LSQML_POISSON != 0;
     let pos = (f0 + fl) as usize;
-    let mut r = [0.0f32; 2 * FFT_EPT as usize];
+    let mut r = [0.0f32; 2 * FFT_EPT_MAX as usize];
     unsafe {
         let tile = DynamicSharedArray::<u8, 16>::get();
         let fft_smem = tile.add(2 * (FUSED_COLS * ny) as usize);
@@ -144,7 +145,7 @@ unsafe fn cols<const NY: u32>(p: LsqmlCols, ctl: *const StackCtl, g: StackGeom, 
             async_copy::cp_async_commit_group();
         }
         #[unroll]
-        for i in 0..FFT_EPT {
+        for i in 0..ept {
             let v = load_c(p.work, plane + ((f + i * tpf) * nx + u) as usize);
             r[2 * i as usize] = v.0;
             r[2 * i as usize + 1] = v.1;
@@ -152,7 +153,7 @@ unsafe fn cols<const NY: u32>(p: LsqmlCols, ctl: *const StackCtl, g: StackGeom, 
         block_fft::<NY, false>(&mut r, fft_smem, b, f, bpb);
         thread::sync_threads();
         #[unroll]
-        for i in 0..FFT_EPT {
+        for i in 0..ept {
             let (re, im) = (r[2 * i as usize], r[2 * i as usize + 1]);
             let v = f + i * tpf;
             *power.add(((m * ny + v) * FUSED_COLS + c) as usize) = re * re + im * im;
@@ -163,7 +164,7 @@ unsafe fn cols<const NY: u32>(p: LsqmlCols, ctl: *const StackCtl, g: StackGeom, 
         let tile = tile.cast::<u16>();
         let a = if chi { *p.a_far.add(pos) } else { 0.0 };
         #[unroll]
-        for i in 0..FFT_EPT {
+        for i in 0..ept {
             let v = f + i * tpf;
             let mut s = 0.0f32;
             for mm in 0..nmode {
@@ -194,7 +195,7 @@ unsafe fn cols<const NY: u32>(p: LsqmlCols, ctl: *const StackCtl, g: StackGeom, 
             thread::sync_threads();
             block_fft::<NY, true>(&mut r, fft_smem, b, f, bpb);
             #[unroll]
-            for i in 0..FFT_EPT {
+            for i in 0..ept {
                 let k = 2 * i as usize;
                 store_c(
                     p.work,
@@ -224,7 +225,7 @@ pub mod lsqml_kernels {
     ///
     /// As [`super::cols`].
     #[kernel]
-    #[launch_bounds(crate::fused::FUSED_COL_THREADS)]
+    #[launch_bounds(crate::fused::fused_col_threads(64))]
     pub unsafe fn lsqml_cols_64(p: LsqmlCols, ctl: *const StackCtl, g: StackGeom, flags: u32) {
         unsafe { cols::<64>(p, ctl, g, flags) }
     }
@@ -235,7 +236,7 @@ pub mod lsqml_kernels {
     ///
     /// As [`super::cols`].
     #[kernel]
-    #[launch_bounds(crate::fused::FUSED_COL_THREADS)]
+    #[launch_bounds(crate::fused::fused_col_threads(128))]
     pub unsafe fn lsqml_cols_128(p: LsqmlCols, ctl: *const StackCtl, g: StackGeom, flags: u32) {
         unsafe { cols::<128>(p, ctl, g, flags) }
     }
@@ -246,7 +247,7 @@ pub mod lsqml_kernels {
     ///
     /// As [`super::cols`].
     #[kernel]
-    #[launch_bounds(crate::fused::FUSED_COL_THREADS)]
+    #[launch_bounds(crate::fused::fused_col_threads(256))]
     pub unsafe fn lsqml_cols_256(p: LsqmlCols, ctl: *const StackCtl, g: StackGeom, flags: u32) {
         unsafe { cols::<256>(p, ctl, g, flags) }
     }
@@ -257,7 +258,7 @@ pub mod lsqml_kernels {
     ///
     /// As [`super::cols`].
     #[kernel]
-    #[launch_bounds(crate::fused::FUSED_COL_THREADS)]
+    #[launch_bounds(crate::fused::fused_col_threads(512))]
     pub unsafe fn lsqml_cols_512(p: LsqmlCols, ctl: *const StackCtl, g: StackGeom, flags: u32) {
         unsafe { cols::<512>(p, ctl, g, flags) }
     }
