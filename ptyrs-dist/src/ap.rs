@@ -14,8 +14,7 @@
 //! above them; C the other regions' max words pulled by copy engine, object and probe
 //! updates, then each owner packs the updated rows its neighbours read; D each receiver pulls
 //! them by copy engine and unpacks its halo. The pair tree in B and all of D run on the side
-//! stream ([`Gpu::side`]), beside the object sums and the next A's stacks that read no halo
-//! tile.
+//! stream ([`Gpu::side`]), beside the object sums and the next A's stacks before the halo.
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -67,8 +66,9 @@ pub struct ApConfig {
 struct Stack {
     leaf: usize,
     frames: Range<u32>,
-    /// Some view reads a halo tile, which the halo exchange rewrites.
-    reads_halo: bool,
+    /// Neither it nor an earlier stack of its leaf reads a halo tile, so A may run it before
+    /// the halo exchange completes without reordering the leaf's probe sums.
+    before_halo: bool,
 }
 
 /// One region's share, fixed at setup.
@@ -198,18 +198,20 @@ impl Plan {
                     continue;
                 }
                 leaf_stack0[l] = Some(stacks.len());
+                let mut before_halo = true;
                 for chunk in frames.chunks(cfg.stack) {
                     let start = u(global.len())?;
                     global.extend_from_slice(chunk);
                     if mine {
                         own.push(stacks.len());
                     }
+                    before_halo &= !chunk
+                        .iter()
+                        .any(|&f| tiles[f as usize].iter().any(|&t| zone[t] == 2));
                     stacks.push(Stack {
                         leaf: l,
                         frames: start..u(global.len())?,
-                        reads_halo: chunk
-                            .iter()
-                            .any(|&f| tiles[f as usize].iter().any(|&t| zone[t] == 2)),
+                        before_halo,
                     });
                 }
             }
@@ -763,18 +765,18 @@ impl State {
         let dims = *views.dims();
         let np = plan.np() as u32;
 
-        // A: own stacks, those reading no halo tile while the side stream unpacks the halo,
-        // then the probe sums in stack order.
+        // A: own stacks, those before the halo while the side stream unpacks it. Each probe
+        // sum follows its stack's projection, whose exit waves are then still in L2.
         for s in leaf_sums.iter_mut() {
             ptyrs_gpu::zero(&ctx, &mut s.num)?;
             ptyrs_gpu::zero(&ctx, &mut s.den)?;
         }
-        for reads_halo in [false, true] {
-            if reads_halo {
+        for early in [true, false] {
+            if !early {
                 gpu.join_side()?;
             }
             for (i, &s) in rp.own.iter().enumerate() {
-                if rp.stacks[s].reads_halo != reads_halo {
+                if rp.stacks[s].before_halo != early {
                     continue;
                 }
                 let at = table.at(s);
@@ -788,11 +790,9 @@ impl State {
                 k.apply_amplitude(&ctx, &dims, at, counts, psi)?;
                 fft.inverse_inplace(&ctx, psi)
                     .map_err(ptyrs_gpu::Error::from)?;
-            }
-        }
-        for &s in &rp.own {
-            if let Some(sums) = leaf_sums.get_mut(rp.stacks[s].leaf - r * plan.k) {
-                k.psi_to_probe(&ctx, views, table.at(s), &psi[s], obj, sums)?;
+                if let Some(sums) = leaf_sums.get_mut(rp.stacks[s].leaf - r * plan.k) {
+                    k.psi_to_probe(&ctx, views, at, psi, obj, sums)?;
+                }
             }
         }
         if let Some(t) = tree.as_ref() {
