@@ -5,6 +5,7 @@
 pub mod data;
 pub mod dip;
 pub mod interop;
+pub mod metric;
 pub mod predictor;
 pub mod ptychonn;
 

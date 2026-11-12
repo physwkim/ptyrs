@@ -167,9 +167,18 @@ pub fn object_patches(object: &Object, addr: &AddrTable, patch: [usize; 2]) -> P
     out
 }
 
+const FLAT: C64 = C64::new(1.0, 0.0);
+
+/// The flat initial object `1 + 0i`, one mode of `addr`'s shape: the start a predicted object
+/// is measured against ([`crate::metric`]).
+pub fn flat_object(addr: &AddrTable) -> Object {
+    let [ny, nx] = addr.obj_shape();
+    Object::new(Stack::filled([1, ny, nx], FLAT))
+}
+
 /// Stitches per-frame patches into a single-mode object of `addr`'s shape. Overlaps average
 /// `A·e^{iφ}` under a `sin²` taper that favours patch centres; pixels no patch covers stay
-/// `1 + 0i`, the flat start.
+/// flat, as [`flat_object`].
 pub fn stitch(patches: &Patches, addr: &AddrTable) -> Result<Object, NnError> {
     let [n, py, px] = patches.dims;
     if n != addr.nframe() {
@@ -200,7 +209,7 @@ pub fn stitch(patches: &Patches, addr: &AddrTable) -> Result<Object, NnError> {
     let data = sum
         .into_iter()
         .zip(weight)
-        .map(|(s, w)| if w > 0.0 { s / w } else { C64::new(1.0, 0.0) })
+        .map(|(s, w)| if w > 0.0 { s / w } else { FLAT })
         .collect();
     Ok(Object::new(Stack::from_vec([1, nyo, nxo], data)?))
 }
