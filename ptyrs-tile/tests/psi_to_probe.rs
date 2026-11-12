@@ -1,5 +1,5 @@
 //! `ptyrs_tile::psi_to_probe` against the SIMT `ptyrs_gpu::Kernels::psi_to_probe` and an
-//! f64 reference, on the geometry of `ptyrs-gpu`'s `update_sums` test.
+//! f64 reference, on the views of `ptyrs-gpu`'s `update_sums` test with 20x40 frames.
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -30,24 +30,24 @@ fn up<T: DeviceCopy>(stream: &CudaStream, host: &[T]) -> DeviceBuffer<T> {
     DeviceBuffer::from_host(stream, host).unwrap()
 }
 
-/// 24x32 frames (a partial 16-pixel tile row) on two 50x60 object modes and two probe modes
-/// (four views per frame); frames 1 and 3 wrap their `+ 1` neighbours, and `fy`, `fx`
-/// cover zero and non-zero.
+/// 20x40 frames (partial 8x32 tiles in both directions) on two 50x60 object modes and two
+/// probe modes (four views per frame); frames 1 and 3 wrap their `+ 1` neighbours, and
+/// `fy`, `fx` cover zero and non-zero.
 fn dims() -> (ViewDims, Vec<ViewAddr>) {
     let d = ViewDims {
         nframe: 5,
         nmode: 4,
         nprobe: 2,
         nobj: 2,
-        frame: [24, 32],
+        frame: [20, 40],
         obj: [50, 60],
         quad_phase: 0.003,
     };
     let offsets = [
         (0, 0, 0.0, 0.0),
-        (26, 28, 0.25, 0.0),
+        (30, 20, 0.25, 0.0),
         (13, 7, 0.0, 0.7),
-        (26, 28, 0.6, 0.9),
+        (30, 20, 0.6, 0.9),
         (5, 20, 0.5, 0.5),
     ];
     let views = offsets

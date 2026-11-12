@@ -70,18 +70,18 @@ mod device {
     }
 
     /// `p[at]` where `m`; other lanes are unspecified.
-    unsafe fn gather(
+    unsafe fn gather<const R: i32, const C: i32>(
         p: *const f32,
-        at: Tile<i32, { [16, 16] }>,
-        m: Tile<bool, { [16, 16] }>,
-    ) -> Tile<f32, { [16, 16] }> {
+        at: Tile<i32, { [R, C] }>,
+        m: Tile<bool, { [R, C] }>,
+    ) -> Tile<f32, { [R, C] }> {
         let base: PointerTile<*const f32, { [] }> = pointer_to_tile(p);
         let base: PointerTile<*const f32, { [1, 1] }> = base.reshape(shape![1, 1]);
-        let base: PointerTile<*const f32, { [16, 16] }> = base.broadcast(shape![16, 16]);
-        let ptrs: PointerTile<*const f32, { [16, 16] }> = base.offset_tile(at);
+        let base: PointerTile<*const f32, { [R, C] }> = base.broadcast(shape![R, C]);
+        let ptrs: PointerTile<*const f32, { [R, C] }> = base.offset_tile(at);
         // A padding value on a rank-2 pointer load fails tileiras; masked lanes are
         // discarded by the caller instead.
-        let (v, _t): (Tile<f32, { [16, 16] }>, Token) = unsafe {
+        let (v, _t): (Tile<f32, { [R, C] }>, Token) = unsafe {
             load_ptr_tko(
                 ptrs,
                 ordering::Weak,
@@ -95,16 +95,52 @@ mod device {
         v
     }
 
-    unsafe fn scatter(
+    /// `(p[at], p[at + 1])` where `m`, as one load of `[R, C, 2]` so each lane reads its
+    /// complex value in one access; other lanes are unspecified.
+    unsafe fn gather_c<const R: i32, const C: i32>(
+        p: *const f32,
+        at: Tile<i32, { [R, C] }>,
+        m: Tile<bool, { [R, C] }>,
+    ) -> (Tile<f32, { [R, C] }>, Tile<f32, { [R, C] }>) {
+        let part: Tile<i32, { [2] }> = iota(shape![2]);
+        let part: Tile<i32, { [1, 1, 2] }> = part.reshape(shape![1, 1, 2]);
+        let part: Tile<i32, { [R, C, 2] }> = part.broadcast(shape![R, C, 2]);
+        let at: Tile<i32, { [R, C, 1] }> = at.reshape(shape![R, C, 1]);
+        let at: Tile<i32, { [R, C, 2] }> = at.broadcast(shape![R, C, 2]) + part;
+        let m: Tile<bool, { [R, C, 1] }> = m.reshape(shape![R, C, 1]);
+        let m: Tile<bool, { [R, C, 2] }> = m.broadcast(shape![R, C, 2]);
+        let base: PointerTile<*const f32, { [] }> = pointer_to_tile(p);
+        let base: PointerTile<*const f32, { [1, 1, 1] }> = base.reshape(shape![1, 1, 1]);
+        let base: PointerTile<*const f32, { [R, C, 2] }> = base.broadcast(shape![R, C, 2]);
+        let ptrs: PointerTile<*const f32, { [R, C, 2] }> = base.offset_tile(at);
+        let (v, _t): (Tile<f32, { [R, C, 2] }>, Token) = unsafe {
+            load_ptr_tko(
+                ptrs,
+                ordering::Weak,
+                None::<scope::TileBlock>,
+                Some(m),
+                None,
+                None,
+                Latency::<0>,
+            )
+        };
+        let z: Tile<i32, { [] }> = scalar_to_tile(0i32);
+        let o: Tile<i32, { [] }> = scalar_to_tile(1i32);
+        let re: Tile<f32, { [R, C, 1] }> = extract(v, [z, z, z]);
+        let im: Tile<f32, { [R, C, 1] }> = extract(v, [z, z, o]);
+        (re.reshape(shape![R, C]), im.reshape(shape![R, C]))
+    }
+
+    unsafe fn scatter<const R: i32, const C: i32>(
         p: *mut f32,
-        at: Tile<i32, { [16, 16] }>,
-        v: Tile<f32, { [16, 16] }>,
-        m: Tile<bool, { [16, 16] }>,
+        at: Tile<i32, { [R, C] }>,
+        v: Tile<f32, { [R, C] }>,
+        m: Tile<bool, { [R, C] }>,
     ) {
         let base: PointerTile<*mut f32, { [] }> = pointer_to_tile(p);
         let base: PointerTile<*mut f32, { [1, 1] }> = base.reshape(shape![1, 1]);
-        let base: PointerTile<*mut f32, { [16, 16] }> = base.broadcast(shape![16, 16]);
-        let ptrs: PointerTile<*mut f32, { [16, 16] }> = base.offset_tile(at);
+        let base: PointerTile<*mut f32, { [R, C] }> = base.broadcast(shape![R, C]);
+        let ptrs: PointerTile<*mut f32, { [R, C] }> = base.offset_tile(at);
         let _t: Token = unsafe {
             store_ptr_tko(
                 ptrs,
@@ -254,7 +290,7 @@ mod device {
     }
 
     /// `ptyrs_kernels::psi_to_probe` with one tile program per probe tile: program `(tx, ty,
-    /// mode)` owns pixels `[16 ty, 16 tx] + [0..16, 0..16]` of probe mode `mode`, walks the
+    /// mode)` owns pixels `[8 ty, 32 tx] + [0..8, 0..32]` of probe mode `mode`, walks the
     /// stack's views `k0 .. k0 + nk` in ascending order, skipping those of other modes, and
     /// adds each with the SIMT kernel's arithmetic (`sample_obj`'s corner order), then
     /// writes the pixels it owns. Buffers as in `psi_to_obj`.
@@ -276,42 +312,45 @@ mod device {
     ) {
         let pid: (i32, i32, i32) = get_tile_block_id();
         let mode: i32 = pid.2;
-        let lane: Tile<i32, { [16] }> = iota(shape![16]);
-        let row: Tile<i32, { [16, 1] }> = lane.reshape(shape![16, 1]);
-        let col: Tile<i32, { [1, 16] }> = lane.reshape(shape![1, 16]);
-        let ys: Tile<i32, { [16, 16] }> =
-            row.broadcast(shape![16, 16]) + broadcast_scalar(pid.1 * 16i32, shape![16, 16]);
-        let xs: Tile<i32, { [16, 16] }> =
-            col.broadcast(shape![16, 16]) + broadcast_scalar(pid.0 * 16i32, shape![16, 16]);
-        let ny_t: Tile<i32, { [16, 16] }> = broadcast_scalar(ny, shape![16, 16]);
-        let nx_t: Tile<i32, { [16, 16] }> = broadcast_scalar(nx, shape![16, 16]);
-        let nyo_t: Tile<i32, { [16, 16] }> = broadcast_scalar(nyo, shape![16, 16]);
-        let nxo_t: Tile<i32, { [16, 16] }> = broadcast_scalar(nxo, shape![16, 16]);
-        let hy_t: Tile<i32, { [16, 16] }> = broadcast_scalar(ny / 2i32, shape![16, 16]);
-        let hx_t: Tile<i32, { [16, 16] }> = broadcast_scalar(nx / 2i32, shape![16, 16]);
-        let zero_i: Tile<i32, { [16, 16] }> = constant(0i32, shape![16, 16]);
-        let one_i: Tile<i32, { [16, 16] }> = constant(1i32, shape![16, 16]);
-        let two_i: Tile<i32, { [16, 16] }> = constant(2i32, shape![16, 16]);
+        // Rows of 32 pixels make each view's psi and object reads 256-byte runs; the
+        // 64-byte runs of 16 x 16 tiles left the kernel at two thirds of the bandwidth.
+        let row: Tile<i32, { [8] }> = iota(shape![8]);
+        let row: Tile<i32, { [8, 1] }> = row.reshape(shape![8, 1]);
+        let col: Tile<i32, { [32] }> = iota(shape![32]);
+        let col: Tile<i32, { [1, 32] }> = col.reshape(shape![1, 32]);
+        let ys: Tile<i32, { [8, 32] }> =
+            row.broadcast(shape![8, 32]) + broadcast_scalar(pid.1 * 8i32, shape![8, 32]);
+        let xs: Tile<i32, { [8, 32] }> =
+            col.broadcast(shape![8, 32]) + broadcast_scalar(pid.0 * 32i32, shape![8, 32]);
+        let ny_t: Tile<i32, { [8, 32] }> = broadcast_scalar(ny, shape![8, 32]);
+        let nx_t: Tile<i32, { [8, 32] }> = broadcast_scalar(nx, shape![8, 32]);
+        let nyo_t: Tile<i32, { [8, 32] }> = broadcast_scalar(nyo, shape![8, 32]);
+        let nxo_t: Tile<i32, { [8, 32] }> = broadcast_scalar(nxo, shape![8, 32]);
+        let hy_t: Tile<i32, { [8, 32] }> = broadcast_scalar(ny / 2i32, shape![8, 32]);
+        let hx_t: Tile<i32, { [8, 32] }> = broadcast_scalar(nx / 2i32, shape![8, 32]);
+        let zero_i: Tile<i32, { [8, 32] }> = constant(0i32, shape![8, 32]);
+        let one_i: Tile<i32, { [8, 32] }> = constant(1i32, shape![8, 32]);
+        let two_i: Tile<i32, { [8, 32] }> = constant(2i32, shape![8, 32]);
 
-        let owned: Tile<bool, { [16, 16] }> = lt_tile(ys, ny_t) & lt_tile(xs, nx_t);
-        let px: Tile<i32, { [16, 16] }> =
-            (broadcast_scalar(mode * ny, shape![16, 16]) + ys) * nx_t + xs;
-        let px_re: Tile<i32, { [16, 16] }> = px * two_i;
-        let px_im: Tile<i32, { [16, 16] }> = px_re + one_i;
+        let owned: Tile<bool, { [8, 32] }> = lt_tile(ys, ny_t) & lt_tile(xs, nx_t);
+        let px: Tile<i32, { [8, 32] }> =
+            (broadcast_scalar(mode * ny, shape![8, 32]) + ys) * nx_t + xs;
+        let px_re: Tile<i32, { [8, 32] }> = px * two_i;
+        let px_im: Tile<i32, { [8, 32] }> = px_re + one_i;
         let num_in: *const f32 = cast_const(num);
         let den_in: *const f32 = cast_const(den);
-        let mut acc_re: Tile<f32, { [16, 16] }> = unsafe { gather(num_in, px_re, owned) };
-        let mut acc_im: Tile<f32, { [16, 16] }> = unsafe { gather(num_in, px_im, owned) };
-        let mut norm: Tile<f32, { [16, 16] }> = unsafe { gather(den_in, px, owned) };
+        let mut acc_re: Tile<f32, { [8, 32] }> = unsafe { gather(num_in, px_re, owned) };
+        let mut acc_im: Tile<f32, { [8, 32] }> = unsafe { gather(num_in, px_im, owned) };
+        let mut norm: Tile<f32, { [8, 32] }> = unsafe { gather(den_in, px, owned) };
 
         // `quad_phase` and `psi_index` of each pixel, the same for every view.
-        let dy: Tile<i32, { [16, 16] }> = ys - hy_t;
-        let dx: Tile<i32, { [16, 16] }> = xs - hx_t;
-        let r2: Tile<f32, { [16, 16] }> = convert_tile(dy * dy + dx * dx);
-        let a: Tile<f32, { [16, 16] }> = broadcast_scalar(quad, shape![16, 16]) * r2;
-        let q_re: Tile<f32, { [16, 16] }> = cos(a);
-        let q_im: Tile<f32, { [16, 16] }> = sin(a);
-        let at: Tile<i32, { [16, 16] }> = ((ys + hy_t) % ny_t) * nx_t + (xs + hx_t) % nx_t;
+        let dy: Tile<i32, { [8, 32] }> = ys - hy_t;
+        let dx: Tile<i32, { [8, 32] }> = xs - hx_t;
+        let r2: Tile<f32, { [8, 32] }> = convert_tile(dy * dy + dx * dx);
+        let a: Tile<f32, { [8, 32] }> = broadcast_scalar(quad, shape![8, 32]) * r2;
+        let q_re: Tile<f32, { [8, 32] }> = cos(a);
+        let q_im: Tile<f32, { [8, 32] }> = sin(a);
+        let at: Tile<i32, { [8, 32] }> = ((ys + hy_t) % ny_t) * nx_t + (xs + hx_t) % nx_t;
 
         let n: i32 = ny * nx;
         for kl in 0i32..nk {
@@ -326,54 +365,53 @@ mod device {
             let fx: f32 = unsafe { load_f32(view_frac, w0 + 3i32) };
             let iobj: i32 = unsafe { load_i32(view_words, w0 + 5i32) };
             // `bilinear_weights`, and which corners `sample_obj` reads.
-            let wt0: Tile<f32, { [16, 16] }> =
-                broadcast_scalar((1.0f32 - fy) * (1.0f32 - fx), shape![16, 16]);
-            let wt1: Tile<f32, { [16, 16] }> = broadcast_scalar((1.0f32 - fy) * fx, shape![16, 16]);
-            let wt2: Tile<f32, { [16, 16] }> = broadcast_scalar(fy * (1.0f32 - fx), shape![16, 16]);
-            let wt3: Tile<f32, { [16, 16] }> = broadcast_scalar(fy * fx, shape![16, 16]);
-            let zero_f: Tile<f32, { [16, 16] }> = constant(0.0f32, shape![16, 16]);
-            let fy_nz: Tile<bool, { [16, 16] }> =
-                ne_tile(broadcast_scalar(fy, shape![16, 16]), zero_f);
-            let fx_nz: Tile<bool, { [16, 16] }> =
-                ne_tile(broadcast_scalar(fx, shape![16, 16]), zero_f);
-            let m01: Tile<bool, { [16, 16] }> = owned & fx_nz;
-            let m10: Tile<bool, { [16, 16] }> = owned & fy_nz;
-            let m11: Tile<bool, { [16, 16] }> = m10 & fx_nz;
+            let wt0: Tile<f32, { [8, 32] }> =
+                broadcast_scalar((1.0f32 - fy) * (1.0f32 - fx), shape![8, 32]);
+            let wt1: Tile<f32, { [8, 32] }> = broadcast_scalar((1.0f32 - fy) * fx, shape![8, 32]);
+            let wt2: Tile<f32, { [8, 32] }> = broadcast_scalar(fy * (1.0f32 - fx), shape![8, 32]);
+            let wt3: Tile<f32, { [8, 32] }> = broadcast_scalar(fy * fx, shape![8, 32]);
+            let zero_f: Tile<f32, { [8, 32] }> = constant(0.0f32, shape![8, 32]);
+            let fy_nz: Tile<bool, { [8, 32] }> =
+                ne_tile(broadcast_scalar(fy, shape![8, 32]), zero_f);
+            let fx_nz: Tile<bool, { [8, 32] }> =
+                ne_tile(broadcast_scalar(fx, shape![8, 32]), zero_f);
+            let m01: Tile<bool, { [8, 32] }> = owned & fx_nz;
+            let m10: Tile<bool, { [8, 32] }> = owned & fy_nz;
+            let m11: Tile<bool, { [8, 32] }> = m10 & fx_nz;
 
-            let y0: Tile<i32, { [16, 16] }> = broadcast_scalar(oy, shape![16, 16]) + ys;
-            let x0: Tile<i32, { [16, 16] }> = broadcast_scalar(ox, shape![16, 16]) + xs;
-            let y1: Tile<i32, { [16, 16] }> =
-                select(eq_tile(y0 + one_i, nyo_t), zero_i, y0 + one_i);
-            let x1: Tile<i32, { [16, 16] }> =
-                select(eq_tile(x0 + one_i, nxo_t), zero_i, x0 + one_i);
-            let plane: Tile<i32, { [16, 16] }> = broadcast_scalar(iobj * nyo, shape![16, 16]);
-            let i00: Tile<i32, { [16, 16] }> = ((plane + y0) * nxo_t + x0) * two_i;
-            let i01: Tile<i32, { [16, 16] }> = ((plane + y0) * nxo_t + x1) * two_i;
-            let i10: Tile<i32, { [16, 16] }> = ((plane + y1) * nxo_t + x0) * two_i;
-            let i11: Tile<i32, { [16, 16] }> = ((plane + y1) * nxo_t + x1) * two_i;
+            let y0: Tile<i32, { [8, 32] }> = broadcast_scalar(oy, shape![8, 32]) + ys;
+            let x0: Tile<i32, { [8, 32] }> = broadcast_scalar(ox, shape![8, 32]) + xs;
+            let y1: Tile<i32, { [8, 32] }> = select(eq_tile(y0 + one_i, nyo_t), zero_i, y0 + one_i);
+            let x1: Tile<i32, { [8, 32] }> = select(eq_tile(x0 + one_i, nxo_t), zero_i, x0 + one_i);
+            let plane: Tile<i32, { [8, 32] }> = broadcast_scalar(iobj * nyo, shape![8, 32]);
+            let i00: Tile<i32, { [8, 32] }> = ((plane + y0) * nxo_t + x0) * two_i;
+            let i01: Tile<i32, { [8, 32] }> = ((plane + y0) * nxo_t + x1) * two_i;
+            let i10: Tile<i32, { [8, 32] }> = ((plane + y1) * nxo_t + x0) * two_i;
+            let i11: Tile<i32, { [8, 32] }> = ((plane + y1) * nxo_t + x1) * two_i;
 
-            let o_re: Tile<f32, { [16, 16] }> = wt0 * unsafe { gather(obj, i00, owned) };
-            let o_im: Tile<f32, { [16, 16] }> = wt0 * unsafe { gather(obj, i00 + one_i, owned) };
-            let c_re: Tile<f32, { [16, 16] }> = unsafe { gather(obj, i01, m01) };
-            let c_im: Tile<f32, { [16, 16] }> = unsafe { gather(obj, i01 + one_i, m01) };
-            let o_re: Tile<f32, { [16, 16] }> = select(fx_nz, o_re + wt1 * c_re, o_re);
-            let o_im: Tile<f32, { [16, 16] }> = select(fx_nz, o_im + wt1 * c_im, o_im);
-            let c_re: Tile<f32, { [16, 16] }> = unsafe { gather(obj, i10, m10) };
-            let c_im: Tile<f32, { [16, 16] }> = unsafe { gather(obj, i10 + one_i, m10) };
-            let o_re: Tile<f32, { [16, 16] }> = select(fy_nz, o_re + wt2 * c_re, o_re);
-            let o_im: Tile<f32, { [16, 16] }> = select(fy_nz, o_im + wt2 * c_im, o_im);
-            let c_re: Tile<f32, { [16, 16] }> = unsafe { gather(obj, i11, m11) };
-            let c_im: Tile<f32, { [16, 16] }> = unsafe { gather(obj, i11 + one_i, m11) };
-            let both: Tile<bool, { [16, 16] }> = fy_nz & fx_nz;
-            let o_re: Tile<f32, { [16, 16] }> = select(both, o_re + wt3 * c_re, o_re);
-            let o_im: Tile<f32, { [16, 16] }> = select(both, o_im + wt3 * c_im, o_im);
+            let (c_re, c_im): (Tile<f32, { [8, 32] }>, Tile<f32, { [8, 32] }>) =
+                unsafe { gather_c(obj, i00, owned) };
+            let o_re: Tile<f32, { [8, 32] }> = wt0 * c_re;
+            let o_im: Tile<f32, { [8, 32] }> = wt0 * c_im;
+            let (c_re, c_im): (Tile<f32, { [8, 32] }>, Tile<f32, { [8, 32] }>) =
+                unsafe { gather_c(obj, i01, m01) };
+            let o_re: Tile<f32, { [8, 32] }> = select(fx_nz, o_re + wt1 * c_re, o_re);
+            let o_im: Tile<f32, { [8, 32] }> = select(fx_nz, o_im + wt1 * c_im, o_im);
+            let (c_re, c_im): (Tile<f32, { [8, 32] }>, Tile<f32, { [8, 32] }>) =
+                unsafe { gather_c(obj, i10, m10) };
+            let o_re: Tile<f32, { [8, 32] }> = select(fy_nz, o_re + wt2 * c_re, o_re);
+            let o_im: Tile<f32, { [8, 32] }> = select(fy_nz, o_im + wt2 * c_im, o_im);
+            let (c_re, c_im): (Tile<f32, { [8, 32] }>, Tile<f32, { [8, 32] }>) =
+                unsafe { gather_c(obj, i11, m11) };
+            let both: Tile<bool, { [8, 32] }> = fy_nz & fx_nz;
+            let o_re: Tile<f32, { [8, 32] }> = select(both, o_re + wt3 * c_re, o_re);
+            let o_im: Tile<f32, { [8, 32] }> = select(both, o_im + wt3 * c_im, o_im);
 
-            let si: Tile<i32, { [16, 16] }> =
-                (broadcast_scalar(kl * n, shape![16, 16]) + at) * two_i;
-            let s_re: Tile<f32, { [16, 16] }> = unsafe { gather(psi, si, owned) };
-            let s_im: Tile<f32, { [16, 16] }> = unsafe { gather(psi, si + one_i, owned) };
-            let oq_re: Tile<f32, { [16, 16] }> = o_re * q_re - o_im * q_im;
-            let oq_im: Tile<f32, { [16, 16] }> = o_re * q_im + o_im * q_re;
+            let si: Tile<i32, { [8, 32] }> = (broadcast_scalar(kl * n, shape![8, 32]) + at) * two_i;
+            let (s_re, s_im): (Tile<f32, { [8, 32] }>, Tile<f32, { [8, 32] }>) =
+                unsafe { gather_c(psi, si, owned) };
+            let oq_re: Tile<f32, { [8, 32] }> = o_re * q_re - o_im * q_im;
+            let oq_im: Tile<f32, { [8, 32] }> = o_re * q_im + o_im * q_re;
             acc_re = acc_re + (oq_re * s_re + oq_im * s_im);
             acc_im = acc_im + (oq_re * s_im - oq_im * s_re);
             norm = norm + (o_re * o_re + o_im * o_im);
@@ -819,7 +857,7 @@ pub fn psi_to_probe(
     let reads = [psi.storage(), obj.storage(), views.addr().storage()];
     let UpdateSums { num, den } = sums;
     launch(stream, &reads, &[num.storage(), den.storage()], || {
-        let grid = (nx.div_ceil(16), ny.div_ceil(16), d.nprobe);
+        let grid = (nx.div_ceil(32), ny.div_ceil(8), d.nprobe);
         // SAFETY: lengths and i32 offsets checked above; `Views::new` checked every view
         // lies inside the object with valid mode indices; the leases order every access
         // on `stream`, and each program writes only the pixels of its own tile.
