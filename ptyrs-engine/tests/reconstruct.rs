@@ -1,5 +1,5 @@
 use ptyrs_core::{C64, Geometry, Object, Probe, Scan, Stack, required_obj_shape};
-use ptyrs_engine::{Algorithm, ApParams, DmParams, MlParams, Ptycho, RpieParams};
+use ptyrs_engine::{Algorithm, ApParams, DmParams, LlkRecord, MlParams, Ptycho, RpieParams};
 
 mod common;
 mod ptychi;
@@ -132,15 +132,16 @@ fn parity_start() -> Ptycho {
     p
 }
 
-/// `table` rows: cycle, then the normalised Poisson, Gaussian, Euclidian LLK and photon count.
-fn assert_history_matches(p: &Ptycho, table: &str) {
+/// `table` rows: cycle, then the normalised Poisson, Gaussian, Euclidian LLK and photon count;
+/// record `k` of `history` against row `k`, at the row's cycle + `lag`.
+fn assert_history_matches(history: &[LlkRecord], lag: usize, table: &str) {
     let rows: Vec<Vec<f64>> = table
         .lines()
         .map(|l| l.split_whitespace().map(|v| v.parse().unwrap()).collect())
         .collect();
-    assert_eq!(p.history().len(), rows.len());
-    for (r, row) in p.history().iter().zip(&rows) {
-        assert_eq!(r.cycle as f64, row[0]);
+    assert_eq!(history.len(), rows.len());
+    for (r, row) in history.iter().zip(&rows) {
+        assert_eq!(r.cycle as f64, row[0] + lag as f64);
         let l = r.llk;
         for (a, b) in [l.poisson, l.gaussian, l.euclidian, l.nb_photons_calc]
             .into_iter()
@@ -157,16 +158,21 @@ fn assert_history_matches(p: &Ptycho, table: &str) {
 
 /// DM against PyNX `cpu_operator` promoted to f64 (`scripts/compare_pynx.py <dir> dm`),
 /// cycles 0-19 of `cargo run --release -p ptyrs-engine --example llk_trace -- <dir> dm 20 1 32
-/// 40`, saved from `<dir>/llk_pynx_dm_f64.txt` to `tests/data/dm_pynx_f64.txt`.
+/// 40`, saved from `<dir>/llk_pynx_dm_f64.txt` to `tests/data/dm_pynx_f64.txt`. That DM
+/// records the estimate after the cycle's update, so its cycle `c` is the record of `c + 1`
+/// here, and record 0 is the start.
 #[test]
 fn dm_llk_matches_pynx() {
     let mut p = parity_start();
+    let start = p.llk();
     let params = DmParams {
         calc_llk: 1,
         ..DmParams::default()
     };
-    p.dm(&params, 20);
-    assert_history_matches(&p, include_str!("data/dm_pynx_f64.txt"));
+    p.dm(&params, 21);
+    let (first, rest) = p.history().split_first().unwrap();
+    assert_eq!((first.cycle, first.llk), (0, start));
+    assert_history_matches(rest, 1, include_str!("data/dm_pynx_f64.txt"));
 }
 
 /// rPIE against pty-chi `RPIEReconstructor` in f64 (`scripts/compare_ptychi_rpie.py <dir>`),
@@ -176,7 +182,7 @@ fn dm_llk_matches_pynx() {
 fn rpie_llk_matches_ptychi() {
     let mut p = parity_start();
     p.rpie(&ptychi::RPIE, 20).unwrap();
-    assert_history_matches(&p, include_str!("data/rpie_ptychi_f64.txt"));
+    assert_history_matches(p.history(), 0, include_str!("data/rpie_ptychi_f64.txt"));
 }
 
 /// [`Ptycho::obj_grad`] and the LLK against the float64 model written independently in

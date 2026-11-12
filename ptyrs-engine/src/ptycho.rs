@@ -397,13 +397,15 @@ impl Ptycho {
     /// `psi ← (2 − a)·PO − (1 − a)·psi`, then magnitude projection `Π_F`, then
     /// `psi ← Π_F(psi) + (1 − a)·(PO − refl)` with `refl` the reflected `psi`. Then
     /// `loop_obj_probe` times an object-only and a probe-only [`psi_to_obj_probe`] (the probe
-    /// update sees the new object). The recorded LLK is of the updated estimate.
+    /// update sees the new object). The recorded LLK is of the estimate the cycle starts from,
+    /// as PyNX's CUDA DM takes it; its `cpu_operator` DM takes the updated one.
     pub fn dm(&mut self, params: &DmParams, ncycle: usize) {
         let (nframe, nmode) = (self.addr.nframe(), self.addr.nmode());
         let a = params.alpha;
         let mut po = vec![C64::default(); self.psi.len()];
         let mut refl = vec![C64::default(); self.psi.len()];
         for ic in 0..ncycle {
+            let l = llk_due(params.calc_llk, ic, ncycle).then(|| self.llk());
             obj_probe_to_psi(
                 self.addr.views(),
                 &self.object,
@@ -442,8 +444,7 @@ impl Ptycho {
                     }
                 }
             }
-            if llk_due(params.calc_llk, ic, ncycle) {
-                let l = self.llk();
+            if let Some(l) = l {
                 self.record(Algorithm::Dm, l);
             }
             self.cycle += 1;
