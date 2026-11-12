@@ -84,7 +84,9 @@ impl Shape {
             rows,
             row_smem: rows * sx,
             col_threads,
-            col_smem: 16 * nslot + (col_threads / (ny / FFT_EPT)) * sy.max(4 * ny),
+            col_smem: 16 * nslot
+                + 2 * FUSED_COLS * ny
+                + (col_threads / (ny / FFT_EPT)) * sy.max(4 * ny),
         };
         if s.col_smem > SMEM_MAX || s.row_smem > SMEM_MAX {
             return Err(bad("shared memory per block exceeds 48 KiB".into()));

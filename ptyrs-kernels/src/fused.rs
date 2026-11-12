@@ -15,12 +15,12 @@
 //! frame sample the object at one position. A stack with `nf == 0` writes nothing; every
 //! block past the stack leaves whole, before its first barrier.
 
-use cuda_device::{device, shared::DynamicSharedArray, thread};
+use cuda_device::{async_copy, device, shared::DynamicSharedArray, thread};
 
 use crate::FFT_EPT;
 use crate::pixel::{
     LlkPartial, MASKED, StackCtl, StackGeom, SumPtrs, TilePtrs, ViewAddr, cmul, cmul_conj, load_c,
-    obj_pixel_sources, psi_index, quad_phase, sample_obj, stack_frames, store_c, tile_stack_run,
+    obj_pixel_sources, quad_phase, sample_obj, stack_frames, store_c, tile_stack_run,
 };
 
 /// [`rows_fwd`] builds the DM reflection `R = (2 - alpha) PO - (1 - alpha) psi` instead of
@@ -37,6 +37,10 @@ pub const FUSED_CONTRIB: u32 = 16;
 
 /// Columns of one frame a [`cols`] block transforms, for every mode.
 pub const FUSED_COLS: u32 = 8;
+const _: () = assert!(
+    2 * FUSED_COLS == 16,
+    "a cols counts row is one 16-byte async copy"
+);
 /// Threads of a [`rows_fwd`] or [`rows_inv`] block: `FUSED_ROW_THREADS / (nx / FFT_EPT)`
 /// rows of `nx / FFT_EPT` threads each.
 pub const FUSED_ROW_THREADS: u32 = 128;
@@ -185,8 +189,9 @@ pub unsafe fn rows_fwd<const NX: u32>(
 /// is thread `f = (tid / FUSED_COLS) % tpf` of FFT `m * FUSED_COLS + c`, `c = tid %
 /// FUSED_COLS`, `m = tid / (FUSED_COLS * tpf)`, so a warp's loads and stores cover whole
 /// row segments. Grid `(nx / FUSED_COLS, nf_max)`; dynamic shared memory `16 * FUSED_COLS *
-/// tpf` bytes of LLK slots, then the larger of `nmode * FUSED_COLS` column FFTs and
-/// `4 * nmode * ny * FUSED_COLS` bytes.
+/// tpf` bytes of LLK slots, `2 * FUSED_COLS * ny` bytes of counts, then the larger of
+/// `nmode * FUSED_COLS` column FFTs and `4 * nmode * ny * FUSED_COLS` bytes.
+/// `counts` must be 16-byte aligned.
 ///
 /// # Safety
 ///
@@ -218,9 +223,24 @@ pub unsafe fn cols<const NY: u32>(p: FusedPtrs, ctl: *const StackCtl, g: StackGe
     unsafe {
         let smem = DynamicSharedArray::<u8, 16>::get();
         let slots = smem.cast::<f32>();
-        let fft_smem = smem.add(16 * nslot as usize);
+        // The frame's counts under this block's columns, by stored row, copied while the
+        // forward FFT runs: read per pixel after it, they stalled the pass.
+        let tile = smem.add(16 * nslot as usize);
+        let fft_smem = tile.add(2 * (FUSED_COLS * ny) as usize);
         // `|Psi_m(v, u)|^2` at `(m * ny + v) * FUSED_COLS + c`, over the FFTs' region.
         let power = fft_smem.cast::<f32>();
+        let counts = p.counts.add((f0 + fl) as usize * n);
+        // The block's columns stay contiguous under the shift: `nx / 2` is a multiple of 8.
+        let col0 = (thread::blockIdx_x() * FUSED_COLS + nx / 2) % nx;
+        let mut row = tid;
+        while row < ny {
+            async_copy::cp_async_cg_16(
+                tile.add(2 * (row * FUSED_COLS) as usize).cast(),
+                counts.add((row * nx + col0) as usize).cast(),
+            );
+            row += nmode * nslot;
+        }
+        async_copy::cp_async_commit_group();
         #[unroll]
         for i in 0..FFT_EPT {
             let v = load_c(p.work, plane + ((f + i * tpf) * nx + u) as usize);
@@ -235,9 +255,10 @@ pub unsafe fn cols<const NY: u32>(p: FusedPtrs, ctl: *const StackCtl, g: StackGe
             let v = f + i * tpf;
             *power.add(((m * ny + v) * FUSED_COLS + c) as usize) = re * re + im * im;
         }
+        async_copy::cp_async_wait_all();
         thread::sync_threads();
         let inv_n = 1.0 / n as f32;
-        let counts = p.counts.add((f0 + fl) as usize * n);
+        let tile = tile.cast::<u16>();
         let mut acc = [0.0f32; 4];
         #[unroll]
         for i in 0..FFT_EPT {
@@ -246,7 +267,7 @@ pub unsafe fn cols<const NY: u32>(p: FusedPtrs, ctl: *const StackCtl, g: StackGe
             for mm in 0..nmode {
                 s += *power.add(((mm * ny + v) * FUSED_COLS + c) as usize);
             }
-            let obs = *counts.add(psi_index(v, u, ny, nx));
+            let obs = *tile.add((((v + ny / 2) % ny) * FUSED_COLS + c) as usize);
             if llk && m == 0 && obs != MASKED {
                 let obs = obs as f32;
                 let calc = (s * inv_n).max(0.0);
