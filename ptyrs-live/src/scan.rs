@@ -4,8 +4,8 @@
 //! [`Views::from_parts`].
 //!
 //! `push` is the one write site of frames into the scan. It lands a frame
-//! only if its index is inside the scan, every view of it passes
-//! [`ViewDims::check_view`] and every object tile it touches has a free
+//! only if its index is inside the scan, every view of it passes the
+//! checks [`Views::new`] makes and every object tile it touches has a free
 //! slot in its slab; it readies those tiles first. So every view the device
 //! reads is in range, `bin_views` never overflows a slab and the stack entry
 //! never needs the kernels' clamp. Frames land in order: the first frame
@@ -86,7 +86,9 @@ pub struct ScanParts<'a> {
 pub enum Refusal {
     /// Its index is past the scan's last frame.
     PastScan { frame: u32 },
-    /// One of its views fails [`ViewDims::check_view`].
+    /// One of its views fails the checks [`Views::new`] makes: inside the
+    /// object, and mode `m` multiplying probe `m % nprobe` and object
+    /// `m / nprobe` at the frame's position.
     View { frame: u32, view: ViewAddr },
     /// A tile it touches has no free slot left in its slab.
     Slab { frame: u32, tile: [u32; 2] },
@@ -285,7 +287,14 @@ impl LiveScan {
         if f >= self.dims.nframe {
             return Some(Refusal::PastScan { frame: f });
         }
-        if let Some(&view) = frame.iter().find(|v| self.dims.check_view(v).is_err()) {
+        let (np, at) = (self.dims.nprobe, |v: &ViewAddr| (v.oy, v.ox, v.fy, v.fx));
+        let off = |(m, v): &(u32, &ViewAddr)| {
+            self.dims.check_view(v).is_err()
+                || v.probe != m % np
+                || v.obj != m / np
+                || at(v) != at(&frame[0])
+        };
+        if let Some((_, &view)) = (0..).zip(frame).find(off) {
             return Some(Refusal::View { frame: f, view });
         }
         let cap = self.obj.cap() as u32;
@@ -583,6 +592,32 @@ mod tests {
         assert_eq!(scan.closed(), Some(Refusal::Failed { frame: 0 }));
         assert_eq!((scan.landed(), scan.lost()), (0, 1));
         assert_eq!(scan.obj().mapped_bytes(), 0);
+    }
+
+    /// A frame whose modes are not probe `m % nprobe` x object `m / nprobe`
+    /// at one position closes the scan as a refused view, like a view
+    /// outside the object: the kernels index modes by that layout.
+    #[test]
+    fn a_frame_whose_views_are_not_canonical_closes_the_scan() {
+        let ctx = Context::new(0).expect("GPU 0");
+        let s = ctx.new_stream().unwrap();
+        let one = NonZeroU32::new(1).unwrap();
+        let [a, b] = raster(1, [16, 16]);
+        let moved = ViewAddr { ox: b.ox + 1, ..b };
+        let shifted = ViewAddr { fx: 0.0, ..b };
+        for (bad, view) in [
+            ([b, a], b),
+            ([a, moved], moved),
+            ([a, shifted], shifted),
+            ([a, a], a),
+        ] {
+            let mut scan = LiveScan::new(&s, &shape(3, [16, 16]), one, 64, [1.0, 0.0], 1).unwrap();
+            let mut backer = scan.backer();
+            let views = [a, b, bad[0], bad[1], a, b];
+            assert_eq!(push(&mut scan, &mut backer, &views).unwrap(), 1, "{bad:?}");
+            assert_eq!(scan.closed(), Some(Refusal::View { frame: 1, view }));
+            assert_eq!((scan.landed(), scan.lost()), (1, 2));
+        }
     }
 
     /// A plan backed before the first frame maps what backing its frames as
