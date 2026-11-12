@@ -3,7 +3,9 @@
 
 use ptyrs_core::{C64, Object, Probe, Stack, View};
 
-use crate::{EngineError, Propagator, accumulate_obj, accumulate_probe, obj_probe_to_psi};
+use crate::{
+    EngineError, Propagator, SliceWaves, accumulate_obj, accumulate_probe, obj_probe_to_psi,
+};
 
 /// A linear map `A` from `domain_len()` to `range_len()` complex values with its adjoint
 /// `Aᴴ`, `⟨A x, y⟩ = ⟨x, Aᴴ y⟩` under `⟨a, b⟩ = Σ a·conj(b)`.
@@ -167,6 +169,46 @@ impl LinearOp for Propagation<'_> {
     fn adjoint(&self, y: &[C64], x: &mut [C64]) {
         x.copy_from_slice(y);
         self.propagator.adjoint(x);
+    }
+}
+
+/// `(dO_0 .. dO_{n−1}, dP) ↦ dpsi`: the change of the exit waves of [`SliceWaves`] at its state,
+/// [`SliceWaves::tangent`], over every slice's object and the probe, laid out in that order;
+/// adjoint [`SliceWaves::obj_adjoint`] of every slice and [`SliceWaves::probe_adjoint`]'s
+/// numerator after [`SliceWaves::back_propagate`].
+pub struct SliceJacobian<'a> {
+    pub waves: &'a SliceWaves<'a>,
+    pub obj_dims: [usize; 3],
+    pub nslice: usize,
+    pub probe_dims: [usize; 3],
+}
+
+impl LinearOp for SliceJacobian<'_> {
+    fn domain_len(&self) -> usize {
+        self.nslice * self.obj_dims.iter().product::<usize>()
+            + self.probe_dims.iter().product::<usize>()
+    }
+    fn range_len(&self) -> usize {
+        self.waves.psi().len()
+    }
+    fn forward(&self, x: &[C64], y: &mut [C64]) {
+        let len = self.obj_dims.iter().product::<usize>();
+        let (o, p) = x.split_at(self.nslice * len);
+        let objects: Vec<Object> = o
+            .chunks_exact(len)
+            .map(|o| Object::new(Stack::from_vec(self.obj_dims, o.to_vec()).expect("object")))
+            .collect();
+        let probe = Probe::new(Stack::from_vec(self.probe_dims, p.to_vec()).expect("probe"));
+        y.copy_from_slice(&self.waves.tangent(&objects, &probe));
+    }
+    fn adjoint(&self, y: &[C64], x: &mut [C64]) {
+        let chi = self.waves.back_propagate(y);
+        let len = self.obj_dims.iter().product::<usize>();
+        let (o, p) = x.split_at_mut(self.nslice * len);
+        for (s, o) in o.chunks_exact_mut(len).enumerate() {
+            o.copy_from_slice(self.waves.obj_adjoint(s, &chi[s]).as_slice());
+        }
+        p.copy_from_slice(self.waves.probe_adjoint(&chi[0]).0.as_slice());
     }
 }
 

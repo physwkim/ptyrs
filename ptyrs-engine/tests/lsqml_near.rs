@@ -5,6 +5,8 @@
 //! with an evanescent band. Every frame sits at a whole-pixel corner, so pty-chi's PATCH
 //! extraction and the engine's views read the same pixels.
 
+use std::slice;
+
 use ptyrs_core::{AddrTable, C64, Counts, Object, Positions, Probe, Stack, View};
 use ptyrs_engine::{
     Cost, Lsqml, LsqmlBatch, LsqmlParams, LsqmlStep, Observed, Optics, ProbeVariation, Propagator,
@@ -231,9 +233,17 @@ fn directions_match_central_differences() {
     });
     let views = &s.addr.views()[..BATCH * s.addr.nmode()];
     for (k, c) in s.cases.iter().enumerate().take(2) {
-        let b = LsqmlBatch::new(&run, views, &c.obs, &c.optics, o, pr, &none);
+        let b = LsqmlBatch::new(
+            &run,
+            views,
+            &c.obs,
+            &c.optics,
+            slice::from_ref(o),
+            pr,
+            &none,
+        );
         let w = b.a_far().to_vec();
-        let mut g_o = b.obj_direction();
+        let [mut g_o] = <[_; 1]>::try_from(b.obj_directions()).unwrap();
         let mut g_p = b.probe_direction();
         g_o.as_mut_slice().iter_mut().for_each(|v| *v *= -2.0);
         let count = BATCH as f64;
@@ -264,7 +274,7 @@ fn assert_step(what: &str, s: &LsqmlStep, rows: &[&Vec<f64>], frame_col: usize) 
     assert_eq!(s.frames, frames, "{what}");
     for (name, got, col, tol) in [
         ("a_far", &s.a_far, frame_col + 1, 1e-13),
-        ("a_o", &s.a_obj, frame_col + 2, 1e-12),
+        ("a_o", &s.a_obj[0], frame_col + 2, 1e-12),
         ("a_p", &s.a_probe, frame_col + 3, 1e-12),
     ] {
         let want: Vec<f64> = rows.iter().map(|r| r[col]).collect();
@@ -313,7 +323,14 @@ fn step_matches_ptychi() {
             seed: 0,
         })
         .with_preconditioner(pre)
-        .step(views, &c.obs, &c.optics, &mut object, &mut probe, &mut var);
+        .step(
+            views,
+            &c.obs,
+            &c.optics,
+            slice::from_mut(&mut object),
+            &mut probe,
+            &mut var,
+        );
         let want: Vec<_> = rows.iter().filter(|r| r[0] == k as f64).collect();
         assert_step(&format!("case {k}"), &step, &want, 1);
         assert_changes(
@@ -355,7 +372,7 @@ fn reconstruction_matches_ptychi() {
                 &s.addr,
                 &c.obs,
                 &c.optics,
-                &mut object,
+                slice::from_mut(&mut object),
                 &mut probe,
                 &mut var,
             ) {

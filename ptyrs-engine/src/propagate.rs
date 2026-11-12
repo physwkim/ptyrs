@@ -15,10 +15,13 @@ use ptyrs_core::{C64, Geometry};
 use crate::{EngineError, Fft2, quad_phase, shift};
 
 /// The exit-wave model of the pty-chi algorithms: `psi = U(P·O·q)` per view, with `q` the
-/// object-plane phase that [`crate::obj_probe_to_psi`] applies and `U` the [`Propagator`].
+/// object-plane phase that [`crate::obj_probe_to_psi`] applies and `U` the [`Propagator`];
+/// through several object slices, [`crate::SliceWaves`].
 pub struct Optics {
     quad: Vec<C64>,
     propagator: Propagator,
+    /// The in-object propagator from each slice to the next.
+    gaps: Vec<Propagator>,
 }
 
 impl Optics {
@@ -27,6 +30,7 @@ impl Optics {
         Self {
             quad: quad_phase(g),
             propagator: Propagator::Fourier(Fft2::new(g.frame)),
+            gaps: Vec::new(),
         }
     }
 
@@ -36,7 +40,28 @@ impl Optics {
         Self {
             quad: vec![C64::new(1.0, 0.0); ny * nx],
             propagator: Propagator::free_space(w),
+            gaps: Vec::new(),
         }
+    }
+
+    /// This model through `gaps.len() + 1` object slices, pty-chi's multislice object: the
+    /// wave crosses gap `s`, from slice `s` to `s + 1`, by [`Propagator::angular_spectrum`] of
+    /// `gaps[s]` (pty-chi `slice_spacings_m[s]` at the object pixel).
+    pub fn with_slices(self, gaps: &[Wavefield]) -> Result<Self, EngineError> {
+        let shape = self.propagator.shape();
+        let gaps = gaps
+            .iter()
+            .map(|w| {
+                if w.shape != shape {
+                    return Err(EngineError::Invalid(format!(
+                        "slice gap plane {:?} is not the exit plane {shape:?}",
+                        w.shape
+                    )));
+                }
+                Propagator::angular_spectrum(w)
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(Self { gaps, ..self })
     }
 
     pub fn quad(&self) -> &[C64] {
@@ -45,6 +70,16 @@ impl Optics {
 
     pub fn propagator(&self) -> &Propagator {
         &self.propagator
+    }
+
+    /// The in-object propagators, gap `s` from slice `s` to `s + 1`.
+    pub fn gaps(&self) -> &[Propagator] {
+        &self.gaps
+    }
+
+    /// The object slices the wave crosses, `gaps().len() + 1`.
+    pub fn nslice(&self) -> usize {
+        self.gaps.len() + 1
     }
 }
 

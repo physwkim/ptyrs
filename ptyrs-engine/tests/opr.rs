@@ -6,6 +6,7 @@
 //! `<dir>/lsqml_opr_{eigen,weights,obj,probe,steps,values}_f64.txt`, saved to `tests/data`.
 
 use std::ops::Range;
+use std::slice;
 
 use ptyrs_core::{C64, Stack, View};
 use ptyrs_engine::{
@@ -230,7 +231,7 @@ fn step(
         &views,
         p.observed(),
         optics,
-        &mut object,
+        slice::from_mut(&mut object),
         &mut probe,
         var,
     );
@@ -297,7 +298,7 @@ fn assert_lsqml_opr_ref(cost: Cost, noise: usize) {
     let (s, d_obj, d_probe) = step(&p, &optics, cost, &frames, &mut var);
     for (name, got, col, tol) in [
         ("a_far", &s.a_far, 1, 1e-13),
-        ("a_o", &s.a_obj, 2, 1e-12),
+        ("a_o", &s.a_obj[0], 2, 1e-12),
         ("a_p", &s.a_probe, 3, 1e-12),
     ] {
         let want: Vec<f64> = rows.iter().map(|r| r[col + 3 * noise]).collect();

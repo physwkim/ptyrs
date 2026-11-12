@@ -25,6 +25,7 @@ mod fft;
 mod gpu;
 mod linop;
 mod lsqml;
+mod multislice;
 mod obs;
 mod opr;
 mod ops;
@@ -41,8 +42,11 @@ pub use features::{
 };
 pub use fft::Fft2;
 pub use gpu::{GpuOptions, GpuPtycho};
-pub use linop::{DOT_TOL, LinearOp, ObjectToPsi, ProbeToPsi, Propagation, Registered, register};
+pub use linop::{
+    DOT_TOL, LinearOp, ObjectToPsi, ProbeToPsi, Propagation, Registered, SliceJacobian, register,
+};
 pub use lsqml::{Lsqml, LsqmlBatch, LsqmlParams, LsqmlStep, illumination};
+pub use multislice::SliceWaves;
 pub use obs::{Observed, shift};
 pub use opr::{ProbeVariation, opr_weight_grad};
 pub use ops::{
