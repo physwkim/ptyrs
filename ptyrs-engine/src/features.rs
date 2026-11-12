@@ -21,6 +21,15 @@ pub enum Cost {
 }
 
 impl Cost {
+    /// The cost at one pixel.
+    pub fn value(self, iobs: f64, icalc: f64) -> f64 {
+        match self {
+            Cost::Poisson if iobs > 0.0 => icalc - iobs + iobs * (iobs / icalc).ln(),
+            Cost::Poisson => icalc,
+            Cost::Amplitude => (icalc.sqrt() - iobs.sqrt()).powi(2),
+        }
+    }
+
     /// `∂cost/∂icalc` at one pixel, `icalc` floored at 1e-12 as in [`crate::poisson_grad`].
     pub fn slope(self, iobs: f64, icalc: f64) -> f64 {
         let icalc = icalc.max(1e-12);
@@ -224,5 +233,67 @@ pub fn intensity_grad(
             })
             .sum();
     }
+    grad
+}
+
+/// Calls `f(iobs, icalc, j)` at every unmasked pixel of the far field `psi` covering `frames`
+/// of `obs`, with `icalc = Σ_m |psi|² + background[j]` and `j` the pixel's shifted index.
+fn with_background(
+    obs: &Observed,
+    frames: Range<usize>,
+    nmode: usize,
+    psi: &[C64],
+    background: &[f64],
+    mut f: impl FnMut(f64, f64, usize),
+) {
+    let n = obs.plane_len();
+    assert_eq!(psi.len(), frames.len() * nmode * n);
+    assert_eq!(background.len(), n);
+    for (o, block) in obs
+        .frames(frames)
+        .chunks_exact(n)
+        .zip(psi.chunks_exact(nmode * n))
+    {
+        for (j, iobs) in o.iter().enumerate() {
+            if let Some(iobs) = *iobs {
+                let i: f64 = (0..nmode).map(|m| block[m * n + j].norm_sqr()).sum();
+                f(iobs, i + background[j], j);
+            }
+        }
+    }
+}
+
+/// `cost` summed over the frames `frames` with an incoherent background, one detector plane
+/// added to every frame (as ptyrs-refgen adds it): `icalc = Σ_m |psi|² + background`, the far
+/// field `psi` covering `frames` of `obs` and `background` shifted as [`Observed`].
+pub fn background_cost(
+    obs: &Observed,
+    frames: Range<usize>,
+    nmode: usize,
+    psi: &[C64],
+    background: &[f64],
+    cost: Cost,
+) -> f64 {
+    let mut sum = 0.0;
+    with_background(obs, frames, nmode, psi, background, |iobs, icalc, _| {
+        sum += cost.value(iobs, icalc)
+    });
+    sum
+}
+
+/// Gradient of [`background_cost`] over `background`, per pixel of the shifted plane:
+/// `∂C/∂b = Σ_frames slope(iobs, icalc)`.
+pub fn background_grad(
+    obs: &Observed,
+    frames: Range<usize>,
+    nmode: usize,
+    psi: &[C64],
+    background: &[f64],
+    cost: Cost,
+) -> Vec<f64> {
+    let mut grad = vec![0.0; background.len()];
+    with_background(obs, frames, nmode, psi, background, |iobs, icalc, j| {
+        grad[j] += cost.slope(iobs, icalc)
+    });
     grad
 }

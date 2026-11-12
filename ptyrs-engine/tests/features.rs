@@ -6,8 +6,8 @@
 
 use ptyrs_core::{C64, Scan};
 use ptyrs_engine::{
-    Cost, Fft2, Ptycho, intensity_grad, llk, obj_probe_shift_to_psi, obj_probe_to_psi,
-    position_grad, quad_phase, scale_psi,
+    Cost, Fft2, Ptycho, background_cost, background_grad, intensity_grad, llk,
+    obj_probe_shift_to_psi, obj_probe_to_psi, position_grad, quad_phase, scale_psi, shift,
 };
 
 pub mod common;
@@ -157,4 +157,48 @@ fn intensity_matches_intensity_step_ref() {
     let full = intensity_grad(p.observed(), 0..nframe, nmode, &scale, &phi, Cost::Poisson);
     assert!(g[..20].iter().chain(&g[30..]).all(|&v| v == 0.0));
     assert_eq!(g[20..30], full[20..30]);
+}
+
+/// `refs/f64/background_step.py`: rows `iy ix b dL/db dF/db d2L/db2 d2F/db2 b'_ap` in detector
+/// order (DC at `[ny/2, nx/2]`), one plane added to every frame.
+#[test]
+fn background_matches_background_step_ref() {
+    let (scan, p) = state();
+    let rows = table(include_str!("data/background_f64.txt"));
+    let [ny, nx] = scan.geometry.frame;
+    assert_eq!(rows.len(), ny * nx);
+    assert!(
+        rows.iter()
+            .enumerate()
+            .all(|(i, r)| r[0] == (i / nx) as f64 && r[1] == (i % nx) as f64)
+    );
+    let shifted =
+        |col: usize| -> Vec<f64> { (0..ny * nx).map(|j| rows[shift(j, ny, nx)][col]).collect() };
+    let b = shifted(2);
+    let (nframe, nmode) = (p.addr().nframe(), p.addr().nmode());
+    let obs = p.observed();
+    let psi = far_field(&scan, &p);
+
+    // no background: the engine's sums
+    let zero = vec![0.0; ny * nx];
+    let l = llk(obs, 0..nframe, nmode, &psi);
+    let rel = |a: f64, b: f64| (a - b).abs() / b.abs();
+    let l0 = background_cost(obs, 0..nframe, nmode, &psi, &zero, Cost::Poisson);
+    let f0 = background_cost(obs, 0..nframe, nmode, &psi, &zero, Cost::Amplitude);
+    assert!(rel(l0, l.poisson) < 1e-13, "L {l0} llk {}", l.poisson);
+    assert!(
+        rel(f0, l.euclidian / 4.0) < 1e-13,
+        "F {f0} llk {}",
+        l.euclidian / 4.0
+    );
+
+    let v = &table(include_str!("data/background_values_f64.txt"))[0];
+    assert_eq!(obs.nb_obs() as f64, v[0]);
+    for (cost, value, col) in [(Cost::Poisson, v[1], 3), (Cost::Amplitude, v[2], 4)] {
+        let c = background_cost(obs, 0..nframe, nmode, &psi, &b, cost);
+        assert!(rel(c, value) < 1e-12, "{cost:?}: {c} ref {value}");
+        let g = background_grad(obs, 0..nframe, nmode, &psi, &b, cost);
+        let e = max_rel(&g, &shifted(col));
+        assert!(e < 1e-12, "{cost:?}: max rel {e:.3e}");
+    }
 }

@@ -28,7 +28,10 @@ mod plan;
 mod ptycho;
 pub mod sim;
 
-pub use features::{Cost, intensity_grad, obj_probe_shift_to_psi, position_grad, scale_psi};
+pub use features::{
+    Cost, background_cost, background_grad, intensity_grad, obj_probe_shift_to_psi, position_grad,
+    scale_psi,
+};
 pub use fft::Fft2;
 pub use gpu::{GpuOptions, GpuPtycho};
 pub use linop::{DOT_TOL, FarField, LinearOp, ObjectToPsi, ProbeToPsi, Registered, register};
