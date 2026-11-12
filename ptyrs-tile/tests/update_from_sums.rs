@@ -116,10 +116,21 @@ fn update_probe_from_sums_matches_simt() {
             .collect();
         let sums =
             || UpdateSums::new(up(&stream, &num_host), up(&stream, &den_host), &stream).unwrap();
+        // The bits of `x` and of the sums the update leaves.
+        let after = |x: DeviceBuffer<C32>, sums: UpdateSums| {
+            let num = flat(&sums.num.to_host_vec(&stream).unwrap());
+            let den = sums.den.to_host_vec(&stream).unwrap();
+            (
+                flat(&x.to_host_vec(&stream).unwrap()),
+                bits(&num),
+                bits(&den),
+            )
+        };
         let mut simt = up(&stream, &x_host);
-        k.update_from_sums(&ex, &mut simt, &mut sums(), len as u32, inertia)
+        let mut simt_sums = sums();
+        k.update_from_sums(&ex, &mut simt, &mut simt_sums, len as u32, inertia)
             .unwrap();
-        let simt = flat(&simt.to_host_vec(&stream).unwrap());
+        let (simt, simt_num, simt_den) = after(simt, simt_sums);
         let run = || {
             let mut sums = sums();
             // Stale scratch above every `den`: the op must zero it itself.
@@ -127,9 +138,13 @@ fn update_probe_from_sums_matches_simt() {
             let mut x = up(&stream, &x_host);
             tk.update_probe_from_sums(&ex, &mut x, &mut sums, inertia)
                 .unwrap();
-            flat(&x.to_host_vec(&stream).unwrap())
+            after(x, sums)
         };
-        let tile = run();
+        let (tile, num, den) = run();
+        // Both consume every sum.
+        assert_eq!(num, vec![0; 2 * len], "n={len}: num not consumed");
+        assert_eq!(den, vec![0; len], "n={len}: den not consumed");
+        assert_eq!((&simt_num, &simt_den), (&num, &den), "n={len}: SIMT sums");
 
         let simt64: Vec<f64> = simt.iter().map(|&v| v as f64).collect();
         let (vs_simt, vs_f64) = (rel_l2(&tile, &simt64), rel_l2(&tile, &want));
@@ -148,15 +163,16 @@ fn update_probe_from_sums_matches_simt() {
         if !positive {
             assert_eq!(bits(&tile), bits(&simt), "n={len}: reg 0 is not exact");
         }
-        assert_eq!(bits(&run()), bits(&tile), "n={len}: differs run to run");
+        assert_eq!(bits(&run().0), bits(&tile), "n={len}: differs run to run");
         assert_eq!(jit_compile_count(), jit, "n={len}: a launch compiled");
     }
 }
 
-/// The object update reads and writes only the tiles with views: their sums poisoned
-/// (`num` NaN, `den` 1e30, above every lit `den`), those tiles keep `obj`, `num` and `den`
-/// bit for bit, and every other pixel gets the SIMT kernels' bits, `max(den)` included,
-/// with negative and NaN `den` among the lit pixels and stale `max_bits`.
+/// The object update reads and writes only the tiles with views: the other tiles' sums
+/// poisoned (`num` NaN, `den` 1e30, above every lit `den`), those tiles keep `obj`, `num`
+/// and `den` bit for bit, and every other pixel gets the SIMT kernels' bits, `max(den)`
+/// included, with negative and NaN `den` among the lit pixels and stale `max_bits`, and
+/// its sums zeroed.
 #[test]
 fn update_obj_from_sums_matches_simt_on_tiles_with_views() {
     let ctx = CudaContext::new(0).expect("CUDA device 0");
@@ -270,6 +286,16 @@ fn update_obj_from_sums_matches_simt_on_tiles_with_views() {
     let vs_f64 = rel_l2(&tx, &want);
     println!("update_obj_from_sums: rel L2 Tile-f64 {vs_f64:.2e}");
     assert_eq!(bits(&tx), bits(&sx), "obj differs from SIMT");
+    assert_eq!(
+        bits(&flat(&tile.1)),
+        bits(&flat(&simt.1)),
+        "num differs from SIMT"
+    );
+    assert_eq!(bits(&tile.2), bits(&simt.2), "den differs from SIMT");
+    for i in (0..len).filter(|&i| lit[i]) {
+        assert_eq!(bits(&flat(&tile.1[i..=i])), [0, 0], "num {i} not consumed");
+        assert_eq!(tile.2[i].to_bits(), 0, "den {i} not consumed");
+    }
     assert!(vs_f64 < 1e-6, "Tile vs f64 rel L2 {vs_f64:.2e}");
     for i in (0..len).filter(|&i| !lit[i]) {
         let (x, n) = (flat(&tile.0[i..=i]), flat(&tile.1[i..=i]));

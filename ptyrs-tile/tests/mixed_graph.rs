@@ -145,8 +145,6 @@ struct State {
 fn epoch(ctx: &ExecutionContext, scan: &Scan, s: &mut State) -> Result<(), Error> {
     let (k, tk, d, table) = (scan.k, scan.tk, scan.views.dims(), scan.table);
     let nk = d.nframe * d.nmode;
-    s.obj_sums.zero(ctx)?;
-    s.probe_sums.zero(ctx)?;
     k.obj_probe_to_psi(ctx, scan.views, table.at(0), &s.obj, &s.probe, &mut s.psi)?;
     fft2(k, ctx, &mut s.psi, nk, false)?;
     k.llk(ctx, d, table.at(0), scan.counts, &s.psi, &mut s.partials)?;
@@ -252,6 +250,17 @@ fn ap_epoch_graph_replays_bit_for_bit() {
         replayed.push(bits(&stream, &s));
     }
     jit_left("replay");
+    // The updates consume every sum an epoch adds, so the next epoch starts from zero.
+    for (what, sums) in [("object", &s.obj_sums), ("probe", &s.probe_sums)] {
+        let num = sums.num.to_host_vec(&stream).unwrap();
+        let den = sums.den.to_host_vec(&stream).unwrap();
+        assert!(
+            num.iter()
+                .all(|c| c.re.to_bits() == 0 && c.im.to_bits() == 0)
+                && den.iter().all(|v| v.to_bits() == 0),
+            "{what} sums not consumed"
+        );
+    }
 
     s.obj.copy_from_host(&stream, &obj0).unwrap();
     s.probe.copy_from_host(&stream, &probe0).unwrap();

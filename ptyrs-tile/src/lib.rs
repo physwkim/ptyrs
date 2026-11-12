@@ -80,13 +80,24 @@ mod device {
         at: Tile<i32, { [R, C] }>,
         m: Tile<bool, { [R, C] }>,
     ) -> Tile<f32, { [R, C] }> {
+        let (v, _t): (Tile<f32, { [R, C] }>, Token) = unsafe { gather_tok(p, at, m) };
+        v
+    }
+
+    /// [`gather`] and the load's token, which a store to the same pixels must take: Tile IR
+    /// orders memory operations only through tokens and data dependencies.
+    unsafe fn gather_tok<const R: i32, const C: i32>(
+        p: *const f32,
+        at: Tile<i32, { [R, C] }>,
+        m: Tile<bool, { [R, C] }>,
+    ) -> (Tile<f32, { [R, C] }>, Token) {
         let base: PointerTile<*const f32, { [] }> = pointer_to_tile(p);
         let base: PointerTile<*const f32, { [1, 1] }> = base.reshape(shape![1, 1]);
         let base: PointerTile<*const f32, { [R, C] }> = base.broadcast(shape![R, C]);
         let ptrs: PointerTile<*const f32, { [R, C] }> = base.offset_tile(at);
         // A padding value on a rank-2 pointer load fails tileiras; masked lanes are
         // discarded by the caller instead.
-        let (v, _t): (Tile<f32, { [R, C] }>, Token) = unsafe {
+        let (v, t): (Tile<f32, { [R, C] }>, Token) = unsafe {
             load_ptr_tko(
                 ptrs,
                 ordering::Weak,
@@ -97,7 +108,7 @@ mod device {
                 Latency::<0>,
             )
         };
-        v
+        (v, t)
     }
 
     /// `(p[at], p[at + 1])` where `m`, as one load of `[R, C, 2]` so each lane reads its
@@ -107,6 +118,17 @@ mod device {
         at: Tile<i32, { [R, C] }>,
         m: Tile<bool, { [R, C] }>,
     ) -> (Tile<f32, { [R, C] }>, Tile<f32, { [R, C] }>) {
+        let (re, im, _t): (Tile<f32, { [R, C] }>, Tile<f32, { [R, C] }>, Token) =
+            unsafe { gather_c_tok(p, at, m) };
+        (re, im)
+    }
+
+    /// [`gather_c`] and the load's token, as [`gather_tok`].
+    unsafe fn gather_c_tok<const R: i32, const C: i32>(
+        p: *const f32,
+        at: Tile<i32, { [R, C] }>,
+        m: Tile<bool, { [R, C] }>,
+    ) -> (Tile<f32, { [R, C] }>, Tile<f32, { [R, C] }>, Token) {
         let part: Tile<i32, { [2] }> = iota(shape![2]);
         let part: Tile<i32, { [1, 1, 2] }> = part.reshape(shape![1, 1, 2]);
         let part: Tile<i32, { [R, C, 2] }> = part.broadcast(shape![R, C, 2]);
@@ -118,7 +140,7 @@ mod device {
         let base: PointerTile<*const f32, { [1, 1, 1] }> = base.reshape(shape![1, 1, 1]);
         let base: PointerTile<*const f32, { [R, C, 2] }> = base.broadcast(shape![R, C, 2]);
         let ptrs: PointerTile<*const f32, { [R, C, 2] }> = base.offset_tile(at);
-        let (v, _t): (Tile<f32, { [R, C, 2] }>, Token) = unsafe {
+        let (v, t): (Tile<f32, { [R, C, 2] }>, Token) = unsafe {
             load_ptr_tko(
                 ptrs,
                 ordering::Weak,
@@ -133,7 +155,7 @@ mod device {
         let o: Tile<i32, { [] }> = scalar_to_tile(1i32);
         let re: Tile<f32, { [R, C, 1] }> = extract(v, [z, z, z]);
         let im: Tile<f32, { [R, C, 1] }> = extract(v, [z, z, o]);
-        (re.reshape(shape![R, C]), im.reshape(shape![R, C]))
+        (re.reshape(shape![R, C]), im.reshape(shape![R, C]), t)
     }
 
     unsafe fn scatter<const R: i32, const C: i32>(
@@ -154,6 +176,31 @@ mod device {
                 None::<scope::TileBlock>,
                 Some(m),
                 None,
+                Latency::<0>,
+            )
+        };
+    }
+
+    /// `p[at] = 0` where `m`, ordered after the operation that returned `after`.
+    unsafe fn zero_after<const R: i32, const C: i32>(
+        p: *mut f32,
+        at: Tile<i32, { [R, C] }>,
+        m: Tile<bool, { [R, C] }>,
+        after: Token,
+    ) {
+        let base: PointerTile<*mut f32, { [] }> = pointer_to_tile(p);
+        let base: PointerTile<*mut f32, { [1, 1] }> = base.reshape(shape![1, 1]);
+        let base: PointerTile<*mut f32, { [R, C] }> = base.broadcast(shape![R, C]);
+        let ptrs: PointerTile<*mut f32, { [R, C] }> = base.offset_tile(at);
+        let zero: Tile<f32, { [R, C] }> = constant(0.0f32, shape![R, C]);
+        let _t: Token = unsafe {
+            store_ptr_tko(
+                ptrs,
+                zero,
+                ordering::Weak,
+                None::<scope::TileBlock>,
+                Some(m),
+                Some(after),
                 Latency::<0>,
             )
         };
@@ -474,11 +521,21 @@ mod device {
         at: Tile<i32, { [1024] }>,
         m: Tile<bool, { [1024] }>,
     ) -> Tile<f32, { [1024] }> {
+        let (v, _t): (Tile<f32, { [1024] }>, Token) = unsafe { gather_1d_tok(p, at, m) };
+        v
+    }
+
+    /// [`gather_1d`] and the load's token, as [`gather_tok`].
+    unsafe fn gather_1d_tok(
+        p: *const f32,
+        at: Tile<i32, { [1024] }>,
+        m: Tile<bool, { [1024] }>,
+    ) -> (Tile<f32, { [1024] }>, Token) {
         let base: PointerTile<*const f32, { [] }> = pointer_to_tile(p);
         let base: PointerTile<*const f32, { [1] }> = base.reshape(shape![1]);
         let base: PointerTile<*const f32, { [1024] }> = base.broadcast(shape![1024]);
         let ptrs: PointerTile<*const f32, { [1024] }> = base.offset_tile(at);
-        let (v, _t): (Tile<f32, { [1024] }>, Token) = unsafe {
+        let (v, t): (Tile<f32, { [1024] }>, Token) = unsafe {
             load_ptr_tko(
                 ptrs,
                 ordering::Weak,
@@ -489,7 +546,32 @@ mod device {
                 Latency::<0>,
             )
         };
-        v
+        (v, t)
+    }
+
+    /// [`zero_after`] of a `[1024]` tile.
+    unsafe fn zero_1d_after(
+        p: *mut f32,
+        at: Tile<i32, { [1024] }>,
+        m: Tile<bool, { [1024] }>,
+        after: Token,
+    ) {
+        let base: PointerTile<*mut f32, { [] }> = pointer_to_tile(p);
+        let base: PointerTile<*mut f32, { [1] }> = base.reshape(shape![1]);
+        let base: PointerTile<*mut f32, { [1024] }> = base.broadcast(shape![1024]);
+        let ptrs: PointerTile<*mut f32, { [1024] }> = base.offset_tile(at);
+        let zero: Tile<f32, { [1024] }> = constant(0.0f32, shape![1024]);
+        let _t: Token = unsafe {
+            store_ptr_tko(
+                ptrs,
+                zero,
+                ordering::Weak,
+                None::<scope::TileBlock>,
+                Some(m),
+                Some(after),
+                Latency::<0>,
+            )
+        };
     }
 
     /// `ptyrs_kernels::max_nonneg_f32`: `*out = max(*out, x[0 .. n] ...)` as `f32` bits
@@ -531,13 +613,14 @@ mod device {
     }
 
     /// `ptyrs_kernels::normalize_update`: `x = (num + reg x) / max(den + reg, 1e-12)` with
-    /// `reg = inertia * *max`, for `n` complex values. Program `i` takes the interleaved
-    /// floats `[1024 i ..][.. 1024]` of `x` and `num`.
+    /// `reg = inertia * *max`, for `n` complex values, then zeroes the `num` and `den` it
+    /// consumed. Program `i` takes the interleaved floats `[1024 i ..][.. 1024]` of `x` and
+    /// `num`, and the `den` values `[512 i ..][.. 512]`.
     #[cutile::entry()]
     unsafe fn normalize_update(
         x: *mut f32,
-        num: *const f32,
-        den: *const f32,
+        num: *mut f32,
+        den: *mut f32,
         n: i32,
         max: *const f32,
         inertia: f32,
@@ -547,11 +630,14 @@ mod device {
         let lane: Tile<i32, { [1024] }> = iota(shape![1024]);
         let at: Tile<i32, { [1024] }> = lane + broadcast_scalar(pid.0 * 1024i32, shape![1024]);
         let inside: Tile<bool, { [1024] }> = lt_tile(at, broadcast_scalar(2i32 * n, shape![1024]));
-        let e: Tile<i32, { [1024] }> = at / constant(2i32, shape![1024]);
+        let two: Tile<i32, { [1024] }> = constant(2i32, shape![1024]);
+        let e: Tile<i32, { [1024] }> = at / two;
         let x_in: *const f32 = cast_const(x);
-        let a: Tile<f32, { [1024] }> = unsafe { gather_1d(num, at, inside) };
+        let (a, num_t): (Tile<f32, { [1024] }>, Token) =
+            unsafe { gather_1d_tok(cast_const(num), at, inside) };
         let b: Tile<f32, { [1024] }> = unsafe { gather_1d(x_in, at, inside) };
-        let dv: Tile<f32, { [1024] }> = unsafe { gather_1d(den, e, inside) };
+        let (dv, den_t): (Tile<f32, { [1024] }>, Token) =
+            unsafe { gather_1d_tok(cast_const(den), e, inside) };
         let reg_t: Tile<f32, { [1024] }> = broadcast_scalar(reg, shape![1024]);
         let eps: Tile<f32, { [1024] }> = constant(1e-12f32, shape![1024]);
         // `f32::max` keeps the non-NaN operand: a NaN `den + reg` becomes `1e-12`.
@@ -573,6 +659,10 @@ mod device {
                 Latency::<0>,
             )
         };
+        // Each `den` value is read by the lanes of both its floats and zeroed by the even one.
+        let even: Tile<bool, { [1024] }> = eq_tile(e * two, at);
+        unsafe { zero_1d_after(num, at, inside, num_t) };
+        unsafe { zero_1d_after(den, e, inside & even, den_t) };
     }
 
     /// `ptyrs_kernels::max_den_tiles`: `max_nonneg_f32` of `den` `[nobj, nyo, nxo]` over the
@@ -605,14 +695,14 @@ mod device {
     }
 
     /// `ptyrs_kernels::normalize_tiles`: `normalize_update` of `x` `[nobj, nyo, nxo]` on the
-    /// pixels of the object tiles with views, one program per tile and object mode, every
-    /// operation rounded on its own as `normalize_at`; a program whose tile has none reads
-    /// and writes nothing.
+    /// pixels of the object tiles with views, zeroing their sums, one program per tile and
+    /// object mode, every operation rounded on its own as `normalize_at`; a program whose
+    /// tile has none reads and writes nothing.
     #[cutile::entry()]
     unsafe fn normalize_tiles(
         x: *mut f32,
-        num: *const f32,
-        den: *const f32,
+        num: *mut f32,
+        den: *mut f32,
         tile_len: *const i32,
         max: *const f32,
         inertia: f32,
@@ -638,11 +728,12 @@ mod device {
                 ftz::Disabled,
             );
             let x_in: *const f32 = cast_const(x);
-            let (a_re, a_im): (Tile<f32, { [16, 16] }>, Tile<f32, { [16, 16] }>) =
-                unsafe { gather_c(num, at, owned) };
+            let (a_re, a_im, num_t): (Tile<f32, { [16, 16] }>, Tile<f32, { [16, 16] }>, Token) =
+                unsafe { gather_c_tok(cast_const(num), at, owned) };
             let (b_re, b_im): (Tile<f32, { [16, 16] }>, Tile<f32, { [16, 16] }>) =
                 unsafe { gather_c(x_in, at, owned) };
-            let dv: Tile<f32, { [16, 16] }> = unsafe { gather(den, px, owned) };
+            let (dv, den_t): (Tile<f32, { [16, 16] }>, Token) =
+                unsafe { gather_tok(cast_const(den), px, owned) };
             let eps: Tile<f32, { [16, 16] }> = constant(1e-12f32, shape![16, 16]);
             // `f32::max` keeps the non-NaN operand: a NaN `den + reg` becomes `1e-12`.
             let s: Tile<f32, { [16, 16] }> = addf(dv, reg, rounding::NearestEven, ftz::Disabled);
@@ -657,8 +748,12 @@ mod device {
                 addf(a_im, rb_im, rounding::NearestEven, ftz::Disabled);
             let r_re: Tile<f32, { [16, 16] }> = divf(t_re, d, rounding::NearestEven, ftz::Disabled);
             let r_im: Tile<f32, { [16, 16] }> = divf(t_im, d, rounding::NearestEven, ftz::Disabled);
+            let at_im: Tile<i32, { [16, 16] }> = at + constant(1i32, shape![16, 16]);
             unsafe { scatter(x, at, r_re, owned) };
-            unsafe { scatter(x, at + constant(1i32, shape![16, 16]), r_im, owned) };
+            unsafe { scatter(x, at_im, r_im, owned) };
+            unsafe { zero_after(num, at, owned, num_t) };
+            unsafe { zero_after(num, at_im, owned, num_t) };
+            unsafe { zero_after(den, px, owned, den_t) };
         }
     }
 
@@ -1106,9 +1201,9 @@ impl<'a> TileKernels<'a> {
 
     /// [`ptyrs_gpu::Kernels::update_obj_from_sums`]: [`Self::update_probe_from_sums`] of the
     /// object `[nobj, nyo, nxo]` on the object tiles with views only, `reg = inertia *
-    /// max(den)` over their pixels. A tile whose run is empty is neither read nor written,
-    /// in `obj` or `sums`, so it keeps its bits. `sums.max_bits` is the scratch for the
-    /// maximum.
+    /// max(den)` over their pixels, zeroing their sums. A tile whose run is empty is neither
+    /// read nor written, in `obj` or `sums`, so it keeps its bits. `sums.max_bits` is the
+    /// scratch for the maximum.
     pub fn update_obj_from_sums(
         &self,
         ctx: &ExecutionContext,
@@ -1129,12 +1224,13 @@ impl<'a> TileKernels<'a> {
             addr("sums.max_bits", max_bits)?,
         ];
         ptyrs_gpu::zero(ctx, max_bits)?;
-        let reads = [
+        let writes = [
+            max_bits.storage(),
+            obj.storage(),
             num.storage(),
             den.storage(),
-            self.views.tile_len().storage(),
         ];
-        lease(ctx, &reads, &[max_bits.storage(), obj.storage()])?;
+        lease(ctx, &[self.views.tile_len().storage()], &writes)?;
         self.update_obj_run(Run::Launch(ctx), at, inertia)
     }
 
@@ -1151,7 +1247,8 @@ impl<'a> TileKernels<'a> {
         let tile_len = self.views.tile_len();
         // SAFETY: a launch comes from `update_obj_from_sums`, which checked that `obj`, `num`
         // and `den` hold the object and `max_bits` one u32, zeroed it and leased the buffers
-        // on `ctx`; `tile_len` holds the object's tiles; `stack_geom` checked the offsets.
+        // on `ctx`; `tile_len` holds the object's tiles; `stack_geom` checked the offsets;
+        // each program reads and writes only the pixels of its own tile.
         unsafe {
             run!(
                 run,
@@ -1177,8 +1274,9 @@ impl<'a> TileKernels<'a> {
 
     /// [`ptyrs_gpu::Kernels::update_from_sums`] of the probe: `x = (num + reg x) / max(den +
     /// reg, 1e-12)` for its `nprobe * ny * nx` values, `reg = inertia * max(0, den ...)`
-    /// over the non-NaN values of `den`. `sums.max_bits` is the scratch for that maximum,
-    /// zeroed on `ctx`'s stream here, so the call allocates nothing and never synchronizes.
+    /// over the non-NaN values of `den`, then zeroes `sums.num` and `sums.den`, which it has
+    /// consumed. `sums.max_bits` is the scratch for that maximum, zeroed on `ctx`'s stream
+    /// here, so the call allocates nothing and never synchronizes.
     pub fn update_probe_from_sums(
         &self,
         ctx: &ExecutionContext,
@@ -1199,11 +1297,13 @@ impl<'a> TileKernels<'a> {
             addr("sums.max_bits", max_bits)?,
         ];
         ptyrs_gpu::zero(ctx, max_bits)?;
-        lease(
-            ctx,
-            &[num.storage(), den.storage()],
-            &[max_bits.storage(), probe.storage()],
-        )?;
+        let writes = [
+            max_bits.storage(),
+            probe.storage(),
+            num.storage(),
+            den.storage(),
+        ];
+        lease(ctx, &[], &writes)?;
         self.update_probe_run(Run::Launch(ctx), at, inertia)
     }
 
