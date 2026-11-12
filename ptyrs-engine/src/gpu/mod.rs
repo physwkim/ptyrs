@@ -24,6 +24,7 @@ mod ap;
 mod bh;
 mod device;
 mod dm;
+mod lsqml;
 mod ml;
 mod rpie;
 
@@ -44,7 +45,8 @@ use device::{Bufs, Device, M1Bufs, NormBufs, PassesMut};
 
 use crate::ptycho::{Algorithm, LlkRecord, zero_phase_ramp};
 use crate::{
-    ApParams, BhParams, DmParams, EngineError, Features, Fft2, Llk, MlParams, Observed, RpieParams,
+    ApParams, BhParams, DmParams, EngineError, Features, Fft2, Llk, LsqmlParams, MlParams,
+    Observed, RpieParams,
 };
 
 /// How [`GpuPtycho`] batches its work.
@@ -96,6 +98,11 @@ enum Epoch {
     },
     /// A BH epoch; with `cg` it continues the last epoch's direction.
     Bh { params: BhParams, cg: bool },
+    /// An LSQML epoch; `pre` says what it does to the preconditioner.
+    Lsqml {
+        params: LsqmlParams,
+        pre: lsqml::Pre,
+    },
 }
 
 impl Epoch {
@@ -106,6 +113,7 @@ impl Epoch {
             Self::Rpie(_) => Algorithm::Rpie,
             Self::Ml { .. } => Algorithm::Ml,
             Self::Bh { .. } => Algorithm::Bh,
+            Self::Lsqml { .. } => Algorithm::Lsqml,
         }
     }
 
@@ -124,6 +132,10 @@ impl Epoch {
                 llk: false,
             },
             Self::Bh { params, .. } => Self::Bh { params, cg: false },
+            Self::Lsqml { params, .. } => Self::Lsqml {
+                params,
+                pre: lsqml::Pre::Keep,
+            },
         }
     }
 }

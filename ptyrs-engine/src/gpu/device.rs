@@ -23,11 +23,15 @@ use ptyrs_gpu::{
 };
 use ptyrs_tile::TileDots;
 
+use super::lsqml::{LsqmlBufs, LsqmlState, Pre};
 use super::{
     Epoch, Frames, GpuOptions, Tag, batch_stacks, plane_len, plans, split, stack_buf_len, stacks,
     to_u32,
 };
-use crate::{ApParams, BhParams, BhStep, DmParams, EngineError, Features, MlParams, RpieParams};
+use crate::{
+    ApParams, BhParams, BhStep, DmParams, EngineError, Features, LsqmlParams, LsqmlStep, MlParams,
+    RpieParams,
+};
 
 /// Every buffer, module and plan a cycle launches on, and the graphs captured from them.
 pub(super) struct Device {
@@ -66,6 +70,8 @@ pub(super) struct Device {
     ml: Option<Box<MlState>>,
     /// BH's state, built by the first BH call and replaced only for another batch size.
     bh_state: Option<Box<BhState>>,
+    /// LSQML's state, built by the first LSQML call and replaced only for another batch size.
+    lsqml: Option<Box<LsqmlState>>,
     features: FeatureBufs,
 }
 
@@ -198,6 +204,12 @@ enum Cycle {
         params: BhParams,
         cg: bool,
     },
+    /// Its buffers are the device's [`LsqmlState`], which every LSQML epoch of its batch
+    /// size shares.
+    Lsqml {
+        params: LsqmlParams,
+        pre: Pre,
+    },
 }
 
 impl Cycle {
@@ -208,6 +220,7 @@ impl Cycle {
             Self::Rpie(p, _) => Epoch::Rpie(p),
             Self::Ml { params, first, llk } => Epoch::Ml { params, first, llk },
             Self::Bh { params, cg } => Epoch::Bh { params, cg },
+            Self::Lsqml { params, pre } => Epoch::Lsqml { params, pre },
         }
     }
 }
@@ -525,6 +538,8 @@ pub(super) struct Bufs<'a> {
     pub ml: Option<MlBufs<'a>>,
     /// BH's state, once a BH call has built it.
     pub bh_state: Option<BhBufs<'a>>,
+    /// LSQML's state, once an LSQML call has built it.
+    pub lsqml: Option<LsqmlBufs<'a>>,
     pub features: FeaturesMut<'a>,
 }
 
@@ -638,6 +653,7 @@ impl Device {
             llk_graph: None,
             ml: None,
             bh_state: None,
+            lsqml: None,
             features: FeatureBufs::default(),
             stack_size: to_u32("stack_size", options.stack_size)?,
             stream,
@@ -766,6 +782,7 @@ impl Device {
             norms: &mut self.norms,
             ml: self.ml.as_deref_mut().map(MlState::lend),
             bh_state: self.bh_state.as_deref_mut().map(BhState::lend),
+            lsqml: self.lsqml.as_deref_mut().map(LsqmlState::lend),
             features: FeaturesMut {
                 scale: self.features.scale.as_mut().map(|s| ScaleMut {
                     values: &mut s.values,
@@ -836,6 +853,33 @@ impl Device {
                 }
             })
             .collect())
+    }
+
+    /// One LSQML epoch as [`Self::steady`] enqueues it, after setting its frame order:
+    /// `order` holds the scan frame at each epoch position.
+    pub fn lsqml_epoch(
+        &mut self,
+        params: LsqmlParams,
+        pre: Pre,
+        cycle: usize,
+        order: &[u32],
+    ) -> Result<(), EngineError> {
+        self.steady_with(Epoch::Lsqml { params, pre }, cycle, |dev| {
+            let ctx = dev.context();
+            let l = dev
+                .lsqml
+                .as_deref_mut()
+                .expect("new_run built the LSQML state");
+            Ok(l.set_order(&ctx, &dev.kernels, &dev.views, order)?)
+        })
+    }
+
+    /// The last LSQML epoch's steps, one per batch; none before an LSQML call.
+    pub fn lsqml_steps(&self) -> Result<Vec<LsqmlStep>, EngineError> {
+        match self.lsqml.as_deref() {
+            Some(l) => l.steps(&self.stream),
+            None => Ok(Vec::new()),
+        }
     }
 
     /// [`Self::steady`] with `stage` enqueued just before the cycle, once its buffers are
@@ -916,6 +960,10 @@ impl Device {
                 self.build_bh(&params)?;
                 Cycle::Bh { params, cg }
             }
+            Epoch::Lsqml { params, pre } => {
+                self.build_lsqml(&params)?;
+                Cycle::Lsqml { params, pre }
+            }
         };
         let graph = if self.use_graph {
             Some(self.capture(|bufs, passes, ring, ctx| bufs.cycle(ctx, passes, ring, &mut cycle))?)
@@ -954,6 +1002,26 @@ impl Device {
                 lens,
             )?;
             self.bh_state = Some(Box::new(state));
+        }
+        Ok(())
+    }
+
+    /// Builds the [`LsqmlState`] for `params`' batch size unless it is built, replaced as
+    /// [`Self::build_bh`] replaces BH's.
+    fn build_lsqml(&mut self, params: &LsqmlParams) -> Result<(), EngineError> {
+        let size = to_u32(
+            "batch_size",
+            params.batch_size.min(self.dims().nframe as usize),
+        )?;
+        if self.lsqml.as_ref().is_none_or(|s| s.size() != size) {
+            let state = LsqmlState::new(
+                &self.stream,
+                &self.kernels,
+                &self.views,
+                size,
+                self.stack_size,
+            )?;
+            self.lsqml = Some(Box::new(state));
         }
         Ok(())
     }
@@ -1080,6 +1148,7 @@ impl<'a> Bufs<'a> {
             Cycle::Bh { params, cg } => self
                 .with_bh(|b, bh| b.bh_epoch(ctx, bh, params, *cg))
                 .map(|()| None),
+            Cycle::Lsqml { params, pre } => self.lsqml_epoch(ctx, params, *pre).map(|()| None),
         }
     }
 }
