@@ -1,7 +1,7 @@
 //! The GPU backend against the CPU oracle: per-record LLK and the final object and probe of AP,
-//! DM, rPIE and ML updating the object, the probe or both, from the same scaled start; AP and
-//! DM by M1's launches and by the fused passes; the ML gradients; and the LLK ring's record
-//! of a scan's first frames.
+//! DM, rPIE and ML updating the object, the probe or both, and of BH with one batch, from the
+//! same scaled start; AP and DM by M1's launches and by the fused passes; the ML gradients;
+//! and the LLK ring's record of a scan's first frames.
 
 use std::sync::Arc;
 
@@ -9,8 +9,8 @@ use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaContext, DeviceBuffer};
 use ptyrs_core::{C64, Counts, MASKED, Object, Probe, Scan, Stack};
 use ptyrs_engine::{
-    ApParams, Backend, DmParams, GpuOptions, GpuPtycho, Llk, LlkRecord, MlParams, Observed, Params,
-    Ptycho, RpieParams, Step, llk,
+    Algorithm, ApParams, Backend, Bh, BhParams, DmParams, GpuOptions, GpuPtycho, Llk, LlkRecord,
+    MlParams, Observed, Params, Ptycho, RpieParams, Step, llk,
 };
 use ptyrs_gpu::{C32, FUSED_SIDES, Kernels, LlkPartial, LlkRing, LlkScratch, StackTable, ViewDims};
 
@@ -282,6 +282,53 @@ fn ml_matches_cpu() {
         eprintln!(
             "ml fused {} {params:?}: llk {:.2e} object {:.2e} probe {:.2e}",
             setup.options.fused, errs[0], errs[1], errs[2]
+        );
+        check(errs, [1e-4, 1e-4, 1e-4]);
+    }
+}
+
+/// BH with one batch of every frame (CG after the first epoch) against the CPU's `f64` BH
+/// from the same start: the LLK after each of 20 epochs and the final arrays, by M1's
+/// launches and on the fused passes' frame side.
+#[test]
+fn bh_matches_cpu() {
+    const NEPOCH: usize = 20;
+    let params = BhParams {
+        batch_size: NPOS,
+        probe_rho: 0.01,
+        seed: 7,
+    };
+    for setup in [M1, FUSED] {
+        let (scan, object, probe) = start(setup.frame, 2, true);
+        let at = Ptycho::new(&scan, object.clone(), probe.clone()).unwrap();
+        let (mut o, mut p) = (object.clone(), probe.clone());
+        let mut bh = Bh::new(params);
+        let want: Vec<_> = (0..NEPOCH)
+            .map(|cycle| {
+                bh.epoch(at.addr(), at.observed(), at.quad(), &mut o, &mut p);
+                let llk = Ptycho::new(&scan, o.clone(), p.clone()).unwrap().llk();
+                LlkRecord {
+                    cycle,
+                    algorithm: Algorithm::Bh,
+                    llk,
+                }
+            })
+            .collect();
+        let mut gpu = GpuPtycho::new(&ctx(), &scan, object, probe, setup.options).unwrap();
+        gpu.bh(&params, NEPOCH, 1).unwrap();
+        let errs = [
+            llk_rel(gpu.history(), &want),
+            rel_l2(&gpu.object().unwrap(), &o),
+            rel_l2(&gpu.probe().unwrap(), &p),
+        ];
+        eprintln!(
+            "bh fused {}: llk {:.2e} object {:.2e} probe {:.2e}, llk {:.4e} -> {:.4e}",
+            setup.options.fused,
+            errs[0],
+            errs[1],
+            errs[2],
+            want[0].llk.poisson,
+            want[NEPOCH - 1].llk.poisson
         );
         check(errs, [1e-4, 1e-4, 1e-4]);
     }

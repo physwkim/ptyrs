@@ -13,6 +13,7 @@
 use cuda_device::{device, kernel, launch_bounds, shared::DynamicSharedArray, thread};
 use cuda_host::cuda_module;
 
+pub mod bh;
 pub mod fused;
 pub mod grad;
 pub mod pixel;

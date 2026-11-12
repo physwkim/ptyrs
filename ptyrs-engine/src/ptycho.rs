@@ -18,6 +18,7 @@ pub enum Algorithm {
     Dm,
     Rpie,
     Ml,
+    Bh,
 }
 
 /// One LLK measurement (PyNX `history`): normalised LLK ([`Llk::normalised`]) taken at

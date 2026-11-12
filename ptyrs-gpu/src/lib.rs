@@ -31,12 +31,14 @@ use cuda_core::{
 use ptyrs_fft::FftError;
 use ptyrs_kernels::kernels::LoadedModule;
 
+mod bh;
 mod fused;
 mod grad;
 mod ops;
 mod ring;
 mod rpie;
 
+pub use bh::{BH_HESS, BH_STEP, BhBatch, BhDisp, BhFieldsRef, BhKernels, BhScan, BhVar, bh_parts};
 pub use fused::{Exit, FUSED_SIDES, FusedBufs, FusedInputs, FusedSums};
 pub use grad::{CG_BLOCKS, GAMMA_CHUNK, GammaStacks, GradKernels, gamma_parts};
 pub use ops::{
