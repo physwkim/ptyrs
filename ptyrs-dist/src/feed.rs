@@ -4,16 +4,9 @@
 
 use std::num::NonZeroUsize;
 
-use crate::Partition;
+use ptyrs_core::ScanPattern;
 
-/// How frames arrive in a live scan.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Scan {
-    /// Row-major raster, every row `row` points long and scanned in the same direction.
-    Raster { row: NonZeroUsize },
-    /// Fermat spiral, or any scan without rows.
-    Spiral,
-}
+use crate::Partition;
 
 /// End (exclusive) of the live batch that starts at arrival `start` and holds at least `want`
 /// frames, clamped to the frames of `part`. On a raster it is the next row end, so batches are
@@ -22,13 +15,18 @@ pub enum Scan {
 ///
 /// # Panics
 /// If `start` is past the last frame of `part`.
-pub fn batch_end(part: &Partition, scan: Scan, start: usize, want: NonZeroUsize) -> usize {
+pub fn batch_end(
+    part: &Partition,
+    pattern: ScanPattern,
+    start: usize,
+    want: NonZeroUsize,
+) -> usize {
     let n = part.nframe();
     assert!(start <= n, "batch starts at {start}, scan has {n} frames");
     let end = start + want.get();
-    match scan {
-        Scan::Raster { row } => end.next_multiple_of(row.get()),
-        Scan::Spiral => end,
+    match pattern {
+        ScanPattern::Raster { row } => end.next_multiple_of(row.get()),
+        ScanPattern::Spiral => end,
     }
     .min(n)
 }
@@ -86,7 +84,7 @@ mod tests {
         .unwrap();
         let n = ny * nx;
         let k = |v| NonZeroUsize::new(v).unwrap();
-        let raster = Scan::Raster { row: k(nx) };
+        let raster = ScanPattern::Raster { row: k(nx) };
         assert_eq!(batch_end(&p, raster, 0, k(16)), nx);
         assert_eq!(batch_end(&p, raster, 150, k(16)), 200);
         assert_eq!(batch_end(&p, raster, 100, k(100)), 200);
@@ -109,8 +107,8 @@ mod tests {
             assert_eq!(c, share, "batch {start}..{end}");
             start = end;
         }
-        assert_eq!(batch_end(&p, Scan::Spiral, 0, k(16)), 16);
-        assert_eq!(batch_end(&p, Scan::Spiral, n - 5, k(16)), n);
+        assert_eq!(batch_end(&p, ScanPattern::Spiral, 0, k(16)), 16);
+        assert_eq!(batch_end(&p, ScanPattern::Spiral, n - 5, k(16)), n);
     }
 
     #[test]
