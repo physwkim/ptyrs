@@ -19,7 +19,6 @@ use std::ops::Range;
 
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig, RawDeviceBuffer};
-use ptyrs_kernels::bh::BhObs;
 use ptyrs_kernels::fused::{FUSED_COLS, FusedCfg, FusedPtrs};
 use ptyrs_kernels::grad::{GAMMA_CHUNK, ObjProbePtrs};
 pub use ptyrs_kernels::lsqml::LSQML_REC;
@@ -160,17 +159,6 @@ fn scan_geom(d: &ViewDims) -> StackGeom {
 /// Values of the object and of the probe.
 fn lens(dims: &ViewDims) -> [usize; 2] {
     [dims.obj_len(), dims.nprobe as usize * dims.n()]
-}
-
-/// The counts and frame ids of `scan`, checked against its views.
-fn obs(scan: &BhScan<'_>) -> Result<(BhObs, ViewDims), Error> {
-    let dims = *scan.order.views().dims();
-    check_len("counts", scan.counts, dims.nframe as usize * dims.n())?;
-    let obs = BhObs {
-        counts: dptr(scan.counts),
-        order: dptr(scan.order.ids()),
-    };
-    Ok((obs, dims))
 }
 
 /// One block of [`PIXEL_THREADS`] per chunk of each of the stack's frames.
@@ -370,7 +358,8 @@ impl LsqmlKernels {
         work: &DeviceBuffer<C32>,
         icalc: &mut DeviceBuffer<f32>,
     ) -> Result<(), Error> {
-        let (obs, d) = obs(&scan)?;
+        let d = *scan.check()?;
+        let obs = scan.obs();
         let g = d.geom(stack)?;
         check_len("icalc", icalc, g.nf_max as usize * d.n())?;
         let p = LsqmlCols {
@@ -397,7 +386,8 @@ impl LsqmlKernels {
         st: &LsqmlScan,
         work: &mut DeviceBuffer<C32>,
     ) -> Result<(), Error> {
-        let (obs, d) = obs(&scan)?;
+        let d = *scan.check()?;
+        let obs = scan.obs();
         st.check(&d)?;
         let l = ColsLaunch::new(&d, stack, work)?;
         let p = LsqmlCols {
@@ -452,7 +442,8 @@ impl LsqmlKernels {
         batch: Range<u32>,
         st: &mut LsqmlScan,
     ) -> Result<(), Error> {
-        let (obs, d) = obs(&scan)?;
+        let d = *scan.check()?;
+        let obs = scan.obs();
         st.check(&d)?;
         let span = st.span(&batch)?;
         let ids = scan.order.ids();
