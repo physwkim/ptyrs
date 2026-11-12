@@ -15,8 +15,9 @@ use crate::fft::Plan2d;
 use crate::gpu::{
     BH_STEP, BackgroundSums, BhKernels, C32, CG_BLOCKS, Ended, EpochOrder, Error as GpuError,
     FarSums, FusedBufs, GammaStacks, GradKernels, Kernels, LlkPartial, LlkRing, LlkScratch,
-    LlkTotals, Model, PositionPartial, PowerMax, RingDevice, RpieKernels, ScalePartial, Shift,
-    ShiftSums, ShiftedProbeSums, SpectrumBuf, StackTable, UpdateSums, ViewAddr, ViewDims, Views,
+    LlkTotals, Model, PositionPartial, PowerMax, PsiSums, RingDevice, RpieKernels, ScalePartial,
+    Shift, ShiftSums, ShiftedProbeSums, SpectrumBuf, StackTable, UpdateSums, ViewAddr, ViewDims,
+    Views,
 };
 use crate::tile::TileDots;
 use cuda_async::cuda_graph::CudaGraph;
@@ -183,9 +184,20 @@ impl Modelled<'_> {
     }
 
     /// Whether the model moves the probe, whose update sums then come from
-    /// [`Self::shift_sums`] and [`Self::probe_sums`].
+    /// [`Self::shift_sums`] or [`Self::psi_sums`], and [`Self::probe_sums`].
     pub fn shifted(&self) -> bool {
         self.position.is_some()
+    }
+
+    /// The update sums of stored waves under the position model: `obj`, and with `probe`
+    /// the shifted probe's; the shifted probe's are none without a position.
+    pub fn psi_sums<'c>(&'c mut self, obj: Option<&'c mut UpdateSums>, probe: bool) -> PsiSums<'c> {
+        PsiSums {
+            obj,
+            probe: (self.position.as_mut())
+                .filter(|_| probe)
+                .map(|p| &mut *p.probe),
+        }
     }
 
     /// Adds the shifted probe's update sums the projections added into `out`, consuming
@@ -208,6 +220,11 @@ impl FeaturesMut<'_> {
     /// Whether some feature takes a step from far sums.
     pub fn stepped(&self) -> bool {
         self.scale.is_some() || self.background.is_some()
+    }
+
+    /// Whether the position is modelled, as [`Modelled::shifted`] of a lend.
+    pub fn shifted(&self) -> bool {
+        self.position.is_some()
     }
 
     /// The per-frame intensity scale, if modelled.
