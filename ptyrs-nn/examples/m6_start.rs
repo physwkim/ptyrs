@@ -4,20 +4,24 @@
 //! engine's CPU path. The first table holds the known probe fixed in DM and single-frame rPIE;
 //! the second starts DM from it and updates it at DM's default probe inertia. rPIE runs at
 //! object alpha 0.5 and 1.0: at its default 0.1 it climbs back from its minimum on these scans
-//! and oscillates, in pty-chi as in the engine.
+//! and oscillates, in pty-chi as in the engine. A start reaches the target once its LLK is
+//! within [`LLK_MARGIN`] above it; the strict count follows. Every LLK curve goes to
+//! `<curves.tsv>`, one row per epoch, epoch 0 being the start.
 //!
-//! `cargo run --release -p ptyrs-nn --example m6_start -- <predictor_dir>`
+//! `cargo run --release -p ptyrs-nn --example m6_start -- <predictor_dir> <curves.tsv>`
 
 mod common;
 
+use std::fs::File;
+use std::io::{BufWriter, Write};
 use std::ops::Range;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use burn::prelude::*;
 use ptyrs_core::{Object, Probe, Scan, sim};
 use ptyrs_engine::{DmParams, Ptycho, RpieParams};
-use ptyrs_nn::metric::iterations_to_llk;
+use ptyrs_nn::metric::{LLK_MARGIN, iterations_to_llk};
 use ptyrs_nn::predictor::{Predictor, flat_object, mean_frame_total};
 
 /// Flat-start epochs whose LLK becomes the target.
@@ -85,12 +89,21 @@ fn known_probe(scan: &Scan, truth: Object, probe: &Probe) -> Probe {
     probe
 }
 
+/// A held-out scan, its two starts and the known probe.
+struct Case {
+    name: &'static str,
+    seed: u64,
+    scan: Scan,
+    flat: Object,
+    predicted: Object,
+    probe: Probe,
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let dir = PathBuf::from(
-        std::env::args()
-            .nth(1)
-            .ok_or("usage: m6_start <predictor_dir>")?,
-    );
+    let usage = "usage: m6_start <predictor_dir> <curves.tsv>";
+    let mut args = std::env::args().skip(1);
+    let dir = PathBuf::from(args.next().ok_or(usage)?);
+    let curves = PathBuf::from(args.next().ok_or(usage)?);
     let predictor = Predictor::load(&dir, &Device::cuda(0))?;
     let frame = predictor.config().frame[0];
     let probe = sim::probe([frame, frame], 1)?;
@@ -99,8 +112,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let (scan, truth, addr) = common::scan(frame, &probe, seed, object);
         let predicted =
             predictor.initial_object(&scan.counts, mean_frame_total(&scan.counts), &addr)?;
-        let known = known_probe(&scan, truth, &probe);
-        cases.push((name, scan, flat_object(&addr), predicted, known));
+        let probe = known_probe(&scan, truth, &probe);
+        let flat = flat_object(&addr);
+        cases.push(Case {
+            name,
+            seed,
+            scan,
+            flat,
+            predicted,
+            probe,
+        });
     }
 
     // One thread per reconstruction: the engine's CPU path is single-threaded.
@@ -109,11 +130,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let runs: Vec<Vec<_>> = std::thread::scope(|s| {
         let handles: Vec<Vec<_>> = cases
             .iter()
-            .map(|(_, scan, flat, predicted, probe)| {
+            .map(|c| {
                 ALGS.map(|alg| {
                     (
-                        s.spawn(move || run(alg, scan, flat.clone(), probe, NS[1])),
-                        s.spawn(move || run(alg, scan, predicted.clone(), probe, MAX)),
+                        s.spawn(move || run(alg, &c.scan, c.flat.clone(), &c.probe, NS[1])),
+                        s.spawn(move || run(alg, &c.scan, c.predicted.clone(), &c.probe, MAX)),
                     )
                 })
                 .into()
@@ -134,6 +155,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         t.elapsed().as_secs_f64()
     );
 
+    write_curves(&curves, &cases, &runs)?;
     for (title, algs) in TABLES {
         println!("{title}");
         table(&cases, &runs, algs);
@@ -143,28 +165,57 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 type Run = (f64, Vec<f64>);
 
-/// One row per case, algorithm of `ALGS[algs]` and N.
-fn table(
-    cases: &[(&str, Scan, Object, Object, Probe)],
-    runs: &[Vec<(Run, Run)>],
-    algs: Range<usize>,
-) {
+/// `object seed alg start epoch llk` rows, the LLK in Rust's round-trip notation.
+fn write_curves(path: &Path, cases: &[Case], runs: &[Vec<(Run, Run)>]) -> std::io::Result<()> {
+    let mut w = BufWriter::new(File::create(path)?);
+    writeln!(w, "object\tseed\talg\tstart\tepoch\tllk")?;
+    for (c, runs) in cases.iter().zip(runs) {
+        for (alg, (flat, pred)) in ALGS.iter().zip(runs) {
+            for (start, (llk0, llk)) in [("flat", flat), ("pred", pred)] {
+                for (epoch, l) in std::iter::once(llk0).chain(llk).enumerate() {
+                    writeln!(w, "{}\t{}\t{alg:?}\t{start}\t{epoch}\t{l}", c.name, c.seed)?;
+                }
+            }
+        }
+    }
+    w.flush()
+}
+
+/// One row per case, algorithm of `ALGS[algs]` and N: the epochs to the target within
+/// [`LLK_MARGIN`], then strictly.
+fn table(cases: &[Case], runs: &[Vec<(Run, Run)>], algs: Range<usize>) {
     println!(
-        "{:12} {:9} {:>3}  {:>8}  {:>8} {:>8}  {:>11} {:>11}",
-        "object", "alg", "N", "target", "LLK flat", "LLK pred", "flat epochs", "pred epochs"
+        "{:12} {:9} {:>3}  {:>8}  {:>8} {:>8}  {:>7} {:>7}  {:>11} {:>11}",
+        "object",
+        "alg",
+        "N",
+        "target",
+        "LLK flat",
+        "LLK pred",
+        "flat 1%",
+        "pred 1%",
+        "flat strict",
+        "pred strict"
     );
-    for ((name, ..), runs) in cases.iter().zip(runs) {
+    for (c, runs) in cases.iter().zip(runs) {
         for (alg, ((flat0, flat), (pred0, pred))) in
             ALGS[algs.clone()].iter().zip(&runs[algs.clone()])
         {
             for n in NS {
                 let target = flat[n - 1];
-                // The flat run's own first epoch at its epoch-N LLK; N when the LLK only falls.
-                let flat_n = iterations_to_llk(*flat0, target, flat.iter().copied()).unwrap();
-                let pred_n = iterations_to_llk(*pred0, target, pred.iter().copied())
-                    .map_or(format!(">{MAX}"), |k| k.to_string());
+                // The flat run reaches its own epoch-N LLK by epoch N; earlier when it rises after.
+                let epochs = |margin| {
+                    let flat_n =
+                        iterations_to_llk(*flat0, target, margin, flat.iter().copied()).unwrap();
+                    let pred_n = iterations_to_llk(*pred0, target, margin, pred.iter().copied())
+                        .map_or(format!(">{MAX}"), |k| k.to_string());
+                    (flat_n, pred_n)
+                };
+                let (flat_m, pred_m) = epochs(LLK_MARGIN);
+                let (flat_s, pred_s) = epochs(0.0);
                 println!(
-                    "{name:12} {:9} {n:>3}  {target:>8.4}  {flat0:>8.4} {pred0:>8.4}  {flat_n:>11} {pred_n:>11}",
+                    "{:12} {:9} {n:>3}  {target:>8.4}  {flat0:>8.4} {pred0:>8.4}  {flat_m:>7} {pred_m:>7}  {flat_s:>11} {pred_s:>11}",
+                    c.name,
                     format!("{alg:?}")
                 );
             }

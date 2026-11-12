@@ -54,11 +54,11 @@ fn the_flat_start_reaches_a_target_near_the_truth_after_epochs() {
     // From flat, rPIE stalls near 1.45 times the truth's LLK and passes 1.75 times it in a few
     // epochs.
     let target = 1.75 * at_truth;
-    let k = iterations_to_llk(at_flat, target, flat.iter().copied())
+    let k = iterations_to_llk(at_flat, target, 0.0, flat.iter().copied())
         .unwrap_or_else(|| panic!("LLK truth {at_truth}, flat {at_flat} then {flat:?}"));
     assert!(k >= 2, "flat start reached the target in {k} epoch");
     assert_eq!(
-        iterations_to_llk(at_flat, target, flat[..k - 1].iter().copied()),
+        iterations_to_llk(at_flat, target, 0.0, flat[..k - 1].iter().copied()),
         None
     );
 }
