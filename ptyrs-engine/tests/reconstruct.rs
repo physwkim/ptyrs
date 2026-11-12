@@ -1,9 +1,10 @@
 use ptyrs_core::{C64, Geometry, Object, Probe, Scan, Stack, required_obj_shape};
 use ptyrs_engine::{
-    Algorithm, ApParams, DmParams, Ptycho, RpieParams, obj_probe_to_psi, quad_phase,
+    Algorithm, ApParams, DmParams, MlParams, Ptycho, RpieParams, obj_probe_to_psi, quad_phase,
 };
 
 mod common;
+mod ptychi;
 
 const PHOTONS: f64 = 1e5;
 
@@ -188,8 +189,48 @@ fn dm_llk_matches_pynx() {
 #[test]
 fn rpie_llk_matches_ptychi() {
     let mut p = parity_start();
-    p.rpie(&common::RPIE, 20).unwrap();
+    p.rpie(&ptychi::RPIE, 20).unwrap();
     assert_history_matches(&p, include_str!("data/rpie_ptychi_f64.txt"));
+}
+
+/// [`Ptycho::obj_grad`] and the LLK against the float64 model written independently in
+/// m3/solve's `refs/f64/ml_grad.py <dir>` (checked there by central differences, PyNX
+/// `cpu_operator` and pty-chi autograd) on the scaled start of `llk_trace -- <dir> dm 1 2 32 40
+/// 4`, saved from `<dir>/ml_grad_f64.txt` (`iy ix re im` per object pixel) and
+/// `<dir>/ml_grad_values_f64.txt` (`nb_obs` and the unnormalised Poisson sum).
+#[test]
+fn obj_grad_matches_ml_grad_reference() {
+    let (scan, object, probe) = common::dm_scenario(32, 40, 2, 2e5, 4.0);
+    let mut p = Ptycho::new(&scan, object, probe).unwrap();
+    p.scale_obj_probe();
+    let values: Vec<f64> = include_str!("data/ml_grad_values_f64.txt")
+        .split_whitespace()
+        .map(|v| v.parse().unwrap())
+        .collect();
+    let [nb_obs, sum] = values[..] else {
+        panic!("values: {values:?}")
+    };
+    let llk = p.llk().poisson * nb_obs;
+    assert!(rel(llk, sum) < 1e-12, "LLK sum: rust {llk} reference {sum}");
+
+    let g = p.obj_grad();
+    let [_, ny, nx] = g.dims();
+    let mut rows = 0;
+    let (mut err, mut max) = (0f64, 0f64);
+    for l in include_str!("data/ml_grad_f64.txt").lines() {
+        let v: Vec<f64> = l.split_whitespace().map(|v| v.parse().unwrap()).collect();
+        let want = C64::new(v[2], v[3]);
+        let got = g.as_slice()[v[0] as usize * nx + v[1] as usize];
+        err = err.max((got - want).norm());
+        max = max.max(want.norm());
+        rows += 1;
+    }
+    assert_eq!((g.dims()[0], rows), (1, ny * nx));
+    eprintln!(
+        "obj_grad: max |rust - reference| / max |reference| {:.2e}",
+        err / max
+    );
+    assert!(err < 1e-12 * max, "{err:e} of {max:e}");
 }
 
 #[test]
@@ -209,6 +250,38 @@ fn ap_object_only_converges() {
     assert!(h[0].llk.poisson > h[1].llk.poisson && h[1].llk.poisson > h[2].llk.poisson);
     let end = p.llk().poisson;
     assert!(end < 1.2 * truth, "end {end} truth {truth}");
+}
+
+#[test]
+fn ml_after_ap_descends_below_the_truth() {
+    let c = case(2, true);
+    let truth = truth_llk(&c);
+    let mut p = Ptycho::new(&c.scan, flat_object(&c.object), c.probe.clone()).unwrap();
+    p.scale_obj_probe();
+    p.ap(&ApParams::default(), 20);
+    let params = MlParams {
+        update_probe: true,
+        calc_llk: 1,
+        ..MlParams::default()
+    };
+    p.ml(&params, 40);
+    let h = p.history();
+    assert_eq!(
+        h.iter().map(|r| r.cycle).collect::<Vec<_>>(),
+        (20..60).collect::<Vec<_>>()
+    );
+    assert!(h.iter().all(|r| r.algorithm == Algorithm::Ml));
+    // ML records the LLK before each update
+    for w in h.windows(2) {
+        assert!(w[1].llk.poisson < w[0].llk.poisson, "{w:?}");
+    }
+    // the noise is fitted too, so ML ends below the LLK of the truth
+    let end = p.llk().poisson;
+    assert!(
+        end < truth,
+        "start {} end {end} truth {truth}",
+        h[0].llk.poisson
+    );
 }
 
 #[test]

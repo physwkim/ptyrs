@@ -16,6 +16,8 @@ use ptyrs_engine::{ApParams, DmParams, EngineError, GpuOptions, GpuPtycho, Ptych
 
 #[path = "../tests/common/mod.rs"]
 mod common;
+#[path = "../tests/ptychi/mod.rs"]
+mod ptychi;
 
 const WARMUP: usize = 5;
 
@@ -79,7 +81,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let rpie = RpieParams {
             batch_size: size,
             calc_llk,
-            ..common::RPIE
+            ..ptychi::RPIE
         };
         let run = |g: &mut GpuPtycho, n: usize| -> Result<(), EngineError> {
             match algo.as_str() {

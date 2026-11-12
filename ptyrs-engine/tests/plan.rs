@@ -4,6 +4,7 @@ use ptyrs_core::{C64, Object, Stack};
 use ptyrs_engine::{ApParams, DmParams, Plan, Ptycho};
 
 mod common;
+mod ptychi;
 
 #[test]
 fn plan_runs_its_steps_in_order() {
@@ -31,7 +32,7 @@ fn plan_runs_its_steps_in_order() {
     };
     by_hand.dm(&dm, 3);
     by_hand.ap(&ap, 3);
-    by_hand.rpie(&common::RPIE, 2).unwrap();
+    by_hand.rpie(&ptychi::RPIE, 2).unwrap();
 
     assert_eq!(by_plan.cycle(), 8);
     assert_eq!(by_plan.history(), by_hand.history());

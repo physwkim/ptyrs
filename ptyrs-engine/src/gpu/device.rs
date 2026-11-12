@@ -13,18 +13,22 @@ use cuda_async::device_operation::{DeviceOp, ExecutionContext};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 use ptyrs_fft::Plan2d;
 use ptyrs_gpu::{
-    C32, Ended, Error as GpuError, FusedBufs, Kernels, LlkPartial, LlkRing, LlkSums, RingDevice,
-    RpieKernels, StackTable, UpdateSums, ViewAddr, ViewDims, Views,
+    C32, CG_BLOCKS, Ended, Error as GpuError, FusedBufs, GammaStacks, GradKernels, Kernels,
+    LlkPartial, LlkRing, LlkSums, RingDevice, RpieKernels, StackTable, UpdateSums, ViewAddr,
+    ViewDims, Views,
 };
 
-use super::{Epoch, Frames, GpuOptions, Tag, plane_len, plans, stack_buf_len, stacks, to_u32};
-use crate::{ApParams, DmParams, EngineError, RpieParams};
+use super::{
+    Epoch, Frames, GpuOptions, Tag, plane_len, plans, split, stack_buf_len, stacks, to_u32,
+};
+use crate::{ApParams, DmParams, EngineError, MlParams, RpieParams};
 
 /// Every buffer, module and plan a cycle launches on, and the graphs captured from them.
 pub(super) struct Device {
     stream: Arc<CudaStream>,
     kernels: Kernels,
     rpie: RpieKernels,
+    grad: GradKernels,
     views: Views,
     counts: DeviceBuffer<u16>,
     obj: DeviceBuffer<C32>,
@@ -42,8 +46,12 @@ pub(super) struct Device {
     use_graph: bool,
     /// The epochs run since the parameters last changed, all of one [`Epoch::run`].
     runs: Vec<EpochRun>,
+    /// Frames per stack, for the [`MlState`] plans.
+    stack_size: u32,
     /// With graphs, the LLK pass's graph.
     llk_graph: Option<Captured>,
+    /// ML's state, built by the first ML call and never replaced.
+    ml: Option<Box<MlState>>,
 }
 
 /// How AP and DM project a stack and the LLK pass takes its partials, with the buffers only
@@ -86,9 +94,21 @@ struct Captured {
 /// A cycle's [`Epoch`] and the buffers only it uses, built together, so a graph captured
 /// from it bakes in sizes that match its buffers.
 enum Cycle {
-    Ap { params: ApParams, llk: bool },
-    Dm { params: DmParams, first: bool },
+    Ap {
+        params: ApParams,
+        llk: bool,
+    },
+    Dm {
+        params: DmParams,
+        first: bool,
+    },
     Rpie(RpieParams, Box<RpieScratch>),
+    /// Its buffers are the device's [`MlState`], which every ML epoch shares.
+    Ml {
+        params: MlParams,
+        first: bool,
+        llk: bool,
+    },
 }
 
 impl Cycle {
@@ -97,6 +117,81 @@ impl Cycle {
             Self::Ap { params, llk } => Epoch::Ap { params, llk },
             Self::Dm { params, first } => Epoch::Dm { params, first },
             Self::Rpie(p, _) => Epoch::Rpie(p),
+            Self::Ml { params, first, llk } => Epoch::Ml { params, first, llk },
+        }
+    }
+}
+
+/// ML's conjugate-gradient state and scratch, sized by the device alone, so one state serves
+/// the graphs of every ML epoch; each call's first epoch resets the state.
+struct MlState {
+    /// One plan per stack length, indexed by [`Frames::plan`].
+    plans: Vec<Plan2d>,
+    /// The last cycle's gradient, object then probe.
+    h: [DeviceBuffer<C32>; 2],
+    /// The search direction, object then probe.
+    d: [DeviceBuffer<C32>; 2],
+    /// Block partial pairs: the β sums of the object then the probe, or one norm sum.
+    parts: DeviceBuffer<f32>,
+    beta: DeviceBuffer<f32>,
+    /// The line-search pair of every frame.
+    frame_pairs: DeviceBuffer<f32>,
+    gamma: DeviceBuffer<f32>,
+    /// `(sum |x|, sum |x|^2)` of the object, the probe and every view's exit wave.
+    norms: [DeviceBuffer<f32>; 3],
+    fields: GammaStacks,
+}
+
+/// An [`MlState`] lent to an epoch.
+pub(super) struct MlBufs<'a> {
+    pub plans: Plans<'a>,
+    pub h: &'a mut [DeviceBuffer<C32>; 2],
+    pub d: &'a mut [DeviceBuffer<C32>; 2],
+    pub parts: &'a mut DeviceBuffer<f32>,
+    pub beta: &'a mut DeviceBuffer<f32>,
+    pub frame_pairs: &'a mut DeviceBuffer<f32>,
+    pub gamma: &'a mut DeviceBuffer<f32>,
+    pub norms: &'a mut [DeviceBuffer<f32>; 3],
+    pub fields: &'a mut GammaStacks,
+}
+
+impl MlState {
+    /// For the device's stacks of `stack_size` frames, whose buffers hold `stack_len` values,
+    /// and arrays of `lens = [object, probe]` values.
+    fn new(
+        stream: &Arc<CudaStream>,
+        dims: &ViewDims,
+        stack_size: u32,
+        stack_len: usize,
+        lens: [usize; 2],
+    ) -> Result<Self, EngineError> {
+        let (_, plan_lens) = split(dims.nframe, stack_size);
+        let zeroed = |len| DeviceBuffer::<C32>::zeroed(stream, len);
+        let pair = || DeviceBuffer::<f32>::zeroed(stream, 2);
+        Ok(Self {
+            plans: plans(stream, dims, &plan_lens)?,
+            h: [zeroed(lens[0])?, zeroed(lens[1])?],
+            d: [zeroed(lens[0])?, zeroed(lens[1])?],
+            parts: DeviceBuffer::zeroed(stream, 4 * CG_BLOCKS as usize)?,
+            beta: pair()?,
+            frame_pairs: DeviceBuffer::zeroed(stream, 2 * dims.nframe as usize)?,
+            gamma: pair()?,
+            norms: [pair()?, pair()?, pair()?],
+            fields: GammaStacks::zeroed(stream, stack_len)?,
+        })
+    }
+
+    fn lend(&mut self) -> MlBufs<'_> {
+        MlBufs {
+            plans: Plans(&mut self.plans),
+            h: &mut self.h,
+            d: &mut self.d,
+            parts: &mut self.parts,
+            beta: &mut self.beta,
+            frame_pairs: &mut self.frame_pairs,
+            gamma: &mut self.gamma,
+            norms: &mut self.norms,
+            fields: &mut self.fields,
         }
     }
 }
@@ -191,6 +286,7 @@ struct StackBufs {
 pub(super) struct Bufs<'a> {
     pub kernels: &'a Kernels,
     pub rpie: &'a RpieKernels,
+    pub grad: &'a GradKernels,
     pub views: &'a Views,
     pub counts: &'a DeviceBuffer<u16>,
     pub obj: &'a mut DeviceBuffer<C32>,
@@ -204,6 +300,8 @@ pub(super) struct Bufs<'a> {
     /// A stack's LLK partials, which [`ptyrs_gpu::RecordWriter::push`] then copies into the
     /// record.
     pub llk: &'a mut DeviceBuffer<LlkPartial>,
+    /// ML's state, once an ML call has built it.
+    pub ml: Option<MlBufs<'a>>,
 }
 
 /// The stacks lent to a cycle, one at a time.
@@ -254,6 +352,7 @@ impl Device {
         let stream = ctx.new_stream()?;
         let kernels = Kernels::load(ctx)?;
         let rpie = RpieKernels::load(&kernels)?;
+        let grad = GradKernels::load(&kernels)?;
         let views = Views::new(&stream, dims, addrs)?;
         let (frames, table, lens) =
             stacks(&stream, &dims, to_u32("stack_size", options.stack_size)?)?;
@@ -292,6 +391,7 @@ impl Device {
             probe_sums: UpdateSums::zeroed(&stream, probe.len())?,
             kernels,
             rpie,
+            grad,
             views,
             table,
             stacks,
@@ -299,6 +399,8 @@ impl Device {
             use_graph: options.graph,
             runs: Vec::new(),
             llk_graph: None,
+            ml: None,
+            stack_size: to_u32("stack_size", options.stack_size)?,
             stream,
         };
         if dev.use_graph {
@@ -343,6 +445,7 @@ impl Device {
         let bufs = Bufs {
             kernels: &self.kernels,
             rpie: &self.rpie,
+            grad: &self.grad,
             views: &self.views,
             counts: &self.counts,
             obj: &mut self.obj,
@@ -354,6 +457,7 @@ impl Device {
             table: &self.table,
             stacks: Stacks(&mut self.stacks),
             llk: &mut self.llk,
+            ml: self.ml.as_deref_mut().map(MlState::lend),
         };
         let passes = match &mut self.passes {
             Passes::M1 { plans, scratch } => PassesMut::M1(M1Bufs {
@@ -429,6 +533,10 @@ impl Device {
                 let scratch = RpieScratch::new(&self.stream, &self.dims(), &p, self.probe.len())?;
                 Cycle::Rpie(p, Box::new(scratch))
             }
+            Epoch::Ml { params, first, llk } => {
+                self.build_ml()?;
+                Cycle::Ml { params, first, llk }
+            }
         };
         let graph = if self.use_graph {
             Some(self.capture(|bufs, passes, ring, ctx| bufs.cycle(ctx, passes, ring, &mut cycle))?)
@@ -436,6 +544,47 @@ impl Device {
             None
         };
         Ok(EpochRun { cycle, graph })
+    }
+
+    /// Builds the [`MlState`] if no ML call has yet.
+    fn build_ml(&mut self) -> Result<(), EngineError> {
+        if self.ml.is_none() {
+            let dims = self.dims();
+            let stack_len = stack_buf_len(&dims, &self.table);
+            let lens = [self.obj.len(), self.probe.len()];
+            let state = MlState::new(&self.stream, &dims, self.stack_size, stack_len, lens)?;
+            self.ml = Some(Box::new(state));
+        }
+        Ok(())
+    }
+
+    /// [`Bufs::scale_obj_probe`] enqueued eagerly, with `total` the unmasked observed photons.
+    pub fn scale_obj_probe(&mut self, total: f32) -> Result<(), EngineError> {
+        self.build_ml()?;
+        let ctx = self.context();
+        let (mut bufs, _, _) = self.lend();
+        Ok(bufs.with_ml(|b, ml| b.scale_obj_probe(&ctx, ml, total))?)
+    }
+
+    /// The ML gradients of the current estimate, object then probe, as
+    /// [`Bufs::ml_grad`] leaves them in the update sums; downloads them and zeroes the sums.
+    pub fn ml_grads(&mut self) -> Result<[Vec<C32>; 2], EngineError> {
+        self.build_ml()?;
+        {
+            let ctx = self.context();
+            let (mut bufs, _, _) = self.lend();
+            bufs.with_ml(|b, ml| b.ml_grad(&ctx, ml, [true, true], None))?;
+        }
+        let grads = [
+            self.obj_sums.num.to_host_vec(&self.stream)?,
+            self.probe_sums.num.to_host_vec(&self.stream)?,
+        ];
+        let ctx = self.context();
+        for sums in [&mut self.obj_sums, &mut self.probe_sums] {
+            ptyrs_gpu::zero(&ctx, &mut sums.num)?;
+            ptyrs_gpu::zero(&ctx, &mut sums.den)?;
+        }
+        Ok(grads)
     }
 
     /// `f` on the lent buffers, captured on a side stream, so nothing runs; with the record
@@ -479,7 +628,15 @@ impl Device {
     }
 }
 
-impl Bufs<'_> {
+impl<'a> Bufs<'a> {
+    /// `f` on these buffers and ML's state, lent apart.
+    pub(super) fn with_ml<R>(&mut self, f: impl FnOnce(&mut Self, &mut MlBufs<'a>) -> R) -> R {
+        let mut ml = self.ml.take().expect("Device::build_ml built the ML state");
+        let r = f(self, &mut ml);
+        self.ml = Some(ml);
+        r
+    }
+
     /// One cycle of `cycle` enqueued on `ctx`, and the LLK record it ends: an AP cycle with
     /// `llk` writes one through `ring`, no other cycle touches it.
     fn cycle(
@@ -497,6 +654,8 @@ impl Bufs<'_> {
                 self.dm_cycle(ctx, passes, params, *first).map(|()| None)
             }
             Cycle::Rpie(p, scratch) => self.rpie_epoch(ctx, p, &mut scratch.lend()).map(|()| None),
+            Cycle::Ml { params, first, llk } => self
+                .with_ml(|b, ml| b.ml_epoch(ctx, ml, params, *first, llk.then(|| ring.record()))),
         }
     }
 }

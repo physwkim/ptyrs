@@ -1,14 +1,16 @@
-//! DM, AP or rPIE on a simulated scan, the Rust side of `scripts/compare_pynx.py` (DM, AP)
-//! and `scripts/compare_ptychi_rpie.py` (rPIE).
+//! DM, AP, ML or rPIE on a simulated scan, the Rust side of `scripts/compare_pynx.py` (DM,
+//! AP), `scripts/compare_pynx_ml.py` (ML) and `scripts/compare_ptychi_rpie.py` (rPIE).
 //!
-//! `cargo run --release -p ptyrs-engine --example llk_trace -- <out_dir> <dm|ap|rpie> [ncycle] [nprobe] [frame] [npos] [step] [--gpu]`
+//! `cargo run --release -p ptyrs-engine --example llk_trace -- <out_dir> <dm|ap|ml|rpie> [ncycle] [nprobe] [frame] [npos] [step] [--gpu]`
 //! (defaults 50, 1, 64, 100, 4 object pixels) writes `scan.cxi`, `init.h5` (the scaled
 //! starting object and probe), `llk_rust.txt` (cycle and the normalised Poisson, Gaussian,
 //! Euclidian LLK and photon count per cycle) and `final_rust.h5`, from the CPU oracle or, with
 //! `--gpu`, from [`GpuPtycho`] on CUDA device 0 with the default stacks, by the fused passes
-//! on 128- or 256-pixel frames and by M1's launches on others. rPIE also writes
+//! on 128- or 256-pixel frames and by M1's launches on others (ML always by M1's). ML
+//! updates object and probe from the end of `ML_WARMUP` AP cycles, which `init.h5` holds.
+//! rPIE also writes
 //! `views.txt` (object window corner `oy ox` per frame), `quad.txt` (`re im` of the quadratic
-//! phase, natural order), which pty-chi has no notion of, and `rpie.txt` (`common::RPIE`,
+//! phase, natural order), which pty-chi has no notion of, and `rpie.txt` (`ptychi::RPIE`,
 //! step 0 for a fixed array).
 
 use std::fmt::Write as _;
@@ -16,11 +18,14 @@ use std::path::PathBuf;
 
 use cuda_core::CudaContext;
 use ptyrs_engine::{
-    ApParams, DmParams, EngineError, GpuOptions, GpuPtycho, Ptycho, RpieParams, quad_phase,
+    ApParams, DmParams, EngineError, GpuOptions, GpuPtycho, MlParams, Ptycho, RpieParams,
+    quad_phase,
 };
 
 #[path = "../tests/common/mod.rs"]
 mod common;
+#[path = "../tests/ptychi/mod.rs"]
+mod ptychi;
 
 /// AP updates the probe too, so both halves of `psi_to_obj_probe` are compared.
 const AP: ApParams = ApParams {
@@ -30,11 +35,20 @@ const AP: ApParams = ApParams {
     zero_phase_ramp: true,
 };
 
-const RPIE: RpieParams = common::RPIE;
+const ML: MlParams = MlParams {
+    update_object: true,
+    update_probe: true,
+    calc_llk: 1,
+    zero_phase_ramp: true,
+};
+
+/// AP cycles before ML, whose end is ML's `init.h5`.
+const ML_WARMUP: usize = 20;
+
+const RPIE: RpieParams = ptychi::RPIE;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let usage =
-        "usage: llk_trace <out_dir> <dm|ap|rpie> [ncycle] [nprobe] [frame] [npos] [step] [--gpu]";
+    let usage = "usage: llk_trace <out_dir> <dm|ap|ml|rpie> [ncycle] [nprobe] [frame] [npos] [step] [--gpu]";
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let gpu = args
         .iter()
@@ -44,7 +58,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = args.into_iter();
     let out = PathBuf::from(args.next().ok_or(usage)?);
     let algo = args.next().ok_or(usage)?;
-    if !["dm", "ap", "rpie"].contains(&algo.as_str()) {
+    if !["dm", "ap", "ml", "rpie"].contains(&algo.as_str()) {
         return Err(usage.into());
     }
     let mut next = |default: usize| args.next().map_or(Ok(default), |s| s.parse());
@@ -58,6 +72,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let scan = ptyrs_io::read_cxi(&cxi)?;
     let mut p = Ptycho::new(&scan, object, probe)?;
     p.scale_obj_probe();
+    if algo == "ml" {
+        // From the flat object ML's trajectory is chaotic (PyNX against itself with the
+        // object nudged by 1e-7 differs by 1e-1 within 10 cycles), so it starts from AP's.
+        p.ap(&AP, ML_WARMUP);
+        let (object, probe) = p.into_modes();
+        p = Ptycho::new(&scan, object, probe)?;
+    }
     ptyrs_io::write_modes(out.join("init.h5"), p.object(), p.probe())?;
     if algo == "rpie" {
         let mut s = String::new();
@@ -98,6 +119,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         match algo.as_str() {
             "dm" => g.dm(&dm, ncycle)?,
             "ap" => g.ap(&AP, ncycle)?,
+            "ml" => g.ml(&ML, ncycle)?,
             _ => g.rpie(&RPIE, ncycle)?,
         }
         g.synchronize()?;
@@ -108,6 +130,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         match algo.as_str() {
             "dm" => p.dm(&dm, ncycle),
             "ap" => p.ap(&AP, ncycle),
+            "ml" => p.ml(&ML, ncycle),
             _ => p.rpie(&RPIE, ncycle)?,
         }
         let secs = t.elapsed().as_secs_f64();
