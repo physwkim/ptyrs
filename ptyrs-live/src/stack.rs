@@ -1,13 +1,16 @@
 //! The frames a live graph replay works on (DESIGN.md §3 B2). The kernels
-//! read one [`StackTable`] entry when they run; the host only lands frames,
-//! through [`LiveFrames::land`], and replays the graph, which starts with
-//! [`LiveFrames::step`] moving the entry onto the next landed frames.
+//! read a [`StackTable`] entry when they run; the host only lands frames,
+//! through [`LiveFrames::land`], and replays graphs that move the entries.
+//! Two entries walk the landed frames: the ingest entry ([`LiveFrames::step`])
+//! takes each landed frame once, for binning; the sweep entry
+//! ([`LiveFrames::sweep_step`]) walks them from the first on after each
+//! [`LiveFrames::rewind`], one sweep per iteration.
 //!
 //! `land` is the one write of the landed count and refuses a count past the
 //! scan or below the last one, so the count is monotone and at most
-//! `nframe`. `step` keeps `f0 + nf <= landed` from `{0, 0}` on, so every
-//! entry it writes is in range and the kernels' own clamp to `nframe` never
-//! drops a landed frame.
+//! `nframe`. Both steps keep `f0 + nf <= landed` from `{0, 0}` on, and so
+//! does a rewind, so every entry they write is in range and the kernels' own
+//! clamp to `nframe` never drops a landed frame.
 
 use std::ffi::c_void;
 use std::num::NonZeroU32;
@@ -47,10 +50,11 @@ const PTX: &str = r#"
 }
 "#;
 
-/// The landed count and the stack entry of one live scan, on one stream:
-/// `land` and graphs that `step` is recorded into must run there.
+/// The landed count and the stack entries of one live scan, on one stream:
+/// `land` and graphs the steps are recorded into must run there.
 pub struct LiveFrames {
     table: StackTable,
+    sweep: StackTable,
     landed: DeviceBuffer<u32>,
     func: Function,
     count: u32,
@@ -59,7 +63,7 @@ pub struct LiveFrames {
 }
 
 impl LiveFrames {
-    /// No frame landed, the entry `{0, 0}`; stacks of at most `nf_max`
+    /// No frame landed, both entries `{0, 0}`; stacks of at most `nf_max`
     /// frames, `nf_max` in `1..=dims.nframe`.
     pub fn new(
         stream: &Arc<Stream>,
@@ -68,12 +72,14 @@ impl LiveFrames {
     ) -> Result<Self, GrowError> {
         let ctx = stream.context();
         let table = StackTable::device(stream, dims, nf_max.get())?;
+        let sweep = StackTable::device(stream, dims, nf_max.get())?;
         let landed = DeviceBuffer::zeroed(stream, 1)?;
         let func = ctx
             .load_module_from_ptx_src(PTX)?
             .load_function("next_stack")?;
         Ok(Self {
             table,
+            sweep,
             landed,
             func,
             count: 0,
@@ -82,9 +88,14 @@ impl LiveFrames {
         })
     }
 
-    /// The entry the stack kernels take.
+    /// The ingest entry.
     pub fn stack(&self) -> StackRef<'_> {
         self.table.at(0)
+    }
+
+    /// The sweep entry.
+    pub fn sweep(&self) -> StackRef<'_> {
+        self.sweep.at(0)
     }
 
     pub fn stream(&self) -> &Arc<Stream> {
@@ -129,18 +140,42 @@ impl LiveFrames {
     }
 
     /// Queues on `ctx`'s stream, or records into its capture, the step of
-    /// the entry onto the next at most `nf_max` landed frames; `nf` is 0
-    /// when none is new.
+    /// the ingest entry onto the next at most `nf_max` landed frames; `nf` is
+    /// 0 when none is new.
     pub fn step(&self, ctx: &ExecutionContext) -> Result<(), ptyrs_gpu::Error> {
+        self.next(ctx, &self.table)
+    }
+
+    /// [`Self::step`] of the sweep entry.
+    pub fn sweep_step(&self, ctx: &ExecutionContext) -> Result<(), ptyrs_gpu::Error> {
+        self.next(ctx, &self.sweep)
+    }
+
+    /// Queues or records the sweep entry's return to `{0, 0}`: the next
+    /// `sweep_step` starts a sweep at the first frame.
+    pub fn rewind(&self, ctx: &ExecutionContext) -> Result<(), ptyrs_gpu::Error> {
+        self.same_context(ctx)?;
+        ptyrs_gpu::lease(ctx, &[], &[self.sweep.storage()])?;
+        ctx.context().bind_to_thread()?;
+        // SAFETY: the entry is two u32 of the sweep table, leased for writing
+        // on this stream.
+        unsafe { sys::cuMemsetD32Async(self.sweep.ptr(), 0, 2, ctx.get_cuda_stream().cu_stream()) }
+            .result()?;
+        Ok(())
+    }
+
+    fn same_context(&self, ctx: &ExecutionContext) -> Result<(), ptyrs_gpu::Error> {
         if ctx.context().as_ref() != self.stream.context().as_ref() {
             return Err(ptyrs_gpu::Error::ContextMismatch);
         }
-        ptyrs_gpu::lease(ctx, &[self.landed.storage()], &[self.table.storage()])?;
-        let (mut ctl, mut landed, mut nf_max) = (
-            self.table.ptr(),
-            self.landed.cu_deviceptr(),
-            self.table.nf_max(),
-        );
+        Ok(())
+    }
+
+    fn next(&self, ctx: &ExecutionContext, table: &StackTable) -> Result<(), ptyrs_gpu::Error> {
+        self.same_context(ctx)?;
+        ptyrs_gpu::lease(ctx, &[self.landed.storage()], &[table.storage()])?;
+        let (mut ctl, mut landed, mut nf_max) =
+            (table.ptr(), self.landed.cu_deviceptr(), table.nf_max());
         let mut params = [
             (&raw mut ctl).cast::<c_void>(),
             (&raw mut landed).cast(),
@@ -175,10 +210,14 @@ mod tests {
     use super::*;
 
     fn read(f: &LiveFrames) -> StackCtl {
+        read_entry(f, f.stack())
+    }
+
+    fn read_entry(f: &LiveFrames, e: StackRef<'_>) -> StackCtl {
         let mut got = StackCtl { f0: 0, nf: 0 };
         f.stream.synchronize().unwrap();
-        // SAFETY: the stream is idle and the table holds one StackCtl.
-        unsafe { sys::cuMemcpyDtoH_v2((&raw mut got).cast(), f.table.ptr(), 8) }
+        // SAFETY: the stream is idle and the entry is one StackCtl.
+        unsafe { sys::cuMemcpyDtoH_v2((&raw mut got).cast(), e.ctl(), 8) }
             .result()
             .unwrap();
         got
@@ -216,5 +255,38 @@ mod tests {
         assert_eq!(f.landed(), 20);
         f.step(&ExecutionContext::new(s.clone())).unwrap();
         assert_eq!(read(&f), StackCtl { f0: 20, nf: 0 });
+    }
+
+    /// Sweeps of `ceil(landed / nf_max)` steps, each after a rewind, cover
+    /// the landed frames `0..landed` in order, with lands between sweeps that
+    /// grow by less and more than `nf_max`; a step past the sweep's end gives
+    /// `nf == 0`, and the ingest entry is left alone.
+    #[test]
+    fn each_sweep_after_a_rewind_covers_every_landed_frame_once() {
+        let ctx = cuda_core::Context::new(0).expect("GPU 0");
+        let s = ctx.new_stream().unwrap();
+        let (nf_max, nframe) = (4u32, 20u32);
+        let f = &mut LiveFrames::new(&s, &frames_only(nframe), NonZeroU32::new(nf_max).unwrap())
+            .unwrap();
+        let c = &ExecutionContext::new(s.clone());
+        f.land(3).unwrap();
+        f.step(c).unwrap();
+        for l in [3u32, 3, 9, 13, 20, 20] {
+            f.land(l).unwrap();
+            f.rewind(c).unwrap();
+            assert_eq!(read_entry(f, f.sweep()), StackCtl { f0: 0, nf: 0 });
+            let mut next = 0;
+            for _ in 0..l.div_ceil(nf_max) {
+                f.sweep_step(c).unwrap();
+                let got = read_entry(f, f.sweep());
+                assert_eq!(got.f0, next, "landed {l}");
+                assert_eq!(got.nf, (l - next).min(nf_max), "landed {l}");
+                next += got.nf;
+            }
+            assert_eq!(next, l);
+            f.sweep_step(c).unwrap();
+            assert_eq!(read_entry(f, f.sweep()), StackCtl { f0: l, nf: 0 });
+        }
+        assert_eq!(read(f), StackCtl { f0: 0, nf: 3 });
     }
 }
