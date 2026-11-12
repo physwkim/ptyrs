@@ -10,7 +10,8 @@
 //!   `f0 .. f0 + nf`, a [`StackCtl`] entry of a [`StackTable`] that the kernels read when they
 //!   run, not when they are launched or captured. Per-stack buffers are sized by the table's
 //!   `nf_max`: `psi` holds `nf_max * nmode` planes, plane `kl < nf * nmode` being view
-//!   `f0 * nmode + kl`; planes and records past the stack are left as they are.
+//!   `f0 * nmode + kl`; planes and records past the stack are left as they are, and a stack
+//!   with `nf == 0` writes nothing.
 //! * Real-space exit waves have their origin at `[0, 0]`: probe pixel `(y, x)` is stored at
 //!   `((y + ny/2) % ny, (x + nx/2) % nx)`. So a plain 2D FFT of each plane
 //!   (`ptyrs_fft::Plan2d`, unnormalized, forward `exp(-2 pi i jk / n)`) gives the far field in
@@ -653,8 +654,8 @@ impl Kernels {
 
     /// Adds the stack's probe-update sums (PyNX `Psi2Probe`) to `sums` `[nprobe, ny, nx]`:
     /// `num += conj(O_v exp(i quad r^2)) psi_v` and `den += |O_v|^2` over the views of each
-    /// probe mode, in ascending view order (stack-split invariant). Zero `sums` before the
-    /// first stack.
+    /// probe mode, in ascending view order (stack-split invariant); a mode without a view in
+    /// the stack is not written. Zero `sums` before the first stack.
     pub fn psi_to_probe(
         &self,
         ctx: &ExecutionContext,

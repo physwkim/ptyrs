@@ -965,19 +965,58 @@ impl StackRun {
         stack: StackRef<'_>,
         counts: &DeviceBuffer<u16>,
     ) -> Result<(), Error> {
-        let (obj, probe) = (&self.obj, &self.probe);
-        let d = *views.dims();
         ptyrs_gpu::zero(ctx, &mut self.psi)?;
         ptyrs_gpu::zero(ctx, &mut self.icalc)?;
         ptyrs_gpu::zero(ctx, &mut self.llk)?;
         self.obj_sums.zero(ctx)?;
         self.probe_sums.zero(ctx)?;
+        self.ops(ctx, k, views, stack, counts)
+    }
+
+    /// The stack launches alone, onto whatever the buffers hold.
+    fn ops(
+        &mut self,
+        ctx: &ExecutionContext,
+        k: &Kernels,
+        views: &Views,
+        stack: StackRef<'_>,
+        counts: &DeviceBuffer<u16>,
+    ) -> Result<(), Error> {
+        let (obj, probe) = (&self.obj, &self.probe);
+        let d = *views.dims();
         k.obj_probe_to_psi(ctx, views, stack, obj, probe, &mut self.psi)?;
         k.mode_intensity(ctx, &d, stack, &self.psi, &mut self.icalc)?;
         k.llk(ctx, &d, stack, counts, &self.psi, &mut self.llk)?;
         k.psi_to_obj(ctx, views, stack, &self.psi, probe, &mut self.obj_sums)?;
         k.psi_to_probe(ctx, views, stack, &self.psi, obj, &mut self.probe_sums)?;
         k.apply_amplitude(ctx, &d, stack, counts, &mut self.psi)
+    }
+
+    /// Fills every buffer the stack launches write with noise.
+    fn fill_noise(&mut self, stream: &CudaStream) {
+        let re =
+            |len: usize, seed| -> Vec<f32> { noise(len, seed, 1.0).iter().map(|c| c.re).collect() };
+        let sums = |len: usize, seed| {
+            let (num, den) = (
+                up(stream, &noise(len, seed, 1.0)),
+                up(stream, &re(len, seed + 1)),
+            );
+            UpdateSums::new(num, den, stream).unwrap()
+        };
+        let llk: Vec<_> = noise(2 * self.llk.len(), 3, 1.0)
+            .chunks(2)
+            .map(|c| LlkPartial {
+                poisson: c[0].re,
+                gaussian: c[0].im,
+                euclidean: c[1].re,
+                icalc: c[1].im,
+            })
+            .collect();
+        self.psi = up(stream, &noise(self.psi.len(), 1, 1.0));
+        self.icalc = up(stream, &re(self.icalc.len(), 2));
+        self.llk = up(stream, &llk);
+        self.obj_sums = sums(self.obj.len(), 4);
+        self.probe_sums = sums(self.probe.len(), 6);
     }
 
     fn bits(&self, stream: &CudaStream) -> Vec<u32> {
@@ -1049,6 +1088,38 @@ fn one_graph_runs_whichever_stack_its_entry_holds() {
         assert!(
             it.bits(&stream) == *want,
             "entry {{ f0: {f0}, nf: {nf} }} differs from eager"
+        );
+    }
+}
+
+/// A captured stack replayed against an entry with `nf == 0` leaves every buffer it writes
+/// as it was, bit for bit, wherever the entry's `f0` points; with `nf == 1` it does not.
+#[test]
+fn empty_stack_replay_writes_nothing() {
+    let (stream, _, k) = setup();
+    let s = scan();
+    let views = Views::new(&stream, s.d, &s.views).unwrap();
+    let counts = up(&stream, &counts(s.d.nframe as usize * s.n()));
+    let dev = StackTable::device(&stream, &s.d, 3).unwrap();
+    let mut it = StackRun::new(&stream, &s, dev.nf_max());
+    it.fill_noise(&stream);
+    let side = k.context().new_stream().unwrap();
+    let graph = CudaGraph::capture(
+        side.clone(),
+        record(|ctx| it.ops(ctx, &k, &views, dev.at(0), &counts)),
+    )
+    .unwrap();
+    let start = it.bits(&stream);
+    for (f0, nf, empty) in [(2, 0, true), (0, 0, true), (4, 0, true), (2, 1, false)] {
+        let ctl = [StackCtl { f0, nf }];
+        k.context().bind_to_thread().unwrap();
+        // SAFETY: `dev` holds one entry; no work on it is in flight.
+        unsafe { cuda_core::memory::memcpy_htod_sync(dev.ptr(), ctl.as_ptr(), 8) }.unwrap();
+        graph.launch().sync_on(&side).unwrap();
+        assert_eq!(
+            it.bits(&stream) == start,
+            empty,
+            "entry {{ f0: {f0}, nf: {nf} }}"
         );
     }
 }

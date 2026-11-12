@@ -33,7 +33,8 @@ pub struct ViewAddr {
 unsafe impl cuda_core::DeviceCopy for ViewAddr {}
 
 /// The frames `f0 .. f0 + nf` of one stack. A kernel reads it from device memory when it
-/// runs, so one launch, or one captured graph, serves whichever stack the entry holds then.
+/// runs, so one launch, or one captured graph, serves whichever stack the entry holds then;
+/// with `nf == 0` it writes nothing.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct StackCtl {

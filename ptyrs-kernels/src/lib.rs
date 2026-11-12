@@ -212,8 +212,9 @@ pub mod kernels {
     // frames `f0 .. f0 + nf` from `stack_frames(ctl, g)`, so views `k0 .. k0 + nk` with
     // `k0 = f0 * nmode`, `nk = nf * nmode` (frame-major, `k = frame * nmode + mode`); its exit
     // waves are planes `0 .. nk` of `psi`, which holds `nf_max * nmode`. Launches are sized
-    // by `nf_max`; threads and blocks past the stack exit. 1D kernels are launched with
-    // `PIXEL_THREADS` threads per block over the stated element count.
+    // by `nf_max`; threads and blocks past the stack exit. A stack with `nf == 0` writes
+    // nothing, so a replay against an empty entry leaves every buffer as it was. 1D kernels
+    // are launched with `PIXEL_THREADS` threads per block over the stated element count.
 
     /// `psi[kl, psi_index(y, x)] = O_v(y, x) * P_v(y, x) * exp(i quad r^2)` for every view
     /// `v = views[k0 + kl]` of the stack, one thread per element of `[nf_max * nmode, ny, nx]`.
@@ -470,7 +471,8 @@ pub mod kernels {
 
     /// Adds the stack's probe-update sums to `sums` `[nprobe, ny, nx]`:
     /// `num += sum_v conj(O_v q) psi_v`, `den += sum_v |O_v|^2` over the views of each probe
-    /// mode, in ascending `k`. One thread per element of `[nprobe, ny, nx]`.
+    /// mode, in ascending `k`; a mode without a view in the stack is not written. One thread
+    /// per element of `[nprobe, ny, nx]`.
     ///
     /// # Safety
     ///
@@ -497,6 +499,7 @@ pub mod kernels {
         unsafe {
             let mut acc = load_c(sums.num, t);
             let mut norm = *sums.den.add(t);
+            let mut added = false;
             let k0 = f0 as usize * g.nmode as usize;
             for kl in 0..nf as usize * g.nmode as usize {
                 let v = *views.add(k0 + kl);
@@ -507,9 +510,12 @@ pub mod kernels {
                 let u = cmul_conj(cmul(o, q), load_c(psi, kl * n + at));
                 acc = (acc.0 + u.0, acc.1 + u.1);
                 norm += o.0 * o.0 + o.1 * o.1;
+                added = true;
             }
-            store_c(sums.num, t, acc);
-            *sums.den.add(t) = norm;
+            if added {
+                store_c(sums.num, t, acc);
+                *sums.den.add(t) = norm;
+            }
         }
     }
 
