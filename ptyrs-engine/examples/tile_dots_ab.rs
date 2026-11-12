@@ -1,23 +1,24 @@
 //! M6: time per cycle of GPU ML and per epoch of GPU BH with each Tile dot product move
 //! ([`GpuOptions::tile_dots`]) against SIMT, on CUDA device 0, in one process.
 //!
-//! `cargo run --release -p ptyrs-engine --example tile_dots_ab -- ml [ncycle] [rounds]`
+//! `cargo run --release -p ptyrs-engine --example tile_dots_ab -- ml [ncycle] [rounds] [rev]`
 //! (defaults 50, 21) runs ML updating object and probe on `gpu_time`'s M1 case (400 frames
 //! of 256x256 on a Fermat spiral of step 16 pixels, 2 probe modes, stacks of 16, fused,
 //! graphs); its moves are `beta` (`cg_beta_parts`, every cycle) and `norm`
 //! (`cg_norm_parts`, once per call in its start).
 //!
-//! `... tile_dots_ab -- bh <cxi> <init.h5> <batch_size> [nepoch] [rounds]` (defaults 20, 21)
-//! runs BH from `init.h5` as it is, as `bh_m3` does (probe rho 0.01, seed 7, stacks of 16,
-//! fused, graphs); its move is `bh` (`bh_dots`, once per batch).
+//! `... tile_dots_ab -- bh <cxi> <init.h5> <batch_size> [nepoch] [rounds] [rev]` (defaults
+//! 20, 21) runs BH from `init.h5` as it is, as `bh_m3` does (probe rho 0.01, seed 7, stacks
+//! of 16, fused, graphs); its move is `bh` (`bh_dots`, once per batch).
 //!
 //! Every variant, and a second all-SIMT one (`simt2`) for the noise between two devices of
-//! the same options, is built first and warmed up by 5 cycles. Each round then times one
-//! call of `ncycle` cycles per variant, in an order rotated per round: the wall time of the
-//! call and a sync, as `gpu_time` times it, without LLK. All variants run the same calls, so
-//! their arrays must end bit-identical, which is checked last. Printed per variant: the
-//! median time per cycle and its range, and the median over rounds of its difference from
-//! `simt` in the same round.
+//! the same options, is built first and warmed up by 5 cycles, in the order printed or, with
+//! `rev`, the reverse: a device's place in build order can cost more than a move saves. Each
+//! round then times one call of `ncycle` cycles per variant, in an order rotated per round:
+//! the wall time of the call and a sync, as `gpu_time` times it, without LLK. All variants
+//! run the same calls, so their arrays must end bit-identical, which is checked last.
+//! Printed per variant: the median time per cycle and its range, and the median over rounds
+//! of its difference from `simt` in the same round.
 
 use std::time::Instant;
 
@@ -36,7 +37,7 @@ fn median(v: &[f64]) -> f64 {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let usage = "usage: tile_dots_ab ml [ncycle] [rounds] | tile_dots_ab bh <cxi> <init.h5> <batch_size> [nepoch] [rounds]";
+    let usage = "usage: tile_dots_ab ml [ncycle] [rounds] [rev] | tile_dots_ab bh <cxi> <init.h5> <batch_size> [nepoch] [rounds] [rev]";
     let mut args = std::env::args().skip(1);
     let algo = args.next().ok_or(usage)?;
     let ctx = CudaContext::new(0).map_err(EngineError::from)?;
@@ -70,6 +71,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let mut next = |default: usize| args.next().map_or(Ok(default), |s| s.parse());
     let (ncycle, rounds) = (next(if bh.is_some() { 20 } else { 50 })?, next(21)?);
+    let rev = match args.next().as_deref() {
+        None => false,
+        Some("rev") => true,
+        Some(_) => return Err(usage.into()),
+    };
     let ml = MlParams {
         update_object: true,
         update_probe: true,
@@ -85,6 +91,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut variants = vec![("simt", simt), ("simt2", simt)];
     variants.extend(moves);
+    if rev {
+        variants.reverse();
+    }
     let mut gs = Vec::new();
     for &(name, tile_dots) in &variants {
         let options = GpuOptions {
@@ -107,6 +116,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let nv = gs.len();
+    let base = if rev { nv - 1 } else { 0 };
     let mut ms = vec![Vec::new(); nv];
     for r in 0..rounds {
         for k in 0..nv {
@@ -126,15 +136,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .flat_map(|v| [v.re.to_bits(), v.im.to_bits()])
             .collect())
     };
-    let want = bits(&gs[0])?;
-    for (g, (name, _)) in gs.iter().zip(&variants).skip(1) {
+    let want = bits(&gs[base])?;
+    for (g, (name, _)) in gs.iter().zip(&variants) {
         if bits(g)? != want {
             return Err(format!("{name}: object or probe differs from simt").into());
         }
     }
     println!("{algo}: object and probe bit-identical across variants");
     for (v, (name, _)) in variants.iter().enumerate() {
-        let d: Vec<f64> = ms[v].iter().zip(&ms[0]).map(|(a, b)| a - b).collect();
+        let d: Vec<f64> = ms[v].iter().zip(&ms[base]).map(|(a, b)| a - b).collect();
         let lo = ms[v].iter().copied().fold(f64::INFINITY, f64::min);
         let hi = ms[v].iter().copied().fold(0.0, f64::max);
         println!(
