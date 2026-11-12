@@ -12,7 +12,7 @@ use cuda_bindings as sys;
 use cuda_core::{Context, IntoResult, PinnedHostBuffer};
 use epics_pva_rs::server_native::{PvaServer, PvaServerConfig, SharedSource};
 use ptyrs_live::args::Args;
-use ptyrs_live::object::{LiveObject, Snapshot, Window};
+use ptyrs_live::object::{LiveObject, Snapshot};
 use ptyrs_live::pv_out::{AmpPhase, PvOut};
 
 const FILL: [f32; 2] = [1.0, 0.5];
@@ -55,13 +55,9 @@ async fn main() {
     let ctx = Context::new(gpu).expect("CUDA context");
     let s = ctx.new_stream().expect("stream");
     let mut o = LiveObject::new(&s, 2, [n, n], 16, 4, FILL, 1).expect("LiveObject");
-    o.ensure(Window {
-        oy: row0,
-        ox: 0,
-        ny: row1 - row0,
-        nx: n,
-    })
-    .expect("ensure");
+    // A tile backs its object rows across the whole width.
+    o.ensure((row0 / 16..=(row1 - 1) / 16).map(|ty| [ty as u32, 0]))
+        .expect("ensure");
     let mut snap = Snapshot::new(&o).expect("Snapshot");
     let band = (row1 - row0) * n;
     let mut stage = PinnedHostBuffer::<[f32; 2]>::zeroed(&ctx, 2 * band).expect("staging");

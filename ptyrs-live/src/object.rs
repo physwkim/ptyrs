@@ -3,15 +3,15 @@
 //! the whole measurement.
 //!
 //! The object is `[nobj, nyo, nxo]` interleaved complex f32, row-major, the
-//! M1 kernels' layout; rows are backed in whole tile rows as frames reach
-//! them, and fresh pixels start at a flat value. The bins give tile
-//! `t = ty * ntx + tx` a slab of `cap` view indices at `t * cap`, appended in
-//! ascending order and padded with `u32::MAX`; with the fixed offsets
-//! `tile_start[t] = t * cap` a slab reads as the sorted run of a CSR index,
-//! because the padding sorts after every view index. `lens[t]` counts the
-//! appends, and is 0 for every tile whose slab or pixels are not backed.
+//! M1 kernels' layout; rows are backed in whole tile rows as views reach
+//! them, and fresh pixels start at a flat value. The bins are the
+//! `tile_start`, `tile_views` and `tile_len` of the M1 `Views`, in storage
+//! the live side owns: tile `t = ty * ntx + tx` has the `cap` slots
+//! `tile_views[t * cap..]`, and its run is the first `tile_len[t]` of them,
+//! appended on the device in ascending view order. Slots past the run are
+//! never read. [`LiveObject::ensure`] backs a tile before any view on it is
+//! binned, so `tile_len[t] > 0` only for backed tiles.
 
-use std::fmt;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -20,26 +20,10 @@ use cuda_core::{DriverError, Event, IntoResult, PinnedHostBuffer, Stream};
 
 use crate::grow::{GrowBuf, GrowError};
 
-/// Object pixels `oy..oy + ny` by `ox..ox + nx`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Window {
-    pub oy: usize,
-    pub ox: usize,
-    pub ny: usize,
-    pub nx: usize,
-}
-
-impl fmt::Display for Window {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let Self { oy, ox, ny, nx } = *self;
-        write!(f, "rows {oy}..{} x cols {ox}..{}", oy + ny, ox + nx)
-    }
-}
-
 pub struct LiveObject {
     obj: GrowBuf,
-    lists: GrowBuf,
-    lens: GrowBuf,
+    tile_views: GrowBuf,
+    tile_len: GrowBuf,
     tile_start: GrowBuf,
     nobj: usize,
     shape: [usize; 2],
@@ -73,8 +57,8 @@ impl LiveObject {
         );
         let mut o = Self {
             obj: GrowBuf::new(ctx, nobj * nyo * nxo * 8, chunk)?,
-            lists: GrowBuf::new(ctx, ntiles * cap * 4, chunk)?,
-            lens: GrowBuf::new(ctx, ntiles * 4, 1)?,
+            tile_views: GrowBuf::new(ctx, ntiles * cap * 4, chunk)?,
+            tile_len: GrowBuf::new(ctx, ntiles * 4, 1)?,
             tile_start: GrowBuf::new(ctx, (ntiles + 1) * 4, 1)?,
             nobj,
             shape,
@@ -84,7 +68,7 @@ impl LiveObject {
             fill,
             stream: stream.clone(),
         };
-        o.lens.map(0..ntiles * 4)?;
+        o.tile_len.map(0..ntiles * 4)?;
         o.tile_start.map(0..(ntiles + 1) * 4)?;
         let starts: Vec<u32> = (0..=ntiles).map(|t| (t * cap) as u32).collect();
         let starts = PinnedHostBuffer::from_slice(ctx, &starts)?;
@@ -93,7 +77,7 @@ impl LiveObject {
         // SAFETY: both destinations were mapped above with these sizes; the
         // stream is synchronised before `starts` is freed.
         unsafe {
-            sys::cuMemsetD32Async(o.lens.ptr(), 0, ntiles, s).result()?;
+            sys::cuMemsetD32Async(o.tile_len.ptr(), 0, ntiles, s).result()?;
             sys::cuMemcpyHtoDAsync_v2(
                 o.tile_start.ptr(),
                 starts.as_ptr().cast(),
@@ -117,13 +101,13 @@ impl LiveObject {
     }
 
     /// `ntiles * cap` u32 view indices.
-    pub fn lists_ptr(&self) -> CUdeviceptr {
-        self.lists.ptr()
+    pub fn tile_views_ptr(&self) -> CUdeviceptr {
+        self.tile_views.ptr()
     }
 
-    /// `ntiles` u32 append counts.
-    pub fn lens_ptr(&self) -> CUdeviceptr {
-        self.lens.ptr()
+    /// `ntiles` u32 run lengths.
+    pub fn tile_len_ptr(&self) -> CUdeviceptr {
+        self.tile_len.ptr()
     }
 
     pub fn nobj(&self) -> usize {
@@ -148,50 +132,48 @@ impl LiveObject {
         self.cap
     }
 
-    /// Backs the object rows and the slabs of every tile `w` touches, in
-    /// every plane, and queues the fill of the fresh parts on the stream, so
-    /// kernels queued there afterwards may read and append to them. Call it
-    /// before a view reading `w` enters the address table.
-    pub fn ensure(&mut self, w: Window) -> Result<(), GrowError> {
+    /// Backs the object rows and the slab of each tile `[ty, tx]` of `tiles`,
+    /// in every plane, and queues the fill of fresh pixels on the stream, so
+    /// kernels queued there afterwards may read the pixels and append to the
+    /// slabs. Call it with `ViewDims::view_tiles` of a view before the view
+    /// enters the address table: the bin append writes those slabs and the
+    /// kernels touch those pixels, the bilinear neighbour's wrapped tile
+    /// included.
+    pub fn ensure(&mut self, tiles: impl IntoIterator<Item = [u32; 2]>) -> Result<(), GrowError> {
         let [nyo, nxo] = self.shape;
-        if w.oy + w.ny > nyo || w.ox + w.nx > nxo {
-            return Err(GrowError::Outside {
-                window: w,
-                shape: self.shape,
-            });
-        }
-        if w.ny == 0 || w.nx == 0 {
-            return Ok(());
-        }
-        let t = self.tile;
-        let ty = w.oy / t..(w.oy + w.ny - 1) / t + 1;
-        let tx = w.ox / t..(w.ox + w.nx - 1) / t + 1;
-        let (row, plane) = (nxo * 8, nyo * nxo * 8);
-        let rows = ty.start * t..(ty.end * t).min(nyo);
+        let [nty, ntx] = self.tiles;
+        let (t, row, plane, slab) = (self.tile, nxo * 8, nyo * nxo * 8, self.cap * 4);
         self.stream.context().bind_to_thread()?;
         let s = self.stream.cu_stream();
         let [re, im] = self.fill.map(f32::to_bits);
         let base = self.obj.ptr();
-        for z in 0..self.nobj {
-            let at = z * plane;
-            self.obj
-                .map_with(at + rows.start * row..at + rows.end * row, |r| {
-                    let dst = base + r.start as u64;
-                    // SAFETY: `r` was just mapped; chunks are 8-byte aligned.
-                    unsafe {
-                        sys::cuMemsetD2D32Async(dst, 8, re, 1, r.len() / 8, s).result()?;
-                        sys::cuMemsetD2D32Async(dst + 4, 8, im, 1, r.len() / 8, s).result()
-                    }
-                })?;
-        }
-        let (ntx, slab, base) = (self.tiles[1], self.cap * 4, self.lists.ptr());
-        for y in ty {
-            let span = (y * ntx + tx.start) * slab..(y * ntx + tx.end) * slab;
-            self.lists.map_with(span, |r| {
-                // SAFETY: `r` was just mapped.
-                unsafe { sys::cuMemsetD32Async(base + r.start as u64, u32::MAX, r.len() / 4, s) }
-                    .result()
-            })?;
+        let mut last_row = None;
+        for [ty, tx] in tiles {
+            let (y, x) = (ty as usize, tx as usize);
+            if y >= nty || x >= ntx {
+                return Err(GrowError::Tile {
+                    tile: [ty, tx],
+                    tiles: self.tiles,
+                });
+            }
+            if last_row != Some(y) {
+                let rows = y * t..((y + 1) * t).min(nyo);
+                for z in 0..self.nobj {
+                    let at = z * plane;
+                    self.obj
+                        .map_with(at + rows.start * row..at + rows.end * row, |r| {
+                            let dst = base + r.start as u64;
+                            // SAFETY: `r` was just mapped; chunks are 8-byte aligned.
+                            unsafe {
+                                sys::cuMemsetD2D32Async(dst, 8, re, 1, r.len() / 8, s).result()?;
+                                sys::cuMemsetD2D32Async(dst + 4, 8, im, 1, r.len() / 8, s).result()
+                            }
+                        })?;
+                }
+                last_row = Some(y);
+            }
+            let at = (y * ntx + x) * slab;
+            self.tile_views.map(at..at + slab)?;
         }
         Ok(())
     }
@@ -315,99 +297,121 @@ impl Drop for Snapshot {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::ffi::c_void;
+    use std::num::NonZeroU32;
 
     use cuda_core::{Context, launch_kernel_on_stream};
 
     use super::*;
     use crate::consumer::{Graph, memset32};
     use crate::grow::GrowTable;
+    use crate::stack::NextStack;
 
     const PTX: &str = r#"
 .version 8.0
 .target sm_89
 .address_size 64
 
-// Thread per tile t = ty * ntx + tx. For frames f in ctl[0]..ctl[1], in
-// ascending f, whose w x w window at wins[f] = (oy, ox) overlaps the tile:
-// lists[t * cap + lens[t]] = f while lens[t] < cap, and lens[t] += 1.
-.visible .entry bin_append(.param .u64 wins, .param .u64 ctl, .param .u64 lists, .param .u64 lens, .param .u32 ntx, .param .u32 ntiles, .param .u32 tile, .param .u32 w, .param .u32 cap)
+// A stand-in for the M1 bin_views. Thread per tile t = ty * ntx + tx. For
+// frames f in f0..f0 + nf of the StackCtl at ctl, ascending, whose w x w view
+// at wins[f] = (oy, ox) touches the tile (on each axis, its tiles o / tile ..=
+// (o + w - 1) / tile or the wrapped neighbour's ((o + w) % n) / tile): store
+// f at views[tstart[t] + lens[t]] and add 1 to lens[t] while that slot is
+// below tstart[t + 1], else add 1 to overflow.
+.visible .entry bin_append(.param .u64 wins, .param .u64 ctl, .param .u64 tstart, .param .u64 views, .param .u64 lens, .param .u64 overflow, .param .u32 ntx, .param .u32 ntiles, .param .u32 tile, .param .u32 w, .param .u32 nyo, .param .u32 nxo)
 {
     .reg .pred p;
-    .reg .b32 r<20>;
-    .reg .b64 rd<8>;
+    .reg .b32 r<22>;
+    .reg .b64 rd<10>;
     ld.param.u64 rd1, [wins];
     ld.param.u64 rd2, [ctl];
-    ld.param.u64 rd3, [lists];
-    ld.param.u64 rd4, [lens];
+    ld.param.u64 rd3, [tstart];
+    ld.param.u64 rd4, [views];
+    ld.param.u64 rd5, [lens];
+    ld.param.u64 rd6, [overflow];
     ld.param.u32 r1, [ntx];
     ld.param.u32 r2, [ntiles];
     ld.param.u32 r3, [tile];
     ld.param.u32 r4, [w];
-    ld.param.u32 r5, [cap];
+    ld.param.u32 r5, [nyo];
+    ld.param.u32 r6, [nxo];
     cvta.to.global.u64 rd1, rd1;
     cvta.to.global.u64 rd2, rd2;
     cvta.to.global.u64 rd3, rd3;
     cvta.to.global.u64 rd4, rd4;
-    mov.u32 r6, %ctaid.x;
-    mov.u32 r7, %ntid.x;
-    mov.u32 r8, %tid.x;
-    mad.lo.u32 r6, r6, r7, r8;
-    setp.ge.u32 p, r6, r2;
+    cvta.to.global.u64 rd5, rd5;
+    cvta.to.global.u64 rd6, rd6;
+    mov.u32 r7, %ctaid.x;
+    mov.u32 r8, %ntid.x;
+    mov.u32 r9, %tid.x;
+    mad.lo.u32 r7, r7, r8, r9;
+    setp.ge.u32 p, r7, r2;
     @p bra BEND;
-    div.u32 r9, r6, r1;
-    rem.u32 r10, r6, r1;
-    mul.lo.u32 r9, r9, r3;
-    mul.lo.u32 r10, r10, r3;
-    mul.wide.u32 rd5, r6, 4;
-    add.s64 rd5, rd4, rd5;
-    ld.global.u32 r11, [rd5];
-    mul.lo.u32 r12, r6, r5;
+    div.u32 r8, r7, r1;
+    rem.u32 r9, r7, r1;
+    mul.wide.u32 rd7, r7, 4;
+    add.s64 rd8, rd3, rd7;
+    ld.global.u32 r10, [rd8];
+    ld.global.u32 r11, [rd8+4];
+    add.s64 rd7, rd5, rd7;
+    ld.global.u32 r12, [rd7];
     ld.global.u32 r13, [rd2];
     ld.global.u32 r14, [rd2+4];
+    add.u32 r14, r13, r14;
 BLOOP:
     setp.ge.u32 p, r13, r14;
     @p bra BSTORE;
-    mul.wide.u32 rd6, r13, 8;
-    add.s64 rd6, rd1, rd6;
-    ld.global.u32 r15, [rd6];
-    ld.global.u32 r16, [rd6+4];
-    add.u32 r17, r9, r3;
-    setp.ge.u32 p, r15, r17;
-    @p bra BNEXT;
-    add.u32 r17, r15, r4;
+    mul.wide.u32 rd9, r13, 8;
+    add.s64 rd9, rd1, rd9;
+    ld.global.u32 r15, [rd9];
+    ld.global.u32 r16, [rd9+4];
+    div.u32 r17, r15, r3;
+    add.u32 r18, r15, r4;
+    sub.u32 r19, r18, 1;
+    div.u32 r19, r19, r3;
+    rem.u32 r18, r18, r5;
+    div.u32 r18, r18, r3;
+    setp.ge.u32 p, r8, r17;
+    setp.le.and.u32 p, r8, r19, p;
+    setp.eq.or.u32 p, r8, r18, p;
+    @!p bra BNEXT;
+    div.u32 r17, r16, r3;
+    add.u32 r18, r16, r4;
+    sub.u32 r19, r18, 1;
+    div.u32 r19, r19, r3;
+    rem.u32 r18, r18, r6;
+    div.u32 r18, r18, r3;
     setp.ge.u32 p, r9, r17;
-    @p bra BNEXT;
-    add.u32 r17, r10, r3;
-    setp.ge.u32 p, r16, r17;
-    @p bra BNEXT;
-    add.u32 r17, r16, r4;
-    setp.ge.u32 p, r10, r17;
-    @p bra BNEXT;
-    setp.ge.u32 p, r11, r5;
-    @p bra BCOUNT;
-    add.u32 r17, r12, r11;
-    mul.wide.u32 rd7, r17, 4;
-    add.s64 rd7, rd3, rd7;
-    st.global.u32 [rd7], r13;
-BCOUNT:
-    add.u32 r11, r11, 1;
+    setp.le.and.u32 p, r9, r19, p;
+    setp.eq.or.u32 p, r9, r18, p;
+    @!p bra BNEXT;
+    add.u32 r20, r10, r12;
+    setp.ge.u32 p, r20, r11;
+    @p bra BOVER;
+    mul.wide.u32 rd9, r20, 4;
+    add.s64 rd9, rd4, rd9;
+    st.global.u32 [rd9], r13;
+    add.u32 r12, r12, 1;
+    bra BNEXT;
+BOVER:
+    atom.global.add.u32 r21, [rd6], 1;
 BNEXT:
     add.u32 r13, r13, 1;
     bra BLOOP;
 BSTORE:
-    st.global.u32 [rd5], r11;
+    st.global.u32 [rd7], r12;
 BEND:
     ret;
 }
 
 // Block per tile, grid (ntx, nty, nobj); a tile with lens[t] == 0 returns
 // before touching anything. Pixel (y, x) of plane z adds to its real part
-// the number of frames f in ctl[0]..ctl[1] with f % 2 == z whose window
-// covers it, read from tile_start[t]..tile_start[t + 1] as the M1
-// psi_to_obj reads its run: binary search for the first f >= ctl[0], stop
-// at the first f >= ctl[1].
-.visible .entry owner_add(.param .u64 obj, .param .u64 wins, .param .u64 ctl, .param .u64 tstart, .param .u64 lists, .param .u64 lens, .param .u32 nyo, .param .u32 nxo, .param .u32 w)
+// the number of frames f in f0..f0 + nf with f % 2 == z whose window covers
+// it, read from the run tstart[t]..tstart[t] + lens[t] as the M1
+// psi_to_obj reads it: binary search for the first f >= f0, stop at the
+// first f >= f0 + nf.
+.visible .entry owner_add(.param .u64 obj, .param .u64 wins, .param .u64 ctl, .param .u64 tstart, .param .u64 views, .param .u64 lens, .param .u32 nyo, .param .u32 nxo, .param .u32 w)
 {
     .reg .pred p;
     .reg .b32 r<28>;
@@ -417,7 +421,7 @@ BEND:
     ld.param.u64 rd2, [wins];
     ld.param.u64 rd3, [ctl];
     ld.param.u64 rd4, [tstart];
-    ld.param.u64 rd5, [lists];
+    ld.param.u64 rd5, [views];
     ld.param.u64 rd6, [lens];
     ld.param.u32 r1, [nyo];
     ld.param.u32 r2, [nxo];
@@ -450,10 +454,11 @@ BEND:
     mov.u32 r13, %ctaid.z;
     add.s64 rd9, rd4, rd7;
     ld.global.u32 r14, [rd9];
-    ld.global.u32 r15, [rd9+4];
+    add.u32 r15, r14, r8;
     mov.u32 r16, r15;
     ld.global.u32 r17, [rd3];
     ld.global.u32 r18, [rd3+4];
+    add.u32 r18, r17, r18;
 SEARCH:
     setp.ge.u32 p, r14, r16;
     @p bra FOUND;
@@ -511,18 +516,6 @@ WDONE:
 OEND:
     ret;
 }
-
-// ctl[0] = ctl[1].
-.visible .entry advance(.param .u64 ctl)
-{
-    .reg .b32 r1;
-    .reg .b64 rd1;
-    ld.param.u64 rd1, [ctl];
-    cvta.to.global.u64 rd1, rd1;
-    ld.global.u32 r1, [rd1+4];
-    st.global.u32 [rd1], r1;
-    ret;
-}
 "#;
 
     fn dtoh(src: CUdeviceptr, n: usize) -> Vec<u32> {
@@ -533,58 +526,97 @@ OEND:
         v
     }
 
-    /// Frames on a raster reach new object rows and tiles in uneven batches;
-    /// each window is ensured, its record appended to a table, and one graph,
-    /// captured before anything was backed, bins the new frames and adds them
-    /// tile by tile, reading the bins as a CSR run. Nothing is synchronised
-    /// until the end.
+    /// The test's `ViewDims::view_tiles` for a `w x w` view at `(oy, ox)` of
+    /// an `n x n` object in 16-pixel tiles: the tiles the view covers and,
+    /// on each axis, the tile of the bilinear neighbour at `(o + w) % n`.
+    fn view_tiles([oy, ox]: [u32; 2], w: u32, n: u32) -> impl Iterator<Item = [u32; 2]> {
+        fn axis(o: u32, w: u32, n: u32) -> impl Iterator<Item = u32> {
+            let (first, last, wrap) = (o / 16, (o + w - 1) / 16, ((o + w) % n) / 16);
+            (first..=last).chain((wrap < first || wrap > last).then_some(wrap))
+        }
+        axis(oy, w, n).flat_map(move |ty| axis(ox, w, n).map(move |tx| [ty, tx]))
+    }
+
+    /// Views on a raster, and views on the far edges whose bilinear
+    /// neighbour wraps to tile row or column 0, reach new object rows and
+    /// tiles in uneven batches. Each view's tiles are ensured before its
+    /// record enters the table, and one graph, captured before anything was
+    /// backed, advances the StackCtl, bins the new views and adds them tile
+    /// by tile, reading each run up to `tile_len`. A batch larger than
+    /// `nf_max` takes several replays; nothing is synchronised until the end.
     #[test]
     fn bins_and_object_grow_while_one_graph_reads_them() {
         let ctx = Context::new(0).expect("GPU 0");
         let m = ctx.load_module_from_ptx_src(PTX).unwrap();
-        let (bin, add, adv) = (
+        let (bin, add) = (
             m.load_function("bin_append").unwrap(),
             m.load_function("owner_add").unwrap(),
-            m.load_function("advance").unwrap(),
         );
         let s = ctx.new_stream().unwrap();
-        let (n, tile, cap, w) = (1024usize, 16usize, 1024usize, 64usize);
+        let (n, tile, cap, w, nf_max) = (2048usize, 16usize, 1024usize, 64usize, 16u32);
         let fill = [1.0f32, 0.5];
         let mut o = LiveObject::new(&s, 2, [n, n], tile, cap, fill, 1).unwrap();
         let [nty, ntx] = o.tiles();
         let ntiles = nty * ntx;
-        let wins: Vec<[u32; 2]> = (0..=400)
+        let mut wins: Vec<[u32; 2]> = (300..=700)
             .step_by(16)
             .flat_map(|oy| (100..=700).step_by(16).map(move |ox| [oy, ox]))
             .collect();
+        let edge = (n - w) as u32;
+        for (at, v) in [
+            (900, [edge, edge]),
+            (600, [600, edge]),
+            (300, [edge, 1000]),
+            (100, [edge, 500]),
+        ] {
+            wins.insert(at, v);
+        }
         let total = wins.len();
         let mut table = GrowTable::<[u32; 2]>::new(&s, total, 1).unwrap();
-        let mut ctl = GrowBuf::new(&ctx, 8, 1).unwrap();
-        ctl.map(0..8).unwrap();
-        memset32(ctl.ptr(), 0, 2, &s).unwrap();
+        let step = NextStack::load(&ctx, NonZeroU32::new(nf_max).unwrap(), total as u32).unwrap();
+        // The StackCtl, the landed count, the overflow count.
+        let mut ctl = GrowBuf::new(&ctx, 16, 1).unwrap();
+        ctl.map(0..16).unwrap();
+        let (landed, overflow) = (ctl.ptr() + 8, ctl.ptr() + 12);
+        memset32(ctl.ptr(), 0, 4, &s).unwrap();
 
-        let (mut b_wins, mut b_ctl, mut b_lists, mut b_lens) =
-            (table.ptr(), ctl.ptr(), o.lists_ptr(), o.lens_ptr());
-        let (mut b_ntx, mut b_ntiles, mut b_tile, mut b_w, mut b_cap) =
-            (ntx as u32, ntiles as u32, tile as u32, w as u32, cap as u32);
+        let (mut b_wins, mut b_ctl, mut b_start, mut b_views, mut b_lens, mut b_over) = (
+            table.ptr(),
+            ctl.ptr(),
+            o.tile_start_ptr(),
+            o.tile_views_ptr(),
+            o.tile_len_ptr(),
+            overflow,
+        );
+        let (mut b_ntx, mut b_ntiles, mut b_tile, mut b_w, mut b_nyo, mut b_nxo) = (
+            ntx as u32,
+            ntiles as u32,
+            tile as u32,
+            w as u32,
+            n as u32,
+            n as u32,
+        );
         let mut bin_params = [
             (&raw mut b_wins).cast::<c_void>(),
             (&raw mut b_ctl).cast(),
-            (&raw mut b_lists).cast(),
+            (&raw mut b_start).cast(),
+            (&raw mut b_views).cast(),
             (&raw mut b_lens).cast(),
+            (&raw mut b_over).cast(),
             (&raw mut b_ntx).cast(),
             (&raw mut b_ntiles).cast(),
             (&raw mut b_tile).cast(),
             (&raw mut b_w).cast(),
-            (&raw mut b_cap).cast(),
+            (&raw mut b_nyo).cast(),
+            (&raw mut b_nxo).cast(),
         ];
-        let (mut a_obj, mut a_wins, mut a_ctl, mut a_start, mut a_lists, mut a_lens) = (
+        let (mut a_obj, mut a_wins, mut a_ctl, mut a_start, mut a_views, mut a_lens) = (
             o.ptr(),
             table.ptr(),
             ctl.ptr(),
             o.tile_start_ptr(),
-            o.lists_ptr(),
-            o.lens_ptr(),
+            o.tile_views_ptr(),
+            o.tile_len_ptr(),
         );
         let (mut a_nyo, mut a_nxo, mut a_w) = (n as u32, n as u32, w as u32);
         let mut add_params = [
@@ -592,139 +624,130 @@ OEND:
             (&raw mut a_wins).cast(),
             (&raw mut a_ctl).cast(),
             (&raw mut a_start).cast(),
-            (&raw mut a_lists).cast(),
+            (&raw mut a_views).cast(),
             (&raw mut a_lens).cast(),
             (&raw mut a_nyo).cast(),
             (&raw mut a_nxo).cast(),
             (&raw mut a_w).cast(),
         ];
-        let mut v_ctl = ctl.ptr();
-        let mut adv_params = [(&raw mut v_ctl).cast::<c_void>()];
         let t = tile as u32;
+        // SAFETY: every buffer the graph reads or writes outlives it; the
+        // parameter arrays match the kernels and outlive the capture.
         let graph = Graph::capture(&s, || unsafe {
+            step.queue(&s, ctl.ptr(), landed)?;
             let blocks = ntiles.div_ceil(256) as u32;
             launch_kernel_on_stream(&bin, (blocks, 1, 1), (256, 1, 1), 0, &s, &mut bin_params)?;
             let grid = (ntx as u32, nty as u32, 2);
-            launch_kernel_on_stream(&add, grid, (t, t, 1), 0, &s, &mut add_params)?;
-            launch_kernel_on_stream(&adv, (1, 1, 1), (1, 1, 1), 0, &s, &mut adv_params)
+            launch_kernel_on_stream(&add, grid, (t, t, 1), 0, &s, &mut add_params)
         })
         .unwrap();
 
         let sizes = [1usize, 5, 13, 2, 40, 7, 3];
-        let (mut f, mut k) = (0usize, 0usize);
+        let (mut f, mut covered, mut k, mut launches) = (0usize, 0usize, 0usize, 0usize);
         while f < total {
             let b = sizes[k % sizes.len()].min(total - f);
             k += 1;
-            for &[oy, ox] in &wins[f..f + b] {
-                let (oy, ox) = (oy as usize, ox as usize);
-                o.ensure(Window {
-                    oy,
-                    ox,
-                    ny: w,
-                    nx: w,
-                })
-                .unwrap();
+            for &v in &wins[f..f + b] {
+                o.ensure(view_tiles(v, w as u32, n as u32)).unwrap();
             }
             assert_eq!(table.push(&wins[f..f + b]).unwrap(), f..f + b);
             f += b;
-            memset32(ctl.ptr() + 4, f as u32, 1, &s).unwrap();
-            graph.launch(&s).unwrap();
+            memset32(landed, f as u32, 1, &s).unwrap();
+            while covered < f {
+                graph.launch(&s).unwrap();
+                launches += 1;
+                covered = (covered + nf_max as usize).min(f);
+            }
         }
+        // Nothing new: this replay has nf = 0 and must change nothing.
+        graph.launch(&s).unwrap();
         s.synchronize().unwrap();
+        assert!(launches > k, "no batch needed several replays");
         assert_eq!(
-            (o.ptr(), o.lists_ptr(), o.lens_ptr()),
-            (a_obj, b_lists, b_lens)
+            (o.ptr(), o.tile_views_ptr(), o.tile_len_ptr()),
+            (a_obj, b_views, b_lens)
         );
-        assert_eq!(dtoh(ctl.ptr(), 2), vec![total as u32; 2]);
+        assert_eq!(dtoh(ctl.ptr(), 4), [total as u32, 0, total as u32, 0]);
+        let starts: Vec<u32> = (0..=ntiles).map(|t| (t * cap) as u32).collect();
+        assert_eq!(dtoh(o.tile_start_ptr(), ntiles + 1), starts);
 
-        // Host model: bins in frame order and per-plane cover counts.
+        // Host model: runs in view order and per-plane cover counts.
         let mut bins: Vec<Vec<u32>> = vec![Vec::new(); ntiles];
         let mut cover = vec![0u32; 2 * n * n];
-        for (fi, &[oy, ox]) in wins.iter().enumerate() {
-            let (oy, ox) = (oy as usize, ox as usize);
-            for ty in oy / tile..=(oy + w - 1) / tile {
-                for tx in ox / tile..=(ox + w - 1) / tile {
-                    bins[ty * ntx + tx].push(fi as u32);
-                }
+        for (fi, &v) in wins.iter().enumerate() {
+            for [ty, tx] in view_tiles(v, w as u32, n as u32) {
+                bins[ty as usize * ntx + tx as usize].push(fi as u32);
             }
+            let [oy, ox] = v.map(|c| c as usize);
             for y in oy..oy + w {
                 for x in ox..ox + w {
                     cover[((fi % 2) * n + y) * n + x] += 1;
                 }
             }
         }
-        let lens = dtoh(o.lens_ptr(), ntiles);
+        // Tile row 0 and column 0 are reached only through the wrap.
+        for t in [0, 500 / 16, 1000 / 16, (600 / 16) * ntx] {
+            assert!(!bins[t].is_empty(), "tile {t} not reached");
+        }
+        let lens = dtoh(o.tile_len_ptr(), ntiles);
         let bad_lens = (0..ntiles)
             .filter(|&t| lens[t] as usize != bins[t].len())
             .count();
-        assert_eq!(bad_lens, 0, "tiles with a wrong append count");
-        let (mut checked, mut bad_runs) = (0, 0);
-        for (t, run) in bins.iter().enumerate().filter(|(_, r)| !r.is_empty()) {
-            let got = dtoh(o.lists_ptr() + (t * cap * 4) as u64, cap);
-            let want: Vec<u32> = run
-                .iter()
-                .copied()
-                .chain(std::iter::repeat(u32::MAX))
-                .take(cap)
-                .collect();
-            checked += 1;
-            bad_runs += usize::from(got != want);
-        }
-        assert_eq!(bad_runs, 0, "of {checked} binned tiles");
+        assert_eq!(bad_lens, 0, "tiles with a wrong run length");
+        let reached: Vec<usize> = (0..ntiles).filter(|&t| !bins[t].is_empty()).collect();
+        let bad_runs = reached
+            .iter()
+            .filter(|&&t| dtoh(o.tile_views_ptr() + (t * cap * 4) as u64, bins[t].len()) != bins[t])
+            .count();
+        assert_eq!(bad_runs, 0, "of {} reached tiles", reached.len());
 
-        // Rows 0..464 are reached; whole chunks back rows 0..512 per plane.
+        // Each plane backs the whole chunks over the reached tile rows, and
+        // every backed pixel is the fill plus its cover count.
         let ck = o.obj.chunk_bytes();
         let (row, plane) = (n * 8, n * n * 8);
         assert_eq!(plane % ck, 0);
-        let backed = (464 * row).div_ceil(ck) * ck / row;
-        assert_eq!(o.obj.mapped_bytes(), 2 * backed * row);
+        let rows: BTreeSet<usize> = reached.iter().map(|t| t / ntx).collect();
+        let mut chunks = BTreeSet::new();
         for z in 0..2 {
-            let at = z * plane;
-            assert!(o.obj.is_mapped(at..at + backed * row));
-            assert!(!o.obj.is_mapped(at + backed * row..at + backed * row + 8));
-            let got = dtoh(o.ptr() + at as u64, backed * n * 2);
-            let bad = (0..backed * n)
+            for ty in &rows {
+                let at = z * plane + ty * tile * row;
+                chunks.extend(at / ck..=(at + tile * row - 1) / ck);
+            }
+        }
+        assert!(chunks.contains(&0) && chunks.contains(&(plane / ck)));
+        assert_eq!(o.obj.mapped_bytes(), chunks.len() * ck);
+        let mut bad = 0;
+        for c in &chunks {
+            assert!(o.obj.is_mapped(c * ck..(c + 1) * ck));
+            let got = dtoh(o.ptr() + (c * ck) as u64, ck / 4);
+            let px0 = c * ck / 8;
+            bad += (0..ck / 8)
                 .filter(|&i| {
-                    let want_re = fill[0] + cover[z * n * n + i] as f32;
-                    f32::from_bits(got[2 * i]) != want_re
+                    f32::from_bits(got[2 * i]) != fill[0] + cover[px0 + i] as f32
                         || f32::from_bits(got[2 * i + 1]) != fill[1]
                 })
                 .count();
-            assert_eq!(bad, 0, "plane {z}: pixels off fill + cover count");
         }
+        assert_eq!(bad, 0, "pixels off fill + cover in {} chunks", chunks.len());
         // Slabs of reached tiles only, in whole chunks.
-        let lck = o.lists.chunk_bytes();
-        let mut chunks = std::collections::BTreeSet::new();
-        for (t, run) in bins.iter().enumerate() {
-            if !run.is_empty() {
-                chunks.extend(t * cap * 4 / lck..=((t + 1) * cap * 4 - 1) / lck);
-            }
-        }
-        assert_eq!(o.lists.mapped_bytes(), chunks.len() * lck);
+        let (sck, slab) = (o.tile_views.chunk_bytes(), cap * 4);
+        let slabs: BTreeSet<usize> = reached
+            .iter()
+            .flat_map(|t| t * slab / sck..=((t + 1) * slab - 1) / sck)
+            .collect();
+        assert_eq!(o.tile_views.mapped_bytes(), slabs.len() * sck);
 
-        assert!(
-            o.ensure(Window {
-                oy: 3,
-                ox: 9,
-                ny: 0,
-                nx: 5
-            })
-            .is_ok()
-        );
-        let past = Window {
-            oy: n - 63,
-            ox: 0,
-            ny: 64,
-            nx: 64,
-        };
-        assert!(matches!(
-            o.ensure(past),
-            Err(GrowError::Outside { window, shape }) if window == past && shape == [n, n]
-        ));
+        assert!(o.ensure([]).is_ok());
+        for past in [[nty as u32, 0], [0, ntx as u32]] {
+            assert!(matches!(
+                o.ensure([past]),
+                Err(GrowError::Tile { tile, tiles }) if tile == past && tiles == [nty, ntx]
+            ));
+        }
         eprintln!(
-            "object: {total} frames in {k} batches; object {} MiB, slabs {} MiB backed",
+            "object: {total} views in {k} batches, {launches} replays; object {} MiB, slabs {} MiB backed",
             o.obj.mapped_bytes() >> 20,
-            o.lists.mapped_bytes() >> 20
+            o.tile_views.mapped_bytes() >> 20
         );
     }
 
@@ -741,14 +764,9 @@ OEND:
         assert!(snap.copied.is_empty());
         assert!(snap.wait().unwrap().iter().all(|&p| p == fill));
 
-        // 2 MiB chunks back 256 rows of a plane: rows 256..512.
-        let win = |oy| Window {
-            oy,
-            ox: 40,
-            ny: 40,
-            nx: 64,
-        };
-        o.ensure(win(300)).unwrap();
+        // The tiles over rows y0..y1; 2 MiB chunks back 256 rows of a plane.
+        let rows = |y0: u32, y1: u32| (y0 / 16..=(y1 - 1) / 16).map(|ty| [ty, 2]);
+        o.ensure(rows(300, 340)).unwrap();
         let mut gate = PinnedHostBuffer::<u32>::zeroed(&ctx, 1).unwrap();
         let mark = 7.0f32.to_bits();
         unsafe {
@@ -795,7 +813,7 @@ OEND:
         assert_eq!(bad, 0);
 
         // Growth adds rows 512..768; touching bands merge.
-        o.ensure(win(700)).unwrap();
+        o.ensure(rows(700, 740)).unwrap();
         o.snapshot(&mut snap).unwrap();
         assert_eq!(
             snap.copied,

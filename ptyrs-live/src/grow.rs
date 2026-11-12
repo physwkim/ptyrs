@@ -13,8 +13,6 @@ use cuda_bindings::{self as sys, CUdeviceptr};
 use cuda_core::vmm::{self, Mapping, PhysicalAllocation, VirtualReservation};
 use cuda_core::{Context, DeviceCopy, DriverError, IntoResult, PinnedHostBuffer, Stream};
 
-use crate::object::Window;
-
 #[derive(Debug)]
 pub enum GrowError {
     /// The requested range ends past the reservation.
@@ -22,10 +20,11 @@ pub enum GrowError {
         end: usize,
         capacity: usize,
     },
-    /// A [`LiveObject`](crate::object::LiveObject) window past the object.
-    Outside {
-        window: Window,
-        shape: [usize; 2],
+    /// A [`LiveObject`](crate::object::LiveObject) tile `[ty, tx]` past its
+    /// `[nty, ntx]` tiles.
+    Tile {
+        tile: [u32; 2],
+        tiles: [usize; 2],
     },
     /// An earlier chunk's initialisation failed; the buffer maps no more.
     Failed,
@@ -38,12 +37,8 @@ impl fmt::Display for GrowError {
             Self::Capacity { end, capacity } => {
                 write!(f, "range end {end} past the {capacity}-byte reservation")
             }
-            Self::Outside { window, shape } => {
-                write!(
-                    f,
-                    "window {window} past the {}x{} object",
-                    shape[0], shape[1]
-                )
+            Self::Tile { tile, tiles } => {
+                write!(f, "tile {tile:?} past the {}x{} tiles", tiles[0], tiles[1])
             }
             Self::Failed => write!(f, "an earlier chunk initialisation failed"),
             Self::Driver(e) => write!(f, "{e}"),
