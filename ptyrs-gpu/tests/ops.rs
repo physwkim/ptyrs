@@ -1833,6 +1833,27 @@ fn fft2_f64(planes: &mut [Z], [ny, nx]: [u32; 2], inverse: bool) {
 /// The M1 Fourier projection in f64 of `frames`' exit waves `psi` (M1 layout) against the
 /// scan's `counts`: the projected waves and each frame's LLK terms of the far field.
 fn project_f64(s: &Scan, frames: Range<u32>, psi: &[Z], counts: &[u16]) -> (Vec<Z>, Vec<[f64; 4]>) {
+    far_f64(s, frames, psi, counts, |obs, calc| {
+        obs.map_or(1.0, |obs| (obs / calc.max(1e-12)).sqrt())
+    })
+}
+
+/// Engine's `poisson_grad` in f64, back in the detector plane, and the LLK terms.
+fn grad_f64(s: &Scan, frames: Range<u32>, psi: &[Z], counts: &[u16]) -> (Vec<Z>, Vec<[f64; 4]>) {
+    far_f64(s, frames, psi, counts, |obs, calc| {
+        obs.map_or(0.0, |obs| 2.0 * (1.0 - obs / calc.max(1e-12)))
+    })
+}
+
+/// `psi`'s far field with every pixel's modes times `scale(obs, calc)` in the ortho plane
+/// (`obs` `None` where masked), back in the detector plane, and each frame's LLK terms.
+fn far_f64(
+    s: &Scan,
+    frames: Range<u32>,
+    psi: &[Z],
+    counts: &[u16],
+    scale: impl Fn(Option<f64>, f64) -> f64,
+) -> (Vec<Z>, Vec<[f64; 4]>) {
     let (n, nm) = (s.n(), s.d.nmode as usize);
     let nf = (frames.end - frames.start) as usize;
     let mut far = psi.to_vec();
@@ -1843,14 +1864,13 @@ fn project_f64(s: &Scan, frames: Range<u32>, psi: &[Z], counts: &[u16]) -> (Vec<
             let at = |m: usize| (fl * nm + m) * n + s.shifted(y, x);
             let calc = (0..nm).map(|m| norm2(far[at(m)])).sum::<f64>() / n as f64;
             let obs = counts[(frames.start as usize + fl) * n + i];
-            let scale = if obs == MASKED {
-                1.0 / n as f64
-            } else {
-                for (l, t) in llk.iter_mut().zip(llk_terms(obs as f64, calc)) {
+            let obs = (obs != MASKED).then_some(obs as f64);
+            if let Some(obs) = obs {
+                for (l, t) in llk.iter_mut().zip(llk_terms(obs, calc)) {
                     *l += t;
                 }
-                (obs as f64 / calc.max(1e-12)).sqrt() / n as f64
-            };
+            }
+            let scale = scale(obs, calc) / n as f64;
             for m in 0..nm {
                 far[at(m)] = (far[at(m)].0 * scale, far[at(m)].1 * scale);
             }
@@ -2012,6 +2032,89 @@ fn fused_ap_matches_f64() {
             let en = rel_l2(&sums.num.to_host_vec(&stream).unwrap(), num);
             let ed = rel_l2_re(&sums.den.to_host_vec(&stream).unwrap(), den);
             println!("fused AP {frame:?} {what} sums: num rel L2 {en:.2e}, den {ed:.2e}");
+            assert!(
+                en < 1e-5 && ed < 1e-5,
+                "{frame:?} {what}: {en:.2e}, {ed:.2e}"
+            );
+        }
+    }
+}
+
+/// ML: `Exit::Grad`'s gradient waves, its object sums (engine's `Ptycho::obj_grad`) and the
+/// probe sums `psi_to_probe` takes from them (`Ptycho::probe_grad`), against engine's
+/// `poisson_grad` chain in f64; its LLK partials bit for bit against `Exit::Ap`'s.
+#[test]
+fn fused_grad_matches_f64() {
+    let (stream, ex, k) = setup();
+    for frame in [[128, 256], [256, 128]] {
+        let fs = FusedScan::new(&stream, frame);
+        let (s, n) = (&fs.s, fs.s.n());
+        let stacks = [0..3, 3..5];
+        let table = StackTable::new(&stream, &s.d, &stacks).unwrap();
+        let mut bufs = FusedBufs::new(&stream, &s.d, table.nf_max()).unwrap();
+        let mut obj_sums = UpdateSums::zeroed(&stream, s.obj.len()).unwrap();
+        let mut probe_sums = UpdateSums::zeroed(&stream, s.probe.len()).unwrap();
+        let mut llk = DeviceBuffer::<LlkPartial>::zeroed(&stream, 3).unwrap();
+        let mut llk_ap = DeviceBuffer::<LlkPartial>::zeroed(&stream, 3).unwrap();
+        let (mut num, mut den) = (vec![(0.0, 0.0); s.obj.len()], vec![0.0; s.obj.len()]);
+        let (mut pnum, mut pden) = (vec![(0.0, 0.0); s.probe.len()], vec![0.0; s.probe.len()]);
+        for (i, frames) in stacks.into_iter().enumerate() {
+            let stack = table.at(i);
+            let nf = (frames.end - frames.start) as usize;
+            k.fused_project(
+                &ex,
+                &fs.inputs(),
+                stack,
+                Exit::Ap {
+                    llk: Some(&mut llk_ap),
+                },
+                &mut bufs,
+                None,
+            )
+            .unwrap();
+            k.fused_project(
+                &ex,
+                &fs.inputs(),
+                stack,
+                Exit::Grad {
+                    llk: Some(&mut llk),
+                },
+                &mut bufs,
+                Some(&mut obj_sums),
+            )
+            .unwrap();
+            let work = bufs.work().to_host_vec(&stream).unwrap();
+            k.psi_to_probe(&ex, &fs.views, stack, bufs.work(), &fs.obj, &mut probe_sums)
+                .unwrap();
+
+            let po = s.psi(frames.clone(), &s.obj);
+            let (want, llk_ref) = grad_f64(s, frames.clone(), &po, &fs.counts_host);
+            let err = rel_l2(&work[..s.nk(&frames) * n], &want);
+            println!("fused grad {frame:?} {frames:?}: rel L2 {err:.2e}");
+            assert!(err < 1e-5, "{frame:?} {frames:?}: rel L2 {err:.2e}");
+            let got = llk.to_host_vec(&stream).unwrap();
+            assert_llk("fused grad llk", &got[..nf], &llk_ref);
+            let llk_bits = |v: &[LlkPartial]| -> Vec<[u32; 4]> {
+                v.iter()
+                    .map(|p| [p.poisson, p.gaussian, p.euclidean, p.icalc].map(f32::to_bits))
+                    .collect()
+            };
+            assert_eq!(
+                llk_bits(&llk_ap.to_host_vec(&stream).unwrap()[..nf]),
+                llk_bits(&got[..nf]),
+                "{frame:?} {frames:?}: grad LLK partials differ from AP's"
+            );
+            let want = to_c32(&want);
+            s.obj_sums(frames.clone(), &want, &mut num, &mut den);
+            s.probe_sums(frames, &want, &mut pnum, &mut pden);
+        }
+        for (what, sums, num, den) in [
+            ("object", &obj_sums, &num, &den),
+            ("probe", &probe_sums, &pnum, &pden),
+        ] {
+            let en = rel_l2(&sums.num.to_host_vec(&stream).unwrap(), num);
+            let ed = rel_l2_re(&sums.den.to_host_vec(&stream).unwrap(), den);
+            println!("fused grad {frame:?} {what} sums: num rel L2 {en:.2e}, den {ed:.2e}");
             assert!(
                 en < 1e-5 && ed < 1e-5,
                 "{frame:?} {what}: {en:.2e}, {ed:.2e}"

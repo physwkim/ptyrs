@@ -13,8 +13,8 @@ use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig};
 use ptyrs_kernels::FFT_EPT;
 use ptyrs_kernels::fused::{
-    FUSED_COLS, FUSED_CONTRIB, FUSED_DM, FUSED_LLK, FUSED_PROJECT, FUSED_ROW_THREADS, FUSED_TO_PSI,
-    FusedCfg, FusedPtrs,
+    FUSED_COLS, FUSED_CONTRIB, FUSED_DM, FUSED_GRAD, FUSED_LLK, FUSED_PROJECT, FUSED_ROW_THREADS,
+    FUSED_TO_PSI, FusedCfg, FusedPtrs,
 };
 
 use crate::ops::grid_1d;
@@ -205,6 +205,14 @@ pub enum Exit<'a> {
     Ap {
         llk: Option<&'a mut DeviceBuffer<LlkPartial>>,
     },
+    /// The Poisson LLK gradient, for ML: the far field of `PO` scaled at every pixel by
+    /// `2 (1 - obs / max(calc, 1e-12))`, 0 where masked, as engine's `poisson_grad`, goes
+    /// back to the detector plane in [`FusedBufs::work`]. The object sums' `num` then gets
+    /// the object gradient `2 dL/dO*` of `Ptycho::obj_grad`, and [`Kernels::psi_to_probe`]
+    /// on `work` the probe's. `llk` as for [`Exit::Ap`].
+    Grad {
+        llk: Option<&'a mut DeviceBuffer<LlkPartial>>,
+    },
     /// The first DM cycle, from PyNX's start `psi = PO`: `psi = P(PO)`.
     DmFirst { psi: &'a mut DeviceBuffer<C32> },
     /// A DM cycle: with `R = (2 - alpha) PO - (1 - alpha) psi`, `psi = P(R) + (1 - alpha)
@@ -217,7 +225,7 @@ pub enum Exit<'a> {
 
 impl Kernels {
     /// One stack's projection: from the current object and probe, the step `exit` names,
-    /// then with `obj_sums` the object-update sums of the new exit waves added as
+    /// then with `obj_sums` the object-update sums of the waves it leaves added as
     /// [`Self::psi_to_obj`] adds them (each object pixel over the stack's frames in
     /// ascending order, so the split into stacks does not change a bit; only tiles the
     /// stack touches are read and written). Up to six launches; a stack with `nf == 0`
@@ -233,10 +241,12 @@ impl Kernels {
     ) -> Result<(), Error> {
         let run = Run::new(self, ctx, *inputs, stack, bufs)?;
         let d = inputs.views.dims();
-        let (psi, llk, dm, alpha) = match exit {
-            Exit::Ap { llk } => (None, llk, false, 0.0),
-            Exit::DmFirst { psi } => (Some(psi), None, false, 0.0),
-            Exit::Dm { psi, alpha } => (Some(psi), None, true, alpha),
+        // `far`: what the column pass does to the far field.
+        let (psi, llk, dm, alpha, far) = match exit {
+            Exit::Ap { llk } => (None, llk, false, 0.0, FUSED_PROJECT),
+            Exit::Grad { llk } => (None, llk, false, 0.0, FUSED_GRAD),
+            Exit::DmFirst { psi } => (Some(psi), None, false, 0.0, FUSED_PROJECT),
+            Exit::Dm { psi, alpha } => (Some(psi), None, true, alpha, FUSED_PROJECT),
         };
         if let Some(psi) = &psi {
             check_len("psi", psi, run.g.nf_max as usize * d.nmode as usize * d.n())?;
@@ -268,7 +278,7 @@ impl Kernels {
         )?;
         let llk_flag = if llk.is_some() { FUSED_LLK } else { 0 };
         let cfg = FusedCfg {
-            flags: FUSED_PROJECT | llk_flag,
+            flags: far | llk_flag,
             alpha,
         };
         run.cols(bufs, p, cfg)?;
@@ -432,7 +442,7 @@ impl<'a> Run<'a> {
         let config = self.sh.cols(&self.g)?;
         let mut reads = vec![self.inputs.counts.storage(), self.stack.storage()];
         let mut writes = vec![];
-        if cfg.flags & FUSED_PROJECT != 0 {
+        if cfg.flags & (FUSED_PROJECT | FUSED_GRAD) != 0 {
             writes.push(bufs.work.storage());
         } else {
             reads.push(bufs.work.storage());

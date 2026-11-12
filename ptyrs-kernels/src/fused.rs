@@ -34,6 +34,9 @@ pub const FUSED_LLK: u32 = 4;
 pub const FUSED_PROJECT: u32 = 8;
 /// [`rows_inv`] writes the per-frame object contributions.
 pub const FUSED_CONTRIB: u32 = 16;
+/// [`cols`] applies the Poisson LLK gradient scale and the inverse column FFT; never with
+/// `FUSED_PROJECT`.
+pub const FUSED_GRAD: u32 = 32;
 
 /// Columns of one frame a [`cols`] block transforms, for every mode.
 pub const FUSED_COLS: u32 = 8;
@@ -182,8 +185,10 @@ pub unsafe fn rows_fwd<const NX: u32>(
 /// frame `fl = blockIdx.y`, then per far-field pixel `calc = sum_m |Psi_m|^2 / n` in
 /// ascending `m`. Under `FUSED_LLK`, `groups[fl, blockIdx.x]` gets the LLK sums of
 /// `kernels::llk` over the block's pixels; under `FUSED_PROJECT`, every mode is scaled as
-/// `kernels::apply_amplitude` scales it, inverse column-FFT'd and stored back. Reads
-/// `counts`; writes `work` and under `FUSED_LLK` `groups`.
+/// `kernels::apply_amplitude` scales it, inverse column-FFT'd and stored back. `FUSED_GRAD`
+/// does the same with the scale `2 (1 - obs / max(calc, 1e-12)) / n`, 0 where masked, which
+/// makes the stored waves the gradient of the Poisson LLK sum over `(Re psi, Im psi)`.
+/// Reads `counts`; writes `work` and under `FUSED_LLK` `groups`.
 ///
 /// One 1D block of `nmode * FUSED_COLS * tpf` threads (`tpf = ny / FFT_EPT`): thread `tid`
 /// is thread `f = (tid / FUSED_COLS) % tpf` of FFT `m * FUSED_COLS + c`, `c = tid %
@@ -219,6 +224,7 @@ pub unsafe fn cols<const NY: u32>(p: FusedPtrs, ctl: *const StackCtl, g: StackGe
     let plane = (fl * nmode + m) as usize * n;
     let llk = cfg.flags & FUSED_LLK != 0;
     let project = cfg.flags & FUSED_PROJECT != 0;
+    let grad = cfg.flags & FUSED_GRAD != 0;
     let mut r = [0.0f32; 2 * FFT_EPT as usize];
     unsafe {
         let smem = DynamicSharedArray::<u8, 16>::get();
@@ -290,6 +296,15 @@ pub unsafe fn cols<const NY: u32>(p: FusedPtrs, ctl: *const StackCtl, g: StackGe
                 r[2 * i as usize] *= scale;
                 r[2 * i as usize + 1] *= scale;
             }
+            if grad {
+                let scale = if obs == MASKED {
+                    0.0
+                } else {
+                    2.0 * (1.0 - obs as f32 / (s * inv_n).max(1e-12)) * inv_n
+                };
+                r[2 * i as usize] *= scale;
+                r[2 * i as usize + 1] *= scale;
+            }
         }
         if llk {
             // Mode 0's threads are `tid < nslot`; a fixed tree over them per term.
@@ -320,7 +335,7 @@ pub unsafe fn cols<const NY: u32>(p: FusedPtrs, ctl: *const StackCtl, g: StackGe
                 };
             }
         }
-        if project {
+        if project || grad {
             // Every power is read before the inverse FFT reuses the region.
             thread::sync_threads();
             block_fft::<NY, true>(&mut r, fft_smem, b, f, bpb);
