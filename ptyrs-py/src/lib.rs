@@ -9,9 +9,9 @@
 mod cpu;
 mod gpu;
 
+use ::ptyrs::base::{C64, CoreError, Counts, Geometry, Positions, Stack};
+use ::ptyrs::engine::{EngineError, Llk, LlkRecord};
 use numpy::{Element, PyArray1, PyArray3, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray3};
-use ptyrs_core::{C64, CoreError, Counts, Geometry, Positions, Stack};
-use ptyrs_engine::{EngineError, Llk, LlkRecord};
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
@@ -86,9 +86,9 @@ macro_rules! params {
 }
 use params;
 
-fn ap_params(kw: Option<&Bound<'_, PyDict>>) -> PyResult<ptyrs_engine::ApParams> {
+fn ap_params(kw: Option<&Bound<'_, PyDict>>) -> PyResult<::ptyrs::engine::ApParams> {
     Ok(params!(
-        ptyrs_engine::ApParams,
+        ::ptyrs::engine::ApParams,
         kw,
         obj_inertia,
         probe_inertia,
@@ -97,9 +97,9 @@ fn ap_params(kw: Option<&Bound<'_, PyDict>>) -> PyResult<ptyrs_engine::ApParams>
     ))
 }
 
-fn dm_params(kw: Option<&Bound<'_, PyDict>>) -> PyResult<ptyrs_engine::DmParams> {
+fn dm_params(kw: Option<&Bound<'_, PyDict>>) -> PyResult<::ptyrs::engine::DmParams> {
     Ok(params!(
-        ptyrs_engine::DmParams,
+        ::ptyrs::engine::DmParams,
         kw,
         obj_inertia,
         probe_inertia,
@@ -110,9 +110,9 @@ fn dm_params(kw: Option<&Bound<'_, PyDict>>) -> PyResult<ptyrs_engine::DmParams>
     ))
 }
 
-fn ml_params(kw: Option<&Bound<'_, PyDict>>) -> PyResult<ptyrs_engine::MlParams> {
+fn ml_params(kw: Option<&Bound<'_, PyDict>>) -> PyResult<::ptyrs::engine::MlParams> {
     Ok(params!(
-        ptyrs_engine::MlParams,
+        ::ptyrs::engine::MlParams,
         kw,
         update_object,
         update_probe,
@@ -121,9 +121,9 @@ fn ml_params(kw: Option<&Bound<'_, PyDict>>) -> PyResult<ptyrs_engine::MlParams>
     ))
 }
 
-fn rpie_params(kw: Option<&Bound<'_, PyDict>>) -> PyResult<ptyrs_engine::RpieParams> {
+fn rpie_params(kw: Option<&Bound<'_, PyDict>>) -> PyResult<::ptyrs::engine::RpieParams> {
     Ok(params!(
-        ptyrs_engine::RpieParams,
+        ::ptyrs::engine::RpieParams,
         kw,
         obj_step,
         probe_step,
@@ -174,7 +174,7 @@ fn history<'py>(py: Python<'py>, h: &[LlkRecord]) -> PyResult<Bound<'py, PyDict>
 /// A far-field scan: counts `[nframe, ny, nx]` (uint16 with 65535 masked, or float64 integers
 /// with negative values masked), positions `y`, `x` in metres, and the geometry in metres.
 #[pyclass(frozen)]
-struct Scan(ptyrs_core::Scan);
+struct Scan(::ptyrs::base::Scan);
 
 #[pymethods]
 impl Scan {
@@ -206,7 +206,7 @@ impl Scan {
         let positions =
             Positions::new(y.as_array().to_vec(), x.as_array().to_vec()).map_err(Error::from)?;
         Ok(Self(
-            ptyrs_core::Scan::new(geometry, positions, counts).map_err(Error::from)?,
+            ::ptyrs::base::Scan::new(geometry, positions, counts).map_err(Error::from)?,
         ))
     }
 }

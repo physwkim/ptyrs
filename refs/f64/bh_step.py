@@ -1,7 +1,7 @@
 """Float64 reference of pty-chi BH steps (object and probe) from a fixed state: CG over one
 batch per epoch, steepest descent over mini-batches.
 
-    <engine>/target/release/examples/llk_trace <dir> dm 1 2 32 40 4
+    <engine>/target/release/examples/engine_llk_trace <dir> dm 1 2 32 40 4
     micromamba run -n ptyrs-ref python -I refs/f64/bh_step.py <dir>
 
 The state is the one ml_grad.py reads (object [1, 76, 80], probe [2, 32, 32], 40 frames). The
@@ -234,7 +234,7 @@ def check_hess(m, bh, step, obj, probe):
 
 def ptychi_run(m, iobs, wavelength, obj, probe, size, cg):
     """pty-chi BHReconstructor (method CG or GD) in f64 on CPU over EPOCHS epochs of the
-    engine's batches, mapped as in ptyrs-engine/scripts/compare_ptychi_rpie.py; per batch beta,
+    engine's batches, mapped as in ptyrs/scripts/engine/compare_ptychi_rpie.py; per batch beta,
     alpha and the object and probe changes in the engine's convention."""
     from torch.utils.data import DataLoader
     import ptychi.api as api

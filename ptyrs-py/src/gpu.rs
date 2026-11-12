@@ -1,9 +1,9 @@
-//! The GPU engine ([`ptyrs_engine::GpuPtycho`]): AP, DM, ML, rPIE and BH in f32.
+//! The GPU engine ([`ptyrs::engine::GpuPtycho`]): AP, DM, ML, rPIE and BH in f32.
 
 use cuda_core::CudaContext;
 use numpy::{PyArray3, PyReadonlyArray3};
-use ptyrs_core::{C64, Object, Probe};
-use ptyrs_engine::{BhParams, GpuOptions};
+use ptyrs::base::{C64, Object, Probe};
+use ptyrs::engine::{BhParams, GpuOptions};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
@@ -12,7 +12,7 @@ use crate::{Error, Scan, history, llk_dict, params, stack_in, stack_out};
 /// The GPU reconstruction state of a scan on CUDA device `device`; keywords are
 /// `GpuOptions` fields.
 #[pyclass(unsendable)]
-pub(crate) struct GpuPtycho(ptyrs_engine::GpuPtycho);
+pub(crate) struct GpuPtycho(ptyrs::engine::GpuPtycho);
 
 #[pymethods]
 impl GpuPtycho {
@@ -29,7 +29,7 @@ impl GpuPtycho {
         let (object, probe) = (Object::new(stack_in(object)?), Probe::new(stack_in(probe)?));
         let ctx = CudaContext::new(device).map_err(|e| Error(e.into()))?;
         Ok(Self(
-            ptyrs_engine::GpuPtycho::new(&ctx, &scan.0, object, probe, options)
+            ptyrs::engine::GpuPtycho::new(&ctx, &scan.0, object, probe, options)
                 .map_err(Error::from)?,
         ))
     }

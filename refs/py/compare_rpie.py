@@ -5,7 +5,7 @@ init as it is, with pty-chi's own rPIE parameters on both sides, PyNX LLK per ep
         [--epochs 20] [--rtol 1e-4] [--module DIR]
     python -I compare_rpie.py DATA_DIR --ptychi-defaults [--seed 7] ...
 
-DATA_DIR is gen_m3's output (ptyrs-refgen), DIR holds the module ptyrs-py/scripts/build.sh
+DATA_DIR is refgen_gen_m3's output (ptyrs::refgen), DIR holds the module ptyrs-py/scripts/build.sh
 installs. Prints the start's far-field intensity difference, each epoch's LLK on both sides and
 their relative difference; exits 1 at the first epoch past rtol.
 

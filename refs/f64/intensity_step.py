@@ -1,12 +1,12 @@
 """Float64 reference of the per-frame intensity scale: the costs' gradients with respect to each
 frame's scale and pty-chi's LSQML intensity-variation step, at a fixed state.
 
-    <engine>/target/release/examples/llk_trace <dir> dm 1 2 32 40 4
+    <engine>/target/release/examples/engine_llk_trace <dir> dm 1 2 32 40 4
     micromamba run -n ptyrs-ref python -I refs/f64/intensity_step.py <dir>
 
 The state is the one ml_grad.py reads (object [1, 76, 80], probe [2, 32, 32], 40 frames, no
 masked pixel) with frame k's intensity multiplied by s_k, uniform in [0.8, 1.2] from numpy
-default_rng(0). s_k scales every probe mode, as the flux scale of ptyrs-refgen does
+default_rng(0). s_k scales every probe mode, as the flux scale of ptyrs::refgen does
 (`intensity_scale` in its meta); otherwise the engine's convention (ml_grad's P, q, corners and
 F = FFT_ortho fftshift):
 

@@ -1,0 +1,84 @@
+[package]
+name = "ptyrs"
+version.workspace = true
+edition.workspace = true
+description = "ptyrs: GPU ptychography on cuda-rust, one host library plus the `ptyrs`, `pty-recv` and `pty-sim` binaries; burn neural networks behind the `nn` feature"
+
+[features]
+# ptyrs::nn on burn. Off by default, so burn and cubecl build only on request.
+nn = ["dep:burn", "dep:burn-cubecl", "dep:cudarc", "dep:cubecl-runtime"]
+
+[dependencies]
+ptyrs-kernels = { path = "../ptyrs-kernels" }
+cuda-core.workspace = true
+cuda-async.workspace = true
+cuda-bindings.workspace = true
+# Absolute like the workspace's cuda-rust paths, so worktrees resolve it; its cuda-core and
+# cuda-async are the workspace's.
+cutile = { path = "/home/stevek/work/cuda-rust/cutile-rs/cutile" }
+num-complex.workspace = true
+thiserror.workspace = true
+rand.workspace = true
+rand_chacha.workspace = true
+rand_distr.workspace = true
+rustfft.workspace = true
+rust-hdf5 = { workspace = true, features = ["lz4"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+# Local epics-rs checkout, absolute like the cuda-rust paths in the workspace manifest.
+epics-pva-rs = { path = "/home/stevek/work/epics-rs/crates/epics-pva-rs" }
+# Unsafe (fast) block codec, still bounds-checked on decode.
+lz4_flex = { version = "0.11", default-features = false, features = ["std", "checked-decode"] }
+bytes = "1"
+crossbeam-channel = "0.5"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+libc = "0.2"
+zmq = "0.10"
+burn = { version = "0.22.1", default-features = false, features = ["std", "cuda", "autodiff", "optim"], optional = true }
+# Named for the CubeCL tensor primitive the cuda-rust boundary reads. Fusion stays off: with it
+# the primitive would be a fusion handle instead of a buffer.
+burn-cubecl = { version = "0.22.1", default-features = false, features = ["std", "cuda"], optional = true }
+# cudarc 0.19.10 knows CUDA up to 13.4 and panics on nvcc 13.5. Pinning its newest bindings here
+# (driver API calls are forward compatible) unifies the feature into cubecl-cuda's copies; the
+# build-dependency entry reaches the build-script graph, which resolver 2+ keeps separate.
+cudarc = { version = "0.19.10", default-features = false, features = ["cuda-13040"], optional = true }
+# For the `Runtime` trait that names cubecl's CUDA server; cubecl does not re-export it.
+cubecl-runtime = { version = "0.11.4", default-features = false, optional = true }
+
+[build-dependencies]
+cuda-artifact-finalizer = { path = "/home/stevek/work/cuda-rust/cuda-oxide/crates/cuda-artifact-finalizer" }
+nvjitlink-sys = { path = "/home/stevek/work/cuda-rust/cuda-oxide/crates/nvjitlink-sys" }
+oxide-artifacts = "0.2.1"
+libloading = "0.8"
+cudarc = { version = "0.19.10", default-features = false, features = ["cuda-13040"], optional = true }
+
+[lints.clippy]
+# clippy.toml's disallowed methods are live's rule (DESIGN §5 inv. 9); the live module and
+# live's binaries, examples and test turn the lint back on.
+disallowed_methods = "allow"
+
+# Discovered like every test and example; listed only to require the feature.
+[[test]]
+name = "nn_interop"
+required-features = ["nn"]
+
+[[test]]
+name = "nn_metric"
+required-features = ["nn"]
+
+[[test]]
+name = "nn_predictor"
+required-features = ["nn"]
+
+[[example]]
+name = "nn_dip"
+required-features = ["nn"]
+
+[[example]]
+name = "nn_m6_start"
+required-features = ["nn"]
+
+[[example]]
+name = "nn_train_ptychonn"
+required-features = ["nn"]

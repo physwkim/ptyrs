@@ -5655,86 +5655,39 @@ name = "ptx-parse"
 version = "0.3.0"
 
 [[package]]
-name = "ptyrs-cli"
+name = "ptyrs"
 version = "0.0.1"
 dependencies = [
- "ptyrs-live",
- "serde",
- "toml 1.2.1+spec-1.1.0",
-]
-
-[[package]]
-name = "ptyrs-core"
-version = "0.0.1"
-dependencies = [
+ "burn",
+ "burn-cubecl",
+ "bytes",
+ "crossbeam-channel",
+ "cubecl-runtime",
+ "cuda-artifact-finalizer",
+ "cuda-async",
+ "cuda-bindings",
+ "cuda-core",
+ "cudarc",
+ "cutile",
+ "epics-pva-rs",
+ "libc",
+ "libloading 0.8.9",
+ "lz4_flex",
  "num-complex",
+ "nvjitlink-sys",
+ "oxide-artifacts",
+ "ptyrs-kernels",
  "rand 0.8.8",
  "rand_chacha 0.3.1",
  "rand_distr 0.4.3",
- "rustfft",
- "thiserror 2.0.21",
-]
-
-[[package]]
-name = "ptyrs-dist"
-version = "0.0.1"
-dependencies = [
- "cuda-async",
- "cuda-core",
- "ptyrs-core",
- "ptyrs-engine",
- "ptyrs-gpu",
- "thiserror 2.0.21",
-]
-
-[[package]]
-name = "ptyrs-engine"
-version = "0.0.1"
-dependencies = [
- "cuda-async",
- "cuda-core",
- "cutile",
- "num-complex",
- "ptyrs-core",
- "ptyrs-fft",
- "ptyrs-gpu",
- "ptyrs-io",
- "ptyrs-tile",
- "rustfft",
- "thiserror 2.0.21",
-]
-
-[[package]]
-name = "ptyrs-fft"
-version = "0.0.1"
-dependencies = [
- "cuda-async",
- "cuda-core",
- "rustfft",
-]
-
-[[package]]
-name = "ptyrs-gpu"
-version = "0.0.1"
-dependencies = [
- "cuda-artifact-finalizer",
- "cuda-async",
- "cuda-core",
- "libloading 0.8.9",
- "nvjitlink-sys",
- "oxide-artifacts",
- "ptyrs-core",
- "ptyrs-fft",
- "ptyrs-kernels",
-]
-
-[[package]]
-name = "ptyrs-io"
-version = "0.0.1"
-dependencies = [
- "ptyrs-core",
  "rust-hdf5",
+ "rustfft",
+ "serde",
+ "serde_json",
  "thiserror 2.0.21",
+ "tokio",
+ "toml 1.2.1+spec-1.1.0",
+ "zmq",
 ]
 
 [[package]]
@@ -5752,81 +5705,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "ptyrs-live"
-version = "0.0.1"
-dependencies = [
- "bytes",
- "crossbeam-channel",
- "cuda-async",
- "cuda-bindings",
- "cuda-core",
- "epics-pva-rs",
- "libc",
- "lz4_flex",
- "ptyrs-core",
- "ptyrs-engine",
- "ptyrs-gpu",
- "rust-hdf5",
- "rustfft",
- "serde",
- "serde_json",
- "tokio",
- "toml 1.2.1+spec-1.1.0",
- "zmq",
-]
-
-[[package]]
-name = "ptyrs-nn"
-version = "0.0.1"
-dependencies = [
- "burn",
- "burn-cubecl",
- "cubecl-runtime",
- "cuda-core",
- "cudarc",
- "num-complex",
- "ptyrs-core",
- "ptyrs-engine",
- "rand 0.8.8",
- "rand_chacha 0.3.1",
- "thiserror 2.0.21",
-]
-
-[[package]]
 name = "ptyrs-py"
 version = "0.0.1"
 dependencies = [
  "cuda-core",
  "numpy",
- "ptyrs-core",
- "ptyrs-engine",
+ "ptyrs",
  "pyo3",
-]
-
-[[package]]
-name = "ptyrs-refgen"
-version = "0.0.1"
-dependencies = [
- "ptyrs-core",
- "ptyrs-io",
- "rand 0.8.8",
- "rand_chacha 0.3.1",
- "rand_distr 0.4.3",
- "rustfft",
- "serde_json",
- "thiserror 2.0.21",
-]
-
-[[package]]
-name = "ptyrs-tile"
-version = "0.0.1"
-dependencies = [
- "cuda-async",
- "cuda-core",
- "cutile",
- "ptyrs-core",
- "ptyrs-fft",
- "ptyrs-gpu",
 ]
 
 [[package]]
