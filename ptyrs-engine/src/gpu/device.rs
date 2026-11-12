@@ -16,9 +16,9 @@ use cuda_async::device_operation::{DeviceOp, ExecutionContext};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 use ptyrs_fft::Plan2d;
 use ptyrs_gpu::{
-    BH_STEP, BhKernels, C32, CG_BLOCKS, Ended, EpochOrder, Error as GpuError, FarSums, FusedBufs,
-    GammaStacks, GradKernels, Kernels, LlkPartial, LlkRing, LlkScratch, LlkTotals, Model,
-    ObjProbeScale, PowerMax, RingDevice, RpieKernels, ScalePartial, StackTable, UpdateSums,
+    BH_STEP, BackgroundSums, BhKernels, C32, CG_BLOCKS, Ended, EpochOrder, Error as GpuError,
+    FarSums, FusedBufs, GammaStacks, GradKernels, Kernels, LlkPartial, LlkRing, LlkScratch,
+    LlkTotals, Model, PowerMax, RingDevice, RpieKernels, ScalePartial, StackTable, UpdateSums,
     ViewAddr, ViewDims, Views,
 };
 use ptyrs_tile::TileDots;
@@ -80,6 +80,7 @@ pub(super) struct Device {
 #[derive(Default)]
 struct FeatureBufs {
     scale: Option<ScaleBufs>,
+    background: Option<BackgroundBufs>,
 }
 
 /// A per-frame intensity scale `[nframe]` and its far sums `[nframe]`.
@@ -88,9 +89,22 @@ struct ScaleBufs {
     sums: DeviceBuffer<ScalePartial>,
 }
 
+/// A detector background `[ny, nx]` in the counts' order, its far sums, each detector
+/// pixel's unmasked frames and the background's photons over them.
+struct BackgroundBufs {
+    values: DeviceBuffer<f32>,
+    sums: BackgroundSums,
+    /// A copy of the ring's [`RingDevice::pixel_frames`], final once [`Device::new`] has
+    /// counted every frame.
+    nobs: DeviceBuffer<u32>,
+    /// `[1]`, written by [`FeaturesMut::background_photons`].
+    photons: DeviceBuffer<f32>,
+}
+
 /// [`FeatureBufs`] lent to a cycle.
 pub(super) struct FeaturesMut<'a> {
     scale: Option<ScaleMut<'a>>,
+    background: Option<BackgroundMut<'a>>,
 }
 
 /// [`ScaleBufs`] lent to a cycle.
@@ -99,16 +113,25 @@ struct ScaleMut<'a> {
     sums: &'a mut DeviceBuffer<ScalePartial>,
 }
 
+/// [`BackgroundBufs`] lent to a cycle.
+struct BackgroundMut<'a> {
+    values: &'a mut DeviceBuffer<f32>,
+    sums: &'a mut BackgroundSums,
+    nobs: &'a DeviceBuffer<u32>,
+    photons: &'a mut DeviceBuffer<f32>,
+}
+
 impl FeaturesMut<'_> {
     /// Whether some feature takes a step from far sums.
     pub fn stepped(&self) -> bool {
-        self.scale.is_some()
+        self.scale.is_some() || self.background.is_some()
     }
 
     /// The model intensity the features set.
     pub fn model(&self) -> Model<'_> {
         Model {
             scale: self.scale.as_ref().map(|s| &*s.values),
+            background: self.background.as_ref().map(|b| &*b.values),
             ..Model::default()
         }
     }
@@ -122,24 +145,51 @@ impl FeaturesMut<'_> {
             Some(s) => (Some(&*s.values), Some(&mut *s.sums)),
             None => (None, None),
         };
+        let (background, background_sums) = match &mut self.background {
+            Some(b) => (Some(&*b.values), Some(&mut *b.sums)),
+            None => (None, None),
+        };
         let model = Model {
             scale,
+            background,
             ..Model::default()
         };
         let far = FarSums {
             llk,
             scale: scale_sums,
-            ..FarSums::default()
+            background: background_sums,
         };
         (model, far)
     }
 
     /// Every stepped feature's step from the far sums [`Self::far`] lent the passes before.
-    pub fn step(&mut self, ctx: &ExecutionContext, grad: &GradKernels) -> Result<(), GpuError> {
+    pub fn step(
+        &mut self,
+        ctx: &ExecutionContext,
+        kernels: &Kernels,
+        grad: &GradKernels,
+    ) -> Result<(), GpuError> {
         if let Some(s) = &mut self.scale {
             grad.scale_step(ctx, s.values, s.sums)?;
         }
+        if let Some(b) = &mut self.background {
+            kernels.background_ap(ctx, b.values, b.sums, b.nobs)?;
+        }
         Ok(())
+    }
+
+    /// The background's photons over the unmasked pixels of every frame, for
+    /// [`ptyrs_gpu::ObjProbeScale::Absolute`]; `None` without a background.
+    pub fn background_photons(
+        &mut self,
+        ctx: &ExecutionContext,
+        grad: &GradKernels,
+    ) -> Result<Option<&DeviceBuffer<f32>>, GpuError> {
+        let Some(b) = &mut self.background else {
+            return Ok(None);
+        };
+        grad.background_photons(ctx, b.values, b.nobs, b.photons)?;
+        Ok(Some(&*b.photons))
     }
 }
 
@@ -684,45 +734,66 @@ impl Device {
                 "features need GpuOptions { fused: true, .. }".into(),
             ));
         }
-        let scale: Option<Vec<f32>> = features
-            .scale
-            .as_ref()
-            .map(|s| s.iter().map(|&s| s as f32).collect());
-        match (&mut self.features.scale, scale) {
-            (Some(b), Some(v)) => b.values.copy_from_host(&self.stream, &v)?,
-            (None, None) => {}
-            (_, scale) => {
-                let scale = scale
-                    .map(|v| {
-                        Ok::<_, EngineError>(ScaleBufs {
-                            values: DeviceBuffer::from_host(&self.stream, &v)?,
-                            sums: DeviceBuffer::zeroed(&self.stream, v.len())?,
-                        })
-                    })
-                    .transpose()?;
-                self.runs.clear();
-                self.llk_graph = None;
-                self.features.scale = scale;
-                self.capture_llk()?;
+        let f32s = |v: &Option<Vec<f64>>| v.as_ref().map(|v| v.iter().map(|&x| x as f32).collect());
+        let (scale, background): (Option<Vec<f32>>, Option<Vec<f32>>) =
+            (f32s(&features.scale), f32s(&features.background));
+        let have = &mut self.features;
+        if have.scale.is_some() == scale.is_some()
+            && have.background.is_some() == background.is_some()
+        {
+            if let (Some(b), Some(v)) = (&mut have.scale, scale) {
+                b.values.copy_from_host(&self.stream, &v)?;
             }
+            if let (Some(b), Some(v)) = (&mut have.background, background) {
+                b.values.copy_from_host(&self.stream, &v)?;
+            }
+            return Ok(());
         }
+        let stream = &self.stream;
+        let scale = scale
+            .map(|v| {
+                Ok::<_, EngineError>(ScaleBufs {
+                    values: DeviceBuffer::from_host(stream, &v)?,
+                    sums: DeviceBuffer::zeroed(stream, v.len())?,
+                })
+            })
+            .transpose()?;
+        let background = background
+            .map(|v| {
+                let pixel_frames = self.ring.device().pixel_frames();
+                let mut nobs = DeviceBuffer::zeroed(stream, pixel_frames.len())?;
+                nobs.copy_from_device_async(pixel_frames, stream)?;
+                Ok::<_, EngineError>(BackgroundBufs {
+                    values: DeviceBuffer::from_host(stream, &v)?,
+                    sums: BackgroundSums::zeroed(stream, self.views.dims(), self.table.nf_max())?,
+                    nobs,
+                    photons: DeviceBuffer::zeroed(stream, 1)?,
+                })
+            })
+            .transpose()?;
+        self.runs.clear();
+        self.llk_graph = None;
+        self.features = FeatureBufs { scale, background };
+        self.capture_llk()?;
         Ok(())
     }
 
     /// The modelled features, read back.
     pub fn features(&self) -> Result<Features, EngineError> {
-        let scale = match &self.features.scale {
-            Some(b) => Some(b.values.to_host_vec(&self.stream)?),
-            None => None,
+        let f64s = |b: Option<&DeviceBuffer<f32>>| {
+            b.map(|b| Ok::<_, EngineError>(b.to_host_vec(&self.stream)?))
+                .transpose()
+                .map(|v| v.map(|v| v.into_iter().map(f64::from).collect()))
         };
         Ok(Features {
-            scale: scale.map(|v| v.into_iter().map(f64::from).collect()),
+            scale: f64s(self.features.scale.as_ref().map(|b| &b.values))?,
+            background: f64s(self.features.background.as_ref().map(|b| &b.values))?,
         })
     }
 
     /// Whether some feature is modelled.
     pub fn has_features(&self) -> bool {
-        self.features.scale.is_some()
+        self.features.scale.is_some() || self.features.background.is_some()
     }
 
     pub fn stream(&self) -> &Arc<CudaStream> {
@@ -787,6 +858,12 @@ impl Device {
                 scale: self.features.scale.as_mut().map(|s| ScaleMut {
                     values: &mut s.values,
                     sums: &mut s.sums,
+                }),
+                background: self.features.background.as_mut().map(|b| BackgroundMut {
+                    values: &mut b.values,
+                    sums: &mut b.sums,
+                    nobs: &b.nobs,
+                    photons: &mut b.photons,
                 }),
             },
         };
@@ -1039,7 +1116,7 @@ impl Device {
     pub fn balance_obj_probe(&mut self) -> Result<(), EngineError> {
         let ctx = self.context();
         let (mut bufs, _, _) = self.lend();
-        Ok(bufs.scale_obj_probe(&ctx, ObjProbeScale::Relative)?)
+        Ok(bufs.scale_obj_probe(&ctx, None)?)
     }
 
     /// The ML gradients of the current estimate, object then probe, as

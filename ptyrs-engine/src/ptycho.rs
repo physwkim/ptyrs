@@ -198,7 +198,8 @@ impl Ptycho {
 
     /// Models and refines `features` from here on; an error leaves the current ones.
     pub fn set_features(&mut self, features: Features) -> Result<(), EngineError> {
-        features.check(self.addr.nframe())?;
+        let [nframe, ny, nx] = self.obs.dims();
+        features.check(nframe, [ny, nx])?;
         self.features = features;
         Ok(())
     }
@@ -258,8 +259,14 @@ impl Ptycho {
         let mut psi = self.calc_psi();
         self.fft.forward(&mut psi);
         let (nframe, nmode) = (self.addr.nframe(), self.addr.nmode());
-        llk_with(&self.obs, 0..nframe, nmode, &psi, Model::of(&self.features))
-            .normalised(self.obs.nb_obs())
+        llk_with(
+            &self.obs,
+            0..nframe,
+            nmode,
+            &psi,
+            Model::of(&self.features, &self.obs),
+        )
+        .normalised(self.obs.nb_obs())
     }
 
     /// [`Features::step`] from the far field of the current object and probe, if some
@@ -337,7 +344,7 @@ impl Ptycho {
             self.fft.forward(x);
         }
         let (nframe, nmode) = (self.addr.nframe(), self.addr.nmode());
-        let model = Model::of(&self.features);
+        let model = Model::of(&self.features, &self.obs);
         cg_poisson_gamma_with(&self.obs, 0..nframe, nmode, [&po, &a, &b], model)
     }
 
@@ -351,7 +358,7 @@ impl Ptycho {
             0..nframe,
             nmode,
             &mut psi,
-            Model::of(&self.features),
+            Model::of(&self.features, &self.obs),
         );
         self.fft.inverse(&mut psi);
         psi
@@ -367,11 +374,14 @@ impl Ptycho {
 
     /// PyNX `ScaleObjProbe(absolute=True)`: scale so the calculated intensity over the
     /// unmasked pixels of every frame ([`Llk::nb_photons_calc`]) equals the observed one
-    /// there, then balance `Σ|O|` and `Σ|P|`: `s = sqrt(Σ iobs / Σ icalc)`,
+    /// there, then balance `Σ|O|` and `Σ|P|`: `s = sqrt((Σ iobs − B) / (Σ icalc − B))` with
+    /// `B` the photons of [`Features::background`] there (PyNX takes `iobs − background`),
     /// `P *= sqrt(Σ|O| / Σ|P| · s)`, `O *= sqrt(Σ|P| / Σ|O| · s)`. Masked pixels are in
     /// neither sum, as in PyNX CUDA's `scale_intensity`.
     pub fn scale_obj_probe(&mut self) {
-        self.split_scale((self.obs.total() / self.llk().nb_photons_calc).sqrt());
+        let b = self.features.background_photons(&self.obs);
+        let calc = self.llk().nb_photons_calc - b;
+        self.split_scale(((self.obs.total() - b) / calc).sqrt());
     }
 
     /// Scales `O P` by `s` and balances `Σ|O|` and `Σ|P|`: `P *= sqrt(Σ|O| / Σ|P| · s)`,
@@ -408,11 +418,11 @@ impl Ptycho {
             );
             self.fft.forward(&mut self.psi);
             let l = llk_due(params.calc_llk, ic, ncycle).then(|| {
-                let model = Model::of(&self.features);
+                let model = Model::of(&self.features, &self.obs);
                 llk_with(&self.obs, 0..nframe, nmode, &self.psi, model).normalised(nb_obs)
             });
             self.features.step(&self.obs, nmode, &self.psi);
-            let model = Model::of(&self.features);
+            let model = Model::of(&self.features, &self.obs);
             apply_amplitude_with(&self.obs, 0..nframe, nmode, &mut self.psi, model);
             self.fft.inverse(&mut self.psi);
             psi_to_obj_probe(
@@ -467,7 +477,7 @@ impl Ptycho {
                 }
             }
             self.fft.forward(&mut self.psi);
-            let model = Model::of(&self.features);
+            let model = Model::of(&self.features, &self.obs);
             apply_amplitude_with(&self.obs, 0..nframe, nmode, &mut self.psi, model);
             self.fft.inverse(&mut self.psi);
             if ic > 0 {

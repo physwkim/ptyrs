@@ -254,18 +254,26 @@ fn gamma_fields_are_the_exit_waves_of_the_directions() {
 /// the scan's `gamma_parts` pairs is their total.
 #[test]
 fn gamma_frames_match_f64_per_chunk_and_sum_to_gamma() {
-    gamma_frames_case(None);
+    gamma_frames_case(None, false);
 }
 
 /// As [`gamma_frames_match_f64_per_chunk_and_sum_to_gamma`] with a per-frame intensity scale
 /// `k`: `calc`, `r` and `s` of each frame times its `k`.
 #[test]
 fn gamma_frames_scale_each_frame() {
-    gamma_frames_case(Some(&[0.5, 2.0, 1.25, 3.0, 0.75]));
+    gamma_frames_case(Some(&[0.5, 2.0, 1.25, 3.0, 0.75]), false);
 }
 
-/// [`gamma_frames_match_f64_per_chunk_and_sum_to_gamma`] with `scale` as the model's.
-fn gamma_frames_case(scale: Option<&[f32]>) {
+/// As [`gamma_frames_scale_each_frame`] with a detector background `b` too: `calc` plus
+/// `b[d]` at detector pixel `d` of every frame.
+#[test]
+fn gamma_frames_add_the_background() {
+    gamma_frames_case(Some(&[0.5, 2.0, 1.25, 3.0, 0.75]), true);
+}
+
+/// [`gamma_frames_match_f64_per_chunk_and_sum_to_gamma`] with `scale` as the model's, and
+/// with `background` a detector background.
+fn gamma_frames_case(scale: Option<&[f32]>, background: bool) {
     let (stream, ctx, _, k) = setup();
     let (ny, nx, nmode) = (48usize, 64usize, 2usize);
     let n = ny * nx;
@@ -297,10 +305,13 @@ fn gamma_frames_case(scale: Option<&[f32]>) {
         .collect();
     let dcounts = up(&stream, &counts);
     let dscale = scale.map(|s| up(&stream, s));
+    let bg: Option<Vec<f32>> = background.then(|| (0..n).map(|d| (d % 7) as f32 * 0.3).collect());
+    let dbg = bg.as_deref().map(|b| up(&stream, b));
     let obs = GammaCounts {
         counts: &dcounts,
         model: Model {
             scale: dscale.as_ref(),
+            background: dbg.as_ref(),
             ..Model::default()
         },
     };
@@ -351,7 +362,8 @@ fn gamma_frames_case(scale: Option<&[f32]>) {
                         r += p.0 * a.0 + p.1 * a.1;
                         sq += a.0 * a.0 + a.1 * a.1 + 2.0 * (p.0 * b.0 + p.1 * b.1);
                     }
-                    let calc = (kf * calc / n as f64).max(1e-12);
+                    let b = bg.as_ref().map_or(0.0, |b| b[d] as f64);
+                    let calc = (kf * calc / n as f64 + b).max(1e-12);
                     let (r, sq, obs) = (kf * r / n as f64, kf * sq / n as f64, obs as f64);
                     let f = 1.0 - obs / calc;
                     let (tn, td) = (-2.0 * r * f, 2.0 * sq * f + obs * (2.0 * r / calc).powi(2));
@@ -393,8 +405,8 @@ fn gamma_frames_case(scale: Option<&[f32]>) {
     );
 }
 
-/// A scale of one value per frame passes; one of another frame count, and a model with a
-/// background, are refused.
+/// A scale of one value per frame passes; one of another frame count, and a background of
+/// another pixel count, are refused.
 #[test]
 fn gamma_frames_refuse_other_models() {
     let (stream, ctx, _, k) = setup();
@@ -414,7 +426,7 @@ fn gamma_frames_refuse_other_models() {
     };
     k.gamma_frames(&ctx, &dims, table.at(0), obs, &stacks, &mut pairs)
         .unwrap();
-    let (short, background) = (up(&stream, &[1.0f32; 4]), up(&stream, &[0.0f32; 64]));
+    let (short, background) = (up(&stream, &[1.0f32; 4]), up(&stream, &[0.0f32; 63]));
     for model in [
         Model {
             scale: Some(&short),
@@ -586,20 +598,31 @@ fn scale_step_is_the_fixed_point_step() {
 }
 
 /// The object and probe scale factors of `ScaleObjProbe` from given norm pairs, absolute
-/// (from given calculated photons) and relative, with the object longer than the probe and
-/// the other way round.
+/// (from given calculated photons, with and without background photons) and relative, with
+/// the object longer than the probe and the other way round.
 #[test]
 fn scale_obj_probe_matches_f64() {
     let (stream, ctx, _, k) = setup();
     let (os, ps, icalc, total) = (300.0f32, 40.0f32, 5.0e4f32, 2.0e6f32);
     let norms = [up(&stream, &[os, 0.0]), up(&stream, &[ps, 0.0])];
-    let icalc_buf = up(&stream, &[icalc]);
+    let (icalc_buf, background) = (up(&stream, &[icalc]), 3.0e5f32);
+    let background_buf = up(&stream, &[background]);
     let absolute = ObjProbeScale::Absolute {
         icalc: &icalc_buf,
         total,
+        background: None,
+    };
+    let less_background = ObjProbeScale::Absolute {
+        icalc: &icalc_buf,
+        total,
+        background: Some(&background_buf),
     };
     let cases = [
         (absolute, (total as f64 / icalc as f64).sqrt()),
+        (
+            less_background,
+            ((total as f64 - background as f64) / icalc as f64).sqrt(),
+        ),
         (ObjProbeScale::Relative, 1.0),
     ];
     for ((scale, s), (nobj, nprobe)) in cases
@@ -627,4 +650,26 @@ fn scale_obj_probe_matches_f64() {
             }
         }
     }
+}
+
+/// The background's photons are `sum_j b[j] nobs[j]` in f64, over more pixels than the block
+/// has threads; a `nobs` shorter than `b` is refused.
+#[test]
+fn background_photons_match_f64() {
+    let (stream, ctx, _, k) = setup();
+    let n = 3000usize;
+    let b: Vec<f32> = (0..n).map(|j| (j % 11) as f32 * 0.25 + 0.1).collect();
+    let nobs: Vec<u32> = (0..n).map(|j| (j % 6) as u32).collect();
+    let want: f64 = b
+        .iter()
+        .zip(&nobs)
+        .map(|(b, k)| *b as f64 * *k as f64)
+        .sum();
+    let (db, dnobs) = (up(&stream, &b), up(&stream, &nobs));
+    let mut out = up(&stream, &[7.0f32]);
+    k.background_photons(&ctx, &db, &dnobs, &mut out).unwrap();
+    let got = out.to_host_vec(&stream).unwrap()[0] as f64;
+    assert!((got - want).abs() < 1e-6 * want, "{got} vs {want}");
+    let short = up(&stream, &nobs[..n - 1]);
+    assert!(k.background_photons(&ctx, &db, &short, &mut out).is_err());
 }
