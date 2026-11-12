@@ -27,8 +27,8 @@ use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{Context, DeviceBuffer, Stream};
 use ptyrs_core::{AddrTable, View};
 use ptyrs_gpu::{
-    C32, Exit, FusedBufs, FusedInputs, FusedSums, Kernels, LlkPartial, LlkSums, StackTable,
-    UpdateSums, ViewAddr, ViewDims, Views, view_tiles,
+    C32, Exit, FarSums, FusedBufs, FusedInputs, FusedSums, Kernels, LlkPartial, LlkSums, Model,
+    StackTable, UpdateSums, ViewAddr, ViewDims, Views, view_tiles,
 };
 
 use crate::exchange::{self, Pull, Run, Runs};
@@ -839,6 +839,7 @@ impl State {
             counts,
             obj,
             probe,
+            model: Model::default(),
         };
         for (s, st) in rp.stacks.iter().enumerate() {
             if s == rp.interior {
@@ -853,8 +854,13 @@ impl State {
             let sums = FusedSums {
                 obj: obj_sums.as_mut(),
                 probe: mine.and_then(|_| leaf_sums.get_mut(st.leaf - r * plan.k)),
+                ..Default::default()
             };
-            k.fused_project(&ctx, &inputs, at, Exit::Ap { llk }, bufs, sums)?;
+            let far = FarSums {
+                llk,
+                ..Default::default()
+            };
+            k.fused_project(&ctx, &inputs, at, Exit::Ap { far }, bufs, sums)?;
         }
         if let Some(t) = tree.as_ref() {
             for a in &t.own {
@@ -1332,16 +1338,20 @@ mod tests {
                 counts: &counts,
                 obj: &obj,
                 probe: &probe,
+                model: Model::default(),
             };
             let mut out = vec![None; pick.len()];
             for (s, r) in stacks.iter().enumerate() {
                 let ec = ExecutionContext::new(stream.clone());
                 let exit = Exit::Ap {
-                    llk: Some(&mut llk),
+                    far: FarSums {
+                        llk: Some(&mut llk),
+                        ..Default::default()
+                    },
                 };
                 let sums = FusedSums {
                     obj: Some(&mut sums),
-                    probe: None,
+                    ..Default::default()
                 };
                 k.fused_project(&ec, &inputs, table.at(s), exit, &mut bufs, sums)
                     .unwrap();
