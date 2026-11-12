@@ -216,6 +216,40 @@ pub struct ScalePartial {
 // SAFETY: repr(C) of three f32, no padding; every bit pattern is a valid value.
 unsafe impl cuda_core::DeviceCopy for ScalePartial {}
 
+/// A sum along the two position axes of a frame, or of a block's share of one: the position
+/// gradient or its normalising denominator.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PositionPartial {
+    pub dy: f32,
+    pub dx: f32,
+}
+
+// SAFETY: repr(C) of two f32, no padding; every bit pattern is a valid value.
+unsafe impl cuda_core::DeviceCopy for PositionPartial {}
+
+/// FFT-order frequency of bin `k` of `n` in cycles per pixel, `fftfreq`: `k / n` below
+/// `n / 2`, else `(k - n) / n`.
+#[device]
+pub fn freq(k: u32, n: u32) -> f32 {
+    let k = if k < n / 2 {
+        k as f32
+    } else {
+        k as f32 - n as f32
+    };
+    k / n as f32
+}
+
+/// `exp(-2 pi i d freq(k, n))` as `(cos, sin)`: bin `k`'s factor of a shift by `d` pixels.
+/// The phase is reduced to half a turn before the sine and cosine.
+#[device]
+pub fn ramp(d: f32, k: u32, n: u32) -> (f32, f32) {
+    let mut t = d * freq(k, n);
+    t -= (t + 0.5).floor();
+    let a = -2.0 * core::f32::consts::PI * t;
+    (a.cos(), a.sin())
+}
+
 /// Adds an unmasked pixel of count `obs` and calculated intensity `calc >= 0` to `acc`:
 /// Poisson `calc` if `obs <= 0.1` else `calc - obs + obs ln(obs / calc)`, Gaussian
 /// `(obs - calc)^2 / (obs + 1)`, Euclidean `4 (sqrt obs - sqrt calc)^2`, and `calc`.

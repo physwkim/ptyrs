@@ -1201,6 +1201,430 @@ pub mod kernels {
         unsafe { crate::fused::probe_terms(p, g) }
     }
 
+    /// [`crate::fused::shift_pre`] for 64-point columns.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::shift_pre`].
+    #[kernel]
+    #[launch_bounds(crate::fused::FUSED_COL_THREADS)]
+    pub unsafe fn fused_shift_pre_64(
+        p: FusedPtrs,
+        ctl: *const StackCtl,
+        g: StackGeom,
+        cfg: FusedCfg,
+    ) {
+        unsafe { crate::fused::shift_pre::<64>(p, ctl, g, cfg) }
+    }
+    /// [`crate::fused::shift_pre`] for 128-point columns.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::shift_pre`].
+    #[kernel]
+    #[launch_bounds(crate::fused::FUSED_COL_THREADS)]
+    pub unsafe fn fused_shift_pre_128(
+        p: FusedPtrs,
+        ctl: *const StackCtl,
+        g: StackGeom,
+        cfg: FusedCfg,
+    ) {
+        unsafe { crate::fused::shift_pre::<128>(p, ctl, g, cfg) }
+    }
+    /// [`crate::fused::shift_pre`] for 256-point columns.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::shift_pre`].
+    #[kernel]
+    #[launch_bounds(crate::fused::FUSED_COL_THREADS)]
+    pub unsafe fn fused_shift_pre_256(
+        p: FusedPtrs,
+        ctl: *const StackCtl,
+        g: StackGeom,
+        cfg: FusedCfg,
+    ) {
+        unsafe { crate::fused::shift_pre::<256>(p, ctl, g, cfg) }
+    }
+    /// [`crate::fused::shift_pre`] for 512-point columns.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::shift_pre`].
+    #[kernel]
+    #[launch_bounds(crate::fused::FUSED_COL_THREADS)]
+    pub unsafe fn fused_shift_pre_512(
+        p: FusedPtrs,
+        ctl: *const StackCtl,
+        g: StackGeom,
+        cfg: FusedCfg,
+    ) {
+        unsafe { crate::fused::shift_pre::<512>(p, ctl, g, cfg) }
+    }
+    /// [`crate::fused::shift_rows_fwd`] for 64-point rows.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::shift_rows_fwd`].
+    #[kernel]
+    pub unsafe fn fused_shift_rows_fwd_64(
+        p: FusedPtrs,
+        ctl: *const StackCtl,
+        g: StackGeom,
+        cfg: FusedCfg,
+    ) {
+        unsafe { crate::fused::shift_rows_fwd::<64>(p, ctl, g, cfg) }
+    }
+    /// [`crate::fused::shift_rows_fwd`] for 128-point rows.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::shift_rows_fwd`].
+    #[kernel]
+    pub unsafe fn fused_shift_rows_fwd_128(
+        p: FusedPtrs,
+        ctl: *const StackCtl,
+        g: StackGeom,
+        cfg: FusedCfg,
+    ) {
+        unsafe { crate::fused::shift_rows_fwd::<128>(p, ctl, g, cfg) }
+    }
+    /// [`crate::fused::shift_rows_fwd`] for 256-point rows.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::shift_rows_fwd`].
+    #[kernel]
+    pub unsafe fn fused_shift_rows_fwd_256(
+        p: FusedPtrs,
+        ctl: *const StackCtl,
+        g: StackGeom,
+        cfg: FusedCfg,
+    ) {
+        unsafe { crate::fused::shift_rows_fwd::<256>(p, ctl, g, cfg) }
+    }
+    /// [`crate::fused::shift_rows_fwd`] for 512-point rows.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::shift_rows_fwd`].
+    #[kernel]
+    pub unsafe fn fused_shift_rows_fwd_512(
+        p: FusedPtrs,
+        ctl: *const StackCtl,
+        g: StackGeom,
+        cfg: FusedCfg,
+    ) {
+        unsafe { crate::fused::shift_rows_fwd::<512>(p, ctl, g, cfg) }
+    }
+    /// [`crate::fused::shift_rows_inv`] for 64-point rows.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::shift_rows_inv`].
+    #[kernel]
+    pub unsafe fn fused_shift_rows_inv_64(
+        p: FusedPtrs,
+        ctl: *const StackCtl,
+        g: StackGeom,
+        cfg: FusedCfg,
+    ) {
+        unsafe { crate::fused::shift_rows_inv::<64>(p, ctl, g, cfg) }
+    }
+    /// [`crate::fused::shift_rows_inv`] for 128-point rows.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::shift_rows_inv`].
+    #[kernel]
+    pub unsafe fn fused_shift_rows_inv_128(
+        p: FusedPtrs,
+        ctl: *const StackCtl,
+        g: StackGeom,
+        cfg: FusedCfg,
+    ) {
+        unsafe { crate::fused::shift_rows_inv::<128>(p, ctl, g, cfg) }
+    }
+    /// [`crate::fused::shift_rows_inv`] for 256-point rows.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::shift_rows_inv`].
+    #[kernel]
+    pub unsafe fn fused_shift_rows_inv_256(
+        p: FusedPtrs,
+        ctl: *const StackCtl,
+        g: StackGeom,
+        cfg: FusedCfg,
+    ) {
+        unsafe { crate::fused::shift_rows_inv::<256>(p, ctl, g, cfg) }
+    }
+    /// [`crate::fused::shift_rows_inv`] for 512-point rows.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::shift_rows_inv`].
+    #[kernel]
+    pub unsafe fn fused_shift_rows_inv_512(
+        p: FusedPtrs,
+        ctl: *const StackCtl,
+        g: StackGeom,
+        cfg: FusedCfg,
+    ) {
+        unsafe { crate::fused::shift_rows_inv::<512>(p, ctl, g, cfg) }
+    }
+    /// [`crate::fused::shift_post`] for 64-point columns.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::shift_post`].
+    #[kernel]
+    #[launch_bounds(crate::fused::FUSED_COL_THREADS)]
+    pub unsafe fn fused_shift_post_64(
+        p: FusedPtrs,
+        ctl: *const StackCtl,
+        g: StackGeom,
+        cfg: FusedCfg,
+    ) {
+        unsafe { crate::fused::shift_post::<64>(p, ctl, g, cfg) }
+    }
+    /// [`crate::fused::shift_post`] for 128-point columns.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::shift_post`].
+    #[kernel]
+    #[launch_bounds(crate::fused::FUSED_COL_THREADS)]
+    pub unsafe fn fused_shift_post_128(
+        p: FusedPtrs,
+        ctl: *const StackCtl,
+        g: StackGeom,
+        cfg: FusedCfg,
+    ) {
+        unsafe { crate::fused::shift_post::<128>(p, ctl, g, cfg) }
+    }
+    /// [`crate::fused::shift_post`] for 256-point columns.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::shift_post`].
+    #[kernel]
+    #[launch_bounds(crate::fused::FUSED_COL_THREADS)]
+    pub unsafe fn fused_shift_post_256(
+        p: FusedPtrs,
+        ctl: *const StackCtl,
+        g: StackGeom,
+        cfg: FusedCfg,
+    ) {
+        unsafe { crate::fused::shift_post::<256>(p, ctl, g, cfg) }
+    }
+    /// [`crate::fused::shift_post`] for 512-point columns.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::shift_post`].
+    #[kernel]
+    #[launch_bounds(crate::fused::FUSED_COL_THREADS)]
+    pub unsafe fn fused_shift_post_512(
+        p: FusedPtrs,
+        ctl: *const StackCtl,
+        g: StackGeom,
+        cfg: FusedCfg,
+    ) {
+        unsafe { crate::fused::shift_post::<512>(p, ctl, g, cfg) }
+    }
+    /// [`crate::fused::spectrum_rows`] for 64-point rows.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::spectrum_rows`].
+    #[kernel]
+    pub unsafe fn fused_spectrum_rows_64(
+        probe: *const f32,
+        spectrum: *mut f32,
+        ny: u32,
+        quad: f32,
+    ) {
+        unsafe { crate::fused::spectrum_rows::<64>(probe, spectrum, ny, quad) }
+    }
+    /// [`crate::fused::spectrum_rows`] for 128-point rows.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::spectrum_rows`].
+    #[kernel]
+    pub unsafe fn fused_spectrum_rows_128(
+        probe: *const f32,
+        spectrum: *mut f32,
+        ny: u32,
+        quad: f32,
+    ) {
+        unsafe { crate::fused::spectrum_rows::<128>(probe, spectrum, ny, quad) }
+    }
+    /// [`crate::fused::spectrum_rows`] for 256-point rows.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::spectrum_rows`].
+    #[kernel]
+    pub unsafe fn fused_spectrum_rows_256(
+        probe: *const f32,
+        spectrum: *mut f32,
+        ny: u32,
+        quad: f32,
+    ) {
+        unsafe { crate::fused::spectrum_rows::<256>(probe, spectrum, ny, quad) }
+    }
+    /// [`crate::fused::spectrum_rows`] for 512-point rows.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::spectrum_rows`].
+    #[kernel]
+    pub unsafe fn fused_spectrum_rows_512(
+        probe: *const f32,
+        spectrum: *mut f32,
+        ny: u32,
+        quad: f32,
+    ) {
+        unsafe { crate::fused::spectrum_rows::<512>(probe, spectrum, ny, quad) }
+    }
+    /// [`crate::fused::shift_cols`] for 64-point columns.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::shift_cols`].
+    #[kernel]
+    pub unsafe fn fused_shift_cols_64(buf: *mut f32, nx: u32, inverse: u32, scale: f32) {
+        unsafe { crate::fused::shift_cols::<64>(buf, nx, inverse, scale) }
+    }
+    /// [`crate::fused::shift_cols`] for 128-point columns.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::shift_cols`].
+    #[kernel]
+    pub unsafe fn fused_shift_cols_128(buf: *mut f32, nx: u32, inverse: u32, scale: f32) {
+        unsafe { crate::fused::shift_cols::<128>(buf, nx, inverse, scale) }
+    }
+    /// [`crate::fused::shift_cols`] for 256-point columns.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::shift_cols`].
+    #[kernel]
+    pub unsafe fn fused_shift_cols_256(buf: *mut f32, nx: u32, inverse: u32, scale: f32) {
+        unsafe { crate::fused::shift_cols::<256>(buf, nx, inverse, scale) }
+    }
+    /// [`crate::fused::shift_cols`] for 512-point columns.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::shift_cols`].
+    #[kernel]
+    pub unsafe fn fused_shift_cols_512(buf: *mut f32, nx: u32, inverse: u32, scale: f32) {
+        unsafe { crate::fused::shift_cols::<512>(buf, nx, inverse, scale) }
+    }
+    /// [`crate::fused::shift_probe_rows`] for 64-point rows.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::shift_probe_rows`].
+    #[kernel]
+    pub unsafe fn fused_shift_probe_rows_64(sums: SumPtrs, out: SumPtrs, ny: u32, quad: f32) {
+        unsafe { crate::fused::shift_probe_rows::<64>(sums, out, ny, quad) }
+    }
+    /// [`crate::fused::shift_probe_rows`] for 128-point rows.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::shift_probe_rows`].
+    #[kernel]
+    pub unsafe fn fused_shift_probe_rows_128(sums: SumPtrs, out: SumPtrs, ny: u32, quad: f32) {
+        unsafe { crate::fused::shift_probe_rows::<128>(sums, out, ny, quad) }
+    }
+    /// [`crate::fused::shift_probe_rows`] for 256-point rows.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::shift_probe_rows`].
+    #[kernel]
+    pub unsafe fn fused_shift_probe_rows_256(sums: SumPtrs, out: SumPtrs, ny: u32, quad: f32) {
+        unsafe { crate::fused::shift_probe_rows::<256>(sums, out, ny, quad) }
+    }
+    /// [`crate::fused::shift_probe_rows`] for 512-point rows.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::shift_probe_rows`].
+    #[kernel]
+    pub unsafe fn fused_shift_probe_rows_512(sums: SumPtrs, out: SumPtrs, ny: u32, quad: f32) {
+        unsafe { crate::fused::shift_probe_rows::<512>(sums, out, ny, quad) }
+    }
+    /// [`crate::fused::gather_shifted`].
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::gather_shifted`].
+    #[kernel]
+    pub unsafe fn fused_gather_shifted(
+        p: FusedPtrs,
+        tiles: TilePtrs,
+        sums: SumPtrs,
+        ctl: *const StackCtl,
+        g: StackGeom,
+        cfg: FusedCfg,
+    ) {
+        static mut SHARED: SharedArray<u32, STACK_TILE_SHARED> = SharedArray::UNINIT;
+        let shared = (&raw mut SHARED).cast::<u32>();
+        unsafe { crate::fused::gather_shifted(p, tiles, sums, shared, ctl, g, cfg) }
+    }
+
+    /// [`crate::fused::shift_probe_sums`].
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::shift_probe_sums`].
+    #[kernel]
+    pub unsafe fn fused_shift_probe_sums(
+        p: FusedPtrs,
+        sums: SumPtrs,
+        ctl: *const StackCtl,
+        g: StackGeom,
+    ) {
+        unsafe { crate::fused::shift_probe_sums(p, sums, ctl, g) }
+    }
+
+    /// Per-frame position sums from `ngroup` partials per frame: `out[f0 + fl]` is the sum of
+    /// `groups[fl * ngroup .. (fl + 1) * ngroup]` in ascending order, for every frame `fl <
+    /// nf`; no other entry is written. One thread per frame of `nf_max`.
+    ///
+    /// # Safety
+    ///
+    /// `groups` holds `nf_max * ngroup` records, `out` `nframe`, `ctl` one entry.
+    #[kernel]
+    pub unsafe fn position_groups(
+        groups: *const PositionPartial,
+        ngroup: u32,
+        out: *mut PositionPartial,
+        ctl: *const StackCtl,
+        g: StackGeom,
+    ) {
+        let (f0, nf) = unsafe { stack_frames(ctl, g) };
+        let fl = global_index();
+        if fl >= nf as usize {
+            return;
+        }
+        let ngroup = ngroup as usize;
+        let mut s = PositionPartial::default();
+        for j in 0..ngroup {
+            let a = unsafe { *groups.add(fl * ngroup + j) };
+            s.dy += a.dy;
+            s.dx += a.dx;
+        }
+        unsafe { *out.add(f0 as usize + fl) = s };
+    }
+
     // Unnormalized C2C FFT of `nline` strided lines (see `load_line`); forward uses
     // exp(-2 pi i jk / N). `input` may equal `output`: a thread reads all its elements
     // before the FFT's block barrier and writes after it, and lines must not overlap.

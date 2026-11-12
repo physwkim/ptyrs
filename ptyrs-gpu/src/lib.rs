@@ -36,10 +36,12 @@ mod ops;
 
 pub use fused::{
     BackgroundSums, Exit, FUSED_SIDES, FarSums, FusedBufs, FusedInputs, FusedSums, Model,
+    ProbeSpectrum, Shift, ShiftSums, ShiftedProbeSums, SpectrumBuf,
 };
 pub use ops::{
-    LLK_TREE_LEAVES, LlkPartial, LlkScratch, LlkSums, MASKED, OBJ_TILE, Permutation, ScalePartial,
-    StackCtl, StackGeom, StackRef, StackTable, UpdateSums, ViewAddr, ViewDims, Views, view_tiles,
+    LLK_TREE_LEAVES, LlkPartial, LlkScratch, LlkSums, MASKED, OBJ_TILE, Permutation,
+    PositionPartial, ScalePartial, StackCtl, StackGeom, StackRef, StackTable, UpdateSums, ViewAddr,
+    ViewDims, Views, view_tiles,
 };
 pub use ptyrs_fft::C32;
 

@@ -147,6 +147,7 @@ impl Run {
             let sums = FusedSums {
                 obj: Some(&mut self.obj_sums),
                 probe: Some(&mut self.probe_sums),
+                ..Default::default()
             };
             k.fused_project(ctx, &inputs, stack, exit, &mut self.bufs, sums)?;
         }
@@ -211,6 +212,7 @@ impl Run {
             let sums = FusedSums {
                 obj: Some(&mut self.obj_sums),
                 probe: None,
+                ..Default::default()
             };
             k.fused_project(ctx, &inputs, self.table.at(s), exit, &mut self.bufs, sums)?;
         }

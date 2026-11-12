@@ -58,7 +58,7 @@ use ptyrs_kernels::pixel::{
     axis_tiles, axis_tiles_max,
 };
 pub use ptyrs_kernels::pixel::{
-    LlkPartial, MASKED, OBJ_TILE, ScalePartial, StackCtl, StackGeom, ViewAddr,
+    LlkPartial, MASKED, OBJ_TILE, PositionPartial, ScalePartial, StackCtl, StackGeom, ViewAddr,
 };
 
 use crate::{C32, Error, Kernels, check_len, dptr};
