@@ -20,6 +20,8 @@ pub enum NnError {
     Burn(String),
     #[error("invalid input: {0}")]
     Invalid(String),
+    #[error("object loss: {0}")]
+    Loss(dip::LossError),
 }
 
 pub(crate) fn burn_err(e: impl std::fmt::Debug) -> NnError {

@@ -4,8 +4,8 @@
 //! With `g` the gradient of the reconstruction loss `L` with respect to the object at the
 //! network's current output, held constant, the weight gradient of `⟨O(θ), g⟩` is exactly
 //! `∂L/∂θ`; burn needs no complex numbers or FFTs. `O(θ)` is formed from the amplitude and phase
-//! outputs inside the graph, so the engine sends its own object gradient and the polar chain
-//! rule is autodiff's.
+//! outputs inside the graph, so the engine, behind [`ObjectLoss`], sends its own object gradient
+//! and the polar chain rule is autodiff's.
 
 use std::f64::consts::PI;
 
@@ -96,6 +96,18 @@ impl DipNet {
     }
 }
 
+/// Whatever an [`ObjectLoss`] fails with.
+pub type LossError = Box<dyn std::error::Error + Send + Sync>;
+
+/// The reconstruction loss `L(O)` that trains a [`Dip`]: the engine's, or a stand-in.
+pub trait ObjectLoss {
+    /// `L` at `object` and its gradient `[∂L/∂Re O, ∂L/∂Im O]`, twice the Wirtinger gradient
+    /// `∂L/∂O*`. Both tensors are `[ny, nx, 2]` with real and imaginary parts interleaved, the
+    /// engine's complex f32 layout that [`crate::interop`] moves; the gradient takes `object`'s
+    /// device and dtype.
+    fn gradient(&mut self, object: &Tensor<3>) -> Result<(f64, Tensor<3>), LossError>;
+}
+
 /// A DIP network, its fixed input code and its Adam state.
 pub struct Dip {
     shape: [usize; 2],
@@ -131,9 +143,21 @@ impl Dip {
         })
     }
 
-    /// The network's current object, amplitude in `(0, 2)` and phase in `(-π, π)`. Hand it back
-    /// to [`Dip::step`] with the loss gradient at it.
-    pub fn object(&self) -> DipObject {
+    /// The network's current object, `[ny, nx, 2]` as [`ObjectLoss`] takes it: amplitude in
+    /// `(0, 2)`, phase in `(-π, π)`.
+    pub fn object(&self) -> Tensor<3> {
+        self.forward().inner()
+    }
+
+    /// One Adam step of size `lr` down `loss`, which is returned at the object before the step.
+    pub fn step(&mut self, loss: &mut impl ObjectLoss, lr: f64) -> Result<f64, NnError> {
+        let (value, grads) = self.weight_grads(loss)?;
+        self.net = self.optim.step(lr, self.net.clone(), grads);
+        Ok(value)
+    }
+
+    /// The object in the weights' autodiff graph.
+    fn forward(&self) -> Tensor<3> {
         let [ny, nx] = self.shape;
         let raw = self.net.forward(self.code.clone());
         // 2·sigmoid(x), as 1 + tanh(x/2): burn's sigmoid computes in f32 whatever the dtype.
@@ -144,46 +168,32 @@ impl Dip {
                 * 0.5,
         ) + 1.0;
         let phase = tanh(raw.slice([0..1, 1..2, 0..ny, 0..nx]).reshape([ny, nx])) * PI;
-        DipObject {
-            object: Tensor::stack(
-                vec![amp.clone() * phase.clone().cos(), amp * phase.sin()],
-                2,
-            ),
-        }
+        Tensor::stack(
+            vec![amp.clone() * phase.clone().cos(), amp * phase.sin()],
+            2,
+        )
     }
 
-    /// One Adam step of size `lr`. `g` is the gradient of the reconstruction loss with respect
-    /// to the real and imaginary parts of `object`, laid out as [`DipObject::interleaved`]; from
-    /// a Wirtinger gradient `∂L/∂O*` it is twice that.
-    pub fn step(&mut self, object: DipObject, g: &Tensor<3>, lr: f64) -> Result<(), NnError> {
-        let grads = self.weight_grads(object, g)?;
-        self.net = self.optim.step(lr, self.net.clone(), grads);
-        Ok(())
-    }
-
-    fn weight_grads(&self, object: DipObject, g: &Tensor<3>) -> Result<GradientsParams, NnError> {
-        let [ny, nx] = self.shape;
-        if g.dims() != [ny, nx, 2] {
+    /// `loss` at the current object and its weight gradient, that of `⟨O(θ), g⟩`.
+    fn weight_grads(&self, loss: &mut impl ObjectLoss) -> Result<(f64, GradientsParams), NnError> {
+        let object = self.forward();
+        let (value, g) = loss
+            .gradient(&object.clone().inner())
+            .map_err(NnError::Loss)?;
+        if g.dims() != object.dims() || g.dtype() != object.dtype() {
             return Err(NnError::Invalid(format!(
-                "gradient {:?} for object [{ny}, {nx}, 2]",
-                g.dims()
+                "gradient {:?} {:?} for object {:?} {:?}",
+                g.dims(),
+                g.dtype(),
+                object.dims(),
+                object.dtype()
             )));
         }
-        let surrogate = (object.object * g.clone().inner()).sum();
-        Ok(GradientsParams::from_grads(surrogate.backward(), &self.net))
-    }
-}
-
-/// An object [`Dip`] produced, still tied to the weights that made it.
-pub struct DipObject {
-    object: Tensor<3>,
-}
-
-impl DipObject {
-    /// Real and imaginary parts interleaved, `[ny, nx, 2]`: the engine's complex f32 layout, to
-    /// hand over with [`crate::interop::lend`].
-    pub fn interleaved(&self) -> Tensor<3> {
-        self.object.clone().inner()
+        let surrogate = (object * g.inner()).sum();
+        Ok((
+            value,
+            GradientsParams::from_grads(surrogate.backward(), &self.net),
+        ))
     }
 }
 
@@ -196,6 +206,7 @@ mod tests {
 
     /// Stand-in for the engine: a loss on the complex object with a closed-form gradient,
     /// `F(O) = Σ w(|O|² − t)² + a·Re O + b·Im O`, nonlinear in `O` like an intensity fit.
+    #[derive(Clone)]
     struct StandIn {
         w: Vec<f64>,
         t: Vec<f64>,
@@ -238,6 +249,42 @@ mod tests {
                 })
                 .collect()
         }
+    }
+
+    impl ObjectLoss for StandIn {
+        fn gradient(&mut self, object: &Tensor<3>) -> Result<(f64, Tensor<3>), LossError> {
+            let o = host64(object.clone());
+            Ok((self.loss(&o), like(object, self.grad(&o))))
+        }
+    }
+
+    /// `F(O) = ½|O − T|²`, gradient `O − T`.
+    struct Fit(Vec<f64>);
+
+    impl ObjectLoss for Fit {
+        fn gradient(&mut self, object: &Tensor<3>) -> Result<(f64, Tensor<3>), LossError> {
+            let o = host64(object.clone());
+            let d: Vec<f64> = o.iter().zip(&self.0).map(|(o, t)| o - t).collect();
+            let value = 0.5 * d.iter().map(|d| d * d).sum::<f64>();
+            Ok((value, like(object, d)))
+        }
+    }
+
+    /// A gradient with the object's axes swapped.
+    struct Transposed;
+
+    impl ObjectLoss for Transposed {
+        fn gradient(&mut self, object: &Tensor<3>) -> Result<(f64, Tensor<3>), LossError> {
+            Ok((0.0, object.clone().swap_dims(0, 1)))
+        }
+    }
+
+    /// `values` as a tensor of `object`'s shape, device and dtype.
+    fn like(object: &Tensor<3>, values: Vec<f64>) -> Tensor<3> {
+        Tensor::from_data(
+            TensorData::new(values, object.shape()),
+            (&object.device(), object.dtype()),
+        )
     }
 
     /// Each float parameter's gradient (`None` without one), in visiting order.
@@ -294,7 +341,20 @@ mod tests {
             .unwrap()
     }
 
-    fn loss_at(dip: &Dip, f: &StandIn, target: usize, step: Vec<f64>) -> f64 {
+    /// `dip` with every float tensor in f64.
+    fn dip64(config: &DipConfig, device: &Device) -> Dip {
+        let mut dip = Dip::new(config, device).unwrap();
+        dip.net = dip.net.map(&mut ToF64);
+        dip.code = dip.code.cast(DType::F64);
+        dip
+    }
+
+    fn loss_at(
+        dip: &Dip,
+        value: &mut impl FnMut(&[f64]) -> f64,
+        target: usize,
+        step: Vec<f64>,
+    ) -> f64 {
         let mut shift = Shift {
             target,
             step,
@@ -307,31 +367,18 @@ mod tests {
             code: dip.code.clone(),
             optim: AdamConfig::new().init(),
         };
-        f.loss(&host64(shifted.object().interleaved()))
+        value(&host64(shifted.object()))
     }
 
-    #[test]
-    fn weight_gradients_match_finite_differences() {
-        let device = Device::cuda(0);
-        device.seed(5);
-        let shape = [20, 28];
-        let config = DipConfig::new(shape)
-            .with_width(4)
-            .with_depth(2)
-            .with_code(3);
-        // In f64: along a weight direction the loss's slope changes on a 1e-3 scale, below which
-        // f32 differences are noise.
-        let mut dip = Dip::new(&config, &device).unwrap();
-        dip.net = dip.net.map(&mut ToF64);
-        dip.code = dip.code.cast(DType::F64);
-        let f = StandIn::new(shape[0] * shape[1], 1);
-        let object = dip.object();
-        let o = host64(object.interleaved());
-        let g = Tensor::from_data(
-            TensorData::new(f.grad(&o), [shape[0], shape[1], 2]),
-            (&device, DType::F64),
-        );
-        let grads = dip.weight_grads(object, &g).unwrap();
+    /// Checks the weight gradient `dip` takes from `loss` against central differences of
+    /// `value`, the same loss on the host object, along a random direction in each parameter
+    /// tensor. Returns the number of tensors checked.
+    fn check_weight_grads(
+        dip: &Dip,
+        loss: &mut impl ObjectLoss,
+        mut value: impl FnMut(&[f64]) -> f64,
+    ) -> usize {
+        let (_, grads) = dip.weight_grads(loss).unwrap();
         let mut collect = Collect {
             grads: &grads,
             out: Vec::new(),
@@ -348,7 +395,8 @@ mod tests {
             let ad: f64 = grad.iter().zip(&d).map(|(g, v)| g * v / norm).sum();
             let h = 1e-5;
             let step = |s: f64| d.iter().map(|v| s * h * v / norm).collect();
-            let fd = (loss_at(&dip, &f, target, step(1.0)) - loss_at(&dip, &f, target, step(-1.0)))
+            let fd = (loss_at(dip, &mut value, target, step(1.0))
+                - loss_at(dip, &mut value, target, step(-1.0)))
                 / (2.0 * h);
             assert!(
                 (fd - ad).abs() < 1e-6 * (1.0 + ad.abs()),
@@ -356,8 +404,24 @@ mod tests {
             );
             checked += 1;
         }
+        checked
+    }
+
+    #[test]
+    fn weight_gradients_match_finite_differences() {
+        let device = Device::cuda(0);
+        device.seed(5);
+        let shape = [20, 28];
+        let config = DipConfig::new(shape)
+            .with_width(4)
+            .with_depth(2)
+            .with_code(3);
+        // In f64: along a weight direction the loss's slope changes on a 1e-3 scale, below which
+        // f32 differences are noise.
+        let dip = dip64(&config, &device);
+        let f = StandIn::new(shape[0] * shape[1], 1);
         // Weight and bias of 11 convolutions, scale and shift of 10 batch norms.
-        assert_eq!(checked, 42);
+        assert_eq!(check_weight_grads(&dip, &mut f.clone(), |o| f.loss(o)), 42);
     }
 
     #[test]
@@ -367,34 +431,21 @@ mod tests {
         let shape = [24, 40];
         let config = DipConfig::new(shape).with_width(8).with_depth(2);
         let mut dip = Dip::new(&config, &device).unwrap();
-        let target: Vec<f64> = crate::data::random_object(shape, 3)
+        let mut fit = Fit(crate::data::random_object(shape, 3)
             .as_slice()
             .iter()
             .flat_map(|z| [z.re, z.im])
-            .collect();
-        // F(O) = ½|O − T|², gradient O − T.
-        let fit = |dip: &mut Dip, lr: f64| -> f64 {
-            let object = dip.object();
-            let o = host64(object.interleaved());
-            let g: Vec<f32> = o.iter().zip(&target).map(|(o, t)| (o - t) as f32).collect();
-            let g = Tensor::from_data(TensorData::new(g, [shape[0], shape[1], 2]), &device);
-            if lr > 0.0 {
-                dip.step(object, &g, lr).unwrap();
-            }
-            0.5 * o
-                .iter()
-                .zip(&target)
-                .map(|(o, t)| (o - t).powi(2))
-                .sum::<f64>()
-        };
-        let start = fit(&mut dip, 0.0);
-        for _ in 0..100 {
-            fit(&mut dip, 1e-2);
+            .collect());
+        let start = dip.step(&mut fit, 1e-2).unwrap();
+        for _ in 0..99 {
+            dip.step(&mut fit, 1e-2).unwrap();
         }
-        let end = fit(&mut dip, 0.0);
+        let (end, _) = fit.gradient(&dip.object()).unwrap();
         assert!(end < 0.1 * start, "loss {start} -> {end}");
 
-        let wrong = Tensor::<3>::zeros([shape[1], shape[0], 2], &device);
-        assert!(dip.step(dip.object(), &wrong, 1e-2).is_err());
+        assert!(matches!(
+            dip.step(&mut Transposed, 1e-2),
+            Err(NnError::Invalid(_))
+        ));
     }
 }
