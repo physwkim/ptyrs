@@ -16,6 +16,7 @@ use ptyrs_gpu::{
     C32, Ended, Error as GpuError, FusedBufs, Kernels, LlkPartial, LlkRing, LlkSums, RingDevice,
     RpieKernels, StackTable, UpdateSums, ViewAddr, ViewDims, Views,
 };
+use ptyrs_tile::TileProbeUpdate;
 
 use super::{Epoch, Frames, GpuOptions, Tag, plane_len, plans, stack_buf_len, stacks, to_u32};
 use crate::{ApParams, DmParams, EngineError, RpieParams};
@@ -25,6 +26,8 @@ pub(super) struct Device {
     stream: Arc<CudaStream>,
     kernels: Kernels,
     rpie: RpieKernels,
+    /// With [`GpuOptions::tile_probe_update`], the Tile probe update.
+    tile: Option<TileProbeUpdate>,
     views: Views,
     counts: DeviceBuffer<u16>,
     obj: DeviceBuffer<C32>,
@@ -191,6 +194,7 @@ struct StackBufs {
 pub(super) struct Bufs<'a> {
     pub kernels: &'a Kernels,
     pub rpie: &'a RpieKernels,
+    pub tile: Option<&'a TileProbeUpdate>,
     pub views: &'a Views,
     pub counts: &'a DeviceBuffer<u16>,
     pub obj: &'a mut DeviceBuffer<C32>,
@@ -255,6 +259,10 @@ impl Device {
         let kernels = Kernels::load(ctx)?;
         let rpie = RpieKernels::load(&kernels)?;
         let views = Views::new(&stream, dims, addrs)?;
+        let tile = options
+            .tile_probe_update
+            .then(|| TileProbeUpdate::new(&stream, &views))
+            .transpose()?;
         let (frames, table, lens) =
             stacks(&stream, &dims, to_u32("stack_size", options.stack_size)?)?;
         let len = stack_buf_len(&dims, &table);
@@ -292,6 +300,7 @@ impl Device {
             probe_sums: UpdateSums::zeroed(&stream, probe.len())?,
             kernels,
             rpie,
+            tile,
             views,
             table,
             stacks,
@@ -343,6 +352,7 @@ impl Device {
         let bufs = Bufs {
             kernels: &self.kernels,
             rpie: &self.rpie,
+            tile: self.tile.as_ref(),
             views: &self.views,
             counts: &self.counts,
             obj: &mut self.obj,

@@ -59,6 +59,10 @@ pub struct GpuOptions {
     /// fails on others) instead of M1's launch sequence. The two agree to rounding, not bit
     /// for bit.
     pub fused: bool,
+    /// Run the probe update from its sums (PyNX `ProbeNorm`) by `ptyrs-tile`'s Tile kernels
+    /// ([`ptyrs_tile::TileProbeUpdate`], compiled in [`GpuPtycho::new`]) instead of the SIMT
+    /// ones; both give the same bits.
+    pub tile_probe_update: bool,
 }
 
 impl Default for GpuOptions {
@@ -68,6 +72,7 @@ impl Default for GpuOptions {
             graph: true,
             llk_slots: 8,
             fused: true,
+            tile_probe_update: true,
         }
     }
 }
@@ -503,14 +508,14 @@ impl Bufs<'_> {
                 inertia as f32,
             )?;
         }
-        if let Some(inertia) = probe {
-            self.kernels.update_from_sums(
-                ctx,
-                self.probe,
-                self.probe_sums,
-                self.probe_len,
-                inertia as f32,
-            )?;
+        if let Some(inertia) = probe.map(|i| i as f32) {
+            let (p, sums) = (&mut *self.probe, &mut *self.probe_sums);
+            match self.tile {
+                Some(t) => t.update_probe_from_sums(ctx, p, sums, inertia)?,
+                None => self
+                    .kernels
+                    .update_from_sums(ctx, p, sums, self.probe_len, inertia)?,
+            }
         }
         Ok(())
     }
