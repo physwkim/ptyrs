@@ -950,18 +950,19 @@ pub mod kernels {
         sums: SumPtrs,
         ctl: *const StackCtl,
         g: StackGeom,
+        cfg: FusedCfg,
     ) {
-        unsafe { crate::fused::gather(p, tiles, sums, ctl, g) }
+        unsafe { crate::fused::gather(p, tiles, sums, ctl, g, cfg) }
     }
 
-    /// [`crate::fused::probe_power`].
+    /// [`crate::fused::probe_terms`].
     ///
     /// # Safety
     ///
-    /// As [`crate::fused::probe_power`].
+    /// As [`crate::fused::probe_terms`].
     #[kernel]
-    pub unsafe fn fused_probe_power(probe: *const f32, pp: *mut f32, nprobe: u32, n: u32) {
-        unsafe { crate::fused::probe_power(probe, pp, nprobe, n) }
+    pub unsafe fn fused_probe_terms(p: FusedPtrs, g: StackGeom) {
+        unsafe { crate::fused::probe_terms(p, g) }
     }
 
     // Unnormalized C2C FFT of `nline` strided lines (see `load_line`); forward uses
