@@ -1,8 +1,9 @@
 //! pty-chi's orthogonal probe relaxation (OPR, Odstrčil et al. 2016) of probe mode 0 as CPU f64
 //! operators over the arrays and layout of [`crate::engine::ops`]: with `k` eigenmodes `U_i`, frame `f`
-//! sees `P_f0 = P_0 + Σ_i w_fi·U_i` and `P_fm = P_m` for `m ≥ 1`. The main mode's weight is
-//! held at 1 (pty-chi `optimize_intensity_variation` off): a frame's intensity is its `s_f`
-//! over every mode, not part of the variation.
+//! sees `P_f0 = c_f·P_0 + Σ_i w_fi·U_i` and `P_fm = P_m` for `m ≥ 1`. The main mode's weight
+//! `c_f` is 1 unless refined ([`ProbeVariation::with_intensity`], pty-chi
+//! `optimize_intensity_variation`); its `primary_mode_weight_floor`, off by default, is not
+//! modelled.
 //!
 //! [`ProbeVariation::unique`] gives every frame of a batch its own probe planes, so the
 //! operators of [`crate::engine::ops`] and [`crate::engine::LsqmlBatch`] run on per-frame probes unchanged;
@@ -13,13 +14,16 @@ use crate::base::{C64, Object, Probe, Stack, View};
 use crate::engine::ops::{accumulate_probe, obj_probe_to_psi};
 use crate::engine::{Cost, Fft2, Observed};
 
-/// `k` eigenmodes `U_i` of probe mode 0, shaped as probe planes, and their weights for every
-/// frame of the scan; `k = 0` is the shared probe.
+/// `k` eigenmodes `U_i` of probe mode 0, shaped as probe planes, their weights for every
+/// frame of the scan and, when refined, the main mode's weight `c_f` of every frame; `k = 0` is
+/// the shared probe.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProbeVariation {
     eigenmodes: Stack<C64>,
     /// Frame-major: `w_fi` at `f·k + i`.
     weights: Vec<f64>,
+    /// `c_f`, 1 when `None`.
+    intensity: Option<Vec<f64>>,
 }
 
 impl ProbeVariation {
@@ -39,6 +43,23 @@ impl ProbeVariation {
         Self {
             eigenmodes,
             weights,
+            intensity: None,
+        }
+    }
+
+    /// With the main mode's weights refined from `c[f]` at frame `f`. Needs an eigenmode: pty-chi
+    /// weights the main mode only with one.
+    pub fn with_intensity(self, c: Vec<f64>) -> Self {
+        let k = self.eigenmodes.len();
+        assert!(k > 0, "main-mode weights without eigenmodes");
+        assert_eq!(
+            c.len(),
+            self.weights.len() / k,
+            "one main-mode weight per frame"
+        );
+        Self {
+            intensity: Some(c),
+            ..self
         }
     }
 
@@ -59,9 +80,14 @@ impl ProbeVariation {
         &self.weights
     }
 
+    /// `c_f` of every frame when refined.
+    pub fn intensity(&self) -> Option<&[f64]> {
+        self.intensity.as_deref()
+    }
+
     /// `views` (whole frames, in order) with probe plane `b·nprobe + m` for the `b`-th frame of
-    /// `views` and probe mode `m`, and those planes: `P_0 + w_f0·U_0 + w_f1·U_1 + …` in that
-    /// order, then `P_1 ..`.
+    /// `views` and probe mode `m`, and those planes: `c_f·P_0 + w_f0·U_0 + w_f1·U_1 + …` in
+    /// that order, then `P_1 ..`.
     pub fn unique(&self, views: &[View], probe: &Probe) -> (Vec<View>, Probe) {
         assert_eq!(probe.plane_shape(), self.eigenmodes.plane_shape());
         let (np, k) = (probe.len(), self.eigenmodes.len());
@@ -81,7 +107,8 @@ impl ProbeVariation {
         let mut data = Vec::with_capacity(frames.len() * probe.as_slice().len());
         for &f in &frames {
             let start = data.len();
-            data.extend_from_slice(probe.plane(0));
+            let c = self.intensity.as_ref().map_or(1.0, |c| c[f as usize]);
+            data.extend(probe.plane(0).iter().map(|p| c * p));
             for i in 0..k {
                 let w = self.weights[f as usize * k + i];
                 data[start..]
@@ -100,7 +127,8 @@ impl ProbeVariation {
     /// `update_variable_probe.m`, relaxations at their default 1) on the batch `frames`, from
     /// [`accumulate_probe`] of its exit-wave update `chi` over the [`Self::unique`] views:
     /// `d` and `vv`, plane `b·nprobe` holding `d_b = conj(q·V_b)·chi_b0` and `|V_b|²` of its
-    /// `b`-th frame, and `moved`, `d` taken back through the frames' probe moves of
+    /// `b`-th frame, `probe0` the shared probe's mode 0 `P_0`, and `moved`, `d` taken back
+    /// through the frames' probe moves of
     /// [`crate::engine::Features::position`] (`d` itself without). With `B` frames, `N` pixels
     /// per plane and `mnorm(x) = √(mean |x|²)`, from `r_b = m_b − mean m`, `m_b` plane `b·nprobe`
     /// of `moved`, for each eigenmode `i` in order, from its weights on entry:
@@ -110,16 +138,28 @@ impl ProbeVariation {
     /// `w_bi += Σ Re(conj(U″)·d_b) / (Σ |U″|²·vv_b + 0.1·mean_b Σ |U″|²·vv_b)`,
     /// then, before the next eigenmode, `r_b −= (Σ r_b·conj(U″) / Σ |U″|²)·U″`.
     ///
-    /// pty-chi's eigenmode, `U·q/√N`, has mnorm 1. A one-frame batch moves nothing, as in
-    /// pty-chi, where its residues `r` vanish.
+    /// pty-chi's eigenmode, `U·q/√N`, has mnorm 1. A one-frame batch moves no eigenmode or
+    /// `w`, as in pty-chi, where its residues `r` vanish.
+    ///
+    /// Refined main-mode weights take pty-chi's `_calculate_intensity_variation_update_direction`
+    /// and its SGD step, from `d` without the moves, with unit-modulus `q`:
+    /// `c_b += 0.1·Σ Re(conj(P_0)·d_b) / Σ |P_0|²·vv_b`.
     pub(crate) fn step(
         &mut self,
         frames: &[usize],
+        probe0: &[C64],
         moved: &Stack<C64>,
         d: &Stack<C64>,
         vv: &Stack<f64>,
         np: usize,
     ) {
+        if let Some(c) = &mut self.intensity {
+            let pp: Vec<f64> = probe0.iter().map(|p| p.norm_sqr()).collect();
+            for (b, &f) in frames.iter().enumerate() {
+                let den: f64 = pp.iter().zip(vv.plane(b * np)).map(|(p, v)| p * v).sum();
+                c[f] += 0.1 * dot(probe0, d.plane(b * np)) / den;
+            }
+        }
         let (k, count) = (self.eigenmodes.len(), frames.len());
         if k == 0 || count < 2 {
             return;

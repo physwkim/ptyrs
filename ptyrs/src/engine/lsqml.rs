@@ -541,7 +541,7 @@ impl Lsqml {
             }
             self.a_far[f] = a;
         }
-        var.step(&frames, &moved, &d, &vv, np);
+        var.step(&frames, probe.plane(0), &moved, &d, &vv, np);
         for ((o, d), a) in objects.iter_mut().zip(&d_obj).zip(&a_obj) {
             let so = trim_mean(a);
             o.as_mut_slice()
