@@ -31,7 +31,7 @@ use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 use ptyrs_core::{AddrTable, C64, Object, Probe, Scan, Stack};
 use ptyrs_fft::Plan2d;
-use ptyrs_gpu::{C32, Error as GpuError, StackTable, ViewAddr, ViewDims};
+use ptyrs_gpu::{C32, Ended, Error as GpuError, RecordWriter, StackTable, ViewAddr, ViewDims};
 
 use device::{Bufs, Device};
 
@@ -75,11 +75,6 @@ enum Epoch {
 }
 
 impl Epoch {
-    /// Whether the epoch takes an LLK record.
-    fn records_llk(self) -> bool {
-        matches!(self, Self::Ap { llk: true, .. })
-    }
-
     fn algorithm(self) -> Algorithm {
         match self {
             Self::Ap { .. } => Algorithm::Ap,
@@ -388,8 +383,12 @@ impl GpuPtycho {
 
 /// The per-stack steps of every algorithm, on the lent device state.
 impl Bufs<'_> {
-    /// The LLK record of the current estimate, through the scratch stack.
-    fn forward_llk(&mut self, ctx: &ExecutionContext) -> Result<(), GpuError> {
+    /// The LLK record of the current estimate through `rec`, by the scratch stack.
+    fn forward_llk(
+        &mut self,
+        ctx: &ExecutionContext,
+        mut rec: RecordWriter<'_>,
+    ) -> Result<Ended, GpuError> {
         let dims = *self.views.dims();
         for s in 0..self.stacks.len() {
             let stack = self.table.at(s);
@@ -407,24 +406,29 @@ impl Bufs<'_> {
                 .forward_inplace(ctx, self.scratch)?;
             self.kernels
                 .llk(ctx, &dims, stack, self.counts, self.scratch, self.llk)?;
-            self.ring.push(ctx, &dims, stack, self.llk)?;
+            rec.push(ctx, &dims, stack, self.llk)?;
         }
-        self.ring.advance(ctx)
+        rec.end(ctx)
     }
 
     /// Fourier-modulus projection of stack `s`'s exit waves in place: FFT, `apply_amplitude`,
-    /// inverse FFT. With `llk`, the stack's LLK partials of the forward stack go into the
-    /// current record first; the caller ends the record after the last stack.
-    fn project(&mut self, ctx: &ExecutionContext, s: usize, llk: bool) -> Result<(), GpuError> {
+    /// inverse FFT. With `llk`, the stack's LLK partials of the forward stack go into that
+    /// record first.
+    fn project(
+        &mut self,
+        ctx: &ExecutionContext,
+        s: usize,
+        llk: Option<&mut RecordWriter<'_>>,
+    ) -> Result<(), GpuError> {
         let dims = *self.views.dims();
         let stack = self.table.at(s);
         let st = self.stacks.get(s);
         let plan = self.plans.get(st.frames.plan);
         plan.forward_inplace(ctx, st.psi)?;
-        if llk {
+        if let Some(rec) = llk {
             self.kernels
                 .llk(ctx, &dims, stack, self.counts, st.psi, self.llk)?;
-            self.ring.push(ctx, &dims, stack, self.llk)?;
+            rec.push(ctx, &dims, stack, self.llk)?;
         }
         self.kernels
             .apply_amplitude(ctx, &dims, stack, self.counts, st.psi)?;

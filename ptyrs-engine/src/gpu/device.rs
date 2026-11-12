@@ -3,7 +3,8 @@
 //! buffers, and nothing here replaces one after [`Device::new`]: a graph replays on the
 //! buffers the eager cycle would use, and other buffers mean another `Device`, which starts
 //! with no graph. The device also owns the LLK ring and its count of records: a record is
-//! counted only once the cycle or pass that writes it has been enqueued.
+//! counted once per enqueued run of a cycle or pass that ended it, as the [`Ended`] its body
+//! returned shows, eagerly or kept from the capture of its graph.
 
 use std::sync::Arc;
 
@@ -12,7 +13,7 @@ use cuda_async::device_operation::{DeviceOp, ExecutionContext};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 use ptyrs_fft::Plan2d;
 use ptyrs_gpu::{
-    C32, Error as GpuError, Kernels, LlkPartial, LlkRing, LlkSums, RingDevice, RpieKernels,
+    C32, Ended, Error as GpuError, Kernels, LlkPartial, LlkRing, LlkSums, RingDevice, RpieKernels,
     StackTable, UpdateSums, ViewAddr, ViewDims, Views,
 };
 
@@ -45,13 +46,19 @@ pub(super) struct Device {
     /// The epochs run since the parameters last changed, all of one [`Epoch::run`].
     runs: Vec<EpochRun>,
     /// With graphs, the LLK pass's graph.
-    llk_graph: Option<CudaGraph<()>>,
+    llk_graph: Option<Captured>,
 }
 
 /// A cycle with the buffers only it uses, and with graphs the graph captured for it.
 struct EpochRun {
     cycle: Cycle,
-    graph: Option<CudaGraph<()>>,
+    graph: Option<Captured>,
+}
+
+/// A graph and the record its body ended when captured, if any: each replay ends it again.
+struct Captured {
+    graph: CudaGraph<()>,
+    ended: Option<Ended>,
 }
 
 /// A cycle's [`Epoch`] and the buffers only it uses, built together, so a graph captured
@@ -174,9 +181,9 @@ pub(super) struct Bufs<'a> {
     pub stacks: Stacks<'a>,
     pub plans: Plans<'a>,
     pub scratch: &'a mut DeviceBuffer<C32>,
-    /// A stack's LLK partials, which [`RingDevice::push`] then copies into the current record.
+    /// A stack's LLK partials, which [`ptyrs_gpu::RecordWriter::push`] then copies into the
+    /// record.
     pub llk: &'a mut DeviceBuffer<LlkPartial>,
-    pub ring: &'a mut RingDevice,
 }
 
 /// The stacks lent to a cycle, one at a time.
@@ -268,7 +275,9 @@ impl Device {
             stream,
         };
         if dev.use_graph {
-            dev.llk_graph = Some(dev.capture(|bufs, ctx| bufs.forward_llk(ctx))?);
+            dev.llk_graph = Some(
+                dev.capture(|bufs, ring, ctx| bufs.forward_llk(ctx, ring.record()).map(Some))?,
+            );
         }
         Ok(dev)
     }
@@ -301,9 +310,9 @@ impl Device {
         Ok(())
     }
 
-    /// Lends every buffer to a cycle enqueued outside a graph.
-    pub fn lend(&mut self) -> Bufs<'_> {
-        Bufs {
+    /// Lends every buffer, and apart the ring the cycle writes its records through.
+    fn lend(&mut self) -> (Bufs<'_>, &mut RingDevice) {
+        let bufs = Bufs {
             kernels: &self.kernels,
             rpie: &self.rpie,
             views: &self.views,
@@ -319,12 +328,12 @@ impl Device {
             plans: Plans(&mut self.plans),
             scratch: &mut self.scratch,
             llk: &mut self.llk,
-            ring: self.ring.device(),
-        }
+        };
+        (bufs, self.ring.device())
     }
 
     /// Enqueues one `epoch` cycle, numbered `cycle`: replays the graph captured for it, or
-    /// launches it eagerly without graphs, and counts its LLK record if it takes one. The
+    /// launches it eagerly without graphs, and counts the LLK record it ends, if any. The
     /// epochs of one [`Epoch::run`] keep their buffers and graphs until an epoch of another
     /// run replaces them.
     pub fn steady(&mut self, epoch: Epoch, cycle: usize) -> Result<(), EngineError> {
@@ -338,35 +347,39 @@ impl Device {
             }
         };
         let run = &mut runs[at];
+        let tag = Some((cycle, epoch.algorithm()));
         let done = match &run.graph {
-            Some(graph) => self.replay(graph),
+            Some(c) => self.replay(c, tag),
             None => {
                 let ctx = self.context();
-                self.lend().cycle(&ctx, &mut run.cycle)
+                let (mut bufs, ring) = self.lend();
+                match bufs.cycle(&ctx, ring, &mut run.cycle) {
+                    Ok(ended) => self.count(ended.as_ref(), tag),
+                    Err(e) => Err(e.into()),
+                }
             }
         };
         self.runs = runs;
-        done?;
-        if epoch.records_llk() {
-            self.ring
-                .enqueued(&self.context(), Some((cycle, epoch.algorithm())))?;
-        }
-        Ok(())
+        done
     }
 
     /// Enqueues the LLK record of the current estimate under `tag`, from the graph captured
     /// in [`Self::new`] or eagerly without graphs.
     pub fn llk_pass(&mut self, tag: Tag) -> Result<(), EngineError> {
-        let done = match &self.llk_graph {
-            Some(graph) => self.replay(graph),
+        let graph = self.llk_graph.take();
+        let done = match &graph {
+            Some(c) => self.replay(c, tag),
             None => {
                 let ctx = self.context();
-                self.lend().forward_llk(&ctx)
+                let (mut bufs, ring) = self.lend();
+                match bufs.forward_llk(&ctx, ring.record()) {
+                    Ok(ended) => self.count(Some(&ended), tag),
+                    Err(e) => Err(e.into()),
+                }
             }
         };
-        done?;
-        self.ring.enqueued(&self.context(), tag)?;
-        Ok(())
+        self.llk_graph = graph;
+        done
     }
 
     /// The LLK records counted since the last flush, in order; waits for their copies.
@@ -385,39 +398,66 @@ impl Device {
             }
         };
         let graph = if self.use_graph {
-            Some(self.capture(|bufs, ctx| bufs.cycle(ctx, &mut cycle))?)
+            Some(self.capture(|bufs, ring, ctx| bufs.cycle(ctx, ring, &mut cycle))?)
         } else {
             None
         };
         Ok(EpochRun { cycle, graph })
     }
 
-    /// `f` on the lent buffers, captured on a side stream, so nothing runs.
+    /// `f` on the lent buffers, captured on a side stream, so nothing runs; with the record
+    /// it ended.
     fn capture(
         &mut self,
-        f: impl FnOnce(&mut Bufs<'_>, &ExecutionContext) -> Result<(), GpuError> + Send,
-    ) -> Result<CudaGraph<()>, EngineError> {
+        f: impl FnOnce(
+            &mut Bufs<'_>,
+            &mut RingDevice,
+            &ExecutionContext,
+        ) -> Result<Option<Ended>, GpuError>
+        + Send,
+    ) -> Result<Captured, EngineError> {
         let side = self.kernels.context().new_stream()?;
-        let mut bufs = self.lend();
-        let op = ptyrs_gpu::record(|ctx| f(&mut bufs, ctx));
-        Ok(CudaGraph::capture(side, op).map_err(GpuError::from)?)
+        let (mut bufs, ring) = self.lend();
+        let mut ended = None;
+        let op = ptyrs_gpu::record(|ctx| {
+            ended = Some(f(&mut bufs, ring, ctx)?);
+            Ok(())
+        });
+        let graph = CudaGraph::capture(side, op).map_err(GpuError::from)?;
+        let ended = ended.expect("a capture that succeeded ran its body once");
+        Ok(Captured { graph, ended })
     }
 
-    /// Enqueues `graph` on the stream.
-    fn replay(&self, graph: &CudaGraph<()>) -> Result<(), GpuError> {
+    /// Enqueues `c`'s graph on the stream and counts the record it ends, if any, under `tag`.
+    fn replay(&mut self, c: &Captured, tag: Tag) -> Result<(), EngineError> {
         // SAFETY: the context holds the replay's leases on every captured buffer until the
         // stream has run it, so no other stream can touch them meanwhile.
-        Ok(unsafe { graph.launch().execute(&self.context()) }?)
+        unsafe { c.graph.launch().execute(&self.context()) }.map_err(GpuError::from)?;
+        self.count(c.ended.as_ref(), tag)
+    }
+
+    /// Counts under `tag` the record a run just enqueued ended, if it ended one.
+    fn count(&mut self, ended: Option<&Ended>, tag: Tag) -> Result<(), EngineError> {
+        if let Some(ended) = ended {
+            self.ring.enqueued(&self.context(), ended, tag)?;
+        }
+        Ok(())
     }
 }
 
 impl Bufs<'_> {
-    /// One cycle of `cycle` enqueued on `ctx`.
-    fn cycle(&mut self, ctx: &ExecutionContext, cycle: &mut Cycle) -> Result<(), GpuError> {
+    /// One cycle of `cycle` enqueued on `ctx`, and the LLK record it ends: an AP cycle with
+    /// `llk` writes one through `ring`, no other cycle touches it.
+    fn cycle(
+        &mut self,
+        ctx: &ExecutionContext,
+        ring: &mut RingDevice,
+        cycle: &mut Cycle,
+    ) -> Result<Option<Ended>, GpuError> {
         match cycle {
-            Cycle::Ap { params, llk } => self.ap_cycle(ctx, params, *llk),
-            Cycle::Dm { params, first } => self.dm_cycle(ctx, params, *first),
-            Cycle::Rpie(p, scratch) => self.rpie_epoch(ctx, p, &mut scratch.lend()),
+            Cycle::Ap { params, llk } => self.ap_cycle(ctx, params, llk.then(|| ring.record())),
+            Cycle::Dm { params, first } => self.dm_cycle(ctx, params, *first).map(|()| None),
+            Cycle::Rpie(p, scratch) => self.rpie_epoch(ctx, p, &mut scratch.lend()).map(|()| None),
         }
     }
 }

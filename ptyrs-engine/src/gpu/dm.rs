@@ -62,7 +62,7 @@ impl Bufs<'_> {
                 self.kernels
                     .dm_reflect(ctx, st.psi, self.scratch, len, alpha)?;
             }
-            self.project(ctx, s, false)?;
+            self.project(ctx, s, None)?;
             if !first {
                 self.kernels
                     .add_c32(ctx, self.stacks.get(s).psi, self.scratch, len)?;

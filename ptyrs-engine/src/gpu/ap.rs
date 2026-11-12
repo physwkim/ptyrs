@@ -1,7 +1,7 @@
 //! PyNX AP on the GPU.
 
 use cuda_async::device_operation::ExecutionContext;
-use ptyrs_gpu::Error as GpuError;
+use ptyrs_gpu::{Ended, Error as GpuError, RecordWriter};
 
 use super::{Bufs, Epoch, GpuPtycho};
 use crate::ptycho::llk_due;
@@ -29,13 +29,14 @@ impl GpuPtycho {
 }
 
 impl Bufs<'_> {
-    /// One AP cycle enqueued on `ctx`; with `llk`, its LLK record too.
+    /// One AP cycle enqueued on `ctx`; with `llk`, its LLK record too, ended after the last
+    /// stack.
     pub(super) fn ap_cycle(
         &mut self,
         ctx: &ExecutionContext,
         params: &ApParams,
-        llk: bool,
-    ) -> Result<(), GpuError> {
+        mut llk: Option<RecordWriter<'_>>,
+    ) -> Result<Option<Ended>, GpuError> {
         let (o, p) = (params.obj_inertia, params.probe_inertia);
         for s in 0..self.stacks.len() {
             self.kernels.obj_probe_to_psi(
@@ -46,12 +47,11 @@ impl Bufs<'_> {
                 self.probe,
                 self.stacks.get(s).psi,
             )?;
-            self.project(ctx, s, llk)?;
+            self.project(ctx, s, llk.as_mut())?;
             self.accumulate(ctx, s, o.is_some(), p.is_some())?;
         }
-        if llk {
-            self.ring.advance(ctx)?;
-        }
-        self.apply_sums(ctx, o, p)
+        let ended = llk.map(|w| w.end(ctx)).transpose()?;
+        self.apply_sums(ctx, o, p)?;
+        Ok(ended)
     }
 }

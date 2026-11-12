@@ -1,14 +1,16 @@
 //! The LLK ring (`ptyrs_kernels::ring`): LLK records written on the device by the epochs that
 //! take them, read on the host after those epochs, with no host sync in between.
 //!
-//! A record is one LLK of the whole scan: per stack, [`Kernels::llk`] into a staging buffer
-//! and [`RingDevice::push`] of it, then one [`RingDevice::advance`]. These are ordinary
-//! launches, legal in a capture. The host counts each record with [`LlkRing::enqueued`] once
-//! its launches, or the graph holding them, are enqueued, and [`LlkRing::flush`] returns the
-//! totals of every record counted since the last flush, in order, each from
-//! [`LlkSums::from_partials`] over its frames. Every frame of record `k` must carry stamp
-//! `k`: a frame not pushed, a cursor advanced other than once per record, or a slot
-//! overwritten before its copy, is a [`RingError::Stamp`], not a value.
+//! A record is one LLK of the whole scan, written through one [`RecordWriter`]: per stack,
+//! [`Kernels::llk`] into a staging buffer and [`RecordWriter::push`] of it, then
+//! [`RecordWriter::end`], the only advance of the cursor, which consumes the writer and
+//! returns the [`Ended`] the host count takes. These are ordinary launches, legal in a
+//! capture. The host counts each record with [`LlkRing::enqueued`] once its launches, or the
+//! graph holding them, are enqueued, and [`LlkRing::flush`] returns the totals of every
+//! record counted since the last flush, in order, each from [`LlkSums::from_partials`] over
+//! its frames. Every frame of record `k` must carry stamp `k`: a frame not pushed, a record
+//! ended but not counted or counted but not ended, or a slot overwritten before its copy, is
+//! a [`RingError::Stamp`], not a value.
 
 use std::collections::VecDeque;
 
@@ -22,7 +24,7 @@ use crate::{
 
 /// The ring's device half, what a cycle launches on: `nslot` records of `nframe` stamped
 /// partials and the cursor numbering the current record. Only [`LlkRing::new`] builds one,
-/// and only [`Self::advance`] moves the cursor.
+/// and only a [`RecordWriter`] writes it.
 pub struct RingDevice {
     base: Kernels,
     module: ring_kernels::LoadedModule,
@@ -33,9 +35,12 @@ pub struct RingDevice {
 }
 
 impl RingDevice {
-    /// Copies the stack's partials, as [`Kernels::llk`] writes them (`nf_max` records), into
-    /// the current record, stamped with it.
-    pub fn push(
+    /// Starts writing the current record.
+    pub fn record(&mut self) -> RecordWriter<'_> {
+        RecordWriter { dev: self }
+    }
+
+    fn push(
         &mut self,
         ctx: &ExecutionContext,
         dims: &ViewDims,
@@ -71,8 +76,7 @@ impl RingDevice {
             })
     }
 
-    /// Ends the current record: the cursor numbers the next.
-    pub fn advance(&mut self, ctx: &ExecutionContext) -> Result<(), Error> {
+    fn advance(&mut self, ctx: &ExecutionContext) -> Result<(), Error> {
         let config = LaunchConfig {
             grid_dim: (1, 1, 1),
             block_dim: (1, 1, 1),
@@ -85,6 +89,40 @@ impl RingDevice {
             })
     }
 }
+
+/// The current record being written: its pushes, then its one advance by [`Self::end`]. The
+/// writer holds the ring for the whole record, so no other record interleaves with it.
+#[must_use = "a record ends only through RecordWriter::end"]
+pub struct RecordWriter<'r> {
+    dev: &'r mut RingDevice,
+}
+
+impl RecordWriter<'_> {
+    /// Copies the stack's partials, as [`Kernels::llk`] writes them (`nf_max` records), into
+    /// the record, stamped with it.
+    pub fn push(
+        &mut self,
+        ctx: &ExecutionContext,
+        dims: &ViewDims,
+        stack: StackRef<'_>,
+        partials: &DeviceBuffer<LlkPartial>,
+    ) -> Result<(), Error> {
+        self.dev.push(ctx, dims, stack, partials)
+    }
+
+    /// Ends the record: the cursor numbers the next.
+    pub fn end(self, ctx: &ExecutionContext) -> Result<Ended, Error> {
+        self.dev.advance(ctx)?;
+        Ok(Ended(()))
+    }
+}
+
+/// What [`RecordWriter::end`] returns: the launches that wrote it end one record each time
+/// they run, eagerly or as a graph captured from them, and [`LlkRing::enqueued`] counts one
+/// record per run.
+#[derive(Debug)]
+#[must_use = "a record ended is counted with LlkRing::enqueued"]
+pub struct Ended(());
 
 /// An LLK ring of `nslot` records: the [`RingDevice`] the epochs write and its pinned host
 /// mirror, read in record order. The copy of record `k` is enqueued at most
@@ -159,10 +197,15 @@ impl<T> LlkRing<T> {
         &mut self.dev
     }
 
-    /// Counts the next record under `tag`, once its pushes and its one advance are enqueued
-    /// on `ctx`'s stream; enqueues the copy of the records not yet copied when they make a
-    /// batch.
-    pub fn enqueued(&mut self, ctx: &ExecutionContext, tag: T) -> Result<(), RingError> {
+    /// Counts the next record under `tag`, once per run of the launches that returned
+    /// `ended`, after that run is enqueued on `ctx`'s stream; enqueues the copy of the records
+    /// not yet copied when they make a batch.
+    pub fn enqueued(
+        &mut self,
+        ctx: &ExecutionContext,
+        _ended: &Ended,
+        tag: T,
+    ) -> Result<(), RingError> {
         self.next += 1;
         self.tags.push_back(tag);
         if self.next - self.copied >= self.batch() {
@@ -284,8 +327,8 @@ impl<T> Drop for LlkRing<T> {
 pub enum RingError {
     Gpu(Error),
     /// Frame `frame` of record `record` holds stamp `found`, not `record`: a frame not pushed
-    /// for it, a cursor advanced other than once per record, or a slot overwritten before its
-    /// copy.
+    /// for it, a record ended but not counted or counted but not ended, or a slot overwritten
+    /// before its copy.
     Stamp {
         record: u64,
         frame: usize,

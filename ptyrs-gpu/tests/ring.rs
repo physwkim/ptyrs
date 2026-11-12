@@ -1,26 +1,29 @@
 //! The LLK ring: records come back in order with the totals of their own partials, across
 //! wraps and copies that overlap later records, and a record with a frame not written for it
-//! is a stamp error.
+//! is a stamp error, as is one ended a number of times other than the host counts it.
 
 use std::sync::Arc;
 
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
-use ptyrs_gpu::{Kernels, LlkPartial, LlkRing, LlkSums, RingError, StackTable, ViewDims};
+use ptyrs_gpu::{Ended, Kernels, LlkPartial, LlkRing, LlkSums, RingError, StackTable, ViewDims};
 
 const NFRAME: u32 = 10;
 /// Stacks of 4, 4 and 2 frames.
 const STACKS: [std::ops::Range<u32>; 3] = [0..4, 4..8, 8..10];
 
-/// One record as the epochs write it: which stacks push, and how many advances follow.
+/// One record as a body writes it: which stacks push through its writer, and how many
+/// writers end (the first pushes, later ones are empty; none drops it unended). The host
+/// counts it once, with the latest [`Ended`], as it counts a graph replay with the token of
+/// the capture.
 struct Record {
     push: [bool; 3],
-    advances: usize,
+    ends: usize,
 }
 
 const WHOLE: Record = Record {
     push: [true; 3],
-    advances: 1,
+    ends: 1,
 };
 
 /// Deterministic partials of record `r`, spread over magnitudes so that the summation order
@@ -54,6 +57,7 @@ struct Fixture {
     dims: ViewDims,
     table: StackTable,
     ring: LlkRing<usize>,
+    ended: Option<Ended>,
 }
 
 fn fixture(nslot: u32) -> Fixture {
@@ -77,12 +81,13 @@ fn fixture(nslot: u32) -> Fixture {
         dims,
         table,
         ring,
+        ended: None,
     }
 }
 
 impl Fixture {
     /// Enqueues `records` as numbered from `r0`, with no host sync between them: each stack's
-    /// partials from its own staging buffer (uploaded first), then the advances, then the count.
+    /// partials from its own staging buffer (uploaded first), then the ends, then the count.
     fn enqueue(&mut self, r0: usize, records: &[Record]) {
         let nf_max = self.table.nf_max() as usize;
         let staged: Vec<Vec<DeviceBuffer<LlkPartial>>> = (r0..r0 + records.len())
@@ -100,16 +105,24 @@ impl Fixture {
             .collect();
         for (i, rec) in records.iter().enumerate() {
             let dev = self.ring.device();
+            let mut writer = dev.record();
             for (s, staging) in staged[i].iter().enumerate() {
                 if rec.push[s] {
-                    dev.push(&self.ctx, &self.dims, self.table.at(s), staging)
+                    writer
+                        .push(&self.ctx, &self.dims, self.table.at(s), staging)
                         .unwrap();
                 }
             }
-            for _ in 0..rec.advances {
-                dev.advance(&self.ctx).unwrap();
+            if rec.ends == 0 {
+                drop(writer);
+            } else {
+                self.ended = Some(writer.end(&self.ctx).unwrap());
+                for _ in 1..rec.ends {
+                    self.ended = Some(dev.record().end(&self.ctx).unwrap());
+                }
             }
-            self.ring.enqueued(&self.ctx, r0 + i).unwrap();
+            let ended = self.ended.as_ref().expect("an earlier record ended");
+            self.ring.enqueued(&self.ctx, ended, r0 + i).unwrap();
         }
     }
 
@@ -159,7 +172,7 @@ fn stamp(e: RingError) -> (u64, usize, u64) {
 fn skipped_push_is_a_stamp_error() {
     let skip = Record {
         push: [true, false, true],
-        advances: 1,
+        ends: 1,
     };
     let mut f = fixture(3);
     f.enqueue(0, &[skip]);
@@ -168,32 +181,32 @@ fn skipped_push_is_a_stamp_error() {
     let mut f = fixture(3);
     let skip = Record {
         push: [true, true, false],
-        advances: 1,
+        ends: 1,
     };
     f.enqueue(0, &[WHOLE, WHOLE, WHOLE, WHOLE, skip]);
     assert_eq!(stamp(f.flush().unwrap_err()), (4, 8, 1));
 }
 
-/// A cursor advanced twice, or not at all, within one record moves the later records off
-/// their slots.
+/// A body that ends two records, or none, where the host counts one, moves the later records
+/// off their slots.
 #[test]
-fn cursor_out_of_step_is_a_stamp_error() {
+fn ends_out_of_step_with_counts_are_a_stamp_error() {
     let twice = Record {
         push: [true; 3],
-        advances: 2,
+        ends: 2,
     };
     let mut f = fixture(4);
     f.enqueue(0, &[WHOLE, twice, WHOLE]);
     assert_eq!(stamp(f.flush().unwrap_err()), (2, 0, u64::MAX));
 
-    // Record 1 lands on record 0's slot and stamp, so record 0 reads with record 1's values;
-    // only record 1's empty slot shows it, and the flush returns neither.
+    // Record 2 lands on record 1's slot and stamp, so record 1 reads with record 2's values;
+    // only record 2's empty slot shows it, and the flush returns none of them.
     let none = Record {
         push: [true; 3],
-        advances: 0,
+        ends: 0,
     };
     let mut f = fixture(4);
-    f.enqueue(0, &[none, WHOLE]);
-    assert_eq!(stamp(f.flush().unwrap_err()), (1, 0, u64::MAX));
+    f.enqueue(0, &[WHOLE, none, WHOLE]);
+    assert_eq!(stamp(f.flush().unwrap_err()), (2, 0, u64::MAX));
     assert!(f.flush().unwrap().is_empty());
 }
