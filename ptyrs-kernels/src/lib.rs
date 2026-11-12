@@ -474,6 +474,8 @@ pub mod kernels {
     /// `psi` `[nf_max * nmode, ny, nx]`, `counts` `[nframe, ny, nx]`, `chunks` `[nf_max,
     /// nchunk]` records, `ctl` one entry; grid `(nchunk, nf_max, 1)`, block `(PIXEL_THREADS,
     /// 1, 1)`.
+    ///
+    /// [`llk_groups`]: LoadedModule::llk_groups
     #[kernel]
     pub unsafe fn llk(
         psi: *const f32,
@@ -626,13 +628,15 @@ pub mod kernels {
     /// `v`. Each object pixel is owned by one thread, which adds its views in ascending `k`
     /// from the tile's run: the result does not depend on how frames are split into stacks.
     /// A pixel's sums are read and written only if its tile's run holds a view of the stack.
-    /// A stack-tile launch ([`for_each_stack_tile`]): its blocks cover the tiles the stack's
+    /// A stack-tile launch (`for_each_stack_tile`): its blocks cover the tiles the stack's
     /// frames sample, not the whole object.
     ///
     /// # Safety
     ///
     /// As [`obj_probe_to_psi`] with `psi` read and canonical views; `sums` hold `[nobj,
-    /// nyo, nxo]`; `tiles` as [`for_each_stack_tile`] needs.
+    /// nyo, nxo]`; `tiles` as `for_each_stack_tile` needs.
+    ///
+    /// [`obj_probe_to_psi`]: LoadedModule::obj_probe_to_psi
     #[kernel]
     pub unsafe fn psi_to_obj(
         psi: *const f32,
@@ -691,6 +695,8 @@ pub mod kernels {
     /// # Safety
     ///
     /// As [`obj_probe_to_psi`] with `psi` read; `sums` hold `[nprobe, ny, nx]`.
+    ///
+    /// [`obj_probe_to_psi`]: LoadedModule::obj_probe_to_psi
     #[kernel]
     pub unsafe fn psi_to_probe(
         psi: *const f32,
@@ -764,6 +770,8 @@ pub mod kernels {
     /// # Safety
     ///
     /// `den` holds `[nobj, nyo, nxo]` floats, `tile_len` `ntx * nty` entries, `out` one `u32`.
+    ///
+    /// [`max_nonneg_f32`]: LoadedModule::max_nonneg_f32
     #[kernel]
     pub unsafe fn max_den_tiles(
         den: *const f32,
@@ -821,6 +829,8 @@ pub mod kernels {
     ///
     /// `x`, `sums` hold `[nobj, nyo, nxo]` values, `tile_len` `ntx * nty` entries, `max_bits`
     /// one `u32`.
+    ///
+    /// [`normalize_update`]: LoadedModule::normalize_update
     #[kernel]
     pub unsafe fn normalize_tiles(
         x: *mut f32,
@@ -1128,6 +1138,8 @@ pub mod kernels {
     /// # Safety
     ///
     /// As [`fft128_lines_fwd`].
+    ///
+    /// [`fft128_lines_fwd`]: LoadedModule::fft128_lines_fwd
     #[kernel]
     pub unsafe fn fft128_lines_inv(
         input: *const f32,
@@ -1154,6 +1166,8 @@ pub mod kernels {
     /// # Safety
     ///
     /// As [`fft128_lines_fwd`].
+    ///
+    /// [`fft128_lines_fwd`]: LoadedModule::fft128_lines_fwd
     #[kernel]
     pub unsafe fn fft256_lines_fwd(
         input: *const f32,
@@ -1180,6 +1194,8 @@ pub mod kernels {
     /// # Safety
     ///
     /// As [`fft128_lines_fwd`].
+    ///
+    /// [`fft128_lines_fwd`]: LoadedModule::fft128_lines_fwd
     #[kernel]
     pub unsafe fn fft256_lines_inv(
         input: *const f32,

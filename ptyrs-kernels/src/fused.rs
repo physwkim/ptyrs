@@ -360,7 +360,7 @@ fn new_waves(p: FusedPtrs, cfg: FusedCfg) -> *mut f32 {
 /// of every mode `m` gives the projected exit wave `proj`. The new exit wave is `proj`, or
 /// under `FUSED_DM` `proj + (1 - a) (PO - R)` with `R = (2 - a) PO - (1 - a) psi` (the
 /// arithmetic of `kernels::dm_reflect` then `kernels::add_c32`); it goes to
-/// [`new_waves`]. Reads `work`, `views`, and under `FUSED_DM` `obj`, `probe` and `psi`;
+/// `new_waves`. Reads `work`, `views`, and under `FUSED_DM` `obj`, `probe` and `psi`;
 /// writes `work` or `psi`. Grid `(ny / rows, nf_max)`, block `(nx / FFT_EPT, rows)`, dynamic
 /// shared memory `rows` row FFTs.
 ///
@@ -450,7 +450,7 @@ pub unsafe fn probe_terms(p: FusedPtrs, g: StackGeom) {
     unsafe { *p.probe_power.add(i) = s };
 }
 
-/// Adds the stack's object-update sums from the exit waves pass C left in [`new_waves`]:
+/// Adds the stack's object-update sums from the exit waves pass C left in `new_waves`:
 /// `num += sum_f B_f^T c_(f, o)` with `c_(f, o) = sum_pm conj(probe_q[pm]) psi_(f, o, pm)`
 /// in ascending `pm`, and `den += sum_f B_f^T probe_power`, over the stack's frames in
 /// ascending order, `B_f` the bilinear sampling of frame `f` (read from its view of mode
