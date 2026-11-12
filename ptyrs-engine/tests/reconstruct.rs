@@ -1,0 +1,225 @@
+use ptyrs_core::{C64, Geometry, Object, Probe, Scan, Stack, required_obj_shape};
+use ptyrs_engine::{
+    Algorithm, ApParams, DmParams, Ptycho, RpieParams, obj_probe_to_psi, quad_phase,
+};
+
+mod common;
+
+const PHOTONS: f64 = 1e5;
+
+struct Case {
+    scan: Scan,
+    object: Object,
+    probe: Probe,
+}
+
+/// 40 Fermat positions, 32x32 frames, `PHOTONS` per frame.
+fn case(nmode: usize, masked: bool) -> Case {
+    case_with(32, nmode, masked)
+}
+
+fn case_with(frame: usize, nmode: usize, masked: bool) -> Case {
+    let g = Geometry::new(1.5e-10, 1.0, 75e-6, [frame, frame]).unwrap();
+    let pixel = g.pixel_size_object();
+    let pos = ptyrs_core::sim::fermat(40, 2.5 * pixel[1]);
+    let shape = required_obj_shape(&pos.pynx_preprocess(pixel), pixel, g.frame, 4);
+    let object = ptyrs_core::sim::object(shape);
+    let probe = ptyrs_core::sim::probe(g.frame, nmode).unwrap();
+    let mask: Option<Vec<bool>> = masked.then(|| {
+        (0..frame * frame)
+            .map(|i| i % frame == 20 || i / frame == 3)
+            .collect()
+    });
+    let scan =
+        ptyrs_engine::sim::simulate(g, pos, &object, &probe, PHOTONS, mask.as_deref(), 7).unwrap();
+    Case {
+        scan,
+        object,
+        probe,
+    }
+}
+
+fn flat_object(o: &Object) -> Object {
+    Object::new(Stack::filled(o.dims(), C64::new(1.0, 0.0)))
+}
+
+/// Poisson LLK of the truth at the photon scale `simulate` used: the noise floor.
+fn truth_llk(c: &Case) -> f64 {
+    let p = Ptycho::new(&c.scan, c.object.clone(), c.probe.clone()).unwrap();
+    let views = p.addr().views();
+    let mut psi = vec![C64::default(); views.len() * c.probe.plane_len()];
+    let q = quad_phase(&c.scan.geometry);
+    obj_probe_to_psi(views, &c.object, &c.probe, &q, &mut psi);
+    let calc: f64 = psi.iter().map(|v| v.norm_sqr()).sum();
+    let s = (PHOTONS * p.addr().nframe() as f64 / calc).sqrt();
+    let mut probe = c.probe.clone();
+    probe.as_mut_slice().iter_mut().for_each(|v| *v *= s);
+    Ptycho::new(&c.scan, c.object.clone(), probe)
+        .unwrap()
+        .llk()
+        .poisson
+}
+
+fn rel(a: f64, b: f64) -> f64 {
+    (a - b).abs() / b.abs()
+}
+
+#[test]
+fn scale_obj_probe_matches_observed_photons() {
+    let c = case(1, true);
+    let mut p = Ptycho::new(&c.scan, flat_object(&c.object), c.probe.clone()).unwrap();
+    p.scale_obj_probe();
+    // the scale matches every calculated pixel to the unmasked observations; the LLK photon
+    // sum leaves the masked pixels out, so it falls short
+    assert!(p.llk().nb_photons_calc < p.observed().total());
+    let c0 = case(1, false);
+    let mut p = Ptycho::new(&c0.scan, flat_object(&c0.object), c0.probe.clone()).unwrap();
+    p.scale_obj_probe();
+    let l = p.llk();
+    assert!(rel(l.nb_photons_calc, p.observed().total()) < 1e-12);
+    let os: f64 = p.object().as_slice().iter().map(|c| c.norm()).sum();
+    let ps: f64 = p.probe().as_slice().iter().map(|c| c.norm()).sum();
+    assert!(rel(os, ps) < 1e-12);
+}
+
+#[test]
+fn zero_phase_ramp_keeps_llk_and_removes_a_probe_tilt() {
+    // 64 pixels: the defocused probe's far field stays inside the frame (on 32 it wraps and
+    // biases the centre of mass by ~0.01 pixel)
+    let c = case_with(64, 2, false);
+    let mut reference = Ptycho::new(&c.scan, c.object.clone(), c.probe.clone()).unwrap();
+    reference.zero_phase_ramp();
+    // tilt the probe by whole far-field pixels (-2, 1), an exact circular shift of its far field
+    let mut probe = c.probe.clone();
+    let nx = probe.plane_shape()[1];
+    for m in 0..2 {
+        for (i, v) in probe.plane_mut(m).iter_mut().enumerate() {
+            let (y, x) = ((i / nx) as f64, (i % nx) as f64);
+            *v *= C64::from_polar(1.0, 2.0 * std::f64::consts::PI * (x - 2.0 * y) / nx as f64);
+        }
+    }
+    let mut p = Ptycho::new(&c.scan, c.object.clone(), probe).unwrap();
+    let before = p.llk();
+    p.zero_phase_ramp();
+    let after = p.llk();
+    assert!(rel(after.poisson, before.poisson) < 1e-10);
+    assert!(rel(after.nb_photons_calc, before.nb_photons_calc) < 1e-12);
+    // the tilt is removed: the same probe as the untilted truth after the same operator, up
+    // to a constant phase per mode
+    for m in 0..2 {
+        let (a, b) = (p.probe().plane(m), reference.probe().plane(m));
+        let tot: f64 = b.iter().map(|v| v.norm_sqr()).sum();
+        let k = a.iter().zip(b).map(|(u, v)| u * v.conj()).sum::<C64>() / tot;
+        let err: f64 = a.iter().zip(b).map(|(u, v)| (u - v * k).norm_sqr()).sum();
+        assert!(err / tot < 1e-6, "mode {m}: {}", err / tot);
+    }
+}
+
+#[test]
+fn dm_converges_and_records_on_schedule() {
+    let c = case(1, false);
+    let truth = truth_llk(&c);
+    let mut p = Ptycho::new(&c.scan, flat_object(&c.object), c.probe.clone()).unwrap();
+    p.scale_obj_probe();
+    let start = p.llk().poisson;
+    let params = DmParams {
+        calc_llk: 10,
+        ..DmParams::default()
+    };
+    p.dm(&params, 101);
+    let cycles: Vec<usize> = p.history().iter().map(|r| r.cycle).collect();
+    assert_eq!(cycles, (0..=100).step_by(10).collect::<Vec<_>>());
+    assert!(p.history().iter().all(|r| r.algorithm == Algorithm::Dm));
+    let end = p.history().last().unwrap().llk.poisson;
+    assert_eq!(p.cycle(), 101);
+    // DM is not an LLK minimiser and settles above the noise floor, as PyNX DM does; only
+    // the progress from the start is asserted
+    assert!(end < start / 10.0, "start {start} end {end} truth {truth}");
+}
+
+/// DM against PyNX `cpu_operator` promoted to f64 (`scripts/compare_pynx_dm.py`), cycles
+/// 0-19 of `cargo run --release -p ptyrs-engine --example dm_llk -- <dir> 20 1 32 40`, saved
+/// from `<dir>/llk_pynx_f64.txt` to `tests/data/dm_pynx_f64.txt`.
+#[test]
+fn dm_llk_matches_pynx() {
+    let (scan, object, probe) = common::dm_scenario(32, 40, 1, 2e5);
+    let mut p = Ptycho::new(&scan, object, probe).unwrap();
+    p.scale_obj_probe();
+    let params = DmParams {
+        calc_llk: 1,
+        ..DmParams::default()
+    };
+    p.dm(&params, 20);
+    let pynx: Vec<Vec<f64>> = include_str!("data/dm_pynx_f64.txt")
+        .lines()
+        .map(|l| l.split_whitespace().map(|v| v.parse().unwrap()).collect())
+        .collect();
+    assert_eq!(p.history().len(), pynx.len());
+    for (r, row) in p.history().iter().zip(&pynx) {
+        assert_eq!(r.cycle as f64, row[0]);
+        let l = r.llk;
+        for (a, b) in [l.poisson, l.gaussian, l.euclidian, l.nb_photons_calc]
+            .into_iter()
+            .zip(&row[1..])
+        {
+            assert!(rel(a, *b) < 1e-9, "cycle {}: rust {a} pynx {b}", r.cycle);
+        }
+    }
+}
+
+#[test]
+fn ap_object_only_converges() {
+    let c = case(2, true);
+    let truth = truth_llk(&c);
+    let mut p = Ptycho::new(&c.scan, flat_object(&c.object), c.probe.clone()).unwrap();
+    p.scale_obj_probe();
+    let params = ApParams {
+        calc_llk: 50,
+        ..ApParams::default()
+    };
+    p.ap(&params, 100);
+    let h = p.history();
+    assert_eq!(h.iter().map(|r| r.cycle).collect::<Vec<_>>(), [0, 50, 99]);
+    // AP records the LLK before the update, so it decreases along the history
+    assert!(h[0].llk.poisson > h[1].llk.poisson && h[1].llk.poisson > h[2].llk.poisson);
+    let end = p.llk().poisson;
+    assert!(end < 1.2 * truth, "end {end} truth {truth}");
+}
+
+#[test]
+fn rpie_converges() {
+    let c = case(1, true);
+    let truth = truth_llk(&c);
+    let mut p = Ptycho::new(&c.scan, flat_object(&c.object), c.probe.clone()).unwrap();
+    p.scale_obj_probe();
+    // pty-chi sums overlapping updates in a batch, so the default step 1 / alpha 0.1 diverges
+    // with several overlapping frames per batch; alpha 1 is the setting pty-chi tests use
+    let params = RpieParams {
+        batch_size: 4,
+        obj_alpha: 1.0,
+        probe_alpha: 1.0,
+        calc_llk: 1,
+        ..RpieParams::default()
+    };
+    p.rpie(&params, 60).unwrap();
+    let h = p.history();
+    assert_eq!(h.len(), 60);
+    assert!(h.iter().all(|r| r.algorithm == Algorithm::Rpie));
+    let end = h.last().unwrap().llk.poisson;
+    assert!(
+        end < 1.2 * truth,
+        "start {} end {end} truth {truth}",
+        h[0].llk.poisson
+    );
+}
+
+#[test]
+fn rpie_rejects_object_modes() {
+    let c = case(1, false);
+    let o = Object::new(Stack::filled(
+        [2, c.object.dims()[1], c.object.dims()[2]],
+        C64::new(1.0, 0.0),
+    ));
+    let mut p = Ptycho::new(&c.scan, o, c.probe.clone()).unwrap();
+    assert!(p.rpie(&RpieParams::default(), 1).is_err());
+}

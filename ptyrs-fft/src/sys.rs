@@ -13,8 +13,10 @@ pub const CUFFT_FORWARD: c_int = -1;
 pub const CUFFT_INVERSE: c_int = 1;
 
 unsafe extern "C" {
-    pub fn cufftPlanMany(
-        plan: *mut cufftHandle,
+    pub fn cufftCreate(plan: *mut cufftHandle) -> cufftResult;
+    pub fn cufftSetAutoAllocation(plan: cufftHandle, auto_allocate: c_int) -> cufftResult;
+    pub fn cufftMakePlanMany(
+        plan: cufftHandle,
         rank: c_int,
         n: *mut c_int,
         inembed: *mut c_int,
@@ -25,7 +27,9 @@ unsafe extern "C" {
         odist: c_int,
         ty: cufftType,
         batch: c_int,
+        work_size: *mut usize,
     ) -> cufftResult;
+    pub fn cufftSetWorkArea(plan: cufftHandle, work_area: *mut c_void) -> cufftResult;
     /// `stream` is a `cudaStream_t`, which is the same handle as a driver `CUstream`.
     pub fn cufftSetStream(plan: cufftHandle, stream: *mut c_void) -> cufftResult;
     pub fn cufftExecC2C(

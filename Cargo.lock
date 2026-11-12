@@ -1625,11 +1625,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "ptyrs-engine"
+version = "0.0.1"
+dependencies = [
+ "num-complex",
+ "ptyrs-core",
+ "ptyrs-io",
+ "rustfft",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "ptyrs-fft"
 version = "0.0.1"
 dependencies = [
+ "cuda-async",
  "cuda-core",
  "rustfft",
+]
+
+[[package]]
+name = "ptyrs-gpu"
+version = "0.0.1"
+dependencies = [
+ "cuda-artifact-finalizer",
+ "cuda-async",
+ "cuda-core",
+ "libloading",
+ "nvjitlink-sys",
+ "oxide-artifacts",
+ "ptyrs-fft",
+ "ptyrs-kernels",
 ]
 
 [[package]]

@@ -1,5 +1,6 @@
 mod common;
 
+use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{Context, DeviceBuffer};
 use ptyrs_fft::{C32, Plan2d};
 use rustfft::{FftPlanner, num_complex::Complex64};
@@ -55,7 +56,8 @@ fn batched_256_forward_inverse_match_f64_reference() {
     let ctx = Context::new(0).unwrap();
     let stream = ctx.new_stream().unwrap();
     println!("cufft version {}", ptyrs_fft::version().unwrap());
-    let plan = Plan2d::new(&stream, N, BATCH).unwrap();
+    let mut plan = Plan2d::new(&stream, N, BATCH).unwrap();
+    let ex = ExecutionContext::new(stream.clone());
 
     let host = common::random_c32(N * N * BATCH, 0x5eed);
     let d_in = DeviceBuffer::from_host(&stream, &host).unwrap();
@@ -63,9 +65,9 @@ fn batched_256_forward_inverse_match_f64_reference() {
 
     for inverse in [false, true] {
         if inverse {
-            plan.inverse(&d_in, &mut d_out).unwrap();
+            plan.inverse(&ex, &d_in, &mut d_out).unwrap();
         } else {
-            plan.forward(&d_in, &mut d_out).unwrap();
+            plan.forward(&ex, &d_in, &mut d_out).unwrap();
         }
         let gpu = d_out.to_host_vec(&stream).unwrap();
         let (max_rel, rms_rel) = errors(&gpu, &reference(&host, inverse));
@@ -78,11 +80,12 @@ fn batched_256_forward_inverse_match_f64_reference() {
 fn inplace_matches_out_of_place_and_roundtrip_scales_by_n2() {
     let ctx = Context::new(0).unwrap();
     let stream = ctx.new_stream().unwrap();
-    let plan = Plan2d::new(&stream, N, 4).unwrap();
+    let mut plan = Plan2d::new(&stream, N, 4).unwrap();
+    let ex = ExecutionContext::new(stream.clone());
     let host = common::random_c32(N * N * 4, 7);
     let mut buf = DeviceBuffer::from_host(&stream, &host).unwrap();
-    plan.forward_inplace(&mut buf).unwrap();
-    plan.inverse_inplace(&mut buf).unwrap();
+    plan.forward_inplace(&ex, &mut buf).unwrap();
+    plan.inverse_inplace(&ex, &mut buf).unwrap();
     let back = buf.to_host_vec(&stream).unwrap();
     let s = (N * N) as f32;
     let max = host
@@ -98,11 +101,12 @@ fn inplace_matches_out_of_place_and_roundtrip_scales_by_n2() {
 fn short_buffer_rejected() {
     let ctx = Context::new(0).unwrap();
     let stream = ctx.new_stream().unwrap();
-    let plan = Plan2d::new(&stream, 16, 2).unwrap();
+    let mut plan = Plan2d::new(&stream, 16, 2).unwrap();
+    let ex = ExecutionContext::new(stream.clone());
     let a = DeviceBuffer::<C32>::zeroed(&stream, 16 * 16).unwrap();
     let mut b = DeviceBuffer::<C32>::zeroed(&stream, 16 * 16 * 2).unwrap();
     assert!(matches!(
-        plan.forward(&a, &mut b),
+        plan.forward(&ex, &a, &mut b),
         Err(ptyrs_fft::FftError::BufferTooSmall { .. })
     ));
 }
