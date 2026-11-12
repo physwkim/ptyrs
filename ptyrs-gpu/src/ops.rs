@@ -85,14 +85,16 @@ impl ViewDims {
         self.obj.map(|n| n.div_ceil(OBJ_TILE))
     }
 
-    /// The per-view check of [`Views::new`]: `v` lies inside the object, `fy` and `fx` are in
-    /// `[0, 1)` and its probe and object modes exist.
+    /// The per-view check of [`Views::new`]: `fy` and `fx` are in `[0, 1)`, every object
+    /// pixel the view's samples read lies inside the object (the `+ 1` neighbour of a
+    /// non-zero `fy` or `fx` included; nothing wraps) and its probe and object modes exist.
     pub fn check_view(&self, v: &ViewAddr) -> Result<(), Error> {
-        let [ny, nx] = self.frame;
-        let [nyo, nxo] = self.obj;
         let frac = |f: f32| (0.0..1.0).contains(&f);
-        let inside = v.oy as u64 + ny as u64 <= nyo as u64 && v.ox as u64 + nx as u64 <= nxo as u64;
-        if !inside || !frac(v.fy) || !frac(v.fx) || v.probe >= self.nprobe || v.obj >= self.nobj {
+        let fits =
+            |o: u32, f: f32, n: u32, no: u32| o as u64 + n as u64 + (f > 0.0) as u64 <= no as u64;
+        let inside = fits(v.oy, v.fy, self.frame[0], self.obj[0])
+            && fits(v.ox, v.fx, self.frame[1], self.obj[1]);
+        if !frac(v.fy) || !frac(v.fx) || !inside || v.probe >= self.nprobe || v.obj >= self.nobj {
             return Err(Error::Shape(format!("{v:?} is outside {self:?}")));
         }
         Ok(())
@@ -387,20 +389,19 @@ impl Views {
     }
 }
 
-/// Object tiles (of `OBJ_TILE` pixels per side) that a view's samples may touch along one
-/// axis: offsets `o .. o + len` plus the bilinear `+ 1` neighbour of the last, wrapped.
-fn axis_tiles(o: u32, len: u32, n: u32) -> impl Iterator<Item = u32> {
-    let (first, last) = (o / OBJ_TILE, (o + len - 1) / OBJ_TILE);
-    let wrap = ((o + len) % n) / OBJ_TILE;
-    (first..=last).chain((wrap < first || wrap > last).then_some(wrap))
+/// Object tiles (of `OBJ_TILE` pixels per side) a view's samples read along one axis:
+/// offsets `o .. o + len`, plus the bilinear `+ 1` neighbour of the last when `f > 0`.
+fn axis_tiles(o: u32, len: u32, f: f32) -> std::ops::RangeInclusive<u32> {
+    o / OBJ_TILE..=(o + len - (f == 0.0) as u32) / OBJ_TILE
 }
 
-/// The object tiles `[ty, tx]` that the samples of view `v` may touch, ty-major; along each
-/// axis ascending, then the tile of the wrapped `+ 1` neighbour if it is not among them.
+/// The object tiles `[ty, tx]` holding the object pixels that the samples of view `v` read,
+/// ascending (ty-major); for a view [`ViewDims::check_view`] accepts, all inside the object.
 /// [`Views::new`] lists view `v` in exactly these tiles' runs.
 pub fn view_tiles(dims: &ViewDims, v: &ViewAddr) -> impl Iterator<Item = [u32; 2]> + use<> {
-    let ([ny, nx], [nyo, nxo], ox) = (dims.frame, dims.obj, v.ox);
-    axis_tiles(v.oy, ny, nyo).flat_map(move |ty| axis_tiles(ox, nx, nxo).map(move |tx| [ty, tx]))
+    let [ny, nx] = dims.frame;
+    let xs = axis_tiles(v.ox, nx, v.fx);
+    axis_tiles(v.oy, ny, v.fy).flat_map(move |ty| xs.clone().map(move |tx| [ty, tx]))
 }
 
 /// Host form of the [`Views`] tile lists.

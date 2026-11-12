@@ -165,22 +165,32 @@ impl Scan {
         (a.cos(), a.sin())
     }
 
-    /// Object indices and bilinear weights of view `v`'s sample at probe pixel `(y, x)`.
-    fn corners(&self, v: &ViewAddr, y: usize, x: usize) -> [(usize, f64); 4] {
+    /// Object indices and bilinear weights of the corners view `v`'s sample at probe pixel
+    /// `(y, x)` reads (non-zero weight).
+    fn corners(&self, v: &ViewAddr, y: usize, x: usize) -> impl Iterator<Item = (usize, f64)> {
         let [nyo, nxo] = [self.d.obj[0] as usize, self.d.obj[1] as usize];
         let (fy, fx) = (v.fy as f64, v.fx as f64);
         let (y0, x0) = (v.oy as usize + y, v.ox as usize + x);
-        let at = |yy: usize, xx: usize| (v.obj as usize * nyo + yy % nyo) * nxo + xx % nxo;
+        let at = move |yy: usize, xx: usize| {
+            assert!(
+                yy < nyo && xx < nxo,
+                "{v:?} reads ({yy}, {xx}) outside the object"
+            );
+            (v.obj as usize * nyo + yy) * nxo + xx
+        };
         [
-            (at(y0, x0), (1.0 - fy) * (1.0 - fx)),
-            (at(y0, x0 + 1), (1.0 - fy) * fx),
-            (at(y0 + 1, x0), fy * (1.0 - fx)),
-            (at(y0 + 1, x0 + 1), fy * fx),
+            ((y0, x0), (1.0 - fy) * (1.0 - fx)),
+            ((y0, x0 + 1), (1.0 - fy) * fx),
+            ((y0 + 1, x0), fy * (1.0 - fx)),
+            ((y0 + 1, x0 + 1), fy * fx),
         ]
+        .into_iter()
+        .filter(|&(_, w)| w != 0.0)
+        .map(move |((yy, xx), w)| (at(yy, xx), w))
     }
 
     fn sample(&self, obj: &[C32], v: &ViewAddr, y: usize, x: usize) -> Z {
-        self.corners(v, y, x).iter().fold((0.0, 0.0), |s, &(i, w)| {
+        self.corners(v, y, x).fold((0.0, 0.0), |s, (i, w)| {
             (s.0 + w * obj[i].re as f64, s.1 + w * obj[i].im as f64)
         })
     }
@@ -230,8 +240,9 @@ impl Scan {
 }
 
 /// 24x32 frames on two 50x60 object modes and two probe modes (four views per frame).
-/// Frames 1 and 3 end on the object's last row and column, so their `+ 1` neighbours wrap;
-/// the subpixel offsets cover `fy` and `fx` zero and non-zero.
+/// Frames 1 and 3 reach the object's last row and column, each once through its last
+/// probe row or column (`f == 0`) and once through the `+ 1` neighbour (`f > 0`); the
+/// subpixel offsets cover `fy` and `fx` zero and non-zero.
 fn scan() -> Scan {
     scan_in([50, 60])
 }
@@ -249,9 +260,9 @@ fn scan_in(obj: [u32; 2]) -> Scan {
     };
     let offsets = [
         (0, 0, 0.0, 0.0),
-        (26, 28, 0.25, 0.0),
+        (25, 28, 0.25, 0.0),
         (13, 7, 0.0, 0.7),
-        (26, 28, 0.6, 0.9),
+        (26, 27, 0.0, 0.9),
         (5, 20, 0.5, 0.5),
     ];
     Scan::new(d, &offsets, 1.0)
@@ -800,7 +811,7 @@ fn fourier_projection_matches_pynx_orthonormal_f64() {
     };
     let s = Scan::new(
         d,
-        &[(0, 0, 0.0, 0.0), (16, 3, 0.3, 0.0), (10, 16, 0.5, 0.25)],
+        &[(0, 0, 0.0, 0.0), (15, 3, 0.3, 0.0), (10, 15, 0.5, 0.25)],
         10.0,
     );
     let (n, nm, nf) = (N * N, 2, 3);
@@ -932,6 +943,34 @@ fn views_and_frame_ranges_are_checked() {
     );
 }
 
+/// A view may end on the object's last row only with `fy == 0`, since its `+ 1` neighbour
+/// would leave the object and nothing wraps; likewise for the last column and `fx`.
+#[test]
+fn check_view_rejects_a_neighbour_past_the_object() {
+    let d = scan().d;
+    let ([ny, nx], [nyo, nxo]) = (d.frame, d.obj);
+    let last = ViewAddr {
+        oy: nyo - ny,
+        ox: nxo - nx,
+        ..ViewAddr::default()
+    };
+    let ok = |v: ViewAddr| d.check_view(&v).is_ok();
+    assert!(ok(last), "last row and column, fy = fx = 0");
+    assert!(!ok(ViewAddr { fy: 0.25, ..last }), "fy > 0 on the last row");
+    assert!(
+        !ok(ViewAddr { fx: 0.25, ..last }),
+        "fx > 0 on the last column"
+    );
+    let inner = ViewAddr {
+        oy: last.oy - 1,
+        ox: last.ox - 1,
+        fy: 0.25,
+        fx: 0.25,
+        ..last
+    };
+    assert!(ok(inner), "+ 1 neighbours on the last row and column");
+}
+
 /// `view_tiles` lists, once each, every tile holding an object pixel a view's samples read,
 /// and `Views::new` lists each view in exactly those tiles' runs.
 #[test]
@@ -949,11 +988,11 @@ fn view_tiles_cover_the_pixels_each_view_reads() {
         once.dedup();
         assert_eq!(once.len(), tiles.len(), "view {k} lists a tile twice");
         for (y, x, _) in s.pixels() {
-            for (i, w) in s.corners(v, y, x) {
+            for (i, _) in s.corners(v, y, x) {
                 let (oy, ox) = (i / nxo % nyo, i % nxo);
                 let tile = [(oy / side) as u32, (ox / side) as u32];
                 assert!(
-                    w == 0.0 || tiles.contains(&tile),
+                    tiles.contains(&tile),
                     "view {k} reads ({oy}, {ox}) outside {tiles:?}"
                 );
             }

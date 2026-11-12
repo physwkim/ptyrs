@@ -17,7 +17,8 @@ pub const MASKED: u16 = u16::MAX;
 
 /// One exit-wave view (PyNX `cx, cy` + `_obj_psidx`, `_probe_psidx`): probe mode `probe`
 /// times object mode `obj` sampled at `(oy + fy + pry, ox + fx + prx)` for probe pixel
-/// `(pry, prx)`. `oy + ny <= nyo`, `ox + nx <= nxo`, `fy`, `fx` in `[0, 1)`.
+/// `(pry, prx)`. `fy`, `fx` in `[0, 1)`; `oy + ny + (fy > 0) <= nyo` and `ox + nx + (fx > 0)
+/// <= nxo`, so every object pixel a sample reads lies inside the object.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct ViewAddr {
@@ -186,13 +187,13 @@ pub fn bilinear_weights(fy: f32, fx: f32) -> [f32; 4] {
 }
 
 /// Object value probe pixel `(pry, prx)` of view `v` sees: bilinear over the object pixels
-/// `(oy + pry + {0, 1}, ox + prx + {0, 1})`, the `+ 1` neighbours wrapped periodically
-/// (PyNX `bilinear`). Corners whose weight is zero (`fy == 0` or `fx == 0`) are not read.
+/// `(oy + pry + {0, 1}, ox + prx + {0, 1})` (PyNX `bilinear`, on an object sized so that it
+/// never wraps). Corners whose weight is zero (`fy == 0` or `fx == 0`) are not read.
 ///
 /// # Safety
 ///
-/// `obj` must hold `[nobj, nyo, nxo]` with `v.obj < nobj`, `v.oy + pry < nyo` and
-/// `v.ox + prx < nxo`.
+/// `obj` must hold `[nobj, nyo, nxo]` with `v.obj < nobj`, `v.oy + pry + (v.fy > 0) < nyo`
+/// and `v.ox + prx + (v.fx > 0) < nxo`.
 #[device]
 pub unsafe fn sample_obj(
     obj: *const f32,
@@ -205,8 +206,7 @@ pub unsafe fn sample_obj(
     let plane = v.obj as usize * nyo as usize * nxo as usize;
     let y0 = v.oy + pry;
     let x0 = v.ox + prx;
-    let y1 = if y0 + 1 == nyo { 0 } else { y0 + 1 };
-    let x1 = if x0 + 1 == nxo { 0 } else { x0 + 1 };
+    let (y1, x1) = (y0 + 1, x0 + 1);
     let w = bilinear_weights(v.fy, v.fx);
     let at = |y: u32, x: u32| plane + y as usize * nxo as usize + x as usize;
     unsafe {
@@ -238,15 +238,13 @@ pub fn obj_pixel_sources(
     x: u32,
     ny: u32,
     nx: u32,
-    nyo: u32,
-    nxo: u32,
 ) -> [Option<(u32, u32, f32)>; 4] {
     // Row offset of `y` in the view (`y0 = oy + pry`), and of the row whose `+ 1`
-    // neighbour is `y`; likewise for columns.
-    let r = (y + nyo - v.oy) % nyo;
-    let c = (x + nxo - v.ox) % nxo;
-    let rm = if r == 0 { nyo - 1 } else { r - 1 };
-    let cm = if c == 0 { nxo - 1 } else { c - 1 };
+    // neighbour is `y`; likewise for columns. An offset below zero wraps past every frame
+    // side, so `pick` drops it.
+    let r = y.wrapping_sub(v.oy);
+    let c = x.wrapping_sub(v.ox);
+    let (rm, cm) = (r.wrapping_sub(1), c.wrapping_sub(1));
     let w = bilinear_weights(v.fy, v.fx);
     let pick = |pry: u32, prx: u32, wt: f32, used: bool| {
         if used && pry < ny && prx < nx {

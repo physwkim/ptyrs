@@ -454,7 +454,7 @@ pub mod kernels {
                     continue;
                 }
                 let plane = (k - k0) as usize * n;
-                let src = obj_pixel_sources(v, y, x, g.ny, g.nx, g.nyo, g.nxo);
+                let src = obj_pixel_sources(v, y, x, g.ny, g.nx);
                 for &(pry, prx, w) in src.iter().flatten() {
                     let p = load_c(probe, v.probe as usize * n + (pry * g.nx + prx) as usize);
                     let q = quad_phase(g.quad, pry, prx, g.ny, g.nx);
