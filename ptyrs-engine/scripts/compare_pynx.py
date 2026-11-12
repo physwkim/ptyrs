@@ -95,10 +95,11 @@ def main():
 
     # (name, operator module, f64, lag). Rust and the CUDA DM record the LLK of the estimate
     # the cycle starts from; the cpu_operator DM takes it after the cycle's object/probe
-    # update, so its record at cycle c is Rust's at c + 1. The CUDA DM's
-    # ScaleObjProbe(absolute=False) after each LLK only trades scale between object and probe,
-    # which DM is covariant under; the final arrays are compared up to a complex scale. AP
-    # records the LLK of the estimate before the update on both CPU and CUDA.
+    # update, so its record at cycle c is Rust's at c + 1. Rust and the CUDA DM run
+    # ScaleObjProbe(absolute=False) after each LLK and the cpu_operator DM does not; it only
+    # trades scale between object and probe, which DM is covariant under, so the final arrays
+    # are compared up to a complex scale. AP records the LLK of the estimate before the update
+    # on both CPU and CUDA.
     flags = sys.argv[3:]
     cpu_lag = 1 if algo == "dm" else 0
     runs = [] if "--no-cpu" in flags else [("f64", cpu_operator_f64(), True, cpu_lag),

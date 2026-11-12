@@ -42,7 +42,7 @@ pub use bh::{
     BH_HESS, BH_STEP, BhBatch, BhDisp, BhFieldsRef, BhKernels, BhScan, BhVar, EpochOrder, bh_parts,
 };
 pub use fused::{Exit, FUSED_SIDES, FusedBufs, FusedInputs, FusedSums};
-pub use grad::{CG_BLOCKS, GAMMA_CHUNK, GammaStacks, GradKernels, gamma_parts};
+pub use grad::{CG_BLOCKS, GAMMA_CHUNK, GammaStacks, GradKernels, ObjProbeScale, gamma_parts};
 pub use ops::{
     LLK_TREE_LEAVES, LlkPartial, LlkScratch, LlkSums, MASKED, OBJ_TILE, StackCtl, StackGeom,
     StackRef, StackTable, UpdateSums, ViewAddr, ViewDims, Views, view_tiles,
