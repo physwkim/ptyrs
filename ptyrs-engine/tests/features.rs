@@ -6,7 +6,8 @@
 
 use ptyrs_core::{C64, Scan};
 use ptyrs_engine::{
-    Cost, Fft2, Ptycho, llk, obj_probe_shift_to_psi, obj_probe_to_psi, position_grad, quad_phase,
+    Cost, Fft2, Ptycho, intensity_grad, llk, obj_probe_shift_to_psi, obj_probe_to_psi,
+    position_grad, quad_phase, scale_psi,
 };
 
 pub mod common;
@@ -107,4 +108,53 @@ fn position_matches_pos_grad_ref() {
         let e = max_rel(&got, &want);
         assert!(e < 1e-12, "{cost:?}: max rel {e:.3e}");
     }
+}
+
+/// Far field of the state's object and probe at the view corners.
+fn far_field(scan: &Scan, p: &Ptycho) -> Vec<C64> {
+    let views = p.addr().views();
+    let mut psi = vec![C64::default(); views.len() * p.probe().plane_len()];
+    obj_probe_to_psi(
+        views,
+        p.object(),
+        p.probe(),
+        &quad_phase(&scan.geometry),
+        &mut psi,
+    );
+    Fft2::new(scan.geometry.frame).forward(&mut psi);
+    psi
+}
+
+/// `refs/f64/intensity_step.py`: rows `k s dL/ds dF/ds s'_gaussian s'_poisson a_far_poisson`,
+/// `s` scaling every mode's intensity.
+#[test]
+fn intensity_matches_intensity_step_ref() {
+    let (scan, p) = state();
+    let rows = table(include_str!("data/intensity_f64.txt"));
+    let scale: Vec<f64> = rows.iter().map(|r| r[1]).collect();
+    let (nframe, nmode) = (p.addr().nframe(), p.addr().nmode());
+    let phi = far_field(&scan, &p);
+    let mut psi = phi.clone();
+    scale_psi(p.observed(), 0..nframe, nmode, &scale, &mut psi);
+    assert_values(&p, &psi, include_str!("data/intensity_values_f64.txt"));
+
+    for (cost, col) in [(Cost::Poisson, 2), (Cost::Amplitude, 3)] {
+        let g = intensity_grad(p.observed(), 0..nframe, nmode, &scale, &phi, cost);
+        let want: Vec<f64> = rows.iter().map(|r| r[col]).collect();
+        let e = max_rel(&g, &want);
+        assert!(e < 1e-12, "{cost:?}: max rel {e:.3e}");
+    }
+    // a batch leaves the other frames at zero
+    let n = nmode * p.probe().plane_len();
+    let g = intensity_grad(
+        p.observed(),
+        20..30,
+        nmode,
+        &scale,
+        &phi[20 * n..30 * n],
+        Cost::Poisson,
+    );
+    let full = intensity_grad(p.observed(), 0..nframe, nmode, &scale, &phi, Cost::Poisson);
+    assert!(g[..20].iter().chain(&g[30..]).all(|&v| v == 0.0));
+    assert_eq!(g[20..30], full[20..30]);
 }

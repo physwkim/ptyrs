@@ -3,6 +3,7 @@
 //! [`Cost`] with respect to the feature.
 
 use std::f64::consts::PI;
+use std::ops::Range;
 
 use ptyrs_core::{C64, Object, Probe, View};
 
@@ -171,6 +172,57 @@ pub fn position_grad(
                     .sum::<f64>();
             }
         }
+    }
+    grad
+}
+
+/// Per-frame intensity scale on every mode, as ptyrs-refgen's flux scale: the far field `psi`
+/// covering the frames `frames` of `obs` (`frames.len() * nmode` planes, frame-major) is
+/// multiplied by `√scale[f]` for frame `f`, so its `icalc` is `scale[f]·Σ_m |psi|²`.
+pub fn scale_psi(
+    obs: &Observed,
+    frames: Range<usize>,
+    nmode: usize,
+    scale: &[f64],
+    psi: &mut [C64],
+) {
+    let block = nmode * obs.plane_len();
+    assert_eq!(psi.len(), frames.len() * block);
+    for (f, block) in frames.zip(psi.chunks_exact_mut(block)) {
+        let r = scale[f].sqrt();
+        block.iter_mut().for_each(|c| *c *= r);
+    }
+}
+
+/// Gradient of `cost` over `scale` in [`scale_psi`] for every frame of `scale` (zero outside
+/// `frames`), from the far field `psi` of `frames` before scaling:
+/// `∂C/∂scale[f] = Σ slope(iobs, scale[f]·I)·I` with `I = Σ_m |psi|²`.
+pub fn intensity_grad(
+    obs: &Observed,
+    frames: Range<usize>,
+    nmode: usize,
+    scale: &[f64],
+    psi: &[C64],
+    cost: Cost,
+) -> Vec<f64> {
+    let n = obs.plane_len();
+    assert_eq!(psi.len(), frames.len() * nmode * n);
+    let mut grad = vec![0.0; scale.len()];
+    for ((f, o), block) in frames
+        .clone()
+        .zip(obs.frames(frames).chunks_exact(n))
+        .zip(psi.chunks_exact(nmode * n))
+    {
+        grad[f] = o
+            .iter()
+            .enumerate()
+            .filter_map(|(j, iobs)| {
+                iobs.map(|iobs| {
+                    let i: f64 = (0..nmode).map(|m| block[m * n + j].norm_sqr()).sum();
+                    cost.slope(iobs, scale[f] * i) * i
+                })
+            })
+            .sum();
     }
     grad
 }
