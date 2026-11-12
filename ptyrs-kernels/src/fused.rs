@@ -89,7 +89,7 @@ pub struct FusedPtrs {
 /// `s` is block shared memory holding `bpb` FFTs of this size; the `(b, f)` pairs of the
 /// block's threads are distinct and cover every thread of every FFT.
 #[device]
-unsafe fn block_fft<const N: u32, const INV: bool>(
+pub(crate) unsafe fn block_fft<const N: u32, const INV: bool>(
     r: &mut [f32; 2 * FFT_EPT as usize],
     s: *mut u8,
     b: u32,
@@ -110,7 +110,7 @@ unsafe fn block_fft<const N: u32, const INV: bool>(
 
 /// [`block_fft`] of a row pass: blockDim `(NX / FFT_EPT, rows)`, one row per FFT.
 #[device]
-unsafe fn row_fft<const NX: u32, const INV: bool>(r: &mut [f32; 2 * FFT_EPT as usize]) {
+pub(crate) unsafe fn row_fft<const NX: u32, const INV: bool>(r: &mut [f32; 2 * FFT_EPT as usize]) {
     let s = DynamicSharedArray::<u8, 16>::get();
     let (b, f, bpb) = (
         thread::threadIdx_y(),

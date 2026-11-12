@@ -34,12 +34,12 @@ macro_rules! sides {
         /// A frame side the fused FFT passes have kernels for; the discriminant is the side.
         #[derive(Clone, Copy)]
         #[repr(u32)]
-        enum Side {
+        pub(crate) enum Side {
             $($v = $n),+
         }
 
         impl Side {
-            const ALL: &[Side] = &[$(Side::$v),+];
+            pub(crate) const ALL: &[Side] = &[$(Side::$v),+];
         }
     };
 }
@@ -58,19 +58,19 @@ pub const FUSED_SIDES: &[u32] = &{
 
 /// Launch shapes of the fused passes for one frame and mode count.
 #[derive(Clone, Copy)]
-struct Shape {
+pub(crate) struct Shape {
     /// Sides along y (the column pass) and x (the row passes).
-    ny: Side,
-    nx: Side,
+    pub(crate) ny: Side,
+    pub(crate) nx: Side,
     /// Rows per row-pass block, of `nx / FFT_EPT` threads each.
-    rows: u32,
-    row_smem: u32,
-    col_threads: u32,
-    col_smem: u32,
+    pub(crate) rows: u32,
+    pub(crate) row_smem: u32,
+    pub(crate) col_threads: u32,
+    pub(crate) col_smem: u32,
 }
 
 impl Shape {
-    fn of(d: &ViewDims) -> Result<Self, Error> {
+    pub(crate) fn of(d: &ViewDims) -> Result<Self, Error> {
         d.check()?;
         let [ny, nx] = d.frame;
         let bad = |what: String| Error::Shape(format!("fused passes, {d:?}: {what}"));
@@ -116,7 +116,7 @@ impl Shape {
     }
 
     /// `rows_fwd` (one block row per view) or `rows_inv` (per frame).
-    fn rows(&self, g: &StackGeom, per_view: bool) -> Result<LaunchConfig, Error> {
+    pub(crate) fn rows(&self, g: &StackGeom, per_view: bool) -> Result<LaunchConfig, Error> {
         let planes = g.nf_max as u64 * if per_view { g.nmode as u64 } else { 1 };
         if planes > GRID_Y_MAX {
             return Err(Error::Shape(format!("{planes} planes exceed grid y")));
@@ -128,7 +128,7 @@ impl Shape {
         })
     }
 
-    fn cols(&self, g: &StackGeom) -> Result<LaunchConfig, Error> {
+    pub(crate) fn cols(&self, g: &StackGeom) -> Result<LaunchConfig, Error> {
         if g.nf_max as u64 > GRID_Y_MAX {
             return Err(Error::Shape(format!("{} frames exceed grid y", g.nf_max)));
         }
