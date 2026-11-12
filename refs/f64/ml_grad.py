@@ -11,7 +11,10 @@ the [ny, nx, 2] array over (Re O, Im O) of
     g = dL/dRe(O) + i dL/dIm(O) = 2 dL/dO*,  L = sum_{frames, iobs >= 0} (icalc - iobs ln icalc),
 
 which is PyNX's Poisson LLK times nb_obs up to a constant (get_llk divides by nb_obs, so the
-normalised LLK's gradient is g / nb_obs). The model is written here, not taken from PyNX:
+normalised LLK's gradient is g / nb_obs). Also writes <dir>/ml_grad_values_f64.txt, one row
+`nb_obs L_engine`, with L_engine = sum (icalc - iobs + iobs ln(iobs / icalc)) (icalc where
+iobs = 0), the engine's unnormalised Poisson sum (ops::llk), L plus a constant. The model is
+written here, not taken from PyNX:
 
     psi_m = FFT_ortho(fftshift(P_m O_view q)),  icalc = sum_m |psi_m|^2,
     q = exp(i pi/(lambda z) px^2 ((y - ny/2)^2 + (x - nx/2)^2)),  corners from get_view_coord,
@@ -315,6 +318,9 @@ def main():
                             g.real.ravel(), g.imag.ravel()])
     np.savetxt(f"{d}/ml_grad_f64.txt", rows, fmt=["%d", "%d", "%.17e", "%.17e"])
     print(f"wrote {d}/ml_grad_f64.txt ({len(rows)} rows)")
+    with open(f"{d}/ml_grad_values_f64.txt", "w") as f:
+        f.write(f"{nb_obs} {L + const:.17e}\n")
+    print(f"wrote {d}/ml_grad_values_f64.txt: nb_obs {nb_obs}, L_engine {L + const:.17e}")
 
 
 if __name__ == "__main__":
