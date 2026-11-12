@@ -1393,13 +1393,8 @@ pub mod kernels {
     /// As [`crate::fused::shift_post`].
     #[kernel]
     #[launch_bounds(crate::fused::FUSED_COL_THREADS)]
-    pub unsafe fn fused_shift_post_64(
-        p: FusedPtrs,
-        ctl: *const StackCtl,
-        g: StackGeom,
-        cfg: FusedCfg,
-    ) {
-        unsafe { crate::fused::shift_post::<64>(p, ctl, g, cfg) }
+    pub unsafe fn fused_shift_post_64(p: FusedPtrs, ctl: *const StackCtl, g: StackGeom) {
+        unsafe { crate::fused::shift_post::<64>(p, ctl, g) }
     }
     /// [`crate::fused::shift_post`] for 128-point columns.
     ///
@@ -1408,13 +1403,8 @@ pub mod kernels {
     /// As [`crate::fused::shift_post`].
     #[kernel]
     #[launch_bounds(crate::fused::FUSED_COL_THREADS)]
-    pub unsafe fn fused_shift_post_128(
-        p: FusedPtrs,
-        ctl: *const StackCtl,
-        g: StackGeom,
-        cfg: FusedCfg,
-    ) {
-        unsafe { crate::fused::shift_post::<128>(p, ctl, g, cfg) }
+    pub unsafe fn fused_shift_post_128(p: FusedPtrs, ctl: *const StackCtl, g: StackGeom) {
+        unsafe { crate::fused::shift_post::<128>(p, ctl, g) }
     }
     /// [`crate::fused::shift_post`] for 256-point columns.
     ///
@@ -1423,13 +1413,8 @@ pub mod kernels {
     /// As [`crate::fused::shift_post`].
     #[kernel]
     #[launch_bounds(crate::fused::FUSED_COL_THREADS)]
-    pub unsafe fn fused_shift_post_256(
-        p: FusedPtrs,
-        ctl: *const StackCtl,
-        g: StackGeom,
-        cfg: FusedCfg,
-    ) {
-        unsafe { crate::fused::shift_post::<256>(p, ctl, g, cfg) }
+    pub unsafe fn fused_shift_post_256(p: FusedPtrs, ctl: *const StackCtl, g: StackGeom) {
+        unsafe { crate::fused::shift_post::<256>(p, ctl, g) }
     }
     /// [`crate::fused::shift_post`] for 512-point columns.
     ///
@@ -1438,13 +1423,8 @@ pub mod kernels {
     /// As [`crate::fused::shift_post`].
     #[kernel]
     #[launch_bounds(crate::fused::FUSED_COL_THREADS)]
-    pub unsafe fn fused_shift_post_512(
-        p: FusedPtrs,
-        ctl: *const StackCtl,
-        g: StackGeom,
-        cfg: FusedCfg,
-    ) {
-        unsafe { crate::fused::shift_post::<512>(p, ctl, g, cfg) }
+    pub unsafe fn fused_shift_post_512(p: FusedPtrs, ctl: *const StackCtl, g: StackGeom) {
+        unsafe { crate::fused::shift_post::<512>(p, ctl, g) }
     }
     /// [`crate::fused::spectrum_rows`] for 64-point rows.
     ///
