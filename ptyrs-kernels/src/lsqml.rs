@@ -18,17 +18,14 @@ use crate::bh::BhObs;
 use crate::fused::{FUSED_COLS, block_fft};
 use crate::pixel::{MASKED, PIXEL_THREADS, StackCtl, StackGeom, load_c, stack_frames, store_c};
 
-/// [`lsqml_kernels::LoadedModule::lsqml_cols_64`] forward-FFTs the loaded columns; without
-/// it `work` already holds them column-FFT'd.
-pub const LSQML_FFT: u32 = 1;
-/// The column pass writes `icalc`.
-pub const LSQML_ICALC: u32 = 2;
+/// [`lsqml_kernels::LoadedModule::lsqml_cols_64`] writes `icalc`.
+pub const LSQML_ICALC: u32 = 1;
 /// The column pass scales every mode by `−a_far c / n`, inverse-FFTs and stores it; without
-/// it the forward transform is stored back.
-pub const LSQML_CHI: u32 = 4;
+/// it `work` is only read.
+pub const LSQML_CHI: u32 = 2;
 /// `c` is the Poisson residual `1 − obs / (icalc + 1e-6)`; without it the Gaussian `2 (1 −
 /// √obs / (√icalc + 1e-9))`.
-pub const LSQML_POISSON: u32 = 8;
+pub const LSQML_POISSON: u32 = 4;
 
 /// Floats a [`lsqml_kernels::LoadedModule::lsqml_dots`] block writes: `Σ |u|²`, `Σ |v|²`,
 /// `Re` and `Im` of `Σ u conj(v)`, `Σ Re(conj(u) chi)`, `Σ Re(conj(v) chi)`.
@@ -91,15 +88,16 @@ pub struct LsqmlPre {
 }
 
 /// The column pass, `fused::cols`' thread and shared-memory layout without its reduction
-/// slots: column FFT of columns `u = blockIdx.x * FUSED_COLS + c` of every mode `m` of frame
-/// `fl = blockIdx.y` (under [`LSQML_FFT`]; else `work` holds them transformed), then per
-/// far-field pixel `icalc = Σ_m |Psi_m|² / n` in ascending `m`, written at detector pixel `j`
-/// under [`LSQML_ICALC`]. Under [`LSQML_CHI`] every mode is scaled by `−a_far[f0 + fl] c /
-/// n`, `c` the cost's residual of `obs` and `icalc`, 0 where masked, inverse column-FFT'd
-/// and stored; without it the forward transform is stored. Grid `(nx / FUSED_COLS, nf_max)`,
+/// slots: column FFT of the row transforms in columns `u = blockIdx.x * FUSED_COLS + c` of
+/// every mode `m` of frame `fl = blockIdx.y`, then per far-field pixel `icalc = Σ_m |Psi_m|² /
+/// n` in ascending `m`, written at detector pixel `j` under [`LSQML_ICALC`]. Under
+/// [`LSQML_CHI`] every mode is scaled by `−a_far[f0 + fl] c / n`, `c` the cost's residual of
+/// `obs` and `icalc`, 0 where masked, inverse column-FFT'd and stored; without it nothing is
+/// stored, so `work` keeps its row transforms. Grid `(nx / FUSED_COLS, nf_max)`,
 /// block `nmode * FUSED_COLS * ny / FFT_EPT`, dynamic shared memory `2 * FUSED_COLS * ny`
 /// bytes of counts, then the larger of `nmode * FUSED_COLS` column FFTs and `4 * nmode * ny
-/// * FUSED_COLS` bytes. `counts` must be 16-byte aligned.
+/// * FUSED_COLS` bytes. `counts` must be 16-byte aligned; it and `a_far` are read only under
+/// [`LSQML_CHI`].
 ///
 /// # Safety
 ///
@@ -132,27 +130,27 @@ unsafe fn cols<const NY: u32>(p: LsqmlCols, ctl: *const StackCtl, g: StackGeom, 
         let fft_smem = tile.add(2 * (FUSED_COLS * ny) as usize);
         // `|Psi_m(v, u)|^2` at `(m * ny + v) * FUSED_COLS + c`, over the FFTs' region.
         let power = fft_smem.cast::<f32>();
-        let counts = p.obs.counts.add(*p.obs.order.add(pos) as usize * n);
         let col0 = (thread::blockIdx_x() * FUSED_COLS + nx / 2) % nx;
-        let mut row = tid;
-        while row < ny {
-            async_copy::cp_async_cg_16(
-                tile.add(2 * (row * FUSED_COLS) as usize).cast(),
-                counts.add((row * nx + col0) as usize).cast(),
-            );
-            row += nmode * nslot;
+        if chi {
+            let counts = p.obs.counts.add(*p.obs.order.add(pos) as usize * n);
+            let mut row = tid;
+            while row < ny {
+                async_copy::cp_async_cg_16(
+                    tile.add(2 * (row * FUSED_COLS) as usize).cast(),
+                    counts.add((row * nx + col0) as usize).cast(),
+                );
+                row += nmode * nslot;
+            }
+            async_copy::cp_async_commit_group();
         }
-        async_copy::cp_async_commit_group();
         #[unroll]
         for i in 0..FFT_EPT {
             let v = load_c(p.work, plane + ((f + i * tpf) * nx + u) as usize);
             r[2 * i as usize] = v.0;
             r[2 * i as usize + 1] = v.1;
         }
-        if flags & LSQML_FFT != 0 {
-            block_fft::<NY, false>(&mut r, fft_smem, b, f, bpb);
-            thread::sync_threads();
-        }
+        block_fft::<NY, false>(&mut r, fft_smem, b, f, bpb);
+        thread::sync_threads();
         #[unroll]
         for i in 0..FFT_EPT {
             let (re, im) = (r[2 * i as usize], r[2 * i as usize + 1]);
@@ -195,15 +193,15 @@ unsafe fn cols<const NY: u32>(p: LsqmlCols, ctl: *const StackCtl, g: StackGeom, 
             // Every power is read before the inverse FFT reuses the region.
             thread::sync_threads();
             block_fft::<NY, true>(&mut r, fft_smem, b, f, bpb);
-        }
-        #[unroll]
-        for i in 0..FFT_EPT {
-            let k = 2 * i as usize;
-            store_c(
-                p.work,
-                plane + ((f + i * tpf) * nx + u) as usize,
-                (r[k], r[k + 1]),
-            );
+            #[unroll]
+            for i in 0..FFT_EPT {
+                let k = 2 * i as usize;
+                store_c(
+                    p.work,
+                    plane + ((f + i * tpf) * nx + u) as usize,
+                    (r[k], r[k + 1]),
+                );
+            }
         }
     }
 }
@@ -583,9 +581,10 @@ pub mod lsqml_kernels {
         }
     }
 
-    /// One batch's step sizes over its positions `p` from the [`lsqml_dots`] sums, each frame's chunks summed in order (and left in its chunk 0), `Σ |u|²` and `Σ
-    /// |v|²` plus `λ0 = 1.2e-7` per mode and pixel: per frame the 2×2 system `a11 = Σ |u|² +
-    /// 0.1 mean(Σ |u|²)`, `a22` likewise, `a12 = Σ u conj(v)`, whose solution's real part
+    /// One batch's step sizes over its positions `p` from the [`lsqml_dots`] sums, each
+    /// frame's chunks summed in order (and left in its chunk 0), `Σ |u|²` and `Σ |v|²` plus
+    /// `λ0 = 1.2e-7` per mode and pixel: per frame the 2×2 system `a11 = Σ |u|² + 0.1
+    /// mean(Σ |u|²)`, `a22` likewise, `a12 = Σ u conj(v)`, whose solution's real part
     /// gives `a_obj = 0.9 max(x0, 0) / nmode` and `a_probe = 0.9 max(x1, 0)`;
     /// `rec[3p .. 3p + 3] = (a_far[p], a_obj, a_probe)`. Writes `step[0]`, the mean of the
     /// `a_obj` without their `trim` smallest and largest, and `step[1]`, the mean `a_probe`.
