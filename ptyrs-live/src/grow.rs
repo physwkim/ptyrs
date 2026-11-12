@@ -7,11 +7,15 @@
 
 use std::fmt;
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use cuda_async::device_operation::ExecutionContext;
 use cuda_bindings::{self as sys, CUdeviceptr};
 use cuda_core::vmm::{self, Mapping, PhysicalAllocation, VirtualReservation};
-use cuda_core::{Context, DeviceCopy, DriverError, IntoResult, PinnedHostBuffer, Stream};
+use cuda_core::{
+    Context, DeviceAllocation, DeviceBuffer, DeviceCopy, DriverError, IntoResult, PinnedHostBuffer,
+    RawDeviceBuffer, Stream,
+};
 
 #[derive(Debug)]
 pub enum GrowError {
@@ -28,7 +32,16 @@ pub enum GrowError {
     },
     /// An earlier chunk's initialisation failed; the buffer maps no more.
     Failed,
+    /// A landed count below the last one or past the scan's `nframe`
+    /// ([`LiveFrames::land`](crate::stack::LiveFrames::land)).
+    Land {
+        n: u32,
+        landed: u32,
+        nframe: u32,
+    },
     Driver(DriverError),
+    /// A leased access or a kernel launch failed.
+    Gpu(ptyrs_gpu::Error),
 }
 
 impl fmt::Display for GrowError {
@@ -41,7 +54,12 @@ impl fmt::Display for GrowError {
                 write!(f, "tile {tile:?} past the {}x{} tiles", tiles[0], tiles[1])
             }
             Self::Failed => write!(f, "an earlier chunk initialisation failed"),
+            Self::Land { n, landed, nframe } => write!(
+                f,
+                "landing {n} frames: {landed} already landed, the scan has {nframe}"
+            ),
             Self::Driver(e) => write!(f, "{e}"),
+            Self::Gpu(e) => write!(f, "{e}"),
         }
     }
 }
@@ -54,17 +72,65 @@ impl From<DriverError> for GrowError {
     }
 }
 
-/// A fixed device address range whose chunks are backed on demand. Chunks
-/// are never unmapped before drop, so every byte of a mapped chunk keeps its
-/// address and contents; drop waits for all work queued on the context.
-pub struct GrowBuf {
+impl From<ptyrs_gpu::Error> for GrowError {
+    fn from(e: ptyrs_gpu::Error) -> Self {
+        Self::Gpu(e)
+    }
+}
+
+impl From<cuda_async::error::DeviceError> for GrowError {
+    fn from(e: cuda_async::error::DeviceError) -> Self {
+        Self::Gpu(e.into())
+    }
+}
+
+/// The reservation and its backed chunks, the owner behind
+/// [`GrowBuf::storage`]: every view and every lease taken through it holds
+/// this, so a mapping lives while any work queued through it may reach it.
+struct Reserved {
     // Declaration order is drop order: mappings before the reservation.
-    chunks: Vec<Option<Mapping>>,
+    chunks: Mutex<Vec<Option<Mapping>>>,
     va: VirtualReservation,
+    ctx: Arc<Context>,
+}
+
+// SAFETY: the base and size are the reservation's, fixed for its life, in
+// `ctx`, which the owner keeps alive.
+unsafe impl DeviceAllocation for Reserved {
+    fn device_ptr(&self) -> CUdeviceptr {
+        self.va.base()
+    }
+
+    fn len_bytes(&self) -> usize {
+        self.va.size()
+    }
+
+    fn context(&self) -> Arc<Context> {
+        self.ctx.clone()
+    }
+}
+
+impl Drop for Reserved {
+    fn drop(&mut self) {
+        // Leased work holds this until it completes, but raw copies (the
+        // uploader's into the frame store) do not. Unlike cuMemFree, cuMemUnmap
+        // does not wait for queued work, and a copy or kernel reaching an
+        // unmapped chunk is an MMU fault (Xid 31); no stream is known here.
+        let _ = self.ctx.synchronize();
+    }
+}
+
+/// A fixed device address range whose chunks are backed on demand. Chunks
+/// are never unmapped before the last holder of [`Self::storage`] (a view,
+/// a lease, a captured graph) is gone, so every byte of a mapped chunk keeps
+/// its address and contents.
+pub struct GrowBuf {
+    alloc: Arc<Reserved>,
+    /// The one access tracker over the whole reservation.
+    storage: RawDeviceBuffer,
     chunk: usize,
     mapped: usize,
     failed: bool,
-    ctx: Arc<Context>,
 }
 
 impl GrowBuf {
@@ -75,24 +141,27 @@ impl GrowBuf {
         ctx.bind_to_thread()?;
         let chunk = vmm::align_size(chunk.max(1), vmm::allocation_granularity(ctx.cu_device())?);
         let n = capacity.div_ceil(chunk).max(1);
-        let va = VirtualReservation::new(n * chunk, chunk)?;
+        let alloc = Arc::new(Reserved {
+            chunks: Mutex::new((0..n).map(|_| None).collect()),
+            va: VirtualReservation::new(n * chunk, chunk)?,
+            ctx: ctx.clone(),
+        });
         Ok(Self {
-            chunks: (0..n).map(|_| None).collect(),
-            va,
+            storage: RawDeviceBuffer::foreign(alloc.clone(), n * chunk),
+            alloc,
             chunk,
             mapped: 0,
             failed: false,
-            ctx: ctx.clone(),
         })
     }
 
     /// Base address; the same for the buffer's whole life.
     pub fn ptr(&self) -> CUdeviceptr {
-        self.va.base()
+        self.alloc.va.base()
     }
 
     pub fn capacity(&self) -> usize {
-        self.va.size()
+        self.alloc.va.size()
     }
 
     pub fn chunk_bytes(&self) -> usize {
@@ -103,9 +172,27 @@ impl GrowBuf {
         self.mapped * self.chunk
     }
 
+    /// The whole reservation, for leasing every access to it.
+    pub fn storage(&self) -> &RawDeviceBuffer {
+        &self.storage
+    }
+
+    /// The first `len` `T`s as a typed view sharing [`Self::storage`]'s
+    /// tracker and owner.
+    ///
+    /// # Safety
+    /// Work through the view may only touch elements whose bytes are backed
+    /// when it runs.
+    pub unsafe fn typed<T: DeviceCopy>(&self, len: usize) -> Result<DeviceBuffer<T>, DriverError> {
+        let bytes = self.storage.slice_bytes(0, len * size_of::<T>())?;
+        // SAFETY: the reservation is chunk-aligned; the caller bounds the use.
+        unsafe { DeviceBuffer::from_storage(bytes, len) }
+    }
+
     /// Whether every byte of `r` is backed.
     pub fn is_mapped(&self, r: Range<usize>) -> bool {
-        r.end <= self.capacity() && self.chunk_span(&r).all(|c| self.chunks[c].is_some())
+        let chunks = self.alloc.chunks.lock().unwrap();
+        r.end <= self.capacity() && self.chunk_span(&r).all(|c| chunks[c].is_some())
     }
 
     /// [`map_with`](Self::map_with) without initialisation, for buffers whose
@@ -124,7 +211,7 @@ impl GrowBuf {
     pub fn map_with(
         &mut self,
         r: Range<usize>,
-        mut init: impl FnMut(Range<usize>) -> Result<(), DriverError>,
+        mut init: impl FnMut(Range<usize>) -> Result<(), GrowError>,
     ) -> Result<(), GrowError> {
         if self.failed {
             return Err(GrowError::Failed);
@@ -136,21 +223,22 @@ impl GrowBuf {
             });
         }
         for c in self.chunk_span(&r) {
-            if self.chunks[c].is_some() {
+            if self.alloc.chunks.lock().unwrap()[c].is_some() {
                 continue;
             }
-            self.ctx.bind_to_thread()?;
-            let dev = self.ctx.cu_device();
-            let va = self.va.base() + (c * self.chunk) as u64;
+            let ctx = &self.alloc.ctx;
+            ctx.bind_to_thread()?;
+            let dev = ctx.cu_device();
+            let va = self.ptr() + (c * self.chunk) as u64;
             // The mapping retains the physical memory; the handle can go.
             let phys = PhysicalAllocation::new(dev, self.chunk)?;
             let m = Mapping::new(va, self.chunk, &phys, 0)?;
             vmm::set_access(va, self.chunk, &[dev])?;
-            self.chunks[c] = Some(m);
+            self.alloc.chunks.lock().unwrap()[c] = Some(m);
             self.mapped += 1;
             if let Err(e) = init(c * self.chunk..(c + 1) * self.chunk) {
                 self.failed = true;
-                return Err(e.into());
+                return Err(e);
             }
         }
         Ok(())
@@ -161,15 +249,6 @@ impl GrowBuf {
             return 0..0;
         }
         r.start / self.chunk..r.end.div_ceil(self.chunk)
-    }
-}
-
-impl Drop for GrowBuf {
-    fn drop(&mut self) {
-        // The fields' own drops unmap and free, with the context current. Unlike
-        // cuMemFree, cuMemUnmap does not wait for queued work, and a copy or kernel
-        // reaching an unmapped chunk is an MMU fault (Xid 31); no stream is known here.
-        let _ = self.ctx.synchronize();
     }
 }
 
@@ -217,8 +296,24 @@ impl<T: DeviceCopy> GrowTable<T> {
         self.buf.mapped_bytes()
     }
 
-    /// Appends `recs` and queues their copy on the table's stream, so
-    /// kernels queued there afterwards see them. Returns their indices.
+    /// The whole reservation, for leasing reads of the records.
+    pub fn storage(&self) -> &RawDeviceBuffer {
+        self.buf.storage()
+    }
+
+    /// The first `len` records as a typed view; see [`GrowBuf::typed`].
+    ///
+    /// # Safety
+    /// Work through the view may only read records already pushed when it
+    /// runs.
+    pub unsafe fn typed(&self, len: usize) -> Result<DeviceBuffer<T>, DriverError> {
+        // SAFETY: forwarded to the caller.
+        unsafe { self.buf.typed(len) }
+    }
+
+    /// Appends `recs` and queues their copy on the table's stream, leased as
+    /// a write, so kernels queued there afterwards see them. Returns their
+    /// indices.
     pub fn push(&mut self, recs: &[T]) -> Result<Range<usize>, GrowError> {
         let sz = size_of::<T>();
         let idx = self.len..self.len + recs.len();
@@ -233,6 +328,8 @@ impl<T: DeviceCopy> GrowTable<T> {
             return Ok(idx);
         }
         self.mirror[idx.clone()].copy_from_slice(recs);
+        let ctx = ExecutionContext::new(self.stream.clone());
+        ptyrs_gpu::lease(&ctx, &[], &[self.buf.storage()])?;
         self.stream.context().bind_to_thread()?;
         // SAFETY: the destination was mapped above; the source is the
         // mirror's slots `idx`, never written again while the table lives
@@ -266,7 +363,7 @@ mod tests {
     use cuda_core::{Function, launch_kernel_on_stream};
 
     use super::*;
-    use crate::consumer::Graph;
+    use crate::graph::LiveGraph;
 
     const PTX: &str = r#"
 .version 8.0
@@ -436,8 +533,12 @@ RDONE:
         v
     }
 
+    fn memset32_async(dst: CUdeviceptr, v: u32, n: usize, s: &Stream) -> Result<(), DriverError> {
+        unsafe { sys::cuMemsetD32Async(dst, v, n, s.cu_stream()) }.result()
+    }
+
     fn memset32(dst: CUdeviceptr, v: u32, n: usize, s: &Stream) {
-        crate::consumer::memset32(dst, v, n, s).unwrap();
+        memset32_async(dst, v, n, s).unwrap();
     }
 
     /// Maps `r` and returns the chunk ranges `init` saw.
@@ -528,7 +629,7 @@ RDONE:
         // A failed init leaves its chunk backed and the buffer failed.
         let bad = DriverError(sys::cudaError_enum_CUDA_ERROR_INVALID_VALUE);
         assert!(matches!(
-            b.map_with(5 * ck..5 * ck + 1, |_| Err(bad)),
+            b.map_with(5 * ck..5 * ck + 1, |_| Err(bad.into())),
             Err(GrowError::Driver(e)) if e == bad
         ));
         assert!(b.is_mapped(5 * ck..6 * ck));
@@ -592,10 +693,15 @@ RDONE:
         let mut b = GrowBuf::new(&ctx, 64 << 20, 1 << 20).unwrap();
         let mut count = GrowBuf::new(&ctx, 4, 1).unwrap();
         count.map(0..4).unwrap();
-        let (mut p_buf, mut p_cnt) = (b.ptr(), count.ptr());
-        let mut params = [(&raw mut p_buf).cast::<c_void>(), (&raw mut p_cnt).cast()];
-        let graph = Graph::capture(&s, || unsafe {
-            launch_kernel_on_stream(&bump, (128, 1, 1), (256, 1, 1), 0, &s, &mut params)
+        let (p_buf, p_cnt) = (b.ptr(), count.ptr());
+        let (bs, cs) = (b.storage(), count.storage());
+        let graph = LiveGraph::capture(&s, |ctx| {
+            ptyrs_gpu::lease(ctx, &[cs], &[bs])?;
+            let (mut p_buf, mut p_cnt) = (p_buf, p_cnt);
+            let mut params = [(&raw mut p_buf).cast::<c_void>(), (&raw mut p_cnt).cast()];
+            let s = ctx.get_cuda_stream();
+            unsafe { launch_kernel_on_stream(&bump, (128, 1, 1), (256, 1, 1), 0, s, &mut params) }?;
+            Ok(())
         })
         .unwrap();
         // Element counts per round: growth by uneven steps, a round with no
@@ -605,11 +711,11 @@ RDONE:
         for &n in &rounds {
             let base = b.ptr();
             b.map_with(0..n * 4, |r| {
-                crate::consumer::memset32(base + r.start as u64, 0, r.len() / 4, &s)
+                Ok(memset32_async(base + r.start as u64, 0, r.len() / 4, &s)?)
             })
             .unwrap();
             memset32(count.ptr(), n as u32, 1, &s);
-            graph.launch(&s).unwrap();
+            graph.replay().unwrap();
         }
         s.synchronize().unwrap();
         assert_eq!(b.ptr(), p_buf);
@@ -645,17 +751,24 @@ RDONE:
         let mut ctl = GrowBuf::new(&ctx, 8, 1).unwrap();
         ctl.map(0..8).unwrap();
         memset32(ctl.ptr(), 0, 2, &s);
-        let (mut p_recs, mut p_ctl, mut p_out) = (t.ptr(), ctl.ptr(), out.ptr());
-        let mut sum_params = [
-            (&raw mut p_recs).cast::<c_void>(),
-            (&raw mut p_ctl).cast(),
-            (&raw mut p_out).cast(),
-        ];
-        let mut a_ctl = ctl.ptr();
-        let mut adv_params = [(&raw mut a_ctl).cast::<c_void>()];
-        let graph = Graph::capture(&s, || unsafe {
-            launch_kernel_on_stream(&sum, (64, 1, 1), (256, 1, 1), 0, &s, &mut sum_params)?;
-            launch_kernel_on_stream(&adv, (1, 1, 1), (1, 1, 1), 0, &s, &mut adv_params)
+        let (p_recs, p_ctl, p_out) = (t.ptr(), ctl.ptr(), out.ptr());
+        let (ts, cs, os) = (t.storage(), ctl.storage(), out.storage());
+        let graph = LiveGraph::capture(&s, |ctx| {
+            ptyrs_gpu::lease(ctx, &[ts], &[cs, os])?;
+            let (mut p_recs, mut p_ctl, mut p_out) = (p_recs, p_ctl, p_out);
+            let mut sum_params = [
+                (&raw mut p_recs).cast::<c_void>(),
+                (&raw mut p_ctl).cast(),
+                (&raw mut p_out).cast(),
+            ];
+            let mut a_ctl = p_ctl;
+            let mut adv_params = [(&raw mut a_ctl).cast::<c_void>()];
+            let s = ctx.get_cuda_stream();
+            unsafe {
+                launch_kernel_on_stream(&sum, (64, 1, 1), (256, 1, 1), 0, s, &mut sum_params)?;
+                launch_kernel_on_stream(&adv, (1, 1, 1), (1, 1, 1), 0, s, &mut adv_params)?;
+            }
+            Ok(())
         })
         .unwrap();
 
@@ -680,7 +793,7 @@ RDONE:
             assert_eq!(t.push(&recs).unwrap(), n..n + b);
             n += b;
             memset32(ctl.ptr() + 4, n as u32, 1, &s);
-            graph.launch(&s).unwrap();
+            graph.replay().unwrap();
         }
         let push_ms = t0.elapsed().as_secs_f64() * 1e3;
         let holding = !held.query().unwrap();

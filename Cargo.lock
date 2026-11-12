@@ -1746,11 +1746,13 @@ version = "0.0.1"
 dependencies = [
  "bytes",
  "crossbeam-channel",
+ "cuda-async",
  "cuda-bindings",
  "cuda-core",
  "epics-pva-rs",
  "libc",
  "lz4_flex",
+ "ptyrs-gpu",
  "rust-hdf5",
  "rustfft",
  "serde",

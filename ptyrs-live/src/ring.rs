@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use crossbeam_channel::Sender;
 use cuda_bindings::CUdeviceptr;
-use cuda_core::{Context, DriverError, Event, IntoResult, PinnedHostBuffer};
+use cuda_core::{Context, DeviceBuffer, DriverError, Event, IntoResult, PinnedHostBuffer};
 
 use crate::grow::{GrowBuf, GrowError};
 use crate::stats::{Histogram, thread_cpu_ns, wall_ns};
@@ -217,6 +217,18 @@ impl DeviceStore {
 
     pub fn max_frames(&self) -> u64 {
         self.max_frames
+    }
+
+    /// All `max_frames` frames as one buffer, frame `seq` from element
+    /// `seq * frame_elems`, sharing the store's tracker: the counts the
+    /// kernels take.
+    ///
+    /// # Safety
+    /// Work through the view may only read frames of batches already sent.
+    pub unsafe fn frames_view(&self) -> Result<DeviceBuffer<u16>, DriverError> {
+        let n = self.max_frames as usize * self.frame_elems;
+        // SAFETY: forwarded to the caller.
+        unsafe { self.bufs.lock().unwrap().frames.typed(n) }
     }
 
     /// Bytes of device memory backing the store.

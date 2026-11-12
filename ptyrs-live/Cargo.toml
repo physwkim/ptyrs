@@ -8,6 +8,8 @@ edition.workspace = true
 epics-pva-rs = { path = "/home/stevek/work/epics-rs/crates/epics-pva-rs" }
 cuda-core = { workspace = true }
 cuda-bindings = { workspace = true }
+cuda-async = { workspace = true }
+ptyrs-gpu = { path = "../ptyrs-gpu" }
 # Unsafe (fast) block codec, still bounds-checked on decode.
 lz4_flex = { version = "0.11", default-features = false, features = ["std", "checked-decode"] }
 bytes = "1"

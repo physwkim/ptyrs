@@ -1,26 +1,26 @@
 //! Stand-in for the engine's live graph (DESIGN.md §3 B2, §5 invariant 9):
 //! one CUDA graph, captured before the first frame, consumes the device
 //! store batch by batch while it grows. Each replay starts with
-//! [`NextStack`], so which frames it covers is read on the GPU from the
-//! [`StackCtl`] the graph advances itself; the host only writes how many
-//! frames have landed and launches the same graph again.
+//! [`LiveFrames::step`], so which frames it covers is read on the GPU from
+//! the stack entry the graph advances itself; the host only lands the frames
+//! that arrived and launches the same graph again.
 //!
 //! The per-frame work is a position-weighted checksum, so an end-of-run
 //! check covers every stored frame.
 
 use std::ffi::c_void;
-use std::mem::MaybeUninit;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use crossbeam_channel::Receiver;
 use cuda_bindings as sys;
-use cuda_bindings::CUdeviceptr;
-use cuda_core::{Context, DriverError, IntoResult, Stream, launch_kernel_on_stream};
+use cuda_core::{Context, IntoResult, launch_kernel_on_stream};
+use ptyrs_gpu::StackCtl;
 
+use crate::graph::LiveGraph;
 use crate::grow::{GrowBuf, GrowError};
 use crate::ring::{DeviceStore, FrameBatch};
-use crate::stack::{NextStack, StackCtl};
+use crate::stack::{LiveFrames, frames_only};
 
 const PTX: &str = r#"
 .version 8.0
@@ -90,75 +90,10 @@ pub fn checksum(frame: &[u16]) -> u64 {
         .zip(1u64..)
         .fold(0u64, |a, (&v, j)| a.wrapping_add(u64::from(v) * j))
 }
-
-/// A captured, instantiated CUDA graph.
-pub struct Graph {
-    exec: sys::CUgraphExec,
-    graph: sys::CUgraph,
-    ctx: Arc<Context>,
-}
-
-impl Graph {
-    /// Records into a graph what `record` issues on `stream`; the capture
-    /// is ended on every return path.
-    pub fn capture(
-        stream: &Stream,
-        record: impl FnOnce() -> Result<(), DriverError>,
-    ) -> Result<Self, DriverError> {
-        let ctx = stream.context().clone();
-        ctx.bind_to_thread()?;
-        // SAFETY: the capture is ended below before `stream` is used again.
-        unsafe {
-            stream
-                .begin_capture(sys::CUstreamCaptureMode_enum_CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?
-        };
-        let recorded = record();
-        // SAFETY: the stream is capturing (begun above).
-        let graph = unsafe { stream.end_capture() }?;
-        let mut exec = MaybeUninit::uninit();
-        // SAFETY: `graph` is the valid graph just captured.
-        let inst = recorded.and_then(|()| {
-            unsafe { sys::cuGraphInstantiateWithFlags(exec.as_mut_ptr(), graph, 0) }.result()
-        });
-        if let Err(e) = inst {
-            // SAFETY: `graph` is owned here and not used afterwards.
-            let _ = unsafe { sys::cuGraphDestroy(graph) };
-            return Err(e);
-        }
-        Ok(Self {
-            // SAFETY: instantiation succeeded.
-            exec: unsafe { exec.assume_init() },
-            graph,
-            ctx,
-        })
-    }
-
-    pub fn launch(&self, stream: &Stream) -> Result<(), DriverError> {
-        // SAFETY: `exec` lives as long as `self`.
-        unsafe { sys::cuGraphLaunch(self.exec, stream.cu_stream()) }.result()
-    }
-}
-
-impl Drop for Graph {
-    fn drop(&mut self) {
-        let _ = self.ctx.bind_to_thread();
-        // SAFETY: both handles are owned by `self` and destroyed once.
-        unsafe {
-            let _ = sys::cuGraphExecDestroy(self.exec);
-            let _ = sys::cuGraphDestroy(self.graph);
-        }
-    }
-}
-
-pub fn memset32(dst: CUdeviceptr, v: u32, n: usize, s: &Stream) -> Result<(), DriverError> {
-    // SAFETY: callers pass a mapped range of at least `n` u32.
-    unsafe { sys::cuMemsetD32Async(dst, v, n, s.cu_stream()) }.result()
-}
-
 pub struct ConsumerReport {
     /// Replays of the one captured graph.
     pub launches: u64,
-    /// Frames the graph consumed, read back from its device counter.
+    /// Frames the graph consumed, read back from its stack entry.
     pub consumed: u64,
     /// Checksum of every consumed frame, by sequence number.
     pub checksums: Vec<u64>,
@@ -179,40 +114,41 @@ pub fn run_checksum_consumer(
     let sum = ctx
         .load_module_from_ptx_src(PTX)?
         .load_function("checksum")?;
-    let step = NextStack::load(&ctx, batch, store.max_frames() as u32)?;
-    // The StackCtl, then the landed count.
-    let mut ctl = GrowBuf::new(&ctx, 12, 1)?;
-    ctl.map(0..12)?;
-    let landed_ptr = ctl.ptr() + 8;
-    memset32(ctl.ptr(), 0, 3, &stream)?;
-    let mut out = GrowBuf::new(&ctx, store.max_frames() as usize * 8, 1)?;
-    let (mut p_frames, mut p_elems, mut p_ctl, mut p_out) = (
-        store.frames_ptr(),
-        store.frame_elems() as u32,
-        ctl.ptr(),
-        out.ptr(),
-    );
-    let mut sum_params = [
-        (&raw mut p_frames).cast::<c_void>(),
-        (&raw mut p_elems).cast(),
-        (&raw mut p_ctl).cast(),
-        (&raw mut p_out).cast(),
-    ];
-    let graph = Graph::capture(&stream, || {
-        // SAFETY: `ctl` backs the StackCtl and the count while the graph
-        // lives; the parameter array matches `checksum` and outlives the
-        // capture.
+    let nframe = u32::try_from(store.max_frames())
+        .map_err(|_| ptyrs_gpu::Error::Shape(format!("{} frames pass u32", store.max_frames())))?;
+    let nf_max = NonZeroU32::new(batch.get().min(nframe)).unwrap_or(batch);
+    let mut frames = LiveFrames::new(&stream, &frames_only(nframe), nf_max)?;
+    let mut out = GrowBuf::new(&ctx, nframe as usize * 8, 1)?;
+    // SAFETY: a replay reads only landed frames, which the uploader sent,
+    // and writes their checksums, which `out` backs before they land.
+    let (counts, sums) = unsafe { (store.frames_view()?, out.typed::<u64>(nframe as usize)?) };
+    let elems = store.frame_elems() as u32;
+    let graph = LiveGraph::capture(&stream, |ctx| {
+        frames.step(ctx)?;
+        ptyrs_gpu::lease(
+            ctx,
+            &[counts.storage(), frames.ctl_storage()],
+            &[sums.storage()],
+        )?;
+        let (mut p_frames, mut p_elems, mut p_ctl, mut p_out) = (
+            counts.cu_deviceptr(),
+            elems,
+            frames.ctl_ptr(),
+            sums.cu_deviceptr(),
+        );
+        let mut params = [
+            (&raw mut p_frames).cast::<c_void>(),
+            (&raw mut p_elems).cast(),
+            (&raw mut p_ctl).cast(),
+            (&raw mut p_out).cast(),
+        ];
+        let s = ctx.get_cuda_stream();
+        // SAFETY: the parameters match `checksum` and are copied at the
+        // launch; every buffer is leased above.
         unsafe {
-            step.queue(&stream, ctl.ptr(), landed_ptr)?;
-            launch_kernel_on_stream(
-                &sum,
-                (batch.get(), 1, 1),
-                (256, 1, 1),
-                0,
-                &stream,
-                &mut sum_params,
-            )
-        }
+            launch_kernel_on_stream(&sum, (nf_max.get(), 1, 1), (256, 1, 1), 0, s, &mut params)
+        }?;
+        Ok(())
     })?;
 
     let (mut landed, mut covered, mut launches) = (0u64, 0u64, 0u64);
@@ -221,11 +157,11 @@ pub fn run_checksum_consumer(
             assert_eq!(b.seq0, landed, "batches arrive in order and without gaps");
             landed += b.n;
             out.map(0..landed as usize * 8)?;
-            memset32(landed_ptr, landed as u32, 1, &stream)?;
+            frames.land(u32::try_from(landed).unwrap_or(u32::MAX))?;
             while covered < landed {
-                graph.launch(&stream)?;
+                graph.replay()?;
                 launches += 1;
-                covered = (covered + u64::from(batch.get())).min(landed);
+                covered = (covered + u64::from(nf_max.get())).min(landed);
             }
         }
         Ok(())
@@ -234,12 +170,12 @@ pub fn run_checksum_consumer(
     stream.synchronize()?;
     fed?;
 
-    let mut done = StackCtl::default();
+    let mut done = StackCtl { f0: 0, nf: 0 };
     let mut checksums = vec![0u64; landed as usize];
     // SAFETY: the stream is idle; both sources are mapped and hold at least
     // the bytes copied.
     unsafe {
-        sys::cuMemcpyDtoH_v2((&raw mut done).cast(), ctl.ptr(), 8).result()?;
+        sys::cuMemcpyDtoH_v2((&raw mut done).cast(), frames.ctl_ptr(), 8).result()?;
         sys::cuMemcpyDtoH_v2(
             checksums.as_mut_ptr().cast(),
             out.ptr(),

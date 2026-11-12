@@ -54,7 +54,7 @@ async fn main() {
 
     let ctx = Context::new(gpu).expect("CUDA context");
     let s = ctx.new_stream().expect("stream");
-    let mut o = LiveObject::new(&s, 2, [n, n], 16, 4, FILL, 1).expect("LiveObject");
+    let mut o = LiveObject::new(&s, 2, [n, n], 4, FILL, 1).expect("LiveObject");
     // A tile backs its object rows across the whole width.
     o.ensure((row0 / 16..=(row1 - 1) / 16).map(|ty| [ty as u32, 0]))
         .expect("ensure");
