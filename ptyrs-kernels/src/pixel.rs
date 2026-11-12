@@ -199,6 +199,23 @@ pub struct LlkPartial {
 // SAFETY: repr(C) of four f32, no padding; every bit pattern is a valid value.
 unsafe impl cuda_core::DeviceCopy for LlkPartial {}
 
+/// Sums over unmasked pixels of one frame, or of a column group of one, from which the
+/// frame's intensity scale `s` is updated; `I = sum_m |Psi_m|^2 / n` is the model intensity
+/// before the scale and `calc` the model intensity the counts are compared with.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ScalePartial {
+    /// `sum I`.
+    pub intensity: f32,
+    /// `sum obs I / max(calc, 1e-12)`, for the Poisson cost.
+    pub ratio: f32,
+    /// `sum sqrt(obs I)`, for the amplitude cost.
+    pub amplitude: f32,
+}
+
+// SAFETY: repr(C) of three f32, no padding; every bit pattern is a valid value.
+unsafe impl cuda_core::DeviceCopy for ScalePartial {}
+
 /// Adds an unmasked pixel of count `obs` and calculated intensity `calc >= 0` to `acc`:
 /// Poisson `calc` if `obs <= 0.1` else `calc - obs + obs ln(obs / calc)`, Gaussian
 /// `(obs - calc)^2 / (obs + 1)`, Euclidean `4 (sqrt obs - sqrt calc)^2`, and `calc`.

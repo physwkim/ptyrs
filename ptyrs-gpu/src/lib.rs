@@ -34,10 +34,10 @@ use ptyrs_kernels::kernels::LoadedModule;
 mod fused;
 mod ops;
 
-pub use fused::{Exit, FUSED_SIDES, FusedBufs, FusedInputs, FusedSums};
+pub use fused::{Exit, FUSED_SIDES, FarSums, FusedBufs, FusedInputs, FusedSums, Model};
 pub use ops::{
-    LLK_TREE_LEAVES, LlkPartial, LlkScratch, LlkSums, MASKED, OBJ_TILE, Permutation, StackCtl,
-    StackGeom, StackRef, StackTable, UpdateSums, ViewAddr, ViewDims, Views, view_tiles,
+    LLK_TREE_LEAVES, LlkPartial, LlkScratch, LlkSums, MASKED, OBJ_TILE, Permutation, ScalePartial,
+    StackCtl, StackGeom, StackRef, StackTable, UpdateSums, ViewAddr, ViewDims, Views, view_tiles,
 };
 pub use ptyrs_fft::C32;
 

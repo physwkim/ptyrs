@@ -20,8 +20,9 @@ use cuda_device::{async_copy, device, shared::DynamicSharedArray, thread};
 
 use crate::FFT_EPT;
 use crate::pixel::{
-    LlkPartial, MASKED, StackCtl, StackGeom, SumPtrs, TilePtrs, ViewAddr, cmul, cmul_conj, llk_add,
-    load_c, obj_pixel_sources, psi_index, quad_phase, sample_obj, stack_frames, store_c,
+    LlkPartial, MASKED, ScalePartial, StackCtl, StackGeom, SumPtrs, TilePtrs, ViewAddr, cmul,
+    cmul_conj, llk_add, load_c, obj_pixel_sources, psi_index, quad_phase, sample_obj, stack_frames,
+    store_c,
 };
 
 /// [`rows_fwd`] builds the DM reflection `R = (2 - alpha) PO - (1 - alpha) psi` instead of
@@ -36,6 +37,10 @@ pub const FUSED_PROJECT: u32 = 8;
 /// [`cols`] applies the Poisson LLK gradient scale and the inverse column FFT; never with
 /// `FUSED_PROJECT`.
 pub const FUSED_GRAD: u32 = 32;
+/// [`cols`] compares the counts with `calc = s[f] I` instead of `I = sum_m |Psi_m|^2 / n`.
+pub const FUSED_SCALE: u32 = 64;
+/// [`cols`] writes the [`ScalePartial`] sums of the forward far field.
+pub const FUSED_SCALE_SUMS: u32 = 128;
 
 /// Columns of one frame a [`cols`] block transforms, for every mode.
 pub const FUSED_COLS: u32 = 8;
@@ -81,6 +86,18 @@ pub struct FusedPtrs {
     pub probe_power: *mut f32,
     /// LLK partials of each frame's column groups, `[nf_max, nx / FUSED_COLS]`.
     pub groups: *mut LlkPartial,
+    /// The intensity scale `s`, `[nframe]`.
+    pub scale: *const f32,
+    /// Scale sums of each frame's column groups, `[nf_max, nx / FUSED_COLS]`.
+    pub scale_groups: *mut ScalePartial,
+}
+
+/// Bytes of [`cols`]' reduction slots under `flags` for columns of `ny`: a row of
+/// `FUSED_COLS * ny / FFT_EPT` f32 per LLK term, and per scale sum under `FUSED_SCALE_SUMS`.
+#[device]
+pub fn col_slot_bytes(flags: u32, ny: u32) -> u32 {
+    let rows = if flags & FUSED_SCALE_SUMS != 0 { 7 } else { 4 };
+    4 * rows * FUSED_COLS * (ny / FFT_EPT)
 }
 
 /// Unnormalized in-register FFT of `N` points (64, 128, 256 or 512), inverse under `INV`, as
@@ -187,25 +204,30 @@ pub unsafe fn rows_fwd<const NX: u32>(
 }
 
 /// Pass B: column FFT of columns `u = blockIdx.x * FUSED_COLS + c` of every mode `m` of
-/// frame `fl = blockIdx.y`, then per far-field pixel `calc = sum_m |Psi_m|^2 / n` in
-/// ascending `m`. Under `FUSED_LLK`, `groups[fl, blockIdx.x]` gets the LLK sums of
-/// `kernels::llk` over the block's pixels; under `FUSED_PROJECT`, every mode is scaled as
-/// `kernels::apply_amplitude` scales it, inverse column-FFT'd and stored back. `FUSED_GRAD`
-/// does the same with the scale `2 (1 - obs / max(calc, 1e-12)) / n`, 0 where masked, which
-/// makes the stored waves the gradient of the Poisson LLK sum over `(Re psi, Im psi)`.
-/// Reads `counts`; writes `work` and under `FUSED_LLK` `groups`.
+/// frame `fl = blockIdx.y`, then per far-field pixel the model intensity `I = sum_m
+/// |Psi_m|^2 / n` in ascending `m` and `calc = I`, or under `FUSED_SCALE` `calc = s I` with
+/// `s = scale[f0 + fl]`. Under `FUSED_LLK`, `groups[fl, blockIdx.x]` gets the LLK sums of
+/// `kernels::llk` of `calc` over the block's pixels, and under `FUSED_SCALE_SUMS`
+/// `scale_groups[fl, blockIdx.x]` the [`ScalePartial`] sums. Under `FUSED_PROJECT`, every
+/// mode is scaled by `sqrt(obs / max(calc, 1e-12)) / n`, `1 / n` where masked (with `calc =
+/// I` the scale of `kernels::apply_amplitude`), inverse column-FFT'd and stored back.
+/// `FUSED_GRAD` does the same with the scale `2 s (1 - obs / max(calc, 1e-12)) / n`, 0 where
+/// masked, which makes the stored waves the gradient of the Poisson LLK sum of `calc` over
+/// `(Re psi, Im psi)`. Reads `counts` and under `FUSED_SCALE` `scale`; writes `work`, under
+/// `FUSED_LLK` `groups` and under `FUSED_SCALE_SUMS` `scale_groups`.
 ///
 /// One 1D block of `nmode * FUSED_COLS * tpf` threads (`tpf = ny / FFT_EPT`): thread `tid`
 /// is thread `f = (tid / FUSED_COLS) % tpf` of FFT `m * FUSED_COLS + c`, `c = tid %
 /// FUSED_COLS`, `m = tid / (FUSED_COLS * tpf)`, so a warp's loads and stores cover whole
-/// row segments. Grid `(nx / FUSED_COLS, nf_max)`; dynamic shared memory `16 * FUSED_COLS *
-/// tpf` bytes of LLK slots, `2 * FUSED_COLS * ny` bytes of counts, then the larger of
-/// `nmode * FUSED_COLS` column FFTs and `4 * nmode * ny * FUSED_COLS` bytes.
+/// row segments. Grid `(nx / FUSED_COLS, nf_max)`; dynamic shared memory
+/// `col_slot_bytes(flags, ny)` bytes of reduction slots, `2 * FUSED_COLS * ny` bytes of
+/// counts, then the larger of `nmode * FUSED_COLS` column FFTs and `4 * nmode * ny *
+/// FUSED_COLS` bytes.
 /// `counts` must be 16-byte aligned.
 ///
 /// # Safety
 ///
-/// `NY == g.ny`; `work`, `counts` and under `FUSED_LLK` `groups` hold their shapes for `g`;
+/// `NY == g.ny`; `work`, `counts` and the buffers the flags name hold their shapes for `g`;
 /// `ctl` one entry; launch as above.
 #[device]
 pub unsafe fn cols<const NY: u32>(p: FusedPtrs, ctl: *const StackCtl, g: StackGeom, cfg: FusedCfg) {
@@ -217,7 +239,7 @@ pub unsafe fn cols<const NY: u32>(p: FusedPtrs, ctl: *const StackCtl, g: StackGe
     let (ny, nx, nmode) = (NY, g.nx, g.nmode);
     let n = ny as usize * nx as usize;
     let tpf = ny / FFT_EPT;
-    // Threads per mode, and LLK slots per term.
+    // Threads per mode, and reduction slots per term.
     let nslot = FUSED_COLS * tpf;
     let tid = thread::threadIdx_x();
     let c = tid % FUSED_COLS;
@@ -228,6 +250,7 @@ pub unsafe fn cols<const NY: u32>(p: FusedPtrs, ctl: *const StackCtl, g: StackGe
     let u = thread::blockIdx_x() * FUSED_COLS + c;
     let plane = (fl * nmode + m) as usize * n;
     let llk = cfg.flags & FUSED_LLK != 0;
+    let sums = cfg.flags & FUSED_SCALE_SUMS != 0;
     let project = cfg.flags & FUSED_PROJECT != 0;
     let grad = cfg.flags & FUSED_GRAD != 0;
     let mut r = [0.0f32; 2 * FFT_EPT as usize];
@@ -236,7 +259,7 @@ pub unsafe fn cols<const NY: u32>(p: FusedPtrs, ctl: *const StackCtl, g: StackGe
         let slots = smem.cast::<f32>();
         // The frame's counts under this block's columns, by stored row, copied while the
         // forward FFT runs: read per pixel after it, they stalled the pass.
-        let tile = smem.add(16 * nslot as usize);
+        let tile = smem.add(col_slot_bytes(cfg.flags, ny) as usize);
         let fft_smem = tile.add(2 * (FUSED_COLS * ny) as usize);
         // `|Psi_m(v, u)|^2` at `(m * ny + v) * FUSED_COLS + c`, over the FFTs' region.
         let power = fft_smem.cast::<f32>();
@@ -270,7 +293,14 @@ pub unsafe fn cols<const NY: u32>(p: FusedPtrs, ctl: *const StackCtl, g: StackGe
         thread::sync_threads();
         let inv_n = 1.0 / n as f32;
         let tile = tile.cast::<u16>();
+        // `1 * I == I`: without `FUSED_SCALE` every result is the unscaled pass's, bit for bit.
+        let sf = if cfg.flags & FUSED_SCALE != 0 {
+            *p.scale.add((f0 + fl) as usize)
+        } else {
+            1.0
+        };
         let mut acc = LlkPartial::default();
+        let mut sacc = ScalePartial::default();
         #[unroll]
         for i in 0..FFT_EPT {
             let v = f + i * tpf;
@@ -278,15 +308,25 @@ pub unsafe fn cols<const NY: u32>(p: FusedPtrs, ctl: *const StackCtl, g: StackGe
             for mm in 0..nmode {
                 s += *power.add(((mm * ny + v) * FUSED_COLS + c) as usize);
             }
+            let intensity = s * inv_n;
+            let calc = sf * intensity;
             let obs = *tile.add((((v + ny / 2) % ny) * FUSED_COLS + c) as usize);
-            if llk && m == 0 && obs != MASKED {
-                llk_add(&mut acc, obs as f32, (s * inv_n).max(0.0));
+            if m == 0 && obs != MASKED {
+                let obs = obs as f32;
+                if llk {
+                    llk_add(&mut acc, obs, calc.max(0.0));
+                }
+                if sums {
+                    sacc.intensity += intensity;
+                    sacc.ratio += obs * intensity / calc.max(1e-12);
+                    sacc.amplitude += (obs * intensity).sqrt();
+                }
             }
             if project {
                 let scale = if obs == MASKED {
                     inv_n
                 } else {
-                    (obs as f32 / (s * inv_n).max(1e-12)).sqrt() * inv_n
+                    (obs as f32 / calc.max(1e-12)).sqrt() * inv_n
                 };
                 r[2 * i as usize] *= scale;
                 r[2 * i as usize + 1] *= scale;
@@ -295,40 +335,62 @@ pub unsafe fn cols<const NY: u32>(p: FusedPtrs, ctl: *const StackCtl, g: StackGe
                 let scale = if obs == MASKED {
                     0.0
                 } else {
-                    2.0 * (1.0 - obs as f32 / (s * inv_n).max(1e-12)) * inv_n
+                    2.0 * sf * (1.0 - obs as f32 / calc.max(1e-12)) * inv_n
                 };
                 r[2 * i as usize] *= scale;
                 r[2 * i as usize + 1] *= scale;
             }
         }
-        if llk {
-            // Mode 0's threads are `tid < nslot`; a fixed tree over them per term.
+        if llk || sums {
+            // Mode 0's threads are `tid < nslot`; a fixed tree over them per term reduced,
+            // rows `lo..hi` of the slots `[7][nslot]`: the LLK terms 0 to 3, the scale sums
+            // 4 to 6.
+            let lo = if llk { 0 } else { 4 };
+            let hi = if sums { 7 } else { 4 };
+            let ns = nslot as usize;
             if m == 0 {
-                let terms = [acc.poisson, acc.gaussian, acc.euclidean, acc.icalc];
-                for (j, &a) in terms.iter().enumerate() {
-                    *slots.add(j * nslot as usize + tid as usize) = a;
+                let terms = [
+                    acc.poisson,
+                    acc.gaussian,
+                    acc.euclidean,
+                    acc.icalc,
+                    sacc.intensity,
+                    sacc.ratio,
+                    sacc.amplitude,
+                ];
+                for (j, &t) in terms.iter().enumerate().take(hi).skip(lo) {
+                    *slots.add(j * ns + tid as usize) = t;
                 }
             }
             let mut half = nslot / 2;
             while half > 0 {
                 thread::sync_threads();
                 if tid < half {
-                    for j in 0..4 {
-                        let at = j * nslot as usize + tid as usize;
-                        *slots.add(at) += *slots.add(at + half as usize);
+                    for j in lo..hi {
+                        let r = slots.add(j * ns + tid as usize);
+                        *r += *r.add(half as usize);
                     }
                 }
                 half /= 2;
             }
             thread::sync_threads();
             if tid == 0 {
-                let at = fl * (nx / FUSED_COLS) + thread::blockIdx_x();
-                *p.groups.add(at as usize) = LlkPartial {
-                    poisson: *slots,
-                    gaussian: *slots.add(nslot as usize),
-                    euclidean: *slots.add(2 * nslot as usize),
-                    icalc: *slots.add(3 * nslot as usize),
-                };
+                let at = (fl * (nx / FUSED_COLS) + thread::blockIdx_x()) as usize;
+                if llk {
+                    *p.groups.add(at) = LlkPartial {
+                        poisson: *slots,
+                        gaussian: *slots.add(ns),
+                        euclidean: *slots.add(2 * ns),
+                        icalc: *slots.add(3 * ns),
+                    };
+                }
+                if sums {
+                    *p.scale_groups.add(at) = ScalePartial {
+                        intensity: *slots.add(4 * ns),
+                        ratio: *slots.add(5 * ns),
+                        amplitude: *slots.add(6 * ns),
+                    };
+                }
             }
         }
         if project || grad {

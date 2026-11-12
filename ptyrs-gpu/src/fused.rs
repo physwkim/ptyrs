@@ -15,13 +15,14 @@ use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig};
 use ptyrs_kernels::FFT_EPT;
 use ptyrs_kernels::fused::{
     FUSED_COL_THREADS, FUSED_COLS, FUSED_DM, FUSED_GRAD, FUSED_LLK, FUSED_PROJECT,
-    FUSED_ROW_THREADS, FUSED_TO_PSI, FusedCfg, FusedPtrs,
+    FUSED_ROW_THREADS, FUSED_SCALE, FUSED_SCALE_SUMS, FUSED_TO_PSI, FusedCfg, FusedPtrs,
+    col_slot_bytes,
 };
 
 use crate::ops::grid_1d;
 use crate::{
-    C32, Error, Kernels, LlkPartial, StackCtl, StackGeom, StackRef, UpdateSums, ViewDims, Views,
-    block_fft, check_len, dptr,
+    C32, Error, Kernels, LlkPartial, ScalePartial, StackCtl, StackGeom, StackRef, UpdateSums,
+    ViewDims, Views, block_fft, check_len, dptr,
 };
 
 /// Dynamic shared memory a block gets without opting in.
@@ -67,7 +68,8 @@ pub(crate) struct Shape {
     pub(crate) rows: u32,
     pub(crate) row_smem: u32,
     pub(crate) col_threads: u32,
-    pub(crate) col_smem: u32,
+    /// Column-pass shared memory past the reduction slots: counts tile and FFTs.
+    pub(crate) col_tile_fft: u32,
 }
 
 impl Shape {
@@ -106,14 +108,17 @@ impl Shape {
             rows,
             row_smem: rows * sx,
             col_threads,
-            col_smem: 16 * nslot
-                + 2 * FUSED_COLS * ny
-                + (col_threads / (ny / FFT_EPT)) * sy.max(4 * ny),
+            col_tile_fft: 2 * FUSED_COLS * ny + (col_threads / (ny / FFT_EPT)) * sy.max(4 * ny),
         };
-        if s.col_smem > SMEM_MAX || s.row_smem > SMEM_MAX {
+        // The column pass's most shared memory is under every flag that adds to it.
+        if s.col_smem(FUSED_SCALE_SUMS) > SMEM_MAX || s.row_smem > SMEM_MAX {
             return Err(bad("shared memory per block exceeds 48 KiB".into()));
         }
         Ok(s)
+    }
+
+    fn col_smem(&self, flags: u32) -> u32 {
+        col_slot_bytes(flags, self.ny as u32) + self.col_tile_fft
     }
 
     /// `rows_fwd` (one block row per view) or `rows_inv` (per frame).
@@ -129,14 +134,14 @@ impl Shape {
         })
     }
 
-    pub(crate) fn cols(&self, g: &StackGeom) -> Result<LaunchConfig, Error> {
+    pub(crate) fn cols(&self, g: &StackGeom, flags: u32) -> Result<LaunchConfig, Error> {
         if g.nf_max as u64 > GRID_Y_MAX {
             return Err(Error::Shape(format!("{} frames exceed grid y", g.nf_max)));
         }
         Ok(LaunchConfig {
             grid_dim: (g.nx / FUSED_COLS, g.nf_max, 1),
             block_dim: (self.col_threads, 1, 1),
-            shared_mem_bytes: self.col_smem,
+            shared_mem_bytes: self.col_smem(flags),
         })
     }
 }
@@ -152,6 +157,8 @@ pub struct FusedBufs {
     probe_power: DeviceBuffer<f32>,
     /// `[nf_max, nx / FUSED_COLS]`.
     groups: DeviceBuffer<LlkPartial>,
+    /// `[nf_max, nx / FUSED_COLS]`.
+    scale_groups: DeviceBuffer<ScalePartial>,
 }
 
 impl FusedBufs {
@@ -163,11 +170,13 @@ impl FusedBufs {
             return Err(Error::Shape("nf_max is zero".into()));
         }
         let (n, nf) = (dims.n(), nf_max as usize);
+        let ngroup = nf * (dims.frame[1] / FUSED_COLS) as usize;
         Ok(Self {
             work: DeviceBuffer::zeroed(stream, nf * dims.nmode as usize * n)?,
             probe_q: DeviceBuffer::zeroed(stream, dims.nprobe as usize * n)?,
             probe_power: DeviceBuffer::zeroed(stream, n)?,
-            groups: DeviceBuffer::zeroed(stream, nf * (dims.frame[1] / FUSED_COLS) as usize)?,
+            groups: DeviceBuffer::zeroed(stream, ngroup)?,
+            scale_groups: DeviceBuffer::zeroed(stream, ngroup)?,
         })
     }
 
@@ -183,18 +192,55 @@ impl FusedBufs {
         check_len("work", &self.work, nf * d.nmode as usize * n)?;
         check_len("probe_q", &self.probe_q, d.nprobe as usize * n)?;
         check_len("probe_power", &self.probe_power, n)?;
-        check_len("groups", &self.groups, nf * (g.nx / FUSED_COLS) as usize)
+        let ngroup = nf * (g.nx / FUSED_COLS) as usize;
+        check_len("groups", &self.groups, ngroup)?;
+        check_len("scale_groups", &self.scale_groups, ngroup)
     }
 }
 
 /// What the fused passes read of the scan: its views, the whole scan's counts `[nframe,
-/// ny, nx]`, the object `[nobj, nyo, nxo]` and the probe `[nprobe, ny, nx]`.
+/// ny, nx]`, the object `[nobj, nyo, nxo]`, the probe `[nprobe, ny, nx]` and the model of
+/// the counts.
 #[derive(Clone, Copy)]
 pub struct FusedInputs<'a> {
     pub views: &'a Views,
     pub counts: &'a DeviceBuffer<u16>,
     pub obj: &'a DeviceBuffer<C32>,
     pub probe: &'a DeviceBuffer<C32>,
+    pub model: Model<'a>,
+}
+
+/// The model intensity `calc` the counts are compared with, from the far field `Psi` of a
+/// frame's exit waves: `Default` is `I = sum_m |Psi_m|^2 / n` and leaves every pass's
+/// arithmetic as it is; each field set adds its term. Every pass that compares with the
+/// counts uses `calc`: the LLK, the projection and the gradient.
+#[derive(Clone, Copy, Default)]
+pub struct Model<'a> {
+    /// Per-frame intensity scale `s`, `[nframe]`: `calc = s[f] I` for frame `f`.
+    pub scale: Option<&'a DeviceBuffer<f32>>,
+}
+
+/// Per-frame sums of the forward far field's `calc` against the counts that
+/// [`Kernels::fused_project`] and [`Kernels::fused_llk`] write; `Default` writes none.
+#[derive(Default)]
+pub struct FarSums<'a> {
+    /// The LLK partials `llk[fl]` for `fl < nf`, `[nf_max]`; entries past `nf` not written.
+    pub llk: Option<&'a mut DeviceBuffer<LlkPartial>>,
+    /// The scale sums `scale[f0 + fl]` for `fl < nf`, `[nframe]`; no other entry written.
+    pub scale: Option<&'a mut DeviceBuffer<ScalePartial>>,
+}
+
+impl FarSums<'_> {
+    /// The column-pass flags that write these sums.
+    fn flags(&self) -> u32 {
+        let llk = if self.llk.is_some() { FUSED_LLK } else { 0 };
+        let scale = if self.scale.is_some() {
+            FUSED_SCALE_SUMS
+        } else {
+            0
+        };
+        llk | scale
+    }
 }
 
 /// The update sums [`Kernels::fused_project`] adds to; `Default` adds to neither.
@@ -209,21 +255,19 @@ pub struct FusedSums<'a> {
 /// Which iteration [`Kernels::fused_project`] runs and where its new exit waves go. `psi`
 /// is a DM stack's exit waves, `[nf_max * nmode, ny, nx]` in the M1 layout.
 pub enum Exit<'a> {
-    /// AP: the projected exit waves `P(PO)` stay in [`FusedBufs::work`]. With `llk`, the
-    /// LLK partials of the forward far field, which is the one [`Kernels::llk`] reads after
-    /// `obj_probe_to_psi` and the FFT, go to `llk[fl]` for `fl < nf`.
-    Ap {
-        llk: Option<&'a mut DeviceBuffer<LlkPartial>>,
-    },
+    /// AP: the projected exit waves `P(PO)` stay in [`FusedBufs::work`]. `far` gets the sums
+    /// of the forward far field, the one [`Kernels::llk`] reads after `obj_probe_to_psi` and
+    /// the FFT.
+    Ap { far: FarSums<'a> },
     /// The Poisson LLK gradient, for ML: the far field of `PO` scaled at every pixel by
-    /// `2 (1 - obs / max(calc, 1e-12))`, 0 where masked, as engine's `poisson_grad`, goes
-    /// back to the detector plane in [`FusedBufs::work`]. The object sums' `num` then gets
-    /// the object gradient `2 dL/dO*` of `Ptycho::obj_grad`, and the probe sums' `num` the
-    /// probe's, `Ptycho::probe_grad`. `llk` as for [`Exit::Ap`].
-    Grad {
-        llk: Option<&'a mut DeviceBuffer<LlkPartial>>,
-    },
-    /// The first DM cycle, from PyNX's start `psi = PO`: `psi = P(PO)`.
+    /// `2 s (1 - obs / max(calc, 1e-12))` (`s` the [`Model::scale`] or 1), 0 where masked,
+    /// as engine's `poisson_grad`, goes back to the detector plane in [`FusedBufs::work`].
+    /// The object sums' `num` then gets the object gradient `2 dL/dO*` of `Ptycho::obj_grad`,
+    /// and the probe sums' `num` the probe's, `Ptycho::probe_grad`. `far` as for
+    /// [`Exit::Ap`].
+    Grad { far: FarSums<'a> },
+    /// The first DM cycle, from PyNX's start `psi = PO`: `psi = P(PO)`. A DM cycle's far
+    /// sums are those of `PO`, which [`Kernels::fused_llk`] gives, not of the reflection.
     DmFirst { psi: &'a mut DeviceBuffer<C32> },
     /// A DM cycle: with `R = (2 - alpha) PO - (1 - alpha) psi`, `psi = P(R) + (1 - alpha)
     /// (PO - R)`, as `dm_reflect`, projection and `add_c32` compute it.
@@ -251,19 +295,17 @@ impl Kernels {
     ) -> Result<(), Error> {
         let run = Run::new(self, ctx, *inputs, stack, bufs)?;
         let d = inputs.views.dims();
-        // `far`: what the column pass does to the far field.
-        let (psi, llk, dm, alpha, far) = match exit {
-            Exit::Ap { llk } => (None, llk, false, 0.0, FUSED_PROJECT),
-            Exit::Grad { llk } => (None, llk, false, 0.0, FUSED_GRAD),
-            Exit::DmFirst { psi } => (Some(psi), None, false, 0.0, FUSED_PROJECT),
-            Exit::Dm { psi, alpha } => (Some(psi), None, true, alpha, FUSED_PROJECT),
+        // `pass`: what the column pass does to the far field.
+        let (psi, far, dm, alpha, pass) = match exit {
+            Exit::Ap { far } => (None, far, false, 0.0, FUSED_PROJECT),
+            Exit::Grad { far } => (None, far, false, 0.0, FUSED_GRAD),
+            Exit::DmFirst { psi } => (Some(psi), FarSums::default(), false, 0.0, FUSED_PROJECT),
+            Exit::Dm { psi, alpha } => (Some(psi), FarSums::default(), true, alpha, FUSED_PROJECT),
         };
         if let Some(psi) = &psi {
             check_len("psi", psi, run.g.nf_max as usize * d.nmode as usize * d.n())?;
         }
-        if let Some(out) = &llk {
-            check_len("llk", out, run.g.nf_max as usize)?;
-        }
+        run.check_far(&far)?;
         let FusedSums {
             obj: obj_sums,
             probe: probe_sums,
@@ -293,15 +335,12 @@ impl Kernels {
                 alpha,
             },
         )?;
-        let llk_flag = if llk.is_some() { FUSED_LLK } else { 0 };
         let cfg = FusedCfg {
-            flags: far | llk_flag,
+            flags: pass | run.model_flags() | far.flags(),
             alpha,
         };
         run.cols(bufs, p, cfg)?;
-        if let Some(out) = llk {
-            run.llk_groups(bufs, out)?;
-        }
+        run.far_sums(bufs, far)?;
         let to_psi = if psi.is_some() { FUSED_TO_PSI } else { 0 };
         let cfg = FusedCfg {
             flags: dm_flag | to_psi,
@@ -318,27 +357,27 @@ impl Kernels {
         Ok(())
     }
 
-    /// The stack's LLK partials, as `obj_probe_to_psi`, the FFT and [`Self::llk`] give them:
-    /// `out[fl]` for `fl < nf`, entries past `nf` not written. Three launches; writes
-    /// nothing but `out` and `bufs`.
+    /// The stack's far sums of the far field of `PO`, the one `obj_probe_to_psi` and the FFT
+    /// give, the LLK partials as [`Self::llk`] gives them. Up to four launches; writes
+    /// nothing but `far` and `bufs`.
     pub fn fused_llk(
         &self,
         ctx: &ExecutionContext,
         inputs: &FusedInputs<'_>,
         stack: StackRef<'_>,
         bufs: &mut FusedBufs,
-        out: &mut DeviceBuffer<LlkPartial>,
+        far: FarSums<'_>,
     ) -> Result<(), Error> {
         let run = Run::new(self, ctx, *inputs, stack, bufs)?;
-        check_len("out", out, run.g.nf_max as usize)?;
+        run.check_far(&far)?;
         let p = run.ptrs(bufs);
         run.rows_fwd(bufs, None, p, FusedCfg::default())?;
         let cfg = FusedCfg {
-            flags: FUSED_LLK,
+            flags: run.model_flags() | far.flags(),
             alpha: 0.0,
         };
         run.cols(bufs, p, cfg)?;
-        run.llk_groups(bufs, out)
+        run.far_sums(bufs, far)
     }
 }
 
@@ -367,6 +406,9 @@ impl<'a> Run<'a> {
         check_len("obj", inputs.obj, d.obj_len())?;
         check_len("probe", inputs.probe, d.nprobe as usize * n)?;
         check_len("counts", inputs.counts, d.nframe as usize * n)?;
+        if let Some(scale) = inputs.model.scale {
+            check_len("scale", scale, d.nframe as usize)?;
+        }
         bufs.check(d, &g)?;
         Ok(Self {
             k,
@@ -390,7 +432,29 @@ impl<'a> Run<'a> {
             probe_q: dptr(&bufs.probe_q),
             probe_power: dptr(&bufs.probe_power),
             groups: dptr(&bufs.groups),
+            scale: (self.inputs.model.scale)
+                .map_or(std::ptr::null(), |b| dptr::<f32, f32>(b).cast_const()),
+            scale_groups: dptr(&bufs.scale_groups),
         }
+    }
+
+    /// The column-pass flags of the model.
+    fn model_flags(&self) -> u32 {
+        if self.inputs.model.scale.is_some() {
+            FUSED_SCALE
+        } else {
+            0
+        }
+    }
+
+    fn check_far(&self, far: &FarSums<'_>) -> Result<(), Error> {
+        if let Some(out) = &far.llk {
+            check_len("llk", out, self.g.nf_max as usize)?;
+        }
+        if let Some(out) = &far.scale {
+            check_len("scale sums", out, self.g.nframe as usize)?;
+        }
+        Ok(())
     }
 
     fn ctl(&self) -> *const StackCtl {
@@ -456,9 +520,10 @@ impl<'a> Run<'a> {
             })
     }
 
-    /// Pass B on `bufs.work`; writes `bufs.groups` under `FUSED_LLK`.
+    /// Pass B on `bufs.work`; reads the scale under `FUSED_SCALE`, writes `bufs.groups`
+    /// under `FUSED_LLK` and `bufs.scale_groups` under `FUSED_SCALE_SUMS`.
     fn cols(&self, bufs: &FusedBufs, p: FusedPtrs, cfg: FusedCfg) -> Result<(), Error> {
-        let config = self.sh.cols(&self.g)?;
+        let config = self.sh.cols(&self.g, cfg.flags)?;
         let mut reads = vec![self.inputs.counts.storage(), self.stack.storage()];
         let mut writes = vec![];
         if cfg.flags & (FUSED_PROJECT | FUSED_GRAD) != 0 {
@@ -466,8 +531,14 @@ impl<'a> Run<'a> {
         } else {
             reads.push(bufs.work.storage());
         }
+        if cfg.flags & FUSED_SCALE != 0 {
+            reads.extend(self.inputs.model.scale.map(|b| b.storage()));
+        }
         if cfg.flags & FUSED_LLK != 0 {
             writes.push(bufs.groups.storage());
+        }
+        if cfg.flags & FUSED_SCALE_SUMS != 0 {
+            writes.push(bufs.scale_groups.storage());
         }
         let (ctl, g) = (self.ctl(), self.g);
         self.k.launch(self.ctx, &reads, &writes, |stream| {
@@ -483,14 +554,34 @@ impl<'a> Run<'a> {
         })
     }
 
-    fn llk_groups(
-        &self,
-        bufs: &FusedBufs,
-        out: &mut DeviceBuffer<LlkPartial>,
-    ) -> Result<(), Error> {
+    /// Each frame's `far` sums from the column groups pass B wrote under `far.flags()`.
+    fn far_sums(&self, bufs: &FusedBufs, far: FarSums<'_>) -> Result<(), Error> {
         let ngroup = self.g.nx / FUSED_COLS;
-        self.k
-            .llk_groups(self.ctx, self.stack, self.g, &bufs.groups, ngroup, out)
+        if let Some(out) = far.llk {
+            self.k
+                .llk_groups(self.ctx, self.stack, self.g, &bufs.groups, ngroup, out)?;
+        }
+        if let Some(out) = far.scale {
+            let config = grid_1d(self.g.nf_max as usize)?;
+            let reads = [bufs.scale_groups.storage(), self.stack.storage()];
+            let (groups, ctl, g) = (dptr(&bufs.scale_groups), self.ctl(), self.g);
+            self.k
+                .launch(self.ctx, &reads, &[out.storage()], |stream| {
+                    // SAFETY: `Run::new` checked `bufs` and `check_far` `out` against `g`.
+                    unsafe {
+                        self.k.module.scale_groups(
+                            stream,
+                            config,
+                            groups,
+                            ngroup,
+                            dptr(out),
+                            ctl,
+                            g,
+                        )
+                    }
+                })?;
+        }
+        Ok(())
     }
 
     /// Pass C from `bufs.work` to `psi` (under `FUSED_TO_PSI`) or back to `bufs.work`;

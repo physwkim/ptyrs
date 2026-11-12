@@ -20,8 +20,8 @@ use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 use ptyrs_core::{AddrTable, Geometry, Positions, required_obj_shape};
 use ptyrs_fft::Plan2d;
 use ptyrs_gpu::{
-    C32, Error, Exit, FusedBufs, FusedInputs, FusedSums, Kernels, StackTable, UpdateSums, ViewAddr,
-    ViewDims, Views, record,
+    C32, Error, Exit, FarSums, FusedBufs, FusedInputs, FusedSums, Kernels, Model, StackTable,
+    UpdateSums, ViewAddr, ViewDims, Views, record,
 };
 
 const WARMUP: usize = 5;
@@ -139,8 +139,11 @@ impl Run {
                 counts: &sc.counts,
                 obj: &self.obj,
                 probe: &self.probe,
+                model: Model::default(),
             };
-            let exit = Exit::Ap { llk: None };
+            let exit = Exit::Ap {
+                far: FarSums::default(),
+            };
             let sums = FusedSums {
                 obj: Some(&mut self.obj_sums),
                 probe: Some(&mut self.probe_sums),
@@ -197,6 +200,7 @@ impl Run {
                 counts: &sc.counts,
                 obj: &self.obj,
                 probe: &self.probe,
+                model: Model::default(),
             };
             let psi = &mut self.psi[s];
             let exit = if first {

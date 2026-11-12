@@ -562,6 +562,37 @@ pub mod kernels {
         unsafe { *out.add(fl) = s };
     }
 
+    /// Per-frame scale sums from `ngroup` partials per frame: `out[f0 + fl]` is the sum of
+    /// `groups[fl * ngroup .. (fl + 1) * ngroup]` in ascending order, for every frame `fl <
+    /// nf`; no other entry is written. One thread per frame of `nf_max`.
+    ///
+    /// # Safety
+    ///
+    /// `groups` holds `nf_max * ngroup` records, `out` `nframe`, `ctl` one entry.
+    #[kernel]
+    pub unsafe fn scale_groups(
+        groups: *const ScalePartial,
+        ngroup: u32,
+        out: *mut ScalePartial,
+        ctl: *const StackCtl,
+        g: StackGeom,
+    ) {
+        let (f0, nf) = unsafe { stack_frames(ctl, g) };
+        let fl = global_index();
+        if fl >= nf as usize {
+            return;
+        }
+        let ngroup = ngroup as usize;
+        let mut s = ScalePartial::default();
+        for j in 0..ngroup {
+            let a = unsafe { *groups.add(fl * ngroup + j) };
+            s.intensity += a.intensity;
+            s.ratio += a.ratio;
+            s.amplitude += a.amplitude;
+        }
+        unsafe { *out.add(f0 as usize + fl) = s };
+    }
+
     /// `bin_tile_views` of the stack's views, the views a slab cannot hold added to
     /// `*overflow`.
     ///
