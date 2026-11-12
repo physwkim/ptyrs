@@ -396,11 +396,11 @@ impl Lsqml {
     /// the shared probe (pty-chi's OPR mode 0), starting from `I` of the probe PtychoShelves
     /// renormalises from the data, `I·max_f Σ iobs_f / (4·(ny·nx)²)` in the engine's units.
     ///
-    /// The start is the caller's object and probe, rescaled as for every algorithm by
-    /// [`crate::Ptycho::scale_obj_probe`]. Departures from a pty-chi epoch: the batches come from
-    /// [`random_batches`]' generator, not torch's, each in scan order; the first epoch updates
-    /// the object and probe (pty-chi's default only rescales the probe); no Poisson `a_far`
-    /// jitter; no post-epoch hook.
+    /// The start is the caller's object and probe as given: an algorithm rescales its start
+    /// only where its reference does, as ML does by [`crate::Ptycho::scale_obj_probe`].
+    /// Departures from a pty-chi epoch: the batches come from [`random_batches`]' generator, not
+    /// torch's, each in scan order; the first epoch updates the object and probe (pty-chi's
+    /// default only rescales the probe); no Poisson `a_far` jitter; no post-epoch hook.
     pub fn epoch(
         &mut self,
         addr: &AddrTable,
