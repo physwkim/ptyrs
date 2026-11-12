@@ -1,13 +1,15 @@
-"""Float64 reference of pty-chi BH-CG steps (object and probe) from a fixed state.
+"""Float64 reference of pty-chi BH steps (object and probe) from a fixed state: CG over one
+batch per epoch, steepest descent over mini-batches.
 
     <engine>/target/release/examples/llk_trace <dir> dm 1 2 32 40 4
     micromamba run -n ptyrs-ref python -I refs/f64/bh_step.py <dir>
 
 The state is the one ml_grad.py reads (object [1, 76, 80], probe [2, 32, 32], 40 frames). The
-steps are pty-chi's BHReconstructor, method CG, probe rho 0.01 (refs/ptychi/run_m3.py bh_sweep,
-the runs behind DESIGN B7), positions fixed, over two epochs of unshuffled batches, in two
-cases: "full", one batch of all 40 frames per epoch, and "mini", batches of 16 (frames 0-15,
-16-31, 32-39). Written in the engine's convention (PyNX probe P, psi_m = F(P_m q O_view),
+steps are pty-chi's BHReconstructor with probe rho 0.01 (refs/ptychi/run_m3.py bh_sweep, the
+runs behind DESIGN B7), positions fixed, over two epochs of unshuffled batches, in two cases:
+"full", method CG with one batch of all 40 frames per epoch, and "mini", method GD (steepest
+descent, no direction kept across batches) with batches of 16 (frames 0-15, 16-31, 32-39).
+Written in the engine's convention (PyNX probe P, psi_m = F(P_m q O_view),
 F = FFT_ortho fftshift, corners and q as ml_grad), with the batch frames B:
 
     F(O, P) = sum_B sum_pixels (A - sqrt(iobs))^2, A = sqrt(sum_m |psi_m|^2)
@@ -19,16 +21,18 @@ F = FFT_ortho fftshift, corners and q as ml_grad), with the batch frames B:
     H(u, v) = sum_B,m Re(conj(2 r_m) d2m) + 2 sum_B,pixels [(1 - d/A) sum_m Re(conj(F dm_u) F dm_v)
               + (d/A) c_u c_v],  dm_u = rho_e u_p q O_view + P q u_op,
               d2m = rho_e q (u_p v_op + v_p u_op), c_u = sum_m Re(conj(psi_m / A) F dm_u),
-              d = sqrt(iobs), A + 1e-8 in place of A; u_op are object-direction patches
-    first epoch: eta = -G; later epochs (CG): beta = H(G, eta') / H(eta', eta'),
-        eta = -G + beta eta', eta' the direction of the previous batch
+              d = sqrt(iobs), A + 1e-8 in place of A; u_op = view(u_o), the object direction
+              at the batch's windows
+    full (CG): eta = -G in the first epoch; later beta = H(G, eta') / H(eta', eta'),
+        eta = -G + beta eta', eta' the previous epoch's direction
+    mini (GD): eta = -G of the batch at every step
     alpha = -<G, eta> / H(eta, eta) x (frames in the batch / batch size)
     O += alpha eta_o, P += rho_e alpha eta_p
 
-The object-direction patches are pty-chi's PATCH cache: G_op = view(g_o), eta_op = -G_op +
-beta eta'_op with eta'_op the patches cached when these frames were last in a batch, and H uses
-eta_op while the object moves by eta_o. With one batch per epoch eta_op = view(eta_o); with
-several, eta'_op holds patches of an older direction than eta'_o, which the "mini" case keeps.
+pty-chi's CG under PATCH caches eta_op per frame instead of taking view(eta_o). With one batch
+per epoch the two are equal; with several the cache holds patches from when those frames were
+last in a batch, so H and alpha belong to another direction than the one the object moves by.
+The engine therefore takes GD for mini-batches, which needs no cache.
 
 Conversions from pty-chi, whose probe is P q / sqrt(ny nx) under an unnormalised FFT: its gradF
 is 2 sqrt(ny nx) r_m, its probe gradient and direction are q times the ones above, rho_e is its
@@ -42,12 +46,12 @@ Writes, per case C in full, mini, in the engine's convention:
                               epoch 1, every pixel, row-major
     <dir>/bh_C_probe_f64.txt  `m iy ix re0 im0 re1 im1`, the probe change likewise
     <dir>/bh_C_steps_f64.txt  `step epoch first count beta alpha top bottom`, one row per batch,
-                              beta 0 in epoch 0, alpha after the batch-size factor, top = -<G, eta>,
-                              bottom = H(eta, eta)
+                              beta 0 in epoch 0 and in GD, alpha after the batch-size
+                              factor, top = -<G, eta>, bottom = H(eta, eta)
 Printed checks, with the eps at 0: g_o and g_P against central differences of F along a random
 direction; H(eta, eta) and H(G, eta') against central differences of <G(x + h eta'), u>; the
 quadratic model -alpha top + alpha^2 bottom / 2 against the change of F; pty-chi's own steps
-in f64 on CPU.
+(method CG for full, GD for mini) in f64 on CPU.
 """
 import importlib.util
 import pathlib
@@ -60,7 +64,7 @@ AX = (-2, -1)
 RHO = 0.01
 EPS = 1e-8
 EPOCHS = 2
-CASES = (("full", 40), ("mini", 16))
+CASES = (("full", 40, True), ("mini", 16, False))  # name, batch size, CG
 STEPS = (1e-4, 1e-5, 1e-6)
 
 
@@ -93,7 +97,6 @@ class BH:
         self.m = m
         self.rho = RHO * np.sqrt(np.prod(m.n))
         self.eta_o = self.eta_p = None
-        self.eta_op = np.zeros((len(m.corners), *m.n), complex)
 
     def state(self, obj, probe, idx, eps):
         m = self.m
@@ -137,27 +140,22 @@ class BH:
         s = self.state(obj, probe, idx, eps)
         g_o, g_p = self.grads(s, obj.shape)
         go, gp = g_o, self.rho * g_p
-        gop = ls.views(go, m.corners[idx], m.n)
         if cg:
-            pop = self.eta_op[idx]
+            gop = ls.views(go, m.corners[idx], m.n)
+            pop = ls.views(self.eta_o, m.corners[idx], m.n)
             beta = (self.hess(s, gop, gp, pop, self.eta_p)
                     / self.hess(s, pop, self.eta_p, pop, self.eta_p))
-            eta_o = -go + beta * self.eta_o
-            eta_op = -gop + beta * pop
-            eta_p = -gp + beta * self.eta_p
+            prev = (self.eta_o, self.eta_p)
+            eta_o, eta_p = -go + beta * self.eta_o, -gp + beta * self.eta_p
         else:
-            beta = 0.0
-            eta_o, eta_op, eta_p = -go, -gop, -gp
-        stale = ls.views(eta_o, m.corners[idx], m.n)
-        stale = np.linalg.norm(eta_op - stale) / np.linalg.norm(stale)
-        prev = (self.eta_o, self.eta_p)
+            beta, prev = 0.0, None
+            eta_o, eta_p = -go, -gp
         self.eta_o, self.eta_p = eta_o, eta_p
-        self.eta_op[idx] = eta_op
+        eta_op = ls.views(eta_o, m.corners[idx], m.n)
         top = -(redot(go, eta_o) + redot(gp, eta_p))
         bottom = self.hess(s, eta_op, eta_p, eta_op, eta_p)
         alpha = top / bottom * len(idx) / batch_size
-        return dict(beta=beta, alpha=alpha, top=top, bottom=bottom, stale=stale,
-                    g_o=g_o, g_p=g_p, prev=prev,
+        return dict(beta=beta, alpha=alpha, top=top, bottom=bottom, g_o=g_o, g_p=g_p, prev=prev,
                     d_obj=alpha * eta_o, d_probe=self.rho * alpha * eta_p)
 
 
@@ -167,15 +165,16 @@ def loss(m, obj, probe, idx):
     return ls.frame_llk("gaussian", (np.abs(psi) ** 2).sum(1), m.iobs[idx], m.valid[idx]).sum()
 
 
-def run(m, obj, probe, size):
-    """Numpy BH-CG over EPOCHS epochs: per-step rows, per-epoch changes, per-step results."""
+def run(m, obj, probe, size, cg):
+    """Numpy BH (CG or GD) over EPOCHS epochs: per-step rows, per-epoch changes, per-step
+    results."""
     bh = BH(m)
     rows, changes, steps = [], [], []
     k = 0
     for epoch in range(EPOCHS):
         o0, p0 = obj, probe
         for idx in batches(len(m.corners), size):
-            s = bh.step(obj, probe, idx, epoch > 0, size)
+            s = bh.step(obj, probe, idx, cg and epoch > 0, size)
             s.update(obj=obj, probe=probe, idx=idx)
             steps.append(s)
             rows.append([k, epoch, idx[0], len(idx), s["beta"], s["alpha"], s["top"],
@@ -212,7 +211,7 @@ def check_hess(m, bh, step, obj, probe):
     go, gp = g_o, bh.rho * g_p
     eta_o, eta_p = step["d_obj"] / step["alpha"], step["d_probe"] / (bh.rho * step["alpha"])
     pairs = [("H(eta, eta)", (eta_o, eta_p), (eta_o, eta_p))]
-    if step["prev"][0] is not None:
+    if step["prev"] is not None:
         pairs.append(("H(G, eta')", (go, gp), step["prev"]))
 
     def dot(x_o, x_p, u):
@@ -232,9 +231,9 @@ def check_hess(m, bh, step, obj, probe):
         print(f"    {name}: " + "  ".join(out))
 
 
-def ptychi_run(m, iobs, wavelength, obj, probe, size):
-    """pty-chi BHReconstructor (CG) in f64 on CPU over EPOCHS epochs of unshuffled batches,
-    mapped as in ptyrs-engine/scripts/compare_ptychi_rpie.py; per batch beta, alpha and the
+def ptychi_run(m, iobs, wavelength, obj, probe, size, cg):
+    """pty-chi BHReconstructor (method CG or GD) in f64 on CPU over EPOCHS epochs of unshuffled
+    batches, mapped as in ptyrs-engine/scripts/compare_ptychi_rpie.py; per batch beta, alpha and the
     object and probe changes in the engine's convention."""
     from torch.utils.data import DataLoader
     import ptychi.api as api
@@ -257,7 +256,7 @@ def ptychi_run(m, iobs, wavelength, obj, probe, size):
     pr.orthogonalize_opr_modes.enabled = False
     opts.probe_position_options.optimizable = False
     r = opts.reconstructor_options
-    r.method = "CG"
+    r.method = "CG" if cg else "GD"
     r.batch_size = size
     r.num_epochs = EPOCHS
     r.default_dtype = api.Dtypes.FLOAT64
@@ -335,22 +334,22 @@ def main():
     print(f"object {obj.shape}, probe {probe.shape}, {nframe} frames, probe rho {RHO} "
           f"(rho_e {RHO * np.sqrt(np.prod(m.n)):g})")
     rng = np.random.default_rng(0)
-    for name, size in CASES:
-        print(f"--- {name}: batch {size}, {EPOCHS} epochs")
+    for name, size, cg in CASES:
+        print(f"--- {name}: batch {size}, method {'CG' if cg else 'GD'}, {EPOCHS} epochs")
         check(m, obj, probe, batches(nframe, size)[0], rng)
-        rows, changes, steps = run(m, obj, probe, size)
+        rows, changes, steps = run(m, obj, probe, size, cg)
         print("  H vs central differences of <G(x + h eta'), u> (eps 0), rel diff:")
         for k, s in enumerate(steps):
             print(f"   step {k}:")
             check_hess(m, BH(m), s, s["obj"], s["probe"])
         print("  step  epoch  frames   beta          alpha         top           bottom"
-              "        stale  F before -> after (batch)")
+              "        F before -> after (batch)")
         for s, row in zip(steps, rows):
             k, epoch, first, count = (int(x) for x in row[:4])
             f0 = loss(m, s["obj"], s["probe"], s["idx"])
             f1 = loss(m, s["obj"] + s["d_obj"], s["probe"] + s["d_probe"], s["idx"])
             print(f"  {k:4d} {epoch:5d}  {first:2d}+{count:<3d} {row[4]: .6e} {row[5]: .6e} "
-                  f"{row[6]: .6e} {row[7]: .6e} {s['stale']:.1e}  {f0:.6e} -> {f1:.6e}")
+                  f"{row[6]: .6e} {row[7]: .6e}  {f0:.6e} -> {f1:.6e}")
         ratio = []
         for s in steps:
             df = (loss(m, s["obj"] + s["d_obj"], s["probe"] + s["d_probe"], s["idx"])
@@ -366,9 +365,9 @@ def main():
                                                                             s0["d_obj"]),
               " probe %.3e %.3e" % mg.rel(e["d_probe"], s0["d_probe"]))
 
-        pc = ptychi_run(m, iobs, wavelength, obj0, probe, size)
+        pc = ptychi_run(m, iobs, wavelength, obj0, probe, size, cg)
         assert len(pc) == len(steps), (len(pc), len(steps))
-        print("  pty-chi BH-CG f64 vs numpy, per step (max, L2) / rel:")
+        print("  pty-chi BH f64 vs numpy, per step (max, L2) / rel:")
         for k, (p, s) in enumerate(zip(pc, steps)):
             assert (p["idx"] == s["idx"]).all() and p["epoch"] == rows[k][1]
             rb = abs(p["beta"] - s["beta"]) / abs(s["beta"]) if s["beta"] else abs(p["beta"])
