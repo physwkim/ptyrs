@@ -466,7 +466,16 @@ fn recon_line(
     // Writing to a String cannot fail.
     write!(l, " offline_epochs={}", off.epochs).unwrap();
     let clock = match off.clock {
-        Ok(c) => c,
+        Ok(c) => {
+            let every = settle.every;
+            write!(
+                l,
+                " settle_every={every} offline_settle_frc={:.4}",
+                c.settled()
+            )
+            .unwrap();
+            c
+        }
         Err(e) => {
             write!(l, " clock=none offline: {e}").unwrap();
             return Ok((l, false));

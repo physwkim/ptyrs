@@ -69,6 +69,7 @@ pub struct Clock {
     shape: [usize; 2],
     region: [Range<usize>; 2],
     scan_end: i64,
+    settled: f64,
 }
 
 impl Clock {
@@ -94,15 +95,12 @@ impl Clock {
             ))
             .into());
         }
-        let clock = Self {
-            offline: offline.to_vec(),
-            cropped: Vec::new(),
-            shape,
-            region,
-            scan_end,
-        };
-        let cropped = clock.crop(offline)?;
-        let f = Frc::compute(&cropped, &clock.crop(earlier)?, clock.region_shape())?;
+        let cropped = crop(offline, shape, &region)?;
+        let f = Frc::compute(
+            &cropped,
+            &crop(earlier, shape, &region)?,
+            region_shape(&region),
+        )?;
         if let Some(ring) = below(&f) {
             return Err(ClockError::Moving {
                 ring,
@@ -110,7 +108,20 @@ impl Clock {
                 frc: f.rings[ring].frc,
             });
         }
-        Ok(Self { cropped, ..clock })
+        Ok(Self {
+            offline: offline.to_vec(),
+            cropped,
+            shape,
+            region,
+            scan_end,
+            settled: lowest(&f),
+        })
+    }
+
+    /// The lowest ring's FRC of the offline object against its earlier
+    /// snapshot over the region: how far the reference still moved.
+    pub fn settled(&self) -> f64 {
+        self.settled
     }
 
     /// Time from the scan's end to `taken` (wall ns) if the live object
@@ -127,7 +138,8 @@ impl Clock {
     /// The lowest ring's FRC of `live` against the offline object over the
     /// region, the figure [`Self::check`] holds to [`MATCH`].
     pub fn region_frc(&self, live: &[C64]) -> Result<f64, CoreError> {
-        let f = Frc::compute(&self.cropped, &self.crop(live)?, self.region_shape())?;
+        let live = crop(live, self.shape, &self.region)?;
+        let f = Frc::compute(&self.cropped, &live, region_shape(&self.region))?;
         Ok(lowest(&f))
     }
 
@@ -136,28 +148,27 @@ impl Clock {
     pub fn whole(&self, live: &[C64]) -> Result<f64, CoreError> {
         Ok(lowest(&Frc::compute(&self.offline, live, self.shape)?))
     }
+}
 
-    /// The region's pixels of an object of the clock's shape.
-    fn crop(&self, obj: &[C64]) -> Result<Vec<C64>, CoreError> {
-        let [ny, nx] = self.shape;
-        if obj.len() != ny * nx {
-            return Err(CoreError::Invalid(format!(
-                "{} pixels for a {:?} object",
-                obj.len(),
-                self.shape
-            )));
-        }
-        let [rows, cols] = &self.region;
-        Ok(rows
-            .clone()
-            .flat_map(|y| &obj[y * nx..][cols.clone()])
-            .copied()
-            .collect())
+/// `region`'s pixels of an object of `shape`.
+fn crop(obj: &[C64], shape: [usize; 2], region: &[Range<usize>; 2]) -> Result<Vec<C64>, CoreError> {
+    let [ny, nx] = shape;
+    if obj.len() != ny * nx {
+        return Err(CoreError::Invalid(format!(
+            "{} pixels for a {shape:?} object",
+            obj.len()
+        )));
     }
+    let [rows, cols] = region;
+    Ok(rows
+        .clone()
+        .flat_map(|y| &obj[y * nx..][cols.clone()])
+        .copied()
+        .collect())
+}
 
-    fn region_shape(&self) -> [usize; 2] {
-        self.region.clone().map(|r| r.len())
-    }
+fn region_shape(region: &[Range<usize>; 2]) -> [usize; 2] {
+    region.clone().map(|r| r.len())
 }
 
 /// The first ring under [`MATCH`].
@@ -202,6 +213,7 @@ mod tests {
         let offline = noise(1);
         let earlier = plus(&offline, 0.02, 2);
         let clock = Clock::new(&offline, &earlier, SHAPE, ALL, 1_000).unwrap();
+        assert!((MATCH..0.9999).contains(&clock.settled()));
         let rot = C64::from_polar(1.0, 0.7);
         let close: Vec<C64> = plus(&offline, 0.05, 3).iter().map(|z| z * rot).collect();
         let far = plus(&offline, 0.5, 4);
