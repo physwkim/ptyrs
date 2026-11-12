@@ -2,7 +2,7 @@
 //! patches with the flat start on held-out scans.
 //!
 //! `cargo run --release -p ptyrs-nn --example train_ptychonn -- <out_dir> [frame] [bin] [nscan] [epochs] [width] [per_scan]`
-//! (defaults 256, 4, 2000, 30, 32, 10). Each training scan contributes `per_scan` of its 100
+//! (defaults 256, 4, 10000, 30, 32, 10). Each training scan contributes `per_scan` of its 100
 //! frames, drawn at random: neighbouring frames of a scan see nearly the same object pixels, so
 //! fewer frames from more scans give more distinct objects for the same epoch time. Writes the
 //! predictor to `out_dir`, and after every epoch the training state to `out_dir/checkpoint`,
@@ -94,7 +94,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (frame, bin, nscan, epochs, width, per_scan) = (
         next(256)?,
         next(4)?,
-        next(2000)?,
+        next(10000)?,
         next(30)?,
         next(32)?,
         next(10)?,
