@@ -12,7 +12,7 @@
 //! whatever else its stack holds.
 //!
 //! Per cycle, with [`Gpu::fence`] between the steps: A per stack one fused pass (exit waves,
-//! LLK, projection, object sums), the leaf probe sums of the own stacks and their subtree; B
+//! LLK, projection, an own stack's leaf probe sums, object sums), then the probe subtree; B
 //! the object sums' max, the other regions' subtree roots pulled by copy engine and the pair
 //! tree above them; C the other regions' max words pulled by copy engine, object and probe
 //! updates, then each owner packs the updated rows its neighbours read; D each receiver pulls
@@ -25,8 +25,8 @@ use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{Context, DeviceBuffer, Stream};
 use ptyrs_core::{AddrTable, View};
 use ptyrs_gpu::{
-    C32, Exit, FusedBufs, FusedInputs, Kernels, LlkPartial, LlkSums, StackTable, UpdateSums,
-    ViewAddr, ViewDims, Views, view_tiles,
+    C32, Exit, FusedBufs, FusedInputs, FusedSums, Kernels, LlkPartial, LlkSums, StackTable,
+    UpdateSums, ViewAddr, ViewDims, Views, view_tiles,
 };
 
 use crate::exchange::{self, Pull, Run, Runs};
@@ -707,8 +707,7 @@ impl State {
         let links = links.as_ref().expect("DistAp::new installs the links");
         let np = plan.np() as u32;
 
-        // A: per stack the fused pass, then for an own stack the probe sums of its projected
-        // exit waves, still in L2.
+        // A: per stack the fused pass, which adds an own stack's probe sums too.
         for s in leaf_sums.iter_mut() {
             ptyrs_gpu::zero(&ctx, &mut s.num)?;
             ptyrs_gpu::zero(&ctx, &mut s.den)?;
@@ -726,10 +725,11 @@ impl State {
                 (true, Some(i)) => Some(&mut llk[i]),
                 _ => None,
             };
-            k.fused_project(&ctx, &inputs, at, Exit::Ap { llk }, bufs, obj_sums.as_mut())?;
-            if let Some(sums) = mine.and_then(|_| leaf_sums.get_mut(st.leaf - r * plan.k)) {
-                k.psi_to_probe(&ctx, views, at, bufs.work(), obj, sums)?;
-            }
+            let sums = FusedSums {
+                obj: obj_sums.as_mut(),
+                probe: mine.and_then(|_| leaf_sums.get_mut(st.leaf - r * plan.k)),
+            };
+            k.fused_project(&ctx, &inputs, at, Exit::Ap { llk }, bufs, sums)?;
         }
         if let Some(t) = tree.as_ref() {
             for a in &t.own {
@@ -1143,7 +1143,11 @@ mod tests {
                 let exit = Exit::Ap {
                     llk: Some(&mut llk),
                 };
-                k.fused_project(&ec, &inputs, table.at(s), exit, &mut bufs, Some(&mut sums))
+                let sums = FusedSums {
+                    obj: Some(&mut sums),
+                    probe: None,
+                };
+                k.fused_project(&ec, &inputs, table.at(s), exit, &mut bufs, sums)
                     .unwrap();
                 drop(ec);
                 let work = bufs.work().to_host_vec(stream).unwrap();
