@@ -16,7 +16,7 @@ use cuda_async::device_operation::{DeviceOp, ExecutionContext};
 use cuda_core::sys::CUevent_flags_enum_CU_EVENT_DEFAULT as TIMED;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 use ptyrs_gpu::{C32, CG_BLOCKS, Error, GradKernels, Kernels, ViewDims, gamma_parts, record};
-use ptyrs_tile::TileDots;
+use ptyrs_tile::TileCgDots;
 
 /// Deterministic values in `[-scale, scale)`.
 fn noise(len: usize, seed: u64, scale: f32) -> Vec<C32> {
@@ -63,7 +63,7 @@ impl Op {
 
 struct Impls {
     grad: GradKernels,
-    tile: TileDots,
+    tile: TileCgDots,
     lens: [u32; 2],
 }
 
@@ -170,9 +170,9 @@ fn main() {
     let ex = ExecutionContext::new(stream.clone());
     let jit0 = cutile::tile_kernel::jit_compile_count();
     let t = std::time::Instant::now();
-    let tile = TileDots::new(&stream, &dims).unwrap();
+    let tile = TileCgDots::new(&stream, &dims).unwrap();
     println!(
-        "object {} and probe {} values, gamma {gamma} pairs; TileDots::new compiled {} \
+        "object {} and probe {} values, gamma {gamma} pairs; TileCgDots::new compiled {} \
          kernels in {:.2} s",
         lens[0],
         lens[1],

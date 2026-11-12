@@ -1,5 +1,5 @@
-//! `ptyrs_tile::TileDots` against the SIMT `ptyrs_gpu::GradKernels` dot products, bit for
-//! bit, and its BH `dots` against f64 sums on the host, at the ML timing case's sizes: an
+//! `ptyrs_tile::TileCgDots` against the SIMT `ptyrs_gpu::GradKernels` dot products, bit for
+//! bit, and `TileDots::dots` against f64 sums on the host, at the ML timing case's sizes: an
 //! object of 636x632 values, two grid strides with the last block partial, and a probe of
 //! 2x256x256, which leaves half the blocks without an element.
 
@@ -9,7 +9,7 @@ use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, DeviceCopy};
 use cutile::tile_kernel::jit_compile_count;
 use ptyrs_gpu::{BhDisp, C32, CG_BLOCKS, GradKernels, Kernels, ViewDims, gamma_parts};
-use ptyrs_tile::TileDots;
+use ptyrs_tile::{TileCgDots, TileDots};
 
 /// Deterministic values in `[-scale, scale)`.
 fn noise(len: usize, seed: u64, scale: f32) -> Vec<C32> {
@@ -68,7 +68,6 @@ struct Gpu {
     stream: Arc<CudaStream>,
     ex: ExecutionContext,
     grad: GradKernels,
-    tile: TileDots,
     dims: ViewDims,
     lens: [u32; 2],
 }
@@ -77,14 +76,11 @@ fn gpu() -> Gpu {
     let ctx = CudaContext::new(0).expect("CUDA device 0");
     let k = Kernels::load(&ctx).expect("load ptyrs-gpu kernels");
     let stream: Arc<CudaStream> = ctx.default_stream();
-    let dims = ml_dims();
-    let tile = TileDots::new(&stream, &dims).unwrap();
     Gpu {
         ex: ExecutionContext::new(stream.clone()),
         grad: GradKernels::load(&k).unwrap(),
-        tile,
         lens: [636 * 632, 2 * 256 * 256],
-        dims,
+        dims: ml_dims(),
         stream,
     }
 }
@@ -96,6 +92,7 @@ fn gpu() -> Gpu {
 fn cg_dots_match_simt_bitwise() {
     let g = gpu();
     let s = &g.stream;
+    let tile = TileCgDots::new(s, &g.dims).unwrap();
     let parts0 = flat(&noise(2 * CG_BLOCKS as usize, 1, 3.0));
     let mut parts = [up(s, &parts0), up(s, &parts0)];
     let mut h = [Vec::new(), Vec::new()];
@@ -109,8 +106,7 @@ fn cg_dots_match_simt_bitwise() {
         g.grad
             .beta_parts(&g.ex, &gd, &mut hd[0], n, &mut parts[0], first)
             .unwrap();
-        g.tile
-            .beta_parts(&g.ex, &gd, &mut hd[1], n, &mut parts[1], first)
+        tile.beta_parts(&g.ex, &gd, &mut hd[1], n, &mut parts[1], first)
             .unwrap();
         let [hs, ht] = hd.map(|b| flat(&down(s, &b)));
         assert_bits("h after beta_parts", &ht, &hs);
@@ -126,7 +122,7 @@ fn cg_dots_match_simt_bitwise() {
     for (npart, src) in [(2 * CG_BLOCKS, &parts[0]), (gamma, &many)] {
         let mut pair = [up(s, &[0.0f32; 2]), up(s, &[0.0f32; 2])];
         g.grad.sum_parts(&g.ex, src, npart, &mut pair[0]).unwrap();
-        g.tile.sum_parts(&g.ex, src, npart, &mut pair[1]).unwrap();
+        tile.sum_parts(&g.ex, src, npart, &mut pair[1]).unwrap();
         let [want, got] = pair.map(|b| down(s, &b));
         assert_bits(&format!("sum_parts of {npart}"), &got, &want);
     }
@@ -135,7 +131,7 @@ fn cg_dots_match_simt_bitwise() {
     for (x, n) in h.iter().zip(g.lens) {
         let xd = up(s, x);
         g.grad.norm_parts(&g.ex, &xd, n, &mut norm[0]).unwrap();
-        g.tile.norm_parts(&g.ex, &xd, n, &mut norm[1]).unwrap();
+        tile.norm_parts(&g.ex, &xd, n, &mut norm[1]).unwrap();
     }
     let [want, got] = [&norm[0], &norm[1]].map(|b| down(s, b));
     assert_bits("norm_parts", &got, &want);
@@ -143,8 +139,7 @@ fn cg_dots_match_simt_bitwise() {
     g.grad
         .sum_parts(&g.ex, &norm[0], CG_BLOCKS, &mut pair[0])
         .unwrap();
-    g.tile
-        .sum_parts(&g.ex, &norm[0], CG_BLOCKS, &mut pair[1])
+    tile.sum_parts(&g.ex, &norm[0], CG_BLOCKS, &mut pair[1])
         .unwrap();
     let [want, got] = pair.map(|b| down(s, &b));
     assert_bits("sum_parts of CG_BLOCKS", &got, &want);
@@ -160,6 +155,7 @@ fn cg_dots_match_simt_bitwise() {
 fn bh_dots_match_f64_host_sums() {
     let g = gpu();
     let s = &g.stream;
+    let tile = TileDots::new(s, &g.dims).unwrap();
     let [u, v] = [30u64, 31].map(|seed| g.lens.map(|n| noise(n as usize, seed, 1.0)));
     let [ud, vd] = [&u, &v].map(|x| [up(s, &x[0]), up(s, &x[1])]);
     let scale = [1.0, 0.37f32];
@@ -172,7 +168,7 @@ fn bh_dots_match_f64_host_sums() {
             v: cg.then(|| [&vd[0], &vd[1]]),
         };
         let mut parts = up(s, &vec![f32::NAN; 4 * CG_BLOCKS as usize]);
-        g.tile.dots(&g.ex, &d, &mut parts).unwrap();
+        tile.dots(&g.ex, &d, &mut parts).unwrap();
         let got = down(s, &parts);
         for (i, n) in g.lens.map(|n| n as usize).into_iter().enumerate() {
             let depth = 2 * n.div_ceil(stride) + 255 + 1;
@@ -215,6 +211,7 @@ fn bh_dots_match_f64_host_sums() {
 fn uncompiled_lengths_are_refused() {
     let g = gpu();
     let s = &g.stream;
+    let tile = TileCgDots::new(s, &g.dims).unwrap();
     let n = g.lens[0] - 1;
     let x = up(s, &noise(n as usize, 3, 1.0));
     let mut h = up(s, &noise(n as usize, 4, 1.0));
@@ -222,11 +219,10 @@ fn uncompiled_lengths_are_refused() {
     let mut pair = up(s, &[0.0f32; 2]);
     let jit = jit_compile_count();
     assert!(
-        g.tile
-            .beta_parts(&g.ex, &x, &mut h, n, &mut parts, 0)
+        tile.beta_parts(&g.ex, &x, &mut h, n, &mut parts, 0)
             .is_err()
     );
-    assert!(g.tile.norm_parts(&g.ex, &x, n, &mut parts).is_err());
-    assert!(g.tile.sum_parts(&g.ex, &parts, 100, &mut pair).is_err());
+    assert!(tile.norm_parts(&g.ex, &x, n, &mut parts).is_err());
+    assert!(tile.sum_parts(&g.ex, &parts, 100, &mut pair).is_err());
     assert_eq!(jit_compile_count(), jit, "a refused launch compiled");
 }
