@@ -77,8 +77,10 @@ pub struct RecvCfg {
     pub queue: NonZeroUsize,
     /// Regenerate and compare the crop of every uid divisible by this; 0 off.
     pub verify_every: i32,
-    /// Only a position that never comes waits this long, holding one worker
-    /// throughout; arrival lag on its own connection is < 1 ms.
+    /// A frame whose position is still missing this long after the frame
+    /// arrived is dropped. The frames behind it wait in the ring meanwhile,
+    /// so a wait past what the ring holds stalls the workers. On its own
+    /// connection the position trailed its frame by up to 15.8 ms at 20 kHz.
     pub pos_wait_ms: i64,
     pub batch: NonZeroUsize,
     pub flush_us: i64,
@@ -540,7 +542,6 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
     let wcfg = WorkerCfg {
         geom,
         verify_every: cfg.verify_every,
-        pos_wait_ns: cfg.pos_wait_ms * 1_000_000,
     };
     let follow = cfg
         .recon
@@ -553,6 +554,7 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
         flush_ns: cfg.flush_us * 1000,
         idle: Duration::from_micros(cfg.idle_us),
         events: 64,
+        pos_wait_ns: cfg.pos_wait_ms * 1_000_000,
     };
     let h5_readers = match &cfg.source {
         SourceCfg::H5(h) => h.readers,
@@ -688,28 +690,28 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
     // below: the source and its Sender go, the workers drain, the uploader
     // lands what they committed and the consumer sees its last batch.
     let stop = Arc::new(AtomicBool::new(false));
+    let pos = Arc::new(PosTable::new(1 << 16));
     let uploader = {
         let (ring, ctx, stop, place) = (ring.clone(), ctx.clone(), stop.clone(), place.clone());
-        let store = store.clone();
+        let (store, pos) = (store.clone(), pos.clone());
         std::thread::Builder::new()
             .name("h2d".into())
             .spawn(move || {
                 place.enter(place.h2d.as_ref().map(std::slice::from_ref));
-                run_uploader(ring, ctx, store, ucfg, stop, Some(btx))
+                run_uploader(ring, ctx, store, pos, ucfg, stop, Some(btx))
             })
             .unwrap()
     };
     let (tx, rx) = work_queue(cfg.queue);
-    let pos = Arc::new(PosTable::new(1 << 16));
     let handles: Vec<_> = (0..workers)
         .map(|i| {
-            let (rx, ring, pos, place) = (rx.clone(), ring.clone(), pos.clone(), place.clone());
+            let (rx, ring, place) = (rx.clone(), ring.clone(), place.clone());
             let truth = truth.clone();
             std::thread::Builder::new()
                 .name(format!("decode{i}"))
                 .spawn(move || {
                     place.enter(place.workers[i].as_ref().map(std::slice::from_ref));
-                    worker(rx, ring, pos, wcfg, truth)
+                    worker(rx, ring, wcfg, truth)
                 })
                 .unwrap()
         })
@@ -859,22 +861,23 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
 
     let st = state.lock().unwrap();
     let ps = pos_stats.lock().unwrap();
-    let (wr, decode, pos_after) = WorkerReport::merge(reports);
+    let (wr, decode) = WorkerReport::merge(reports);
     // The checks below spread over every listed CPU, not the runtime's.
     place.enter(place.all.as_deref());
 
-    // End-to-end check of the frames the ring still holds: their place in
-    // the device store against the host ring slot and against a fresh
-    // synthesis of the same crop; the position and uid of every stored frame.
+    // End-to-end check of the landed frames the ring still holds: their
+    // place in the device store against the host ring slot and against a
+    // fresh synthesis of the same crop; the position and uid of every stored
+    // frame.
     let se = crop * crop;
     let host = ring.host_frames();
     let filled: Vec<(usize, u64, i32)> = (0..ring.slots())
-        .filter_map(|i| ring.slot(i).map(|(seq, uid)| (i, seq, uid)))
+        .filter_map(|i| ring.slot(i).map(|(f, uid)| (i, f, uid)))
         .collect();
     let mut dev = vec![0u16; filled.len() * se];
-    for (k, &(_, seq, _)) in filled.iter().enumerate() {
+    for (k, &(_, f, _)) in filled.iter().enumerate() {
         store
-            .read_frames(seq..seq + 1, &mut dev[k * se..(k + 1) * se])
+            .read_frames(f..f + 1, &mut dev[k * se..(k + 1) * se])
             .map_err(fail("store readback"))?;
     }
     let threads = std::thread::available_parallelism().map_or(8, |n| n.get());
@@ -972,7 +975,7 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
         Consumed::Sums(c) => c.consumed,
         Consumed::Recon(r) => r.rep.landed,
     };
-    let rx_lost = FrameLoss::new(&st, &wr, consumed);
+    let rx_lost = FrameLoss::new(&st, wr.decode_err, up.pos_missing, consumed);
     let mut s = String::new();
     // Writing to a String cannot fail.
     let mut line = |args: fmt::Arguments| {
@@ -983,7 +986,7 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
         "recv expected={frames} received_unique={} gpu_frames={} lost={lost} rx_lost={} \
          unaccounted={} dup={} beyond={} \
          gap_events={} gap_frames={} out_of_order={} queue_full={} rejected={} placeholders={} \
-         decode_err={} pos_missing={} pos_mismatch={} pos_waits={} pos_updates={} pos_rejected={}",
+         decode_err={} pos_missing={} pos_waits={} pos_updates={} pos_rejected={}",
         st.unique,
         up.frames,
         rx_lost.total(),
@@ -997,9 +1000,8 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
         st.rejected,
         st.placeholders,
         wr.decode_err,
-        wr.pos_missing,
-        wr.pos_mismatch,
-        wr.pos_waited,
+        up.pos_missing,
+        up.pos_waits,
         ps.updates,
         ps.rejected,
     ));
@@ -1056,8 +1058,8 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
     line(format_args!("recv decode {}", decode.summary()));
     line(format_args!(
         "recv pos_before_frame={} pos_after_frame {}",
-        wr.pos_first,
-        pos_after.summary()
+        up.pos_first,
+        up.pos_after_frame.summary()
     ));
     line(format_args!(
         "recv verify sampled={} sampled_bad={} ring_slots_checked={} h2d_mismatch_slots={h2d_bad} \
@@ -1103,7 +1105,7 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
             posts.llk.last().copied().unwrap_or(f64::NAN)
         ));
     }
-    let bad = (wr.verify_bad + wr.pos_mismatch) as usize
+    let bad = wr.verify_bad as usize
         + h2d_bad
         + e2e_bad
         + store_pos_bad

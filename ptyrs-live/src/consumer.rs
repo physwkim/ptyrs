@@ -153,7 +153,7 @@ pub fn run_checksum_consumer(
     let (mut landed, mut covered, mut launches) = (0u64, 0u64, 0u64);
     let fed = (|| -> Result<(), GrowError> {
         for b in batches.iter() {
-            assert_eq!(b.seq0, landed, "batches arrive in order and without gaps");
+            assert_eq!(b.f0, landed, "batches arrive in order and without gaps");
             landed += b.n;
             frames.land(u32::try_from(landed).unwrap_or(u32::MAX))?;
             while covered < landed {
@@ -196,6 +196,7 @@ mod tests {
 
     use super::*;
     use crate::graph::WarmUp;
+    use crate::pos::{Pos, PosTable};
     use crate::ring::{Ring, UploaderConfig, run_uploader};
     use std::num::NonZeroUsize;
 
@@ -208,6 +209,7 @@ mod tests {
         let (se, total, batch) = (65536, 203u64, NonZeroU32::new(7).unwrap());
         let ring = Arc::new(Ring::new(&ctx, 16, se).unwrap());
         let store = Arc::new(DeviceStore::new(&ctx, total as usize, se).unwrap());
+        let pos = Arc::new(PosTable::new(256));
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, rx) = crossbeam_channel::unbounded();
         let (cap_tx, cap_rx) = crossbeam_channel::bounded(1);
@@ -219,13 +221,15 @@ mod tests {
         let warm = WarmUp::end();
         let uploader = {
             let (ring, ctx, stop, store) = (ring.clone(), ctx.clone(), stop.clone(), store.clone());
+            let pos = pos.clone();
             let cfg = UploaderConfig {
                 batch: NonZeroUsize::new(5).unwrap(),
                 flush_ns: 100_000,
                 idle: Duration::from_micros(20),
                 events: 4,
+                pos_wait_ns: 1_000_000_000,
             };
-            std::thread::spawn(move || run_uploader(ring, ctx, store, cfg, stop, Some(tx)))
+            std::thread::spawn(move || run_uploader(ring, ctx, store, pos, cfg, stop, Some(tx)))
         };
         let frame = |seq: u64| -> Vec<u16> {
             (0..se)
@@ -236,7 +240,15 @@ mod tests {
             let mut s = ring.reserve();
             let seq = s.seq();
             s.frame().copy_from_slice(&frame(seq));
-            s.commit(seq as i32, 0.0, 0.0, 0, 0);
+            pos.insert(
+                seq as i32,
+                Pos {
+                    x: 0.0,
+                    y: 0.0,
+                    t_rx: 0,
+                },
+            );
+            s.commit(seq as i32, 0, 0);
             std::thread::sleep(Duration::from_micros(200));
         }
         stop.store(true, Ordering::Release);

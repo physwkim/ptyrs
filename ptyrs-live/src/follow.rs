@@ -272,7 +272,7 @@ fn back_ahead(
         let views = views_of(&ap, &place, &b.positions);
         if let Some(k) = &mut backer {
             k.back(&views)?;
-            if b.seq0 + b.n >= u64::from(ap.shape.nframe) {
+            if b.f0 + b.n >= u64::from(ap.shape.nframe) {
                 backer = None;
             }
         }
@@ -384,7 +384,7 @@ pub fn run_ap_consumer(
             }
             for (b, views) in got.drain(..) {
                 assert_eq!(
-                    b.seq0,
+                    b.f0,
                     positions.len() as u64,
                     "batches arrive in order and without gaps"
                 );
@@ -631,6 +631,7 @@ mod tests {
     use super::*;
     use crate::farfield::{Ptycho, PtychoSpec, ScanPath};
     use crate::graph::WarmUp;
+    use crate::pos::{Pos, PosTable};
     use crate::ring::{Ring, UploaderConfig, run_uploader};
 
     struct Streamed {
@@ -694,15 +695,18 @@ mod tests {
         };
         cap_rx.recv().expect("the graphs are captured");
         let warm = WarmUp::end();
+        let table = Arc::new(PosTable::new(1 << 16));
         let uploader = {
             let (ring, ctx, stop, store) = (ring.clone(), ctx.clone(), stop.clone(), store.clone());
+            let table = table.clone();
             let up = UploaderConfig {
                 batch: NonZeroUsize::new(4).unwrap(),
                 flush_ns: 100_000,
                 idle: Duration::from_micros(20),
                 events: 4,
+                pos_wait_ns: 1_000_000_000,
             };
-            std::thread::spawn(move || run_uploader(ring, ctx, store, up, stop, Some(tx)))
+            std::thread::spawn(move || run_uploader(ring, ctx, store, table, up, stop, Some(tx)))
         };
         let (mut k, mut scan_end) = (0, 0);
         for burst in [5, 1, 13, 0, 17] {
@@ -712,7 +716,9 @@ mod tests {
                 }
                 let mut s = ring.reserve();
                 s.frame().copy_from_slice(&p.frame(k));
-                s.commit(k as i32, pos[k].0, pos[k].1, 0, 0);
+                let (x, y) = pos[k];
+                table.insert(k as i32, Pos { x, y, t_rx: 0 });
+                s.commit(k as i32, 0, 0);
                 k += 1;
             }
             std::thread::sleep(Duration::from_millis(20));

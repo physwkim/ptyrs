@@ -1,10 +1,10 @@
 //! Source-independent half of the receive path. Every input (PVA, ZMQ)
 //! turns an update into a [`Work`] and hands it to [`SourceStats::accept`];
-//! decode workers then match the position, crop and commit into the pinned
-//! [`Ring`], whose uploader emits the one "new frame batch" event.
+//! decode workers then crop and commit into the pinned [`Ring`], whose
+//! uploader lands each frame once its position is in and emits the one
+//! "new frame batch" event.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use bytes::Bytes;
 
@@ -13,7 +13,6 @@ use crate::codec::{
     bytemuck_u16_mut, lz4_decompress_into,
 };
 use crate::handoff::{WorkRx, WorkTx};
-use crate::pos::PosTable;
 use crate::ring::Ring;
 use crate::sched::{parse_cpu_list, pin_current, set_util_min};
 use crate::stats::{Histogram, mono_ns, process_cpu_ns, thread_cpu_ns};
@@ -109,67 +108,44 @@ pub struct WorkerCfg {
     pub geom: Geometry,
     /// Regenerate and compare the crop of every uid divisible by this; 0 off.
     pub verify_every: i32,
-    /// How long a frame waits for its position before it is dropped.
-    pub pos_wait_ns: i64,
 }
 
 #[derive(Default)]
 pub struct WorkerReport {
     pub frames: u64,
     pub decode_err: u64,
-    pub pos_missing: u64,
-    pub pos_waited: u64,
-    pub pos_mismatch: u64,
     pub verified: u64,
     pub verify_bad: u64,
     pub cpu_ns: i64,
     pub decode: Option<Histogram>,
-    /// Frames whose position had already arrived when the frame did.
-    pub pos_first: u64,
-    /// Frame arrival → position arrival, for the rest.
-    pub pos_after_frame: Option<Histogram>,
 }
 
 impl WorkerReport {
     /// Sum of several workers' reports.
-    pub fn merge(reports: Vec<WorkerReport>) -> (WorkerReport, Histogram, Histogram) {
+    pub fn merge(reports: Vec<WorkerReport>) -> (WorkerReport, Histogram) {
         let mut wr = WorkerReport::default();
         let mut decode = Histogram::new(100_000);
-        let mut pos_after = Histogram::new(1_000_000);
         for r in reports {
-            wr.pos_first += r.pos_first;
             wr.frames += r.frames;
             wr.decode_err += r.decode_err;
-            wr.pos_missing += r.pos_missing;
-            wr.pos_waited += r.pos_waited;
-            wr.pos_mismatch += r.pos_mismatch;
             wr.verified += r.verified;
             wr.verify_bad += r.verify_bad;
             wr.cpu_ns += r.cpu_ns;
             if let Some(h) = r.decode {
                 decode.merge(&h);
             }
-            if let Some(h) = r.pos_after_frame {
-                pos_after.merge(&h);
-            }
         }
-        (wr, decode, pos_after)
+        (wr, decode)
     }
 }
 
-/// Decode → position match → crop → ring, until every sender is gone.
-/// One image-sized scratch per worker, allocated once.
-pub fn worker(
-    rx: WorkRx,
-    ring: Arc<Ring>,
-    pos: Arc<PosTable>,
-    cfg: WorkerCfg,
-    truth: Arc<dyn Truth>,
-) -> WorkerReport {
+/// Decode → crop → ring, until every sender is gone; the uploader joins
+/// each frame with its position. One image-sized scratch per worker,
+/// allocated once.
+pub fn worker(rx: WorkRx, ring: Arc<Ring>, cfg: WorkerCfg, truth: Arc<dyn Truth>) -> WorkerReport {
     let g = cfg.geom;
     let mut r = WorkerReport {
         decode: Some(Histogram::new(100_000)),
-        pos_after_frame: Some(Histogram::new(1_000_000)),
         ..Default::default()
     };
     let mut img = vec![0u16; g.pixels()];
@@ -178,7 +154,7 @@ pub fn worker(
     let rows = g.y0 * g.width..(g.y0 + g.crop) * g.width;
     let row_bytes = g.crop * 2;
     let cpu0 = thread_cpu_ns();
-    'frames: while let Some(w) = rx.recv() {
+    while let Some(w) = rx.recv() {
         let t = mono_ns();
         let res = match w.codec {
             Codec::None if w.payload.len() == g.pixels() * 2 => Ok(()),
@@ -198,31 +174,13 @@ pub fn worker(
             _ => bytemuck_u16(&img),
         };
         r.decode.as_mut().unwrap().record(mono_ns() - t);
-        let deadline = mono_ns() + cfg.pos_wait_ns;
-        let p = loop {
-            if let Some(p) = pos.get(w.uid) {
-                break p;
-            }
-            if mono_ns() > deadline {
-                r.pos_missing += 1;
-                continue 'frames;
-            }
-            r.pos_waited += 1;
-            std::thread::sleep(Duration::from_micros(20));
-        };
-        match p.t_rx - w.t_rx {
-            lag if lag > 0 => r.pos_after_frame.as_mut().unwrap().record(lag),
-            _ => r.pos_first += 1,
-        }
-        let (x, y) = (p.x, p.y);
-        r.pos_mismatch += ((x, y) != truth.position(w.uid)) as u64;
         let mut slot = ring.reserve();
         let dst = bytemuck_u16_mut(slot.frame());
         for (i, d) in dst.chunks_exact_mut(row_bytes).enumerate() {
             let off = ((g.y0 + i) * g.width + g.x0) * 2;
             d.copy_from_slice(&src[off..off + row_bytes]);
         }
-        slot.commit(w.uid, x, y, w.t_rx, w.t_pub);
+        slot.commit(w.uid, w.t_rx, w.t_pub);
         r.frames += 1;
         if cfg.verify_every > 0 && w.uid % cfg.verify_every == 0 {
             truth.fill(w.uid, g.crop_region(), &mut vbuf);
@@ -249,22 +207,23 @@ pub struct FrameLoss {
     /// Frames the full work queue turned away.
     pub queue_full: u64,
     pub decode_err: u64,
-    /// Frames whose position did not arrive in time.
+    /// Frames the uploader dropped because their position did not come in time.
     pub pos_missing: u64,
     /// Received, not consumed on the GPU and in none of the counts above.
     pub unaccounted: u64,
 }
 
 impl FrameLoss {
-    /// From the source's and the workers' counts and the frames the GPU
-    /// consumed, once every worker and the uploader have drained.
-    pub fn new(st: &SourceStats, wr: &WorkerReport, on_gpu: u64) -> Self {
-        let counted = st.queue_full + wr.decode_err + wr.pos_missing;
+    /// From the source's counts, the workers' decode errors, the uploader's
+    /// frames without a position and the frames the GPU consumed, once
+    /// every worker and the uploader have drained.
+    pub fn new(st: &SourceStats, decode_err: u64, pos_missing: u64, on_gpu: u64) -> Self {
+        let counted = st.queue_full + decode_err + pos_missing;
         Self {
             rejected: st.rejected,
             queue_full: st.queue_full,
-            decode_err: wr.decode_err,
-            pos_missing: wr.pos_missing,
+            decode_err,
+            pos_missing,
             unaccounted: st.unique.saturating_sub(on_gpu).saturating_sub(counted),
         }
     }
@@ -494,22 +453,17 @@ mod tests {
             rejected,
             ..SourceStats::new(10)
         };
-        let wr = |decode_err, pos_missing| WorkerReport {
-            decode_err,
-            pos_missing,
-            ..Default::default()
-        };
-        let none = FrameLoss::new(&st(0, 0), &wr(0, 0), 10);
+        let none = FrameLoss::new(&st(0, 0), 0, 0, 10);
         assert_eq!((none, none.total()), (FrameLoss::default(), 0));
-        let counted = FrameLoss::new(&st(1, 0), &wr(2, 3), 4);
+        let counted = FrameLoss::new(&st(1, 0), 2, 3, 4);
         assert_eq!(
             (counted.queue_full, counted.decode_err, counted.pos_missing),
             (1, 2, 3)
         );
         assert_eq!((counted.unaccounted, counted.total()), (0, 6));
-        let silent = FrameLoss::new(&st(1, 0), &wr(0, 0), 7);
+        let silent = FrameLoss::new(&st(1, 0), 0, 0, 7);
         assert_eq!((silent.unaccounted, silent.total()), (2, 3));
-        let rejected = FrameLoss::new(&st(0, 1), &wr(0, 0), 10);
+        let rejected = FrameLoss::new(&st(0, 1), 0, 0, 10);
         assert_eq!((rejected.rejected, rejected.total()), (1, 1));
     }
 }
