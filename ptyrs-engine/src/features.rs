@@ -5,10 +5,10 @@
 use std::f64::consts::PI;
 use std::ops::Range;
 
-use ptyrs_core::{C64, Object, Probe, View};
+use ptyrs_core::{C64, Probe, View};
 
 use crate::ops::natural;
-use crate::{Fft2, Observed};
+use crate::{Fft2, Observed, Ptycho};
 
 /// A cost of the modelled intensity `icalc` against `iobs`, summed over unmasked pixels.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -92,16 +92,11 @@ fn translate(a: &[C64], offset: [f64; 2], axis: Option<usize>, fft: &Fft2) -> Ve
 /// grid, `W = DFT⁻¹(DFT(P·q)·exp(−2πi f·offset))` with `f` numpy's `fftfreq`:
 /// `psi[k] = fftshift(W[probe_k, frame_k] · O[obj_k, win_k])`.
 ///
-/// `psi` holds one object-plane plane per view and is overwritten; with zero offsets it is
+/// `views` are those of `p` to model, `p`'s object, probe and quadratic phase the state; `psi`
+/// holds one object-plane plane per view and is overwritten; with zero offsets it is
 /// [`crate::obj_probe_to_psi`] up to FFT rounding.
-pub fn obj_probe_shift_to_psi(
-    views: &[View],
-    object: &Object,
-    probe: &Probe,
-    quad: &[C64],
-    offsets: &[[f64; 2]],
-    psi: &mut [C64],
-) {
+pub fn obj_probe_shift_to_psi(p: &Ptycho, views: &[View], offsets: &[[f64; 2]], psi: &mut [C64]) {
+    let (object, probe) = (p.object(), p.probe());
     let [ny, nx] = probe.plane_shape();
     let n = ny * nx;
     assert_eq!(
@@ -110,7 +105,7 @@ pub fn obj_probe_shift_to_psi(
         "psi must hold one plane per view"
     );
     let fft = &Fft2::new([ny, nx]);
-    let a = probe_spectra(probe, quad, fft);
+    let a = probe_spectra(probe, p.quad(), fft);
     for (v, out) in views.iter().zip(psi.chunks_exact_mut(n)) {
         let w = translate(
             &a[v.probe as usize * n..][..n],
@@ -130,24 +125,23 @@ pub fn obj_probe_shift_to_psi(
 /// Gradient of `cost` over the offsets of [`obj_probe_shift_to_psi`]: `[∂C/∂dy, ∂C/∂dx]` for
 /// every frame of `offsets` (zero for a frame without views),
 /// `Σ_views Σ Re(conj(g)·V·∂W/∂offset)` with `V` the object window and
-/// `g = 2·∂C/∂exit* = 2·DFT⁻¹(slope·psi)` from the far field `psi` of the frame's modes.
+/// `g = 2·∂C/∂exit* = 2·DFT⁻¹(slope·psi)` from the far field `psi` of the frame's modes against
+/// `p`'s observed intensities.
 pub fn position_grad(
+    p: &Ptycho,
     views: &[View],
-    object: &Object,
-    probe: &Probe,
-    quad: &[C64],
-    obs: &Observed,
     offsets: &[[f64; 2]],
     cost: Cost,
 ) -> Vec<[f64; 2]> {
+    let (object, probe, obs) = (p.object(), p.probe(), p.observed());
     let [ny, nx] = probe.plane_shape();
     let n = ny * nx;
     let nxo = object.plane_shape()[1];
     let fft = &Fft2::new([ny, nx]);
     let mut g = vec![C64::default(); views.len() * n];
-    obj_probe_shift_to_psi(views, object, probe, quad, offsets, &mut g);
+    obj_probe_shift_to_psi(p, views, offsets, &mut g);
     fft.forward(&mut g);
-    let a = probe_spectra(probe, quad, fft);
+    let a = probe_spectra(probe, p.quad(), fft);
     let mut grad = vec![[0.0; 2]; offsets.len()];
     let mut start = 0;
     for frame_views in views.chunk_by(|a, b| a.frame == b.frame) {

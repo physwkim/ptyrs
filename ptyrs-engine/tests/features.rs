@@ -7,10 +7,10 @@
 use ptyrs_core::{C64, Scan};
 use ptyrs_engine::{
     Cost, Fft2, Ptycho, background_cost, background_grad, intensity_grad, llk,
-    obj_probe_shift_to_psi, obj_probe_to_psi, position_grad, quad_phase, scale_psi, shift,
+    obj_probe_shift_to_psi, obj_probe_to_psi, position_grad, scale_psi, shift,
 };
 
-pub mod common;
+mod common;
 
 fn state() -> (Scan, Ptycho) {
     let (scan, object, probe) = common::dm_scenario(32, 40, 2, 2e5, 4.0);
@@ -72,15 +72,14 @@ fn position_matches_pos_grad_ref() {
         })
         .collect();
     let views = p.addr().views();
-    let quad = quad_phase(&scan.geometry);
     let fft = Fft2::new(scan.geometry.frame);
     let mut psi = vec![C64::default(); views.len() * p.probe().plane_len()];
 
     // zero offsets: the unshifted operator
     let mut plain = psi.clone();
-    obj_probe_to_psi(views, p.object(), p.probe(), &quad, &mut plain);
+    obj_probe_to_psi(views, p.object(), p.probe(), p.quad(), &mut plain);
     let zero = vec![[0.0; 2]; offsets.len()];
-    obj_probe_shift_to_psi(views, p.object(), p.probe(), &quad, &zero, &mut psi);
+    obj_probe_shift_to_psi(&p, views, &zero, &mut psi);
     let d = psi
         .iter()
         .zip(&plain)
@@ -89,20 +88,12 @@ fn position_matches_pos_grad_ref() {
     let m = plain.iter().map(|b| b.norm()).fold(0.0, f64::max);
     assert!(d / m < 1e-13, "zero offsets: max rel {}", d / m);
 
-    obj_probe_shift_to_psi(views, p.object(), p.probe(), &quad, &offsets, &mut psi);
+    obj_probe_shift_to_psi(&p, views, &offsets, &mut psi);
     fft.forward(&mut psi);
     assert_values(&p, &psi, include_str!("data/pos_grad_values_f64.txt"));
 
     for (cost, col) in [(Cost::Poisson, 3), (Cost::Amplitude, 5)] {
-        let g = position_grad(
-            views,
-            p.object(),
-            p.probe(),
-            &quad,
-            p.observed(),
-            &offsets,
-            cost,
-        );
+        let g = position_grad(&p, views, &offsets, cost);
         let got: Vec<f64> = g.iter().flatten().copied().collect();
         let want: Vec<f64> = rows.iter().flat_map(|r| [r[col], r[col + 1]]).collect();
         let e = max_rel(&got, &want);
@@ -114,13 +105,7 @@ fn position_matches_pos_grad_ref() {
 fn far_field(scan: &Scan, p: &Ptycho) -> Vec<C64> {
     let views = p.addr().views();
     let mut psi = vec![C64::default(); views.len() * p.probe().plane_len()];
-    obj_probe_to_psi(
-        views,
-        p.object(),
-        p.probe(),
-        &quad_phase(&scan.geometry),
-        &mut psi,
-    );
+    obj_probe_to_psi(views, p.object(), p.probe(), p.quad(), &mut psi);
     Fft2::new(scan.geometry.frame).forward(&mut psi);
     psi
 }
