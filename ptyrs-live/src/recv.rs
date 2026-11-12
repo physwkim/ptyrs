@@ -625,16 +625,22 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
             let px: Vec<[f32; 2]> = f.probe.iter().map(|c| [c.re, c.im]).collect();
             let probe = AmpPhase::new(&px, f.ap.shape.nprobe as usize, [n, n], 1);
             let (tx, rx) = crossbeam_channel::bounded(1);
+            let (llk, llk_rx) = crossbeam_channel::unbounded();
             let (bin, place) = (pc.bin, place.clone());
             let h = std::thread::Builder::new()
                 .name("pv".into())
                 .spawn(move || {
                     place.enter(place.rt.as_deref());
-                    publish(&out, probe, rx, bin)
+                    publish(&out, probe, rx, llk_rx, bin)
                 })
                 .unwrap();
-            let period = Duration::from_millis(pc.period_ms);
-            (Some(Preview { period, tx }), Some(h), Some((server, rt)))
+            let preview = Preview {
+                period: Duration::from_millis(pc.period_ms),
+                tx,
+                llk_period: Duration::from_millis(pc.llk_period_ms),
+                llk,
+            };
+            (Some(preview), Some(h), Some((server, rt)))
         }
         _ => (None, None, None),
     };
@@ -1085,8 +1091,14 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
     }
     if let (Some(posts), Some(pc)) = (pv_posts, pv) {
         line(format_args!(
-            "recv pv prefix={} bin={} period_ms={} object_posts={posts}",
-            pc.prefix, pc.bin, pc.period_ms
+            "recv pv prefix={} bin={} period_ms={} llk_period_ms={} object_posts={} llk_epochs={} llk_last={:.6e}",
+            pc.prefix,
+            pc.bin,
+            pc.period_ms,
+            pc.llk_period_ms,
+            posts.objects,
+            posts.llk.len(),
+            posts.llk.last().copied().unwrap_or(f64::NAN)
         ));
     }
     let bad = (wr.verify_bad + wr.pos_mismatch) as usize
@@ -1203,6 +1215,7 @@ mod tests {
                     prefix: "PTY:R:".into(),
                     bin: NonZeroUsize::new(2).unwrap(),
                     period_ms: 100,
+                    llk_period_ms: 700,
                 }),
             }),
         };
@@ -1309,6 +1322,8 @@ mod tests {
             "2",
             "--recon-pv-period-ms",
             "100",
+            "--recon-pv-llk-period-ms",
+            "700",
         ]);
         let t = toml(
             r#"
@@ -1369,6 +1384,7 @@ mod tests {
             prefix = "PTY:R:"
             bin = 2
             period-ms = 100
+            llk-period-ms = 700
             "#,
         );
         assert_eq!(f, want);

@@ -9,7 +9,8 @@
 //! run has. At most two epochs are queued ahead of the host, so frames that
 //! arrive land behind at most one epoch already running. With a
 //! [`Preview`], it also hands a viewer a copy of the object from the first
-//! epoch on, read on the host only once a later epoch's fence shows it done.
+//! epoch on, read on the host only once a later epoch's fence shows it done,
+//! and each epoch's LLK, read once a period.
 //! [`offline_ap`] runs the same AP on the same stored frames until it
 //! settles, the reference the clock compares against.
 
@@ -75,8 +76,8 @@ impl Default for ReconCfg {
 impl ReconCfg {
     /// `--recon ALGO --recon-nf-max --recon-inertia --recon-chunk-mib
     /// --recon-snap-every --recon-snaps --recon-settle-max`, and
-    /// `--recon-pv PREFIX --recon-pv-bin --recon-pv-period-ms`; `None`
-    /// without `--recon`.
+    /// `--recon-pv PREFIX --recon-pv-bin --recon-pv-period-ms
+    /// --recon-pv-llk-period-ms`; `None` without `--recon`.
     pub fn from_args(a: &Args) -> Option<Self> {
         let algo = a.opt("recon")?;
         let d = Self::default();
@@ -93,6 +94,7 @@ impl ReconCfg {
                 PvCfg {
                     bin: a.get("recon-pv-bin", p.bin),
                     period_ms: a.get("recon-pv-period-ms", p.period_ms),
+                    llk_period_ms: a.get("recon-pv-llk-period-ms", p.llk_period_ms),
                     ..p
                 }
             }),
@@ -196,10 +198,16 @@ pub struct View {
 
 /// Where the live run sends [`View`]s: one copy is queued after an epoch
 /// once `period` has passed since the last and `tx` holds none, and one
-/// after the last epoch.
+/// after the last epoch. With it the run records each epoch's per-pixel
+/// LLK ([`LiveAp::llk`]) and sends on `llk`, in epoch order from the first,
+/// those of the epochs queued so far once `llk_period` has passed since the
+/// last send, and the rest after the last epoch. Each such read waits for
+/// the epoch queued last, so the next starts a host turn late.
 pub struct Preview {
     pub period: Duration,
     pub tx: Sender<View>,
+    pub llk_period: Duration,
+    pub llk: Sender<Vec<f64>>,
 }
 
 pub struct FollowReport {
@@ -260,7 +268,7 @@ pub fn run_ap_consumer(
     // SAFETY: an epoch reads only landed frames, whose copies into the
     // store completed before the uploader sent their batch.
     let counts = unsafe { store.frames_view()? };
-    let mut live = LiveAp::new(&stream, &cfg.ap, &cfg.probe, counts)?;
+    let mut live = LiveAp::new(&stream, &cfg.ap, &cfg.probe, counts, preview.is_some())?;
     let mut snaps = [live.new_snapshot()?, live.new_snapshot()?];
     let fence = [sleeping_event(&ctx)?, sleeping_event(&ctx)?];
     let mut view = match preview {
@@ -271,6 +279,7 @@ pub fn run_ap_consumer(
     // when it was queued.
     let mut viewing: Option<u64> = None;
     let mut viewed: Option<Instant> = None;
+    let mut llk_sent: Option<Instant> = None;
     let _ = captured.send(());
 
     let mut positions: Vec<(f64, f64)> = Vec::with_capacity(shape.nframe as usize);
@@ -329,6 +338,15 @@ pub fn run_ap_consumer(
                     view = None;
                 }
             }
+            if let Some((p, _)) = &view
+                && live.epochs() > 0
+                && llk_sent.is_none_or(|t| t.elapsed() >= p.llk_period)
+            {
+                llk_sent = Some(Instant::now());
+                if !send_llk(&mut live, &p.llk)? {
+                    view = None;
+                }
+            }
             live.epoch()?;
             f.record(&stream)?;
             if let Some((p, snap)) = &mut view
@@ -359,9 +377,10 @@ pub fn run_ap_consumer(
     // Nothing may still read the store once this returns.
     stream.synchronize()?;
     fed?;
-    // The viewer's last copy is the object after the last epoch.
+    // The viewer's last LLK and copy are those of the last epoch.
     if let Some((p, mut snap)) = view
         && live.epochs() > 0
+        && send_llk(&mut live, &p.llk)?
     {
         if viewing != Some(live.epochs()) {
             live.snapshot(&mut snap)?;
@@ -380,6 +399,13 @@ pub fn run_ap_consumer(
         obj_mapped_bytes: live.scan().obj().mapped_bytes(),
         landings,
     })
+}
+
+/// Sends `live`'s LLK of the epochs queued since the last read, waiting for
+/// them; false once the receiver is gone.
+fn send_llk(live: &mut LiveAp, tx: &Sender<Vec<f64>>) -> Result<bool, GrowError> {
+    let llk = live.llk()?.expect("a run with a preview records its LLK");
+    Ok(tx.send(llk.into_iter().map(|(_, l)| l).collect()).is_ok())
 }
 
 /// Waits for `snap`, which follows `epochs`, and copies its object 0.
@@ -437,7 +463,7 @@ pub fn offline_ap(
         })?;
     // SAFETY: every frame read is stored, and nothing writes the store now.
     let counts = unsafe { store.frames_view()? };
-    let mut run = LiveAp::new(&stream, &ap, &cfg.probe, counts)?;
+    let mut run = LiveAp::new(&stream, &ap, &cfg.probe, counts, false)?;
     run.push(&views_of(&ap, &cfg.place, positions))?;
     settle(&mut run, region, scan_end, max_epochs)
 }
@@ -537,6 +563,8 @@ mod tests {
         scan_end: i64,
         recaptures: u64,
         views: Vec<View>,
+        /// The LLK history the viewer was sent.
+        llk: Vec<f64>,
     }
 
     /// A 6x6 raster of 64x64 frames, two probe modes, streamed through the
@@ -573,11 +601,15 @@ mod tests {
         let (cap_tx, cap_rx) = crossbeam_channel::bounded(1);
         let (view_tx, view_rx) = crossbeam_channel::bounded(1);
         let viewer = std::thread::spawn(move || view_rx.iter().collect::<Vec<View>>());
+        let (llk_tx, llk_rx) = crossbeam_channel::unbounded();
+        let llk_reader = std::thread::spawn(move || llk_rx.iter().flatten().collect());
         let consumer = {
             let (ctx, store, cfg) = (ctx.clone(), store.clone(), cfg.clone());
             let preview = preview.map(|period| Preview {
                 period,
                 tx: view_tx,
+                llk_period: period,
+                llk: llk_tx,
             });
             std::thread::spawn(move || run_ap_consumer(ctx, store, cfg, rx, cap_tx, preview))
         };
@@ -619,6 +651,7 @@ mod tests {
             scan_end,
             recaptures: warm.recaptures(),
             views: viewer.join().unwrap(),
+            llk: llk_reader.join().unwrap(),
         }
     }
 
@@ -631,7 +664,8 @@ mod tests {
     ///
     /// The viewer's copies, the first after the first epoch and so during
     /// the scan, the last after the last epoch, are each that replay at
-    /// their epochs, before the landings that followed them.
+    /// their epochs, before the landings that followed them; the LLK it was
+    /// sent is the replay's of every epoch.
     ///
     /// The live object is not held to the offline one here: after thousands
     /// of epochs over a partial scan, AP on these frames stops at 0.985 in
@@ -646,6 +680,7 @@ mod tests {
             scan_end,
             recaptures,
             views,
+            llk,
         } = streamed(Some(Duration::from_millis(10)));
         assert_eq!(recaptures, 0);
         let total = rep.positions.len() as u64;
@@ -665,7 +700,7 @@ mod tests {
         let st = ctx.new_stream().unwrap();
         // SAFETY: the consumer has returned; nothing writes the store.
         let counts = unsafe { store.frames_view().unwrap() };
-        let mut run = LiveAp::new(&st, &cfg.ap, &cfg.probe, counts).unwrap();
+        let mut run = LiveAp::new(&st, &cfg.ap, &cfg.probe, counts, true).unwrap();
         assert!(views.len() > 2, "{} views", views.len());
         assert!(views.windows(2).all(|w| w[0].epochs < w[1].epochs));
         assert_eq!(views[0].epochs, 1);
@@ -706,6 +741,19 @@ mod tests {
         run.snapshot(&mut snap).unwrap();
         let got = snap.wait().unwrap();
         assert!(got[..last.pixels.len()] == last.pixels[..]);
+        let replayed = run.llk().unwrap().unwrap();
+        assert!(replayed.iter().map(|&(e, _)| e).eq(0..last.epochs));
+        let bits = |l: &f64| l.to_bits();
+        assert!(
+            replayed
+                .iter()
+                .map(|(_, l)| bits(l))
+                .eq(llk.iter().map(bits)),
+            "{} sent, {} replayed",
+            llk.len(),
+            replayed.len()
+        );
+        assert!(llk.iter().all(|l| l.is_finite() && *l > 0.0));
     }
 
     /// The offline run settles at a doubling of its epochs within the cap,

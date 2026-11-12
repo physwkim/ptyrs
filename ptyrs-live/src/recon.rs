@@ -9,14 +9,20 @@
 //! sums to the object and rewinds the sweep. Frames land only between
 //! epochs, so an epoch's sweep covers exactly the frames landed when it was
 //! queued, as the engine's AP cycle covers its scan.
+//!
+//! With LLK recording, each epoch is also one record of an [`LlkRing`]: the
+//! ingest graph counts each frame's unmasked pixels once, the sweep graph
+//! pushes each stack's LLK partials of its forward exit waves, as the
+//! engine's AP cycle takes them, and the update graph ends the record.
 
 use std::num::NonZeroU32;
 use std::ops::Range;
 use std::sync::Arc;
 
+use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{DeviceBuffer, Stream};
 use ptyrs_fft::Plan2d;
-use ptyrs_gpu::{C32, Kernels, ViewAddr};
+use ptyrs_gpu::{C32, Ended, Kernels, LlkPartial, LlkRing, LlkScratch, ViewAddr};
 
 use crate::graph::LiveGraph;
 use crate::grow::GrowError;
@@ -39,11 +45,29 @@ pub struct ApConfig {
     pub inertia: f32,
 }
 
+/// The LLK records the ring holds; each batch of half of them is copied to
+/// the host while later epochs run.
+const LLK_SLOTS: u32 = 8;
+
+/// The device side of each epoch's LLK record.
+struct LlkBufs {
+    ring: LlkRing<u64>,
+    scratch: LlkScratch,
+    partials: DeviceBuffer<LlkPartial>,
+}
+
+struct EpochLlk {
+    bufs: LlkBufs,
+    /// The update graph ends a record each replay.
+    ended: Ended,
+}
+
 pub struct LiveAp {
     // The graphs drop before the buffers and kernels they replay on.
     ingest: LiveGraph,
     sweep: LiveGraph,
     update: LiveGraph,
+    llk: Option<EpochLlk>,
     scan: LiveScan,
     _kernels: Kernels,
     _probe: DeviceBuffer<C32>,
@@ -59,12 +83,14 @@ impl LiveAp {
     /// An empty scan of `cfg.shape` on `stream` with the fixed `probe`
     /// (`[nprobe, ny, nx]`, natural order), reading frame `f` of the scan
     /// from element `f * ny * nx` of `counts`, which holds at least
-    /// `nframe` frames; captures its three graphs.
+    /// `nframe` frames; captures its three graphs, which record each
+    /// epoch's LLK with `llk` ([`Self::llk`]).
     pub fn new(
         stream: &Arc<Stream>,
         cfg: &ApConfig,
         probe: &[C32],
         counts: DeviceBuffer<u16>,
+        llk: bool,
     ) -> Result<Self, GrowError> {
         let ctx = stream.context();
         let kernels = Kernels::load(ctx)?;
@@ -83,13 +109,34 @@ impl LiveAp {
         let mut psi = DeviceBuffer::<C32>::zeroed(stream, planes * n)?;
         let mut plan =
             Plan2d::new(stream, d.frame[0] as usize, planes).map_err(ptyrs_gpu::Error::from)?;
+        let mut bufs = if llk {
+            Some(LlkBufs {
+                ring: LlkRing::new(&kernels, stream, d.nframe, LLK_SLOTS)?,
+                scratch: LlkScratch::new(stream, &d, cfg.nf_max.get())?,
+                partials: DeviceBuffer::zeroed(stream, cfg.nf_max.get() as usize)?,
+            })
+        } else {
+            None
+        };
         let k = &kernels;
         let ingest = {
-            let s = &mut scan;
-            LiveGraph::capture(stream, move |c| s.advance(k, c))?
+            let (s, counts) = (&mut scan, &counts);
+            let ring = bufs.as_mut().map(|b| b.ring.device());
+            LiveGraph::capture(stream, move |c| {
+                s.advance(k, c)?;
+                match ring {
+                    Some(r) => r.count(c, &d, s.stack(), counts),
+                    None => Ok(()),
+                }
+            })?
         };
+        // One writer for every record: the sweep graph pushes through it and
+        // the update graph ends it.
+        let mut rec = bufs
+            .as_mut()
+            .map(|b| (b.ring.device().record(), &mut b.scratch, &mut b.partials));
         let sweep = {
-            let (s, psi, plan) = (&mut scan, &mut psi, &mut plan);
+            let (s, psi, plan, rec) = (&mut scan, &mut psi, &mut plan, &mut rec);
             let (probe, counts) = (&probe, &counts);
             LiveGraph::capture(stream, move |c| {
                 let p = s.parts_mut();
@@ -97,23 +144,38 @@ impl LiveAp {
                 let st = p.frames.sweep();
                 k.obj_probe_to_psi(c, p.views, st, p.pixels, probe, psi)?;
                 plan.forward_inplace(c, psi)?;
+                if let Some((w, scratch, partials)) = rec {
+                    k.llk(c, st, counts, psi, scratch, partials)?;
+                    w.push(c, &d, st, partials)?;
+                }
                 k.apply_amplitude(c, &d, st, counts, psi)?;
                 plan.inverse_inplace(c, psi)?;
                 k.psi_to_obj(c, p.views, st, psi, probe, p.sums)
             })?
         };
+        let mut ended = None;
         let update = {
-            let (s, inertia) = (&mut scan, cfg.inertia);
+            let (s, inertia, ended) = (&mut scan, cfg.inertia, &mut ended);
+            let w = rec.map(|(w, _, _)| w);
             LiveGraph::capture(stream, move |c| {
                 let p = s.parts_mut();
                 k.update_obj_from_sums(c, p.views, p.pixels, p.sums, inertia)?;
-                p.frames.rewind(c)
+                p.frames.rewind(c)?;
+                if let Some(w) = w {
+                    *ended = Some(w.end(c)?);
+                }
+                Ok(())
             })?
         };
+        let llk = bufs.map(|bufs| EpochLlk {
+            bufs,
+            ended: ended.expect("the update capture ends the record"),
+        });
         Ok(Self {
             ingest,
             sweep,
             update,
+            llk,
             scan,
             _kernels: kernels,
             _probe: probe,
@@ -143,8 +205,29 @@ impl LiveAp {
             self.sweep.replay()?;
         }
         self.update.replay()?;
+        if let Some(l) = &mut self.llk {
+            let ctx = ExecutionContext::new(self.scan.stream().clone());
+            l.bufs.ring.enqueued(&ctx, &l.ended, self.epochs, landed)?;
+        }
         self.epochs += 1;
         Ok(())
+    }
+
+    /// `(e, llk)` for each epoch queued since the last call, oldest first:
+    /// the per-pixel Poisson LLK (PyNX's `LLK`) of the object after `e`
+    /// epochs over the frames landed when epoch `e + 1` ran, NaN over none.
+    /// Waits for those epochs. `None` unless `new` was asked to record it.
+    pub fn llk(&mut self) -> Result<Option<Vec<(u64, f64)>>, GrowError> {
+        let Some(l) = &mut self.llk else {
+            return Ok(None);
+        };
+        let ctx = ExecutionContext::new(self.scan.stream().clone());
+        let done = l.bufs.ring.flush(&ctx)?;
+        Ok(Some(
+            done.into_iter()
+                .map(|(e, t)| (e, t.sums.poisson / t.nb_obs as f64))
+                .collect(),
+        ))
     }
 
     /// Queues the object's copy into `snap` after the epochs queued so far.
@@ -347,7 +430,8 @@ mod tests {
 
     /// Epochs over every frame landed at once are the engine's AP cycles
     /// with the probe fixed: same views, stacks, frames and start, so the
-    /// same object after each of a few cycles.
+    /// same object after each of a few cycles, and each epoch's LLK the
+    /// engine's history record of that cycle.
     #[test]
     fn epochs_over_a_whole_scan_are_the_engine_ap_cycles() {
         let (n, nf_max) = (64usize, 16u32);
@@ -406,7 +490,7 @@ mod tests {
         let params = ApParams {
             obj_inertia: Some(0.01),
             probe_inertia: None,
-            calc_llk: 0,
+            calc_llk: 1,
             zero_phase_ramp: false,
         };
 
@@ -421,7 +505,7 @@ mod tests {
             quad_phase,
         };
         let dev = DeviceBuffer::from_host(&st, &counts).unwrap();
-        let mut live = LiveAp::new(&st, &config(shape, nf_max), &probe(&p), dev).unwrap();
+        let mut live = LiveAp::new(&st, &config(shape, nf_max), &probe(&p), dev, true).unwrap();
         assert_eq!(live.push(&views).unwrap(), p.points() as u32);
         let mut snap = live.new_snapshot().unwrap();
         let [ly, lx] = snap.shape();
@@ -445,6 +529,17 @@ mod tests {
                 }
             }
             assert_eq!(worst, 0.0, "after {} epochs", live.epochs());
+            let llk = live.llk().unwrap().unwrap();
+            let history = engine.history();
+            let want = &history[history.len() - cycles..];
+            let first = live.epochs() - cycles as u64;
+            assert!(llk.iter().map(|&(e, _)| e).eq(first..live.epochs()));
+            assert!(
+                llk.iter()
+                    .zip(want)
+                    .all(|(&(_, l), r)| l.to_bits() == r.llk.poisson.to_bits()),
+                "{llk:?} against {want:?}"
+            );
         }
     }
 
@@ -487,7 +582,7 @@ mod tests {
                 chunk,
                 ..config(shape, 32)
             };
-            LiveAp::new(&st, &cfg, &probe(&p), dev).unwrap()
+            LiveAp::new(&st, &cfg, &probe(&p), dev, false).unwrap()
         };
         let (mut grown, mut whole) = (run(1), run(64 << 20));
         let warm = WarmUp::end();
@@ -532,7 +627,7 @@ mod tests {
         let run = || {
             let st = ctx.new_stream().unwrap();
             let dev = DeviceBuffer::from_host(&st, &frames(&p)).unwrap();
-            LiveAp::new(&st, &config(shape, 16), &probe(&p), dev).unwrap()
+            LiveAp::new(&st, &config(shape, 16), &probe(&p), dev, false).unwrap()
         };
 
         let mut offline = run();

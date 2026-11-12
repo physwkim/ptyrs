@@ -9,7 +9,7 @@
 
 use std::num::NonZeroUsize;
 
-use crossbeam_channel::Receiver;
+use crossbeam_channel::{Receiver, never, select};
 use epics_pva_rs::error::PvaResult;
 use epics_pva_rs::nt::nd_array::{
     NdArrayBuffer, NdAttribute, NdCodec, NdDimension, NdTimeStamp, NtNdArray, nt_nd_array_desc,
@@ -35,6 +35,10 @@ pub struct PvCfg {
     /// download of its object.
     #[serde(default = "PvCfg::period_ms")]
     pub period_ms: u64,
+    /// Least time between LLK posts; each makes the live run wait for its
+    /// last epoch.
+    #[serde(default = "PvCfg::period_ms")]
+    pub llk_period_ms: u64,
 }
 
 impl PvCfg {
@@ -43,6 +47,7 @@ impl PvCfg {
             prefix,
             bin: Self::bin(),
             period_ms: Self::period_ms(),
+            llk_period_ms: Self::period_ms(),
         }
     }
 
@@ -147,21 +152,48 @@ impl PvOut {
     }
 }
 
+/// What [`publish`] posted.
+#[derive(Debug, Default, PartialEq)]
+pub struct Posts {
+    pub objects: u64,
+    /// The LLK history as last posted.
+    pub llk: Vec<f64>,
+}
+
 /// Posts `probe` once, then each object copy `views` delivers, binned by
-/// `bin` with the epochs it follows as its uid, until the sender drops;
-/// returns the object posts made.
+/// `bin` with the epochs it follows as its uid, and the LLK history each
+/// time `llk` extends it, with its length as its uid, until both senders
+/// drop.
 pub fn publish(
     out: &PvOut,
     probe: AmpPhase,
     views: Receiver<View>,
+    llk: Receiver<Vec<f64>>,
     bin: NonZeroUsize,
-) -> PvaResult<u64> {
+) -> PvaResult<Posts> {
     out.post_probe(probe, 0)?;
-    let mut posts = 0;
-    for v in views {
-        let img = AmpPhase::new(&v.pixels, 1, v.shape, bin.get());
-        out.post_object(img, i32::try_from(v.epochs).unwrap_or(i32::MAX))?;
-        posts += 1;
+    let mut posts = Posts::default();
+    let uid = |n: u64| i32::try_from(n).unwrap_or(i32::MAX);
+    let (mut views, mut llk) = (Some(views), Some(llk));
+    let (no_view, no_llk) = (never(), never());
+    while views.is_some() || llk.is_some() {
+        select! {
+            recv(views.as_ref().unwrap_or(&no_view)) -> v => match v {
+                Ok(v) => {
+                    let img = AmpPhase::new(&v.pixels, 1, v.shape, bin.get());
+                    out.post_object(img, uid(v.epochs))?;
+                    posts.objects += 1;
+                }
+                Err(_) => views = None,
+            },
+            recv(llk.as_ref().unwrap_or(&no_llk)) -> l => match l {
+                Ok(l) => {
+                    posts.llk.extend(l);
+                    out.post_llk(&posts.llk, uid(posts.llk.len() as u64))?;
+                }
+                Err(_) => llk = None,
+            },
+        }
     }
     Ok(posts)
 }
@@ -331,11 +363,12 @@ mod tests {
         (int(s.get_field("uniqueId")), dims, first)
     }
 
-    /// A client subscribed to `OBJ:AMP` before the first copy sees each
-    /// one [`publish`] posts, binned, with its epochs as the uid;
-    /// `PROBE:PHASE` holds the probe's two modes stacked along y.
+    /// A client subscribed to `OBJ:AMP` and `LLK` before the first post
+    /// sees each object copy [`publish`] posts, binned, with its epochs as
+    /// the uid, and the LLK history each batch extends, with its length as
+    /// the uid; `PROBE:PHASE` holds the probe's two modes stacked along y.
     #[test]
-    fn a_subscriber_sees_each_object_copy_and_the_probe() {
+    fn a_subscriber_sees_each_object_copy_the_llk_and_the_probe() {
         use std::sync::Arc;
         use std::time::Duration;
 
@@ -354,24 +387,37 @@ mod tests {
         let _in = rt.enter();
         let server = PvaServer::isolated(Arc::new(source)).unwrap();
         let client = PvaClient::builder().server_addr(server.tcp_addr()).build();
-        let (mtx, mrx) = crossbeam_channel::unbounded();
-        let _sub = rt
-            .block_on(client.pvmonitor_handle(
-                "T:OBJ:AMP",
-                move |_, v| {
-                    let _ = mtx.send(header(v));
-                },
-                |_| {},
-            ))
-            .unwrap();
-        let wait = || mrx.recv_timeout(Duration::from_secs(10)).unwrap();
-        assert_eq!(wait().0, -1, "the empty array before any post");
+        let monitor = |pv: &str| {
+            let (mtx, mrx) = crossbeam_channel::unbounded();
+            let sub = rt
+                .block_on(client.pvmonitor_handle(
+                    pv,
+                    move |_, v| {
+                        let _ = mtx.send(header(v));
+                    },
+                    |_| {},
+                ))
+                .unwrap();
+            let wait = move || mrx.recv_timeout(Duration::from_secs(10)).unwrap();
+            assert_eq!(wait().0, -1, "{pv}: the empty array before any post");
+            (sub, wait)
+        };
+        let (_obj, wait) = monitor("T:OBJ:AMP");
+        let (_llk, wait_llk) = monitor("T:LLK");
 
         let probe_px: Vec<[f32; 2]> = (0..2 * 4 * 4).map(|i| polar(1.0, i as f64 * 0.1)).collect();
         let probe = AmpPhase::new(&probe_px, 2, [4, 4], 1);
         let (vtx, vrx) = crossbeam_channel::bounded(0);
+        let (ltx, lrx) = crossbeam_channel::unbounded();
         let bin = NonZeroUsize::new(2).unwrap();
-        let publisher = std::thread::spawn(move || publish(&out, probe, vrx, bin));
+        let publisher = std::thread::spawn(move || publish(&out, probe, vrx, lrx, bin));
+        for (batch, len) in [(vec![2.5, 1.5], 2), (vec![0.75], 3)] {
+            ltx.send(batch).unwrap();
+            let (uid, dims, first) = wait_llk();
+            assert_eq!((uid, dims), (len, vec![(len, 1)]));
+            assert_eq!(first, Some(ScalarValue::Double(2.5)));
+        }
+        drop(ltx);
         for epochs in [3u32, 7] {
             let pixels: Vec<[f32; 2]> = (0..5 * 6)
                 .map(|i| polar(f64::from(epochs) + i as f64, 0.3))
@@ -389,7 +435,14 @@ mod tests {
             assert_eq!(first, Some(ScalarValue::Float(want.amp[0])));
         }
         drop(vtx);
-        assert_eq!(publisher.join().unwrap().unwrap(), 2);
+        let posts = publisher.join().unwrap().unwrap();
+        assert_eq!(
+            posts,
+            Posts {
+                objects: 2,
+                llk: vec![2.5, 1.5, 0.75]
+            }
+        );
         let (uid, dims, _) = header(&rt.block_on(client.pvget("T:PROBE:PHASE")).unwrap());
         assert_eq!((uid, dims), (0, vec![(4, 1), (8, 1)]));
     }

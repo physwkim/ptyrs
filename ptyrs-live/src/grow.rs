@@ -42,6 +42,8 @@ pub enum GrowError {
     Driver(DriverError),
     /// A leased access or a kernel launch failed.
     Gpu(ptyrs_gpu::Error),
+    /// An LLK record read back wrong.
+    Llk(ptyrs_gpu::RingError),
 }
 
 impl fmt::Display for GrowError {
@@ -60,6 +62,7 @@ impl fmt::Display for GrowError {
             ),
             Self::Driver(e) => write!(f, "{e}"),
             Self::Gpu(e) => write!(f, "{e}"),
+            Self::Llk(e) => write!(f, "{e}"),
         }
     }
 }
@@ -75,6 +78,15 @@ impl From<DriverError> for GrowError {
 impl From<ptyrs_gpu::Error> for GrowError {
     fn from(e: ptyrs_gpu::Error) -> Self {
         Self::Gpu(e)
+    }
+}
+
+impl From<ptyrs_gpu::RingError> for GrowError {
+    fn from(e: ptyrs_gpu::RingError) -> Self {
+        match e {
+            ptyrs_gpu::RingError::Gpu(e) => Self::Gpu(e),
+            e => Self::Llk(e),
+        }
     }
 }
 
