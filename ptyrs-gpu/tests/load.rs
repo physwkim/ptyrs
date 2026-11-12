@@ -4,13 +4,17 @@
 use std::f64::consts::PI;
 use std::sync::Arc;
 
-use cuda_core::{CudaContext, DeviceBuffer};
+use cuda_async::device_operation::ExecutionContext;
+use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 use ptyrs_gpu::{C32, Kernels, Lines};
 
-fn setup() -> (Arc<CudaContext>, Kernels) {
+/// A stream, an eager execution context on it (its leases end when the test drops it) and
+/// the kernels.
+fn setup() -> (Arc<CudaStream>, ExecutionContext, Kernels) {
     let ctx = CudaContext::new(0).expect("CUDA device 0");
     let kernels = Kernels::load(&ctx).expect("load ptyrs-gpu kernels");
-    (ctx, kernels)
+    let stream = ctx.default_stream();
+    (stream.clone(), ExecutionContext::new(stream), kernels)
 }
 
 /// Deterministic values in [-1, 1).
@@ -68,11 +72,10 @@ fn rel_l2(got: &[C32], want: &[(f64, f64)], lines: Lines) -> f64 {
 
 #[test]
 fn simt_scale() {
-    let (ctx, k) = setup();
-    let stream = ctx.default_stream();
+    let (stream, ex, k) = setup();
     let host = noise(1000, 1);
     let mut x = DeviceBuffer::from_host(&stream, &host).unwrap();
-    k.scale_c32(&stream, &mut x, 999, 0.5).unwrap();
+    k.scale_c32(&ex, &mut x, 999, 0.5).unwrap();
     let got = x.to_host_vec(&stream).unwrap();
     for (i, (g, h)) in got.iter().zip(&host).enumerate() {
         let s = if i < 999 { 0.5 } else { 1.0 };
@@ -82,8 +85,7 @@ fn simt_scale() {
 
 #[test]
 fn block_fft_rows_out_of_place() {
-    let (ctx, k) = setup();
-    let stream = ctx.default_stream();
+    let (stream, ex, k) = setup();
     for n in [128u32, 256] {
         for inverse in [false, true] {
             // 37 lines: the last block is partly empty.
@@ -96,7 +98,7 @@ fn block_fft_rows_out_of_place() {
             let host = noise((37 * n) as usize, u64::from(n) + u64::from(inverse));
             let input = DeviceBuffer::from_host(&stream, &host).unwrap();
             let mut output = DeviceBuffer::<C32>::zeroed(&stream, host.len()).unwrap();
-            k.fft_lines(&stream, &input, &mut output, lines, inverse)
+            k.fft_lines(&ex, &input, &mut output, lines, inverse)
                 .unwrap();
             let err = rel_l2(
                 &output.to_host_vec(&stream).unwrap(),
@@ -111,8 +113,7 @@ fn block_fft_rows_out_of_place() {
 
 #[test]
 fn block_fft_columns_in_place() {
-    let (ctx, k) = setup();
-    let stream = ctx.default_stream();
+    let (stream, ex, k) = setup();
     for n in [128u32, 256] {
         let lines = Lines {
             n,
@@ -122,8 +123,7 @@ fn block_fft_columns_in_place() {
         };
         let host = noise((n * n) as usize, 7 * u64::from(n));
         let mut data = DeviceBuffer::from_host(&stream, &host).unwrap();
-        k.fft_lines_inplace(&stream, &mut data, lines, false)
-            .unwrap();
+        k.fft_lines_inplace(&ex, &mut data, lines, false).unwrap();
         let err = rel_l2(
             &data.to_host_vec(&stream).unwrap(),
             &dft_lines(&host, lines, false),
@@ -136,8 +136,7 @@ fn block_fft_columns_in_place() {
 
 #[test]
 fn rejects_bad_shapes() {
-    let (ctx, k) = setup();
-    let stream = ctx.default_stream();
+    let (stream, ex, k) = setup();
     let mut x = DeviceBuffer::<C32>::zeroed(&stream, 128 * 4).unwrap();
     let short = Lines {
         n: 128,
@@ -156,11 +155,11 @@ fn rejects_bad_shapes() {
         elem_stride: 1,
     };
     for lines in [short, overlapping, unsupported] {
-        let err = k.fft_lines_inplace(&stream, &mut x, lines, false);
+        let err = k.fft_lines_inplace(&ex, &mut x, lines, false);
         assert!(
             matches!(err, Err(ptyrs_gpu::Error::Shape(_))),
             "{lines:?}: {err:?}"
         );
     }
-    assert!(k.scale_c32(&stream, &mut x, 513, 1.0).is_err());
+    assert!(k.scale_c32(&ex, &mut x, 513, 1.0).is_err());
 }
