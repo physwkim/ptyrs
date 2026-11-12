@@ -180,11 +180,12 @@ fn update_obj_from_sums_matches_simt_on_tiles_with_views() {
     let stream: Arc<CudaStream> = ctx.default_stream();
     let ex = ExecutionContext::new(stream.clone());
     let inertia = 0.01f32;
-    // Two 82x100 object modes, one view each: tiles rows 0-1 x columns 0-1 and rows 3-5 x
-    // columns 4-6 (the partial last row and column) have views, the rest none.
+    // Two 82x100 object modes and two frames, each viewing both modes at one position:
+    // tiles rows 0-1 x columns 0-1 and rows 3-5 x columns 4-6 (the partial last row and
+    // column) have views, the rest none.
     let d = ViewDims {
         nframe: 2,
-        nmode: 1,
+        nmode: 2,
         nprobe: 1,
         nobj: 2,
         frame: [24, 32],
@@ -199,7 +200,12 @@ fn update_obj_from_sums_matches_simt_on_tiles_with_views() {
         probe: 0,
         obj,
     };
-    let view_list = [view(0, 0, 0.0, 0.0, 0), view(57, 67, 0.6, 0.9, 1)];
+    let view_list = [
+        view(0, 0, 0.0, 0.0, 0),
+        view(0, 0, 0.0, 0.0, 1),
+        view(57, 67, 0.6, 0.9, 0),
+        view(57, 67, 0.6, 0.9, 1),
+    ];
     let views = Views::new(&stream, d, &view_list).unwrap();
     let table = StackTable::new(&stream, &d, std::slice::from_ref(&(0..d.nframe))).unwrap();
     let tk = TileKernels::new(&stream, &views, &table).unwrap();

@@ -1,8 +1,7 @@
 //! `ptyrs_tile::TileKernels::psi_to_probe` against the SIMT
 //! `ptyrs_gpu::Kernels::psi_to_probe` and an f64 reference: whole and split stack tables, a
-//! device-written entry (including `nf == 0` and entries the kernels clamp), and probe modes
-//! no view of the stack uses. No launch compiles: the set compiled every kernel when it was
-//! built.
+//! device-written entry (including `nf == 0` and entries the kernels clamp). No launch
+//! compiles: the set compiled every kernel when it was built.
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -42,13 +41,12 @@ fn up<T: DeviceCopy>(stream: &CudaStream, host: &[T]) -> DeviceBuffer<T> {
 }
 
 /// 20x40 frames (partial 8x32 tiles in both directions) on two 50x60 object modes and
-/// three probe modes, four views per frame. `fy`, `fx` cover zero and non-zero, frames 1
-/// and 3 reach the object's last row and frames 3 and 4 its last column; probe mode 2 has
-/// views in frames 3 and 4 only.
+/// three probe modes, six views per frame. `fy`, `fx` cover zero and non-zero, frames 1
+/// and 3 reach the object's last row and frames 3 and 4 its last column.
 fn dims() -> (ViewDims, Vec<ViewAddr>) {
     let d = ViewDims {
         nframe: 5,
-        nmode: 4,
+        nmode: 6,
         nprobe: 3,
         nobj: 2,
         frame: [20, 40],
@@ -64,15 +62,14 @@ fn dims() -> (ViewDims, Vec<ViewAddr>) {
     ];
     let views = offsets
         .iter()
-        .enumerate()
-        .flat_map(|(f, &(oy, ox, fy, fx))| {
+        .flat_map(|&(oy, ox, fy, fx)| {
             (0..d.nmode).map(move |m| ViewAddr {
                 oy,
                 ox,
                 fy,
                 fx,
-                probe: if f >= 3 && m % 2 == 1 { 2 } else { m % 2 },
-                obj: m / 2,
+                probe: m % d.nprobe,
+                obj: m / d.nprobe,
             })
         })
         .collect();
@@ -303,7 +300,6 @@ fn psi_to_probe_matches_simt_and_ignores_stack_split() {
     let fsize = Fixture::fsize(&fx.d);
     let whole = StackTable::new(stream, &fx.d, std::slice::from_ref(&(0..fx.d.nframe))).unwrap();
     let psi = up(stream, &fx.psi_host);
-    // Stack 0 has no view of probe mode 2.
     let stacks = [0..2, 2..5];
     let split = StackTable::new(stream, &fx.d, &stacks).unwrap();
     let tk_whole = TileKernels::new(stream, views, &whole).unwrap();
@@ -349,9 +345,8 @@ fn psi_to_probe_matches_simt_and_ignores_stack_split() {
 }
 
 /// One launch per entry value, written to the device between them: the kernels read the
-/// entry when they run and clamp it to `nf_max` frames inside the scan. A probe mode
-/// without a view in the stack, and every mode of an entry with no frames after the clamp,
-/// keeps its sums bit for bit.
+/// entry when they run and clamp it to `nf_max` frames inside the scan. Every mode of an
+/// entry with no frames after the clamp keeps its sums bit for bit.
 #[test]
 fn psi_to_probe_follows_the_device_entry() {
     let fx = Fixture::new();
@@ -366,14 +361,14 @@ fn psi_to_probe_follows_the_device_entry() {
         ((0, 0), &[0, 1, 2]),
         ((2, 0), &[0, 1, 2]),
         ((5, 0), &[0, 1, 2]),
-        ((0, 3), &[2]),
+        ((0, 3), &[]),
         ((1, 3), &[]),
-        ((3, 2), &[1]),
-        ((0, 4), &[2]),
-        ((4, 3), &[1]),
+        ((3, 2), &[]),
+        ((0, 4), &[]),
+        ((4, 3), &[]),
         ((9, 2), &[0, 1, 2]),
         ((u32::MAX, u32::MAX), &[0, 1, 2]),
-        ((0, u32::MAX), &[2]),
+        ((0, u32::MAX), &[]),
     ];
     for ((f0, nf), idle) in entries {
         let c0 = f0.min(nframe);
