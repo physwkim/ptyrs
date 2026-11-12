@@ -18,12 +18,12 @@
 
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig};
-use ptyrs_kernels::FFT_EPT;
+use ptyrs_kernels::fft_ept;
 use ptyrs_kernels::fused::{
-    FFT_SKEW, FUSED_BACKGROUND, FUSED_BACKGROUND_SUMS, FUSED_COL_THREADS, FUSED_COLS, FUSED_DM,
-    FUSED_GRAD, FUSED_LLK, FUSED_PROJECT, FUSED_ROW_THREADS, FUSED_SCALE, FUSED_SCALE_SUMS,
-    FUSED_SHIFT_DEN, FUSED_SHIFT_OBJ, FUSED_SHIFT_POSITION, FUSED_SHIFT_PROBE, FUSED_TO_PSI,
-    FusedCfg, FusedPtrs, col_slot_bytes,
+    FFT_SKEW, FUSED_BACKGROUND, FUSED_BACKGROUND_SUMS, FUSED_COLS, FUSED_DM, FUSED_GRAD, FUSED_LLK,
+    FUSED_PROJECT, FUSED_ROW_THREADS, FUSED_SCALE, FUSED_SCALE_SUMS, FUSED_SHIFT_DEN,
+    FUSED_SHIFT_OBJ, FUSED_SHIFT_POSITION, FUSED_SHIFT_PROBE, FUSED_TO_PSI, FusedCfg, FusedPtrs,
+    col_slot_bytes, fused_col_threads,
 };
 use ptyrs_kernels::pixel::SumPtrs;
 
@@ -72,7 +72,7 @@ pub(crate) struct Shape {
     /// Sides along y (the column pass) and x (the row passes).
     pub(crate) ny: Side,
     pub(crate) nx: Side,
-    /// Rows per row-pass block, of `nx / FFT_EPT` threads each.
+    /// Rows per row-pass block, of `nx / fft_ept(nx)` threads each.
     pub(crate) rows: u32,
     pub(crate) row_smem: u32,
     pub(crate) col_threads: u32,
@@ -96,8 +96,8 @@ impl Shape {
             };
             match (block_fft(n, false), block_fft(n, true)) {
                 (Some(f), Some(i))
-                    if [f.ept, i.ept] == [FFT_EPT; 2]
-                        && [f.threads_per_fft, i.threads_per_fft] == [n / FFT_EPT; 2] =>
+                    if [f.ept, i.ept] == [fft_ept(n); 2]
+                        && [f.threads_per_fft, i.threads_per_fft] == [n / fft_ept(n); 2] =>
                 {
                     Ok((side, f.smem_per_fft.max(i.smem_per_fft)))
                 }
@@ -105,10 +105,10 @@ impl Shape {
             }
         };
         let ((side_y, sy), (side_x, sx)) = (side(ny)?, side(nx)?);
-        let rows = FUSED_ROW_THREADS / (nx / FFT_EPT);
-        let nslot = FUSED_COLS * (ny / FFT_EPT);
+        let rows = FUSED_ROW_THREADS / (nx / fft_ept(nx));
+        let nslot = FUSED_COLS * (ny / fft_ept(ny));
         let col_threads = d.nmode as u64 * nslot as u64;
-        if col_threads > FUSED_COL_THREADS as u64 {
+        if col_threads > fused_col_threads(ny) as u64 {
             return Err(bad(format!("{col_threads} threads per column block")));
         }
         let col_threads = col_threads as u32;
@@ -120,7 +120,7 @@ impl Shape {
             row_smem: rows * (sx + FFT_SKEW),
             col_threads,
             col_tile_fft: 2 * FUSED_COLS * ny
-                + (col_threads / (ny / FFT_EPT)) * col_fft.max(4 * ny),
+                + (col_threads / (ny / fft_ept(ny))) * col_fft.max(4 * ny),
             col_fft,
         };
         // The column pass's most shared memory is under every flag that adds to it.
@@ -161,7 +161,7 @@ impl Shape {
     /// `shift_pre` or `shift_post` for `nprobe` probe modes.
     fn shift_cols(&self, nprobe: u32, nf_max: u32) -> Result<LaunchConfig, Error> {
         let (ny, nx) = (self.ny as u32, self.nx as u32);
-        let threads = nprobe * FUSED_COLS * (ny / FFT_EPT);
+        let threads = nprobe * FUSED_COLS * (ny / fft_ept(ny));
         let smem = 8 * ny + nprobe * FUSED_COLS * self.col_fft;
         if smem > SMEM_MAX {
             return Err(Error::Shape(format!(
@@ -193,7 +193,7 @@ impl Shape {
         let (ny, nx) = (self.ny as u32, self.nx as u32);
         LaunchConfig {
             grid_dim: (nx / FUSED_COLS, nplane, 1),
-            block_dim: (FUSED_COLS * (ny / FFT_EPT), 1, 1),
+            block_dim: (FUSED_COLS * (ny / fft_ept(ny)), 1, 1),
             shared_mem_bytes: FUSED_COLS * self.col_fft,
         }
     }
@@ -218,10 +218,12 @@ pub struct FusedBufs {
 
 /// [`FusedBufs`]' scratch of the position model.
 struct ShiftScratch {
-    /// `T`, then `X`, then `G` of the shift passes, `[nf_max * nprobe, ny, nx]`.
+    /// `T` of the shift passes, `[nf_max * nprobe, ny, nx]`.
     t: DeviceBuffer<C32>,
     /// `T_y`, as `t`.
     t_dy: DeviceBuffer<C32>,
+    /// `X`, then `G`, of the probe adjoint, as `t`.
+    adj: DeviceBuffer<C32>,
     /// `[nf_max * nobj, ny, nx]`.
     obj: DeviceBuffer<C32>,
     /// `[nf_max, ny, nx]`.
@@ -237,6 +239,7 @@ impl ShiftScratch {
         let (n, nf) = (d.n(), g.nf_max as usize);
         check_len("shift", &self.t, nf * d.nprobe as usize * n)?;
         check_len("shift_dy", &self.t_dy, nf * d.nprobe as usize * n)?;
+        check_len("shift_adj", &self.adj, nf * d.nprobe as usize * n)?;
         check_len("shift_obj", &self.obj, nf * d.nobj as usize * n)?;
         check_len("shift_power", &self.power, nf * n)?;
         let ngroup = nf * (g.ny / sh.rows) as usize;
@@ -247,7 +250,7 @@ impl ShiftScratch {
 
 impl FusedBufs {
     /// Scratch for `dims`, whose frame sides must be in [`FUSED_SIDES`] and whose modes must
-    /// fit one column block of [`FUSED_COL_THREADS`] threads: at most `1024 / ny` of them.
+    /// fit one column block of [`fused_col_threads`] threads: at most `1024 / ny` of them.
     pub fn new(stream: &CudaStream, dims: &ViewDims, nf_max: u32) -> Result<Self, Error> {
         Shape::of(dims)?;
         if nf_max == 0 {
@@ -265,7 +268,7 @@ impl FusedBufs {
         })
     }
 
-    /// [`Self::new`] with the scratch of a [`Model::shift`]: `(2 nprobe + nobj) nf_max`
+    /// [`Self::new`] with the scratch of a [`Model::shift`]: `(3 nprobe + nobj) nf_max`
     /// complex frames more, and `nf_max` real ones.
     pub fn with_shift(stream: &CudaStream, dims: &ViewDims, nf_max: u32) -> Result<Self, Error> {
         let mut bufs = Self::new(stream, dims, nf_max)?;
@@ -276,6 +279,7 @@ impl FusedBufs {
         bufs.shift = Some(ShiftScratch {
             t: DeviceBuffer::zeroed(stream, nf * dims.nprobe as usize * n)?,
             t_dy: DeviceBuffer::zeroed(stream, nf * dims.nprobe as usize * n)?,
+            adj: DeviceBuffer::zeroed(stream, nf * dims.nprobe as usize * n)?,
             obj: DeviceBuffer::zeroed(stream, nf * dims.nobj as usize * n)?,
             power: DeviceBuffer::zeroed(stream, nf * n)?,
             grad_groups: DeviceBuffer::zeroed(stream, ngroup)?,
@@ -983,6 +987,7 @@ impl<'a> Run<'a> {
             }),
             shift: scratch(|b| dptr(&b.t)),
             shift_dy: scratch(|b| dptr(&b.t_dy)),
+            shift_adj: scratch(|b| dptr(&b.adj)),
             shift_obj: scratch(|b| dptr(&b.obj)),
             shift_power: scratch(|b| dptr(&b.power)),
             shift_grad: groups(|b| dptr(&b.grad_groups)),
@@ -1370,10 +1375,9 @@ impl<'a> Run<'a> {
             _ => writes.push(bufs.work.storage()),
         }
         let s = sh.scratch;
+        reads.push(s.t.storage());
         if f & FUSED_SHIFT_PROBE != 0 {
-            writes.push(s.t.storage());
-        } else {
-            reads.push(s.t.storage());
+            writes.push(s.adj.storage());
         }
         if f & FUSED_SHIFT_OBJ != 0 {
             writes.extend([s.obj.storage(), s.power.storage()]);
@@ -1419,7 +1423,7 @@ impl<'a> Run<'a> {
     fn shift_post(&self, sh: &Shifted<'_>, p: FusedPtrs) -> Result<(), Error> {
         let config = self.sh.shift_cols(self.g.nprobe, self.g.nf_max)?;
         let reads = [sh.model.offsets.storage(), self.stack.storage()];
-        let writes = [sh.scratch.t.storage()];
+        let writes = [sh.scratch.adj.storage()];
         let (ctl, g) = (self.ctl(), self.g);
         self.k.launch(self.ctx, &reads, &writes, |stream| {
             // SAFETY: as in `shift_pre`, and `shift_rows_inv` wrote `X` of this stack; the
@@ -1474,7 +1478,7 @@ impl<'a> Run<'a> {
     ) -> Result<(), Error> {
         let config = grid_1d(self.g.nprobe as usize * self.inputs.views.dims().n())?;
         let reads = [
-            sh.scratch.t.storage(),
+            sh.scratch.adj.storage(),
             self.inputs.views.addr().storage(),
             self.inputs.obj.storage(),
             self.stack.storage(),
