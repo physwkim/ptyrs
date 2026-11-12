@@ -113,7 +113,7 @@ mod tests {
 
     #[test]
     fn inverse_undoes_forward() {
-        // The adjoint pairing is checked by registering `FarField`.
+        // The adjoint pairing is checked by registering `Propagator::Fourier`.
         let f = Fft2::new([8, 6]);
         let a = signal(96, 0.0);
         let mut back = a.clone();

@@ -7,20 +7,21 @@
 //! `tests/opr.rs` checks the step with them.
 
 use std::ops::Range;
+use std::slice;
 
 use ptyrs_core::{C64, Object, Probe, Stack, View};
 use ptyrs_engine::{
-    Cost, Fft2, Lsqml, LsqmlBatch, LsqmlParams, ProbeVariation, Ptycho, illumination,
+    Cost, Fft2, Lsqml, LsqmlBatch, LsqmlParams, Optics, ProbeVariation, Ptycho, illumination,
     obj_probe_to_psi, random_batches,
 };
 
 mod common;
 
-fn state() -> Ptycho {
+fn state() -> (Ptycho, Optics) {
     let (scan, object, probe) = common::dm_scenario(32, 40, 2, 2e5, 4.0);
     let mut p = Ptycho::new(&scan, object, probe).unwrap();
     p.scale_obj_probe();
-    p
+    (p, Optics::far_field(&scan.geometry))
 }
 
 fn table(text: &str) -> Vec<Vec<f64>> {
@@ -139,7 +140,7 @@ const FRAMES: Range<usize> = 0..20;
 /// and `w_f` its `a_far` (Poisson) or `2·a_far` (Gaussian), held at the state's values.
 #[test]
 fn directions_match_central_differences() {
-    let p = state();
+    let (p, optics) = state();
     let (o, pr) = (p.object(), p.probe());
     for (cost, scale) in [(Cost::Amplitude, 2.0), (Cost::Poisson, 1.0)] {
         let none = ProbeVariation::none(pr.plane_shape());
@@ -152,13 +153,13 @@ fn directions_match_central_differences() {
             &run,
             batch(&p, FRAMES),
             p.observed(),
-            p.quad(),
-            o,
+            &optics,
+            slice::from_ref(o),
             pr,
             &none,
         );
         let w: Vec<f64> = b.a_far().iter().map(|a| scale * a).collect();
-        let mut g_o = b.obj_direction();
+        let [mut g_o] = <[_; 1]>::try_from(b.obj_directions()).unwrap();
         let mut g_p = b.probe_direction();
         g_o.as_mut_slice().iter_mut().for_each(|c| *c *= -2.0);
         let count = FRAMES.len() as f64;
@@ -188,7 +189,7 @@ fn directions_match_central_differences() {
 /// against the reference's object (`iy ix re im`) and probe (`m iy ix re im`) changes and
 /// per-frame `frame a_far a_o a_p`.
 fn assert_ref(cost: Cost, obj: &str, probe: &str, steps: &str) {
-    let p = state();
+    let (p, optics) = state();
     let (mut object, mut pr) = (p.object().clone(), p.probe().clone());
     let pre = illumination(p.addr().views(), object.dims(), &pr);
     let mut var = ProbeVariation::none(pr.plane_shape());
@@ -200,8 +201,8 @@ fn assert_ref(cost: Cost, obj: &str, probe: &str, steps: &str) {
     let s = Lsqml::new(params).with_preconditioner(pre).step(
         batch(&p, FRAMES),
         p.observed(),
-        p.quad(),
-        &mut object,
+        &optics,
+        slice::from_mut(&mut object),
         &mut pr,
         &mut var,
     );
@@ -214,7 +215,7 @@ fn assert_ref(cost: Cost, obj: &str, probe: &str, steps: &str) {
     }
     for (name, got, col, tol) in [
         ("a_far", &s.a_far, 1, 1e-13),
-        ("a_o", &s.a_obj, 2, 1e-12),
+        ("a_o", &s.a_obj[0], 2, 1e-12),
         ("a_p", &s.a_probe, 3, 1e-12),
     ] {
         let want: Vec<f64> = rows.iter().map(|r| r[col]).collect();
@@ -276,8 +277,8 @@ fn poisson_step_matches_lsqml_ref() {
 /// probe changes over the run. Epoch 0 is each frame's first visit, a Poisson `a_far` solved
 /// from 1/2; epochs 1–2 revisit every frame, from its `a_far` of the epoch before.
 fn assert_epochs_ref(cost: Cost, obj: &str, probe: &str, steps: &str) {
-    let p = state();
-    let (addr, obs, quad) = (p.addr(), p.observed(), p.quad());
+    let (p, optics) = state();
+    let (addr, obs) = (p.addr(), p.observed());
     let (mut object, mut pr) = (p.object().clone(), p.probe().clone());
     let mut var = ProbeVariation::none(pr.plane_shape());
     let mut lsqml = Lsqml::new(LsqmlParams {
@@ -288,7 +289,14 @@ fn assert_epochs_ref(cost: Cost, obj: &str, probe: &str, steps: &str) {
     let rows = table(steps);
     let mut next = 0;
     for e in 0..3 {
-        for s in lsqml.epoch(addr, obs, quad, &mut object, &mut pr, &mut var) {
+        for s in lsqml.epoch(
+            addr,
+            obs,
+            &optics,
+            slice::from_mut(&mut object),
+            &mut pr,
+            &mut var,
+        ) {
             let want = &rows[next..next + s.frames.len()];
             next += s.frames.len();
             let frames: Vec<usize> = want.iter().map(|r| r[1] as usize).collect();
@@ -296,7 +304,7 @@ fn assert_epochs_ref(cost: Cost, obj: &str, probe: &str, steps: &str) {
             assert_eq!(s.frames, frames, "epoch {e}");
             for (name, got, col, tol) in [
                 ("a_far", &s.a_far, 2, 1e-13),
-                ("a_o", &s.a_obj, 3, 1e-12),
+                ("a_o", &s.a_obj[0], 3, 1e-12),
                 ("a_p", &s.a_probe, 4, 1e-12),
             ] {
                 let want: Vec<f64> = want.iter().map(|r| r[col]).collect();
@@ -337,8 +345,8 @@ fn poisson_epochs_match_lsqml_ref() {
 /// [`random_batches`].
 #[test]
 fn epoch_follows_ptychi_preconditioner_schedule() {
-    let p = state();
-    let (addr, obs, quad) = (p.addr(), p.observed(), p.quad());
+    let (p, optics) = state();
+    let (addr, obs) = (p.addr(), p.observed());
     let mut lsqml = Lsqml::new(LsqmlParams {
         batch_size: 20,
         cost: Cost::Poisson,
@@ -376,7 +384,14 @@ fn epoch_follows_ptychi_preconditioner_schedule() {
         };
         let (mut o2, mut p2, mut v2) = (object.clone(), pr.clone(), var.clone());
         let replay = lsqml.clone();
-        let steps = lsqml.epoch(addr, obs, quad, &mut object, &mut pr, &mut var);
+        let steps = lsqml.epoch(
+            addr,
+            obs,
+            &optics,
+            slice::from_mut(&mut object),
+            &mut pr,
+            &mut var,
+        );
         let pre = lsqml.preconditioner().unwrap();
         assert_eq!(pre.as_slice(), &next[..], "epoch {e}");
         let mut replay = replay.with_preconditioner(pre.clone());
@@ -392,7 +407,14 @@ fn epoch_follows_ptychi_preconditioner_schedule() {
                 .flat_map(|&f| batch(&p, f..f + 1))
                 .copied()
                 .collect();
-            let r = replay.step(&views, obs, quad, &mut o2, &mut p2, &mut v2);
+            let r = replay.step(
+                &views,
+                obs,
+                &optics,
+                slice::from_mut(&mut o2),
+                &mut p2,
+                &mut v2,
+            );
             assert_eq!(&r, s, "epoch {e}");
         }
         assert_eq!(o2.as_slice(), object.as_slice(), "epoch {e}");

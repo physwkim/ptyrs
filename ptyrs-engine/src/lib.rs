@@ -25,10 +25,12 @@ mod fft;
 mod gpu;
 mod linop;
 mod lsqml;
+mod multislice;
 mod obs;
 mod opr;
 mod ops;
 mod plan;
+mod propagate;
 mod ptycho;
 pub mod sim;
 
@@ -40,8 +42,11 @@ pub use features::{
 };
 pub use fft::Fft2;
 pub use gpu::{GpuOptions, GpuPtycho};
-pub use linop::{DOT_TOL, FarField, LinearOp, ObjectToPsi, ProbeToPsi, Registered, register};
+pub use linop::{
+    DOT_TOL, LinearOp, ObjectToPsi, ProbeToPsi, Propagation, Registered, SliceJacobian, register,
+};
 pub use lsqml::{Lsqml, LsqmlBatch, LsqmlParams, LsqmlStep, illumination};
+pub use multislice::SliceWaves;
 pub use obs::{Observed, shift};
 pub use opr::{ProbeVariation, opr_weight_grad};
 pub use ops::{
@@ -49,6 +54,7 @@ pub use ops::{
     obj_probe_to_psi, poisson_grad, psi_to_obj_probe, quad_phase,
 };
 pub use plan::{Backend, Params, Plan, Step};
+pub use propagate::{AngularSpectrum, Fresnel, Optics, Propagator, Wavefield};
 pub use ptycho::{Algorithm, ApParams, DmParams, LlkRecord, MlParams, Ptycho, RpieParams};
 
 /// Errors from building or running the engine.
