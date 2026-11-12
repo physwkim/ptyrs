@@ -367,7 +367,7 @@ pub fn psi_to_obj_probe(
     }
 }
 
-fn blend(old: &mut Stack<C64>, num: &Stack<C64>, norm: &Stack<f64>, inertia: f64) {
+pub(crate) fn blend(old: &mut Stack<C64>, num: &Stack<C64>, norm: &Stack<f64>, inertia: f64) {
     let reg = norm.as_slice().iter().fold(0.0, |a: f64, &b| a.max(b)) * inertia;
     for ((o, a), w) in old
         .as_mut_slice()

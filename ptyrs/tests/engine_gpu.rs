@@ -276,7 +276,7 @@ fn ml_matches_cpu() {
         let (scan, object, probe) = start(setup.frame, 2, true);
         let mut cpu = Ptycho::new(&scan, object.clone(), probe.clone()).unwrap();
         let mut gpu = GpuPtycho::new(&ctx(), &scan, object, probe, setup.options).unwrap();
-        cpu.ml(&params, 10);
+        cpu.ml(&params, 10).unwrap();
         gpu.ml(&params, 10).unwrap();
         assert_eq!(gpu.cycle(), cpu.cycle());
         let errs = [
@@ -503,7 +503,7 @@ fn switches_match_cpu(setup: Setup) {
         update_probe: false,
         ..ml
     };
-    cpu.ml(&ml, 3);
+    cpu.ml(&ml, 3).unwrap();
     gpu.ml(&ml, 3).unwrap();
     let step = Step {
         params: steps[1],
@@ -511,7 +511,7 @@ fn switches_match_cpu(setup: Setup) {
     };
     cpu.run(&step).unwrap();
     gpu.run(&step).unwrap();
-    cpu.ml(&only_obj, 3);
+    cpu.ml(&only_obj, 3).unwrap();
     gpu.ml(&only_obj, 3).unwrap();
     check(
         [
@@ -857,7 +857,7 @@ impl Cycles {
         match self {
             Cycles::Ap(a) => p.ap(&a, ncycle),
             Cycles::Dm(d) => p.dm(&d, ncycle),
-            Cycles::Ml(m) => p.ml(&m, ncycle),
+            Cycles::Ml(m) => p.ml(&m, ncycle).unwrap(),
         }
     }
 
@@ -1037,6 +1037,7 @@ fn scale_and_background_match_cpu() {
     let both = Features {
         scale: Some(vec![1.0; NPOS]),
         background: Some(flat_background(&start.0)),
+        position: None,
     };
     for cycles in feature_cycles(1) {
         let (cpu, plain) = features_match_cpu(cycles, &start, &both, NCYCLE);
@@ -1052,9 +1053,10 @@ fn scale_and_background_match_cpu() {
     }
 }
 
-/// Features need the fused passes, one finite, positive scale per frame and one finite,
-/// non-negative background value per detector pixel; rPIE and BH model none; a refused set
-/// leaves the features modelled.
+/// Features need the fused passes, one finite, positive scale per frame, one finite,
+/// non-negative background value per detector pixel and one finite offset pair per frame;
+/// GPU positions are not wired yet; rPIE and BH model none; a refused set leaves the features
+/// modelled.
 #[test]
 fn features_are_refused_where_they_cannot_run() {
     let (scan, object, probe) = start(M1.frame, 1, false);
@@ -1081,6 +1083,7 @@ fn features_are_refused_where_they_cannot_run() {
     let half = Features {
         scale: Some(vec![0.5; NPOS]),
         background: Some(flat.iter().map(|b| 2.0 * b).collect()),
+        position: None,
     };
     cpu.set_features(half.clone()).unwrap();
     gpu.set_features(&half).unwrap();
@@ -1088,6 +1091,11 @@ fn features_are_refused_where_they_cannot_run() {
         let n = v.len();
         v[n / 2] = bad;
         v
+    };
+    let one_pos_bad = |bad: [f64; 2]| {
+        let mut d = vec![[0.0; 2]; NPOS];
+        d[NPOS / 2] = bad;
+        d
     };
     let bad_scales = [
         vec![1.0; NPOS - 1],
@@ -1102,13 +1110,24 @@ fn features_are_refused_where_they_cannot_run() {
         one_bad(flat.clone(), f64::NAN),
         one_bad(flat.clone(), f64::INFINITY),
     ];
+    let bad_positions = [
+        vec![[0.0; 2]; NPOS - 1],
+        one_pos_bad([f64::NAN, 0.0]),
+        one_pos_bad([0.0, f64::INFINITY]),
+    ];
     let bad = (bad_scales.into_iter()).map(|s| Features {
         scale: Some(s),
         background: Some(flat.clone()),
+        position: None,
     });
     let bad = bad.chain(bad_backgrounds.into_iter().map(|b| Features {
         scale: Some(vec![1.0; NPOS]),
         background: Some(b),
+        position: None,
+    }));
+    let bad = bad.chain(bad_positions.into_iter().map(|d| Features {
+        position: Some(d),
+        ..half.clone()
     }));
     for bad in bad {
         assert!(cpu.set_features(bad.clone()).is_err(), "{bad:?}");
@@ -1116,6 +1135,17 @@ fn features_are_refused_where_they_cannot_run() {
     }
     assert_eq!(cpu.features(), &half);
     assert_eq!(gpu.features().unwrap(), half);
+    let moved = Features {
+        position: Some(vec![[0.25, -0.25]; NPOS]),
+        ..Features::default()
+    };
+    let err = gpu.set_features(&moved).unwrap_err().to_string();
+    assert!(err.contains("not on the GPU"), "{err}");
+    assert_eq!(gpu.features().unwrap(), half);
+    let mut moved_cpu = Ptycho::new(&scan, cpu.object().clone(), cpu.probe().clone()).unwrap();
+    moved_cpu.set_features(moved).unwrap();
+    assert!(moved_cpu.rpie(&ptychi::RPIE, 1).is_err());
+    assert!(moved_cpu.ml(&MlParams::default(), 1).is_err());
     assert!(cpu.rpie(&ptychi::RPIE, 1).is_err());
     assert!(gpu.rpie(&ptychi::RPIE, 1).is_err());
     let bh = BhParams {
@@ -1173,6 +1203,7 @@ fn feature_graphs_replay_bitwise_like_eager() {
     let start = Features {
         scale: Some(vec![1.0; NPOS]),
         background: Some(flat.clone()),
+        position: None,
     };
     let run = |graph: bool| {
         let mut g = new(graph);
@@ -1183,6 +1214,7 @@ fn feature_graphs_replay_bitwise_like_eager() {
         g.set_features(&Features {
             scale: Some((0..NPOS).map(flux).collect()),
             background: Some(flat.iter().map(|b| 0.5 * b).collect()),
+            position: None,
         })
         .unwrap();
         dm.gpu(&mut g, 4);

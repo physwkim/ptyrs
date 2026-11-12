@@ -720,6 +720,11 @@ impl Device {
                 "features need GpuOptions { fused: true, .. }".into(),
             ));
         }
+        if features.position.is_some() {
+            return Err(EngineError::Invalid(
+                "position refinement is not on the GPU yet".into(),
+            ));
+        }
         let f32s = |v: &Option<Vec<f64>>| v.as_ref().map(|v| v.iter().map(|&x| x as f32).collect());
         let (scale, background): (Option<Vec<f32>>, Option<Vec<f32>>) =
             (f32s(&features.scale), f32s(&features.background));
@@ -774,6 +779,7 @@ impl Device {
         Ok(Features {
             scale: f64s(self.features.scale.as_ref().map(|b| &b.values))?,
             background: f64s(self.features.background.as_ref().map(|b| &b.values))?,
+            position: None,
         })
     }
 
