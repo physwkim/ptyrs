@@ -1,9 +1,11 @@
 //! The CPU f64 engine: [`ptyrs::engine::Ptycho`] (AP, DM, ML, rPIE), LSQML and BH epochs over
 //! its scan, and the forward model and LLK of given arrays.
 
+use std::slice;
+
 use numpy::{PyArray1, PyArray3, PyArray4, PyArrayMethods, PyReadonlyArray3};
 use ptyrs::base::{C64, Object, Probe};
-use ptyrs::engine::{Cost, Fft2, Llk, ProbeVariation, llk, obj_probe_to_psi};
+use ptyrs::engine::{Cost, Llk, Optics, ProbeVariation, llk, obj_probe_to_psi};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
@@ -19,17 +21,22 @@ type Epoch<'py> = (
 
 /// Far field `FT(fftshift(P·O·q))` of every view of `p`'s scan at `object` and `probe`, frame
 /// major and mode minor, zero frequency at `[0, 0]` (PyNX's `psi` layout).
-fn far_field(p: &ptyrs::engine::Ptycho, fft: &Fft2, object: &Object, probe: &Probe) -> Vec<C64> {
+fn far_field(
+    p: &ptyrs::engine::Ptycho,
+    optics: &Optics,
+    object: &Object,
+    probe: &Probe,
+) -> Vec<C64> {
     let views = p.addr().views();
     let mut psi = vec![C64::default(); views.len() * probe.plane_len()];
-    obj_probe_to_psi(views, object, probe, p.quad(), &mut psi);
-    fft.forward(&mut psi);
+    obj_probe_to_psi(views, object, probe, optics.quad(), &mut psi);
+    optics.propagator().forward(&mut psi);
     psi
 }
 
 /// [`ptyrs::engine::Ptycho::llk`] of `object` and `probe` in place of `p`'s own.
-fn llk_of(p: &ptyrs::engine::Ptycho, fft: &Fft2, object: &Object, probe: &Probe) -> Llk {
-    let psi = far_field(p, fft, object, probe);
+fn llk_of(p: &ptyrs::engine::Ptycho, optics: &Optics, object: &Object, probe: &Probe) -> Llk {
+    let psi = far_field(p, optics, object, probe);
     let (addr, obs) = (p.addr(), p.observed());
     llk(obs, 0..addr.nframe(), addr.nmode(), &psi).normalised(obs.nb_obs())
 }
@@ -40,7 +47,8 @@ fn llk_of(p: &ptyrs::engine::Ptycho, fft: &Fft2, object: &Object, probe: &Probe)
 #[pyclass]
 pub(crate) struct Ptycho {
     inner: ptyrs::engine::Ptycho,
-    fft: Fft2,
+    /// [`Optics::far_field`] of the scan: the engine's own quadratic phase and FFT.
+    optics: Optics,
 }
 
 impl Ptycho {
@@ -76,7 +84,7 @@ impl Ptycho {
         let (object, probe) = (Object::new(stack_in(object)?), Probe::new(stack_in(probe)?));
         let inner = ptyrs::engine::Ptycho::new(&scan.0, object, probe).map_err(Error::from)?;
         Ok(Self {
-            fft: Fft2::new(scan.0.geometry.frame),
+            optics: Optics::far_field(&scan.0.geometry),
             inner,
         })
     }
@@ -140,7 +148,7 @@ impl Ptycho {
         probe: PyReadonlyArray3<'_, C64>,
     ) -> PyResult<Bound<'py, PyArray4<C64>>> {
         let (object, probe) = self.modes(object, probe)?;
-        let psi = far_field(&self.inner, &self.fft, &object, &probe);
+        let psi = far_field(&self.inner, &self.optics, &object, &probe);
         let addr = self.inner.addr();
         let [ny, nx] = addr.frame_shape();
         PyArray1::from_vec(py, psi).reshape([addr.nframe(), addr.nmode(), ny, nx])
@@ -154,7 +162,7 @@ impl Ptycho {
         probe: PyReadonlyArray3<'_, C64>,
     ) -> PyResult<Bound<'py, PyDict>> {
         let (object, probe) = self.modes(object, probe)?;
-        llk_dict(py, &llk_of(&self.inner, &self.fft, &object, &probe))
+        llk_dict(py, &llk_of(&self.inner, &self.optics, &object, &probe))
     }
 }
 
@@ -199,8 +207,8 @@ impl Lsqml {
         let steps = self.0.epoch(
             p.addr(),
             p.observed(),
-            p.quad(),
-            &mut object,
+            &ptycho.optics,
+            slice::from_mut(&mut object),
             &mut probe,
             &mut var,
         );
@@ -208,7 +216,8 @@ impl Lsqml {
             let d = PyDict::new(py);
             d.set_item("frames", PyArray1::from_slice(py, &s.frames))?;
             d.set_item("a_far", PyArray1::from_slice(py, &s.a_far))?;
-            d.set_item("a_obj", PyArray1::from_slice(py, &s.a_obj))?;
+            // the far-field model has one object slice
+            d.set_item("a_obj", PyArray1::from_slice(py, &s.a_obj[0]))?;
             d.set_item("a_probe", PyArray1::from_slice(py, &s.a_probe))?;
             Ok(d)
         });
@@ -243,9 +252,10 @@ impl Bh {
     ) -> PyResult<Epoch<'py>> {
         let (mut object, mut probe) = ptycho.modes(object, probe)?;
         let p = &ptycho.inner;
+        let objects = slice::from_mut(&mut object);
         let steps = self
             .0
-            .epoch(p.addr(), p.observed(), p.quad(), &mut object, &mut probe);
+            .epoch(p.addr(), p.observed(), &ptycho.optics, objects, &mut probe);
         let steps = steps.iter().map(|s| {
             let d = PyDict::new(py);
             d.set_item("frames", PyArray1::from_slice(py, &s.frames))?;
@@ -278,7 +288,7 @@ mod tests {
         let scan =
             ptyrs::engine::sim::simulate(g, positions, &object, &probe, 2e3, None, 3).unwrap();
         let p = ptyrs::engine::Ptycho::new(&scan, object, probe).unwrap();
-        let fft = Fft2::new(g.frame);
-        assert_eq!(llk_of(&p, &fft, p.object(), p.probe()), p.llk());
+        let optics = Optics::far_field(&g);
+        assert_eq!(llk_of(&p, &optics, p.object(), p.probe()), p.llk());
     }
 }

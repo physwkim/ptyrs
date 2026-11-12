@@ -3,6 +3,7 @@
 //! same scaled start; AP and DM by M1's launches and by the fused passes; the ML gradients;
 //! and the LLK ring's record of a scan's first frames.
 
+use std::slice;
 use std::sync::Arc;
 
 use cuda_async::device_operation::ExecutionContext;
@@ -10,7 +11,7 @@ use cuda_core::{CudaContext, DeviceBuffer};
 use ptyrs::base::{C64, Counts, MASKED, Object, Probe, Scan, Stack};
 use ptyrs::engine::{
     Algorithm, ApParams, Backend, Bh, BhParams, BhStep, DmParams, Features, GpuOptions, GpuPtycho,
-    Llk, LlkRecord, MlParams, Observed, Params, Ptycho, RpieParams, Step, llk,
+    Llk, LlkRecord, MlParams, Observed, Optics, Params, Ptycho, RpieParams, Step, llk,
 };
 use ptyrs::gpu::{
     C32, FUSED_SIDES, Kernels, LlkPartial, LlkRing, LlkScratch, StackTable, ViewDims,
@@ -307,11 +308,18 @@ fn bh_matches_cpu() {
         };
         let (scan, object, probe) = start(setup.frame, 2, true);
         let at = Ptycho::new(&scan, object.clone(), probe.clone()).unwrap();
+        let optics = Optics::far_field(&scan.geometry);
         let (mut o, mut p) = (object.clone(), probe.clone());
         let mut bh = Bh::new(params);
         let want: Vec<_> = (0..NEPOCH)
             .map(|cycle| {
-                bh.epoch(at.addr(), at.observed(), at.quad(), &mut o, &mut p);
+                bh.epoch(
+                    at.addr(),
+                    at.observed(),
+                    &optics,
+                    slice::from_mut(&mut o),
+                    &mut p,
+                );
                 let llk = Ptycho::new(&scan, o.clone(), p.clone()).unwrap().llk();
                 LlkRecord {
                     cycle,
@@ -363,11 +371,18 @@ fn bh_steps_match_cpu() {
         };
         let (scan, object, probe) = start(setup.frame, 2, true);
         let at = Ptycho::new(&scan, object.clone(), probe.clone()).unwrap();
+        let optics = Optics::far_field(&scan.geometry);
         let (mut o, mut p) = (object.clone(), probe.clone());
         let mut bh = Bh::new(params);
         let mut worst = [0.0f64; 3];
         for nepoch in 1..=NEPOCH {
-            let want = bh.epoch(at.addr(), at.observed(), at.quad(), &mut o, &mut p);
+            let want = bh.epoch(
+                at.addr(),
+                at.observed(),
+                &optics,
+                slice::from_mut(&mut o),
+                &mut p,
+            );
             let mut gpu =
                 GpuPtycho::new(&ctx(), &scan, object.clone(), probe.clone(), options).unwrap();
             gpu.bh(&params, nepoch, 0).unwrap();

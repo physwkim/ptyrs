@@ -230,6 +230,10 @@ name = "llk_trace"
 path = "examples/engine/llk_trace.rs"
 
 [[example]]
+name = "near_speed"
+path = "examples/engine/near_speed.rs"
+
+[[example]]
 name = "bench"
 path = "examples/fft/bench.rs"
 
