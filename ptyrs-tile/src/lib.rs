@@ -2,10 +2,9 @@
 //!
 //! Every launch is a method of a [`TileKernels`], the kernels of one scan, which compiles
 //! them all when it is built, so no launch compiles, eagerly or under a graph capture. A
-//! launch takes the context and buffers of its `ptyrs_gpu` counterpart, the scan's views
-//! and stack table being the set's, leases the buffers with [`ptyrs_gpu::lease`] and
-//! enqueues on the context's stream, so it runs eagerly or records into a capture the same
-//! way.
+//! launch takes the context, stack and buffers of its `ptyrs_gpu` counterpart, the scan's
+//! views being the set's, leases the buffers with [`ptyrs_gpu::lease`] and enqueues on the
+//! context's stream, so it runs eagerly or records into a capture the same way.
 
 use std::sync::Arc;
 
@@ -15,7 +14,8 @@ use cuda_core::{CudaStream, DeviceBuffer, DeviceCopy};
 use cutile::prelude::*;
 pub use ptyrs_gpu::Error;
 use ptyrs_gpu::{
-    C32, LLK_TREE_LEAVES, LlkPartial, StackCtl, StackTable, UpdateSums, ViewDims, Views, lease,
+    C32, LLK_TREE_LEAVES, LlkPartial, StackGeom, StackRef, StackTable, UpdateSums, ViewDims, Views,
+    lease,
 };
 
 #[cutile::module]
@@ -923,34 +923,20 @@ fn addr<T: DeviceCopy>(what: &str, buf: &DeviceBuffer<T>) -> Result<CUdeviceptr,
 /// address [`addr`] accepts, and never read.
 const UNBOUND: CUdeviceptr = 0;
 
-/// Entry `s` of `table` as a kernel's [`StackCtl`] words; panics if `s >= table.len()`, as
-/// [`StackTable::at`].
-fn stack_ctl(table: &StackTable, s: usize) -> DevicePointer<i32> {
-    table.at(s);
-    ptr(table.ptr() + (s * size_of::<StackCtl>()) as CUdeviceptr)
-}
+/// What a compile-only run passes for a stack entry, one address of each alignment [`ctl`]
+/// accepts (16 and 8 bytes), never read.
+const UNBOUND_CTL: [CUdeviceptr; 2] = [0, 8];
 
-/// The stack kernels' scalar arguments: `nframe`, `nf_max`, `nmode`, the frame and object
-/// sides. Checks that every offset the kernels form from them, in `f32` or `ViewAddr`-word
-/// units, is an `i32`, and returns the `f32` length of a stack's psi.
-fn stack_geom(views: &Views, table: &StackTable) -> Result<([i32; 7], usize), Error> {
-    let d = views.dims();
-    let n = d.frame[0] as usize * d.frame[1] as usize;
-    let psi_len = table.nf_max() as usize * d.nmode as usize * n;
-    offset("psi length", 2 * psi_len)?;
-    offset("probe length", 2 * d.nprobe as usize * n)?;
-    offset("object length", 2 * obj_len(d))?;
-    offset("view words", 6 * views.addr().len())?;
-    let [ny, nx] = d.frame;
-    let [nyo, nxo] = d.obj;
-    let mut g = [0; 7];
-    for (g, v) in g
-        .iter_mut()
-        .zip([d.nframe, table.nf_max(), d.nmode, ny, nx, nyo, nxo])
-    {
-        *g = offset("geometry", v as usize)?;
+/// Address of `stack`'s entry. Entry `s` lies `8 s` bytes into its table's allocation, so
+/// it is aligned to 16 or 8 bytes, the two cases [`TileKernels::new`] compiles.
+fn ctl(stack: StackRef<'_>) -> Result<CUdeviceptr, Error> {
+    let a = stack.ctl();
+    if !a.is_multiple_of(8) {
+        return Err(shape(format!(
+            "stack entry at {a:#x} is not 8-byte aligned"
+        )));
     }
-    Ok((g, psi_len))
+    Ok(a)
 }
 
 fn obj_len(d: &ViewDims) -> usize {
@@ -997,18 +983,19 @@ macro_rules! run {
     };
 }
 
-/// The Tile kernels of one scan, its [`Views`] and [`StackTable`], compiled when the set is
-/// built. cutile compiles a kernel once per specialization, keyed by the power-of-two
-/// divisor of each integer argument and the alignment of each pointer. Every integer here
-/// comes from the scan, the scan's buffers are the set's, entry `s` of the table is aligned
-/// like entry `s % 2`, and every other buffer must be 16-byte aligned; so [`Self::new`]
+/// The Tile kernels of one scan's [`Views`] and stack geometry ([`StackGeom`]: the views'
+/// sizes and a table's `nf_max`), compiled when the set is built. cutile compiles a kernel
+/// once per specialization, keyed by the power-of-two divisor of each integer argument and
+/// the alignment of each pointer. Every integer here comes from the geometry, which a launch
+/// checks its stack against, the scan's buffers are the set's, a stack entry is aligned to
+/// 16 or 8 bytes ([`ctl`]) and every other buffer must be 16-byte aligned; so [`Self::new`]
 /// compiles every specialization a launch can reach, and no launch, eager or captured,
 /// compiles.
 pub struct TileKernels<'a> {
     views: &'a Views,
-    table: &'a StackTable,
-    /// [`stack_geom`].
-    geom: [i32; 7],
+    /// What the kernels were compiled for; each of its counts and sides is an `i32`.
+    geom: StackGeom,
+    /// Complex values of a stack's psi, `nf_max * nmode * ny * nx`.
     psi_len: usize,
     /// Complex values of the probe, `nprobe * ny * nx`.
     probe_len: usize,
@@ -1017,30 +1004,42 @@ pub struct TileKernels<'a> {
 
 impl<'a> TileKernels<'a> {
     /// Checks the scan's sizes against the kernels' `i32` offsets and compiles every kernel
-    /// on `stream`, without launching any.
+    /// on `stream`, without launching any, for the stacks of `table` and of every other
+    /// table of its `nf_max` over `views`.
     pub fn new(
         stream: &Arc<CudaStream>,
         views: &'a Views,
-        table: &'a StackTable,
+        table: &StackTable,
     ) -> Result<Self, Error> {
         let d = views.dims();
-        let (geom, psi_len) = stack_geom(views, table)?;
+        let geom = d.geom(table.at(0))?;
+        let n = geom.ny as usize * geom.nx as usize;
+        let psi_len = geom.nf_max as usize * geom.nmode as usize * n;
+        let probe_len = geom.nprobe as usize * n;
+        // Every offset the kernels form, in `f32` or `ViewAddr`-word units, is an i32.
+        offset("psi length", 2 * psi_len)?;
+        offset("probe length", 2 * probe_len)?;
+        offset("object length", 2 * obj_len(d))?;
+        offset("view words", 6 * views.addr().len())?;
         offset("tile list length", views.tile_views().len())?;
-        let llk_levels = llk_levels(d.nframe);
+        let g = geom;
+        for v in [g.nframe, g.nf_max, g.nmode, g.ny, g.nx, g.nyo, g.nxo] {
+            offset("geometry", v as usize)?;
+        }
+        let llk_levels = llk_levels(geom.nframe);
         // The first level's programs index 256 four-term nodes each, as i32.
         offset("leaf offsets", 4 * LLK_TREE_LEAVES * llk_levels[0])?;
         let k = Self {
             views,
-            table,
             geom,
             psi_len,
-            probe_len: d.nprobe as usize * d.frame[0] as usize * d.frame[1] as usize,
+            probe_len,
             llk_levels,
         };
         let run = Run::Compile(stream);
-        for s in 0..table.len().min(2) {
-            k.psi_to_obj_run(run, s, [UNBOUND; 4])?;
-            k.psi_to_probe_run(run, s, [UNBOUND; 4])?;
+        for ctl in UNBOUND_CTL {
+            k.psi_to_obj_run(run, ctl, [UNBOUND; 4])?;
+            k.psi_to_probe_run(run, ctl, [UNBOUND; 4])?;
         }
         k.update_obj_run(run, [UNBOUND; 4], 0.0)?;
         k.update_probe_run(run, [UNBOUND; 4], 0.0)?;
@@ -1048,20 +1047,41 @@ impl<'a> TileKernels<'a> {
         Ok(k)
     }
 
-    /// [`ptyrs_gpu::Kernels::psi_to_obj`] for the stack in entry `s` of the table: adds the
-    /// stack's object-update sums to `sums` `[nobj, nyo, nxo]`, each object pixel adding its
-    /// views in ascending view order from the same tile lists, so the result does not depend
-    /// on the stack split. Only the pixels of tiles the stack's views touch are read and
-    /// written. `psi` holds `nf_max` frames.
+    /// The stack kernels' scalar arguments: `nframe`, `nf_max`, `nmode`, the frame and
+    /// object sides, each checked by [`Self::new`] to be an `i32`.
+    fn args(&self) -> [i32; 7] {
+        let g = self.geom;
+        [g.nframe, g.nf_max, g.nmode, g.ny, g.nx, g.nyo, g.nxo].map(|v| v as i32)
+    }
+
+    /// The address of `stack`'s entry, a stack of the geometry the set was compiled for.
+    fn stack(&self, stack: StackRef<'_>) -> Result<CUdeviceptr, Error> {
+        let g = self.views.dims().geom(stack)?;
+        if g != self.geom {
+            return Err(shape(format!(
+                "a stack of {g:?}, the kernels were built for {:?}",
+                self.geom
+            )));
+        }
+        ctl(stack)
+    }
+
+    /// [`ptyrs_gpu::Kernels::psi_to_obj`] for `stack`: adds the stack's object-update sums
+    /// to `sums` `[nobj, nyo, nxo]`, each object pixel adding its views in ascending view
+    /// order from the same tile lists, so the result does not depend on the stack split.
+    /// Only the pixels of tiles the stack's views touch are read and written. `psi` holds
+    /// `nf_max` frames. The kernel reads the entry when it runs, so a captured launch serves
+    /// whichever stack the entry holds at replay.
     pub fn psi_to_obj(
         &self,
         ctx: &ExecutionContext,
-        s: usize,
+        stack: StackRef<'_>,
         psi: &DeviceBuffer<C32>,
         probe: &DeviceBuffer<C32>,
         sums: &mut UpdateSums,
     ) -> Result<(), Error> {
         let (v, len) = (self.views, obj_len(self.views.dims()));
+        let ctl = self.stack(stack)?;
         check_len("psi", psi, self.psi_len)?;
         check_len("probe", probe, self.probe_len)?;
         check_len("sums.num", &sums.num, len)?;
@@ -1079,25 +1099,25 @@ impl<'a> TileKernels<'a> {
             v.tile_start().storage(),
             v.tile_len().storage(),
             v.tile_views().storage(),
-            self.table.storage(),
+            stack.storage(),
         ];
         lease(ctx, &reads, &[sums.num.storage(), sums.den.storage()])?;
-        self.psi_to_obj_run(Run::Launch(ctx), s, at)
+        self.psi_to_obj_run(Run::Launch(ctx), ctl, at)
     }
 
     fn psi_to_obj_run(
         &self,
         run: Run,
-        s: usize,
+        ctl: CUdeviceptr,
         [psi, probe, num, den]: [CUdeviceptr; 4],
     ) -> Result<(), Error> {
-        let (v, d, g) = (self.views, self.views.dims(), self.geom);
+        let (v, d, g) = (self.views, self.views.dims(), self.args());
         let [nty, ntx] = d.tiles();
-        // SAFETY: a launch comes from `psi_to_obj`, which checked the lengths and leased the
-        // buffers on `ctx`; `stack_geom` checked the i32 offsets; `Views` checked every view
-        // lies inside the object with valid mode indices and holds tile runs built from them;
-        // the kernel clamps the stack entry to `nf_max` frames inside the scan, and each
-        // program writes only the pixels of its own tile.
+        // SAFETY: a launch comes from `psi_to_obj`, which checked the stack's geometry and
+        // the lengths and leased the buffers on `ctx`; `new` checked the i32 offsets; `Views`
+        // checked every view lies inside the object with valid mode indices and holds tile
+        // runs built from them; the kernel clamps the stack entry to `nf_max` frames inside
+        // the scan, and each program writes only the pixels of its own tile.
         unsafe {
             run!(
                 run,
@@ -1111,7 +1131,7 @@ impl<'a> TileKernels<'a> {
                     dptr(v.tile_views()),
                     ptr(num),
                     ptr(den),
-                    stack_ctl(self.table, s),
+                    ptr(ctl),
                     g[0],
                     g[1],
                     g[2],
@@ -1119,7 +1139,7 @@ impl<'a> TileKernels<'a> {
                     g[4],
                     g[5],
                     g[6],
-                    d.quad_phase,
+                    self.geom.quad,
                 )
                 .grid((ntx, nty, d.nobj))
             );
@@ -1127,19 +1147,20 @@ impl<'a> TileKernels<'a> {
         Ok(())
     }
 
-    /// [`ptyrs_gpu::Kernels::psi_to_probe`] for the stack in entry `s` of the table: adds
-    /// the stack's probe-update sums to `sums` `[nprobe, ny, nx]`, each probe pixel adding
-    /// the views of its mode in ascending view order, so the result does not depend on the
-    /// stack split; a mode without a view in the stack is not written. `psi` holds `nf_max`
-    /// frames.
+    /// [`ptyrs_gpu::Kernels::psi_to_probe`] for `stack`: adds the stack's probe-update sums
+    /// to `sums` `[nprobe, ny, nx]`, each probe pixel adding the views of its mode in
+    /// ascending view order, so the result does not depend on the stack split; a mode
+    /// without a view in the stack is not written. `psi` holds `nf_max` frames. The entry is
+    /// read as in [`Self::psi_to_obj`].
     pub fn psi_to_probe(
         &self,
         ctx: &ExecutionContext,
-        s: usize,
+        stack: StackRef<'_>,
         psi: &DeviceBuffer<C32>,
         obj: &DeviceBuffer<C32>,
         sums: &mut UpdateSums,
     ) -> Result<(), Error> {
+        let ctl = self.stack(stack)?;
         check_len("psi", psi, self.psi_len)?;
         check_len("obj", obj, obj_len(self.views.dims()))?;
         check_len("sums.num", &sums.num, self.probe_len)?;
@@ -1154,25 +1175,25 @@ impl<'a> TileKernels<'a> {
             psi.storage(),
             obj.storage(),
             self.views.addr().storage(),
-            self.table.storage(),
+            stack.storage(),
         ];
         lease(ctx, &reads, &[sums.num.storage(), sums.den.storage()])?;
-        self.psi_to_probe_run(Run::Launch(ctx), s, at)
+        self.psi_to_probe_run(Run::Launch(ctx), ctl, at)
     }
 
     fn psi_to_probe_run(
         &self,
         run: Run,
-        s: usize,
+        ctl: CUdeviceptr,
         [psi, obj, num, den]: [CUdeviceptr; 4],
     ) -> Result<(), Error> {
-        let (v, d, g) = (self.views, self.views.dims(), self.geom);
-        let [ny, nx] = d.frame;
-        // SAFETY: a launch comes from `psi_to_probe`, which checked the lengths and leased the
-        // buffers on `ctx`; `stack_geom` checked the i32 offsets; `Views` checked every view
-        // lies inside the object with valid mode indices; the kernel clamps the stack entry to
-        // `nf_max` frames inside the scan, and each program writes only the pixels of its own
-        // tile.
+        let (v, g) = (self.views, self.args());
+        let (ny, nx, nprobe) = (self.geom.ny, self.geom.nx, self.geom.nprobe);
+        // SAFETY: a launch comes from `psi_to_probe`, which checked the stack's geometry and
+        // the lengths and leased the buffers on `ctx`; `new` checked the i32 offsets; `Views`
+        // checked every view lies inside the object with valid mode indices; the kernel clamps
+        // the stack entry to `nf_max` frames inside the scan, and each program writes only the
+        // pixels of its own tile.
         unsafe {
             run!(
                 run,
@@ -1183,7 +1204,7 @@ impl<'a> TileKernels<'a> {
                     dptr(v.addr()),
                     ptr(num),
                     ptr(den),
-                    stack_ctl(self.table, s),
+                    ptr(ctl),
                     g[0],
                     g[1],
                     g[2],
@@ -1191,9 +1212,9 @@ impl<'a> TileKernels<'a> {
                     g[4],
                     g[5],
                     g[6],
-                    d.quad_phase,
+                    self.geom.quad,
                 )
-                .grid((nx.div_ceil(32), ny.div_ceil(8), d.nprobe))
+                .grid((nx.div_ceil(32), ny.div_ceil(8), nprobe))
             );
         }
         Ok(())
@@ -1241,13 +1262,13 @@ impl<'a> TileKernels<'a> {
         inertia: f32,
     ) -> Result<(), Error> {
         let d = self.views.dims();
-        let [nyo, nxo] = [self.geom[5], self.geom[6]];
+        let [nyo, nxo] = [self.geom.nyo, self.geom.nxo].map(|v| v as i32);
         let [nty, ntx] = d.tiles();
         let grid = (ntx, nty, d.nobj);
         let tile_len = self.views.tile_len();
         // SAFETY: a launch comes from `update_obj_from_sums`, which checked that `obj`, `num`
         // and `den` hold the object and `max_bits` one u32, zeroed it and leased the buffers
-        // on `ctx`; `tile_len` holds the object's tiles; `stack_geom` checked the offsets;
+        // on `ctx`; `tile_len` holds the object's tiles; `new` checked the offsets;
         // each program reads and writes only the pixels of its own tile.
         unsafe {
             run!(
@@ -1313,7 +1334,7 @@ impl<'a> TileKernels<'a> {
         [x, num, den, max_bits]: [CUdeviceptr; 4],
         inertia: f32,
     ) -> Result<(), Error> {
-        // `stack_geom` checked that the probe's `2 n` floats index as i32.
+        // `new` checked that the probe's `2 n` floats index as i32.
         let n = self.probe_len as i32;
         // SAFETY: a launch comes from `update_probe_from_sums`, which checked that `x`, `num`
         // hold `n` complex values, `den` `n` floats and `max_bits` one, zeroed `max_bits` and
@@ -1346,7 +1367,7 @@ impl<'a> TileKernels<'a> {
         scratch: &mut DeviceBuffer<f64>,
         out: &mut DeviceBuffer<f64>,
     ) -> Result<(), Error> {
-        let n = self.views.dims().nframe;
+        let n = self.geom.nframe;
         check_len("partials", partials, n as usize)?;
         check_len("scratch", scratch, llk_sums_scratch_len(n))?;
         check_len("out", out, 4)?;
@@ -1364,7 +1385,7 @@ impl<'a> TileKernels<'a> {
     }
 
     fn llk_run(&self, run: Run, [partials, scratch, out]: [CUdeviceptr; 3]) -> Result<(), Error> {
-        let n = self.geom[0];
+        let n = self.geom.nframe as i32;
         let node = |at: usize| scratch + (at * size_of::<f64>()) as CUdeviceptr;
         // Scratch offset and node count of the level below.
         let mut below: Option<(usize, i32)> = None;

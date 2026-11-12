@@ -353,7 +353,9 @@ fn psi_to_obj_matches_simt_and_ignores_stack_split() {
     let simt = host(stream, &simt);
     let tile_whole = || {
         let mut s = fx.start();
-        tk_whole.psi_to_obj(ex, 0, &psi, &fx.probe, &mut s).unwrap();
+        tk_whole
+            .psi_to_obj(ex, whole.at(0), &psi, &fx.probe, &mut s)
+            .unwrap();
         host(stream, &s)
     };
     let tile = tile_whole();
@@ -368,7 +370,7 @@ fn psi_to_obj_matches_simt_and_ignores_stack_split() {
     let mut parts = fx.start();
     for (s, psi) in psi_parts.iter().enumerate() {
         tk_split
-            .psi_to_obj(ex, s, psi, &fx.probe, &mut parts)
+            .psi_to_obj(ex, split.at(s), psi, &fx.probe, &mut parts)
             .unwrap();
     }
     let parts = host(stream, &parts);
@@ -424,7 +426,8 @@ fn psi_to_obj_follows_the_device_entry() {
         fx.k.psi_to_obj(ex, views, dev.at(0), &psi, &fx.probe, &mut simt)
             .unwrap();
         let mut tile = fx.start();
-        tk.psi_to_obj(ex, 0, &psi, &fx.probe, &mut tile).unwrap();
+        tk.psi_to_obj(ex, dev.at(0), &psi, &fx.probe, &mut tile)
+            .unwrap();
         let what = format!("psi_to_obj entry {{ f0: {f0}, nf: {nf} }} = frames {f:?}");
         let (simt, tile) = (host(stream, &simt), host(stream, &tile));
         let dark = fx.check(&what, f.clone(), &tile, &simt);
@@ -454,15 +457,15 @@ fn psi_to_obj_checks_buffers() {
     let mut sums = UpdateSums::zeroed(stream, len).unwrap();
     // Two frames of psi do not hold `nf_max` = 3.
     let short_psi = up(stream, &fx.psi_host[..2 * fsize]);
-    let r = tk.psi_to_obj(ex, 1, &short_psi, &fx.probe, &mut sums);
+    let r = tk.psi_to_obj(ex, table.at(1), &short_psi, &fx.probe, &mut sums);
     shape(r, "psi");
     // One probe mode does not hold two.
     let short_probe = up(stream, &fx.probe_host[..n(&fx.d)]);
-    let r = tk.psi_to_obj(ex, 1, &psi, &short_probe, &mut sums);
+    let r = tk.psi_to_obj(ex, table.at(1), &psi, &short_probe, &mut sums);
     shape(r, "probe");
     // One object mode of sums does not hold two.
     let mut short = UpdateSums::zeroed(stream, len / 2).unwrap();
-    let r = tk.psi_to_obj(ex, 1, &psi, &fx.probe, &mut short);
+    let r = tk.psi_to_obj(ex, table.at(1), &psi, &fx.probe, &mut short);
     shape(r, "sums");
     // Psi 8 bytes into its allocation, aligned for `C32` but not to 16 bytes.
     let wide = up(stream, &fx.psi_host[..3 * fsize + 1]);
@@ -472,8 +475,21 @@ fn psi_to_obj_checks_buffers() {
         .unwrap();
     // SAFETY: the bytes hold initialized `C32` values.
     let shifted = unsafe { DeviceBuffer::<C32>::from_storage(bytes, 3 * fsize) }.unwrap();
-    let r = tk.psi_to_obj(ex, 1, &shifted, &fx.probe, &mut sums);
+    let r = tk.psi_to_obj(ex, table.at(1), &shifted, &fx.probe, &mut sums);
     shape(r, "misaligned psi");
-    tk.psi_to_obj(ex, 1, &psi, &fx.probe, &mut sums).unwrap();
+    tk.psi_to_obj(ex, table.at(1), &psi, &fx.probe, &mut sums)
+        .unwrap();
+    // A stack of another `nf_max`, or of a table for another scan length, is refused; one
+    // of another table of the same geometry launches.
+    let other = StackTable::new(stream, &fx.d, &[0..1, 1..5]).unwrap();
+    let r = tk.psi_to_obj(ex, other.at(0), &psi, &fx.probe, &mut sums);
+    shape(r, "stack of nf_max 4");
+    let short_scan = ViewDims { nframe: 4, ..fx.d };
+    let other = StackTable::new(stream, &short_scan, std::slice::from_ref(&(0..3))).unwrap();
+    let r = tk.psi_to_obj(ex, other.at(0), &psi, &fx.probe, &mut sums);
+    shape(r, "stack of a 4-frame scan");
+    let same = StackTable::new(stream, &fx.d, &[0..3, 3..5]).unwrap();
+    tk.psi_to_obj(ex, same.at(1), &psi, &fx.probe, &mut sums)
+        .unwrap();
     assert_eq!(jit_compile_count(), jit, "a launch compiled");
 }

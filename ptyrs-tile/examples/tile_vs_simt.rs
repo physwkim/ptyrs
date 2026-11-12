@@ -152,7 +152,8 @@ fn main() {
     let total = 2 + reps;
     for _ in 0..total {
         if tile {
-            tk.psi_to_obj(&ex, 0, &psi, &probe, &mut obj_sums).unwrap();
+            tk.psi_to_obj(&ex, table.at(0), &psi, &probe, &mut obj_sums)
+                .unwrap();
         } else {
             k.psi_to_obj(&ex, &views, table.at(0), &psi, &probe, &mut obj_sums)
                 .unwrap();
@@ -160,7 +161,7 @@ fn main() {
     }
     for _ in 0..total {
         if tile {
-            tk.psi_to_probe(&ex, 0, &psi, &obj, &mut probe_sums)
+            tk.psi_to_probe(&ex, table.at(0), &psi, &obj, &mut probe_sums)
                 .unwrap();
         } else {
             k.psi_to_probe(&ex, &views, table.at(0), &psi, &obj, &mut probe_sums)
