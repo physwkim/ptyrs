@@ -479,7 +479,7 @@ pub unsafe fn gather(
     let n = g.ny as usize * g.nx as usize;
     let waves = new_waves(p, cfg);
     let (f0, nf) = unsafe { stack_frames(ctl, g) };
-    let (k0, k1) = (f0 * g.nmode, (f0 + nf) * g.nmode);
+    let (k0, nk) = (f0 * g.nmode, nf * g.nmode);
     let pixel = |lo: u32, end: u32, y: u32, x: u32| unsafe {
         if x >= g.nxo || y >= g.nyo {
             return;
@@ -489,15 +489,16 @@ pub unsafe fn gather(
         let mut norm = *sums.den.add(px);
         for j in lo..end {
             let k = *tiles.views.add(j as usize);
-            if k >= k1 {
+            let i = k.wrapping_sub(k0);
+            if i >= nk {
                 break;
             }
             let v = *p.views.add(k as usize);
             if v.obj != iobj || v.probe != 0 {
                 continue;
             }
-            // Mode `o * nprobe + pm` of the frame is view `k + pm`, plane `k - k0 + pm`.
-            let plane = (k - k0) as usize * n;
+            // Mode `o * nprobe + pm` of the frame is view `k + pm`, plane `i + pm`.
+            let plane = i as usize * n;
             obj_pixel_sources(v, y, x, g.ny, g.nx, |pry, prx, w| {
                 let at = (pry * g.nx + prx) as usize;
                 let ps = psi_index(pry, prx, g.ny, g.nx);

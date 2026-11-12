@@ -122,8 +122,9 @@ pub unsafe fn tile_run(tiles: TilePtrs, t: usize) -> (u32, u32) {
 }
 
 /// The part of tile `t`'s run from its first view `>= k0` to its end, if that view is
-/// `< k1`; the caller stops at the first view `>= k1`. `None` when no view of the stack
-/// `k0 .. k1` touches the tile, so the tile's sums must be left untouched.
+/// `< k1`; the caller stops at the first view outside `k0 .. k1`, so a run out of
+/// ascending order reads no view past the stack. `None` when no view of the stack `k0 ..
+/// k1` touches the tile, so the tile's sums must be left untouched.
 ///
 /// # Safety
 ///

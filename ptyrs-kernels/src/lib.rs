@@ -122,22 +122,22 @@ const STACK_TILE_SHARED: usize = 3 * pixel::STACK_TILE_CANDIDATES as usize + 1;
 
 /// Calls `f(lo, end, y, x)` on every thread, with `(y, x)` the thread's pixel of the tile and
 /// `lo .. end` the tile's run from its first view of the stack (the caller stops at the
-/// first view `>= k1`), for each object tile this block owns in a stack-tile launch:
-/// `(OBJ_TILE, OBJ_TILE, 1)` blocks, `gridDim.x * STACK_TILE_CANDIDATES >= nf_max * per`.
-/// The stack's candidates are the tiles of each frame's [`pixel::axis_tiles`] box, `c = fl
-/// * per + iy * fpx + ix` for tile `(y0 + iy, x0 + ix)` of frame `fl`, with `fpy`, `fpx`
-/// the [`pixel::axis_tiles_max`] of the frame sides and `per = fpy * fpx`. Thread `t <
-/// STACK_TILE_CANDIDATES` tests candidate `blockIdx.x + t * gridDim.x`, which its block
-/// owns if the tile is in the box and the run's first view of the stack is frame `fl`'s:
-/// each tile some frame of the stack is binned to gets exactly one owner block, and no
-/// other tile gets one.
+/// first view outside `k0 .. k1`), for each object tile this block owns in a stack-tile
+/// launch: `(OBJ_TILE, OBJ_TILE, 1)` blocks, `gridDim.x * STACK_TILE_CANDIDATES >= nf_max *
+/// per`. The stack's candidates are the tiles of each frame's [`pixel::axis_tiles`] box, `c
+/// = fl * per + iy * fpx + ix` for tile `(y0 + iy, x0 + ix)` of frame `fl`, with `fpy`,
+/// `fpx` the [`pixel::axis_tiles_max`] of the frame sides and `per = fpy * fpx`. Thread `t
+/// < STACK_TILE_CANDIDATES` tests candidate `blockIdx.x + t * gridDim.x`, which its block
+/// owns if the tile is in the box and the run's first view of the stack is frame `fl`'s.
+/// No tile gets two owner blocks; when the stack's views in each run are exactly those
+/// [`pixel::axis_tiles`] bins to it, each tile some frame of the stack is binned to gets
+/// one, and no other tile does.
 ///
 /// # Safety
 ///
 /// `views` holds the scan's `nframe * nmode` views, `ctl` one entry, `shared`
-/// `STACK_TILE_SHARED` block-shared `u32`; `tiles` as [`TilePtrs`] says, the views of the
-/// stack in tile `t`'s run exactly those [`pixel::axis_tiles`] bins to it. Every thread of
-/// the block must call it: it synchronizes the block.
+/// `STACK_TILE_SHARED` block-shared `u32`; `tiles` as [`TilePtrs`] says, each run's views
+/// `< nframe * nmode`. Every thread of the block must call it: it synchronizes the block.
 #[device]
 unsafe fn for_each_stack_tile<F: FnMut(u32, u32, u32, u32)>(
     views: *const pixel::ViewAddr,
@@ -652,7 +652,7 @@ pub mod kernels {
         let iobj = thread::blockIdx_z();
         let n = g.ny as usize * g.nx as usize;
         let (f0, nf) = unsafe { stack_frames(ctl, g) };
-        let (k0, k1) = (f0 * g.nmode, (f0 + nf) * g.nmode);
+        let (k0, nk) = (f0 * g.nmode, nf * g.nmode);
         let pixel = |lo: u32, end: u32, y: u32, x: u32| unsafe {
             if x >= g.nxo || y >= g.nyo {
                 return;
@@ -663,7 +663,8 @@ pub mod kernels {
             let mut j = lo;
             while j < end {
                 let k = *tiles.views.add(j as usize);
-                if k >= k1 {
+                let i = k.wrapping_sub(k0);
+                if i >= nk {
                     break;
                 }
                 j += 1;
@@ -671,7 +672,7 @@ pub mod kernels {
                 if v.obj != iobj {
                     continue;
                 }
-                let plane = (k - k0) as usize * n;
+                let plane = i as usize * n;
                 obj_pixel_sources(v, y, x, g.ny, g.nx, |pry, prx, w| {
                     let p = load_c(probe, v.probe as usize * n + (pry * g.nx + prx) as usize);
                     let q = quad_phase(g.quad, pry, prx, g.ny, g.nx);

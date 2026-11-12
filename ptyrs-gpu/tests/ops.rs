@@ -1734,6 +1734,60 @@ fn stack_pass_over_reordered_views_matches_the_frames_in_that_order() {
     }
 }
 
+/// Stacks binned out of frame order leave runs whose later views are of earlier frames; the
+/// stack passes over them stay in bounds (their sums are unspecified).
+#[test]
+fn stack_passes_over_runs_binned_out_of_frame_order_stay_in_bounds() {
+    let (stream, _, k) = setup();
+    let mut overflow = up(&stream, &[0u32]);
+    let mut bin_in = |views: &mut Views, table: &StackTable| {
+        for i in 0..table.len() {
+            record(|ctx| k.bin_views(ctx, views, table.at(i), &mut overflow))
+                .sync_on(&stream)
+                .unwrap();
+        }
+    };
+
+    let s = scan12();
+    let mut views =
+        Views::reordered(&stream, &Views::new(&stream, s.d, &s.views).unwrap()).unwrap();
+    let table = StackTable::new(&stream, &s.d, &[4..12, 0..4]).unwrap();
+    bin_in(&mut views, &table);
+    let psi = up(&stream, &noise(s.nk(&(4..12)) * s.n(), 80, 1.0));
+    let probe = up(&stream, &s.probe);
+    let mut sums = UpdateSums::zeroed(&stream, s.obj.len()).unwrap();
+    record(|ctx| k.psi_to_obj(ctx, &views, table.at(0), &psi, &probe, &mut sums))
+        .sync_on(&stream)
+        .unwrap();
+
+    let fs = FusedScan::new(&stream, [256, 128], [2, 2]);
+    let mut views = Views::reordered(&stream, &fs.views).unwrap();
+    let table = StackTable::new(&stream, &fs.s.d, &[2..5, 0..2]).unwrap();
+    bin_in(&mut views, &table);
+    let inputs = FusedInputs {
+        views: &views,
+        ..fs.inputs()
+    };
+    let mut bufs = FusedBufs::new(&stream, &fs.s.d, table.nf_max()).unwrap();
+    let mut sums = UpdateSums::zeroed(&stream, fs.s.obj.len()).unwrap();
+    record(|ctx| {
+        let sums = FusedSums {
+            obj: Some(&mut sums),
+            probe: None,
+        };
+        k.fused_project(
+            ctx,
+            &inputs,
+            table.at(0),
+            Exit::Ap { llk: None },
+            &mut bufs,
+            sums,
+        )
+    })
+    .sync_on(&stream)
+    .unwrap();
+}
+
 /// Side of the square image the line FFTs and the `Plan2d` of [`Iteration`] round-trip.
 const AUX: u32 = 128;
 
