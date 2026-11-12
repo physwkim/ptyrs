@@ -201,6 +201,8 @@ impl Dip {
 mod tests {
     use burn::module::{ModuleMapper, ModuleVisitor, Param};
     use burn::tensor::DType;
+    use ptyrs_core::{C64, Geometry, Object, Probe, Scan, Stack, required_obj_shape, sim};
+    use ptyrs_engine::Ptycho;
 
     use super::*;
 
@@ -276,6 +278,73 @@ mod tests {
     impl ObjectLoss for Transposed {
         fn gradient(&mut self, object: &Tensor<3>) -> Result<(f64, Tensor<3>), LossError> {
             Ok((0.0, object.clone().swap_dims(0, 1)))
+        }
+    }
+
+    /// [`ObjectLoss`] from a loss on the host object (interleaved f64), the gradient by central
+    /// differences.
+    struct CentralDifferences<F>(F);
+
+    impl<F: FnMut(&[f64]) -> f64> ObjectLoss for CentralDifferences<F> {
+        fn gradient(&mut self, object: &Tensor<3>) -> Result<(f64, Tensor<3>), LossError> {
+            // Rounding and curvature errors of the engine LLK balance here: 1e-5 and 1e-7 err more.
+            const H: f64 = 1e-6;
+            let mut o = host64(object.clone());
+            let value = (self.0)(&o);
+            let g = (0..o.len())
+                .map(|k| {
+                    let v = o[k];
+                    o[k] = v + H;
+                    let up = (self.0)(&o);
+                    o[k] = v - H;
+                    let down = (self.0)(&o);
+                    o[k] = v;
+                    (up - down) / (2.0 * H)
+                })
+                .collect();
+            Ok((value, like(object, g)))
+        }
+    }
+
+    /// The engine's normalised Poisson LLK (CPU) over a 25-frame scan of a 16×16 object with
+    /// 8×8 frames.
+    struct Tiny {
+        scan: Scan,
+        probe: Probe,
+    }
+
+    impl Tiny {
+        const SHAPE: [usize; 2] = [16, 16];
+
+        fn new() -> Self {
+            let frame = [8, 8];
+            let g = Geometry::new(1.5e-10, 1.0, 75e-6, frame).unwrap();
+            let pixel = g.pixel_size_object();
+            let positions = sim::fermat(25, pixel[1]);
+            let need = required_obj_shape(&positions.pynx_preprocess(pixel), pixel, frame, 0);
+            assert!(
+                need[0] <= Self::SHAPE[0] && need[1] <= Self::SHAPE[1],
+                "{need:?}"
+            );
+            let truth = crate::data::random_object(Self::SHAPE, 7);
+            let mut probe = sim::probe(frame, 1).unwrap();
+            let scan =
+                ptyrs_engine::sim::simulate(g, positions, &truth, &probe, 1e4, None, 7).unwrap();
+            // The simulator scales the intensity to the photon count; the probe has to follow.
+            let p = Ptycho::new(&scan, truth, probe.clone()).unwrap();
+            let s = (p.observed().total() / p.llk().nb_photons_calc).sqrt();
+            probe.as_mut_slice().iter_mut().for_each(|c| *c *= s);
+            Self { scan, probe }
+        }
+
+        fn llk(&self, o: &[f64]) -> f64 {
+            let [ny, nx] = Self::SHAPE;
+            let data = o.chunks(2).map(|z| C64::new(z[0], z[1])).collect();
+            let object = Object::new(Stack::from_vec([1, ny, nx], data).unwrap());
+            Ptycho::new(&self.scan, object, self.probe.clone())
+                .unwrap()
+                .llk()
+                .poisson
         }
     }
 
@@ -393,7 +462,8 @@ mod tests {
             let d: Vec<f64> = grad.iter().map(|_| rng.gen_range(-1.0..1.0)).collect();
             let norm = d.iter().map(|v| v * v).sum::<f64>().sqrt();
             let ad: f64 = grad.iter().zip(&d).map(|(g, v)| g * v / norm).sum();
-            let h = 1e-5;
+            // At 1e-5 the curvature of the engine LLK along a direction reaches 9e-7 of the slope.
+            let h = 3e-6;
             let step = |s: f64| d.iter().map(|v| s * h * v / norm).collect();
             let fd = (loss_at(dip, &mut value, target, step(1.0))
                 - loss_at(dip, &mut value, target, step(-1.0)))
@@ -447,5 +517,22 @@ mod tests {
             dip.step(&mut Transposed, 1e-2),
             Err(NnError::Invalid(_))
         ));
+    }
+
+    #[test]
+    fn weight_gradients_from_the_engine_llk_match_finite_differences() {
+        let device = Device::cuda(0);
+        device.seed(5);
+        let config = DipConfig::new(Tiny::SHAPE)
+            .with_width(4)
+            .with_depth(2)
+            .with_code(3);
+        let dip = dip64(&config, &device);
+        let tiny = Tiny::new();
+        let llk = |o: &[f64]| tiny.llk(o);
+        assert_eq!(
+            check_weight_grads(&dip, &mut CentralDifferences(llk), llk),
+            42
+        );
     }
 }
