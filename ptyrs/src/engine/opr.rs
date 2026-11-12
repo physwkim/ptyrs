@@ -100,8 +100,10 @@ impl ProbeVariation {
     /// `update_variable_probe.m`, relaxations at their default 1) on the batch `frames`, from
     /// [`accumulate_probe`] of its exit-wave update `chi` over the [`Self::unique`] views:
     /// `d` and `vv`, plane `b·nprobe` holding `d_b = conj(q·V_b)·chi_b0` and `|V_b|²` of its
-    /// `b`-th frame. With `B` frames, `N` pixels per plane and `mnorm(x) = √(mean |x|²)`, from
-    /// `r_b = d_b − mean d`, for each eigenmode `i` in order, from its weights on entry:
+    /// `b`-th frame, and `moved`, `d` taken back through the frames' probe moves of
+    /// [`crate::engine::Features::position`] (`d` itself without). With `B` frames, `N` pixels
+    /// per plane and `mnorm(x) = √(mean |x|²)`, from `r_b = m_b − mean m`, `m_b` plane `b·nprobe`
+    /// of `moved`, for each eigenmode `i` in order, from its weights on entry:
     ///
     /// `p_b = (Σ Re(conj(r_b)·U_i)/N² + w_bi) / Σ_b w_bi²`, `e = mean(r_b·p_b)`,
     /// `U′ = U_i + min(0.1, B/nframe)·√N·e/mnorm(e)`, `U_i ← U″ = √N·U′/mnorm(U′)`,
@@ -110,21 +112,28 @@ impl ProbeVariation {
     ///
     /// pty-chi's eigenmode, `U·q/√N`, has mnorm 1. A one-frame batch moves nothing, as in
     /// pty-chi, where its residues `r` vanish.
-    pub(crate) fn step(&mut self, frames: &[usize], d: &Stack<C64>, vv: &Stack<f64>, np: usize) {
+    pub(crate) fn step(
+        &mut self,
+        frames: &[usize],
+        moved: &Stack<C64>,
+        d: &Stack<C64>,
+        vv: &Stack<f64>,
+        np: usize,
+    ) {
         let (k, count) = (self.eigenmodes.len(), frames.len());
         if k == 0 || count < 2 {
             return;
         }
         let n = d.plane_len();
         let (nn, cnt) = (n as f64, count as f64);
-        let d0 = |b: usize| d.plane(b * np);
+        let (m0, d0) = (|b: usize| moved.plane(b * np), |b: usize| d.plane(b * np));
         let mut mean = vec![C64::default(); n];
         for b in 0..count {
-            mean.iter_mut().zip(d0(b)).for_each(|(m, d)| *m += d);
+            mean.iter_mut().zip(m0(b)).for_each(|(m, d)| *m += d);
         }
         mean.iter_mut().for_each(|m| *m /= cnt);
         let mut r: Vec<Vec<C64>> = (0..count)
-            .map(|b| d0(b).iter().zip(&mean).map(|(d, m)| d - m).collect())
+            .map(|b| m0(b).iter().zip(&mean).map(|(d, m)| d - m).collect())
             .collect();
         let a_u = 0.1f64.min(cnt / (self.weights.len() / k) as f64);
         for i in 0..k {
