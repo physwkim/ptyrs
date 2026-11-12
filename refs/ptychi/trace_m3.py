@@ -2,11 +2,10 @@
 summarize.py's targets: the ptyrs side of the M3 comparison.
 
     target/release/examples/llk_trace <dir> <algo> <ncycle> <nprobe> <frame> <npos> <step> --gpu
-    target/release/examples/scenario_truth <dir>
     python -I ptyrs-engine/scripts/compare_pynx.py <dir> <dm|ap> --cuda --no-cpu
     python -I refs/ptychi/trace_m3.py <dir> <algo> [--epoch-s SERIES=SECONDS ...] [--start-epoch N]
 
-Reads <dir>/llk_truth.txt (scenario_truth), llk_rust.txt (series "ptyrs") and every
+Reads <dir>/llk_truth.txt (llk_trace's truth), llk_rust.txt (series "ptyrs") and every
 llk_pynx_<algo>_<name>.txt (series "pynx_<name>"; ML's from the engine's compare_pynx_ml.py),
 each normalised by nb_obs as PyNX records it.
 A record of cycle c is the LLK of the state after FIRST + c updates plus --start-epoch, the
