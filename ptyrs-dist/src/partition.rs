@@ -6,7 +6,8 @@
 //!
 //! A frame is computed by the owner of its home tile, the tile holding its footprint centre.
 //! The halo of a region is every foreign tile within one probe width (in whole tiles) of an
-//! owned tile, which covers every footprint the region computes.
+//! owned tile, which covers every footprint that touches an owned tile: a region holds the
+//! object under its neighbours' frames that touch its tiles, not only under its own.
 
 use std::f64::consts::PI;
 
@@ -520,7 +521,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn every_footprint_is_covered_by_its_region() {
+    fn every_footprint_touching_a_region_is_covered_by_it() {
         for (name, p) in parts() {
             for (r, g) in p.regions().iter().enumerate() {
                 assert!(g.halo.iter().all(|&t| p.owner()[t as usize] as usize != r));
@@ -529,8 +530,19 @@ pub(crate) mod tests {
                     held[t as usize] = true;
                 }
                 for &f in &g.frames {
+                    assert_eq!(p.computed_by(f as usize), r);
+                }
+                let mut touching: Vec<u32> = g
+                    .own
+                    .iter()
+                    .flat_map(|&t| p.tile_frames().row(t as usize))
+                    .copied()
+                    .collect();
+                touching.sort_unstable();
+                touching.dedup();
+                assert!(g.frames.iter().all(|f| touching.binary_search(f).is_ok()));
+                for f in touching {
                     let f = f as usize;
-                    assert_eq!(p.computed_by(f), r);
                     for y in 0..p.frame()[0] {
                         for x in 0..p.frame()[1] {
                             let [cy, cx] = p.corners()[f];
