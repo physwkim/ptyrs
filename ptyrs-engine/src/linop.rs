@@ -3,7 +3,7 @@
 
 use ptyrs_core::{C64, Object, Probe, Stack, View};
 
-use crate::{EngineError, Fft2, accumulate_obj, accumulate_probe, obj_probe_to_psi};
+use crate::{EngineError, Propagator, accumulate_obj, accumulate_probe, obj_probe_to_psi};
 
 /// A linear map `A` from `domain_len()` to `range_len()` complex values with its adjoint
 /// `Aᴴ`, `⟨A x, y⟩ = ⟨x, Aᴴ y⟩` under `⟨a, b⟩ = Σ a·conj(b)`.
@@ -42,15 +42,7 @@ pub const DOT_TOL: f64 = 1e-10;
 /// Admits `op` if it passes the dot test on fixed pseudo-random `x` and `y` with independent
 /// real and imaginary parts, which catches a missing conjugate, transpose or scale.
 pub fn register<A: LinearOp>(op: A) -> Result<Registered<A>, EngineError> {
-    let x = noise(op.domain_len(), 0x5eed_0001);
-    let y = noise(op.range_len(), 0x5eed_0002);
-    let mut ax = vec![C64::default(); y.len()];
-    let mut ahy = vec![C64::default(); x.len()];
-    op.forward(&x, &mut ax);
-    op.adjoint(&y, &mut ahy);
-    let (lhs, rhs) = (dot(&ax, &y), dot(&x, &ahy));
-    let scale = (norm(&ax) * norm(&y)).max(norm(&x) * norm(&ahy));
-    let err = (lhs - rhs).norm() / scale;
+    let (lhs, rhs, err) = dot_test(&op);
     if err <= DOT_TOL {
         Ok(Registered(op))
     } else {
@@ -59,6 +51,25 @@ pub fn register<A: LinearOp>(op: A) -> Result<Registered<A>, EngineError> {
             std::any::type_name::<A>()
         )))
     }
+}
+
+/// `(⟨A x, y⟩, ⟨x, Aᴴ y⟩, relative error)` of [`register`]'s dot test.
+fn dot_test<A: LinearOp>(op: &A) -> (C64, C64, f64) {
+    let x = noise(op.domain_len(), 0x5eed_0001);
+    let y = noise(op.range_len(), 0x5eed_0002);
+    let mut ax = vec![C64::default(); y.len()];
+    let mut ahy = vec![C64::default(); x.len()];
+    op.forward(&x, &mut ax);
+    op.adjoint(&y, &mut ahy);
+    let (lhs, rhs) = (dot(&ax, &y), dot(&x, &ahy));
+    let scale = (norm(&ax) * norm(&y)).max(norm(&x) * norm(&ahy));
+    (lhs, rhs, (lhs - rhs).norm() / scale)
+}
+
+/// The relative error of [`register`]'s dot test on `op`.
+#[cfg(test)]
+pub(crate) fn dot_error<A: LinearOp>(op: &A) -> f64 {
+    dot_test(op).2
 }
 
 fn dot(a: &[C64], b: &[C64]) -> C64 {
@@ -70,7 +81,7 @@ fn norm(a: &[C64]) -> f64 {
 }
 
 /// SplitMix64 values in `[-1, 1)` for both parts.
-fn noise(n: usize, seed: u64) -> Vec<C64> {
+pub(crate) fn noise(n: usize, seed: u64) -> Vec<C64> {
     let mut s = seed;
     let mut next = || {
         s = s.wrapping_add(0x9e37_79b9_7f4a_7c15);
@@ -135,15 +146,15 @@ impl LinearOp for ProbeToPsi<'_> {
     }
 }
 
-/// [`Fft2::forward`] over `nplane` planes; adjoint [`Fft2::inverse`] (unitary).
-pub struct FarField<'a> {
-    pub fft: &'a Fft2,
+/// [`Propagator::forward`] over `nplane` planes; adjoint [`Propagator::adjoint`].
+pub struct Propagation<'a> {
+    pub propagator: &'a Propagator,
     pub nplane: usize,
 }
 
-impl LinearOp for FarField<'_> {
+impl LinearOp for Propagation<'_> {
     fn domain_len(&self) -> usize {
-        let [ny, nx] = self.fft.shape();
+        let [ny, nx] = self.propagator.shape();
         self.nplane * ny * nx
     }
     fn range_len(&self) -> usize {
@@ -151,11 +162,11 @@ impl LinearOp for FarField<'_> {
     }
     fn forward(&self, x: &[C64], y: &mut [C64]) {
         y.copy_from_slice(x);
-        self.fft.forward(y);
+        self.propagator.forward(y);
     }
     fn adjoint(&self, y: &[C64], x: &mut [C64]) {
         x.copy_from_slice(y);
-        self.fft.inverse(x);
+        self.propagator.adjoint(x);
     }
 }
 
@@ -205,15 +216,5 @@ mod tests {
             "{missing_conj}"
         );
         assert!(register(op(true, 1.0 + 1e-6)).is_err(), "scale error");
-    }
-
-    #[test]
-    fn far_field_registers() {
-        let fft = Fft2::new([8, 6]);
-        register(FarField {
-            fft: &fft,
-            nplane: 3,
-        })
-        .unwrap();
     }
 }
