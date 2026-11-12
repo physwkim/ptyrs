@@ -96,6 +96,9 @@ pub struct RecvCfg {
     pub util_min: u32,
     /// EEVDF slice of the placed threads; 0 keeps the kernel's.
     pub slice_us: u64,
+    /// SCHED_FIFO priority of the uploader (RLIMIT_RTPRIO at least this);
+    /// 0 keeps it in the fair class with the rest.
+    pub h2d_rtprio: u32,
     /// Stop once no frame arrived for this long.
     pub idle_ms: i64,
     /// Stop if no frame arrived within this long.
@@ -134,6 +137,7 @@ impl Default for RecvCfg {
             cpus: None,
             util_min: 1024,
             slice_us: 100,
+            h2d_rtprio: 10,
             idle_ms: 3000,
             connect_timeout_s: 120,
             recon: None,
@@ -265,6 +269,7 @@ impl RecvCfg {
             cpus: a.opt("cpus"),
             util_min: a.get("util-min", d.util_min),
             slice_us: a.get("slice-us", d.slice_us),
+            h2d_rtprio: a.get("h2d-rtprio", d.h2d_rtprio),
             idle_ms: a.get("idle-ms", d.idle_ms),
             connect_timeout_s: a.get("connect-timeout-s", d.connect_timeout_s),
             recon: ReconCfg::from_args(a),
@@ -575,6 +580,7 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
             util_min: cfg.util_min,
             slice_ns: cfg.slice_us * 1000,
         },
+        cfg.h2d_rtprio,
     ));
     // The calling thread only polls for completion; it shares the runtime CPUs.
     place.enter(place.rt.as_deref());
@@ -706,7 +712,7 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
         std::thread::Builder::new()
             .name("h2d".into())
             .spawn(move || {
-                place.enter(place.h2d.as_ref().map(std::slice::from_ref));
+                place.enter_h2d();
                 run_uploader(ring, ctx, store, pos, ucfg, stop, Some(btx))
             })
             .unwrap()
@@ -1216,6 +1222,7 @@ mod tests {
             cpus: Some("2-5".into()),
             util_min: 0,
             slice_us: 200,
+            h2d_rtprio: 5,
             idle_ms: 1000,
             connect_timeout_s: 5,
             recon: Some(ReconCfg {
@@ -1316,6 +1323,8 @@ mod tests {
             "0",
             "--slice-us",
             "200",
+            "--h2d-rtprio",
+            "5",
             "--idle-ms",
             "1000",
             "--connect-timeout-s",
@@ -1371,6 +1380,7 @@ mod tests {
             cpus = "2-5"
             util-min = 0
             slice-us = 200
+            h2d-rtprio = 5
             idle-ms = 1000
             connect-timeout-s = 5
 
