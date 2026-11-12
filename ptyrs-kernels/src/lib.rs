@@ -58,12 +58,9 @@ unsafe fn load_line(
     if l < nline {
         for i in 0..FFT_EPT {
             let j = thread::threadIdx_x() + i * (n / FFT_EPT);
-            let at = 2 * (l as usize * line_stride as usize + j as usize * elem_stride as usize);
+            let at = l as usize * line_stride as usize + j as usize * elem_stride as usize;
             let k = 2 * i as usize;
-            unsafe {
-                r[k] = *input.add(at);
-                r[k + 1] = *input.add(at + 1);
-            }
+            (r[k], r[k + 1]) = unsafe { pixel::load_c(input, at) };
         }
     }
     r
@@ -87,12 +84,9 @@ unsafe fn store_line(
     if l < nline {
         for i in 0..FFT_EPT {
             let j = thread::threadIdx_x() + i * (n / FFT_EPT);
-            let at = 2 * (l as usize * line_stride as usize + j as usize * elem_stride as usize);
+            let at = l as usize * line_stride as usize + j as usize * elem_stride as usize;
             let k = 2 * i as usize;
-            unsafe {
-                *output.add(at) = r[k];
-                *output.add(at + 1) = r[k + 1];
-            }
+            unsafe { pixel::store_c(output, at, (r[k], r[k + 1])) };
         }
     }
 }
@@ -767,8 +761,8 @@ pub mod kernels {
         let i = thread::index_1d().get();
         if i < n as usize {
             unsafe {
-                *x.add(2 * i) *= s;
-                *x.add(2 * i + 1) *= s;
+                let v = load_c(x, i);
+                store_c(x, i, (v.0 * s, v.1 * s));
             }
         }
     }

@@ -206,25 +206,28 @@ pub fn cmul_conj(a: (f32, f32), b: (f32, f32)) -> (f32, f32) {
     (a.0 * b.0 + a.1 * b.1, a.0 * b.1 - a.1 * b.0)
 }
 
+/// One interleaved complex value, so that it moves as one 8-byte access, not two.
+#[repr(C, align(8))]
+#[derive(Clone, Copy)]
+struct F2(f32, f32);
+
 /// Complex value `i` of an interleaved buffer.
 ///
 /// # Safety
 ///
-/// `p` must hold `i + 1` complex values.
+/// `p` must hold `i + 1` complex values and be 8-byte aligned.
 #[device]
 pub unsafe fn load_c(p: *const f32, i: usize) -> (f32, f32) {
-    unsafe { (*p.add(2 * i), *p.add(2 * i + 1)) }
+    let v = unsafe { *p.cast::<F2>().add(i) };
+    (v.0, v.1)
 }
 
 /// # Safety
 ///
-/// `p` must hold `i + 1` complex values.
+/// `p` must hold `i + 1` complex values and be 8-byte aligned.
 #[device]
 pub unsafe fn store_c(p: *mut f32, i: usize, v: (f32, f32)) {
-    unsafe {
-        *p.add(2 * i) = v.0;
-        *p.add(2 * i + 1) = v.1;
-    }
+    unsafe { *p.cast::<F2>().add(i) = F2(v.0, v.1) };
 }
 
 /// Bilinear weights of the four object pixels a sample reads, in the order
