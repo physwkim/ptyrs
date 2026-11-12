@@ -4,9 +4,11 @@
 //! `cargo run --release -p ptyrs-engine --example llk_trace -- <out_dir> <dm|ap|ml|rpie> [ncycle] [nprobe] [frame] [npos] [step] [--gpu]`
 //! (defaults 50, 1, 64, 100, 4 object pixels) writes `scan.cxi`, `init.h5` (the scaled
 //! starting object and probe), `llk_rust.txt` (cycle and the normalised Poisson, Gaussian,
-//! Euclidian LLK and photon count per cycle) and `final_rust.h5`, from the CPU oracle or, with
-//! `--gpu`, from [`GpuPtycho`] on CUDA device 0 with the default stacks, by the fused passes
-//! on 128- or 256-pixel frames and by M1's launches on others (ML always by M1's). ML
+//! Euclidian LLK and photon count per cycle), `llk_truth.txt` (the same four for the truth the
+//! counts were drawn from, [`ptyrs_engine::sim::Simulation::truth_llk`]) and `final_rust.h5`,
+//! from the CPU oracle or, with `--gpu`, from [`GpuPtycho`] on CUDA device 0 with the default
+//! stacks, by the fused passes on 128- or 256-pixel frames and by M1's launches on others (ML
+//! always by M1's). ML
 //! updates object and probe from the end of `ML_WARMUP` AP cycles, which `init.h5` holds.
 //! rPIE also writes
 //! `views.txt` (object window corner `oy ox` per frame), `quad.txt` (`re im` of the quadratic
@@ -18,14 +20,14 @@ use std::path::PathBuf;
 
 use cuda_core::CudaContext;
 use ptyrs_engine::{
-    ApParams, DmParams, EngineError, GpuOptions, GpuPtycho, MlParams, Ptycho, RpieParams,
+    ApParams, DmParams, EngineError, GpuOptions, GpuPtycho, Llk, MlParams, Ptycho, RpieParams,
     quad_phase,
 };
 
-#[path = "../tests/common/mod.rs"]
-mod common;
 #[path = "../tests/ptychi/mod.rs"]
 mod ptychi;
+#[path = "../tests/common/scenario.rs"]
+mod scenario;
 
 /// AP updates the probe too, so both halves of `psi_to_obj_probe` are compared.
 const AP: ApParams = ApParams {
@@ -66,10 +68,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let step = args.next().map_or(Ok(4.0), |s| s.parse::<f64>())?;
     std::fs::create_dir_all(&out)?;
 
-    let (scan, object, probe) = common::dm_scenario(frame, npos, nprobe, 2e5, step);
+    let (scan, object, probe, truth) = scenario::dm_scenario_truth(frame, npos, nprobe, 2e5, step);
     let cxi = out.join("scan.cxi");
     ptyrs_io::write_cxi(&cxi, &scan)?;
     let scan = ptyrs_io::read_cxi(&cxi)?;
+    std::fs::write(out.join("llk_truth.txt"), llk_line(&truth))?;
     let mut p = Ptycho::new(&scan, object, probe)?;
     p.scale_obj_probe();
     if algo == "ml" {
@@ -110,7 +113,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let ctx = CudaContext::new(0).map_err(EngineError::from)?;
         let (object, probe) = p.into_modes();
         let options = GpuOptions {
-            fused: matches!(frame, 128 | 256),
+            fused: algo != "ml" && matches!(frame, 128 | 256),
             ..GpuOptions::default()
         };
         eprintln!("GPU passes: {}", if options.fused { "fused" } else { "m1" });
@@ -142,14 +145,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut s = String::new();
     for r in &history {
-        let l = r.llk;
-        writeln!(
-            s,
-            "{} {:.17e} {:.17e} {:.17e} {:.17e}",
-            r.cycle, l.poisson, l.gaussian, l.euclidian, l.nb_photons_calc
-        )?;
+        write!(s, "{} {}", r.cycle, llk_line(&r.llk))?;
     }
     std::fs::write(out.join("llk_rust.txt"), s)?;
     ptyrs_io::write_modes(out.join("final_rust.h5"), &object, &probe)?;
     Ok(())
+}
+
+/// The normalised Poisson, Gaussian, Euclidian LLK and photon count, one line.
+fn llk_line(l: &Llk) -> String {
+    format!(
+        "{:.17e} {:.17e} {:.17e} {:.17e}\n",
+        l.poisson, l.gaussian, l.euclidian, l.nb_photons_calc
+    )
 }

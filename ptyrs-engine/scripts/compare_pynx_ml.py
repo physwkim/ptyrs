@@ -1,6 +1,6 @@
 """PyNX CUDA ML on the scan and starting point written by `cargo run --example llk_trace -- <dir> ml`.
 
-Usage: python -I compare_pynx_ml.py <dir> [--fix-gamma] [--noise]
+Usage: python -I compare_pynx_ml.py <dir> [--fix-gamma] [--noise] [--time N]
 
 Reads <dir>/scan.cxi, init.h5 (the end of llk_trace's AP warm-up), llk_rust.txt and
 final_rust.h5. Runs ML(update_object=True, update_probe=True, calc_llk=1) of the PyNX CUDA
@@ -13,8 +13,10 @@ it calls. --fix-gamma corrects the cross term `PdO.real() * dPO.imag()` of PyNX'
 CG_Poisson_Gamma to `PdO.imag() * dPO.imag()` (as in its CG_Poisson_Gamma4) before the
 kernels compile; it matters only when object and probe are both updated. --noise also prints
 PyNX nohann against itself, rerun and with the starting object nudged by 1e-7, which bounds
-how closely any other implementation can track it cycle by cycle. PyNX's CPU ML is no
-reference: its first direction is +grad and the later ones beta*dir - grad.
+how closely any other implementation can track it cycle by cycle. --time N then times N
+cycles of stock ML without LLK or phase-ramp removal, after 5 untimed ones, as
+`cargo run --example gpu_time -- ml` times ptyrs. PyNX's CPU ML is no reference: its first
+direction is +grad and the later ones beta*dir - grad.
 """
 import sys
 
@@ -106,7 +108,8 @@ def print_poisson(ref, h, ncycle):
 
 
 def main():
-    d, opts = sys.argv[1], set(sys.argv[2:])
+    d, flags = sys.argv[1], sys.argv[2:]
+    opts = set(flags)
     tag = ""
     if "--fix-gamma" in opts:
         fix_gamma()
@@ -146,6 +149,22 @@ def main():
             print(f"--- nohann{tag} against itself, {name}: max poisson rel {r.max():.2e}"
                   f" (cycle {r.argmax()})")
             print_poisson(ref[:, 0], h, ncycle)
+    if "--time" in opts:
+        import time
+        ntime = int(flags[flags.index("--time") + 1])
+        set_hann(True)
+
+        def ml():
+            return cuop.ML(update_object=True, update_probe=True, calc_llk=0,
+                           zero_phase_ramp=False)
+
+        p = ml() ** 5 * build(*args)
+        cuop.default_processing_unit.finish()
+        t = time.perf_counter()
+        p = ml() ** ntime * p
+        cuop.default_processing_unit.finish()
+        dt = (time.perf_counter() - t) / ntime
+        print(f"--- PyNX CUDA ML: {1e3 * dt:.3f} ms/cycle over {ntime} cycles")
 
 
 if __name__ == "__main__":
