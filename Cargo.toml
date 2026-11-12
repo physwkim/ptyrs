@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["ptyrs-core", "ptyrs-engine", "ptyrs-fft", "ptyrs-gpu", "ptyrs-io", "ptyrs-kernels", "ptyrs-live", "ptyrs-py", "ptyrs-refgen", "ptyrs-tile"]
+members = ["ptyrs", "ptyrs-kernels", "ptyrs-py"]
 
 [workspace.package]
 version = "0.0.1"
@@ -15,13 +15,11 @@ cuda-async = { path = "/home/stevek/work/cuda-rust/cuda-async" }
 cuda-device = { path = "/home/stevek/work/cuda-rust/cuda-oxide/crates/cuda-device" }
 cuda-host = { path = "/home/stevek/work/cuda-rust/cuda-oxide/crates/cuda-host" }
 
-# Host-side numerics and I/O shared by ptyrs-core, ptyrs-io and ptyrs-engine.
+# Host-side numerics and I/O of ptyrs.
 num-complex = "0.4"
 thiserror = "2"
 rand = "0.8"
 rand_chacha = "0.3"
 rand_distr = "0.4"
 rustfft = "6"
-rust-hdf5 = "0.7.10"
-ptyrs-core = { path = "ptyrs-core" }
-ptyrs-io = { path = "ptyrs-io" }
+rust-hdf5 = "0.7.13"

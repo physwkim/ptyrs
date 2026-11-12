@@ -24,7 +24,7 @@
 
 근거는 두 갈래로 세웠고, M0에서 호스트 쪽을 접어 GPU 쪽 하나가 남았습니다.
 
-- **GPU 쪽(구조).** 어림 계산 가정: 대역폭 576 GB/s의 70% 사용, 256² 크롭, 프로브 모드 2개, 메모리 왕복 1회 = Ψ 한 번 읽고 쓰기. 왕복 10회 구조는 GPU 1장이 초당 약 1.9만 프레임-반복, 3회 구조(B1)는 약 6.4만입니다. Eiger 3 kHz 스트림에서 스캔 동안 쓸 수 있는 계산량을 프레임 수로 나누면 1장 약 6 대 21회, 4장(B4) 약 26 대 85회입니다. 1차 방법은 수백 반복이 필요한데, BH가 논문 주장대로 반복 수를 약 10배 줄이면(B7) 85회 범위에서 수렴할 수 있습니다.
+- **GPU 쪽(구조).** 어림 계산 가정: 대역폭 576 GB/s의 70% 사용, 256² 크롭, 프로브 모드 2개, 메모리 왕복 1회 = Ψ 한 번 읽고 쓰기. 왕복 10회 구조는 GPU 1장이 초당 약 1.9만 프레임-반복, 3회 구조(B1)는 약 6.4만입니다. Eiger 3 kHz 스트림에서 스캔 동안 쓸 수 있는 계산량을 프레임 수로 나누면 1장 약 6 대 21회, 4장(B4) 약 26 대 85회입니다. 1차 방법은 수백 반복이 필요합니다. M3 기준 측정(pty-chi, 참값 LLK의 1% 이내)에서 미니배치 BH(배치 96)는 20 에포크, LSQML(Gaussian, 배치 32)은 36 에포크로 둘 다 85회 안에 들고, BH는 1장의 21회 안에도 듭니다. BH의 반복 수 이득은 LSQML 대비 1.8배입니다. 논문의 약 10배는 근거리 데이터에서 같은 계산 시간으로 비교한 값입니다(B7).
 - **호스트 쪽(언어) — M0에서 접음.** GPU가 계산하는 동안 수신·해제·위치 매칭·크롭·전송이 333 µs 주기로 멈추지 않고 돌아야 합니다. Rust가 유리할 것으로 봤으나, 같은 기계에서 만든 다중 프로세스 + 공유 메모리 Python 기준선도 3 kHz에서 손실이 없었고 손실 없는 최대 속도와 CPU 사용량이 비슷했습니다(§1 호스트 입력 경로). 입력 경로는 B6을 위해 Rust로 만들지만, ptyrs를 만드는 이유로 내세우지 않습니다.
 
 **하드웨어로 바꿔 말하면, 목표는 검출기 옆 워크스테이션(RTX 5000 Ada 4장)이 데이터센터 GPU 1장 위의 Python 패키지보다 빠른 것입니다.** 위와 같은 어림 계산(256², 모드 2개, 대역폭 70%, 대역폭은 사양값)입니다.
@@ -67,6 +67,7 @@
 | 런타임 | 스트림·이벤트·pinned memory·async 복사·메모리 풀·CUDA graph(`cuda-async/src/cuda_graph.rs`: capture/update/replay)·VMM(`cuda-core/src/vmm.rs`: 예약+물리할당+매핑)·peer access | 그래프 실행, 성장형 버퍼, P2P 경계 교환에 그대로 사용 |
 | 멀티 GPU | `cuda-async` 멀티 디바이스는 미완성 표시(`device_context.rs:140`). NCCL 바인딩·설치 없음 | 디바이스별 스레드 + P2P 직접 접근으로 자체 구현 |
 | 호스트 입력 경로 (M0 측정) | ptyrs-live 시제품: epics-pva-rs 시뮬레이터 → 수신 → 해제 → 위치 매칭 → 256² 크롭 → pinned 링 → GPU, 별도 프로세스 두 개. 1028×1062 u16 합성 프레임을 3 kHz로 30,000장 보내 손실 0(lz4 7회, bslz4 6회). 수신→GPU p99 약 4.7 ms. 수신 쪽 CPU 코어는 lz4 약 7, bslz4 약 5(크롭 행만 해제), bslz4 전체 해제 약 12. 손실 없는 최대 속도(3회 모두 손실 0)는 lz4 3.75 kHz, bslz4 6 kHz. 해제·크롭·위치 매칭은 C liblz4·bitshuffle과 비트 단위로 교차 확인. **Python 기준선**(p4p, 같은 CPU 배치, GPU 전송 없음): 스레드 풀 한 프로세스는 lz4 3 kHz에서 손실(`lz4.block.decompress`가 호출마다 GIL을 약 290 µs 잡음), 최대 1.5 kHz. 다중 프로세스 + 공유 메모리는 3 kHz 두 코덱 모두 손실 0, 약 5.7코어, 최대 lz4 3.75 kHz·bslz4 5 kHz. C 해제기가 Rust 것보다 빠름(lz4 1.26 대 1.89 ms, bslz4 전체 1.32 대 3.81 ms) | 3 kHz는 통과. 다중 프로세스 Python과의 차이가 작아 호스트 쪽 근거를 접음(§0 접는 조건 1, §8). lz4는 두 구현 모두 약 4 kHz(약 1.7 GB/s)에서 수신이 막힘 |
+| 단일 GPU 기준선 (M1 측정) | 시뮬레이션 256² 프레임, 위치 400, 프로브 모드 2. f64에서 ptyrs CPU 기준 구현과 PyNX의 DM LLK가 50사이클까지 1e-13, 99사이클에서 1.5e-8 이내 일치. f32 GPU는 f64에서 LLK 4.5e-3 벌어지는데, PyNX f32 CPU 대 f64(5.8e-3), PyNX CUDA 실행 간 차이(4.5e-3)와 같은 크기. GPU2, 스택 16, 사이클당: DM 8.3 ms 대 PyNX CUDA 22.1–23.0 ms, AP 6.0 대 16.2–16.6 ms(약 2.7배). rPIE(배치 16) 10.6 ms이나 작은 커널 약 15개를 잇달아 띄워 CPU 부하에 따라 실행마다 최대 2배 흔들림. 스택 64는 32보다 느림(원인 미측정) | M1 기준(PyNX DM과 LLK 곡선 일치) 충족. f32 차이는 단정밀도 반올림 혼돈. M2 비교 기준은 DM 8.3·AP 6.0 ms. rPIE 흔들림은 graph 실행(B2)으로 없앨 대상 |
 | 툴체인 | cuda-oxide는 Rust 1.99.1(+rustc-dev, llvm-tools)과 nvptx 지원 llc 필요. Rust 동봉 llc(LLVM 23.1.1)로 sm_89 빌드·실행 확인(M0). cutile-rs는 stable 1.89+. SIMT 커널은 별도 device crate를 `cargo oxide`가 PTX로 만들고 호스트가 실행 중에 읽음(예제 `Cargo.toml`의 `package.metadata.cuda-oxide.device-crates`) | 작업 공간 전체를 1.99.1 하나로 빌드(`rust-toolchain.toml`). `cargo oxide`는 의존성이 가리키는 cuda-rust 체크아웃의 것을 실행(`.cargo/config.toml` 별칭) |
 | Rust 딥러닝 프레임워크 (2026-11 웹 검색) | burn은 학습·추론·자동 미분·CUDA를 지원하지만 복소수 완전 지원은 추적 이슈(#5366), FFT는 2의 거듭제곱 길이만(#4865). candle은 추론 위주. numr은 복소수·FFT·자동 미분을 표방하나 신생이고 자체 GPU 런타임을 가짐 | 물리 계산은 cuda-rust로만. burn은 신경망 부분(ptyrs-nn)에만. numr은 cuda-rust와 역할이 겹쳐 쓰지 않음. PyTorch는 쓰지 않음 |
 
@@ -76,12 +77,12 @@
 
 | | 가져올 장점 (근거) | 구조적 한계 (근거) |
 |---|---|---|
-| **pty-chi** (Argonne, PyTorch, 약 2만 줄) | LSQML 해석적 스텝(위치별 2×2 해, `lsqml.py:~720`); BH 정확 line search(`bh.py:406-589`); 위치 보정(gradient/상관, affine 제약); OPR; 다층(slice 간격까지 최적화); compact(k-means) 배치 | 커스텀 GPU 코드는 Triton scatter 2개뿐이고 매 실행 후 `synchronize`(`triton/patches.py:71`); 배치마다 loss를 호스트로 읽음(`base.py:129`); 융합·graph 없음; 멀티 GPU는 매 배치 물체 전체 all-reduce(`lsqml.py:1697-1710`); 결정적 scatter는 픽셀당 O(N) |
+| **pty-chi** (Argonne, PyTorch, 약 2만 줄) | LSQML 해석적 스텝(위치별 2×2 해, `lsqml.py:~720`); BH 정확 line search(`bh.py:406-589`); 위치 보정(gradient/상관, affine 제약); OPR; 다층(slice 간격 최적화는 AD 재구성기에서만, `api/options/base.py:421-427`); compact(k-means) 배치 | 커스텀 GPU 코드는 Triton scatter 2개뿐이고 매 실행 후 `synchronize`(`triton/patches.py:71`); 배치마다 loss를 호스트로 읽음(`base.py:129`); 융합·graph 없음; 멀티 GPU는 매 배치 물체 전체 all-reduce(`lsqml.py:1697-1710`); 결정적 scatter는 픽셀당 O(N) |
 | **PtyPy** (Diamond) | 주소표 `addr[frame, mode, {pr,ob,ex,di,ma}, (layer,y,x)]`로 커널과 데이터 모델 분리(`projectional_serial.py:51-96`); 3-스트림 페이징(`projectional_cupy_stream.py`); cuFFT 콜백으로 전·후 필터 융합 → 388 → 223 ms(128²×2000, `optimisation_log.md`); 라이브 스캔(`min_frames_for_recon`) | 융합 시도가 경쟁 조건과 속도 저하로 실패(`fourier_update.cu:120`); MPI allreduce가 최대 병목이라고 로그에 명시; 새 데이터가 오면 물체·프로브 전체 재업로드(`engine_prepare`); GPU ML은 Gaussian만 |
 | **PyNX** (ESRF) | 화소 단위 융합(모드합+배경+마스크+FFT 스케일을 한 패스, `projection_amplitude_elw.cu`); ML-CG의 β·γ를 GPU에 두어 호스트 동기 없음(`cu_operator.py:3225-3330`); 연산자 대수 `DM**100*ML**40`; 음수 iobs 마스크 규약; CXI I/O | 전체 데이터 GPU 상주 필수, DM/RAAR는 Ψ 전체 보관 → VRAM 초과 시 실패; FFT는 별도 패스; 스트림 1개; 멀티 GPU는 MPI 호스트 경유 Send/Recv; atomic 때문에 결과 비결정적; float32 고정 |
 | **PtyRAD** (Cornell, 논문) | PyTorch AD로 기존 대비 최대 24배, 다층 깊이 정규화 | 저자들이 JIT 프레임워크로 더 빨라질 여지를 언급 |
 | **phaser** (논문) | 선언형 설정, JAX로 fold_slice 대비 반복 속도 6배 | 8/16비트 정밀도는 향후 과제로 남김 |
-| **BH** (Carlsson·Nikitin·Wendt 2025) | 2차 정보(bilinear Hessian)로 1차 방법·LSQML 대비 반복 수 약 10배 감소 주장 | pty-chi 구현은 OPR 미지원 |
+| **BH** (Carlsson·Nikitin·Wendt 2025) | 2차 정보(bilinear Hessian)로 1차 방법·LSQML 대비 계산 시간 약 10배 감소 주장(근거리 데이터만 시험) | pty-chi 구현은 OPR 미지원 |
 | **PtyGer** (APS, arXiv 2021) | 대규모 X선 데이터를 GPU별 물체 조각 + halo로 분할, GPU별 호스트 스레드(CuPy). 1장 결과와 수렴 곡선 일치를 보임 | CG 방향 계산에 기울기를 마스터 GPU로 모았다 다시 나눔; 시험 환경은 P2P가 꺼져 호스트 경유; 비트 단위 결정성은 주장하지 않음 |
 | **측정 중 재구성** — APS(pvaPy로 PVA 스트림 수신 → PtychoNN, 2 kHz, Babu 2023), PETRA III PtyNAMi(측정 중 ePIE, Weber 외), NSLS-II HXN(CuPy 반복 재구성, A100 1장, SciPy 2025), Diamond I13-1(DECTRIS 연동, 2025), SC25 XLOOP | PVA로 프레임·위치를 따로 받아 트리거 카운트로 짝짓고 결과를 PV로 게시하는 구조는 APS에서 이미 동작 | APS의 2 kHz 실시간은 신경망 추정이지 반복 재구성이 아님. 나머지는 Python 위 반복 재구성이고, 검출기 속도를 따라가는지 공개 수치는 확인 못 함 |
 
@@ -138,7 +139,8 @@ X선에서 GPU 4장을 쓰는 경우는 셋이고, 분할 방식이 다릅니다
 
 공간 분할:
 - pty-chi는 매 배치, PtyPy는 매 반복 물체 전체를 all-reduce하고, PtyPy 로그는 이것을 최대 병목으로 지목했습니다. NVLink 없는 PCIe 4장에서는 더 나쁩니다.
-- ptyrs: 스캔 영역을 GPU 수만큼 공간 분할하고, 각 GPU는 자기 영역 + 경계(halo, 프로브 폭)만 가집니다. 경계는 P2P로 이웃 GPU 메모리를 직접 읽어 합칩니다(모든 쌍 P2P OK 확인). 통신량이 물체 면적이 아니라 경계 길이에 비례합니다. CG/BH 방향은 화소별 계산이라 GPU마다 자기 영역에서 구하고, 전역으로 모으는 것은 내적 스칼라뿐입니다.
+- ptyrs: 스캔 영역을 GPU 수만큼 공간 분할하고, 각 GPU는 자기 영역 + 경계(halo, 소유 타일 바깥으로 프로브 폭 1배, 자기 프레임이 읽는 폭의 2배)만 가집니다. 경계에 걸친 이웃 프레임의 출사파는 복사하지 않고 각 GPU가 직접 다시 계산합니다(4장에서 계산 약 11.5% 증가). M4 측정에서 1장 대비 2장 1.86배(GPU2+GPU3 단독, 35.4→19.0 ms/사이클), 4장 3.53배(GPU 공유, x8 링크 포함, 단독 측정 전)였고 결과는 1·2·4장에서 비트 단위로 같습니다. 물체 경계는 소유 GPU가 묶어 두고 받는 쪽 copy engine이 P2P로 끌어옵니다(모든 쌍 P2P OK 확인). 통신량이 물체 면적이 아니라 경계 길이에 비례합니다.
+  - M4 측정: 커널이 이웃 메모리를 직접 읽는 방식은 4장이 동시에 주고받으면 전송당 0.2–0.9 GB/s로 떨어져 4장이 1장보다 3배 느렸습니다(221 vs 74 ms/사이클). copy engine은 2.1–3.8 GB/s를 유지했습니다. 그래서 출사파 복사(약 120 MB/사이클)를 재계산으로 바꾸고 물체 경계(약 24 MB)만 copy engine으로 옮깁니다. cuFFT는 고정 크기 배치 안 위치와 무관하게 같은 비트를 내므로 비트 일치(B3)는 유지됩니다. CG/BH 방향은 화소별 계산이라 GPU마다 자기 영역에서 구하고, 전역으로 모으는 것은 내적 스칼라뿐입니다.
 - 라이브 분할 방향: 새 프레임이 모든 GPU에 고르게 들어가야 합니다. 래스터 스캔은 빠른 축(x)을 4구간으로 나눈 세로 띠로 나눠 매 행이 네 영역을 모두 지나게 하고, 나선(Fermat) 스캔은 중심 기준 부채꼴로 나눕니다. 느린 축으로 나누면 측정 초반에는 GPU 한 장만 새 프레임을 받습니다.
 - NUMA: 띠 분할은 경계 3개 중 가운데(GPU1–2)가 소켓을 건넙니다. 대면적 2D는 2×2 격자로 나누고 NUMA 쌍(0–1, 2–3)이 긴 경계를 공유하게 합니다.
 - 프로브는 작으므로 GPU별 부분합만 P2P로 모읍니다.
@@ -155,7 +157,7 @@ X선에서 GPU 4장을 쓰는 경우는 셋이고, 분할 방식이 다릅니다
 
 - 입력: EPICS PVA(NTNDArray 프레임 + 위치 PV, 자체 epics-pva-rs 사용), ZMQ(Eiger 스트림), HDF5 SWMR. 모두 "새 프레임 묶음" 이벤트로 통일합니다.
 - 입력 경로: 프레임은 압축된 채로 받고(areaDetector NDCodec, Eiger 스트림의 bslz4·lz4), Rust 작업 스레드들이 해제 → 위치 매칭(트리거 카운트, APS 방식) → 크롭 → u16 변환을 해 pinned 링버퍼에 바로 씁니다. 프레임 수에 비례해 도는 Python 코드가 없습니다.
-- 물체 버퍼는 VMM으로 큰 가상 주소를 먼저 예약하고, 스캔이 새 영역에 닿을 때 물리 메모리만 추가 매핑합니다. PtyPy는 새 데이터마다 물체·프로브를 통째로 재업로드하는데, ptyrs는 기존 메모리를 건드리지 않습니다.
+- 물체 버퍼는 VMM으로 큰 가상 주소를 먼저 예약하고, 스캔 계획 범위의 물리 메모리는 첫 프레임 전에 매핑합니다(M5 측정: 3.9 GB 물체에 약 0.5초). 스캔이 계획 밖의 새 영역에 닿을 때만 매핑 스레드가 물리 메모리를 추가 매핑합니다. 스캔 중 매핑은 드라이버 잠금으로 재구성 스레드를 멈추게 할 수 있기 때문입니다(M5 측정: 1e6 프레임 스캔에서 최대 230 ms). PtyPy는 새 데이터마다 물체·프로브를 통째로 재업로드하는데, ptyrs는 기존 메모리를 건드리지 않습니다.
 - 새 프레임은 주소표와 공간 bin에 추가만 되고, graph는 다시 캡처하지 않습니다(B2).
 - 스캔이 새로 닿은 물체 영역의 초기값은 평평한 값이 기본이고, 선택 기능으로 ptyrs-nn의 신경망 예측(PtychoNN 방식)으로 채웁니다. 예측은 출발점일 뿐이고 최종 값은 반복 재구성이 정합니다.
 - 출력: 재구성 물체(위상/진폭 미리보기)·프로브·LLK를 PVA PV(NTNDArray)로 게시 → Phoebus, ImageJ EPICS NTNDArray 뷰어, Ptychodus(pvaPy), Bluesky, 피드백 루프가 그대로 구독합니다.
@@ -164,7 +166,10 @@ X선에서 GPU 4장을 쓰는 경우는 셋이고, 분할 방식이 다릅니다
 ### B7. 2차 최적화를 기본값으로 + 타입 안전 알고리즘 계획
 
 - 엔진: rPIE/ePIE, DM, RAAR, ML-CG(Poisson/Gaussian, PyNX식 해석적 γ), LSQML(pty-chi 기준), BH-CG(pty-chi `bh.py` 기준, OPR 확장은 ptyrs가 추가할 여지).
-- BH-CG는 Hessian-벡터 곱이 같은 순·역 연산자 조합이라 B1 커널을 그대로 재사용합니다. 반복 수 감소(논문 주장 약 10배)와 반복당 비용 감소(B1·B2)가 곱해지는 지점이 ptyrs의 대표 수치가 될 후보입니다.
+- BH-CG는 Hessian-벡터 곱이 같은 순·역 연산자 조합이라 B1 커널을 그대로 재사용합니다. 반복 수 감소와 반복당 비용 감소(B1·B2)가 곱해지는 지점이 ptyrs의 대표 수치가 될 후보입니다.
+  - M3 측정(pty-chi, fermat_clean, 참값 LLK의 1% 이내까지 에포크 수): 미니배치 BH(배치 96) 20, 전체 배치 BH-CG 47, LSQML Gaussian(배치 32) 36, LSQML Poisson(배치 64) 164. 원거리 데이터의 반복 수로는 논문의 약 10배(근거리 데이터, 계산 시간)에 해당하는 이득이 나오지 않았고, 기준 BH 설정은 미니배치 96(LSQML 대비 1.8배)입니다. pty-chi의 BH는 Gaussian 모델이라 반복 수 비교 기준은 같은 모델의 LSQML입니다.
+  - 근거리 측정(`refs/ptychi/run_near.py`, pty-chi f32 GPU2, 같은 1% 기준): 논문의 근거리 데이터가 로컬에 없어 angular spectrum 전파 사례(24² 프레임 16장, 프로브 모드 2)로 쟀고, 30개 설정 모두 ptyrs CPU f64와 에포크 수가 같습니다. 방법마다 가장 좋은 배치끼리 비교하면 LSQML 대비 전체 배치 BH-CG는 시간 2.08배·에포크 1.13배, 미니배치 BH는 시간 1.26배·에포크 1.42배 적어, 근거리에서도 약 10배는 나오지 않았습니다. BH 프로브 rho는 모든 배치에서 10이 가장 좋습니다(pty-chi 권장값 1은 전체 배치에서만 78 에포크에 도달). 이 크기에서 벽시계 시간은 계산이 아니라 배치당 고정 비용이라, 에포크당 배치가 적은 쪽이 유리합니다.
+  - 미니배치 BH는 CG를 쓰지 않고 배치 기울기 방향의 최급강하에 Hessian 걸음 크기를 씁니다. pty-chi의 미니배치 BH-CG는 이전 배치에서 캐시한 프레임별 조각으로 방향을 만들어, 걸음 크기를 계산한 방향과 실제 이동 방향이 다릅니다(한 걸음에 배치 손실 4.10e5 → 5.45e5). 배치 96에서 최급강하와 CG는 둘 다 20 에포크이고 최급강하가 약 2배 빠릅니다. CG는 전체 배치에서만 씁니다.
 - 계획 언어: PyNX의 `ML**40 * DM**100`을 문자열 `eval` 대신 타입이 있는 문법으로(`plan = "dm:100 -> ml:40"` 또는 TOML 배열), 엔진별 옵션은 스키마 검증.
 - 확장 규칙: 모든 순방향 연산자는 adjoint와 쌍으로 정의하고, 내적 테스트(⟨Ax, y⟩ = ⟨x, Aᴴy⟩)를 통과해야 등록됩니다. 자동미분이 없는 대신 이 불변식으로 기울기 정확성을 보장합니다. 새 연산자는 이것만 쓰면 연산자별 커널 경로로 바로 동작하고, 빨라야 할 때 융합 커널을 추가합니다. PyTorch식 자동 미분을 엔진에 쓰지 않는 이유는 복소수·FFT 지원 부족(§1)과 FFT 융합·graph 실행(B1, B2)을 잃기 때문입니다.
 
@@ -182,20 +187,28 @@ X선에서 GPU 4장을 쓰는 경우는 셋이고, 분할 방식이 다릅니다
 ## 4. 구조
 
 ```
-ptyrs/
-├── ptyrs-core      데이터 모델: Scan, Positions, Probe(모드, OPR), Object(층), Geometry,
-│                   주소표(PtyPy addr 개념), 공간 bin, DisjointBatch
-├── ptyrs-fft       cuFFT 바인딩(직접 쓴 FFI) + cuFFT 장치 API 조회·LTOIR 생성
+ptyrs/                  작업공간: 패키지 3개
+├── ptyrs           호스트 크레이트 하나(lib + 바이너리). 옛 크레이트마다 모듈 하나(ptyrs::engine 등),
+│   │               tests/·examples/는 `<모듈>_<파일>.rs`로 평탄(cargo 자동 탐색), 공용 도우미는 common/,
+│   │               데이터와 scripts/는 모듈별 하위 디렉터리. build.rs가 cuFFT 링크와 커널 빌드
+│   ├── src/base    데이터 모델: Scan, Positions, Probe(모드, OPR), Object(층), Geometry,
+│   │               주소표(PtyPy addr 개념), 공간 bin, DisjointBatch. `core`는 내장 크레이트를 가려서 base
+│   ├── src/fft     cuFFT 바인딩(직접 쓴 FFI) + cuFFT 장치 API 조회·LTOIR 생성
+│   ├── src/gpu     ptyrs-kernels를 cubin 하나로 빌드(cuFFT 장치 코드와 링크)·로드, 커널 호출 래퍼
+│   ├── src/tile    cutile-rs 커널(실행 중 JIT, CUDA 13.2+): 타일 소유 누적, 물체·프로브 갱신, 리덕션
+│   ├── src/engine  엔진(rPIE, DM, RAAR, ML-CG, LSQML, BH-CG), 계획 언어, 그래프 캡처
+│   ├── src/dist    공간 분할(라이브 띠·부채꼴, 대면적 격자), halo P2P 교환, 각도 병렬, 디바이스별 워커 스레드
+│   ├── src/io      CXI/HDF5 입출력(PyNX CXI 배치와 호환), PtyPy .ptyr 읽기
+│   ├── src/live    PVA / ZMQ / SWMR 입력(해제·위치 매칭·크롭 작업 스레드 → pinned 링버퍼), VMM 성장형 물체, PV 출력.
+│   │               바이너리 pty-recv, pty-sim은 src/bin
+│   ├── src/nn      (선택, feature `nn`일 때만 burn 빌드) burn 신경망: 라이브 초기값 예측, DIP·PINN.
+│   │               본체와는 배열·기울기 전달로만 연결
+│   ├── src/refgen  M3 참조 데이터셋 시뮬레이션(위치 오차, 세기 변화, 배경, 플라이 스캔, OPR)
+│   └── src/main.rs 단일 바이너리 ptyrs(옛 ptyrs-cli), TOML 설정
 ├── ptyrs-kernels   cuda-oxide SIMT device crate(`cargo oxide`로 PTX 생성): A/B/C 패스, 공간 bin 색인,
 │                   위치 기울기. Tile 전환 전에는 아래 Tile 후보 커널의 SIMT 판도 여기
-├── ptyrs-tile      cutile-rs 커널(실행 중 JIT, CUDA 13.2+): 타일 소유 누적, 물체·프로브 갱신, 리덕션
-├── ptyrs-engine    엔진(rPIE, DM, RAAR, ML-CG, LSQML, BH-CG), 계획 언어, 그래프 캡처
-├── ptyrs-dist      공간 분할(라이브 띠·부채꼴, 대면적 격자), halo P2P 교환, 각도 병렬, 디바이스별 워커 스레드
-├── ptyrs-io        CXI/HDF5 입출력(PyNX CXI 배치와 호환), PtyPy .ptyr 읽기
-├── ptyrs-live      PVA / ZMQ / SWMR 입력(해제·위치 매칭·크롭 작업 스레드 → pinned 링버퍼), VMM 성장형 물체, PV 출력
-├── ptyrs-nn        (선택) burn 신경망: 라이브 초기값 예측, DIP·PINN. 본체와는 배열·기울기 전달로만 연결
-├── ptyrs-py        PyO3 바인딩(numpy 입출력) — 검증 전용(pty-chi·PyNX·PtyPy와 결과 비교). 재구성 실행 경로에는 쓰지 않음
-└── ptyrs-cli       단일 바이너리, TOML 설정
+└── ptyrs-py        PyO3 바인딩(numpy 입출력, ptyrs에 의존하는 cdylib) — 검증 전용(pty-chi·PyNX·PtyPy와 결과 비교).
+                    재구성 실행 경로에는 쓰지 않음
 ```
 
 데이터 흐름(한 GPU):
@@ -217,12 +230,14 @@ ptyrs/
 |---|---|---|
 | A/B/C 패스 | SIMT | 커널 안 FFT(cuFFT 장치 API)와 shared memory 직접 제어가 필요. Tile에는 FFT, complex, shared memory 제어가 없음 |
 | 공간 bin 색인 재구성, 위치 기울기 | SIMT | 불규칙 접근, 분기, warp 리덕션 |
-| 타일 소유 누적 | Tile 후보 | 물체 타일이 곧 cutile-rs의 "겹치지 않는 출력 조각"이라 불변식 2가 관례가 아니라 타입으로 강제됨. 타일마다 겹치는 프레임 수가 다른 gather를 표현할 수 있는지는 미검증(gather view는 Tile IR 13.3+). 안 되면 SIMT |
+| 타일 소유 누적 | Tile 후보 | 물체 타일이 곧 cutile-rs의 "겹치지 않는 출력 조각"이라 불변식 2가 관례가 아니라 타입으로 강제됨. 타일마다 겹치는 프레임 수가 다른 gather는 포인터 gather와 Tile IR 13.3 gather view 둘 다로 표현되고, 13.5·sm_89에서 f32 기준과 비트 단위로 같음(M6) |
 | 물체·프로브 갱신(정규화, 나눗셈), LLK 부분합의 최종 합, CG/BH 스칼라용 합계·내적 | Tile 후보 | 밀집 화소 연산과 리덕션. 원래 독립 커널이라 경계 비용이 늘지 않음 |
 
-전환은 커널 하나씩, SIMT 판과 결과가 허용오차 안에서 일치하고 반복당 시간이 같거나 짧을 때만 합니다.
+전환은 커널 하나씩, SIMT 판과 결과가 허용오차 안에서 일치하고 반복당 시간이 짧을 때만 합니다. 시간이 같으면 SIMT를 둡니다. Tile 판은 실행 기계에 CUDA 13.2+ 툴킷(Hopper는 13.3+)이 있어야 하고 시작할 때 tileiras로 컴파일하지만, SIMT 판은 미리 빌드됩니다. 옮긴 커널의 SIMT 판은 지우고 Tile 판 하나만 둡니다. 두 벌을 관리하지 않는 대신, 그 커널을 쓰는 엔진은 13.2 미만 환경에서 돌지 않습니다.
 
-### 신경망 경계 (ptyrs-nn)
+M6 측정(GPU2, 스택 16): 물체 갱신은 Tile 24–26 µs, SIMT 10–11 µs라 SIMT에 남고, 프로브 갱신은 비트 단위로 같고 사이클 시간 차이 0.000 ms로 동률이라 SIMT에 남습니다. 물체 합(타일 소유 누적)도 Tile이 사이클당 0.22–0.25 ms 느렸습니다. BH 내적은 Tile로 옮겼습니다. 한 프로세스 안에서 두 판을 번갈아 잰 A/B(BH 배치 96, 커널 빌드 순서를 앞뒤로 바꾼 깨끗한 실행 6회)에서 Tile이 에폭당 0.036–0.043 ms 빨랐고 결과는 비트 단위로 같습니다. 전체 배치에서는 차이를 가르지 못했습니다. 따로 빌드한 두 바이너리를 번갈아 재는 방식은 빌드마다 약 0.2 ms씩 흔들려 이 차이를 가르지 못합니다. CG β·노름 부분합은 동률이라 SIMT에 남습니다. LLK 부분합의 최종 합은 에폭마다 합계를 읽을 때만 Tile이 빠른데 엔진은 그렇게 읽지 않으므로 SIMT에 남습니다. Tile 커널은 하나에 약 0.45 s씩 프로세스의 첫 장치 생성 때 컴파일됩니다. Tile 커널을 섞은 ML 사이클과 BH 에폭은 각각 graph 하나로 캡처됩니다(nsys 확인). Tile 커널은 장치를 만들 때 컴파일해 두므로 캡처 중에 JIT가 일어나지 않습니다.
+
+### 신경망 경계 (ptyrs::nn)
 
 - 예측: 새 프레임 묶음 → burn CNN → 물체 조각 → 해당 영역 초기값. 프레임 묶음마다 한 번 넘깁니다.
 - 학습(DIP·PINN): 신경망이 물체를 진폭·위상(실수)으로 출력 → ptyrs 순·역방향 연산자로 물체 기울기 g 계산 → burn에서 손실을 ⟨출력, g⟩(g는 상수 취급)로 두고 역전파하면 신경망 가중치의 기울기가 정확히 나옵니다. burn에 복소수·FFT가 필요 없습니다.
@@ -272,9 +287,6 @@ ptyrs/
 
 ## 8. 열린 결정과 미검증 사항
 
-- **Tile로 옮긴 커널의 SIMT 판을 남길지**: 남기면 13.2 미만 환경에서도 돌고 결과 비교 기준이 되지만, 같은 커널을 두 벌 관리해야 합니다.
-- **Tile·SIMT 혼합 에폭의 graph 캡처**: 두 모델 모두 `DeviceOp`이고 cutile-rs는 graph 재생을 지원하지만, 섞인 체인을 graph 하나로 캡처하는 것은 미검증입니다. Tile 커널은 첫 실행 때 JIT 컴파일되므로 캡처 전에 한 번 돌려 두는 것을 전제로 합니다.
-- **타일 소유 누적의 Tile 표현**: 타일마다 겹치는 프레임 수가 달라 반복 횟수가 데이터에 따라 바뀌는 gather를 cutile-rs로 쓸 수 있는지 미검증입니다.
 - **burn ↔ cuda-rust 메모리 공유**: burn CUDA 백엔드가 외부 GPU 포인터를 복사 없이 받을 수 있는지 미검증입니다.
 - **std::autodiff(Rust 컴파일러 내장 자동 미분, nightly)**: cuda-oxide 커널에 쓸 수 있다면 역방향 연산자를 손으로 쓰지 않아도 됩니다. cuda-oxide는 별도 컴파일 백엔드라 함께 동작하는지 미검증이며, 지켜볼 항목입니다.
 - **cuFFT 장치 API의 안정성**: 실험 API(`cufft_device.h` 0.6.0)입니다. 커널이 부르는 함수 이름(`cufftdx_private_lto_function<600, ID, float, 1>`)은 공개 문서에 없고, ID가 크기·방향·SM마다 정해져 지금 코드는 sm_89에 고정입니다. CUDA를 올리면 깨질 수 있습니다. 이름을 libcufft가 주는 database 문자열에서 만들어 버전 변화를 따라갈 수 있는지는 미검증입니다. 열 패스가 256 간격으로 읽는 비용도 미측정입니다(M2).

@@ -1,6 +1,6 @@
 """Float64 reference of the maximum-likelihood (Poisson) object gradient at a fixed state.
 
-    <engine>/target/release/examples/llk_trace <dir> dm 1 2 32 40 4
+    <engine>/target/release/examples/engine_llk_trace <dir> dm 1 2 32 40 4
     micromamba run -n ptyrs-ref python -I refs/f64/ml_grad.py <dir> [--cuda]
 
 The state is <dir>/scan.cxi and init.h5: common::dm_scenario(32, 40, 2, 2e5, 4.0) after
@@ -41,7 +41,7 @@ STEPS = (1e-3, 1e-4, 1e-5)
 
 
 def load(d):
-    """As ptyrs-engine/scripts/compare_pynx.py: iobs DC-centred as in the CXI file."""
+    """As ptyrs/scripts/engine/compare_pynx.py: iobs DC-centred as in the CXI file."""
     with h5py.File(f"{d}/scan.cxi", "r") as f:
         raw = f["entry_1/data_1/data"][()]
         iobs = raw.astype(np.float64)

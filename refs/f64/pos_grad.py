@@ -1,7 +1,7 @@
 """Float64 reference of the Poisson and amplitude costs' gradients with respect to each frame's
 position, at a fixed state with sub-pixel positions, the sub-pixel part applied to the probe.
 
-    <engine>/target/release/examples/llk_trace <dir> dm 1 2 32 40 4
+    <engine>/target/release/examples/engine_llk_trace <dir> dm 1 2 32 40 4
     micromamba run -n ptyrs-ref python -I refs/f64/pos_grad.py <dir>
 
 The state is the one ml_grad.py reads (object [1, 76, 80], probe [2, 32, 32], 40 frames, no

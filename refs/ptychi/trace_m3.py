@@ -1,17 +1,17 @@
-"""Epochs and time to the truth LLK of ptyrs and PyNX on one llk_trace scenario, by
+"""Epochs and time to the truth LLK of ptyrs and PyNX on one engine_llk_trace scenario, by
 summarize.py's targets: the ptyrs side of the M3 comparison.
 
-    target/release/examples/llk_trace <dir> <algo> <ncycle> <nprobe> <frame> <npos> <step> --gpu
-    python -I ptyrs-engine/scripts/compare_pynx.py <dir> <dm|ap> --cuda --no-cpu
+    target/release/examples/engine_llk_trace <dir> <algo> <ncycle> <nprobe> <frame> <npos> <step> --gpu
+    python -I ptyrs/scripts/engine/compare_pynx.py <dir> <dm|ap> --cuda --no-cpu
     python -I refs/ptychi/trace_m3.py <dir> <algo> [--epoch-s SERIES=SECONDS ...] [--start-epoch N]
 
-Reads <dir>/llk_truth.txt (llk_trace's truth), llk_rust.txt (series "ptyrs") and every
+Reads <dir>/llk_truth.txt (engine_llk_trace's truth), llk_rust.txt (series "ptyrs") and every
 llk_pynx_<algo>_<name>.txt (series "pynx_<name>"; ML's from the engine's compare_pynx_ml.py),
 each normalised by nb_obs as PyNX records it.
 A record of cycle c is the LLK of the state after FIRST + c updates plus --start-epoch, the
-epochs that made init.h5 (llk_trace ml: its ML_WARMUP AP cycles). Targets are
+epochs that made init.h5 (engine_llk_trace ml: its ML_WARMUP AP cycles). Targets are
 m3ref.TARGET_FACTORS of the truth LLK, hit at the first epoch at or below. Time to target is
-epoch x the series' seconds per epoch (--epoch-s, a clean GPU2 run without LLK: gpu_time for
+epoch x the series' seconds per epoch (--epoch-s, a clean GPU2 run without LLK: engine_gpu_time for
 ptyrs, compare_pynx.py --time for PyNX CUDA), as pty-chi's wall_s leaves out evaluate().
 Unlike m3ref.time_to_target no Poisson row is skipped: a trace has no poisson_floor_share, and
 a rounding-dominated Poisson LLK is orders above every target, so it cannot make a hit.

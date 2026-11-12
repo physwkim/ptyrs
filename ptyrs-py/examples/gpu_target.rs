@@ -15,7 +15,7 @@ use std::iter::once;
 use std::time::Instant;
 
 use cuda_core::CudaContext;
-use ptyrs_engine::{BhParams, EngineError, GpuOptions, GpuPtycho, RpieParams};
+use ptyrs::engine::{BhParams, EngineError, GpuOptions, GpuPtycho, RpieParams};
 
 const USAGE: &str = "usage: gpu_target <cxi> <init.h5> <nepoch> <target|-> \
     (bh <batch_size> <probe_rho> <seed> | \
@@ -71,8 +71,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let options = GpuOptions::default();
 
     let t = Instant::now();
-    let scan = ptyrs_io::read_cxi(cxi)?;
-    let (object, probe) = ptyrs_io::read_modes(init)?;
+    let scan = ptyrs::io::read_cxi(cxi)?;
+    let (object, probe) = ptyrs::io::read_modes(init)?;
     println!("read_s {}", t.elapsed().as_secs_f64());
     let ctx = CudaContext::new(0).map_err(EngineError::from)?;
     println!("context_s {}", t.elapsed().as_secs_f64());

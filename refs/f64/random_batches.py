@@ -1,4 +1,4 @@
-"""ptyrs-engine `random_batches` (src/batch.rs) bit for bit: the frames 0..nframe of one epoch
+"""ptyrs::engine `random_batches` (ptyrs/src/engine/batch.rs) bit for bit: the frames 0..nframe of one epoch
 as a SplitMix64 Fisher-Yates permutation from state seed ^ mix(epoch), cut into batches of
 `size`, the last one shorter, each sorted ascending."""
 import numpy as np

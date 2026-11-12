@@ -8,11 +8,7 @@ description = "ptyrs Python bindings (numpy in and out), for validating against 
 crate-type = ["cdylib"]
 
 [dependencies]
-ptyrs-core.workspace = true
-ptyrs-engine = { path = "../ptyrs-engine" }
+ptyrs = { path = "../ptyrs" }
 cuda-core.workspace = true
 numpy = "0.28"
 pyo3 = "0.28"
-
-[dev-dependencies]
-ptyrs-io.workspace = true

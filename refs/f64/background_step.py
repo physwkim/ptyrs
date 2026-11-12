@@ -1,11 +1,11 @@
 """Float64 reference of the incoherent background: the costs' gradient and curvature with respect
 to each detector pixel's background and PyNX's AP background update, at a fixed state.
 
-    <engine>/target/release/examples/llk_trace <dir> dm 1 2 32 40 4
+    <engine>/target/release/examples/engine_llk_trace <dir> dm 1 2 32 40 4
     micromamba run -n ptyrs-ref python -I refs/f64/background_step.py <dir> [--cuda]
 
 The state is the one ml_grad.py reads (object [1, 76, 80], probe [2, 32, 32], 40 frames, no
-masked pixel) plus a background b(u), one detector plane added to every frame, as ptyrs-refgen
+masked pixel) plus a background b(u), one detector plane added to every frame, as ptyrs::refgen
 adds it (Background::plane, detector order, DC at [ny/2, nx/2]):
 
     b = 2 + 50 exp(-r^2 / (2 3^2)),  r the distance in pixels from [ny/2, nx/2]
@@ -65,7 +65,7 @@ mg = sibling("ml_grad")
 
 
 def plane(ny, nx):
-    """ptyrs-refgen Background::plane, detector order."""
+    """ptyrs::refgen Background::plane, detector order."""
     y, x = np.arange(ny)[:, None] - ny // 2, np.arange(nx)[None, :] - nx // 2
     return FLAT + PEAK * np.exp(-(y**2 + x**2) / (2 * WIDTH**2))
 

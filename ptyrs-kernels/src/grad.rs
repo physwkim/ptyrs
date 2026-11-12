@@ -130,27 +130,34 @@ pub mod grad_kernels {
         }
     }
 
-    /// Adds the calculated photons of the stack's frames, `sum_fl partials[fl].icalc` over
-    /// `fl < nf` in a fixed order, to `out[0]`.
+    /// Adds the calculated photons of the stack's frames, `sum_fl s[f0 + fl] partials[fl].icalc`
+    /// over `fl < nf` in a fixed order, to `out[0]`; `s` is the per-frame intensity `scale`,
+    /// or 1 if it is null.
     ///
     /// # Safety
     ///
-    /// `partials` holds `nf_max` records, `out` and `ctl` one entry each; grid `(1, 1, 1)`,
-    /// block `(PIXEL_THREADS, 1, 1)`.
+    /// `partials` holds `nf_max` records, `out` and `ctl` one entry each, `scale` is null or
+    /// holds `nframe` floats; grid `(1, 1, 1)`, block `(PIXEL_THREADS, 1, 1)`.
     #[kernel]
     pub unsafe fn cg_icalc_add(
         partials: *const LlkPartial,
+        scale: *const f32,
         ctl: *const StackCtl,
         g: StackGeom,
         out: *mut f32,
     ) {
         static mut RED: SharedArray<f32, 256> = SharedArray::UNINIT;
-        let (_, nf) = unsafe { stack_frames(ctl, g) };
+        let (f0, nf) = unsafe { stack_frames(ctl, g) };
         let t = thread::threadIdx_x() as usize;
         let mut acc = 0.0f32;
         let mut fl = t;
         while fl < nf as usize {
-            acc += unsafe { (*partials.add(fl)).icalc };
+            let icalc = unsafe { (*partials.add(fl)).icalc };
+            acc += if scale.is_null() {
+                icalc
+            } else {
+                unsafe { *scale.add(f0 as usize + fl) * icalc }
+            };
             fl += PIXEL_THREADS as usize;
         }
         let s = (&raw mut RED).cast::<f32>();
@@ -311,9 +318,10 @@ pub mod grad_kernels {
 
     /// PyNX `CG_Poisson_Gamma` (no background) per chunk `c = blockIdx.x` of frame `f0 + fl`,
     /// `fl = blockIdx.y`, on the forward-FFT'd (unnormalized) line-search stacks: over the
-    /// unmasked pixels `d` in `c * GAMMA_CHUNK .. min((c + 1) * GAMMA_CHUNK, n)`, with `calc =
-    /// max(sum_m |po|^2 / n, 1e-12)`, `r = sum_m Re(conj(po) a) / n`, `s = sum_m (|a|^2 +
-    /// 2 Re(conj(po) b)) / n` and `f = 1 - obs / calc`, pair `p = (f0 + fl) * nchunk + c`,
+    /// unmasked pixels `d` in `c * GAMMA_CHUNK .. min((c + 1) * GAMMA_CHUNK, n)`, with `k` the
+    /// frame's intensity `scale` (1 if it is null), `calc = max(k sum_m |po|^2 / n, 1e-12)`,
+    /// `r = k sum_m Re(conj(po) a) / n`, `s = k sum_m (|a|^2 + 2 Re(conj(po) b)) / n` and
+    /// `f = 1 - obs / calc`, pair `p = (f0 + fl) * nchunk + c`,
     /// `nchunk = ceil(n / GAMMA_CHUNK)`, gets `out[2 p] = sum -2 r f` and `out[2 p + 1] =
     /// sum 2 s f + obs (2 r / calc)^2`, the numerator and denominator of `γ = -L'(0) /
     /// L''(0)` (ptyrs-engine `cg_poisson_gamma`, which has the cross term right where PyNX's
@@ -322,12 +330,13 @@ pub mod grad_kernels {
     /// # Safety
     ///
     /// Each of `x` `[nf_max * nmode, ny, nx]`, `counts` `[nframe, ny, nx]`, `out`
-    /// `2 * nframe * nchunk` floats, `ctl` one entry; grid `(nchunk, nf_max, 1)`, block
-    /// `(PIXEL_THREADS, 1, 1)`.
+    /// `2 * nframe * nchunk` floats, `ctl` one entry, `scale` null or `nframe` floats; grid
+    /// `(nchunk, nf_max, 1)`, block `(PIXEL_THREADS, 1, 1)`.
     #[kernel]
     pub unsafe fn cg_gamma_frames(
         x: GammaPtrs,
         counts: *const u16,
+        scale: *const f32,
         out: *mut f32,
         ctl: *const StackCtl,
         g: StackGeom,
@@ -345,6 +354,12 @@ pub mod grad_kernels {
         let chunk = GAMMA_CHUNK as usize;
         let end = n.min((c + 1) * chunk);
         let inv_n = 1.0 / n as f32;
+        // `1 * x == x`: without a scale every pair is the unscaled kernel's, bit for bit.
+        let k = if scale.is_null() {
+            1.0
+        } else {
+            unsafe { *scale.add(f0 as usize + fl) }
+        };
         let mut acc = [0.0f32; 2];
         let mut d = c * chunk + thread::threadIdx_x() as usize;
         while d < end {
@@ -359,8 +374,8 @@ pub mod grad_kernels {
                     r += cmul_conj(p, a).0;
                     s += a.0 * a.0 + a.1 * a.1 + 2.0 * cmul_conj(p, b).0;
                 }
-                let calc = (calc * inv_n).max(1e-12);
-                let (r, s, obs) = (r * inv_n, s * inv_n, obs as f32);
+                let calc = (k * (calc * inv_n)).max(1e-12);
+                let (r, s, obs) = (k * (r * inv_n), k * (s * inv_n), obs as f32);
                 let f = 1.0 - obs / calc;
                 let rc = 2.0 * r / calc;
                 acc[0] -= 2.0 * r * f;
@@ -370,6 +385,43 @@ pub mod grad_kernels {
         }
         let o = unsafe { out.add(2 * ((f0 as usize + fl) * n.div_ceil(chunk) + c)) };
         unsafe { super::store_pair((&raw mut RED).cast::<f32>(), acc, o) }
+    }
+
+    /// Poisson's fixed-point step of the per-frame intensity scale from the frames' far sums,
+    /// `scale[f] *= sums[f].ratio / sums[f].intensity` where the intensity is above 0, then
+    /// division by the mean over the `nframe` frames.
+    ///
+    /// # Safety
+    ///
+    /// `scale` and `sums` hold `nframe` entries; grid `(1, 1, 1)`, block
+    /// `(PIXEL_THREADS, 1, 1)`.
+    #[kernel]
+    pub unsafe fn cg_scale_step(scale: *mut f32, sums: *const ScalePartial, nframe: u32) {
+        static mut RED: SharedArray<f32, 256> = SharedArray::UNINIT;
+        let t = thread::threadIdx_x() as usize;
+        let mut acc = 0.0f32;
+        let mut f = t;
+        while f < nframe as usize {
+            unsafe {
+                let p = *sums.add(f);
+                if p.intensity > 0.0 {
+                    *scale.add(f) *= p.ratio / p.intensity;
+                }
+                acc += *scale.add(f);
+            }
+            f += PIXEL_THREADS as usize;
+        }
+        let s = (&raw mut RED).cast::<f32>();
+        let inv = unsafe {
+            *s.add(t) = acc;
+            crate::block_sum::<1>(s);
+            nframe as f32 / *s
+        };
+        let mut f = t;
+        while f < nframe as usize {
+            unsafe { *scale.add(f) *= inv };
+            f += PIXEL_THREADS as usize;
+        }
     }
 
     /// PyNX `cu_linear_comb_fcfc_gamma`: with `gamma = gamma_pair[0] / gamma_pair[1]`,
