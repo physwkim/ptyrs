@@ -1658,6 +1658,7 @@ dependencies = [
  "libloading",
  "nvjitlink-sys",
  "oxide-artifacts",
+ "ptyrs-core",
  "ptyrs-fft",
  "ptyrs-kernels",
 ]

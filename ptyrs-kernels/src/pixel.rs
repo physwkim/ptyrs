@@ -118,6 +118,31 @@ pub unsafe fn tile_run(tiles: TilePtrs, t: usize) -> (u32, u32) {
     (lo, lo + unsafe { *tiles.len.add(t) })
 }
 
+/// The part of tile `t`'s run from its first view `>= k0` to its end, if that view is
+/// `< k1`; the caller stops at the first view `>= k1`. `None` when no view of the stack
+/// `k0 .. k1` touches the tile, so the tile's sums must be left untouched.
+///
+/// # Safety
+///
+/// As [`tile_run`], and the run must lie in `tiles.views`.
+#[device]
+pub unsafe fn tile_stack_run(tiles: TilePtrs, t: usize, k0: u32, k1: u32) -> Option<(u32, u32)> {
+    let (mut lo, end) = unsafe { tile_run(tiles, t) };
+    let mut hi = end;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if unsafe { *tiles.views.add(mid as usize) } < k0 {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    if lo == end || unsafe { *tiles.views.add(lo as usize) } >= k1 {
+        return None;
+    }
+    Some((lo, end))
+}
+
 /// [`TilePtrs`] with the runs writable, for `bin_views` to append to: tile `t`'s slab is
 /// `views[start[t] .. start[t + 1]]`, its run the first `len[t]` slots.
 #[repr(C)]

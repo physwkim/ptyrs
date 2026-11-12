@@ -6,7 +6,10 @@
 //!   even; `n = ny * nx`. `probe` is `[nprobe, ny, nx]`, `obj` `[nobj, nyo, nxo]`, both in
 //!   natural order (no shift). Complex values are [`C32`].
 //! * Views are frame-major, `k = frame * nmode + mode`; [`ViewAddr`] says which probe and
-//!   object mode a view multiplies and where it samples the object. A stack is frames
+//!   object mode a view multiplies and where it samples the object. They are canonical
+//!   ([`Views::new`] checks it): `nmode = nprobe * nobj`, mode `m` multiplies probe mode
+//!   `m % nprobe` and object mode `m / nprobe`, and all views of a frame sample the object
+//!   at one position. A stack is frames
 //!   `f0 .. f0 + nf`, a [`StackCtl`] entry of a [`StackTable`] that the kernels read when they
 //!   run, not when they are launched or captured. Per-stack buffers are sized by the table's
 //!   `nf_max`: `psi` holds `nf_max * nmode` planes, plane `kl < nf * nmode` being view
@@ -72,11 +75,11 @@ pub struct ViewDims {
 }
 
 impl ViewDims {
-    fn n(&self) -> usize {
+    pub(crate) fn n(&self) -> usize {
         self.frame[0] as usize * self.frame[1] as usize
     }
 
-    fn obj_len(&self) -> usize {
+    pub(crate) fn obj_len(&self) -> usize {
         self.nobj as usize * self.obj[0] as usize * self.obj[1] as usize
     }
 
@@ -107,7 +110,7 @@ impl ViewDims {
     }
 
     /// One `(OBJ_TILE, OBJ_TILE)` block per object tile and object mode.
-    fn tile_grid(&self) -> LaunchConfig {
+    pub(crate) fn tile_grid(&self) -> LaunchConfig {
         let [nty, ntx] = self.tiles();
         LaunchConfig {
             grid_dim: (ntx, nty, self.nobj),
@@ -116,12 +119,15 @@ impl ViewDims {
         }
     }
 
-    fn check(&self) -> Result<(), Error> {
+    pub(crate) fn check(&self) -> Result<(), Error> {
         let [ny, nx] = self.frame;
         let [nyo, nxo] = self.obj;
         let bad = |what: &str| Err(Error::Shape(format!("{self:?}: {what}")));
         if self.nframe == 0 || self.nmode == 0 || self.nprobe == 0 || self.nobj == 0 {
             return bad("a count is zero");
+        }
+        if self.nmode as u64 != self.nprobe as u64 * self.nobj as u64 {
+            return bad("nmode is not nprobe * nobj");
         }
         // `r^2` of the quadratic phase is an i32 on the device.
         if ny == 0 || nx == 0 || ny % 2 != 0 || nx % 2 != 0 || ny > 32768 || nx > 32768 {
@@ -292,8 +298,8 @@ pub struct Views {
 }
 
 impl Views {
-    /// Checks `addr` (`nframe * nmode` views, each inside the object with `fy`, `fx` in
-    /// `[0, 1)` and valid mode indices) and uploads it with its tile lists.
+    /// Checks `addr` (`nframe * nmode` canonical views, each inside the object with `fy`,
+    /// `fx` in `[0, 1)`) and uploads it with its tile lists.
     pub fn new(stream: &CudaStream, dims: ViewDims, addr: &[ViewAddr]) -> Result<Self, Error> {
         dims.check()?;
         let nview = dims.nframe as usize * dims.nmode as usize;
@@ -306,6 +312,20 @@ impl Views {
         for (k, v) in addr.iter().enumerate() {
             dims.check_view(v)
                 .map_err(|e| Error::Shape(format!("view {k}: {e}")))?;
+        }
+        for (f, frame) in addr.chunks_exact(dims.nmode as usize).enumerate() {
+            let at = |v: &ViewAddr| (v.oy, v.ox, v.fy, v.fx);
+            for (m, v) in (0..).zip(frame) {
+                if v.probe != m % dims.nprobe || v.obj != m / dims.nprobe || at(v) != at(&frame[0])
+                {
+                    return Err(Error::Shape(format!(
+                        "frame {f} mode {m}: {v:?} is not probe {} x object {} at the frame's \
+                         position",
+                        m % dims.nprobe,
+                        m / dims.nprobe
+                    )));
+                }
+            }
         }
         let t = tile_lists(&dims, addr)?;
         Ok(Self {
@@ -376,7 +396,7 @@ impl Views {
         &self.tile_len
     }
 
-    fn tile_ptrs(&self) -> TilePtrs {
+    pub(crate) fn tile_ptrs(&self) -> TilePtrs {
         TilePtrs {
             start: dptr(&self.tile_start),
             len: dptr(&self.tile_len),
@@ -384,7 +404,7 @@ impl Views {
         }
     }
 
-    fn tile_storages(&self) -> [&RawDeviceBuffer; 3] {
+    pub(crate) fn tile_storages(&self) -> [&RawDeviceBuffer; 3] {
         [
             self.tile_start.storage(),
             self.tile_len.storage(),
@@ -494,7 +514,7 @@ fn pair_tree(block: &[[f64; 4]]) -> [f64; 4] {
 }
 
 /// `PIXEL_THREADS`-thread blocks covering `total` elements.
-fn grid_1d(total: usize) -> Result<LaunchConfig, Error> {
+pub(crate) fn grid_1d(total: usize) -> Result<LaunchConfig, Error> {
     let blocks = total.div_ceil(PIXEL_THREADS as usize);
     let blocks = u32::try_from(blocks)
         .ok()
@@ -1050,17 +1070,17 @@ impl UpdateSums {
         })
     }
 
-    fn check(&self, need: usize) -> Result<(), Error> {
+    pub(crate) fn check(&self, need: usize) -> Result<(), Error> {
         check_len("sums.num", &self.num, need)?;
         check_len("sums.den", &self.den, need)?;
         check_len("sums.max_bits", &self.max_bits, 1)
     }
 
-    fn storages(&self) -> [&cuda_core::RawDeviceBuffer; 2] {
+    pub(crate) fn storages(&self) -> [&cuda_core::RawDeviceBuffer; 2] {
         [self.num.storage(), self.den.storage()]
     }
 
-    fn ptrs(&self) -> SumPtrs {
+    pub(crate) fn ptrs(&self) -> SumPtrs {
         SumPtrs {
             num: dptr(&self.num),
             den: dptr(&self.den),
