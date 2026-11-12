@@ -323,6 +323,37 @@ fn switches_match_cpu(setup: Setup) {
     );
 }
 
+/// An object set between AP calls, after graphs were captured, gives the bits and the LLK of
+/// a fresh reconstruction built with that object and the probe so far; one of other dims is
+/// refused.
+#[test]
+fn set_object_matches_a_fresh_start() {
+    let ap = ApParams {
+        obj_inertia: Some(0.01),
+        probe_inertia: Some(0.001),
+        calc_llk: 1,
+        zero_phase_ramp: false,
+    };
+    for setup in [M1, FUSED] {
+        let (scan, object, probe) = start(setup.frame, 2, true);
+        let mut g = GpuPtycho::new(&ctx(), &scan, object.clone(), probe, setup.options).unwrap();
+        g.ap(&ap, 2).unwrap();
+        let turn = C64::from_polar(0.9, 0.3);
+        let values = object.as_slice().iter().map(|&c| c * turn).collect();
+        let other = Object::new(Stack::from_vec(object.dims(), values).unwrap());
+        let wrong = Object::new(Stack::filled([1, 4, 4], C64::new(1.0, 0.0)));
+        assert!(g.set_object(&wrong).is_err());
+        g.set_object(&other).unwrap();
+        let mut fresh =
+            GpuPtycho::new(&ctx(), &scan, other, g.probe().unwrap(), setup.options).unwrap();
+        g.ap(&ap, 1).unwrap();
+        fresh.ap(&ap, 1).unwrap();
+        assert_eq!(g.history()[2].llk, fresh.history()[0].llk, "{setup:?}");
+        assert_eq!(g.object().unwrap(), fresh.object().unwrap(), "{setup:?}");
+        assert_eq!(g.probe().unwrap(), fresh.probe().unwrap(), "{setup:?}");
+    }
+}
+
 #[test]
 fn gpu_rejects_what_it_cannot_run() {
     let (scan, object, probe) = start(M1.frame, 1, false);

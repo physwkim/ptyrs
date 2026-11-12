@@ -437,9 +437,14 @@ impl Device {
         &self.probe
     }
 
+    /// Overwrites the object in place, so every captured graph reads the new values.
+    pub fn write_object(&mut self, obj: &[C32]) -> Result<(), EngineError> {
+        Ok(self.obj.copy_from_host(&self.stream, obj)?)
+    }
+
     /// Overwrites the object and probe in place.
     pub fn write_arrays(&mut self, obj: &[C32], probe: &[C32]) -> Result<(), EngineError> {
-        self.obj.copy_from_host(&self.stream, obj)?;
+        self.write_object(obj)?;
         self.probe.copy_from_host(&self.stream, probe)?;
         Ok(())
     }

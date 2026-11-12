@@ -350,6 +350,20 @@ impl GpuPtycho {
         )?))
     }
 
+    /// Replaces the object between algorithm calls, which start from it as from the one
+    /// [`Self::new`] uploads; fails, changing nothing, when its dims differ from the current
+    /// object's.
+    pub fn set_object(&mut self, object: &Object) -> Result<(), EngineError> {
+        if object.dims() != self.obj_dims {
+            return Err(EngineError::Invalid(format!(
+                "object {:?} differs from the reconstruction's {:?}",
+                object.dims(),
+                self.obj_dims
+            )));
+        }
+        self.dev.write_object(&to_c32(object.as_slice()))
+    }
+
     /// The probe, read back from the device.
     pub fn probe(&self) -> Result<Probe, EngineError> {
         Ok(Probe::new(download(
