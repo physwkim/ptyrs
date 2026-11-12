@@ -363,7 +363,9 @@ fn worker<S, I>(
 {
     let setup = || -> Result<(Gpu, [Event; 2]), DistError> {
         ctx.bind_to_thread()?;
-        let stream = ctx.new_stream()?;
+        // Above the side stream, whose event-blocked work otherwise widens the gaps between
+        // the main stream's kernels (0.7 to 1.4 us in DistAp's stacks).
+        let stream = ctx.new_stream_with_priority(ctx.stream_priority_range()?.greatest())?;
         let events = [
             ctx.new_event_with_flags(None)?,
             ctx.new_event_with_flags(None)?,
