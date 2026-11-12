@@ -1,10 +1,10 @@
 //! ptyrs-tile: cuTile (Tile IR) alternatives to `ptyrs-gpu` SIMT pieces.
 //!
 //! Every launch is a method of a [`TileKernels`], the kernels of one scan, or of its
-//! [`TileObjUpdate`] or [`TileProbeUpdate`], each compiling its kernels when it is built, so
-//! no launch compiles, eagerly or under a graph capture. A launch takes the context, stack
-//! and buffers of its `ptyrs_gpu` counterpart, the scan's views being the set's (the object
-//! update takes them, as its counterpart does), leases the buffers with
+//! [`TileObjUpdate`], [`TileProbeUpdate`] or [`TileDots`], each compiling its kernels when
+//! it is built, so no launch compiles, eagerly or under a graph capture. A launch takes the
+//! context, stack and buffers of its `ptyrs_gpu` counterpart, the scan's views being the
+//! set's (the object update takes them, as its counterpart does), leases the buffers with
 //! [`ptyrs_gpu::lease`] and enqueues on the context's stream, so it runs eagerly or records
 //! into a capture the same way.
 
@@ -16,8 +16,8 @@ use cuda_core::{CudaStream, DeviceBuffer, DeviceCopy};
 use cutile::prelude::*;
 pub use ptyrs_gpu::Error;
 use ptyrs_gpu::{
-    C32, LLK_TREE_LEAVES, LlkPartial, StackGeom, StackRef, StackTable, UpdateSums, ViewDims, Views,
-    lease,
+    BhDisp, C32, CG_BLOCKS, LLK_TREE_LEAVES, LlkPartial, StackGeom, StackRef, StackTable,
+    UpdateSums, ViewDims, Views, gamma_parts, lease,
 };
 
 #[cutile::module]
@@ -877,6 +877,267 @@ mod device {
         let v: Tile<f64, { [256, 4] }> = select(inside, v, zero);
         unsafe { llk_store(out, llk_pairs(v)) };
     }
+
+    /// Program `b`'s 256 lanes as SIMT block `b`'s threads: element `256 b + t` of lane
+    /// `t`, the grid stride `256 * grid` and how many strides start below `n`.
+    fn dot_lanes(n: i32) -> (Tile<i32, { [256] }>, i32, i32) {
+        let pid: (i32, i32, i32) = get_tile_block_id();
+        let grid: (i32, i32, i32) = get_num_tile_blocks();
+        let first: i32 = pid.0 * 256i32;
+        let stride: i32 = grid.0 * 256i32;
+        let lane: Tile<i32, { [256] }> = iota(shape![256]);
+        let at: Tile<i32, { [256] }> = lane + broadcast_scalar(first, shape![256]);
+        (at, stride, ceil_div(max(n - first, 0i32), stride))
+    }
+
+    /// Float offsets `2 at + [0, 1]` of the complex values at `at`, and `m` for both.
+    fn c_at(
+        at: Tile<i32, { [256] }>,
+        m: Tile<bool, { [256] }>,
+    ) -> (Tile<i32, { [256, 2] }>, Tile<bool, { [256, 2] }>) {
+        let part: Tile<i32, { [2] }> = iota(shape![2]);
+        let part: Tile<i32, { [1, 2] }> = part.reshape(shape![1, 2]);
+        let part: Tile<i32, { [256, 2] }> = part.broadcast(shape![256, 2]);
+        let at: Tile<i32, { [256] }> = at * constant(2i32, shape![256]);
+        let at: Tile<i32, { [256, 1] }> = at.reshape(shape![256, 1]);
+        let m: Tile<bool, { [256, 1] }> = m.reshape(shape![256, 1]);
+        (
+            at.broadcast(shape![256, 2]) + part,
+            m.broadcast(shape![256, 2]),
+        )
+    }
+
+    /// `p[at]` where `m`, as one load; other lanes are unspecified.
+    unsafe fn load_c(
+        p: *const f32,
+        at: Tile<i32, { [256, 2] }>,
+        m: Tile<bool, { [256, 2] }>,
+    ) -> (Tile<f32, { [256, 2] }>, Token) {
+        let base: PointerTile<*const f32, { [] }> = pointer_to_tile(p);
+        let base: PointerTile<*const f32, { [1, 1] }> = base.reshape(shape![1, 1]);
+        let base: PointerTile<*const f32, { [256, 2] }> = base.broadcast(shape![256, 2]);
+        let ptrs: PointerTile<*const f32, { [256, 2] }> = base.offset_tile(at);
+        let (v, t): (Tile<f32, { [256, 2] }>, Token) = unsafe {
+            load_ptr_tko(
+                ptrs,
+                ordering::Weak,
+                None::<scope::TileBlock>,
+                Some(m),
+                None,
+                None,
+                Latency::<0>,
+            )
+        };
+        (v, t)
+    }
+
+    /// The real and imaginary columns of complex values.
+    fn re_im(v: Tile<f32, { [256, 2] }>) -> (Tile<f32, { [256] }>, Tile<f32, { [256] }>) {
+        let z: Tile<i32, { [] }> = scalar_to_tile(0i32);
+        let o: Tile<i32, { [] }> = scalar_to_tile(1i32);
+        let re: Tile<f32, { [256, 1] }> = extract(v, [z, z]);
+        let im: Tile<f32, { [256, 1] }> = extract(v, [z, o]);
+        (re.reshape(shape![256]), im.reshape(shape![256]))
+    }
+
+    /// `ptyrs_kernels::block_sum` of one value per lane: `s[t] += s[t + half]` for `half =
+    /// 128, 64, .., 1`, the first half plus the second at every level.
+    fn block_sum(x: Tile<f32, { [256] }>) -> Tile<f32, { [1] }> {
+        let z: Tile<i32, { [] }> = scalar_to_tile(0i32);
+        let o: Tile<i32, { [] }> = scalar_to_tile(1i32);
+        let x: Tile<f32, { [2, 128] }> = x.reshape(shape![2, 128]);
+        let a: Tile<f32, { [1, 128] }> = extract(x, [z, z]);
+        let b: Tile<f32, { [1, 128] }> = extract(x, [o, z]);
+        let x: Tile<f32, { [2, 64] }> = (a + b).reshape(shape![2, 64]);
+        let a: Tile<f32, { [1, 64] }> = extract(x, [z, z]);
+        let b: Tile<f32, { [1, 64] }> = extract(x, [o, z]);
+        let x: Tile<f32, { [2, 32] }> = (a + b).reshape(shape![2, 32]);
+        let a: Tile<f32, { [1, 32] }> = extract(x, [z, z]);
+        let b: Tile<f32, { [1, 32] }> = extract(x, [o, z]);
+        let x: Tile<f32, { [2, 16] }> = (a + b).reshape(shape![2, 16]);
+        let a: Tile<f32, { [1, 16] }> = extract(x, [z, z]);
+        let b: Tile<f32, { [1, 16] }> = extract(x, [o, z]);
+        let x: Tile<f32, { [2, 8] }> = (a + b).reshape(shape![2, 8]);
+        let a: Tile<f32, { [1, 8] }> = extract(x, [z, z]);
+        let b: Tile<f32, { [1, 8] }> = extract(x, [o, z]);
+        let x: Tile<f32, { [2, 4] }> = (a + b).reshape(shape![2, 4]);
+        let a: Tile<f32, { [1, 4] }> = extract(x, [z, z]);
+        let b: Tile<f32, { [1, 4] }> = extract(x, [o, z]);
+        let x: Tile<f32, { [2, 2] }> = (a + b).reshape(shape![2, 2]);
+        let a: Tile<f32, { [1, 2] }> = extract(x, [z, z]);
+        let b: Tile<f32, { [1, 2] }> = extract(x, [o, z]);
+        let x: Tile<f32, { [2, 1] }> = (a + b).reshape(shape![2, 1]);
+        let a: Tile<f32, { [1, 1] }> = extract(x, [z, z]);
+        let b: Tile<f32, { [1, 1] }> = extract(x, [o, z]);
+        (a + b).reshape(shape![1])
+    }
+
+    /// `p[i] = v`.
+    unsafe fn store_1(p: *mut f32, i: i32, v: Tile<f32, { [1] }>) {
+        let at: PointerTile<*mut f32, { [] }> = pointer_to_tile(p);
+        let at: PointerTile<*mut f32, { [] }> = at.offset(i);
+        let at: PointerTile<*mut f32, { [1] }> = at.reshape(shape![1]);
+        let _t: Token = unsafe {
+            store_ptr_tko(
+                at,
+                v,
+                ordering::Weak,
+                None::<scope::TileBlock>,
+                None,
+                None,
+                Latency::<0>,
+            )
+        };
+    }
+
+    /// `out[2 b ..][.. 2] = (block_sum(s0), block_sum(s1))` for program `b`, as
+    /// `ptyrs_kernels::store_pair`.
+    unsafe fn store_pair(out: *mut f32, s0: Tile<f32, { [256] }>, s1: Tile<f32, { [256] }>) {
+        let pid: (i32, i32, i32) = get_tile_block_id();
+        unsafe { store_1(out, 2i32 * pid.0, block_sum(s0)) };
+        unsafe { store_1(out, 2i32 * pid.0 + 1i32, block_sum(s1)) };
+    }
+
+    /// `ptyrs_kernels::cg_beta_parts`: program `b`'s pair `(sum Re(conj(g) (g - h)), sum
+    /// |h|^2)` over its SIMT block's grid-stride elements of `g` and `h` (`n` complex), into
+    /// `part[2 b ..][.. 2]`, then `h = g` there. Each lane accumulates as the SIMT build
+    /// contracts it, `acc = fma(x0, y0, fma(x1, y1, acc))`.
+    #[cutile::entry()]
+    unsafe fn cg_beta_parts(g: *const f32, h: *mut f32, n: i32, part: *mut f32) {
+        let (at0, stride, steps): (Tile<i32, { [256] }>, i32, i32) = dot_lanes(n);
+        let n_t: Tile<i32, { [256] }> = broadcast_scalar(n, shape![256]);
+        let mut acc0: Tile<f32, { [256] }> = constant(0.0f32, shape![256]);
+        let mut acc1: Tile<f32, { [256] }> = constant(0.0f32, shape![256]);
+        for k in 0i32..steps {
+            let at: Tile<i32, { [256] }> = at0 + broadcast_scalar(k * stride, shape![256]);
+            let inside: Tile<bool, { [256] }> = lt_tile(at, n_t);
+            let (ac, mc): (Tile<i32, { [256, 2] }>, Tile<bool, { [256, 2] }>) = c_at(at, inside);
+            let (va, _ta): (Tile<f32, { [256, 2] }>, Token) = unsafe { load_c(g, ac, mc) };
+            let (vb, tb): (Tile<f32, { [256, 2] }>, Token) =
+                unsafe { load_c(cast_const(h), ac, mc) };
+            let (a0, a1): (Tile<f32, { [256] }>, Tile<f32, { [256] }>) = re_im(va);
+            let (b0, b1): (Tile<f32, { [256] }>, Tile<f32, { [256] }>) = re_im(vb);
+            let d0: Tile<f32, { [256] }> = subf(a0, b0, rounding::NearestEven, ftz::Disabled);
+            let d1: Tile<f32, { [256] }> = subf(a1, b1, rounding::NearestEven, ftz::Disabled);
+            let s0: Tile<f32, { [256] }> = fma(a1, d1, acc0, rounding::NearestEven, ftz::Disabled);
+            let s0: Tile<f32, { [256] }> = fma(a0, d0, s0, rounding::NearestEven, ftz::Disabled);
+            let s1: Tile<f32, { [256] }> = fma(b1, b1, acc1, rounding::NearestEven, ftz::Disabled);
+            let s1: Tile<f32, { [256] }> = fma(b0, b0, s1, rounding::NearestEven, ftz::Disabled);
+            acc0 = select(inside, s0, acc0);
+            acc1 = select(inside, s1, acc1);
+            let base: PointerTile<*mut f32, { [] }> = pointer_to_tile(h);
+            let base: PointerTile<*mut f32, { [1, 1] }> = base.reshape(shape![1, 1]);
+            let base: PointerTile<*mut f32, { [256, 2] }> = base.broadcast(shape![256, 2]);
+            let ptrs: PointerTile<*mut f32, { [256, 2] }> = base.offset_tile(ac);
+            let _t: Token = unsafe {
+                store_ptr_tko(
+                    ptrs,
+                    va,
+                    ordering::Weak,
+                    None::<scope::TileBlock>,
+                    Some(mc),
+                    Some(tb),
+                    Latency::<0>,
+                )
+            };
+        }
+        unsafe { store_pair(part, acc0, acc1) };
+    }
+
+    /// `ptyrs_kernels::cg_sum_parts`: `out[0 .. 2]` = the sum of the `npart` pairs of
+    /// `part`, lane `t` adding pairs `t, t + 256, ..` in order, then `block_sum`. One
+    /// program.
+    #[cutile::entry()]
+    unsafe fn cg_sum_parts(part: *const f32, npart: i32, out: *mut f32) {
+        let lane: Tile<i32, { [256] }> = iota(shape![256]);
+        let n_t: Tile<i32, { [256] }> = broadcast_scalar(npart, shape![256]);
+        let mut acc0: Tile<f32, { [256] }> = constant(0.0f32, shape![256]);
+        let mut acc1: Tile<f32, { [256] }> = constant(0.0f32, shape![256]);
+        for k in 0i32..ceil_div(npart, 256i32) {
+            let at: Tile<i32, { [256] }> = lane + broadcast_scalar(256i32 * k, shape![256]);
+            let inside: Tile<bool, { [256] }> = lt_tile(at, n_t);
+            let (ac, mc): (Tile<i32, { [256, 2] }>, Tile<bool, { [256, 2] }>) = c_at(at, inside);
+            let (v, _t): (Tile<f32, { [256, 2] }>, Token) = unsafe { load_c(part, ac, mc) };
+            let (v0, v1): (Tile<f32, { [256] }>, Tile<f32, { [256] }>) = re_im(v);
+            acc0 = select(inside, acc0 + v0, acc0);
+            acc1 = select(inside, acc1 + v1, acc1);
+        }
+        unsafe { store_pair(out, acc0, acc1) };
+    }
+
+    /// `ptyrs_kernels::cg_norm_parts`: adds program `b`'s `(sum |x|, sum |x|^2)` over its
+    /// SIMT block's grid-stride elements of `x` (`n` complex) to `part[2 b ..][.. 2]`, with
+    /// `|x|^2 = fma(re, re, im im)` as the SIMT build contracts it and an IEEE square root.
+    #[cutile::entry()]
+    unsafe fn cg_norm_parts(x: *const f32, n: i32, part: *mut f32) {
+        let pid: (i32, i32, i32) = get_tile_block_id();
+        let (at0, stride, steps): (Tile<i32, { [256] }>, i32, i32) = dot_lanes(n);
+        let n_t: Tile<i32, { [256] }> = broadcast_scalar(n, shape![256]);
+        let mut acc0: Tile<f32, { [256] }> = constant(0.0f32, shape![256]);
+        let mut acc1: Tile<f32, { [256] }> = constant(0.0f32, shape![256]);
+        for k in 0i32..steps {
+            let at: Tile<i32, { [256] }> = at0 + broadcast_scalar(k * stride, shape![256]);
+            let inside: Tile<bool, { [256] }> = lt_tile(at, n_t);
+            let (ac, mc): (Tile<i32, { [256, 2] }>, Tile<bool, { [256, 2] }>) = c_at(at, inside);
+            let (v, _t): (Tile<f32, { [256, 2] }>, Token) = unsafe { load_c(x, ac, mc) };
+            let (re, im): (Tile<f32, { [256] }>, Tile<f32, { [256] }>) = re_im(v);
+            let im2: Tile<f32, { [256] }> = mulf(im, im, rounding::NearestEven, ftz::Disabled);
+            let s: Tile<f32, { [256] }> = fma(re, re, im2, rounding::NearestEven, ftz::Disabled);
+            let r: Tile<f32, { [256] }> = sqrt(s, rounding::NearestEven, ftz::Disabled);
+            acc0 = select(inside, acc0 + r, acc0);
+            acc1 = select(inside, acc1 + s, acc1);
+        }
+        let i0: i32 = 2i32 * pid.0;
+        let p0: f32 = unsafe { load_f32(cast_const(part), i0) };
+        let p1: f32 = unsafe { load_f32(cast_const(part), i0 + 1i32) };
+        let s0: Tile<f32, { [1] }> = block_sum(acc0) + broadcast_scalar(p0, shape![1]);
+        let s1: Tile<f32, { [1] }> = block_sum(acc1) + broadcast_scalar(p1, shape![1]);
+        unsafe { store_1(part, i0, s0) };
+        unsafe { store_1(part, i0 + 1i32, s1) };
+    }
+
+    /// `ptyrs_kernels::bh_dots`: program `b`'s pair `(scale sum |g|^2, sum Re(conj(g)
+    /// prev))` over its SIMT block's grid-stride elements (`n` complex) into `part[2 b
+    /// ..][.. 2]`, the second sum only if `cg != 0` (else `0`, and `prev` is not read).
+    /// Each lane accumulates as the SIMT build contracts it, `acc = fma(x0, y0, fma(x1, y1,
+    /// acc))`, and is scaled before the tree.
+    #[cutile::entry()]
+    unsafe fn bh_dots(
+        g: *const f32,
+        prev: *const f32,
+        n: i32,
+        scale: f32,
+        cg: i32,
+        part: *mut f32,
+    ) {
+        let (at0, stride, steps): (Tile<i32, { [256] }>, i32, i32) = dot_lanes(n);
+        let n_t: Tile<i32, { [256] }> = broadcast_scalar(n, shape![256]);
+        let cg_i: Tile<i32, { [256] }> = broadcast_scalar(cg, shape![256]);
+        let zero_i: Tile<i32, { [256] }> = constant(0i32, shape![256]);
+        let cg_t: Tile<bool, { [256] }> = ne_tile(cg_i, zero_i);
+        let mut acc0: Tile<f32, { [256] }> = constant(0.0f32, shape![256]);
+        let mut acc1: Tile<f32, { [256] }> = constant(0.0f32, shape![256]);
+        for k in 0i32..steps {
+            let at: Tile<i32, { [256] }> = at0 + broadcast_scalar(k * stride, shape![256]);
+            let inside: Tile<bool, { [256] }> = lt_tile(at, n_t);
+            let both: Tile<bool, { [256] }> = inside & cg_t;
+            let (ac, mc): (Tile<i32, { [256, 2] }>, Tile<bool, { [256, 2] }>) = c_at(at, inside);
+            let (_ab, mb): (Tile<i32, { [256, 2] }>, Tile<bool, { [256, 2] }>) = c_at(at, both);
+            let (va, _ta): (Tile<f32, { [256, 2] }>, Token) = unsafe { load_c(g, ac, mc) };
+            let (vb, _tb): (Tile<f32, { [256, 2] }>, Token) = unsafe { load_c(prev, ac, mb) };
+            let (a0, a1): (Tile<f32, { [256] }>, Tile<f32, { [256] }>) = re_im(va);
+            let (b0, b1): (Tile<f32, { [256] }>, Tile<f32, { [256] }>) = re_im(vb);
+            let s0: Tile<f32, { [256] }> = fma(a1, a1, acc0, rounding::NearestEven, ftz::Disabled);
+            let s0: Tile<f32, { [256] }> = fma(a0, a0, s0, rounding::NearestEven, ftz::Disabled);
+            let s1: Tile<f32, { [256] }> = fma(a1, b1, acc1, rounding::NearestEven, ftz::Disabled);
+            let s1: Tile<f32, { [256] }> = fma(a0, b0, s1, rounding::NearestEven, ftz::Disabled);
+            acc0 = select(inside, s0, acc0);
+            acc1 = select(both, s1, acc1);
+        }
+        let sc: Tile<f32, { [256] }> = broadcast_scalar(scale, shape![256]);
+        let acc0: Tile<f32, { [256] }> = mulf(acc0, sc, rounding::NearestEven, ftz::Disabled);
+        unsafe { store_pair(part, acc0, acc1) };
+    }
 }
 
 fn shape(what: String) -> Error {
@@ -1482,4 +1743,229 @@ impl TileProbeUpdate {
         }
         Ok(())
     }
+}
+
+/// The Tile versions of the CG and BH dot products over a scan of one [`ViewDims`]:
+/// [`ptyrs_gpu::GradKernels`]' `beta_parts`, `norm_parts` and `sum_parts` and
+/// [`ptyrs_gpu::BhKernels::dots`], in their block order and float order, so their sums are
+/// bit-identical. [`Self::new`] compiles each for the lengths a scan's calls take, the
+/// object's and the probe's `n` and the `npart`s `CG_BLOCKS`, `2 CG_BLOCKS` and
+/// [`gamma_parts`]; a launch of another length is refused rather than compiled.
+pub struct TileDots {
+    /// Complex values of the object and of the probe.
+    lens: [i32; 2],
+    /// The `npart`s of [`Self::sum_parts`].
+    nparts: [i32; 3],
+}
+
+/// Elements a dot product's `CG_BLOCKS` programs of 256 lanes visit per grid stride.
+const DOT_STRIDE: usize = 256 * CG_BLOCKS as usize;
+
+impl TileDots {
+    /// Checks the lengths against the kernels' `i32` offsets, which reach `2 (n + stride)`
+    /// floats, and compiles every kernel on `stream` for a scan of `dims`, without launching
+    /// any.
+    pub fn new(stream: &Arc<CudaStream>, dims: &ViewDims) -> Result<Self, Error> {
+        let probe_len = dims.nprobe as usize * dims.frame[0] as usize * dims.frame[1] as usize;
+        let mut lens = [0; 2];
+        for (l, (what, n)) in lens.iter_mut().zip([
+            ("object length", obj_len(dims)),
+            ("probe length", probe_len),
+        ]) {
+            offset(what, 2 * (n + DOT_STRIDE))?;
+            *l = n as i32;
+        }
+        let gamma = gamma_parts(dims)? as usize;
+        offset("line-search pairs", 2 * (gamma + 256))?;
+        let c = CG_BLOCKS as i32;
+        let t = Self {
+            lens,
+            nparts: [c, 2 * c, gamma as i32],
+        };
+        let run = Run::Compile(stream);
+        for n in lens {
+            t.beta_run(run, [UNBOUND; 3], n)?;
+            t.norm_run(run, [UNBOUND; 2], n)?;
+            for cg in [false, true] {
+                t.dots_run(run, [UNBOUND; 3], n, 1.0, cg)?;
+            }
+        }
+        for npart in t.nparts {
+            t.sum_run(run, [UNBOUND; 2], npart)?;
+        }
+        Ok(t)
+    }
+
+    /// `n` as compiled: one of the object's and the probe's lengths.
+    fn len(&self, n: u32) -> Result<i32, Error> {
+        self.lens
+            .into_iter()
+            .find(|&l| l as u32 == n)
+            .ok_or_else(|| shape(format!("no Tile dot product compiled for {n} values")))
+    }
+
+    /// [`ptyrs_gpu::GradKernels::beta_parts`]: one array's Polak–Ribière partial sums `(sum
+    /// Re(conj(g) (g - h)), sum |h|^2)` over its first `n` values into the `CG_BLOCKS` pairs
+    /// of `parts` from pair `first`, then `h = g`.
+    pub fn beta_parts(
+        &self,
+        ctx: &ExecutionContext,
+        g: &DeviceBuffer<C32>,
+        h: &mut DeviceBuffer<C32>,
+        n: u32,
+        parts: &mut DeviceBuffer<f32>,
+        first: u32,
+    ) -> Result<(), Error> {
+        let n = self.len(n)?;
+        check_len("g", g, n as usize)?;
+        check_len("h", h, n as usize)?;
+        check_len("parts", parts, 2 * (first as usize + CG_BLOCKS as usize))?;
+        let at = [
+            addr("g", g)?,
+            addr("h", h)?,
+            pairs_at(parts, first as usize)?,
+        ];
+        lease(ctx, &[g.storage()], &[h.storage(), parts.storage()])?;
+        self.beta_run(Run::Launch(ctx), at, n)
+    }
+
+    /// [`ptyrs_gpu::GradKernels::norm_parts`]: adds `(sum |x|, sum |x|^2)` over the first `n`
+    /// values of `x` to the first `CG_BLOCKS` pairs of `parts`.
+    pub fn norm_parts(
+        &self,
+        ctx: &ExecutionContext,
+        x: &DeviceBuffer<C32>,
+        n: u32,
+        parts: &mut DeviceBuffer<f32>,
+    ) -> Result<(), Error> {
+        let n = self.len(n)?;
+        check_len("x", x, n as usize)?;
+        check_len("parts", parts, 2 * CG_BLOCKS as usize)?;
+        let at = [addr("x", x)?, addr("parts", parts)?];
+        lease(ctx, &[x.storage()], &[parts.storage()])?;
+        self.norm_run(Run::Launch(ctx), at, n)
+    }
+
+    /// [`ptyrs_gpu::GradKernels::sum_parts`]: `pair = sum` of the first `npart` pairs of
+    /// `parts`, in a fixed order.
+    pub fn sum_parts(
+        &self,
+        ctx: &ExecutionContext,
+        parts: &DeviceBuffer<f32>,
+        npart: u32,
+        pair: &mut DeviceBuffer<f32>,
+    ) -> Result<(), Error> {
+        let npart = self
+            .nparts
+            .into_iter()
+            .find(|&p| p as u32 == npart)
+            .ok_or_else(|| shape(format!("no Tile sum compiled for {npart} pairs")))?;
+        check_len("parts", parts, 2 * npart as usize)?;
+        check_len("pair", pair, 2)?;
+        let at = [addr("parts", parts)?, addr("pair", pair)?];
+        lease(ctx, &[parts.storage()], &[pair.storage()])?;
+        self.sum_run(Run::Launch(ctx), at, npart)
+    }
+
+    /// [`ptyrs_gpu::BhKernels::dots`]: the dot products of the step along `d`, `⟨u, Pu⟩` and
+    /// (CG) `⟨u, v⟩`, as block partials into the first `2 CG_BLOCKS` pairs of `parts`, object
+    /// then probe.
+    pub fn dots(
+        &self,
+        ctx: &ExecutionContext,
+        d: &BhDisp<'_>,
+        parts: &mut DeviceBuffer<f32>,
+    ) -> Result<(), Error> {
+        check_len("parts", parts, 4 * CG_BLOCKS as usize)?;
+        for (i, n) in self.lens.into_iter().enumerate() {
+            let (g, prev) = (d.u[i], d.v.map(|v| v[i]));
+            check_len("u", g, n as usize)?;
+            if let Some(v) = prev {
+                check_len("v", v, n as usize)?;
+            }
+            // Without `v`, `u` stands in for it, unread, as in the SIMT launch.
+            let at = [
+                addr("u", g)?,
+                addr("v", prev.unwrap_or(g))?,
+                pairs_at(parts, i * CG_BLOCKS as usize)?,
+            ];
+            let reads: Vec<_> = [Some(g), prev]
+                .into_iter()
+                .flatten()
+                .map(|b| b.storage())
+                .collect();
+            lease(ctx, &reads, &[parts.storage()])?;
+            let scale = if i == 0 { 1.0 } else { d.u_scale };
+            self.dots_run(Run::Launch(ctx), at, n, scale, prev.is_some())?;
+        }
+        Ok(())
+    }
+
+    fn beta_run(&self, run: Run, [g, h, out]: [CUdeviceptr; 3], n: i32) -> Result<(), Error> {
+        // SAFETY: a launch comes from `beta_parts`, which checked that `g` and `h` hold `n`
+        // complex values and `out` `CG_BLOCKS` pairs, and leased them on `ctx`.
+        unsafe {
+            run!(
+                run,
+                device::cg_beta_parts(ptr(g), ptr(h), n, ptr(out)).grid((CG_BLOCKS, 1, 1))
+            );
+        }
+        Ok(())
+    }
+
+    fn norm_run(&self, run: Run, [x, out]: [CUdeviceptr; 2], n: i32) -> Result<(), Error> {
+        // SAFETY: a launch comes from `norm_parts`, which checked that `x` holds `n` complex
+        // values and `out` `CG_BLOCKS` pairs, and leased them on `ctx`.
+        unsafe {
+            run!(
+                run,
+                device::cg_norm_parts(ptr(x), n, ptr(out)).grid((CG_BLOCKS, 1, 1))
+            );
+        }
+        Ok(())
+    }
+
+    fn sum_run(&self, run: Run, [parts, out]: [CUdeviceptr; 2], npart: i32) -> Result<(), Error> {
+        // SAFETY: a launch comes from `sum_parts`, which checked that `parts` holds `npart`
+        // pairs and `out` one, and leased them on `ctx`.
+        unsafe {
+            run!(
+                run,
+                device::cg_sum_parts(ptr(parts), npart, ptr(out)).grid((1, 1, 1))
+            );
+        }
+        Ok(())
+    }
+
+    fn dots_run(
+        &self,
+        run: Run,
+        [g, prev, out]: [CUdeviceptr; 3],
+        n: i32,
+        scale: f32,
+        cg: bool,
+    ) -> Result<(), Error> {
+        // SAFETY: a launch comes from `dots`, which checked that `g` holds `n` complex values,
+        // `prev` too when `cg`, and `out` `CG_BLOCKS` pairs, and leased them on `ctx`.
+        unsafe {
+            run!(
+                run,
+                device::bh_dots(ptr(g), ptr(prev), n, scale, i32::from(cg), ptr(out))
+                    .grid((CG_BLOCKS, 1, 1))
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Address of pair `first` of `parts`, which must be 16-byte aligned like every address
+/// [`addr`] accepts.
+fn pairs_at(parts: &DeviceBuffer<f32>, first: usize) -> Result<CUdeviceptr, Error> {
+    let a = addr("parts", parts)? + 8 * first as CUdeviceptr;
+    if !a.is_multiple_of(16) {
+        return Err(shape(format!(
+            "pair {first} of parts is not 16-byte aligned"
+        )));
+    }
+    Ok(a)
 }
