@@ -23,7 +23,7 @@ use ptyrs_gpu::{C32, ViewAddr};
 
 use crate::converge::{Clock, ClockError};
 use crate::grow::GrowError;
-use crate::object::Snapshot;
+use crate::object::{Snapshot, sleeping_event};
 use crate::recon::{ApConfig, LiveAp, ViewPlacement};
 use crate::ring::{DeviceStore, FrameBatch};
 use crate::stats::wall_ns;
@@ -111,10 +111,7 @@ pub fn run_ap_consumer(
     let counts = unsafe { store.frames_view()? };
     let mut live = LiveAp::new(&stream, &cfg.ap, &cfg.probe, counts)?;
     let mut snaps = [live.new_snapshot()?, live.new_snapshot()?];
-    let fence = [
-        ctx.new_event_with_flags(None)?,
-        ctx.new_event_with_flags(None)?,
-    ];
+    let fence = [sleeping_event(&ctx)?, sleeping_event(&ctx)?];
     let _ = captured.send(());
 
     let mut positions: Vec<(f64, f64)> = Vec::with_capacity(shape.nframe as usize);

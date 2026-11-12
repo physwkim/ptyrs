@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use cuda_async::device_operation::ExecutionContext;
 use cuda_bindings::{self as sys, CUdeviceptr};
-use cuda_core::{DeviceBuffer, DriverError, Event, IntoResult, PinnedHostBuffer, Stream};
+use cuda_core::{Context, DeviceBuffer, DriverError, Event, IntoResult, PinnedHostBuffer, Stream};
 use ptyrs_gpu::{C32, OBJ_TILE};
 
 use crate::grow::{GrowBuf, GrowError};
@@ -283,6 +283,16 @@ impl Drop for LiveObject {
     }
 }
 
+/// An event whose synchronize sleeps the waiting thread. With more CPUs
+/// than contexts the driver otherwise spins it, and the live consumer waits
+/// on the CPUs the receive runtime runs on.
+pub(crate) fn sleeping_event(ctx: &Arc<Context>) -> Result<Event, DriverError> {
+    ctx.new_event_with_flags(Some(
+        sys::CUevent_flags_enum_CU_EVENT_BLOCKING_SYNC
+            | sys::CUevent_flags_enum_CU_EVENT_DISABLE_TIMING,
+    ))
+}
+
 /// A host copy of a [`LiveObject`], filled by [`LiveObject::snapshot`] and
 /// read only through [`wait`](Self::wait); dropping it also waits, so a
 /// queued copy never writes freed memory.
@@ -302,7 +312,7 @@ impl Snapshot {
         let [nyo, nxo] = o.shape;
         Ok(Self {
             buf: PinnedHostBuffer::zeroed(ctx, o.nobj * nyo * nxo)?,
-            done: ctx.new_event_with_flags(None)?,
+            done: sleeping_event(ctx)?,
             copied: Vec::new(),
             fill: o.fill,
             nobj: o.nobj,
