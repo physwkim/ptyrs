@@ -62,10 +62,6 @@ pub struct GpuOptions {
     /// [`ptyrs_gpu::FUSED_SIDES`], and [`GpuPtycho::new`] fails on others) instead of M1's
     /// launch sequence. The two agree to rounding, not bit for bit.
     pub fused: bool,
-    /// The CG and BH dot products run by `ptyrs-tile`'s Tile kernels
-    /// ([`ptyrs_tile::TileDots`], compiled in [`GpuPtycho::new`] when any is on) instead of
-    /// the SIMT ones; both give the same bits.
-    pub tile_dots: TileDotsOn,
 }
 
 impl Default for GpuOptions {
@@ -75,35 +71,8 @@ impl Default for GpuOptions {
             graph: true,
             llk_slots: 8,
             fused: true,
-            tile_dots: TileDotsOn::SIMT,
         }
     }
-}
-
-/// Which dot products [`GpuOptions::tile_dots`] runs by Tile kernels.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TileDotsOn {
-    /// ML's Polak–Ribière partials (`cg_beta_parts`), once per array per cycle.
-    pub beta: bool,
-    /// `ScaleObjProbe`'s norms (`cg_norm_parts`): ML's start and DM's balance after an LLK.
-    pub norm: bool,
-    /// BH's `|u|²` and `<u, v>` partials (`bh_dots`), once per batch.
-    pub bh: bool,
-}
-
-impl TileDotsOn {
-    /// Every dot product by SIMT kernels.
-    pub const SIMT: Self = Self {
-        beta: false,
-        norm: false,
-        bh: false,
-    };
-    /// Every dot product by Tile kernels.
-    pub const TILE: Self = Self {
-        beta: true,
-        norm: true,
-        bh: true,
-    };
 }
 
 /// A cycle with its parameters, which cover every value its launches bake in: the key of a
@@ -642,10 +611,7 @@ impl Bufs<'_> {
             (&*self.probe, self.probe_len, &mut *probe_norm),
         ] {
             ptyrs_gpu::zero(ctx, parts)?;
-            match self.tile_norm {
-                Some(t) => t.norm_parts(ctx, x, n, parts)?,
-                None => self.grad.norm_parts(ctx, x, n, parts)?,
-            }
+            self.grad.norm_parts(ctx, x, n, parts)?;
             self.grad.sum_parts(ctx, parts, CG_BLOCKS, out)?;
         }
         let norms = [&*obj_norm, &*probe_norm];

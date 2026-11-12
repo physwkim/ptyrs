@@ -102,10 +102,7 @@ impl Bufs<'_> {
             u_scale: rho2,
             v: cg.then_some([&bh.prev[0], &bh.prev[1]]),
         };
-        match self.tile_bh {
-            Some(t) => t.dots(ctx, &d, bh.parts)?,
-            None => self.bh.dots(ctx, &dims, &d, bh.parts)?,
-        }
+        self.bh.dots(ctx, &dims, &d, bh.parts)?;
         for (k, s) in batch.clone().enumerate() {
             let stack = bh.table.at(s);
             let plan = bh.plans.get(bh.stacks[s].plan);
