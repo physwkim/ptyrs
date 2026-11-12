@@ -3,7 +3,7 @@
 use cuda_async::device_operation::ExecutionContext;
 use ptyrs_gpu::Error as GpuError;
 
-use super::GpuPtycho;
+use super::{Epoch, GpuPtycho};
 use crate::ptycho::{Algorithm, llk_due};
 use crate::{ApParams, EngineError};
 
@@ -13,11 +13,12 @@ impl GpuPtycho {
     /// last stack, both updates from the sums, which read only the old arrays.
     pub fn ap(&mut self, params: &ApParams, ncycle: usize) -> Result<(), EngineError> {
         for ic in 0..ncycle {
-            let due = llk_due(params.calc_llk, ic, ncycle);
-            self.ap_cycle(&self.context(), params, due)?;
-            if due {
+            if llk_due(params.calc_llk, ic, ncycle) {
+                self.ap_cycle(&self.context(), params, true)?;
                 let l = self.read_llk()?;
                 self.record(Algorithm::Ap, l);
+            } else {
+                self.steady_cycle(Epoch::Ap(*params))?;
             }
             self.cycle += 1;
         }
@@ -28,7 +29,7 @@ impl GpuPtycho {
     }
 
     /// One AP cycle enqueued on `ctx`; with `llk`, every stack's LLK partials too.
-    fn ap_cycle(
+    pub(super) fn ap_cycle(
         &mut self,
         ctx: &ExecutionContext,
         params: &ApParams,

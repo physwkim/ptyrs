@@ -3,7 +3,7 @@
 use cuda_async::device_operation::ExecutionContext;
 use ptyrs_gpu::Error as GpuError;
 
-use super::GpuPtycho;
+use super::{Epoch, GpuPtycho};
 use crate::ptycho::{Algorithm, llk_due};
 use crate::{DmParams, EngineError};
 
@@ -15,7 +15,11 @@ impl GpuPtycho {
     /// updates, the probe one from the new object.
     pub fn dm(&mut self, params: &DmParams, ncycle: usize) -> Result<(), EngineError> {
         for ic in 0..ncycle {
-            self.dm_cycle(&self.context(), params, ic == 0)?;
+            if ic == 0 {
+                self.dm_cycle(&self.context(), params, true)?;
+            } else {
+                self.steady_cycle(Epoch::Dm(*params))?;
+            }
             if llk_due(params.calc_llk, ic, ncycle) {
                 let l = self.llk()?;
                 self.record(Algorithm::Dm, l);
@@ -29,7 +33,7 @@ impl GpuPtycho {
     }
 
     /// One DM cycle enqueued on `ctx`; `first` for cycle 0 of a call.
-    fn dm_cycle(
+    pub(super) fn dm_cycle(
         &mut self,
         ctx: &ExecutionContext,
         params: &DmParams,

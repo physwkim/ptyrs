@@ -13,7 +13,10 @@ mod common;
 
 /// 30 positions: stacks of 7 and batches of 4 both leave a shorter last one.
 const NPOS: usize = 30;
-const STACK: GpuOptions = GpuOptions { stack_size: 7 };
+const STACK: GpuOptions = GpuOptions {
+    stack_size: 7,
+    graph: true,
+};
 
 fn ctx() -> Arc<CudaContext> {
     CudaContext::new(0).expect("CUDA device 0")
@@ -165,6 +168,58 @@ fn gpu_rejects_what_it_cannot_run() {
     ));
     let mut g = GpuPtycho::new(&ctx(), &scan, two, probe.clone(), STACK).unwrap();
     assert!(g.rpie(&common::RPIE, 1).is_err());
-    let zero = GpuOptions { stack_size: 0 };
+    let zero = GpuOptions {
+        stack_size: 0,
+        ..STACK
+    };
     assert!(GpuPtycho::new(&ctx(), &scan, object, probe, zero).is_err());
+}
+
+/// Steady-state AP and DM cycles replayed from captured graphs give the eager bits: the
+/// object, the probe and every LLK record, across the parameter and algorithm switches that
+/// make a new capture and a call that reuses the last one, with a short last stack.
+#[test]
+fn graph_replays_bitwise_like_eager() {
+    let (scan, object, probe) = start(2, true);
+    let run = |graph: bool| {
+        let options = GpuOptions { graph, ..STACK };
+        let mut g = GpuPtycho::new(&ctx(), &scan, object.clone(), probe.clone(), options).unwrap();
+        let dm = DmParams {
+            calc_llk: 3,
+            zero_phase_ramp: false,
+            ..DmParams::default()
+        };
+        let ap = ApParams {
+            obj_inertia: Some(0.01),
+            probe_inertia: Some(0.001),
+            calc_llk: 3,
+            zero_phase_ramp: false,
+        };
+        // new capture, new parameters, new algorithm, the same graph in a second call
+        g.dm(&dm, 7).unwrap();
+        g.dm(&DmParams { alpha: 0.1, ..dm }, 4).unwrap();
+        g.ap(&ap, 7).unwrap();
+        g.ap(&ap, 4).unwrap();
+        let bits = |s: &Stack<C64>| -> Vec<[u64; 2]> {
+            s.as_slice()
+                .iter()
+                .map(|v| [v.re.to_bits(), v.im.to_bits()])
+                .collect()
+        };
+        let llk: Vec<_> = g
+            .history()
+            .iter()
+            .map(|r| {
+                let l = r.llk;
+                let v = [l.poisson, l.gaussian, l.euclidian, l.nb_photons_calc];
+                (r.cycle, r.algorithm, v.map(f64::to_bits))
+            })
+            .collect();
+        (bits(&g.object().unwrap()), bits(&g.probe().unwrap()), llk)
+    };
+    let (eager, graph) = (run(false), run(true));
+    assert_eq!(eager.2.len(), 3 + 3 + 2 + 2);
+    assert!(eager.2 == graph.2, "LLK records differ");
+    assert!(eager.0 == graph.0, "object differs");
+    assert!(eager.1 == graph.1, "probe differs");
 }

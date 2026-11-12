@@ -9,7 +9,9 @@
 //! all, and stacks of one length share a cuFFT plan, which transforms only their frames.
 //! Each cycle enqueues through its own `ExecutionContext`, dropped when the cycle has been
 //! enqueued. Within a cycle nothing reads back to the host: LLK partials are downloaded only
-//! in the cycles that record one, and the arrays only when asked for. Each algorithm is its
+//! in the cycles that record one, and the arrays only when asked for. An AP or DM cycle that
+//! records no LLK in-cycle replays one captured CUDA graph (DESIGN B2, [`GpuOptions::graph`]),
+//! kept until another algorithm or other parameters need a new one. Each algorithm is its
 //! own module over the per-stack steps here, so M2's fused passes can replace those steps one
 //! algorithm at a time.
 
@@ -21,7 +23,8 @@ use std::f64::consts::PI;
 use std::ops::Range;
 use std::sync::Arc;
 
-use cuda_async::device_operation::ExecutionContext;
+use cuda_async::cuda_graph::CudaGraph;
+use cuda_async::device_operation::{DeviceOp, ExecutionContext};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 use ptyrs_core::{AddrTable, C64, Object, Probe, Scan, Stack};
 use ptyrs_fft::Plan2d;
@@ -31,19 +34,40 @@ use ptyrs_gpu::{
 };
 
 use crate::ptycho::{Algorithm, LlkRecord, zero_phase_ramp};
-use crate::{EngineError, Fft2, Llk};
+use crate::{ApParams, DmParams, EngineError, Fft2, Llk};
 
 /// How [`GpuPtycho`] batches its work.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GpuOptions {
     /// Frames per stack (the last stack may be shorter); PyNX's default is 16.
     pub stack_size: usize,
+    /// Replay steady-state AP and DM cycles as one captured CUDA graph each instead of
+    /// launching them kernel by kernel; both give the same bits.
+    pub graph: bool,
 }
 
 impl Default for GpuOptions {
     fn default() -> Self {
-        Self { stack_size: 16 }
+        Self {
+            stack_size: 16,
+            graph: true,
+        }
     }
+}
+
+/// A steady-state cycle with its parameters, which cover every value its launches bake in:
+/// the key of a captured graph.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Epoch {
+    /// An AP cycle that takes no LLK.
+    Ap(ApParams),
+    /// A DM cycle after the first of a call.
+    Dm(DmParams),
+}
+
+struct EpochGraph {
+    epoch: Epoch,
+    graph: CudaGraph<()>,
 }
 
 /// One stack (or rPIE batch): the frames its table entry holds, for what the host needs of
@@ -191,6 +215,10 @@ pub struct GpuPtycho {
     nb_obs: usize,
     /// The probe-frame FFT of [`zero_phase_ramp`], which runs on the host.
     fft: Fft2,
+    use_graph: bool,
+    /// The last captured steady-state cycle. Its nodes hold the buffers above, which are
+    /// allocated once in [`GpuPtycho::new`] and never replaced.
+    graph: Option<EpochGraph>,
     cycle: usize,
     history: Vec<LlkRecord>,
 }
@@ -295,6 +323,8 @@ impl GpuPtycho {
             table,
             stacks,
             plans,
+            use_graph: options.graph,
+            graph: None,
             cycle: 0,
             history: Vec::new(),
         })
@@ -343,6 +373,38 @@ impl GpuPtycho {
     /// A fresh eager context on the stream: one per cycle, so leases end with its work.
     fn context(&self) -> ExecutionContext {
         ExecutionContext::new(self.stream.clone())
+    }
+
+    /// Enqueues one `epoch` cycle: replays its graph, captured (on a side stream, so nothing
+    /// runs) when the cached one is for another epoch, or launches it eagerly without graphs.
+    fn steady_cycle(&mut self, epoch: Epoch) -> Result<(), GpuError> {
+        if !self.use_graph {
+            return self.epoch_cycle(&self.context(), epoch);
+        }
+        let cached = match self.graph.take() {
+            Some(g) if g.epoch == epoch => g,
+            _ => {
+                let side = self.kernels.context().new_stream()?;
+                let op = ptyrs_gpu::record(|ctx| self.epoch_cycle(ctx, epoch));
+                EpochGraph {
+                    epoch,
+                    graph: CudaGraph::capture(side, op)?,
+                }
+            }
+        };
+        let ctx = self.context();
+        // SAFETY: `ctx` holds the replay's leases on every captured buffer until the stream
+        // has run it, so no other stream can touch them meanwhile.
+        let launched = unsafe { cached.graph.launch().execute(&ctx) };
+        self.graph = Some(cached);
+        Ok(launched?)
+    }
+
+    fn epoch_cycle(&mut self, ctx: &ExecutionContext, epoch: Epoch) -> Result<(), GpuError> {
+        match epoch {
+            Epoch::Ap(params) => self.ap_cycle(ctx, &params, false),
+            Epoch::Dm(params) => self.dm_cycle(ctx, &params, false),
+        }
     }
 
     fn record(&mut self, algorithm: Algorithm, llk: Llk) {
