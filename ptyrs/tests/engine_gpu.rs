@@ -1121,10 +1121,145 @@ fn position_matches_cpu() {
     );
 }
 
+/// Probe positions refined by 20 DM cycles from [`drawn_offsets`], as [`features_match_cpu`]
+/// checks them, with one and with two object-then-probe updates per cycle: the projection
+/// gives the first object update's sums, the carried waves every later update's. On the CPU
+/// the offsets' RMS falls.
+#[test]
+fn dm_position_matches_cpu() {
+    const NCYCLE: usize = 20;
+    let start = featured_start(2, false, false);
+    let d0 = drawn_offsets();
+    let moved = Features {
+        position: Some(d0.clone()),
+        ..Features::default()
+    };
+    // Measured llk 1.5e-6 and 1.2e-6, object 9.1e-6 and 1.7e-5, probe 6.7e-6 and 8.6e-6,
+    // offsets 5.4e-7 and 3.3e-7 pixels; rms offset 0.22 from 0.28 both.
+    for loop_obj_probe in [1, 2] {
+        let dm = Cycles::Dm(DmParams {
+            calc_llk: 1,
+            loop_obj_probe,
+            ..DmParams::default()
+        });
+        let (cpu, _) = features_match_cpu(dm, &start, &moved, NCYCLE);
+        let d = cpu.features().position.clone().unwrap();
+        println!(
+            "dm position, loop {loop_obj_probe}: rms offset {:.4} from {:.4}",
+            rms(&d),
+            rms(&d0),
+        );
+        assert!(
+            rms(&d) < rms(&d0),
+            "rms offset {} from {}",
+            rms(&d),
+            rms(&d0)
+        );
+    }
+}
+
+/// DM cycles modelling a position, two object-then-probe updates each, give the bits of
+/// stacks of 7 frames with stacks of 4 and with one stack of every frame: the object, the
+/// probe, the offsets and every LLK record.
+#[test]
+fn dm_position_is_bit_identical_across_stack_splits() {
+    let (scan, object, probe) = featured_start(2, false, false);
+    let moved = Features {
+        position: Some(drawn_offsets()),
+        ..Features::default()
+    };
+    let dm = DmParams {
+        calc_llk: 3,
+        loop_obj_probe: 2,
+        ..DmParams::default()
+    };
+    let run = |stack_size: usize| {
+        let options = GpuOptions {
+            stack_size,
+            ..FUSED.options
+        };
+        let mut g = GpuPtycho::new(&ctx(), &scan, object.clone(), probe.clone(), options).unwrap();
+        g.set_features(&moved).unwrap();
+        g.dm(&dm, 6).unwrap();
+        bit_state(&mut g)
+    };
+    let seven = run(7);
+    assert_eq!(seven.llk.len(), 3 + 1);
+    for stack_size in [4, NPOS] {
+        let other = run(stack_size);
+        assert!(
+            other.llk == seven.llk,
+            "stacks of {stack_size}: LLK records differ"
+        );
+        assert!(
+            other.object == seven.object,
+            "stacks of {stack_size}: object differs"
+        );
+        assert!(
+            other.probe == seven.probe,
+            "stacks of {stack_size}: probe differs"
+        );
+        assert!(
+            other.features == seven.features,
+            "stacks of {stack_size}: offsets differ"
+        );
+    }
+}
+
+/// The bits of a run's object and probe.
+fn bits(s: &Stack<C64>) -> Vec<[u64; 2]> {
+    s.as_slice()
+        .iter()
+        .map(|v| [v.re.to_bits(), v.im.to_bits()])
+        .collect()
+}
+
+/// The bits of an LLK record.
+fn llk_bits(l: Llk) -> [u64; 4] {
+    [l.poisson, l.gaussian, l.euclidian, l.nb_photons_calc].map(f64::to_bits)
+}
+
+/// The bits of a GPU run.
+#[derive(Debug, PartialEq)]
+struct RunBits {
+    object: Vec<[u64; 2]>,
+    probe: Vec<[u64; 2]>,
+    /// The scale, the background and the offsets.
+    features: [Option<Vec<u64>>; 3],
+    /// The LLK records, then the public LLK query's.
+    llk: Vec<(RecordTag, [u64; 4])>,
+}
+
+/// An LLK record's cycle and algorithm; `None` for a query.
+type RecordTag = Option<(usize, Algorithm)>;
+
+/// The bits of `g`'s state.
+fn bit_state(g: &mut GpuPtycho) -> RunBits {
+    let mut llk: Vec<_> = g
+        .history()
+        .iter()
+        .map(|r| (Some((r.cycle, r.algorithm)), llk_bits(r.llk)))
+        .collect();
+    llk.push((None, llk_bits(g.llk().unwrap())));
+    let features = g.features().unwrap();
+    let feature_bits =
+        |v: Option<Vec<f64>>| v.map(|v| v.into_iter().map(f64::to_bits).collect::<Vec<_>>());
+    RunBits {
+        object: bits(&g.object().unwrap()),
+        probe: bits(&g.probe().unwrap()),
+        features: [
+            feature_bits(features.scale),
+            feature_bits(features.background),
+            feature_bits(features.position.map(|d| d.concat())),
+        ],
+        llk,
+    }
+}
+
 /// Features need the fused passes, one finite, positive scale per frame, one finite,
 /// non-negative background value per detector pixel and one finite offset pair per frame;
-/// rPIE and BH model none; the GPU's DM, ML and ML gradients refuse a position before they
-/// touch anything; a refused set leaves the features modelled.
+/// rPIE and BH model none; the GPU's ML and ML gradients refuse a position before they touch
+/// anything; a refused set leaves the features modelled.
 #[test]
 fn features_are_refused_where_they_cannot_run() {
     let (scan, object, probe) = start(M1.frame, 1, false);
@@ -1225,8 +1360,6 @@ fn features_are_refused_where_they_cannot_run() {
     assert!(cpu.rpie(&ptychi::RPIE, 1).is_err());
     assert!(cpu.ml(&MlParams::default(), 1).is_err());
     let (object, probe) = (gpu.object().unwrap(), gpu.probe().unwrap());
-    let err = gpu.dm(&DmParams::default(), 1).unwrap_err().to_string();
-    assert!(err.contains("positions"), "{err}");
     for err in [
         gpu.ml(&MlParams::default(), 1).unwrap_err(),
         gpu.ml_grads().unwrap_err(),
@@ -1241,43 +1374,14 @@ fn features_are_refused_where_they_cannot_run() {
     assert_eq!(gpu.cycle(), 0);
 }
 
-/// AP, DM and ML cycles modelling a scale and a background, then AP cycles also modelling a
-/// position, replay from graphs the eager bits: the object, the probe, every feature and every
+/// AP, DM and ML cycles modelling a scale and a background, then AP and DM cycles also
+/// modelling a position, replay from graphs the eager bits: the object, the probe, every feature and every
 /// LLK record, across features written in place between calls and the public LLK query.
 /// Dropping the features before any cycle gives a fresh start's bits.
 #[test]
 fn feature_graphs_replay_bitwise_like_eager() {
     let (scan, object, probe) = featured_start(2, true, true);
     let flat = flat_background(&scan);
-    let bits = |s: &Stack<C64>| -> Vec<[u64; 2]> {
-        s.as_slice()
-            .iter()
-            .map(|v| [v.re.to_bits(), v.im.to_bits()])
-            .collect()
-    };
-    let llk_bits =
-        |l: Llk| [l.poisson, l.gaussian, l.euclidian, l.nb_photons_calc].map(f64::to_bits);
-    let state = |g: &mut GpuPtycho| {
-        let mut llk: Vec<_> = g
-            .history()
-            .iter()
-            .map(|r| (Some((r.cycle, r.algorithm)), llk_bits(r.llk)))
-            .collect();
-        llk.push((None, llk_bits(g.llk().unwrap())));
-        let features = g.features().unwrap();
-        let feature_bits =
-            |v: Option<Vec<f64>>| v.map(|v| v.into_iter().map(f64::to_bits).collect::<Vec<_>>());
-        (
-            bits(&g.object().unwrap()),
-            bits(&g.probe().unwrap()),
-            [
-                feature_bits(features.scale),
-                feature_bits(features.background),
-                feature_bits(features.position.map(|d| d.concat())),
-            ],
-            llk,
-        )
-    };
     let new = |graph: bool| {
         let options = GpuOptions {
             graph,
@@ -1314,16 +1418,17 @@ fn feature_graphs_replay_bitwise_like_eager() {
         moved.position = Some(vec![[0.1, -0.1]; NPOS]);
         g.set_features(&moved).unwrap();
         ap.gpu(&mut g, 4);
-        let mut s = state(&mut g);
-        s.3.push((None, llk_bits(query)));
+        dm.gpu(&mut g, 4);
+        let mut s = bit_state(&mut g);
+        s.llk.push((None, llk_bits(query)));
         s
     };
     let (eager, graph) = (run(false), run(true));
-    assert_eq!(eager.3.len(), 2 + 2 + 2 + 2 + 2 + 2 + 2);
-    assert!(eager.3 == graph.3, "LLK records differ");
-    assert!(eager.0 == graph.0, "object differs");
-    assert!(eager.1 == graph.1, "probe differs");
-    assert!(eager.2 == graph.2, "features differ");
+    assert_eq!(eager.llk.len(), 2 + 2 + 2 + 2 + 2 + 2 + 2 + 2);
+    assert!(eager.llk == graph.llk, "LLK records differ");
+    assert!(eager.object == graph.object, "object differs");
+    assert!(eager.probe == graph.probe, "probe differs");
+    assert!(eager.features == graph.features, "features differ");
 
     let [ap, ..] = feature_cycles(3);
     let mut fresh = new(true);
@@ -1337,8 +1442,8 @@ fn feature_graphs_replay_bitwise_like_eager() {
         .unwrap();
     dropped.set_features(&Features::default()).unwrap();
     ap.gpu(&mut dropped, 4);
-    let (fresh, dropped) = (state(&mut fresh), state(&mut dropped));
-    assert!(dropped.2 == [None, None, None]);
+    let (fresh, dropped) = (bit_state(&mut fresh), bit_state(&mut dropped));
+    assert!(dropped.features == [None, None, None]);
     assert!(
         fresh == dropped,
         "dropping the features differs from a fresh start"
