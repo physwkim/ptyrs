@@ -1249,8 +1249,9 @@ macro_rules! run {
 /// sizes and a table's `nf_max`), compiled when the set is built. cutile compiles a kernel
 /// once per specialization, keyed by the power-of-two divisor of each integer argument and
 /// the alignment of each pointer. Every integer here comes from the geometry, which a launch
-/// checks its stack against, the scan's buffers are the set's, a stack entry is aligned to
-/// 16 or 8 bytes ([`ctl`]) and every other buffer must be 16-byte aligned; so [`Self::new`]
+/// checks its stack against, the scan's buffers are the set's, a stack entry (`8 s` bytes
+/// into its table) is aligned to 16 or 8 bytes and every other buffer must be 16-byte
+/// aligned; so [`Self::new`]
 /// compiles every specialization a launch can reach, and no launch, eager or captured,
 /// compiles.
 pub struct TileKernels<'a> {
