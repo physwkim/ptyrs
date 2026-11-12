@@ -34,8 +34,8 @@ use ptyrs_kernels::kernels::LoadedModule;
 mod ops;
 
 pub use ops::{
-    LlkPartial, LlkSums, MASKED, OBJ_TILE, StackCtl, StackRef, StackTable, UpdateSums, ViewAddr,
-    ViewDims, Views, view_tiles,
+    LlkPartial, LlkSums, MASKED, OBJ_TILE, StackCtl, StackGeom, StackRef, StackTable, UpdateSums,
+    ViewAddr, ViewDims, Views, view_tiles,
 };
 pub use ptyrs_fft::C32;
 

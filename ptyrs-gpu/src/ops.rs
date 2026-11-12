@@ -49,10 +49,8 @@ use std::ops::Range;
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::sys::CUdeviceptr;
 use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig, RawDeviceBuffer};
-pub use ptyrs_kernels::pixel::{LlkPartial, MASKED, OBJ_TILE, StackCtl, ViewAddr};
-use ptyrs_kernels::pixel::{
-    PIXEL_THREADS, StackGeom, SumPtrs, TilePtrs, TileSlabs, WARP, axis_tiles,
-};
+pub use ptyrs_kernels::pixel::{LlkPartial, MASKED, OBJ_TILE, StackCtl, StackGeom, ViewAddr};
+use ptyrs_kernels::pixel::{PIXEL_THREADS, SumPtrs, TilePtrs, TileSlabs, WARP, axis_tiles};
 
 use crate::{C32, Error, Kernels, check_len, dptr};
 
@@ -144,8 +142,8 @@ impl ViewDims {
     }
 
     /// The stack kernels' geometry for `stack`, whose table must have been made for a scan
-    /// of `nframe` frames.
-    fn geom(&self, stack: StackRef<'_>) -> Result<StackGeom, Error> {
+    /// of `nframe` frames: the [`StackGeom`] a stack kernel takes by value.
+    pub fn geom(&self, stack: StackRef<'_>) -> Result<StackGeom, Error> {
         self.check()?;
         let t = stack.table;
         if t.nframe != self.nframe {
@@ -266,11 +264,13 @@ impl StackRef<'_> {
         self.table.nf_max
     }
 
-    fn ctl(&self) -> *const StackCtl {
-        (self.table.ptr() + (self.s * size_of::<StackCtl>()) as CUdeviceptr) as *const StackCtl
+    /// Device address of this entry's [`StackCtl`], a stack kernel's `ctl` argument.
+    pub fn ctl(&self) -> CUdeviceptr {
+        self.table.ptr() + (self.s * size_of::<StackCtl>()) as CUdeviceptr
     }
 
-    fn storage(&self) -> &RawDeviceBuffer {
+    /// The whole table's storage, for leasing a read of the entry around a launch.
+    pub fn storage(&self) -> &RawDeviceBuffer {
         self.table.ctl.storage()
     }
 }
@@ -509,7 +509,7 @@ impl Kernels {
                     dptr(probe),
                     dptr(&views.addr),
                     dptr(psi),
-                    stack.ctl(),
+                    stack.ctl() as *const StackCtl,
                     g,
                 )
             }
@@ -536,8 +536,14 @@ impl Kernels {
         self.launch(ctx, &reads, &[icalc.storage()], |stream| {
             // SAFETY: lengths checked above.
             unsafe {
-                self.module
-                    .mode_intensity(stream, config, dptr(psi), dptr(icalc), stack.ctl(), g)
+                self.module.mode_intensity(
+                    stream,
+                    config,
+                    dptr(psi),
+                    dptr(icalc),
+                    stack.ctl() as *const StackCtl,
+                    g,
+                )
             }
         })
     }
@@ -564,8 +570,14 @@ impl Kernels {
         self.launch(ctx, &reads, &[psi.storage()], |stream| {
             // SAFETY: lengths checked above.
             unsafe {
-                self.module
-                    .apply_amplitude(stream, config, dptr(psi), dptr(counts), stack.ctl(), g)
+                self.module.apply_amplitude(
+                    stream,
+                    config,
+                    dptr(psi),
+                    dptr(counts),
+                    stack.ctl() as *const StackCtl,
+                    g,
+                )
             }
         })
     }
@@ -605,7 +617,7 @@ impl Kernels {
                     dptr(psi),
                     dptr(counts),
                     dptr(out),
-                    stack.ctl(),
+                    stack.ctl() as *const StackCtl,
                     g,
                 )
             }
@@ -654,7 +666,7 @@ impl Kernels {
                     dptr(&views.addr),
                     slabs,
                     dptr(overflow),
-                    stack.ctl(),
+                    stack.ctl() as *const StackCtl,
                     g,
                 )
             }
@@ -703,7 +715,7 @@ impl Kernels {
                     dptr(&views.addr),
                     views.tile_ptrs(),
                     sums.ptrs(),
-                    stack.ctl(),
+                    stack.ctl() as *const StackCtl,
                     g,
                 )
             }
@@ -746,7 +758,7 @@ impl Kernels {
                     dptr(obj),
                     dptr(&views.addr),
                     sums.ptrs(),
-                    stack.ctl(),
+                    stack.ctl() as *const StackCtl,
                     g,
                 )
             }
