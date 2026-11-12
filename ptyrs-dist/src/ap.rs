@@ -10,13 +10,14 @@
 //!
 //! Per cycle, with [`Gpu::fence`] between the steps: A exit waves, LLK, projection and the
 //! leaf probe sums of the own stacks; B gather of foreign exit waves, object sums and their
-//! max, probe pair tree; C object and probe updates; D halo pull of the updated object.
+//! max, probe pair tree; C object and probe updates, then each owner packs the updated rows
+//! its neighbours read; D each receiver pulls them by copy engine and unpacks its halo.
 
 use std::ops::Range;
 use std::sync::Arc;
 
 use cuda_async::device_operation::ExecutionContext;
-use cuda_core::DeviceBuffer;
+use cuda_core::{Context, DeviceBuffer};
 use ptyrs_core::{AddrTable, View};
 use ptyrs_fft::Plan2d;
 use ptyrs_gpu::{
@@ -24,7 +25,7 @@ use ptyrs_gpu::{
     view_tiles,
 };
 
-use crate::exchange::{Run, Runs};
+use crate::exchange::{self, Pull, Run, Runs};
 use crate::{DEFAULT_TILE, DistError, Exchange, Gpu, Partition, Scheme, Workers};
 
 /// Leaf regions every run is cut from; a run uses 1, 2 or 4 GPUs.
@@ -79,6 +80,18 @@ struct RegionPlan {
     halo_read: Vec<u32>,
 }
 
+/// The object rows region `recv` reads from region `owner`'s tiles, `[byte offset, words]`
+/// each. `owner` packs them from word `send_at` of its send buffer on; `recv` pulls them to
+/// word `recv_at` of its receive buffer and unpacks them into its object.
+struct HaloSeg {
+    recv: usize,
+    owner: usize,
+    rows: Vec<[u64; 2]>,
+    words: u64,
+    send_at: u64,
+    recv_at: u64,
+}
+
 struct Plan {
     run: Partition,
     /// Leaves per region.
@@ -90,6 +103,8 @@ struct Plan {
     probe_inertia: Option<f32>,
     calc_llk: usize,
     regions: Vec<RegionPlan>,
+    /// By receiver, then owner.
+    halo: Vec<HaloSeg>,
 }
 
 impl Plan {
@@ -225,6 +240,7 @@ impl Plan {
                 leaf_stack0,
             });
         }
+        let halo = halo_segs(&run, &regions, dims.nobj as usize);
         Ok(Self {
             run,
             k,
@@ -234,6 +250,7 @@ impl Plan {
             probe_inertia: cfg.probe_inertia,
             calc_llk: cfg.calc_llk,
             regions,
+            halo,
         })
     }
 
@@ -282,16 +299,88 @@ impl Plan {
         runs
     }
 
-    /// Halo pull runs of region `r`: each pixel row of consecutive read halo tiles with one
-    /// owner, every object mode, from the owner's object.
-    fn halo(&self, r: usize, ptrs: &[Ptrs]) -> Vec<Run> {
-        let grid = self.run.grid();
-        let [nyo, nxo] = grid.obj();
-        let tile = grid.tile();
-        let owner = self.run.owner();
-        let read = &self.regions[r].halo_read;
-        let mut runs = Vec::new();
-        for m in 0..self.dims().nobj as usize {
+    /// Words of region `r`'s halo send and receive buffers.
+    fn halo_words(&self, r: usize) -> [u64; 2] {
+        let sum = |f: &dyn Fn(&HaloSeg) -> bool| -> u64 {
+            self.halo.iter().filter(|s| f(s)).map(|s| s.words).sum()
+        };
+        [sum(&|s| s.owner == r), sum(&|s| s.recv == r)]
+    }
+
+    /// `[object byte offset, buffer word, words]` of every row of the segments `pick` selects,
+    /// laid out in the buffer from word `at(segment)` on.
+    fn halo_rows(
+        &self,
+        pick: impl Fn(&HaloSeg) -> bool,
+        at: fn(&HaloSeg) -> u64,
+    ) -> impl Iterator<Item = [u64; 3]> {
+        self.halo
+            .iter()
+            .filter(move |s| pick(s))
+            .flat_map(move |s| {
+                let mut w = at(s);
+                s.rows.iter().map(move |&[off, len]| {
+                    w += len;
+                    [off, w - len, len]
+                })
+            })
+    }
+
+    /// Runs copying region `r`'s object rows that others read into its send buffer.
+    fn halo_pack(&self, r: usize, obj: u64, send: u64) -> Vec<Run> {
+        self.halo_rows(|s| s.owner == r, |s| s.send_at)
+            .map(|[off, w, len]| Run {
+                dst: send + w * 8,
+                src: obj + off,
+                len,
+            })
+            .collect()
+    }
+
+    /// Runs copying region `r`'s receive buffer into the halo rows of its object.
+    fn halo_unpack(&self, r: usize, obj: u64, recv: u64) -> Vec<Run> {
+        self.halo_rows(|s| s.recv == r, |s| s.recv_at)
+            .map(|[off, w, len]| Run {
+                dst: obj + off,
+                src: recv + w * 8,
+                len,
+            })
+            .collect()
+    }
+
+    /// Copy-engine pulls of region `r`'s receive buffer from the owners' send buffers.
+    fn halo_pulls(&self, r: usize, ptrs: &[Ptrs]) -> Vec<Pull> {
+        self.halo
+            .iter()
+            .filter(|s| s.recv == r)
+            .map(|s| {
+                let o = &ptrs[s.owner];
+                Pull {
+                    dst: ptrs[r].halo_recv + s.recv_at * 8,
+                    src: o.halo_send + s.send_at * 8,
+                    bytes: (s.words * 8) as usize,
+                    from: o.ctx.clone(),
+                }
+            })
+            .collect()
+    }
+}
+
+/// The halo segments of `regions`: each pixel row of consecutive read halo tiles with one
+/// owner, every object mode; receive buffers hold the owners in order, send buffers the
+/// receivers.
+fn halo_segs(run: &Partition, regions: &[RegionPlan], nobj: usize) -> Vec<HaloSeg> {
+    let grid = run.grid();
+    let [nyo, nxo] = grid.obj();
+    let tile = grid.tile();
+    let owner = run.owner();
+    let n = regions.len();
+    let mut send_at = vec![0; n];
+    let mut segs = Vec::new();
+    for (r, rp) in regions.iter().enumerate() {
+        let mut rows = vec![Vec::new(); n];
+        let read = &rp.halo_read;
+        for m in 0..nobj {
             let mut i = 0;
             while i < read.len() {
                 let t0 = read[i] as usize;
@@ -310,22 +399,37 @@ impl Plan {
                 let (x0, x1) = (tx0 * tile, ((tx1 + 1) * tile).min(nxo));
                 for y in ty * tile..((ty + 1) * tile).min(nyo) {
                     let off = (((m * nyo + y) * nxo + x0) * size_of::<C32>()) as u64;
-                    runs.push(Run {
-                        dst: ptrs[r].obj + off,
-                        src: ptrs[o].obj + off,
-                        len: (x1 - x0) as u64,
-                    });
+                    rows[o].push([off, (x1 - x0) as u64]);
                 }
             }
         }
-        runs
+        let mut recv_at = 0;
+        for (o, rows) in rows.into_iter().enumerate() {
+            let words: u64 = rows.iter().map(|w| w[1]).sum();
+            if words == 0 {
+                continue;
+            }
+            segs.push(HaloSeg {
+                recv: r,
+                owner: o,
+                rows,
+                words,
+                send_at: send_at[o],
+                recv_at,
+            });
+            send_at[o] += words;
+            recv_at += words;
+        }
     }
+    segs
 }
 
 /// Device addresses a region exposes to its peers.
 struct Ptrs {
+    ctx: Arc<Context>,
     psi: Vec<u64>,
-    obj: u64,
+    halo_send: u64,
+    halo_recv: u64,
     max_bits: u64,
     /// `(num, den)` of each own leaf's probe sums.
     leaf: Vec<(u64, u64)>,
@@ -334,7 +438,7 @@ struct Ptrs {
 /// What a region's exchange reads, built once all regions exist.
 struct Links {
     gather: Runs,
-    halo: Runs,
+    halo: Vec<Pull>,
     max_srcs: DeviceBuffer<u64>,
     /// `(num, den)` of every leaf's probe sums, by leaf.
     leaf: [(u64, u64); NLEAF],
@@ -347,6 +451,15 @@ struct Tree {
     root: UpdateSums,
 }
 
+/// A region's side of the halo exchange: it packs what others read of its tiles into `send`
+/// and unpacks what it pulled from the owners into `recv`.
+struct Halo {
+    send: DeviceBuffer<u64>,
+    recv: DeviceBuffer<u64>,
+    pack: Runs,
+    unpack: Runs,
+}
+
 struct State {
     k: Kernels,
     ex: Exchange,
@@ -355,6 +468,7 @@ struct State {
     table: StackTable,
     counts: DeviceBuffer<u16>,
     obj: DeviceBuffer<C32>,
+    halo: Halo,
     probe: DeviceBuffer<C32>,
     /// Per local stack.
     psi: Vec<DeviceBuffer<C32>>,
@@ -391,6 +505,21 @@ impl State {
         let zeroed = |len| DeviceBuffer::zeroed(stream, len);
         let probe_sums = plan.probe_inertia.is_some();
         let np = plan.np();
+        let obj = DeviceBuffer::from_host(stream, &data.object)?;
+        let halo = {
+            let r = gpu.region();
+            let [send, recv] = plan
+                .halo_words(r)
+                .map(|w| DeviceBuffer::<u64>::zeroed(stream, (w as usize).max(1)));
+            let (send, recv) = (send?, recv?);
+            let o = obj.cu_deviceptr();
+            Halo {
+                pack: Runs::new(stream, &plan.halo_pack(r, o, send.cu_deviceptr()))?,
+                unpack: Runs::new(stream, &plan.halo_unpack(r, o, recv.cu_deviceptr()))?,
+                send,
+                recv,
+            }
+        };
         Ok(Self {
             k: Kernels::load(gpu.ctx())?,
             ex: Exchange::load(gpu.ctx())?,
@@ -399,7 +528,8 @@ impl State {
             views: Views::new(stream, rp.dims, &rp.views)?,
             table: StackTable::new(stream, &rp.dims, &ranges)?,
             counts: DeviceBuffer::from_host(stream, &counts)?,
-            obj: DeviceBuffer::from_host(stream, &data.object)?,
+            obj,
+            halo,
             probe: DeviceBuffer::from_host(stream, &data.probe)?,
             psi: (0..rp.stacks.len())
                 .map(|_| zeroed(nk * n))
@@ -432,8 +562,10 @@ impl State {
 
     fn ptrs(&self) -> Ptrs {
         Ptrs {
+            ctx: self.obj.context().clone(),
             psi: self.psi.iter().map(|b| b.cu_deviceptr()).collect(),
-            obj: self.obj.cu_deviceptr(),
+            halo_send: self.halo.send.cu_deviceptr(),
+            halo_recv: self.halo.recv.cu_deviceptr(),
             max_bits: self
                 .obj_sums
                 .as_ref()
@@ -465,6 +597,7 @@ impl State {
             table,
             counts,
             obj,
+            halo,
             probe,
             psi,
             llk,
@@ -536,17 +669,25 @@ impl State {
             // rewritten only after the next.
             unsafe { ex.max_u32(&stream, gmax.cu_deviceptr(), &links.max_srcs)? };
             k.normalize_obj(&ctx, views, obj, sums, gmax, inertia)?;
+            // SAFETY: the runs address this region's object and send buffer, which its peers
+            // last pulled before this cycle's first fence.
+            unsafe { ex.copy_runs(&stream, &halo.pack)? };
         }
         if let (Some(t), Some(inertia)) = (tree.as_mut(), plan.probe_inertia) {
             k.update_from_sums(&ctx, probe, &mut t.root, np, inertia)?;
         }
         gpu.fence()?;
 
-        // D: halo pull; overwrites what `normalize_obj` left in the halo tiles it read.
+        // D: halo pull from the owners' send buffers; the unpack overwrites what
+        // `normalize_obj` left in the halo tiles it read.
         if obj_sums.is_some() {
-            // SAFETY: the runs address owned object tiles, updated before the fence and
-            // rewritten only after the next cycle's second fence.
-            unsafe { ex.copy_runs(&stream, &links.halo)? };
+            // SAFETY: each pull reads the part of an owner's send buffer packed for this
+            // region before the fence, repacked only after the next cycle's second fence; the
+            // receive buffer and the object are this region's and touched by this stream only.
+            unsafe {
+                exchange::pull(&stream, &links.halo)?;
+                ex.copy_runs(&stream, &halo.unpack)?;
+            }
         }
         drop(ctx);
 
@@ -618,7 +759,7 @@ impl DistAp {
                     let o = l / plan.k;
                     ptrs[o].leaf.get(l - o * plan.k).copied().unwrap_or((0, 0))
                 });
-                (plan.gather(r, &ptrs), plan.halo(r, &ptrs), leaf)
+                (plan.gather(r, &ptrs), plan.halo_pulls(r, &ptrs), leaf)
             })
             .collect();
         let max_srcs: Vec<u64> = ptrs.iter().map(|p| p.max_bits).collect();
@@ -628,7 +769,7 @@ impl DistAp {
             let s = gpu.stream();
             st.links = Some(Links {
                 gather: Runs::new(s, gather)?,
-                halo: Runs::new(s, halo)?,
+                halo: halo.clone(),
                 max_srcs: DeviceBuffer::from_host(s, &max_srcs)?,
                 leaf: *leaf,
             });

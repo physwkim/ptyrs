@@ -10,7 +10,9 @@
 use std::ffi::c_void;
 use std::sync::Arc;
 
-use cuda_core::{Context, DeviceBuffer, Function, Stream, launch_kernel_on_stream};
+use cuda_core::{
+    Context, DeviceBuffer, Function, IntoResult, Stream, launch_kernel_on_stream, sys,
+};
 
 use crate::{DistError, Partition};
 
@@ -200,6 +202,43 @@ impl Runs {
     pub fn is_empty(&self) -> bool {
         self.nruns == 0
     }
+}
+
+/// One copy-engine transfer of `bytes` from `src` on `from`'s device to `dst` on the device
+/// of the stream that runs it.
+#[derive(Clone)]
+pub struct Pull {
+    pub dst: u64,
+    pub src: u64,
+    pub bytes: usize,
+    pub from: Arc<Context>,
+}
+
+/// Enqueues every pull on `stream` as a copy-engine transfer (`cuMemcpyPeerAsync`), so no
+/// kernel touches peer memory.
+///
+/// # Safety
+/// Every `dst` must address `bytes` on the stream's device and every `src` `bytes` on `from`'s
+/// device. The sources must not be written until the stream passes this point, and nothing
+/// may read or write the destinations meanwhile ([`crate::Gpu::fence`]).
+pub unsafe fn pull(stream: &Stream, pulls: &[Pull]) -> Result<(), DistError> {
+    let ctx = stream.context();
+    ctx.bind_to_thread()?;
+    for p in pulls {
+        // SAFETY: the caller guarantees both ranges; the contexts are live.
+        unsafe {
+            sys::cuMemcpyPeerAsync(
+                p.dst,
+                ctx.cu_ctx(),
+                p.src,
+                p.from.cu_ctx(),
+                p.bytes,
+                stream.cu_stream(),
+            )
+            .result()?
+        };
+    }
+    Ok(())
 }
 
 /// The exchange kernels, loaded into one context.
