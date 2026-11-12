@@ -295,11 +295,19 @@ fn lsqml_restarts_and_rejects() {
         ..params
     };
     assert!(gpu.lsqml(&zero, 1, 1).is_err());
-    let features = Features {
-        scale: Some(vec![1.0; NPOS]),
-    };
-    gpu.set_features(&features).unwrap();
-    assert!(gpu.lsqml(&params, 1, 0).is_err());
+    for features in [
+        Features {
+            scale: Some(vec![1.0; NPOS]),
+            background: None,
+        },
+        Features {
+            scale: None,
+            background: Some(vec![1.0; frame * frame]),
+        },
+    ] {
+        gpu.set_features(&features).unwrap();
+        assert!(gpu.lsqml(&params, 1, 0).is_err(), "{features:?}");
+    }
 
     let (scan, object, probe) = start(32);
     let m1 = GpuOptions {
