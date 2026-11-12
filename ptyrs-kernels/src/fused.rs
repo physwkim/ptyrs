@@ -936,6 +936,36 @@ pub unsafe fn shift_rows_inv<const NX: u32>(
     g: StackGeom,
     cfg: FusedCfg,
 ) {
+    unsafe { shift_rows_inv_with::<NX, false>(p, ctl, g, cfg) }
+}
+
+/// [`shift_rows_inv`]'s `FUSED_SHIFT_OBJ` and `FUSED_SHIFT_PROBE` terms of the waves `x` a
+/// stack's `psi` holds, its stored rows as [`rows_inv`] stores them: no transform, no new
+/// waves; the other flags are ignored. Reads `psi`, `views`, `shift`, and `obj` under
+/// `FUSED_SHIFT_PROBE`; writes what the flags name. Grid `(ny / rows, nf_max)`, block
+/// `FUSED_ROW_THREADS`, dynamic shared memory `rows` row FFTs ([`FFT_SKEW`]).
+///
+/// # Safety
+///
+/// As [`shift_rows_inv`], with `psi` holding the stack's waves in place of `work`.
+#[device]
+pub unsafe fn shift_sums<const NX: u32>(
+    p: FusedPtrs,
+    ctl: *const StackCtl,
+    g: StackGeom,
+    cfg: FusedCfg,
+) {
+    unsafe { shift_rows_inv_with::<NX, true>(p, ctl, g, cfg) }
+}
+
+/// [`shift_rows_inv`], or under `SUMS` [`shift_sums`].
+#[device]
+unsafe fn shift_rows_inv_with<const NX: u32, const SUMS: bool>(
+    p: FusedPtrs,
+    ctl: *const StackCtl,
+    g: StackGeom,
+    cfg: FusedCfg,
+) {
     let (f0, nf) = unsafe { stack_frames(ctl, g) };
     let fl = thread::blockIdx_y();
     if fl >= nf {
@@ -949,12 +979,18 @@ pub unsafe fn shift_rows_inv<const NX: u32>(
     let tpf = nx / ept;
     let y = (ys + ny / 2) % ny;
     let nobj = g.nmode / g.nprobe;
-    let dm = cfg.flags & FUSED_DM != 0;
-    let obj_terms = cfg.flags & FUSED_SHIFT_OBJ != 0;
-    let probe = cfg.flags & FUSED_SHIFT_PROBE != 0;
-    let position = cfg.flags & FUSED_SHIFT_POSITION != 0;
-    let den = cfg.flags & FUSED_SHIFT_DEN != 0;
-    let grad = cfg.flags & FUSED_GRAD != 0;
+    // A constant mask: the sums build has no new waves and no slope rows.
+    let flags = if SUMS {
+        cfg.flags & (FUSED_SHIFT_OBJ | FUSED_SHIFT_PROBE)
+    } else {
+        cfg.flags
+    };
+    let dm = flags & FUSED_DM != 0;
+    let obj_terms = flags & FUSED_SHIFT_OBJ != 0;
+    let probe = flags & FUSED_SHIFT_PROBE != 0;
+    let position = flags & FUSED_SHIFT_POSITION != 0;
+    let den = flags & FUSED_SHIFT_DEN != 0;
+    let grad = flags & FUSED_GRAD != 0;
     let adjoint = probe || position;
     let slopes = den || position;
     let out = new_waves(p, cfg);
@@ -994,14 +1030,16 @@ pub unsafe fn shift_rows_inv<const NX: u32>(
             for o in 0..nobj {
                 let m = o * g.nprobe + pm;
                 let row = (fl * g.nmode + m) as usize * n + srow;
-                #[unroll]
-                for i in 0..ept {
-                    let v = load_c(p.work, row + (t + i * tpf) as usize);
-                    r[2 * i as usize] = v.0;
-                    r[2 * i as usize + 1] = v.1;
+                if !SUMS {
+                    #[unroll]
+                    for i in 0..ept {
+                        let v = load_c(p.work, row + (t + i * tpf) as usize);
+                        r[2 * i as usize] = v.0;
+                        r[2 * i as usize + 1] = v.1;
+                    }
+                    row_fft::<NX, true>(&mut r, lane);
+                    thread::sync_threads();
                 }
-                row_fft::<NX, true>(&mut r, lane);
-                thread::sync_threads();
                 let v = *p.views.add((k0 + m) as usize);
                 let cplane = (fl * nobj + o) as usize * n + srow;
                 #[unroll]
@@ -1010,8 +1048,12 @@ pub unsafe fn shift_rows_inv<const NX: u32>(
                     let xs = t + i * tpf;
                     let x = (xs + nx / 2) % nx;
                     let wi = (w[k], w[k + 1]);
-                    let mut s = (r[k], r[k + 1]);
                     let at = row + xs as usize;
+                    let mut s = if SUMS {
+                        load_c(p.psi, at)
+                    } else {
+                        (r[k], r[k + 1])
+                    };
                     let vo = if dm || adjoint {
                         sample_obj(p.obj, v, y, x, g.nyo, g.nxo)
                     } else {
@@ -1024,7 +1066,9 @@ pub unsafe fn shift_rows_inv<const NX: u32>(
                         let d = (b * (po.0 - refl.0), b * (po.1 - refl.1));
                         s = (s.0 + d.0, s.1 + d.1);
                     }
-                    store_c(out, at, s);
+                    if !SUMS {
+                        store_c(out, at, s);
+                    }
                     if obj_terms {
                         let ct = cplane + xs as usize;
                         let u = cmul_conj(wi, s);
