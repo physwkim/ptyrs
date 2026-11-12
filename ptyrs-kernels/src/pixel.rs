@@ -281,17 +281,19 @@ pub unsafe fn sample_obj(
     }
 }
 
-/// The probe pixels of view `v` whose bilinear sample reads object pixel `(y, x)`, as
-/// `(pry, prx, weight)` in [`bilinear_weights`] order; `None` where no such pixel exists or
-/// the weight is zero. This is the exact transpose of [`sample_obj`].
+/// Calls `f(pry, prx, weight)` for each probe pixel of view `v` whose bilinear sample reads
+/// object pixel `(y, x)`, in [`bilinear_weights`] order, skipping corners outside the frame
+/// or of zero weight. This is the exact transpose of [`sample_obj`]. A visitor, not an
+/// array of sources: kernels kept such an array in local memory.
 #[device]
-pub fn obj_pixel_sources(
+pub fn obj_pixel_sources<F: FnMut(u32, u32, f32)>(
     v: ViewAddr,
     y: u32,
     x: u32,
     ny: u32,
     nx: u32,
-) -> [Option<(u32, u32, f32)>; 4] {
+    mut f: F,
+) {
     // Row offset of `y` in the view (`y0 = oy + pry`), and of the row whose `+ 1`
     // neighbour is `y`; likewise for columns. An offset below zero wraps past every frame
     // side, so `pick` drops it.
@@ -299,17 +301,13 @@ pub fn obj_pixel_sources(
     let c = x.wrapping_sub(v.ox);
     let (rm, cm) = (r.wrapping_sub(1), c.wrapping_sub(1));
     let w = bilinear_weights(v.fy, v.fx);
-    let pick = |pry: u32, prx: u32, wt: f32, used: bool| {
+    let mut pick = |pry: u32, prx: u32, wt: f32, used: bool| {
         if used && pry < ny && prx < nx {
-            Some((pry, prx, wt))
-        } else {
-            None
+            f(pry, prx, wt);
         }
     };
-    [
-        pick(r, c, w[0], true),
-        pick(r, cm, w[1], v.fx != 0.0),
-        pick(rm, c, w[2], v.fy != 0.0),
-        pick(rm, cm, w[3], v.fy != 0.0 && v.fx != 0.0),
-    ]
+    pick(r, c, w[0], true);
+    pick(r, cm, w[1], v.fx != 0.0);
+    pick(rm, c, w[2], v.fy != 0.0);
+    pick(rm, cm, w[3], v.fy != 0.0 && v.fx != 0.0);
 }

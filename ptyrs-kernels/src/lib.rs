@@ -542,15 +542,14 @@ pub mod kernels {
                     continue;
                 }
                 let plane = (k - k0) as usize * n;
-                let src = obj_pixel_sources(v, y, x, g.ny, g.nx);
-                for &(pry, prx, w) in src.iter().flatten() {
+                obj_pixel_sources(v, y, x, g.ny, g.nx, |pry, prx, w| {
                     let p = load_c(probe, v.probe as usize * n + (pry * g.nx + prx) as usize);
                     let q = quad_phase(g.quad, pry, prx, g.ny, g.nx);
                     let ps = load_c(psi, plane + psi_index(pry, prx, g.ny, g.nx));
                     let u = cmul_conj(cmul(p, q), ps);
                     acc = (acc.0 + w * u.0, acc.1 + w * u.1);
                     norm += w * (p.0 * p.0 + p.1 * p.1);
-                }
+                });
             }
             store_c(sums.num, px, acc);
             *sums.den.add(px) = norm;

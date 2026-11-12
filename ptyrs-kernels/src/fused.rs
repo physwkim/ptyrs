@@ -473,12 +473,12 @@ pub unsafe fn gather(
                 continue;
             }
             let plane = ((k / g.nmode - f0) * nobj + iobj) as usize * n;
-            for &(pry, prx, w) in obj_pixel_sources(v, y, x, g.ny, g.nx).iter().flatten() {
+            obj_pixel_sources(v, y, x, g.ny, g.nx, |pry, prx, w| {
                 let at = (pry * g.nx + prx) as usize;
                 let c = load_c(p.contrib, plane + at);
                 acc = (acc.0 + w * c.0, acc.1 + w * c.1);
                 norm += w * *p.probe_power.add(at);
-            }
+            });
         }
         store_c(sums.num, px, acc);
         *sums.den.add(px) = norm;
