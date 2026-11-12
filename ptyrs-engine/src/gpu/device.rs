@@ -23,7 +23,7 @@ use super::{
     Epoch, Frames, GpuOptions, Tag, batch_stacks, plane_len, plans, split, stack_buf_len, stacks,
     to_u32,
 };
-use crate::{ApParams, BhParams, DmParams, EngineError, MlParams, RpieParams};
+use crate::{ApParams, BhParams, BhStep, DmParams, EngineError, MlParams, RpieParams};
 
 /// Every buffer, module and plan a cycle launches on, and the graphs captured from them.
 pub(super) struct Device {
@@ -668,6 +668,34 @@ impl Device {
                 .expect("new_run built the BH state");
             Ok(bh.order.set(&ctx, &dev.kernels, &dev.views, order)?)
         })
+    }
+
+    /// The last BH epoch's steps, one per batch, read back: each batch's frames from the
+    /// device's epoch order and its `(β, α, top, bottom)` record; none before a BH call.
+    pub fn bh_steps(&self) -> Result<Vec<BhStep>, EngineError> {
+        let Some(bh) = self.bh_state.as_deref() else {
+            return Ok(Vec::new());
+        };
+        let ids = bh.order.ids().to_host_vec(&self.stream)?;
+        let records = bh.steps.to_host_vec(&self.stream)?;
+        let steps = bh
+            .batches
+            .iter()
+            .zip(records.as_chunks::<{ BH_STEP as usize }>().0);
+        Ok(steps
+            .map(|(b, r)| {
+                let at = bh.stacks[b.start].range.start as usize
+                    ..bh.stacks[b.end - 1].range.end as usize;
+                let [beta, alpha, top, bottom] = r.map(f64::from);
+                BhStep {
+                    frames: ids[at].iter().map(|&f| f as usize).collect(),
+                    beta,
+                    alpha,
+                    top,
+                    bottom,
+                }
+            })
+            .collect())
     }
 
     /// [`Self::steady`] with `stage` enqueued just before the cycle, once its buffers are
