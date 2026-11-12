@@ -523,7 +523,7 @@ impl Device {
             ring: LlkRing::new(
                 &kernels,
                 &stream,
-                dims.nframe,
+                &dims,
                 to_u32("llk_slots", options.llk_slots)?,
             )?,
             counts: DeviceBuffer::from_host(&stream, counts)?,

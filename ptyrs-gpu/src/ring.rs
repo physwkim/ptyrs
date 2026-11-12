@@ -10,7 +10,9 @@
 //! the [`LlkTotals`] of every record counted since the last read, in order, and
 //! [`LlkRing::poll`], without waiting, those of them whose copies have completed; each from
 //! [`LlkSums::from_partials`] over its frames with their unmasked pixels, which
-//! [`RingDevice::count`] counts once per frame. Every frame of record `k` must carry stamp
+//! [`RingDevice::count`] counts once per frame. The same count adds each frame to the frame
+//! counts of its unmasked pixels, [`RingDevice::pixel_frames`], in integer adds, so they come
+//! out the same in any frame order. Every frame of record `k` must carry stamp
 //! `k`: a frame not pushed, a record ended but not counted or counted but not ended, or a
 //! slot overwritten before its copy, is a [`RingError::Stamp`], not a value; a frame pushed
 //! before it was counted is a [`RingError::Uncounted`].
@@ -28,8 +30,9 @@ use crate::{
 };
 
 /// The ring's device half, what a cycle launches on: `nslot` records of `nframe` stamped
-/// partials, the cursor numbering the current record, and each frame's unmasked pixels. Only
-/// [`LlkRing::new`] builds one, and only a [`RecordWriter`] writes its records.
+/// partials, the cursor numbering the current record, each frame's unmasked pixels and each
+/// detector pixel's unmasked frames. Only [`LlkRing::new`] builds one, and only a
+/// [`RecordWriter`] writes its records.
 pub struct RingDevice {
     base: Kernels,
     module: ring_kernels::LoadedModule,
@@ -37,7 +40,11 @@ pub struct RingDevice {
     cursor: DeviceBuffer<u64>,
     /// Frame `f`'s unmasked pixels once [`Self::count`] ran on it, [`UNCOUNTED`] before.
     nobs: DeviceBuffer<u32>,
+    /// Detector pixel `p`'s unmasked frames among those [`Self::count`] ran on.
+    pixel_frames: DeviceBuffer<u32>,
     nframe: u32,
+    /// The detector's `[ny, nx]`.
+    frame: [u32; 2],
     nslot: u32,
 }
 
@@ -48,8 +55,10 @@ impl RingDevice {
     }
 
     /// Counts the unmasked pixels of the stack's frames in `counts` (`nframe` frames of the
-    /// scan), which every later push of those frames carries; once per frame, after its
-    /// counts are in place and before its first push.
+    /// scan), which every later push of those frames carries, and adds each frame to
+    /// [`Self::pixel_frames`] of its unmasked pixels; after the frame's counts are in place
+    /// and before its first push. A frame counted before is skipped, so counting it again
+    /// changes neither.
     pub fn count(
         &mut self,
         ctx: &ExecutionContext,
@@ -65,30 +74,38 @@ impl RingDevice {
             shared_mem_bytes: 0,
         };
         let reads = [counts.storage(), stack.storage()];
-        self.base
-            .launch(ctx, &reads, &[self.nobs.storage()], |stream| {
-                // SAFETY: `counts` checked above; `nobs` holds `nframe` since `LlkRing::new`;
-                // one block of PIXEL_THREADS per frame.
-                unsafe {
-                    self.module.ring_count(
-                        stream,
-                        config,
-                        dptr(counts),
-                        dptr(&self.nobs),
-                        stack.ctl() as *const StackCtl,
-                        g,
-                    )
-                }
-            })
+        let writes = [self.nobs.storage(), self.pixel_frames.storage()];
+        self.base.launch(ctx, &reads, &writes, |stream| {
+            // SAFETY: `counts` checked above; `nobs` holds `nframe` and `pixel_frames`
+            // `frame[0] * frame[1]` since `LlkRing::new`, which `geom` checked `dims`
+            // against; one block of PIXEL_THREADS per frame.
+            unsafe {
+                self.module.ring_count(
+                    stream,
+                    config,
+                    dptr(counts),
+                    dptr(&self.nobs),
+                    dptr(&self.pixel_frames),
+                    stack.ctl() as *const StackCtl,
+                    g,
+                )
+            }
+        })
     }
 
-    /// The stack's geometry, checked against the ring's frames.
+    /// Detector pixel `p`'s unmasked frames, `ny * nx` in the detector order of the counts,
+    /// over the frames [`Self::count`] has counted: the `nobs` of the background update.
+    pub fn pixel_frames(&self) -> &DeviceBuffer<u32> {
+        &self.pixel_frames
+    }
+
+    /// The stack's geometry, checked against the ring's frames and detector.
     fn geom(&self, dims: &ViewDims, stack: StackRef<'_>) -> Result<StackGeom, Error> {
         let g = dims.geom(stack)?;
-        if g.nframe != self.nframe {
+        if (g.nframe, dims.frame) != (self.nframe, self.frame) {
             return Err(Error::Shape(format!(
-                "a stack of {} frames, the ring holds {}",
-                g.nframe, self.nframe
+                "a stack of {} frames of {:?} pixels, the ring holds {} of {:?}",
+                g.nframe, dims.frame, self.nframe, self.frame
             )));
         }
         Ok(g)
@@ -213,17 +230,19 @@ pub struct LlkRing<T> {
 }
 
 impl<T> LlkRing<T> {
-    /// A ring of `nslot >= 1` records for a scan of `nframe` frames, on the kernels
-    /// `kernels` loaded, initialised on `stream`.
+    /// A ring of `nslot >= 1` records for a scan of `dims.nframe` frames of `dims.frame`
+    /// pixels, on the kernels `kernels` loaded, initialised on `stream`.
     pub fn new(
         kernels: &Kernels,
         stream: &CudaStream,
-        nframe: u32,
+        dims: &ViewDims,
         nslot: u32,
     ) -> Result<Self, Error> {
-        if nframe == 0 || nslot == 0 {
+        let nframe = dims.nframe;
+        if nframe == 0 || nslot == 0 || dims.n() == 0 {
             return Err(Error::Shape(format!(
-                "a ring of {nslot} records of {nframe} frames"
+                "a ring of {nslot} records of {nframe} frames of {:?} pixels",
+                dims.frame
             )));
         }
         if stream.context().as_ref() != kernels.context().as_ref() {
@@ -243,7 +262,9 @@ impl<T> LlkRing<T> {
                 records: DeviceBuffer::from_host(stream, &vec![unwritten; len])?,
                 cursor: DeviceBuffer::from_host(stream, &[0u64])?,
                 nobs: DeviceBuffer::from_host(stream, &vec![UNCOUNTED; nframe as usize])?,
+                pixel_frames: DeviceBuffer::zeroed(stream, dims.n())?,
                 nframe,
+                frame: dims.frame,
                 nslot,
             },
             host: PinnedHostBuffer::zeroed(kernels.context(), len)?,
@@ -497,7 +518,16 @@ mod tests {
         let kernels = Kernels::load(&cuda).expect("load ptyrs-gpu kernels");
         let stream = cuda.new_stream().unwrap();
         let ctx = ExecutionContext::new(stream.clone());
-        let mut ring = LlkRing::new(&kernels, &stream, 10, 1).unwrap();
+        let dims = ViewDims {
+            nframe: 10,
+            nmode: 1,
+            nprobe: 1,
+            nobj: 1,
+            frame: [8, 8],
+            obj: [8, 8],
+            quad_phase: 0.0,
+        };
+        let mut ring = LlkRing::new(&kernels, &stream, &dims, 1).unwrap();
         stream.synchronize().unwrap();
         let old = RingRecord {
             seq: 7,

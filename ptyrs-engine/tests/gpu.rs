@@ -623,7 +623,7 @@ fn ring_record_of_the_first_frames_matches_the_cpu_llk() {
     let mut scratch = LlkScratch::new(&stream, &dims, table.nf_max()).unwrap();
     let mut partials =
         DeviceBuffer::<LlkPartial>::zeroed(&stream, table.nf_max() as usize).unwrap();
-    let mut ring = LlkRing::new(&kernels, &stream, nframe as u32, 2).unwrap();
+    let mut ring = LlkRing::new(&kernels, &stream, &dims, 2).unwrap();
 
     let ns = [10, nframe as u32];
     let mut counted = 0;
