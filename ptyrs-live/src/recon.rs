@@ -398,6 +398,9 @@ mod tests {
             stack_size: nf_max as usize,
             graph: true,
             llk_slots: 8,
+            // The live run launches M1's sequence; the fused passes agree with
+            // it only to rounding.
+            fused: false,
         };
         let mut engine = GpuPtycho::new(&ctx, &scan, start, truth, opts).unwrap();
         let params = ApParams {
