@@ -5,13 +5,14 @@ use cuda_async::device_operation::ExecutionContext;
 use ptyrs_gpu::{BhBatch, BhDisp, BhFieldsRef, BhScan, BhVar, Error as GpuError};
 
 use super::device::BhBufs;
-use super::{Bufs, Epoch, GpuPtycho, plane_len};
+use super::{Bufs, GpuPtycho, plane_len};
 use crate::ptycho::{Algorithm, llk_due};
-use crate::{BhParams, EngineError};
+use crate::{BhParams, EngineError, random_batches};
 
 impl GpuPtycho {
-    /// [`crate::Bh::epoch`] `nepoch` times from a fresh [`crate::Bh`]: the first epoch starts
-    /// without a last direction; one LLK record after every due epoch.
+    /// [`crate::Bh::epoch`] `nepoch` times from a fresh [`crate::Bh`], over the same
+    /// [`random_batches`]: with one batch of every frame, CG from the second epoch on, else
+    /// steepest descent; one LLK record after every due epoch.
     pub fn bh(
         &mut self,
         params: &BhParams,
@@ -21,17 +22,16 @@ impl GpuPtycho {
         if params.batch_size == 0 {
             return Err(EngineError::Invalid("BH batch_size must be >= 1".into()));
         }
-        if params.batch_size < self.dev.dims().nframe as usize {
-            return Err(EngineError::Invalid(
-                "GPU BH runs one batch of every frame only".into(),
-            ));
-        }
+        let nframe = self.dev.dims().nframe as usize;
+        let full = params.batch_size >= nframe;
         for ic in 0..nepoch {
-            let epoch = Epoch::Bh {
-                params: *params,
-                first: ic == 0,
-            };
-            self.dev.steady(epoch, self.cycle)?;
+            let order: Vec<u32> = random_batches(nframe, params.batch_size, params.seed, ic as u64)
+                .concat()
+                .into_iter()
+                .map(|f| f as u32)
+                .collect();
+            self.dev
+                .bh_epoch(*params, full && ic > 0, self.cycle, &order)?;
             if llk_due(calc_llk, ic, nepoch) {
                 self.dev.llk_pass(Some((self.cycle, Algorithm::Bh)))?;
             }
@@ -43,17 +43,15 @@ impl GpuPtycho {
 }
 
 impl Bufs<'_> {
-    /// One epoch enqueued on `ctx`, batch by batch; CG across epochs with one batch of every
-    /// frame after the call's `first` epoch.
+    /// One epoch enqueued on `ctx`, batch by batch over the frames in `bh.order`; with `cg`,
+    /// the first batch continues the last direction.
     pub(super) fn bh_epoch(
         &mut self,
         ctx: &ExecutionContext,
         bh: &mut BhBufs<'_>,
         params: &BhParams,
-        first: bool,
+        cg: bool,
     ) -> Result<(), GpuError> {
-        let nframe = self.views.dims().nframe;
-        let cg = bh.size == nframe && !first;
         let rho2 = (params.probe_rho.powi(2) * plane_len(self.views.dims()) as f64) as f32;
         for b in 0..bh.batches.len() {
             self.bh_batch(ctx, bh, b, rho2, cg)?;
@@ -74,23 +72,23 @@ impl Bufs<'_> {
         let dims = *self.views.dims();
         let batch = bh.batches[b].clone();
         let scan = BhScan {
-            views: self.views,
-            counts: self.counts,
             order: bh.order,
+            counts: self.counts,
         };
+        let views = bh.order.views();
         for (k, s) in batch.clone().enumerate() {
             let stack = bh.table.at(s);
             let plan = bh.plans.get(bh.stacks[s].plan);
             let (psi, r) = (&mut bh.psi[k], &mut bh.r[k]);
             self.kernels
-                .obj_probe_to_psi(ctx, self.views, stack, self.obj, self.probe, psi)?;
+                .obj_probe_to_psi(ctx, views, stack, self.obj, self.probe, psi)?;
             plan.forward_inplace(ctx, psi)?;
             self.bh.residual(ctx, scan, stack, psi, r)?;
             plan.inverse_inplace(ctx, r)?;
             self.kernels
-                .psi_to_obj(ctx, self.views, stack, r, self.probe, self.obj_sums)?;
+                .psi_to_obj(ctx, views, stack, r, self.probe, self.obj_sums)?;
             self.kernels
-                .psi_to_probe(ctx, self.views, stack, r, self.obj, self.probe_sums)?;
+                .psi_to_probe(ctx, views, stack, r, self.obj, self.probe_sums)?;
         }
 
         let d = BhDisp {
@@ -104,7 +102,7 @@ impl Bufs<'_> {
             let plan = bh.plans.get(bh.stacks[s].plan);
             let x = [&*self.obj, &*self.probe];
             self.bh
-                .far(ctx, self.views, stack, x, &d, [&mut *bh.lu, &mut *bh.lv])?;
+                .far(ctx, views, stack, x, &d, [&mut *bh.lu, &mut *bh.lv])?;
             plan.forward_inplace(ctx, bh.lu)?;
             if cg {
                 plan.forward_inplace(ctx, bh.lv)?;

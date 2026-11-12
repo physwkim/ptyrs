@@ -91,8 +91,8 @@ enum Epoch {
         first: bool,
         llk: bool,
     },
-    /// A BH epoch; `first` for epoch 0 of a call.
-    Bh { params: BhParams, first: bool },
+    /// A BH epoch; with `cg` it continues the last epoch's direction.
+    Bh { params: BhParams, cg: bool },
 }
 
 impl Epoch {
@@ -120,10 +120,7 @@ impl Epoch {
                 first: false,
                 llk: false,
             },
-            Self::Bh { params, .. } => Self::Bh {
-                params,
-                first: false,
-            },
+            Self::Bh { params, .. } => Self::Bh { params, cg: false },
         }
     }
 }

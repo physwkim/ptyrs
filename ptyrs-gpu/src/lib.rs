@@ -38,7 +38,9 @@ mod ops;
 mod ring;
 mod rpie;
 
-pub use bh::{BH_HESS, BH_STEP, BhBatch, BhDisp, BhFieldsRef, BhKernels, BhScan, BhVar, bh_parts};
+pub use bh::{
+    BH_HESS, BH_STEP, BhBatch, BhDisp, BhFieldsRef, BhKernels, BhScan, BhVar, EpochOrder, bh_parts,
+};
 pub use fused::{Exit, FUSED_SIDES, FusedBufs, FusedInputs, FusedSums};
 pub use grad::{CG_BLOCKS, GAMMA_CHUNK, GammaStacks, GradKernels, gamma_parts};
 pub use ops::{

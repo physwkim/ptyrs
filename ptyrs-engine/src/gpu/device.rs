@@ -14,9 +14,9 @@ use cuda_async::device_operation::{DeviceOp, ExecutionContext};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 use ptyrs_fft::Plan2d;
 use ptyrs_gpu::{
-    BH_STEP, BhKernels, C32, CG_BLOCKS, Ended, Error as GpuError, FusedBufs, GammaStacks,
-    GradKernels, Kernels, LlkPartial, LlkRing, LlkScratch, LlkTotals, PowerMax, RingDevice,
-    RpieKernels, StackTable, UpdateSums, ViewAddr, ViewDims, Views,
+    BH_STEP, BhKernels, C32, CG_BLOCKS, Ended, EpochOrder, Error as GpuError, FusedBufs,
+    GammaStacks, GradKernels, Kernels, LlkPartial, LlkRing, LlkScratch, LlkTotals, PowerMax,
+    RingDevice, RpieKernels, StackTable, UpdateSums, ViewAddr, ViewDims, Views,
 };
 
 use super::{
@@ -120,7 +120,7 @@ enum Cycle {
     /// shares.
     Bh {
         params: BhParams,
-        first: bool,
+        cg: bool,
     },
 }
 
@@ -131,7 +131,7 @@ impl Cycle {
             Self::Dm { params, first } => Epoch::Dm { params, first },
             Self::Rpie(p, _) => Epoch::Rpie(p),
             Self::Ml { params, first, llk } => Epoch::Ml { params, first, llk },
-            Self::Bh { params, first } => Epoch::Bh { params, first },
+            Self::Bh { params, cg } => Epoch::Bh { params, cg },
         }
     }
 }
@@ -216,8 +216,8 @@ impl MlState {
 }
 
 /// BH's batches over epoch positions and its state, sized by the device and the batch size
-/// alone, so one state serves the graphs of every BH epoch of that size; each call's first
-/// epoch starts without a last direction.
+/// alone, so one state serves the graphs of every BH epoch of that size; [`Device::bh_epoch`]
+/// sets each epoch's frame order before its cycle.
 struct BhState {
     /// Frames per batch, the batch size capped at the frame count.
     size: u32,
@@ -236,8 +236,8 @@ struct BhState {
     lv: DeviceBuffer<C32>,
     /// The last direction, object then probe.
     prev: [DeviceBuffer<C32>; 2],
-    /// The scan frame at each epoch position.
-    order: DeviceBuffer<u32>,
+    /// The scan frame at each epoch position, and the views in that order.
+    order: EpochOrder,
     /// One step's partial sums ([`ptyrs_gpu::bh_parts`]).
     parts: DeviceBuffer<f32>,
     /// The epoch's step records, one per batch.
@@ -256,26 +256,27 @@ pub(super) struct BhBufs<'a> {
     pub lu: &'a mut DeviceBuffer<C32>,
     pub lv: &'a mut DeviceBuffer<C32>,
     pub prev: &'a mut [DeviceBuffer<C32>; 2],
-    pub order: &'a DeviceBuffer<u32>,
+    pub order: &'a EpochOrder,
     pub parts: &'a mut DeviceBuffer<f32>,
     pub steps: &'a mut DeviceBuffer<f32>,
 }
 
 impl BhState {
-    /// For batches of `size` frames cut into stacks of `stack_size`, and arrays of `lens =
-    /// [object, probe]` values; the epoch order is the scan's.
+    /// For `views` in batches of `size` frames cut into stacks of `stack_size`, and arrays of
+    /// `lens = [object, probe]` values; the epoch order is the scan's.
     fn new(
         stream: &Arc<CudaStream>,
-        dims: &ViewDims,
+        kernels: &Kernels,
+        views: &Views,
         size: u32,
         stack_size: u32,
         lens: [usize; 2],
     ) -> Result<Self, EngineError> {
+        let dims = views.dims();
         let ((stacks, table, plan_lens), batches) = batch_stacks(stream, dims, size, stack_size)?;
         let len = stack_buf_len(dims, &table);
         let slots = batches.iter().map(|b| b.len()).max().unwrap_or(0);
         let zeroed = |len| DeviceBuffer::<C32>::zeroed(stream, len);
-        let order: Vec<u32> = (0..dims.nframe).collect();
         Ok(Self {
             size,
             plans: plans(stream, dims, &plan_lens)?,
@@ -284,7 +285,7 @@ impl BhState {
             lu: zeroed(len)?,
             lv: zeroed(len)?,
             prev: [zeroed(lens[0])?, zeroed(lens[1])?],
-            order: DeviceBuffer::from_host(stream, &order)?,
+            order: EpochOrder::new(kernels, stream, views)?,
             parts: DeviceBuffer::zeroed(stream, ptyrs_gpu::bh_parts(dims))?,
             steps: DeviceBuffer::zeroed(stream, BH_STEP as usize * batches.len())?,
             batches,
@@ -631,28 +632,61 @@ impl Device {
     /// epochs of one [`Epoch::run`] keep their buffers and graphs until an epoch of another
     /// run replaces them.
     pub fn steady(&mut self, epoch: Epoch, cycle: usize) -> Result<(), EngineError> {
+        self.steady_with(epoch, cycle, |_| Ok(()))
+    }
+
+    /// One BH epoch as [`Self::steady`] enqueues it, after setting its frame order: `order`
+    /// holds the scan frame at each epoch position.
+    pub fn bh_epoch(
+        &mut self,
+        params: BhParams,
+        cg: bool,
+        cycle: usize,
+        order: &[u32],
+    ) -> Result<(), EngineError> {
+        self.steady_with(Epoch::Bh { params, cg }, cycle, |dev| {
+            let ctx = dev.context();
+            let bh = dev
+                .bh_state
+                .as_deref_mut()
+                .expect("new_run built the BH state");
+            Ok(bh.order.set(&ctx, &dev.kernels, &dev.views, order)?)
+        })
+    }
+
+    /// [`Self::steady`] with `stage` enqueued just before the cycle, once its buffers are
+    /// built.
+    fn steady_with(
+        &mut self,
+        epoch: Epoch,
+        cycle: usize,
+        stage: impl FnOnce(&mut Self) -> Result<(), EngineError>,
+    ) -> Result<(), EngineError> {
         let mut runs = std::mem::take(&mut self.runs);
         runs.retain(|r| r.cycle.epoch().run() == epoch.run());
         let at = match runs.iter().position(|r| r.cycle.epoch() == epoch) {
-            Some(at) => at,
-            None => {
-                runs.push(self.new_run(epoch)?);
+            Some(at) => Ok(at),
+            None => self.new_run(epoch).map(|run| {
+                runs.push(run);
                 runs.len() - 1
-            }
+            }),
         };
-        let run = &mut runs[at];
-        let tag = Some((cycle, epoch.algorithm()));
-        let done = match &run.graph {
-            Some(c) => self.replay(c, tag),
-            None => {
-                let ctx = self.context();
-                let (mut bufs, mut passes, ring) = self.lend();
-                match bufs.cycle(&ctx, &mut passes, ring, &mut run.cycle) {
-                    Ok(ended) => self.count(ended.as_ref(), tag),
-                    Err(e) => Err(e.into()),
+        let done = at.and_then(|at| {
+            stage(self)?;
+            let run = &mut runs[at];
+            let tag = Some((cycle, epoch.algorithm()));
+            match &run.graph {
+                Some(c) => self.replay(c, tag),
+                None => {
+                    let ctx = self.context();
+                    let (mut bufs, mut passes, ring) = self.lend();
+                    match bufs.cycle(&ctx, &mut passes, ring, &mut run.cycle) {
+                        Ok(ended) => self.count(ended.as_ref(), tag),
+                        Err(e) => Err(e.into()),
+                    }
                 }
             }
-        };
+        });
         self.runs = runs;
         done
     }
@@ -694,9 +728,9 @@ impl Device {
                 self.build_ml()?;
                 Cycle::Ml { params, first, llk }
             }
-            Epoch::Bh { params, first } => {
+            Epoch::Bh { params, cg } => {
                 self.build_bh(&params)?;
-                Cycle::Bh { params, first }
+                Cycle::Bh { params, cg }
             }
         };
         let graph = if self.use_graph {
@@ -727,7 +761,14 @@ impl Device {
         let size = to_u32("batch_size", params.batch_size.min(dims.nframe as usize))?;
         if self.bh_state.as_ref().is_none_or(|s| s.size != size) {
             let lens = [self.obj.len(), self.probe.len()];
-            let state = BhState::new(&self.stream, &dims, size, self.stack_size, lens)?;
+            let state = BhState::new(
+                &self.stream,
+                &self.kernels,
+                &self.views,
+                size,
+                self.stack_size,
+                lens,
+            )?;
             self.bh_state = Some(Box::new(state));
         }
         Ok(())
@@ -844,8 +885,8 @@ impl<'a> Bufs<'a> {
             Cycle::Ml { params, first, llk } => self.with_ml(|b, ml| {
                 b.ml_epoch(ctx, passes, ml, params, *first, llk.then(|| ring.record()))
             }),
-            Cycle::Bh { params, first } => self
-                .with_bh(|b, bh| b.bh_epoch(ctx, bh, params, *first))
+            Cycle::Bh { params, cg } => self
+                .with_bh(|b, bh| b.bh_epoch(ctx, bh, params, *cg))
                 .map(|()| None),
         }
     }

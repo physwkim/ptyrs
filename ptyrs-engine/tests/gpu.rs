@@ -1,5 +1,5 @@
 //! The GPU backend against the CPU oracle: per-record LLK and the final object and probe of AP,
-//! DM, rPIE and ML updating the object, the probe or both, and of BH with one batch, from the
+//! DM, rPIE and ML updating the object, the probe or both, and of BH in one or more batches, from the
 //! same scaled start; AP and DM by M1's launches and by the fused passes; the ML gradients;
 //! and the LLK ring's record of a scan's first frames.
 
@@ -287,18 +287,22 @@ fn ml_matches_cpu() {
     }
 }
 
-/// BH with one batch of every frame (CG after the first epoch) against the CPU's `f64` BH
-/// from the same start: the LLK after each of 20 epochs and the final arrays, by M1's
-/// launches and on the fused passes' frame side.
+/// BH against the CPU's `f64` BH from the same start: the LLK after each of 20 epochs and the
+/// final arrays, by M1's launches and on the fused passes' frame side. One batch of every
+/// frame (CG after the first epoch); batches of 12, two stacks each in M1 but the last; and
+/// batches of 4, the last of 2.
 #[test]
 fn bh_matches_cpu() {
     const NEPOCH: usize = 20;
-    let params = BhParams {
-        batch_size: NPOS,
-        probe_rho: 0.01,
-        seed: 7,
-    };
-    for setup in [M1, FUSED] {
+    for (setup, batch_size) in [M1, FUSED]
+        .into_iter()
+        .flat_map(|s| [NPOS, 12, 4].map(|b| (s, b)))
+    {
+        let params = BhParams {
+            batch_size,
+            probe_rho: 0.01,
+            seed: 7,
+        };
         let (scan, object, probe) = start(setup.frame, 2, true);
         let at = Ptycho::new(&scan, object.clone(), probe.clone()).unwrap();
         let (mut o, mut p) = (object.clone(), probe.clone());
@@ -322,7 +326,7 @@ fn bh_matches_cpu() {
             rel_l2(&gpu.probe().unwrap(), &p),
         ];
         eprintln!(
-            "bh fused {}: llk {:.2e} object {:.2e} probe {:.2e}, llk {:.4e} -> {:.4e}",
+            "bh fused {} batch {batch_size}: llk {:.2e} object {:.2e} probe {:.2e}, llk {:.4e} -> {:.4e}",
             setup.options.fused,
             errs[0],
             errs[1],

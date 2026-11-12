@@ -3,8 +3,8 @@
 //!
 //! # One BH batch in these calls
 //!
-//! A batch is a run of stacks whose table entries hold epoch positions; [`BhScan::order`]
-//! maps a position to its scan frame, and the views are in epoch order. With zeroed update
+//! A batch is a run of stacks whose table entries hold epoch positions; an [`EpochOrder`]
+//! maps a position to its scan frame and holds the views in epoch order. With zeroed update
 //! sums, per stack: [`Kernels::obj_probe_to_psi`] into its `psi`, forward FFT,
 //! [`BhKernels::residual`] into its `r`, inverse FFT of `r`, [`Kernels::psi_to_obj`] and
 //! [`Kernels::psi_to_probe`] of `r`: the sums' `num` is the gradient `g`. Then, with `u = g`
@@ -14,9 +14,10 @@
 //! The step never leaves the device.
 
 use std::ops::Range;
+use std::sync::Arc;
 
 use cuda_async::device_operation::ExecutionContext;
-use cuda_core::{DeviceBuffer, LaunchConfig, RawDeviceBuffer};
+use cuda_core::{CudaStream, DeviceBuffer, Event, LaunchConfig, PinnedHostBuffer, RawDeviceBuffer};
 pub use ptyrs_kernels::bh::{BH_HESS, BH_STEP};
 use ptyrs_kernels::bh::{BhDirs, BhFields, BhObs, bh_kernels};
 use ptyrs_kernels::grad::{CG_BLOCKS, GAMMA_CHUNK, ObjProbePtrs};
@@ -24,7 +25,8 @@ use ptyrs_kernels::pixel::{PIXEL_THREADS, SumPtrs};
 
 use crate::ops::grid_1d;
 use crate::{
-    C32, Error, Kernels, StackCtl, StackRef, UpdateSums, ViewAddr, ViewDims, Views, check_len, dptr,
+    C32, Error, Kernels, StackCtl, StackRef, UpdateSums, ViewAddr, ViewDims, Views, check_len,
+    dptr, lease,
 };
 
 /// The BH kernels, bound to the module a [`Kernels`] loaded.
@@ -34,27 +36,131 @@ pub struct BhKernels {
     module: bh_kernels::LoadedModule,
 }
 
-/// The scan in epoch order: the views at each epoch position and, through `order`
-/// (`nframe` scan frame ids, one per position), the counts in the scan's own order.
+/// The scan in an epoch's order: the views and frame ids of `order`, and the counts in the
+/// scan's own order, which the kernels read through the ids.
 #[derive(Clone, Copy)]
 pub struct BhScan<'a> {
-    pub views: &'a Views,
+    pub order: &'a EpochOrder,
     pub counts: &'a DeviceBuffer<u16>,
-    pub order: &'a DeviceBuffer<u32>,
 }
 
 impl BhScan<'_> {
     fn check(&self) -> Result<&ViewDims, Error> {
-        let dims = self.views.dims();
+        let dims = self.order.views.dims();
         check_len("counts", self.counts, dims.nframe as usize * dims.n())?;
-        check_len("order", self.order, dims.nframe as usize)?;
         Ok(dims)
     }
 
     fn obs(&self) -> BhObs {
         BhObs {
             counts: dptr(self.counts),
-            order: dptr(self.order),
+            order: dptr(&self.order.ids),
+        }
+    }
+}
+
+/// Host slots of [`EpochOrder::set`]'s uploads: the host waits for a copy only when it comes
+/// round to that copy's slot again.
+const ORDER_SLOTS: usize = 4;
+
+/// A scan's frames in an epoch's order: `nframe` scan frame ids, one per epoch position, and
+/// the scan's views reordered by them. [`Self::set`] is the only writer of either and takes
+/// only a permutation of `0 .. nframe`, so every id indexes a frame. Its uploads go through
+/// pinned host slots, so the host does not wait on the stream.
+pub struct EpochOrder {
+    ids: DeviceBuffer<u32>,
+    views: Views,
+    /// The ids the device holds; empty after a [`Self::set`] that failed midway.
+    last: Vec<u32>,
+    host: PinnedHostBuffer<u32>,
+    /// Per host slot, the event after the last copy out of it.
+    copies: [Option<Event>; ORDER_SLOTS],
+    next: usize,
+}
+
+impl EpochOrder {
+    /// `src`'s frames in their own order, set on `stream`.
+    pub fn new(kernels: &Kernels, stream: &Arc<CudaStream>, src: &Views) -> Result<Self, Error> {
+        let nframe = src.dims().nframe as usize;
+        let mut order = Self {
+            ids: DeviceBuffer::zeroed(stream, nframe)?,
+            views: Views::reordered(stream, src)?,
+            last: Vec::new(),
+            host: PinnedHostBuffer::zeroed(kernels.context(), ORDER_SLOTS * nframe)?,
+            copies: Default::default(),
+            next: 0,
+        };
+        let ids: Vec<u32> = (0..nframe as u32).collect();
+        order.set(&ExecutionContext::new(stream.clone()), kernels, src, &ids)?;
+        Ok(order)
+    }
+
+    /// The views in epoch order.
+    pub fn views(&self) -> &Views {
+        &self.views
+    }
+
+    /// Enqueues on `ctx` the upload of `ids`, the scan frame at each epoch position, and the
+    /// reorder of `src`, the views this order was made from, by them; nothing when the
+    /// device already holds `ids`. Waits only for the copy [`ORDER_SLOTS`] uploads back.
+    pub fn set(
+        &mut self,
+        ctx: &ExecutionContext,
+        kernels: &Kernels,
+        src: &Views,
+        ids: &[u32],
+    ) -> Result<(), Error> {
+        if ids == self.last {
+            return Ok(());
+        }
+        let n = self.ids.len();
+        let mut seen = vec![false; n];
+        let fresh = |id: &u32| {
+            seen.get_mut(*id as usize)
+                .is_some_and(|s| !std::mem::replace(s, true))
+        };
+        if ids.len() != n || !ids.iter().all(fresh) {
+            return Err(Error::Shape(format!(
+                "epoch order of {} ids is not a permutation of 0 .. {n}",
+                ids.len()
+            )));
+        }
+        if ctx.context().as_ref() != self.host.context().as_ref() {
+            return Err(Error::ContextMismatch);
+        }
+        self.last.clear();
+        let slot = self.next;
+        if let Some(copy) = self.copies[slot].take() {
+            copy.synchronize()?;
+        }
+        let host = &mut self.host.as_mut_slice()[slot * n..(slot + 1) * n];
+        host.copy_from_slice(ids);
+        lease(ctx, &[], &[self.ids.storage()])?;
+        ctx.context().bind_to_thread()?;
+        let stream = ctx.get_cuda_stream();
+        // SAFETY: the host slot holds `n` ids and is not written again before this copy's
+        // event completes; `ids` holds `n`, leased for writing on this stream.
+        unsafe {
+            cuda_core::memory::memcpy_htod_async(
+                self.ids.cu_deviceptr(),
+                host.as_ptr(),
+                size_of_val(host),
+                stream.cu_stream(),
+            )?
+        };
+        self.copies[slot] = Some(stream.record_event(None)?);
+        self.next = (slot + 1) % ORDER_SLOTS;
+        kernels.reorder_views(ctx, src, &self.ids, &mut self.views)?;
+        self.last.extend_from_slice(ids);
+        Ok(())
+    }
+}
+
+impl Drop for EpochOrder {
+    fn drop(&mut self) {
+        // The copies read `host`, freed after this.
+        for copy in self.copies.iter().flatten() {
+            let _ = copy.synchronize();
         }
     }
 }
@@ -184,12 +290,12 @@ impl BhKernels {
         let config = grid_1d(nf_max * n)?;
         let reads = [
             scan.counts.storage(),
-            scan.order.storage(),
+            scan.order.ids.storage(),
             psi.storage(),
             stack.storage(),
         ];
         self.base.launch(ctx, &reads, &[r.storage()], |stream| {
-            // SAFETY: lengths checked above; `order` holds frame ids below `nframe`.
+            // SAFETY: lengths checked above; `EpochOrder` holds frame ids below `nframe`.
             unsafe {
                 self.module.bh_residual(
                     stream,
@@ -333,9 +439,9 @@ impl BhKernels {
             shared_mem_bytes: 0,
         };
         let mut reads = vec![
-            scan.views.addr().storage(),
+            scan.order.views.addr().storage(),
             scan.counts.storage(),
-            scan.order.storage(),
+            scan.order.ids.storage(),
             f.psi.storage(),
             f.r.storage(),
             f.lu.storage(),
@@ -352,14 +458,14 @@ impl BhKernels {
                 lv: dptr(f.lv),
             };
             // SAFETY: lengths checked above; one block of PIXEL_THREADS per chunk and frame;
-            // `order` holds frame ids below `nframe`.
+            // `EpochOrder` holds frame ids below `nframe`.
             unsafe {
                 self.module.bh_hess_frames(
                     stream,
                     config,
                     fields,
                     d.ptrs(),
-                    dptr::<ViewAddr, ViewAddr>(scan.views.addr()),
+                    dptr::<ViewAddr, ViewAddr>(scan.order.views.addr()),
                     scan.obs(),
                     out,
                     stack.ctl() as *const StackCtl,
