@@ -1036,6 +1036,22 @@ fn views_and_frame_ranges_are_checked() {
     assert!(shape_err(with(|v| v.fx = -0.1)), "fx < 0");
     assert!(shape_err(with(|v| v.probe = 2)), "probe mode out of range");
     assert!(shape_err(with(|v| v.obj = 2)), "object mode out of range");
+    // Frame 1 mode 2 must be probe 0 times object 1 at the frame's (25, 28, 0.25, 0).
+    assert!(shape_err(with(|v| v.probe = 1)), "probe not m % nprobe");
+    assert!(shape_err(with(|v| v.obj = 0)), "object not m / nprobe");
+    assert!(shape_err(with(|v| v.oy = 24)), "mode off the frame's row");
+    assert!(
+        shape_err(with(|v| v.fx = 0.5)),
+        "mode off the frame's subpixel"
+    );
+    let uneven = ViewDims { nobj: 1, ..s.d };
+    assert!(
+        matches!(
+            StackTable::new(&stream, &uneven, std::slice::from_ref(&(0..1))),
+            Err(Error::Shape(_))
+        ),
+        "nmode != nprobe * nobj"
+    );
     let odd = ViewDims {
         frame: [24, 31],
         ..s.d
