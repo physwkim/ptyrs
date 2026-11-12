@@ -31,8 +31,8 @@
 //! # PyNX AP / DM in these calls (per stack, then per cycle)
 //!
 //! AP: `obj_probe_to_psi`, FFT, `apply_amplitude`, inverse FFT, `psi_to_obj` and/or
-//! `psi_to_probe` into zeroed sums; after the last stack, `update_obj_from_sums` with inertia
-//! 0.01 (object) or `update_from_sums` with 0.001 (probe).
+//! `psi_to_probe` into the sums; after the last stack, `update_obj_from_sums` with inertia
+//! 0.01 (object) or `update_from_sums` with 0.001 (probe), which consume the sums.
 //!
 //! DM (`alpha` 0.02, `psi` kept per stack across cycles): `obj_probe_to_psi` into a scratch
 //! `po`, then on the first cycle copy `po` into `psi` (PyNX starts from `psi = PO`, which
@@ -41,18 +41,17 @@
 //! new `psi`.
 //!
 //! LLK: forward FFT of `obj_probe_to_psi`, then [`Kernels::llk`] per stack; PyNX's reported
-//! (normalized) values are [`LlkSums::from_partials`] over all frames divided by the number
-//! of unmasked count pixels of the scan.
+//! (normalized) values are [`LlkSums::from_partials`] over the scan's partials indexed by
+//! frame, a tree fixed by frame index whatever the stacks or GPUs, divided by the number of
+//! unmasked count pixels of the scan.
 
 use std::ops::Range;
 
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::sys::CUdeviceptr;
 use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig, RawDeviceBuffer};
-pub use ptyrs_kernels::pixel::{LlkPartial, MASKED, OBJ_TILE, StackCtl, ViewAddr};
-use ptyrs_kernels::pixel::{
-    PIXEL_THREADS, StackGeom, SumPtrs, TilePtrs, TileSlabs, WARP, axis_tiles,
-};
+pub use ptyrs_kernels::pixel::{LlkPartial, MASKED, OBJ_TILE, StackCtl, StackGeom, ViewAddr};
+use ptyrs_kernels::pixel::{PIXEL_THREADS, SumPtrs, TilePtrs, TileSlabs, WARP, axis_tiles};
 
 use crate::{C32, Error, Kernels, check_len, dptr};
 
@@ -144,8 +143,8 @@ impl ViewDims {
     }
 
     /// The stack kernels' geometry for `stack`, whose table must have been made for a scan
-    /// of `nframe` frames.
-    fn geom(&self, stack: StackRef<'_>) -> Result<StackGeom, Error> {
+    /// of `nframe` frames: the [`StackGeom`] a stack kernel takes by value.
+    pub fn geom(&self, stack: StackRef<'_>) -> Result<StackGeom, Error> {
         self.check()?;
         let t = stack.table;
         if t.nframe != self.nframe {
@@ -266,11 +265,13 @@ impl StackRef<'_> {
         self.table.nf_max
     }
 
-    fn ctl(&self) -> *const StackCtl {
-        (self.table.ptr() + (self.s * size_of::<StackCtl>()) as CUdeviceptr) as *const StackCtl
+    /// Device address of this entry's [`StackCtl`], a stack kernel's `ctl` argument.
+    pub fn ctl(&self) -> CUdeviceptr {
+        self.table.ptr() + (self.s * size_of::<StackCtl>()) as CUdeviceptr
     }
 
-    fn storage(&self) -> &RawDeviceBuffer {
+    /// The whole table's storage, for leasing a read of the entry around a launch.
+    pub fn storage(&self) -> &RawDeviceBuffer {
         self.table.ctl.storage()
     }
 }
@@ -543,7 +544,7 @@ impl Kernels {
                     dptr(probe),
                     dptr(&views.addr),
                     dptr(psi),
-                    stack.ctl(),
+                    stack.ctl() as *const StackCtl,
                     g,
                 )
             }
@@ -570,8 +571,14 @@ impl Kernels {
         self.launch(ctx, &reads, &[icalc.storage()], |stream| {
             // SAFETY: lengths checked above.
             unsafe {
-                self.module
-                    .mode_intensity(stream, config, dptr(psi), dptr(icalc), stack.ctl(), g)
+                self.module.mode_intensity(
+                    stream,
+                    config,
+                    dptr(psi),
+                    dptr(icalc),
+                    stack.ctl() as *const StackCtl,
+                    g,
+                )
             }
         })
     }
@@ -598,8 +605,14 @@ impl Kernels {
         self.launch(ctx, &reads, &[psi.storage()], |stream| {
             // SAFETY: lengths checked above.
             unsafe {
-                self.module
-                    .apply_amplitude(stream, config, dptr(psi), dptr(counts), stack.ctl(), g)
+                self.module.apply_amplitude(
+                    stream,
+                    config,
+                    dptr(psi),
+                    dptr(counts),
+                    stack.ctl() as *const StackCtl,
+                    g,
+                )
             }
         })
     }
@@ -639,7 +652,7 @@ impl Kernels {
                     dptr(psi),
                     dptr(counts),
                     dptr(out),
-                    stack.ctl(),
+                    stack.ctl() as *const StackCtl,
                     g,
                 )
             }
@@ -688,7 +701,7 @@ impl Kernels {
                     dptr(&views.addr),
                     slabs,
                     dptr(overflow),
-                    stack.ctl(),
+                    stack.ctl() as *const StackCtl,
                     g,
                 )
             }
@@ -700,7 +713,6 @@ impl Kernels {
     /// `den` the same bilinear spread of `|P_v|^2`. Each object pixel adds its views in
     /// ascending view order, so splitting the frames into stacks does not change a bit of
     /// the result. Only the pixels of tiles the stack's views touch are read and written.
-    /// Zero `sums` before the first stack.
     pub fn psi_to_obj(
         &self,
         ctx: &ExecutionContext,
@@ -738,7 +750,7 @@ impl Kernels {
                     dptr(&views.addr),
                     views.tile_ptrs(),
                     sums.ptrs(),
-                    stack.ctl(),
+                    stack.ctl() as *const StackCtl,
                     g,
                 )
             }
@@ -748,7 +760,7 @@ impl Kernels {
     /// Adds the stack's probe-update sums (PyNX `Psi2Probe`) to `sums` `[nprobe, ny, nx]`:
     /// `num += conj(O_v exp(i quad r^2)) psi_v` and `den += |O_v|^2` over the views of each
     /// probe mode, in ascending view order (stack-split invariant); a mode without a view in
-    /// the stack is not written. Zero `sums` before the first stack.
+    /// the stack is not written.
     pub fn psi_to_probe(
         &self,
         ctx: &ExecutionContext,
@@ -781,7 +793,7 @@ impl Kernels {
                     dptr(obj),
                     dptr(&views.addr),
                     sums.ptrs(),
-                    stack.ctl(),
+                    stack.ctl() as *const StackCtl,
                     g,
                 )
             }
@@ -790,7 +802,8 @@ impl Kernels {
 
     /// Applies accumulated sums to the first `n` elements of `x` (PyNX `ObjNorm`):
     /// `x = (num + reg x) / max(den + reg, 1e-12)` with `reg = inertia * max(den[..n])`,
-    /// every operation rounded on its own. `sums.max_bits` is its scratch.
+    /// every operation rounded on its own; then zeroes `sums` over `..n`, which it consumed.
+    /// `sums.max_bits` is its scratch.
     pub fn update_from_sums(
         &self,
         ctx: &ExecutionContext,
@@ -819,16 +832,19 @@ impl Kernels {
                     .max_nonneg_f32(stream, max_config, dptr(den), n, dptr(max_bits))
             }
         })?;
-        let reads = [num.storage(), den.storage(), max_bits.storage()];
-        self.launch(ctx, &reads, &[x.storage()], |stream| {
+        let writes = [x.storage(), num.storage(), den.storage()];
+        let ptrs = SumPtrs {
+            num: dptr(num),
+            den: dptr(den),
+        };
+        self.launch(ctx, &[max_bits.storage()], &writes, |stream| {
             // SAFETY: all lengths checked above.
             unsafe {
                 self.module.normalize_update(
                     stream,
                     config,
                     dptr(x),
-                    dptr(num),
-                    dptr(den),
+                    ptrs,
                     n,
                     dptr(max_bits),
                     inertia,
@@ -838,10 +854,11 @@ impl Kernels {
     }
 
     /// [`Self::update_from_sums`] of the object `[nobj, nyo, nxo]` on the object tiles with
-    /// views only: `reg = inertia * max(den)` over their pixels, then the update of each. A
-    /// tile whose run is empty is neither read nor written, in `obj` or `sums`, so it keeps
-    /// its bits; with `den` zero there, as after [`UpdateSums::zero`], every other pixel
-    /// gets the bits `update_from_sums` gives it.
+    /// views only: `reg = inertia * max(den)` over their pixels, then the update of each,
+    /// zeroing its sums. A tile whose run is empty is neither read nor written, in `obj` or
+    /// `sums`, so it keeps its bits; when its `den` is zero, as in sums built zeroed (no stack
+    /// adds to such a tile), every other pixel gets the bits `update_from_sums` gives it.
+    /// It is [`Self::obj_den_max`] then [`Self::normalize_obj`] with `sums.max_bits`.
     pub fn update_obj_from_sums(
         &self,
         ctx: &ExecutionContext,
@@ -850,13 +867,27 @@ impl Kernels {
         sums: &mut UpdateSums,
         inertia: f32,
     ) -> Result<(), Error> {
+        self.obj_den_max(ctx, views, sums)?;
+        let UpdateSums { num, den, max_bits } = sums;
+        self.normalize_obj_tiles(ctx, views, obj, (num, den), max_bits, inertia)
+    }
+
+    /// The first step of [`Self::update_obj_from_sums`]: the bits of `max(den)` over the
+    /// pixels of the object tiles with views into `sums.max_bits`. The max is exact and
+    /// independent of order, so the largest of several devices' words is the max over the
+    /// union of their tiles.
+    pub fn obj_den_max(
+        &self,
+        ctx: &ExecutionContext,
+        views: &Views,
+        sums: &mut UpdateSums,
+    ) -> Result<(), Error> {
         let d = &views.dims;
-        check_len("obj", obj, d.obj_len())?;
         sums.check(d.obj_len())?;
         let config = d.tile_grid();
         let [nyo, nxo] = d.obj;
         let tile_len = &views.tile_len;
-        let UpdateSums { num, den, max_bits } = sums;
+        let UpdateSums { den, max_bits, .. } = sums;
         crate::zero(ctx, max_bits)?;
         let reads = [den.storage(), tile_len.storage()];
         self.launch(ctx, &reads, &[max_bits.storage()], |stream| {
@@ -872,18 +903,52 @@ impl Kernels {
                     nxo,
                 )
             }
-        })?;
-        let reads = [
-            num.storage(),
-            den.storage(),
-            tile_len.storage(),
-            max_bits.storage(),
-        ];
+        })
+    }
+
+    /// The second step of [`Self::update_obj_from_sums`], with `reg = inertia *
+    /// f32::from_bits(max_bits[0])` read on the device when it runs (a captured graph reads
+    /// whatever an exchange of [`Self::obj_den_max`] words left there): the update of each
+    /// pixel of the object tiles with views, zeroing its sums. `sums.max_bits` is not used.
+    pub fn normalize_obj(
+        &self,
+        ctx: &ExecutionContext,
+        views: &Views,
+        obj: &mut DeviceBuffer<C32>,
+        sums: &mut UpdateSums,
+        max_bits: &DeviceBuffer<u32>,
+        inertia: f32,
+    ) -> Result<(), Error> {
+        check_len("max_bits", max_bits, 1)?;
+        let UpdateSums { num, den, .. } = sums;
+        self.normalize_obj_tiles(ctx, views, obj, (num, den), max_bits, inertia)
+    }
+
+    /// [`Self::normalize_obj`] over `sums` as `(num, den)`, so that
+    /// [`Self::update_obj_from_sums`] can pass the max word of the same [`UpdateSums`].
+    fn normalize_obj_tiles(
+        &self,
+        ctx: &ExecutionContext,
+        views: &Views,
+        obj: &mut DeviceBuffer<C32>,
+        (num, den): (&mut DeviceBuffer<C32>, &mut DeviceBuffer<f32>),
+        max_bits: &DeviceBuffer<u32>,
+        inertia: f32,
+    ) -> Result<(), Error> {
+        let d = &views.dims;
+        check_len("obj", obj, d.obj_len())?;
+        check_len("sums.num", num, d.obj_len())?;
+        check_len("sums.den", den, d.obj_len())?;
+        let config = d.tile_grid();
+        let [nyo, nxo] = d.obj;
+        let tile_len = &views.tile_len;
+        let reads = [tile_len.storage(), max_bits.storage()];
+        let writes = [obj.storage(), num.storage(), den.storage()];
         let ptrs = SumPtrs {
             num: dptr(num),
             den: dptr(den),
         };
-        self.launch(ctx, &reads, &[obj.storage()], |stream| {
+        self.launch(ctx, &reads, &writes, |stream| {
             // SAFETY: all lengths checked above.
             unsafe {
                 self.module.normalize_tiles(
@@ -952,11 +1017,14 @@ impl Kernels {
 
 /// Numerator and denominator of an object or probe update (PyNX `obj_new`, `obj_norm`),
 /// element `i` of `den` belonging to element `i` of `num`, with the scratch the update
-/// needs, so that no launch allocates.
+/// needs, so that no launch allocates. They hold what was accumulated since the last
+/// [`Kernels::update_from_sums`], [`Kernels::update_obj_from_sums`] or
+/// [`Kernels::normalize_obj`] consumed them; the only other reset is construction.
 pub struct UpdateSums {
     pub num: DeviceBuffer<C32>,
     pub den: DeviceBuffer<f32>,
-    /// One word: [`Kernels::update_from_sums`] writes the bits of `max(den)` here.
+    /// One word: [`Kernels::update_from_sums`] and [`Kernels::obj_den_max`] write the bits of
+    /// `max(den)` here.
     pub max_bits: DeviceBuffer<u32>,
 }
 
@@ -980,12 +1048,6 @@ impl UpdateSums {
             den,
             max_bits: DeviceBuffer::zeroed(stream, 1)?,
         })
-    }
-
-    /// Zeroes `num` and `den` on `ctx`'s stream.
-    pub fn zero(&mut self, ctx: &ExecutionContext) -> Result<(), Error> {
-        crate::zero(ctx, &mut self.num)?;
-        crate::zero(ctx, &mut self.den)
     }
 
     fn check(&self, need: usize) -> Result<(), Error> {

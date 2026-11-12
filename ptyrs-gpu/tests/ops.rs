@@ -511,16 +511,132 @@ fn object_update_skips_tiles_without_views() {
         c32_bits(&flat_obj.to_host_vec(&stream).unwrap()),
         c32_bits(&s.obj),
     );
-    let den = tiled.den.to_host_vec(&stream).unwrap();
+    let (num, den) = (
+        c32_bits(&tiled.num.to_host_vec(&stream).unwrap()),
+        tiled.den.to_host_vec(&stream).unwrap(),
+    );
     for i in 0..len {
         let want = if lit(i) { flat[i] } else { start[i] };
         assert_eq!(got[i], want, "pixel {i}, tile with views: {}", lit(i));
-        if !lit(i) {
-            assert_eq!(den[i].to_bits(), den0[i].to_bits(), "den {i} written");
-        }
+        // The update consumes the sums of the tiles with views and touches no other.
+        let (num_want, den_want) = if lit(i) {
+            ((0, 0), 0)
+        } else {
+            (c32_bits(&[nan])[0], den0[i].to_bits())
+        };
+        assert_eq!(num[i], num_want, "num {i}, tile with views: {}", lit(i));
+        assert_eq!(
+            den[i].to_bits(),
+            den_want,
+            "den {i}, tile with views: {}",
+            lit(i)
+        );
     }
     let moved = (0..len).filter(|&i| got[i] != start[i]).count();
     assert!(moved > nlit / 2, "only {moved} of {nlit} pixels updated");
+}
+
+/// `obj_den_max` writes the max of `den` over the tiles with views; `normalize_obj` with that
+/// word gives the bits of `update_obj_from_sums`, and with a larger word from elsewhere (the
+/// max another device holds) the plain f32 formula at that max, on the tiles with views only.
+#[test]
+fn object_update_split_takes_the_max_it_is_given() {
+    let (stream, ex, k) = setup();
+    let s = scan_in([80, 96]);
+    let len = s.obj.len();
+    let views = Views::new(&stream, s.d, &s.views).unwrap();
+    let all = one_stack(&stream, &s.d, 0..5);
+    let probe = up(&stream, &s.probe);
+    let psi = up(&stream, &noise(s.nk(&(0..5)) * s.n(), 6, 1.0));
+    let [nyo, nxo] = s.d.obj.map(|v| v as usize);
+    let (t, ntx) = (OBJ_TILE as usize, nxo.div_ceil(OBJ_TILE as usize));
+    let tile_len = views.tile_len().to_host_vec(&stream).unwrap();
+    let lit = |i: usize| tile_len[(i / nxo % nyo) / t * ntx + i % nxo / t] != 0;
+    // Unlit pixels carry a den above every lit one: read, it would become the max.
+    let den0: Vec<f32> = (0..len).map(|i| if lit(i) { 0.0 } else { 1e30 }).collect();
+    let start = (vec![C32::default(); len], den0);
+    let accumulated = || {
+        let mut sums = sums(&stream, &start);
+        k.psi_to_obj(&ex, &views, all.at(0), &psi, &probe, &mut sums)
+            .unwrap();
+        sums
+    };
+    let host_sums = |sums: &UpdateSums| {
+        (
+            sums.num.to_host_vec(&stream).unwrap(),
+            sums.den.to_host_vec(&stream).unwrap(),
+        )
+    };
+
+    let mut joined = up(&stream, &s.obj);
+    let mut sums = accumulated();
+    let (num, den) = host_sums(&sums);
+    k.update_obj_from_sums(&ex, &views, &mut joined, &mut sums, 0.01)
+        .unwrap();
+    let joined = c32_bits(&joined.to_host_vec(&stream).unwrap());
+    let joined_sums = host_sums(&sums);
+
+    let local = (0..len)
+        .filter(|&i| lit(i))
+        .fold(0.0f32, |m, i| m.max(den[i]));
+    let mut sums = accumulated();
+    k.obj_den_max(&ex, &views, &mut sums).unwrap();
+    let word = sums.max_bits.to_host_vec(&stream).unwrap()[0];
+    assert_eq!(word, local.to_bits(), "obj_den_max");
+    let mut split = up(&stream, &s.obj);
+    let max = up(&stream, &[word]);
+    k.normalize_obj(&ex, &views, &mut split, &mut sums, &max, 0.01)
+        .unwrap();
+    assert!(
+        c32_bits(&split.to_host_vec(&stream).unwrap()) == joined,
+        "split object differs from update_obj_from_sums"
+    );
+    let split_sums = host_sums(&sums);
+    assert!(
+        c32_bits(&split_sums.0) == c32_bits(&joined_sums.0)
+            && split_sums
+                .1
+                .iter()
+                .map(|v| v.to_bits())
+                .eq(joined_sums.1.iter().map(|v| v.to_bits())),
+        "split sums differ from update_obj_from_sums"
+    );
+
+    let global = 4.0 * local;
+    let mut sums = accumulated();
+    let mut obj = up(&stream, &s.obj);
+    let max = up(&stream, &[global.to_bits()]);
+    k.normalize_obj(&ex, &views, &mut obj, &mut sums, &max, 0.01)
+        .unwrap();
+    let got = c32_bits(&obj.to_host_vec(&stream).unwrap());
+    let reg = 0.01f32 * global;
+    for i in 0..len {
+        let want = if lit(i) {
+            let d = (den[i] + reg).max(1e-12);
+            let part = |a: f32, b: f32| (a + reg * b) / d;
+            let (a, b) = (num[i], s.obj[i]);
+            (part(a.re, b.re).to_bits(), part(a.im, b.im).to_bits())
+        } else {
+            c32_bits(&s.obj[i..=i])[0]
+        };
+        assert_eq!(got[i], want, "pixel {i}, tile with views: {}", lit(i));
+    }
+    let (num_after, den_after) = host_sums(&sums);
+    for i in (0..len).filter(|&i| lit(i)) {
+        assert_eq!(
+            (c32_bits(&num_after[i..=i])[0], den_after[i].to_bits()),
+            ((0, 0), 0),
+            "sums at {i} not consumed"
+        );
+    }
+    let short = DeviceBuffer::<u32>::zeroed(&stream, 0).unwrap();
+    assert!(
+        matches!(
+            k.normalize_obj(&ex, &views, &mut obj, &mut sums, &short, 0.01),
+            Err(Error::Shape(_))
+        ),
+        "max_bits without its word"
+    );
 }
 
 /// [`Views::from_parts`] over slabs with padding past each run (the live layout) gives the
@@ -676,12 +792,30 @@ fn update_from_sums_matches_f64() {
                 ((a.0 + reg * b.0) / d, (a.1 + reg * b.1) / d)
             })
             .collect();
+        // A tail past `n` the update must neither use nor consume.
+        let tail = (C32 { re: 5.0, im: -5.0 }, 1e30f32);
+        let (mut num_t, mut den_t) = (num_host.clone(), den_host.clone());
+        num_t.push(tail.0);
+        den_t.push(tail.1);
         let mut x = up(&stream, &x_host);
-        let mut sums =
-            UpdateSums::new(up(&stream, &num_host), up(&stream, &den_host), &stream).unwrap();
+        let mut sums = UpdateSums::new(up(&stream, &num_t), up(&stream, &den_t), &stream).unwrap();
         k.update_from_sums(&ex, &mut x, &mut sums, len as u32, inertia)
             .unwrap();
         let got = x.to_host_vec(&stream).unwrap();
+        let (num_after, den_after) = (
+            sums.num.to_host_vec(&stream).unwrap(),
+            sums.den.to_host_vec(&stream).unwrap(),
+        );
+        assert!(
+            num_after[..len] == vec![C32::default(); len][..]
+                && den_after[..len] == vec![0.0; len][..],
+            "n={len}: consumed sums not zeroed"
+        );
+        assert_eq!(
+            (num_after[len], den_after[len]),
+            tail,
+            "n={len}: tail written"
+        );
         let err = rel_l2(&got, &want);
         println!("update_from_sums n={len}: rel L2 {err:.2e}");
         assert!(err < 1e-6, "n={len}: rel L2 {err:.2e}");
@@ -1011,7 +1145,8 @@ fn view_tiles_cover_the_pixels_each_view_reads() {
     }
 }
 
-/// Every stack launch over one stack, on buffers it zeroes first.
+/// Every stack launch over one stack, on per-stack outputs it zeroes first; the update sums
+/// accumulate across runs.
 struct StackRun {
     obj: DeviceBuffer<C32>,
     probe: DeviceBuffer<C32>,
@@ -1044,12 +1179,15 @@ impl StackRun {
         stack: StackRef<'_>,
         counts: &DeviceBuffer<u16>,
     ) -> Result<(), Error> {
+        self.clear(ctx)?;
+        self.ops(ctx, k, views, stack, counts)
+    }
+
+    /// Zeroes the per-stack outputs.
+    fn clear(&mut self, ctx: &ExecutionContext) -> Result<(), Error> {
         ptyrs_gpu::zero(ctx, &mut self.psi)?;
         ptyrs_gpu::zero(ctx, &mut self.icalc)?;
-        ptyrs_gpu::zero(ctx, &mut self.llk)?;
-        self.obj_sums.zero(ctx)?;
-        self.probe_sums.zero(ctx)?;
-        self.ops(ctx, k, views, stack, counts)
+        ptyrs_gpu::zero(ctx, &mut self.llk)
     }
 
     /// The stack launches alone, onto whatever the buffers hold.
@@ -1128,8 +1266,8 @@ impl StackRun {
 }
 
 /// A graph captured once on a device-written entry runs whichever stack the entry holds when
-/// it replays, bit for bit like eager launches on a host-made table, and an entry past
-/// `nf_max` or the scan is clamped.
+/// it replays, bit for bit like eager launches on a host-made table, sums accumulating over
+/// the replays, and an entry past `nf_max` or the scan is clamped.
 #[test]
 fn one_graph_runs_whichever_stack_its_entry_holds() {
     let (stream, _, k) = setup();
@@ -1146,8 +1284,9 @@ fn one_graph_runs_whichever_stack_its_entry_holds() {
             eager.bits(&stream)
         })
         .collect();
-    // f0 past the scan: no frames.
-    want.push(vec![0; want[0].len()]);
+    // f0 past the scan: no frames, so the outputs stay zeroed and the sums as they were.
+    record(|ctx| eager.clear(ctx)).sync_on(&stream).unwrap();
+    want.push(eager.bits(&stream));
 
     let dev = StackTable::device(&stream, &s.d, 3).unwrap();
     let mut it = StackRun::new(&stream, &s, dev.nf_max());
@@ -1361,8 +1500,6 @@ impl Iteration {
         let d = *views.dims();
         let stack = self.stacks.at(0);
         let nk = self.psi.len() as u32;
-        self.obj_sums.zero(ctx)?;
-        self.probe_sums.zero(ctx)?;
         k.obj_probe_to_psi(ctx, views, stack, &self.obj, &self.probe, &mut self.po)?;
         k.dm_reflect(ctx, &mut self.psi, &mut self.po, nk, 0.02)?;
         k.mode_intensity(ctx, &d, stack, &self.psi, &mut self.icalc)?;
