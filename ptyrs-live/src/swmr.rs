@@ -5,9 +5,9 @@
 //! it (pty-sim `--out h5`); [`run_swmr`] turns it into the same [`Work`]
 //! events as the PVA and ZMQ sources.
 //!
-//! rust-hdf5 0.7.10's `SwmrFileReader` hands out decoded slices only, so
-//! the reader threads here decode and the frames reach the workers as
-//! [`Codec::None`].
+//! The reader threads take each frame's stored chunk as it stands
+//! (`SwmrFileReader::read_chunk_raw`); the workers decode it as they do a
+//! PVA or ZMQ frame, a bslz4 one only over the crop rows.
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -16,11 +16,12 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use crossbeam_channel::{Receiver, Sender};
-use rust_hdf5::FilterPipeline;
+use rust_hdf5::format::messages::filter::{BSHUF_COMPRESS_LZ4, FILTER_BSHUF, FILTER_LZ4};
 use rust_hdf5::swmr::{SwmrFileReader, SwmrFileWriter};
+use rust_hdf5::{Filter, FilterPipeline, H5File};
 
-use crate::codec::{Codec, bslz4_compress_u16, bytemuck_u16, lz4_compress};
-use crate::eiger::{Progress, blob_prefix};
+use crate::codec::{Codec, bslz4_compress_u16, bytemuck_u16, lz4_compress, lz4_decompress_into};
+use crate::eiger::{Progress, blob_payload, blob_prefix};
 use crate::handoff::WorkTx;
 use crate::pipeline::{Placement, SourceStats, Work};
 use crate::pos::{Pos, PosTable};
@@ -182,7 +183,7 @@ pub struct SwmrReport {
     pub frames: u64,
     /// Frames visible to the index thread but not yet read, at most.
     pub max_backlog: u64,
-    /// Read and decode of one frame.
+    /// Read of one frame's chunk, its lz4 envelope taken off.
     pub read: Histogram,
 }
 
@@ -200,6 +201,94 @@ fn visible(r: &mut SwmrFileReader) -> rust_hdf5::Result<u64> {
         k = k.min(r.dataset_shape(name)?[0]);
     }
     Ok(k)
+}
+
+/// The codec [`DATA`]'s chunks are stored under, from its filter pipeline.
+fn stored_codec(filters: &[Filter]) -> Result<Codec, String> {
+    match filters {
+        [] => Ok(Codec::None),
+        [f] if f.id == FILTER_LZ4 => Ok(Codec::Lz4),
+        [f] if f.id == FILTER_BSHUF && f.cd_values.get(4) == Some(&BSHUF_COMPRESS_LZ4) => {
+            Ok(Codec::Bslz4)
+        }
+        _ => {
+            let ids: Vec<_> = filters.iter().map(|f| (f.id, &f.cd_values)).collect();
+            Err(format!(
+                "{DATA}: filters {ids:?} are not none, lz4 or bslz4"
+            ))
+        }
+    }
+}
+
+/// One stored chunk of a `w` x `h` [`DATA`] frame as the payload and codec
+/// the workers take. Bit 0 of `mask` set means the one filter was skipped
+/// and the chunk is the raw image.
+fn wire_frame(
+    stored: Codec,
+    chunk: Bytes,
+    mask: u32,
+    (w, h): (usize, usize),
+) -> Result<(Bytes, Codec), String> {
+    match (stored, mask) {
+        (Codec::None, 0) | (Codec::Lz4 | Codec::Bslz4, 1) => Ok((chunk, Codec::None)),
+        // Filter 32008's chunk is the Eiger blob.
+        (Codec::Bslz4, 0) => match blob_payload(stored, &chunk, w, h) {
+            Some(p) => Ok((p, Codec::Bslz4)),
+            None => Err("bslz4 chunk header is not the image size and default block".into()),
+        },
+        (Codec::Lz4, 0) => unwrap_lz4(chunk, w * h * 2),
+        _ => Err(format!("filter mask {mask:#x} on a {stored:?} chunk")),
+    }
+}
+
+/// Filter 32004's chunk: [u64 BE total][u32 BE block], then per block of
+/// `block` bytes, the last one short, [u32 BE stored] and the block, raw
+/// when `stored` is its size, else lz4. The workers' lz4 is one block, so
+/// a chunk of several is decoded here.
+fn unwrap_lz4(c: Bytes, image: usize) -> Result<(Bytes, Codec), String> {
+    let be = |at: usize, n: usize| {
+        c.get(at..at + n)
+            .map(|b| b.iter().fold(0u64, |v, &x| (v << 8) | x as u64))
+            .ok_or_else(|| format!("lz4 chunk of {} bytes ends in a header", c.len()))
+    };
+    let (total, block) = (be(0, 8)?, be(8, 4)? as usize);
+    if total != image as u64 || block == 0 {
+        return Err(format!(
+            "lz4 chunk of {total} bytes in {block}-byte blocks for a {image}-byte image"
+        ));
+    }
+    let mut at = 12;
+    let mut blocks = Vec::new();
+    for off in (0..image).step_by(block) {
+        let len = block.min(image - off);
+        let stored = be(at, 4)? as usize;
+        let body = at + 4..at + 4 + stored;
+        if stored > len || body.end > c.len() {
+            return Err(format!("lz4 block at {off} stores {stored} of {len} bytes"));
+        }
+        at = body.end;
+        blocks.push((body, len));
+    }
+    if at != c.len() {
+        return Err(format!("{} bytes after the last lz4 block", c.len() - at));
+    }
+    if let [(body, len)] = &blocks[..] {
+        let codec = if body.len() == *len {
+            Codec::None
+        } else {
+            Codec::Lz4
+        };
+        return Ok((c.slice(body.clone()), codec));
+    }
+    let mut img = vec![0u8; image];
+    for ((body, len), dst) in blocks.into_iter().zip(img.chunks_mut(block)) {
+        if body.len() == len {
+            dst.copy_from_slice(&c[body]);
+        } else {
+            lz4_decompress_into(&c[body], dst).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok((Bytes::from(img), Codec::None))
 }
 
 /// Retries `op` through transient failures, sleeping `poll` in between.
@@ -284,6 +373,12 @@ pub fn run_swmr(
             cfg.height, cfg.width
         ));
     }
+    // `SwmrFileReader` does not give the filter pipeline; the dataset's
+    // header holds it from before the writer started SWMR.
+    let filters = retry(cfg.poll, &mut rep.retries, "filters", || {
+        H5File::open(&cfg.path)?.dataset(DATA)?.filters()
+    })?;
+    let stored = stored_codec(&filters)?;
     let (jtx, jrx) = crossbeam_channel::bounded::<Job>(cfg.queue);
     std::thread::scope(|sc| {
         let readers: Vec<_> = (0..cfg.readers)
@@ -293,7 +388,7 @@ pub fn run_swmr(
                     .name(format!("h5-read{i}"))
                     .spawn_scoped(sc, move || {
                         place.enter(place.readers[i].as_ref().map(std::slice::from_ref));
-                        read_frames(cfg, jrx, st, tx, progress)
+                        read_frames(cfg, stored, jrx, st, tx, progress)
                     })
                     .unwrap()
             })
@@ -364,6 +459,7 @@ fn index(
 
 fn read_frames(
     cfg: &SwmrCfg,
+    stored: Codec,
     jobs: Receiver<Job>,
     st: &Mutex<SourceStats>,
     tx: WorkTx,
@@ -374,30 +470,37 @@ fn read_frames(
         SwmrFileReader::open(&cfg.path)
     })?;
     let mut hist = Histogram::new(100_000);
-    let (mut seen, h, w) = (0u64, cfg.height as u64, cfg.width as u64);
     for job in jobs {
         let t = mono_ns();
-        // The index thread saw the frame, so one refresh shows it here.
-        let b = retry(cfg.poll, &mut retries, "frame", || {
-            if job.index >= seen {
-                r.refresh()?;
-                seen = visible(&mut r)?;
+        let at = [job.index, 0, 0];
+        let (chunk, mask) = retry(cfg.poll, &mut retries, "frame", || {
+            if let Some(c) = r.read_chunk_raw(DATA, &at)? {
+                return Ok(c);
             }
-            r.read_slice_raw(DATA, &[job.index, 0, 0], &[1, h, w])
+            // The index thread saw the frame, so a refresh shows it.
+            r.refresh()?;
+            r.read_chunk_raw(DATA, &at)?
+                .ok_or_else(|| rust_hdf5::Hdf5Error::NotFound(format!("frame {}", job.index)))
         })?;
+        let frame = wire_frame(stored, Bytes::from(chunk), mask, (cfg.width, cfg.height));
         hist.record(mono_ns() - t);
         let mut s = st.lock().unwrap();
-        // Received once read, not once visible: a finished file's whole
-        // backlog is visible at once. Stamped under the lock, so receive
-        // times keep the queue's order.
-        let work = Work {
-            payload: Bytes::from(b),
-            codec: Codec::None,
-            uid: job.uid,
-            t_rx: wall_ns(),
-            t_pub: job.t_pub,
-        };
-        s.accept(work, &tx);
+        match frame {
+            // Received once read, not once visible: a finished file's whole
+            // backlog is visible at once. Stamped under the lock, so receive
+            // times keep the queue's order.
+            Ok((payload, codec)) => {
+                let work = Work {
+                    payload,
+                    codec,
+                    uid: job.uid,
+                    t_rx: wall_ns(),
+                    t_pub: job.t_pub,
+                };
+                s.accept(work, &tx);
+            }
+            Err(e) => s.reject(format!("frame {}: {e}", job.index)),
+        }
         progress.publish(&s);
     }
     Ok((hist, retries))
@@ -408,6 +511,7 @@ mod tests {
     use std::sync::atomic::AtomicBool;
 
     use super::*;
+    use crate::codec::{Bslz4Scratch, bslz4_decompress_into_u16, bytemuck_u16_mut};
 
     /// Removed when the test ends, pass or fail.
     struct Tmp(PathBuf);
@@ -469,7 +573,7 @@ mod tests {
         cfg: &SwmrCfg,
         frames: u64,
         writer: impl FnOnce() + Send,
-    ) -> (Vec<Work>, PosTable, Result<SwmrReport, String>) {
+    ) -> (Vec<Work>, PosTable, Result<SwmrReport, String>, SourceStats) {
         let st = Mutex::new(SourceStats::new(frames));
         let pos = PosTable::new(1 << 12);
         let (tx, rx) = crate::handoff::work_queue((frames as usize).try_into().unwrap());
@@ -488,16 +592,31 @@ mod tests {
             stop.store(true, Ordering::Relaxed);
             src.join().unwrap()
         });
-        (got, pos, rep)
+        (got, pos, rep, st.into_inner().unwrap())
     }
 
-    fn check(got: &[Work], pos: &PosTable, frames: i32) {
+    /// The image a worker decodes from `w`.
+    fn decoded(w: &Work) -> Vec<u8> {
+        let mut img = vec![0u16; W * H];
+        match w.codec {
+            Codec::None => return w.payload.to_vec(),
+            Codec::Lz4 => lz4_decompress_into(&w.payload, bytemuck_u16_mut(&mut img)).unwrap(),
+            Codec::Bslz4 => {
+                let mut bs = Bslz4Scratch::default();
+                bslz4_decompress_into_u16(&w.payload, &mut img, &mut bs).unwrap()
+            }
+        }
+        bytemuck_u16(&img).to_vec()
+    }
+
+    /// Every frame arrived once, in `codec`, with its position and stamps.
+    fn check(got: &[Work], pos: &PosTable, frames: i32, codec: Codec) {
         let mut uids: Vec<i32> = got.iter().map(|w| w.uid).collect();
         uids.sort_unstable();
         assert_eq!(uids, (0..frames).collect::<Vec<_>>());
         for w in got {
-            assert_eq!(w.codec, Codec::None);
-            assert_eq!(&w.payload[..], bytemuck_u16(&frame(w.uid)), "uid {}", w.uid);
+            assert_eq!(w.codec, codec, "uid {}", w.uid);
+            assert_eq!(decoded(w), bytemuck_u16(&frame(w.uid)), "uid {}", w.uid);
             assert_eq!(w.t_pub, wall_of(w.uid));
             let p = pos.get(w.uid).expect("position posted");
             assert_eq!((p.x, p.y), pos_of(w.uid));
@@ -516,9 +635,11 @@ mod tests {
             let mut out = SwmrOut::create(&t.0, codec, (W, H)).unwrap();
             write(&mut out, codec, 0..40);
             out.close().unwrap();
-            let (got, pos, rep) = follow(&cfg(&t.0, 2), 40, || {});
+            let (got, pos, rep, st) = follow(&cfg(&t.0, 2), 40, || {});
             let rep = rep.unwrap();
-            check(&got, &pos, 40);
+            // Every frame compresses, so none leaves the lz4 filter raw.
+            check(&got, &pos, 40, codec);
+            assert_eq!(st.rejected, 0, "{codec:?}");
             assert_eq!(rep.frames, 40, "{codec:?}");
             // The NDFileHDF5 link to the frames.
             let mut r = SwmrFileReader::open(&t.0).unwrap();
@@ -535,7 +656,7 @@ mod tests {
         let codec = Codec::Bslz4;
         let n = 300;
         let path = t.0.clone();
-        let (got, pos, rep) = follow(&cfg(&t.0, 3), n as u64, move || {
+        let (got, pos, rep, _) = follow(&cfg(&t.0, 3), n as u64, move || {
             std::thread::sleep(Duration::from_millis(20));
             // The writer is not Send; it lives on this thread.
             let mut out = SwmrOut::create(&path, codec, (W, H)).unwrap();
@@ -548,7 +669,7 @@ mod tests {
             out.close().unwrap();
         });
         let rep = rep.unwrap();
-        check(&got, &pos, n);
+        check(&got, &pos, n, codec);
         assert_eq!(rep.frames, n as u64);
         assert!(rep.refreshes > n as u64 / 7, "{} refreshes", rep.refreshes);
     }
@@ -573,6 +694,129 @@ mod tests {
         let mut r = SwmrFileReader::open(&t.0).unwrap();
         let b = r.read_slice_raw(DATA, &[0, 0, 0], &[1, H as u64, W as u64]);
         assert_eq!(b.unwrap(), bytemuck_u16(&img));
+        let (got, _, rep, _) = follow(&cfg(&t.0, 1), 1, || {});
+        rep.unwrap();
+        assert_eq!(got[0].codec, Codec::None);
+        assert_eq!(&got[0].payload[..], bytemuck_u16(&img));
+    }
+
+    /// Filter 32004 with 256-byte blocks over the 768-byte frame: the first
+    /// and last lz4, the middle one raw.
+    fn three_block_chunk(img: &[u16]) -> Vec<u8> {
+        let raw = bytemuck_u16(img);
+        let mut c = (raw.len() as u64).to_be_bytes().to_vec();
+        c.extend_from_slice(&256u32.to_be_bytes());
+        for (i, b) in raw.chunks(256).enumerate() {
+            let z = lz4_compress(b);
+            let body: &[u8] = if i == 1 { b } else { &z };
+            assert!(i == 1 || z.len() < b.len());
+            c.extend_from_slice(&(body.len() as u32).to_be_bytes());
+            c.extend_from_slice(body);
+        }
+        c
+    }
+
+    /// The reader takes an lz4 chunk of several blocks apart into the image;
+    /// rust-hdf5's own decode of the same chunk says the framing is 32004's.
+    #[test]
+    fn an_lz4_chunk_of_several_blocks_reaches_the_workers_decoded() {
+        assert_eq!(W * H * 2, 768);
+        let t = tmp("lz4-blocks");
+        let mut out = SwmrOut::create(&t.0, Codec::Lz4, (W, H)).unwrap();
+        for uid in 0..3 {
+            let c = three_block_chunk(&frame(uid));
+            out.append(&c, uid, pos_of(uid), wall_of(uid)).unwrap();
+        }
+        out.close().unwrap();
+        let mut r = SwmrFileReader::open(&t.0).unwrap();
+        let b = r.read_slice_raw(DATA, &[1, 0, 0], &[1, H as u64, W as u64]);
+        assert_eq!(b.unwrap(), bytemuck_u16(&frame(1)));
+        let (got, pos, rep, st) = follow(&cfg(&t.0, 2), 3, || {});
+        rep.unwrap();
+        check(&got, &pos, 3, Codec::None);
+        assert_eq!(st.rejected, 0);
+    }
+
+    /// A chunk whose lz4 framing does not hold the image is rejected and
+    /// counted; the frames around it still arrive.
+    #[test]
+    fn a_malformed_lz4_chunk_is_rejected_and_the_run_goes_on() {
+        let t = tmp("lz4-bad");
+        let mut out = SwmrOut::create(&t.0, Codec::Lz4, (W, H)).unwrap();
+        write(&mut out, Codec::Lz4, 0..2);
+        let mut c = filtered_chunk(Codec::Lz4, &frame(2), W, H);
+        c.push(0);
+        out.append(&c, 2, pos_of(2), wall_of(2)).unwrap();
+        out.close().unwrap();
+        let (got, _, rep, st) = follow(&cfg(&t.0, 1), 2, || {});
+        rep.unwrap();
+        let uids: Vec<i32> = got.iter().map(|w| w.uid).collect();
+        assert_eq!(uids, [0, 1]);
+        assert_eq!(st.rejected, 1);
+        let e = st.first_error.unwrap();
+        assert!(
+            e.contains("frame 2: 1 bytes after the last lz4 block"),
+            "{e}"
+        );
+    }
+
+    /// The stored chunk under each filter mask, and each way an lz4
+    /// envelope can fail to hold the image.
+    #[test]
+    fn wire_frame_follows_the_filter_mask_and_the_lz4_framing() {
+        let img = frame(3);
+        let lz = Bytes::from(filtered_chunk(Codec::Lz4, &img, W, H));
+        let bs = Bytes::from(filtered_chunk(Codec::Bslz4, &img, W, H));
+        let raw = Bytes::copy_from_slice(bytemuck_u16(&img));
+        let (p, c) = wire_frame(Codec::Lz4, lz.clone(), 0, (W, H)).unwrap();
+        assert_eq!((&p[..], c), (&lz[16..], Codec::Lz4));
+        let (p, c) = wire_frame(Codec::Bslz4, bs.clone(), 0, (W, H)).unwrap();
+        assert_eq!((&p[..], c), (&bs[12..], Codec::Bslz4));
+        let e = wire_frame(Codec::Bslz4, bs.clone(), 0, (H, H)).unwrap_err();
+        assert!(e.contains("not the image size and default block"), "{e}");
+        let mut c = bs.to_vec();
+        c[11] ^= 1;
+        let e = wire_frame(Codec::Bslz4, c.into(), 0, (W, H)).unwrap_err();
+        assert!(e.contains("not the image size and default block"), "{e}");
+        for stored in [Codec::None, Codec::Lz4, Codec::Bslz4] {
+            let mask = (stored != Codec::None) as u32;
+            let got = wire_frame(stored, raw.clone(), mask, (W, H));
+            assert_eq!(got, Ok((raw.clone(), Codec::None)), "{stored:?}");
+        }
+        for (stored, mask) in [(Codec::None, 1), (Codec::Lz4, 2), (Codec::Bslz4, 3)] {
+            let e = wire_frame(stored, raw.clone(), mask, (W, H)).unwrap_err();
+            assert!(e.starts_with("filter mask"), "{e}");
+        }
+        let bad = |c: &[u8]| wire_frame(Codec::Lz4, Bytes::copy_from_slice(c), 0, (W, H));
+        assert!(bad(&lz[..10]).unwrap_err().contains("ends in a header"));
+        assert!(bad(&lz[..14]).unwrap_err().contains("ends in a header"));
+        assert!(bad(&lz[..lz.len() - 1]).unwrap_err().contains("stores"));
+        let mut c = lz.to_vec();
+        c[7] ^= 2;
+        assert!(bad(&c).unwrap_err().contains("for a 768-byte image"));
+        let mut c = lz.to_vec();
+        c[8..12].copy_from_slice(&0u32.to_be_bytes());
+        assert!(bad(&c).unwrap_err().contains("in 0-byte blocks"));
+        let mut c = three_block_chunk(&img);
+        let at = 12 + 4 + u32::from_be_bytes(c[12..16].try_into().unwrap()) as usize;
+        c[at..at + 4].copy_from_slice(&257u32.to_be_bytes());
+        assert!(bad(&c).unwrap_err().contains("stores 257 of 256 bytes"));
+    }
+
+    #[test]
+    fn stored_codec_takes_none_lz4_and_bslz4_only() {
+        let of = |p: FilterPipeline| stored_codec(&p.filters);
+        assert_eq!(stored_codec(&[]), Ok(Codec::None));
+        assert_eq!(of(FilterPipeline::lz4()), Ok(Codec::Lz4));
+        assert_eq!(of(FilterPipeline::bshuf_lz4(2)), Ok(Codec::Bslz4));
+        for p in [
+            FilterPipeline::bshuf(2),
+            FilterPipeline::deflate(4),
+            FilterPipeline::shuffle_deflate(2, 4),
+        ] {
+            let e = of(p).unwrap_err();
+            assert!(e.contains("are not none, lz4 or bslz4"), "{e}");
+        }
     }
 
     #[test]
@@ -583,7 +827,7 @@ mod tests {
         out.close().unwrap();
         let mut c = cfg(&t.0, 1);
         c.height = W;
-        let (got, _, rep) = follow(&c, 2, || {});
+        let (got, _, rep, _) = follow(&c, 2, || {});
         assert!(got.is_empty());
         let e = rep.err().expect("shape refused");
         assert!(e.contains("expected [n, 24, 24] u16"), "{e}");

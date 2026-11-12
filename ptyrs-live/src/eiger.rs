@@ -150,6 +150,13 @@ pub fn blob_prefix(codec: Codec, w: usize, h: usize) -> Vec<u8> {
     }
 }
 
+/// The codec payload of `blob`, `None` unless it starts with
+/// [`blob_prefix`]: the workers' bslz4 decode takes the default block only.
+pub fn blob_payload(codec: Codec, blob: &Bytes, w: usize, h: usize) -> Option<Bytes> {
+    let p = blob_prefix(codec, w, h);
+    blob.starts_with(&p).then(|| blob.slice(p.len()..))
+}
+
 pub fn end_message(series: u64) -> Vec<u8> {
     json(&Head {
         htype: "dseries_end-1.0".into(),
@@ -282,16 +289,8 @@ impl EigerFrames {
             "bs16-lz4<" => Codec::Bslz4,
             e => return Err(format!("unsupported encoding {e:?}")),
         };
-        let payload = match codec {
-            Codec::Bslz4 => {
-                let want = blob_prefix(codec, g.width, g.height);
-                if blob.len() < BSHUF_HEADER || blob[..BSHUF_HEADER] != want[..] {
-                    return Err("bs16-lz4< blob header does not match the frame".into());
-                }
-                blob.slice(BSHUF_HEADER..)
-            }
-            _ => blob.clone(),
-        };
+        let payload = blob_payload(codec, blob, g.width, g.height)
+            .ok_or("bs16-lz4< blob header does not match the frame")?;
         let t: ImageTimes = parse(times, "dconfig")?;
         Ok(Work {
             payload,
