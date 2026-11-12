@@ -201,8 +201,9 @@ impl Dip {
 mod tests {
     use burn::module::{ModuleMapper, ModuleVisitor, Param};
     use burn::tensor::DType;
+    use cuda_core::CudaContext;
     use ptyrs_core::{C64, Geometry, Object, Probe, Scan, Stack, required_obj_shape, sim};
-    use ptyrs_engine::Ptycho;
+    use ptyrs_engine::{GpuOptions, GpuPtycho, Ptycho};
 
     use super::*;
 
@@ -338,13 +339,52 @@ mod tests {
         }
 
         fn llk(&self, o: &[f64]) -> f64 {
-            let [ny, nx] = Self::SHAPE;
-            let data = o.chunks(2).map(|z| C64::new(z[0], z[1])).collect();
-            let object = Object::new(Stack::from_vec([1, ny, nx], data).unwrap());
-            Ptycho::new(&self.scan, object, self.probe.clone())
+            Ptycho::new(&self.scan, object(o, Self::SHAPE), self.probe.clone())
                 .unwrap()
                 .llk()
                 .poisson
+        }
+
+        /// The same LLK by the engine's GPU reconstruction (M1's launches: the fused passes
+        /// take no 8-pixel frames).
+        fn gpu(&self) -> Gpu {
+            let options = GpuOptions {
+                fused: false,
+                ..GpuOptions::default()
+            };
+            let ctx = CudaContext::new(0).unwrap();
+            let start = object(&vec![0.0; 2 * Self::SHAPE[0] * Self::SHAPE[1]], Self::SHAPE);
+            Gpu {
+                ptycho: GpuPtycho::new(&ctx, &self.scan, start, self.probe.clone(), options)
+                    .unwrap(),
+                nb_obs: self.scan.counts.nb_obs() as f64,
+            }
+        }
+    }
+
+    /// Interleaved real and imaginary parts as a one-mode object of `shape`.
+    fn object(o: &[f64], [ny, nx]: [usize; 2]) -> Object {
+        let data = o.chunks(2).map(|z| C64::new(z[0], z[1])).collect();
+        Object::new(Stack::from_vec([1, ny, nx], data).unwrap())
+    }
+
+    /// The engine's GPU reconstruction as the loss: its normalised Poisson LLK, and
+    /// [`GpuPtycho::ml_grads`]' object gradient of the LLK sum over the observed pixel count.
+    struct Gpu {
+        ptycho: GpuPtycho,
+        nb_obs: f64,
+    }
+
+    impl ObjectLoss for Gpu {
+        fn gradient(&mut self, o: &Tensor<3>) -> Result<(f64, Tensor<3>), LossError> {
+            let [ny, nx, _] = o.dims();
+            self.ptycho
+                .set_object(&object(&host64(o.clone()), [ny, nx]))?;
+            let llk = self.ptycho.llk()?.poisson;
+            let [g, _] = self.ptycho.ml_grads()?;
+            let n = self.nb_obs;
+            let g = g.as_slice().iter().flat_map(|c| [c.re / n, c.im / n]);
+            Ok((llk, like(o, g.collect())))
         }
     }
 
@@ -441,11 +481,13 @@ mod tests {
 
     /// Checks the weight gradient `dip` takes from `loss` against central differences of
     /// `value`, the same loss on the host object, along a random direction in each parameter
-    /// tensor. Returns the number of tensors checked.
+    /// tensor, to `tol` relative to the slope (absolute below 1). Returns the number of tensors
+    /// checked.
     fn check_weight_grads(
         dip: &Dip,
         loss: &mut impl ObjectLoss,
         mut value: impl FnMut(&[f64]) -> f64,
+        tol: f64,
     ) -> usize {
         let (_, grads) = dip.weight_grads(loss).unwrap();
         let mut collect = Collect {
@@ -469,7 +511,7 @@ mod tests {
                 - loss_at(dip, &mut value, target, step(-1.0)))
                 / (2.0 * h);
             assert!(
-                (fd - ad).abs() < 1e-6 * (1.0 + ad.abs()),
+                (fd - ad).abs() < tol * (1.0 + ad.abs()),
                 "parameter {target}: autodiff {ad:e}, finite difference {fd:e}"
             );
             checked += 1;
@@ -491,7 +533,10 @@ mod tests {
         let dip = dip64(&config, &device);
         let f = StandIn::new(shape[0] * shape[1], 1);
         // Weight and bias of 11 convolutions, scale and shift of 10 batch norms.
-        assert_eq!(check_weight_grads(&dip, &mut f.clone(), |o| f.loss(o)), 42);
+        assert_eq!(
+            check_weight_grads(&dip, &mut f.clone(), |o| f.loss(o), 1e-6),
+            42
+        );
     }
 
     #[test]
@@ -531,7 +576,26 @@ mod tests {
         let tiny = Tiny::new();
         let llk = |o: &[f64]| tiny.llk(o);
         assert_eq!(
-            check_weight_grads(&dip, &mut CentralDifferences(llk), llk),
+            check_weight_grads(&dip, &mut CentralDifferences(llk), llk, 1e-6),
+            42
+        );
+    }
+
+    /// The same check with the engine's GPU gradient, in f32 against the f64 LLK of the CPU: to
+    /// the f32 gradient's rounding (6e-6 at worst here; 1e-5 in ptyrs-engine's
+    /// `ml_grads_match_cpu`).
+    #[test]
+    fn weight_gradients_from_the_engine_gpu_gradient_match_finite_differences() {
+        let device = Device::cuda(0);
+        device.seed(5);
+        let config = DipConfig::new(Tiny::SHAPE)
+            .with_width(4)
+            .with_depth(2)
+            .with_code(3);
+        let dip = dip64(&config, &device);
+        let tiny = Tiny::new();
+        assert_eq!(
+            check_weight_grads(&dip, &mut tiny.gpu(), |o| tiny.llk(o), 2e-5),
             42
         );
     }
