@@ -10,10 +10,11 @@
 //! epochs, so an epoch's sweep covers exactly the frames landed when it was
 //! queued, as the engine's AP cycle covers its scan.
 //!
-//! With LLK recording, each epoch is also one record of an [`LlkRing`]: the
-//! ingest graph counts each frame's unmasked pixels once, the sweep graph
-//! pushes each stack's LLK partials of its forward exit waves, as the
-//! engine's AP cycle takes them, and the update graph ends the record.
+//! With LLK recording, each epoch is also one record of an [`LlkRing`]: one
+//! launch outside the graphs counts the unmasked pixels of the frames binned
+//! since the last epoch, the sweep graph pushes each stack's LLK partials of
+//! its forward exit waves, as the engine's AP cycle takes them, and the
+//! update graph ends the record.
 
 use std::num::NonZeroU32;
 use std::ops::Range;
@@ -73,7 +74,7 @@ pub struct LiveAp {
     _probe: DeviceBuffer<C32>,
     _psi: DeviceBuffer<C32>,
     _plan: Plan2d,
-    _counts: DeviceBuffer<u16>,
+    counts: DeviceBuffer<u16>,
     /// Frames the ingest graph has binned.
     binned: u32,
     epochs: u64,
@@ -120,15 +121,8 @@ impl LiveAp {
         };
         let k = &kernels;
         let ingest = {
-            let (s, counts) = (&mut scan, &counts);
-            let ring = bufs.as_mut().map(|b| b.ring.device());
-            LiveGraph::capture(stream, move |c| {
-                s.advance(k, c)?;
-                match ring {
-                    Some(r) => r.count(c, &d, s.stack(), counts),
-                    None => Ok(()),
-                }
-            })?
+            let s = &mut scan;
+            LiveGraph::capture(stream, move |c| s.advance(k, c))?
         };
         // One writer for every record: the sweep graph pushes through it and
         // the update graph ends it.
@@ -181,7 +175,7 @@ impl LiveAp {
             _probe: probe,
             _psi: psi,
             _plan: plan,
-            _counts: counts,
+            counts,
             binned: 0,
             epochs: 0,
         })
@@ -203,16 +197,23 @@ impl LiveAp {
     /// Queues one epoch over every frame landed so far, without waiting.
     pub fn epoch(&mut self) -> Result<(), GrowError> {
         let (landed, nf) = (self.scan.landed(), self.scan.frames().nf_max());
+        let binned = self.binned;
         while self.binned < landed {
             self.ingest.replay()?;
             self.binned = (self.binned + nf).min(landed);
+        }
+        let ctx = ExecutionContext::new(self.scan.stream().clone());
+        if let Some(l) = &mut self.llk {
+            l.bufs
+                .ring
+                .device()
+                .count(&ctx, binned..landed, &self.counts)?;
         }
         for _ in 0..landed.div_ceil(nf) {
             self.sweep.replay()?;
         }
         self.update.replay()?;
         if let Some(l) = &mut self.llk {
-            let ctx = ExecutionContext::new(self.scan.stream().clone());
             l.bufs.ring.enqueued(&ctx, &l.ended, self.epochs, landed)?;
         }
         self.epochs += 1;

@@ -18,11 +18,12 @@
 //! before it was counted is a [`RingError::Uncounted`].
 
 use std::collections::VecDeque;
+use std::ops::Range;
 
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaStream, DeviceBuffer, DriverError, Event, LaunchConfig, PinnedHostBuffer};
 use ptyrs_kernels::pixel::PIXEL_THREADS;
-use ptyrs_kernels::ring::{RingRecord, UNCOUNTED, ring_kernels};
+use ptyrs_kernels::ring::{COUNT_FRAMES, RingRecord, UNCOUNTED, ring_kernels};
 
 use crate::{
     Error, Kernels, LlkPartial, LlkSums, StackCtl, StackGeom, StackRef, ViewDims, check_len, dptr,
@@ -40,6 +41,8 @@ pub struct RingDevice {
     cursor: DeviceBuffer<u64>,
     /// Frame `f`'s unmasked pixels once [`Self::count`] ran on it, [`UNCOUNTED`] before.
     nobs: DeviceBuffer<u32>,
+    /// Zero between counts: within one, the chunks of frame `f` done and their pixels so far.
+    partial: DeviceBuffer<u64>,
     /// Detector pixel `p`'s unmasked frames among those [`Self::count`] ran on.
     pixel_frames: DeviceBuffer<u32>,
     nframe: u32,
@@ -54,40 +57,61 @@ impl RingDevice {
         RecordWriter { dev: self }
     }
 
-    /// Counts the unmasked pixels of the stack's frames in `counts` (`nframe` frames of the
+    /// Counts the unmasked pixels of frames `frames` in `counts` (`nframe` frames of the
     /// scan), which every later push of those frames carries, and adds each frame to
-    /// [`Self::pixel_frames`] of its unmasked pixels; after the frame's counts are in place
-    /// and before its first push. A frame counted before is skipped, so counting it again
-    /// changes neither.
+    /// [`Self::pixel_frames`] of its unmasked pixels; after the frames' counts are in place
+    /// and before their first push. A frame counted before is skipped, so counting it again
+    /// changes neither. One launch, of every pixel chunk of every frame of the range.
     pub fn count(
         &mut self,
         ctx: &ExecutionContext,
-        dims: &ViewDims,
-        stack: StackRef<'_>,
+        frames: Range<u32>,
         counts: &DeviceBuffer<u16>,
     ) -> Result<(), Error> {
-        let g = self.geom(dims, stack)?;
-        check_len("counts", counts, dims.nframe as usize * dims.n())?;
+        // `LlkRing::new` checked that `n + PIXEL_THREADS` fits.
+        let n = self.frame[0] * self.frame[1];
+        let nf = (frames.end.checked_sub(frames.start))
+            .filter(|_| frames.end <= self.nframe)
+            .ok_or_else(|| {
+                Error::Shape(format!(
+                    "frames {frames:?} of a ring of {} frames",
+                    self.nframe
+                ))
+            })?;
+        check_len("counts", counts, self.nframe as usize * n as usize)?;
+        if nf == 0 {
+            return Ok(());
+        }
+        let blocks = (n.div_ceil(PIXEL_THREADS))
+            .checked_mul(nf.div_ceil(COUNT_FRAMES))
+            .filter(|&b| b <= i32::MAX as u32)
+            .ok_or_else(|| Error::Shape(format!("{nf} frames of {n} pixels in one launch")))?;
         let config = LaunchConfig {
-            grid_dim: (g.nf_max, 1, 1),
+            grid_dim: (blocks, 1, 1),
             block_dim: (PIXEL_THREADS, 1, 1),
             shared_mem_bytes: 0,
         };
-        let reads = [counts.storage(), stack.storage()];
-        let writes = [self.nobs.storage(), self.pixel_frames.storage()];
+        let reads = [counts.storage()];
+        let writes = [
+            self.nobs.storage(),
+            self.partial.storage(),
+            self.pixel_frames.storage(),
+        ];
         self.base.launch(ctx, &reads, &writes, |stream| {
-            // SAFETY: `counts` checked above; `nobs` holds `nframe` and `pixel_frames`
-            // `frame[0] * frame[1]` since `LlkRing::new`, which `geom` checked `dims`
-            // against; one block of PIXEL_THREADS per frame.
+            // SAFETY: `counts` checked above, `frames` within `nframe`, `n + PIXEL_THREADS`
+            // within u32; `nobs` and `partial` hold `nframe` and `pixel_frames` `n` since
+            // `LlkRing::new`, and every count leaves `partial` zero.
             unsafe {
                 self.module.ring_count(
                     stream,
                     config,
                     dptr(counts),
                     dptr(&self.nobs),
+                    dptr(&self.partial),
                     dptr(&self.pixel_frames),
-                    stack.ctl() as *const StackCtl,
-                    g,
+                    frames.start,
+                    nf,
+                    n,
                 )
             }
         })
@@ -239,7 +263,9 @@ impl<T> LlkRing<T> {
         nslot: u32,
     ) -> Result<Self, Error> {
         let nframe = dims.nframe;
-        if nframe == 0 || nslot == 0 || dims.n() == 0 {
+        // `RingDevice::count` takes pixel indices up to `n + PIXEL_THREADS` in u32.
+        let n_fits = u32::try_from(dims.n() + PIXEL_THREADS as usize).is_ok();
+        if nframe == 0 || nslot == 0 || dims.n() == 0 || !n_fits {
             return Err(Error::Shape(format!(
                 "a ring of {nslot} records of {nframe} frames of {:?} pixels",
                 dims.frame
@@ -262,6 +288,7 @@ impl<T> LlkRing<T> {
                 records: DeviceBuffer::from_host(stream, &vec![unwritten; len])?,
                 cursor: DeviceBuffer::from_host(stream, &[0u64])?,
                 nobs: DeviceBuffer::from_host(stream, &vec![UNCOUNTED; nframe as usize])?,
+                partial: DeviceBuffer::zeroed(stream, nframe as usize)?,
                 pixel_frames: DeviceBuffer::zeroed(stream, dims.n())?,
                 nframe,
                 frame: dims.frame,
@@ -509,6 +536,80 @@ mod tests {
     use cuda_core::CudaContext;
 
     use super::*;
+
+    /// Each frame's unmasked pixels and each pixel's unmasked frames come out as on the host
+    /// in any layout of ranges, over several pixel chunks, the last one part full or not, and
+    /// a last frame group part full; frame 1 is all masked and frame 2 not at all. A frame
+    /// counted twice adds once, and every count leaves `partial` zero.
+    #[test]
+    fn range_counts_match_the_host_in_any_layout() {
+        let cuda = CudaContext::new(0).expect("CUDA device 0");
+        let kernels = Kernels::load(&cuda).expect("load ptyrs-gpu kernels");
+        let stream = cuda.new_stream().unwrap();
+        let ctx = ExecutionContext::new(stream.clone());
+        for (frame, nframe) in [([100u32, 100u32], 61u32), ([256, 256], 19)] {
+            let dims = ViewDims {
+                nframe,
+                nmode: 1,
+                nprobe: 1,
+                nobj: 1,
+                frame,
+                obj: frame,
+                quad_phase: 0.0,
+            };
+            let n = dims.n();
+            let mut st = 0x1234_5678_9abc_def1u64 ^ n as u64;
+            let mut counts = vec![0u16; nframe as usize * n];
+            for (f, frame) in counts.chunks_mut(n).enumerate() {
+                let rate = (f * 37 % 100) as u64;
+                for c in frame {
+                    st ^= st << 13;
+                    st ^= st >> 7;
+                    st ^= st << 17;
+                    let masked = match f {
+                        1 => true,
+                        2 => false,
+                        _ => st % 100 < rate,
+                    };
+                    *c = if masked { crate::MASKED } else { 1 };
+                }
+            }
+            let unmasked = |c: &u16| *c != crate::MASKED;
+            let want_nobs: Vec<u32> = counts
+                .chunks(n)
+                .map(|f| f.iter().filter(|c| unmasked(c)).count() as u32)
+                .collect();
+            let want_pixel_frames: Vec<u32> = (0..n)
+                .map(|p| {
+                    (0..nframe as usize)
+                        .filter(|f| unmasked(&counts[f * n + p]))
+                        .count() as u32
+                })
+                .collect();
+            let dev_counts = DeviceBuffer::from_host(&stream, &counts).unwrap();
+            let layouts: [Vec<Range<u32>>; 3] = [
+                std::iter::once(0..nframe).collect(),
+                vec![0..5, 3..nframe / 2, nframe / 2..nframe, 0..nframe],
+                (0..nframe).rev().map(|f| f..f + 1).collect(),
+            ];
+            for ranges in layouts {
+                let mut ring = LlkRing::<()>::new(&kernels, &stream, &dims, 1).unwrap();
+                for r in &ranges {
+                    ring.device().count(&ctx, r.clone(), &dev_counts).unwrap();
+                }
+                let dev = &ring.dev;
+                let at = format!(
+                    "frame {frame:?}, ranges {:?}",
+                    &ranges[..ranges.len().min(4)]
+                );
+                assert_eq!(dev.nobs.to_host_vec(&stream).unwrap(), want_nobs, "{at}");
+                let got = dev.pixel_frames.to_host_vec(&stream).unwrap();
+                assert_eq!(got, want_pixel_frames, "{at}");
+                let partial = dev.partial.to_host_vec(&stream).unwrap();
+                assert!(partial.iter().all(|&x| x == 0), "{at}");
+            }
+        }
+    }
 
     /// A record of 4 frames copies those into its host slot and leaves the slot's other 6 as
     /// they were.

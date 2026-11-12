@@ -620,8 +620,8 @@ fn graph_like_eager(setup: Setup) {
 }
 
 /// A ring record of the frames a live scan has landed, `0 .. n`, against the CPU LLK over the
-/// same frames: the GPU's LLK partials stack by stack, the frames counted as their stacks land
-/// and pushed by every stack that holds one below `n`, read back with `n` and the frames'
+/// same frames: the GPU's LLK partials stack by stack, the frames counted in one range as their
+/// stacks land and pushed by every stack that holds one below `n`, read back with `n` and the frames'
 /// unmasked pixels; `n` inside a stack (10) and the whole scan. The mask differs from frame to
 /// frame, so the count is the frames' own.
 #[test]
@@ -692,12 +692,9 @@ fn ring_record_of_the_first_frames_matches_the_cpu_llk() {
     let mut counted = 0;
     for (r, &n) in ns.iter().enumerate() {
         let landed: Vec<usize> = (0..stacks.len()).filter(|&s| stacks[s].start < n).collect();
-        for &s in &landed[counted..] {
-            ring.device()
-                .count(&ex, &dims, table.at(s), &dev_counts)
-                .unwrap();
-        }
-        counted = landed.len();
+        let end = stacks[*landed.last().unwrap()].end;
+        ring.device().count(&ex, counted..end, &dev_counts).unwrap();
+        counted = end;
         let mut rec = ring.device().record();
         for &s in &landed {
             let stack = table.at(s);
