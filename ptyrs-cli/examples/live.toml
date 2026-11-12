@@ -54,6 +54,19 @@ source = "pva"
 # poll-us = 200
 # queue = 1024
 
+# Reconstruct the received frames live and time the scan's end to the first
+# live object that matches the offline run; off when the table is absent.
+# Needs the ptycho model and whole frames (crop = n, centred).
+# [recv.recon]
+# algo = "ap"
+# nf-max = 32           # frames per stack
+# inertia = 0.01        # PyNX ObjNorm inertia
+# chunk-mib = 2         # the object is backed this many MiB at a time
+# snap-every = 5        # epochs between kept snapshots once the scan landed
+# snaps = 200           # snapshots kept; the live run stops after the last
+# settle-every = 100    # the offline run's epochs between settle checks
+# settle-max = 5000     # and its most epochs
+
 # What the frames and positions are checked against; its frame size is the
 # detector's. In its place, the M5 scan simulator:
 # [recv.model.ptycho]

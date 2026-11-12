@@ -1,8 +1,10 @@
 //! `ptyrs live CONFIG.toml` receives one scan through
 //! [`ptyrs_live::recv::run`] as the file's `[recv]` table says, prints the
-//! `recv ...` report and exits like pty-recv: 2 if a trigger never reached
-//! the GPU, 3 if one reached it wrong, 1 on a bad file or a failed step.
+//! `recv ...` report and exits with [`RecvReport::exit_code`], or 1 on a bad
+//! file or a failed step.
 //! `examples/live.toml` lists every key at its default.
+//!
+//! [`RecvReport::exit_code`]: ptyrs_live::recv::RecvReport::exit_code
 
 use std::path::Path;
 use std::process::ExitCode;

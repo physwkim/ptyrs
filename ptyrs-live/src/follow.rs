@@ -20,13 +20,97 @@ use crossbeam_channel::{Receiver, Sender, TryRecvError};
 use cuda_core::Context;
 use ptyrs_core::{C64, CoreError};
 use ptyrs_gpu::{C32, ViewAddr};
+use serde::Deserialize;
 
+use crate::args::Args;
 use crate::converge::{Clock, ClockError};
+use crate::farfield::Ptycho;
 use crate::grow::GrowError;
 use crate::object::{Snapshot, sleeping_event};
 use crate::recon::{ApConfig, LiveAp, ViewPlacement};
 use crate::ring::{DeviceStore, FrameBatch};
+use crate::scan::ScanShape;
 use crate::stats::wall_ns;
+
+/// The reconstruction run on the received frames: `pty-recv --recon ap`
+/// and its `--recon-*` flags, or a `[recon]` table with the same keys.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+pub struct ReconCfg {
+    pub algo: Algo,
+    /// Frames per stack; at most the scan's.
+    pub nf_max: NonZeroU32,
+    /// PyNX `ObjNorm` inertia.
+    pub inertia: f32,
+    /// The object is backed this many MiB at a time.
+    pub chunk_mib: usize,
+    /// Epochs between the live run's kept snapshots once the scan landed.
+    pub snap_every: NonZeroU32,
+    /// Snapshots kept; the live run stops after the last.
+    pub snaps: usize,
+    /// The offline reference's [`Settle`].
+    pub settle_every: NonZeroU32,
+    pub settle_max: u64,
+}
+
+impl Default for ReconCfg {
+    fn default() -> Self {
+        Self {
+            algo: Algo::Ap,
+            nf_max: NonZeroU32::new(32).unwrap(),
+            inertia: 0.01,
+            chunk_mib: 2,
+            snap_every: NonZeroU32::new(5).unwrap(),
+            snaps: 200,
+            settle_every: NonZeroU32::new(100).unwrap(),
+            settle_max: 5000,
+        }
+    }
+}
+
+impl ReconCfg {
+    /// `--recon ALGO --recon-nf-max --recon-inertia --recon-chunk-mib
+    /// --recon-snap-every --recon-snaps --recon-settle-every
+    /// --recon-settle-max`; `None` without `--recon`.
+    pub fn from_args(a: &Args) -> Option<Self> {
+        let algo = a.opt("recon")?;
+        let d = Self::default();
+        Some(Self {
+            algo,
+            nf_max: a.get("recon-nf-max", d.nf_max),
+            inertia: a.get("recon-inertia", d.inertia),
+            chunk_mib: a.get("recon-chunk-mib", d.chunk_mib),
+            snap_every: a.get("recon-snap-every", d.snap_every),
+            snaps: a.get("recon-snaps", d.snaps),
+            settle_every: a.get("recon-settle-every", d.settle_every),
+            settle_max: a.get("recon-settle-max", d.settle_max),
+        })
+    }
+
+    pub fn settle(&self) -> Settle {
+        Settle {
+            every: self.settle_every,
+            max: self.settle_max,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Algo {
+    Ap,
+}
+
+impl std::str::FromStr for Algo {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "ap" => Ok(Algo::Ap),
+            _ => Err("expected ap".into()),
+        }
+    }
+}
 
 /// What the live run reconstructs with, fixed before the first frame.
 #[derive(Clone, Debug)]
@@ -40,6 +124,50 @@ pub struct FollowCfg {
     pub snap_every: NonZeroU32,
     /// Snapshots kept; the run stops after the last.
     pub snaps: usize,
+}
+
+impl FollowCfg {
+    /// `rc` on the first `nframe` triggers of `p`'s scan, trigger `u` at
+    /// its point `u % p.points()`: one object, `p`'s probe modes held fixed,
+    /// the object placed and its tile slots sized from those positions.
+    pub fn plan(p: &Ptycho, nframe: NonZeroU32, rc: &ReconCfg) -> Self {
+        let n = p.spec().n;
+        let dx = p.spec().dx();
+        let pos: Vec<(f64, f64)> = (0..nframe.get() as usize)
+            .map(|u| p.position(u % p.points()))
+            .collect();
+        let (place, reach) = ViewPlacement::plan([dx, dx], &pos);
+        let nprobe = (p.probe().len() / (n * n)) as u32;
+        let shape = ScanShape {
+            nframe: nframe.get(),
+            nmode: nprobe,
+            nprobe,
+            nobj: 1,
+            frame: [n as u32; 2],
+            reach,
+            quad_phase: 0.0,
+        };
+        let mut ap = ApConfig {
+            shape,
+            nf_max: rc.nf_max.min(nframe),
+            cap: 0,
+            fill: [1.0, 0.0],
+            chunk: rc.chunk_mib << 20,
+            inertia: rc.inertia,
+        };
+        ap.cap = shape.tile_cap(&views_of(&ap, &place, &pos));
+        Self {
+            ap,
+            probe: p
+                .probe()
+                .iter()
+                .map(|c| C32 { re: c.re, im: c.im })
+                .collect(),
+            place,
+            snap_every: rc.snap_every,
+            snaps: rc.snaps,
+        }
+    }
 }
 
 /// Object 0 of the live run some epochs after its scan landed.
@@ -324,7 +452,6 @@ mod tests {
     use crate::farfield::{Ptycho, PtychoSpec, ScanPath};
     use crate::graph::WarmUp;
     use crate::ring::{Ring, UploaderConfig, run_uploader};
-    use crate::scan::ScanShape;
 
     struct Streamed {
         ctx: Arc<Context>,
@@ -352,37 +479,14 @@ mod tests {
         });
         let (n, total) = (64usize, p.points());
         let pos: Vec<(f64, f64)> = (0..total).map(|k| p.position(k)).collect();
-        let dx = p.spec().dx();
-        let (place, reach) = ViewPlacement::plan([dx, dx], &pos);
-        let shape = ScanShape {
-            nframe: total as u32,
-            nmode: 2,
-            nprobe: 2,
-            nobj: 1,
-            frame: [n as u32; 2],
-            reach,
-            quad_phase: 0.0,
-        };
-        let mut ap = ApConfig {
-            shape,
+        let rc = ReconCfg {
             nf_max: NonZeroU32::new(16).unwrap(),
-            cap: 0,
-            fill: [1.0, 0.0],
-            chunk: 1,
-            inertia: 0.01,
-        };
-        ap.cap = shape.tile_cap(&views_of(&ap, &place, &pos));
-        let cfg = FollowCfg {
-            ap,
-            probe: p
-                .probe()
-                .iter()
-                .map(|c| C32 { re: c.re, im: c.im })
-                .collect(),
-            place,
             snap_every: NonZeroU32::new(25).unwrap(),
             snaps: 80,
+            ..ReconCfg::default()
         };
+        let cfg = FollowCfg::plan(&p, NonZeroU32::new(total as u32).unwrap(), &rc);
+        assert_eq!((cfg.ap.shape.nmode, cfg.ap.shape.nprobe), (2, 2));
 
         let ctx = Context::new(0).expect("GPU 0");
         let ring = Arc::new(Ring::new(&ctx, 16, n * n).unwrap());

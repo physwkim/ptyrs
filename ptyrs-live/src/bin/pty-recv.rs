@@ -1,6 +1,8 @@
 //! Receiver: [`ptyrs_live::recv::run`] with the `--key value` flags of
-//! [`RecvCfg::from_args`]. Exits 2 if a trigger never reached the GPU, 3 if
-//! one reached it wrong, 1 if a step failed.
+//! [`RecvCfg::from_args`]. Exits with [`RecvReport::exit_code`], or 1 if a
+//! step failed.
+//!
+//! [`RecvReport::exit_code`]: ptyrs_live::recv::RecvReport::exit_code
 
 use std::process::ExitCode;
 

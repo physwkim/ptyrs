@@ -11,7 +11,9 @@
 //! allocated before the first frame, and the store maps device memory in
 //! `store-chunk-mib` steps as frames arrive. A graph captured once before
 //! the first frame stands in for the engine and checksums every stored
-//! frame, `graph-batch` frames per replay.
+//! frame, `graph-batch` frames per replay; with `recon` set, the live
+//! reconstruction of [`crate::follow`] takes the frames instead and is
+//! timed from the scan's end against its offline run.
 
 use std::fmt::{self, Write as _};
 use std::net::SocketAddr;
@@ -26,11 +28,14 @@ use epics_pva_rs::client_native::PvaClient;
 use serde::Deserialize;
 
 use crate::args::Args;
-use crate::consumer::{checksum, run_checksum_consumer};
+use crate::consumer::{ConsumerReport, checksum, run_checksum_consumer};
 use crate::eiger::{EigerFrames, Progress, PullReport, run_pull};
+use crate::follow::{
+    FollowCfg, FollowReport, ReconCfg, Settle, first_converged, offline_ap, plane, run_ap_consumer,
+};
 use crate::graph::WarmUp;
 use crate::handoff::work_queue;
-use crate::model::ModelCfg;
+use crate::model::{Model, ModelCfg};
 use crate::pipeline::{
     FrameLoss, Geometry, Placement, SourceStats, Truth, WorkerCfg, WorkerReport, worker,
 };
@@ -39,6 +44,7 @@ use crate::pva_source::{NtndFrames, PosStats, monitor_positions};
 use crate::ring::{DeviceStore, Ring, UploaderConfig, run_uploader};
 use crate::stats::{mono_ns, process_cpu_ns, wall_ns};
 use crate::swmr::{SwmrCfg, SwmrReport, run_swmr};
+use crate::synth::Region;
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
@@ -89,6 +95,9 @@ pub struct RecvCfg {
     pub idle_ms: i64,
     /// Stop if no frame arrived within this long.
     pub connect_timeout_s: i64,
+    /// Reconstruct live instead of checksumming; needs the `ptycho` model
+    /// and the whole frame as the crop.
+    pub recon: Option<ReconCfg>,
 }
 
 impl Default for RecvCfg {
@@ -122,6 +131,7 @@ impl Default for RecvCfg {
             util_min: 1024,
             idle_ms: 3000,
             connect_timeout_s: 120,
+            recon: None,
         }
     }
 }
@@ -195,7 +205,8 @@ impl H5Cfg {
 impl RecvCfg {
     /// pty-recv's flags: every field under its TOML key, plus `--source
     /// zmq --zmq ENDPOINT --rcvhwm N`, `--source h5 --h5 PATH --h5-readers
-    /// --h5-poll-us --h5-queue`, `--crop-decode 0|1` and [`ModelCfg::from_args`].
+    /// --h5-poll-us --h5-queue`, `--crop-decode 0|1`, [`ModelCfg::from_args`]
+    /// and [`ReconCfg::from_args`].
     pub fn from_args(a: &Args) -> Self {
         let d = Self::default();
         let source = match a.str("source", "pva").as_str() {
@@ -251,6 +262,7 @@ impl RecvCfg {
             util_min: a.get("util-min", d.util_min),
             idle_ms: a.get("idle-ms", d.idle_ms),
             connect_timeout_s: a.get("connect-timeout-s", d.connect_timeout_s),
+            recon: ReconCfg::from_args(a),
         }
     }
 }
@@ -298,12 +310,15 @@ pub struct RecvReport {
     pub recaptures: u64,
     /// Frames, positions and checksums that reached the GPU wrong, all checks.
     pub bad: usize,
+    /// With `recon`, whether a live object matched the settled offline run.
+    pub converged: Option<bool>,
     /// The `recv ...` lines, one per check group.
     pub lines: String,
 }
 
 impl RecvReport {
-    /// 2 lost, 3 wrong, 4 a graph captured after the warm-up, else 0.
+    /// 2 lost, 3 wrong, 4 a graph captured after the warm-up, 5 no live
+    /// object matched, else 0.
     pub fn exit_code(&self) -> u8 {
         if self.lost > 0 || self.rx_lost.total() > 0 {
             2
@@ -311,10 +326,177 @@ impl RecvReport {
             3
         } else if self.recaptures > 0 {
             4
+        } else if self.converged == Some(false) {
+            5
         } else {
             0
         }
     }
+}
+
+/// What the graph thread did with the stored frames.
+enum Consumed {
+    Sums(ConsumerReport),
+    Recon(Box<Recon>),
+}
+
+struct Recon {
+    rep: FollowReport,
+    follow: FollowCfg,
+    settle: Settle,
+}
+
+/// The live run `rc` asks for on `cfg`'s scan: it starts from the
+/// simulator's probe and planned positions, and takes whole frames.
+fn follow_cfg(cfg: &RecvCfg, model: &Model, rc: &ReconCfg) -> Result<FollowCfg, RecvError> {
+    let refuse = |cause: String| RecvError {
+        what: "recon",
+        cause,
+    };
+    let Model::Ptycho(p) = model else {
+        return Err(refuse("needs --model ptycho for its probe and scan".into()));
+    };
+    let n = p.spec().n;
+    if cfg.crop != n
+        || [cfg.cx, cfg.cy]
+            .iter()
+            .any(|&c| c.is_some_and(|c| c != n / 2))
+    {
+        return Err(refuse(format!("needs the whole {n}x{n} frame as the crop")));
+    }
+    let nframe = u32::try_from(cfg.frames)
+        .ok()
+        .and_then(NonZeroU32::new)
+        .ok_or_else(|| refuse(format!("{} frames", cfg.frames)))?;
+    Ok(FollowCfg::plan(p, nframe, rc))
+}
+
+/// Stored frames, sequence number `s` holding trigger `uids[s]`, that differ
+/// from their synthesis over `r`; read back a slab at a time and compared
+/// on `threads` threads.
+fn stored_bad(
+    store: &DeviceStore,
+    uids: &[i32],
+    truth: &dyn Truth,
+    r: Region,
+    threads: usize,
+) -> Result<usize, RecvError> {
+    let se = store.frame_elems();
+    let slab = 1024;
+    let mut dev = vec![0u16; slab * se];
+    let mut bad = 0;
+    for (k, uids) in uids.chunks(slab).enumerate() {
+        let s0 = (k * slab) as u64;
+        let dev = &mut dev[..uids.len() * se];
+        store
+            .read_frames(s0..s0 + uids.len() as u64, dev)
+            .map_err(fail("store readback"))?;
+        let per = uids.len().div_ceil(threads).max(1);
+        bad += std::thread::scope(|sc| {
+            uids.chunks(per)
+                .zip(dev.chunks(per * se))
+                .map(|(uids, dev)| {
+                    sc.spawn(move || {
+                        let mut buf = vec![0u16; se];
+                        uids.iter()
+                            .zip(dev.chunks(se))
+                            .filter(|&(&uid, d)| {
+                                truth.fill(uid, r, &mut buf);
+                                buf[..] != *d
+                            })
+                            .count()
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .sum::<usize>()
+        });
+    }
+    Ok(bad)
+}
+
+/// The `recv recon` line and whether a live object matched: the offline run
+/// on the stored frames, the clock from `scan_end` over the scanned region,
+/// and the first kept snapshot it finds converged.
+fn recon_line(
+    ctx: &Arc<Context>,
+    store: &DeviceStore,
+    follow: &FollowCfg,
+    settle: Settle,
+    rep: &FollowReport,
+    scan_end: Option<i64>,
+    threads: usize,
+) -> Result<(String, bool), RecvError> {
+    let [ny, nx] = rep.shape;
+    let region = follow.place.scanned(&rep.positions, follow.ap.shape.frame);
+    let [rows, cols] = &region;
+    let scan_epochs = rep.scan_epochs.unwrap_or(0);
+    // Epoch time once the scan landed, from the kept snapshots' stamps.
+    let epoch_ms = match (rep.kept.first(), rep.kept.last()) {
+        (Some(a), Some(b)) if b.epochs > a.epochs => {
+            Some((b.taken - a.taken) as f64 / 1e6 / (b.epochs - a.epochs) as f64)
+        }
+        _ => None,
+    };
+    let mut l = format!(
+        "recv recon algo=ap nf_max={} tile_cap={} stored={} landed={} scan_epochs={scan_epochs} \
+         epochs={} snap_every={} kept={} epoch_ms={} object={ny}x{nx} obj_mapped_MiB={} \
+         crop=window_centre_bbox region_rows={}..{} region_cols={}..{}",
+        follow.ap.nf_max,
+        follow.ap.cap,
+        rep.stored,
+        rep.landed,
+        rep.epochs,
+        follow.snap_every,
+        rep.kept.len(),
+        Fig(epoch_ms, 3),
+        rep.obj_mapped_bytes >> 20,
+        rows.start,
+        rows.end,
+        cols.start,
+        cols.end,
+    );
+    let Some(scan_end) = scan_end else {
+        l += " clock=none no_scan_end";
+        return Ok((l, false));
+    };
+    let off = offline_ap(ctx, store, follow, &rep.positions, region, scan_end, settle)
+        .map_err(fail("offline reconstruction"))?;
+    // Writing to a String cannot fail.
+    write!(l, " offline_epochs={}", off.epochs).unwrap();
+    let clock = match off.clock {
+        Ok(c) => c,
+        Err(e) => {
+            write!(l, " clock=none offline: {e}").unwrap();
+            return Ok((l, false));
+        }
+    };
+    let frc = |px: &[[f32; 2]]| -> Result<(f64, f64), RecvError> {
+        let o = plane(px, rep.shape);
+        let both = clock.region_frc(&o).and_then(|r| Ok((r, clock.whole(&o)?)));
+        both.map_err(fail("clock"))
+    };
+    let hit = first_converged(&clock, &rep.kept, rep.shape, threads).map_err(fail("clock"))?;
+    match hit {
+        Some((i, after)) => {
+            let k = &rep.kept[i];
+            let (r, w) = frc(&k.pixels)?;
+            write!(
+                l,
+                " converged_ms={:.1} converged_epochs={} frc_region={r:.4} frc_whole={w:.4}",
+                after.as_secs_f64() * 1e3,
+                k.epochs - scan_epochs
+            )
+            .unwrap();
+        }
+        None => l += " converged_ms=none",
+    }
+    if let Some(k) = rep.kept.last() {
+        let (r, w) = frc(&k.pixels)?;
+        write!(l, " last_frc_region={r:.4} last_frc_whole={w:.4}").unwrap();
+    }
+    Ok((l, hit.is_some()))
 }
 
 /// Receive one scan as `cfg` says, then check what reached the GPU. Pins
@@ -340,6 +522,11 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
         verify_every: cfg.verify_every,
         pos_wait_ns: cfg.pos_wait_ms * 1_000_000,
     };
+    let follow = cfg
+        .recon
+        .as_ref()
+        .map(|rc| Ok::<_, RecvError>((follow_cfg(cfg, &model, rc)?, rc.settle())))
+        .transpose()?;
     let truth: Arc<dyn Truth> = Arc::new(model);
     let ucfg = UploaderConfig {
         batch: cfg.batch,
@@ -381,7 +568,20 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
             .name("graph".into())
             .spawn(move || {
                 place.enter(place.rt.as_deref());
-                run_checksum_consumer(ctx, store, batch, brx, cap_tx)
+                match follow {
+                    None => {
+                        run_checksum_consumer(ctx, store, batch, brx, cap_tx).map(Consumed::Sums)
+                    }
+                    Some((follow, settle)) => {
+                        run_ap_consumer(ctx, store, follow.clone(), brx, cap_tx).map(|rep| {
+                            Consumed::Recon(Box::new(Recon {
+                                rep,
+                                follow,
+                                settle,
+                            }))
+                        })
+                    }
+                }
             })
             .unwrap()
     };
@@ -573,10 +773,12 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
     let reports: Vec<WorkerReport> = handles.into_iter().map(|h| h.join().unwrap()).collect();
     stop.store(true, Ordering::Release);
     let up = uploader.join().unwrap();
-    let cons = consumer.join().unwrap();
-    let recaptures = warm.recaptures();
+    // Every frame is stored; a live reconstruction iterates on past here.
     let t_end = wall_ns();
     let cpu_end = process_cpu_ns();
+    let cons = consumer.join().unwrap();
+    // Before the offline run captures graphs of its own.
+    let recaptures = warm.recaptures();
     let (pulled, followed) = streamed?;
     let up = up.map_err(fail("uploader"))?;
     let cons = cons.map_err(fail("graph consumer"))?;
@@ -634,30 +836,48 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
         .enumerate()
         .filter(|&(s, &uid)| (dpos[2 * s], dpos[2 * s + 1]) != truth.position(uid))
         .count();
-    // Every stored frame as the graph saw it, against its synthesis.
-    let per = up.uids.len().div_ceil(threads).max(1);
-    let sum_bad: usize = std::thread::scope(|sc| {
-        up.uids
-            .chunks(per)
-            .zip(cons.checksums.chunks(per))
-            .map(|(uids, sums)| {
-                let truth = &truth;
-                sc.spawn(move || {
-                    let mut buf = vec![0u16; se];
-                    uids.iter()
-                        .zip(sums)
-                        .filter(|&(&uid, &sum)| {
-                            truth.fill(uid, geom.crop_region(), &mut buf);
-                            checksum(&buf) != sum
+    // Every stored frame as the graph saw it, or as the store holds it for
+    // the reconstruction, against its synthesis.
+    let sum_bad: usize = match &cons {
+        Consumed::Sums(cons) => {
+            let per = up.uids.len().div_ceil(threads).max(1);
+            std::thread::scope(|sc| {
+                up.uids
+                    .chunks(per)
+                    .zip(cons.checksums.chunks(per))
+                    .map(|(uids, sums)| {
+                        let truth = &truth;
+                        sc.spawn(move || {
+                            let mut buf = vec![0u16; se];
+                            uids.iter()
+                                .zip(sums)
+                                .filter(|&(&uid, &sum)| {
+                                    truth.fill(uid, geom.crop_region(), &mut buf);
+                                    checksum(&buf) != sum
+                                })
+                                .count()
                         })
-                        .count()
-                })
+                    })
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .map(|h| h.join().unwrap())
+                    .sum()
             })
-            .collect::<Vec<_>>()
-            .into_iter()
-            .map(|h| h.join().unwrap())
-            .sum()
-    });
+        }
+        Consumed::Recon(_) => stored_bad(&store, &up.uids, &*truth, geom.crop_region(), threads)?,
+    };
+    let recon = match &cons {
+        Consumed::Sums(_) => None,
+        Consumed::Recon(r) => Some(recon_line(
+            &ctx,
+            &store,
+            &r.follow,
+            r.settle,
+            &r.rep,
+            st.scan_end,
+            threads,
+        )?),
+    };
     let mut sorted = up.uids.clone();
     sorted.sort_unstable();
     sorted.dedup();
@@ -674,7 +894,11 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
         rate((cpu - r.cpu_first) as f64, t - r.first)
     });
     let lost = frames - up.frames.min(frames);
-    let rx_lost = FrameLoss::new(&st, &wr, cons.consumed);
+    let consumed = match &cons {
+        Consumed::Sums(c) => c.consumed,
+        Consumed::Recon(r) => r.rep.landed,
+    };
+    let rx_lost = FrameLoss::new(&st, &wr, consumed);
     let mut s = String::new();
     // Writing to a String cannot fail.
     let mut line = |args: fmt::Arguments| {
@@ -771,16 +995,28 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
         up.uids.len(),
         store.mapped_bytes() >> 20,
     ));
-    line(format_args!(
-        "recv graph launches={} consumed={} checksummed={} checksum_bad={sum_bad} out_mapped_MiB={} \
-         recaptures={recaptures}",
-        cons.launches,
-        cons.consumed,
-        cons.checksums.len(),
-        cons.out_mapped_bytes >> 20,
-    ));
-    let consumed_bad =
-        usize::from(cons.consumed != up.frames || cons.checksums.len() != up.uids.len());
+    let consumed_bad = usize::from(match &cons {
+        Consumed::Sums(c) => {
+            line(format_args!(
+                "recv graph launches={} consumed={} checksummed={} checksum_bad={sum_bad} \
+                 out_mapped_MiB={} recaptures={recaptures}",
+                c.launches,
+                c.consumed,
+                c.checksums.len(),
+                c.out_mapped_bytes >> 20,
+            ));
+            c.consumed != up.frames || c.checksums.len() != up.uids.len()
+        }
+        Consumed::Recon(r) => {
+            line(format_args!(
+                "recv recon_store frames_bad={sum_bad} recaptures={recaptures}"
+            ));
+            r.rep.stored != up.frames || r.rep.landed != r.rep.stored
+        }
+    });
+    if let Some((l, _)) = &recon {
+        line(format_args!("{l}"));
+    }
     let bad = (wr.verify_bad + wr.pos_mismatch) as usize
         + h2d_bad
         + e2e_bad
@@ -793,6 +1029,7 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
         rx_lost,
         recaptures,
         bad,
+        converged: recon.map(|(_, c)| c),
         lines: s,
     })
 }
@@ -800,6 +1037,7 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::follow::Algo;
     use crate::model::{PathKind, PtychoCfg};
     use crate::synth::Synth;
 
@@ -816,6 +1054,12 @@ mod tests {
         assert_eq!(flags(&[]), RecvCfg::default());
         assert_eq!(toml(""), RecvCfg::default());
         assert_eq!(toml("source = \"pva\""), RecvCfg::default());
+        let recon = RecvCfg {
+            recon: Some(ReconCfg::default()),
+            ..RecvCfg::default()
+        };
+        assert_eq!(flags(&["--recon", "ap"]), recon);
+        assert_eq!(toml("[recon]"), recon);
     }
 
     #[test]
@@ -866,6 +1110,16 @@ mod tests {
             util_min: 0,
             idle_ms: 1000,
             connect_timeout_s: 5,
+            recon: Some(ReconCfg {
+                algo: Algo::Ap,
+                nf_max: NonZeroU32::new(8).unwrap(),
+                inertia: 0.05,
+                chunk_mib: 4,
+                snap_every: NonZeroU32::new(3).unwrap(),
+                snaps: 50,
+                settle_every: NonZeroU32::new(20).unwrap(),
+                settle_max: 900,
+            }),
         };
         let f = flags(&[
             "--frames",
@@ -952,6 +1206,22 @@ mod tests {
             "1000",
             "--connect-timeout-s",
             "5",
+            "--recon",
+            "ap",
+            "--recon-nf-max",
+            "8",
+            "--recon-inertia",
+            "0.05",
+            "--recon-chunk-mib",
+            "4",
+            "--recon-snap-every",
+            "3",
+            "--recon-snaps",
+            "50",
+            "--recon-settle-every",
+            "20",
+            "--recon-settle-max",
+            "900",
         ]);
         let t = toml(
             r#"
@@ -999,6 +1269,16 @@ mod tests {
             wavelength-m = 1e-10
             distance-m = 3.0
             det-pixel-m = 55e-6
+
+            [recon]
+            algo = "ap"
+            nf-max = 8
+            inertia = 0.05
+            chunk-mib = 4
+            snap-every = 3
+            snaps = 50
+            settle-every = 20
+            settle-max = 900
             "#,
         );
         assert_eq!(f, want);
@@ -1078,9 +1358,58 @@ mod tests {
             ("batch = 0", "batch"),
             ("graph-batch = 0", "graph-batch"),
             ("[source.zmq]\n[source.h5]\npath = \"a.h5\"", "source"),
+            ("[recon]\nalgo = \"dm\"", "dm"),
+            ("[recon]\nsnap-every = 0", "snap-every"),
+            ("[recon]\nsnapz = 3", "snapz"),
         ] {
             let e = ::toml::from_str::<RecvCfg>(t).unwrap_err().to_string();
             assert!(e.contains(needle), "{t:?}: {e}");
         }
+    }
+
+    /// The live run starts from the simulator's probe and planned scan and
+    /// reconstructs whole frames: another model, a crop smaller or off the
+    /// centre, or an empty scan is refused before any frame comes.
+    #[test]
+    fn recon_needs_the_ptycho_model_whole_frames_and_a_scan() {
+        let rc = ReconCfg::default();
+        let ptycho = ModelCfg::Ptycho(PtychoCfg {
+            n: 64,
+            points: 20,
+            ..PtychoCfg::default()
+        });
+        let ok = RecvCfg {
+            frames: 20,
+            crop: 64,
+            model: ptycho.clone(),
+            ..RecvCfg::default()
+        };
+        let model = ok.model.build();
+        let f = follow_cfg(&ok, &model, &rc).unwrap();
+        assert_eq!((f.ap.shape.nframe, f.ap.shape.frame), (20, [64, 64]));
+        let centred = RecvCfg {
+            cx: Some(32),
+            cy: Some(32),
+            ..ok.clone()
+        };
+        assert!(follow_cfg(&centred, &model, &rc).is_ok());
+        for bad in [
+            RecvCfg {
+                crop: 32,
+                ..ok.clone()
+            },
+            RecvCfg {
+                cx: Some(30),
+                ..ok.clone()
+            },
+            RecvCfg {
+                frames: 0,
+                ..ok.clone()
+            },
+        ] {
+            assert!(follow_cfg(&bad, &model, &rc).is_err(), "{bad:?}");
+        }
+        let synth = ModelCfg::default().build();
+        assert!(follow_cfg(&ok, &synth, &rc).is_err());
     }
 }
