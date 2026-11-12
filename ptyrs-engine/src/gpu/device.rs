@@ -14,8 +14,8 @@ use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 use ptyrs_fft::Plan2d;
 use ptyrs_gpu::{
     C32, CG_BLOCKS, Ended, Error as GpuError, FusedBufs, GammaStacks, GradKernels, Kernels,
-    LlkPartial, LlkRing, LlkSums, RingDevice, RpieKernels, StackTable, UpdateSums, ViewAddr,
-    ViewDims, Views,
+    LlkPartial, LlkRing, LlkScratch, LlkTotals, PowerMax, RingDevice, RpieKernels, StackTable,
+    UpdateSums, ViewAddr, ViewDims, Views,
 };
 
 use super::{
@@ -42,6 +42,8 @@ pub(super) struct Device {
     passes: Passes,
     /// One stack's LLK partials, on their way into the ring.
     llk: DeviceBuffer<LlkPartial>,
+    /// The chunk sums M1's [`Kernels::llk`] reduces a stack's frames through.
+    llk_scratch: LlkScratch,
     ring: LlkRing<Tag>,
     use_graph: bool,
     /// The epochs run since the parameters last changed, all of one [`Epoch::run`].
@@ -134,11 +136,13 @@ struct MlState {
     /// Block partial pairs: the β sums of the object then the probe, or one norm sum.
     parts: DeviceBuffer<f32>,
     beta: DeviceBuffer<f32>,
-    /// The line-search pair of every frame.
-    frame_pairs: DeviceBuffer<f32>,
+    /// The line-search pairs of every frame's pixel chunks ([`ptyrs_gpu::gamma_parts`]).
+    gamma_parts: DeviceBuffer<f32>,
     gamma: DeviceBuffer<f32>,
-    /// `(sum |x|, sum |x|^2)` of the object, the probe and every view's exit wave.
-    norms: [DeviceBuffer<f32>; 3],
+    /// `(sum |x|, sum |x|^2)` of the object and the probe.
+    norms: [DeviceBuffer<f32>; 2],
+    /// The calculated photons over the unmasked pixels of every frame.
+    icalc: DeviceBuffer<f32>,
     fields: GammaStacks,
 }
 
@@ -149,9 +153,10 @@ pub(super) struct MlBufs<'a> {
     pub d: &'a mut [DeviceBuffer<C32>; 2],
     pub parts: &'a mut DeviceBuffer<f32>,
     pub beta: &'a mut DeviceBuffer<f32>,
-    pub frame_pairs: &'a mut DeviceBuffer<f32>,
+    pub gamma_parts: &'a mut DeviceBuffer<f32>,
     pub gamma: &'a mut DeviceBuffer<f32>,
-    pub norms: &'a mut [DeviceBuffer<f32>; 3],
+    pub norms: &'a mut [DeviceBuffer<f32>; 2],
+    pub icalc: &'a mut DeviceBuffer<f32>,
     pub fields: &'a mut GammaStacks,
 }
 
@@ -174,9 +179,10 @@ impl MlState {
             d: [zeroed(lens[0])?, zeroed(lens[1])?],
             parts: DeviceBuffer::zeroed(stream, 4 * CG_BLOCKS as usize)?,
             beta: pair()?,
-            frame_pairs: DeviceBuffer::zeroed(stream, 2 * dims.nframe as usize)?,
+            gamma_parts: DeviceBuffer::zeroed(stream, 2 * ptyrs_gpu::gamma_parts(dims)? as usize)?,
             gamma: pair()?,
-            norms: [pair()?, pair()?, pair()?],
+            norms: [pair()?, pair()?],
+            icalc: DeviceBuffer::zeroed(stream, 1)?,
             fields: GammaStacks::zeroed(stream, stack_len)?,
         })
     }
@@ -188,9 +194,10 @@ impl MlState {
             d: &mut self.d,
             parts: &mut self.parts,
             beta: &mut self.beta,
-            frame_pairs: &mut self.frame_pairs,
+            gamma_parts: &mut self.gamma_parts,
             gamma: &mut self.gamma,
             norms: &mut self.norms,
+            icalc: &mut self.icalc,
             fields: &mut self.fields,
         }
     }
@@ -207,6 +214,7 @@ struct RpieScratch {
     plans: Vec<Plan2d>,
     psi: DeviceBuffer<C32>,
     dlt: DeviceBuffer<C32>,
+    max_chunks: DeviceBuffer<f32>,
     omax: DeviceBuffer<f32>,
     ptilde: DeviceBuffer<C32>,
     pmax: DeviceBuffer<f32>,
@@ -224,6 +232,8 @@ pub(super) struct RpieBufs<'a> {
     pub psi: &'a mut DeviceBuffer<C32>,
     /// pty-chi's `Δ`, then the probe step's weighted `Δ`.
     pub dlt: &'a mut DeviceBuffer<C32>,
+    /// [`ptyrs_gpu::RpieKernels::power_max`]'s per-chunk maxes, for up to `nk_max` groups.
+    pub max_chunks: &'a mut DeviceBuffer<f32>,
     /// Per-view `max |O_v|^2`.
     pub omax: &'a mut DeviceBuffer<f32>,
     /// `P / ((1 - a_o) |P|^2 + a_o max_i sum_m |P_m|^2)`.
@@ -244,13 +254,20 @@ impl RpieScratch {
             stacks(stream, dims, to_u32("batch_size", params.batch_size)?)?;
         let len = stack_buf_len(dims, &table);
         let nk_max = table.nf_max() as usize * dims.nmode as usize;
+        let n = to_u32("frame size", plane_len(dims))?;
+        let max_groups = PowerMax {
+            ngroup: to_u32("planes per batch", nk_max)?,
+            nsum: 1,
+            n,
+        };
         Ok(Self {
             batches,
-            n: to_u32("frame size", plane_len(dims))?,
+            n,
             table,
             plans: plans(stream, dims, &lens)?,
             psi: DeviceBuffer::zeroed(stream, len)?,
             dlt: DeviceBuffer::zeroed(stream, len)?,
+            max_chunks: DeviceBuffer::zeroed(stream, max_groups.chunks())?,
             omax: DeviceBuffer::zeroed(stream, nk_max)?,
             ptilde: DeviceBuffer::zeroed(stream, nprobe_values)?,
             pmax: DeviceBuffer::zeroed(stream, 1)?,
@@ -266,6 +283,7 @@ impl RpieScratch {
             plans: Plans(&mut self.plans),
             psi: &mut self.psi,
             dlt: &mut self.dlt,
+            max_chunks: &mut self.max_chunks,
             omax: &mut self.omax,
             ptilde: &mut self.ptilde,
             pmax: &mut self.pmax,
@@ -300,6 +318,8 @@ pub(super) struct Bufs<'a> {
     /// A stack's LLK partials, which [`ptyrs_gpu::RecordWriter::push`] then copies into the
     /// record.
     pub llk: &'a mut DeviceBuffer<LlkPartial>,
+    /// The chunk sums of M1's [`Kernels::llk`].
+    pub llk_scratch: &'a mut LlkScratch,
     /// ML's state, once an ML call has built it.
     pub ml: Option<MlBufs<'a>>,
 }
@@ -339,7 +359,8 @@ impl Plans<'_> {
 impl Device {
     /// Loads the kernels and uploads the views, counts and starting arrays on a new stream of
     /// `ctx`; the stacks cut `0 .. nframe` into `options.stack_size` frames, the LLK ring
-    /// holds `options.llk_slots` records, and `options.fused` picks the [`Passes`].
+    /// holds `options.llk_slots` records of every frame, its unmasked pixels counted here, and
+    /// `options.fused` picks the [`Passes`].
     pub fn new(
         ctx: &Arc<CudaContext>,
         dims: ViewDims,
@@ -358,7 +379,13 @@ impl Device {
             stacks(&stream, &dims, to_u32("stack_size", options.stack_size)?)?;
         let len = stack_buf_len(&dims, &table);
         let passes = if options.fused {
-            Passes::Fused(FusedBufs::new(&stream, &dims, table.nf_max())?)
+            let f = FusedBufs::new(&stream, &dims, table.nf_max()).map_err(|e| match e {
+                GpuError::Shape(m) => EngineError::Invalid(format!(
+                    "{m}; GpuOptions {{ fused: false, .. }} runs M1's launches instead"
+                )),
+                e => e.into(),
+            })?;
+            Passes::Fused(f)
         } else {
             Passes::M1 {
                 plans: plans(&stream, &dims, &lens)?,
@@ -378,6 +405,7 @@ impl Device {
             obj_len: to_u32("object length", obj.len())?,
             probe_len: to_u32("probe length", probe.len())?,
             llk: DeviceBuffer::zeroed(&stream, table.nf_max() as usize)?,
+            llk_scratch: LlkScratch::new(&stream, &dims, table.nf_max())?,
             ring: LlkRing::new(
                 &kernels,
                 &stream,
@@ -403,6 +431,12 @@ impl Device {
             stack_size: to_u32("stack_size", options.stack_size)?,
             stream,
         };
+        let ctx = dev.context();
+        for s in 0..dev.stacks.len() {
+            dev.ring
+                .device()
+                .count(&ctx, &dims, dev.table.at(s), &dev.counts)?;
+        }
         if dev.use_graph {
             dev.llk_graph = Some(dev.capture(|bufs, passes, ring, ctx| {
                 bufs.forward_llk(ctx, passes, ring.record()).map(Some)
@@ -432,9 +466,14 @@ impl Device {
         &self.probe
     }
 
+    /// Overwrites the object in place, so every captured graph reads the new values.
+    pub fn write_object(&mut self, obj: &[C32]) -> Result<(), EngineError> {
+        Ok(self.obj.copy_from_host(&self.stream, obj)?)
+    }
+
     /// Overwrites the object and probe in place.
     pub fn write_arrays(&mut self, obj: &[C32], probe: &[C32]) -> Result<(), EngineError> {
-        self.obj.copy_from_host(&self.stream, obj)?;
+        self.write_object(obj)?;
         self.probe.copy_from_host(&self.stream, probe)?;
         Ok(())
     }
@@ -457,6 +496,7 @@ impl Device {
             table: &self.table,
             stacks: Stacks(&mut self.stacks),
             llk: &mut self.llk,
+            llk_scratch: &mut self.llk_scratch,
             ml: self.ml.as_deref_mut().map(MlState::lend),
         };
         let passes = match &mut self.passes {
@@ -520,7 +560,7 @@ impl Device {
     }
 
     /// The LLK records counted since the last flush, in order; waits for their copies.
-    pub fn flush(&mut self) -> Result<Vec<(Tag, LlkSums)>, EngineError> {
+    pub fn flush(&mut self) -> Result<Vec<(Tag, LlkTotals)>, EngineError> {
         Ok(self.ring.flush(&self.context())?)
     }
 
@@ -572,8 +612,8 @@ impl Device {
         self.build_ml()?;
         {
             let ctx = self.context();
-            let (mut bufs, _, _) = self.lend();
-            bufs.with_ml(|b, ml| b.ml_grad(&ctx, ml, [true, true], None))?;
+            let (mut bufs, mut passes, _) = self.lend();
+            bufs.with_ml(|b, ml| b.ml_grad(&ctx, &mut passes, ml, [true, true], None))?;
         }
         let grads = [
             self.obj_sums.num.to_host_vec(&self.stream)?,
@@ -622,7 +662,8 @@ impl Device {
     /// Counts under `tag` the record a run just enqueued ended, if it ended one.
     fn count(&mut self, ended: Option<&Ended>, tag: Tag) -> Result<(), EngineError> {
         if let Some(ended) = ended {
-            self.ring.enqueued(&self.context(), ended, tag)?;
+            let nframe = self.dims().nframe;
+            self.ring.enqueued(&self.context(), ended, tag, nframe)?;
         }
         Ok(())
     }
@@ -654,8 +695,9 @@ impl<'a> Bufs<'a> {
                 self.dm_cycle(ctx, passes, params, *first).map(|()| None)
             }
             Cycle::Rpie(p, scratch) => self.rpie_epoch(ctx, p, &mut scratch.lend()).map(|()| None),
-            Cycle::Ml { params, first, llk } => self
-                .with_ml(|b, ml| b.ml_epoch(ctx, ml, params, *first, llk.then(|| ring.record()))),
+            Cycle::Ml { params, first, llk } => self.with_ml(|b, ml| {
+                b.ml_epoch(ctx, passes, ml, params, *first, llk.then(|| ring.record()))
+            }),
         }
     }
 }

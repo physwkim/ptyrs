@@ -1,10 +1,13 @@
-//! PyNX ML (Poisson conjugate gradient) on the GPU, by M1's launches.
+//! PyNX ML (Poisson conjugate gradient) on the GPU. The gradient pass runs as AP's
+//! projection does ([`super::GpuOptions::fused`]); the line search always by M1's launches.
 
 use cuda_async::device_operation::ExecutionContext;
 use ptyrs_core::{C64, Stack};
-use ptyrs_gpu::{CG_BLOCKS, Ended, Error as GpuError, RecordWriter};
+use ptyrs_gpu::{
+    CG_BLOCKS, Ended, Error as GpuError, Exit, FusedBufs, FusedInputs, FusedSums, RecordWriter,
+};
 
-use super::device::MlBufs;
+use super::device::{MlBufs, PassesMut};
 use super::{Bufs, Epoch, GpuPtycho};
 use crate::ptycho::llk_due;
 use crate::{EngineError, MlParams};
@@ -52,6 +55,7 @@ impl Bufs<'_> {
     pub(super) fn ml_epoch(
         &mut self,
         ctx: &ExecutionContext,
+        passes: &mut PassesMut<'_>,
         ml: &mut MlBufs<'_>,
         params: &MlParams,
         first: bool,
@@ -63,7 +67,7 @@ impl Bufs<'_> {
                 ptyrs_gpu::zero(ctx, b)?;
             }
         }
-        let ended = self.ml_grad(ctx, ml, update, llk)?;
+        let ended = self.ml_grad(ctx, passes, ml, update, llk)?;
 
         // β from the gradients in the sums and the last ones in h (then h = g), and d.
         let lens = [self.obj_len, self.probe_len];
@@ -99,10 +103,10 @@ impl Bufs<'_> {
                 plan.forward_inplace(ctx, f)?;
             }
             self.grad
-                .gamma_frames(ctx, &dims, stack, self.counts, ml.fields, ml.frame_pairs)?;
+                .gamma_frames(ctx, &dims, stack, self.counts, ml.fields, ml.gamma_parts)?;
         }
-        self.grad
-            .sum_parts(ctx, ml.frame_pairs, dims.nframe, ml.gamma)?;
+        let npart = ptyrs_gpu::gamma_parts(&dims)?;
+        self.grad.sum_parts(ctx, ml.gamma_parts, npart, ml.gamma)?;
         for (i, x) in [&mut *self.obj, &mut *self.probe].into_iter().enumerate() {
             if update[i] {
                 self.grad
@@ -113,60 +117,106 @@ impl Bufs<'_> {
     }
 
     /// The Poisson gradients of the estimate into the update sums' `num` (object, probe, as
-    /// `update` asks), stack by stack in `ml.fields.po`: exit waves, forward FFT, the LLK
-    /// partials into `llk` if given, [`ptyrs_gpu::GradKernels::poisson_grad`], inverse FFT,
-    /// back-projection. Returns the ended record.
+    /// `update` asks), stack by stack, with the LLK partials into `llk` if given; by the
+    /// fused passes' [`Exit::Grad`] or by M1's launches, as `passes` holds. Returns the ended
+    /// record.
     pub(super) fn ml_grad(
         &mut self,
         ctx: &ExecutionContext,
+        passes: &mut PassesMut<'_>,
         ml: &mut MlBufs<'_>,
         update: [bool; 2],
         mut llk: Option<RecordWriter<'_>>,
     ) -> Result<Option<Ended>, GpuError> {
-        let dims = *self.views.dims();
-        let psi = &mut ml.fields.po;
         for s in 0..self.stacks.len() {
-            let stack = self.table.at(s);
-            self.kernels
-                .obj_probe_to_psi(ctx, self.views, stack, self.obj, self.probe, psi)?;
-            let plan = ml.plans.get(self.stacks.get(s).frames.plan);
-            plan.forward_inplace(ctx, psi)?;
-            if let Some(rec) = llk.as_mut() {
-                self.kernels
-                    .llk(ctx, &dims, stack, self.counts, psi, self.llk)?;
-                rec.push(ctx, &dims, stack, self.llk)?;
-            }
-            self.grad
-                .poisson_grad(ctx, &dims, stack, self.counts, psi)?;
-            plan.inverse_inplace(ctx, psi)?;
-            if update[0] {
-                self.kernels
-                    .psi_to_obj(ctx, self.views, stack, psi, self.probe, self.obj_sums)?;
-            }
-            if update[1] {
-                self.kernels.psi_to_probe(
-                    ctx,
-                    self.views,
-                    stack,
-                    psi,
-                    self.obj,
-                    self.probe_sums,
-                )?;
+            match passes {
+                PassesMut::Fused(f) => self.fused_grad(ctx, f, s, update, llk.as_mut())?,
+                PassesMut::M1(_) => self.m1_grad(ctx, ml, s, update, llk.as_mut())?,
             }
         }
         llk.map(|w| w.end(ctx)).transpose()
     }
 
+    /// Stack `s` of [`Self::ml_grad`] by one fused pass.
+    fn fused_grad(
+        &mut self,
+        ctx: &ExecutionContext,
+        f: &mut FusedBufs,
+        s: usize,
+        update: [bool; 2],
+        llk: Option<&mut RecordWriter<'_>>,
+    ) -> Result<(), GpuError> {
+        let dims = *self.views.dims();
+        let stack = self.table.at(s);
+        let inputs = FusedInputs {
+            views: self.views,
+            counts: self.counts,
+            obj: self.obj,
+            probe: self.probe,
+        };
+        let exit = Exit::Grad {
+            llk: llk.is_some().then_some(&mut *self.llk),
+        };
+        let sums = FusedSums {
+            obj: update[0].then_some(&mut *self.obj_sums),
+            probe: update[1].then_some(&mut *self.probe_sums),
+        };
+        self.kernels
+            .fused_project(ctx, &inputs, stack, exit, f, sums)?;
+        if let Some(rec) = llk {
+            rec.push(ctx, &dims, stack, self.llk)?;
+        }
+        Ok(())
+    }
+
+    /// Stack `s` of [`Self::ml_grad`] by M1's launches in `ml.fields.po`: exit waves, forward
+    /// FFT, the LLK partials, [`ptyrs_gpu::GradKernels::poisson_grad`], inverse FFT,
+    /// back-projection.
+    fn m1_grad(
+        &mut self,
+        ctx: &ExecutionContext,
+        ml: &mut MlBufs<'_>,
+        s: usize,
+        update: [bool; 2],
+        llk: Option<&mut RecordWriter<'_>>,
+    ) -> Result<(), GpuError> {
+        let dims = *self.views.dims();
+        let stack = self.table.at(s);
+        let psi = &mut ml.fields.po;
+        self.kernels
+            .obj_probe_to_psi(ctx, self.views, stack, self.obj, self.probe, psi)?;
+        let plan = ml.plans.get(self.stacks.get(s).frames.plan);
+        plan.forward_inplace(ctx, psi)?;
+        if let Some(rec) = llk {
+            self.kernels
+                .llk(ctx, stack, self.counts, psi, self.llk_scratch, self.llk)?;
+            rec.push(ctx, &dims, stack, self.llk)?;
+        }
+        self.grad
+            .poisson_grad(ctx, &dims, stack, self.counts, psi)?;
+        plan.inverse_inplace(ctx, psi)?;
+        if update[0] {
+            self.kernels
+                .psi_to_obj(ctx, self.views, stack, psi, self.probe, self.obj_sums)?;
+        }
+        if update[1] {
+            self.kernels
+                .psi_to_probe(ctx, self.views, stack, psi, self.obj, self.probe_sums)?;
+        }
+        Ok(())
+    }
+
     /// [`crate::Ptycho::scale_obj_probe`] on the device, `total` being the unmasked observed
-    /// photons: the norms of the object, the probe and every view's exit wave (stack by
-    /// stack in `ml.fields.po`), then the scaling, all without a host sync.
+    /// photons: the norms of the object and the probe, the calculated photons over the same
+    /// unmasked pixels (stack by stack, by the LLK kernel on the far field in `ml.fields.po`),
+    /// then the scaling, all without a host sync.
     pub(super) fn scale_obj_probe(
         &mut self,
         ctx: &ExecutionContext,
         ml: &mut MlBufs<'_>,
         total: f32,
     ) -> Result<(), GpuError> {
-        let [obj_norm, probe_norm, psi_norm] = &mut *ml.norms;
+        let [obj_norm, probe_norm] = &mut *ml.norms;
         for (x, n, out) in [
             (&*self.obj, self.obj_len, &mut *obj_norm),
             (&*self.probe, self.probe_len, &mut *probe_norm),
@@ -175,23 +225,27 @@ impl Bufs<'_> {
             self.grad.norm_parts(ctx, x, n, ml.parts)?;
             self.grad.sum_parts(ctx, ml.parts, CG_BLOCKS, out)?;
         }
-        ptyrs_gpu::zero(ctx, ml.parts)?;
+        ptyrs_gpu::zero(ctx, ml.icalc)?;
+        let dims = *self.views.dims();
         let psi = &mut ml.fields.po;
         for s in 0..self.stacks.len() {
-            self.kernels.obj_probe_to_psi(
-                ctx,
-                self.views,
-                self.table.at(s),
-                self.obj,
-                self.probe,
-                psi,
-            )?;
-            let n = self.stacks.get(s).frames.len;
-            self.grad.norm_parts(ctx, psi, n, ml.parts)?;
+            let stack = self.table.at(s);
+            self.kernels
+                .obj_probe_to_psi(ctx, self.views, stack, self.obj, self.probe, psi)?;
+            ml.plans
+                .get(self.stacks.get(s).frames.plan)
+                .forward_inplace(ctx, psi)?;
+            self.kernels
+                .llk(ctx, stack, self.counts, psi, self.llk_scratch, self.llk)?;
+            self.grad.icalc_add(ctx, &dims, stack, self.llk, ml.icalc)?;
         }
-        self.grad.sum_parts(ctx, ml.parts, CG_BLOCKS, psi_norm)?;
-        let norms = [&*obj_norm, &*probe_norm, &*psi_norm];
-        self.grad
-            .scale_obj_probe(ctx, self.obj, self.probe, norms, total)
+        self.grad.scale_obj_probe(
+            ctx,
+            self.obj,
+            self.probe,
+            [obj_norm, probe_norm],
+            ml.icalc,
+            total,
+        )
     }
 }

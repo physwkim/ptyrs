@@ -1,15 +1,18 @@
 //! The GPU backend against the CPU oracle: per-record LLK and the final object and probe of AP,
 //! DM, rPIE and ML updating the object, the probe or both, from the same scaled start; AP and
-//! DM by M1's launches and by the fused passes; and the ML gradients.
+//! DM by M1's launches and by the fused passes; the ML gradients; and the LLK ring's record
+//! of a scan's first frames.
 
 use std::sync::Arc;
 
-use cuda_core::CudaContext;
+use cuda_async::device_operation::ExecutionContext;
+use cuda_core::{CudaContext, DeviceBuffer};
 use ptyrs_core::{C64, Counts, MASKED, Object, Probe, Scan, Stack};
 use ptyrs_engine::{
-    ApParams, Backend, DmParams, GpuOptions, GpuPtycho, Llk, LlkRecord, MlParams, Params, Ptycho,
-    RpieParams, Step,
+    ApParams, Backend, DmParams, GpuOptions, GpuPtycho, Llk, LlkRecord, MlParams, Observed, Params,
+    Ptycho, RpieParams, Step, llk,
 };
+use ptyrs_gpu::{C32, FUSED_SIDES, Kernels, LlkPartial, LlkRing, LlkScratch, StackTable, ViewDims};
 
 mod common;
 mod ptychi;
@@ -36,9 +39,9 @@ const M1: Setup = Setup {
     },
 };
 
-/// The fused passes on 128-pixel frames, the smallest side they run.
+/// The fused passes on the smallest side they run.
 const FUSED: Setup = Setup {
-    frame: 128,
+    frame: FUSED_SIDES[0] as usize,
     options: GpuOptions {
         fused: true,
         ..M1.options
@@ -55,23 +58,33 @@ fn start(frame: usize, nprobe: usize, masked: bool) -> (Scan, Object, Probe) {
     let (mut scan, object, probe) =
         common::dm_scenario(frame, NPOS, nprobe, 2e5, frame as f64 / 8.0);
     if masked {
-        let dims = scan.counts.dims();
-        let data = scan
-            .counts
-            .as_slice()
-            .iter()
-            .enumerate()
-            .map(|(i, &c)| {
-                let (y, x) = ((i / frame) % frame, i % frame);
-                if y == 3 || x == 20 { MASKED } else { c }
-            })
-            .collect();
-        scan.counts = Counts::from_raw(dims, data).unwrap();
+        scan = mask(scan, |y, x| y == 3 || x == 20);
     }
     let mut p = Ptycho::new(&scan, object, probe).unwrap();
     p.scale_obj_probe();
     let (object, probe) = p.into_modes();
     (scan, object, probe)
+}
+
+/// `scan` with pixel `(y, x)` of every frame masked where `masked(y, x)`.
+fn mask(mut scan: Scan, masked: impl Fn(usize, usize) -> bool) -> Scan {
+    let dims = scan.counts.dims();
+    let [_, ny, nx] = dims;
+    let data = scan
+        .counts
+        .as_slice()
+        .iter()
+        .enumerate()
+        .map(|(i, &c)| {
+            if masked((i / nx) % ny, i % nx) {
+                MASKED
+            } else {
+                c
+            }
+        })
+        .collect();
+    scan.counts = Counts::from_raw(dims, data).unwrap();
+    scan
 }
 
 /// `|a - b| / |b|` over the whole array.
@@ -196,8 +209,8 @@ fn rpie_matches_cpu() {
     }
 }
 
-/// ML's gradients of the same estimate, in `f32` against `f64`, on M1's and the fused passes'
-/// setups (ML itself always runs M1's launches).
+/// ML's gradients of the same estimate, in `f32` against `f64`, by M1's launches and by the
+/// fused passes.
 #[test]
 fn ml_grads_match_cpu() {
     for setup in [M1, FUSED] {
@@ -217,20 +230,47 @@ fn ml_grads_match_cpu() {
     }
 }
 
+/// ML's starting scale counts the calculated photons over the unmasked pixels only, as the
+/// observed total does: with the bright centre of every frame masked, holding over a tenth of
+/// the calculated photons, the first LLK record's photon count is the observed total.
+#[test]
+fn ml_scale_leaves_masked_pixels_out() {
+    let (frame, c) = (M1.frame, M1.frame / 2);
+    let (scan, object, probe) = common::dm_scenario(frame, NPOS, 2, 2e5, frame as f64 / 8.0);
+    let open = Ptycho::new(&scan, object.clone(), probe.clone()).unwrap();
+    let scan = mask(scan, |y, x| y.abs_diff(c) < 3 && x.abs_diff(c) < 3);
+    let cpu = Ptycho::new(&scan, object.clone(), probe.clone()).unwrap();
+    let share = 1.0 - cpu.llk().nb_photons_calc / open.llk().nb_photons_calc;
+    assert!(share > 0.1, "masked share {share}");
+    let total = cpu.observed().total();
+    let mut gpu = GpuPtycho::new(&ctx(), &scan, object, probe, M1.options).unwrap();
+    let params = MlParams {
+        calc_llk: 1,
+        ..MlParams::default()
+    };
+    gpu.ml(&params, 1).unwrap();
+    let got = gpu.history()[0].llk.nb_photons_calc;
+    assert!((got - total).abs() < 1e-5 * total, "{got} vs {total}");
+}
+
 /// ML's direction (β from the last gradient across both arrays) and Poisson quadratic step
-/// against the CPU, for each pair of updated arrays.
+/// against the CPU, for each pair of updated arrays, with the gradients by M1's launches and
+/// by the fused passes.
 #[test]
 fn ml_matches_cpu() {
-    for (o, p) in UPDATES {
+    for (setup, (o, p)) in [M1, FUSED]
+        .into_iter()
+        .flat_map(|s| UPDATES.map(|u| (s, u)))
+    {
         let params = MlParams {
             update_object: o.is_some(),
             update_probe: p.is_some(),
             calc_llk: 1,
             zero_phase_ramp: true,
         };
-        let (scan, object, probe) = start(M1.frame, 2, true);
+        let (scan, object, probe) = start(setup.frame, 2, true);
         let mut cpu = Ptycho::new(&scan, object.clone(), probe.clone()).unwrap();
-        let mut gpu = GpuPtycho::new(&ctx(), &scan, object, probe, M1.options).unwrap();
+        let mut gpu = GpuPtycho::new(&ctx(), &scan, object, probe, setup.options).unwrap();
         cpu.ml(&params, 10);
         gpu.ml(&params, 10).unwrap();
         assert_eq!(gpu.cycle(), cpu.cycle());
@@ -240,8 +280,8 @@ fn ml_matches_cpu() {
             rel_l2(&gpu.probe().unwrap(), cpu.probe()),
         ];
         eprintln!(
-            "ml {params:?}: llk {:.2e} object {:.2e} probe {:.2e}",
-            errs[0], errs[1], errs[2]
+            "ml fused {} {params:?}: llk {:.2e} object {:.2e} probe {:.2e}",
+            setup.options.fused, errs[0], errs[1], errs[2]
         );
         check(errs, [1e-4, 1e-4, 1e-4]);
     }
@@ -319,6 +359,37 @@ fn switches_match_cpu(setup: Setup) {
     );
 }
 
+/// An object set between AP calls, after graphs were captured, gives the bits and the LLK of
+/// a fresh reconstruction built with that object and the probe so far; one of other dims is
+/// refused.
+#[test]
+fn set_object_matches_a_fresh_start() {
+    let ap = ApParams {
+        obj_inertia: Some(0.01),
+        probe_inertia: Some(0.001),
+        calc_llk: 1,
+        zero_phase_ramp: false,
+    };
+    for setup in [M1, FUSED] {
+        let (scan, object, probe) = start(setup.frame, 2, true);
+        let mut g = GpuPtycho::new(&ctx(), &scan, object.clone(), probe, setup.options).unwrap();
+        g.ap(&ap, 2).unwrap();
+        let turn = C64::from_polar(0.9, 0.3);
+        let values = object.as_slice().iter().map(|&c| c * turn).collect();
+        let other = Object::new(Stack::from_vec(object.dims(), values).unwrap());
+        let wrong = Object::new(Stack::filled([1, 4, 4], C64::new(1.0, 0.0)));
+        assert!(g.set_object(&wrong).is_err());
+        g.set_object(&other).unwrap();
+        let mut fresh =
+            GpuPtycho::new(&ctx(), &scan, other, g.probe().unwrap(), setup.options).unwrap();
+        g.ap(&ap, 1).unwrap();
+        fresh.ap(&ap, 1).unwrap();
+        assert_eq!(g.history()[2].llk, fresh.history()[0].llk, "{setup:?}");
+        assert_eq!(g.object().unwrap(), fresh.object().unwrap(), "{setup:?}");
+        assert_eq!(g.probe().unwrap(), fresh.probe().unwrap(), "{setup:?}");
+    }
+}
+
 #[test]
 fn gpu_rejects_what_it_cannot_run() {
     let (scan, object, probe) = start(M1.frame, 1, false);
@@ -338,8 +409,17 @@ fn gpu_rejects_what_it_cannot_run() {
         ..M1.options
     };
     assert!(GpuPtycho::new(&ctx(), &scan, object.clone(), probe.clone(), no_ring).is_err());
-    // the fused passes have no 32-point FFT
-    assert!(GpuPtycho::new(&ctx(), &scan, object, probe, FUSED.options).is_err());
+    // the fused passes have no 32-point FFT; the error says which sides they take and how
+    // to run without them
+    assert!(!FUSED_SIDES.contains(&(M1.frame as u32)));
+    let err = GpuPtycho::new(&ctx(), &scan, object, probe, FUSED.options)
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(
+        err.contains(&format!("{FUSED_SIDES:?}")) && err.contains("fused: false"),
+        "{err}"
+    );
 }
 
 /// AP, DM and ML cycles (AP's and ML's with an LLK, DM's and ML's first included), rPIE
@@ -423,4 +503,127 @@ fn graph_like_eager(setup: Setup) {
     assert!(eager.2 == graph.2, "{setup:?}: LLK records differ");
     assert!(eager.0 == graph.0, "{setup:?}: object differs");
     assert!(eager.1 == graph.1, "{setup:?}: probe differs");
+}
+
+/// A ring record of the frames a live scan has landed, `0 .. n`, against the CPU LLK over the
+/// same frames: the GPU's LLK partials stack by stack, the frames counted as their stacks land
+/// and pushed by every stack that holds one below `n`, read back with `n` and the frames'
+/// unmasked pixels; `n` inside a stack (10) and the whole scan. The mask differs from frame to
+/// frame, so the count is the frames' own.
+#[test]
+fn ring_record_of_the_first_frames_matches_the_cpu_llk() {
+    let (scan, _, _) = start(M1.frame, 2, false);
+    let [nframe, ny, nx] = scan.counts.dims();
+    let (nmode, npix) = (2, ny * nx);
+    let data = scan.counts.as_slice().iter().enumerate();
+    let data = data.map(|(i, &c)| if (i + i / npix) % 9 == 0 { MASKED } else { c });
+    let counts = Counts::from_raw([nframe, ny, nx], data.collect()).unwrap();
+    // Far fields in the GPU's scaling, `sum |psi|^2 / npix` per pixel, and the same for the CPU.
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        0.5 + (seed >> 40) as f32 / (1u64 << 23) as f32
+    };
+    let amp = (npix as f32 / nmode as f32).sqrt();
+    let psi: Vec<C32> = (0..nframe * nmode * npix)
+        .map(|_| C32 {
+            re: amp * next(),
+            im: amp * next(),
+        })
+        .collect();
+    let root = (npix as f64).sqrt();
+    let psi64: Vec<C64> = psi
+        .iter()
+        .map(|c| C64::new(f64::from(c.re) / root, f64::from(c.im) / root))
+        .collect();
+
+    let cuda = ctx();
+    let kernels = Kernels::load(&cuda).unwrap();
+    let stream = cuda.new_stream().unwrap();
+    let ex = ExecutionContext::new(stream.clone());
+    let side = [ny as u32, nx as u32];
+    let dims = ViewDims {
+        nframe: nframe as u32,
+        nmode: nmode as u32,
+        nprobe: nmode as u32,
+        nobj: 1,
+        frame: side,
+        obj: side,
+        quad_phase: 0.0,
+    };
+    let stacks: Vec<_> = (0..nframe as u32)
+        .step_by(7)
+        .map(|f| f..(f + 7).min(nframe as u32))
+        .collect();
+    let table = StackTable::new(&stream, &dims, &stacks).unwrap();
+    let plane = table.nf_max() as usize * nmode * npix;
+    let staged: Vec<DeviceBuffer<C32>> = stacks
+        .iter()
+        .map(|r| {
+            let mut v =
+                psi[r.start as usize * nmode * npix..r.end as usize * nmode * npix].to_vec();
+            v.resize(plane, C32::default());
+            DeviceBuffer::from_host(&stream, &v).unwrap()
+        })
+        .collect();
+    let dev_counts = DeviceBuffer::from_host(&stream, counts.as_slice()).unwrap();
+    let mut scratch = LlkScratch::new(&stream, &dims, table.nf_max()).unwrap();
+    let mut partials =
+        DeviceBuffer::<LlkPartial>::zeroed(&stream, table.nf_max() as usize).unwrap();
+    let mut ring = LlkRing::new(&kernels, &stream, nframe as u32, 2).unwrap();
+
+    let ns = [10, nframe as u32];
+    let mut counted = 0;
+    for (r, &n) in ns.iter().enumerate() {
+        let landed: Vec<usize> = (0..stacks.len()).filter(|&s| stacks[s].start < n).collect();
+        for &s in &landed[counted..] {
+            ring.device()
+                .count(&ex, &dims, table.at(s), &dev_counts)
+                .unwrap();
+        }
+        counted = landed.len();
+        let mut rec = ring.device().record();
+        for &s in &landed {
+            let stack = table.at(s);
+            kernels
+                .llk(
+                    &ex,
+                    stack,
+                    &dev_counts,
+                    &staged[s],
+                    &mut scratch,
+                    &mut partials,
+                )
+                .unwrap();
+            rec.push(&ex, &dims, stack, &partials).unwrap();
+        }
+        let ended = rec.end(&ex).unwrap();
+        ring.enqueued(&ex, &ended, r, n).unwrap();
+    }
+
+    let obs = Observed::from_counts(&counts);
+    let got = ring.flush(&ex).unwrap();
+    assert_eq!(got.len(), ns.len());
+    for (r, t) in got {
+        let n = ns[r] as usize;
+        let cpu = llk(&obs, 0..n, nmode, &psi64[..n * nmode * npix]);
+        let nb_obs = counts.as_slice()[..n * npix]
+            .iter()
+            .filter(|&&c| c != MASKED)
+            .count();
+        assert_eq!((t.nframe as usize, t.nb_obs), (n, nb_obs), "record {r}");
+        let s = t.sums;
+        for (what, g, c) in [
+            ("poisson", s.poisson, cpu.poisson),
+            ("gaussian", s.gaussian, cpu.gaussian),
+            ("euclidean", s.euclidean, cpu.euclidian),
+            ("icalc", s.icalc, cpu.nb_photons_calc),
+        ] {
+            let rel = (g - c).abs() / c.abs();
+            println!("record {r} (n {n}) {what}: rel {rel:.2e}");
+            assert!(rel < 1e-5, "record {r} (n {n}) {what}: {g} vs {c}");
+        }
+    }
 }

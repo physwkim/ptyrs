@@ -331,13 +331,13 @@ impl Ptycho {
         });
     }
 
-    /// PyNX `ScaleObjProbe(absolute=True)`: scale so `Σ|P·O·q|²` over all views equals the
-    /// total unmasked observed intensity, then balance `Σ|O|` and `Σ|P|`:
-    /// `s = sqrt(Σ iobs / Σ|psi|²)`, `P *= sqrt(Σ|O| / Σ|P| · s)`, `O *= sqrt(Σ|P| / Σ|O| · s)`.
-    /// PyNX sums `iobs` including its negative masked values; here masked pixels are left out.
+    /// PyNX `ScaleObjProbe(absolute=True)`: scale so the calculated intensity over the
+    /// unmasked pixels of every frame ([`Llk::nb_photons_calc`]) equals the observed one
+    /// there, then balance `Σ|O|` and `Σ|P|`: `s = sqrt(Σ iobs / Σ icalc)`,
+    /// `P *= sqrt(Σ|O| / Σ|P| · s)`, `O *= sqrt(Σ|P| / Σ|O| · s)`. Masked pixels are in
+    /// neither sum, as in PyNX CUDA's `scale_intensity`.
     pub fn scale_obj_probe(&mut self) {
-        let calc: f64 = self.calc_psi().iter().map(|c| c.norm_sqr()).sum();
-        let s = (self.obs.total() / calc).sqrt();
+        let s = (self.obs.total() / self.llk().nb_photons_calc).sqrt();
         let os: f64 = self.object.as_slice().iter().map(|c| c.norm()).sum();
         let ps: f64 = self.probe.as_slice().iter().map(|c| c.norm()).sum();
         let (fp, fo) = ((os / ps * s).sqrt(), (ps / os * s).sqrt());
@@ -345,7 +345,11 @@ impl Ptycho {
         self.object.as_mut_slice().iter_mut().for_each(|c| *c *= fo);
     }
 
-    /// [`zero_phase_ramp`] of the object and probe.
+    /// PyNX `ZeroPhaseRamp`: centre the probe's far field. With `(cy, cx)` the centre of mass
+    /// of `Σ_modes |fftshift(FT(fftshift(P)))|²`, `dx = cx − nx/2`, `dy = cy − ny/2`:
+    /// `P *= exp(−2πi(dx·(x − nx/2)/nx + dy·(y − ny/2)/ny))` and
+    /// `O *= exp(+2πi(dx·(x − nxo/2)/nx + dy·(y − nyo/2)/ny))` (integer halves). The two
+    /// ramps cancel in every view up to a constant phase, so the LLK is unchanged.
     pub fn zero_phase_ramp(&mut self) {
         zero_phase_ramp(&self.fft, &mut self.object, &mut self.probe);
     }
@@ -490,6 +494,8 @@ impl Ptycho {
                 }
             }
             let (num, den) = self.cg_gamma(&dir[0], &dir[1]);
+            // PyNX's γ has a wrong cross term in `den` (see `cg_poisson_gamma`); ptyrs follows
+            // the math on both backends, so a γ gap to PyNX is not to be fixed toward it.
             let gamma = num / den;
             if gamma.is_finite() {
                 let [d_obj, d_probe] = &dir;
@@ -649,11 +655,8 @@ impl Ptycho {
     }
 }
 
-/// PyNX `ZeroPhaseRamp`: centre the probe's far field. With `(cy, cx)` the centre of mass
-/// of `Σ_modes |fftshift(FT(fftshift(P)))|²`, `dx = cx − nx/2`, `dy = cy − ny/2`:
-/// `P *= exp(−2πi(dx·(x − nx/2)/nx + dy·(y − ny/2)/ny))` and
-/// `O *= exp(+2πi(dx·(x − nxo/2)/nx + dy·(y − nyo/2)/ny))` (integer halves). The two
-/// ramps cancel in every view up to a constant phase, so the LLK is unchanged.
+/// [`Ptycho::zero_phase_ramp`] of the given arrays, which the GPU backend also runs on its
+/// downloads.
 pub(crate) fn zero_phase_ramp(fft: &Fft2, object: &mut Object, probe: &mut Probe) {
     let [ny, nx] = probe.plane_shape();
     let n = ny * nx;

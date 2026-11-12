@@ -7,9 +7,9 @@
 //! an LLK record every `calc_llk` cycles (0: none, as `scripts/compare_pynx.py --time` times
 //! PyNX, and `scripts/compare_pynx_ml.py --time` PyNX ML). `graph` replays steady-state AP,
 //! DM and ML cycles, rPIE epochs and LLK passes from the graphs the untimed cycles captured
-//! ([`GpuOptions::graph`]); `fused` runs AP and DM stacks and the LLK pass by the fused
-//! passes, `m1` by M1's launches ([`GpuOptions::fused`]). ML updates object and probe and
-//! always runs M1's launches.
+//! ([`GpuOptions::graph`]); `fused` runs AP and DM stacks, ML's gradients and the LLK pass by
+//! the fused passes, `m1` by M1's launches ([`GpuOptions::fused`]). ML updates object and
+//! probe.
 
 use std::time::Instant;
 
@@ -50,7 +50,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None | Some("fused") => true,
         Some("m1") => false,
         Some(_) => return Err(usage.into()),
-    } && algo != "ml";
+    };
 
     let (scan, object, probe) = common::dm_scenario(frame, npos, nprobe, 2e5, step);
     let mut p = Ptycho::new(&scan, object, probe)?;

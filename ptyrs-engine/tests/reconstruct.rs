@@ -50,22 +50,23 @@ fn rel(a: f64, b: f64) -> f64 {
     (a - b).abs() / b.abs()
 }
 
+/// With and without masked pixels, the scaled calculated photons over the unmasked pixels
+/// are the observed ones there.
 #[test]
 fn scale_obj_probe_matches_observed_photons() {
-    let c = case(1, true);
-    let mut p = Ptycho::new(&c.scan, flat_object(&c.object), c.probe.clone()).unwrap();
-    p.scale_obj_probe();
-    // the scale matches every calculated pixel to the unmasked observations; the LLK photon
-    // sum leaves the masked pixels out, so it falls short
-    assert!(p.llk().nb_photons_calc < p.observed().total());
-    let c0 = case(1, false);
-    let mut p = Ptycho::new(&c0.scan, flat_object(&c0.object), c0.probe.clone()).unwrap();
-    p.scale_obj_probe();
-    let l = p.llk();
-    assert!(rel(l.nb_photons_calc, p.observed().total()) < 1e-12);
-    let os: f64 = p.object().as_slice().iter().map(|c| c.norm()).sum();
-    let ps: f64 = p.probe().as_slice().iter().map(|c| c.norm()).sum();
-    assert!(rel(os, ps) < 1e-12);
+    for masked in [true, false] {
+        let c = case(1, masked);
+        let mut p = Ptycho::new(&c.scan, flat_object(&c.object), c.probe.clone()).unwrap();
+        p.scale_obj_probe();
+        let got = p.llk().nb_photons_calc;
+        assert!(
+            rel(got, p.observed().total()) < 1e-12,
+            "masked {masked}: {got}"
+        );
+        let os: f64 = p.object().as_slice().iter().map(|c| c.norm()).sum();
+        let ps: f64 = p.probe().as_slice().iter().map(|c| c.norm()).sum();
+        assert!(rel(os, ps) < 1e-12);
+    }
 }
 
 #[test]

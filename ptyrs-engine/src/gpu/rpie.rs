@@ -1,7 +1,7 @@
 //! pty-chi rPIE on the GPU, in the call sequence of `ptyrs_gpu::RpieKernels`.
 
 use cuda_async::device_operation::ExecutionContext;
-use ptyrs_gpu::{Error as GpuError, Weight};
+use ptyrs_gpu::{Error as GpuError, PowerMax, Weight};
 
 use super::device::RpieBufs;
 use super::{Bufs, Epoch, GpuPtycho};
@@ -72,7 +72,12 @@ impl Bufs<'_> {
         k.add_c32(ctx, rb.dlt, rb.psi, len)?;
 
         if params.obj_step.is_some() {
-            rk.power_max(ctx, self.probe, 1, dims.nprobe, n, rb.pmax)?;
+            let groups = PowerMax {
+                ngroup: 1,
+                nsum: dims.nprobe,
+                n,
+            };
+            rk.power_max(ctx, self.probe, groups, rb.max_chunks, rb.pmax)?;
             let spec = Weight {
                 nk: dims.nprobe,
                 n,
@@ -84,7 +89,12 @@ impl Bufs<'_> {
         }
         if params.probe_step.is_some() {
             k.obj_probe_to_psi(ctx, self.views, stack, self.obj, rb.ones, rb.psi)?;
-            rk.power_max(ctx, rb.psi, nk, 1, n, rb.omax)?;
+            let groups = PowerMax {
+                ngroup: nk,
+                nsum: 1,
+                n,
+            };
+            rk.power_max(ctx, rb.psi, groups, rb.max_chunks, rb.omax)?;
             let spec = Weight {
                 nk,
                 n,

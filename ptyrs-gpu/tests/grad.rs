@@ -6,8 +6,8 @@ use std::sync::Arc;
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, DeviceCopy};
 use ptyrs_gpu::{
-    C32, CG_BLOCKS, GammaStacks, GradKernels, Kernels, MASKED, StackTable, UpdateSums, ViewAddr,
-    ViewDims, Views,
+    C32, CG_BLOCKS, GAMMA_CHUNK, GammaStacks, GradKernels, Kernels, LlkPartial, MASKED, StackTable,
+    UpdateSums, ViewAddr, ViewDims, Views, gamma_parts,
 };
 
 /// A stream, an eager execution context on it, the M1 kernels and the CG kernels.
@@ -248,13 +248,31 @@ fn gamma_fields_are_the_exit_waves_of_the_directions() {
     }
 }
 
-/// Each frame's pair is the f64 `CG_Poisson_Gamma` sum of its unmasked pixels, frames outside
-/// the stack keep their pair, and `sum_parts` of all frames' pairs is their total.
+/// Each chunk's pair is the f64 `CG_Poisson_Gamma` sum of its unmasked pixels, on frames of
+/// a full and a short chunk; frames outside the stack keep their pairs, and `sum_parts` of
+/// the scan's `gamma_parts` pairs is their total.
 #[test]
-fn gamma_frames_match_f64_and_sum_to_gamma() {
+fn gamma_frames_match_f64_per_chunk_and_sum_to_gamma() {
     let (stream, ctx, _, k) = setup();
-    let (views, table) = scan(&stream);
-    let (ny, nx, nmode, n) = (8usize, 8usize, 2usize, 64usize);
+    let (ny, nx, nmode) = (48usize, 64usize, 2usize);
+    let n = ny * nx;
+    let dims = ViewDims {
+        nframe: 5,
+        nmode: nmode as u32,
+        nprobe: 2,
+        nobj: 1,
+        frame: [ny as u32, nx as u32],
+        obj: [64, 64],
+        quad_phase: 0.0,
+    };
+    let table = StackTable::new(&stream, &dims, &[0..3, 3..5]).unwrap();
+    let chunk = GAMMA_CHUNK as usize;
+    let nchunk = n.div_ceil(chunk);
+    assert!(
+        n % chunk != 0 && nchunk == 2,
+        "one full and one short chunk"
+    );
+    assert_eq!(gamma_parts(&dims).unwrap() as usize, 5 * nchunk);
     let counts: Vec<u16> = (0..5 * n)
         .map(|i| {
             if i % 13 == 5 {
@@ -265,7 +283,7 @@ fn gamma_frames_match_f64_and_sum_to_gamma() {
         })
         .collect();
     let dcounts = up(&stream, &counts);
-    let mut pairs = up(&stream, &[7.0f32; 10]);
+    let mut pairs = up(&stream, &vec![7.0f32; 2 * 5 * nchunk]);
     let mut total = (0.0f64, 0.0f64);
     for (s, f0, nf) in [(0usize, 0usize, 3usize), (1, 3, 2)] {
         let len = 3 * nmode * n;
@@ -280,62 +298,63 @@ fn gamma_frames_match_f64_and_sum_to_gamma() {
             b: up(&stream, &x[2]),
         };
         let before = pairs.to_host_vec(&stream).unwrap();
-        k.gamma_frames(
-            &ctx,
-            views.dims(),
-            table.at(s),
-            &dcounts,
-            &stacks,
-            &mut pairs,
-        )
-        .unwrap();
+        k.gamma_frames(&ctx, &dims, table.at(s), &dcounts, &stacks, &mut pairs)
+            .unwrap();
         let got = pairs.to_host_vec(&stream).unwrap();
         for f in 0..5 {
-            let (lo, hi) = (2 * f, 2 * f + 2);
+            let frame = 2 * f * nchunk..2 * (f + 1) * nchunk;
             if !(f0..f0 + nf).contains(&f) {
-                assert_eq!(got[lo..hi], before[lo..hi], "frame {f} outside stack {s}");
+                assert_eq!(
+                    got[frame.clone()],
+                    before[frame],
+                    "frame {f} outside stack {s}"
+                );
                 continue;
             }
             let fl = f - f0;
-            let (mut num, mut den, mut scale) = (0.0f64, 0.0f64, [0.0f64; 2]);
-            for d in 0..n {
-                let obs = counts[f * n + d];
-                if obs == MASKED {
-                    continue;
+            for c in 0..nchunk {
+                let (mut num, mut den, mut scale) = (0.0f64, 0.0f64, [0.0f64; 2]);
+                for d in c * chunk..n.min((c + 1) * chunk) {
+                    let obs = counts[f * n + d];
+                    if obs == MASKED {
+                        continue;
+                    }
+                    let at = ((d / nx + ny / 2) % ny) * nx + (d % nx + nx / 2) % nx;
+                    let (mut calc, mut r, mut sq) = (0.0f64, 0.0f64, 0.0f64);
+                    for m in 0..nmode {
+                        let j = (fl * nmode + m) * n + at;
+                        let c = |v: &Vec<C32>| (v[j].re as f64, v[j].im as f64);
+                        let (p, a, b) = (c(&x[0]), c(&x[1]), c(&x[2]));
+                        calc += p.0 * p.0 + p.1 * p.1;
+                        r += p.0 * a.0 + p.1 * a.1;
+                        sq += a.0 * a.0 + a.1 * a.1 + 2.0 * (p.0 * b.0 + p.1 * b.1);
+                    }
+                    let calc = (calc / n as f64).max(1e-12);
+                    let (r, sq, obs) = (r / n as f64, sq / n as f64, obs as f64);
+                    let f = 1.0 - obs / calc;
+                    let (tn, td) = (-2.0 * r * f, 2.0 * sq * f + obs * (2.0 * r / calc).powi(2));
+                    num += tn;
+                    den += td;
+                    scale[0] += tn.abs();
+                    scale[1] += td.abs();
                 }
-                let at = ((d / nx + ny / 2) % ny) * nx + (d % nx + nx / 2) % nx;
-                let (mut calc, mut r, mut sq) = (0.0f64, 0.0f64, 0.0f64);
-                for m in 0..nmode {
-                    let j = (fl * nmode + m) * n + at;
-                    let c = |v: &Vec<C32>| (v[j].re as f64, v[j].im as f64);
-                    let (p, a, b) = (c(&x[0]), c(&x[1]), c(&x[2]));
-                    calc += p.0 * p.0 + p.1 * p.1;
-                    r += p.0 * a.0 + p.1 * a.1;
-                    sq += a.0 * a.0 + a.1 * a.1 + 2.0 * (p.0 * b.0 + p.1 * b.1);
+                let lo = 2 * (f * nchunk + c);
+                for (i, w) in [num, den].into_iter().enumerate() {
+                    let e = (got[lo + i] as f64 - w).abs();
+                    assert!(
+                        e < 1e-5 * scale[i],
+                        "frame {f} chunk {c} pair {i}: {} vs {w}",
+                        got[lo + i]
+                    );
                 }
-                let calc = (calc / n as f64).max(1e-12);
-                let (r, sq, obs) = (r / n as f64, sq / n as f64, obs as f64);
-                let f = 1.0 - obs / calc;
-                let (tn, td) = (-2.0 * r * f, 2.0 * sq * f + obs * (2.0 * r / calc).powi(2));
-                num += tn;
-                den += td;
-                scale[0] += tn.abs();
-                scale[1] += td.abs();
+                total.0 += got[lo] as f64;
+                total.1 += got[lo + 1] as f64;
             }
-            for (i, w) in [num, den].into_iter().enumerate() {
-                let e = (got[lo + i] as f64 - w).abs();
-                assert!(
-                    e < 1e-5 * scale[i],
-                    "frame {f} pair {i}: {} vs {w}",
-                    got[lo + i]
-                );
-            }
-            total.0 += got[lo] as f64;
-            total.1 += got[lo + 1] as f64;
         }
     }
     let mut gamma = DeviceBuffer::<f32>::zeroed(&stream, 2).unwrap();
-    k.sum_parts(&ctx, &pairs, 5, &mut gamma).unwrap();
+    k.sum_parts(&ctx, &pairs, gamma_parts(&dims).unwrap(), &mut gamma)
+        .unwrap();
     let got = gamma.to_host_vec(&stream).unwrap();
     for (g, w) in got.iter().zip([total.0, total.1]) {
         assert!(
@@ -343,6 +362,13 @@ fn gamma_frames_match_f64_and_sum_to_gamma() {
             "{got:?} vs {total:?}"
         );
     }
+    // A pairs buffer of one pair per frame is too short.
+    let mut short = up(&stream, &[0.0f32; 10]);
+    let stacks = GammaStacks::zeroed(&stream, 3 * nmode * n).unwrap();
+    assert!(
+        k.gamma_frames(&ctx, &dims, table.at(0), &dcounts, &stacks, &mut short)
+            .is_err()
+    );
 }
 
 /// The Fourier-space Poisson gradient is the f64 formula at every pixel of the stack's frames,
@@ -421,18 +447,39 @@ fn norm_parts_add_up_both_arrays() {
     }
 }
 
-/// The object and probe scale factors of `ScaleObjProbe` from given norm pairs, with the
-/// object longer than the probe and the other way round.
+/// The stacks' frame partials add up into one total, each stack's `icalc` over its own `nf`
+/// records only (stack `3..5` leaves its third record out).
+#[test]
+fn icalc_add_sums_each_stacks_frames() {
+    let (stream, ctx, _, k) = setup();
+    let (views, table) = scan(&stream);
+    let rec = |icalc| LlkPartial {
+        poisson: 100.0,
+        gaussian: 200.0,
+        euclidean: 300.0,
+        icalc,
+    };
+    let mut out = up(&stream, &[0.0f32]);
+    for (s, icalc) in [[1.0, 2.0, 4.0], [8.0, 16.0, 1000.0]]
+        .into_iter()
+        .enumerate()
+    {
+        let partials = up(&stream, &icalc.map(rec));
+        k.icalc_add(&ctx, views.dims(), table.at(s), &partials, &mut out)
+            .unwrap();
+    }
+    assert_eq!(out.to_host_vec(&stream).unwrap(), [31.0]);
+}
+
+/// The object and probe scale factors of `ScaleObjProbe` from given norm pairs and
+/// calculated photons, with the object longer than the probe and the other way round.
 #[test]
 fn scale_obj_probe_matches_f64() {
     let (stream, ctx, _, k) = setup();
-    let (os, ps, psi2, total) = (300.0f32, 40.0f32, 5.0e4f32, 2.0e6f32);
-    let norms = [
-        up(&stream, &[os, 0.0]),
-        up(&stream, &[ps, 0.0]),
-        up(&stream, &[0.0, psi2]),
-    ];
-    let s = (total as f64 / psi2 as f64).sqrt();
+    let (os, ps, icalc, total) = (300.0f32, 40.0f32, 5.0e4f32, 2.0e6f32);
+    let norms = [up(&stream, &[os, 0.0]), up(&stream, &[ps, 0.0])];
+    let icalc_buf = up(&stream, &[icalc]);
+    let s = (total as f64 / icalc as f64).sqrt();
     let fo = (ps as f64 / os as f64 * s).sqrt();
     let fp = (os as f64 / ps as f64 * s).sqrt();
     for (nobj, nprobe) in [(2000usize, 300usize), (100, 700)] {
@@ -442,7 +489,8 @@ fn scale_obj_probe_matches_f64() {
             &ctx,
             &mut obj,
             &mut probe,
-            [&norms[0], &norms[1], &norms[2]],
+            [&norms[0], &norms[1]],
+            &icalc_buf,
             total,
         )
         .unwrap();

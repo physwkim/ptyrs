@@ -5,11 +5,11 @@
 //! The scan's frames are cut into stacks of [`GpuOptions::stack_size`] consecutive frames,
 //! one [`StackTable`] entry each: every launch reads its stack's frames from the entry on the
 //! device. Each stack keeps its own exit waves (DM carries them across cycles), sized like
-//! PyNX's fixed stack for the longest stack. AP and DM project a stack, and the LLK pass
-//! takes its partials, either by M2's fused passes over one scratch set or by the M1 launch
-//! sequence ([`GpuOptions::fused`]), whose one scratch stack serves all and whose stacks of
-//! one length share a cuFFT plan, which transforms only their frames; rPIE and ML always run
-//! M1's launches. Each cycle enqueues through its own `ExecutionContext`, dropped when the cycle
+//! PyNX's fixed stack for the longest stack. AP and DM project a stack, ML takes a stack's
+//! gradient, and the LLK pass takes its partials, either by M2's fused passes over one
+//! scratch set or by the M1 launch sequence ([`GpuOptions::fused`]), whose one scratch stack
+//! serves all and whose stacks of one length share a cuFFT plan, which transforms only their
+//! frames; rPIE and ML's line search always run M1's launches. Each cycle enqueues through its own `ExecutionContext`, dropped when the cycle
 //! has been enqueued. Nothing in a cycle
 //! reads back to the host: an LLK record goes, stack by stack, into the device's
 //! [`ptyrs_gpu::LlkRing`], whose copies download while later cycles run, and the host reads
@@ -55,10 +55,10 @@ pub struct GpuOptions {
     /// most half this many records after it, and the host waits for one only when it is
     /// this many records ahead of it, or at the end of an algorithm call.
     pub llk_slots: usize,
-    /// Project AP and DM stacks and take the LLK pass's partials by M2's fused passes
-    /// ([`ptyrs_gpu::Kernels::fused_project`]; frame sides 128 or 256, and [`GpuPtycho::new`]
-    /// fails on others) instead of M1's launch sequence. The two agree to rounding, not bit
-    /// for bit.
+    /// Project AP and DM stacks, take ML's gradients and the LLK pass's partials by M2's fused
+    /// passes ([`ptyrs_gpu::Kernels::fused_project`]; frame sides in
+    /// [`ptyrs_gpu::FUSED_SIDES`], and [`GpuPtycho::new`] fails on others) instead of M1's
+    /// launch sequence. The two agree to rounding, not bit for bit.
     pub fused: bool,
 }
 
@@ -248,7 +248,6 @@ pub struct GpuPtycho {
     dev: Device,
     obj_dims: [usize; 3],
     probe_dims: [usize; 3],
-    nb_obs: usize,
     /// Sum of the unmasked observed counts, for ML's [`crate::Ptycho::scale_obj_probe`].
     total_obs: f64,
     /// The probe-frame FFT of [`zero_phase_ramp`], which runs on the host.
@@ -332,7 +331,6 @@ impl GpuPtycho {
             dev,
             obj_dims: object.dims(),
             probe_dims: probe.dims(),
-            nb_obs: scan.counts.nb_obs(),
             total_obs: Observed::from_counts(&scan.counts).total(),
             fft: Fft2::new(g.frame),
             cycle: 0,
@@ -347,6 +345,20 @@ impl GpuPtycho {
             self.dev.obj(),
             self.obj_dims,
         )?))
+    }
+
+    /// Replaces the object between algorithm calls, which start from it as from the one
+    /// [`Self::new`] uploads; fails, changing nothing, when its dims differ from the current
+    /// object's.
+    pub fn set_object(&mut self, object: &Object) -> Result<(), EngineError> {
+        if object.dims() != self.obj_dims {
+            return Err(EngineError::Invalid(format!(
+                "object {:?} differs from the reconstruction's {:?}",
+                object.dims(),
+                self.obj_dims
+            )));
+        }
+        self.dev.write_object(&to_c32(object.as_slice()))
     }
 
     /// The probe, read back from the device.
@@ -387,14 +399,15 @@ impl GpuPtycho {
     /// the untagged one.
     fn collect(&mut self) -> Result<Option<Llk>, EngineError> {
         let mut untagged = None;
-        for (tag, s) in self.dev.flush()? {
+        for (tag, t) in self.dev.flush()? {
+            let s = t.sums;
             let llk = Llk {
                 poisson: s.poisson,
                 gaussian: s.gaussian,
                 euclidian: s.euclidean,
                 nb_photons_calc: s.icalc,
             }
-            .normalised(self.nb_obs);
+            .normalised(t.nb_obs);
             match tag {
                 Some((cycle, algorithm)) => self.history.push(LlkRecord {
                     cycle,
@@ -437,8 +450,14 @@ impl Bufs<'_> {
                     )?;
                     let plan = self.stacks.get(s).frames.plan;
                     m1.plans.get(plan).forward_inplace(ctx, m1.scratch)?;
-                    self.kernels
-                        .llk(ctx, &dims, stack, self.counts, m1.scratch, self.llk)?;
+                    self.kernels.llk(
+                        ctx,
+                        stack,
+                        self.counts,
+                        m1.scratch,
+                        self.llk_scratch,
+                        self.llk,
+                    )?;
                 }
                 PassesMut::Fused(f) => {
                     let inputs = FusedInputs {
@@ -472,7 +491,7 @@ impl Bufs<'_> {
         plan.forward_inplace(ctx, st.psi)?;
         if let Some(rec) = llk {
             self.kernels
-                .llk(ctx, &dims, stack, self.counts, st.psi, self.llk)?;
+                .llk(ctx, stack, self.counts, st.psi, self.llk_scratch, self.llk)?;
             rec.push(ctx, &dims, stack, self.llk)?;
         }
         self.kernels
