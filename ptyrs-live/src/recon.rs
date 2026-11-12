@@ -627,11 +627,17 @@ mod tests {
     /// Frames landed in uneven batches with epochs between, from graphs
     /// captured before the first frame: once the scan ends, the live object
     /// converges over the scanned region to the offline run over every
-    /// frame, settled at 8192 epochs, with no recapture. It crosses 0.99
-    /// about 2000 epochs after the scan's end and goes on to 0.995.
+    /// frame, settled at 512 epochs, with no recapture. It crosses 0.99
+    /// about 75 epochs after the scan's end and goes on to 0.9995.
+    ///
+    /// Steps of 8 px overlap the probe's 16 px by half. At 12 px AP's
+    /// settled object moves by more than [`MATCH`] when the start moves by
+    /// 1e-6, so whether the live run matches it is decided by rounding.
+    ///
+    /// [`MATCH`]: crate::converge::MATCH
     #[test]
     fn a_scan_landed_in_batches_converges_to_the_offline_run() {
-        let p = sim(64, 6, 36, 12.0);
+        let p = sim(64, 6, 36, 8.0);
         let (views, shape, region) = planned(&p);
         let ctx = Context::new(0).expect("GPU 0");
         let run = || {

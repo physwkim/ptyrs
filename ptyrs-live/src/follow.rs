@@ -755,9 +755,11 @@ mod tests {
     /// The plan, every streamed position, was backed before the first frame:
     /// landing the scan mapped no more of the object.
     ///
-    /// The live object is not held to the offline one here: how near AP on
-    /// these frames gets to the offline run, settled at 8192 epochs, depends
-    /// on how many epochs ran over the partial scan, which wall time sets.
+    /// The live object is not held to the offline one here: these frames,
+    /// 12 px apart, overlap the probe's 16 px too little for AP's settled
+    /// object to be set by the frames, so how near the live run gets to the
+    /// offline one depends on rounding and on how many epochs ran over the
+    /// partial scan, which wall time sets.
     #[test]
     fn the_live_object_is_its_landings_replayed_one_at_a_time() {
         let Streamed {
