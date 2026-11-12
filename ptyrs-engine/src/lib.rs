@@ -23,6 +23,7 @@ mod features;
 mod fft;
 mod gpu;
 mod linop;
+mod lsqml;
 mod obs;
 mod ops;
 mod plan;
@@ -37,6 +38,7 @@ pub use features::{
 pub use fft::Fft2;
 pub use gpu::{GpuOptions, GpuPtycho};
 pub use linop::{DOT_TOL, FarField, LinearOp, ObjectToPsi, ProbeToPsi, Registered, register};
+pub use lsqml::{Lsqml, LsqmlBatch, LsqmlParams, LsqmlStep, illumination, lsqml_step};
 pub use obs::{Observed, shift};
 pub use ops::{
     Llk, accumulate_obj, accumulate_probe, apply_amplitude, cg_poisson_gamma, llk,
