@@ -578,7 +578,7 @@ mod tests {
         let st = Mutex::new(SourceStats::new(frames));
         let pos = PosTable::new(1 << 12);
         let (tx, rx) = crate::handoff::work_queue((frames as usize).try_into().unwrap());
-        let place = Placement::new("", 1, 0, cfg.readers, FairSched::default());
+        let place = Placement::new("", 1, 0, cfg.readers, FairSched::default(), 0);
         let (stop, progress) = (AtomicBool::new(false), Progress::default());
         let mut got = Vec::new();
         let rep = std::thread::scope(|sc| {
