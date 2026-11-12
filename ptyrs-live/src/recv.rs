@@ -29,7 +29,7 @@ use serde::Deserialize;
 
 use crate::args::Args;
 use crate::consumer::{ConsumerReport, checksum, run_checksum_consumer};
-use crate::eiger::{EigerFrames, Progress, PullReport, run_pull};
+use crate::eiger::{EigerFrames, Progress, PullReport, connect_pull, run_pull};
 use crate::follow::{
     FollowCfg, FollowReport, Preview, ReconCfg, first_converged, offline_ap, plane, run_ap_consumer,
 };
@@ -508,6 +508,15 @@ fn recon_line(
     Ok((l, hit.is_some()))
 }
 
+/// The frame source as [`run`] opens it before the GPU setup. Only ZMQ has
+/// anything to open: PVA connects lazily and the SWMR file may not exist
+/// before its writer starts.
+enum Opened {
+    Pva,
+    Zmq(zmq::Socket),
+    H5(SwmrCfg),
+}
+
 /// Receive one scan as `cfg` says, then check what reached the GPU. Pins
 /// the calling thread to the runtime CPUs while frames arrive and to every
 /// listed CPU for the checks.
@@ -556,6 +565,24 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
     ));
     // The calling thread only polls for completion; it shares the runtime CPUs.
     place.enter(place.rt.as_deref());
+    // Before the GPU setup, which takes seconds, so that a bad source stops
+    // the run at once. Receiving starts once the store is ready; ZMQ queues
+    // until then. libzmq's I/O thread starts with the first socket and
+    // inherits this thread's CPUs.
+    let opened = match &cfg.source {
+        SourceCfg::Pva => Opened::Pva,
+        SourceCfg::Zmq(z) => {
+            Opened::Zmq(connect_pull(&z.endpoint, z.rcvhwm).map_err(fail("ZMQ PULL"))?)
+        }
+        SourceCfg::H5(h) => Opened::H5(SwmrCfg {
+            path: h.path.clone(),
+            readers: h.readers,
+            width,
+            height,
+            poll: Duration::from_micros(h.poll_us),
+            queue: h.queue,
+        }),
+    };
 
     let ctx = Context::new(cfg.gpu).map_err(fail("CUDA context"))?;
     let ring = Arc::new(Ring::new(&ctx, cfg.ring_slots, crop * crop).map_err(fail("pinned ring"))?);
@@ -721,8 +748,8 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
                 ),
             };
             // Frames from exactly one source; the others hold no Sender.
-            let (frame_sub, pull, follow) = match &cfg.source {
-                SourceCfg::Pva => {
+            let (frame_sub, pull, follow) = match opened {
+                Opened::Pva => {
                     let (st, pr) = (state.clone(), progress.clone());
                     let mut src = NtndFrames::new(geom);
                     let sub = client
@@ -739,37 +766,19 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
                         .map_err(fail("FRAME monitor"))?;
                     (Some(sub), None, None)
                 }
-                SourceCfg::Zmq(z) => {
-                    let (st, pr, z) = (state.clone(), progress.clone(), z.clone());
+                Opened::Zmq(sock) => {
+                    let (st, pr) = (state.clone(), progress.clone());
                     let (stop, place) = (pull_stop.clone(), place.clone());
                     let h = std::thread::Builder::new()
                         .name("zmq-pull".into())
                         .spawn(move || {
-                            // libzmq's I/O thread starts with the first socket
-                            // and inherits this thread's CPUs.
                             place.enter(place.rt.as_deref());
-                            run_pull(
-                                &z.endpoint,
-                                z.rcvhwm,
-                                EigerFrames::new(geom),
-                                st,
-                                tx,
-                                &stop,
-                                &pr,
-                            )
+                            run_pull(sock, EigerFrames::new(geom), st, tx, &stop, &pr)
                         })
                         .unwrap();
                     (None, Some(h), None)
                 }
-                SourceCfg::H5(h) => {
-                    let scfg = SwmrCfg {
-                        path: h.path.clone(),
-                        readers: h.readers,
-                        width,
-                        height,
-                        poll: Duration::from_micros(h.poll_us),
-                        queue: h.queue,
-                    };
+                Opened::H5(scfg) => {
                     let (st, pr, pos) = (state.clone(), progress.clone(), pos.clone());
                     let (stop, place) = (pull_stop.clone(), place.clone());
                     let h = std::thread::Builder::new()

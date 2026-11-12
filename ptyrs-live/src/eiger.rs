@@ -341,23 +341,29 @@ impl Progress {
     }
 }
 
-/// PULL from `endpoint` until the series ends or `stop` is set. Every part
-/// is moved into a [`Bytes`] without copying, so the workers decode
-/// straight out of the ZMQ receive buffers.
+/// A PULL socket connected to `endpoint`. The connect fails at once only on
+/// an endpoint libzmq cannot parse; until [`run_pull`] receives, ZMQ queues
+/// up to `rcvhwm` messages.
+pub fn connect_pull(endpoint: &str, rcvhwm: i32) -> zmq::Result<zmq::Socket> {
+    // The socket holds its context.
+    let sock = zmq::Context::new().socket(zmq::PULL)?;
+    sock.set_rcvhwm(rcvhwm)?;
+    sock.set_rcvtimeo(20)?;
+    sock.connect(endpoint)?;
+    Ok(sock)
+}
+
+/// PULL from `sock` until the series ends or `stop` is set. Every part is
+/// moved into a [`Bytes`] without copying, so the workers decode straight
+/// out of the ZMQ receive buffers.
 pub fn run_pull(
-    endpoint: &str,
-    rcvhwm: i32,
+    sock: zmq::Socket,
     mut frames: EigerFrames,
     st: Arc<Mutex<SourceStats>>,
     tx: WorkTx,
     stop: &AtomicBool,
     progress: &Progress,
 ) -> zmq::Result<PullReport> {
-    let ctx = zmq::Context::new();
-    let sock = ctx.socket(zmq::PULL)?;
-    sock.set_rcvhwm(rcvhwm)?;
-    sock.set_rcvtimeo(20)?;
-    sock.connect(endpoint)?;
     let mut rep = PullReport::default();
     let mut parts: Vec<Bytes> = Vec::with_capacity(8);
     while !stop.load(Ordering::Relaxed) {
