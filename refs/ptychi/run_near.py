@@ -20,7 +20,7 @@ LLK is evaluated in float64 from each epoch's state, outside the timed task.run(
 in its default float32 on the GPU. Every run takes the engine's random_batches(16, batch, SEED,
 epoch) (refs/f64/random_batches.py) and pty-chi's options of the parity scripts
 (lsqml_near.task with the Gaussian model, refs/f64/bh_near.task), so `ptyrs` runs the same
-trajectory in float64 through the near_speed example of ptyrs::engine; LSQML's a_far jitter
+trajectory in float64 through the engine_near_speed example of ptyrs::engine; LSQML's a_far jitter
 (torch.randn) returns zeros, as ptyrs has none. A pty-chi run stops at the target or at
 --epochs.
 
@@ -286,7 +286,7 @@ def main():
     elif a.cmd == "ptyrs":
         specs = sorted({spec for *_, spec in all_runs.values()})
         subprocess.run(["cargo", "run", "--release", "-p", "ptyrs", "--example",
-                        "near_speed", "--", os.path.abspath(a.out), str(a.epochs), *specs],
+                        "engine_near_speed", "--", os.path.abspath(a.out), str(a.epochs), *specs],
                        cwd=ROOT, check=True)
     else:
         compare(a.out)

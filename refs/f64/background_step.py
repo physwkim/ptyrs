@@ -1,7 +1,7 @@
 """Float64 reference of the incoherent background: the costs' gradient and curvature with respect
 to each detector pixel's background and PyNX's AP background update, at a fixed state.
 
-    <engine>/target/release/examples/llk_trace <dir> dm 1 2 32 40 4
+    <engine>/target/release/examples/engine_llk_trace <dir> dm 1 2 32 40 4
     micromamba run -n ptyrs-ref python -I refs/f64/background_step.py <dir> [--cuda]
 
 The state is the one ml_grad.py reads (object [1, 76, 80], probe [2, 32, 32], 40 frames, no

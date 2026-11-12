@@ -189,7 +189,8 @@ X선에서 GPU 4장을 쓰는 경우는 셋이고, 분할 방식이 다릅니다
 ```
 ptyrs/                  작업공간: 패키지 3개
 ├── ptyrs           호스트 크레이트 하나(lib + 바이너리). 옛 크레이트마다 모듈 하나(ptyrs::engine 등),
-│   │               tests/·examples/·scripts/도 모듈별 하위 디렉터리. build.rs가 cuFFT 링크와 커널 빌드
+│   │               tests/·examples/는 `<모듈>_<파일>.rs`로 평탄(cargo 자동 탐색), 공용 도우미는 common/,
+│   │               데이터와 scripts/는 모듈별 하위 디렉터리. build.rs가 cuFFT 링크와 커널 빌드
 │   ├── src/base    데이터 모델: Scan, Positions, Probe(모드, OPR), Object(층), Geometry,
 │   │               주소표(PtyPy addr 개념), 공간 bin, DisjointBatch. `core`는 내장 크레이트를 가려서 base
 │   ├── src/fft     cuFFT 바인딩(직접 쓴 FFI) + cuFFT 장치 API 조회·LTOIR 생성

@@ -1,7 +1,7 @@
 """Cross-check ptyrs::live's lz4/bslz4 codecs against C liblz4 (python-lz4)
 and C bitshuffle, bit for bit, in both directions:
 
-  Rust payloads (examples/codec_cross --dump) -> C decode
+  Rust payloads (examples/live_codec_cross --dump) -> C decode
   pty-sim payloads received over PVA (p4p)    -> C decode
   C payloads (lz4.block, bitshuffle)          -> Rust decode (--check)
 
@@ -114,7 +114,7 @@ def main():
     a = ap.parse_args()
     t = Tally()
     with tempfile.TemporaryDirectory() as d:
-        subprocess.run([f"{a.target}/examples/codec_cross", "--dump", d], check=True)
+        subprocess.run([f"{a.target}/examples/live_codec_cross", "--dump", d], check=True)
         eiger = []
         identical = {"lz4": 0, "bslz4": 0}
         for line in open(f"{d}/cases.txt"):
@@ -139,7 +139,7 @@ def main():
                 open(f("c.bslz4"), "wb").write(c_bs)
         for k, codec in enumerate(("lz4", "bslz4")):
             capture_sim(a.target, codec, eiger, a.port + k, a.sim_frames, t)
-        rc = subprocess.run([f"{a.target}/examples/codec_cross", "--check", d]).returncode
+        rc = subprocess.run([f"{a.target}/examples/live_codec_cross", "--check", d]).returncode
         t("C->rust (codec_cross --check)", rc == 0, f"exit {rc}")
     for what, n in sorted(t.ok.items()):
         print(f"codec_cross.py {what} ok={n}")

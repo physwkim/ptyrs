@@ -1,6 +1,6 @@
 """Float64 reference of the maximum-likelihood (Poisson) object gradient at a fixed state.
 
-    <engine>/target/release/examples/llk_trace <dir> dm 1 2 32 40 4
+    <engine>/target/release/examples/engine_llk_trace <dir> dm 1 2 32 40 4
     micromamba run -n ptyrs-ref python -I refs/f64/ml_grad.py <dir> [--cuda]
 
 The state is <dir>/scan.cxi and init.h5: common::dm_scenario(32, 40, 2, 2e5, 4.0) after

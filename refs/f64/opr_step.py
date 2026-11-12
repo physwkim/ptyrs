@@ -1,7 +1,7 @@
 """Float64 reference of pty-chi LSQML's probe-variation (OPR) step: one minibatch's update of the
 first eigenmode of probe mode 0 and of its per-frame weights, at a fixed state.
 
-    <engine>/target/release/examples/llk_trace <dir> dm 1 2 32 40 4
+    <engine>/target/release/examples/engine_llk_trace <dir> dm 1 2 32 40 4
     micromamba run -n ptyrs-ref python -I refs/f64/opr_step.py <dir>
 
 The state is the one ml_grad.py reads (object [1, 76, 80], probe [2, 32, 32], 40 frames, no

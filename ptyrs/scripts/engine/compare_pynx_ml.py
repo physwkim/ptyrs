@@ -1,8 +1,8 @@
-"""PyNX CUDA ML on the scan and starting point written by `cargo run --example llk_trace -- <dir> ml`.
+"""PyNX CUDA ML on the scan and starting point written by `cargo run --example engine_llk_trace -- <dir> ml`.
 
 Usage: python -I compare_pynx_ml.py <dir> [--fix-gamma] [--noise] [--time N]
 
-Reads <dir>/scan.cxi, init.h5 (the end of llk_trace's AP warm-up), llk_rust.txt and
+Reads <dir>/scan.cxi, init.h5 (the end of engine_llk_trace's AP warm-up), llk_rust.txt and
 final_rust.h5. Runs ML(update_object=True, update_probe=True, calc_llk=1) of the PyNX CUDA
 operator for as many cycles as the Rust run,
   - stock: as shipped, which Hann-filters the Fourier-space Poisson gradient,
@@ -15,7 +15,7 @@ kernels compile; it matters only when object and probe are both updated. --noise
 PyNX nohann against itself, rerun and with the starting object nudged by 1e-7, which bounds
 how closely any other implementation can track it cycle by cycle. --time N then times N
 cycles of stock ML without LLK or phase-ramp removal, after 5 untimed ones, as
-`cargo run --example gpu_time -- ml` times ptyrs. PyNX's CPU ML is no reference: its first
+`cargo run --example engine_gpu_time -- ml` times ptyrs. PyNX's CPU ML is no reference: its first
 direction is +grad and the later ones beta*dir - grad.
 """
 import sys

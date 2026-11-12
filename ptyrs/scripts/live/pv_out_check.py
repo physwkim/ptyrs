@@ -1,5 +1,5 @@
 """Check ptyrs::live's result PVs (pv_out) with a p4p client: the
-pv_out_demo example publishes a LiveObject snapshot preview (rows
+live_pv_out_demo example publishes a LiveObject snapshot preview (rows
 row0..row1 of two planes hold a known pattern, the rest the flat fill), a
 two-mode probe and an LLK history; every update received is compared with
 the same patterns computed here, together with its dimensions, binning and
@@ -64,7 +64,7 @@ def main():
     assert a.n % a.bin == 0
     prefix = "PTYOUT:"
     demo = subprocess.Popen(
-        [f"{a.target}/examples/pv_out_demo", "--port", str(a.port), "--gpu", str(a.gpu),
+        [f"{a.target}/examples/live_pv_out_demo", "--port", str(a.port), "--gpu", str(a.gpu),
          "--prefix", prefix, "--n", str(a.n), "--row0", str(a.row0), "--row1", str(a.row1),
          "--bin", str(a.bin), "--probe", str(a.probe), "--posts", str(a.posts)],
         stdout=subprocess.PIPE, text=True,

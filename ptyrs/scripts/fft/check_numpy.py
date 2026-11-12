@@ -1,6 +1,6 @@
-"""Compare ptyrs::fft GPU output (examples/dump) with numpy.fft in float64.
+"""Compare ptyrs::fft GPU output (examples/fft_dump) with numpy.fft in float64.
 
-usage: cargo run -p ptyrs --release --example dump -- DIR && python check_numpy.py DIR
+usage: cargo run -p ptyrs --release --example fft_dump -- DIR && python check_numpy.py DIR
 """
 import sys
 import numpy as np

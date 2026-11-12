@@ -6,7 +6,7 @@
   C libzmq PUSH (C-compressed frames) + p4p POS server -> pty-recv
       --source zmq, which compares every frame with its own synthesis
 
-Reference frames come from `codec_cross --dump` (pty-sim's frames at
+Reference frames come from `live_codec_cross --dump` (pty-sim's frames at
 --pool 16).
 
   cargo build --release -p ptyrs --bins --examples
@@ -269,7 +269,7 @@ def main():
     print(f"zmq_cross.py system libzmq {z.version} ({a.libzmq})")
     t = Tally()
     with tempfile.TemporaryDirectory() as d:
-        subprocess.run([f"{a.target}/examples/codec_cross", "--dump", d], check=True)
+        subprocess.run([f"{a.target}/examples/live_codec_cross", "--dump", d], check=True)
         raw = [np.fromfile(f"{d}/eiger_{i}.raw", "<u2") for i in range(POOL)]
     assert all(r.size == W * H for r in raw)
     for k, codec in enumerate(("none", "lz4", "bslz4")):

@@ -1,6 +1,6 @@
 """Loading, PyNX<->pty-chi conversion and PyNX-definition LLK for the M3 pty-chi reference runs.
 
-Datasets come from `cargo run --release -p ptyrs --example gen_m3 -- refs/ptychi/data`:
+Datasets come from `cargo run --release -p ptyrs --example refgen_gen_m3 -- refs/ptychi/data`:
 `<name>.cxi` (u16 counts, DC at [ny/2, nx/2], positions in metres), `<name>.json` (truth
 metadata, `llk_truth`), `<name>_truth.h5` and `<name>_init.h5` (object [1,nyo,nxo] and probe
 [nmode,ny,nx] in PyNX normalisation).

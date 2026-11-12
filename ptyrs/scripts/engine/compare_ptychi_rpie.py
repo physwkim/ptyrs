@@ -1,4 +1,4 @@
-"""pty-chi rPIE on the scan and starting point written by `cargo run --example llk_trace -- <dir> rpie`.
+"""pty-chi rPIE on the scan and starting point written by `cargo run --example engine_llk_trace -- <dir> rpie`.
 
 Usage: python -I compare_ptychi_rpie.py <dir> [--gpu]
 

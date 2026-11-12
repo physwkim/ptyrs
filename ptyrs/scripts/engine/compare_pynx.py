@@ -1,4 +1,4 @@
-"""PyNX DM or AP on the scan and starting point written by `cargo run --example llk_trace`.
+"""PyNX DM or AP on the scan and starting point written by `cargo run --example engine_llk_trace`.
 
 Usage: python -I compare_pynx.py <dir> <dm|ap> [--cuda] [--no-cpu] [--time N]
 
@@ -10,7 +10,7 @@ AP(update_probe=True, calc_llk=1), for as many cycles as the Rust run with
 and prints per-cycle normalised LLK (Poisson, Gaussian, Euclidian, photon count) relative
 differences against Rust, and the relative L2 difference of the final object and probe.
 --no-cpu drops the two cpu_operator runs. --time N then times N cycles of the CUDA operator
-without LLK or phase-ramp removal, after 5 untimed ones, as `cargo run --example gpu_time`
+without LLK or phase-ramp removal, after 5 untimed ones, as `cargo run --example engine_gpu_time`
 times ptyrs.
 """
 import sys

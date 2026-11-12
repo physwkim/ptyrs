@@ -1,7 +1,7 @@
 """Float64 reference of pty-chi BH steps (object and probe) from a fixed state: CG over one
 batch per epoch, steepest descent over mini-batches.
 
-    <engine>/target/release/examples/llk_trace <dir> dm 1 2 32 40 4
+    <engine>/target/release/examples/engine_llk_trace <dir> dm 1 2 32 40 4
     micromamba run -n ptyrs-ref python -I refs/f64/bh_step.py <dir>
 
 The state is the one ml_grad.py reads (object [1, 76, 80], probe [2, 32, 32], 40 frames). The

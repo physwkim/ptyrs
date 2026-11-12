@@ -1,5 +1,5 @@
 """Check the M5 scan simulator's ground-truth dump against an independent
-numpy forward model: the ptycho_truth example writes object, probe,
+numpy forward model: the live_ptycho_truth example writes object, probe,
 positions, offsets and frames for a raster and a Fermat scan; every frame
 is compared with Poisson statistics around the convention in meta.json,
 computed here with numpy's FFT.
@@ -18,7 +18,7 @@ import numpy as np
 
 
 def run(target, out, extra):
-    p = subprocess.run([f"{target}/examples/ptycho_truth", "--model", "ptycho", "--truth", out]
+    p = subprocess.run([f"{target}/examples/live_ptycho_truth", "--model", "ptycho", "--truth", out]
                        + extra, capture_output=True, text=True)
     print(p.stdout, end="")
     if p.returncode != 0:
