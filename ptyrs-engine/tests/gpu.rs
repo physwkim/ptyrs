@@ -10,7 +10,7 @@ use cuda_core::{CudaContext, DeviceBuffer};
 use ptyrs_core::{C64, Counts, MASKED, Object, Probe, Scan, Stack};
 use ptyrs_engine::{
     Algorithm, ApParams, Backend, Bh, BhParams, BhStep, DmParams, GpuOptions, GpuPtycho, Llk,
-    LlkRecord, MlParams, Observed, Params, Ptycho, RpieParams, Step, llk,
+    LlkRecord, MlParams, Observed, Params, Ptycho, RpieParams, Step, TileDotsOn, llk,
 };
 use ptyrs_gpu::{C32, FUSED_SIDES, Kernels, LlkPartial, LlkRing, LlkScratch, StackTable, ViewDims};
 
@@ -36,6 +36,7 @@ const M1: Setup = Setup {
         graph: true,
         llk_slots: 3,
         fused: false,
+        tile_dots: TileDotsOn::SIMT,
     },
 };
 
@@ -617,6 +618,86 @@ fn graph_like_eager(setup: Setup) {
     assert!(eager.2 == graph.2, "{setup:?}: LLK records differ");
     assert!(eager.0 == graph.0, "{setup:?}: object differs");
     assert!(eager.1 == graph.1, "{setup:?}: probe differs");
+}
+
+/// The Tile dot products ([`GpuOptions::tile_dots`]) give the SIMT ones' bits: the object,
+/// the probe, every LLK record and BH's steps after ML (β and the start's norms), DM
+/// balancing after its LLKs (norms) and BH of one batch, with CG, and of batches of 4
+/// (dots), from graphs and eagerly.
+#[test]
+fn tile_dots_match_simt_bitwise() {
+    for setup in [M1, FUSED] {
+        let (scan, object, probe) = start(setup.frame, 2, true);
+        let run = |tile_dots: TileDotsOn, graph: bool| {
+            let options = GpuOptions {
+                tile_dots,
+                graph,
+                ..setup.options
+            };
+            let mut g =
+                GpuPtycho::new(&ctx(), &scan, object.clone(), probe.clone(), options).unwrap();
+            let ml = MlParams {
+                update_object: true,
+                update_probe: true,
+                calc_llk: 2,
+                zero_phase_ramp: false,
+            };
+            g.ml(&ml, 5).unwrap();
+            let dm = DmParams {
+                calc_llk: 2,
+                zero_phase_ramp: false,
+                ..DmParams::default()
+            };
+            g.dm(&dm, 3).unwrap();
+            let mut steps = Vec::new();
+            for batch_size in [NPOS, 4] {
+                let bh = BhParams {
+                    batch_size,
+                    probe_rho: 0.01,
+                    seed: 7,
+                };
+                g.bh(&bh, 3, 1).unwrap();
+                for s in g.bh_steps().unwrap() {
+                    steps.push((
+                        s.frames,
+                        [s.beta, s.alpha, s.top, s.bottom].map(f64::to_bits),
+                    ));
+                }
+            }
+            let bits = |s: &Stack<C64>| -> Vec<[u64; 2]> {
+                s.as_slice()
+                    .iter()
+                    .map(|v| [v.re.to_bits(), v.im.to_bits()])
+                    .collect()
+            };
+            let llk: Vec<_> = g
+                .history()
+                .iter()
+                .map(|r| {
+                    let l = r.llk;
+                    [l.poisson, l.gaussian, l.euclidian, l.nb_photons_calc].map(f64::to_bits)
+                })
+                .collect();
+            (
+                bits(&g.object().unwrap()),
+                bits(&g.probe().unwrap()),
+                llk,
+                steps,
+            )
+        };
+        let simt = run(TileDotsOn::SIMT, true);
+        // ML cycles 0, 2, 4; DM 0, 2; every BH epoch
+        assert_eq!(simt.2.len(), 3 + 2 + 2 * 3);
+        assert!(simt.3.iter().any(|s| s.1[0] != 0), "no BH step took a CG β");
+        for graph in [true, false] {
+            let tile = run(TileDotsOn::TILE, graph);
+            let at = format!("{setup:?} graph {graph}");
+            assert!(tile.2 == simt.2, "{at}: LLK records differ");
+            assert!(tile.3 == simt.3, "{at}: BH steps differ");
+            assert!(tile.0 == simt.0, "{at}: object differs");
+            assert!(tile.1 == simt.1, "{at}: probe differs");
+        }
+    }
 }
 
 /// A ring record of the frames a live scan has landed, `0 .. n`, against the CPU LLK over the

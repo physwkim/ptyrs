@@ -18,10 +18,11 @@ use ptyrs_gpu::{
     GammaStacks, GradKernels, Kernels, LlkPartial, LlkRing, LlkScratch, LlkTotals, ObjProbeScale,
     PowerMax, RingDevice, RpieKernels, StackTable, UpdateSums, ViewAddr, ViewDims, Views,
 };
+use ptyrs_tile::TileDots;
 
 use super::{
-    Epoch, Frames, GpuOptions, Tag, batch_stacks, plane_len, plans, split, stack_buf_len, stacks,
-    to_u32,
+    Epoch, Frames, GpuOptions, Tag, TileDotsOn, batch_stacks, plane_len, plans, split,
+    stack_buf_len, stacks, to_u32,
 };
 use crate::{ApParams, BhParams, BhStep, DmParams, EngineError, MlParams, RpieParams};
 
@@ -32,6 +33,9 @@ pub(super) struct Device {
     rpie: RpieKernels,
     grad: GradKernels,
     bh: BhKernels,
+    /// With any of [`GpuOptions::tile_dots`], the Tile dot products.
+    tile: Option<TileDots>,
+    tile_on: TileDotsOn,
     views: Views,
     counts: DeviceBuffer<u16>,
     obj: DeviceBuffer<C32>,
@@ -429,6 +433,10 @@ pub(super) struct Bufs<'a> {
     pub rpie: &'a RpieKernels,
     pub grad: &'a GradKernels,
     pub bh: &'a BhKernels,
+    /// The Tile dot products [`GpuOptions::tile_dots`] turns on, each `None` for SIMT.
+    pub tile_beta: Option<&'a TileDots>,
+    pub tile_norm: Option<&'a TileDots>,
+    pub tile_bh: Option<&'a TileDots>,
     pub views: &'a Views,
     pub counts: &'a DeviceBuffer<u16>,
     pub obj: &'a mut DeviceBuffer<C32>,
@@ -503,6 +511,9 @@ impl Device {
         let grad = GradKernels::load(&kernels)?;
         let bh = BhKernels::load(&kernels)?;
         let views = Views::new(&stream, dims, addrs)?;
+        let tile = (options.tile_dots != TileDotsOn::SIMT)
+            .then(|| TileDots::new(&stream, &dims))
+            .transpose()?;
         let (frames, table, lens) =
             stacks(&stream, &dims, to_u32("stack_size", options.stack_size)?)?;
         let len = stack_buf_len(&dims, &table);
@@ -550,6 +561,8 @@ impl Device {
             rpie,
             grad,
             bh,
+            tile,
+            tile_on: options.tile_dots,
             views,
             table,
             stacks,
@@ -617,6 +630,9 @@ impl Device {
             rpie: &self.rpie,
             grad: &self.grad,
             bh: &self.bh,
+            tile_beta: self.tile.as_ref().filter(|_| self.tile_on.beta),
+            tile_norm: self.tile.as_ref().filter(|_| self.tile_on.norm),
+            tile_bh: self.tile.as_ref().filter(|_| self.tile_on.bh),
             views: &self.views,
             counts: &self.counts,
             obj: &mut self.obj,

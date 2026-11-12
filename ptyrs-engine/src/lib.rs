@@ -39,7 +39,7 @@ pub use features::{
     scale_psi,
 };
 pub use fft::Fft2;
-pub use gpu::{GpuOptions, GpuPtycho};
+pub use gpu::{GpuOptions, GpuPtycho, TileDotsOn};
 pub use linop::{DOT_TOL, FarField, LinearOp, ObjectToPsi, ProbeToPsi, Registered, register};
 pub use lsqml::{Lsqml, LsqmlBatch, LsqmlParams, LsqmlStep, illumination};
 pub use obs::{Observed, shift};

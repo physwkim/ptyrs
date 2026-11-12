@@ -75,9 +75,13 @@ impl Bufs<'_> {
         ptyrs_gpu::zero(ctx, ml.parts)?;
         for (i, g) in [&*self.obj_sums, &*self.probe_sums].into_iter().enumerate() {
             if update[i] {
-                let first_pair = i as u32 * CG_BLOCKS;
-                self.grad
-                    .beta_parts(ctx, &g.num, &mut ml.h[i], lens[i], ml.parts, first_pair)?;
+                let (h, first_pair) = (&mut ml.h[i], i as u32 * CG_BLOCKS);
+                match self.tile_beta {
+                    Some(t) => t.beta_parts(ctx, &g.num, h, lens[i], ml.parts, first_pair)?,
+                    None => self
+                        .grad
+                        .beta_parts(ctx, &g.num, h, lens[i], ml.parts, first_pair)?,
+                }
             }
         }
         self.grad.sum_parts(ctx, ml.parts, 2 * CG_BLOCKS, ml.beta)?;

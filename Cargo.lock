@@ -1768,6 +1768,7 @@ dependencies = [
  "ptyrs-fft",
  "ptyrs-gpu",
  "ptyrs-io",
+ "ptyrs-tile",
  "rustfft",
  "thiserror 2.0.21",
 ]

@@ -13,6 +13,7 @@ cuda-core.workspace = true
 cuda-async.workspace = true
 ptyrs-fft = { path = "../ptyrs-fft" }
 ptyrs-gpu = { path = "../ptyrs-gpu" }
+ptyrs-tile = { path = "../ptyrs-tile" }
 
 [dev-dependencies]
 ptyrs-io.workspace = true
