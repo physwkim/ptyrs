@@ -1,6 +1,6 @@
 //! Strong scaling of [`DistAp`] (DESIGN §7 M4): AP time per cycle, object and probe updated,
 //! on every visible GPU in NUMA order. 4096 frames of 256x256, 2 probe modes, 80 px steps
-//! (as `live_feed`), stacks of 32 frames, M1 (unfused) kernels.
+//! (as `live_feed`), stacks of 32 frames, fused passes.
 //!
 //! `ap_scaling prepare <dir> <fermat|raster>` simulates the counts once on the CPU into
 //! `<dir>`, so timed runs hold the GPUs only for the reconstruction.

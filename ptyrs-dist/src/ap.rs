@@ -8,14 +8,15 @@
 //! fixed pair tree; the regulariser's `max(den)` is an exact max over regions; the LLK is
 //! [`LlkSums::from_partials`] over frames by global index. A recomputed exit wave has its
 //! owner's bits: the halo holds the owner's object under the whole footprint, the probe and
-//! counts are the same, and cuFFT gives a transform the same bits at any position of a batch.
+//! counts are the same, and [`Kernels::fused_project`] transforms each frame in its own blocks,
+//! whatever else its stack holds.
 //!
-//! Per cycle, with [`Gpu::fence`] between the steps: A exit waves, LLK, projection, the leaf
-//! probe sums of the own stacks and their subtree; B object sums and their max, the other
-//! regions' subtree roots pulled by copy engine and the pair tree above them; C the other
-//! regions' max words pulled by copy engine, object and probe updates, then each owner packs
-//! the updated rows its neighbours read; D each receiver pulls them by copy engine and unpacks
-//! its halo.
+//! Per cycle, with [`Gpu::fence`] between the steps: A per stack one fused pass (exit waves,
+//! LLK, projection, object sums), the leaf probe sums of the own stacks and their subtree; B
+//! the object sums' max, the other regions' subtree roots pulled by copy engine and the pair
+//! tree above them; C the other regions' max words pulled by copy engine, object and probe
+//! updates, then each owner packs the updated rows its neighbours read; D each receiver pulls
+//! them by copy engine and unpacks its halo.
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -23,10 +24,9 @@ use std::sync::Arc;
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{Context, DeviceBuffer, Stream};
 use ptyrs_core::{AddrTable, View};
-use ptyrs_fft::Plan2d;
 use ptyrs_gpu::{
-    C32, Kernels, LlkPartial, LlkSums, StackTable, UpdateSums, ViewAddr, ViewDims, Views,
-    view_tiles,
+    C32, Exit, FusedBufs, FusedInputs, Kernels, LlkPartial, LlkSums, StackTable, UpdateSums,
+    ViewAddr, ViewDims, Views, view_tiles,
 };
 
 use crate::exchange::{self, Pull, Run, Runs};
@@ -52,7 +52,7 @@ pub struct ApProblem {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ApConfig {
     pub scheme: Scheme,
-    /// Frames per stack; every GPU transforms `stack * nmode` planes per FFT.
+    /// Frames per stack, the fused passes' batch.
     pub stack: usize,
     /// Object update with this inertia; `None` keeps the object fixed.
     pub obj_inertia: Option<f32>,
@@ -116,9 +116,6 @@ impl Plan {
     ) -> Result<Self, DistError> {
         let bad = |m: String| Err(DistError::Partition(m));
         let [ny, nx] = addr.frame_shape();
-        if ny != nx {
-            return bad(format!("frame {ny}x{nx} is not square"));
-        }
         if cfg.stack == 0 {
             return bad("stack of 0 frames".into());
         }
@@ -144,14 +141,6 @@ impl Plan {
                 grid.dims()
             ));
         }
-        let view_addr = |v: &View| ViewAddr {
-            oy: v.oy,
-            ox: v.ox,
-            fy: 0.0,
-            fx: 0.0,
-            probe: v.probe,
-            obj: v.obj,
-        };
         // Tiles each frame's views read, by the kernels' rule.
         let tiles: Vec<Vec<usize>> = (0..addr.nframe())
             .map(|f| {
@@ -328,6 +317,18 @@ impl Plan {
                 }
             })
             .collect()
+    }
+}
+
+/// A view as the kernels take it; integer offsets only.
+fn view_addr(v: &View) -> ViewAddr {
+    ViewAddr {
+        oy: v.oy,
+        ox: v.ox,
+        fy: 0.0,
+        fx: 0.0,
+        probe: v.probe,
+        obj: v.obj,
     }
 }
 
@@ -523,15 +524,13 @@ struct Halo {
 struct State {
     k: Kernels,
     ex: Exchange,
-    fft: Plan2d,
     views: Views,
     table: StackTable,
     counts: DeviceBuffer<u16>,
     obj: DeviceBuffer<C32>,
     halo: Halo,
     probe: DeviceBuffer<C32>,
-    /// Per local stack.
-    psi: Vec<DeviceBuffer<C32>>,
+    bufs: FusedBufs,
     /// Per own stack.
     llk: Vec<DeviceBuffer<LlkPartial>>,
     obj_sums: Option<UpdateSums>,
@@ -563,8 +562,7 @@ impl State {
             .copied()
             .collect();
         let ranges: Vec<Range<u32>> = rp.stacks.iter().map(|s| s.frames.clone()).collect();
-        let nk = plan.stack * rp.dims.nmode as usize;
-        let zeroed = |len| DeviceBuffer::zeroed(stream, len);
+        let table = StackTable::new(stream, &rp.dims, &ranges)?;
         let np = plan.np();
         let leaf_sums: Vec<UpdateSums> = (0..if plan.probe_inertia.is_some() {
             plan.k
@@ -595,17 +593,13 @@ impl State {
         Ok(Self {
             k: Kernels::load(gpu.ctx())?,
             ex: Exchange::load(gpu.ctx())?,
-            fft: Plan2d::new(stream, rp.dims.frame[0] as usize, nk)
-                .map_err(ptyrs_gpu::Error::from)?,
             views: Views::new(stream, rp.dims, &rp.views)?,
-            table: StackTable::new(stream, &rp.dims, &ranges)?,
+            bufs: FusedBufs::new(stream, &rp.dims, table.nf_max())?,
+            table,
             counts: DeviceBuffer::from_host(stream, &counts)?,
             obj,
             halo,
             probe: DeviceBuffer::from_host(stream, &data.probe)?,
-            psi: (0..rp.stacks.len())
-                .map(|_| zeroed(nk * n))
-                .collect::<Result<_, _>>()?,
             llk: (0..rp.own.len())
                 .map(|_| DeviceBuffer::zeroed(stream, plan.stack))
                 .collect::<Result<_, _>>()?,
@@ -695,14 +689,13 @@ impl State {
         let Self {
             k,
             ex,
-            fft,
             views,
             table,
             counts,
             obj,
             halo,
             probe,
-            psi,
+            bufs,
             llk,
             obj_sums,
             leaf_sums,
@@ -712,30 +705,30 @@ impl State {
             links,
         } = self;
         let links = links.as_ref().expect("DistAp::new installs the links");
-        let dims = *views.dims();
         let np = plan.np() as u32;
 
-        // A: exit waves. An own stack's probe sum follows its projection, whose exit waves are
-        // then still in L2.
+        // A: per stack the fused pass, then for an own stack the probe sums of its projected
+        // exit waves, still in L2.
         for s in leaf_sums.iter_mut() {
             ptyrs_gpu::zero(&ctx, &mut s.num)?;
             ptyrs_gpu::zero(&ctx, &mut s.den)?;
         }
+        let inputs = FusedInputs {
+            views,
+            counts,
+            obj,
+            probe,
+        };
         for (s, st) in rp.stacks.iter().enumerate() {
             let mine = rp.own.binary_search(&s).ok();
             let at = table.at(s);
-            let psi = &mut psi[s];
-            k.obj_probe_to_psi(&ctx, views, at, obj, probe, psi)?;
-            fft.forward_inplace(&ctx, psi)
-                .map_err(ptyrs_gpu::Error::from)?;
-            if let (true, Some(i)) = (due, mine) {
-                k.llk(&ctx, &dims, at, counts, psi, &mut llk[i])?;
-            }
-            k.apply_amplitude(&ctx, &dims, at, counts, psi)?;
-            fft.inverse_inplace(&ctx, psi)
-                .map_err(ptyrs_gpu::Error::from)?;
+            let llk = match (due, mine) {
+                (true, Some(i)) => Some(&mut llk[i]),
+                _ => None,
+            };
+            k.fused_project(&ctx, &inputs, at, Exit::Ap { llk }, bufs, obj_sums.as_mut())?;
             if let Some(sums) = mine.and_then(|_| leaf_sums.get_mut(st.leaf - r * plan.k)) {
-                k.psi_to_probe(&ctx, views, at, psi, obj, sums)?;
+                k.psi_to_probe(&ctx, views, at, bufs.work(), obj, sums)?;
             }
         }
         if let Some(t) = tree.as_ref() {
@@ -746,11 +739,8 @@ impl State {
         }
         gpu.fence()?;
 
-        // B: object sums and their max, probe pair tree above the subtree roots.
+        // B: the object sums' max, probe pair tree above the subtree roots.
         if let Some(sums) = obj_sums.as_mut() {
-            for (s, psi) in psi.iter().enumerate() {
-                k.psi_to_obj(&ctx, views, table.at(s), psi, probe, sums)?;
-            }
             k.obj_den_max(&ctx, views, sums)?;
         }
         if let Some(t) = tree.as_ref() {
@@ -970,18 +960,33 @@ mod tests {
 
     const PHOTONS: f64 = 1e5;
 
-    /// A simulated 32x32 scan at `positions(pixel)` and its PyNX start: flat object and the
-    /// truth probe, scaled to the observed photons.
-    fn case(nmode: usize, positions: impl FnOnce(f64) -> Positions) -> (Scan, Ptycho) {
-        let g = Geometry::new(1.5e-10, 1.0, 75e-6, [32, 32]).unwrap();
+    /// A simulated `frame`x`frame` scan at `positions(pixel)` and its start: unit-modulus object with a uniform random phase in
+    /// [-0.5, 0.5) rad and the truth probe, scaled to the observed photons. From a flat object
+    /// the far field of the Gaussian probe is f32 rounding noise in pixels with counts, where
+    /// the Poisson LLK is infinite; the random phase scatters into every pixel.
+    fn case(
+        frame: usize,
+        nmode: usize,
+        positions: impl FnOnce(f64) -> Positions,
+    ) -> (Scan, Ptycho) {
+        let g = Geometry::new(1.5e-10, 1.0, 75e-6, [frame, frame]).unwrap();
         let pixel = g.pixel_size_object();
         let pos = positions(pixel[1]);
         let shape = required_obj_shape(&pos.pynx_preprocess(pixel), pixel, g.frame, 4);
         let object = sim::object(shape);
         let probe = sim::probe(g.frame, nmode).unwrap();
         let scan = ptyrs_engine::sim::simulate(g, pos, &object, &probe, PHOTONS, None, 7).unwrap();
-        let flat = Object::new(Stack::filled(object.dims(), C64::new(1.0, 0.0)));
-        let mut p = Ptycho::new(&scan, flat, probe).unwrap();
+        let mut x = 0x9e37_79b9_7f4a_7c15_u64;
+        let phase: Vec<C64> = (0..object.as_slice().len())
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                C64::from_polar(1.0, (x >> 11) as f64 / (1u64 << 53) as f64 - 0.5)
+            })
+            .collect();
+        let start = Object::new(Stack::from_vec(object.dims(), phase).unwrap());
+        let mut p = Ptycho::new(&scan, start, probe).unwrap();
         p.scale_obj_probe();
         (scan, p)
     }
@@ -1038,8 +1043,8 @@ mod tests {
     /// sectors and a raster cut in strips, with partial last stacks and two probe modes.
     #[test]
     fn ap_is_bit_identical_on_1_2_and_4_gpus() {
-        let fermat = case(2, |px| sim::fermat(200, 2.5 * px));
-        let raster = case(2, |px| sim::raster(8, 40, 3.0 * px));
+        let fermat = case(128, 2, |px| sim::fermat(200, 10.0 * px));
+        let raster = case(128, 2, |px| sim::raster(8, 40, 12.0 * px));
         for (name, scheme, (scan, p)) in [
             ("fermat", Scheme::Sectors { centre: None }, fermat),
             ("raster", Scheme::Strips, raster),
@@ -1072,53 +1077,113 @@ mod tests {
         }
     }
 
-    /// A region recomputes its neighbours' border frames in its own stacks, so a frame's exit
-    /// wave is the owner's only if cuFFT gives a transform the same bits at any position of a
-    /// fixed-size batch, whatever the other transforms hold. Checked at this module's test
-    /// shape and at `ap_scaling`'s, each transform at every position.
+    /// A region recomputes its neighbours' border frames in stacks of its own, so a frame's
+    /// exit wave, LLK partial and object-sum terms are the owner's only if the fused pass
+    /// gives a frame the same bits whatever else its stack holds and wherever in it the frame
+    /// sits. Some frames of a scan, in two stacks of their own, against each of them alone
+    /// in a stack over the whole scan's views; the object sums add the same frames in the same
+    /// order either way. At both frame sides the fused passes take.
     #[test]
-    fn fft_bits_do_not_depend_on_batch_position() {
+    fn fused_bits_do_not_depend_on_the_stack() {
         let ctx = cuda_core::Context::new(gpus(1)[0]).unwrap();
         let stream = ctx.new_stream().unwrap();
-        let mut x = 0x2545_f491_4f6c_dd1du64;
-        let mut rand = || {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            (x >> 40) as f32 / (1u64 << 24) as f32 - 0.5
-        };
-        for (n, batch) in [(32, 7 * 2), (256, 32 * 2)] {
-            let len = n * n;
-            let data: Vec<C32> = (0..batch * len)
-                .map(|_| C32 {
-                    re: rand(),
-                    im: rand(),
-                })
-                .collect();
-            let mut plan = Plan2d::new(&stream, n, batch).unwrap();
-            // Bits after the forward transform and after the inverse that follows it.
-            let mut run = |host: &[C32]| {
-                let mut buf = DeviceBuffer::from_host(&stream, host).unwrap();
-                let ec = ExecutionContext::new(stream.clone());
-                plan.forward_inplace(&ec, &mut buf).unwrap();
-                drop(ec);
-                let fwd = bits(&buf.to_host_vec(&stream).unwrap());
-                let ec = ExecutionContext::new(stream.clone());
-                plan.inverse_inplace(&ec, &mut buf).unwrap();
-                drop(ec);
-                [fwd, bits(&buf.to_host_vec(&stream).unwrap())]
+        let k = Kernels::load(&ctx).unwrap();
+        for frame in [128, 256] {
+            fused_stack_case(&stream, &k, frame);
+        }
+    }
+
+    fn fused_stack_case(stream: &Arc<Stream>, k: &Kernels, frame: usize) {
+        let step = frame as f64 / 12.8;
+        let (scan, p) = case(frame, 2, |px| sim::fermat(24, step * px));
+        let pick: [u32; 8] = [1, 4, 6, 7, 11, 15, 16, 22];
+        let addr = p.addr();
+        let [ny, nx] = addr.frame_shape();
+        let [nyo, nxo] = addr.obj_shape();
+        let n = ny * nx;
+        let nmode = addr.nmode();
+        let obj = c32(sim::object([nyo, nxo]).as_slice());
+        let obj = DeviceBuffer::from_host(stream, &obj).unwrap();
+        let probe = DeviceBuffer::from_host(stream, &c32(p.probe().as_slice())).unwrap();
+        // Per picked frame its exit waves and LLK partial, then the object sums.
+        let run = |frames: &[u32], stacks: &[Range<u32>], at: &dyn Fn(u32) -> u32| {
+            let dims = ViewDims {
+                nframe: frames.len() as u32,
+                nmode: nmode as u32,
+                nprobe: addr.nprobe() as u32,
+                nobj: addr.nobj() as u32,
+                frame: [ny as u32, nx as u32],
+                obj: [nyo as u32, nxo as u32],
+                quad_phase: problem(&scan, &p).quad_phase,
             };
-            let base = run(&data);
-            for k in 1..batch {
-                let mut rot = data.clone();
-                rot.rotate_left(k * len);
-                for (got, base) in run(&rot).iter().zip(&base) {
-                    let mut want = base.clone();
-                    want.rotate_left(k * len);
-                    assert!(*got == want, "{n}x{n} batch {batch}: rotated by {k}");
+            let va: Vec<ViewAddr> = frames
+                .iter()
+                .flat_map(|&f| addr.frame_views(f as usize).iter().map(view_addr))
+                .collect();
+            let counts: Vec<u16> = frames
+                .iter()
+                .flat_map(|&f| &scan.counts.as_slice()[f as usize * n..][..n])
+                .copied()
+                .collect();
+            let views = Views::new(stream, dims, &va).unwrap();
+            let table = StackTable::new(stream, &dims, stacks).unwrap();
+            let counts = DeviceBuffer::from_host(stream, &counts).unwrap();
+            let mut bufs = FusedBufs::new(stream, &dims, table.nf_max()).unwrap();
+            let mut llk = DeviceBuffer::zeroed(stream, table.nf_max() as usize).unwrap();
+            let mut sums = UpdateSums::zeroed(stream, obj.len()).unwrap();
+            let inputs = FusedInputs {
+                views: &views,
+                counts: &counts,
+                obj: &obj,
+                probe: &probe,
+            };
+            let mut out = vec![None; pick.len()];
+            for (s, r) in stacks.iter().enumerate() {
+                let ec = ExecutionContext::new(stream.clone());
+                let exit = Exit::Ap {
+                    llk: Some(&mut llk),
+                };
+                k.fused_project(&ec, &inputs, table.at(s), exit, &mut bufs, Some(&mut sums))
+                    .unwrap();
+                drop(ec);
+                let work = bufs.work().to_host_vec(stream).unwrap();
+                let llk = llk.to_host_vec(stream).unwrap();
+                for (i, f) in r.clone().enumerate() {
+                    let psi = bits(&work[i * nmode * n..][..nmode * n]);
+                    let l = [
+                        llk[i].poisson,
+                        llk[i].gaussian,
+                        llk[i].euclidean,
+                        llk[i].icalc,
+                    ];
+                    out[at(f) as usize] = Some((psi, l.map(f32::to_bits)));
                 }
             }
+            let num = bits(&sums.num.to_host_vec(stream).unwrap());
+            let den: Vec<u32> = sums
+                .den
+                .to_host_vec(stream)
+                .unwrap()
+                .iter()
+                .map(|d| d.to_bits())
+                .collect();
+            (out, num, den)
+        };
+        let alone: Vec<Range<u32>> = pick.iter().map(|&f| f..f + 1).collect();
+        let pos = |f: u32| pick.iter().position(|&g| g == f).unwrap() as u32;
+        let want = run(&(0..24).collect::<Vec<_>>(), &alone, &pos);
+        let got = run(&pick, &[0..3, 3..8], &|i| i);
+        assert!(want.0.iter().all(Option::is_some));
+        assert!(want.2.iter().any(|&d| d != 0), "{frame}: no object sums");
+        for (i, (g, w)) in got.0.iter().zip(&want.0).enumerate() {
+            assert!(
+                g == w,
+                "{frame}: frame {}: exit waves or LLK differ",
+                pick[i]
+            );
         }
+        assert!(got.1 == want.1, "{frame}: object sums num differ");
+        assert!(got.2 == want.2, "{frame}: object sums den differ");
     }
 
     fn rel_l2(a: &[C32], b: &[C64]) -> f64 {
@@ -1134,7 +1199,7 @@ mod tests {
     /// rounding; the run is split in two calls to check the history's cycle numbers.
     #[test]
     fn ap_follows_the_cpu_reference() {
-        let (scan, mut cpu) = case(2, |px| sim::fermat(100, 2.5 * px));
+        let (scan, mut cpu) = case(128, 2, |px| sim::fermat(100, 10.0 * px));
         let cfg = ApConfig {
             scheme: Scheme::Sectors { centre: None },
             stack: 8,
