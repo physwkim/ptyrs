@@ -179,19 +179,23 @@ unsafe fn block_max_into(s: *mut f32, t: usize, m: f32, out: *mut u32) {
     }
 }
 
-/// Tree sum of `PIXEL_THREADS` shared values into element 0; every thread must call it.
+/// Tree sums of `K` segments of `PIXEL_THREADS` shared values, each into its element 0;
+/// every thread must call it.
 ///
 /// # Safety
 ///
-/// `s` must point to `PIXEL_THREADS` block-shared floats, each written by its thread.
+/// `s` must point to `K * PIXEL_THREADS` block-shared floats, each written by its thread.
 #[device]
-unsafe fn block_sum(s: *mut f32) {
-    let t = thread::threadIdx_x();
-    let mut half = pixel::PIXEL_THREADS / 2;
+unsafe fn block_sum<const K: usize>(s: *mut f32) {
+    let t = thread::threadIdx_x() as usize;
+    let seg = pixel::PIXEL_THREADS as usize;
+    let mut half = seg / 2;
     while half > 0 {
         thread::sync_threads();
         if t < half {
-            unsafe { *s.add(t as usize) += *s.add((t + half) as usize) };
+            for j in 0..K {
+                unsafe { *s.add(j * seg + t) += *s.add(j * seg + t + half) };
+            }
         }
         half /= 2;
     }
@@ -358,7 +362,7 @@ pub mod kernels {
         let t = thread::threadIdx_x() as usize;
         let plane0 = fl * nmode as usize;
         let inv_n = 1.0 / n as f32;
-        let mut acc = [0.0f32; 4];
+        let mut acc = LlkPartial::default();
         let mut d = c * chunk + t;
         while d < end {
             let at = psi_index((d / nx as usize) as u32, (d % nx as usize) as u32, ny, nx);
@@ -366,25 +370,26 @@ pub mod kernels {
             if obs != MASKED {
                 let obs = obs as f32;
                 let calc = (unsafe { mode_power(psi, plane0, nmode, n, at) } * inv_n).max(0.0);
-                acc[0] += if obs <= 0.1 {
+                acc.poisson += if obs <= 0.1 {
                     calc
                 } else {
                     calc - obs + obs * (obs / calc).ln()
                 };
-                acc[1] += (obs - calc) * (obs - calc) / (obs + 1.0);
+                acc.gaussian += (obs - calc) * (obs - calc) / (obs + 1.0);
                 let e = obs.sqrt() - calc.sqrt();
-                acc[2] += 4.0 * e * e;
-                acc[3] += calc;
+                acc.euclidean += 4.0 * e * e;
+                acc.icalc += calc;
             }
             d += PIXEL_THREADS as usize;
         }
         let s = (&raw mut RED).cast::<f32>();
         let seg = PIXEL_THREADS as usize;
         unsafe {
-            for (j, &a) in acc.iter().enumerate() {
-                *s.add(j * seg + t) = a;
-                block_sum(s.add(j * seg));
-            }
+            *s.add(t) = acc.poisson;
+            *s.add(seg + t) = acc.gaussian;
+            *s.add(2 * seg + t) = acc.euclidean;
+            *s.add(3 * seg + t) = acc.icalc;
+            block_sum::<4>(s);
             if t == 0 {
                 *chunks.add(fl * n.div_ceil(chunk) + c) = LlkPartial {
                     poisson: *s,
