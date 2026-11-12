@@ -1633,6 +1633,7 @@ dependencies = [
 name = "ptyrs-fft"
 version = "0.0.1"
 dependencies = [
+ "cuda-async",
  "cuda-core",
  "rustfft",
 ]
@@ -1642,6 +1643,7 @@ name = "ptyrs-gpu"
 version = "0.0.1"
 dependencies = [
  "cuda-artifact-finalizer",
+ "cuda-async",
  "cuda-core",
  "libloading",
  "nvjitlink-sys",

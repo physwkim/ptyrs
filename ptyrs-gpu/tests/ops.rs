@@ -5,18 +5,25 @@ use std::f64::consts::PI;
 use std::ops::Range;
 use std::sync::Arc;
 
-use cuda_core::{CudaContext, CudaStream, DeviceBuffer, DeviceCopy};
-use ptyrs_fft::Plan2d;
+use cuda_async::cuda_graph::CudaGraph;
+use cuda_async::device_operation::{DeviceOp, ExecutionContext};
+use cuda_async::error::DeviceError;
+use cuda_core::{CudaContext, CudaStream, DeviceBuffer, DeviceCopy, DriverError};
+use ptyrs_fft::{FftError, Plan2d};
 use ptyrs_gpu::{
-    C32, Error, Kernels, LlkPartial, LlkSums, MASKED, UpdateSums, ViewAddr, ViewDims, Views,
+    C32, Error, Kernels, Lines, LlkPartial, LlkSums, MASKED, OBJ_TILE, StackCtl, StackRef,
+    StackTable, UpdateSums, ViewAddr, ViewDims, Views, record, view_tiles,
 };
 
 type Z = (f64, f64);
 
-fn setup() -> (Arc<CudaStream>, Kernels) {
+/// A stream, an eager execution context on it (its leases end when the test drops it) and
+/// the kernels.
+fn setup() -> (Arc<CudaStream>, ExecutionContext, Kernels) {
     let ctx = CudaContext::new(0).expect("CUDA device 0");
     let kernels = Kernels::load(&ctx).expect("load ptyrs-gpu kernels");
-    (ctx.default_stream(), kernels)
+    let stream = ctx.default_stream();
+    (stream.clone(), ExecutionContext::new(stream), kernels)
 }
 
 /// Deterministic values in `[-scale, scale)`.
@@ -38,6 +45,18 @@ fn noise(len: usize, seed: u64, scale: f32) -> Vec<C32> {
 
 fn up<T: DeviceCopy>(stream: &CudaStream, host: &[T]) -> DeviceBuffer<T> {
     DeviceBuffer::from_host(stream, host).unwrap()
+}
+
+/// A table of the one stack `frames`.
+fn one_stack(stream: &CudaStream, d: &ViewDims, frames: Range<u32>) -> StackTable {
+    StackTable::new(stream, d, std::slice::from_ref(&frames)).unwrap()
+}
+
+/// `host` followed by zeros up to `len` values.
+fn up_padded(stream: &CudaStream, host: &[C32], len: usize) -> DeviceBuffer<C32> {
+    let mut v = host.to_vec();
+    v.resize(len, C32::default());
+    up(stream, &v)
 }
 
 fn z(c: C32) -> Z {
@@ -146,22 +165,32 @@ impl Scan {
         (a.cos(), a.sin())
     }
 
-    /// Object indices and bilinear weights of view `v`'s sample at probe pixel `(y, x)`.
-    fn corners(&self, v: &ViewAddr, y: usize, x: usize) -> [(usize, f64); 4] {
+    /// Object indices and bilinear weights of the corners view `v`'s sample at probe pixel
+    /// `(y, x)` reads (non-zero weight).
+    fn corners(&self, v: &ViewAddr, y: usize, x: usize) -> impl Iterator<Item = (usize, f64)> {
         let [nyo, nxo] = [self.d.obj[0] as usize, self.d.obj[1] as usize];
         let (fy, fx) = (v.fy as f64, v.fx as f64);
         let (y0, x0) = (v.oy as usize + y, v.ox as usize + x);
-        let at = |yy: usize, xx: usize| (v.obj as usize * nyo + yy % nyo) * nxo + xx % nxo;
+        let at = move |yy: usize, xx: usize| {
+            assert!(
+                yy < nyo && xx < nxo,
+                "{v:?} reads ({yy}, {xx}) outside the object"
+            );
+            (v.obj as usize * nyo + yy) * nxo + xx
+        };
         [
-            (at(y0, x0), (1.0 - fy) * (1.0 - fx)),
-            (at(y0, x0 + 1), (1.0 - fy) * fx),
-            (at(y0 + 1, x0), fy * (1.0 - fx)),
-            (at(y0 + 1, x0 + 1), fy * fx),
+            ((y0, x0), (1.0 - fy) * (1.0 - fx)),
+            ((y0, x0 + 1), (1.0 - fy) * fx),
+            ((y0 + 1, x0), fy * (1.0 - fx)),
+            ((y0 + 1, x0 + 1), fy * fx),
         ]
+        .into_iter()
+        .filter(|&(_, w)| w != 0.0)
+        .map(move |((yy, xx), w)| (at(yy, xx), w))
     }
 
     fn sample(&self, obj: &[C32], v: &ViewAddr, y: usize, x: usize) -> Z {
-        self.corners(v, y, x).iter().fold((0.0, 0.0), |s, &(i, w)| {
+        self.corners(v, y, x).fold((0.0, 0.0), |s, (i, w)| {
             (s.0 + w * obj[i].re as f64, s.1 + w * obj[i].im as f64)
         })
     }
@@ -211,23 +240,29 @@ impl Scan {
 }
 
 /// 24x32 frames on two 50x60 object modes and two probe modes (four views per frame).
-/// Frames 1 and 3 end on the object's last row and column, so their `+ 1` neighbours wrap;
-/// the subpixel offsets cover `fy` and `fx` zero and non-zero.
+/// Frames 1 and 3 reach the object's last row and column, each once through its last
+/// probe row or column (`f == 0`) and once through the `+ 1` neighbour (`f > 0`); the
+/// subpixel offsets cover `fy` and `fx` zero and non-zero.
 fn scan() -> Scan {
+    scan_in([50, 60])
+}
+
+/// [`scan`] on an object of `obj` `[nyo, nxo]`.
+fn scan_in(obj: [u32; 2]) -> Scan {
     let d = ViewDims {
         nframe: 5,
         nmode: 4,
         nprobe: 2,
         nobj: 2,
         frame: [24, 32],
-        obj: [50, 60],
+        obj,
         quad_phase: 0.003,
     };
     let offsets = [
         (0, 0, 0.0, 0.0),
-        (26, 28, 0.25, 0.0),
+        (25, 28, 0.25, 0.0),
         (13, 7, 0.0, 0.7),
-        (26, 28, 0.6, 0.9),
+        (26, 27, 0.0, 0.9),
         (5, 20, 0.5, 0.5),
     ];
     Scan::new(d, &offsets, 1.0)
@@ -278,29 +313,31 @@ fn assert_llk(what: &str, got: &[LlkPartial], want: &[[f64; 4]]) {
 
 #[test]
 fn obj_probe_to_psi_matches_f64() {
-    let (stream, k) = setup();
+    let (stream, ex, k) = setup();
     let s = scan();
     let views = Views::new(&stream, s.d, &s.views).unwrap();
     let (obj, probe) = (up(&stream, &s.obj), up(&stream, &s.probe));
-    for frames in [0..5, 2..5] {
-        let mut psi = DeviceBuffer::<C32>::zeroed(&stream, s.nk(&frames) * s.n()).unwrap();
-        k.obj_probe_to_psi(&stream, &views, frames.clone(), &obj, &probe, &mut psi)
+    let stacks = [0..5, 2..5];
+    let table = StackTable::new(&stream, &s.d, &stacks).unwrap();
+    for (i, frames) in stacks.into_iter().enumerate() {
+        let mut psi = DeviceBuffer::<C32>::zeroed(&stream, s.nk(&(0..5)) * s.n()).unwrap();
+        k.obj_probe_to_psi(&ex, &views, table.at(i), &obj, &probe, &mut psi)
             .unwrap();
-        let err = rel_l2(
-            &psi.to_host_vec(&stream).unwrap(),
-            &s.psi(frames.clone(), &s.obj),
-        );
+        let got = psi.to_host_vec(&stream).unwrap();
+        let (stack, rest) = got.split_at(s.nk(&frames) * s.n());
+        let err = rel_l2(stack, &s.psi(frames.clone(), &s.obj));
         println!("obj_probe_to_psi {frames:?}: rel L2 {err:.2e}");
         assert!(err < 2e-6, "frames {frames:?}: rel L2 {err:.2e}");
+        assert!(
+            rest.iter().all(|c| *c == C32::default()),
+            "frames {frames:?}: planes past the stack written"
+        );
     }
 }
 
 /// Uploads `num`, `den` as sums.
 fn sums(stream: &CudaStream, start: &(Vec<C32>, Vec<f32>)) -> UpdateSums {
-    UpdateSums {
-        num: up(stream, &start.0),
-        den: up(stream, &start.1),
-    }
+    UpdateSums::new(up(stream, &start.0), up(stream, &start.1), stream).unwrap()
 }
 
 /// `whole` matches the f64 sums, and `parts` (the same frames in two stacks) matches
@@ -337,16 +374,18 @@ fn check_sums(
 
 #[test]
 fn update_sums_match_f64_and_ignore_stack_split() {
-    let (stream, k) = setup();
+    let (stream, ex, k) = setup();
     let s = scan();
     let n = s.n();
     let views = Views::new(&stream, s.d, &s.views).unwrap();
     let (obj, probe) = (up(&stream, &s.obj), up(&stream, &s.probe));
     let psi_host = noise(s.nk(&(0..5)) * n, 3, 1.0);
     let psi = up(&stream, &psi_host);
-    let split = s.nk(&(0..2)) * n;
+    let whole_stack = one_stack(&stream, &s.d, 0..5);
+    let part_stacks = StackTable::new(&stream, &s.d, &[0..2, 2..5]).unwrap();
+    let (split, part_len) = (s.nk(&(0..2)) * n, s.nk(&(2..5)) * n);
     let psi_parts = [
-        up(&stream, &psi_host[..split]),
+        up_padded(&stream, &psi_host[..split], part_len),
         up(&stream, &psi_host[split..]),
     ];
     // Non-zero starting sums: the kernels add to what is there.
@@ -366,24 +405,24 @@ fn update_sums_match_f64_and_ignore_stack_split() {
 
     let st = start(s.obj.len(), 10);
     let (mut whole, mut parts) = (sums(&stream, &st), sums(&stream, &st));
-    k.psi_to_obj(&stream, &views, 0..5, &psi, &probe, &mut whole)
+    k.psi_to_obj(&ex, &views, whole_stack.at(0), &psi, &probe, &mut whole)
         .unwrap();
-    k.psi_to_obj(&stream, &views, 0..2, &psi_parts[0], &probe, &mut parts)
-        .unwrap();
-    k.psi_to_obj(&stream, &views, 2..5, &psi_parts[1], &probe, &mut parts)
-        .unwrap();
+    for (i, part) in psi_parts.iter().enumerate() {
+        k.psi_to_obj(&ex, &views, part_stacks.at(i), part, &probe, &mut parts)
+            .unwrap();
+    }
     let (mut num, mut den) = f64_start(&st);
     s.obj_sums(0..5, &psi_host, &mut num, &mut den);
     check_sums("object", &stream, &whole, &parts, (&num, &den));
 
     let st = start(s.probe.len(), 20);
     let (mut whole, mut parts) = (sums(&stream, &st), sums(&stream, &st));
-    k.psi_to_probe(&stream, &views, 0..5, &psi, &obj, &mut whole)
+    k.psi_to_probe(&ex, &views, whole_stack.at(0), &psi, &obj, &mut whole)
         .unwrap();
-    k.psi_to_probe(&stream, &views, 0..2, &psi_parts[0], &obj, &mut parts)
-        .unwrap();
-    k.psi_to_probe(&stream, &views, 2..5, &psi_parts[1], &obj, &mut parts)
-        .unwrap();
+    for (i, part) in psi_parts.iter().enumerate() {
+        k.psi_to_probe(&ex, &views, part_stacks.at(i), part, &obj, &mut parts)
+            .unwrap();
+    }
     let (mut num, mut den) = f64_start(&st);
     s.probe_sums(0..5, &psi_host, &mut num, &mut den);
     check_sums("probe", &stream, &whole, &parts, (&num, &den));
@@ -391,17 +430,18 @@ fn update_sums_match_f64_and_ignore_stack_split() {
 
 #[test]
 fn psi_to_obj_is_the_adjoint_of_obj_probe_to_psi() {
-    let (stream, k) = setup();
+    let (stream, ex, k) = setup();
     let s = scan();
     let views = Views::new(&stream, s.d, &s.views).unwrap();
+    let all = one_stack(&stream, &s.d, 0..5);
     let probe = up(&stream, &s.probe);
     let o = noise(s.obj.len(), 7, 1.0);
     // <A o, A o> = <o, A^H A o>: no cancellation, so f32 rounding stays small.
     let mut a_o = DeviceBuffer::<C32>::zeroed(&stream, s.nk(&(0..5)) * s.n()).unwrap();
-    k.obj_probe_to_psi(&stream, &views, 0..5, &up(&stream, &o), &probe, &mut a_o)
+    k.obj_probe_to_psi(&ex, &views, all.at(0), &up(&stream, &o), &probe, &mut a_o)
         .unwrap();
     let mut ah = UpdateSums::zeroed(&stream, o.len()).unwrap();
-    k.psi_to_obj(&stream, &views, 0..5, &a_o, &probe, &mut ah)
+    k.psi_to_obj(&ex, &views, all.at(0), &a_o, &probe, &mut ah)
         .unwrap();
     let dot = |a: &[C32], b: &[C32]| {
         a.iter().zip(b).fold((0.0, 0.0), |s, (&a, &b)| {
@@ -417,6 +457,137 @@ fn psi_to_obj_is_the_adjoint_of_obj_probe_to_psi() {
     assert!(rel < 1e-5, "rel {rel:.2e}");
 }
 
+fn c32_bits(v: &[C32]) -> Vec<(u32, u32)> {
+    v.iter().map(|c| (c.re.to_bits(), c.im.to_bits())).collect()
+}
+
+/// The tiled object update leaves the tiles without views bit-exact and reads none of their
+/// sums; every other pixel gets the bits of the flat update.
+#[test]
+fn object_update_skips_tiles_without_views() {
+    let (stream, ex, k) = setup();
+    // Views reach row 50 and column 60: tile row 4 and tile columns 4, 5 have none.
+    let s = scan_in([80, 96]);
+    let len = s.obj.len();
+    let views = Views::new(&stream, s.d, &s.views).unwrap();
+    let all = one_stack(&stream, &s.d, 0..5);
+    let probe = up(&stream, &s.probe);
+    let psi = up(&stream, &noise(s.nk(&(0..5)) * s.n(), 3, 1.0));
+    let [nyo, nxo] = s.d.obj.map(|v| v as usize);
+    let (t, ntx) = (OBJ_TILE as usize, nxo.div_ceil(OBJ_TILE as usize));
+    let tile_len = views.tile_len().to_host_vec(&stream).unwrap();
+    let lit = |i: usize| tile_len[(i / nxo % nyo) / t * ntx + i % nxo / t] != 0;
+    let nlit = (0..len).filter(|&i| lit(i)).count();
+    assert!(
+        nlit > 0 && nlit < len,
+        "{nlit} of {len} pixels on tiles with views"
+    );
+
+    let mut flat_obj = up(&stream, &s.obj);
+    let mut flat = UpdateSums::zeroed(&stream, len).unwrap();
+    k.psi_to_obj(&ex, &views, all.at(0), &psi, &probe, &mut flat)
+        .unwrap();
+    k.update_from_sums(&ex, &mut flat_obj, &mut flat, len as u32, 0.01)
+        .unwrap();
+
+    // Read, the poisoned sums would raise max(den) or put NaN into the object.
+    let nan = C32 {
+        re: f32::NAN,
+        im: f32::NAN,
+    };
+    let num0 = (0..len)
+        .map(|i| if lit(i) { C32::default() } else { nan })
+        .collect();
+    let den0: Vec<f32> = (0..len).map(|i| if lit(i) { 0.0 } else { 1e30 }).collect();
+    let mut obj = up(&stream, &s.obj);
+    let mut tiled = sums(&stream, &(num0, den0.clone()));
+    k.psi_to_obj(&ex, &views, all.at(0), &psi, &probe, &mut tiled)
+        .unwrap();
+    k.update_obj_from_sums(&ex, &views, &mut obj, &mut tiled, 0.01)
+        .unwrap();
+
+    let got = c32_bits(&obj.to_host_vec(&stream).unwrap());
+    let (flat, start) = (
+        c32_bits(&flat_obj.to_host_vec(&stream).unwrap()),
+        c32_bits(&s.obj),
+    );
+    let den = tiled.den.to_host_vec(&stream).unwrap();
+    for i in 0..len {
+        let want = if lit(i) { flat[i] } else { start[i] };
+        assert_eq!(got[i], want, "pixel {i}, tile with views: {}", lit(i));
+        if !lit(i) {
+            assert_eq!(den[i].to_bits(), den0[i].to_bits(), "den {i} written");
+        }
+    }
+    let moved = (0..len).filter(|&i| got[i] != start[i]).count();
+    assert!(moved > nlit / 2, "only {moved} of {nlit} pixels updated");
+}
+
+/// [`Views::from_parts`] over slabs with padding past each run (the live layout) gives the
+/// bits of the packed lists: a run ends at its length, not at the next tile's start.
+#[test]
+fn views_over_padded_slabs_match_packed_lists() {
+    let (stream, ex, k) = setup();
+    let s = scan_in([80, 96]);
+    let packed = Views::new(&stream, s.d, &s.views).unwrap();
+    let start = packed.tile_start().to_host_vec(&stream).unwrap();
+    let len = packed.tile_len().to_host_vec(&stream).unwrap();
+    let list = packed.tile_views().to_host_vec(&stream).unwrap();
+    let cap = *len.iter().max().unwrap() as usize + 2;
+    // Padding names view 0, which touches tile 0: read, it would add to the sums.
+    let mut slab = vec![0u32; len.len() * cap];
+    for (t, &l) in len.iter().enumerate() {
+        let run = &list[start[t] as usize..][..l as usize];
+        slab[t * cap..][..run.len()].copy_from_slice(run);
+    }
+    let slab_start: Vec<u32> = (0..=len.len()).map(|t| (t * cap) as u32).collect();
+    // SAFETY: the runs are those of `Views::new` for these views, each within its slab.
+    let slabs = unsafe {
+        Views::from_parts(
+            s.d,
+            up(&stream, &s.views),
+            up(&stream, &slab_start),
+            up(&stream, &slab),
+            up(&stream, &len),
+        )
+    }
+    .unwrap();
+
+    let table = StackTable::new(&stream, &s.d, &[0..2, 2..5]).unwrap();
+    let probe = up(&stream, &s.probe);
+    let psi = up(&stream, &noise(s.nk(&(0..5)) * s.n(), 4, 1.0));
+    let mut out = Vec::new();
+    for views in [&packed, &slabs] {
+        let mut obj = up(&stream, &s.obj);
+        let mut sums = UpdateSums::zeroed(&stream, s.obj.len()).unwrap();
+        for i in 0..table.len() {
+            k.psi_to_obj(&ex, views, table.at(i), &psi, &probe, &mut sums)
+                .unwrap();
+        }
+        k.update_obj_from_sums(&ex, views, &mut obj, &mut sums, 0.01)
+            .unwrap();
+        out.push(c32_bits(&obj.to_host_vec(&stream).unwrap()));
+    }
+    assert!(out[0] == out[1], "slab views differ from packed views");
+    assert!(out[0] != c32_bits(&s.obj), "the update moved nothing");
+
+    let short = |n: usize| DeviceBuffer::<u32>::zeroed(&stream, n).unwrap();
+    // SAFETY: rejected before any launch.
+    let r = unsafe {
+        Views::from_parts(
+            s.d,
+            up(&stream, &s.views),
+            short(len.len()),
+            short(1),
+            short(len.len()),
+        )
+    };
+    assert!(
+        matches!(r, Err(Error::Shape(_))),
+        "tile_start without its end"
+    );
+}
+
 /// Scan counts: every 7th pixel masked, every 5th of the rest zero, others 1..=60.
 fn counts(len: usize) -> Vec<u16> {
     (0..len)
@@ -430,7 +601,7 @@ fn counts(len: usize) -> Vec<u16> {
 
 #[test]
 fn intensity_amplitude_and_llk_match_f64() {
-    let (stream, k) = setup();
+    let (stream, ex, k) = setup();
     let s = scan();
     let (d, n, nm) = (s.d, s.n(), s.d.nmode as usize);
     let frames = 1..4;
@@ -465,14 +636,14 @@ fn intensity_amplitude_and_llk_match_f64() {
     }
 
     let counts = up(&stream, &counts_host);
+    let table = one_stack(&stream, &d, frames);
+    let stack = table.at(0);
     let mut psi = up(&stream, &psi_host);
     let mut icalc = DeviceBuffer::<f32>::zeroed(&stream, nf * n).unwrap();
-    k.mode_intensity(&stream, &d, frames.clone(), &psi, &mut icalc)
-        .unwrap();
+    k.mode_intensity(&ex, &d, stack, &psi, &mut icalc).unwrap();
     let mut llk = DeviceBuffer::<LlkPartial>::zeroed(&stream, nf).unwrap();
-    k.llk(&stream, &d, frames.clone(), &counts, &psi, &mut llk)
-        .unwrap();
-    k.apply_amplitude(&stream, &d, frames.clone(), &counts, &mut psi)
+    k.llk(&ex, &d, stack, &counts, &psi, &mut llk).unwrap();
+    k.apply_amplitude(&ex, &d, stack, &counts, &mut psi)
         .unwrap();
 
     let err = rel_l2_re(&icalc.to_host_vec(&stream).unwrap(), &icalc_ref);
@@ -486,7 +657,7 @@ fn intensity_amplitude_and_llk_match_f64() {
 
 #[test]
 fn update_from_sums_matches_f64() {
-    let (stream, k) = setup();
+    let (stream, ex, k) = setup();
     let inertia = 0.01f32;
     // 300_001 values make each block of the max pass stride; its maximum is the last value.
     for (len, seed) in [(6000usize, 20u64), (300_001, 30)] {
@@ -506,21 +677,37 @@ fn update_from_sums_matches_f64() {
             })
             .collect();
         let mut x = up(&stream, &x_host);
-        let sums = UpdateSums {
-            num: up(&stream, &num_host),
-            den: up(&stream, &den_host),
-        };
-        k.update_from_sums(&stream, &mut x, &sums, len as u32, inertia)
+        let mut sums =
+            UpdateSums::new(up(&stream, &num_host), up(&stream, &den_host), &stream).unwrap();
+        k.update_from_sums(&ex, &mut x, &mut sums, len as u32, inertia)
             .unwrap();
-        let err = rel_l2(&x.to_host_vec(&stream).unwrap(), &want);
+        let got = x.to_host_vec(&stream).unwrap();
+        let err = rel_l2(&got, &want);
         println!("update_from_sums n={len}: rel L2 {err:.2e}");
         assert!(err < 1e-6, "n={len}: rel L2 {err:.2e}");
+
+        // Bit for bit the plain f32 formula, each operation rounded on its own (what a Tile
+        // or CPU port computes), not a mix of fused and separate roundings.
+        let reg = inertia * den_host.iter().fold(0.0f32, |m, &v| m.max(v));
+        let mismatches = (0..len)
+            .filter(|&i| {
+                let d = (den_host[i] + reg).max(1e-12);
+                let part = |a: f32, b: f32| (a + reg * b) / d;
+                let (a, b) = (num_host[i], x_host[i]);
+                let w = (part(a.re, b.re), part(a.im, b.im));
+                (got[i].re.to_bits(), got[i].im.to_bits()) != (w.0.to_bits(), w.1.to_bits())
+            })
+            .count();
+        assert_eq!(
+            mismatches, 0,
+            "n={len}: {mismatches} values differ from plain f32"
+        );
     }
 }
 
 #[test]
 fn dm_reflect_and_add_match_f64() {
-    let (stream, k) = setup();
+    let (stream, ex, k) = setup();
     let (len, alpha) = (5000usize, 0.02f32);
     let a = alpha as f64;
     let (psi_host, po_host) = (noise(len, 40, 1.0), noise(len, 41, 1.0));
@@ -552,18 +739,18 @@ fn dm_reflect_and_add_match_f64() {
         .collect();
 
     let (mut psi, mut po) = (up(&stream, &psi_host), up(&stream, &po_host));
-    k.dm_reflect(&stream, &mut psi, &mut po, len as u32, alpha)
+    k.dm_reflect(&ex, &mut psi, &mut po, len as u32, alpha)
         .unwrap();
     let e_psi = rel_l2(&psi.to_host_vec(&stream).unwrap(), &psi1);
     let e_po = rel_l2(&po.to_host_vec(&stream).unwrap(), &po1);
-    k.add_c32(&stream, &mut psi, &po, len as u32).unwrap();
+    k.add_c32(&ex, &mut psi, &po, len as u32).unwrap();
     let e_sum = rel_l2(&psi.to_host_vec(&stream).unwrap(), &sum);
     println!("dm_reflect: psi {e_psi:.2e}, po {e_po:.2e}; add_c32 {e_sum:.2e}");
     assert!(e_psi < 1e-6 && e_po < 1e-6 && e_sum < 1e-6);
 
     // First DM cycle: psi = PO is a fixed point, and the add-back term vanishes.
     let (mut psi, mut po) = (up(&stream, &po_host), up(&stream, &po_host));
-    k.dm_reflect(&stream, &mut psi, &mut po, len as u32, alpha)
+    k.dm_reflect(&ex, &mut psi, &mut po, len as u32, alpha)
         .unwrap();
     let want: Vec<Z> = po_host.iter().map(|&c| z(c)).collect();
     let e_fix = rel_l2(&psi.to_host_vec(&stream).unwrap(), &want);
@@ -612,7 +799,7 @@ fn dft2_ortho(plane: &[Z], n: usize, inverse: bool) -> Vec<Z> {
 #[test]
 fn fourier_projection_matches_pynx_orthonormal_f64() {
     const N: usize = 32;
-    let (stream, k) = setup();
+    let (stream, ex, k) = setup();
     let d = ViewDims {
         nframe: 3,
         nmode: 2,
@@ -624,7 +811,7 @@ fn fourier_projection_matches_pynx_orthonormal_f64() {
     };
     let s = Scan::new(
         d,
-        &[(0, 0, 0.0, 0.0), (16, 3, 0.3, 0.0), (10, 16, 0.5, 0.25)],
+        &[(0, 0, 0.0, 0.0), (15, 3, 0.3, 0.0), (10, 15, 0.5, 0.25)],
         10.0,
     );
     let (n, nm, nf) = (N * N, 2, 3);
@@ -662,24 +849,26 @@ fn fourier_projection_matches_pynx_orthonormal_f64() {
     let want: Vec<Z> = far.chunks(n).flat_map(|p| dft2_ortho(p, N, true)).collect();
 
     let views = Views::new(&stream, d, &s.views).unwrap();
-    let plan = Plan2d::new(&stream, N, nf * nm).unwrap();
+    let table = one_stack(&stream, &d, 0..3);
+    let mut plan = Plan2d::new(&stream, N, nf * nm).unwrap();
     let counts = up(&stream, &counts_host);
     let mut psi = DeviceBuffer::<C32>::zeroed(&stream, nf * nm * n).unwrap();
     k.obj_probe_to_psi(
-        &stream,
+        &ex,
         &views,
-        0..3,
+        table.at(0),
         &up(&stream, &s.obj),
         &up(&stream, &s.probe),
         &mut psi,
     )
     .unwrap();
-    plan.forward_inplace(&mut psi).unwrap();
+    plan.forward_inplace(&ex, &mut psi).unwrap();
     let mut llk = DeviceBuffer::<LlkPartial>::zeroed(&stream, nf).unwrap();
-    k.llk(&stream, &d, 0..3, &counts, &psi, &mut llk).unwrap();
-    k.apply_amplitude(&stream, &d, 0..3, &counts, &mut psi)
+    k.llk(&ex, &d, table.at(0), &counts, &psi, &mut llk)
         .unwrap();
-    plan.inverse_inplace(&mut psi).unwrap();
+    k.apply_amplitude(&ex, &d, table.at(0), &counts, &mut psi)
+        .unwrap();
+    plan.inverse_inplace(&ex, &mut psi).unwrap();
 
     assert_llk("chain llk", &llk.to_host_vec(&stream).unwrap(), &llk_ref);
     let err = rel_l2(&psi.to_host_vec(&stream).unwrap(), &want);
@@ -689,7 +878,7 @@ fn fourier_projection_matches_pynx_orthonormal_f64() {
 
 #[test]
 fn views_and_frame_ranges_are_checked() {
-    let (stream, k) = setup();
+    let (stream, ex, k) = setup();
     let s = scan();
     let shape_err = |r: Result<Views, Error>| matches!(r, Err(Error::Shape(_)));
     assert!(
@@ -722,14 +911,631 @@ fn views_and_frame_ranges_are_checked() {
         "odd frame side"
     );
 
+    let table_err = |r: Result<StackTable, Error>| matches!(r, Err(Error::Shape(_)));
+    for stacks in [&[0..2, 3..3][..], &[0..1, 4..6], &[]] {
+        assert!(
+            table_err(StackTable::new(&stream, &s.d, stacks)),
+            "stacks {stacks:?}"
+        );
+    }
+    for nf_max in [0, 6] {
+        assert!(
+            table_err(StackTable::device(&stream, &s.d, nf_max)),
+            "nf_max {nf_max}"
+        );
+    }
+
     let views = Views::new(&stream, s.d, &s.views).unwrap();
     let (obj, probe) = (up(&stream, &s.obj), up(&stream, &s.probe));
+    let table = StackTable::new(&stream, &s.d, &[0..2, 1..5]).unwrap();
+    let mut short = DeviceBuffer::<C32>::zeroed(&stream, s.nk(&(0..4)) * s.n() - 1).unwrap();
+    let r = k.obj_probe_to_psi(&ex, &views, table.at(0), &obj, &probe, &mut short);
+    assert!(
+        matches!(r, Err(Error::Shape(_))),
+        "psi shorter than nf_max frames"
+    );
+    let other = one_stack(&stream, &ViewDims { nframe: 4, ..s.d }, 0..4);
     let mut psi = DeviceBuffer::<C32>::zeroed(&stream, s.nk(&(0..5)) * s.n()).unwrap();
-    for frames in [3..3, 4..6] {
-        let r = k.obj_probe_to_psi(&stream, &views, frames.clone(), &obj, &probe, &mut psi);
-        assert!(matches!(r, Err(Error::Shape(_))), "frames {frames:?}");
+    let r = k.obj_probe_to_psi(&ex, &views, other.at(0), &obj, &probe, &mut psi);
+    assert!(
+        matches!(r, Err(Error::Shape(_))),
+        "table made for another frame count"
+    );
+}
+
+/// A view may end on the object's last row only with `fy == 0`, since its `+ 1` neighbour
+/// would leave the object and nothing wraps; likewise for the last column and `fx`.
+#[test]
+fn check_view_rejects_a_neighbour_past_the_object() {
+    let d = scan().d;
+    let ([ny, nx], [nyo, nxo]) = (d.frame, d.obj);
+    let last = ViewAddr {
+        oy: nyo - ny,
+        ox: nxo - nx,
+        ..ViewAddr::default()
+    };
+    let ok = |v: ViewAddr| d.check_view(&v).is_ok();
+    assert!(ok(last), "last row and column, fy = fx = 0");
+    assert!(!ok(ViewAddr { fy: 0.25, ..last }), "fy > 0 on the last row");
+    assert!(
+        !ok(ViewAddr { fx: 0.25, ..last }),
+        "fx > 0 on the last column"
+    );
+    let inner = ViewAddr {
+        oy: last.oy - 1,
+        ox: last.ox - 1,
+        fy: 0.25,
+        fx: 0.25,
+        ..last
+    };
+    assert!(ok(inner), "+ 1 neighbours on the last row and column");
+}
+
+/// `view_tiles` lists, once each, every tile holding an object pixel a view's samples read,
+/// and `Views::new` lists each view in exactly those tiles' runs.
+#[test]
+fn view_tiles_cover_the_pixels_each_view_reads() {
+    let (stream, _, _) = setup();
+    let s = scan();
+    let [nyo, nxo] = s.d.obj.map(|n| n as usize);
+    let [nty, ntx] = s.d.tiles().map(|n| n as usize);
+    let side = OBJ_TILE as usize;
+    let mut runs = vec![Vec::new(); nty * ntx];
+    for (k, v) in s.views.iter().enumerate() {
+        let tiles: Vec<_> = view_tiles(&s.d, v).collect();
+        let mut once = tiles.clone();
+        once.sort();
+        once.dedup();
+        assert_eq!(once.len(), tiles.len(), "view {k} lists a tile twice");
+        for (y, x, _) in s.pixels() {
+            for (i, _) in s.corners(v, y, x) {
+                let (oy, ox) = (i / nxo % nyo, i % nxo);
+                let tile = [(oy / side) as u32, (ox / side) as u32];
+                assert!(
+                    tiles.contains(&tile),
+                    "view {k} reads ({oy}, {ox}) outside {tiles:?}"
+                );
+            }
+        }
+        for [ty, tx] in tiles {
+            runs[ty as usize * ntx + tx as usize].push(k as u32);
+        }
     }
-    let mut short = DeviceBuffer::<C32>::zeroed(&stream, s.nk(&(0..5)) * s.n() - 1).unwrap();
-    let r = k.obj_probe_to_psi(&stream, &views, 0..5, &obj, &probe, &mut short);
-    assert!(matches!(r, Err(Error::Shape(_))), "short psi");
+    let views = Views::new(&stream, s.d, &s.views).unwrap();
+    let start = views.tile_start().to_host_vec(&stream).unwrap();
+    let list = views.tile_views().to_host_vec(&stream).unwrap();
+    let len = views.tile_len().to_host_vec(&stream).unwrap();
+    for (t, run) in runs.iter().enumerate() {
+        let lo = start[t] as usize;
+        assert_eq!(&list[lo..lo + len[t] as usize], run, "tile {t}");
+    }
+}
+
+/// Every stack launch over one stack, on buffers it zeroes first.
+struct StackRun {
+    obj: DeviceBuffer<C32>,
+    probe: DeviceBuffer<C32>,
+    psi: DeviceBuffer<C32>,
+    icalc: DeviceBuffer<f32>,
+    llk: DeviceBuffer<LlkPartial>,
+    obj_sums: UpdateSums,
+    probe_sums: UpdateSums,
+}
+
+impl StackRun {
+    fn new(stream: &CudaStream, s: &Scan, nf_max: u32) -> Self {
+        let (nf, n) = (nf_max as usize, s.n());
+        Self {
+            obj: up(stream, &s.obj),
+            probe: up(stream, &s.probe),
+            psi: DeviceBuffer::zeroed(stream, s.nk(&(0..nf_max)) * n).unwrap(),
+            icalc: DeviceBuffer::zeroed(stream, nf * n).unwrap(),
+            llk: DeviceBuffer::zeroed(stream, nf).unwrap(),
+            obj_sums: UpdateSums::zeroed(stream, s.obj.len()).unwrap(),
+            probe_sums: UpdateSums::zeroed(stream, s.probe.len()).unwrap(),
+        }
+    }
+
+    fn run(
+        &mut self,
+        ctx: &ExecutionContext,
+        k: &Kernels,
+        views: &Views,
+        stack: StackRef<'_>,
+        counts: &DeviceBuffer<u16>,
+    ) -> Result<(), Error> {
+        ptyrs_gpu::zero(ctx, &mut self.psi)?;
+        ptyrs_gpu::zero(ctx, &mut self.icalc)?;
+        ptyrs_gpu::zero(ctx, &mut self.llk)?;
+        self.obj_sums.zero(ctx)?;
+        self.probe_sums.zero(ctx)?;
+        self.ops(ctx, k, views, stack, counts)
+    }
+
+    /// The stack launches alone, onto whatever the buffers hold.
+    fn ops(
+        &mut self,
+        ctx: &ExecutionContext,
+        k: &Kernels,
+        views: &Views,
+        stack: StackRef<'_>,
+        counts: &DeviceBuffer<u16>,
+    ) -> Result<(), Error> {
+        let (obj, probe) = (&self.obj, &self.probe);
+        let d = *views.dims();
+        k.obj_probe_to_psi(ctx, views, stack, obj, probe, &mut self.psi)?;
+        k.mode_intensity(ctx, &d, stack, &self.psi, &mut self.icalc)?;
+        k.llk(ctx, &d, stack, counts, &self.psi, &mut self.llk)?;
+        k.psi_to_obj(ctx, views, stack, &self.psi, probe, &mut self.obj_sums)?;
+        k.psi_to_probe(ctx, views, stack, &self.psi, obj, &mut self.probe_sums)?;
+        k.apply_amplitude(ctx, &d, stack, counts, &mut self.psi)
+    }
+
+    /// Fills every buffer the stack launches write with noise.
+    fn fill_noise(&mut self, stream: &CudaStream) {
+        let re =
+            |len: usize, seed| -> Vec<f32> { noise(len, seed, 1.0).iter().map(|c| c.re).collect() };
+        let sums = |len: usize, seed| {
+            let (num, den) = (
+                up(stream, &noise(len, seed, 1.0)),
+                up(stream, &re(len, seed + 1)),
+            );
+            UpdateSums::new(num, den, stream).unwrap()
+        };
+        let llk: Vec<_> = noise(2 * self.llk.len(), 3, 1.0)
+            .chunks(2)
+            .map(|c| LlkPartial {
+                poisson: c[0].re,
+                gaussian: c[0].im,
+                euclidean: c[1].re,
+                icalc: c[1].im,
+            })
+            .collect();
+        self.psi = up(stream, &noise(self.psi.len(), 1, 1.0));
+        self.icalc = up(stream, &re(self.icalc.len(), 2));
+        self.llk = up(stream, &llk);
+        self.obj_sums = sums(self.obj.len(), 4);
+        self.probe_sums = sums(self.probe.len(), 6);
+    }
+
+    fn bits(&self, stream: &CudaStream) -> Vec<u32> {
+        let c = |b: &DeviceBuffer<C32>| -> Vec<u32> {
+            let v = b.to_host_vec(stream).unwrap();
+            v.iter()
+                .flat_map(|c| [c.re, c.im])
+                .map(f32::to_bits)
+                .collect()
+        };
+        let f = |b: &DeviceBuffer<f32>| -> Vec<u32> {
+            let v = b.to_host_vec(stream).unwrap();
+            v.iter().map(|x| x.to_bits()).collect()
+        };
+        let llk = self.llk.to_host_vec(stream).unwrap();
+        let llk = llk
+            .iter()
+            .flat_map(|p| [p.poisson, p.gaussian, p.euclidean, p.icalc].map(f32::to_bits));
+        [
+            c(&self.psi),
+            f(&self.icalc),
+            llk.collect(),
+            c(&self.obj_sums.num),
+            f(&self.obj_sums.den),
+            c(&self.probe_sums.num),
+            f(&self.probe_sums.den),
+        ]
+        .concat()
+    }
+}
+
+/// A graph captured once on a device-written entry runs whichever stack the entry holds when
+/// it replays, bit for bit like eager launches on a host-made table, and an entry past
+/// `nf_max` or the scan is clamped.
+#[test]
+fn one_graph_runs_whichever_stack_its_entry_holds() {
+    let (stream, _, k) = setup();
+    let s = scan();
+    let views = Views::new(&stream, s.d, &s.views).unwrap();
+    let counts = up(&stream, &counts(s.d.nframe as usize * s.n()));
+    let host = StackTable::new(&stream, &s.d, &[0..3, 3..5, 1..4, 4..5]).unwrap();
+    let mut eager = StackRun::new(&stream, &s, host.nf_max());
+    let mut want: Vec<_> = (0..host.len())
+        .map(|i| {
+            record(|ctx| eager.run(ctx, &k, &views, host.at(i), &counts))
+                .sync_on(&stream)
+                .unwrap();
+            eager.bits(&stream)
+        })
+        .collect();
+    // f0 past the scan: no frames.
+    want.push(vec![0; want[0].len()]);
+
+    let dev = StackTable::device(&stream, &s.d, 3).unwrap();
+    let mut it = StackRun::new(&stream, &s, dev.nf_max());
+    let side = k.context().new_stream().unwrap();
+    let graph = CudaGraph::capture(
+        side.clone(),
+        record(|ctx| it.run(ctx, &k, &views, dev.at(0), &counts)),
+    )
+    .unwrap();
+    let entries = [(0, 3), (3, 2), (1, 3), (4, 3), (9, 2)];
+    for ((f0, nf), want) in entries.into_iter().zip(&want) {
+        let ctl = [StackCtl { f0, nf }];
+        k.context().bind_to_thread().unwrap();
+        // SAFETY: `dev` holds one entry; no work on it is in flight.
+        unsafe { cuda_core::memory::memcpy_htod_sync(dev.ptr(), ctl.as_ptr(), 8) }.unwrap();
+        graph.launch().sync_on(&side).unwrap();
+        assert!(
+            it.bits(&stream) == *want,
+            "entry {{ f0: {f0}, nf: {nf} }} differs from eager"
+        );
+    }
+}
+
+/// A captured stack replayed against an entry with `nf == 0` leaves every buffer it writes
+/// as it was, bit for bit, wherever the entry's `f0` points; with `nf == 1` it does not.
+#[test]
+fn empty_stack_replay_writes_nothing() {
+    let (stream, _, k) = setup();
+    let s = scan();
+    let views = Views::new(&stream, s.d, &s.views).unwrap();
+    let counts = up(&stream, &counts(s.d.nframe as usize * s.n()));
+    let dev = StackTable::device(&stream, &s.d, 3).unwrap();
+    let mut it = StackRun::new(&stream, &s, dev.nf_max());
+    it.fill_noise(&stream);
+    let side = k.context().new_stream().unwrap();
+    let graph = CudaGraph::capture(
+        side.clone(),
+        record(|ctx| it.ops(ctx, &k, &views, dev.at(0), &counts)),
+    )
+    .unwrap();
+    let start = it.bits(&stream);
+    for (f0, nf, empty) in [(2, 0, true), (0, 0, true), (4, 0, true), (2, 1, false)] {
+        let ctl = [StackCtl { f0, nf }];
+        k.context().bind_to_thread().unwrap();
+        // SAFETY: `dev` holds one entry; no work on it is in flight.
+        unsafe { cuda_core::memory::memcpy_htod_sync(dev.ptr(), ctl.as_ptr(), 8) }.unwrap();
+        graph.launch().sync_on(&side).unwrap();
+        assert_eq!(
+            it.bits(&stream) == start,
+            empty,
+            "entry {{ f0: {f0}, nf: {nf} }}"
+        );
+    }
+}
+
+/// One graph of `bin_views`, replayed over a device entry holding the stacks in ascending
+/// frame order, leaves in each tile slab the packed run of `Views::new` cut to the slab's
+/// capacity, with the cut views counted in `overflow` and the slots past the run untouched;
+/// a replay with `nf == 0` changes nothing.
+#[test]
+fn bin_views_appends_each_stack_to_the_tile_slabs() {
+    let (stream, _, k) = setup();
+    // 12 frames of 4 views: the 9-frame stack has 36, more than one warp ballot.
+    let base = scan();
+    let d = ViewDims {
+        nframe: 12,
+        ..base.d
+    };
+    let offsets: Vec<_> = (0..12)
+        .map(|f| {
+            let (oy, ox, fy, fx): (u32, u32, f32, f32) = [
+                (0, 0, 0.0, 0.0),
+                (25, 28, 0.25, 0.0),
+                (13, 7, 0.0, 0.7),
+                (26, 27, 0.0, 0.9),
+                (5, 20, 0.5, 0.5),
+            ][f % 5];
+            let back = (f / 5) as u32;
+            (
+                oy.saturating_sub(3 * back),
+                ox.saturating_sub(4 * back),
+                fy,
+                fx,
+            )
+        })
+        .collect();
+    let s = Scan::new(d, &offsets, 1.0);
+    let packed = Views::new(&stream, d, &s.views).unwrap();
+    let pstart = packed.tile_start().to_host_vec(&stream).unwrap();
+    let plen = packed.tile_len().to_host_vec(&stream).unwrap();
+    let plist = packed.tile_views().to_host_vec(&stream).unwrap();
+    let ntiles = plen.len();
+    let full = *plen.iter().max().unwrap();
+    let dev = StackTable::device(&stream, &d, 9).unwrap();
+    let side = k.context().new_stream().unwrap();
+    for cap in [full, full - 1] {
+        let slot_start: Vec<u32> = (0..=ntiles as u32).map(|t| t * cap).collect();
+        let unset = vec![u32::MAX; ntiles * cap as usize];
+        // SAFETY: empty runs; `bin_views` fills them in ascending frame order.
+        let mut views = unsafe {
+            Views::from_parts(
+                d,
+                up(&stream, &s.views),
+                up(&stream, &slot_start),
+                up(&stream, &unset),
+                up(&stream, &vec![0u32; ntiles]),
+            )
+        }
+        .unwrap();
+        let mut overflow = up(&stream, &[0u32]);
+        let graph = CudaGraph::capture(
+            side.clone(),
+            record(|ctx| k.bin_views(ctx, &mut views, dev.at(0), &mut overflow)),
+        )
+        .unwrap();
+        let state = |views: &Views, overflow: &DeviceBuffer<u32>| {
+            (
+                views.tile_len().to_host_vec(&stream).unwrap(),
+                views.tile_views().to_host_vec(&stream).unwrap(),
+                overflow.to_host_vec(&stream).unwrap()[0],
+            )
+        };
+        let mut before = state(&views, &overflow);
+        let mut kend = 0;
+        // (12, 3) clamps to no frames.
+        for (f0, nf) in [(0, 0), (0, 2), (5, 0), (2, 9), (11, 0), (11, 1), (12, 3)] {
+            let ctl = [StackCtl { f0, nf }];
+            k.context().bind_to_thread().unwrap();
+            // SAFETY: `dev` holds one entry; no work on it is in flight.
+            unsafe { cuda_core::memory::memcpy_htod_sync(dev.ptr(), ctl.as_ptr(), 8) }.unwrap();
+            graph.launch().sync_on(&side).unwrap();
+            let got = state(&views, &overflow);
+            let what = format!("cap {cap}, entry {{ f0: {f0}, nf: {nf} }}");
+            if nf == 0 || f0 >= d.nframe {
+                assert!(got == before, "{what} changed the slabs");
+                continue;
+            }
+            kend = (f0 + nf) * d.nmode;
+            let (len, list, cut) = &got;
+            let mut want_cut = 0;
+            for t in 0..ntiles {
+                let run = &plist[pstart[t] as usize..][..plen[t] as usize];
+                let want: Vec<u32> = run.iter().copied().filter(|&v| v < kend).collect();
+                let kept = want.len().min(cap as usize);
+                want_cut += want.len() - kept;
+                let slab = &list[t * cap as usize..][..cap as usize];
+                assert_eq!(len[t] as usize, kept, "{what}: tile {t} length");
+                assert_eq!(&slab[..kept], &want[..kept], "{what}: tile {t} run");
+                assert!(
+                    slab[kept..].iter().all(|&v| v == u32::MAX),
+                    "{what}: tile {t} wrote past its run"
+                );
+            }
+            assert_eq!(*cut as usize, want_cut, "{what}: overflow");
+            before = got;
+        }
+        assert_eq!(kend, d.nframe * d.nmode, "every frame binned");
+        assert_eq!(before.2 > 0, cap < full, "cap {cap}: overflow");
+    }
+}
+
+/// Side of the square image the line FFTs and the `Plan2d` of [`Iteration`] round-trip.
+const AUX: u32 = 128;
+
+/// State that one call of every launch method updates in place.
+struct Iteration {
+    obj: DeviceBuffer<C32>,
+    probe: DeviceBuffer<C32>,
+    psi: DeviceBuffer<C32>,
+    po: DeviceBuffer<C32>,
+    icalc: DeviceBuffer<f32>,
+    llk: DeviceBuffer<LlkPartial>,
+    obj_sums: UpdateSums,
+    probe_sums: UpdateSums,
+    aux: DeviceBuffer<C32>,
+    tmp: DeviceBuffer<C32>,
+    plan: Plan2d,
+    stacks: StackTable,
+}
+
+impl Iteration {
+    fn new(stream: &CudaStream, s: &Scan) -> Self {
+        let (nf, n) = (s.d.nframe as usize, s.n());
+        let nk = s.nk(&(0..s.d.nframe)) * n;
+        let aux = (AUX * AUX) as usize;
+        Self {
+            obj: up(stream, &s.obj),
+            probe: up(stream, &s.probe),
+            psi: up(stream, &noise(nk, 50, 1.0)),
+            po: DeviceBuffer::zeroed(stream, nk).unwrap(),
+            icalc: DeviceBuffer::zeroed(stream, nf * n).unwrap(),
+            llk: DeviceBuffer::zeroed(stream, nf).unwrap(),
+            obj_sums: UpdateSums::zeroed(stream, s.obj.len()).unwrap(),
+            probe_sums: UpdateSums::zeroed(stream, s.probe.len()).unwrap(),
+            aux: up(stream, &noise(aux, 51, 1.0)),
+            tmp: DeviceBuffer::zeroed(stream, aux).unwrap(),
+            plan: Plan2d::new(stream, AUX as usize, 1).unwrap(),
+            stacks: one_stack(stream, &s.d, 0..s.d.nframe),
+        }
+    }
+
+    /// A DM iteration, then 2D FFT round trips of `aux` through the line kernels and through
+    /// every `Plan2d` transform.
+    fn run(
+        &mut self,
+        ctx: &ExecutionContext,
+        k: &Kernels,
+        views: &Views,
+        counts: &DeviceBuffer<u16>,
+    ) -> Result<(), Error> {
+        let d = *views.dims();
+        let stack = self.stacks.at(0);
+        let nk = self.psi.len() as u32;
+        self.obj_sums.zero(ctx)?;
+        self.probe_sums.zero(ctx)?;
+        k.obj_probe_to_psi(ctx, views, stack, &self.obj, &self.probe, &mut self.po)?;
+        k.dm_reflect(ctx, &mut self.psi, &mut self.po, nk, 0.02)?;
+        k.mode_intensity(ctx, &d, stack, &self.psi, &mut self.icalc)?;
+        k.llk(ctx, &d, stack, counts, &self.psi, &mut self.llk)?;
+        k.apply_amplitude(ctx, &d, stack, counts, &mut self.psi)?;
+        k.add_c32(ctx, &mut self.psi, &self.po, nk)?;
+        k.psi_to_obj(
+            ctx,
+            views,
+            stack,
+            &self.psi,
+            &self.probe,
+            &mut self.obj_sums,
+        )?;
+        k.psi_to_probe(
+            ctx,
+            views,
+            stack,
+            &self.psi,
+            &self.obj,
+            &mut self.probe_sums,
+        )?;
+        let np = self.probe.len() as u32;
+        k.update_obj_from_sums(ctx, views, &mut self.obj, &mut self.obj_sums, 0.01)?;
+        k.update_from_sums(ctx, &mut self.probe, &mut self.probe_sums, np, 0.01)?;
+
+        let rows = Lines {
+            n: AUX,
+            count: AUX,
+            line_stride: AUX,
+            elem_stride: 1,
+        };
+        let cols = Lines {
+            line_stride: 1,
+            elem_stride: AUX,
+            ..rows
+        };
+        k.fft_lines(ctx, &self.aux, &mut self.tmp, rows, false)?;
+        k.fft_lines_inplace(ctx, &mut self.tmp, cols, false)?;
+        k.fft_lines(ctx, &self.tmp, &mut self.aux, rows, true)?;
+        k.fft_lines_inplace(ctx, &mut self.aux, cols, true)?;
+        k.scale_c32(ctx, &mut self.aux, AUX * AUX, 1.0 / (AUX * AUX) as f32)?;
+
+        self.plan.forward(ctx, &self.aux, &mut self.tmp)?;
+        self.plan.inverse_inplace(ctx, &mut self.tmp)?;
+        self.plan.forward_inplace(ctx, &mut self.tmp)?;
+        self.plan.inverse(ctx, &self.tmp, &mut self.aux)?;
+        let n4 = ((AUX * AUX) as f32).powi(2);
+        k.scale_c32(ctx, &mut self.aux, AUX * AUX, 1.0 / n4)
+    }
+
+    /// The bits of every buffer `run` writes.
+    fn bits(&self, stream: &CudaStream) -> Vec<Vec<u32>> {
+        let c = |b: &DeviceBuffer<C32>| {
+            b.to_host_vec(stream)
+                .unwrap()
+                .iter()
+                .flat_map(|c| [c.re.to_bits(), c.im.to_bits()])
+                .collect()
+        };
+        let f = |b: &DeviceBuffer<f32>| {
+            b.to_host_vec(stream)
+                .unwrap()
+                .iter()
+                .map(|x| x.to_bits())
+                .collect()
+        };
+        let llk = self.llk.to_host_vec(stream).unwrap();
+        vec![
+            c(&self.obj),
+            c(&self.probe),
+            c(&self.psi),
+            c(&self.po),
+            f(&self.icalc),
+            llk.iter()
+                .flat_map(|p| [p.poisson, p.gaussian, p.euclidean, p.icalc].map(f32::to_bits))
+                .collect(),
+            c(&self.obj_sums.num),
+            f(&self.obj_sums.den),
+            c(&self.probe_sums.num),
+            f(&self.probe_sums.den),
+            c(&self.aux),
+            c(&self.tmp),
+        ]
+    }
+}
+
+#[test]
+fn captured_iteration_replays_bitwise_like_eager() {
+    let (stream, _, k) = setup();
+    let s = scan();
+    let views = Views::new(&stream, s.d, &s.views).unwrap();
+    let counts = up(&stream, &counts(s.d.nframe as usize * s.n()));
+
+    let mut eager = Iteration::new(&stream, &s);
+    let start = eager.bits(&stream);
+    let want: Vec<_> = (0..4)
+        .map(|_| {
+            record(|ctx| eager.run(ctx, &k, &views, &counts))
+                .sync_on(&stream)
+                .unwrap();
+            eager.bits(&stream)
+        })
+        .collect();
+    assert!(
+        want.iter()
+            .flatten()
+            .flatten()
+            .all(|&b| f32::from_bits(b).is_finite()),
+        "eager state went non-finite"
+    );
+    assert!(
+        want[0][0] != want[1][0],
+        "a second iteration must move the object"
+    );
+
+    let mut it = Iteration::new(&stream, &s);
+    let side = k.context().new_stream().unwrap();
+    let graph =
+        CudaGraph::capture(side.clone(), record(|ctx| it.run(ctx, &k, &views, &counts))).unwrap();
+    assert!(
+        it.bits(&stream) == start,
+        "capture must not execute the work"
+    );
+    for (replay, want) in want[..2].iter().enumerate() {
+        graph.launch().sync_on(&side).unwrap();
+        assert!(
+            it.bits(&stream) == *want,
+            "replay {replay} differs from eager"
+        );
+    }
+
+    // A replay holds its accesses until it completes: another stream can neither write
+    // `obj`, which the graph reads, nor read `icalc`, which it only writes, nor run the
+    // plan, whose work area the graph writes.
+    let replay = ExecutionContext::new(side.clone());
+    // SAFETY: `replay` keeps the launch's leases until `side` is synchronized below, and
+    // those leases refuse every other access to the buffers until then.
+    unsafe { graph.launch().execute(&replay) }.unwrap();
+    let other = ExecutionContext::new(stream.clone());
+    let not_ready = cuda_core::sys::cudaError_enum_CUDA_ERROR_NOT_READY;
+    let refused = k.scale_c32(&other, &mut it.obj, 1, 1.0);
+    assert!(
+        matches!(refused, Err(Error::Device(DeviceError::Driver(DriverError(e)))) if e == not_ready),
+        "{refused:?}"
+    );
+    let refused = it.icalc.to_host_vec(&stream);
+    assert!(
+        matches!(refused, Err(DriverError(e)) if e == not_ready),
+        "{refused:?}"
+    );
+    let (a, mut b) = (
+        DeviceBuffer::<C32>::zeroed(&stream, it.aux.len()).unwrap(),
+        DeviceBuffer::<C32>::zeroed(&stream, it.aux.len()).unwrap(),
+    );
+    let refused = it.plan.forward(&other, &a, &mut b);
+    assert!(
+        matches!(refused, Err(FftError::Device(DeviceError::Driver(DriverError(e)))) if e == not_ready),
+        "{refused:?}"
+    );
+    side.synchronize().unwrap();
+    drop(replay);
+    assert!(
+        it.bits(&stream) == want[2],
+        "in-flight replay differs from eager"
+    );
+
+    // After the replays, the buffers are ordinary eager buffers again.
+    record(|ctx| it.run(ctx, &k, &views, &counts))
+        .sync_on(&stream)
+        .unwrap();
+    assert!(
+        it.bits(&stream) == want[3],
+        "eager run after replays differs"
+    );
 }

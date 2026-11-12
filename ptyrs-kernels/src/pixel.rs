@@ -17,7 +17,8 @@ pub const MASKED: u16 = u16::MAX;
 
 /// One exit-wave view (PyNX `cx, cy` + `_obj_psidx`, `_probe_psidx`): probe mode `probe`
 /// times object mode `obj` sampled at `(oy + fy + pry, ox + fx + prx)` for probe pixel
-/// `(pry, prx)`. `oy + ny <= nyo`, `ox + nx <= nxo`, `fy`, `fx` in `[0, 1)`.
+/// `(pry, prx)`. `fy`, `fx` in `[0, 1)`; `oy + ny + (fy > 0) <= nyo` and `ox + nx + (fx > 0)
+/// <= nxo`, so every object pixel a sample reads lies inside the object.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct ViewAddr {
@@ -32,20 +33,49 @@ pub struct ViewAddr {
 // SAFETY: repr(C) of four u32 and two f32, no padding; every bit pattern is a valid value.
 unsafe impl cuda_core::DeviceCopy for ViewAddr {}
 
-/// What a view kernel needs besides its buffers, passed by value: the stack's views
-/// `k0 .. k0 + nk`, the frame `[ny, nx]`, the object `[nyo, nxo]`, the probe mode count and
-/// the far-field phase `quad` (radians per squared pixel).
+/// The frames `f0 .. f0 + nf` of one stack. A kernel reads it from device memory when it
+/// runs, so one launch, or one captured graph, serves whichever stack the entry holds then;
+/// with `nf == 0` it writes nothing.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct StackCtl {
+    pub f0: u32,
+    pub nf: u32,
+}
+
+// SAFETY: repr(C) of two u32, no padding; every bit pattern is a valid value.
+unsafe impl cuda_core::DeviceCopy for StackCtl {}
+
+/// What a stack kernel needs besides its buffers and [`StackCtl`], passed by value: the
+/// scan's `nframe` and `nmode`, `nf_max` (the most frames a stack may have, which sizes the
+/// launch and the per-stack buffers), the probe mode count, the frame `[ny, nx]`, the object
+/// `[nyo, nxo]` and the far-field phase `quad` (radians per squared pixel).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct StackGeom {
-    pub k0: u32,
-    pub nk: u32,
+    pub nframe: u32,
+    pub nf_max: u32,
+    pub nmode: u32,
     pub nprobe: u32,
     pub ny: u32,
     pub nx: u32,
     pub nyo: u32,
     pub nxo: u32,
     pub quad: f32,
+}
+
+/// `(f0, nf)` of the stack `ctl` holds, clamped to `nf <= nf_max` and `f0 + nf <= nframe`:
+/// the one place a kernel reads a [`StackCtl`], so no entry, however written, makes a launch
+/// address past its per-stack buffers or the scan.
+///
+/// # Safety
+///
+/// `ctl` must point to a readable `StackCtl`.
+#[device]
+pub unsafe fn stack_frames(ctl: *const StackCtl, g: StackGeom) -> (u32, u32) {
+    let c = unsafe { *ctl };
+    let f0 = c.f0.min(g.nframe);
+    (f0, c.nf.min(g.nf_max).min(g.nframe - f0))
 }
 
 /// Device addresses of an update's numerator (complex, interleaved) and denominator (real);
@@ -55,6 +85,56 @@ pub struct StackGeom {
 pub struct SumPtrs {
     pub num: *mut f32,
     pub den: *mut f32,
+}
+
+// An object tile is one block of the object kernels and of the reductions.
+const _: () = assert!(OBJ_TILE * OBJ_TILE == PIXEL_THREADS);
+
+/// Threads of a warp; `bin_views` runs one warp per object tile.
+pub const WARP: u32 = 32;
+// A 1D launch's warps lie whole in its blocks.
+const _: () = assert!(PIXEL_THREADS.is_multiple_of(WARP));
+
+/// Device addresses of the per-object-tile view lists: tile `t`'s run is
+/// `views[start[t] .. start[t] + len[t]]`, ascending view indices, `len[t] <=
+/// start[t + 1] - start[t]`. No kernel reads or writes the object or sum pixels of a tile
+/// with `len[t] == 0`, nor its run.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct TilePtrs {
+    pub start: *const u32,
+    pub len: *const u32,
+    pub views: *const u32,
+}
+
+/// Tile `t`'s run `lo .. end` of `tiles.views`.
+///
+/// # Safety
+///
+/// `tiles.start` and `tiles.len` must hold entry `t`.
+#[device]
+pub unsafe fn tile_run(tiles: TilePtrs, t: usize) -> (u32, u32) {
+    let lo = unsafe { *tiles.start.add(t) };
+    (lo, lo + unsafe { *tiles.len.add(t) })
+}
+
+/// [`TilePtrs`] with the runs writable, for `bin_views` to append to: tile `t`'s slab is
+/// `views[start[t] .. start[t + 1]]`, its run the first `len[t]` slots.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct TileSlabs {
+    pub start: *const u32,
+    pub len: *mut u32,
+    pub views: *mut u32,
+}
+
+/// First and last object tile, of `OBJ_TILE` pixels, holding an object pixel that a view's
+/// samples read along one axis: offsets `o .. o + len`, and the bilinear `+ 1` neighbour of
+/// the last when `f > 0`. The host tile lists and `bin_views` both bin by this rule.
+#[device]
+pub fn axis_tiles(o: u32, len: u32, f: f32) -> (u32, u32) {
+    let last = if f > 0.0 { o + len } else { o + len - 1 };
+    (o / OBJ_TILE, last / OBJ_TILE)
 }
 
 /// Per-frame log-likelihood sums over the frame's unmasked pixels (PyNX `LLKAll`).
@@ -131,13 +211,13 @@ pub fn bilinear_weights(fy: f32, fx: f32) -> [f32; 4] {
 }
 
 /// Object value probe pixel `(pry, prx)` of view `v` sees: bilinear over the object pixels
-/// `(oy + pry + {0, 1}, ox + prx + {0, 1})`, the `+ 1` neighbours wrapped periodically
-/// (PyNX `bilinear`). Corners whose weight is zero (`fy == 0` or `fx == 0`) are not read.
+/// `(oy + pry + {0, 1}, ox + prx + {0, 1})` (PyNX `bilinear`, on an object sized so that it
+/// never wraps). Corners whose weight is zero (`fy == 0` or `fx == 0`) are not read.
 ///
 /// # Safety
 ///
-/// `obj` must hold `[nobj, nyo, nxo]` with `v.obj < nobj`, `v.oy + pry < nyo` and
-/// `v.ox + prx < nxo`.
+/// `obj` must hold `[nobj, nyo, nxo]` with `v.obj < nobj`, `v.oy + pry + (v.fy > 0) < nyo`
+/// and `v.ox + prx + (v.fx > 0) < nxo`.
 #[device]
 pub unsafe fn sample_obj(
     obj: *const f32,
@@ -150,8 +230,7 @@ pub unsafe fn sample_obj(
     let plane = v.obj as usize * nyo as usize * nxo as usize;
     let y0 = v.oy + pry;
     let x0 = v.ox + prx;
-    let y1 = if y0 + 1 == nyo { 0 } else { y0 + 1 };
-    let x1 = if x0 + 1 == nxo { 0 } else { x0 + 1 };
+    let (y1, x1) = (y0 + 1, x0 + 1);
     let w = bilinear_weights(v.fy, v.fx);
     let at = |y: u32, x: u32| plane + y as usize * nxo as usize + x as usize;
     unsafe {
@@ -183,15 +262,13 @@ pub fn obj_pixel_sources(
     x: u32,
     ny: u32,
     nx: u32,
-    nyo: u32,
-    nxo: u32,
 ) -> [Option<(u32, u32, f32)>; 4] {
     // Row offset of `y` in the view (`y0 = oy + pry`), and of the row whose `+ 1`
-    // neighbour is `y`; likewise for columns.
-    let r = (y + nyo - v.oy) % nyo;
-    let c = (x + nxo - v.ox) % nxo;
-    let rm = if r == 0 { nyo - 1 } else { r - 1 };
-    let cm = if c == 0 { nxo - 1 } else { c - 1 };
+    // neighbour is `y`; likewise for columns. An offset below zero wraps past every frame
+    // side, so `pick` drops it.
+    let r = y.wrapping_sub(v.oy);
+    let c = x.wrapping_sub(v.ox);
+    let (rm, cm) = (r.wrapping_sub(1), c.wrapping_sub(1));
     let w = bilinear_weights(v.fy, v.fx);
     let pick = |pry: u32, prx: u32, wt: f32, used: bool| {
         if used && pry < ny && prx < nx {
