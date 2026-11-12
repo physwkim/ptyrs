@@ -703,8 +703,9 @@ fn object_update_split_takes_the_max_it_is_given() {
     );
 }
 
-/// [`Views::from_parts`] over slabs with padding past each run (the live layout) gives the
-/// bits of the packed lists: a run ends at its length, not at the next tile's start.
+/// [`Views::from_parts`] over slabs with spare slots past each run (the live layout), its
+/// runs empty until `bin_views` fills them stack by stack, gets the runs and the bits of the
+/// packed lists: a run ends at its length, not at the next tile's start.
 #[test]
 fn views_over_padded_slabs_match_packed_lists() {
     let (stream, ex, k) = setup();
@@ -713,27 +714,41 @@ fn views_over_padded_slabs_match_packed_lists() {
     let start = packed.tile_start().to_host_vec(&stream).unwrap();
     let len = packed.tile_len().to_host_vec(&stream).unwrap();
     let list = packed.tile_views().to_host_vec(&stream).unwrap();
-    let cap = *len.iter().max().unwrap() as usize + 2;
-    // Padding names view 0, which touches tile 0: read, it would add to the sums.
-    let mut slab = vec![0u32; len.len() * cap];
-    for (t, &l) in len.iter().enumerate() {
-        let run = &list[start[t] as usize..][..l as usize];
-        slab[t * cap..][..run.len()].copy_from_slice(run);
-    }
-    let slab_start: Vec<u32> = (0..=len.len()).map(|t| (t * cap) as u32).collect();
-    // SAFETY: the runs are those of `Views::new` for these views, each within its slab.
-    let slabs = unsafe {
+    let ntiles = len.len();
+    let cap = *len.iter().max().unwrap() + 2;
+    // Spare slots name view 0, which touches tile 0: read, it would add to the sums.
+    // SAFETY: the views pass `Views::new`'s checks; the slabs are one whole buffer.
+    let mut slabs = unsafe {
         Views::from_parts(
+            &stream,
             s.d,
             up(&stream, &s.views),
-            up(&stream, &slab_start),
-            up(&stream, &slab),
-            up(&stream, &len),
+            up(&stream, &vec![0u32; ntiles * cap as usize]),
+            cap,
         )
     }
     .unwrap();
+    let slab_start: Vec<u32> = (0..=ntiles as u32).map(|t| t * cap).collect();
+    assert_eq!(slabs.tile_start().to_host_vec(&stream).unwrap(), slab_start);
+    assert_eq!(
+        slabs.tile_len().to_host_vec(&stream).unwrap(),
+        vec![0; ntiles]
+    );
 
     let table = StackTable::new(&stream, &s.d, &[0..2, 2..5]).unwrap();
+    let mut overflow = up(&stream, &[0u32]);
+    for i in 0..table.len() {
+        k.bin_views(&ex, &mut slabs, table.at(i), &mut overflow)
+            .unwrap();
+    }
+    assert_eq!(slabs.tile_len().to_host_vec(&stream).unwrap(), len);
+    let slab = slabs.tile_views().to_host_vec(&stream).unwrap();
+    for t in 0..ntiles {
+        let run = |list: &[u32], at: u32| list[at as usize..][..len[t] as usize].to_vec();
+        assert_eq!(run(&slab, slab_start[t]), run(&list, start[t]), "tile {t}");
+    }
+    assert_eq!(overflow.to_host_vec(&stream).unwrap(), [0]);
+
     let probe = up(&stream, &s.probe);
     let psi = up(&stream, &noise(s.nk(&(0..5)) * s.n(), 4, 1.0));
     let mut out = Vec::new();
@@ -751,21 +766,28 @@ fn views_over_padded_slabs_match_packed_lists() {
     assert!(out[0] == out[1], "slab views differ from packed views");
     assert!(out[0] != c32_bits(&s.obj), "the update moved nothing");
 
-    let short = |n: usize| DeviceBuffer::<u32>::zeroed(&stream, n).unwrap();
-    // SAFETY: rejected before any launch.
-    let r = unsafe {
+    // SAFETY: each is rejected before any launch.
+    let parts = |nview: usize, nslot: usize, cap: u32| unsafe {
         Views::from_parts(
+            &stream,
             s.d,
-            up(&stream, &s.views),
-            short(len.len()),
-            short(1),
-            short(len.len()),
+            up(&stream, &s.views[..nview]),
+            DeviceBuffer::<u32>::zeroed(&stream, nslot).unwrap(),
+            cap,
         )
     };
-    assert!(
-        matches!(r, Err(Error::Shape(_))),
-        "tile_start without its end"
-    );
+    let nview = s.views.len();
+    let rejected = [
+        (
+            "records short",
+            parts(nview - 1, ntiles * cap as usize, cap),
+        ),
+        ("slabs short", parts(nview, ntiles * cap as usize - 1, cap)),
+        ("slots past u32", parts(nview, 1, u32::MAX)),
+    ];
+    for (what, r) in rejected {
+        assert!(matches!(r, Err(Error::Shape(_))), "{what}");
+    }
 }
 
 /// Scan counts: every 7th pixel masked, every 5th of the rest zero, others 1..=60.
@@ -1540,17 +1562,10 @@ fn bin_views_appends_each_stack_to_the_tile_slabs() {
     let dev = StackTable::device(&stream, &d, 9).unwrap();
     let side = k.context().new_stream().unwrap();
     for cap in [full, full - 1] {
-        let slot_start: Vec<u32> = (0..=ntiles as u32).map(|t| t * cap).collect();
         let unset = vec![u32::MAX; ntiles * cap as usize];
-        // SAFETY: empty runs; `bin_views` fills them in ascending frame order.
+        // SAFETY: the views pass `Views::new`'s checks; the slabs are one whole buffer.
         let mut views = unsafe {
-            Views::from_parts(
-                d,
-                up(&stream, &s.views),
-                up(&stream, &slot_start),
-                up(&stream, &unset),
-                up(&stream, &vec![0u32; ntiles]),
-            )
+            Views::from_parts(&stream, d, up(&stream, &s.views), up(&stream, &unset), cap)
         }
         .unwrap();
         let mut overflow = up(&stream, &[0u32]);
@@ -1668,14 +1683,14 @@ fn reorder_views_by_a_permutation_and_its_inverse_restores_the_views() {
     let ntiles = wlen.len();
     let cap = wlen.iter().max().unwrap() + 3;
     let start: Vec<u32> = (0..=ntiles as u32).map(|t| t * cap).collect();
-    // SAFETY: empty runs, which `bin_views` fills with the one stack of every frame.
+    // SAFETY: the views pass `Views::new`'s checks; the slabs are one whole buffer.
     let mut slab = unsafe {
         Views::from_parts(
+            &stream,
             d,
             up(&stream, &s.views),
-            up(&stream, &start),
             up(&stream, &vec![u32::MAX; ntiles * cap as usize]),
-            up(&stream, &vec![0u32; ntiles]),
+            cap,
         )
     }
     .unwrap();

@@ -368,37 +368,38 @@ impl Views {
         })
     }
 
-    /// Views over device storage the caller keeps filling, e.g. through
-    /// [`Kernels::bin_views`] into a slab of `tile_cap` slots per tile (`tile_start[t] = t *
-    /// tile_cap`) with `tile_len` starting zeroed. Checks `dims`
-    /// and that `addr` holds `nframe * nmode` records, `tile_start` `ntiles + 1` and
-    /// `tile_len` `ntiles` entries.
+    /// Views over device storage the caller keeps filling and backing: `addr` takes the
+    /// records of frames as they land, and `tile_views` holds `ntiles` slabs of `cap` slots,
+    /// tile `t`'s from slot `t * cap`. Every run starts empty; only binning
+    /// ([`Kernels::bin_views`], [`Kernels::reorder_views`]) writes runs. Checks `dims`, that
+    /// `addr` holds `nframe * nmode` records and `tile_views` `ntiles * cap` slots.
     ///
     /// # Safety
     ///
-    /// Whenever a launch reads them: `tile_start` is ascending with `tile_start[ntiles] <=
-    /// tile_views.len()`; `tile_len[t] <= tile_start[t + 1] - tile_start[t]`; each run holds
-    /// ascending indices of views that may touch the tile, every view of the launch's stack
-    /// that does among them; and every view the launch reads passes the checks of
-    /// [`Self::new`].
+    /// Whenever a launch runs, every record it reads passes the checks of [`Self::new`], and
+    /// the slab of every tile those views touch is device memory; a launch touches no other
+    /// slab.
     pub unsafe fn from_parts(
+        stream: &CudaStream,
         dims: ViewDims,
         addr: DeviceBuffer<ViewAddr>,
-        tile_start: DeviceBuffer<u32>,
         tile_views: DeviceBuffer<u32>,
-        tile_len: DeviceBuffer<u32>,
+        cap: u32,
     ) -> Result<Self, Error> {
         dims.check()?;
         let ntiles = dims.ntiles();
         check_len("addr", &addr, dims.nframe as usize * dims.nmode as usize)?;
-        check_len("tile_start", &tile_start, ntiles + 1)?;
-        check_len("tile_len", &tile_len, ntiles)?;
+        let start = (0..=ntiles as u64)
+            .map(|t| u32::try_from(t * u64::from(cap)))
+            .collect::<Result<Vec<u32>, _>>()
+            .map_err(|_| Error::Shape(format!("{ntiles} slabs of {cap} slots overflow u32")))?;
+        check_len("tile_views", &tile_views, start[ntiles] as usize)?;
         Ok(Self {
             dims,
             addr,
-            tile_start,
+            tile_start: DeviceBuffer::from_host(stream, &start)?,
             tile_views,
-            tile_len,
+            tile_len: DeviceBuffer::zeroed(stream, ntiles)?,
         })
     }
 
@@ -812,9 +813,10 @@ impl Kernels {
     }
 
     /// Appends the stack's views to the tile lists: each view of frames `f0 .. f0 + nf` goes
-    /// after the run of every tile [`view_tiles`] lists it in, in ascending view order, so
-    /// runs stay ascending while stacks are binned once each in ascending frame order (the
-    /// order [`Views::from_parts`] requires of them). A view whose tile's slab
+    /// after the run of every tile [`view_tiles`] lists it in, in ascending view order.
+    /// Stacks binned once each in ascending frame order leave the runs [`Views::new`] makes
+    /// of the frames binned; in any other order the launches stay in bounds, but the runs
+    /// and what the passes add over them are unspecified. A view whose tile's slab
     /// `tile_start[t] .. tile_start[t + 1]` is full is not written and adds 1 to
     /// `overflow[0]`. A stack with `nf == 0` writes nothing.
     pub fn bin_views(
@@ -840,8 +842,9 @@ impl Kernels {
         ];
         let slabs = views.tile_slabs();
         self.launch(ctx, &reads, &writes, |stream| {
-            // SAFETY: `Views::new` or the `from_parts` contract keeps the views inside the
-            // object and each run within its slab; `overflow` holds one u32.
+            // SAFETY: `Views::new` or the `from_parts` contract keeps the stack's views
+            // inside the object; every constructor leaves each run within its slab, and
+            // binning keeps it there; `overflow` holds one u32.
             unsafe {
                 self.module.bin_views(
                     stream,
