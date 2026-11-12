@@ -43,6 +43,7 @@ use crate::pos::PosTable;
 use crate::pv_out::{AmpPhase, PvOut, publish};
 use crate::pva_source::{NtndFrames, PosStats, monitor_positions};
 use crate::ring::{DeviceStore, Ring, UploaderConfig, run_uploader};
+use crate::sched::FairSched;
 use crate::stats::{mono_ns, process_cpu_ns, wall_ns};
 use crate::swmr::{SwmrCfg, SwmrReport, run_swmr};
 use crate::synth::Region;
@@ -93,6 +94,8 @@ pub struct RecvCfg {
     /// CPU list (`2-23,48-71`) the threads are pinned to; unpinned when unset.
     pub cpus: Option<String>,
     pub util_min: u32,
+    /// EEVDF slice of the placed threads; 0 keeps the kernel's.
+    pub slice_us: u64,
     /// Stop once no frame arrived for this long.
     pub idle_ms: i64,
     /// Stop if no frame arrived within this long.
@@ -130,6 +133,7 @@ impl Default for RecvCfg {
             rt_threads: 1,
             cpus: None,
             util_min: 1024,
+            slice_us: 100,
             idle_ms: 3000,
             connect_timeout_s: 120,
             recon: None,
@@ -260,6 +264,7 @@ impl RecvCfg {
             rt_threads: a.get("rt-threads", d.rt_threads),
             cpus: a.opt("cpus"),
             util_min: a.get("util-min", d.util_min),
+            slice_us: a.get("slice-us", d.slice_us),
             idle_ms: a.get("idle-ms", d.idle_ms),
             connect_timeout_s: a.get("connect-timeout-s", d.connect_timeout_s),
             recon: ReconCfg::from_args(a),
@@ -566,7 +571,10 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
         cfg.rt_threads,
         workers,
         h5_readers,
-        cfg.util_min,
+        FairSched {
+            util_min: cfg.util_min,
+            slice_ns: cfg.slice_us * 1000,
+        },
     ));
     // The calling thread only polls for completion; it shares the runtime CPUs.
     place.enter(place.rt.as_deref());
@@ -1207,6 +1215,7 @@ mod tests {
             rt_threads: 2,
             cpus: Some("2-5".into()),
             util_min: 0,
+            slice_us: 200,
             idle_ms: 1000,
             connect_timeout_s: 5,
             recon: Some(ReconCfg {
@@ -1305,6 +1314,8 @@ mod tests {
             "2-5",
             "--util-min",
             "0",
+            "--slice-us",
+            "200",
             "--idle-ms",
             "1000",
             "--connect-timeout-s",
@@ -1359,6 +1370,7 @@ mod tests {
             rt-threads = 2
             cpus = "2-5"
             util-min = 0
+            slice-us = 200
             idle-ms = 1000
             connect-timeout-s = 5
 

@@ -14,7 +14,7 @@ use crate::codec::{
 };
 use crate::handoff::{WorkRx, WorkTx};
 use crate::ring::Ring;
-use crate::sched::{parse_cpu_list, pin_current, set_util_min};
+use crate::sched::{FairSched, parse_cpu_list, pin_current, set_fair};
 use crate::stats::{Histogram, mono_ns, process_cpu_ns, thread_cpu_ns};
 use crate::synth::{Region, Synth, SynthScratch};
 
@@ -338,7 +338,7 @@ pub struct Placement {
     pub h2d: Option<usize>,
     pub workers: Vec<Option<usize>>,
     pub readers: Vec<Option<usize>>,
-    pub util_min: u32,
+    pub sched: FairSched,
 }
 
 impl Placement {
@@ -347,7 +347,7 @@ impl Placement {
         rt_threads: usize,
         workers: usize,
         readers: usize,
-        util_min: u32,
+        sched: FairSched,
     ) -> Self {
         if cpus.is_empty() {
             return Self {
@@ -356,7 +356,7 @@ impl Placement {
                 h2d: None,
                 workers: vec![None; workers],
                 readers: vec![None; readers],
-                util_min,
+                sched,
             };
         }
         let c = parse_cpu_list(cpus).unwrap_or_else(|e| panic!("--cpus: {e}"));
@@ -374,7 +374,7 @@ impl Placement {
             h2d: Some(c[rt_threads]),
             workers: some(&c[w0..w0 + workers]),
             readers: some(&c[w0 + workers..need]),
-            util_min,
+            sched,
         }
     }
 
@@ -383,11 +383,12 @@ impl Placement {
         if let Some(c) = cpus {
             pin_current(c).unwrap_or_else(|e| panic!("pin to {c:?}: {e}"));
         }
-        if self.util_min > 0 {
-            set_util_min(self.util_min).unwrap_or_else(|e| {
-                panic!("uclamp min {}: {e} (--util-min 0 skips it)", self.util_min)
-            });
-        }
+        set_fair(self.sched).unwrap_or_else(|e| {
+            panic!(
+                "sched_setattr {:?}: {e} (--util-min 0 --slice-us 0 skip it)",
+                self.sched
+            )
+        });
     }
 }
 

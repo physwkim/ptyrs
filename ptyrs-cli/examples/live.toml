@@ -34,6 +34,8 @@ rt-threads = 1
 # CPUs the threads are pinned to; unpinned when unset.
 # cpus = "2-23"
 util-min = 1024
+# EEVDF slice of the pinned threads; 0 keeps the kernel's.
+slice-us = 100
 # Stop once no frame arrived for this long.
 idle-ms = 3000
 # Stop if no frame arrived within this long.

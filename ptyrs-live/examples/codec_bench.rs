@@ -7,7 +7,7 @@ use ptyrs_live::codec::{
     Bslz4Scratch, Codec, bslz4_compress_u16, bslz4_decompress_into_u16, bslz4_decompress_range_u16,
     bytemuck_u16, bytemuck_u16_mut, lz4_compress, lz4_decompress_into,
 };
-use ptyrs_live::sched::set_util_min;
+use ptyrs_live::sched::{FairSched, set_fair};
 use ptyrs_live::stats::{mono_ns, thread_cpu_ns};
 use ptyrs_live::synth::Synth;
 
@@ -27,9 +27,11 @@ fn run(
     gap_us: u64,
     util_min: u32,
 ) -> (f64, f64) {
-    if util_min > 0 {
-        set_util_min(util_min).expect("sched_setattr uclamp min");
-    }
+    set_fair(FairSched {
+        util_min,
+        slice_ns: 0,
+    })
+    .expect("sched_setattr uclamp min");
     let n = s.width * s.height;
     let mut img = vec![0u16; n];
     let mut sc = Bslz4Scratch::default();

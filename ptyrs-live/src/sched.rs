@@ -1,5 +1,5 @@
-//! Thread placement for the receive path: CPU pinning, and a frequency
-//! floor for threads that idle between frames.
+//! Thread placement for the receive path: CPU pinning, and the scheduling
+//! of threads that idle between frames.
 
 use std::io;
 
@@ -49,6 +49,7 @@ pub fn pin_current(cpus: &[usize]) -> io::Result<()> {
 /// `struct sched_attr` up to SCHED_ATTR_SIZE_VER1; libc stops at VER0,
 /// before the utilization clamps.
 #[repr(C)]
+#[derive(Default)]
 struct SchedAttr {
     size: u32,
     policy: u32,
@@ -62,22 +63,56 @@ struct SchedAttr {
     util_max: u32,
 }
 
-/// Ask schedutil to pick at least `min`/1024 of peak capacity whenever the
-/// calling thread runs (uclamp min). A decode worker that sleeps between
-/// frames otherwise never builds the utilization that raises its clock.
-pub fn set_util_min(min: u32) -> io::Result<()> {
-    let attr = SchedAttr {
-        size: std::mem::size_of::<SchedAttr>() as u32,
-        policy: 0,
-        flags: (libc::SCHED_FLAG_KEEP_ALL | libc::SCHED_FLAG_UTIL_CLAMP_MIN) as u64,
-        nice: 0,
-        priority: 0,
-        runtime: 0,
-        deadline: 0,
-        period: 0,
-        util_min: min,
-        util_max: 0,
+/// Fair-class scheduling of a thread that sleeps between frames; a zero
+/// field leaves what the thread already has.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FairSched {
+    /// uclamp min out of 1024: schedutil picks at least this share of peak
+    /// capacity whenever the thread runs. A decode worker that sleeps between
+    /// frames otherwise never builds the utilization that raises its clock.
+    pub util_min: u32,
+    /// EEVDF slice. A waking thread preempts the running task only with the
+    /// shorter slice (Linux 6.12+), so at the 3 ms base slice any task that
+    /// lands on the uploader's CPU held each of its wakeups up to 3 ms.
+    pub slice_ns: u64,
+}
+
+/// The calling thread's attributes, sized for writing back.
+fn get_attr() -> io::Result<SchedAttr> {
+    let size = std::mem::size_of::<SchedAttr>() as u32;
+    let mut attr = SchedAttr::default();
+    // SAFETY: pid 0 is the calling thread; `attr` holds `size` bytes.
+    let r = unsafe {
+        libc::syscall(
+            libc::SYS_sched_getattr,
+            0,
+            &mut attr as *mut SchedAttr,
+            size,
+            0,
+        )
     };
+    if r != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    attr.size = size;
+    Ok(attr)
+}
+
+/// Apply `s` to the calling thread, keeping its policy and nice.
+pub fn set_fair(s: FairSched) -> io::Result<()> {
+    if s.util_min == 0 && s.slice_ns == 0 {
+        return Ok(());
+    }
+    let mut attr = get_attr()?;
+    if s.slice_ns > 0 {
+        attr.runtime = s.slice_ns;
+    } else {
+        attr.flags |= libc::SCHED_FLAG_KEEP_PARAMS as u64;
+    }
+    if s.util_min > 0 {
+        attr.flags |= libc::SCHED_FLAG_UTIL_CLAMP_MIN as u64;
+        attr.util_min = s.util_min;
+    }
     // SAFETY: pid 0 is the calling thread; `attr` is a valid VER1 sched_attr
     // whose size field matches its layout.
     let r = unsafe { libc::syscall(libc::SYS_sched_setattr, 0, &attr as *const SchedAttr, 0) };
@@ -104,5 +139,33 @@ mod tests {
     #[test]
     fn sched_attr_is_ver1_sized() {
         assert_eq!(std::mem::size_of::<SchedAttr>(), 56);
+    }
+
+    #[test]
+    fn set_fair_changes_only_the_fields_it_is_given() {
+        std::thread::spawn(|| {
+            // SAFETY: lowers the calling thread's own priority.
+            let r = unsafe { libc::setpriority(libc::PRIO_PROCESS, libc::gettid() as u32, 5) };
+            assert_eq!(r, 0);
+            let base = get_attr().unwrap();
+            let fields = |a: SchedAttr| (a.policy, a.nice, a.runtime, a.util_min);
+            set_fair(FairSched {
+                util_min: 512,
+                slice_ns: 0,
+            })
+            .unwrap();
+            assert_eq!(
+                fields(get_attr().unwrap()),
+                (base.policy, 5, base.runtime, 512)
+            );
+            set_fair(FairSched {
+                util_min: 0,
+                slice_ns: 200_000,
+            })
+            .unwrap();
+            assert_eq!(fields(get_attr().unwrap()), (base.policy, 5, 200_000, 512));
+        })
+        .join()
+        .unwrap();
     }
 }

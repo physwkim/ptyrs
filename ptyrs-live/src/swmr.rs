@@ -512,6 +512,7 @@ mod tests {
 
     use super::*;
     use crate::codec::{Bslz4Scratch, bslz4_decompress_into_u16, bytemuck_u16_mut};
+    use crate::sched::FairSched;
 
     /// Removed when the test ends, pass or fail.
     struct Tmp(PathBuf);
@@ -577,7 +578,7 @@ mod tests {
         let st = Mutex::new(SourceStats::new(frames));
         let pos = PosTable::new(1 << 12);
         let (tx, rx) = crate::handoff::work_queue((frames as usize).try_into().unwrap());
-        let place = Placement::new("", 1, 0, cfg.readers, 0);
+        let place = Placement::new("", 1, 0, cfg.readers, FairSched::default());
         let (stop, progress) = (AtomicBool::new(false), Progress::default());
         let mut got = Vec::new();
         let rep = std::thread::scope(|sc| {
