@@ -380,9 +380,11 @@ mod tests {
     /// waiting for its probe (lag 1 chains every later angle to it).
     #[test]
     fn a_failing_angle_releases_the_waiting_workers() {
+        // Built before the clock starts: the limit below times the runs, not context and
+        // module setup, which alone can pass a minute while the full suite loads the GPUs.
+        let w = workers(2);
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let w = workers(2);
             let run = |fault| reconstruct(&w, Synth::new(fault), 12, lag(1), initial());
             let _ = tx.send((
                 run(Some((5, Fault::Error))).err(),
