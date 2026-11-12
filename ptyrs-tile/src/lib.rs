@@ -1,11 +1,12 @@
 //! ptyrs-tile: cuTile (Tile IR) alternatives to `ptyrs-gpu` SIMT pieces.
 //!
 //! Every launch is a method of a [`TileKernels`], the kernels of one scan, or of its
-//! [`TileUpdates`], each compiling its kernels when it is built, so no launch compiles,
-//! eagerly or under a graph capture. A launch takes the context, stack and buffers of its
-//! `ptyrs_gpu` counterpart, the scan's views being the set's (the updates take them, as
-//! their counterparts do), leases the buffers with [`ptyrs_gpu::lease`] and enqueues on the
-//! context's stream, so it runs eagerly or records into a capture the same way.
+//! [`TileObjUpdate`] or [`TileProbeUpdate`], each compiling its kernels when it is built, so
+//! no launch compiles, eagerly or under a graph capture. A launch takes the context, stack
+//! and buffers of its `ptyrs_gpu` counterpart, the scan's views being the set's (the object
+//! update takes them, as its counterpart does), leases the buffers with
+//! [`ptyrs_gpu::lease`] and enqueues on the context's stream, so it runs eagerly or records
+//! into a capture the same way.
 
 use std::sync::Arc;
 
@@ -1001,7 +1002,8 @@ pub struct TileKernels<'a> {
     /// Complex values of the probe, `nprobe * ny * nx`.
     probe_len: usize,
     llk_levels: Vec<usize>,
-    updates: TileUpdates,
+    obj_update: TileObjUpdate,
+    probe_update: TileProbeUpdate,
 }
 
 impl<'a> TileKernels<'a> {
@@ -1037,7 +1039,8 @@ impl<'a> TileKernels<'a> {
             psi_len,
             probe_len,
             llk_levels,
-            updates: TileUpdates::new(stream, views)?,
+            obj_update: TileObjUpdate::new(stream, views)?,
+            probe_update: TileProbeUpdate::new(stream, views)?,
         };
         let run = Run::Compile(stream);
         for ctl in UNBOUND_CTL {
@@ -1048,9 +1051,14 @@ impl<'a> TileKernels<'a> {
         Ok(k)
     }
 
-    /// The scan's object and probe updates, compiled with the set.
-    pub fn updates(&self) -> &TileUpdates {
-        &self.updates
+    /// The scan's object update, compiled with the set.
+    pub fn obj_update(&self) -> &TileObjUpdate {
+        &self.obj_update
+    }
+
+    /// The scan's probe update, compiled with the set.
+    pub fn probe_update(&self) -> &TileProbeUpdate {
+        &self.probe_update
     }
 
     /// The stack kernels' scalar arguments: `nframe`, `nf_max`, `nmode`, the frame and
@@ -1288,37 +1296,31 @@ impl<'a> TileKernels<'a> {
     }
 }
 
-/// The Tile object and probe updates of one scan's views, compiled when the set is built, as
-/// [`TileKernels`] compiles its kernels; a launch's integers are the views' sizes, which it
-/// checks, and every buffer, `tile_len` included, must be 16-byte aligned. The set keeps the
-/// sizes, not the views, so the owner of a [`Views`] can hold it beside them.
-pub struct TileUpdates {
-    /// What the updates were compiled for.
+/// The Tile object update of one scan's views, compiled when it is built, as [`TileKernels`]
+/// compiles its kernels; a launch's integers are the views' sizes, which it checks, and every
+/// buffer, `tile_len` included, must be 16-byte aligned. It keeps the sizes, not the views,
+/// so the owner of a [`Views`] can hold it beside them.
+pub struct TileObjUpdate {
+    /// What the update was compiled for.
     dims: ViewDims,
-    /// Complex values of the probe, `nprobe * ny * nx`.
-    probe_len: usize,
 }
 
-impl TileUpdates {
-    /// Checks the object's and probe's lengths against the kernels' `i32` offsets and compiles
-    /// both updates on `stream`, without launching either, for views of `views`' sizes.
+impl TileObjUpdate {
+    /// Checks the object's length against the kernels' `i32` offsets and compiles the update
+    /// on `stream`, without launching it, for views of `views`' sizes.
     pub fn new(stream: &Arc<CudaStream>, views: &Views) -> Result<Self, Error> {
         let dims = *views.dims();
-        let probe_len = dims.nprobe as usize * dims.frame[0] as usize * dims.frame[1] as usize;
-        offset("probe length", 2 * probe_len)?;
         offset("object length", 2 * obj_len(&dims))?;
-        let u = Self { dims, probe_len };
-        let run = Run::Compile(stream);
-        u.obj_run(run, [UNBOUND; 5], 0.0)?;
-        u.probe_run(run, [UNBOUND; 4], 0.0)?;
+        let u = Self { dims };
+        u.obj_run(Run::Compile(stream), [UNBOUND; 5], 0.0)?;
         Ok(u)
     }
 
-    /// [`ptyrs_gpu::Kernels::update_obj_from_sums`]: [`Self::update_probe_from_sums`] of the
-    /// object `[nobj, nyo, nxo]` on the object tiles with views only, `reg = inertia *
-    /// max(den)` over their pixels, zeroing their sums. A tile whose run is empty is neither
-    /// read nor written, in `obj` or `sums`, so it keeps its bits. `sums.max_bits` is the
-    /// scratch for the maximum.
+    /// [`ptyrs_gpu::Kernels::update_obj_from_sums`]:
+    /// [`TileProbeUpdate::update_probe_from_sums`] of the object `[nobj, nyo, nxo]` on the
+    /// object tiles with views only, `reg = inertia * max(den)` over their pixels, zeroing
+    /// their sums. A tile whose run is empty is neither read nor written, in `obj` or `sums`,
+    /// so it keeps its bits. `sums.max_bits` is the scratch for the maximum.
     pub fn update_obj_from_sums(
         &self,
         ctx: &ExecutionContext,
@@ -1330,7 +1332,7 @@ impl TileUpdates {
         let (d, at) = (views.dims(), &self.dims);
         if d.nobj != at.nobj || d.obj != at.obj {
             return Err(shape(format!(
-                "views of {} objects of {:?}, the updates were built for {} of {:?}",
+                "views of {} objects of {:?}, the update was built for {} of {:?}",
                 d.nobj, d.obj, at.nobj, at.obj
             )));
         }
@@ -1395,6 +1397,26 @@ impl TileUpdates {
             );
         }
         Ok(())
+    }
+}
+
+/// The Tile probe update of one scan's views, compiled when it is built, as [`TileKernels`]
+/// compiles its kernels; every buffer must be 16-byte aligned.
+pub struct TileProbeUpdate {
+    /// Complex values of the probe, `nprobe * ny * nx`.
+    probe_len: usize,
+}
+
+impl TileProbeUpdate {
+    /// Checks the probe's length against the kernels' `i32` offsets and compiles the update
+    /// on `stream`, without launching it, for views of `views`' sizes.
+    pub fn new(stream: &Arc<CudaStream>, views: &Views) -> Result<Self, Error> {
+        let d = views.dims();
+        let probe_len = d.nprobe as usize * d.frame[0] as usize * d.frame[1] as usize;
+        offset("probe length", 2 * probe_len)?;
+        let u = Self { probe_len };
+        u.probe_run(Run::Compile(stream), [UNBOUND; 4], 0.0)?;
+        Ok(u)
     }
 
     /// [`ptyrs_gpu::Kernels::update_from_sums`] of the probe: `x = (num + reg x) / max(den +

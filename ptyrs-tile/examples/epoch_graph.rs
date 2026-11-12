@@ -214,14 +214,23 @@ fn epoch(
         }
     }
     if obj_up_t {
-        tk.updates()
-            .update_obj_from_sums(ctx, views, &mut s.obj, &mut s.obj_sums, OBJ_INERTIA)?;
+        tk.obj_update().update_obj_from_sums(
+            ctx,
+            views,
+            &mut s.obj,
+            &mut s.obj_sums,
+            OBJ_INERTIA,
+        )?;
     } else {
         k.update_obj_from_sums(ctx, views, &mut s.obj, &mut s.obj_sums, OBJ_INERTIA)?;
     }
     if probe_up_t {
-        tk.updates()
-            .update_probe_from_sums(ctx, &mut s.probe, &mut s.probe_sums, PROBE_INERTIA)?;
+        tk.probe_update().update_probe_from_sums(
+            ctx,
+            &mut s.probe,
+            &mut s.probe_sums,
+            PROBE_INERTIA,
+        )?;
     } else {
         k.update_from_sums(
             ctx,

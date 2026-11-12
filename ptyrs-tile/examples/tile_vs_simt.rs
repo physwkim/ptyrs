@@ -170,7 +170,7 @@ fn main() {
     }
     for _ in 0..total {
         if tile {
-            tk.updates()
+            tk.obj_update()
                 .update_obj_from_sums(&ex, &views, &mut obj, &mut obj_sums, 0.01)
                 .unwrap();
         } else {
@@ -180,7 +180,7 @@ fn main() {
     }
     for _ in 0..total {
         if tile {
-            tk.updates()
+            tk.probe_update()
                 .update_probe_from_sums(&ex, &mut probe, &mut probe_sums, 0.01)
                 .unwrap();
         } else {

@@ -1,5 +1,6 @@
-//! `ptyrs_tile::TileUpdates::update_probe_from_sums` and `update_obj_from_sums` against
-//! their SIMT `ptyrs_gpu::Kernels` counterparts and an f64 reference.
+//! `ptyrs_tile::TileProbeUpdate::update_probe_from_sums` and
+//! `TileObjUpdate::update_obj_from_sums` against their SIMT `ptyrs_gpu::Kernels` counterparts
+//! and an f64 reference.
 
 use std::sync::Arc;
 
@@ -9,7 +10,7 @@ use cutile::tile_kernel::jit_compile_count;
 use ptyrs_gpu::{
     C32, Kernels, OBJ_TILE, StackTable, UpdateSums, ViewAddr, ViewDims, Views, view_tiles,
 };
-use ptyrs_tile::{TileKernels, TileUpdates};
+use ptyrs_tile::{TileKernels, TileObjUpdate};
 
 /// Deterministic values in `[-scale, scale)`.
 fn noise(len: usize, seed: u64, scale: f32) -> Vec<C32> {
@@ -136,7 +137,7 @@ fn update_probe_from_sums_matches_simt() {
             // Stale scratch above every `den`: the op must zero it itself.
             sums.max_bits = up(&stream, &[1e30f32.to_bits()]);
             let mut x = up(&stream, &x_host);
-            tk.updates()
+            tk.probe_update()
                 .update_probe_from_sums(&ex, &mut x, &mut sums, inertia)
                 .unwrap();
             after(x, sums)
@@ -279,7 +280,7 @@ fn update_obj_from_sums_matches_simt_on_tiles_with_views() {
             k.update_obj_from_sums(&ex, &views, &mut x, &mut sums, inertia)
                 .unwrap();
         } else {
-            tk.updates()
+            tk.obj_update()
                 .update_obj_from_sums(&ex, &views, &mut x, &mut sums, inertia)
                 .unwrap();
         }
@@ -335,10 +336,10 @@ fn update_obj_from_sums_rejects_views_of_other_sizes() {
     let ex = ExecutionContext::new(stream.clone());
     let (views, _) = probe_scan(&stream, 1, [32, 32]);
     let (wider, _) = probe_scan(&stream, 1, [32, 64]);
-    let up_set = TileUpdates::new(&stream, &views).unwrap();
+    let update = TileObjUpdate::new(&stream, &views).unwrap();
     let len = 32 * 64;
     let mut obj = up(&stream, &noise(len, 60, 1.0));
     let mut sums = UpdateSums::zeroed(&stream, len).unwrap();
-    let e = up_set.update_obj_from_sums(&ex, &wider, &mut obj, &mut sums, 0.01);
+    let e = update.update_obj_from_sums(&ex, &wider, &mut obj, &mut sums, 0.01);
     assert!(matches!(e, Err(ptyrs_tile::Error::Shape(_))), "{e:?}");
 }
