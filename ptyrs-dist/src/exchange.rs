@@ -152,11 +152,68 @@ pub fn tree_sum_host(leaves: &[f64], k: usize) -> Vec<f64> {
     s
 }
 
+/// One [`Exchange::copy_runs`] run: `len` 64-bit words from `src` to `dst`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Run {
+    pub dst: u64,
+    pub src: u64,
+    pub len: u64,
+}
+
+/// A device table of [`Run`]s with its launch shape.
+pub struct Runs {
+    table: DeviceBuffer<u64>,
+    nruns: u32,
+    chunks: u32,
+}
+
+/// Words one thread copies per chunk of a run before the grid strides on.
+const RUN_WORDS_PER_THREAD: u64 = 8;
+
+impl Runs {
+    pub fn new(stream: &Stream, runs: &[Run]) -> Result<Self, DistError> {
+        let nruns = u32::try_from(runs.len())
+            .ok()
+            .filter(|&n| n <= i32::MAX as u32)
+            .ok_or_else(|| DistError::Partition(format!("{} runs", runs.len())))?;
+        let flat: Vec<u64> = runs.iter().flat_map(|r| [r.dst, r.src, r.len]).collect();
+        let longest = runs.iter().map(|r| r.len).max().unwrap_or(0);
+        let chunks = longest
+            .div_ceil(RUN_THREADS as u64 * RUN_WORDS_PER_THREAD)
+            .clamp(1, u16::MAX as u64) as u32;
+        let table = if flat.is_empty() {
+            DeviceBuffer::zeroed(stream, 3)?
+        } else {
+            DeviceBuffer::from_host(stream, &flat)?
+        };
+        Ok(Self {
+            table,
+            nruns,
+            chunks,
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        self.nruns as usize
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.nruns == 0
+    }
+}
+
 /// The exchange kernels, loaded into one context.
 pub struct Exchange {
     halo_pull: Function,
     tree_sum: Function,
+    copy_runs: Function,
+    add_f32: Function,
+    max_u32: Function,
 }
+
+const RUN_THREADS: u32 = 256;
+const ADD_THREADS: u32 = 256;
+const ADD_MAX_BLOCKS: u32 = 1024;
 
 const TREE_THREADS: u32 = 1024;
 
@@ -166,7 +223,102 @@ impl Exchange {
         Ok(Self {
             halo_pull: m.load_function("halo_pull")?,
             tree_sum: m.load_function("tree_sum")?,
+            copy_runs: m.load_function("copy_runs")?,
+            add_f32: m.load_function("add_f32")?,
+            max_u32: m.load_function("max_u32")?,
         })
+    }
+
+    /// Copies every run of `runs`, one block row per run.
+    ///
+    /// # Safety
+    /// Every run's `dst` must address `len` words on the stream's device and its `src` `len`
+    /// words on this device or a peer with access enabled, 8-byte aligned, with no run's
+    /// destination overlapping another run's source or destination. The sources must not be
+    /// written until this launch completes ([`crate::Gpu::fence`]).
+    pub unsafe fn copy_runs(&self, stream: &Stream, runs: &Runs) -> Result<(), DistError> {
+        if runs.is_empty() {
+            return Ok(());
+        }
+        let mut table = runs.table.cu_deviceptr();
+        let mut params = [(&raw mut table).cast::<c_void>()];
+        // SAFETY: the kernel reads `table[0..3 * nruns]`; the caller guarantees the runs.
+        unsafe {
+            launch_kernel_on_stream(
+                &self.copy_runs,
+                (runs.nruns, runs.chunks, 1),
+                (RUN_THREADS, 1, 1),
+                0,
+                stream,
+                &mut params,
+            )?
+        };
+        Ok(())
+    }
+
+    /// `dst[i] = a[i] + b[i]` for `i < n`, rounded to nearest: bit-identical to the host sum.
+    ///
+    /// # Safety
+    /// `dst` must address `n` f32 on the stream's device; `a` and `b` `n` f32 each on this
+    /// device or a peer with access enabled, written before this launch on every device and
+    /// not overlapping `dst` unless equal to it.
+    pub unsafe fn add_f32(
+        &self,
+        stream: &Stream,
+        dst: u64,
+        a: u64,
+        b: u64,
+        n: u32,
+    ) -> Result<(), DistError> {
+        if n == 0 {
+            return Ok(());
+        }
+        let blocks = n.div_ceil(ADD_THREADS).min(ADD_MAX_BLOCKS);
+        let (mut dst, mut a, mut b, mut n) = (dst, a, b, n);
+        let mut params = [
+            (&raw mut dst).cast::<c_void>(),
+            (&raw mut a).cast::<c_void>(),
+            (&raw mut b).cast::<c_void>(),
+            (&raw mut n).cast::<c_void>(),
+        ];
+        // SAFETY: the caller guarantees the extents; the grid strides over `n`.
+        unsafe {
+            launch_kernel_on_stream(
+                &self.add_f32,
+                (blocks, 1, 1),
+                (ADD_THREADS, 1, 1),
+                0,
+                stream,
+                &mut params,
+            )?
+        };
+        Ok(())
+    }
+
+    /// `dst[0] = max_j *srcs[j]` over 32-bit words; one thread.
+    ///
+    /// # Safety
+    /// `dst` must address one word on the stream's device; every `srcs[j]` one word on this
+    /// device or a peer with access enabled, written before this launch on every device.
+    pub unsafe fn max_u32(
+        &self,
+        stream: &Stream,
+        dst: u64,
+        srcs: &DeviceBuffer<u64>,
+    ) -> Result<(), DistError> {
+        let n = u32::try_from(srcs.len())
+            .map_err(|_| DistError::Partition("more than u32::MAX max sources".into()))?;
+        let (mut dst, mut src, mut n) = (dst, srcs.cu_deviceptr(), n);
+        let mut params = [
+            (&raw mut dst).cast::<c_void>(),
+            (&raw mut src).cast::<c_void>(),
+            (&raw mut n).cast::<c_void>(),
+        ];
+        // SAFETY: the kernel reads `srcs[0..n]`; the caller guarantees the addresses.
+        unsafe {
+            launch_kernel_on_stream(&self.max_u32, (1, 1, 1), (1, 1, 1), 0, stream, &mut params)?
+        };
+        Ok(())
     }
 
     /// Copies halo slot `j` (`words` 32-bit words) from `srcs[j]` to `dst + j * words * 4`.
@@ -400,6 +552,128 @@ TS_DONE:
 TS_END:
     ret;
 }
+
+// Run r = ctaid.x of the table [dst, src, len] triples: dst[i] = src[i] (64-bit words) for
+// i = ctaid.y * ntid.x + tid.x, striding by nctaid.y * ntid.x while i < len.
+.visible .entry copy_runs(
+    .param .u64 p_runs
+)
+{
+    .reg .pred %p<2>;
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<14>;
+
+    ld.param.u64 %rd1, [p_runs];
+    cvta.to.global.u64 %rd1, %rd1;
+    mov.u32 %r1, %ctaid.x;
+    mul.wide.u32 %rd2, %r1, 24;
+    add.s64 %rd2, %rd1, %rd2;
+    ld.global.u64 %rd3, [%rd2];
+    ld.global.u64 %rd4, [%rd2+8];
+    ld.global.u64 %rd5, [%rd2+16];
+    cvta.to.global.u64 %rd3, %rd3;
+    cvta.to.global.u64 %rd4, %rd4;
+    mov.u32 %r2, %ctaid.y;
+    mov.u32 %r3, %ntid.x;
+    mov.u32 %r4, %tid.x;
+    mov.u32 %r5, %nctaid.y;
+    mul.wide.u32 %rd6, %r2, %r3;
+    cvt.u64.u32 %rd7, %r4;
+    add.s64 %rd6, %rd6, %rd7;
+    mul.wide.u32 %rd8, %r5, %r3;
+CR_LOOP:
+    setp.ge.u64 %p1, %rd6, %rd5;
+    @%p1 bra CR_DONE;
+    shl.b64 %rd9, %rd6, 3;
+    add.s64 %rd10, %rd4, %rd9;
+    ld.global.u64 %rd11, [%rd10];
+    add.s64 %rd12, %rd3, %rd9;
+    st.global.u64 [%rd12], %rd11;
+    add.s64 %rd6, %rd6, %rd8;
+    bra CR_LOOP;
+CR_DONE:
+    ret;
+}
+
+// dst[i] = a[i] + b[i] for i < n, grid-stride.
+.visible .entry add_f32(
+    .param .u64 p_dst,
+    .param .u64 p_a,
+    .param .u64 p_b,
+    .param .u32 p_n
+)
+{
+    .reg .pred %p<2>;
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<12>;
+    .reg .f32 %f<4>;
+
+    ld.param.u64 %rd1, [p_dst];
+    ld.param.u64 %rd2, [p_a];
+    ld.param.u64 %rd3, [p_b];
+    ld.param.u32 %r1, [p_n];
+    cvta.to.global.u64 %rd1, %rd1;
+    cvta.to.global.u64 %rd2, %rd2;
+    cvta.to.global.u64 %rd3, %rd3;
+    mov.u32 %r2, %ctaid.x;
+    mov.u32 %r3, %ntid.x;
+    mov.u32 %r4, %tid.x;
+    mov.u32 %r5, %nctaid.x;
+    mul.wide.u32 %rd4, %r2, %r3;
+    cvt.u64.u32 %rd5, %r4;
+    add.s64 %rd4, %rd4, %rd5;
+    mul.wide.u32 %rd6, %r5, %r3;
+    cvt.u64.u32 %rd7, %r1;
+AF_LOOP:
+    setp.ge.u64 %p1, %rd4, %rd7;
+    @%p1 bra AF_DONE;
+    shl.b64 %rd8, %rd4, 2;
+    add.s64 %rd9, %rd2, %rd8;
+    ld.global.f32 %f1, [%rd9];
+    add.s64 %rd10, %rd3, %rd8;
+    ld.global.f32 %f2, [%rd10];
+    add.rn.f32 %f3, %f1, %f2;
+    add.s64 %rd11, %rd1, %rd8;
+    st.global.f32 [%rd11], %f3;
+    add.s64 %rd4, %rd4, %rd6;
+    bra AF_LOOP;
+AF_DONE:
+    ret;
+}
+
+// dst[0] = max over j < n of *srcs[j].
+.visible .entry max_u32(
+    .param .u64 p_dst,
+    .param .u64 p_srcs,
+    .param .u32 p_n
+)
+{
+    .reg .pred %p<2>;
+    .reg .b32 %r<6>;
+    .reg .b64 %rd<6>;
+
+    ld.param.u64 %rd1, [p_dst];
+    ld.param.u64 %rd2, [p_srcs];
+    ld.param.u32 %r1, [p_n];
+    cvta.to.global.u64 %rd1, %rd1;
+    cvta.to.global.u64 %rd2, %rd2;
+    mov.u32 %r2, 0;
+    mov.u32 %r3, 0;
+MU_LOOP:
+    setp.ge.u32 %p1, %r3, %r1;
+    @%p1 bra MU_DONE;
+    mul.wide.u32 %rd3, %r3, 8;
+    add.s64 %rd3, %rd2, %rd3;
+    ld.global.u64 %rd4, [%rd3];
+    cvta.to.global.u64 %rd4, %rd4;
+    ld.global.u32 %r4, [%rd4];
+    max.u32 %r2, %r2, %r4;
+    add.u32 %r3, %r3, 1;
+    bra MU_LOOP;
+MU_DONE:
+    st.global.u32 [%rd1], %r2;
+    ret;
+}
 "#;
 
 #[cfg(test)]
@@ -443,5 +717,123 @@ mod tests {
             unsafe { cuda_core::sys::cuCtxSynchronize().result().unwrap() };
         }
         assert!(bad.is_empty(), "(reader, owner, first word): {bad:x?}");
+    }
+
+    /// Runs from every peer into every reader: a run long enough for several chunks and grid
+    /// strides, a short one, an empty one and one from the reader's own memory.
+    #[test]
+    fn copy_runs_reads_every_peer() {
+        let ctxs: Vec<_> = (0..4).map(|o| Context::new(o).unwrap()).collect();
+        enable_all_pairs(&ctxs).unwrap();
+        const LONG: usize = 2 * 65535 * 256 * 8 / 1000 + 12345;
+        let mut bad = Vec::new();
+        for b in &ctxs {
+            let sb = b.new_stream().unwrap();
+            let host: Vec<u64> = (0..LONG as u64 + 100)
+                .map(|i| i.wrapping_mul(0x9e37_79b9_7f4a_7c15))
+                .collect();
+            let src = DeviceBuffer::from_host(&sb, &host).unwrap();
+            for a in &ctxs {
+                let sa = a.new_stream().unwrap();
+                let ex = Exchange::load(a).unwrap();
+                let own: Vec<u64> = (0..7).map(|i| !i).collect();
+                let own = DeviceBuffer::from_host(&sa, &own).unwrap();
+                let dst = DeviceBuffer::<u64>::zeroed(&sa, LONG + 20).unwrap();
+                let (s, d, o) = (src.cu_deviceptr(), dst.cu_deviceptr(), own.cu_deviceptr());
+                let runs = [
+                    Run {
+                        dst: d,
+                        src: s + 8 * 100,
+                        len: LONG as u64,
+                    },
+                    Run {
+                        dst: d + 8 * LONG as u64,
+                        src: s + 8 * 3,
+                        len: 5,
+                    },
+                    Run {
+                        dst: d + 8 * (LONG as u64 + 5),
+                        src: s,
+                        len: 0,
+                    },
+                    Run {
+                        dst: d + 8 * (LONG as u64 + 6),
+                        src: o,
+                        len: 7,
+                    },
+                ];
+                let runs = Runs::new(&sa, &runs).unwrap();
+                assert!(runs.chunks > 1);
+                unsafe { ex.copy_runs(&sa, &runs).unwrap() };
+                let got = dst.to_host_vec(&sa).unwrap();
+                let mut want = host[100..100 + LONG].to_vec();
+                want.extend_from_slice(&host[3..8]);
+                want.push(0);
+                want.extend((0..7).map(|i: u64| !i));
+                want.resize(LONG + 20, 0);
+                if got != want {
+                    bad.push((a.ordinal(), b.ordinal()));
+                }
+            }
+            unsafe { cuda_core::sys::cuCtxSynchronize().result().unwrap() };
+        }
+        assert!(bad.is_empty(), "(reader, owner): {bad:?}");
+    }
+
+    /// The sum of a peer's floats and local floats, subnormals included, matches the host's
+    /// round-to-nearest sum bit for bit; the max of one word per GPU is read across peers.
+    #[test]
+    fn add_f32_and_max_u32_read_peers() {
+        let ctxs: Vec<_> = (0..4).map(|o| Context::new(o).unwrap()).collect();
+        enable_all_pairs(&ctxs).unwrap();
+        const N: usize = 300_000;
+        let val = |i: usize, seed: u32| {
+            let h = (i as u32).wrapping_mul(0x9e37_79b9) ^ seed;
+            match i % 7 {
+                0 => f32::from_bits(h & 0x007f_ffff),
+                _ => f32::from_bits((h & 0x807f_ffff) | 0x3f00_0000) * (1 + i % 5) as f32,
+            }
+        };
+        let words = [7u32, 0x4000_0001, 3, 0x3f80_0000];
+        let peers: Vec<_> = ctxs
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let s = c.new_stream().unwrap();
+                let xs: Vec<f32> = (0..N).map(|j| val(j, i as u32)).collect();
+                (
+                    DeviceBuffer::from_host(&s, &xs).unwrap(),
+                    DeviceBuffer::from_host(&s, &[words[i]]).unwrap(),
+                    xs,
+                )
+            })
+            .collect();
+        for (ia, a) in ctxs.iter().enumerate() {
+            let sa = a.new_stream().unwrap();
+            let ex = Exchange::load(a).unwrap();
+            for (ib, (b, _, xb)) in peers.iter().enumerate() {
+                let dst = DeviceBuffer::<f32>::zeroed(&sa, N).unwrap();
+                let la = &peers[ia].0;
+                unsafe {
+                    ex.add_f32(
+                        &sa,
+                        dst.cu_deviceptr(),
+                        b.cu_deviceptr(),
+                        la.cu_deviceptr(),
+                        N as u32,
+                    )
+                    .unwrap()
+                };
+                let got = dst.to_host_vec(&sa).unwrap();
+                let xa = &peers[ia].2;
+                let bad = (0..N).find(|&j| got[j].to_bits() != (xb[j] + xa[j]).to_bits());
+                assert_eq!(bad, None, "reader {ia}, peer {ib}");
+            }
+            let srcs: Vec<u64> = peers.iter().map(|p| p.1.cu_deviceptr()).collect();
+            let srcs = DeviceBuffer::from_host(&sa, &srcs).unwrap();
+            let out = DeviceBuffer::<u32>::zeroed(&sa, 1).unwrap();
+            unsafe { ex.max_u32(&sa, out.cu_deviceptr(), &srcs).unwrap() };
+            assert_eq!(out.to_host_vec(&sa).unwrap(), [0x4000_0001], "reader {ia}");
+        }
     }
 }
