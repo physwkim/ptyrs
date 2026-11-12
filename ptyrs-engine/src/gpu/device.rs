@@ -563,11 +563,7 @@ impl Device {
             stream,
         };
         let ctx = dev.context();
-        for s in 0..dev.stacks.len() {
-            dev.ring
-                .device()
-                .count(&ctx, &dims, dev.table.at(s), &dev.counts)?;
-        }
+        dev.ring.device().count(&ctx, 0..dims.nframe, &dev.counts)?;
         if dev.use_graph {
             dev.llk_graph = Some(dev.capture(|bufs, passes, ring, ctx| {
                 bufs.forward_llk(ctx, passes, ring.record()).map(Some)

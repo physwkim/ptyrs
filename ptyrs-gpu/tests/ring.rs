@@ -4,7 +4,7 @@
 //! a stamp error, as is one ended a number of times other than the host counts it, and one
 //! with a frame never counted is an uncounted error. A poll returns the records whose copies
 //! have completed without waiting for the rest. Each detector pixel's frame count holds the
-//! counted frames unmasked there, each once, in any stack layout and order.
+//! counted frames unmasked there, each once, in any layout and order of counted ranges.
 
 use std::sync::Arc;
 use std::sync::mpsc::{self, Sender};
@@ -130,7 +130,8 @@ fn fixture(nslot: u32) -> Fixture {
     fixture_counting(nslot, [true; 3])
 }
 
-/// A ring of `nslot` records whose device counted the frames of the stacks `counted` asks for.
+/// A ring of `nslot` records whose device counted the frames of the stacks `counted` asks for,
+/// a range per stack.
 fn fixture_counting(nslot: u32, counted: [bool; 3]) -> Fixture {
     let cuda = CudaContext::new(0).expect("CUDA device 0");
     let kernels = Kernels::load(&cuda).expect("load ptyrs-gpu kernels");
@@ -142,7 +143,7 @@ fn fixture_counting(nslot: u32, counted: [bool; 3]) -> Fixture {
     let dev_counts = DeviceBuffer::from_host(&stream, &counts()).unwrap();
     for (s, _) in counted.iter().enumerate().filter(|(_, c)| **c) {
         ring.device()
-            .count(&ctx, &dims, table.at(s), &dev_counts)
+            .count(&ctx, STACKS[s].clone(), &dev_counts)
             .unwrap();
     }
     Fixture {
@@ -223,11 +224,11 @@ impl Fixture {
         self.ring.poll(&self.ctx).unwrap()
     }
 
-    /// Counts stack `s` on the ring's device.
+    /// Counts the frames of stack `s` on the ring's device.
     fn count(&mut self, s: usize) {
         self.ring
             .device()
-            .count(&self.ctx, &self.dims, self.table.at(s), &self.counts)
+            .count(&self.ctx, STACKS[s].clone(), &self.counts)
             .unwrap();
     }
 
@@ -416,8 +417,9 @@ fn ends_out_of_step_with_counts_are_a_stamp_error() {
 
 /// Counting adds each frame to its unmasked pixels' frame counts once: the first two stacks'
 /// frames, then all of them with the first stack counted again, which leaves both its pixels'
-/// frame counts and its frames' unmasked pixels as they were. A count with a detector of
-/// other shape than the ring's is refused, though its counts fit.
+/// frame counts and its frames' unmasked pixels as they were. A count of counts too short for
+/// the ring's frames is refused, as is a range past its frames or one that ends before it
+/// starts.
 #[test]
 fn pixel_frames_count_each_frame_once() {
     let mut f = fixture_counting(2, [true, true, false]);
@@ -430,23 +432,21 @@ fn pixel_frames_count_each_frame_once() {
     f.enqueue(0, &[WHOLE]);
     check_whole(&f.flush().unwrap(), 0..1);
 
-    let half = ViewDims {
-        frame: [8, 4],
-        ..f.dims
-    };
     let half_counts =
         DeviceBuffer::from_host(&f.stream, &counts()[..NFRAME as usize * 32]).unwrap();
-    let table = StackTable::new(&f.stream, &half, &STACKS).unwrap();
-    let e = f
-        .ring
-        .device()
-        .count(&f.ctx, &half, table.at(0), &half_counts)
-        .unwrap_err();
-    assert!(matches!(e, Error::Shape(_)), "{e}");
+    let dev = f.ring.device();
+    let refused = [
+        dev.count(&f.ctx, 0..4, &half_counts),
+        dev.count(&f.ctx, 8..NFRAME + 1, &f.counts),
+        dev.count(&f.ctx, std::ops::Range { start: 5, end: 4 }, &f.counts),
+    ];
+    for e in refused {
+        assert!(matches!(e, Err(Error::Shape(_))), "{e:?}");
+    }
 }
 
-/// The frame counts come out the same whatever stacks count the frames and in whatever
-/// order: three stacks forward and backward, one frame per stack backward, and one stack.
+/// The frame counts come out the same whatever ranges count the frames and in whatever
+/// order: three ranges forward and backward, one frame per range backward, and one range.
 #[test]
 fn pixel_frames_are_the_same_in_any_frame_order() {
     let cuda = CudaContext::new(0).expect("CUDA device 0");
@@ -455,24 +455,19 @@ fn pixel_frames_are_the_same_in_any_frame_order() {
     let ctx = ExecutionContext::new(stream.clone());
     let dims = dims();
     let dev_counts = DeviceBuffer::from_host(&stream, &counts()).unwrap();
-    let singles: Vec<_> = (0..NFRAME).map(|f| f..f + 1).collect();
-    let all = 0..NFRAME;
-    let layouts: [(&[std::ops::Range<u32>], Vec<usize>); 4] = [
-        (&STACKS, vec![0, 1, 2]),
-        (&STACKS, vec![2, 1, 0]),
-        (&singles, (0..NFRAME as usize).rev().collect()),
-        (std::slice::from_ref(&all), vec![0]),
+    let layouts = [
+        STACKS.to_vec(),
+        STACKS.iter().rev().cloned().collect(),
+        (0..NFRAME).rev().map(|f| f..f + 1).collect(),
+        std::iter::once(0..NFRAME).collect(),
     ];
     let want = pixel_frames(0..NFRAME);
-    for (stacks, order) in layouts {
-        let table = StackTable::new(&stream, &dims, stacks).unwrap();
+    for ranges in layouts {
         let mut ring = LlkRing::<()>::new(&kernels, &stream, &dims, 1).unwrap();
-        for &s in &order {
-            ring.device()
-                .count(&ctx, &dims, table.at(s), &dev_counts)
-                .unwrap();
+        for r in &ranges {
+            ring.device().count(&ctx, r.clone(), &dev_counts).unwrap();
         }
         let got = ring.device().pixel_frames().to_host_vec(&stream).unwrap();
-        assert_eq!(got, want, "stacks {stacks:?} in order {order:?}");
+        assert_eq!(got, want, "ranges {ranges:?}");
     }
 }
