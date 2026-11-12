@@ -32,7 +32,7 @@ pub use gpu::{GpuOptions, GpuPtycho};
 pub use linop::{DOT_TOL, FarField, LinearOp, ObjectToPsi, ProbeToPsi, Registered, register};
 pub use obs::{Observed, shift};
 pub use ops::{
-    Llk, accumulate_obj, accumulate_probe, apply_amplitude, llk, obj_probe_to_psi,
+    Llk, accumulate_obj, accumulate_probe, apply_amplitude, llk, obj_probe_to_psi, poisson_grad,
     psi_to_obj_probe, quad_phase,
 };
 pub use plan::{Backend, Params, Plan, Step};

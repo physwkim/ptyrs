@@ -130,6 +130,34 @@ pub fn llk(obs: &Observed, frames: Range<usize>, nmode: usize, psi: &[C64]) -> L
     s
 }
 
+/// PyNX `GradPoissonFourier` (no background, and without the CUDA operator's Hann filter) on
+/// detector-plane `psi`: at every unmasked pixel `psi *= 2·(1 − iobs / max(1e-12, icalc))`
+/// with `icalc = Σ_modes |psi|²`; masked pixels become 0. The result is the gradient of
+/// [`llk`]'s Poisson sum over `(Re psi, Im psi)`, packed as `∂L/∂Re + i·∂L/∂Im = 2·∂L/∂psi*`;
+/// PyNX keeps `∂L/∂psi*`, half of it.
+pub fn poisson_grad(obs: &Observed, frames: Range<usize>, nmode: usize, psi: &mut [C64]) {
+    let n = obs.plane_len();
+    assert_eq!(psi.len(), frames.len() * nmode * n);
+    for (o, block) in obs
+        .frames(frames)
+        .chunks_exact(n)
+        .zip(psi.chunks_exact_mut(nmode * n))
+    {
+        for (j, iobs) in o.iter().enumerate() {
+            let r = match *iobs {
+                Some(iobs) => {
+                    let icalc: f64 = (0..nmode).map(|m| block[m * n + j].norm_sqr()).sum();
+                    2.0 * (1.0 - iobs / icalc.max(1e-12))
+                }
+                None => 0.0,
+            };
+            for m in 0..nmode {
+                block[m * n + j] *= r;
+            }
+        }
+    }
+}
+
 /// Log-likelihood values: sums from [`llk`], or per-observation values from
 /// [`Llk::normalised`].
 #[derive(Clone, Copy, Debug, Default, PartialEq)]

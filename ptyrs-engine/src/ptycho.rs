@@ -6,7 +6,8 @@ use std::ops::Range;
 use ptyrs_core::{AddrTable, C64, Object, Probe, Scan, Stack};
 
 use crate::ops::{
-    Llk, apply_amplitude, llk, natural, obj_probe_to_psi, psi_to_obj_probe, quad_phase,
+    Llk, accumulate_obj, apply_amplitude, llk, natural, obj_probe_to_psi, poisson_grad,
+    psi_to_obj_probe, quad_phase,
 };
 use crate::{EngineError, Fft2, Observed, shift};
 
@@ -211,6 +212,24 @@ impl Ptycho {
         let mut psi = self.calc_psi();
         self.fft.forward(&mut psi);
         llk(&self.obs, 0..self.addr.nframe(), self.addr.nmode(), &psi).normalised(self.obs.nb_obs())
+    }
+
+    /// Gradient of the Poisson LLK sum ([`llk`], not normalised) of the current object and probe
+    /// over the object's real and imaginary parts, packed as
+    /// `∂L/∂Re O + i·∂L/∂Im O = 2·∂L/∂O*`: [`poisson_grad`] of the far field, inverse FFT, then
+    /// [`accumulate_obj`]'s numerator. PyNX `ML`'s `obj_grad` is half of it.
+    pub fn obj_grad(&self) -> Stack<C64> {
+        let mut psi = self.calc_psi();
+        self.fft.forward(&mut psi);
+        poisson_grad(
+            &self.obs,
+            0..self.addr.nframe(),
+            self.addr.nmode(),
+            &mut psi,
+        );
+        self.fft.inverse(&mut psi);
+        let views = self.addr.views();
+        accumulate_obj(views, self.object.dims(), &self.probe, &self.quad, &psi).0
     }
 
     fn record(&mut self, algorithm: Algorithm, llk: Llk) {
@@ -518,5 +537,81 @@ fn apply_ramp(a: &mut Stack<C64>, ry: &[f64], rx: &[f64]) {
         for (i, c) in c.iter_mut().enumerate() {
             *c *= C64::from_polar(1.0, ry[i / nx] + rx[i % nx]);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ptyrs_core::{Geometry, required_obj_shape};
+
+    use super::*;
+
+    fn poisson_sum(p: &Ptycho) -> f64 {
+        let mut psi = p.calc_psi();
+        p.fft.forward(&mut psi);
+        llk(&p.obs, 0..p.addr.nframe(), p.addr.nmode(), &psi).poisson
+    }
+
+    /// [`Ptycho::obj_grad`] against central differences of the Poisson LLK sum in the real and
+    /// imaginary part of every object pixel, away from the truth, with two object and two probe
+    /// modes, masked detector pixels and pixels with zero counts.
+    #[test]
+    fn obj_grad_matches_central_differences() {
+        let g = Geometry::new(1.5e-10, 1.0, 75e-6, [16, 16]).unwrap();
+        let pixel = g.pixel_size_object();
+        let positions = ptyrs_core::sim::fermat(5, 3.0 * pixel[1]);
+        let shape = required_obj_shape(&positions.pynx_preprocess(pixel), pixel, g.frame, 0);
+        let one = ptyrs_core::sim::object(shape);
+        let second = one.as_slice().iter().map(|v| v.conj() * 0.3);
+        let truth: Vec<C64> = one.as_slice().iter().copied().chain(second).collect();
+        let truth = Object::new(Stack::from_vec([2, shape[0], shape[1]], truth).unwrap());
+        let probe = ptyrs_core::sim::probe(g.frame, 2).unwrap();
+        let mut mask = vec![false; 256];
+        mask[8 * 16 + 9] = true;
+        mask[3 * 16 + 5] = true;
+        let scan = crate::sim::simulate(g, positions, &truth, &probe, 2e3, Some(&mask), 3).unwrap();
+        let start = truth
+            .as_slice()
+            .iter()
+            .enumerate()
+            .map(|(i, v)| v * C64::from_polar(0.9, 0.4 * (0.37 * i as f64).sin()))
+            .collect();
+        let start = Object::new(Stack::from_vec(truth.dims(), start).unwrap());
+        let mut p = Ptycho::new(&scan, start, probe).unwrap();
+        p.scale_obj_probe();
+        let obs = p.obs.frames(0..p.addr.nframe());
+        assert!(obs.contains(&None) && obs.contains(&Some(0.0)));
+
+        let grad = p.obj_grad();
+        let gmax = grad.as_slice().iter().map(|v| v.norm()).fold(0.0, f64::max);
+        let len = grad.as_slice().len();
+        let rms = (p
+            .object
+            .as_slice()
+            .iter()
+            .map(|v| v.norm_sqr())
+            .sum::<f64>()
+            / len as f64)
+            .sqrt();
+        let h = 1e-6 * rms;
+        let mut err = 0.0f64;
+        for k in 0..len {
+            let o = p.object.as_slice()[k];
+            for (dir, want) in [
+                (C64::new(h, 0.0), grad.as_slice()[k].re),
+                (C64::new(0.0, h), grad.as_slice()[k].im),
+            ] {
+                p.object.as_mut_slice()[k] = o + dir;
+                let lp = poisson_sum(&p);
+                p.object.as_mut_slice()[k] = o - dir;
+                let lm = poisson_sum(&p);
+                p.object.as_mut_slice()[k] = o;
+                err = err.max(((lp - lm) / (2.0 * h) - want).abs());
+            }
+        }
+        assert!(
+            err < 1e-6 * gmax,
+            "max |fd - grad| {err:e}, max |grad| {gmax:e}"
+        );
     }
 }
