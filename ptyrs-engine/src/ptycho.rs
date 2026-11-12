@@ -6,8 +6,8 @@ use std::ops::Range;
 use ptyrs_core::{AddrTable, C64, Object, Probe, Scan, Stack};
 
 use crate::ops::{
-    Llk, accumulate_obj, apply_amplitude, llk, natural, obj_probe_to_psi, poisson_grad,
-    psi_to_obj_probe, quad_phase,
+    Llk, accumulate_obj, accumulate_probe, apply_amplitude, llk, natural, obj_probe_to_psi,
+    poisson_grad, psi_to_obj_probe, quad_phase,
 };
 use crate::{EngineError, Fft2, Observed, shift};
 
@@ -219,6 +219,33 @@ impl Ptycho {
     /// `∂L/∂Re O + i·∂L/∂Im O = 2·∂L/∂O*`: [`poisson_grad`] of the far field, inverse FFT, then
     /// [`accumulate_obj`]'s numerator. PyNX `ML`'s `obj_grad` is half of it.
     pub fn obj_grad(&self) -> Stack<C64> {
+        let psi = self.grad_psi();
+        accumulate_obj(
+            self.addr.views(),
+            self.object.dims(),
+            &self.probe,
+            &self.quad,
+            &psi,
+        )
+        .0
+    }
+
+    /// As [`Ptycho::obj_grad`] over the probe: `2·∂L/∂P*`, [`accumulate_probe`]'s numerator.
+    /// PyNX `ML`'s `probe_grad` is half of it.
+    pub fn probe_grad(&self) -> Stack<C64> {
+        let psi = self.grad_psi();
+        accumulate_probe(
+            self.addr.views(),
+            &self.object,
+            self.probe.dims(),
+            &self.quad,
+            &psi,
+        )
+        .0
+    }
+
+    /// The object-plane `2·∂L/∂psi*` both gradients back-project.
+    fn grad_psi(&self) -> Vec<C64> {
         let mut psi = self.calc_psi();
         self.fft.forward(&mut psi);
         poisson_grad(
@@ -228,8 +255,7 @@ impl Ptycho {
             &mut psi,
         );
         self.fft.inverse(&mut psi);
-        let views = self.addr.views();
-        accumulate_obj(views, self.object.dims(), &self.probe, &self.quad, &psi).0
+        psi
     }
 
     fn record(&mut self, algorithm: Algorithm, llk: Llk) {
@@ -552,11 +578,9 @@ mod tests {
         llk(&p.obs, 0..p.addr.nframe(), p.addr.nmode(), &psi).poisson
     }
 
-    /// [`Ptycho::obj_grad`] against central differences of the Poisson LLK sum in the real and
-    /// imaginary part of every object pixel, away from the truth, with two object and two probe
-    /// modes, masked detector pixels and pixels with zero counts.
-    #[test]
-    fn obj_grad_matches_central_differences() {
+    /// Two object and two probe modes, masked detector pixels and pixels with zero counts, the
+    /// object away from the truth, scaled.
+    fn grad_start() -> Ptycho {
         let g = Geometry::new(1.5e-10, 1.0, 75e-6, [16, 16]).unwrap();
         let pixel = g.pixel_size_object();
         let positions = ptyrs_core::sim::fermat(5, 3.0 * pixel[1]);
@@ -581,31 +605,29 @@ mod tests {
         p.scale_obj_probe();
         let obs = p.obs.frames(0..p.addr.nframe());
         assert!(obs.contains(&None) && obs.contains(&Some(0.0)));
+        p
+    }
 
-        let grad = p.obj_grad();
+    /// `grad` against central differences of the Poisson LLK sum in the real and imaginary
+    /// part of every element of the array `arr` picks, steps 1e-6 of its rms.
+    fn assert_central(p: &mut Ptycho, grad: &Stack<C64>, arr: fn(&mut Ptycho) -> &mut [C64]) {
+        let len = arr(p).len();
+        assert_eq!(grad.as_slice().len(), len);
         let gmax = grad.as_slice().iter().map(|v| v.norm()).fold(0.0, f64::max);
-        let len = grad.as_slice().len();
-        let rms = (p
-            .object
-            .as_slice()
-            .iter()
-            .map(|v| v.norm_sqr())
-            .sum::<f64>()
-            / len as f64)
-            .sqrt();
+        let rms = (arr(p).iter().map(|v| v.norm_sqr()).sum::<f64>() / len as f64).sqrt();
         let h = 1e-6 * rms;
         let mut err = 0.0f64;
         for k in 0..len {
-            let o = p.object.as_slice()[k];
+            let o = arr(p)[k];
             for (dir, want) in [
                 (C64::new(h, 0.0), grad.as_slice()[k].re),
                 (C64::new(0.0, h), grad.as_slice()[k].im),
             ] {
-                p.object.as_mut_slice()[k] = o + dir;
-                let lp = poisson_sum(&p);
-                p.object.as_mut_slice()[k] = o - dir;
-                let lm = poisson_sum(&p);
-                p.object.as_mut_slice()[k] = o;
+                arr(p)[k] = o + dir;
+                let lp = poisson_sum(p);
+                arr(p)[k] = o - dir;
+                let lm = poisson_sum(p);
+                arr(p)[k] = o;
                 err = err.max(((lp - lm) / (2.0 * h) - want).abs());
             }
         }
@@ -613,5 +635,19 @@ mod tests {
             err < 1e-6 * gmax,
             "max |fd - grad| {err:e}, max |grad| {gmax:e}"
         );
+    }
+
+    #[test]
+    fn obj_grad_matches_central_differences() {
+        let mut p = grad_start();
+        let grad = p.obj_grad();
+        assert_central(&mut p, &grad, |p| p.object.as_mut_slice());
+    }
+
+    #[test]
+    fn probe_grad_matches_central_differences() {
+        let mut p = grad_start();
+        let grad = p.probe_grad();
+        assert_central(&mut p, &grad, |p| p.probe.as_mut_slice());
     }
 }
