@@ -183,6 +183,20 @@ pub struct SliceJacobian<'a> {
     pub probe_dims: [usize; 3],
 }
 
+impl SliceJacobian<'_> {
+    /// A domain vector as its slices' objects and its probe.
+    pub(crate) fn split(&self, x: &[C64]) -> (Vec<Object>, Probe) {
+        let len = self.obj_dims.iter().product::<usize>();
+        let (o, p) = x.split_at(self.nslice * len);
+        let objects = o
+            .chunks_exact(len)
+            .map(|o| Object::new(Stack::from_vec(self.obj_dims, o.to_vec()).expect("object")))
+            .collect();
+        let probe = Probe::new(Stack::from_vec(self.probe_dims, p.to_vec()).expect("probe"));
+        (objects, probe)
+    }
+}
+
 impl LinearOp for SliceJacobian<'_> {
     fn domain_len(&self) -> usize {
         self.nslice * self.obj_dims.iter().product::<usize>()
@@ -192,13 +206,7 @@ impl LinearOp for SliceJacobian<'_> {
         self.waves.psi().len()
     }
     fn forward(&self, x: &[C64], y: &mut [C64]) {
-        let len = self.obj_dims.iter().product::<usize>();
-        let (o, p) = x.split_at(self.nslice * len);
-        let objects: Vec<Object> = o
-            .chunks_exact(len)
-            .map(|o| Object::new(Stack::from_vec(self.obj_dims, o.to_vec()).expect("object")))
-            .collect();
-        let probe = Probe::new(Stack::from_vec(self.probe_dims, p.to_vec()).expect("probe"));
+        let (objects, probe) = self.split(x);
         y.copy_from_slice(&self.waves.tangent(&objects, &probe));
     }
     fn adjoint(&self, y: &[C64], x: &mut [C64]) {
@@ -209,6 +217,31 @@ impl LinearOp for SliceJacobian<'_> {
             o.copy_from_slice(self.waves.obj_adjoint(s, &chi[s]).as_slice());
         }
         p.copy_from_slice(self.waves.probe_adjoint(&chi[0]).0.as_slice());
+    }
+}
+
+/// [`SliceJacobian`] then the propagator `U` to the detector plane, the change of the
+/// detector-plane field; adjoint `Jᴴ·Uᴴ`, which takes [`crate::BhBatch`]'s gradient back.
+pub(crate) struct FarJacobian<'a> {
+    pub slices: SliceJacobian<'a>,
+    pub propagator: &'a Propagator,
+}
+
+impl LinearOp for FarJacobian<'_> {
+    fn domain_len(&self) -> usize {
+        self.slices.domain_len()
+    }
+    fn range_len(&self) -> usize {
+        self.slices.range_len()
+    }
+    fn forward(&self, x: &[C64], y: &mut [C64]) {
+        self.slices.forward(x, y);
+        self.propagator.forward(y);
+    }
+    fn adjoint(&self, y: &[C64], x: &mut [C64]) {
+        let mut near = y.to_vec();
+        self.propagator.adjoint(&mut near);
+        self.slices.adjoint(&near, x);
     }
 }
 

@@ -120,6 +120,43 @@ impl<'a> SliceWaves<'a> {
     /// The change of the exit waves along a change `d_objects` of every slice and `d_probe`
     /// of the probe (planes as the probe's): the linearisation of [`Self::new`] at this state.
     pub fn tangent(&self, d_objects: &[Object], d_probe: &Probe) -> Vec<C64> {
+        self.tangent_waves(d_objects, d_probe).1
+    }
+
+    /// The derivatives of the exit waves along two changes `u` and `v`, each
+    /// `(d_objects, d_probe)` as in [`Self::tangent`]: `[J u, J v, J″(u, v)]` with `J″(u, v)`
+    /// the mixed second derivative. Slice `s` adds `q_s·(u_s·w_v,s + v_s·w_u,s)` to
+    /// `q_s·O_s` times the mixed change of the wave entering it, `w_u,s` being that wave's
+    /// change along `u`; at one slice `J″(u, v) = q·(u_O·v_P + v_O·u_P)`.
+    pub fn second_order(&self, u: (&[Object], &Probe), v: (&[Object], &Probe)) -> [Vec<C64>; 3] {
+        let (wu, ju) = self.tangent_waves(u.0, u.1);
+        let (wv, jv) = self.tangent_waves(v.0, v.1);
+        let dims = self.incident[0].dims();
+        let mut out = vec![C64::default(); self.psi.len()];
+        let mut cross = out.clone();
+        // the mixed change of the wave entering slice s, zero at slice 0
+        let mut wave: Option<Probe> = None;
+        for (s, o) in self.objects.iter().enumerate() {
+            let q = self.quad(s);
+            match &wave {
+                Some(w) => obj_probe_to_psi(&self.own, o, w, q, &mut out),
+                None => out.fill(C64::default()),
+            }
+            for (d, w) in [(&u.0[s], &wv[s]), (&v.0[s], &wu[s])] {
+                obj_probe_to_psi(&self.own, d, w, q, &mut cross);
+                out.iter_mut().zip(&cross).for_each(|(o, c)| *o += c);
+            }
+            if let Some(gap) = self.optics.gaps().get(s) {
+                gap.forward(&mut out);
+                wave = Some(Probe::new(reshift(&out, dims)));
+            }
+        }
+        [ju, jv, out]
+    }
+
+    /// Per slice, the change of the wave entering it along `(d_objects, d_probe)` (natural
+    /// layout, one plane per view), and the change of the exit waves.
+    fn tangent_waves(&self, d_objects: &[Object], d_probe: &Probe) -> (Vec<Probe>, Vec<C64>) {
         assert_eq!(d_objects.len(), self.objects.len());
         assert_eq!(d_probe.dims(), self.probe_dims);
         let dims = self.incident[0].dims();
@@ -128,20 +165,20 @@ impl<'a> SliceWaves<'a> {
             .iter()
             .flat_map(|v| d_probe.plane(v.probe as usize).iter().copied())
             .collect();
-        let mut wave = Probe::new(Stack::from_vec(dims, entry).unwrap());
+        let mut waves = vec![Probe::new(Stack::from_vec(dims, entry).unwrap())];
         let mut out = vec![C64::default(); self.psi.len()];
         for (s, (o, d)) in self.objects.iter().zip(d_objects).enumerate() {
-            obj_probe_to_psi(&self.own, o, &wave, self.quad(s), &mut out);
+            obj_probe_to_psi(&self.own, o, &waves[s], self.quad(s), &mut out);
             self.obj_tangent(s, d)
                 .iter()
                 .zip(out.iter_mut())
                 .for_each(|(t, o)| *o += t);
             if let Some(gap) = self.optics.gaps().get(s) {
                 gap.forward(&mut out);
-                wave = Probe::new(reshift(&out, dims));
+                waves.push(Probe::new(reshift(&out, dims)));
             }
         }
-        out
+        (waves, out)
     }
 
     /// The change of `psi_s` along `d` on slice `s` with the wave entering it held: `dop` of
