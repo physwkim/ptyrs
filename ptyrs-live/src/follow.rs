@@ -1,8 +1,11 @@
 //! The live AP consumer (DESIGN.md §3 B6, §7 M5): lands each frame batch
 //! the uploader sends into a [`LiveAp`] and runs epochs over the landed
 //! frames between batches, from graphs captured before the first frame.
-//! A mapper thread backs each batch's object tiles and view records before
-//! handing it on, so growing the object never stalls the epochs.
+//! The object the scan's plan reaches is backed before the first frame,
+//! and a mapper thread backs what each batch needs beyond it, its object
+//! tiles and view records, before handing it on: a scan inside its plan
+//! makes no growth call, which would hold the driver lock against the
+//! epochs' own calls, and growing past it never stalls them on the call.
 //!
 //! Once every frame of the scan has landed, or the uploader stopped with
 //! some missing, it goes on iterating and keeps a host copy of the object
@@ -130,6 +133,10 @@ pub struct FollowCfg {
     /// `[nprobe, n, n]`, natural order.
     pub probe: Vec<C32>,
     pub place: ViewPlacement,
+    /// The scan's planned positions, frame by frame from the first; the
+    /// object they reach is backed before the first frame. Empty when the
+    /// scan has no plan.
+    pub plan: Vec<(f64, f64)>,
     /// Epochs between kept snapshots.
     pub snap_every: NonZeroU32,
     /// Snapshots kept; the run stops after the last.
@@ -139,7 +146,8 @@ pub struct FollowCfg {
 impl FollowCfg {
     /// `rc` on the first `nframe` triggers of `p`'s scan, trigger `u` at
     /// its point `u % p.points()`: one object, `p`'s probe modes held fixed,
-    /// the object placed and its tile slots sized from those positions.
+    /// the object placed, its tile slots sized and its plan set from those
+    /// positions.
     pub fn plan(p: &Ptycho, nframe: NonZeroU32, rc: &ReconCfg) -> Self {
         let n = p.spec().n;
         let dx = p.spec().dx();
@@ -174,6 +182,7 @@ impl FollowCfg {
                 .map(|c| C32 { re: c.re, im: c.im })
                 .collect(),
             place,
+            plan: pos,
             snap_every: rc.snap_every,
             snaps: rc.snaps,
         }
@@ -227,6 +236,11 @@ pub struct FollowReport {
     pub positions: Vec<(f64, f64)>,
     pub kept: Vec<Kept>,
     pub obj_mapped_bytes: usize,
+    /// Time backing the plan took, before the first frame.
+    pub plan_time: Duration,
+    /// Object bytes mapped once the plan was backed; the scan grew it to
+    /// `obj_mapped_bytes`.
+    pub plan_mapped_bytes: usize,
     /// Per batch, the epochs queued before it landed and the frames stored
     /// with it: the schedule that, replayed, gives the same object.
     pub landings: Vec<(u64, u64)>,
@@ -308,10 +322,16 @@ pub fn run_ap_consumer(
     // store completed before the uploader sent their batch.
     let counts = unsafe { store.frames_view()? };
     let mut live = LiveAp::new(&stream, &cfg.ap, &cfg.probe, counts, preview.is_some())?;
-    // Only the mapper grows device memory from here on.
+    // The plan is backed before `captured` lets the first frame in; from
+    // here on only the mapper grows device memory, past the plan.
+    let mut backer = live.backer();
+    let t = Instant::now();
+    backer.plan(&views_of(&cfg.ap, &cfg.place, &cfg.plan))?;
+    let plan_time = t.elapsed();
+    let plan_mapped_bytes = live.scan().obj().mapped_bytes();
     let (fwd, ahead) = crossbeam_channel::unbounded();
     let mut mapper = {
-        let (b, ap, place) = (live.backer(), cfg.ap, cfg.place);
+        let (b, ap, place) = (backer, cfg.ap, cfg.place);
         Some(
             std::thread::Builder::new()
                 .name("backer".into())
@@ -453,6 +473,8 @@ pub fn run_ap_consumer(
         positions,
         kept,
         obj_mapped_bytes: live.scan().obj().mapped_bytes(),
+        plan_time,
+        plan_mapped_bytes,
         landings,
     })
 }
@@ -724,6 +746,9 @@ mod tests {
     /// their epochs, before the landings that followed them; the LLK it was
     /// sent is the replay's of every epoch.
     ///
+    /// The plan, every streamed position, was backed before the first frame:
+    /// landing the scan mapped no more of the object.
+    ///
     /// The live object is not held to the offline one here: how near AP on
     /// these frames gets to the offline run, settled at 8192 epochs, depends
     /// on how many epochs ran over the partial scan, which wall time sets.
@@ -742,6 +767,8 @@ mod tests {
         assert_eq!(recaptures, 0);
         let total = rep.positions.len() as u64;
         assert_eq!((rep.stored, rep.landed), (total, total));
+        assert!(rep.plan_mapped_bytes > 0);
+        assert_eq!(rep.obj_mapped_bytes, rep.plan_mapped_bytes);
         let scan_epochs = rep.scan_epochs.unwrap();
         assert!(scan_epochs > 0, "no epoch ran while the scan landed");
         assert_eq!(rep.landings.last().unwrap(), &(scan_epochs, total));

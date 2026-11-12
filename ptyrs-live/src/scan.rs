@@ -105,28 +105,41 @@ pub struct ScanBacker {
 }
 
 impl ScanBacker {
+    /// Backs the scan's plan before its first frame: what pushing `views`,
+    /// `nmode` per frame, as the scan's first frames needs. It counts no
+    /// frame as backed; [`Self::back`] then backs only what the frames
+    /// pushed need beyond it.
+    pub fn plan(&mut self, views: &[ViewAddr]) -> Result<(), GrowError> {
+        self.back_from(0, views)
+    }
+
     /// Backs what pushing `views`, `nmode` per frame, as the frames after
-    /// those already backed needs: the object tiles of every view that
-    /// passes [`ViewDims::check_view`] and the address records of the
-    /// frames inside the scan. Frames land in push order, so backing every
-    /// batch here before pushing it backs every frame that lands.
+    /// those already backed needs. Frames land in push order, so backing
+    /// every batch here before pushing it backs every frame that lands.
     pub fn back(&mut self, views: &[ViewAddr]) -> Result<(), GrowError> {
+        self.back_from(self.next, views)?;
+        self.next += (views.len() / self.dims.nmode as usize) as u64;
+        Ok(())
+    }
+
+    /// Backs the object tiles of every view of `views`, frames `first` on,
+    /// that passes [`ViewDims::check_view`] and the address records of
+    /// those frames inside the scan.
+    fn back_from(&mut self, first: u64, views: &[ViewAddr]) -> Result<(), GrowError> {
         let d = self.dims;
         let nmode = d.nmode as usize;
         let n = (views.len() / nmode) as u64;
-        let inside = u64::from(d.nframe).clamp(self.next, self.next + n);
-        let ins = &views[..(inside - self.next) as usize * nmode];
+        let inside = u64::from(d.nframe).clamp(first, first + n);
+        let ins = &views[..(inside - first) as usize * nmode];
         self.obj.back(
             ins.iter()
                 .filter(|v| d.check_view(v).is_ok())
                 .flat_map(|v| view_tiles(&d, v)),
         )?;
-        if inside > self.next {
+        if inside > first {
             let sz = size_of::<ViewAddr>() * nmode;
-            self.addr
-                .back(self.next as usize * sz..inside as usize * sz)?;
+            self.addr.back(first as usize * sz..inside as usize * sz)?;
         }
-        self.next += n;
         Ok(())
     }
 }
@@ -570,6 +583,56 @@ mod tests {
         assert_eq!(scan.closed(), Some(Refusal::Failed { frame: 0 }));
         assert_eq!((scan.landed(), scan.lost()), (0, 1));
         assert_eq!(scan.obj().mapped_bytes(), 0);
+    }
+
+    /// A plan backed before the first frame maps what backing its frames as
+    /// pushed maps; its frames then push without mapping more, a frame past
+    /// it grows the object, and an empty plan maps nothing.
+    #[test]
+    fn a_planned_scan_grows_only_past_its_plan() {
+        let ctx = Context::new(0).expect("GPU 0");
+        let s = ctx.new_stream().unwrap();
+        let one = NonZeroU32::new(1).unwrap();
+        // About four 2 MiB chunks of object rows.
+        let sh = shape(12, [1024, 1024]);
+        let at = |f: u32, oy| {
+            let v = ViewAddr {
+                oy,
+                ox: f * 64,
+                fy: 0.0,
+                fx: 0.0,
+                probe: 0,
+                obj: 0,
+            };
+            [v, ViewAddr { probe: 1, ..v }]
+        };
+        // Ten frames on the top rows are planned; two on the bottom are not.
+        let views: Vec<ViewAddr> = (0..10)
+            .flat_map(|f| at(f, 0))
+            .chain((10..12).flat_map(|f| at(f, 1024)))
+            .collect();
+        let (plan, past) = views.split_at(20);
+        let new = || LiveScan::new(&s, &sh, one, 64, [1.0, 0.0], 1).unwrap();
+        let mapped = |scan: &LiveScan| (scan.obj().mapped_bytes(), scan.addr.mapped_bytes());
+
+        let mut scan = new();
+        let mut b = scan.backer();
+        b.plan(plan).unwrap();
+        let planned = mapped(&scan);
+        let pushed = new();
+        pushed.backer().back(plan).unwrap();
+        assert_eq!(planned, mapped(&pushed));
+        assert!(planned.0 > 0 && planned.1 > 0, "{planned:?}");
+        assert_eq!(push(&mut scan, &mut b, &plan[..6]).unwrap(), 3);
+        assert_eq!(push(&mut scan, &mut b, &plan[6..]).unwrap(), 7);
+        assert_eq!(mapped(&scan), planned);
+        assert_eq!(push(&mut scan, &mut b, past).unwrap(), 2);
+        assert!(mapped(&scan).0 > planned.0, "{:?}", mapped(&scan));
+        assert_eq!((scan.landed(), scan.lost()), (12, 0));
+
+        let empty = new();
+        empty.backer().plan(&[]).unwrap();
+        assert_eq!(mapped(&empty), (0, 0));
     }
 
     /// A slab of `tile_cap` slots takes every view; one slot fewer refuses

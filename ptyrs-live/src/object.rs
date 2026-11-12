@@ -3,10 +3,11 @@
 //! the whole measurement.
 //!
 //! The object is `[nobj, nyo, nxo]` interleaved complex f32, row-major, the
-//! kernels' layout; rows are backed in whole tile rows as views reach them,
-//! by an [`ObjectBacker`] on a thread of its own, and fresh pixels start at
-//! a flat value. Its update sums, pixel for pixel in the same layout, are
-//! backed with those rows and start at zero. The
+//! kernels' layout; rows are backed in whole tile rows by an
+//! [`ObjectBacker`], those the scan's plan reaches before its first frame and
+//! the rest on a thread of its own as views reach them, and fresh pixels
+//! start at a flat value. Its update sums, pixel for pixel in the same
+//! layout, are backed with those rows and start at zero. The
 //! bins are the `tile_start`, `tile_views` and `tile_len` of
 //! [`ptyrs_gpu::Views`], in storage the live side owns: tile
 //! `t = ty * ntx + tx` of [`OBJ_TILE`] pixels per side has the `cap` slots
