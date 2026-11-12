@@ -75,7 +75,7 @@ enum Passes {
         scratch: DeviceBuffer<C32>,
     },
     /// M2's fused passes, one scratch set for every stack in turn.
-    Fused(FusedBufs),
+    Fused(Box<FusedBufs>),
 }
 
 /// [`Passes`] lent to a cycle.
@@ -518,7 +518,7 @@ impl Device {
                 )),
                 e => e.into(),
             })?;
-            Passes::Fused(f)
+            Passes::Fused(Box::new(f))
         } else {
             Passes::M1 {
                 plans: plans(&stream, &dims, &lens)?,

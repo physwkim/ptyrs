@@ -1,7 +1,9 @@
 //! PyNX AP on the GPU.
 
 use cuda_async::device_operation::ExecutionContext;
-use ptyrs_gpu::{Ended, Error as GpuError, Exit, FusedBufs, FusedInputs, FusedSums, RecordWriter};
+use ptyrs_gpu::{
+    Ended, Error as GpuError, Exit, FarSums, FusedBufs, FusedInputs, FusedSums, Model, RecordWriter,
+};
 
 use super::device::PassesMut;
 use super::{Bufs, Epoch, GpuPtycho};
@@ -82,13 +84,17 @@ impl Bufs<'_> {
             counts: self.counts,
             obj: self.obj,
             probe: self.probe,
+            model: Model::default(),
         };
         let exit = Exit::Ap {
-            llk: llk.is_some().then_some(&mut *self.llk),
+            far: FarSums {
+                llk: llk.is_some().then_some(&mut *self.llk),
+                ..FarSums::default()
+            },
         };
         let sums = FusedSums {
             obj: obj.then_some(&mut *self.obj_sums),
-            probe: None,
+            ..FusedSums::default()
         };
         self.kernels
             .fused_project(ctx, &inputs, stack, exit, f, sums)?;

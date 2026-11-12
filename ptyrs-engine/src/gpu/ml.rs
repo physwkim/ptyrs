@@ -4,8 +4,8 @@
 use cuda_async::device_operation::ExecutionContext;
 use ptyrs_core::{C64, Stack};
 use ptyrs_gpu::{
-    CG_BLOCKS, Ended, Error as GpuError, Exit, FusedBufs, FusedInputs, FusedSums, ObjProbeScale,
-    RecordWriter,
+    CG_BLOCKS, Ended, Error as GpuError, Exit, FarSums, FusedBufs, FusedInputs, FusedSums, Model,
+    ObjProbeScale, RecordWriter,
 };
 
 use super::device::{MlBufs, PassesMut};
@@ -154,13 +154,18 @@ impl Bufs<'_> {
             counts: self.counts,
             obj: self.obj,
             probe: self.probe,
+            model: Model::default(),
         };
         let exit = Exit::Grad {
-            llk: llk.is_some().then_some(&mut *self.llk),
+            far: FarSums {
+                llk: llk.is_some().then_some(&mut *self.llk),
+                ..FarSums::default()
+            },
         };
         let sums = FusedSums {
             obj: update[0].then_some(&mut *self.obj_sums),
             probe: update[1].then_some(&mut *self.probe_sums),
+            ..FusedSums::default()
         };
         self.kernels
             .fused_project(ctx, &inputs, stack, exit, f, sums)?;

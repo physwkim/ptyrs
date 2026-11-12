@@ -100,8 +100,9 @@ const _: () = assert!(PIXEL_THREADS.is_multiple_of(WARP));
 
 /// Device addresses of the per-object-tile view lists: tile `t`'s run is
 /// `views[start[t] .. start[t] + len[t]]`, ascending view indices, `len[t] <=
-/// start[t + 1] - start[t]`. No kernel reads or writes the object or sum pixels of a tile
-/// with `len[t] == 0`, nor its run.
+/// start[t + 1] - start[t]`. No kernel writes the object pixels of a tile with `len[t] ==
+/// 0`, nor reads or writes its sums or run; kernels that sample the object per view read
+/// its object pixels.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct TilePtrs {
@@ -122,8 +123,9 @@ pub unsafe fn tile_run(tiles: TilePtrs, t: usize) -> (u32, u32) {
 }
 
 /// The part of tile `t`'s run from its first view `>= k0` to its end, if that view is
-/// `< k1`; the caller stops at the first view `>= k1`. `None` when no view of the stack
-/// `k0 .. k1` touches the tile, so the tile's sums must be left untouched.
+/// `< k1`; the caller stops at the first view outside `k0 .. k1`, so a run out of
+/// ascending order reads no view past the stack. `None` when no view of the stack `k0 ..
+/// k1` touches the tile, so the tile's sums must be left untouched.
 ///
 /// # Safety
 ///
@@ -197,6 +199,73 @@ pub struct LlkPartial {
 
 // SAFETY: repr(C) of four f32, no padding; every bit pattern is a valid value.
 unsafe impl cuda_core::DeviceCopy for LlkPartial {}
+
+/// Sums over unmasked pixels of one frame, or of a column group of one, from which the
+/// frame's intensity scale `s` is updated; `I = sum_m |Psi_m|^2 / n` is the model intensity
+/// before the scale and `calc` the model intensity the counts are compared with.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ScalePartial {
+    /// `sum I`.
+    pub intensity: f32,
+    /// `sum obs I / max(calc, 1e-12)`, for the Poisson cost.
+    pub ratio: f32,
+    /// `sum sqrt(obs I)`, for the amplitude cost.
+    pub amplitude: f32,
+}
+
+// SAFETY: repr(C) of three f32, no padding; every bit pattern is a valid value.
+unsafe impl cuda_core::DeviceCopy for ScalePartial {}
+
+/// A sum along the two position axes of a frame, or of a block's share of one: the position
+/// gradient or its normalising denominator.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PositionPartial {
+    pub dy: f32,
+    pub dx: f32,
+}
+
+// SAFETY: repr(C) of two f32, no padding; every bit pattern is a valid value.
+unsafe impl cuda_core::DeviceCopy for PositionPartial {}
+
+/// FFT-order frequency of bin `k` of `n` in cycles per pixel, `fftfreq`: `k / n` below
+/// `n / 2`, else `(k - n) / n`.
+#[device]
+pub fn freq(k: u32, n: u32) -> f32 {
+    let k = if k < n / 2 {
+        k as f32
+    } else {
+        k as f32 - n as f32
+    };
+    k / n as f32
+}
+
+/// `exp(-2 pi i d freq(k, n))` as `(cos, sin)`: bin `k`'s factor of a shift by `d` pixels.
+/// The phase is reduced to half a turn before the sine and cosine.
+#[device]
+pub fn ramp(d: f32, k: u32, n: u32) -> (f32, f32) {
+    let mut t = d * freq(k, n);
+    t -= (t + 0.5).floor();
+    let a = -2.0 * core::f32::consts::PI * t;
+    (a.cos(), a.sin())
+}
+
+/// Adds an unmasked pixel of count `obs` and calculated intensity `calc >= 0` to `acc`:
+/// Poisson `calc` if `obs <= 0.1` else `calc - obs + obs ln(obs / calc)`, Gaussian
+/// `(obs - calc)^2 / (obs + 1)`, Euclidean `4 (sqrt obs - sqrt calc)^2`, and `calc`.
+#[device]
+pub fn llk_add(acc: &mut LlkPartial, obs: f32, calc: f32) {
+    acc.poisson += if obs <= 0.1 {
+        calc
+    } else {
+        calc - obs + obs * (obs / calc).ln()
+    };
+    acc.gaussian += (obs - calc) * (obs - calc) / (obs + 1.0);
+    let e = obs.sqrt() - calc.sqrt();
+    acc.euclidean += 4.0 * e * e;
+    acc.icalc += calc;
+}
 
 /// Offset in an origin-at-`[0, 0]` plane of natural pixel `(y, x)`.
 #[device]

@@ -1,7 +1,7 @@
 //! PyNX DM on the GPU.
 
 use cuda_async::device_operation::ExecutionContext;
-use ptyrs_gpu::{Error as GpuError, Exit, FusedInputs, FusedSums};
+use ptyrs_gpu::{Error as GpuError, Exit, FusedInputs, FusedSums, Model};
 
 use super::device::{M1Bufs, PassesMut};
 use super::{Bufs, Epoch, GpuPtycho};
@@ -70,6 +70,7 @@ impl Bufs<'_> {
                         counts: self.counts,
                         obj: self.obj,
                         probe: self.probe,
+                        model: Model::default(),
                     };
                     let exit = if first {
                         Exit::DmFirst { psi }
@@ -78,7 +79,7 @@ impl Bufs<'_> {
                     };
                     let sums = FusedSums {
                         obj: summed.then_some(&mut *self.obj_sums),
-                        probe: None,
+                        ..FusedSums::default()
                     };
                     self.kernels
                         .fused_project(ctx, &inputs, stack, exit, f, sums)?;

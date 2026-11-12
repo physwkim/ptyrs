@@ -30,8 +30,8 @@ use ptyrs_core::sim::fermat;
 use ptyrs_core::{AddrTable, Geometry, Positions, required_obj_shape};
 use ptyrs_fft::Plan2d;
 use ptyrs_gpu::{
-    C32, Error, Exit, FusedBufs, FusedInputs, FusedSums, Kernels, LlkPartial, LlkSums, StackTable,
-    UpdateSums, ViewAddr, ViewDims, Views, record,
+    C32, Error, Exit, FarSums, FusedBufs, FusedInputs, FusedSums, Kernels, LlkPartial, LlkSums,
+    Model, StackTable, UpdateSums, ViewAddr, ViewDims, Views, record,
 };
 use ptyrs_tile::{TileKernels, llk_sums_scratch_len};
 
@@ -197,13 +197,17 @@ fn epoch(
             counts: scan.counts,
             obj: &s.obj,
             probe: &s.probe,
+            model: Model::default(),
         };
         let exit = Exit::Ap {
-            llk: llk.then_some(partials),
+            far: FarSums {
+                llk: llk.then_some(partials),
+                ..FarSums::default()
+            },
         };
         let sums = FusedSums {
             obj: (!obj_t).then_some(&mut s.obj_sums),
-            probe: None,
+            ..FusedSums::default()
         };
         k.fused_project(ctx, &inputs, stack, exit, &mut s.bufs, sums)?;
         let work = s.bufs.work();
