@@ -490,6 +490,8 @@ impl Ptycho {
                 }
             }
             let (num, den) = self.cg_gamma(&dir[0], &dir[1]);
+            // PyNX's γ has a wrong cross term in `den` (see `cg_poisson_gamma`); ptyrs follows
+            // the math on both backends, so a γ gap to PyNX is not to be fixed toward it.
             let gamma = num / den;
             if gamma.is_finite() {
                 let [d_obj, d_probe] = &dir;
