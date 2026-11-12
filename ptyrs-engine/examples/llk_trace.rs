@@ -5,7 +5,8 @@
 //! (defaults 50, 1, 64, 100, 4 object pixels) writes `scan.cxi`, `init.h5` (the scaled
 //! starting object and probe), `llk_rust.txt` (cycle and the normalised Poisson, Gaussian,
 //! Euclidian LLK and photon count per cycle) and `final_rust.h5`, from the CPU oracle or, with
-//! `--gpu`, from [`GpuPtycho`] on CUDA device 0 with the default stacks. rPIE also writes
+//! `--gpu`, from [`GpuPtycho`] on CUDA device 0 with the default stacks, by the fused passes
+//! on 128- or 256-pixel frames and by M1's launches on others. rPIE also writes
 //! `views.txt` (object window corner `oy ox` per frame), `quad.txt` (`re im` of the quadratic
 //! phase, natural order), which pty-chi has no notion of, and `rpie.txt` (`common::RPIE`,
 //! step 0 for a fixed array).
@@ -87,7 +88,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (history, object, probe, secs) = if gpu {
         let ctx = CudaContext::new(0).map_err(EngineError::from)?;
         let (object, probe) = p.into_modes();
-        let mut g = GpuPtycho::new(&ctx, &scan, object, probe, GpuOptions::default())?;
+        let options = GpuOptions {
+            fused: matches!(frame, 128 | 256),
+            ..GpuOptions::default()
+        };
+        eprintln!("GPU passes: {}", if options.fused { "fused" } else { "m1" });
+        let mut g = GpuPtycho::new(&ctx, &scan, object, probe, options)?;
         let t = std::time::Instant::now();
         match algo.as_str() {
             "dm" => g.dm(&dm, ncycle)?,

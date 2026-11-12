@@ -1,5 +1,6 @@
 //! The GPU backend against the CPU oracle: per-record LLK and the final object and probe of AP,
-//! DM and rPIE updating the object, the probe or both, from the same scaled start.
+//! DM and rPIE updating the object, the probe or both, from the same scaled start; AP and DM
+//! by M1's launches and by the fused passes.
 
 use std::sync::Arc;
 
@@ -15,20 +16,43 @@ mod common;
 /// 30 positions: stacks of 7 and batches of 4 both leave a shorter last one. Three LLK
 /// slots: the ring wraps within every LLK-taking call.
 const NPOS: usize = 30;
-const STACK: GpuOptions = GpuOptions {
-    stack_size: 7,
-    graph: true,
-    llk_slots: 3,
+
+/// A frame side and the options run on it.
+#[derive(Clone, Copy, Debug)]
+struct Setup {
+    frame: usize,
+    options: GpuOptions,
+}
+
+/// M1's launches on 32-pixel frames.
+const M1: Setup = Setup {
+    frame: 32,
+    options: GpuOptions {
+        stack_size: 7,
+        graph: true,
+        llk_slots: 3,
+        fused: false,
+    },
+};
+
+/// The fused passes on 128-pixel frames, the smallest side they run.
+const FUSED: Setup = Setup {
+    frame: 128,
+    options: GpuOptions {
+        fused: true,
+        ..M1.options
+    },
 };
 
 fn ctx() -> Arc<CudaContext> {
     CudaContext::new(0).expect("CUDA device 0")
 }
 
-/// The parity scenario at 32 pixels, scaled on the CPU; `masked` masks row 3 and column 20
-/// of every frame.
-fn start(nprobe: usize, masked: bool) -> (Scan, Object, Probe) {
-    let (mut scan, object, probe) = common::dm_scenario(32, NPOS, nprobe, 2e5, 4.0);
+/// The parity scenario on `frame`-pixel frames, `frame / 8` object pixels apart, scaled on
+/// the CPU; `masked` masks row 3 and column 20 of every frame.
+fn start(frame: usize, nprobe: usize, masked: bool) -> (Scan, Object, Probe) {
+    let (mut scan, object, probe) =
+        common::dm_scenario(frame, NPOS, nprobe, 2e5, frame as f64 / 8.0);
     if masked {
         let dims = scan.counts.dims();
         let data = scan
@@ -37,7 +61,7 @@ fn start(nprobe: usize, masked: bool) -> (Scan, Object, Probe) {
             .iter()
             .enumerate()
             .map(|(i, &c)| {
-                let (y, x) = ((i / 32) % 32, i % 32);
+                let (y, x) = ((i / frame) % frame, i % frame);
                 if y == 3 || x == 20 { MASKED } else { c }
             })
             .collect();
@@ -78,10 +102,10 @@ fn llk_rel(g: &[LlkRecord], c: &[LlkRecord]) -> f64 {
 
 /// Runs `params` for `ncycle` on both backends and returns the worst LLK and the object and
 /// probe relative errors.
-fn compare(nprobe: usize, masked: bool, params: Params, ncycle: usize) -> [f64; 3] {
-    let (scan, object, probe) = start(nprobe, masked);
+fn compare(setup: Setup, nprobe: usize, masked: bool, params: Params, ncycle: usize) -> [f64; 3] {
+    let (scan, object, probe) = start(setup.frame, nprobe, masked);
     let mut cpu = Ptycho::new(&scan, object.clone(), probe.clone()).unwrap();
-    let mut gpu = GpuPtycho::new(&ctx(), &scan, object, probe, STACK).unwrap();
+    let mut gpu = GpuPtycho::new(&ctx(), &scan, object, probe, setup.options).unwrap();
     let step = Step {
         params,
         count: ncycle,
@@ -95,8 +119,8 @@ fn compare(nprobe: usize, masked: bool, params: Params, ncycle: usize) -> [f64; 
         rel_l2(&gpu.probe().unwrap(), cpu.probe()),
     ];
     eprintln!(
-        "{params:?}: llk {:.2e} object {:.2e} probe {:.2e}",
-        errs[0], errs[1], errs[2]
+        "fused {} {params:?}: llk {:.2e} object {:.2e} probe {:.2e}",
+        setup.options.fused, errs[0], errs[1], errs[2]
     );
     errs
 }
@@ -116,35 +140,44 @@ fn check(errs: [f64; 3], tol: [f64; 3]) {
 
 #[test]
 fn ap_matches_cpu() {
-    for (o, p) in UPDATES {
-        let params = ApParams {
-            obj_inertia: o,
-            probe_inertia: p,
-            calc_llk: 1,
-            zero_phase_ramp: true,
-        };
-        check(compare(2, true, Params::Ap(params), 10), [1e-4, 1e-4, 1e-4]);
+    for setup in [M1, FUSED] {
+        for (o, p) in UPDATES {
+            let params = ApParams {
+                obj_inertia: o,
+                probe_inertia: p,
+                calc_llk: 1,
+                zero_phase_ramp: true,
+            };
+            let errs = compare(setup, 2, true, Params::Ap(params), 10);
+            check(errs, [1e-4, 1e-4, 1e-4]);
+        }
     }
 }
 
 #[test]
 fn dm_matches_cpu() {
-    for (o, p) in UPDATES {
+    for setup in [M1, FUSED] {
+        for (o, p) in UPDATES {
+            let params = DmParams {
+                obj_inertia: o,
+                probe_inertia: p,
+                calc_llk: 1,
+                ..DmParams::default()
+            };
+            let errs = compare(setup, 2, true, Params::Dm(params), 10);
+            check(errs, [1e-4, 1e-4, 1e-4]);
+        }
+        // two object-then-probe rounds per cycle, one mode, no mask
         let params = DmParams {
-            obj_inertia: o,
-            probe_inertia: p,
-            calc_llk: 1,
+            loop_obj_probe: 2,
+            calc_llk: 3,
             ..DmParams::default()
         };
-        check(compare(2, true, Params::Dm(params), 10), [1e-4, 1e-4, 1e-4]);
+        check(
+            compare(setup, 1, false, Params::Dm(params), 7),
+            [1e-4, 1e-4, 1e-4],
+        );
     }
-    // two object-then-probe rounds per cycle, one mode, no mask
-    let params = DmParams {
-        loop_obj_probe: 2,
-        calc_llk: 3,
-        ..DmParams::default()
-    };
-    check(compare(1, false, Params::Dm(params), 7), [1e-4, 1e-4, 1e-4]);
 }
 
 #[test]
@@ -156,7 +189,7 @@ fn rpie_matches_cpu() {
             ..common::RPIE
         };
         check(
-            compare(2, true, Params::Rpie(params), 10),
+            compare(M1, 2, true, Params::Rpie(params), 10),
             [1e-4, 1e-4, 1e-4],
         );
     }
@@ -167,9 +200,15 @@ fn rpie_matches_cpu() {
 /// size differs, so its epochs get their own batches and graph.
 #[test]
 fn algorithm_switches_match_cpu() {
-    let (scan, object, probe) = start(2, true);
+    for setup in [M1, FUSED] {
+        switches_match_cpu(setup);
+    }
+}
+
+fn switches_match_cpu(setup: Setup) {
+    let (scan, object, probe) = start(setup.frame, 2, true);
     let mut cpu = Ptycho::new(&scan, object.clone(), probe.clone()).unwrap();
-    let mut gpu = GpuPtycho::new(&ctx(), &scan, object, probe, STACK).unwrap();
+    let mut gpu = GpuPtycho::new(&ctx(), &scan, object, probe, setup.options).unwrap();
     let (o, p) = UPDATES[2];
     let steps = [
         Params::Rpie(common::RPIE),
@@ -208,23 +247,25 @@ fn algorithm_switches_match_cpu() {
 
 #[test]
 fn gpu_rejects_what_it_cannot_run() {
-    let (scan, object, probe) = start(1, false);
+    let (scan, object, probe) = start(M1.frame, 1, false);
     let two = Object::new(Stack::filled(
         [2, object.dims()[1], object.dims()[2]],
         C64::new(1.0, 0.0),
     ));
-    let mut g = GpuPtycho::new(&ctx(), &scan, two, probe.clone(), STACK).unwrap();
+    let mut g = GpuPtycho::new(&ctx(), &scan, two, probe.clone(), M1.options).unwrap();
     assert!(g.rpie(&common::RPIE, 1).is_err());
     let zero = GpuOptions {
         stack_size: 0,
-        ..STACK
+        ..M1.options
     };
     assert!(GpuPtycho::new(&ctx(), &scan, object.clone(), probe.clone(), zero).is_err());
     let no_ring = GpuOptions {
         llk_slots: 0,
-        ..STACK
+        ..M1.options
     };
-    assert!(GpuPtycho::new(&ctx(), &scan, object, probe, no_ring).is_err());
+    assert!(GpuPtycho::new(&ctx(), &scan, object.clone(), probe.clone(), no_ring).is_err());
+    // the fused passes have no 32-point FFT
+    assert!(GpuPtycho::new(&ctx(), &scan, object, probe, FUSED.options).is_err());
 }
 
 /// AP and DM cycles (AP's with an LLK and DM's first included), rPIE epochs and LLK passes
@@ -234,9 +275,18 @@ fn gpu_rejects_what_it_cannot_run() {
 /// public LLK query between calls.
 #[test]
 fn graph_replays_bitwise_like_eager() {
-    let (scan, object, probe) = start(2, true);
+    for setup in [M1, FUSED] {
+        graph_like_eager(setup);
+    }
+}
+
+fn graph_like_eager(setup: Setup) {
+    let (scan, object, probe) = start(setup.frame, 2, true);
     let run = |graph: bool| {
-        let options = GpuOptions { graph, ..STACK };
+        let options = GpuOptions {
+            graph,
+            ..setup.options
+        };
         let mut g = GpuPtycho::new(&ctx(), &scan, object.clone(), probe.clone(), options).unwrap();
         let dm = DmParams {
             calc_llk: 3,
@@ -288,7 +338,7 @@ fn graph_replays_bitwise_like_eager() {
     };
     let (eager, graph) = (run(false), run(true));
     assert_eq!(eager.2.len(), 3 + 3 + 2 + 2 + 3 + 2 + 2 + 1);
-    assert!(eager.2 == graph.2, "LLK records differ");
-    assert!(eager.0 == graph.0, "object differs");
-    assert!(eager.1 == graph.1, "probe differs");
+    assert!(eager.2 == graph.2, "{setup:?}: LLK records differ");
+    assert!(eager.0 == graph.0, "{setup:?}: object differs");
+    assert!(eager.1 == graph.1, "{setup:?}: probe differs");
 }

@@ -13,11 +13,11 @@ use cuda_async::device_operation::{DeviceOp, ExecutionContext};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 use ptyrs_fft::Plan2d;
 use ptyrs_gpu::{
-    C32, Ended, Error as GpuError, Kernels, LlkPartial, LlkRing, LlkSums, RingDevice, RpieKernels,
-    StackTable, UpdateSums, ViewAddr, ViewDims, Views,
+    C32, Ended, Error as GpuError, FusedBufs, Kernels, LlkPartial, LlkRing, LlkSums, RingDevice,
+    RpieKernels, StackTable, UpdateSums, ViewAddr, ViewDims, Views,
 };
 
-use super::{Epoch, Frames, GpuOptions, Tag, plane_len, stack_buf_len, stacks, to_u32};
+use super::{Epoch, Frames, GpuOptions, Tag, plane_len, plans, stack_buf_len, stacks, to_u32};
 use crate::{ApParams, DmParams, EngineError, RpieParams};
 
 /// Every buffer, module and plan a cycle launches on, and the graphs captured from them.
@@ -35,10 +35,7 @@ pub(super) struct Device {
     probe_len: u32,
     table: StackTable,
     stacks: Vec<StackBufs>,
-    /// One plan per stack length, indexed by [`Frames::plan`].
-    plans: Vec<Plan2d>,
-    /// One stack's worth of exit waves: DM's `PO`, the LLK pass's forward stack.
-    scratch: DeviceBuffer<C32>,
+    passes: Passes,
     /// One stack's LLK partials, on their way into the ring.
     llk: DeviceBuffer<LlkPartial>,
     ring: LlkRing<Tag>,
@@ -47,6 +44,31 @@ pub(super) struct Device {
     runs: Vec<EpochRun>,
     /// With graphs, the LLK pass's graph.
     llk_graph: Option<Captured>,
+}
+
+/// How AP and DM project a stack and the LLK pass takes its partials, with the buffers only
+/// that way uses ([`GpuOptions::fused`]).
+enum Passes {
+    M1 {
+        /// One plan per stack length, indexed by [`Frames::plan`].
+        plans: Vec<Plan2d>,
+        /// One stack's worth of exit waves: DM's `PO`, the LLK pass's forward stack.
+        scratch: DeviceBuffer<C32>,
+    },
+    /// M2's fused passes, one scratch set for every stack in turn.
+    Fused(FusedBufs),
+}
+
+/// [`Passes`] lent to a cycle.
+pub(super) enum PassesMut<'a> {
+    M1(M1Bufs<'a>),
+    Fused(&'a mut FusedBufs),
+}
+
+/// [`Passes::M1`] lent to a cycle.
+pub(super) struct M1Bufs<'a> {
+    pub plans: Plans<'a>,
+    pub scratch: &'a mut DeviceBuffer<C32>,
 }
 
 /// A cycle with the buffers only it uses, and with graphs the graph captured for it.
@@ -123,7 +145,7 @@ impl RpieScratch {
         params: &RpieParams,
         nprobe_values: usize,
     ) -> Result<Self, EngineError> {
-        let (batches, table, plans) =
+        let (batches, table, lens) =
             stacks(stream, dims, to_u32("batch_size", params.batch_size)?)?;
         let len = stack_buf_len(dims, &table);
         let nk_max = table.nf_max() as usize * dims.nmode as usize;
@@ -131,7 +153,7 @@ impl RpieScratch {
             batches,
             n: to_u32("frame size", plane_len(dims))?,
             table,
-            plans,
+            plans: plans(stream, dims, &lens)?,
             psi: DeviceBuffer::zeroed(stream, len)?,
             dlt: DeviceBuffer::zeroed(stream, len)?,
             omax: DeviceBuffer::zeroed(stream, nk_max)?,
@@ -164,8 +186,8 @@ struct StackBufs {
     psi: DeviceBuffer<C32>,
 }
 
-/// The [`Device`] lent to a cycle: references only, so a cycle launches on every buffer but
-/// rebinding a field leaves the `Device` as it was.
+/// The [`Device`] lent to a cycle, but for its [`PassesMut`]: references only, so a cycle
+/// launches on every buffer but rebinding a field leaves the `Device` as it was.
 pub(super) struct Bufs<'a> {
     pub kernels: &'a Kernels,
     pub rpie: &'a RpieKernels,
@@ -179,8 +201,6 @@ pub(super) struct Bufs<'a> {
     pub probe_len: u32,
     pub table: &'a StackTable,
     pub stacks: Stacks<'a>,
-    pub plans: Plans<'a>,
-    pub scratch: &'a mut DeviceBuffer<C32>,
     /// A stack's LLK partials, which [`ptyrs_gpu::RecordWriter::push`] then copies into the
     /// record.
     pub llk: &'a mut DeviceBuffer<LlkPartial>,
@@ -220,8 +240,8 @@ impl Plans<'_> {
 
 impl Device {
     /// Loads the kernels and uploads the views, counts and starting arrays on a new stream of
-    /// `ctx`; the stacks cut `0 .. nframe` into `options.stack_size` frames, and the LLK ring
-    /// holds `options.llk_slots` records.
+    /// `ctx`; the stacks cut `0 .. nframe` into `options.stack_size` frames, the LLK ring
+    /// holds `options.llk_slots` records, and `options.fused` picks the [`Passes`].
     pub fn new(
         ctx: &Arc<CudaContext>,
         dims: ViewDims,
@@ -235,9 +255,17 @@ impl Device {
         let kernels = Kernels::load(ctx)?;
         let rpie = RpieKernels::load(&kernels)?;
         let views = Views::new(&stream, dims, addrs)?;
-        let (frames, table, plans) =
+        let (frames, table, lens) =
             stacks(&stream, &dims, to_u32("stack_size", options.stack_size)?)?;
         let len = stack_buf_len(&dims, &table);
+        let passes = if options.fused {
+            Passes::Fused(FusedBufs::new(&stream, &dims, table.nf_max())?)
+        } else {
+            Passes::M1 {
+                plans: plans(&stream, &dims, &lens)?,
+                scratch: DeviceBuffer::zeroed(&stream, len)?,
+            }
+        };
         let stacks = frames
             .into_iter()
             .map(|frames| {
@@ -250,7 +278,6 @@ impl Device {
         let mut dev = Self {
             obj_len: to_u32("object length", obj.len())?,
             probe_len: to_u32("probe length", probe.len())?,
-            scratch: DeviceBuffer::zeroed(&stream, len)?,
             llk: DeviceBuffer::zeroed(&stream, table.nf_max() as usize)?,
             ring: LlkRing::new(
                 &kernels,
@@ -268,16 +295,16 @@ impl Device {
             views,
             table,
             stacks,
-            plans,
+            passes,
             use_graph: options.graph,
             runs: Vec::new(),
             llk_graph: None,
             stream,
         };
         if dev.use_graph {
-            dev.llk_graph = Some(
-                dev.capture(|bufs, ring, ctx| bufs.forward_llk(ctx, ring.record()).map(Some))?,
-            );
+            dev.llk_graph = Some(dev.capture(|bufs, passes, ring, ctx| {
+                bufs.forward_llk(ctx, passes, ring.record()).map(Some)
+            })?);
         }
         Ok(dev)
     }
@@ -310,8 +337,9 @@ impl Device {
         Ok(())
     }
 
-    /// Lends every buffer, and apart the ring the cycle writes its records through.
-    fn lend(&mut self) -> (Bufs<'_>, &mut RingDevice) {
+    /// Lends every buffer, and apart the passes' own and the ring the cycle writes its records
+    /// through.
+    fn lend(&mut self) -> (Bufs<'_>, PassesMut<'_>, &mut RingDevice) {
         let bufs = Bufs {
             kernels: &self.kernels,
             rpie: &self.rpie,
@@ -325,11 +353,16 @@ impl Device {
             probe_len: self.probe_len,
             table: &self.table,
             stacks: Stacks(&mut self.stacks),
-            plans: Plans(&mut self.plans),
-            scratch: &mut self.scratch,
             llk: &mut self.llk,
         };
-        (bufs, self.ring.device())
+        let passes = match &mut self.passes {
+            Passes::M1 { plans, scratch } => PassesMut::M1(M1Bufs {
+                plans: Plans(plans),
+                scratch,
+            }),
+            Passes::Fused(f) => PassesMut::Fused(f),
+        };
+        (bufs, passes, self.ring.device())
     }
 
     /// Enqueues one `epoch` cycle, numbered `cycle`: replays the graph captured for it, or
@@ -352,8 +385,8 @@ impl Device {
             Some(c) => self.replay(c, tag),
             None => {
                 let ctx = self.context();
-                let (mut bufs, ring) = self.lend();
-                match bufs.cycle(&ctx, ring, &mut run.cycle) {
+                let (mut bufs, mut passes, ring) = self.lend();
+                match bufs.cycle(&ctx, &mut passes, ring, &mut run.cycle) {
                     Ok(ended) => self.count(ended.as_ref(), tag),
                     Err(e) => Err(e.into()),
                 }
@@ -371,8 +404,8 @@ impl Device {
             Some(c) => self.replay(c, tag),
             None => {
                 let ctx = self.context();
-                let (mut bufs, ring) = self.lend();
-                match bufs.forward_llk(&ctx, ring.record()) {
+                let (mut bufs, mut passes, ring) = self.lend();
+                match bufs.forward_llk(&ctx, &mut passes, ring.record()) {
                     Ok(ended) => self.count(Some(&ended), tag),
                     Err(e) => Err(e.into()),
                 }
@@ -398,7 +431,7 @@ impl Device {
             }
         };
         let graph = if self.use_graph {
-            Some(self.capture(|bufs, ring, ctx| bufs.cycle(ctx, ring, &mut cycle))?)
+            Some(self.capture(|bufs, passes, ring, ctx| bufs.cycle(ctx, passes, ring, &mut cycle))?)
         } else {
             None
         };
@@ -411,16 +444,17 @@ impl Device {
         &mut self,
         f: impl FnOnce(
             &mut Bufs<'_>,
+            &mut PassesMut<'_>,
             &mut RingDevice,
             &ExecutionContext,
         ) -> Result<Option<Ended>, GpuError>
         + Send,
     ) -> Result<Captured, EngineError> {
         let side = self.kernels.context().new_stream()?;
-        let (mut bufs, ring) = self.lend();
+        let (mut bufs, mut passes, ring) = self.lend();
         let mut ended = None;
         let op = ptyrs_gpu::record(|ctx| {
-            ended = Some(f(&mut bufs, ring, ctx)?);
+            ended = Some(f(&mut bufs, &mut passes, ring, ctx)?);
             Ok(())
         });
         let graph = CudaGraph::capture(side, op).map_err(GpuError::from)?;
@@ -451,12 +485,17 @@ impl Bufs<'_> {
     fn cycle(
         &mut self,
         ctx: &ExecutionContext,
+        passes: &mut PassesMut<'_>,
         ring: &mut RingDevice,
         cycle: &mut Cycle,
     ) -> Result<Option<Ended>, GpuError> {
         match cycle {
-            Cycle::Ap { params, llk } => self.ap_cycle(ctx, params, llk.then(|| ring.record())),
-            Cycle::Dm { params, first } => self.dm_cycle(ctx, params, *first).map(|()| None),
+            Cycle::Ap { params, llk } => {
+                self.ap_cycle(ctx, passes, params, llk.then(|| ring.record()))
+            }
+            Cycle::Dm { params, first } => {
+                self.dm_cycle(ctx, passes, params, *first).map(|()| None)
+            }
             Cycle::Rpie(p, scratch) => self.rpie_epoch(ctx, p, &mut scratch.lend()).map(|()| None),
         }
     }

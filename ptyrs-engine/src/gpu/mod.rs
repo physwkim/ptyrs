@@ -5,9 +5,12 @@
 //! The scan's frames are cut into stacks of [`GpuOptions::stack_size`] consecutive frames,
 //! one [`StackTable`] entry each: every launch reads its stack's frames from the entry on the
 //! device. Each stack keeps its own exit waves (DM carries them across cycles), sized like
-//! PyNX's fixed stack for the longest stack; one scratch stack serves all, and stacks of one
-//! length share a cuFFT plan, which transforms only their frames. Each cycle enqueues through
-//! its own `ExecutionContext`, dropped when the cycle has been enqueued. Nothing in a cycle
+//! PyNX's fixed stack for the longest stack. AP and DM project a stack, and the LLK pass
+//! takes its partials, either by M2's fused passes over one scratch set or by the M1 launch
+//! sequence ([`GpuOptions::fused`]), whose one scratch stack serves all and whose stacks of
+//! one length share a cuFFT plan, which transforms only their frames; rPIE always runs M1's
+//! launches. Each cycle enqueues through its own `ExecutionContext`, dropped when the cycle
+//! has been enqueued. Nothing in a cycle
 //! reads back to the host: an LLK record goes, stack by stack, into the device's
 //! [`ptyrs_gpu::LlkRing`], whose copies download while later cycles run, and the host reads
 //! the records at the end of each algorithm call (or of [`GpuPtycho::llk`]), the arrays only
@@ -15,8 +18,7 @@
 //! replay a captured CUDA graph (DESIGN B2, [`GpuOptions::graph`]): one per [`Epoch`], kept
 //! with the buffers it captured until another algorithm or other parameters need new ones,
 //! and the LLK pass's for the life of the device state. Each algorithm is its own module over
-//! the per-stack steps here, so M2's fused passes can replace those steps one algorithm at a
-//! time.
+//! the per-stack steps here.
 
 mod ap;
 mod device;
@@ -31,9 +33,11 @@ use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 use ptyrs_core::{AddrTable, C64, Object, Probe, Scan, Stack};
 use ptyrs_fft::Plan2d;
-use ptyrs_gpu::{C32, Ended, Error as GpuError, RecordWriter, StackTable, ViewAddr, ViewDims};
+use ptyrs_gpu::{
+    C32, Ended, Error as GpuError, FusedInputs, RecordWriter, StackTable, ViewAddr, ViewDims,
+};
 
-use device::{Bufs, Device};
+use device::{Bufs, Device, M1Bufs, PassesMut};
 
 use crate::ptycho::{Algorithm, LlkRecord, zero_phase_ramp};
 use crate::{ApParams, DmParams, EngineError, Fft2, Llk, RpieParams};
@@ -50,6 +54,11 @@ pub struct GpuOptions {
     /// most half this many records after it, and the host waits for one only when it is
     /// this many records ahead of it, or at the end of an algorithm call.
     pub llk_slots: usize,
+    /// Project AP and DM stacks and take the LLK pass's partials by M2's fused passes
+    /// ([`ptyrs_gpu::Kernels::fused_project`]; frame sides 128 or 256, and [`GpuPtycho::new`]
+    /// fails on others) instead of M1's launch sequence. The two agree to rounding, not bit
+    /// for bit.
+    pub fused: bool,
 }
 
 impl Default for GpuOptions {
@@ -58,6 +67,7 @@ impl Default for GpuOptions {
             stack_size: 16,
             graph: true,
             llk_slots: 8,
+            fused: true,
         }
     }
 }
@@ -105,7 +115,7 @@ type Tag = Option<(usize, Algorithm)>;
 #[derive(Clone, Debug)]
 struct Frames {
     range: Range<u32>,
-    /// Index of the stack's length, and so of its cuFFT plan.
+    /// Index of the stack's length, and so of its M1 cuFFT plan.
     plan: usize,
     /// `nf * nmode * n`: the values of the stack's exit waves, what the element-wise steps
     /// and its plan cover.
@@ -119,12 +129,13 @@ impl Frames {
 }
 
 /// `0 .. nframe` cut into consecutive ranges of `size` frames, the last one shorter when
-/// `size` does not divide `nframe`; the table of their entries and one plan per length.
+/// `size` does not divide `nframe`; the table of their entries and the distinct lengths, in
+/// the order [`Frames::plan`] indexes them.
 fn stacks(
     stream: &Arc<CudaStream>,
     dims: &ViewDims,
     size: u32,
-) -> Result<(Vec<Frames>, StackTable, Vec<Plan2d>), EngineError> {
+) -> Result<(Vec<Frames>, StackTable, Vec<u32>), EngineError> {
     let (ranges, lens) = split(dims.nframe, size);
     let table = StackTable::new(
         stream,
@@ -132,10 +143,6 @@ fn stacks(
         &ranges.iter().map(|(r, _)| r.clone()).collect::<Vec<_>>(),
     )?;
     let nmode = dims.nmode as usize;
-    let plans = lens
-        .iter()
-        .map(|&nf| Plan2d::new(stream, dims.frame[0] as usize, nf as usize * nmode))
-        .collect::<Result<Vec<_>, _>>()?;
     let frames = ranges
         .into_iter()
         .map(|(range, plan)| {
@@ -147,7 +154,20 @@ fn stacks(
             })
         })
         .collect::<Result<Vec<_>, EngineError>>()?;
-    Ok((frames, table, plans))
+    Ok((frames, table, lens))
+}
+
+/// One cuFFT plan per stack length of [`stacks`].
+fn plans(
+    stream: &Arc<CudaStream>,
+    dims: &ViewDims,
+    lens: &[u32],
+) -> Result<Vec<Plan2d>, EngineError> {
+    let nmode = dims.nmode as usize;
+    Ok(lens
+        .iter()
+        .map(|&nf| Plan2d::new(stream, dims.frame[0] as usize, nf as usize * nmode))
+        .collect::<Result<Vec<_>, _>>()?)
 }
 
 /// Values of `nf_max` frames' exit waves, what every stack buffer holds.
@@ -383,47 +403,55 @@ impl GpuPtycho {
 
 /// The per-stack steps of every algorithm, on the lent device state.
 impl Bufs<'_> {
-    /// The LLK record of the current estimate through `rec`, by the scratch stack.
+    /// The LLK record of the current estimate through `rec`: M1's by the scratch stack.
     fn forward_llk(
         &mut self,
         ctx: &ExecutionContext,
+        passes: &mut PassesMut<'_>,
         mut rec: RecordWriter<'_>,
     ) -> Result<Ended, GpuError> {
         let dims = *self.views.dims();
         for s in 0..self.stacks.len() {
             let stack = self.table.at(s);
-            let st = self.stacks.get(s);
-            self.kernels.obj_probe_to_psi(
-                ctx,
-                self.views,
-                stack,
-                self.obj,
-                self.probe,
-                self.scratch,
-            )?;
-            self.plans
-                .get(st.frames.plan)
-                .forward_inplace(ctx, self.scratch)?;
-            self.kernels
-                .llk(ctx, &dims, stack, self.counts, self.scratch, self.llk)?;
+            match passes {
+                PassesMut::M1(m1) => {
+                    self.kernels.obj_probe_to_psi(
+                        ctx, self.views, stack, self.obj, self.probe, m1.scratch,
+                    )?;
+                    let plan = self.stacks.get(s).frames.plan;
+                    m1.plans.get(plan).forward_inplace(ctx, m1.scratch)?;
+                    self.kernels
+                        .llk(ctx, &dims, stack, self.counts, m1.scratch, self.llk)?;
+                }
+                PassesMut::Fused(f) => {
+                    let inputs = FusedInputs {
+                        views: self.views,
+                        counts: self.counts,
+                        obj: self.obj,
+                        probe: self.probe,
+                    };
+                    self.kernels.fused_llk(ctx, &inputs, stack, f, self.llk)?;
+                }
+            }
             rec.push(ctx, &dims, stack, self.llk)?;
         }
         rec.end(ctx)
     }
 
-    /// Fourier-modulus projection of stack `s`'s exit waves in place: FFT, `apply_amplitude`,
-    /// inverse FFT. With `llk`, the stack's LLK partials of the forward stack go into that
-    /// record first.
+    /// M1 Fourier-modulus projection of stack `s`'s exit waves in place: FFT,
+    /// `apply_amplitude`, inverse FFT. With `llk`, the stack's LLK partials of the forward
+    /// stack go into that record first.
     fn project(
         &mut self,
         ctx: &ExecutionContext,
+        m1: &mut M1Bufs<'_>,
         s: usize,
         llk: Option<&mut RecordWriter<'_>>,
     ) -> Result<(), GpuError> {
         let dims = *self.views.dims();
         let stack = self.table.at(s);
         let st = self.stacks.get(s);
-        let plan = self.plans.get(st.frames.plan);
+        let plan = m1.plans.get(st.frames.plan);
         plan.forward_inplace(ctx, st.psi)?;
         if let Some(rec) = llk {
             self.kernels
