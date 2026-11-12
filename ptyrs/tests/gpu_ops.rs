@@ -14,7 +14,8 @@ use ptyrs::gpu::{
     BackgroundSums, C32, Error, Exit, FUSED_SIDES, FarSums, FusedBufs, FusedInputs, FusedSums,
     Kernels, Lines, LlkPartial, LlkScratch, LlkSums, MASKED, Model, OBJ_TILE, Permutation,
     PositionPartial, ProbeSpectrum, ScalePartial, Shift, ShiftSums, ShiftedProbeSums, SpectrumBuf,
-    StackCtl, StackRef, StackTable, UpdateSums, ViewAddr, ViewDims, Views, record, view_tiles,
+    StackCtl, StackRef, StackTable, UpdateSums, ViewAddr, ViewDims, Views, lease, record,
+    view_tiles,
 };
 
 type Z = (f64, f64);
@@ -47,6 +48,29 @@ fn noise(len: usize, seed: u64, scale: f32) -> Vec<C32> {
 
 fn up<T: DeviceCopy>(stream: &CudaStream, host: &[T]) -> DeviceBuffer<T> {
     DeviceBuffer::from_host(stream, host).unwrap()
+}
+
+/// Writes `table`'s one entry on `stream`, leased like a launch. A replay that reads it must
+/// run on the same stream: a non-blocking stream does not wait for another stream's write.
+fn set_entry(stream: &Arc<CudaStream>, table: &StackTable, f0: u32, nf: u32) {
+    let ctl = [StackCtl { f0, nf }];
+    record(|ctx| {
+        lease(ctx, &[], &[table.storage()])?;
+        ctx.context().bind_to_thread()?;
+        // SAFETY: `table` holds one entry, leased for writing on this stream; the driver
+        // stages the pageable source before returning.
+        unsafe {
+            cuda_core::memory::memcpy_htod_async(
+                table.ptr(),
+                ctl.as_ptr(),
+                8,
+                ctx.get_cuda_stream().cu_stream(),
+            )
+        }?;
+        Ok(())
+    })
+    .sync_on(stream)
+    .unwrap();
 }
 
 /// A table of the one stack `frames`.
@@ -1734,10 +1758,7 @@ fn one_graph_runs_whichever_stack_its_entry_holds() {
     .unwrap();
     let entries = [(0, 3), (3, 2), (1, 3), (4, 3), (9, 2)];
     for ((f0, nf), want) in entries.into_iter().zip(&want) {
-        let ctl = [StackCtl { f0, nf }];
-        k.context().bind_to_thread().unwrap();
-        // SAFETY: `dev` holds one entry; no work on it is in flight.
-        unsafe { cuda_core::memory::memcpy_htod_sync(dev.ptr(), ctl.as_ptr(), 8) }.unwrap();
+        set_entry(&side, &dev, f0, nf);
         graph.launch().sync_on(&side).unwrap();
         assert!(
             it.bits(&stream) == *want,
@@ -1765,10 +1786,7 @@ fn empty_stack_replay_writes_nothing() {
     .unwrap();
     let start = it.bits(&stream);
     for (f0, nf, empty) in [(2, 0, true), (0, 0, true), (4, 0, true), (2, 1, false)] {
-        let ctl = [StackCtl { f0, nf }];
-        k.context().bind_to_thread().unwrap();
-        // SAFETY: `dev` holds one entry; no work on it is in flight.
-        unsafe { cuda_core::memory::memcpy_htod_sync(dev.ptr(), ctl.as_ptr(), 8) }.unwrap();
+        set_entry(&side, &dev, f0, nf);
         graph.launch().sync_on(&side).unwrap();
         assert_eq!(
             it.bits(&stream) == start,
@@ -1848,10 +1866,7 @@ fn bin_views_appends_each_stack_to_the_tile_slabs() {
         let mut kend = 0;
         // (12, 3) clamps to no frames.
         for (f0, nf) in [(0, 0), (0, 2), (5, 0), (2, 9), (11, 0), (11, 1), (12, 3)] {
-            let ctl = [StackCtl { f0, nf }];
-            k.context().bind_to_thread().unwrap();
-            // SAFETY: `dev` holds one entry; no work on it is in flight.
-            unsafe { cuda_core::memory::memcpy_htod_sync(dev.ptr(), ctl.as_ptr(), 8) }.unwrap();
+            set_entry(&side, &dev, f0, nf);
             graph.launch().sync_on(&side).unwrap();
             let got = state(&views, &overflow);
             let what = format!("cap {cap}, entry {{ f0: {f0}, nf: {nf} }}");
@@ -3126,10 +3141,7 @@ fn fused_empty_stack_replay_writes_nothing() {
         [&ap_sums, &dm_sums, &ap_probe, &dm_probe],
     );
     for (f0, nf, empty) in [(2, 0, true), (0, 0, true), (4, 0, true), (2, 1, false)] {
-        let ctl = [StackCtl { f0, nf }];
-        k.context().bind_to_thread().unwrap();
-        // SAFETY: `dev` holds one entry; no work on it is in flight.
-        unsafe { cuda_core::memory::memcpy_htod_sync(dev.ptr(), ctl.as_ptr(), 8) }.unwrap();
+        set_entry(&side, &dev, f0, nf);
         graph.launch().sync_on(&side).unwrap();
         assert_eq!(
             bits(
@@ -4377,10 +4389,7 @@ fn fused_shift_empty_stack_replay_writes_nothing() {
     };
     let start = bits(&psi, &llk);
     for (f0, nf, empty) in [(2, 0, true), (0, 0, true), (4, 0, true), (2, 1, false)] {
-        let ctl = [StackCtl { f0, nf }];
-        k.context().bind_to_thread().unwrap();
-        // SAFETY: `dev` holds one entry; no work on it is in flight.
-        unsafe { cuda_core::memory::memcpy_htod_sync(dev.ptr(), ctl.as_ptr(), 8) }.unwrap();
+        set_entry(&side, &dev, f0, nf);
         graph.launch().sync_on(&side).unwrap();
         assert_eq!(
             bits(&psi, &llk) == start,
