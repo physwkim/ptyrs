@@ -2,12 +2,15 @@
 //! the Poisson LLK the flat start reaches after N epochs of an algorithm; the measure is the
 //! epochs the predicted start needs to reach it with the same algorithm and data, on the
 //! engine's CPU path. The first table holds the known probe fixed in DM and single-frame rPIE;
-//! the second starts DM from it and updates it at DM's default probe inertia.
+//! the second starts DM from it and updates it at DM's default probe inertia. rPIE runs at
+//! object alpha 0.5 and 1.0: at its default 0.1 it climbs back from its minimum on these scans
+//! and oscillates, in pty-chi as in the engine.
 //!
 //! `cargo run --release -p ptyrs-nn --example m6_start -- <predictor_dir>`
 
 mod common;
 
+use std::ops::Range;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -25,16 +28,14 @@ const MAX: usize = 200;
 #[derive(Clone, Copy, Debug)]
 enum Alg {
     Dm,
-    Rpie,
+    /// rPIE at this object alpha.
+    Rpie(f64),
     /// DM updating the probe.
     DmProbe,
 }
-/// In discriminant order.
-const ALGS: [Alg; 3] = [Alg::Dm, Alg::Rpie, Alg::DmProbe];
-const TABLES: [(&str, &[Alg]); 2] = [
-    ("probe fixed", &[Alg::Dm, Alg::Rpie]),
-    ("probe updated", &[Alg::DmProbe]),
-];
+const ALGS: [Alg; 4] = [Alg::Dm, Alg::Rpie(0.5), Alg::Rpie(1.0), Alg::DmProbe];
+/// Each table's rows, as a range of `ALGS`.
+const TABLES: [(&str, Range<usize>); 2] = [("probe fixed", 0..3), ("probe updated", 3..4)];
 
 /// The LLK of `start` and after each of `epochs` epochs of `alg`.
 fn run(alg: Alg, scan: &Scan, start: Object, probe: &Probe, epochs: usize) -> (f64, Vec<f64>) {
@@ -56,9 +57,10 @@ fn run(alg: Alg, scan: &Scan, start: Object, probe: &Probe, epochs: usize) -> (f
             },
             epochs,
         ),
-        Alg::Rpie => p
+        Alg::Rpie(obj_alpha) => p
             .rpie(
                 &RpieParams {
+                    obj_alpha,
                     probe_step: None,
                     batch_size: 1,
                     calc_llk: 1,
@@ -103,7 +105,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // One thread per reconstruction: the engine's CPU path is single-threaded.
     let t = Instant::now();
-    // runs[case][alg as usize] = (flat run, predicted run).
+    // runs[case][k] = (flat run, predicted run) of ALGS[k].
     let runs: Vec<Vec<_>> = std::thread::scope(|s| {
         let handles: Vec<Vec<_>> = cases
             .iter()
@@ -141,15 +143,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 type Run = (f64, Vec<f64>);
 
-/// One row per case, algorithm of `algs` and N.
-fn table(cases: &[(&str, Scan, Object, Object, Probe)], runs: &[Vec<(Run, Run)>], algs: &[Alg]) {
+/// One row per case, algorithm of `ALGS[algs]` and N.
+fn table(
+    cases: &[(&str, Scan, Object, Object, Probe)],
+    runs: &[Vec<(Run, Run)>],
+    algs: Range<usize>,
+) {
     println!(
-        "{:12} {:7} {:>3}  {:>8}  {:>8} {:>8}  {:>11} {:>11}",
+        "{:12} {:9} {:>3}  {:>8}  {:>8} {:>8}  {:>11} {:>11}",
         "object", "alg", "N", "target", "LLK flat", "LLK pred", "flat epochs", "pred epochs"
     );
     for ((name, ..), runs) in cases.iter().zip(runs) {
-        for &alg in algs {
-            let ((flat0, flat), (pred0, pred)) = &runs[alg as usize];
+        for (alg, ((flat0, flat), (pred0, pred))) in
+            ALGS[algs.clone()].iter().zip(&runs[algs.clone()])
+        {
             for n in NS {
                 let target = flat[n - 1];
                 // The flat run's own first epoch at its epoch-N LLK; N when the LLK only falls.
@@ -157,7 +164,7 @@ fn table(cases: &[(&str, Scan, Object, Object, Probe)], runs: &[Vec<(Run, Run)>]
                 let pred_n = iterations_to_llk(*pred0, target, pred.iter().copied())
                     .map_or(format!(">{MAX}"), |k| k.to_string());
                 println!(
-                    "{name:12} {:7} {n:>3}  {target:>8.4}  {flat0:>8.4} {pred0:>8.4}  {flat_n:>11} {pred_n:>11}",
+                    "{name:12} {:9} {n:>3}  {target:>8.4}  {flat0:>8.4} {pred0:>8.4}  {flat_n:>11} {pred_n:>11}",
                     format!("{alg:?}")
                 );
             }
