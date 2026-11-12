@@ -24,32 +24,31 @@ pub mod rpie_kernels {
     /// pty-chi's modulus constraint on the forward-FFT'd stack, with the `1 / (ny * nx)` of
     /// the unnormalized round trip folded in: each pixel's modes are scaled by
     /// `sqrt(obs + 1e-7) / (sqrt(icalc) + 1e-7) / n` with `icalc = sum_m |psi|^2 / n`, or by
-    /// `1 / n` where `obs` is `MASKED`. One thread per element of `[nf, ny, nx]`.
+    /// `1 / n` where `obs` is `MASKED`. One thread per element of `[nf_max, ny, nx]`.
     ///
     /// # Safety
     ///
-    /// `psi` `[nf * nmode, ny, nx]`, `counts` `[f0 + nf, ny, nx]`.
+    /// `psi` `[nf_max * nmode, ny, nx]`, `counts` `[nframe, ny, nx]`, `ctl` one entry.
     #[kernel]
     pub unsafe fn rpie_amplitude(
         psi: *mut f32,
         counts: *const u16,
-        f0: u32,
-        nf: u32,
-        nmode: u32,
-        ny: u32,
-        nx: u32,
+        ctl: *const StackCtl,
+        g: StackGeom,
     ) {
+        let (f0, nf) = unsafe { stack_frames(ctl, g) };
+        let (ny, nx, nmode) = (g.ny, g.nx, g.nmode);
         let n = ny as usize * nx as usize;
-        let g = global_index();
-        if g >= nf as usize * n {
+        let t = global_index();
+        if t >= nf as usize * n {
             return;
         }
-        let (fl, d) = (g / n, g % n);
+        let (fl, d) = (t / n, t % n);
         let at = psi_index((d / nx as usize) as u32, (d % nx as usize) as u32, ny, nx);
         let inv_n = 1.0 / n as f32;
         let plane0 = fl * nmode as usize;
         unsafe {
-            let obs = *counts.add(f0 as usize * n + g);
+            let obs = *counts.add(f0 as usize * n + t);
             let s = if obs == MASKED {
                 inv_n
             } else {

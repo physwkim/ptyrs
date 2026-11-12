@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, DeviceCopy};
-use ptyrs_gpu::{C32, Kernels, MASKED, RpieKernels, UpdateSums, ViewAddr, ViewDims, Views, Weight};
+use ptyrs_gpu::{C32, Kernels, MASKED, RpieKernels, StackTable, UpdateSums, ViewDims, Weight};
 
 /// A stream, an eager execution context on it and the rPIE kernels.
 fn setup() -> (Arc<CudaStream>, ExecutionContext, RpieKernels) {
@@ -66,15 +66,6 @@ fn amplitude_matches_ptychi_formula() {
         obj: [16, 16],
         quad_phase: 0.0,
     };
-    let addr: Vec<ViewAddr> = (0..nframe * nmode)
-        .map(|v| ViewAddr {
-            oy: (v / nmode) as u32,
-            ox: 2,
-            probe: (v % nmode) as u32,
-            ..Default::default()
-        })
-        .collect();
-    let views = Views::new(&stream, dims, &addr).unwrap();
     let counts: Vec<u16> = (0..nframe * n)
         .map(|i| {
             if i % 11 == 3 {
@@ -84,36 +75,40 @@ fn amplitude_matches_ptychi_formula() {
             }
         })
         .collect();
-    let (f0, f1) = (1usize, 3usize);
-    let psi = noise((f1 - f0) * nmode * n, 7, 2.0);
-    let mut want = vec![(0.0, 0.0); psi.len()];
-    for fl in 0..f1 - f0 {
-        for d in 0..n {
-            let at = ((d / nx + ny / 2) % ny) * nx + (d % nx + nx / 2) % nx;
-            let obs = counts[(f0 + fl) * n + d];
-            let s = if obs == MASKED {
-                1.0 / n as f64
-            } else {
-                let calc = ((0..nmode)
-                    .map(|m| norm2(psi[(fl * nmode + m) * n + at]))
-                    .sum::<f64>()
-                    / n as f64)
-                    .sqrt();
-                (obs as f64 + 1e-7).sqrt() / (calc + 1e-7) / n as f64
-            };
-            for m in 0..nmode {
-                let j = (fl * nmode + m) * n + at;
-                want[j] = (psi[j].re as f64 * s, psi[j].im as f64 * s);
+    // Entry 0 fills the `nf_max = 2` frames of `psi`; entry 1 only its first.
+    let table = StackTable::new(&stream, &dims, &[1..3, 0..1]).unwrap();
+    let c = up(&stream, &counts);
+    let psi = noise(2 * nmode * n, 7, 2.0);
+    for (s, f0, nf) in [(0, 1usize, 2usize), (1, 0, 1)] {
+        let mut want: Vec<(f64, f64)> = psi.iter().map(|v| (v.re as f64, v.im as f64)).collect();
+        for fl in 0..nf {
+            for d in 0..n {
+                let at = ((d / nx + ny / 2) % ny) * nx + (d % nx + nx / 2) % nx;
+                let obs = counts[(f0 + fl) * n + d];
+                let s = if obs == MASKED {
+                    1.0 / n as f64
+                } else {
+                    let calc = ((0..nmode)
+                        .map(|m| norm2(psi[(fl * nmode + m) * n + at]))
+                        .sum::<f64>()
+                        / n as f64)
+                        .sqrt();
+                    (obs as f64 + 1e-7).sqrt() / (calc + 1e-7) / n as f64
+                };
+                for m in 0..nmode {
+                    let j = (fl * nmode + m) * n + at;
+                    want[j] = (psi[j].re as f64 * s, psi[j].im as f64 * s);
+                }
             }
         }
+        let mut p = up(&stream, &psi);
+        k.amplitude(&ctx, &dims, table.at(s), &c, &mut p).unwrap();
+        let got = p.to_host_vec(&stream).unwrap();
+        let err = max_rel(&got, &want, 1e-6);
+        assert!(err < 1e-5, "amplitude entry {s} max rel err {err:e}");
+        // Planes past the entry's frames are untouched.
+        assert_eq!(got[nf * nmode * n..], psi[nf * nmode * n..], "entry {s}");
     }
-    let c = up(&stream, &counts);
-    let mut p = up(&stream, &psi);
-    k.amplitude(&ctx, &views, f0 as u32..f1 as u32, &c, &mut p)
-        .unwrap();
-    let got = p.to_host_vec(&stream).unwrap();
-    let err = max_rel(&got, &want, 1e-6);
-    assert!(err < 1e-5, "amplitude max rel err {err:e}");
 }
 
 #[test]

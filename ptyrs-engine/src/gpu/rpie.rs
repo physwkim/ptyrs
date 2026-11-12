@@ -114,13 +114,7 @@ impl GpuPtycho {
             &mut bufs.psi,
         )?;
         plan.forward(ctx, &bufs.psi, &mut bufs.dlt)?;
-        rk.amplitude(
-            ctx,
-            &self.views,
-            frames.range.clone(),
-            &self.counts,
-            &mut bufs.dlt,
-        )?;
+        rk.amplitude(ctx, &dims, stack, &self.counts, &mut bufs.dlt)?;
         plan.inverse_inplace(ctx, &mut bufs.dlt)?;
         k.scale_c32(ctx, &mut bufs.psi, len, -1.0)?;
         k.add_c32(ctx, &mut bufs.dlt, &bufs.psi, len)?;

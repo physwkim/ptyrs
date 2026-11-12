@@ -12,14 +12,12 @@
 //! by them, then `psi_to_probe(dlt, O)`. Both steps read the batch-start arrays: apply
 //! [`RpieKernels::step`], which consumes the sums, only after both sums are taken.
 
-use std::ops::Range;
-
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{DeviceBuffer, LaunchConfig};
 use ptyrs_kernels::pixel::{PIXEL_THREADS, SumPtrs};
 use ptyrs_kernels::rpie::{WeightGeom, rpie_kernels};
 
-use crate::{C32, Error, Kernels, UpdateSums, Views, check_len, dptr};
+use crate::{C32, Error, Kernels, StackCtl, StackRef, UpdateSums, ViewDims, check_len, dptr};
 
 /// The rPIE kernels, bound to the module a [`Kernels`] loaded.
 #[derive(Clone, Debug)]
@@ -45,47 +43,37 @@ impl RpieKernels {
         })
     }
 
-    /// pty-chi's modulus constraint on the forward-FFT'd stack of `frames`: each pixel's
-    /// modes are scaled by `sqrt(obs + 1e-7) / (sqrt(icalc) + 1e-7) / n`, `icalc = sum_m
-    /// |Psi_m|^2 / n`, or by `1 / n` where the count is `MASKED`; the unnormalized inverse
-    /// FFT then yields pty-chi's corrected exit wave. `counts` holds the whole scan.
+    /// pty-chi's modulus constraint on the forward-FFT'd stack: each pixel's modes are
+    /// scaled by `sqrt(obs + 1e-7) / (sqrt(icalc) + 1e-7) / n`, `icalc = sum_m |Psi_m|^2 /
+    /// n`, or by `1 / n` where the count is `MASKED`; the unnormalized inverse FFT then
+    /// yields pty-chi's corrected exit wave. `counts` holds the whole scan.
     pub fn amplitude(
         &self,
         ctx: &ExecutionContext,
-        views: &Views,
-        frames: Range<u32>,
+        dims: &ViewDims,
+        stack: StackRef<'_>,
         counts: &DeviceBuffer<u16>,
         psi: &mut DeviceBuffer<C32>,
     ) -> Result<(), Error> {
-        let d = views.dims();
-        if frames.start >= frames.end || frames.end > d.nframe {
-            return Err(Error::Shape(format!(
-                "frames {frames:?} is not a non-empty part of 0..{}",
-                d.nframe
-            )));
-        }
-        let nf = frames.end - frames.start;
-        let n = d.frame[0] as usize * d.frame[1] as usize;
-        check_len("counts", counts, d.nframe as usize * n)?;
-        check_len("psi", psi, nf as usize * d.nmode as usize * n)?;
-        let (_, config) = elems(nf as usize * n)?;
-        self.base
-            .launch(ctx, &[counts.storage()], &[psi.storage()], |stream| {
-                // SAFETY: lengths checked above; `Views::new` checked the frame shape.
-                unsafe {
-                    self.module.rpie_amplitude(
-                        stream,
-                        config,
-                        dptr(psi),
-                        dptr(counts),
-                        frames.start,
-                        nf,
-                        d.nmode,
-                        d.frame[0],
-                        d.frame[1],
-                    )
-                }
-            })
+        let g = dims.geom(stack)?;
+        let (n, nf_max) = (g.ny as usize * g.nx as usize, g.nf_max as usize);
+        check_len("counts", counts, dims.nframe as usize * n)?;
+        check_len("psi", psi, nf_max * dims.nmode as usize * n)?;
+        let (_, config) = elems(nf_max * n)?;
+        let reads = [counts.storage(), stack.storage()];
+        self.base.launch(ctx, &reads, &[psi.storage()], |stream| {
+            // SAFETY: lengths checked above.
+            unsafe {
+                self.module.rpie_amplitude(
+                    stream,
+                    config,
+                    dptr(psi),
+                    dptr(counts),
+                    stack.ctl() as *const StackCtl,
+                    g,
+                )
+            }
+        })
     }
 
     /// `out[b] = max_i sum_{m < nsum} |x[b * nsum + m, i]|^2` for `ngroup` groups of `nsum`
