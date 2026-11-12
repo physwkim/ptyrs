@@ -16,6 +16,7 @@
 //! algorithm at a time.
 
 mod ap;
+mod device;
 mod dm;
 mod rpie;
 
@@ -23,15 +24,13 @@ use std::f64::consts::PI;
 use std::ops::Range;
 use std::sync::Arc;
 
-use cuda_async::cuda_graph::CudaGraph;
-use cuda_async::device_operation::{DeviceOp, ExecutionContext};
+use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 use ptyrs_core::{AddrTable, C64, Object, Probe, Scan, Stack};
 use ptyrs_fft::Plan2d;
-use ptyrs_gpu::{
-    C32, Error as GpuError, Kernels, LlkPartial, LlkSums, RpieKernels, StackTable, UpdateSums,
-    ViewAddr, ViewDims, Views,
-};
+use ptyrs_gpu::{C32, Error as GpuError, LlkSums, StackTable, ViewAddr, ViewDims};
+
+use device::{Bufs, Device};
 
 use crate::ptycho::{Algorithm, LlkRecord, zero_phase_ramp};
 use crate::{ApParams, DmParams, EngineError, Fft2, Llk};
@@ -65,11 +64,6 @@ enum Epoch {
     Dm(DmParams),
 }
 
-struct EpochGraph {
-    epoch: Epoch,
-    graph: CudaGraph<()>,
-}
-
 /// One stack (or rPIE batch): the frames its table entry holds, for what the host needs of
 /// them (which plan, how many LLK partials, rPIE's `1 / nf`); the kernels read the entry.
 #[derive(Clone, Debug)]
@@ -86,14 +80,6 @@ impl Frames {
     fn nf(&self) -> u32 {
         self.range.end - self.range.start
     }
-}
-
-/// One stack's buffers, sized like every stack's for the table's `nf_max` frames.
-struct StackBufs {
-    frames: Frames,
-    /// Exit waves of the stack's views; planes past `nf * nmode` stay zero.
-    psi: DeviceBuffer<C32>,
-    llk: DeviceBuffer<LlkPartial>,
 }
 
 /// `0 .. nframe` cut into consecutive ranges of `size` frames, the last one shorter when
@@ -162,10 +148,6 @@ fn to_u32(what: &str, v: usize) -> Result<u32, EngineError> {
     u32::try_from(v).map_err(|_| EngineError::Invalid(format!("{what} {v} exceeds u32")))
 }
 
-fn upload(stream: &CudaStream, a: &Stack<C64>) -> Result<DeviceBuffer<C32>, EngineError> {
-    Ok(DeviceBuffer::from_host(stream, &to_c32(a.as_slice()))?)
-}
-
 fn to_c32(a: &[C64]) -> Vec<C32> {
     a.iter()
         .map(|c| C32 {
@@ -193,32 +175,12 @@ fn download(
 /// memory, and the LLK history. The same scan, starting arrays and parameters give the same
 /// records as [`crate::Ptycho`] up to `f32` rounding.
 pub struct GpuPtycho {
-    stream: Arc<CudaStream>,
-    kernels: Kernels,
-    rpie: RpieKernels,
-    views: Views,
-    counts: DeviceBuffer<u16>,
-    obj: DeviceBuffer<C32>,
-    probe: DeviceBuffer<C32>,
+    dev: Device,
     obj_dims: [usize; 3],
     probe_dims: [usize; 3],
-    obj_sums: UpdateSums,
-    probe_sums: UpdateSums,
-    obj_len: u32,
-    probe_len: u32,
-    table: StackTable,
-    stacks: Vec<StackBufs>,
-    /// One plan per stack length, indexed by [`Frames::plan`].
-    plans: Vec<Plan2d>,
-    /// One stack's worth of exit waves: DM's `PO`, the LLK pass's forward stack.
-    scratch: DeviceBuffer<C32>,
     nb_obs: usize,
     /// The probe-frame FFT of [`zero_phase_ramp`], which runs on the host.
     fft: Fft2,
-    use_graph: bool,
-    /// The last captured steady-state cycle. Its nodes hold the buffers above, which are
-    /// allocated once in [`GpuPtycho::new`] and never replaced.
-    graph: Option<EpochGraph>,
     cycle: usize,
     history: Vec<LlkRecord>,
 }
@@ -285,46 +247,21 @@ impl GpuPtycho {
             })
             .collect();
 
-        let ctx_stream = ctx.new_stream()?;
-        let stream = &ctx_stream;
-        let kernels = Kernels::load(ctx)?;
-        let rpie = RpieKernels::load(&kernels)?;
-        let views = Views::new(stream, dims, &addrs)?;
-        let (frames, table, plans) =
-            stacks(stream, &dims, to_u32("stack_size", options.stack_size)?)?;
-        let len = stack_buf_len(&dims, &table);
-        let stacks = frames
-            .into_iter()
-            .map(|frames| {
-                Ok(StackBufs {
-                    frames,
-                    psi: DeviceBuffer::zeroed(stream, len)?,
-                    llk: DeviceBuffer::zeroed(stream, table.nf_max() as usize)?,
-                })
-            })
-            .collect::<Result<Vec<_>, EngineError>>()?;
+        let dev = Device::new(
+            ctx,
+            dims,
+            &addrs,
+            scan.counts.as_slice(),
+            &to_c32(object.as_slice()),
+            &to_c32(probe.as_slice()),
+            options,
+        )?;
         Ok(Self {
-            obj_len: to_u32("object length", object.as_slice().len())?,
-            probe_len: to_u32("probe length", probe.as_slice().len())?,
-            scratch: DeviceBuffer::zeroed(stream, len)?,
-            counts: DeviceBuffer::from_host(stream, scan.counts.as_slice())?,
-            obj: upload(stream, &object)?,
-            probe: upload(stream, &probe)?,
-            obj_sums: UpdateSums::zeroed(stream, object.as_slice().len())?,
-            probe_sums: UpdateSums::zeroed(stream, probe.as_slice().len())?,
+            dev,
             obj_dims: object.dims(),
             probe_dims: probe.dims(),
             nb_obs: scan.counts.nb_obs(),
             fft: Fft2::new(g.frame),
-            stream: ctx_stream.clone(),
-            kernels,
-            rpie,
-            views,
-            table,
-            stacks,
-            plans,
-            use_graph: options.graph,
-            graph: None,
             cycle: 0,
             history: Vec::new(),
         })
@@ -333,8 +270,8 @@ impl GpuPtycho {
     /// The object, read back from the device.
     pub fn object(&self) -> Result<Object, EngineError> {
         Ok(Object::new(download(
-            &self.stream,
-            &self.obj,
+            self.dev.stream(),
+            self.dev.obj(),
             self.obj_dims,
         )?))
     }
@@ -342,8 +279,8 @@ impl GpuPtycho {
     /// The probe, read back from the device.
     pub fn probe(&self) -> Result<Probe, EngineError> {
         Ok(Probe::new(download(
-            &self.stream,
-            &self.probe,
+            self.dev.stream(),
+            self.dev.probe(),
             self.probe_dims,
         )?))
     }
@@ -360,51 +297,15 @@ impl GpuPtycho {
 
     /// Waits for every enqueued step to finish (for timing).
     pub fn synchronize(&self) -> Result<(), EngineError> {
-        Ok(self.stream.synchronize()?)
+        Ok(self.dev.stream().synchronize()?)
     }
 
     /// Normalised LLK of the current object and probe, as [`crate::Ptycho::llk`]; the
     /// exit-wave stacks are left as they are.
     pub fn llk(&mut self) -> Result<Llk, EngineError> {
-        self.forward_llk(&self.context())?;
+        let ctx = self.dev.context();
+        self.dev.lend().forward_llk(&ctx)?;
         self.read_llk()
-    }
-
-    /// A fresh eager context on the stream: one per cycle, so leases end with its work.
-    fn context(&self) -> ExecutionContext {
-        ExecutionContext::new(self.stream.clone())
-    }
-
-    /// Enqueues one `epoch` cycle: replays its graph, captured (on a side stream, so nothing
-    /// runs) when the cached one is for another epoch, or launches it eagerly without graphs.
-    fn steady_cycle(&mut self, epoch: Epoch) -> Result<(), GpuError> {
-        if !self.use_graph {
-            return self.epoch_cycle(&self.context(), epoch);
-        }
-        let cached = match self.graph.take() {
-            Some(g) if g.epoch == epoch => g,
-            _ => {
-                let side = self.kernels.context().new_stream()?;
-                let op = ptyrs_gpu::record(|ctx| self.epoch_cycle(ctx, epoch));
-                EpochGraph {
-                    epoch,
-                    graph: CudaGraph::capture(side, op)?,
-                }
-            }
-        };
-        let ctx = self.context();
-        // SAFETY: `ctx` holds the replay's leases on every captured buffer until the stream
-        // has run it, so no other stream can touch them meanwhile.
-        let launched = unsafe { cached.graph.launch().execute(&ctx) };
-        self.graph = Some(cached);
-        Ok(launched?)
-    }
-
-    fn epoch_cycle(&mut self, ctx: &ExecutionContext, epoch: Epoch) -> Result<(), GpuError> {
-        match epoch {
-            Epoch::Ap(params) => self.ap_cycle(ctx, &params, false),
-            Epoch::Dm(params) => self.dm_cycle(ctx, &params, false),
-        }
     }
 
     fn record(&mut self, algorithm: Algorithm, llk: Llk) {
@@ -415,34 +316,13 @@ impl GpuPtycho {
         });
     }
 
-    /// LLK partials of the current estimate into every stack's `llk`, through the scratch
-    /// stack.
-    fn forward_llk(&mut self, ctx: &ExecutionContext) -> Result<(), GpuError> {
-        let dims = *self.views.dims();
-        for (s, st) in self.stacks.iter_mut().enumerate() {
-            let stack = self.table.at(s);
-            self.kernels.obj_probe_to_psi(
-                ctx,
-                &self.views,
-                stack,
-                &self.obj,
-                &self.probe,
-                &mut self.scratch,
-            )?;
-            self.plans[st.frames.plan].forward_inplace(ctx, &mut self.scratch)?;
-            self.kernels
-                .llk(ctx, &dims, stack, &self.counts, &self.scratch, &mut st.llk)?;
-        }
-        Ok(())
-    }
-
     /// Reads back the stacks' LLK partials (the one host sync of a recording cycle) and sums
     /// them in frame order.
     fn read_llk(&self) -> Result<Llk, EngineError> {
-        let mut partials = Vec::with_capacity(self.views.dims().nframe as usize);
-        for st in &self.stacks {
-            let llk = st.llk.to_host_vec(&self.stream)?;
-            partials.extend_from_slice(&llk[..st.frames.nf() as usize]);
+        let mut partials = Vec::with_capacity(self.dev.dims().nframe as usize);
+        for (frames, llk) in self.dev.stack_llk() {
+            let llk = llk.to_host_vec(self.dev.stream())?;
+            partials.extend_from_slice(&llk[..frames.nf() as usize]);
         }
         let s = LlkSums::from_partials(&partials);
         Ok(Llk {
@@ -454,21 +334,65 @@ impl GpuPtycho {
         .normalised(self.nb_obs))
     }
 
+    /// [`zero_phase_ramp`] on the host: one read-back and upload, after an algorithm's last
+    /// cycle.
+    fn zero_phase_ramp(&mut self) -> Result<(), EngineError> {
+        let mut object = self.object()?;
+        let mut probe = self.probe()?;
+        zero_phase_ramp(&self.fft, &mut object, &mut probe);
+        self.dev
+            .write_arrays(&to_c32(object.as_slice()), &to_c32(probe.as_slice()))
+    }
+}
+
+/// The per-stack steps of every algorithm, on the lent device state.
+impl Bufs<'_> {
+    fn epoch_cycle(&mut self, ctx: &ExecutionContext, epoch: Epoch) -> Result<(), GpuError> {
+        match epoch {
+            Epoch::Ap(params) => self.ap_cycle(ctx, &params, false),
+            Epoch::Dm(params) => self.dm_cycle(ctx, &params, false),
+        }
+    }
+
+    /// LLK partials of the current estimate into every stack's `llk`, through the scratch
+    /// stack.
+    fn forward_llk(&mut self, ctx: &ExecutionContext) -> Result<(), GpuError> {
+        let dims = *self.views.dims();
+        for s in 0..self.stacks.len() {
+            let stack = self.table.at(s);
+            let st = self.stacks.get(s);
+            self.kernels.obj_probe_to_psi(
+                ctx,
+                self.views,
+                stack,
+                self.obj,
+                self.probe,
+                self.scratch,
+            )?;
+            self.plans
+                .get(st.frames.plan)
+                .forward_inplace(ctx, self.scratch)?;
+            self.kernels
+                .llk(ctx, &dims, stack, self.counts, self.scratch, st.llk)?;
+        }
+        Ok(())
+    }
+
     /// Fourier-modulus projection of stack `s`'s exit waves in place: FFT, `apply_amplitude`,
     /// inverse FFT. With `llk`, the stack's LLK partials of the forward stack are taken first.
     fn project(&mut self, ctx: &ExecutionContext, s: usize, llk: bool) -> Result<(), GpuError> {
         let dims = *self.views.dims();
         let stack = self.table.at(s);
-        let st = &mut self.stacks[s];
-        let plan = &mut self.plans[st.frames.plan];
-        plan.forward_inplace(ctx, &mut st.psi)?;
+        let st = self.stacks.get(s);
+        let plan = self.plans.get(st.frames.plan);
+        plan.forward_inplace(ctx, st.psi)?;
         if llk {
             self.kernels
-                .llk(ctx, &dims, stack, &self.counts, &st.psi, &mut st.llk)?;
+                .llk(ctx, &dims, stack, self.counts, st.psi, st.llk)?;
         }
         self.kernels
-            .apply_amplitude(ctx, &dims, stack, &self.counts, &mut st.psi)?;
-        plan.inverse_inplace(ctx, &mut st.psi)?;
+            .apply_amplitude(ctx, &dims, stack, self.counts, st.psi)?;
+        plan.inverse_inplace(ctx, st.psi)?;
         Ok(())
     }
 
@@ -482,26 +406,14 @@ impl GpuPtycho {
         probe: bool,
     ) -> Result<(), GpuError> {
         let stack = self.table.at(s);
-        let psi = &self.stacks[s].psi;
+        let psi = self.stacks.get(s).psi;
         if obj {
-            self.kernels.psi_to_obj(
-                ctx,
-                &self.views,
-                stack,
-                psi,
-                &self.probe,
-                &mut self.obj_sums,
-            )?;
+            self.kernels
+                .psi_to_obj(ctx, self.views, stack, psi, self.probe, self.obj_sums)?;
         }
         if probe {
-            self.kernels.psi_to_probe(
-                ctx,
-                &self.views,
-                stack,
-                psi,
-                &self.obj,
-                &mut self.probe_sums,
-            )?;
+            self.kernels
+                .psi_to_probe(ctx, self.views, stack, psi, self.obj, self.probe_sums)?;
         }
         Ok(())
     }
@@ -517,34 +429,21 @@ impl GpuPtycho {
         if let Some(inertia) = obj {
             self.kernels.update_obj_from_sums(
                 ctx,
-                &self.views,
-                &mut self.obj,
-                &mut self.obj_sums,
+                self.views,
+                self.obj,
+                self.obj_sums,
                 inertia as f32,
             )?;
         }
         if let Some(inertia) = probe {
             self.kernels.update_from_sums(
                 ctx,
-                &mut self.probe,
-                &mut self.probe_sums,
+                self.probe,
+                self.probe_sums,
                 self.probe_len,
                 inertia as f32,
             )?;
         }
-        Ok(())
-    }
-
-    /// [`zero_phase_ramp`] on the host: one read-back and upload, after an algorithm's last
-    /// cycle.
-    fn zero_phase_ramp(&mut self) -> Result<(), EngineError> {
-        let mut object = self.object()?;
-        let mut probe = self.probe()?;
-        zero_phase_ramp(&self.fft, &mut object, &mut probe);
-        self.obj
-            .copy_from_host(&self.stream, &to_c32(object.as_slice()))?;
-        self.probe
-            .copy_from_host(&self.stream, &to_c32(probe.as_slice()))?;
         Ok(())
     }
 }

@@ -3,7 +3,7 @@
 use cuda_async::device_operation::ExecutionContext;
 use ptyrs_gpu::Error as GpuError;
 
-use super::{Epoch, GpuPtycho};
+use super::{Bufs, Epoch, GpuPtycho};
 use crate::ptycho::{Algorithm, llk_due};
 use crate::{ApParams, EngineError};
 
@@ -14,11 +14,12 @@ impl GpuPtycho {
     pub fn ap(&mut self, params: &ApParams, ncycle: usize) -> Result<(), EngineError> {
         for ic in 0..ncycle {
             if llk_due(params.calc_llk, ic, ncycle) {
-                self.ap_cycle(&self.context(), params, true)?;
+                let ctx = self.dev.context();
+                self.dev.lend().ap_cycle(&ctx, params, true)?;
                 let l = self.read_llk()?;
                 self.record(Algorithm::Ap, l);
             } else {
-                self.steady_cycle(Epoch::Ap(*params))?;
+                self.dev.steady(Epoch::Ap(*params))?;
             }
             self.cycle += 1;
         }
@@ -27,7 +28,9 @@ impl GpuPtycho {
         }
         Ok(())
     }
+}
 
+impl Bufs<'_> {
     /// One AP cycle enqueued on `ctx`; with `llk`, every stack's LLK partials too.
     pub(super) fn ap_cycle(
         &mut self,
@@ -39,11 +42,11 @@ impl GpuPtycho {
         for s in 0..self.stacks.len() {
             self.kernels.obj_probe_to_psi(
                 ctx,
-                &self.views,
+                self.views,
                 self.table.at(s),
-                &self.obj,
-                &self.probe,
-                &mut self.stacks[s].psi,
+                self.obj,
+                self.probe,
+                self.stacks.get(s).psi,
             )?;
             self.project(ctx, s, llk)?;
             self.accumulate(ctx, s, o.is_some(), p.is_some())?;
