@@ -1,13 +1,17 @@
-//! `ptyrs_tile::psi_to_probe` against the SIMT `ptyrs_gpu::Kernels::psi_to_probe` and an
-//! f64 reference: whole and split stack tables, a device-written entry (including `nf == 0`
-//! and entries the kernels clamp), and probe modes no view of the stack uses.
+//! `ptyrs_tile::TileKernels::psi_to_probe` against the SIMT
+//! `ptyrs_gpu::Kernels::psi_to_probe` and an f64 reference: whole and split stack tables, a
+//! device-written entry (including `nf == 0` and entries the kernels clamp), and probe modes
+//! no view of the stack uses. No launch compiles: the set compiled every kernel when it was
+//! built.
 
 use std::ops::Range;
 use std::sync::Arc;
 
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, DeviceCopy};
+use cutile::tile_kernel::jit_compile_count;
 use ptyrs_gpu::{C32, Kernels, StackCtl, StackTable, UpdateSums, ViewAddr, ViewDims, Views};
+use ptyrs_tile::TileKernels;
 
 type Z = (f64, f64);
 
@@ -302,6 +306,9 @@ fn psi_to_probe_matches_simt_and_ignores_stack_split() {
     // Stack 0 has no view of probe mode 2.
     let stacks = [0..2, 2..5];
     let split = StackTable::new(stream, &fx.d, &stacks).unwrap();
+    let tk_whole = TileKernels::new(stream, views, &whole).unwrap();
+    let tk_split = TileKernels::new(stream, views, &split).unwrap();
+    let jit = jit_compile_count();
     let psi_parts = stacks.map(|f| up(stream, &stack_psi(&fx.psi_host, fsize, f, split.nf_max())));
 
     let mut simt = fx.start();
@@ -310,7 +317,7 @@ fn psi_to_probe_matches_simt_and_ignores_stack_split() {
     let simt = host(stream, &simt);
     let tile_whole = || {
         let mut s = fx.start();
-        ptyrs_tile::psi_to_probe(ex, views, &whole, 0, &psi, &fx.obj, &mut s).unwrap();
+        tk_whole.psi_to_probe(ex, 0, &psi, &fx.obj, &mut s).unwrap();
         host(stream, &s)
     };
     let tile = tile_whole();
@@ -318,7 +325,9 @@ fn psi_to_probe_matches_simt_and_ignores_stack_split() {
 
     let mut parts = fx.start();
     for (s, psi) in psi_parts.iter().enumerate() {
-        ptyrs_tile::psi_to_probe(ex, views, &split, s, psi, &fx.obj, &mut parts).unwrap();
+        tk_split
+            .psi_to_probe(ex, s, psi, &fx.obj, &mut parts)
+            .unwrap();
     }
     let parts = host(stream, &parts);
     assert_eq!(
@@ -334,6 +343,7 @@ fn psi_to_probe_matches_simt_and_ignores_stack_split() {
     let again = tile_whole();
     assert_eq!(bits(&again.0), bits(&tile.0), "num differs run to run");
     assert_eq!(bits(&again.1), bits(&tile.1), "den differs run to run");
+    assert_eq!(jit_compile_count(), jit, "a launch compiled");
 }
 
 /// One launch per entry value, written to the device between them: the kernels read the
@@ -346,6 +356,8 @@ fn psi_to_probe_follows_the_device_entry() {
     let (stream, ex, views) = (&fx.stream, &fx.ex, &fx.views);
     let fsize = Fixture::fsize(&fx.d);
     let dev = StackTable::device(stream, &fx.d, 3).unwrap();
+    let tk = TileKernels::new(stream, views, &dev).unwrap();
+    let jit = jit_compile_count();
     let nframe = fx.d.nframe;
     // With the modes each leaves without views.
     let entries: [((u32, u32), &[u32]); 11] = [
@@ -373,19 +385,22 @@ fn psi_to_probe_follows_the_device_entry() {
         fx.k.psi_to_probe(ex, views, dev.at(0), &psi, &fx.obj, &mut simt)
             .unwrap();
         let mut tile = fx.start();
-        ptyrs_tile::psi_to_probe(ex, views, &dev, 0, &psi, &fx.obj, &mut tile).unwrap();
+        tk.psi_to_probe(ex, 0, &psi, &fx.obj, &mut tile).unwrap();
         let what = format!("psi_to_probe entry {{ f0: {f0}, nf: {nf} }} = frames {f:?}");
         let (simt, tile) = (host(stream, &simt), host(stream, &tile));
         assert_eq!(fx.check(&what, f, &tile, &simt), idle, "{what}: idle modes");
     }
+    assert_eq!(jit_compile_count(), jit, "a launch compiled");
 }
 
 #[test]
-fn psi_to_probe_checks_lengths() {
+fn psi_to_probe_checks_buffers() {
     let fx = Fixture::new();
     let (stream, ex, views) = (&fx.stream, &fx.ex, &fx.views);
     let fsize = Fixture::fsize(&fx.d);
     let table = StackTable::new(stream, &fx.d, &[0..2, 2..5]).unwrap();
+    let tk = TileKernels::new(stream, views, &table).unwrap();
+    let jit = jit_compile_count();
     let psi = up(stream, &fx.psi_host[..3 * fsize]);
     let shape = |r: Result<(), ptyrs_gpu::Error>, what: &str| {
         assert!(
@@ -396,15 +411,26 @@ fn psi_to_probe_checks_lengths() {
     let mut sums = UpdateSums::zeroed(stream, fx.num0.len()).unwrap();
     // Two frames of psi do not hold `nf_max` = 3.
     let short_psi = up(stream, &fx.psi_host[..2 * fsize]);
-    let r = ptyrs_tile::psi_to_probe(ex, views, &table, 1, &short_psi, &fx.obj, &mut sums);
+    let r = tk.psi_to_probe(ex, 1, &short_psi, &fx.obj, &mut sums);
     shape(r, "psi");
     // One object mode does not hold two.
     let short_obj = up(stream, &fx.obj_host[..fx.obj_host.len() / 2]);
-    let r = ptyrs_tile::psi_to_probe(ex, views, &table, 1, &psi, &short_obj, &mut sums);
+    let r = tk.psi_to_probe(ex, 1, &psi, &short_obj, &mut sums);
     shape(r, "obj");
     // Two probe modes of sums do not hold three.
     let mut short = UpdateSums::zeroed(stream, 2 * n(&fx.d)).unwrap();
-    let r = ptyrs_tile::psi_to_probe(ex, views, &table, 1, &psi, &fx.obj, &mut short);
+    let r = tk.psi_to_probe(ex, 1, &psi, &fx.obj, &mut short);
     shape(r, "sums");
-    ptyrs_tile::psi_to_probe(ex, views, &table, 1, &psi, &fx.obj, &mut sums).unwrap();
+    // Psi 8 bytes into its allocation, aligned for `C32` but not to 16 bytes.
+    let wide = up(stream, &fx.psi_host[..3 * fsize + 1]);
+    let bytes = wide
+        .storage()
+        .slice_bytes(8, 3 * fsize * size_of::<C32>())
+        .unwrap();
+    // SAFETY: the bytes hold initialized `C32` values.
+    let shifted = unsafe { DeviceBuffer::<C32>::from_storage(bytes, 3 * fsize) }.unwrap();
+    let r = tk.psi_to_probe(ex, 1, &shifted, &fx.obj, &mut sums);
+    shape(r, "misaligned psi");
+    tk.psi_to_probe(ex, 1, &psi, &fx.obj, &mut sums).unwrap();
+    assert_eq!(jit_compile_count(), jit, "a launch compiled");
 }

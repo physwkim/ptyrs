@@ -1,12 +1,17 @@
 //! ptyrs-tile: cuTile (Tile IR) alternatives to `ptyrs-gpu` SIMT pieces.
 //!
-//! Each launch takes the same context and buffers as its `ptyrs_gpu` counterpart, leases
-//! the buffers with [`ptyrs_gpu::lease`] and enqueues on the context's stream, so it runs
-//! eagerly or records into a graph capture the same way. cutile JIT-compiles a kernel on
-//! its first launch.
+//! Every launch is a method of a [`TileKernels`], the kernels of one scan, which compiles
+//! them all when it is built, so no launch compiles, eagerly or under a graph capture. A
+//! launch takes the context and buffers of its `ptyrs_gpu` counterpart, the scan's views
+//! and stack table being the set's, leases the buffers with [`ptyrs_gpu::lease`] and
+//! enqueues on the context's stream, so it runs eagerly or records into a capture the same
+//! way.
+
+use std::sync::Arc;
 
 use cuda_async::device_buffer::DevicePointer;
-use cuda_core::{DeviceBuffer, DeviceCopy};
+use cuda_core::sys::CUdeviceptr;
+use cuda_core::{CudaStream, DeviceBuffer, DeviceCopy};
 use cutile::prelude::*;
 pub use ptyrs_gpu::Error;
 use ptyrs_gpu::{
@@ -796,24 +801,38 @@ fn offset(what: &str, v: usize) -> Result<i32, Error> {
     i32::try_from(v).map_err(|_| shape(format!("{what} {v} exceeds the i32 offsets")))
 }
 
-/// Device address of `buf` as a kernel pointer to `U`.
-fn dptr<T: DeviceCopy, U>(buf: &DeviceBuffer<T>) -> DevicePointer<U> {
-    dptr_at(buf, 0)
+/// A device address as a kernel pointer to `U`.
+fn ptr<U>(addr: CUdeviceptr) -> DevicePointer<U> {
+    // SAFETY: a launch hands the kernel this address with a contract that keeps every
+    // access inside the buffer it came from (checked by its caller); a compile-only run
+    // reads nothing.
+    unsafe { DevicePointer::from_cu_deviceptr(addr) }
 }
 
-/// Device address of `buf[at]` as a kernel pointer to `U`.
-fn dptr_at<T: DeviceCopy, U>(buf: &DeviceBuffer<T>, at: usize) -> DevicePointer<U> {
-    // SAFETY: a launch hands the kernel this address with a contract that keeps every
-    // access inside `buf` (checked by its caller).
-    unsafe { DevicePointer::from_cu_deviceptr(buf.cu_deviceptr() + (at * size_of::<T>()) as u64) }
+/// Device address of `buf` as a kernel pointer to `U`.
+fn dptr<T: DeviceCopy, U>(buf: &DeviceBuffer<T>) -> DevicePointer<U> {
+    ptr(buf.cu_deviceptr())
 }
+
+/// Address of a buffer a launch is handed. cutile specializes a kernel on the alignment of
+/// each pointer, up to 16 bytes, and [`TileKernels::new`] compiles the 16-byte case only.
+fn addr<T: DeviceCopy>(what: &str, buf: &DeviceBuffer<T>) -> Result<CUdeviceptr, Error> {
+    let a = buf.cu_deviceptr();
+    if !a.is_multiple_of(16) {
+        return Err(shape(format!("{what} at {a:#x} is not 16-byte aligned")));
+    }
+    Ok(a)
+}
+
+/// What a compile-only run passes for a buffer a launch is handed: aligned like every
+/// address [`addr`] accepts, and never read.
+const UNBOUND: CUdeviceptr = 0;
 
 /// Entry `s` of `table` as a kernel's [`StackCtl`] words; panics if `s >= table.len()`, as
 /// [`StackTable::at`].
 fn stack_ctl(table: &StackTable, s: usize) -> DevicePointer<i32> {
     table.at(s);
-    // SAFETY: entry `s` lies inside the table; a launch leases `table.storage()`.
-    unsafe { DevicePointer::from_cu_deviceptr(table.ptr() + (s * size_of::<StackCtl>()) as u64) }
+    ptr(table.ptr() + (s * size_of::<StackCtl>()) as CUdeviceptr)
 }
 
 /// The stack kernels' scalar arguments: `nframe`, `nf_max`, `nmode`, the frame and object
@@ -843,239 +862,6 @@ fn obj_len(d: &ViewDims) -> usize {
     d.nobj as usize * d.obj[0] as usize * d.obj[1] as usize
 }
 
-/// [`ptyrs_gpu::Kernels::psi_to_obj`] as a Tile kernel, for the stack in entry `s` of
-/// `table`: adds the stack's object-update sums to `sums` `[nobj, nyo, nxo]`, each object
-/// pixel adding its views in ascending view order from the same tile lists, so the result
-/// does not depend on the stack split. Only the pixels of tiles the stack's views touch are
-/// read and written. `psi` holds `table.nf_max()` frames.
-pub fn psi_to_obj(
-    ctx: &ExecutionContext,
-    views: &Views,
-    table: &StackTable,
-    s: usize,
-    psi: &DeviceBuffer<C32>,
-    probe: &DeviceBuffer<C32>,
-    sums: &mut UpdateSums,
-) -> Result<(), Error> {
-    let ctl = stack_ctl(table, s);
-    let d = views.dims();
-    let (g, psi_len) = stack_geom(views, table)?;
-    let obj_len = obj_len(d);
-    check_len("psi", psi, psi_len)?;
-    check_len(
-        "probe",
-        probe,
-        d.nprobe as usize * d.frame[0] as usize * d.frame[1] as usize,
-    )?;
-    check_len("sums.num", &sums.num, obj_len)?;
-    check_len("sums.den", &sums.den, obj_len)?;
-    offset("tile list length", views.tile_views().len())?;
-    let reads = [
-        psi.storage(),
-        probe.storage(),
-        views.addr().storage(),
-        views.tile_start().storage(),
-        views.tile_len().storage(),
-        views.tile_views().storage(),
-        table.storage(),
-    ];
-    lease(ctx, &reads, &[sums.num.storage(), sums.den.storage()])?;
-    let [nty, ntx] = d.tiles();
-    // SAFETY: lengths and i32 offsets checked above; `Views` checked every view lies inside
-    // the object with valid mode indices and holds tile runs built from them; the kernel
-    // clamps the stack entry to `nf_max` frames inside the scan; the leases order every
-    // access on `ctx`'s stream, and each program writes only the pixels of its own tile.
-    unsafe {
-        device::psi_to_obj(
-            dptr(psi),
-            dptr(probe),
-            dptr(views.addr()),
-            dptr(views.addr()),
-            dptr(views.tile_start()),
-            dptr(views.tile_len()),
-            dptr(views.tile_views()),
-            dptr(&sums.num),
-            dptr(&sums.den),
-            ctl,
-            g[0],
-            g[1],
-            g[2],
-            g[3],
-            g[4],
-            g[5],
-            g[6],
-            d.quad_phase,
-        )
-        .grid((ntx, nty, d.nobj))
-        .execute(ctx)?;
-    }
-    Ok(())
-}
-
-/// [`ptyrs_gpu::Kernels::psi_to_probe`] as a Tile kernel, for the stack in entry `s` of
-/// `table`: adds the stack's probe-update sums to `sums` `[nprobe, ny, nx]`, each probe
-/// pixel adding the views of its mode in ascending view order, so the result does not
-/// depend on the stack split; a mode without a view in the stack is not written. `psi`
-/// holds `table.nf_max()` frames.
-pub fn psi_to_probe(
-    ctx: &ExecutionContext,
-    views: &Views,
-    table: &StackTable,
-    s: usize,
-    psi: &DeviceBuffer<C32>,
-    obj: &DeviceBuffer<C32>,
-    sums: &mut UpdateSums,
-) -> Result<(), Error> {
-    let ctl = stack_ctl(table, s);
-    let d = views.dims();
-    let (g, psi_len) = stack_geom(views, table)?;
-    let probe_len = d.nprobe as usize * d.frame[0] as usize * d.frame[1] as usize;
-    check_len("psi", psi, psi_len)?;
-    check_len("obj", obj, obj_len(d))?;
-    check_len("sums.num", &sums.num, probe_len)?;
-    check_len("sums.den", &sums.den, probe_len)?;
-    let reads = [
-        psi.storage(),
-        obj.storage(),
-        views.addr().storage(),
-        table.storage(),
-    ];
-    lease(ctx, &reads, &[sums.num.storage(), sums.den.storage()])?;
-    let [ny, nx] = d.frame;
-    // SAFETY: lengths and i32 offsets checked above; `Views` checked every view lies inside
-    // the object with valid mode indices; the kernel clamps the stack entry to `nf_max`
-    // frames inside the scan; the leases order every access on `ctx`'s stream, and each
-    // program writes only the pixels of its own tile.
-    unsafe {
-        device::psi_to_probe(
-            dptr(psi),
-            dptr(obj),
-            dptr(views.addr()),
-            dptr(views.addr()),
-            dptr(&sums.num),
-            dptr(&sums.den),
-            ctl,
-            g[0],
-            g[1],
-            g[2],
-            g[3],
-            g[4],
-            g[5],
-            g[6],
-            d.quad_phase,
-        )
-        .grid((nx.div_ceil(32), ny.div_ceil(8), d.nprobe))
-        .execute(ctx)?;
-    }
-    Ok(())
-}
-
-/// [`ptyrs_gpu::Kernels::update_obj_from_sums`] as Tile kernels: [`update_from_sums`] of
-/// the object `[nobj, nyo, nxo]` on the object tiles with views only, `reg = inertia *
-/// max(den)` over their pixels. A tile whose run is empty is neither read nor written, in
-/// `obj` or `sums`, so it keeps its bits. `sums.max_bits` is the scratch for the maximum.
-pub fn update_obj_from_sums(
-    ctx: &ExecutionContext,
-    views: &Views,
-    obj: &mut DeviceBuffer<C32>,
-    sums: &mut UpdateSums,
-    inertia: f32,
-) -> Result<(), Error> {
-    let d = views.dims();
-    let len = obj_len(d);
-    check_len("obj", obj, len)?;
-    check_len("sums.num", &sums.num, len)?;
-    check_len("sums.den", &sums.den, len)?;
-    check_len("sums.max_bits", &sums.max_bits, 1)?;
-    offset("object length", 2 * len)?;
-    let [nyo, nxo] = d.obj.map(|v| v as i32);
-    let [nty, ntx] = d.tiles();
-    let grid = (ntx, nty, d.nobj);
-    let tile_len = views.tile_len();
-    let UpdateSums { num, den, max_bits } = sums;
-    ptyrs_gpu::zero(ctx, max_bits)?;
-    lease(
-        ctx,
-        &[den.storage(), tile_len.storage()],
-        &[max_bits.storage()],
-    )?;
-    // SAFETY: `den` holds the object, `tile_len` its tiles, `max_bits` one zeroed u32, all
-    // leased on `ctx`; offsets checked above.
-    unsafe {
-        device::max_den_tiles(dptr(den), dptr(tile_len), dptr(max_bits), nyo, nxo)
-            .grid(grid)
-            .execute(ctx)?;
-    }
-    let reads = [
-        num.storage(),
-        den.storage(),
-        tile_len.storage(),
-        max_bits.storage(),
-    ];
-    lease(ctx, &reads, &[obj.storage()])?;
-    // SAFETY: as above; `obj` and `num` hold the object's complex values.
-    unsafe {
-        device::normalize_tiles(
-            dptr(obj),
-            dptr(num),
-            dptr(den),
-            dptr(tile_len),
-            dptr(max_bits),
-            inertia,
-            nyo,
-            nxo,
-        )
-        .grid(grid)
-        .execute(ctx)?;
-    }
-    Ok(())
-}
-
-/// [`ptyrs_gpu::Kernels::update_from_sums`] as Tile kernels: `x = (num + reg x) /
-/// max(den + reg, 1e-12)` for the first `n` values, `reg = inertia * max(0, den[0 .. n]
-/// ...)` over the non-NaN values of `den`. `sums.max_bits` is the scratch for that
-/// maximum, zeroed on `ctx`'s stream here, so the call allocates nothing and never
-/// synchronizes.
-pub fn update_from_sums(
-    ctx: &ExecutionContext,
-    x: &mut DeviceBuffer<C32>,
-    sums: &mut UpdateSums,
-    n: u32,
-    inertia: f32,
-) -> Result<(), Error> {
-    check_len("x", x, n as usize)?;
-    check_len("sums.num", &sums.num, n as usize)?;
-    check_len("sums.den", &sums.den, n as usize)?;
-    check_len("sums.max_bits", &sums.max_bits, 1)?;
-    // The kernels index interleaved floats, `2 n` of them, as i32.
-    let n = offset("n", n as usize)?;
-    offset("2 n", 2 * n as usize)?;
-    if n == 0 {
-        return Ok(());
-    }
-    let UpdateSums { num, den, max_bits } = sums;
-    ptyrs_gpu::zero(ctx, max_bits)?;
-    lease(ctx, &[den.storage()], &[max_bits.storage()])?;
-    // SAFETY: `den` holds `n` floats and `max_bits` one zeroed u32, leased on `ctx`.
-    unsafe {
-        device::max_nonneg_f32(dptr(den), n, dptr(max_bits))
-            .grid(((n as u32).div_ceil(1024), 1, 1))
-            .execute(ctx)?;
-    }
-    lease(
-        ctx,
-        &[num.storage(), den.storage(), max_bits.storage()],
-        &[x.storage()],
-    )?;
-    // SAFETY: `x`, `num` hold `n` complex values, `den` `n` floats, `max_bits` one.
-    unsafe {
-        device::normalize_update(dptr(x), dptr(num), dptr(den), n, dptr(max_bits), inertia)
-            .grid(((2 * n as u32).div_ceil(1024), 1, 1))
-            .execute(ctx)?;
-    }
-    Ok(())
-}
-
 /// Node counts of the [`ptyrs_gpu::LlkSums`] tree levels above `n` leaves, the root last.
 fn llk_levels(n: u32) -> Vec<usize> {
     let mut levels = Vec::new();
@@ -1089,62 +875,425 @@ fn llk_levels(n: u32) -> Vec<usize> {
     }
 }
 
-/// `f64`s of scratch [`llk_sums`] needs for `n` frames: the tree levels below the root.
+/// `f64`s of scratch [`TileKernels::llk_sums`] needs for `n` frames: the tree levels below
+/// the root.
 pub fn llk_sums_scratch_len(n: u32) -> usize {
     let levels = llk_levels(n);
     4 * levels[..levels.len() - 1].iter().sum::<usize>()
 }
 
-/// [`ptyrs_gpu::LlkSums::from_partials`] of `partials[0 .. n]` on the device, into `out` as
-/// `[poisson, gaussian, euclidean, icalc]`, bit for bit: one launch per tree level, the
-/// levels below the root in `scratch` ([`llk_sums_scratch_len`] long).
-pub fn llk_sums(
-    ctx: &ExecutionContext,
-    partials: &DeviceBuffer<LlkPartial>,
-    n: u32,
-    scratch: &mut DeviceBuffer<f64>,
-    out: &mut DeviceBuffer<f64>,
-) -> Result<(), Error> {
-    check_len("partials", partials, n as usize)?;
-    check_len("scratch", scratch, llk_sums_scratch_len(n))?;
-    check_len("out", out, 4)?;
-    let levels = llk_levels(n);
-    // The first level's programs index 256 four-term nodes each, as i32.
-    offset("leaf offsets", 4 * LLK_TREE_LEAVES * levels[0])?;
-    let n = n as i32;
-    lease(
-        ctx,
-        &[partials.storage()],
-        &[scratch.storage(), out.storage()],
-    )?;
-    // Scratch offset and node count of the level below.
-    let mut below: Option<(usize, i32)> = None;
-    let mut at = 0;
-    for (l, &m) in levels.iter().enumerate() {
-        let dst = if l + 1 == levels.len() {
-            dptr(out)
-        } else {
-            dptr_at(scratch, at)
-        };
-        // SAFETY: `partials` holds `n` records of four f32 and `scratch` every level below
-        // the root, each of `m` four-f64 nodes at `at`; program `p` reads nodes `256 p ..`
-        // below `n` (or the level's count) and writes node `p`.
-        unsafe {
-            match below {
-                None => {
-                    device::llk_leaves(dptr(partials), n, dst)
-                        .grid((m as u32, 1, 1))
-                        .execute(ctx)?;
-                }
-                Some((src, count)) => {
-                    device::llk_nodes(dptr_at(scratch, src), count, dst)
-                        .grid((m as u32, 1, 1))
-                        .execute(ctx)?;
-                }
+/// Where a launch sequence goes: compiled only, while a [`TileKernels`] is built, or onto a
+/// context's stream.
+#[derive(Clone, Copy)]
+enum Run<'c> {
+    Compile(&'c Arc<CudaStream>),
+    Launch(&'c ExecutionContext),
+}
+
+/// Compiles or launches a launcher, as `$run` says. Expands to unsafe calls.
+macro_rules! run {
+    ($run:expr, $launcher:expr) => {
+        match $run {
+            Run::Compile(stream) => $launcher.compile_on(stream)?,
+            Run::Launch(ctx) => {
+                $launcher.execute(ctx)?;
             }
         }
-        below = Some((at, m as i32));
-        at += 4 * m;
+    };
+}
+
+/// The Tile kernels of one scan, its [`Views`] and [`StackTable`], compiled when the set is
+/// built. cutile compiles a kernel once per specialization, keyed by the power-of-two
+/// divisor of each integer argument and the alignment of each pointer. Every integer here
+/// comes from the scan, the scan's buffers are the set's, entry `s` of the table is aligned
+/// like entry `s % 2`, and every other buffer must be 16-byte aligned; so [`Self::new`]
+/// compiles every specialization a launch can reach, and no launch, eager or captured,
+/// compiles.
+pub struct TileKernels<'a> {
+    views: &'a Views,
+    table: &'a StackTable,
+    /// [`stack_geom`].
+    geom: [i32; 7],
+    psi_len: usize,
+    /// Complex values of the probe, `nprobe * ny * nx`.
+    probe_len: usize,
+    llk_levels: Vec<usize>,
+}
+
+impl<'a> TileKernels<'a> {
+    /// Checks the scan's sizes against the kernels' `i32` offsets and compiles every kernel
+    /// on `stream`, without launching any.
+    pub fn new(
+        stream: &Arc<CudaStream>,
+        views: &'a Views,
+        table: &'a StackTable,
+    ) -> Result<Self, Error> {
+        let d = views.dims();
+        let (geom, psi_len) = stack_geom(views, table)?;
+        offset("tile list length", views.tile_views().len())?;
+        let llk_levels = llk_levels(d.nframe);
+        // The first level's programs index 256 four-term nodes each, as i32.
+        offset("leaf offsets", 4 * LLK_TREE_LEAVES * llk_levels[0])?;
+        let k = Self {
+            views,
+            table,
+            geom,
+            psi_len,
+            probe_len: d.nprobe as usize * d.frame[0] as usize * d.frame[1] as usize,
+            llk_levels,
+        };
+        let run = Run::Compile(stream);
+        for s in 0..table.len().min(2) {
+            k.psi_to_obj_run(run, s, [UNBOUND; 4])?;
+            k.psi_to_probe_run(run, s, [UNBOUND; 4])?;
+        }
+        k.update_obj_run(run, [UNBOUND; 4], 0.0)?;
+        k.update_probe_run(run, [UNBOUND; 4], 0.0)?;
+        k.llk_run(run, [UNBOUND; 3])?;
+        Ok(k)
     }
-    Ok(())
+
+    /// [`ptyrs_gpu::Kernels::psi_to_obj`] for the stack in entry `s` of the table: adds the
+    /// stack's object-update sums to `sums` `[nobj, nyo, nxo]`, each object pixel adding its
+    /// views in ascending view order from the same tile lists, so the result does not depend
+    /// on the stack split. Only the pixels of tiles the stack's views touch are read and
+    /// written. `psi` holds `nf_max` frames.
+    pub fn psi_to_obj(
+        &self,
+        ctx: &ExecutionContext,
+        s: usize,
+        psi: &DeviceBuffer<C32>,
+        probe: &DeviceBuffer<C32>,
+        sums: &mut UpdateSums,
+    ) -> Result<(), Error> {
+        let (v, len) = (self.views, obj_len(self.views.dims()));
+        check_len("psi", psi, self.psi_len)?;
+        check_len("probe", probe, self.probe_len)?;
+        check_len("sums.num", &sums.num, len)?;
+        check_len("sums.den", &sums.den, len)?;
+        let at = [
+            addr("psi", psi)?,
+            addr("probe", probe)?,
+            addr("sums.num", &sums.num)?,
+            addr("sums.den", &sums.den)?,
+        ];
+        let reads = [
+            psi.storage(),
+            probe.storage(),
+            v.addr().storage(),
+            v.tile_start().storage(),
+            v.tile_len().storage(),
+            v.tile_views().storage(),
+            self.table.storage(),
+        ];
+        lease(ctx, &reads, &[sums.num.storage(), sums.den.storage()])?;
+        self.psi_to_obj_run(Run::Launch(ctx), s, at)
+    }
+
+    fn psi_to_obj_run(
+        &self,
+        run: Run,
+        s: usize,
+        [psi, probe, num, den]: [CUdeviceptr; 4],
+    ) -> Result<(), Error> {
+        let (v, d, g) = (self.views, self.views.dims(), self.geom);
+        let [nty, ntx] = d.tiles();
+        // SAFETY: a launch comes from `psi_to_obj`, which checked the lengths and leased the
+        // buffers on `ctx`; `stack_geom` checked the i32 offsets; `Views` checked every view
+        // lies inside the object with valid mode indices and holds tile runs built from them;
+        // the kernel clamps the stack entry to `nf_max` frames inside the scan, and each
+        // program writes only the pixels of its own tile.
+        unsafe {
+            run!(
+                run,
+                device::psi_to_obj(
+                    ptr(psi),
+                    ptr(probe),
+                    dptr(v.addr()),
+                    dptr(v.addr()),
+                    dptr(v.tile_start()),
+                    dptr(v.tile_len()),
+                    dptr(v.tile_views()),
+                    ptr(num),
+                    ptr(den),
+                    stack_ctl(self.table, s),
+                    g[0],
+                    g[1],
+                    g[2],
+                    g[3],
+                    g[4],
+                    g[5],
+                    g[6],
+                    d.quad_phase,
+                )
+                .grid((ntx, nty, d.nobj))
+            );
+        }
+        Ok(())
+    }
+
+    /// [`ptyrs_gpu::Kernels::psi_to_probe`] for the stack in entry `s` of the table: adds
+    /// the stack's probe-update sums to `sums` `[nprobe, ny, nx]`, each probe pixel adding
+    /// the views of its mode in ascending view order, so the result does not depend on the
+    /// stack split; a mode without a view in the stack is not written. `psi` holds `nf_max`
+    /// frames.
+    pub fn psi_to_probe(
+        &self,
+        ctx: &ExecutionContext,
+        s: usize,
+        psi: &DeviceBuffer<C32>,
+        obj: &DeviceBuffer<C32>,
+        sums: &mut UpdateSums,
+    ) -> Result<(), Error> {
+        check_len("psi", psi, self.psi_len)?;
+        check_len("obj", obj, obj_len(self.views.dims()))?;
+        check_len("sums.num", &sums.num, self.probe_len)?;
+        check_len("sums.den", &sums.den, self.probe_len)?;
+        let at = [
+            addr("psi", psi)?,
+            addr("obj", obj)?,
+            addr("sums.num", &sums.num)?,
+            addr("sums.den", &sums.den)?,
+        ];
+        let reads = [
+            psi.storage(),
+            obj.storage(),
+            self.views.addr().storage(),
+            self.table.storage(),
+        ];
+        lease(ctx, &reads, &[sums.num.storage(), sums.den.storage()])?;
+        self.psi_to_probe_run(Run::Launch(ctx), s, at)
+    }
+
+    fn psi_to_probe_run(
+        &self,
+        run: Run,
+        s: usize,
+        [psi, obj, num, den]: [CUdeviceptr; 4],
+    ) -> Result<(), Error> {
+        let (v, d, g) = (self.views, self.views.dims(), self.geom);
+        let [ny, nx] = d.frame;
+        // SAFETY: a launch comes from `psi_to_probe`, which checked the lengths and leased the
+        // buffers on `ctx`; `stack_geom` checked the i32 offsets; `Views` checked every view
+        // lies inside the object with valid mode indices; the kernel clamps the stack entry to
+        // `nf_max` frames inside the scan, and each program writes only the pixels of its own
+        // tile.
+        unsafe {
+            run!(
+                run,
+                device::psi_to_probe(
+                    ptr(psi),
+                    ptr(obj),
+                    dptr(v.addr()),
+                    dptr(v.addr()),
+                    ptr(num),
+                    ptr(den),
+                    stack_ctl(self.table, s),
+                    g[0],
+                    g[1],
+                    g[2],
+                    g[3],
+                    g[4],
+                    g[5],
+                    g[6],
+                    d.quad_phase,
+                )
+                .grid((nx.div_ceil(32), ny.div_ceil(8), d.nprobe))
+            );
+        }
+        Ok(())
+    }
+
+    /// [`ptyrs_gpu::Kernels::update_obj_from_sums`]: [`Self::update_probe_from_sums`] of the
+    /// object `[nobj, nyo, nxo]` on the object tiles with views only, `reg = inertia *
+    /// max(den)` over their pixels. A tile whose run is empty is neither read nor written,
+    /// in `obj` or `sums`, so it keeps its bits. `sums.max_bits` is the scratch for the
+    /// maximum.
+    pub fn update_obj_from_sums(
+        &self,
+        ctx: &ExecutionContext,
+        obj: &mut DeviceBuffer<C32>,
+        sums: &mut UpdateSums,
+        inertia: f32,
+    ) -> Result<(), Error> {
+        let len = obj_len(self.views.dims());
+        check_len("obj", obj, len)?;
+        check_len("sums.num", &sums.num, len)?;
+        check_len("sums.den", &sums.den, len)?;
+        check_len("sums.max_bits", &sums.max_bits, 1)?;
+        let UpdateSums { num, den, max_bits } = sums;
+        let at = [
+            addr("obj", obj)?,
+            addr("sums.num", num)?,
+            addr("sums.den", den)?,
+            addr("sums.max_bits", max_bits)?,
+        ];
+        ptyrs_gpu::zero(ctx, max_bits)?;
+        let reads = [
+            num.storage(),
+            den.storage(),
+            self.views.tile_len().storage(),
+        ];
+        lease(ctx, &reads, &[max_bits.storage(), obj.storage()])?;
+        self.update_obj_run(Run::Launch(ctx), at, inertia)
+    }
+
+    fn update_obj_run(
+        &self,
+        run: Run,
+        [obj, num, den, max_bits]: [CUdeviceptr; 4],
+        inertia: f32,
+    ) -> Result<(), Error> {
+        let d = self.views.dims();
+        let [nyo, nxo] = [self.geom[5], self.geom[6]];
+        let [nty, ntx] = d.tiles();
+        let grid = (ntx, nty, d.nobj);
+        let tile_len = self.views.tile_len();
+        // SAFETY: a launch comes from `update_obj_from_sums`, which checked that `obj`, `num`
+        // and `den` hold the object and `max_bits` one u32, zeroed it and leased the buffers
+        // on `ctx`; `tile_len` holds the object's tiles; `stack_geom` checked the offsets.
+        unsafe {
+            run!(
+                run,
+                device::max_den_tiles(ptr(den), dptr(tile_len), ptr(max_bits), nyo, nxo).grid(grid)
+            );
+            run!(
+                run,
+                device::normalize_tiles(
+                    ptr(obj),
+                    ptr(num),
+                    ptr(den),
+                    dptr(tile_len),
+                    ptr(max_bits),
+                    inertia,
+                    nyo,
+                    nxo,
+                )
+                .grid(grid)
+            );
+        }
+        Ok(())
+    }
+
+    /// [`ptyrs_gpu::Kernels::update_from_sums`] of the probe: `x = (num + reg x) / max(den +
+    /// reg, 1e-12)` for its `nprobe * ny * nx` values, `reg = inertia * max(0, den ...)`
+    /// over the non-NaN values of `den`. `sums.max_bits` is the scratch for that maximum,
+    /// zeroed on `ctx`'s stream here, so the call allocates nothing and never synchronizes.
+    pub fn update_probe_from_sums(
+        &self,
+        ctx: &ExecutionContext,
+        probe: &mut DeviceBuffer<C32>,
+        sums: &mut UpdateSums,
+        inertia: f32,
+    ) -> Result<(), Error> {
+        let n = self.probe_len;
+        check_len("probe", probe, n)?;
+        check_len("sums.num", &sums.num, n)?;
+        check_len("sums.den", &sums.den, n)?;
+        check_len("sums.max_bits", &sums.max_bits, 1)?;
+        let UpdateSums { num, den, max_bits } = sums;
+        let at = [
+            addr("probe", probe)?,
+            addr("sums.num", num)?,
+            addr("sums.den", den)?,
+            addr("sums.max_bits", max_bits)?,
+        ];
+        ptyrs_gpu::zero(ctx, max_bits)?;
+        lease(
+            ctx,
+            &[num.storage(), den.storage()],
+            &[max_bits.storage(), probe.storage()],
+        )?;
+        self.update_probe_run(Run::Launch(ctx), at, inertia)
+    }
+
+    fn update_probe_run(
+        &self,
+        run: Run,
+        [x, num, den, max_bits]: [CUdeviceptr; 4],
+        inertia: f32,
+    ) -> Result<(), Error> {
+        // `stack_geom` checked that the probe's `2 n` floats index as i32.
+        let n = self.probe_len as i32;
+        // SAFETY: a launch comes from `update_probe_from_sums`, which checked that `x`, `num`
+        // hold `n` complex values, `den` `n` floats and `max_bits` one, zeroed `max_bits` and
+        // leased the buffers on `ctx`.
+        unsafe {
+            run!(
+                run,
+                device::max_nonneg_f32(ptr(den), n, ptr(max_bits)).grid((
+                    (n as u32).div_ceil(1024),
+                    1,
+                    1
+                ))
+            );
+            run!(
+                run,
+                device::normalize_update(ptr(x), ptr(num), ptr(den), n, ptr(max_bits), inertia)
+                    .grid(((2 * n as u32).div_ceil(1024), 1, 1))
+            );
+        }
+        Ok(())
+    }
+
+    /// [`ptyrs_gpu::LlkSums::from_partials`] of the scan's `nframe` partials on the device,
+    /// into `out` as `[poisson, gaussian, euclidean, icalc]`, bit for bit: one launch per
+    /// tree level, the levels below the root in `scratch` ([`llk_sums_scratch_len`] long).
+    pub fn llk_sums(
+        &self,
+        ctx: &ExecutionContext,
+        partials: &DeviceBuffer<LlkPartial>,
+        scratch: &mut DeviceBuffer<f64>,
+        out: &mut DeviceBuffer<f64>,
+    ) -> Result<(), Error> {
+        let n = self.views.dims().nframe;
+        check_len("partials", partials, n as usize)?;
+        check_len("scratch", scratch, llk_sums_scratch_len(n))?;
+        check_len("out", out, 4)?;
+        let at = [
+            addr("partials", partials)?,
+            addr("scratch", scratch)?,
+            addr("out", out)?,
+        ];
+        lease(
+            ctx,
+            &[partials.storage()],
+            &[scratch.storage(), out.storage()],
+        )?;
+        self.llk_run(Run::Launch(ctx), at)
+    }
+
+    fn llk_run(&self, run: Run, [partials, scratch, out]: [CUdeviceptr; 3]) -> Result<(), Error> {
+        let n = self.geom[0];
+        let node = |at: usize| scratch + (at * size_of::<f64>()) as CUdeviceptr;
+        // Scratch offset and node count of the level below.
+        let mut below: Option<(usize, i32)> = None;
+        let mut at = 0;
+        for (l, &m) in self.llk_levels.iter().enumerate() {
+            let dst = if l + 1 == self.llk_levels.len() {
+                out
+            } else {
+                node(at)
+            };
+            // SAFETY: a launch comes from `llk_sums`, which checked that `partials` holds `n`
+            // records of four f32 and `scratch` every level below the root, each of `m`
+            // four-f64 nodes at `at`, and leased them on `ctx`; program `p` reads nodes `256 p
+            // ..` below `n` (or the level's count) and writes node `p`.
+            unsafe {
+                match below {
+                    None => run!(
+                        run,
+                        device::llk_leaves(ptr(partials), n, ptr(dst)).grid((m as u32, 1, 1))
+                    ),
+                    Some((src, count)) => run!(
+                        run,
+                        device::llk_nodes(ptr(node(src)), count, ptr(dst)).grid((m as u32, 1, 1))
+                    ),
+                }
+            }
+            below = Some((at, m as i32));
+            at += 4 * m;
+        }
+        Ok(())
+    }
 }

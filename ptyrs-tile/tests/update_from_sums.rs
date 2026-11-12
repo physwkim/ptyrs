@@ -1,11 +1,15 @@
-//! `ptyrs_tile::update_from_sums` and `update_obj_from_sums` against their SIMT
-//! `ptyrs_gpu::Kernels` counterparts and an f64 reference.
+//! `ptyrs_tile::TileKernels::update_probe_from_sums` and `update_obj_from_sums` against
+//! their SIMT `ptyrs_gpu::Kernels` counterparts and an f64 reference.
 
 use std::sync::Arc;
 
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, DeviceCopy};
-use ptyrs_gpu::{C32, Kernels, OBJ_TILE, UpdateSums, ViewAddr, ViewDims, Views, view_tiles};
+use cutile::tile_kernel::jit_compile_count;
+use ptyrs_gpu::{
+    C32, Kernels, OBJ_TILE, StackTable, UpdateSums, ViewAddr, ViewDims, Views, view_tiles,
+};
+use ptyrs_tile::TileKernels;
 
 /// Deterministic values in `[-scale, scale)`.
 fn noise(len: usize, seed: u64, scale: f32) -> Vec<C32> {
@@ -45,20 +49,47 @@ fn bits(v: &[f32]) -> Vec<u32> {
     v.iter().map(|x| x.to_bits()).collect()
 }
 
+/// A scan whose probe is `nprobe` modes of `frame`: one frame, viewing each mode at the
+/// origin of a one-mode object of the frame's size, and its one-stack table.
+fn probe_scan(stream: &Arc<CudaStream>, nprobe: u32, frame: [u32; 2]) -> (Views, StackTable) {
+    let d = ViewDims {
+        nframe: 1,
+        nmode: nprobe,
+        nprobe,
+        nobj: 1,
+        frame,
+        obj: frame,
+        quad_phase: 0.0,
+    };
+    let views: Vec<ViewAddr> = (0..nprobe)
+        .map(|probe| ViewAddr {
+            probe,
+            ..ViewAddr::default()
+        })
+        .collect();
+    let views = Views::new(stream, d, &views).unwrap();
+    let table = StackTable::new(stream, &d, std::slice::from_ref(&(0..1))).unwrap();
+    (views, table)
+}
+
 #[test]
-fn update_from_sums_matches_simt() {
+fn update_probe_from_sums_matches_simt() {
     let ctx = CudaContext::new(0).expect("CUDA device 0");
     let k = Kernels::load(&ctx).expect("load ptyrs-gpu kernels");
     let stream: Arc<CudaStream> = ctx.default_stream();
     let ex = ExecutionContext::new(stream.clone());
     let inertia = 0.01f32;
-    // 300_001 values span several max programs; their maximum is the last value. The 1500
+    // 300_000 values span several max programs; their maximum is the last value. The 1500
     // have no positive `den` (negatives, -0, NaN), so `reg` is 0 and the update is exact.
-    for (len, seed, positive) in [
-        (6000usize, 20u64, true),
-        (300_001, 30, true),
-        (1500, 40, false),
+    for (nprobe, frame, seed, positive) in [
+        (3, [40, 50], 20u64, true),
+        (1, [500, 600], 30, true),
+        (1, [30, 50], 40, false),
     ] {
+        let len = (nprobe * frame[0] * frame[1]) as usize;
+        let (views, table) = probe_scan(&stream, nprobe, frame);
+        let tk = TileKernels::new(&stream, &views, &table).unwrap();
+        let jit = jit_compile_count();
         let x_host = noise(len, seed, 1.0);
         let num_host = noise(len, seed + 1, 3.0);
         let mut den_host: Vec<f32> = noise(len, seed + 2, 2.0)
@@ -83,17 +114,19 @@ fn update_from_sums_matches_simt() {
                 ]
             })
             .collect();
-        let mut sums =
-            UpdateSums::new(up(&stream, &num_host), up(&stream, &den_host), &stream).unwrap();
+        let sums =
+            || UpdateSums::new(up(&stream, &num_host), up(&stream, &den_host), &stream).unwrap();
         let mut simt = up(&stream, &x_host);
-        k.update_from_sums(&ex, &mut simt, &mut sums, len as u32, inertia)
+        k.update_from_sums(&ex, &mut simt, &mut sums(), len as u32, inertia)
             .unwrap();
         let simt = flat(&simt.to_host_vec(&stream).unwrap());
-        // Stale scratch above every `den`: the op must zero it itself.
-        sums.max_bits = up(&stream, &[1e30f32.to_bits()]);
-        let mut run = || {
+        let run = || {
+            let mut sums = sums();
+            // Stale scratch above every `den`: the op must zero it itself.
+            sums.max_bits = up(&stream, &[1e30f32.to_bits()]);
             let mut x = up(&stream, &x_host);
-            ptyrs_tile::update_from_sums(&ex, &mut x, &mut sums, len as u32, inertia).unwrap();
+            tk.update_probe_from_sums(&ex, &mut x, &mut sums, inertia)
+                .unwrap();
             flat(&x.to_host_vec(&stream).unwrap())
         };
         let tile = run();
@@ -106,7 +139,7 @@ fn update_from_sums_matches_simt() {
             .filter(|(a, b)| a.to_bits() == b.to_bits())
             .count();
         println!(
-            "update_from_sums n={len}: rel L2 Tile-SIMT {vs_simt:.2e}, Tile-f64 {vs_f64:.2e}; \
+            "update_probe_from_sums n={len}: rel L2 Tile-SIMT {vs_simt:.2e}, Tile-f64 {vs_f64:.2e}; \
              {same} of {} values bit-equal to SIMT",
             tile.len()
         );
@@ -116,6 +149,7 @@ fn update_from_sums_matches_simt() {
             assert_eq!(bits(&tile), bits(&simt), "n={len}: reg 0 is not exact");
         }
         assert_eq!(bits(&run()), bits(&tile), "n={len}: differs run to run");
+        assert_eq!(jit_compile_count(), jit, "n={len}: a launch compiled");
     }
 }
 
@@ -151,6 +185,9 @@ fn update_obj_from_sums_matches_simt_on_tiles_with_views() {
     };
     let view_list = [view(0, 0, 0.0, 0.0, 0), view(57, 67, 0.6, 0.9, 1)];
     let views = Views::new(&stream, d, &view_list).unwrap();
+    let table = StackTable::new(&stream, &d, std::slice::from_ref(&(0..d.nframe))).unwrap();
+    let tk = TileKernels::new(&stream, &views, &table).unwrap();
+    let jit = jit_compile_count();
     let [nyo, nxo] = d.obj.map(|v| v as usize);
     let [nty, ntx] = d.tiles().map(|v| v as usize);
     let mut lit_tiles = vec![false; nty * ntx];
@@ -219,7 +256,8 @@ fn update_obj_from_sums_matches_simt_on_tiles_with_views() {
             k.update_obj_from_sums(&ex, &views, &mut x, &mut sums, inertia)
                 .unwrap();
         } else {
-            ptyrs_tile::update_obj_from_sums(&ex, &views, &mut x, &mut sums, inertia).unwrap();
+            tk.update_obj_from_sums(&ex, &mut x, &mut sums, inertia)
+                .unwrap();
         }
         let x = x.to_host_vec(&stream).unwrap();
         let num = sums.num.to_host_vec(&stream).unwrap();
@@ -252,4 +290,5 @@ fn update_obj_from_sums_matches_simt_on_tiles_with_views() {
         );
     }
     assert_eq!(bits(&flat(&run(false).0)), bits(&tx), "differs run to run");
+    assert_eq!(jit_compile_count(), jit, "a launch compiled");
 }

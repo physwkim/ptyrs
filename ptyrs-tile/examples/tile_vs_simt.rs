@@ -14,6 +14,7 @@ use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 use ptyrs_gpu::{
     C32, Kernels, LlkPartial, LlkSums, StackTable, UpdateSums, ViewAddr, ViewDims, Views,
 };
+use ptyrs_tile::{TileKernels, llk_sums_scratch_len};
 
 const N: u32 = 256;
 const STEP: u32 = 24;
@@ -112,6 +113,7 @@ fn main() {
     let mut probe = DeviceBuffer::from_host(&stream, &probe_host).unwrap();
     let mut psi = DeviceBuffer::<C32>::zeroed(&stream, nk * n2).unwrap();
     let table = StackTable::new(&stream, &d, std::slice::from_ref(&(0..d.nframe))).unwrap();
+    let tk = TileKernels::new(&stream, &views, &table).unwrap();
     // Leases every buffer the launches below touch until it drops after their sync.
     let ex = ExecutionContext::new(stream.clone());
     k.obj_probe_to_psi(&ex, &views, table.at(0), &obj, &probe, &mut psi)
@@ -132,7 +134,7 @@ fn main() {
     let mut probe_sums = UpdateSums::zeroed(&stream, probe_len).unwrap();
     let mut llk = DeviceBuffer::<f64>::zeroed(&stream, 4).unwrap();
     let mut llk_scratch =
-        DeviceBuffer::<f64>::zeroed(&stream, ptyrs_tile::llk_sums_scratch_len(d.nframe)).unwrap();
+        DeviceBuffer::<f64>::zeroed(&stream, llk_sums_scratch_len(d.nframe)).unwrap();
     stream.synchronize().unwrap();
     println!(
         "{} {}: {} frames x {} modes of {N}x{N}, object {}x{}, {reps} reps",
@@ -144,13 +146,13 @@ fn main() {
         d.obj[1]
     );
 
-    // Two warm-up launches (the Tile JIT) and `reps` timed ones of each kernel, in the
+    // Two warm-up launches and `reps` timed ones of each kernel, in the
     // order the nsys trace is read: psi_to_obj, psi_to_probe, update_obj_from_sums,
     // update_from_sums on the probe, then the LLK totals.
     let total = 2 + reps;
     for _ in 0..total {
         if tile {
-            ptyrs_tile::psi_to_obj(&ex, &views, &table, 0, &psi, &probe, &mut obj_sums).unwrap();
+            tk.psi_to_obj(&ex, 0, &psi, &probe, &mut obj_sums).unwrap();
         } else {
             k.psi_to_obj(&ex, &views, table.at(0), &psi, &probe, &mut obj_sums)
                 .unwrap();
@@ -158,7 +160,8 @@ fn main() {
     }
     for _ in 0..total {
         if tile {
-            ptyrs_tile::psi_to_probe(&ex, &views, &table, 0, &psi, &obj, &mut probe_sums).unwrap();
+            tk.psi_to_probe(&ex, 0, &psi, &obj, &mut probe_sums)
+                .unwrap();
         } else {
             k.psi_to_probe(&ex, &views, table.at(0), &psi, &obj, &mut probe_sums)
                 .unwrap();
@@ -166,7 +169,8 @@ fn main() {
     }
     for _ in 0..total {
         if tile {
-            ptyrs_tile::update_obj_from_sums(&ex, &views, &mut obj, &mut obj_sums, 0.01).unwrap();
+            tk.update_obj_from_sums(&ex, &mut obj, &mut obj_sums, 0.01)
+                .unwrap();
         } else {
             k.update_obj_from_sums(&ex, &views, &mut obj, &mut obj_sums, 0.01)
                 .unwrap();
@@ -174,7 +178,7 @@ fn main() {
     }
     for _ in 0..total {
         if tile {
-            ptyrs_tile::update_from_sums(&ex, &mut probe, &mut probe_sums, probe_len as u32, 0.01)
+            tk.update_probe_from_sums(&ex, &mut probe, &mut probe_sums, 0.01)
                 .unwrap();
         } else {
             k.update_from_sums(&ex, &mut probe, &mut probe_sums, probe_len as u32, 0.01)
@@ -191,7 +195,8 @@ fn main() {
         let t = Instant::now();
         let totals = if tile {
             let ex = ExecutionContext::new(stream.clone());
-            ptyrs_tile::llk_sums(&ex, &partials, d.nframe, &mut llk_scratch, &mut llk).unwrap();
+            tk.llk_sums(&ex, &partials, &mut llk_scratch, &mut llk)
+                .unwrap();
             llk.to_host_vec(&stream).unwrap()
         } else {
             let s = LlkSums::from_partials(&partials.to_host_vec(&stream).unwrap());

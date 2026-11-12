@@ -1,13 +1,34 @@
-//! `ptyrs_tile::llk_sums` against the host `ptyrs_gpu::LlkSums::from_partials` tree.
+//! `ptyrs_tile::TileKernels::llk_sums` against the host `ptyrs_gpu::LlkSums::from_partials`
+//! tree.
 
 use std::sync::Arc;
 
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
-use ptyrs_gpu::{LlkPartial, LlkSums};
+use cutile::tile_kernel::jit_compile_count;
+use ptyrs_gpu::{LlkPartial, LlkSums, StackTable, ViewAddr, ViewDims, Views};
+use ptyrs_tile::{TileKernels, llk_sums_scratch_len};
 
 fn totals(s: &LlkSums) -> [u64; 4] {
     [s.poisson, s.gaussian, s.euclidean, s.icalc].map(f64::to_bits)
+}
+
+/// A scan of `nframe` 2x2 frames, all viewing a 2x2 object at its origin, and its
+/// one-stack table: [`TileKernels::llk_sums`] sums `nframe` partials.
+fn scan(stream: &Arc<CudaStream>, nframe: u32) -> (Views, StackTable) {
+    let d = ViewDims {
+        nframe,
+        nmode: 1,
+        nprobe: 1,
+        nobj: 1,
+        frame: [2, 2],
+        obj: [2, 2],
+        quad_phase: 0.0,
+    };
+    let views = vec![ViewAddr::default(); nframe as usize];
+    let views = Views::new(stream, d, &views).unwrap();
+    let table = StackTable::new(stream, &d, std::slice::from_ref(&(0..nframe))).unwrap();
+    (views, table)
 }
 
 fn sequential(p: &[LlkPartial]) -> [u64; 4] {
@@ -67,13 +88,17 @@ fn llk_sums_equal_from_partials_bit_for_bit() {
         "the data does not tell the tree from the sequential sum"
     );
     let partials = DeviceBuffer::from_host(&stream, &host).unwrap();
+    let mut out = DeviceBuffer::<f64>::zeroed(&stream, 4).unwrap();
     // One, two and three tree levels, at and next to the level boundaries.
-    for n in [0usize, 1, 255, 256, 257, 3000, 65_536, 70_000] {
-        let scratch_len = ptyrs_tile::llk_sums_scratch_len(n as u32);
+    for n in [1usize, 255, 256, 257, 3000, 65_536, 70_000] {
+        let (views, table) = scan(&stream, n as u32);
+        let tk = TileKernels::new(&stream, &views, &table).unwrap();
+        let jit = jit_compile_count();
+        let scratch_len = llk_sums_scratch_len(n as u32);
         let run = || {
             let mut scratch = DeviceBuffer::<f64>::zeroed(&stream, scratch_len).unwrap();
             let mut out = DeviceBuffer::<f64>::zeroed(&stream, 4).unwrap();
-            ptyrs_tile::llk_sums(&ex, &partials, n as u32, &mut scratch, &mut out).unwrap();
+            tk.llk_sums(&ex, &partials, &mut scratch, &mut out).unwrap();
             out.to_host_vec(&stream).unwrap()
         };
         let got: Vec<u64> = run().iter().map(|v| v.to_bits()).collect();
@@ -81,12 +106,18 @@ fn llk_sums_equal_from_partials_bit_for_bit() {
         assert_eq!(got, want, "n={n}: Tile totals differ from from_partials");
         let again: Vec<u64> = run().iter().map(|v| v.to_bits()).collect();
         assert_eq!(again, got, "n={n}: differs run to run");
+        if n == 70_000 {
+            // Two levels below the root, of 274 and 2 nodes.
+            assert_eq!(scratch_len, 4 * (274 + 2));
+            let mut short = DeviceBuffer::<f64>::zeroed(&stream, scratch_len - 4).unwrap();
+            let r = tk.llk_sums(&ex, &partials, &mut short, &mut out);
+            assert!(r.is_err(), "short scratch: {r:?}");
+            let few = DeviceBuffer::from_host(&stream, &host[..n - 1]).unwrap();
+            let mut scratch = DeviceBuffer::<f64>::zeroed(&stream, scratch_len).unwrap();
+            let r = tk.llk_sums(&ex, &few, &mut scratch, &mut out);
+            assert!(r.is_err(), "partials short of nframe: {r:?}");
+        }
+        assert_eq!(jit_compile_count(), jit, "n={n}: a launch compiled");
     }
-    assert_eq!(ptyrs_tile::llk_sums_scratch_len(256), 0);
-    assert_eq!(ptyrs_tile::llk_sums_scratch_len(70_000), 4 * (274 + 2));
-    let mut scratch = DeviceBuffer::<f64>::zeroed(&stream, 4 * (274 + 2)).unwrap();
-    let mut out = DeviceBuffer::<f64>::zeroed(&stream, 4).unwrap();
-    assert!(ptyrs_tile::llk_sums(&ex, &partials, 70_002, &mut scratch, &mut out).is_err());
-    let mut short = DeviceBuffer::<f64>::zeroed(&stream, 4 * (274 + 1)).unwrap();
-    assert!(ptyrs_tile::llk_sums(&ex, &partials, 70_000, &mut short, &mut out).is_err());
+    assert_eq!(llk_sums_scratch_len(256), 0, "one level, the root");
 }

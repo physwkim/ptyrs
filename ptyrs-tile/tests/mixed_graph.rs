@@ -1,6 +1,7 @@
 //! One AP epoch as one CUDA graph: the SIMT forward model, Fourier projection and LLK
 //! partials of `ptyrs_gpu`, then the Tile object and probe updates and LLK totals. The
-//! graph is replayed and compared bit for bit with the same epoch run eagerly.
+//! epoch is captured before any Tile kernel has launched, the graph replayed, and each
+//! replay compared bit for bit with the same epoch run directly.
 
 use std::sync::Arc;
 
@@ -11,6 +12,7 @@ use ptyrs_gpu::{
     C32, Error, Kernels, Lines, LlkPartial, StackTable, UpdateSums, ViewAddr, ViewDims, Views,
     record,
 };
+use ptyrs_tile::{TileKernels, llk_sums_scratch_len};
 
 const N: u32 = 128;
 const EPOCHS: usize = 4;
@@ -118,6 +120,8 @@ fn fft2(
 
 struct Scan<'a> {
     k: &'a Kernels,
+    /// The Tile kernels of `views` and `table`.
+    tk: &'a TileKernels<'a>,
     views: &'a Views,
     /// One stack, the whole scan.
     table: &'a StackTable,
@@ -139,9 +143,8 @@ struct State {
 /// One AP epoch over the whole scan as one stack: the object update, then the probe
 /// update from the new object.
 fn epoch(ctx: &ExecutionContext, scan: &Scan, s: &mut State) -> Result<(), Error> {
-    let (k, d, table) = (scan.k, scan.views.dims(), scan.table);
+    let (k, tk, d, table) = (scan.k, scan.tk, scan.views.dims(), scan.table);
     let nk = d.nframe * d.nmode;
-    let probe_len = s.probe.len() as u32;
     s.obj_sums.zero(ctx)?;
     s.probe_sums.zero(ctx)?;
     k.obj_probe_to_psi(ctx, scan.views, table.at(0), &s.obj, &s.probe, &mut s.psi)?;
@@ -149,11 +152,11 @@ fn epoch(ctx: &ExecutionContext, scan: &Scan, s: &mut State) -> Result<(), Error
     k.llk(ctx, d, table.at(0), scan.counts, &s.psi, &mut s.partials)?;
     k.apply_amplitude(ctx, d, table.at(0), scan.counts, &mut s.psi)?;
     fft2(k, ctx, &mut s.psi, nk, true)?;
-    ptyrs_tile::psi_to_obj(ctx, scan.views, table, 0, &s.psi, &s.probe, &mut s.obj_sums)?;
-    ptyrs_tile::update_obj_from_sums(ctx, scan.views, &mut s.obj, &mut s.obj_sums, 0.01)?;
-    ptyrs_tile::psi_to_probe(ctx, scan.views, table, 0, &s.psi, &s.obj, &mut s.probe_sums)?;
-    ptyrs_tile::update_from_sums(ctx, &mut s.probe, &mut s.probe_sums, probe_len, 0.01)?;
-    ptyrs_tile::llk_sums(ctx, &s.partials, d.nframe, &mut s.llk_scratch, &mut s.llk)
+    tk.psi_to_obj(ctx, 0, &s.psi, &s.probe, &mut s.obj_sums)?;
+    tk.update_obj_from_sums(ctx, &mut s.obj, &mut s.obj_sums, 0.01)?;
+    tk.psi_to_probe(ctx, 0, &s.psi, &s.obj, &mut s.probe_sums)?;
+    tk.update_probe_from_sums(ctx, &mut s.probe, &mut s.probe_sums, 0.01)?;
+    tk.llk_sums(ctx, &s.partials, &mut s.llk_scratch, &mut s.llk)
 }
 
 /// The bits of the object, the probe and the LLK totals.
@@ -206,8 +209,11 @@ fn ap_epoch_graph_replays_bit_for_bit() {
     let scale = 2e4 / icalc.iter().fold(0f32, |m, &v| m.max(v));
     let counts: Vec<u16> = icalc.iter().map(|&v| (v * scale).round() as u16).collect();
     let counts = DeviceBuffer::from_host(&stream, &counts).unwrap();
+    let tk = TileKernels::new(&stream, &views, &table).unwrap();
+    let jit = cutile::tile_kernel::jit_compile_count();
     let scan = Scan {
         k: &k,
+        tk: &tk,
         views: &views,
         table: &table,
         counts: &counts,
@@ -223,52 +229,52 @@ fn ap_epoch_graph_replays_bit_for_bit() {
         obj_sums: UpdateSums::zeroed(&stream, obj_len).unwrap(),
         probe_sums: UpdateSums::zeroed(&stream, probe0.len()).unwrap(),
         partials: DeviceBuffer::zeroed(&stream, d.nframe as usize).unwrap(),
-        llk_scratch: DeviceBuffer::zeroed(&stream, ptyrs_tile::llk_sums_scratch_len(d.nframe))
-            .unwrap(),
+        llk_scratch: DeviceBuffer::zeroed(&stream, llk_sums_scratch_len(d.nframe)).unwrap(),
         llk: DeviceBuffer::zeroed(&stream, 4).unwrap(),
     };
 
-    // Eager: also JIT-compiles every Tile kernel the epoch launches.
+    // Capture before any Tile kernel has launched: building `tk` compiled them all.
     let start = bits(&stream, &s);
-    let mut eager = Vec::with_capacity(EPOCHS);
+    let graph = CudaGraph::capture(stream.clone(), record(|ctx| epoch(ctx, &scan, &mut s)))
+        .expect("capture the epoch");
+    let jit_left = |what: &str| {
+        assert_eq!(
+            cutile::tile_kernel::jit_compile_count(),
+            jit,
+            "{what} compiled a Tile kernel"
+        );
+    };
+    jit_left("capture");
+    assert!(bits(&stream, &s).0 == start.0, "capture ran work");
+    let mut replayed = Vec::with_capacity(EPOCHS);
     for _ in 0..EPOCHS {
-        record(|ctx| epoch(ctx, &scan, &mut s))
-            .sync_on(&stream)
-            .unwrap();
-        eager.push(bits(&stream, &s));
+        graph.launch().sync_on(&stream).unwrap();
+        replayed.push(bits(&stream, &s));
     }
-    let poisson: Vec<f64> = eager.iter().map(|e| f64::from_bits(e.1[0])).collect();
-    println!("eager Poisson LLK per epoch: {poisson:?}");
-    assert!(
-        poisson.windows(2).all(|w| w[1] < w[0]),
-        "AP does not descend"
-    );
+    jit_left("replay");
 
     s.obj.copy_from_host(&stream, &obj0).unwrap();
     s.probe.copy_from_host(&stream, &probe0).unwrap();
     assert!(bits(&stream, &s).0 == start.0, "reset to the start failed");
-    let jit = cutile::tile_kernel::jit_compile_count();
-    let graph = CudaGraph::capture(stream.clone(), record(|ctx| epoch(ctx, &scan, &mut s)))
-        .expect("capture the epoch");
-    assert_eq!(
-        cutile::tile_kernel::jit_compile_count(),
-        jit,
-        "capture compiled a Tile kernel"
-    );
-    assert!(bits(&stream, &s).0 == start.0, "capture ran work eagerly");
-
-    for (e, want) in eager.iter().enumerate() {
-        graph.launch().sync_on(&stream).unwrap();
+    for (e, want) in replayed.iter().enumerate() {
+        record(|ctx| epoch(ctx, &scan, &mut s))
+            .sync_on(&stream)
+            .unwrap();
         let got = bits(&stream, &s);
-        assert_eq!(got.1, want.1, "replay {e}: LLK totals differ from eager");
+        assert_eq!(
+            got.1, want.1,
+            "epoch {e}: direct LLK totals differ from replay"
+        );
         assert!(
             got.0 == want.0,
-            "replay {e}: object or probe differs from eager"
+            "epoch {e}: direct object or probe differs from replay"
         );
     }
-    assert_eq!(
-        cutile::tile_kernel::jit_compile_count(),
-        jit,
-        "replay compiled a Tile kernel"
+    jit_left("a direct run");
+    let poisson: Vec<f64> = replayed.iter().map(|e| f64::from_bits(e.1[0])).collect();
+    println!("Poisson LLK per epoch: {poisson:?}");
+    assert!(
+        poisson.windows(2).all(|w| w[1] < w[0]),
+        "AP does not descend"
     );
 }
