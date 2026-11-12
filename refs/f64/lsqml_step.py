@@ -164,7 +164,7 @@ def directional(f, x, d, h):
 
 def ptychi_step(m, iobs, wavelength, obj, probe, noise, nbatch):
     """pty-chi LSQMLReconstructor.run_minibatch in f64 on CPU on the first `nbatch` frames,
-    mapped as in ptyrs-engine/scripts/compare_ptychi_rpie.py, with the preconditioner set to
+    mapped as in ptyrs/scripts/engine/compare_ptychi_rpie.py, with the preconditioner set to
     the illumination map and torch.randn returning zeros during the step."""
     import torch
     from torch.utils.data import DataLoader

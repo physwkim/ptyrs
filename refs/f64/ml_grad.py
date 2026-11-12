@@ -41,7 +41,7 @@ STEPS = (1e-3, 1e-4, 1e-5)
 
 
 def load(d):
-    """As ptyrs-engine/scripts/compare_pynx.py: iobs DC-centred as in the CXI file."""
+    """As ptyrs/scripts/engine/compare_pynx.py: iobs DC-centred as in the CXI file."""
     with h5py.File(f"{d}/scan.cxi", "r") as f:
         raw = f["entry_1/data_1/data"][()]
         iobs = raw.astype(np.float64)

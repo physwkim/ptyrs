@@ -1,0 +1,293 @@
+[package]
+name = "ptyrs"
+version.workspace = true
+edition.workspace = true
+description = "ptyrs: GPU ptychography on cuda-rust, one host library plus the `ptyrs`, `pty-recv` and `pty-sim` binaries; burn neural networks behind the `nn` feature"
+# Tests and examples sit in one directory per module, where cargo does not look; each is listed
+# below. A test target is named <module>_<file>.
+autotests = false
+autoexamples = false
+
+[features]
+# ptyrs::nn on burn. Off by default, so burn and cubecl build only on request.
+nn = ["dep:burn", "dep:burn-cubecl", "dep:cudarc", "dep:cubecl-runtime"]
+
+[dependencies]
+ptyrs-kernels = { path = "../ptyrs-kernels" }
+cuda-core.workspace = true
+cuda-async.workspace = true
+cuda-bindings.workspace = true
+# Absolute like the workspace's cuda-rust paths, so worktrees resolve it; its cuda-core and
+# cuda-async are the workspace's.
+cutile = { path = "/home/stevek/work/cuda-rust/cutile-rs/cutile" }
+num-complex.workspace = true
+thiserror.workspace = true
+rand.workspace = true
+rand_chacha.workspace = true
+rand_distr.workspace = true
+rustfft.workspace = true
+rust-hdf5 = { workspace = true, features = ["lz4"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+# Local epics-rs checkout, absolute like the cuda-rust paths in the workspace manifest.
+epics-pva-rs = { path = "/home/stevek/work/epics-rs/crates/epics-pva-rs" }
+# Unsafe (fast) block codec, still bounds-checked on decode.
+lz4_flex = { version = "0.11", default-features = false, features = ["std", "checked-decode"] }
+bytes = "1"
+crossbeam-channel = "0.5"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+libc = "0.2"
+zmq = "0.10"
+burn = { version = "0.22.1", default-features = false, features = ["std", "cuda", "autodiff", "optim"], optional = true }
+# Named for the CubeCL tensor primitive the cuda-rust boundary reads. Fusion stays off: with it
+# the primitive would be a fusion handle instead of a buffer.
+burn-cubecl = { version = "0.22.1", default-features = false, features = ["std", "cuda"], optional = true }
+# cudarc 0.19.10 knows CUDA up to 13.4 and panics on nvcc 13.5. Pinning its newest bindings here
+# (driver API calls are forward compatible) unifies the feature into cubecl-cuda's copies; the
+# build-dependency entry reaches the build-script graph, which resolver 2+ keeps separate.
+cudarc = { version = "0.19.10", default-features = false, features = ["cuda-13040"], optional = true }
+# For the `Runtime` trait that names cubecl's CUDA server; cubecl does not re-export it.
+cubecl-runtime = { version = "0.11.4", default-features = false, optional = true }
+
+[build-dependencies]
+cuda-artifact-finalizer = { path = "/home/stevek/work/cuda-rust/cuda-oxide/crates/cuda-artifact-finalizer" }
+nvjitlink-sys = { path = "/home/stevek/work/cuda-rust/cuda-oxide/crates/nvjitlink-sys" }
+oxide-artifacts = "0.2.1"
+libloading = "0.8"
+cudarc = { version = "0.19.10", default-features = false, features = ["cuda-13040"], optional = true }
+
+[lints.clippy]
+# clippy.toml's disallowed methods are live's rule (DESIGN §5 inv. 9); the live module and
+# live's binaries, examples and test turn the lint back on.
+disallowed_methods = "allow"
+
+[[test]]
+name = "cli_live"
+path = "tests/cli/live.rs"
+
+[[test]]
+name = "engine_batch"
+path = "tests/engine/batch.rs"
+
+[[test]]
+name = "engine_bh"
+path = "tests/engine/bh.rs"
+
+[[test]]
+name = "engine_bh_near"
+path = "tests/engine/bh_near.rs"
+
+[[test]]
+name = "engine_features"
+path = "tests/engine/features.rs"
+
+[[test]]
+name = "engine_gpu"
+path = "tests/engine/gpu.rs"
+
+[[test]]
+name = "engine_lsqml"
+path = "tests/engine/lsqml.rs"
+
+[[test]]
+name = "engine_lsqml_multislice"
+path = "tests/engine/lsqml_multislice.rs"
+
+[[test]]
+name = "engine_lsqml_near"
+path = "tests/engine/lsqml_near.rs"
+
+[[test]]
+name = "engine_opr"
+path = "tests/engine/opr.rs"
+
+[[test]]
+name = "engine_plan"
+path = "tests/engine/plan.rs"
+
+[[test]]
+name = "engine_propagate"
+path = "tests/engine/propagate.rs"
+
+[[test]]
+name = "engine_reconstruct"
+path = "tests/engine/reconstruct.rs"
+
+[[test]]
+name = "fft_accuracy"
+path = "tests/fft/accuracy.rs"
+
+[[test]]
+name = "fft_lease"
+path = "tests/fft/lease.rs"
+
+[[test]]
+name = "gpu_bh"
+path = "tests/gpu/bh.rs"
+
+[[test]]
+name = "gpu_grad"
+path = "tests/gpu/grad.rs"
+
+[[test]]
+name = "gpu_load"
+path = "tests/gpu/load.rs"
+
+[[test]]
+name = "gpu_ops"
+path = "tests/gpu/ops.rs"
+
+[[test]]
+name = "gpu_ring"
+path = "tests/gpu/ring.rs"
+
+[[test]]
+name = "gpu_rpie"
+path = "tests/gpu/rpie.rs"
+
+[[test]]
+name = "io_pynx_fixture"
+path = "tests/io/pynx_fixture.rs"
+
+[[test]]
+name = "live_recv_args"
+path = "tests/live/recv_args.rs"
+
+[[test]]
+name = "nn_interop"
+path = "tests/nn/interop.rs"
+required-features = ["nn"]
+
+[[test]]
+name = "nn_metric"
+path = "tests/nn/metric.rs"
+required-features = ["nn"]
+
+[[test]]
+name = "nn_predictor"
+path = "tests/nn/predictor.rs"
+required-features = ["nn"]
+
+[[test]]
+name = "refgen_refgen"
+path = "tests/refgen/refgen.rs"
+
+[[test]]
+name = "tile_dots"
+path = "tests/tile/dots.rs"
+
+[[test]]
+name = "tile_gather_feasibility"
+path = "tests/tile/gather_feasibility.rs"
+
+[[test]]
+name = "tile_llk_sums"
+path = "tests/tile/llk_sums.rs"
+
+[[test]]
+name = "tile_mixed_graph"
+path = "tests/tile/mixed_graph.rs"
+
+[[test]]
+name = "tile_psi_to_obj"
+path = "tests/tile/psi_to_obj.rs"
+
+[[test]]
+name = "tile_psi_to_probe"
+path = "tests/tile/psi_to_probe.rs"
+
+[[test]]
+name = "tile_update_from_sums"
+path = "tests/tile/update_from_sums.rs"
+
+[[example]]
+name = "ap_scaling"
+path = "examples/dist/ap_scaling.rs"
+
+[[example]]
+name = "live_feed"
+path = "examples/dist/live_feed.rs"
+
+[[example]]
+name = "p2p_bench"
+path = "examples/dist/p2p_bench.rs"
+
+[[example]]
+name = "pull_pattern"
+path = "examples/dist/pull_pattern.rs"
+
+[[example]]
+name = "bh_m3"
+path = "examples/engine/bh_m3.rs"
+
+[[example]]
+name = "gpu_time"
+path = "examples/engine/gpu_time.rs"
+
+[[example]]
+name = "llk_trace"
+path = "examples/engine/llk_trace.rs"
+
+[[example]]
+name = "bench"
+path = "examples/fft/bench.rs"
+
+[[example]]
+name = "dump"
+path = "examples/fft/dump.rs"
+
+[[example]]
+name = "count_time"
+path = "examples/gpu/count_time.rs"
+
+[[example]]
+name = "fused_time"
+path = "examples/gpu/fused_time.rs"
+
+[[example]]
+name = "codec_bench"
+path = "examples/live/codec_bench.rs"
+
+[[example]]
+name = "codec_cross"
+path = "examples/live/codec_cross.rs"
+
+[[example]]
+name = "ptycho_truth"
+path = "examples/live/ptycho_truth.rs"
+
+[[example]]
+name = "pv_out_demo"
+path = "examples/live/pv_out_demo.rs"
+
+[[example]]
+name = "dip"
+path = "examples/nn/dip.rs"
+required-features = ["nn"]
+
+[[example]]
+name = "m6_start"
+path = "examples/nn/m6_start.rs"
+required-features = ["nn"]
+
+[[example]]
+name = "train_ptychonn"
+path = "examples/nn/train_ptychonn.rs"
+required-features = ["nn"]
+
+[[example]]
+name = "gen_m3"
+path = "examples/refgen/gen_m3.rs"
+
+[[example]]
+name = "dots_time"
+path = "examples/tile/dots_time.rs"
+
+[[example]]
+name = "epoch_graph"
+path = "examples/tile/epoch_graph.rs"
+
+[[example]]
+name = "tile_vs_simt"
+path = "examples/tile/tile_vs_simt.rs"

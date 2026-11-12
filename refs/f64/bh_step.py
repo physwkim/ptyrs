@@ -234,7 +234,7 @@ def check_hess(m, bh, step, obj, probe):
 
 def ptychi_run(m, iobs, wavelength, obj, probe, size, cg):
     """pty-chi BHReconstructor (method CG or GD) in f64 on CPU over EPOCHS epochs of the
-    engine's batches, mapped as in ptyrs-engine/scripts/compare_ptychi_rpie.py; per batch beta,
+    engine's batches, mapped as in ptyrs/scripts/engine/compare_ptychi_rpie.py; per batch beta,
     alpha and the object and probe changes in the engine's convention."""
     from torch.utils.data import DataLoader
     import ptychi.api as api

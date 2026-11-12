@@ -186,20 +186,27 @@ X선에서 GPU 4장을 쓰는 경우는 셋이고, 분할 방식이 다릅니다
 ## 4. 구조
 
 ```
-ptyrs/
-├── ptyrs-core      데이터 모델: Scan, Positions, Probe(모드, OPR), Object(층), Geometry,
-│                   주소표(PtyPy addr 개념), 공간 bin, DisjointBatch
-├── ptyrs-fft       cuFFT 바인딩(직접 쓴 FFI) + cuFFT 장치 API 조회·LTOIR 생성
+ptyrs/                  작업공간: 패키지 3개
+├── ptyrs           호스트 크레이트 하나(lib + 바이너리). 옛 크레이트마다 모듈 하나(ptyrs::engine 등),
+│   │               tests/·examples/·scripts/도 모듈별 하위 디렉터리. build.rs가 cuFFT 링크와 커널 빌드
+│   ├── src/base    데이터 모델: Scan, Positions, Probe(모드, OPR), Object(층), Geometry,
+│   │               주소표(PtyPy addr 개념), 공간 bin, DisjointBatch. `core`는 내장 크레이트를 가려서 base
+│   ├── src/fft     cuFFT 바인딩(직접 쓴 FFI) + cuFFT 장치 API 조회·LTOIR 생성
+│   ├── src/gpu     ptyrs-kernels를 cubin 하나로 빌드(cuFFT 장치 코드와 링크)·로드, 커널 호출 래퍼
+│   ├── src/tile    cutile-rs 커널(실행 중 JIT, CUDA 13.2+): 타일 소유 누적, 물체·프로브 갱신, 리덕션
+│   ├── src/engine  엔진(rPIE, DM, RAAR, ML-CG, LSQML, BH-CG), 계획 언어, 그래프 캡처
+│   ├── src/dist    공간 분할(라이브 띠·부채꼴, 대면적 격자), halo P2P 교환, 각도 병렬, 디바이스별 워커 스레드
+│   ├── src/io      CXI/HDF5 입출력(PyNX CXI 배치와 호환), PtyPy .ptyr 읽기
+│   ├── src/live    PVA / ZMQ / SWMR 입력(해제·위치 매칭·크롭 작업 스레드 → pinned 링버퍼), VMM 성장형 물체, PV 출력.
+│   │               바이너리 pty-recv, pty-sim은 src/bin
+│   ├── src/nn      (선택, feature `nn`일 때만 burn 빌드) burn 신경망: 라이브 초기값 예측, DIP·PINN.
+│   │               본체와는 배열·기울기 전달로만 연결
+│   ├── src/refgen  M3 참조 데이터셋 시뮬레이션(위치 오차, 세기 변화, 배경, 플라이 스캔, OPR)
+│   └── src/main.rs 단일 바이너리 ptyrs(옛 ptyrs-cli), TOML 설정
 ├── ptyrs-kernels   cuda-oxide SIMT device crate(`cargo oxide`로 PTX 생성): A/B/C 패스, 공간 bin 색인,
 │                   위치 기울기. Tile 전환 전에는 아래 Tile 후보 커널의 SIMT 판도 여기
-├── ptyrs-tile      cutile-rs 커널(실행 중 JIT, CUDA 13.2+): 타일 소유 누적, 물체·프로브 갱신, 리덕션
-├── ptyrs-engine    엔진(rPIE, DM, RAAR, ML-CG, LSQML, BH-CG), 계획 언어, 그래프 캡처
-├── ptyrs-dist      공간 분할(라이브 띠·부채꼴, 대면적 격자), halo P2P 교환, 각도 병렬, 디바이스별 워커 스레드
-├── ptyrs-io        CXI/HDF5 입출력(PyNX CXI 배치와 호환), PtyPy .ptyr 읽기
-├── ptyrs-live      PVA / ZMQ / SWMR 입력(해제·위치 매칭·크롭 작업 스레드 → pinned 링버퍼), VMM 성장형 물체, PV 출력
-├── ptyrs-nn        (선택) burn 신경망: 라이브 초기값 예측, DIP·PINN. 본체와는 배열·기울기 전달로만 연결
-├── ptyrs-py        PyO3 바인딩(numpy 입출력) — 검증 전용(pty-chi·PyNX·PtyPy와 결과 비교). 재구성 실행 경로에는 쓰지 않음
-└── ptyrs-cli       단일 바이너리, TOML 설정
+└── ptyrs-py        PyO3 바인딩(numpy 입출력, ptyrs에 의존하는 cdylib) — 검증 전용(pty-chi·PyNX·PtyPy와 결과 비교).
+                    재구성 실행 경로에는 쓰지 않음
 ```
 
 데이터 흐름(한 GPU):
@@ -228,7 +235,7 @@ ptyrs/
 
 M6 측정(GPU2, 스택 16): 물체 갱신은 Tile 24–26 µs, SIMT 10–11 µs라 SIMT에 남고, 프로브 갱신은 비트 단위로 같고 사이클 시간 차이 0.000 ms로 동률이라 SIMT에 남습니다. 물체 합(타일 소유 누적)도 Tile이 사이클당 0.22–0.25 ms 느렸습니다. BH 내적은 Tile로 옮겼습니다. 한 프로세스 안에서 두 판을 번갈아 잰 A/B(BH 배치 96, 커널 빌드 순서를 앞뒤로 바꾼 깨끗한 실행 6회)에서 Tile이 에폭당 0.036–0.043 ms 빨랐고 결과는 비트 단위로 같습니다. 전체 배치에서는 차이를 가르지 못했습니다. 따로 빌드한 두 바이너리를 번갈아 재는 방식은 빌드마다 약 0.2 ms씩 흔들려 이 차이를 가르지 못합니다. CG β·노름 부분합은 동률이라 SIMT에 남습니다. LLK 부분합의 최종 합은 에폭마다 합계를 읽을 때만 Tile이 빠른데 엔진은 그렇게 읽지 않으므로 SIMT에 남습니다. Tile 커널은 하나에 약 0.45 s씩 프로세스의 첫 장치 생성 때 컴파일됩니다. Tile 커널을 섞은 ML 사이클과 BH 에폭은 각각 graph 하나로 캡처됩니다(nsys 확인). Tile 커널은 장치를 만들 때 컴파일해 두므로 캡처 중에 JIT가 일어나지 않습니다.
 
-### 신경망 경계 (ptyrs-nn)
+### 신경망 경계 (ptyrs::nn)
 
 - 예측: 새 프레임 묶음 → burn CNN → 물체 조각 → 해당 영역 초기값. 프레임 묶음마다 한 번 넘깁니다.
 - 학습(DIP·PINN): 신경망이 물체를 진폭·위상(실수)으로 출력 → ptyrs 순·역방향 연산자로 물체 기울기 g 계산 → burn에서 손실을 ⟨출력, g⟩(g는 상수 취급)로 두고 역전파하면 신경망 가중치의 기울기가 정확히 나옵니다. burn에 복소수·FFT가 필요 없습니다.

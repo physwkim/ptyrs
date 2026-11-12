@@ -2,7 +2,7 @@
 summarize.py's targets: the ptyrs side of the M3 comparison.
 
     target/release/examples/llk_trace <dir> <algo> <ncycle> <nprobe> <frame> <npos> <step> --gpu
-    python -I ptyrs-engine/scripts/compare_pynx.py <dir> <dm|ap> --cuda --no-cpu
+    python -I ptyrs/scripts/engine/compare_pynx.py <dir> <dm|ap> --cuda --no-cpu
     python -I refs/ptychi/trace_m3.py <dir> <algo> [--epoch-s SERIES=SECONDS ...] [--start-epoch N]
 
 Reads <dir>/llk_truth.txt (llk_trace's truth), llk_rust.txt (series "ptyrs") and every

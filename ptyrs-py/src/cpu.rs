@@ -1,9 +1,9 @@
-//! The CPU f64 engine: [`ptyrs_engine::Ptycho`] (AP, DM, ML, rPIE), LSQML and BH epochs over
+//! The CPU f64 engine: [`ptyrs::engine::Ptycho`] (AP, DM, ML, rPIE), LSQML and BH epochs over
 //! its scan, and the forward model and LLK of given arrays.
 
 use numpy::{PyArray1, PyArray3, PyArray4, PyArrayMethods, PyReadonlyArray3};
-use ptyrs_core::{C64, Object, Probe};
-use ptyrs_engine::{Cost, Fft2, Llk, ProbeVariation, llk, obj_probe_to_psi};
+use ptyrs::base::{C64, Object, Probe};
+use ptyrs::engine::{Cost, Fft2, Llk, ProbeVariation, llk, obj_probe_to_psi};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
@@ -19,7 +19,7 @@ type Epoch<'py> = (
 
 /// Far field `FT(fftshift(P·O·q))` of every view of `p`'s scan at `object` and `probe`, frame
 /// major and mode minor, zero frequency at `[0, 0]` (PyNX's `psi` layout).
-fn far_field(p: &ptyrs_engine::Ptycho, fft: &Fft2, object: &Object, probe: &Probe) -> Vec<C64> {
+fn far_field(p: &ptyrs::engine::Ptycho, fft: &Fft2, object: &Object, probe: &Probe) -> Vec<C64> {
     let views = p.addr().views();
     let mut psi = vec![C64::default(); views.len() * probe.plane_len()];
     obj_probe_to_psi(views, object, probe, p.quad(), &mut psi);
@@ -27,19 +27,19 @@ fn far_field(p: &ptyrs_engine::Ptycho, fft: &Fft2, object: &Object, probe: &Prob
     psi
 }
 
-/// [`ptyrs_engine::Ptycho::llk`] of `object` and `probe` in place of `p`'s own.
-fn llk_of(p: &ptyrs_engine::Ptycho, fft: &Fft2, object: &Object, probe: &Probe) -> Llk {
+/// [`ptyrs::engine::Ptycho::llk`] of `object` and `probe` in place of `p`'s own.
+fn llk_of(p: &ptyrs::engine::Ptycho, fft: &Fft2, object: &Object, probe: &Probe) -> Llk {
     let psi = far_field(p, fft, object, probe);
     let (addr, obs) = (p.addr(), p.observed());
     llk(obs, 0..addr.nframe(), addr.nmode(), &psi).normalised(obs.nb_obs())
 }
 
 /// The CPU f64 reconstruction state of a scan from a starting object and probe
-/// (`ptyrs_engine::Ptycho`). Its scan also carries the LSQML and BH epochs and the forward model
+/// (`ptyrs::engine::Ptycho`). Its scan also carries the LSQML and BH epochs and the forward model
 /// of arrays of the same shapes.
 #[pyclass]
 pub(crate) struct Ptycho {
-    inner: ptyrs_engine::Ptycho,
+    inner: ptyrs::engine::Ptycho,
     fft: Fft2,
 }
 
@@ -74,7 +74,7 @@ impl Ptycho {
         probe: PyReadonlyArray3<'_, C64>,
     ) -> PyResult<Self> {
         let (object, probe) = (Object::new(stack_in(object)?), Probe::new(stack_in(probe)?));
-        let inner = ptyrs_engine::Ptycho::new(&scan.0, object, probe).map_err(Error::from)?;
+        let inner = ptyrs::engine::Ptycho::new(&scan.0, object, probe).map_err(Error::from)?;
         Ok(Self {
             fft: Fft2::new(scan.0.geometry.frame),
             inner,
@@ -158,9 +158,9 @@ impl Ptycho {
     }
 }
 
-/// LSQML across epochs (`ptyrs_engine::Lsqml`); `cost` is `"amplitude"` or `"poisson"`.
+/// LSQML across epochs (`ptyrs::engine::Lsqml`); `cost` is `"amplitude"` or `"poisson"`.
 #[pyclass]
-pub(crate) struct Lsqml(ptyrs_engine::Lsqml);
+pub(crate) struct Lsqml(ptyrs::engine::Lsqml);
 
 #[pymethods]
 impl Lsqml {
@@ -175,11 +175,13 @@ impl Lsqml {
                 )));
             }
         };
-        Ok(Self(ptyrs_engine::Lsqml::new(ptyrs_engine::LsqmlParams {
-            batch_size,
-            cost,
-            seed,
-        })))
+        Ok(Self(ptyrs::engine::Lsqml::new(
+            ptyrs::engine::LsqmlParams {
+                batch_size,
+                cost,
+                seed,
+            },
+        )))
     }
 
     /// One epoch over `ptycho`'s scan from `object` and `probe`, without probe variation;
@@ -215,15 +217,15 @@ impl Lsqml {
     }
 }
 
-/// BH across epochs (`ptyrs_engine::Bh`).
+/// BH across epochs (`ptyrs::engine::Bh`).
 #[pyclass]
-pub(crate) struct Bh(ptyrs_engine::Bh);
+pub(crate) struct Bh(ptyrs::engine::Bh);
 
 #[pymethods]
 impl Bh {
     #[new]
     fn new(batch_size: usize, probe_rho: f64, seed: u64) -> Self {
-        Self(ptyrs_engine::Bh::new(ptyrs_engine::BhParams {
+        Self(ptyrs::engine::Bh::new(ptyrs::engine::BhParams {
             batch_size,
             probe_rho,
             seed,
@@ -260,7 +262,7 @@ impl Bh {
 
 #[cfg(test)]
 mod tests {
-    use ptyrs_core::{Geometry, required_obj_shape};
+    use ptyrs::base::{Geometry, required_obj_shape};
 
     use super::*;
 
@@ -269,13 +271,13 @@ mod tests {
     fn llk_of_the_state_is_the_engine_llk() {
         let g = Geometry::new(1.5e-10, 1.0, 75e-6, [16, 16]).unwrap();
         let pixel = g.pixel_size_object();
-        let positions = ptyrs_core::sim::fermat(5, 3.0 * pixel[1]);
+        let positions = ptyrs::base::sim::fermat(5, 3.0 * pixel[1]);
         let shape = required_obj_shape(&positions.pynx_preprocess(pixel), pixel, g.frame, 0);
-        let object = ptyrs_core::sim::object(shape);
-        let probe = ptyrs_core::sim::probe(g.frame, 2).unwrap();
+        let object = ptyrs::base::sim::object(shape);
+        let probe = ptyrs::base::sim::probe(g.frame, 2).unwrap();
         let scan =
-            ptyrs_engine::sim::simulate(g, positions, &object, &probe, 2e3, None, 3).unwrap();
-        let p = ptyrs_engine::Ptycho::new(&scan, object, probe).unwrap();
+            ptyrs::engine::sim::simulate(g, positions, &object, &probe, 2e3, None, 3).unwrap();
+        let p = ptyrs::engine::Ptycho::new(&scan, object, probe).unwrap();
         let fft = Fft2::new(g.frame);
         assert_eq!(llk_of(&p, &fft, p.object(), p.probe()), p.llk());
     }
