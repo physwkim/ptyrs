@@ -330,7 +330,6 @@ pub struct PullReport {
 pub struct Progress {
     pub unique: AtomicU64,
     pub last_rx: AtomicI64,
-    pub series_end: AtomicBool,
 }
 
 impl Progress {
@@ -381,10 +380,7 @@ pub fn run_pull(
         drop(s);
         match kind {
             Kind::Rejected => rep.rejected += 1,
-            Kind::End => {
-                progress.series_end.store(true, Ordering::Release);
-                break;
-            }
+            Kind::End => break,
             Kind::Header | Kind::Image => {}
         }
     }

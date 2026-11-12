@@ -522,8 +522,12 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
                 {
                     break;
                 }
-                if progress.series_end.load(Ordering::Acquire) {
-                    eprintln!("recv series end");
+                // The PULL and SWMR threads end unasked only at the series end
+                // or on a failure, which their joins below report.
+                if pull.as_ref().is_some_and(|h| h.is_finished())
+                    || follow.as_ref().is_some_and(|h| h.is_finished())
+                {
+                    eprintln!("recv source ended");
                     break;
                 }
                 if lr != 0 && wall_ns() - lr > idle_ns {

@@ -63,6 +63,24 @@ fn a_run_without_frames_reports_no_rates() {
     }
 }
 
+/// Needs a GPU. The PULL socket fails at connect: the run stops with that
+/// error at once instead of waiting out the 30 s connect timeout.
+#[test]
+fn a_failing_zmq_source_stops_the_run_at_once() {
+    let p = config(
+        "zmq_bad_endpoint",
+        "[recv]\nframes = 10\naddr = \"127.0.0.1:15999\"\nconnect-timeout-s = 30\n\
+         ring-slots = 16\n[recv.source.zmq]\nendpoint = \"tcp://127.0.0.1:notaport\"\n",
+    );
+    let t0 = std::time::Instant::now();
+    let out = ptyrs(&["live", p.to_str().unwrap()]);
+    let took = t0.elapsed();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(err.contains("ZMQ PULL"), "{err}");
+    assert!(took.as_secs() < 10, "stopped after {took:?}");
+}
+
 #[test]
 fn a_missing_file_or_command_is_refused() {
     let err = refused(&ptyrs(&["live", "/nonexistent/live.toml"]));
