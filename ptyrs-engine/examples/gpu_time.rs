@@ -61,7 +61,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     for size in sizes {
         let stack_size = if algo == "rpie" { 16 } else { size };
-        let options = GpuOptions { stack_size, graph };
+        let options = GpuOptions {
+            stack_size,
+            graph,
+            ..GpuOptions::default()
+        };
         let mut g = GpuPtycho::new(&ctx, &scan, object.clone(), probe.clone(), options)?;
         let rpie = RpieParams {
             batch_size: size,

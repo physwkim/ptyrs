@@ -21,13 +21,13 @@ impl GpuPtycho {
             return Err(EngineError::Invalid("rPIE batch_size must be >= 1".into()));
         }
         for ic in 0..nepoch {
-            self.dev.steady(Epoch::Rpie(*params))?;
+            self.dev.steady(Epoch::Rpie(*params), self.cycle)?;
             if llk_due(params.calc_llk, ic, nepoch) {
-                let l = self.llk()?;
-                self.record(Algorithm::Rpie, l);
+                self.dev.llk_pass(Some((self.cycle, Algorithm::Rpie)))?;
             }
             self.cycle += 1;
         }
+        self.collect()?;
         Ok(())
     }
 }

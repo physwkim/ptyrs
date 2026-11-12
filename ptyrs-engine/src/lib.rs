@@ -47,6 +47,8 @@ pub enum EngineError {
     Invalid(String),
     #[error("GPU: {0}")]
     Gpu(#[from] ptyrs_gpu::Error),
+    #[error("GPU LLK ring: {0}")]
+    Ring(#[from] ptyrs_gpu::RingError),
     #[error("cuFFT: {0}")]
     Fft(#[from] ptyrs_fft::FftError),
 }

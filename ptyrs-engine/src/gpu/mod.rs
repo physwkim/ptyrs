@@ -4,17 +4,19 @@
 //!
 //! The scan's frames are cut into stacks of [`GpuOptions::stack_size`] consecutive frames,
 //! one [`StackTable`] entry each: every launch reads its stack's frames from the entry on the
-//! device. Each stack keeps its own exit waves (DM carries them across cycles) and LLK
-//! partials, sized like PyNX's fixed stack for the longest stack; one scratch stack serves
-//! all, and stacks of one length share a cuFFT plan, which transforms only their frames.
-//! Each cycle enqueues through its own `ExecutionContext`, dropped when the cycle has been
-//! enqueued. Within a cycle nothing reads back to the host: LLK partials are downloaded only
-//! after the cycles that record one, and the arrays only when asked for. Every cycle, AP's
-//! with an LLK and DM's first included, and the LLK pass replay a captured CUDA graph (DESIGN
-//! B2, [`GpuOptions::graph`]): one per [`Epoch`], kept with the buffers it captured until
-//! another algorithm or other parameters need new ones, and the LLK pass's for the life of
-//! the device state. Each algorithm is its own module over the per-stack steps here, so M2's
-//! fused passes can replace those steps one algorithm at a time.
+//! device. Each stack keeps its own exit waves (DM carries them across cycles), sized like
+//! PyNX's fixed stack for the longest stack; one scratch stack serves all, and stacks of one
+//! length share a cuFFT plan, which transforms only their frames. Each cycle enqueues through
+//! its own `ExecutionContext`, dropped when the cycle has been enqueued. Nothing in a cycle
+//! reads back to the host: an LLK record goes, stack by stack, into the device's
+//! [`ptyrs_gpu::LlkRing`], whose copies download while later cycles run, and the host reads
+//! the records at the end of each algorithm call (or of [`GpuPtycho::llk`]), the arrays only
+//! when asked for. Every cycle, AP's with an LLK and DM's first included, and the LLK pass
+//! replay a captured CUDA graph (DESIGN B2, [`GpuOptions::graph`]): one per [`Epoch`], kept
+//! with the buffers it captured until another algorithm or other parameters need new ones,
+//! and the LLK pass's for the life of the device state. Each algorithm is its own module over
+//! the per-stack steps here, so M2's fused passes can replace those steps one algorithm at a
+//! time.
 
 mod ap;
 mod device;
@@ -29,7 +31,7 @@ use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 use ptyrs_core::{AddrTable, C64, Object, Probe, Scan, Stack};
 use ptyrs_fft::Plan2d;
-use ptyrs_gpu::{C32, Error as GpuError, LlkSums, StackTable, ViewAddr, ViewDims};
+use ptyrs_gpu::{C32, Error as GpuError, StackTable, ViewAddr, ViewDims};
 
 use device::{Bufs, Device};
 
@@ -44,6 +46,10 @@ pub struct GpuOptions {
     /// Replay every AP and DM cycle, rPIE epoch and LLK pass from a CUDA graph captured once
     /// per kind of cycle instead of launching it kernel by kernel; both give the same bits.
     pub graph: bool,
+    /// LLK records the device ring holds, at least 1: a record's download is enqueued at
+    /// most half this many records after it, and the host waits for one only when it is
+    /// this many records ahead of it, or at the end of an algorithm call.
+    pub llk_slots: usize,
 }
 
 impl Default for GpuOptions {
@@ -51,6 +57,7 @@ impl Default for GpuOptions {
         Self {
             stack_size: 16,
             graph: true,
+            llk_slots: 8,
         }
     }
 }
@@ -68,6 +75,19 @@ enum Epoch {
 }
 
 impl Epoch {
+    /// Whether the epoch takes an LLK record.
+    fn records_llk(self) -> bool {
+        matches!(self, Self::Ap { llk: true, .. })
+    }
+
+    fn algorithm(self) -> Algorithm {
+        match self {
+            Self::Ap { .. } => Algorithm::Ap,
+            Self::Dm { .. } => Algorithm::Dm,
+            Self::Rpie(_) => Algorithm::Rpie,
+        }
+    }
+
     /// The epoch with its flag cleared: the parameters a run's buffers are built for.
     fn run(self) -> Self {
         match self {
@@ -81,8 +101,12 @@ impl Epoch {
     }
 }
 
+/// What an LLK record is filed under: the cycle and algorithm of a history record, or `None`
+/// for [`GpuPtycho::llk`]'s.
+type Tag = Option<(usize, Algorithm)>;
+
 /// One stack (or rPIE batch): the frames its table entry holds, for what the host needs of
-/// them (which plan, how many LLK partials, rPIE's `1 / nf`); the kernels read the entry.
+/// them (which plan, rPIE's `1 / nf`); the kernels read the entry.
 #[derive(Clone, Debug)]
 struct Frames {
     range: Range<u32>,
@@ -320,34 +344,35 @@ impl GpuPtycho {
     /// Normalised LLK of the current object and probe, as [`crate::Ptycho::llk`]; the
     /// exit-wave stacks are left as they are.
     pub fn llk(&mut self) -> Result<Llk, EngineError> {
-        self.dev.llk_pass()?;
-        self.read_llk()
+        self.dev.llk_pass(None)?;
+        Ok(self
+            .collect()?
+            .expect("the LLK pass counts one untagged record"))
     }
 
-    fn record(&mut self, algorithm: Algorithm, llk: Llk) {
-        self.history.push(LlkRecord {
-            cycle: self.cycle,
-            algorithm,
-            llk,
-        });
-    }
-
-    /// Reads back the stacks' LLK partials (the one host sync of a recording cycle) and sums
-    /// them in frame order.
-    fn read_llk(&self) -> Result<Llk, EngineError> {
-        let mut partials = Vec::with_capacity(self.dev.dims().nframe as usize);
-        for (frames, llk) in self.dev.stack_llk() {
-            let llk = llk.to_host_vec(self.dev.stream())?;
-            partials.extend_from_slice(&llk[..frames.nf() as usize]);
+    /// Waits for the LLK records enqueued since the last collection (the one host sync of an
+    /// algorithm call that takes any), appends the tagged ones to the history, and returns
+    /// the untagged one.
+    fn collect(&mut self) -> Result<Option<Llk>, EngineError> {
+        let mut untagged = None;
+        for (tag, s) in self.dev.flush()? {
+            let llk = Llk {
+                poisson: s.poisson,
+                gaussian: s.gaussian,
+                euclidian: s.euclidean,
+                nb_photons_calc: s.icalc,
+            }
+            .normalised(self.nb_obs);
+            match tag {
+                Some((cycle, algorithm)) => self.history.push(LlkRecord {
+                    cycle,
+                    algorithm,
+                    llk,
+                }),
+                None => untagged = Some(llk),
+            }
         }
-        let s = LlkSums::from_partials(&partials);
-        Ok(Llk {
-            poisson: s.poisson,
-            gaussian: s.gaussian,
-            euclidian: s.euclidean,
-            nb_photons_calc: s.icalc,
-        }
-        .normalised(self.nb_obs))
+        Ok(untagged)
     }
 
     /// [`zero_phase_ramp`] on the host: one read-back and upload, after an algorithm's last
@@ -363,8 +388,7 @@ impl GpuPtycho {
 
 /// The per-stack steps of every algorithm, on the lent device state.
 impl Bufs<'_> {
-    /// LLK partials of the current estimate into every stack's `llk`, through the scratch
-    /// stack.
+    /// The LLK record of the current estimate, through the scratch stack.
     fn forward_llk(&mut self, ctx: &ExecutionContext) -> Result<(), GpuError> {
         let dims = *self.views.dims();
         for s in 0..self.stacks.len() {
@@ -382,13 +406,15 @@ impl Bufs<'_> {
                 .get(st.frames.plan)
                 .forward_inplace(ctx, self.scratch)?;
             self.kernels
-                .llk(ctx, &dims, stack, self.counts, self.scratch, st.llk)?;
+                .llk(ctx, &dims, stack, self.counts, self.scratch, self.llk)?;
+            self.ring.push(ctx, &dims, stack, self.llk)?;
         }
-        Ok(())
+        self.ring.advance(ctx)
     }
 
     /// Fourier-modulus projection of stack `s`'s exit waves in place: FFT, `apply_amplitude`,
-    /// inverse FFT. With `llk`, the stack's LLK partials of the forward stack are taken first.
+    /// inverse FFT. With `llk`, the stack's LLK partials of the forward stack go into the
+    /// current record first; the caller ends the record after the last stack.
     fn project(&mut self, ctx: &ExecutionContext, s: usize, llk: bool) -> Result<(), GpuError> {
         let dims = *self.views.dims();
         let stack = self.table.at(s);
@@ -397,7 +423,8 @@ impl Bufs<'_> {
         plan.forward_inplace(ctx, st.psi)?;
         if llk {
             self.kernels
-                .llk(ctx, &dims, stack, self.counts, st.psi, st.llk)?;
+                .llk(ctx, &dims, stack, self.counts, st.psi, self.llk)?;
+            self.ring.push(ctx, &dims, stack, self.llk)?;
         }
         self.kernels
             .apply_amplitude(ctx, &dims, stack, self.counts, st.psi)?;

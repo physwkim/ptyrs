@@ -6,16 +6,19 @@ use std::sync::Arc;
 use cuda_core::CudaContext;
 use ptyrs_core::{C64, Counts, MASKED, Object, Probe, Scan, Stack};
 use ptyrs_engine::{
-    ApParams, Backend, DmParams, GpuOptions, GpuPtycho, LlkRecord, Params, Ptycho, RpieParams, Step,
+    ApParams, Backend, DmParams, GpuOptions, GpuPtycho, Llk, LlkRecord, Params, Ptycho, RpieParams,
+    Step,
 };
 
 mod common;
 
-/// 30 positions: stacks of 7 and batches of 4 both leave a shorter last one.
+/// 30 positions: stacks of 7 and batches of 4 both leave a shorter last one. Three LLK
+/// slots: the ring wraps within every LLK-taking call.
 const NPOS: usize = 30;
 const STACK: GpuOptions = GpuOptions {
     stack_size: 7,
     graph: true,
+    llk_slots: 3,
 };
 
 fn ctx() -> Arc<CudaContext> {
@@ -216,13 +219,19 @@ fn gpu_rejects_what_it_cannot_run() {
         stack_size: 0,
         ..STACK
     };
-    assert!(GpuPtycho::new(&ctx(), &scan, object, probe, zero).is_err());
+    assert!(GpuPtycho::new(&ctx(), &scan, object.clone(), probe.clone(), zero).is_err());
+    let no_ring = GpuOptions {
+        llk_slots: 0,
+        ..STACK
+    };
+    assert!(GpuPtycho::new(&ctx(), &scan, object, probe, no_ring).is_err());
 }
 
 /// AP and DM cycles (AP's with an LLK and DM's first included), rPIE epochs and LLK passes
 /// replayed from captured graphs give the eager bits: the object, the probe and every LLK
-/// record, across the parameter and algorithm switches that make a new capture and calls
-/// that reuse the last one, with a short last stack and batch.
+/// record read from the ring, across the parameter and algorithm switches that make a new
+/// capture and calls that reuse the last one, with a short last stack and batch, and the
+/// public LLK query between calls.
 #[test]
 fn graph_replays_bitwise_like_eager() {
     let (scan, object, probe) = start(2, true);
@@ -248,6 +257,7 @@ fn graph_replays_bitwise_like_eager() {
         g.dm(&dm, 7).unwrap();
         g.dm(&DmParams { alpha: 0.1, ..dm }, 4).unwrap();
         g.ap(&ap, 7).unwrap();
+        let query = g.llk().unwrap();
         g.ap(&ap, 4).unwrap();
         // batches of 4 leave a short last one; batches of 3 are new buffers and a new graph
         g.rpie(&rpie, 7).unwrap();
@@ -266,19 +276,18 @@ fn graph_replays_bitwise_like_eager() {
                 .map(|v| [v.re.to_bits(), v.im.to_bits()])
                 .collect()
         };
-        let llk: Vec<_> = g
+        let llk_bits =
+            |l: Llk| [l.poisson, l.gaussian, l.euclidian, l.nb_photons_calc].map(f64::to_bits);
+        let mut llk: Vec<_> = g
             .history()
             .iter()
-            .map(|r| {
-                let l = r.llk;
-                let v = [l.poisson, l.gaussian, l.euclidian, l.nb_photons_calc];
-                (r.cycle, r.algorithm, v.map(f64::to_bits))
-            })
+            .map(|r| (Some((r.cycle, r.algorithm)), llk_bits(r.llk)))
             .collect();
+        llk.push((None, llk_bits(query)));
         (bits(&g.object().unwrap()), bits(&g.probe().unwrap()), llk)
     };
     let (eager, graph) = (run(false), run(true));
-    assert_eq!(eager.2.len(), 3 + 3 + 2 + 2 + 3 + 2 + 2);
+    assert_eq!(eager.2.len(), 3 + 3 + 2 + 2 + 3 + 2 + 2 + 1);
     assert!(eager.2 == graph.2, "LLK records differ");
     assert!(eager.0 == graph.0, "object differs");
     assert!(eager.1 == graph.1, "probe differs");

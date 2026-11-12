@@ -32,6 +32,7 @@ use ptyrs_fft::FftError;
 use ptyrs_kernels::kernels::LoadedModule;
 
 mod ops;
+mod ring;
 mod rpie;
 
 pub use ops::{
@@ -39,6 +40,7 @@ pub use ops::{
     StackTable, UpdateSums, ViewAddr, ViewDims, Views, view_tiles,
 };
 pub use ptyrs_fft::C32;
+pub use ring::{LlkRing, RingDevice, RingError};
 pub use rpie::{RpieKernels, Weight};
 
 /// The linked device code: every `ptyrs-kernels` kernel plus the cuFFT functions they call.

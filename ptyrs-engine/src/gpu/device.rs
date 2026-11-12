@@ -2,7 +2,8 @@
 //! owner. Nothing outside this module can reach a field of [`Device`] or of a stack's
 //! buffers, and nothing here replaces one after [`Device::new`]: a graph replays on the
 //! buffers the eager cycle would use, and other buffers mean another `Device`, which starts
-//! with no graph.
+//! with no graph. The device also owns the LLK ring and its count of records: a record is
+//! counted only once the cycle or pass that writes it has been enqueued.
 
 use std::sync::Arc;
 
@@ -11,11 +12,11 @@ use cuda_async::device_operation::{DeviceOp, ExecutionContext};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 use ptyrs_fft::Plan2d;
 use ptyrs_gpu::{
-    C32, Error as GpuError, Kernels, LlkPartial, RpieKernels, StackTable, UpdateSums, ViewAddr,
-    ViewDims, Views,
+    C32, Error as GpuError, Kernels, LlkPartial, LlkRing, LlkSums, RingDevice, RpieKernels,
+    StackTable, UpdateSums, ViewAddr, ViewDims, Views,
 };
 
-use super::{Epoch, Frames, GpuOptions, plane_len, stack_buf_len, stacks, to_u32};
+use super::{Epoch, Frames, GpuOptions, Tag, plane_len, stack_buf_len, stacks, to_u32};
 use crate::{ApParams, DmParams, EngineError, RpieParams};
 
 /// Every buffer, module and plan a cycle launches on, and the graphs captured from them.
@@ -37,6 +38,9 @@ pub(super) struct Device {
     plans: Vec<Plan2d>,
     /// One stack's worth of exit waves: DM's `PO`, the LLK pass's forward stack.
     scratch: DeviceBuffer<C32>,
+    /// One stack's LLK partials, on their way into the ring.
+    llk: DeviceBuffer<LlkPartial>,
+    ring: LlkRing<Tag>,
     use_graph: bool,
     /// The epochs run since the parameters last changed, all of one [`Epoch::run`].
     runs: Vec<EpochRun>,
@@ -151,7 +155,6 @@ struct StackBufs {
     frames: Frames,
     /// Exit waves of the stack's views; planes past `nf * nmode` stay zero.
     psi: DeviceBuffer<C32>,
-    llk: DeviceBuffer<LlkPartial>,
 }
 
 /// The [`Device`] lent to a cycle: references only, so a cycle launches on every buffer but
@@ -171,6 +174,9 @@ pub(super) struct Bufs<'a> {
     pub stacks: Stacks<'a>,
     pub plans: Plans<'a>,
     pub scratch: &'a mut DeviceBuffer<C32>,
+    /// A stack's LLK partials, which [`RingDevice::push`] then copies into the current record.
+    pub llk: &'a mut DeviceBuffer<LlkPartial>,
+    pub ring: &'a mut RingDevice,
 }
 
 /// The stacks lent to a cycle, one at a time.
@@ -180,7 +186,6 @@ pub(super) struct Stacks<'a>(&'a mut [StackBufs]);
 pub(super) struct StackMut<'a> {
     pub frames: &'a Frames,
     pub psi: &'a mut DeviceBuffer<C32>,
-    pub llk: &'a mut DeviceBuffer<LlkPartial>,
 }
 
 impl Stacks<'_> {
@@ -193,7 +198,6 @@ impl Stacks<'_> {
         StackMut {
             frames: &st.frames,
             psi: &mut st.psi,
-            llk: &mut st.llk,
         }
     }
 }
@@ -209,7 +213,8 @@ impl Plans<'_> {
 
 impl Device {
     /// Loads the kernels and uploads the views, counts and starting arrays on a new stream of
-    /// `ctx`; the stacks cut `0 .. nframe` into `options.stack_size` frames.
+    /// `ctx`; the stacks cut `0 .. nframe` into `options.stack_size` frames, and the LLK ring
+    /// holds `options.llk_slots` records.
     pub fn new(
         ctx: &Arc<CudaContext>,
         dims: ViewDims,
@@ -232,7 +237,6 @@ impl Device {
                 Ok(StackBufs {
                     frames,
                     psi: DeviceBuffer::zeroed(&stream, len)?,
-                    llk: DeviceBuffer::zeroed(&stream, table.nf_max() as usize)?,
                 })
             })
             .collect::<Result<Vec<_>, EngineError>>()?;
@@ -240,6 +244,13 @@ impl Device {
             obj_len: to_u32("object length", obj.len())?,
             probe_len: to_u32("probe length", probe.len())?,
             scratch: DeviceBuffer::zeroed(&stream, len)?,
+            llk: DeviceBuffer::zeroed(&stream, table.nf_max() as usize)?,
+            ring: LlkRing::new(
+                &kernels,
+                &stream,
+                dims.nframe,
+                to_u32("llk_slots", options.llk_slots)?,
+            )?,
             counts: DeviceBuffer::from_host(&stream, counts)?,
             obj: DeviceBuffer::from_host(&stream, obj)?,
             probe: DeviceBuffer::from_host(&stream, probe)?,
@@ -283,11 +294,6 @@ impl Device {
         &self.probe
     }
 
-    /// Each stack's frames and LLK partials.
-    pub fn stack_llk(&self) -> impl Iterator<Item = (&Frames, &DeviceBuffer<LlkPartial>)> {
-        self.stacks.iter().map(|st| (&st.frames, &st.llk))
-    }
-
     /// Overwrites the object and probe in place.
     pub fn write_arrays(&mut self, obj: &[C32], probe: &[C32]) -> Result<(), EngineError> {
         self.obj.copy_from_host(&self.stream, obj)?;
@@ -312,13 +318,16 @@ impl Device {
             stacks: Stacks(&mut self.stacks),
             plans: Plans(&mut self.plans),
             scratch: &mut self.scratch,
+            llk: &mut self.llk,
+            ring: self.ring.device(),
         }
     }
 
-    /// Enqueues one `epoch` cycle: replays the graph captured for it, or launches it eagerly
-    /// without graphs. The epochs of one [`Epoch::run`] keep their buffers and graphs until
-    /// an epoch of another run replaces them.
-    pub fn steady(&mut self, epoch: Epoch) -> Result<(), EngineError> {
+    /// Enqueues one `epoch` cycle, numbered `cycle`: replays the graph captured for it, or
+    /// launches it eagerly without graphs, and counts its LLK record if it takes one. The
+    /// epochs of one [`Epoch::run`] keep their buffers and graphs until an epoch of another
+    /// run replaces them.
+    pub fn steady(&mut self, epoch: Epoch, cycle: usize) -> Result<(), EngineError> {
         let mut runs = std::mem::take(&mut self.runs);
         runs.retain(|r| r.cycle.epoch().run() == epoch.run());
         let at = match runs.iter().position(|r| r.cycle.epoch() == epoch) {
@@ -337,12 +346,17 @@ impl Device {
             }
         };
         self.runs = runs;
-        Ok(done?)
+        done?;
+        if epoch.records_llk() {
+            self.ring
+                .enqueued(&self.context(), Some((cycle, epoch.algorithm())))?;
+        }
+        Ok(())
     }
 
-    /// Enqueues the LLK partials of the current estimate into every stack's `llk`, from the
-    /// graph captured in [`Self::new`] or eagerly without graphs.
-    pub fn llk_pass(&mut self) -> Result<(), EngineError> {
+    /// Enqueues the LLK record of the current estimate under `tag`, from the graph captured
+    /// in [`Self::new`] or eagerly without graphs.
+    pub fn llk_pass(&mut self, tag: Tag) -> Result<(), EngineError> {
         let done = match &self.llk_graph {
             Some(graph) => self.replay(graph),
             None => {
@@ -350,7 +364,14 @@ impl Device {
                 self.lend().forward_llk(&ctx)
             }
         };
-        Ok(done?)
+        done?;
+        self.ring.enqueued(&self.context(), tag)?;
+        Ok(())
+    }
+
+    /// The LLK records counted since the last flush, in order; waits for their copies.
+    pub fn flush(&mut self) -> Result<Vec<(Tag, LlkSums)>, EngineError> {
+        Ok(self.ring.flush(&self.context())?)
     }
 
     /// The buffers of `epoch`'s cycle, and with graphs its graph, captured from them.

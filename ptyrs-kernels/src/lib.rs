@@ -14,6 +14,7 @@ use cuda_device::{device, kernel, shared::DynamicSharedArray, thread};
 use cuda_host::cuda_module;
 
 pub mod pixel;
+pub mod ring;
 pub mod rpie;
 
 /// Complex elements per thread of every in-kernel FFT (cuFFT device API, BY_COMPONENT).
