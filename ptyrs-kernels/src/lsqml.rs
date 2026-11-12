@@ -13,9 +13,9 @@
 use cuda_device::{async_copy, device, shared::DynamicSharedArray, thread};
 use cuda_host::cuda_module;
 
-use crate::bh::BhObs;
+use crate::bh::{BhObs, store_sums};
 use crate::fused::{FUSED_COLS, col_fft};
-use crate::pixel::{MASKED, PIXEL_THREADS, StackCtl, StackGeom, load_c, stack_frames, store_c};
+use crate::pixel::{MASKED, StackCtl, StackGeom, load_c, stack_frames, store_c};
 use crate::{FFT_EPT_MAX, fft_ept};
 
 /// [`lsqml_kernels::LoadedModule::lsqml_cols_64`] writes `icalc`.
@@ -706,30 +706,6 @@ pub mod lsqml_kernels {
             store_c(x, i, (v.0 + s * d.0, v.1 + s * d.1));
             store_c(sums.num, i, (0.0, 0.0));
             *sums.den.add(i) = 0.0;
-        }
-    }
-}
-
-/// Thread 0 writes the block sums of each thread's `acc` to `out[0..K]`; `s` is `K`
-/// `PIXEL_THREADS` segments of shared memory. Every thread of the block must call it.
-///
-/// # Safety
-///
-/// `s` holds `K * PIXEL_THREADS` shared floats, `out` `K` floats; block `(PIXEL_THREADS, 1,
-/// 1)`.
-#[device]
-unsafe fn store_sums<const K: usize>(s: *mut f32, acc: [f32; K], out: *mut f32) {
-    let t = thread::threadIdx_x() as usize;
-    let seg = PIXEL_THREADS as usize;
-    unsafe {
-        for (j, &a) in acc.iter().enumerate() {
-            *s.add(j * seg + t) = a;
-        }
-        crate::block_sum::<K>(s);
-        if t == 0 {
-            for j in 0..K {
-                *out.add(j) = *s.add(j * seg);
-            }
         }
     }
 }
