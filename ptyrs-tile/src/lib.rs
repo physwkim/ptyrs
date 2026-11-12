@@ -1096,11 +1096,10 @@ mod device {
         unsafe { store_1(part, i0 + 1i32, s1) };
     }
 
-    /// `ptyrs_kernels::bh_dots`: program `b`'s pair `(scale sum |g|^2, sum Re(conj(g)
-    /// prev))` over its SIMT block's grid-stride elements (`n` complex) into `part[2 b
-    /// ..][.. 2]`, the second sum only if `cg != 0` (else `0`, and `prev` is not read).
-    /// Each lane accumulates as the SIMT build contracts it, `acc = fma(x0, y0, fma(x1, y1,
-    /// acc))`, and is scaled before the tree.
+    /// Program `b`'s pair `(scale sum |g|^2, sum Re(conj(g) prev))` over its SIMT block's
+    /// grid-stride elements (`n` complex) into `part[2 b ..][.. 2]`, the second sum only if
+    /// `cg != 0` (else `0`, and `prev` is not read). Each lane accumulates `acc = fma(x0,
+    /// y0, fma(x1, y1, acc))` and is scaled before the tree.
     #[cutile::entry()]
     unsafe fn bh_dots(
         g: *const f32,
@@ -1745,10 +1744,10 @@ impl TileProbeUpdate {
     }
 }
 
-/// The Tile versions of the CG and BH dot products over a scan of one [`ViewDims`]:
-/// [`ptyrs_gpu::GradKernels`]' `beta_parts`, `norm_parts` and `sum_parts` and
-/// [`ptyrs_gpu::BhKernels::dots`], in their block order and float order, so their sums are
-/// bit-identical. [`Self::new`] compiles each for the lengths a scan's calls take, the
+/// The CG and BH dot products over a scan of one [`ViewDims`]: the Tile versions of
+/// [`ptyrs_gpu::GradKernels`]' `beta_parts`, `norm_parts` and `sum_parts`, in their block
+/// order and float order, so their sums are bit-identical, and BH's [`Self::dots`], which
+/// has no SIMT form. [`Self::new`] compiles each for the lengths a scan's calls take, the
 /// object's and the probe's `n` and the `npart`s `CG_BLOCKS`, `2 CG_BLOCKS` and
 /// [`gamma_parts`]; a launch of another length is refused rather than compiled.
 pub struct TileDots {
@@ -1867,9 +1866,8 @@ impl TileDots {
         self.sum_run(Run::Launch(ctx), at, npart)
     }
 
-    /// [`ptyrs_gpu::BhKernels::dots`]: the dot products of the step along `d`, `⟨u, Pu⟩` and
-    /// (CG) `⟨u, v⟩`, as block partials into the first `2 CG_BLOCKS` pairs of `parts`, object
-    /// then probe.
+    /// BH's dot products of the step along `d`, `⟨u, Pu⟩` and (CG) `⟨u, v⟩`, as block
+    /// partials into the first `2 CG_BLOCKS` pairs of `parts`, object then probe.
     pub fn dots(
         &self,
         ctx: &ExecutionContext,
@@ -1883,7 +1881,7 @@ impl TileDots {
             if let Some(v) = prev {
                 check_len("v", v, n as usize)?;
             }
-            // Without `v`, `u` stands in for it, unread, as in the SIMT launch.
+            // Without `v`, `u` stands in for it, unread.
             let at = [
                 addr("u", g)?,
                 addr("v", prev.unwrap_or(g))?,
