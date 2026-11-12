@@ -429,7 +429,9 @@ impl GpuPtycho {
     /// Models and refines `features` from here on, as [`crate::Ptycho::set_features`], in
     /// `f32` on the device; with [`GpuOptions::fused`] only. An error leaves the current ones.
     pub fn set_features(&mut self, features: &Features) -> Result<(), EngineError> {
-        features.check(self.dev.dims().nframe as usize)?;
+        let dims = self.dev.dims();
+        let [ny, nx] = dims.frame.map(|n| n as usize);
+        features.check(dims.nframe as usize, [ny, nx])?;
         self.dev.set_features(features)
     }
 
@@ -563,7 +565,7 @@ impl Bufs<'_> {
             }
         }
         let ended = llk.map(|w| w.end(ctx)).transpose()?;
-        self.features.step(ctx, self.grad)?;
+        self.features.step(ctx, self.kernels, self.grad)?;
         Ok(ended)
     }
 
@@ -644,12 +646,13 @@ impl Bufs<'_> {
         Ok(())
     }
 
-    /// PyNX `ScaleObjProbe` by `scale`: the norms of the object and the probe, then the
-    /// scaling, without a host sync.
+    /// PyNX `ScaleObjProbe`, without a host sync: the norms of the object and the probe, then
+    /// the scaling, [`ObjProbeScale::Absolute`] to `absolute`'s `(icalc, total)` photons, the
+    /// background's photons left out of both, or [`ObjProbeScale::Relative`] for `None`.
     fn scale_obj_probe(
         &mut self,
         ctx: &ExecutionContext,
-        scale: ObjProbeScale<'_>,
+        absolute: Option<(&DeviceBuffer<f32>, f32)>,
     ) -> Result<(), GpuError> {
         let NormBufs {
             parts,
@@ -664,6 +667,14 @@ impl Bufs<'_> {
             self.grad.sum_parts(ctx, parts, CG_BLOCKS, out)?;
         }
         let norms = [&*obj_norm, &*probe_norm];
+        let scale = match absolute {
+            Some((icalc, total)) => ObjProbeScale::Absolute {
+                icalc,
+                total,
+                background: self.features.background_photons(ctx, self.grad)?,
+            },
+            None => ObjProbeScale::Relative,
+        };
         self.grad
             .scale_obj_probe(ctx, self.obj, self.probe, norms, scale)
     }

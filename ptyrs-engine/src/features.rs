@@ -9,7 +9,7 @@ use std::ops::Range;
 use ptyrs_core::{C64, Probe, View};
 
 use crate::ops::natural;
-use crate::{EngineError, Fft2, Observed, Ptycho};
+use crate::{EngineError, Fft2, Observed, Ptycho, shift};
 
 /// The features of a reconstruction's model intensity, each modelled and refined while set;
 /// `Default` sets none and leaves every loop's arithmetic as it is without features.
@@ -23,11 +23,18 @@ pub struct Features {
     /// cycle's LLK record is under the scale before the step, the rest of it models the
     /// stepped scale.
     pub scale: Option<Vec<f64>>,
+    /// Detector background `b`, `[ny, nx]` in the detector order of the counts, the same for
+    /// every frame: the model intensity is `s[f]·I + b`. Each cycle's step, from the estimate
+    /// and model the scale's takes, is also the EM step `b[j] *= Σ_f iobs / max(icalc, 1e-12)
+    /// / nobs[j]` over the `nobs[j]` frames where pixel `j` is unmasked (kept where there is
+    /// none); a pixel at 0 stays at 0. ML's [`Ptycho::scale_obj_probe`] leaves the
+    /// background's photons out of both sums.
+    pub background: Option<Vec<f64>>,
 }
 
 impl Features {
-    /// Checks the features against a scan of `nframe` frames.
-    pub(crate) fn check(&self, nframe: usize) -> Result<(), EngineError> {
+    /// Checks the features against a scan of `nframe` frames of `frame` (`[ny, nx]`) pixels.
+    pub(crate) fn check(&self, nframe: usize, frame: [usize; 2]) -> Result<(), EngineError> {
         if let Some(s) = &self.scale {
             if s.len() != nframe {
                 return Err(EngineError::Invalid(format!(
@@ -41,23 +48,55 @@ impl Features {
                 ));
             }
         }
+        if let Some(b) = &self.background {
+            if b.len() != frame[0] * frame[1] {
+                return Err(EngineError::Invalid(format!(
+                    "a background of {} pixels for {frame:?} frames",
+                    b.len()
+                )));
+            }
+            if !b.iter().all(|b| b.is_finite() && *b >= 0.0) {
+                return Err(EngineError::Invalid(
+                    "the background must be finite and not negative".into(),
+                ));
+            }
+        }
         Ok(())
     }
 
     /// Whether some feature takes a step before each cycle.
     pub(crate) fn stepped(&self) -> bool {
-        self.scale.is_some()
+        self.scale.is_some() || self.background.is_some()
     }
 
     /// Every feature's step before a cycle models it, from the far field `psi` of the
     /// estimate the cycle starts from (all frames, as [`scale_sums`] takes it) under the
-    /// current model: [`scale_step`] of the scale.
+    /// current model: [`scale_step`] of the scale and [`background_step`] of the background,
+    /// both from sums taken before either steps.
     pub(crate) fn step(&mut self, obs: &Observed, nmode: usize, psi: &[C64]) {
-        let model = Model::of(self);
-        let sums = (self.scale.as_ref()).map(|s| scale_sums(obs, 0..s.len(), nmode, psi, model));
-        if let (Some(scale), Some(sums)) = (&mut self.scale, sums) {
+        let model = Model::of(self, obs);
+        let scale = (self.scale.as_ref()).map(|s| scale_sums(obs, 0..s.len(), nmode, psi, model));
+        let background =
+            (self.background.as_ref()).map(|_| background_sums(obs, nmode, psi, model));
+        if let (Some(scale), Some(sums)) = (&mut self.scale, scale) {
             scale_step(scale, &sums);
         }
+        if let (Some(b), Some(sums)) = (&mut self.background, background) {
+            background_step(b, &sums);
+        }
+    }
+
+    /// The background's photons over the unmasked pixels of `obs`, `Σ_j b[j]·nobs[j]`; 0
+    /// without one.
+    pub(crate) fn background_photons(&self, obs: &Observed) -> f64 {
+        let Some(b) = &self.background else {
+            return 0.0;
+        };
+        let [_, ny, nx] = obs.dims();
+        let nobs = unmasked_frames(obs);
+        (nobs.iter().enumerate())
+            .map(|(j, &k)| b[shift(j, ny, nx)] * k as f64)
+            .sum()
     }
 }
 
@@ -66,12 +105,17 @@ impl Features {
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Model<'a> {
     scale: Option<&'a [f64]>,
+    /// The background in detector order, and the detector's `[ny, nx]`.
+    background: Option<(&'a [f64], [usize; 2])>,
 }
 
 impl<'a> Model<'a> {
-    pub(crate) fn of(features: &'a Features) -> Self {
+    /// The model of `features` over the frames of `obs`.
+    pub(crate) fn of(features: &'a Features, obs: &Observed) -> Self {
+        let [_, ny, nx] = obs.dims();
         Self {
             scale: features.scale.as_deref(),
+            background: features.background.as_deref().map(|b| (b, [ny, nx])),
         }
     }
 
@@ -84,10 +128,14 @@ impl<'a> Model<'a> {
         }
     }
 
-    /// `icalc` of frame `f` at a pixel of intensity `i`.
+    /// `icalc` of frame `f` at its shifted pixel `j` of intensity `i`.
     #[inline]
-    pub(crate) fn calc(&self, f: usize, i: f64) -> f64 {
-        self.scaled(f, i)
+    pub(crate) fn calc(&self, f: usize, j: usize, i: f64) -> f64 {
+        let calc = self.scaled(f, i);
+        match self.background {
+            Some((b, [ny, nx])) => calc + b[shift(j, ny, nx)],
+            None => calc,
+        }
     }
 }
 
@@ -113,7 +161,7 @@ pub(crate) fn scale_sums(
                 if let Some(iobs) = *iobs {
                     let i: f64 = (0..nmode).map(|m| block[m * n + j].norm_sqr()).sum();
                     sums[0] += i;
-                    sums[1] += iobs * i / model.calc(f, i).max(1e-12);
+                    sums[1] += iobs * i / model.calc(f, j, i).max(1e-12);
                 }
             }
             sums
@@ -134,6 +182,59 @@ pub(crate) fn scale_step(scale: &mut [f64], sums: &[[f64; 2]]) {
     let mean = scale.iter().sum::<f64>() / scale.len() as f64;
     for s in scale {
         *s /= mean;
+    }
+}
+
+/// Each shifted pixel's unmasked frames in `obs`.
+fn unmasked_frames(obs: &Observed) -> Vec<usize> {
+    let n = obs.plane_len();
+    let mut nobs = vec![0; n];
+    for o in obs.frames(0..obs.nframe()).chunks_exact(n) {
+        for (k, iobs) in nobs.iter_mut().zip(o) {
+            *k += usize::from(iobs.is_some());
+        }
+    }
+    nobs
+}
+
+/// Per detector pixel `j` (detector order), `[Σ_f iobs / max(icalc, 1e-12), nobs]` over the
+/// `nobs` frames of `obs` where `j` is unmasked, from the far field `psi` of every frame
+/// (`nframe * nmode` planes, frame-major) and `icalc` of `model`: the sums of
+/// [`background_step`].
+pub(crate) fn background_sums(
+    obs: &Observed,
+    nmode: usize,
+    psi: &[C64],
+    model: Model<'_>,
+) -> Vec<[f64; 2]> {
+    let [nframe, ny, nx] = obs.dims();
+    let n = ny * nx;
+    assert_eq!(psi.len(), nframe * nmode * n);
+    let mut sums = vec![[0.0; 2]; n];
+    for (f, (o, block)) in (obs.frames(0..nframe).chunks_exact(n))
+        .zip(psi.chunks_exact(nmode * n))
+        .enumerate()
+    {
+        for (j, iobs) in o.iter().enumerate() {
+            if let Some(iobs) = *iobs {
+                let i: f64 = (0..nmode).map(|m| block[m * n + j].norm_sqr()).sum();
+                let s = &mut sums[shift(j, ny, nx)];
+                s[0] += iobs / model.calc(f, j, i).max(1e-12);
+                s[1] += 1.0;
+            }
+        }
+    }
+    sums
+}
+
+/// The background's EM (Richardson–Lucy) step, `b[j] *= ratio / nobs` for each pixel's
+/// `[ratio, nobs]` of [`background_sums`] where `nobs` is above 0.
+pub(crate) fn background_step(b: &mut [f64], sums: &[[f64; 2]]) {
+    assert_eq!(b.len(), sums.len());
+    for (b, [ratio, nobs]) in b.iter_mut().zip(sums) {
+        if *nobs > 0.0 {
+            *b *= ratio / nobs;
+        }
     }
 }
 

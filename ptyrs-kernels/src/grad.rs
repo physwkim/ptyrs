@@ -34,14 +34,16 @@ pub struct ObjProbePtrs {
     pub probe: *const f32,
 }
 
-/// The `(sum |x|, sum |x|^2)` pairs of the object and the probe, and the calculated photons
-/// over the unmasked pixels of every frame (one float), or null to keep `O P`.
+/// The `(sum |x|, sum |x|^2)` pairs of the object and the probe, the calculated photons
+/// over the unmasked pixels of every frame (one float), or null to keep `O P`, and the
+/// background's photons over the same pixels (one float), or null for none.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct NormPtrs {
     pub obj: *const f32,
     pub probe: *const f32,
     pub icalc: *const f32,
+    pub background: *const f32,
 }
 
 #[cuda_module]
@@ -170,16 +172,43 @@ pub mod grad_kernels {
         }
     }
 
+    /// The background's photons over the unmasked pixels of every frame, `out[0] = sum_j b[j]
+    /// nobs[j]` in a fixed order, `nobs[j]` the frames where detector pixel `j` is unmasked.
+    ///
+    /// # Safety
+    ///
+    /// `b` and `nobs` hold `n` values, `out` one; grid `(1, 1, 1)`, block
+    /// `(PIXEL_THREADS, 1, 1)`.
+    #[kernel]
+    pub unsafe fn cg_background_photons(b: *const f32, nobs: *const u32, n: u32, out: *mut f32) {
+        static mut RED: SharedArray<f32, 256> = SharedArray::UNINIT;
+        let t = thread::threadIdx_x() as usize;
+        let mut acc = 0.0f32;
+        let mut j = t;
+        while j < n as usize {
+            acc += unsafe { *b.add(j) * *nobs.add(j) as f32 };
+            j += PIXEL_THREADS as usize;
+        }
+        let s = (&raw mut RED).cast::<f32>();
+        unsafe {
+            *s.add(t) = acc;
+            crate::block_sum::<1>(s);
+            if t == 0 {
+                *out = *s;
+            }
+        }
+    }
+
     /// PyNX `ScaleObjProbe` from the pairs `(sum |x|, sum |x|^2)` of the object and the
-    /// probe: with `s = sqrt(total / icalc)` (`absolute=True`), or 1 if `norms.icalc` is null
-    /// (`absolute=False`), `obj *= sqrt(probe[0] / obj[0] * s)` and
-    /// `probe *= sqrt(obj[0] / probe[0] * s)`.
+    /// probe: with `s = sqrt((total - background) / icalc)` (`absolute=True`, `background` 0
+    /// if `norms.background` is null), or 1 if `norms.icalc` is null (`absolute=False`),
+    /// `obj *= sqrt(probe[0] / obj[0] * s)` and `probe *= sqrt(obj[0] / probe[0] * s)`.
     ///
     /// # Safety
     ///
     /// `obj` holds `nobj` complex values, `probe` `nprobe`, `norms.obj` and `norms.probe` two
-    /// floats each and `norms.icalc` one or is null; one thread per element of the longer
-    /// array.
+    /// floats each, `norms.icalc` and `norms.background` one or are null; one thread per
+    /// element of the longer array.
     #[kernel]
     pub unsafe fn cg_scale_obj_probe(
         obj: *mut f32,
@@ -194,8 +223,10 @@ pub mod grad_kernels {
             let (os, ps) = (*norms.obj, *norms.probe);
             let s = if norms.icalc.is_null() {
                 1.0
-            } else {
+            } else if norms.background.is_null() {
                 (total / *norms.icalc).sqrt()
+            } else {
+                ((total - *norms.background) / *norms.icalc).sqrt()
             };
             for (x, len, f) in [
                 (obj, nobj, (ps / os * s).sqrt()),
@@ -316,10 +347,11 @@ pub mod grad_kernels {
         }
     }
 
-    /// PyNX `CG_Poisson_Gamma` (no background) per chunk `c = blockIdx.x` of frame `f0 + fl`,
-    /// `fl = blockIdx.y`, on the forward-FFT'd (unnormalized) line-search stacks: over the
-    /// unmasked pixels `d` in `c * GAMMA_CHUNK .. min((c + 1) * GAMMA_CHUNK, n)`, with `k` the
-    /// frame's intensity `scale` (1 if it is null), `calc = max(k sum_m |po|^2 / n, 1e-12)`,
+    /// PyNX `CG_Poisson_Gamma` per chunk `c = blockIdx.x` of frame `f0 + fl`, `fl =
+    /// blockIdx.y`, on the forward-FFT'd (unnormalized) line-search stacks: over the unmasked
+    /// detector pixels `d` in `c * GAMMA_CHUNK .. min((c + 1) * GAMMA_CHUNK, n)`, with `k` the
+    /// frame's intensity `scale` (1 if it is null), `b` the detector `background[d]` (0 if it
+    /// is null), `calc = max(k sum_m |po|^2 / n + b, 1e-12)`,
     /// `r = k sum_m Re(conj(po) a) / n`, `s = k sum_m (|a|^2 + 2 Re(conj(po) b)) / n` and
     /// `f = 1 - obs / calc`, pair `p = (f0 + fl) * nchunk + c`,
     /// `nchunk = ceil(n / GAMMA_CHUNK)`, gets `out[2 p] = sum -2 r f` and `out[2 p + 1] =
@@ -330,13 +362,14 @@ pub mod grad_kernels {
     /// # Safety
     ///
     /// Each of `x` `[nf_max * nmode, ny, nx]`, `counts` `[nframe, ny, nx]`, `out`
-    /// `2 * nframe * nchunk` floats, `ctl` one entry, `scale` null or `nframe` floats; grid
-    /// `(nchunk, nf_max, 1)`, block `(PIXEL_THREADS, 1, 1)`.
+    /// `2 * nframe * nchunk` floats, `ctl` one entry, `scale` null or `nframe` floats,
+    /// `background` null or `n`; grid `(nchunk, nf_max, 1)`, block `(PIXEL_THREADS, 1, 1)`.
     #[kernel]
     pub unsafe fn cg_gamma_frames(
         x: GammaPtrs,
         counts: *const u16,
         scale: *const f32,
+        background: *const f32,
         out: *mut f32,
         ctl: *const StackCtl,
         g: StackGeom,
@@ -354,7 +387,8 @@ pub mod grad_kernels {
         let chunk = GAMMA_CHUNK as usize;
         let end = n.min((c + 1) * chunk);
         let inv_n = 1.0 / n as f32;
-        // `1 * x == x`: without a scale every pair is the unscaled kernel's, bit for bit.
+        // `1 * x == x` and `x + 0 == x` for `x >= 0`: without a scale and a background every
+        // pair is the plain kernel's, bit for bit.
         let k = if scale.is_null() {
             1.0
         } else {
@@ -374,7 +408,12 @@ pub mod grad_kernels {
                     r += cmul_conj(p, a).0;
                     s += a.0 * a.0 + a.1 * a.1 + 2.0 * cmul_conj(p, b).0;
                 }
-                let calc = (k * (calc * inv_n)).max(1e-12);
+                let b = if background.is_null() {
+                    0.0
+                } else {
+                    unsafe { *background.add(d) }
+                };
+                let calc = (k * (calc * inv_n) + b).max(1e-12);
                 let (r, s, obs) = (k * (r * inv_n), k * (s * inv_n), obs as f32);
                 let f = 1.0 - obs / calc;
                 let rc = 2.0 * r / calc;

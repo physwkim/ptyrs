@@ -770,21 +770,32 @@ fn ring_record_of_the_first_frames_matches_the_cpu_llk() {
     }
 }
 
-/// Frame `f`'s flux in [`flux_start`]: 0.6 to 1.4 times the scenario's, unordered.
+/// Frame `f`'s flux in [`featured_start`]: 0.6 to 1.4 times the scenario's, unordered.
 fn flux(f: usize) -> f64 {
     1.0 + 0.4 * (2.3 * f as f64).sin()
 }
 
-/// [`start`]'s masked scan on the fused side with frame `f`'s counts times [`flux`]`(f)`,
-/// rounded, and the truth object and probe it was drawn from scaled to that scan, so that the
-/// flux is what the model misses.
-fn flux_start(nprobe: usize) -> (Scan, Object, Probe) {
+/// Detector pixel `(y, x)`'s background in [`featured_start`]: 1 to 5 counts, smooth.
+fn truth_background(y: usize, x: usize) -> f64 {
+    3.0 + 2.0 * (0.21 * y as f64).sin() * (0.13 * x as f64 + 0.5).cos()
+}
+
+/// Whether pixel `(y, x)` is masked in every frame of [`featured_start`]'s scan.
+fn featured_mask(y: usize, x: usize) -> bool {
+    y == 3 || x == 20
+}
+
+/// [`start`]'s scan on the fused side masked by [`featured_mask`], with frame `f`'s counts
+/// times [`flux`]`(f)` where `with_flux`, plus [`truth_background`] where `with_background`,
+/// rounded; and the truth object and probe it was drawn from scaled to that scan, so that the
+/// flux and the background are what the model misses.
+fn featured_start(nprobe: usize, with_flux: bool, with_background: bool) -> (Scan, Object, Probe) {
     let frame = FUSED.frame;
     let (sim, object, probe) =
         common::scenario::truth(frame, NPOS, nprobe, 2e5, frame as f64 / 8.0);
-    let mut scan = mask(sim.scan, |y, x| y == 3 || x == 20);
+    let mut scan = mask(sim.scan, featured_mask);
     let dims = scan.counts.dims();
-    let n = dims[1] * dims[2];
+    let [_, ny, nx] = dims;
     let data = scan
         .counts
         .as_slice()
@@ -794,7 +805,15 @@ fn flux_start(nprobe: usize) -> (Scan, Object, Probe) {
             if c == MASKED {
                 return c;
             }
-            let c = (f64::from(c) * flux(i / n)).round();
+            let (f, j) = (i / (ny * nx), i % (ny * nx));
+            let mut c = f64::from(c);
+            if with_flux {
+                c *= flux(f);
+            }
+            if with_background {
+                c += truth_background(j / nx, j % nx);
+            }
+            let c = c.round();
             assert!(c < f64::from(MASKED), "count {c} overflows");
             c as u16
         })
@@ -834,7 +853,7 @@ impl Cycles {
 }
 
 /// AP, DM and ML updating the object and the probe, each with an LLK every `calc_llk` cycles.
-fn scale_cycles(calc_llk: usize) -> [Cycles; 3] {
+fn feature_cycles(calc_llk: usize) -> [Cycles; 3] {
     [
         Cycles::Ap(ApParams {
             obj_inertia: Some(0.01),
@@ -855,101 +874,224 @@ fn scale_cycles(calc_llk: usize) -> [Cycles; 3] {
     ]
 }
 
+/// `ncycle` of `cycles` from `start` modelling `features` on the GPU and on the CPU, and
+/// without them on the CPU. Checks the GPU's LLK records, object, probe and features within
+/// 1e-4 of the CPU's `f64`, and returns the CPU runs with and without the features.
+fn features_match_cpu(
+    cycles: Cycles,
+    (scan, object, probe): &(Scan, Object, Probe),
+    features: &Features,
+    ncycle: usize,
+) -> (Ptycho, Ptycho) {
+    let new = || Ptycho::new(scan, object.clone(), probe.clone()).unwrap();
+    let (mut cpu, mut plain) = (new(), new());
+    cpu.set_features(features.clone()).unwrap();
+    let mut gpu =
+        GpuPtycho::new(&ctx(), scan, object.clone(), probe.clone(), FUSED.options).unwrap();
+    gpu.set_features(features).unwrap();
+    cycles.cpu(&mut cpu, ncycle);
+    cycles.cpu(&mut plain, ncycle);
+    cycles.gpu(&mut gpu, ncycle);
+    assert_eq!(gpu.cycle(), cpu.cycle());
+    let errs = [
+        llk_rel(gpu.history(), cpu.history()),
+        rel_l2(&gpu.object().unwrap(), cpu.object()),
+        rel_l2(&gpu.probe().unwrap(), cpu.probe()),
+    ];
+    let (g, c) = (gpu.features().unwrap(), cpu.features());
+    let worst = |g: &Option<Vec<f64>>, c: &Option<Vec<f64>>| {
+        assert_eq!(g.is_some(), c.is_some());
+        (g.iter().flatten().zip(c.iter().flatten()))
+            .map(|(a, b)| ((a - b) / b).abs())
+            .fold(0.0, f64::max)
+    };
+    let scale = worst(&g.scale, &c.scale);
+    let background = worst(&g.background, &c.background);
+    println!(
+        "{cycles:?}: llk {:.2e} object {:.2e} probe {:.2e} scale {scale:.2e} \
+         background {background:.2e}",
+        errs[0], errs[1], errs[2],
+    );
+    check(errs, [1e-4, 1e-4, 1e-4]);
+    assert!(scale < 1e-4, "scale: {scale:e}");
+    assert!(background < 1e-4, "background: {background:e}");
+    (cpu, plain)
+}
+
+/// The last LLK record's Poisson LLK.
+fn last_llk(p: &Ptycho) -> f64 {
+    p.history().last().unwrap().llk.poisson
+}
+
 /// A per-frame intensity scale refined from 1 by 20 AP, DM and ML cycles on a scan whose
-/// frames' flux varies, against the CPU's `f64`: the LLK of every cycle and the final object,
-/// probe and scale. On the CPU the scale follows the frames' flux relative to its mean and
-/// brings the last LLK below that of a run without it.
+/// frames' flux varies, as [`features_match_cpu`] checks it. On the CPU the scale follows the
+/// frames' flux relative to its mean and brings the last LLK below that of a run without it.
 #[test]
 fn scale_matches_cpu() {
     const NCYCLE: usize = 20;
-    let (scan, object, probe) = flux_start(2);
+    let start = featured_start(2, true, false);
     let ones = Features {
         scale: Some(vec![1.0; NPOS]),
+        ..Features::default()
     };
     let mean = (0..NPOS).map(flux).sum::<f64>() / NPOS as f64;
     // Measured 2.2e-2, 9.3e-2 and 2.7e-2 from 0.67 at the start.
-    for (cycles, flux_tol) in scale_cycles(1).into_iter().zip([0.05, 0.15, 0.05]) {
-        let new = || Ptycho::new(&scan, object.clone(), probe.clone()).unwrap();
-        let (mut cpu, mut plain) = (new(), new());
-        cpu.set_features(ones.clone()).unwrap();
-        let mut gpu =
-            GpuPtycho::new(&ctx(), &scan, object.clone(), probe.clone(), FUSED.options).unwrap();
-        gpu.set_features(&ones).unwrap();
-        cycles.cpu(&mut cpu, NCYCLE);
-        cycles.cpu(&mut plain, NCYCLE);
-        cycles.gpu(&mut gpu, NCYCLE);
-        assert_eq!(gpu.cycle(), cpu.cycle());
-        let s = gpu.features().unwrap().scale.unwrap();
-        let want = cpu.features().scale.clone().unwrap();
-        let scale = s
-            .iter()
-            .zip(&want)
-            .map(|(a, b)| ((a - b) / b).abs())
-            .fold(0.0, f64::max);
-        let errs = [
-            llk_rel(gpu.history(), cpu.history()),
-            rel_l2(&gpu.object().unwrap(), cpu.object()),
-            rel_l2(&gpu.probe().unwrap(), cpu.probe()),
-        ];
-        let off_flux = want
-            .iter()
-            .enumerate()
+    for (cycles, flux_tol) in feature_cycles(1).into_iter().zip([0.05, 0.15, 0.05]) {
+        let (cpu, plain) = features_match_cpu(cycles, &start, &ones, NCYCLE);
+        let off_flux = (cpu.features().scale.as_ref().unwrap().iter().enumerate())
             .map(|(f, s)| (s * mean / flux(f) - 1.0).abs())
             .fold(0.0, f64::max);
-        let last = |p: &Ptycho| p.history().last().unwrap().llk.poisson;
         println!(
-            "scale {cycles:?}: llk {:.2e} object {:.2e} probe {:.2e} scale {scale:.2e}; \
-             off flux {off_flux:.2e}; last llk {:.4e}, {:.4e} without",
-            errs[0],
-            errs[1],
-            errs[2],
-            last(&cpu),
-            last(&plain),
+            "scale {cycles:?}: off flux {off_flux:.2e}; last llk {:.4e}, {:.4e} without",
+            last_llk(&cpu),
+            last_llk(&plain),
         );
-        check(errs, [1e-4, 1e-4, 1e-4]);
-        assert!(scale < 1e-4, "scale: {scale:e}");
         assert!(off_flux < flux_tol, "{cycles:?}: off flux {off_flux:e}");
         assert!(
-            last(&cpu) < last(&plain),
+            last_llk(&cpu) < last_llk(&plain),
             "{cycles:?}: the scale left the LLK"
         );
     }
 }
 
-/// Features need the fused passes and one finite, positive scale per frame; rPIE and BH model
-/// none; a refused set leaves the features modelled.
+/// A flat background of 1 count on `scan`'s detector.
+fn flat_background(scan: &Scan) -> Vec<f64> {
+    let [_, ny, nx] = scan.counts.dims();
+    vec![1.0; ny * nx]
+}
+
+/// The RMS of `b`'s error relative to [`truth_background`] over the pixels [`featured_mask`]
+/// leaves, `[ny, nx]` in detector order; asserts the masked pixels kept the flat start.
+fn off_truth_background(b: &[f64], [ny, nx]: [usize; 2]) -> f64 {
+    let (mut e, mut t) = (0.0, 0.0);
+    for (j, &b) in b.iter().enumerate().take(ny * nx) {
+        let (y, x) = (j / nx, j % nx);
+        if featured_mask(y, x) {
+            assert_eq!(b, 1.0, "masked pixel ({y}, {x}) stepped");
+            continue;
+        }
+        let w = truth_background(y, x);
+        e += (b - w).powi(2);
+        t += w * w;
+    }
+    (e / t).sqrt()
+}
+
+/// A detector background refined from a flat 1 count by 20 AP, DM and ML cycles on a scan with
+/// one, as [`features_match_cpu`] checks it. On the CPU the background nears the truth's on the
+/// unmasked pixels, the masked ones keep the start, and the last LLK falls below that of a run
+/// without it.
+#[test]
+fn background_matches_cpu() {
+    const NCYCLE: usize = 20;
+    let start = featured_start(2, false, true);
+    let [_, ny, nx] = start.0.counts.dims();
+    let flat = Features {
+        background: Some(flat_background(&start.0)),
+        ..Features::default()
+    };
+    let at_start = off_truth_background(flat.background.as_ref().unwrap(), [ny, nx]);
+    // Measured 2.8e-1, 3.0e-1 and 2.7e-1 from 7.0e-1 at the start.
+    for (cycles, truth_tol) in feature_cycles(1).into_iter().zip([0.4, 0.4, 0.4]) {
+        let (cpu, plain) = features_match_cpu(cycles, &start, &flat, NCYCLE);
+        let off = off_truth_background(cpu.features().background.as_ref().unwrap(), [ny, nx]);
+        println!(
+            "background {cycles:?}: off truth {off:.2e} from {at_start:.2e}; \
+             last llk {:.4e}, {:.4e} without",
+            last_llk(&cpu),
+            last_llk(&plain),
+        );
+        assert!(off < truth_tol, "{cycles:?}: off truth {off:e}");
+        assert!(
+            last_llk(&cpu) < last_llk(&plain),
+            "{cycles:?}: the background left the LLK"
+        );
+    }
+}
+
+/// Both features at once on a scan with both effects, as [`features_match_cpu`] checks it:
+/// every feature's step takes its sums before any steps, on both backends.
+#[test]
+fn scale_and_background_match_cpu() {
+    const NCYCLE: usize = 20;
+    let start = featured_start(2, true, true);
+    let both = Features {
+        scale: Some(vec![1.0; NPOS]),
+        background: Some(flat_background(&start.0)),
+    };
+    for cycles in feature_cycles(1) {
+        let (cpu, plain) = features_match_cpu(cycles, &start, &both, NCYCLE);
+        println!(
+            "both {cycles:?}: last llk {:.4e}, {:.4e} without",
+            last_llk(&cpu),
+            last_llk(&plain),
+        );
+        assert!(
+            last_llk(&cpu) < last_llk(&plain),
+            "{cycles:?}: the features left the LLK"
+        );
+    }
+}
+
+/// Features need the fused passes, one finite, positive scale per frame and one finite,
+/// non-negative background value per detector pixel; rPIE and BH model none; a refused set
+/// leaves the features modelled.
 #[test]
 fn features_are_refused_where_they_cannot_run() {
-    let ones = Features {
-        scale: Some(vec![1.0; NPOS]),
-    };
     let (scan, object, probe) = start(M1.frame, 1, false);
     let mut m1 = GpuPtycho::new(&ctx(), &scan, object, probe, M1.options).unwrap();
-    let err = m1.set_features(&ones).unwrap_err().to_string();
-    assert!(err.contains("fused: true"), "{err}");
+    for features in [
+        Features {
+            scale: Some(vec![1.0; NPOS]),
+            ..Features::default()
+        },
+        Features {
+            background: Some(flat_background(&scan)),
+            ..Features::default()
+        },
+    ] {
+        let err = m1.set_features(&features).unwrap_err().to_string();
+        assert!(err.contains("fused: true"), "{err}");
+    }
     m1.set_features(&Features::default()).unwrap();
 
-    let (scan, object, probe) = flux_start(1);
+    let (scan, object, probe) = featured_start(1, true, true);
     let mut cpu = Ptycho::new(&scan, object.clone(), probe.clone()).unwrap();
     let mut gpu = GpuPtycho::new(&ctx(), &scan, object, probe, FUSED.options).unwrap();
+    let flat = flat_background(&scan);
     let half = Features {
         scale: Some(vec![0.5; NPOS]),
+        background: Some(flat.iter().map(|b| 2.0 * b).collect()),
     };
     cpu.set_features(half.clone()).unwrap();
     gpu.set_features(&half).unwrap();
-    let one_bad = |v: f64| {
-        let mut s = vec![1.0; NPOS];
-        s[NPOS / 2] = v;
-        s
+    let one_bad = |mut v: Vec<f64>, bad: f64| {
+        let n = v.len();
+        v[n / 2] = bad;
+        v
     };
-    for scale in [
+    let bad_scales = [
         vec![1.0; NPOS - 1],
-        one_bad(0.0),
-        one_bad(-1.0),
-        one_bad(f64::NAN),
-        one_bad(f64::INFINITY),
-    ] {
-        let bad = Features { scale: Some(scale) };
+        one_bad(vec![1.0; NPOS], 0.0),
+        one_bad(vec![1.0; NPOS], -1.0),
+        one_bad(vec![1.0; NPOS], f64::NAN),
+        one_bad(vec![1.0; NPOS], f64::INFINITY),
+    ];
+    let bad_backgrounds = [
+        flat[1..].to_vec(),
+        one_bad(flat.clone(), -1.0),
+        one_bad(flat.clone(), f64::NAN),
+        one_bad(flat.clone(), f64::INFINITY),
+    ];
+    let bad = (bad_scales.into_iter()).map(|s| Features {
+        scale: Some(s),
+        background: Some(flat.clone()),
+    });
+    let bad = bad.chain(bad_backgrounds.into_iter().map(|b| Features {
+        scale: Some(vec![1.0; NPOS]),
+        background: Some(b),
+    }));
+    for bad in bad {
         assert!(cpu.set_features(bad.clone()).is_err(), "{bad:?}");
         assert!(gpu.set_features(&bad).is_err(), "{bad:?}");
     }
@@ -966,12 +1108,14 @@ fn features_are_refused_where_they_cannot_run() {
     assert_eq!(gpu.cycle(), 0);
 }
 
-/// AP, DM and ML cycles modelling a scale replay from graphs the eager bits: the object, the
-/// probe, the scale and every LLK record, across a scale written in place between calls and
-/// the public LLK query. Dropping the features before any cycle gives a fresh start's bits.
+/// AP, DM and ML cycles modelling a scale and a background replay from graphs the eager bits:
+/// the object, the probe, both features and every LLK record, across features written in place
+/// between calls and the public LLK query. Dropping the features before any cycle gives a fresh
+/// start's bits.
 #[test]
-fn scale_graphs_replay_bitwise_like_eager() {
-    let (scan, object, probe) = flux_start(2);
+fn feature_graphs_replay_bitwise_like_eager() {
+    let (scan, object, probe) = featured_start(2, true, true);
+    let flat = flat_background(&scan);
     let bits = |s: &Stack<C64>| -> Vec<[u64; 2]> {
         s.as_slice()
             .iter()
@@ -987,15 +1131,16 @@ fn scale_graphs_replay_bitwise_like_eager() {
             .map(|r| (Some((r.cycle, r.algorithm)), llk_bits(r.llk)))
             .collect();
         llk.push((None, llk_bits(g.llk().unwrap())));
-        let scale = g
-            .features()
-            .unwrap()
-            .scale
-            .map(|s| s.into_iter().map(f64::to_bits).collect::<Vec<_>>());
+        let features = g.features().unwrap();
+        let feature_bits =
+            |v: Option<Vec<f64>>| v.map(|v| v.into_iter().map(f64::to_bits).collect::<Vec<_>>());
         (
             bits(&g.object().unwrap()),
             bits(&g.probe().unwrap()),
-            scale,
+            [
+                feature_bits(features.scale),
+                feature_bits(features.background),
+            ],
             llk,
         )
     };
@@ -1006,17 +1151,19 @@ fn scale_graphs_replay_bitwise_like_eager() {
         };
         GpuPtycho::new(&ctx(), &scan, object.clone(), probe.clone(), options).unwrap()
     };
+    let start = Features {
+        scale: Some(vec![1.0; NPOS]),
+        background: Some(flat.clone()),
+    };
     let run = |graph: bool| {
         let mut g = new(graph);
-        g.set_features(&Features {
-            scale: Some(vec![1.0; NPOS]),
-        })
-        .unwrap();
-        let [ap, dm, ml] = scale_cycles(3);
+        g.set_features(&start).unwrap();
+        let [ap, dm, ml] = feature_cycles(3);
         ap.gpu(&mut g, 4);
         let query = g.llk().unwrap();
         g.set_features(&Features {
             scale: Some((0..NPOS).map(flux).collect()),
+            background: Some(flat.iter().map(|b| 0.5 * b).collect()),
         })
         .unwrap();
         dm.gpu(&mut g, 4);
@@ -1031,21 +1178,17 @@ fn scale_graphs_replay_bitwise_like_eager() {
     assert!(eager.3 == graph.3, "LLK records differ");
     assert!(eager.0 == graph.0, "object differs");
     assert!(eager.1 == graph.1, "probe differs");
-    assert!(eager.2 == graph.2, "scale differs");
+    assert!(eager.2 == graph.2, "features differ");
 
-    let [ap, ..] = scale_cycles(3);
+    let [ap, ..] = feature_cycles(3);
     let mut fresh = new(true);
     ap.gpu(&mut fresh, 4);
     let mut dropped = new(true);
-    dropped
-        .set_features(&Features {
-            scale: Some(vec![1.0; NPOS]),
-        })
-        .unwrap();
+    dropped.set_features(&start).unwrap();
     dropped.set_features(&Features::default()).unwrap();
     ap.gpu(&mut dropped, 4);
     let (fresh, dropped) = (state(&mut fresh), state(&mut dropped));
-    assert!(dropped.2.is_none());
+    assert!(dropped.2 == [None, None]);
     assert!(
         fresh == dropped,
         "dropping the features differs from a fresh start"
