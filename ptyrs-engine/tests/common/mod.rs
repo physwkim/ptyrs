@@ -16,8 +16,9 @@ pub const RPIE: RpieParams = RpieParams {
     calc_llk: 1,
 };
 
-/// A simulated scan (`npos` Fermat positions 4 object pixels apart, `photons` per frame,
-/// seed 1, no mask) and its starting object and probe, before `scale_obj_probe`.
+/// A simulated scan (`npos` Fermat positions `step` object pixels apart, `photons` per frame,
+/// seed 1, no mask) and its starting object and probe, before `scale_obj_probe`. The probe's
+/// Gaussian envelope has σ = `frame` / 12, so a step of `frame` / 16 overlaps by about 2/3.
 ///
 /// The object starts at unit modulus with a uniform random phase in [-0.5, 0.5) rad, the
 /// probe as the truth with its defocus phase 1.5 r²/σ² cut to 1.0 r²/σ². A flat object would
@@ -29,11 +30,12 @@ pub fn dm_scenario(
     npos: usize,
     nprobe: usize,
     photons: f64,
+    step: f64,
 ) -> (Scan, Object, Probe) {
     let g = Geometry::new(1.5e-10, 1.0, 75e-6, [frame, frame]).unwrap();
     let pixel = g.pixel_size_object();
     // CXI stores translations as f32: round first so a CXI round trip keeps them exactly
-    let f = ptyrs_core::sim::fermat(npos, 4.0 * pixel[1]);
+    let f = ptyrs_core::sim::fermat(npos, step * pixel[1]);
     let round = |v: Vec<f64>| v.into_iter().map(|x| x as f32 as f64).collect();
     let positions = Positions::new(round(f.y), round(f.x)).unwrap();
     let shape = required_obj_shape(&positions.pynx_preprocess(pixel), pixel, g.frame, 16);

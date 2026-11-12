@@ -1687,8 +1687,12 @@ dependencies = [
 name = "ptyrs-engine"
 version = "0.0.1"
 dependencies = [
+ "cuda-async",
+ "cuda-core",
  "num-complex",
  "ptyrs-core",
+ "ptyrs-fft",
+ "ptyrs-gpu",
  "ptyrs-io",
  "rustfft",
  "thiserror 2.0.21",
