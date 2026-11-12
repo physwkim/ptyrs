@@ -141,21 +141,6 @@ fn chunks(n: usize) -> usize {
     n.div_ceil(GAMMA_CHUNK as usize)
 }
 
-/// The geometry of the whole scan as one stack.
-fn scan_geom(d: &ViewDims) -> StackGeom {
-    StackGeom {
-        nframe: d.nframe,
-        nf_max: d.nframe,
-        nmode: d.nmode,
-        nprobe: d.nprobe,
-        ny: d.frame[0],
-        nx: d.frame[1],
-        nyo: d.obj[0],
-        nxo: d.obj[1],
-        quad: d.quad_phase,
-    }
-}
-
 /// Values of the object and of the probe.
 fn lens(dims: &ViewDims) -> [usize; 2] {
     [dims.obj_len(), dims.nprobe as usize * dims.n()]
@@ -295,7 +280,7 @@ impl LsqmlKernels {
                     views.tile_ptrs(),
                     pre,
                     init.into(),
-                    scan_geom(&d),
+                    d.scan_geom(),
                 )
             }
         })
@@ -595,7 +580,7 @@ impl LsqmlKernels {
         let span = st.span(&batch)?;
         // pty-chi's `trim_mean`, the cut saturating at 0 for small batches.
         let trim = (span.nb as f64 * 0.1 / 2.0 - 0.5).ceil() as u32;
-        let g = scan_geom(&st.dims);
+        let g = st.dims.scan_geom();
         let writes = [st.dots.storage(), st.rec.storage(), st.step.storage()];
         self.base
             .launch(ctx, &[st.a_pos.storage()], &writes, |stream| {
