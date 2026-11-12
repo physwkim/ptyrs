@@ -5,8 +5,9 @@
 //! the second starts DM from it and updates it at DM's default probe inertia. rPIE runs at
 //! object alpha 0.5 and 1.0: at its default 0.1 it climbs back from its minimum on these scans
 //! and oscillates, in pty-chi as in the engine. A start reaches the target once its LLK is
-//! within [`LLK_MARGIN`] above it; the strict count follows. Every LLK curve goes to
-//! `<curves.tsv>`, one row per epoch, epoch 0 being the start.
+//! within [`LLK_MARGIN`] above it: the LLK of rPIE and of DM passes a minimum and drifts, and a
+//! strict count would measure the flat run's own dip. Every LLK curve goes to `<curves.tsv>`,
+//! one row per epoch, epoch 0 being the start.
 //!
 //! `cargo run --release -p ptyrs-nn --example m6_start -- <predictor_dir> <curves.tsv>`
 
@@ -182,20 +183,11 @@ fn write_curves(path: &Path, cases: &[Case], runs: &[Vec<(Run, Run)>]) -> std::i
 }
 
 /// One row per case, algorithm of `ALGS[algs]` and N: the epochs to the target within
-/// [`LLK_MARGIN`], then strictly.
+/// [`LLK_MARGIN`].
 fn table(cases: &[Case], runs: &[Vec<(Run, Run)>], algs: Range<usize>) {
     println!(
-        "{:12} {:9} {:>3}  {:>8}  {:>8} {:>8}  {:>7} {:>7}  {:>11} {:>11}",
-        "object",
-        "alg",
-        "N",
-        "target",
-        "LLK flat",
-        "LLK pred",
-        "flat 1%",
-        "pred 1%",
-        "flat strict",
-        "pred strict"
+        "{:12} {:9} {:>3}  {:>8}  {:>8} {:>8}  {:>7} {:>7}",
+        "object", "alg", "N", "target", "LLK flat", "LLK pred", "flat 1%", "pred 1%"
     );
     for (c, runs) in cases.iter().zip(runs) {
         for (alg, ((flat0, flat), (pred0, pred))) in
@@ -204,17 +196,12 @@ fn table(cases: &[Case], runs: &[Vec<(Run, Run)>], algs: Range<usize>) {
             for n in NS {
                 let target = flat[n - 1];
                 // The flat run reaches its own epoch-N LLK by epoch N; earlier when it rises after.
-                let epochs = |margin| {
-                    let flat_n =
-                        iterations_to_llk(*flat0, target, margin, flat.iter().copied()).unwrap();
-                    let pred_n = iterations_to_llk(*pred0, target, margin, pred.iter().copied())
-                        .map_or(format!(">{MAX}"), |k| k.to_string());
-                    (flat_n, pred_n)
-                };
-                let (flat_m, pred_m) = epochs(LLK_MARGIN);
-                let (flat_s, pred_s) = epochs(0.0);
+                let flat_m =
+                    iterations_to_llk(*flat0, target, LLK_MARGIN, flat.iter().copied()).unwrap();
+                let pred_m = iterations_to_llk(*pred0, target, LLK_MARGIN, pred.iter().copied())
+                    .map_or(format!(">{MAX}"), |k| k.to_string());
                 println!(
-                    "{:12} {:9} {n:>3}  {target:>8.4}  {flat0:>8.4} {pred0:>8.4}  {flat_m:>7} {pred_m:>7}  {flat_s:>11} {pred_s:>11}",
+                    "{:12} {:9} {n:>3}  {target:>8.4}  {flat0:>8.4} {pred0:>8.4}  {flat_m:>7} {pred_m:>7}",
                     c.name,
                     format!("{alg:?}")
                 );
