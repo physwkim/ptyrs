@@ -9,7 +9,7 @@
 use ptyrs_core::{AddrTable, C64, Object, Probe, Stack, View};
 
 use crate::ops::{accumulate_obj, accumulate_probe, natural, obj_probe_to_psi};
-use crate::{Fft2, Observed};
+use crate::{Fft2, Observed, random_batches};
 
 /// pty-chi's offset on the modelled amplitude `A` in the residual and the Hessian.
 const EPS: f64 = 1e-8;
@@ -17,23 +17,24 @@ const EPS: f64 = 1e-8;
 /// BH parameters.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BhParams {
-    /// Frames per batch, consecutive in scan order, capped at the scan's frame count. One
-    /// batch of every frame runs CG across epochs; smaller batches take steepest descent along
-    /// each batch's gradient (DESIGN B7).
+    /// Frames per batch, capped at the scan's frame count. One batch of every frame runs CG
+    /// across epochs; smaller batches take steepest descent along each batch's gradient
+    /// (DESIGN B7).
     pub batch_size: usize,
     /// pty-chi probe `rho`: the probe variable is the probe over `ρ = rho·√(ny·nx)`, so in
     /// probe displacements its gradient is scaled by `ρ²`.
     pub probe_rho: f64,
+    /// The seed of every epoch's [`random_batches`].
+    pub seed: u64,
 }
 
 /// One batch's step, as pty-chi computes it.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct BhStep {
-    pub first: usize,
-    pub count: usize,
+    pub frames: Vec<usize>,
     /// CG weight of the previous direction; 0 in steepest descent and the first epoch.
     pub beta: f64,
-    /// Step along the direction, after the factor `count / batch_size`.
+    /// Step along the direction, after the factor `frames.len() / batch_size`.
     pub alpha: f64,
     /// `−⟨g, D⟩` with `g` the gradient and `D` the direction.
     pub top: f64,
@@ -43,7 +44,8 @@ pub struct BhStep {
 
 /// The amplitude cost of a batch of views at one object and probe and its derivatives:
 /// `F = Σ_frames Σ_unmasked (A − √iobs)²` with `A = √(Σ_m |psi_m|²)` and `psi` the far field of
-/// [`obj_probe_to_psi`]. `views` are whole frames of an [`AddrTable`] in its order.
+/// [`obj_probe_to_psi`]. `views` are whole frames of an [`AddrTable`], each frame's views in
+/// its order.
 pub struct BhBatch<'a> {
     views: &'a [View],
     quad: &'a [C64],
@@ -212,23 +214,30 @@ fn refs(a: &[Stack<C64>; 2]) -> [&Stack<C64>; 2] {
     [&a[0], &a[1]]
 }
 
-/// BH state across epochs: the parameters and, with one batch per epoch, the last direction.
+/// BH state across epochs: the parameters, the epoch count and, with one batch per epoch, the
+/// last direction.
 pub struct Bh {
     params: BhParams,
+    epochs: usize,
     prev: Option<[Stack<C64>; 2]>,
 }
 
 impl Bh {
     pub fn new(params: BhParams) -> Self {
         assert!(params.batch_size > 0, "batch_size must be positive");
-        Self { params, prev: None }
+        Self {
+            params,
+            epochs: 0,
+            prev: None,
+        }
     }
 
-    /// One epoch over consecutive batches of `addr`'s frames in scan order, each moving
-    /// `object` and `probe` by `α·D`. With `g` the batch's [`BhBatch::grads`] and
-    /// `Pg = [g_O, ρ²·g_P]`: `D = −Pg`, or with one batch per epoch, after the first epoch,
-    /// `D = −Pg + β·D′` with `β = H(Pg, D′) / H(D′, D′)` and `D′` the previous epoch's
-    /// direction; `α = −⟨g, D⟩ / H(D, D) · count / batch_size`.
+    /// One epoch over [`random_batches`] of `addr`'s frames, from the params' seed and this
+    /// epoch's index, each batch moving `object` and `probe` by `α·D`. With `g` the batch's
+    /// [`BhBatch::grads`] and `Pg = [g_O, ρ²·g_P]`: `D = −Pg`, or with one batch per epoch,
+    /// after the first epoch, `D = −Pg + β·D′` with `β = H(Pg, D′) / H(D′, D′)` and `D′` the
+    /// previous epoch's direction; `α = −⟨g, D⟩ / H(D, D) · count / batch_size` with `count`
+    /// the batch's frames.
     pub fn epoch(
         &mut self,
         addr: &AddrTable,
@@ -241,11 +250,17 @@ impl Bh {
         let size = self.params.batch_size.min(nframe);
         let full = size == nframe;
         let rho2 = self.params.probe_rho.powi(2) * probe.plane_len() as f64;
+        let epoch = self.epochs as u64;
+        self.epochs += 1;
         let mut steps = Vec::new();
-        for first in (0..nframe).step_by(size) {
-            let count = size.min(nframe - first);
-            let views = &addr.views()[first * nmode..(first + count) * nmode];
-            let b = BhBatch::new(views, obs, quad, object, probe);
+        for frames in random_batches(nframe, size, self.params.seed, epoch) {
+            let views: Vec<View> = frames
+                .iter()
+                .flat_map(|&f| &addr.views()[f * nmode..(f + 1) * nmode])
+                .copied()
+                .collect();
+            let count = frames.len();
+            let b = BhBatch::new(&views, obs, quad, object, probe);
             let g = b.grads();
             let mut pg = g.clone();
             pg[1].as_mut_slice().iter_mut().for_each(|c| *c *= rho2);
@@ -282,8 +297,7 @@ impl Bh {
                 self.prev = Some(dir);
             }
             steps.push(BhStep {
-                first,
-                count,
+                frames,
                 beta,
                 alpha,
                 top,

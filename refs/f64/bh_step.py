@@ -6,9 +6,10 @@ batch per epoch, steepest descent over mini-batches.
 
 The state is the one ml_grad.py reads (object [1, 76, 80], probe [2, 32, 32], 40 frames). The
 steps are pty-chi's BHReconstructor with probe rho 0.01 (refs/ptychi/run_m3.py bh_sweep, the
-runs behind DESIGN B7), positions fixed, over two epochs of unshuffled batches, in two cases:
+runs behind DESIGN B7), positions fixed, over two epochs of the engine's random_batches(40,
+size, SEED, epoch) (random_batches.py), fed to pty-chi as its batch sampler, in two cases:
 "full", method CG with one batch of all 40 frames per epoch, and "mini", method GD (steepest
-descent, no direction kept across batches) with batches of 16 (frames 0-15, 16-31, 32-39).
+descent, no direction kept across batches) with batches of 16, 16 and 8 frames.
 Written in the engine's convention (PyNX probe P, psi_m = F(P_m q O_view),
 F = FFT_ortho fftshift, corners and q as ml_grad), with the batch frames B:
 
@@ -45,9 +46,10 @@ Writes, per case C in full, mini, in the engine's convention:
     <dir>/bh_C_obj_f64.txt    `iy ix re0 im0 re1 im1`, the object change over epoch 0 and over
                               epoch 1, every pixel, row-major
     <dir>/bh_C_probe_f64.txt  `m iy ix re0 im0 re1 im1`, the probe change likewise
-    <dir>/bh_C_steps_f64.txt  `step epoch first count beta alpha top bottom`, one row per batch,
-                              beta 0 in epoch 0 and in GD, alpha after the batch-size
-                              factor, top = -<G, eta>, bottom = H(eta, eta)
+    <dir>/bh_C_steps_f64.txt  `step epoch count beta alpha top bottom f_0 .. f_count-1`, one row
+                              per batch, beta 0 in epoch 0 and in GD, alpha after the
+                              batch-size factor, top = -<G, eta>, bottom = H(eta, eta), f the
+                              batch's frames
 Printed checks, with the eps at 0: g_o and g_P against central differences of F along a random
 direction; H(eta, eta) and H(G, eta') against central differences of <G(x + h eta'), u>; the
 quadratic model -alpha top + alpha^2 bottom / 2 against the change of F; pty-chi's own steps
@@ -64,6 +66,7 @@ AX = (-2, -1)
 RHO = 0.01
 EPS = 1e-8
 EPOCHS = 2
+SEED = 7
 CASES = (("full", 40, True), ("mini", 16, False))  # name, batch size, CG
 STEPS = (1e-4, 1e-5, 1e-6)
 
@@ -80,14 +83,11 @@ def sibling(name):
 
 mg = sibling("ml_grad")
 ls = sibling("lsqml_step")
+rb = sibling("random_batches")
 
 
 def redot(a, b):
     return np.real(np.vdot(a, b))
-
-
-def batches(nframe, size):
-    return [np.arange(s, min(s + size, nframe)) for s in range(0, nframe, size)]
 
 
 class BH:
@@ -173,16 +173,17 @@ def run(m, obj, probe, size, cg):
     k = 0
     for epoch in range(EPOCHS):
         o0, p0 = obj, probe
-        for idx in batches(len(m.corners), size):
+        for idx in rb.random_batches(len(m.corners), size, SEED, epoch):
             s = bh.step(obj, probe, idx, cg and epoch > 0, size)
-            s.update(obj=obj, probe=probe, idx=idx)
+            s.update(obj=obj, probe=probe, idx=idx, epoch=epoch)
             steps.append(s)
-            rows.append([k, epoch, idx[0], len(idx), s["beta"], s["alpha"], s["top"],
-                         s["bottom"]])
+            rows.append(f"{k} {epoch} {len(idx)} "
+                        + " ".join(f"{s[x]:.17e}" for x in ("beta", "alpha", "top", "bottom"))
+                        + " " + " ".join(str(f) for f in idx))
             obj, probe = obj + s["d_obj"], probe + s["d_probe"]
             k += 1
         changes.append((obj - o0, probe - p0))
-    return np.array(rows), changes, steps
+    return rows, changes, steps
 
 
 def check(m, obj, probe, idx, rng):
@@ -232,9 +233,9 @@ def check_hess(m, bh, step, obj, probe):
 
 
 def ptychi_run(m, iobs, wavelength, obj, probe, size, cg):
-    """pty-chi BHReconstructor (method CG or GD) in f64 on CPU over EPOCHS epochs of unshuffled
-    batches, mapped as in ptyrs-engine/scripts/compare_ptychi_rpie.py; per batch beta, alpha and the
-    object and probe changes in the engine's convention."""
+    """pty-chi BHReconstructor (method CG or GD) in f64 on CPU over EPOCHS epochs of the
+    engine's batches, mapped as in ptyrs-engine/scripts/compare_ptychi_rpie.py; per batch beta,
+    alpha and the object and probe changes in the engine's convention."""
     from torch.utils.data import DataLoader
     import ptychi.api as api
     from ptychi.api.task import PtychographyTask
@@ -273,7 +274,8 @@ def ptychi_run(m, iobs, wavelength, obj, probe, size, cg):
         probe_position_x_px=m.corners[:, 1].astype(np.float64),
     )
     rec = task.reconstructor
-    rec.dataloader = DataLoader(rec.dataset, batch_size=size, shuffle=False)
+    rec.dataloader = DataLoader(rec.dataset,
+                                batch_sampler=rb.Sampler(len(m.corners), size, SEED))
     out = []
     cls = type(rec)
 
@@ -336,20 +338,20 @@ def main():
     rng = np.random.default_rng(0)
     for name, size, cg in CASES:
         print(f"--- {name}: batch {size}, method {'CG' if cg else 'GD'}, {EPOCHS} epochs")
-        check(m, obj, probe, batches(nframe, size)[0], rng)
+        check(m, obj, probe, rb.random_batches(nframe, size, SEED, 0)[0], rng)
         rows, changes, steps = run(m, obj, probe, size, cg)
         print("  H vs central differences of <G(x + h eta'), u> (eps 0), rel diff:")
         for k, s in enumerate(steps):
             print(f"   step {k}:")
             check_hess(m, BH(m), s, s["obj"], s["probe"])
-        print("  step  epoch  frames   beta          alpha         top           bottom"
+        print("  step  epoch  count  beta          alpha         top           bottom"
               "        F before -> after (batch)")
-        for s, row in zip(steps, rows):
-            k, epoch, first, count = (int(x) for x in row[:4])
+        for k, s in enumerate(steps):
             f0 = loss(m, s["obj"], s["probe"], s["idx"])
             f1 = loss(m, s["obj"] + s["d_obj"], s["probe"] + s["d_probe"], s["idx"])
-            print(f"  {k:4d} {epoch:5d}  {first:2d}+{count:<3d} {row[4]: .6e} {row[5]: .6e} "
-                  f"{row[6]: .6e} {row[7]: .6e}  {f0:.6e} -> {f1:.6e}")
+            print(f"  {k:4d} {s['epoch']:5d}  {len(s['idx']):5d} {s['beta']: .6e} "
+                  f"{s['alpha']: .6e} {s['top']: .6e} {s['bottom']: .6e}  "
+                  f"{f0:.6e} -> {f1:.6e}")
         ratio = []
         for s in steps:
             df = (loss(m, s["obj"] + s["d_obj"], s["probe"] + s["d_probe"], s["idx"])
@@ -369,9 +371,9 @@ def main():
         assert len(pc) == len(steps), (len(pc), len(steps))
         print("  pty-chi BH f64 vs numpy, per step (max, L2) / rel:")
         for k, (p, s) in enumerate(zip(pc, steps)):
-            assert (p["idx"] == s["idx"]).all() and p["epoch"] == rows[k][1]
-            rb = abs(p["beta"] - s["beta"]) / abs(s["beta"]) if s["beta"] else abs(p["beta"])
-            print(f"    step {k}: beta {rb:.3e}  alpha "
+            assert (p["idx"] == s["idx"]).all() and p["epoch"] == s["epoch"]
+            db = abs(p["beta"] - s["beta"]) / abs(s["beta"]) if s["beta"] else abs(p["beta"])
+            print(f"    step {k}: beta {db:.3e}  alpha "
                   f"{abs(p['alpha'] - s['alpha']) / abs(s['alpha']):.3e}  "
                   "object %.3e %.3e" % mg.rel(p["d_obj"], s["d_obj"])
                   + "  probe %.3e %.3e" % mg.rel(p["d_probe"], s["d_probe"]))
@@ -386,11 +388,13 @@ def main():
 
         for kind, (data, fmt) in (
                 ("obj", rows_obj([c[0] for c in changes])),
-                ("probe", rows_probe([c[1] for c in changes])),
-                ("steps", (rows, ["%d"] * 4 + ["%.17e"] * 4))):
+                ("probe", rows_probe([c[1] for c in changes]))):
             path = f"{d}/bh_{name}_{kind}_f64.txt"
             np.savetxt(path, data, fmt=fmt)
             print(f"  wrote {path} ({len(data)} rows)")
+        path = f"{d}/bh_{name}_steps_f64.txt"
+        pathlib.Path(path).write_text("".join(r + "\n" for r in rows))
+        print(f"  wrote {path} ({len(rows)} rows)")
 
 
 if __name__ == "__main__":
