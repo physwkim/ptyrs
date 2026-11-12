@@ -206,6 +206,12 @@ impl Ptycho {
         &self.obs
     }
 
+    /// The far-field quadratic phase [`quad_phase`] of the scan's geometry, which every exit
+    /// wave carries.
+    pub fn quad(&self) -> &[C64] {
+        &self.quad
+    }
+
     /// LLK records in the order they were taken.
     pub fn history(&self) -> &[LlkRecord] {
         &self.history
