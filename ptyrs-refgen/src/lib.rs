@@ -403,9 +403,11 @@ pub fn generate(spec: &Spec) -> Result<Generated, RefgenError> {
             }
             modes[0] = &varied;
         }
-        let oy = view_corner(obj_shape[0], ny, truth_pp.y[f] / pixel[0]);
+        // `obj_shape` was sized over these same windows, fly offsets included.
+        let corner = |obj, n, d| view_corner(obj, n, d).expect("object covers every true window");
+        let oy = corner(obj_shape[0], ny, truth_pp.y[f] / pixel[0]);
         for &d in &spec.fly_px {
-            let ox = view_corner(obj_shape[1], nx, truth_pp.x[f] / pixel[1] + d as f64);
+            let ox = corner(obj_shape[1], nx, truth_pp.x[f] / pixel[1] + d as f64);
             far.accumulate(&modes, object.plane(0), obj_shape[1], [oy, ox], w, out);
         }
     }
