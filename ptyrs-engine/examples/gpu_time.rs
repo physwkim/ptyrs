@@ -1,15 +1,13 @@
 //! Per-cycle time of [`GpuPtycho`] on CUDA device 0, the M1 baseline for M2.
 //!
-//! `cargo run --release -p ptyrs-engine --example gpu_time -- <dm|ap|rpie> [ncycle] [nprobe] [frame] [npos] [step] [sizes] [graph|eager] [calc_llk] [fused|m1] [tile|simt]`
-//! (defaults 50, 2, 256, 400, 16 object pixels, `16`, `graph`, 0, `fused`, `tile`) builds the
+//! `cargo run --release -p ptyrs-engine --example gpu_time -- <dm|ap|rpie> [ncycle] [nprobe] [frame] [npos] [step] [sizes] [graph|eager] [calc_llk] [fused|m1]`
+//! (defaults 50, 2, 256, 400, 16 object pixels, `16`, `graph`, 0, `fused`) builds the
 //! `llk_trace` scan, and for each comma-separated size (frames per stack; rPIE frames per
 //! batch) runs 5 untimed cycles, then times `ncycle` cycles without phase-ramp removal, with
 //! an LLK record every `calc_llk` cycles (0: none, as `scripts/compare_pynx.py --time` times
 //! PyNX). `graph` replays steady-state AP and DM cycles, rPIE epochs and LLK passes from the
 //! graphs the untimed cycles captured ([`GpuOptions::graph`]); `fused` runs AP and DM stacks
-//! and the LLK pass by the fused passes, `m1` by M1's launches ([`GpuOptions::fused`]);
-//! `tile` runs the probe update by Tile kernels, `simt` by SIMT ones
-//! ([`GpuOptions::tile_probe_update`]).
+//! and the LLK pass by the fused passes, `m1` by M1's launches ([`GpuOptions::fused`]).
 
 use std::time::Instant;
 
@@ -22,7 +20,7 @@ mod common;
 const WARMUP: usize = 5;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let usage = "usage: gpu_time <dm|ap|rpie> [ncycle] [nprobe] [frame] [npos] [step] [sizes] [graph|eager] [calc_llk] [fused|m1] [tile|simt]";
+    let usage = "usage: gpu_time <dm|ap|rpie> [ncycle] [nprobe] [frame] [npos] [step] [sizes] [graph|eager] [calc_llk] [fused|m1]";
     let mut args = std::env::args().skip(1);
     let algo = args.next().ok_or(usage)?;
     if !["dm", "ap", "rpie"].contains(&algo.as_str()) {
@@ -45,11 +43,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let fused = match args.next().as_deref() {
         None | Some("fused") => true,
         Some("m1") => false,
-        Some(_) => return Err(usage.into()),
-    };
-    let tile_probe_update = match args.next().as_deref() {
-        None | Some("tile") => true,
-        Some("simt") => false,
         Some(_) => return Err(usage.into()),
     };
 
@@ -80,7 +73,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             stack_size,
             graph,
             fused,
-            tile_probe_update,
             ..GpuOptions::default()
         };
         let mut g = GpuPtycho::new(&ctx, &scan, object.clone(), probe.clone(), options)?;
@@ -104,9 +96,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let ms = 1e3 * t.elapsed().as_secs_f64() / ncycle as f64;
         let mode = if graph { "graph" } else { "eager" };
         let passes = if fused { "fused" } else { "m1" };
-        let probe_update = if tile_probe_update { "tile" } else { "simt" };
         println!(
-            "{algo} size {size} {mode} {passes} {probe_update} calc_llk {calc_llk}: {ms:.3} ms/cycle over {ncycle} cycles, {} LLK records",
+            "{algo} size {size} {mode} {passes} calc_llk {calc_llk}: {ms:.3} ms/cycle over {ncycle} cycles, {} LLK records",
             g.history().len()
         );
     }
