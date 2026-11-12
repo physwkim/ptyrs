@@ -32,7 +32,6 @@ const M1: Setup = Setup {
         graph: true,
         llk_slots: 3,
         fused: false,
-        tile_probe_update: true,
     },
 };
 
@@ -342,65 +341,4 @@ fn graph_like_eager(setup: Setup) {
     assert!(eager.2 == graph.2, "{setup:?}: LLK records differ");
     assert!(eager.0 == graph.0, "{setup:?}: object differs");
     assert!(eager.1 == graph.1, "{setup:?}: probe differs");
-}
-
-/// The Tile probe update ([`GpuOptions::tile_probe_update`]) gives the SIMT update's bits:
-/// the object, the probe and every LLK record of a DM call and of AP calls updating the
-/// object, the probe or both, replayed from graphs and run eagerly.
-#[test]
-fn tile_probe_update_matches_simt_bitwise() {
-    for setup in [M1, FUSED] {
-        let (scan, object, probe) = start(setup.frame, 2, true);
-        let run = |tile_probe_update: bool, graph: bool| {
-            let options = GpuOptions {
-                tile_probe_update,
-                graph,
-                ..setup.options
-            };
-            let mut g =
-                GpuPtycho::new(&ctx(), &scan, object.clone(), probe.clone(), options).unwrap();
-            let dm = DmParams {
-                calc_llk: 2,
-                zero_phase_ramp: false,
-                ..DmParams::default()
-            };
-            g.dm(&dm, 5).unwrap();
-            for (obj_inertia, probe_inertia) in UPDATES {
-                let ap = ApParams {
-                    obj_inertia,
-                    probe_inertia,
-                    calc_llk: 2,
-                    zero_phase_ramp: false,
-                };
-                g.ap(&ap, 4).unwrap();
-            }
-            let bits = |s: &Stack<C64>| -> Vec<[u64; 2]> {
-                s.as_slice()
-                    .iter()
-                    .map(|v| [v.re.to_bits(), v.im.to_bits()])
-                    .collect()
-            };
-            let llk: Vec<_> = g
-                .history()
-                .iter()
-                .map(|r| {
-                    let l = r.llk;
-                    [l.poisson, l.gaussian, l.euclidian, l.nb_photons_calc].map(f64::to_bits)
-                })
-                .collect();
-            (bits(&g.object().unwrap()), bits(&g.probe().unwrap()), llk)
-        };
-        let simt = run(false, true);
-        // cycles 0, 2 and the last of each call
-        assert_eq!(simt.2.len(), 3 + 3 * 3);
-        for graph in [true, false] {
-            let tile = run(true, graph);
-            assert!(
-                tile.2 == simt.2,
-                "{setup:?} graph {graph}: LLK records differ"
-            );
-            assert!(tile.0 == simt.0, "{setup:?} graph {graph}: object differs");
-            assert!(tile.1 == simt.1, "{setup:?} graph {graph}: probe differs");
-        }
-    }
 }
