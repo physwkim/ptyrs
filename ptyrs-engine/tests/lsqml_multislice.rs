@@ -1,11 +1,12 @@
 //! Poisson LSQML through pty-chi's multislice object against `refs/f64/lsqml_multislice.py`,
 //! which generates the state and runs pty-chi on it, writing `lsqml_multislice_*_f64.txt`,
 //! saved to `tests/data`. Three slices with unequal gaps; the cases share the start and the
-//! corners and differ in the exit propagator (0 angular spectrum, 1 Fresnel transform) and the
-//! counts. pty-chi runs with `multislice_solve_obj_prb_step_size_jointly`, the step-size rule of
+//! corners and differ in the exit propagator (0 angular spectrum, 1 Fresnel transform, 2 the
+//! far field of [`Optics::far_field`], whose `q` multiplies the last slice) and the counts.
+//! pty-chi runs with `multislice_solve_obj_prb_step_size_jointly`, the step-size rule of
 //! [`LsqmlBatch::step_sizes`]. Every frame sits at a whole-pixel corner.
 
-use ptyrs_core::{AddrTable, C64, Counts, Object, Positions, Probe, Stack, View};
+use ptyrs_core::{AddrTable, C64, Counts, Geometry, Object, Positions, Probe, Stack, View};
 use ptyrs_engine::{
     Cost, Lsqml, LsqmlBatch, LsqmlParams, LsqmlStep, Observed, Optics, ProbeVariation, Propagator,
     SliceWaves, Wavefield, illumination, llk, shift,
@@ -90,14 +91,22 @@ fn state() -> State {
     let cases = table(include_str!("data/lsqml_multislice_cases_f64.txt"))
         .iter()
         .map(|c| {
-            let pixel = [c[2], c[2]];
+            // kind 0 is the far field at detector distance c[3], detector pixel λz/(ny·c[2])
+            let (optics, pixel) = if c[4] == 0.0 {
+                let lz = c[1] * c[3];
+                let g = Geometry::new(c[1], c[3], lz / (SHAPE[0] as f64 * c[2]), SHAPE).unwrap();
+                (Optics::far_field(&g), g.pixel_size_object())
+            } else {
+                let pixel = [c[2], c[2]];
+                let w = Wavefield::new(SHAPE, c[1], pixel, c[3]).unwrap();
+                (Optics::free_space(&w), pixel)
+            };
             let gaps: Vec<_> = c[7..]
                 .iter()
                 .map(|&d| Wavefield::new(SHAPE, c[1], pixel, d).unwrap())
                 .collect();
             assert_eq!(gaps.len(), NSLICE - 1);
-            let w = Wavefield::new(SHAPE, c[1], pixel, c[3]).unwrap();
-            let optics = Optics::free_space(&w).with_slices(&gaps).unwrap();
+            let optics = optics.with_slices(&gaps).unwrap();
             let p = optics.propagator();
             let kind = match p {
                 Propagator::Fourier(_) => 0,
@@ -226,6 +235,12 @@ fn moved(x: &Stack<C64>, t: f64, d: &Stack<C64>) -> Stack<C64> {
     Stack::from_vec(x.dims(), data).unwrap()
 }
 
+/// `f'(0)` by the five-point central stencil. The far-field case's slice-0 cost has a curvature
+/// that keeps the three-point stencil above 1e-7 at every step.
+fn slope(f: impl Fn(f64) -> f64, h: f64) -> f64 {
+    (8.0 * (f(h) - f(-h)) - (f(2.0 * h) - f(-2.0 * h))) / (12.0 * h)
+}
+
 /// Every slice's `−2·obj_directions` and `−2·BATCH·probe_direction` against central
 /// differences of [`weighted_cost`] with `w` the batch's `a_far`, every case.
 #[test]
@@ -239,7 +254,7 @@ fn directions_match_central_differences() {
         seed: 0,
     });
     let views = &s.addr.views()[..BATCH * s.addr.nmode()];
-    let h = 1e-5;
+    let h = 1e-3;
     for (k, c) in s.cases.iter().enumerate() {
         let b = LsqmlBatch::new(&run, views, &c.obs, &c.optics, os, pr, &none);
         let w = b.a_far().to_vec();
@@ -253,7 +268,7 @@ fn directions_match_central_differences() {
                 os[i] = Object::new(moved(&os[i], t, &d_o));
                 f(&os, pr)
             };
-            let e = rel(dot(&g_o, &d_o), (at(h) - at(-h)) / (2.0 * h));
+            let e = rel(dot(&g_o, &d_o), slope(at, h));
             eprintln!("case {k} slice {i}: {e:.3e}");
             assert!(e < 1e-7, "case {k} slice {i}: {e:.3e}");
         }
@@ -263,8 +278,7 @@ fn directions_match_central_differences() {
             .iter_mut()
             .for_each(|v| *v *= -2.0 * count);
         let d_p = direction(pr, &mut seed);
-        let fp = (f(os, &Probe::new(moved(pr, h, &d_p))) - f(os, &Probe::new(moved(pr, -h, &d_p))))
-            / (2.0 * h);
+        let fp = slope(|t| f(os, &Probe::new(moved(pr, t, &d_p))), h);
         let e = rel(dot(&g_p, &d_p), fp);
         eprintln!("case {k} probe: {e:.3e}");
         assert!(e < 1e-7, "case {k} probe: {e:.3e}");

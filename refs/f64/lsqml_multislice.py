@@ -10,6 +10,15 @@ The last slice's wave leaves through the case's free-space propagator. The count
 truth's Poisson counts through that model, natural layout. The start is every slice ones and
 the truth probe plus a smooth complex perturbation.
 
+The far-field case is the engine's Optics::far_field: the last slice's wave times PyNX's
+object-plane phase q (ops::quad_phase) through pty-chi's FourierPropagator. pty-chi has no q,
+and with several slices q cannot move into the probe as it does for one, so the script swaps
+pty-chi's free-space propagator for FourierPropagator behind q (QuadFourier). Its geometry is
+the ptyrs Geometry (wavelength, distance, detector pixel wavelength distance / (24 pixel)),
+whose pixel_size_object is the pixel of q and of the gaps; pty-chi reads the data with
+fft_shift True and its far field is in corner layout, the counts and y_pred are written
+natural.
+
 The in-object propagator has intensity scale 1, so pty-chi's waves are the engine's over
 sqrt(k) at every slice, k the exit propagator's scale, as in lsqml_near.py. pty-chi runs with
 multislice_solve_obj_prb_step_size_jointly True: the joint object/probe step sizes at slice 0,
@@ -17,7 +26,8 @@ the object-only Eq. 23b at the others, every object step size over NSLICE * NMOD
 
 Writes, every complex value `re im`, every plane row-major:
     <dir>/lsqml_multislice_cases_f64.txt    `case wavelength pixel distance kind scale
-                                            truth_llk` and SPACINGS
+                                            truth_llk` and SPACINGS, kind 0 (Fourier) the
+                                            far field with distance the detector's
     <dir>/lsqml_multislice_corners_f64.txt  `frame cy cx`
     <dir>/lsqml_multislice_obj_f64.txt      `slice iy ix re im`, the start object
     <dir>/lsqml_multislice_probe_f64.txt    `m iy ix re im`, the start probe
@@ -49,8 +59,10 @@ BATCH = 8
 BATCH_SEED = 7
 EPOCHS = 30
 ICALC_FRAMES = 4
-# (wavelength, pixel, distance) of the exit propagation: angular spectrum, Fresnel transform.
-GEOMETRIES = [(1e-10, 50e-9, 5e-4), (1e-10, 50e-9, 2e-3)]
+# (wavelength, pixel, distance) of the exit propagation: angular spectrum, Fresnel transform,
+# far field (FarGeometry).
+GEOMETRIES = [(1e-10, 50e-9, 5e-4), (1e-10, 50e-9, 2e-3), (1e-10, 50e-9, 5e-3)]
+FAR = 2
 
 
 def sibling(name):
@@ -67,7 +79,7 @@ near = sibling("lsqml_near")
 ls = near.ls
 rb = near.rb
 pp = near.pp
-SHAPE, OBJ, NMODE, GRID = near.SHAPE, near.OBJ, near.NMODE, near.GRID
+SHAPE, OBJ, NMODE, GRID, AX = near.SHAPE, near.OBJ, near.NMODE, near.GRID, near.AX
 
 
 def make_state():
@@ -87,13 +99,18 @@ def make_state():
     return obj, probe, probe + shift, corners, rng
 
 
-class Geometry(near.Geometry):
-    """lsqml_near.Geometry with pty-chi's in-object propagator over each gap."""
+class Slices:
+    """pty-chi's in-object propagator over each gap at `self.pixel`."""
 
-    def __init__(self, wavelength, pixel, distance):
-        super().__init__(wavelength, pixel, distance)
-        self.gaps = [pp.AngularSpectrumPropagator(pp.params(SHAPE, wavelength, pixel, pixel, d))
-                     for d in SPACINGS]
+    far = False
+
+    def build_gaps(self):
+        self.gaps = [pp.AngularSpectrumPropagator(
+            pp.params(SHAPE, self.wavelength, self.pixel, self.pixel, d)) for d in SPACINGS]
+
+    def natural(self, y):
+        """pty-chi's far field (y_pred) in natural layout."""
+        return np.fft.fftshift(y, axes=AX) if self.far else y
 
     def through(self, slices, probe, corners):
         """The exit waves [frame, mode] of the probe through the slices' windows."""
@@ -103,6 +120,77 @@ class Geometry(near.Geometry):
             if s < NSLICE - 1:
                 psi = self.gaps[s].propagate_forward(self.torch.from_numpy(psi)).numpy()
         return psi
+
+    def install(self, rec):
+        """Fit pty-chi's reconstructor to this exit propagator."""
+
+
+class Geometry(Slices, near.Geometry):
+    """lsqml_near.Geometry through the slices."""
+
+    def __init__(self, wavelength, pixel, distance):
+        near.Geometry.__init__(self, wavelength, pixel, distance)
+        self.ptychi_distance = distance
+        self.build_gaps()
+
+
+def quad_fourier():
+    """pty-chi's FourierPropagator behind q, defined once ptychi is importable."""
+    from ptychi.propagate import FourierPropagator
+
+    class QuadFourier(FourierPropagator):
+        """FourierPropagator of q x; propagate_backward stays its inverse."""
+
+        def __init__(self, q):
+            super().__init__()
+            self.register_buffer("_q", q)
+
+        def propagate_forward(self, wavefield):
+            return super().propagate_forward(wavefield * self._q)
+
+        def propagate_backward(self, wavefield):
+            return super().propagate_backward(wavefield) * self._q.conj()
+
+    return QuadFourier
+
+
+class FarGeometry(Slices):
+    """ptyrs Optics::far_field: q (ops::quad_phase) on the exit wave, then pty-chi's unnormalised
+    FFT, k = ny nx. `pixel` sets the detector pixel; the gaps and q use pixel_size_object."""
+
+    far = True
+    kind = 0
+
+    def __init__(self, wavelength, pixel, distance):
+        import torch
+        self.torch = torch
+        ny, nx = SHAPE
+        lz = wavelength * distance
+        detector = lz / (ny * pixel)
+        py, px = lz / (ny * detector), lz / (nx * detector)
+        assert py == px
+        self.wavelength, self.pixel, self.distance = wavelength, px, distance
+        self.ptychi_distance = np.inf
+        f = np.pi / lz
+        dy = (np.arange(ny) - ny // 2)[:, None].astype(np.float64)
+        dx = (np.arange(nx) - nx // 2)[None, :].astype(np.float64)
+        t = f * (dx * dx * px * px + dy * dy * py * py)
+        self.q = np.cos(t) + 1j * np.sin(t)
+        self.prop = quad_fourier()(torch.from_numpy(self.q))
+        self.k = float(pp.get_intensity_scaling_factor(self.prop, SHAPE))
+        assert self.k == ny * nx
+        self.build_gaps()
+
+    def fwd(self, x):
+        """U x, natural layout."""
+        y = self.prop.propagate_forward(self.torch.from_numpy(x)).numpy()
+        return np.fft.fftshift(y, axes=AX) / np.sqrt(self.k)
+
+    def install(self, rec):
+        # The script's patch to pty-chi: the far field behind the engine's q.
+        fm = rec.forward_model
+        fm.build_free_space_propagator = lambda: setattr(fm, "free_space_propagator", self.prop)
+        fm.build_free_space_propagator()
 
 
 def icalc(g, slices, probe, corners):
@@ -124,8 +212,8 @@ def task(g, obj, probe, corners, counts, batch, epochs):
     ny, nx = SHAPE
     opts = api.LSQMLOptions()
     opts.data_options.wavelength_m = g.wavelength
-    opts.data_options.fft_shift = False
-    opts.data_options.free_space_propagation_distance_m = g.distance
+    opts.data_options.fft_shift = g.far
+    opts.data_options.free_space_propagation_distance_m = g.ptychi_distance
     o = opts.object_options
     o.optimizable = True
     o.pixel_size_m = g.pixel
@@ -151,7 +239,7 @@ def task(g, obj, probe, corners, counts, batch, epochs):
     r.default_dtype = api.Dtypes.FLOAT64
     r.default_device = api.Devices.CPU
     r.allow_nondeterministic_algorithms = False
-    return PtychographyTask(
+    t = PtychographyTask(
         opts,
         diffraction_data=counts.copy(),
         object_data=obj.copy(),
@@ -159,6 +247,8 @@ def task(g, obj, probe, corners, counts, batch, epochs):
         probe_position_y_px=corners[:, 0].astype(np.float64),
         probe_position_x_px=corners[:, 1].astype(np.float64),
     )
+    g.install(t.reconstructor)
+    return t
 
 
 def state_of(t, g):
@@ -183,7 +273,7 @@ def ptychi_step(g, obj, probe, corners, counts):
             pg.probe, pg.probe_positions, use_all_modes=True)
         batch = next(iter(DataLoader(rec.dataset, batch_size=BATCH, shuffle=False)))
         input_data, y_true = rec.prepare_batch_data(batch)
-        y_pred = rec.forward_model(*input_data).numpy().copy()
+        y_pred = g.natural(rec.forward_model(*input_data).numpy().copy())
         rec.run_minibatch(input_data, y_true)
     idx = input_data[0].numpy()
     buf = rec.reconstructor_buffers
@@ -258,7 +348,7 @@ def main():
     f = "%.17e"
     steps_fmt = ["%d"] + [f] * (NSLICE + 2)
     for case, geom in enumerate(GEOMETRIES):
-        g = Geometry(*geom)
+        g = (FarGeometry if case == FAR else Geometry)(*geom)
         counts = rng.poisson(icalc(g, truth_obj, truth_probe, corners)).astype(np.float64)
         assert counts.max() < 65535, counts.max()
         truth_llk = llk(g, truth_obj, truth_probe, corners, counts)
