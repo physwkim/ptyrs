@@ -1,16 +1,17 @@
 //! M6: time per graph-replayed AP epoch with each Tile candidate in its SIMT or Tile form, on
 //! the M1 timing scan (`ptyrs-engine` example `gpu_time ap`: 400 frames of 256x256 on a
 //! Fermat spiral of step 16 pixels, 2 probe modes, stacks of 16), with its views and object.
-//! An epoch is the engine's steady AP cycle: per stack, exit waves, FFT, amplitude
-//! projection, inverse FFT and both update sums from the old arrays; then the object
-//! (inertia 0.01) and probe (0.001) updates.
-//! With `llk`, each stack also takes the LLK partials of its forward stack and every epoch
+//! An epoch is the fused AP cycle of `ptyrs-gpu`'s `fused_time`: per stack, `fused_project`
+//! (exit waves, in-kernel FFTs, amplitude projection) and both update sums of its projected
+//! waves from the old arrays; then the object (inertia 0.01) and probe (0.001) updates.
+//! With `llk`, each `fused_project` also writes its stack's LLK partials and every epoch
 //! ends with the totals on the host: Tile `llk_sums` in the graph and a copy of its 4 f64,
 //! or SIMT's copy of the partials and `LlkSums::from_partials`.
 //!
-//! A variant spells psi_to_obj, psi_to_probe, the object update, the probe update (and with
-//! `llk` the totals) as `s` (ptyrs-gpu) or `t` (ptyrs-tile); the default is every steady
-//! combination, or `sssss,sssst,tttts,ttttt` with `llk`. All graphs are captured before any
+//! A variant spells the object sums, the probe sums, the object update, the probe update
+//! (and with `llk` the totals) as `s` (ptyrs-gpu) or `t` (ptyrs-tile); the default is every
+//! steady combination, or `sssss,sssst,tttts,ttttt` with `llk`. SIMT object sums are
+//! `fused_project`'s own; Tile ones are `psi_to_obj` after a `fused_project` without them. All graphs are captured before any
 //! replay. One epoch of each from the same start is checked against a direct all-SIMT epoch.
 //! Each round then replays every variant `epochs` times from that start, in an order rotated
 //! per round; its time per epoch is the wall time of the replays, launched back to back with
@@ -29,8 +30,8 @@ use ptyrs_core::sim::fermat;
 use ptyrs_core::{AddrTable, Geometry, Positions, required_obj_shape};
 use ptyrs_fft::Plan2d;
 use ptyrs_gpu::{
-    C32, Error, Kernels, LlkPartial, LlkSums, StackTable, UpdateSums, ViewAddr, ViewDims, Views,
-    record,
+    C32, Error, Exit, FusedBufs, FusedInputs, Kernels, LlkPartial, LlkSums, StackTable, UpdateSums,
+    ViewAddr, ViewDims, Views, record,
 };
 use ptyrs_tile::{TileKernels, llk_sums_scratch_len};
 
@@ -41,7 +42,7 @@ const STACK: u32 = 16;
 const OBJ_INERTIA: f32 = 0.01;
 const PROBE_INERTIA: f32 = 0.001;
 
-/// Which form runs each Tile candidate, `true` for Tile: psi_to_obj, psi_to_probe, the
+/// Which form runs each Tile candidate, `true` for Tile: the object sums, psi_to_probe, the
 /// object update, the probe update, the LLK totals.
 #[derive(Clone, Copy, PartialEq)]
 struct Variant([bool; 5]);
@@ -169,9 +170,8 @@ struct Scan<'a> {
 struct State {
     obj: DeviceBuffer<C32>,
     probe: DeviceBuffer<C32>,
-    /// One exit-wave stack per stack, as the engine keeps them.
-    psi: Vec<DeviceBuffer<C32>>,
-    plan: Plan2d,
+    /// The fused passes' scratch, one set for every stack in turn.
+    bufs: FusedBufs,
     obj_sums: UpdateSums,
     probe_sums: UpdateSums,
     /// The scan's LLK partials; `stack_partials[s]` is stack `s`'s slice of it.
@@ -188,26 +188,29 @@ fn epoch(
     v: Variant,
     llk: bool,
 ) -> Result<(), Error> {
-    let (k, tk, views, d) = (scan.k, scan.tk, scan.views, scan.views.dims());
+    let (k, tk, views) = (scan.k, scan.tk, scan.views);
     let [obj_t, probe_t, obj_up_t, probe_up_t, llk_t] = v.0;
-    for (i, psi) in s.psi.iter_mut().enumerate() {
+    for (i, partials) in s.stack_partials.iter_mut().enumerate() {
         let stack = scan.table.at(i);
-        k.obj_probe_to_psi(ctx, views, stack, &s.obj, &s.probe, psi)?;
-        s.plan.forward_inplace(ctx, psi)?;
-        if llk {
-            k.llk(ctx, d, stack, scan.counts, psi, &mut s.stack_partials[i])?;
-        }
-        k.apply_amplitude(ctx, d, stack, scan.counts, psi)?;
-        s.plan.inverse_inplace(ctx, psi)?;
+        let inputs = FusedInputs {
+            views,
+            counts: scan.counts,
+            obj: &s.obj,
+            probe: &s.probe,
+        };
+        let exit = Exit::Ap {
+            llk: llk.then_some(partials),
+        };
+        let sums = (!obj_t).then_some(&mut s.obj_sums);
+        k.fused_project(ctx, &inputs, stack, exit, &mut s.bufs, sums)?;
+        let work = s.bufs.work();
         if obj_t {
-            tk.psi_to_obj(ctx, stack, psi, &s.probe, &mut s.obj_sums)?;
-        } else {
-            k.psi_to_obj(ctx, views, stack, psi, &s.probe, &mut s.obj_sums)?;
+            tk.psi_to_obj(ctx, stack, work, &s.probe, &mut s.obj_sums)?;
         }
         if probe_t {
-            tk.psi_to_probe(ctx, stack, psi, &s.obj, &mut s.probe_sums)?;
+            tk.psi_to_probe(ctx, stack, work, &s.obj, &mut s.probe_sums)?;
         } else {
-            k.psi_to_probe(ctx, views, stack, psi, &s.obj, &mut s.probe_sums)?;
+            k.psi_to_probe(ctx, views, stack, work, &s.obj, &mut s.probe_sums)?;
         }
     }
     if obj_up_t {
@@ -327,7 +330,7 @@ fn main() {
         .collect();
     assert!(
         d.nframe.is_multiple_of(STACK),
-        "stacks of one length share one plan"
+        "every stack's LLK partials are a slice of STACK records"
     );
     let table = StackTable::new(&stream, &d, &ranges).unwrap();
     let tk = TileKernels::new(&stream, &views, &table).unwrap();
@@ -341,7 +344,6 @@ fn main() {
         probe_len: probe_len as u32,
     };
 
-    let stack_len = (STACK * d.nmode) as usize * n2;
     let partials = DeviceBuffer::<LlkPartial>::zeroed(&stream, d.nframe as usize).unwrap();
     let rec = size_of::<LlkPartial>();
     let stack_partials = ranges
@@ -361,10 +363,7 @@ fn main() {
     let mut s = State {
         obj: up(&obj0),
         probe: up(&probe0),
-        psi: (0..ranges.len())
-            .map(|_| DeviceBuffer::zeroed(&stream, stack_len).unwrap())
-            .collect(),
-        plan: Plan2d::new(&stream, N as usize, (STACK * d.nmode) as usize).unwrap(),
+        bufs: FusedBufs::new(&stream, &d, table.nf_max()).unwrap(),
         obj_sums: UpdateSums::zeroed(&stream, obj_len).unwrap(),
         probe_sums: UpdateSums::zeroed(&stream, probe_len).unwrap(),
         partials,
