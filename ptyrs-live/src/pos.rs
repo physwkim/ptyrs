@@ -1,5 +1,5 @@
 //! Scan positions keyed by uniqueId, written by the position monitor and
-//! read by the frame workers.
+//! read by the uploader, which lands each frame once its position is in.
 
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 

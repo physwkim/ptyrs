@@ -30,18 +30,18 @@ pub fn splitmix64(mut z: u64) -> u64 {
 }
 
 #[inline]
-fn hash3(seed: u64, a: u64, b: u64) -> u64 {
+pub(crate) fn hash3(seed: u64, a: u64, b: u64) -> u64 {
     splitmix64(seed ^ splitmix64(a ^ splitmix64(b ^ 0xD1B5_4A32_D192_ED03)))
 }
 
 /// Uniform in `(0, 1]`.
 #[inline]
-fn unit(h: u64) -> f64 {
+pub(crate) fn unit(h: u64) -> f64 {
     ((h >> 11) + 1) as f64 * (1.0 / (1u64 << 53) as f64)
 }
 
 #[inline]
-fn poisson(lambda: f64, h: u64) -> u32 {
+pub(crate) fn poisson(lambda: f64, h: u64) -> u32 {
     if lambda <= 0.0 {
         return 0;
     }
@@ -71,13 +71,27 @@ pub fn position(uid: i32) -> (f64, f64) {
     (x, y)
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct Synth {
     pub width: usize,
     pub height: usize,
     pub seed: u64,
     pub flux: f64,
     pub pool: usize,
+}
+
+impl Default for Synth {
+    /// An Eiger 1M frame.
+    fn default() -> Self {
+        Self {
+            width: 1028,
+            height: 1062,
+            seed: 1,
+            flux: 1.0,
+            pool: 64,
+        }
+    }
 }
 
 /// `[x0, x0 + w) x [y0, y0 + h)` in frame pixels.
@@ -96,10 +110,6 @@ pub struct SynthScratch {
 }
 
 impl Synth {
-    pub fn centre(&self) -> (usize, usize) {
-        (self.width / 2, self.height / 2)
-    }
-
     /// Pool frame `uid` is published with.
     pub fn pool_index(&self, uid: i32) -> u64 {
         uid.rem_euclid(self.pool as i32) as u64

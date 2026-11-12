@@ -8,9 +8,21 @@ edition.workspace = true
 epics-pva-rs = { path = "/home/stevek/work/epics-rs/crates/epics-pva-rs" }
 cuda-core = { workspace = true }
 cuda-bindings = { workspace = true }
+cuda-async = { workspace = true }
+ptyrs-gpu = { path = "../ptyrs-gpu" }
+ptyrs-core = { workspace = true }
 # Unsafe (fast) block codec, still bounds-checked on decode.
 lz4_flex = { version = "0.11", default-features = false, features = ["std", "checked-decode"] }
 bytes = "1"
 crossbeam-channel = "0.5"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
 libc = "0.2"
+zmq = "0.10"
+serde_json = "1"
+rustfft = "6"
+rust-hdf5 = { workspace = true, features = ["lz4"] }
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+ptyrs-engine = { path = "../ptyrs-engine" }
+toml = "1"
