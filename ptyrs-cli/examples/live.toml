@@ -67,6 +67,14 @@ source = "pva"
 # settle-max = 8192     # the offline run's epoch cap: it settles once its
 #                       # object at epoch E matches E/2 to 0.999, E doubling
 
+# The live object and the probe as NTNDArray PVs <prefix>OBJ:AMP, OBJ:PHASE,
+# PROBE:AMP, PROBE:PHASE on a PVA server set up from EPICS_PVAS_*; off when
+# the table is absent.
+# [recv.recon.pv]
+# prefix = "PTY:R:"     # required
+# bin = 4               # the object preview's bin
+# period-ms = 500       # least time between object posts
+
 # What the frames and positions are checked against; its frame size is the
 # detector's. In its place, the M5 scan simulator:
 # [recv.model.ptycho]

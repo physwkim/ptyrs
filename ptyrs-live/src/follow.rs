@@ -7,14 +7,16 @@
 //! every `snap_every` epochs, stamped with the wall time the host had it,
 //! for [`Clock::check`]; a copy from before then lacks frames the offline
 //! run has. At most two epochs are queued ahead of the host, so frames that
-//! arrive land behind at most one epoch already running.
+//! arrive land behind at most one epoch already running. With a
+//! [`Preview`], it also hands a viewer a copy of the object from the first
+//! epoch on, read on the host only once a later epoch's fence shows it done.
 //! [`offline_ap`] runs the same AP on the same stored frames until it
 //! settles, the reference the clock compares against.
 
 use std::num::NonZeroU32;
 use std::ops::Range;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError};
 use cuda_core::Context;
@@ -27,6 +29,7 @@ use crate::converge::{Clock, ClockError};
 use crate::farfield::Ptycho;
 use crate::grow::GrowError;
 use crate::object::{Snapshot, sleeping_event};
+use crate::pv_out::PvCfg;
 use crate::recon::{ApConfig, LiveAp, ViewPlacement};
 use crate::ring::{DeviceStore, FrameBatch};
 use crate::scan::ScanShape;
@@ -50,6 +53,8 @@ pub struct ReconCfg {
     pub snaps: usize,
     /// The offline reference's epoch cap; see [`settle`].
     pub settle_max: u64,
+    /// Publish the live results as PVs; off when unset.
+    pub pv: Option<PvCfg>,
 }
 
 impl Default for ReconCfg {
@@ -62,14 +67,16 @@ impl Default for ReconCfg {
             snap_every: NonZeroU32::new(5).unwrap(),
             snaps: 200,
             settle_max: 8192,
+            pv: None,
         }
     }
 }
 
 impl ReconCfg {
     /// `--recon ALGO --recon-nf-max --recon-inertia --recon-chunk-mib
-    /// --recon-snap-every --recon-snaps --recon-settle-max`; `None` without
-    /// `--recon`.
+    /// --recon-snap-every --recon-snaps --recon-settle-max`, and
+    /// `--recon-pv PREFIX --recon-pv-bin --recon-pv-period-ms`; `None`
+    /// without `--recon`.
     pub fn from_args(a: &Args) -> Option<Self> {
         let algo = a.opt("recon")?;
         let d = Self::default();
@@ -81,6 +88,14 @@ impl ReconCfg {
             snap_every: a.get("recon-snap-every", d.snap_every),
             snaps: a.get("recon-snaps", d.snaps),
             settle_max: a.get("recon-settle-max", d.settle_max),
+            pv: a.opt("recon-pv").map(|prefix| {
+                let p = PvCfg::new(prefix);
+                PvCfg {
+                    bin: a.get("recon-pv-bin", p.bin),
+                    period_ms: a.get("recon-pv-period-ms", p.period_ms),
+                    ..p
+                }
+            }),
         })
     }
 }
@@ -170,6 +185,23 @@ pub struct Kept {
     pub pixels: Vec<[f32; 2]>,
 }
 
+/// Object 0 of the live run after some epochs, for a viewer.
+pub struct View {
+    pub epochs: u64,
+    /// `[ny, nx]`.
+    pub shape: [usize; 2],
+    /// `[ny, nx]` row-major.
+    pub pixels: Vec<[f32; 2]>,
+}
+
+/// Where the live run sends [`View`]s: one copy is queued after an epoch
+/// once `period` has passed since the last and `tx` holds none, and one
+/// after the last epoch.
+pub struct Preview {
+    pub period: Duration,
+    pub tx: Sender<View>,
+}
+
 pub struct FollowReport {
     /// Frames the uploader sent.
     pub stored: u64,
@@ -200,15 +232,16 @@ fn views_of(cfg: &ApConfig, place: &ViewPlacement, positions: &[(f64, f64)]) -> 
 }
 
 /// Live AP on `store`'s frames as `batches` say they landed, until the
-/// uploader drops its sender and `cfg.snaps` snapshots are kept. Sends on
-/// `captured` once its graphs are captured, and drops it unsent if that
-/// fails.
+/// uploader drops its sender and `cfg.snaps` snapshots are kept, with
+/// copies to `preview` if given. Sends on `captured` once its graphs are
+/// captured, and drops it unsent if that fails.
 pub fn run_ap_consumer(
     ctx: Arc<Context>,
     store: Arc<DeviceStore>,
     cfg: FollowCfg,
     batches: Receiver<FrameBatch>,
     captured: Sender<()>,
+    preview: Option<Preview>,
 ) -> Result<FollowReport, GrowError> {
     ctx.bind_to_thread()?;
     let stream = ctx.new_stream()?;
@@ -230,6 +263,14 @@ pub fn run_ap_consumer(
     let mut live = LiveAp::new(&stream, &cfg.ap, &cfg.probe, counts)?;
     let mut snaps = [live.new_snapshot()?, live.new_snapshot()?];
     let fence = [sleeping_event(&ctx)?, sleeping_event(&ctx)?];
+    let mut view = match preview {
+        Some(p) => Some((p, live.new_snapshot()?)),
+        None => None,
+    };
+    // The epochs the view copy queued last follows, until it is sent, and
+    // when it was queued.
+    let mut viewing: Option<u64> = None;
+    let mut viewed: Option<Instant> = None;
     let _ = captured.send(());
 
     let mut positions: Vec<(f64, f64)> = Vec::with_capacity(shape.nframe as usize);
@@ -276,8 +317,29 @@ pub fn run_ap_consumer(
             let f = &fence[(live.epochs() % 2) as usize];
             // The epoch two before this one has finished.
             f.synchronize()?;
+            // So has a copy queued after the epoch before that one, behind
+            // its fence: it is sent without waiting.
+            if let Some(e) = viewing
+                && live.epochs() >= e + 2
+                && let Some((p, snap)) = &mut view
+            {
+                viewing = None;
+                // Only this thread sends, so only a viewer gone refuses it.
+                if p.tx.try_send(view_of(snap, e)?).is_err() {
+                    view = None;
+                }
+            }
             live.epoch()?;
             f.record(&stream)?;
+            if let Some((p, snap)) = &mut view
+                && viewing.is_none()
+                && p.tx.is_empty()
+                && viewed.is_none_or(|t| t.elapsed() >= p.period)
+            {
+                live.snapshot(snap)?;
+                viewing = Some(live.epochs());
+                viewed = Some(Instant::now());
+            }
             if let Some(k) = scan_epochs.map(|s| live.epochs() - s)
                 && k.is_multiple_of(u64::from(cfg.snap_every.get()))
             {
@@ -297,6 +359,15 @@ pub fn run_ap_consumer(
     // Nothing may still read the store once this returns.
     stream.synchronize()?;
     fed?;
+    // The viewer's last copy is the object after the last epoch.
+    if let Some((p, mut snap)) = view
+        && live.epochs() > 0
+    {
+        if viewing != Some(live.epochs()) {
+            live.snapshot(&mut snap)?;
+        }
+        let _ = p.tx.send(view_of(&mut snap, live.epochs())?);
+    }
     let [ny, nx] = snaps[0].shape();
     Ok(FollowReport {
         stored: positions.len() as u64,
@@ -308,6 +379,17 @@ pub fn run_ap_consumer(
         kept,
         obj_mapped_bytes: live.scan().obj().mapped_bytes(),
         landings,
+    })
+}
+
+/// Waits for `snap`, which follows `epochs`, and copies its object 0.
+fn view_of(snap: &mut Snapshot, epochs: u64) -> Result<View, GrowError> {
+    let shape = snap.shape();
+    let px = snap.wait()?;
+    Ok(View {
+        epochs,
+        shape,
+        pixels: px[..shape[0] * shape[1]].to_vec(),
     })
 }
 
@@ -454,11 +536,13 @@ mod tests {
         /// Wall ns just before the last frame was committed.
         scan_end: i64,
         recaptures: u64,
+        views: Vec<View>,
     }
 
     /// A 6x6 raster of 64x64 frames, two probe modes, streamed through the
-    /// ring and the uploader in bursts 20 ms apart into the consumer.
-    fn streamed() -> Streamed {
+    /// ring and the uploader in bursts 20 ms apart into the consumer, which
+    /// hands a viewer copies at least `preview` apart if given.
+    fn streamed(preview: Option<Duration>) -> Streamed {
         let p = Ptycho::new(PtychoSpec {
             n: 64,
             path: ScanPath::Raster { cols: 6 },
@@ -487,9 +571,15 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, rx) = crossbeam_channel::unbounded();
         let (cap_tx, cap_rx) = crossbeam_channel::bounded(1);
+        let (view_tx, view_rx) = crossbeam_channel::bounded(1);
+        let viewer = std::thread::spawn(move || view_rx.iter().collect::<Vec<View>>());
         let consumer = {
             let (ctx, store, cfg) = (ctx.clone(), store.clone(), cfg.clone());
-            std::thread::spawn(move || run_ap_consumer(ctx, store, cfg, rx, cap_tx))
+            let preview = preview.map(|period| Preview {
+                period,
+                tx: view_tx,
+            });
+            std::thread::spawn(move || run_ap_consumer(ctx, store, cfg, rx, cap_tx, preview))
         };
         cap_rx.recv().expect("the graphs are captured");
         let warm = WarmUp::end();
@@ -528,6 +618,7 @@ mod tests {
             rep,
             scan_end,
             recaptures: warm.recaptures(),
+            views: viewer.join().unwrap(),
         }
     }
 
@@ -537,6 +628,10 @@ mod tests {
     /// stamped after the scan's end. Its last one is the object of its
     /// landings replayed on an idle stream, each landing and epoch waited
     /// for: no landing raced an epoch in flight.
+    ///
+    /// The viewer's copies, the first after the first epoch and so during
+    /// the scan, the last after the last epoch, are each that replay at
+    /// their epochs, before the landings that followed them.
     ///
     /// The live object is not held to the offline one here: after thousands
     /// of epochs over a partial scan, AP on these frames stops at 0.985 in
@@ -550,7 +645,8 @@ mod tests {
             rep,
             scan_end,
             recaptures,
-        } = streamed();
+            views,
+        } = streamed(Some(Duration::from_millis(10)));
         assert_eq!(recaptures, 0);
         let total = rep.positions.len() as u64;
         assert_eq!((rep.stored, rep.landed), (total, total));
@@ -570,10 +666,31 @@ mod tests {
         // SAFETY: the consumer has returned; nothing writes the store.
         let counts = unsafe { store.frames_view().unwrap() };
         let mut run = LiveAp::new(&st, &cfg.ap, &cfg.probe, counts).unwrap();
+        assert!(views.len() > 2, "{} views", views.len());
+        assert!(views.windows(2).all(|w| w[0].epochs < w[1].epochs));
+        assert_eq!(views[0].epochs, 1);
+        assert!(views[0].epochs <= scan_epochs);
+        let end = views.last().unwrap();
+        assert_eq!(end.epochs, last.epochs);
+        assert_eq!((end.shape, &end.pixels[..]), (rep.shape, &last.pixels[..]));
+        let mut snap = run.new_snapshot().unwrap();
+        let mut unseen = views.iter().peekable();
+        let mut step = |run: &mut LiveAp| {
+            run.epoch().unwrap();
+            if let Some(v) = unseen.next_if(|v| v.epochs == run.epochs()) {
+                run.snapshot(&mut snap).unwrap();
+                let got = snap.wait().unwrap();
+                assert!(
+                    got[..v.pixels.len()] == v.pixels[..],
+                    "view at {}",
+                    v.epochs
+                );
+            }
+        };
         let mut at = 0;
         for &(epochs, upto) in &rep.landings {
             while run.epochs() < epochs {
-                run.epoch().unwrap();
+                step(&mut run);
                 st.synchronize().unwrap();
             }
             let p = &rep.positions[at as usize..upto as usize];
@@ -582,9 +699,10 @@ mod tests {
             at = upto;
         }
         while run.epochs() < last.epochs {
-            run.epoch().unwrap();
+            step(&mut run);
         }
-        let mut snap = run.new_snapshot().unwrap();
+        drop(step);
+        assert_eq!(unseen.count(), 0, "views off the replay's epochs");
         run.snapshot(&mut snap).unwrap();
         let got = snap.wait().unwrap();
         assert!(got[..last.pixels.len()] == last.pixels[..]);
@@ -598,7 +716,7 @@ mod tests {
     /// search, timed from the scan's end.
     #[test]
     fn the_offline_run_settles_and_the_search_finds_the_first_match() {
-        let s = streamed();
+        let s = streamed(None);
         let rep = &s.rep;
         let region = s.cfg.place.scanned(&rep.positions, s.cfg.ap.shape.frame);
         let offline = |max| {

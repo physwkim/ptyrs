@@ -7,6 +7,9 @@
 //! preview carries its bin in the dimensions' `binning`. `LLK` is the
 //! history, one Float64 per epoch, oldest first.
 
+use std::num::NonZeroUsize;
+
+use crossbeam_channel::Receiver;
 use epics_pva_rs::error::PvaResult;
 use epics_pva_rs::nt::nd_array::{
     NdArrayBuffer, NdAttribute, NdCodec, NdDimension, NdTimeStamp, NtNdArray, nt_nd_array_desc,
@@ -14,8 +17,43 @@ use epics_pva_rs::nt::nd_array::{
 };
 use epics_pva_rs::pvdata::{PvField, ScalarValue};
 use epics_pva_rs::server_native::{SharedPV, SharedSource};
+use serde::Deserialize;
 
+use crate::follow::View;
 use crate::stats::wall_ns;
+
+/// `[recon.pv]`: the live results as these PVs, on a PVA server set up from
+/// the `EPICS_PVAS_*` environment.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct PvCfg {
+    pub prefix: String,
+    /// The object preview's bin.
+    #[serde(default = "PvCfg::bin")]
+    pub bin: NonZeroUsize,
+    /// Least time between object posts; each costs the live run one more
+    /// download of its object.
+    #[serde(default = "PvCfg::period_ms")]
+    pub period_ms: u64,
+}
+
+impl PvCfg {
+    pub fn new(prefix: String) -> Self {
+        Self {
+            prefix,
+            bin: Self::bin(),
+            period_ms: Self::period_ms(),
+        }
+    }
+
+    fn bin() -> NonZeroUsize {
+        NonZeroUsize::new(4).unwrap()
+    }
+
+    fn period_ms() -> u64 {
+        500
+    }
+}
 
 /// Modulus and argument of complex planes, binned.
 #[derive(Debug, Clone, PartialEq)]
@@ -107,6 +145,25 @@ impl PvOut {
         );
         self.llk.try_post_checked(v)
     }
+}
+
+/// Posts `probe` once, then each object copy `views` delivers, binned by
+/// `bin` with the epochs it follows as its uid, until the sender drops;
+/// returns the object posts made.
+pub fn publish(
+    out: &PvOut,
+    probe: AmpPhase,
+    views: Receiver<View>,
+    bin: NonZeroUsize,
+) -> PvaResult<u64> {
+    out.post_probe(probe, 0)?;
+    let mut posts = 0;
+    for v in views {
+        let img = AmpPhase::new(&v.pixels, 1, v.shape, bin.get());
+        out.post_object(img, i32::try_from(v.epochs).unwrap_or(i32::MAX))?;
+        posts += 1;
+    }
+    Ok(posts)
 }
 
 fn post_image(pvs: &[SharedPV; 2], img: AmpPhase, uid: i32) -> PvaResult<usize> {
@@ -242,5 +299,98 @@ mod tests {
             "amp {}",
             img.amp[0]
         );
+    }
+
+    /// `uniqueId`, the dimension sizes and binnings, and the first pixel.
+    fn header(v: &PvField) -> (i32, Vec<(i32, i32)>, Option<ScalarValue>) {
+        let PvField::Structure(s) = v else {
+            panic!("{v:?}")
+        };
+        let int = |f: Option<&PvField>| match f {
+            Some(PvField::Scalar(ScalarValue::Int(i))) => *i,
+            f => panic!("{f:?}"),
+        };
+        let Some(PvField::StructureArray(ds)) = s.get_field("dimension") else {
+            panic!("no dimension")
+        };
+        let dims = ds
+            .iter()
+            .map(|d| {
+                let d = d.as_ref().unwrap();
+                (int(d.get_field("size")), int(d.get_field("binning")))
+            })
+            .collect();
+        let first = match s.get_field("value") {
+            Some(PvField::Union { value, .. }) => match &**value {
+                PvField::ScalarArrayTyped(a) => a.get(0),
+                PvField::ScalarArray(a) => a.first().cloned(),
+                _ => None,
+            },
+            _ => None,
+        };
+        (int(s.get_field("uniqueId")), dims, first)
+    }
+
+    /// A client subscribed to `OBJ:AMP` before the first copy sees each
+    /// one [`publish`] posts, binned, with its epochs as the uid;
+    /// `PROBE:PHASE` holds the probe's two modes stacked along y.
+    #[test]
+    fn a_subscriber_sees_each_object_copy_and_the_probe() {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        use epics_pva_rs::client_native::PvaClient;
+        use epics_pva_rs::server_native::PvaServer;
+
+        use crate::follow::View;
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let source = SharedSource::new();
+        let out = PvOut::new(&source, "T:").unwrap();
+        let _in = rt.enter();
+        let server = PvaServer::isolated(Arc::new(source)).unwrap();
+        let client = PvaClient::builder().server_addr(server.tcp_addr()).build();
+        let (mtx, mrx) = crossbeam_channel::unbounded();
+        let _sub = rt
+            .block_on(client.pvmonitor_handle(
+                "T:OBJ:AMP",
+                move |_, v| {
+                    let _ = mtx.send(header(v));
+                },
+                |_| {},
+            ))
+            .unwrap();
+        let wait = || mrx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(wait().0, -1, "the empty array before any post");
+
+        let probe_px: Vec<[f32; 2]> = (0..2 * 4 * 4).map(|i| polar(1.0, i as f64 * 0.1)).collect();
+        let probe = AmpPhase::new(&probe_px, 2, [4, 4], 1);
+        let (vtx, vrx) = crossbeam_channel::bounded(0);
+        let bin = NonZeroUsize::new(2).unwrap();
+        let publisher = std::thread::spawn(move || publish(&out, probe, vrx, bin));
+        for epochs in [3u32, 7] {
+            let pixels: Vec<[f32; 2]> = (0..5 * 6)
+                .map(|i| polar(f64::from(epochs) + i as f64, 0.3))
+                .collect();
+            let want = AmpPhase::new(&pixels, 1, [5, 6], 2);
+            vtx.send(View {
+                epochs: epochs.into(),
+                shape: [5, 6],
+                pixels,
+            })
+            .unwrap();
+            let (uid, dims, first) = wait();
+            assert_eq!(uid, epochs as i32);
+            assert_eq!(dims, [(3, 2), (3, 2)]);
+            assert_eq!(first, Some(ScalarValue::Float(want.amp[0])));
+        }
+        drop(vtx);
+        assert_eq!(publisher.join().unwrap().unwrap(), 2);
+        let (uid, dims, _) = header(&rt.block_on(client.pvget("T:PROBE:PHASE")).unwrap());
+        assert_eq!((uid, dims), (0, vec![(4, 1), (8, 1)]));
     }
 }

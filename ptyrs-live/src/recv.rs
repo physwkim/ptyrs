@@ -25,13 +25,14 @@ use std::time::Duration;
 
 use cuda_core::Context;
 use epics_pva_rs::client_native::PvaClient;
+use epics_pva_rs::server_native::{PvaServer, PvaServerConfig, SharedSource};
 use serde::Deserialize;
 
 use crate::args::Args;
 use crate::consumer::{ConsumerReport, checksum, run_checksum_consumer};
 use crate::eiger::{EigerFrames, Progress, PullReport, run_pull};
 use crate::follow::{
-    FollowCfg, FollowReport, ReconCfg, first_converged, offline_ap, plane, run_ap_consumer,
+    FollowCfg, FollowReport, Preview, ReconCfg, first_converged, offline_ap, plane, run_ap_consumer,
 };
 use crate::graph::WarmUp;
 use crate::handoff::work_queue;
@@ -40,6 +41,7 @@ use crate::pipeline::{
     FrameLoss, Geometry, Placement, SourceStats, Truth, WorkerCfg, WorkerReport, worker,
 };
 use crate::pos::PosTable;
+use crate::pv_out::{AmpPhase, PvOut, publish};
 use crate::pva_source::{NtndFrames, PosStats, monitor_positions};
 use crate::ring::{DeviceStore, Ring, UploaderConfig, run_uploader};
 use crate::stats::{mono_ns, process_cpu_ns, wall_ns};
@@ -570,6 +572,50 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
         )
         .map_err(fail("device store"))?,
     );
+    // The live results' PVs, served on a runtime of their own: the frame
+    // sources' runtime stops at the scan's end, the live run later. The
+    // publisher posts the probe now and each object copy the live run hands
+    // it. The server drops before its runtime.
+    let pv = cfg.recon.as_ref().and_then(|rc| rc.pv.as_ref());
+    let (preview, publisher, _pv_server) = match (pv, &follow) {
+        (Some(pc), Some((f, _))) => {
+            let source = SharedSource::new();
+            let out = PvOut::new(&source, &pc.prefix).map_err(fail("PV output"))?;
+            let rt = {
+                let place = place.clone();
+                tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(1)
+                    .thread_name("pv-rt")
+                    .on_thread_start(move || place.enter(place.rt.as_deref()))
+                    .enable_all()
+                    .build()
+                    .unwrap()
+            };
+            let server = {
+                let _in = rt.enter();
+                let config = PvaServerConfig::default()
+                    .with_env()
+                    .map_err(fail("PV server environment"))?;
+                PvaServer::start(Arc::new(source), config).map_err(fail("PV server"))?
+            };
+            eprintln!("recv pv listening={}", server.tcp_addr());
+            let n = f.ap.shape.frame[0] as usize;
+            let px: Vec<[f32; 2]> = f.probe.iter().map(|c| [c.re, c.im]).collect();
+            let probe = AmpPhase::new(&px, f.ap.shape.nprobe as usize, [n, n], 1);
+            let (tx, rx) = crossbeam_channel::bounded(1);
+            let (bin, place) = (pc.bin, place.clone());
+            let h = std::thread::Builder::new()
+                .name("pv".into())
+                .spawn(move || {
+                    place.enter(place.rt.as_deref());
+                    publish(&out, probe, rx, bin)
+                })
+                .unwrap();
+            let period = Duration::from_millis(pc.period_ms);
+            (Some(Preview { period, tx }), Some(h), Some((server, rt)))
+        }
+        _ => (None, None, None),
+    };
     let (btx, brx) = crossbeam_channel::unbounded();
     let (cap_tx, cap_rx) = crossbeam_channel::bounded(1);
     let consumer = {
@@ -584,7 +630,8 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
                         run_checksum_consumer(ctx, store, batch, brx, cap_tx).map(Consumed::Sums)
                     }
                     Some((follow, settle_max)) => {
-                        run_ap_consumer(ctx, store, follow.clone(), brx, cap_tx).map(|rep| {
+                        let f = follow.clone();
+                        run_ap_consumer(ctx, store, f, brx, cap_tx, preview).map(|rep| {
                             Consumed::Recon(Box::new(Recon {
                                 rep,
                                 follow,
@@ -793,6 +840,10 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
     let (pulled, followed) = streamed?;
     let up = up.map_err(fail("uploader"))?;
     let cons = cons.map_err(fail("graph consumer"))?;
+    // The live run has dropped its sender.
+    let pv_posts = publisher
+        .map(|h| h.join().unwrap().map_err(fail("PV output")))
+        .transpose()?;
 
     let st = state.lock().unwrap();
     let ps = pos_stats.lock().unwrap();
@@ -1028,6 +1079,12 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
     if let Some((l, _)) = &recon {
         line(format_args!("{l}"));
     }
+    if let (Some(posts), Some(pc)) = (pv_posts, pv) {
+        line(format_args!(
+            "recv pv prefix={} bin={} period_ms={} object_posts={posts}",
+            pc.prefix, pc.bin, pc.period_ms
+        ));
+    }
     let bad = (wr.verify_bad + wr.pos_mismatch) as usize
         + h2d_bad
         + e2e_bad
@@ -1050,6 +1107,7 @@ mod tests {
     use super::*;
     use crate::follow::Algo;
     use crate::model::{PathKind, PtychoCfg};
+    use crate::pv_out::PvCfg;
     use crate::synth::Synth;
 
     fn flags(f: &[&str]) -> RecvCfg {
@@ -1071,6 +1129,15 @@ mod tests {
         };
         assert_eq!(flags(&["--recon", "ap"]), recon);
         assert_eq!(toml("[recon]"), recon);
+        let pv = RecvCfg {
+            recon: Some(ReconCfg {
+                pv: Some(PvCfg::new("X:".into())),
+                ..ReconCfg::default()
+            }),
+            ..RecvCfg::default()
+        };
+        assert_eq!(flags(&["--recon", "ap", "--recon-pv", "X:"]), pv);
+        assert_eq!(toml("[recon.pv]\nprefix = \"X:\""), pv);
     }
 
     #[test]
@@ -1129,6 +1196,11 @@ mod tests {
                 snap_every: NonZeroU32::new(3).unwrap(),
                 snaps: 50,
                 settle_max: 900,
+                pv: Some(PvCfg {
+                    prefix: "PTY:R:".into(),
+                    bin: NonZeroUsize::new(2).unwrap(),
+                    period_ms: 100,
+                }),
             }),
         };
         let f = flags(&[
@@ -1230,6 +1302,12 @@ mod tests {
             "50",
             "--recon-settle-max",
             "900",
+            "--recon-pv",
+            "PTY:R:",
+            "--recon-pv-bin",
+            "2",
+            "--recon-pv-period-ms",
+            "100",
         ]);
         let t = toml(
             r#"
@@ -1286,6 +1364,11 @@ mod tests {
             snap-every = 3
             snaps = 50
             settle-max = 900
+
+            [recon.pv]
+            prefix = "PTY:R:"
+            bin = 2
+            period-ms = 100
             "#,
         );
         assert_eq!(f, want);
@@ -1369,6 +1452,9 @@ mod tests {
             ("[recon]\nsnap-every = 0", "snap-every"),
             ("[recon]\nsnapz = 3", "snapz"),
             ("[recon]\nsettle-every = 100", "settle-every"),
+            ("[recon.pv]\nbin = 2", "prefix"),
+            ("[recon.pv]\nprefix = \"X:\"\nbin = 0", "bin"),
+            ("[recon.pv]\nprefix = \"X:\"\nperiod = 5", "period"),
         ] {
             let e = ::toml::from_str::<RecvCfg>(t).unwrap_err().to_string();
             assert!(e.contains(needle), "{t:?}: {e}");
