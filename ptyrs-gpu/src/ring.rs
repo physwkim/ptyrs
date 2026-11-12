@@ -317,8 +317,8 @@ impl<T> LlkRing<T> {
         (self.dev.nslot as u64 / 2).max(1)
     }
 
-    /// Enqueues the copy of records `copied .. next` to their host slots, after reading the
-    /// records those slots hold.
+    /// Enqueues the copy of records `copied .. next`, each of its frames `0 .. n`, to their host
+    /// slots, after reading the records those slots hold.
     fn copy_out(&mut self, ctx: &ExecutionContext) -> Result<(), RingError> {
         let (start, end) = (self.copied, self.next);
         let nslot = self.dev.nslot as u64;
@@ -329,24 +329,21 @@ impl<T> LlkRing<T> {
         lease(ctx, &[self.dev.records.storage()], &[])?;
         ctx.context().bind_to_thread()?;
         let stream = ctx.get_cuda_stream();
-        let nframe = self.dev.nframe as usize;
         let size = size_of::<RingRecord>();
-        let s0 = (start % nslot) as usize;
-        let count = (end - start) as usize;
-        let first = count.min(nslot as usize - s0);
-        for (slot, n) in [(s0, first), (0, count - first)] {
+        let pending = self.tags.range((start - self.read) as usize..);
+        for (k, &(_, n)) in (start..end).zip(pending) {
             if n == 0 {
                 continue;
             }
-            let at = slot * nframe;
-            // SAFETY: slots `slot .. slot + n` lie in both buffers; the host ones hold no
-            // record left to read (read_until above), and none is read before this copy's
-            // event completes.
+            let at = (k % nslot) as usize * self.dev.nframe as usize;
+            // SAFETY: frames `0 .. n <= nframe` of slot `k % nslot` lie in both buffers; the
+            // host slot holds no record left to read (read_until above), and it is not read
+            // before this copy's event completes.
             unsafe {
                 cuda_core::memory::memcpy_dtoh_async(
                     self.host.as_mut_ptr().add(at),
                     self.dev.records.cu_deviceptr() + (at * size) as u64,
-                    n * nframe * size,
+                    n as usize * size,
                     stream.cu_stream(),
                 )?
             };
@@ -483,5 +480,38 @@ impl From<Error> for RingError {
 impl From<DriverError> for RingError {
     fn from(e: DriverError) -> Self {
         Self::Gpu(e.into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use cuda_core::CudaContext;
+
+    use super::*;
+
+    /// A record of 4 frames copies those into its host slot and leaves the slot's other 6 as
+    /// they were.
+    #[test]
+    fn a_record_copies_only_its_frames() {
+        let cuda = CudaContext::new(0).expect("CUDA device 0");
+        let kernels = Kernels::load(&cuda).expect("load ptyrs-gpu kernels");
+        let stream = cuda.new_stream().unwrap();
+        let ctx = ExecutionContext::new(stream.clone());
+        let mut ring = LlkRing::new(&kernels, &stream, 10, 1).unwrap();
+        stream.synchronize().unwrap();
+        let old = RingRecord {
+            seq: 7,
+            ..RingRecord::default()
+        };
+        ring.host.as_mut_slice().fill(old);
+        ring.enqueued(&ctx, &Ended(()), (), 4).unwrap();
+        stream.synchronize().unwrap();
+        let seqs: Vec<u64> = ring.host.as_slice().iter().map(|r| r.seq).collect();
+        assert_eq!(
+            seqs[..4],
+            [u64::MAX; 4],
+            "copied from the unwritten device slot"
+        );
+        assert_eq!(seqs[4..], [7; 6], "left as they were");
     }
 }
