@@ -1692,6 +1692,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "ptyrs-refgen"
+version = "0.0.1"
+dependencies = [
+ "ptyrs-core",
+ "ptyrs-io",
+ "rand",
+ "rand_chacha",
+ "rand_distr",
+ "rustfft",
+ "serde_json",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "quote"
 version = "1.0.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"
