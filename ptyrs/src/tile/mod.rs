@@ -7,13 +7,14 @@
 //! and [`TileCgDots`].
 //!
 //! Every launch is a method of a set, each compiling its kernels when it is built, so no
-//! launch compiles, eagerly or under a graph capture. A launch takes the context, stack and
-//! buffers of its `crate::gpu` counterpart, the scan's views being the set's (the object
-//! update takes them, as its counterpart does), leases the buffers with
-//! [`crate::gpu::lease`] and enqueues on the context's stream, so it runs eagerly or records
-//! into a capture the same way.
+//! launch compiles, eagerly or under a graph capture. The first build of a process turns on
+//! cutile's per-user cubin cache (`~/.cache/cutile/kernels`), which later processes load.
+//! A launch takes the context, stack and buffers of its `crate::gpu` counterpart, the scan's
+//! views being the set's (the object update takes them, as its counterpart does), leases the
+//! buffers with [`crate::gpu::lease`] and enqueues on the context's stream, so it runs
+//! eagerly or records into a capture the same way.
 
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 
 pub use crate::gpu::Error;
 use crate::gpu::{
@@ -23,6 +24,7 @@ use crate::gpu::{
 use cuda_async::device_buffer::DevicePointer;
 use cuda_core::sys::CUdeviceptr;
 use cuda_core::{CudaStream, DeviceBuffer, DeviceCopy};
+use cutile::jit_cache;
 use cutile::prelude::*;
 
 #[cutile::module]
@@ -1238,11 +1240,26 @@ enum Run<'c> {
     Launch(&'c ExecutionContext),
 }
 
+/// Installs cutile's per-user on-disk cubin cache once per process, so a later process loads
+/// the cubins tileiras made instead of rerunning it. A store that fails to open leaves the
+/// cache off; one the program installed itself is kept.
+fn disk_cache() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        if !jit_cache::is_enabled() {
+            let _ = jit_cache::enable_default();
+        }
+    });
+}
+
 /// Compiles or launches a launcher, as `$run` says. Expands to unsafe calls.
 macro_rules! run {
     ($run:expr, $launcher:expr) => {
         match $run {
-            Run::Compile(stream) => $launcher.compile_on(stream)?,
+            Run::Compile(stream) => {
+                disk_cache();
+                $launcher.compile_on(stream)?
+            }
             Run::Launch(ctx) => {
                 $launcher.execute(ctx)?;
             }
