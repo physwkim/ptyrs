@@ -8,7 +8,8 @@ use cuda_async::cuda_graph::CudaGraph;
 use cuda_async::device_operation::{DeviceOp, ExecutionContext};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 use ptyrs_gpu::{
-    C32, Error, Kernels, Lines, LlkPartial, UpdateSums, ViewAddr, ViewDims, Views, record,
+    C32, Error, Kernels, Lines, LlkPartial, StackTable, UpdateSums, ViewAddr, ViewDims, Views,
+    record,
 };
 
 const N: u32 = 128;
@@ -118,6 +119,8 @@ fn fft2(
 struct Scan<'a> {
     k: &'a Kernels,
     views: &'a Views,
+    /// One stack, the whole scan.
+    table: &'a StackTable,
     counts: &'a DeviceBuffer<u16>,
 }
 
@@ -136,34 +139,19 @@ struct State {
 /// One AP epoch over the whole scan as one stack: the object update, then the probe
 /// update from the new object.
 fn epoch(ctx: &ExecutionContext, scan: &Scan, s: &mut State) -> Result<(), Error> {
-    let (k, d) = (scan.k, scan.views.dims());
-    let frames = 0..d.nframe;
+    let (k, d, table) = (scan.k, scan.views.dims(), scan.table);
     let nk = d.nframe * d.nmode;
-    let (obj_len, probe_len) = (s.obj.len() as u32, s.probe.len() as u32);
+    let probe_len = s.probe.len() as u32;
     s.obj_sums.zero(ctx)?;
     s.probe_sums.zero(ctx)?;
-    k.obj_probe_to_psi(
-        ctx,
-        scan.views,
-        frames.clone(),
-        &s.obj,
-        &s.probe,
-        &mut s.psi,
-    )?;
+    k.obj_probe_to_psi(ctx, scan.views, table.at(0), &s.obj, &s.probe, &mut s.psi)?;
     fft2(k, ctx, &mut s.psi, nk, false)?;
-    k.llk(ctx, d, frames.clone(), scan.counts, &s.psi, &mut s.partials)?;
-    k.apply_amplitude(ctx, d, frames.clone(), scan.counts, &mut s.psi)?;
+    k.llk(ctx, d, table.at(0), scan.counts, &s.psi, &mut s.partials)?;
+    k.apply_amplitude(ctx, d, table.at(0), scan.counts, &mut s.psi)?;
     fft2(k, ctx, &mut s.psi, nk, true)?;
-    ptyrs_tile::psi_to_obj(
-        ctx,
-        scan.views,
-        frames.clone(),
-        &s.psi,
-        &s.probe,
-        &mut s.obj_sums,
-    )?;
-    ptyrs_tile::update_from_sums(ctx, &mut s.obj, &mut s.obj_sums, obj_len, 0.01)?;
-    ptyrs_tile::psi_to_probe(ctx, scan.views, frames, &s.psi, &s.obj, &mut s.probe_sums)?;
+    ptyrs_tile::psi_to_obj(ctx, scan.views, table, 0, &s.psi, &s.probe, &mut s.obj_sums)?;
+    ptyrs_tile::update_obj_from_sums(ctx, scan.views, &mut s.obj, &mut s.obj_sums, 0.01)?;
+    ptyrs_tile::psi_to_probe(ctx, scan.views, table, 0, &s.psi, &s.obj, &mut s.probe_sums)?;
     ptyrs_tile::update_from_sums(ctx, &mut s.probe, &mut s.probe_sums, probe_len, 0.01)?;
     ptyrs_tile::llk_sums(ctx, &s.partials, d.nframe, &mut s.llk_scratch, &mut s.llk)
 }
@@ -206,10 +194,11 @@ fn ap_epoch_graph_replays_bit_for_bit() {
     let (truth, true_probe) = (up(&truth), up(&probe(1)));
     let mut psi = DeviceBuffer::<C32>::zeroed(&stream, nk * n2).unwrap();
     let mut icalc = DeviceBuffer::<f32>::zeroed(&stream, d.nframe as usize * n2).unwrap();
+    let table = StackTable::new(&stream, &d, std::slice::from_ref(&(0..d.nframe))).unwrap();
     record(|ctx| {
-        k.obj_probe_to_psi(ctx, &views, 0..d.nframe, &truth, &true_probe, &mut psi)?;
+        k.obj_probe_to_psi(ctx, &views, table.at(0), &truth, &true_probe, &mut psi)?;
         fft2(&k, ctx, &mut psi, nk as u32, false)?;
-        k.mode_intensity(ctx, &d, 0..d.nframe, &psi, &mut icalc)
+        k.mode_intensity(ctx, &d, table.at(0), &psi, &mut icalc)
     })
     .sync_on(&stream)
     .unwrap();
@@ -220,6 +209,7 @@ fn ap_epoch_graph_replays_bit_for_bit() {
     let scan = Scan {
         k: &k,
         views: &views,
+        table: &table,
         counts: &counts,
     };
 

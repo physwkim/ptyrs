@@ -11,7 +11,9 @@ use std::time::Instant;
 
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
-use ptyrs_gpu::{C32, Kernels, LlkPartial, LlkSums, UpdateSums, ViewAddr, ViewDims, Views};
+use ptyrs_gpu::{
+    C32, Kernels, LlkPartial, LlkSums, StackTable, UpdateSums, ViewAddr, ViewDims, Views,
+};
 
 const N: u32 = 256;
 const STEP: u32 = 24;
@@ -109,10 +111,10 @@ fn main() {
     let mut obj = DeviceBuffer::from_host(&stream, &obj_host).unwrap();
     let mut probe = DeviceBuffer::from_host(&stream, &probe_host).unwrap();
     let mut psi = DeviceBuffer::<C32>::zeroed(&stream, nk * n2).unwrap();
-    let frames = 0..d.nframe;
+    let table = StackTable::new(&stream, &d, std::slice::from_ref(&(0..d.nframe))).unwrap();
     // Leases every buffer the launches below touch until it drops after their sync.
     let ex = ExecutionContext::new(stream.clone());
-    k.obj_probe_to_psi(&ex, &views, frames.clone(), &obj, &probe, &mut psi)
+    k.obj_probe_to_psi(&ex, &views, table.at(0), &obj, &probe, &mut psi)
         .unwrap();
     let partials_host: Vec<LlkPartial> = unit(4 * d.nframe as usize, 3)
         .as_chunks::<4>()
@@ -143,37 +145,40 @@ fn main() {
     );
 
     // Two warm-up launches (the Tile JIT) and `reps` timed ones of each kernel, in the
-    // order the nsys trace is read: psi_to_obj, psi_to_probe, update_from_sums on the
-    // object, then on the probe, then the LLK totals.
+    // order the nsys trace is read: psi_to_obj, psi_to_probe, update_obj_from_sums,
+    // update_from_sums on the probe, then the LLK totals.
     let total = 2 + reps;
     for _ in 0..total {
         if tile {
-            ptyrs_tile::psi_to_obj(&ex, &views, frames.clone(), &psi, &probe, &mut obj_sums)
-                .unwrap();
+            ptyrs_tile::psi_to_obj(&ex, &views, &table, 0, &psi, &probe, &mut obj_sums).unwrap();
         } else {
-            k.psi_to_obj(&ex, &views, frames.clone(), &psi, &probe, &mut obj_sums)
+            k.psi_to_obj(&ex, &views, table.at(0), &psi, &probe, &mut obj_sums)
                 .unwrap();
         }
     }
     for _ in 0..total {
         if tile {
-            ptyrs_tile::psi_to_probe(&ex, &views, frames.clone(), &psi, &obj, &mut probe_sums)
-                .unwrap();
+            ptyrs_tile::psi_to_probe(&ex, &views, &table, 0, &psi, &obj, &mut probe_sums).unwrap();
         } else {
-            k.psi_to_probe(&ex, &views, frames.clone(), &psi, &obj, &mut probe_sums)
+            k.psi_to_probe(&ex, &views, table.at(0), &psi, &obj, &mut probe_sums)
                 .unwrap();
         }
     }
-    for (x, sums, len) in [
-        (&mut obj, &mut obj_sums, obj_len),
-        (&mut probe, &mut probe_sums, probe_len),
-    ] {
-        for _ in 0..total {
-            if tile {
-                ptyrs_tile::update_from_sums(&ex, x, sums, len as u32, 0.01).unwrap();
-            } else {
-                k.update_from_sums(&ex, x, sums, len as u32, 0.01).unwrap();
-            }
+    for _ in 0..total {
+        if tile {
+            ptyrs_tile::update_obj_from_sums(&ex, &views, &mut obj, &mut obj_sums, 0.01).unwrap();
+        } else {
+            k.update_obj_from_sums(&ex, &views, &mut obj, &mut obj_sums, 0.01)
+                .unwrap();
+        }
+    }
+    for _ in 0..total {
+        if tile {
+            ptyrs_tile::update_from_sums(&ex, &mut probe, &mut probe_sums, probe_len as u32, 0.01)
+                .unwrap();
+        } else {
+            k.update_from_sums(&ex, &mut probe, &mut probe_sums, probe_len as u32, 0.01)
+                .unwrap();
         }
     }
     stream.synchronize().unwrap();

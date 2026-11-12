@@ -1,12 +1,13 @@
 //! `ptyrs_tile::psi_to_probe` against the SIMT `ptyrs_gpu::Kernels::psi_to_probe` and an
-//! f64 reference, on the views of `ptyrs-gpu`'s `update_sums` test with 20x40 frames.
+//! f64 reference: whole and split stack tables, a device-written entry (including `nf == 0`
+//! and entries the kernels clamp), and probe modes no view of the stack uses.
 
 use std::ops::Range;
 use std::sync::Arc;
 
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, DeviceCopy};
-use ptyrs_gpu::{C32, Kernels, UpdateSums, ViewAddr, ViewDims, Views};
+use ptyrs_gpu::{C32, Kernels, StackCtl, StackTable, UpdateSums, ViewAddr, ViewDims, Views};
 
 type Z = (f64, f64);
 
@@ -27,18 +28,24 @@ fn noise(len: usize, seed: u64, scale: f32) -> Vec<C32> {
         .collect()
 }
 
+/// Pixels per frame.
+fn n(d: &ViewDims) -> usize {
+    d.frame[0] as usize * d.frame[1] as usize
+}
+
 fn up<T: DeviceCopy>(stream: &CudaStream, host: &[T]) -> DeviceBuffer<T> {
     DeviceBuffer::from_host(stream, host).unwrap()
 }
 
-/// 20x40 frames (partial 8x32 tiles in both directions) on two 50x60 object modes and two
-/// probe modes (four views per frame); frames 1 and 3 wrap their `+ 1` neighbours, and
-/// `fy`, `fx` cover zero and non-zero.
+/// 20x40 frames (partial 8x32 tiles in both directions) on two 50x60 object modes and
+/// three probe modes, four views per frame. `fy`, `fx` cover zero and non-zero, frames 1
+/// and 3 reach the object's last row and frames 3 and 4 its last column; probe mode 2 has
+/// views in frames 3 and 4 only.
 fn dims() -> (ViewDims, Vec<ViewAddr>) {
     let d = ViewDims {
         nframe: 5,
         nmode: 4,
-        nprobe: 2,
+        nprobe: 3,
         nobj: 2,
         frame: [20, 40],
         obj: [50, 60],
@@ -46,21 +53,22 @@ fn dims() -> (ViewDims, Vec<ViewAddr>) {
     };
     let offsets = [
         (0, 0, 0.0, 0.0),
-        (30, 20, 0.25, 0.0),
+        (29, 20, 0.25, 0.0),
         (13, 7, 0.0, 0.7),
-        (30, 20, 0.6, 0.9),
-        (5, 20, 0.5, 0.5),
+        (29, 19, 0.6, 0.9),
+        (5, 19, 0.5, 0.5),
     ];
     let views = offsets
         .iter()
-        .flat_map(|&(oy, ox, fy, fx)| {
+        .enumerate()
+        .flat_map(|(f, &(oy, ox, fy, fx))| {
             (0..d.nmode).map(move |m| ViewAddr {
                 oy,
                 ox,
                 fy,
                 fx,
-                probe: m % d.nprobe,
-                obj: m / d.nprobe,
+                probe: if f >= 3 && m % 2 == 1 { 2 } else { m % 2 },
+                obj: m / 2,
             })
         })
         .collect();
@@ -68,7 +76,7 @@ fn dims() -> (ViewDims, Vec<ViewAddr>) {
 }
 
 /// Adds the probe sums of `views` (from view 0 of `psi`) in f64: each probe pixel takes its
-/// bilinear object sample.
+/// bilinear object sample over the corners of non-zero weight.
 fn probe_sums_f64(
     d: &ViewDims,
     views: &[ViewAddr],
@@ -85,16 +93,18 @@ fn probe_sums_f64(
             for x in 0..nx {
                 let (fy, fx) = (v.fy as f64, v.fx as f64);
                 let (y0, x0) = (v.oy as usize + y, v.ox as usize + x);
-                let at = |yy: usize, xx: usize| (v.obj as usize * nyo + yy % nyo) * nxo + xx % nxo;
+                let at = |yy: usize, xx: usize| (v.obj as usize * nyo + yy) * nxo + xx;
                 let o = [
-                    (at(y0, x0), (1.0 - fy) * (1.0 - fx)),
-                    (at(y0, x0 + 1), (1.0 - fy) * fx),
-                    (at(y0 + 1, x0), fy * (1.0 - fx)),
-                    (at(y0 + 1, x0 + 1), fy * fx),
+                    (y0, x0, (1.0 - fy) * (1.0 - fx)),
+                    (y0, x0 + 1, (1.0 - fy) * fx),
+                    (y0 + 1, x0, fy * (1.0 - fx)),
+                    (y0 + 1, x0 + 1, fy * fx),
                 ]
                 .iter()
-                .fold((0.0, 0.0), |s, &(i, w)| {
-                    (s.0 + w * obj[i].re as f64, s.1 + w * obj[i].im as f64)
+                .filter(|c| c.2 != 0.0)
+                .fold((0.0, 0.0), |s, &(yy, xx, w)| {
+                    let o = obj[at(yy, xx)];
+                    (s.0 + w * o.re as f64, s.1 + w * o.im as f64)
                 });
                 let (dy, dx) = (y as f64 - (ny / 2) as f64, x as f64 - (nx / 2) as f64);
                 let a = d.quad_phase as f64 * (dy * dy + dx * dx);
@@ -107,6 +117,27 @@ fn probe_sums_f64(
             }
         }
     }
+}
+
+/// Psi of the frames `f` of `all` (`fsize` values each), padded with NaN to `nf_max`
+/// frames: a kernel reading past its stack spreads NaN.
+fn stack_psi(all: &[C32], fsize: usize, f: Range<u32>, nf_max: u32) -> Vec<C32> {
+    let mut psi = all[f.start as usize * fsize..f.end as usize * fsize].to_vec();
+    let nan = C32 {
+        re: f32::NAN,
+        im: f32::NAN,
+    };
+    psi.resize(nf_max as usize * fsize, nan);
+    psi
+}
+
+/// Writes `{ f0, nf }` to the one entry of `table`.
+fn set_entry(k: &Kernels, stream: &CudaStream, table: &StackTable, f0: u32, nf: u32) {
+    stream.synchronize().unwrap();
+    let ctl = [StackCtl { f0, nf }];
+    k.context().bind_to_thread().unwrap();
+    // SAFETY: `table` holds one entry; no work on it is in flight.
+    unsafe { cuda_core::memory::memcpy_htod_sync(table.ptr(), ctl.as_ptr(), 8) }.unwrap();
 }
 
 /// The sums as host `f32`s, real and imaginary parts of `num` interleaved.
@@ -129,70 +160,167 @@ fn bits(v: &[f32]) -> Vec<u32> {
     v.iter().map(|x| x.to_bits()).collect()
 }
 
+struct Fixture {
+    k: Kernels,
+    stream: Arc<CudaStream>,
+    ex: ExecutionContext,
+    d: ViewDims,
+    view_list: Vec<ViewAddr>,
+    views: Views,
+    obj_host: Vec<C32>,
+    obj: DeviceBuffer<C32>,
+    /// Psi of every frame of the scan.
+    psi_host: Vec<C32>,
+    /// Non-zero starting sums: the kernels add to what is there.
+    num0: Vec<C32>,
+    den0: Vec<f32>,
+}
+
+impl Fixture {
+    fn new() -> Self {
+        let ctx = CudaContext::new(0).expect("CUDA device 0");
+        let k = Kernels::load(&ctx).expect("load ptyrs-gpu kernels");
+        let stream: Arc<CudaStream> = ctx.default_stream();
+        let ex = ExecutionContext::new(stream.clone());
+        let (d, view_list) = dims();
+        let views = Views::new(&stream, d, &view_list).unwrap();
+        let obj_host = noise(d.nobj as usize * (d.obj[0] * d.obj[1]) as usize, 2, 1.0);
+        let obj = up(&stream, &obj_host);
+        let psi_host = noise(d.nframe as usize * Self::fsize(&d), 3, 1.0);
+        let len = d.nprobe as usize * n(&d);
+        let num0 = noise(len, 20, 1.0);
+        let den0 = noise(len, 21, 1.0).iter().map(|c| c.re.abs()).collect();
+        Self {
+            k,
+            stream,
+            ex,
+            d,
+            view_list,
+            views,
+            obj_host,
+            obj,
+            psi_host,
+            num0,
+            den0,
+        }
+    }
+
+    /// Psi values per frame.
+    fn fsize(d: &ViewDims) -> usize {
+        d.nmode as usize * n(d)
+    }
+
+    fn start(&self) -> UpdateSums {
+        let s = &self.stream;
+        UpdateSums::new(up(s, &self.num0), up(s, &self.den0), s).unwrap()
+    }
+
+    fn frame_views(&self, f: Range<u32>) -> &[ViewAddr] {
+        let m = self.d.nmode;
+        &self.view_list[(f.start * m) as usize..(f.end * m) as usize]
+    }
+
+    /// The starting sums plus the f64 sums of frames `f`.
+    fn want(&self, f: Range<u32>) -> (Vec<f64>, Vec<f64>) {
+        let mut num: Vec<Z> = self
+            .num0
+            .iter()
+            .map(|c| (c.re as f64, c.im as f64))
+            .collect();
+        let mut den: Vec<f64> = self.den0.iter().map(|&v| v as f64).collect();
+        let psi = &self.psi_host[f.start as usize * Self::fsize(&self.d)..];
+        let views = self.frame_views(f);
+        probe_sums_f64(&self.d, views, psi, &self.obj_host, &mut num, &mut den);
+        (num.iter().flat_map(|&(a, b)| [a, b]).collect(), den)
+    }
+
+    /// Asserts Tile against SIMT and f64, and that both kept the bits of every probe mode
+    /// no view of frames `f` uses; returns those modes.
+    fn check(
+        &self,
+        what: &str,
+        f: Range<u32>,
+        tile: &(Vec<f32>, Vec<f32>),
+        simt: &(Vec<f32>, Vec<f32>),
+    ) -> Vec<u32> {
+        let want = self.want(f.clone());
+        let as_f64 = |v: &[f32]| v.iter().map(|&x| x as f64).collect::<Vec<_>>();
+        for (part, t, s, w) in [
+            ("num", &tile.0, &simt.0, &want.0),
+            ("den", &tile.1, &simt.1, &want.1),
+        ] {
+            let (vs_simt, vs_f64, simt_f64) = (rel_l2(t, &as_f64(s)), rel_l2(t, w), rel_l2(s, w));
+            let same = t.iter().zip(s).filter(|(a, b)| a.to_bits() == b.to_bits());
+            println!(
+                "{what} {part}: rel L2 Tile-SIMT {vs_simt:.2e}, Tile-f64 {vs_f64:.2e}, \
+                 SIMT-f64 {simt_f64:.2e}; {} of {} values bit-equal to SIMT",
+                same.count(),
+                t.len()
+            );
+            assert!(
+                vs_simt < 1e-6,
+                "{what} {part}: Tile vs SIMT rel L2 {vs_simt:.2e}"
+            );
+            assert!(
+                vs_f64 < 1e-5,
+                "{what} {part}: Tile vs f64 rel L2 {vs_f64:.2e}"
+            );
+        }
+        let views = self.frame_views(f);
+        let idle: Vec<u32> = (0..self.d.nprobe)
+            .filter(|&p| views.iter().all(|v| v.probe != p))
+            .collect();
+        let n = n(&self.d);
+        let num0: Vec<f32> = self.num0.iter().flat_map(|c| [c.re, c.im]).collect();
+        for &p in &idle {
+            let px = p as usize * n..(p as usize + 1) * n;
+            let re = 2 * px.start..2 * px.end;
+            for (who, got) in [("SIMT", simt), ("Tile", tile)] {
+                assert_eq!(
+                    bits(&got.0[re.clone()]),
+                    bits(&num0[re.clone()]),
+                    "{what} {who}: num of probe mode {p}, without views, changed"
+                );
+                assert_eq!(
+                    bits(&got.1[px.clone()]),
+                    bits(&self.den0[px.clone()]),
+                    "{what} {who}: den of probe mode {p}, without views, changed"
+                );
+            }
+        }
+        idle
+    }
+}
+
 #[test]
 fn psi_to_probe_matches_simt_and_ignores_stack_split() {
-    let ctx = CudaContext::new(0).expect("CUDA device 0");
-    let k = Kernels::load(&ctx).expect("load ptyrs-gpu kernels");
-    let stream: Arc<CudaStream> = ctx.default_stream();
-    let ex = ExecutionContext::new(stream.clone());
-    let (d, view_list) = dims();
-    let n = (d.frame[0] * d.frame[1]) as usize;
-    let nk = |f: Range<u32>| ((f.end - f.start) * d.nmode) as usize;
-    let views = Views::new(&stream, d, &view_list).unwrap();
-    let obj_host = noise(d.nobj as usize * (d.obj[0] * d.obj[1]) as usize, 2, 1.0);
-    let obj = up(&stream, &obj_host);
-    let psi_host = noise(nk(0..5) * n, 3, 1.0);
-    let psi = up(&stream, &psi_host);
-    let split = nk(0..2) * n;
-    let psi_parts = [
-        up(&stream, &psi_host[..split]),
-        up(&stream, &psi_host[split..]),
-    ];
-    // Non-zero starting sums: the kernels add to what is there.
-    let len = d.nprobe as usize * n;
-    let num0 = noise(len, 20, 1.0);
-    let den0: Vec<f32> = noise(len, 21, 1.0).iter().map(|c| c.re.abs()).collect();
-    let start = || UpdateSums::new(up(&stream, &num0), up(&stream, &den0), &stream).unwrap();
+    let fx = Fixture::new();
+    let (stream, ex, views) = (&fx.stream, &fx.ex, &fx.views);
+    let fsize = Fixture::fsize(&fx.d);
+    let whole = StackTable::new(stream, &fx.d, std::slice::from_ref(&(0..fx.d.nframe))).unwrap();
+    let psi = up(stream, &fx.psi_host);
+    // Stack 0 has no view of probe mode 2.
+    let stacks = [0..2, 2..5];
+    let split = StackTable::new(stream, &fx.d, &stacks).unwrap();
+    let psi_parts = stacks.map(|f| up(stream, &stack_psi(&fx.psi_host, fsize, f, split.nf_max())));
 
-    let mut simt = start();
-    k.psi_to_probe(&ex, &views, 0..5, &psi, &obj, &mut simt)
+    let mut simt = fx.start();
+    fx.k.psi_to_probe(ex, views, whole.at(0), &psi, &fx.obj, &mut simt)
         .unwrap();
-    let simt = host(&stream, &simt);
+    let simt = host(stream, &simt);
     let tile_whole = || {
-        let mut s = start();
-        ptyrs_tile::psi_to_probe(&ex, &views, 0..5, &psi, &obj, &mut s).unwrap();
-        host(&stream, &s)
+        let mut s = fx.start();
+        ptyrs_tile::psi_to_probe(ex, views, &whole, 0, &psi, &fx.obj, &mut s).unwrap();
+        host(stream, &s)
     };
     let tile = tile_whole();
-    let mut parts = start();
-    ptyrs_tile::psi_to_probe(&ex, &views, 0..2, &psi_parts[0], &obj, &mut parts).unwrap();
-    ptyrs_tile::psi_to_probe(&ex, &views, 2..5, &psi_parts[1], &obj, &mut parts).unwrap();
-    let parts = host(&stream, &parts);
+    fx.check("psi_to_probe 0..5", 0..5, &tile, &simt);
 
-    let mut num: Vec<Z> = num0.iter().map(|c| (c.re as f64, c.im as f64)).collect();
-    let mut den: Vec<f64> = den0.iter().map(|&v| v as f64).collect();
-    probe_sums_f64(&d, &view_list, &psi_host, &obj_host, &mut num, &mut den);
-    let num: Vec<f64> = num.iter().flat_map(|&(a, b)| [a, b]).collect();
-    let as_f64 = |v: &[f32]| v.iter().map(|&x| x as f64).collect::<Vec<_>>();
-
-    for (what, t, s, want) in [
-        ("num", &tile.0, &simt.0, &num),
-        ("den", &tile.1, &simt.1, &den),
-    ] {
-        let (vs_simt, vs_f64, simt_f64) = (rel_l2(t, &as_f64(s)), rel_l2(t, want), rel_l2(s, want));
-        let same = t
-            .iter()
-            .zip(s.iter())
-            .filter(|(a, b)| a.to_bits() == b.to_bits());
-        println!(
-            "psi_to_probe {what}: rel L2 Tile-SIMT {vs_simt:.2e}, Tile-f64 {vs_f64:.2e}, \
-             SIMT-f64 {simt_f64:.2e}; {} of {} values bit-equal to SIMT",
-            same.count(),
-            t.len()
-        );
-        assert!(vs_simt < 1e-6, "{what}: Tile vs SIMT rel L2 {vs_simt:.2e}");
-        assert!(vs_f64 < 1e-5, "{what}: Tile vs f64 rel L2 {vs_f64:.2e}");
+    let mut parts = fx.start();
+    for (s, psi) in psi_parts.iter().enumerate() {
+        ptyrs_tile::psi_to_probe(ex, views, &split, s, psi, &fx.obj, &mut parts).unwrap();
     }
+    let parts = host(stream, &parts);
     assert_eq!(
         bits(&parts.0),
         bits(&tile.0),
@@ -208,32 +336,75 @@ fn psi_to_probe_matches_simt_and_ignores_stack_split() {
     assert_eq!(bits(&again.1), bits(&tile.1), "den differs run to run");
 }
 
+/// One launch per entry value, written to the device between them: the kernels read the
+/// entry when they run and clamp it to `nf_max` frames inside the scan. A probe mode
+/// without a view in the stack, and every mode of an entry with no frames after the clamp,
+/// keeps its sums bit for bit.
 #[test]
-fn psi_to_probe_checks_frames_and_lengths() {
-    let ctx = CudaContext::new(0).expect("CUDA device 0");
-    let stream: Arc<CudaStream> = ctx.default_stream();
-    let ex = ExecutionContext::new(stream.clone());
-    let (d, view_list) = dims();
-    let n = (d.frame[0] * d.frame[1]) as usize;
-    let views = Views::new(&stream, d, &view_list).unwrap();
-    let obj = up(
-        &stream,
-        &noise(d.nobj as usize * (d.obj[0] * d.obj[1]) as usize, 2, 1.0),
-    );
-    let psi = up(&stream, &noise(2 * d.nmode as usize * n, 3, 1.0));
-    let mut sums = UpdateSums::zeroed(&stream, d.nprobe as usize * n).unwrap();
-    for frames in [1..1, 4..6] {
-        let r = ptyrs_tile::psi_to_probe(&ex, &views, frames.clone(), &psi, &obj, &mut sums);
+fn psi_to_probe_follows_the_device_entry() {
+    let fx = Fixture::new();
+    let (stream, ex, views) = (&fx.stream, &fx.ex, &fx.views);
+    let fsize = Fixture::fsize(&fx.d);
+    let dev = StackTable::device(stream, &fx.d, 3).unwrap();
+    let nframe = fx.d.nframe;
+    // With the modes each leaves without views.
+    let entries: [((u32, u32), &[u32]); 11] = [
+        ((0, 0), &[0, 1, 2]),
+        ((2, 0), &[0, 1, 2]),
+        ((5, 0), &[0, 1, 2]),
+        ((0, 3), &[2]),
+        ((1, 3), &[]),
+        ((3, 2), &[1]),
+        ((0, 4), &[2]),
+        ((4, 3), &[1]),
+        ((9, 2), &[0, 1, 2]),
+        ((u32::MAX, u32::MAX), &[0, 1, 2]),
+        ((0, u32::MAX), &[2]),
+    ];
+    for ((f0, nf), idle) in entries {
+        let c0 = f0.min(nframe);
+        let f = c0..c0 + nf.min(dev.nf_max()).min(nframe - c0);
+        let psi = up(
+            stream,
+            &stack_psi(&fx.psi_host, fsize, f.clone(), dev.nf_max()),
+        );
+        set_entry(&fx.k, stream, &dev, f0, nf);
+        let mut simt = fx.start();
+        fx.k.psi_to_probe(ex, views, dev.at(0), &psi, &fx.obj, &mut simt)
+            .unwrap();
+        let mut tile = fx.start();
+        ptyrs_tile::psi_to_probe(ex, views, &dev, 0, &psi, &fx.obj, &mut tile).unwrap();
+        let what = format!("psi_to_probe entry {{ f0: {f0}, nf: {nf} }} = frames {f:?}");
+        let (simt, tile) = (host(stream, &simt), host(stream, &tile));
+        assert_eq!(fx.check(&what, f, &tile, &simt), idle, "{what}: idle modes");
+    }
+}
+
+#[test]
+fn psi_to_probe_checks_lengths() {
+    let fx = Fixture::new();
+    let (stream, ex, views) = (&fx.stream, &fx.ex, &fx.views);
+    let fsize = Fixture::fsize(&fx.d);
+    let table = StackTable::new(stream, &fx.d, &[0..2, 2..5]).unwrap();
+    let psi = up(stream, &fx.psi_host[..3 * fsize]);
+    let shape = |r: Result<(), ptyrs_gpu::Error>, what: &str| {
         assert!(
             matches!(r, Err(ptyrs_gpu::Error::Shape(_))),
-            "frames {frames:?}: {r:?}"
+            "{what}: {r:?}"
         );
-    }
-    // Two frames of psi do not hold three.
-    let r = ptyrs_tile::psi_to_probe(&ex, &views, 0..3, &psi, &obj, &mut sums);
-    assert!(matches!(r, Err(ptyrs_gpu::Error::Shape(_))), "{r:?}");
-    // One probe mode of sums does not hold two.
-    let mut short = UpdateSums::zeroed(&stream, n).unwrap();
-    let r = ptyrs_tile::psi_to_probe(&ex, &views, 0..2, &psi, &obj, &mut short);
-    assert!(matches!(r, Err(ptyrs_gpu::Error::Shape(_))), "{r:?}");
+    };
+    let mut sums = UpdateSums::zeroed(stream, fx.num0.len()).unwrap();
+    // Two frames of psi do not hold `nf_max` = 3.
+    let short_psi = up(stream, &fx.psi_host[..2 * fsize]);
+    let r = ptyrs_tile::psi_to_probe(ex, views, &table, 1, &short_psi, &fx.obj, &mut sums);
+    shape(r, "psi");
+    // One object mode does not hold two.
+    let short_obj = up(stream, &fx.obj_host[..fx.obj_host.len() / 2]);
+    let r = ptyrs_tile::psi_to_probe(ex, views, &table, 1, &psi, &short_obj, &mut sums);
+    shape(r, "obj");
+    // Two probe modes of sums do not hold three.
+    let mut short = UpdateSums::zeroed(stream, 2 * n(&fx.d)).unwrap();
+    let r = ptyrs_tile::psi_to_probe(ex, views, &table, 1, &psi, &fx.obj, &mut short);
+    shape(r, "sums");
+    ptyrs_tile::psi_to_probe(ex, views, &table, 1, &psi, &fx.obj, &mut sums).unwrap();
 }
