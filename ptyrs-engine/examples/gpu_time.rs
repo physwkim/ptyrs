@@ -1,11 +1,12 @@
 //! Per-cycle time of [`GpuPtycho`] on CUDA device 0, the M1 baseline for M2.
 //!
-//! `cargo run --release -p ptyrs-engine --example gpu_time -- <dm|ap|rpie> [ncycle] [nprobe] [frame] [npos] [step] [sizes] [graph|eager]`
-//! (defaults 50, 2, 256, 400, 16 object pixels, `16`, `graph`) builds the `llk_trace` scan,
-//! and for each comma-separated size (frames per stack; rPIE frames per batch) runs 5 untimed
-//! cycles, then times `ncycle` cycles without LLK or phase-ramp removal, as
-//! `scripts/compare_pynx.py --time` times PyNX. `graph` replays steady-state AP and DM cycles
-//! and rPIE epochs from the graph the untimed cycles captured ([`GpuOptions::graph`]).
+//! `cargo run --release -p ptyrs-engine --example gpu_time -- <dm|ap|rpie> [ncycle] [nprobe] [frame] [npos] [step] [sizes] [graph|eager] [calc_llk]`
+//! (defaults 50, 2, 256, 400, 16 object pixels, `16`, `graph`, 0) builds the `llk_trace`
+//! scan, and for each comma-separated size (frames per stack; rPIE frames per batch) runs 5
+//! untimed cycles, then times `ncycle` cycles without phase-ramp removal, with an LLK record
+//! every `calc_llk` cycles (0: none, as `scripts/compare_pynx.py --time` times PyNX). `graph`
+//! replays steady-state AP and DM cycles, rPIE epochs and LLK passes from the graphs the
+//! untimed cycles captured ([`GpuOptions::graph`]).
 
 use std::time::Instant;
 
@@ -18,7 +19,7 @@ mod common;
 const WARMUP: usize = 5;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let usage = "usage: gpu_time <dm|ap|rpie> [ncycle] [nprobe] [frame] [npos] [step] [sizes] [graph|eager]";
+    let usage = "usage: gpu_time <dm|ap|rpie> [ncycle] [nprobe] [frame] [npos] [step] [sizes] [graph|eager] [calc_llk]";
     let mut args = std::env::args().skip(1);
     let algo = args.next().ok_or(usage)?;
     if !["dm", "ap", "rpie"].contains(&algo.as_str()) {
@@ -37,6 +38,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some("eager") => false,
         Some(_) => return Err(usage.into()),
     };
+    let calc_llk = args.next().map_or(Ok(0), |s| s.parse::<usize>())?;
 
     let (scan, object, probe) = common::dm_scenario(frame, npos, nprobe, 2e5, step);
     let mut p = Ptycho::new(&scan, object, probe)?;
@@ -51,11 +53,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ap = ApParams {
         obj_inertia: Some(0.01),
         probe_inertia: Some(0.001),
-        calc_llk: 0,
+        calc_llk,
         zero_phase_ramp: false,
     };
     let dm = DmParams {
-        calc_llk: 0,
+        calc_llk,
         zero_phase_ramp: false,
         ..DmParams::default()
     };
@@ -69,7 +71,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut g = GpuPtycho::new(&ctx, &scan, object.clone(), probe.clone(), options)?;
         let rpie = RpieParams {
             batch_size: size,
-            calc_llk: 0,
+            calc_llk,
             ..common::RPIE
         };
         let run = |g: &mut GpuPtycho, n: usize| -> Result<(), EngineError> {
@@ -86,7 +88,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         g.synchronize()?;
         let ms = 1e3 * t.elapsed().as_secs_f64() / ncycle as f64;
         let mode = if graph { "graph" } else { "eager" };
-        println!("{algo} size {size} {mode}: {ms:.3} ms/cycle over {ncycle} cycles");
+        println!(
+            "{algo} size {size} {mode} calc_llk {calc_llk}: {ms:.3} ms/cycle over {ncycle} cycles, {} LLK records",
+            g.history().len()
+        );
     }
     Ok(())
 }
