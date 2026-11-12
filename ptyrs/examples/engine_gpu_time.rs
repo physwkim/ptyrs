@@ -10,7 +10,8 @@
 //! ([`GpuOptions::graph`]); `fused` runs AP and DM stacks, ML's gradients and the LLK pass by
 //! the fused passes, `m1` by M1's launches ([`GpuOptions::fused`]). ML updates object and
 //! probe. `features`, comma-separated, models [`Features`] from the start: `scale` (1 per
-//! frame), `background` (1 count per pixel) or `none`.
+//! frame), `background` (1 count per pixel), `position` (offsets of 0.1 pixels alternating in
+//! sign, AP only) or `none`.
 
 use std::time::Instant;
 
@@ -59,6 +60,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "none" => {}
             "scale" => want.scale = Some(vec![1.0; npos]),
             "background" => want.background = Some(vec![1.0; frame * frame]),
+            "position" => {
+                let d = |f: usize| if f.is_multiple_of(2) { 0.1 } else { -0.1 };
+                want.position = Some((0..npos).map(|f| [d(f), -d(f)]).collect());
+            }
             _ => return Err(usage.into()),
         }
     }
