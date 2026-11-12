@@ -14,9 +14,9 @@ use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig};
 use ptyrs_kernels::FFT_EPT;
 use ptyrs_kernels::fused::{
-    FUSED_COL_THREADS, FUSED_COLS, FUSED_DM, FUSED_GRAD, FUSED_LLK, FUSED_PROJECT,
-    FUSED_ROW_THREADS, FUSED_SCALE, FUSED_SCALE_SUMS, FUSED_TO_PSI, FusedCfg, FusedPtrs,
-    col_slot_bytes,
+    FUSED_BACKGROUND, FUSED_BACKGROUND_SUMS, FUSED_COL_THREADS, FUSED_COLS, FUSED_DM, FUSED_GRAD,
+    FUSED_LLK, FUSED_PROJECT, FUSED_ROW_THREADS, FUSED_SCALE, FUSED_SCALE_SUMS, FUSED_TO_PSI,
+    FusedCfg, FusedPtrs, col_slot_bytes,
 };
 
 use crate::ops::grid_1d;
@@ -218,9 +218,12 @@ pub struct FusedInputs<'a> {
 pub struct Model<'a> {
     /// Per-frame intensity scale `s`, `[nframe]`: `calc = s[f] I` for frame `f`.
     pub scale: Option<&'a DeviceBuffer<f32>>,
+    /// Incoherent background `b`, `[ny, nx]` in the counts' (detector) order, the same for
+    /// every frame: `calc` plus `b[j]` at detector pixel `j`.
+    pub background: Option<&'a DeviceBuffer<f32>>,
 }
 
-/// Per-frame sums of the forward far field's `calc` against the counts that
+/// Sums of the forward far field's `calc` against the counts that
 /// [`Kernels::fused_project`] and [`Kernels::fused_llk`] write; `Default` writes none.
 #[derive(Default)]
 pub struct FarSums<'a> {
@@ -228,18 +231,46 @@ pub struct FarSums<'a> {
     pub llk: Option<&'a mut DeviceBuffer<LlkPartial>>,
     /// The scale sums `scale[f0 + fl]` for `fl < nf`, `[nframe]`; no other entry written.
     pub scale: Option<&'a mut DeviceBuffer<ScalePartial>>,
+    /// The background sums, the stack's frames added.
+    pub background: Option<&'a mut BackgroundSums>,
 }
 
 impl FarSums<'_> {
     /// The column-pass flags that write these sums.
     fn flags(&self) -> u32 {
-        let llk = if self.llk.is_some() { FUSED_LLK } else { 0 };
-        let scale = if self.scale.is_some() {
-            FUSED_SCALE_SUMS
-        } else {
-            0
-        };
-        llk | scale
+        let flag = |on: bool, flag: u32| if on { flag } else { 0 };
+        flag(self.llk.is_some(), FUSED_LLK)
+            | flag(self.scale.is_some(), FUSED_SCALE_SUMS)
+            | flag(self.background.is_some(), FUSED_BACKGROUND_SUMS)
+    }
+}
+
+/// The background's sums over a scan's frames: `sum[j]` is `obs / max(calc, 1e-12)` at
+/// detector pixel `j` summed over the frames where `j` is unmasked, which
+/// [`Kernels::fused_project`] and [`Kernels::fused_llk`] add a stack at a time in ascending
+/// frame order, so that the split into stacks does not change a bit. They hold what was
+/// added since the last [`Kernels::background_ap`] or [`Kernels::background_grad`] consumed
+/// them; the only other reset is construction.
+pub struct BackgroundSums {
+    /// `[ny, nx]`, detector order.
+    pub sum: DeviceBuffer<f32>,
+    /// Each frame's ratios, `[nf_max, ny, nx]`, the column pass writes for the sum.
+    ratio: DeviceBuffer<f32>,
+}
+
+impl BackgroundSums {
+    /// Zeroed sums for frames of `dims` in stacks of up to `nf_max` frames.
+    pub fn zeroed(stream: &CudaStream, dims: &ViewDims, nf_max: u32) -> Result<Self, Error> {
+        let n = dims.n();
+        Ok(Self {
+            sum: DeviceBuffer::zeroed(stream, n)?,
+            ratio: DeviceBuffer::zeroed(stream, nf_max as usize * n)?,
+        })
+    }
+
+    fn check(&self, n: usize, nf_max: u32) -> Result<(), Error> {
+        check_len("background sums", &self.sum, n)?;
+        check_len("background ratios", &self.ratio, nf_max as usize * n)
     }
 }
 
@@ -319,7 +350,7 @@ impl Kernels {
         let psi = psi.as_deref();
         let p = FusedPtrs {
             psi: psi.map_or(std::ptr::null_mut(), dptr),
-            ..run.ptrs(bufs)
+            ..run.ptrs(bufs, &far)
         };
         let dm_flag = if dm { FUSED_DM } else { 0 };
 
@@ -339,7 +370,7 @@ impl Kernels {
             flags: pass | run.model_flags() | far.flags(),
             alpha,
         };
-        run.cols(bufs, p, cfg)?;
+        run.cols(bufs, &far, p, cfg)?;
         run.far_sums(bufs, far)?;
         let to_psi = if psi.is_some() { FUSED_TO_PSI } else { 0 };
         let cfg = FusedCfg {
@@ -370,14 +401,74 @@ impl Kernels {
     ) -> Result<(), Error> {
         let run = Run::new(self, ctx, *inputs, stack, bufs)?;
         run.check_far(&far)?;
-        let p = run.ptrs(bufs);
+        let p = run.ptrs(bufs, &far);
         run.rows_fwd(bufs, None, p, FusedCfg::default())?;
         let cfg = FusedCfg {
             flags: run.model_flags() | far.flags(),
             alpha: 0.0,
         };
-        run.cols(bufs, p, cfg)?;
+        run.cols(bufs, &far, p, cfg)?;
         run.far_sums(bufs, far)
+    }
+
+    /// Poisson's fixed-point background step from `sums`, `b[j] = b[j] sum[j] / nobs[j]`
+    /// where `nobs[j]`, the frames at which detector pixel `j` is unmasked, is not 0; then
+    /// zeroes `sums`, which the step has consumed.
+    pub fn background_ap(
+        &self,
+        ctx: &ExecutionContext,
+        b: &mut DeviceBuffer<f32>,
+        sums: &mut BackgroundSums,
+        nobs: &DeviceBuffer<u32>,
+    ) -> Result<(), Error> {
+        let n = sums.sum.len();
+        check_len("background", b, n)?;
+        check_len("nobs", nobs, n)?;
+        let config = grid_1d(n)?;
+        let writes = [b.storage(), sums.sum.storage()];
+        self.launch(ctx, &[nobs.storage()], &writes, |stream| {
+            // SAFETY: all three hold `n` values.
+            unsafe {
+                self.module.background_ap(
+                    stream,
+                    config,
+                    dptr(b),
+                    dptr(&sums.sum),
+                    dptr(nobs),
+                    n as u32,
+                )
+            }
+        })
+    }
+
+    /// The Poisson LLK gradient over the background from `sums`, `grad[j] = nobs[j] -
+    /// sum[j]` (`nobs` as in [`Self::background_ap`]); then zeroes `sums`, which the
+    /// gradient has consumed.
+    pub fn background_grad(
+        &self,
+        ctx: &ExecutionContext,
+        sums: &mut BackgroundSums,
+        nobs: &DeviceBuffer<u32>,
+        grad: &mut DeviceBuffer<f32>,
+    ) -> Result<(), Error> {
+        let n = sums.sum.len();
+        check_len("nobs", nobs, n)?;
+        check_len("grad", grad, n)?;
+        let config = grid_1d(n)?;
+        let writes = [sums.sum.storage(), grad.storage()];
+        self.launch(ctx, &[nobs.storage()], &writes, |stream| {
+            // SAFETY: all three hold `n` values.
+            unsafe {
+                self.module.background_grad(
+                    stream,
+                    config,
+                    dptr(&sums.sum),
+                    dptr(nobs),
+                    dptr(grad),
+                    n as u32,
+                )
+            }
+        })
     }
 }
 
@@ -409,6 +500,9 @@ impl<'a> Run<'a> {
         if let Some(scale) = inputs.model.scale {
             check_len("scale", scale, d.nframe as usize)?;
         }
+        if let Some(background) = inputs.model.background {
+            check_len("background", background, n)?;
+        }
         bufs.check(d, &g)?;
         Ok(Self {
             k,
@@ -421,7 +515,10 @@ impl<'a> Run<'a> {
     }
 
     /// Every address but `psi`, which is null.
-    fn ptrs(&self, bufs: &FusedBufs) -> FusedPtrs {
+    fn ptrs(&self, bufs: &FusedBufs, far: &FarSums<'_>) -> FusedPtrs {
+        let input = |b: Option<&DeviceBuffer<f32>>| {
+            b.map_or(std::ptr::null(), |b| dptr::<f32, f32>(b).cast_const())
+        };
         FusedPtrs {
             obj: dptr(self.inputs.obj),
             probe: dptr(self.inputs.probe),
@@ -432,19 +529,19 @@ impl<'a> Run<'a> {
             probe_q: dptr(&bufs.probe_q),
             probe_power: dptr(&bufs.probe_power),
             groups: dptr(&bufs.groups),
-            scale: (self.inputs.model.scale)
-                .map_or(std::ptr::null(), |b| dptr::<f32, f32>(b).cast_const()),
+            scale: input(self.inputs.model.scale),
             scale_groups: dptr(&bufs.scale_groups),
+            background: input(self.inputs.model.background),
+            background_ratio: (far.background.as_deref())
+                .map_or(std::ptr::null_mut(), |b| dptr(&b.ratio)),
         }
     }
 
     /// The column-pass flags of the model.
     fn model_flags(&self) -> u32 {
-        if self.inputs.model.scale.is_some() {
-            FUSED_SCALE
-        } else {
-            0
-        }
+        let Model { scale, background } = self.inputs.model;
+        let flag = |on: bool, flag: u32| if on { flag } else { 0 };
+        flag(scale.is_some(), FUSED_SCALE) | flag(background.is_some(), FUSED_BACKGROUND)
     }
 
     fn check_far(&self, far: &FarSums<'_>) -> Result<(), Error> {
@@ -453,6 +550,9 @@ impl<'a> Run<'a> {
         }
         if let Some(out) = &far.scale {
             check_len("scale sums", out, self.g.nframe as usize)?;
+        }
+        if let Some(sums) = &far.background {
+            sums.check(self.inputs.views.dims().n(), self.g.nf_max)?;
         }
         Ok(())
     }
@@ -520,9 +620,15 @@ impl<'a> Run<'a> {
             })
     }
 
-    /// Pass B on `bufs.work`; reads the scale under `FUSED_SCALE`, writes `bufs.groups`
-    /// under `FUSED_LLK` and `bufs.scale_groups` under `FUSED_SCALE_SUMS`.
-    fn cols(&self, bufs: &FusedBufs, p: FusedPtrs, cfg: FusedCfg) -> Result<(), Error> {
+    /// Pass B on `bufs.work`; reads the model's buffers and writes `bufs.groups`,
+    /// `bufs.scale_groups` and the background ratios of `far` under their flags.
+    fn cols(
+        &self,
+        bufs: &FusedBufs,
+        far: &FarSums<'_>,
+        p: FusedPtrs,
+        cfg: FusedCfg,
+    ) -> Result<(), Error> {
         let config = self.sh.cols(&self.g, cfg.flags)?;
         let mut reads = vec![self.inputs.counts.storage(), self.stack.storage()];
         let mut writes = vec![];
@@ -534,11 +640,17 @@ impl<'a> Run<'a> {
         if cfg.flags & FUSED_SCALE != 0 {
             reads.extend(self.inputs.model.scale.map(|b| b.storage()));
         }
+        if cfg.flags & FUSED_BACKGROUND != 0 {
+            reads.extend(self.inputs.model.background.map(|b| b.storage()));
+        }
         if cfg.flags & FUSED_LLK != 0 {
             writes.push(bufs.groups.storage());
         }
         if cfg.flags & FUSED_SCALE_SUMS != 0 {
             writes.push(bufs.scale_groups.storage());
+        }
+        if cfg.flags & FUSED_BACKGROUND_SUMS != 0 {
+            writes.extend(far.background.as_deref().map(|b| b.ratio.storage()));
         }
         let (ctl, g) = (self.ctl(), self.g);
         self.k.launch(self.ctx, &reads, &writes, |stream| {
@@ -575,6 +687,25 @@ impl<'a> Run<'a> {
                             groups,
                             ngroup,
                             dptr(out),
+                            ctl,
+                            g,
+                        )
+                    }
+                })?;
+        }
+        if let Some(sums) = far.background {
+            let config = grid_1d(self.inputs.views.dims().n())?;
+            let reads = [sums.ratio.storage(), self.stack.storage()];
+            let (ctl, g) = (self.ctl(), self.g);
+            self.k
+                .launch(self.ctx, &reads, &[sums.sum.storage()], |stream| {
+                    // SAFETY: `check_far` checked `sums` against `g`.
+                    unsafe {
+                        self.k.module.background_sums(
+                            stream,
+                            config,
+                            dptr(&sums.ratio),
+                            dptr(&sums.sum),
                             ctl,
                             g,
                         )

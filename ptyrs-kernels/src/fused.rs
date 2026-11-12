@@ -41,6 +41,11 @@ pub const FUSED_GRAD: u32 = 32;
 pub const FUSED_SCALE: u32 = 64;
 /// [`cols`] writes the [`ScalePartial`] sums of the forward far field.
 pub const FUSED_SCALE_SUMS: u32 = 128;
+/// [`cols`] adds the detector background `b[j]` to `calc`.
+pub const FUSED_BACKGROUND: u32 = 256;
+/// [`cols`] writes each frame's background ratio `obs / max(calc, 1e-12)` of the forward far
+/// field.
+pub const FUSED_BACKGROUND_SUMS: u32 = 512;
 
 /// Columns of one frame a [`cols`] block transforms, for every mode.
 pub const FUSED_COLS: u32 = 8;
@@ -90,6 +95,10 @@ pub struct FusedPtrs {
     pub scale: *const f32,
     /// Scale sums of each frame's column groups, `[nf_max, nx / FUSED_COLS]`.
     pub scale_groups: *mut ScalePartial,
+    /// The background `b`, `[ny, nx]`, detector order.
+    pub background: *const f32,
+    /// Each frame's background ratio, `[nf_max, ny, nx]`, detector order.
+    pub background_ratio: *mut f32,
 }
 
 /// Bytes of [`cols`]' reduction slots under `flags` for columns of `ny`: a row of
@@ -205,16 +214,18 @@ pub unsafe fn rows_fwd<const NX: u32>(
 
 /// Pass B: column FFT of columns `u = blockIdx.x * FUSED_COLS + c` of every mode `m` of
 /// frame `fl = blockIdx.y`, then per far-field pixel the model intensity `I = sum_m
-/// |Psi_m|^2 / n` in ascending `m` and `calc = I`, or under `FUSED_SCALE` `calc = s I` with
-/// `s = scale[f0 + fl]`. Under `FUSED_LLK`, `groups[fl, blockIdx.x]` gets the LLK sums of
-/// `kernels::llk` of `calc` over the block's pixels, and under `FUSED_SCALE_SUMS`
-/// `scale_groups[fl, blockIdx.x]` the [`ScalePartial`] sums. Under `FUSED_PROJECT`, every
+/// |Psi_m|^2 / n` in ascending `m` and `calc = I`, under `FUSED_SCALE` times `s = scale[f0 +
+/// fl]` and under `FUSED_BACKGROUND` plus `background[j]` at detector pixel `j`. Under
+/// `FUSED_LLK`, `groups[fl, blockIdx.x]` gets the LLK sums of `kernels::llk` of `calc` over
+/// the block's pixels, under `FUSED_SCALE_SUMS` `scale_groups[fl, blockIdx.x]` the
+/// [`ScalePartial`] sums, and under `FUSED_BACKGROUND_SUMS` `background_ratio[fl, j]` is `obs
+/// / max(calc, 1e-12)`, 0 where masked. Under `FUSED_PROJECT`, every
 /// mode is scaled by `sqrt(obs / max(calc, 1e-12)) / n`, `1 / n` where masked (with `calc =
 /// I` the scale of `kernels::apply_amplitude`), inverse column-FFT'd and stored back.
 /// `FUSED_GRAD` does the same with the scale `2 s (1 - obs / max(calc, 1e-12)) / n`, 0 where
 /// masked, which makes the stored waves the gradient of the Poisson LLK sum of `calc` over
-/// `(Re psi, Im psi)`. Reads `counts` and under `FUSED_SCALE` `scale`; writes `work`, under
-/// `FUSED_LLK` `groups` and under `FUSED_SCALE_SUMS` `scale_groups`.
+/// `(Re psi, Im psi)`. Reads `counts`, and `scale` and `background` under their flags;
+/// writes `work`, and `groups`, `scale_groups` and `background_ratio` under theirs.
 ///
 /// One 1D block of `nmode * FUSED_COLS * tpf` threads (`tpf = ny / FFT_EPT`): thread `tid`
 /// is thread `f = (tid / FUSED_COLS) % tpf` of FFT `m * FUSED_COLS + c`, `c = tid %
@@ -251,6 +262,8 @@ pub unsafe fn cols<const NY: u32>(p: FusedPtrs, ctl: *const StackCtl, g: StackGe
     let plane = (fl * nmode + m) as usize * n;
     let llk = cfg.flags & FUSED_LLK != 0;
     let sums = cfg.flags & FUSED_SCALE_SUMS != 0;
+    let background = cfg.flags & FUSED_BACKGROUND != 0;
+    let bg_ratio = cfg.flags & FUSED_BACKGROUND_SUMS != 0;
     let project = cfg.flags & FUSED_PROJECT != 0;
     let grad = cfg.flags & FUSED_GRAD != 0;
     let mut r = [0.0f32; 2 * FFT_EPT as usize];
@@ -309,8 +322,21 @@ pub unsafe fn cols<const NY: u32>(p: FusedPtrs, ctl: *const StackCtl, g: StackGe
                 s += *power.add(((mm * ny + v) * FUSED_COLS + c) as usize);
             }
             let intensity = s * inv_n;
-            let calc = sf * intensity;
-            let obs = *tile.add((((v + ny / 2) % ny) * FUSED_COLS + c) as usize);
+            let y = (v + ny / 2) % ny;
+            // Detector pixel: `col0 + c` is `(u + nx / 2) % nx`.
+            let j = (y * nx + col0 + c) as usize;
+            let mut calc = sf * intensity;
+            if background {
+                calc += *p.background.add(j);
+            }
+            let obs = *tile.add((y * FUSED_COLS + c) as usize);
+            if m == 0 && bg_ratio {
+                *p.background_ratio.add(fl as usize * n + j) = if obs == MASKED {
+                    0.0
+                } else {
+                    obs as f32 / calc.max(1e-12)
+                };
+            }
             if m == 0 && obs != MASKED {
                 let obs = obs as f32;
                 if llk {

@@ -593,6 +593,74 @@ pub mod kernels {
         unsafe { *out.add(f0 as usize + fl) = s };
     }
 
+    /// The stack's background ratios into `sum`: `sum[j] += ratio[fl, j]` for `fl` ascending
+    /// over the stack's frames, at every pixel `j < ny * nx`, so that stacks taken in scan
+    /// order give every pixel one sum whatever the split. One thread per pixel.
+    ///
+    /// # Safety
+    ///
+    /// `ratio` holds `nf_max * ny * nx` floats, `sum` `ny * nx`, `ctl` one entry.
+    #[kernel]
+    pub unsafe fn background_sums(
+        ratio: *const f32,
+        sum: *mut f32,
+        ctl: *const StackCtl,
+        g: StackGeom,
+    ) {
+        let (_, nf) = unsafe { stack_frames(ctl, g) };
+        let n = g.ny as usize * g.nx as usize;
+        let j = global_index();
+        if j >= n || nf == 0 {
+            return;
+        }
+        unsafe {
+            let mut acc = *sum.add(j);
+            for fl in 0..nf as usize {
+                acc += *ratio.add(fl * n + j);
+            }
+            *sum.add(j) = acc;
+        }
+    }
+
+    /// Poisson's fixed-point background update, `b[j] = b[j] * sum[j] / nobs[j]` where
+    /// `nobs[j] > 0` (else `b[j]` is kept), consuming the sums: `sum[j] = 0`.
+    ///
+    /// # Safety
+    ///
+    /// `b`, `sum` and `nobs` hold `n` values.
+    #[kernel]
+    pub unsafe fn background_ap(b: *mut f32, sum: *mut f32, nobs: *const u32, n: u32) {
+        let j = global_index();
+        if j >= n as usize {
+            return;
+        }
+        unsafe {
+            let k = *nobs.add(j);
+            if k > 0 {
+                *b.add(j) = *b.add(j) * *sum.add(j) / k as f32;
+            }
+            *sum.add(j) = 0.0;
+        }
+    }
+
+    /// The Poisson LLK gradient over the background, `grad[j] = nobs[j] - sum[j]`, consuming
+    /// the sums: `sum[j] = 0`.
+    ///
+    /// # Safety
+    ///
+    /// `sum`, `nobs` and `grad` hold `n` values.
+    #[kernel]
+    pub unsafe fn background_grad(sum: *mut f32, nobs: *const u32, grad: *mut f32, n: u32) {
+        let j = global_index();
+        if j >= n as usize {
+            return;
+        }
+        unsafe {
+            *grad.add(j) = *nobs.add(j) as f32 - *sum.add(j);
+            *sum.add(j) = 0.0;
+        }
+    }
+
     /// `bin_tile_views` of the stack's views, the views a slab cannot hold added to
     /// `*overflow`.
     ///

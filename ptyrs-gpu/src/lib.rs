@@ -34,7 +34,9 @@ use ptyrs_kernels::kernels::LoadedModule;
 mod fused;
 mod ops;
 
-pub use fused::{Exit, FUSED_SIDES, FarSums, FusedBufs, FusedInputs, FusedSums, Model};
+pub use fused::{
+    BackgroundSums, Exit, FUSED_SIDES, FarSums, FusedBufs, FusedInputs, FusedSums, Model,
+};
 pub use ops::{
     LLK_TREE_LEAVES, LlkPartial, LlkScratch, LlkSums, MASKED, OBJ_TILE, Permutation, ScalePartial,
     StackCtl, StackGeom, StackRef, StackTable, UpdateSums, ViewAddr, ViewDims, Views, view_tiles,
