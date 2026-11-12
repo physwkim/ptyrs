@@ -170,7 +170,8 @@ fn main() {
     }
     for _ in 0..total {
         if tile {
-            tk.update_obj_from_sums(&ex, &mut obj, &mut obj_sums, 0.01)
+            tk.updates()
+                .update_obj_from_sums(&ex, &views, &mut obj, &mut obj_sums, 0.01)
                 .unwrap();
         } else {
             k.update_obj_from_sums(&ex, &views, &mut obj, &mut obj_sums, 0.01)
@@ -179,7 +180,8 @@ fn main() {
     }
     for _ in 0..total {
         if tile {
-            tk.update_probe_from_sums(&ex, &mut probe, &mut probe_sums, 0.01)
+            tk.updates()
+                .update_probe_from_sums(&ex, &mut probe, &mut probe_sums, 0.01)
                 .unwrap();
         } else {
             k.update_from_sums(&ex, &mut probe, &mut probe_sums, probe_len as u32, 0.01)

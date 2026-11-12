@@ -1,9 +1,10 @@
 //! ptyrs-tile: cuTile (Tile IR) alternatives to `ptyrs-gpu` SIMT pieces.
 //!
-//! Every launch is a method of a [`TileKernels`], the kernels of one scan, which compiles
-//! them all when it is built, so no launch compiles, eagerly or under a graph capture. A
-//! launch takes the context, stack and buffers of its `ptyrs_gpu` counterpart, the scan's
-//! views being the set's, leases the buffers with [`ptyrs_gpu::lease`] and enqueues on the
+//! Every launch is a method of a [`TileKernels`], the kernels of one scan, or of its
+//! [`TileUpdates`], each compiling its kernels when it is built, so no launch compiles,
+//! eagerly or under a graph capture. A launch takes the context, stack and buffers of its
+//! `ptyrs_gpu` counterpart, the scan's views being the set's (the updates take them, as
+//! their counterparts do), leases the buffers with [`ptyrs_gpu::lease`] and enqueues on the
 //! context's stream, so it runs eagerly or records into a capture the same way.
 
 use std::sync::Arc;
@@ -1000,6 +1001,7 @@ pub struct TileKernels<'a> {
     /// Complex values of the probe, `nprobe * ny * nx`.
     probe_len: usize,
     llk_levels: Vec<usize>,
+    updates: TileUpdates,
 }
 
 impl<'a> TileKernels<'a> {
@@ -1035,16 +1037,20 @@ impl<'a> TileKernels<'a> {
             psi_len,
             probe_len,
             llk_levels,
+            updates: TileUpdates::new(stream, views)?,
         };
         let run = Run::Compile(stream);
         for ctl in UNBOUND_CTL {
             k.psi_to_obj_run(run, ctl, [UNBOUND; 4])?;
             k.psi_to_probe_run(run, ctl, [UNBOUND; 4])?;
         }
-        k.update_obj_run(run, [UNBOUND; 4], 0.0)?;
-        k.update_probe_run(run, [UNBOUND; 4], 0.0)?;
         k.llk_run(run, [UNBOUND; 3])?;
         Ok(k)
+    }
+
+    /// The scan's object and probe updates, compiled with the set.
+    pub fn updates(&self) -> &TileUpdates {
+        &self.updates
     }
 
     /// The stack kernels' scalar arguments: `nframe`, `nf_max`, `nmode`, the frame and
@@ -1220,143 +1226,6 @@ impl<'a> TileKernels<'a> {
         Ok(())
     }
 
-    /// [`ptyrs_gpu::Kernels::update_obj_from_sums`]: [`Self::update_probe_from_sums`] of the
-    /// object `[nobj, nyo, nxo]` on the object tiles with views only, `reg = inertia *
-    /// max(den)` over their pixels, zeroing their sums. A tile whose run is empty is neither
-    /// read nor written, in `obj` or `sums`, so it keeps its bits. `sums.max_bits` is the
-    /// scratch for the maximum.
-    pub fn update_obj_from_sums(
-        &self,
-        ctx: &ExecutionContext,
-        obj: &mut DeviceBuffer<C32>,
-        sums: &mut UpdateSums,
-        inertia: f32,
-    ) -> Result<(), Error> {
-        let len = obj_len(self.views.dims());
-        check_len("obj", obj, len)?;
-        check_len("sums.num", &sums.num, len)?;
-        check_len("sums.den", &sums.den, len)?;
-        check_len("sums.max_bits", &sums.max_bits, 1)?;
-        let UpdateSums { num, den, max_bits } = sums;
-        let at = [
-            addr("obj", obj)?,
-            addr("sums.num", num)?,
-            addr("sums.den", den)?,
-            addr("sums.max_bits", max_bits)?,
-        ];
-        ptyrs_gpu::zero(ctx, max_bits)?;
-        let writes = [
-            max_bits.storage(),
-            obj.storage(),
-            num.storage(),
-            den.storage(),
-        ];
-        lease(ctx, &[self.views.tile_len().storage()], &writes)?;
-        self.update_obj_run(Run::Launch(ctx), at, inertia)
-    }
-
-    fn update_obj_run(
-        &self,
-        run: Run,
-        [obj, num, den, max_bits]: [CUdeviceptr; 4],
-        inertia: f32,
-    ) -> Result<(), Error> {
-        let d = self.views.dims();
-        let [nyo, nxo] = [self.geom.nyo, self.geom.nxo].map(|v| v as i32);
-        let [nty, ntx] = d.tiles();
-        let grid = (ntx, nty, d.nobj);
-        let tile_len = self.views.tile_len();
-        // SAFETY: a launch comes from `update_obj_from_sums`, which checked that `obj`, `num`
-        // and `den` hold the object and `max_bits` one u32, zeroed it and leased the buffers
-        // on `ctx`; `tile_len` holds the object's tiles; `new` checked the offsets;
-        // each program reads and writes only the pixels of its own tile.
-        unsafe {
-            run!(
-                run,
-                device::max_den_tiles(ptr(den), dptr(tile_len), ptr(max_bits), nyo, nxo).grid(grid)
-            );
-            run!(
-                run,
-                device::normalize_tiles(
-                    ptr(obj),
-                    ptr(num),
-                    ptr(den),
-                    dptr(tile_len),
-                    ptr(max_bits),
-                    inertia,
-                    nyo,
-                    nxo,
-                )
-                .grid(grid)
-            );
-        }
-        Ok(())
-    }
-
-    /// [`ptyrs_gpu::Kernels::update_from_sums`] of the probe: `x = (num + reg x) / max(den +
-    /// reg, 1e-12)` for its `nprobe * ny * nx` values, `reg = inertia * max(0, den ...)`
-    /// over the non-NaN values of `den`, then zeroes `sums.num` and `sums.den`, which it has
-    /// consumed. `sums.max_bits` is the scratch for that maximum, zeroed on `ctx`'s stream
-    /// here, so the call allocates nothing and never synchronizes.
-    pub fn update_probe_from_sums(
-        &self,
-        ctx: &ExecutionContext,
-        probe: &mut DeviceBuffer<C32>,
-        sums: &mut UpdateSums,
-        inertia: f32,
-    ) -> Result<(), Error> {
-        let n = self.probe_len;
-        check_len("probe", probe, n)?;
-        check_len("sums.num", &sums.num, n)?;
-        check_len("sums.den", &sums.den, n)?;
-        check_len("sums.max_bits", &sums.max_bits, 1)?;
-        let UpdateSums { num, den, max_bits } = sums;
-        let at = [
-            addr("probe", probe)?,
-            addr("sums.num", num)?,
-            addr("sums.den", den)?,
-            addr("sums.max_bits", max_bits)?,
-        ];
-        ptyrs_gpu::zero(ctx, max_bits)?;
-        let writes = [
-            max_bits.storage(),
-            probe.storage(),
-            num.storage(),
-            den.storage(),
-        ];
-        lease(ctx, &[], &writes)?;
-        self.update_probe_run(Run::Launch(ctx), at, inertia)
-    }
-
-    fn update_probe_run(
-        &self,
-        run: Run,
-        [x, num, den, max_bits]: [CUdeviceptr; 4],
-        inertia: f32,
-    ) -> Result<(), Error> {
-        // `new` checked that the probe's `2 n` floats index as i32.
-        let n = self.probe_len as i32;
-        // SAFETY: a launch comes from `update_probe_from_sums`, which checked that `x`, `num`
-        // hold `n` complex values, `den` `n` floats and `max_bits` one, zeroed `max_bits` and
-        // leased the buffers on `ctx`.
-        unsafe {
-            run!(
-                run,
-                device::max_nonneg_f32(ptr(den), n, ptr(max_bits)).grid((
-                    (n as u32).div_ceil(1024),
-                    1,
-                    1
-                ))
-            );
-            run!(
-                run,
-                device::normalize_update(ptr(x), ptr(num), ptr(den), n, ptr(max_bits), inertia)
-                    .grid(((2 * n as u32).div_ceil(1024), 1, 1))
-            );
-        }
-        Ok(())
-    }
-
     /// [`ptyrs_gpu::LlkSums::from_partials`] of the scan's `nframe` partials on the device,
     /// into `out` as `[poisson, gaussian, euclidean, icalc]`, bit for bit: one launch per
     /// tree level, the levels below the root in `scratch` ([`llk_sums_scratch_len`] long).
@@ -1414,6 +1283,180 @@ impl<'a> TileKernels<'a> {
             }
             below = Some((at, m as i32));
             at += 4 * m;
+        }
+        Ok(())
+    }
+}
+
+/// The Tile object and probe updates of one scan's views, compiled when the set is built, as
+/// [`TileKernels`] compiles its kernels; a launch's integers are the views' sizes, which it
+/// checks, and every buffer, `tile_len` included, must be 16-byte aligned. The set keeps the
+/// sizes, not the views, so the owner of a [`Views`] can hold it beside them.
+pub struct TileUpdates {
+    /// What the updates were compiled for.
+    dims: ViewDims,
+    /// Complex values of the probe, `nprobe * ny * nx`.
+    probe_len: usize,
+}
+
+impl TileUpdates {
+    /// Checks the object's and probe's lengths against the kernels' `i32` offsets and compiles
+    /// both updates on `stream`, without launching either, for views of `views`' sizes.
+    pub fn new(stream: &Arc<CudaStream>, views: &Views) -> Result<Self, Error> {
+        let dims = *views.dims();
+        let probe_len = dims.nprobe as usize * dims.frame[0] as usize * dims.frame[1] as usize;
+        offset("probe length", 2 * probe_len)?;
+        offset("object length", 2 * obj_len(&dims))?;
+        let u = Self { dims, probe_len };
+        let run = Run::Compile(stream);
+        u.obj_run(run, [UNBOUND; 5], 0.0)?;
+        u.probe_run(run, [UNBOUND; 4], 0.0)?;
+        Ok(u)
+    }
+
+    /// [`ptyrs_gpu::Kernels::update_obj_from_sums`]: [`Self::update_probe_from_sums`] of the
+    /// object `[nobj, nyo, nxo]` on the object tiles with views only, `reg = inertia *
+    /// max(den)` over their pixels, zeroing their sums. A tile whose run is empty is neither
+    /// read nor written, in `obj` or `sums`, so it keeps its bits. `sums.max_bits` is the
+    /// scratch for the maximum.
+    pub fn update_obj_from_sums(
+        &self,
+        ctx: &ExecutionContext,
+        views: &Views,
+        obj: &mut DeviceBuffer<C32>,
+        sums: &mut UpdateSums,
+        inertia: f32,
+    ) -> Result<(), Error> {
+        let (d, at) = (views.dims(), &self.dims);
+        if d.nobj != at.nobj || d.obj != at.obj {
+            return Err(shape(format!(
+                "views of {} objects of {:?}, the updates were built for {} of {:?}",
+                d.nobj, d.obj, at.nobj, at.obj
+            )));
+        }
+        let len = obj_len(at);
+        check_len("obj", obj, len)?;
+        check_len("sums.num", &sums.num, len)?;
+        check_len("sums.den", &sums.den, len)?;
+        check_len("sums.max_bits", &sums.max_bits, 1)?;
+        let UpdateSums { num, den, max_bits } = sums;
+        let tile_len = views.tile_len();
+        let at = [
+            addr("obj", obj)?,
+            addr("sums.num", num)?,
+            addr("sums.den", den)?,
+            addr("sums.max_bits", max_bits)?,
+            addr("views.tile_len", tile_len)?,
+        ];
+        ptyrs_gpu::zero(ctx, max_bits)?;
+        let writes = [
+            max_bits.storage(),
+            obj.storage(),
+            num.storage(),
+            den.storage(),
+        ];
+        lease(ctx, &[tile_len.storage()], &writes)?;
+        self.obj_run(Run::Launch(ctx), at, inertia)
+    }
+
+    fn obj_run(
+        &self,
+        run: Run,
+        [obj, num, den, max_bits, tile_len]: [CUdeviceptr; 5],
+        inertia: f32,
+    ) -> Result<(), Error> {
+        let d = &self.dims;
+        // `new` checked that the object's `2 nobj nyo nxo` floats index as i32.
+        let [nyo, nxo] = d.obj.map(|v| v as i32);
+        let [nty, ntx] = d.tiles();
+        let grid = (ntx, nty, d.nobj);
+        // SAFETY: a launch comes from `update_obj_from_sums`, which checked that `obj`, `num`
+        // and `den` hold the object and `max_bits` one u32, zeroed it and leased the buffers
+        // on `ctx`, and that `tile_len` holds the tiles of views of the object's sizes; each
+        // program reads and writes only the pixels of its own tile.
+        unsafe {
+            run!(
+                run,
+                device::max_den_tiles(ptr(den), ptr(tile_len), ptr(max_bits), nyo, nxo).grid(grid)
+            );
+            run!(
+                run,
+                device::normalize_tiles(
+                    ptr(obj),
+                    ptr(num),
+                    ptr(den),
+                    ptr(tile_len),
+                    ptr(max_bits),
+                    inertia,
+                    nyo,
+                    nxo,
+                )
+                .grid(grid)
+            );
+        }
+        Ok(())
+    }
+
+    /// [`ptyrs_gpu::Kernels::update_from_sums`] of the probe: `x = (num + reg x) / max(den +
+    /// reg, 1e-12)` for its `nprobe * ny * nx` values, `reg = inertia * max(0, den ...)`
+    /// over the non-NaN values of `den`, then zeroes `sums.num` and `sums.den`, which it has
+    /// consumed. `sums.max_bits` is the scratch for that maximum, zeroed on `ctx`'s stream
+    /// here, so the call allocates nothing and never synchronizes.
+    pub fn update_probe_from_sums(
+        &self,
+        ctx: &ExecutionContext,
+        probe: &mut DeviceBuffer<C32>,
+        sums: &mut UpdateSums,
+        inertia: f32,
+    ) -> Result<(), Error> {
+        let n = self.probe_len;
+        check_len("probe", probe, n)?;
+        check_len("sums.num", &sums.num, n)?;
+        check_len("sums.den", &sums.den, n)?;
+        check_len("sums.max_bits", &sums.max_bits, 1)?;
+        let UpdateSums { num, den, max_bits } = sums;
+        let at = [
+            addr("probe", probe)?,
+            addr("sums.num", num)?,
+            addr("sums.den", den)?,
+            addr("sums.max_bits", max_bits)?,
+        ];
+        ptyrs_gpu::zero(ctx, max_bits)?;
+        let writes = [
+            max_bits.storage(),
+            probe.storage(),
+            num.storage(),
+            den.storage(),
+        ];
+        lease(ctx, &[], &writes)?;
+        self.probe_run(Run::Launch(ctx), at, inertia)
+    }
+
+    fn probe_run(
+        &self,
+        run: Run,
+        [x, num, den, max_bits]: [CUdeviceptr; 4],
+        inertia: f32,
+    ) -> Result<(), Error> {
+        // `new` checked that the probe's `2 n` floats index as i32.
+        let n = self.probe_len as i32;
+        // SAFETY: a launch comes from `update_probe_from_sums`, which checked that `x`, `num`
+        // hold `n` complex values, `den` `n` floats and `max_bits` one, zeroed `max_bits` and
+        // leased the buffers on `ctx`.
+        unsafe {
+            run!(
+                run,
+                device::max_nonneg_f32(ptr(den), n, ptr(max_bits)).grid((
+                    (n as u32).div_ceil(1024),
+                    1,
+                    1
+                ))
+            );
+            run!(
+                run,
+                device::normalize_update(ptr(x), ptr(num), ptr(den), n, ptr(max_bits), inertia)
+                    .grid(((2 * n as u32).div_ceil(1024), 1, 1))
+            );
         }
         Ok(())
     }

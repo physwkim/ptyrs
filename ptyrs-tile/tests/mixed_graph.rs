@@ -151,9 +151,11 @@ fn epoch(ctx: &ExecutionContext, scan: &Scan, s: &mut State) -> Result<(), Error
     k.apply_amplitude(ctx, d, table.at(0), scan.counts, &mut s.psi)?;
     fft2(k, ctx, &mut s.psi, nk, true)?;
     tk.psi_to_obj(ctx, table.at(0), &s.psi, &s.probe, &mut s.obj_sums)?;
-    tk.update_obj_from_sums(ctx, &mut s.obj, &mut s.obj_sums, 0.01)?;
+    tk.updates()
+        .update_obj_from_sums(ctx, scan.views, &mut s.obj, &mut s.obj_sums, 0.01)?;
     tk.psi_to_probe(ctx, table.at(0), &s.psi, &s.obj, &mut s.probe_sums)?;
-    tk.update_probe_from_sums(ctx, &mut s.probe, &mut s.probe_sums, 0.01)?;
+    tk.updates()
+        .update_probe_from_sums(ctx, &mut s.probe, &mut s.probe_sums, 0.01)?;
     tk.llk_sums(ctx, &s.partials, &mut s.llk_scratch, &mut s.llk)
 }
 
