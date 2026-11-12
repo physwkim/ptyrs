@@ -7,10 +7,10 @@
 //! holds for the probe and geometry of its training scans.
 
 use std::f64::consts::PI;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use burn::module::{Module, Param};
-use burn::optim::{AdamConfig, GradientsParams};
+use burn::optim::{AdamConfig, GradientsParams, ModuleOptimizer};
 use burn::prelude::*;
 use ptyrs_core::{AddrTable, C64, Counts, Object, Stack};
 use rand::SeedableRng;
@@ -21,7 +21,7 @@ use crate::ptychonn::PtychoNN;
 use crate::{NnError, burn_err};
 
 /// Shape of a predictor: the detector frame it reads, the binning, and the network size.
-#[derive(Config, Debug)]
+#[derive(Config, Debug, PartialEq)]
 pub struct PredictorConfig {
     pub frame: [usize; 2],
     pub bin: usize,
@@ -281,6 +281,94 @@ pub struct TrainOptions {
     pub batch: usize,
     pub lr: f64,
     pub seed: u64,
+    /// Directory [`train`] writes its state to after every epoch and resumes from when it holds
+    /// one, so that a stopped run continues from its last finished epoch.
+    pub checkpoint: Option<PathBuf>,
+}
+
+/// The run a checkpoint belongs to and the epochs it has finished.
+#[derive(Config, Debug, PartialEq)]
+struct Checkpoint {
+    config: PredictorConfig,
+    batch: usize,
+    lr: f64,
+    seed: u64,
+    epochs: usize,
+}
+
+impl Checkpoint {
+    /// Writes the state into `dir/epoch-<epochs>`, then points `dir/latest` at it and removes
+    /// older states. `latest` is renamed into place only once the state is complete, so a run
+    /// killed at any point leaves the previous checkpoint readable.
+    fn save(&self, dir: &Path, model: &Model, optim: &ModuleOptimizer) -> Result<(), NnError> {
+        let name = format!("epoch-{}", self.epochs);
+        let state = dir.join(&name);
+        std::fs::create_dir_all(&state)?;
+        Config::save(self, state.join("checkpoint.json"))?;
+        // `valid` folds in the last batch-norm running-statistics update, which burn holds back
+        // until the next read; saving `model` itself would store the value before it.
+        model
+            .valid()
+            .save_file(state.join("model.bpk"))
+            .map_err(burn_err)?;
+        optim.save(state.join("optim.bpk")).map_err(burn_err)?;
+        let tmp = dir.join("latest.tmp");
+        std::fs::write(&tmp, &name)?;
+        std::fs::rename(&tmp, dir.join("latest"))?;
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let old = entry.file_name();
+            if old.to_string_lossy().starts_with("epoch-") && old != *name {
+                std::fs::remove_dir_all(entry.path())?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The epochs finished, model and optimiser of the state `dir/latest` points at; 0 and the
+    /// given ones when there is none. The state must come from a run of the same settings
+    /// (`self`, whatever its `epochs`) on the same samples, which `model`'s input statistics
+    /// stand for.
+    fn resume(
+        &self,
+        dir: &Path,
+        model: Model,
+        optim: ModuleOptimizer,
+    ) -> Result<(usize, Model, ModuleOptimizer), NnError> {
+        let name = match std::fs::read_to_string(dir.join("latest")) {
+            Ok(name) => name,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((0, model, optim)),
+            Err(e) => return Err(e.into()),
+        };
+        let state = dir.join(name);
+        let saved = Checkpoint::load(state.join("checkpoint.json")).map_err(burn_err)?;
+        let own = Checkpoint {
+            config: self.config.clone(),
+            epochs: saved.epochs,
+            ..*self
+        };
+        if saved != own {
+            return Err(NnError::Invalid(format!(
+                "checkpoint {} is of {saved:?}, not {own:?}",
+                state.display()
+            )));
+        }
+        let stats = |m: &Model| -> Result<_, NnError> {
+            Ok((host(m.mean.val())?, host(m.inv_spread.val())?))
+        };
+        let want = stats(&model)?;
+        let model = model
+            .try_load_file(state.join("model.bpk"))
+            .map_err(burn_err)?;
+        if stats(&model)? != want {
+            return Err(NnError::Invalid(format!(
+                "checkpoint {} was trained on other samples",
+                state.display()
+            )));
+        }
+        let optim = optim.load(state.join("optim.bpk")).map_err(burn_err)?;
+        Ok((saved.epochs, model, optim))
+    }
 }
 
 /// Mean L1 loss (amplitude plus phase) of one epoch.
@@ -381,8 +469,10 @@ fn l1(model: &Model, x: Tensor<4>, amp: Tensor<4>, phase: Tensor<4>) -> Tensor<1
     (a - amp).abs().mean() + (p - phase).abs().mean()
 }
 
-/// Trains a fresh network of `config` with Adam on L1 loss, reporting each epoch to `log`.
-/// `device` is a plain device; autodiff is enabled on it here.
+/// Trains a fresh network of `config` with Adam on L1 loss, reporting each epoch to `log`, or
+/// resumes the run in `options.checkpoint`. `options.seed` seeds the device's generator for the
+/// initial weights and the shuffle of each epoch. `device` is a plain device; autodiff is enabled
+/// on it here.
 pub fn train(
     config: &PredictorConfig,
     options: &TrainOptions,
@@ -395,16 +485,32 @@ pub fn train(
         return Err(NnError::Invalid("no training samples or zero batch".into()));
     }
     let ad = device.clone().autodiff();
+    ad.seed(options.seed);
     let (mean, inv_spread) = input_stats(train)?;
     let mut model = Model::new(config, mean, inv_spread, &ad)?;
+    let mut optim = AdamConfig::new().init();
+    let mut checkpoint = Checkpoint {
+        config: config.clone(),
+        batch: options.batch,
+        lr: options.lr,
+        seed: options.seed,
+        epochs: 0,
+    };
+    let mut start = 0;
+    if let Some(dir) = &options.checkpoint {
+        (start, model, optim) = checkpoint.resume(dir, model, optim)?;
+    }
     let dims = train.target.dims;
     let x = tensor(&train.input, dims, &ad);
     let amp = tensor(&train.target.amp, dims, &ad);
     let phase = tensor(&train.target.phase, dims, &ad);
-    let mut optim = AdamConfig::new().init();
     let mut rng = ChaCha8Rng::seed_from_u64(options.seed);
     let mut order: Vec<i64> = (0..dims[0] as i64).collect();
-    for epoch in 0..options.epochs {
+    // Each epoch shuffles the previous order: replay the finished ones.
+    for _ in 0..start {
+        order.shuffle(&mut rng);
+    }
+    for epoch in start..options.epochs {
         order.shuffle(&mut rng);
         let mut sum = Tensor::<1>::zeros([1], &device.clone().inner());
         for batch in order.chunks(options.batch) {
@@ -431,6 +537,10 @@ pub fn train(
                 .loss(v)
             })
             .transpose()?;
+        if let Some(dir) = &options.checkpoint {
+            checkpoint.epochs = epoch + 1;
+            checkpoint.save(dir, &model, &optim)?;
+        }
         log(&EpochLoss {
             epoch,
             train: train_loss,

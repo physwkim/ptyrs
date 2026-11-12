@@ -5,7 +5,8 @@
 //! (defaults 256, 4, 2000, 30, 32, 10). Each training scan contributes `per_scan` of its 100
 //! frames, drawn at random: neighbouring frames of a scan see nearly the same object pixels, so
 //! fewer frames from more scans give more distinct objects for the same epoch time. Writes the
-//! predictor to `out_dir`.
+//! predictor to `out_dir`, and after every epoch the training state to `out_dir/checkpoint`,
+//! from which the same command resumes a stopped run.
 
 mod common;
 
@@ -117,6 +118,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         batch: 32,
         lr: 1e-3,
         seed: 1,
+        checkpoint: Some(out.join("checkpoint")),
     };
     let t = Instant::now();
     let predictor = train(

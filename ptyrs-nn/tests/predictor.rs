@@ -1,12 +1,13 @@
 //! The predictor on scans from `ptyrs_engine::sim::simulate` (GPU).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use burn::prelude::*;
 use ptyrs_core::{AddrTable, Geometry, Object, Probe, Scan, required_obj_shape, sim};
+use ptyrs_nn::NnError;
 use ptyrs_nn::data::random_object;
 use ptyrs_nn::predictor::{
-    PredictorConfig, Samples, TrainOptions, mean_frame_total, object_patches, train,
+    Predictor, PredictorConfig, Samples, TrainOptions, mean_frame_total, object_patches, train,
 };
 use ptyrs_nn::ptychonn::PtychoNN;
 
@@ -90,6 +91,7 @@ fn trained_predictor_keeps_its_fit_at_inference_and_after_reload() {
         batch: 32,
         lr: 1e-3,
         seed: 7,
+        checkpoint: None,
     };
     let mut losses = Vec::new();
     let predictor = train(&config, &options, &train_set, None, &device, |e| {
@@ -120,7 +122,56 @@ fn trained_predictor_keeps_its_fit_at_inference_and_after_reload() {
     // A saved and reloaded predictor predicts the same patches.
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ptyrs-nn-predictor");
     predictor.save(&dir).unwrap();
-    let back = ptyrs_nn::predictor::Predictor::load(&dir, &device).unwrap();
+    let back = Predictor::load(&dir, &device).unwrap();
     assert_eq!(back.config().frame, config.frame);
     assert_eq!(back.predict(&scan.counts, norm).unwrap(), patches);
+}
+
+#[test]
+fn a_resumed_run_continues_from_its_last_epoch() {
+    let device = Device::cuda(0);
+    let probe = sim::probe([FRAME, FRAME], 1).unwrap();
+    let config = config();
+    let train_set = samples(&config, &probe, 0..2);
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ptyrs-nn-checkpoint");
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    let options = |epochs, seed, checkpoint: Option<&Path>| TrainOptions {
+        epochs,
+        batch: 16,
+        lr: 1e-3,
+        seed,
+        checkpoint: checkpoint.map(Path::to_path_buf),
+    };
+    let run = |options: &TrainOptions, samples: &Samples| -> Result<_, NnError> {
+        let mut losses = Vec::new();
+        let p = train(&config, options, samples, None, &device, |e| {
+            losses.push((e.epoch, e.train))
+        })?;
+        Ok((losses, p))
+    };
+
+    let (whole, straight) = run(&options(3, 7, None), &train_set).unwrap();
+    let (first, _) = run(&options(2, 7, Some(&dir)), &train_set).unwrap();
+    let (rest, resumed) = run(&options(3, 7, Some(&dir)), &train_set).unwrap();
+    assert_eq!([first, rest].concat(), whole);
+    let (scan, ..) = scan(&probe, 0);
+    let norm = mean_frame_total(&scan.counts);
+    assert_eq!(
+        resumed.predict(&scan.counts, norm).unwrap(),
+        straight.predict(&scan.counts, norm).unwrap()
+    );
+    let mut kept: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    kept.sort();
+    assert_eq!(kept, ["epoch-3", "latest"]);
+
+    // A checkpoint of other settings or other samples is refused.
+    assert!(run(&options(4, 8, Some(&dir)), &train_set).is_err());
+    let others = samples(&config, &probe, 2..4);
+    assert_eq!(others.len(), train_set.len());
+    assert!(run(&options(4, 7, Some(&dir)), &others).is_err());
 }
