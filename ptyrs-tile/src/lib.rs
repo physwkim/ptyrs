@@ -1,10 +1,15 @@
 //! ptyrs-tile: cuTile (Tile IR) alternatives to `ptyrs-gpu` SIMT pieces.
 //!
-//! Every launch is a method of a [`TileKernels`], the kernels of one scan, or of its
-//! [`TileObjUpdate`], [`TileProbeUpdate`] or [`TileDots`], each compiling its kernels when
-//! it is built, so no launch compiles, eagerly or under a graph capture. A launch takes the
-//! context, stack and buffers of its `ptyrs_gpu` counterpart, the scan's views being the
-//! set's (the object update takes them, as its counterpart does), leases the buffers with
+//! The engine builds [`TileDots`] alone, BH's dot products, which have no SIMT form, so it
+//! compiles only the Tile kernels it launches. The other sets are the Tile forms of kernels
+//! the engine runs in SIMT, built by this crate's tests and examples to compare them:
+//! [`TileKernels`], the kernels of one scan, its [`TileObjUpdate`] and [`TileProbeUpdate`],
+//! and [`TileCgDots`].
+//!
+//! Every launch is a method of a set, each compiling its kernels when it is built, so no
+//! launch compiles, eagerly or under a graph capture. A launch takes the context, stack and
+//! buffers of its `ptyrs_gpu` counterpart, the scan's views being the set's (the object
+//! update takes them, as its counterpart does), leases the buffers with
 //! [`ptyrs_gpu::lease`] and enqueues on the context's stream, so it runs eagerly or records
 //! into a capture the same way.
 
@@ -1745,36 +1750,118 @@ impl TileProbeUpdate {
     }
 }
 
-/// The CG and BH dot products over a scan of one [`ViewDims`]: the Tile versions of
-/// [`ptyrs_gpu::GradKernels`]' `beta_parts`, `norm_parts` and `sum_parts`, in their block
-/// order and float order, so their sums are bit-identical, and BH's [`Self::dots`], which
-/// has no SIMT form. [`Self::new`] compiles each for the lengths a scan's calls take, the
-/// object's and the probe's `n` and the `npart`s `CG_BLOCKS`, `2 CG_BLOCKS` and
-/// [`gamma_parts`]; a launch of another length is refused rather than compiled.
+/// Elements a dot product's `CG_BLOCKS` programs of 256 lanes visit per grid stride.
+const DOT_STRIDE: usize = 256 * CG_BLOCKS as usize;
+
+/// The object's and the probe's lengths in complex values, checked against the dot
+/// kernels' `i32` offsets, which reach `2 (n + DOT_STRIDE)` floats.
+fn dot_lens(dims: &ViewDims) -> Result<[i32; 2], Error> {
+    let probe_len = dims.nprobe as usize * dims.frame[0] as usize * dims.frame[1] as usize;
+    let mut lens = [0; 2];
+    for (l, (what, n)) in lens.iter_mut().zip([
+        ("object length", obj_len(dims)),
+        ("probe length", probe_len),
+    ]) {
+        offset(what, 2 * (n + DOT_STRIDE))?;
+        *l = n as i32;
+    }
+    Ok(lens)
+}
+
+/// BH's dot products over a scan of one [`ViewDims`], [`Self::dots`], which has no SIMT
+/// form. [`Self::new`] compiles it for the object's and the probe's lengths, with and
+/// without `v`, and nothing else.
 pub struct TileDots {
+    /// Complex values of the object and of the probe.
+    lens: [i32; 2],
+}
+
+impl TileDots {
+    /// Checks the lengths against the kernels' `i32` offsets and compiles [`Self::dots`] on
+    /// `stream` for a scan of `dims`, without launching it.
+    pub fn new(stream: &Arc<CudaStream>, dims: &ViewDims) -> Result<Self, Error> {
+        let t = Self {
+            lens: dot_lens(dims)?,
+        };
+        for n in t.lens {
+            for cg in [false, true] {
+                t.dots_run(Run::Compile(stream), [UNBOUND; 3], n, 1.0, cg)?;
+            }
+        }
+        Ok(t)
+    }
+
+    /// BH's dot products of the step along `d`, `⟨u, Pu⟩` and (CG) `⟨u, v⟩`, as block
+    /// partials into the first `2 CG_BLOCKS` pairs of `parts`, object then probe.
+    pub fn dots(
+        &self,
+        ctx: &ExecutionContext,
+        d: &BhDisp<'_>,
+        parts: &mut DeviceBuffer<f32>,
+    ) -> Result<(), Error> {
+        check_len("parts", parts, 4 * CG_BLOCKS as usize)?;
+        for (i, n) in self.lens.into_iter().enumerate() {
+            let (g, prev) = (d.u[i], d.v.map(|v| v[i]));
+            check_len("u", g, n as usize)?;
+            if let Some(v) = prev {
+                check_len("v", v, n as usize)?;
+            }
+            // Without `v`, `u` stands in for it, unread.
+            let at = [
+                addr("u", g)?,
+                addr("v", prev.unwrap_or(g))?,
+                pairs_at(parts, i * CG_BLOCKS as usize)?,
+            ];
+            let reads: Vec<_> = [Some(g), prev]
+                .into_iter()
+                .flatten()
+                .map(|b| b.storage())
+                .collect();
+            lease(ctx, &reads, &[parts.storage()])?;
+            let scale = if i == 0 { 1.0 } else { d.u_scale };
+            self.dots_run(Run::Launch(ctx), at, n, scale, prev.is_some())?;
+        }
+        Ok(())
+    }
+
+    fn dots_run(
+        &self,
+        run: Run,
+        [g, prev, out]: [CUdeviceptr; 3],
+        n: i32,
+        scale: f32,
+        cg: bool,
+    ) -> Result<(), Error> {
+        // SAFETY: a launch comes from `dots`, which checked that `g` holds `n` complex values,
+        // `prev` too when `cg`, and `out` `CG_BLOCKS` pairs, and leased them on `ctx`.
+        unsafe {
+            run!(
+                run,
+                device::bh_dots(ptr(g), ptr(prev), n, scale, i32::from(cg), ptr(out))
+                    .grid((CG_BLOCKS, 1, 1))
+            );
+        }
+        Ok(())
+    }
+}
+
+/// The Tile forms of [`ptyrs_gpu::GradKernels`]' CG dot products `beta_parts`, `norm_parts`
+/// and `sum_parts` over a scan of one [`ViewDims`], in their block order and float order, so
+/// their sums are bit-identical. [`Self::new`] compiles each for the lengths a scan's calls
+/// take, the object's and the probe's `n` and the `npart`s `CG_BLOCKS`, `2 CG_BLOCKS` and
+/// [`gamma_parts`]; a launch of another length is refused rather than compiled.
+pub struct TileCgDots {
     /// Complex values of the object and of the probe.
     lens: [i32; 2],
     /// The `npart`s of [`Self::sum_parts`].
     nparts: [i32; 3],
 }
 
-/// Elements a dot product's `CG_BLOCKS` programs of 256 lanes visit per grid stride.
-const DOT_STRIDE: usize = 256 * CG_BLOCKS as usize;
-
-impl TileDots {
-    /// Checks the lengths against the kernels' `i32` offsets, which reach `2 (n + stride)`
-    /// floats, and compiles every kernel on `stream` for a scan of `dims`, without launching
-    /// any.
+impl TileCgDots {
+    /// Checks the lengths against the kernels' `i32` offsets and compiles every kernel on
+    /// `stream` for a scan of `dims`, without launching any.
     pub fn new(stream: &Arc<CudaStream>, dims: &ViewDims) -> Result<Self, Error> {
-        let probe_len = dims.nprobe as usize * dims.frame[0] as usize * dims.frame[1] as usize;
-        let mut lens = [0; 2];
-        for (l, (what, n)) in lens.iter_mut().zip([
-            ("object length", obj_len(dims)),
-            ("probe length", probe_len),
-        ]) {
-            offset(what, 2 * (n + DOT_STRIDE))?;
-            *l = n as i32;
-        }
+        let lens = dot_lens(dims)?;
         let gamma = gamma_parts(dims)? as usize;
         offset("line-search pairs", 2 * (gamma + 256))?;
         let c = CG_BLOCKS as i32;
@@ -1786,9 +1873,6 @@ impl TileDots {
         for n in lens {
             t.beta_run(run, [UNBOUND; 3], n)?;
             t.norm_run(run, [UNBOUND; 2], n)?;
-            for cg in [false, true] {
-                t.dots_run(run, [UNBOUND; 3], n, 1.0, cg)?;
-            }
         }
         for npart in t.nparts {
             t.sum_run(run, [UNBOUND; 2], npart)?;
@@ -1867,39 +1951,6 @@ impl TileDots {
         self.sum_run(Run::Launch(ctx), at, npart)
     }
 
-    /// BH's dot products of the step along `d`, `⟨u, Pu⟩` and (CG) `⟨u, v⟩`, as block
-    /// partials into the first `2 CG_BLOCKS` pairs of `parts`, object then probe.
-    pub fn dots(
-        &self,
-        ctx: &ExecutionContext,
-        d: &BhDisp<'_>,
-        parts: &mut DeviceBuffer<f32>,
-    ) -> Result<(), Error> {
-        check_len("parts", parts, 4 * CG_BLOCKS as usize)?;
-        for (i, n) in self.lens.into_iter().enumerate() {
-            let (g, prev) = (d.u[i], d.v.map(|v| v[i]));
-            check_len("u", g, n as usize)?;
-            if let Some(v) = prev {
-                check_len("v", v, n as usize)?;
-            }
-            // Without `v`, `u` stands in for it, unread.
-            let at = [
-                addr("u", g)?,
-                addr("v", prev.unwrap_or(g))?,
-                pairs_at(parts, i * CG_BLOCKS as usize)?,
-            ];
-            let reads: Vec<_> = [Some(g), prev]
-                .into_iter()
-                .flatten()
-                .map(|b| b.storage())
-                .collect();
-            lease(ctx, &reads, &[parts.storage()])?;
-            let scale = if i == 0 { 1.0 } else { d.u_scale };
-            self.dots_run(Run::Launch(ctx), at, n, scale, prev.is_some())?;
-        }
-        Ok(())
-    }
-
     fn beta_run(&self, run: Run, [g, h, out]: [CUdeviceptr; 3], n: i32) -> Result<(), Error> {
         // SAFETY: a launch comes from `beta_parts`, which checked that `g` and `h` hold `n`
         // complex values and `out` `CG_BLOCKS` pairs, and leased them on `ctx`.
@@ -1931,26 +1982,6 @@ impl TileDots {
             run!(
                 run,
                 device::cg_sum_parts(ptr(parts), npart, ptr(out)).grid((1, 1, 1))
-            );
-        }
-        Ok(())
-    }
-
-    fn dots_run(
-        &self,
-        run: Run,
-        [g, prev, out]: [CUdeviceptr; 3],
-        n: i32,
-        scale: f32,
-        cg: bool,
-    ) -> Result<(), Error> {
-        // SAFETY: a launch comes from `dots`, which checked that `g` holds `n` complex values,
-        // `prev` too when `cg`, and `out` `CG_BLOCKS` pairs, and leased them on `ctx`.
-        unsafe {
-            run!(
-                run,
-                device::bh_dots(ptr(g), ptr(prev), n, scale, i32::from(cg), ptr(out))
-                    .grid((CG_BLOCKS, 1, 1))
             );
         }
         Ok(())

@@ -48,10 +48,10 @@ pub struct BhDirs {
     pub cg: u32,
 }
 
-/// Floats a [`bh_kernels::bh_hess_frames`] block writes: the partial `H(u, u)`, `H(u, v)`,
-/// `H(v, v)`.
+/// Floats a [`bh_kernels::LoadedModule::bh_hess_frames`] block writes: the partial `H(u, u)`,
+/// `H(u, v)`, `H(v, v)`.
 pub const BH_HESS: u32 = 3;
-/// Floats of one step record of [`bh_kernels::bh_step`]: `β, α, top, bottom`.
+/// Floats of one step record of [`bh_kernels::LoadedModule::bh_step`]: `β, α, top, bottom`.
 pub const BH_STEP: u32 = 4;
 
 #[cuda_module]
@@ -261,6 +261,8 @@ pub mod bh_kernels {
     ///
     /// `dots` holds `2 * ndots` floats, `hess` `3 * nhess`, `out` four; grid `(1, 1, 1)`,
     /// block `(PIXEL_THREADS, 1, 1)`.
+    ///
+    /// [`bh_hess_frames`]: LoadedModule::bh_hess_frames
     #[kernel]
     pub unsafe fn bh_step(
         dots: *const f32,
@@ -320,6 +322,8 @@ pub mod bh_kernels {
     /// # Safety
     ///
     /// `x`, `prev`, `g.num` hold `n` complex values, `g.den` `n` floats, `step` two.
+    ///
+    /// [`bh_step`]: LoadedModule::bh_step
     #[kernel]
     pub unsafe fn bh_update(
         x: *mut f32,

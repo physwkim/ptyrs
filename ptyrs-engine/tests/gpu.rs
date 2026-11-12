@@ -403,17 +403,18 @@ fn bh_steps_match_cpu() {
 
 /// [`GpuPtycho::new`] compiles BH's Tile dot products, so graphed BH epochs, one batch of
 /// every frame (CG from the second epoch) and batches of 4, compile no Tile kernel in their
-/// captures or replays.
+/// captures or replays. cutile keeps a compile for the process, so a later setup whose
+/// kernels match an earlier one's compiles nothing.
 #[test]
 fn bh_graphs_compile_no_tile_kernel() {
+    let before = cutile::tile_kernel::jit_compile_count();
     for setup in [M1, FUSED] {
         let (scan, object, probe) = start(setup.frame, 2, true);
-        let before = cutile::tile_kernel::jit_compile_count();
         let mut g = GpuPtycho::new(&ctx(), &scan, object, probe, setup.options).unwrap();
         let jit = cutile::tile_kernel::jit_compile_count();
         assert!(
             jit > before,
-            "{setup:?}: GpuPtycho::new compiled no Tile kernel"
+            "{setup:?}: no GpuPtycho::new compiled a Tile kernel"
         );
         for batch_size in [NPOS, 4] {
             let params = BhParams {

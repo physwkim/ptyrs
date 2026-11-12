@@ -36,8 +36,8 @@ use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 use ptyrs_core::{AddrTable, C64, Object, Probe, Scan, Stack};
 use ptyrs_fft::Plan2d;
 use ptyrs_gpu::{
-    C32, CG_BLOCKS, Ended, Error as GpuError, FusedInputs, ObjProbeScale, RecordWriter, StackTable,
-    ViewAddr, ViewDims,
+    C32, CG_BLOCKS, Ended, Error as GpuError, FarSums, FusedInputs, Model, ObjProbeScale,
+    RecordWriter, StackTable, ViewAddr, ViewDims,
 };
 
 use device::{Bufs, Device, M1Bufs, NormBufs, PassesMut};
@@ -509,8 +509,13 @@ impl Bufs<'_> {
                         counts: self.counts,
                         obj: self.obj,
                         probe: self.probe,
+                        model: Model::default(),
                     };
-                    self.kernels.fused_llk(ctx, &inputs, stack, f, self.llk)?;
+                    let far = FarSums {
+                        llk: Some(&mut *self.llk),
+                        ..FarSums::default()
+                    };
+                    self.kernels.fused_llk(ctx, &inputs, stack, f, far)?;
                 }
             }
             rec.push(ctx, &dims, stack, self.llk)?;
