@@ -52,6 +52,21 @@ impl ScanShape {
             quad_phase: self.quad_phase,
         }
     }
+
+    /// The most of `views` that touch one object tile: the smallest slab
+    /// `cap` under which [`LiveScan::push`] takes them all. Views outside
+    /// the object touch no tile.
+    pub fn tile_cap(&self, views: &[ViewAddr]) -> u32 {
+        let d = self.dims();
+        let [nty, ntx] = d.tiles().map(|t| t as usize);
+        let mut n = vec![0u32; nty * ntx];
+        for v in views.iter().filter(|v| d.check_view(v).is_ok()) {
+            for [ty, tx] in view_tiles(&d, v) {
+                n[ty as usize * ntx + tx as usize] += 1;
+            }
+        }
+        n.into_iter().max().unwrap_or(0)
+    }
 }
 
 /// The first frame a scan refused; it closed the scan.
@@ -469,5 +484,33 @@ mod tests {
         assert_eq!(scan.push(&three[..2]).unwrap(), 0);
         assert_eq!((scan.landed(), scan.lost()), (2, 2));
         assert!(matches!(scan.push(&three[..1]), Err(GrowError::Gpu(_))));
+    }
+
+    /// A slab of `tile_cap` slots takes every view; one slot fewer refuses
+    /// the last frame. A view off the object adds to no tile.
+    #[test]
+    fn the_tile_cap_is_the_smallest_slab_that_takes_every_view() {
+        let ctx = Context::new(0).expect("GPU 0");
+        let s = ctx.new_stream().unwrap();
+        let one = NonZeroU32::new(1).unwrap();
+        let sh = shape(5, [16, 16]);
+        let v = raster(0, [16, 16]);
+        let three: Vec<ViewAddr> = (0..3).flat_map(|_| v).collect();
+        let cap = sh.tile_cap(&three);
+        assert_eq!(cap, 6);
+        let off = ViewAddr {
+            ox: u32::MAX,
+            ..v[0]
+        };
+        assert_eq!(sh.tile_cap(&[three.as_slice(), &[off, off]].concat()), cap);
+        let mut scan = LiveScan::new(&s, &sh, one, cap, [1.0, 0.0], 1).unwrap();
+        assert_eq!(scan.push(&three).unwrap(), 3);
+        assert_eq!(scan.closed(), None);
+        let mut scan = LiveScan::new(&s, &sh, one, cap - 1, [1.0, 0.0], 1).unwrap();
+        assert_eq!(scan.push(&three).unwrap(), 2);
+        assert!(matches!(
+            scan.closed(),
+            Some(Refusal::Slab { frame: 2, .. })
+        ));
     }
 }
