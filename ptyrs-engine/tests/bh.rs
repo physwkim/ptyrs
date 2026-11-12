@@ -4,17 +4,18 @@
 //! reference writes `<dir>/bh_{full,mini}_{obj,probe,steps}_f64.txt`, saved to `tests/data`.
 
 use std::ops::Range;
+use std::slice;
 
 use ptyrs_core::{C64, Object, Probe, Stack};
-use ptyrs_engine::{Bh, BhBatch, BhParams, Fft2, Ptycho, llk, obj_probe_to_psi};
+use ptyrs_engine::{Bh, BhBatch, BhParams, Optics, Ptycho, llk, obj_probe_to_psi};
 
 mod common;
 
-fn state() -> Ptycho {
+fn state() -> (Ptycho, Optics) {
     let (scan, object, probe) = common::dm_scenario(32, 40, 2, 2e5, 4.0);
     let mut p = Ptycho::new(&scan, object, probe).unwrap();
     p.scale_obj_probe();
-    p
+    (p, Optics::far_field(&scan.geometry))
 }
 
 fn table(text: &str) -> Vec<Vec<f64>> {
@@ -53,12 +54,13 @@ fn direction(like: &Stack<C64>, seed: &mut u64) -> Stack<C64> {
     Stack::from_vec(like.dims(), data).unwrap()
 }
 
-fn dot(a: &Stack<C64>, b: &Stack<C64>) -> f64 {
-    a.as_slice()
-        .iter()
-        .zip(b.as_slice())
-        .map(|(a, b)| (a.conj() * b).re)
-        .sum()
+fn dot(a: &[C64], b: &[C64]) -> f64 {
+    a.iter().zip(b).map(|(a, b)| (a.conj() * b).re).sum()
+}
+
+/// The flat displacement of an object and a probe change, [`BhBatch`]'s layout.
+fn flat(o: &Stack<C64>, p: &Stack<C64>) -> Vec<C64> {
+    [o.as_slice(), p.as_slice()].concat()
 }
 
 /// `x + t·d`.
@@ -80,11 +82,11 @@ fn batch(p: &Ptycho, frames: Range<usize>) -> &[ptyrs_core::View] {
 
 /// `F` of `frames` at `(object, probe)` without the amplitude offset: a quarter of the
 /// engine's Euclidian sum.
-fn cost(p: &Ptycho, frames: Range<usize>, object: &Object, probe: &Probe) -> f64 {
+fn cost(p: &Ptycho, optics: &Optics, frames: Range<usize>, object: &Object, probe: &Probe) -> f64 {
     let views = batch(p, frames.clone());
     let mut psi = vec![C64::default(); views.len() * probe.plane_len()];
-    obj_probe_to_psi(views, object, probe, p.quad(), &mut psi);
-    Fft2::new(probe.plane_shape()).forward(&mut psi);
+    obj_probe_to_psi(views, object, probe, optics.quad(), &mut psi);
+    optics.propagator().forward(&mut psi);
     llk(p.observed(), frames, p.addr().nmode(), &psi).euclidian / 4.0
 }
 
@@ -93,21 +95,30 @@ const FRAMES: Range<usize> = 0..16;
 /// `⟨g, d⟩` against `(F(x + h·d) − F(x − h·d)) / 2h` along random object and probe directions.
 #[test]
 fn grads_match_central_differences() {
-    let p = state();
+    let (p, optics) = state();
     let (o, pr) = (p.object(), p.probe());
-    let b = BhBatch::new(batch(&p, FRAMES), p.observed(), p.quad(), o, pr);
-    let [g_o, g_p] = b.grads();
+    let b = BhBatch::new(
+        batch(&p, FRAMES),
+        p.observed(),
+        &optics,
+        slice::from_ref(o),
+        pr,
+    );
+    let g = b.grads();
+    let (g_o, g_p) = g.split_at(o.as_slice().len());
     let mut seed = 0x2545_f491_4f6c_dd1d;
     let (d_o, d_p) = (direction(o, &mut seed), direction(pr, &mut seed));
     let h = 1e-5;
-    let fo = (cost(&p, FRAMES, &Object::new(moved(o, h, &d_o)), pr)
-        - cost(&p, FRAMES, &Object::new(moved(o, -h, &d_o)), pr))
+    let f = |o: &Object, pr: &Probe| cost(&p, &optics, FRAMES, o, pr);
+    let fo = (f(&Object::new(moved(o, h, &d_o)), pr) - f(&Object::new(moved(o, -h, &d_o)), pr))
         / (2.0 * h);
-    let fp = (cost(&p, FRAMES, o, &Probe::new(moved(pr, h, &d_p)))
-        - cost(&p, FRAMES, o, &Probe::new(moved(pr, -h, &d_p))))
+    let fp = (f(o, &Probe::new(moved(pr, h, &d_p))) - f(o, &Probe::new(moved(pr, -h, &d_p))))
         / (2.0 * h);
     // the gradient carries the 1e-8 amplitude offset, the differences do not
-    let (eo, ep) = (rel(dot(&g_o, &d_o), fo), rel(dot(&g_p, &d_p), fp));
+    let (eo, ep) = (
+        rel(dot(g_o, d_o.as_slice()), fo),
+        rel(dot(g_p, d_p.as_slice()), fp),
+    );
     assert!(eo < 1e-7 && ep < 1e-7, "object {eo:.3e} probe {ep:.3e}");
 }
 
@@ -115,24 +126,20 @@ fn grads_match_central_differences() {
 /// `u ≠ v` over both the object and the probe.
 #[test]
 fn hessian_matches_central_differences() {
-    let p = state();
+    let (p, optics) = state();
     let (o, pr) = (p.object(), p.probe());
     let views = batch(&p, FRAMES);
     let mut seed = 0x9e37_79b9_7f4a_7c15;
-    let u = [direction(o, &mut seed), direction(pr, &mut seed)];
-    let v = [direction(o, &mut seed), direction(pr, &mut seed)];
-    let h_an =
-        BhBatch::new(views, p.observed(), p.quad(), o, pr).hessian([&u[0], &u[1]], [&v[0], &v[1]]);
-    let h_sym =
-        BhBatch::new(views, p.observed(), p.quad(), o, pr).hessian([&v[0], &v[1]], [&u[0], &u[1]]);
+    let (u_o, u_p) = (direction(o, &mut seed), direction(pr, &mut seed));
+    let (v_o, v_p) = (direction(o, &mut seed), direction(pr, &mut seed));
+    let (u, v) = (flat(&u_o, &u_p), flat(&v_o, &v_p));
+    let b = BhBatch::new(views, p.observed(), &optics, slice::from_ref(o), pr);
+    let (h_an, h_sym) = (b.hessian(&u, &v), b.hessian(&v, &u));
     assert!(rel(h_sym, h_an) < 1e-13, "H(u, v) {h_an} H(v, u) {h_sym}");
     let du = |t: f64| {
-        let (o, pr) = (
-            Object::new(moved(o, t, &v[0])),
-            Probe::new(moved(pr, t, &v[1])),
-        );
-        let [a, b] = BhBatch::new(views, p.observed(), p.quad(), &o, &pr).grads();
-        dot(&a, &u[0]) + dot(&b, &u[1])
+        let (o, pr) = (Object::new(moved(o, t, &v_o)), moved(pr, t, &v_p));
+        let g = BhBatch::new(views, p.observed(), &optics, &[o], &Probe::new(pr)).grads();
+        dot(&g, &u)
     };
     let h = 1e-6;
     let fd = (du(h) - du(-h)) / (2.0 * h);
@@ -143,7 +150,7 @@ fn hessian_matches_central_differences() {
 /// beta alpha top bottom frames..` and per-epoch object (`iy ix re0 im0 re1 im1`) and probe
 /// (`m iy ix ...`) changes.
 fn assert_ref(batch_size: usize, steps: &str, obj: &str, probe: &str) {
-    let p = state();
+    let (p, optics) = state();
     let mut bh = Bh::new(BhParams {
         batch_size,
         probe_rho: 0.01,
@@ -154,7 +161,8 @@ fn assert_ref(batch_size: usize, steps: &str, obj: &str, probe: &str) {
     let mut changes = Vec::new();
     for _ in 0..2 {
         let (o0, p0) = (object.clone(), pr.clone());
-        got.push(bh.epoch(p.addr(), p.observed(), p.quad(), &mut object, &mut pr));
+        let objects = slice::from_mut(&mut object);
+        got.push(bh.epoch(p.addr(), p.observed(), &optics, objects, &mut pr));
         changes.push([moved(&object, -1.0, &o0), moved(&pr, -1.0, &p0)]);
     }
     let rows = table(steps);

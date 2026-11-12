@@ -6,3 +6,5 @@ oxide = "run --quiet --manifest-path /home/stevek/work/cuda-rust/cuda-oxide/crat
 # Unlocks rustc_private / -Z for the cuda-oxide backend on the pinned stable.
 RUSTC_BOOTSTRAP = "1"
 CUDA_TOOLKIT_PATH = { value = "/usr/local/cuda-13.5", relative = false }
+# The interpreter ptyrs-py builds against: the validation env with pty-chi and PyNX.
+PYO3_PYTHON = { value = "/home/stevek/micromamba/envs/ptyrs-ref/bin/python3.12", relative = false }

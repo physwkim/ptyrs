@@ -41,11 +41,17 @@ mod rpie;
 pub use bh::{
     BH_HESS, BH_STEP, BhBatch, BhDisp, BhFieldsRef, BhKernels, BhScan, BhVar, EpochOrder, bh_parts,
 };
-pub use fused::{Exit, FUSED_SIDES, FusedBufs, FusedInputs, FusedSums};
-pub use grad::{CG_BLOCKS, GAMMA_CHUNK, GammaStacks, GradKernels, ObjProbeScale, gamma_parts};
+pub use fused::{
+    BackgroundSums, Exit, FUSED_SIDES, FarSums, FusedBufs, FusedInputs, FusedSums, Model,
+    ProbeSpectrum, Shift, ShiftSums, ShiftedProbeSums, SpectrumBuf,
+};
+pub use grad::{
+    CG_BLOCKS, GAMMA_CHUNK, GammaCounts, GammaStacks, GradKernels, ObjProbeScale, gamma_parts,
+};
 pub use ops::{
-    LLK_TREE_LEAVES, LlkPartial, LlkScratch, LlkSums, MASKED, OBJ_TILE, StackCtl, StackGeom,
-    StackRef, StackTable, UpdateSums, ViewAddr, ViewDims, Views, view_tiles,
+    LLK_TREE_LEAVES, LlkPartial, LlkScratch, LlkSums, MASKED, OBJ_TILE, Permutation,
+    PositionPartial, ScalePartial, StackCtl, StackGeom, StackRef, StackTable, UpdateSums, ViewAddr,
+    ViewDims, Views, view_tiles,
 };
 pub use ptyrs_fft::C32;
 pub use ring::{Ended, LlkRing, LlkTotals, RecordWriter, RingDevice, RingError};

@@ -1,5 +1,5 @@
-//! pty-chi BH on the GPU ([`crate::Bh`]), in the call sequence of `ptyrs_gpu::BhKernels`;
-//! the step's scalars stay on the device.
+//! pty-chi BH on the GPU ([`crate::Bh`]), in the call sequence of `ptyrs_gpu::BhKernels`, its
+//! dot products by `ptyrs_tile::TileDots`; the step's scalars stay on the device.
 
 use cuda_async::device_operation::ExecutionContext;
 use ptyrs_gpu::{BhBatch, BhDisp, BhFieldsRef, BhScan, BhVar, Error as GpuError};
@@ -21,6 +21,9 @@ impl GpuPtycho {
     ) -> Result<(), EngineError> {
         if params.batch_size == 0 {
             return Err(EngineError::Invalid("BH batch_size must be >= 1".into()));
+        }
+        if self.dev.has_features() {
+            return Err(EngineError::Invalid("BH models no features".into()));
         }
         let nframe = self.dev.dims().nframe as usize;
         let full = params.batch_size >= nframe;
@@ -102,7 +105,7 @@ impl Bufs<'_> {
             u_scale: rho2,
             v: cg.then_some([&bh.prev[0], &bh.prev[1]]),
         };
-        self.bh.dots(ctx, &dims, &d, bh.parts)?;
+        self.tile.dots(ctx, &d, bh.parts)?;
         for (k, s) in batch.clone().enumerate() {
             let stack = bh.table.at(s);
             let plan = bh.plans.get(bh.stacks[s].plan);

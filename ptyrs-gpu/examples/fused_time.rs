@@ -1,14 +1,18 @@
-//! Per-cycle time of the M1 and the fused AP and DM cycles on CUDA device 0.
+//! Per-cycle time of the M1 and the fused AP and DM cycles, and of the fused AP cycle with
+//! the position model, on CUDA device 0.
 //!
 //! `cargo run --release -p ptyrs-gpu --example fused_time -- [ncycle] [sizes] [paths]
-//! [frame]` (defaults 50, `8,16,20,25,32,40`, `ap-m1,ap-fused,dm-m1,dm-fused` and 256) builds
+//! [frame]` (defaults 50, `8,16,20,25,32,40`, `ap-m1,ap-fused,dm-m1,dm-fused` and 256; the
+//! path `ap-shift` is the shifted-probe cycle) builds
 //! the scan of the engine's `gpu_time` (400 Fermat positions `frame / 16` object pixels
 //! apart, `frame` x `frame` frames, 2 probe modes, 1 object mode, counts from the model; at
 //! the default frame exactly the engine's) and, per comma-separated stack size,
 //! runs each selected path, the engine's M1 cycles (object inertia 0.01, probe inertia 0.001,
 //! DM alpha 0.02 and one object-then-probe update, no LLK) or the fused passes: 5 untimed
 //! cycles, then `ncycle` timed ones, eagerly and as replays of a graph captured from one
-//! steady cycle.
+//! steady cycle. `ap-shift` moves each frame's probe by fixed offsets uniform in `[-1, 1)`
+//! pixels per axis and takes every sum of the model each cycle: the probe's spectra, the
+//! object sums, the shifted probe sums and both position sums.
 
 use std::f64::consts::PI;
 use std::sync::Arc;
@@ -20,8 +24,9 @@ use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 use ptyrs_core::{AddrTable, Geometry, Positions, required_obj_shape};
 use ptyrs_fft::Plan2d;
 use ptyrs_gpu::{
-    C32, Error, Exit, FusedBufs, FusedInputs, FusedSums, Kernels, StackTable, UpdateSums, ViewAddr,
-    ViewDims, Views, record,
+    C32, Error, Exit, FarSums, FusedBufs, FusedInputs, FusedSums, Kernels, Model, PositionPartial,
+    Shift, ShiftSums, ShiftedProbeSums, SpectrumBuf, StackTable, UpdateSums, ViewAddr, ViewDims,
+    Views, record,
 };
 
 const WARMUP: usize = 5;
@@ -33,18 +38,28 @@ const NPROBE: usize = 2;
 /// Frame side per object pixel of scan step.
 const FRAME_PER_STEP: usize = 16;
 
-/// What every run reads: the views, counts and starting arrays.
+/// What every run reads: the views, counts, starting arrays and `ap-shift`'s offsets.
 struct Scene {
     views: Views,
     counts: DeviceBuffer<u16>,
     obj: Vec<C32>,
     probe: Vec<C32>,
+    offsets: DeviceBuffer<f32>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
 enum Algo {
     Ap,
     Dm,
+}
+
+/// How a cycle runs its passes: the M1 sequence, the fused passes, or the fused passes with
+/// the position model (AP only).
+#[derive(Clone, Copy, PartialEq)]
+enum Kind {
+    M1,
+    Fused,
+    Shift,
 }
 
 /// One run's buffers, laid out as the engine lays out its M1 stacks.
@@ -61,6 +76,10 @@ struct Run {
     probe: DeviceBuffer<C32>,
     obj_sums: UpdateSums,
     probe_sums: UpdateSums,
+    spectrum: SpectrumBuf,
+    shifted: ShiftedProbeSums,
+    position: DeviceBuffer<PositionPartial>,
+    position_den: DeviceBuffer<PositionPartial>,
 }
 
 impl Run {
@@ -70,6 +89,7 @@ impl Run {
         obj: &[C32],
         probe: &[C32],
         size: u32,
+        kind: Kind,
     ) -> Result<Self, Error> {
         let (n, nmode) = (d.frame[0] as usize * d.frame[1] as usize, d.nmode as usize);
         let ranges: Vec<_> = (0..d.nframe)
@@ -104,11 +124,19 @@ impl Run {
             plans,
             psi,
             scratch: DeviceBuffer::zeroed(stream, buf_len)?,
-            bufs: FusedBufs::new(stream, d, table.nf_max())?,
+            bufs: if kind == Kind::Shift {
+                FusedBufs::with_shift(stream, d, table.nf_max())?
+            } else {
+                FusedBufs::new(stream, d, table.nf_max())?
+            },
             obj: DeviceBuffer::from_host(stream, obj)?,
             probe: DeviceBuffer::from_host(stream, probe)?,
             obj_sums: UpdateSums::zeroed(stream, obj.len())?,
             probe_sums: UpdateSums::zeroed(stream, probe.len())?,
+            spectrum: SpectrumBuf::zeroed(stream, d)?,
+            shifted: ShiftedProbeSums::zeroed(stream, d)?,
+            position: DeviceBuffer::zeroed(stream, d.nframe as usize)?,
+            position_den: DeviceBuffer::zeroed(stream, d.nframe as usize)?,
             table,
         })
     }
@@ -139,15 +167,57 @@ impl Run {
                 counts: &sc.counts,
                 obj: &self.obj,
                 probe: &self.probe,
+                model: Model::default(),
             };
-            let exit = Exit::Ap { llk: None };
+            let exit = Exit::Ap {
+                far: FarSums::default(),
+            };
             let sums = FusedSums {
                 obj: Some(&mut self.obj_sums),
                 probe: Some(&mut self.probe_sums),
+                ..Default::default()
             };
             k.fused_project(ctx, &inputs, stack, exit, &mut self.bufs, sums)?;
         }
         self.update_obj(ctx, k, sc)?;
+        self.update_probe(ctx, k)
+    }
+
+    /// The AP cycle with the position model: the probe's spectra, `fused_project` with every
+    /// shift sum, the object update, and the probe's from the shifted probe sums.
+    fn shift_ap(&mut self, ctx: &ExecutionContext, k: &Kernels, sc: &Scene) -> Result<(), Error> {
+        let d = *sc.views.dims();
+        let spectrum = k.probe_spectrum(ctx, &d, &self.probe, &mut self.spectrum)?;
+        for s in 0..self.table.len() {
+            let inputs = FusedInputs {
+                views: &sc.views,
+                counts: &sc.counts,
+                obj: &self.obj,
+                probe: &self.probe,
+                model: Model {
+                    shift: Some(Shift {
+                        offsets: &sc.offsets,
+                        spectrum,
+                    }),
+                    ..Default::default()
+                },
+            };
+            let exit = Exit::Ap {
+                far: FarSums::default(),
+            };
+            let sums = FusedSums {
+                obj: Some(&mut self.obj_sums),
+                probe: None,
+                shift: ShiftSums {
+                    probe: Some(&mut self.shifted),
+                    position: Some(&mut self.position),
+                    position_den: Some(&mut self.position_den),
+                },
+            };
+            k.fused_project(ctx, &inputs, self.table.at(s), exit, &mut self.bufs, sums)?;
+        }
+        self.update_obj(ctx, k, sc)?;
+        k.shifted_probe_sums(ctx, &d, &mut self.shifted, &mut self.probe_sums)?;
         self.update_probe(ctx, k)
     }
 
@@ -197,6 +267,7 @@ impl Run {
                 counts: &sc.counts,
                 obj: &self.obj,
                 probe: &self.probe,
+                model: Model::default(),
             };
             let psi = &mut self.psi[s];
             let exit = if first {
@@ -207,6 +278,7 @@ impl Run {
             let sums = FusedSums {
                 obj: Some(&mut self.obj_sums),
                 probe: None,
+                ..Default::default()
             };
             k.fused_project(ctx, &inputs, self.table.at(s), exit, &mut self.bufs, sums)?;
         }
@@ -250,20 +322,23 @@ impl Run {
         ctx: &ExecutionContext,
         k: &Kernels,
         sc: &Scene,
-        (algo, fused): (Algo, bool),
+        path: (Algo, Kind),
         first: bool,
     ) -> Result<(), Error> {
-        match (algo, fused) {
-            (Algo::Ap, false) => self.m1_ap(ctx, k, sc),
-            (Algo::Ap, true) => self.fused_ap(ctx, k, sc),
-            (Algo::Dm, false) => self.m1_dm(ctx, k, sc, first),
-            (Algo::Dm, true) => self.fused_dm(ctx, k, sc, first),
+        match path {
+            (Algo::Ap, Kind::M1) => self.m1_ap(ctx, k, sc),
+            (Algo::Ap, Kind::Fused) => self.fused_ap(ctx, k, sc),
+            (Algo::Ap, Kind::Shift) => self.shift_ap(ctx, k, sc),
+            (Algo::Dm, Kind::M1) => self.m1_dm(ctx, k, sc, first),
+            (Algo::Dm, Kind::Fused) => self.fused_dm(ctx, k, sc, first),
+            (Algo::Dm, Kind::Shift) => unreachable!("main parses no dm-shift"),
         }
     }
 }
 
 /// The engine's `gpu_time` scan at `frame`: its geometry, views and object shape, with a
-/// unit-modulus random-phase object, the simulated probe and counts of their far field.
+/// unit-modulus random-phase object, the simulated probe, counts of their far field and
+/// `ap-shift`'s offsets.
 fn scene(
     stream: &Arc<CudaStream>,
     k: &Kernels,
@@ -326,10 +401,13 @@ fn scene(
             im: (c.im * scale) as f32,
         })
         .collect();
+    let offsets: Vec<f32> = (0..2 * NPOS)
+        .map(|_| (2.0 * uniform() - 1.0) as f32)
+        .collect();
 
     // Counts: the model's intensity, rounded, one 16-frame stack at a time.
     let (n, size) = (frame * frame, 16);
-    let mut run = Run::new(stream, &dims, &obj, &probe, size)?;
+    let mut run = Run::new(stream, &dims, &obj, &probe, size, Kind::M1)?;
     let mut icalc = DeviceBuffer::<f32>::zeroed(stream, size as usize * n)?;
     let mut counts = Vec::with_capacity(NPOS * n);
     for s in 0..run.table.len() {
@@ -354,6 +432,7 @@ fn scene(
         counts: DeviceBuffer::from_host(stream, &counts)?,
         obj,
         probe,
+        offsets: DeviceBuffer::from_host(stream, &offsets)?,
     })
 }
 
@@ -399,10 +478,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let paths = paths
         .split(',')
         .map(|p| match p {
-            "ap-m1" => Ok((Algo::Ap, false)),
-            "ap-fused" => Ok((Algo::Ap, true)),
-            "dm-m1" => Ok((Algo::Dm, false)),
-            "dm-fused" => Ok((Algo::Dm, true)),
+            "ap-m1" => Ok((Algo::Ap, Kind::M1)),
+            "ap-fused" => Ok((Algo::Ap, Kind::Fused)),
+            "ap-shift" => Ok((Algo::Ap, Kind::Shift)),
+            "dm-m1" => Ok((Algo::Dm, Kind::M1)),
+            "dm-fused" => Ok((Algo::Dm, Kind::Fused)),
             _ => Err(usage),
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -426,23 +506,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for algo in [Algo::Ap, Algo::Dm] {
             let name = if algo == Algo::Ap { "ap" } else { "dm" };
             let mut objs = Vec::new();
-            for fused in [false, true] {
-                let path = (algo, fused);
+            for kind in [Kind::M1, Kind::Fused, Kind::Shift] {
+                let path = (algo, kind);
                 if !paths.contains(&path) {
                     continue;
                 }
-                let label = if fused { "fused" } else { "m1" };
+                let label = match kind {
+                    Kind::M1 => "m1",
+                    Kind::Fused => "fused",
+                    Kind::Shift => "shift",
+                };
 
-                let mut run = Run::new(&stream, d, &sc.obj, &sc.probe, size)?;
+                let mut run = Run::new(&stream, d, &sc.obj, &sc.probe, size, kind)?;
                 let mut ic = 0;
                 time(&stream, WARMUP, |ctx| {
                     ic += 1;
                     run.cycle(ctx, &k, &sc, path, ic == 1)
                 })?;
                 let eager = time(&stream, ncycle, |ctx| run.cycle(ctx, &k, &sc, path, false))?;
-                objs.push(run.obj.to_host_vec(&stream)?);
+                if kind != Kind::Shift {
+                    objs.push(run.obj.to_host_vec(&stream)?);
+                }
 
-                let mut run = Run::new(&stream, d, &sc.obj, &sc.probe, size)?;
+                let mut run = Run::new(&stream, d, &sc.obj, &sc.probe, size, kind)?;
                 let mut ic = 0;
                 time(&stream, WARMUP, |ctx| {
                     ic += 1;

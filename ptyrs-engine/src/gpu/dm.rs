@@ -16,7 +16,9 @@ impl GpuPtycho {
     /// updates, the probe one from the new object; the fused projection adds the first
     /// object-only update's sums itself. The LLK record is of the estimate the cycle starts
     /// from; after the update of each cycle that records one, `Σ|O|` and `Σ|P|` are balanced
-    /// with `O P` unchanged (PyNX `ScaleObjProbe(absolute=False)`).
+    /// with `O P` unchanged (PyNX `ScaleObjProbe(absolute=False)`). With stepped features, a
+    /// pass of their own first takes the far sums of `PO` under the cycle-start model and
+    /// steps them, and the projection models the stepped values.
     pub fn dm(&mut self, params: &DmParams, ncycle: usize) -> Result<(), EngineError> {
         for ic in 0..ncycle {
             let epoch = Epoch::Dm {
@@ -62,6 +64,10 @@ impl Bufs<'_> {
             }
             PassesMut::Fused(f) => {
                 summed = params.loop_obj_probe > 0 && params.obj_inertia.is_some();
+                if self.features.stepped() {
+                    // No record, so nothing ended.
+                    let _ = self.step_features(ctx, f, None)?;
+                }
                 for s in 0..self.stacks.len() {
                     let stack = self.table.at(s);
                     let psi = self.stacks.get(s).psi;
@@ -70,6 +76,7 @@ impl Bufs<'_> {
                         counts: self.counts,
                         obj: self.obj,
                         probe: self.probe,
+                        model: self.features.model(),
                     };
                     let exit = if first {
                         Exit::DmFirst { psi }
@@ -78,7 +85,7 @@ impl Bufs<'_> {
                     };
                     let sums = FusedSums {
                         obj: summed.then_some(&mut *self.obj_sums),
-                        probe: None,
+                        ..FusedSums::default()
                     };
                     self.kernels
                         .fused_project(ctx, &inputs, stack, exit, f, sums)?;

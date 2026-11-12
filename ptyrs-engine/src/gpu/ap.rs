@@ -1,7 +1,9 @@
 //! PyNX AP on the GPU.
 
 use cuda_async::device_operation::ExecutionContext;
-use ptyrs_gpu::{Ended, Error as GpuError, Exit, FusedBufs, FusedInputs, FusedSums, RecordWriter};
+use ptyrs_gpu::{
+    Ended, Error as GpuError, Exit, FarSums, FusedBufs, FusedInputs, FusedSums, RecordWriter,
+};
 
 use super::device::PassesMut;
 use super::{Bufs, Epoch, GpuPtycho};
@@ -11,7 +13,10 @@ use crate::{ApParams, EngineError};
 impl GpuPtycho {
     /// [`crate::Ptycho::ap`]: per stack, exit waves of the current estimate, projection (the
     /// LLK of the estimate is taken from the forward stack) and the update sums; after the
-    /// last stack, both updates from the sums, which read only the old arrays.
+    /// last stack, both updates from the sums, which read only the old arrays. With stepped
+    /// features, a pass of their own first takes the LLK and the far sums of the estimate
+    /// under the cycle-start model and steps them, and the projection models the stepped
+    /// values.
     pub fn ap(&mut self, params: &ApParams, ncycle: usize) -> Result<(), EngineError> {
         for ic in 0..ncycle {
             let epoch = Epoch::Ap {
@@ -40,6 +45,12 @@ impl Bufs<'_> {
         mut llk: Option<RecordWriter<'_>>,
     ) -> Result<Option<Ended>, GpuError> {
         let (o, p) = (params.obj_inertia, params.probe_inertia);
+        let stepped = match passes {
+            PassesMut::Fused(f) if self.features.stepped() => {
+                self.step_features(ctx, f, llk.take())?
+            }
+            _ => None,
+        };
         for s in 0..self.stacks.len() {
             match passes {
                 PassesMut::M1(m1) => {
@@ -59,13 +70,13 @@ impl Bufs<'_> {
                 }
             }
         }
-        let ended = llk.map(|w| w.end(ctx)).transpose()?;
+        let ended = llk.map(|w| w.end(ctx)).transpose()?.or(stepped);
         self.apply_sums(ctx, o, p)?;
         Ok(ended)
     }
 
     /// Stack `s` of an AP cycle by the fused passes: the projection with its LLK partials and
-    /// object sums, then the probe sums from the projected exit waves it leaves in `f`.
+    /// the object sums, then the probe sums from the projected exit waves it leaves in `f`.
     fn fused_ap(
         &mut self,
         ctx: &ExecutionContext,
@@ -82,13 +93,16 @@ impl Bufs<'_> {
             counts: self.counts,
             obj: self.obj,
             probe: self.probe,
+            model: self.features.model(),
         };
-        let exit = Exit::Ap {
+        let far = FarSums {
             llk: llk.is_some().then_some(&mut *self.llk),
+            ..FarSums::default()
         };
+        let exit = Exit::Ap { far };
         let sums = FusedSums {
             obj: obj.then_some(&mut *self.obj_sums),
-            probe: None,
+            ..FusedSums::default()
         };
         self.kernels
             .fused_project(ctx, &inputs, stack, exit, f, sums)?;

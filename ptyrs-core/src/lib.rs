@@ -15,6 +15,7 @@ pub mod frc;
 mod geometry;
 mod positions;
 mod scan;
+mod scan_pattern;
 pub mod sim;
 
 pub use addr::{AddrTable, View, required_obj_shape, view_corner};
@@ -24,3 +25,4 @@ pub use error::CoreError;
 pub use geometry::Geometry;
 pub use positions::Positions;
 pub use scan::Scan;
+pub use scan_pattern::ScanPattern;

@@ -5,6 +5,7 @@ use std::ops::Range;
 
 use ptyrs_core::{C64, Geometry, Object, Probe, Stack, View};
 
+use crate::features::Model;
 use crate::{Observed, shift};
 
 /// Far-field quadratic phase `q`, natural (centred) layout `[ny, nx]`:
@@ -74,19 +75,29 @@ pub fn obj_probe_to_psi(
 /// `psi *= sqrt(iobs) / max(1e-12, sqrt(Σ_modes |psi|²))`; masked pixels keep their value
 /// (PyNX sets `r = 1` where `iobs < 0`).
 pub fn apply_amplitude(obs: &Observed, frames: Range<usize>, nmode: usize, psi: &mut [C64]) {
+    apply_amplitude_with(obs, frames, nmode, psi, Model::default());
+}
+
+/// [`apply_amplitude`] against `model`'s intensity: `sqrt(icalc)` in place of
+/// `sqrt(Σ_modes |psi|²)`.
+pub(crate) fn apply_amplitude_with(
+    obs: &Observed,
+    frames: Range<usize>,
+    nmode: usize,
+    psi: &mut [C64],
+    model: Model<'_>,
+) {
     let n = obs.plane_len();
     assert_eq!(psi.len(), frames.len() * nmode * n);
-    for (o, block) in obs
-        .frames(frames)
-        .chunks_exact(n)
+    for ((f, o), block) in frames
+        .clone()
+        .zip(obs.frames(frames).chunks_exact(n))
         .zip(psi.chunks_exact_mut(nmode * n))
     {
         for (j, iobs) in o.iter().enumerate() {
             let Some(iobs) = *iobs else { continue };
-            let calc = (0..nmode)
-                .map(|m| block[m * n + j].norm_sqr())
-                .sum::<f64>()
-                .sqrt();
+            let i = (0..nmode).map(|m| block[m * n + j].norm_sqr()).sum();
+            let calc = model.calc(f, i).sqrt();
             let r = iobs.sqrt() / calc.max(1e-12);
             for m in 0..nmode {
                 block[m * n + j] *= r;
@@ -106,17 +117,29 @@ pub fn apply_amplitude(obs: &Observed, frames: Range<usize>, nmode: usize, psi: 
 /// adds them to the Gaussian, Euclidian and photon sums). [`Llk::normalised`] gives the values
 /// PyNX records.
 pub fn llk(obs: &Observed, frames: Range<usize>, nmode: usize, psi: &[C64]) -> Llk {
+    llk_with(obs, frames, nmode, psi, Model::default())
+}
+
+/// [`llk`] of `model`'s intensity.
+pub(crate) fn llk_with(
+    obs: &Observed,
+    frames: Range<usize>,
+    nmode: usize,
+    psi: &[C64],
+    model: Model<'_>,
+) -> Llk {
     let n = obs.plane_len();
     assert_eq!(psi.len(), frames.len() * nmode * n);
     let mut s = Llk::default();
-    for (o, block) in obs
-        .frames(frames)
-        .chunks_exact(n)
+    for ((f, o), block) in frames
+        .clone()
+        .zip(obs.frames(frames).chunks_exact(n))
         .zip(psi.chunks_exact(nmode * n))
     {
         for (j, iobs) in o.iter().enumerate() {
             let Some(iobs) = *iobs else { continue };
-            let icalc: f64 = (0..nmode).map(|m| block[m * n + j].norm_sqr()).sum();
+            let i = (0..nmode).map(|m| block[m * n + j].norm_sqr()).sum();
+            let icalc = model.calc(f, i);
             s.poisson += if iobs > 0.0 {
                 icalc - iobs + iobs * (iobs / icalc).ln()
             } else {
@@ -136,18 +159,31 @@ pub fn llk(obs: &Observed, frames: Range<usize>, nmode: usize, psi: &[C64]) -> L
 /// [`llk`]'s Poisson sum over `(Re psi, Im psi)`, packed as `∂L/∂Re + i·∂L/∂Im = 2·∂L/∂psi*`;
 /// PyNX keeps `∂L/∂psi*`, half of it.
 pub fn poisson_grad(obs: &Observed, frames: Range<usize>, nmode: usize, psi: &mut [C64]) {
+    poisson_grad_with(obs, frames, nmode, psi, Model::default());
+}
+
+/// [`poisson_grad`] of [`llk_with`]'s Poisson sum: `psi *= 2·s·(1 − iobs / max(1e-12, icalc))`
+/// with `s` the frame's intensity scale and `icalc` `model`'s.
+pub(crate) fn poisson_grad_with(
+    obs: &Observed,
+    frames: Range<usize>,
+    nmode: usize,
+    psi: &mut [C64],
+    model: Model<'_>,
+) {
     let n = obs.plane_len();
     assert_eq!(psi.len(), frames.len() * nmode * n);
-    for (o, block) in obs
-        .frames(frames)
-        .chunks_exact(n)
+    for ((f, o), block) in frames
+        .clone()
+        .zip(obs.frames(frames).chunks_exact(n))
         .zip(psi.chunks_exact_mut(nmode * n))
     {
         for (j, iobs) in o.iter().enumerate() {
             let r = match *iobs {
                 Some(iobs) => {
-                    let icalc: f64 = (0..nmode).map(|m| block[m * n + j].norm_sqr()).sum();
-                    2.0 * (1.0 - iobs / icalc.max(1e-12))
+                    let i = (0..nmode).map(|m| block[m * n + j].norm_sqr()).sum();
+                    let icalc = model.calc(f, i);
+                    model.scaled(f, 2.0 * (1.0 - iobs / icalc.max(1e-12)))
                 }
                 None => 0.0,
             };
@@ -174,11 +210,27 @@ pub fn cg_poisson_gamma(
     a: &[C64],
     b: &[C64],
 ) -> (f64, f64) {
+    cg_poisson_gamma_with(obs, frames, nmode, [po, a, b], Model::default())
+}
+
+/// [`cg_poisson_gamma`] of [`llk_with`]'s Poisson sum: `icalc`, `r` and `s` times the frame's
+/// intensity scale, `icalc` `model`'s.
+pub(crate) fn cg_poisson_gamma_with(
+    obs: &Observed,
+    frames: Range<usize>,
+    nmode: usize,
+    [po, a, b]: [&[C64]; 3],
+    model: Model<'_>,
+) -> (f64, f64) {
     let n = obs.plane_len();
     let len = frames.len() * nmode * n;
     assert!(po.len() == len && a.len() == len && b.len() == len);
     let (mut num, mut den) = (0.0, 0.0);
-    for (k, o) in obs.frames(frames).chunks_exact(n).enumerate() {
+    for (k, (f, o)) in frames
+        .clone()
+        .zip(obs.frames(frames).chunks_exact(n))
+        .enumerate()
+    {
         let at = |m: usize, j: usize| (k * nmode + m) * n + j;
         for (j, iobs) in o.iter().enumerate() {
             let Some(iobs) = *iobs else { continue };
@@ -189,10 +241,11 @@ pub fn cg_poisson_gamma(
                 r += (p.conj() * a).re;
                 s += a.norm_sqr() + 2.0 * (p.conj() * b).re;
             }
-            let calc = calc.max(1e-12);
-            let f = 1.0 - iobs / calc;
-            num -= 2.0 * r * f;
-            den += 2.0 * s * f + iobs * (2.0 * r / calc).powi(2);
+            let calc = model.calc(f, calc).max(1e-12);
+            let (r, s) = (model.scaled(f, r), model.scaled(f, s));
+            let d = 1.0 - iobs / calc;
+            num -= 2.0 * r * d;
+            den += 2.0 * s * d + iobs * (2.0 * r / calc).powi(2);
         }
     }
     (num, den)

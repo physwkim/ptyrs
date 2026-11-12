@@ -77,6 +77,8 @@ pub mod rpie_kernels {
     ///
     /// `x` holds `gridDim.y * nsum` planes of `n` complex values, `chunks` `gridDim.y *
     /// nchunk` floats; grid `(nchunk, ngroup, 1)`, block `(PIXEL_THREADS, 1, 1)`.
+    ///
+    /// [`rpie_max_chunks`]: LoadedModule::rpie_max_chunks
     #[kernel]
     pub unsafe fn rpie_power_max(x: *const f32, nsum: u32, n: u32, chunks: *mut f32) {
         static mut RED: SharedArray<f32, 256> = SharedArray::UNINIT;
@@ -117,6 +119,8 @@ pub mod rpie_kernels {
     /// # Safety
     ///
     /// `chunks` holds `ngroup * nchunk` floats, `out` `ngroup`.
+    ///
+    /// [`rpie_power_max`]: LoadedModule::rpie_power_max
     #[kernel]
     pub unsafe fn rpie_max_chunks(chunks: *const f32, nchunk: u32, ngroup: u32, out: *mut f32) {
         let b = global_index();

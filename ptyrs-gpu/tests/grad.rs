@@ -6,8 +6,9 @@ use std::sync::Arc;
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, DeviceCopy};
 use ptyrs_gpu::{
-    C32, CG_BLOCKS, GAMMA_CHUNK, GammaStacks, GradKernels, Kernels, LlkPartial, MASKED,
-    ObjProbeScale, StackTable, UpdateSums, ViewAddr, ViewDims, Views, gamma_parts,
+    C32, CG_BLOCKS, GAMMA_CHUNK, GammaCounts, GammaStacks, GradKernels, Kernels, LlkPartial,
+    MASKED, Model, ObjProbeScale, ScalePartial, StackTable, UpdateSums, ViewAddr, ViewDims, Views,
+    gamma_parts,
 };
 
 /// A stream, an eager execution context on it, the M1 kernels and the CG kernels.
@@ -253,6 +254,18 @@ fn gamma_fields_are_the_exit_waves_of_the_directions() {
 /// the scan's `gamma_parts` pairs is their total.
 #[test]
 fn gamma_frames_match_f64_per_chunk_and_sum_to_gamma() {
+    gamma_frames_case(None);
+}
+
+/// As [`gamma_frames_match_f64_per_chunk_and_sum_to_gamma`] with a per-frame intensity scale
+/// `k`: `calc`, `r` and `s` of each frame times its `k`.
+#[test]
+fn gamma_frames_scale_each_frame() {
+    gamma_frames_case(Some(&[0.5, 2.0, 1.25, 3.0, 0.75]));
+}
+
+/// [`gamma_frames_match_f64_per_chunk_and_sum_to_gamma`] with `scale` as the model's.
+fn gamma_frames_case(scale: Option<&[f32]>) {
     let (stream, ctx, _, k) = setup();
     let (ny, nx, nmode) = (48usize, 64usize, 2usize);
     let n = ny * nx;
@@ -283,6 +296,14 @@ fn gamma_frames_match_f64_per_chunk_and_sum_to_gamma() {
         })
         .collect();
     let dcounts = up(&stream, &counts);
+    let dscale = scale.map(|s| up(&stream, s));
+    let obs = GammaCounts {
+        counts: &dcounts,
+        model: Model {
+            scale: dscale.as_ref(),
+            ..Model::default()
+        },
+    };
     let mut pairs = up(&stream, &vec![7.0f32; 2 * 5 * nchunk]);
     let mut total = (0.0f64, 0.0f64);
     for (s, f0, nf) in [(0usize, 0usize, 3usize), (1, 3, 2)] {
@@ -298,7 +319,7 @@ fn gamma_frames_match_f64_per_chunk_and_sum_to_gamma() {
             b: up(&stream, &x[2]),
         };
         let before = pairs.to_host_vec(&stream).unwrap();
-        k.gamma_frames(&ctx, &dims, table.at(s), &dcounts, &stacks, &mut pairs)
+        k.gamma_frames(&ctx, &dims, table.at(s), obs, &stacks, &mut pairs)
             .unwrap();
         let got = pairs.to_host_vec(&stream).unwrap();
         for f in 0..5 {
@@ -312,6 +333,7 @@ fn gamma_frames_match_f64_per_chunk_and_sum_to_gamma() {
                 continue;
             }
             let fl = f - f0;
+            let kf = scale.map_or(1.0, |s| s[f] as f64);
             for c in 0..nchunk {
                 let (mut num, mut den, mut scale) = (0.0f64, 0.0f64, [0.0f64; 2]);
                 for d in c * chunk..n.min((c + 1) * chunk) {
@@ -329,8 +351,8 @@ fn gamma_frames_match_f64_per_chunk_and_sum_to_gamma() {
                         r += p.0 * a.0 + p.1 * a.1;
                         sq += a.0 * a.0 + a.1 * a.1 + 2.0 * (p.0 * b.0 + p.1 * b.1);
                     }
-                    let calc = (calc / n as f64).max(1e-12);
-                    let (r, sq, obs) = (r / n as f64, sq / n as f64, obs as f64);
+                    let calc = (kf * calc / n as f64).max(1e-12);
+                    let (r, sq, obs) = (kf * r / n as f64, kf * sq / n as f64, obs as f64);
                     let f = 1.0 - obs / calc;
                     let (tn, td) = (-2.0 * r * f, 2.0 * sq * f + obs * (2.0 * r / calc).powi(2));
                     num += tn;
@@ -366,9 +388,52 @@ fn gamma_frames_match_f64_per_chunk_and_sum_to_gamma() {
     let mut short = up(&stream, &[0.0f32; 10]);
     let stacks = GammaStacks::zeroed(&stream, 3 * nmode * n).unwrap();
     assert!(
-        k.gamma_frames(&ctx, &dims, table.at(0), &dcounts, &stacks, &mut short)
+        k.gamma_frames(&ctx, &dims, table.at(0), obs, &stacks, &mut short)
             .is_err()
     );
+}
+
+/// A scale of one value per frame passes; one of another frame count, and a model with a
+/// background, are refused.
+#[test]
+fn gamma_frames_refuse_other_models() {
+    let (stream, ctx, _, k) = setup();
+    let (views, table) = scan(&stream);
+    let dims = *views.dims();
+    let counts = up(&stream, &vec![1u16; 5 * 64]);
+    let stacks = GammaStacks::zeroed(&stream, 3 * 2 * 64).unwrap();
+    let npairs = 2 * gamma_parts(&dims).unwrap() as usize;
+    let mut pairs = DeviceBuffer::<f32>::zeroed(&stream, npairs).unwrap();
+    let ones = up(&stream, &[1.0f32; 5]);
+    let obs = GammaCounts {
+        counts: &counts,
+        model: Model {
+            scale: Some(&ones),
+            ..Model::default()
+        },
+    };
+    k.gamma_frames(&ctx, &dims, table.at(0), obs, &stacks, &mut pairs)
+        .unwrap();
+    let (short, background) = (up(&stream, &[1.0f32; 4]), up(&stream, &[0.0f32; 64]));
+    for model in [
+        Model {
+            scale: Some(&short),
+            ..Model::default()
+        },
+        Model {
+            background: Some(&background),
+            ..Model::default()
+        },
+    ] {
+        let obs = GammaCounts {
+            counts: &counts,
+            model,
+        };
+        assert!(
+            k.gamma_frames(&ctx, &dims, table.at(0), obs, &stacks, &mut pairs)
+                .is_err()
+        );
+    }
 }
 
 /// The Fourier-space Poisson gradient is the f64 formula at every pixel of the stack's frames,
@@ -448,7 +513,8 @@ fn norm_parts_add_up_both_arrays() {
 }
 
 /// The stacks' frame partials add up into one total, each stack's `icalc` over its own `nf`
-/// records only (stack `3..5` leaves its third record out).
+/// records only (stack `3..5` leaves its third record out), each times its frame's scale when
+/// one is given; a scale of another frame count is refused.
 #[test]
 fn icalc_add_sums_each_stacks_frames() {
     let (stream, ctx, _, k) = setup();
@@ -459,16 +525,64 @@ fn icalc_add_sums_each_stacks_frames() {
         euclidean: 300.0,
         icalc,
     };
-    let mut out = up(&stream, &[0.0f32]);
-    for (s, icalc) in [[1.0, 2.0, 4.0], [8.0, 16.0, 1000.0]]
-        .into_iter()
-        .enumerate()
-    {
-        let partials = up(&stream, &icalc.map(rec));
-        k.icalc_add(&ctx, views.dims(), table.at(s), &partials, &mut out)
-            .unwrap();
+    let scale = up(&stream, &[1.0f32, 2.0, 3.0, 4.0, 5.0]);
+    for (scale, want) in [(None, 31.0), (Some(&scale), 129.0)] {
+        let mut out = up(&stream, &[0.0f32]);
+        for (s, icalc) in [[1.0, 2.0, 4.0], [8.0, 16.0, 1000.0]]
+            .into_iter()
+            .enumerate()
+        {
+            let partials = up(&stream, &icalc.map(rec));
+            k.icalc_add(&ctx, views.dims(), table.at(s), &partials, scale, &mut out)
+                .unwrap();
+        }
+        assert_eq!(out.to_host_vec(&stream).unwrap(), [want]);
     }
-    assert_eq!(out.to_host_vec(&stream).unwrap(), [31.0]);
+    let (partials, mut out) = (up(&stream, &[rec(1.0); 3]), up(&stream, &[0.0f32]));
+    let short = up(&stream, &[1.0f32; 4]);
+    let dims = views.dims();
+    assert!(
+        k.icalc_add(&ctx, dims, table.at(0), &partials, Some(&short), &mut out)
+            .is_err()
+    );
+}
+
+/// Every frame's scale times `ratio / intensity`, a frame of no intensity kept, then over
+/// the mean, past the 256 threads of a block.
+#[test]
+fn scale_step_is_the_fixed_point_step() {
+    let (stream, ctx, _, k) = setup();
+    let nframe = 600;
+    let scale: Vec<f32> = (0..nframe).map(|f| 0.5 + f as f32 / 300.0).collect();
+    let sums: Vec<ScalePartial> = (0..nframe)
+        .map(|f| ScalePartial {
+            intensity: if f % 7 == 3 { 0.0 } else { 10.0 + f as f32 },
+            ratio: 12.0 + 0.5 * f as f32,
+            amplitude: -1.0,
+        })
+        .collect();
+    let mut dscale = up(&stream, &scale);
+    k.scale_step(&ctx, &mut dscale, &up(&stream, &sums))
+        .unwrap();
+    let got = dscale.to_host_vec(&stream).unwrap();
+    let stepped: Vec<f64> = scale
+        .iter()
+        .zip(&sums)
+        .map(|(s, p)| match p.intensity > 0.0 {
+            true => *s as f64 * (p.ratio as f64 / p.intensity as f64),
+            false => *s as f64,
+        })
+        .collect();
+    let mean = stepped.iter().sum::<f64>() / nframe as f64;
+    for (f, (g, s)) in got.iter().zip(&stepped).enumerate() {
+        let want = s / mean;
+        assert!(
+            (*g as f64 - want).abs() <= 2e-6 * want,
+            "frame {f}: {g} vs {want}"
+        );
+    }
+    let short = up(&stream, &sums[..5]);
+    assert!(k.scale_step(&ctx, &mut dscale, &short).is_err());
 }
 
 /// The object and probe scale factors of `ScaleObjProbe` from given norm pairs, absolute

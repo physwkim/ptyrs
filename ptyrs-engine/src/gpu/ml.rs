@@ -4,8 +4,8 @@
 use cuda_async::device_operation::ExecutionContext;
 use ptyrs_core::{C64, Stack};
 use ptyrs_gpu::{
-    CG_BLOCKS, Ended, Error as GpuError, Exit, FusedBufs, FusedInputs, FusedSums, ObjProbeScale,
-    RecordWriter,
+    CG_BLOCKS, Ended, Error as GpuError, Exit, FarSums, FusedBufs, FusedInputs, FusedSums,
+    GammaCounts, ObjProbeScale, RecordWriter,
 };
 
 use super::device::{MlBufs, PassesMut};
@@ -17,7 +17,9 @@ impl GpuPtycho {
     /// [`crate::Ptycho::ml`]: [`crate::Ptycho::scale_obj_probe`] once, then per cycle the
     /// gradient of the estimate (its LLK taken from the same forward stacks), the
     /// Polak–Ribière direction and the Poisson quadratic step along it; each cycle is one
-    /// graph and nothing reads back until the call's end.
+    /// graph and nothing reads back until the call's end. With stepped features, a pass of
+    /// their own first takes the LLK and the far sums of the estimate under the cycle-start
+    /// model and steps them, and the cycle models the stepped values.
     pub fn ml(&mut self, params: &MlParams, ncycle: usize) -> Result<(), EngineError> {
         self.dev.scale_to_photons(self.total_obs as f32)?;
         for ic in 0..ncycle {
@@ -60,7 +62,7 @@ impl Bufs<'_> {
         ml: &mut MlBufs<'_>,
         params: &MlParams,
         first: bool,
-        llk: Option<RecordWriter<'_>>,
+        mut llk: Option<RecordWriter<'_>>,
     ) -> Result<Option<Ended>, GpuError> {
         let update = [params.update_object, params.update_probe];
         if first {
@@ -68,7 +70,13 @@ impl Bufs<'_> {
                 ptyrs_gpu::zero(ctx, b)?;
             }
         }
-        let ended = self.ml_grad(ctx, passes, ml, update, llk)?;
+        let stepped = match passes {
+            PassesMut::Fused(f) if self.features.stepped() => {
+                self.step_features(ctx, f, llk.take())?
+            }
+            _ => None,
+        };
+        let ended = self.ml_grad(ctx, passes, ml, update, llk)?.or(stepped);
 
         // β from the gradients in the sums and the last ones in h (then h = g), and d.
         let lens = [self.obj_len, self.probe_len];
@@ -103,8 +111,12 @@ impl Bufs<'_> {
             for f in [&mut ml.fields.po, &mut ml.fields.a, &mut ml.fields.b] {
                 plan.forward_inplace(ctx, f)?;
             }
+            let obs = GammaCounts {
+                counts: self.counts,
+                model: self.features.model(),
+            };
             self.grad
-                .gamma_frames(ctx, &dims, stack, self.counts, ml.fields, ml.gamma_parts)?;
+                .gamma_frames(ctx, &dims, stack, obs, ml.fields, ml.gamma_parts)?;
         }
         let npart = ptyrs_gpu::gamma_parts(&dims)?;
         self.grad.sum_parts(ctx, ml.gamma_parts, npart, ml.gamma)?;
@@ -119,8 +131,8 @@ impl Bufs<'_> {
 
     /// The Poisson gradients of the estimate into the update sums' `num` (object, probe, as
     /// `update` asks), stack by stack, with the LLK partials into `llk` if given; by the
-    /// fused passes' [`Exit::Grad`] or by M1's launches, as `passes` holds. Returns the ended
-    /// record.
+    /// fused passes' [`Exit::Grad`] or by M1's launches (which model no features), as
+    /// `passes` holds. Returns the ended record.
     pub(super) fn ml_grad(
         &mut self,
         ctx: &ExecutionContext,
@@ -154,13 +166,17 @@ impl Bufs<'_> {
             counts: self.counts,
             obj: self.obj,
             probe: self.probe,
+            model: self.features.model(),
         };
-        let exit = Exit::Grad {
+        let far = FarSums {
             llk: llk.is_some().then_some(&mut *self.llk),
+            ..FarSums::default()
         };
+        let exit = Exit::Grad { far };
         let sums = FusedSums {
             obj: update[0].then_some(&mut *self.obj_sums),
             probe: update[1].then_some(&mut *self.probe_sums),
+            ..FusedSums::default()
         };
         self.kernels
             .fused_project(ctx, &inputs, stack, exit, f, sums)?;
@@ -209,8 +225,8 @@ impl Bufs<'_> {
 
     /// [`crate::Ptycho::scale_obj_probe`] on the device, `total` being the unmasked observed
     /// photons: the calculated photons over the same unmasked pixels (stack by stack, by the
-    /// LLK kernel on the far field in `ml.fields.po`), then [`Bufs::scale_obj_probe`], all
-    /// without a host sync.
+    /// LLK kernel on the far field in `ml.fields.po`, each frame's times its intensity scale),
+    /// then [`Bufs::scale_obj_probe`], all without a host sync.
     pub(super) fn scale_to_photons(
         &mut self,
         ctx: &ExecutionContext,
@@ -229,7 +245,9 @@ impl Bufs<'_> {
                 .forward_inplace(ctx, psi)?;
             self.kernels
                 .llk(ctx, stack, self.counts, psi, self.llk_scratch, self.llk)?;
-            self.grad.icalc_add(ctx, &dims, stack, self.llk, ml.icalc)?;
+            let scale = self.features.model().scale;
+            self.grad
+                .icalc_add(ctx, &dims, stack, self.llk, scale, ml.icalc)?;
         }
         let icalc = &*ml.icalc;
         self.scale_obj_probe(ctx, ObjProbeScale::Absolute { icalc, total })

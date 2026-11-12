@@ -3,7 +3,9 @@
 
 use ptyrs_core::{C64, Object, Probe, Stack, View};
 
-use crate::{EngineError, Fft2, accumulate_obj, accumulate_probe, obj_probe_to_psi};
+use crate::{
+    EngineError, Propagator, SliceWaves, accumulate_obj, accumulate_probe, obj_probe_to_psi,
+};
 
 /// A linear map `A` from `domain_len()` to `range_len()` complex values with its adjoint
 /// `Aᴴ`, `⟨A x, y⟩ = ⟨x, Aᴴ y⟩` under `⟨a, b⟩ = Σ a·conj(b)`.
@@ -42,15 +44,7 @@ pub const DOT_TOL: f64 = 1e-10;
 /// Admits `op` if it passes the dot test on fixed pseudo-random `x` and `y` with independent
 /// real and imaginary parts, which catches a missing conjugate, transpose or scale.
 pub fn register<A: LinearOp>(op: A) -> Result<Registered<A>, EngineError> {
-    let x = noise(op.domain_len(), 0x5eed_0001);
-    let y = noise(op.range_len(), 0x5eed_0002);
-    let mut ax = vec![C64::default(); y.len()];
-    let mut ahy = vec![C64::default(); x.len()];
-    op.forward(&x, &mut ax);
-    op.adjoint(&y, &mut ahy);
-    let (lhs, rhs) = (dot(&ax, &y), dot(&x, &ahy));
-    let scale = (norm(&ax) * norm(&y)).max(norm(&x) * norm(&ahy));
-    let err = (lhs - rhs).norm() / scale;
+    let (lhs, rhs, err) = dot_test(&op);
     if err <= DOT_TOL {
         Ok(Registered(op))
     } else {
@@ -59,6 +53,25 @@ pub fn register<A: LinearOp>(op: A) -> Result<Registered<A>, EngineError> {
             std::any::type_name::<A>()
         )))
     }
+}
+
+/// `(⟨A x, y⟩, ⟨x, Aᴴ y⟩, relative error)` of [`register`]'s dot test.
+fn dot_test<A: LinearOp>(op: &A) -> (C64, C64, f64) {
+    let x = noise(op.domain_len(), 0x5eed_0001);
+    let y = noise(op.range_len(), 0x5eed_0002);
+    let mut ax = vec![C64::default(); y.len()];
+    let mut ahy = vec![C64::default(); x.len()];
+    op.forward(&x, &mut ax);
+    op.adjoint(&y, &mut ahy);
+    let (lhs, rhs) = (dot(&ax, &y), dot(&x, &ahy));
+    let scale = (norm(&ax) * norm(&y)).max(norm(&x) * norm(&ahy));
+    (lhs, rhs, (lhs - rhs).norm() / scale)
+}
+
+/// The relative error of [`register`]'s dot test on `op`.
+#[cfg(test)]
+pub(crate) fn dot_error<A: LinearOp>(op: &A) -> f64 {
+    dot_test(op).2
 }
 
 fn dot(a: &[C64], b: &[C64]) -> C64 {
@@ -70,7 +83,7 @@ fn norm(a: &[C64]) -> f64 {
 }
 
 /// SplitMix64 values in `[-1, 1)` for both parts.
-fn noise(n: usize, seed: u64) -> Vec<C64> {
+pub(crate) fn noise(n: usize, seed: u64) -> Vec<C64> {
     let mut s = seed;
     let mut next = || {
         s = s.wrapping_add(0x9e37_79b9_7f4a_7c15);
@@ -135,15 +148,15 @@ impl LinearOp for ProbeToPsi<'_> {
     }
 }
 
-/// [`Fft2::forward`] over `nplane` planes; adjoint [`Fft2::inverse`] (unitary).
-pub struct FarField<'a> {
-    pub fft: &'a Fft2,
+/// [`Propagator::forward`] over `nplane` planes; adjoint [`Propagator::adjoint`].
+pub struct Propagation<'a> {
+    pub propagator: &'a Propagator,
     pub nplane: usize,
 }
 
-impl LinearOp for FarField<'_> {
+impl LinearOp for Propagation<'_> {
     fn domain_len(&self) -> usize {
-        let [ny, nx] = self.fft.shape();
+        let [ny, nx] = self.propagator.shape();
         self.nplane * ny * nx
     }
     fn range_len(&self) -> usize {
@@ -151,11 +164,84 @@ impl LinearOp for FarField<'_> {
     }
     fn forward(&self, x: &[C64], y: &mut [C64]) {
         y.copy_from_slice(x);
-        self.fft.forward(y);
+        self.propagator.forward(y);
     }
     fn adjoint(&self, y: &[C64], x: &mut [C64]) {
         x.copy_from_slice(y);
-        self.fft.inverse(x);
+        self.propagator.adjoint(x);
+    }
+}
+
+/// `(dO_0 .. dO_{n−1}, dP) ↦ dpsi`: the change of the exit waves of [`SliceWaves`] at its state,
+/// [`SliceWaves::tangent`], over every slice's object and the probe, laid out in that order;
+/// adjoint [`SliceWaves::obj_adjoint`] of every slice and [`SliceWaves::probe_adjoint`]'s
+/// numerator after [`SliceWaves::back_propagate`].
+pub struct SliceJacobian<'a> {
+    pub waves: &'a SliceWaves<'a>,
+    pub obj_dims: [usize; 3],
+    pub nslice: usize,
+    pub probe_dims: [usize; 3],
+}
+
+impl SliceJacobian<'_> {
+    /// A domain vector as its slices' objects and its probe.
+    pub(crate) fn split(&self, x: &[C64]) -> (Vec<Object>, Probe) {
+        let len = self.obj_dims.iter().product::<usize>();
+        let (o, p) = x.split_at(self.nslice * len);
+        let objects = o
+            .chunks_exact(len)
+            .map(|o| Object::new(Stack::from_vec(self.obj_dims, o.to_vec()).expect("object")))
+            .collect();
+        let probe = Probe::new(Stack::from_vec(self.probe_dims, p.to_vec()).expect("probe"));
+        (objects, probe)
+    }
+}
+
+impl LinearOp for SliceJacobian<'_> {
+    fn domain_len(&self) -> usize {
+        self.nslice * self.obj_dims.iter().product::<usize>()
+            + self.probe_dims.iter().product::<usize>()
+    }
+    fn range_len(&self) -> usize {
+        self.waves.psi().len()
+    }
+    fn forward(&self, x: &[C64], y: &mut [C64]) {
+        let (objects, probe) = self.split(x);
+        y.copy_from_slice(&self.waves.tangent(&objects, &probe));
+    }
+    fn adjoint(&self, y: &[C64], x: &mut [C64]) {
+        let chi = self.waves.back_propagate(y);
+        let len = self.obj_dims.iter().product::<usize>();
+        let (o, p) = x.split_at_mut(self.nslice * len);
+        for (s, o) in o.chunks_exact_mut(len).enumerate() {
+            o.copy_from_slice(self.waves.obj_adjoint(s, &chi[s]).as_slice());
+        }
+        p.copy_from_slice(self.waves.probe_adjoint(&chi[0]).0.as_slice());
+    }
+}
+
+/// [`SliceJacobian`] then the propagator `U` to the detector plane, the change of the
+/// detector-plane field; adjoint `Jᴴ·Uᴴ`, which takes [`crate::BhBatch`]'s gradient back.
+pub(crate) struct FarJacobian<'a> {
+    pub slices: SliceJacobian<'a>,
+    pub propagator: &'a Propagator,
+}
+
+impl LinearOp for FarJacobian<'_> {
+    fn domain_len(&self) -> usize {
+        self.slices.domain_len()
+    }
+    fn range_len(&self) -> usize {
+        self.slices.range_len()
+    }
+    fn forward(&self, x: &[C64], y: &mut [C64]) {
+        self.slices.forward(x, y);
+        self.propagator.forward(y);
+    }
+    fn adjoint(&self, y: &[C64], x: &mut [C64]) {
+        let mut near = y.to_vec();
+        self.propagator.adjoint(&mut near);
+        self.slices.adjoint(&near, x);
     }
 }
 
@@ -205,15 +291,5 @@ mod tests {
             "{missing_conj}"
         );
         assert!(register(op(true, 1.0 + 1e-6)).is_err(), "scale error");
-    }
-
-    #[test]
-    fn far_field_registers() {
-        let fft = Fft2::new([8, 6]);
-        register(FarField {
-            fft: &fft,
-            nplane: 3,
-        })
-        .unwrap();
     }
 }
