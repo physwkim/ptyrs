@@ -192,6 +192,46 @@ fn rpie_llk_matches_ptychi() {
     assert_history_matches(&p, include_str!("data/rpie_ptychi_f64.txt"));
 }
 
+/// [`Ptycho::obj_grad`] and the LLK against the float64 model written independently in
+/// m3/solve's `refs/f64/ml_grad.py <dir>` (checked there by central differences, PyNX
+/// `cpu_operator` and pty-chi autograd) on the scaled start of `llk_trace -- <dir> dm 1 2 32 40
+/// 4`, saved from `<dir>/ml_grad_f64.txt` (`iy ix re im` per object pixel) and
+/// `<dir>/ml_grad_values_f64.txt` (`nb_obs` and the unnormalised Poisson sum).
+#[test]
+fn obj_grad_matches_ml_grad_reference() {
+    let (scan, object, probe) = common::dm_scenario(32, 40, 2, 2e5, 4.0);
+    let mut p = Ptycho::new(&scan, object, probe).unwrap();
+    p.scale_obj_probe();
+    let values: Vec<f64> = include_str!("data/ml_grad_values_f64.txt")
+        .split_whitespace()
+        .map(|v| v.parse().unwrap())
+        .collect();
+    let [nb_obs, sum] = values[..] else {
+        panic!("values: {values:?}")
+    };
+    let llk = p.llk().poisson * nb_obs;
+    assert!(rel(llk, sum) < 1e-12, "LLK sum: rust {llk} reference {sum}");
+
+    let g = p.obj_grad();
+    let [_, ny, nx] = g.dims();
+    let mut rows = 0;
+    let (mut err, mut max) = (0f64, 0f64);
+    for l in include_str!("data/ml_grad_f64.txt").lines() {
+        let v: Vec<f64> = l.split_whitespace().map(|v| v.parse().unwrap()).collect();
+        let want = C64::new(v[2], v[3]);
+        let got = g.as_slice()[v[0] as usize * nx + v[1] as usize];
+        err = err.max((got - want).norm());
+        max = max.max(want.norm());
+        rows += 1;
+    }
+    assert_eq!((g.dims()[0], rows), (1, ny * nx));
+    eprintln!(
+        "obj_grad: max |rust - reference| / max |reference| {:.2e}",
+        err / max
+    );
+    assert!(err < 1e-12 * max, "{err:e} of {max:e}");
+}
+
 #[test]
 fn ap_object_only_converges() {
     let c = case(2, true);
