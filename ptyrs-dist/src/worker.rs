@@ -1,9 +1,9 @@
-//! One OS thread per GPU, each with its device's context, its own stream and its own state.
+//! One OS thread per GPU, each with its device's context, its own streams and its own state.
 //!
-//! Cross-GPU ordering has one owner, [`Gpu::fence`]: work any GPU enqueued before a fence is
-//! complete before work any GPU enqueues after it. Peers only read each other's memory
-//! (invariant 5), so a fence between a producer step and its readers, and another before the
-//! producer overwrites, is all the exchange needs.
+//! Cross-GPU ordering has one owner, [`Gpu::fence`]: work any GPU enqueued before a fence, on
+//! either of its streams, is complete before work any GPU enqueues after it. Peers only read
+//! each other's memory (invariant 5), so a fence between a producer step and its readers, and
+//! another before the producer overwrites, is all the exchange needs.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -15,13 +15,23 @@ use cuda_core::{Context, Event, IntoResult, Stream, sys};
 use crate::DistError;
 use crate::topo::enable_all_pairs;
 
-/// What a job sees: its region, its device and the shared fence.
+/// What a job sees: its region, its device, its main and side streams and the shared fence.
 pub struct Gpu {
     region: usize,
     ctx: Arc<Context>,
     stream: Arc<Stream>,
+    side: Side,
     shared: Arc<Shared>,
     fences: usize,
+}
+
+/// A second stream, reachable only through [`Gpu::side`], which forks it from the main stream
+/// first: side work is ordered after everything enqueued on the main stream before it, the
+/// fences' waits included, and overlaps what the main stream runs next until [`Gpu::join`].
+struct Side {
+    stream: Arc<Stream>,
+    fork: Event,
+    join: Event,
 }
 
 impl Gpu {
@@ -41,20 +51,44 @@ impl Gpu {
         &self.ctx
     }
 
+    /// The main stream.
     pub fn stream(&self) -> &Arc<Stream> {
         &self.stream
     }
 
-    /// Orders every GPU's prior stream work before every GPU's later stream work, without a
-    /// host sync: record this GPU's event, meet the other workers on the host so every record
-    /// is enqueued, then make this stream wait on every peer's event. All workers of a run
-    /// must call it the same number of times.
+    /// Runs `f` on the side stream, forked from the main stream first. The side stream has the
+    /// device's highest priority, so its kernels take free SMs ahead of the main stream's.
+    pub fn side<R>(&self, f: impl FnOnce(&Stream) -> Result<R, DistError>) -> Result<R, DistError> {
+        let s = &self.side;
+        s.fork.record(&self.stream)?;
+        s.stream.wait(&s.fork)?;
+        f(&s.stream)
+    }
+
+    /// Makes the main stream wait for everything enqueued on the side stream so far.
+    pub fn join(&self) -> Result<(), DistError> {
+        let s = &self.side;
+        s.join.record(&s.stream)?;
+        Ok(self.stream.wait(&s.join)?)
+    }
+
+    /// Blocks until both streams are idle.
+    pub fn synchronize(&self) -> Result<(), DistError> {
+        self.join()?;
+        Ok(self.stream.synchronize()?)
+    }
+
+    /// Orders every GPU's prior work, on both streams, before every GPU's later work, without
+    /// a host sync: join the side stream, record this GPU's event, meet the other workers on
+    /// the host so every record is enqueued, then make the main stream wait on every peer's
+    /// event. All workers of a run must call it the same number of times.
     pub fn fence(&mut self) -> Result<(), DistError> {
         let events = self.shared.events.get().ok_or(DistError::Aborted)?;
         // Alternate two events: a peer can only re-record parity p after the next fence's
         // rendezvous, which this worker reaches only after enqueuing its waits on parity p.
         let p = self.fences % 2;
         self.fences += 1;
+        self.join()?;
         events[self.region][p].record(&self.stream)?;
         self.shared.rendezvous.wait()?;
         for (r, e) in events.iter().enumerate() {
@@ -303,7 +337,7 @@ impl<S: Send + 'static> Drop for Workers<S> {
     /// Peers may still be reading any worker's buffers, so every stream drains before any
     /// thread drops its state.
     fn drop(&mut self) {
-        let _ = self.run(|gpu, _| Ok(gpu.stream.synchronize()?));
+        let _ = self.run(|gpu, _| gpu.synchronize());
         self.senders.clear();
         for h in self.handles.drain(..) {
             let _ = h.join();
@@ -330,10 +364,16 @@ fn worker<S, I>(
             ctx.new_event_with_flags(None)?,
             ctx.new_event_with_flags(None)?,
         ];
+        let side = Side {
+            stream: ctx.new_stream_with_priority(ctx.stream_priority_range()?.greatest())?,
+            fork: ctx.new_event_with_flags(None)?,
+            join: ctx.new_event_with_flags(None)?,
+        };
         let gpu = Gpu {
             region,
             ctx: ctx.clone(),
             stream,
+            side,
             shared,
             fences: 0,
         };
@@ -364,7 +404,7 @@ fn worker<S, I>(
     for job in jobs {
         job(&mut gpu, &mut state);
     }
-    let _ = gpu.stream.synchronize();
+    let _ = gpu.synchronize();
     drop(state);
 }
 
@@ -426,6 +466,60 @@ pub(crate) mod tests {
                         unsafe { sys::cuMemcpyDtoDAsync_v2(dst, p, LEN * 4, s).result()? };
                     }
                     // Nobody overwrites `own` until every peer's copy is done.
+                    g.fence()?;
+                    let seen = b.seen.to_host_vec(g.stream())?;
+                    Ok((0..4).all(|r| {
+                        seen[r * LEN..(r + 1) * LEN]
+                            .iter()
+                            .all(|&v| v == round * 16 + r as u32)
+                    }))
+                })
+                .unwrap();
+            assert_eq!(got, [true; 4], "round {round}");
+        }
+    }
+
+    /// The fence covers the side stream: each round every GPU overwrites its buffer eight times
+    /// on the side stream, the right value last, fences, copies every peer's buffer on the side
+    /// stream, fences, then reads the copies on the main stream.
+    #[test]
+    fn fence_orders_side_stream_work() {
+        let w = Workers::spawn(&gpus(4), |g| {
+            Ok(Bufs {
+                own: DeviceBuffer::zeroed(g.stream(), LEN)?,
+                seen: DeviceBuffer::zeroed(g.stream(), 4 * LEN)?,
+            })
+        })
+        .unwrap();
+        let ptrs: Arc<Vec<u64>> = Arc::new(w.run(|_, b| Ok(b.own.cu_deviceptr())).unwrap());
+        for round in 1..=4u32 {
+            let ptrs = ptrs.clone();
+            let got = w
+                .run(move |g, b| {
+                    let value = round * 16 + g.region() as u32;
+                    let own = b.own.cu_deviceptr();
+                    g.side(|s| {
+                        for i in (0..8u32).rev() {
+                            // SAFETY: `own` holds LEN u32 on this device.
+                            unsafe {
+                                sys::cuMemsetD32Async(own, value | i << 8, LEN, s.cu_stream())
+                                    .result()?
+                            };
+                        }
+                        Ok(())
+                    })?;
+                    g.fence()?;
+                    g.side(|s| {
+                        for (r, &p) in ptrs.iter().enumerate() {
+                            let dst = b.seen.cu_deviceptr() + (r * LEN * 4) as u64;
+                            // SAFETY: peer access is enabled; both ranges hold LEN u32.
+                            unsafe {
+                                sys::cuMemcpyDtoDAsync_v2(dst, p, LEN * 4, s.cu_stream())
+                                    .result()?
+                            };
+                        }
+                        Ok(())
+                    })?;
                     g.fence()?;
                     let seen = b.seen.to_host_vec(g.stream())?;
                     Ok((0..4).all(|r| {

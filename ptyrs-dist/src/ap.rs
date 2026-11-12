@@ -3,20 +3,22 @@
 //! The scan is cut once into [`NLEAF`] leaf regions and a run on `g` GPUs merges them
 //! ([`Partition::merge`]), so every order fixed per leaf is the same on 1, 2 and 4 GPUs:
 //! a region computes the exit waves of its own leaves' frames and recomputes those of the other
-//! leaves' frames that touch its tiles, in stacks of `stack` frames per leaf; each object pixel
-//! adds its views in (leaf, frame) order; the probe sums are one per leaf, added through a
-//! fixed pair tree; the regulariser's `max(den)` is an exact max over regions; the LLK is
-//! [`LlkSums::from_partials`] over frames by global index. A recomputed exit wave has its
-//! owner's bits: the halo holds the owner's object under the whole footprint, the probe and
-//! counts are the same, and [`Kernels::fused_project`] transforms each frame in its own blocks,
-//! whatever else its stack holds.
+//! leaves' frames that touch its tiles, in stacks of `stack` frames per class and leaf, the
+//! interior frames (reading only their own leaf's tiles, so no halo on any GPU count) before
+//! the border frames; each object pixel adds its views in (class, leaf, frame) order; the probe
+//! sums are one per leaf, added through a fixed pair tree; the regulariser's `max(den)` is an
+//! exact max over regions; the LLK is [`LlkSums::from_partials`] over frames by global index.
+//! A recomputed exit wave has its owner's bits: the halo holds the owner's object under the
+//! whole footprint, the probe and counts are the same, and [`Kernels::fused_project`]
+//! transforms each frame in its own blocks, whatever else its stack holds.
 //!
 //! Per cycle, with [`Gpu::fence`] between the steps: A per stack one fused pass (exit waves,
-//! LLK, projection, an own stack's leaf probe sums, object sums), then the probe subtree; B
-//! the object sums' max, the other regions' subtree roots pulled by copy engine and the pair
-//! tree above them; C the other regions' max words pulled by copy engine, object and probe
-//! updates, then each owner packs the updated rows its neighbours read; D each receiver pulls
-//! them by copy engine and unpacks its halo.
+//! LLK, projection, an own stack's leaf probe sums, object sums), the border stacks only once
+//! the halo has landed, then the probe subtree; B the object sums' max, the other regions'
+//! subtree roots pulled by copy engine and the pair tree above them; C the other regions' max
+//! words pulled by copy engine, object and probe updates, then each owner packs the updated
+//! rows its neighbours read; D each receiver pulls them by copy engine and unpacks its halo on
+//! its side stream, under the next cycle's interior stacks.
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -73,9 +75,11 @@ struct Stack {
 struct RegionPlan {
     dims: ViewDims,
     views: Vec<ViewAddr>,
-    /// Global frame of each local frame, in (leaf, frame) order.
+    /// Global frame of each local frame, in (class, leaf, frame) order.
     global: Vec<u32>,
     stacks: Vec<Stack>,
+    /// Leading stacks of interior frames, which read no halo.
+    interior: usize,
     /// Stacks of the own leaves, ascending; the others' frames are recomputed.
     own: Vec<usize>,
     /// Halo tiles some local view reads.
@@ -157,6 +161,14 @@ impl Plan {
             .collect();
         let leaf_frames: Vec<Vec<u32>> =
             leaves.regions().iter().map(|g| g.frames.clone()).collect();
+        let leaf_of = leaves.owner();
+        let mut interior = vec![false; addr.nframe()];
+        for (l, frames) in leaf_frames.iter().enumerate() {
+            for &f in frames {
+                let f = f as usize;
+                interior[f] = tiles[f].iter().all(|&t| leaf_of[t] as usize == l);
+            }
+        }
         let owner = run.owner();
         let mut regions = Vec::with_capacity(ngpu);
         for (r, region) in run.regions().iter().enumerate() {
@@ -166,29 +178,34 @@ impl Plan {
             let mut global = Vec::new();
             let mut stacks = Vec::new();
             let mut own = Vec::new();
-            for (l, all) in leaf_frames.iter().enumerate() {
-                let mine = l / k == r;
-                let frames: Vec<u32> = if mine {
-                    all.clone()
-                } else {
-                    all.iter()
+            let mut ninterior = 0;
+            // Interior frames first; another leaf's interior frames read none of this region's
+            // tiles.
+            for class in [true, false] {
+                for (l, all) in leaf_frames.iter().enumerate() {
+                    let mine = l / k == r;
+                    let frames: Vec<u32> = all
+                        .iter()
                         .copied()
-                        .filter(|&f| tiles[f as usize].iter().any(|&t| owner[t] as usize == r))
-                        .collect()
-                };
-                if frames.is_empty() {
-                    continue;
-                }
-                for chunk in frames.chunks(cfg.stack) {
-                    let start = u(global.len())?;
-                    global.extend_from_slice(chunk);
-                    if mine {
-                        own.push(stacks.len());
+                        .filter(|&f| interior[f as usize] == class)
+                        .filter(|&f| {
+                            mine || tiles[f as usize].iter().any(|&t| owner[t] as usize == r)
+                        })
+                        .collect();
+                    for chunk in frames.chunks(cfg.stack) {
+                        let start = u(global.len())?;
+                        global.extend_from_slice(chunk);
+                        if mine {
+                            own.push(stacks.len());
+                        }
+                        stacks.push(Stack {
+                            leaf: l,
+                            frames: start..u(global.len())?,
+                        });
                     }
-                    stacks.push(Stack {
-                        leaf: l,
-                        frames: start..u(global.len())?,
-                    });
+                }
+                if class {
+                    ninterior = stacks.len();
                 }
             }
             if global.is_empty() {
@@ -223,6 +240,7 @@ impl Plan {
                     .collect(),
                 global,
                 stacks,
+                interior: ninterior,
                 own,
             });
         }
@@ -707,7 +725,8 @@ impl State {
         let links = links.as_ref().expect("DistAp::new installs the links");
         let np = plan.np() as u32;
 
-        // A: per stack the fused pass, which adds an own stack's probe sums too.
+        // A: per stack the fused pass, which adds an own stack's probe sums too; the border
+        // stacks read the halo, so they wait for the side stream's unpack.
         for s in leaf_sums.iter_mut() {
             ptyrs_gpu::zero(&ctx, &mut s.num)?;
             ptyrs_gpu::zero(&ctx, &mut s.den)?;
@@ -719,6 +738,9 @@ impl State {
             probe,
         };
         for (s, st) in rp.stacks.iter().enumerate() {
+            if s == rp.interior {
+                gpu.join()?;
+            }
             let mine = rp.own.binary_search(&s).ok();
             let at = table.at(s);
             let llk = match (due, mine) {
@@ -777,12 +799,13 @@ impl State {
         // `normalize_obj` left in the halo tiles it read.
         if obj_sums.is_some() {
             // SAFETY: each pull reads the part of an owner's send buffer packed for this
-            // region before the fence, repacked only after the next cycle's second fence; the
-            // receive buffer and the object are this region's and touched by this stream only.
-            unsafe {
-                exchange::pull(&stream, &links.halo)?;
-                ex.copy_runs(&stream, &halo.unpack)?;
-            }
+            // region before the fence; the next cycle joins it before its first fence, after
+            // which the owner repacks. The receive buffer and the halo rows of the object are
+            // touched by nothing else until that join: the interior stacks read own tiles only.
+            gpu.side(|s| unsafe {
+                exchange::pull(s, &links.halo)?;
+                ex.copy_runs(s, &halo.unpack)
+            })?;
         }
         drop(ctx);
 
@@ -808,6 +831,8 @@ impl State {
 pub struct RegionLoad {
     /// Frames of its own leaves: exit waves, LLK and probe sums.
     pub computed: usize,
+    /// Of those, the interior frames, computed while the halo is in flight.
+    pub interior: usize,
     /// Other regions' frames touching its tiles, whose exit waves it recomputes for its object
     /// sums.
     pub recomputed: usize,
@@ -875,6 +900,10 @@ impl DistAp {
                 let computed = rp.own.iter().map(|&s| rp.stacks[s].frames.len()).sum();
                 RegionLoad {
                     computed,
+                    interior: rp.stacks[..rp.interior]
+                        .iter()
+                        .map(|s| s.frames.len())
+                        .sum(),
                     recomputed: rp.global.len() - computed,
                     halo_tiles: rp.halo_read.len(),
                 }
@@ -895,7 +924,7 @@ impl DistAp {
                     out.push(p);
                 }
             }
-            gpu.stream().synchronize()?;
+            gpu.synchronize()?;
             Ok(out)
         })?;
         let nframe = self.plan.run.nframe();
