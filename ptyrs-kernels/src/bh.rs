@@ -362,8 +362,11 @@ pub(crate) unsafe fn store_sums<const K: usize>(s: *mut f32, acc: [f32; K], out:
     let t = thread::threadIdx_x() as usize;
     let seg = PIXEL_THREADS as usize;
     unsafe {
-        for (j, &a) in acc.iter().enumerate() {
-            *s.add(j * seg + t) = a;
+        // Unrolled, so `acc` stays in registers rather than local memory.
+        #[unroll]
+        for j in 0..K as u32 {
+            let j = j as usize;
+            *s.add(j * seg + t) = acc[j];
         }
         crate::block_sum::<K>(s);
         if t == 0 {

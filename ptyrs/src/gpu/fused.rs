@@ -559,7 +559,7 @@ impl Kernels {
         sums: FusedSums<'_>,
     ) -> Result<(), Error> {
         let bufs = &*bufs;
-        let run = Run::new(self, ctx, *inputs, stack, bufs)?;
+        let (run, shift) = Run::new(self, ctx, *inputs, stack, bufs)?;
         let d = inputs.views.dims();
         // `pass`: what the column pass does to the far field.
         let (psi, far, dm, alpha, pass) = match exit {
@@ -589,7 +589,7 @@ impl Kernels {
             sums.check(d.nprobe as usize * d.n())?;
         }
         let shift_out = shift_probe.is_some() || position.is_some() || position_den.is_some();
-        match &run.shift {
+        match &shift {
             Some(_) if probe_sums.is_some() => {
                 return Err(Error::Shape(
                     "a shifted probe's sums go to FusedSums::shift".into(),
@@ -613,7 +613,7 @@ impl Kernels {
         };
         let dm_flag = if dm { FUSED_DM } else { 0 };
         let flag = |on: bool, flag: u32| if on { flag } else { 0 };
-        let shift_flags = match run.shift {
+        let shift_flags = match shift {
             Some(_) => {
                 flag(obj_sums.is_some(), FUSED_SHIFT_OBJ)
                     | flag(shift_probe.is_some(), FUSED_SHIFT_PROBE)
@@ -628,11 +628,12 @@ impl Kernels {
             flags: dm_flag,
             alpha,
         };
-        match &run.shift {
+        match &shift {
             Some(sh) => {
                 let slopes = FUSED_SHIFT_DEN | FUSED_SHIFT_POSITION;
-                run.shift_pre(sh, p, shift_flags & slopes)?;
-                run.shift_rows_fwd(sh, bufs, psi, p, cfg)?;
+                let t_dy = (shift_flags & slopes != 0).then_some(&sh.scratch.t_dy);
+                run.shift_pre(&sh.model, &sh.scratch.t, t_dy, p)?;
+                run.shift_rows_fwd(&sh.scratch.t, &bufs.work, psi, p, cfg)?;
             }
             None => {
                 if obj_sums.is_some() {
@@ -653,7 +654,7 @@ impl Kernels {
             alpha,
         };
         let waves = psi.unwrap_or(&bufs.work);
-        match &run.shift {
+        match &shift {
             Some(sh) => {
                 run.shift_rows_inv(sh, bufs, psi, p, cfg)?;
                 if shift_probe.is_some() {
@@ -702,8 +703,8 @@ impl Kernels {
         sums: PsiSums<'_>,
     ) -> Result<(), Error> {
         let bufs = &*bufs;
-        let run = Run::new(self, ctx, *inputs, stack, bufs)?;
-        let Some(sh) = &run.shift else {
+        let (run, shift) = Run::new(self, ctx, *inputs, stack, bufs)?;
+        let Some(sh) = &shift else {
             return Err(Error::Shape("shifted_psi_sums needs a Model::shift".into()));
         };
         let d = inputs.views.dims();
@@ -724,7 +725,7 @@ impl Kernels {
             flags: flag(obj.is_some(), FUSED_SHIFT_OBJ) | flag(probe.is_some(), FUSED_SHIFT_PROBE),
             alpha: 0.0,
         };
-        run.shift_pre(sh, p, 0)?;
+        run.shift_pre(&sh.model, &sh.scratch.t, None, p)?;
         run.shift_sums(sh, psi, p, cfg)?;
         if let Some(sums) = probe {
             run.shift_post(sh, p)?;
@@ -734,6 +735,37 @@ impl Kernels {
             run.gather_shifted(sh, p, cfg, sums)?;
         }
         Ok(())
+    }
+
+    /// The stack's row-FFT'd exit waves `O W` into `work`, `[nf_max * nmode, ny, nx]`, the
+    /// fused forward row pass with the shifted probe `W` of the [`Model::shift`] of `inputs`,
+    /// as [`Self::fused_llk`] leaves them for its column pass; and `T` into `t`, `[nf_max *
+    /// nprobe, ny, nx]`: `W_p` of frame `fl` is the unnormalized row IDFT of plane `fl *
+    /// nprobe + p`, in the exit waves' layout. The model's scale and background are not read.
+    /// Two launches.
+    pub fn shifted_rows_fwd(
+        &self,
+        ctx: &ExecutionContext,
+        inputs: &FusedInputs<'_>,
+        stack: StackRef<'_>,
+        t: &mut DeviceBuffer<C32>,
+        work: &mut DeviceBuffer<C32>,
+    ) -> Result<(), Error> {
+        let run = Run::checked(self, ctx, *inputs, stack)?;
+        let Some(model) = inputs.model.shift else {
+            return Err(Error::Shape("shifted_rows_fwd needs a Model::shift".into()));
+        };
+        let d = inputs.views.dims();
+        let (n, nf) = (d.n(), run.g.nf_max as usize);
+        check_len("t", t, nf * d.nprobe as usize * n)?;
+        check_len("work", work, nf * d.nmode as usize * n)?;
+        let p = FusedPtrs {
+            shift: dptr(t),
+            work: dptr(work),
+            ..run.input_ptrs()
+        };
+        run.shift_pre(&model, t, None, p)?;
+        run.shift_rows_fwd(t, work, None, p, FusedCfg::default())
     }
 
     /// The stack's far sums of the far field of `PO`, the one `obj_probe_to_psi` and the FFT
@@ -748,13 +780,13 @@ impl Kernels {
         far: FarSums<'_>,
     ) -> Result<(), Error> {
         let bufs = &*bufs;
-        let run = Run::new(self, ctx, *inputs, stack, bufs)?;
+        let (run, shift) = Run::new(self, ctx, *inputs, stack, bufs)?;
         run.check_far(&far)?;
         let p = run.ptrs(bufs, &far);
-        match &run.shift {
+        match &shift {
             Some(sh) => {
-                run.shift_pre(sh, p, 0)?;
-                run.shift_rows_fwd(sh, bufs, None, p, FusedCfg::default())?;
+                run.shift_pre(&sh.model, &sh.scratch.t, None, p)?;
+                run.shift_rows_fwd(&sh.scratch.t, &bufs.work, None, p, FusedCfg::default())?;
             }
             None => run.rows_fwd(bufs, None, p, FusedCfg::default())?,
         }
@@ -956,7 +988,8 @@ struct Shifted<'a> {
     scratch: &'a ShiftScratch,
 }
 
-/// One fused call, checked: what every pass launch of it needs.
+/// One fused call's inputs and stack, checked (a [`Model::shift`]'s offsets and spectrum
+/// too): what every pass launch of it needs but the scratch.
 struct Run<'a> {
     k: &'a Kernels,
     ctx: &'a ExecutionContext,
@@ -964,16 +997,14 @@ struct Run<'a> {
     stack: StackRef<'a>,
     g: StackGeom,
     sh: Shape,
-    shift: Option<Shifted<'a>>,
 }
 
 impl<'a> Run<'a> {
-    fn new(
+    fn checked(
         k: &'a Kernels,
         ctx: &'a ExecutionContext,
         inputs: FusedInputs<'a>,
         stack: StackRef<'a>,
-        bufs: &'a FusedBufs,
     ) -> Result<Self, Error> {
         let d = inputs.views.dims();
         let g = d.geom(stack)?;
@@ -988,22 +1019,11 @@ impl<'a> Run<'a> {
         if let Some(background) = inputs.model.background {
             check_len("background", background, n)?;
         }
-        bufs.check(d, &g)?;
-        let shift = match inputs.model.shift {
-            None => None,
-            Some(model) => {
-                check_len("offsets", model.offsets, 2 * d.nframe as usize)?;
-                model.spectrum.check(d, inputs.probe)?;
-                let Some(scratch) = &bufs.shift else {
-                    return Err(Error::Shape(
-                        "a Model::shift needs FusedBufs::with_shift".into(),
-                    ));
-                };
-                scratch.check(d, &g, &sh)?;
-                sh.shift_cols(d.nprobe, g.nf_max)?;
-                Some(Shifted { model, scratch })
-            }
-        };
+        if let Some(model) = inputs.model.shift {
+            check_len("offsets", model.offsets, 2 * d.nframe as usize)?;
+            model.spectrum.check(d, inputs.probe)?;
+            sh.shift_cols(d.nprobe, g.nf_max)?;
+        }
         Ok(Self {
             k,
             ctx,
@@ -1011,40 +1031,82 @@ impl<'a> Run<'a> {
             stack,
             g,
             sh,
-            shift,
         })
     }
 
-    /// Every address but `psi`, which is null.
-    fn ptrs(&self, bufs: &FusedBufs, far: &FarSums<'_>) -> FusedPtrs {
+    /// [`Self::checked`] with `bufs` checked, and the shift model with its scratch.
+    fn new(
+        k: &'a Kernels,
+        ctx: &'a ExecutionContext,
+        inputs: FusedInputs<'a>,
+        stack: StackRef<'a>,
+        bufs: &'a FusedBufs,
+    ) -> Result<(Self, Option<Shifted<'a>>), Error> {
+        let run = Self::checked(k, ctx, inputs, stack)?;
+        let d = inputs.views.dims();
+        bufs.check(d, &run.g)?;
+        let Some(model) = inputs.model.shift else {
+            return Ok((run, None));
+        };
+        let Some(scratch) = &bufs.shift else {
+            return Err(Error::Shape(
+                "a Model::shift needs FusedBufs::with_shift".into(),
+            ));
+        };
+        scratch.check(d, &run.g, &run.sh)?;
+        Ok((run, Some(Shifted { model, scratch })))
+    }
+
+    /// The inputs' addresses; every other is null.
+    fn input_ptrs(&self) -> FusedPtrs {
         let input = |b: Option<&DeviceBuffer<f32>>| {
             b.map_or(std::ptr::null(), |b| dptr::<f32, f32>(b).cast_const())
         };
         let model = self.inputs.model.shift;
+        let null = std::ptr::null_mut();
+        FusedPtrs {
+            obj: dptr(self.inputs.obj),
+            probe: dptr(self.inputs.probe),
+            views: dptr(self.inputs.views.addr()),
+            counts: dptr(self.inputs.counts),
+            psi: null,
+            work: null,
+            probe_q: null,
+            probe_power: null,
+            groups: std::ptr::null_mut(),
+            scale: input(self.inputs.model.scale),
+            scale_groups: std::ptr::null_mut(),
+            background: input(self.inputs.model.background),
+            background_ratio: null,
+            offsets: input(model.map(|m| m.offsets)),
+            spectrum: model.map_or(std::ptr::null(), |m| {
+                dptr::<C32, f32>(m.spectrum.a).cast_const()
+            }),
+            shift: null,
+            shift_dy: null,
+            shift_adj: null,
+            shift_obj: null,
+            shift_power: null,
+            shift_grad: std::ptr::null_mut(),
+            shift_den: std::ptr::null_mut(),
+        }
+    }
+
+    /// Every address but `psi`, which is null.
+    fn ptrs(&self, bufs: &FusedBufs, far: &FarSums<'_>) -> FusedPtrs {
         let scratch =
             |f: fn(&ShiftScratch) -> *mut f32| bufs.shift.as_ref().map_or(std::ptr::null_mut(), f);
         let groups = |f: fn(&ShiftScratch) -> *mut PositionPartial| {
             bufs.shift.as_ref().map_or(std::ptr::null_mut(), f)
         };
         FusedPtrs {
-            obj: dptr(self.inputs.obj),
-            probe: dptr(self.inputs.probe),
-            views: dptr(self.inputs.views.addr()),
-            counts: dptr(self.inputs.counts),
-            psi: std::ptr::null_mut(),
             work: dptr(&bufs.work),
             probe_q: dptr(&bufs.probe_q),
             probe_power: dptr(&bufs.probe_power),
             groups: dptr(&bufs.groups),
-            scale: input(self.inputs.model.scale),
             scale_groups: dptr(&bufs.scale_groups),
-            background: input(self.inputs.model.background),
             background_ratio: (far.background.as_deref())
                 .map_or(std::ptr::null_mut(), |b| dptr(&b.ratio)),
-            offsets: input(model.map(|m| m.offsets)),
-            spectrum: model.map_or(std::ptr::null(), |m| {
-                dptr::<C32, f32>(m.spectrum.a).cast_const()
-            }),
             shift: scratch(|b| dptr(&b.t)),
             shift_dy: scratch(|b| dptr(&b.t_dy)),
             shift_adj: scratch(|b| dptr(&b.adj)),
@@ -1052,6 +1114,7 @@ impl<'a> Run<'a> {
             shift_power: scratch(|b| dptr(&b.power)),
             shift_grad: groups(|b| dptr(&b.grad_groups)),
             shift_den: groups(|b| dptr(&b.den_groups)),
+            ..self.input_ptrs()
         }
     }
 
@@ -1327,23 +1390,31 @@ impl<'a> Run<'a> {
         })
     }
 
-    /// `T`, and `T_y` under `FUSED_SHIFT_DEN` or `FUSED_SHIFT_POSITION` in `flags`, of the
-    /// stack's frames.
-    fn shift_pre(&self, sh: &Shifted<'_>, p: FusedPtrs, flags: u32) -> Result<(), Error> {
+    /// `T` of the stack's frames into `t`, at `p.shift`, and with `t_dy` `T_y` into it, at
+    /// `p.shift_dy`.
+    fn shift_pre(
+        &self,
+        model: &Shift<'_>,
+        t: &DeviceBuffer<C32>,
+        t_dy: Option<&DeviceBuffer<C32>>,
+        p: FusedPtrs,
+    ) -> Result<(), Error> {
         let config = self.sh.shift_cols(self.g.nprobe, self.g.nf_max)?;
         let reads = [
-            sh.model.offsets.storage(),
-            sh.model.spectrum.a.storage(),
+            model.offsets.storage(),
+            model.spectrum.a.storage(),
             self.stack.storage(),
         ];
-        let mut writes = vec![sh.scratch.t.storage()];
-        if flags & (FUSED_SHIFT_DEN | FUSED_SHIFT_POSITION) != 0 {
-            writes.push(sh.scratch.t_dy.storage());
-        }
+        let mut writes = vec![t.storage()];
+        writes.extend(t_dy.map(|b| b.storage()));
+        let flags = match t_dy {
+            Some(_) => FUSED_SHIFT_DEN | FUSED_SHIFT_POSITION,
+            None => 0,
+        };
         let (ctl, g, cfg) = (self.ctl(), self.g, FusedCfg { flags, alpha: 0.0 });
         self.k.launch(self.ctx, &reads, &writes, |stream| {
-            // SAFETY: `Run::new` checked the shift model and scratch against `g`; the launch
-            // is the one `shift_pre` documents.
+            // SAFETY: `Run::checked` checked the shift model against `g` and the callers `t`
+            // and `t_dy`; the launch is the one `shift_pre` documents.
             unsafe {
                 match self.sh.ny {
                     Side::N64 => self
@@ -1367,11 +1438,12 @@ impl<'a> Run<'a> {
         })
     }
 
-    /// Pass A with the shifted probe into `bufs.work`; reads `psi` under `FUSED_DM`.
+    /// Pass A with the shifted probe from `t` into `work`, at `p.shift` and `p.work`; reads
+    /// `psi` under `FUSED_DM`.
     fn shift_rows_fwd(
         &self,
-        sh: &Shifted<'_>,
-        bufs: &FusedBufs,
+        t: &DeviceBuffer<C32>,
+        work: &DeviceBuffer<C32>,
         psi: Option<&DeviceBuffer<C32>>,
         p: FusedPtrs,
         cfg: FusedCfg,
@@ -1381,16 +1453,17 @@ impl<'a> Run<'a> {
             self.inputs.obj.storage(),
             self.inputs.views.addr().storage(),
             self.stack.storage(),
-            sh.scratch.t.storage(),
+            t.storage(),
         ];
         if cfg.flags & FUSED_DM != 0 {
             reads.extend(psi.map(|b| b.storage()));
         }
         let (ctl, g) = (self.ctl(), self.g);
         self.k
-            .launch(self.ctx, &reads, &[bufs.work.storage()], |stream| {
-                // SAFETY: as in `rows_fwd`, and `shift_pre` wrote `T` of this stack; the
-                // launch is the one `shift_rows_fwd` documents.
+            .launch(self.ctx, &reads, &[work.storage()], |stream| {
+                // SAFETY: as in `rows_fwd`, with the callers checking `t` and `work`, and
+                // `shift_pre` wrote `T` of this stack into `t`; the launch is the one
+                // `shift_rows_fwd` documents.
                 unsafe {
                     match self.sh.nx {
                         Side::N64 => self
