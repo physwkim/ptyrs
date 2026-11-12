@@ -1,14 +1,14 @@
 //! `ptyrs_tile::TileDots` against the SIMT `ptyrs_gpu::GradKernels` dot products, bit for
-//! bit, at the ML timing case's sizes: an object of 636x632 values, two grid strides with
-//! the last block partial, and a probe of 2x256x256, which leaves half the blocks without an
-//! element.
+//! bit, and its BH `dots` against f64 sums on the host, at the ML timing case's sizes: an
+//! object of 636x632 values, two grid strides with the last block partial, and a probe of
+//! 2x256x256, which leaves half the blocks without an element.
 
 use std::sync::Arc;
 
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, DeviceCopy};
 use cutile::tile_kernel::jit_compile_count;
-use ptyrs_gpu::{C32, CG_BLOCKS, GradKernels, Kernels, ViewDims, gamma_parts};
+use ptyrs_gpu::{BhDisp, C32, CG_BLOCKS, GradKernels, Kernels, ViewDims, gamma_parts};
 use ptyrs_tile::TileDots;
 
 /// Deterministic values in `[-scale, scale)`.
@@ -148,6 +148,65 @@ fn cg_dots_match_simt_bitwise() {
         .unwrap();
     let [want, got] = pair.map(|b| down(s, &b));
     assert_bits("sum_parts of CG_BLOCKS", &got, &want);
+    assert_eq!(jit_compile_count(), jit, "a launch compiled");
+}
+
+/// `dots` with and without `v`, the probe's `u` scaled, block by block against f64 sums of
+/// the elements block `b` takes, `256 b + t + k 256 CG_BLOCKS`. A partial may differ from
+/// its f64 sum by `depth u sum |terms|`, `depth` bounding the f32 roundings a term passes
+/// through: two fmas per stride in its lane, 255 in a sum of 256 lanes in any order, and
+/// the scale. A block without an element, or the second sum without `v`, must be 0.
+#[test]
+fn bh_dots_match_f64_host_sums() {
+    let g = gpu();
+    let s = &g.stream;
+    let [u, v] = [30u64, 31].map(|seed| g.lens.map(|n| noise(n as usize, seed, 1.0)));
+    let [ud, vd] = [&u, &v].map(|x| [up(s, &x[0]), up(s, &x[1])]);
+    let scale = [1.0, 0.37f32];
+    let stride = 256 * CG_BLOCKS as usize;
+    let jit = jit_compile_count();
+    for cg in [false, true] {
+        let d = BhDisp {
+            u: [&ud[0], &ud[1]],
+            u_scale: scale[1],
+            v: cg.then(|| [&vd[0], &vd[1]]),
+        };
+        let mut parts = up(s, &vec![f32::NAN; 4 * CG_BLOCKS as usize]);
+        g.tile.dots(&g.ex, &d, &mut parts).unwrap();
+        let got = down(s, &parts);
+        for (i, n) in g.lens.map(|n| n as usize).into_iter().enumerate() {
+            let depth = 2 * n.div_ceil(stride) + 255 + 1;
+            let tol = |abs: f64| depth as f64 * f64::from(f32::EPSILON) / 2.0 * abs;
+            for b in 0..CG_BLOCKS as usize {
+                let (mut uu, mut uv, mut uv_abs) = (0.0f64, 0.0f64, 0.0f64);
+                for e in (256 * b..n)
+                    .step_by(stride)
+                    .flat_map(|e0| e0..(e0 + 256).min(n))
+                {
+                    let (x, y) = (u[i][e], v[i][e]);
+                    let [x0, x1, y0, y1] = [x.re, x.im, y.re, y.im].map(f64::from);
+                    uu += x0 * x0 + x1 * x1;
+                    uv += x0 * y0 + x1 * y1;
+                    uv_abs += (x0 * y0).abs() + (x1 * y1).abs();
+                }
+                let uu = f64::from(scale[i]) * uu;
+                let at = 2 * (i * CG_BLOCKS as usize + b);
+                let [pu, pv] = [got[at], got[at + 1]].map(f64::from);
+                assert!(
+                    (pu - uu).abs() <= tol(uu),
+                    "cg {cg}, array {i}, block {b}: <u, Pu> {pu}, f64 {uu}"
+                );
+                if cg {
+                    assert!(
+                        (pv - uv).abs() <= tol(uv_abs),
+                        "array {i}, block {b}: <u, v> {pv}, f64 {uv}"
+                    );
+                } else {
+                    assert_eq!(pv, 0.0, "array {i}, block {b}: <u, v> without v");
+                }
+            }
+        }
+    }
     assert_eq!(jit_compile_count(), jit, "a launch compiled");
 }
 
