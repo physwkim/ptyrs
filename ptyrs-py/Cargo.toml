@@ -13,3 +13,6 @@ ptyrs-engine = { path = "../ptyrs-engine" }
 cuda-core.workspace = true
 numpy = "0.28"
 pyo3 = "0.28"
+
+[dev-dependencies]
+ptyrs-io.workspace = true

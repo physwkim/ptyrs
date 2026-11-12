@@ -1899,6 +1899,7 @@ dependencies = [
  "numpy",
  "ptyrs-core",
  "ptyrs-engine",
+ "ptyrs-io",
  "pyo3",
 ]
 
