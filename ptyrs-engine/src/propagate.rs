@@ -10,9 +10,43 @@
 
 use std::f64::consts::PI;
 
-use ptyrs_core::C64;
+use ptyrs_core::{C64, Geometry};
 
-use crate::{EngineError, Fft2, shift};
+use crate::{EngineError, Fft2, quad_phase, shift};
+
+/// The exit-wave model of the pty-chi algorithms: `psi = U(P·O·q)` per view, with `q` the
+/// object-plane phase that [`crate::obj_probe_to_psi`] applies and `U` the [`Propagator`].
+pub struct Optics {
+    quad: Vec<C64>,
+    propagator: Propagator,
+}
+
+impl Optics {
+    /// PyNX's far field: [`quad_phase`] and [`Propagator::Fourier`].
+    pub fn far_field(g: &Geometry) -> Self {
+        Self {
+            quad: quad_phase(g),
+            propagator: Propagator::Fourier(Fft2::new(g.frame)),
+        }
+    }
+
+    /// pty-chi's planar model: no object-plane phase and [`Propagator::free_space`].
+    pub fn free_space(w: &Wavefield) -> Self {
+        let [ny, nx] = w.shape;
+        Self {
+            quad: vec![C64::new(1.0, 0.0); ny * nx],
+            propagator: Propagator::free_space(w),
+        }
+    }
+
+    pub fn quad(&self) -> &[C64] {
+        &self.quad
+    }
+
+    pub fn propagator(&self) -> &Propagator {
+        &self.propagator
+    }
+}
 
 /// One free-space propagation: pty-chi `WavefieldPropagatorParameters` in metres.
 #[derive(Clone, Copy, Debug, PartialEq)]

@@ -50,7 +50,7 @@ pub use ops::{
     obj_probe_to_psi, poisson_grad, psi_to_obj_probe, quad_phase,
 };
 pub use plan::{Backend, Params, Plan, Step};
-pub use propagate::{AngularSpectrum, Fresnel, Propagator, Wavefield};
+pub use propagate::{AngularSpectrum, Fresnel, Optics, Propagator, Wavefield};
 pub use ptycho::{Algorithm, ApParams, DmParams, LlkRecord, MlParams, Ptycho, RpieParams};
 
 /// Errors from building or running the engine.

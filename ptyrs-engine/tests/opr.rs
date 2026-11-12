@@ -9,17 +9,17 @@ use std::ops::Range;
 
 use ptyrs_core::{C64, Stack, View};
 use ptyrs_engine::{
-    Cost, Fft2, Llk, Lsqml, LsqmlParams, LsqmlStep, ProbeVariation, Ptycho, illumination, llk,
-    obj_probe_to_psi, opr_weight_grad,
+    Cost, Fft2, Llk, Lsqml, LsqmlParams, LsqmlStep, Optics, ProbeVariation, Ptycho, illumination,
+    llk, obj_probe_to_psi, opr_weight_grad,
 };
 
 mod common;
 
-fn state() -> Ptycho {
+fn state() -> (Ptycho, Optics) {
     let (scan, object, probe) = common::dm_scenario(32, 40, 2, 2e5, 4.0);
     let mut p = Ptycho::new(&scan, object, probe).unwrap();
     p.scale_obj_probe();
-    p
+    (p, Optics::far_field(&scan.geometry))
 }
 
 fn table(text: &str) -> Vec<Vec<f64>> {
@@ -138,7 +138,7 @@ fn frame_llk(p: &Ptycho, frames: Range<usize>, var: &ProbeVariation) -> Vec<Llk>
 /// The Poisson and amplitude costs over every frame against each reference's `L` and `F`.
 #[test]
 fn costs_match_opr_refs() {
-    let p = state();
+    let (p, _) = state();
     for r in [&OPR, &LSQML_OPR] {
         let ref_ = table(r.values)[0].clone();
         let nb_obs = p.observed().frames(0..40).iter().flatten().count();
@@ -155,7 +155,7 @@ fn costs_match_opr_refs() {
 /// differences of each frame's cost in its own weights, one eigenmode at a time.
 #[test]
 fn weight_grad_matches_refs_and_central_differences() {
-    let p = state();
+    let (p, _) = state();
     let all: Vec<usize> = (0..40).collect();
     let views = views(&p, &all);
     for r in [&OPR, &LSQML_OPR] {
@@ -213,6 +213,7 @@ fn weight_grad_matches_refs_and_central_differences() {
 /// probe as preconditioner: the step and the object and probe changes.
 fn step(
     p: &Ptycho,
+    optics: &Optics,
     cost: Cost,
     frames: &[usize],
     var: &mut ProbeVariation,
@@ -220,7 +221,6 @@ fn step(
     let (mut object, mut probe) = (p.object().clone(), p.probe().clone());
     let pre = illumination(p.addr().views(), object.dims(), &probe);
     let views = views(p, frames);
-    let (obs, quad) = (p.observed(), p.quad());
     let params = LsqmlParams {
         batch_size: frames.len(),
         cost,
@@ -228,8 +228,8 @@ fn step(
     };
     let s = Lsqml::new(params).with_preconditioner(pre).step(
         &views,
-        obs,
-        quad,
+        p.observed(),
+        optics,
         &mut object,
         &mut probe,
         var,
@@ -266,10 +266,10 @@ fn assert_variation(r: &Ref, var: &ProbeVariation, frames: &[usize], u: usize, w
 
 /// The one-eigenmode reference's step on frames 0–19 (`a_far` in weight column 6).
 fn assert_opr_ref(cost: Cost, noise: usize) {
-    let p = state();
+    let (p, optics) = state();
     let mut var = OPR.variation();
     let frames: Vec<usize> = (0..20).collect();
-    let (s, _, _) = step(&p, cost, &frames, &mut var);
+    let (s, _, _) = step(&p, &optics, cost, &frames, &mut var);
     if cost == Cost::Poisson {
         let err = max_rel(&s.a_far, &OPR.weights(6)[..20]);
         assert!(err < 1e-13, "a_far max rel {err:.3e}");
@@ -290,11 +290,11 @@ fn poisson_step_matches_opr_ref() {
 /// The three-eigenmode reference's LSQML step on its batch: per-frame `a_far a_o a_p`, the
 /// object and probe changes and the eigenmodes and weights after it.
 fn assert_lsqml_opr_ref(cost: Cost, noise: usize) {
-    let p = state();
+    let (p, optics) = state();
     let mut var = LSQML_OPR.variation();
     let rows = table(include_str!("data/lsqml_opr_steps_f64.txt"));
     let frames: Vec<usize> = rows.iter().map(|r| r[0] as usize).collect();
-    let (s, d_obj, d_probe) = step(&p, cost, &frames, &mut var);
+    let (s, d_obj, d_probe) = step(&p, &optics, cost, &frames, &mut var);
     for (name, got, col, tol) in [
         ("a_far", &s.a_far, 1, 1e-13),
         ("a_o", &s.a_obj, 2, 1e-12),
@@ -342,10 +342,10 @@ fn poisson_step_matches_lsqml_opr_ref() {
 /// A one-frame batch leaves every eigenmode and weight unchanged.
 #[test]
 fn single_frame_batch_moves_nothing() {
-    let p = state();
+    let (p, optics) = state();
     for r in [&OPR, &LSQML_OPR] {
         let mut var = r.variation();
-        let (s, _, _) = step(&p, Cost::Poisson, &[3], &mut var);
+        let (s, _, _) = step(&p, &optics, Cost::Poisson, &[3], &mut var);
         assert_eq!(s.a_far.len(), 1);
         assert_eq!(var, r.variation(), "k {}", r.k);
     }

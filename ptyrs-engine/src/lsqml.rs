@@ -5,19 +5,21 @@
 //! [`ProbeVariation`] step ([`Lsqml::step`]) and runs the epochs.
 //!
 //! The noise model is a [`Cost`]: [`Cost::Amplitude`] is pty-chi's Gaussian model with weight
-//! `1/(2σ)² = 1`.
+//! `1/(2σ)² = 1`. The exit waves reach the detector through an [`Optics`]; pty-chi's probe is
+//! the engine's over `√k`, `k` the propagator's [`crate::Propagator::intensity_scale`].
 
 use ptyrs_core::{AddrTable, C64, Object, Probe, Stack, View};
 
 use crate::ops::{accumulate_obj, accumulate_probe, obj_probe_to_psi};
-use crate::{Cost, Fft2, Observed, ProbeVariation, random_batches};
+use crate::{Cost, Observed, Optics, ProbeVariation, random_batches};
 
 /// pty-chi's offsets: on `√icalc` in the Gaussian residual, on `icalc` in the Poisson
 /// residual and in the Poisson `xi`.
 const EPS_AMPLITUDE: f64 = 1e-9;
 const EPS_POISSON: f64 = 1e-6;
 const EPS_XI: f64 = 1e-5;
-/// pty-chi's `λ0` per pixel and mode in the step-size system, in the engine's units.
+/// pty-chi's `λ0` per pixel and mode in the step-size system times the probe's pixel count:
+/// `λ0 = 1.2e-7/(ny·nx)` on pty-chi's probe, `1.2e-7·k/(ny·nx)` on the engine's.
 const LAMBDA0: f64 = 1.2e-7;
 
 /// LSQML parameters.
@@ -43,11 +45,13 @@ pub struct LsqmlStep {
 }
 
 /// The update directions of a batch of views at one object, probe and [`ProbeVariation`]. With
-/// `psi` the far field of [`obj_probe_to_psi`] at each frame's own probe
-/// ([`ProbeVariation::unique`]), `icalc = Σ_m |psi_m|²` and `c` the cost's residual (Gaussian
-/// `2(1 − √iobs/(√icalc + 1e-9))`, Poisson `1 − iobs/(icalc + 1e-6)`, 0 where masked), the
-/// exit-wave update is `chi_m = F⁻¹(−a_far·c·psi_m)`. `views` are whole frames of an
-/// [`AddrTable`], each frame's views in its order.
+/// `psi` the exit waves of [`obj_probe_to_psi`] at each frame's own probe
+/// ([`ProbeVariation::unique`]), `U` the propagator, `icalc = Σ_m |U psi_m|²` and `c` the
+/// cost's residual (Gaussian `2(1 − √iobs/(√icalc + 1e-9))`, Poisson `1 − iobs/(icalc + 1e-6)`,
+/// 0 where masked), the exit-wave update is pty-chi's Eq. 19
+/// `chi_m = Uᴴ((1 − a_far·c)·U psi_m) − psi_m`, which also drops the part of `psi` on angular
+/// spectrum's evanescent band. `views` are whole frames of an [`AddrTable`], each frame's views
+/// in its order.
 pub struct LsqmlBatch<'a> {
     /// The shared views and probe, which the probe direction moves.
     views: &'a [View],
@@ -55,7 +59,7 @@ pub struct LsqmlBatch<'a> {
     /// The views and planes of [`ProbeVariation::unique`].
     uviews: Vec<View>,
     uprobe: Probe,
-    quad: &'a [C64],
+    optics: &'a Optics,
     object: &'a Object,
     frames: Vec<usize>,
     nmode: usize,
@@ -75,7 +79,7 @@ impl<'a> LsqmlBatch<'a> {
         run: &Lsqml,
         views: &'a [View],
         obs: &Observed,
-        quad: &'a [C64],
+        optics: &'a Optics,
         object: &'a Object,
         probe: &'a Probe,
         var: &ProbeVariation,
@@ -95,10 +99,11 @@ impl<'a> LsqmlBatch<'a> {
             })
             .collect();
         let (uviews, uprobe) = var.unique(views, probe);
-        let fft = Fft2::new(probe.plane_shape());
+        let prop = optics.propagator();
         let mut chi = vec![C64::default(); views.len() * n];
-        obj_probe_to_psi(&uviews, object, &uprobe, quad, &mut chi);
-        fft.forward(&mut chi);
+        obj_probe_to_psi(&uviews, object, &uprobe, optics.quad(), &mut chi);
+        let psi = chi.clone();
+        prop.forward(&mut chi);
         let iobs: Vec<&[Option<f64>]> = frames.iter().map(|&f| obs.frames(f..f + 1)).collect();
         let icalc: Vec<f64> = chi
             .chunks_exact(nmode * n)
@@ -138,16 +143,17 @@ impl<'a> LsqmlBatch<'a> {
                     }
                     (Cost::Poisson, Some(yt)) => 1.0 - yt / (yp + EPS_POISSON),
                 };
-                (0..nmode).for_each(|m| block[m * n + j] *= -a_far[k] * c);
+                (0..nmode).for_each(|m| block[m * n + j] *= 1.0 - a_far[k] * c);
             }
         }
-        fft.inverse(&mut chi);
+        prop.adjoint(&mut chi);
+        chi.iter_mut().zip(&psi).for_each(|(c, p)| *c -= p);
         Self {
             views,
             probe,
             uviews,
             uprobe,
-            quad,
+            optics,
             object,
             frames,
             nmode,
@@ -174,7 +180,7 @@ impl<'a> LsqmlBatch<'a> {
             &self.uviews,
             self.object.dims(),
             &self.uprobe,
-            self.quad,
+            self.optics.quad(),
             &self.chi,
         )
         .0
@@ -188,7 +194,7 @@ impl<'a> LsqmlBatch<'a> {
             &self.uviews,
             self.object,
             self.uprobe.dims(),
-            self.quad,
+            self.optics.quad(),
             &self.chi,
         )
     }
@@ -201,16 +207,19 @@ impl<'a> LsqmlBatch<'a> {
     /// Per-frame `[a_obj, a_probe]` along the object and probe directions `d_obj` and
     /// `d_probe`: with `dop` (at each frame's own probe) and `dpo` (along `d_probe` from the
     /// shared views) the exit-wave changes of [`obj_probe_to_psi`] along each, the frame's
-    /// system `[[a11, a12], [conj a12, a22]]·x = b` over its modes and
-    /// pixels with `a11 = Σ(|dop|² + 1.2e-7)` and `a22 = Σ(|dpo|² + 1.2e-7)`, each then plus
+    /// system `[[a11, a12], [conj a12, a22]]·x = b` over its modes and pixels with
+    /// `a11 = Σ(|dop|² + λ0)` and `a22 = Σ(|dpo|² + λ0)`, `λ0 = 1.2e-7·k/(ny·nx)`, each then plus
     /// 0.1 of its batch mean, `a12 = Σ dop·conj(dpo)`, `b = [Σ Re(conj(dop)·chi),
     /// Σ Re(conj(dpo)·chi)]`; `a_obj = 0.9·max(Re x0, 0)/nmode`, `a_probe = 0.9·max(Re x1, 0)`.
     pub fn step_sizes(&self, d_obj: &Object, d_probe: &Probe) -> [Vec<f64>; 2] {
         let mut dop = vec![C64::default(); self.chi.len()];
         let mut dpo = vec![C64::default(); self.chi.len()];
-        obj_probe_to_psi(&self.uviews, d_obj, &self.uprobe, self.quad, &mut dop);
-        obj_probe_to_psi(self.views, self.object, d_probe, self.quad, &mut dpo);
-        let block = self.nmode * self.probe.plane_len();
+        let quad = self.optics.quad();
+        obj_probe_to_psi(&self.uviews, d_obj, &self.uprobe, quad, &mut dop);
+        obj_probe_to_psi(self.views, self.object, d_probe, quad, &mut dpo);
+        let n = self.probe.plane_len();
+        let lambda0 = LAMBDA0 * self.optics.propagator().intensity_scale() / n as f64;
+        let block = self.nmode * n;
         let sums: Vec<[f64; 6]> = dop
             .chunks_exact(block)
             .zip(dpo.chunks_exact(block))
@@ -219,8 +228,8 @@ impl<'a> LsqmlBatch<'a> {
                 let mut s = [0.0; 6];
                 for ((u, v), c) in dop.iter().zip(dpo).zip(chi) {
                     let a12 = u * v.conj();
-                    s[0] += u.norm_sqr() + LAMBDA0;
-                    s[1] += v.norm_sqr() + LAMBDA0;
+                    s[0] += u.norm_sqr() + lambda0;
+                    s[1] += v.norm_sqr() + lambda0;
                     s[2] += a12.re;
                     s[3] += a12.im;
                     s[4] += (u.conj() * c).re;
@@ -339,7 +348,7 @@ impl Lsqml {
         &mut self,
         views: &[View],
         obs: &Observed,
-        quad: &[C64],
+        optics: &Optics,
         object: &mut Object,
         probe: &mut Probe,
         var: &mut ProbeVariation,
@@ -349,7 +358,7 @@ impl Lsqml {
             .expect("no preconditioner before the first epoch")
             .as_slice();
         let floor = (0.1 * pre.iter().fold(0.0, |a: f64, &b| a.max(b))).powi(2);
-        let b = LsqmlBatch::new(self, views, obs, quad, object, probe, var);
+        let b = LsqmlBatch::new(self, views, obs, optics, object, probe, var);
         let mut d_obj = b.obj_direction();
         for (d, p) in d_obj.as_mut_slice().iter_mut().zip(pre) {
             *d /= (p * p + floor).sqrt();
@@ -394,7 +403,7 @@ impl Lsqml {
     /// schedule with the probe optimised from epoch 0 (`Object.update_preconditioner`, epochs
     /// 0–9 and every tenth): `pre = (pre + I)/2` with `I` the [`illumination`] of every view at
     /// the shared probe (pty-chi's OPR mode 0), starting from `I` of the probe PtychoShelves
-    /// renormalises from the data, `I·max_f Σ iobs_f / (4·(ny·nx)²)` in the engine's units.
+    /// renormalises from the data, `I·max_f Σ iobs_f / (4·ny·nx·k)` in the engine's units.
     ///
     /// The start is the caller's object and probe as given: an algorithm rescales its start
     /// only where its reference does, as ML does by [`crate::Ptycho::scale_obj_probe`].
@@ -405,7 +414,7 @@ impl Lsqml {
         &mut self,
         addr: &AddrTable,
         obs: &Observed,
-        quad: &[C64],
+        optics: &Optics,
         object: &mut Object,
         probe: &mut Probe,
         var: &mut ProbeVariation,
@@ -415,13 +424,14 @@ impl Lsqml {
             let illum = illumination(addr.views(), object.dims(), probe);
             let pre = self.preconditioner.take().unwrap_or_else(|| {
                 let n = probe.plane_len() as f64;
+                let k = optics.propagator().intensity_scale();
                 let power = (0..nframe)
                     .map(|f| obs.frames(f..f + 1).iter().flatten().sum::<f64>())
                     .fold(0.0, f64::max);
                 let mut init = illum.clone();
                 init.as_mut_slice()
                     .iter_mut()
-                    .for_each(|v| *v *= power / (4.0 * n * n));
+                    .for_each(|v| *v *= power / (4.0 * n * k));
                 init
             });
             let data = pre
@@ -443,7 +453,7 @@ impl Lsqml {
                     .flat_map(|&f| &addr.views()[f * nmode..(f + 1) * nmode])
                     .copied()
                     .collect();
-                self.step(&views, obs, quad, object, probe, var)
+                self.step(&views, obs, optics, object, probe, var)
             })
             .collect()
     }
