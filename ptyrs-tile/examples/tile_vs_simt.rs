@@ -9,6 +9,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 use ptyrs_gpu::{C32, Kernels, LlkPartial, LlkSums, UpdateSums, ViewAddr, ViewDims, Views};
 
@@ -109,7 +110,9 @@ fn main() {
     let mut probe = DeviceBuffer::from_host(&stream, &probe_host).unwrap();
     let mut psi = DeviceBuffer::<C32>::zeroed(&stream, nk * n2).unwrap();
     let frames = 0..d.nframe;
-    k.obj_probe_to_psi(&stream, &views, frames.clone(), &obj, &probe, &mut psi)
+    // Leases every buffer the launches below touch until it drops after their sync.
+    let ex = ExecutionContext::new(stream.clone());
+    k.obj_probe_to_psi(&ex, &views, frames.clone(), &obj, &probe, &mut psi)
         .unwrap();
     let partials_host: Vec<LlkPartial> = unit(4 * d.nframe as usize, 3)
         .as_chunks::<4>()
@@ -125,7 +128,6 @@ fn main() {
     let partials = DeviceBuffer::from_host(&stream, &partials_host).unwrap();
     let mut obj_sums = UpdateSums::zeroed(&stream, obj_len).unwrap();
     let mut probe_sums = UpdateSums::zeroed(&stream, probe_len).unwrap();
-    let mut max_bits = DeviceBuffer::<u32>::zeroed(&stream, 1).unwrap();
     let mut llk = DeviceBuffer::<f64>::zeroed(&stream, 4).unwrap();
     let mut llk_scratch =
         DeviceBuffer::<f64>::zeroed(&stream, ptyrs_tile::llk_sums_scratch_len(d.nframe)).unwrap();
@@ -146,37 +148,36 @@ fn main() {
     let total = 2 + reps;
     for _ in 0..total {
         if tile {
-            ptyrs_tile::psi_to_obj(&stream, &views, frames.clone(), &psi, &probe, &mut obj_sums)
+            ptyrs_tile::psi_to_obj(&ex, &views, frames.clone(), &psi, &probe, &mut obj_sums)
                 .unwrap();
         } else {
-            k.psi_to_obj(&stream, &views, frames.clone(), &psi, &probe, &mut obj_sums)
+            k.psi_to_obj(&ex, &views, frames.clone(), &psi, &probe, &mut obj_sums)
                 .unwrap();
         }
     }
     for _ in 0..total {
         if tile {
-            ptyrs_tile::psi_to_probe(&stream, &views, frames.clone(), &psi, &obj, &mut probe_sums)
+            ptyrs_tile::psi_to_probe(&ex, &views, frames.clone(), &psi, &obj, &mut probe_sums)
                 .unwrap();
         } else {
-            k.psi_to_probe(&stream, &views, frames.clone(), &psi, &obj, &mut probe_sums)
+            k.psi_to_probe(&ex, &views, frames.clone(), &psi, &obj, &mut probe_sums)
                 .unwrap();
         }
     }
     for (x, sums, len) in [
-        (&mut obj, &obj_sums, obj_len),
-        (&mut probe, &probe_sums, probe_len),
+        (&mut obj, &mut obj_sums, obj_len),
+        (&mut probe, &mut probe_sums, probe_len),
     ] {
         for _ in 0..total {
             if tile {
-                ptyrs_tile::update_from_sums(&stream, x, sums, len as u32, 0.01, &mut max_bits)
-                    .unwrap();
+                ptyrs_tile::update_from_sums(&ex, x, sums, len as u32, 0.01).unwrap();
             } else {
-                k.update_from_sums(&stream, x, sums, len as u32, 0.01)
-                    .unwrap();
+                k.update_from_sums(&ex, x, sums, len as u32, 0.01).unwrap();
             }
         }
     }
     stream.synchronize().unwrap();
+    drop(ex);
 
     // LLK totals to the host, wall time from an idle stream.
     let mut wall = Vec::with_capacity(reps);
@@ -184,7 +185,8 @@ fn main() {
         stream.synchronize().unwrap();
         let t = Instant::now();
         let totals = if tile {
-            ptyrs_tile::llk_sums(&stream, &partials, d.nframe, &mut llk_scratch, &mut llk).unwrap();
+            let ex = ExecutionContext::new(stream.clone());
+            ptyrs_tile::llk_sums(&ex, &partials, d.nframe, &mut llk_scratch, &mut llk).unwrap();
             llk.to_host_vec(&stream).unwrap()
         } else {
             let s = LlkSums::from_partials(&partials.to_host_vec(&stream).unwrap());

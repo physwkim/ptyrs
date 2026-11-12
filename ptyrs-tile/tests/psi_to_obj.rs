@@ -4,6 +4,7 @@
 use std::ops::Range;
 use std::sync::Arc;
 
+use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, DeviceCopy};
 use ptyrs_gpu::{C32, Kernels, UpdateSums, ViewAddr, ViewDims, Views};
 
@@ -133,6 +134,7 @@ fn psi_to_obj_matches_simt_and_ignores_stack_split() {
     let ctx = CudaContext::new(0).expect("CUDA device 0");
     let k = Kernels::load(&ctx).expect("load ptyrs-gpu kernels");
     let stream: Arc<CudaStream> = ctx.default_stream();
+    let ex = ExecutionContext::new(stream.clone());
     let (d, view_list) = dims();
     let n = (d.frame[0] * d.frame[1]) as usize;
     let nk = |f: Range<u32>| ((f.end - f.start) * d.nmode) as usize;
@@ -150,24 +152,21 @@ fn psi_to_obj_matches_simt_and_ignores_stack_split() {
     let len = d.nobj as usize * (d.obj[0] * d.obj[1]) as usize;
     let num0 = noise(len, 10, 1.0);
     let den0: Vec<f32> = noise(len, 11, 1.0).iter().map(|c| c.re.abs()).collect();
-    let start = || UpdateSums {
-        num: up(&stream, &num0),
-        den: up(&stream, &den0),
-    };
+    let start = || UpdateSums::new(up(&stream, &num0), up(&stream, &den0), &stream).unwrap();
 
     let mut simt = start();
-    k.psi_to_obj(&stream, &views, 0..5, &psi, &probe, &mut simt)
+    k.psi_to_obj(&ex, &views, 0..5, &psi, &probe, &mut simt)
         .unwrap();
     let simt = host(&stream, &simt);
     let tile_whole = || {
         let mut s = start();
-        ptyrs_tile::psi_to_obj(&stream, &views, 0..5, &psi, &probe, &mut s).unwrap();
+        ptyrs_tile::psi_to_obj(&ex, &views, 0..5, &psi, &probe, &mut s).unwrap();
         host(&stream, &s)
     };
     let tile = tile_whole();
     let mut parts = start();
-    ptyrs_tile::psi_to_obj(&stream, &views, 0..2, &psi_parts[0], &probe, &mut parts).unwrap();
-    ptyrs_tile::psi_to_obj(&stream, &views, 2..5, &psi_parts[1], &probe, &mut parts).unwrap();
+    ptyrs_tile::psi_to_obj(&ex, &views, 0..2, &psi_parts[0], &probe, &mut parts).unwrap();
+    ptyrs_tile::psi_to_obj(&ex, &views, 2..5, &psi_parts[1], &probe, &mut parts).unwrap();
     let parts = host(&stream, &parts);
 
     let mut num: Vec<Z> = num0.iter().map(|c| (c.re as f64, c.im as f64)).collect();
@@ -213,6 +212,7 @@ fn psi_to_obj_matches_simt_and_ignores_stack_split() {
 fn psi_to_obj_checks_frames_and_lengths() {
     let ctx = CudaContext::new(0).expect("CUDA device 0");
     let stream: Arc<CudaStream> = ctx.default_stream();
+    let ex = ExecutionContext::new(stream.clone());
     let (d, view_list) = dims();
     let n = (d.frame[0] * d.frame[1]) as usize;
     let views = Views::new(&stream, d, &view_list).unwrap();
@@ -221,16 +221,13 @@ fn psi_to_obj_checks_frames_and_lengths() {
     let len = d.nobj as usize * (d.obj[0] * d.obj[1]) as usize;
     let mut sums = UpdateSums::zeroed(&stream, len).unwrap();
     for frames in [1..1, 4..6] {
-        let r = ptyrs_tile::psi_to_obj(&stream, &views, frames.clone(), &psi, &probe, &mut sums);
+        let r = ptyrs_tile::psi_to_obj(&ex, &views, frames.clone(), &psi, &probe, &mut sums);
         assert!(
-            matches!(r, Err(ptyrs_tile::Error::Gpu(ptyrs_gpu::Error::Shape(_)))),
+            matches!(r, Err(ptyrs_gpu::Error::Shape(_))),
             "frames {frames:?}: {r:?}"
         );
     }
     // Two frames of psi do not hold three.
-    let r = ptyrs_tile::psi_to_obj(&stream, &views, 0..3, &psi, &probe, &mut sums);
-    assert!(
-        matches!(r, Err(ptyrs_tile::Error::Gpu(ptyrs_gpu::Error::Shape(_)))),
-        "{r:?}"
-    );
+    let r = ptyrs_tile::psi_to_obj(&ex, &views, 0..3, &psi, &probe, &mut sums);
+    assert!(matches!(r, Err(ptyrs_gpu::Error::Shape(_))), "{r:?}");
 }

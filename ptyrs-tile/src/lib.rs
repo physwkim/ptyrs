@@ -1,17 +1,17 @@
 //! ptyrs-tile: cuTile (Tile IR) alternatives to `ptyrs-gpu` SIMT pieces.
 //!
-//! Each launch takes the same buffers as its `ptyrs_gpu` counterpart, enqueues on the
-//! caller's stream and returns; like `ptyrs_gpu`, it leases every buffer it touches on that
-//! stream until the kernel completes. cutile JIT-compiles a kernel on its first launch.
+//! Each launch takes the same context and buffers as its `ptyrs_gpu` counterpart, leases
+//! the buffers with [`ptyrs_gpu::lease`] and enqueues on the context's stream, so it runs
+//! eagerly or records into a graph capture the same way. cutile JIT-compiles a kernel on
+//! its first launch.
 
 use std::ops::Range;
-use std::sync::Arc;
 
 use cuda_async::device_buffer::DevicePointer;
-use cuda_async::error::DeviceError;
-use cuda_core::{AllocationLease, CudaStream, DeviceBuffer, DeviceCopy, RawDeviceBuffer};
+use cuda_core::{DeviceBuffer, DeviceCopy};
 use cutile::prelude::*;
-use ptyrs_gpu::{C32, LLK_TREE_LEAVES, LlkPartial, OBJ_TILE, UpdateSums, Views};
+pub use ptyrs_gpu::Error;
+use ptyrs_gpu::{C32, LLK_TREE_LEAVES, LlkPartial, OBJ_TILE, UpdateSums, Views, lease};
 
 #[cutile::module]
 mod device {
@@ -643,45 +643,8 @@ mod device {
     }
 }
 
-#[derive(Debug)]
-pub enum Error {
-    /// A shape, context or driver failure, as `ptyrs_gpu` reports it.
-    Gpu(ptyrs_gpu::Error),
-    /// cutile failed to compile or launch a kernel.
-    Tile(DeviceError),
-}
-
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Gpu(e) => e.fmt(f),
-            Self::Tile(e) => write!(f, "cutile: {e:?}"),
-        }
-    }
-}
-
-impl std::error::Error for Error {}
-
-impl From<ptyrs_gpu::Error> for Error {
-    fn from(e: ptyrs_gpu::Error) -> Self {
-        Self::Gpu(e)
-    }
-}
-
-impl From<cuda_core::DriverError> for Error {
-    fn from(e: cuda_core::DriverError) -> Self {
-        Self::Gpu(e.into())
-    }
-}
-
-impl From<DeviceError> for Error {
-    fn from(e: DeviceError) -> Self {
-        Self::Tile(e)
-    }
-}
-
 fn shape(what: String) -> Error {
-    Error::Gpu(ptyrs_gpu::Error::Shape(what))
+    Error::Shape(what)
 }
 
 fn check_len<T: DeviceCopy>(what: &str, buf: &DeviceBuffer<T>, need: usize) -> Result<(), Error> {
@@ -711,35 +674,11 @@ fn dptr_at<T: DeviceCopy, U>(buf: &DeviceBuffer<T>, at: usize) -> DevicePointer<
     unsafe { DevicePointer::from_cu_deviceptr(buf.cu_deviceptr() + (at * size_of::<T>()) as u64) }
 }
 
-/// Leases `reads` and `writes` on `stream`, runs `enqueue`, and keeps the leases until the
-/// work it enqueued completes (as `ptyrs_gpu::Kernels` does for its launches).
-fn launch(
-    stream: &Arc<CudaStream>,
-    reads: &[&RawDeviceBuffer],
-    writes: &[&RawDeviceBuffer],
-    enqueue: impl FnOnce() -> Result<(), Error>,
-) -> Result<(), Error> {
-    let mut leases: Vec<AllocationLease> = Vec::with_capacity(reads.len() + writes.len());
-    for (bufs, write) in [(reads, false), (writes, true)] {
-        for buf in bufs {
-            if buf.context().as_ref() != stream.context().as_ref() {
-                return Err(ptyrs_gpu::Error::ContextMismatch.into());
-            }
-            leases.push(buf.acquire(stream, write, false)?);
-        }
-    }
-    enqueue()?;
-    for lease in leases {
-        lease.retain_until_complete(stream)?;
-    }
-    Ok(())
-}
-
 /// [`ptyrs_gpu::Kernels::psi_to_obj`] as a Tile kernel: adds the stack's object-update sums
 /// to `sums` `[nobj, nyo, nxo]`, each object pixel adding its views in ascending view
 /// order from the same tile lists, so the result does not depend on the stack split.
 pub fn psi_to_obj(
-    stream: &Arc<CudaStream>,
+    ctx: &ExecutionContext,
     views: &Views,
     frames: Range<u32>,
     psi: &DeviceBuffer<C32>,
@@ -782,43 +721,41 @@ pub fn psi_to_obj(
         views.tile_start().storage(),
         views.tile_views().storage(),
     ];
-    let UpdateSums { num, den } = sums;
-    launch(stream, &reads, &[num.storage(), den.storage()], || {
-        let grid = (nxo.div_ceil(OBJ_TILE), nyo.div_ceil(OBJ_TILE), d.nobj);
-        // SAFETY: lengths and i32 offsets checked above; `Views::new` checked every view
-        // lies inside the object with valid mode indices and built the tile lists from
-        // them; the leases order every access on `stream`, and each program writes only
-        // the pixels of its own tile.
-        unsafe {
-            device::psi_to_obj(
-                dptr(psi),
-                dptr(probe),
-                dptr(views.addr()),
-                dptr(views.addr()),
-                dptr(views.tile_start()),
-                dptr(views.tile_views()),
-                dptr(num),
-                dptr(den),
-                geom[0],
-                geom[1],
-                geom[2],
-                geom[3],
-                geom[4],
-                geom[5],
-                d.quad_phase,
-            )
-            .grid(grid)
-            .async_on(stream)?;
-        }
-        Ok(())
-    })
+    lease(ctx, &reads, &[sums.num.storage(), sums.den.storage()])?;
+    let grid = (nxo.div_ceil(OBJ_TILE), nyo.div_ceil(OBJ_TILE), d.nobj);
+    // SAFETY: lengths and i32 offsets checked above; `Views::new` checked every view lies
+    // inside the object with valid mode indices and built the tile lists from them; the
+    // leases order every access on `ctx`'s stream, and each program writes only the pixels
+    // of its own tile.
+    unsafe {
+        device::psi_to_obj(
+            dptr(psi),
+            dptr(probe),
+            dptr(views.addr()),
+            dptr(views.addr()),
+            dptr(views.tile_start()),
+            dptr(views.tile_views()),
+            dptr(&sums.num),
+            dptr(&sums.den),
+            geom[0],
+            geom[1],
+            geom[2],
+            geom[3],
+            geom[4],
+            geom[5],
+            d.quad_phase,
+        )
+        .grid(grid)
+        .execute(ctx)?;
+    }
+    Ok(())
 }
 
 /// [`ptyrs_gpu::Kernels::psi_to_probe`] as a Tile kernel: adds the stack's probe-update sums
 /// to `sums` `[nprobe, ny, nx]`, each probe pixel adding the views of its mode in ascending
 /// view order, so the result does not depend on the stack split.
 pub fn psi_to_probe(
-    stream: &Arc<CudaStream>,
+    ctx: &ExecutionContext,
     views: &Views,
     frames: Range<u32>,
     psi: &DeviceBuffer<C32>,
@@ -855,80 +792,76 @@ pub fn psi_to_probe(
         .map(|&v| offset("geometry", v as usize))
         .collect::<Result<Vec<_>, _>>()?;
     let reads = [psi.storage(), obj.storage(), views.addr().storage()];
-    let UpdateSums { num, den } = sums;
-    launch(stream, &reads, &[num.storage(), den.storage()], || {
-        let grid = (nx.div_ceil(32), ny.div_ceil(8), d.nprobe);
-        // SAFETY: lengths and i32 offsets checked above; `Views::new` checked every view
-        // lies inside the object with valid mode indices; the leases order every access
-        // on `stream`, and each program writes only the pixels of its own tile.
-        unsafe {
-            device::psi_to_probe(
-                dptr(psi),
-                dptr(obj),
-                dptr(views.addr()),
-                dptr(views.addr()),
-                dptr(num),
-                dptr(den),
-                geom[0],
-                geom[1],
-                geom[2],
-                geom[3],
-                geom[4],
-                geom[5],
-                d.quad_phase,
-            )
-            .grid(grid)
-            .async_on(stream)?;
-        }
-        Ok(())
-    })
+    lease(ctx, &reads, &[sums.num.storage(), sums.den.storage()])?;
+    let grid = (nx.div_ceil(32), ny.div_ceil(8), d.nprobe);
+    // SAFETY: lengths and i32 offsets checked above; `Views::new` checked every view lies
+    // inside the object with valid mode indices; the leases order every access on `ctx`'s
+    // stream, and each program writes only the pixels of its own tile.
+    unsafe {
+        device::psi_to_probe(
+            dptr(psi),
+            dptr(obj),
+            dptr(views.addr()),
+            dptr(views.addr()),
+            dptr(&sums.num),
+            dptr(&sums.den),
+            geom[0],
+            geom[1],
+            geom[2],
+            geom[3],
+            geom[4],
+            geom[5],
+            d.quad_phase,
+        )
+        .grid(grid)
+        .execute(ctx)?;
+    }
+    Ok(())
 }
 
 /// [`ptyrs_gpu::Kernels::update_from_sums`] as Tile kernels: `x = (num + reg x) /
 /// max(den + reg, 1e-12)` for the first `n` values, `reg = inertia * max(0, den[0 .. n]
-/// ...)` over the non-NaN values of `den`. `max_bits` (one `u32`) is the caller's scratch
-/// for that maximum; it is zeroed on `stream` here, so the call allocates nothing and
-/// never synchronizes.
+/// ...)` over the non-NaN values of `den`. `sums.max_bits` is the scratch for that
+/// maximum, zeroed on `ctx`'s stream here, so the call allocates nothing and never
+/// synchronizes.
 pub fn update_from_sums(
-    stream: &Arc<CudaStream>,
+    ctx: &ExecutionContext,
     x: &mut DeviceBuffer<C32>,
-    sums: &UpdateSums,
+    sums: &mut UpdateSums,
     n: u32,
     inertia: f32,
-    max_bits: &mut DeviceBuffer<u32>,
 ) -> Result<(), Error> {
     check_len("x", x, n as usize)?;
     check_len("sums.num", &sums.num, n as usize)?;
     check_len("sums.den", &sums.den, n as usize)?;
-    check_len("max_bits", max_bits, 1)?;
+    check_len("sums.max_bits", &sums.max_bits, 1)?;
     // The kernels index interleaved floats, `2 n` of them, as i32.
     let n = offset("n", n as usize)?;
     offset("2 n", 2 * n as usize)?;
     if n == 0 {
         return Ok(());
     }
-    let UpdateSums { num, den } = sums;
-    launch(stream, &[den.storage()], &[max_bits.storage()], || {
-        // SAFETY: `max_bits` holds at least one u32 and is leased for writing on `stream`;
-        // `den` holds `n` floats.
-        unsafe {
-            cuda_core::memory::memset_d8_async(max_bits.cu_deviceptr(), 0, 4, stream.cu_stream())?;
-            device::max_nonneg_f32(dptr(den), n, dptr(max_bits))
-                .grid(((n as u32).div_ceil(1024), 1, 1))
-                .async_on(stream)?;
-        }
-        Ok(())
-    })?;
-    let reads = [num.storage(), den.storage(), max_bits.storage()];
-    launch(stream, &reads, &[x.storage()], || {
-        // SAFETY: `x`, `num` hold `n` complex values, `den` `n` floats, `max_bits` one.
-        unsafe {
-            device::normalize_update(dptr(x), dptr(num), dptr(den), n, dptr(max_bits), inertia)
-                .grid(((2 * n as u32).div_ceil(1024), 1, 1))
-                .async_on(stream)?;
-        }
-        Ok(())
-    })
+    let UpdateSums { num, den, max_bits } = sums;
+    ptyrs_gpu::zero(ctx, max_bits)?;
+    lease(ctx, &[den.storage()], &[max_bits.storage()])?;
+    // SAFETY: `den` holds `n` floats and `max_bits` one zeroed u32, leased on `ctx`.
+    unsafe {
+        device::max_nonneg_f32(dptr(den), n, dptr(max_bits))
+            .grid(((n as u32).div_ceil(1024), 1, 1))
+            .execute(ctx)?;
+    }
+    lease(
+        ctx,
+        &[num.storage(), den.storage(), max_bits.storage()],
+        &[x.storage()],
+    )?;
+    // SAFETY: `x`, `num` hold `n` complex values, `den` `n` floats, `max_bits` one.
+    unsafe {
+        device::normalize_update(dptr(x), dptr(num), dptr(den), n, dptr(max_bits), inertia)
+            .grid(((2 * n as u32).div_ceil(1024), 1, 1))
+            .execute(ctx)?;
+    }
+    Ok(())
 }
 
 /// Node counts of the [`ptyrs_gpu::LlkSums`] tree levels above `n` leaves, the root last.
@@ -954,7 +887,7 @@ pub fn llk_sums_scratch_len(n: u32) -> usize {
 /// `[poisson, gaussian, euclidean, icalc]`, bit for bit: one launch per tree level, the
 /// levels below the root in `scratch` ([`llk_sums_scratch_len`] long).
 pub fn llk_sums(
-    stream: &Arc<CudaStream>,
+    ctx: &ExecutionContext,
     partials: &DeviceBuffer<LlkPartial>,
     n: u32,
     scratch: &mut DeviceBuffer<f64>,
@@ -967,37 +900,39 @@ pub fn llk_sums(
     // The first level's programs index 256 four-term nodes each, as i32.
     offset("leaf offsets", 4 * LLK_TREE_LEAVES * levels[0])?;
     let n = n as i32;
-    let reads = [partials.storage()];
-    launch(stream, &reads, &[scratch.storage(), out.storage()], || {
-        // Scratch offset and node count of the level below.
-        let mut below: Option<(usize, i32)> = None;
-        let mut at = 0;
-        for (l, &m) in levels.iter().enumerate() {
-            let dst = if l + 1 == levels.len() {
-                dptr(out)
-            } else {
-                dptr_at(scratch, at)
-            };
-            // SAFETY: `partials` holds `n` records of four f32 and `scratch` every level
-            // below the root, each of `m` four-f64 nodes at `at`; program `p` reads nodes
-            // `256 p ..` below `n` (or the level's count) and writes node `p`.
-            unsafe {
-                match below {
-                    None => {
-                        device::llk_leaves(dptr(partials), n, dst)
-                            .grid((m as u32, 1, 1))
-                            .async_on(stream)?;
-                    }
-                    Some((src, count)) => {
-                        device::llk_nodes(dptr_at(scratch, src), count, dst)
-                            .grid((m as u32, 1, 1))
-                            .async_on(stream)?;
-                    }
+    lease(
+        ctx,
+        &[partials.storage()],
+        &[scratch.storage(), out.storage()],
+    )?;
+    // Scratch offset and node count of the level below.
+    let mut below: Option<(usize, i32)> = None;
+    let mut at = 0;
+    for (l, &m) in levels.iter().enumerate() {
+        let dst = if l + 1 == levels.len() {
+            dptr(out)
+        } else {
+            dptr_at(scratch, at)
+        };
+        // SAFETY: `partials` holds `n` records of four f32 and `scratch` every level below
+        // the root, each of `m` four-f64 nodes at `at`; program `p` reads nodes `256 p ..`
+        // below `n` (or the level's count) and writes node `p`.
+        unsafe {
+            match below {
+                None => {
+                    device::llk_leaves(dptr(partials), n, dst)
+                        .grid((m as u32, 1, 1))
+                        .execute(ctx)?;
+                }
+                Some((src, count)) => {
+                    device::llk_nodes(dptr_at(scratch, src), count, dst)
+                        .grid((m as u32, 1, 1))
+                        .execute(ctx)?;
                 }
             }
-            below = Some((at, m as i32));
-            at += 4 * m;
         }
-        Ok(())
-    })
+        below = Some((at, m as i32));
+        at += 4 * m;
+    }
+    Ok(())
 }

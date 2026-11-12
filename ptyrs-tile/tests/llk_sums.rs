@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 use ptyrs_gpu::{LlkPartial, LlkSums};
 
@@ -42,6 +43,7 @@ fn from_partials_adds_adjacent_pairs() {
 fn llk_sums_equal_from_partials_bit_for_bit() {
     let ctx = CudaContext::new(0).expect("CUDA device 0");
     let stream: Arc<CudaStream> = ctx.default_stream();
+    let ex = ExecutionContext::new(stream.clone());
     // Terms spanning 1e-3 .. 1e7 with both signs, so the f64 totals depend on the order.
     let mut s = 0x2545_f491_4f6c_dd1du64;
     let mut next = || {
@@ -71,7 +73,7 @@ fn llk_sums_equal_from_partials_bit_for_bit() {
         let run = || {
             let mut scratch = DeviceBuffer::<f64>::zeroed(&stream, scratch_len).unwrap();
             let mut out = DeviceBuffer::<f64>::zeroed(&stream, 4).unwrap();
-            ptyrs_tile::llk_sums(&stream, &partials, n as u32, &mut scratch, &mut out).unwrap();
+            ptyrs_tile::llk_sums(&ex, &partials, n as u32, &mut scratch, &mut out).unwrap();
             out.to_host_vec(&stream).unwrap()
         };
         let got: Vec<u64> = run().iter().map(|v| v.to_bits()).collect();
@@ -84,7 +86,7 @@ fn llk_sums_equal_from_partials_bit_for_bit() {
     assert_eq!(ptyrs_tile::llk_sums_scratch_len(70_000), 4 * (274 + 2));
     let mut scratch = DeviceBuffer::<f64>::zeroed(&stream, 4 * (274 + 2)).unwrap();
     let mut out = DeviceBuffer::<f64>::zeroed(&stream, 4).unwrap();
-    assert!(ptyrs_tile::llk_sums(&stream, &partials, 70_002, &mut scratch, &mut out).is_err());
+    assert!(ptyrs_tile::llk_sums(&ex, &partials, 70_002, &mut scratch, &mut out).is_err());
     let mut short = DeviceBuffer::<f64>::zeroed(&stream, 4 * (274 + 1)).unwrap();
-    assert!(ptyrs_tile::llk_sums(&stream, &partials, 70_000, &mut short, &mut out).is_err());
+    assert!(ptyrs_tile::llk_sums(&ex, &partials, 70_000, &mut short, &mut out).is_err());
 }

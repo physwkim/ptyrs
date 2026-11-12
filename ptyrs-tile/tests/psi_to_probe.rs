@@ -4,6 +4,7 @@
 use std::ops::Range;
 use std::sync::Arc;
 
+use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, DeviceCopy};
 use ptyrs_gpu::{C32, Kernels, UpdateSums, ViewAddr, ViewDims, Views};
 
@@ -133,6 +134,7 @@ fn psi_to_probe_matches_simt_and_ignores_stack_split() {
     let ctx = CudaContext::new(0).expect("CUDA device 0");
     let k = Kernels::load(&ctx).expect("load ptyrs-gpu kernels");
     let stream: Arc<CudaStream> = ctx.default_stream();
+    let ex = ExecutionContext::new(stream.clone());
     let (d, view_list) = dims();
     let n = (d.frame[0] * d.frame[1]) as usize;
     let nk = |f: Range<u32>| ((f.end - f.start) * d.nmode) as usize;
@@ -150,24 +152,21 @@ fn psi_to_probe_matches_simt_and_ignores_stack_split() {
     let len = d.nprobe as usize * n;
     let num0 = noise(len, 20, 1.0);
     let den0: Vec<f32> = noise(len, 21, 1.0).iter().map(|c| c.re.abs()).collect();
-    let start = || UpdateSums {
-        num: up(&stream, &num0),
-        den: up(&stream, &den0),
-    };
+    let start = || UpdateSums::new(up(&stream, &num0), up(&stream, &den0), &stream).unwrap();
 
     let mut simt = start();
-    k.psi_to_probe(&stream, &views, 0..5, &psi, &obj, &mut simt)
+    k.psi_to_probe(&ex, &views, 0..5, &psi, &obj, &mut simt)
         .unwrap();
     let simt = host(&stream, &simt);
     let tile_whole = || {
         let mut s = start();
-        ptyrs_tile::psi_to_probe(&stream, &views, 0..5, &psi, &obj, &mut s).unwrap();
+        ptyrs_tile::psi_to_probe(&ex, &views, 0..5, &psi, &obj, &mut s).unwrap();
         host(&stream, &s)
     };
     let tile = tile_whole();
     let mut parts = start();
-    ptyrs_tile::psi_to_probe(&stream, &views, 0..2, &psi_parts[0], &obj, &mut parts).unwrap();
-    ptyrs_tile::psi_to_probe(&stream, &views, 2..5, &psi_parts[1], &obj, &mut parts).unwrap();
+    ptyrs_tile::psi_to_probe(&ex, &views, 0..2, &psi_parts[0], &obj, &mut parts).unwrap();
+    ptyrs_tile::psi_to_probe(&ex, &views, 2..5, &psi_parts[1], &obj, &mut parts).unwrap();
     let parts = host(&stream, &parts);
 
     let mut num: Vec<Z> = num0.iter().map(|c| (c.re as f64, c.im as f64)).collect();
@@ -213,6 +212,7 @@ fn psi_to_probe_matches_simt_and_ignores_stack_split() {
 fn psi_to_probe_checks_frames_and_lengths() {
     let ctx = CudaContext::new(0).expect("CUDA device 0");
     let stream: Arc<CudaStream> = ctx.default_stream();
+    let ex = ExecutionContext::new(stream.clone());
     let (d, view_list) = dims();
     let n = (d.frame[0] * d.frame[1]) as usize;
     let views = Views::new(&stream, d, &view_list).unwrap();
@@ -223,23 +223,17 @@ fn psi_to_probe_checks_frames_and_lengths() {
     let psi = up(&stream, &noise(2 * d.nmode as usize * n, 3, 1.0));
     let mut sums = UpdateSums::zeroed(&stream, d.nprobe as usize * n).unwrap();
     for frames in [1..1, 4..6] {
-        let r = ptyrs_tile::psi_to_probe(&stream, &views, frames.clone(), &psi, &obj, &mut sums);
+        let r = ptyrs_tile::psi_to_probe(&ex, &views, frames.clone(), &psi, &obj, &mut sums);
         assert!(
-            matches!(r, Err(ptyrs_tile::Error::Gpu(ptyrs_gpu::Error::Shape(_)))),
+            matches!(r, Err(ptyrs_gpu::Error::Shape(_))),
             "frames {frames:?}: {r:?}"
         );
     }
     // Two frames of psi do not hold three.
-    let r = ptyrs_tile::psi_to_probe(&stream, &views, 0..3, &psi, &obj, &mut sums);
-    assert!(
-        matches!(r, Err(ptyrs_tile::Error::Gpu(ptyrs_gpu::Error::Shape(_)))),
-        "{r:?}"
-    );
+    let r = ptyrs_tile::psi_to_probe(&ex, &views, 0..3, &psi, &obj, &mut sums);
+    assert!(matches!(r, Err(ptyrs_gpu::Error::Shape(_))), "{r:?}");
     // One probe mode of sums does not hold two.
     let mut short = UpdateSums::zeroed(&stream, n).unwrap();
-    let r = ptyrs_tile::psi_to_probe(&stream, &views, 0..2, &psi, &obj, &mut short);
-    assert!(
-        matches!(r, Err(ptyrs_tile::Error::Gpu(ptyrs_gpu::Error::Shape(_)))),
-        "{r:?}"
-    );
+    let r = ptyrs_tile::psi_to_probe(&ex, &views, 0..2, &psi, &obj, &mut short);
+    assert!(matches!(r, Err(ptyrs_gpu::Error::Shape(_))), "{r:?}");
 }

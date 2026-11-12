@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 
+use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, DeviceCopy};
 use ptyrs_gpu::{C32, Kernels, UpdateSums};
 
@@ -49,6 +50,7 @@ fn update_from_sums_matches_simt() {
     let ctx = CudaContext::new(0).expect("CUDA device 0");
     let k = Kernels::load(&ctx).expect("load ptyrs-gpu kernels");
     let stream: Arc<CudaStream> = ctx.default_stream();
+    let ex = ExecutionContext::new(stream.clone());
     let inertia = 0.01f32;
     // 300_001 values span several max programs; their maximum is the last value. The 1500
     // have no positive `den` (negatives, -0, NaN), so `reg` is 0 and the update is exact.
@@ -81,27 +83,17 @@ fn update_from_sums_matches_simt() {
                 ]
             })
             .collect();
-        let sums = UpdateSums {
-            num: up(&stream, &num_host),
-            den: up(&stream, &den_host),
-        };
+        let mut sums =
+            UpdateSums::new(up(&stream, &num_host), up(&stream, &den_host), &stream).unwrap();
         let mut simt = up(&stream, &x_host);
-        k.update_from_sums(&stream, &mut simt, &sums, len as u32, inertia)
+        k.update_from_sums(&ex, &mut simt, &mut sums, len as u32, inertia)
             .unwrap();
         let simt = flat(&simt.to_host_vec(&stream).unwrap());
         // Stale scratch above every `den`: the op must zero it itself.
-        let mut max_bits = up(&stream, &[1e30f32.to_bits()]);
+        sums.max_bits = up(&stream, &[1e30f32.to_bits()]);
         let mut run = || {
             let mut x = up(&stream, &x_host);
-            ptyrs_tile::update_from_sums(
-                &stream,
-                &mut x,
-                &sums,
-                len as u32,
-                inertia,
-                &mut max_bits,
-            )
-            .unwrap();
+            ptyrs_tile::update_from_sums(&ex, &mut x, &mut sums, len as u32, inertia).unwrap();
             flat(&x.to_host_vec(&stream).unwrap())
         };
         let tile = run();
