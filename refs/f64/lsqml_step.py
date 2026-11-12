@@ -1,6 +1,6 @@
 """Float64 reference of one pty-chi LSQML minibatch step (object and probe) at a fixed state.
 
-    <engine>/target/release/examples/llk_trace <dir> dm 1 2 32 40 4
+    <engine>/target/release/examples/engine_llk_trace <dir> dm 1 2 32 40 4
     micromamba run -n ptyrs-ref python -I refs/f64/lsqml_step.py <dir>
 
 The state is the one ml_grad.py reads (object [1, 76, 80], probe [2, 32, 32], 40 frames). The
@@ -164,7 +164,7 @@ def directional(f, x, d, h):
 
 def ptychi_step(m, iobs, wavelength, obj, probe, noise, nbatch):
     """pty-chi LSQMLReconstructor.run_minibatch in f64 on CPU on the first `nbatch` frames,
-    mapped as in ptyrs-engine/scripts/compare_ptychi_rpie.py, with the preconditioner set to
+    mapped as in ptyrs/scripts/engine/compare_ptychi_rpie.py, with the preconditioner set to
     the illumination map and torch.randn returning zeros during the step."""
     import torch
     from torch.utils.data import DataLoader
