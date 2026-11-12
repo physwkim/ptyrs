@@ -15,8 +15,7 @@
 //! regions' subtree roots pulled by copy engine and the pair tree above them; C the other
 //! regions' max words pulled by copy engine, object and probe updates, then each owner packs
 //! the updated rows its neighbours read; D each receiver pulls them by copy engine and unpacks
-//! its halo. The pair tree in B and all of D run on the side stream ([`Gpu::side`]), beside the
-//! object sums and the next A's stacks before the halo.
+//! its halo.
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -68,9 +67,6 @@ pub struct ApConfig {
 struct Stack {
     leaf: usize,
     frames: Range<u32>,
-    /// Neither it nor an earlier stack of its leaf reads a halo tile, so A may run it before
-    /// the halo exchange completes without reordering the leaf's probe sums.
-    before_halo: bool,
 }
 
 /// One region's share, fixed at setup.
@@ -194,20 +190,15 @@ impl Plan {
                 if frames.is_empty() {
                     continue;
                 }
-                let mut before_halo = true;
                 for chunk in frames.chunks(cfg.stack) {
                     let start = u(global.len())?;
                     global.extend_from_slice(chunk);
                     if mine {
                         own.push(stacks.len());
                     }
-                    before_halo &= !chunk
-                        .iter()
-                        .any(|&f| tiles[f as usize].iter().any(|&t| zone[t] == 2));
                     stacks.push(Stack {
                         leaf: l,
                         frames: start..u(global.len())?,
-                        before_halo,
                     });
                 }
             }
@@ -724,36 +715,27 @@ impl State {
         let dims = *views.dims();
         let np = plan.np() as u32;
 
-        // A: exit waves, those before the halo while the side stream unpacks it; the other
-        // leaves' stacks all read the halo. An own stack's probe sum follows its projection,
-        // whose exit waves are then still in L2.
+        // A: exit waves. An own stack's probe sum follows its projection, whose exit waves are
+        // then still in L2.
         for s in leaf_sums.iter_mut() {
             ptyrs_gpu::zero(&ctx, &mut s.num)?;
             ptyrs_gpu::zero(&ctx, &mut s.den)?;
         }
-        for early in [true, false] {
-            if !early {
-                gpu.join_side()?;
+        for (s, st) in rp.stacks.iter().enumerate() {
+            let mine = rp.own.binary_search(&s).ok();
+            let at = table.at(s);
+            let psi = &mut psi[s];
+            k.obj_probe_to_psi(&ctx, views, at, obj, probe, psi)?;
+            fft.forward_inplace(&ctx, psi)
+                .map_err(ptyrs_gpu::Error::from)?;
+            if let (true, Some(i)) = (due, mine) {
+                k.llk(&ctx, &dims, at, counts, psi, &mut llk[i])?;
             }
-            for (s, st) in rp.stacks.iter().enumerate() {
-                if st.before_halo != early {
-                    continue;
-                }
-                let mine = rp.own.binary_search(&s).ok();
-                let at = table.at(s);
-                let psi = &mut psi[s];
-                k.obj_probe_to_psi(&ctx, views, at, obj, probe, psi)?;
-                fft.forward_inplace(&ctx, psi)
-                    .map_err(ptyrs_gpu::Error::from)?;
-                if let (true, Some(i)) = (due, mine) {
-                    k.llk(&ctx, &dims, at, counts, psi, &mut llk[i])?;
-                }
-                k.apply_amplitude(&ctx, &dims, at, counts, psi)?;
-                fft.inverse_inplace(&ctx, psi)
-                    .map_err(ptyrs_gpu::Error::from)?;
-                if let Some(sums) = mine.and_then(|_| leaf_sums.get_mut(st.leaf - r * plan.k)) {
-                    k.psi_to_probe(&ctx, views, at, psi, obj, sums)?;
-                }
+            k.apply_amplitude(&ctx, &dims, at, counts, psi)?;
+            fft.inverse_inplace(&ctx, psi)
+                .map_err(ptyrs_gpu::Error::from)?;
+            if let Some(sums) = mine.and_then(|_| leaf_sums.get_mut(st.leaf - r * plan.k)) {
+                k.psi_to_probe(&ctx, views, at, psi, obj, sums)?;
             }
         }
         if let Some(t) = tree.as_ref() {
@@ -764,27 +746,22 @@ impl State {
         }
         gpu.fence()?;
 
-        // B: probe pair tree above the subtree roots on the side stream; object sums and their
-        // max.
-        if let Some(t) = tree.as_ref() {
-            gpu.side(|x| {
-                // SAFETY: each pull reads an owner's subtree root, added before the fence and
-                // rewritten only after the third; the pulled copies and the upper nodes are
-                // local and touched by the side stream only.
-                unsafe {
-                    exchange::pull(x, &links.tree)?;
-                    for a in &t.upper {
-                        a.run(ex, x, np)?;
-                    }
-                }
-                Ok(())
-            })?;
-        }
+        // B: object sums and their max, probe pair tree above the subtree roots.
         if let Some(sums) = obj_sums.as_mut() {
             for (s, psi) in psi.iter().enumerate() {
                 k.psi_to_obj(&ctx, views, table.at(s), psi, probe, sums)?;
             }
             k.obj_den_max(&ctx, views, sums)?;
+        }
+        if let Some(t) = tree.as_ref() {
+            // SAFETY: each pull reads an owner's subtree root, added before the fence and
+            // rewritten only after the third; the pulled copies and the upper nodes are local.
+            unsafe {
+                exchange::pull(&stream, &links.tree)?;
+                for a in &t.upper {
+                    a.run(ex, &stream, np)?;
+                }
+            }
         }
         gpu.fence()?;
 
@@ -806,19 +783,16 @@ impl State {
         }
         gpu.fence()?;
 
-        // D: halo pull from the owners' send buffers on the side stream; the unpack overwrites
-        // what `normalize_obj` left in the halo tiles it read.
+        // D: halo pull from the owners' send buffers; the unpack overwrites what
+        // `normalize_obj` left in the halo tiles it read.
         if obj_sums.is_some() {
-            gpu.side(|x| {
-                // SAFETY: each pull reads the part of an owner's send buffer packed for this
-                // region before the fence, repacked only after the next cycle's second fence.
-                // The receive buffer is this side stream's; the halo tiles it writes are read
-                // by the main stream only after `join_side` in the next cycle's A.
-                unsafe {
-                    exchange::pull(x, &links.halo)?;
-                    ex.copy_runs(x, &halo.unpack)
-                }
-            })?;
+            // SAFETY: each pull reads the part of an owner's send buffer packed for this
+            // region before the fence, repacked only after the next cycle's second fence; the
+            // receive buffer and the object are this region's and touched by this stream only.
+            unsafe {
+                exchange::pull(&stream, &links.halo)?;
+                ex.copy_runs(&stream, &halo.unpack)?;
+            }
         }
         drop(ctx);
 
@@ -931,7 +905,7 @@ impl DistAp {
                     out.push(p);
                 }
             }
-            gpu.synchronize()?;
+            gpu.stream().synchronize()?;
             Ok(out)
         })?;
         let nframe = self.plan.run.nframe();
