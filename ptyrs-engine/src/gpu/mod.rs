@@ -5,11 +5,11 @@
 //! The scan's frames are cut into stacks of [`GpuOptions::stack_size`] consecutive frames,
 //! one [`StackTable`] entry each: every launch reads its stack's frames from the entry on the
 //! device. Each stack keeps its own exit waves (DM carries them across cycles), sized like
-//! PyNX's fixed stack for the longest stack. AP and DM project a stack, and the LLK pass
-//! takes its partials, either by M2's fused passes over one scratch set or by the M1 launch
-//! sequence ([`GpuOptions::fused`]), whose one scratch stack serves all and whose stacks of
-//! one length share a cuFFT plan, which transforms only their frames; rPIE and ML always run
-//! M1's launches. Each cycle enqueues through its own `ExecutionContext`, dropped when the cycle
+//! PyNX's fixed stack for the longest stack. AP and DM project a stack, ML takes a stack's
+//! gradient, and the LLK pass takes its partials, either by M2's fused passes over one
+//! scratch set or by the M1 launch sequence ([`GpuOptions::fused`]), whose one scratch stack
+//! serves all and whose stacks of one length share a cuFFT plan, which transforms only their
+//! frames; rPIE and ML's line search always run M1's launches. Each cycle enqueues through its own `ExecutionContext`, dropped when the cycle
 //! has been enqueued. Nothing in a cycle
 //! reads back to the host: an LLK record goes, stack by stack, into the device's
 //! [`ptyrs_gpu::LlkRing`], whose copies download while later cycles run, and the host reads
@@ -55,7 +55,8 @@ pub struct GpuOptions {
     /// most half this many records after it, and the host waits for one only when it is
     /// this many records ahead of it, or at the end of an algorithm call.
     pub llk_slots: usize,
-    /// Project AP and DM stacks and take the LLK pass's partials by M2's fused passes
+    /// Project AP and DM stacks, take ML's gradients and the LLK pass's partials by M2's fused
+    /// passes
     /// ([`ptyrs_gpu::Kernels::fused_project`]; frame sides 128 or 256, and [`GpuPtycho::new`]
     /// fails on others) instead of M1's launch sequence. The two agree to rounding, not bit
     /// for bit.

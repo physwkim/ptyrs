@@ -196,8 +196,8 @@ fn rpie_matches_cpu() {
     }
 }
 
-/// ML's gradients of the same estimate, in `f32` against `f64`, on M1's and the fused passes'
-/// setups (ML itself always runs M1's launches).
+/// ML's gradients of the same estimate, in `f32` against `f64`, by M1's launches and by the
+/// fused passes.
 #[test]
 fn ml_grads_match_cpu() {
     for setup in [M1, FUSED] {
@@ -218,19 +218,23 @@ fn ml_grads_match_cpu() {
 }
 
 /// ML's direction (β from the last gradient across both arrays) and Poisson quadratic step
-/// against the CPU, for each pair of updated arrays.
+/// against the CPU, for each pair of updated arrays, with the gradients by M1's launches and
+/// by the fused passes.
 #[test]
 fn ml_matches_cpu() {
-    for (o, p) in UPDATES {
+    for (setup, (o, p)) in [M1, FUSED]
+        .into_iter()
+        .flat_map(|s| UPDATES.map(|u| (s, u)))
+    {
         let params = MlParams {
             update_object: o.is_some(),
             update_probe: p.is_some(),
             calc_llk: 1,
             zero_phase_ramp: true,
         };
-        let (scan, object, probe) = start(M1.frame, 2, true);
+        let (scan, object, probe) = start(setup.frame, 2, true);
         let mut cpu = Ptycho::new(&scan, object.clone(), probe.clone()).unwrap();
-        let mut gpu = GpuPtycho::new(&ctx(), &scan, object, probe, M1.options).unwrap();
+        let mut gpu = GpuPtycho::new(&ctx(), &scan, object, probe, setup.options).unwrap();
         cpu.ml(&params, 10);
         gpu.ml(&params, 10).unwrap();
         assert_eq!(gpu.cycle(), cpu.cycle());
@@ -240,8 +244,8 @@ fn ml_matches_cpu() {
             rel_l2(&gpu.probe().unwrap(), cpu.probe()),
         ];
         eprintln!(
-            "ml {params:?}: llk {:.2e} object {:.2e} probe {:.2e}",
-            errs[0], errs[1], errs[2]
+            "ml fused {} {params:?}: llk {:.2e} object {:.2e} probe {:.2e}",
+            setup.options.fused, errs[0], errs[1], errs[2]
         );
         check(errs, [1e-4, 1e-4, 1e-4]);
     }

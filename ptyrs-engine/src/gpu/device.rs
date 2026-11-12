@@ -578,8 +578,8 @@ impl Device {
         self.build_ml()?;
         {
             let ctx = self.context();
-            let (mut bufs, _, _) = self.lend();
-            bufs.with_ml(|b, ml| b.ml_grad(&ctx, ml, [true, true], None))?;
+            let (mut bufs, mut passes, _) = self.lend();
+            bufs.with_ml(|b, ml| b.ml_grad(&ctx, &mut passes, ml, [true, true], None))?;
         }
         let grads = [
             self.obj_sums.num.to_host_vec(&self.stream)?,
@@ -660,8 +660,9 @@ impl<'a> Bufs<'a> {
                 self.dm_cycle(ctx, passes, params, *first).map(|()| None)
             }
             Cycle::Rpie(p, scratch) => self.rpie_epoch(ctx, p, &mut scratch.lend()).map(|()| None),
-            Cycle::Ml { params, first, llk } => self
-                .with_ml(|b, ml| b.ml_epoch(ctx, ml, params, *first, llk.then(|| ring.record()))),
+            Cycle::Ml { params, first, llk } => self.with_ml(|b, ml| {
+                b.ml_epoch(ctx, passes, ml, params, *first, llk.then(|| ring.record()))
+            }),
         }
     }
 }
