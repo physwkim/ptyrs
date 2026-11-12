@@ -133,27 +133,23 @@ fn tile_and_pixel() -> (usize, u32, u32) {
 }
 
 /// PyNX `ObjNorm` of element `g`: `x = (num + reg x) / max(den + reg, 1e-12)` with
-/// `reg = inertia * max`, every operation rounded on its own (no FMA contraction).
+/// `reg = inertia * max`, every operation rounded on its own (no FMA contraction); then
+/// zeroes `num` and `den` at `g`, which this update has consumed.
 ///
 /// # Safety
 ///
 /// `x`, `num` hold `g + 1` complex values, `den` `g + 1` floats.
 #[device]
-unsafe fn normalize_at(
-    x: *mut f32,
-    num: *const f32,
-    den: *const f32,
-    g: usize,
-    inertia: f32,
-    max: f32,
-) {
+unsafe fn normalize_at(x: *mut f32, sums: pixel::SumPtrs, g: usize, inertia: f32, max: f32) {
     use cuda_device::float::{add_rn_f32, div_rn_f32, mul_rn_f32};
     unsafe {
         let reg = mul_rn_f32(inertia, max);
-        let d = add_rn_f32(*den.add(g), reg).max(1e-12);
-        let (a, b) = (pixel::load_c(num, g), pixel::load_c(x, g));
+        let d = add_rn_f32(*sums.den.add(g), reg).max(1e-12);
+        let (a, b) = (pixel::load_c(sums.num, g), pixel::load_c(x, g));
         let part = |a: f32, b: f32| div_rn_f32(add_rn_f32(a, mul_rn_f32(reg, b)), d);
         pixel::store_c(x, g, (part(a.0, b.0), part(a.1, b.1)));
+        pixel::store_c(sums.num, g, (0.0, 0.0));
+        *sums.den.add(g) = 0.0;
     }
 }
 
@@ -642,17 +638,17 @@ pub mod kernels {
     }
 
     /// PyNX `ObjNorm`: `x = (num + reg x) / max(den + reg, 1e-12)` with
-    /// `reg = inertia * f32::from_bits(*max_bits)`, for `n` elements. Every operation is
-    /// rounded on its own (no FMA contraction), so the result is the plain f32 formula.
+    /// `reg = inertia * f32::from_bits(*max_bits)`, for `n` elements, zeroing the `n` sums it
+    /// consumed. Every operation is rounded on its own (no FMA contraction), so the result is
+    /// the plain f32 formula.
     ///
     /// # Safety
     ///
-    /// `x`, `num` hold `n` complex values, `den` `n` floats, `max_bits` one `u32`.
+    /// `x`, `sums.num` hold `n` complex values, `sums.den` `n` floats, `max_bits` one `u32`.
     #[kernel]
     pub unsafe fn normalize_update(
         x: *mut f32,
-        num: *const f32,
-        den: *const f32,
+        sums: SumPtrs,
         n: u32,
         max_bits: *const u32,
         inertia: f32,
@@ -661,12 +657,12 @@ pub mod kernels {
         if g >= n as usize {
             return;
         }
-        unsafe { normalize_at(x, num, den, g, inertia, f32::from_bits(*max_bits)) }
+        unsafe { normalize_at(x, sums, g, inertia, f32::from_bits(*max_bits)) }
     }
 
     /// [`normalize_update`] of `x` `[nobj, nyo, nxo]` on the pixels of the object tiles with
-    /// views; a block whose tile has none returns without reading or writing. Grid
-    /// `(ntx, nty, nobj)` of `OBJ_TILE` tiles, block `(OBJ_TILE, OBJ_TILE, 1)`.
+    /// views, zeroing their sums; a block whose tile has none returns without reading or
+    /// writing. Grid `(ntx, nty, nobj)` of `OBJ_TILE` tiles, block `(OBJ_TILE, OBJ_TILE, 1)`.
     ///
     /// # Safety
     ///
@@ -688,16 +684,7 @@ pub mod kernels {
         }
         let px = (thread::blockIdx_z() as usize * nyo as usize + y as usize) * nxo as usize
             + xo as usize;
-        unsafe {
-            normalize_at(
-                x,
-                sums.num,
-                sums.den,
-                px,
-                inertia,
-                f32::from_bits(*max_bits),
-            )
-        }
+        unsafe { normalize_at(x, sums, px, inertia, f32::from_bits(*max_bits)) }
     }
 
     /// DM reflection (PyNX `DM1` and the copy `DM2` reads): with `psi1 = (2 - alpha) po -
