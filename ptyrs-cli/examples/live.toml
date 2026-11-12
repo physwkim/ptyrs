@@ -22,7 +22,7 @@ workers = 16
 queue = 256
 # Regenerate and compare the crop of every uid divisible by this; 0 off.
 verify-every = 0
-pos-wait-ms = 1000
+pos-wait-ms = 40
 batch = 16
 flush-us = 500
 idle-us = 50

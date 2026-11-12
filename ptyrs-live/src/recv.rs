@@ -78,9 +78,9 @@ pub struct RecvCfg {
     /// Regenerate and compare the crop of every uid divisible by this; 0 off.
     pub verify_every: i32,
     /// A frame whose position is still missing this long after the frame
-    /// arrived is dropped. The frames behind it wait in the ring meanwhile,
-    /// so a wait past what the ring holds stalls the workers. On its own
-    /// connection the position trailed its frame by up to 15.8 ms at 20 kHz.
+    /// arrived is dropped, or sooner once a worker needs its ring slot. On
+    /// its own connection the position trailed its frame by up to 15.8 ms at
+    /// 20 kHz.
     pub pos_wait_ms: i64,
     pub batch: NonZeroUsize,
     pub flush_us: i64,
@@ -120,7 +120,7 @@ impl Default for RecvCfg {
             workers: NonZeroUsize::new(16).unwrap(),
             queue: NonZeroUsize::new(256).unwrap(),
             verify_every: 0,
-            pos_wait_ms: 1000,
+            pos_wait_ms: 40,
             batch: NonZeroUsize::new(16).unwrap(),
             flush_us: 500,
             idle_us: 50,
@@ -986,7 +986,7 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
         "recv expected={frames} received_unique={} gpu_frames={} lost={lost} rx_lost={} \
          unaccounted={} dup={} beyond={} \
          gap_events={} gap_frames={} out_of_order={} queue_full={} rejected={} placeholders={} \
-         decode_err={} pos_missing={} pos_waits={} pos_updates={} pos_rejected={}",
+         decode_err={} pos_missing={} pos_crowded={} pos_waits={} pos_updates={} pos_rejected={}",
         st.unique,
         up.frames,
         rx_lost.total(),
@@ -1001,6 +1001,7 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
         st.placeholders,
         wr.decode_err,
         up.pos_missing,
+        up.pos_crowded,
         up.pos_waits,
         ps.updates,
         ps.rejected,

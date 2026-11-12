@@ -10,10 +10,10 @@
 //!
 //! Workers commit frames without their positions. The uploader joins each
 //! committed frame, in sequence order, with its position from the
-//! [`PosTable`]: the frame lands once its position is in, and one whose
-//! position is still missing `pos_wait_ns` after the frame arrived is
-//! dropped. A late position therefore holds frames in the ring, and only a
-//! full ring holds the workers.
+//! [`PosTable`]: the frame lands once its position is in. One still without
+//! its position is dropped `pos_wait_ns` after it arrived, or sooner, as soon
+//! as a worker needs its slot: a missing position holds the frames behind it
+//! only while the ring has room for them, so it never costs another frame.
 //!
 //! On the device every landed frame has its own place in a [`DeviceStore`],
 //! the next one in landing order, so an uploaded frame is never overwritten
@@ -316,7 +316,7 @@ pub struct UploaderConfig {
     /// Events, i.e. batches in flight.
     pub events: usize,
     /// A frame whose position is still missing this long after the frame
-    /// arrived is dropped.
+    /// arrived is dropped, if a worker has not needed its slot before.
     pub pos_wait_ns: i64,
 }
 
@@ -325,6 +325,9 @@ pub struct UploadReport {
     pub frames: u64,
     /// Frames dropped because their position did not come in time.
     pub pos_missing: u64,
+    /// Of `pos_missing`, those dropped before `pos_wait_ns` because a worker
+    /// needed their slot.
+    pub pos_crowded: u64,
     /// Frames that reached the head of the ring before their position did.
     pub pos_waits: u64,
     /// Frames whose position had already arrived when the frame did.
@@ -383,6 +386,7 @@ pub fn run_uploader(
     let mut rep = UploadReport {
         frames: 0,
         pos_missing: 0,
+        pos_crowded: 0,
         pos_waits: 0,
         pos_first: 0,
         pos_after_frame: Histogram::new(1_000_000),
@@ -422,17 +426,21 @@ pub fn run_uploader(
                     }
                     lands[i] = true;
                 }
-                None if wall_ns() - t_rx > cfg.pos_wait_ns => {
+                None => {
+                    // Sequence `joined + slots` is reserved: a worker waits
+                    // for this frame's slot.
+                    let crowded = ring.next.load(Ordering::Acquire) > joined + slots as u64;
+                    if !crowded && wall_ns() - t_rx <= cfg.pos_wait_ns {
+                        if waiting != Some(joined) {
+                            rep.pos_waits += 1;
+                            waiting = Some(joined);
+                        }
+                        break;
+                    }
                     rep.pos_missing += 1;
+                    rep.pos_crowded += crowded as u64;
                     m.place.store(0, Ordering::Relaxed);
                     lands[i] = false;
-                }
-                None => {
-                    if waiting != Some(joined) {
-                        rep.pos_waits += 1;
-                        waiting = Some(joined);
-                    }
-                    break;
                 }
             }
             joined += 1;
@@ -751,9 +759,9 @@ mod tests {
     }
 
     /// A frame whose position never comes is dropped once `pos_wait_ns` has
-    /// passed since it arrived: it takes no place in the store and its slot
-    /// goes back to the ring, which here wraps many times past such frames,
-    /// first and last among them; the frames around them land in order.
+    /// passed since it arrived, when no worker needs its slot before: it
+    /// takes no place in the store and its slot goes back to the ring; the
+    /// frames around it, first and last among them, land in order.
     #[test]
     fn a_frame_without_a_position_is_dropped_after_the_wait() {
         let ctx = Context::new(0).expect("GPU 0");
@@ -761,7 +769,8 @@ mod tests {
         let total = 120;
         let lost = |uid: i32| uid % 7 == 0 || uid == total - 1;
         let landed: Vec<i32> = (0..total).filter(|&u| !lost(u)).collect();
-        let ring = Arc::new(Ring::new(&ctx, 4, se).unwrap());
+        // Room for every frame: no worker waits for a slot.
+        let ring = Arc::new(Ring::new(&ctx, total as usize, se).unwrap());
         let store = Arc::new(DeviceStore::new(&ctx, landed.len(), se).unwrap());
         let pos = Arc::new(PosTable::new(256));
         let stop = Arc::new(AtomicBool::new(false));
@@ -779,8 +788,74 @@ mod tests {
         let rep = up.join().unwrap().unwrap();
         let missing = (0..total).filter(|&u| lost(u)).count() as u64;
         assert_eq!(
-            (rep.frames, rep.pos_missing),
-            (landed.len() as u64, missing)
+            (rep.frames, rep.pos_missing, rep.pos_crowded),
+            (landed.len() as u64, missing, 0)
+        );
+        assert_eq!(ring.stalls(), 0);
+        check_landed(&ring, &store, &rep, rx, &landed);
+    }
+
+    /// A full ring behind a frame still without its position holds it until
+    /// its position comes within the wait, and it lands: no slot is needed
+    /// past the ring.
+    #[test]
+    fn a_position_within_the_wait_lands_its_frame_behind_a_full_ring() {
+        let ctx = Context::new(0).expect("GPU 0");
+        let se = 4096;
+        let ring = Arc::new(Ring::new(&ctx, 4, se).unwrap());
+        let store = Arc::new(DeviceStore::new(&ctx, 4, se).unwrap());
+        let pos = Arc::new(PosTable::new(64));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let up = uploader(&ring, &ctx, &store, &pos, cfg(), &stop, Some(tx));
+        for uid in 1..4 {
+            post(&pos, uid);
+        }
+        commit(&ring, 0..4);
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(rx.try_recv().is_err(), "a frame landed before frame 0");
+        post(&pos, 0);
+        stop.store(true, Ordering::Release);
+        let rep = up.join().unwrap().unwrap();
+        assert_eq!((rep.frames, rep.pos_missing), (4, 0));
+        assert_eq!(ring.stalls(), 0);
+        check_landed(&ring, &store, &rep, rx, &[0, 1, 2, 3]);
+    }
+
+    /// A frame still without its position is dropped as soon as a worker
+    /// needs its slot, long before `pos_wait_ns`: a missing position costs
+    /// only its own frame. Here the ring wraps many times past such frames,
+    /// singly and in a run longer than the ring, and every frame with a
+    /// position lands in order.
+    #[test]
+    fn a_frame_without_a_position_is_dropped_once_a_worker_needs_its_slot() {
+        let ctx = Context::new(0).expect("GPU 0");
+        let se = 4096;
+        // More frames than the ring holds follow the last one without a
+        // position, 119, so a worker needs its slot.
+        let total = 126;
+        let lost = |uid: i32| uid % 7 == 0 || (40..50).contains(&uid);
+        let landed: Vec<i32> = (0..total).filter(|&u| !lost(u)).collect();
+        let ring = Arc::new(Ring::new(&ctx, 4, se).unwrap());
+        let store = Arc::new(DeviceStore::new(&ctx, landed.len(), se).unwrap());
+        let pos = Arc::new(PosTable::new(256));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let cfg = UploaderConfig {
+            pos_wait_ns: 3_600_000_000_000,
+            ..cfg()
+        };
+        let up = uploader(&ring, &ctx, &store, &pos, cfg, &stop, Some(tx));
+        for &uid in &landed {
+            post(&pos, uid);
+        }
+        commit(&ring, 0..total);
+        stop.store(true, Ordering::Release);
+        let rep = up.join().unwrap().unwrap();
+        let missing = (0..total).filter(|&u| lost(u)).count() as u64;
+        assert_eq!(
+            (rep.frames, rep.pos_missing, rep.pos_crowded),
+            (landed.len() as u64, missing, missing)
         );
         check_landed(&ring, &store, &rep, rx, &landed);
     }
