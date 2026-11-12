@@ -1,0 +1,139 @@
+//! Poisson ML conjugate-gradient kernels (PyNX `ML`): the Polak–Ribière `β`, the search
+//! direction and the step, on arrays of complex values (object or probe). A CG coefficient
+//! lives on the device as a pair `(num, den)` of floats whose quotient it is; partial pairs
+//! are reduced in a fixed order, so coefficients and iterates are bitwise reproducible.
+
+use cuda_device::{device, thread};
+use cuda_host::cuda_module;
+
+use crate::pixel::PIXEL_THREADS;
+
+/// Blocks of every `cg_beta_parts` launch, and so the partial pairs each launch writes.
+pub const CG_BLOCKS: u32 = 1024;
+
+#[cuda_module]
+pub mod grad_kernels {
+    use crate::pixel::*;
+    use crate::*;
+    use cuda_device::SharedArray;
+
+    /// One array's Polak–Ribière partial sums, then `h = g`: block `b` writes
+    /// `part[2b] = sum Re(conj(g) (g - h))` and `part[2b + 1] = sum |h|^2` over the elements
+    /// `i ≡ b * PIXEL_THREADS + t (mod CG_BLOCKS * PIXEL_THREADS)`. `h` holds the previous
+    /// cycle's gradient on entry and this cycle's on exit.
+    ///
+    /// # Safety
+    ///
+    /// `g`, `h` hold `n` complex values, `part` `2 * CG_BLOCKS` floats; grid
+    /// `(CG_BLOCKS, 1, 1)`, block `(PIXEL_THREADS, 1, 1)`.
+    #[kernel]
+    pub unsafe fn cg_beta_parts(g: *const f32, h: *mut f32, n: u32, part: *mut f32) {
+        static mut RED: SharedArray<f32, 512> = SharedArray::UNINIT;
+        let stride = thread::gridDim_x() as usize * PIXEL_THREADS as usize;
+        let mut acc = [0.0f32; 2];
+        let mut i = global_index();
+        while i < n as usize {
+            unsafe {
+                let (a, b) = (load_c(g, i), load_c(h, i));
+                acc[0] += a.0 * (a.0 - b.0) + a.1 * (a.1 - b.1);
+                acc[1] += b.0 * b.0 + b.1 * b.1;
+                store_c(h, i, a);
+            }
+            i += stride;
+        }
+        let out = unsafe { part.add(2 * thread::blockIdx_x() as usize) };
+        unsafe { super::block_pair((&raw mut RED).cast::<f32>(), acc, out) }
+    }
+
+    /// `out[0..2] = sum_b part[2b .. 2b + 2]` over `npart` pairs.
+    ///
+    /// # Safety
+    ///
+    /// `part` holds `2 * npart` floats, `out` two; grid `(1, 1, 1)`, block
+    /// `(PIXEL_THREADS, 1, 1)`.
+    #[kernel]
+    pub unsafe fn cg_sum_parts(part: *const f32, npart: u32, out: *mut f32) {
+        static mut RED: SharedArray<f32, 512> = SharedArray::UNINIT;
+        let mut acc = [0.0f32; 2];
+        let mut b = thread::threadIdx_x() as usize;
+        while b < npart as usize {
+            unsafe {
+                acc[0] += *part.add(2 * b);
+                acc[1] += *part.add(2 * b + 1);
+            }
+            b += PIXEL_THREADS as usize;
+        }
+        unsafe { super::block_pair((&raw mut RED).cast::<f32>(), acc, out) }
+    }
+
+    /// PyNX `cu_linear_comb_fcfc_beta`: `d = beta d - g` with `beta = beta_pair[0] /
+    /// beta_pair[1]`, or 0 where that is negative or not finite (a reset to `-g`); then the
+    /// consumed gradient sums are zero.
+    ///
+    /// # Safety
+    ///
+    /// `d`, `g.num` hold `n` complex values, `g.den` `n` floats, `beta_pair` two.
+    #[kernel]
+    pub unsafe fn cg_direction(d: *mut f32, g: SumPtrs, n: u32, beta_pair: *const f32) {
+        let i = global_index();
+        if i >= n as usize {
+            return;
+        }
+        unsafe {
+            let b = *beta_pair / *beta_pair.add(1);
+            let b = if b.is_finite() && b >= 0.0 { b } else { 0.0 };
+            let (dv, gv) = (load_c(d, i), load_c(g.num, i));
+            store_c(d, i, (b * dv.0 - gv.0, b * dv.1 - gv.1));
+            store_c(g.num, i, (0.0, 0.0));
+            *g.den.add(i) = 0.0;
+        }
+    }
+
+    /// PyNX `cu_linear_comb_fcfc_gamma`: with `gamma = gamma_pair[0] / gamma_pair[1]`,
+    /// `x += gamma d` if `gamma` is finite, else `x` stays and `d = -h` (with `h` this cycle's
+    /// gradient, as `cg_beta_parts` leaves it).
+    ///
+    /// # Safety
+    ///
+    /// `x`, `d`, `h` hold `n` complex values, `gamma_pair` two floats.
+    #[kernel]
+    pub unsafe fn cg_step(x: *mut f32, d: *mut f32, h: *const f32, n: u32, gamma_pair: *const f32) {
+        let i = global_index();
+        if i >= n as usize {
+            return;
+        }
+        unsafe {
+            let c = *gamma_pair / *gamma_pair.add(1);
+            if c.is_finite() {
+                let (xv, dv) = (load_c(x, i), load_c(d, i));
+                store_c(x, i, (xv.0 + c * dv.0, xv.1 + c * dv.1));
+            } else {
+                let hv = load_c(h, i);
+                store_c(d, i, (-hv.0, -hv.1));
+            }
+        }
+    }
+}
+
+/// Block sums of each thread's `acc`, written by thread 0 to `out[0..2]`; `s` is two
+/// `PIXEL_THREADS` segments of shared memory. Every thread of the block must call it.
+///
+/// # Safety
+///
+/// `s` holds `2 * PIXEL_THREADS` shared floats, `out` two floats; block
+/// `(PIXEL_THREADS, 1, 1)`.
+#[device]
+unsafe fn block_pair(s: *mut f32, acc: [f32; 2], out: *mut f32) {
+    let t = thread::threadIdx_x() as usize;
+    let seg = PIXEL_THREADS as usize;
+    unsafe {
+        for (j, &a) in acc.iter().enumerate() {
+            *s.add(j * seg + t) = a;
+            crate::block_sum(s.add(j * seg));
+        }
+        if t == 0 {
+            *out = *s;
+            *out.add(1) = *s.add(seg);
+        }
+    }
+}
