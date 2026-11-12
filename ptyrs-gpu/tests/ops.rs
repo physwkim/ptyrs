@@ -11,9 +11,9 @@ use cuda_async::error::DeviceError;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, DeviceCopy, DriverError};
 use ptyrs_fft::{FftError, Plan2d};
 use ptyrs_gpu::{
-    C32, Error, Exit, FusedBufs, FusedInputs, Kernels, Lines, LlkPartial, LlkScratch, LlkSums,
-    MASKED, OBJ_TILE, StackCtl, StackRef, StackTable, UpdateSums, ViewAddr, ViewDims, Views,
-    record, view_tiles,
+    C32, Error, Exit, FUSED_SIDES, FusedBufs, FusedInputs, Kernels, Lines, LlkPartial, LlkScratch,
+    LlkSums, MASKED, OBJ_TILE, StackCtl, StackRef, StackTable, UpdateSums, ViewAddr, ViewDims,
+    Views, record, view_tiles,
 };
 
 type Z = (f64, f64);
@@ -2309,6 +2309,14 @@ fn fused_shapes_are_checked() {
             assert!(matches!(e, Error::Shape(_)), "{e:?}");
         }
     }
+    for &n in FUSED_SIDES {
+        let r = FusedBufs::new(&stream, &dims([n, n], 1), 2);
+        assert!(r.is_ok(), "side {n}: {:?}", r.err());
+    }
+    let e = FusedBufs::new(&stream, &dims([24, 32], 1), 2)
+        .err()
+        .unwrap();
+    assert!(format!("{e}").contains(&format!("{FUSED_SIDES:?}")), "{e}");
     assert!(
         matches!(FusedBufs::new(&stream, &base, 0), Err(Error::Shape(_))),
         "nf_max 0"

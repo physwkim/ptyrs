@@ -28,12 +28,33 @@ const SMEM_MAX: u32 = 48 * 1024;
 /// Most blocks along grid y.
 const GRID_Y_MAX: u64 = 65535;
 
-/// A frame side the fused FFT passes have kernels for.
-#[derive(Clone, Copy)]
-enum Side {
-    N128,
-    N256,
+/// Declares [`Side`] and [`Side::ALL`] from one list, so that they cannot disagree.
+macro_rules! sides {
+    ($($v:ident = $n:literal),+) => {
+        /// A frame side the fused FFT passes have kernels for; the discriminant is the side.
+        #[derive(Clone, Copy)]
+        #[repr(u32)]
+        enum Side {
+            $($v = $n),+
+        }
+
+        impl Side {
+            const ALL: &[Side] = &[$(Side::$v),+];
+        }
+    };
 }
+sides!(N128 = 128, N256 = 256);
+
+/// Frame sides the fused passes take along either axis, ascending.
+pub const FUSED_SIDES: &[u32] = &{
+    let mut out = [0; Side::ALL.len()];
+    let mut i = 0;
+    while i < out.len() {
+        out[i] = Side::ALL[i] as u32;
+        i += 1;
+    }
+    out
+};
 
 /// Launch shapes of the fused passes for one frame and mode count.
 #[derive(Clone, Copy)]
@@ -55,13 +76,13 @@ impl Shape {
         let bad = |what: String| Error::Shape(format!("fused passes, {d:?}: {what}"));
         // The side's kernels and its shared memory per FFT, the larger of the two directions.
         let side = |n: u32| {
-            let side = match n {
-                128 => Some(Side::N128),
-                256 => Some(Side::N256),
-                _ => None,
+            let Some(side) = Side::ALL.iter().copied().find(|&s| s as u32 == n) else {
+                return Err(bad(format!(
+                    "no fused kernels for side {n}; fused sides are {FUSED_SIDES:?}"
+                )));
             };
-            match (side, block_fft(n, false), block_fft(n, true)) {
-                (Some(side), Some(f), Some(i))
+            match (block_fft(n, false), block_fft(n, true)) {
+                (Some(f), Some(i))
                     if [f.ept, i.ept] == [FFT_EPT; 2]
                         && [f.threads_per_fft, i.threads_per_fft] == [n / FFT_EPT; 2] =>
                 {
