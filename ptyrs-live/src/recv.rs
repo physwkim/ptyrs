@@ -28,6 +28,7 @@ use serde::Deserialize;
 use crate::args::Args;
 use crate::consumer::{checksum, run_checksum_consumer};
 use crate::eiger::{EigerFrames, Progress, PullReport, run_pull};
+use crate::graph::WarmUp;
 use crate::handoff::work_queue;
 use crate::model::ModelCfg;
 use crate::pipeline::{Geometry, Placement, SourceStats, Truth, WorkerCfg, WorkerReport, worker};
@@ -289,6 +290,8 @@ impl fmt::Display for Fig {
 pub struct RecvReport {
     /// Triggers that never reached the device store.
     pub lost: u64,
+    /// Graphs captured after the warm-up.
+    pub recaptures: u64,
     /// Frames, positions and checksums that reached the GPU wrong, all checks.
     pub bad: usize,
     /// The `recv ...` lines, one per check group.
@@ -296,12 +299,14 @@ pub struct RecvReport {
 }
 
 impl RecvReport {
-    /// 2 lost, 3 wrong, else 0.
+    /// 2 lost, 3 wrong, 4 a graph captured after the warm-up, else 0.
     pub fn exit_code(&self) -> u8 {
         if self.lost > 0 {
             2
         } else if self.bad > 0 {
             3
+        } else if self.recaptures > 0 {
+            4
         } else {
             0
         }
@@ -363,10 +368,8 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
         )
         .map_err(fail("device store"))?,
     );
-    // From here on every exit, failed or not, goes through the one shutdown
-    // below: the source and its Sender go, the workers drain, the uploader
-    // lands what they committed and the consumer sees its last batch.
     let (btx, brx) = crossbeam_channel::unbounded();
+    let (cap_tx, cap_rx) = crossbeam_channel::bounded(1);
     let consumer = {
         let (ctx, store, place) = (ctx.clone(), store.clone(), place.clone());
         let batch = cfg.graph_batch;
@@ -374,10 +377,24 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
             .name("graph".into())
             .spawn(move || {
                 place.enter(place.rt.as_deref());
-                run_checksum_consumer(ctx, store, batch, brx)
+                run_checksum_consumer(ctx, store, batch, brx, cap_tx)
             })
             .unwrap()
     };
+    // The warm-up ends once the graph is captured, before any source starts.
+    let warm = match cap_rx.recv() {
+        Ok(()) => WarmUp::end(),
+        Err(_) => {
+            let failed = consumer.join().unwrap().err();
+            return Err(fail("graph capture")(failed.map_or_else(
+                || "the consumer ended before its capture".to_string(),
+                |e| e.to_string(),
+            )));
+        }
+    };
+    // From here on every exit, failed or not, goes through the one shutdown
+    // below: the source and its Sender go, the workers drain, the uploader
+    // lands what they committed and the consumer sees its last batch.
     let stop = Arc::new(AtomicBool::new(false));
     let uploader = {
         let (ring, ctx, stop, place) = (ring.clone(), ctx.clone(), stop.clone(), place.clone());
@@ -553,6 +570,7 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
     stop.store(true, Ordering::Release);
     let up = uploader.join().unwrap();
     let cons = consumer.join().unwrap();
+    let recaptures = warm.recaptures();
     let t_end = wall_ns();
     let cpu_end = process_cpu_ns();
     let (pulled, followed) = streamed?;
@@ -741,7 +759,8 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
         store.mapped_bytes() >> 20,
     ));
     line(format_args!(
-        "recv graph launches={} consumed={} checksummed={} checksum_bad={sum_bad} out_mapped_MiB={}",
+        "recv graph launches={} consumed={} checksummed={} checksum_bad={sum_bad} out_mapped_MiB={} \
+         recaptures={recaptures}",
         cons.launches,
         cons.consumed,
         cons.checksums.len(),
@@ -758,6 +777,7 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
         + consumed_bad;
     Ok(RecvReport {
         lost,
+        recaptures,
         bad,
         lines: s,
     })

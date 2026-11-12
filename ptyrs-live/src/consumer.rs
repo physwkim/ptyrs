@@ -12,7 +12,7 @@ use std::ffi::c_void;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
-use crossbeam_channel::Receiver;
+use crossbeam_channel::{Receiver, Sender};
 use cuda_bindings as sys;
 use cuda_core::{Context, IntoResult, launch_kernel_on_stream};
 use ptyrs_gpu::StackCtl;
@@ -102,12 +102,14 @@ pub struct ConsumerReport {
 }
 
 /// Consume `batches` until the uploader drops its sender, `batch` frames per
-/// replay at most.
+/// replay at most. Sends on `captured` once its one graph is captured, and
+/// drops it unsent if the capture fails.
 pub fn run_checksum_consumer(
     ctx: Arc<Context>,
     store: Arc<DeviceStore>,
     batch: NonZeroU32,
     batches: Receiver<FrameBatch>,
+    captured: Sender<()>,
 ) -> Result<ConsumerReport, GrowError> {
     ctx.bind_to_thread()?;
     let stream = ctx.new_stream()?;
@@ -143,6 +145,8 @@ pub fn run_checksum_consumer(
         }?;
         Ok(())
     })?;
+    // The waiter may have given up; the run goes on either way.
+    let _ = captured.send(());
 
     let (mut landed, mut covered, mut launches) = (0u64, 0u64, 0u64);
     let fed = (|| -> Result<(), GrowError> {
@@ -190,6 +194,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::graph::WarmUp;
     use crate::ring::{Ring, UploaderConfig, run_uploader};
     use std::num::NonZeroUsize;
 
@@ -204,10 +209,13 @@ mod tests {
         let store = Arc::new(DeviceStore::new(&ctx, total as usize, se, 1).unwrap());
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, rx) = crossbeam_channel::unbounded();
+        let (cap_tx, cap_rx) = crossbeam_channel::bounded(1);
         let consumer = {
             let (ctx, store) = (ctx.clone(), store.clone());
-            std::thread::spawn(move || run_checksum_consumer(ctx, store, batch, rx))
+            std::thread::spawn(move || run_checksum_consumer(ctx, store, batch, rx, cap_tx))
         };
+        cap_rx.recv().expect("the graph is captured");
+        let warm = WarmUp::end();
         let uploader = {
             let (ring, ctx, stop, store) = (ring.clone(), ctx.clone(), stop.clone(), store.clone());
             let cfg = UploaderConfig {
@@ -234,6 +242,7 @@ mod tests {
         let up = uploader.join().unwrap().unwrap();
         let rep = consumer.join().unwrap().unwrap();
 
+        assert_eq!(warm.recaptures(), 0);
         assert_eq!(up.frames, total);
         assert_eq!(rep.consumed, total);
         assert!(rep.launches >= total.div_ceil(u64::from(batch.get())));
