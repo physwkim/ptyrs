@@ -139,14 +139,15 @@ fn hessian_matches_central_differences() {
     assert!(rel(h_an, fd) < 1e-7, "H {h_an} differences {fd}");
 }
 
-/// Two epochs of [`Bh::epoch`] against a reference's per-step `step epoch first count beta
-/// alpha top bottom` and per-epoch object (`iy ix re0 im0 re1 im1`) and probe (`m iy ix ...`)
-/// changes.
+/// Two epochs of [`Bh::epoch`] with seed 7 against a reference's per-step `step epoch count
+/// beta alpha top bottom frames..` and per-epoch object (`iy ix re0 im0 re1 im1`) and probe
+/// (`m iy ix ...`) changes.
 fn assert_ref(batch_size: usize, steps: &str, obj: &str, probe: &str) {
     let p = state();
     let mut bh = Bh::new(BhParams {
         batch_size,
         probe_rho: 0.01,
+        seed: 7,
     });
     let (mut object, mut pr) = (p.object().clone(), p.probe().clone());
     let mut got = Vec::new();
@@ -164,24 +165,24 @@ fn assert_ref(batch_size: usize, steps: &str, obj: &str, probe: &str) {
         .collect();
     assert_eq!(got.len(), rows.len());
     for (k, ((epoch, s), r)) in got.iter().zip(&rows).enumerate() {
-        assert_eq!(
-            [k, *epoch, s.first, s.count],
-            [r[0], r[1], r[2], r[3]].map(|v| v as usize)
-        );
-        if r[4] == 0.0 {
+        let count = r[2] as usize;
+        assert_eq!([k, *epoch, count], [r[0], r[1], r[2]].map(|v| v as usize));
+        let frames: Vec<usize> = r[7..].iter().map(|&f| f as usize).collect();
+        assert_eq!((frames.len(), &s.frames), (count, &frames), "step {k}");
+        if r[3] == 0.0 {
             assert_eq!(s.beta, 0.0, "step {k}");
         } else {
             assert!(
-                rel(s.beta, r[4]) < 1e-13,
+                rel(s.beta, r[3]) < 1e-13,
                 "step {k}: beta {} ref {}",
                 s.beta,
-                r[4]
+                r[3]
             );
         }
         for (name, got, want) in [
-            ("alpha", s.alpha, r[5]),
-            ("top", s.top, r[6]),
-            ("bottom", s.bottom, r[7]),
+            ("alpha", s.alpha, r[4]),
+            ("top", s.top, r[5]),
+            ("bottom", s.bottom, r[6]),
         ] {
             assert!(rel(got, want) < 1e-13, "step {k}: {name} {got} ref {want}");
         }
