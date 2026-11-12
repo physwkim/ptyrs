@@ -1,12 +1,13 @@
 //! Per-cycle time of the M1 and the fused AP and DM cycles on CUDA device 0.
 //!
-//! `cargo run --release -p ptyrs-gpu --example fused_time -- [ncycle] [sizes]` (defaults 50,
-//! `8,16,20,25,32,40`) builds the scan of the engine's `gpu_time` (400 Fermat positions 16
-//! object pixels apart, 256 x 256 frames, 2 probe modes, 1 object mode, counts from the model)
-//! and, per comma-separated stack size, runs each cycle as the engine's M1 cycles do (object
-//! inertia 0.01, probe inertia 0.001, DM alpha 0.02 and one object-then-probe update, no LLK)
-//! and with the fused passes: 5 untimed cycles, then `ncycle` timed ones, eagerly and as
-//! replays of a graph captured from one steady cycle.
+//! `cargo run --release -p ptyrs-gpu --example fused_time -- [ncycle] [sizes] [paths]`
+//! (defaults 50, `8,16,20,25,32,40` and `ap-m1,ap-fused,dm-m1,dm-fused`) builds the scan of
+//! the engine's `gpu_time` (400 Fermat positions 16 object pixels apart, 256 x 256 frames,
+//! 2 probe modes, 1 object mode, counts from the model) and, per comma-separated stack size,
+//! runs each selected path, the engine's M1 cycles (object inertia 0.01, probe inertia 0.001,
+//! DM alpha 0.02 and one object-then-probe update, no LLK) or the fused passes: 5 untimed
+//! cycles, then `ncycle` timed ones, eagerly and as replays of a graph captured from one
+//! steady cycle.
 
 use std::f64::consts::PI;
 use std::sync::Arc;
@@ -373,7 +374,7 @@ fn rel_diff(a: &[C32], b: &[C32]) -> f64 {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let usage = "usage: fused_time [ncycle] [sizes]";
+    let usage = "usage: fused_time [ncycle] [sizes] [paths]";
     let mut args = std::env::args().skip(1);
     let ncycle: usize = args.next().map_or(Ok(50), |s| s.parse())?;
     let sizes = args.next().unwrap_or_else(|| "8,16,20,25,32,40".into());
@@ -382,6 +383,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(str::parse)
         .collect::<Result<Vec<u32>, _>>()
         .map_err(|_| usage)?;
+    let paths = args
+        .next()
+        .unwrap_or_else(|| "ap-m1,ap-fused,dm-m1,dm-fused".into());
+    let paths = paths
+        .split(',')
+        .map(|p| match p {
+            "ap-m1" => Ok((Algo::Ap, false)),
+            "ap-fused" => Ok((Algo::Ap, true)),
+            "dm-m1" => Ok((Algo::Dm, false)),
+            "dm-fused" => Ok((Algo::Dm, true)),
+            _ => Err(usage),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     if ncycle == 0 || sizes.contains(&0) || args.next().is_some() {
         return Err(usage.into());
     }
@@ -403,6 +417,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut objs = Vec::new();
             for fused in [false, true] {
                 let path = (algo, fused);
+                if !paths.contains(&path) {
+                    continue;
+                }
                 let label = if fused { "fused" } else { "m1" };
 
                 let mut run = Run::new(&stream, d, &sc.obj, &sc.probe, size)?;
@@ -436,11 +453,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "{name} size {size} {label}: eager {eager:.3} graph {replay:.3} ms/cycle over {ncycle} cycles"
                 );
             }
-            println!(
-                "{name} size {size}: object rel L2 m1 vs fused after {} eager cycles {:.2e}",
-                WARMUP + ncycle,
-                rel_diff(&objs[0], &objs[1])
-            );
+            if let [m1, fused] = &objs[..] {
+                println!(
+                    "{name} size {size}: object rel L2 m1 vs fused after {} eager cycles {:.2e}",
+                    WARMUP + ncycle,
+                    rel_diff(m1, fused)
+                );
+            }
         }
     }
     Ok(())
