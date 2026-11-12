@@ -536,6 +536,109 @@ fn object_update_skips_tiles_without_views() {
     assert!(moved > nlit / 2, "only {moved} of {nlit} pixels updated");
 }
 
+/// `obj_den_max` writes the max of `den` over the tiles with views; `normalize_obj` with that
+/// word gives the bits of `update_obj_from_sums`, and with a larger word from elsewhere (the
+/// max another device holds) the plain f32 formula at that max, on the tiles with views only.
+#[test]
+fn object_update_split_takes_the_max_it_is_given() {
+    let (stream, ex, k) = setup();
+    let s = scan_in([80, 96]);
+    let len = s.obj.len();
+    let views = Views::new(&stream, s.d, &s.views).unwrap();
+    let all = one_stack(&stream, &s.d, 0..5);
+    let probe = up(&stream, &s.probe);
+    let psi = up(&stream, &noise(s.nk(&(0..5)) * s.n(), 6, 1.0));
+    let [nyo, nxo] = s.d.obj.map(|v| v as usize);
+    let (t, ntx) = (OBJ_TILE as usize, nxo.div_ceil(OBJ_TILE as usize));
+    let tile_len = views.tile_len().to_host_vec(&stream).unwrap();
+    let lit = |i: usize| tile_len[(i / nxo % nyo) / t * ntx + i % nxo / t] != 0;
+    // Unlit pixels carry a den above every lit one: read, it would become the max.
+    let den0: Vec<f32> = (0..len).map(|i| if lit(i) { 0.0 } else { 1e30 }).collect();
+    let start = (vec![C32::default(); len], den0);
+    let accumulated = || {
+        let mut sums = sums(&stream, &start);
+        k.psi_to_obj(&ex, &views, all.at(0), &psi, &probe, &mut sums)
+            .unwrap();
+        sums
+    };
+    let host_sums = |sums: &UpdateSums| {
+        (
+            sums.num.to_host_vec(&stream).unwrap(),
+            sums.den.to_host_vec(&stream).unwrap(),
+        )
+    };
+
+    let mut joined = up(&stream, &s.obj);
+    let mut sums = accumulated();
+    let (num, den) = host_sums(&sums);
+    k.update_obj_from_sums(&ex, &views, &mut joined, &mut sums, 0.01)
+        .unwrap();
+    let joined = c32_bits(&joined.to_host_vec(&stream).unwrap());
+    let joined_sums = host_sums(&sums);
+
+    let local = (0..len)
+        .filter(|&i| lit(i))
+        .fold(0.0f32, |m, i| m.max(den[i]));
+    let mut sums = accumulated();
+    k.obj_den_max(&ex, &views, &mut sums).unwrap();
+    let word = sums.max_bits.to_host_vec(&stream).unwrap()[0];
+    assert_eq!(word, local.to_bits(), "obj_den_max");
+    let mut split = up(&stream, &s.obj);
+    let max = up(&stream, &[word]);
+    k.normalize_obj(&ex, &views, &mut split, &mut sums, &max, 0.01)
+        .unwrap();
+    assert!(
+        c32_bits(&split.to_host_vec(&stream).unwrap()) == joined,
+        "split object differs from update_obj_from_sums"
+    );
+    let split_sums = host_sums(&sums);
+    assert!(
+        c32_bits(&split_sums.0) == c32_bits(&joined_sums.0)
+            && split_sums
+                .1
+                .iter()
+                .map(|v| v.to_bits())
+                .eq(joined_sums.1.iter().map(|v| v.to_bits())),
+        "split sums differ from update_obj_from_sums"
+    );
+
+    let global = 4.0 * local;
+    let mut sums = accumulated();
+    let mut obj = up(&stream, &s.obj);
+    let max = up(&stream, &[global.to_bits()]);
+    k.normalize_obj(&ex, &views, &mut obj, &mut sums, &max, 0.01)
+        .unwrap();
+    let got = c32_bits(&obj.to_host_vec(&stream).unwrap());
+    let reg = 0.01f32 * global;
+    for i in 0..len {
+        let want = if lit(i) {
+            let d = (den[i] + reg).max(1e-12);
+            let part = |a: f32, b: f32| (a + reg * b) / d;
+            let (a, b) = (num[i], s.obj[i]);
+            (part(a.re, b.re).to_bits(), part(a.im, b.im).to_bits())
+        } else {
+            c32_bits(&s.obj[i..=i])[0]
+        };
+        assert_eq!(got[i], want, "pixel {i}, tile with views: {}", lit(i));
+    }
+    let (num_after, den_after) = host_sums(&sums);
+    for i in (0..len).filter(|&i| lit(i)) {
+        assert_eq!(
+            (c32_bits(&num_after[i..=i])[0], den_after[i].to_bits()),
+            ((0, 0), 0),
+            "sums at {i} not consumed"
+        );
+    }
+    let short = DeviceBuffer::<u32>::zeroed(&stream, 0).unwrap();
+    assert!(
+        matches!(
+            k.normalize_obj(&ex, &views, &mut obj, &mut sums, &short, 0.01),
+            Err(Error::Shape(_))
+        ),
+        "max_bits without its word"
+    );
+}
+
 /// [`Views::from_parts`] over slabs with padding past each run (the live layout) gives the
 /// bits of the packed lists: a run ends at its length, not at the next tile's start.
 #[test]

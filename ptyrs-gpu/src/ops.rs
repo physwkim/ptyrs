@@ -858,6 +858,7 @@ impl Kernels {
     /// zeroing its sums. A tile whose run is empty is neither read nor written, in `obj` or
     /// `sums`, so it keeps its bits; when its `den` is zero, as in sums built zeroed (no stack
     /// adds to such a tile), every other pixel gets the bits `update_from_sums` gives it.
+    /// It is [`Self::obj_den_max`] then [`Self::normalize_obj`] with `sums.max_bits`.
     pub fn update_obj_from_sums(
         &self,
         ctx: &ExecutionContext,
@@ -866,13 +867,27 @@ impl Kernels {
         sums: &mut UpdateSums,
         inertia: f32,
     ) -> Result<(), Error> {
+        self.obj_den_max(ctx, views, sums)?;
+        let UpdateSums { num, den, max_bits } = sums;
+        self.normalize_obj_tiles(ctx, views, obj, (num, den), max_bits, inertia)
+    }
+
+    /// The first step of [`Self::update_obj_from_sums`]: the bits of `max(den)` over the
+    /// pixels of the object tiles with views into `sums.max_bits`. The max is exact and
+    /// independent of order, so the largest of several devices' words is the max over the
+    /// union of their tiles.
+    pub fn obj_den_max(
+        &self,
+        ctx: &ExecutionContext,
+        views: &Views,
+        sums: &mut UpdateSums,
+    ) -> Result<(), Error> {
         let d = &views.dims;
-        check_len("obj", obj, d.obj_len())?;
         sums.check(d.obj_len())?;
         let config = d.tile_grid();
         let [nyo, nxo] = d.obj;
         let tile_len = &views.tile_len;
-        let UpdateSums { num, den, max_bits } = sums;
+        let UpdateSums { den, max_bits, .. } = sums;
         crate::zero(ctx, max_bits)?;
         let reads = [den.storage(), tile_len.storage()];
         self.launch(ctx, &reads, &[max_bits.storage()], |stream| {
@@ -888,7 +903,45 @@ impl Kernels {
                     nxo,
                 )
             }
-        })?;
+        })
+    }
+
+    /// The second step of [`Self::update_obj_from_sums`], with `reg = inertia *
+    /// f32::from_bits(max_bits[0])` read on the device when it runs (a captured graph reads
+    /// whatever an exchange of [`Self::obj_den_max`] words left there): the update of each
+    /// pixel of the object tiles with views, zeroing its sums. `sums.max_bits` is not used.
+    pub fn normalize_obj(
+        &self,
+        ctx: &ExecutionContext,
+        views: &Views,
+        obj: &mut DeviceBuffer<C32>,
+        sums: &mut UpdateSums,
+        max_bits: &DeviceBuffer<u32>,
+        inertia: f32,
+    ) -> Result<(), Error> {
+        check_len("max_bits", max_bits, 1)?;
+        let UpdateSums { num, den, .. } = sums;
+        self.normalize_obj_tiles(ctx, views, obj, (num, den), max_bits, inertia)
+    }
+
+    /// [`Self::normalize_obj`] over `sums` as `(num, den)`, so that
+    /// [`Self::update_obj_from_sums`] can pass the max word of the same [`UpdateSums`].
+    fn normalize_obj_tiles(
+        &self,
+        ctx: &ExecutionContext,
+        views: &Views,
+        obj: &mut DeviceBuffer<C32>,
+        (num, den): (&mut DeviceBuffer<C32>, &mut DeviceBuffer<f32>),
+        max_bits: &DeviceBuffer<u32>,
+        inertia: f32,
+    ) -> Result<(), Error> {
+        let d = &views.dims;
+        check_len("obj", obj, d.obj_len())?;
+        check_len("sums.num", num, d.obj_len())?;
+        check_len("sums.den", den, d.obj_len())?;
+        let config = d.tile_grid();
+        let [nyo, nxo] = d.obj;
+        let tile_len = &views.tile_len;
         let reads = [tile_len.storage(), max_bits.storage()];
         let writes = [obj.storage(), num.storage(), den.storage()];
         let ptrs = SumPtrs {
@@ -965,12 +1018,13 @@ impl Kernels {
 /// Numerator and denominator of an object or probe update (PyNX `obj_new`, `obj_norm`),
 /// element `i` of `den` belonging to element `i` of `num`, with the scratch the update
 /// needs, so that no launch allocates. They hold what was accumulated since the last
-/// [`Kernels::update_from_sums`] or [`Kernels::update_obj_from_sums`] consumed them; the
-/// only other reset is construction.
+/// [`Kernels::update_from_sums`], [`Kernels::update_obj_from_sums`] or
+/// [`Kernels::normalize_obj`] consumed them; the only other reset is construction.
 pub struct UpdateSums {
     pub num: DeviceBuffer<C32>,
     pub den: DeviceBuffer<f32>,
-    /// One word: [`Kernels::update_from_sums`] writes the bits of `max(den)` here.
+    /// One word: [`Kernels::update_from_sums`] and [`Kernels::obj_den_max`] write the bits of
+    /// `max(den)` here.
     pub max_bits: DeviceBuffer<u32>,
 }
 
