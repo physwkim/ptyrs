@@ -2,6 +2,7 @@
 //! scans.
 
 use ptyrs_core::{AddrTable, Geometry, Object, Probe, Scan, required_obj_shape, sim};
+use ptyrs_engine::Ptycho;
 use ptyrs_nn::data::random_object;
 
 /// The engine's parity geometry (`ptyrs-engine/tests/common`).
@@ -27,16 +28,30 @@ pub fn scan(
     (scan, object, addr)
 }
 
-/// Held-out scans as `(name, object, seed)` for [`scan`]: two random objects and the engine's
-/// test object.
-pub fn held_out(frame: usize, probe: &Probe) -> Vec<(&'static str, Option<Object>, u64)> {
+/// The held-out scans as `(name, seed, scan, truth, addresses, probe)`: two of random objects
+/// and one of the engine's test object, each with the probe that reproduces its counts from the
+/// truth, since the simulator scales the intensity to its photon count.
+pub fn held_out(
+    frame: usize,
+    probe: &Probe,
+) -> Vec<(&'static str, u64, Scan, Object, AddrTable, Probe)> {
     let shape = {
         let (_, o, _) = scan(frame, probe, 0, None);
         o.plane_shape()
     };
-    vec![
+    [
         ("random", None, 2_000_000),
         ("random", None, 2_000_001),
         ("sim::object", Some(sim::object(shape)), 2_000_002),
     ]
+    .into_iter()
+    .map(|(name, object, seed)| {
+        let (scan, truth, addr) = scan(frame, probe, seed, object);
+        let p = Ptycho::new(&scan, truth.clone(), probe.clone()).unwrap();
+        let s = (p.observed().total() / p.llk().nb_photons_calc).sqrt();
+        let mut known = probe.clone();
+        known.as_mut_slice().iter_mut().for_each(|c| *c *= s);
+        (name, seed, scan, truth, addr, known)
+    })
+    .collect()
 }

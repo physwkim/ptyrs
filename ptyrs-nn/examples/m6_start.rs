@@ -80,16 +80,6 @@ fn run(alg: Alg, scan: &Scan, start: Object, probe: &Probe, epochs: usize) -> (f
     (start, history)
 }
 
-/// The probe that reproduces `scan`'s counts from `truth`: the simulator scales the intensity
-/// to its photon count.
-fn known_probe(scan: &Scan, truth: Object, probe: &Probe) -> Probe {
-    let p = Ptycho::new(scan, truth, probe.clone()).unwrap();
-    let s = (p.observed().total() / p.llk().nb_photons_calc).sqrt();
-    let mut probe = probe.clone();
-    probe.as_mut_slice().iter_mut().for_each(|c| *c *= s);
-    probe
-}
-
 /// A held-out scan, its two starts and the known probe.
 struct Case {
     name: &'static str,
@@ -109,11 +99,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let frame = predictor.config().frame[0];
     let probe = sim::probe([frame, frame], 1)?;
     let mut cases = Vec::new();
-    for (name, object, seed) in common::held_out(frame, &probe) {
-        let (scan, truth, addr) = common::scan(frame, &probe, seed, object);
+    for (name, seed, scan, _, addr, probe) in common::held_out(frame, &probe) {
         let predicted =
             predictor.initial_object(&scan.counts, mean_frame_total(&scan.counts), &addr)?;
-        let probe = known_probe(&scan, truth, &probe);
         let flat = flat_object(&addr);
         cases.push(Case {
             name,

@@ -139,8 +139,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     predictor.save(&out)?;
 
-    for (name, object, seed) in common::held_out(frame, &probe) {
-        let (scan, truth, addr) = scan(frame, &probe, seed, object);
+    for (name, _, scan, truth, addr, _) in common::held_out(frame, &probe) {
         let patches = predictor.predict(&scan.counts, mean_frame_total(&scan.counts))?;
         let want = object_patches(&truth, &addr, config.patch());
         let ones = vec![1.0; want.amp.len()];
