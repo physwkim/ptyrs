@@ -139,11 +139,14 @@ impl GrowBuf {
     /// backed yet.
     pub fn new(ctx: &Arc<Context>, capacity: usize, chunk: usize) -> Result<Self, DriverError> {
         ctx.bind_to_thread()?;
-        let chunk = vmm::align_size(chunk.max(1), vmm::allocation_granularity(ctx.cu_device())?);
+        let granule = vmm::allocation_granularity(ctx.cu_device())?;
+        let chunk = vmm::align_size(chunk.max(1), granule);
         let n = capacity.div_ceil(chunk).max(1);
         let alloc = Arc::new(Reserved {
             chunks: Mutex::new((0..n).map(|_| None).collect()),
-            va: VirtualReservation::new(n * chunk, chunk)?,
+            // Mapping needs granule alignment only, and the driver refuses
+            // an alignment that is not a power of two, as a chunk may be.
+            va: VirtualReservation::new(n * chunk, granule)?,
             ctx: ctx.clone(),
         });
         Ok(Self {
@@ -635,6 +638,22 @@ RDONE:
         assert!(b.is_mapped(5 * ck..6 * ck));
         assert_eq!(b.mapped_bytes(), 6 * ck);
         assert!(matches!(b.map(0..1), Err(GrowError::Failed)));
+    }
+
+    /// A chunk of three granules: the reservation is not chunk-aligned, and
+    /// data crosses the chunk boundary intact.
+    #[test]
+    fn a_chunk_need_not_be_a_power_of_two() {
+        let ctx = ctx();
+        let g = vmm::allocation_granularity(ctx.cu_device()).unwrap();
+        let mut b = GrowBuf::new(&ctx, 4 * g, 3 * g).unwrap();
+        assert_eq!((b.chunk_bytes(), b.capacity()), (3 * g, 6 * g));
+        b.map(0..b.capacity()).unwrap();
+        assert_eq!(b.mapped_bytes(), 6 * g);
+        let pat: Vec<u32> = (0..(2 * g / 4) as u32).collect();
+        let at = b.ptr() + (2 * g) as u64;
+        htod(at, &pat);
+        assert_eq!(dtoh(at, pat.len()), pat);
     }
 
     /// Chunks are mapped while a running kernel keeps reading the mapped
