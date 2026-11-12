@@ -29,7 +29,6 @@ idle-us = 50
 ring-slots = 1024
 # Device store capacity; `frames` when unset.
 # store-frames = 30000
-store-chunk-mib = 32
 graph-batch = 32
 rt-threads = 1
 # CPUs the threads are pinned to; unpinned when unset.

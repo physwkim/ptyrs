@@ -1,6 +1,6 @@
 //! Stand-in for the engine's live graph (DESIGN.md §3 B2, §5 invariant 9):
 //! one CUDA graph, captured before the first frame, consumes the device
-//! store batch by batch while it grows. Each replay starts with
+//! store batch by batch as frames land in it. Each replay starts with
 //! [`LiveFrames::step`], so which frames it covers is read on the GPU from
 //! the stack entry the graph advances itself; the host only lands the frames
 //! that arrived and launches the same graph again.
@@ -198,15 +198,15 @@ mod tests {
     use crate::ring::{Ring, UploaderConfig, run_uploader};
     use std::num::NonZeroUsize;
 
-    /// The input path feeds a graph captured before the first frame: the
-    /// store grows 2 MiB at a time under it and every frame is consumed
-    /// exactly once, the last replay covering a partial batch.
+    /// The input path feeds a graph captured before the first frame: frames
+    /// fill the store under it and every frame is consumed exactly once, the
+    /// last replay covering a partial batch.
     #[test]
-    fn one_graph_consumes_every_frame_while_the_store_grows() {
+    fn one_graph_consumes_every_frame_as_the_store_fills() {
         let ctx = Context::new(0).expect("GPU 0");
         let (se, total, batch) = (65536, 203u64, NonZeroU32::new(7).unwrap());
         let ring = Arc::new(Ring::new(&ctx, 16, se).unwrap());
-        let store = Arc::new(DeviceStore::new(&ctx, total as usize, se, 1).unwrap());
+        let store = Arc::new(DeviceStore::new(&ctx, total as usize, se).unwrap());
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, rx) = crossbeam_channel::unbounded();
         let (cap_tx, cap_rx) = crossbeam_channel::bounded(1);

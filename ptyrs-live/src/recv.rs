@@ -7,13 +7,12 @@
 //!
 //! The source only parses the frame metadata and hands a zero-copy slice
 //! of the received buffer to the workers. Workers reuse one image-sized
-//! scratch each; the ring, the store's address range and the events are
-//! allocated before the first frame, and the store maps device memory in
-//! `store-chunk-mib` steps as frames arrive. A graph captured once before
-//! the first frame stands in for the engine and checksums every stored
-//! frame, `graph-batch` frames per replay; with `recon` set, the live
-//! reconstruction of [`crate::follow`] takes the frames instead and is
-//! timed from the scan's end against its offline run.
+//! scratch each; the ring, the device store and the events are allocated
+//! before the first frame. A graph captured once before the first frame
+//! stands in for the engine and checksums every stored frame, `graph-batch`
+//! frames per replay; with `recon` set, the live reconstruction of
+//! [`crate::follow`] takes the frames instead and is timed from the scan's
+//! end against its offline run.
 
 use std::fmt::{self, Write as _};
 use std::net::SocketAddr;
@@ -87,7 +86,6 @@ pub struct RecvCfg {
     pub ring_slots: usize,
     /// Device store capacity; `frames` when unset.
     pub store_frames: Option<usize>,
-    pub store_chunk_mib: usize,
     pub graph_batch: NonZeroU32,
     pub rt_threads: usize,
     /// CPU list (`2-23,48-71`) the threads are pinned to; unpinned when unset.
@@ -126,7 +124,6 @@ impl Default for RecvCfg {
             idle_us: 50,
             ring_slots: 1024,
             store_frames: None,
-            store_chunk_mib: 32,
             graph_batch: NonZeroU32::new(32).unwrap(),
             rt_threads: 1,
             cpus: None,
@@ -257,7 +254,6 @@ impl RecvCfg {
             idle_us: a.get("idle-us", d.idle_us),
             ring_slots: a.get("ring-slots", d.ring_slots),
             store_frames: a.opt("store-frames"),
-            store_chunk_mib: a.get("store-chunk-mib", d.store_chunk_mib),
             graph_batch: a.get("graph-batch", d.graph_batch),
             rt_threads: a.get("rt-threads", d.rt_threads),
             cpus: a.opt("cpus"),
@@ -568,7 +564,6 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
             &ctx,
             cfg.store_frames.unwrap_or(frames as usize),
             crop * crop,
-            cfg.store_chunk_mib << 20,
         )
         .map_err(fail("device store"))?,
     );
@@ -1181,7 +1176,6 @@ mod tests {
             idle_us: 20,
             ring_slots: 256,
             store_frames: Some(2000),
-            store_chunk_mib: 16,
             graph_batch: NonZeroU32::new(8).unwrap(),
             rt_threads: 2,
             cpus: Some("2-5".into()),
@@ -1274,8 +1268,6 @@ mod tests {
             "256",
             "--store-frames",
             "2000",
-            "--store-chunk-mib",
-            "16",
             "--graph-batch",
             "8",
             "--rt-threads",
@@ -1330,7 +1322,6 @@ mod tests {
             idle-us = 20
             ring-slots = 256
             store-frames = 2000
-            store-chunk-mib = 16
             graph-batch = 8
             rt-threads = 2
             cpus = "2-5"

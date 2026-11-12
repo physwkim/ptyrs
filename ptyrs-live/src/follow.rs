@@ -567,7 +567,7 @@ mod tests {
 
         let ctx = Context::new(0).expect("GPU 0");
         let ring = Arc::new(Ring::new(&ctx, 16, n * n).unwrap());
-        let store = Arc::new(DeviceStore::new(&ctx, total, n * n, 1).unwrap());
+        let store = Arc::new(DeviceStore::new(&ctx, total, n * n).unwrap());
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, rx) = crossbeam_channel::unbounded();
         let (cap_tx, cap_rx) = crossbeam_channel::bounded(1);
