@@ -466,23 +466,27 @@ pub unsafe fn probe_terms(p: FusedPtrs, g: StackGeom) {
 /// `o * nprobe`). Each object pixel is owned by one thread, which reads and writes its sums
 /// only if its tile's run holds a view of the stack, as `kernels::psi_to_obj`; so the
 /// result does not depend on how frames are split into stacks. Reads the new waves,
-/// `probe_q`, `probe_power`, `views`; writes `sums`. Grid `(ntx, nty, nobj)` of `OBJ_TILE`
-/// tiles, block `(OBJ_TILE, OBJ_TILE, 1)`.
+/// `probe_q`, `probe_power`, `views`; writes `sums`. A stack-tile launch, as
+/// `kernels::psi_to_obj`.
 ///
 /// # Safety
 ///
 /// As `kernels::psi_to_obj`, with the new waves in place of `psi`, and `probe_q` and
-/// `probe_power` as [`probe_terms`] wrote them for this probe in place of `probe`.
+/// `probe_power` as [`probe_terms`] wrote them for this probe in place of `probe`; `seen`
+/// as `stack_tile_and_pixel` needs.
 #[device]
 pub unsafe fn gather(
     p: FusedPtrs,
     tiles: TilePtrs,
     sums: SumPtrs,
+    seen: *mut u32,
     ctl: *const StackCtl,
     g: StackGeom,
     cfg: FusedCfg,
 ) {
-    let (tile, y, x) = crate::tile_and_pixel();
+    let Some((tile, y, x)) = (unsafe { crate::stack_tile_and_pixel(p.views, seen, ctl, g) }) else {
+        return;
+    };
     if x >= g.nxo || y >= g.nyo {
         return;
     }

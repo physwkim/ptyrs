@@ -54,7 +54,7 @@ use cuda_async::device_operation::ExecutionContext;
 use cuda_core::sys::CUdeviceptr;
 use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig, RawDeviceBuffer};
 use ptyrs_kernels::pixel::{
-    LLK_CHUNK, PIXEL_THREADS, SumPtrs, TilePtrs, TileSlabs, WARP, axis_tiles,
+    LLK_CHUNK, PIXEL_THREADS, SumPtrs, TilePtrs, TileSlabs, WARP, axis_tiles, axis_tiles_max,
 };
 pub use ptyrs_kernels::pixel::{LlkPartial, MASKED, OBJ_TILE, StackCtl, StackGeom, ViewAddr};
 
@@ -119,6 +119,24 @@ impl ViewDims {
             block_dim: (OBJ_TILE, OBJ_TILE, 1),
             shared_mem_bytes: 0,
         }
+    }
+
+    /// The launch of the per-stack object kernels for stacks of at most `nf_max` frames: one
+    /// `(OBJ_TILE, OBJ_TILE)` block per tile of each frame's [`axis_tiles`] box and object
+    /// mode, so the grid scales with the stack, not with the object.
+    pub(crate) fn stack_tile_grid(&self, nf_max: u32) -> Result<LaunchConfig, Error> {
+        let [ny, nx] = self.frame;
+        let gx = u64::from(nf_max) * u64::from(axis_tiles_max(nx));
+        if gx > i32::MAX as u64 {
+            return Err(Error::Shape(format!(
+                "{self:?}: {nf_max} frames per stack exceed the object-gather grid"
+            )));
+        }
+        Ok(LaunchConfig {
+            grid_dim: (gx as u32, axis_tiles_max(ny), self.nobj),
+            block_dim: (OBJ_TILE, OBJ_TILE, 1),
+            shared_mem_bytes: 0,
+        })
     }
 
     pub(crate) fn check(&self) -> Result<(), Error> {
@@ -823,7 +841,7 @@ impl Kernels {
         check_len("psi", psi, g.nf_max as usize * d.nmode as usize * n)?;
         check_len("probe", probe, d.nprobe as usize * n)?;
         sums.check(d.obj_len())?;
-        let config = d.tile_grid();
+        let config = d.stack_tile_grid(g.nf_max)?;
         let [start, len, list] = views.tile_storages();
         let reads = [
             psi.storage(),

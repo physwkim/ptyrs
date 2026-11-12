@@ -116,6 +116,73 @@ unsafe fn mode_power(psi: *const f32, plane0: usize, nmode: u32, n: usize, at: u
     s
 }
 
+/// Warps of a `PIXEL_THREADS` block: the shared flags [`stack_tile_and_pixel`] takes.
+const BLOCK_WARPS: usize = (pixel::PIXEL_THREADS / pixel::WARP) as usize;
+
+/// This thread's object tile `ty * ntx + tx` and object pixel `(y, x)` in a stack-tile
+/// launch: grid `(nf_max * fpx, fpy, nobj)` of `(OBJ_TILE, OBJ_TILE, 1)` blocks, `fpy`,
+/// `fpx` the [`pixel::axis_tiles_max`] of the frame sides. Block `(fl * fpx + ix, iy, _)`
+/// takes tile `(y0 + iy, x0 + ix)` of the [`pixel::axis_tiles`] box of frame `fl` of the
+/// stack, and gets `None` on every thread unless the tile is in that box and in no earlier
+/// frame's: each tile some frame of the stack is binned to has exactly one block per object
+/// mode, and no other tile has one. Canonical views put a frame's modes at one position.
+///
+/// # Safety
+///
+/// `views` holds the scan's `nframe * nmode` views, `ctl` one entry, `seen` `BLOCK_WARPS`
+/// block-shared `u32`. Every thread of the block must call it: it synchronizes the block.
+#[device]
+unsafe fn stack_tile_and_pixel(
+    views: *const pixel::ViewAddr,
+    seen: *mut u32,
+    ctl: *const pixel::StackCtl,
+    g: pixel::StackGeom,
+) -> Option<(usize, u32, u32)> {
+    use cuda_device::warp;
+    use pixel::{OBJ_TILE, PIXEL_THREADS, WARP, axis_tiles, view_in_tile};
+    let fpx = pixel::axis_tiles_max(g.nx);
+    let (fl, ix, iy) = (
+        thread::blockIdx_x() / fpx,
+        thread::blockIdx_x() % fpx,
+        thread::blockIdx_y(),
+    );
+    let (f0, nf) = unsafe { pixel::stack_frames(ctl, g) };
+    if fl >= nf {
+        return None;
+    }
+    let frame = |f: u32| unsafe { *views.add((f0 + f) as usize * g.nmode as usize) };
+    let v = frame(fl);
+    let (y0, y1) = axis_tiles(v.oy, g.ny, v.fy);
+    let (x0, x1) = axis_tiles(v.ox, g.nx, v.fx);
+    let (ty, tx) = (y0 + iy, x0 + ix);
+    if ty > y1 || tx > x1 {
+        return None;
+    }
+    let t = thread::threadIdx_y() * OBJ_TILE + thread::threadIdx_x();
+    let mut earlier = false;
+    let mut j = t;
+    while j < fl && !earlier {
+        earlier = view_in_tile(frame(j), ty, tx, g.ny, g.nx);
+        j += PIXEL_THREADS;
+    }
+    let any = warp::ballot(earlier) != 0;
+    if warp::lane_id() == 0 {
+        unsafe { *seen.add((t / WARP) as usize) = any as u32 };
+    }
+    thread::sync_threads();
+    for w in 0..BLOCK_WARPS {
+        if unsafe { *seen.add(w) } != 0 {
+            return None;
+        }
+    }
+    let ntx = g.nxo.div_ceil(OBJ_TILE);
+    Some((
+        (ty * ntx + tx) as usize,
+        ty * OBJ_TILE + thread::threadIdx_y(),
+        tx * OBJ_TILE + thread::threadIdx_x(),
+    ))
+}
+
 /// This thread's object tile `ty * ntx + tx` and object pixel `(y, x)`, in a
 /// `(ntx, nty, nobj)` grid of `(OBJ_TILE, OBJ_TILE, 1)` blocks.
 #[device]
@@ -470,12 +537,8 @@ pub mod kernels {
             let mut base = 0u32;
             while base < nk {
                 let kl = base + lane;
-                let hit = kl < nk && {
-                    let v = *views.add((k0 + kl) as usize);
-                    let (y0, y1) = axis_tiles(v.oy, g.ny, v.fy);
-                    let (x0, x1) = axis_tiles(v.ox, g.nx, v.fx);
-                    y0 <= ty && ty <= y1 && x0 <= tx && tx <= x1
-                };
+                let hit =
+                    kl < nk && view_in_tile(*views.add((k0 + kl) as usize), ty, tx, g.ny, g.nx);
                 let hits = warp::ballot(hit);
                 let slot = len0 + added + (hits & warp::lanemask_lt()).count_ones();
                 if hit && slot < cap {
@@ -501,13 +564,14 @@ pub mod kernels {
     /// `v`. Each object pixel is owned by one thread, which adds its views in ascending `k`
     /// from the tile's run: the result does not depend on how frames are split into stacks.
     /// A pixel's sums are read and written only if its tile's run holds a view of the stack.
-    /// Grid `(ntx, nty, nobj)` of `OBJ_TILE` tiles, block `(OBJ_TILE, OBJ_TILE, 1)`.
+    /// A stack-tile launch ([`stack_tile_and_pixel`]): its blocks cover the tiles the stack's
+    /// frames sample, not the whole object.
     ///
     /// # Safety
     ///
-    /// As [`obj_probe_to_psi`] with `psi` read; `sums` hold `[nobj, nyo, nxo]`; `tiles` as
-    /// [`TilePtrs`] says for tile `ty * ntx + tx`, its run covering every view of the stack
-    /// that samples the tile.
+    /// As [`obj_probe_to_psi`] with `psi` read and canonical views; `sums` hold `[nobj,
+    /// nyo, nxo]`; `tiles` as [`TilePtrs`] says for tile `ty * ntx + tx`, its run covering
+    /// every view of the stack that samples the tile.
     #[kernel]
     pub unsafe fn psi_to_obj(
         psi: *const f32,
@@ -518,7 +582,11 @@ pub mod kernels {
         ctl: *const StackCtl,
         g: StackGeom,
     ) {
-        let (tile, y, x) = tile_and_pixel();
+        static mut SEEN: SharedArray<u32, BLOCK_WARPS> = SharedArray::UNINIT;
+        let seen = (&raw mut SEEN).cast::<u32>();
+        let Some((tile, y, x)) = (unsafe { stack_tile_and_pixel(views, seen, ctl, g) }) else {
+            return;
+        };
         if x >= g.nxo || y >= g.nyo {
             return;
         }
@@ -952,7 +1020,9 @@ pub mod kernels {
         g: StackGeom,
         cfg: FusedCfg,
     ) {
-        unsafe { crate::fused::gather(p, tiles, sums, ctl, g, cfg) }
+        static mut SEEN: SharedArray<u32, BLOCK_WARPS> = SharedArray::UNINIT;
+        let seen = (&raw mut SEEN).cast::<u32>();
+        unsafe { crate::fused::gather(p, tiles, sums, seen, ctl, g, cfg) }
     }
 
     /// [`crate::fused::probe_terms`].

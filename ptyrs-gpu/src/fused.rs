@@ -564,7 +564,7 @@ impl<'a> Run<'a> {
             list,
             self.stack.storage(),
         ];
-        let config = views.dims().tile_grid();
+        let config = views.dims().stack_tile_grid(self.g.nf_max)?;
         let (tiles, ctl, g) = (views.tile_ptrs(), self.ctl(), self.g);
         self.k.launch(self.ctx, &reads, &sums.storages(), |stream| {
             // SAFETY: as `psi_to_obj`, with `waves` where `cfg` has pass C store them and
