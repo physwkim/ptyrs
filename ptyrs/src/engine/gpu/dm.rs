@@ -18,8 +18,14 @@ impl GpuPtycho {
     /// from; after the update of each cycle that records one, `Σ|O|` and `Σ|P|` are balanced
     /// with `O P` unchanged (PyNX `ScaleObjProbe(absolute=False)`). With stepped features, a
     /// pass of their own first takes the far sums of `PO` under the cycle-start model and
-    /// steps them, and the projection models the stepped values.
+    /// steps them, and the projection models the stepped values. Refuses a position: the
+    /// fused DM projection takes no sums under one yet.
     pub fn dm(&mut self, params: &DmParams, ncycle: usize) -> Result<(), EngineError> {
+        if self.dev.has_position() {
+            return Err(EngineError::Invalid(
+                "DM refines no positions on the GPU yet".into(),
+            ));
+        }
         for ic in 0..ncycle {
             let epoch = Epoch::Dm {
                 params: *params,
@@ -68,6 +74,8 @@ impl Bufs<'_> {
                     // No record, so nothing ended.
                     let _ = self.step_features(ctx, f, None)?;
                 }
+                let dims = *self.views.dims();
+                let m = self.features.lend(ctx, self.kernels, &dims, self.probe)?;
                 for s in 0..self.stacks.len() {
                     let stack = self.table.at(s);
                     let psi = self.stacks.get(s).psi;
@@ -76,7 +84,7 @@ impl Bufs<'_> {
                         counts: self.counts,
                         obj: self.obj,
                         probe: self.probe,
-                        model: self.features.model(),
+                        model: m.model,
                     };
                     let exit = if first {
                         Exit::DmFirst { psi }

@@ -19,8 +19,10 @@ impl GpuPtycho {
     /// Polak–Ribière direction and the Poisson quadratic step along it; each cycle is one
     /// graph and nothing reads back until the call's end. With stepped features, a pass of
     /// their own first takes the LLK and the far sums of the estimate under the cycle-start
-    /// model and steps them, and the cycle models the stepped values.
+    /// model and steps them, and the cycle models the stepped values. Refuses a position, as
+    /// the CPU's does.
     pub fn ml(&mut self, params: &MlParams, ncycle: usize) -> Result<(), EngineError> {
+        self.refuse_position()?;
         self.dev.scale_to_photons(self.total_obs as f32)?;
         for ic in 0..ncycle {
             let epoch = Epoch::Ml {
@@ -39,8 +41,10 @@ impl GpuPtycho {
     }
 
     /// The ML gradients of the current estimate in `f32`, object then probe, as
-    /// [`crate::engine::Ptycho::obj_grad`] and [`crate::engine::Ptycho::probe_grad`] give them.
+    /// [`crate::engine::Ptycho::obj_grad`] and [`crate::engine::Ptycho::probe_grad`] give them;
+    /// refuses a position, as [`Self::ml`] does.
     pub fn ml_grads(&mut self) -> Result<[Stack<C64>; 2], EngineError> {
+        self.refuse_position()?;
         let [obj, probe] = self.dev.ml_grads()?;
         let widen = |v: Vec<_>, dims| {
             let v = v
@@ -49,6 +53,14 @@ impl GpuPtycho {
             Stack::from_vec(dims, v.collect())
         };
         Ok([widen(obj, self.obj_dims)?, widen(probe, self.probe_dims)?])
+    }
+
+    /// The refusal of a position by [`Self::ml`] and [`Self::ml_grads`].
+    fn refuse_position(&self) -> Result<(), EngineError> {
+        if self.dev.has_position() {
+            return Err(EngineError::Invalid("ML refines no positions".into()));
+        }
+        Ok(())
     }
 }
 
@@ -101,6 +113,7 @@ impl Bufs<'_> {
 
         // γ along d, then the step.
         let dims = *self.views.dims();
+        let m = self.features.lend(ctx, self.kernels, &dims, self.probe)?;
         for s in 0..self.stacks.len() {
             let stack = self.table.at(s);
             let x = [&*self.obj, &*self.probe];
@@ -113,7 +126,7 @@ impl Bufs<'_> {
             }
             let obs = GammaCounts {
                 counts: self.counts,
-                model: self.features.model(),
+                model: m.model,
             };
             self.grad
                 .gamma_frames(ctx, &dims, stack, obs, ml.fields, ml.gamma_parts)?;
@@ -141,47 +154,51 @@ impl Bufs<'_> {
         update: [bool; 2],
         mut llk: Option<RecordWriter<'_>>,
     ) -> Result<Option<Ended>, GpuError> {
-        for s in 0..self.stacks.len() {
-            match passes {
-                PassesMut::Fused(f) => self.fused_grad(ctx, f, s, update, llk.as_mut())?,
-                PassesMut::M1(_) => self.m1_grad(ctx, ml, s, update, llk.as_mut())?,
+        match passes {
+            PassesMut::Fused(f) => self.fused_grad(ctx, f, update, llk.as_mut())?,
+            PassesMut::M1(_) => {
+                for s in 0..self.stacks.len() {
+                    self.m1_grad(ctx, ml, s, update, llk.as_mut())?;
+                }
             }
         }
         llk.map(|w| w.end(ctx)).transpose()
     }
 
-    /// Stack `s` of [`Self::ml_grad`] by one fused pass.
+    /// The stacks of [`Self::ml_grad`] by one fused pass each.
     fn fused_grad(
         &mut self,
         ctx: &ExecutionContext,
         f: &mut FusedBufs,
-        s: usize,
         update: [bool; 2],
-        llk: Option<&mut RecordWriter<'_>>,
+        mut llk: Option<&mut RecordWriter<'_>>,
     ) -> Result<(), GpuError> {
         let dims = *self.views.dims();
-        let stack = self.table.at(s);
-        let inputs = FusedInputs {
-            views: self.views,
-            counts: self.counts,
-            obj: self.obj,
-            probe: self.probe,
-            model: self.features.model(),
-        };
-        let far = FarSums {
-            llk: llk.is_some().then_some(&mut *self.llk),
-            ..FarSums::default()
-        };
-        let exit = Exit::Grad { far };
-        let sums = FusedSums {
-            obj: update[0].then_some(&mut *self.obj_sums),
-            probe: update[1].then_some(&mut *self.probe_sums),
-            ..FusedSums::default()
-        };
-        self.kernels
-            .fused_project(ctx, &inputs, stack, exit, f, sums)?;
-        if let Some(rec) = llk {
-            rec.push(ctx, &dims, stack, self.llk)?;
+        let m = self.features.lend(ctx, self.kernels, &dims, self.probe)?;
+        for s in 0..self.stacks.len() {
+            let stack = self.table.at(s);
+            let inputs = FusedInputs {
+                views: self.views,
+                counts: self.counts,
+                obj: self.obj,
+                probe: self.probe,
+                model: m.model,
+            };
+            let far = FarSums {
+                llk: llk.is_some().then_some(&mut *self.llk),
+                ..FarSums::default()
+            };
+            let exit = Exit::Grad { far };
+            let sums = FusedSums {
+                obj: update[0].then_some(&mut *self.obj_sums),
+                probe: update[1].then_some(&mut *self.probe_sums),
+                ..FusedSums::default()
+            };
+            self.kernels
+                .fused_project(ctx, &inputs, stack, exit, f, sums)?;
+            if let Some(rec) = &mut llk {
+                rec.push(ctx, &dims, stack, self.llk)?;
+            }
         }
         Ok(())
     }
@@ -245,7 +262,7 @@ impl Bufs<'_> {
                 .forward_inplace(ctx, psi)?;
             self.kernels
                 .llk(ctx, stack, self.counts, psi, self.llk_scratch, self.llk)?;
-            let scale = self.features.model().scale;
+            let scale = self.features.scale();
             self.grad
                 .icalc_add(ctx, &dims, stack, self.llk, scale, ml.icalc)?;
         }

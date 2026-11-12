@@ -16,7 +16,9 @@ impl GpuPtycho {
     /// last stack, both updates from the sums, which read only the old arrays. With stepped
     /// features, a pass of their own first takes the LLK and the far sums of the estimate
     /// under the cycle-start model and steps them, and the projection models the stepped
-    /// values.
+    /// values. With a position, every pass models the probe moved by each frame's offsets,
+    /// the projection also takes each frame's position sums against the arrays it read, and
+    /// the offsets step after the updates.
     pub fn ap(&mut self, params: &ApParams, ncycle: usize) -> Result<(), EngineError> {
         for ic in 0..ncycle {
             let epoch = Epoch::Ap {
@@ -51,9 +53,9 @@ impl Bufs<'_> {
             }
             _ => None,
         };
-        for s in 0..self.stacks.len() {
-            match passes {
-                PassesMut::M1(m1) => {
+        match passes {
+            PassesMut::M1(m1) => {
+                for s in 0..self.stacks.len() {
                     self.kernels.obj_probe_to_psi(
                         ctx,
                         self.views,
@@ -65,59 +67,67 @@ impl Bufs<'_> {
                     self.project(ctx, m1, s, llk.as_mut())?;
                     self.accumulate(ctx, s, o.is_some(), p.is_some())?;
                 }
-                PassesMut::Fused(f) => {
-                    self.fused_ap(ctx, f, s, llk.as_mut(), o.is_some(), p.is_some())?
-                }
             }
+            PassesMut::Fused(f) => self.fused_ap(ctx, f, llk.as_mut(), o.is_some(), p.is_some())?,
         }
         let ended = llk.map(|w| w.end(ctx)).transpose()?.or(stepped);
         self.apply_sums(ctx, o, p)?;
+        self.features.position_step(ctx, self.grad)?;
         Ok(ended)
     }
 
-    /// Stack `s` of an AP cycle by the fused passes: the projection with its LLK partials and
-    /// the object sums, then the probe sums from the projected exit waves it leaves in `f`.
+    /// The stacks of an AP cycle by the fused passes: per stack the projection with its LLK
+    /// partials and the object sums, then the probe sums from the projected exit waves it
+    /// leaves in `f`. With a position, the projection adds the shifted probe's sums and each
+    /// frame's position sums instead, and the shifted probe's become probe sums after the
+    /// last stack.
     fn fused_ap(
         &mut self,
         ctx: &ExecutionContext,
         f: &mut FusedBufs,
-        s: usize,
-        llk: Option<&mut RecordWriter<'_>>,
+        mut llk: Option<&mut RecordWriter<'_>>,
         obj: bool,
         probe: bool,
     ) -> Result<(), GpuError> {
         let dims = *self.views.dims();
-        let stack = self.table.at(s);
-        let inputs = FusedInputs {
-            views: self.views,
-            counts: self.counts,
-            obj: self.obj,
-            probe: self.probe,
-            model: self.features.model(),
-        };
-        let far = FarSums {
-            llk: llk.is_some().then_some(&mut *self.llk),
-            ..FarSums::default()
-        };
-        let exit = Exit::Ap { far };
-        let sums = FusedSums {
-            obj: obj.then_some(&mut *self.obj_sums),
-            ..FusedSums::default()
-        };
-        self.kernels
-            .fused_project(ctx, &inputs, stack, exit, f, sums)?;
-        if let Some(rec) = llk {
-            rec.push(ctx, &dims, stack, self.llk)?;
+        let mut m = self.features.lend(ctx, self.kernels, &dims, self.probe)?;
+        for s in 0..self.stacks.len() {
+            let stack = self.table.at(s);
+            let inputs = FusedInputs {
+                views: self.views,
+                counts: self.counts,
+                obj: self.obj,
+                probe: self.probe,
+                model: m.model,
+            };
+            let far = FarSums {
+                llk: llk.is_some().then_some(&mut *self.llk),
+                ..FarSums::default()
+            };
+            let exit = Exit::Ap { far };
+            let sums = FusedSums {
+                obj: obj.then_some(&mut *self.obj_sums),
+                shift: m.shift_sums(probe),
+                ..FusedSums::default()
+            };
+            self.kernels
+                .fused_project(ctx, &inputs, stack, exit, f, sums)?;
+            if let Some(rec) = &mut llk {
+                rec.push(ctx, &dims, stack, self.llk)?;
+            }
+            if probe && !m.shifted() {
+                self.kernels.psi_to_probe(
+                    ctx,
+                    self.views,
+                    stack,
+                    f.work(),
+                    self.obj,
+                    self.probe_sums,
+                )?;
+            }
         }
         if probe {
-            self.kernels.psi_to_probe(
-                ctx,
-                self.views,
-                stack,
-                f.work(),
-                self.obj,
-                self.probe_sums,
-            )?;
+            m.probe_sums(ctx, self.kernels, &dims, self.probe_sums)?;
         }
         Ok(())
     }

@@ -18,7 +18,7 @@ use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig};
 pub use ptyrs_kernels::grad::{CG_BLOCKS, GAMMA_CHUNK};
 use ptyrs_kernels::grad::{GammaPtrs, NormPtrs, ObjProbePtrs, grad_kernels};
-use ptyrs_kernels::pixel::{PIXEL_THREADS, SumPtrs};
+use ptyrs_kernels::pixel::{PIXEL_THREADS, PositionPartial, SumPtrs};
 
 use crate::gpu::ops::grid_1d;
 use crate::gpu::{
@@ -589,6 +589,48 @@ impl GradKernels {
                 unsafe {
                     self.module
                         .cg_scale_step(stream, config, dptr(scale), dptr(sums), n)
+                }
+            })
+    }
+
+    /// pty-chi's gradient step of the offsets `[nframe, 2]` (as [`crate::gpu::Shift`]'s) from
+    /// each frame's position sums ([`crate::gpu::ShiftSums`]): per axis, `s = clamp(step num /
+    /// (den + max den), -limit, limit)`, 0 where that denominator is not above 0, then `d +=
+    /// s - mean s`.
+    pub fn position_step(
+        &self,
+        ctx: &ExecutionContext,
+        offsets: &mut DeviceBuffer<f32>,
+        sums: [&DeviceBuffer<PositionPartial>; 2],
+        [step, limit]: [f32; 2],
+    ) -> Result<(), Error> {
+        let [num, den] = sums;
+        let nframe = num.len();
+        check_len("offsets", offsets, 2 * nframe)?;
+        check_len("den", den, nframe)?;
+        let n = u32::try_from(nframe)
+            .map_err(|_| Error::Shape(format!("{nframe} frames exceed u32")))?;
+        let config = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (PIXEL_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let reads = [num.storage(), den.storage()];
+        self.base
+            .launch(ctx, &reads, &[offsets.storage()], |stream| {
+                // SAFETY: `offsets` holds `2 nframe` floats, `num` and `den` `nframe`
+                // entries; one PIXEL_THREADS block.
+                unsafe {
+                    self.module.cg_position_step(
+                        stream,
+                        config,
+                        dptr(offsets),
+                        dptr(num),
+                        dptr(den),
+                        n,
+                        step,
+                        limit,
+                    )
                 }
             })
     }

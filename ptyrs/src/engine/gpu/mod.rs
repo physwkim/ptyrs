@@ -501,10 +501,10 @@ impl Bufs<'_> {
         mut rec: RecordWriter<'_>,
     ) -> Result<Ended, GpuError> {
         let dims = *self.views.dims();
-        for s in 0..self.stacks.len() {
-            let stack = self.table.at(s);
-            match passes {
-                PassesMut::M1(m1) => {
+        match passes {
+            PassesMut::M1(m1) => {
+                for s in 0..self.stacks.len() {
+                    let stack = self.table.at(s);
                     self.kernels.obj_probe_to_psi(
                         ctx, self.views, stack, self.obj, self.probe, m1.scratch,
                     )?;
@@ -518,23 +518,28 @@ impl Bufs<'_> {
                         self.llk_scratch,
                         self.llk,
                     )?;
+                    rec.push(ctx, &dims, stack, self.llk)?;
                 }
-                PassesMut::Fused(f) => {
+            }
+            PassesMut::Fused(f) => {
+                let m = self.features.lend(ctx, self.kernels, &dims, self.probe)?;
+                for s in 0..self.stacks.len() {
+                    let stack = self.table.at(s);
                     let inputs = FusedInputs {
                         views: self.views,
                         counts: self.counts,
                         obj: self.obj,
                         probe: self.probe,
-                        model: self.features.model(),
+                        model: m.model,
                     };
                     let far = FarSums {
                         llk: Some(&mut *self.llk),
                         ..FarSums::default()
                     };
                     self.kernels.fused_llk(ctx, &inputs, stack, f, far)?;
+                    rec.push(ctx, &dims, stack, self.llk)?;
                 }
             }
-            rec.push(ctx, &dims, stack, self.llk)?;
         }
         rec.end(ctx)
     }
@@ -549,16 +554,17 @@ impl Bufs<'_> {
         mut llk: Option<RecordWriter<'_>>,
     ) -> Result<Option<Ended>, GpuError> {
         let dims = *self.views.dims();
+        let mut m = self.features.lend(ctx, self.kernels, &dims, self.probe)?;
         for s in 0..self.stacks.len() {
             let stack = self.table.at(s);
-            let (model, far) = self.features.far(llk.is_some().then_some(&mut *self.llk));
             let inputs = FusedInputs {
                 views: self.views,
                 counts: self.counts,
                 obj: self.obj,
                 probe: self.probe,
-                model,
+                model: m.model,
             };
+            let far = m.far(llk.is_some().then_some(&mut *self.llk));
             self.kernels.fused_llk(ctx, &inputs, stack, f, far)?;
             if let Some(rec) = &mut llk {
                 rec.push(ctx, &dims, stack, self.llk)?;

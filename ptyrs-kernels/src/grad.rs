@@ -463,6 +463,78 @@ pub mod grad_kernels {
         }
     }
 
+    /// pty-chi's gradient position step on the offsets `[nframe, 2]`, `(dy, dx)` per frame,
+    /// from each frame's position sums `num` and `den`: per axis, `s = clamp(step num / (den +
+    /// max den), -limit, limit)`, 0 where that denominator is not above 0, then `d += s -
+    /// mean s`.
+    ///
+    /// # Safety
+    ///
+    /// `offsets` holds `2 nframe` floats, `num` and `den` `nframe` entries; one
+    /// `(PIXEL_THREADS, 1, 1)` block.
+    #[kernel]
+    pub unsafe fn cg_position_step(
+        offsets: *mut f32,
+        num: *const PositionPartial,
+        den: *const PositionPartial,
+        nframe: u32,
+        step: f32,
+        limit: f32,
+    ) {
+        static mut RED: SharedArray<f32, 1024> = SharedArray::UNINIT;
+        let t = thread::threadIdx_x() as usize;
+        let seg = PIXEL_THREADS as usize;
+        let (n, s) = (nframe as usize, (&raw mut RED).cast::<f32>());
+        let mut max = [0.0f32; 2];
+        let mut f = t;
+        while f < n {
+            let d = unsafe { *den.add(f) };
+            for (m, d) in max.iter_mut().zip([d.dy, d.dx]) {
+                if d > *m {
+                    *m = d;
+                }
+            }
+            f += seg;
+        }
+        let max = unsafe {
+            *s.add(t) = max[0];
+            *s.add(seg + t) = max[1];
+            super::block_max::<2>(s);
+            [*s, *s.add(seg)]
+        };
+        let steps = |f: usize| {
+            let (p, d) = unsafe { (*num.add(f), *den.add(f)) };
+            [
+                super::position_axis_step(p.dy, d.dy + max[0], step, limit),
+                super::position_axis_step(p.dx, d.dx + max[1], step, limit),
+            ]
+        };
+        let mut acc = [0.0f32; 2];
+        let mut f = t;
+        while f < n {
+            let st = steps(f);
+            acc = [acc[0] + st[0], acc[1] + st[1]];
+            f += seg;
+        }
+        // The sums take the next two segments: the maxima just read may still be unread.
+        let mean = unsafe {
+            let s = s.add(2 * seg);
+            *s.add(t) = acc[0];
+            *s.add(seg + t) = acc[1];
+            crate::block_sum::<2>(s);
+            [*s / nframe as f32, *s.add(seg) / nframe as f32]
+        };
+        let mut f = t;
+        while f < n {
+            let st = steps(f);
+            unsafe {
+                *offsets.add(2 * f) += st[0] - mean[0];
+                *offsets.add(2 * f + 1) += st[1] - mean[1];
+            }
+            f += seg;
+        }
+    }
+
     /// PyNX `cu_linear_comb_fcfc_gamma`: with `gamma = gamma_pair[0] / gamma_pair[1]`,
     /// `x += gamma d` if `gamma` is finite, else `x` stays and `d = -h` (with `h` this cycle's
     /// gradient, as `cg_beta_parts` leaves it).
@@ -487,6 +559,51 @@ pub mod grad_kernels {
             }
         }
     }
+}
+
+/// `clamp(step num / den, -limit, limit)` of `cg_position_step`, 0 unless `den > 0`; NaN stays.
+#[device]
+fn position_axis_step(num: f32, den: f32, step: f32, limit: f32) -> f32 {
+    if den > 0.0 {
+        let s = step * num / den;
+        if s > limit {
+            limit
+        } else if s < -limit {
+            -limit
+        } else {
+            s
+        }
+    } else {
+        0.0
+    }
+}
+
+/// Tree maxima of `K` segments of `PIXEL_THREADS` shared values, each into its element 0, as
+/// [`crate::block_sum`] sums them; every thread must call it.
+///
+/// # Safety
+///
+/// `s` must point to `K * PIXEL_THREADS` block-shared floats, each written by its thread.
+#[device]
+unsafe fn block_max<const K: usize>(s: *mut f32) {
+    let t = thread::threadIdx_x() as usize;
+    let seg = PIXEL_THREADS as usize;
+    let mut half = seg / 2;
+    while half > 0 {
+        thread::sync_threads();
+        if t < half {
+            for j in 0..K {
+                unsafe {
+                    let (a, b) = (s.add(j * seg + t), *s.add(j * seg + t + half));
+                    if b > *a {
+                        *a = b;
+                    }
+                }
+            }
+        }
+        half /= 2;
+    }
+    thread::sync_threads();
 }
 
 /// Block sums of each thread's `acc`, returned to every thread; `s` is two `PIXEL_THREADS`

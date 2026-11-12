@@ -361,8 +361,8 @@ pub fn obj_probe_shift_to_psi(p: &Ptycho, views: &[View], offsets: &[[f64; 2]], 
 }
 
 /// pty-chi's position step size and per-axis update limit, in object pixels.
-const POSITION_STEP: f64 = 0.3;
-const POSITION_LIMIT: f64 = 0.1;
+pub(crate) const POSITION_STEP: f64 = 0.3;
+pub(crate) const POSITION_LIMIT: f64 = 0.1;
 
 /// A probe under [`Features::position`]: its spectra and every view's moved probe `W`, which
 /// take the place of `q·P` in the operators of [`crate::engine::ops`].
