@@ -6,15 +6,25 @@
 //! `PTYRS_CUDA_ARCH`, default `sm_89`, to change it). [`Kernels::load`] loads it into a
 //! context.
 //!
-//! Every launch method checks buffer lengths against the shape it is given, then enqueues on
-//! `stream` and returns. Each buffer it touches is leased on that stream until the kernel
+//! Every launch method checks buffer lengths against the shape it is given, registers each
+//! buffer it touches with the cuda-async `ExecutionContext` it is given ([`lease`]), enqueues
+//! on that context's stream and returns. No method allocates or synchronizes, so each is
+//! legal inside `CudaGraph::capture`; [`record`] turns a sequence of them into the
+//! `DeviceOp` to capture. Eagerly (`ExecutionContext::new(stream)`, or
+//! `record(..).sync_on(&stream)`) the leases last until the context is dropped and its work
 //! completes: dropping a buffer early is safe, and a conflicting access to it from another
-//! stream fails with `CUDA_ERROR_NOT_READY` until then. Work on one stream runs in order.
+//! stream fails with `CUDA_ERROR_NOT_READY` until then. A captured graph instead keeps the
+//! accesses and reacquires them on every replay. Work on one stream runs in order.
 
+use std::future::IntoFuture;
 use std::sync::Arc;
 
+use cuda_async::device_context::with_default_device_policy;
+use cuda_async::device_future::DeviceFuture;
+use cuda_async::device_operation::{DeviceOp, ExecutionContext};
+use cuda_async::error::DeviceError;
 use cuda_core::{
-    AllocationLease, CudaContext, CudaStream, DeviceBuffer, DeviceCopy, DriverError, LaunchConfig,
+    CudaContext, CudaStream, DeviceBuffer, DeviceCopy, DriverError, LaunchConfig, RawDeviceBuffer,
 };
 use ptyrs_kernels::kernels::LoadedModule;
 
@@ -57,6 +67,8 @@ pub fn block_fft(n: u32, inverse: bool) -> Option<BlockFft> {
 #[derive(Debug)]
 pub enum Error {
     Driver(DriverError),
+    /// A cuda-async error, e.g. a lease refused because another stream holds the buffer.
+    Device(DeviceError),
     /// The device's compute capability is not the one [`CUBIN`] was built for.
     Arch {
         built: &'static str,
@@ -72,6 +84,7 @@ impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Driver(e) => write!(f, "CUDA driver error: {e:?}"),
+            Self::Device(e) => write!(f, "{e}"),
             Self::Arch { built, device } => write!(
                 f,
                 "kernels were built for {built}, device is sm_{}{}; rebuild with \
@@ -89,6 +102,103 @@ impl std::error::Error for Error {}
 impl From<DriverError> for Error {
     fn from(e: DriverError) -> Self {
         Self::Driver(e)
+    }
+}
+
+impl From<DeviceError> for Error {
+    fn from(e: DeviceError) -> Self {
+        Self::Device(e)
+    }
+}
+
+impl From<Error> for DeviceError {
+    fn from(e: Error) -> Self {
+        match e {
+            Error::Device(e) => e,
+            Error::Driver(e) => Self::Driver(e),
+            e => Self::Launch(e.to_string()),
+        }
+    }
+}
+
+/// Registers `reads` and `writes` with `ctx` before work touching them is enqueued on its
+/// stream. Eagerly, each is leased until `ctx`'s work completes; while `ctx` records a
+/// capture, the graph keeps the access and reacquires it on every replay.
+pub fn lease(
+    ctx: &ExecutionContext,
+    reads: &[&RawDeviceBuffer],
+    writes: &[&RawDeviceBuffer],
+) -> Result<(), Error> {
+    let all = || {
+        reads
+            .iter()
+            .map(|b| (b, false))
+            .chain(writes.iter().map(|b| (b, true)))
+    };
+    if all().any(|(b, _)| b.context().as_ref() != ctx.context().as_ref()) {
+        return Err(Error::ContextMismatch);
+    }
+    for (buf, write) in all() {
+        ctx.retain_buffer((*buf).clone(), write)?;
+    }
+    Ok(())
+}
+
+/// Zeroes `buf` on `ctx`'s stream (a memset node under capture), leased like a launch.
+pub fn zero<T: DeviceCopy>(ctx: &ExecutionContext, buf: &mut DeviceBuffer<T>) -> Result<(), Error> {
+    if buf.num_bytes() == 0 {
+        return Ok(());
+    }
+    lease(ctx, &[], &[buf.storage()])?;
+    ctx.context().bind_to_thread()?;
+    // SAFETY: the range is `buf`'s whole allocation, leased for writing on this stream.
+    unsafe {
+        cuda_core::memory::memset_d8_async(
+            buf.cu_deviceptr(),
+            0,
+            buf.num_bytes(),
+            ctx.get_cuda_stream().cu_stream(),
+        )?
+    };
+    Ok(())
+}
+
+/// The `DeviceOp` that runs `f` on the context it executes on: what
+/// `CudaGraph::capture` takes for a sequence of these launches, or what runs one eagerly
+/// with `.sync_on(&stream)`. An error from `f` fails the op, and so the capture.
+pub fn record<F>(f: F) -> Record<F>
+where
+    F: FnOnce(&ExecutionContext) -> Result<(), Error> + Send,
+{
+    Record(f)
+}
+
+/// See [`record`].
+pub struct Record<F>(F);
+
+impl<F> DeviceOp for Record<F>
+where
+    F: FnOnce(&ExecutionContext) -> Result<(), Error> + Send,
+{
+    type Output = ();
+
+    unsafe fn execute(self, ctx: &ExecutionContext) -> Result<(), DeviceError> {
+        Ok((self.0)(ctx)?)
+    }
+}
+
+impl<F> IntoFuture for Record<F>
+where
+    F: FnOnce(&ExecutionContext) -> Result<(), Error> + Send,
+{
+    type Output = Result<(), DeviceError>;
+    type IntoFuture = DeviceFuture<(), Self>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        match with_default_device_policy(|policy| policy.next_stream()) {
+            Ok(Ok(stream)) => DeviceFuture::scheduled(self, ExecutionContext::new(stream)),
+            Ok(Err(e)) | Err(e) => DeviceFuture::failed(e),
+        }
     }
 }
 
@@ -165,38 +275,25 @@ impl Kernels {
         &self.ctx
     }
 
-    /// Leases `reads` and `writes` on `stream`, runs `enqueue`, and keeps the leases until
-    /// the work it enqueued completes.
+    /// [`lease`]s `reads` and `writes` with `ctx`, then runs `enqueue` on its stream.
     fn launch(
         &self,
-        stream: &CudaStream,
-        reads: &[&cuda_core::RawDeviceBuffer],
-        writes: &[&cuda_core::RawDeviceBuffer],
-        enqueue: impl FnOnce() -> Result<(), DriverError>,
+        ctx: &ExecutionContext,
+        reads: &[&RawDeviceBuffer],
+        writes: &[&RawDeviceBuffer],
+        enqueue: impl FnOnce(&CudaStream) -> Result<(), DriverError>,
     ) -> Result<(), Error> {
-        if stream.context().as_ref() != self.ctx.as_ref() {
+        if ctx.context().as_ref() != self.ctx.as_ref() {
             return Err(Error::ContextMismatch);
         }
-        let mut leases: Vec<AllocationLease> = Vec::with_capacity(reads.len() + writes.len());
-        for (bufs, write) in [(reads, false), (writes, true)] {
-            for buf in bufs {
-                if buf.context().as_ref() != self.ctx.as_ref() {
-                    return Err(Error::ContextMismatch);
-                }
-                leases.push(buf.acquire(stream, write, false)?);
-            }
-        }
-        enqueue()?;
-        for lease in leases {
-            lease.retain_until_complete(stream)?;
-        }
-        Ok(())
+        lease(ctx, reads, writes)?;
+        Ok(enqueue(ctx.get_cuda_stream())?)
     }
 
     /// `x[i] *= s` for the first `n` values of `x`.
     pub fn scale_c32(
         &self,
-        stream: &CudaStream,
+        ctx: &ExecutionContext,
         x: &mut DeviceBuffer<C32>,
         n: u32,
         s: f32,
@@ -205,7 +302,7 @@ impl Kernels {
         if n == 0 {
             return Ok(());
         }
-        self.launch(stream, &[], &[x.storage()], || {
+        self.launch(ctx, &[], &[x.storage()], |stream| {
             // SAFETY: `x` holds `n` values and the kernel guards its 1D index against `n`.
             unsafe {
                 self.module
@@ -219,7 +316,7 @@ impl Kernels {
     /// cuFFT call; [`BLOCK_FFTS`] lists the sizes `n` built in.
     pub fn fft_lines(
         &self,
-        stream: &CudaStream,
+        ctx: &ExecutionContext,
         input: &DeviceBuffer<C32>,
         output: &mut DeviceBuffer<C32>,
         lines: Lines,
@@ -229,7 +326,7 @@ impl Kernels {
         check_len("input", input, need)?;
         check_len("output", output, need)?;
         let (launch, config) = fft_lines_launch(lines, inverse)?;
-        self.launch(stream, &[input.storage()], &[output.storage()], || {
+        self.launch(ctx, &[input.storage()], &[output.storage()], |stream| {
             // SAFETY: both buffers hold `lines`, whose lines do not overlap; `config` is the
             // launch shape the kernel documents.
             unsafe {
@@ -250,14 +347,14 @@ impl Kernels {
     /// [`Self::fft_lines`] in place.
     pub fn fft_lines_inplace(
         &self,
-        stream: &CudaStream,
+        ctx: &ExecutionContext,
         data: &mut DeviceBuffer<C32>,
         lines: Lines,
         inverse: bool,
     ) -> Result<(), Error> {
         check_len("data", data, lines.extent()?)?;
         let (launch, config) = fft_lines_launch(lines, inverse)?;
-        self.launch(stream, &[], &[data.storage()], || {
+        self.launch(ctx, &[], &[data.storage()], |stream| {
             // SAFETY: as in `fft_lines`; each thread reads its elements before the FFT's
             // block barrier and writes them after it.
             unsafe {

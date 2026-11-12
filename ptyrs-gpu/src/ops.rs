@@ -43,6 +43,7 @@
 
 use std::ops::Range;
 
+use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig};
 pub use ptyrs_kernels::pixel::{LlkPartial, MASKED, OBJ_TILE, ViewAddr};
 use ptyrs_kernels::pixel::{PIXEL_THREADS, StackGeom, SumPtrs};
@@ -315,7 +316,7 @@ impl Kernels {
     /// offset (PyNX `ObjProbe2Psi`). `psi` holds `frames.len() * nmode` planes.
     pub fn obj_probe_to_psi(
         &self,
-        stream: &CudaStream,
+        ctx: &ExecutionContext,
         views: &Views,
         frames: Range<u32>,
         obj: &DeviceBuffer<C32>,
@@ -330,7 +331,7 @@ impl Kernels {
         check_len("psi", psi, s.nk as usize * n)?;
         let config = grid_1d(s.nk as usize * n)?;
         let reads = [views.addr.storage(), obj.storage(), probe.storage()];
-        self.launch(stream, &reads, &[psi.storage()], || {
+        self.launch(ctx, &reads, &[psi.storage()], |stream| {
             // SAFETY: lengths checked above; `Views::new` checked every view lies inside the
             // object with valid mode indices.
             unsafe {
@@ -352,7 +353,7 @@ impl Kernels {
     /// no background). `icalc` holds `frames.len()` frames.
     pub fn mode_intensity(
         &self,
-        stream: &CudaStream,
+        ctx: &ExecutionContext,
         dims: &ViewDims,
         frames: Range<u32>,
         psi: &DeviceBuffer<C32>,
@@ -363,7 +364,7 @@ impl Kernels {
         check_len("psi", psi, s.nk as usize * n)?;
         check_len("icalc", icalc, s.nf as usize * n)?;
         let config = grid_1d(s.nf as usize * n)?;
-        self.launch(stream, &[psi.storage()], &[icalc.storage()], || {
+        self.launch(ctx, &[psi.storage()], &[icalc.storage()], |stream| {
             // SAFETY: lengths checked above.
             unsafe {
                 self.module.mode_intensity(
@@ -387,7 +388,7 @@ impl Kernels {
     /// the whole scan.
     pub fn apply_amplitude(
         &self,
-        stream: &CudaStream,
+        ctx: &ExecutionContext,
         dims: &ViewDims,
         frames: Range<u32>,
         counts: &DeviceBuffer<u16>,
@@ -398,7 +399,7 @@ impl Kernels {
         check_len("counts", counts, dims.nframe as usize * n)?;
         check_len("psi", psi, s.nk as usize * n)?;
         let config = grid_1d(s.nf as usize * n)?;
-        self.launch(stream, &[counts.storage()], &[psi.storage()], || {
+        self.launch(ctx, &[counts.storage()], &[psi.storage()], |stream| {
             // SAFETY: lengths checked above.
             unsafe {
                 self.module.apply_amplitude(
@@ -424,7 +425,7 @@ impl Kernels {
     /// block reduction; total with [`LlkSums::from_partials`].
     pub fn llk(
         &self,
-        stream: &CudaStream,
+        ctx: &ExecutionContext,
         dims: &ViewDims,
         frames: Range<u32>,
         counts: &DeviceBuffer<u16>,
@@ -442,10 +443,10 @@ impl Kernels {
             shared_mem_bytes: 0,
         };
         self.launch(
-            stream,
+            ctx,
             &[counts.storage(), psi.storage()],
             &[out.storage()],
-            || {
+            |stream| {
                 // SAFETY: lengths checked above; one block of PIXEL_THREADS per frame.
                 unsafe {
                     self.module.llk(
@@ -471,7 +472,7 @@ impl Kernels {
     /// the result. Zero `sums` before the first stack.
     pub fn psi_to_obj(
         &self,
-        stream: &CudaStream,
+        ctx: &ExecutionContext,
         views: &Views,
         frames: Range<u32>,
         psi: &DeviceBuffer<C32>,
@@ -500,7 +501,7 @@ impl Kernels {
             views.tile_start.storage(),
             views.tile_views.storage(),
         ];
-        self.launch(stream, &reads, &sums.storages(), || {
+        self.launch(ctx, &reads, &sums.storages(), |stream| {
             // SAFETY: lengths checked above; the tile lists were built from these views.
             unsafe {
                 self.module.psi_to_obj(
@@ -524,7 +525,7 @@ impl Kernels {
     /// first stack.
     pub fn psi_to_probe(
         &self,
-        stream: &CudaStream,
+        ctx: &ExecutionContext,
         views: &Views,
         frames: Range<u32>,
         psi: &DeviceBuffer<C32>,
@@ -539,7 +540,7 @@ impl Kernels {
         sums.check(d.nprobe as usize * n)?;
         let config = grid_1d(d.nprobe as usize * n)?;
         let reads = [psi.storage(), obj.storage(), views.addr.storage()];
-        self.launch(stream, &reads, &sums.storages(), || {
+        self.launch(ctx, &reads, &sums.storages(), |stream| {
             // SAFETY: lengths checked above; `Views::new` checked every view.
             unsafe {
                 self.module.psi_to_probe(
@@ -556,12 +557,13 @@ impl Kernels {
     }
 
     /// Applies accumulated sums to the first `n` elements of `x` (PyNX `ObjNorm`):
-    /// `x = (num + reg x) / max(den + reg, 1e-12)` with `reg = inertia * max(den[..n])`.
+    /// `x = (num + reg x) / max(den + reg, 1e-12)` with `reg = inertia * max(den[..n])`,
+    /// every operation rounded on its own. `sums.max_bits` is its scratch.
     pub fn update_from_sums(
         &self,
-        stream: &CudaStream,
+        ctx: &ExecutionContext,
         x: &mut DeviceBuffer<C32>,
-        sums: &UpdateSums,
+        sums: &mut UpdateSums,
         n: u32,
         inertia: f32,
     ) -> Result<(), Error> {
@@ -576,17 +578,17 @@ impl Kernels {
             grid_dim: (config.grid_dim.0.min(1024), 1, 1),
             ..config
         };
-        let max_bits = DeviceBuffer::<u32>::zeroed(stream, 1)?;
-        let UpdateSums { num, den } = sums;
-        self.launch(stream, &[den.storage()], &[max_bits.storage()], || {
+        let UpdateSums { num, den, max_bits } = sums;
+        crate::zero(ctx, max_bits)?;
+        self.launch(ctx, &[den.storage()], &[max_bits.storage()], |stream| {
             // SAFETY: `den` holds `n` floats, `max_bits` one zeroed u32.
             unsafe {
                 self.module
-                    .max_nonneg_f32(stream, max_config, dptr(den), n, dptr(&max_bits))
+                    .max_nonneg_f32(stream, max_config, dptr(den), n, dptr(max_bits))
             }
         })?;
         let reads = [num.storage(), den.storage(), max_bits.storage()];
-        self.launch(stream, &reads, &[x.storage()], || {
+        self.launch(ctx, &reads, &[x.storage()], |stream| {
             // SAFETY: all lengths checked above.
             unsafe {
                 self.module.normalize_update(
@@ -596,7 +598,7 @@ impl Kernels {
                     dptr(num),
                     dptr(den),
                     n,
-                    dptr(&max_bits),
+                    dptr(max_bits),
                     inertia,
                 )
             }
@@ -610,7 +612,7 @@ impl Kernels {
     /// PyNX's `DM2` result.
     pub fn dm_reflect(
         &self,
-        stream: &CudaStream,
+        ctx: &ExecutionContext,
         psi: &mut DeviceBuffer<C32>,
         po: &mut DeviceBuffer<C32>,
         n: u32,
@@ -622,7 +624,7 @@ impl Kernels {
             return Ok(());
         }
         let config = grid_1d(n as usize)?;
-        self.launch(stream, &[], &[psi.storage(), po.storage()], || {
+        self.launch(ctx, &[], &[psi.storage(), po.storage()], |stream| {
             // SAFETY: both hold `n` values.
             unsafe {
                 self.module
@@ -634,7 +636,7 @@ impl Kernels {
     /// `y += x` for the first `n` values.
     pub fn add_c32(
         &self,
-        stream: &CudaStream,
+        ctx: &ExecutionContext,
         y: &mut DeviceBuffer<C32>,
         x: &DeviceBuffer<C32>,
         n: u32,
@@ -645,7 +647,7 @@ impl Kernels {
             return Ok(());
         }
         let config = grid_1d(n as usize)?;
-        self.launch(stream, &[x.storage()], &[y.storage()], || {
+        self.launch(ctx, &[x.storage()], &[y.storage()], |stream| {
             // SAFETY: both hold `n` values.
             unsafe { self.module.add_c32(stream, config, dptr(y), dptr(x), n) }
         })
@@ -653,30 +655,47 @@ impl Kernels {
 }
 
 /// Numerator and denominator of an object or probe update (PyNX `obj_new`, `obj_norm`),
-/// element `i` of `den` belonging to element `i` of `num`.
+/// element `i` of `den` belonging to element `i` of `num`, with the scratch the update
+/// needs, so that no launch allocates.
 pub struct UpdateSums {
     pub num: DeviceBuffer<C32>,
     pub den: DeviceBuffer<f32>,
+    /// One word: [`Kernels::update_from_sums`] writes the bits of `max(den)` here.
+    pub max_bits: DeviceBuffer<u32>,
 }
 
 impl UpdateSums {
     pub fn zeroed(stream: &CudaStream, len: usize) -> Result<Self, Error> {
+        Self::new(
+            DeviceBuffer::zeroed(stream, len)?,
+            DeviceBuffer::zeroed(stream, len)?,
+            stream,
+        )
+    }
+
+    /// `num` and `den` with a fresh `max_bits`.
+    pub fn new(
+        num: DeviceBuffer<C32>,
+        den: DeviceBuffer<f32>,
+        stream: &CudaStream,
+    ) -> Result<Self, Error> {
         Ok(Self {
-            num: DeviceBuffer::zeroed(stream, len)?,
-            den: DeviceBuffer::zeroed(stream, len)?,
+            num,
+            den,
+            max_bits: DeviceBuffer::zeroed(stream, 1)?,
         })
     }
 
-    /// Zeroes both on `stream`.
-    pub fn zero(&mut self, stream: &CudaStream) -> Result<(), Error> {
-        self.num.zero_async(stream)?;
-        self.den.zero_async(stream)?;
-        Ok(())
+    /// Zeroes `num` and `den` on `ctx`'s stream.
+    pub fn zero(&mut self, ctx: &ExecutionContext) -> Result<(), Error> {
+        crate::zero(ctx, &mut self.num)?;
+        crate::zero(ctx, &mut self.den)
     }
 
     fn check(&self, need: usize) -> Result<(), Error> {
         check_len("sums.num", &self.num, need)?;
-        check_len("sums.den", &self.den, need)
+        check_len("sums.den", &self.den, need)?;
+        check_len("sums.max_bits", &self.max_bits, 1)
     }
 
     fn storages(&self) -> [&cuda_core::RawDeviceBuffer; 2] {
