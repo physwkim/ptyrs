@@ -289,6 +289,57 @@ unsafe fn block_sum<const K: usize>(s: *mut f32) {
     thread::sync_threads();
 }
 
+/// Appends views `k0 .. k0 + nk` to the slab of this warp's tile `ty * ntx + tx`, in
+/// ascending `k`, each view after the run of every tile [`pixel::axis_tiles`] puts it in. A
+/// run's length is written only if the range has a view of the tile. Returns, the same on
+/// every lane, how many of the tile's views the slab could not hold. One warp per tile, a 1D
+/// launch of `ntiles * WARP` threads; warps past the tiles return 0.
+///
+/// # Safety
+///
+/// `views` holds views `k0 .. k0 + nk`, each inside the object; `slabs` as
+/// [`pixel::TileSlabs`] says for `ntiles` tiles, with `len[t] <= start[t + 1] - start[t]`.
+#[device]
+unsafe fn bin_tile_views(
+    views: *const pixel::ViewAddr,
+    slabs: pixel::TileSlabs,
+    k0: u32,
+    nk: u32,
+    g: pixel::StackGeom,
+) -> u32 {
+    use cuda_device::warp;
+    use pixel::{OBJ_TILE, WARP, view_in_tile};
+    let ntx = g.nxo.div_ceil(OBJ_TILE);
+    let t = global_index() / WARP as usize;
+    // Whole warps leave together, so every lane left reaches each ballot.
+    if t >= g.nyo.div_ceil(OBJ_TILE) as usize * ntx as usize {
+        return 0;
+    }
+    let (ty, tx) = ((t / ntx as usize) as u32, (t % ntx as usize) as u32);
+    unsafe {
+        let lo = *slabs.start.add(t);
+        let cap = *slabs.start.add(t + 1) - lo;
+        let len0 = *slabs.len.add(t);
+        let mut added = 0u32;
+        let mut base = 0u32;
+        while base < nk {
+            let kl = base + warp::lane_id();
+            let hit = kl < nk && view_in_tile(*views.add((k0 + kl) as usize), ty, tx, g.ny, g.nx);
+            let hits = warp::ballot(hit);
+            let slot = len0 + added + (hits & warp::lanemask_lt()).count_ones();
+            if hit && slot < cap {
+                *slabs.views.add((lo + slot) as usize) = k0 + kl;
+            }
+            added += hits.count_ones();
+            base += WARP;
+        }
+        if warp::lane_id() == 0 && added > 0 {
+            *slabs.len.add(t) = (len0 + added).min(cap);
+        }
+        (len0 + added).saturating_sub(cap)
+    }
+}
+
 #[cuda_module]
 pub mod kernels {
     use super::*;
@@ -520,11 +571,8 @@ pub mod kernels {
         unsafe { *out.add(fl) = s };
     }
 
-    /// Appends the stack's views to the tile slabs: view `k` of the stack goes, in ascending
-    /// `k`, after the run of every tile [`axis_tiles`] puts it in. A view whose tile's slab
-    /// is full is not written and adds 1 to `*overflow`; a run's length is written only if
-    /// the stack has a view of the tile. One warp per tile `ty * ntx + tx`, a 1D launch of
-    /// `ntiles * WARP` threads.
+    /// `bin_tile_views` of the stack's views, the views a slab cannot hold added to
+    /// `*overflow`.
     ///
     /// # Safety
     ///
@@ -540,43 +588,46 @@ pub mod kernels {
         g: StackGeom,
     ) {
         use cuda_device::atomic::{AtomicOrdering, DeviceAtomicU32};
-        use cuda_device::warp;
-        let ntx = g.nxo.div_ceil(OBJ_TILE);
-        let t = global_index() / WARP as usize;
-        // Whole warps leave together, so every lane left reaches each ballot.
-        if t >= g.nyo.div_ceil(OBJ_TILE) as usize * ntx as usize {
+        let (f0, nf) = unsafe { stack_frames(ctl, g) };
+        let lost = unsafe { bin_tile_views(views, slabs, f0 * g.nmode, nf * g.nmode, g) };
+        if cuda_device::warp::lane_id() == 0 && lost > 0 {
+            unsafe { DeviceAtomicU32::from_ptr(overflow) }.fetch_add(lost, AtomicOrdering::Relaxed);
+        }
+    }
+
+    /// `bin_tile_views` of all `nframe * nmode` views, for slabs that hold every tile's
+    /// views: what a slab cannot hold is dropped uncounted.
+    ///
+    /// # Safety
+    ///
+    /// As `bin_views` without `overflow` and `ctl`.
+    #[kernel]
+    pub unsafe fn bin_all_views(views: *const ViewAddr, slabs: TileSlabs, g: StackGeom) {
+        unsafe { bin_tile_views(views, slabs, 0, g.nframe * g.nmode, g) };
+    }
+
+    /// `dst[p * nmode + m] = src[order[p] * nmode + m]`, frame `p` of `dst` taking frame
+    /// `order[p]` of `src`; a `p` whose `order[p] >= nframe` leaves its frame unwritten.
+    /// A 1D launch of at least `nframe * nmode` threads.
+    ///
+    /// # Safety
+    ///
+    /// `src` and `dst` hold `nframe * nmode` records and do not overlap; `order` `nframe`.
+    #[kernel]
+    pub unsafe fn gather_frames(
+        src: *const ViewAddr,
+        order: *const u32,
+        dst: *mut ViewAddr,
+        nframe: u32,
+        nmode: u32,
+    ) {
+        let (k, nmode) = (global_index(), nmode as usize);
+        if k >= nframe as usize * nmode {
             return;
         }
-        let (ty, tx) = ((t / ntx as usize) as u32, (t % ntx as usize) as u32);
-        let lane = warp::lane_id();
-        unsafe {
-            let (f0, nf) = stack_frames(ctl, g);
-            let (k0, nk) = (f0 * g.nmode, nf * g.nmode);
-            let lo = *slabs.start.add(t);
-            let cap = *slabs.start.add(t + 1) - lo;
-            let len0 = *slabs.len.add(t);
-            let mut added = 0u32;
-            let mut base = 0u32;
-            while base < nk {
-                let kl = base + lane;
-                let hit =
-                    kl < nk && view_in_tile(*views.add((k0 + kl) as usize), ty, tx, g.ny, g.nx);
-                let hits = warp::ballot(hit);
-                let slot = len0 + added + (hits & warp::lanemask_lt()).count_ones();
-                if hit && slot < cap {
-                    *slabs.views.add((lo + slot) as usize) = k0 + kl;
-                }
-                added += hits.count_ones();
-                base += WARP;
-            }
-            if lane == 0 && added > 0 {
-                let want = len0 + added;
-                *slabs.len.add(t) = want.min(cap);
-                if want > cap {
-                    DeviceAtomicU32::from_ptr(overflow)
-                        .fetch_add(want - cap, AtomicOrdering::Relaxed);
-                }
-            }
+        let q = unsafe { *order.add(k / nmode) };
+        if q < nframe {
+            unsafe { *dst.add(k) = *src.add(q as usize * nmode + k % nmode) };
         }
     }
 
