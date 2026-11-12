@@ -12,6 +12,7 @@
 //!
 //! [`SourceStats::scan_end`]: crate::pipeline::SourceStats::scan_end
 
+use std::fmt;
 use std::ops::Range;
 use std::time::Duration;
 
@@ -25,6 +26,40 @@ use ptyrs_core::{C64, CoreError};
 /// simulated frames hold their outer rings only at 0.983–0.9994, so 0.999
 /// is out of reach.
 pub const MATCH: f64 = 0.99;
+
+/// Why [`Clock::new`] refused its reference.
+#[derive(Debug)]
+pub enum ClockError {
+    /// Ring `ring` of `rings` of the offline object correlates with its
+    /// earlier snapshot only at `frc`, under [`MATCH`].
+    Moving {
+        ring: usize,
+        rings: usize,
+        frc: f64,
+    },
+    Invalid(CoreError),
+}
+
+impl fmt::Display for ClockError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Moving { ring, rings, frc } => write!(
+                f,
+                "the offline run is still moving: ring {ring} of {rings} at FRC {frc:.4} \
+                 against its earlier snapshot, under {MATCH}"
+            ),
+            Self::Invalid(e) => e.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for ClockError {}
+
+impl From<CoreError> for ClockError {
+    fn from(e: CoreError) -> Self {
+        Self::Invalid(e)
+    }
+}
 
 /// One scan's clock, started at its end.
 pub struct Clock {
@@ -48,7 +83,7 @@ impl Clock {
         shape: [usize; 2],
         region: [Range<usize>; 2],
         scan_end: i64,
-    ) -> Result<Self, CoreError> {
+    ) -> Result<Self, ClockError> {
         if region
             .iter()
             .zip(shape)
@@ -56,7 +91,8 @@ impl Clock {
         {
             return Err(CoreError::Invalid(format!(
                 "region {region:?} is empty or leaves the {shape:?} object"
-            )));
+            ))
+            .into());
         }
         let clock = Self {
             offline: offline.to_vec(),
@@ -67,13 +103,12 @@ impl Clock {
         };
         let cropped = clock.crop(offline)?;
         let f = Frc::compute(&cropped, &clock.crop(earlier)?, clock.region_shape())?;
-        if let Some(r) = below(&f) {
-            return Err(CoreError::Invalid(format!(
-                "the offline run is still moving: ring {r} of {} at FRC {:.4} against its \
-                 earlier snapshot, under {MATCH}",
-                f.rings.len(),
-                f.rings[r].frc
-            )));
+        if let Some(ring) = below(&f) {
+            return Err(ClockError::Moving {
+                ring,
+                rings: f.rings.len(),
+                frc: f.rings[ring].frc,
+            });
         }
         Ok(Self { cropped, ..clock })
     }
@@ -86,15 +121,20 @@ impl Clock {
         let Ok(after) = u64::try_from(taken - self.scan_end) else {
             return Ok(None);
         };
+        Ok((self.region_frc(live)? >= MATCH).then(|| Duration::from_nanos(after)))
+    }
+
+    /// The lowest ring's FRC of `live` against the offline object over the
+    /// region, the figure [`Self::check`] holds to [`MATCH`].
+    pub fn region_frc(&self, live: &[C64]) -> Result<f64, CoreError> {
         let f = Frc::compute(&self.cropped, &self.crop(live)?, self.region_shape())?;
-        Ok(below(&f).is_none().then(|| Duration::from_nanos(after)))
+        Ok(lowest(&f))
     }
 
     /// The lowest ring's FRC of `live` against the offline object over the
     /// whole array, region or not.
     pub fn whole(&self, live: &[C64]) -> Result<f64, CoreError> {
-        let f = Frc::compute(&self.offline, live, self.shape)?;
-        Ok(f.rings.iter().map(|r| r.frc).fold(f64::INFINITY, f64::min))
+        Ok(lowest(&Frc::compute(&self.offline, live, self.shape)?))
     }
 
     /// The region's pixels of an object of the clock's shape.
@@ -123,6 +163,10 @@ impl Clock {
 /// The first ring under [`MATCH`].
 fn below(f: &Frc) -> Option<usize> {
     f.rings.iter().position(|r| r.frc < MATCH)
+}
+
+fn lowest(f: &Frc) -> f64 {
+    f.rings.iter().map(|r| r.frc).fold(f64::INFINITY, f64::min)
 }
 
 #[cfg(test)]
@@ -181,7 +225,7 @@ mod tests {
         let earlier = plus(&offline, 0.5, 5);
         let err = Clock::new(&offline, &earlier, SHAPE, ALL, 0).err().unwrap();
         assert!(
-            matches!(&err, CoreError::Invalid(m) if m.contains("still moving")),
+            matches!(err, ClockError::Moving { frc, .. } if frc < MATCH),
             "{err}"
         );
     }
@@ -218,9 +262,11 @@ mod tests {
             clock.check(&live, 10).unwrap(),
             Some(Duration::from_nanos(10))
         );
+        assert!(clock.region_frc(&live).unwrap() >= MATCH);
         assert!(clock.whole(&live).unwrap() < MATCH);
         assert!(clock.whole(&offline).unwrap() > 0.999_999);
         assert_eq!(clock.check(&inside(&live, &far), 10).unwrap(), None);
+        assert!(clock.region_frc(&inside(&live, &far)).unwrap() < MATCH);
         assert!(clock.check(&live[1..], 10).is_err());
         for bad in [[16..48, 16..65], [16..16, 16..48]] {
             assert!(Clock::new(&offline, &offline, SHAPE, bad, 0).is_err());
