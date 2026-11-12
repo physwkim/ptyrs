@@ -109,6 +109,49 @@ pub mod grad_kernels {
         }
     }
 
+    /// The Poisson gradient in Fourier space (PyNX `GradPoissonFourier`, no background, no
+    /// Hann filter) of the forward-FFT'd (unnormalized) stack, with the `1 / (ny * nx)` of
+    /// the FFT round trip folded in: `psi *= 2 (1 - obs / max(calc, 1e-12)) / (ny * nx)` with
+    /// `calc = sum_m |psi|^2 / (ny * nx)`, or `psi = 0` where `obs` is `MASKED`. One thread
+    /// per element of `[nf_max, ny, nx]`.
+    ///
+    /// # Safety
+    ///
+    /// `psi` `[nf_max * nmode, ny, nx]`, `counts` `[nframe, ny, nx]`, `ctl` one entry.
+    #[kernel]
+    pub unsafe fn cg_poisson_grad(
+        psi: *mut f32,
+        counts: *const u16,
+        ctl: *const StackCtl,
+        g: StackGeom,
+    ) {
+        let (f0, nf) = unsafe { stack_frames(ctl, g) };
+        let (ny, nx, nmode) = (g.ny, g.nx, g.nmode);
+        let n = ny as usize * nx as usize;
+        let t = global_index();
+        if t >= nf as usize * n {
+            return;
+        }
+        let (fl, d) = (t / n, t % n);
+        let at = psi_index((d / nx as usize) as u32, (d % nx as usize) as u32, ny, nx);
+        let inv_n = 1.0 / n as f32;
+        let plane0 = fl * nmode as usize;
+        unsafe {
+            let obs = *counts.add(f0 as usize * n + t);
+            let s = if obs == MASKED {
+                0.0
+            } else {
+                let calc = mode_power(psi, plane0, nmode, n, at) * inv_n;
+                2.0 * (1.0 - obs as f32 / calc.max(1e-12)) * inv_n
+            };
+            for m in 0..nmode as usize {
+                let j = (plane0 + m) * n + at;
+                let v = load_c(psi, j);
+                store_c(psi, j, (v.0 * s, v.1 * s));
+            }
+        }
+    }
+
     /// The line-search exit waves of `x = (O, P)` along `d = (dO, dP)`, in
     /// `obj_probe_to_psi`'s layout and order of operations: for view `v = views[f0 * nmode +
     /// kl]`, `q = exp(i quad r^2)`, `po = O_v P_v q`, `a = (dO_v P_v + O_v dP_v) q`, `b = dO_v

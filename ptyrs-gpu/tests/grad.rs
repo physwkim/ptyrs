@@ -344,3 +344,54 @@ fn gamma_frames_match_f64_and_sum_to_gamma() {
         );
     }
 }
+
+/// The Fourier-space Poisson gradient is the f64 formula at every pixel of the stack's frames,
+/// masked pixels become zero, and the planes past a short stack's frames are untouched.
+#[test]
+fn poisson_grad_matches_f64() {
+    let (stream, ctx, _, k) = setup();
+    let (views, table) = scan(&stream);
+    let (ny, nx, nmode, n) = (8usize, 8usize, 2usize, 64usize);
+    let counts: Vec<u16> = (0..5 * n)
+        .map(|i| match i % 11 {
+            4 => MASKED,
+            7 => 0,
+            _ => (i * 29 % 41) as u16,
+        })
+        .collect();
+    let dcounts = up(&stream, &counts);
+    for (s, f0, nf) in [(0usize, 0usize, 3usize), (1, 3, 2)] {
+        let x = noise(3 * nmode * n, 40 + s as u64, 30.0);
+        let mut psi = up(&stream, &x);
+        k.poisson_grad(&ctx, views.dims(), table.at(s), &dcounts, &mut psi)
+            .unwrap();
+        let got = psi.to_host_vec(&stream).unwrap();
+        assert_eq!(got[nf * nmode * n..], x[nf * nmode * n..], "stack {s} tail");
+        for fl in 0..nf {
+            for d in 0..n {
+                let at = ((d / nx + ny / 2) % ny) * nx + (d % nx + nx / 2) % nx;
+                let js: Vec<usize> = (0..nmode).map(|m| (fl * nmode + m) * n + at).collect();
+                let obs = counts[(f0 + fl) * n + d];
+                let r = if obs == MASKED {
+                    0.0
+                } else {
+                    let calc: f64 = js
+                        .iter()
+                        .map(|&j| (x[j].re as f64).powi(2) + (x[j].im as f64).powi(2))
+                        .sum::<f64>()
+                        / n as f64;
+                    2.0 * (1.0 - obs as f64 / calc.max(1e-12)) / n as f64
+                };
+                for &j in &js {
+                    let want = (r * x[j].re as f64, r * x[j].im as f64);
+                    let err = (got[j].re as f64 - want.0).hypot(got[j].im as f64 - want.1);
+                    assert!(
+                        err < 1e-5 * want.0.hypot(want.1).max(1e-6),
+                        "stack {s} psi[{j}] {:?} vs {want:?}",
+                        got[j]
+                    );
+                }
+            }
+        }
+    }
+}

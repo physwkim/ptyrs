@@ -2,8 +2,10 @@
 //!
 //! # One CG cycle (PyNX `ML`) in these calls
 //!
-//! Per updated array (object, probe): the gradient `g` accumulates into zeroed sums, `h`
-//! holds the last cycle's gradient (zeros before the first) and `d` the direction (zeros).
+//! Per updated array (object, probe): the gradient `g` accumulates into zeroed sums (per
+//! stack [`Kernels::obj_probe_to_psi`], forward FFT, [`GradKernels::poisson_grad`], inverse
+//! FFT, then [`Kernels::psi_to_obj`] and [`Kernels::psi_to_probe`]), `h` holds the last
+//! cycle's gradient (zeros before the first) and `d` the direction (zeros).
 //! [`GradKernels::beta_parts`] of every array into its own `CG_BLOCKS` pairs of one parts
 //! buffer, then [`GradKernels::sum_parts`] of them all gives the Polak–Ribière pair; it is
 //! `(sum |g|^2, 0)` on the first cycle, so `β = 0`. [`GradKernels::direction`] per array,
@@ -157,6 +159,41 @@ impl GradKernels {
             unsafe {
                 self.module
                     .cg_direction(stream, config, dptr(d), g, n, dptr(beta))
+            }
+        })
+    }
+
+    /// The stack's Poisson gradient in Fourier space, in place on its forward-FFT'd exit
+    /// waves (PyNX `GradPoissonFourier`, no Hann filter): `psi *= 2 (1 - obs / max(calc,
+    /// 1e-12)) / (ny * nx)`, `calc = sum_m |psi|^2 / (ny * nx)`, and masked pixels zeroed.
+    /// The unnormalized inverse FFT of the result, back-projected by
+    /// [`Kernels::psi_to_obj`] and [`Kernels::psi_to_probe`], gives the sums' `num` as the
+    /// gradients `2 dL/dO*` and `2 dL/dP*` of the unnormalised Poisson sum.
+    pub fn poisson_grad(
+        &self,
+        ctx: &ExecutionContext,
+        dims: &ViewDims,
+        stack: StackRef<'_>,
+        counts: &DeviceBuffer<u16>,
+        psi: &mut DeviceBuffer<C32>,
+    ) -> Result<(), Error> {
+        let g = dims.geom(stack)?;
+        let (n, nf_max) = (dims.n(), g.nf_max as usize);
+        check_len("counts", counts, dims.nframe as usize * n)?;
+        check_len("psi", psi, nf_max * dims.nmode as usize * n)?;
+        let config = grid_1d(nf_max * n)?;
+        let reads = [counts.storage(), stack.storage()];
+        self.base.launch(ctx, &reads, &[psi.storage()], |stream| {
+            // SAFETY: lengths checked above.
+            unsafe {
+                self.module.cg_poisson_grad(
+                    stream,
+                    config,
+                    dptr(psi),
+                    dptr(counts),
+                    stack.ctl() as *const StackCtl,
+                    g,
+                )
             }
         })
     }
