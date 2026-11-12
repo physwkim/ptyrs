@@ -36,7 +36,7 @@ pub struct DipConfig {
     /// Channels of the fixed input code.
     #[config(default = 8)]
     pub code: usize,
-    /// Seed of the input code.
+    /// Seed of the input code and the initial weights.
     #[config(default = 0)]
     pub seed: u64,
 }
@@ -131,6 +131,7 @@ impl Dip {
             nx.div_ceil(granule) * granule,
         );
         let ad = device.clone().autodiff();
+        ad.seed(config.seed);
         let mut rng = ChaCha8Rng::seed_from_u64(config.seed);
         let code: Vec<f32> = (0..config.code * cy * cx)
             .map(|_| 0.1 * rng.r#gen::<f32>())
@@ -288,8 +289,9 @@ mod tests {
 
     impl<F: FnMut(&[f64]) -> f64> ObjectLoss for CentralDifferences<F> {
         fn gradient(&mut self, object: &Tensor<3>) -> Result<(f64, Tensor<3>), LossError> {
-            // Rounding and curvature errors of the engine LLK balance here: 1e-5 and 1e-7 err more.
-            const H: f64 = 1e-6;
+            // Rounding and curvature of the engine LLK balance here: the weight check errs 1.3e-7
+            // of the slope, 1e-6 at steps of 1e-6 and 3e-7.
+            const H: f64 = 3e-6;
             let mut o = host64(object.clone());
             let value = (self.0)(&o);
             let g = (0..o.len())
@@ -520,9 +522,16 @@ mod tests {
     }
 
     #[test]
+    fn one_config_gives_one_start() {
+        let device = Device::cuda(0);
+        let config = DipConfig::new([20, 28]).with_width(4).with_depth(2);
+        let start = || host64(Dip::new(&config, &device).unwrap().object());
+        assert!(start() == start(), "two networks of one config start apart");
+    }
+
+    #[test]
     fn weight_gradients_match_finite_differences() {
         let device = Device::cuda(0);
-        device.seed(5);
         let shape = [20, 28];
         let config = DipConfig::new(shape)
             .with_width(4)
@@ -542,7 +551,6 @@ mod tests {
     #[test]
     fn steps_fit_a_target_object() {
         let device = Device::cuda(0);
-        device.seed(5);
         let shape = [24, 40];
         let config = DipConfig::new(shape).with_width(8).with_depth(2);
         let mut dip = Dip::new(&config, &device).unwrap();
@@ -567,7 +575,6 @@ mod tests {
     #[test]
     fn weight_gradients_from_the_engine_llk_match_finite_differences() {
         let device = Device::cuda(0);
-        device.seed(5);
         let config = DipConfig::new(Tiny::SHAPE)
             .with_width(4)
             .with_depth(2)
@@ -582,12 +589,11 @@ mod tests {
     }
 
     /// The same check with the engine's GPU gradient, in f32 against the f64 LLK of the CPU: to
-    /// the f32 gradient's rounding (6e-6 at worst here; 1e-5 in ptyrs-engine's
+    /// the f32 gradient's rounding (3e-6 at worst here; 1e-5 in ptyrs-engine's
     /// `ml_grads_match_cpu`).
     #[test]
     fn weight_gradients_from_the_engine_gpu_gradient_match_finite_differences() {
         let device = Device::cuda(0);
-        device.seed(5);
         let config = DipConfig::new(Tiny::SHAPE)
             .with_width(4)
             .with_depth(2)
