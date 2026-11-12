@@ -97,7 +97,7 @@ pub(crate) fn apply_amplitude_with(
         for (j, iobs) in o.iter().enumerate() {
             let Some(iobs) = *iobs else { continue };
             let i = (0..nmode).map(|m| block[m * n + j].norm_sqr()).sum();
-            let calc = model.calc(f, i).sqrt();
+            let calc = model.calc(f, j, i).sqrt();
             let r = iobs.sqrt() / calc.max(1e-12);
             for m in 0..nmode {
                 block[m * n + j] *= r;
@@ -139,7 +139,7 @@ pub(crate) fn llk_with(
         for (j, iobs) in o.iter().enumerate() {
             let Some(iobs) = *iobs else { continue };
             let i = (0..nmode).map(|m| block[m * n + j].norm_sqr()).sum();
-            let icalc = model.calc(f, i);
+            let icalc = model.calc(f, j, i);
             s.poisson += if iobs > 0.0 {
                 icalc - iobs + iobs * (iobs / icalc).ln()
             } else {
@@ -182,7 +182,7 @@ pub(crate) fn poisson_grad_with(
             let r = match *iobs {
                 Some(iobs) => {
                     let i = (0..nmode).map(|m| block[m * n + j].norm_sqr()).sum();
-                    let icalc = model.calc(f, i);
+                    let icalc = model.calc(f, j, i);
                     model.scaled(f, 2.0 * (1.0 - iobs / icalc.max(1e-12)))
                 }
                 None => 0.0,
@@ -213,8 +213,8 @@ pub fn cg_poisson_gamma(
     cg_poisson_gamma_with(obs, frames, nmode, [po, a, b], Model::default())
 }
 
-/// [`cg_poisson_gamma`] of [`llk_with`]'s Poisson sum: `icalc`, `r` and `s` times the frame's
-/// intensity scale, `icalc` `model`'s.
+/// [`cg_poisson_gamma`] of [`llk_with`]'s Poisson sum: `icalc` `model`'s, `r` and `s` times
+/// the frame's intensity scale.
 pub(crate) fn cg_poisson_gamma_with(
     obs: &Observed,
     frames: Range<usize>,
@@ -241,7 +241,7 @@ pub(crate) fn cg_poisson_gamma_with(
                 r += (p.conj() * a).re;
                 s += a.norm_sqr() + 2.0 * (p.conj() * b).re;
             }
-            let calc = model.calc(f, calc).max(1e-12);
+            let calc = model.calc(f, j, calc).max(1e-12);
             let (r, s) = (model.scaled(f, r), model.scaled(f, s));
             let d = 1.0 - iobs / calc;
             num -= 2.0 * r * d;
@@ -367,7 +367,7 @@ pub fn psi_to_obj_probe(
     }
 }
 
-fn blend(old: &mut Stack<C64>, num: &Stack<C64>, norm: &Stack<f64>, inertia: f64) {
+pub(crate) fn blend(old: &mut Stack<C64>, num: &Stack<C64>, norm: &Stack<f64>, inertia: f64) {
     let reg = norm.as_slice().iter().fold(0.0, |a: f64, &b| a.max(b)) * inertia;
     for ((o, a), w) in old
         .as_mut_slice()

@@ -2,8 +2,10 @@
 //!
 //! The driver can report peer access as supported and enabled while the platform corrupts the
 //! traffic (an IOMMU without the peer mapping returns all-ones loads). The halo pull and the
-//! gather read peer memory with SM loads, so [`verify_reads`] checks that path before peer
-//! access counts as enabled.
+//! gather read peer memory with SM loads, so [`enable_all_pairs`] checks that path with a kernel
+//! before peer access counts as enabled.
+//!
+//! [`enable_all_pairs`]: super::topo::enable_all_pairs
 
 use std::ffi::c_void;
 use std::sync::Arc;
@@ -205,7 +207,7 @@ fn push_words(
     Ok(dst.to_host_vec(dst_stream)?)
 }
 
-/// What [`bench`] found for one ordered pair: data moves from device `src` to device `dst`.
+/// What [`bench()`] found for one ordered pair: data moves from device `src` to device `dst`.
 #[derive(Clone, Copy, Debug)]
 pub struct PairResult {
     pub src: usize,
@@ -273,7 +275,8 @@ const CHASE_HOPS: u32 = 4096;
 const PULL_BLOCKS: u32 = 1024;
 
 /// Times every ordered pair of `ctxs` in turn, `reps` transfers of `bytes` per bulk timing,
-/// after enabling peer access without [`verify_reads`] so a broken pair is reported instead of
+/// after enabling peer access without the read check of
+/// [`enable_all_pairs`](super::topo::enable_all_pairs), so a broken pair is reported instead of
 /// failing the whole run. Each pair first moves a probe of at most 256 KiB by both paths, and
 /// only a pair whose probe arrives intact carries bulk traffic.
 ///

@@ -6,8 +6,8 @@
 
 use ptyrs::base::{C64, Scan};
 use ptyrs::engine::{
-    Cost, Fft2, Ptycho, background_cost, background_grad, intensity_grad, llk,
-    obj_probe_shift_to_psi, obj_probe_to_psi, position_grad, scale_psi, shift,
+    ApParams, Cost, DmParams, Features, Fft2, Ptycho, background_cost, background_grad,
+    intensity_grad, llk, obj_probe_shift_to_psi, obj_probe_to_psi, position_grad, scale_psi, shift,
 };
 
 #[path = "common/engine/mod.rs"]
@@ -194,5 +194,70 @@ fn background_matches_background_step_ref() {
         let g = background_grad(obs, 0..nframe, nmode, &psi, &b, cost);
         let e = max_rel(&g, &shifted(col));
         assert!(e < 1e-12, "{cost:?}: max rel {e:.3e}");
+    }
+}
+
+/// AP and DM from the truth's object and probe on counts drawn at the view corners, the probe
+/// moved by zero-mean offsets of up to 0.4 pixels: over 100 cycles the offsets' rms falls at
+/// every tenth cycle and below 0.65 of the start's (0.60 for AP and 0.40 for DM when written),
+/// their mean stays 0, and the LLK falls.
+#[test]
+fn position_refines_toward_the_drawn_positions() {
+    let (sim, object, probe) = common::scenario::truth(32, 40, 1, 1e6, 4.0);
+    let nframe = sim.scan.positions.len();
+    let mut d0: Vec<[f64; 2]> = (0..nframe)
+        .map(|f| {
+            let f = f as f64;
+            [0.4 * (1.7 * f + 0.3).sin(), 0.4 * (2.3 * f).cos()]
+        })
+        .collect();
+    for axis in 0..2 {
+        let mean = d0.iter().map(|d| d[axis]).sum::<f64>() / nframe as f64;
+        d0.iter_mut().for_each(|d| d[axis] -= mean);
+    }
+    let rms = |d: &[[f64; 2]]| {
+        (d.iter().flatten().map(|v| v * v).sum::<f64>() / (2 * d.len()) as f64).sqrt()
+    };
+    for algo in ["ap", "dm"] {
+        let mut p = Ptycho::new(&sim.scan, object.clone(), probe.clone()).unwrap();
+        p.set_features(Features {
+            position: Some(d0.clone()),
+            ..Features::default()
+        })
+        .unwrap();
+        p.scale_obj_probe();
+        let l0 = p.llk().poisson;
+        let mut last = rms(&d0);
+        for _ in 0..10 {
+            match algo {
+                "ap" => p.ap(&ApParams::default(), 10),
+                _ => p.dm(&DmParams::default(), 10),
+            }
+            let r = rms(p.features().position.as_deref().unwrap());
+            println!("{algo} cycle {}: rms offset {r:.4}", p.cycle());
+            assert!(
+                r < last,
+                "{algo} cycle {}: rms offset {r} from {last}",
+                p.cycle()
+            );
+            last = r;
+        }
+        let d = p.features().position.as_deref().unwrap();
+        let mean = [0, 1].map(|a| d.iter().map(|d| d[a]).sum::<f64>() / nframe as f64);
+        assert!(
+            mean.iter().all(|m| m.abs() < 1e-12),
+            "{algo}: mean offset {mean:?}"
+        );
+        assert!(
+            rms(d) < 0.65 * rms(&d0),
+            "{algo}: rms offset {} from {}",
+            rms(d),
+            rms(&d0)
+        );
+        assert!(
+            p.llk().poisson < l0,
+            "{algo}: llk {} from {l0}",
+            p.llk().poisson
+        );
     }
 }

@@ -5,7 +5,7 @@ use std::ops::Range;
 
 use crate::base::{AddrTable, C64, Object, Probe, Scan, Stack};
 
-use crate::engine::features::Model;
+use crate::engine::features::{Model, Shifted, position_step};
 use crate::engine::ops::{
     Llk, accumulate_obj, accumulate_probe, apply_amplitude_with, cg_poisson_gamma_with, llk_with,
     natural, obj_probe_to_psi, poisson_grad_with, psi_to_obj_probe, quad_phase,
@@ -20,6 +20,7 @@ pub enum Algorithm {
     Rpie,
     Ml,
     Bh,
+    Lsqml,
 }
 
 /// One LLK measurement (PyNX `history`): normalised LLK ([`Llk::normalised`]) taken at
@@ -197,7 +198,8 @@ impl Ptycho {
 
     /// Models and refines `features` from here on; an error leaves the current ones.
     pub fn set_features(&mut self, features: Features) -> Result<(), EngineError> {
-        features.check(self.addr.nframe())?;
+        let [nframe, ny, nx] = self.obs.dims();
+        features.check(nframe, [ny, nx])?;
         self.features = features;
         Ok(())
     }
@@ -238,17 +240,76 @@ impl Ptycho {
         self.cycle
     }
 
-    /// Exit waves `P·O·q` of every view, in a new buffer.
+    /// The probe moved by [`Features::position`] for every view, if one is set.
+    fn shifted(&self) -> Option<Shifted> {
+        let views = self.addr.views();
+        (self.features.position.as_deref())
+            .map(|d| Shifted::new(views, &self.probe, &self.quad, d, &self.fft))
+    }
+
+    /// Exit waves `P·O·q` of every view, `P·q` moved by [`Features::position`], into `psi`.
+    fn to_psi(&self, shifted: Option<&Shifted>, psi: &mut [C64]) {
+        let views = self.addr.views();
+        match shifted {
+            Some(s) => s.to_psi(views, &self.object, psi),
+            None => obj_probe_to_psi(views, &self.object, &self.probe, &self.quad, psi),
+        }
+    }
+
+    /// [`Ptycho::to_psi`] of the current object and probe, in a new buffer.
     fn calc_psi(&self) -> Vec<C64> {
         let mut psi = vec![C64::default(); self.psi.len()];
-        obj_probe_to_psi(
-            self.addr.views(),
-            &self.object,
-            &self.probe,
-            &self.quad,
-            &mut psi,
-        );
+        self.to_psi(self.shifted().as_ref(), &mut psi);
         psi
+    }
+
+    /// [`psi_to_obj_probe`] of the exit waves `self.psi`, `P·q` moved by
+    /// [`Features::position`].
+    fn update_from_psi(&mut self, obj_inertia: Option<f64>, probe_inertia: Option<f64>) {
+        let views = self.addr.views();
+        match self.shifted() {
+            Some(s) => s.psi_to_obj_probe(
+                views,
+                &self.psi,
+                &mut self.object,
+                &mut self.probe,
+                [obj_inertia, probe_inertia],
+                &self.fft,
+            ),
+            None => psi_to_obj_probe(
+                views,
+                &self.quad,
+                &self.psi,
+                &mut self.object,
+                &mut self.probe,
+                obj_inertia,
+                probe_inertia,
+            ),
+        }
+    }
+
+    /// The numerators of the object's and the probe's back-projections of the object-plane
+    /// `psi`, [`accumulate_obj`] and [`accumulate_probe`] with `P·q` moved by
+    /// [`Features::position`]; an array not asked for gets zeros.
+    fn back_project(&self, psi: &[C64], object: bool, probe: bool) -> [Stack<C64>; 2] {
+        let views = self.addr.views();
+        let (od, pd) = (self.object.dims(), self.probe.dims());
+        let shifted = self.shifted();
+        [
+            match (object, &shifted) {
+                (false, _) => Stack::filled(od, C64::default()),
+                (true, Some(s)) => s.accumulate_obj(views, od, psi).0,
+                (true, None) => accumulate_obj(views, od, &self.probe, &self.quad, psi).0,
+            },
+            match (probe, &shifted) {
+                (false, _) => Stack::filled(pd, C64::default()),
+                (true, Some(s)) => {
+                    s.accumulate_probe(views, &self.object, pd, psi, &self.fft)
+                        .0
+                }
+                (true, None) => accumulate_probe(views, &self.object, pd, &self.quad, psi).0,
+            },
+        ]
     }
 
     /// Normalised LLK of the current object and probe (PyNX `LLK() * FT() * ObjProbe2Psi()`
@@ -257,8 +318,14 @@ impl Ptycho {
         let mut psi = self.calc_psi();
         self.fft.forward(&mut psi);
         let (nframe, nmode) = (self.addr.nframe(), self.addr.nmode());
-        llk_with(&self.obs, 0..nframe, nmode, &psi, Model::of(&self.features))
-            .normalised(self.obs.nb_obs())
+        llk_with(
+            &self.obs,
+            0..nframe,
+            nmode,
+            &psi,
+            Model::of(&self.features, &self.obs),
+        )
+        .normalised(self.obs.nb_obs())
     }
 
     /// [`Features::step`] from the far field of the current object and probe, if some
@@ -275,49 +342,24 @@ impl Ptycho {
     /// Gradient of the Poisson LLK sum ([`crate::engine::llk`], not normalised) of the current object
     /// and probe over the object's real and imaginary parts, packed as
     /// `∂L/∂Re O + i·∂L/∂Im O = 2·∂L/∂O*`: [`crate::engine::poisson_grad`] of the far field, inverse
-    /// FFT, then [`accumulate_obj`]'s numerator. PyNX `ML`'s `obj_grad` is half of it.
+    /// FFT, then [`accumulate_obj`]'s numerator (`P·q` moved by [`Features::position`]). PyNX
+    /// `ML`'s `obj_grad` is half of it.
     pub fn obj_grad(&self) -> Stack<C64> {
-        let psi = self.grad_psi();
-        accumulate_obj(
-            self.addr.views(),
-            self.object.dims(),
-            &self.probe,
-            &self.quad,
-            &psi,
-        )
-        .0
+        let [g, _] = self.grads(true, false);
+        g
     }
 
     /// As [`Ptycho::obj_grad`] over the probe: `2·∂L/∂P*`, [`accumulate_probe`]'s numerator.
     /// PyNX `ML`'s `probe_grad` is half of it.
     pub fn probe_grad(&self) -> Stack<C64> {
-        let psi = self.grad_psi();
-        accumulate_probe(
-            self.addr.views(),
-            &self.object,
-            self.probe.dims(),
-            &self.quad,
-            &psi,
-        )
-        .0
+        let [_, g] = self.grads(false, true);
+        g
     }
 
     /// [`Ptycho::obj_grad`] and [`Ptycho::probe_grad`] from one far field; an array not asked
     /// for gets zeros.
     fn grads(&self, object: bool, probe: bool) -> [Stack<C64>; 2] {
-        let psi = self.grad_psi();
-        let views = self.addr.views();
-        let (od, pd) = (self.object.dims(), self.probe.dims());
-        [
-            match object {
-                true => accumulate_obj(views, od, &self.probe, &self.quad, &psi).0,
-                false => Stack::filled(od, C64::default()),
-            },
-            match probe {
-                true => accumulate_probe(views, &self.object, pd, &self.quad, &psi).0,
-                false => Stack::filled(pd, C64::default()),
-            },
-        ]
+        self.back_project(&self.grad_psi(), object, probe)
     }
 
     /// [`crate::engine::cg_poisson_gamma`] of the current object and probe along `(d_obj, d_probe)`,
@@ -328,15 +370,27 @@ impl Ptycho {
         let mut po = self.calc_psi();
         let mut a = vec![C64::default(); po.len()];
         let mut b = a.clone();
-        obj_probe_to_psi(views, &d_obj, &self.probe, quad, &mut a);
-        obj_probe_to_psi(views, &self.object, &d_probe, quad, &mut b);
-        a.iter_mut().zip(&b).for_each(|(a, b)| *a += b);
-        obj_probe_to_psi(views, &d_obj, &d_probe, quad, &mut b);
+        match self.features.position.as_deref() {
+            Some(d) => {
+                let probe = Shifted::new(views, &self.probe, quad, d, &self.fft);
+                let d_probe = Shifted::new(views, &d_probe, quad, d, &self.fft);
+                probe.to_psi(views, &d_obj, &mut a);
+                d_probe.to_psi(views, &self.object, &mut b);
+                a.iter_mut().zip(&b).for_each(|(a, b)| *a += b);
+                d_probe.to_psi(views, &d_obj, &mut b);
+            }
+            None => {
+                obj_probe_to_psi(views, &d_obj, &self.probe, quad, &mut a);
+                obj_probe_to_psi(views, &self.object, &d_probe, quad, &mut b);
+                a.iter_mut().zip(&b).for_each(|(a, b)| *a += b);
+                obj_probe_to_psi(views, &d_obj, &d_probe, quad, &mut b);
+            }
+        }
         for x in [&mut po, &mut a, &mut b] {
             self.fft.forward(x);
         }
         let (nframe, nmode) = (self.addr.nframe(), self.addr.nmode());
-        let model = Model::of(&self.features);
+        let model = Model::of(&self.features, &self.obs);
         cg_poisson_gamma_with(&self.obs, 0..nframe, nmode, [&po, &a, &b], model)
     }
 
@@ -350,7 +404,7 @@ impl Ptycho {
             0..nframe,
             nmode,
             &mut psi,
-            Model::of(&self.features),
+            Model::of(&self.features, &self.obs),
         );
         self.fft.inverse(&mut psi);
         psi
@@ -366,11 +420,14 @@ impl Ptycho {
 
     /// PyNX `ScaleObjProbe(absolute=True)`: scale so the calculated intensity over the
     /// unmasked pixels of every frame ([`Llk::nb_photons_calc`]) equals the observed one
-    /// there, then balance `Σ|O|` and `Σ|P|`: `s = sqrt(Σ iobs / Σ icalc)`,
+    /// there, then balance `Σ|O|` and `Σ|P|`: `s = sqrt((Σ iobs − B) / (Σ icalc − B))` with
+    /// `B` the photons of [`Features::background`] there (PyNX takes `iobs − background`),
     /// `P *= sqrt(Σ|O| / Σ|P| · s)`, `O *= sqrt(Σ|P| / Σ|O| · s)`. Masked pixels are in
     /// neither sum, as in PyNX CUDA's `scale_intensity`.
     pub fn scale_obj_probe(&mut self) {
-        self.split_scale((self.obs.total() / self.llk().nb_photons_calc).sqrt());
+        let b = self.features.background_photons(&self.obs);
+        let calc = self.llk().nb_photons_calc - b;
+        self.split_scale(((self.obs.total() - b) / calc).sqrt());
     }
 
     /// Scales `O P` by `s` and balances `Σ|O|` and `Σ|P|`: `P *= sqrt(Σ|O| / Σ|P| · s)`,
@@ -387,42 +444,38 @@ impl Ptycho {
     /// of `Σ_modes |fftshift(FT(fftshift(P)))|²`, `dx = cx − nx/2`, `dy = cy − ny/2`:
     /// `P *= exp(−2πi(dx·(x − nx/2)/nx + dy·(y − ny/2)/ny))` and
     /// `O *= exp(+2πi(dx·(x − nxo/2)/nx + dy·(y − nyo/2)/ny))` (integer halves). The two
-    /// ramps cancel in every view up to a constant phase, so the LLK is unchanged.
+    /// ramps cancel in every view up to a constant phase, so the LLK is unchanged, except that
+    /// [`Features::position`] moves a ramp of non-integer `dx` or `dy` as a periodic one.
     pub fn zero_phase_ramp(&mut self) {
         zero_phase_ramp(&self.fft, &mut self.object, &mut self.probe);
     }
 
     /// PyNX `AP(...)**ncycle`: per cycle, exit waves from the current estimate, Fourier
     /// magnitude projection (the recorded LLK is of the estimate before the update), then
-    /// [`psi_to_obj_probe`] with both updates from the old arrays.
+    /// [`psi_to_obj_probe`] with both updates from the old arrays, then the step of
+    /// [`Features::position`].
     pub fn ap(&mut self, params: &ApParams, ncycle: usize) {
         let (nframe, nmode, nb_obs) = (self.addr.nframe(), self.addr.nmode(), self.obs.nb_obs());
         for ic in 0..ncycle {
-            obj_probe_to_psi(
-                self.addr.views(),
-                &self.object,
-                &self.probe,
-                &self.quad,
-                &mut self.psi,
-            );
+            let shifted = self.shifted();
+            let mut psi = std::mem::take(&mut self.psi);
+            self.to_psi(shifted.as_ref(), &mut psi);
+            self.psi = psi;
             self.fft.forward(&mut self.psi);
             let l = llk_due(params.calc_llk, ic, ncycle).then(|| {
-                let model = Model::of(&self.features);
+                let model = Model::of(&self.features, &self.obs);
                 llk_with(&self.obs, 0..nframe, nmode, &self.psi, model).normalised(nb_obs)
             });
             self.features.step(&self.obs, nmode, &self.psi);
-            let model = Model::of(&self.features);
+            let model = Model::of(&self.features, &self.obs);
             apply_amplitude_with(&self.obs, 0..nframe, nmode, &mut self.psi, model);
             self.fft.inverse(&mut self.psi);
-            psi_to_obj_probe(
-                self.addr.views(),
-                &self.quad,
-                &self.psi,
-                &mut self.object,
-                &mut self.probe,
-                params.obj_inertia,
-                params.probe_inertia,
-            );
+            let sums = (shifted.as_ref())
+                .map(|s| s.position_sums(self.addr.views(), &self.object, &self.psi, &self.fft));
+            self.update_from_psi(params.obj_inertia, params.probe_inertia);
+            if let (Some(d), Some(sums)) = (&mut self.features.position, sums) {
+                position_step(d, &sums);
+            }
             if let Some(l) = l {
                 self.record(Algorithm::Ap, l);
             }
@@ -438,10 +491,11 @@ impl Ptycho {
     /// `psi ← (2 − a)·PO − (1 − a)·psi`, then magnitude projection `Π_F`, then
     /// `psi ← Π_F(psi) + (1 − a)·(PO − refl)` with `refl` the reflected `psi`. Then
     /// `loop_obj_probe` times an object-only and a probe-only [`psi_to_obj_probe`] (the probe
-    /// update sees the new object). The recorded LLK is of the estimate the cycle starts from,
-    /// as PyNX's CUDA DM takes it; its `cpu_operator` DM takes the updated one. After the update
-    /// of each cycle that records one, PyNX's CUDA DM balances `Σ|O|` and `Σ|P|` with `O P`
-    /// unchanged (`ScaleObjProbe(absolute=False)`), and so does this.
+    /// update sees the new object), then the step of [`Features::position`]. The recorded LLK
+    /// is of the estimate the cycle starts from, as PyNX's CUDA DM takes it; its `cpu_operator`
+    /// DM takes the updated one. After the update of each cycle that records one, PyNX's CUDA
+    /// DM balances `Σ|O|` and `Σ|P|` with `O P` unchanged (`ScaleObjProbe(absolute=False)`),
+    /// and so does this.
     pub fn dm(&mut self, params: &DmParams, ncycle: usize) {
         let (nframe, nmode) = (self.addr.nframe(), self.addr.nmode());
         let a = params.alpha;
@@ -450,13 +504,8 @@ impl Ptycho {
         for ic in 0..ncycle {
             let l = llk_due(params.calc_llk, ic, ncycle).then(|| self.llk());
             self.step_features();
-            obj_probe_to_psi(
-                self.addr.views(),
-                &self.object,
-                &self.probe,
-                &self.quad,
-                &mut po,
-            );
+            let shifted = self.shifted();
+            self.to_psi(shifted.as_ref(), &mut po);
             if ic == 0 {
                 self.psi.copy_from_slice(&po);
             } else {
@@ -466,7 +515,7 @@ impl Ptycho {
                 }
             }
             self.fft.forward(&mut self.psi);
-            let model = Model::of(&self.features);
+            let model = Model::of(&self.features, &self.obs);
             apply_amplitude_with(&self.obs, 0..nframe, nmode, &mut self.psi, model);
             self.fft.inverse(&mut self.psi);
             if ic > 0 {
@@ -474,20 +523,17 @@ impl Ptycho {
                     *s += (p - r) * (1.0 - a);
                 }
             }
+            let sums = (shifted.as_ref())
+                .map(|s| s.position_sums(self.addr.views(), &self.object, &self.psi, &self.fft));
             for _ in 0..params.loop_obj_probe {
                 for (o, p) in [(params.obj_inertia, None), (None, params.probe_inertia)] {
                     if o.is_some() || p.is_some() {
-                        psi_to_obj_probe(
-                            self.addr.views(),
-                            &self.quad,
-                            &self.psi,
-                            &mut self.object,
-                            &mut self.probe,
-                            o,
-                            p,
-                        );
+                        self.update_from_psi(o, p);
                     }
                 }
+            }
+            if let (Some(d), Some(sums)) = (&mut self.features.position, sums) {
+                position_step(d, &sums);
             }
             if let Some(l) = l {
                 self.record(Algorithm::Dm, l);
@@ -510,8 +556,12 @@ impl Ptycho {
     /// finite, no update and `d = −g` (PyNX `cu_linear_comb_fcfc_gamma`). PyNX CUDA keeps
     /// `−g / 2`, which changes neither `β` nor the step, and Hann-filters it in the far field;
     /// this does not filter. As in PyNX, a negative curvature `den` is not guarded: far from
-    /// the solution (a flat object) the step can climb, so ML follows DM or AP.
-    pub fn ml(&mut self, params: &MlParams, ncycle: usize) {
+    /// the solution (a flat object) the step can climb, so ML follows DM or AP. ML takes no
+    /// position step, so it refuses [`Features::position`].
+    pub fn ml(&mut self, params: &MlParams, ncycle: usize) -> Result<(), EngineError> {
+        if self.features.position.is_some() {
+            return Err(EngineError::Invalid("ML refines no positions".into()));
+        }
         let (uo, up) = (params.update_object, params.update_probe);
         self.scale_obj_probe();
         let mut last: Option<[Stack<C64>; 2]> = None;
@@ -573,6 +623,7 @@ impl Ptycho {
         if params.zero_phase_ramp {
             self.zero_phase_ramp();
         }
+        Ok(())
     }
 
     /// rPIE after pty-chi `RPIEReconstructor` with SGD, on consecutive batches of
@@ -802,6 +853,26 @@ mod tests {
         p
     }
 
+    /// [`grad_start`] and [`grad_start`] with its probe moved by sub-pixel offsets of both signs.
+    fn grad_starts() -> [Ptycho; 2] {
+        let mut moved = grad_start();
+        let d = (0..moved.addr.nframe())
+            .map(|f| {
+                [
+                    0.6 * (1.3 * f as f64 + 0.2).sin(),
+                    -0.45 * (0.7 * f as f64).cos(),
+                ]
+            })
+            .collect();
+        moved
+            .set_features(Features {
+                position: Some(d),
+                ..Features::default()
+            })
+            .unwrap();
+        [grad_start(), moved]
+    }
+
     /// `grad` against central differences of the Poisson LLK sum in the real and imaginary
     /// part of every element of the array `arr` picks, steps 1e-6 of its rms.
     fn assert_central(p: &mut Ptycho, grad: &Stack<C64>, arr: fn(&mut Ptycho) -> &mut [C64]) {
@@ -833,16 +904,18 @@ mod tests {
 
     #[test]
     fn obj_grad_matches_central_differences() {
-        let mut p = grad_start();
-        let grad = p.obj_grad();
-        assert_central(&mut p, &grad, |p| p.object.as_mut_slice());
+        for mut p in grad_starts() {
+            let grad = p.obj_grad();
+            assert_central(&mut p, &grad, |p| p.object.as_mut_slice());
+        }
     }
 
     #[test]
     fn probe_grad_matches_central_differences() {
-        let mut p = grad_start();
-        let grad = p.probe_grad();
-        assert_central(&mut p, &grad, |p| p.probe.as_mut_slice());
+        for mut p in grad_starts() {
+            let grad = p.probe_grad();
+            assert_central(&mut p, &grad, |p| p.probe.as_mut_slice());
+        }
     }
 
     /// `cg_gamma` along a direction that is not the gradient's: its numerator is `−Re⟨g, d⟩`,
@@ -850,7 +923,12 @@ mod tests {
     /// `O + t·d_O`, `P + t·d_P`, by central differences at 1e-4 of the step.
     #[test]
     fn cg_gamma_is_the_newton_step_of_the_llk() {
-        let mut p = grad_start();
+        for p in grad_starts() {
+            cg_gamma_newton(p);
+        }
+    }
+
+    fn cg_gamma_newton(mut p: Ptycho) {
         let g = p.grads(true, true);
         let d = g.clone().map(|mut d| {
             let w = d.as_mut_slice();

@@ -13,22 +13,25 @@ use std::sync::Arc;
 
 use crate::fft::Plan2d;
 use crate::gpu::{
-    BH_STEP, BhKernels, C32, CG_BLOCKS, Ended, EpochOrder, Error as GpuError, FarSums, FusedBufs,
-    GammaStacks, GradKernels, Kernels, LlkPartial, LlkRing, LlkScratch, LlkTotals, Model,
-    ObjProbeScale, PowerMax, RingDevice, RpieKernels, ScalePartial, StackTable, UpdateSums,
-    ViewAddr, ViewDims, Views,
+    BH_STEP, BackgroundSums, BhKernels, C32, CG_BLOCKS, Ended, EpochOrder, Error as GpuError,
+    FarSums, FusedBufs, GammaStacks, GradKernels, Kernels, LlkPartial, LlkRing, LlkScratch,
+    LlkTotals, Model, PositionPartial, PowerMax, RingDevice, RpieKernels, ScalePartial, Shift,
+    ShiftSums, ShiftedProbeSums, SpectrumBuf, StackTable, UpdateSums, ViewAddr, ViewDims, Views,
 };
 use crate::tile::TileDots;
 use cuda_async::cuda_graph::CudaGraph;
 use cuda_async::device_operation::{DeviceOp, ExecutionContext};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 
+use super::lsqml::{LsqmlBufs, LsqmlState, Pre};
 use super::{
     Epoch, Frames, GpuOptions, Tag, batch_stacks, plane_len, plans, split, stack_buf_len, stacks,
     to_u32,
 };
+use crate::engine::features::{POSITION_LIMIT, POSITION_STEP};
 use crate::engine::{
-    ApParams, BhParams, BhStep, DmParams, EngineError, Features, MlParams, RpieParams,
+    ApParams, BhParams, BhStep, DmParams, EngineError, Features, LsqmlParams, LsqmlStep, MlParams,
+    RpieParams,
 };
 
 /// Every buffer, module and plan a cycle launches on, and the graphs captured from them.
@@ -68,6 +71,8 @@ pub(super) struct Device {
     ml: Option<Box<MlState>>,
     /// BH's state, built by the first BH call and replaced only for another batch size.
     bh_state: Option<Box<BhState>>,
+    /// LSQML's state, built by the first LSQML call and replaced only for another batch size.
+    lsqml: Option<Box<LsqmlState>>,
     features: FeatureBufs,
 }
 
@@ -76,6 +81,8 @@ pub(super) struct Device {
 #[derive(Default)]
 struct FeatureBufs {
     scale: Option<ScaleBufs>,
+    background: Option<BackgroundBufs>,
+    position: Option<PositionBufs>,
 }
 
 /// A per-frame intensity scale `[nframe]` and its far sums `[nframe]`.
@@ -84,9 +91,33 @@ struct ScaleBufs {
     sums: DeviceBuffer<ScalePartial>,
 }
 
+/// A detector background `[ny, nx]` in the counts' order, its far sums, each detector
+/// pixel's unmasked frames and the background's photons over them.
+struct BackgroundBufs {
+    values: DeviceBuffer<f32>,
+    sums: BackgroundSums,
+    /// A copy of the ring's [`RingDevice::pixel_frames`], final once [`Device::new`] has
+    /// counted every frame.
+    nobs: DeviceBuffer<u32>,
+    /// `[1]`, written by [`FeaturesMut::background_photons`].
+    photons: DeviceBuffer<f32>,
+}
+
+/// Per-frame offsets `[nframe, 2]` of the position model, the spectra of the probe they
+/// move, the shifted probe's update sums and each frame's position sums `[nframe]`.
+struct PositionBufs {
+    offsets: DeviceBuffer<f32>,
+    spectrum: SpectrumBuf,
+    probe_sums: ShiftedProbeSums,
+    num: DeviceBuffer<PositionPartial>,
+    den: DeviceBuffer<PositionPartial>,
+}
+
 /// [`FeatureBufs`] lent to a cycle.
 pub(super) struct FeaturesMut<'a> {
     scale: Option<ScaleMut<'a>>,
+    background: Option<BackgroundMut<'a>>,
+    position: Option<PositionMut<'a>>,
 }
 
 /// [`ScaleBufs`] lent to a cycle.
@@ -95,47 +126,183 @@ struct ScaleMut<'a> {
     sums: &'a mut DeviceBuffer<ScalePartial>,
 }
 
-impl FeaturesMut<'_> {
-    /// Whether some feature takes a step from far sums.
-    pub fn stepped(&self) -> bool {
-        self.scale.is_some()
-    }
+/// [`BackgroundBufs`] lent to a cycle.
+struct BackgroundMut<'a> {
+    values: &'a mut DeviceBuffer<f32>,
+    sums: &'a mut BackgroundSums,
+    nobs: &'a DeviceBuffer<u32>,
+    photons: &'a mut DeviceBuffer<f32>,
+}
 
-    /// The model intensity the features set.
-    pub fn model(&self) -> Model<'_> {
-        Model {
-            scale: self.scale.as_ref().map(|s| &*s.values),
-            ..Model::default()
+/// [`PositionBufs`] lent to a cycle.
+struct PositionMut<'a> {
+    offsets: &'a mut DeviceBuffer<f32>,
+    spectrum: &'a mut SpectrumBuf,
+    probe_sums: &'a mut ShiftedProbeSums,
+    num: &'a mut DeviceBuffer<PositionPartial>,
+    den: &'a mut DeviceBuffer<PositionPartial>,
+}
+
+/// The features lent to the passes of one cycle body by [`FeaturesMut::lend`]: the model
+/// every pass that compares with the counts reads, and the sums the passes write.
+pub(super) struct Modelled<'b> {
+    pub model: Model<'b>,
+    scale: Option<&'b mut DeviceBuffer<ScalePartial>>,
+    background: Option<&'b mut BackgroundSums>,
+    position: Option<PositionSums<'b>>,
+}
+
+/// The sums of the position model, lent by [`Modelled`].
+struct PositionSums<'b> {
+    probe: &'b mut ShiftedProbeSums,
+    num: &'b mut DeviceBuffer<PositionPartial>,
+    den: &'b mut DeviceBuffer<PositionPartial>,
+}
+
+impl Modelled<'_> {
+    /// The far sums of `llk` and of every stepped feature.
+    pub fn far<'c>(&'c mut self, llk: Option<&'c mut DeviceBuffer<LlkPartial>>) -> FarSums<'c> {
+        FarSums {
+            llk,
+            scale: self.scale.as_deref_mut(),
+            background: self.background.as_deref_mut(),
         }
     }
 
-    /// The model intensity, and far sums of `llk` and of every stepped feature.
-    pub fn far<'b>(
+    /// An AP projection's sums of the position model: each frame's position sums, and with
+    /// `probe` the shifted probe's update sums; none without a position.
+    pub fn shift_sums(&mut self, probe: bool) -> ShiftSums<'_> {
+        match &mut self.position {
+            Some(p) => ShiftSums {
+                probe: probe.then_some(&mut *p.probe),
+                position: Some(&mut *p.num),
+                position_den: Some(&mut *p.den),
+            },
+            None => ShiftSums::default(),
+        }
+    }
+
+    /// Whether the model moves the probe, whose update sums then come from
+    /// [`Self::shift_sums`] and [`Self::probe_sums`].
+    pub fn shifted(&self) -> bool {
+        self.position.is_some()
+    }
+
+    /// Adds the shifted probe's update sums the projections added into `out`, consuming
+    /// them; nothing without a position.
+    pub fn probe_sums(
+        &mut self,
+        ctx: &ExecutionContext,
+        kernels: &Kernels,
+        dims: &ViewDims,
+        out: &mut UpdateSums,
+    ) -> Result<(), GpuError> {
+        if let Some(p) = &mut self.position {
+            kernels.shifted_probe_sums(ctx, dims, p.probe, out)?;
+        }
+        Ok(())
+    }
+}
+
+impl FeaturesMut<'_> {
+    /// Whether some feature takes a step from far sums.
+    pub fn stepped(&self) -> bool {
+        self.scale.is_some() || self.background.is_some()
+    }
+
+    /// The per-frame intensity scale, if modelled.
+    pub fn scale(&self) -> Option<&DeviceBuffer<f32>> {
+        self.scale.as_ref().map(|s| &*s.values)
+    }
+
+    /// The features lent to the passes of one cycle body over `probe`, which cannot change
+    /// while they are: the model of every feature set, the position's after the spectra of
+    /// `probe` it moves (two launches), and the sums.
+    pub fn lend<'b>(
         &'b mut self,
-        llk: Option<&'b mut DeviceBuffer<LlkPartial>>,
-    ) -> (Model<'b>, FarSums<'b>) {
+        ctx: &ExecutionContext,
+        kernels: &Kernels,
+        dims: &ViewDims,
+        probe: &'b DeviceBuffer<C32>,
+    ) -> Result<Modelled<'b>, GpuError> {
         let (scale, scale_sums) = match &mut self.scale {
             Some(s) => (Some(&*s.values), Some(&mut *s.sums)),
             None => (None, None),
         };
-        let model = Model {
-            scale,
-            ..Model::default()
+        let (background, background_sums) = match &mut self.background {
+            Some(b) => (Some(&*b.values), Some(&mut *b.sums)),
+            None => (None, None),
         };
-        let far = FarSums {
-            llk,
+        let (shift, position) = match &mut self.position {
+            Some(p) => {
+                let shift = Shift {
+                    offsets: &*p.offsets,
+                    spectrum: kernels.probe_spectrum(ctx, dims, probe, p.spectrum)?,
+                };
+                let sums = PositionSums {
+                    probe: &mut *p.probe_sums,
+                    num: &mut *p.num,
+                    den: &mut *p.den,
+                };
+                (Some(shift), Some(sums))
+            }
+            None => (None, None),
+        };
+        Ok(Modelled {
+            model: Model {
+                scale,
+                background,
+                shift,
+            },
             scale: scale_sums,
-            ..FarSums::default()
-        };
-        (model, far)
+            background: background_sums,
+            position,
+        })
     }
 
-    /// Every stepped feature's step from the far sums [`Self::far`] lent the passes before.
-    pub fn step(&mut self, ctx: &ExecutionContext, grad: &GradKernels) -> Result<(), GpuError> {
+    /// Every stepped feature's step from the far sums [`Modelled::far`] lent the passes
+    /// before.
+    pub fn step(
+        &mut self,
+        ctx: &ExecutionContext,
+        kernels: &Kernels,
+        grad: &GradKernels,
+    ) -> Result<(), GpuError> {
         if let Some(s) = &mut self.scale {
             grad.scale_step(ctx, s.values, s.sums)?;
         }
+        if let Some(b) = &mut self.background {
+            kernels.background_ap(ctx, b.values, b.sums, b.nobs)?;
+        }
         Ok(())
+    }
+
+    /// The position step from the position sums the AP projections wrote, after the
+    /// updates; nothing without a position.
+    pub fn position_step(
+        &mut self,
+        ctx: &ExecutionContext,
+        grad: &GradKernels,
+    ) -> Result<(), GpuError> {
+        if let Some(p) = &mut self.position {
+            let limits = [POSITION_STEP as f32, POSITION_LIMIT as f32];
+            grad.position_step(ctx, p.offsets, [&*p.num, &*p.den], limits)?;
+        }
+        Ok(())
+    }
+
+    /// The background's photons over the unmasked pixels of every frame, for
+    /// [`crate::gpu::ObjProbeScale::Absolute`]; `None` without a background.
+    pub fn background_photons(
+        &mut self,
+        ctx: &ExecutionContext,
+        grad: &GradKernels,
+    ) -> Result<Option<&DeviceBuffer<f32>>, GpuError> {
+        let Some(b) = &mut self.background else {
+            return Ok(None);
+        };
+        grad.background_photons(ctx, b.values, b.nobs, b.photons)?;
+        Ok(Some(&*b.photons))
     }
 }
 
@@ -200,6 +367,12 @@ enum Cycle {
         params: BhParams,
         cg: bool,
     },
+    /// Its buffers are the device's [`LsqmlState`], which every LSQML epoch of its batch
+    /// size shares.
+    Lsqml {
+        params: LsqmlParams,
+        pre: Pre,
+    },
 }
 
 impl Cycle {
@@ -210,6 +383,7 @@ impl Cycle {
             Self::Rpie(p, _) => Epoch::Rpie(p),
             Self::Ml { params, first, llk } => Epoch::Ml { params, first, llk },
             Self::Bh { params, cg } => Epoch::Bh { params, cg },
+            Self::Lsqml { params, pre } => Epoch::Lsqml { params, pre },
         }
     }
 }
@@ -527,6 +701,8 @@ pub(super) struct Bufs<'a> {
     pub ml: Option<MlBufs<'a>>,
     /// BH's state, once a BH call has built it.
     pub bh_state: Option<BhBufs<'a>>,
+    /// LSQML's state, once an LSQML call has built it.
+    pub lsqml: Option<LsqmlBufs<'a>>,
     pub features: FeaturesMut<'a>,
 }
 
@@ -640,6 +816,7 @@ impl Device {
             llk_graph: None,
             ml: None,
             bh_state: None,
+            lsqml: None,
             features: FeatureBufs::default(),
             stack_size: to_u32("stack_size", options.stack_size)?,
             stream,
@@ -663,52 +840,125 @@ impl Device {
     /// Models `features`, which the caller checked against the scan, from here on: the
     /// values of the features already set are written in place; other features replace the
     /// buffers, and so first drop every graph, which addresses them, and then recapture the
-    /// LLK pass's. Only the fused passes model features.
+    /// LLK pass's. Only the fused passes model features; a position also takes their
+    /// scratch of a shift, which they drop again with it.
     pub fn set_features(&mut self, features: &Features) -> Result<(), EngineError> {
         if matches!(self.passes, Passes::M1 { .. }) && *features != Features::default() {
             return Err(EngineError::Invalid(
                 "features need GpuOptions { fused: true, .. }".into(),
             ));
         }
-        let scale: Option<Vec<f32>> = features
-            .scale
-            .as_ref()
-            .map(|s| s.iter().map(|&s| s as f32).collect());
-        match (&mut self.features.scale, scale) {
-            (Some(b), Some(v)) => b.values.copy_from_host(&self.stream, &v)?,
-            (None, None) => {}
-            (_, scale) => {
-                let scale = scale
-                    .map(|v| {
-                        Ok::<_, EngineError>(ScaleBufs {
-                            values: DeviceBuffer::from_host(&self.stream, &v)?,
-                            sums: DeviceBuffer::zeroed(&self.stream, v.len())?,
-                        })
-                    })
-                    .transpose()?;
-                self.runs.clear();
-                self.llk_graph = None;
-                self.features.scale = scale;
-                self.capture_llk()?;
+        let f32s = |v: &Option<Vec<f64>>| v.as_ref().map(|v| v.iter().map(|&x| x as f32).collect());
+        let (scale, background): (Option<Vec<f32>>, Option<Vec<f32>>) =
+            (f32s(&features.scale), f32s(&features.background));
+        let position: Option<Vec<f32>> =
+            (features.position.as_ref()).map(|d| d.iter().flatten().map(|&x| x as f32).collect());
+        let have = &mut self.features;
+        if have.scale.is_some() == scale.is_some()
+            && have.background.is_some() == background.is_some()
+            && have.position.is_some() == position.is_some()
+        {
+            if let (Some(b), Some(v)) = (&mut have.scale, scale) {
+                b.values.copy_from_host(&self.stream, &v)?;
             }
+            if let (Some(b), Some(v)) = (&mut have.background, background) {
+                b.values.copy_from_host(&self.stream, &v)?;
+            }
+            if let (Some(b), Some(v)) = (&mut have.position, position) {
+                b.offsets.copy_from_host(&self.stream, &v)?;
+            }
+            return Ok(());
         }
+        let stream = &self.stream;
+        let scale = scale
+            .map(|v| {
+                Ok::<_, EngineError>(ScaleBufs {
+                    values: DeviceBuffer::from_host(stream, &v)?,
+                    sums: DeviceBuffer::zeroed(stream, v.len())?,
+                })
+            })
+            .transpose()?;
+        let background = background
+            .map(|v| {
+                let pixel_frames = self.ring.device().pixel_frames();
+                let mut nobs = DeviceBuffer::zeroed(stream, pixel_frames.len())?;
+                nobs.copy_from_device_async(pixel_frames, stream)?;
+                Ok::<_, EngineError>(BackgroundBufs {
+                    values: DeviceBuffer::from_host(stream, &v)?,
+                    sums: BackgroundSums::zeroed(stream, self.views.dims(), self.table.nf_max())?,
+                    nobs,
+                    photons: DeviceBuffer::zeroed(stream, 1)?,
+                })
+            })
+            .transpose()?;
+        let dims = self.views.dims();
+        let passes = if have.position.is_some() == position.is_some() {
+            None
+        } else {
+            let nf_max = self.table.nf_max();
+            let bufs = match position {
+                Some(_) => FusedBufs::with_shift(stream, dims, nf_max),
+                None => FusedBufs::new(stream, dims, nf_max),
+            };
+            Some(Passes::Fused(Box::new(bufs.map_err(|e| match e {
+                GpuError::Shape(m) => EngineError::Invalid(format!("position model: {m}")),
+                e => e.into(),
+            })?)))
+        };
+        let position = position
+            .map(|v| {
+                Ok::<_, EngineError>(PositionBufs {
+                    offsets: DeviceBuffer::from_host(stream, &v)?,
+                    spectrum: SpectrumBuf::zeroed(stream, dims)?,
+                    probe_sums: ShiftedProbeSums::zeroed(stream, dims)?,
+                    num: DeviceBuffer::zeroed(stream, dims.nframe as usize)?,
+                    den: DeviceBuffer::zeroed(stream, dims.nframe as usize)?,
+                })
+            })
+            .transpose()?;
+        self.runs.clear();
+        self.llk_graph = None;
+        self.features = FeatureBufs {
+            scale,
+            background,
+            position,
+        };
+        if let Some(passes) = passes {
+            self.passes = passes;
+        }
+        self.capture_llk()?;
         Ok(())
     }
 
     /// The modelled features, read back.
     pub fn features(&self) -> Result<Features, EngineError> {
-        let scale = match &self.features.scale {
-            Some(b) => Some(b.values.to_host_vec(&self.stream)?),
-            None => None,
+        let f64s = |b: Option<&DeviceBuffer<f32>>| {
+            b.map(|b| Ok::<_, EngineError>(b.to_host_vec(&self.stream)?))
+                .transpose()
+                .map(|v| v.map(|v| v.into_iter().map(f64::from).collect()))
         };
         Ok(Features {
-            scale: scale.map(|v| v.into_iter().map(f64::from).collect()),
+            scale: f64s(self.features.scale.as_ref().map(|b| &b.values))?,
+            background: f64s(self.features.background.as_ref().map(|b| &b.values))?,
+            position: (self.features.position.as_ref())
+                .map(|p| {
+                    let d = p.offsets.to_host_vec(&self.stream)?;
+                    let d = d.as_chunks::<2>().0.iter();
+                    Ok::<_, EngineError>(d.map(|o| o.map(f64::from)).collect())
+                })
+                .transpose()?,
         })
     }
 
     /// Whether some feature is modelled.
     pub fn has_features(&self) -> bool {
-        self.features.scale.is_some()
+        let f = &self.features;
+        f.scale.is_some() || f.background.is_some() || f.position.is_some()
+    }
+
+    /// Whether the position is modelled.
+    pub fn has_position(&self) -> bool {
+        self.features.position.is_some()
     }
 
     pub fn stream(&self) -> &Arc<CudaStream> {
@@ -768,10 +1018,24 @@ impl Device {
             norms: &mut self.norms,
             ml: self.ml.as_deref_mut().map(MlState::lend),
             bh_state: self.bh_state.as_deref_mut().map(BhState::lend),
+            lsqml: self.lsqml.as_deref_mut().map(LsqmlState::lend),
             features: FeaturesMut {
                 scale: self.features.scale.as_mut().map(|s| ScaleMut {
                     values: &mut s.values,
                     sums: &mut s.sums,
+                }),
+                background: self.features.background.as_mut().map(|b| BackgroundMut {
+                    values: &mut b.values,
+                    sums: &mut b.sums,
+                    nobs: &b.nobs,
+                    photons: &mut b.photons,
+                }),
+                position: self.features.position.as_mut().map(|p| PositionMut {
+                    offsets: &mut p.offsets,
+                    spectrum: &mut p.spectrum,
+                    probe_sums: &mut p.probe_sums,
+                    num: &mut p.num,
+                    den: &mut p.den,
                 }),
             },
         };
@@ -838,6 +1102,33 @@ impl Device {
                 }
             })
             .collect())
+    }
+
+    /// One LSQML epoch as [`Self::steady`] enqueues it, after setting its frame order:
+    /// `order` holds the scan frame at each epoch position.
+    pub fn lsqml_epoch(
+        &mut self,
+        params: LsqmlParams,
+        pre: Pre,
+        cycle: usize,
+        order: &[u32],
+    ) -> Result<(), EngineError> {
+        self.steady_with(Epoch::Lsqml { params, pre }, cycle, |dev| {
+            let ctx = dev.context();
+            let l = dev
+                .lsqml
+                .as_deref_mut()
+                .expect("new_run built the LSQML state");
+            Ok(l.set_order(&ctx, &dev.kernels, &dev.views, order)?)
+        })
+    }
+
+    /// The last LSQML epoch's steps, one per batch; none before an LSQML call.
+    pub fn lsqml_steps(&self) -> Result<Vec<LsqmlStep>, EngineError> {
+        match self.lsqml.as_deref() {
+            Some(l) => l.steps(&self.stream),
+            None => Ok(Vec::new()),
+        }
     }
 
     /// [`Self::steady`] with `stage` enqueued just before the cycle, once its buffers are
@@ -918,6 +1209,10 @@ impl Device {
                 self.build_bh(&params)?;
                 Cycle::Bh { params, cg }
             }
+            Epoch::Lsqml { params, pre } => {
+                self.build_lsqml(&params)?;
+                Cycle::Lsqml { params, pre }
+            }
         };
         let graph = if self.use_graph {
             Some(self.capture(|bufs, passes, ring, ctx| bufs.cycle(ctx, passes, ring, &mut cycle))?)
@@ -960,6 +1255,26 @@ impl Device {
         Ok(())
     }
 
+    /// Builds the [`LsqmlState`] for `params`' batch size unless it is built, replaced as
+    /// [`Self::build_bh`] replaces BH's.
+    fn build_lsqml(&mut self, params: &LsqmlParams) -> Result<(), EngineError> {
+        let size = to_u32(
+            "batch_size",
+            params.batch_size.min(self.dims().nframe as usize),
+        )?;
+        if self.lsqml.as_ref().is_none_or(|s| s.size() != size) {
+            let state = LsqmlState::new(
+                &self.stream,
+                &self.kernels,
+                &self.views,
+                size,
+                self.stack_size,
+            )?;
+            self.lsqml = Some(Box::new(state));
+        }
+        Ok(())
+    }
+
     /// [`Bufs::scale_to_photons`] enqueued eagerly, with `total` the unmasked observed photons.
     pub fn scale_to_photons(&mut self, total: f32) -> Result<(), EngineError> {
         self.build_ml()?;
@@ -973,7 +1288,7 @@ impl Device {
     pub fn balance_obj_probe(&mut self) -> Result<(), EngineError> {
         let ctx = self.context();
         let (mut bufs, _, _) = self.lend();
-        Ok(bufs.scale_obj_probe(&ctx, ObjProbeScale::Relative)?)
+        Ok(bufs.scale_obj_probe(&ctx, None)?)
     }
 
     /// The ML gradients of the current estimate, object then probe, as
@@ -1082,6 +1397,7 @@ impl<'a> Bufs<'a> {
             Cycle::Bh { params, cg } => self
                 .with_bh(|b, bh| b.bh_epoch(ctx, bh, params, *cg))
                 .map(|()| None),
+            Cycle::Lsqml { params, pre } => self.lsqml_epoch(ctx, params, *pre).map(|()| None),
         }
     }
 }

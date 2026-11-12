@@ -24,6 +24,7 @@ mod ap;
 mod bh;
 mod device;
 mod dm;
+mod lsqml;
 mod ml;
 mod rpie;
 
@@ -44,7 +45,8 @@ use device::{Bufs, Device, M1Bufs, NormBufs, PassesMut};
 
 use crate::engine::ptycho::{Algorithm, LlkRecord, zero_phase_ramp};
 use crate::engine::{
-    ApParams, BhParams, DmParams, EngineError, Features, Fft2, Llk, MlParams, Observed, RpieParams,
+    ApParams, BhParams, DmParams, EngineError, Features, Fft2, Llk, LsqmlParams, MlParams,
+    Observed, RpieParams,
 };
 
 /// How [`GpuPtycho`] batches its work.
@@ -96,6 +98,11 @@ enum Epoch {
     },
     /// A BH epoch; with `cg` it continues the last epoch's direction.
     Bh { params: BhParams, cg: bool },
+    /// An LSQML epoch; `pre` says what it does to the preconditioner.
+    Lsqml {
+        params: LsqmlParams,
+        pre: lsqml::Pre,
+    },
 }
 
 impl Epoch {
@@ -106,6 +113,7 @@ impl Epoch {
             Self::Rpie(_) => Algorithm::Rpie,
             Self::Ml { .. } => Algorithm::Ml,
             Self::Bh { .. } => Algorithm::Bh,
+            Self::Lsqml { .. } => Algorithm::Lsqml,
         }
     }
 
@@ -124,6 +132,10 @@ impl Epoch {
                 llk: false,
             },
             Self::Bh { params, .. } => Self::Bh { params, cg: false },
+            Self::Lsqml { params, .. } => Self::Lsqml {
+                params,
+                pre: lsqml::Pre::Keep,
+            },
         }
     }
 }
@@ -429,7 +441,9 @@ impl GpuPtycho {
     /// Models and refines `features` from here on, as [`crate::engine::Ptycho::set_features`], in
     /// `f32` on the device; with [`GpuOptions::fused`] only. An error leaves the current ones.
     pub fn set_features(&mut self, features: &Features) -> Result<(), EngineError> {
-        features.check(self.dev.dims().nframe as usize)?;
+        let dims = self.dev.dims();
+        let [ny, nx] = dims.frame.map(|n| n as usize);
+        features.check(dims.nframe as usize, [ny, nx])?;
         self.dev.set_features(features)
     }
 
@@ -499,10 +513,10 @@ impl Bufs<'_> {
         mut rec: RecordWriter<'_>,
     ) -> Result<Ended, GpuError> {
         let dims = *self.views.dims();
-        for s in 0..self.stacks.len() {
-            let stack = self.table.at(s);
-            match passes {
-                PassesMut::M1(m1) => {
+        match passes {
+            PassesMut::M1(m1) => {
+                for s in 0..self.stacks.len() {
+                    let stack = self.table.at(s);
                     self.kernels.obj_probe_to_psi(
                         ctx, self.views, stack, self.obj, self.probe, m1.scratch,
                     )?;
@@ -516,23 +530,28 @@ impl Bufs<'_> {
                         self.llk_scratch,
                         self.llk,
                     )?;
+                    rec.push(ctx, &dims, stack, self.llk)?;
                 }
-                PassesMut::Fused(f) => {
+            }
+            PassesMut::Fused(f) => {
+                let m = self.features.lend(ctx, self.kernels, &dims, self.probe)?;
+                for s in 0..self.stacks.len() {
+                    let stack = self.table.at(s);
                     let inputs = FusedInputs {
                         views: self.views,
                         counts: self.counts,
                         obj: self.obj,
                         probe: self.probe,
-                        model: self.features.model(),
+                        model: m.model,
                     };
                     let far = FarSums {
                         llk: Some(&mut *self.llk),
                         ..FarSums::default()
                     };
                     self.kernels.fused_llk(ctx, &inputs, stack, f, far)?;
+                    rec.push(ctx, &dims, stack, self.llk)?;
                 }
             }
-            rec.push(ctx, &dims, stack, self.llk)?;
         }
         rec.end(ctx)
     }
@@ -547,23 +566,24 @@ impl Bufs<'_> {
         mut llk: Option<RecordWriter<'_>>,
     ) -> Result<Option<Ended>, GpuError> {
         let dims = *self.views.dims();
+        let mut m = self.features.lend(ctx, self.kernels, &dims, self.probe)?;
         for s in 0..self.stacks.len() {
             let stack = self.table.at(s);
-            let (model, far) = self.features.far(llk.is_some().then_some(&mut *self.llk));
             let inputs = FusedInputs {
                 views: self.views,
                 counts: self.counts,
                 obj: self.obj,
                 probe: self.probe,
-                model,
+                model: m.model,
             };
+            let far = m.far(llk.is_some().then_some(&mut *self.llk));
             self.kernels.fused_llk(ctx, &inputs, stack, f, far)?;
             if let Some(rec) = &mut llk {
                 rec.push(ctx, &dims, stack, self.llk)?;
             }
         }
         let ended = llk.map(|w| w.end(ctx)).transpose()?;
-        self.features.step(ctx, self.grad)?;
+        self.features.step(ctx, self.kernels, self.grad)?;
         Ok(ended)
     }
 
@@ -644,12 +664,13 @@ impl Bufs<'_> {
         Ok(())
     }
 
-    /// PyNX `ScaleObjProbe` by `scale`: the norms of the object and the probe, then the
-    /// scaling, without a host sync.
+    /// PyNX `ScaleObjProbe`, without a host sync: the norms of the object and the probe, then
+    /// the scaling, [`ObjProbeScale::Absolute`] to `absolute`'s `(icalc, total)` photons, the
+    /// background's photons left out of both, or [`ObjProbeScale::Relative`] for `None`.
     fn scale_obj_probe(
         &mut self,
         ctx: &ExecutionContext,
-        scale: ObjProbeScale<'_>,
+        absolute: Option<(&DeviceBuffer<f32>, f32)>,
     ) -> Result<(), GpuError> {
         let NormBufs {
             parts,
@@ -664,6 +685,14 @@ impl Bufs<'_> {
             self.grad.sum_parts(ctx, parts, CG_BLOCKS, out)?;
         }
         let norms = [&*obj_norm, &*probe_norm];
+        let scale = match absolute {
+            Some((icalc, total)) => ObjProbeScale::Absolute {
+                icalc,
+                total,
+                background: self.features.background_photons(ctx, self.grad)?,
+            },
+            None => ObjProbeScale::Relative,
+        };
         self.grad
             .scale_obj_probe(ctx, self.obj, self.probe, norms, scale)
     }

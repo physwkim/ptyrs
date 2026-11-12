@@ -132,7 +132,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         match algo.as_str() {
             "dm" => p.dm(&dm, ncycle),
             "ap" => p.ap(&AP, ncycle),
-            "ml" => p.ml(&ML, ncycle),
+            "ml" => p.ml(&ML, ncycle)?,
             _ => p.rpie(&RPIE, ncycle)?,
         }
         let secs = t.elapsed().as_secs_f64();

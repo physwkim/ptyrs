@@ -107,7 +107,7 @@ impl EpochOrder {
 
     /// Enqueues on `ctx` the upload of `ids`, the scan frame at each epoch position, and the
     /// reorder of `src`, the views this order was made from, by them; nothing when the
-    /// device already holds `ids`. Waits only for the copy [`ORDER_SLOTS`] uploads back.
+    /// device already holds `ids`. Waits only for the copy `ORDER_SLOTS` uploads back.
     pub fn set(
         &mut self,
         ctx: &ExecutionContext,
@@ -420,9 +420,10 @@ impl BhKernels {
     }
 
     /// The step of `batch` along `d` into its record of `steps` (`(β, α, top, bottom)`,
-    /// [`BH_STEP`] floats each) from the partials [`Self::dots`] and [`Self::hess_frames`]
-    /// left in `parts`: `β = H(u, v) / H(v, v)` with `d.v`, else 0; `top = ⟨u, Pu⟩ − β ⟨u,
-    /// v⟩ = −⟨g, D⟩` and `bottom = H(D, D)` for `D = β v − Pu`; `α = top / bottom * frac`.
+    /// [`BH_STEP`] floats each) from the partials [`crate::tile::TileDots::dots`] and
+    /// [`Self::hess_frames`] left in `parts`: `β = H(u, v) / H(v, v)` with `d.v`, else 0;
+    /// `top = ⟨u, Pu⟩ − β ⟨u, v⟩ = −⟨g, D⟩` and `bottom = H(D, D)` for `D = β v − Pu`;
+    /// `α = top / bottom * frac`.
     pub fn step(
         &self,
         ctx: &ExecutionContext,
