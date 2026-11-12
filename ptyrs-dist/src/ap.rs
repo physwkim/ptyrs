@@ -32,7 +32,7 @@ use ptyrs_gpu::{
 };
 
 use crate::exchange::{self, Pull, Run, Runs};
-use crate::{DEFAULT_TILE, DistError, Exchange, Gpu, Partition, Scheme, Workers};
+use crate::{DEFAULT_TILE, DistError, Exchange, Gpu, Partition, Scheme, TileGrid, Workers};
 
 /// Leaf regions every run is cut from; a run uses 1, 2 or 4 GPUs.
 pub const NLEAF: usize = 4;
@@ -71,9 +71,77 @@ struct Stack {
     frames: Range<u32>,
 }
 
+/// The part of the object a region's GPU holds: the bounding box of its own tiles and the
+/// halo tiles it reads, in whole tiles, so its kernel tiles are the object's shifted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Window {
+    /// First object pixel `[y, x]`.
+    at: [usize; 2],
+    /// `[ny, nx]` pixels per object mode.
+    shape: [usize; 2],
+}
+
+impl Window {
+    fn new(grid: &TileGrid, tiles: impl IntoIterator<Item = usize>) -> Self {
+        let (mut lo, mut hi) = ([usize::MAX; 2], [0; 2]);
+        for t in tiles {
+            let c = grid.coords(t);
+            for a in 0..2 {
+                lo[a] = lo[a].min(c[a]);
+                hi[a] = hi[a].max(c[a] + 1);
+            }
+        }
+        let (obj, tile) = (grid.obj(), grid.tile());
+        let at = lo.map(|l| l * tile);
+        Self {
+            at,
+            shape: [0, 1].map(|a| (hi[a] * tile).min(obj[a]) - at[a]),
+        }
+    }
+
+    fn len(&self, nobj: usize) -> usize {
+        nobj * self.shape[0] * self.shape[1]
+    }
+
+    /// Index in the window's `[nobj, ny, nx]` of object pixel `(y, x)` of mode `m`.
+    fn index(&self, m: usize, y: usize, x: usize) -> usize {
+        let [dy, dx] = [(y, 0), (x, 1)].map(|(p, a)| {
+            p.checked_sub(self.at[a])
+                .filter(|&d| d < self.shape[a])
+                .expect("pixel inside the window")
+        });
+        (m * self.shape[0] + dy) * self.shape[1] + dx
+    }
+
+    /// The window of the `[nobj, nyo, nxo]` object `obj`.
+    fn crop(&self, obj: &[C32], [nyo, nxo]: [usize; 2]) -> Vec<C32> {
+        let ([y0, x0], [ny, nx]) = (self.at, self.shape);
+        let mut out = Vec::with_capacity(self.len(obj.len() / (nyo * nxo)));
+        for plane in obj.chunks_exact(nyo * nxo) {
+            for y in y0..y0 + ny {
+                out.extend_from_slice(&plane[y * nxo + x0..][..nx]);
+            }
+        }
+        out
+    }
+
+    /// `v` with offsets into the window.
+    fn view(&self, v: &View) -> ViewAddr {
+        let shift = |o: u32, a: usize| o - self.at[a] as u32;
+        ViewAddr {
+            oy: shift(v.oy, 0),
+            ox: shift(v.ox, 1),
+            ..view_addr(v)
+        }
+    }
+}
+
 /// One region's share, fixed at setup.
 struct RegionPlan {
+    window: Window,
+    /// Over the window.
     dims: ViewDims,
+    /// Offsets into the window.
     views: Vec<ViewAddr>,
     /// Global frame of each local frame, in (class, leaf, frame) order.
     global: Vec<u32>,
@@ -86,13 +154,22 @@ struct RegionPlan {
     halo_read: Vec<u32>,
 }
 
-/// The object rows region `recv` reads from region `owner`'s tiles, `[byte offset, words]`
-/// each. `owner` packs them from word `send_at` of its send buffer on; `recv` pulls them to
-/// word `recv_at` of its receive buffer and unpacks them into its object.
+/// `len` object pixels of mode `m` from `(y, x)` on.
+#[derive(Clone)]
+struct HaloRow {
+    m: usize,
+    y: usize,
+    x: usize,
+    len: usize,
+}
+
+/// The object rows region `recv` reads from region `owner`'s tiles. `owner` packs them from
+/// word `send_at` of its send buffer on; `recv` pulls them to word `recv_at` of its receive
+/// buffer and unpacks them into its window.
 struct HaloSeg {
     recv: usize,
     owner: usize,
-    rows: Vec<[u64; 2]>,
+    rows: Vec<HaloRow>,
     words: u64,
     send_at: u64,
     recv_at: u64,
@@ -225,19 +302,26 @@ impl Plan {
                     }
                 }
             }
+            let halo_read: Vec<u32> = (0..grid.len())
+                .filter(|&t| read[t])
+                .map(|t| t as u32)
+                .collect();
+            let window = Window::new(
+                grid,
+                region.own.iter().chain(&halo_read).map(|&t| t as usize),
+            );
             regions.push(RegionPlan {
+                window,
                 dims: ViewDims {
                     nframe: u(global.len())?,
+                    obj: [u(window.shape[0])?, u(window.shape[1])?],
                     ..dims
                 },
                 views: global
                     .iter()
-                    .flat_map(|&f| addr.frame_views(f as usize).iter().map(view_addr))
+                    .flat_map(|&f| addr.frame_views(f as usize).iter().map(|v| window.view(v)))
                     .collect(),
-                halo_read: (0..grid.len())
-                    .filter(|&t| read[t])
-                    .map(|t| t as u32)
-                    .collect(),
+                halo_read,
                 global,
                 stacks,
                 interior: ninterior,
@@ -279,28 +363,31 @@ impl Plan {
         [sum(&|s| s.owner == r), sum(&|s| s.recv == r)]
     }
 
-    /// `[object byte offset, buffer word, words]` of every row of the segments `pick` selects,
-    /// laid out in the buffer from word `at(segment)` on.
+    /// `[byte offset in region r's window, buffer word, words]` of every row of the segments
+    /// `pick` selects, laid out in the buffer from word `at(segment)` on.
     fn halo_rows(
         &self,
+        r: usize,
         pick: impl Fn(&HaloSeg) -> bool,
         at: fn(&HaloSeg) -> u64,
     ) -> impl Iterator<Item = [u64; 3]> {
+        let win = self.regions[r].window;
         self.halo
             .iter()
             .filter(move |s| pick(s))
             .flat_map(move |s| {
                 let mut w = at(s);
-                s.rows.iter().map(move |&[off, len]| {
+                s.rows.iter().map(move |row| {
+                    let (off, len) = (win.index(row.m, row.y, row.x), row.len as u64);
                     w += len;
-                    [off, w - len, len]
+                    [(off * size_of::<C32>()) as u64, w - len, len]
                 })
             })
     }
 
     /// Runs copying region `r`'s object rows that others read into its send buffer.
     fn halo_pack(&self, r: usize, obj: u64, send: u64) -> Vec<Run> {
-        self.halo_rows(|s| s.owner == r, |s| s.send_at)
+        self.halo_rows(r, |s| s.owner == r, |s| s.send_at)
             .map(|[off, w, len]| Run {
                 dst: send + w * 8,
                 src: obj + off,
@@ -311,7 +398,7 @@ impl Plan {
 
     /// Runs copying region `r`'s receive buffer into the halo rows of its object.
     fn halo_unpack(&self, r: usize, obj: u64, recv: u64) -> Vec<Run> {
-        self.halo_rows(|s| s.recv == r, |s| s.recv_at)
+        self.halo_rows(r, |s| s.recv == r, |s| s.recv_at)
             .map(|[off, w, len]| Run {
                 dst: obj + off,
                 src: recv + w * 8,
@@ -391,16 +478,20 @@ fn halo_segs(run: &Partition, regions: &[RegionPlan], nobj: usize) -> Vec<HaloSe
                     i += 1;
                 }
                 i += 1;
-                let (x0, x1) = (tx0 * tile, ((tx1 + 1) * tile).min(nxo));
+                let (x, x1) = (tx0 * tile, ((tx1 + 1) * tile).min(nxo));
                 for y in ty * tile..((ty + 1) * tile).min(nyo) {
-                    let off = (((m * nyo + y) * nxo + x0) * size_of::<C32>()) as u64;
-                    rows[o].push([off, (x1 - x0) as u64]);
+                    rows[o].push(HaloRow {
+                        m,
+                        y,
+                        x,
+                        len: x1 - x,
+                    });
                 }
             }
         }
         let mut recv_at = 0;
         for (o, rows) in rows.into_iter().enumerate() {
-            let words: u64 = rows.iter().map(|w| w[1]).sum();
+            let words: u64 = rows.iter().map(|w| w.len as u64).sum();
             if words == 0 {
                 continue;
             }
@@ -604,7 +695,8 @@ impl State {
             .probe_inertia
             .map(|_| Tree::new(stream, gpu.region(), plan.k, np, &leaf_sums))
             .transpose()?;
-        let obj = DeviceBuffer::from_host(stream, &data.object)?;
+        let obj = rp.window.crop(&data.object, plan.run.grid().obj());
+        let obj = DeviceBuffer::from_host(stream, &obj)?;
         let halo = {
             let r = gpu.region();
             let [send, recv] = plan
@@ -634,7 +726,7 @@ impl State {
                 .collect::<Result<_, _>>()?,
             obj_sums: plan
                 .obj_inertia
-                .map(|_| UpdateSums::zeroed(stream, data.object.len()))
+                .map(|_| UpdateSums::zeroed(stream, rp.window.len(rp.dims.nobj as usize)))
                 .transpose()?,
             leaf_sums,
             tree,
@@ -971,14 +1063,17 @@ impl DistAp {
         let grid = self.plan.run.grid();
         let [nyo, nxo] = grid.obj();
         let tile = grid.tile();
-        let mut out = objs[0].clone();
+        let nobj = self.plan.dims().nobj as usize;
+        let mut out = vec![C32::default(); nobj * nyo * nxo];
         for (t, &o) in self.plan.run.owner().iter().enumerate() {
             let [ty, tx] = grid.coords(t);
             let (x0, x1) = (tx * tile, ((tx + 1) * tile).min(nxo));
-            for m in 0..self.plan.dims().nobj as usize {
+            let (win, src) = (&self.plan.regions[o as usize].window, &objs[o as usize]);
+            for m in 0..nobj {
                 for y in ty * tile..((ty + 1) * tile).min(nyo) {
                     let row = (m * nyo + y) * nxo;
-                    out[row + x0..row + x1].copy_from_slice(&objs[o as usize][row + x0..row + x1]);
+                    let at = win.index(m, y, x0);
+                    out[row + x0..row + x1].copy_from_slice(&src[at..at + x1 - x0]);
                 }
             }
         }
@@ -1132,6 +1227,48 @@ mod tests {
                 assert!(got.0 == one.0, "{name}: object differs on {ngpu} GPUs");
                 assert!(got.1 == one.1, "{name}: probe differs on {ngpu} GPUs");
                 assert_eq!(got.2, one.2, "{name}: LLK differs on {ngpu} GPUs");
+            }
+        }
+    }
+
+    /// On the cases above at 2 and 4 GPUs every region's window holds its own tiles and the
+    /// halo tiles it reads and is smaller than the object, and some start inside it, so the
+    /// bit-identity test runs windows with shifted offsets and their own row strides.
+    #[test]
+    fn windows_hold_own_and_read_tiles_only() {
+        let fermat = case(128, 2, |px| sim::fermat(200, 10.0 * px));
+        let raster = case(128, 2, |px| sim::raster(8, 40, 12.0 * px));
+        for (scheme, (_, p)) in [
+            (Scheme::Sectors { centre: None }, fermat),
+            (Scheme::Strips, raster),
+        ] {
+            let cfg = ApConfig {
+                scheme,
+                stack: 7,
+                obj_inertia: Some(0.01),
+                probe_inertia: Some(0.001),
+                calc_llk: 1,
+            };
+            for ngpu in [2, 4] {
+                let plan = Plan::new(p.addr(), &cfg, 0.0, ngpu).unwrap();
+                let grid = plan.run.grid();
+                let (obj, tile) = (grid.obj(), grid.tile());
+                let mut shifted = false;
+                for (rp, region) in plan.regions.iter().zip(plan.run.regions()) {
+                    let w = rp.window;
+                    assert!(
+                        w.shape[0] * w.shape[1] < obj[0] * obj[1],
+                        "{scheme:?} on {ngpu}: {w:?} of {obj:?}"
+                    );
+                    for &t in region.own.iter().chain(&rp.halo_read) {
+                        let [ty, tx] = grid.coords(t as usize);
+                        let end = |i: usize, a: usize| ((i + 1) * tile).min(obj[a]) - 1;
+                        w.index(0, ty * tile, tx * tile);
+                        w.index(0, end(ty, 0), end(tx, 1));
+                    }
+                    shifted |= w.at != [0, 0];
+                }
+                assert!(shifted, "{scheme:?} on {ngpu}: every window starts at 0");
             }
         }
     }
