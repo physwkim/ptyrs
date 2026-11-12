@@ -320,11 +320,15 @@ impl Plan {
             .collect()
     }
 
-    /// Copy-engine pulls of region `r`'s receive buffer from the owners' send buffers.
+    /// Copy-engine pulls of region `r`'s receive buffer from the owners' send buffers, in
+    /// [`peers`] order.
     fn halo_pulls(&self, r: usize, ptrs: &[Ptrs]) -> Vec<Pull> {
-        self.halo
-            .iter()
-            .filter(|s| s.recv == r)
+        peers(r, ptrs.len())
+            .flat_map(|o| {
+                self.halo
+                    .iter()
+                    .filter(move |s| s.recv == r && s.owner == o)
+            })
             .map(|s| {
                 let o = &ptrs[s.owner];
                 Pull {
@@ -336,6 +340,13 @@ impl Plan {
             })
             .collect()
     }
+}
+
+/// The regions other than `r` of `n`, from `r + 1` on, wrapping: at each step of pull lists
+/// in this order every region reads a different source, where in index order all would read
+/// region 0 first and queue on its link.
+fn peers(r: usize, n: usize) -> impl Iterator<Item = usize> {
+    (1..n).map(move |i| (r + i) % n)
 }
 
 /// A view as the kernels take it; integer offsets only.
@@ -649,7 +660,7 @@ impl State {
     /// Region `r`'s exchange with the regions exposing `ptrs`.
     fn links(&self, gpu: &Gpu, plan: &Plan, ptrs: &[Ptrs]) -> Result<Links, DistError> {
         let (r, s) = (gpu.region(), gpu.stream());
-        let others = || ptrs.iter().enumerate().filter(move |(o, _)| *o != r);
+        let others = || peers(r, ptrs.len()).map(|o| (o, &ptrs[o]));
         let np = plan.np();
         let tree = match &self.tree {
             Some(t) => others()
@@ -1069,6 +1080,22 @@ mod tests {
             bits(&ap.probe().unwrap()),
             llk_bits(ap.history()),
         )
+    }
+
+    #[test]
+    fn peers_read_a_different_source_at_each_step() {
+        for n in [1, 2, 4] {
+            for r in 0..n {
+                let mut all: Vec<usize> = peers(r, n).collect();
+                all.sort();
+                assert_eq!(all, (0..n).filter(|&o| o != r).collect::<Vec<_>>());
+            }
+            for step in 0..n - 1 {
+                let mut src: Vec<usize> = (0..n).map(|r| peers(r, n).nth(step).unwrap()).collect();
+                src.sort();
+                assert_eq!(src, (0..n).collect::<Vec<_>>(), "n {n} step {step}");
+            }
+        }
     }
 
     /// Object, probe and every LLK are the same bits on 1, 2 and 4 GPUs, for a spiral cut in
