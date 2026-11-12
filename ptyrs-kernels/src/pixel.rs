@@ -85,13 +85,30 @@ pub struct SumPtrs {
     pub den: *mut f32,
 }
 
+// An object tile is one block of the object kernels and of the reductions.
+const _: () = assert!(OBJ_TILE * OBJ_TILE == PIXEL_THREADS);
+
 /// Device addresses of the per-object-tile view lists: tile `t`'s run is
-/// `views[start[t] .. start[t + 1]]`, ascending view indices.
+/// `views[start[t] .. start[t] + len[t]]`, ascending view indices, `len[t] <=
+/// start[t + 1] - start[t]`. No kernel reads or writes the object or sum pixels of a tile
+/// with `len[t] == 0`, nor its run.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct TilePtrs {
     pub start: *const u32,
+    pub len: *const u32,
     pub views: *const u32,
+}
+
+/// Tile `t`'s run `lo .. end` of `tiles.views`.
+///
+/// # Safety
+///
+/// `tiles.start` and `tiles.len` must hold entry `t`.
+#[device]
+pub unsafe fn tile_run(tiles: TilePtrs, t: usize) -> (u32, u32) {
+    let lo = unsafe { *tiles.start.add(t) };
+    (lo, lo + unsafe { *tiles.len.add(t) })
 }
 
 /// Per-frame log-likelihood sums over the frame's unmasked pixels (PyNX `LLKAll`).

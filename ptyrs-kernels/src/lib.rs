@@ -117,6 +117,71 @@ unsafe fn mode_power(psi: *const f32, plane0: usize, nmode: u32, n: usize, at: u
     s
 }
 
+/// This thread's object tile `ty * ntx + tx` and object pixel `(y, x)`, in a
+/// `(ntx, nty, nobj)` grid of `(OBJ_TILE, OBJ_TILE, 1)` blocks.
+#[device]
+fn tile_and_pixel() -> (usize, u32, u32) {
+    let (bx, by) = (thread::blockIdx_x(), thread::blockIdx_y());
+    let tile = (by * thread::gridDim_x() + bx) as usize;
+    let tile_px = pixel::OBJ_TILE;
+    (
+        tile,
+        by * tile_px + thread::threadIdx_y(),
+        bx * tile_px + thread::threadIdx_x(),
+    )
+}
+
+/// PyNX `ObjNorm` of element `g`: `x = (num + reg x) / max(den + reg, 1e-12)` with
+/// `reg = inertia * max`, every operation rounded on its own (no FMA contraction).
+///
+/// # Safety
+///
+/// `x`, `num` hold `g + 1` complex values, `den` `g + 1` floats.
+#[device]
+unsafe fn normalize_at(
+    x: *mut f32,
+    num: *const f32,
+    den: *const f32,
+    g: usize,
+    inertia: f32,
+    max: f32,
+) {
+    use cuda_device::float::{add_rn_f32, div_rn_f32, mul_rn_f32};
+    unsafe {
+        let reg = mul_rn_f32(inertia, max);
+        let d = add_rn_f32(*den.add(g), reg).max(1e-12);
+        let (a, b) = (pixel::load_c(num, g), pixel::load_c(x, g));
+        let part = |a: f32, b: f32| div_rn_f32(add_rn_f32(a, mul_rn_f32(reg, b)), d);
+        pixel::store_c(x, g, (part(a.0, b.0), part(a.1, b.1)));
+    }
+}
+
+/// Merges the block's thread values `m`, all non-negative, into `*out` (the bits of a
+/// non-negative float) as their maximum; non-negative floats order like their bits. Every
+/// thread of the `PIXEL_THREADS` block must call it, `t` being its index in the block.
+///
+/// # Safety
+///
+/// `s` must point to `PIXEL_THREADS` block-shared floats, `out` to one `u32`.
+#[device]
+unsafe fn block_max_into(s: *mut f32, t: usize, m: f32, out: *mut u32) {
+    use cuda_device::atomic::{AtomicOrdering, DeviceAtomicU32};
+    unsafe {
+        *s.add(t) = m;
+        let mut half = pixel::PIXEL_THREADS as usize / 2;
+        while half > 0 {
+            thread::sync_threads();
+            if t < half && *s.add(t + half) > *s.add(t) {
+                *s.add(t) = *s.add(t + half);
+            }
+            half /= 2;
+        }
+        if t == 0 {
+            DeviceAtomicU32::from_ptr(out).fetch_max((*s).to_bits(), AtomicOrdering::Relaxed);
+        }
+    }
+}
+
 /// Tree sum of `PIXEL_THREADS` shared values into element 0; every thread must call it.
 ///
 /// # Safety
@@ -141,8 +206,6 @@ pub mod kernels {
     use super::*;
     use crate::pixel::*;
     use cuda_device::SharedArray;
-    use cuda_device::atomic::{AtomicOrdering, DeviceAtomicU32};
-    use cuda_device::float::{add_rn_f32, div_rn_f32, mul_rn_f32};
 
     // M1 pixel kernels. Shapes, orders and the FFT scaling convention are documented on the
     // ptyrs-gpu wrappers, which check them; `pixel` documents the index maps. A stack is
@@ -333,15 +396,14 @@ pub mod kernels {
     /// transpose of [`obj_probe_to_psi`] applied to `psi`, `num += sum_v B_v^T (conj(P_v q)
     /// psi_v)`, and `den += sum_v B_v^T |P_v|^2` with `B_v` the bilinear sampling of view
     /// `v`. Each object pixel is owned by one thread, which adds its views in ascending `k`
-    /// from the tile list: the result does not depend on how frames are split into stacks.
-    /// Grid `(ceil(nxo / OBJ_TILE), ceil(nyo / OBJ_TILE), nobj)`, block
-    /// `(OBJ_TILE, OBJ_TILE, 1)`.
+    /// from the tile's run: the result does not depend on how frames are split into stacks.
+    /// A pixel's sums are read and written only if its tile's run holds a view of the stack.
+    /// Grid `(ntx, nty, nobj)` of `OBJ_TILE` tiles, block `(OBJ_TILE, OBJ_TILE, 1)`.
     ///
     /// # Safety
     ///
-    /// As [`obj_probe_to_psi`] with `psi` read; `sums` hold `[nobj, nyo, nxo]`;
-    /// `tiles.start` holds `ntiles + 1` ascending offsets into `tiles.views` (tile
-    /// `ty * gridDim.x + tx`), whose runs are ascending view indices covering every view
+    /// As [`obj_probe_to_psi`] with `psi` read; `sums` hold `[nobj, nyo, nxo]`; `tiles` as
+    /// [`TilePtrs`] says for tile `ty * ntx + tx`, its run covering every view of the stack
     /// that samples the tile.
     #[kernel]
     pub unsafe fn psi_to_obj(
@@ -353,19 +415,17 @@ pub mod kernels {
         ctl: *const StackCtl,
         g: StackGeom,
     ) {
-        let x = thread::blockIdx_x() * OBJ_TILE + thread::threadIdx_x();
-        let y = thread::blockIdx_y() * OBJ_TILE + thread::threadIdx_y();
+        let (tile, y, x) = tile_and_pixel();
         if x >= g.nxo || y >= g.nyo {
             return;
         }
         let iobj = thread::blockIdx_z();
         let n = g.ny as usize * g.nx as usize;
-        let tile = (thread::blockIdx_y() * thread::gridDim_x() + thread::blockIdx_x()) as usize;
         let px = (iobj as usize * g.nyo as usize + y as usize) * g.nxo as usize + x as usize;
         unsafe {
             let (f0, nf) = stack_frames(ctl, g);
             let (k0, k1) = (f0 * g.nmode, (f0 + nf) * g.nmode);
-            let (mut lo, end) = (*tiles.start.add(tile), *tiles.start.add(tile + 1));
+            let (mut lo, end) = tile_run(tiles, tile);
             // First entry >= k0.
             let mut hi = end;
             while lo < hi {
@@ -375,6 +435,9 @@ pub mod kernels {
                 } else {
                     hi = mid;
                 }
+            }
+            if lo == end || *tiles.views.add(lo as usize) >= k1 {
+                return;
             }
             let mut acc = load_c(sums.num, px);
             let mut norm = *sums.den.add(px);
@@ -471,22 +534,40 @@ pub mod kernels {
             }
             i += stride;
         }
-        let s = (&raw mut RED).cast::<f32>();
-        unsafe {
-            *s.add(t) = m;
-            let mut half = PIXEL_THREADS as usize / 2;
-            while half > 0 {
-                thread::sync_threads();
-                if t < half && *s.add(t + half) > *s.add(t) {
-                    *s.add(t) = *s.add(t + half);
-                }
-                half /= 2;
-            }
-            if t == 0 {
-                // Non-negative floats order like their bit patterns.
-                DeviceAtomicU32::from_ptr(out).fetch_max((*s).to_bits(), AtomicOrdering::Relaxed);
+        unsafe { block_max_into((&raw mut RED).cast::<f32>(), t, m, out) }
+    }
+
+    /// [`max_nonneg_f32`] of `den` `[nobj, nyo, nxo]` over the pixels of the object tiles
+    /// with views, merged into `*out`. A block whose tile has none returns without reading.
+    /// Grid `(ntx, nty, nobj)` of `OBJ_TILE` tiles, block `(OBJ_TILE, OBJ_TILE, 1)`.
+    ///
+    /// # Safety
+    ///
+    /// `den` holds `[nobj, nyo, nxo]` floats, `tile_len` `ntx * nty` entries, `out` one `u32`.
+    #[kernel]
+    pub unsafe fn max_den_tiles(
+        den: *const f32,
+        tile_len: *const u32,
+        out: *mut u32,
+        nyo: u32,
+        nxo: u32,
+    ) {
+        static mut RED: SharedArray<f32, 256> = SharedArray::UNINIT;
+        let (tile, y, x) = tile_and_pixel();
+        if unsafe { *tile_len.add(tile) } == 0 {
+            return;
+        }
+        let mut m = 0.0f32;
+        if x < nxo && y < nyo {
+            let px = (thread::blockIdx_z() as usize * nyo as usize + y as usize) * nxo as usize
+                + x as usize;
+            let v = unsafe { *den.add(px) };
+            if v > m {
+                m = v;
             }
         }
+        let t = (thread::threadIdx_y() * OBJ_TILE + thread::threadIdx_x()) as usize;
+        unsafe { block_max_into((&raw mut RED).cast::<f32>(), t, m, out) }
     }
 
     /// PyNX `ObjNorm`: `x = (num + reg x) / max(den + reg, 1e-12)` with
@@ -509,12 +590,42 @@ pub mod kernels {
         if g >= n as usize {
             return;
         }
+        unsafe { normalize_at(x, num, den, g, inertia, f32::from_bits(*max_bits)) }
+    }
+
+    /// [`normalize_update`] of `x` `[nobj, nyo, nxo]` on the pixels of the object tiles with
+    /// views; a block whose tile has none returns without reading or writing. Grid
+    /// `(ntx, nty, nobj)` of `OBJ_TILE` tiles, block `(OBJ_TILE, OBJ_TILE, 1)`.
+    ///
+    /// # Safety
+    ///
+    /// `x`, `sums` hold `[nobj, nyo, nxo]` values, `tile_len` `ntx * nty` entries, `max_bits`
+    /// one `u32`.
+    #[kernel]
+    pub unsafe fn normalize_tiles(
+        x: *mut f32,
+        sums: SumPtrs,
+        tile_len: *const u32,
+        max_bits: *const u32,
+        inertia: f32,
+        nyo: u32,
+        nxo: u32,
+    ) {
+        let (tile, y, xo) = tile_and_pixel();
+        if xo >= nxo || y >= nyo || unsafe { *tile_len.add(tile) } == 0 {
+            return;
+        }
+        let px = (thread::blockIdx_z() as usize * nyo as usize + y as usize) * nxo as usize
+            + xo as usize;
         unsafe {
-            let reg = mul_rn_f32(inertia, f32::from_bits(*max_bits));
-            let d = add_rn_f32(*den.add(g), reg).max(1e-12);
-            let (a, b) = (load_c(num, g), load_c(x, g));
-            let part = |a: f32, b: f32| div_rn_f32(add_rn_f32(a, mul_rn_f32(reg, b)), d);
-            store_c(x, g, (part(a.0, b.0), part(a.1, b.1)));
+            normalize_at(
+                x,
+                sums.num,
+                sums.den,
+                px,
+                inertia,
+                f32::from_bits(*max_bits),
+            )
         }
     }
 

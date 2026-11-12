@@ -11,8 +11,8 @@ use cuda_async::error::DeviceError;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, DeviceCopy, DriverError};
 use ptyrs_fft::{FftError, Plan2d};
 use ptyrs_gpu::{
-    C32, Error, Kernels, Lines, LlkPartial, LlkSums, MASKED, StackCtl, StackRef, StackTable,
-    UpdateSums, ViewAddr, ViewDims, Views, record,
+    C32, Error, Kernels, Lines, LlkPartial, LlkSums, MASKED, OBJ_TILE, StackCtl, StackRef,
+    StackTable, UpdateSums, ViewAddr, ViewDims, Views, record,
 };
 
 type Z = (f64, f64);
@@ -233,13 +233,18 @@ impl Scan {
 /// Frames 1 and 3 end on the object's last row and column, so their `+ 1` neighbours wrap;
 /// the subpixel offsets cover `fy` and `fx` zero and non-zero.
 fn scan() -> Scan {
+    scan_in([50, 60])
+}
+
+/// [`scan`] on an object of `obj` `[nyo, nxo]`.
+fn scan_in(obj: [u32; 2]) -> Scan {
     let d = ViewDims {
         nframe: 5,
         nmode: 4,
         nprobe: 2,
         nobj: 2,
         frame: [24, 32],
-        obj: [50, 60],
+        obj,
         quad_phase: 0.003,
     };
     let offsets = [
@@ -439,6 +444,137 @@ fn psi_to_obj_is_the_adjoint_of_obj_probe_to_psi() {
     let rel = norm2((lhs.0 - rhs.0, lhs.1 - rhs.1)).sqrt() / norm2(lhs).sqrt();
     println!("adjoint: <Ao,Ao> {lhs:?}, <o,A^H Ao> {rhs:?}, rel {rel:.2e}");
     assert!(rel < 1e-5, "rel {rel:.2e}");
+}
+
+fn c32_bits(v: &[C32]) -> Vec<(u32, u32)> {
+    v.iter().map(|c| (c.re.to_bits(), c.im.to_bits())).collect()
+}
+
+/// The tiled object update leaves the tiles without views bit-exact and reads none of their
+/// sums; every other pixel gets the bits of the flat update.
+#[test]
+fn object_update_skips_tiles_without_views() {
+    let (stream, ex, k) = setup();
+    // Views reach row 50 and column 60: tile row 4 and tile columns 4, 5 have none.
+    let s = scan_in([80, 96]);
+    let len = s.obj.len();
+    let views = Views::new(&stream, s.d, &s.views).unwrap();
+    let all = one_stack(&stream, &s.d, 0..5);
+    let probe = up(&stream, &s.probe);
+    let psi = up(&stream, &noise(s.nk(&(0..5)) * s.n(), 3, 1.0));
+    let [nyo, nxo] = s.d.obj.map(|v| v as usize);
+    let (t, ntx) = (OBJ_TILE as usize, nxo.div_ceil(OBJ_TILE as usize));
+    let tile_len = views.tile_len().to_host_vec(&stream).unwrap();
+    let lit = |i: usize| tile_len[(i / nxo % nyo) / t * ntx + i % nxo / t] != 0;
+    let nlit = (0..len).filter(|&i| lit(i)).count();
+    assert!(
+        nlit > 0 && nlit < len,
+        "{nlit} of {len} pixels on tiles with views"
+    );
+
+    let mut flat_obj = up(&stream, &s.obj);
+    let mut flat = UpdateSums::zeroed(&stream, len).unwrap();
+    k.psi_to_obj(&ex, &views, all.at(0), &psi, &probe, &mut flat)
+        .unwrap();
+    k.update_from_sums(&ex, &mut flat_obj, &mut flat, len as u32, 0.01)
+        .unwrap();
+
+    // Read, the poisoned sums would raise max(den) or put NaN into the object.
+    let nan = C32 {
+        re: f32::NAN,
+        im: f32::NAN,
+    };
+    let num0 = (0..len)
+        .map(|i| if lit(i) { C32::default() } else { nan })
+        .collect();
+    let den0: Vec<f32> = (0..len).map(|i| if lit(i) { 0.0 } else { 1e30 }).collect();
+    let mut obj = up(&stream, &s.obj);
+    let mut tiled = sums(&stream, &(num0, den0.clone()));
+    k.psi_to_obj(&ex, &views, all.at(0), &psi, &probe, &mut tiled)
+        .unwrap();
+    k.update_obj_from_sums(&ex, &views, &mut obj, &mut tiled, 0.01)
+        .unwrap();
+
+    let got = c32_bits(&obj.to_host_vec(&stream).unwrap());
+    let (flat, start) = (
+        c32_bits(&flat_obj.to_host_vec(&stream).unwrap()),
+        c32_bits(&s.obj),
+    );
+    let den = tiled.den.to_host_vec(&stream).unwrap();
+    for i in 0..len {
+        let want = if lit(i) { flat[i] } else { start[i] };
+        assert_eq!(got[i], want, "pixel {i}, tile with views: {}", lit(i));
+        if !lit(i) {
+            assert_eq!(den[i].to_bits(), den0[i].to_bits(), "den {i} written");
+        }
+    }
+    let moved = (0..len).filter(|&i| got[i] != start[i]).count();
+    assert!(moved > nlit / 2, "only {moved} of {nlit} pixels updated");
+}
+
+/// [`Views::from_parts`] over slabs with padding past each run (the live layout) gives the
+/// bits of the packed lists: a run ends at its length, not at the next tile's start.
+#[test]
+fn views_over_padded_slabs_match_packed_lists() {
+    let (stream, ex, k) = setup();
+    let s = scan_in([80, 96]);
+    let packed = Views::new(&stream, s.d, &s.views).unwrap();
+    let start = packed.tile_start().to_host_vec(&stream).unwrap();
+    let len = packed.tile_len().to_host_vec(&stream).unwrap();
+    let list = packed.tile_views().to_host_vec(&stream).unwrap();
+    let cap = *len.iter().max().unwrap() as usize + 2;
+    // Padding names view 0, which touches tile 0: read, it would add to the sums.
+    let mut slab = vec![0u32; len.len() * cap];
+    for (t, &l) in len.iter().enumerate() {
+        let run = &list[start[t] as usize..][..l as usize];
+        slab[t * cap..][..run.len()].copy_from_slice(run);
+    }
+    let slab_start: Vec<u32> = (0..=len.len()).map(|t| (t * cap) as u32).collect();
+    // SAFETY: the runs are those of `Views::new` for these views, each within its slab.
+    let slabs = unsafe {
+        Views::from_parts(
+            s.d,
+            up(&stream, &s.views),
+            up(&stream, &slab_start),
+            up(&stream, &slab),
+            up(&stream, &len),
+        )
+    }
+    .unwrap();
+
+    let table = StackTable::new(&stream, &s.d, &[0..2, 2..5]).unwrap();
+    let probe = up(&stream, &s.probe);
+    let psi = up(&stream, &noise(s.nk(&(0..5)) * s.n(), 4, 1.0));
+    let mut out = Vec::new();
+    for views in [&packed, &slabs] {
+        let mut obj = up(&stream, &s.obj);
+        let mut sums = UpdateSums::zeroed(&stream, s.obj.len()).unwrap();
+        for i in 0..table.len() {
+            k.psi_to_obj(&ex, views, table.at(i), &psi, &probe, &mut sums)
+                .unwrap();
+        }
+        k.update_obj_from_sums(&ex, views, &mut obj, &mut sums, 0.01)
+            .unwrap();
+        out.push(c32_bits(&obj.to_host_vec(&stream).unwrap()));
+    }
+    assert!(out[0] == out[1], "slab views differ from packed views");
+    assert!(out[0] != c32_bits(&s.obj), "the update moved nothing");
+
+    let short = |n: usize| DeviceBuffer::<u32>::zeroed(&stream, n).unwrap();
+    // SAFETY: rejected before any launch.
+    let r = unsafe {
+        Views::from_parts(
+            s.d,
+            up(&stream, &s.views),
+            short(len.len()),
+            short(1),
+            short(len.len()),
+        )
+    };
+    assert!(
+        matches!(r, Err(Error::Shape(_))),
+        "tile_start without its end"
+    );
 }
 
 /// Scan counts: every 7th pixel masked, every 5th of the rest zero, others 1..=60.
@@ -993,8 +1129,8 @@ impl Iteration {
             &self.obj,
             &mut self.probe_sums,
         )?;
-        let (no, np) = (self.obj.len() as u32, self.probe.len() as u32);
-        k.update_from_sums(ctx, &mut self.obj, &mut self.obj_sums, no, 0.01)?;
+        let np = self.probe.len() as u32;
+        k.update_obj_from_sums(ctx, views, &mut self.obj, &mut self.obj_sums, 0.01)?;
         k.update_from_sums(ctx, &mut self.probe, &mut self.probe_sums, np, 0.01)?;
 
         let rows = Lines {

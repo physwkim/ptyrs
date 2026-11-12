@@ -30,8 +30,8 @@
 //! # PyNX AP / DM in these calls (per stack, then per cycle)
 //!
 //! AP: `obj_probe_to_psi`, FFT, `apply_amplitude`, inverse FFT, `psi_to_obj` and/or
-//! `psi_to_probe` into zeroed sums; after the last stack, `update_from_sums` with inertia
-//! 0.01 (object) or 0.001 (probe).
+//! `psi_to_probe` into zeroed sums; after the last stack, `update_obj_from_sums` with inertia
+//! 0.01 (object) or `update_from_sums` with 0.001 (probe).
 //!
 //! DM (`alpha` 0.02, `psi` kept per stack across cycles): `obj_probe_to_psi` into a scratch
 //! `po`, then on the first cycle copy `po` into `psi` (PyNX starts from `psi = PO`, which
@@ -76,6 +76,26 @@ impl ViewDims {
 
     fn obj_len(&self) -> usize {
         self.nobj as usize * self.obj[0] as usize * self.obj[1] as usize
+    }
+
+    /// `[nty, ntx]` object tiles of `OBJ_TILE` pixels per side.
+    fn tiles(&self) -> [u32; 2] {
+        self.obj.map(|n| n.div_ceil(OBJ_TILE))
+    }
+
+    fn ntiles(&self) -> usize {
+        let [nty, ntx] = self.tiles();
+        nty as usize * ntx as usize
+    }
+
+    /// One `(OBJ_TILE, OBJ_TILE)` block per object tile and object mode.
+    fn tile_grid(&self) -> LaunchConfig {
+        let [nty, ntx] = self.tiles();
+        LaunchConfig {
+            grid_dim: (ntx, nty, self.nobj),
+            block_dim: (OBJ_TILE, OBJ_TILE, 1),
+            shared_mem_bytes: 0,
+        }
     }
 
     fn check(&self) -> Result<(), Error> {
@@ -237,14 +257,18 @@ impl StackRef<'_> {
 }
 
 /// The views of a scan on the device, with the per-object-tile view lists the object
-/// gather walks.
+/// gather walks: tile `t`'s run is `tile_views[tile_start[t] .. tile_start[t] + tile_len[t]]`.
 pub struct Views {
     dims: ViewDims,
     addr: DeviceBuffer<ViewAddr>,
-    /// `ntiles + 1` offsets into `tile_views`; tile `ty * ntx + tx` of `OBJ_TILE` pixels.
+    /// `ntiles + 1` ascending offsets into `tile_views`; tile `ty * ntx + tx` of `OBJ_TILE`
+    /// pixels.
     tile_start: DeviceBuffer<u32>,
     /// Per tile, ascending indices of the views whose samples may touch it.
     tile_views: DeviceBuffer<u32>,
+    /// `ntiles` run lengths, at most `tile_start[t + 1] - tile_start[t]`. No launch reads or
+    /// writes the object or sum pixels of a tile whose run is empty.
+    tile_len: DeviceBuffer<u32>,
 }
 
 impl Views {
@@ -270,12 +294,46 @@ impl Views {
                 return Err(Error::Shape(format!("view {k}: {v:?} is outside {dims:?}")));
             }
         }
-        let (start, list) = tile_lists(&dims, addr)?;
+        let t = tile_lists(&dims, addr)?;
         Ok(Self {
             dims,
             addr: DeviceBuffer::from_host(stream, addr)?,
-            tile_start: DeviceBuffer::from_host(stream, &start)?,
-            tile_views: DeviceBuffer::from_host(stream, &list)?,
+            tile_start: DeviceBuffer::from_host(stream, &t.start)?,
+            tile_views: DeviceBuffer::from_host(stream, &t.views)?,
+            tile_len: DeviceBuffer::from_host(stream, &t.len)?,
+        })
+    }
+
+    /// Views over device storage the caller keeps filling, e.g. with a slab of `tile_cap`
+    /// slots per tile (`tile_start[t] = t * tile_cap`) and `tile_len` zeroed. Checks `dims`
+    /// and that `addr` holds `nframe * nmode` records, `tile_start` `ntiles + 1` and
+    /// `tile_len` `ntiles` entries.
+    ///
+    /// # Safety
+    ///
+    /// Whenever a launch reads them: `tile_start` is ascending with `tile_start[ntiles] <=
+    /// tile_views.len()`; `tile_len[t] <= tile_start[t + 1] - tile_start[t]`; each run holds
+    /// ascending indices of views that may touch the tile, every view of the launch's stack
+    /// that does among them; and every view the launch reads passes the checks of
+    /// [`Self::new`].
+    pub unsafe fn from_parts(
+        dims: ViewDims,
+        addr: DeviceBuffer<ViewAddr>,
+        tile_start: DeviceBuffer<u32>,
+        tile_views: DeviceBuffer<u32>,
+        tile_len: DeviceBuffer<u32>,
+    ) -> Result<Self, Error> {
+        dims.check()?;
+        let ntiles = dims.ntiles();
+        check_len("addr", &addr, dims.nframe as usize * dims.nmode as usize)?;
+        check_len("tile_start", &tile_start, ntiles + 1)?;
+        check_len("tile_len", &tile_len, ntiles)?;
+        Ok(Self {
+            dims,
+            addr,
+            tile_start,
+            tile_views,
+            tile_len,
         })
     }
 
@@ -288,7 +346,7 @@ impl Views {
         &self.addr
     }
 
-    /// `ntiles + 1` CSR offsets into [`Self::tile_views`]; object tile `ty * ntx + tx`
+    /// `ntiles + 1` ascending offsets into [`Self::tile_views`]; object tile `ty * ntx + tx`
     /// covers `OBJ_TILE` pixels per side, `ntx = nxo.div_ceil(OBJ_TILE)`.
     pub fn tile_start(&self) -> &DeviceBuffer<u32> {
         &self.tile_start
@@ -297,6 +355,27 @@ impl Views {
     /// Per object tile, the ascending indices of the views whose samples may touch it.
     pub fn tile_views(&self) -> &DeviceBuffer<u32> {
         &self.tile_views
+    }
+
+    /// Per object tile, the length of its run in [`Self::tile_views`].
+    pub fn tile_len(&self) -> &DeviceBuffer<u32> {
+        &self.tile_len
+    }
+
+    fn tile_ptrs(&self) -> TilePtrs {
+        TilePtrs {
+            start: dptr(&self.tile_start),
+            len: dptr(&self.tile_len),
+            views: dptr(&self.tile_views),
+        }
+    }
+
+    fn tile_storages(&self) -> [&RawDeviceBuffer; 3] {
+        [
+            self.tile_start.storage(),
+            self.tile_len.storage(),
+            self.tile_views.storage(),
+        ]
     }
 }
 
@@ -308,13 +387,19 @@ fn axis_tiles(o: u32, len: u32, n: u32) -> impl Iterator<Item = u32> {
     (first..=last).chain((wrap < first || wrap > last).then_some(wrap))
 }
 
+/// Host form of the [`Views`] tile lists.
+struct TileLists {
+    start: Vec<u32>,
+    len: Vec<u32>,
+    views: Vec<u32>,
+}
+
 /// CSR lists of the views touching each object tile, ascending per tile.
-fn tile_lists(dims: &ViewDims, addr: &[ViewAddr]) -> Result<(Vec<u32>, Vec<u32>), Error> {
+fn tile_lists(dims: &ViewDims, addr: &[ViewAddr]) -> Result<TileLists, Error> {
     let [ny, nx] = dims.frame;
     let [nyo, nxo] = dims.obj;
-    let ntx = nxo.div_ceil(OBJ_TILE) as usize;
-    let ntiles = nyo.div_ceil(OBJ_TILE) as usize * ntx;
-    let mut lists = vec![Vec::new(); ntiles];
+    let ntx = dims.tiles()[1] as usize;
+    let mut lists = vec![Vec::new(); dims.ntiles()];
     for (k, v) in addr.iter().enumerate() {
         for ty in axis_tiles(v.oy, ny, nyo) {
             for tx in axis_tiles(v.ox, nx, nxo) {
@@ -322,7 +407,8 @@ fn tile_lists(dims: &ViewDims, addr: &[ViewAddr]) -> Result<(Vec<u32>, Vec<u32>)
             }
         }
     }
-    let mut start = Vec::with_capacity(ntiles + 1);
+    let mut start = Vec::with_capacity(lists.len() + 1);
+    let len = lists.iter().map(|l| l.len() as u32).collect();
     let mut flat = Vec::new();
     start.push(0);
     for l in lists {
@@ -332,7 +418,11 @@ fn tile_lists(dims: &ViewDims, addr: &[ViewAddr]) -> Result<(Vec<u32>, Vec<u32>)
                 .map_err(|_| Error::Shape("tile lists exceed u32::MAX entries".into()))?,
         );
     }
-    Ok((start, flat))
+    Ok(TileLists {
+        start,
+        len,
+        views: flat,
+    })
 }
 
 /// Frame-ordered `f64` totals of [`LlkPartial`]s.
@@ -515,7 +605,8 @@ impl Kernels {
     /// into `num` the exact adjoint of [`Self::obj_probe_to_psi`] applied to `psi`, into
     /// `den` the same bilinear spread of `|P_v|^2`. Each object pixel adds its views in
     /// ascending view order, so splitting the frames into stacks does not change a bit of
-    /// the result. Zero `sums` before the first stack.
+    /// the result. Only the pixels of tiles the stack's views touch are read and written.
+    /// Zero `sums` before the first stack.
     pub fn psi_to_obj(
         &self,
         ctx: &ExecutionContext,
@@ -531,21 +622,15 @@ impl Kernels {
         check_len("psi", psi, g.nf_max as usize * d.nmode as usize * n)?;
         check_len("probe", probe, d.nprobe as usize * n)?;
         sums.check(d.obj_len())?;
-        let config = LaunchConfig {
-            grid_dim: (
-                d.obj[1].div_ceil(OBJ_TILE),
-                d.obj[0].div_ceil(OBJ_TILE),
-                d.nobj,
-            ),
-            block_dim: (OBJ_TILE, OBJ_TILE, 1),
-            shared_mem_bytes: 0,
-        };
+        let config = d.tile_grid();
+        let [start, len, list] = views.tile_storages();
         let reads = [
             psi.storage(),
             probe.storage(),
             views.addr.storage(),
-            views.tile_start.storage(),
-            views.tile_views.storage(),
+            start,
+            len,
+            list,
             stack.storage(),
         ];
         self.launch(ctx, &reads, &sums.storages(), |stream| {
@@ -557,10 +642,7 @@ impl Kernels {
                     dptr(psi),
                     dptr(probe),
                     dptr(&views.addr),
-                    TilePtrs {
-                        start: dptr(&views.tile_start),
-                        views: dptr(&views.tile_views),
-                    },
+                    views.tile_ptrs(),
                     sums.ptrs(),
                     stack.ctl(),
                     g,
@@ -656,6 +738,70 @@ impl Kernels {
                     n,
                     dptr(max_bits),
                     inertia,
+                )
+            }
+        })
+    }
+
+    /// [`Self::update_from_sums`] of the object `[nobj, nyo, nxo]` on the object tiles with
+    /// views only: `reg = inertia * max(den)` over their pixels, then the update of each. A
+    /// tile whose run is empty is neither read nor written, in `obj` or `sums`, so it keeps
+    /// its bits; with `den` zero there, as after [`UpdateSums::zero`], every other pixel
+    /// gets the bits `update_from_sums` gives it.
+    pub fn update_obj_from_sums(
+        &self,
+        ctx: &ExecutionContext,
+        views: &Views,
+        obj: &mut DeviceBuffer<C32>,
+        sums: &mut UpdateSums,
+        inertia: f32,
+    ) -> Result<(), Error> {
+        let d = &views.dims;
+        check_len("obj", obj, d.obj_len())?;
+        sums.check(d.obj_len())?;
+        let config = d.tile_grid();
+        let [nyo, nxo] = d.obj;
+        let tile_len = &views.tile_len;
+        let UpdateSums { num, den, max_bits } = sums;
+        crate::zero(ctx, max_bits)?;
+        let reads = [den.storage(), tile_len.storage()];
+        self.launch(ctx, &reads, &[max_bits.storage()], |stream| {
+            // SAFETY: `den` holds the object, `tile_len` its tiles, `max_bits` one zeroed u32.
+            unsafe {
+                self.module.max_den_tiles(
+                    stream,
+                    config,
+                    dptr(den),
+                    dptr(tile_len),
+                    dptr(max_bits),
+                    nyo,
+                    nxo,
+                )
+            }
+        })?;
+        let reads = [
+            num.storage(),
+            den.storage(),
+            tile_len.storage(),
+            max_bits.storage(),
+        ];
+        let ptrs = SumPtrs {
+            num: dptr(num),
+            den: dptr(den),
+        };
+        self.launch(ctx, &reads, &[obj.storage()], |stream| {
+            // SAFETY: all lengths checked above.
+            unsafe {
+                self.module.normalize_tiles(
+                    stream,
+                    config,
+                    dptr(obj),
+                    ptrs,
+                    dptr(tile_len),
+                    dptr(max_bits),
+                    inertia,
+                    nyo,
+                    nxo,
                 )
             }
         })
