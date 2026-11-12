@@ -14,8 +14,8 @@ use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 use ptyrs_fft::Plan2d;
 use ptyrs_gpu::{
     C32, CG_BLOCKS, Ended, Error as GpuError, FusedBufs, GammaStacks, GradKernels, Kernels,
-    LlkPartial, LlkRing, LlkSums, RingDevice, RpieKernels, StackTable, UpdateSums, ViewAddr,
-    ViewDims, Views,
+    LlkPartial, LlkRing, LlkScratch, LlkSums, RingDevice, RpieKernels, StackTable, UpdateSums,
+    ViewAddr, ViewDims, Views,
 };
 
 use super::{
@@ -42,6 +42,8 @@ pub(super) struct Device {
     passes: Passes,
     /// One stack's LLK partials, on their way into the ring.
     llk: DeviceBuffer<LlkPartial>,
+    /// The chunk sums M1's [`Kernels::llk`] reduces a stack's frames through.
+    llk_scratch: LlkScratch,
     ring: LlkRing<Tag>,
     use_graph: bool,
     /// The epochs run since the parameters last changed, all of one [`Epoch::run`].
@@ -300,6 +302,8 @@ pub(super) struct Bufs<'a> {
     /// A stack's LLK partials, which [`ptyrs_gpu::RecordWriter::push`] then copies into the
     /// record.
     pub llk: &'a mut DeviceBuffer<LlkPartial>,
+    /// The chunk sums of M1's [`Kernels::llk`].
+    pub llk_scratch: &'a mut LlkScratch,
     /// ML's state, once an ML call has built it.
     pub ml: Option<MlBufs<'a>>,
 }
@@ -378,6 +382,7 @@ impl Device {
             obj_len: to_u32("object length", obj.len())?,
             probe_len: to_u32("probe length", probe.len())?,
             llk: DeviceBuffer::zeroed(&stream, table.nf_max() as usize)?,
+            llk_scratch: LlkScratch::new(&stream, &dims, table.nf_max())?,
             ring: LlkRing::new(
                 &kernels,
                 &stream,
@@ -457,6 +462,7 @@ impl Device {
             table: &self.table,
             stacks: Stacks(&mut self.stacks),
             llk: &mut self.llk,
+            llk_scratch: &mut self.llk_scratch,
             ml: self.ml.as_deref_mut().map(MlState::lend),
         };
         let passes = match &mut self.passes {

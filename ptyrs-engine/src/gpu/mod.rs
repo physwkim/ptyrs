@@ -437,8 +437,14 @@ impl Bufs<'_> {
                     )?;
                     let plan = self.stacks.get(s).frames.plan;
                     m1.plans.get(plan).forward_inplace(ctx, m1.scratch)?;
-                    self.kernels
-                        .llk(ctx, &dims, stack, self.counts, m1.scratch, self.llk)?;
+                    self.kernels.llk(
+                        ctx,
+                        stack,
+                        self.counts,
+                        m1.scratch,
+                        self.llk_scratch,
+                        self.llk,
+                    )?;
                 }
                 PassesMut::Fused(f) => {
                     let inputs = FusedInputs {
@@ -472,7 +478,7 @@ impl Bufs<'_> {
         plan.forward_inplace(ctx, st.psi)?;
         if let Some(rec) = llk {
             self.kernels
-                .llk(ctx, &dims, stack, self.counts, st.psi, self.llk)?;
+                .llk(ctx, stack, self.counts, st.psi, self.llk_scratch, self.llk)?;
             rec.push(ctx, &dims, stack, self.llk)?;
         }
         self.kernels

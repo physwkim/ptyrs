@@ -362,8 +362,8 @@ unsafe fn block_pair(s: *mut f32, acc: [f32; 2]) -> [f32; 2] {
     unsafe {
         for (j, &a) in acc.iter().enumerate() {
             *s.add(j * seg + t) = a;
-            crate::block_sum(s.add(j * seg));
         }
+        crate::block_sum::<2>(s);
         [*s, *s.add(seg)]
     }
 }

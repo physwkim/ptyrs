@@ -133,7 +133,7 @@ impl Bufs<'_> {
             plan.forward_inplace(ctx, psi)?;
             if let Some(rec) = llk.as_mut() {
                 self.kernels
-                    .llk(ctx, &dims, stack, self.counts, psi, self.llk)?;
+                    .llk(ctx, stack, self.counts, psi, self.llk_scratch, self.llk)?;
                 rec.push(ctx, &dims, stack, self.llk)?;
             }
             self.grad

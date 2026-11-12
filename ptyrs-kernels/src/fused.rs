@@ -15,12 +15,12 @@
 //! frame sample the object at one position. A stack with `nf == 0` writes nothing; every
 //! block past the stack leaves whole, before its first barrier.
 
-use cuda_device::{device, shared::DynamicSharedArray, thread};
+use cuda_device::{async_copy, device, shared::DynamicSharedArray, thread};
 
 use crate::FFT_EPT;
 use crate::pixel::{
     LlkPartial, MASKED, StackCtl, StackGeom, SumPtrs, TilePtrs, ViewAddr, cmul, cmul_conj, load_c,
-    obj_pixel_sources, psi_index, quad_phase, sample_obj, stack_frames, store_c, tile_stack_run,
+    obj_pixel_sources, quad_phase, sample_obj, stack_frames, store_c, tile_stack_run,
 };
 
 /// [`rows_fwd`] builds the DM reflection `R = (2 - alpha) PO - (1 - alpha) psi` instead of
@@ -34,9 +34,19 @@ pub const FUSED_LLK: u32 = 4;
 pub const FUSED_PROJECT: u32 = 8;
 /// [`rows_inv`] writes the per-frame object contributions.
 pub const FUSED_CONTRIB: u32 = 16;
+/// [`cols`] applies the Poisson LLK gradient scale and the inverse column FFT; never with
+/// `FUSED_PROJECT`.
+pub const FUSED_GRAD: u32 = 32;
 
 /// Columns of one frame a [`cols`] block transforms, for every mode.
 pub const FUSED_COLS: u32 = 8;
+const _: () = assert!(
+    2 * FUSED_COLS == 16,
+    "a cols counts row is one 16-byte async copy"
+);
+/// Most threads of a [`cols`] block, `nmode * FUSED_COLS * ny / FFT_EPT`. Its kernels are
+/// built with this launch bound, so their registers cannot cap a block below it.
+pub const FUSED_COL_THREADS: u32 = 512;
 /// Threads of a [`rows_fwd`] or [`rows_inv`] block: `FUSED_ROW_THREADS / (nx / FFT_EPT)`
 /// rows of `nx / FFT_EPT` threads each.
 pub const FUSED_ROW_THREADS: u32 = 128;
@@ -75,38 +85,42 @@ pub struct FusedPtrs {
     pub groups: *mut LlkPartial,
 }
 
-/// Unnormalized in-register FFT of `N` points (128 or 256), inverse under `INV`, as FFT `b`
-/// of `bpb` in the block, this thread being its thread `f`. Every thread of the block must
-/// call it with the same `bpb`: it synchronizes the block. Each pass is generic in its FFT
-/// side so that this resolves to one direct call and `r` stays in registers.
+/// Unnormalized in-register FFT of `N` points (64, 128, 256 or 512), inverse under `INV`, as
+/// FFT `b` of `bpb` in the block, this thread being its thread `f`. Every thread of the block
+/// must call it with the same `bpb`: it synchronizes the block. Each pass is generic in its
+/// FFT side so that this resolves to one direct call and `r` stays in registers.
 ///
 /// # Safety
 ///
 /// `s` is block shared memory holding `bpb` FFTs of this size; the `(b, f)` pairs of the
 /// block's threads are distinct and cover every thread of every FFT.
 #[device]
-unsafe fn block_fft<const N: u32, const INV: bool>(
+pub(crate) unsafe fn block_fft<const N: u32, const INV: bool>(
     r: &mut [f32; 2 * FFT_EPT as usize],
     s: *mut u8,
     b: u32,
     f: u32,
     bpb: u32,
 ) {
-    const { assert!(N == 128 || N == 256) };
+    const { assert!(N == 64 || N == 128 || N == 256 || N == 512) };
     let r = r.as_mut_ptr();
     unsafe {
         match (N, INV) {
+            (64, false) => crate::ptyrs_cufft_c2c_f32_n64_e16_fwd(r, s, b, f, bpb),
+            (64, true) => crate::ptyrs_cufft_c2c_f32_n64_e16_inv(r, s, b, f, bpb),
             (128, false) => crate::ptyrs_cufft_c2c_f32_n128_e16_fwd(r, s, b, f, bpb),
             (128, true) => crate::ptyrs_cufft_c2c_f32_n128_e16_inv(r, s, b, f, bpb),
-            (_, false) => crate::ptyrs_cufft_c2c_f32_n256_e16_fwd(r, s, b, f, bpb),
-            (_, true) => crate::ptyrs_cufft_c2c_f32_n256_e16_inv(r, s, b, f, bpb),
+            (256, false) => crate::ptyrs_cufft_c2c_f32_n256_e16_fwd(r, s, b, f, bpb),
+            (256, true) => crate::ptyrs_cufft_c2c_f32_n256_e16_inv(r, s, b, f, bpb),
+            (_, false) => crate::ptyrs_cufft_c2c_f32_n512_e16_fwd(r, s, b, f, bpb),
+            (_, true) => crate::ptyrs_cufft_c2c_f32_n512_e16_inv(r, s, b, f, bpb),
         }
     }
 }
 
 /// [`block_fft`] of a row pass: blockDim `(NX / FFT_EPT, rows)`, one row per FFT.
 #[device]
-unsafe fn row_fft<const NX: u32, const INV: bool>(r: &mut [f32; 2 * FFT_EPT as usize]) {
+pub(crate) unsafe fn row_fft<const NX: u32, const INV: bool>(r: &mut [f32; 2 * FFT_EPT as usize]) {
     let s = DynamicSharedArray::<u8, 16>::get();
     let (b, f, bpb) = (
         thread::threadIdx_y(),
@@ -178,15 +192,18 @@ pub unsafe fn rows_fwd<const NX: u32>(
 /// frame `fl = blockIdx.y`, then per far-field pixel `calc = sum_m |Psi_m|^2 / n` in
 /// ascending `m`. Under `FUSED_LLK`, `groups[fl, blockIdx.x]` gets the LLK sums of
 /// `kernels::llk` over the block's pixels; under `FUSED_PROJECT`, every mode is scaled as
-/// `kernels::apply_amplitude` scales it, inverse column-FFT'd and stored back. Reads
-/// `counts`; writes `work` and under `FUSED_LLK` `groups`.
+/// `kernels::apply_amplitude` scales it, inverse column-FFT'd and stored back. `FUSED_GRAD`
+/// does the same with the scale `2 (1 - obs / max(calc, 1e-12)) / n`, 0 where masked, which
+/// makes the stored waves the gradient of the Poisson LLK sum over `(Re psi, Im psi)`.
+/// Reads `counts`; writes `work` and under `FUSED_LLK` `groups`.
 ///
 /// One 1D block of `nmode * FUSED_COLS * tpf` threads (`tpf = ny / FFT_EPT`): thread `tid`
 /// is thread `f = (tid / FUSED_COLS) % tpf` of FFT `m * FUSED_COLS + c`, `c = tid %
 /// FUSED_COLS`, `m = tid / (FUSED_COLS * tpf)`, so a warp's loads and stores cover whole
 /// row segments. Grid `(nx / FUSED_COLS, nf_max)`; dynamic shared memory `16 * FUSED_COLS *
-/// tpf` bytes of LLK slots, then the larger of `nmode * FUSED_COLS` column FFTs and
-/// `4 * nmode * ny * FUSED_COLS` bytes.
+/// tpf` bytes of LLK slots, `2 * FUSED_COLS * ny` bytes of counts, then the larger of
+/// `nmode * FUSED_COLS` column FFTs and `4 * nmode * ny * FUSED_COLS` bytes.
+/// `counts` must be 16-byte aligned.
 ///
 /// # Safety
 ///
@@ -214,13 +231,29 @@ pub unsafe fn cols<const NY: u32>(p: FusedPtrs, ctl: *const StackCtl, g: StackGe
     let plane = (fl * nmode + m) as usize * n;
     let llk = cfg.flags & FUSED_LLK != 0;
     let project = cfg.flags & FUSED_PROJECT != 0;
+    let grad = cfg.flags & FUSED_GRAD != 0;
     let mut r = [0.0f32; 2 * FFT_EPT as usize];
     unsafe {
         let smem = DynamicSharedArray::<u8, 16>::get();
         let slots = smem.cast::<f32>();
-        let fft_smem = smem.add(16 * nslot as usize);
+        // The frame's counts under this block's columns, by stored row, copied while the
+        // forward FFT runs: read per pixel after it, they stalled the pass.
+        let tile = smem.add(16 * nslot as usize);
+        let fft_smem = tile.add(2 * (FUSED_COLS * ny) as usize);
         // `|Psi_m(v, u)|^2` at `(m * ny + v) * FUSED_COLS + c`, over the FFTs' region.
         let power = fft_smem.cast::<f32>();
+        let counts = p.counts.add((f0 + fl) as usize * n);
+        // The block's columns stay contiguous under the shift: `nx / 2` is a multiple of 8.
+        let col0 = (thread::blockIdx_x() * FUSED_COLS + nx / 2) % nx;
+        let mut row = tid;
+        while row < ny {
+            async_copy::cp_async_cg_16(
+                tile.add(2 * (row * FUSED_COLS) as usize).cast(),
+                counts.add((row * nx + col0) as usize).cast(),
+            );
+            row += nmode * nslot;
+        }
+        async_copy::cp_async_commit_group();
         #[unroll]
         for i in 0..FFT_EPT {
             let v = load_c(p.work, plane + ((f + i * tpf) * nx + u) as usize);
@@ -235,9 +268,10 @@ pub unsafe fn cols<const NY: u32>(p: FusedPtrs, ctl: *const StackCtl, g: StackGe
             let v = f + i * tpf;
             *power.add(((m * ny + v) * FUSED_COLS + c) as usize) = re * re + im * im;
         }
+        async_copy::cp_async_wait_all();
         thread::sync_threads();
         let inv_n = 1.0 / n as f32;
-        let counts = p.counts.add((f0 + fl) as usize * n);
+        let tile = tile.cast::<u16>();
         let mut acc = [0.0f32; 4];
         #[unroll]
         for i in 0..FFT_EPT {
@@ -246,7 +280,7 @@ pub unsafe fn cols<const NY: u32>(p: FusedPtrs, ctl: *const StackCtl, g: StackGe
             for mm in 0..nmode {
                 s += *power.add(((mm * ny + v) * FUSED_COLS + c) as usize);
             }
-            let obs = *counts.add(psi_index(v, u, ny, nx));
+            let obs = *tile.add((((v + ny / 2) % ny) * FUSED_COLS + c) as usize);
             if llk && m == 0 && obs != MASKED {
                 let obs = obs as f32;
                 let calc = (s * inv_n).max(0.0);
@@ -265,6 +299,15 @@ pub unsafe fn cols<const NY: u32>(p: FusedPtrs, ctl: *const StackCtl, g: StackGe
                     inv_n
                 } else {
                     (obs as f32 / (s * inv_n).max(1e-12)).sqrt() * inv_n
+                };
+                r[2 * i as usize] *= scale;
+                r[2 * i as usize + 1] *= scale;
+            }
+            if grad {
+                let scale = if obs == MASKED {
+                    0.0
+                } else {
+                    2.0 * (1.0 - obs as f32 / (s * inv_n).max(1e-12)) * inv_n
                 };
                 r[2 * i as usize] *= scale;
                 r[2 * i as usize + 1] *= scale;
@@ -299,7 +342,7 @@ pub unsafe fn cols<const NY: u32>(p: FusedPtrs, ctl: *const StackCtl, g: StackGe
                 };
             }
         }
-        if project {
+        if project || grad {
             // Every power is read before the inverse FFT reuses the region.
             thread::sync_threads();
             block_fft::<NY, true>(&mut r, fft_smem, b, f, bpb);
@@ -311,37 +354,6 @@ pub unsafe fn cols<const NY: u32>(p: FusedPtrs, ctl: *const StackCtl, g: StackGe
             }
         }
     }
-}
-
-/// Per-frame LLK partials from pass B's column groups: `out[fl]` is the sum of
-/// `groups[fl, 0 .. nx / FUSED_COLS]` in ascending group order, for every frame `fl < nf`;
-/// entries past `nf` are not written. One thread per frame of `nf_max`.
-///
-/// # Safety
-///
-/// `groups` holds `[nf_max, nx / FUSED_COLS]` records, `out` `nf_max`, `ctl` one entry.
-#[device]
-pub unsafe fn llk_groups(
-    groups: *const LlkPartial,
-    out: *mut LlkPartial,
-    ctl: *const StackCtl,
-    g: StackGeom,
-) {
-    let (_, nf) = unsafe { stack_frames(ctl, g) };
-    let fl = crate::global_index();
-    if fl >= nf as usize {
-        return;
-    }
-    let ngroup = (g.nx / FUSED_COLS) as usize;
-    let mut s = LlkPartial::default();
-    for j in 0..ngroup {
-        let a = unsafe { *groups.add(fl * ngroup + j) };
-        s.poisson += a.poisson;
-        s.gaussian += a.gaussian;
-        s.euclidean += a.euclidean;
-        s.icalc += a.icalc;
-    }
-    unsafe { *out.add(fl) = s };
 }
 
 /// Pass C: for frame `fl = blockIdx.y` of the stack and stored row `ys`, the inverse row FFT
@@ -504,12 +516,12 @@ pub unsafe fn gather(
                 continue;
             }
             let plane = ((k / g.nmode - f0) * nobj + iobj) as usize * n;
-            for &(pry, prx, w) in obj_pixel_sources(v, y, x, g.ny, g.nx).iter().flatten() {
+            obj_pixel_sources(v, y, x, g.ny, g.nx, |pry, prx, w| {
                 let at = (pry * g.nx + prx) as usize;
                 let c = load_c(p.contrib, plane + at);
                 acc = (acc.0 + w * c.0, acc.1 + w * c.1);
                 norm += w * *p.probe_power.add(at);
-            }
+            });
         }
         store_c(sums.num, px, acc);
         *sums.den.add(px) = norm;

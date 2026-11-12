@@ -53,8 +53,10 @@ use std::ops::Range;
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::sys::CUdeviceptr;
 use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig, RawDeviceBuffer};
+use ptyrs_kernels::pixel::{
+    LLK_CHUNK, PIXEL_THREADS, SumPtrs, TilePtrs, TileSlabs, WARP, axis_tiles,
+};
 pub use ptyrs_kernels::pixel::{LlkPartial, MASKED, OBJ_TILE, StackCtl, StackGeom, ViewAddr};
-use ptyrs_kernels::pixel::{PIXEL_THREADS, SumPtrs, TilePtrs, TileSlabs, WARP, axis_tiles};
 
 use crate::{C32, Error, Kernels, check_len, dptr};
 
@@ -499,6 +501,34 @@ impl LlkSums {
     }
 }
 
+/// The per-chunk sums [`Kernels::llk`] reduces each frame through, for stacks of up to
+/// `nf_max` frames of one scan's [`ViewDims`]; one serves every stack in turn.
+pub struct LlkScratch {
+    dims: ViewDims,
+    /// `[nf_max, llk_chunks(n)]`.
+    chunks: DeviceBuffer<LlkPartial>,
+}
+
+impl LlkScratch {
+    pub fn new(stream: &CudaStream, dims: &ViewDims, nf_max: u32) -> Result<Self, Error> {
+        dims.check()?;
+        if nf_max == 0 {
+            return Err(Error::Shape("nf_max is zero".into()));
+        }
+        let len = nf_max as usize * llk_chunks(dims.n()) as usize;
+        Ok(Self {
+            dims: *dims,
+            chunks: DeviceBuffer::zeroed(stream, len)?,
+        })
+    }
+}
+
+/// Chunks of [`LLK_CHUNK`] pixels per frame of `n` pixels.
+fn llk_chunks(n: usize) -> u32 {
+    // `n <= 32768^2`, so at most 2^19 chunks.
+    n.div_ceil(LLK_CHUNK as usize) as u32
+}
+
 /// Pairwise total of `block` padded with `+0.0` to [`LLK_TREE_LEAVES`] nodes.
 fn pair_tree(block: &[[f64; 4]]) -> [f64; 4] {
     let mut node = [[0.0; 4]; LLK_TREE_LEAVES];
@@ -641,36 +671,81 @@ impl Kernels {
     /// `LLKAll`, no background): `out[fl]`, `fl < nf`, gets, over the unmasked pixels of
     /// frame `f0 + fl`, with `calc = sum_m |Psi_m|^2 / n`: Poisson `calc` if `obs == 0`
     /// else `calc - obs + obs ln(obs / calc)`; Gaussian `(obs - calc)^2 / (obs + 1)`;
-    /// Euclidean `4 (sqrt obs - sqrt calc)^2`; and `calc`. Each frame's sum is a fixed-order
-    /// block reduction; total with [`LlkSums::from_partials`]. `out` holds `nf_max` records.
+    /// Euclidean `4 (sqrt obs - sqrt calc)^2`; and `calc`. Each frame's sum is fixed-order:
+    /// one block reduction per chunk of `LLK_CHUNK` contiguous pixels into `scratch`, then
+    /// the chunks in ascending order; total with [`LlkSums::from_partials`]. The scan's
+    /// dims are the ones `scratch` was made for; `out` holds `nf_max` records. Two launches.
     pub fn llk(
         &self,
         ctx: &ExecutionContext,
-        dims: &ViewDims,
         stack: StackRef<'_>,
         counts: &DeviceBuffer<u16>,
         psi: &DeviceBuffer<C32>,
+        scratch: &mut LlkScratch,
         out: &mut DeviceBuffer<LlkPartial>,
     ) -> Result<(), Error> {
+        let dims = &scratch.dims;
         let g = dims.geom(stack)?;
         let n = dims.n();
+        let nchunk = llk_chunks(n);
         check_len("counts", counts, dims.nframe as usize * n)?;
         check_len("psi", psi, g.nf_max as usize * dims.nmode as usize * n)?;
+        check_len(
+            "scratch",
+            &scratch.chunks,
+            g.nf_max as usize * nchunk as usize,
+        )?;
         check_len("out", out, g.nf_max as usize)?;
+        if g.nf_max > u16::MAX as u32 {
+            return Err(Error::Shape(format!("{} frames exceed grid y", g.nf_max)));
+        }
         let config = LaunchConfig {
-            grid_dim: (g.nf_max, 1, 1),
+            grid_dim: (nchunk, g.nf_max, 1),
             block_dim: (PIXEL_THREADS, 1, 1),
             shared_mem_bytes: 0,
         };
         let reads = [counts.storage(), psi.storage(), stack.storage()];
-        self.launch(ctx, &reads, &[out.storage()], |stream| {
-            // SAFETY: lengths checked above; one block of PIXEL_THREADS per frame.
+        self.launch(ctx, &reads, &[scratch.chunks.storage()], |stream| {
+            // SAFETY: lengths checked above; one block of PIXEL_THREADS per chunk and frame.
             unsafe {
                 self.module.llk(
                     stream,
                     config,
                     dptr(psi),
                     dptr(counts),
+                    dptr(&scratch.chunks),
+                    stack.ctl() as *const StackCtl,
+                    g,
+                )
+            }
+        })?;
+        self.llk_groups(ctx, stack, g, &scratch.chunks, nchunk, out)
+    }
+
+    /// `out[fl]`, `fl < nf`, gets the sum of `groups[fl * ngroup .. (fl + 1) * ngroup]` in
+    /// ascending order.
+    pub(crate) fn llk_groups(
+        &self,
+        ctx: &ExecutionContext,
+        stack: StackRef<'_>,
+        g: StackGeom,
+        groups: &DeviceBuffer<LlkPartial>,
+        ngroup: u32,
+        out: &mut DeviceBuffer<LlkPartial>,
+    ) -> Result<(), Error> {
+        let nf_max = g.nf_max as usize;
+        check_len("groups", groups, nf_max * ngroup as usize)?;
+        check_len("out", out, nf_max)?;
+        let config = grid_1d(nf_max)?;
+        let reads = [groups.storage(), stack.storage()];
+        self.launch(ctx, &reads, &[out.storage()], |stream| {
+            // SAFETY: `groups` holds `nf_max * ngroup` records, `out` `nf_max`.
+            unsafe {
+                self.module.llk_groups(
+                    stream,
+                    config,
+                    dptr(groups),
+                    ngroup,
                     dptr(out),
                     stack.ctl() as *const StackCtl,
                     g,

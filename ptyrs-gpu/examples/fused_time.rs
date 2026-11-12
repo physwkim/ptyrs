@@ -1,9 +1,10 @@
 //! Per-cycle time of the M1 and the fused AP and DM cycles on CUDA device 0.
 //!
-//! `cargo run --release -p ptyrs-gpu --example fused_time -- [ncycle] [sizes] [paths]`
-//! (defaults 50, `8,16,20,25,32,40` and `ap-m1,ap-fused,dm-m1,dm-fused`) builds the scan of
-//! the engine's `gpu_time` (400 Fermat positions 16 object pixels apart, 256 x 256 frames,
-//! 2 probe modes, 1 object mode, counts from the model) and, per comma-separated stack size,
+//! `cargo run --release -p ptyrs-gpu --example fused_time -- [ncycle] [sizes] [paths]
+//! [frame]` (defaults 50, `8,16,20,25,32,40`, `ap-m1,ap-fused,dm-m1,dm-fused` and 256) builds
+//! the scan of the engine's `gpu_time` (400 Fermat positions `frame / 16` object pixels
+//! apart, `frame` x `frame` frames, 2 probe modes, 1 object mode, counts from the model; at
+//! the default frame exactly the engine's) and, per comma-separated stack size,
 //! runs each selected path, the engine's M1 cycles (object inertia 0.01, probe inertia 0.001,
 //! DM alpha 0.02 and one object-then-probe update, no LLK) or the fused passes: 5 untimed
 //! cycles, then `ncycle` timed ones, eagerly and as replays of a graph captured from one
@@ -19,8 +20,8 @@ use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 use ptyrs_core::{AddrTable, Geometry, Positions, required_obj_shape};
 use ptyrs_fft::Plan2d;
 use ptyrs_gpu::{
-    C32, Error, Exit, FusedBufs, FusedInputs, Kernels, StackTable, UpdateSums, ViewAddr, ViewDims,
-    Views, record,
+    C32, Error, Exit, FusedBufs, FusedInputs, FusedSums, Kernels, StackTable, UpdateSums, ViewAddr,
+    ViewDims, Views, record,
 };
 
 const WARMUP: usize = 5;
@@ -28,9 +29,9 @@ const OBJ_INERTIA: f32 = 0.01;
 const PROBE_INERTIA: f32 = 0.001;
 const ALPHA: f32 = 0.02;
 const NPOS: usize = 400;
-const FRAME: usize = 256;
 const NPROBE: usize = 2;
-const STEP: f64 = 16.0;
+/// Frame side per object pixel of scan step.
+const FRAME_PER_STEP: usize = 16;
 
 /// What every run reads: the views, counts and starting arrays.
 struct Scene {
@@ -129,7 +130,7 @@ impl Run {
         self.update_probe(ctx, k)
     }
 
-    /// The AP cycle with `fused_project`; the probe sums from its projected waves.
+    /// The AP cycle with `fused_project`, which adds both sums.
     fn fused_ap(&mut self, ctx: &ExecutionContext, k: &Kernels, sc: &Scene) -> Result<(), Error> {
         for s in 0..self.table.len() {
             let stack = self.table.at(s);
@@ -140,10 +141,11 @@ impl Run {
                 probe: &self.probe,
             };
             let exit = Exit::Ap { llk: None };
-            let sums = Some(&mut self.obj_sums);
+            let sums = FusedSums {
+                obj: Some(&mut self.obj_sums),
+                probe: Some(&mut self.probe_sums),
+            };
             k.fused_project(ctx, &inputs, stack, exit, &mut self.bufs, sums)?;
-            let work = self.bufs.work();
-            k.psi_to_probe(ctx, &sc.views, stack, work, &self.obj, &mut self.probe_sums)?;
         }
         self.update_obj(ctx, k, sc)?;
         self.update_probe(ctx, k)
@@ -202,7 +204,10 @@ impl Run {
             } else {
                 Exit::Dm { psi, alpha: ALPHA }
             };
-            let sums = Some(&mut self.obj_sums);
+            let sums = FusedSums {
+                obj: Some(&mut self.obj_sums),
+                probe: None,
+            };
             k.fused_project(ctx, &inputs, self.table.at(s), exit, &mut self.bufs, sums)?;
         }
         self.update_obj(ctx, k, sc)?;
@@ -257,12 +262,17 @@ impl Run {
     }
 }
 
-/// The engine's `gpu_time` scan: its geometry, views and object shape, with a unit-modulus
-/// random-phase object, the simulated probe and counts of their far field.
-fn scene(stream: &Arc<CudaStream>, k: &Kernels) -> Result<Scene, Box<dyn std::error::Error>> {
-    let g = Geometry::new(1.5e-10, 1.0, 75e-6, [FRAME, FRAME])?;
+/// The engine's `gpu_time` scan at `frame`: its geometry, views and object shape, with a
+/// unit-modulus random-phase object, the simulated probe and counts of their far field.
+fn scene(
+    stream: &Arc<CudaStream>,
+    k: &Kernels,
+    frame: usize,
+) -> Result<Scene, Box<dyn std::error::Error>> {
+    let g = Geometry::new(1.5e-10, 1.0, 75e-6, [frame, frame])?;
     let pixel = g.pixel_size_object();
-    let f = ptyrs_core::sim::fermat(NPOS, STEP * pixel[1]);
+    let step = (frame / FRAME_PER_STEP) as f64;
+    let f = ptyrs_core::sim::fermat(NPOS, step * pixel[1]);
     let round = |v: Vec<f64>| v.into_iter().map(|x| x as f32 as f64).collect();
     let positions = Positions::new(round(f.y), round(f.x))?.pynx_preprocess(pixel);
     let shape = required_obj_shape(&positions, pixel, g.frame, 16);
@@ -272,7 +282,7 @@ fn scene(stream: &Arc<CudaStream>, k: &Kernels) -> Result<Scene, Box<dyn std::er
         nmode: NPROBE as u32,
         nprobe: NPROBE as u32,
         nobj: 1,
-        frame: [FRAME as u32; 2],
+        frame: [frame as u32; 2],
         obj: shape.map(|s| s as u32),
         quad_phase: (PI * pixel[1] * pixel[1] / (g.wavelength * g.distance)) as f32,
     };
@@ -318,7 +328,7 @@ fn scene(stream: &Arc<CudaStream>, k: &Kernels) -> Result<Scene, Box<dyn std::er
         .collect();
 
     // Counts: the model's intensity, rounded, one 16-frame stack at a time.
-    let (n, size) = (FRAME * FRAME, 16);
+    let (n, size) = (frame * frame, 16);
     let mut run = Run::new(stream, &dims, &obj, &probe, size)?;
     let mut icalc = DeviceBuffer::<f32>::zeroed(stream, size as usize * n)?;
     let mut counts = Vec::with_capacity(NPOS * n);
@@ -374,7 +384,7 @@ fn rel_diff(a: &[C32], b: &[C32]) -> f64 {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let usage = "usage: fused_time [ncycle] [sizes] [paths]";
+    let usage = "usage: fused_time [ncycle] [sizes] [paths] [frame]";
     let mut args = std::env::args().skip(1);
     let ncycle: usize = args.next().map_or(Ok(50), |s| s.parse())?;
     let sizes = args.next().unwrap_or_else(|| "8,16,20,25,32,40".into());
@@ -396,7 +406,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             _ => Err(usage),
         })
         .collect::<Result<Vec<_>, _>>()?;
-    if ncycle == 0 || sizes.contains(&0) || args.next().is_some() {
+    let frame: usize = args.next().map_or(Ok(256), |s| s.parse())?;
+    if ncycle == 0 || sizes.contains(&0) || frame < FRAME_PER_STEP || args.next().is_some() {
         return Err(usage.into());
     }
 
@@ -404,7 +415,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let k = Kernels::load(&cuda)?;
     let stream = cuda.default_stream();
     let side = cuda.new_stream()?;
-    let sc = scene(&stream, &k)?;
+    let sc = scene(&stream, &k, frame)?;
     let d = sc.views.dims();
     eprintln!(
         "{} frames {:?}, {} probe modes, object {:?}",
