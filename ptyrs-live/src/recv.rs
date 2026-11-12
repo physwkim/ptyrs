@@ -31,7 +31,7 @@ use crate::args::Args;
 use crate::consumer::{ConsumerReport, checksum, run_checksum_consumer};
 use crate::eiger::{EigerFrames, Progress, PullReport, run_pull};
 use crate::follow::{
-    FollowCfg, FollowReport, ReconCfg, Settle, first_converged, offline_ap, plane, run_ap_consumer,
+    FollowCfg, FollowReport, ReconCfg, first_converged, offline_ap, plane, run_ap_consumer,
 };
 use crate::graph::WarmUp;
 use crate::handoff::work_queue;
@@ -343,7 +343,7 @@ enum Consumed {
 struct Recon {
     rep: FollowReport,
     follow: FollowCfg,
-    settle: Settle,
+    settle_max: u64,
 }
 
 /// The live run `rc` asks for on `cfg`'s scan: it starts from the
@@ -423,7 +423,7 @@ fn recon_line(
     ctx: &Arc<Context>,
     store: &DeviceStore,
     follow: &FollowCfg,
-    settle: Settle,
+    settle_max: u64,
     rep: &FollowReport,
     scan_end: Option<i64>,
     threads: usize,
@@ -461,19 +461,21 @@ fn recon_line(
         l += " clock=none no_scan_end";
         return Ok((l, false));
     };
-    let off = offline_ap(ctx, store, follow, &rep.positions, region, scan_end, settle)
-        .map_err(fail("offline reconstruction"))?;
+    let off = offline_ap(
+        ctx,
+        store,
+        follow,
+        &rep.positions,
+        region,
+        scan_end,
+        settle_max,
+    )
+    .map_err(fail("offline reconstruction"))?;
     // Writing to a String cannot fail.
     write!(l, " offline_epochs={}", off.epochs).unwrap();
     let clock = match off.clock {
         Ok(c) => {
-            let every = settle.every;
-            write!(
-                l,
-                " settle_every={every} offline_settle_frc={:.4}",
-                c.settled()
-            )
-            .unwrap();
+            write!(l, " offline_settle_frc={:.4}", c.settled()).unwrap();
             c
         }
         Err(e) => {
@@ -534,7 +536,7 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
     let follow = cfg
         .recon
         .as_ref()
-        .map(|rc| Ok::<_, RecvError>((follow_cfg(cfg, &model, rc)?, rc.settle())))
+        .map(|rc| Ok::<_, RecvError>((follow_cfg(cfg, &model, rc)?, rc.settle_max)))
         .transpose()?;
     let truth: Arc<dyn Truth> = Arc::new(model);
     let ucfg = UploaderConfig {
@@ -581,12 +583,12 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
                     None => {
                         run_checksum_consumer(ctx, store, batch, brx, cap_tx).map(Consumed::Sums)
                     }
-                    Some((follow, settle)) => {
+                    Some((follow, settle_max)) => {
                         run_ap_consumer(ctx, store, follow.clone(), brx, cap_tx).map(|rep| {
                             Consumed::Recon(Box::new(Recon {
                                 rep,
                                 follow,
-                                settle,
+                                settle_max,
                             }))
                         })
                     }
@@ -881,7 +883,7 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
             &ctx,
             &store,
             &r.follow,
-            r.settle,
+            r.settle_max,
             &r.rep,
             st.scan_end,
             threads,
@@ -1126,7 +1128,6 @@ mod tests {
                 chunk_mib: 4,
                 snap_every: NonZeroU32::new(3).unwrap(),
                 snaps: 50,
-                settle_every: NonZeroU32::new(20).unwrap(),
                 settle_max: 900,
             }),
         };
@@ -1227,8 +1228,6 @@ mod tests {
             "3",
             "--recon-snaps",
             "50",
-            "--recon-settle-every",
-            "20",
             "--recon-settle-max",
             "900",
         ]);
@@ -1286,7 +1285,6 @@ mod tests {
             chunk-mib = 4
             snap-every = 3
             snaps = 50
-            settle-every = 20
             settle-max = 900
             "#,
         );
@@ -1370,6 +1368,7 @@ mod tests {
             ("[recon]\nalgo = \"dm\"", "dm"),
             ("[recon]\nsnap-every = 0", "snap-every"),
             ("[recon]\nsnapz = 3", "snapz"),
+            ("[recon]\nsettle-every = 100", "settle-every"),
         ] {
             let e = ::toml::from_str::<RecvCfg>(t).unwrap_err().to_string();
             assert!(e.contains(needle), "{t:?}: {e}");

@@ -27,11 +27,18 @@ use ptyrs_core::{C64, CoreError};
 /// is out of reach.
 pub const MATCH: f64 = 0.99;
 
+/// The offline reference has settled once its object at epoch `E`
+/// correlates with its own at `E/2` at least this much in every ring,
+/// checked as `E` doubles. AP's tail is slow: over a fixed lag a run can
+/// pass 0.999 and still drift by the whole [`MATCH`] tolerance later, while
+/// doubling bounds what is left to change by the last change.
+pub const SETTLED: f64 = 0.999;
+
 /// Why [`Clock::new`] refused its reference.
 #[derive(Debug)]
 pub enum ClockError {
     /// Ring `ring` of `rings` of the offline object correlates with its
-    /// earlier snapshot only at `frc`, under [`MATCH`].
+    /// object at half the epochs only at `frc`, under [`SETTLED`].
     Moving {
         ring: usize,
         rings: usize,
@@ -46,7 +53,7 @@ impl fmt::Display for ClockError {
             Self::Moving { ring, rings, frc } => write!(
                 f,
                 "the offline run is still moving: ring {ring} of {rings} at FRC {frc:.4} \
-                 against its earlier snapshot, under {MATCH}"
+                 against its object at half the epochs, under {SETTLED}"
             ),
             Self::Invalid(e) => e.fmt(f),
         }
@@ -75,12 +82,12 @@ pub struct Clock {
 impl Clock {
     /// Against `offline`, the offline run's object, `[ny, nx]` = `shape`
     /// row-major, compared over the rows and columns of `region`.
-    /// `earlier`, a snapshot of that run some iterations before, must match
-    /// it to [`MATCH`] in every ring: a run still moving is no reference.
+    /// `half`, that run's object at half its epochs, must match it to
+    /// [`SETTLED`] in every ring: a run still moving is no reference.
     /// `scan_end` is wall ns, as frame arrivals are.
     pub fn new(
         offline: &[C64],
-        earlier: &[C64],
+        half: &[C64],
         shape: [usize; 2],
         region: [Range<usize>; 2],
         scan_end: i64,
@@ -98,7 +105,7 @@ impl Clock {
         let cropped = crop(offline, shape, &region)?;
         let f = Frc::compute(
             &cropped,
-            &crop(earlier, shape, &region)?,
+            &crop(half, shape, &region)?,
             region_shape(&region),
         )?;
         if let Some(ring) = below(&f) {
@@ -118,8 +125,8 @@ impl Clock {
         })
     }
 
-    /// The lowest ring's FRC of the offline object against its earlier
-    /// snapshot over the region: how far the reference still moved.
+    /// The lowest ring's FRC of the offline object against its own at half
+    /// the epochs, over the region: how far the reference still moved.
     pub fn settled(&self) -> f64 {
         self.settled
     }
@@ -171,9 +178,9 @@ fn region_shape(region: &[Range<usize>; 2]) -> [usize; 2] {
     region.clone().map(|r| r.len())
 }
 
-/// The first ring under [`MATCH`].
+/// The first ring under [`SETTLED`].
 fn below(f: &Frc) -> Option<usize> {
-    f.rings.iter().position(|r| r.frc < MATCH)
+    f.rings.iter().position(|r| r.frc < SETTLED)
 }
 
 fn lowest(f: &Frc) -> f64 {
@@ -211,9 +218,9 @@ mod tests {
     #[test]
     fn a_live_object_converges_once_every_ring_matches_after_the_scan_end() {
         let offline = noise(1);
-        let earlier = plus(&offline, 0.02, 2);
-        let clock = Clock::new(&offline, &earlier, SHAPE, ALL, 1_000).unwrap();
-        assert!((MATCH..0.9999).contains(&clock.settled()));
+        let half = plus(&offline, 0.02, 2);
+        let clock = Clock::new(&offline, &half, SHAPE, ALL, 1_000).unwrap();
+        assert!((SETTLED..1.0).contains(&clock.settled()));
         let rot = C64::from_polar(1.0, 0.7);
         let close: Vec<C64> = plus(&offline, 0.05, 3).iter().map(|z| z * rot).collect();
         let far = plus(&offline, 0.5, 4);
@@ -229,17 +236,20 @@ mod tests {
         assert!(clock.check(&bad, 2_000).is_err());
     }
 
-    /// An offline run whose earlier snapshot is 0.5 away is still moving and
-    /// starts no clock.
+    /// An offline run whose object at half the epochs is 0.1 away (FRC
+    /// near 0.995, over [`MATCH`] but under [`SETTLED`]) or 0.5 away is still
+    /// moving and starts no clock.
     #[test]
     fn an_offline_run_still_moving_is_no_reference() {
         let offline = noise(1);
-        let earlier = plus(&offline, 0.5, 5);
-        let err = Clock::new(&offline, &earlier, SHAPE, ALL, 0).err().unwrap();
-        assert!(
-            matches!(err, ClockError::Moving { frc, .. } if frc < MATCH),
-            "{err}"
-        );
+        for (eps, seed) in [(0.1, 5), (0.5, 6)] {
+            let half = plus(&offline, eps, seed);
+            let err = Clock::new(&offline, &half, SHAPE, ALL, 0).err().unwrap();
+            assert!(
+                matches!(err, ClockError::Moving { frc, .. } if frc < SETTLED),
+                "{err}"
+            );
+        }
     }
 
     /// `b` inside rows and columns 16..48, `a` outside.
@@ -267,8 +277,8 @@ mod tests {
         let offline = noise(1);
         let region = [16..48, 16..48];
         let far = plus(&offline, 0.5, 6);
-        let earlier = inside(&far, &offline);
-        let clock = Clock::new(&offline, &earlier, SHAPE, region.clone(), 0).unwrap();
+        let half = inside(&far, &offline);
+        let clock = Clock::new(&offline, &half, SHAPE, region.clone(), 0).unwrap();
         let live = inside(&far, &plus(&offline, 0.05, 7));
         assert_eq!(
             clock.check(&live, 10).unwrap(),

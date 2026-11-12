@@ -64,8 +64,8 @@ source = "pva"
 # chunk-mib = 2         # the object is backed this many MiB at a time
 # snap-every = 5        # epochs between kept snapshots once the scan landed
 # snaps = 200           # snapshots kept; the live run stops after the last
-# settle-every = 100    # the offline run's epochs between settle checks
-# settle-max = 5000     # and its most epochs
+# settle-max = 8192     # the offline run's epoch cap: it settles once its
+#                       # object at epoch E matches E/2 to 0.999, E doubling
 
 # What the frames and positions are checked against; its frame size is the
 # detector's. In its place, the M5 scan simulator:

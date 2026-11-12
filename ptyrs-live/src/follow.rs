@@ -48,8 +48,7 @@ pub struct ReconCfg {
     pub snap_every: NonZeroU32,
     /// Snapshots kept; the live run stops after the last.
     pub snaps: usize,
-    /// The offline reference's [`Settle`].
-    pub settle_every: NonZeroU32,
+    /// The offline reference's epoch cap; see [`settle`].
     pub settle_max: u64,
 }
 
@@ -62,16 +61,15 @@ impl Default for ReconCfg {
             chunk_mib: 2,
             snap_every: NonZeroU32::new(5).unwrap(),
             snaps: 200,
-            settle_every: NonZeroU32::new(100).unwrap(),
-            settle_max: 5000,
+            settle_max: 8192,
         }
     }
 }
 
 impl ReconCfg {
     /// `--recon ALGO --recon-nf-max --recon-inertia --recon-chunk-mib
-    /// --recon-snap-every --recon-snaps --recon-settle-every
-    /// --recon-settle-max`; `None` without `--recon`.
+    /// --recon-snap-every --recon-snaps --recon-settle-max`; `None` without
+    /// `--recon`.
     pub fn from_args(a: &Args) -> Option<Self> {
         let algo = a.opt("recon")?;
         let d = Self::default();
@@ -82,16 +80,8 @@ impl ReconCfg {
             chunk_mib: a.get("recon-chunk-mib", d.chunk_mib),
             snap_every: a.get("recon-snap-every", d.snap_every),
             snaps: a.get("recon-snaps", d.snaps),
-            settle_every: a.get("recon-settle-every", d.settle_every),
             settle_max: a.get("recon-settle-max", d.settle_max),
         })
-    }
-
-    pub fn settle(&self) -> Settle {
-        Settle {
-            every: self.settle_every,
-            max: self.settle_max,
-        }
     }
 }
 
@@ -333,14 +323,6 @@ fn keep(snap: &mut Snapshot, epochs: u64) -> Result<Kept, GrowError> {
     })
 }
 
-/// How long [`offline_ap`] iterates: `every` epochs at a time, at least
-/// two such steps and at most `max` epochs in all.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Settle {
-    pub every: NonZeroU32,
-    pub max: u64,
-}
-
 pub struct Offline {
     pub epochs: u64,
     /// The clock against the run's last object, or why it would not start.
@@ -348,9 +330,7 @@ pub struct Offline {
 }
 
 /// AP as the live run does it on `store`'s frames `0..positions.len()` at
-/// `positions`, landed at once, `settle.every` epochs at a time until its
-/// object matches the one `every` epochs before over `region` to the
-/// clock's threshold, or `settle.max` epochs have run.
+/// `positions`, landed at once, run until it [`settle`]s.
 pub fn offline_ap(
     ctx: &Arc<Context>,
     store: &DeviceStore,
@@ -358,7 +338,7 @@ pub fn offline_ap(
     positions: &[(f64, f64)],
     region: [Range<usize>; 2],
     scan_end: i64,
-    settle: Settle,
+    max_epochs: u64,
 ) -> Result<Offline, GrowError> {
     ctx.bind_to_thread()?;
     let stream = ctx.new_stream()?;
@@ -377,27 +357,39 @@ pub fn offline_ap(
     let counts = unsafe { store.frames_view()? };
     let mut run = LiveAp::new(&stream, &ap, &cfg.probe, counts)?;
     run.push(&views_of(&ap, &cfg.place, positions))?;
+    settle(&mut run, region, scan_end, max_epochs)
+}
+
+/// Iterates `run`, every frame landed, to epochs `E` = `E0`, `2 E0`, … from
+/// its count `E0` now (1 when fresh) until its object at `E` matches the
+/// one at `E/2` over `region` to
+/// [`SETTLED`](crate::converge::SETTLED), the clock's reference; refused
+/// as still moving once the next doubling would pass `max_epochs`, after
+/// at least the check at `E` = 2.
+pub fn settle(
+    run: &mut LiveAp,
+    region: [Range<usize>; 2],
+    scan_end: i64,
+    max_epochs: u64,
+) -> Result<Offline, GrowError> {
     let mut snap = run.new_snapshot()?;
-    let mut earlier: Option<Vec<C64>> = None;
+    let mut half: Option<Vec<C64>> = None;
+    let mut e = run.epochs().max(1);
     loop {
-        for _ in 0..settle.every.get() {
+        while run.epochs() < e {
             run.epoch()?;
         }
         run.snapshot(&mut snap)?;
         let shape = snap.shape();
         let now = plane(snap.wait()?, shape);
-        if let Some(e) = &earlier {
-            match Clock::new(&now, e, shape, region.clone(), scan_end) {
-                Err(ClockError::Moving { .. }) if run.epochs() < settle.max => {}
-                clock => {
-                    return Ok(Offline {
-                        epochs: run.epochs(),
-                        clock,
-                    });
-                }
+        if let Some(h) = &half {
+            match Clock::new(&now, h, shape, region.clone(), scan_end) {
+                Err(ClockError::Moving { .. }) if 2 * e <= max_epochs => {}
+                clock => return Ok(Offline { epochs: e, clock }),
             }
         }
-        earlier = Some(now);
+        half = Some(now);
+        e *= 2;
     }
 }
 
@@ -449,6 +441,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::*;
+    use crate::converge::MATCH;
     use crate::farfield::{Ptycho, PtychoSpec, ScanPath};
     use crate::graph::WarmUp;
     use crate::ring::{Ring, UploaderConfig, run_uploader};
@@ -546,8 +539,8 @@ mod tests {
     /// for: no landing raced an epoch in flight.
     ///
     /// The live object is not held to the offline one here: after thousands
-    /// of epochs over a partial scan, AP on these frames stops at 0.98 in
-    /// the outer rings against the settled offline run.
+    /// of epochs over a partial scan, AP on these frames stops at 0.985 in
+    /// the outer rings against the offline run, settled at 8192 epochs.
     #[test]
     fn the_live_object_is_its_landings_replayed_one_at_a_time() {
         let Streamed {
@@ -597,42 +590,34 @@ mod tests {
         assert!(got[..last.pixels.len()] == last.pixels[..]);
     }
 
-    /// The offline run settles within its cap and refuses as still moving
-    /// when the cap stops it first. Against a clock on the live run's own
-    /// last snapshot, the search on one thread per snapshot finds the same
-    /// first converged one as an in-order search, timed from the scan's end.
+    /// The offline run settles at a doubling of its epochs within the cap,
+    /// and a cap under that refuses it as still moving at the doubling
+    /// before. The live object stays under [`MATCH`] against it, so against
+    /// a clock on the live run's own last snapshot, the search on one thread
+    /// per snapshot finds the same first converged one as an in-order
+    /// search, timed from the scan's end.
     #[test]
     fn the_offline_run_settles_and_the_search_finds_the_first_match() {
         let s = streamed();
         let rep = &s.rep;
         let region = s.cfg.place.scanned(&rep.positions, s.cfg.ap.shape.frame);
         let offline = |max| {
-            let settle = Settle {
-                every: NonZeroU32::new(100).unwrap(),
-                max,
-            };
             let r = region.clone();
-            offline_ap(
-                &s.ctx,
-                &s.store,
-                &s.cfg,
-                &rep.positions,
-                r,
-                s.scan_end,
-                settle,
-            )
-            .unwrap()
+            offline_ap(&s.ctx, &s.store, &s.cfg, &rep.positions, r, s.scan_end, max).unwrap()
         };
-        let settled = offline(3000);
-        assert!(settled.clock.is_ok());
-        assert!((200..=3000).contains(&settled.epochs));
-        let capped = offline(200);
-        assert_eq!(capped.epochs, 200);
+        let settled = offline(1 << 14);
+        let e = settled.epochs;
+        let reference = settled.clock.unwrap();
+        assert!(e.is_power_of_two() && e >= 4, "settled at {e}");
+        let capped = offline(e - 1);
+        assert_eq!(capped.epochs, e / 2);
         assert!(matches!(capped.clock, Err(ClockError::Moving { .. })));
 
         let n = rep.kept.len();
         let obj = |i: usize| plane(&rep.kept[i].pixels, rep.shape);
-        let clock = Clock::new(&obj(n - 1), &obj(n - 2), rep.shape, region, s.scan_end).unwrap();
+        assert!(reference.region_frc(&obj(n - 1)).unwrap() < MATCH);
+        let last = obj(n - 1);
+        let clock = Clock::new(&last, &last, rep.shape, region, s.scan_end).unwrap();
         let first = (0..n)
             .find(|&i| clock.check(&obj(i), rep.kept[i].taken).unwrap().is_some())
             .unwrap();

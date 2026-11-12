@@ -271,7 +271,6 @@ mod tests {
     use ptyrs_engine::{ApParams, GpuOptions, GpuPtycho};
 
     use super::*;
-    use crate::converge::Clock;
     use crate::farfield::{Ptycho, PtychoSpec, ScanPath};
     use crate::graph::WarmUp;
 
@@ -526,8 +525,8 @@ mod tests {
     /// Frames landed in uneven batches with epochs between, from graphs
     /// captured before the first frame: once the scan ends, the live object
     /// converges over the scanned region to the offline run over every
-    /// frame (settled to 0.9994 between its epochs 900 and 1000), with no
-    /// recapture.
+    /// frame, settled at 8192 epochs, with no recapture. It crosses 0.99
+    /// about 2000 epochs after the scan's end and goes on to 0.995.
     #[test]
     fn a_scan_landed_in_batches_converges_to_the_offline_run() {
         let p = sim(64, 6, 36, 12.0);
@@ -539,21 +538,12 @@ mod tests {
             LiveAp::new(&st, &config(shape, 16), &probe(&p), dev).unwrap()
         };
 
-        let (settle, every) = (1000, 100);
         let mut offline = run();
         offline.push(&views).unwrap();
-        let mut snap = offline.new_snapshot().unwrap();
-        for _ in 0..settle - every {
-            offline.epoch().unwrap();
-        }
-        offline.snapshot(&mut snap).unwrap();
-        let (earlier, sh) = plane(&mut snap, 0);
-        for _ in 0..every {
-            offline.epoch().unwrap();
-        }
-        offline.snapshot(&mut snap).unwrap();
         // Epochs after the scan's end stand in for wall time.
-        let clock = Clock::new(&plane(&mut snap, 0).0, &earlier, sh, region, 0).unwrap();
+        let settled = crate::follow::settle(&mut offline, region, 0, 1 << 14).unwrap();
+        let settle = settled.epochs;
+        let clock = settled.clock.unwrap();
 
         let mut live = run();
         let warm = WarmUp::end();
