@@ -18,6 +18,7 @@ use ptyrs_gpu::{
     GammaStacks, GradKernels, Kernels, LlkPartial, LlkRing, LlkScratch, LlkTotals, ObjProbeScale,
     PowerMax, RingDevice, RpieKernels, StackTable, UpdateSums, ViewAddr, ViewDims, Views,
 };
+use ptyrs_tile::TileDots;
 
 use super::{
     Epoch, Frames, GpuOptions, Tag, batch_stacks, plane_len, plans, split, stack_buf_len, stacks,
@@ -32,6 +33,8 @@ pub(super) struct Device {
     rpie: RpieKernels,
     grad: GradKernels,
     bh: BhKernels,
+    /// BH's dot products, compiled by [`Device::new`] so no capture compiles a Tile kernel.
+    tile: TileDots,
     views: Views,
     counts: DeviceBuffer<u16>,
     obj: DeviceBuffer<C32>,
@@ -429,6 +432,7 @@ pub(super) struct Bufs<'a> {
     pub rpie: &'a RpieKernels,
     pub grad: &'a GradKernels,
     pub bh: &'a BhKernels,
+    pub tile: &'a TileDots,
     pub views: &'a Views,
     pub counts: &'a DeviceBuffer<u16>,
     pub obj: &'a mut DeviceBuffer<C32>,
@@ -503,6 +507,7 @@ impl Device {
         let grad = GradKernels::load(&kernels)?;
         let bh = BhKernels::load(&kernels)?;
         let views = Views::new(&stream, dims, addrs)?;
+        let tile = TileDots::new(&stream, &dims)?;
         let (frames, table, lens) =
             stacks(&stream, &dims, to_u32("stack_size", options.stack_size)?)?;
         let len = stack_buf_len(&dims, &table);
@@ -550,6 +555,7 @@ impl Device {
             rpie,
             grad,
             bh,
+            tile,
             views,
             table,
             stacks,
@@ -613,6 +619,7 @@ impl Device {
             rpie: &self.rpie,
             grad: &self.grad,
             bh: &self.bh,
+            tile: &self.tile,
             views: &self.views,
             counts: &self.counts,
             obj: &mut self.obj,

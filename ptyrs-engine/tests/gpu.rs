@@ -401,6 +401,36 @@ fn bh_steps_match_cpu() {
     }
 }
 
+/// [`GpuPtycho::new`] compiles BH's Tile dot products, so graphed BH epochs, one batch of
+/// every frame (CG from the second epoch) and batches of 4, compile no Tile kernel in their
+/// captures or replays.
+#[test]
+fn bh_graphs_compile_no_tile_kernel() {
+    for setup in [M1, FUSED] {
+        let (scan, object, probe) = start(setup.frame, 2, true);
+        let before = cutile::tile_kernel::jit_compile_count();
+        let mut g = GpuPtycho::new(&ctx(), &scan, object, probe, setup.options).unwrap();
+        let jit = cutile::tile_kernel::jit_compile_count();
+        assert!(
+            jit > before,
+            "{setup:?}: GpuPtycho::new compiled no Tile kernel"
+        );
+        for batch_size in [NPOS, 4] {
+            let params = BhParams {
+                batch_size,
+                probe_rho: 0.01,
+                seed: 7,
+            };
+            g.bh(&params, 3, 1).unwrap();
+        }
+        assert_eq!(
+            cutile::tile_kernel::jit_compile_count(),
+            jit,
+            "{setup:?}: BH compiled a Tile kernel"
+        );
+    }
+}
+
 /// Every update consumes its sums, so each algorithm starts from zero sums whatever ran
 /// before: rPIE's steps, then AP's and DM's updates, against the CPU. The last rPIE batch
 /// size differs, so its epochs get their own batches and graph.

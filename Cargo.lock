@@ -1763,11 +1763,13 @@ version = "0.0.1"
 dependencies = [
  "cuda-async",
  "cuda-core",
+ "cutile",
  "num-complex",
  "ptyrs-core",
  "ptyrs-fft",
  "ptyrs-gpu",
  "ptyrs-io",
+ "ptyrs-tile",
  "rustfft",
  "thiserror 2.0.21",
 ]
