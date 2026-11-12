@@ -4,17 +4,17 @@
 //!
 //! An epoch is one AP cycle over every landed frame: the ingest graph bins
 //! the frames landed since the last epoch, the sweep graph takes the next
-//! stack of the sweep entry through PyNX AP (exit waves, FFT, amplitude
-//! projection, inverse FFT, object sums) and the update graph applies the
-//! sums to the object and rewinds the sweep. Frames land only between
+//! stack of the sweep entry through the engine's fused AP pass (exit waves,
+//! amplitude projection and object sums, as [`Kernels::fused_project`]) and
+//! the update graph applies the sums to the object and rewinds the sweep. Frames land only between
 //! epochs, so an epoch's sweep covers exactly the frames landed when it was
 //! queued, as the engine's AP cycle covers its scan.
 //!
 //! With LLK recording, each epoch is also one record of an [`LlkRing`]: one
 //! launch outside the graphs counts the unmasked pixels of the frames binned
-//! since the last epoch, the sweep graph pushes each stack's LLK partials of
-//! its forward exit waves, as the engine's AP cycle takes them, and the
-//! update graph ends the record.
+//! since the last epoch, the sweep graph pushes each stack's LLK partials,
+//! which the fused pass takes from its forward far field as the engine's AP
+//! cycle does, and the update graph ends the record.
 
 use std::num::NonZeroU32;
 use std::ops::Range;
@@ -22,8 +22,9 @@ use std::sync::Arc;
 
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{DeviceBuffer, Stream};
-use ptyrs_fft::Plan2d;
-use ptyrs_gpu::{C32, Ended, Kernels, LlkPartial, LlkRing, LlkScratch, ViewAddr};
+use ptyrs_gpu::{
+    C32, Ended, Exit, FusedBufs, FusedInputs, FusedSums, Kernels, LlkPartial, LlkRing, ViewAddr,
+};
 
 use crate::graph::LiveGraph;
 use crate::grow::GrowError;
@@ -53,7 +54,6 @@ const LLK_SLOTS: u32 = 8;
 /// The device side of each epoch's LLK record.
 struct LlkBufs {
     ring: LlkRing<u64>,
-    scratch: LlkScratch,
     partials: DeviceBuffer<LlkPartial>,
 }
 
@@ -72,8 +72,7 @@ pub struct LiveAp {
     scan: LiveScan,
     _kernels: Kernels,
     _probe: DeviceBuffer<C32>,
-    _psi: DeviceBuffer<C32>,
-    _plan: Plan2d,
+    _fused: FusedBufs,
     counts: DeviceBuffer<u16>,
     /// Frames the ingest graph has binned.
     binned: u32,
@@ -97,23 +96,11 @@ impl LiveAp {
         let kernels = Kernels::load(ctx)?;
         let mut scan = LiveScan::new(stream, &cfg.shape, cfg.nf_max, cfg.cap, cfg.fill, cfg.chunk)?;
         let d = *scan.dims();
-        let n = d.frame[0] as usize * d.frame[1] as usize;
-        let planes = cfg.nf_max.get() as usize * d.nmode as usize;
-        if d.frame[0] != d.frame[1] {
-            return Err(ptyrs_gpu::Error::Shape(format!(
-                "live AP needs square frames, got {:?}",
-                d.frame
-            ))
-            .into());
-        }
         let probe = DeviceBuffer::from_host(stream, probe)?;
-        let mut psi = DeviceBuffer::<C32>::zeroed(stream, planes * n)?;
-        let mut plan =
-            Plan2d::new(stream, d.frame[0] as usize, planes).map_err(ptyrs_gpu::Error::from)?;
+        let mut fused = FusedBufs::new(stream, &d, cfg.nf_max.get())?;
         let mut bufs = if llk {
             Some(LlkBufs {
                 ring: LlkRing::new(&kernels, stream, &d, LLK_SLOTS)?,
-                scratch: LlkScratch::new(stream, &d, cfg.nf_max.get())?,
                 partials: DeviceBuffer::zeroed(stream, cfg.nf_max.get() as usize)?,
             })
         } else {
@@ -128,29 +115,36 @@ impl LiveAp {
         // the update graph ends it.
         let mut rec = bufs
             .as_mut()
-            .map(|b| (b.ring.device().record(), &mut b.scratch, &mut b.partials));
+            .map(|b| (b.ring.device().record(), &mut b.partials));
         let sweep = {
-            let (s, psi, plan, rec) = (&mut scan, &mut psi, &mut plan, &mut rec);
+            let (s, fused, rec) = (&mut scan, &mut fused, &mut rec);
             let (probe, counts) = (&probe, &counts);
             LiveGraph::capture(stream, move |c| {
                 let p = s.parts_mut();
                 p.frames.sweep_step(c)?;
                 let st = p.frames.sweep();
-                k.obj_probe_to_psi(c, p.views, st, p.pixels, probe, psi)?;
-                plan.forward_inplace(c, psi)?;
-                if let Some((w, scratch, partials)) = rec {
-                    k.llk(c, st, counts, psi, scratch, partials)?;
+                let inputs = FusedInputs {
+                    views: p.views,
+                    counts,
+                    obj: p.pixels,
+                    probe,
+                };
+                let llk = rec.as_mut().map(|(_, partials)| &mut **partials);
+                let sums = FusedSums {
+                    obj: Some(p.sums),
+                    probe: None,
+                };
+                k.fused_project(c, &inputs, st, Exit::Ap { llk }, fused, sums)?;
+                if let Some((w, partials)) = rec {
                     w.push(c, &d, st, partials)?;
                 }
-                k.apply_amplitude(c, &d, st, counts, psi)?;
-                plan.inverse_inplace(c, psi)?;
-                k.psi_to_obj(c, p.views, st, psi, probe, p.sums)
+                Ok(())
             })?
         };
         let mut ended = None;
         let update = {
             let (s, inertia, ended) = (&mut scan, cfg.inertia, &mut ended);
-            let w = rec.map(|(w, _, _)| w);
+            let w = rec.map(|(w, _)| w);
             LiveGraph::capture(stream, move |c| {
                 let p = s.parts_mut();
                 k.update_obj_from_sums(c, p.views, p.pixels, p.sums, inertia)?;
@@ -173,8 +167,7 @@ impl LiveAp {
             scan,
             _kernels: kernels,
             _probe: probe,
-            _psi: psi,
-            _plan: plan,
+            _fused: fused,
             counts,
             binned: 0,
             epochs: 0,
@@ -489,9 +482,7 @@ mod tests {
             stack_size: nf_max as usize,
             graph: true,
             llk_slots: 8,
-            // The live run launches M1's sequence; the fused passes agree with
-            // it only to rounding.
-            fused: false,
+            fused: true,
         };
         let mut engine = GpuPtycho::new(&ctx, &scan, start, truth, opts).unwrap();
         let params = ApParams {
@@ -628,7 +619,7 @@ mod tests {
     /// captured before the first frame: once the scan ends, the live object
     /// converges over the scanned region to the offline run over every
     /// frame, settled at 512 epochs, with no recapture. It crosses 0.99
-    /// about 75 epochs after the scan's end and goes on to 0.9995.
+    /// about 125 epochs after the scan's end and goes on to 0.9996.
     ///
     /// Steps of 8 px overlap the probe's 16 px by half. At 12 px AP's
     /// settled object moves by more than [`MATCH`] when the start moves by
