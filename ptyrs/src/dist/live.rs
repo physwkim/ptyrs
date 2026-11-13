@@ -15,7 +15,7 @@ use crate::gpu::{ViewAddr, ViewDims, view_tiles};
 use crate::live::scan::ScanShape;
 
 use crate::dist::exchange::Pull;
-use crate::dist::halo::{Halo, HaloRows, LiveHaloBufs, Window};
+use crate::dist::halo::{Halo, HaloBufs, HaloRows, Window};
 use crate::dist::{DEFAULT_TILE, DistError, NLEAF, Partition, Scheme, TileGrid};
 
 /// One GPU's part of a live scan.
@@ -48,8 +48,8 @@ impl LiveRegion {
         stream: &Arc<Stream>,
         obj: u64,
         chunk: usize,
-    ) -> Result<LiveHaloBufs, DistError> {
-        LiveHaloBufs::new(
+    ) -> Result<HaloBufs, DistError> {
+        HaloBufs::new(
             stream,
             self.halo_words,
             self.halo_rows,
@@ -203,7 +203,7 @@ impl LivePlan {
 
     /// The copy-engine pulls into region `r`'s halo receive buffer at `recv` from the owners'
     /// send buffers, `send(o)` giving owner `o`'s context and send buffer
-    /// ([`LiveHaloBufs::ptrs`]): the same for the whole scan.
+    /// ([`HaloBufs::ptrs`]): the same for the whole scan.
     pub fn halo_pulls(
         &self,
         r: usize,
@@ -693,7 +693,7 @@ mod tests {
         win: DeviceBuffer<u64>,
         stage: DeviceBuffer<u64>,
         own: Runs,
-        halo: LiveHaloBufs,
+        halo: HaloBufs,
         graphs: [LiveGraph; 2],
         pulls: Vec<Pull>,
     }
@@ -774,13 +774,16 @@ mod tests {
                         let (ex, own) = (Exchange::load(g.ctx())?, Runs::new(&st, &own)?);
                         let obj = win.cu_deviceptr();
                         let halo = at.region.halo_bufs(&st, obj, 4096)?;
-                        // SAFETY: `win` holds the window at `obj` for as long as the graphs.
+                        // SAFETY: `win` holds the window at `obj` for as long as the graphs, leased
+                        // in them; each epoch writes it before the pack and pulls before the
+                        // unpack, on this stream.
                         let pack = LiveGraph::capture(&st, |c| unsafe {
-                            halo.pack(&ex, c, win.storage())
+                            crate::gpu::lease(c, &[win.storage()], &[])?;
+                            halo.pack(&ex, c)
                         })?;
-                        // SAFETY: as above; each epoch pulls before it replays this.
                         let unpack = LiveGraph::capture(&st, |c| unsafe {
-                            halo.unpack(&ex, c, win.storage())
+                            crate::gpu::lease(c, &[], &[win.storage()])?;
+                            halo.unpack(&ex, c)
                         })?;
                         let out = (g.ctx().clone(), halo.ptrs(), halo.backer());
                         *side = Some(OnGpu {

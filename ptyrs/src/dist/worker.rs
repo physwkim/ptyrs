@@ -58,7 +58,10 @@ impl Gpu {
 
     /// Runs `f` on the side stream, forked from the main stream first. The side stream has the
     /// device's highest priority, so its kernels take free SMs ahead of the main stream's.
-    pub fn side<R>(&self, f: impl FnOnce(&Stream) -> Result<R, DistError>) -> Result<R, DistError> {
+    pub fn side<R>(
+        &self,
+        f: impl FnOnce(&Arc<Stream>) -> Result<R, DistError>,
+    ) -> Result<R, DistError> {
         let s = &self.side;
         s.fork.record(&self.stream)?;
         s.stream.wait(&s.fork)?;
