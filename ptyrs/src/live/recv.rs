@@ -442,13 +442,6 @@ fn recon_line(
     let region = follow.place.scanned(&rep.positions, follow.ap.shape.frame);
     let [rows, cols] = &region;
     let scan_epochs = rep.scan_epochs.unwrap_or(0);
-    // Epoch time once the scan landed, from the kept snapshots' stamps.
-    let epoch_ms = match (rep.kept.first(), rep.kept.last()) {
-        (Some(a), Some(b)) if b.epochs > a.epochs => {
-            Some((b.taken - a.taken) as f64 / 1e6 / (b.epochs - a.epochs) as f64)
-        }
-        _ => None,
-    };
     let mut l = format!(
         "recv recon algo=ap nf_max={} stacks={} tile_cap={} stored={} landed={} scan_epochs={scan_epochs} \
          epochs={} snap_every={} kept={} epoch_ms={} object={ny}x{nx} obj_mapped_MiB={} \
@@ -461,7 +454,7 @@ fn recon_line(
         rep.epochs,
         follow.snap_every,
         rep.kept.len(),
-        Fig(epoch_ms, 3),
+        Fig(rep.epoch_ms(), 3),
         rep.obj_mapped_bytes >> 20,
         rep.plan_time.as_secs_f64() * 1e3,
         rep.plan_mapped_bytes >> 20,
@@ -524,7 +517,7 @@ fn recon_line(
 }
 
 /// Frame arrival (`t_rx`, by store place) → end of the first epoch that
-/// took the frame; and epoch end → next epoch end once the scan landed.
+/// took the frame; and [`FollowReport::epochs_after_scan`].
 fn epoch_latency(rep: &FollowReport, t_rx: &[i64]) -> (Histogram, Histogram) {
     let (mut to_epoch, mut epoch) = (Histogram::new(1_000_000), Histogram::new(1_000_000));
     let mut f0 = 0;
@@ -537,10 +530,8 @@ fn epoch_latency(rep: &FollowReport, t_rx: &[i64]) -> (Histogram, Histogram) {
         }
         f0 = stored;
     }
-    if let Some(s) = rep.scan_epochs {
-        for w in rep.epoch_done[(s.max(1) - 1) as usize..].windows(2) {
-            epoch.record(w[1] - w[0]);
-        }
+    for t in rep.epochs_after_scan() {
+        epoch.record(t);
     }
     (to_epoch, epoch)
 }
