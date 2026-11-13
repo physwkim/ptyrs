@@ -110,6 +110,19 @@ fn dm_params(kw: Option<&Bound<'_, PyDict>>) -> PyResult<::ptyrs::engine::DmPara
     ))
 }
 
+fn raar_params(kw: Option<&Bound<'_, PyDict>>) -> PyResult<::ptyrs::engine::RaarParams> {
+    Ok(params!(
+        ::ptyrs::engine::RaarParams,
+        kw,
+        obj_inertia,
+        probe_inertia,
+        beta,
+        loop_obj_probe,
+        calc_llk,
+        zero_phase_ramp
+    ))
+}
+
 fn ml_params(kw: Option<&Bound<'_, PyDict>>) -> PyResult<::ptyrs::engine::MlParams> {
     Ok(params!(
         ::ptyrs::engine::MlParams,

@@ -1,7 +1,7 @@
-//! DM, AP, ML or rPIE on a simulated scan, the Rust side of `scripts/compare_pynx.py` (DM,
-//! AP), `scripts/compare_pynx_ml.py` (ML) and `scripts/compare_ptychi_rpie.py` (rPIE).
+//! DM, RAAR, AP, ML or rPIE on a simulated scan, the Rust side of `scripts/compare_pynx.py` (DM,
+//! RAAR, AP), `scripts/compare_pynx_ml.py` (ML) and `scripts/compare_ptychi_rpie.py` (rPIE).
 //!
-//! `cargo run --release -p ptyrs --example engine_llk_trace -- <out_dir> <dm|ap|ml|rpie> [ncycle] [nprobe] [frame] [npos] [step] [--gpu]`
+//! `cargo run --release -p ptyrs --example engine_llk_trace -- <out_dir> <dm|raar|ap|ml|rpie> [ncycle] [nprobe] [frame] [npos] [step] [--gpu]`
 //! (defaults 50, 1, 64, 100, 4 object pixels) writes `scan.cxi`, `init.h5` (the scaled
 //! starting object and probe), `llk_rust.txt` (cycle and the normalised Poisson, Gaussian,
 //! Euclidian LLK and photon count per cycle), `llk_truth.txt` (the same four for the truth the
@@ -19,8 +19,8 @@ use std::path::PathBuf;
 
 use cuda_core::CudaContext;
 use ptyrs::engine::{
-    ApParams, DmParams, EngineError, GpuOptions, GpuPtycho, Llk, MlParams, Ptycho, RpieParams,
-    quad_phase,
+    ApParams, DmParams, EngineError, GpuOptions, GpuPtycho, Llk, MlParams, Ptycho, RaarParams,
+    RpieParams, quad_phase,
 };
 
 #[path = "../tests/common/ptychi/mod.rs"]
@@ -49,7 +49,7 @@ const ML_WARMUP: usize = 20;
 const RPIE: RpieParams = ptychi::RPIE;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let usage = "usage: llk_trace <out_dir> <dm|ap|ml|rpie> [ncycle] [nprobe] [frame] [npos] [step] [--gpu]";
+    let usage = "usage: llk_trace <out_dir> <dm|raar|ap|ml|rpie> [ncycle] [nprobe] [frame] [npos] [step] [--gpu]";
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let gpu = args
         .iter()
@@ -59,7 +59,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = args.into_iter();
     let out = PathBuf::from(args.next().ok_or(usage)?);
     let algo = args.next().ok_or(usage)?;
-    if !["dm", "ap", "ml", "rpie"].contains(&algo.as_str()) {
+    if !["dm", "raar", "ap", "ml", "rpie"].contains(&algo.as_str()) {
         return Err(usage.into());
     }
     let mut next = |default: usize| args.next().map_or(Ok(default), |s| s.parse());
@@ -107,6 +107,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         calc_llk: 1,
         ..DmParams::default()
     };
+    let raar = RaarParams {
+        calc_llk: 1,
+        ..RaarParams::default()
+    };
     let backend = if gpu { "gpu" } else { "cpu" };
     let (history, object, probe, secs) = if gpu {
         let ctx = CudaContext::new(0).map_err(EngineError::from)?;
@@ -120,6 +124,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let t = std::time::Instant::now();
         match algo.as_str() {
             "dm" => g.dm(&dm, ncycle)?,
+            "raar" => g.raar(&raar, ncycle)?,
             "ap" => g.ap(&AP, ncycle)?,
             "ml" => g.ml(&ML, ncycle)?,
             _ => g.rpie(&RPIE, ncycle)?,
@@ -131,6 +136,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let t = std::time::Instant::now();
         match algo.as_str() {
             "dm" => p.dm(&dm, ncycle),
+            "raar" => p.raar(&raar, ncycle),
             "ap" => p.ap(&AP, ncycle),
             "ml" => p.ml(&ML, ncycle),
             _ => p.rpie(&RPIE, ncycle)?,

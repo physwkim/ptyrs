@@ -1,4 +1,4 @@
-//! The GPU engine ([`ptyrs::engine::GpuPtycho`]): AP, DM, ML, rPIE and BH in f32.
+//! The GPU engine ([`ptyrs::engine::GpuPtycho`]): AP, DM, RAAR, ML, rPIE and BH in f32.
 
 use cuda_core::CudaContext;
 use numpy::{PyArray3, PyReadonlyArray3};
@@ -49,6 +49,15 @@ impl GpuPtycho {
         Ok(self
             .0
             .dm(&crate::dm_params(params)?, ncycle)
+            .map_err(Error::from)?)
+    }
+
+    /// `ncycle` RAAR cycles; keywords are `RaarParams` fields.
+    #[pyo3(signature = (ncycle, **params))]
+    fn raar(&mut self, ncycle: usize, params: Option<&Bound<'_, PyDict>>) -> PyResult<()> {
+        Ok(self
+            .0
+            .raar(&crate::raar_params(params)?, ncycle)
             .map_err(Error::from)?)
     }
 

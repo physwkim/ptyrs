@@ -1,6 +1,6 @@
 //! The GPU backend against the CPU oracle: per-record LLK and the final object and probe of AP,
-//! DM, rPIE and ML updating the object, the probe or both, and of BH in one or more batches, from the
-//! same scaled start; AP and DM by M1's launches and by the fused passes; the ML gradients;
+//! DM, RAAR, rPIE and ML updating the object, the probe or both, and of BH in one or more batches, from the
+//! same scaled start; AP, DM and RAAR by M1's launches and by the fused passes; the ML gradients;
 //! and the LLK ring's record of a scan's first frames.
 
 use std::slice;
@@ -11,8 +11,8 @@ use cuda_core::{CudaContext, DeviceBuffer};
 use ptyrs::base::{C64, Counts, MASKED, Object, Probe, Scan, Stack};
 use ptyrs::engine::{
     Algorithm, ApParams, Backend, Bh, BhParams, BhStep, Cost, DmParams, Features, GpuOptions,
-    GpuPtycho, Llk, LlkRecord, LsqmlParams, MlParams, Observed, Optics, Params, Ptycho, RpieParams,
-    Step, llk,
+    GpuPtycho, Llk, LlkRecord, LsqmlParams, MlParams, Observed, Optics, Params, Ptycho, RaarParams,
+    RpieParams, Step, llk,
 };
 use ptyrs::gpu::{
     C32, FUSED_SIDES, Kernels, LlkPartial, LlkRing, LlkScratch, StackTable, ViewDims,
@@ -195,6 +195,33 @@ fn dm_matches_cpu() {
         };
         check(
             compare(setup, 1, false, Params::Dm(params), 7),
+            [1e-4, 1e-4, 1e-4],
+        );
+    }
+}
+
+#[test]
+fn raar_matches_cpu() {
+    for setup in [M1, FUSED] {
+        for (o, p) in UPDATES {
+            let params = RaarParams {
+                obj_inertia: o,
+                probe_inertia: p,
+                calc_llk: 1,
+                ..RaarParams::default()
+            };
+            let errs = compare(setup, 2, true, Params::Raar(params), 10);
+            check(errs, [1e-4, 1e-4, 1e-4]);
+        }
+        // two object-then-probe rounds per cycle, one mode, no mask, another beta
+        let params = RaarParams {
+            beta: 0.75,
+            loop_obj_probe: 2,
+            calc_llk: 3,
+            ..RaarParams::default()
+        };
+        check(
+            compare(setup, 1, false, Params::Raar(params), 7),
             [1e-4, 1e-4, 1e-4],
         );
     }
@@ -484,7 +511,8 @@ fn bh_graphs_compile_no_tile_kernel() {
 }
 
 /// Every update consumes its sums, so each algorithm starts from zero sums whatever ran
-/// before: rPIE's steps, then AP's and DM's updates, against the CPU. The last rPIE batch
+/// before: rPIE's steps, then AP's, DM's and RAAR's updates, against the CPU; RAAR's iterate
+/// starts afresh after DM. The last rPIE batch
 /// size differs, so its epochs get their own batches and graph.
 #[test]
 fn algorithm_switches_match_cpu() {
@@ -511,6 +539,12 @@ fn switches_match_cpu(setup: Setup) {
             probe_inertia: p,
             calc_llk: 1,
             ..DmParams::default()
+        }),
+        Params::Raar(RaarParams {
+            obj_inertia: o,
+            probe_inertia: p,
+            calc_llk: 1,
+            ..RaarParams::default()
         }),
         Params::Rpie(ptychi::RPIE),
         Params::Rpie(RpieParams {
@@ -618,7 +652,7 @@ fn gpu_rejects_what_it_cannot_run() {
     );
 }
 
-/// AP, DM and ML cycles (AP's and ML's with an LLK, DM's and ML's first included), rPIE
+/// AP, DM, RAAR and ML cycles (AP's and ML's with an LLK, DM's, RAAR's and ML's first included), rPIE
 /// epochs and LLK passes replayed from captured graphs give the eager bits: the object, the
 /// probe and every LLK record read from the ring, across the parameter and algorithm switches
 /// that make a new capture and calls that reuse the last one, with a short last stack and
@@ -656,6 +690,14 @@ fn graph_like_eager(setup: Setup) {
         // new capture, new parameters, new algorithm, the same graph in a second call
         g.dm(&dm, 7).unwrap();
         g.dm(&DmParams { alpha: 0.1, ..dm }, 4).unwrap();
+        let raar = RaarParams {
+            calc_llk: 3,
+            zero_phase_ramp: false,
+            ..RaarParams::default()
+        };
+        g.raar(&raar, 7).unwrap();
+        g.raar(&RaarParams { beta: 0.75, ..raar }, 4).unwrap();
+        g.raar(&RaarParams { beta: 0.75, ..raar }, 4).unwrap();
         g.ap(&ap, 7).unwrap();
         let query = g.llk().unwrap();
         g.ap(&ap, 4).unwrap();
@@ -695,7 +737,10 @@ fn graph_like_eager(setup: Setup) {
         (bits(&g.object().unwrap()), bits(&g.probe().unwrap()), llk)
     };
     let (eager, graph) = (run(false), run(true));
-    assert_eq!(eager.2.len(), 3 + 3 + 2 + 2 + 3 + 2 + 2 + 3 + 2 + 1);
+    assert_eq!(
+        eager.2.len(),
+        3 + 2 + 3 + 2 + 2 + 3 + 2 + 3 + 2 + 2 + 3 + 2 + 1
+    );
     assert!(eager.2 == graph.2, "{setup:?}: LLK records differ");
     assert!(eager.0 == graph.0, "{setup:?}: object differs");
     assert!(eager.1 == graph.1, "{setup:?}: probe differs");
@@ -876,11 +921,12 @@ fn featured_start(nprobe: usize, with_flux: bool, with_background: bool) -> (Sca
     (scan, object, probe)
 }
 
-/// AP, DM, ML or rPIE cycles on either backend.
+/// AP, DM, RAAR, ML or rPIE cycles on either backend.
 #[derive(Clone, Copy, Debug)]
 enum Cycles {
     Ap(ApParams),
     Dm(DmParams),
+    Raar(RaarParams),
     Ml(MlParams),
     Rpie(RpieParams),
 }
@@ -890,6 +936,7 @@ impl Cycles {
         match self {
             Cycles::Ap(a) => p.ap(&a, ncycle),
             Cycles::Dm(d) => p.dm(&d, ncycle),
+            Cycles::Raar(r) => p.raar(&r, ncycle),
             Cycles::Ml(m) => p.ml(&m, ncycle),
             Cycles::Rpie(r) => p.rpie(&r, ncycle).unwrap(),
         }
@@ -899,6 +946,7 @@ impl Cycles {
         match self {
             Cycles::Ap(a) => g.ap(&a, ncycle),
             Cycles::Dm(d) => g.dm(&d, ncycle),
+            Cycles::Raar(r) => g.raar(&r, ncycle),
             Cycles::Ml(m) => g.ml(&m, ncycle),
             Cycles::Rpie(r) => g.rpie(&r, ncycle),
         }
@@ -1193,6 +1241,59 @@ fn dm_position_matches_cpu() {
     }
 }
 
+/// A scale and a background refined by 20 RAAR cycles on a scan with both effects, then probe
+/// positions refined by 20 RAAR cycles from [`drawn_offsets`] with one and with two
+/// object-then-probe updates per cycle, as [`features_match_cpu`] checks them. On the CPU the
+/// features bring the last LLK below that of a run without them and the offsets' RMS falls.
+#[test]
+fn raar_features_match_cpu() {
+    const NCYCLE: usize = 20;
+    let raar = |loop_obj_probe| {
+        Cycles::Raar(RaarParams {
+            calc_llk: 1,
+            loop_obj_probe,
+            ..RaarParams::default()
+        })
+    };
+    let start = featured_start(2, true, true);
+    let both = Features {
+        scale: Some(vec![1.0; NPOS]),
+        background: Some(flat_background(&start.0)),
+        position: None,
+    };
+    let (cpu, plain) = features_match_cpu(raar(1), &start, &both, NCYCLE);
+    println!(
+        "raar both: last llk {:.4e}, {:.4e} without",
+        last_llk(&cpu),
+        last_llk(&plain),
+    );
+    assert!(
+        last_llk(&cpu) < last_llk(&plain),
+        "the features left the LLK"
+    );
+    let start = featured_start(2, false, false);
+    let d0 = drawn_offsets();
+    let moved = Features {
+        position: Some(d0.clone()),
+        ..Features::default()
+    };
+    for loop_obj_probe in [1, 2] {
+        let (cpu, _) = features_match_cpu(raar(loop_obj_probe), &start, &moved, NCYCLE);
+        let d = cpu.features().position.clone().unwrap();
+        println!(
+            "raar position, loop {loop_obj_probe}: rms offset {:.4} from {:.4}",
+            rms(&d),
+            rms(&d0),
+        );
+        assert!(
+            rms(&d) < rms(&d0),
+            "rms offset {} from {}",
+            rms(&d),
+            rms(&d0)
+        );
+    }
+}
+
 /// Probe positions refined by 10 rPIE epochs of batches of 4 from [`drawn_offsets`], each
 /// batch stepping its frames' offsets, as [`features_match_cpu`] checks them. On the CPU the
 /// offsets' RMS falls.
@@ -1440,9 +1541,9 @@ fn rpie_position_graphs_replay_bitwise_like_eager() {
     );
 }
 
-/// DM cycles modelling a position, two object-then-probe updates each, then ML cycles
-/// modelling it, give the bits of stacks of 7 frames with stacks of 4 and with one stack of
-/// every frame: the object, the probe, the offsets and every LLK record.
+/// DM, then RAAR, cycles modelling a position, two object-then-probe updates each, then ML
+/// cycles modelling it, give the bits of stacks of 7 frames with stacks of 4 and with one stack
+/// of every frame: the object, the probe, the offsets and every LLK record.
 #[test]
 fn position_is_bit_identical_across_stack_splits() {
     let (scan, object, probe) = featured_start(2, false, false);
@@ -1455,6 +1556,11 @@ fn position_is_bit_identical_across_stack_splits() {
         loop_obj_probe: 2,
         ..DmParams::default()
     };
+    let raar = RaarParams {
+        calc_llk: 3,
+        loop_obj_probe: 2,
+        ..RaarParams::default()
+    };
     let [.., ml] = feature_cycles(3);
     let run = |stack_size: usize| {
         let options = GpuOptions {
@@ -1464,11 +1570,12 @@ fn position_is_bit_identical_across_stack_splits() {
         let mut g = GpuPtycho::new(&ctx(), &scan, object.clone(), probe.clone(), options).unwrap();
         g.set_features(&moved).unwrap();
         g.dm(&dm, 6).unwrap();
+        g.raar(&raar, 6).unwrap();
         ml.gpu(&mut g, 6);
         bit_state(&mut g)
     };
     let seven = run(7);
-    assert_eq!(seven.llk.len(), 3 + 3 + 1);
+    assert_eq!(seven.llk.len(), 3 + 3 + 3 + 1);
     for stack_size in [4, NPOS] {
         let other = run(stack_size);
         assert!(

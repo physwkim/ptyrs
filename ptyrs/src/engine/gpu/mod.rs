@@ -1,12 +1,13 @@
-//! The GPU backend (DESIGN §7 M1): [`GpuPtycho`] runs AP, DM, rPIE, ML and BH in `f32` on one CUDA
+//! The GPU backend (DESIGN §7 M1): [`GpuPtycho`] runs AP, DM, RAAR, rPIE, ML and BH in `f32` on one CUDA
 //! stream with the `ptyrs::gpu` pixel kernels and `ptyrs::fft` plans, in the call sequences the
 //! `crate::gpu` ops and rPIE docs give, and is checked against [`crate::engine::Ptycho`].
 //!
 //! The scan's frames are cut into stacks of consecutive frames, one [`StackTable`] entry each:
 //! every launch reads its stack's frames from the entry on the device. The passes that stream
 //! one exit-wave set per frame take stacks up to twice as long as the rest
-//! ([`GpuOptions::stack_size`]). Each stack keeps its own exit waves (DM carries them across
-//! cycles), sized like PyNX's fixed stack for the longest stack. AP and DM project a stack, ML
+//! ([`GpuOptions::stack_size`]). Each stack keeps its own exit waves (DM and RAAR carry them
+//! across cycles, RAAR also its iterate), sized like PyNX's fixed stack for the longest stack.
+//! AP, DM and RAAR project a stack, ML
 //! takes a stack's gradient, and the LLK pass takes its partials, either by M2's fused passes
 //! over one scratch set or by the M1 launch sequence ([`GpuOptions::fused`]), whose one scratch
 //! stack serves all and whose stacks of one length share a cuFFT plan, which transforms only
@@ -15,7 +16,7 @@
 //! reads back to the host: an LLK record goes, stack by stack, into the device's
 //! [`crate::gpu::LlkRing`], whose copies download while later cycles run, and the host reads
 //! the records at the end of each algorithm call (or of [`GpuPtycho::llk`]), the arrays only
-//! when asked for. Every cycle, AP's with an LLK and DM's first included, and the LLK pass
+//! when asked for. Every cycle, AP's with an LLK and DM's and RAAR's first included, and the LLK pass
 //! replay a captured CUDA graph (DESIGN B2, [`GpuOptions::graph`]): one per [`Epoch`], kept
 //! with the buffers it captured until another algorithm or other parameters need new ones,
 //! and the LLK pass's for the life of the device state. Each algorithm is its own module over
@@ -27,6 +28,7 @@ mod device;
 mod dm;
 mod lsqml;
 mod ml;
+mod raar;
 mod rpie;
 
 use std::f64::consts::PI;
@@ -47,7 +49,7 @@ use device::{Bufs, Device, M1Bufs, NormBufs, PassesMut};
 use crate::engine::ptycho::{Algorithm, LlkRecord, zero_phase_ramp};
 use crate::engine::{
     ApParams, BhParams, DmParams, EngineError, Features, Fft2, Llk, LsqmlParams, MlParams,
-    RpieParams,
+    RaarParams, RpieParams,
 };
 
 /// How [`GpuPtycho`] batches its work.
@@ -93,6 +95,8 @@ enum Epoch {
     Ap { params: ApParams, llk: bool },
     /// A DM cycle; `first` for cycle 0 of a call.
     Dm { params: DmParams, first: bool },
+    /// A RAAR cycle; `first` for cycle 0 of a call.
+    Raar { params: RaarParams, first: bool },
     /// An rPIE epoch.
     Rpie(RpieParams),
     /// An ML cycle; `first` for cycle 0 of a call, with `llk` it takes the LLK of the
@@ -116,6 +120,7 @@ impl Epoch {
         match self {
             Self::Ap { .. } => Algorithm::Ap,
             Self::Dm { .. } => Algorithm::Dm,
+            Self::Raar { .. } => Algorithm::Raar,
             Self::Rpie(_) => Algorithm::Rpie,
             Self::Ml { .. } => Algorithm::Ml,
             Self::Bh { .. } => Algorithm::Bh,
@@ -128,6 +133,10 @@ impl Epoch {
         match self {
             Self::Ap { params, .. } => Self::Ap { params, llk: false },
             Self::Dm { params, .. } => Self::Dm {
+                params,
+                first: false,
+            },
+            Self::Raar { params, .. } => Self::Raar {
                 params,
                 first: false,
             },
