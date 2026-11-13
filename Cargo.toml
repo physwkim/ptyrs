@@ -7,13 +7,18 @@ version = "0.0.1"
 edition = "2024"
 
 [workspace.dependencies]
-# Local cuda-rust checkout, absolute so git worktrees resolve it too. cargo-oxide builds its backend
-# from the same checkout, so host crates and backend stay on one commit.
-cuda-bindings = { path = "/home/stevek/work/cuda-rust/cuda-bindings" }
-cuda-core = { path = "/home/stevek/work/cuda-rust/cuda-core" }
-cuda-async = { path = "/home/stevek/work/cuda-rust/cuda-async" }
-cuda-device = { path = "/home/stevek/work/cuda-rust/cuda-oxide/crates/cuda-device" }
-cuda-host = { path = "/home/stevek/work/cuda-rust/cuda-oxide/crates/cuda-host" }
+# cuda-rust and epics-rs pinned by commit. ptyrs/build.rs runs cargo-oxide from the cuda-rust
+# checkout these resolve to, and cargo-oxide builds its backend from that checkout too, so host
+# crates, CLI and backend share one commit. .cargo/config.toml says how to build from local clones.
+cuda-bindings = { git = "https://github.com/NVIDIA/cuda-rust.git", rev = "367bc0f8e671070e00eebc7e5498f3e8eebefc72" }
+cuda-core = { git = "https://github.com/NVIDIA/cuda-rust.git", rev = "367bc0f8e671070e00eebc7e5498f3e8eebefc72" }
+cuda-async = { git = "https://github.com/NVIDIA/cuda-rust.git", rev = "367bc0f8e671070e00eebc7e5498f3e8eebefc72" }
+cuda-device = { git = "https://github.com/NVIDIA/cuda-rust.git", rev = "367bc0f8e671070e00eebc7e5498f3e8eebefc72" }
+cuda-host = { git = "https://github.com/NVIDIA/cuda-rust.git", rev = "367bc0f8e671070e00eebc7e5498f3e8eebefc72" }
+cuda-artifact-finalizer = { git = "https://github.com/NVIDIA/cuda-rust.git", rev = "367bc0f8e671070e00eebc7e5498f3e8eebefc72" }
+nvjitlink-sys = { git = "https://github.com/NVIDIA/cuda-rust.git", rev = "367bc0f8e671070e00eebc7e5498f3e8eebefc72" }
+cutile = { git = "https://github.com/NVIDIA/cuda-rust.git", rev = "367bc0f8e671070e00eebc7e5498f3e8eebefc72" }
+epics-pva-rs = { git = "https://github.com/epics-rs/epics-rs.git", rev = "55d3d654c60dc614d83e61839ebccdaf5ece3dc4" }
 
 # Host-side numerics and I/O of ptyrs.
 num-complex = "0.4"

@@ -8,3 +8,5 @@
 /*.ll
 /*.options
 /*.target
+# Machine-local cargo settings; see .cargo/config.local.example.toml.
+/.cargo/config.local.toml

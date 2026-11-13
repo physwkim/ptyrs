@@ -203,12 +203,14 @@ def gpu_uuid():
 
 
 def other_gpu_processes(gpu):
-    """Other compute processes on GPU `gpu` (UUID)."""
+    """Executable names of the other compute processes on GPU `gpu` (UUID), without their
+    directories, which are machine-local."""
     out = subprocess.run(
         ["nvidia-smi", "--query-compute-apps=gpu_uuid,pid,process_name", "--format=csv,noheader"],
         capture_output=True, text=True, check=True).stdout
     rows = [[f.strip() for f in line.split(",")] for line in out.splitlines() if line.strip()]
-    return [name for uuid, pid, name in rows if uuid == gpu and pid != str(os.getpid())]
+    return [os.path.basename(name) for uuid, pid, name in rows
+            if uuid == gpu and pid != str(os.getpid())]
 
 
 class GpuWatch:
