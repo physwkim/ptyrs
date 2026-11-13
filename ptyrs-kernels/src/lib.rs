@@ -18,6 +18,7 @@ pub mod fused;
 pub mod grad;
 pub mod lsqml;
 pub mod pixel;
+pub mod position;
 pub mod ring;
 pub mod rpie;
 

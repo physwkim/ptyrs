@@ -14,29 +14,33 @@
 //! [`LsqmlKernels::dots`], then [`LsqmlKernels::step`] and [`LsqmlKernels::update`], which
 //! consumes the sums. An epoch starts with [`LsqmlKernels::start`] on a new run, and
 //! [`LsqmlKernels::precondition`] on pty-chi's schedule. The steps never leave the device.
+//!
+//! Under the position model the epoch's frames move as [`crate::gpu::PositionKernels`] lays
+//! out: per stack [`Kernels::shifted_rows_fwd`] and its moved probe take the place of
+//! [`LsqmlKernels::forward`], [`Kernels::shifted_psi_sums`] and then
+//! [`Kernels::shifted_probe_sums`] that of the update sums, and [`LsqmlChi::Moved`] gives the
+//! dots the moved probe.
 
 use std::ops::Range;
 
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig, RawDeviceBuffer};
 use ptyrs_kernels::fused::{FUSED_COLS, FusedCfg, FusedPtrs};
-use ptyrs_kernels::grad::{GAMMA_CHUNK, ObjProbePtrs};
+use ptyrs_kernels::grad::ObjProbePtrs;
 pub use ptyrs_kernels::lsqml::LSQML_REC;
 use ptyrs_kernels::lsqml::{
-    LSQML_CHI, LSQML_DOTS, LSQML_ICALC, LSQML_POISSON, LSQML_XI, LsqmlCols, LsqmlFar, LsqmlPre,
-    LsqmlSpan, lsqml_kernels,
+    LSQML_CHI, LSQML_DOTS, LSQML_ICALC, LSQML_POISSON, LSQML_XI, LsqmlCols, LsqmlDots, LsqmlFar,
+    LsqmlPre, lsqml_kernels,
 };
 use ptyrs_kernels::pixel::PIXEL_THREADS;
 
 use crate::gpu::fused::{Shape, Side};
 use crate::gpu::ops::grid_1d;
+use crate::gpu::position::{GRID_Y_MAX, ONE_BLOCK, chunk_grid, chunks, same_dims, span};
 use crate::gpu::{
     BhScan, C32, Error, Kernels, StackCtl, StackGeom, StackRef, UpdateSums, ViewAddr, ViewDims,
     Views, check_len, dptr,
 };
-
-/// Most blocks along grid y.
-const GRID_Y_MAX: u32 = 65535;
 
 /// The LSQML kernels, bound to the module a [`Kernels`] loaded.
 #[derive(Clone, Debug)]
@@ -101,29 +105,7 @@ impl LsqmlScan {
     }
 
     fn check(&self, dims: &ViewDims) -> Result<(), Error> {
-        if self.dims != *dims {
-            return Err(Error::Shape(format!(
-                "LSQML state for {:?}, views have {dims:?}",
-                self.dims
-            )));
-        }
-        Ok(())
-    }
-
-    /// The batch `p` over its epoch positions.
-    fn span(&self, p: &Range<u32>) -> Result<LsqmlSpan, Error> {
-        if p.start >= p.end || p.end > self.dims.nframe {
-            return Err(Error::Shape(format!(
-                "batch {p:?} outside {} frames",
-                self.dims.nframe
-            )));
-        }
-        Ok(LsqmlSpan {
-            p0: p.start,
-            nb: p.end - p.start,
-            // `zeroed` sized the sums by it, so it fits.
-            nchunk: chunks(self.dims.n()) as u32,
-        })
+        same_dims(&self.dims, dims)
     }
 
     fn far(&self, order: &DeviceBuffer<u32>) -> LsqmlFar {
@@ -136,9 +118,15 @@ impl LsqmlScan {
     }
 }
 
-/// Chunks of [`GAMMA_CHUNK`] pixels per frame of `n` pixels.
-fn chunks(n: usize) -> usize {
-    n.div_ceil(GAMMA_CHUNK as usize)
+/// A stack's exit-wave update `chi` ([`LsqmlKernels::chi`]) for [`LsqmlKernels::dots`]; under
+/// the position model with the stack's moved probe `w`
+/// ([`crate::gpu::PositionKernels::shift_w`]).
+pub enum LsqmlChi<'a> {
+    Unmoved(&'a DeviceBuffer<C32>),
+    Moved {
+        chi: &'a DeviceBuffer<C32>,
+        w: &'a DeviceBuffer<C32>,
+    },
 }
 
 /// Values of the object and of the probe.
@@ -146,29 +134,10 @@ fn lens(dims: &ViewDims) -> [usize; 2] {
     [dims.obj_len(), dims.nprobe as usize * dims.n()]
 }
 
-/// One block of [`PIXEL_THREADS`] per chunk of each of the stack's frames.
-fn chunk_grid(g: &StackGeom, n: usize) -> Result<LaunchConfig, Error> {
-    if g.nf_max > GRID_Y_MAX {
-        return Err(Error::Shape(format!("{} frames exceed grid y", g.nf_max)));
-    }
-    Ok(LaunchConfig {
-        grid_dim: (chunks(n) as u32, g.nf_max, 1),
-        block_dim: (PIXEL_THREADS, 1, 1),
-        shared_mem_bytes: 0,
-    })
-}
-
 /// `n` as a kernel's element count.
 fn to_u32(n: usize) -> Result<u32, Error> {
     u32::try_from(n).map_err(|_| Error::Shape(format!("{n} elements exceed u32")))
 }
-
-/// One block of [`PIXEL_THREADS`].
-const ONE_BLOCK: LaunchConfig = LaunchConfig {
-    grid_dim: (1, 1, 1),
-    block_dim: (PIXEL_THREADS, 1, 1),
-    shared_mem_bytes: 0,
-};
 
 /// The object and probe a batch starts from, `x`, and their directions `d`, each `[object,
 /// probe]`.
@@ -430,7 +399,7 @@ impl LsqmlKernels {
         let d = *scan.check()?;
         let obs = scan.obs();
         st.check(&d)?;
-        let span = st.span(&batch)?;
+        let span = span(&st.dims, &batch)?;
         let ids = scan.order.ids();
         let far = st.far(ids);
         let mut stacks = Vec::with_capacity(icalc.len());
@@ -520,50 +489,61 @@ impl LsqmlKernels {
             })
     }
 
-    /// The step-size sums of the stack's frames into `st`, with `chi` the stack's
-    /// [`Self::chi`]; `views` in epoch order.
+    /// The step-size sums of the stack's frames into `st` from its exit-wave update `chi`;
+    /// `views` in epoch order. Under [`LsqmlChi::Moved`] the object direction's waves take
+    /// the moved probe.
     pub fn dots(
         &self,
         ctx: &ExecutionContext,
         views: &Views,
         stack: StackRef<'_>,
-        chi: &DeviceBuffer<C32>,
         at: LsqmlAt<'_>,
+        chi: LsqmlChi<'_>,
         st: &mut LsqmlScan,
     ) -> Result<(), Error> {
         let d = views.dims();
         st.check(d)?;
         let g = d.geom(stack)?;
-        check_len("chi", chi, g.nf_max as usize * d.nmode as usize * d.n())?;
+        let c = match &chi {
+            LsqmlChi::Unmoved(c) | LsqmlChi::Moved { chi: c, .. } => *c,
+        };
+        check_len("chi", c, g.nf_max as usize * d.nmode as usize * d.n())?;
         for (pair, what) in [(at.x, ["obj", "probe"]), (at.d, ["d_obj", "d_probe"])] {
             for ((b, len), what) in pair.into_iter().zip(lens(d)).zip(what) {
                 check_len(what, b, len)?;
             }
         }
         let config = chunk_grid(&g, d.n())?;
-        let mut reads = vec![chi.storage(), views.addr().storage(), stack.storage()];
+        let mut reads = vec![c.storage(), views.addr().storage(), stack.storage()];
         reads.extend(at.x.into_iter().chain(at.d).map(|b| b.storage()));
         let pair = |p: [&DeviceBuffer<C32>; 2]| ObjProbePtrs {
             obj: dptr::<C32, f32>(p[0]).cast_const(),
             probe: dptr::<C32, f32>(p[1]).cast_const(),
         };
+        let p = LsqmlDots {
+            chi: dptr::<C32, f32>(c).cast_const(),
+            x: pair(at.x),
+            d: pair(at.d),
+            views: dptr::<ViewAddr, ViewAddr>(views.addr()).cast_const(),
+            out: dptr(&st.dots),
+        };
+        let ctl = stack.ctl() as *const StackCtl;
+        let LsqmlChi::Moved { w, .. } = chi else {
+            return self
+                .base
+                .launch(ctx, &reads, &[st.dots.storage()], |stream| {
+                    // SAFETY: lengths checked above, `st.dots` sized for every position's
+                    // chunks; `Views::new` checked the views are inside the object.
+                    unsafe { self.module.lsqml_dots(stream, config, p, ctl, g) }
+                });
+        };
+        check_len("w", w, g.nf_max as usize * d.nprobe as usize * d.n())?;
+        reads.push(w.storage());
+        let w = dptr::<C32, f32>(w).cast_const();
         self.base
             .launch(ctx, &reads, &[st.dots.storage()], |stream| {
-                // SAFETY: lengths checked above, `st.dots` sized for every position's chunks;
-                // `Views::new` checked the views are inside the object.
-                unsafe {
-                    self.module.lsqml_dots(
-                        stream,
-                        config,
-                        dptr::<C32, f32>(chi).cast_const(),
-                        pair(at.x),
-                        pair(at.d),
-                        dptr::<ViewAddr, ViewAddr>(views.addr()).cast_const(),
-                        dptr(&st.dots),
-                        stack.ctl() as *const StackCtl,
-                        g,
-                    )
-                }
+                // SAFETY: as `lsqml_dots`; `w` checked above.
+                unsafe { self.module.lsqml_dots_shifted(stream, config, p, w, ctl, g) }
             })
     }
 
@@ -577,7 +557,7 @@ impl LsqmlKernels {
         batch: Range<u32>,
         st: &mut LsqmlScan,
     ) -> Result<(), Error> {
-        let span = st.span(&batch)?;
+        let span = span(&st.dims, &batch)?;
         // pty-chi's `trim_mean`, the cut saturating at 0 for small batches.
         let trim = (span.nb as f64 * 0.1 / 2.0 - 0.5).ceil() as u32;
         let g = st.dims.scan_geom();
