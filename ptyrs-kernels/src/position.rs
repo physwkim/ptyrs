@@ -9,9 +9,7 @@ use cuda_device::{device, shared::DynamicSharedArray, thread};
 use cuda_host::cuda_module;
 
 use crate::fused::{FUSED_COLS, col_fft};
-use crate::pixel::{
-    PIXEL_THREADS, StackCtl, StackGeom, ViewAddr, freq, load_c, stack_frames, store_c,
-};
+use crate::pixel::{StackCtl, StackGeom, ViewAddr, freq, load_c, stack_frames, store_c};
 use crate::{FFT_EPT_MAX, fft_ept};
 
 /// Floats [`position_kernels::LoadedModule::position_sums`] writes per frame and chunk:
@@ -166,42 +164,13 @@ pub unsafe fn slopes<const N: u32>(
     }
 }
 
-/// Tree maxima of `K` segments of `PIXEL_THREADS` shared values, each into its element 0;
-/// every thread must call it.
-///
-/// # Safety
-///
-/// `s` must point to `K * PIXEL_THREADS` block-shared floats, each written by its thread.
-#[device]
-unsafe fn block_max<const K: usize>(s: *mut f32) {
-    let t = thread::threadIdx_x() as usize;
-    let seg = PIXEL_THREADS as usize;
-    let mut half = seg / 2;
-    while half > 0 {
-        thread::sync_threads();
-        if t < half {
-            for j in 0..K {
-                unsafe {
-                    let (a, b) = (s.add(j * seg + t), *s.add(j * seg + t + half));
-                    if b > *a {
-                        *a = b;
-                    }
-                }
-            }
-        }
-        half /= 2;
-    }
-    thread::sync_threads();
-}
-
 #[cuda_module]
 pub mod position_kernels {
     use super::{
-        BatchSpan, EPS_POSITION, POSITION_SUMS, PositionRule, PositionSums, block_max, shift_w,
-        slopes,
+        BatchSpan, EPS_POSITION, POSITION_SUMS, PositionRule, PositionSums, shift_w, slopes,
     };
     use crate::bh::store_sums;
-    use crate::grad::GAMMA_CHUNK;
+    use crate::grad::{GAMMA_CHUNK, block_max};
     use crate::pixel::*;
     use crate::*;
     use cuda_device::SharedArray;

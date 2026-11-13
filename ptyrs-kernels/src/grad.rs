@@ -585,7 +585,7 @@ fn position_axis_step(num: f32, den: f32, step: f32, limit: f32) -> f32 {
 ///
 /// `s` must point to `K * PIXEL_THREADS` block-shared floats, each written by its thread.
 #[device]
-unsafe fn block_max<const K: usize>(s: *mut f32) {
+pub(crate) unsafe fn block_max<const K: usize>(s: *mut f32) {
     let t = thread::threadIdx_x() as usize;
     let seg = PIXEL_THREADS as usize;
     let mut half = seg / 2;

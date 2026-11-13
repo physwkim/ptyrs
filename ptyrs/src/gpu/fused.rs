@@ -34,9 +34,9 @@ use crate::gpu::{
 };
 
 /// Dynamic shared memory a block gets without opting in.
-const SMEM_MAX: u32 = 48 * 1024;
+pub(crate) const SMEM_MAX: u32 = 48 * 1024;
 /// Most blocks along grid y.
-const GRID_Y_MAX: u64 = 65535;
+pub(crate) const GRID_Y_MAX: u64 = 65535;
 
 /// Declares [`Side`] and [`Side::ALL`] from one list, so that they cannot disagree.
 macro_rules! sides {
