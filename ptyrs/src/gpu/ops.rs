@@ -410,17 +410,50 @@ impl Views {
     }
 
     /// Views over device storage the caller keeps filling and backing: `addr` takes the
-    /// records of frames as they land, and `tile_views` holds `ntiles` slabs of `cap` slots,
-    /// tile `t`'s from slot `t * cap`, so it owns every tile, or none when `cap` is 0. Every
-    /// run starts empty; only binning ([`Kernels::bin_views`], [`Kernels::reorder_views`])
-    /// writes runs. Checks `dims`, that `addr` holds `nframe * nmode` records and
-    /// `tile_views` `ntiles * cap` slots.
+    /// records of frames as they land, and `tile_views` holds tile `t`'s slab at slots
+    /// `start[t] .. start[t + 1]`, so the tiles with an empty slab are not owned. Every run
+    /// starts empty; only binning ([`Kernels::bin_views`], [`Kernels::reorder_views`])
+    /// writes runs. Checks `dims`, that `addr` holds `nframe * nmode` records, `start`
+    /// `ntiles + 1` ascending offsets and `tile_views` `start[ntiles]` slots.
     ///
     /// # Safety
     ///
     /// Whenever a launch runs, every record it reads passes the checks of [`Self::new`], and
     /// the slab of every tile those views touch is device memory; a launch touches no other
     /// slab.
+    pub unsafe fn from_slabs(
+        stream: &CudaStream,
+        dims: ViewDims,
+        addr: DeviceBuffer<ViewAddr>,
+        tile_views: DeviceBuffer<u32>,
+        start: &[u32],
+    ) -> Result<Self, Error> {
+        dims.check()?;
+        let ntiles = dims.ntiles();
+        check_len("addr", &addr, dims.nframe as usize * dims.nmode as usize)?;
+        if start.len() != ntiles + 1 || !start.is_sorted() {
+            return Err(Error::Shape(format!(
+                "{} slab starts, need {} ascending offsets",
+                start.len(),
+                ntiles + 1
+            )));
+        }
+        check_len("tile_views", &tile_views, start[ntiles] as usize)?;
+        Ok(Self {
+            dims,
+            addr,
+            tile_start: DeviceBuffer::from_host(stream, start)?,
+            tile_views,
+            tile_len: DeviceBuffer::zeroed(stream, ntiles)?,
+        })
+    }
+
+    /// [`Self::from_slabs`] with `ntiles` slabs of `cap` slots, tile `t`'s from slot
+    /// `t * cap`, so it owns every tile, or none when `cap` is 0.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::from_slabs`].
     pub unsafe fn from_parts(
         stream: &CudaStream,
         dims: ViewDims,
@@ -430,19 +463,12 @@ impl Views {
     ) -> Result<Self, Error> {
         dims.check()?;
         let ntiles = dims.ntiles();
-        check_len("addr", &addr, dims.nframe as usize * dims.nmode as usize)?;
         let start = (0..=ntiles as u64)
             .map(|t| u32::try_from(t * u64::from(cap)))
             .collect::<Result<Vec<u32>, _>>()
             .map_err(|_| Error::Shape(format!("{ntiles} slabs of {cap} slots overflow u32")))?;
-        check_len("tile_views", &tile_views, start[ntiles] as usize)?;
-        Ok(Self {
-            dims,
-            addr,
-            tile_start: DeviceBuffer::from_host(stream, &start)?,
-            tile_views,
-            tile_len: DeviceBuffer::zeroed(stream, ntiles)?,
-        })
+        // SAFETY: the caller keeps `from_slabs`' contract, which this layout does not change.
+        unsafe { Self::from_slabs(stream, dims, addr, tile_views, &start) }
     }
 
     /// Views for [`Kernels::reorder_views`] of `src`: its dims, frames and tile slabs, so
@@ -963,7 +989,7 @@ impl Kernels {
         ];
         let slabs = views.tile_slabs();
         self.launch(ctx, &reads, &writes, |stream| {
-            // SAFETY: `Views::new` or the `from_parts` contract keeps the stack's views
+            // SAFETY: `Views::new` or the `from_slabs` contract keeps the stack's views
             // inside the object; every constructor leaves each run within its slab, and
             // binning keeps it there; `overflow` holds one u32.
             unsafe {
@@ -1028,7 +1054,7 @@ impl Kernels {
         let (slabs, g) = (dst.tile_slabs(), d.scan_geom());
         self.launch(ctx, &reads, &writes, |stream| {
             // SAFETY: every view of `dst` is one it held or one of `src`'s, each of the same
-            // dims and inside the object by `Views::new` or the `from_parts` contract; the
+            // dims and inside the object by `Views::new` or the `from_slabs` contract; the
             // runs start empty, each within its slab.
             unsafe {
                 self.module

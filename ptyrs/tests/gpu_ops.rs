@@ -1077,6 +1077,103 @@ fn views_over_padded_slabs_match_packed_lists() {
     }
 }
 
+/// [`Views::from_slabs`] with slabs of uneven capacity, empty for the tiles outside a region,
+/// its runs filled by `bin_views` stack by stack, gets the runs, and the update bits, of
+/// [`Views::owned`] over the same region.
+#[test]
+fn views_over_uneven_slabs_match_owned_lists() {
+    let (stream, ex, k) = setup();
+    let s = scan_in([80, 96]);
+    let ntiles = s.d.tiles().iter().product::<u32>() as usize;
+    let own: Vec<u32> = (0..ntiles as u32).filter(|t| t % 3 != 1).collect();
+    let owned = Views::owned(&stream, s.d, &s.views, &own).unwrap();
+    let ostart = owned.tile_start().to_host_vec(&stream).unwrap();
+    let len = owned.tile_len().to_host_vec(&stream).unwrap();
+    let list = owned.tile_views().to_host_vec(&stream).unwrap();
+    let mut start = vec![0u32];
+    for t in 0..ntiles {
+        let spare = if own.contains(&(t as u32)) {
+            t as u32 % 4
+        } else {
+            0
+        };
+        start.push(start[t] + len[t] + spare);
+    }
+    assert!((0..ntiles).any(|t| len[t] > 0 && start[t + 1] - start[t] == len[t]));
+    assert!((0..ntiles).any(|t| start[t + 1] - start[t] > len[t] + 1));
+    assert!((0..ntiles).any(|t| !own.contains(&(t as u32)) && start[t + 1] == start[t]));
+    // Spare slots name view 0, which touches tile 0: read, it would add to the sums.
+    // SAFETY: the views pass `Views::new`'s checks; the slabs are one whole buffer.
+    let mut slabs = unsafe {
+        Views::from_slabs(
+            &stream,
+            s.d,
+            up(&stream, &s.views),
+            up(&stream, &vec![0u32; start[ntiles] as usize]),
+            &start,
+        )
+    }
+    .unwrap();
+    assert_eq!(slabs.tile_start().to_host_vec(&stream).unwrap(), start);
+
+    let table = StackTable::new(&stream, &s.d, &[0..2, 2..5]).unwrap();
+    let mut overflow = up(&stream, &[0u32]);
+    for i in 0..table.len() {
+        k.bin_views(&ex, &mut slabs, table.at(i), &mut overflow)
+            .unwrap();
+    }
+    assert_eq!(slabs.tile_len().to_host_vec(&stream).unwrap(), len);
+    let slab = slabs.tile_views().to_host_vec(&stream).unwrap();
+    for t in 0..ntiles {
+        let run = |list: &[u32], at: u32| list[at as usize..][..len[t] as usize].to_vec();
+        assert_eq!(run(&slab, start[t]), run(&list, ostart[t]), "tile {t}");
+    }
+    assert_eq!(overflow.to_host_vec(&stream).unwrap(), [0]);
+
+    let probe = up(&stream, &s.probe);
+    let psi = up(&stream, &noise(s.nk(&(0..5)) * s.n(), 4, 1.0));
+    let mut out = Vec::new();
+    for views in [&owned, &slabs] {
+        let mut obj = up(&stream, &s.obj);
+        let mut sums = UpdateSums::zeroed(&stream, s.obj.len()).unwrap();
+        for i in 0..table.len() {
+            k.psi_to_obj(&ex, views, table.at(i), &psi, &probe, &mut sums)
+                .unwrap();
+        }
+        k.update_obj_from_sums(&ex, views, &mut obj, &mut sums, 0.01)
+            .unwrap();
+        out.push(c32_bits(&obj.to_host_vec(&stream).unwrap()));
+    }
+    assert!(out[0] == out[1], "slab views differ from owned views");
+    assert!(out[0] != c32_bits(&s.obj), "the update moved nothing");
+
+    // SAFETY: each is rejected before any launch.
+    let slabs = |nslot: usize, start: &[u32]| unsafe {
+        Views::from_slabs(
+            &stream,
+            s.d,
+            up(&stream, &s.views),
+            DeviceBuffer::<u32>::zeroed(&stream, nslot).unwrap(),
+            start,
+        )
+    };
+    let nslot = start[ntiles] as usize;
+    let mut descending = start.clone();
+    descending[1] = start[2] + 1;
+    let rejected = [
+        ("starts short", slabs(nslot, &start[..ntiles])),
+        (
+            "starts long",
+            slabs(nslot, &[&start[..], &[nslot as u32]].concat()),
+        ),
+        ("starts descending", slabs(nslot, &descending)),
+        ("slabs short", slabs(nslot - 1, &start)),
+    ];
+    for (what, r) in rejected {
+        assert!(matches!(r, Err(Error::Shape(_))), "{what}");
+    }
+}
+
 /// Scan counts: every 7th pixel masked, every 5th of the rest zero, others 1..=60.
 fn counts(len: usize) -> Vec<u16> {
     (0..len)

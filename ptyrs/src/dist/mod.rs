@@ -4,6 +4,8 @@
 pub mod ap;
 pub mod exchange;
 pub mod feed;
+mod halo;
+pub mod live;
 pub mod p2p;
 pub mod partition;
 #[cfg(test)]
@@ -14,6 +16,8 @@ pub mod worker;
 
 pub use ap::{ApConfig, ApProblem, DistAp, NLEAF, RegionLoad};
 pub use exchange::{Exchange, Layout};
+pub use halo::{HaloBacker, HaloRow, HaloRows, LiveHaloBufs};
+pub use live::{LivePlan, LiveRegion, Share};
 pub use partition::{Csr, DEFAULT_TILE, Partition, Region, Scheme, TileGrid};
 pub use worker::{Gpu, Workers};
 
@@ -25,6 +29,8 @@ pub enum DistError {
     Driver(#[from] cuda_core::DriverError),
     #[error("GPU: {0}")]
     Gpu(#[from] crate::gpu::Error),
+    #[error("growth: {0}")]
+    Grow(#[from] crate::live::grow::GrowError),
     #[error("topology: {0}")]
     Topology(String),
     #[error("GPU {from} cannot access GPU {to} peer-to-peer")]
