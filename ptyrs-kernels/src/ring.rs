@@ -88,17 +88,22 @@ pub mod ring_kernels {
         }
         thread::sync_threads();
         // Every load before the first vote, so a thread has all its frames in flight.
+        // Both loops unrolled, so `v` stays in registers rather than local memory.
         let mut v = [MASKED; F];
-        for (i, v) in v.iter_mut().enumerate() {
+        #[unroll]
+        for i in 0..COUNT_FRAMES {
+            let i = i as usize;
             if p < n && unsafe { *open.add(i) } != 0 {
-                let f = (fa + i as u32) as usize;
-                *v = unsafe { *counts.add(f * n as usize + p as usize) };
+                let f = fa as usize + i;
+                v[i] = unsafe { *counts.add(f * n as usize + p as usize) };
             }
         }
         let w = (t / 32) as usize;
         let mut acc = 0u32;
-        for (i, v) in v.iter().enumerate() {
-            let unmasked = *v != MASKED;
+        #[unroll]
+        for i in 0..COUNT_FRAMES {
+            let i = i as usize;
+            let unmasked = v[i] != MASKED;
             acc += unmasked as u32;
             let k = warp::popc(unmasked);
             if warp::lane_id() == 0 {

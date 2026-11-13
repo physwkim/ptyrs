@@ -287,7 +287,10 @@ pub mod bh_kernels {
         let h = BH_HESS as usize;
         let mut b = t;
         while b < nhess as usize {
-            for k in 0..h {
+            // Unrolled, as every loop over `acc`, so it stays in registers.
+            #[unroll]
+            for k in 0..BH_HESS {
+                let k = k as usize;
                 acc[2 + k] += unsafe { *hess.add(h * b + k) };
             }
             b += PIXEL_THREADS as usize;
@@ -295,8 +298,10 @@ pub mod bh_kernels {
         let s = (&raw mut RED).cast::<f32>();
         let seg = PIXEL_THREADS as usize;
         unsafe {
-            for (j, &a) in acc.iter().enumerate() {
-                *s.add(j * seg + t) = a;
+            #[unroll]
+            for j in 0..5u32 {
+                let j = j as usize;
+                *s.add(j * seg + t) = acc[j];
             }
             crate::block_sum::<5>(s);
         }
@@ -308,8 +313,10 @@ pub mod bh_kernels {
                 let top = gg - beta * gd;
                 let bottom = huu - 2.0 * beta * huv + beta * beta * hvv;
                 let rec: [f32; BH_STEP as usize] = [beta, top / bottom * frac, top, bottom];
-                for (k, v) in rec.into_iter().enumerate() {
-                    *out.add(k) = v;
+                #[unroll]
+                for k in 0..BH_STEP {
+                    let k = k as usize;
+                    *out.add(k) = rec[k];
                 }
             }
         }
