@@ -293,6 +293,17 @@ impl FusedBufs {
         Ok(bufs)
     }
 
+    /// Bytes of the frame planes [`Self::new`] (or with `shift`, [`Self::with_shift`])
+    /// holds per frame of `nf_max`: what a stack's passes stream through it per frame.
+    pub fn frame_bytes(dims: &ViewDims, shift: bool) -> usize {
+        let n = dims.n();
+        let complex = match shift {
+            false => dims.nmode as usize,
+            true => (dims.nmode + 2 * dims.nprobe + dims.nobj) as usize,
+        };
+        complex * n * size_of::<C32>() + usize::from(shift) * n * size_of::<f32>()
+    }
+
     /// The stack's transforms. After an AP [`Kernels::fused_project`], its projected exit
     /// waves in the layout of M1 `psi` (origin at `[0, 0]`, plane `kl` view `f0 * nmode +
     /// kl`), what [`Kernels::psi_to_probe`] takes.

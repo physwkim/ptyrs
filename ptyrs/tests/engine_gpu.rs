@@ -1597,10 +1597,11 @@ fn position_is_bit_identical_across_stack_splits() {
     }
 }
 
-/// On a 64 MiB L2 the default stack size cuts 30 frames of 256x256 with two probe modes into
-/// stacks of 24 for the passes that stream one exit-wave set and of 12 for the rest: AP, DM
-/// and ML cycles modelling a scale and a position, and BH then LSQML epochs of every frame
-/// modelling a position, give the bits of stacks of 7 for all.
+/// On a 64 MiB L2 the default stack size cuts 30 frames of 256x256 with two probe modes by
+/// the bytes each pass streams per frame under a position: 6 for the fused passes, 5 for DM,
+/// 4 for RAAR, ML's line search and LSQML, 2 for BH. AP, DM, RAAR and ML cycles modelling a
+/// scale and a position, and BH then LSQML epochs of every frame modelling a position, give
+/// the bits of stacks of 7 for all.
 #[test]
 fn default_stacks_give_the_bits_of_explicit_stacks() {
     let (scan, object, probe) = start(256, 2, false);
@@ -1639,13 +1640,18 @@ fn default_stacks_give_the_bits_of_explicit_stacks() {
         for c in feature_cycles(2) {
             c.gpu(&mut cycles, 4);
         }
+        let raar = RaarParams {
+            calc_llk: 2,
+            ..RaarParams::default()
+        };
+        Cycles::Raar(raar).gpu(&mut cycles, 4);
         let mut epochs = new(stack_size, &moved);
         epochs.bh(&bh, 3, 1).unwrap();
         epochs.lsqml(&lsqml, 3, 1).unwrap();
         [bit_state(&mut cycles), bit_state(&mut epochs)]
     };
     let (seven, default) = (run(Some(7)), run(None));
-    assert_eq!(seven[0].llk.len(), 3 * 3 + 1);
+    assert_eq!(seven[0].llk.len(), 4 * 3 + 1);
     assert_eq!(seven[1].llk.len(), 3 + 3 + 1);
     for (k, what) in ["cycles", "epochs"].into_iter().enumerate() {
         let (seven, default) = (&seven[k], &default[k]);

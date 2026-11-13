@@ -8,14 +8,17 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use crate::gpu::{
-    BhScan, C32, EpochOrder, Error as GpuError, FusedInputs, Kernels, LSQML_REC, LsqmlAt, LsqmlChi,
-    LsqmlKernels, LsqmlNoise, LsqmlScan, LsqmlVar, Model, PositionRule, PsiSums, StackTable, Views,
+    BhScan, C32, EpochOrder, Error as GpuError, FusedBufs, FusedInputs, Kernels, LSQML_REC,
+    LsqmlAt, LsqmlChi, LsqmlKernels, LsqmlNoise, LsqmlScan, LsqmlVar, Model, PositionRule, PsiSums,
+    StackTable, Views,
 };
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaStream, DeviceBuffer};
 
 use super::device::{Moved, MovedLent, PassesMut, moved_inputs, moved_shift};
-use super::{Bufs, Frames, GpuPtycho, batch_stacks, plane_len, stack_buf_len};
+use super::{
+    Bufs, Cut, Frames, GpuPtycho, StackRule, batch_stacks, plane_bytes, plane_len, wave_bytes,
+};
 use crate::engine::features::{POSITION_LIMIT, POSITION_STEP};
 use crate::engine::ptycho::{Algorithm, llk_due};
 use crate::engine::{Cost, EngineError, LsqmlParams, LsqmlStep, random_batches};
@@ -93,7 +96,7 @@ pub(super) struct LsqmlState {
     size: u32,
     /// Each batch's range of `stacks`.
     batches: Vec<Range<usize>>,
-    /// The batches cut into stacks as long as the device's wide ones, one table entry each.
+    /// The batches cut into stacks by the bytes a stack's passes touch, one table entry each.
     stacks: Vec<Frames>,
     table: StackTable,
     /// A batch's row transforms, then exit-wave updates, one per stack of a batch.
@@ -121,19 +124,27 @@ pub(super) struct LsqmlBufs<'a> {
 }
 
 impl LsqmlState {
-    /// For `views` in batches of `size` frames cut into stacks of `stack_size`, `moved` under
+    /// For `views` in batches of `size` frames, each cut into stacks by `rule`, `moved` under
     /// the position model; the epoch order is the scan's.
     pub(super) fn new(
         stream: &Arc<CudaStream>,
         kernels: &Kernels,
         views: &Views,
         size: u32,
-        stack_size: u32,
+        rule: StackRule,
         moved: bool,
     ) -> Result<Self, EngineError> {
         let dims = views.dims();
-        let ((stacks, table, _), batches) = batch_stacks(stream, dims, size, stack_size)?;
-        let len = stack_buf_len(dims, &table);
+        // work, icalc; under the position also the moved probes and the shifted sums' scratch.
+        let shift = plane_bytes::<C32>(dims, dims.nprobe) + FusedBufs::frame_bytes(dims, true);
+        let bytes = wave_bytes(dims) + plane_bytes::<f32>(dims, 1) + usize::from(moved) * shift;
+        let (cut, batches) = batch_stacks(stream, dims, size, rule.frames(bytes)?)?;
+        let len = cut.wave_len(dims);
+        let Cut {
+            frames: stacks,
+            table,
+            ..
+        } = cut;
         let nf_max = table.nf_max();
         let icalc_len = nf_max as usize * plane_len(dims);
         let slots = batches.iter().map(|b| b.len()).max().unwrap_or(0);
