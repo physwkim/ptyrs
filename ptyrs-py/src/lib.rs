@@ -3,8 +3,9 @@
 //! reconstruction path goes through it.
 //!
 //! Arrays are row-major as in the engine: counts `[nframe, ny, nx]` in detector order,
-//! object `[nmode, nyo, nxo]` and probe `[nmode, ny, nx]` complex128 in PyNX convention,
-//! positions as the raw sample translations in metres (CXI `translation`).
+//! object `[nmode, nyo, nxo]` (`[nslice, nmode, nyo, nxo]` in epochs over `Views`) and probe
+//! `[nmode, ny, nx]` complex128 in PyNX convention, a `Scan`'s positions as the raw sample
+//! translations in metres (CXI `translation`).
 
 mod cpu;
 mod gpu;
@@ -175,14 +176,14 @@ fn cost(name: &str) -> PyResult<Cost> {
     }
 }
 
-/// LSQML steps as dicts of `frames`, `a_far`, `a_obj` (object slice 0) and `a_probe`.
+/// LSQML steps as dicts of `frames`, `a_far`, `a_obj` (`[nslice, frames]`) and `a_probe`.
 fn lsqml_steps<'py>(py: Python<'py>, steps: &[LsqmlStep]) -> PyResult<Bound<'py, PyList>> {
     let steps = steps.iter().map(|s| {
         let d = PyDict::new(py);
         d.set_item("frames", PyArray1::from_slice(py, &s.frames))?;
         d.set_item("a_far", PyArray1::from_slice(py, &s.a_far))?;
-        // the far-field model has one object slice
-        d.set_item("a_obj", PyArray1::from_slice(py, &s.a_obj[0]))?;
+        let a_obj = PyArray1::from_vec(py, s.a_obj.concat());
+        d.set_item("a_obj", a_obj.reshape([s.a_obj.len(), s.frames.len()])?)?;
         d.set_item("a_probe", PyArray1::from_slice(py, &s.a_probe))?;
         Ok(d)
     });
@@ -293,6 +294,25 @@ fn history<'py>(py: Python<'py>, h: &[LlkRecord]) -> PyResult<Bound<'py, PyDict>
     Ok(d)
 }
 
+/// Counts `[nframe, ny, nx]` in detector order: uint16 with 65535 masked, or float64 integers
+/// with negative values masked.
+fn counts_in(counts: &Bound<'_, PyAny>) -> PyResult<Counts> {
+    if let Ok(c) = counts.extract::<PyReadonlyArray3<'_, u16>>() {
+        let c = c.as_array();
+        let (n, ny, nx) = c.dim();
+        Ok(Counts::from_raw([n, ny, nx], c.iter().copied().collect()).map_err(Error::from)?)
+    } else if let Ok(c) = counts.extract::<PyReadonlyArray3<'_, f64>>() {
+        let c = c.as_array();
+        let (n, ny, nx) = c.dim();
+        let values: Vec<f64> = c.iter().copied().collect();
+        Ok(Counts::from_f64([n, ny, nx], &values, None).map_err(Error::from)?)
+    } else {
+        Err(PyTypeError::new_err(
+            "counts must be a 3-D uint16 or float64 array",
+        ))
+    }
+}
+
 /// A far-field scan: counts `[nframe, ny, nx]` (uint16 with 65535 masked, or float64 integers
 /// with negative values masked), positions `y`, `x` in metres, and the geometry in metres.
 #[pyclass(frozen)]
@@ -309,20 +329,7 @@ impl Scan {
         distance: f64,
         detector_pixel: f64,
     ) -> PyResult<Self> {
-        let counts = if let Ok(c) = counts.extract::<PyReadonlyArray3<'_, u16>>() {
-            let c = c.as_array();
-            let (n, ny, nx) = c.dim();
-            Counts::from_raw([n, ny, nx], c.iter().copied().collect()).map_err(Error::from)?
-        } else if let Ok(c) = counts.extract::<PyReadonlyArray3<'_, f64>>() {
-            let c = c.as_array();
-            let (n, ny, nx) = c.dim();
-            let values: Vec<f64> = c.iter().copied().collect();
-            Counts::from_f64([n, ny, nx], &values, None).map_err(Error::from)?
-        } else {
-            return Err(PyTypeError::new_err(
-                "counts must be a 3-D uint16 or float64 array",
-            ));
-        };
+        let counts = counts_in(counts)?;
         let geometry = Geometry::new(wavelength, distance, detector_pixel, counts.frame_shape())
             .map_err(Error::from)?;
         let positions =
@@ -336,6 +343,9 @@ impl Scan {
 #[pymodule]
 fn ptyrs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Scan>()?;
+    m.add_class::<cpu::Wavefield>()?;
+    m.add_class::<cpu::Optics>()?;
+    m.add_class::<cpu::Views>()?;
     m.add_class::<cpu::Ptycho>()?;
     m.add_class::<cpu::Lsqml>()?;
     m.add_class::<cpu::Bh>()?;

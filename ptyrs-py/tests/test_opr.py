@@ -1,7 +1,8 @@
 """Lsqml's probe variation (OPR) against the engine's own LSQML epochs from the same scan and
 start, `examples/engine_reference.rs`' `opr.h5`: after every epoch the object, probe,
 eigenmodes, weights, main-mode weights and steps, exactly, as one CPU f64 engine runs both;
-eigenmodes and weights alone with the amplitude cost, and with main-mode weights with Poisson."""
+eigenmodes and weights alone with the amplitude cost, and with main-mode weights with Poisson;
+over `Ptycho.views` and over views built from the far field and preprocessed positions."""
 
 import os
 
@@ -26,24 +27,36 @@ def state(f):
     return ptyrs.Ptycho(scan, f["object"][()], f["probe"][()])
 
 
+def views_of(f, kind):
+    """`f`'s views from its `Ptycho` or built from its positions as the views read them."""
+    if kind == "ptycho":
+        return state(f).views
+    a, counts, obj, probe = f.attrs, f["counts"][()], f["object"][()], f["probe"][()]
+    optics = ptyrs.Optics.far_field(a["wavelength"], a["distance"], a["detector_pixel"],
+                                    counts.shape[1:])
+    return ptyrs.Views(counts, f["positions"][()], f["pixel"][()], obj.shape[1:], len(probe),
+                       len(obj), optics)
+
+
 def variation(g):
     """A run's or an epoch's `eigenmodes`, `weights` and `intensity` (None if absent)."""
     return {k: g[k][()] if k in g else None for k in ("eigenmodes", "weights", "intensity")}
 
 
+@pytest.mark.parametrize("views", ["ptycho", "built"])
 @pytest.mark.parametrize("run", ["opr", "intensity"])
-def test_lsqml_opr_matches_engine(ref, run):
+def test_lsqml_opr_matches_engine(ref, run, views):
     g = ref[run]
     start = variation(g)
     assert (start["intensity"] is not None) == (run == "intensity")
     lsqml = ptyrs.Lsqml(int(g.attrs["batch_size"]), g.attrs["cost"], int(g.attrs["seed"]),
                         **{k: v for k, v in start.items() if v is not None})
-    p = state(ref)
-    o, pr = ref["object"][()], ref["probe"][()]
+    over = views_of(ref, views)
+    o, pr = ref["object"][()][None], ref["probe"][()]
     epochs = sorted((k for k in g if k.startswith("epoch")), key=lambda k: int(k[5:]))
     assert len(epochs) == 3
     for e in epochs:
-        o, pr, steps = lsqml.epoch(p, o, pr)
+        o, pr, steps = lsqml.epoch(over, o, pr)
         want = g[e]
         np.testing.assert_array_equal(o, want["object"][()])
         np.testing.assert_array_equal(pr, want["probe"][()])
@@ -55,14 +68,14 @@ def test_lsqml_opr_matches_engine(ref, run):
                 np.testing.assert_array_equal(got[k], v, err_msg=f"{e} {k}")
         assert [len(s["frames"]) for s in steps] == list(want["batch_len"][()])
         for k in ("frames", "a_far", "a_obj", "a_probe"):
-            np.testing.assert_array_equal(np.concatenate([s[k] for s in steps]), want[k][()],
-                                          err_msg=f"{e} {k}")
+            np.testing.assert_array_equal(np.concatenate([s[k] for s in steps], axis=-1),
+                                          want[k][()], err_msg=f"{e} {k}")
     assert not np.array_equal(lsqml.weights, start["weights"])
 
 
 def test_lsqml_opr_refusals(ref):
-    p = state(ref)
-    o, pr = ref["object"][()], ref["probe"][()]
+    p = state(ref).views
+    o, pr = ref["object"][()][None], ref["probe"][()]
     v = variation(ref["intensity"])
     e, w, c = v["eigenmodes"], v["weights"], v["intensity"]
     nframe = len(w)

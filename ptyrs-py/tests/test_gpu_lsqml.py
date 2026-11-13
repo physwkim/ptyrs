@@ -56,12 +56,12 @@ def test_lsqml_matches_cpu(scenario, cost, batch, fused, moved):
     scan, obj, probe, d0 = start(scenario, moved)
     state = ptyrs.Ptycho(scan, obj, probe)
     cpu = ptyrs.Lsqml(batch, cost, 7, position=d0)
-    o, p = obj, probe
+    o, p = obj[None], probe
     want = []
     for _ in range(NEPOCH):
-        o, p, _ = cpu.epoch(state, o, p)
+        o, p, _ = cpu.epoch(state.views, o, p)
         state.set_features(position=cpu.position)
-        want.append(state.llk(o, p))
+        want.append(state.llk(o[0], p))
 
     gpu = gpu_at(scan, obj, probe, fused, d0)
     gpu.lsqml(NEPOCH, 1, batch, cost, 7)
@@ -71,7 +71,7 @@ def test_lsqml_matches_cpu(scenario, cost, batch, fused, moved):
     for key in ("poisson", "gaussian", "euclidian", "nb_photons_calc"):
         err = rel(h[key], [w[key] for w in want]).max()
         assert err < TOL, f"llk {key}: {err:.2e}"
-    assert rel_l2(gpu.object, o) < TOL
+    assert rel_l2(gpu.object, o[0]) < TOL
     assert rel_l2(gpu.probe, p) < TOL
     offsets_match(gpu, cpu, d0)
     assert gpu.cycle == NEPOCH
@@ -84,9 +84,9 @@ def test_lsqml_steps_match_cpu(scenario, cost, batch, fused, moved):
     scan, obj, probe, d0 = start(scenario, moved)
     state = ptyrs.Ptycho(scan, obj, probe)
     cpu = ptyrs.Lsqml(batch, cost, 7, position=d0)
-    o, p = obj, probe
+    o, p = obj[None], probe
     for nepoch in range(1, NEPOCH_STEPS + 1):
-        o, p, want = cpu.epoch(state, o, p)
+        o, p, want = cpu.epoch(state.views, o, p)
         gpu = gpu_at(scan, obj, probe, fused, d0)
         assert gpu.lsqml_steps() == []
         gpu.lsqml(nepoch, 0, batch, cost, 7)
@@ -95,7 +95,7 @@ def test_lsqml_steps_match_cpu(scenario, cost, batch, fused, moved):
         for key in ("a_far", "a_obj", "a_probe"):
             err = max(steps_rel(g[key], w[key]) for g, w in zip(got, want))
             assert err < TOL, f"epoch {nepoch} {key}: {err:.2e}"
-        assert rel_l2(gpu.object, o) < TOL
+        assert rel_l2(gpu.object, o[0]) < TOL
         assert rel_l2(gpu.probe, p) < TOL
         offsets_match(gpu, cpu, d0)
 
@@ -115,4 +115,4 @@ def test_lsqml_rejects(scenario):
         ptyrs.Lsqml(8, "poisson", 7, position=np.full((npos, 2), np.nan))
     short = ptyrs.Lsqml(8, "poisson", 7, position=np.zeros((npos - 1, 2)))
     with pytest.raises(ValueError, match=f"{npos - 1} position offsets for {npos} frames"):
-        short.epoch(ptyrs.Ptycho(scan, obj, probe), obj, probe)
+        short.epoch(ptyrs.Ptycho(scan, obj, probe).views, obj[None], probe)

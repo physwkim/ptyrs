@@ -1,14 +1,13 @@
-//! The CPU f64 engine: [`ptyrs::engine::Ptycho`] (AP, DM, RAAR, ML, rPIE), LSQML and BH epochs over
-//! its scan, and the forward model and LLK of given arrays.
-
-use std::slice;
+//! The CPU f64 engine: [`ptyrs::engine::Ptycho`] (AP, DM, RAAR, ML, rPIE) and the forward model
+//! and LLK of given arrays over its scan, and LSQML and BH epochs over the views of a scan
+//! through far-field, near-field or multislice optics.
 
 use numpy::{
     PyArray1, PyArray2, PyArray3, PyArray4, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2,
-    PyReadonlyArray3,
+    PyReadonlyArray3, PyReadonlyArray4,
 };
-use ptyrs::base::{C64, Object, Probe};
-use ptyrs::engine::{Features, Optics, ProbeVariation, obj_probe_to_psi};
+use ptyrs::base::{AddrTable, C64, Geometry, Object, Positions, Probe, Stack};
+use ptyrs::engine::{Features, Observed, ProbeVariation, obj_probe_to_psi};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
@@ -34,19 +33,210 @@ fn offsets_fit(features: &Features, nframe: usize) -> PyResult<()> {
     }
 }
 
-/// An epoch's new object and probe and its steps.
+/// An epoch's new object slices and probe and its steps.
 type Epoch<'py> = (
-    Bound<'py, PyArray3<C64>>,
+    Bound<'py, PyArray4<C64>>,
     Bound<'py, PyArray3<C64>>,
     Bound<'py, PyList>,
 );
+
+/// One free-space propagation (`ptyrs::engine::Wavefield`): `[ny, nx]` planes (both even),
+/// `wavelength`, source-plane `pixel` `[py, px]` and signed `distance` in metres.
+#[pyclass(frozen)]
+pub(crate) struct Wavefield(ptyrs::engine::Wavefield);
+
+#[pymethods]
+impl Wavefield {
+    #[new]
+    fn new(shape: [usize; 2], wavelength: f64, pixel: [f64; 2], distance: f64) -> PyResult<Self> {
+        let w = ptyrs::engine::Wavefield::new(shape, wavelength, pixel, distance);
+        Ok(Self(w.map_err(Error::from)?))
+    }
+}
+
+/// The exit model an [`ptyrs::engine::Optics`] was built on; `Optics.with_slices` rebuilds
+/// from it, as the engine's consumes the optics it slices.
+#[derive(Clone, Copy)]
+enum Exit {
+    FarField(Geometry),
+    FreeSpace(ptyrs::engine::Wavefield),
+}
+
+impl Exit {
+    fn optics(self) -> ptyrs::engine::Optics {
+        match self {
+            Self::FarField(g) => ptyrs::engine::Optics::far_field(&g),
+            Self::FreeSpace(w) => ptyrs::engine::Optics::free_space(&w),
+        }
+    }
+}
+
+/// The engine's exit-wave model from object to detector (`ptyrs::engine::Optics`): PyNX's
+/// far field (`far_field`), pty-chi's planar near field (`free_space`), and either through
+/// several object slices (`with_slices`).
+#[pyclass(frozen)]
+pub(crate) struct Optics {
+    inner: ptyrs::engine::Optics,
+    exit: Exit,
+}
+
+impl Optics {
+    fn new(exit: Exit) -> Self {
+        Self {
+            inner: exit.optics(),
+            exit,
+        }
+    }
+}
+
+#[pymethods]
+impl Optics {
+    /// PyNX's far field of `frame` `[ny, nx]` detector frames, as a `Scan`'s geometry.
+    #[staticmethod]
+    fn far_field(
+        wavelength: f64,
+        distance: f64,
+        detector_pixel: f64,
+        frame: [usize; 2],
+    ) -> PyResult<Self> {
+        let g = Geometry::new(wavelength, distance, detector_pixel, frame).map_err(Error::from)?;
+        Ok(Self::new(Exit::FarField(g)))
+    }
+
+    /// pty-chi's planar model of one free-space propagation from the object plane.
+    #[staticmethod]
+    fn free_space(w: &Wavefield) -> Self {
+        Self::new(Exit::FreeSpace(w.0))
+    }
+
+    /// This exit model through `len(gaps) + 1` object slices, gap `s` from slice `s` to
+    /// `s + 1` (pty-chi `slice_spacings_m[s]` at the object pixel), in place of any slices
+    /// this one has.
+    fn with_slices(&self, gaps: Vec<Bound<'_, Wavefield>>) -> PyResult<Self> {
+        let gaps: Vec<_> = gaps.iter().map(|w| w.get().0).collect();
+        let inner = self.exit.optics().with_slices(&gaps);
+        Ok(Self {
+            inner: inner.map_err(Error::from)?,
+            exit: self.exit,
+        })
+    }
+
+    /// The object slices the wave crosses.
+    #[getter]
+    fn nslice(&self) -> usize {
+        self.inner.nslice()
+    }
+}
+
+/// A scan as the engine's epochs read it: counts `[nframe, ny, nx]` as `Scan` takes them,
+/// `positions` `[nframe, 2]` `[y, x]` already preprocessed (as `Ptycho.views` has them) in the
+/// units of `pixel` `[py, px]`, the views of `nprobe` probe and `nobj` object modes over an
+/// `object_shape` `[nyo, nxo]` object, and the `optics` to the counts' plane.
+#[pyclass(frozen)]
+pub(crate) struct Views {
+    addr: AddrTable,
+    obs: Observed,
+    optics: Py<Optics>,
+}
+
+impl Views {
+    fn optics(&self) -> &ptyrs::engine::Optics {
+        &self.optics.get().inner
+    }
+
+    /// `object` `[nslice, nobj, nyo, nxo]` and `probe` `[nprobe, ny, nx]` as engine arrays,
+    /// of the shapes these views and their optics read.
+    fn modes(
+        &self,
+        object: PyReadonlyArray4<'_, C64>,
+        probe: PyReadonlyArray3<'_, C64>,
+    ) -> PyResult<(Vec<Object>, Probe)> {
+        let a = &self.addr;
+        let ([nyo, nxo], [ny, nx]) = (a.obj_shape(), a.frame_shape());
+        let want = (
+            [self.optics().nslice(), a.nobj(), nyo, nxo],
+            [a.nprobe(), ny, nx],
+        );
+        let (o, p) = (object.as_array(), probe.as_array());
+        if (o.shape(), p.shape()) != (&want.0[..], &want.1[..]) {
+            return Err(PyValueError::new_err(format!(
+                "object {:?} and probe {:?} differ from the views' {:?} and {:?}",
+                o.shape(),
+                p.shape(),
+                want.0,
+                want.1
+            )));
+        }
+        let objects = o.outer_iter().map(|s| {
+            let s = Stack::from_vec([a.nobj(), nyo, nxo], s.iter().copied().collect());
+            Ok(Object::new(s.map_err(Error::from)?))
+        });
+        Ok((
+            objects.collect::<PyResult<_>>()?,
+            Probe::new(stack_in(probe)?),
+        ))
+    }
+}
+
+#[pymethods]
+impl Views {
+    #[new]
+    fn new(
+        counts: &Bound<'_, PyAny>,
+        positions: PyReadonlyArray2<'_, f64>,
+        pixel: [f64; 2],
+        object_shape: [usize; 2],
+        nprobe: usize,
+        nobj: usize,
+        optics: Bound<'_, Optics>,
+    ) -> PyResult<Self> {
+        let counts = crate::counts_in(counts)?;
+        let [nframe, ny, nx] = counts.dims();
+        let plane = optics.get().inner.propagator().shape();
+        if [ny, nx] != plane {
+            return Err(PyValueError::new_err(format!(
+                "{:?} frames on the optics' {plane:?} plane",
+                [ny, nx]
+            )));
+        }
+        let positions = positions.as_array();
+        if positions.ncols() != 2 {
+            return Err(PyValueError::new_err(format!(
+                "positions must be [nframe, 2], got {:?}",
+                positions.shape()
+            )));
+        }
+        let [y, x] = [0, 1].map(|axis| positions.column(axis).to_vec());
+        let positions = Positions::new(y, x).map_err(Error::from)?;
+        if positions.len() != nframe {
+            return Err(PyValueError::new_err(format!(
+                "{} positions for {nframe} frames",
+                positions.len()
+            )));
+        }
+        let addr = AddrTable::new(&positions, pixel, [ny, nx], object_shape, nprobe, nobj);
+        Ok(Self {
+            addr: addr.map_err(Error::from)?,
+            obs: Observed::from_counts(&counts),
+            optics: optics.unbind(),
+        })
+    }
+}
+
+/// `objects` as `[nslice, nobj, nyo, nxo]`.
+fn objects_out<'py>(py: Python<'py>, objects: Vec<Object>) -> PyResult<Bound<'py, PyArray4<C64>>> {
+    let [nobj, nyo, nxo] = objects[0].dims();
+    let nslice = objects.len();
+    let data = objects.into_iter().flat_map(|o| o.0.into_vec()).collect();
+    PyArray1::from_vec(py, data).reshape([nslice, nobj, nyo, nxo])
+}
 
 /// Far field `FT(fftshift(P·O·q))` of every view of `p`'s scan at `object` and `probe`, frame
 /// major and mode minor, zero frequency at `[0, 0]` (PyNX's `psi` layout); `p`'s features are
 /// not modelled.
 fn far_field(
     p: &ptyrs::engine::Ptycho,
-    optics: &Optics,
+    optics: &ptyrs::engine::Optics,
     object: &Object,
     probe: &Probe,
 ) -> Vec<C64> {
@@ -58,13 +248,13 @@ fn far_field(
 }
 
 /// The CPU f64 reconstruction state of a scan from a starting object and probe
-/// (`ptyrs::engine::Ptycho`). Its scan also carries the LSQML and BH epochs and the forward model
-/// of arrays of the same shapes.
+/// (`ptyrs::engine::Ptycho`). Its scan also carries the forward model of arrays of the same
+/// shapes, and its `views` the LSQML and BH epochs.
 #[pyclass]
 pub(crate) struct Ptycho {
     inner: ptyrs::engine::Ptycho,
-    /// [`Optics::far_field`] of the scan: the engine's own quadratic phase and FFT.
-    optics: Optics,
+    /// `inner`'s views and the far field of its scan, the engine's own quadratic phase and FFT.
+    views: Py<Views>,
     /// The scan `inner` was built on, for the engine's LLK of other arrays.
     scan: ptyrs::base::Scan,
 }
@@ -95,17 +285,29 @@ impl Ptycho {
 impl Ptycho {
     #[new]
     fn new(
+        py: Python<'_>,
         scan: &Scan,
         object: PyReadonlyArray3<'_, C64>,
         probe: PyReadonlyArray3<'_, C64>,
     ) -> PyResult<Self> {
         let (object, probe) = (Object::new(stack_in(object)?), Probe::new(stack_in(probe)?));
         let inner = ptyrs::engine::Ptycho::new(&scan.0, object, probe).map_err(Error::from)?;
+        let views = Views {
+            addr: inner.addr().clone(),
+            obs: inner.observed().clone(),
+            optics: Py::new(py, Optics::new(Exit::FarField(scan.0.geometry)))?,
+        };
         Ok(Self {
-            optics: Optics::far_field(&scan.0.geometry),
+            views: Py::new(py, views)?,
             inner,
             scan: scan.0.clone(),
         })
+    }
+
+    /// The views of the scan through its far field, which the LSQML and BH epochs take.
+    #[getter]
+    fn views(&self, py: Python<'_>) -> Py<Views> {
+        self.views.clone_ref(py)
     }
 
     /// `ncycle` AP cycles; keywords are `ApParams` fields.
@@ -197,7 +399,7 @@ impl Ptycho {
         probe: PyReadonlyArray3<'_, C64>,
     ) -> PyResult<Bound<'py, PyArray4<C64>>> {
         let (object, probe) = self.modes(object, probe)?;
-        let psi = far_field(&self.inner, &self.optics, &object, &probe);
+        let psi = far_field(&self.inner, self.views.get().optics(), &object, &probe);
         let addr = self.inner.addr();
         let [ny, nx] = addr.frame_shape();
         PyArray1::from_vec(py, psi).reshape([addr.nframe(), addr.nmode(), ny, nx])
@@ -339,33 +541,32 @@ impl Lsqml {
         c.map(|c| PyArray1::from_slice(py, c))
     }
 
-    /// One epoch over `ptycho`'s scan from `object` and `probe`; returns the new object and
-    /// probe and each batch's step sizes.
+    /// One epoch over `views` from `object` `[nslice, nobj, nyo, nxo]` and `probe`; returns
+    /// the new object and probe and each batch's step sizes.
     fn epoch<'py>(
         &mut self,
         py: Python<'py>,
-        ptycho: &Ptycho,
-        object: PyReadonlyArray3<'_, C64>,
+        views: &Views,
+        object: PyReadonlyArray4<'_, C64>,
         probe: PyReadonlyArray3<'_, C64>,
     ) -> PyResult<Epoch<'py>> {
-        let (mut object, mut probe) = ptycho.modes(object, probe)?;
-        let p = &ptycho.inner;
-        let (nframe, plane) = (p.addr().nframe(), probe.plane_shape());
+        let (mut objects, mut probe) = views.modes(object, probe)?;
+        let (nframe, plane) = (views.addr.nframe(), probe.plane_shape());
         offsets_fit(self.inner.features(), nframe)?;
         if let Some(v) = &self.var {
             variation_fits(v, nframe, plane)?;
         }
         let mut none = ProbeVariation::none(plane);
         let steps = self.inner.epoch(
-            p.addr(),
-            p.observed(),
-            &ptycho.optics,
-            slice::from_mut(&mut object),
+            &views.addr,
+            &views.obs,
+            views.optics(),
+            &mut objects,
             &mut probe,
             self.var.as_mut().unwrap_or(&mut none),
         );
         let steps = crate::lsqml_steps(py, &steps)?;
-        Ok((stack_out(py, object.0)?, stack_out(py, probe.0)?, steps))
+        Ok((objects_out(py, objects)?, stack_out(py, probe.0)?, steps))
     }
 }
 
@@ -403,24 +604,23 @@ impl Bh {
         d.map(|d| crate::position_out(py, d)).transpose()
     }
 
-    /// One epoch over `ptycho`'s scan from `object` and `probe`; returns the new object and
-    /// probe and each batch's step.
+    /// One epoch over `views` from `object` `[nslice, nobj, nyo, nxo]` and `probe`; returns
+    /// the new object and probe and each batch's step.
     fn epoch<'py>(
         &mut self,
         py: Python<'py>,
-        ptycho: &Ptycho,
-        object: PyReadonlyArray3<'_, C64>,
+        views: &Views,
+        object: PyReadonlyArray4<'_, C64>,
         probe: PyReadonlyArray3<'_, C64>,
     ) -> PyResult<Epoch<'py>> {
-        let (mut object, mut probe) = ptycho.modes(object, probe)?;
-        let p = &ptycho.inner;
-        offsets_fit(self.0.features(), p.addr().nframe())?;
-        let objects = slice::from_mut(&mut object);
+        let (mut objects, mut probe) = views.modes(object, probe)?;
+        offsets_fit(self.0.features(), views.addr.nframe())?;
+        let (addr, obs) = (&views.addr, &views.obs);
         let steps = self
             .0
-            .epoch(p.addr(), p.observed(), &ptycho.optics, objects, &mut probe);
+            .epoch(addr, obs, views.optics(), &mut objects, &mut probe);
         let steps = crate::bh_steps(py, &steps)?;
-        Ok((stack_out(py, object.0)?, stack_out(py, probe.0)?, steps))
+        Ok((objects_out(py, objects)?, stack_out(py, probe.0)?, steps))
     }
 }
 
@@ -444,7 +644,7 @@ mod tests {
         let scan =
             ptyrs::engine::sim::simulate(g, positions, &object, &probe, 2e3, None, 3).unwrap();
         let p = ptyrs::engine::Ptycho::new(&scan, object, probe).unwrap();
-        let optics = Optics::far_field(&g);
+        let optics = ptyrs::engine::Optics::far_field(&g);
         let psi = far_field(&p, &optics, p.object(), p.probe());
         let (addr, obs) = (p.addr(), p.observed());
         let got = llk(obs, 0..addr.nframe(), addr.nmode(), &psi).normalised(obs.nb_obs());

@@ -3,12 +3,13 @@
 //! `{r, i}`); `scripts/build.sh` runs it into the module's directory.
 //!
 //! `opr.h5` holds a simulated far-field scan (`counts`, raw `y` and `x`, the geometry as root
-//! attributes), its start `object` and `probe` (`Ptycho::scale_obj_probe` of a flat object
-//! and the simulation's probe) and one group per LSQML run with probe variation, its `cost`,
+//! attributes), its `positions` `[nframe, 2]` as the views read them at the object `pixel`,
+//! its start `object` and `probe` (`Ptycho::scale_obj_probe` of a flat object and the
+//! simulation's probe) and one group per LSQML run with probe variation, its `cost`,
 //! `batch_size` and `seed` as attributes: the start `eigenmodes`, `weights` and (`intensity`
 //! run) `intensity`, then for each epoch `e` of [`NEPOCH`] a group `epoch<e>` of the arrays it
-//! left and its steps, every batch's `frames`, `a_far`, `a_obj` and `a_probe` concatenated
-//! and `batch_len`.
+//! left (`object` `[nslice, nobj, nyo, nxo]`) and its steps, every batch's `frames`, `a_far`, `a_obj` (`[nslice, nframe]`) and
+//! `a_probe` concatenated and `batch_len`.
 
 use std::error::Error;
 use std::path::Path;
@@ -52,6 +53,17 @@ fn write_variation(g: &H5Group, var: &ProbeVariation) -> Result<(), Box<dyn Erro
         write(g, "intensity", &[c.len()], c)?;
     }
     Ok(())
+}
+
+/// `objects` as `[nslice, nobj, nyo, nxo]`.
+fn write_objects(g: &H5Group, name: &str, objects: &[Object]) -> Result<(), Box<dyn Error>> {
+    let data: Vec<Complex64> = objects
+        .iter()
+        .flat_map(|o| o.0.as_slice())
+        .map(|c| Complex64 { re: c.re, im: c.im })
+        .collect();
+    let [nobj, nyo, nxo] = objects[0].dims();
+    write(g, name, &[objects.len(), nobj, nyo, nxo], &data)
 }
 
 /// `√(mean |x|²)`.
@@ -124,6 +136,10 @@ fn opr(path: &Path) -> Result<(), Box<dyn Error>> {
     write(&root, "counts", &scan.counts.dims(), scan.counts.as_slice())?;
     write(&root, "y", &[nframe], &scan.positions.y)?;
     write(&root, "x", &[nframe], &scan.positions.x)?;
+    let at = scan.positions.pynx_preprocess(pixel);
+    let positions: Vec<f64> = at.y.iter().zip(&at.x).flat_map(|(y, x)| [*y, *x]).collect();
+    write(&root, "positions", &[nframe, 2], &positions)?;
+    write(&root, "pixel", &[2], &pixel)?;
     write_stack(&root, "object", &p.object().0)?;
     write_stack(&root, "probe", &p.probe().0)?;
 
@@ -155,7 +171,7 @@ fn opr(path: &Path) -> Result<(), Box<dyn Error>> {
                 &mut var,
             );
             let at = group.create_group(&format!("epoch{e}"))?;
-            write_stack(&at, "object", &object.0)?;
+            write_objects(&at, "object", slice::from_ref(&object))?;
             write_stack(&at, "probe", &probe.0)?;
             write_variation(&at, &var)?;
             let cat = |f: fn(&ptyrs::engine::LsqmlStep) -> &[f64]| -> Vec<f64> {
@@ -167,8 +183,10 @@ fn opr(path: &Path) -> Result<(), Box<dyn Error>> {
                 .collect();
             write(&at, "frames", &[nframe], &frames)?;
             write(&at, "a_far", &[nframe], &cat(|s| &s.a_far))?;
-            // the far-field model has one object slice
-            write(&at, "a_obj", &[nframe], &cat(|s| &s.a_obj[0]))?;
+            let a_obj: Vec<f64> = (0..optics.nslice())
+                .flat_map(|j| steps.iter().flat_map(move |s| s.a_obj[j].iter().copied()))
+                .collect();
+            write(&at, "a_obj", &[optics.nslice(), nframe], &a_obj)?;
             write(&at, "a_probe", &[nframe], &cat(|s| &s.a_probe))?;
             let len: Vec<u64> = steps.iter().map(|s| s.frames.len() as u64).collect();
             write(&at, "batch_len", &[len.len()], &len)?;

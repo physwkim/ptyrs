@@ -26,12 +26,12 @@ def test_bh_steps_match_cpu(scenario, batch, fused, moved, rho):
     d0 = drawn_offsets(npos) if moved else None
     state = ptyrs.Ptycho(scan, obj, probe)
     cpu = ptyrs.Bh(batch, 0.01, 7, position=d0, **rho)
-    o, p = obj, probe
+    o, p = obj[None], probe
     llk = []
     for nepoch in range(1, NEPOCH + 1):
-        o, p, want = cpu.epoch(state, o, p)
+        o, p, want = cpu.epoch(state.views, o, p)
         state.set_features(position=cpu.position)
-        llk.append(state.llk(o, p))
+        llk.append(state.llk(o[0], p))
         gpu = ptyrs.GpuPtycho(scan, obj, probe, DEVICE, stack_size=7, llk_slots=3, fused=fused)
         if moved:
             gpu.set_features(position=d0)
@@ -46,7 +46,7 @@ def test_bh_steps_match_cpu(scenario, batch, fused, moved, rho):
             # a CPU 0 (β in steepest descent) must be an exact GPU 0
             err = max(rel(g[key], w[key]) for g, w in zip(got, want))
             assert err < TOL, f"epoch {nepoch} {key}: {err:.2e}"
-        assert rel_l2(gpu.object, o) < TOL
+        assert rel_l2(gpu.object, o[0]) < TOL
         assert rel_l2(gpu.probe, p) < TOL
         if moved:
             err = np.abs(gpu.features["position"] - cpu.position).max()
@@ -63,7 +63,7 @@ def test_bh_position_rho_and_refusals(scenario):
     moved = []
     for rho in ({}, dict(position_rho=0.1), dict(position_rho=0.3)):
         bh = ptyrs.Bh(4, 0.01, 7, position=d0, **rho)
-        bh.epoch(state, obj, probe)
+        bh.epoch(state.views, obj[None], probe)
         moved.append(bh.position)
     assert (moved[0] == moved[1]).all() and not np.allclose(moved[0], moved[2])
     assert ptyrs.Bh(4, 0.01, 7).position is None
@@ -73,4 +73,4 @@ def test_bh_position_rho_and_refusals(scenario):
         ptyrs.Bh(4, 0.01, 7, position=np.full((npos, 2), np.inf))
     short = ptyrs.Bh(4, 0.01, 7, position=np.zeros((npos + 1, 2)))
     with pytest.raises(ValueError, match=f"{npos + 1} position offsets for {npos} frames"):
-        short.epoch(state, obj, probe)
+        short.epoch(state.views, obj[None], probe)
