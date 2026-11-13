@@ -7,13 +7,19 @@
 //! planned or not, and its halo grows as frames read new tiles, so a frame off the plan
 //! lands wherever one GPU would take it.
 
+use std::sync::Arc;
+
+use cuda_core::{Context, Stream};
+
 use crate::gpu::{ViewAddr, ViewDims, view_tiles};
 use crate::live::scan::ScanShape;
 
-use crate::dist::halo::{Halo, HaloRows, Window};
+use crate::dist::exchange::Pull;
+use crate::dist::halo::{Halo, HaloRows, LiveHaloBufs, Window};
 use crate::dist::{DEFAULT_TILE, DistError, NLEAF, Partition, Scheme, TileGrid};
 
 /// One GPU's part of a live scan.
+#[derive(Clone)]
 pub struct LiveRegion {
     /// The part of the object it holds: its own tiles and their partition halo, every tile a
     /// frame inside the object that touches one of its own can read.
@@ -27,6 +33,31 @@ pub struct LiveRegion {
     pub frames: Vec<u32>,
     /// Their views, offsets into its window: what its scan's backer plans.
     pub planned: Vec<ViewAddr>,
+    /// Words of its halo send and receive buffers: every tile of its partition halo, so the
+    /// buffers and pulls never change as frames read new tiles.
+    halo_words: [u64; 2],
+    /// The most halo rows it packs and unpacks over the whole scan, whatever frames land.
+    halo_rows: [u64; 2],
+}
+
+impl LiveRegion {
+    /// Its side of the halo exchange, for its window at `obj` on `stream`'s device, the row
+    /// lists backed `chunk` bytes at a time.
+    pub fn halo_bufs(
+        &self,
+        stream: &Arc<Stream>,
+        obj: u64,
+        chunk: usize,
+    ) -> Result<LiveHaloBufs, DistError> {
+        LiveHaloBufs::new(
+            stream,
+            self.halo_words,
+            self.halo_rows,
+            self.window,
+            obj,
+            chunk,
+        )
+    }
 }
 
 /// A live scan's split over GPUs, cut from its planned frames before the first one lands.
@@ -106,6 +137,11 @@ impl LivePlan {
                 frames[r].push(f as u32);
             }
         }
+        let halo = Halo::new(
+            &run,
+            run.regions().iter().map(|g| g.halo.as_slice()),
+            dims.nobj as usize,
+        );
         let mut regions = Vec::with_capacity(ngpu);
         for (r, g) in run.regions().iter().enumerate() {
             let frames = std::mem::take(&mut frames[r]);
@@ -136,13 +172,10 @@ impl LivePlan {
                 window,
                 frames,
                 planned,
+                halo_words: halo.words(r),
+                halo_rows: halo.max_rows(r),
             });
         }
-        let halo = Halo::new(
-            &run,
-            run.regions().iter().map(|g| g.halo.as_slice()),
-            dims.nobj as usize,
-        );
         Ok(Self {
             run,
             dims,
@@ -163,10 +196,21 @@ impl LivePlan {
         &self.run
     }
 
-    /// Words of region `r`'s halo send and receive buffers: every tile of its partition halo,
-    /// so the buffers and pulls never change as frames read new tiles.
+    /// Words of region `r`'s halo send and receive buffers.
     pub fn halo_words(&self, r: usize) -> [u64; 2] {
-        self.halo.words(r)
+        self.regions[r].halo_words
+    }
+
+    /// The copy-engine pulls into region `r`'s halo receive buffer at `recv` from the owners'
+    /// send buffers, `send(o)` giving owner `o`'s context and send buffer
+    /// ([`LiveHaloBufs::ptrs`]): the same for the whole scan.
+    pub fn halo_pulls(
+        &self,
+        r: usize,
+        recv: u64,
+        send: impl Fn(usize) -> (Arc<Context>, u64),
+    ) -> Vec<Pull> {
+        self.halo.pulls(r, self.regions.len(), recv, send)
     }
 
     /// Splits the arriving frames whose views are `views`, `nmode` per frame, in arrival
@@ -236,8 +280,12 @@ fn owners(owner: &[u32], tiles: &[usize], n: usize) -> Vec<usize> {
 mod tests {
     use super::*;
     use crate::base::{Positions, sim};
-    use crate::dist::halo::HaloRows;
+    use crate::dist::exchange::{self, Exchange, Run, Runs};
+    use crate::dist::halo::{HaloBacker, HaloRows};
+    use crate::dist::worker::{Workers, tests::gpus};
+    use crate::live::graph::{LiveGraph, WarmUp};
     use crate::live::recon::ViewPlacement;
+    use cuda_core::DeviceBuffer;
 
     const PIXEL: [f64; 2] = [1e-8, 1e-8];
 
@@ -635,6 +683,224 @@ mod tests {
         check_exchange(&plan, &rows, &read, "far");
         split_all(&mut plan, [both.as_slice()], &mut rows, &mut read);
         check_exchange(&plan, &rows, &read, "far, split again");
+    }
+
+    /// One region's GPU in [`gpus_exchange_the_halo_as_it_grows`]: its window, an epoch's
+    /// values over the window, the copies of its own tiles' pixel rows from those into the
+    /// window, its halo and the graphs packing and unpacking it.
+    struct OnGpu {
+        ex: Exchange,
+        win: DeviceBuffer<u64>,
+        stage: DeviceBuffer<u64>,
+        own: Runs,
+        halo: LiveHaloBufs,
+        graphs: [LiveGraph; 2],
+        pulls: Vec<Pull>,
+    }
+
+    /// What a region's GPU needs from the plan: its region and the `[window index, length]`
+    /// of each pixel row of its own tiles.
+    struct Setup {
+        region: LiveRegion,
+        own: Vec<[u64; 2]>,
+    }
+
+    /// The planned frames, then frames off the plan, split in batches on the host while graphs
+    /// captured once before the first frame exchange the halo on the GPUs at each epoch: each
+    /// batch's rows are listed on the GPUs, owners write new pixels, pack, every receiver pulls
+    /// its fixed segments and unpacks. After each epoch every GPU's window holds that epoch's
+    /// owner pixels in exactly the foreign tiles its frames read so far, and no capture is
+    /// redone; in some case frames off the plan read tiles the plan does not, from no halo at
+    /// all for two strips that read nothing of each other.
+    #[test]
+    fn gpus_exchange_the_halo_as_it_grows() {
+        let mut grew = 0;
+        for ngpu in [2, 4] {
+            let w = Workers::spawn(&gpus(ngpu), |_| Ok(None::<OnGpu>)).unwrap();
+            let mut all: Vec<_> = cases()
+                .into_iter()
+                .map(|(name, shape, views, scheme)| {
+                    let dims = shape.dims();
+                    let off = [[5, -9], [-13, 11], [0, 17]].map(|d| jittered(&dims, &views, d));
+                    (name, shape, views, off.concat(), scheme)
+                })
+                .collect();
+            if ngpu == 2 {
+                let (shape, both, mid) = far();
+                all.push(("far", shape, both, mid, Scheme::Strips));
+            }
+            for (name, shape, views, off, scheme) in all {
+                let what = format!("{name} on {ngpu}");
+                let dims = shape.dims();
+                let (nmode, nobj) = (dims.nmode as usize, dims.nobj as usize);
+                let mut plan = LivePlan::new(&shape, &views, scheme, ngpu).unwrap();
+                let (grid, owner) = (*plan.partition().grid(), plan.partition().owner().to_vec());
+                let ([nyo, nxo], tile) = (grid.obj(), grid.tile());
+                let setup: Vec<Setup> = (0..ngpu)
+                    .map(|r| {
+                        let window = plan.regions()[r].window;
+                        let mut own = Vec::new();
+                        for t in (0..grid.len()).filter(|&t| owner[t] as usize == r) {
+                            let [y0, x0] = grid.coords(t).map(|c| c * tile);
+                            let len = ((x0 + tile).min(nxo) - x0) as u64;
+                            for m in 0..nobj {
+                                for y in y0..(y0 + tile).min(nyo) {
+                                    own.push([window.index(m, y, x0) as u64, len]);
+                                }
+                            }
+                        }
+                        Setup {
+                            region: plan.regions()[r].clone(),
+                            own,
+                        }
+                    })
+                    .collect();
+                let setup = Arc::new(setup);
+                let sides = w
+                    .run(move |g, side| {
+                        let (st, at) = (g.stream().clone(), &setup[g.region()]);
+                        let len = at.region.window.len(nobj);
+                        let win = DeviceBuffer::<u64>::zeroed(&st, len)?;
+                        let stage = DeviceBuffer::<u64>::zeroed(&st, len)?;
+                        let own: Vec<Run> = at
+                            .own
+                            .iter()
+                            .map(|&[i, len]| Run {
+                                dst: win.cu_deviceptr() + 8 * i,
+                                src: stage.cu_deviceptr() + 8 * i,
+                                len,
+                            })
+                            .collect();
+                        let (ex, own) = (Exchange::load(g.ctx())?, Runs::new(&st, &own)?);
+                        let obj = win.cu_deviceptr();
+                        let halo = at.region.halo_bufs(&st, obj, 4096)?;
+                        // SAFETY: `win` holds the window at `obj` for as long as the graphs.
+                        let pack = LiveGraph::capture(&st, |c| unsafe {
+                            halo.pack(&ex, c, win.storage())
+                        })?;
+                        // SAFETY: as above; each epoch pulls before it replays this.
+                        let unpack = LiveGraph::capture(&st, |c| unsafe {
+                            halo.unpack(&ex, c, win.storage())
+                        })?;
+                        let out = (g.ctx().clone(), halo.ptrs(), halo.backer());
+                        *side = Some(OnGpu {
+                            ex,
+                            win,
+                            stage,
+                            own,
+                            halo,
+                            graphs: [pack, unpack],
+                            pulls: Vec::new(),
+                        });
+                        Ok(out)
+                    })
+                    .unwrap();
+                let warm = WarmUp::end();
+                let pulls: Vec<Vec<Pull>> = (0..ngpu)
+                    .map(|r| {
+                        plan.halo_pulls(r, sides[r].1[1], |o| (sides[o].0.clone(), sides[o].1[0]))
+                    })
+                    .collect();
+                let mut backers: Vec<HaloBacker> = sides.into_iter().map(|(_, _, b)| b).collect();
+                let pulls = Arc::new(pulls);
+                w.run(move |g, side| {
+                    side.as_mut().unwrap().pulls = pulls[g.region()].clone();
+                    Ok(())
+                })
+                .unwrap();
+
+                let value = |k: usize, m: usize, y: usize, x: usize| {
+                    (((k * nobj + m) * nyo + y) * nxo + x + 1) as u64
+                };
+                let mut read = vec![vec![false; grid.len()]; ngpu];
+                let mut listed = vec![[0; 2]; ngpu];
+                let mut shares = vec![Share::default(); ngpu];
+                let planned = views.chunks(7 * nmode).count();
+                for (k, batch) in views
+                    .chunks(7 * nmode)
+                    .chain(off.chunks(5 * nmode))
+                    .enumerate()
+                {
+                    plan.split(batch, &mut shares).unwrap();
+                    for (r, (s, g)) in shares.iter().zip(plan.regions()).enumerate() {
+                        backers[r].back(&s.halo).unwrap();
+                        listed[r][0] += s.halo.pack.len();
+                        listed[r][1] += s.halo.unpack.len();
+                        if k >= planned && !s.halo.unpack.is_empty() {
+                            grew += 1;
+                        }
+                        let (ld, at) = (g.shape.dims(), g.window.at.map(|p| p / tile));
+                        for v in s.views.chunks(nmode) {
+                            for t in tiles_of(&ld, v, grid.dims()[1], at) {
+                                read[r][t] |= owner[t] as usize != r;
+                            }
+                        }
+                    }
+                    let rows: Vec<HaloRows> = shares.iter().map(|s| s.halo.clone()).collect();
+                    let stage: Vec<Vec<u64>> = plan
+                        .regions()
+                        .iter()
+                        .map(|g| {
+                            let mut v = vec![0; g.window.len(nobj)];
+                            for m in 0..nobj {
+                                for y in g.window.at[0]..g.window.at[0] + g.window.shape[0] {
+                                    for x in g.window.at[1]..g.window.at[1] + g.window.shape[1] {
+                                        v[g.window.index(m, y, x)] = value(k, m, y, x);
+                                    }
+                                }
+                            }
+                            v
+                        })
+                        .collect();
+                    let (rows, stage) = (Arc::new(rows), Arc::new(stage));
+                    let got = w
+                        .run(move |g, side| {
+                            let (st, r) = (g.stream().clone(), g.region());
+                            let s = side.as_mut().unwrap();
+                            s.halo.push(&rows[r])?;
+                            s.stage.copy_from_host(&st, &stage[r])?;
+                            // SAFETY: own pixel rows from the staged values into the window,
+                            // which no peer reads before the fence below.
+                            unsafe { s.ex.copy_runs(&st, &s.own) }?;
+                            s.graphs[0].replay()?;
+                            g.fence()?;
+                            // SAFETY: the owners packed before the fence and pack again only
+                            // after the next one; the receive buffer is this GPU's alone.
+                            unsafe { exchange::pull(&st, &s.pulls) }?;
+                            s.graphs[1].replay()?;
+                            g.fence()?;
+                            Ok((s.win.to_host_vec(&st)?, s.halo.rows()))
+                        })
+                        .unwrap();
+                    for (r, ((win, rows), g)) in got.iter().zip(plan.regions()).enumerate() {
+                        let what = format!("{what}, epoch {k}: region {r}");
+                        assert_eq!(*rows, listed[r], "{what}");
+                        let max = g.halo_rows;
+                        assert!(
+                            rows[0] as u64 <= max[0] && rows[1] as u64 <= max[1],
+                            "{what}"
+                        );
+                        let w = g.window;
+                        for m in 0..nobj {
+                            for y in w.at[0]..w.at[0] + w.shape[0] {
+                                for x in w.at[1]..w.at[1] + w.shape[1] {
+                                    let t = grid.of_pixel(y, x);
+                                    let want = if owner[t] as usize == r || read[r][t] {
+                                        value(k, m, y, x)
+                                    } else {
+                                        0
+                                    };
+                                    let got = win[w.index(m, y, x)];
+                                    assert_eq!(got, want, "{what}: mode {m} pixel {y} {x}");
+                                }
+                            }
+                        }
+                    }
+                }
+                assert_eq!(warm.recaptures(), 0, "{what}");
+            }
+        }
+        assert!(grew > 0, "no frame off the plan read a new tile");
     }
 
     /// A frame off the object is refused, with the frames before it and the halo rows they

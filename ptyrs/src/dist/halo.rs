@@ -7,9 +7,11 @@ use std::sync::Arc;
 
 use crate::base::View;
 use crate::gpu::{C32, ViewAddr};
-use cuda_core::{Context, DeviceBuffer, Stream};
+use crate::live::grow::{Backer, GrowError};
+use cuda_async::device_operation::ExecutionContext;
+use cuda_core::{Context, DeviceBuffer, RawDeviceBuffer, Stream};
 
-use crate::dist::exchange::{Pull, Run, Runs};
+use crate::dist::exchange::{Exchange, Pull, Run, RunList, Runs};
 use crate::dist::{DistError, Partition, TileGrid};
 
 /// The part of the object a region's GPU holds: the bounding box of its own tiles and the
@@ -175,6 +177,20 @@ impl AsMut<HaloRows> for HaloRows {
     }
 }
 
+impl HaloRows {
+    /// The pack and unpack copies of these rows for the window `win` at `obj` and the halo
+    /// buffers at `send` and `recv`.
+    fn runs(&self, win: Window, obj: u64, [send, recv]: [u64; 2]) -> [Vec<Run>; 2] {
+        [
+            self.pack.iter().map(|w| w.pack(win, obj, send)).collect(),
+            self.unpack
+                .iter()
+                .map(|w| w.unpack(win, obj, recv))
+                .collect(),
+        ]
+    }
+}
+
 /// Consecutive tiles of tile row `ty` from `tx0` on, one owner's, that a receiver may read; per
 /// object mode, their pixel rows sit from word `at` of the mode's part of the segment, `width`
 /// words each.
@@ -195,6 +211,8 @@ struct HaloSeg {
     /// Words per object mode.
     mode_words: u64,
     words: u64,
+    /// Rows [`Halo::read`] adds at most: one per tile, object mode and pixel row.
+    max_rows: u64,
     send_at: u64,
     recv_at: u64,
 }
@@ -240,6 +258,7 @@ impl Halo {
         for (r, tiles) in may.into_iter().enumerate() {
             let mut runs: Vec<Vec<TileRun>> = (0..n).map(|_| Vec::new()).collect();
             let mut at = vec![0; n];
+            let mut rows = vec![0; n];
             let mut members = Vec::with_capacity(tiles.len());
             let mut i = 0;
             while i < tiles.len() {
@@ -266,6 +285,7 @@ impl Halo {
                     at: at[o],
                 });
                 at[o] += height * width;
+                rows[o] += height * (tx1 - tx0 + 1) as u64;
             }
             let mut seg_of = vec![u32::MAX; n];
             let mut recv_at = 0;
@@ -281,6 +301,7 @@ impl Halo {
                     runs,
                     mode_words: at[o],
                     words,
+                    max_rows: nobj as u64 * rows[o],
                     send_at: send_at[o],
                     recv_at,
                 });
@@ -310,10 +331,21 @@ impl Halo {
 
     /// Words of region `r`'s halo send and receive buffers.
     pub(crate) fn words(&self, r: usize) -> [u64; 2] {
-        let sum = |f: &dyn Fn(&HaloSeg) -> bool| -> u64 {
-            self.segs.iter().filter(|s| f(s)).map(|s| s.words).sum()
+        self.sides(r, |s| s.words)
+    }
+
+    /// The most pack and unpack rows [`Self::read`] adds for region `r` over a whole scan,
+    /// reached when each call reads a single new tile of a segment.
+    pub(crate) fn max_rows(&self, r: usize) -> [u64; 2] {
+        self.sides(r, |s| s.max_rows)
+    }
+
+    /// `f` summed over the segments region `r` owns and over those it receives.
+    fn sides(&self, r: usize, f: impl Fn(&HaloSeg) -> u64) -> [u64; 2] {
+        let sum = |side: fn(&HaloSeg) -> usize| -> u64 {
+            self.segs.iter().filter(|s| side(s) == r).map(&f).sum()
         };
-        [sum(&|s| s.owner == r), sum(&|s| s.recv == r)]
+        [sum(|s| s.owner), sum(|s| s.recv)]
     }
 
     /// Region `r` reads the tiles `tiles` from now on: for each foreign one it did
@@ -439,23 +471,144 @@ impl HaloBufs {
             .words(r)
             .map(|w| DeviceBuffer::<u64>::zeroed(stream, (w as usize).max(1)));
         let (send, recv) = (send?, recv?);
-        let (at_send, at_recv) = (send.cu_deviceptr(), recv.cu_deviceptr());
-        let pack: Vec<Run> = rows
-            .pack
-            .iter()
-            .map(|w| w.pack(win, obj, at_send))
-            .collect();
-        let unpack: Vec<Run> = rows
-            .unpack
-            .iter()
-            .map(|w| w.unpack(win, obj, at_recv))
-            .collect();
+        let [pack, unpack] = rows.runs(win, obj, [send.cu_deviceptr(), recv.cu_deviceptr()]);
         Ok(Self {
             pack: Runs::new(stream, &pack)?,
             unpack: Runs::new(stream, &unpack)?,
             send,
             recv,
         })
+    }
+}
+
+/// A region's side of the halo exchange as the halo grows (DESIGN B6, invariant 9): its send
+/// and receive buffers hold every tile it may read or be read of, so the pulls between them
+/// never change, and its pack and unpack rows are listed in device memory, so graphs captured
+/// once over [`Self::pack`] and [`Self::unpack`] copy, at each replay, every row pushed before.
+pub struct LiveHaloBufs {
+    send: DeviceBuffer<u64>,
+    recv: DeviceBuffer<u64>,
+    pack: RunList,
+    unpack: RunList,
+    win: Window,
+    obj: u64,
+}
+
+impl LiveHaloBufs {
+    /// Buffers of `words` send and receive words and lists of `max_rows` pack and unpack rows,
+    /// a region's [`Halo::words`] and [`Halo::max_rows`], backed `chunk` bytes at a time, for
+    /// its window `win` at `obj` on `stream`'s device; rows are pushed on `stream`.
+    pub(crate) fn new(
+        stream: &Arc<Stream>,
+        words: [u64; 2],
+        max_rows: [u64; 2],
+        win: Window,
+        obj: u64,
+        chunk: usize,
+    ) -> Result<Self, DistError> {
+        let [send, recv] = words.map(|w| DeviceBuffer::zeroed(stream, (w as usize).max(1)));
+        let [pack, unpack] = max_rows.map(|n| RunList::new(stream, (n as usize).max(1), chunk));
+        Ok(Self {
+            send: send?,
+            recv: recv?,
+            pack: pack?,
+            unpack: unpack?,
+            win,
+            obj,
+        })
+    }
+
+    /// Backs the rows pushed from now on, from any thread.
+    pub fn backer(&self) -> HaloBacker {
+        HaloBacker {
+            lists: [self.pack.backer(), self.unpack.backer()],
+            next: [self.pack.len(), self.unpack.len()],
+        }
+    }
+
+    /// Device addresses of the send and receive buffers, for
+    /// [`LivePlan::halo_pulls`](crate::dist::LivePlan::halo_pulls).
+    pub fn ptrs(&self) -> [u64; 2] {
+        [self.send.cu_deviceptr(), self.recv.cu_deviceptr()]
+    }
+
+    /// Rows listed so far: `[pack, unpack]`.
+    pub fn rows(&self) -> [usize; 2] {
+        [self.pack.len(), self.unpack.len()]
+    }
+
+    /// Lists `rows`, which a [`HaloBacker`] backed: launches queued on the stream afterwards
+    /// copy them too.
+    pub fn push(&mut self, rows: &HaloRows) -> Result<(), DistError> {
+        let [pack, unpack] = rows.runs(self.win, self.obj, self.ptrs());
+        self.pack.push(&pack)?;
+        self.unpack.push(&unpack)
+    }
+
+    /// Copies every row listed when it runs from the window into the send buffer, on `ctx`'s
+    /// stream.
+    ///
+    /// # Safety
+    /// `obj` must be the storage holding the window at the address [`Self::new`] took, on
+    /// `ctx`'s device, and no peer may pull the send buffer meanwhile
+    /// ([`crate::dist::Gpu::fence`]).
+    pub unsafe fn pack(
+        &self,
+        ex: &Exchange,
+        ctx: &ExecutionContext,
+        obj: &RawDeviceBuffer,
+    ) -> Result<(), crate::gpu::Error> {
+        let [runs, count] = self.pack.storages();
+        crate::gpu::lease(ctx, &[runs, count, obj], &[self.send.storage()])?;
+        // SAFETY: each row reads its own pixels of the window and writes its own words of the
+        // send buffer, both laid out by the halo; the caller keeps the window.
+        unsafe { ex.copy_listed(ctx.get_cuda_stream(), &self.pack) }?;
+        Ok(())
+    }
+
+    /// Copies every row listed when it runs from the receive buffer into the window, on
+    /// `ctx`'s stream.
+    ///
+    /// # Safety
+    /// As [`Self::pack`]; the pulls into the receive buffer must be queued before it on the
+    /// stream.
+    pub unsafe fn unpack(
+        &self,
+        ex: &Exchange,
+        ctx: &ExecutionContext,
+        obj: &RawDeviceBuffer,
+    ) -> Result<(), crate::gpu::Error> {
+        let [runs, count] = self.unpack.storages();
+        crate::gpu::lease(ctx, &[runs, count, self.recv.storage()], &[obj])?;
+        // SAFETY: each row reads its own words of the receive buffer and writes its own
+        // foreign pixels of the window, both laid out by the halo; the caller keeps the window.
+        unsafe { ex.copy_listed(ctx.get_cuda_stream(), &self.unpack) }?;
+        Ok(())
+    }
+}
+
+/// Backs a region's halo row lists on any thread, ahead of [`LiveHaloBufs::push`]: rows are
+/// listed in push order, so backing each batch's rows here before pushing them backs every
+/// row listed.
+pub struct HaloBacker {
+    lists: [Backer; 2],
+    /// Pack and unpack rows backed so far.
+    next: [usize; 2],
+}
+
+impl HaloBacker {
+    /// Backs what pushing `rows` after the rows backed so far needs.
+    pub fn back(&mut self, rows: &HaloRows) -> Result<(), GrowError> {
+        let sz = size_of::<Run>();
+        let end = [
+            self.next[0] + rows.pack.len(),
+            self.next[1] + rows.unpack.len(),
+        ];
+        for ((list, next), end) in self.lists.iter().zip(self.next).zip(end) {
+            list.back(next * sz..end * sz)?;
+        }
+        self.next = end;
+        Ok(())
     }
 }
 
@@ -530,6 +683,78 @@ mod tests {
                     assert!(got.iter().map(|p| p[0]).eq(0..words), "region {r}");
                 }
             }
+        }
+    }
+
+    /// Read one tile per call, every tile of every region's halo adds rows up to exactly
+    /// [`Halo::max_rows`]; read all at once, fewer.
+    #[test]
+    fn a_tile_per_read_reaches_max_rows() {
+        let count = |w: &HaloRows| [w.pack.len() as u64, w.unpack.len() as u64];
+        let mut fewer = false;
+        for run in runs() {
+            let n = run.nregion();
+            let (mut apart, mut once) =
+                (Halo::new(&run, may(&run), 2), Halo::new(&run, may(&run), 2));
+            let mut by_tile = vec![HaloRows::default(); n];
+            let mut at_once = vec![HaloRows::default(); n];
+            for (r, g) in run.regions().iter().enumerate() {
+                for &t in &g.halo {
+                    apart.read(r, [t as usize], &mut by_tile);
+                }
+                once.read(r, g.halo.iter().map(|&t| t as usize), &mut at_once);
+            }
+            for r in 0..n {
+                assert_eq!(count(&by_tile[r]), apart.max_rows(r), "region {r}");
+                let [got, max] = [count(&at_once[r]), once.max_rows(r)];
+                assert!(got[0] <= max[0] && got[1] <= max[1], "region {r}");
+                fewer |= got != max;
+            }
+        }
+        assert!(fewer, "no read merged tiles into one row");
+    }
+
+    /// Rows backed by a [`HaloBacker`] batch by batch push, across several chunks of the row
+    /// lists (7.2 MB each); a row no backer reached is refused.
+    #[test]
+    fn a_backer_backs_each_batch_before_its_push() {
+        let ctx = Context::new(0).unwrap();
+        let s = ctx.new_stream().unwrap();
+        let win = Window {
+            at: [32, 16],
+            shape: [64, 48],
+        };
+        let obj = DeviceBuffer::<u64>::zeroed(&s, win.len(1)).unwrap();
+        let total = 300_000;
+        let words = [total as u64; 2];
+        let mut bufs = LiveHaloBufs::new(&s, words, words, win, obj.cu_deviceptr(), 4096).unwrap();
+        let row = |i: usize| HaloRow {
+            m: 0,
+            y: (32 + i % 64) as u32,
+            x: (16 + i / 64 % 48) as u32,
+            len: 1,
+            word: i as u64,
+        };
+        let batch = |r: std::ops::Range<usize>| {
+            let rows: Vec<HaloRow> = r.map(row).collect();
+            HaloRows {
+                pack: rows.clone(),
+                unpack: rows,
+            }
+        };
+        let err = bufs.push(&batch(0..1)).unwrap_err();
+        assert!(
+            matches!(err, DistError::Grow(GrowError::Unbacked { .. })),
+            "{err}"
+        );
+        let mut backer = bufs.backer();
+        let (mut n, mut sizes) = (0, [1, 7, 5000, 33, 90_000, 2, 100_000, 999].iter().cycle());
+        while n < total {
+            let rows = batch(n..(n + sizes.next().unwrap()).min(total));
+            backer.back(&rows).unwrap();
+            bufs.push(&rows).unwrap();
+            n += rows.pack.len();
+            assert_eq!(bufs.rows(), [n; 2]);
         }
     }
 
