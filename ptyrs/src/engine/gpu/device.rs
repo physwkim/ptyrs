@@ -29,8 +29,8 @@ use super::lsqml::{LsqmlBufs, LsqmlState, Pre};
 use super::ml::MlMoved;
 use super::rpie::RpieMoved;
 use super::{
-    Cut, Epoch, Frames, GpuOptions, StackRule, Tag, batch_stacks, plane_bytes, plane_len, to_u32,
-    wave_bytes,
+    Cut, Epoch, Frames, GpuOptions, StackRule, Streamed, Tag, batch_stacks, plane_bytes, plane_len,
+    to_u32, wave_bytes,
 };
 use crate::engine::features::{POSITION_LIMIT, POSITION_STEP};
 use crate::engine::{
@@ -489,11 +489,12 @@ pub(super) struct M1Bufs<'a> {
 
 /// The [`Passes`] every algorithm shares, the stacks of the passes that stream their scratch
 /// alone, and the LLK buffers those passes fill, built together, so the scratch and the LLK
-/// buffers hold the longest of those stacks. Every other pass that touches the scratch
-/// counts its bytes, so its own stacks are no longer.
+/// buffers hold the longest of those stacks. DM's and RAAR's stacks count the scratch's
+/// buffers with their own, and the position model's BH and LSQML stacks, whose sums borrow its
+/// shift planes, are capped at its stacks, so no stack that touches it is longer.
 struct Shared {
-    /// Bytes per frame of the scratch.
-    bytes: usize,
+    /// The scratch's buffers.
+    streamed: Vec<Streamed>,
     /// AP's, the LLK pass's, ML's gradient's and opening scale's stacks.
     cut: Cut,
     passes: Passes,
@@ -513,11 +514,14 @@ impl Shared {
         fused: bool,
         shift: bool,
     ) -> Result<Self, EngineError> {
-        let bytes = match fused {
-            true => FusedBufs::frame_bytes(dims, shift),
-            false => wave_bytes(dims),
-        };
-        let cut = rule.cut(stream, dims, bytes)?;
+        // M1's scratch: `obj_probe_to_psi`, the transforms and `apply_amplitude`; the fused
+        // work planes: the row, column and inverse row passes; each shift plane: the pass that
+        // writes it and a later one.
+        let mut streamed = vec![Streamed::new(wave_bytes(dims), if fused { 3 } else { 4 })];
+        if shift {
+            streamed.push(Streamed::new(FusedBufs::shift_bytes(dims), 2));
+        }
+        let cut = rule.cut(stream, dims, &streamed)?;
         let nf_max = cut.table.nf_max();
         let passes = if fused {
             let f = match shift {
@@ -539,7 +543,7 @@ impl Shared {
             }
         };
         Ok(Self {
-            bytes,
+            streamed,
             llk: DeviceBuffer::zeroed(stream, nf_max as usize)?,
             llk_scratch: LlkScratch::new(stream, dims, nf_max)?,
             cut,
@@ -549,8 +553,9 @@ impl Shared {
 }
 
 /// DM's or RAAR's stacks and the exit waves each carries across cycles, with RAAR's iterate,
-/// cut by the bytes a cycle streams per frame: the carried sets and the shared scratch. Cycle
-/// 0 of a call overwrites both sets, so nothing is carried from one call to the next.
+/// cut by the carried exit waves and the shared scratch; the iterate, which one pass reads and
+/// writes, does not count. Cycle 0 of a call overwrites both sets, so nothing is carried from
+/// one call to the next.
 struct CarriedBufs {
     cut: Cut,
     /// M1's plans, one per stack length of `cut`; none for the fused passes.
@@ -570,8 +575,15 @@ impl CarriedBufs {
         shared: &Shared,
         raar: bool,
     ) -> Result<Self, EngineError> {
-        let sets = 1 + usize::from(raar);
-        let cut = rule.cut(stream, dims, sets * wave_bytes(dims) + shared.bytes)?;
+        // The exit waves: read by the forward pass, written by the inverse one (M1: also
+        // `dm_reflect`, `add_c32`); the iterate: the forward row pass (M1: `raar_iterate`).
+        let wave = wave_bytes(dims);
+        let mut streamed = shared.streamed.clone();
+        streamed.push(Streamed::new(wave, 2));
+        if raar {
+            streamed.push(Streamed::new(wave, 1));
+        }
+        let cut = rule.cut(stream, dims, &streamed)?;
         let plans = match shared.passes {
             Passes::M1 { .. } => cut.plans(stream, dims)?,
             Passes::Fused(_) => Vec::new(),
@@ -748,13 +760,14 @@ impl MlState {
         lens: [usize; 2],
         moved: bool,
     ) -> Result<Self, EngineError> {
-        // The fields po, a, b, and under the position the moved probes of P and dP.
-        let probes = 2 * plane_bytes::<C32>(dims, dims.nprobe);
-        let cut = rule.cut(
-            stream,
-            dims,
-            3 * wave_bytes(dims) + usize::from(moved) * probes,
-        )?;
+        // The fields po, a, b: `gamma_fields`, the transform, `gamma_frames`; under the
+        // position the moved probes of P and dP: `shifted_rows_fwd`, `shift_w`,
+        // `obj_wave_to_psi`.
+        let mut streamed = vec![Streamed::new(3 * wave_bytes(dims), 3)];
+        if moved {
+            streamed.push(Streamed::new(2 * plane_bytes::<C32>(dims, dims.nprobe), 3));
+        }
+        let cut = rule.cut(stream, dims, &streamed)?;
         let zeroed = |len| DeviceBuffer::<C32>::zeroed(stream, len);
         let pair = || DeviceBuffer::<f32>::zeroed(stream, 2);
         Ok(Self {
@@ -858,9 +871,10 @@ pub(super) struct BhBufs<'a> {
 }
 
 impl BhState {
-    /// For `views` in batches of `size` frames, each cut into stacks by `rule`, arrays of
-    /// `lens = [object, probe]` values and with `moved` the position model; the epoch order
-    /// is the scan's.
+    /// For `views` in batches of `size` frames, each cut into stacks by `rule`, and arrays of
+    /// `lens = [object, probe]` values; under the position model, `scratch` holds the frames
+    /// per stack of the shared scratch, whose shift planes its sums borrow, which caps its
+    /// stacks. The epoch order is the scan's.
     fn new(
         stream: &Arc<CudaStream>,
         kernels: &Kernels,
@@ -868,16 +882,25 @@ impl BhState {
         size: u32,
         rule: StackRule,
         lens: [usize; 2],
-        moved: bool,
+        scratch: Option<u32>,
     ) -> Result<Self, EngineError> {
         let dims = views.dims();
-        // psi, r, lu, lv; under the position also y, the moved probes and the shifted sums'
-        // scratch.
+        // psi, r, lu, lv, each written by one pass and transformed or read by later ones;
+        // under the position also y (`obj_conj`, the transform, `pos_grad`), the moved probes
+        // (`shifted_rows_fwd`, `shift_w`, `obj_wave_to_psi`) and the shift planes of the
+        // shared scratch, which `shifted_psi_sums` writes and reads.
         let wave = wave_bytes(dims);
-        let shift =
-            wave + plane_bytes::<C32>(dims, dims.nprobe) + FusedBufs::frame_bytes(dims, true);
-        let bytes = 4 * wave + usize::from(moved) * shift;
-        let (cut, batches) = batch_stacks(stream, dims, size, rule.frames(bytes)?)?;
+        let mut streamed = vec![Streamed::new(4 * wave, 3)];
+        if scratch.is_some() {
+            streamed.extend([
+                Streamed::new(wave, 3),
+                Streamed::new(plane_bytes::<C32>(dims, dims.nprobe), 3),
+                Streamed::new(FusedBufs::shift_bytes(dims), 2),
+            ]);
+        }
+        let frames = rule.frames(&streamed)?;
+        let frames = scratch.map_or(frames, |s| frames.min(s));
+        let (cut, batches) = batch_stacks(stream, dims, size, frames)?;
         let len = cut.wave_len(dims);
         let plans = cut.plans(stream, dims)?;
         let Cut {
@@ -887,7 +910,7 @@ impl BhState {
         } = cut;
         let slots = batches.iter().map(|b| b.len()).max().unwrap_or(0);
         let zeroed = |len| DeviceBuffer::<C32>::zeroed(stream, len);
-        let moved = moved
+        let moved = (scratch.is_some())
             .then(|| BhMoved::new(stream, kernels, dims, table.nf_max(), slots, len))
             .transpose()?;
         Ok(Self {
@@ -1582,7 +1605,7 @@ impl Device {
                 size,
                 self.rule,
                 lens,
-                moved,
+                moved.then(|| self.shared.cut.table.nf_max()),
             )?;
             self.bh_state = Some(Box::new(state));
         }
@@ -1604,7 +1627,7 @@ impl Device {
                 &self.views,
                 size,
                 self.rule,
-                moved,
+                moved.then(|| self.shared.cut.table.nf_max()),
             )?;
             self.lsqml = Some(Box::new(state));
         }

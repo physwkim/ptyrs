@@ -17,7 +17,8 @@ use cuda_core::{CudaStream, DeviceBuffer};
 
 use super::device::{Moved, MovedLent, PassesMut, moved_inputs, moved_shift};
 use super::{
-    Bufs, Cut, Frames, GpuPtycho, StackRule, batch_stacks, plane_bytes, plane_len, wave_bytes,
+    Bufs, Cut, Frames, GpuPtycho, StackRule, Streamed, batch_stacks, plane_bytes, plane_len,
+    wave_bytes,
 };
 use crate::engine::features::{POSITION_LIMIT, POSITION_STEP};
 use crate::engine::ptycho::{Algorithm, llk_due};
@@ -124,21 +125,35 @@ pub(super) struct LsqmlBufs<'a> {
 }
 
 impl LsqmlState {
-    /// For `views` in batches of `size` frames, each cut into stacks by `rule`, `moved` under
-    /// the position model; the epoch order is the scan's.
+    /// For `views` in batches of `size` frames, each cut into stacks by `rule`; under the
+    /// position model, `scratch` holds the frames per stack of the shared scratch, whose shift
+    /// planes its sums borrow, which caps its stacks. The epoch order is the scan's.
     pub(super) fn new(
         stream: &Arc<CudaStream>,
         kernels: &Kernels,
         views: &Views,
         size: u32,
         rule: StackRule,
-        moved: bool,
+        scratch: Option<u32>,
     ) -> Result<Self, EngineError> {
         let dims = views.dims();
-        // work, icalc; under the position also the moved probes and the shifted sums' scratch.
-        let shift = plane_bytes::<C32>(dims, dims.nprobe) + FusedBufs::frame_bytes(dims, true);
-        let bytes = wave_bytes(dims) + plane_bytes::<f32>(dims, 1) + usize::from(moved) * shift;
-        let (cut, batches) = batch_stacks(stream, dims, size, rule.frames(bytes)?)?;
+        // work: the forward pass, `chi`, the update sums, `dots`; icalc: `icalc` and `far`;
+        // under the position also the moved probes (`shifted_rows_fwd`, `shift_w`, `dots`)
+        // and the shift planes of the shared scratch, which `shifted_psi_sums` writes and
+        // reads.
+        let mut streamed = vec![
+            Streamed::new(wave_bytes(dims), 3),
+            Streamed::new(plane_bytes::<f32>(dims, 1), 2),
+        ];
+        if scratch.is_some() {
+            streamed.extend([
+                Streamed::new(plane_bytes::<C32>(dims, dims.nprobe), 3),
+                Streamed::new(FusedBufs::shift_bytes(dims), 2),
+            ]);
+        }
+        let frames = rule.frames(&streamed)?;
+        let frames = scratch.map_or(frames, |s| frames.min(s));
+        let (cut, batches) = batch_stacks(stream, dims, size, frames)?;
         let len = cut.wave_len(dims);
         let Cut {
             frames: stacks,
@@ -153,9 +168,9 @@ impl LsqmlState {
                 .map(|_| DeviceBuffer::zeroed(stream, len))
                 .collect::<Result<_, _>>()?)
         };
-        let moved = match moved {
-            true => Some(Moved::new(stream, kernels, dims, nf_max, slots)?),
-            false => None,
+        let moved = match scratch {
+            Some(_) => Some(Moved::new(stream, kernels, dims, nf_max, slots)?),
+            None => None,
         };
         Ok(Self {
             kernels: LsqmlKernels::load(kernels)?,

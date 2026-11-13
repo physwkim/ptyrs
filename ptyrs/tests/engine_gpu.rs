@@ -1598,8 +1598,8 @@ fn position_is_bit_identical_across_stack_splits() {
 }
 
 /// On a 64 MiB L2 the default stack size cuts 30 frames of 256x256 with two probe modes by
-/// the bytes each pass streams per frame under a position: 6 for the fused passes, 5 for DM,
-/// 4 for RAAR, ML's line search and LSQML, 2 for BH. AP, DM, RAAR and ML cycles modelling a
+/// the bytes each pass streams per frame under a position: 6 for the fused passes, 5 for DM
+/// and RAAR, 4 for ML's line search and LSQML, 2 for BH. AP, DM, RAAR and ML cycles modelling a
 /// scale and a position, and BH then LSQML epochs of every frame modelling a position, give
 /// the bits of stacks of 7 for all.
 #[test]

@@ -58,11 +58,12 @@ pub struct GpuOptions {
     /// batches are its own, and at most this many for BH and LSQML, which cut each batch into
     /// as few stacks as that takes, of lengths within a frame of each other; PyNX's default
     /// is 16. `None`, the default, cuts each pass by bytes instead: as many frames as fill 3/8
-    /// of the device's L2, the fastest share at frame sides 256 and 512, with every per-stack
-    /// buffer the pass touches. That is the shared scratch alone in AP, the LLK pass and ML's
-    /// gradient, and with it DM's carried exit waves, RAAR's and its iterate; ML's line
-    /// search, BH and LSQML count their own buffers, and under the position model the shared
-    /// scratch they shift through.
+    /// of the device's L2, the fastest share at frame sides 256 and 512, with the buffers that
+    /// more than one launch over a stack touches, which stay in L2 between them. That is the
+    /// shared scratch alone in AP, the LLK pass and ML's gradient, and with it DM's and RAAR's
+    /// carried exit waves (RAAR's iterate, touched once, streams); ML's line search, BH and
+    /// LSQML count their own buffers, and under the position model BH and LSQML the shift
+    /// planes they borrow from the shared scratch, whose stacks also cap theirs.
     pub stack_size: Option<usize>,
     /// Replay every AP, DM and ML cycle, rPIE epoch and LLK pass from a CUDA graph captured once
     /// per kind of cycle instead of launching it kernel by kernel; both give the same bits.
@@ -297,9 +298,24 @@ fn table_of(
     Ok((frames, table))
 }
 
-/// [`GpuOptions::stack_size`] on one device: a pass's frames per stack from the bytes it
-/// streams per frame. A pass counts every per-stack buffer it touches in full, so its stacks
-/// are never longer than the cut that buffer was sized for.
+/// A per-frame buffer of a loop over stacks: its bytes per frame and how many of the passes
+/// over one stack (launches) of the loop's cycle touch it.
+#[derive(Clone, Copy, Debug)]
+struct Streamed {
+    bytes: usize,
+    passes: u32,
+}
+
+impl Streamed {
+    fn new(bytes: usize, passes: u32) -> Self {
+        Self { bytes, passes }
+    }
+}
+
+/// [`GpuOptions::stack_size`] on one device: a loop's frames per stack from the buffers its
+/// passes stream. Stacking keeps the buffers a stack's passes share in L2 from one pass to the
+/// next, so only the bytes per frame of buffers more than one pass touches fill the budget; a
+/// buffer one pass touches streams through either way.
 #[derive(Clone, Copy, Debug)]
 struct StackRule {
     size: Option<usize>,
@@ -316,23 +332,26 @@ impl StackRule {
         }
     }
 
-    /// Frames per stack of a pass that streams `frame_bytes` per frame: the given size, else
-    /// as many as fit the budget, at least one.
-    fn frames(self, frame_bytes: usize) -> Result<u32, EngineError> {
+    /// Frames per stack of a loop over `bufs`: the given size, else as many frames of the
+    /// shared buffers as fit the budget, at least one.
+    fn frames(self, bufs: &[Streamed]) -> Result<u32, EngineError> {
+        let shared: usize = (bufs.iter().filter(|b| b.passes > 1))
+            .map(|b| b.bytes)
+            .sum();
         let n = self
             .size
-            .unwrap_or_else(|| (self.budget / frame_bytes).max(1));
+            .unwrap_or_else(|| (self.budget / shared.max(1)).max(1));
         to_u32("stack_size", n)
     }
 
-    /// `0 .. nframe` in stacks of [`Self::frames`] for `frame_bytes`.
+    /// `0 .. nframe` in stacks of [`Self::frames`] for `bufs`.
     fn cut(
         self,
         stream: &Arc<CudaStream>,
         dims: &ViewDims,
-        frame_bytes: usize,
+        bufs: &[Streamed],
     ) -> Result<Cut, EngineError> {
-        Cut::new(stream, dims, self.frames(frame_bytes)?)
+        Cut::new(stream, dims, self.frames(bufs)?)
     }
 }
 
@@ -831,21 +850,27 @@ mod tests {
         assert_eq!(lens(3..8, 8), [5]);
     }
 
-    /// 24 MiB of a 64 MiB L2 holds 24, 12, 8 and 6 frames of one to four two-mode exit-wave
-    /// sets at 256x256, 6, 3, 2 and 1 at 512x512, 16 of one and a half sets (a carried set
-    /// stored at half width), and one when a frame alone overfills it; a given size wins.
+    /// 24 MiB of a 64 MiB L2 holds 24, 12, 8 and 6 frames of one to four shared two-mode
+    /// exit-wave sets at 256x256, 6, 3, 2 and 1 at 512x512, and 16 of one and a half (a set
+    /// stored at half width); a set one pass touches does not count; a frame alone that
+    /// overfills it is one, and a given size wins.
     #[test]
     fn stack_rule_fills_three_eighths_of_l2() {
         const L2: usize = 64 << 20;
         let rule = StackRule::new(None, L2);
+        let sets = |wave, k, passes| vec![Streamed::new(wave, passes); k];
         for (side, want) in [(256, [24, 12, 8, 6]), (512, [6, 3, 2, 1])] {
             let wave = wave_bytes(&dims(side));
-            assert_eq!([1, 2, 3, 4].map(|k| rule.frames(k * wave).unwrap()), want);
+            let frames = [1, 2, 3, 4].map(|k| rule.frames(&sets(wave, k, 2)).unwrap());
+            assert_eq!(frames, want);
         }
         let wave = wave_bytes(&dims(256));
-        assert_eq!(rule.frames(wave + wave / 2).unwrap(), 16);
-        let big = wave_bytes(&dims(512));
-        assert_eq!(StackRule::new(None, 4 << 20).frames(big).unwrap(), 1);
-        assert_eq!(StackRule::new(Some(16), L2).frames(4 * big).unwrap(), 16);
+        let once = [sets(wave, 2, 3), sets(wave, 1, 1)].concat();
+        assert_eq!(rule.frames(&once).unwrap(), 12);
+        let half = [Streamed::new(wave, 2), Streamed::new(wave / 2, 2)];
+        assert_eq!(rule.frames(&half).unwrap(), 16);
+        let big = sets(wave_bytes(&dims(512)), 4, 2);
+        assert_eq!(StackRule::new(None, 4 << 20).frames(&big[..1]).unwrap(), 1);
+        assert_eq!(StackRule::new(Some(16), L2).frames(&big).unwrap(), 16);
     }
 }
