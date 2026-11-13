@@ -29,6 +29,8 @@ pub enum DistError {
     Driver(#[from] cuda_core::DriverError),
     #[error("GPU: {0}")]
     Gpu(#[from] crate::gpu::Error),
+    #[error("growth: {0}")]
+    Grow(#[from] crate::live::grow::GrowError),
     #[error("topology: {0}")]
     Topology(String),
     #[error("GPU {from} cannot access GPU {to} peer-to-peer")]

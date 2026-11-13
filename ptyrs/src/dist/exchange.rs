@@ -10,11 +10,14 @@
 use std::ffi::c_void;
 use std::sync::Arc;
 
+use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{
-    Context, DeviceBuffer, Function, IntoResult, Stream, launch_kernel_on_stream, sys,
+    Context, DeviceBuffer, DeviceCopy, DriverError, Function, IntoResult, RawDeviceBuffer, Stream,
+    launch_kernel_on_stream, sys,
 };
 
 use crate::dist::{DistError, Partition};
+use crate::live::grow::{Backer, GrowTable};
 
 /// Where one region keeps its tiles and frames.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -156,11 +159,15 @@ pub fn tree_sum_host(leaves: &[f64], k: usize) -> Vec<f64> {
 
 /// One [`Exchange::copy_runs`] run: `len` 64-bit words from `src` to `dst`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C)]
 pub struct Run {
     pub dst: u64,
     pub src: u64,
     pub len: u64,
 }
+
+// SAFETY: three u64s with no padding; any bits are a valid `Run`.
+unsafe impl DeviceCopy for Run {}
 
 /// A device table of [`Run`]s with its launch shape.
 pub struct Runs {
@@ -201,6 +208,67 @@ impl Runs {
 
     pub fn is_empty(&self) -> bool {
         self.nruns == 0
+    }
+}
+
+/// [`Run`]s that grow while one captured graph replays them (DESIGN B6, invariant 9): each run
+/// keeps its device address in a [`GrowTable`], and the count [`Exchange::copy_listed`] reads
+/// is in device memory, so the runs pushed before a replay are the ones it copies.
+pub struct RunList {
+    runs: GrowTable<Run>,
+    count: DeviceBuffer<u32>,
+    stream: Arc<Stream>,
+}
+
+impl RunList {
+    /// Room for `max_len` runs, backed `chunk` bytes at a time and pushed on `stream`.
+    pub fn new(stream: &Arc<Stream>, max_len: usize, chunk: usize) -> Result<Self, DistError> {
+        if max_len > i32::MAX as usize {
+            return Err(DistError::Partition(format!("{max_len} listed runs")));
+        }
+        Ok(Self {
+            runs: GrowTable::new(stream, max_len, chunk)?,
+            count: DeviceBuffer::zeroed(stream, 1)?,
+            stream: stream.clone(),
+        })
+    }
+
+    /// Backs the bytes of runs, run `i` at `i * size_of::<Run>()`, from any thread.
+    pub fn backer(&self) -> Backer {
+        self.runs.backer()
+    }
+
+    pub fn len(&self) -> usize {
+        self.runs.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.runs.is_empty()
+    }
+
+    /// The runs and the count, for leasing the reads of [`Exchange::copy_listed`].
+    pub fn storages(&self) -> [&RawDeviceBuffer; 2] {
+        [self.runs.storage(), self.count.storage()]
+    }
+
+    /// Appends `runs`, which a [`Self::backer`] backed, and raises the count on the list's
+    /// stream: launches queued there afterwards copy them too. The only write of the count.
+    pub fn push(&mut self, runs: &[Run]) -> Result<(), DistError> {
+        let end = self.runs.push(runs)?.end;
+        if runs.is_empty() {
+            return Ok(());
+        }
+        let stream = &self.stream;
+        let ctx = ExecutionContext::new(stream.clone());
+        crate::gpu::lease(&ctx, &[], &[self.count.storage()])?;
+        stream.context().bind_to_thread()?;
+        // SAFETY: `count` holds one u32, leased for writing on this stream; `end` fits, as
+        // `max_len` does.
+        unsafe {
+            sys::cuMemsetD32Async(self.count.cu_deviceptr(), end as u32, 1, stream.cu_stream())
+        }
+        .result()?;
+        Ok(())
     }
 }
 
@@ -246,11 +314,16 @@ pub struct Exchange {
     halo_pull: Function,
     tree_sum: Function,
     copy_runs: Function,
+    copy_listed: Function,
     add_f32: Function,
     max_u32: Function,
 }
 
 const RUN_THREADS: u32 = 256;
+/// [`Exchange::copy_listed`]'s fixed grid: about five blocks per SM of a 100-SM GPU, a warp
+/// per run, so the runs past its 4096 warps loop.
+const LISTED_BLOCKS: u32 = 512;
+const LISTED_THREADS: u32 = 256;
 const ADD_THREADS: u32 = 256;
 const ADD_MAX_BLOCKS: u32 = 1024;
 
@@ -263,6 +336,7 @@ impl Exchange {
             halo_pull: m.load_function("halo_pull")?,
             tree_sum: m.load_function("tree_sum")?,
             copy_runs: m.load_function("copy_runs")?,
+            copy_listed: m.load_function("copy_listed")?,
             add_f32: m.load_function("add_f32")?,
             max_u32: m.load_function("max_u32")?,
         })
@@ -293,6 +367,30 @@ impl Exchange {
             )?
         };
         Ok(())
+    }
+
+    /// Copies the runs of `list` pushed before the launch runs, the count read on the device,
+    /// a warp per run over a fixed grid: a graph that captured it once copies every run pushed
+    /// before each replay.
+    ///
+    /// # Safety
+    /// As [`Self::copy_runs`] for every run pushed before the launch runs; a launch on another
+    /// stream than the list's must be ordered after the pushes it is to copy.
+    pub unsafe fn copy_listed(&self, stream: &Stream, list: &RunList) -> Result<(), DriverError> {
+        let (mut runs, mut count) = (list.runs.ptr(), list.count.cu_deviceptr());
+        let mut params = [(&raw mut runs).cast::<c_void>(), (&raw mut count).cast()];
+        // SAFETY: the kernel reads the count, then that many runs, all pushed and so backed;
+        // the caller guarantees the runs.
+        unsafe {
+            launch_kernel_on_stream(
+                &self.copy_listed,
+                (LISTED_BLOCKS, 1, 1),
+                (LISTED_THREADS, 1, 1),
+                0,
+                stream,
+                &mut params,
+            )
+        }
     }
 
     /// `dst[i] = a[i] + b[i]` for `i < n`, rounded to nearest: bit-identical to the host sum.
@@ -634,6 +732,60 @@ CR_DONE:
     ret;
 }
 
+// Runs r < *count of the table of [dst, src, len] triples, warp w = global thread / 32 taking
+// runs w, w + nwarps, ...: dst[i] = src[i] (64-bit words) for i = lane, striding by 32 while
+// i < len.
+.visible .entry copy_listed(
+    .param .u64 p_runs,
+    .param .u64 p_count
+)
+{
+    .reg .pred %p<3>;
+    .reg .b32 %r<10>;
+    .reg .b64 %rd<12>;
+
+    ld.param.u64 %rd1, [p_runs];
+    ld.param.u64 %rd2, [p_count];
+    cvta.to.global.u64 %rd1, %rd1;
+    cvta.to.global.u64 %rd2, %rd2;
+    ld.global.u32 %r1, [%rd2];
+    mov.u32 %r2, %ctaid.x;
+    mov.u32 %r3, %ntid.x;
+    mov.u32 %r4, %tid.x;
+    mad.lo.u32 %r5, %r2, %r3, %r4;
+    shr.u32 %r6, %r5, 5;
+    and.b32 %r7, %r4, 31;
+    mov.u32 %r8, %nctaid.x;
+    mul.lo.u32 %r8, %r8, %r3;
+    shr.u32 %r8, %r8, 5;
+CL_RUN:
+    setp.ge.u32 %p1, %r6, %r1;
+    @%p1 bra CL_DONE;
+    mul.wide.u32 %rd3, %r6, 24;
+    add.s64 %rd3, %rd1, %rd3;
+    ld.global.u64 %rd4, [%rd3];
+    ld.global.u64 %rd5, [%rd3+8];
+    ld.global.u64 %rd6, [%rd3+16];
+    cvta.to.global.u64 %rd4, %rd4;
+    cvta.to.global.u64 %rd5, %rd5;
+    cvt.u64.u32 %rd7, %r7;
+CL_WORD:
+    setp.ge.u64 %p2, %rd7, %rd6;
+    @%p2 bra CL_NEXT;
+    shl.b64 %rd8, %rd7, 3;
+    add.s64 %rd9, %rd5, %rd8;
+    ld.global.u64 %rd10, [%rd9];
+    add.s64 %rd11, %rd4, %rd8;
+    st.global.u64 [%rd11], %rd10;
+    add.s64 %rd7, %rd7, 32;
+    bra CL_WORD;
+CL_NEXT:
+    add.u32 %r6, %r6, %r8;
+    bra CL_RUN;
+CL_DONE:
+    ret;
+}
+
 // dst[i] = a[i] + b[i] for i < n, grid-stride.
 .visible .entry add_f32(
     .param .u64 p_dst,
@@ -817,6 +969,69 @@ mod tests {
             unsafe { cuda_core::sys::cuCtxSynchronize().result().unwrap() };
         }
         assert!(bad.is_empty(), "(reader, owner): {bad:?}");
+    }
+
+    /// One graph captured before any run is listed copies, at each replay, the runs pushed
+    /// so far and nothing else: none at first, then rounds of runs empty, shorter and longer
+    /// than a warp, one round more than the grid has warps, with no recapture.
+    #[test]
+    fn copy_listed_replays_copy_every_run_pushed_so_far() {
+        use crate::live::graph::{LiveGraph, WarmUp};
+        let ctx = Context::new(0).unwrap();
+        let s = ctx.new_stream().unwrap();
+        let ex = Exchange::load(&ctx).unwrap();
+        const LENS: [u64; 9] = [0, 1, 5, 31, 32, 33, 64, 100, 257];
+        let rounds = [0, 1, 7, 5000, 0, 1500];
+        let nrun: usize = rounds.iter().sum();
+        assert!(rounds[3] > (LISTED_BLOCKS * LISTED_THREADS / 32) as usize);
+        let len = |i: usize| LENS[i % LENS.len()];
+        let off = |i: usize| (i * 37 % 300) as u64;
+        // Run `i` lands at `at[i]`, one untouched word after the run before it.
+        let at: Vec<u64> = (0..=nrun)
+            .scan(0, |a, i| {
+                let here = *a;
+                *a += len(i) + 1;
+                Some(here)
+            })
+            .collect();
+        let words = at[nrun] as usize;
+        let host: Vec<u64> = (0..words as u64 + 300)
+            .map(|i| i.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1)
+            .collect();
+        let src = DeviceBuffer::from_host(&s, &host).unwrap();
+        let dst = DeviceBuffer::<u64>::zeroed(&s, words).unwrap();
+        let mut list = RunList::new(&s, nrun, 4096).unwrap();
+        let graph = LiveGraph::capture(&s, |c| {
+            let [runs, count] = list.storages();
+            crate::gpu::lease(c, &[runs, count, src.storage()], &[dst.storage()])?;
+            // SAFETY: every run reads `src` and writes its own words of `dst`.
+            unsafe { ex.copy_listed(c.get_cuda_stream(), &list) }?;
+            Ok(())
+        })
+        .unwrap();
+        let warm = WarmUp::end();
+        let (backer, mut pushed) = (list.backer(), 0);
+        for n in rounds {
+            let runs: Vec<Run> = (pushed..pushed + n)
+                .map(|i| Run {
+                    dst: dst.cu_deviceptr() + 8 * at[i],
+                    src: src.cu_deviceptr() + 8 * (at[i] + off(i)),
+                    len: len(i),
+                })
+                .collect();
+            backer.back(0..(pushed + n) * size_of::<Run>()).unwrap();
+            list.push(&runs).unwrap();
+            pushed += n;
+            assert_eq!(list.len(), pushed);
+            graph.replay().unwrap();
+            let mut want = vec![0; words];
+            for i in 0..pushed {
+                let (a, n) = (at[i] as usize, len(i) as usize);
+                want[a..a + n].copy_from_slice(&host[a + off(i) as usize..][..n]);
+            }
+            assert!(dst.to_host_vec(&s).unwrap() == want, "after {pushed} runs");
+        }
+        assert_eq!(warm.recaptures(), 0);
     }
 
     /// The sum of a peer's floats and local floats, subnormals included, matches the host's
