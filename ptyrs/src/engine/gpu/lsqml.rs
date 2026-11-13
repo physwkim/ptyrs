@@ -93,7 +93,7 @@ pub(super) struct LsqmlState {
     size: u32,
     /// Each batch's range of `stacks`.
     batches: Vec<Range<usize>>,
-    /// The batches cut into stacks of the device's stack size, one table entry each.
+    /// The batches cut into stacks as long as the device's wide ones, one table entry each.
     stacks: Vec<Frames>,
     table: StackTable,
     /// A batch's row transforms, then exit-wave updates, one per stack of a batch.

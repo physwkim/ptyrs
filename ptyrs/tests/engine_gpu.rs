@@ -10,8 +10,9 @@ use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaContext, DeviceBuffer};
 use ptyrs::base::{C64, Counts, MASKED, Object, Probe, Scan, Stack};
 use ptyrs::engine::{
-    Algorithm, ApParams, Backend, Bh, BhParams, BhStep, DmParams, Features, GpuOptions, GpuPtycho,
-    Llk, LlkRecord, MlParams, Observed, Optics, Params, Ptycho, RpieParams, Step, llk,
+    Algorithm, ApParams, Backend, Bh, BhParams, BhStep, Cost, DmParams, Features, GpuOptions,
+    GpuPtycho, Llk, LlkRecord, LsqmlParams, MlParams, Observed, Optics, Params, Ptycho, RpieParams,
+    Step, llk,
 };
 use ptyrs::gpu::{
     C32, FUSED_SIDES, Kernels, LlkPartial, LlkRing, LlkScratch, StackTable, ViewDims,
@@ -1490,34 +1491,65 @@ fn position_is_bit_identical_across_stack_splits() {
 }
 
 /// On a 64 MiB L2 the default stack size cuts 30 frames of 256x256 with two probe modes into
-/// stacks of 24 for the fused passes over the shared scratch and of 12 for the rest: AP, DM
-/// and ML cycles modelling a scale and a position give the bits of stacks of 7 for all.
+/// stacks of 24 for the passes that stream one exit-wave set and of 12 for the rest: AP, DM
+/// and ML cycles modelling a scale and a position, and BH then LSQML epochs of every frame
+/// modelling a position, give the bits of stacks of 7 for all.
 #[test]
 fn default_stacks_give_the_bits_of_explicit_stacks() {
     let (scan, object, probe) = start(256, 2, false);
-    let features = Features {
+    let position = Some(drawn_offsets());
+    let scaled = Features {
         scale: Some(vec![1.0; NPOS]),
-        position: Some(drawn_offsets()),
+        position: position.clone(),
         ..Features::default()
     };
-    let run = |stack_size| {
+    let moved = Features {
+        position,
+        ..Features::default()
+    };
+    let bh = BhParams {
+        batch_size: NPOS,
+        probe_rho: 0.01,
+        position_rho: 0.1,
+        seed: 7,
+    };
+    let lsqml = LsqmlParams {
+        batch_size: NPOS,
+        cost: Cost::Poisson,
+        seed: 7,
+    };
+    let new = |stack_size, features: &Features| {
         let options = GpuOptions {
             stack_size,
             ..FUSED.options
         };
         let mut g = GpuPtycho::new(&ctx(), &scan, object.clone(), probe.clone(), options).unwrap();
-        g.set_features(&features).unwrap();
-        for cycles in feature_cycles(2) {
-            cycles.gpu(&mut g, 4);
+        g.set_features(features).unwrap();
+        g
+    };
+    let run = |stack_size| {
+        let mut cycles = new(stack_size, &scaled);
+        for c in feature_cycles(2) {
+            c.gpu(&mut cycles, 4);
         }
-        bit_state(&mut g)
+        let mut epochs = new(stack_size, &moved);
+        epochs.bh(&bh, 3, 1).unwrap();
+        epochs.lsqml(&lsqml, 3, 1).unwrap();
+        [bit_state(&mut cycles), bit_state(&mut epochs)]
     };
     let (seven, default) = (run(Some(7)), run(None));
-    assert_eq!(seven.llk.len(), 3 * 3 + 1);
-    assert!(default.llk == seven.llk, "LLK records differ");
-    assert!(default.object == seven.object, "object differs");
-    assert!(default.probe == seven.probe, "probe differs");
-    assert!(default.features == seven.features, "features differ");
+    assert_eq!(seven[0].llk.len(), 3 * 3 + 1);
+    assert_eq!(seven[1].llk.len(), 3 + 3 + 1);
+    for (k, what) in ["cycles", "epochs"].into_iter().enumerate() {
+        let (seven, default) = (&seven[k], &default[k]);
+        assert!(default.llk == seven.llk, "{what}: LLK records differ");
+        assert!(default.object == seven.object, "{what}: object differs");
+        assert!(default.probe == seven.probe, "{what}: probe differs");
+        assert!(
+            default.features == seven.features,
+            "{what}: features differ"
+        );
+    }
 }
 
 /// The bits of a run's object and probe.
