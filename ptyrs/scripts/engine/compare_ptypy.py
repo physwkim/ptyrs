@@ -1,20 +1,28 @@
-"""PtyPy DM on the scan and starting point written by `cargo run --example ptypy_dm -- <dir> prepare`.
+"""PtyPy DM or RAAR on the scan, start and algorithm written by `cargo run --example ptypy_compare --
+<dir> prepare <dm|raar>`.
 
 Usage: PYTHONPATH=<ptypy checkout> python -P compare_ptypy.py <dir> <niter> [--ptyrs-guard]
 
-Reads <dir>/scan.cxi, init.h5 and views.txt, and runs PtyPy's CPU DM (Full model, double
-precision) from the same object and probe on the same integer views, writing the state after
-each iteration i = 0..niter to <dir>/ptypy/ptypy_<i>.ptyr for `ptypy_dm <dir> compare`.
+Reads <dir>/scan.cxi, init.h5, views.txt and algo.txt, and runs PtyPy's CPU DM or RAAR (Full
+model, double precision) from the same object and probe on the same integer views, writing the
+state after each iteration i = 0..niter to <dir>/ptypy/ptypy_<i>.ptyr for `ptypy_compare <dir>
+compare`.
 
-PtyPy is set to the plain DM ptyrs runs with alpha = 0: alpha = 1, an exact Fourier projection
-(fourier_relax_factor 0), probe updated from the first iteration, one object-then-probe overlap
-pass, no probe support. Each view is given at its ptyrs centre (corner + n/2) times the object
-pixel, so ptyrs object pixel (0, 0) sits at the origin and a storage's `_origin` maps PtyPy
-pixels onto ptyrs pixels.
+PtyPy is set to ptyrs's run: an exact Fourier projection (fourier_relax_factor 0), probe updated
+from the first iteration, one object-then-probe overlap pass, no probe support, and DM alpha 1
+(ptyrs's plain DM, alpha 0) or ptyrs's RAAR beta. Each view is given at its ptyrs centre
+(corner + n/2) times the object pixel, so ptyrs object pixel (0, 0) sits at the origin and a
+storage's `_origin` maps PtyPy pixels onto ptyrs pixels.
+
+PtyPy's RAAR is not ptyrs's (PyNX's) for any beta. PtyPy takes the next exit waves as
+beta exit + (1 - 2 beta) PO + beta P_F(2 PO - exit) and fits object and probe to them; ptyrs
+sends psi' = beta/2 (2 PO - psi) + (1 - beta/2) P_F(psi) to the Fourier projection, psi being
+the previous cycle's (PO in cycle 0), and fits object and probe to P_F(psi'). The two agree
+only at the start, so their curves are compared side by side.
 
 PtyPy's inertia is a constant times the mean diffraction power (object) or the frame count
 (probe), where ptyrs (PyNX) scales it by the largest normalisation of the update; no constant
-matches that, so DMPtyrsInertia sets PtyPy's inertia before every update to the value that gives
+matches that, so PtyrsInertia sets PtyPy's inertia before every update to the value that gives
 ptyrs's regulariser.
 
 PtyPy guards the magnitude ratio as sqrt(Iobs) / (|f| + 1e-10), ptyrs as sqrt(Iobs) / max(|f|,
@@ -33,10 +41,10 @@ from ptypy.core.data import PtyScan
 from ptypy.core.geometry import Geo
 from ptypy.engines import projectional
 from ptypy.engines import register as register_engine
-from ptypy.engines.projectional import DM
+from ptypy.engines.projectional import DM, RAAR
 from ptypy.experiment import register as register_scan
 
-# ptyrs DmParams::default() obj_inertia and probe_inertia (PyNX DM).
+# ptyrs DmParams::default() and RaarParams::default() obj_inertia and probe_inertia (PyNX).
 OBJ_INERTIA, PROBE_INERTIA = 0.01, 0.001
 
 SCAN = {}
@@ -64,19 +72,11 @@ class PtyrsScan(PtyScan):
                 {k: (iobs[k] >= 0).astype(float) for k in indices})
 
 
-@register_engine()
-class DMPtyrsInertia(DM):
+class PtyrsInertia:
     """
-    DM whose object and probe regularisers are ptyrs's: inertia times the largest value of the
-    update's normalisation (sum of |P|^2 over views and modes for the object, of |O|^2 over views
-    for the probe).
-
-    Defaults:
-
-    [name]
-    default = DMPtyrsInertia
-    type = str
-    help =
+    Object and probe regularisers of ptyrs: inertia times the largest value of the update's
+    normalisation (sum of |P|^2 over views and modes for the object, of |O|^2 over views for
+    the probe).
     """
 
     def _max_norm(self, nrm, view, weight):
@@ -96,6 +96,34 @@ class DMPtyrsInertia(DM):
         m = self._max_norm(self.pr_nrm, "pr_view", "object")
         self.p.probe_inertia = PROBE_INERTIA * m * s.data.shape[0] / len(s.views)
         return super().probe_update()
+
+
+@register_engine()
+class DMPtyrsInertia(PtyrsInertia, DM):
+    """
+    DM with ptyrs's regularisers.
+
+    Defaults:
+
+    [name]
+    default = DMPtyrsInertia
+    type = str
+    help =
+    """
+
+
+@register_engine()
+class RAARPtyrsInertia(PtyrsInertia, RAAR):
+    """
+    RAAR with ptyrs's regularisers.
+
+    Defaults:
+
+    [name]
+    default = RAARPtyrsInertia
+    type = str
+    help =
+    """
 
 
 def ptyrs_guard_projection(diff_view, a, b, c, pbound):
@@ -131,7 +159,8 @@ def load(d):
     with h5py.File(f"{d}/init.h5", "r") as f:
         obj, probe = f["object"][()], f["probe"][()]
     corners = np.loadtxt(f"{d}/views.txt", dtype=int, ndmin=2)
-    return iobs, distance, pixel, wavelength, obj, probe, corners
+    algo, param = open(f"{d}/algo.txt").read().split()
+    return iobs, distance, pixel, wavelength, obj, probe, corners, algo, float(param)
 
 
 def main():
@@ -140,7 +169,7 @@ def main():
         projectional.projection_update_generalized = ptyrs_guard_projection
     elif sys.argv[3:]:
         sys.exit(__doc__)
-    iobs, distance, pixel, wavelength, obj, probe, corners = load(d)
+    iobs, distance, pixel, wavelength, obj, probe, corners, algo, param = load(d)
     out = f"{d}/ptypy"
     os.makedirs(out, exist_ok=True)
     n = iobs.shape[-1]
@@ -161,10 +190,16 @@ def main():
                              energy=Geo._keV2m / wavelength, center="fftshift", auto_center=False,
                              orientation=None, save=None)
     p.engines = u.Param()
-    p.engines.e0 = u.Param(name="DMPtyrsInertia", numiter=niter, numiter_contiguous=1, alpha=1.0,
-                           probe_update_start=0, overlap_max_iterations=1, update_object_first=True,
+    p.engines.e0 = u.Param(numiter=niter, numiter_contiguous=1, probe_update_start=0,
+                           overlap_max_iterations=1, update_object_first=True,
                            fourier_relax_factor=0.0, probe_support=None,
                            compute_log_likelihood=False)
+    if algo == "dm":
+        p.engines.e0.update(name="DMPtyrsInertia", alpha=param)
+    elif algo == "raar":
+        p.engines.e0.update(name="RAARPtyrsInertia", beta=param)
+    else:
+        sys.exit(f"{d}/algo.txt names {algo}, expected dm or raar")
     P = Ptycho(p, level=4)
 
     (ob,) = P.obj.storages.values()
@@ -179,7 +214,7 @@ def main():
     assert pr.data.shape == probe.shape, (pr.data.shape, probe.shape)
 
     # Every view lies inside both arrays, so the overlap of the two frames carries every value
-    # DM reads; PtyPy pixels outside it stay at PtyPy's initial object and are never read.
+    # the engine reads; PtyPy pixels outside it stay at PtyPy's initial object and are never read.
     lo = np.maximum(off, 0)
     hi = np.minimum(np.array(obj.shape[1:]) + off, ob.data.shape[1:])
     ob.data[0, lo[0]:hi[0], lo[1]:hi[1]] = obj[0, lo[0] - off[0]:hi[0] - off[0], lo[1] - off[1]:hi[1] - off[1]]

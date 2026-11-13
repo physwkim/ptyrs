@@ -1,18 +1,21 @@
-//! Plain DM against PtyPy's, the Rust side of `scripts/engine/compare_ptypy.py`, on M1's scan
-//! (256² frames, 400 positions 4 object pixels apart, 2 probe modes, 2e5 photons per frame).
+//! Plain DM or RAAR against PtyPy's, the Rust side of `scripts/engine/compare_ptypy.py`, on
+//! M1's scan (256² frames, 400 positions 4 object pixels apart, 2 probe modes, 2e5 photons per
+//! frame).
 //!
-//! `cargo run --release -p ptyrs --example ptypy_dm -- <dir> prepare [ncycle]` (default 100)
-//! writes `scan.cxi`, `init.h5` (the scaled start), `views.txt` (object window corner `oy ox`
-//! per frame) and `truth.h5`, and runs DM with alpha 0 and no phase-ramp removal on the CPU in
-//! f64, writing `llk_rust.txt` (cycle and the normalised Poisson, Gaussian, Euclidian LLK and
-//! photon count of the estimate each cycle starts from) and `final_rust.h5`.
+//! `cargo run --release -p ptyrs --example ptypy_compare -- <dir> prepare <dm|raar> [ncycle]`
+//! (default 100) writes `scan.cxi`, `init.h5` (the scaled start), `views.txt` (object window
+//! corner `oy ox` per frame), `truth.h5` and `algo.txt` (the algorithm and its parameter as
+//! PtyPy takes it: `dm 1` for DM with alpha 0, `raar 0.9` for RAAR with PyNX's default beta),
+//! and runs it without phase-ramp removal on the CPU in f64, writing `llk_rust.txt` (cycle and
+//! the normalised Poisson, Gaussian, Euclidian LLK and photon count of the estimate each cycle
+//! starts from) and `final_rust.h5`.
 //!
 //! `... -- <dir> compare` reads PtyPy's state after each iteration `i`,
 //! `ptypy/ptypy_<i>.ptyr`, maps its object onto ptyrs's pixels by the storage origin, and
-//! prints the relative difference of its LLK (taken by ptyrs) from ptyrs's after `i` cycles
-//! (row `i` of `llk_rust.txt`, or `final_rust.h5` for the last); then the FRC between the final
-//! objects of ptyrs, PtyPy and the truth over the bounding box of the window centres (the
-//! region the M5 clock compares).
+//! prints its LLK (taken by ptyrs) against ptyrs's after `i` cycles (row `i` of
+//! `llk_rust.txt`, or `final_rust.h5` for the last); then the FRC between the final objects of
+//! ptyrs, PtyPy and the truth over the bounding box of the window centres (the region the M5
+//! clock compares).
 
 use std::fmt::Write as _;
 use std::ops::Range;
@@ -20,7 +23,7 @@ use std::path::{Path, PathBuf};
 
 use ptyrs::base::frc::Frc;
 use ptyrs::base::{C64, Object, Probe, Scan};
-use ptyrs::engine::{DmParams, Llk, Ptycho};
+use ptyrs::engine::{DmParams, Llk, Ptycho, RaarParams};
 
 #[path = "../tests/common/engine/scenario.rs"]
 mod scenario;
@@ -33,18 +36,31 @@ const STEP: f64 = 4.0;
 
 type Error = Box<dyn std::error::Error>;
 
+enum Algo {
+    Dm,
+    Raar,
+}
+
 fn main() -> Result<(), Error> {
-    let usage = "usage: ptypy_dm <dir> prepare [ncycle] | ptypy_dm <dir> compare";
+    let usage =
+        "usage: ptypy_compare <dir> prepare <dm|raar> [ncycle] | ptypy_compare <dir> compare";
     let mut args = std::env::args().skip(1);
     let dir = PathBuf::from(args.next().ok_or(usage)?);
     match args.next().as_deref() {
-        Some("prepare") => prepare(&dir, args.next().map_or(Ok(100), |s| s.parse())?),
+        Some("prepare") => {
+            let algo = match args.next().as_deref() {
+                Some("dm") => Algo::Dm,
+                Some("raar") => Algo::Raar,
+                _ => return Err(usage.into()),
+            };
+            prepare(&dir, algo, args.next().map_or(Ok(100), |s| s.parse())?)
+        }
         Some("compare") => compare(&dir),
         _ => Err(usage.into()),
     }
 }
 
-fn prepare(dir: &Path, ncycle: usize) -> Result<(), Error> {
+fn prepare(dir: &Path, algo: Algo, ncycle: usize) -> Result<(), Error> {
     std::fs::create_dir_all(dir)?;
     let (scan, object, probe, _) = scenario::dm_scenario_truth(FRAME, NPOS, NPROBE, PHOTONS, STEP);
     let cxi = dir.join("scan.cxi");
@@ -68,9 +84,22 @@ fn prepare(dir: &Path, ncycle: usize) -> Result<(), Error> {
         zero_phase_ramp: false,
         ..DmParams::default()
     };
+    let raar = RaarParams {
+        calc_llk: 1,
+        zero_phase_ramp: false,
+        ..RaarParams::default()
+    };
+    let line = match algo {
+        Algo::Dm => "dm 1".to_string(),
+        Algo::Raar => format!("raar {}", raar.beta),
+    };
+    std::fs::write(dir.join("algo.txt"), format!("{line}\n"))?;
     let t = std::time::Instant::now();
-    p.dm(&dm, ncycle);
-    eprintln!("dm x{ncycle}: {:.1} s", t.elapsed().as_secs_f64());
+    match algo {
+        Algo::Dm => p.dm(&dm, ncycle),
+        Algo::Raar => p.raar(&raar, ncycle),
+    }
+    eprintln!("{line} x{ncycle}: {:.1} s", t.elapsed().as_secs_f64());
     let mut s = String::new();
     for r in p.history() {
         writeln!(s, "{} {}", r.cycle, llk_line(&r.llk))?;
