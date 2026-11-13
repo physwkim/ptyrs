@@ -5,17 +5,19 @@
 //! other regions' tiles its frames read come from their owners after each update
 //! (invariant 5). A GPU's window holds every tile a frame touching its own tiles can read,
 //! planned or not, and its halo grows as frames read new tiles, so a frame off the plan
-//! lands wherever one GPU would take it.
+//! lands wherever one GPU would take it. The split admits frames through the one-GPU scan's
+//! [`Gate`] on the whole object, so every GPU's batch ends at the frame one GPU's scan
+//! refuses.
 
 use std::sync::Arc;
 
 use cuda_core::{Context, Stream};
 
 use crate::gpu::{ViewAddr, ViewDims, view_tiles};
-use crate::live::scan::ScanShape;
+use crate::live::scan::{Gate, Refusal, ScanShape};
 
 use crate::dist::exchange::Pull;
-use crate::dist::halo::{Halo, HaloRows, LiveHaloBufs, Window};
+use crate::dist::halo::{Halo, HaloBufs, HaloRows, Window};
 use crate::dist::{DEFAULT_TILE, DistError, NLEAF, Partition, Scheme, TileGrid};
 
 /// One GPU's part of a live scan.
@@ -48,8 +50,8 @@ impl LiveRegion {
         stream: &Arc<Stream>,
         obj: u64,
         chunk: usize,
-    ) -> Result<LiveHaloBufs, DistError> {
-        LiveHaloBufs::new(
+    ) -> Result<HaloBufs, DistError> {
+        HaloBufs::new(
             stream,
             self.halo_words,
             self.halo_rows,
@@ -65,6 +67,8 @@ pub struct LivePlan {
     run: Partition,
     /// The one-GPU scan's.
     dims: ViewDims,
+    /// The one-GPU scan's, on every tile.
+    gate: Gate,
     regions: Vec<LiveRegion>,
     halo: Halo,
 }
@@ -90,19 +94,24 @@ impl AsMut<HaloRows> for Share {
 
 impl LivePlan {
     /// The split over `ngpu` GPUs, cut by `scheme` from [`NLEAF`] leaves, of the one-GPU scan
-    /// `shape` whose `shape.nframe` planned frames have the views `planned`, `nmode` each.
+    /// `shape` with `cap` view slots per tile, whose first frames are planned with the views
+    /// `planned`, `nmode` each.
     pub fn new(
         shape: &ScanShape,
         planned: &[ViewAddr],
         scheme: Scheme,
         ngpu: usize,
+        cap: u32,
     ) -> Result<Self, DistError> {
         let bad = |m: String| Err(DistError::Partition(m));
         let dims = shape.dims();
         let nmode = dims.nmode as usize;
-        if nmode == 0 || planned.len() != dims.nframe as usize * nmode {
+        if nmode == 0
+            || !planned.len().is_multiple_of(nmode)
+            || planned.len() > dims.nframe as usize * nmode
+        {
             return bad(format!(
-                "{} planned views are not {} frames of {nmode}",
+                "{} planned views are not at most {} frames of {nmode}",
                 planned.len(),
                 dims.nframe
             ));
@@ -176,9 +185,12 @@ impl LivePlan {
                 halo_rows: halo.max_rows(r),
             });
         }
+        let [nty, ntx] = dims.tiles();
+        let all: Vec<u32> = (0..nty * ntx).collect();
         Ok(Self {
             run,
             dims,
+            gate: Gate::new(dims, cap, &all),
             regions,
             halo,
         })
@@ -203,7 +215,7 @@ impl LivePlan {
 
     /// The copy-engine pulls into region `r`'s halo receive buffer at `recv` from the owners'
     /// send buffers, `send(o)` giving owner `o`'s context and send buffer
-    /// ([`LiveHaloBufs::ptrs`]): the same for the whole scan.
+    /// ([`HaloBufs::ptrs`]): the same for the whole scan.
     pub fn halo_pulls(
         &self,
         r: usize,
@@ -214,11 +226,12 @@ impl LivePlan {
     }
 
     /// Splits the arriving frames whose views are `views`, `nmode` per frame, in arrival
-    /// order, into `shares`, one per region: each frame goes to the owner of every tile it
-    /// touches, and the halo rows of the tiles it reads on a region for the first time to
-    /// that region and the tiles' owners. Every view must be inside the one-GPU scan's object;
-    /// at the first frame that is not, `shares` hold the frames before it.
-    pub fn split(&mut self, views: &[ViewAddr], shares: &mut [Share]) -> Result<(), DistError> {
+    /// order, into `shares`, one per region, up to the first one the one-GPU scan refuses,
+    /// and returns how many it took: each frame goes to the owner of every tile it touches,
+    /// and the halo rows of the tiles it reads on a region for the first time to that region
+    /// and the tiles' owners. The refused frame closes the plan as it closes the one-GPU
+    /// scan ([`Self::closed`]), and every frame after it is lost.
+    pub fn split(&mut self, views: &[ViewAddr], shares: &mut [Share]) -> Result<u32, DistError> {
         let bad = |m: String| Err(DistError::Partition(m));
         let nmode = self.dims.nmode as usize;
         if shares.len() != self.regions.len() || !views.len().is_multiple_of(nmode) {
@@ -236,10 +249,10 @@ impl LivePlan {
             s.halo.unpack.clear();
         });
         let grid = self.run.grid();
-        let mut tiles = Vec::new();
-        for (i, frame) in views.chunks(nmode).enumerate() {
-            if let Some(e) = frame.iter().find_map(|v| self.dims.check_view(v).err()) {
-                return bad(format!("frame {i} of the batch: {e}"));
+        let (mut tiles, mut took) = (Vec::new(), 0);
+        for frame in views.chunks(nmode) {
+            if self.gate.admit(frame).is_err() {
+                break;
             }
             touched(&self.dims, grid, frame, &mut tiles);
             for r in owners(self.run.owner(), &tiles, self.regions.len()) {
@@ -248,10 +261,16 @@ impl LivePlan {
                 self.halo.read(r, tiles.iter().copied(), shares);
                 let win = self.regions[r].window;
                 shares[r].views.extend(frame.iter().map(|&v| win.shift(v)));
-                shares[r].frames.push(i as u32);
+                shares[r].frames.push(took);
             }
+            took += 1;
         }
-        Ok(())
+        Ok(took)
+    }
+
+    /// The frame that closed the plan, as it closed the one-GPU scan.
+    pub fn closed(&self) -> Option<Refusal> {
+        self.gate.closed()
     }
 }
 
@@ -285,9 +304,13 @@ mod tests {
     use crate::dist::worker::{Workers, tests::gpus};
     use crate::live::graph::{LiveGraph, WarmUp};
     use crate::live::recon::ViewPlacement;
+    use crate::live::scan::{LiveScan, ScanBacker};
     use cuda_core::DeviceBuffer;
+    use std::num::NonZeroU32;
 
     const PIXEL: [f64; 2] = [1e-8, 1e-8];
+    /// Slab slots no test here fills.
+    const ROOM: u32 = u32::MAX;
 
     /// The one-GPU scan of `frame`-pixel frames at `pos`, 2 probe modes, and its views.
     fn scan(pos: Positions, frame: u32) -> (ScanShape, Vec<ViewAddr>) {
@@ -361,9 +384,9 @@ mod tests {
             .collect()
     }
 
-    /// Two columns of frames at x = 0 and 8 px, then the same at x = 200 px, cut in two strips
-    /// whose planned frames read no tile of the other, and a frame between them that reads
-    /// tiles of both.
+    /// Two columns of frames at x = 0 and 8 px, then the same at x = 200 px, planned as the
+    /// first quarter of the scan and cut in two strips whose planned frames read no tile of
+    /// the other, and a frame between them that reads tiles of both.
     fn far() -> (ScanShape, Vec<ViewAddr>, Vec<ViewAddr>) {
         let (shape, views) = scan(sim::raster(4, 2, 8e-8), 32);
         let nmode = shape.nmode as usize;
@@ -375,7 +398,7 @@ mod tests {
         };
         let both = [views.clone(), moved(200)].concat();
         let shape = ScanShape {
-            nframe: shape.nframe * 2,
+            nframe: shape.nframe * 8,
             reach: [shape.reach[0], shape.reach[1] + 200],
             ..shape
         };
@@ -474,7 +497,7 @@ mod tests {
     #[test]
     fn one_gpu_holds_the_whole_scan() {
         for (name, shape, views, scheme) in cases() {
-            let plan = LivePlan::new(&shape, &views, scheme, 1).unwrap();
+            let plan = LivePlan::new(&shape, &views, scheme, 1, ROOM).unwrap();
             let g = &plan.regions()[0];
             assert_eq!(g.window.at, [0, 0], "{name}");
             assert_eq!(g.shape, shape, "{name}");
@@ -494,7 +517,7 @@ mod tests {
             let dims = shape.dims();
             let nmode = dims.nmode as usize;
             for ngpu in [1, 2, 4] {
-                let mut plan = LivePlan::new(&shape, &views, scheme, ngpu).unwrap();
+                let mut plan = LivePlan::new(&shape, &views, scheme, ngpu, ROOM).unwrap();
                 let mut shares = vec![Share::default(); ngpu];
                 let mut local: Vec<Vec<(u32, Vec<ViewAddr>)>> = vec![Vec::new(); ngpu];
                 let (mut start, mut sizes) = (0, [1, 7, 64, 3].iter().cycle());
@@ -560,7 +583,7 @@ mod tests {
         for (name, shape, views, scheme) in cases() {
             let dims = shape.dims();
             for ngpu in [2, 4] {
-                let plan = LivePlan::new(&shape, &views, scheme, ngpu).unwrap();
+                let plan = LivePlan::new(&shape, &views, scheme, ngpu, ROOM).unwrap();
                 let (grid, owner) = (plan.partition().grid(), plan.partition().owner());
                 let (tile, ntx) = (grid.tile(), grid.dims()[1]);
                 for (r, g) in plan.regions().iter().enumerate() {
@@ -627,9 +650,13 @@ mod tests {
                 .map(|d| jittered(&dims, &views, d))
                 .concat();
             assert!(!off.is_empty(), "{name}");
+            let shape = ScanShape {
+                nframe: shape.nframe + (off.len() / nmode) as u32,
+                ..shape
+            };
             for ngpu in [2, 4] {
                 let what = format!("{name} on {ngpu}");
-                let mut plan = LivePlan::new(&shape, &views, scheme, ngpu).unwrap();
+                let mut plan = LivePlan::new(&shape, &views, scheme, ngpu, ROOM).unwrap();
                 let ntiles = plan.partition().grid().len();
                 let mut rows = vec![HaloRows::default(); ngpu];
                 let mut read = vec![vec![false; ntiles]; ngpu];
@@ -661,7 +688,7 @@ mod tests {
     #[test]
     fn a_frame_off_the_plan_grows_the_halo() {
         let (shape, both, mid) = far();
-        let mut plan = LivePlan::new(&shape, &both, Scheme::Strips, 2).unwrap();
+        let mut plan = LivePlan::new(&shape, &both, Scheme::Strips, 2, ROOM).unwrap();
         let ntiles = plan.partition().grid().len();
         let mut rows = vec![HaloRows::default(); 2];
         let mut read = vec![vec![false; ntiles]; 2];
@@ -693,7 +720,7 @@ mod tests {
         win: DeviceBuffer<u64>,
         stage: DeviceBuffer<u64>,
         own: Runs,
-        halo: LiveHaloBufs,
+        halo: HaloBufs,
         graphs: [LiveGraph; 2],
         pulls: Vec<Pull>,
     }
@@ -722,7 +749,12 @@ mod tests {
                 .map(|(name, shape, views, scheme)| {
                     let dims = shape.dims();
                     let off = [[5, -9], [-13, 11], [0, 17]].map(|d| jittered(&dims, &views, d));
-                    (name, shape, views, off.concat(), scheme)
+                    let off = off.concat();
+                    let shape = ScanShape {
+                        nframe: shape.nframe + (off.len() / dims.nmode as usize) as u32,
+                        ..shape
+                    };
+                    (name, shape, views, off, scheme)
                 })
                 .collect();
             if ngpu == 2 {
@@ -733,7 +765,7 @@ mod tests {
                 let what = format!("{name} on {ngpu}");
                 let dims = shape.dims();
                 let (nmode, nobj) = (dims.nmode as usize, dims.nobj as usize);
-                let mut plan = LivePlan::new(&shape, &views, scheme, ngpu).unwrap();
+                let mut plan = LivePlan::new(&shape, &views, scheme, ngpu, ROOM).unwrap();
                 let (grid, owner) = (*plan.partition().grid(), plan.partition().owner().to_vec());
                 let ([nyo, nxo], tile) = (grid.obj(), grid.tile());
                 let setup: Vec<Setup> = (0..ngpu)
@@ -774,13 +806,16 @@ mod tests {
                         let (ex, own) = (Exchange::load(g.ctx())?, Runs::new(&st, &own)?);
                         let obj = win.cu_deviceptr();
                         let halo = at.region.halo_bufs(&st, obj, 4096)?;
-                        // SAFETY: `win` holds the window at `obj` for as long as the graphs.
+                        // SAFETY: `win` holds the window at `obj` for as long as the graphs, leased
+                        // in them; each epoch writes it before the pack and pulls before the
+                        // unpack, on this stream.
                         let pack = LiveGraph::capture(&st, |c| unsafe {
-                            halo.pack(&ex, c, win.storage())
+                            crate::gpu::lease(c, &[win.storage()], &[])?;
+                            halo.pack(&ex, c)
                         })?;
-                        // SAFETY: as above; each epoch pulls before it replays this.
                         let unpack = LiveGraph::capture(&st, |c| unsafe {
-                            halo.unpack(&ex, c, win.storage())
+                            crate::gpu::lease(c, &[], &[win.storage()])?;
+                            halo.unpack(&ex, c)
                         })?;
                         let out = (g.ctx().clone(), halo.ptrs(), halo.backer());
                         *side = Some(OnGpu {
@@ -903,28 +938,98 @@ mod tests {
         assert!(grew > 0, "no frame off the plan read a new tile");
     }
 
-    /// A frame off the object is refused, with the frames before it and the halo rows they
-    /// add split.
+    /// A frame off the object closes the plan: the frames before it and the halo rows they
+    /// add are split, and no frame after it.
     #[test]
     fn split_refuses_frames_off_the_object() {
         let (shape, both, mid) = far();
-        let mut plan = LivePlan::new(&shape, &both, Scheme::Strips, 2).unwrap();
+        let mut plan = LivePlan::new(&shape, &both, Scheme::Strips, 2, ROOM).unwrap();
         let off: Vec<ViewAddr> = mid
             .iter()
             .map(|&v| ViewAddr { oy: u32::MAX, ..v })
             .collect();
         let mut shares = vec![Share::default(); 2];
-        let err = plan
-            .split(&[mid.as_slice(), &off].concat(), &mut shares)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("outside"), "{err}");
+        let took = plan.split(&[mid.as_slice(), &off].concat(), &mut shares);
+        assert_eq!(took.unwrap(), 1);
+        let refused = Some(Refusal::View {
+            frame: 1,
+            view: off[0],
+        });
+        assert_eq!(plan.closed(), refused);
         for s in &shares {
             assert_eq!(s.frames, [0], "only the frame before the refused one");
             assert!(!s.halo.unpack.is_empty());
         }
-        plan.split(&both, &mut shares).unwrap();
-        let n: usize = shares.iter().map(|s| s.frames.len()).sum();
-        assert!(n >= both.len() / shape.nmode as usize);
+        assert_eq!(plan.split(&both, &mut shares).unwrap(), 0);
+        assert_eq!(shares, vec![Share::default(); 2]);
+        assert_eq!(plan.closed(), refused);
+    }
+
+    /// Split in the batches a one-GPU scan lands, the plan takes the frames it lands and
+    /// closes at the frame it refuses: one off the object, one with no free slot left on a
+    /// tile, one past the scan. Every region's scan, binning its own tiles with the one-GPU
+    /// slab size, lands its share whole.
+    #[test]
+    fn split_closes_where_one_gpu_refuses() {
+        let ctx = Context::new(0).expect("GPU 0");
+        let s = ctx.new_stream().unwrap();
+        let one = NonZeroU32::new(1).unwrap();
+        let (_, shape, views, scheme) = cases().swap_remove(0);
+        let (nmode, fill) = (shape.nmode as usize, [1.0, 0.0]);
+        let k = shape.nframe as usize / 2;
+        let cap = shape.tile_cap(&views);
+        let mut off = views.clone();
+        off[k * nmode..][..nmode]
+            .iter_mut()
+            .for_each(|v| v.oy = u32::MAX);
+        let short = ScanShape {
+            nframe: k as u32,
+            ..shape
+        };
+        for (what, sh, planned, cap, pushed) in [
+            ("off the object", shape, &views[..], cap, &off),
+            ("a full slab", shape, &views[..], cap - 1, &views),
+            ("past the scan", short, &views[..k * nmode], cap, &views),
+        ] {
+            let batches: Vec<&[ViewAddr]> = pushed.chunks(7 * nmode).collect();
+            let mut scan = LiveScan::new(&s, &sh, one, cap, fill, 1).unwrap();
+            let mut b = scan.backer();
+            let landed: Vec<u32> = batches
+                .iter()
+                .map(|batch| {
+                    b.back(batch).unwrap();
+                    scan.push(batch).unwrap()
+                })
+                .collect();
+            let closed = scan.closed();
+            assert!(closed.is_some(), "{what}");
+            for ngpu in [2, 4] {
+                let what = format!("{what} on {ngpu}");
+                let mut plan = LivePlan::new(&sh, planned, scheme, ngpu, cap).unwrap();
+                let mut local: Vec<(LiveScan, ScanBacker)> = plan
+                    .regions()
+                    .iter()
+                    .map(|g| {
+                        let l = LiveScan::owned(&s, &g.shape, one, cap, fill, 1, &g.own).unwrap();
+                        let b = l.backer();
+                        (l, b)
+                    })
+                    .collect();
+                let mut shares = vec![Share::default(); ngpu];
+                for (batch, &want) in batches.iter().zip(&landed) {
+                    assert_eq!(plan.split(batch, &mut shares).unwrap(), want, "{what}");
+                    for ((l, b), share) in local.iter_mut().zip(&shares) {
+                        assert!(share.frames.iter().all(|&f| f < want), "{what}");
+                        b.back(&share.views).unwrap();
+                        let n = l.push(&share.views).unwrap();
+                        assert_eq!(n as usize, share.frames.len(), "{what}");
+                    }
+                }
+                assert_eq!(plan.closed(), closed, "{what}");
+                for (l, _) in &local {
+                    assert_eq!((l.closed(), l.lost()), (None, 0), "{what}");
+                }
+            }
+        }
     }
 }

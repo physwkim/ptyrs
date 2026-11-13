@@ -6,6 +6,7 @@ pub mod exchange;
 pub mod feed;
 mod halo;
 pub mod live;
+pub mod live_ap;
 pub mod p2p;
 pub mod partition;
 #[cfg(test)]
@@ -16,8 +17,9 @@ pub mod worker;
 
 pub use ap::{ApConfig, ApProblem, DistAp, NLEAF, RegionLoad};
 pub use exchange::{Exchange, Layout};
-pub use halo::{HaloBacker, HaloRow, HaloRows, LiveHaloBufs};
+pub use halo::{HaloBacker, HaloBufs, HaloRow, HaloRows};
 pub use live::{LivePlan, LiveRegion, Share};
+pub use live_ap::DistLiveAp;
 pub use partition::{Csr, DEFAULT_TILE, Partition, Region, Scheme, TileGrid};
 pub use worker::{Gpu, Workers};
 

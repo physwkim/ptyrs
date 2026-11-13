@@ -733,16 +733,16 @@ CR_DONE:
 }
 
 // Runs r < *count of the table of [dst, src, len] triples, warp w = global thread / 32 taking
-// runs w, w + nwarps, ...: dst[i] = src[i] (64-bit words) for i = lane, striding by 32 while
-// i < len.
+// runs w, w + nwarps, ...: dst[i] = src[i] (64-bit words) for i = lane + 32 j while i < len,
+// four loads of j issued before their stores.
 .visible .entry copy_listed(
     .param .u64 p_runs,
     .param .u64 p_count
 )
 {
-    .reg .pred %p<3>;
+    .reg .pred %p<6>;
     .reg .b32 %r<10>;
-    .reg .b64 %rd<12>;
+    .reg .b64 %rd<18>;
 
     ld.param.u64 %rd1, [p_runs];
     ld.param.u64 %rd2, [p_count];
@@ -774,10 +774,22 @@ CL_WORD:
     @%p2 bra CL_NEXT;
     shl.b64 %rd8, %rd7, 3;
     add.s64 %rd9, %rd5, %rd8;
-    ld.global.u64 %rd10, [%rd9];
     add.s64 %rd11, %rd4, %rd8;
+    add.s64 %rd12, %rd7, 32;
+    setp.lt.u64 %p3, %rd12, %rd6;
+    add.s64 %rd12, %rd7, 64;
+    setp.lt.u64 %p4, %rd12, %rd6;
+    add.s64 %rd12, %rd7, 96;
+    setp.lt.u64 %p5, %rd12, %rd6;
+    ld.global.u64 %rd10, [%rd9];
+    @%p3 ld.global.u64 %rd13, [%rd9+256];
+    @%p4 ld.global.u64 %rd14, [%rd9+512];
+    @%p5 ld.global.u64 %rd15, [%rd9+768];
     st.global.u64 [%rd11], %rd10;
-    add.s64 %rd7, %rd7, 32;
+    @%p3 st.global.u64 [%rd11+256], %rd13;
+    @%p4 st.global.u64 [%rd11+512], %rd14;
+    @%p5 st.global.u64 [%rd11+768], %rd15;
+    add.s64 %rd7, %rd7, 128;
     bra CL_WORD;
 CL_NEXT:
     add.u32 %r6, %r6, %r8;

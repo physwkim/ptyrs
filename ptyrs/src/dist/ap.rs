@@ -31,7 +31,7 @@ use crate::gpu::{
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{Context, DeviceBuffer, Stream};
 
-use crate::dist::exchange::{self, Pull};
+use crate::dist::exchange::{self, Pull, Run};
 use crate::dist::halo::{Halo, HaloBufs, HaloRows, Window, peers, view_addr};
 use crate::dist::{DEFAULT_TILE, DistError, Exchange, Gpu, Partition, Scheme, Workers};
 
@@ -466,14 +466,22 @@ impl State {
             .transpose()?;
         let obj = rp.window.crop(&data.object, plan.run.grid().obj());
         let obj = DeviceBuffer::from_host(stream, &obj)?;
-        let halo = HaloBufs::new(
+        let rows = &plan.halo_rows[gpu.region()];
+        let nrow = [rows.pack.len(), rows.unpack.len()];
+        // Every row is listed here, so one chunk backs each list.
+        let chunk = nrow[0].max(nrow[1]) * size_of::<Run>();
+        let mut halo = HaloBufs::new(
             stream,
-            &plan.halo,
-            gpu.region(),
-            &plan.halo_rows[gpu.region()],
+            plan.halo.words(gpu.region()),
+            nrow.map(|n| n as u64),
             rp.window,
             obj.cu_deviceptr(),
+            chunk,
         )?;
+        halo.backer().back(rows)?;
+        halo.push(rows)?;
+        // The side stream's unpack leases the lists pushed here, on the main stream.
+        gpu.synchronize()?;
         Ok(Self {
             k: Kernels::load(gpu.ctx())?,
             ex: Exchange::load(gpu.ctx())?,
@@ -500,10 +508,11 @@ impl State {
     }
 
     fn ptrs(&self) -> Ptrs {
+        let [halo_send, halo_recv] = self.halo.ptrs();
         Ptrs {
             ctx: self.obj.context().clone(),
-            halo_send: self.halo.send.cu_deviceptr(),
-            halo_recv: self.halo.recv.cu_deviceptr(),
+            halo_send,
+            halo_recv,
             max_bits: self
                 .obj_sums
                 .as_ref()
@@ -662,9 +671,10 @@ impl State {
         }
         if let Some((sums, inertia)) = obj_update {
             k.normalize_obj(&ctx, views, obj, sums, gmax, inertia)?;
-            // SAFETY: the runs address this region's object and send buffer, which its peers
-            // last pulled on their side streams, joined before the fence.
-            unsafe { ex.copy_runs(&stream, &halo.pack)? };
+            // SAFETY: the rows address this region's object, updated just above on this
+            // stream, and its send buffer, which its peers last pulled on their side streams,
+            // joined before the fence.
+            unsafe { halo.pack(ex, &ctx)? };
         }
         if let (Some(t), Some(inertia)) = (tree.as_mut(), plan.probe_inertia) {
             gpu.join()?;
@@ -681,7 +691,7 @@ impl State {
             // touched by nothing else until that join: the interior stacks read own tiles only.
             gpu.side(|s| unsafe {
                 exchange::pull(s, &links.halo)?;
-                ex.copy_runs(s, &halo.unpack)
+                Ok(halo.unpack(ex, &ExecutionContext::new(s.clone()))?)
             })?;
         }
         drop(ctx);
