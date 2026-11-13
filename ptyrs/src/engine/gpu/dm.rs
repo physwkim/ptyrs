@@ -1,11 +1,11 @@
-//! PyNX DM on the GPU.
+//! PyNX DM on the GPU, and the cycle it shares with RAAR.
 
 use crate::gpu::{Error as GpuError, Exit, FusedBufs, FusedInputs, FusedSums};
 use cuda_async::device_operation::ExecutionContext;
 
 use super::device::{M1Bufs, PassesMut};
 use super::{Bufs, Epoch, GpuPtycho};
-use crate::engine::ptycho::{Algorithm, llk_due};
+use crate::engine::ptycho::llk_due;
 use crate::engine::{DmParams, EngineError};
 
 impl GpuPtycho {
@@ -24,14 +24,27 @@ impl GpuPtycho {
     /// take their sums of the carried waves by `shifted_psi_sums`, and the offsets step after
     /// the updates.
     pub fn dm(&mut self, params: &DmParams, ncycle: usize) -> Result<(), EngineError> {
+        let epoch = |first| Epoch::Dm {
+            params: *params,
+            first,
+        };
+        self.carried(ncycle, params.calc_llk, params.zero_phase_ramp, epoch)
+    }
+
+    /// `ncycle` cycles of DM or RAAR, `epoch(first)` each: the LLK record due by `calc_llk`
+    /// before the cycle and the balance after it, then the phase ramp's removal.
+    pub(super) fn carried(
+        &mut self,
+        ncycle: usize,
+        calc_llk: usize,
+        zero_phase_ramp: bool,
+        epoch: impl Fn(bool) -> Epoch,
+    ) -> Result<(), EngineError> {
         for ic in 0..ncycle {
-            let epoch = Epoch::Dm {
-                params: *params,
-                first: ic == 0,
-            };
-            let llk = llk_due(params.calc_llk, ic, ncycle);
+            let epoch = epoch(ic == 0);
+            let llk = llk_due(calc_llk, ic, ncycle);
             if llk {
-                self.dev.llk_pass(Some((self.cycle, Algorithm::Dm)))?;
+                self.dev.llk_pass(Some((self.cycle, epoch.algorithm())))?;
             }
             self.dev.steady(epoch, self.cycle)?;
             if llk {
@@ -40,11 +53,29 @@ impl GpuPtycho {
             self.cycle += 1;
         }
         self.collect()?;
-        if params.zero_phase_ramp {
+        if zero_phase_ramp {
             self.zero_phase_ramp()?;
         }
         Ok(())
     }
+}
+
+/// What a DM or RAAR cycle makes of each stack's carried sets and `PO` before the projection.
+#[derive(Clone, Copy)]
+pub(super) enum Mix {
+    /// DM's reflection ([`Exit::Dm`]).
+    Dm { alpha: f32 },
+    /// RAAR's iterate ([`Exit::Raar`]).
+    Raar { beta: f32 },
+}
+
+/// A DM or RAAR cycle: its [`Mix`], `first` for cycle 0 of a call, and `loops` object-only
+/// then probe-only updates with `inertia` (object, probe).
+pub(super) struct Carried {
+    pub mix: Mix,
+    pub first: bool,
+    pub inertia: [Option<f64>; 2],
+    pub loops: usize,
 }
 
 impl Bufs<'_> {
@@ -56,18 +87,39 @@ impl Bufs<'_> {
         params: &DmParams,
         first: bool,
     ) -> Result<(), GpuError> {
-        let alpha = params.alpha as f32;
+        let c = Carried {
+            mix: Mix::Dm {
+                alpha: params.alpha as f32,
+            },
+            first,
+            inertia: [params.obj_inertia, params.probe_inertia],
+            loops: params.loop_obj_probe,
+        };
+        self.carried_cycle(ctx, passes, &c)
+    }
+
+    /// One DM or RAAR cycle enqueued on `ctx`.
+    pub(super) fn carried_cycle(
+        &mut self,
+        ctx: &ExecutionContext,
+        passes: &mut PassesMut<'_>,
+        c: &Carried,
+    ) -> Result<(), GpuError> {
+        let [obj_inertia, probe_inertia] = c.inertia;
         // Whether the projection added the first object-only update's sums, which read the
         // projected exit waves and the probe the projection read.
         let mut summed = false;
         match passes {
             PassesMut::M1(m1) => {
                 for s in 0..self.stacks.len() {
-                    self.dm_m1(ctx, m1, s, alpha, first)?;
+                    match c.mix {
+                        Mix::Dm { alpha } => self.dm_m1(ctx, m1, s, alpha, c.first)?,
+                        Mix::Raar { beta } => self.raar_m1(ctx, m1, s, beta, c.first)?,
+                    }
                 }
             }
             PassesMut::Fused(f) => {
-                summed = params.loop_obj_probe > 0 && params.obj_inertia.is_some();
+                summed = c.loops > 0 && obj_inertia.is_some();
                 if self.features.stepped() {
                     // No record, so nothing ended.
                     let _ = self.step_features(ctx, f, None)?;
@@ -76,18 +128,29 @@ impl Bufs<'_> {
                 let mut m = self.features.lend(ctx, self.kernels, &dims, self.probe)?;
                 for s in 0..self.stacks.len() {
                     let stack = self.table.at(s);
-                    let psi = self.stacks.get(s).psi;
+                    let exit = match c.mix {
+                        Mix::Dm { alpha } => {
+                            let psi = self.stacks.get(s).psi;
+                            match c.first {
+                                true => Exit::DmFirst { psi },
+                                false => Exit::Dm { psi, alpha },
+                            }
+                        }
+                        Mix::Raar { beta } => {
+                            let (st, iterate) = self.stacks.raar(s);
+                            let psi = st.psi;
+                            match c.first {
+                                true => Exit::RaarFirst { psi, iterate },
+                                false => Exit::Raar { psi, iterate, beta },
+                            }
+                        }
+                    };
                     let inputs = FusedInputs {
                         views: self.views,
                         counts: self.counts,
                         obj: self.obj,
                         probe: self.probe,
                         model: m.model,
-                    };
-                    let exit = if first {
-                        Exit::DmFirst { psi }
-                    } else {
-                        Exit::Dm { psi, alpha }
                     };
                     let sums = FusedSums {
                         obj: summed.then_some(&mut *self.obj_sums),
@@ -99,8 +162,8 @@ impl Bufs<'_> {
                 }
             }
         }
-        for _ in 0..params.loop_obj_probe {
-            for (o, p) in [(params.obj_inertia, None), (None, params.probe_inertia)] {
+        for _ in 0..c.loops {
+            for (o, p) in [(obj_inertia, None), (None, probe_inertia)] {
                 if o.is_none() && p.is_none() {
                     continue;
                 }

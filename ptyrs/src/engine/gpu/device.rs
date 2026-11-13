@@ -35,7 +35,7 @@ use super::{
 use crate::engine::features::{POSITION_LIMIT, POSITION_STEP};
 use crate::engine::{
     ApParams, BhParams, BhStep, DmParams, EngineError, Features, LsqmlParams, LsqmlStep, MlParams,
-    RpieParams,
+    RaarParams, RpieParams,
 };
 
 /// Every buffer, module and plan a cycle launches on, and the graphs captured from them.
@@ -82,6 +82,9 @@ pub(super) struct Device {
     bh_state: Option<Box<BhState>>,
     /// LSQML's state, built by the first LSQML call and replaced only for another batch size.
     lsqml: Option<Box<LsqmlState>>,
+    /// RAAR's iterate per stack, laid out as `stacks`' `psi`: built by a RAAR run and dropped
+    /// by [`Self::steady_with`] once no RAAR run, whose graphs bind it, is left.
+    raar_iterate: Option<Vec<DeviceBuffer<C32>>>,
     features: FeatureBufs,
 }
 
@@ -518,6 +521,11 @@ enum Cycle {
         params: DmParams,
         first: bool,
     },
+    /// Its buffers are the device's RAAR iterate, which every RAAR epoch shares.
+    Raar {
+        params: RaarParams,
+        first: bool,
+    },
     Rpie(RpieParams, Box<RpieScratch>),
     /// Its buffers are the device's [`MlState`], which every ML epoch shares.
     Ml {
@@ -544,6 +552,7 @@ impl Cycle {
         match *self {
             Self::Ap { params, llk } => Epoch::Ap { params, llk },
             Self::Dm { params, first } => Epoch::Dm { params, first },
+            Self::Raar { params, first } => Epoch::Raar { params, first },
             Self::Rpie(p, _) => Epoch::Rpie(p),
             Self::Ml { params, first, llk } => Epoch::Ml { params, first, llk },
             Self::Bh { params, cg } => Epoch::Bh { params, cg },
@@ -899,7 +908,11 @@ pub(super) struct Bufs<'a> {
 }
 
 /// The stacks lent to a cycle, one at a time.
-pub(super) struct Stacks<'a>(&'a mut [StackBufs]);
+pub(super) struct Stacks<'a> {
+    bufs: &'a mut [StackBufs],
+    /// RAAR's iterate per stack, once a RAAR run has built it.
+    iterate: Option<&'a mut [DeviceBuffer<C32>]>,
+}
 
 /// Stack `s` lent to a cycle.
 pub(super) struct StackMut<'a> {
@@ -909,15 +922,29 @@ pub(super) struct StackMut<'a> {
 
 impl Stacks<'_> {
     pub fn len(&self) -> usize {
-        self.0.len()
+        self.bufs.len()
     }
 
     pub fn get(&mut self, s: usize) -> StackMut<'_> {
-        let st = &mut self.0[s];
+        let st = &mut self.bufs[s];
         StackMut {
             frames: &st.frames,
             psi: &mut st.psi,
         }
+    }
+
+    /// Stack `s` and its RAAR iterate, for a RAAR cycle.
+    pub fn raar(&mut self, s: usize) -> (StackMut<'_>, &mut DeviceBuffer<C32>) {
+        let iterate = self
+            .iterate
+            .as_deref_mut()
+            .expect("Device::new_run built the RAAR iterate");
+        let st = &mut self.bufs[s];
+        let stack = StackMut {
+            frames: &st.frames,
+            psi: &mut st.psi,
+        };
+        (stack, &mut iterate[s])
     }
 }
 
@@ -1013,6 +1040,7 @@ impl Device {
             ml: None,
             bh_state: None,
             lsqml: None,
+            raar_iterate: None,
             features: FeatureBufs::default(),
             stack_size,
             wide_size,
@@ -1204,7 +1232,10 @@ impl Device {
             obj_len: self.obj_len,
             probe_len: self.probe_len,
             table: &self.table,
-            stacks: Stacks(&mut self.stacks),
+            stacks: Stacks {
+                bufs: &mut self.stacks,
+                iterate: self.raar_iterate.as_deref_mut(),
+            },
             wide: &self.wide,
             llk: &mut self.llk,
             llk_scratch: &mut self.llk_scratch,
@@ -1334,6 +1365,10 @@ impl Device {
     ) -> Result<(), EngineError> {
         let mut runs = std::mem::take(&mut self.runs);
         runs.retain(|r| r.cycle.epoch().run() == epoch.run());
+        if !matches!(epoch, Epoch::Raar { .. }) {
+            // The runs left are all of `epoch.run()`: none binds the iterate.
+            self.raar_iterate = None;
+        }
         let at = match runs.iter().position(|r| r.cycle.epoch() == epoch) {
             Some(at) => Ok(at),
             None => self.new_run(epoch).map(|run| {
@@ -1390,6 +1425,17 @@ impl Device {
         let mut cycle = match epoch {
             Epoch::Ap { params, llk } => Cycle::Ap { params, llk },
             Epoch::Dm { params, first } => Cycle::Dm { params, first },
+            Epoch::Raar { params, first } => {
+                if self.raar_iterate.is_none() {
+                    let len = stack_buf_len(&self.dims(), &self.table);
+                    let zeroed = |_| DeviceBuffer::<C32>::zeroed(&self.stream, len);
+                    let iterate = (0..self.stacks.len())
+                        .map(zeroed)
+                        .collect::<Result<_, _>>()?;
+                    self.raar_iterate = Some(iterate);
+                }
+                Cycle::Raar { params, first }
+            }
             Epoch::Rpie(p) => {
                 let moved = self.features.position.is_some();
                 let scratch = RpieScratch::new(
@@ -1603,6 +1649,9 @@ impl<'a> Bufs<'a> {
             }
             Cycle::Dm { params, first } => {
                 self.dm_cycle(ctx, passes, params, *first).map(|()| None)
+            }
+            Cycle::Raar { params, first } => {
+                self.raar_cycle(ctx, passes, params, *first).map(|()| None)
             }
             Cycle::Rpie(p, scratch) => self.rpie_epoch(ctx, p, &mut scratch.lend()).map(|()| None),
             Cycle::Ml { params, first, llk } => self.with_ml(|b, ml| {

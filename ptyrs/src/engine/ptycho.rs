@@ -1,4 +1,5 @@
-//! [`Ptycho`]: the reconstruction state and the AP, DM and rPIE loops built on the operators.
+//! [`Ptycho`]: the reconstruction state and the AP, DM, RAAR and rPIE loops built on the
+//! operators.
 
 use std::f64::consts::PI;
 use std::ops::Range;
@@ -20,6 +21,7 @@ use crate::engine::{EngineError, Features, Fft2, Observed, shift};
 pub enum Algorithm {
     Ap,
     Dm,
+    Raar,
     Rpie,
     Ml,
     Bh,
@@ -82,6 +84,32 @@ impl Default for DmParams {
             obj_inertia: Some(0.01),
             probe_inertia: Some(0.001),
             alpha: 0.02,
+            loop_obj_probe: 1,
+            calc_llk: 0,
+            zero_phase_ramp: true,
+        }
+    }
+}
+
+/// PyNX `RAAR` parameters. An inertia of `None` leaves that array fixed.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RaarParams {
+    pub obj_inertia: Option<f64>,
+    pub probe_inertia: Option<f64>,
+    /// Relaxation `β` (PyNX default 0.9).
+    pub beta: f64,
+    /// Object-then-probe updates per cycle (PyNX `loop_obj_probe`).
+    pub loop_obj_probe: usize,
+    pub calc_llk: usize,
+    pub zero_phase_ramp: bool,
+}
+
+impl Default for RaarParams {
+    fn default() -> Self {
+        Self {
+            obj_inertia: Some(0.01),
+            probe_inertia: Some(0.001),
+            beta: 0.9,
             loop_obj_probe: 1,
             calc_llk: 0,
             zero_phase_ramp: true,
@@ -153,7 +181,8 @@ pub struct Ptycho {
     fft: Fft2,
     object: Object,
     probe: Probe,
-    /// Object-plane exit waves, one shifted plane per view; DM carries it across cycles.
+    /// Object-plane exit waves, one shifted plane per view; DM and RAAR carry it across
+    /// cycles.
     psi: Vec<C64>,
     features: Features,
     cycle: usize,
@@ -539,18 +568,8 @@ impl Ptycho {
                     *s += (p - r) * (1.0 - a);
                 }
             }
-            let sums = (shifted.as_ref())
-                .map(|s| s.position_sums(self.addr.views(), &self.object, &self.psi, &self.fft));
-            for _ in 0..params.loop_obj_probe {
-                for (o, p) in [(params.obj_inertia, None), (None, params.probe_inertia)] {
-                    if o.is_some() || p.is_some() {
-                        self.update_from_psi(o, p);
-                    }
-                }
-            }
-            if let (Some(d), Some(sums)) = (&mut self.features.position, sums) {
-                position_step(d, &sums);
-            }
+            let inertia = [params.obj_inertia, params.probe_inertia];
+            self.update_obj_probe(shifted.as_ref(), inertia, params.loop_obj_probe);
             if let Some(l) = l {
                 self.record(Algorithm::Dm, l);
                 self.split_scale(1.0);
@@ -559,6 +578,70 @@ impl Ptycho {
         }
         if params.zero_phase_ramp {
             self.zero_phase_ramp();
+        }
+    }
+
+    /// PyNX `RAAR(...)**ncycle` with `b = beta`. Cycle 0 starts from `psi = PO`; later cycles
+    /// mix the carried projection `psi` with the carried iterate `it` it was projected from:
+    /// `psi ← (1 − b/2)·psi + (b/2)·(2·PO − it)`, which becomes the next `it`, then magnitude
+    /// projection `Π_F`. The update, the position step, the LLK record and the balance
+    /// after it are DM's ([`Ptycho::dm`]), from the projection.
+    pub fn raar(&mut self, params: &RaarParams, ncycle: usize) {
+        let (nframe, nmode) = (self.addr.nframe(), self.addr.nmode());
+        let h = 0.5 * params.beta;
+        let mut po = vec![C64::default(); self.psi.len()];
+        let mut iterate = vec![C64::default(); self.psi.len()];
+        for ic in 0..ncycle {
+            let l = llk_due(params.calc_llk, ic, ncycle).then(|| self.llk());
+            self.step_features();
+            let shifted = self.shifted();
+            self.to_psi(shifted.as_ref(), &mut po);
+            if ic == 0 {
+                self.psi.copy_from_slice(&po);
+            } else {
+                for ((s, it), p) in self.psi.iter_mut().zip(&iterate).zip(&po) {
+                    *s = *s * (1.0 - h) + (p * 2.0 - it) * h;
+                }
+            }
+            iterate.copy_from_slice(&self.psi);
+            self.fft.forward(&mut self.psi);
+            let model = Model::of(&self.features, &self.obs);
+            apply_amplitude_with(&self.obs, 0..nframe, nmode, &mut self.psi, model);
+            self.fft.inverse(&mut self.psi);
+            let inertia = [params.obj_inertia, params.probe_inertia];
+            self.update_obj_probe(shifted.as_ref(), inertia, params.loop_obj_probe);
+            if let Some(l) = l {
+                self.record(Algorithm::Raar, l);
+                self.split_scale(1.0);
+            }
+            self.cycle += 1;
+        }
+        if params.zero_phase_ramp {
+            self.zero_phase_ramp();
+        }
+    }
+
+    /// DM's and RAAR's update from the exit waves `self.psi`: their position sums under
+    /// `shifted`, `loops` times an object-only then a probe-only [`psi_to_obj_probe`] with
+    /// `inertia` (object, probe), so the probe update sees the new object, then the step of
+    /// [`Features::position`].
+    fn update_obj_probe(
+        &mut self,
+        shifted: Option<&Shifted>,
+        inertia: [Option<f64>; 2],
+        loops: usize,
+    ) {
+        let sums =
+            shifted.map(|s| s.position_sums(self.addr.views(), &self.object, &self.psi, &self.fft));
+        for _ in 0..loops {
+            for (o, p) in [(inertia[0], None), (None, inertia[1])] {
+                if o.is_some() || p.is_some() {
+                    self.update_from_psi(o, p);
+                }
+            }
+        }
+        if let (Some(d), Some(sums)) = (&mut self.features.position, sums) {
+            position_step(d, &sums);
         }
     }
 

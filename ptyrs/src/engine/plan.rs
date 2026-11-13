@@ -4,7 +4,7 @@
 //! ```text
 //! plan   := step ("->" step)*
 //! step   := engine ["(" [option ("," option)*] ")"] ":" count
-//! engine := "ap" | "dm" | "rpie"
+//! engine := "ap" | "dm" | "raar" | "rpie"
 //! option := name "=" value          value: number, "none", "true" or "false"
 //! ```
 //!
@@ -16,13 +16,14 @@
 
 use std::str::FromStr;
 
-use crate::engine::{ApParams, DmParams, EngineError, GpuPtycho, Ptycho, RpieParams};
+use crate::engine::{ApParams, DmParams, EngineError, GpuPtycho, Ptycho, RaarParams, RpieParams};
 
 /// An engine and its parameters.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Params {
     Ap(ApParams),
     Dm(DmParams),
+    Raar(RaarParams),
     Rpie(RpieParams),
 }
 
@@ -49,6 +50,7 @@ impl Backend for Ptycho {
         match &step.params {
             Params::Ap(p) => self.ap(p, step.count),
             Params::Dm(p) => self.dm(p, step.count),
+            Params::Raar(p) => self.raar(p, step.count),
             Params::Rpie(p) => self.rpie(p, step.count)?,
         }
         Ok(())
@@ -60,6 +62,7 @@ impl Backend for GpuPtycho {
         match &step.params {
             Params::Ap(p) => self.ap(p, step.count),
             Params::Dm(p) => self.dm(p, step.count),
+            Params::Raar(p) => self.raar(p, step.count),
             Params::Rpie(p) => self.rpie(p, step.count),
         }
     }
@@ -121,8 +124,13 @@ fn parse_step(s: &str) -> Result<Step, String> {
     let params = match engine {
         "ap" => Params::Ap(parse_options(options)?),
         "dm" => Params::Dm(parse_options(options)?),
+        "raar" => Params::Raar(parse_options(options)?),
         "rpie" => Params::Rpie(parse_options(options)?),
-        _ => return Err(format!("unknown engine `{engine}`; engines: ap, dm, rpie")),
+        _ => {
+            return Err(format!(
+                "unknown engine `{engine}`; engines: ap, dm, raar, rpie"
+            ));
+        }
     };
     Ok(Step { params, count })
 }
@@ -185,6 +193,14 @@ fn parse_real(v: &str) -> Result<f64, String> {
     }
 }
 
+/// [`parse_real`] `<= 1`.
+fn parse_unit(v: &str) -> Result<f64, String> {
+    match parse_real(v)? {
+        x if x <= 1.0 => Ok(x),
+        _ => Err(format!("expected a number in [0, 1], got `{v}`")),
+    }
+}
+
 /// [`parse_real`], or `none` for an array the engine leaves fixed.
 fn parse_update(v: &str) -> Result<Option<f64>, String> {
     if v == "none" {
@@ -233,12 +249,39 @@ impl Schema for DmParams {
             Ok(())
         }),
         // PyNX: alpha·AP + (1 − alpha)·DM
-        ("alpha", |p, v| match parse_real(v)? {
-            a if a <= 1.0 => {
-                p.alpha = a;
-                Ok(())
-            }
-            _ => Err(format!("expected a number in [0, 1], got `{v}`")),
+        ("alpha", |p, v| {
+            p.alpha = parse_unit(v)?;
+            Ok(())
+        }),
+        ("loop_obj_probe", |p, v| {
+            p.loop_obj_probe = parse_count(v)?;
+            Ok(())
+        }),
+        ("calc_llk", |p, v| {
+            p.calc_llk = parse_usize(v)?;
+            Ok(())
+        }),
+        ("zero_phase_ramp", |p, v| {
+            p.zero_phase_ramp = parse_bool(v)?;
+            Ok(())
+        }),
+    ];
+}
+
+impl Schema for RaarParams {
+    const ENGINE: &'static str = "raar";
+    const OPTIONS: &'static [(&'static str, Setter<Self>)] = &[
+        ("obj_inertia", |p, v| {
+            p.obj_inertia = parse_update(v)?;
+            Ok(())
+        }),
+        ("probe_inertia", |p, v| {
+            p.probe_inertia = parse_update(v)?;
+            Ok(())
+        }),
+        ("beta", |p, v| {
+            p.beta = parse_unit(v)?;
+            Ok(())
         }),
         ("loop_obj_probe", |p, v| {
             p.loop_obj_probe = parse_count(v)?;
@@ -295,7 +338,7 @@ mod tests {
 
     #[test]
     fn parses_steps_over_engine_defaults() {
-        let plan: Plan = " dm:100 -> ap( probe_inertia = 0.001 , calc_llk=5 ):40\n->rpie(obj_step=none, batch_size=4):3 -> dm():1"
+        let plan: Plan = " dm:100 -> ap( probe_inertia = 0.001 , calc_llk=5 ):40\n->rpie(obj_step=none, batch_size=4):3 -> dm():1 -> raar:20"
             .parse()
             .unwrap();
         let ap = ApParams {
@@ -313,6 +356,7 @@ mod tests {
             (Params::Ap(ap), 40),
             (Params::Rpie(rpie), 3),
             (Params::Dm(DmParams::default()), 1),
+            (Params::Raar(RaarParams::default()), 20),
         ]
         .map(|(params, count)| Step { params, count });
         assert_eq!(plan.steps(), want);
@@ -352,6 +396,18 @@ mod tests {
                 DmParams::OPTIONS.len(),
             ),
             (
+                "raar(obj_inertia=0.5, probe_inertia=none, beta=0.75, loop_obj_probe=2, calc_llk=7, zero_phase_ramp=false):1",
+                Params::Raar(RaarParams {
+                    obj_inertia: Some(0.5),
+                    probe_inertia: None,
+                    beta: 0.75,
+                    loop_obj_probe: 2,
+                    calc_llk: 7,
+                    zero_phase_ramp: false,
+                }),
+                RaarParams::OPTIONS.len(),
+            ),
+            (
                 "rpie(obj_step=0.5, probe_step=none, obj_alpha=0.25, probe_alpha=0.75, batch_size=4, calc_llk=7):1",
                 Params::Rpie(RpieParams {
                     obj_step: Some(0.5),
@@ -378,7 +434,7 @@ mod tests {
             ("dm", "expected `engine:count`"),
             ("dm:0", "plan step `dm:0`: count: must be at least 1"),
             ("dm:-1", "count: expected a positive integer, got `-1`"),
-            ("ml:10", "unknown engine `ml`; engines: ap, dm, rpie"),
+            ("ml:10", "unknown engine `ml`; engines: ap, dm, raar, rpie"),
             ("dm(alpha=0.1:10", "must end with `)`"),
             (
                 "dm(beta=1):10",
@@ -390,6 +446,14 @@ mod tests {
             (
                 "dm(alpha=1.5):10",
                 "alpha: expected a number in [0, 1], got `1.5`",
+            ),
+            (
+                "raar(beta=1.5):10",
+                "beta: expected a number in [0, 1], got `1.5`",
+            ),
+            (
+                "raar(alpha=0.5):10",
+                "unknown raar option `alpha`; options: obj_inertia, probe_inertia, beta, loop_obj_probe, calc_llk, zero_phase_ramp",
             ),
             (
                 "dm(obj_inertia=-0.1):10",
