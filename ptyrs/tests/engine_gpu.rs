@@ -37,7 +37,7 @@ struct Setup {
 const M1: Setup = Setup {
     frame: 32,
     options: GpuOptions {
-        stack_size: 7,
+        stack_size: Some(7),
         graph: true,
         llk_slots: 3,
         fused: false,
@@ -595,7 +595,7 @@ fn gpu_rejects_what_it_cannot_run() {
     let mut g = GpuPtycho::new(&ctx(), &scan, two, probe.clone(), M1.options).unwrap();
     assert!(g.rpie(&ptychi::RPIE, 1).is_err());
     let zero = GpuOptions {
-        stack_size: 0,
+        stack_size: Some(0),
         ..M1.options
     };
     assert!(GpuPtycho::new(&ctx(), &scan, object.clone(), probe.clone(), zero).is_err());
@@ -1233,7 +1233,12 @@ fn rpie_position_batch_over_stack() {
         batch_size: 12,
         ..ptychi::RPIE
     };
-    assert!(params.batch_size > FUSED.options.stack_size);
+    assert!(
+        FUSED
+            .options
+            .stack_size
+            .is_some_and(|n| params.batch_size > n)
+    );
     let start = featured_start(2, false, false);
     features_match_cpu(Cycles::Rpie(params), &start, &moved, 3);
 }
@@ -1452,7 +1457,7 @@ fn position_is_bit_identical_across_stack_splits() {
     let [.., ml] = feature_cycles(3);
     let run = |stack_size: usize| {
         let options = GpuOptions {
-            stack_size,
+            stack_size: Some(stack_size),
             ..FUSED.options
         };
         let mut g = GpuPtycho::new(&ctx(), &scan, object.clone(), probe.clone(), options).unwrap();
@@ -1482,6 +1487,37 @@ fn position_is_bit_identical_across_stack_splits() {
             "stacks of {stack_size}: offsets differ"
         );
     }
+}
+
+/// On a 64 MiB L2 the default stack size cuts 30 frames of 256x256 with two probe modes into
+/// stacks of 24 for the fused passes over the shared scratch and of 12 for the rest: AP, DM
+/// and ML cycles modelling a scale and a position give the bits of stacks of 7 for all.
+#[test]
+fn default_stacks_give_the_bits_of_explicit_stacks() {
+    let (scan, object, probe) = start(256, 2, false);
+    let features = Features {
+        scale: Some(vec![1.0; NPOS]),
+        position: Some(drawn_offsets()),
+        ..Features::default()
+    };
+    let run = |stack_size| {
+        let options = GpuOptions {
+            stack_size,
+            ..FUSED.options
+        };
+        let mut g = GpuPtycho::new(&ctx(), &scan, object.clone(), probe.clone(), options).unwrap();
+        g.set_features(&features).unwrap();
+        for cycles in feature_cycles(2) {
+            cycles.gpu(&mut g, 4);
+        }
+        bit_state(&mut g)
+    };
+    let (seven, default) = (run(Some(7)), run(None));
+    assert_eq!(seven.llk.len(), 3 * 3 + 1);
+    assert!(default.llk == seven.llk, "LLK records differ");
+    assert!(default.object == seven.object, "object differs");
+    assert!(default.probe == seven.probe, "probe differs");
+    assert!(default.features == seven.features, "features differ");
 }
 
 /// The bits of a run's object and probe.

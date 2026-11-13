@@ -74,7 +74,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if gpu {
         let ctx = CudaContext::new(0).map_err(EngineError::from)?;
         let options = GpuOptions {
-            stack_size,
+            stack_size: Some(stack_size),
             ..GpuOptions::default()
         };
         let mut g = GpuPtycho::new(&ctx, &scan, object.clone(), probe.clone(), options)?;

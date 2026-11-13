@@ -500,7 +500,7 @@ mod tests {
                 .unwrap(),
             );
             let opts = GpuOptions {
-                stack_size: nf_max as usize,
+                stack_size: Some(nf_max as usize),
                 graph: true,
                 llk_slots: 8,
                 fused: true,

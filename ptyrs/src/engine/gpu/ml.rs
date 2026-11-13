@@ -240,7 +240,7 @@ impl Bufs<'_> {
     ) -> Result<(), GpuError> {
         let dims = *self.views.dims();
         let mut m = self.features.lend(ctx, self.kernels, &dims, self.probe)?;
-        for s in 0..self.stacks.len() {
+        for s in 0..self.wide.len() {
             let inputs = FusedInputs {
                 views: self.views,
                 counts: self.counts,
@@ -256,7 +256,7 @@ impl Bufs<'_> {
                 ..FusedSums::default()
             };
             self.kernels
-                .fused_project(ctx, &inputs, self.table.at(s), exit, f, sums)?;
+                .fused_project(ctx, &inputs, self.wide.at(s), exit, f, sums)?;
         }
         Ok(())
     }
@@ -295,8 +295,8 @@ impl Bufs<'_> {
     ) -> Result<(), GpuError> {
         let dims = *self.views.dims();
         let mut m = self.features.lend(ctx, self.kernels, &dims, self.probe)?;
-        for s in 0..self.stacks.len() {
-            let stack = self.table.at(s);
+        for s in 0..self.wide.len() {
+            let stack = self.wide.at(s);
             let inputs = FusedInputs {
                 views: self.views,
                 counts: self.counts,

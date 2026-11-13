@@ -85,7 +85,7 @@ fn warm(dir: &Path, algo: &str, size: usize) -> Result<(GpuPtycho, usize), Box<d
     let (object, probe) = read_modes(dir.join("init.h5"))?;
     let ctx = CudaContext::new(0).map_err(EngineError::from)?;
     let options = GpuOptions {
-        stack_size: size,
+        stack_size: Some(size),
         graph: true,
         fused: true,
         ..GpuOptions::default()
