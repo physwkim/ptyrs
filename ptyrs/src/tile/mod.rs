@@ -31,6 +31,10 @@ use cutile::prelude::*;
 mod device {
     use cutile::core::*;
 
+    // `core::f32::consts`' values to the bit: device code names no `core` path.
+    const FRAC_1_PI: f32 = 0.318_309_87;
+    const PI: f32 = 3.141_592_7;
+
     unsafe fn load_i32(p: *const i32, i: i32) -> i32 {
         let base: PointerTile<*const i32, { [] }> = pointer_to_tile(p);
         let at: PointerTile<*const i32, { [] }> = base.offset(i);
@@ -232,6 +236,22 @@ mod device {
         (f0, nf)
     }
 
+    /// `ptyrs_kernels::pixel::quad_phase` at squared centre distances `r2`: the angle over
+    /// pi, formed as the SIMT kernels form it, less its nearest even integer before `cos`
+    /// and `sin`, as `cospif` and `sinpif` reduce it. cutile has no `cospi` or `sinpi`.
+    fn quad_phase<const R: i32, const C: i32>(
+        quad: f32,
+        r2: Tile<f32, { [R, C] }>,
+    ) -> (Tile<f32, { [R, C] }>, Tile<f32, { [R, C] }>) {
+        let quad_pi: f32 = quad * FRAC_1_PI;
+        let y: Tile<f32, { [R, C] }> = broadcast_scalar(quad_pi, shape![R, C]) * r2;
+        let half: Tile<f32, { [R, C] }> = constant(0.5f32, shape![R, C]);
+        let n: Tile<f32, { [R, C] }> = floor(y * half + half);
+        let pi: Tile<f32, { [R, C] }> = constant(PI, shape![R, C]);
+        let a: Tile<f32, { [R, C] }> = pi * (y - (n + n));
+        (cos(a), sin(a))
+    }
+
     /// Object tile `ty * ntx + tx` of program `(tx, ty, ..)` in a `(ntx, nty, ..)` grid, and
     /// the rows and columns of its pixels `[16 ty, 16 tx] + [0..16, 0..16]`.
     fn obj_tile() -> (i32, Tile<i32, { [16, 16] }>, Tile<i32, { [16, 16] }>) {
@@ -296,7 +316,6 @@ mod device {
             let one_i: Tile<i32, { [16, 16] }> = constant(1i32, shape![16, 16]);
             let two_i: Tile<i32, { [16, 16] }> = constant(2i32, shape![16, 16]);
             let zero_f: Tile<f32, { [16, 16] }> = constant(0.0f32, shape![16, 16]);
-            let quad_t: Tile<f32, { [16, 16] }> = broadcast_scalar(quad, shape![16, 16]);
 
             let owned: Tile<bool, { [16, 16] }> = lt_tile(ys, nyo_t) & lt_tile(xs, nxo_t);
             let px: Tile<i32, { [16, 16] }> =
@@ -361,9 +380,8 @@ mod device {
                     let dy: Tile<i32, { [16, 16] }> = pry - hy_t;
                     let dx: Tile<i32, { [16, 16] }> = prx - hx_t;
                     let r2: Tile<f32, { [16, 16] }> = convert_tile(dy * dy + dx * dx);
-                    let a: Tile<f32, { [16, 16] }> = quad_t * r2;
-                    let q_re: Tile<f32, { [16, 16] }> = cos(a);
-                    let q_im: Tile<f32, { [16, 16] }> = sin(a);
+                    let (q_re, q_im): (Tile<f32, { [16, 16] }>, Tile<f32, { [16, 16] }>) =
+                        quad_phase(quad, r2);
                     let si: Tile<i32, { [16, 16] }> =
                         (plane + ((pry + hy_t) % ny_t) * nx_t + (prx + hx_t) % nx_t) * two_i;
                     let s_re: Tile<f32, { [16, 16] }> = unsafe { gather(psi, si, m) };
@@ -445,9 +463,7 @@ mod device {
         let dy: Tile<i32, { [8, 32] }> = ys - hy_t;
         let dx: Tile<i32, { [8, 32] }> = xs - hx_t;
         let r2: Tile<f32, { [8, 32] }> = convert_tile(dy * dy + dx * dx);
-        let a: Tile<f32, { [8, 32] }> = broadcast_scalar(quad, shape![8, 32]) * r2;
-        let q_re: Tile<f32, { [8, 32] }> = cos(a);
-        let q_im: Tile<f32, { [8, 32] }> = sin(a);
+        let (q_re, q_im): (Tile<f32, { [8, 32] }>, Tile<f32, { [8, 32] }>) = quad_phase(quad, r2);
         let at: Tile<i32, { [8, 32] }> = ((ys + hy_t) % ny_t) * nx_t + (xs + hx_t) % nx_t;
 
         let n: i32 = ny * nx;
