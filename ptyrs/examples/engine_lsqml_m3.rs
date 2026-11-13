@@ -103,7 +103,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let (mut o, mut p) = (object, probe);
         let mut var = ProbeVariation::none(p.plane_shape());
         let optics = Optics::far_field(&scan.geometry);
-        let mut cpu = Lsqml::new(params);
+        let mut cpu = Lsqml::new(params)?;
         let t = Instant::now();
         for e in 1..=nepoch {
             cpu.epoch(

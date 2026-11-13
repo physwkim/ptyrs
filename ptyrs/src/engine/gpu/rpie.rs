@@ -26,9 +26,7 @@ impl GpuPtycho {
                 "rPIE needs exactly one object mode".into(),
             ));
         }
-        if params.batch_size == 0 {
-            return Err(EngineError::Invalid("rPIE batch_size must be >= 1".into()));
-        }
+        params.validate()?;
         if self.dev.has_stepped() {
             return Err(EngineError::Invalid(
                 "rPIE models no intensity scale or background".into(),

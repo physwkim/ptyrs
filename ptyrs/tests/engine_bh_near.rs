@@ -109,7 +109,8 @@ fn bh_matches_ptychi_in_near_field() {
                 probe_rho: 1.0,
                 position_rho: 0.1,
                 seed: 7,
-            });
+            })
+            .unwrap();
             let (mut object, mut probe) = (object0.clone(), probe0.clone());
             let got: Vec<_> = (0..EPOCHS)
                 .flat_map(|e| {

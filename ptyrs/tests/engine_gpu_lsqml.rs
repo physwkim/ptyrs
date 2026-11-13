@@ -159,7 +159,10 @@ fn steps_match_cpu(position: Option<Vec<[f64; 2]>>) {
         let optics = Optics::far_field(&scan.geometry);
         let (mut o, mut p) = (object.clone(), probe.clone());
         let mut var = ProbeVariation::none(probe.plane_shape());
-        let mut cpu = Lsqml::new(params).with_features(features.clone()).unwrap();
+        let mut cpu = Lsqml::new(params)
+            .unwrap()
+            .with_features(features.clone())
+            .unwrap();
         let mut worst = [0.0f64; 6];
         for nepoch in 1..=NEPOCH {
             let want = cpu.epoch(
@@ -246,7 +249,10 @@ fn matches_cpu(position: Option<Vec<[f64; 2]>>) {
         let optics = Optics::far_field(&scan.geometry);
         let (mut o, mut p) = (object.clone(), probe.clone());
         let mut var = ProbeVariation::none(probe.plane_shape());
-        let mut cpu = Lsqml::new(params).with_features(features.clone()).unwrap();
+        let mut cpu = Lsqml::new(params)
+            .unwrap()
+            .with_features(features.clone())
+            .unwrap();
         let want: Vec<_> = (0..NEPOCH)
             .map(|cycle| {
                 cpu.epoch(
@@ -363,7 +369,10 @@ fn lsqml_restarts_and_rejects() {
         let (mut o, mut p) = (gpu.object().unwrap(), gpu.probe().unwrap());
         let at = Ptycho::new(&scan, o.clone(), p.clone()).unwrap();
         let mut var = ProbeVariation::none(p.plane_shape());
-        let mut cpu = Lsqml::new(params).with_features(features.clone()).unwrap();
+        let mut cpu = Lsqml::new(params)
+            .unwrap()
+            .with_features(features.clone())
+            .unwrap();
         let want = cpu.epoch(
             at.addr(),
             at.observed(),

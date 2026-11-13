@@ -254,7 +254,8 @@ fn directions_match_central_differences() {
         batch_size: BATCH,
         cost: Cost::Poisson,
         seed: 0,
-    });
+    })
+    .unwrap();
     let views = &s.addr.views()[..BATCH * s.addr.nmode()];
     let h = 1e-3;
     for (k, c) in s.cases.iter().enumerate() {
@@ -353,6 +354,7 @@ fn step_matches_ptychi() {
             cost: Cost::Poisson,
             seed: 0,
         })
+        .unwrap()
         .with_preconditioner(pre)
         .step(views, &c.obs, &c.optics, &mut objects, &mut probe, &mut var);
         let want: Vec<_> = rows.iter().filter(|r| r[0] == k as f64).collect();
@@ -404,6 +406,7 @@ fn step_with_positions_matches_ptychi() {
             cost: Cost::Poisson,
             seed: 0,
         })
+        .unwrap()
         .with_preconditioner(pre)
         .with_features(Features {
             position: Some(d0.clone()),
@@ -452,7 +455,8 @@ fn reconstruction_matches_ptychi() {
             batch_size: BATCH,
             cost: Cost::Poisson,
             seed: 7,
-        });
+        })
+        .unwrap();
         let want: Vec<_> = trace.iter().filter(|r| r[0] == k as f64).collect();
         let epochs = want.len() - 1;
         let mut llks = vec![poisson_llk(&s, c, &objects, &probe)];

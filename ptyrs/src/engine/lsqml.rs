@@ -38,6 +38,17 @@ pub struct LsqmlParams {
     pub seed: u64,
 }
 
+impl LsqmlParams {
+    /// The check every LSQML run makes of its params, on the CPU and the GPU: a batch has
+    /// frames.
+    pub(crate) fn validate(&self) -> Result<(), EngineError> {
+        if self.batch_size == 0 {
+            return Err(EngineError::Invalid("LSQML batch_size must be >= 1".into()));
+        }
+        Ok(())
+    }
+}
+
 /// One batch's step sizes, per frame of the batch in its order.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LsqmlStep {
@@ -402,15 +413,16 @@ pub struct Lsqml {
 }
 
 impl Lsqml {
-    pub fn new(params: LsqmlParams) -> Self {
-        assert!(params.batch_size > 0, "batch_size must be positive");
-        Self {
+    /// A run from its first epoch, `Err` on a `batch_size` of 0.
+    pub fn new(params: LsqmlParams) -> Result<Self, EngineError> {
+        params.validate()?;
+        Ok(Self {
             params,
             epochs: 0,
             preconditioner: None,
             a_far: Vec::new(),
             features: Features::default(),
-        }
+        })
     }
 
     /// This run modelling and refining `features`, which hold one entry per frame of the scan

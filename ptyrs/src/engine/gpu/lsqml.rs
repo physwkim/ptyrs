@@ -54,9 +54,7 @@ impl GpuPtycho {
         nepoch: usize,
         calc_llk: usize,
     ) -> Result<(), EngineError> {
-        if params.batch_size == 0 {
-            return Err(EngineError::Invalid("LSQML batch_size must be >= 1".into()));
-        }
+        params.validate()?;
         if self.dev.has_stepped() {
             return Err(EngineError::Invalid(
                 "LSQML refines no intensity scale or background, as pty-chi's".into(),
