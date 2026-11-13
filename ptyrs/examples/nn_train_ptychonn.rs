@@ -2,8 +2,10 @@
 //! patches with the flat start on held-out scans.
 //!
 //! `cargo run --release -p ptyrs --features nn --example nn_train_ptychonn -- <out_dir> [frame] [bin] [nscan] [epochs] [width] [per_scan] [structured]`
-//! (defaults 256, 4, 10000, 30, 32, 10, 0). The training set holds `nscan` scans of
-//! `random_object` and `structured` more of `structured_object`. Each training scan contributes
+//! (defaults 256, 4, 10000, 30, 32, 10, 5000). The training set holds `nscan` scans of
+//! `random_object`'s soft shapes and `structured` more of `structured_object`'s spoke stars,
+//! line pairs and sharp-edged polygons; `sim::object` stays out of it, held out for the
+//! comparison below. Each training scan contributes
 //! `per_scan` of its 100 frames, drawn at random: neighbouring frames of a scan see nearly the
 //! same object pixels, so fewer frames from more scans give more distinct objects for the same
 //! epoch time. Writes the predictor to `out_dir`, and after every epoch the training state to
@@ -114,7 +116,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         next(30)?,
         next(32)?,
         next(10)?,
-        next(0)?,
+        next(5000)?,
     );
 
     let device = Device::cuda(0);

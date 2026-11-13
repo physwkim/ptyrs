@@ -6,7 +6,7 @@
 //! object alpha 0.5 and 1.0: at its default 0.1 it climbs back from its minimum on these scans
 //! and oscillates, in pty-chi as in the engine. A start reaches the target at the epoch
 //! [`iterations_to_llk`] gives, from which its LLK stays within [`LLK_MARGIN`] above it through
-//! the last epoch; both starts run [`MAX`] epochs. Every LLK curve goes to `<curves.tsv>`, one
+//! the last epoch; both starts run `MAX` (200) epochs. Every LLK curve goes to `<curves.tsv>`, one
 //! row per epoch, epoch 0 being the start.
 //!
 //! `cargo run --release -p ptyrs --features nn --example nn_m6_start -- <predictor_dir> <curves.tsv>`
