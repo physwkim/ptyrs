@@ -4,6 +4,7 @@
 pub mod ap;
 pub mod exchange;
 pub mod feed;
+mod halo;
 pub mod p2p;
 pub mod partition;
 #[cfg(test)]
