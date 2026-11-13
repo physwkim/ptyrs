@@ -351,7 +351,7 @@ pub mod grad_kernels {
     /// blockIdx.y`, on the forward-FFT'd (unnormalized) line-search stacks: over the unmasked
     /// detector pixels `d` in `c * GAMMA_CHUNK .. min((c + 1) * GAMMA_CHUNK, n)`, with `k` the
     /// frame's intensity `scale` (1 if it is null), `b` the detector `background[d]` (0 if it
-    /// is null), `calc = max(k sum_m |po|^2 / n + b, 1e-12)`,
+    /// is null), `calc = max(k sum_m |po|^2 / n + b, 1e-32)` (PyNX's floor),
     /// `r = k sum_m Re(conj(po) a) / n`, `s = k sum_m (|a|^2 + 2 Re(conj(po) b)) / n` and
     /// `f = 1 - obs / calc`, pair `p = (f0 + fl) * nchunk + c`,
     /// `nchunk = ceil(n / GAMMA_CHUNK)`, gets `out[2 p] = sum -2 r f` and `out[2 p + 1] =
@@ -413,7 +413,7 @@ pub mod grad_kernels {
                 } else {
                     unsafe { *background.add(d) }
                 };
-                let calc = (k * (calc * inv_n) + b).max(1e-12);
+                let calc = (k * (calc * inv_n) + b).max(1e-32);
                 let (r, s, obs) = (k * (r * inv_n), k * (s * inv_n), obs as f32);
                 let f = 1.0 - obs / calc;
                 let rc = 2.0 * r / calc;
