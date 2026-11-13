@@ -1,4 +1,4 @@
-//! The CPU f64 engine: [`ptyrs::engine::Ptycho`] (AP, DM, ML, rPIE), LSQML and BH epochs over
+//! The CPU f64 engine: [`ptyrs::engine::Ptycho`] (AP, DM, RAAR, ML, rPIE), LSQML and BH epochs over
 //! its scan, and the forward model and LLK of given arrays.
 
 use std::slice;
@@ -100,6 +100,13 @@ impl Ptycho {
     #[pyo3(signature = (ncycle, **params))]
     fn dm(&mut self, ncycle: usize, params: Option<&Bound<'_, PyDict>>) -> PyResult<()> {
         self.inner.dm(&crate::dm_params(params)?, ncycle);
+        Ok(())
+    }
+
+    /// `ncycle` RAAR cycles; keywords are `RaarParams` fields.
+    #[pyo3(signature = (ncycle, **params))]
+    fn raar(&mut self, ncycle: usize, params: Option<&Bound<'_, PyDict>>) -> PyResult<()> {
+        self.inner.raar(&crate::raar_params(params)?, ncycle);
         Ok(())
     }
 
