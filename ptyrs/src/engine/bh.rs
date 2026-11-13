@@ -35,6 +35,10 @@ pub struct BhParams {
     /// propagator's [`crate::engine::Propagator::intensity_scale`] (`ny·nx` in the far field), so in
     /// probe displacements its gradient is scaled by `ρ²`.
     pub probe_rho: f64,
+    /// pty-chi's `BHProbePositionOptions.rho` (0.1 there): under [`Features::position`] the
+    /// offset variable is the offsets over it, so in displacements their gradient is scaled by
+    /// `position_rho²`.
+    pub position_rho: f64,
     /// The seed of every epoch's [`random_batches`].
     pub seed: u64,
 }
@@ -356,7 +360,6 @@ fn dot(a: &[C64], b: &[C64]) -> f64 {
 pub struct Bh {
     params: BhParams,
     features: Features,
-    position_rho: f64,
     epochs: usize,
     /// The last direction's `x` and its offsets' part by frame of the scan, empty without
     /// positions.
@@ -369,18 +372,16 @@ impl Bh {
         Self {
             params,
             features: Features::default(),
-            position_rho: 0.0,
             epochs: 0,
             prev: None,
         }
     }
 
     /// This run modelling and refining `features`, which hold one entry per frame of the scan
-    /// it runs on, with pty-chi's `BHProbePositionOptions.rho` `position_rho`: the offset
-    /// variable is the offsets over it, so in displacements their gradient is scaled by
-    /// `position_rho²`. pty-chi's BH refines the positions alone; it has neither a per-frame
-    /// intensity scale nor a detector background, and those are refused.
-    pub fn with_features(self, features: Features, position_rho: f64) -> Result<Self, EngineError> {
+    /// it runs on, the offsets weighted by [`BhParams::position_rho`]. pty-chi's BH refines the
+    /// positions alone; it has neither a per-frame intensity scale nor a detector background,
+    /// and those are refused.
+    pub fn with_features(self, features: Features) -> Result<Self, EngineError> {
         if features.scale.is_some() || features.background.is_some() {
             return Err(EngineError::Invalid(
                 "BH refines no intensity scale or background, as pty-chi's".into(),
@@ -393,11 +394,7 @@ impl Bh {
                 "position offsets must be finite".into(),
             ));
         }
-        Ok(Self {
-            features,
-            position_rho,
-            ..self
-        })
+        Ok(Self { features, ..self })
     }
 
     /// The features as the last step left them.
@@ -410,8 +407,8 @@ impl Bh {
     /// and `probe` by `α·D` and, with [`Features::position`], its frames' offsets by
     /// `0.3·α·D_d` (pty-chi's position step size, unclipped). With `g` the batch's
     /// [`BhBatch::grads`] and `Pg` it with the probe part times `ρ²` and the offsets' times
-    /// `position_rho²`: `D = −Pg`, or with one batch per epoch, after the first epoch,
-    /// `D = −Pg + β·D′` with `β = H(Pg, D′) / H(D′, D′)` and `D′` the previous epoch's
+    /// [`BhParams::position_rho`]`²`: `D = −Pg`, or with one batch per epoch, after the first
+    /// epoch, `D = −Pg + β·D′` with `β = H(Pg, D′) / H(D′, D′)` and `D′` the previous epoch's
     /// direction; `α = −⟨g, D⟩ / H(D, D) · count / batch_size` with `count` the batch's frames.
     pub fn epoch(
         &mut self,
@@ -428,7 +425,7 @@ impl Bh {
         let size = self.params.batch_size.min(nframe);
         let full = size == nframe;
         let rho2 = self.params.probe_rho.powi(2) * optics.propagator().intensity_scale();
-        let pos_rho2 = self.position_rho.powi(2);
+        let pos_rho2 = self.params.position_rho.powi(2);
         let len = objects[0].as_slice().len();
         let split = objects.len() * len;
         let epoch = self.epochs as u64;

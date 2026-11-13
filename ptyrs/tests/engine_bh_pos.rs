@@ -69,9 +69,10 @@ fn assert_model(batch_size: usize, steps: &str, obj: &str, probe: &str, table_of
     let params = BhParams {
         batch_size,
         probe_rho: 0.01,
+        position_rho: 2.0,
         seed: 7,
     };
-    let mut bh = Bh::new(params).with_features(features, 2.0).unwrap();
+    let mut bh = Bh::new(params).with_features(features).unwrap();
     let (o0, p0) = (p.object().clone(), p.probe().clone());
     let (mut object, mut pr) = (o0.clone(), p0.clone());
     let mut got = Vec::new();

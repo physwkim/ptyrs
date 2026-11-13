@@ -342,6 +342,7 @@ fn lsqml_restarts_and_rejects() {
     let bh = BhParams {
         batch_size: 4,
         probe_rho: 0.01,
+        position_rho: 0.1,
         seed: 7,
     };
     let (scan, object, probe) = start(frame);

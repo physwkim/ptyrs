@@ -159,6 +159,7 @@ fn assert_ref(batch_size: usize, steps: &str, obj: &str, probe: &str) {
     let mut bh = Bh::new(BhParams {
         batch_size,
         probe_rho: 0.01,
+        position_rho: 0.1,
         seed: 7,
     });
     let (mut object, mut pr) = (p.object().clone(), p.probe().clone());

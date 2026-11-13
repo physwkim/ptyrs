@@ -237,6 +237,7 @@ impl Bh {
         Self(ptyrs::engine::Bh::new(ptyrs::engine::BhParams {
             batch_size,
             probe_rho,
+            position_rho: 0.1,
             seed,
         }))
     }

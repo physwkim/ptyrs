@@ -334,6 +334,7 @@ fn bh_matches_cpu() {
         let params = BhParams {
             batch_size,
             probe_rho: 0.01,
+            position_rho: 0.1,
             seed: 7,
         };
         let (scan, object, probe) = start(setup.frame, 2, true);
@@ -397,6 +398,7 @@ fn bh_steps_match_cpu() {
         let params = BhParams {
             batch_size,
             probe_rho: 0.01,
+            position_rho: 0.1,
             seed: 7,
         };
         let (scan, object, probe) = start(setup.frame, 2, true);
@@ -467,6 +469,7 @@ fn bh_graphs_compile_no_tile_kernel() {
             let params = BhParams {
                 batch_size,
                 probe_rho: 0.01,
+                position_rho: 0.1,
                 seed: 7,
             };
             g.bh(&params, 3, 1).unwrap();
@@ -1496,6 +1499,7 @@ fn features_are_refused_where_they_cannot_run() {
     let bh = BhParams {
         batch_size: NPOS,
         probe_rho: 0.01,
+        position_rho: 0.1,
         seed: 7,
     };
     assert!(gpu.bh(&bh, 1, 1).is_err());
