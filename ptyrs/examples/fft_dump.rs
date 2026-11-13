@@ -1,5 +1,5 @@
 //! Writes the fixed-seed input and the GPU forward/inverse results as raw f32 (re,im interleaved)
-//! into the directory given as argv[1], for scripts/check_numpy.py.
+//! into the directory given as `argv[1]`, for scripts/check_numpy.py.
 #[path = "../tests/common/fft/mod.rs"]
 mod common;
 

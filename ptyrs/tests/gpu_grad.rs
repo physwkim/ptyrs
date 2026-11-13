@@ -363,7 +363,7 @@ fn gamma_frames_case(scale: Option<&[f32]>, background: bool) {
                         sq += a.0 * a.0 + a.1 * a.1 + 2.0 * (p.0 * b.0 + p.1 * b.1);
                     }
                     let b = bg.as_ref().map_or(0.0, |b| b[d] as f64);
-                    let calc = (kf * calc / n as f64 + b).max(1e-12);
+                    let calc = (kf * calc / n as f64 + b).max(1e-32);
                     let (r, sq, obs) = (kf * r / n as f64, kf * sq / n as f64, obs as f64);
                     let f = 1.0 - obs / calc;
                     let (tn, td) = (-2.0 * r * f, 2.0 * sq * f + obs * (2.0 * r / calc).powi(2));

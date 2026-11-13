@@ -197,11 +197,12 @@ pub(crate) fn poisson_grad_with(
 /// PyNX `CG_Poisson_Gamma` (no background) on detector-plane `po = FT(P·O·q)`,
 /// `a = FT(dP·O·q + P·dO·q)` and `b = FT(dP·dO·q)`: the numerator and denominator of the
 /// step `γ = −L′(0) / L″(0)` of the Poisson sum `L(γ)` of [`llk`] at `O + γ·dO`, `P + γ·dP`.
-/// Over unmasked pixels, with `icalc = max(Σ_modes |po|², 1e-12)`, `r = Σ Re(conj(po)·a)`,
+/// Over unmasked pixels, with `icalc = max(Σ_modes |po|², 1e-32)`, `r = Σ Re(conj(po)·a)`,
 /// `s = Σ (|a|² + 2·Re(conj(po)·b))` and `f = 1 − iobs / icalc`:
-/// `num = Σ −2·r·f`, `den = Σ 2·s·f + iobs·(2·r / icalc)²`. The `1e-12` floor is
-/// [`poisson_grad`]'s, so `num = −Re Σ conj(g)·d` for the gradient `g` it yields; PyNX floors at
-/// `1e-32`, and its `s` has `Re(PdO)·Im(dPO)` where `Im(PdO)·Im(dPO)` belongs.
+/// `num = Σ −2·r·f`, `den = Σ 2·s·f + iobs·(2·r / icalc)²`. The floor is PyNX's, below
+/// [`poisson_grad`]'s `1e-12` as there, so `num = −Re Σ conj(g)·d` for the gradient `g` it
+/// yields only while every `icalc ≥ 1e-12`; PyNX's `s` has `Re(PdO)·Im(dPO)` where
+/// `Im(PdO)·Im(dPO)` belongs.
 pub fn cg_poisson_gamma(
     obs: &Observed,
     frames: Range<usize>,
@@ -241,7 +242,7 @@ pub(crate) fn cg_poisson_gamma_with(
                 r += (p.conj() * a).re;
                 s += a.norm_sqr() + 2.0 * (p.conj() * b).re;
             }
-            let calc = model.calc(f, j, calc).max(1e-12);
+            let calc = model.calc(f, j, calc).max(1e-32);
             let (r, s) = (model.scaled(f, r), model.scaled(f, s));
             let d = 1.0 - iobs / calc;
             num -= 2.0 * r * d;
