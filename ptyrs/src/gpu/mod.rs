@@ -300,6 +300,7 @@ impl Kernels {
             });
         }
         let module = ptyrs_kernels::kernels::from_module(ctx.load_module_from_image(CUBIN)?)?;
+        ptyrs_kernels::fused::pin_rows_inv_carveout(&module)?;
         Ok(Self {
             module,
             ctx: ctx.clone(),
