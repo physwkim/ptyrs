@@ -50,7 +50,9 @@ pub use fused::{
 pub use grad::{
     CG_BLOCKS, GAMMA_CHUNK, GammaCounts, GammaStacks, GradKernels, ObjProbeScale, gamma_parts,
 };
-pub use lsqml::{LSQML_REC, LsqmlAt, LsqmlKernels, LsqmlNoise, LsqmlScan, LsqmlVar};
+pub use lsqml::{
+    LSQML_REC, LsqmlAt, LsqmlChi, LsqmlKernels, LsqmlNoise, LsqmlPositions, LsqmlScan, LsqmlVar,
+};
 pub use ops::{
     LLK_TREE_LEAVES, LlkPartial, LlkScratch, LlkSums, MASKED, OBJ_TILE, Permutation,
     PositionPartial, ScalePartial, StackCtl, StackGeom, StackRef, StackTable, UpdateSums, ViewAddr,
