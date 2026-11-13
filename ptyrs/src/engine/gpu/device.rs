@@ -24,6 +24,7 @@ use cuda_async::cuda_graph::CudaGraph;
 use cuda_async::device_operation::{DeviceOp, ExecutionContext};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 
+use super::bh::BhMoved;
 use super::lsqml::{LsqmlBufs, LsqmlState, Pre};
 use super::ml::MlMoved;
 use super::rpie::RpieMoved;
@@ -520,9 +521,10 @@ impl NormBufs {
     }
 }
 
-/// BH's batches over epoch positions and its state, sized by the device and the batch size
-/// alone, so one state serves the graphs of every BH epoch of that size; [`Device::bh_epoch`]
-/// sets each epoch's frame order before its cycle.
+/// BH's batches over epoch positions and its state, sized by the device, the batch size and
+/// whether the position is modelled alone, so one state serves the graphs of every BH epoch
+/// of that size and model; [`Device::bh_epoch`] sets each epoch's frame order before its
+/// cycle.
 struct BhState {
     /// Frames per batch, the batch size capped at the frame count.
     size: u32,
@@ -547,6 +549,8 @@ struct BhState {
     parts: DeviceBuffer<f32>,
     /// The epoch's step records, one per batch.
     steps: DeviceBuffer<f32>,
+    /// The state of the position model, if modelled.
+    moved: Option<BhMoved>,
 }
 
 /// A [`BhState`] lent to an epoch.
@@ -564,11 +568,13 @@ pub(super) struct BhBufs<'a> {
     pub order: &'a EpochOrder,
     pub parts: &'a mut DeviceBuffer<f32>,
     pub steps: &'a mut DeviceBuffer<f32>,
+    pub moved: Option<&'a mut BhMoved>,
 }
 
 impl BhState {
-    /// For `views` in batches of `size` frames cut into stacks of `stack_size`, and arrays of
-    /// `lens = [object, probe]` values; the epoch order is the scan's.
+    /// For `views` in batches of `size` frames cut into stacks of `stack_size`, arrays of
+    /// `lens = [object, probe]` values and with `moved` the position model; the epoch order
+    /// is the scan's.
     fn new(
         stream: &Arc<CudaStream>,
         kernels: &Kernels,
@@ -576,12 +582,16 @@ impl BhState {
         size: u32,
         stack_size: u32,
         lens: [usize; 2],
+        moved: bool,
     ) -> Result<Self, EngineError> {
         let dims = views.dims();
         let ((stacks, table, plan_lens), batches) = batch_stacks(stream, dims, size, stack_size)?;
         let len = stack_buf_len(dims, &table);
         let slots = batches.iter().map(|b| b.len()).max().unwrap_or(0);
         let zeroed = |len| DeviceBuffer::<C32>::zeroed(stream, len);
+        let moved = moved
+            .then(|| BhMoved::new(stream, kernels, dims, table.nf_max(), slots, len))
+            .transpose()?;
         Ok(Self {
             size,
             plans: plans(stream, dims, &plan_lens)?,
@@ -596,6 +606,7 @@ impl BhState {
             batches,
             stacks,
             table,
+            moved,
         })
     }
 
@@ -614,6 +625,7 @@ impl BhState {
             order: &self.order,
             parts: &mut self.parts,
             steps: &mut self.steps,
+            moved: self.moved.as_mut(),
         }
     }
 }
@@ -1001,20 +1013,10 @@ impl Device {
         })
     }
 
-    /// Whether some feature is modelled.
-    pub fn has_features(&self) -> bool {
-        self.has_stepped() || self.has_position()
-    }
-
     /// Whether some feature takes a step from far sums: the scale or the background.
     pub fn has_stepped(&self) -> bool {
         let f = &self.features;
         f.scale.is_some() || f.background.is_some()
-    }
-
-    /// Whether the position is modelled.
-    pub fn has_position(&self) -> bool {
-        self.features.position.is_some()
     }
 
     pub fn stream(&self) -> &Arc<CudaStream> {
@@ -1306,13 +1308,15 @@ impl Device {
         Ok(())
     }
 
-    /// Builds the [`BhState`] for `params`' batch size unless it is built. A state of another
-    /// size is replaced only here, when [`Self::steady`] has already dropped the runs of
-    /// other parameters, so no graph captured from it survives.
+    /// Builds the [`BhState`] for `params`' batch size and the position model unless it is
+    /// built. A state of another size or model is replaced only here, when [`Self::steady`]
+    /// has already dropped the runs of other parameters and [`Self::set_features`] those of
+    /// other features, so no graph captured from it survives.
     fn build_bh(&mut self, params: &BhParams) -> Result<(), EngineError> {
         let dims = self.dims();
         let size = to_u32("batch_size", params.batch_size.min(dims.nframe as usize))?;
-        if self.bh_state.as_ref().is_none_or(|s| s.size != size) {
+        let moved = self.features.position.is_some();
+        if (self.bh_state.as_ref()).is_none_or(|s| s.size != size || s.moved.is_some() != moved) {
             let lens = [self.obj.len(), self.probe.len()];
             let state = BhState::new(
                 &self.stream,
@@ -1321,6 +1325,7 @@ impl Device {
                 size,
                 self.stack_size,
                 lens,
+                moved,
             )?;
             self.bh_state = Some(Box::new(state));
         }
@@ -1471,7 +1476,7 @@ impl<'a> Bufs<'a> {
                 b.ml_epoch(ctx, passes, ml, params, *first, llk.then(|| ring.record()))
             }),
             Cycle::Bh { params, cg } => self
-                .with_bh(|b, bh| b.bh_epoch(ctx, bh, params, *cg))
+                .with_bh(|b, bh| b.bh_epoch(ctx, passes, bh, params, *cg))
                 .map(|()| None),
             Cycle::Lsqml { params, pre } => {
                 self.lsqml_epoch(ctx, passes, params, *pre).map(|()| None)

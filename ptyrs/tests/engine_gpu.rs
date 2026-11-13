@@ -1251,6 +1251,115 @@ fn ml_position_matches_cpu() {
     );
 }
 
+/// Probe positions refined by 4 BH epochs from [`drawn_offsets`] against the CPU's `f64` BH
+/// from the same start: every LLK record (the CPU's modelling the offsets the epoch left),
+/// the last epoch's steps, the object, the probe and the offsets, eagerly and from graphs.
+/// One batch of every frame (CG from the second epoch) and batches of 4, the last of 2. On
+/// the CPU the offsets' RMS falls. 4 epochs, as from the sixth CG epoch on this start
+/// amplifies any rounding about 4 times an epoch: the CPU itself, fed 1e-6 relative noise in
+/// the object every epoch, ends its tenth 4e-4 off in the Hessian.
+#[test]
+fn bh_position_matches_cpu() {
+    const NEPOCH: usize = 4;
+    let (scan, object, probe) = featured_start(2, false, false);
+    let d0 = drawn_offsets();
+    let moved = Features {
+        position: Some(d0.clone()),
+        ..Features::default()
+    };
+    let at = Ptycho::new(&scan, object.clone(), probe.clone()).unwrap();
+    let optics = Optics::far_field(&scan.geometry);
+    for batch_size in [NPOS, 4] {
+        let params = BhParams {
+            batch_size,
+            probe_rho: 0.01,
+            position_rho: 0.1,
+            seed: 7,
+        };
+        let (mut o, mut p) = (object.clone(), probe.clone());
+        let mut bh = Bh::new(params).with_features(moved.clone()).unwrap();
+        let mut steps = Vec::new();
+        let want: Vec<_> = (0..NEPOCH)
+            .map(|cycle| {
+                steps = bh.epoch(
+                    at.addr(),
+                    at.observed(),
+                    &optics,
+                    slice::from_mut(&mut o),
+                    &mut p,
+                );
+                let mut q = Ptycho::new(&scan, o.clone(), p.clone()).unwrap();
+                q.set_features(bh.features().clone()).unwrap();
+                LlkRecord {
+                    cycle,
+                    algorithm: Algorithm::Bh,
+                    llk: q.llk(),
+                }
+            })
+            .collect();
+        let d = bh.features().position.clone().unwrap();
+        println!(
+            "bh position batch {batch_size}: rms offset {:.4} from {:.4}; llk {:.4e} -> {:.4e}",
+            rms(&d),
+            rms(&d0),
+            want[0].llk.poisson,
+            want[NEPOCH - 1].llk.poisson
+        );
+        assert!(
+            rms(&d) < rms(&d0),
+            "rms offset {} from {}",
+            rms(&d),
+            rms(&d0)
+        );
+        for graph in [false, true] {
+            let options = GpuOptions {
+                graph,
+                ..FUSED.options
+            };
+            let mut gpu =
+                GpuPtycho::new(&ctx(), &scan, object.clone(), probe.clone(), options).unwrap();
+            gpu.set_features(&moved).unwrap();
+            gpu.bh(&params, NEPOCH, 1).unwrap();
+            let got = gpu.bh_steps().unwrap();
+            assert_eq!(got.len(), steps.len());
+            let mut step = 0.0f64;
+            for (g, w) in got.iter().zip(&steps) {
+                assert_eq!(g.frames, w.frames);
+                for (a, b) in [
+                    (g.beta, w.beta),
+                    (g.alpha, w.alpha),
+                    (g.top, w.top),
+                    (g.bottom, w.bottom),
+                ] {
+                    // a CPU 0 (β in steepest descent) must be an exact GPU 0
+                    step = step.max(if b == 0.0 {
+                        a.abs()
+                    } else {
+                        (a - b).abs() / b.abs()
+                    });
+                }
+            }
+            let errs = [
+                llk_rel(gpu.history(), &want),
+                rel_l2(&gpu.object().unwrap(), &o),
+                rel_l2(&gpu.probe().unwrap(), &p),
+            ];
+            let g = gpu.features().unwrap().position.unwrap();
+            let position = (g.iter().zip(&d))
+                .flat_map(|(a, b)| [(a[0] - b[0]).abs(), (a[1] - b[1]).abs()])
+                .fold(0.0, f64::max);
+            println!(
+                "bh position batch {batch_size} graph {graph}: llk {:.2e} object {:.2e} \
+                 probe {:.2e} step {step:.2e} position {position:.2e}",
+                errs[0], errs[1], errs[2],
+            );
+            check(errs, [1e-4, 1e-4, 1e-4]);
+            assert!(step < 1e-4, "step: {step:e}");
+            assert!(position < 1e-4, "position: {position:e}");
+        }
+    }
+}
+
 /// rPIE epochs modelling a position, in batches of 4 (a short last one) around AP cycles
 /// modelling it and then in batches of 7, replay from graphs the eager bits: the object, the
 /// probe, the offsets and every LLK record. Dropping the position before any epoch gives a

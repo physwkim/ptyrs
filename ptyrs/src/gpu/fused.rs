@@ -372,7 +372,12 @@ pub struct ProbeSpectrum<'a> {
     key: [u32; 4],
 }
 
-impl ProbeSpectrum<'_> {
+impl<'a> ProbeSpectrum<'a> {
+    /// The spectra `A_p`, `[nprobe, ny, nx]`, FFT order.
+    pub(crate) fn spectra(&self) -> &'a DeviceBuffer<C32> {
+        self.a
+    }
+
     fn key(d: &ViewDims) -> [u32; 4] {
         [d.frame[0], d.frame[1], d.nprobe, d.quad_phase.to_bits()]
     }

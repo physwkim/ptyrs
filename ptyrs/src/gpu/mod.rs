@@ -42,7 +42,8 @@ mod rpie;
 
 pub use crate::fft::C32;
 pub use bh::{
-    BH_HESS, BH_STEP, BhBatch, BhDisp, BhFieldsRef, BhKernels, BhScan, BhVar, EpochOrder, bh_parts,
+    BH_HESS, BH_STEP, BhBatch, BhDisp, BhFieldsRef, BhKernels, BhMovedFarRef, BhMovesRef,
+    BhNearMut, BhOffsets, BhPositions, BhScan, BhVar, EpochOrder, bh_parts,
 };
 pub use fused::{
     BackgroundSums, Exit, FUSED_SIDES, FarSums, FusedBufs, FusedInputs, FusedSums, Model,
