@@ -1,6 +1,6 @@
-//! Links libcufft for `ptyrs::fft` and builds ptyrs-kernels into one cubin for
-//! `PTYRS_CUDA_ARCH` (default `sm_89`). Every toolkit file it or the nested build uses comes
-//! from the one root that CUDA_TOOLKIT_PATH, else CUDA_HOME, names; see [`Toolkit`].
+//! Builds ptyrs-kernels into one cubin for `PTYRS_CUDA_ARCH` (default `sm_89`) and names the
+//! libcufft `ptyrs::fft` opens at run time. Every toolkit file it or the nested build uses
+//! comes from the one root that CUDA_TOOLKIT_PATH, else CUDA_HOME, names; see [`Toolkit`].
 //!
 //! 1. A nested `cargo oxide build --emit-nvvm-ir` compiles ptyrs-kernels with the cuda-oxide
 //!    backend into `<target>/oxide-device`, writing `ptyrs_kernels.{ll,options,target}` to
@@ -11,8 +11,8 @@
 //!    API version come from libcufft's database string, not from constants here.
 //! 3. libNVVM turns the IR into LTOIR; nvJitLink links it with the cuFFT LTOIR/fatbin pieces.
 //!
-//! Outputs: `$OUT_DIR/ptyrs_kernels.cubin`, `$OUT_DIR/block_fft.rs` (the FFT launch traits)
-//! and `PTYRS_GPU_ARCH` for the crate.
+//! Outputs: `$OUT_DIR/ptyrs_kernels.cubin`, `$OUT_DIR/block_fft.rs` (the FFT launch traits),
+//! and `PTYRS_GPU_ARCH` and `PTYRS_LIBCUFFT` for the crate.
 
 use std::env;
 use std::error::Error;
@@ -51,7 +51,8 @@ const KEEP_ENV: &[&str] = &[
     "LD_LIBRARY_PATH",
 ];
 
-const LIBCUFFT: &str = "lib64/libcufft.so";
+/// The SONAME `ptyrs::fft::sys` is written against.
+const LIBCUFFT: &str = "lib64/libcufft.so.12";
 
 fn main() {
     // Cargo runs a build script without arguments; `Toolkit::exec_bound` reruns it with one.
@@ -109,22 +110,18 @@ impl Toolkit {
         }
         Err(cmd.exec().into())
     }
-
-    fn link_cufft(&self) -> Res<()> {
-        self.file(LIBCUFFT)?;
-        let lib = self.root.join("lib64");
-        println!("cargo:rustc-link-search=native={}", lib.display());
-        println!("cargo:rustc-link-lib=dylib=cufft");
-        // Tests/examples run without LD_LIBRARY_PATH.
-        println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib.display());
-        Ok(())
-    }
 }
 
 fn run(toolkit: &Toolkit) -> Res<()> {
     println!("cargo:rerun-if-env-changed=CUDA_TOOLKIT_PATH");
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
-    toolkit.link_cufft()?;
+    // The one libcufft: the cubin's FFTs come from it and ptyrs::fft opens it by this path, not
+    // through the loader's search, which LD_LIBRARY_PATH leads. A toolkit update removes the
+    // versioned file this resolves to, which reruns the script.
+    let libcufft = fs::canonicalize(toolkit.file(LIBCUFFT)?)?;
+    let libcufft_str = libcufft.to_str().ok_or("libcufft's path is not UTF-8")?;
+    println!("cargo:rerun-if-changed={libcufft_str}");
+    println!("cargo:rustc-env=PTYRS_LIBCUFFT={libcufft_str}");
 
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
     let workspace = manifest.parent().ok_or("ptyrs has no parent directory")?;
@@ -149,7 +146,7 @@ fn run(toolkit: &Toolkit) -> Res<()> {
     build_device_crate(workspace, toolkit, &target_dir, &nvvm_dir, &arch)?;
     let (ir, options) = read_device_artifact(&nvvm_dir, &arch)?;
 
-    let cufft = CufftDevice::load(&toolkit.file(LIBCUFFT)?)?;
+    let cufft = CufftDevice::load(&libcufft)?;
     let (ir, ffts) = define_block_ffts(&ir, &cufft, arch.capability())?;
     let ltoir = NvvmCompiler::discover()?.compile_nvvm_ir_to_ltoir(
         DEVICE_CRATE,

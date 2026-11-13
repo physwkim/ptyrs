@@ -36,6 +36,8 @@ pub enum FftError {
     ContextMismatch,
     /// `n` or `batch` is zero or does not fit a C int.
     BadShape,
+    /// [`sys::LIBRARY`] could not be opened or lacks a function the binding calls.
+    Load(&'static str),
 }
 
 impl fmt::Display for FftError {
@@ -67,8 +69,9 @@ fn check(r: sys::cufftResult) -> Result<(), FftError> {
 
 /// cuFFT library version, e.g. 12500 for the 13.5 toolkit.
 pub fn version() -> Result<i32, FftError> {
+    let lib = sys::cufft().map_err(FftError::Load)?;
     let mut v = 0;
-    check(unsafe { sys::cufftGetVersion(&mut v) })?;
+    check(unsafe { (lib.get_version)(&mut v) })?;
     Ok(v)
 }
 
@@ -101,12 +104,13 @@ pub fn lease(
 struct Handle {
     raw: sys::cufftHandle,
     ctx: Arc<Context>,
+    lib: &'static sys::Cufft,
 }
 
 impl Drop for Handle {
     fn drop(&mut self) {
         let _ = self.ctx.bind_to_thread();
-        unsafe { sys::cufftDestroy(self.raw) };
+        unsafe { (self.lib.destroy)(self.raw) };
     }
 }
 
@@ -131,18 +135,19 @@ impl Plan2d {
             (Ok(n), Ok(b)) if n > 0 && b > 0 => (n, b),
             _ => return Err(FftError::BadShape),
         };
+        let lib = sys::cufft().map_err(FftError::Load)?;
         // cuFFT runs on the runtime API, which uses the driver's current context; the primary
         // context cuda-core retains for this device is that context once bound.
         let ctx = stream.context().clone();
         ctx.bind_to_thread()?;
         let mut raw = 0;
-        check(unsafe { sys::cufftCreate(&mut raw) })?;
-        let handle = Arc::new(Handle { raw, ctx });
-        check(unsafe { sys::cufftSetAutoAllocation(raw, 0) })?;
+        check(unsafe { (lib.create)(&mut raw) })?;
+        let handle = Arc::new(Handle { raw, ctx, lib });
+        check(unsafe { (lib.set_auto_allocation)(raw, 0) })?;
         let mut dims = [ni, ni];
         let mut work_size = 0;
         check(unsafe {
-            sys::cufftMakePlanMany(
+            (lib.make_plan_many)(
                 raw,
                 2,
                 dims.as_mut_ptr(),
@@ -158,7 +163,7 @@ impl Plan2d {
             )
         })?;
         let work = DeviceBuffer::<u8>::zeroed(stream, work_size)?;
-        check(unsafe { sys::cufftSetWorkArea(raw, work.cu_deviceptr() as *mut _) })?;
+        check(unsafe { (lib.set_work_area)(raw, work.cu_deviceptr() as *mut _) })?;
         Ok(Self {
             handle,
             work,
@@ -209,11 +214,11 @@ impl Plan2d {
         // SAFETY: both buffers hold the plan's extent and, like the work area, are leased on
         // `ctx`'s stream; `&mut self` keeps the stream binding until the exec is enqueued.
         unsafe {
-            check(sys::cufftSetStream(
+            check((self.handle.lib.set_stream)(
                 self.handle.raw,
                 ctx.get_cuda_stream().cu_stream() as *mut _,
             ))?;
-            check(sys::cufftExecC2C(self.handle.raw, i, o, dir))
+            check((self.handle.lib.exec_c2c)(self.handle.raw, i, o, dir))
         }
     }
 
