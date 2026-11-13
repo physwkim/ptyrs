@@ -144,6 +144,14 @@ struct PositionMut<'a> {
     den: &'a mut DeviceBuffer<PositionPartial>,
 }
 
+/// The position model's buffers lent by [`FeaturesMut::position_lent`] to a cycle that runs
+/// its own passes: the offsets by frame, the probe spectra and the shifted probe's sums.
+pub(super) struct PositionLent<'a> {
+    pub offsets: &'a mut DeviceBuffer<f32>,
+    pub spectrum: &'a mut SpectrumBuf,
+    pub probe_sums: &'a mut ShiftedProbeSums,
+}
+
 /// The features lent to the passes of one cycle body by [`FeaturesMut::lend`]: the model
 /// every pass that compares with the counts reads, and the sums the passes write.
 pub(super) struct Modelled<'b> {
@@ -225,6 +233,15 @@ impl FeaturesMut<'_> {
     /// Whether the position is modelled, as [`Modelled::shifted`] of a lend.
     pub fn shifted(&self) -> bool {
         self.position.is_some()
+    }
+
+    /// The position model's buffers, if modelled.
+    pub fn position_lent(&mut self) -> Option<PositionLent<'_>> {
+        self.position.as_mut().map(|p| PositionLent {
+            offsets: &mut *p.offsets,
+            spectrum: &mut *p.spectrum,
+            probe_sums: &mut *p.probe_sums,
+        })
     }
 
     /// The per-frame intensity scale, if modelled.
@@ -969,8 +986,13 @@ impl Device {
 
     /// Whether some feature is modelled.
     pub fn has_features(&self) -> bool {
+        self.has_stepped() || self.has_position()
+    }
+
+    /// Whether some feature takes a step from far sums: the scale or the background.
+    pub fn has_stepped(&self) -> bool {
         let f = &self.features;
-        f.scale.is_some() || f.background.is_some() || f.position.is_some()
+        f.scale.is_some() || f.background.is_some()
     }
 
     /// Whether the position is modelled.
@@ -1272,20 +1294,22 @@ impl Device {
         Ok(())
     }
 
-    /// Builds the [`LsqmlState`] for `params`' batch size unless it is built, replaced as
-    /// [`Self::build_bh`] replaces BH's.
+    /// Builds the [`LsqmlState`] for `params`' batch size and the position model unless it is
+    /// built, replaced as [`Self::build_bh`] replaces BH's.
     fn build_lsqml(&mut self, params: &LsqmlParams) -> Result<(), EngineError> {
         let size = to_u32(
             "batch_size",
             params.batch_size.min(self.dims().nframe as usize),
         )?;
-        if self.lsqml.as_ref().is_none_or(|s| s.size() != size) {
+        let moved = self.features.position.is_some();
+        if (self.lsqml.as_ref()).is_none_or(|s| s.size() != size || s.moved() != moved) {
             let state = LsqmlState::new(
                 &self.stream,
                 &self.kernels,
                 &self.views,
                 size,
                 self.stack_size,
+                moved,
             )?;
             self.lsqml = Some(Box::new(state));
         }
@@ -1414,7 +1438,9 @@ impl<'a> Bufs<'a> {
             Cycle::Bh { params, cg } => self
                 .with_bh(|b, bh| b.bh_epoch(ctx, bh, params, *cg))
                 .map(|()| None),
-            Cycle::Lsqml { params, pre } => self.lsqml_epoch(ctx, params, *pre).map(|()| None),
+            Cycle::Lsqml { params, pre } => {
+                self.lsqml_epoch(ctx, passes, params, *pre).map(|()| None)
+            }
         }
     }
 }

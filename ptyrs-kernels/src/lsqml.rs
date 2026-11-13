@@ -15,7 +15,11 @@ use cuda_host::cuda_module;
 
 use crate::bh::{BhObs, store_sums};
 use crate::fused::{FUSED_COLS, col_fft};
-use crate::pixel::{MASKED, StackCtl, StackGeom, load_c, stack_frames, store_c};
+use crate::grad::{GAMMA_CHUNK, ObjProbePtrs};
+use crate::pixel::{
+    MASKED, PIXEL_THREADS, StackCtl, StackGeom, ViewAddr, cmul, cmul_conj, load_c, psi_index,
+    quad_phase, sample_obj, stack_frames, store_c,
+};
 use crate::{FFT_EPT_MAX, fft_ept};
 
 /// [`lsqml_kernels::LoadedModule::lsqml_cols_64`] writes `icalc`.
@@ -56,15 +60,6 @@ pub struct LsqmlCols {
     pub a_far: *const f32,
 }
 
-/// A batch: epoch positions `p0 .. p0 + nb`, each with `nchunk` reduction chunks.
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct LsqmlSpan {
-    pub p0: u32,
-    pub nb: u32,
-    pub nchunk: u32,
-}
-
 /// The Poisson `a_far` state: `order` the epoch's frames by position, `a_scan` `a_far` by
 /// frame (from each frame's last step), `a_pos` by epoch position, `prev` one float, the
 /// running `a′`.
@@ -75,6 +70,19 @@ pub struct LsqmlFar {
     pub a_scan: *mut f32,
     pub a_pos: *mut f32,
     pub prev: *mut f32,
+}
+
+/// What [`lsqml_kernels::LoadedModule::lsqml_dots`] reads and writes: `chi` `[nf_max * nmode,
+/// ny, nx]`, the object and probe `x` and their directions `d`, the epoch's `views`, and
+/// `out` the [`LSQML_DOTS`] sums of every frame's chunks by epoch position.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct LsqmlDots {
+    pub chi: *const f32,
+    pub x: ObjProbePtrs,
+    pub d: ObjProbePtrs,
+    pub views: *const ViewAddr,
+    pub out: *mut f32,
 }
 
 /// The object preconditioner: `pre` `[nobj, nyo, nxo]` floats, `max_bits` its maximum as
@@ -207,15 +215,90 @@ pub unsafe fn cols<const NY: u32>(p: LsqmlCols, ctl: *const StackCtl, g: StackGe
     }
 }
 
+/// The step-size sums of chunk `c = blockIdx.x` of frame `f0 + fl`, `fl = blockIdx.y`, of
+/// [`lsqml_kernels::LoadedModule::lsqml_dots`], under `SHIFT` with the moved probe `W` of
+/// `w` in place of `P q` in `u`. `red` is `LSQML_DOTS` segments of `PIXEL_THREADS` shared
+/// floats.
+///
+/// # Safety
+///
+/// As `lsqml_dots`, and under `SHIFT` `w` the stack's moved probe `[nf_max * nprobe, ny,
+/// nx]` at its stored pixels ([`crate::position::shift_w`]).
+#[device]
+unsafe fn dots<const SHIFT: bool>(
+    p: LsqmlDots,
+    w_moved: *const f32,
+    ctl: *const StackCtl,
+    g: StackGeom,
+    red: *mut f32,
+) {
+    let LsqmlDots {
+        chi,
+        x,
+        d,
+        views,
+        out,
+    } = p;
+    let (f0, nf) = unsafe { stack_frames(ctl, g) };
+    let (ny, nx, nmode) = (g.ny, g.nx, g.nmode as usize);
+    let n = ny as usize * nx as usize;
+    let fl = thread::blockIdx_y() as usize;
+    // The whole block leaves together, before its first barrier.
+    if fl >= nf as usize {
+        return;
+    }
+    let c = thread::blockIdx_x() as usize;
+    let chunk = GAMMA_CHUNK as usize;
+    let end = n.min((c + 1) * chunk);
+    let pos = f0 as usize + fl;
+    let mut acc = [0.0f32; LSQML_DOTS as usize];
+    let mut i = c * chunk + thread::threadIdx_x() as usize;
+    while i < end {
+        let (py, px) = ((i / nx as usize) as u32, (i % nx as usize) as u32);
+        let at = psi_index(py, px, ny, nx);
+        let q = quad_phase(g.quad, py, px, ny, nx);
+        for m in 0..nmode {
+            unsafe {
+                let w = *views.add(pos * nmode + m);
+                let pa = w.probe as usize * n + i;
+                let o = sample_obj(x.obj, w, py, px, g.nyo, g.nxo);
+                let d_o = sample_obj(d.obj, w, py, px, g.nyo, g.nxo);
+                let ch = load_c(chi, (fl * nmode + m) * n + at);
+                let u = if SHIFT {
+                    let ws = load_c(
+                        w_moved,
+                        (fl * g.nprobe as usize + w.probe as usize) * n + at,
+                    );
+                    cmul(d_o, ws)
+                } else {
+                    cmul(cmul(d_o, load_c(x.probe, pa)), q)
+                };
+                let v = cmul(cmul(o, load_c(d.probe, pa)), q);
+                let uv = cmul_conj(u, v);
+                acc[0] += u.0 * u.0 + u.1 * u.1;
+                acc[1] += v.0 * v.0 + v.1 * v.1;
+                acc[2] += uv.0;
+                acc[3] -= uv.1;
+                acc[4] += cmul_conj(u, ch).0;
+                acc[5] += cmul_conj(v, ch).0;
+            }
+        }
+        i += PIXEL_THREADS as usize;
+    }
+    let at = pos * n.div_ceil(chunk) + c;
+    unsafe { store_sums::<6>(red, acc, out.add(LSQML_DOTS as usize * at)) }
+}
+
 #[cuda_module]
 pub mod lsqml_kernels {
     use super::{
-        EPS_XI, LAMBDA0, LSQML_DOTS, LSQML_REC, LSQML_XI, LsqmlCols, LsqmlFar, LsqmlPre, LsqmlSpan,
-        cols, store_sums,
+        EPS_XI, LAMBDA0, LSQML_DOTS, LSQML_REC, LSQML_XI, LsqmlCols, LsqmlDots, LsqmlFar, LsqmlPre,
+        cols, dots, store_sums,
     };
     use crate::bh::BhObs;
-    use crate::grad::{GAMMA_CHUNK, ObjProbePtrs};
+    use crate::grad::GAMMA_CHUNK;
     use crate::pixel::*;
+    use crate::position::BatchSpan;
     use crate::*;
     use cuda_device::SharedArray;
 
@@ -447,7 +530,7 @@ pub mod lsqml_kernels {
     /// `far` as [`LsqmlFar`] says, `order` over the span; grid `(1, 1, 1)`, block
     /// `(PIXEL_THREADS, 1, 1)`.
     #[kernel]
-    pub unsafe fn lsqml_far_mean(far: LsqmlFar, span: LsqmlSpan) {
+    pub unsafe fn lsqml_far_mean(far: LsqmlFar, span: BatchSpan) {
         static mut RED: SharedArray<f32, 256> = SharedArray::UNINIT;
         let t = thread::threadIdx_x() as usize;
         let mut acc = [0.0f32; 1];
@@ -479,7 +562,7 @@ pub mod lsqml_kernels {
     ///
     /// [`lsqml_xi`]: LoadedModule::lsqml_xi
     #[kernel]
-    pub unsafe fn lsqml_far_step(sums: *const f32, span: LsqmlSpan, far: LsqmlFar, last: u32) {
+    pub unsafe fn lsqml_far_step(sums: *const f32, span: BatchSpan, far: LsqmlFar, last: u32) {
         static mut RED: SharedArray<f32, 256> = SharedArray::UNINIT;
         let t = thread::threadIdx_x() as usize;
         let h = LSQML_XI as usize;
@@ -525,63 +608,33 @@ pub mod lsqml_kernels {
     ///
     /// # Safety
     ///
-    /// `chi` holds `[nf_max * nmode, ny, nx]`, `x` and `d` as [`ObjProbePtrs`] says, `views`
-    /// `nframe * nmode` records in range, `out` `6 * nframe * nchunk` floats, `ctl` one
-    /// entry; grid `(nchunk, nf_max, 1)`, block `(PIXEL_THREADS, 1, 1)`.
+    /// `p` as [`LsqmlDots`] says, `views` `nframe * nmode` records in range, `out` `6 *
+    /// nframe * nchunk` floats, `ctl` one entry; grid `(nchunk, nf_max, 1)`, block
+    /// `(PIXEL_THREADS, 1, 1)`.
     #[kernel]
-    pub unsafe fn lsqml_dots(
-        chi: *const f32,
-        x: ObjProbePtrs,
-        d: ObjProbePtrs,
-        views: *const ViewAddr,
-        out: *mut f32,
+    pub unsafe fn lsqml_dots(p: LsqmlDots, ctl: *const StackCtl, g: StackGeom) {
+        static mut RED: SharedArray<f32, 1536> = SharedArray::UNINIT;
+        let red = (&raw mut RED).cast::<f32>();
+        unsafe { dots::<false>(p, core::ptr::null(), ctl, g, red) }
+    }
+
+    /// [`lsqml_dots`] with the moved probe `W_w` of `w` in place of `P_w q` in `u`.
+    ///
+    /// # Safety
+    ///
+    /// As [`lsqml_dots`], `w` the stack's moved probe `[nf_max * nprobe, ny, nx]` at its
+    /// stored pixels ([`crate::position::shift_w`]).
+    ///
+    /// [`lsqml_dots`]: LoadedModule::lsqml_dots
+    #[kernel]
+    pub unsafe fn lsqml_dots_shifted(
+        p: LsqmlDots,
+        w: *const f32,
         ctl: *const StackCtl,
         g: StackGeom,
     ) {
         static mut RED: SharedArray<f32, 1536> = SharedArray::UNINIT;
-        let (f0, nf) = unsafe { stack_frames(ctl, g) };
-        let (ny, nx, nmode) = (g.ny, g.nx, g.nmode as usize);
-        let n = ny as usize * nx as usize;
-        let fl = thread::blockIdx_y() as usize;
-        // The whole block leaves together, before its first barrier.
-        if fl >= nf as usize {
-            return;
-        }
-        let c = thread::blockIdx_x() as usize;
-        let chunk = GAMMA_CHUNK as usize;
-        let end = n.min((c + 1) * chunk);
-        let pos = f0 as usize + fl;
-        let mut acc = [0.0f32; LSQML_DOTS as usize];
-        let mut i = c * chunk + thread::threadIdx_x() as usize;
-        while i < end {
-            let (py, px) = ((i / nx as usize) as u32, (i % nx as usize) as u32);
-            let at = psi_index(py, px, ny, nx);
-            let q = quad_phase(g.quad, py, px, ny, nx);
-            for m in 0..nmode {
-                unsafe {
-                    let w = *views.add(pos * nmode + m);
-                    let pa = w.probe as usize * n + i;
-                    let (p, dp) = (load_c(x.probe, pa), load_c(d.probe, pa));
-                    let o = sample_obj(x.obj, w, py, px, g.nyo, g.nxo);
-                    let d_o = sample_obj(d.obj, w, py, px, g.nyo, g.nxo);
-                    let u = cmul(cmul(d_o, p), q);
-                    let v = cmul(cmul(o, dp), q);
-                    let ch = load_c(chi, (fl * nmode + m) * n + at);
-                    let uv = cmul_conj(u, v);
-                    acc[0] += u.0 * u.0 + u.1 * u.1;
-                    acc[1] += v.0 * v.0 + v.1 * v.1;
-                    acc[2] += uv.0;
-                    acc[3] -= uv.1;
-                    acc[4] += cmul_conj(u, ch).0;
-                    acc[5] += cmul_conj(v, ch).0;
-                }
-            }
-            i += PIXEL_THREADS as usize;
-        }
-        unsafe {
-            let o = out.add(LSQML_DOTS as usize * (pos * n.div_ceil(chunk) + c));
-            store_sums::<6>((&raw mut RED).cast::<f32>(), acc, o);
-        }
+        unsafe { dots::<true>(p, w, ctl, g, (&raw mut RED).cast::<f32>()) }
     }
 
     /// One batch's step sizes over its positions `p` from the [`lsqml_dots`] sums, each
@@ -602,7 +655,7 @@ pub mod lsqml_kernels {
     #[kernel]
     pub unsafe fn lsqml_step(
         sums: *mut f32,
-        span: LsqmlSpan,
+        span: BatchSpan,
         trim: u32,
         a_far: *const f32,
         rec: *mut f32,

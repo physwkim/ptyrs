@@ -1,8 +1,11 @@
-//! The GPU engine's BH or rPIE on a measured scan from its init as it is, on CUDA device 0, for
-//! `refs/py/time_to_target.py`.
+//! The GPU engine's BH, rPIE or LSQML on a measured scan from its init as it is, on CUDA device
+//! 0, for `refs/py/time_to_target.py`.
 //!
 //! `gpu_target <cxi> <init.h5> <nepoch> <target|-> bh <batch_size> <probe_rho> <seed>`
 //! `gpu_target <cxi> <init.h5> <nepoch> <target|-> rpie <obj_step> <probe_step> <obj_alpha> <probe_alpha> <batch_size>`
+//! `gpu_target <cxi> <init.h5> <nepoch> <target|-> lsqml <batch_size> <amplitude|poisson> <seed> <position 0|1>`
+//!
+//! LSQML with position 1 refines [`Features::position`] from 0 at every frame.
 //!
 //! Prints `setup_s` (reading the files, the CUDA context and [`GpuPtycho::new`], synchronised),
 //! with `read_s` and `context_s` the time to the end of the first two, and `llk E G`, the
@@ -15,15 +18,20 @@ use std::iter::once;
 use std::time::Instant;
 
 use cuda_core::CudaContext;
-use ptyrs::engine::{BhParams, EngineError, GpuOptions, GpuPtycho, RpieParams};
+use ptyrs::engine::{
+    BhParams, Cost, EngineError, Features, GpuOptions, GpuPtycho, LsqmlParams, RpieParams,
+};
 
 const USAGE: &str = "usage: gpu_target <cxi> <init.h5> <nepoch> <target|-> \
     (bh <batch_size> <probe_rho> <seed> | \
-    rpie <obj_step> <probe_step> <obj_alpha> <probe_alpha> <batch_size>)";
+    rpie <obj_step> <probe_step> <obj_alpha> <probe_alpha> <batch_size> | \
+    lsqml <batch_size> <amplitude|poisson> <seed> <position 0|1>)";
 
 enum Method {
     Bh(BhParams),
     Rpie(RpieParams),
+    /// Whether it refines the positions.
+    Lsqml(LsqmlParams, bool),
 }
 
 impl Method {
@@ -44,15 +52,44 @@ impl Method {
                     calc_llk: 0,
                 })
             }
+            ("lsqml", [batch, cost, seed, position]) => Self::Lsqml(
+                LsqmlParams {
+                    batch_size: batch.parse()?,
+                    cost: match cost.as_str() {
+                        "amplitude" => Cost::Amplitude,
+                        "poisson" => Cost::Poisson,
+                        _ => return Err(USAGE.into()),
+                    },
+                    seed: seed.parse()?,
+                },
+                match position.as_str() {
+                    "0" => false,
+                    "1" => true,
+                    _ => return Err(USAGE.into()),
+                },
+            ),
             _ => return Err(USAGE.into()),
         })
     }
 
-    /// `nepoch` epochs in one call: BH restarts its CG direction at every call.
+    /// A new [`GpuPtycho`] of `nframe` frames modelling the features the method refines.
+    fn start(&self, g: &mut GpuPtycho, nframe: usize) -> Result<(), EngineError> {
+        match self {
+            Self::Lsqml(_, true) => g.set_features(&Features {
+                position: Some(vec![[0.0; 2]; nframe]),
+                ..Features::default()
+            }),
+            _ => Ok(()),
+        }
+    }
+
+    /// `nepoch` epochs in one call: BH restarts its CG direction at every call, LSQML its
+    /// preconditioner and Poisson `a_far`.
     fn run(&self, g: &mut GpuPtycho, nepoch: usize, calc_llk: usize) -> Result<(), EngineError> {
         match self {
             Self::Bh(p) => g.bh(p, nepoch, calc_llk),
             Self::Rpie(p) => g.rpie(&RpieParams { calc_llk, ..*p }, nepoch),
+            Self::Lsqml(p, _) => g.lsqml(p, nepoch, calc_llk),
         }
     }
 }
@@ -76,7 +113,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("read_s {}", t.elapsed().as_secs_f64());
     let ctx = CudaContext::new(0).map_err(EngineError::from)?;
     println!("context_s {}", t.elapsed().as_secs_f64());
+    let nframe = scan.counts.dims()[0];
     let mut g = GpuPtycho::new(&ctx, &scan, object.clone(), probe.clone(), options)?;
+    method.start(&mut g, nframe)?;
     g.synchronize()?;
     println!("setup_s {}", t.elapsed().as_secs_f64());
 
@@ -99,6 +138,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     drop(g);
     let mut g = GpuPtycho::new(&ctx, &scan, object, probe, options)?;
+    method.start(&mut g, nframe)?;
     g.synchronize()?;
     let t = Instant::now();
     method.run(&mut g, epochs, 0)?;

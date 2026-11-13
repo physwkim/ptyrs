@@ -131,9 +131,8 @@ pub struct FusedPtrs {
     /// One plane per frame and probe mode, `fl * nprobe + p`, `[nf_max * nprobe, ny, nx]`:
     /// `T` of the shift passes.
     pub shift: *mut f32,
-    /// `T_y` of the shift passes, as `shift`.
-    pub shift_dy: *mut f32,
-    /// `X`, then `G`, of the probe adjoint, as `shift`.
+    /// `T_y` of the shift passes until [`shift_rows_inv`] has read a row, which then holds the
+    /// probe adjoint's `X`, then its `G`, as `shift`.
     pub shift_adj: *mut f32,
     /// `c = sum_p conj(W_p) psi_(o, p)` of each frame and object mode, `fl * nobj + o`,
     /// `[nf_max * nobj, ny, nx]`, origin at `[0, 0]`.
@@ -152,6 +151,17 @@ pub struct FusedPtrs {
 pub fn col_slot_bytes(flags: u32, ny: u32) -> u32 {
     let rows = if flags & FUSED_SCALE_SUMS != 0 { 7 } else { 4 };
     4 * rows * FUSED_COLS * (ny / fft_ept(ny))
+}
+
+/// Bytes of [`shift_rows_inv`]'s `T_y` stage under `flags` for rows of `nx`: the block's rows
+/// under `FUSED_SHIFT_DEN` or `FUSED_SHIFT_POSITION`, none otherwise.
+#[device]
+pub fn shift_stage_bytes(flags: u32, nx: u32) -> u32 {
+    if flags & (FUSED_SHIFT_DEN | FUSED_SHIFT_POSITION) != 0 {
+        8 * FUSED_ROW_THREADS * fft_ept(nx)
+    } else {
+        0
+    }
 }
 
 /// Unnormalized in-register FFT of `N` points (64, 128, 256 or 512), inverse under `INV`, as
@@ -245,7 +255,16 @@ unsafe fn row_fft<const NX: u32, const INV: bool>(
     r: &mut [f32; 2 * FFT_EPT_MAX as usize],
     lane: RowLane,
 ) {
-    let s = DynamicSharedArray::<u8, 16>::get();
+    unsafe { row_fft_at::<NX, INV>(r, DynamicSharedArray::<u8, 16>::get(), lane) }
+}
+
+/// [`row_fft`] with the block's row FFTs at `s` in shared memory.
+#[device]
+unsafe fn row_fft_at<const NX: u32, const INV: bool>(
+    r: &mut [f32; 2 * FFT_EPT_MAX as usize],
+    s: *mut u8,
+    lane: RowLane,
+) {
     let skew = lane.b * FFT_SKEW;
     let rows = FUSED_ROW_THREADS / (NX / const { fft_ept(NX) });
     unsafe { block_fft::<NX, INV>(r, s.add(skew as usize), lane.b, lane.f, rows) }
@@ -816,7 +835,7 @@ unsafe fn gather_with<const SHIFT: bool>(
 /// Each frame's column half of the shifted probe: `T[fl * nprobe + p, ys, kx] =
 /// IDFT_y(A_p e_f)` over `ky` for `f = f0 + fl`, and under `FUSED_SHIFT_DEN` or
 /// `FUSED_SHIFT_POSITION` `T_y` the same of `A_p e_f (-2 pi i freq(ky, ny))` into
-/// `shift_dy`. Reads `offsets` and `spectrum`; writes `shift`, and `shift_dy` under those
+/// `shift_adj`. Reads `offsets` and `spectrum`; writes `shift`, and `shift_adj` under those
 /// flags.
 ///
 /// One 1D block of `nprobe * FUSED_COLS * tpf` threads mapped as [`cols`] maps modes, with
@@ -825,7 +844,7 @@ unsafe fn gather_with<const SHIFT: bool>(
 ///
 /// # Safety
 ///
-/// `NY == g.ny`; `offsets`, `spectrum`, `shift` and under those flags `shift_dy` hold their
+/// `NY == g.ny`; `offsets`, `spectrum`, `shift` and under those flags `shift_adj` hold their
 /// shapes for `g`; `ctl` one entry; launch as above.
 #[device]
 pub unsafe fn shift_pre<const NY: u32>(
@@ -883,7 +902,7 @@ pub unsafe fn shift_pre<const NY: u32>(
             for i in 0..ept {
                 let k = 2 * i as usize;
                 let at = plane + ((f + i * tpf) * nx + kx) as usize;
-                store_c(p.shift_dy, at, (r[k], r[k + 1]));
+                store_c(p.shift_adj, at, (r[k], r[k + 1]));
             }
             thread::sync_threads();
         }
@@ -913,20 +932,20 @@ pub unsafe fn shift_pre<const NY: u32>(
 /// of mode `o * nprobe + p` as [`rows_inv`] stores it (the DM add-back with `O W_p`). Under
 /// `FUSED_SHIFT_OBJ` `shift_power[fl] = sum_p |W_p|^2` and `shift_obj[fl * nobj + o] = sum_p
 /// conj(W_p) x`, both in ascending `p`. Under `FUSED_SHIFT_PROBE` `shift_adj`'s row gets `X
-/// = DFT_x(sum_o conj(O_o) x)`, `o` ascending. With the slopes `dW / dx = IDFT_x(T (-2 pi i
-/// freq(kx, nx)))` and `dW / dy = IDFT_x(T_y)`, under `FUSED_SHIFT_DEN` `shift_den[fl,
+/// = DFT_x(sum_o conj(O_o) x)`, `o` ascending, in place of the `T_y` row it has read. With
+/// the slopes `dW / dx = IDFT_x(T (-2 pi i freq(kx, nx)))` and `dW / dy = IDFT_x(T_y)`, under `FUSED_SHIFT_DEN` `shift_den[fl,
 /// blockIdx.x]` gets the block's `sum |O_o|^2 |dW_p / d_ax|^2` over its pixels, `o` and `p`,
 /// and under `FUSED_SHIFT_POSITION` `shift_grad[fl, blockIdx.x]` the block's `Re sum conj(x -
 /// O_o W_p) O_o dW_p / d_ax`, `x` alone under `FUSED_GRAD`; the difference is taken per pixel
 /// as `sum_o conj(O_o) x - sum_o |O_o|^2 W_p`, and each sum is a fixed tree over the block.
-/// Reads `work`, `views`, `obj`, `shift`, `shift_dy` under either sum's flag, and `psi` under
+/// Reads `work`, `views`, `obj`, `shift`, `shift_adj` under either sum's flag, and `psi` under
 /// `FUSED_DM`; writes the new waves and what the flags name. Grid `(ny / rows, nf_max)`,
-/// block `FUSED_ROW_THREADS`, dynamic shared memory the larger of `rows` row FFTs
-/// ([`FFT_SKEW`]) and `16 * FUSED_ROW_THREADS` bytes.
+/// block `FUSED_ROW_THREADS`, dynamic shared memory the larger of `shift_stage_bytes(flags,
+/// nx)` bytes then `rows` row FFTs ([`FFT_SKEW`]), and `16 * FUSED_ROW_THREADS` bytes.
 ///
 /// # Safety
 ///
-/// As [`rows_inv`], `shift` holding [`shift_pre`]'s `T` (and `shift_dy` its `T_y` under
+/// As [`rows_inv`], `shift` holding [`shift_pre`]'s `T` (and `shift_adj` its `T_y` under
 /// `FUSED_SHIFT_DEN` or `FUSED_SHIFT_POSITION`) of this stack, and the buffers the flags name
 /// holding their shapes.
 #[device]
@@ -1002,15 +1021,31 @@ unsafe fn shift_rows_inv_with<const NX: u32, const SUMS: bool>(
     let (mut den_y, mut den_x) = (0.0f32, 0.0f32);
     let (mut pos_y, mut pos_x) = (0.0f32, 0.0f32);
     unsafe {
+        let smem = DynamicSharedArray::<u8, 16>::get();
+        let stage = smem.cast::<f32>();
+        let fft_smem = smem.add(shift_stage_bytes(flags, nx) as usize);
         for pm in 0..g.nprobe {
             let trow = (fl * g.nprobe + pm) as usize * n + srow;
+            if slopes {
+                // `T_y`, copied while `W` and the waves transform: loaded beside the `X` that
+                // overwrites it, it cost registers and stalled `X`'s stores.
+                #[unroll]
+                for i in 0..ept {
+                    let e = 2 * (lane.b * nx + t + i * tpf) as usize;
+                    async_copy::cp_async_ca_8(
+                        stage.add(e).cast(),
+                        p.shift_adj.add(2 * (trow + (t + i * tpf) as usize)).cast(),
+                    );
+                }
+                async_copy::cp_async_commit_group();
+            }
             #[unroll]
             for i in 0..ept {
                 let v = load_c(p.shift, trow + (t + i * tpf) as usize);
                 w[2 * i as usize] = v.0;
                 w[2 * i as usize + 1] = v.1;
             }
-            row_fft::<NX, true>(&mut w, lane);
+            row_fft_at::<NX, true>(&mut w, fft_smem, lane);
             thread::sync_threads();
             if obj_terms {
                 #[unroll]
@@ -1037,7 +1072,7 @@ unsafe fn shift_rows_inv_with<const NX: u32, const SUMS: bool>(
                         r[2 * i as usize] = v.0;
                         r[2 * i as usize + 1] = v.1;
                     }
-                    row_fft::<NX, true>(&mut r, lane);
+                    row_fft_at::<NX, true>(&mut r, fft_smem, lane);
                     thread::sync_threads();
                 }
                 let v = *p.views.add((k0 + m) as usize);
@@ -1112,9 +1147,14 @@ unsafe fn shift_rows_inv_with<const NX: u32, const SUMS: bool>(
                 }
             }
             if probe {
-                // `X` has its own plane, so `acc` is dead before the slope rows.
-                row_fft::<NX, false>(&mut acc, lane);
+                row_fft_at::<NX, false>(&mut acc, fft_smem, lane);
                 thread::sync_threads();
+            }
+            if slopes {
+                // `X` takes the pixels this thread copied `T_y` from.
+                async_copy::cp_async_wait_all();
+            }
+            if probe {
                 #[unroll]
                 for i in 0..ept {
                     let k = 2 * i as usize;
@@ -1137,6 +1177,17 @@ unsafe fn shift_rows_inv_with<const NX: u32, const SUMS: bool>(
                     }
                     (d, q)
                 };
+                #[unroll]
+                for i in 0..ept {
+                    let e = 2 * (lane.b * nx + t + i * tpf) as usize;
+                    r[2 * i as usize] = *stage.add(e);
+                    r[2 * i as usize + 1] = *stage.add(e + 1);
+                }
+                row_fft_at::<NX, true>(&mut r, fft_smem, lane);
+                thread::sync_threads();
+                let (d, q) = terms(&r);
+                den_y += d;
+                pos_y += q;
                 let tau = 2.0 * core::f32::consts::PI;
                 #[unroll]
                 for i in 0..ept {
@@ -1147,22 +1198,11 @@ unsafe fn shift_rows_inv_with<const NX: u32, const SUMS: bool>(
                     r[2 * i as usize] = v.1 * wf;
                     r[2 * i as usize + 1] = -v.0 * wf;
                 }
-                row_fft::<NX, true>(&mut r, lane);
+                row_fft_at::<NX, true>(&mut r, fft_smem, lane);
                 thread::sync_threads();
                 let (d, q) = terms(&r);
                 den_x += d;
                 pos_x += q;
-                #[unroll]
-                for i in 0..ept {
-                    let v = load_c(p.shift_dy, trow + (t + i * tpf) as usize);
-                    r[2 * i as usize] = v.0;
-                    r[2 * i as usize + 1] = v.1;
-                }
-                row_fft::<NX, true>(&mut r, lane);
-                thread::sync_threads();
-                let (d, q) = terms(&r);
-                den_y += d;
-                pos_y += q;
             }
         }
         if slopes {

@@ -1,13 +1,14 @@
-"""Time to target, ptyrs against pty-chi on GPU2 in float32: BH-CG at full batch or rPIE on one M3
-dataset from its init as it is, matched settings on both sides, every run through gpu2.sh.
+"""Time to target, ptyrs against pty-chi on GPU2 in float32: BH-CG at full batch, rPIE or LSQML on
+one M3 dataset from its init as it is, matched settings on both sides, every run through gpu2.sh.
 
-    python -I time_to_target.py DATA_DIR {bh,rpie} [--long 2000] [--runs 3] [--every 50]
-        [--name fermat_clean] [--example PATH] [--gpu2 PATH] [--out DIR]
+    python -I time_to_target.py DATA_DIR {bh,rpie,lsqml} [--positions] [--truth] [--long 2000]
+        [--runs 3] [--every 50] [--name fermat_clean] [--example PATH] [--gpu2 PATH] [--out DIR]
 
 A long run of --long epochs on each side sets the target, 1.01 times the lower of the two final
-Gaussian LLKs (PyNX definition, m3ref.py). Each side then runs from the start until --runs runs
-that gpu2.sh calls clean have reached it, or --long epochs. Prints every run and the medians of
-the epochs to target, the wall time to target and the setup time; logs and a JSON summary go to
+Gaussian LLKs (PyNX definition, m3ref.py); with --truth it is 1.01 times the dataset's own
+llk_truth instead, and there are no long runs. Each side then runs from the start until --runs
+runs that gpu2.sh calls clean have reached it, or --long epochs. Prints every run and the medians
+of the epochs to target, the wall time to target and the setup time; logs and a JSON summary go to
 --out.
 
 ptyrs is ptyrs-py's gpu_target example (cargo build --release -p ptyrs-py --example gpu_target),
@@ -22,7 +23,10 @@ implement are off (object-probe ambiguity removal, mode orthogonalisation), PATC
 PyNX integer corners, consecutive rPIE batches, and gpu_target's parameters read from the pty-chi
 options (ptyrs_args). rPIE takes pty-chi's rPIE test settings
 (test_2d_ptycho_rpie_synthesisdictlearn.py, SDL probe off): pty-chi's defaults diverge on
-fermat_clean on both sides (compare_rpie.py --ptychi-defaults).
+fermat_clean on both sides (compare_rpie.py --ptychi-defaults). LSQML takes pty-chi's defaults
+(batch 100, Gaussian noise, the engine's Cost::Amplitude) with compare_lsqml.py's matched config,
+both sides over the engine's random_batches order (seed 7); --positions makes the probe positions
+optimizable at pty-chi's default position correction, which ptyrs' Features::position models.
 """
 
 import time
@@ -40,19 +44,30 @@ import numpy as np  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.dont_write_bytecode = True  # no __pycache__ in the refs directories
-sys.path[:0] = [HERE, os.path.join(HERE, "..", "ptychi")]
+sys.path[:0] = [HERE, os.path.join(HERE, "..", "ptychi"), os.path.join(HERE, "..", "f64")]
 import m3ref  # noqa: E402
 from compare_rpie import rpie_params  # noqa: E402
+from random_batches import Sampler  # noqa: E402
 
 FACTOR = 1.01
+SEED = 7  # the engine's frame order: BH's in its one batch, LSQML's batches
 SCRATCH = os.path.expanduser("~/work/ptyrs-scratch")
 KEYS = {"imports_s", "read_s", "context_s", "setup_s", "llk", "target", "wall_s", "end_llk"}
 
 
-def ptychi_options(method, nframe):
+def ptychi_options(method, nframe, positions):
     import ptychi.api as api
 
-    if method == "bh":
+    if method == "lsqml":
+        opts = api.LSQMLOptions()
+        r = opts.reconstructor_options
+        r.batch_size = 100  # LSQMLReconstructorOptions' default, as noise_model's
+        r.noise_model = api.NoiseModels.GAUSSIAN
+        opts.object_options.build_preconditioner_with_all_modes = True
+        r.forward_model_options.subpixel_shift_all_probe_modes = True
+        r.solve_step_sizes_only_using_first_probe_mode = False
+        r.rescale_probe_intensity_in_first_epoch = False
+    elif method == "bh":
         opts = api.BHOptions()
         r = opts.reconstructor_options
         r.method = "CG"
@@ -69,7 +84,8 @@ def ptychi_options(method, nframe):
         r.batch_size = round(0.1 * nframe)
     o, pr = opts.object_options, opts.probe_options
     o.optimizable = pr.optimizable = True
-    opts.probe_position_options.optimizable = False
+    assert not positions or method == "lsqml", "only LSQML refines the positions here"
+    opts.probe_position_options.optimizable = positions
     o.remove_object_probe_ambiguity.enabled = False
     pr.orthogonalize_incoherent_modes.enabled = False
     pr.orthogonalize_opr_modes.enabled = False
@@ -86,6 +102,12 @@ def ptychi_options(method, nframe):
 def ptyrs_args(method, opts):
     """gpu_target's method and parameters equal to the pty-chi options `opts`."""
     r, pr = opts.reconstructor_options, opts.probe_options
+    if method == "lsqml":
+        import ptychi.api as api
+
+        assert r.noise_model == api.NoiseModels.GAUSSIAN  # Poisson's alpha jitter is unmatched
+        return ["lsqml", str(r.batch_size), "amplitude", str(SEED),
+                str(int(opts.probe_position_options.optimizable))]
     if method == "rpie":
         p = rpie_params(opts)
         return ["rpie", *(repr(float(p[k])) for k in
@@ -96,7 +118,7 @@ def ptyrs_args(method, opts):
         "bh",
         str(r.batch_size),  # BHReconstructorOptions.batch_size: one batch of every frame, CG
         repr(pr.rho),  # BHProbeOptions.rho: the probe variable is P / (rho sqrt(ny nx))
-        "7",  # seed of the engine's frame order in its one batch (pty-chi's is consecutive)
+        str(SEED),  # the engine's frame order in its one batch (pty-chi's is consecutive)
     ]
 
 
@@ -123,7 +145,11 @@ def ptychi_task(ds, obj, probe, opts):
         probe_position_x_px=corners[:, 1],
     )
     rec = task.reconstructor
-    rec.dataloader = DataLoader(rec.dataset, batch_size=rec.batch_size, shuffle=False)
+    if isinstance(opts, api.LSQMLOptions):
+        sampler = Sampler(len(corners), rec.batch_size, SEED)
+        rec.dataloader = DataLoader(rec.dataset, batch_sampler=sampler)
+    else:
+        rec.dataloader = DataLoader(rec.dataset, batch_size=rec.batch_size, shuffle=False)
     return task
 
 
@@ -138,7 +164,7 @@ def worker(args):
     ds = m3ref.Dataset(args.name, args.data_dir)
     obj, probe = ds.modes("init")
     print(f"read_s {time.perf_counter() - t}")
-    task = ptychi_task(ds, obj, probe, ptychi_options(args.method, ds.nframe))
+    task = ptychi_task(ds, obj, probe, ptychi_options(args.method, ds.nframe, args.positions))
     torch.cuda.synchronize()
     print(f"setup_s {time.perf_counter() - t}")
     print(f"llk 0 {m3ref.evaluate(task)['gaussian']}", flush=True)
@@ -150,6 +176,8 @@ def worker(args):
         task.run(n_epochs=1)
         torch.cuda.synchronize()
         wall += time.perf_counter() - t
+        sampler = task.reconstructor.dataloader.batch_sampler
+        assert not isinstance(sampler, Sampler) or sampler.epoch == e, (sampler.epoch, e)
         if e % every and e < args.long:
             continue
         v = m3ref.evaluate(task)["gaussian"]
@@ -182,14 +210,15 @@ def parse(log):
 def run(args, side, label, target):
     """One run under gpu2.sh: its parsed lines, with `clean` and `log`."""
     os.makedirs(args.out, exist_ok=True)
-    log = os.path.join(args.out, f"{args.name}_{args.method}_{side}_{label}.log")
+    log = os.path.join(args.out, f"{args.name}_{args.tag}_{side}_{label}.log")
     t = "-" if target is None else repr(target)
     if side == "ptyrs":
         cmd = [args.example, args.cxi, args.init, str(args.long), t, *args.ptyrs]
     else:
         cmd = [sys.executable, "-I", os.path.abspath(__file__), args.data_dir, args.method,
                "--worker", "--name", args.name, "--long", str(args.long), "--every",
-               str(args.every)] + ([] if target is None else ["--target", t])
+               str(args.every)] + ([] if target is None else ["--target", t]) + (
+               ["--positions"] if args.positions else [])
     r = subprocess.run([args.gpu2, log, *cmd], capture_output=True, text=True)
     status = (r.stdout.strip().splitlines() or ["?"])[-1]
     if r.returncode:
@@ -207,7 +236,9 @@ def median(rows, key):
 def main():
     a = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     a.add_argument("data_dir")
-    a.add_argument("method", choices=("bh", "rpie"))
+    a.add_argument("method", choices=("bh", "rpie", "lsqml"))
+    a.add_argument("--positions", action="store_true", help="LSQML: refine the positions")
+    a.add_argument("--truth", action="store_true", help="target 1.01 x the dataset's llk_truth")
     a.add_argument("--name", default="fermat_clean")
     a.add_argument("--long", type=int, default=2000)
     a.add_argument("--runs", type=int, default=3)
@@ -225,20 +256,25 @@ def main():
     with open(os.path.join(args.data_dir, args.name + ".json")) as f:
         meta = json.load(f)
     args.cxi, args.init = (os.path.join(args.data_dir, meta["files"][k]) for k in ("cxi", "init"))
-    args.ptyrs = ptyrs_args(args.method, ptychi_options(args.method, meta["nframe"]))
-    print(f"{args.name} {args.method}: gpu_target {' '.join(args.ptyrs)}", flush=True)
+    opts = ptychi_options(args.method, meta["nframe"], args.positions)
+    args.ptyrs = ptyrs_args(args.method, opts)
+    args.tag = args.method + ("_pos" if args.positions else "") + ("_truth" if args.truth else "")
+    print(f"{args.name} {args.tag}: gpu_target {' '.join(args.ptyrs)}", flush=True)
 
     sides = ("ptyrs", "pty-chi")
     final = {}
-    for side in sides:
-        r = run(args, side, "long", None)
-        e, final[side] = r["llk"][-1]
-        print(f"{side:8s} long run: Gaussian LLK {final[side]:.6f} at epoch {e}, "
-              f"{r['status']}", flush=True)
+    if args.truth:
+        final["truth"] = meta["llk_truth"]["gaussian"]
+    else:
+        for side in sides:
+            r = run(args, side, "long", None)
+            e, final[side] = r["llk"][-1]
+            print(f"{side:8s} long run: Gaussian LLK {final[side]:.6f} at epoch {e}, "
+                  f"{r['status']}", flush=True)
     target = FACTOR * min(final.values())
     print(f"target {FACTOR:g} x {min(final.values()):.6f} = {target:.6f}", flush=True)
 
-    summary = {"name": args.name, "method": args.method, "gpu_target": args.ptyrs,
+    summary = {"name": args.name, "method": args.tag, "gpu_target": args.ptyrs,
                "long_epochs": args.long, "final_llk": final, "target": target, "runs": {}}
     for side in sides:
         clean = []
@@ -264,7 +300,7 @@ def main():
         rows = summary["runs"][side]
         print(f"{side:8s} {median(rows, 'epochs')} epochs, {median(rows, 'wall_s')} s, "
               f"{median(rows, 'setup_s'):.3f} s ({median(rows, 'read_s'):.3f} s)")
-    path = os.path.join(args.out, f"{args.name}_{args.method}.json")
+    path = os.path.join(args.out, f"{args.name}_{args.tag}.json")
     m3ref.dump(summary, path)
     print(path)
 

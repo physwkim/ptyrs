@@ -36,6 +36,7 @@ mod fused;
 mod grad;
 mod lsqml;
 mod ops;
+mod position;
 mod ring;
 mod rpie;
 
@@ -50,12 +51,13 @@ pub use fused::{
 pub use grad::{
     CG_BLOCKS, GAMMA_CHUNK, GammaCounts, GammaStacks, GradKernels, ObjProbeScale, gamma_parts,
 };
-pub use lsqml::{LSQML_REC, LsqmlAt, LsqmlKernels, LsqmlNoise, LsqmlScan, LsqmlVar};
+pub use lsqml::{LSQML_REC, LsqmlAt, LsqmlChi, LsqmlKernels, LsqmlNoise, LsqmlScan, LsqmlVar};
 pub use ops::{
     LLK_TREE_LEAVES, LlkPartial, LlkScratch, LlkSums, MASKED, OBJ_TILE, Permutation,
     PositionPartial, ScalePartial, StackCtl, StackGeom, StackRef, StackTable, UpdateSums, ViewAddr,
     ViewDims, Views, view_tiles,
 };
+pub use position::{PositionKernels, PositionRule, Positions};
 pub use ring::{Ended, LlkRing, LlkTotals, RecordWriter, RingDevice, RingError};
 pub use rpie::{POWER_CHUNK, PowerMax, RpieKernels, Weight};
 
