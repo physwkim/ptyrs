@@ -3,8 +3,8 @@
 //! `crate::gpu` ops and rPIE docs give, and is checked against [`crate::engine::Ptycho`].
 //!
 //! The scan's frames are cut into stacks of consecutive frames, one [`StackTable`] entry each:
-//! every launch reads its stack's frames from the entry on the device. The fused passes that
-//! stream only the shared scratch take stacks up to twice as long as the rest
+//! every launch reads its stack's frames from the entry on the device. The passes that stream
+//! one exit-wave set per frame take stacks up to twice as long as the rest
 //! ([`GpuOptions::stack_size`]). Each stack keeps its own exit waves (DM carries them across
 //! cycles), sized like PyNX's fixed stack for the longest stack. AP and DM project a stack, ML
 //! takes a stack's gradient, and the LLK pass takes its partials, either by M2's fused passes
@@ -55,10 +55,10 @@ use crate::engine::{
 pub struct GpuOptions {
     /// Frames per stack (the last stack may be shorter) for every pass; PyNX's default is 16.
     /// `None`, the default, cuts by bytes instead, so a stack's exit waves fill 3/8 of the
-    /// device's L2, the fastest share at frame sides 256 and 512: one set of them per frame in
-    /// the fused passes that stream only the shared scratch (AP's, the LLK pass's, ML's
-    /// gradient), two where the stack also streams its own (DM's carried waves, ML's line
-    /// search, M1's launches, BH's and LSQML's stacks).
+    /// device's L2, the fastest share at frame sides 256 and 512: one set of them per frame
+    /// where a pass streams one (the fused passes' shared scratch in AP, the LLK pass and ML's
+    /// gradient; LSQML's own), two where it streams two (DM's carried waves, ML's line search,
+    /// M1's launches, BH's stacks).
     pub stack_size: Option<usize>,
     /// Replay every AP, DM and ML cycle, rPIE epoch and LLK pass from a CUDA graph captured once
     /// per kind of cycle instead of launching it kernel by kernel; both give the same bits.
@@ -249,9 +249,8 @@ fn plans(
 }
 
 /// Frames per stack, `[wide, carry]`: `size` for both when given, else, for an `l2`-byte L2,
-/// as many as fill 3/8 of it with one exit-wave set per frame (the fused passes over the
-/// shared scratch) and with two (the passes that stream the stack's own too), at least one
-/// each ([`GpuOptions::stack_size`]).
+/// as many as fill 3/8 of it with one exit-wave set per frame (the passes that stream one)
+/// and with two (the rest), at least one each ([`GpuOptions::stack_size`]).
 fn stack_frames(size: Option<usize>, l2: usize, dims: &ViewDims) -> Result<[u32; 2], EngineError> {
     let set = dims.nmode as usize * plane_len(dims) * size_of::<C32>();
     let cap = l2 / 8 * 3;

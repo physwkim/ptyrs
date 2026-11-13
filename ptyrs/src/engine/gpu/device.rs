@@ -70,8 +70,10 @@ pub(super) struct Device {
     use_graph: bool,
     /// The epochs run since the parameters last changed, all of one [`Epoch::run`].
     runs: Vec<EpochRun>,
-    /// Frames per stack of `stacks`, for the [`MlState`] plans and BH's and LSQML's stacks.
+    /// Frames per stack of `stacks`, for the [`MlState`] plans and BH's stacks.
     stack_size: u32,
+    /// Frames per stack of `wide`, for LSQML's stacks, which stream one exit-wave set.
+    wide_size: u32,
     /// With graphs, the LLK pass's graph.
     llk_graph: Option<Captured>,
     /// ML's state, built by the first ML call and never replaced.
@@ -949,10 +951,10 @@ impl Device {
         let bh = BhKernels::load(&kernels)?;
         let views = Views::new(&stream, dims, addrs)?;
         let tile = TileDots::new(&stream, &dims)?;
-        let [wide, stack_size] =
+        let [wide_size, stack_size] =
             stack_frames(options.stack_size, ctx.l2_cache_size_bytes()?, &dims)?;
         let (frames, table, lens) = stacks(&stream, &dims, stack_size)?;
-        let wide = stacks(&stream, &dims, wide)?.1;
+        let wide = stacks(&stream, &dims, wide_size)?.1;
         let len = stack_buf_len(&dims, &table);
         let nf_max = nf_max(&wide, &table);
         let passes = if options.fused {
@@ -1013,6 +1015,7 @@ impl Device {
             lsqml: None,
             features: FeatureBufs::default(),
             stack_size,
+            wide_size,
             stream,
         };
         let ctx = dev.context();
@@ -1478,7 +1481,7 @@ impl Device {
                 &self.kernels,
                 &self.views,
                 size,
-                self.stack_size,
+                self.wide_size,
                 moved,
             )?;
             self.lsqml = Some(Box::new(state));

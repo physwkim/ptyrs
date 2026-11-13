@@ -1,10 +1,12 @@
 //! Per-cycle time of [`GpuPtycho`] on CUDA device 0, the M1 baseline for M2.
 //!
-//! `cargo run --release -p ptyrs --example engine_gpu_time -- <dm|ap|ml|rpie> [ncycle] [nprobe] [frame] [npos] [step] [sizes] [graph|eager] [calc_llk] [fused|m1] [features]`
-//! (defaults 50, 2, 256, 400, 16 object pixels, `16`, `graph`, 0, `fused`, `none`) builds the
-//! `engine_llk_trace` scan, and for each comma-separated size (frames per stack, or `default`
-//! for [`GpuOptions::stack_size`]'s; rPIE frames per batch) runs 5 untimed cycles, then times
-//! `ncycle` cycles without phase-ramp removal, with an LLK record every `calc_llk` cycles (0:
+//! `cargo run --release -p ptyrs --example engine_gpu_time -- <dm|ap|ml|rpie|bh|lsqml> [ncycle] [nprobe] [frame] [npos] [step] [sizes] [graph|eager] [calc_llk] [fused|m1] [features] [batch]`
+//! (defaults 50, 2, 256, 400, 16 object pixels, `16`, `graph`, 0, `fused`, `none`, `npos`)
+//! builds the `engine_llk_trace` scan, and for each comma-separated size (frames per stack, or
+//! `default` for [`GpuOptions::stack_size`]'s; rPIE frames per batch) runs 5 untimed cycles
+//! (LSQML 12, through its preconditioner's build, update and keep epochs), then times `ncycle`
+//! cycles (BH and LSQML epochs of `batch` frames per batch, seed 7) without phase-ramp
+//! removal, with an LLK record every `calc_llk` cycles (0:
 //! none, as `scripts/compare_pynx.py --time` times PyNX, and `scripts/compare_pynx_ml.py
 //! --time` PyNX ML). `graph` replays steady-state AP,
 //! DM and ML cycles, rPIE epochs and LLK passes from the graphs the untimed cycles captured
@@ -18,7 +20,8 @@ use std::time::Instant;
 
 use cuda_core::CudaContext;
 use ptyrs::engine::{
-    ApParams, DmParams, EngineError, Features, GpuOptions, GpuPtycho, MlParams, Ptycho, RpieParams,
+    ApParams, BhParams, Cost, DmParams, EngineError, Features, GpuOptions, GpuPtycho, LsqmlParams,
+    MlParams, Ptycho, RpieParams,
 };
 
 #[path = "../tests/common/engine/mod.rs"]
@@ -27,12 +30,13 @@ mod common;
 mod ptychi;
 
 const WARMUP: usize = 5;
+const LSQML_WARMUP: usize = 12;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let usage = "usage: gpu_time <dm|ap|ml|rpie> [ncycle] [nprobe] [frame] [npos] [step] [sizes] [graph|eager] [calc_llk] [fused|m1] [features]";
+    let usage = "usage: gpu_time <dm|ap|ml|rpie|bh|lsqml> [ncycle] [nprobe] [frame] [npos] [step] [sizes] [graph|eager] [calc_llk] [fused|m1] [features] [batch]";
     let mut args = std::env::args().skip(1);
     let algo = args.next().ok_or(usage)?;
-    if !["dm", "ap", "ml", "rpie"].contains(&algo.as_str()) {
+    if !["dm", "ap", "ml", "rpie", "bh", "lsqml"].contains(&algo.as_str()) {
         return Err(usage.into());
     }
     let mut next = |default: usize| args.next().map_or(Ok(default), |s| s.parse());
@@ -71,6 +75,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             _ => return Err(usage.into()),
         }
     }
+    let batch_size = args.next().map_or(Ok(npos), |s| s.parse::<usize>())?;
 
     let (scan, object, probe) = common::dm_scenario(frame, npos, nprobe, 2e5, step);
     let mut p = Ptycho::new(&scan, object, probe)?;
@@ -99,6 +104,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         calc_llk,
         zero_phase_ramp: false,
     };
+    let bh = BhParams {
+        batch_size,
+        probe_rho: 0.01,
+        position_rho: 0.1,
+        seed: 7,
+    };
+    let lsqml = LsqmlParams {
+        batch_size,
+        cost: Cost::Poisson,
+        seed: 7,
+    };
+    let warmup = if algo == "lsqml" {
+        LSQML_WARMUP
+    } else {
+        WARMUP
+    };
     for size in sizes {
         let stack_size = if algo == "rpie" { Some(16) } else { size };
         let options = GpuOptions {
@@ -119,10 +140,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "dm" => g.dm(&dm, n),
                 "ap" => g.ap(&ap, n),
                 "ml" => g.ml(&ml, n),
+                "bh" => g.bh(&bh, n, calc_llk),
+                "lsqml" => g.lsqml(&lsqml, n, calc_llk),
                 _ => g.rpie(&rpie, n),
             }
         };
-        run(&mut g, WARMUP)?;
+        run(&mut g, warmup)?;
         g.synchronize()?;
         let t = Instant::now();
         run(&mut g, ncycle)?;
@@ -130,8 +153,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let ms = 1e3 * t.elapsed().as_secs_f64() / ncycle as f64;
         let mode = if graph { "graph" } else { "eager" };
         let passes = if fused { "fused" } else { "m1" };
+        let batch = match algo.as_str() {
+            "bh" | "lsqml" => format!(" batch {batch_size}"),
+            _ => String::new(),
+        };
         println!(
-            "{algo} size {} {mode} {passes} calc_llk {calc_llk} features {features}: {ms:.3} ms/cycle over {ncycle} cycles, {} LLK records",
+            "{algo} size {}{batch} {mode} {passes} calc_llk {calc_llk} features {features}: {ms:.3} ms/cycle over {ncycle} cycles, {} LLK records",
             size.map_or("default".into(), |n| n.to_string()),
             g.history().len()
         );
