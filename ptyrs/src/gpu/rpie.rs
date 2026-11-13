@@ -11,6 +11,13 @@
 //! `O_v q`; [`RpieKernels::power_max`] per plane and [`RpieKernels::weight_inplace`] of `dlt`
 //! by them, then `psi_to_probe(dlt, O)`. Both steps read the batch-start arrays: apply
 //! [`RpieKernels::step`], which consumes the sums, only after both sums are taken.
+//!
+//! Under the position model `W = T_d(P q)` is each frame's moved probe, which
+//! `shifted_rows_fwd` and [`crate::gpu::PositionKernels::shift_w`] leave; `psi` is
+//! [`RpieKernels::obj_wave_to_psi`] of it. The object step weights `dlt` by `W` against
+//! [`RpieKernels::power_max_all`] of `W` over the batch and takes `shifted_psi_sums` of it;
+//! the probe step takes the weighted `dlt` through `shifted_psi_sums` and
+//! `shifted_probe_sums`, which move it back by `-d`.
 
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{DeviceBuffer, LaunchConfig};
@@ -82,7 +89,7 @@ impl RpieKernels {
 
     /// Exit waves of each frame's own probe `w`, `[nf_max * nprobe, ny, nx]` in the exit
     /// waves' layout with plane `fl * nprobe + p` mode `p` of frame `fl`, as
-    /// [`crate::gpu::LsqmlKernels::shift_w`] leaves the moved probe: `psi[kl] = O_v w[fl *
+    /// [`crate::gpu::PositionKernels::shift_w`] leaves the moved probe: `psi[kl] = O_v w[fl *
     /// nprobe + v.probe]` for view `v = f0 * nmode + kl`, `O_v` and `psi` as in
     /// [`Kernels::obj_probe_to_psi`].
     pub fn obj_wave_to_psi(
@@ -135,13 +142,39 @@ impl RpieKernels {
         chunks: &mut DeviceBuffer<f32>,
         out: &mut DeviceBuffer<f32>,
     ) -> Result<(), Error> {
+        self.launch_power_max(ctx, x, spec, chunks, out, false)
+    }
+
+    /// [`Self::power_max`]'s largest over the groups too, into `out[0]`.
+    pub fn power_max_all(
+        &self,
+        ctx: &ExecutionContext,
+        x: &DeviceBuffer<C32>,
+        spec: PowerMax,
+        chunks: &mut DeviceBuffer<f32>,
+        out: &mut DeviceBuffer<f32>,
+    ) -> Result<(), Error> {
+        self.launch_power_max(ctx, x, spec, chunks, out, true)
+    }
+
+    /// [`Self::power_max`], or with `all` [`Self::power_max_all`]: the chunks of the groups
+    /// are contiguous, so the second launch takes them as one group's.
+    fn launch_power_max(
+        &self,
+        ctx: &ExecutionContext,
+        x: &DeviceBuffer<C32>,
+        spec: PowerMax,
+        chunks: &mut DeviceBuffer<f32>,
+        out: &mut DeviceBuffer<f32>,
+        all: bool,
+    ) -> Result<(), Error> {
         let PowerMax { ngroup, nsum, n } = spec;
         if ngroup == 0 || nsum == 0 || n == 0 || ngroup > u16::MAX as u32 {
             return Err(Error::Shape(format!("empty or too many groups {spec:?}")));
         }
         check_len("x", x, ngroup as usize * nsum as usize * n as usize)?;
         check_len("chunks", chunks, spec.chunks())?;
-        check_len("out", out, ngroup as usize)?;
+        check_len("out", out, if all { 1 } else { ngroup as usize })?;
         let nchunk = n.div_ceil(POWER_CHUNK);
         let config = LaunchConfig {
             grid_dim: (nchunk, ngroup, 1),
@@ -156,6 +189,11 @@ impl RpieKernels {
                         .rpie_power_max(stream, config, dptr(x), nsum, n, dptr(chunks))
                 }
             })?;
+        let (nchunk, ngroup) = if all {
+            (nchunk * ngroup, 1)
+        } else {
+            (nchunk, ngroup)
+        };
         let config = LaunchConfig::for_num_elems(ngroup);
         self.base
             .launch(ctx, &[chunks.storage()], &[out.storage()], |stream| {

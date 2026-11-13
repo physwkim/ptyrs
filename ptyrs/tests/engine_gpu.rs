@@ -844,12 +844,13 @@ fn featured_start(nprobe: usize, with_flux: bool, with_background: bool) -> (Sca
     (scan, object, probe)
 }
 
-/// AP, DM or ML cycles on either backend.
+/// AP, DM, ML or rPIE cycles on either backend.
 #[derive(Clone, Copy, Debug)]
 enum Cycles {
     Ap(ApParams),
     Dm(DmParams),
     Ml(MlParams),
+    Rpie(RpieParams),
 }
 
 impl Cycles {
@@ -858,6 +859,7 @@ impl Cycles {
             Cycles::Ap(a) => p.ap(&a, ncycle),
             Cycles::Dm(d) => p.dm(&d, ncycle),
             Cycles::Ml(m) => p.ml(&m, ncycle),
+            Cycles::Rpie(r) => p.rpie(&r, ncycle).unwrap(),
         }
     }
 
@@ -866,6 +868,7 @@ impl Cycles {
             Cycles::Ap(a) => g.ap(&a, ncycle),
             Cycles::Dm(d) => g.dm(&d, ncycle),
             Cycles::Ml(m) => g.ml(&m, ncycle),
+            Cycles::Rpie(r) => g.rpie(&r, ncycle),
         }
         .unwrap()
     }
@@ -1158,6 +1161,92 @@ fn dm_position_matches_cpu() {
     }
 }
 
+/// Probe positions refined by 10 rPIE epochs of batches of 4 from [`drawn_offsets`], each
+/// batch stepping its frames' offsets, as [`features_match_cpu`] checks them. On the CPU the
+/// offsets' RMS falls.
+#[test]
+fn rpie_position_matches_cpu() {
+    const NEPOCH: usize = 10;
+    let start = featured_start(2, false, false);
+    let d0 = drawn_offsets();
+    let moved = Features {
+        position: Some(d0.clone()),
+        ..Features::default()
+    };
+    // Measured llk 3.5e-7, object 1.8e-7, probe 1.4e-6, offsets 9.6e-8 pixels; rms offset
+    // 0.257 from 0.282.
+    let (cpu, _) = features_match_cpu(Cycles::Rpie(ptychi::RPIE), &start, &moved, NEPOCH);
+    let d = cpu.features().position.clone().unwrap();
+    println!(
+        "rpie position: rms offset {:.4} from {:.4}",
+        rms(&d),
+        rms(&d0)
+    );
+    assert!(
+        rms(&d) < rms(&d0),
+        "rms offset {} from {}",
+        rms(&d),
+        rms(&d0)
+    );
+}
+
+/// rPIE epochs modelling a position, in batches of 4 (a short last one) around AP cycles
+/// modelling it and then in batches of 7, replay from graphs the eager bits: the object, the
+/// probe, the offsets and every LLK record. Dropping the position before any epoch gives a
+/// fresh start's bits.
+#[test]
+fn rpie_position_graphs_replay_bitwise_like_eager() {
+    let (scan, object, probe) = featured_start(2, false, false);
+    let moved = Features {
+        position: Some(drawn_offsets()),
+        ..Features::default()
+    };
+    let rpie = RpieParams {
+        calc_llk: 3,
+        ..ptychi::RPIE
+    };
+    let [ap, ..] = feature_cycles(3);
+    let new = |graph: bool| {
+        let options = GpuOptions {
+            graph,
+            ..FUSED.options
+        };
+        GpuPtycho::new(&ctx(), &scan, object.clone(), probe.clone(), options).unwrap()
+    };
+    let run = |graph: bool| {
+        let mut g = new(graph);
+        g.set_features(&moved).unwrap();
+        g.rpie(&rpie, 4).unwrap();
+        ap.gpu(&mut g, 4);
+        g.rpie(&rpie, 4).unwrap();
+        let sevens = RpieParams {
+            batch_size: 7,
+            ..rpie
+        };
+        g.rpie(&sevens, 4).unwrap();
+        bit_state(&mut g)
+    };
+    let (eager, graph) = (run(false), run(true));
+    assert_eq!(eager.llk.len(), 2 + 2 + 2 + 2 + 1);
+    assert!(eager.llk == graph.llk, "LLK records differ");
+    assert!(eager.object == graph.object, "object differs");
+    assert!(eager.probe == graph.probe, "probe differs");
+    assert!(eager.features == graph.features, "offsets differ");
+
+    let mut fresh = new(true);
+    fresh.rpie(&rpie, 4).unwrap();
+    let mut dropped = new(true);
+    dropped.set_features(&moved).unwrap();
+    dropped.set_features(&Features::default()).unwrap();
+    dropped.rpie(&rpie, 4).unwrap();
+    let (fresh, dropped) = (bit_state(&mut fresh), bit_state(&mut dropped));
+    assert!(dropped.features == [None, None, None]);
+    assert!(
+        fresh == dropped,
+        "dropping the position differs from a fresh start"
+    );
+}
+
 /// DM cycles modelling a position, two object-then-probe updates each, give the bits of
 /// stacks of 7 frames with stacks of 4 and with one stack of every frame: the object, the
 /// probe, the offsets and every LLK record.
@@ -1258,7 +1347,7 @@ fn bit_state(g: &mut GpuPtycho) -> RunBits {
 
 /// Features need the fused passes, one finite, positive scale per frame, one finite,
 /// non-negative background value per detector pixel and one finite offset pair per frame;
-/// rPIE and BH model none; the GPU's ML and ML gradients refuse a position before they touch
+/// rPIE models neither a scale nor a background and BH none; the GPU's ML and ML gradients refuse a position before they touch
 /// anything; a refused set leaves the features modelled.
 #[test]
 fn features_are_refused_where_they_cannot_run() {

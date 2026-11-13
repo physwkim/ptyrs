@@ -25,6 +25,7 @@ use cuda_async::device_operation::{DeviceOp, ExecutionContext};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 
 use super::lsqml::{LsqmlBufs, LsqmlState, Pre};
+use super::rpie::RpieMoved;
 use super::{
     Epoch, Frames, GpuOptions, Tag, batch_stacks, plane_len, plans, split, stack_buf_len, stacks,
     to_u32,
@@ -627,6 +628,8 @@ struct RpieScratch {
     ptilde: DeviceBuffer<C32>,
     pmax: DeviceBuffer<f32>,
     ones: DeviceBuffer<C32>,
+    /// The position model's state, if the device models positions.
+    moved: Option<RpieMoved>,
 }
 
 /// An [`RpieScratch`] lent to an epoch.
@@ -649,15 +652,20 @@ pub(super) struct RpieBufs<'a> {
     pub pmax: &'a mut DeviceBuffer<f32>,
     /// A probe of ones, so `obj_probe_to_psi` yields the object windows.
     pub ones: &'a DeviceBuffer<C32>,
+    pub moved: Option<&'a mut RpieMoved>,
 }
 
 impl RpieScratch {
+    /// For `views` in `params`' batches, `moved` under the position model.
     fn new(
         stream: &Arc<CudaStream>,
-        dims: &ViewDims,
+        kernels: &Kernels,
+        views: &Views,
         params: &RpieParams,
         nprobe_values: usize,
+        moved: bool,
     ) -> Result<Self, EngineError> {
+        let dims = views.dims();
         let (batches, table, lens) =
             stacks(stream, dims, to_u32("batch_size", params.batch_size)?)?;
         let len = stack_buf_len(dims, &table);
@@ -671,7 +679,6 @@ impl RpieScratch {
         Ok(Self {
             batches,
             n,
-            table,
             plans: plans(stream, dims, &lens)?,
             psi: DeviceBuffer::zeroed(stream, len)?,
             dlt: DeviceBuffer::zeroed(stream, len)?,
@@ -680,6 +687,9 @@ impl RpieScratch {
             ptilde: DeviceBuffer::zeroed(stream, nprobe_values)?,
             pmax: DeviceBuffer::zeroed(stream, 1)?,
             ones: DeviceBuffer::from_host(stream, &vec![C32 { re: 1.0, im: 0.0 }; nprobe_values])?,
+            moved: (moved.then(|| RpieMoved::new(stream, kernels, views, table.nf_max())))
+                .transpose()?,
+            table,
         })
     }
 
@@ -696,6 +706,7 @@ impl RpieScratch {
             ptilde: &mut self.ptilde,
             pmax: &mut self.pmax,
             ones: &self.ones,
+            moved: self.moved.as_mut(),
         }
     }
 }
@@ -1237,7 +1248,15 @@ impl Device {
             Epoch::Ap { params, llk } => Cycle::Ap { params, llk },
             Epoch::Dm { params, first } => Cycle::Dm { params, first },
             Epoch::Rpie(p) => {
-                let scratch = RpieScratch::new(&self.stream, &self.dims(), &p, self.probe.len())?;
+                let moved = self.features.position.is_some();
+                let scratch = RpieScratch::new(
+                    &self.stream,
+                    &self.kernels,
+                    &self.views,
+                    &p,
+                    self.probe.len(),
+                    moved,
+                )?;
                 Cycle::Rpie(p, Box::new(scratch))
             }
             Epoch::Ml { params, first, llk } => {
@@ -1431,7 +1450,9 @@ impl<'a> Bufs<'a> {
             Cycle::Dm { params, first } => {
                 self.dm_cycle(ctx, passes, params, *first).map(|()| None)
             }
-            Cycle::Rpie(p, scratch) => self.rpie_epoch(ctx, p, &mut scratch.lend()).map(|()| None),
+            Cycle::Rpie(p, scratch) => self
+                .rpie_epoch(ctx, passes, p, &mut scratch.lend())
+                .map(|()| None),
             Cycle::Ml { params, first, llk } => self.with_ml(|b, ml| {
                 b.ml_epoch(ctx, passes, ml, params, *first, llk.then(|| ring.record()))
             }),
