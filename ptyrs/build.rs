@@ -1,5 +1,6 @@
-//! Links libcufft from the toolkit named by CUDA_TOOLKIT_PATH (or CUDA_HOME) for `ptyrs::fft`,
-//! and builds ptyrs-kernels into one cubin for `PTYRS_CUDA_ARCH` (default `sm_89`).
+//! Links libcufft for `ptyrs::fft` and builds ptyrs-kernels into one cubin for
+//! `PTYRS_CUDA_ARCH` (default `sm_89`). Every toolkit file it or the nested build uses comes
+//! from the one root that CUDA_TOOLKIT_PATH, else CUDA_HOME, names; see [`Toolkit`].
 //!
 //! 1. A nested `cargo oxide build --emit-nvvm-ir` compiles ptyrs-kernels with the cuda-oxide
 //!    backend into `<target>/oxide-device`, writing `ptyrs_kernels.{ll,options,target}` to
@@ -18,6 +19,7 @@ use std::error::Error;
 use std::ffi::{OsString, c_char, c_int};
 use std::fmt::Write as _;
 use std::fs;
+use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -37,7 +39,7 @@ const FFT_PARAMS: &str = "(float*, i8*, i32, i32, i32)";
 
 /// Variables the nested cargo inherits. Everything else the outer cargo, clippy or nextest
 /// set (RUSTC_WORKSPACE_WRAPPER, CARGO_TARGET_DIR, CARGO_ENCODED_RUSTFLAGS, jobserver, ...)
-/// would redirect or break the device build.
+/// would redirect or break the device build. The toolkit is passed by [`nested_cargo`].
 const KEEP_ENV: &[&str] = &[
     "PATH",
     "HOME",
@@ -47,40 +49,83 @@ const KEEP_ENV: &[&str] = &[
     "RUSTUP_HOME",
     "RUSTUP_TOOLCHAIN",
     "LD_LIBRARY_PATH",
-    "CUDA_TOOLKIT_PATH",
-    "CUDA_HOME",
-    "CUDA_PATH",
-    "LIBNVVM_PATH",
-    "LIBNVJITLINK_PATH",
 ];
 
+const LIBCUFFT: &str = "lib64/libcufft.so";
+
 fn main() {
-    link_cufft();
-    if let Err(e) = run() {
+    // Cargo runs a build script without arguments; `Toolkit::exec_bound` reruns it with one.
+    let result = match env::args_os().nth(1) {
+        None => Toolkit::resolve().and_then(|toolkit| toolkit.exec_bound()),
+        Some(root) => run(&Toolkit { root: root.into() }),
+    };
+    if let Err(e) = result {
         eprintln!("error: ptyrs build script: {e}");
         std::process::exit(1);
     }
 }
 
-fn link_cufft() {
-    println!("cargo:rerun-if-env-changed=CUDA_TOOLKIT_PATH");
-    println!("cargo:rerun-if-env-changed=CUDA_HOME");
-    let root = env::var("CUDA_TOOLKIT_PATH")
-        .or_else(|_| env::var("CUDA_HOME"))
-        .expect("set CUDA_TOOLKIT_PATH or CUDA_HOME to the CUDA toolkit root");
-    let lib = PathBuf::from(root).join("lib64");
-    assert!(
-        lib.join("libcufft.so").exists(),
-        "libcufft.so not in {}",
-        lib.display()
-    );
-    println!("cargo:rustc-link-search=native={}", lib.display());
-    println!("cargo:rustc-link-lib=dylib=cufft");
-    // Tests/examples run without LD_LIBRARY_PATH.
-    println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib.display());
+/// The CUDA toolkit root, CUDA_TOOLKIT_PATH else CUDA_HOME. A file missing under it is an
+/// error, never a search of other toolkits.
+struct Toolkit {
+    root: PathBuf,
 }
 
-fn run() -> Res<()> {
+impl Toolkit {
+    fn resolve() -> Res<Self> {
+        let root = env::var("CUDA_TOOLKIT_PATH")
+            .or_else(|_| env::var("CUDA_HOME"))
+            .map_err(|_| "set CUDA_TOOLKIT_PATH or CUDA_HOME to the CUDA toolkit root")?;
+        Ok(Self { root: root.into() })
+    }
+
+    fn file(&self, rel: &str) -> Res<PathBuf> {
+        let path = self.root.join(rel);
+        if path.is_file() {
+            Ok(path)
+        } else {
+            Err(format!("{} not found", path.display()).into())
+        }
+    }
+
+    /// Reruns this script with the root as its argument, the root's lib64 first on the loader
+    /// path and libnvvm-sys's and nvjitlink-sys's exact-file overrides naming the root's files.
+    /// libcufft dlopens libnvJitLink and libnvrtc, and libnvrtc its builtins, by SONAME, and
+    /// glibc reads LD_LIBRARY_PATH only at startup. Returns only on failure.
+    fn exec_bound(&self) -> Res<()> {
+        let mut path = OsString::from(self.root.join("lib64"));
+        if let Some(inherited) = env::var_os("LD_LIBRARY_PATH") {
+            path.push(":");
+            path.push(inherited);
+        }
+        let mut cmd = Command::new(env::current_exe()?);
+        cmd.arg(&self.root).env("LD_LIBRARY_PATH", path);
+        for (var, rel) in [
+            ("LIBNVVM_PATH", "nvvm/lib64/libnvvm.so"),
+            ("CUDA_OXIDE_LIBDEVICE", "nvvm/libdevice/libdevice.10.bc"),
+            ("LIBNVJITLINK_PATH", "lib64/libnvJitLink.so"),
+        ] {
+            cmd.env(var, self.file(rel)?);
+        }
+        Err(cmd.exec().into())
+    }
+
+    fn link_cufft(&self) -> Res<()> {
+        self.file(LIBCUFFT)?;
+        let lib = self.root.join("lib64");
+        println!("cargo:rustc-link-search=native={}", lib.display());
+        println!("cargo:rustc-link-lib=dylib=cufft");
+        // Tests/examples run without LD_LIBRARY_PATH.
+        println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib.display());
+        Ok(())
+    }
+}
+
+fn run(toolkit: &Toolkit) -> Res<()> {
+    println!("cargo:rerun-if-env-changed=CUDA_TOOLKIT_PATH");
+    println!("cargo:rerun-if-env-changed=CUDA_HOME");
+    toolkit.link_cufft()?;
+
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
     let workspace = manifest.parent().ok_or("ptyrs has no parent directory")?;
     let kernels = workspace.join(DEVICE_PACKAGE);
@@ -101,10 +146,10 @@ fn run() -> Res<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|| workspace.join("target"));
 
-    build_device_crate(workspace, &target_dir, &nvvm_dir, &arch)?;
+    build_device_crate(workspace, toolkit, &target_dir, &nvvm_dir, &arch)?;
     let (ir, options) = read_device_artifact(&nvvm_dir, &arch)?;
 
-    let cufft = CufftDevice::load()?;
+    let cufft = CufftDevice::load(&toolkit.file(LIBCUFFT)?)?;
     let (ir, ffts) = define_block_ffts(&ir, &cufft, arch.capability())?;
     let ltoir = NvvmCompiler::discover()?.compile_nvvm_ir_to_ltoir(
         DEVICE_CRATE,
@@ -133,8 +178,9 @@ fn run() -> Res<()> {
 }
 
 /// A cargo for the nested builds. Everything else the outer cargo, clippy or nextest set would
-/// redirect or break them; see [`KEEP_ENV`].
-fn nested_cargo(workspace: &Path) -> Command {
+/// redirect or break them; see [`KEEP_ENV`]. CUDA_TOOLKIT_PATH is the root even when CUDA_HOME
+/// named it, so the workspace config's `[env]` cannot substitute another toolkit.
+fn nested_cargo(workspace: &Path, toolkit: &Toolkit) -> Command {
     let cargo = env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
     let mut cmd = Command::new(cargo);
     cmd.current_dir(workspace).env_clear();
@@ -143,6 +189,7 @@ fn nested_cargo(workspace: &Path) -> Command {
             cmd.env(key, value);
         }
     }
+    cmd.env("CUDA_TOOLKIT_PATH", &toolkit.root);
     cmd
 }
 
@@ -162,8 +209,8 @@ fn output_ok(mut cmd: Command, what: &str) -> Res<Vec<u8>> {
 
 /// cargo-oxide's manifest in the cuda-rust checkout cargo resolved `cuda-device` to: the pinned
 /// git commit, or the local clone a `.cargo/config.local.toml` replaces it with.
-fn cargo_oxide_manifest(workspace: &Path) -> Res<PathBuf> {
-    let mut cmd = nested_cargo(workspace);
+fn cargo_oxide_manifest(workspace: &Path, toolkit: &Toolkit) -> Res<PathBuf> {
+    let mut cmd = nested_cargo(workspace, toolkit);
     cmd.args(["metadata", "--format-version=1", "--locked"]);
     let metadata: serde_json::Value = serde_json::from_slice(&output_ok(cmd, "`cargo metadata`")?)?;
     let device = metadata["packages"]
@@ -187,12 +234,13 @@ fn cargo_oxide_manifest(workspace: &Path) -> Res<PathBuf> {
 /// of the current sources for this architecture.
 fn build_device_crate(
     workspace: &Path,
+    toolkit: &Toolkit,
     target_dir: &Path,
     nvvm_dir: &Path,
     arch: &CudaArch,
 ) -> Res<()> {
-    let cargo_oxide = cargo_oxide_manifest(workspace)?;
-    let mut cmd = nested_cargo(workspace);
+    let cargo_oxide = cargo_oxide_manifest(workspace, toolkit)?;
+    let mut cmd = nested_cargo(workspace, toolkit);
     cmd.env("CUDA_OXIDE_PTX_DIR", nvvm_dir)
         .args(["run", "--quiet", "--locked", "--manifest-path"])
         .arg(&cargo_oxide)
@@ -402,22 +450,11 @@ fn ck(call: &str, status: c_int) -> Res<()> {
 }
 
 impl CufftDevice {
-    fn load() -> Res<Self> {
-        let toolkit = env::var_os("CUDA_TOOLKIT_PATH").map(PathBuf::from);
-        let candidates = toolkit
-            .iter()
-            .map(|root| root.join("lib64").join("libcufft.so"))
-            .chain([
-                PathBuf::from("libcufft.so.12"),
-                PathBuf::from("libcufft.so"),
-            ]);
+    fn load(path: &Path) -> Res<Self> {
         // SAFETY: loading libcufft runs no initialisers with preconditions, and every symbol
         // type below matches its declaration in cufft_device.h.
         unsafe {
-            let lib = candidates
-                .into_iter()
-                .find_map(|path| Library::new(path).ok())
-                .ok_or("cannot load libcufft (set CUDA_TOOLKIT_PATH)")?;
+            let lib = Library::new(path).map_err(|e| format!("{}: {e}", path.display()))?;
             Ok(Self {
                 get_version: *lib.get(b"cufftDeviceGetVersion\0")?,
                 desc_create: *lib.get(b"cufftDescriptionCreate\0")?,
