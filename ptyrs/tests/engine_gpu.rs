@@ -1221,6 +1221,23 @@ fn rpie_position_matches_cpu() {
     );
 }
 
+/// rPIE under the position model in batches of 12, more frames than [`FUSED`]'s stacks of 7
+/// hold, as [`features_match_cpu`] checks them.
+#[test]
+fn rpie_position_batch_over_stack() {
+    let moved = Features {
+        position: Some(drawn_offsets()),
+        ..Features::default()
+    };
+    let params = RpieParams {
+        batch_size: 12,
+        ..ptychi::RPIE
+    };
+    assert!(params.batch_size > FUSED.options.stack_size);
+    let start = featured_start(2, false, false);
+    features_match_cpu(Cycles::Rpie(params), &start, &moved, 3);
+}
+
 /// Probe positions refined by 20 ML cycles from [`drawn_offsets`], their sums from the
 /// magnitude projection of each cycle's start estimate, as [`features_match_cpu`] checks
 /// them. On the CPU the offsets' RMS falls.

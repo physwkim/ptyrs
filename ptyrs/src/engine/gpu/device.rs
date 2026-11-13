@@ -1469,9 +1469,7 @@ impl<'a> Bufs<'a> {
             Cycle::Dm { params, first } => {
                 self.dm_cycle(ctx, passes, params, *first).map(|()| None)
             }
-            Cycle::Rpie(p, scratch) => self
-                .rpie_epoch(ctx, passes, p, &mut scratch.lend())
-                .map(|()| None),
+            Cycle::Rpie(p, scratch) => self.rpie_epoch(ctx, p, &mut scratch.lend()).map(|()| None),
             Cycle::Ml { params, first, llk } => self.with_ml(|b, ml| {
                 b.ml_epoch(ctx, passes, ml, params, *first, llk.then(|| ring.record()))
             }),

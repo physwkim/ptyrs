@@ -10,7 +10,7 @@ use crate::gpu::{
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaStream, DeviceBuffer};
 
-use super::device::{FeaturesMut, PassesMut, PositionLent, RpieBufs};
+use super::device::{FeaturesMut, PositionLent, RpieBufs};
 use super::{Bufs, Epoch, GpuPtycho, plane_len};
 use crate::engine::features::{POSITION_LIMIT, POSITION_STEP};
 use crate::engine::ptycho::{Algorithm, llk_due};
@@ -48,13 +48,15 @@ impl GpuPtycho {
 }
 
 /// rPIE's state under the position model: a batch's moved probe `[nf_max * nprobe, ny, nx]`,
-/// the positions, the scan order they step in, and their kernels.
+/// the positions, the scan order they step in, their kernels, and the shifted sums' scratch.
 pub(super) struct RpieMoved {
     w: DeviceBuffer<C32>,
     pos: Positions,
     /// Never set: rPIE's batches take the frames in scan order.
     order: EpochOrder,
     kernels: PositionKernels,
+    /// Its own, as a batch is one stack, which may outgrow the device's.
+    fused: FusedBufs,
 }
 
 impl RpieMoved {
@@ -72,30 +74,27 @@ impl RpieMoved {
             pos: Positions::zeroed(stream, dims, nf_max)?,
             order: EpochOrder::new(kernels, stream, views)?,
             kernels: PositionKernels::load(kernels)?,
+            fused: FusedBufs::with_shift(stream, dims, nf_max)?,
         })
     }
 }
 
-/// [`RpieMoved`] with the device's position buffers and the fused passes' scratch.
+/// [`RpieMoved`] with the device's position buffers.
 struct MovedLent<'m> {
     moved: &'m mut RpieMoved,
     lent: PositionLent<'m>,
-    fused: &'m mut FusedBufs,
 }
 
 impl<'m> MovedLent<'m> {
-    /// For rPIE's `moved` state with the device's `passes` and `features`: none without a
-    /// position, an error when the two disagree.
+    /// For rPIE's `moved` state with the device's `features`: none without a position, an
+    /// error when the two disagree.
     fn lend(
         moved: Option<&'m mut RpieMoved>,
-        passes: &'m mut PassesMut<'_>,
         features: &'m mut FeaturesMut<'_>,
     ) -> Result<Option<Self>, GpuError> {
-        match (moved, features.position_lent(), passes) {
-            (None, None, _) => Ok(None),
-            (Some(moved), Some(lent), PassesMut::Fused(fused)) => {
-                Ok(Some(Self { moved, lent, fused }))
-            }
+        match (moved, features.position_lent()) {
+            (None, None) => Ok(None),
+            (Some(moved), Some(lent)) => Ok(Some(Self { moved, lent })),
             _ => Err(GpuError::Shape(
                 "rPIE state built for another position model".into(),
             )),
@@ -120,7 +119,6 @@ impl<'m> MovedLent<'m> {
             moved: self.moved,
             offsets,
             probe_sums,
-            fused: self.fused,
         })
     }
 }
@@ -132,7 +130,6 @@ struct MovedBatch<'m> {
     offsets: &'m mut DeviceBuffer<f32>,
     probe_sums: &'m mut ShiftedProbeSums,
     spectrum: ProbeSpectrum<'m>,
-    fused: &'m mut FusedBufs,
 }
 
 /// `base` under the batch's position model: the epoch's offsets `pos` and the batch-start
@@ -160,14 +157,13 @@ impl Bufs<'_> {
     pub(super) fn rpie_epoch(
         &mut self,
         ctx: &ExecutionContext,
-        passes: &mut PassesMut<'_>,
         params: &RpieParams,
         rb: &mut RpieBufs<'_>,
     ) -> Result<(), GpuError> {
         // Each frame is in one batch, stepped after its batch's passes: the offsets the epoch
         // starts from serve every batch.
         let moved = rb.moved.as_deref_mut();
-        if let Some(m) = MovedLent::lend(moved, passes, &mut self.features)? {
+        if let Some(m) = MovedLent::lend(moved, &mut self.features)? {
             let RpieMoved {
                 pos,
                 order,
@@ -177,7 +173,7 @@ impl Bufs<'_> {
             kernels.gather(ctx, order, m.lent.offsets, pos)?;
         }
         for b in 0..rb.batches.len() {
-            self.rpie_batch(ctx, passes, params, rb, b)?;
+            self.rpie_batch(ctx, params, rb, b)?;
         }
         Ok(())
     }
@@ -186,7 +182,6 @@ impl Bufs<'_> {
     fn rpie_batch(
         &mut self,
         ctx: &ExecutionContext,
-        passes: &mut PassesMut<'_>,
         params: &RpieParams,
         rb: &mut RpieBufs<'_>,
         b: usize,
@@ -199,7 +194,7 @@ impl Bufs<'_> {
         let nk = frames.nf() * dims.nmode;
         let len = frames.len;
         let (k, rk) = (self.kernels, self.rpie);
-        let moved = MovedLent::lend(rb.moved.as_deref_mut(), passes, &mut self.features)?;
+        let moved = MovedLent::lend(rb.moved.as_deref_mut(), &mut self.features)?;
         let mut moved = (moved.map(|m| m.batch(ctx, k, self.probe))).transpose()?;
         let base = FusedInputs {
             views: self.views,
@@ -240,7 +235,7 @@ impl Bufs<'_> {
             match &mut moved {
                 // `conj(W) Δ / ((1 − a) |W|² + a max Σ_m |W_m|²)`, the max over the batch.
                 Some(m) => {
-                    let RpieMoved { w, pos, .. } = &*m.moved;
+                    let RpieMoved { w, pos, fused, .. } = &mut *m.moved;
                     let groups = PowerMax {
                         ngroup: frames.nf(),
                         nsum: dims.nprobe,
@@ -259,7 +254,7 @@ impl Bufs<'_> {
                         probe: None,
                     };
                     let inputs = moved_inputs(&base, pos, m.spectrum);
-                    k.shifted_psi_sums(ctx, &inputs, stack, rb.psi, m.fused, sums)?;
+                    k.shifted_psi_sums(ctx, &inputs, stack, rb.psi, fused, sums)?;
                 }
                 None => {
                     let groups = PowerMax {
@@ -301,8 +296,9 @@ impl Bufs<'_> {
                         obj: None,
                         probe: Some(&mut *m.probe_sums),
                     };
-                    let inputs = moved_inputs(&base, &m.moved.pos, m.spectrum);
-                    k.shifted_psi_sums(ctx, &inputs, stack, rb.dlt, m.fused, sums)?;
+                    let RpieMoved { pos, fused, .. } = &mut *m.moved;
+                    let inputs = moved_inputs(&base, pos, m.spectrum);
+                    k.shifted_psi_sums(ctx, &inputs, stack, rb.dlt, fused, sums)?;
                     k.shifted_probe_sums(ctx, &dims, m.probe_sums, self.probe_sums)?;
                 }
                 None => {
