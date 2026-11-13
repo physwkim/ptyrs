@@ -719,7 +719,6 @@ fn null_ptrs() -> FusedPtrs {
         offsets: std::ptr::null(),
         spectrum: std::ptr::null(),
         shift: std::ptr::null_mut(),
-        shift_dy: std::ptr::null_mut(),
         shift_obj: std::ptr::null_mut(),
         shift_power: std::ptr::null_mut(),
         shift_grad: std::ptr::null_mut(),

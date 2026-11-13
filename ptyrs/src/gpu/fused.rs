@@ -23,7 +23,7 @@ use ptyrs_kernels::fused::{
     FFT_SKEW, FUSED_BACKGROUND, FUSED_BACKGROUND_SUMS, FUSED_COLS, FUSED_DM, FUSED_GRAD, FUSED_LLK,
     FUSED_MODEL_TERMS, FUSED_PROJECT, FUSED_ROW_THREADS, FUSED_SCALE, FUSED_SCALE_SUMS,
     FUSED_SHIFT_DEN, FUSED_SHIFT_OBJ, FUSED_SHIFT_POSITION, FUSED_SHIFT_PROBE, FUSED_TO_PSI,
-    FusedCfg, FusedPtrs, col_slot_bytes, fused_col_threads,
+    FusedCfg, FusedPtrs, col_slot_bytes, fused_col_threads, shift_stage_bytes,
 };
 use ptyrs_kernels::pixel::SumPtrs;
 
@@ -123,8 +123,10 @@ impl Shape {
                 + (col_threads / (ny / fft_ept(ny))) * col_fft.max(4 * ny),
             col_fft,
         };
-        // The column pass's most shared memory is under every flag that adds to it.
-        if s.col_smem(FUSED_SCALE_SUMS) > SMEM_MAX || s.row_smem > SMEM_MAX {
+        // The passes' most shared memory is under every flag that adds to it.
+        if s.col_smem(FUSED_SCALE_SUMS) > SMEM_MAX
+            || s.shift_row_smem(FUSED_SHIFT_DEN | FUSED_SHIFT_POSITION) > SMEM_MAX
+        {
             return Err(bad("shared memory per block exceeds 48 KiB".into()));
         }
         Ok(s)
@@ -132,6 +134,10 @@ impl Shape {
 
     fn col_smem(&self, flags: u32) -> u32 {
         col_slot_bytes(flags, self.ny as u32) + self.col_tile_fft
+    }
+
+    fn shift_row_smem(&self, flags: u32) -> u32 {
+        (shift_stage_bytes(flags, self.nx as u32) + self.row_smem).max(16 * FUSED_ROW_THREADS)
     }
 
     /// `rows_fwd` (one block row per view) or `rows_inv` (per frame).
@@ -220,9 +226,7 @@ pub struct FusedBufs {
 struct ShiftScratch {
     /// `T` of the shift passes, `[nf_max * nprobe, ny, nx]`.
     t: DeviceBuffer<C32>,
-    /// `T_y`, as `t`.
-    t_dy: DeviceBuffer<C32>,
-    /// `X`, then `G`, of the probe adjoint, as `t`.
+    /// `T_y`, then the probe adjoint's `X` and `G`, as `t`: the kernels' `shift_adj`.
     adj: DeviceBuffer<C32>,
     /// `[nf_max * nobj, ny, nx]`.
     obj: DeviceBuffer<C32>,
@@ -238,7 +242,6 @@ impl ShiftScratch {
     fn check(&self, d: &ViewDims, g: &StackGeom, sh: &Shape) -> Result<(), Error> {
         let (n, nf) = (d.n(), g.nf_max as usize);
         check_len("shift", &self.t, nf * d.nprobe as usize * n)?;
-        check_len("shift_dy", &self.t_dy, nf * d.nprobe as usize * n)?;
         check_len("shift_adj", &self.adj, nf * d.nprobe as usize * n)?;
         check_len("shift_obj", &self.obj, nf * d.nobj as usize * n)?;
         check_len("shift_power", &self.power, nf * n)?;
@@ -268,7 +271,7 @@ impl FusedBufs {
         })
     }
 
-    /// [`Self::new`] with the scratch of a [`Model::shift`]: `(3 nprobe + nobj) nf_max`
+    /// [`Self::new`] with the scratch of a [`Model::shift`]: `(2 nprobe + nobj) nf_max`
     /// complex frames more, and `nf_max` real ones.
     pub fn with_shift(stream: &CudaStream, dims: &ViewDims, nf_max: u32) -> Result<Self, Error> {
         let mut bufs = Self::new(stream, dims, nf_max)?;
@@ -278,7 +281,6 @@ impl FusedBufs {
         let ngroup = nf * (dims.frame[0] / sh.rows) as usize;
         bufs.shift = Some(ShiftScratch {
             t: DeviceBuffer::zeroed(stream, nf * dims.nprobe as usize * n)?,
-            t_dy: DeviceBuffer::zeroed(stream, nf * dims.nprobe as usize * n)?,
             adj: DeviceBuffer::zeroed(stream, nf * dims.nprobe as usize * n)?,
             obj: DeviceBuffer::zeroed(stream, nf * dims.nobj as usize * n)?,
             power: DeviceBuffer::zeroed(stream, nf * n)?,
@@ -631,7 +633,7 @@ impl Kernels {
         match &shift {
             Some(sh) => {
                 let slopes = FUSED_SHIFT_DEN | FUSED_SHIFT_POSITION;
-                let t_dy = (shift_flags & slopes != 0).then_some(&sh.scratch.t_dy);
+                let t_dy = (shift_flags & slopes != 0).then_some(&sh.scratch.adj);
                 run.shift_pre(&sh.model, &sh.scratch.t, t_dy, p)?;
                 run.shift_rows_fwd(&sh.scratch.t, &bufs.work, psi, p, cfg)?;
             }
@@ -1083,7 +1085,6 @@ impl<'a> Run<'a> {
                 dptr::<C32, f32>(m.spectrum.a).cast_const()
             }),
             shift: null,
-            shift_dy: null,
             shift_adj: null,
             shift_obj: null,
             shift_power: null,
@@ -1108,7 +1109,6 @@ impl<'a> Run<'a> {
             background_ratio: (far.background.as_deref())
                 .map_or(std::ptr::null_mut(), |b| dptr(&b.ratio)),
             shift: scratch(|b| dptr(&b.t)),
-            shift_dy: scratch(|b| dptr(&b.t_dy)),
             shift_adj: scratch(|b| dptr(&b.adj)),
             shift_obj: scratch(|b| dptr(&b.obj)),
             shift_power: scratch(|b| dptr(&b.power)),
@@ -1391,7 +1391,7 @@ impl<'a> Run<'a> {
     }
 
     /// `T` of the stack's frames into `t`, at `p.shift`, and with `t_dy` `T_y` into it, at
-    /// `p.shift_dy`.
+    /// `p.shift_adj`.
     fn shift_pre(
         &self,
         model: &Shift<'_>,
@@ -1497,7 +1497,7 @@ impl<'a> Run<'a> {
         cfg: FusedCfg,
     ) -> Result<(), Error> {
         let config = LaunchConfig {
-            shared_mem_bytes: self.sh.row_smem.max(16 * FUSED_ROW_THREADS),
+            shared_mem_bytes: self.sh.shift_row_smem(cfg.flags),
             ..self.sh.rows(&self.g, false)?
         };
         let f = cfg.flags;
@@ -1510,8 +1510,9 @@ impl<'a> Run<'a> {
             _ => writes.push(bufs.work.storage()),
         }
         let s = sh.scratch;
-        if f & (FUSED_SHIFT_DEN | FUSED_SHIFT_POSITION) != 0 {
-            reads.push(s.t_dy.storage());
+        // Under `FUSED_SHIFT_PROBE` `shift_terms` already lists `T_y`'s plane as written.
+        if f & FUSED_SHIFT_PROBE == 0 && f & (FUSED_SHIFT_DEN | FUSED_SHIFT_POSITION) != 0 {
+            reads.push(s.adj.storage());
         }
         if f & FUSED_SHIFT_DEN != 0 {
             writes.push(s.den_groups.storage());
