@@ -118,7 +118,7 @@ pub mod grad_kernels {
         while i < n as usize {
             let v = unsafe { load_c(x, i) };
             let s = v.0 * v.0 + v.1 * v.1;
-            acc[0] += s.sqrt();
+            acc[0] += zsqrt(s);
             acc[1] += s;
             i += stride;
         }
@@ -297,7 +297,7 @@ pub mod grad_kernels {
                 0.0
             } else {
                 let calc = mode_power(psi, plane0, nmode, n, at) * inv_n;
-                2.0 * (1.0 - obs as f32 / calc.max(1e-12)) * inv_n
+                2.0 * (1.0 - zdiv(obs as f32, calc.max(1e-12))) * inv_n
             };
             for m in 0..nmode as usize {
                 let j = (plane0 + m) * n + at;
@@ -416,10 +416,11 @@ pub mod grad_kernels {
                 };
                 let calc = (k * (calc * inv_n) + b).max(1e-32);
                 let (r, s, obs) = (k * (r * inv_n), k * (s * inv_n), obs as f32);
-                let f = 1.0 - obs / calc;
+                let f = 1.0 - zdiv(obs, calc);
                 let rc = 2.0 * r / calc;
                 acc[0] -= 2.0 * r * f;
-                acc[1] += 2.0 * s * f + obs * rc * rc;
+                // The nesting contraction chose before `zdiv`, which it flips otherwise.
+                acc[1] = fma(f, 2.0 * s, fma(obs * rc, rc, acc[1]));
             }
             d += PIXEL_THREADS as usize;
         }

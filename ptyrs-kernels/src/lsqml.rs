@@ -18,7 +18,7 @@ use crate::fused::{FUSED_COLS, col_fft, walk_slot};
 use crate::grad::{GAMMA_CHUNK, ObjProbePtrs};
 use crate::pixel::{
     MASKED, PIXEL_THREADS, StackCtl, StackGeom, ViewAddr, cmul, cmul_conj, load_c, psi_index,
-    quad_phase, sample_obj, stack_frames, store_c,
+    quad_phase, sample_obj, stack_frames, store_c, zdiv, zsqrt,
 };
 use crate::{FFT_EPT_MAX, fft_ept};
 
@@ -188,9 +188,9 @@ pub unsafe fn cols<const NY: u32>(p: LsqmlCols, ctl: *const StackCtl, g: StackGe
                 let res = if obs == MASKED {
                     0.0
                 } else if poisson {
-                    1.0 - obs as f32 / (icalc + EPS_POISSON)
+                    1.0 - zdiv(obs as f32, icalc + EPS_POISSON)
                 } else {
-                    2.0 * (1.0 - (obs as f32).sqrt() / (icalc.sqrt() + EPS_AMPLITUDE))
+                    2.0 * (1.0 - zdiv(zsqrt(obs as f32), icalc.sqrt() + EPS_AMPLITUDE))
                 };
                 let scale = -a * res * inv_n;
                 r[2 * i as usize] *= scale;
@@ -512,8 +512,8 @@ pub mod lsqml_kernels {
                 let count = *obs.counts.add(frame * n + d);
                 if count != MASKED {
                     let (yt, yp) = (count as f32, *icalc.add(fl * n + d));
-                    let xi = 1.0 - yt / (yp + EPS_XI);
-                    acc[0] += xi * (yp - yt / (1.0 - a * xi));
+                    let xi = 1.0 - zdiv(yt, yp + EPS_XI);
+                    acc[0] += xi * (yp - zdiv(yt, 1.0 - a * xi));
                     acc[1] += xi * xi * yp;
                 }
                 d += PIXEL_THREADS as usize;
