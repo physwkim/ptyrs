@@ -300,6 +300,8 @@ M6 측정(GPU2, 스택 16): 물체 갱신은 Tile 24–26 µs, SIMT 10–11 µs�
 | M5 라이브 | PVA/ZMQ 입력, VMM 성장형 물체, PV 출력 | 시뮬레이터 3 kHz 스트림(256², 모드 2개)을 프레임 손실 없이 따라잡으며 재구성, 측정 중 graph 재캡처 0회. 스캔 종료부터 수렴 결과(같은 알고리즘 오프라인 결과와 FRC 일치)까지 시간 — 대표 수치(§0 접는 조건 4) |
 | M6 확장 | 다층(multislice), 근접장, PyO3(검증용), Tile 전환(§4 커널 배치의 Tile 후보), 신경망 연동(ptyrs-nn: 라이브 초기값 예측, DIP) | 기능별 기존 패키지 대비 비교. Tile 전환 커널은 SIMT 판과 허용오차 내 일치, 반복당 시간 같거나 짧음, 에폭이 graph 1개로 캡처됨. 예측 초기값 출발 시 평평한 초기값 대비 목표 LLK 도달 반복 수 비교. DIP 기울기 전달은 유한차분과 일치 |
 
+M6 다층·근접장 비교(CPU f64 엔진 대 pty-chi LSQML Poisson f64, 같은 시작값과 배치 순서: 24² 프로브 모드 2, 40² 물체, 프레임 16장, 배치 8, 30 에폭): 근접장은 angular spectrum(λ 0.1 nm, 화소 50 nm, 0.5 mm)과 Fresnel 변환(2 mm) 두 경우에서 에폭별 LLK의 상대오차가 최대 1.2e-15, 최종 물체·프로브가 최대 1.9e-14이고 참값 LLK에 닿는 에폭(29, 23)도 같습니다(`refs/f64/lsqml_near.py`, `ptyrs/tests/engine_lsqml_near.rs`; BH는 `engine_bh_near.rs`에서 2 에폭 스텝마다 1e-13 이내). 다층(3층, 간격 40·60 µm, pty-chi `multislice_solve_obj_prb_step_size_jointly=True`)은 출구 전파가 angular spectrum·Fresnel·원거리인 세 경우에서 에폭별 LLK 최대 5.3e-15, 최종 물체·프로브 최대 5.0e-14이고 참값 도달 에폭(23, 16, 15)이 같습니다(`refs/f64/lsqml_multislice.py`, `ptyrs/tests/engine_lsqml_multislice.rs`). 최종 배열이 이만큼 같아 FRC는 따로 재지 않았습니다.
+
 ---
 
 ## 8. 열린 결정과 미검증 사항
