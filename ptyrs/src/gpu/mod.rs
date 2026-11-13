@@ -107,6 +107,8 @@ pub enum Error {
     Shape(String),
     /// Non-zero `cufftResult` from a `crate::fft::Plan2d` call.
     Cufft(i32),
+    /// [`crate::fft::sys::LIBRARY`] could not be opened or lacks a function.
+    CufftLoad(&'static str),
 }
 
 impl std::fmt::Display for Error {
@@ -123,6 +125,7 @@ impl std::fmt::Display for Error {
             Self::ContextMismatch => write!(f, "buffers, stream and kernels span contexts"),
             Self::Shape(what) => write!(f, "bad shape: {what}"),
             Self::Cufft(r) => write!(f, "cuFFT error {r}"),
+            Self::CufftLoad(e) => write!(f, "cannot load libcufft: {e}"),
         }
     }
 }
@@ -152,6 +155,7 @@ impl From<FftError> for Error {
             }
             FftError::ContextMismatch => Self::ContextMismatch,
             FftError::BadShape => Self::Shape("FFT side or batch is zero or exceeds i32".into()),
+            FftError::Load(e) => Self::CufftLoad(e),
         }
     }
 }

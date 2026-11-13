@@ -31,6 +31,7 @@ bytes = "1"
 crossbeam-channel = "0.5"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
 libc = "0.2"
+libloading = "0.8"
 zmq = "0.10"
 burn = { version = "0.22.1", default-features = false, features = ["std", "cuda", "autodiff", "optim"], optional = true }
 # Named for the CubeCL tensor primitive the cuda-rust boundary reads. Fusion stays off: with it
