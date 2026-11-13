@@ -76,12 +76,34 @@ impl Window {
 
     /// `v` with offsets into the window.
     pub(crate) fn view(&self, v: &View) -> ViewAddr {
-        let shift = |o: u32, a: usize| o - self.at[a] as u32;
+        self.shift(view_addr(v))
+    }
+
+    /// `v` with offsets into the window.
+    pub(crate) fn shift(&self, v: ViewAddr) -> ViewAddr {
         ViewAddr {
-            oy: shift(v.oy, 0),
-            ox: shift(v.ox, 1),
-            ..view_addr(v)
+            oy: v.oy - self.at[0] as u32,
+            ox: v.ox - self.at[1] as u32,
+            ..v
         }
+    }
+
+    /// This window grown at its far edges by whole tiles of `grid`, inside the object, to at
+    /// least `len + 1` pixels per axis: the object a live scan of `len`-pixel frames sizes
+    /// ([`ScanShape::dims`](crate::live::scan::ScanShape::dims)). `None` when the object ends
+    /// first.
+    pub(crate) fn hold(self, grid: &TileGrid, len: [usize; 2]) -> Option<Self> {
+        let (obj, tile) = (grid.obj(), grid.tile());
+        let mut shape = self.shape;
+        for a in 0..2 {
+            let need = self.at[a] + len[a] + 1;
+            if need > obj[a] {
+                return None;
+            }
+            let end = (self.at[a] + shape[a]).max(need.next_multiple_of(tile).min(obj[a]));
+            shape[a] = end - self.at[a];
+        }
+        Some(Self { shape, ..self })
     }
 }
 
