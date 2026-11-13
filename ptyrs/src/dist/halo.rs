@@ -126,88 +126,154 @@ pub(crate) fn peers(r: usize, n: usize) -> impl Iterator<Item = usize> {
     (1..n).map(move |i| (r + i) % n)
 }
 
-/// `len` object pixels of mode `m` from `(y, x)` on.
-#[derive(Clone)]
-struct HaloRow {
-    m: usize,
-    y: usize,
-    x: usize,
-    len: usize,
+/// `len` object pixels of mode `m` from `(y, x)` on, at word `word` of a halo buffer: a row an
+/// owner packs into its send buffer, or a receiver unpacks from its receive buffer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HaloRow {
+    pub m: u32,
+    pub y: u32,
+    pub x: u32,
+    pub len: u32,
+    pub word: u64,
 }
 
-/// The object rows region `recv` reads from region `owner`'s tiles. `owner` packs them from
-/// word `send_at` of its send buffer on; `recv` pulls them to word `recv_at` of its receive
-/// buffer and unpacks them into its window.
+impl HaloRow {
+    /// The copy of this row from the window `win` at `obj` into the send buffer at `send`.
+    pub(crate) fn pack(&self, win: Window, obj: u64, send: u64) -> Run {
+        Run {
+            dst: send + self.word * 8,
+            src: obj + self.offset(win),
+            len: self.len as u64,
+        }
+    }
+
+    /// The copy of this row from the receive buffer at `recv` into the window `win` at `obj`.
+    pub(crate) fn unpack(&self, win: Window, obj: u64, recv: u64) -> Run {
+        Run {
+            dst: obj + self.offset(win),
+            src: recv + self.word * 8,
+            len: self.len as u64,
+        }
+    }
+
+    fn offset(&self, win: Window) -> u64 {
+        let [m, y, x] = [self.m, self.y, self.x].map(|i| i as usize);
+        (win.index(m, y, x) * size_of::<C32>()) as u64
+    }
+}
+
+/// The halo rows a region copies at each exchange, as owner and as receiver.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HaloRows {
+    pub pack: Vec<HaloRow>,
+    pub unpack: Vec<HaloRow>,
+}
+
+/// Consecutive tiles of tile row `ty` from `tx0` on, one owner's, that a receiver may read; per
+/// object mode, their pixel rows sit from word `at` of the mode's part of the segment, `width`
+/// words each.
+struct TileRun {
+    ty: usize,
+    tx0: usize,
+    width: u64,
+    at: u64,
+}
+
+/// The tiles region `recv` may read from region `owner`, laid out for good: `owner` packs them
+/// from word `send_at` of its send buffer on; `recv` pulls them to word `recv_at` of its
+/// receive buffer and unpacks them into its window.
 struct HaloSeg {
     recv: usize,
     owner: usize,
-    rows: Vec<HaloRow>,
+    runs: Vec<TileRun>,
+    /// Words per object mode.
+    mode_words: u64,
     words: u64,
     send_at: u64,
     recv_at: u64,
 }
 
-/// The halo rows every region of a partition reads from the others, fixed at setup.
+/// A tile a receiver may read: in run `run` of segment `seg`, and whether it reads it yet.
+#[derive(Clone, Copy)]
+struct MayRead {
+    tile: u32,
+    seg: u32,
+    run: u32,
+    read: bool,
+}
+
+/// The halo of a partition: the buffers of every tile each region may read from the others,
+/// laid out before the first exchange, and the rows of those it reads so far
+/// (DESIGN B6: the halo grows as frames read new tiles, its buffers never move).
 pub(crate) struct Halo {
+    grid: TileGrid,
+    owner: Vec<u32>,
+    nobj: usize,
     /// By receiver, then owner.
     segs: Vec<HaloSeg>,
+    /// Per receiver, ascending.
+    may: Vec<Vec<MayRead>>,
 }
 
 impl Halo {
-    /// The halo of `run` whose region `r` reads the halo tiles `reads[r]` (ascending): each
-    /// pixel row of consecutive read tiles with one owner, every object mode; receive buffers
-    /// hold the owners in order, send buffers the receivers.
+    /// The halo of `run` whose region `r` may read the foreign tiles `may[r]` (ascending): per
+    /// object mode, each pixel row of consecutive tiles with one owner; receive buffers hold
+    /// the owners in order, send buffers the receivers. No region reads any yet.
     pub(crate) fn new<'a>(
         run: &Partition,
-        reads: impl IntoIterator<Item = &'a [u32]>,
+        may: impl IntoIterator<Item = &'a [u32]>,
         nobj: usize,
     ) -> Self {
-        let grid = run.grid();
+        let grid = *run.grid();
         let [nyo, nxo] = grid.obj();
         let tile = grid.tile();
-        let owner = run.owner();
+        let owner = run.owner().to_vec();
         let n = run.regions().len();
         let mut send_at = vec![0; n];
-        let mut segs = Vec::new();
-        for (r, read) in reads.into_iter().enumerate() {
-            let mut rows = vec![Vec::new(); n];
-            for m in 0..nobj {
-                let mut i = 0;
-                while i < read.len() {
-                    let t0 = read[i] as usize;
-                    let [ty, tx0] = grid.coords(t0);
-                    let o = owner[t0] as usize;
-                    let mut tx1 = tx0;
-                    while let Some(&t) = read.get(i + 1) {
-                        let t = t as usize;
-                        if grid.coords(t) != [ty, tx1 + 1] || owner[t] as usize != o {
-                            break;
-                        }
-                        tx1 += 1;
-                        i += 1;
+        let (mut segs, mut mays) = (Vec::new(), Vec::new());
+        for (r, tiles) in may.into_iter().enumerate() {
+            let mut runs: Vec<Vec<TileRun>> = (0..n).map(|_| Vec::new()).collect();
+            let mut at = vec![0; n];
+            let mut members = Vec::with_capacity(tiles.len());
+            let mut i = 0;
+            while i < tiles.len() {
+                let t0 = tiles[i] as usize;
+                let [ty, tx0] = grid.coords(t0);
+                let o = owner[t0] as usize;
+                let mut tx1 = tx0;
+                while let Some(&t) = tiles.get(i + 1) {
+                    let t = t as usize;
+                    if grid.coords(t) != [ty, tx1 + 1] || owner[t] as usize != o {
+                        break;
                     }
+                    tx1 += 1;
                     i += 1;
-                    let (x, x1) = (tx0 * tile, ((tx1 + 1) * tile).min(nxo));
-                    for y in ty * tile..((ty + 1) * tile).min(nyo) {
-                        rows[o].push(HaloRow {
-                            m,
-                            y,
-                            x,
-                            len: x1 - x,
-                        });
-                    }
                 }
+                i += 1;
+                let width = (((tx1 + 1) * tile).min(nxo) - tx0 * tile) as u64;
+                let height = (((ty + 1) * tile).min(nyo) - ty * tile) as u64;
+                members.extend((tx0..=tx1).map(|tx| (grid.id(ty, tx) as u32, o, runs[o].len())));
+                runs[o].push(TileRun {
+                    ty,
+                    tx0,
+                    width,
+                    at: at[o],
+                });
+                at[o] += height * width;
             }
+            let mut seg_of = vec![u32::MAX; n];
             let mut recv_at = 0;
-            for (o, rows) in rows.into_iter().enumerate() {
-                let words: u64 = rows.iter().map(|w| w.len as u64).sum();
-                if words == 0 {
+            for (o, runs) in runs.into_iter().enumerate() {
+                if runs.is_empty() {
                     continue;
                 }
+                let words = nobj as u64 * at[o];
+                seg_of[o] = segs.len() as u32;
                 segs.push(HaloSeg {
                     recv: r,
                     owner: o,
-                    rows,
+                    runs,
+                    mode_words: at[o],
                     words,
                     send_at: send_at[o],
                     recv_at,
@@ -215,8 +281,25 @@ impl Halo {
                 send_at[o] += words;
                 recv_at += words;
             }
+            mays.push(
+                members
+                    .into_iter()
+                    .map(|(tile, o, run)| MayRead {
+                        tile,
+                        seg: seg_of[o],
+                        run: run as u32,
+                        read: false,
+                    })
+                    .collect(),
+            );
         }
-        Self { segs }
+        Self {
+            grid,
+            owner,
+            nobj,
+            segs,
+            may: mays,
+        }
     }
 
     /// Words of region `r`'s halo send and receive buffers.
@@ -227,54 +310,75 @@ impl Halo {
         [sum(&|s| s.owner == r), sum(&|s| s.recv == r)]
     }
 
-    /// `[byte offset in window win, buffer word, words]` of every row of the segments `pick`
-    /// selects, laid out in the buffer from word `at(segment)` on.
-    fn rows(
-        &self,
-        win: Window,
-        pick: impl Fn(&HaloSeg) -> bool,
-        at: fn(&HaloSeg) -> u64,
-    ) -> impl Iterator<Item = [u64; 3]> {
-        self.segs
-            .iter()
-            .filter(move |s| pick(s))
-            .flat_map(move |s| {
-                let mut w = at(s);
-                s.rows.iter().map(move |row| {
-                    let (off, len) = (win.index(row.m, row.y, row.x), row.len as u64);
-                    w += len;
-                    [(off * size_of::<C32>()) as u64, w - len, len]
-                })
-            })
-    }
-
-    /// Runs copying region `r`'s object rows that others read, from its window `win` at
-    /// `obj`, into its send buffer.
-    pub(crate) fn pack(&self, r: usize, win: Window, obj: u64, send: u64) -> Vec<Run> {
-        self.rows(win, |s| s.owner == r, |s| s.send_at)
-            .map(|[off, w, len]| Run {
-                dst: send + w * 8,
-                src: obj + off,
-                len,
-            })
-            .collect()
-    }
-
-    /// Runs copying region `r`'s receive buffer into the halo rows of its window `win` at
-    /// `obj`.
-    pub(crate) fn unpack(&self, r: usize, win: Window, obj: u64, recv: u64) -> Vec<Run> {
-        self.rows(win, |s| s.recv == r, |s| s.recv_at)
-            .map(|[off, w, len]| Run {
-                dst: obj + off,
-                src: recv + w * 8,
-                len,
-            })
-            .collect()
+    /// Region `r` reads the tiles `tiles` from now on: for each foreign one it did
+    /// not read yet, appends to `rows[o].pack` the rows its owner `o` packs and to
+    /// `rows[r].unpack` those `r` unpacks, per segment, object mode, run of consecutive new
+    /// tiles, pixel row. Its own tiles are skipped.
+    ///
+    /// # Panics
+    /// If a foreign tile is not one `r` may read: the layout fixed at [`Self::new`] has no
+    /// room for it.
+    pub(crate) fn read(
+        &mut self,
+        r: usize,
+        tiles: impl IntoIterator<Item = usize>,
+        rows: &mut [HaloRows],
+    ) {
+        let may = &mut self.may[r];
+        let mut new = Vec::new();
+        for t in tiles {
+            if self.owner[t] as usize == r {
+                continue;
+            }
+            let k = may
+                .binary_search_by_key(&(t as u32), |m| m.tile)
+                .unwrap_or_else(|_| panic!("region {r} may not read tile {t}"));
+            if !std::mem::replace(&mut may[k].read, true) {
+                new.push(may[k]);
+            }
+        }
+        // Tile order is each segment's run order, and each run's tile order.
+        new.sort_by_key(|m| (m.seg, m.tile));
+        let tile = self.grid.tile();
+        let [nyo, nxo] = self.grid.obj();
+        for group in new.chunk_by(|a, b| a.seg == b.seg) {
+            let seg = &self.segs[group[0].seg as usize];
+            let mut spans: Vec<(usize, usize, usize)> = Vec::new();
+            for m in group {
+                let tx = self.grid.coords(m.tile as usize)[1];
+                match spans.last_mut() {
+                    Some((run, _, end)) if *run == m.run as usize && *end + 1 == tx => *end = tx,
+                    _ => spans.push((m.run as usize, tx, tx)),
+                }
+            }
+            for mode in 0..self.nobj {
+                for &(k, txa, txb) in &spans {
+                    let run = &seg.runs[k];
+                    let (y0, x0) = (run.ty * tile, run.tx0 * tile);
+                    let (x, x1) = (txa * tile, ((txb + 1) * tile).min(nxo));
+                    for y in y0..(y0 + tile).min(nyo) {
+                        let word = mode as u64 * seg.mode_words
+                            + run.at
+                            + (y - y0) as u64 * run.width
+                            + (x - x0) as u64;
+                        let row = |at: u64| HaloRow {
+                            m: mode as u32,
+                            y: y as u32,
+                            x: x as u32,
+                            len: (x1 - x) as u32,
+                            word: at + word,
+                        };
+                        rows[seg.owner].pack.push(row(seg.send_at));
+                        rows[r].unpack.push(row(seg.recv_at));
+                    }
+                }
+            }
+        }
     }
 
     /// Copy-engine pulls into region `r`'s receive buffer at `recv` from the owners' send
     /// buffers, `send(o)` giving owner `o`'s context and send buffer, in [`peers`] order over
-    /// `n` regions.
+    /// `n` regions: every tile `r` may read, read yet or not, so the pulls never change.
     pub(crate) fn pulls(
         &self,
         r: usize,
@@ -311,11 +415,12 @@ pub(crate) struct HaloBufs {
 }
 
 impl HaloBufs {
-    /// Region `r`'s buffers and runs of `halo`, for its window `win` at `obj`.
+    /// Region `r`'s buffers of `halo` and its runs copying `rows`, for its window `win` at `obj`.
     pub(crate) fn new(
         stream: &Stream,
         halo: &Halo,
         r: usize,
+        rows: &HaloRows,
         win: Window,
         obj: u64,
     ) -> Result<Self, DistError> {
@@ -323,9 +428,20 @@ impl HaloBufs {
             .words(r)
             .map(|w| DeviceBuffer::<u64>::zeroed(stream, (w as usize).max(1)));
         let (send, recv) = (send?, recv?);
+        let (at_send, at_recv) = (send.cu_deviceptr(), recv.cu_deviceptr());
+        let pack: Vec<Run> = rows
+            .pack
+            .iter()
+            .map(|w| w.pack(win, obj, at_send))
+            .collect();
+        let unpack: Vec<Run> = rows
+            .unpack
+            .iter()
+            .map(|w| w.unpack(win, obj, at_recv))
+            .collect();
         Ok(Self {
-            pack: Runs::new(stream, &halo.pack(r, win, obj, send.cu_deviceptr()))?,
-            unpack: Runs::new(stream, &halo.unpack(r, win, obj, recv.cu_deviceptr()))?,
+            pack: Runs::new(stream, &pack)?,
+            unpack: Runs::new(stream, &unpack)?,
             send,
             recv,
         })
@@ -335,6 +451,93 @@ impl HaloBufs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::base::sim;
+    use crate::dist::partition::tests::addr;
+    use crate::dist::{DEFAULT_TILE, NLEAF, Scheme};
+
+    fn runs() -> Vec<Partition> {
+        [
+            (sim::raster(12, 20, 8e-8), 32, Scheme::Strips),
+            (sim::fermat(300, 8e-8), 30, Scheme::Sectors { centre: None }),
+        ]
+        .into_iter()
+        .flat_map(|(pos, frame, scheme)| {
+            let leaves = Partition::from_addr(&addr(pos, frame), DEFAULT_TILE, scheme, NLEAF);
+            let leaves = leaves.unwrap();
+            [2, 4].map(|n| leaves.merge(n).unwrap())
+        })
+        .collect()
+    }
+
+    fn may(run: &Partition) -> impl Iterator<Item = &[u32]> {
+        run.regions().iter().map(|g| g.halo.as_slice())
+    }
+
+    /// Tiles read in steps, in any order, own ones among them and some twice, put each pixel
+    /// at the buffer word reading them all at once does; with every tile read, each word of a
+    /// buffer is exactly one pixel's.
+    #[test]
+    fn reading_in_steps_lays_pixels_where_reading_at_once_does() {
+        let pixels = |rows: Vec<HaloRow>| {
+            let mut p: Vec<[u64; 4]> = rows
+                .into_iter()
+                .flat_map(|w| {
+                    let at = [w.m, w.y, w.x].map(u64::from);
+                    (0..w.len as u64).map(move |i| [w.word + i, at[0], at[1], at[2] + i])
+                })
+                .collect();
+            p.sort_unstable();
+            p
+        };
+        for run in runs() {
+            let n = run.nregion();
+            let mut once = Halo::new(&run, may(&run), 2);
+            let mut want = vec![HaloRows::default(); n];
+            for (r, g) in run.regions().iter().enumerate() {
+                once.read(r, g.halo.iter().map(|&t| t as usize), &mut want);
+            }
+            let mut steps = Halo::new(&run, may(&run), 2);
+            let mut got = vec![HaloRows::default(); n];
+            let count = |rows: &[HaloRows]| rows.iter().map(|w| w.pack.len()).sum::<usize>();
+            for (r, g) in run.regions().iter().enumerate().rev() {
+                let tiles = g.halo.iter().chain(&g.own).rev().map(|&t| t as usize);
+                let tiles: Vec<usize> = tiles.collect();
+                for step in tiles.chunks(3) {
+                    steps.read(r, step.iter().copied(), &mut got);
+                    let before = count(&got);
+                    steps.read(r, step.iter().copied(), &mut got);
+                    assert_eq!(count(&got), before, "a tile read again adds rows");
+                }
+            }
+            for (r, (got, want)) in got.into_iter().zip(want).enumerate() {
+                let [send, recv] = steps.words(r);
+                for (got, want, words) in
+                    [(got.pack, want.pack, send), (got.unpack, want.unpack, recv)]
+                {
+                    let (got, want) = (pixels(got), pixels(want));
+                    assert!(got == want, "region {r}");
+                    assert!(got.iter().map(|p| p[0]).eq(0..words), "region {r}");
+                }
+            }
+        }
+    }
+
+    /// A foreign tile outside a region's halo has no room in its buffers.
+    #[test]
+    #[should_panic(expected = "may not read tile")]
+    fn reading_outside_the_halo_panics() {
+        let run = &runs()[1];
+        let mut halo = Halo::new(run, may(run), 1);
+        let g = &run.regions()[0];
+        let far = (0..run.grid().len() as u32)
+            .find(|t| !g.own.contains(t) && !g.halo.contains(t))
+            .unwrap();
+        halo.read(
+            0,
+            [far as usize],
+            &mut vec![HaloRows::default(); run.nregion()],
+        );
+    }
 
     #[test]
     fn peers_read_a_different_source_at_each_step() {

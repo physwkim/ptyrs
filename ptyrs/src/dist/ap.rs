@@ -32,7 +32,7 @@ use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{Context, DeviceBuffer, Stream};
 
 use crate::dist::exchange::{self, Pull};
-use crate::dist::halo::{Halo, HaloBufs, Window, peers, view_addr};
+use crate::dist::halo::{Halo, HaloBufs, HaloRows, Window, peers, view_addr};
 use crate::dist::{DEFAULT_TILE, DistError, Exchange, Gpu, Partition, Scheme, Workers};
 
 /// Leaf regions every run is cut from; a run uses 1, 2 or 4 GPUs.
@@ -102,6 +102,8 @@ struct Plan {
     calc_llk: usize,
     regions: Vec<RegionPlan>,
     halo: Halo,
+    /// Per region, the halo rows it packs and unpacks.
+    halo_rows: Vec<HaloRows>,
 }
 
 impl Plan {
@@ -249,11 +251,15 @@ impl Plan {
                 own,
             });
         }
-        let halo = Halo::new(
+        let mut halo = Halo::new(
             &run,
             regions.iter().map(|rp| rp.halo_read.as_slice()),
             dims.nobj as usize,
         );
+        let mut halo_rows = vec![HaloRows::default(); regions.len()];
+        for (r, rp) in regions.iter().enumerate() {
+            halo.read(r, rp.halo_read.iter().map(|&t| t as usize), &mut halo_rows);
+        }
         Ok(Self {
             run,
             k,
@@ -263,6 +269,7 @@ impl Plan {
             calc_llk: cfg.calc_llk,
             regions,
             halo,
+            halo_rows,
         })
     }
 
@@ -463,6 +470,7 @@ impl State {
             stream,
             &plan.halo,
             gpu.region(),
+            &plan.halo_rows[gpu.region()],
             rp.window,
             obj.cu_deviceptr(),
         )?;

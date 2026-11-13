@@ -245,6 +245,7 @@ fn owners(owner: &[u32], tiles: &[usize], n: usize) -> Vec<usize> {
 mod tests {
     use super::*;
     use crate::base::{Positions, sim};
+    use crate::dist::halo::HaloRows;
     use crate::live::recon::ViewPlacement;
 
     const PIXEL: [f64; 2] = [1e-8, 1e-8];
@@ -431,7 +432,12 @@ mod tests {
     fn halo_rows_cover_the_read_tiles() {
         for (name, shape, views, scheme) in cases() {
             for ngpu in [2, 4] {
-                let plan = LivePlan::new(&shape, &views, scheme, ngpu).unwrap();
+                let mut plan = LivePlan::new(&shape, &views, scheme, ngpu).unwrap();
+                let mut rows = vec![HaloRows::default(); ngpu];
+                for r in 0..ngpu {
+                    let reads = plan.regions[r].reads.iter().map(|&t| t as usize);
+                    plan.halo.read(r, reads, &mut rows);
+                }
                 let grid = plan.partition().grid();
                 let [nyo, nxo] = grid.obj();
                 let tile = grid.tile();
@@ -441,7 +447,7 @@ mod tests {
                     let what = format!("{name} on {ngpu}: region {r}");
                     let win = g.window;
                     let mut got = Vec::new();
-                    for run in plan.halo.unpack(r, win, 0, 0) {
+                    for run in rows[r].unpack.iter().map(|w| w.unpack(win, 0, 0)) {
                         let at = run.dst as usize / size_of::<crate::gpu::C32>();
                         got.extend(at..at + run.len as usize);
                     }
