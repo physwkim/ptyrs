@@ -13,7 +13,7 @@ replace-with = "cuda-rust-local"
 git = "file:///path/to/cuda-rust"
 
 [source.epics-rs]
-git = "https://github.com/physwkim/epics-rs.git"
+git = "https://github.com/epics-rs/epics-rs.git"
 rev = "55d3d654c60dc614d83e61839ebccdaf5ece3dc4"
 replace-with = "epics-rs-local"
 

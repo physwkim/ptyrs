@@ -18,7 +18,7 @@ cuda-host = { git = "https://github.com/NVIDIA/cuda-rust.git", rev = "367bc0f8e6
 cuda-artifact-finalizer = { git = "https://github.com/NVIDIA/cuda-rust.git", rev = "367bc0f8e671070e00eebc7e5498f3e8eebefc72" }
 nvjitlink-sys = { git = "https://github.com/NVIDIA/cuda-rust.git", rev = "367bc0f8e671070e00eebc7e5498f3e8eebefc72" }
 cutile = { git = "https://github.com/NVIDIA/cuda-rust.git", rev = "367bc0f8e671070e00eebc7e5498f3e8eebefc72" }
-epics-pva-rs = { git = "https://github.com/physwkim/epics-rs.git", rev = "55d3d654c60dc614d83e61839ebccdaf5ece3dc4" }
+epics-pva-rs = { git = "https://github.com/epics-rs/epics-rs.git", rev = "55d3d654c60dc614d83e61839ebccdaf5ece3dc4" }
 
 # Host-side numerics and I/O of ptyrs.
 num-complex = "0.4"

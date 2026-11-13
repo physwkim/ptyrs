@@ -3040,7 +3040,7 @@ dependencies = [
 [[package]]
 name = "epics-base-rs"
 version = "0.34.1"
-source = "git+https://github.com/physwkim/epics-rs.git?rev=55d3d654c60dc614d83e61839ebccdaf5ece3dc4#55d3d654c60dc614d83e61839ebccdaf5ece3dc4"
+source = "git+https://github.com/epics-rs/epics-rs.git?rev=55d3d654c60dc614d83e61839ebccdaf5ece3dc4#55d3d654c60dc614d83e61839ebccdaf5ece3dc4"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3066,7 +3066,7 @@ dependencies = [
 [[package]]
 name = "epics-libcom-rs"
 version = "0.34.1"
-source = "git+https://github.com/physwkim/epics-rs.git?rev=55d3d654c60dc614d83e61839ebccdaf5ece3dc4#55d3d654c60dc614d83e61839ebccdaf5ece3dc4"
+source = "git+https://github.com/epics-rs/epics-rs.git?rev=55d3d654c60dc614d83e61839ebccdaf5ece3dc4#55d3d654c60dc614d83e61839ebccdaf5ece3dc4"
 dependencies = [
  "chrono",
  "hostname",
@@ -3082,7 +3082,7 @@ dependencies = [
 [[package]]
 name = "epics-macros-rs"
 version = "0.34.1"
-source = "git+https://github.com/physwkim/epics-rs.git?rev=55d3d654c60dc614d83e61839ebccdaf5ece3dc4#55d3d654c60dc614d83e61839ebccdaf5ece3dc4"
+source = "git+https://github.com/epics-rs/epics-rs.git?rev=55d3d654c60dc614d83e61839ebccdaf5ece3dc4#55d3d654c60dc614d83e61839ebccdaf5ece3dc4"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -3093,7 +3093,7 @@ dependencies = [
 [[package]]
 name = "epics-pva-rs"
 version = "0.34.1"
-source = "git+https://github.com/physwkim/epics-rs.git?rev=55d3d654c60dc614d83e61839ebccdaf5ece3dc4#55d3d654c60dc614d83e61839ebccdaf5ece3dc4"
+source = "git+https://github.com/epics-rs/epics-rs.git?rev=55d3d654c60dc614d83e61839ebccdaf5ece3dc4#55d3d654c60dc614d83e61839ebccdaf5ece3dc4"
 dependencies = [
  "arc-swap",
  "bytes",
@@ -3132,7 +3132,7 @@ dependencies = [
 [[package]]
 name = "epics-rtems-boot"
 version = "0.34.1"
-source = "git+https://github.com/physwkim/epics-rs.git?rev=55d3d654c60dc614d83e61839ebccdaf5ece3dc4#55d3d654c60dc614d83e61839ebccdaf5ece3dc4"
+source = "git+https://github.com/epics-rs/epics-rs.git?rev=55d3d654c60dc614d83e61839ebccdaf5ece3dc4#55d3d654c60dc614d83e61839ebccdaf5ece3dc4"
 dependencies = [
  "cc",
  "libc",
