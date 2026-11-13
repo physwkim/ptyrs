@@ -3,33 +3,33 @@
 //! that owns a tile the frame touches. A GPU's own tiles then bin the frames one GPU bins
 //! there, in the same order, so their object sums add in the same order (invariant 8); the
 //! other regions' tiles its frames read come from their owners after each update
-//! (invariant 5).
+//! (invariant 5). A GPU's window holds every tile a frame touching its own tiles can read,
+//! planned or not, and its halo grows as frames read new tiles, so a frame off the plan
+//! lands wherever one GPU would take it.
 
 use crate::gpu::{ViewAddr, ViewDims, view_tiles};
 use crate::live::scan::ScanShape;
 
-use crate::dist::halo::{Halo, Window};
+use crate::dist::halo::{Halo, HaloRows, Window};
 use crate::dist::{DEFAULT_TILE, DistError, NLEAF, Partition, Scheme, TileGrid};
 
 /// One GPU's part of a live scan.
 pub struct LiveRegion {
-    /// The part of the object it holds.
+    /// The part of the object it holds: its own tiles and their partition halo, every tile a
+    /// frame inside the object that touches one of its own can read.
     pub(crate) window: Window,
-    /// Its scan: the planned frames routed to it, over its window.
+    /// Its scan over its window, of the one-GPU scan's frame count, so whatever share of the
+    /// frames it gets it closes past the one-GPU scan's end only.
     pub shape: ScanShape,
     /// Its own tiles, numbered in its window, ascending: the only ones it bins and updates.
     pub own: Vec<u32>,
-    /// The other regions' tiles its planned frames read, ascending.
-    pub(crate) reads: Vec<u32>,
-    /// Per object tile, whether it is one of its own tiles or `reads`.
-    held: Vec<bool>,
     /// The planned frames routed to it, ascending.
     pub frames: Vec<u32>,
     /// Their views, offsets into its window: what its scan's backer plans.
     pub planned: Vec<ViewAddr>,
 }
 
-/// A live scan's split over GPUs, fixed by its planned frames before the first one lands.
+/// A live scan's split over GPUs, cut from its planned frames before the first one lands.
 pub struct LivePlan {
     run: Partition,
     /// The one-GPU scan's.
@@ -45,6 +45,16 @@ pub struct Share {
     pub views: Vec<ViewAddr>,
     /// Their index in the batch, ascending.
     pub frames: Vec<u32>,
+    /// The halo rows they add: those the region packs of its tiles the batch's frames read on
+    /// other regions for the first time, and those it unpacks of others' tiles its own read
+    /// for the first time.
+    pub halo: HaloRows,
+}
+
+impl AsMut<HaloRows> for Share {
+    fn as_mut(&mut self) -> &mut HaloRows {
+        &mut self.halo
+    }
 }
 
 impl LivePlan {
@@ -88,35 +98,21 @@ impl LivePlan {
             .map(|f| [f[0].oy as usize, f[0].ox as usize])
             .collect();
         let run = Partition::new(grid, frame, corners, scheme, NLEAF)?.merge(ngpu)?;
-        let owner = run.owner();
         let mut frames = vec![Vec::new(); ngpu];
-        let mut held = vec![vec![false; grid.len()]; ngpu];
-        for (r, g) in run.regions().iter().enumerate() {
-            g.own.iter().for_each(|&t| held[r][t as usize] = true);
-        }
-        let mut read = vec![vec![false; grid.len()]; ngpu];
         let mut tiles = Vec::new();
         for (f, views) in planned.chunks(nmode).enumerate() {
             touched(&dims, &grid, views, &mut tiles);
-            for r in owners(owner, &tiles, ngpu) {
+            for r in owners(run.owner(), &tiles, ngpu) {
                 frames[r].push(f as u32);
-                for &t in &tiles {
-                    read[r][t] |= owner[t] as usize != r;
-                }
             }
         }
         let mut regions = Vec::with_capacity(ngpu);
         for (r, g) in run.regions().iter().enumerate() {
-            let reads: Vec<u32> = (0..grid.len())
-                .filter(|&t| read[r][t])
-                .map(|t| t as u32)
-                .collect();
-            reads.iter().for_each(|&t| held[r][t as usize] = true);
             let frames = std::mem::take(&mut frames[r]);
             if frames.is_empty() {
                 return bad(format!("region {r} of {ngpu} has no frames"));
             }
-            let window = Window::new(&grid, g.own.iter().chain(&reads).map(|&t| t as usize));
+            let window = Window::new(&grid, g.own.iter().chain(&g.halo).map(|&t| t as usize));
             let Some(window) = window.hold(&grid, frame) else {
                 return bad(format!(
                     "region {r}'s window {window:?} ends past the object"
@@ -129,7 +125,6 @@ impl LivePlan {
                 .collect();
             regions.push(LiveRegion {
                 shape: ScanShape {
-                    nframe: frames.len() as u32,
                     reach: [0, 1].map(|a| (window.shape[a] - frame[a] - 1) as u32),
                     ..*shape
                 },
@@ -139,15 +134,13 @@ impl LivePlan {
                     .map(|&t| window.tile(&grid, t as usize))
                     .collect(),
                 window,
-                reads,
-                held: std::mem::take(&mut held[r]),
                 frames,
                 planned,
             });
         }
         let halo = Halo::new(
             &run,
-            regions.iter().map(|g| g.reads.as_slice()),
+            run.regions().iter().map(|g| g.halo.as_slice()),
             dims.nobj as usize,
         );
         Ok(Self {
@@ -170,17 +163,18 @@ impl LivePlan {
         &self.run
     }
 
-    /// Pixels region `r` sends to and receives from the others after each update.
+    /// Words of region `r`'s halo send and receive buffers: every tile of its partition halo,
+    /// so the buffers and pulls never change as frames read new tiles.
     pub fn halo_words(&self, r: usize) -> [u64; 2] {
         self.halo.words(r)
     }
 
     /// Splits the arriving frames whose views are `views`, `nmode` per frame, in arrival
     /// order, into `shares`, one per region: each frame goes to the owner of every tile it
-    /// touches. Every view must be inside the one-GPU scan's object, and every tile a frame
-    /// touches one its regions hold; at the first frame that is not, `shares` hold the frames
-    /// before it.
-    pub fn split(&self, views: &[ViewAddr], shares: &mut [Share]) -> Result<(), DistError> {
+    /// touches, and the halo rows of the tiles it reads on a region for the first time to
+    /// that region and the tiles' owners. Every view must be inside the one-GPU scan's object;
+    /// at the first frame that is not, `shares` hold the frames before it.
+    pub fn split(&mut self, views: &[ViewAddr], shares: &mut [Share]) -> Result<(), DistError> {
         let bad = |m: String| Err(DistError::Partition(m));
         let nmode = self.dims.nmode as usize;
         if shares.len() != self.regions.len() || !views.len().is_multiple_of(nmode) {
@@ -194,6 +188,8 @@ impl LivePlan {
         shares.iter_mut().for_each(|s| {
             s.views.clear();
             s.frames.clear();
+            s.halo.pack.clear();
+            s.halo.unpack.clear();
         });
         let grid = self.run.grid();
         let mut tiles = Vec::new();
@@ -202,15 +198,10 @@ impl LivePlan {
                 return bad(format!("frame {i} of the batch: {e}"));
             }
             touched(&self.dims, grid, frame, &mut tiles);
-            let to = owners(self.run.owner(), &tiles, self.regions.len());
-            for &r in &to {
-                if let Some(t) = tiles.iter().find(|&&t| !self.regions[r].held[t]) {
-                    return bad(format!(
-                        "frame {i} of the batch reads tile {t}, which region {r} does not hold"
-                    ));
-                }
-            }
-            for r in to {
+            for r in owners(self.run.owner(), &tiles, self.regions.len()) {
+                // Inside the object, the tiles a frame touches lie within its frame width of
+                // each other, so within region `r`'s partition halo of the one it owns.
+                self.halo.read(r, tiles.iter().copied(), shares);
                 let win = self.regions[r].window;
                 shares[r].views.extend(frame.iter().map(|&v| win.shift(v)));
                 shares[r].frames.push(i as u32);
@@ -302,6 +293,135 @@ mod tests {
         t
     }
 
+    /// Every planned frame moved by `d` pixels, those still inside the object of `dims`.
+    fn jittered(dims: &ViewDims, views: &[ViewAddr], d: [i64; 2]) -> Vec<ViewAddr> {
+        let nmode = dims.nmode as usize;
+        let mv = |o: u32, d: i64| u32::try_from(o as i64 + d).unwrap_or(u32::MAX);
+        views
+            .chunks(nmode)
+            .map(|f| {
+                f.iter()
+                    .map(|&v| ViewAddr {
+                        oy: mv(v.oy, d[0]),
+                        ox: mv(v.ox, d[1]),
+                        ..v
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .filter(|f| f.iter().all(|v| dims.check_view(v).is_ok()))
+            .flatten()
+            .collect()
+    }
+
+    /// Two columns of frames at x = 0 and 8 px, then the same at x = 200 px, cut in two strips
+    /// whose planned frames read no tile of the other, and a frame between them that reads
+    /// tiles of both.
+    fn far() -> (ScanShape, Vec<ViewAddr>, Vec<ViewAddr>) {
+        let (shape, views) = scan(sim::raster(4, 2, 8e-8), 32);
+        let nmode = shape.nmode as usize;
+        let moved = |d: u32| -> Vec<ViewAddr> {
+            views
+                .iter()
+                .map(|&v| ViewAddr { ox: v.ox + d, ..v })
+                .collect()
+        };
+        let both = [views.clone(), moved(200)].concat();
+        let shape = ScanShape {
+            nframe: shape.nframe * 2,
+            reach: [shape.reach[0], shape.reach[1] + 200],
+            ..shape
+        };
+        (shape, both, moved(100)[..nmode].to_vec())
+    }
+
+    /// The pixel values each region's window holds after one exchange of the halo rows
+    /// `rows`, from windows holding only their own tiles' pixels: every tile `read[r]` marks,
+    /// and no other foreign one, must hold its owner's pixels.
+    fn check_exchange(plan: &LivePlan, rows: &[HaloRows], read: &[Vec<bool>], what: &str) {
+        let (grid, owner) = (plan.partition().grid(), plan.partition().owner());
+        let [nyo, nxo] = grid.obj();
+        let n = plan.nregion();
+        let nobj = plan.dims.nobj as usize;
+        let value = |m: usize, y: usize, x: usize| ((m * nyo + y) * nxo + x + 1) as u64;
+        let pixels = |w: Window| {
+            (0..nobj).flat_map(move |m| {
+                (w.at[0]..w.at[0] + w.shape[0])
+                    .flat_map(move |y| (w.at[1]..w.at[1] + w.shape[1]).map(move |x| [m, y, x]))
+            })
+        };
+        let mut wins: Vec<Vec<u64>> = plan
+            .regions()
+            .iter()
+            .enumerate()
+            .map(|(r, g)| {
+                let mut win = vec![0; g.window.len(nobj)];
+                for [m, y, x] in pixels(g.window) {
+                    if owner[grid.of_pixel(y, x)] as usize == r {
+                        win[g.window.index(m, y, x)] = value(m, y, x);
+                    }
+                }
+                win
+            })
+            .collect();
+        let mut send: Vec<Vec<u64>> = (0..n)
+            .map(|r| vec![0; plan.halo_words(r)[0] as usize])
+            .collect();
+        for (o, g) in plan.regions().iter().enumerate() {
+            for run in rows[o].pack.iter().map(|w| w.pack(g.window, 0, 0)) {
+                let (dst, src, len) = ((run.dst / 8) as usize, (run.src / 8) as usize, run.len);
+                send[o][dst..][..len as usize].copy_from_slice(&wins[o][src..][..len as usize]);
+            }
+        }
+        for (r, g) in plan.regions().iter().enumerate() {
+            let mut recv = vec![0; plan.halo_words(r)[1] as usize];
+            for [o, at, from, len] in plan.halo.links(r, n) {
+                let [at, from, len] = [at, from, len].map(|w| w as usize);
+                recv[at..][..len].copy_from_slice(&send[o as usize][from..][..len]);
+            }
+            for run in rows[r].unpack.iter().map(|w| w.unpack(g.window, 0, 0)) {
+                let (dst, src, len) = ((run.dst / 8) as usize, (run.src / 8) as usize, run.len);
+                wins[r][dst..][..len as usize].copy_from_slice(&recv[src..][..len as usize]);
+            }
+            for [m, y, x] in pixels(g.window) {
+                let t = grid.of_pixel(y, x);
+                let want = if owner[t] as usize == r || read[r][t] {
+                    value(m, y, x)
+                } else {
+                    0
+                };
+                let got = wins[r][g.window.index(m, y, x)];
+                assert_eq!(got, want, "{what}: region {r} mode {m} pixel {y} {x}");
+            }
+        }
+    }
+
+    /// Splits `batches` in turn, adding each share's halo rows to `rows` and marking in
+    /// `read[r]` the foreign tiles its frames touch.
+    fn split_all<'a>(
+        plan: &mut LivePlan,
+        batches: impl IntoIterator<Item = &'a [ViewAddr]>,
+        rows: &mut [HaloRows],
+        read: &mut [Vec<bool>],
+    ) {
+        let n = plan.nregion();
+        let nmode = plan.dims.nmode as usize;
+        let mut shares = vec![Share::default(); n];
+        for batch in batches {
+            plan.split(batch, &mut shares).unwrap();
+            let (grid, owner) = (plan.partition().grid(), plan.partition().owner());
+            for (r, (s, g)) in shares.iter().zip(plan.regions()).enumerate() {
+                rows[r].pack.extend(&s.halo.pack);
+                rows[r].unpack.extend(&s.halo.unpack);
+                let (ld, at) = (g.shape.dims(), g.window.at.map(|p| p / grid.tile()));
+                for v in s.views.chunks(nmode) {
+                    for t in tiles_of(&ld, v, grid.dims()[1], at) {
+                        read[r][t] |= owner[t] as usize != r;
+                    }
+                }
+            }
+        }
+    }
+
     /// On one GPU the region is the one-GPU scan itself.
     #[test]
     fn one_gpu_holds_the_whole_scan() {
@@ -313,7 +433,6 @@ mod tests {
             assert_eq!(g.planned, views, "{name}");
             let ntiles = plan.partition().grid().len() as u32;
             assert_eq!(g.own, (0..ntiles).collect::<Vec<_>>(), "{name}");
-            assert!(g.reads.is_empty(), "{name}");
             assert_eq!(plan.halo_words(0), [0, 0], "{name}");
         }
     }
@@ -327,9 +446,7 @@ mod tests {
             let dims = shape.dims();
             let nmode = dims.nmode as usize;
             for ngpu in [1, 2, 4] {
-                let plan = LivePlan::new(&shape, &views, scheme, ngpu).unwrap();
-                let (grid, owner) = (plan.partition().grid(), plan.partition().owner());
-                let ntx = grid.dims()[1];
+                let mut plan = LivePlan::new(&shape, &views, scheme, ngpu).unwrap();
                 let mut shares = vec![Share::default(); ngpu];
                 let mut local: Vec<Vec<(u32, Vec<ViewAddr>)>> = vec![Vec::new(); ngpu];
                 let (mut start, mut sizes) = (0, [1, 7, 64, 3].iter().cycle());
@@ -346,6 +463,8 @@ mod tests {
                     }
                     start = end;
                 }
+                let (grid, owner) = (plan.partition().grid(), plan.partition().owner());
+                let ntx = grid.dims()[1];
                 let one: Vec<Vec<usize>> = (0..grid.len())
                     .map(|t| {
                         (0..shape.nframe as usize)
@@ -385,19 +504,21 @@ mod tests {
         }
     }
 
-    /// A region's window holds its own tiles and the tiles its frames read, as an object of
-    /// its scan's shape whose tiles are the one-GPU object's; every planned view fits it.
+    /// A region's window is an object of its scan's shape whose tiles are the one-GPU
+    /// object's, and every view inside the one-GPU object that touches one of its own tiles,
+    /// planned or not, whole-pixel or not, fits it and touches the same tiles there.
     #[test]
-    fn windows_hold_own_and_read_tiles_as_the_scan_object() {
+    fn any_frame_on_own_tiles_fits_the_window() {
         for (name, shape, views, scheme) in cases() {
             let dims = shape.dims();
             for ngpu in [2, 4] {
                 let plan = LivePlan::new(&shape, &views, scheme, ngpu).unwrap();
                 let (grid, owner) = (plan.partition().grid(), plan.partition().owner());
-                let tile = grid.tile();
+                let (tile, ntx) = (grid.tile(), grid.dims()[1]);
                 for (r, g) in plan.regions().iter().enumerate() {
                     let what = format!("{name} on {ngpu}: region {r}");
                     let ld = g.shape.dims();
+                    assert_eq!(ld.nframe, dims.nframe, "{what}");
                     assert_eq!(ld.obj.map(|n| n as usize), g.window.shape, "{what}");
                     assert_eq!(g.window.at.map(|p| p % tile), [0, 0], "{what}");
                     let end = [0, 1].map(|a| g.window.at[a] + g.window.shape[a]);
@@ -409,122 +530,135 @@ mod tests {
                         .map(|t| g.window.tile(grid, t))
                         .collect();
                     assert_eq!(g.own, own, "{what}");
-                    assert!(g.reads.iter().all(|&t| owner[t as usize] as usize != r));
-                    let at = g.window.at.map(|p| p / tile);
-                    let mut read = Vec::new();
-                    for v in g.planned.chunks(dims.nmode as usize) {
-                        assert!(v.iter().all(|v| ld.check_view(v).is_ok()), "{what}");
-                        let t = tiles_of(&ld, v, grid.dims()[1], at);
-                        read.extend(t.into_iter().filter(|&t| owner[t] as usize != r));
-                    }
-                    read.sort_unstable();
-                    read.dedup();
-                    let read: Vec<u32> = read.into_iter().map(|t| t as u32).collect();
-                    assert_eq!(g.reads, read, "{what}");
+                    assert!(g.planned.iter().all(|v| ld.check_view(v).is_ok()), "{what}");
                 }
-            }
-        }
-    }
-
-    /// Each region's halo receive rows are exactly the pixels of the tiles it reads, every
-    /// object mode; the send buffers hold what the receive buffers take.
-    #[test]
-    fn halo_rows_cover_the_read_tiles() {
-        for (name, shape, views, scheme) in cases() {
-            for ngpu in [2, 4] {
-                let mut plan = LivePlan::new(&shape, &views, scheme, ngpu).unwrap();
-                let mut rows = vec![HaloRows::default(); ngpu];
-                for r in 0..ngpu {
-                    let reads = plan.regions[r].reads.iter().map(|&t| t as usize);
-                    plan.halo.read(r, reads, &mut rows);
-                }
-                let grid = plan.partition().grid();
-                let [nyo, nxo] = grid.obj();
-                let tile = grid.tile();
-                let nobj = shape.nobj as usize;
-                let (mut sent, mut taken) = (0, 0);
-                for (r, g) in plan.regions().iter().enumerate() {
-                    let what = format!("{name} on {ngpu}: region {r}");
-                    let win = g.window;
-                    let mut got = Vec::new();
-                    for run in rows[r].unpack.iter().map(|w| w.unpack(win, 0, 0)) {
-                        let at = run.dst as usize / size_of::<crate::gpu::C32>();
-                        got.extend(at..at + run.len as usize);
-                    }
-                    got.sort_unstable();
-                    let mut want = Vec::new();
-                    for m in 0..nobj {
-                        for &t in &g.reads {
-                            let [ty, tx] = grid.coords(t as usize);
-                            for y in ty * tile..((ty + 1) * tile).min(nyo) {
-                                for x in tx * tile..((tx + 1) * tile).min(nxo) {
-                                    want.push(win.index(m, y, x));
-                                }
+                let mut fits = 0;
+                for f in [0.0, 0.5] {
+                    for oy in 0..dims.obj[0] {
+                        for ox in 0..dims.obj[1] {
+                            let v = ViewAddr {
+                                oy,
+                                ox,
+                                fy: f,
+                                fx: f,
+                                probe: 0,
+                                obj: 0,
+                            };
+                            if dims.check_view(&v).is_err() {
+                                continue;
+                            }
+                            let t = tiles_of(&dims, &[v], ntx, [0, 0]);
+                            for r in owners(owner, &t, ngpu) {
+                                let g = &plan.regions()[r];
+                                let (ld, w) = (g.shape.dims(), g.window.shift(v));
+                                let what = format!("{name} on {ngpu}: region {r}, {v:?}");
+                                assert!(ld.check_view(&w).is_ok(), "{what}");
+                                let at = g.window.at.map(|p| p / tile);
+                                assert_eq!(tiles_of(&ld, &[w], ntx, at), t, "{what}");
+                                fits += 1;
                             }
                         }
                     }
-                    want.sort_unstable();
-                    assert_eq!(got, want, "{what}");
-                    let [send, recv] = plan.halo_words(r);
-                    assert_eq!(recv as usize, want.len(), "{what}");
-                    (sent, taken) = (sent + send, taken + recv);
                 }
-                assert_eq!(sent, taken, "{name} on {ngpu}");
-                assert!(sent > 0, "{name} on {ngpu}: no halo");
+                assert!(fits > 0, "{name} on {ngpu}");
             }
         }
     }
 
-    /// A frame off the object, or one reading a tile its region's planned frames do not, is
-    /// refused, with the frames before it split.
+    /// After the planned frames and frames moved off the plan, split in batches, each
+    /// receiver's window holds its owners' pixels in exactly the foreign tiles its frames
+    /// read, from one exchange of the rows the batches added. In some case the moved frames
+    /// read tiles the planned ones do not.
     #[test]
-    fn split_refuses_frames_outside_the_plan() {
-        let (shape, views) = scan(sim::raster(4, 2, 8e-8), 32);
-        let nmode = shape.nmode as usize;
-        // Columns at x = 0 and 8 px, then the same at x = 200 px, so each region's frames
-        // read no tile of the other: a frame between them reads tiles of both.
-        let far: Vec<ViewAddr> = views
-            .iter()
-            .map(|&v| ViewAddr {
-                ox: v.ox + 200,
-                ..v
-            })
-            .collect();
-        let both = [views.clone(), far].concat();
-        let shape = ScanShape {
-            nframe: shape.nframe * 2,
-            reach: [shape.reach[0], shape.reach[1] + 200],
-            ..shape
-        };
-        let plan = LivePlan::new(&shape, &both, Scheme::Strips, 2).unwrap();
-        assert!(plan.regions().iter().all(|g| g.reads.is_empty()));
+    fn exchange_gives_receivers_the_owners_pixels_of_every_tile_they_read() {
+        let mut grew = false;
+        for (name, shape, views, scheme) in cases() {
+            let dims = shape.dims();
+            let nmode = dims.nmode as usize;
+            let off = [[5, -9], [-13, 11], [0, 17]]
+                .map(|d| jittered(&dims, &views, d))
+                .concat();
+            assert!(!off.is_empty(), "{name}");
+            for ngpu in [2, 4] {
+                let what = format!("{name} on {ngpu}");
+                let mut plan = LivePlan::new(&shape, &views, scheme, ngpu).unwrap();
+                let ntiles = plan.partition().grid().len();
+                let mut rows = vec![HaloRows::default(); ngpu];
+                let mut read = vec![vec![false; ntiles]; ngpu];
+                split_all(&mut plan, views.chunks(5 * nmode), &mut rows, &mut read);
+                let planned: usize = rows.iter().map(|w| w.unpack.len()).sum();
+                assert!(planned > 0, "{what}: no halo");
+                check_exchange(&plan, &rows, &read, &format!("{what}, planned"));
+                let words = |rows: &[HaloRows]| -> u64 {
+                    let rows = rows.iter().flat_map(|w| &w.unpack);
+                    rows.map(|w| u64::from(w.len)).sum()
+                };
+                let before = words(&rows);
+                split_all(&mut plan, off.chunks(3 * nmode), &mut rows, &mut read);
+                let max: u64 = (0..ngpu).map(|r| plan.halo_words(r)[1]).sum();
+                assert!(words(&rows) <= max, "{what}");
+                grew |= words(&rows) > before;
+                check_exchange(&plan, &rows, &read, &format!("{what}, off the plan"));
+                let packed: usize = rows.iter().map(|w| w.pack.len()).sum();
+                let unpacked: usize = rows.iter().map(|w| w.unpack.len()).sum();
+                assert_eq!(packed, unpacked, "{what}");
+            }
+        }
+        assert!(grew, "no frame off the plan read a new tile");
+    }
+
+    /// A frame between two strips whose planned frames read nothing of each other lands on
+    /// both, and adds the rows of the tiles it reads on each to both: the halo grows past the
+    /// plan. Split again, it adds none.
+    #[test]
+    fn a_frame_off_the_plan_grows_the_halo() {
+        let (shape, both, mid) = far();
+        let mut plan = LivePlan::new(&shape, &both, Scheme::Strips, 2).unwrap();
+        let ntiles = plan.partition().grid().len();
+        let mut rows = vec![HaloRows::default(); 2];
+        let mut read = vec![vec![false; ntiles]; 2];
+        split_all(&mut plan, [both.as_slice()], &mut rows, &mut read);
+        assert_eq!(rows, vec![HaloRows::default(); 2], "the plan reads no halo");
         let mut shares = vec![Share::default(); 2];
-        let mid: Vec<ViewAddr> = both[..nmode]
-            .iter()
-            .map(|&v| ViewAddr {
-                ox: v.ox + 100,
-                ..v
-            })
-            .collect();
-        let batch = [&both[..nmode], &mid].concat();
-        let err = plan.split(&batch, &mut shares).unwrap_err().to_string();
-        assert!(err.contains("does not hold"), "{err}");
-        let landed: Vec<&[u32]> = shares.iter().map(|s| s.frames.as_slice()).collect();
+        plan.split(&mid, &mut shares).unwrap();
+        for s in &shares {
+            assert_eq!(s.frames, [0]);
+            assert!(!s.halo.pack.is_empty() && !s.halo.unpack.is_empty());
+        }
+        split_all(&mut plan, [mid.as_slice()], &mut rows, &mut read);
         assert_eq!(
-            landed,
-            [&[0][..], &[]],
-            "only the frame before the refused one"
+            rows,
+            vec![HaloRows::default(); 2],
+            "a frame read again adds rows"
         );
-        let off: Vec<ViewAddr> = both[..nmode]
+        let mut rows: Vec<HaloRows> = shares.into_iter().map(|s| s.halo).collect();
+        check_exchange(&plan, &rows, &read, "far");
+        split_all(&mut plan, [both.as_slice()], &mut rows, &mut read);
+        check_exchange(&plan, &rows, &read, "far, split again");
+    }
+
+    /// A frame off the object is refused, with the frames before it and the halo rows they
+    /// add split.
+    #[test]
+    fn split_refuses_frames_off_the_object() {
+        let (shape, both, mid) = far();
+        let mut plan = LivePlan::new(&shape, &both, Scheme::Strips, 2).unwrap();
+        let off: Vec<ViewAddr> = mid
             .iter()
             .map(|&v| ViewAddr { oy: u32::MAX, ..v })
             .collect();
-        let err = plan.split(&off, &mut shares).unwrap_err().to_string();
+        let mut shares = vec![Share::default(); 2];
+        let err = plan
+            .split(&[mid.as_slice(), &off].concat(), &mut shares)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("outside"), "{err}");
+        for s in &shares {
+            assert_eq!(s.frames, [0], "only the frame before the refused one");
+            assert!(!s.halo.unpack.is_empty());
+        }
         plan.split(&both, &mut shares).unwrap();
-        assert_eq!(
-            shares[0].frames.len() + shares[1].frames.len(),
-            both.len() / nmode
-        );
+        let n: usize = shares.iter().map(|s| s.frames.len()).sum();
+        assert!(n >= both.len() / shape.nmode as usize);
     }
 }

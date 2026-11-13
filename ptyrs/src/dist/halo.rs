@@ -169,6 +169,12 @@ pub struct HaloRows {
     pub unpack: Vec<HaloRow>,
 }
 
+impl AsMut<HaloRows> for HaloRows {
+    fn as_mut(&mut self) -> &mut HaloRows {
+        self
+    }
+}
+
 /// Consecutive tiles of tile row `ty` from `tx0` on, one owner's, that a receiver may read; per
 /// object mode, their pixel rows sit from word `at` of the mode's part of the segment, `width`
 /// words each.
@@ -322,7 +328,7 @@ impl Halo {
         &mut self,
         r: usize,
         tiles: impl IntoIterator<Item = usize>,
-        rows: &mut [HaloRows],
+        rows: &mut [impl AsMut<HaloRows>],
     ) {
         let may = &mut self.may[r];
         let mut new = Vec::new();
@@ -368,17 +374,27 @@ impl Halo {
                             len: (x1 - x) as u32,
                             word: at + word,
                         };
-                        rows[seg.owner].pack.push(row(seg.send_at));
-                        rows[r].unpack.push(row(seg.recv_at));
+                        rows[seg.owner].as_mut().pack.push(row(seg.send_at));
+                        rows[r].as_mut().unpack.push(row(seg.recv_at));
                     }
                 }
             }
         }
     }
 
-    /// Copy-engine pulls into region `r`'s receive buffer at `recv` from the owners' send
-    /// buffers, `send(o)` giving owner `o`'s context and send buffer, in [`peers`] order over
-    /// `n` regions: every tile `r` may read, read yet or not, so the pulls never change.
+    /// `[owner, receive word, send word, words]` of each pull into region `r`, in [`peers`]
+    /// order over `n` regions: every tile `r` may read, read yet or not, so they never change.
+    pub(crate) fn links(&self, r: usize, n: usize) -> impl Iterator<Item = [u64; 4]> {
+        peers(r, n).flat_map(move |o| {
+            self.segs
+                .iter()
+                .filter(move |s| s.recv == r && s.owner == o)
+                .map(|s| [s.owner as u64, s.recv_at, s.send_at, s.words])
+        })
+    }
+
+    /// Copy-engine [`Self::links`] into region `r`'s receive buffer at `recv` from the owners'
+    /// send buffers, `send(o)` giving owner `o`'s context and send buffer.
     pub(crate) fn pulls(
         &self,
         r: usize,
@@ -386,18 +402,13 @@ impl Halo {
         recv: u64,
         send: impl Fn(usize) -> (Arc<Context>, u64),
     ) -> Vec<Pull> {
-        peers(r, n)
-            .flat_map(|o| {
-                self.segs
-                    .iter()
-                    .filter(move |s| s.recv == r && s.owner == o)
-            })
-            .map(|s| {
-                let (from, at) = send(s.owner);
+        self.links(r, n)
+            .map(|[o, recv_at, send_at, words]| {
+                let (from, at) = send(o as usize);
                 Pull {
-                    dst: recv + s.recv_at * 8,
-                    src: at + s.send_at * 8,
-                    bytes: (s.words * 8) as usize,
+                    dst: recv + recv_at * 8,
+                    src: at + send_at * 8,
+                    bytes: (words * 8) as usize,
                     from,
                 }
             })
