@@ -1,6 +1,6 @@
 //! The CPU engine's results the Python tests compare the bindings against, run here on the
-//! engine itself: `engine_reference <dir>` writes `<dir>/opr.h5` and `<dir>/near.h5`,
-//! h5py-readable (complex as `{r, i}`); `scripts/build.sh` runs it into the module's directory.
+//! engine itself: `engine_reference <dir>` writes `<dir>/opr.h5`, `<dir>/near.h5` and
+//! `<dir>/multislice.h5`, h5py-readable (complex as `{r, i}`); `scripts/build.sh` runs it into the module's directory.
 //!
 //! `opr.h5` holds a simulated far-field scan (`counts`, raw `y` and `x`, the geometry as root
 //! attributes), its `positions` `[nframe, 2]` as the views read them at the object `pixel`,
@@ -17,6 +17,10 @@
 //! and `probe`, then an `lsqml` and a `bh` group of [`NEPOCH`] epochs from that start, their
 //! parameters as attributes and each epoch's groups as in `opr.h5`, BH's steps as `frames`,
 //! `beta`, `alpha`, `top`, `bottom` and `batch_len`.
+//!
+//! `multislice.h5` is laid out as `near.h5` for a scan through three object slices and PyNX's
+//! far field ([`Optics::with_slices`] of [`Optics::far_field`], `exit` `"far_field"` with its
+//! `detector_pixel`), the slice `gaps` in metres at the object pixel.
 
 use std::error::Error;
 use std::path::Path;
@@ -384,11 +388,54 @@ fn near(path: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// Three object slices with unequal gaps before PyNX's far field.
+fn multislice(path: &Path) -> Result<(), Box<dyn Error>> {
+    let frame = [32, 32];
+    let (wavelength, distance) = (1e-10, 5e-3);
+    let g = Geometry::new(wavelength, distance, wavelength * distance / 1.6e-6, frame)?;
+    let pixel = g.pixel_size_object();
+    let gaps = [4e-5, 6e-5];
+    let waves = gaps
+        .iter()
+        .map(|&d| Wavefield::new(frame, wavelength, pixel, d))
+        .collect::<Result<Vec<_>, _>>()?;
+    let optics = Optics::far_field(&g).with_slices(&waves)?;
+    let positions = fermat(20, 3.0 * pixel[1]);
+    let shape = required_obj_shape(&positions, pixel, frame, 0);
+    let o = object(shape);
+    let third = Stack::from_vec(
+        o.0.dims(),
+        o.0.as_slice().iter().map(|c| c.powf(1.0 / 3.0)).collect(),
+    )?;
+    let f = H5File::create(path)?;
+    let root = f.root_group();
+    root.set_attr_string("exit", "far_field")?;
+    for (name, v) in [
+        ("wavelength", g.wavelength),
+        ("distance", g.distance),
+        ("detector_pixel", g.detector_pixel),
+    ] {
+        root.set_attr_numeric(name, &v)?;
+    }
+    write(&root, "gaps", &[gaps.len()], &gaps)?;
+    let objects = vec![Object::new(third); optics.nslice()];
+    optics_runs(
+        &root,
+        &optics,
+        &positions,
+        pixel,
+        (&objects, &probe(frame, 2)?),
+    )?;
+    f.close()?;
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let dir = std::env::args()
         .nth(1)
         .ok_or("usage: engine_reference <dir>")?;
     let dir = Path::new(&dir);
     opr(&dir.join("opr.h5"))?;
-    near(&dir.join("near.h5"))
+    near(&dir.join("near.h5"))?;
+    multislice(&dir.join("multislice.h5"))
 }

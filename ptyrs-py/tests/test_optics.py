@@ -1,6 +1,7 @@
-"""Lsqml and Bh over Views of near-field Optics against the engine's own epochs from the same
-scan and start, `examples/engine_reference.rs`' `near.h5`: after every epoch the object
-slices, probe and steps, exactly, as one CPU f64 engine runs both."""
+"""Lsqml and Bh over Views of near-field and multislice Optics against the engine's own epochs
+from the same scan and start, `examples/engine_reference.rs`' `near.h5` (pty-chi's planar
+near field) and `multislice.h5` (three slices before PyNX's far field): after every epoch the
+object slices, probe and steps, exactly, as one CPU f64 engine runs both."""
 
 import os
 
@@ -12,23 +13,31 @@ import ptyrs
 from conftest import MODULE_DIR
 
 
-@pytest.fixture(scope="module", params=["near"])
+@pytest.fixture(scope="module", params=["near", "multislice"])
 def ref(request):
     with h5py.File(os.path.join(MODULE_DIR, f"{request.param}.h5"), "r") as f:
         yield f
 
 
 def optics_of(f):
-    a = f.attrs
-    assert a["exit"] == "free_space"
-    w = ptyrs.Wavefield(f["counts"].shape[1:], a["wavelength"], f["wave_pixel"][()],
-                        a["distance"])
-    return ptyrs.Optics.free_space(w)
+    a, frame = f.attrs, f["counts"].shape[1:]
+    if a["exit"] == "free_space":
+        w = ptyrs.Wavefield(frame, a["wavelength"], f["wave_pixel"][()], a["distance"])
+        optics = ptyrs.Optics.free_space(w)
+    else:
+        assert a["exit"] == "far_field"
+        optics = ptyrs.Optics.far_field(a["wavelength"], a["distance"], a["detector_pixel"],
+                                        frame)
+    if "gaps" not in f:
+        return optics
+    gaps = [ptyrs.Wavefield(frame, a["wavelength"], f["pixel"][()], d) for d in f["gaps"][()]]
+    return optics.with_slices(gaps)
 
 
 def start(f):
     """`f`'s views and start object slices and probe."""
     o, p = f["object"][()], f["probe"][()]
+    assert len(o) == (len(f["gaps"]) + 1 if "gaps" in f else 1)
     views = ptyrs.Views(f["counts"][()], f["positions"][()], f["pixel"][()], o.shape[2:],
                         len(p), o.shape[1], optics_of(f))
     return views, o, p
