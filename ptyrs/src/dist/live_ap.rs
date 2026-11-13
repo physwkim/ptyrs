@@ -376,11 +376,10 @@ impl DistLiveAp {
         let mut shares = vec![Share::default(); self.plan.nregion()];
         let took = self.plan.split(views, &mut shares)?;
         self.lost += (views.len() / nmode) as u64 - u64::from(took);
-        let (shares, batch) = (Arc::new(shares), Arc::<[u16]>::from(counts));
         self.failed = true;
         let got = self
             .workers
-            .run(move |gpu, st| st.push(&shares[gpu.region()], &batch))?;
+            .run(|gpu, st| st.push(&shares[gpu.region()], counts))?;
         self.failed = false;
         for (r, (landed, rows)) in got.into_iter().enumerate() {
             self.landed[r] = landed;

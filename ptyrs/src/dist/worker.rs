@@ -284,17 +284,21 @@ impl<S: Send + 'static> Workers<S> {
 
     /// Runs `f` on every worker at once and returns the results in region order. On failure
     /// the error of the lowest failing region is returned, preferring a root cause over
-    /// [`DistError::Aborted`] from the workers it released.
+    /// [`DistError::Aborted`] from the workers it released. `f` may borrow from the caller:
+    /// `run` returns only after every worker is done with it.
     pub fn run<R, F>(&self, f: F) -> Result<Vec<R>, DistError>
     where
         R: Send + 'static,
-        F: Fn(&mut Gpu, &mut S) -> Result<R, DistError> + Send + Sync + 'static,
+        F: Fn(&mut Gpu, &mut S) -> Result<R, DistError> + Sync,
     {
         self.shared.rendezvous.reset();
-        let f = Arc::new(f);
-        let (tx, rx) = channel();
+        let f: &Body<'_, S, R> = &f;
+        // SAFETY: only the jobs below hold `f`, and `results` does not let this frame end,
+        // unwinding included, before every job has run or been dropped.
+        let f: &'static Body<'static, S, R> = unsafe { std::mem::transmute(f) };
+        let mut results = Results::new();
         for (region, s) in self.senders.iter().enumerate() {
-            let (f, tx) = (f.clone(), tx.clone());
+            let tx = results.sender();
             let job: Job<S> = Box::new(move |gpu, state| {
                 let out = catch_unwind(AssertUnwindSafe(|| {
                     gpu.ctx.bind_to_thread()?;
@@ -309,11 +313,15 @@ impl<S: Send + 'static> Workers<S> {
                 gpu.shared.rendezvous.depart(out.is_ok());
                 let _ = tx.send((region, out));
             });
-            s.send(job).map_err(|_| DistError::Aborted)?;
+            if s.send(job).is_err() {
+                // The worker is gone: release the ones already started, unsent ones report
+                // `Aborted`.
+                self.shared.rendezvous.depart(false);
+                break;
+            }
         }
-        drop(tx);
         let mut out: Vec<Option<Result<R, DistError>>> = (0..self.len()).map(|_| None).collect();
-        for (r, res) in rx.iter() {
+        for (r, res) in results.wait() {
             out[r] = Some(res);
         }
         let mut results = Vec::with_capacity(out.len());
@@ -333,6 +341,38 @@ impl<S: Send + 'static> Workers<S> {
             Some(e) => Err(e),
             None => Ok(results),
         }
+    }
+}
+
+type Body<'a, S, R> = dyn Fn(&mut Gpu, &mut S) -> Result<R, DistError> + Sync + 'a;
+
+/// The channel a run's jobs report on. Dropping it waits until every job has run or been
+/// dropped, so a closure the jobs borrow outlives them.
+struct Results<T> {
+    tx: Option<Sender<T>>,
+    rx: Receiver<T>,
+}
+
+impl<T> Results<T> {
+    fn new() -> Self {
+        let (tx, rx) = channel();
+        Self { tx: Some(tx), rx }
+    }
+
+    fn sender(&self) -> Sender<T> {
+        self.tx.clone().expect("sender taken before wait")
+    }
+
+    /// Every result, ending once no job is left.
+    fn wait(&mut self) -> std::sync::mpsc::Iter<'_, T> {
+        self.tx = None;
+        self.rx.iter()
+    }
+}
+
+impl<T> Drop for Results<T> {
+    fn drop(&mut self) {
+        self.wait().for_each(drop);
     }
 }
 
@@ -571,6 +611,30 @@ pub(crate) mod tests {
         // The workers stay usable after each failure.
         let regions = w.run(|g, _| Ok(g.region())).unwrap();
         assert_eq!(regions, [0, 1, 2, 3]);
+    }
+
+    /// `run` borrows its closure, so it must not return, failure included, while a worker
+    /// can still reach what the closure borrows.
+    #[test]
+    fn run_returns_after_every_worker_is_done_with_its_borrows() {
+        use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+        let w = Workers::spawn(&gpus(4), |_| Ok(())).unwrap();
+        let input: Vec<u32> = (10..14).collect();
+        let late: Vec<AtomicU32> = (0..4).map(|_| AtomicU32::new(0)).collect();
+        let err = w
+            .run(|g, _| {
+                let r = g.region();
+                if r == 0 {
+                    return Err(DistError::Topology("early".into()));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                late[r].store(input[r], Relaxed);
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(matches!(err, DistError::Topology(_)), "{err}");
+        let late: Vec<u32> = late.iter().map(|a| a.load(Relaxed)).collect();
+        assert_eq!(late, [0, 11, 12, 13]);
     }
 
     #[test]
