@@ -5,8 +5,8 @@
 //! probe's far field underflows f32 at pixels with counts, so the GPU Poisson LLK is infinite
 //! and ML's line search does not move. The DM cycles count as iterations of ML's curve. Every
 //! LLK curve goes to `<curves.tsv>`, one row per iteration, iteration 0 being the start; the
-//! table gives the LLK at a few iterations and the iterations DIP takes to come within
-//! [`LLK_MARGIN`] of ML's LLK after N.
+//! table gives the LLK at a few iterations and the iteration from which DIP stays within
+//! [`LLK_MARGIN`] of ML's LLK after N ([`iterations_to_llk`]).
 //!
 //! `cargo run --release -p ptyrs --features nn --example nn_dip -- <curves.tsv> [iterations=1000] [lr=0.01]`
 
@@ -172,8 +172,8 @@ fn main() -> Result<(), LossError> {
             println!("{alg:4} {row}  {:>7.4}", t / n as f64);
         }
         for m in NS.into_iter().filter(|&m| m <= n) {
-            let k = iterations_to_llk(dip[0], ml[m], LLK_MARGIN, dip[1..].iter().copied())
-                .map_or(format!(">{n}"), |k| k.to_string());
+            let k = iterations_to_llk(dip[0], ml[m], LLK_MARGIN, &dip[1..])
+                .map_or("not reached".to_string(), |k| k.to_string());
             println!("dip to within 1% of ml's LLK at {m:>3} ({:.4}): {k}", ml[m]);
         }
     }

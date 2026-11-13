@@ -4,10 +4,10 @@
 //! engine's CPU path. The first table holds the known probe fixed in DM and single-frame rPIE;
 //! the second starts DM from it and updates it at DM's default probe inertia. rPIE runs at
 //! object alpha 0.5 and 1.0: at its default 0.1 it climbs back from its minimum on these scans
-//! and oscillates, in pty-chi as in the engine. A start reaches the target once its LLK is
-//! within [`LLK_MARGIN`] above it: the LLK of rPIE and of DM passes a minimum and drifts, and a
-//! strict count would measure the flat run's own dip. Every LLK curve goes to `<curves.tsv>`,
-//! one row per epoch, epoch 0 being the start.
+//! and oscillates, in pty-chi as in the engine. A start reaches the target at the epoch
+//! [`iterations_to_llk`] gives, from which its LLK stays within [`LLK_MARGIN`] above it through
+//! the last epoch; both starts run [`MAX`] epochs. Every LLK curve goes to `<curves.tsv>`, one
+//! row per epoch, epoch 0 being the start.
 //!
 //! `cargo run --release -p ptyrs --features nn --example nn_m6_start -- <predictor_dir> <curves.tsv>`
 
@@ -28,7 +28,7 @@ use ptyrs::nn::predictor::{Predictor, flat_object, mean_frame_total};
 
 /// Flat-start epochs whose LLK becomes the target.
 const NS: [usize; 2] = [20, 100];
-/// Epochs run from the predicted start.
+/// Epochs run from either start.
 const MAX: usize = 200;
 
 #[derive(Clone, Copy, Debug)]
@@ -123,7 +123,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map(|c| {
                 ALGS.map(|alg| {
                     (
-                        s.spawn(move || run(alg, &c.scan, c.flat.clone(), &c.probe, NS[1])),
+                        s.spawn(move || run(alg, &c.scan, c.flat.clone(), &c.probe, MAX)),
                         s.spawn(move || run(alg, &c.scan, c.predicted.clone(), &c.probe, MAX)),
                     )
                 })
@@ -171,26 +171,24 @@ fn write_curves(path: &Path, cases: &[Case], runs: &[Vec<(Run, Run)>]) -> std::i
     w.flush()
 }
 
-/// One row per case, algorithm of `ALGS[algs]` and N: the epochs to the target within
-/// [`LLK_MARGIN`].
+/// One row per case, algorithm of `ALGS[algs]` and N: the epochs each start takes to reach the
+/// flat start's epoch-N LLK.
 fn table(cases: &[Case], runs: &[Vec<(Run, Run)>], algs: Range<usize>) {
     println!(
-        "{:12} {:9} {:>3}  {:>8}  {:>8} {:>8}  {:>7} {:>7}",
-        "object", "alg", "N", "target", "LLK flat", "LLK pred", "flat 1%", "pred 1%"
+        "{:12} {:9} {:>3}  {:>8}  {:>8} {:>8}  {:>11} {:>11}",
+        "object", "alg", "N", "target", "LLK flat", "LLK pred", "flat", "pred"
     );
+    let count = |k: Option<usize>| k.map_or("not reached".to_string(), |k| k.to_string());
     for (c, runs) in cases.iter().zip(runs) {
         for (alg, ((flat0, flat), (pred0, pred))) in
             ALGS[algs.clone()].iter().zip(&runs[algs.clone()])
         {
             for n in NS {
                 let target = flat[n - 1];
-                // The flat run reaches its own epoch-N LLK by epoch N; earlier when it rises after.
-                let flat_m =
-                    iterations_to_llk(*flat0, target, LLK_MARGIN, flat.iter().copied()).unwrap();
-                let pred_m = iterations_to_llk(*pred0, target, LLK_MARGIN, pred.iter().copied())
-                    .map_or(format!(">{MAX}"), |k| k.to_string());
+                let flat_m = count(iterations_to_llk(*flat0, target, LLK_MARGIN, flat));
+                let pred_m = count(iterations_to_llk(*pred0, target, LLK_MARGIN, pred));
                 println!(
-                    "{:12} {:9} {n:>3}  {target:>8.4}  {flat0:>8.4} {pred0:>8.4}  {flat_m:>7} {pred_m:>7}",
+                    "{:12} {:9} {n:>3}  {target:>8.4}  {flat0:>8.4} {pred0:>8.4}  {flat_m:>11} {pred_m:>11}",
                     c.name,
                     format!("{alg:?}")
                 );
