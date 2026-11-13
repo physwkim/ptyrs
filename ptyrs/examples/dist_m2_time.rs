@@ -12,7 +12,9 @@
 //! median.
 //!
 //! `... -- prof <dir> <ap|dm> <size> <k>` runs 5 untimed cycles, then one call of `k` cycles
-//! between `cuProfilerStart` and `cuProfilerStop`, for `ncu --profile-from-start off`.
+//! between `cuProfilerStart` and `cuProfilerStop`, for `ncu --profile-from-start off`. Each
+//! cycle is one graph launch, so `--graph-profiling graph` makes it one result; cycle 0 of a
+//! DM call projects PO itself, so the steady cycle is any later one.
 
 use std::error::Error;
 use std::path::Path;

@@ -5,8 +5,10 @@ Usage: python -I pynx_m2.py time <dir> <ap|dm> <ncycle> <repeats>
        python -I pynx_m2.py prof <dir> <ap|dm> <k>
 
 Both run 5 untimed cycles at PyNX's default stack (16) without LLK or phase-ramp removal.
-`time` then times `repeats` runs of `ncycle` cycles and prints their median; `prof` runs `k`
-cycles between cuProfilerStart and cuProfilerStop, for `ncu --profile-from-start off`.
+`time` then times `repeats` runs of `ncycle` cycles and prints their median; `prof` runs one
+call of `k` cycles with each cycle between its own cuProfilerStart and cuProfilerStop, for
+`ncu --profile-from-start off --replay-mode app-range`. Cycle 0 of a DM call projects PO
+itself, so the steady cycle is any later one.
 """
 import os
 import sys
@@ -43,11 +45,22 @@ def main():
               f" (runs {runs}) over {ncycle} cycles")
     else:
         k = int(sys.argv[4])
+        # PyNX AP and DM end every cycle with p.update_history on the host.
+        history, ended = p.update_history, [0]
+
+        def cycle_end(*args, **kwargs):
+            cuop.default_processing_unit.finish()
+            drv.stop_profiler()
+            history(*args, **kwargs)
+            ended[0] += 1
+            if ended[0] < k:
+                drv.start_profiler()
+
+        p.update_history = cycle_end
         drv.start_profiler()
         p = op(algo) ** k * p
         cuop.default_processing_unit.finish()
-        drv.stop_profiler()
-        print(f"pynx {algo}: profiled {k} cycles")
+        print(f"pynx {algo}: profiled {ended[0]} cycles, one range each")
 
 
 if __name__ == "__main__":
