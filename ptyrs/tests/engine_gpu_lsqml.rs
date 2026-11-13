@@ -25,7 +25,7 @@ mod common;
 const NPOS: usize = 30;
 
 const OPTIONS: GpuOptions = GpuOptions {
-    stack_size: 7,
+    stack_size: Some(7),
     graph: true,
     llk_slots: 3,
     fused: true,
@@ -484,7 +484,7 @@ fn lsqml_position_is_bit_identical_across_stack_splits() {
         let run = |stack_size, graph| {
             let (scan, object, probe) = start(frame);
             let options = GpuOptions {
-                stack_size,
+                stack_size: Some(stack_size),
                 graph,
                 ..OPTIONS
             };

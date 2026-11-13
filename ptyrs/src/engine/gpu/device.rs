@@ -29,8 +29,8 @@ use super::lsqml::{LsqmlBufs, LsqmlState, Pre};
 use super::ml::MlMoved;
 use super::rpie::RpieMoved;
 use super::{
-    Epoch, Frames, GpuOptions, Tag, batch_stacks, plane_len, plans, split, stack_buf_len, stacks,
-    to_u32,
+    Epoch, Frames, GpuOptions, Tag, batch_stacks, nf_max, plane_len, plans, split, stack_buf_len,
+    stack_frames, stacks, to_u32,
 };
 use crate::engine::features::{POSITION_LIMIT, POSITION_STEP};
 use crate::engine::{
@@ -57,6 +57,9 @@ pub(super) struct Device {
     probe_len: u32,
     table: StackTable,
     stacks: Vec<StackBufs>,
+    /// The stacks of the fused passes that stream only the shared scratch, up to twice as
+    /// long as `stacks` ([`stack_frames`]).
+    wide: StackTable,
     passes: Passes,
     /// One stack's LLK partials, on their way into the ring.
     llk: DeviceBuffer<LlkPartial>,
@@ -67,7 +70,7 @@ pub(super) struct Device {
     use_graph: bool,
     /// The epochs run since the parameters last changed, all of one [`Epoch::run`].
     runs: Vec<EpochRun>,
-    /// Frames per stack, for the [`MlState`] plans.
+    /// Frames per stack of `stacks`, for the [`MlState`] plans and BH's and LSQML's stacks.
     stack_size: u32,
     /// With graphs, the LLK pass's graph.
     llk_graph: Option<Captured>,
@@ -876,6 +879,8 @@ pub(super) struct Bufs<'a> {
     pub probe_len: u32,
     pub table: &'a StackTable,
     pub stacks: Stacks<'a>,
+    /// The stacks of the fused passes that stream only the shared scratch.
+    pub wide: &'a StackTable,
     /// A stack's LLK partials, which [`crate::gpu::RecordWriter::push`] then copies into the
     /// record.
     pub llk: &'a mut DeviceBuffer<LlkPartial>,
@@ -925,7 +930,7 @@ impl Plans<'_> {
 
 impl Device {
     /// Loads the kernels and uploads the views, counts and starting arrays on a new stream of
-    /// `ctx`; the stacks cut `0 .. nframe` into `options.stack_size` frames, the LLK ring
+    /// `ctx`; the stacks cut `0 .. nframe` as [`stack_frames`] gives for `ctx`'s L2, the LLK ring
     /// holds `options.llk_slots` records of every frame, its unmasked pixels counted here, and
     /// `options.fused` picks the [`Passes`].
     pub fn new(
@@ -944,11 +949,14 @@ impl Device {
         let bh = BhKernels::load(&kernels)?;
         let views = Views::new(&stream, dims, addrs)?;
         let tile = TileDots::new(&stream, &dims)?;
-        let (frames, table, lens) =
-            stacks(&stream, &dims, to_u32("stack_size", options.stack_size)?)?;
+        let [wide, stack_size] =
+            stack_frames(options.stack_size, ctx.l2_cache_size_bytes()?, &dims)?;
+        let (frames, table, lens) = stacks(&stream, &dims, stack_size)?;
+        let wide = stacks(&stream, &dims, wide)?.1;
         let len = stack_buf_len(&dims, &table);
+        let nf_max = nf_max(&wide, &table);
         let passes = if options.fused {
-            let f = FusedBufs::new(&stream, &dims, table.nf_max()).map_err(|e| match e {
+            let f = FusedBufs::new(&stream, &dims, nf_max).map_err(|e| match e {
                 GpuError::Shape(m) => EngineError::Invalid(format!(
                     "{m}; GpuOptions {{ fused: false, .. }} runs M1's launches instead"
                 )),
@@ -973,7 +981,7 @@ impl Device {
         let mut dev = Self {
             obj_len: to_u32("object length", obj.len())?,
             probe_len: to_u32("probe length", probe.len())?,
-            llk: DeviceBuffer::zeroed(&stream, table.nf_max() as usize)?,
+            llk: DeviceBuffer::zeroed(&stream, nf_max as usize)?,
             llk_scratch: LlkScratch::new(&stream, &dims, table.nf_max())?,
             norms: NormBufs::zeroed(&stream)?,
             ring: LlkRing::new(
@@ -995,6 +1003,7 @@ impl Device {
             views,
             table,
             stacks,
+            wide,
             passes,
             use_graph: options.graph,
             runs: Vec::new(),
@@ -1003,7 +1012,7 @@ impl Device {
             bh_state: None,
             lsqml: None,
             features: FeatureBufs::default(),
-            stack_size: to_u32("stack_size", options.stack_size)?,
+            stack_size,
             stream,
         };
         let ctx = dev.context();
@@ -1055,6 +1064,7 @@ impl Device {
             return Ok(());
         }
         let stream = &self.stream;
+        let nf_max = nf_max(&self.wide, &self.table);
         let scale = scale
             .map(|v| {
                 Ok::<_, EngineError>(ScaleBufs {
@@ -1070,7 +1080,7 @@ impl Device {
                 nobs.copy_from_device_async(pixel_frames, stream)?;
                 Ok::<_, EngineError>(BackgroundBufs {
                     values: DeviceBuffer::from_host(stream, &v)?,
-                    sums: BackgroundSums::zeroed(stream, self.views.dims(), self.table.nf_max())?,
+                    sums: BackgroundSums::zeroed(stream, self.views.dims(), nf_max)?,
                     nobs,
                     photons: DeviceBuffer::zeroed(stream, 1)?,
                 })
@@ -1080,7 +1090,6 @@ impl Device {
         let passes = if have.position.is_some() == position.is_some() {
             None
         } else {
-            let nf_max = self.table.nf_max();
             let bufs = match position {
                 Some(_) => FusedBufs::with_shift(stream, dims, nf_max),
                 None => FusedBufs::new(stream, dims, nf_max),
@@ -1193,6 +1202,7 @@ impl Device {
             probe_len: self.probe_len,
             table: &self.table,
             stacks: Stacks(&mut self.stacks),
+            wide: &self.wide,
             llk: &mut self.llk,
             llk_scratch: &mut self.llk_scratch,
             norms: &mut self.norms,

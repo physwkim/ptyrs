@@ -57,7 +57,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (object, probe) = p.into_modes();
     let ctx = CudaContext::new(0).map_err(EngineError::from)?;
     let options = GpuOptions {
-        stack_size,
+        stack_size: Some(stack_size),
         fused,
         ..GpuOptions::default()
     };

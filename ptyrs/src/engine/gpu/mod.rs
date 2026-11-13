@@ -2,14 +2,15 @@
 //! stream with the `ptyrs::gpu` pixel kernels and `ptyrs::fft` plans, in the call sequences the
 //! `crate::gpu` ops and rPIE docs give, and is checked against [`crate::engine::Ptycho`].
 //!
-//! The scan's frames are cut into stacks of [`GpuOptions::stack_size`] consecutive frames,
-//! one [`StackTable`] entry each: every launch reads its stack's frames from the entry on the
-//! device. Each stack keeps its own exit waves (DM carries them across cycles), sized like
-//! PyNX's fixed stack for the longest stack. AP and DM project a stack, ML takes a stack's
-//! gradient, and the LLK pass takes its partials, either by M2's fused passes over one
-//! scratch set or by the M1 launch sequence ([`GpuOptions::fused`]), whose one scratch stack
-//! serves all and whose stacks of one length share a cuFFT plan, which transforms only their
-//! frames; rPIE, BH and ML's line search always run M1's launches. Each cycle enqueues through its own `ExecutionContext`, dropped when the cycle
+//! The scan's frames are cut into stacks of consecutive frames, one [`StackTable`] entry each:
+//! every launch reads its stack's frames from the entry on the device. The fused passes that
+//! stream only the shared scratch take stacks up to twice as long as the rest
+//! ([`GpuOptions::stack_size`]). Each stack keeps its own exit waves (DM carries them across
+//! cycles), sized like PyNX's fixed stack for the longest stack. AP and DM project a stack, ML
+//! takes a stack's gradient, and the LLK pass takes its partials, either by M2's fused passes
+//! over one scratch set or by the M1 launch sequence ([`GpuOptions::fused`]), whose one scratch
+//! stack serves all and whose stacks of one length share a cuFFT plan, which transforms only
+//! their frames; rPIE, BH and ML's line search always run M1's launches. Each cycle enqueues through its own `ExecutionContext`, dropped when the cycle
 //! has been enqueued. Nothing in a cycle
 //! reads back to the host: an LLK record goes, stack by stack, into the device's
 //! [`crate::gpu::LlkRing`], whose copies download while later cycles run, and the host reads
@@ -52,8 +53,13 @@ use crate::engine::{
 /// How [`GpuPtycho`] batches its work.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GpuOptions {
-    /// Frames per stack (the last stack may be shorter); PyNX's default is 16.
-    pub stack_size: usize,
+    /// Frames per stack (the last stack may be shorter) for every pass; PyNX's default is 16.
+    /// `None`, the default, cuts by bytes instead, so a stack's exit waves fill 3/8 of the
+    /// device's L2, the fastest share at frame sides 256 and 512: one set of them per frame in
+    /// the fused passes that stream only the shared scratch (AP's, the LLK pass's, ML's
+    /// gradient), two where the stack also streams its own (DM's carried waves, ML's line
+    /// search, M1's launches, BH's and LSQML's stacks).
+    pub stack_size: Option<usize>,
     /// Replay every AP, DM and ML cycle, rPIE epoch and LLK pass from a CUDA graph captured once
     /// per kind of cycle instead of launching it kernel by kernel; both give the same bits.
     pub graph: bool,
@@ -71,7 +77,7 @@ pub struct GpuOptions {
 impl Default for GpuOptions {
     fn default() -> Self {
         Self {
-            stack_size: 16,
+            stack_size: None,
             graph: true,
             llk_slots: 8,
             fused: true,
@@ -242,6 +248,29 @@ fn plans(
         .collect::<Result<Vec<_>, _>>()?)
 }
 
+/// Frames per stack, `[wide, carry]`: `size` for both when given, else, for an `l2`-byte L2,
+/// as many as fill 3/8 of it with one exit-wave set per frame (the fused passes over the
+/// shared scratch) and with two (the passes that stream the stack's own too), at least one
+/// each ([`GpuOptions::stack_size`]).
+fn stack_frames(size: Option<usize>, l2: usize, dims: &ViewDims) -> Result<[u32; 2], EngineError> {
+    let set = dims.nmode as usize * plane_len(dims) * size_of::<C32>();
+    let cap = l2 / 8 * 3;
+    let frames = match size {
+        Some(n) => [n; 2],
+        None => [1, 2].map(|sets| (cap / (sets * set)).max(1)),
+    };
+    Ok([
+        to_u32("stack_size", frames[0])?,
+        to_u32("stack_size", frames[1])?,
+    ])
+}
+
+/// The longest stack of either cut: the frames every buffer that more than one cut indexes
+/// holds.
+fn nf_max(wide: &StackTable, carry: &StackTable) -> u32 {
+    wide.nf_max().max(carry.nf_max())
+}
+
 /// Values of `nf_max` frames' exit waves, what every stack buffer holds.
 fn stack_buf_len(dims: &ViewDims, table: &StackTable) -> usize {
     table.nf_max() as usize * dims.nmode as usize * plane_len(dims)
@@ -340,7 +369,7 @@ impl GpuPtycho {
                 g.frame
             )));
         }
-        if options.stack_size == 0 {
+        if options.stack_size == Some(0) {
             return Err(EngineError::Invalid("stack_size must be >= 1".into()));
         }
         let pixel = g.pixel_size_object();
@@ -535,8 +564,8 @@ impl Bufs<'_> {
             }
             PassesMut::Fused(f) => {
                 let m = self.features.lend(ctx, self.kernels, &dims, self.probe)?;
-                for s in 0..self.stacks.len() {
-                    let stack = self.table.at(s);
+                for s in 0..self.wide.len() {
+                    let stack = self.wide.at(s);
                     let inputs = FusedInputs {
                         views: self.views,
                         counts: self.counts,
@@ -567,8 +596,8 @@ impl Bufs<'_> {
     ) -> Result<Option<Ended>, GpuError> {
         let dims = *self.views.dims();
         let mut m = self.features.lend(ctx, self.kernels, &dims, self.probe)?;
-        for s in 0..self.stacks.len() {
-            let stack = self.table.at(s);
+        for s in 0..self.wide.len() {
+            let stack = self.wide.at(s);
             let inputs = FusedInputs {
                 views: self.views,
                 counts: self.counts,
@@ -695,5 +724,33 @@ impl Bufs<'_> {
         };
         self.grad
             .scale_obj_probe(ctx, self.obj, self.probe, norms, scale)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dims(side: u32) -> ViewDims {
+        ViewDims {
+            nframe: 400,
+            nmode: 2,
+            nprobe: 2,
+            nobj: 1,
+            frame: [side; 2],
+            obj: [1024; 2],
+            quad_phase: 0.0,
+        }
+    }
+
+    /// Two modes' exit waves in 24 MiB of a 64 MiB L2: 24 and 12 frames of 256x256, 6 and 3
+    /// of 512x512, and one each when a frame alone overfills the share; a given size wins.
+    #[test]
+    fn stack_frames_fill_three_eighths_of_l2() {
+        const L2: usize = 64 << 20;
+        assert_eq!(stack_frames(None, L2, &dims(256)).unwrap(), [24, 12]);
+        assert_eq!(stack_frames(None, L2, &dims(512)).unwrap(), [6, 3]);
+        assert_eq!(stack_frames(None, 4 << 20, &dims(512)).unwrap(), [1, 1]);
+        assert_eq!(stack_frames(Some(16), L2, &dims(512)).unwrap(), [16, 16]);
     }
 }

@@ -2,10 +2,11 @@
 //!
 //! `cargo run --release -p ptyrs --example engine_gpu_time -- <dm|ap|ml|rpie> [ncycle] [nprobe] [frame] [npos] [step] [sizes] [graph|eager] [calc_llk] [fused|m1] [features]`
 //! (defaults 50, 2, 256, 400, 16 object pixels, `16`, `graph`, 0, `fused`, `none`) builds the
-//! `engine_llk_trace` scan, and for each comma-separated size (frames per stack; rPIE frames per
-//! batch) runs 5 untimed cycles, then times `ncycle` cycles without phase-ramp removal, with
-//! an LLK record every `calc_llk` cycles (0: none, as `scripts/compare_pynx.py --time` times
-//! PyNX, and `scripts/compare_pynx_ml.py --time` PyNX ML). `graph` replays steady-state AP,
+//! `engine_llk_trace` scan, and for each comma-separated size (frames per stack, or `default`
+//! for [`GpuOptions::stack_size`]'s; rPIE frames per batch) runs 5 untimed cycles, then times
+//! `ncycle` cycles without phase-ramp removal, with an LLK record every `calc_llk` cycles (0:
+//! none, as `scripts/compare_pynx.py --time` times PyNX, and `scripts/compare_pynx_ml.py
+//! --time` PyNX ML). `graph` replays steady-state AP,
 //! DM and ML cycles, rPIE epochs and LLK passes from the graphs the untimed cycles captured
 //! ([`GpuOptions::graph`]); `fused` runs AP and DM stacks, ML's gradients and the LLK pass by
 //! the fused passes, `m1` by M1's launches ([`GpuOptions::fused`]). ML updates object and
@@ -40,8 +41,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sizes = args.next().unwrap_or_else(|| "16".into());
     let sizes = sizes
         .split(',')
-        .map(str::parse)
-        .collect::<Result<Vec<usize>, _>>()?;
+        .map(|s| (s != "default").then(|| s.parse()).transpose())
+        .collect::<Result<Vec<Option<usize>>, _>>()?;
+    if algo == "rpie" && sizes.contains(&None) {
+        return Err(usage.into());
+    }
     let graph = match args.next().as_deref() {
         None | Some("graph") => true,
         Some("eager") => false,
@@ -96,7 +100,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         zero_phase_ramp: false,
     };
     for size in sizes {
-        let stack_size = if algo == "rpie" { 16 } else { size };
+        let stack_size = if algo == "rpie" { Some(16) } else { size };
         let options = GpuOptions {
             stack_size,
             graph,
@@ -106,7 +110,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut g = GpuPtycho::new(&ctx, &scan, object.clone(), probe.clone(), options)?;
         g.set_features(&want)?;
         let rpie = RpieParams {
-            batch_size: size,
+            batch_size: size.unwrap_or_default(),
             calc_llk,
             ..ptychi::RPIE
         };
@@ -127,7 +131,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mode = if graph { "graph" } else { "eager" };
         let passes = if fused { "fused" } else { "m1" };
         println!(
-            "{algo} size {size} {mode} {passes} calc_llk {calc_llk} features {features}: {ms:.3} ms/cycle over {ncycle} cycles, {} LLK records",
+            "{algo} size {} {mode} {passes} calc_llk {calc_llk} features {features}: {ms:.3} ms/cycle over {ncycle} cycles, {} LLK records",
+            size.map_or("default".into(), |n| n.to_string()),
             g.history().len()
         );
     }
