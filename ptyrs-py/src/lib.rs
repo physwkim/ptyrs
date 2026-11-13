@@ -10,8 +10,11 @@ mod cpu;
 mod gpu;
 
 use ::ptyrs::base::{C64, CoreError, Counts, Geometry, Positions, Stack};
-use ::ptyrs::engine::{BhStep, Cost, EngineError, Llk, LlkRecord, LsqmlStep};
-use numpy::{Element, PyArray1, PyArray3, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray3};
+use ::ptyrs::engine::{BhStep, Cost, EngineError, Features, Llk, LlkRecord, LsqmlStep};
+use numpy::{
+    Element, PyArray1, PyArray3, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2,
+    PyReadonlyArray3,
+};
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
@@ -195,6 +198,67 @@ fn bh_steps<'py>(py: Python<'py>, steps: &[BhStep]) -> PyResult<Bound<'py, PyLis
         Ok(d)
     });
     PyList::new(py, steps.collect::<PyResult<Vec<_>>>()?)
+}
+
+/// [`Features`] of `set_features`' keywords on `frame` (`[ny, nx]`) detector frames: `scale`
+/// `[nframe]`, `background` `[ny, nx]` in the counts' detector order and `position`
+/// `[nframe, 2]` offsets `[dy, dx]` in object pixels; each left out is not modelled. The
+/// engine checks the frame count and the values.
+fn features_in(
+    scale: Option<PyReadonlyArray1<'_, f64>>,
+    background: Option<PyReadonlyArray2<'_, f64>>,
+    position: Option<PyReadonlyArray2<'_, f64>>,
+    frame: [usize; 2],
+) -> PyResult<Features> {
+    let background = background
+        .map(|b| {
+            let b = b.as_array();
+            if b.dim() != frame.into() {
+                return Err(PyValueError::new_err(format!(
+                    "a background of {:?} for {frame:?} frames",
+                    b.shape()
+                )));
+            }
+            Ok(b.iter().copied().collect())
+        })
+        .transpose()?;
+    let position = position
+        .map(|d| {
+            let d = d.as_array();
+            if d.ncols() != 2 {
+                return Err(PyValueError::new_err(format!(
+                    "position offsets must be [nframe, 2], got {:?}",
+                    d.shape()
+                )));
+            }
+            Ok(d.rows().into_iter().map(|r| [r[0], r[1]]).collect())
+        })
+        .transpose()?;
+    Ok(Features {
+        scale: scale.map(|s| s.as_array().to_vec()),
+        background,
+        position,
+    })
+}
+
+/// `features` as a dict of `scale`, `background` and `position` in [`features_in`]'s shapes,
+/// `None` for each not modelled.
+fn features_out<'py>(
+    py: Python<'py>,
+    f: Features,
+    frame: [usize; 2],
+) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("scale", f.scale.map(|s| PyArray1::from_vec(py, s)))?;
+    let background = f
+        .background
+        .map(|b| PyArray1::from_vec(py, b).reshape(frame));
+    d.set_item("background", background.transpose()?)?;
+    let position = f
+        .position
+        .map(|p| PyArray1::from_vec(py, p.concat()).reshape([p.len(), 2]));
+    d.set_item("position", position.transpose()?)?;
+    Ok(d)
 }
 
 /// The engine's [`Llk`] as a dict of its fields.

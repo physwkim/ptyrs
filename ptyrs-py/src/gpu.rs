@@ -1,7 +1,7 @@
 //! The GPU engine ([`ptyrs::engine::GpuPtycho`]): AP, DM, RAAR, ML, rPIE, BH and LSQML in f32.
 
 use cuda_core::CudaContext;
-use numpy::{PyArray3, PyReadonlyArray3};
+use numpy::{PyArray3, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArray3};
 use ptyrs::base::{C64, Object, Probe};
 use ptyrs::engine::{BhParams, GpuOptions, LsqmlParams};
 use pyo3::prelude::*;
@@ -12,7 +12,11 @@ use crate::{Error, Scan, history, llk_dict, params, stack_in, stack_out};
 /// The GPU reconstruction state of a scan on CUDA device `device`; keywords are
 /// `GpuOptions` fields.
 #[pyclass(unsendable)]
-pub(crate) struct GpuPtycho(ptyrs::engine::GpuPtycho);
+pub(crate) struct GpuPtycho(
+    ptyrs::engine::GpuPtycho,
+    /// The scan's frame shape `[ny, nx]`, which the engine keeps on the device.
+    [usize; 2],
+);
 
 #[pymethods]
 impl GpuPtycho {
@@ -31,6 +35,7 @@ impl GpuPtycho {
         Ok(Self(
             ptyrs::engine::GpuPtycho::new(&ctx, &scan.0, object, probe, options)
                 .map_err(Error::from)?,
+            scan.0.counts.frame_shape(),
         ))
     }
 
@@ -127,6 +132,24 @@ impl GpuPtycho {
     /// The last LSQML epoch's steps as `Lsqml.epoch` returns them; none before an LSQML call.
     fn lsqml_steps<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
         crate::lsqml_steps(py, &self.0.lsqml_steps().map_err(Error::from)?)
+    }
+
+    /// As `Ptycho.set_features`, in `f32` on the device; with `fused=True` only.
+    #[pyo3(signature = (*, scale = None, background = None, position = None))]
+    fn set_features(
+        &mut self,
+        scale: Option<PyReadonlyArray1<'_, f64>>,
+        background: Option<PyReadonlyArray2<'_, f64>>,
+        position: Option<PyReadonlyArray2<'_, f64>>,
+    ) -> PyResult<()> {
+        let features = crate::features_in(scale, background, position, self.1)?;
+        Ok(self.0.set_features(&features).map_err(Error::from)?)
+    }
+
+    /// As `Ptycho.features`, read back from the device.
+    #[getter]
+    fn features<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        crate::features_out(py, self.0.features().map_err(Error::from)?, self.1)
     }
 
     #[getter]

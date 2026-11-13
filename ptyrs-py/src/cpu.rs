@@ -3,7 +3,10 @@
 
 use std::slice;
 
-use numpy::{PyArray1, PyArray3, PyArray4, PyArrayMethods, PyReadonlyArray3};
+use numpy::{
+    PyArray1, PyArray3, PyArray4, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2,
+    PyReadonlyArray3,
+};
 use ptyrs::base::{C64, Object, Probe};
 use ptyrs::engine::{Llk, Optics, ProbeVariation, llk, obj_probe_to_psi};
 use pyo3::exceptions::PyValueError;
@@ -124,6 +127,29 @@ impl Ptycho {
             .inner
             .rpie(&crate::rpie_params(params)?, nepoch)
             .map_err(Error::from)?)
+    }
+
+    /// Models and refines these features from here on, in place of the current ones:
+    /// `scale` `[nframe]`, `background` `[ny, nx]` in the counts' detector order and
+    /// `position` `[nframe, 2]` offsets `[dy, dx]` in object pixels from each view's corner;
+    /// each left out is not modelled. An error leaves the current ones.
+    #[pyo3(signature = (*, scale = None, background = None, position = None))]
+    fn set_features(
+        &mut self,
+        scale: Option<PyReadonlyArray1<'_, f64>>,
+        background: Option<PyReadonlyArray2<'_, f64>>,
+        position: Option<PyReadonlyArray2<'_, f64>>,
+    ) -> PyResult<()> {
+        let frame = self.inner.addr().frame_shape();
+        let features = crate::features_in(scale, background, position, frame)?;
+        Ok(self.inner.set_features(features).map_err(Error::from)?)
+    }
+
+    /// The features modelled as `set_features` takes them, `None` for each not modelled.
+    #[getter]
+    fn features<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let frame = self.inner.addr().frame_shape();
+        crate::features_out(py, self.inner.features().clone(), frame)
     }
 
     #[getter]
