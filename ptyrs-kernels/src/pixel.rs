@@ -229,6 +229,26 @@ pub struct PositionPartial {
 // SAFETY: repr(C) of two f32, no padding; every bit pattern is a valid value.
 unsafe impl cuda_core::DeviceCopy for PositionPartial {}
 
+/// `num / den`, bit for bit for every input. IEEE division takes an out-of-line slow path
+/// for a zero `num`, which zero counts make common; here it divides `2^-24` instead and
+/// `num * (2^-24 / den)` is exactly `0 / den`: signed zero, or NaN for a zero or NaN `den`
+/// (`2^-24` keeps the quotient finite for a subnormal `den`).
+#[device]
+pub fn zdiv(num: f32, den: f32) -> f32 {
+    let zero = num == 0.0;
+    let q = if zero { 5.9604645e-8 } else { num } / den;
+    if zero { num * q } else { q }
+}
+
+/// `x.sqrt()`, bit for bit for every input, without the out-of-line slow path that a zero
+/// `x` takes.
+#[device]
+pub fn zsqrt(x: f32) -> f32 {
+    let zero = x == 0.0;
+    let r = if zero { 1.0 } else { x }.sqrt();
+    if zero { x } else { r }
+}
+
 /// FFT-order frequency of bin `k` of `n` in cycles per pixel, `fftfreq`: `k / n` below
 /// `n / 2`, else `(k - n) / n`.
 #[device]
@@ -238,7 +258,7 @@ pub fn freq(k: u32, n: u32) -> f32 {
     } else {
         k as f32 - n as f32
     };
-    k / n as f32
+    zdiv(k, n as f32)
 }
 
 /// `exp(-2 pi i d freq(k, n))` as `(cos, sin)`: bin `k`'s factor of a shift by `d` pixels.
@@ -257,10 +277,18 @@ fn cos_sin_pi(x: f32) -> (f32, f32) {
     unsafe { (__nv_cospif(x), __nv_sinpif(x)) }
 }
 
+/// `a * b + c` rounded once, for a sum whose FMA nesting must not be left to contraction.
+#[device]
+pub fn fma(a: f32, b: f32, c: f32) -> f32 {
+    // SAFETY: libdevice function of three f32, no side effects.
+    unsafe { __nv_fmaf(a, b, c) }
+}
+
 #[device]
 unsafe extern "C" {
     fn __nv_cospif(x: f32) -> f32;
     fn __nv_sinpif(x: f32) -> f32;
+    fn __nv_fmaf(x: f32, y: f32, z: f32) -> f32;
 }
 
 /// Adds an unmasked pixel of count `obs` and calculated intensity `calc >= 0` to `acc`:
@@ -274,7 +302,7 @@ pub fn llk_add(acc: &mut LlkPartial, obs: f32, calc: f32) {
         calc - obs + obs * (obs / calc).ln()
     };
     acc.gaussian += (obs - calc) * (obs - calc) / (obs + 1.0);
-    let e = obs.sqrt() - calc.sqrt();
+    let e = zsqrt(obs) - calc.sqrt();
     acc.euclidean += 4.0 * e * e;
     acc.icalc += calc;
 }
