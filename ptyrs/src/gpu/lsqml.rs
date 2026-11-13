@@ -34,9 +34,9 @@ use ptyrs_kernels::lsqml::{
 };
 use ptyrs_kernels::pixel::PIXEL_THREADS;
 
-use crate::gpu::fused::{Shape, Side};
+use crate::gpu::fused::{GRID_Y_MAX, Shape, Side};
 use crate::gpu::ops::grid_1d;
-use crate::gpu::position::{GRID_Y_MAX, ONE_BLOCK, chunk_grid, chunks, same_dims, span};
+use crate::gpu::position::{ONE_BLOCK, chunk_grid, chunks, same_dims, span};
 use crate::gpu::{
     BhScan, C32, Error, Kernels, StackCtl, StackGeom, StackRef, UpdateSums, ViewAddr, ViewDims,
     Views, check_len, dptr,
@@ -665,7 +665,7 @@ impl ColsLaunch {
     fn new(d: &ViewDims, stack: StackRef<'_>, work: &DeviceBuffer<C32>) -> Result<Self, Error> {
         let (sh, g) = (Shape::of(d)?, d.geom(stack)?);
         check_len("work", work, g.nf_max as usize * d.nmode as usize * d.n())?;
-        if g.nf_max > GRID_Y_MAX {
+        if g.nf_max as u64 > GRID_Y_MAX {
             return Err(Error::Shape(format!("{} frames exceed grid y", g.nf_max)));
         }
         Ok(Self {
@@ -699,7 +699,6 @@ fn null_ptrs() -> FusedPtrs {
         offsets: std::ptr::null(),
         spectrum: std::ptr::null(),
         shift: std::ptr::null_mut(),
-        shift_dy: std::ptr::null_mut(),
         shift_obj: std::ptr::null_mut(),
         shift_power: std::ptr::null_mut(),
         shift_grad: std::ptr::null_mut(),

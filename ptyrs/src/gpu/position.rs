@@ -24,15 +24,12 @@ use ptyrs_kernels::pixel::PIXEL_THREADS;
 pub use ptyrs_kernels::position::PositionRule;
 use ptyrs_kernels::position::{BatchSpan, POSITION_SUMS, PositionSums, position_kernels};
 
-use crate::gpu::fused::{Shape, Side};
+use crate::gpu::fused::{GRID_Y_MAX, SMEM_MAX, Shape, Side};
 use crate::gpu::ops::grid_1d;
 use crate::gpu::{
     C32, EpochOrder, Error, Kernels, StackCtl, StackGeom, StackRef, ViewAddr, ViewDims, Views,
     check_len, dptr,
 };
-
-/// Most blocks along grid y.
-pub(super) const GRID_Y_MAX: u32 = 65535;
 
 /// The position kernels, bound to the module a [`Kernels`] loaded.
 #[derive(Clone, Debug)]
@@ -103,7 +100,7 @@ pub(super) fn chunks(n: usize) -> usize {
 
 /// One block of [`PIXEL_THREADS`] per chunk of each of the stack's frames.
 pub(super) fn chunk_grid(g: &StackGeom, n: usize) -> Result<LaunchConfig, Error> {
-    if g.nf_max > GRID_Y_MAX {
+    if g.nf_max as u64 > GRID_Y_MAX {
         return Err(Error::Shape(format!("{} frames exceed grid y", g.nf_max)));
     }
     Ok(LaunchConfig {
@@ -119,9 +116,6 @@ pub(super) const ONE_BLOCK: LaunchConfig = LaunchConfig {
     block_dim: (PIXEL_THREADS, 1, 1),
     shared_mem_bytes: 0,
 };
-
-/// Dynamic shared memory a launch may take without opting in.
-const SMEM_MAX: u32 = 48 * 1024;
 
 /// `bytes` of dynamic shared memory, if a block may take them.
 fn smem(bytes: u32) -> Result<u32, Error> {
@@ -155,7 +149,7 @@ impl PositionKernels {
     ) -> Result<(), Error> {
         let (sh, g) = (Shape::of(dims)?, dims.geom(stack)?);
         let planes = g.nf_max as u64 * g.nprobe as u64;
-        if planes > GRID_Y_MAX as u64 {
+        if planes > GRID_Y_MAX {
             return Err(Error::Shape(format!("{planes} planes exceed grid y")));
         }
         check_len("t", t, planes as usize * dims.n())?;
@@ -240,7 +234,7 @@ impl PositionKernels {
     ) -> Result<(), Error> {
         let d = views.dims();
         let (sh, g) = (Shape::of(d)?, d.geom(stack)?);
-        if g.nf_max > GRID_Y_MAX {
+        if g.nf_max as u64 > GRID_Y_MAX {
             return Err(Error::Shape(format!("{} frames exceed grid y", g.nf_max)));
         }
         let reads = [obj.storage(), views.addr().storage(), stack.storage()];
