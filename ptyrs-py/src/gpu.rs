@@ -98,6 +98,11 @@ impl GpuPtycho {
         Ok(self.0.bh(&params, nepoch, calc_llk).map_err(Error::from)?)
     }
 
+    /// The last BH epoch's steps as `Bh.epoch` returns them; none before a BH call.
+    fn bh_steps<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        crate::bh_steps(py, &self.0.bh_steps().map_err(Error::from)?)
+    }
+
     /// `nepoch` LSQML epochs from a fresh LSQML (`cost` `"amplitude"` or `"poisson"`), an LLK
     /// record every `calc_llk` epochs and after the last.
     fn lsqml(

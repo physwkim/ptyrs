@@ -246,16 +246,7 @@ impl Bh {
         let steps = self
             .0
             .epoch(p.addr(), p.observed(), &ptycho.optics, objects, &mut probe);
-        let steps = steps.iter().map(|s| {
-            let d = PyDict::new(py);
-            d.set_item("frames", PyArray1::from_slice(py, &s.frames))?;
-            d.set_item("beta", s.beta)?;
-            d.set_item("alpha", s.alpha)?;
-            d.set_item("top", s.top)?;
-            d.set_item("bottom", s.bottom)?;
-            Ok(d)
-        });
-        let steps = PyList::new(py, steps.collect::<PyResult<Vec<_>>>()?)?;
+        let steps = crate::bh_steps(py, &steps)?;
         Ok((stack_out(py, object.0)?, stack_out(py, probe.0)?, steps))
     }
 }

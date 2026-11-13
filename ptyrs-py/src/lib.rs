@@ -10,7 +10,7 @@ mod cpu;
 mod gpu;
 
 use ::ptyrs::base::{C64, CoreError, Counts, Geometry, Positions, Stack};
-use ::ptyrs::engine::{Cost, EngineError, Llk, LlkRecord, LsqmlStep};
+use ::ptyrs::engine::{BhStep, Cost, EngineError, Llk, LlkRecord, LsqmlStep};
 use numpy::{Element, PyArray1, PyArray3, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray3};
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
@@ -178,6 +178,20 @@ fn lsqml_steps<'py>(py: Python<'py>, steps: &[LsqmlStep]) -> PyResult<Bound<'py,
         // the far-field model has one object slice
         d.set_item("a_obj", PyArray1::from_slice(py, &s.a_obj[0]))?;
         d.set_item("a_probe", PyArray1::from_slice(py, &s.a_probe))?;
+        Ok(d)
+    });
+    PyList::new(py, steps.collect::<PyResult<Vec<_>>>()?)
+}
+
+/// BH steps as dicts of `frames`, `beta`, `alpha`, `top` and `bottom`.
+fn bh_steps<'py>(py: Python<'py>, steps: &[BhStep]) -> PyResult<Bound<'py, PyList>> {
+    let steps = steps.iter().map(|s| {
+        let d = PyDict::new(py);
+        d.set_item("frames", PyArray1::from_slice(py, &s.frames))?;
+        d.set_item("beta", s.beta)?;
+        d.set_item("alpha", s.alpha)?;
+        d.set_item("top", s.top)?;
+        d.set_item("bottom", s.bottom)?;
         Ok(d)
     });
     PyList::new(py, steps.collect::<PyResult<Vec<_>>>()?)
