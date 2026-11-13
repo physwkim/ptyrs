@@ -544,17 +544,19 @@ pub unsafe fn cols<const NY: u32, const TERMS: u32>(
             let hi = if sums { 7 } else { 4 };
             let ns = nslot as usize;
             if m == 0 {
-                let terms = [
-                    acc.poisson,
-                    acc.gaussian,
-                    acc.euclidean,
-                    acc.icalc,
-                    sacc.intensity,
-                    sacc.ratio,
-                    sacc.amplitude,
-                ];
-                for (j, &t) in terms.iter().enumerate().take(hi).skip(lo) {
-                    *slots.add(j * ns + tid as usize) = t;
+                // One store per term: an array indexed by the runtime `lo..hi` lives in
+                // local memory.
+                let s = slots.add(tid as usize);
+                if llk {
+                    *s = acc.poisson;
+                    *s.add(ns) = acc.gaussian;
+                    *s.add(2 * ns) = acc.euclidean;
+                    *s.add(3 * ns) = acc.icalc;
+                }
+                if sums {
+                    *s.add(4 * ns) = sacc.intensity;
+                    *s.add(5 * ns) = sacc.ratio;
+                    *s.add(6 * ns) = sacc.amplitude;
                 }
             }
             let mut half = nslot / 2;
