@@ -1,6 +1,6 @@
 //! The CPU engine's results the Python tests compare the bindings against, run here on the
-//! engine itself: `engine_reference <dir>` writes `<dir>/opr.h5`, h5py-readable (complex as
-//! `{r, i}`); `scripts/build.sh` runs it into the module's directory.
+//! engine itself: `engine_reference <dir>` writes `<dir>/opr.h5` and `<dir>/near.h5`,
+//! h5py-readable (complex as `{r, i}`); `scripts/build.sh` runs it into the module's directory.
 //!
 //! `opr.h5` holds a simulated far-field scan (`counts`, raw `y` and `x`, the geometry as root
 //! attributes), its `positions` `[nframe, 2]` as the views read them at the object `pixel`,
@@ -10,15 +10,26 @@
 //! run) `intensity`, then for each epoch `e` of [`NEPOCH`] a group `epoch<e>` of the arrays it
 //! left (`object` `[nslice, nobj, nyo, nxo]`) and its steps, every batch's `frames`, `a_far`, `a_obj` (`[nslice, nframe]`) and
 //! `a_probe` concatenated and `batch_len`.
+//!
+//! `near.h5` holds a scan simulated through pty-chi's planar near field ([`Optics::free_space`]
+//! of the `wavelength`, `wave_pixel` and `distance` it names, `exit` `"free_space"`): its
+//! `counts`, `positions` at the object `pixel` and start `object` (`[nslice, nobj, nyo, nxo]`)
+//! and `probe`, then an `lsqml` and a `bh` group of [`NEPOCH`] epochs from that start, their
+//! parameters as attributes and each epoch's groups as in `opr.h5`, BH's steps as `frames`,
+//! `beta`, `alpha`, `top`, `bottom` and `batch_len`.
 
 use std::error::Error;
 use std::path::Path;
 use std::slice;
 
-use ptyrs::base::sim::{fermat, object, probe};
-use ptyrs::base::{C64, Geometry, Object, Stack, required_obj_shape};
+use ptyrs::base::required_obj_shape;
+use ptyrs::base::sim::{fermat, object, poisson, probe};
+use ptyrs::base::{AddrTable, C64, Counts, Geometry, Object, Positions, Probe, Stack};
 use ptyrs::engine::sim::simulate;
-use ptyrs::engine::{Cost, Lsqml, LsqmlParams, Optics, ProbeVariation, Ptycho};
+use ptyrs::engine::{
+    Bh, BhParams, Cost, Lsqml, LsqmlParams, Observed, Optics, ProbeVariation, Ptycho, SliceWaves,
+    Wavefield, shift,
+};
 use rust_hdf5::{Complex64, H5File, H5Group, H5Type};
 
 const NEPOCH: usize = 3;
@@ -196,9 +207,188 @@ fn opr(path: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// Counts of `objects` and `probe` through `optics` at `addr`'s views, in detector order,
+/// Poisson-drawn with `seed` from intensities scaled to `photons` per frame on average, and
+/// that scale.
+fn draw(
+    addr: &AddrTable,
+    optics: &Optics,
+    objects: &[Object],
+    probe: &Probe,
+    photons: f64,
+    seed: u64,
+) -> Result<(Counts, f64), Box<dyn Error>> {
+    let mut psi = SliceWaves::new(optics, addr.views(), objects, probe)
+        .psi()
+        .to_vec();
+    optics.propagator().forward(&mut psi);
+    let ([ny, nx], nframe, nmode) = (addr.frame_shape(), addr.nframe(), addr.nmode());
+    let n = ny * nx;
+    let mut intensity: Vec<f64> = psi
+        .chunks_exact(nmode * n)
+        .flat_map(|block| {
+            (0..n).map(move |i| {
+                let j = shift(i, ny, nx);
+                (0..nmode).map(|m| block[m * n + j].norm_sqr()).sum::<f64>()
+            })
+        })
+        .collect();
+    let scale = photons / (intensity.iter().sum::<f64>() / nframe as f64);
+    intensity.iter_mut().for_each(|v| *v *= scale);
+    Ok((poisson([nframe, ny, nx], &intensity, None, seed)?, scale))
+}
+
+/// The scan `truth` draws through `optics` at `positions` (at the object `pixel`), and LSQML
+/// and BH runs from flat object slices and the truth's probe at the counts' scale, into
+/// `root` as `near.h5` lays them out.
+fn optics_runs(
+    root: &H5Group,
+    optics: &Optics,
+    positions: &Positions,
+    pixel: [f64; 2],
+    truth: (&[Object], &Probe),
+) -> Result<(), Box<dyn Error>> {
+    let (objects, probe) = truth;
+    let shape = objects[0].plane_shape();
+    let frame = probe.plane_shape();
+    let addr = AddrTable::new(positions, pixel, frame, shape, probe.nmode(), 1)?;
+    let (counts, scale) = draw(&addr, optics, objects, probe, 2e5, 3)?;
+    let obs = Observed::from_counts(&counts);
+    let nframe = addr.nframe();
+    write(root, "counts", &counts.dims(), counts.as_slice())?;
+    let yx: Vec<f64> = positions
+        .y
+        .iter()
+        .zip(&positions.x)
+        .flat_map(|(y, x)| [*y, *x])
+        .collect();
+    write(root, "positions", &[nframe, 2], &yx)?;
+    write(root, "pixel", &[2], &pixel)?;
+    let flat = Object::new(Stack::from_vec(
+        [1, shape[0], shape[1]],
+        vec![C64::new(1.0, 0.0); shape[0] * shape[1]],
+    )?);
+    let start = vec![flat; optics.nslice()];
+    let r = scale.sqrt();
+    let p0 = Probe::new(Stack::from_vec(
+        probe.dims(),
+        probe.as_slice().iter().map(|c| c * r).collect(),
+    )?);
+    write_objects(root, "object", &start)?;
+    write_stack(root, "probe", &p0.0)?;
+
+    let params = LsqmlParams {
+        batch_size: 5,
+        cost: Cost::Poisson,
+        seed: 7,
+    };
+    let group = root.create_group("lsqml")?;
+    group.set_attr_string("cost", "poisson")?;
+    group.set_attr_numeric("batch_size", &(params.batch_size as u64))?;
+    group.set_attr_numeric("seed", &params.seed)?;
+    let (mut objects, mut probe) = (start.clone(), p0.clone());
+    let mut lsqml = Lsqml::new(params);
+    let mut none = ProbeVariation::none(frame);
+    for e in 1..=NEPOCH {
+        let steps = lsqml.epoch(&addr, &obs, optics, &mut objects, &mut probe, &mut none);
+        let at = group.create_group(&format!("epoch{e}"))?;
+        write_objects(&at, "object", &objects)?;
+        write_stack(&at, "probe", &probe.0)?;
+        let cat = |f: fn(&ptyrs::engine::LsqmlStep) -> &[f64]| -> Vec<f64> {
+            steps.iter().flat_map(|s| f(s).iter().copied()).collect()
+        };
+        let frames: Vec<u64> = steps
+            .iter()
+            .flat_map(|s| s.frames.iter().map(|&f| f as u64))
+            .collect();
+        write(&at, "frames", &[nframe], &frames)?;
+        write(&at, "a_far", &[nframe], &cat(|s| &s.a_far))?;
+        let a_obj: Vec<f64> = (0..optics.nslice())
+            .flat_map(|j| steps.iter().flat_map(move |s| s.a_obj[j].iter().copied()))
+            .collect();
+        write(&at, "a_obj", &[optics.nslice(), nframe], &a_obj)?;
+        write(&at, "a_probe", &[nframe], &cat(|s| &s.a_probe))?;
+        let len: Vec<u64> = steps.iter().map(|s| s.frames.len() as u64).collect();
+        write(&at, "batch_len", &[len.len()], &len)?;
+    }
+
+    let params = BhParams {
+        batch_size: 5,
+        probe_rho: 0.01,
+        position_rho: 0.1,
+        seed: 7,
+    };
+    let group = root.create_group("bh")?;
+    group.set_attr_numeric("batch_size", &(params.batch_size as u64))?;
+    group.set_attr_numeric("probe_rho", &params.probe_rho)?;
+    group.set_attr_numeric("seed", &params.seed)?;
+    let (mut objects, mut probe) = (start, p0);
+    let mut bh = Bh::new(params);
+    for e in 1..=NEPOCH {
+        let steps = bh.epoch(&addr, &obs, optics, &mut objects, &mut probe);
+        let at = group.create_group(&format!("epoch{e}"))?;
+        write_objects(&at, "object", &objects)?;
+        write_stack(&at, "probe", &probe.0)?;
+        let frames: Vec<u64> = steps
+            .iter()
+            .flat_map(|s| s.frames.iter().map(|&f| f as u64))
+            .collect();
+        write(&at, "frames", &[nframe], &frames)?;
+        let nbatch = steps.len();
+        write(
+            &at,
+            "beta",
+            &[nbatch],
+            &steps.iter().map(|s| s.beta).collect::<Vec<_>>(),
+        )?;
+        write(
+            &at,
+            "alpha",
+            &[nbatch],
+            &steps.iter().map(|s| s.alpha).collect::<Vec<_>>(),
+        )?;
+        write(
+            &at,
+            "top",
+            &[nbatch],
+            &steps.iter().map(|s| s.top).collect::<Vec<_>>(),
+        )?;
+        write(
+            &at,
+            "bottom",
+            &[nbatch],
+            &steps.iter().map(|s| s.bottom).collect::<Vec<_>>(),
+        )?;
+        let len: Vec<u64> = steps.iter().map(|s| s.frames.len() as u64).collect();
+        write(&at, "batch_len", &[nbatch], &len)?;
+    }
+    Ok(())
+}
+
+/// pty-chi's planar near field at an angular-spectrum distance.
+fn near(path: &Path) -> Result<(), Box<dyn Error>> {
+    let frame = [32, 32];
+    let (wavelength, pixel, distance) = (1e-10, [5e-8, 5e-8], 5e-4);
+    let w = Wavefield::new(frame, wavelength, pixel, distance)?;
+    let positions = fermat(20, 3.0 * pixel[1]);
+    let shape = required_obj_shape(&positions, pixel, frame, 0);
+    let f = H5File::create(path)?;
+    let root = f.root_group();
+    root.set_attr_string("exit", "free_space")?;
+    root.set_attr_numeric("wavelength", &wavelength)?;
+    root.set_attr_numeric("distance", &distance)?;
+    write(&root, "wave_pixel", &[2], &pixel)?;
+    let truth = (&[object(shape)][..], &probe(frame, 2)?);
+    optics_runs(&root, &Optics::free_space(&w), &positions, pixel, truth)?;
+    f.close()?;
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let dir = std::env::args()
         .nth(1)
         .ok_or("usage: engine_reference <dir>")?;
-    opr(&Path::new(&dir).join("opr.h5"))
+    let dir = Path::new(&dir);
+    opr(&dir.join("opr.h5"))?;
+    near(&dir.join("near.h5"))
 }
