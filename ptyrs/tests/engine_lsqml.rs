@@ -149,7 +149,8 @@ fn directions_match_central_differences() {
             batch_size: FRAMES.len(),
             cost,
             seed: 0,
-        });
+        })
+        .unwrap();
         let b = LsqmlBatch::new(
             &run,
             batch(&p, FRAMES),
@@ -199,7 +200,7 @@ fn assert_ref(cost: Cost, obj: &str, probe: &str, steps: &str) {
         cost,
         seed: 0,
     };
-    let s = Lsqml::new(params).with_preconditioner(pre).step(
+    let s = Lsqml::new(params).unwrap().with_preconditioner(pre).step(
         batch(&p, FRAMES),
         p.observed(),
         &optics,
@@ -286,7 +287,8 @@ fn assert_epochs_ref(cost: Cost, obj: &str, probe: &str, steps: &str) {
         batch_size: 16,
         cost,
         seed: 7,
-    });
+    })
+    .unwrap();
     let rows = table(steps);
     let mut next = 0;
     for e in 0..3 {
@@ -352,7 +354,8 @@ fn epoch_follows_ptychi_preconditioner_schedule() {
         batch_size: 20,
         cost: Cost::Poisson,
         seed: 7,
-    });
+    })
+    .unwrap();
     assert!(lsqml.preconditioner().is_none());
     let (mut object, mut pr) = (p.object().clone(), p.probe().clone());
     let mut seed = 0x9e37_79b9_7f4a_7c15;

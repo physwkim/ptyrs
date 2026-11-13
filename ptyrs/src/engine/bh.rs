@@ -43,6 +43,16 @@ pub struct BhParams {
     pub seed: u64,
 }
 
+impl BhParams {
+    /// The check every BH run makes of its params, on the CPU and the GPU: a batch has frames.
+    pub(crate) fn validate(&self) -> Result<(), EngineError> {
+        if self.batch_size == 0 {
+            return Err(EngineError::Invalid("BH batch_size must be >= 1".into()));
+        }
+        Ok(())
+    }
+}
+
 /// One batch's step, as pty-chi computes it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct BhStep {
@@ -367,14 +377,15 @@ pub struct Bh {
 }
 
 impl Bh {
-    pub fn new(params: BhParams) -> Self {
-        assert!(params.batch_size > 0, "batch_size must be positive");
-        Self {
+    /// A run from its first epoch, `Err` on a `batch_size` of 0.
+    pub fn new(params: BhParams) -> Result<Self, EngineError> {
+        params.validate()?;
+        Ok(Self {
             params,
             features: Features::default(),
             epochs: 0,
             prev: None,
-        }
+        })
     }
 
     /// This run modelling and refining `features`, which hold one entry per frame of the scan

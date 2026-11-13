@@ -154,6 +154,17 @@ pub struct RpieParams {
     pub calc_llk: usize,
 }
 
+impl RpieParams {
+    /// The check every rPIE run makes of its params, on the CPU and the GPU: a batch has
+    /// frames.
+    pub(crate) fn validate(&self) -> Result<(), EngineError> {
+        if self.batch_size == 0 {
+            return Err(EngineError::Invalid("rPIE batch_size must be >= 1".into()));
+        }
+        Ok(())
+    }
+}
+
 impl Default for RpieParams {
     fn default() -> Self {
         Self {
@@ -754,9 +765,7 @@ impl Ptycho {
                 "rPIE needs exactly one object mode".into(),
             ));
         }
-        if params.batch_size == 0 {
-            return Err(EngineError::Invalid("rPIE batch_size must be >= 1".into()));
-        }
+        params.validate()?;
         if self.features.scale.is_some() || self.features.background.is_some() {
             return Err(EngineError::Invalid(
                 "rPIE models no intensity scale or background".into(),

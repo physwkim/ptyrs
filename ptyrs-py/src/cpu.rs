@@ -190,13 +190,14 @@ impl Lsqml {
                 )));
             }
         };
-        Ok(Self(ptyrs::engine::Lsqml::new(
-            ptyrs::engine::LsqmlParams {
+        Ok(Self(
+            ptyrs::engine::Lsqml::new(ptyrs::engine::LsqmlParams {
                 batch_size,
                 cost,
                 seed,
-            },
-        )))
+            })
+            .map_err(Error::from)?,
+        ))
     }
 
     /// One epoch over `ptycho`'s scan from `object` and `probe`, without probe variation;
@@ -240,13 +241,16 @@ pub(crate) struct Bh(ptyrs::engine::Bh);
 #[pymethods]
 impl Bh {
     #[new]
-    fn new(batch_size: usize, probe_rho: f64, seed: u64) -> Self {
-        Self(ptyrs::engine::Bh::new(ptyrs::engine::BhParams {
-            batch_size,
-            probe_rho,
-            position_rho: 0.1,
-            seed,
-        }))
+    fn new(batch_size: usize, probe_rho: f64, seed: u64) -> PyResult<Self> {
+        Ok(Self(
+            ptyrs::engine::Bh::new(ptyrs::engine::BhParams {
+                batch_size,
+                probe_rho,
+                position_rho: 0.1,
+                seed,
+            })
+            .map_err(Error::from)?,
+        ))
     }
 
     /// One epoch over `ptycho`'s scan from `object` and `probe`; returns the new object and

@@ -277,7 +277,7 @@ fn step(
         cost,
         seed: 0,
     };
-    let s = Lsqml::new(params).with_preconditioner(pre).step(
+    let s = Lsqml::new(params).unwrap().with_preconditioner(pre).step(
         &views,
         p.observed(),
         optics,

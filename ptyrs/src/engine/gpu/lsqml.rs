@@ -8,14 +8,18 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use crate::gpu::{
-    BhScan, C32, EpochOrder, Error as GpuError, FusedInputs, Kernels, LSQML_REC, LsqmlAt, LsqmlChi,
-    LsqmlKernels, LsqmlNoise, LsqmlScan, LsqmlVar, Model, PositionRule, PsiSums, StackTable, Views,
+    BhScan, C32, EpochOrder, Error as GpuError, FusedBufs, FusedInputs, Kernels, LSQML_REC,
+    LsqmlAt, LsqmlChi, LsqmlKernels, LsqmlNoise, LsqmlScan, LsqmlVar, Model, PositionRule, PsiSums,
+    StackTable, Views,
 };
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaStream, DeviceBuffer};
 
 use super::device::{Moved, MovedLent, PassesMut, moved_inputs, moved_shift};
-use super::{Bufs, Frames, GpuPtycho, batch_stacks, plane_len, stack_buf_len};
+use super::{
+    Bufs, Cut, Frames, GpuPtycho, StackRule, Streamed, batch_stacks, plane_bytes, plane_len,
+    wave_bytes,
+};
 use crate::engine::features::{POSITION_LIMIT, POSITION_STEP};
 use crate::engine::ptycho::{Algorithm, llk_due};
 use crate::engine::{Cost, EngineError, LsqmlParams, LsqmlStep, random_batches};
@@ -50,9 +54,7 @@ impl GpuPtycho {
         nepoch: usize,
         calc_llk: usize,
     ) -> Result<(), EngineError> {
-        if params.batch_size == 0 {
-            return Err(EngineError::Invalid("LSQML batch_size must be >= 1".into()));
-        }
+        params.validate()?;
         if self.dev.has_stepped() {
             return Err(EngineError::Invalid(
                 "LSQML refines no intensity scale or background, as pty-chi's".into(),
@@ -93,7 +95,7 @@ pub(super) struct LsqmlState {
     size: u32,
     /// Each batch's range of `stacks`.
     batches: Vec<Range<usize>>,
-    /// The batches cut into stacks as long as the device's wide ones, one table entry each.
+    /// The batches cut into stacks by the bytes a stack's passes touch, one table entry each.
     stacks: Vec<Frames>,
     table: StackTable,
     /// A batch's row transforms, then exit-wave updates, one per stack of a batch.
@@ -121,19 +123,41 @@ pub(super) struct LsqmlBufs<'a> {
 }
 
 impl LsqmlState {
-    /// For `views` in batches of `size` frames cut into stacks of `stack_size`, `moved` under
-    /// the position model; the epoch order is the scan's.
+    /// For `views` in batches of `size` frames, each cut into stacks by `rule`; under the
+    /// position model, `scratch` holds the frames per stack of the shared scratch, whose shift
+    /// planes its sums borrow, which caps its stacks. The epoch order is the scan's.
     pub(super) fn new(
         stream: &Arc<CudaStream>,
         kernels: &Kernels,
         views: &Views,
         size: u32,
-        stack_size: u32,
-        moved: bool,
+        rule: StackRule,
+        scratch: Option<u32>,
     ) -> Result<Self, EngineError> {
         let dims = views.dims();
-        let ((stacks, table, _), batches) = batch_stacks(stream, dims, size, stack_size)?;
-        let len = stack_buf_len(dims, &table);
+        // work: the forward pass, `chi`, the update sums, `dots`; icalc: `icalc` and `far`;
+        // under the position also the moved probes (`shifted_rows_fwd`, `shift_w`, `dots`)
+        // and the shift planes of the shared scratch, which `shifted_psi_sums` writes and
+        // reads.
+        let mut streamed = vec![
+            Streamed::new(wave_bytes(dims), 3),
+            Streamed::new(plane_bytes::<f32>(dims, 1), 2),
+        ];
+        if scratch.is_some() {
+            streamed.extend([
+                Streamed::new(plane_bytes::<C32>(dims, dims.nprobe), 3),
+                Streamed::new(FusedBufs::shift_bytes(dims), 2),
+            ]);
+        }
+        let frames = rule.frames(&streamed)?;
+        let frames = scratch.map_or(frames, |s| frames.min(s));
+        let (cut, batches) = batch_stacks(stream, dims, size, frames)?;
+        let len = cut.wave_len(dims);
+        let Cut {
+            frames: stacks,
+            table,
+            ..
+        } = cut;
         let nf_max = table.nf_max();
         let icalc_len = nf_max as usize * plane_len(dims);
         let slots = batches.iter().map(|b| b.len()).max().unwrap_or(0);
@@ -142,9 +166,9 @@ impl LsqmlState {
                 .map(|_| DeviceBuffer::zeroed(stream, len))
                 .collect::<Result<_, _>>()?)
         };
-        let moved = match moved {
-            true => Some(Moved::new(stream, kernels, dims, nf_max, slots)?),
-            false => None,
+        let moved = match scratch {
+            Some(_) => Some(Moved::new(stream, kernels, dims, nf_max, slots)?),
+            None => None,
         };
         Ok(Self {
             kernels: LsqmlKernels::load(kernels)?,

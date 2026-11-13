@@ -161,7 +161,8 @@ fn assert_ref(batch_size: usize, steps: &str, obj: &str, probe: &str) {
         probe_rho: 0.01,
         position_rho: 0.1,
         seed: 7,
-    });
+    })
+    .unwrap();
     let (mut object, mut pr) = (p.object().clone(), p.probe().clone());
     let mut got = Vec::new();
     let mut changes = Vec::new();
