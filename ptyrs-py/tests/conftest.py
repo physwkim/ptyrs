@@ -33,6 +33,13 @@ def rel(a, b):
     return np.where(b == 0, np.abs(a), np.abs(a - b) / np.where(b == 0, 1, np.abs(b)))
 
 
+def intensity(ptycho, obj, probe):
+    """`ptycho`'s model intensity of `obj` and `probe`, `[nframe, ny, nx]` in the counts'
+    detector order (zero frequency at the centre; `forward` has it at `[0, 0]`)."""
+    icalc = (np.abs(ptycho.forward(obj, probe)) ** 2).sum(axis=1)
+    return np.fft.fftshift(icalc, axes=(-2, -1))
+
+
 def make_scenario(n=64, npos=30, nprobe=2, photons=2e5, seed=3):
     """A far-field scan of `npos` Fermat-spiral frames of `n` pixels drawn from a smooth object
     and `nprobe` Gaussian probe modes, Poisson counts with row 3 and column 20 masked, and a
@@ -56,7 +63,7 @@ def make_scenario(n=64, npos=30, nprobe=2, photons=2e5, seed=3):
 
     zeros = np.zeros((npos, n, n))
     model = ptyrs.Ptycho(ptyrs.Scan(zeros, y, x, WAVELENGTH, DISTANCE, DETECTOR_PIXEL), obj, probe)
-    icalc = (np.abs(model.forward(obj, probe)) ** 2).sum(axis=1)
+    icalc = intensity(model, obj, probe)
     k = photons / icalc.sum(axis=(1, 2)).mean()
     counts = rng.poisson(icalc * k).clip(0, 65534).astype(np.uint16)
     counts[:, 3, :] = 65535
@@ -67,8 +74,7 @@ def make_scenario(n=64, npos=30, nprobe=2, photons=2e5, seed=3):
     start_probe = probe * np.exp(-0.5j * (u ** 2 + v ** 2))
     # the model's photons on the unmasked pixels to the counts'
     keep = counts != 65535
-    calc = (np.abs(ptyrs.Ptycho(scan, start_obj, start_probe).forward(start_obj, start_probe))
-            ** 2).sum(axis=1)
+    calc = intensity(ptyrs.Ptycho(scan, start_obj, start_probe), start_obj, start_probe)
     start_probe *= np.sqrt(counts[keep].sum(dtype=np.float64) / calc[keep].sum())
     return scan, start_obj, start_probe, npos
 
