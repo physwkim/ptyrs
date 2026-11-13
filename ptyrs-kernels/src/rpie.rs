@@ -68,6 +68,45 @@ pub mod rpie_kernels {
         }
     }
 
+    /// Exit waves of each frame's own probe: `psi[kl, j] = O_v(y, x) * w[fl * nprobe +
+    /// v.probe, j]` for every view `v = views[f0 * nmode + kl]` of the stack, `fl = kl /
+    /// nmode`, `j = psi_index(y, x)`, `O_v` sampled as `obj_probe_to_psi` samples it. `w`
+    /// holds the probe modes of each frame in the exit waves' layout, the quadratic phase
+    /// included; the product is the fused shifted row pass's. One thread per element of
+    /// `[nf_max * nmode, ny, nx]`, in stored order.
+    ///
+    /// # Safety
+    ///
+    /// `obj` `[nobj, nyo, nxo]`, `w` `[nf_max * nprobe, ny, nx]`, `views` `nframe * nmode`
+    /// records in range for those shapes, `psi` `[nf_max * nmode, ny, nx]`, `ctl` one entry.
+    #[kernel]
+    pub unsafe fn rpie_obj_wave_to_psi(
+        obj: *const f32,
+        w: *const f32,
+        views: *const ViewAddr,
+        psi: *mut f32,
+        ctl: *const StackCtl,
+        g: StackGeom,
+    ) {
+        let (f0, nf) = unsafe { stack_frames(ctl, g) };
+        let (ny, nx) = (g.ny, g.nx);
+        let n = ny as usize * nx as usize;
+        let t = global_index();
+        if t >= nf as usize * g.nmode as usize * n {
+            return;
+        }
+        let (kl, j) = (t / n, t % n);
+        // Natural pixel stored at `j` (the shift is its own inverse).
+        let y = ((j / nx as usize) as u32 + ny / 2) % ny;
+        let x = ((j % nx as usize) as u32 + nx / 2) % nx;
+        unsafe {
+            let v = *views.add(f0 as usize * g.nmode as usize + kl);
+            let plane = kl / g.nmode as usize * g.nprobe as usize + v.probe as usize;
+            let o = sample_obj(obj, v, y, x, g.nyo, g.nxo);
+            store_c(psi, t, cmul(o, load_c(w, plane * n + j)));
+        }
+    }
+
     /// `chunks[b * nchunk + c] = max(0, max_i sum_{m < nsum} |x[(b * nsum + m) * n + i]|^2)`
     /// over `i` in chunk `c = blockIdx.x`, `c * POWER_CHUNK .. min((c + 1) * POWER_CHUNK,
     /// n)`, of group `b = blockIdx.y` of `nsum` planes, `nchunk = ceil(n / POWER_CHUNK)`;

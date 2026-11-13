@@ -83,6 +83,7 @@ impl GpuPtycho {
         let params = BhParams {
             batch_size,
             probe_rho,
+            position_rho: 0.1,
             seed,
         };
         Ok(self.0.bh(&params, nepoch, calc_llk).map_err(Error::from)?)

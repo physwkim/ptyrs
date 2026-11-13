@@ -2,20 +2,19 @@
 //! probe modes and no probe variation, in the call sequence of `crate::gpu::LsqmlKernels`:
 //! the exit waves through the fused row passes around LSQML's column pass, the step sizes
 //! and every frame's `a_far` kept on the device. Under the position model the probe moves by
-//! each frame's offsets, and each batch steps its frames' offsets after the update.
+//! each frame's offsets, and each batch steps its frames' offsets after its passes.
 
 use std::ops::Range;
 use std::sync::Arc;
 
 use crate::gpu::{
-    BhScan, C32, EpochOrder, Error as GpuError, FusedBufs, FusedInputs, Kernels, LSQML_REC,
-    LsqmlAt, LsqmlChi, LsqmlKernels, LsqmlNoise, LsqmlScan, LsqmlVar, Model, PositionKernels,
-    PositionRule, Positions, PsiSums, Shift, ShiftedProbeSums, SpectrumBuf, StackTable, Views,
+    BhScan, C32, EpochOrder, Error as GpuError, FusedInputs, Kernels, LSQML_REC, LsqmlAt, LsqmlChi,
+    LsqmlKernels, LsqmlNoise, LsqmlScan, LsqmlVar, Model, PositionRule, PsiSums, StackTable, Views,
 };
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaStream, DeviceBuffer};
 
-use super::device::{FeaturesMut, PassesMut};
+use super::device::{Moved, MovedLent, PassesMut, moved_inputs, moved_shift};
 use super::{Bufs, Frames, GpuPtycho, batch_stacks, plane_len, stack_buf_len};
 use crate::engine::features::{POSITION_LIMIT, POSITION_STEP};
 use crate::engine::ptycho::{Algorithm, llk_due};
@@ -108,14 +107,6 @@ pub(super) struct LsqmlState {
     moved: Option<Moved>,
 }
 
-/// LSQML's state under the position model: a batch's moved probes, one per stack, the
-/// positions and their kernels.
-struct Moved {
-    w: Vec<DeviceBuffer<C32>>,
-    pos: Positions,
-    kernels: PositionKernels,
-}
-
 /// An [`LsqmlState`] lent to an epoch.
 pub(super) struct LsqmlBufs<'a> {
     kernels: &'a LsqmlKernels,
@@ -127,76 +118,6 @@ pub(super) struct LsqmlBufs<'a> {
     order: &'a EpochOrder,
     scan: &'a mut LsqmlScan,
     moved: Option<&'a mut Moved>,
-}
-
-/// The position model lent to one LSQML batch: the device's position buffers, the fused
-/// passes' scratch and LSQML's own [`Moved`].
-struct MovedLent<'m> {
-    fused: &'m mut FusedBufs,
-    /// By frame: the device's offsets, which the batch steps.
-    offsets: &'m mut DeviceBuffer<f32>,
-    spectrum: &'m mut SpectrumBuf,
-    probe_sums: &'m mut ShiftedProbeSums,
-    w: &'m mut [DeviceBuffer<C32>],
-    pos: &'m mut Positions,
-    kernels: &'m PositionKernels,
-}
-
-impl<'m> MovedLent<'m> {
-    /// For LSQML's `moved` state with the device's `passes` and `features`: none without a
-    /// position, an error when the two disagree.
-    fn lend(
-        moved: Option<&'m mut Moved>,
-        passes: &'m mut PassesMut<'_>,
-        features: &'m mut FeaturesMut<'_>,
-    ) -> Result<Option<Self>, GpuError> {
-        match (moved, features.position_lent(), passes) {
-            (None, None, _) => Ok(None),
-            (Some(m), Some(p), PassesMut::Fused(fused)) => Ok(Some(Self {
-                fused,
-                offsets: p.offsets,
-                spectrum: p.spectrum,
-                probe_sums: p.probe_sums,
-                w: &mut m.w,
-                pos: &mut m.pos,
-                kernels: &m.kernels,
-            })),
-            _ => Err(GpuError::Shape(
-                "LSQML state built for another position model".into(),
-            )),
-        }
-    }
-
-    /// The batch's waves under the position model, the spectra of `probe` taken.
-    fn waves<'w>(
-        &'w mut self,
-        ctx: &ExecutionContext,
-        kernels: &Kernels,
-        views: &Views,
-        probe: &'w DeviceBuffer<C32>,
-    ) -> Result<MovedWaves<'w>, GpuError> {
-        let spectrum = kernels.probe_spectrum(ctx, views.dims(), probe, self.spectrum)?;
-        Ok(MovedWaves {
-            shift: Shift {
-                offsets: self.pos.offsets(),
-                spectrum,
-            },
-            fused: self.fused,
-            probe_sums: self.probe_sums,
-            w: self.w,
-            kernels: self.kernels,
-        })
-    }
-}
-
-/// [`MovedLent`] lent to a batch's exit waves and their update sums: the model of the probe
-/// they move, which borrows it.
-struct MovedWaves<'w> {
-    shift: Shift<'w>,
-    fused: &'w mut FusedBufs,
-    probe_sums: &'w mut ShiftedProbeSums,
-    w: &'w mut [DeviceBuffer<C32>],
-    kernels: &'w PositionKernels,
 }
 
 impl LsqmlState {
@@ -222,11 +143,7 @@ impl LsqmlState {
                 .collect::<Result<_, _>>()?)
         };
         let moved = match moved {
-            true => Some(Moved {
-                w: bufs(nf_max as usize * dims.nprobe as usize * plane_len(dims))?,
-                pos: Positions::zeroed(stream, dims, nf_max)?,
-                kernels: PositionKernels::load(kernels)?,
-            }),
+            true => Some(Moved::new(stream, kernels, dims, nf_max, slots)?),
             false => None,
         };
         Ok(Self {
@@ -345,9 +262,9 @@ impl<'a> Bufs<'a> {
         }
         // Each frame is in one batch, stepped after its batch's passes: the offsets the
         // epoch starts from serve every pass.
-        let moved = l.moved.as_deref_mut();
-        if let Some(m) = MovedLent::lend(moved, passes, &mut self.features)? {
-            m.kernels.gather(ctx, l.order, m.offsets, m.pos)?;
+        let moved = l.moved.as_deref_mut().map(|m| (m, ()));
+        if let Some(mut m) = MovedLent::lend(moved, passes.fused(), &mut self.features)? {
+            m.gather(ctx, l.order)?;
         }
         let noise = match params.cost {
             Cost::Amplitude => LsqmlNoise::Gaussian,
@@ -360,8 +277,8 @@ impl<'a> Bufs<'a> {
     }
 
     /// Batch `b` of an epoch: its exit-wave updates, the directions in the update sums, the
-    /// step sizes and the update, which consumes the sums; under the position model then the
-    /// step of its frames' offsets.
+    /// step sizes and the update, which consumes the sums; under the position model the step
+    /// of its frames' offsets before the update.
     fn lsqml_batch(
         &mut self,
         ctx: &ExecutionContext,
@@ -377,32 +294,29 @@ impl<'a> Bufs<'a> {
             counts: self.counts,
         };
         let views = l.order.views();
-        let mut moved = MovedLent::lend(l.moved.as_deref_mut(), passes, &mut self.features)?;
-        let mut waves = (moved.as_mut())
-            .map(|m| m.waves(ctx, self.kernels, views, self.probe))
-            .transpose()?;
-        let inputs = |model| FusedInputs {
+        let moved = l.moved.as_deref_mut().map(|m| (m, ()));
+        let moved = MovedLent::lend(moved, passes.fused(), &mut self.features)?;
+        let mut moved =
+            (moved.map(|m| m.batch(ctx, self.kernels, views.dims(), self.probe))).transpose()?;
+        let base = FusedInputs {
             views,
             counts: self.counts,
             obj: self.obj,
             probe: self.probe,
-            model,
+            model: Model::default(),
         };
         for (k, s) in batch.clone().enumerate() {
             let (stack, work) = (l.table.at(s), &mut l.work[k]);
-            match &mut waves {
+            match &mut moved {
                 None => l
                     .kernels
                     .forward(ctx, views, stack, self.obj, self.probe, work)?,
-                Some(mw) => {
-                    let model = Model {
-                        shift: Some(mw.shift),
-                        ..Model::default()
-                    };
-                    let w = &mut mw.w[k];
+                Some(m) => {
+                    let inputs = moved_inputs(&base, moved_shift(m.pos, m.spectrum));
+                    let w = &mut m.w[k];
                     self.kernels
-                        .shifted_rows_fwd(ctx, &inputs(model), stack, w, work)?;
-                    mw.kernels.shift_w(ctx, views.dims(), stack, w)?;
+                        .shifted_rows_fwd(ctx, &inputs, stack, w, work)?;
+                    m.kernels.shift_w(ctx, views.dims(), stack, w)?;
                 }
             }
             match noise {
@@ -425,7 +339,7 @@ impl<'a> Bufs<'a> {
             }
         }
 
-        match waves {
+        match &mut moved {
             None => {
                 for (k, s) in batch.clone().enumerate() {
                     let stack = l.table.at(s);
@@ -447,30 +361,21 @@ impl<'a> Bufs<'a> {
                     )?;
                 }
             }
-            Some(mw) => {
-                let model = Model {
-                    shift: Some(mw.shift),
-                    ..Model::default()
-                };
+            Some(m) => {
                 for (k, s) in batch.clone().enumerate() {
+                    let inputs = moved_inputs(&base, moved_shift(m.pos, m.spectrum));
                     let sums = PsiSums {
                         obj: Some(&mut *self.obj_sums),
-                        probe: Some(&mut *mw.probe_sums),
+                        probe: Some(&mut *m.probe_sums),
                     };
                     let stack = l.table.at(s);
-                    self.kernels.shifted_psi_sums(
-                        ctx,
-                        &inputs(model),
-                        stack,
-                        &l.work[k],
-                        mw.fused,
-                        sums,
-                    )?;
+                    self.kernels
+                        .shifted_psi_sums(ctx, &inputs, stack, &l.work[k], m.fused, sums)?;
                 }
                 self.kernels.shifted_probe_sums(
                     ctx,
                     views.dims(),
-                    mw.probe_sums,
+                    m.probe_sums,
                     self.probe_sums,
                 )?;
             }
@@ -497,6 +402,15 @@ impl<'a> Bufs<'a> {
             }
         }
         l.kernels.step(ctx, positions.clone(), l.scan)?;
+        // Before the update, as the batch's spectra borrow the probe; the step reads neither.
+        if let Some(m) = moved {
+            let rule = PositionRule {
+                step: POSITION_STEP as f32,
+                limit: POSITION_LIMIT as f32,
+            };
+            m.kernels
+                .step(ctx, positions, l.order, m.offsets, rule, m.pos)?;
+        }
         let obj = LsqmlVar {
             x: &mut *self.obj,
             sums: &mut *self.obj_sums,
@@ -506,14 +420,6 @@ impl<'a> Bufs<'a> {
             sums: &mut *self.probe_sums,
         };
         l.kernels.update(ctx, l.scan, obj, probe)?;
-        if let Some(m) = moved {
-            let rule = PositionRule {
-                step: POSITION_STEP as f32,
-                limit: POSITION_LIMIT as f32,
-            };
-            m.kernels
-                .step(ctx, positions, l.order, m.offsets, rule, m.pos)?;
-        }
         Ok(())
     }
 }

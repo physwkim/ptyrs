@@ -73,6 +73,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let params = BhParams {
             batch_size,
             probe_rho: 0.01,
+            position_rho: 0.1,
             seed: 7,
         };
         let mut g = GpuPtycho::new(&ctx, &scan, object.clone(), probe.clone(), options)?;

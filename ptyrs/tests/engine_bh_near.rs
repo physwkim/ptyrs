@@ -107,6 +107,7 @@ fn bh_matches_ptychi_in_near_field() {
             let mut bh = Bh::new(BhParams {
                 batch_size,
                 probe_rho: 1.0,
+                position_rho: 0.1,
                 seed: 7,
             });
             let (mut object, mut probe) = (object0.clone(), probe0.clone());

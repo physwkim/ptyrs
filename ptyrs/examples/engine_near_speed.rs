@@ -127,6 +127,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             ["bh", batch, rho] => Method::Bh(Bh::new(BhParams {
                 batch_size: batch.parse()?,
                 probe_rho: rho.parse()?,
+                position_rho: 0.1,
                 seed: SEED,
             })),
             _ => return Err(usage.into()),

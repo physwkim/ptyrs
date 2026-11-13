@@ -89,8 +89,8 @@ impl Default for DmParams {
     }
 }
 
-/// PyNX `ML` parameters, Poisson noise without regularisation, background or position
-/// updates.
+/// PyNX `ML` parameters, Poisson noise without regularisation; the background and the
+/// positions are [`Features`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MlParams {
     pub update_object: bool,
@@ -331,6 +331,19 @@ impl Ptycho {
         .normalised(self.obs.nb_obs())
     }
 
+    /// [`Shifted::position_sums`] of the magnitude projection of the current estimate's exit
+    /// waves under `s`, the probe moved by [`Features::position`].
+    fn projected_position_sums(&self, s: &Shifted) -> Vec<[[f64; 2]; 2]> {
+        let mut psi = vec![C64::default(); self.psi.len()];
+        self.to_psi(Some(s), &mut psi);
+        self.fft.forward(&mut psi);
+        let (nframe, nmode) = (self.addr.nframe(), self.addr.nmode());
+        let model = Model::of(&self.features, &self.obs);
+        apply_amplitude_with(&self.obs, 0..nframe, nmode, &mut psi, model);
+        self.fft.inverse(&mut psi);
+        s.position_sums(self.addr.views(), &self.object, &psi, &self.fft)
+    }
+
     /// [`Features::step`] from the far field of the current object and probe, if some
     /// feature takes one.
     fn step_features(&mut self) {
@@ -559,12 +572,13 @@ impl Ptycho {
     /// finite, no update and `d = −g` (PyNX `cu_linear_comb_fcfc_gamma`). PyNX CUDA keeps
     /// `−g / 2`, which changes neither `β` nor the step, and Hann-filters it in the far field;
     /// this does not filter. As in PyNX, a negative curvature `den` is not guarded: far from
-    /// the solution (a flat object) the step can climb, so ML follows DM or AP. ML takes no
-    /// position step, so it refuses [`Features::position`].
-    pub fn ml(&mut self, params: &MlParams, ncycle: usize) -> Result<(), EngineError> {
-        if self.features.position.is_some() {
-            return Err(EngineError::Invalid("ML refines no positions".into()));
-        }
+    /// the solution (a flat object) the step can climb, so ML follows DM or AP.
+    ///
+    /// [`Features::position`] takes AP's and DM's step, not PyNX ML's `update_pos` (which
+    /// moves the scan positions themselves): its sums from the magnitude projection of the
+    /// estimate the cycle starts from, a pass PyNX ML also makes for its positions, and the
+    /// step after the update.
+    pub fn ml(&mut self, params: &MlParams, ncycle: usize) {
         let (uo, up) = (params.update_object, params.update_probe);
         self.scale_obj_probe();
         let mut last: Option<[Stack<C64>; 2]> = None;
@@ -575,6 +589,7 @@ impl Ptycho {
         for ic in 0..ncycle {
             let l = llk_due(params.calc_llk, ic, ncycle).then(|| self.llk());
             self.step_features();
+            let sums = self.shifted().map(|s| self.projected_position_sums(&s));
             let g = self.grads(uo, up);
             let beta = match &last {
                 None => 0.0,
@@ -618,6 +633,9 @@ impl Ptycho {
                 }
             }
             last = Some(g);
+            if let (Some(d), Some(sums)) = (&mut self.features.position, sums) {
+                position_step(d, &sums);
+            }
             if let Some(l) = l {
                 self.record(Algorithm::Ml, l);
             }
@@ -626,7 +644,6 @@ impl Ptycho {
         if params.zero_phase_ramp {
             self.zero_phase_ramp();
         }
-        Ok(())
     }
 
     /// rPIE after pty-chi `RPIEReconstructor` with SGD, on consecutive batches of

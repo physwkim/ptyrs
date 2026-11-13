@@ -91,7 +91,7 @@ impl Bufs<'_> {
                     };
                     let sums = FusedSums {
                         obj: summed.then_some(&mut *self.obj_sums),
-                        shift: m.shift_sums(false),
+                        shift: m.shift_sums(false, true),
                         ..FusedSums::default()
                     };
                     self.kernels

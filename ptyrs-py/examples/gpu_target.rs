@@ -40,6 +40,7 @@ impl Method {
             ("bh", [batch, rho, seed]) => Self::Bh(BhParams {
                 batch_size: batch.parse()?,
                 probe_rho: rho.parse()?,
+                position_rho: 0.1,
                 seed: seed.parse()?,
             }),
             ("rpie", [obj_step, probe_step, obj_alpha, probe_alpha, batch]) => {

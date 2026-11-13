@@ -14,17 +14,20 @@ use std::sync::Arc;
 use crate::fft::Plan2d;
 use crate::gpu::{
     BH_STEP, BackgroundSums, BhKernels, C32, CG_BLOCKS, Ended, EpochOrder, Error as GpuError,
-    FarSums, FusedBufs, GammaStacks, GradKernels, Kernels, LlkPartial, LlkRing, LlkScratch,
-    LlkTotals, Model, PositionPartial, PowerMax, PsiSums, RingDevice, RpieKernels, ScalePartial,
-    Shift, ShiftSums, ShiftedProbeSums, SpectrumBuf, StackTable, UpdateSums, ViewAddr, ViewDims,
-    Views,
+    FarSums, FusedBufs, FusedInputs, GammaStacks, GradKernels, Kernels, LlkPartial, LlkRing,
+    LlkScratch, LlkTotals, Model, PositionKernels, PositionPartial, Positions, PowerMax,
+    ProbeSpectrum, PsiSums, RingDevice, RpieKernels, ScalePartial, Shift, ShiftSums,
+    ShiftedProbeSums, SpectrumBuf, StackTable, UpdateSums, ViewAddr, ViewDims, Views,
 };
 use crate::tile::TileDots;
 use cuda_async::cuda_graph::CudaGraph;
 use cuda_async::device_operation::{DeviceOp, ExecutionContext};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 
+use super::bh::BhMoved;
 use super::lsqml::{LsqmlBufs, LsqmlState, Pre};
+use super::ml::MlMoved;
+use super::rpie::RpieMoved;
 use super::{
     Epoch, Frames, GpuOptions, Tag, batch_stacks, plane_len, plans, split, stack_buf_len, stacks,
     to_u32,
@@ -144,12 +147,133 @@ struct PositionMut<'a> {
     den: &'a mut DeviceBuffer<PositionPartial>,
 }
 
-/// The position model's buffers lent by [`FeaturesMut::position_lent`] to a cycle that runs
-/// its own passes: the offsets by frame, the probe spectra and the shifted probe's sums.
-pub(super) struct PositionLent<'a> {
-    pub offsets: &'a mut DeviceBuffer<f32>,
-    pub spectrum: &'a mut SpectrumBuf,
-    pub probe_sums: &'a mut ShiftedProbeSums,
+/// The position model's state a cycle that runs its own passes owns: per batch slot the moved
+/// probes `[nf_max * nprobe, ny, nx]`, the offsets by epoch position and their kernels.
+pub(super) struct Moved {
+    w: Vec<DeviceBuffer<C32>>,
+    pos: Positions,
+    kernels: PositionKernels,
+}
+
+impl Moved {
+    /// For frames of `dims` in `slots` stacks per batch of up to `nf_max` frames each.
+    pub fn new(
+        stream: &Arc<CudaStream>,
+        kernels: &Kernels,
+        dims: &ViewDims,
+        nf_max: u32,
+        slots: usize,
+    ) -> Result<Self, EngineError> {
+        let wlen = nf_max as usize * dims.nprobe as usize * plane_len(dims);
+        Ok(Self {
+            w: (0..slots)
+                .map(|_| DeviceBuffer::zeroed(stream, wlen))
+                .collect::<Result<_, _>>()?,
+            pos: Positions::zeroed(stream, dims, nf_max)?,
+            kernels: PositionKernels::load(kernels)?,
+        })
+    }
+}
+
+/// A cycle's [`Moved`] lent with the device's position buffers: the offsets by frame, the
+/// probe spectra and the shifted probe's sums; `own` the cycle's other buffers of the model,
+/// `fused` the scratch of the shifted sums over its stacks.
+pub(super) struct MovedLent<'m, X> {
+    pub own: X,
+    fused: &'m mut FusedBufs,
+    w: &'m mut [DeviceBuffer<C32>],
+    pos: &'m mut Positions,
+    kernels: &'m PositionKernels,
+    offsets: &'m mut DeviceBuffer<f32>,
+    spectrum: &'m mut SpectrumBuf,
+    probe_sums: &'m mut ShiftedProbeSums,
+}
+
+impl<'m, X> MovedLent<'m, X> {
+    /// `moved` with `fused` and `features`' position buffers: none without a position, an
+    /// error when they disagree, as for a cycle's state built for another position model.
+    pub fn lend(
+        moved: Option<(&'m mut Moved, X)>,
+        fused: Option<&'m mut FusedBufs>,
+        features: &'m mut FeaturesMut<'_>,
+    ) -> Result<Option<Self>, GpuError> {
+        match (moved, features.position.as_mut(), fused) {
+            (None, None, _) => Ok(None),
+            (Some((m, own)), Some(p), Some(fused)) => Ok(Some(Self {
+                own,
+                fused,
+                w: &mut m.w,
+                pos: &mut m.pos,
+                kernels: &m.kernels,
+                offsets: &mut *p.offsets,
+                spectrum: &mut *p.spectrum,
+                probe_sums: &mut *p.probe_sums,
+            })),
+            _ => Err(GpuError::Shape(
+                "cycle state built for another position model".into(),
+            )),
+        }
+    }
+
+    /// The offsets by epoch position from the device's, through `order`, the epoch's.
+    pub fn gather(&mut self, ctx: &ExecutionContext, order: &EpochOrder) -> Result<(), GpuError> {
+        self.kernels.gather(ctx, order, self.offsets, self.pos)
+    }
+
+    /// The lend for one batch, with the spectra of `probe` it starts from (two launches).
+    pub fn batch(
+        self,
+        ctx: &ExecutionContext,
+        kernels: &Kernels,
+        dims: &ViewDims,
+        probe: &'m DeviceBuffer<C32>,
+    ) -> Result<MovedBatch<'m, X>, GpuError> {
+        Ok(MovedBatch {
+            spectrum: kernels.probe_spectrum(ctx, dims, probe, self.spectrum)?,
+            own: self.own,
+            fused: self.fused,
+            w: self.w,
+            pos: self.pos,
+            kernels: self.kernels,
+            offsets: self.offsets,
+            probe_sums: self.probe_sums,
+        })
+    }
+}
+
+/// [`MovedLent`] for one batch, with the spectra of the batch-start probe, which they borrow.
+pub(super) struct MovedBatch<'m, X> {
+    pub own: X,
+    pub fused: &'m mut FusedBufs,
+    /// The moved probes, one per stack of the batch.
+    pub w: &'m mut [DeviceBuffer<C32>],
+    pub pos: &'m mut Positions,
+    pub kernels: &'m PositionKernels,
+    /// By frame: the device's offsets, which the batch steps.
+    pub offsets: &'m mut DeviceBuffer<f32>,
+    pub probe_sums: &'m mut ShiftedProbeSums,
+    pub spectrum: ProbeSpectrum<'m>,
+}
+
+/// A batch's model of the probe, from its [`MovedBatch::pos`] and [`MovedBatch::spectrum`]
+/// alone, so its other fields stay free to borrow: the spectra moved by the offsets by epoch
+/// position.
+pub(super) fn moved_shift<'a>(pos: &'a Positions, spectrum: ProbeSpectrum<'a>) -> Shift<'a> {
+    Shift {
+        offsets: pos.offsets(),
+        spectrum,
+    }
+}
+
+/// `base` under the position model `shift`.
+pub(super) fn moved_inputs<'a>(base: &FusedInputs<'a>, shift: Shift<'a>) -> FusedInputs<'a> {
+    FusedInputs {
+        model: Model {
+            shift: Some(shift),
+            ..Model::default()
+        },
+        ..*base
+    }
 }
 
 /// The features lent to the passes of one cycle body by [`FeaturesMut::lend`]: the model
@@ -178,14 +302,14 @@ impl Modelled<'_> {
         }
     }
 
-    /// An AP projection's sums of the position model: each frame's position sums, and with
-    /// `probe` the shifted probe's update sums; none without a position.
-    pub fn shift_sums(&mut self, probe: bool) -> ShiftSums<'_> {
+    /// A fused pass's sums of the position model: with `probe` the shifted probe's update
+    /// sums, with `position` each frame's position sums; none without a position.
+    pub fn shift_sums(&mut self, probe: bool, position: bool) -> ShiftSums<'_> {
         match &mut self.position {
             Some(p) => ShiftSums {
                 probe: probe.then_some(&mut *p.probe),
-                position: Some(&mut *p.num),
-                position_den: Some(&mut *p.den),
+                position: position.then_some(&mut *p.num),
+                position_den: position.then_some(&mut *p.den),
             },
             None => ShiftSums::default(),
         }
@@ -233,15 +357,6 @@ impl FeaturesMut<'_> {
     /// Whether the position is modelled, as [`Modelled::shifted`] of a lend.
     pub fn shifted(&self) -> bool {
         self.position.is_some()
-    }
-
-    /// The position model's buffers, if modelled.
-    pub fn position_lent(&mut self) -> Option<PositionLent<'_>> {
-        self.position.as_mut().map(|p| PositionLent {
-            offsets: &mut *p.offsets,
-            spectrum: &mut *p.spectrum,
-            probe_sums: &mut *p.probe_sums,
-        })
     }
 
     /// The per-frame intensity scale, if modelled.
@@ -359,6 +474,16 @@ pub(super) enum PassesMut<'a> {
     Fused(&'a mut FusedBufs),
 }
 
+impl PassesMut<'_> {
+    /// The fused passes' scratch, if the passes are fused.
+    pub fn fused(&mut self) -> Option<&mut FusedBufs> {
+        match self {
+            Self::M1(_) => None,
+            Self::Fused(f) => Some(f),
+        }
+    }
+}
+
 /// [`Passes::M1`] lent to a cycle.
 pub(super) struct M1Bufs<'a> {
     pub plans: Plans<'a>,
@@ -440,6 +565,8 @@ struct MlState {
     /// The calculated photons over the unmasked pixels of every frame.
     icalc: DeviceBuffer<f32>,
     fields: GammaStacks,
+    /// The line search's moved probes, once an ML call has run under the position model.
+    moved: Option<MlMoved>,
 }
 
 /// An [`MlState`] lent to an epoch.
@@ -453,6 +580,7 @@ pub(super) struct MlBufs<'a> {
     pub gamma: &'a mut DeviceBuffer<f32>,
     pub icalc: &'a mut DeviceBuffer<f32>,
     pub fields: &'a mut GammaStacks,
+    pub moved: Option<&'a mut MlMoved>,
 }
 
 impl MlState {
@@ -478,6 +606,7 @@ impl MlState {
             gamma: pair()?,
             icalc: DeviceBuffer::zeroed(stream, 1)?,
             fields: GammaStacks::zeroed(stream, stack_len)?,
+            moved: None,
         })
     }
 
@@ -492,6 +621,7 @@ impl MlState {
             gamma: &mut self.gamma,
             icalc: &mut self.icalc,
             fields: &mut self.fields,
+            moved: self.moved.as_mut(),
         }
     }
 }
@@ -513,9 +643,10 @@ impl NormBufs {
     }
 }
 
-/// BH's batches over epoch positions and its state, sized by the device and the batch size
-/// alone, so one state serves the graphs of every BH epoch of that size; [`Device::bh_epoch`]
-/// sets each epoch's frame order before its cycle.
+/// BH's batches over epoch positions and its state, sized by the device, the batch size and
+/// whether the position is modelled alone, so one state serves the graphs of every BH epoch
+/// of that size and model; [`Device::bh_epoch`] sets each epoch's frame order before its
+/// cycle.
 struct BhState {
     /// Frames per batch, the batch size capped at the frame count.
     size: u32,
@@ -540,6 +671,8 @@ struct BhState {
     parts: DeviceBuffer<f32>,
     /// The epoch's step records, one per batch.
     steps: DeviceBuffer<f32>,
+    /// The state of the position model, if modelled.
+    moved: Option<BhMoved>,
 }
 
 /// A [`BhState`] lent to an epoch.
@@ -557,11 +690,13 @@ pub(super) struct BhBufs<'a> {
     pub order: &'a EpochOrder,
     pub parts: &'a mut DeviceBuffer<f32>,
     pub steps: &'a mut DeviceBuffer<f32>,
+    pub moved: Option<&'a mut BhMoved>,
 }
 
 impl BhState {
-    /// For `views` in batches of `size` frames cut into stacks of `stack_size`, and arrays of
-    /// `lens = [object, probe]` values; the epoch order is the scan's.
+    /// For `views` in batches of `size` frames cut into stacks of `stack_size`, arrays of
+    /// `lens = [object, probe]` values and with `moved` the position model; the epoch order
+    /// is the scan's.
     fn new(
         stream: &Arc<CudaStream>,
         kernels: &Kernels,
@@ -569,12 +704,16 @@ impl BhState {
         size: u32,
         stack_size: u32,
         lens: [usize; 2],
+        moved: bool,
     ) -> Result<Self, EngineError> {
         let dims = views.dims();
         let ((stacks, table, plan_lens), batches) = batch_stacks(stream, dims, size, stack_size)?;
         let len = stack_buf_len(dims, &table);
         let slots = batches.iter().map(|b| b.len()).max().unwrap_or(0);
         let zeroed = |len| DeviceBuffer::<C32>::zeroed(stream, len);
+        let moved = moved
+            .then(|| BhMoved::new(stream, kernels, dims, table.nf_max(), slots, len))
+            .transpose()?;
         Ok(Self {
             size,
             plans: plans(stream, dims, &plan_lens)?,
@@ -589,6 +728,7 @@ impl BhState {
             batches,
             stacks,
             table,
+            moved,
         })
     }
 
@@ -607,6 +747,7 @@ impl BhState {
             order: &self.order,
             parts: &mut self.parts,
             steps: &mut self.steps,
+            moved: self.moved.as_mut(),
         }
     }
 }
@@ -627,6 +768,8 @@ struct RpieScratch {
     ptilde: DeviceBuffer<C32>,
     pmax: DeviceBuffer<f32>,
     ones: DeviceBuffer<C32>,
+    /// The position model's state, if the device models positions.
+    moved: Option<RpieMoved>,
 }
 
 /// An [`RpieScratch`] lent to an epoch.
@@ -649,15 +792,20 @@ pub(super) struct RpieBufs<'a> {
     pub pmax: &'a mut DeviceBuffer<f32>,
     /// A probe of ones, so `obj_probe_to_psi` yields the object windows.
     pub ones: &'a DeviceBuffer<C32>,
+    pub moved: Option<&'a mut RpieMoved>,
 }
 
 impl RpieScratch {
+    /// For `views` in `params`' batches, `moved` under the position model.
     fn new(
         stream: &Arc<CudaStream>,
-        dims: &ViewDims,
+        kernels: &Kernels,
+        views: &Views,
         params: &RpieParams,
         nprobe_values: usize,
+        moved: bool,
     ) -> Result<Self, EngineError> {
+        let dims = views.dims();
         let (batches, table, lens) =
             stacks(stream, dims, to_u32("batch_size", params.batch_size)?)?;
         let len = stack_buf_len(dims, &table);
@@ -671,7 +819,6 @@ impl RpieScratch {
         Ok(Self {
             batches,
             n,
-            table,
             plans: plans(stream, dims, &lens)?,
             psi: DeviceBuffer::zeroed(stream, len)?,
             dlt: DeviceBuffer::zeroed(stream, len)?,
@@ -680,6 +827,9 @@ impl RpieScratch {
             ptilde: DeviceBuffer::zeroed(stream, nprobe_values)?,
             pmax: DeviceBuffer::zeroed(stream, 1)?,
             ones: DeviceBuffer::from_host(stream, &vec![C32 { re: 1.0, im: 0.0 }; nprobe_values])?,
+            moved: (moved.then(|| RpieMoved::new(stream, kernels, views, table.nf_max())))
+                .transpose()?,
+            table,
         })
     }
 
@@ -696,6 +846,7 @@ impl RpieScratch {
             ptilde: &mut self.ptilde,
             pmax: &mut self.pmax,
             ones: &self.ones,
+            moved: self.moved.as_mut(),
         }
     }
 }
@@ -984,20 +1135,10 @@ impl Device {
         })
     }
 
-    /// Whether some feature is modelled.
-    pub fn has_features(&self) -> bool {
-        self.has_stepped() || self.has_position()
-    }
-
     /// Whether some feature takes a step from far sums: the scale or the background.
     pub fn has_stepped(&self) -> bool {
         let f = &self.features;
         f.scale.is_some() || f.background.is_some()
-    }
-
-    /// Whether the position is modelled.
-    pub fn has_position(&self) -> bool {
-        self.features.position.is_some()
     }
 
     pub fn stream(&self) -> &Arc<CudaStream> {
@@ -1237,7 +1378,15 @@ impl Device {
             Epoch::Ap { params, llk } => Cycle::Ap { params, llk },
             Epoch::Dm { params, first } => Cycle::Dm { params, first },
             Epoch::Rpie(p) => {
-                let scratch = RpieScratch::new(&self.stream, &self.dims(), &p, self.probe.len())?;
+                let moved = self.features.position.is_some();
+                let scratch = RpieScratch::new(
+                    &self.stream,
+                    &self.kernels,
+                    &self.views,
+                    &p,
+                    self.probe.len(),
+                    moved,
+                )?;
                 Cycle::Rpie(p, Box::new(scratch))
             }
             Epoch::Ml { params, first, llk } => {
@@ -1261,25 +1410,35 @@ impl Device {
         Ok(EpochRun { cycle, graph })
     }
 
-    /// Builds the [`MlState`] if no ML call has yet.
+    /// Builds the [`MlState`] if no ML call has yet, and its [`MlMoved`] under the position
+    /// model if no ML call under it has yet.
     fn build_ml(&mut self) -> Result<(), EngineError> {
-        if self.ml.is_none() {
-            let dims = self.dims();
-            let stack_len = stack_buf_len(&dims, &self.table);
-            let lens = [self.obj.len(), self.probe.len()];
-            let state = MlState::new(&self.stream, &dims, self.stack_size, stack_len, lens)?;
-            self.ml = Some(Box::new(state));
+        let dims = self.dims();
+        let ml = match &mut self.ml {
+            Some(ml) => ml,
+            None => {
+                let stack_len = stack_buf_len(&dims, &self.table);
+                let lens = [self.obj.len(), self.probe.len()];
+                let state = MlState::new(&self.stream, &dims, self.stack_size, stack_len, lens)?;
+                self.ml.insert(Box::new(state))
+            }
+        };
+        if self.features.position.is_some() && ml.moved.is_none() {
+            let moved = MlMoved::new(&self.stream, &self.kernels, &dims, self.table.nf_max())?;
+            ml.moved = Some(moved);
         }
         Ok(())
     }
 
-    /// Builds the [`BhState`] for `params`' batch size unless it is built. A state of another
-    /// size is replaced only here, when [`Self::steady`] has already dropped the runs of
-    /// other parameters, so no graph captured from it survives.
+    /// Builds the [`BhState`] for `params`' batch size and the position model unless it is
+    /// built. A state of another size or model is replaced only here, when [`Self::steady`]
+    /// has already dropped the runs of other parameters and [`Self::set_features`] those of
+    /// other features, so no graph captured from it survives.
     fn build_bh(&mut self, params: &BhParams) -> Result<(), EngineError> {
         let dims = self.dims();
         let size = to_u32("batch_size", params.batch_size.min(dims.nframe as usize))?;
-        if self.bh_state.as_ref().is_none_or(|s| s.size != size) {
+        let moved = self.features.position.is_some();
+        if (self.bh_state.as_ref()).is_none_or(|s| s.size != size || s.moved.is_some() != moved) {
             let lens = [self.obj.len(), self.probe.len()];
             let state = BhState::new(
                 &self.stream,
@@ -1288,6 +1447,7 @@ impl Device {
                 size,
                 self.stack_size,
                 lens,
+                moved,
             )?;
             self.bh_state = Some(Box::new(state));
         }
@@ -1320,8 +1480,8 @@ impl Device {
     pub fn scale_to_photons(&mut self, total: f32) -> Result<(), EngineError> {
         self.build_ml()?;
         let ctx = self.context();
-        let (mut bufs, _, _) = self.lend();
-        Ok(bufs.with_ml(|b, ml| b.scale_to_photons(&ctx, ml, total))?)
+        let (mut bufs, mut passes, _) = self.lend();
+        Ok(bufs.with_ml(|b, ml| b.scale_to_photons(&ctx, &mut passes, ml, total))?)
     }
 
     /// PyNX `ScaleObjProbe(absolute=False)` enqueued eagerly: `Σ|O|` and `Σ|P|` balanced,
@@ -1436,7 +1596,7 @@ impl<'a> Bufs<'a> {
                 b.ml_epoch(ctx, passes, ml, params, *first, llk.then(|| ring.record()))
             }),
             Cycle::Bh { params, cg } => self
-                .with_bh(|b, bh| b.bh_epoch(ctx, bh, params, *cg))
+                .with_bh(|b, bh| b.bh_epoch(ctx, passes, bh, params, *cg))
                 .map(|()| None),
             Cycle::Lsqml { params, pre } => {
                 self.lsqml_epoch(ctx, passes, params, *pre).map(|()| None)

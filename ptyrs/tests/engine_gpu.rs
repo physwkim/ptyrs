@@ -215,18 +215,30 @@ fn rpie_matches_cpu() {
 }
 
 /// ML's gradients of the same estimate, in `f32` against `f64`, by M1's launches and by the
-/// fused passes.
+/// fused passes, these also modelling a position.
 #[test]
 fn ml_grads_match_cpu() {
-    for setup in [M1, FUSED] {
+    let moved = Features {
+        position: Some(drawn_offsets()),
+        ..Features::default()
+    };
+    for (setup, features) in [
+        (M1, Features::default()),
+        (FUSED, Features::default()),
+        (FUSED, moved),
+    ] {
         let (scan, object, probe) = start(setup.frame, 2, true);
-        let cpu = Ptycho::new(&scan, object.clone(), probe.clone()).unwrap();
+        let mut cpu = Ptycho::new(&scan, object.clone(), probe.clone()).unwrap();
         let mut gpu = GpuPtycho::new(&ctx(), &scan, object, probe, setup.options).unwrap();
+        cpu.set_features(features.clone()).unwrap();
+        gpu.set_features(&features).unwrap();
         let [go, gp] = gpu.ml_grads().unwrap();
         let errs = [rel_l2(&go, &cpu.obj_grad()), rel_l2(&gp, &cpu.probe_grad())];
         eprintln!(
-            "ml grads {setup:?}: object {:.2e} probe {:.2e}",
-            errs[0], errs[1]
+            "ml grads {setup:?}, position {}: object {:.2e} probe {:.2e}",
+            features.position.is_some(),
+            errs[0],
+            errs[1]
         );
         assert!(errs[0] < 1e-5 && errs[1] < 1e-5, "{errs:?}");
         // the sums are consumed: a second call gives the same gradients
@@ -237,25 +249,41 @@ fn ml_grads_match_cpu() {
 
 /// ML's starting scale counts the calculated photons over the unmasked pixels only, as the
 /// observed total does: with the bright centre of every frame masked, holding over a tenth of
-/// the calculated photons, the first LLK record's photon count is the observed total.
+/// the calculated photons, the first LLK record's photon count is the observed total, by M1's
+/// launches and by the fused passes, these also under a position.
 #[test]
 fn ml_scale_leaves_masked_pixels_out() {
-    let (frame, c) = (M1.frame, M1.frame / 2);
-    let (scan, object, probe) = common::dm_scenario(frame, NPOS, 2, 2e5, frame as f64 / 8.0);
-    let open = Ptycho::new(&scan, object.clone(), probe.clone()).unwrap();
-    let scan = mask(scan, |y, x| y.abs_diff(c) < 3 && x.abs_diff(c) < 3);
-    let cpu = Ptycho::new(&scan, object.clone(), probe.clone()).unwrap();
-    let share = 1.0 - cpu.llk().nb_photons_calc / open.llk().nb_photons_calc;
-    assert!(share > 0.1, "masked share {share}");
-    let total = cpu.observed().total();
-    let mut gpu = GpuPtycho::new(&ctx(), &scan, object, probe, M1.options).unwrap();
-    let params = MlParams {
-        calc_llk: 1,
-        ..MlParams::default()
+    let moved = Features {
+        position: Some(drawn_offsets()),
+        ..Features::default()
     };
-    gpu.ml(&params, 1).unwrap();
-    let got = gpu.history()[0].llk.nb_photons_calc;
-    assert!((got - total).abs() < 1e-5 * total, "{got} vs {total}");
+    for (setup, features) in [
+        (M1, Features::default()),
+        (FUSED, Features::default()),
+        (FUSED, moved),
+    ] {
+        let (frame, c) = (setup.frame, setup.frame / 2);
+        let (scan, object, probe) = common::dm_scenario(frame, NPOS, 2, 2e5, frame as f64 / 8.0);
+        let open = Ptycho::new(&scan, object.clone(), probe.clone()).unwrap();
+        let scan = mask(scan, |y, x| y.abs_diff(c) < 3 && x.abs_diff(c) < 3);
+        let cpu = Ptycho::new(&scan, object.clone(), probe.clone()).unwrap();
+        let share = 1.0 - cpu.llk().nb_photons_calc / open.llk().nb_photons_calc;
+        assert!(share > 0.1, "masked share {share}");
+        let total = cpu.observed().total();
+        let mut gpu = GpuPtycho::new(&ctx(), &scan, object, probe, setup.options).unwrap();
+        gpu.set_features(&features).unwrap();
+        let params = MlParams {
+            calc_llk: 1,
+            ..MlParams::default()
+        };
+        gpu.ml(&params, 1).unwrap();
+        let got = gpu.history()[0].llk.nb_photons_calc;
+        assert!(
+            (got - total).abs() < 1e-5 * total,
+            "{setup:?}, position {}: {got} vs {total}",
+            features.position.is_some()
+        );
+    }
 }
 
 /// ML's direction (β from the last gradient across both arrays) and Poisson quadratic step
@@ -276,7 +304,7 @@ fn ml_matches_cpu() {
         let (scan, object, probe) = start(setup.frame, 2, true);
         let mut cpu = Ptycho::new(&scan, object.clone(), probe.clone()).unwrap();
         let mut gpu = GpuPtycho::new(&ctx(), &scan, object, probe, setup.options).unwrap();
-        cpu.ml(&params, 10).unwrap();
+        cpu.ml(&params, 10);
         gpu.ml(&params, 10).unwrap();
         assert_eq!(gpu.cycle(), cpu.cycle());
         let errs = [
@@ -306,6 +334,7 @@ fn bh_matches_cpu() {
         let params = BhParams {
             batch_size,
             probe_rho: 0.01,
+            position_rho: 0.1,
             seed: 7,
         };
         let (scan, object, probe) = start(setup.frame, 2, true);
@@ -369,6 +398,7 @@ fn bh_steps_match_cpu() {
         let params = BhParams {
             batch_size,
             probe_rho: 0.01,
+            position_rho: 0.1,
             seed: 7,
         };
         let (scan, object, probe) = start(setup.frame, 2, true);
@@ -439,6 +469,7 @@ fn bh_graphs_compile_no_tile_kernel() {
             let params = BhParams {
                 batch_size,
                 probe_rho: 0.01,
+                position_rho: 0.1,
                 seed: 7,
             };
             g.bh(&params, 3, 1).unwrap();
@@ -503,7 +534,7 @@ fn switches_match_cpu(setup: Setup) {
         update_probe: false,
         ..ml
     };
-    cpu.ml(&ml, 3).unwrap();
+    cpu.ml(&ml, 3);
     gpu.ml(&ml, 3).unwrap();
     let step = Step {
         params: steps[1],
@@ -511,7 +542,7 @@ fn switches_match_cpu(setup: Setup) {
     };
     cpu.run(&step).unwrap();
     gpu.run(&step).unwrap();
-    cpu.ml(&only_obj, 3).unwrap();
+    cpu.ml(&only_obj, 3);
     gpu.ml(&only_obj, 3).unwrap();
     check(
         [
@@ -844,12 +875,13 @@ fn featured_start(nprobe: usize, with_flux: bool, with_background: bool) -> (Sca
     (scan, object, probe)
 }
 
-/// AP, DM or ML cycles on either backend.
+/// AP, DM, ML or rPIE cycles on either backend.
 #[derive(Clone, Copy, Debug)]
 enum Cycles {
     Ap(ApParams),
     Dm(DmParams),
     Ml(MlParams),
+    Rpie(RpieParams),
 }
 
 impl Cycles {
@@ -857,7 +889,8 @@ impl Cycles {
         match self {
             Cycles::Ap(a) => p.ap(&a, ncycle),
             Cycles::Dm(d) => p.dm(&d, ncycle),
-            Cycles::Ml(m) => p.ml(&m, ncycle).unwrap(),
+            Cycles::Ml(m) => p.ml(&m, ncycle),
+            Cycles::Rpie(r) => p.rpie(&r, ncycle).unwrap(),
         }
     }
 
@@ -866,6 +899,7 @@ impl Cycles {
             Cycles::Ap(a) => g.ap(&a, ncycle),
             Cycles::Dm(d) => g.dm(&d, ncycle),
             Cycles::Ml(m) => g.ml(&m, ncycle),
+            Cycles::Rpie(r) => g.rpie(&r, ncycle),
         }
         .unwrap()
     }
@@ -1158,11 +1192,253 @@ fn dm_position_matches_cpu() {
     }
 }
 
-/// DM cycles modelling a position, two object-then-probe updates each, give the bits of
-/// stacks of 7 frames with stacks of 4 and with one stack of every frame: the object, the
-/// probe, the offsets and every LLK record.
+/// Probe positions refined by 10 rPIE epochs of batches of 4 from [`drawn_offsets`], each
+/// batch stepping its frames' offsets, as [`features_match_cpu`] checks them. On the CPU the
+/// offsets' RMS falls.
 #[test]
-fn dm_position_is_bit_identical_across_stack_splits() {
+fn rpie_position_matches_cpu() {
+    const NEPOCH: usize = 10;
+    let start = featured_start(2, false, false);
+    let d0 = drawn_offsets();
+    let moved = Features {
+        position: Some(d0.clone()),
+        ..Features::default()
+    };
+    // Measured llk 3.5e-7, object 1.8e-7, probe 1.4e-6, offsets 9.6e-8 pixels; rms offset
+    // 0.257 from 0.282.
+    let (cpu, _) = features_match_cpu(Cycles::Rpie(ptychi::RPIE), &start, &moved, NEPOCH);
+    let d = cpu.features().position.clone().unwrap();
+    println!(
+        "rpie position: rms offset {:.4} from {:.4}",
+        rms(&d),
+        rms(&d0)
+    );
+    assert!(
+        rms(&d) < rms(&d0),
+        "rms offset {} from {}",
+        rms(&d),
+        rms(&d0)
+    );
+}
+
+/// rPIE under the position model in batches of 12, more frames than [`FUSED`]'s stacks of 7
+/// hold, as [`features_match_cpu`] checks them.
+#[test]
+fn rpie_position_batch_over_stack() {
+    let moved = Features {
+        position: Some(drawn_offsets()),
+        ..Features::default()
+    };
+    let params = RpieParams {
+        batch_size: 12,
+        ..ptychi::RPIE
+    };
+    assert!(params.batch_size > FUSED.options.stack_size);
+    let start = featured_start(2, false, false);
+    features_match_cpu(Cycles::Rpie(params), &start, &moved, 3);
+}
+
+/// Probe positions refined by 20 ML cycles from [`drawn_offsets`], their sums from the
+/// magnitude projection of each cycle's start estimate, as [`features_match_cpu`] checks
+/// them. On the CPU the offsets' RMS falls.
+#[test]
+fn ml_position_matches_cpu() {
+    const NCYCLE: usize = 20;
+    let start = featured_start(2, false, false);
+    let d0 = drawn_offsets();
+    let moved = Features {
+        position: Some(d0.clone()),
+        ..Features::default()
+    };
+    let [.., ml] = feature_cycles(1);
+    // Measured llk 1.0e-6, object 1.0e-6, probe 2.7e-7, offsets 9.2e-8 pixels; rms offset
+    // 0.261 from 0.282.
+    let (cpu, _) = features_match_cpu(ml, &start, &moved, NCYCLE);
+    let d = cpu.features().position.clone().unwrap();
+    println!(
+        "ml position: rms offset {:.4} from {:.4}",
+        rms(&d),
+        rms(&d0)
+    );
+    assert!(
+        rms(&d) < rms(&d0),
+        "rms offset {} from {}",
+        rms(&d),
+        rms(&d0)
+    );
+}
+
+/// Probe positions refined by 4 BH epochs from [`drawn_offsets`] against the CPU's `f64` BH
+/// from the same start: every LLK record (the CPU's modelling the offsets the epoch left),
+/// the last epoch's steps, the object, the probe and the offsets, eagerly and from graphs.
+/// One batch of every frame (CG from the second epoch) and batches of 4, the last of 2. On
+/// the CPU the offsets' RMS falls. 4 epochs, as from the sixth CG epoch on this start
+/// amplifies any rounding about 4 times an epoch: the CPU itself, fed 1e-6 relative noise in
+/// the object every epoch, ends its tenth 4e-4 off in the Hessian.
+#[test]
+fn bh_position_matches_cpu() {
+    const NEPOCH: usize = 4;
+    let (scan, object, probe) = featured_start(2, false, false);
+    let d0 = drawn_offsets();
+    let moved = Features {
+        position: Some(d0.clone()),
+        ..Features::default()
+    };
+    let at = Ptycho::new(&scan, object.clone(), probe.clone()).unwrap();
+    let optics = Optics::far_field(&scan.geometry);
+    for batch_size in [NPOS, 4] {
+        let params = BhParams {
+            batch_size,
+            probe_rho: 0.01,
+            position_rho: 0.1,
+            seed: 7,
+        };
+        let (mut o, mut p) = (object.clone(), probe.clone());
+        let mut bh = Bh::new(params).with_features(moved.clone()).unwrap();
+        let mut steps = Vec::new();
+        let want: Vec<_> = (0..NEPOCH)
+            .map(|cycle| {
+                steps = bh.epoch(
+                    at.addr(),
+                    at.observed(),
+                    &optics,
+                    slice::from_mut(&mut o),
+                    &mut p,
+                );
+                let mut q = Ptycho::new(&scan, o.clone(), p.clone()).unwrap();
+                q.set_features(bh.features().clone()).unwrap();
+                LlkRecord {
+                    cycle,
+                    algorithm: Algorithm::Bh,
+                    llk: q.llk(),
+                }
+            })
+            .collect();
+        let d = bh.features().position.clone().unwrap();
+        println!(
+            "bh position batch {batch_size}: rms offset {:.4} from {:.4}; llk {:.4e} -> {:.4e}",
+            rms(&d),
+            rms(&d0),
+            want[0].llk.poisson,
+            want[NEPOCH - 1].llk.poisson
+        );
+        assert!(
+            rms(&d) < rms(&d0),
+            "rms offset {} from {}",
+            rms(&d),
+            rms(&d0)
+        );
+        for graph in [false, true] {
+            let options = GpuOptions {
+                graph,
+                ..FUSED.options
+            };
+            let mut gpu =
+                GpuPtycho::new(&ctx(), &scan, object.clone(), probe.clone(), options).unwrap();
+            gpu.set_features(&moved).unwrap();
+            gpu.bh(&params, NEPOCH, 1).unwrap();
+            let got = gpu.bh_steps().unwrap();
+            assert_eq!(got.len(), steps.len());
+            let mut step = 0.0f64;
+            for (g, w) in got.iter().zip(&steps) {
+                assert_eq!(g.frames, w.frames);
+                for (a, b) in [
+                    (g.beta, w.beta),
+                    (g.alpha, w.alpha),
+                    (g.top, w.top),
+                    (g.bottom, w.bottom),
+                ] {
+                    // a CPU 0 (β in steepest descent) must be an exact GPU 0
+                    step = step.max(if b == 0.0 {
+                        a.abs()
+                    } else {
+                        (a - b).abs() / b.abs()
+                    });
+                }
+            }
+            let errs = [
+                llk_rel(gpu.history(), &want),
+                rel_l2(&gpu.object().unwrap(), &o),
+                rel_l2(&gpu.probe().unwrap(), &p),
+            ];
+            let g = gpu.features().unwrap().position.unwrap();
+            let position = (g.iter().zip(&d))
+                .flat_map(|(a, b)| [(a[0] - b[0]).abs(), (a[1] - b[1]).abs()])
+                .fold(0.0, f64::max);
+            println!(
+                "bh position batch {batch_size} graph {graph}: llk {:.2e} object {:.2e} \
+                 probe {:.2e} step {step:.2e} position {position:.2e}",
+                errs[0], errs[1], errs[2],
+            );
+            check(errs, [1e-4, 1e-4, 1e-4]);
+            assert!(step < 1e-4, "step: {step:e}");
+            assert!(position < 1e-4, "position: {position:e}");
+        }
+    }
+}
+
+/// rPIE epochs modelling a position, in batches of 4 (a short last one) around AP cycles
+/// modelling it and then in batches of 7, replay from graphs the eager bits: the object, the
+/// probe, the offsets and every LLK record. Dropping the position before any epoch gives a
+/// fresh start's bits.
+#[test]
+fn rpie_position_graphs_replay_bitwise_like_eager() {
+    let (scan, object, probe) = featured_start(2, false, false);
+    let moved = Features {
+        position: Some(drawn_offsets()),
+        ..Features::default()
+    };
+    let rpie = RpieParams {
+        calc_llk: 3,
+        ..ptychi::RPIE
+    };
+    let [ap, ..] = feature_cycles(3);
+    let new = |graph: bool| {
+        let options = GpuOptions {
+            graph,
+            ..FUSED.options
+        };
+        GpuPtycho::new(&ctx(), &scan, object.clone(), probe.clone(), options).unwrap()
+    };
+    let run = |graph: bool| {
+        let mut g = new(graph);
+        g.set_features(&moved).unwrap();
+        g.rpie(&rpie, 4).unwrap();
+        ap.gpu(&mut g, 4);
+        g.rpie(&rpie, 4).unwrap();
+        let sevens = RpieParams {
+            batch_size: 7,
+            ..rpie
+        };
+        g.rpie(&sevens, 4).unwrap();
+        bit_state(&mut g)
+    };
+    let (eager, graph) = (run(false), run(true));
+    assert_eq!(eager.llk.len(), 2 + 2 + 2 + 2 + 1);
+    assert!(eager.llk == graph.llk, "LLK records differ");
+    assert!(eager.object == graph.object, "object differs");
+    assert!(eager.probe == graph.probe, "probe differs");
+    assert!(eager.features == graph.features, "offsets differ");
+
+    let mut fresh = new(true);
+    fresh.rpie(&rpie, 4).unwrap();
+    let mut dropped = new(true);
+    dropped.set_features(&moved).unwrap();
+    dropped.set_features(&Features::default()).unwrap();
+    dropped.rpie(&rpie, 4).unwrap();
+    let (fresh, dropped) = (bit_state(&mut fresh), bit_state(&mut dropped));
+    assert!(dropped.features == [None, None, None]);
+    assert!(
+        fresh == dropped,
+        "dropping the position differs from a fresh start"
+    );
+}
+
+/// DM cycles modelling a position, two object-then-probe updates each, then ML cycles
+/// modelling it, give the bits of stacks of 7 frames with stacks of 4 and with one stack of
+/// every frame: the object, the probe, the offsets and every LLK record.
+#[test]
+fn position_is_bit_identical_across_stack_splits() {
     let (scan, object, probe) = featured_start(2, false, false);
     let moved = Features {
         position: Some(drawn_offsets()),
@@ -1173,6 +1449,7 @@ fn dm_position_is_bit_identical_across_stack_splits() {
         loop_obj_probe: 2,
         ..DmParams::default()
     };
+    let [.., ml] = feature_cycles(3);
     let run = |stack_size: usize| {
         let options = GpuOptions {
             stack_size,
@@ -1181,10 +1458,11 @@ fn dm_position_is_bit_identical_across_stack_splits() {
         let mut g = GpuPtycho::new(&ctx(), &scan, object.clone(), probe.clone(), options).unwrap();
         g.set_features(&moved).unwrap();
         g.dm(&dm, 6).unwrap();
+        ml.gpu(&mut g, 6);
         bit_state(&mut g)
     };
     let seven = run(7);
-    assert_eq!(seven.llk.len(), 3 + 1);
+    assert_eq!(seven.llk.len(), 3 + 3 + 1);
     for stack_size in [4, NPOS] {
         let other = run(stack_size);
         assert!(
@@ -1258,7 +1536,7 @@ fn bit_state(g: &mut GpuPtycho) -> RunBits {
 
 /// Features need the fused passes, one finite, positive scale per frame, one finite,
 /// non-negative background value per detector pixel and one finite offset pair per frame;
-/// rPIE and BH model none; the GPU's ML and ML gradients refuse a position before they touch
+/// rPIE models neither a scale nor a background and BH none, refused before they touch
 /// anything; a refused set leaves the features modelled.
 #[test]
 fn features_are_refused_where_they_cannot_run() {
@@ -1347,6 +1625,7 @@ fn features_are_refused_where_they_cannot_run() {
     let bh = BhParams {
         batch_size: NPOS,
         probe_rho: 0.01,
+        position_rho: 0.1,
         seed: 7,
     };
     assert!(gpu.bh(&bh, 1, 1).is_err());
@@ -1358,14 +1637,7 @@ fn features_are_refused_where_they_cannot_run() {
     cpu.set_features(moved.clone()).unwrap();
     gpu.set_features(&moved).unwrap();
     assert!(cpu.rpie(&ptychi::RPIE, 1).is_err());
-    assert!(cpu.ml(&MlParams::default(), 1).is_err());
     let (object, probe) = (gpu.object().unwrap(), gpu.probe().unwrap());
-    for err in [
-        gpu.ml(&MlParams::default(), 1).unwrap_err(),
-        gpu.ml_grads().unwrap_err(),
-    ] {
-        assert!(err.to_string().contains("positions"), "{err}");
-    }
     assert!(gpu.rpie(&ptychi::RPIE, 1).is_err());
     assert!(gpu.bh(&bh, 1, 1).is_err());
     assert_eq!(rel_l2(&gpu.object().unwrap(), &object), 0.0);
@@ -1374,9 +1646,10 @@ fn features_are_refused_where_they_cannot_run() {
     assert_eq!(gpu.cycle(), 0);
 }
 
-/// AP, DM and ML cycles modelling a scale and a background, then AP and DM cycles also
-/// modelling a position, replay from graphs the eager bits: the object, the probe, every feature and every
-/// LLK record, across features written in place between calls and the public LLK query.
+/// AP, DM and ML cycles modelling a scale and a background, then AP, DM and ML cycles also
+/// modelling a position, replay from graphs the eager bits: the object, the probe, every
+/// feature and every LLK record, across features written in place between calls and the
+/// public LLK query.
 /// Dropping the features before any cycle gives a fresh start's bits.
 #[test]
 fn feature_graphs_replay_bitwise_like_eager() {
@@ -1419,12 +1692,13 @@ fn feature_graphs_replay_bitwise_like_eager() {
         g.set_features(&moved).unwrap();
         ap.gpu(&mut g, 4);
         dm.gpu(&mut g, 4);
+        ml.gpu(&mut g, 4);
         let mut s = bit_state(&mut g);
         s.llk.push((None, llk_bits(query)));
         s
     };
     let (eager, graph) = (run(false), run(true));
-    assert_eq!(eager.llk.len(), 2 + 2 + 2 + 2 + 2 + 2 + 2 + 2);
+    assert_eq!(eager.llk.len(), 2 + 2 + 2 + 2 + 2 + 2 + 2 + 2 + 2);
     assert!(eager.llk == graph.llk, "LLK records differ");
     assert!(eager.object == graph.object, "object differs");
     assert!(eager.probe == graph.probe, "probe differs");

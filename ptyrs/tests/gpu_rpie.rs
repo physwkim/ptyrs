@@ -5,8 +5,8 @@ use std::sync::Arc;
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, DeviceCopy};
 use ptyrs::gpu::{
-    C32, Kernels, MASKED, POWER_CHUNK, PowerMax, RpieKernels, StackTable, UpdateSums, ViewDims,
-    Weight,
+    C32, Kernels, MASKED, POWER_CHUNK, PowerMax, RpieKernels, StackTable, UpdateSums, ViewAddr,
+    ViewDims, Views, Weight,
 };
 
 /// A stream, an eager execution context on it and the rPIE kernels.
@@ -185,6 +185,112 @@ fn power_max_and_weights_match_f64() {
         k.weight_inplace(&ctx, &mut inplace, &dw, mx, spec).unwrap();
         assert_eq!(inplace.to_host_vec(&stream).unwrap(), got);
     }
+}
+
+/// The f64 formula on two stacks of a split, planes past each stack untouched, and every
+/// frame's waves the same bits in the split as in one stack of the whole scan.
+#[test]
+fn obj_wave_to_psi_matches_f64() {
+    let (stream, ctx, k) = setup();
+    let (ny, nx, nprobe, nframe) = (8usize, 8usize, 2usize, 3usize);
+    let (nyo, nxo) = (16usize, 16usize);
+    let n = ny * nx;
+    let dims = ViewDims {
+        nframe: nframe as u32,
+        nmode: nprobe as u32,
+        nprobe: nprobe as u32,
+        nobj: 1,
+        frame: [ny as u32, nx as u32],
+        obj: [nyo as u32, nxo as u32],
+        quad_phase: 0.0,
+    };
+    // Frame 1 on whole pixels, so its zero-weight corners are not read.
+    let corners = [(3, 5, 0.25f32, 0.5f32), (0, 0, 0.0, 0.0), (7, 2, 0.75, 0.0)];
+    let addr: Vec<ViewAddr> = corners
+        .iter()
+        .flat_map(|&(oy, ox, fy, fx)| {
+            (0..nprobe as u32).map(move |p| ViewAddr {
+                oy,
+                ox,
+                fy,
+                fx,
+                probe: p,
+                obj: 0,
+            })
+        })
+        .collect();
+    let views = Views::new(&stream, dims, &addr).unwrap();
+    let obj = noise(nyo * nxo, 3, 1.0);
+    let dobj = up(&stream, &obj);
+    let fill = noise(2 * nprobe * n, 9, 1.0);
+    let whole_w = noise(nframe * nprobe * n, 5, 1.5);
+    let sample = |v: &ViewAddr, y: usize, x: usize| {
+        let (fy, fx) = (v.fy as f64, v.fx as f64);
+        let at =
+            |dy: usize, dx: usize| obj[(v.oy as usize + y + dy) * nxo + v.ox as usize + x + dx];
+        [
+            ((1.0 - fy) * (1.0 - fx), 0, 0),
+            ((1.0 - fy) * fx, 0, 1),
+            (fy * (1.0 - fx), 1, 0),
+            (fy * fx, 1, 1),
+        ]
+        .iter()
+        .filter(|(w, ..)| *w != 0.0)
+        .fold((0.0, 0.0), |(re, im), &(w, dy, dx)| {
+            let o = at(dy, dx);
+            (re + w * o.re as f64, im + w * o.im as f64)
+        })
+    };
+
+    let table = StackTable::new(&stream, &dims, &[1..3, 0..1]).unwrap();
+    let mut split = vec![C32::default(); nframe * nprobe * n];
+    for (s, f0, nf) in [(0, 1usize, 2usize), (1, 0, 1)] {
+        let w = &whole_w[f0 * nprobe * n..(f0 + nf) * nprobe * n];
+        let mut want: Vec<(f64, f64)> = fill.iter().map(|v| (v.re as f64, v.im as f64)).collect();
+        for kl in 0..nf * nprobe {
+            let v = &addr[f0 * nprobe + kl];
+            let plane = kl / nprobe * nprobe + v.probe as usize;
+            for j in 0..n {
+                let (y, x) = ((j / nx + ny / 2) % ny, (j % nx + nx / 2) % nx);
+                let o = sample(v, y, x);
+                let a = w[plane * n + j];
+                let (ar, ai) = (a.re as f64, a.im as f64);
+                want[kl * n + j] = (o.0 * ar - o.1 * ai, o.0 * ai + o.1 * ar);
+            }
+        }
+        let pad = vec![C32::default(); (2 - nf) * nprobe * n];
+        let dw = up(&stream, &[w, &pad].concat());
+        let mut psi = up(&stream, &fill);
+        k.obj_wave_to_psi(&ctx, &views, table.at(s), &dobj, &dw, &mut psi)
+            .unwrap();
+        let got = psi.to_host_vec(&stream).unwrap();
+        let scale = want.iter().map(|w| w.0.hypot(w.1)).fold(0.0, f64::max);
+        let err = max_rel(&got, &want, scale);
+        assert!(err < 1e-6, "entry {s}: max err / max |psi| {err:e}");
+        assert_eq!(got[nf * nprobe * n..], fill[nf * nprobe * n..], "entry {s}");
+        split[f0 * nprobe * n..(f0 + nf) * nprobe * n].copy_from_slice(&got[..nf * nprobe * n]);
+    }
+
+    let whole = 0..nframe as u32;
+    let one = StackTable::new(&stream, &dims, std::slice::from_ref(&whole)).unwrap();
+    let mut psi = DeviceBuffer::<C32>::zeroed(&stream, nframe * nprobe * n).unwrap();
+    k.obj_wave_to_psi(
+        &ctx,
+        &views,
+        one.at(0),
+        &dobj,
+        &up(&stream, &whole_w),
+        &mut psi,
+    )
+    .unwrap();
+    assert_eq!(psi.to_host_vec(&stream).unwrap(), split);
+
+    // `w` one plane short.
+    let short = DeviceBuffer::<C32>::zeroed(&stream, (nframe * nprobe - 1) * n).unwrap();
+    assert!(
+        k.obj_wave_to_psi(&ctx, &views, one.at(0), &dobj, &short, &mut psi)
+            .is_err()
+    );
 }
 
 /// Bit for bit `x + s * num` with the product and the sum rounded separately, and the sums
