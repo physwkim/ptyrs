@@ -228,15 +228,16 @@ pub mod grad_kernels {
             } else {
                 ((total - *norms.background) / *norms.icalc).sqrt()
             };
-            for (x, len, f) in [
-                (obj, nobj, (ps / os * s).sqrt()),
-                (probe, nprobe, (os / ps * s).sqrt()),
-            ] {
+            // Two calls, not a loop over an array of the pairs: that array lives in local
+            // memory.
+            let scale = |x: *mut f32, len: u32, f: f32| {
                 if i < len as usize {
                     let v = load_c(x, i);
                     store_c(x, i, (v.0 * f, v.1 * f));
                 }
-            }
+            };
+            scale(obj, nobj, (ps / os * s).sqrt());
+            scale(probe, nprobe, (os / ps * s).sqrt());
         }
     }
 
@@ -489,10 +490,11 @@ pub mod grad_kernels {
         let mut f = t;
         while f < n {
             let d = unsafe { *den.add(f) };
-            for (m, d) in max.iter_mut().zip([d.dy, d.dx]) {
-                if d > *m {
-                    *m = d;
-                }
+            if d.dy > max[0] {
+                max[0] = d.dy;
+            }
+            if d.dx > max[1] {
+                max[1] = d.dx;
             }
             f += seg;
         }
@@ -617,9 +619,8 @@ unsafe fn block_pair(s: *mut f32, acc: [f32; 2]) -> [f32; 2] {
     let t = thread::threadIdx_x() as usize;
     let seg = PIXEL_THREADS as usize;
     unsafe {
-        for (j, &a) in acc.iter().enumerate() {
-            *s.add(j * seg + t) = a;
-        }
+        *s.add(t) = acc[0];
+        *s.add(seg + t) = acc[1];
         crate::block_sum::<2>(s);
         [*s, *s.add(seg)]
     }

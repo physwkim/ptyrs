@@ -41,6 +41,12 @@ pub const FUSED_TO_PSI: u32 = 2;
 pub const FUSED_LLK: u32 = 4;
 /// [`cols`] applies the modulus projection and the inverse column FFT.
 pub const FUSED_PROJECT: u32 = 8;
+/// A frame pass walks the stack last to first: grid row `blockIdx.y` takes stack slot `count -
+/// 1 - blockIdx.y` of the pass's `count` frames (views for [`rows_fwd`]), not `blockIdx.y`.
+/// Blocks start in grid order, so a pass walking opposite to the one whose plane it reads
+/// first reads what that one touched last, which L2 still holds when the stack's planes
+/// outgrow it.
+pub const FUSED_DOWN: u32 = 16;
 /// [`cols`] applies the Poisson LLK gradient scale and the inverse column FFT; never with
 /// `FUSED_PROJECT`. [`shift_rows_inv`]'s position sums then take the new waves as the
 /// exit-wave correction, in place of `x - O W`.
@@ -91,6 +97,20 @@ pub const FUSED_ROW_THREADS: u32 = 128;
 pub struct FusedCfg {
     pub flags: u32,
     pub alpha: f32,
+}
+
+/// The stack slot, of `count`, of a frame pass block: its grid row `blockIdx.y`, or `count -
+/// 1 - blockIdx.y` under `FUSED_DOWN`; `None` past `count`, as in a stack short of `nf_max`.
+#[device]
+fn walk_slot(cfg: FusedCfg, count: u32) -> Option<u32> {
+    let by = thread::blockIdx_y();
+    if by >= count {
+        None
+    } else if cfg.flags & FUSED_DOWN != 0 {
+        Some(count - 1 - by)
+    } else {
+        Some(by)
+    }
 }
 
 /// Device addresses of the fused passes' buffers; a pass reads and writes only those its doc
@@ -270,11 +290,12 @@ unsafe fn row_fft_at<const NX: u32, const INV: bool>(
     unsafe { block_fft::<NX, INV>(r, s.add(skew as usize), lane.b, lane.f, rows) }
 }
 
-/// Pass A: `work[kl, ys, :] = FFT_x(w[ys, :])` for view `k0 + kl` of the stack and stored
-/// row `ys`, with `w = PO` as `kernels::obj_probe_to_psi` stores it or, under `FUSED_DM`,
-/// `w = (2 - a) PO - (1 - a) psi` as `kernels::dm_reflect` computes it. Reads `obj`,
-/// `probe`, `views` and under `FUSED_DM` `psi`; writes `work`. Grid `(ny / rows, nf_max *
-/// nmode)`, block `FUSED_ROW_THREADS`, dynamic shared memory `rows` row FFTs ([`FFT_SKEW`]).
+/// Pass A: `work[kl, ys, :] = FFT_x(w[ys, :])` for view `k0 + kl` of the stack, `kl` of
+/// grid row `blockIdx.y` ([`FUSED_DOWN`]), and stored row `ys`, with `w = PO` as
+/// `kernels::obj_probe_to_psi` stores it or, under `FUSED_DM`, `w = (2 - a) PO - (1 - a)
+/// psi` as `kernels::dm_reflect` computes it. Reads `obj`, `probe`, `views` and under
+/// `FUSED_DM` `psi`; writes `work`. Grid `(ny / rows, nf_max * nmode)`, block
+/// `FUSED_ROW_THREADS`, dynamic shared memory `rows` row FFTs ([`FFT_SKEW`]).
 ///
 /// # Safety
 ///
@@ -316,10 +337,9 @@ unsafe fn rows_fwd_with<const NX: u32, const SHIFT: bool>(
     cfg: FusedCfg,
 ) {
     let (f0, nf) = unsafe { stack_frames(ctl, g) };
-    let kl = thread::blockIdx_y();
-    if kl >= nf * g.nmode {
+    let Some(kl) = walk_slot(cfg, nf * g.nmode) else {
         return;
-    }
+    };
     let (ny, nx) = (g.ny, NX);
     let n = ny as usize * nx as usize;
     let lane = row_lane::<NX>();
@@ -373,19 +393,20 @@ unsafe fn rows_fwd_with<const NX: u32, const SHIFT: bool>(
 }
 
 /// Pass B: column FFT of columns `u = blockIdx.x * FUSED_COLS + c` of every mode `m` of
-/// frame `fl = blockIdx.y`, then per far-field pixel the model intensity `I = sum_m
-/// |Psi_m|^2 / n` in ascending `m` and `calc = I`, under `FUSED_SCALE` times `s = scale[f0 +
-/// fl]` and under `FUSED_BACKGROUND` plus `background[j]` at detector pixel `j`. Under
-/// `FUSED_LLK`, `groups[fl, blockIdx.x]` gets the LLK sums of `kernels::llk` of `calc` over
-/// the block's pixels, under `FUSED_SCALE_SUMS` `scale_groups[fl, blockIdx.x]` the
-/// [`ScalePartial`] sums, and under `FUSED_BACKGROUND_SUMS` `background_ratio[fl, j]` is `obs
-/// / max(calc, 1e-12)`, 0 where masked. Under `FUSED_PROJECT`, every
-/// mode is scaled by `sqrt(obs / max(calc, 1e-12)) / n`, `1 / n` where masked (with `calc =
-/// I` the scale of `kernels::apply_amplitude`), inverse column-FFT'd and stored back.
-/// `FUSED_GRAD` does the same with the scale `2 s (1 - obs / max(calc, 1e-12)) / n`, 0 where
-/// masked, which makes the stored waves the gradient of the Poisson LLK sum of `calc` over
-/// `(Re psi, Im psi)`. Reads `counts`, and `scale` and `background` under their flags;
-/// writes `work`, and `groups`, `scale_groups` and `background_ratio` under theirs.
+/// frame `fl` of grid row `blockIdx.y` ([`FUSED_DOWN`]), then per far-field pixel the model
+/// intensity `I = sum_m |Psi_m|^2 / n` in ascending `m` and `calc = I`, under `FUSED_SCALE`
+/// times `s = scale[f0 + fl]` and under `FUSED_BACKGROUND` plus `background[j]` at detector
+/// pixel `j`. Under `FUSED_LLK`, `groups[fl, blockIdx.x]` gets the LLK sums of
+/// `kernels::llk` of `calc` over the block's pixels, under `FUSED_SCALE_SUMS`
+/// `scale_groups[fl, blockIdx.x]` the [`ScalePartial`] sums, and under
+/// `FUSED_BACKGROUND_SUMS` `background_ratio[fl, j]` is `obs / max(calc, 1e-12)`, 0 where
+/// masked. Under `FUSED_PROJECT`, every mode is scaled by `sqrt(obs / max(calc, 1e-12)) /
+/// n`, `1 / n` where masked (with `calc = I` the scale of `kernels::apply_amplitude`),
+/// inverse column-FFT'd and stored back. `FUSED_GRAD` does the same with the scale `2 s (1
+/// - obs / max(calc, 1e-12)) / n`, 0 where masked, which makes the stored waves the
+/// gradient of the Poisson LLK sum of `calc` over `(Re psi, Im psi)`. Reads `counts`, and
+/// `scale` and `background` under their flags; writes `work`, and `groups`, `scale_groups`
+/// and `background_ratio` under theirs.
 ///
 /// One 1D block of `nmode * FUSED_COLS * tpf` threads (`tpf = ny / fft_ept(ny)`): thread `tid`
 /// is thread `f = (tid / FUSED_COLS) % tpf` of FFT `m * FUSED_COLS + c`, `c = tid %
@@ -409,10 +430,9 @@ pub unsafe fn cols<const NY: u32, const TERMS: u32>(
     cfg: FusedCfg,
 ) {
     let (f0, nf) = unsafe { stack_frames(ctl, g) };
-    let fl = thread::blockIdx_y();
-    if fl >= nf {
+    let Some(fl) = walk_slot(cfg, nf) else {
         return;
-    }
+    };
     let (ny, nx, nmode) = (NY, g.nx, g.nmode);
     let n = ny as usize * nx as usize;
     let ept = const { fft_ept(NY) };
@@ -544,17 +564,19 @@ pub unsafe fn cols<const NY: u32, const TERMS: u32>(
             let hi = if sums { 7 } else { 4 };
             let ns = nslot as usize;
             if m == 0 {
-                let terms = [
-                    acc.poisson,
-                    acc.gaussian,
-                    acc.euclidean,
-                    acc.icalc,
-                    sacc.intensity,
-                    sacc.ratio,
-                    sacc.amplitude,
-                ];
-                for (j, &t) in terms.iter().enumerate().take(hi).skip(lo) {
-                    *slots.add(j * ns + tid as usize) = t;
+                // One store per term: an array indexed by the runtime `lo..hi` lives in
+                // local memory.
+                let s = slots.add(tid as usize);
+                if llk {
+                    *s = acc.poisson;
+                    *s.add(ns) = acc.gaussian;
+                    *s.add(2 * ns) = acc.euclidean;
+                    *s.add(3 * ns) = acc.icalc;
+                }
+                if sums {
+                    *s.add(4 * ns) = sacc.intensity;
+                    *s.add(5 * ns) = sacc.ratio;
+                    *s.add(6 * ns) = sacc.amplitude;
                 }
             }
             let mut half = nslot / 2;
@@ -613,13 +635,13 @@ fn new_waves(p: FusedPtrs, cfg: FusedCfg) -> *mut f32 {
     }
 }
 
-/// Pass C: for frame `fl = blockIdx.y` of the stack and stored row `ys`, the inverse row FFT
-/// of every mode `m` gives the projected exit wave `proj`. The new exit wave is `proj`, or
-/// under `FUSED_DM` `proj + (1 - a) (PO - R)` with `R = (2 - a) PO - (1 - a) psi` (the
-/// arithmetic of `kernels::dm_reflect` then `kernels::add_c32`); it goes to
-/// `new_waves`. Reads `work`, `views`, and under `FUSED_DM` `obj`, `probe` and `psi`;
-/// writes `work` or `psi`. Grid `(ny / rows, nf_max)`, block `FUSED_ROW_THREADS`, dynamic
-/// shared memory `rows` row FFTs ([`FFT_SKEW`]).
+/// Pass C: for frame `fl` of grid row `blockIdx.y` ([`FUSED_DOWN`]) of the stack and stored
+/// row `ys`, the inverse row FFT of every mode `m` gives the projected exit wave `proj`.
+/// The new exit wave is `proj`, or under `FUSED_DM` `proj + (1 - a) (PO - R)` with `R = (2
+/// - a) PO - (1 - a) psi` (the arithmetic of `kernels::dm_reflect` then
+/// `kernels::add_c32`); it goes to `new_waves`. Reads `work`, `views`, and under `FUSED_DM`
+/// `obj`, `probe` and `psi`; writes `work` or `psi`. Grid `(ny / rows, nf_max)`, block
+/// `FUSED_ROW_THREADS`, dynamic shared memory `rows` row FFTs ([`FFT_SKEW`]).
 ///
 /// # Safety
 ///
@@ -633,10 +655,9 @@ pub unsafe fn rows_inv<const NX: u32>(
     cfg: FusedCfg,
 ) {
     let (f0, nf) = unsafe { stack_frames(ctl, g) };
-    let fl = thread::blockIdx_y();
-    if fl >= nf {
+    let Some(fl) = walk_slot(cfg, nf) else {
         return;
-    }
+    };
     let (ny, nx) = (g.ny, NX);
     let n = ny as usize * nx as usize;
     let lane = row_lane::<NX>();
@@ -833,10 +854,10 @@ unsafe fn gather_with<const SHIFT: bool>(
 // `H = DFT(Y_p)` and the probe adjoint's `G = conj(e_f) H`.
 
 /// Each frame's column half of the shifted probe: `T[fl * nprobe + p, ys, kx] =
-/// IDFT_y(A_p e_f)` over `ky` for `f = f0 + fl`, and under `FUSED_SHIFT_DEN` or
-/// `FUSED_SHIFT_POSITION` `T_y` the same of `A_p e_f (-2 pi i freq(ky, ny))` into
-/// `shift_adj`. Reads `offsets` and `spectrum`; writes `shift`, and `shift_adj` under those
-/// flags.
+/// IDFT_y(A_p e_f)` over `ky` for `f = f0 + fl` of grid row `blockIdx.y` ([`FUSED_DOWN`]),
+/// and under `FUSED_SHIFT_DEN` or `FUSED_SHIFT_POSITION` `T_y` the same of `A_p e_f (-2 pi
+/// i freq(ky, ny))` into `shift_adj`. Reads `offsets` and `spectrum`; writes `shift`, and
+/// `shift_adj` under those flags.
 ///
 /// One 1D block of `nprobe * FUSED_COLS * tpf` threads mapped as [`cols`] maps modes, with
 /// probe modes for modes; grid `(nx / FUSED_COLS, nf_max)`; dynamic shared memory `8 * ny`
@@ -854,10 +875,9 @@ pub unsafe fn shift_pre<const NY: u32>(
     cfg: FusedCfg,
 ) {
     let (f0, nf) = unsafe { stack_frames(ctl, g) };
-    let fl = thread::blockIdx_y();
-    if fl >= nf {
+    let Some(fl) = walk_slot(cfg, nf) else {
         return;
-    }
+    };
     let (ny, nx) = (NY, g.nx);
     let n = ny as usize * nx as usize;
     let ept = const { fft_ept(NY) };
@@ -927,21 +947,23 @@ pub unsafe fn shift_pre<const NY: u32>(
     }
 }
 
-/// [`rows_inv`] with the shifted probe, per frame `fl = blockIdx.y` and stored row `ys`, probe
-/// mode `p` outermost: `W_p` from the `T` row, then for each object mode `o` the new wave `x`
-/// of mode `o * nprobe + p` as [`rows_inv`] stores it (the DM add-back with `O W_p`). Under
-/// `FUSED_SHIFT_OBJ` `shift_power[fl] = sum_p |W_p|^2` and `shift_obj[fl * nobj + o] = sum_p
-/// conj(W_p) x`, both in ascending `p`. Under `FUSED_SHIFT_PROBE` `shift_adj`'s row gets `X
-/// = DFT_x(sum_o conj(O_o) x)`, `o` ascending, in place of the `T_y` row it has read. With
-/// the slopes `dW / dx = IDFT_x(T (-2 pi i freq(kx, nx)))` and `dW / dy = IDFT_x(T_y)`, under `FUSED_SHIFT_DEN` `shift_den[fl,
-/// blockIdx.x]` gets the block's `sum |O_o|^2 |dW_p / d_ax|^2` over its pixels, `o` and `p`,
-/// and under `FUSED_SHIFT_POSITION` `shift_grad[fl, blockIdx.x]` the block's `Re sum conj(x -
-/// O_o W_p) O_o dW_p / d_ax`, `x` alone under `FUSED_GRAD`; the difference is taken per pixel
-/// as `sum_o conj(O_o) x - sum_o |O_o|^2 W_p`, and each sum is a fixed tree over the block.
-/// Reads `work`, `views`, `obj`, `shift`, `shift_adj` under either sum's flag, and `psi` under
-/// `FUSED_DM`; writes the new waves and what the flags name. Grid `(ny / rows, nf_max)`,
-/// block `FUSED_ROW_THREADS`, dynamic shared memory the larger of `shift_stage_bytes(flags,
-/// nx)` bytes then `rows` row FFTs ([`FFT_SKEW`]), and `16 * FUSED_ROW_THREADS` bytes.
+/// [`rows_inv`] with the shifted probe, per frame `fl` of grid row `blockIdx.y`
+/// ([`FUSED_DOWN`]) and stored row `ys`, probe mode `p` outermost: `W_p` from the `T` row,
+/// then for each object mode `o` the new wave `x` of mode `o * nprobe + p` as [`rows_inv`]
+/// stores it (the DM add-back with `O W_p`). Under `FUSED_SHIFT_OBJ` `shift_power[fl] =
+/// sum_p |W_p|^2` and `shift_obj[fl * nobj + o] = sum_p conj(W_p) x`, both in ascending
+/// `p`. Under `FUSED_SHIFT_PROBE` `shift_adj`'s row gets `X = DFT_x(sum_o conj(O_o) x)`,
+/// `o` ascending, in place of the `T_y` row it has read. With the slopes `dW / dx =
+/// IDFT_x(T (-2 pi i freq(kx, nx)))` and `dW / dy = IDFT_x(T_y)`, under `FUSED_SHIFT_DEN`
+/// `shift_den[fl, blockIdx.x]` gets the block's `sum |O_o|^2 |dW_p / d_ax|^2` over its
+/// pixels, `o` and `p`, and under `FUSED_SHIFT_POSITION` `shift_grad[fl, blockIdx.x]` the
+/// block's `Re sum conj(x - O_o W_p) O_o dW_p / d_ax`, `x` alone under `FUSED_GRAD`; the
+/// difference is taken per pixel as `sum_o conj(O_o) x - sum_o |O_o|^2 W_p`, and each sum
+/// is a fixed tree over the block. Reads `work`, `views`, `obj`, `shift`, `shift_adj` under
+/// either sum's flag, and `psi` under `FUSED_DM`; writes the new waves and what the flags
+/// name. Grid `(ny / rows, nf_max)`, block `FUSED_ROW_THREADS`, dynamic shared memory the
+/// larger of `shift_stage_bytes(flags, nx)` bytes then `rows` row FFTs ([`FFT_SKEW`]), and
+/// `16 * FUSED_ROW_THREADS` bytes.
 ///
 /// # Safety
 ///
@@ -986,10 +1008,9 @@ unsafe fn shift_rows_inv_with<const NX: u32, const SUMS: bool>(
     cfg: FusedCfg,
 ) {
     let (f0, nf) = unsafe { stack_frames(ctl, g) };
-    let fl = thread::blockIdx_y();
-    if fl >= nf {
+    let Some(fl) = walk_slot(cfg, nf) else {
         return;
-    }
+    };
     let (ny, nx) = (g.ny, NX);
     let n = ny as usize * nx as usize;
     let lane = row_lane::<NX>();
@@ -1245,9 +1266,9 @@ unsafe fn shift_rows_inv_with<const NX: u32, const SUMS: bool>(
     }
 }
 
-/// The column FFT of [`shift_rows_inv`]'s `X`: `H = DFT_y(X)` over `ys` for frame `fl =
-/// blockIdx.y`, probe mode `p`, and the plane becomes the probe adjoint's `G = conj(e_f) H`.
-/// Reads `offsets` and `shift_adj`; writes `shift_adj`.
+/// The column FFT of [`shift_rows_inv`]'s `X`: `H = DFT_y(X)` over `ys` for frame `fl`
+/// of grid row `blockIdx.y` ([`FUSED_DOWN`]), probe mode `p`, and the plane becomes the
+/// probe adjoint's `G = conj(e_f) H`. Reads `offsets` and `shift_adj`; writes `shift_adj`.
 ///
 /// Block and grid as [`shift_pre`]; dynamic shared memory `8 * ny` bytes of `e_y`, then
 /// `nprobe * FUSED_COLS` column FFTs ([`FFT_SKEW`]).
@@ -1256,12 +1277,16 @@ unsafe fn shift_rows_inv_with<const NX: u32, const SUMS: bool>(
 ///
 /// As [`shift_pre`], `shift_adj` holding [`shift_rows_inv`]'s `X` of this stack.
 #[device]
-pub unsafe fn shift_post<const NY: u32>(p: FusedPtrs, ctl: *const StackCtl, g: StackGeom) {
+pub unsafe fn shift_post<const NY: u32>(
+    p: FusedPtrs,
+    ctl: *const StackCtl,
+    g: StackGeom,
+    cfg: FusedCfg,
+) {
     let (f0, nf) = unsafe { stack_frames(ctl, g) };
-    let fl = thread::blockIdx_y();
-    if fl >= nf {
+    let Some(fl) = walk_slot(cfg, nf) else {
         return;
-    }
+    };
     let (ny, nx) = (NY, g.nx);
     let n = ny as usize * nx as usize;
     let ept = const { fft_ept(NY) };

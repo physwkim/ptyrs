@@ -242,13 +242,25 @@ pub fn freq(k: u32, n: u32) -> f32 {
 }
 
 /// `exp(-2 pi i d freq(k, n))` as `(cos, sin)`: bin `k`'s factor of a shift by `d` pixels.
-/// The phase is reduced to half a turn before the sine and cosine.
 #[device]
 pub fn ramp(d: f32, k: u32, n: u32) -> (f32, f32) {
-    let mut t = d * freq(k, n);
-    t -= (t + 0.5).floor();
-    let a = -2.0 * core::f32::consts::PI * t;
-    (a.cos(), a.sin())
+    let (c, s) = cos_sin_pi(2.0 * d * freq(k, n));
+    (c, -s)
+}
+
+/// `(cos(pi x), sin(pi x))`. libdevice's `cospif`/`sinpif` reduce `x` exactly; `cosf`/`sinf`
+/// carry a Payne-Hanek path for `|pi x| >= 105615` that costs stack, registers and code in
+/// every kernel that inlines them.
+#[device]
+fn cos_sin_pi(x: f32) -> (f32, f32) {
+    // SAFETY: libdevice functions of one finite or non-finite f32, no side effects.
+    unsafe { (__nv_cospif(x), __nv_sinpif(x)) }
+}
+
+#[device]
+unsafe extern "C" {
+    fn __nv_cospif(x: f32) -> f32;
+    fn __nv_sinpif(x: f32) -> f32;
 }
 
 /// Adds an unmasked pixel of count `obs` and calculated intensity `calc >= 0` to `acc`:
@@ -278,8 +290,7 @@ pub fn psi_index(y: u32, x: u32, ny: u32, nx: u32) -> usize {
 pub fn quad_phase(quad: f32, y: u32, x: u32, ny: u32, nx: u32) -> (f32, f32) {
     let dy = y as i32 - (ny / 2) as i32;
     let dx = x as i32 - (nx / 2) as i32;
-    let a = quad * (dy * dy + dx * dx) as f32;
-    (a.cos(), a.sin())
+    cos_sin_pi(quad * core::f32::consts::FRAC_1_PI * (dy * dy + dx * dx) as f32)
 }
 
 #[device]
