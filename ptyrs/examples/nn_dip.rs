@@ -1,7 +1,7 @@
 //! DIP (DESIGN §4) against the engine's ML on two held-out scans of `nn_train_ptychonn`, a random
 //! object and `sim::object`, both on the GPU with the known probe fixed. DIP trains its network
 //! by Adam on the object gradient of `GpuPtycho::ml_grads`. ML starts from the flat object after
-//! [`DM_CYCLES`] DM cycles, as PyNX's recipes run DM or AP first: at the flat start the narrow
+//! `DM_CYCLES` DM cycles, as PyNX's recipes run DM or AP first: at the flat start the narrow
 //! probe's far field underflows f32 at pixels with counts, so the GPU Poisson LLK is infinite
 //! and ML's line search does not move. The DM cycles count as iterations of ML's curve. Every
 //! LLK curve goes to `<curves.tsv>`, one row per iteration, iteration 0 being the start; the
