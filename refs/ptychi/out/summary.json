@@ -1965,90 +1965,90 @@
   "poisson": {
    "per_factor": {
     "1.01": {
-     "by_epochs": "sweep_lsqml_poisson_b64",
-     "by_wall": null,
-     "by_wall_indicative": "sweep_lsqml_poisson_b64"
+     "by_epochs": "timing_sweep_lsqml_poisson_b64",
+     "by_wall": "timing_sweep_lsqml_poisson_b64",
+     "by_wall_indicative": "timing_sweep_lsqml_poisson_b64"
     },
     "1.02": {
-     "by_epochs": "sweep_lsqml_poisson_b64",
-     "by_wall": null,
+     "by_epochs": "timing_sweep_lsqml_poisson_b64",
+     "by_wall": "timing_sweep_lsqml_poisson_b64",
      "by_wall_indicative": "sweep_lsqml_poisson_b64"
     },
     "1.05": {
-     "by_epochs": "sweep_lsqml_poisson_b32",
-     "by_wall": null,
+     "by_epochs": "timing_sweep_lsqml_poisson_b64",
+     "by_wall": "timing_sweep_lsqml_poisson_b64",
      "by_wall_indicative": "sweep_lsqml_poisson_b32"
     },
     "1.1": {
      "by_epochs": "sweep_lsqml_poisson_b32",
-     "by_wall": null,
+     "by_wall": "timing_sweep_lsqml_poisson_b64",
      "by_wall_indicative": "sweep_lsqml_poisson_b32"
     },
     "1.2": {
      "by_epochs": "sweep_lsqml_poisson_b16",
-     "by_wall": null,
+     "by_wall": "timing_sweep_lsqml_poisson_b64",
      "by_wall_indicative": "sweep_lsqml_poisson_b32"
     },
     "1.5": {
      "by_epochs": "sweep_lsqml_poisson_b16",
-     "by_wall": null,
+     "by_wall": "timing_sweep_lsqml_poisson_b64",
      "by_wall_indicative": "sweep_lsqml_poisson_b64"
     },
     "2": {
      "by_epochs": "sweep_lsqml_poisson_b16",
-     "by_wall": null,
+     "by_wall": "timing_sweep_lsqml_poisson_b64",
      "by_wall_indicative": "sweep_lsqml_poisson_b64"
     }
    },
    "tightest_reached": "1.01",
    "optimal": {
-    "by_epochs": "sweep_lsqml_poisson_b64",
-    "by_wall": null,
-    "by_wall_indicative": "sweep_lsqml_poisson_b64"
+    "by_epochs": "timing_sweep_lsqml_poisson_b64",
+    "by_wall": "timing_sweep_lsqml_poisson_b64",
+    "by_wall_indicative": "timing_sweep_lsqml_poisson_b64"
    }
   },
   "gaussian": {
    "per_factor": {
     "1.01": {
-     "by_epochs": "sweep_lsqml_gaussian_b32",
-     "by_wall": null,
+     "by_epochs": "timing_sweep_lsqml_gaussian_b32",
+     "by_wall": "timing_sweep_lsqml_gaussian_b32",
      "by_wall_indicative": "sweep_lsqml_gaussian_b32"
     },
     "1.02": {
      "by_epochs": "sweep_lsqml_gaussian_b16",
-     "by_wall": null,
+     "by_wall": "timing_sweep_lsqml_gaussian_b32",
      "by_wall_indicative": "sweep_lsqml_gaussian_b32"
     },
     "1.05": {
      "by_epochs": "sweep_lsqml_gaussian_b16",
-     "by_wall": null,
+     "by_wall": "timing_sweep_lsqml_gaussian_b32",
      "by_wall_indicative": "sweep_lsqml_gaussian_b32"
     },
     "1.1": {
      "by_epochs": "sweep_lsqml_gaussian_b16",
-     "by_wall": null,
+     "by_wall": "timing_sweep_lsqml_gaussian_b32",
      "by_wall_indicative": "sweep_lsqml_gaussian_b32"
     },
     "1.2": {
      "by_epochs": "sweep_lsqml_gaussian_b16",
-     "by_wall": null,
+     "by_wall": "timing_sweep_lsqml_gaussian_b32",
      "by_wall_indicative": "sweep_lsqml_gaussian_b32"
     },
     "1.5": {
      "by_epochs": "sweep_lsqml_gaussian_b16",
-     "by_wall": null,
+     "by_wall": "timing_sweep_lsqml_gaussian_b32",
      "by_wall_indicative": "sweep_lsqml_gaussian_b32"
     },
     "2": {
      "by_epochs": "sweep_lsqml_gaussian_b16",
-     "by_wall": null,
+     "by_wall": "timing_sweep_lsqml_gaussian_b32",
      "by_wall_indicative": "sweep_lsqml_gaussian_b32"
     }
    },
    "tightest_reached": "1.01",
    "optimal": {
-    "by_epochs": "sweep_lsqml_gaussian_b32",
-    "by_wall": null,
+    "by_epochs": "timing_sweep_lsqml_gaussian_b32",
+    "by_wall": "timing_sweep_lsqml_gaussian_b32",
     "by_wall_indicative": "sweep_lsqml_gaussian_b32"
    }
   }
@@ -2057,52 +2057,52 @@
   "chosen": "bh_sweep_cg_rho0.01",
   "per_factor": {
    "1.01": {
-    "by_epochs": "bh_sweep_gd_rho0.01_b96",
-    "by_wall": null,
+    "by_epochs": "timing_bh_sweep_gd_rho0.01_b96",
+    "by_wall": "timing_bh_sweep_gd_rho0.01_b96",
     "by_wall_indicative": "bh_sweep_gd_rho0.01_b96"
    },
    "1.02": {
-    "by_epochs": "bh_sweep_gd_rho0.01_b96",
-    "by_wall": null,
+    "by_epochs": "timing_bh_sweep_gd_rho0.01_b96",
+    "by_wall": "timing_bh_sweep_gd_rho0.01_b96",
     "by_wall_indicative": "bh_sweep_gd_rho0.01_b96"
    },
    "1.05": {
-    "by_epochs": "bh_sweep_gd_rho0.01_b96",
-    "by_wall": null,
+    "by_epochs": "timing_bh_sweep_gd_rho0.01_b96",
+    "by_wall": "timing_bh_sweep_gd_rho0.01_b96",
     "by_wall_indicative": "bh_sweep_gd_rho0.01_b96"
    },
    "1.1": {
-    "by_epochs": "bh_sweep_gd_rho0.01_b96",
-    "by_wall": null,
+    "by_epochs": "timing_bh_sweep_gd_rho0.01_b96",
+    "by_wall": "timing_bh_sweep_gd_rho0.01_b96",
     "by_wall_indicative": "bh_sweep_gd_rho0.01_b96"
    },
    "1.2": {
     "by_epochs": "bh_sweep_cg_rho0.01_b96",
-    "by_wall": null,
+    "by_wall": "timing_bh_sweep_gd_rho0.01_b96",
     "by_wall_indicative": "bh_sweep_gd_rho0.01_b96"
    },
    "1.5": {
-    "by_epochs": "bh_sweep_gd_rho0.01_b96",
-    "by_wall": null,
+    "by_epochs": "timing_bh_sweep_gd_rho0.01_b96",
+    "by_wall": "timing_bh_sweep_gd_rho0.01_b96",
     "by_wall_indicative": "bh_sweep_gd_rho0.01_b96"
    },
    "2": {
     "by_epochs": "bh_sweep_cg_rho0.01_b96",
-    "by_wall": null,
+    "by_wall": "timing_bh_sweep_gd_rho0.01_b96",
     "by_wall_indicative": "bh_sweep_gd_rho0.01_b96"
    }
   },
   "tightest_reached": "1.01",
   "optimal": {
-   "by_epochs": "bh_sweep_gd_rho0.01_b96",
-   "by_wall": null,
+   "by_epochs": "timing_bh_sweep_gd_rho0.01_b96",
+   "by_wall": "timing_bh_sweep_gd_rho0.01_b96",
    "by_wall_indicative": "bh_sweep_gd_rho0.01_b96"
   }
  },
  "b7_epoch_ratio": {
   "bh_cg": "bh_sweep_cg_rho0.01",
   "lsqml_best_batch": {
-   "run": "sweep_lsqml_gaussian_b32",
+   "run": "timing_sweep_lsqml_gaussian_b32",
    "over_bh_cg": {
     "1.01": 0.7659574468085106,
     "1.02": 0.7333333333333333,
@@ -2126,7 +2126,7 @@
    }
   },
   "lsqml_best_batch_over_bh_best": {
-   "bh_run": "bh_sweep_gd_rho0.01_b96",
+   "bh_run": "timing_bh_sweep_gd_rho0.01_b96",
    "ratio": {
     "1.01": 1.8,
     "1.02": 1.736842105263158,
