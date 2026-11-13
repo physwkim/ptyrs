@@ -33,6 +33,9 @@ def rel(a, b):
     return np.where(b == 0, np.abs(a), np.abs(a - b) / np.where(b == 0, 1, np.abs(b)))
 
 
+MASKED = 65535
+
+
 def intensity(ptycho, obj, probe):
     """`ptycho`'s model intensity of `obj` and `probe`, `[nframe, ny, nx]` in the counts'
     detector order (zero frequency at the centre; `forward` has it at `[0, 0]`)."""
@@ -40,42 +43,88 @@ def intensity(ptycho, obj, probe):
     return np.fft.fftshift(icalc, axes=(-2, -1))
 
 
-def make_scenario(n=64, npos=30, nprobe=2, photons=2e5, seed=3):
-    """A far-field scan of `npos` Fermat-spiral frames of `n` pixels drawn from a smooth object
-    and `nprobe` Gaussian probe modes, Poisson counts with row 3 and column 20 masked, and a
-    start of a random-phase object and the probe with a quadratic phase error, scaled to the
-    counts. Returns (scan, object, probe, frame count)."""
-    rng = np.random.default_rng(seed)
+def smoothstep(e0, e1, v):
+    t = np.clip((v - e0) / (e1 - e0), 0, 1)
+    return t * t * (3 - 2 * t)
+
+
+def sim_object(side):
+    """`base::sim::object`: a Siemens star and three Gaussian features in phase and amplitude,
+    `[1, side, side]`."""
+    v, u = (np.mgrid[:side, :side] - side / 2) / (side / 2)
+    r = np.hypot(u, v)
+
+    def blob(cu, cv, w):
+        return np.exp(-((u - cu) ** 2 + (v - cv) ** 2) / (2 * w * w))
+
+    star = (0.5 * (1 + np.tanh(3 * np.cos(12 * np.arctan2(v, u)))) * smoothstep(0.08, 0.12, r)
+            * (1 - smoothstep(0.55, 0.6, r)))
+    phase = star + 0.6 * blob(0.55, -0.45, 0.12) - 0.4 * blob(-0.5, 0.5, 0.1)
+    amp = 0.95 - 0.3 * blob(-0.45, -0.55, 0.15) - 0.15 * star
+    return (amp * np.exp(1j * phase))[None]
+
+
+def sim_probe(n, nmode):
+    """`base::sim::probe`: `nmode` Hermite-Gauss modes on one Gaussian envelope (σ = n/12)
+    with a defocus curvature, mode k carrying power 4^-k of a total of 1."""
+    hermite = (lambda t: np.ones_like(t), lambda t: 2 * t, lambda t: 4 * t * t - 2)
+    orders = [(0, 0), (1, 0), (0, 1), (1, 1), (2, 0), (0, 2)][:nmode]
+    v, u = (np.mgrid[:n, :n] - n / 2) / (n / 12)
+    r2 = u * u + v * v
+    w = 0.25 ** np.arange(nmode)
+    modes = []
+    for k, (a, b) in enumerate(orders):
+        m = hermite[a](u) * hermite[b](v) * np.exp(-r2 / 2) * np.exp(1j * (1.5 * r2 + 0.3 * k))
+        modes.append(m * np.sqrt(w[k] / w.sum()) / np.linalg.norm(m))
+    return np.stack(modes)
+
+
+def make_truth(n=64, npos=30, nprobe=2):
+    """The engine's parity scenario (`tests/common/engine/scenario.rs` `truth`) on `n`-pixel
+    frames: `npos` Fermat-spiral positions about `n / 8` pixels apart, `sim_object` and
+    `nprobe` modes of `sim_probe`, and their `intensity`. Returns (y, x, object, probe,
+    intensity)."""
     pixel = WAVELENGTH * DISTANCE / (n * DETECTOR_PIXEL)
-    i = np.arange(npos)
-    r = n / 8 * np.sqrt(i + 0.5)
-    th = i * np.pi * (3 - np.sqrt(5))
-    y, x = r * np.sin(th) * pixel, r * np.cos(th) * pixel
+    k = np.arange(npos)
+    r = n / 8 * pixel / np.sqrt(np.pi) * np.sqrt(k)
+    th = k * np.pi * (3 - np.sqrt(5))
+    y, x = r * np.sin(th), r * np.cos(th)
     # base::required_obj_shape of the centred positions, with room to spare
     ext = int(np.ceil(np.abs(np.r_[y - y.mean(), x - x.mean()] / pixel).max())) + 1
     side = (2 * ext + n + 8 + 3) // 4 * 4
-    yy, xx = np.mgrid[:side, :side] / side
-    obj = (0.8 + 0.2 * np.cos(9 * yy) * np.sin(7 * xx)) * np.exp(1j * np.sin(5 * xx + 3 * yy))
-    obj = obj[None].astype(np.complex128)
-    v, u = (np.mgrid[:n, :n] - n / 2) / (n / 8)
-    probe = np.stack([np.exp(-(u - m) ** 2 / 2 - v ** 2 / 2) / (1 + 2 * m) for m in range(nprobe)])
-    probe = probe.astype(np.complex128)
-
+    obj, probe = sim_object(side), sim_probe(n, nprobe)
     zeros = np.zeros((npos, n, n))
     model = ptyrs.Ptycho(ptyrs.Scan(zeros, y, x, WAVELENGTH, DISTANCE, DETECTOR_PIXEL), obj, probe)
-    icalc = intensity(model, obj, probe)
-    k = photons / icalc.sum(axis=(1, 2)).mean()
-    counts = rng.poisson(icalc * k).clip(0, 65534).astype(np.uint16)
-    counts[:, 3, :] = 65535
-    counts[:, :, 20] = 65535
-    scan = ptyrs.Scan(counts, y, x, WAVELENGTH, DISTANCE, DETECTOR_PIXEL)
+    return y, x, obj, probe, intensity(model, obj, probe)
 
+
+def mask(counts):
+    """`counts` with row 3 and column 20 of every frame masked."""
+    counts[:, 3, :] = MASKED
+    counts[:, :, 20] = MASKED
+    return counts
+
+
+def scaled_probe(scan, counts, obj, probe):
+    """`probe` scaled so that the model photons of `obj` and it on the unmasked pixels of
+    `scan`'s `counts` are the counts'."""
+    keep = counts != MASKED
+    calc = intensity(ptyrs.Ptycho(scan, obj, probe), obj, probe)
+    return probe * np.sqrt(counts[keep].sum(dtype=np.float64) / calc[keep].sum())
+
+
+def make_scenario(n=64, npos=30, nprobe=2, photons=2e5, seed=3):
+    """A far-field scan of `make_truth`, Poisson counts of `photons` per frame on average,
+    `mask`ed, and a start of a random-phase object and the probe with a quadratic phase
+    error, `scaled_probe`. Returns (scan, object, probe, frame count)."""
+    rng = np.random.default_rng(seed)
+    y, x, obj, probe, icalc = make_truth(n, npos, nprobe)
+    k = photons / icalc.sum(axis=(1, 2)).mean()
+    counts = mask(rng.poisson(icalc * k).clip(0, MASKED - 1).astype(np.uint16))
+    scan = ptyrs.Scan(counts, y, x, WAVELENGTH, DISTANCE, DETECTOR_PIXEL)
     start_obj = np.exp(1j * (rng.uniform(size=obj.shape) - 0.5))
-    start_probe = probe * np.exp(-0.5j * (u ** 2 + v ** 2))
-    # the model's photons on the unmasked pixels to the counts'
-    keep = counts != 65535
-    calc = intensity(ptyrs.Ptycho(scan, start_obj, start_probe), start_obj, start_probe)
-    start_probe *= np.sqrt(counts[keep].sum(dtype=np.float64) / calc[keep].sum())
+    v, u = (np.mgrid[:n, :n] - n / 2) / (n / 8)
+    start_probe = scaled_probe(scan, counts, start_obj, probe * np.exp(-0.5j * (u ** 2 + v ** 2)))
     return scan, start_obj, start_probe, npos
 
 
