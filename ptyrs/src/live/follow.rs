@@ -639,7 +639,8 @@ pub fn plane(px: &[[f32; 2]], shape: [usize; 2]) -> Vec<C64> {
 }
 
 /// The first of `kept`, in order, that `clock` finds converged, with its
-/// time from the scan's end; checked on `threads` threads.
+/// time from the scan's end to [`Kept::taken`], both host clock; checked on
+/// `threads` threads.
 pub fn first_converged(
     clock: &Clock,
     kept: &[Kept],

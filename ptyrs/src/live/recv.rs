@@ -428,7 +428,11 @@ fn stored_bad(
 
 /// The `recv recon` line and whether a live object matched: the offline run
 /// on the stored frames, the clock from `scan_end` over the scanned region,
-/// and the first kept snapshot it finds converged.
+/// and the first kept snapshot it finds converged. `converged_ms` is host
+/// clock at both ends: from the last frame's arrival on the host
+/// (`scan_end`) to the host's receipt of that snapshot
+/// ([`Kept::taken`](crate::live::follow::Kept::taken)), when the result is
+/// in hand.
 fn recon_line(
     ctx: &Arc<Context>,
     store: &DeviceStore,
