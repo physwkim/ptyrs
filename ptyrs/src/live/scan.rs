@@ -1,15 +1,16 @@
 //! One live scan on the device (DESIGN.md §3 B2, B3, B6): the address
 //! table, the object with its bins, and the stack entry, all on one stream,
 //! fed through [`LiveScan::push`] and read by the kernels through
-//! [`Views::from_parts`].
+//! [`Views::from_slabs`].
 //!
 //! `push` is the one write site of frames into the scan. It lands a frame
-//! only if its index is inside the scan, every view of it passes the
-//! checks [`Views::new`] makes and every object tile it touches has a free
-//! slot in its slab; it readies those tiles first. So every view the device
-//! reads is in range, `bin_views` never overflows a slab and the stack entry
-//! never needs the kernels' clamp. Frames land in order: the first frame
-//! refused closes the scan, and it and every frame after it count as lost.
+//! only if its [`Gate`] admits it, and readies the tiles the frame touches
+//! first. So every view the device reads is in range, `bin_views` never
+//! overflows a slab and the stack entry never needs the kernels' clamp.
+//! Frames land in order: the first frame refused closes the scan, and it
+//! and every frame after it count as lost. A scan split over GPUs runs the
+//! same gate once on the whole object before the split, so every GPU's
+//! scan closes at the frame one GPU's would.
 //!
 //! `push` never backs device memory: a [`ScanBacker`], on a thread of its
 //! own, backs the tiles and address records of frames before they are
@@ -96,6 +97,99 @@ pub enum Refusal {
     Failed { frame: u32 },
 }
 
+/// The one rule that admits a frame into a live scan, on one GPU or before
+/// a split over several. Frames come in order and the first one refused
+/// closes the gate, so nothing is admitted after it. A frame is refused if
+/// its index is past the scan, a view of it fails the checks [`Views::new`]
+/// makes (inside the object, and mode `m` multiplying probe `m % nprobe`
+/// and object `m / nprobe` at the frame's position) or a tile it touches
+/// that has a slab has no free slot left; admitting it takes a slot per
+/// view on each such tile.
+#[derive(Clone, Debug)]
+pub(crate) struct Gate {
+    dims: ViewDims,
+    cap: u32,
+    /// Per tile, the slots its slab has given out; `None` for a tile without
+    /// one.
+    slots: Vec<Option<u32>>,
+    admitted: u32,
+    closed: Option<Refusal>,
+}
+
+impl Gate {
+    /// A gate for a scan of `dims` in which the tiles `own`, ascending ids
+    /// `ty * ntx + tx`, have slabs of `cap` slots.
+    pub(crate) fn new(dims: ViewDims, cap: u32, own: &[u32]) -> Self {
+        let [nty, ntx] = dims.tiles();
+        let mut slots = vec![None; nty as usize * ntx as usize];
+        own.iter().for_each(|&t| slots[t as usize] = Some(0));
+        Self {
+            dims,
+            cap,
+            slots,
+            admitted: 0,
+            closed: None,
+        }
+    }
+
+    /// Admits the next frame, whose views are `frame`, and returns its
+    /// index, or refuses it and closes the gate. A closed gate refuses every
+    /// frame with the refusal that closed it.
+    pub(crate) fn admit(&mut self, frame: &[ViewAddr]) -> Result<u32, Refusal> {
+        if let Some(r) = self.closed {
+            return Err(r);
+        }
+        let f = self.admitted;
+        if let Some(r) = self.refusal(f, frame) {
+            self.closed = Some(r);
+            return Err(r);
+        }
+        self.admitted += 1;
+        Ok(f)
+    }
+
+    /// Closes the gate at frame `frame`, admitted but not landed.
+    pub(crate) fn fail(&mut self, frame: u32) {
+        self.closed = Some(Refusal::Failed { frame });
+    }
+
+    pub(crate) fn closed(&self) -> Option<Refusal> {
+        self.closed
+    }
+
+    /// Why frame `f` with views `frame` cannot be admitted, if it cannot;
+    /// takes its slots when it can. Nothing is admitted after a refusal, so
+    /// slots taken by the refused frame's earlier views are never given back.
+    fn refusal(&mut self, f: u32, frame: &[ViewAddr]) -> Option<Refusal> {
+        let d = &self.dims;
+        if f >= d.nframe {
+            return Some(Refusal::PastScan { frame: f });
+        }
+        let (np, at) = (d.nprobe, |v: &ViewAddr| (v.oy, v.ox, v.fy, v.fx));
+        let off = |(m, v): &(u32, &ViewAddr)| {
+            d.check_view(v).is_err()
+                || v.probe != m % np
+                || v.obj != m / np
+                || at(v) != at(&frame[0])
+        };
+        if let Some((_, &view)) = (0..).zip(frame).find(off) {
+            return Some(Refusal::View { frame: f, view });
+        }
+        let ntx = d.tiles()[1] as usize;
+        for v in frame {
+            for tile in view_tiles(d, v) {
+                let slot = &mut self.slots[tile[0] as usize * ntx + tile[1] as usize];
+                match slot {
+                    Some(s) if *s == self.cap => return Some(Refusal::Slab { frame: f, tile }),
+                    Some(s) => *s += 1,
+                    None => {}
+                }
+            }
+        }
+        None
+    }
+}
+
 /// Backs a [`LiveScan`]'s memory for frames ahead of [`LiveScan::push`],
 /// on any thread.
 pub struct ScanBacker {
@@ -153,17 +247,13 @@ pub struct LiveScan {
     addr: GrowTable<ViewAddr>,
     frames: LiveFrames,
     overflow: DeviceBuffer<u32>,
-    /// Per tile, the slots its slab has given out: views pushed onto it.
-    slots: Vec<u32>,
+    gate: Gate,
     stage: Vec<ViewAddr>,
     lost: u64,
-    closed: Option<Refusal>,
 }
 
 impl LiveScan {
-    /// An empty scan of `shape` on `stream`: stacks of at most `nf_max`
-    /// frames, `cap` view slots per object tile, fresh object pixels at
-    /// `fill`, device memory backed `chunk` bytes at a time.
+    /// [`Self::owned`] binning every tile.
     pub fn new(
         stream: &Arc<Stream>,
         shape: &ScanShape,
@@ -172,15 +262,36 @@ impl LiveScan {
         fill: [f32; 2],
         chunk: usize,
     ) -> Result<Self, GrowError> {
+        let [nty, ntx] = shape.dims().tiles();
+        let all: Vec<u32> = (0..nty * ntx).collect();
+        Self::owned(stream, shape, nf_max, cap, fill, chunk, &all)
+    }
+
+    /// An empty scan of `shape` on `stream` that bins its frames' views on
+    /// the object tiles `own` only, ascending ids `ty * ntx + tx`: stacks of
+    /// at most `nf_max` frames, `cap` view slots per tile of `own`, fresh
+    /// object pixels at `fill`, device memory backed `chunk` bytes at a
+    /// time. Its frames still read and add to the pixels of every tile they
+    /// touch.
+    pub fn owned(
+        stream: &Arc<Stream>,
+        shape: &ScanShape,
+        nf_max: NonZeroU32,
+        cap: u32,
+        fill: [f32; 2],
+        chunk: usize,
+        own: &[u32],
+    ) -> Result<Self, GrowError> {
         let dims = shape.dims();
         let nview = dims.nframe as usize * dims.nmode as usize;
-        let obj = LiveObject::new(
+        let obj = LiveObject::owned(
             stream,
             dims.nobj as usize,
             dims.obj.map(|n| n as usize),
             cap as usize,
             fill,
             chunk,
+            own,
         )?;
         let addr = GrowTable::new(stream, nview, chunk)?;
         let frames = LiveFrames::new(stream, &dims, nf_max)?;
@@ -190,9 +301,8 @@ impl LiveScan {
         // appends each stack once, in frame order.
         let views = unsafe {
             let slabs = obj.tile_views()?;
-            Views::from_parts(stream, dims, addr.typed(nview)?, slabs, cap)?
+            Views::from_slabs(stream, dims, addr.typed(nview)?, slabs, obj.slab_starts())?
         };
-        let ntiles = obj.tiles()[0] * obj.tiles()[1];
         Ok(Self {
             dims,
             views,
@@ -200,10 +310,9 @@ impl LiveScan {
             addr,
             frames,
             overflow: DeviceBuffer::zeroed(stream, 1)?,
-            slots: vec![0; ntiles],
+            gate: Gate::new(dims, cap, own),
             stage: Vec::new(),
             lost: 0,
-            closed: None,
         })
     }
 
@@ -232,7 +341,7 @@ impl LiveScan {
             .into());
         }
         let n = (views.len() / nmode) as u64;
-        if self.closed.is_some() {
+        if self.gate.closed().is_some() {
             self.lost += n;
             return Ok(0);
         }
@@ -247,20 +356,19 @@ impl LiveScan {
     /// closes the scan at the first refused frame or failure.
     fn stage_and_land(&mut self, views: &[ViewAddr]) -> Result<(), GrowError> {
         let first = self.frames.landed();
-        let ntx = self.dims.tiles()[1] as usize;
         self.stage.clear();
-        for (i, frame) in views.chunks(self.dims.nmode as usize).enumerate() {
-            let f = first + i as u32;
-            if let Some(r) = self.refusal(f, frame, ntx) {
-                self.closed = Some(r);
+        for frame in views.chunks(self.dims.nmode as usize) {
+            // Every frame the gate admits lands or closes it, so its count
+            // is the frames landed and staged.
+            let Ok(f) = self.gate.admit(frame) else {
                 break;
-            }
+            };
             let dims = self.dims;
             if let Err(e) = self
                 .obj
                 .init_tiles(frame.iter().flat_map(|v| view_tiles(&dims, v)))
             {
-                self.closed = Some(Refusal::Failed { frame: f });
+                self.gate.fail(f);
                 return Err(e);
             }
             self.stage.extend_from_slice(frame);
@@ -274,39 +382,9 @@ impl LiveScan {
             .push(&self.stage)
             .and_then(|_| self.frames.land(first + k));
         if landed.is_err() {
-            self.closed = Some(Refusal::Failed { frame: first });
+            self.gate.fail(first);
         }
         landed
-    }
-
-    /// Why frame `f` with views `frame` cannot land, if it cannot; takes its
-    /// slots when it can. Nothing lands after a refusal, so slots taken by
-    /// the refused frame's earlier views are never given back.
-    fn refusal(&mut self, f: u32, frame: &[ViewAddr], ntx: usize) -> Option<Refusal> {
-        if f >= self.dims.nframe {
-            return Some(Refusal::PastScan { frame: f });
-        }
-        let (np, at) = (self.dims.nprobe, |v: &ViewAddr| (v.oy, v.ox, v.fy, v.fx));
-        let off = |(m, v): &(u32, &ViewAddr)| {
-            self.dims.check_view(v).is_err()
-                || v.probe != m % np
-                || v.obj != m / np
-                || at(v) != at(&frame[0])
-        };
-        if let Some((_, &view)) = (0..).zip(frame).find(off) {
-            return Some(Refusal::View { frame: f, view });
-        }
-        let cap = self.obj.cap() as u32;
-        for v in frame {
-            for tile in view_tiles(&self.dims, v) {
-                let s = &mut self.slots[tile[0] as usize * ntx + tile[1] as usize];
-                if *s == cap {
-                    return Some(Refusal::Slab { frame: f, tile });
-                }
-                *s += 1;
-            }
-        }
-        None
     }
 
     /// Queues on `ctx`'s stream, or records into its capture, the step of
@@ -364,7 +442,7 @@ impl LiveScan {
     }
 
     pub fn closed(&self) -> Option<Refusal> {
-        self.closed
+        self.gate.closed()
     }
 
     pub fn landed(&self) -> u32 {
@@ -382,7 +460,7 @@ impl LiveScan {
 
 #[cfg(test)]
 mod tests {
-    use crate::gpu::StackCtl;
+    use crate::gpu::{OBJ_TILE, StackCtl};
     use cuda_bindings as sys;
     use cuda_core::{Context, IntoResult};
 
@@ -553,6 +631,106 @@ mod tests {
                 "pixel {p}: {:?} vs {want:?}",
                 num[p]
             );
+        }
+    }
+
+    /// A scan owning some tiles bins its views on those only, in the runs a scan owning
+    /// every tile gives them, from slabs packed over its tiles, and adds the object sums of
+    /// those tiles only. A tile it does not own takes no slot, so the frame a scan owning
+    /// every tile refuses for a full slab there lands.
+    #[test]
+    fn an_owned_scan_bins_and_sums_its_own_tiles_only() {
+        let ctx = Context::new(0).expect("GPU 0");
+        let s = ctx.new_stream().unwrap();
+        let k = Kernels::load(&ctx).unwrap();
+        let (reach, nf) = ([40, 70], 30u32);
+        let sh = shape(nf, reach);
+        let dims = sh.dims();
+        let [nty, ntx] = dims.tiles();
+        let views: Vec<ViewAddr> = (0..nf).flat_map(|f| raster(f, reach)).collect();
+        let mut on = vec![Vec::new(); (nty * ntx) as usize];
+        for (i, v) in views.iter().enumerate() {
+            for [ty, tx] in view_tiles(&dims, v) {
+                on[(ty * ntx + tx) as usize].push(i as u32);
+            }
+        }
+        // Every tile but those with the most views, so slabs one slot short refuse no frame.
+        let most = sh.tile_cap(&views);
+        let own: Vec<u32> = (0..nty * ntx)
+            .filter(|&t| (on[t as usize].len() as u32) < most)
+            .collect();
+        assert!(!own.is_empty() && own.len() < on.len());
+        let (nf_max, fill) = (NonZeroU32::new(4).unwrap(), [0.75f32, -0.5]);
+        let mut all = LiveScan::new(&s, &sh, nf_max, most - 1, fill, 1).unwrap();
+        let mut b = all.backer();
+        assert!(push(&mut all, &mut b, &views).unwrap() < nf);
+        assert!(matches!(all.closed(), Some(Refusal::Slab { .. })));
+
+        let mut scan = LiveScan::owned(&s, &sh, nf_max, most - 1, fill, 1, &own).unwrap();
+        let start = scan.obj().slab_starts().to_vec();
+        for t in 0..on.len() {
+            let slab = if own.contains(&(t as u32)) {
+                most - 1
+            } else {
+                0
+            };
+            assert_eq!(start[t + 1] - start[t], slab, "tile {t}");
+        }
+        let n = 64usize;
+        let one = C32 { re: 1.0, im: 0.0 };
+        let probe = DeviceBuffer::from_host(&s, &vec![one; 2 * n]).unwrap();
+        let mut psi = DeviceBuffer::<C32>::zeroed(&s, 4 * 2 * n).unwrap();
+        let graph = LiveGraph::capture(&s, |c| {
+            scan.advance(&k, c)?;
+            let p = scan.parts_mut();
+            let st = p.frames.stack();
+            k.obj_probe_to_psi(c, p.views, st, p.pixels, &probe, &mut psi)?;
+            k.psi_to_obj(c, p.views, st, &psi, &probe, p.sums)
+        })
+        .unwrap();
+        let mut b = scan.backer();
+        assert_eq!(push(&mut scan, &mut b, &views).unwrap(), nf);
+        assert_eq!(scan.closed(), None);
+        for _ in 0..nf.div_ceil(nf_max.get()) {
+            graph.replay().unwrap();
+        }
+        assert_eq!(scan.overflow().to_host_vec(&s).unwrap(), vec![0]);
+        let len = scan.views().tile_len().to_host_vec(&s).unwrap();
+        let list = scan.views().tile_views().cu_deviceptr();
+        let mine = |t: usize| own.contains(&(t as u32));
+        for (t, w) in on.iter().enumerate() {
+            let want = if mine(t) { w.as_slice() } else { &[] };
+            assert_eq!(len[t] as usize, want.len(), "tile {t}");
+            let mut run = vec![0u32; want.len()];
+            // SAFETY: the stream is idle and a tile with views has its slab backed.
+            unsafe {
+                sys::cuMemcpyDtoH_v2(
+                    run.as_mut_ptr().cast(),
+                    list + u64::from(start[t]) * 4,
+                    run.len() * 4,
+                )
+            }
+            .result()
+            .unwrap();
+            assert_eq!(run, want, "tile {t}");
+        }
+
+        // Sums: den > 0 exactly on the pixels of own tiles the views read.
+        let [nyo, nxo] = dims.obj.map(|n| n as usize);
+        let mut read = vec![false; nyo * nxo];
+        for v in &views {
+            for y in v.oy..v.oy + 8 + (v.fy > 0.0) as u32 {
+                for x in v.ox..v.ox + 8 + (v.fx > 0.0) as u32 {
+                    read[y as usize * nxo + x as usize] = true;
+                }
+            }
+        }
+        // Every tile row has a view, so the sums are backed whole.
+        let den = scan.obj().sums().den.to_host_vec(&s).unwrap();
+        for p in 0..nyo * nxo {
+            let tile = OBJ_TILE as usize;
+            let t = (p / nxo / tile) * ntx as usize + p % nxo / tile;
+            assert_eq!(den[p] > 0.0, read[p] && mine(t), "pixel {p}");
         }
     }
 
