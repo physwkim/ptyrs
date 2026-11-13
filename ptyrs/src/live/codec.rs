@@ -78,11 +78,28 @@ pub fn lz4_compress(raw: &[u8]) -> Vec<u8> {
     lz4_flex::block::compress(raw)
 }
 
-/// Decode an `lz4` payload into `dst`, which must be exactly the image.
+/// Decode an `lz4` payload into `dst`, which must be exactly the image. C
+/// liblz4, as Python's `lz4.block` uses: lz4_flex, built with `safe-decode`
+/// because rust-hdf5 turns on its defaults, took 1.5x its time per frame.
 pub fn lz4_decompress_into(src: &[u8], dst: &mut [u8]) -> Result<(), CodecError> {
-    match lz4_flex::block::decompress_into(src, dst) {
-        Ok(n) if n == dst.len() => Ok(()),
-        _ => Err(CodecError::Lz4),
+    let (Ok(src_len), Ok(dst_len)) = (i32::try_from(src.len()), i32::try_from(dst.len())) else {
+        return Err(CodecError::Lz4);
+    };
+    // SAFETY: LZ4_decompress_safe reads at most `src_len` bytes from `src`
+    // and writes at most `dst_len` bytes to `dst`, whatever the input; a
+    // malformed stream returns a negative count.
+    let n = unsafe {
+        lz4_sys::LZ4_decompress_safe(
+            src.as_ptr().cast(),
+            dst.as_mut_ptr().cast(),
+            src_len,
+            dst_len,
+        )
+    };
+    if n == dst_len {
+        Ok(())
+    } else {
+        Err(CodecError::Lz4)
     }
 }
 

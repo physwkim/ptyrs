@@ -25,8 +25,9 @@ serde_json = { version = "1", features = ["float_roundtrip"] }
 serde = { version = "1", features = ["derive"] }
 toml = "1"
 epics-pva-rs.workspace = true
-# Unsafe (fast) block codec, still bounds-checked on decode.
-lz4_flex = { version = "0.11", default-features = false, features = ["std", "checked-decode"] }
+# Block compression only; lz4 decode is C liblz4 (lz4-sys), which builds its vendored copy at -O3.
+lz4_flex = { version = "0.11", default-features = false, features = ["std"] }
+lz4-sys = "1.11"
 bytes = "1"
 crossbeam-channel = "0.5"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }

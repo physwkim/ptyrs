@@ -255,6 +255,26 @@ pub struct FollowReport {
     pub epoch_clock_ns: i64,
 }
 
+impl FollowReport {
+    /// GPU time, ns, of each epoch queued once the scan had landed, from
+    /// [`Self::epoch_done`]: the only source of epoch time. The first epoch
+    /// has no end before it to time from.
+    pub fn epochs_after_scan(&self) -> impl Iterator<Item = i64> + '_ {
+        let from = self
+            .scan_epochs
+            .map_or(self.epoch_done.len(), |s| s.max(1) as usize - 1);
+        self.epoch_done[from..].windows(2).map(|w| w[1] - w[0])
+    }
+
+    /// Mean of [`Self::epochs_after_scan`], ms.
+    pub fn epoch_ms(&self) -> Option<f64> {
+        let (n, ns) = self
+            .epochs_after_scan()
+            .fold((0u64, 0i64), |(n, ns), t| (n + 1, ns + t));
+        (n > 0).then(|| ns as f64 / 1e6 / n as f64)
+    }
+}
+
 /// The views of the frames at `positions`.
 fn views_of(cfg: &ApConfig, place: &ViewPlacement, positions: &[(f64, f64)]) -> Vec<ViewAddr> {
     let (nprobe, nobj) = (cfg.shape.nprobe, cfg.shape.nobj);
@@ -619,7 +639,8 @@ pub fn plane(px: &[[f32; 2]], shape: [usize; 2]) -> Vec<C64> {
 }
 
 /// The first of `kept`, in order, that `clock` finds converged, with its
-/// time from the scan's end; checked on `threads` threads.
+/// time from the scan's end to [`Kept::taken`], both host clock; checked on
+/// `threads` threads.
 pub fn first_converged(
     clock: &Clock,
     kept: &[Kept],
@@ -921,5 +942,24 @@ mod tests {
             .unwrap();
         assert_eq!(i, first);
         assert_eq!(after.as_nanos() as i64, rep.kept[i].taken - s.scan_end);
+    }
+
+    /// The reported epoch time is the GPU fences' over the epochs after the
+    /// scan landed. Every epoch has an end, in order, each before the host
+    /// held a snapshot that follows it.
+    #[test]
+    fn the_epoch_time_is_the_gpu_fences_after_the_scan() {
+        let rep = streamed(None).rep;
+        let (e, s) = (rep.epochs as usize, rep.scan_epochs.unwrap() as usize);
+        assert!(s > 0, "no epoch ran while the scan landed");
+        let done = &rep.epoch_done;
+        assert_eq!(done.len(), e);
+        assert!(done.windows(2).all(|w| w[0] < w[1]));
+        // CUDA times events to about 0.5 µs.
+        for k in &rep.kept {
+            assert!(done[k.epochs as usize - 1] <= k.taken + rep.epoch_clock_ns + 1_000);
+        }
+        let gpu = (done[e - 1] - done[s - 1]) as f64 / 1e6 / (e - s) as f64;
+        assert_eq!(rep.epoch_ms(), Some(gpu));
     }
 }
