@@ -3,7 +3,9 @@
 //! splits them, replayed in arrival order. Prints the spread (most minus fewest new frames over
 //! the regions) per window of N consecutive arrivals and per live batch ([`feed::batch_end`]:
 //! a raster batch rounds up to whole rows), and writes the window spread over time to
-//! `<out>/<scan>_<regions>.csv`. CPU only.
+//! `<out>/<scan>_<regions>.csv`. Per scan it also prints each region's frames over the whole
+//! scan, their max/min, and the arrivals until every region has a frame. CPU only: the frame
+//! each region gets is fixed by the positions and the arrival order, not by the GPUs.
 //!
 //! `cargo run --release -p ptyrs --example dist_live_feed <out>`
 
@@ -54,19 +56,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         RASTER[0] * RASTER[1],
     );
     println!(
-        "spread = most - fewest new frames over the regions in one window; every window start."
+        "spread = most - fewest new frames over the regions in one window; every window start. \
+         max/min = worst over the windows where every region gets a frame."
     );
     println!(
-        "{:<7} {:>4} {:>5} {:>7} {:>6} {:>8} {:>5} {:>5} {:>8}",
-        "scan", "gpus", "N", "ms", "share", "mean", "p95", "max", "idle %"
+        "{:<7} {:>4} {:>5} {:>7} {:>6} {:>8} {:>5} {:>5} {:>8} {:>7}",
+        "scan", "gpus", "N", "ms", "share", "mean", "p95", "max", "idle %", "max/min"
     );
-    let mut batch_rows = Vec::new();
+    let (mut batch_rows, mut scan_rows) = (Vec::new(), Vec::new());
     for (name, pos, scheme, pattern) in scans {
         let pos = pos.pynx_preprocess(PIXEL);
         let obj = required_obj_shape(&pos, PIXEL, [FRAME, FRAME], 0);
         let addr = AddrTable::new(&pos, PIXEL, [FRAME, FRAME], obj, 1, 1)?;
         for nregion in [2, 4] {
             let part = Partition::from_addr(&addr, DEFAULT_TILE, scheme, NLEAF)?.merge(nregion)?;
+            let (mut total, mut first) = (vec![0; nregion], vec![None; nregion]);
+            for f in 0..part.nframe() {
+                let r = part.computed_by(f);
+                total[r] += 1;
+                first[r].get_or_insert(f);
+            }
+            let all = first.iter().try_fold(0, |m, f| f.map(|f| m.max(f + 1)));
+            let totals: Vec<String> = total.iter().map(usize::to_string).collect();
+            scan_rows.push(format!(
+                "{:<7} {:>4} {:>23} {:>7.3} {:>9} {:>7}",
+                name,
+                nregion,
+                totals.join("/"),
+                ratio(&total),
+                all.map_or("never".into(), |n| n.to_string()),
+                all.map_or("-".into(), |n| format!("{:.1}", n as f64 / RATE_HZ * 1e3)),
+            ));
             for want in WINDOWS {
                 let want = NonZeroUsize::new(want).ok_or("window of 0 arrivals")?;
                 let (mut start, mut spreads, mut idle) = (0, Vec::new(), 0);
@@ -102,13 +122,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let w = feed::windows(&part, len);
                     let spreads: Vec<usize> = w.iter().map(|c| feed::spread(c)).collect();
                     let idle = w.iter().filter(|c| c.contains(&0)).count();
+                    let worst = w
+                        .iter()
+                        .filter(|c| !c.contains(&0))
+                        .map(|c| ratio(c))
+                        .fold(f64::NAN, f64::max);
                     let ordered = {
                         let mut s = spreads.clone();
                         s.sort_unstable();
                         s
                     };
                     println!(
-                        "{:<7} {:>4} {:>5} {:>7.1} {:>6.1} {:>8.2} {:>5} {:>5} {:>8.1}",
+                        "{:<7} {:>4} {:>5} {:>7.1} {:>6.1} {:>8.2} {:>5} {:>5} {:>8.1} {:>7.3}",
                         name,
                         nregion,
                         len,
@@ -118,6 +143,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         ordered[(ordered.len() - 1) * 95 / 100],
                         ordered[ordered.len() - 1],
                         idle as f64 * 100.0 / w.len() as f64,
+                        worst,
                     );
                     spreads
                 })
@@ -151,5 +177,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for r in batch_rows {
         println!("{r}");
     }
+    println!(
+        "\nWhole scan: frames per region, their max/min, and the arrivals (and ms) until every \
+         region has a frame."
+    );
+    println!(
+        "{:<7} {:>4} {:>23} {:>7} {:>9} {:>7}",
+        "scan", "gpus", "frames", "max/min", "arrivals", "ms"
+    );
+    for r in scan_rows {
+        println!("{r}");
+    }
     Ok(())
+}
+
+/// Most over fewest frames over the regions; infinite when a region gets none.
+fn ratio(counts: &[usize]) -> f64 {
+    let most = counts.iter().max().copied().unwrap_or(0);
+    let fewest = counts.iter().min().copied().unwrap_or(0);
+    most as f64 / fewest as f64
 }
