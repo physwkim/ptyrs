@@ -68,7 +68,7 @@
 | 멀티 GPU | `cuda-async` 멀티 디바이스는 미완성 표시(`device_context.rs:140`). NCCL 바인딩·설치 없음 | 디바이스별 스레드 + P2P 직접 접근으로 자체 구현 |
 | 호스트 입력 경로 (M0 측정) | ptyrs-live 시제품: epics-pva-rs 시뮬레이터 → 수신 → 해제 → 위치 매칭 → 256² 크롭 → pinned 링 → GPU, 별도 프로세스 두 개. 1028×1062 u16 합성 프레임을 3 kHz로 30,000장 보내 손실 0(lz4 7회, bslz4 6회). 수신→GPU p99 약 4.7 ms. 수신 쪽 CPU 코어는 lz4 약 7, bslz4 약 5(크롭 행만 해제), bslz4 전체 해제 약 12. 손실 없는 최대 속도(3회 모두 손실 0)는 lz4 3.75 kHz, bslz4 6 kHz. 해제·크롭·위치 매칭은 C liblz4·bitshuffle과 비트 단위로 교차 확인. **Python 기준선**(p4p, 같은 CPU 배치, GPU 전송 없음): 스레드 풀 한 프로세스는 lz4 3 kHz에서 손실(`lz4.block.decompress`가 호출마다 GIL을 약 290 µs 잡음), 최대 1.5 kHz. 다중 프로세스 + 공유 메모리는 3 kHz 두 코덱 모두 손실 0, 약 5.7코어, 최대 lz4 3.75 kHz·bslz4 5 kHz. C 해제기가 Rust 것보다 빠름(lz4 1.26 대 1.89 ms, bslz4 전체 1.32 대 3.81 ms) | 3 kHz는 통과. 다중 프로세스 Python과의 차이가 작아 호스트 쪽 근거를 접음(§0 접는 조건 1, §8). lz4는 두 구현 모두 약 4 kHz(약 1.7 GB/s)에서 수신이 막힘 |
 | 단일 GPU 기준선 (M1 측정) | 시뮬레이션 256² 프레임, 위치 400, 프로브 모드 2. f64에서 ptyrs CPU 기준 구현과 PyNX의 DM LLK가 50사이클까지 1e-13, 99사이클에서 1.5e-8 이내 일치. f32 GPU는 f64에서 LLK 4.5e-3 벌어지는데, PyNX f32 CPU 대 f64(5.8e-3), PyNX CUDA 실행 간 차이(4.5e-3)와 같은 크기. GPU2, 스택 16, 사이클당: DM 8.3 ms 대 PyNX CUDA 22.1–23.0 ms, AP 6.0 대 16.2–16.6 ms(약 2.7배). rPIE(배치 16) 10.6 ms이나 작은 커널 약 15개를 잇달아 띄워 CPU 부하에 따라 실행마다 최대 2배 흔들림. 스택 64는 32보다 느림(원인 미측정) | M1 기준(PyNX DM과 LLK 곡선 일치) 충족. f32 차이는 단정밀도 반올림 혼돈. M2 비교 기준은 DM 8.3·AP 6.0 ms. rPIE 흔들림은 graph 실행(B2)으로 없앨 대상 |
-| 툴체인 | cuda-oxide는 Rust 1.99.1(+rustc-dev, llvm-tools)과 nvptx 지원 llc 필요. Rust 동봉 llc(LLVM 23.1.1)로 sm_89 빌드·실행 확인(M0). cutile-rs는 stable 1.89+. SIMT 커널은 별도 device crate를 `cargo oxide`가 PTX로 만들고 호스트가 실행 중에 읽음(예제 `Cargo.toml`의 `package.metadata.cuda-oxide.device-crates`) | 작업 공간 전체를 1.99.1 하나로 빌드(`rust-toolchain.toml`). `cargo oxide`는 의존성이 가리키는 cuda-rust 체크아웃의 것을 실행(`.cargo/config.toml` 별칭) |
+| 툴체인 | cuda-oxide는 Rust 1.99.1(+rustc-dev, llvm-tools)과 nvptx 지원 llc 필요. Rust 동봉 llc(LLVM 23.1.1)로 sm_89 빌드·실행 확인(M0). cutile-rs는 stable 1.89+. SIMT 커널은 별도 device crate를 `cargo oxide`가 PTX로 만들고 호스트가 실행 중에 읽음(예제 `Cargo.toml`의 `package.metadata.cuda-oxide.device-crates`) | 작업 공간 전체를 1.99.1 하나로 빌드(`rust-toolchain.toml`). `cargo oxide`는 의존성이 가리키는 cuda-rust 체크아웃의 것을 실행(`ptyrs/build.rs`가 그 체크아웃의 cargo-oxide를 `cargo run`으로 실행) |
 | Rust 딥러닝 프레임워크 (2026-11 웹 검색) | burn은 학습·추론·자동 미분·CUDA를 지원하지만 복소수 완전 지원은 추적 이슈(#5366), FFT는 2의 거듭제곱 길이만(#4865). candle은 추론 위주. numr은 복소수·FFT·자동 미분을 표방하나 신생이고 자체 GPU 런타임을 가짐 | 물리 계산은 cuda-rust로만. burn은 신경망 부분(ptyrs-nn)에만. numr은 cuda-rust와 역할이 겹쳐 쓰지 않음. PyTorch는 쓰지 않음 |
 
 ---
@@ -259,7 +259,7 @@ M6 측정(GPU2, 스택 16): 물체 갱신은 Tile 24–26 µs, SIMT 10–11 µs�
 - 예측: 새 프레임 묶음 → burn CNN → 물체 조각 → 해당 영역 초기값. 프레임 묶음마다 한 번 넘깁니다.
 - 학습(DIP·PINN): 신경망이 물체를 진폭·위상(실수)으로 출력 → ptyrs 순·역방향 연산자로 물체 기울기 g 계산 → burn에서 손실을 ⟨출력, g⟩(g는 상수 취급)로 두고 역전파하면 신경망 가중치의 기울기가 정확히 나옵니다. burn에 복소수·FFT가 필요 없습니다.
 - DIP·PINN 모드는 반복마다 경계를 건너므로, 에폭 단위 graph(불변식 1)는 ptyrs 쪽 구간에만 적용됩니다.
-- burn의 CUDA 쪽이 cuda-rust의 GPU 메모리를 복사 없이 받을 수 있는지는 미검증입니다. 안 되면 복사하며, 크기는 프레임 묶음 또는 물체 배열 하나입니다.
+- 메모리는 burn → cuda-rust 방향만 복사 없이 넘어갑니다(`ptyrs/src/nn/interop.rs`). burn 텐서의 버퍼는 `lend`가 cuda-rust `DeviceBuffer<f32>`로 그대로 빌려줍니다. 반대 방향은 안 됩니다. cubecl CUDA 저장소는 자기가 할당한 포인터만 내주고 해제하며(cubecl-cuda 0.11.4 `compute/storage/gpu.rs:232`, 표에 넣는 곳이 `alloc` 하나), 외부 포인터를 받아들이는 API가 없습니다. 그래서 엔진이 가진 버퍼는 `copy_in`이 장치 간 복사 한 번으로 새 burn 텐서에 옮기며, 크기는 프레임 묶음 또는 물체 배열 하나입니다. 경계 버퍼를 burn이 가지면 복사가 없습니다. `ptyrs/tests/nn_interop.rs`의 `lend_aliases_burn_memory`(빌린 버퍼에 cuda-rust가 쓴 값이 burn 텐서에 보임)와 `copy_in_copies_engine_memory`(뒤이은 엔진 쓰기가 burn 텐서를 바꾸지 않음)가 두 방향을 확인합니다.
 
 ---
 
@@ -304,9 +304,9 @@ M6 측정(GPU2, 스택 16): 물체 갱신은 Tile 24–26 µs, SIMT 10–11 µs�
 
 ## 8. 열린 결정과 미검증 사항
 
-- **burn ↔ cuda-rust 메모리 공유**: burn CUDA 백엔드가 외부 GPU 포인터를 복사 없이 받을 수 있는지 미검증입니다.
+- **burn ↔ cuda-rust 메모리 공유**: 확인했습니다(§4 신경망 경계). burn → cuda-rust는 복사 없이(`lend`), cuda-rust → burn은 장치 간 복사 한 번(`copy_in`)입니다. cubecl CUDA 저장소가 자기가 할당한 포인터만 다루고 외부 포인터를 받는 API가 없기 때문입니다. `ptyrs/tests/nn_interop.rs`의 `lend_aliases_burn_memory`와 `copy_in_copies_engine_memory`가 확인합니다.
 - **std::autodiff(Rust 컴파일러 내장 자동 미분, nightly)**: cuda-oxide 커널에 쓸 수 있다면 역방향 연산자를 손으로 쓰지 않아도 됩니다. cuda-oxide는 별도 컴파일 백엔드라 함께 동작하는지 미검증이며, 지켜볼 항목입니다.
-- **cuFFT 장치 API의 안정성**: 실험 API(`cufft_device.h` 0.6.0)입니다. 커널이 부르는 함수 이름(`cufftdx_private_lto_function<600, ID, float, 1>`)은 공개 문서에 없고, ID가 크기·방향·SM마다 정해져 지금 코드는 sm_89에 고정입니다. CUDA를 올리면 깨질 수 있습니다. 이름을 libcufft가 주는 database 문자열에서 만들어 버전 변화를 따라갈 수 있는지는 미검증입니다. 열 패스가 256 간격으로 읽는 비용도 미측정입니다(M2).
+- **cuFFT 장치 API의 안정성**: 실험 API(`cufft_device.h` 0.6.0, CUDA 13.5)입니다. 커널이 부르는 진입 함수(`cufftdx_private_lto_function<버전, ID, float, 1>`)는 공개 문서에 없습니다. `ptyrs/build.rs`는 FFT마다 크기·방향·SM으로 libcufft에 함수를 묻고, ID와 버전을 그 함수의 database 문자열에서 읽어 버전이 `cufftDeviceGetVersion`과 같은지 확인합니다. 그래서 SM이나 CUDA 버전이 바뀌어 ID가 달라져도 코드는 그대로입니다. 아키텍처는 `PTYRS_CUDA_ARCH`(기본 `sm_89`)로 정하고, sm_80·sm_90 빌드도 FFT 8개를 모두 링크합니다. 다만 그 GPU가 없어 실행은 미검증입니다. cubin은 한 아키텍처용이라 `Kernels::load`가 다른 SM 장치를 거부합니다. sm_89에 고정된 것은 M0 시제품 `m0_fft_device`뿐입니다. CUDA를 올릴 때 바꿀 것은 `.cargo/config.toml`의 `CUDA_TOOLKIT_PATH`입니다. 그래도 문서에 없는 세 가지에 기댑니다. 진입 함수의 이름 모양과 인자, database 문자열 안에서 ID·버전의 자리, `cufft_device.h`의 열거값입니다. 이름 모양이나 인자 타입이 바뀌면 nvJitLink가 미해결 심볼로 빌드를 멈춥니다(ID를 일부러 틀려 확인). 문자열 형식이 바뀌면 build.rs가 오류를 냅니다. 타입은 같고 인자 뜻만 바뀌면 빌드는 통과하고, `ptyrs/tests/gpu_load.rs`의 블록 FFT 시험(f64 DFT 대비)이 잡습니다. 이 기계에서 장치 API가 있는 툴킷은 13.5뿐이라 실제로 CUDA를 올려 본 적은 없습니다. 열 패스가 256 간격으로 읽는 비용은 M2의 ncu 측정이 다룹니다.
 - **Rust로 쓴 cuFFT LTO 콜백**: API는 있으나 cuda-oxide LTOIR과 cuFFT JIT 링크의 호환성은 미검증입니다.
 - **u16 데이터·f16 Ψ의 정밀도 영향**: u16은 정수 광자수라 손실이 없지만, 전처리(배경 차감, 평탄화)를 거친 데이터는 f32 경로가 필요합니다.
 - **Python 기준선 수치**: NSLS-II·Diamond 등 Python 라이브 재구성이 몇 kHz까지 따라가는지 공개 수치를 확인 못 했습니다. §0의 비교는 M0에서 같은 기계에 기준선을 직접 만들어 쟀습니다(§1 호스트 입력 경로).

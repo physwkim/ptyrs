@@ -232,7 +232,7 @@
    "gpu_uuid": "GPU-fdf6033d-b702-4876-ce32-4b60eba986ef",
    "indicative": true,
    "gpu_shared_with": [
-    "/home/stevek/work/ptyrs-wt-dist/target/debug/deps/ptyrs_dist-8603622f8ec93428"
+    "ptyrs_dist-8603622f8ec93428"
    ],
    "wall_per_epoch_s": 0.49787393064999225,
    "peak_memory_reserved_gib": 2.29296875,
@@ -342,7 +342,7 @@
    "gpu_uuid": "GPU-fdf6033d-b702-4876-ce32-4b60eba986ef",
    "indicative": true,
    "gpu_shared_with": [
-    "/home/stevek/work/ptyrs-wt-dist/target/debug/deps/ptyrs_dist-8603622f8ec93428"
+    "ptyrs_dist-8603622f8ec93428"
    ],
    "wall_per_epoch_s": 0.2662236268266497,
    "peak_memory_reserved_gib": 8.53125,
@@ -626,7 +626,7 @@
    "gpu_uuid": "GPU-fdf6033d-b702-4876-ce32-4b60eba986ef",
    "indicative": true,
    "gpu_shared_with": [
-    "/home/stevek/work/ptyrs-wt-dist/target/debug/deps/ptyrs_dist-e57b1af6c88d91a9"
+    "ptyrs_dist-e57b1af6c88d91a9"
    ],
    "wall_per_epoch_s": 1.257820233899929,
    "peak_memory_reserved_gib": 20.646484375,
@@ -767,7 +767,7 @@
    "gpu_uuid": "GPU-fdf6033d-b702-4876-ce32-4b60eba986ef",
    "indicative": true,
    "gpu_shared_with": [
-    "/home/stevek/work/ptyrs-wt-dist/target/debug/deps/ptyrs_dist-e57b1af6c88d91a9"
+    "ptyrs_dist-e57b1af6c88d91a9"
    ],
    "wall_per_epoch_s": 0.5036424010599967,
    "peak_memory_reserved_gib": 15.794921875,
@@ -799,7 +799,7 @@
    "gpu_uuid": "GPU-fdf6033d-b702-4876-ce32-4b60eba986ef",
    "indicative": true,
    "gpu_shared_with": [
-    "/home/stevek/work/ptyrs-wt-dist/target/debug/deps/ptyrs_dist-e57b1af6c88d91a9"
+    "ptyrs_dist-e57b1af6c88d91a9"
    ],
    "wall_per_epoch_s": 0.3265895717933381,
    "peak_memory_reserved_gib": 1.1640625,

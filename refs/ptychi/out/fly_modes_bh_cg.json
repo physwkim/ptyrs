@@ -372,7 +372,7 @@
   "host": "sm-gpu"
  },
  "gpu_shared_with": [
-  "/home/stevek/work/ptyrs-wt-dist/target/debug/deps/ptyrs_dist-e57b1af6c88d91a9"
+  "ptyrs_dist-e57b1af6c88d91a9"
  ],
  "gpu_watch_period_s": 1.0,
  "peak_memory_reserved_gib": 20.646484375,

@@ -10,6 +10,6 @@ cuda-core = { workspace = true }
 cuda-async = { workspace = true }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
 # m0_fft_device: NVVM IR -> LTOIR, then nvJitLink with the cuFFT device-API LTOIR/fatbin pieces.
-cuda-artifact-finalizer = { path = "/home/stevek/work/cuda-rust/cuda-oxide/crates/cuda-artifact-finalizer" }
-nvjitlink-sys = { path = "/home/stevek/work/cuda-rust/cuda-oxide/crates/nvjitlink-sys" }
+cuda-artifact-finalizer.workspace = true
+nvjitlink-sys.workspace = true
 libloading = "0.8"
