@@ -42,14 +42,24 @@ use crate::gpu::{
     Views, check_len, dptr,
 };
 
-/// The fused row passes' cfg: both walk the stack down, against the column pass between them,
-/// which walks up in grid order, so each pass starts on the frames the one before it touched
-/// last, still in L2, and the inverse pass ends where [`Kernels::psi_to_probe`]'s in-order sum
-/// starts.
-const ROWS: FusedCfg = FusedCfg {
-    flags: FUSED_DOWN,
-    alpha: 0.0,
-};
+/// The walks of the frame passes over a stack, [`FUSED_DOWN`] or 0, each against the pass
+/// before it in the module doc's order, so it starts on the frames that one touched last,
+/// still in L2. The engine interleaves stacks, so a walk is fixed by its pass, not by the
+/// calls before it. Chi's inverse row pass walks down, to end where
+/// [`Kernels::psi_to_probe`]'s in-order sum starts, and the dots down from where it ends. The
+/// forward pass cannot tell a Poisson cost's [`LsqmlKernels::icalc`] and `a_far` passes
+/// follow it, so there chi's column pass walks with the second `a_far` pass.
+const ROWS_INV: u32 = FUSED_DOWN;
+const CHI_COLS: u32 = against(ROWS_INV);
+const FORWARD: u32 = against(CHI_COLS);
+const ICALC: u32 = against(FORWARD);
+const XI: [u32; 2] = [against(ICALC), ICALC];
+const DOTS: u32 = FUSED_DOWN;
+
+/// The walk opposite to `walk`.
+const fn against(walk: u32) -> u32 {
+    walk ^ FUSED_DOWN
+}
 
 /// The LSQML kernels, bound to the module a [`Kernels`] loaded.
 #[derive(Clone, Debug)]
@@ -295,7 +305,11 @@ impl LsqmlKernels {
             views.addr().storage(),
             stack.storage(),
         ];
-        let (ctl, cfg) = (stack.ctl() as *const StackCtl, ROWS);
+        let ctl = stack.ctl() as *const StackCtl;
+        let cfg = FusedCfg {
+            flags: FORWARD,
+            alpha: 0.0,
+        };
         let m = &self.base.module;
         self.base.launch(ctx, &reads, &[work.storage()], |stream| {
             // SAFETY: lengths checked above; `Shape::of` checked the side's kernels and shared
@@ -333,7 +347,8 @@ impl LsqmlKernels {
         };
         let l = ColsLaunch::new(&d, stack, work)?;
         let reads = [work.storage(), stack.storage()];
-        self.cols(ctx, l, p, LSQML_ICALC, &reads, &[icalc.storage()])
+        let flags = LSQML_ICALC | ICALC;
+        self.cols(ctx, l, p, flags, &reads, &[icalc.storage()])
     }
 
     /// The stack's exit-wave update `chi` from the row transforms [`Self::forward`] left in
@@ -362,7 +377,7 @@ impl LsqmlKernels {
         let flags = match noise {
             LsqmlNoise::Gaussian => LSQML_CHI,
             LsqmlNoise::Poisson => LSQML_CHI | LSQML_POISSON,
-        };
+        } | CHI_COLS;
         let reads = [
             scan.counts.storage(),
             scan.order.ids().storage(),
@@ -378,7 +393,11 @@ impl LsqmlKernels {
             ..null_ptrs()
         };
         let reads = [scan.order.views().addr().storage(), stack.storage()];
-        let (ctl, cfg) = (stack.ctl() as *const StackCtl, ROWS);
+        let ctl = stack.ctl() as *const StackCtl;
+        let cfg = FusedCfg {
+            flags: ROWS_INV,
+            alpha: 0.0,
+        };
         let m = &self.base.module;
         self.base.launch(ctx, &reads, &[work.storage()], |stream| {
             // SAFETY: `ColsLaunch::new` checked `work`; as in `forward`.
@@ -423,7 +442,7 @@ impl LsqmlKernels {
                 // SAFETY: `span` lies in the scan's positions, which `order` maps to frames.
                 unsafe { self.module.lsqml_far_mean(stream, ONE_BLOCK, far, span) }
             })?;
-        for last in [0, 1] {
+        for (last, walk) in [0, 1].into_iter().zip(XI) {
             for &(stack, buf, g, config) in &stacks {
                 let reads = [
                     buf.storage(),
@@ -446,6 +465,7 @@ impl LsqmlKernels {
                                 dptr(&st.xi),
                                 stack.ctl() as *const StackCtl,
                                 g,
+                                walk,
                             )
                         }
                     })?;
@@ -543,7 +563,7 @@ impl LsqmlKernels {
                 .launch(ctx, &reads, &[st.dots.storage()], |stream| {
                     // SAFETY: lengths checked above, `st.dots` sized for every position's
                     // chunks; `Views::new` checked the views are inside the object.
-                    unsafe { self.module.lsqml_dots(stream, config, p, ctl, g) }
+                    unsafe { self.module.lsqml_dots(stream, config, p, ctl, g, DOTS) }
                 });
         };
         check_len("w", w, g.nf_max as usize * d.nprobe as usize * d.n())?;
@@ -552,7 +572,10 @@ impl LsqmlKernels {
         self.base
             .launch(ctx, &reads, &[st.dots.storage()], |stream| {
                 // SAFETY: as `lsqml_dots`; `w` checked above.
-                unsafe { self.module.lsqml_dots_shifted(stream, config, p, w, ctl, g) }
+                unsafe {
+                    self.module
+                        .lsqml_dots_shifted(stream, config, p, w, ctl, g, DOTS)
+                }
             })
     }
 
