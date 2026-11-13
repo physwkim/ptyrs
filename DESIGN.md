@@ -259,7 +259,7 @@ M6 측정(GPU2, 스택 16): 물체 갱신은 Tile 24–26 µs, SIMT 10–11 µs�
 - 예측: 새 프레임 묶음 → burn CNN → 물체 조각 → 해당 영역 초기값. 프레임 묶음마다 한 번 넘깁니다.
 - 학습(DIP·PINN): 신경망이 물체를 진폭·위상(실수)으로 출력 → ptyrs 순·역방향 연산자로 물체 기울기 g 계산 → burn에서 손실을 ⟨출력, g⟩(g는 상수 취급)로 두고 역전파하면 신경망 가중치의 기울기가 정확히 나옵니다. burn에 복소수·FFT가 필요 없습니다.
 - DIP·PINN 모드는 반복마다 경계를 건너므로, 에폭 단위 graph(불변식 1)는 ptyrs 쪽 구간에만 적용됩니다.
-- burn의 CUDA 쪽이 cuda-rust의 GPU 메모리를 복사 없이 받을 수 있는지는 미검증입니다. 안 되면 복사하며, 크기는 프레임 묶음 또는 물체 배열 하나입니다.
+- 메모리는 burn → cuda-rust 방향만 복사 없이 넘어갑니다(`ptyrs/src/nn/interop.rs`). burn 텐서의 버퍼는 `lend`가 cuda-rust `DeviceBuffer<f32>`로 그대로 빌려줍니다. 반대 방향은 안 됩니다. cubecl CUDA 저장소는 자기가 할당한 포인터만 내주고 해제하며(cubecl-cuda 0.11.4 `compute/storage/gpu.rs:232`, 표에 넣는 곳이 `alloc` 하나), 외부 포인터를 받아들이는 API가 없습니다. 그래서 엔진이 가진 버퍼는 `copy_in`이 장치 간 복사 한 번으로 새 burn 텐서에 옮기며, 크기는 프레임 묶음 또는 물체 배열 하나입니다. 경계 버퍼를 burn이 가지면 복사가 없습니다. `ptyrs/tests/nn_interop.rs`의 `lend_aliases_burn_memory`(빌린 버퍼에 cuda-rust가 쓴 값이 burn 텐서에 보임)와 `copy_in_copies_engine_memory`(뒤이은 엔진 쓰기가 burn 텐서를 바꾸지 않음)가 두 방향을 확인합니다.
 
 ---
 
@@ -304,7 +304,7 @@ M6 측정(GPU2, 스택 16): 물체 갱신은 Tile 24–26 µs, SIMT 10–11 µs�
 
 ## 8. 열린 결정과 미검증 사항
 
-- **burn ↔ cuda-rust 메모리 공유**: burn CUDA 백엔드가 외부 GPU 포인터를 복사 없이 받을 수 있는지 미검증입니다.
+- **burn ↔ cuda-rust 메모리 공유**: 확인했습니다(§4 신경망 경계). burn → cuda-rust는 복사 없이(`lend`), cuda-rust → burn은 장치 간 복사 한 번(`copy_in`)입니다. cubecl CUDA 저장소가 자기가 할당한 포인터만 다루고 외부 포인터를 받는 API가 없기 때문입니다. `ptyrs/tests/nn_interop.rs`의 `lend_aliases_burn_memory`와 `copy_in_copies_engine_memory`가 확인합니다.
 - **std::autodiff(Rust 컴파일러 내장 자동 미분, nightly)**: cuda-oxide 커널에 쓸 수 있다면 역방향 연산자를 손으로 쓰지 않아도 됩니다. cuda-oxide는 별도 컴파일 백엔드라 함께 동작하는지 미검증이며, 지켜볼 항목입니다.
 - **cuFFT 장치 API의 안정성**: 실험 API(`cufft_device.h` 0.6.0)입니다. 커널이 부르는 함수 이름(`cufftdx_private_lto_function<600, ID, float, 1>`)은 공개 문서에 없고, ID가 크기·방향·SM마다 정해져 지금 코드는 sm_89에 고정입니다. CUDA를 올리면 깨질 수 있습니다. 이름을 libcufft가 주는 database 문자열에서 만들어 버전 변화를 따라갈 수 있는지는 미검증입니다. 열 패스가 256 간격으로 읽는 비용도 미측정입니다(M2).
 - **Rust로 쓴 cuFFT LTO 콜백**: API는 있으나 cuda-oxide LTOIR과 cuFFT JIT 링크의 호환성은 미검증입니다.
