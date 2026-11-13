@@ -7,7 +7,7 @@ use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 
 /// One shape of an object, evaluated inside its bounding box: soft ones for [`random_object`],
-/// hard-edged polygons and gratings for [`structured_object`].
+/// hard-edged polygons, gratings and spoke stars for [`structured_object`].
 enum Shape {
     Ellipse {
         a: f64,
@@ -38,6 +38,15 @@ enum Shape {
         duty: f64,
         edge: f64,
     },
+    /// `spokes` wedges, each `duty` of its angular period wide, between the radii `inner` and
+    /// `outer`.
+    Star {
+        spokes: usize,
+        inner: f64,
+        outer: f64,
+        duty: f64,
+        edge: f64,
+    },
 }
 
 impl Shape {
@@ -65,15 +74,20 @@ impl Shape {
                 period,
                 duty,
                 edge,
+            } => soft(
+                stripe(u, period, duty).min(a - u.abs()).min(b - v.abs()),
+                edge,
+            ),
+            Shape::Star {
+                spokes,
+                inner,
+                outer,
+                duty,
+                edge,
             } => {
-                let x = u.rem_euclid(period);
-                let w = duty * period;
-                let line = if x < w {
-                    x.min(w - x)
-                } else {
-                    -(x - w).min(period - x)
-                };
-                soft(line.min(a - u.abs()).min(b - v.abs()), edge)
+                let r = u.hypot(v);
+                let wedge = r * stripe(v.atan2(u), 2.0 * PI / spokes as f64, duty);
+                soft(wedge.min(r - inner).min(outer - r), edge)
             }
         }
     }
@@ -85,6 +99,7 @@ impl Shape {
             | Shape::Grating { a, b, edge, .. } => a.hypot(b) + 2.0 * edge,
             Shape::Blob { sigma } => 4.0 * sigma,
             Shape::Polygon { reach, edge, .. } => reach + 2.0 * edge,
+            Shape::Star { outer, edge, .. } => outer + 2.0 * edge,
         }
     }
 
@@ -144,6 +159,18 @@ fn soft(d: f64, edge: f64) -> f64 {
     (d / edge + 0.5).clamp(0.0, 1.0)
 }
 
+/// Signed distance from `x` to the nearest edge of stripes `duty·period` wide starting at every
+/// multiple of `period`: positive inside a stripe.
+fn stripe(x: f64, period: f64, duty: f64) -> f64 {
+    let x = x.rem_euclid(period);
+    let w = duty * period;
+    if x < w {
+        x.min(w - x)
+    } else {
+        -(x - w).min(period - x)
+    }
+}
+
 /// Adds `count` random shapes with signed heights into `t`.
 fn scatter(t: &mut [f64], shape: [usize; 2], count: usize, rng: &mut ChaCha8Rng) {
     let [ny, nx] = shape;
@@ -170,15 +197,46 @@ fn scatter(t: &mut [f64], shape: [usize; 2], count: usize, rng: &mut ChaCha8Rng)
     }
 }
 
-/// Adds `count` random hard-edged shapes with signed heights into `t`: convex polygons
-/// (radius 3–48 px, 3–8 vertices) and gratings (period 4–32 px) cut to rectangles of 20–120
-/// px, each edge rising over 0.3–1 px.
-fn scatter_hard(t: &mut [f64], shape: [usize; 2], count: usize, rng: &mut ChaCha8Rng) {
+/// Adds `count` random hard-edged shapes into the phase and amplitude layouts `tp` and `ta`, with
+/// a signed phase height and an amplitude height of 0–1.5 drawn apart for each: convex polygons
+/// (radius 3–96 px, 3–8 vertices) and gratings of line pairs (period 4–32 px, cut to rectangles
+/// of 20–120 px), each edge rising over 0.3–1 px, and 1–2 spoke stars (4–40 spokes, outer
+/// radius 16–200 px, hole up to 0.3 of it, edges over 0.3–6 px) centred in the middle half of
+/// the object.
+fn scatter_hard(
+    tp: &mut [f64],
+    ta: &mut [f64],
+    shape: [usize; 2],
+    count: usize,
+    rng: &mut ChaCha8Rng,
+) {
     let [ny, nx] = shape;
+    let mut add = |s: Shape, centre: (f64, f64), rng: &mut ChaCha8Rng| {
+        let hp = rng.gen_range(0.3..1.5) * if rng.gen_bool(0.25) { -1.0 } else { 1.0 };
+        let ha = rng.gen_range(0.0..1.5);
+        let turn = rng.gen_range(0.0..2.0 * PI).sin_cos();
+        s.add_to(tp, shape, hp, centre, turn);
+        s.add_to(ta, shape, ha, centre, turn);
+    };
+    for _ in 0..rng.gen_range(1..=2) {
+        let outer = 16.0 * 12.5f64.powf(rng.r#gen::<f64>()); // log-uniform
+        let s = Shape::Star {
+            spokes: rng.gen_range(4..=40),
+            inner: outer * rng.gen_range(0.0..0.3),
+            outer,
+            duty: rng.gen_range(0.3..0.7),
+            edge: 0.3 * 20f64.powf(rng.r#gen::<f64>()),
+        };
+        let centre = (
+            rng.gen_range(0.25..0.75) * ny as f64,
+            rng.gen_range(0.25..0.75) * nx as f64,
+        );
+        add(s, centre, rng);
+    }
     for _ in 0..count {
         let edge = rng.gen_range(0.3..1.0);
         let s = if rng.gen_bool(0.5) {
-            let r = 3.0 * 16f64.powf(rng.r#gen::<f64>()); // log-uniform
+            let r = 3.0 * 32f64.powf(rng.r#gen::<f64>()); // log-uniform
             let mut angles: Vec<f64> = (0..rng.gen_range(3..=8))
                 .map(|_| rng.gen_range(0.0..2.0 * PI))
                 .collect();
@@ -194,9 +252,8 @@ fn scatter_hard(t: &mut [f64], shape: [usize; 2], count: usize, rng: &mut ChaCha
                 edge,
             }
         };
-        let height = rng.gen_range(0.3..1.5) * if rng.gen_bool(0.25) { -1.0 } else { 1.0 };
         let centre = (rng.gen_range(0.0..ny as f64), rng.gen_range(0.0..nx as f64));
-        s.add_to(t, shape, height, centre, rng.gen_range(0.0..PI).sin_cos());
+        add(s, centre, rng);
     }
 }
 
@@ -227,20 +284,23 @@ pub fn random_object(shape: [usize; 2], seed: u64) -> Object {
     Object::new(Stack::from_vec([1, ny, nx], data).expect("shape"))
 }
 
-/// A seeded structured single-mode object `[1, ny, nx]`: hard-edged polygons and line
-/// gratings of one material on a flat background `1 + 0i`. Phase is `φmax·tanh(t)` and
-/// amplitude `exp(-μ·|tanh(t)|)` of the one layout `t`, with `φmax` (0.5–2 rad) and `μ` (0–0.7)
-/// drawn per object as in [`random_object`].
+/// A seeded structured single-mode object `[1, ny, nx]`: hard-edged polygons, line-pair
+/// gratings and spoke stars on a flat background `1 + 0i`, each with its own phase and amplitude
+/// contrast. Phase is `φmax·tanh(t_p)` and amplitude `exp(-μ·|tanh(t_a)|)` of the phase and
+/// amplitude layouts, with `φmax` (0.5–2 rad) and `μ` (0–0.7) drawn per object as in
+/// [`random_object`].
 pub fn structured_object(shape: [usize; 2], seed: u64) -> Object {
     let [ny, nx] = shape;
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
-    let mut t = vec![0.0; ny * nx];
-    scatter_hard(&mut t, shape, (ny * nx).div_ceil(2500), &mut rng);
+    let mut tp = vec![0.0; ny * nx];
+    let mut ta = vec![0.0; ny * nx];
+    scatter_hard(&mut tp, &mut ta, shape, (ny * nx).div_ceil(2500), &mut rng);
     let phi = rng.gen_range(0.5..2.0);
     let mu = rng.gen_range(0.0..0.7);
-    let data = t
+    let data = tp
         .iter()
-        .map(|&t| C64::from_polar((-mu * t.tanh().abs()).exp(), phi * t.tanh()))
+        .zip(&ta)
+        .map(|(&p, &a)| C64::from_polar((-mu * a.tanh().abs()).exp(), phi * p.tanh()))
         .collect();
     Object::new(Stack::from_vec([1, ny, nx], data).expect("shape"))
 }
@@ -260,7 +320,7 @@ mod tests {
     }
 
     #[test]
-    fn polygons_and_gratings_rise_over_their_edge() {
+    fn polygons_gratings_and_stars_rise_over_their_edge() {
         let near = |got: f64, want: f64| assert!((got - want).abs() < 1e-12, "{got} != {want}");
         // The square |u|, |v| <= 10.
         let q = PI / 4.0;
@@ -295,6 +355,29 @@ mod tests {
             (2.0, 10.5, 0.0),
         ] {
             near(grating.at(u, v), want);
+        }
+        // Wedges on angles [0, π/4) + kπ/2 between radii 5 and 20.
+        let star = Shape::Star {
+            spokes: 4,
+            inner: 5.0,
+            outer: 20.0,
+            duty: 0.5,
+            edge: 0.5,
+        };
+        let at = |r: f64, t: f64| star.at(r * t.cos(), r * t.sin());
+        let p = PI / 8.0;
+        for (r, t, want) in [
+            (10.0, p, 1.0),
+            (10.0, 5.0 * p, 1.0),
+            (10.0, 3.0 * p, 0.0),
+            (10.0, -p, 0.0),
+            (10.0, 2.0 * p, 0.5),
+            (5.0, p, 0.5),
+            (20.0, p, 0.5),
+            (21.0, p, 0.0),
+            (0.0, 0.0, 0.0),
+        ] {
+            near(at(r, t), want);
         }
     }
 
