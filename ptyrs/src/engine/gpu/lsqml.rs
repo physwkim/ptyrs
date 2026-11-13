@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use crate::gpu::{
     BhScan, C32, EpochOrder, Error as GpuError, FusedBufs, FusedInputs, Kernels, LSQML_REC,
-    LsqmlAt, LsqmlChi, LsqmlKernels, LsqmlNoise, LsqmlPositions, LsqmlScan, LsqmlVar, Model,
-    PsiSums, Shift, ShiftedProbeSums, SpectrumBuf, StackTable, Views,
+    LsqmlAt, LsqmlChi, LsqmlKernels, LsqmlNoise, LsqmlScan, LsqmlVar, Model, PositionKernels,
+    PositionRule, Positions, PsiSums, Shift, ShiftedProbeSums, SpectrumBuf, StackTable, Views,
 };
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaStream, DeviceBuffer};
@@ -108,11 +108,12 @@ pub(super) struct LsqmlState {
     moved: Option<Moved>,
 }
 
-/// LSQML's state under the position model: a batch's shifted probes, one per stack, and the
-/// positions.
+/// LSQML's state under the position model: a batch's moved probes, one per stack, the
+/// positions and their kernels.
 struct Moved {
     w: Vec<DeviceBuffer<C32>>,
-    pos: LsqmlPositions,
+    pos: Positions,
+    kernels: PositionKernels,
 }
 
 /// An [`LsqmlState`] lent to an epoch.
@@ -137,7 +138,8 @@ struct MovedLent<'m> {
     spectrum: &'m mut SpectrumBuf,
     probe_sums: &'m mut ShiftedProbeSums,
     w: &'m mut [DeviceBuffer<C32>],
-    pos: &'m mut LsqmlPositions,
+    pos: &'m mut Positions,
+    kernels: &'m PositionKernels,
 }
 
 impl<'m> MovedLent<'m> {
@@ -157,6 +159,7 @@ impl<'m> MovedLent<'m> {
                 probe_sums: p.probe_sums,
                 w: &mut m.w,
                 pos: &mut m.pos,
+                kernels: &m.kernels,
             })),
             _ => Err(GpuError::Shape(
                 "LSQML state built for another position model".into(),
@@ -181,6 +184,7 @@ impl<'m> MovedLent<'m> {
             fused: self.fused,
             probe_sums: self.probe_sums,
             w: self.w,
+            kernels: self.kernels,
         })
     }
 }
@@ -192,6 +196,7 @@ struct MovedWaves<'w> {
     fused: &'w mut FusedBufs,
     probe_sums: &'w mut ShiftedProbeSums,
     w: &'w mut [DeviceBuffer<C32>],
+    kernels: &'w PositionKernels,
 }
 
 impl LsqmlState {
@@ -219,7 +224,8 @@ impl LsqmlState {
         let moved = match moved {
             true => Some(Moved {
                 w: bufs(nf_max as usize * dims.nprobe as usize * plane_len(dims))?,
-                pos: LsqmlPositions::zeroed(stream, dims, nf_max)?,
+                pos: Positions::zeroed(stream, dims, nf_max)?,
+                kernels: PositionKernels::load(kernels)?,
             }),
             false => None,
         };
@@ -341,7 +347,7 @@ impl<'a> Bufs<'a> {
         // epoch starts from serve every pass.
         let moved = l.moved.as_deref_mut();
         if let Some(m) = MovedLent::lend(moved, passes, &mut self.features)? {
-            l.kernels.gather_offsets(ctx, l.order, m.offsets, m.pos)?;
+            m.kernels.gather(ctx, l.order, m.offsets, m.pos)?;
         }
         let noise = match params.cost {
             Cost::Amplitude => LsqmlNoise::Gaussian,
@@ -396,7 +402,7 @@ impl<'a> Bufs<'a> {
                     let w = &mut mw.w[k];
                     self.kernels
                         .shifted_rows_fwd(ctx, &inputs(model), stack, w, work)?;
-                    l.kernels.shift_w(ctx, views.dims(), stack, w)?;
+                    mw.kernels.shift_w(ctx, views.dims(), stack, w)?;
                 }
             }
             match noise {
@@ -474,19 +480,21 @@ impl<'a> Bufs<'a> {
         self.kernels
             .scale_c32(ctx, &mut self.probe_sums.num, self.probe_len, 1.0 / nb)?;
         for (k, s) in batch.enumerate() {
+            let (stack, chi) = (l.table.at(s), &l.work[k]);
             let at = LsqmlAt {
                 x: [&*self.obj, &*self.probe],
                 d: [&self.obj_sums.num, &self.probe_sums.num],
             };
-            let chi = match &mut moved {
-                None => LsqmlChi::Unmoved(&l.work[k]),
-                Some(m) => LsqmlChi::Moved {
-                    chi: &l.work[k],
-                    w: &m.w[k],
-                    pos: &mut *m.pos,
-                },
+            let c = match &moved {
+                None => LsqmlChi::Unmoved(chi),
+                Some(m) => LsqmlChi::Moved { chi, w: &m.w[k] },
             };
-            l.kernels.dots(ctx, views, l.table.at(s), at, chi, l.scan)?;
+            l.kernels.dots(ctx, views, stack, at, c, l.scan)?;
+            if let Some(m) = &mut moved {
+                // The slopes of the object the batch started from.
+                m.kernels
+                    .sums(ctx, views, stack, self.obj, [chi, &m.w[k]], m.pos)?;
+            }
         }
         l.kernels.step(ctx, positions.clone(), l.scan)?;
         let obj = LsqmlVar {
@@ -499,9 +507,12 @@ impl<'a> Bufs<'a> {
         };
         l.kernels.update(ctx, l.scan, obj, probe)?;
         if let Some(m) = moved {
-            let limits = [POSITION_STEP as f32, POSITION_LIMIT as f32];
-            l.kernels
-                .position_step(ctx, positions, l.order, m.offsets, limits, m.pos)?;
+            let rule = PositionRule {
+                step: POSITION_STEP as f32,
+                limit: POSITION_LIMIT as f32,
+            };
+            m.kernels
+                .step(ctx, positions, l.order, m.offsets, rule, m.pos)?;
         }
         Ok(())
     }

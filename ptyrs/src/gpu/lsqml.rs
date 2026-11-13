@@ -15,36 +15,32 @@
 //! consumes the sums. An epoch starts with [`LsqmlKernels::start`] on a new run, and
 //! [`LsqmlKernels::precondition`] on pty-chi's schedule. The steps never leave the device.
 //!
-//! Under the position model ([`LsqmlPositions`]) the epoch starts with
-//! [`LsqmlKernels::gather_offsets`]; per stack [`Kernels::shifted_rows_fwd`] and
-//! [`LsqmlKernels::shift_w`] take the place of [`LsqmlKernels::forward`],
-//! [`Kernels::shifted_psi_sums`] and then [`Kernels::shifted_probe_sums`] that of the update
-//! sums, [`LsqmlChi::Moved`] takes the position sums with the dots, and
-//! [`LsqmlKernels::position_step`] follows the update.
+//! Under the position model the epoch's frames move as [`crate::gpu::PositionKernels`] lays
+//! out: per stack [`Kernels::shifted_rows_fwd`] and its moved probe take the place of
+//! [`LsqmlKernels::forward`], [`Kernels::shifted_psi_sums`] and then
+//! [`Kernels::shifted_probe_sums`] that of the update sums, and [`LsqmlChi::Moved`] gives the
+//! dots the moved probe.
 
 use std::ops::Range;
 
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig, RawDeviceBuffer};
-use ptyrs_kernels::fft_ept;
 use ptyrs_kernels::fused::{FUSED_COLS, FusedCfg, FusedPtrs};
-use ptyrs_kernels::grad::{GAMMA_CHUNK, ObjProbePtrs};
+use ptyrs_kernels::grad::ObjProbePtrs;
 pub use ptyrs_kernels::lsqml::LSQML_REC;
 use ptyrs_kernels::lsqml::{
-    LSQML_CHI, LSQML_DOTS, LSQML_ICALC, LSQML_POISSON, LSQML_POS, LSQML_XI, LsqmlCols, LsqmlDots,
-    LsqmlFar, LsqmlPosRule, LsqmlPre, LsqmlShift, LsqmlSpan, lsqml_kernels,
+    LSQML_CHI, LSQML_DOTS, LSQML_ICALC, LSQML_POISSON, LSQML_XI, LsqmlCols, LsqmlDots, LsqmlFar,
+    LsqmlPre, lsqml_kernels,
 };
 use ptyrs_kernels::pixel::PIXEL_THREADS;
 
 use crate::gpu::fused::{Shape, Side};
 use crate::gpu::ops::grid_1d;
+use crate::gpu::position::{GRID_Y_MAX, ONE_BLOCK, chunk_grid, chunks, same_dims, span};
 use crate::gpu::{
-    BhScan, C32, EpochOrder, Error, Kernels, StackCtl, StackGeom, StackRef, UpdateSums, ViewAddr,
-    ViewDims, Views, check_len, dptr,
+    BhScan, C32, Error, Kernels, StackCtl, StackGeom, StackRef, UpdateSums, ViewAddr, ViewDims,
+    Views, check_len, dptr,
 };
-
-/// Most blocks along grid y.
-const GRID_Y_MAX: u32 = 65535;
 
 /// The LSQML kernels, bound to the module a [`Kernels`] loaded.
 #[derive(Clone, Debug)]
@@ -122,76 +118,15 @@ impl LsqmlScan {
     }
 }
 
-/// LSQML's position state over one scan, sized by its dims and the stacks' `nf_max`: the
-/// offsets `[nframe, 2]` by epoch position, which the shifted passes read as
-/// [`crate::gpu::Shift::offsets`], every position's [`LSQML_POS`] sums per chunk, and one
-/// stack's object slopes `[nf_max, 2, ny, nx]`.
-pub struct LsqmlPositions {
-    dims: ViewDims,
-    offsets: DeviceBuffer<f32>,
-    sums: DeviceBuffer<f32>,
-    grad: DeviceBuffer<C32>,
-}
-
-impl LsqmlPositions {
-    /// Zeroed state for a scan of `dims` in stacks of up to `nf_max` frames.
-    pub fn zeroed(stream: &CudaStream, dims: &ViewDims, nf_max: u32) -> Result<Self, Error> {
-        dims.check()?;
-        let nframe = dims.nframe as usize;
-        Ok(Self {
-            dims: *dims,
-            offsets: DeviceBuffer::zeroed(stream, 2 * nframe)?,
-            sums: DeviceBuffer::zeroed(stream, LSQML_POS as usize * nframe * chunks(dims.n()))?,
-            grad: DeviceBuffer::zeroed(stream, 2 * nf_max as usize * dims.n())?,
-        })
-    }
-
-    /// The offsets by epoch position, as [`LsqmlKernels::gather_offsets`] set them.
-    pub fn offsets(&self) -> &DeviceBuffer<f32> {
-        &self.offsets
-    }
-}
-
 /// A stack's exit-wave update `chi` ([`LsqmlKernels::chi`]) for [`LsqmlKernels::dots`]; under
-/// the position model with the stack's shifted probe `w` ([`LsqmlKernels::shift_w`]) and
-/// the position state its sums go to.
+/// the position model with the stack's moved probe `w`
+/// ([`crate::gpu::PositionKernels::shift_w`]).
 pub enum LsqmlChi<'a> {
     Unmoved(&'a DeviceBuffer<C32>),
     Moved {
         chi: &'a DeviceBuffer<C32>,
         w: &'a DeviceBuffer<C32>,
-        pos: &'a mut LsqmlPositions,
     },
-}
-
-fn same_dims(have: &ViewDims, dims: &ViewDims) -> Result<(), Error> {
-    if have != dims {
-        return Err(Error::Shape(format!(
-            "LSQML state for {have:?}, views have {dims:?}"
-        )));
-    }
-    Ok(())
-}
-
-/// The batch `p` over the epoch positions of a scan of `dims`.
-fn span(dims: &ViewDims, p: &Range<u32>) -> Result<LsqmlSpan, Error> {
-    if p.start >= p.end || p.end > dims.nframe {
-        return Err(Error::Shape(format!(
-            "batch {p:?} outside {} frames",
-            dims.nframe
-        )));
-    }
-    Ok(LsqmlSpan {
-        p0: p.start,
-        nb: p.end - p.start,
-        // Every per-chunk buffer was sized by it, so it fits.
-        nchunk: chunks(dims.n()) as u32,
-    })
-}
-
-/// Chunks of [`GAMMA_CHUNK`] pixels per frame of `n` pixels.
-fn chunks(n: usize) -> usize {
-    n.div_ceil(GAMMA_CHUNK as usize)
 }
 
 /// Values of the object and of the probe.
@@ -199,42 +134,10 @@ fn lens(dims: &ViewDims) -> [usize; 2] {
     [dims.obj_len(), dims.nprobe as usize * dims.n()]
 }
 
-/// One block of [`PIXEL_THREADS`] per chunk of each of the stack's frames.
-fn chunk_grid(g: &StackGeom, n: usize) -> Result<LaunchConfig, Error> {
-    if g.nf_max > GRID_Y_MAX {
-        return Err(Error::Shape(format!("{} frames exceed grid y", g.nf_max)));
-    }
-    Ok(LaunchConfig {
-        grid_dim: (chunks(n) as u32, g.nf_max, 1),
-        block_dim: (PIXEL_THREADS, 1, 1),
-        shared_mem_bytes: 0,
-    })
-}
-
 /// `n` as a kernel's element count.
 fn to_u32(n: usize) -> Result<u32, Error> {
     u32::try_from(n).map_err(|_| Error::Shape(format!("{n} elements exceed u32")))
 }
-
-/// Dynamic shared memory a launch may take without opting in.
-const SMEM_MAX: u32 = 48 * 1024;
-
-/// `bytes` of dynamic shared memory, if a block may take them.
-fn smem(bytes: u32) -> Result<u32, Error> {
-    if bytes > SMEM_MAX {
-        return Err(Error::Shape(format!(
-            "{bytes} bytes of shared memory per block exceed {SMEM_MAX}"
-        )));
-    }
-    Ok(bytes)
-}
-
-/// One block of [`PIXEL_THREADS`].
-const ONE_BLOCK: LaunchConfig = LaunchConfig {
-    grid_dim: (1, 1, 1),
-    block_dim: (PIXEL_THREADS, 1, 1),
-    shared_mem_bytes: 0,
-};
 
 /// The object and probe a batch starts from, `x`, and their directions `d`, each `[object,
 /// probe]`.
@@ -588,8 +491,7 @@ impl LsqmlKernels {
 
     /// The step-size sums of the stack's frames into `st` from its exit-wave update `chi`;
     /// `views` in epoch order. Under [`LsqmlChi::Moved`] the object direction's waves take
-    /// the shifted probe, and each frame's position sums of its first view go to `pos`, with
-    /// the slopes of the object `at.x[0]`.
+    /// the moved probe.
     pub fn dots(
         &self,
         ctx: &ExecutionContext,
@@ -626,7 +528,7 @@ impl LsqmlKernels {
             out: dptr(&st.dots),
         };
         let ctl = stack.ctl() as *const StackCtl;
-        let LsqmlChi::Moved { w, pos, .. } = chi else {
+        let LsqmlChi::Moved { w, .. } = chi else {
             return self
                 .base
                 .launch(ctx, &reads, &[st.dots.storage()], |stream| {
@@ -635,182 +537,14 @@ impl LsqmlKernels {
                     unsafe { self.module.lsqml_dots(stream, config, p, ctl, g) }
                 });
         };
-        same_dims(&pos.dims, d)?;
         check_len("w", w, g.nf_max as usize * d.nprobe as usize * d.n())?;
-        check_len("grad", &pos.grad, 2 * g.nf_max as usize * d.n())?;
-        self.grad(ctx, views, stack, at.x[0], &mut pos.grad)?;
-        reads.extend([w.storage(), pos.grad.storage()]);
-        let shift = LsqmlShift {
-            w: dptr::<C32, f32>(w).cast_const(),
-            grad: dptr::<C32, f32>(&pos.grad).cast_const(),
-            sums: dptr(&pos.sums),
-        };
-        let writes = [st.dots.storage(), pos.sums.storage()];
-        self.base.launch(ctx, &reads, &writes, |stream| {
-            // SAFETY: as `lsqml_dots`; `w` and `pos.grad` checked above, `pos.sums` sized for
-            // every position's chunks.
-            unsafe {
-                self.module
-                    .lsqml_dots_shifted(stream, config, p, shift, ctl, g)
-            }
-        })
-    }
-
-    /// The object slopes of each of the stack's frames, at its first view's window of `obj`,
-    /// into `grad` `[nf_max, 2, ny, nx]`; `views` in epoch order.
-    fn grad(
-        &self,
-        ctx: &ExecutionContext,
-        views: &Views,
-        stack: StackRef<'_>,
-        obj: &DeviceBuffer<C32>,
-        grad: &mut DeviceBuffer<C32>,
-    ) -> Result<(), Error> {
-        let d = views.dims();
-        let (sh, g) = (Shape::of(d)?, d.geom(stack)?);
-        if g.nf_max > GRID_Y_MAX {
-            return Err(Error::Shape(format!("{} frames exceed grid y", g.nf_max)));
-        }
-        let reads = [obj.storage(), views.addr().storage(), stack.storage()];
-        let (o, v) = (
-            dptr::<C32, f32>(obj).cast_const(),
-            dptr::<ViewAddr, ViewAddr>(views.addr()).cast_const(),
-        );
-        let ctl = stack.ctl() as *const StackCtl;
-        let m = &self.module;
-        // Along `y` the lines are the columns, `nx` of them; along `x` the rows.
-        for (axis, side, across, fft) in [
-            (0, sh.ny, g.nx, sh.col_fft),
-            (1, sh.nx, g.ny, sh.row_smem / sh.rows),
-        ] {
-            let config = LaunchConfig {
-                grid_dim: (across / FUSED_COLS, g.nf_max, 1),
-                block_dim: (FUSED_COLS * (side as u32 / fft_ept(side as u32)), 1, 1),
-                shared_mem_bytes: smem(FUSED_COLS * fft)?,
-            };
-            let out = dptr::<C32, f32>(grad);
-            self.base.launch(ctx, &reads, &[grad.storage()], |stream| {
-                // SAFETY: the caller checked `grad`, `obj` and `views`; `Shape::of` checked the
-                // side's FFT; `Views::new` checked every view's window is inside the object.
-                unsafe {
-                    match side {
-                        Side::N64 => m.lsqml_grad_64(stream, config, o, v, out, axis, ctl, g),
-                        Side::N128 => m.lsqml_grad_128(stream, config, o, v, out, axis, ctl, g),
-                        Side::N256 => m.lsqml_grad_256(stream, config, o, v, out, axis, ctl, g),
-                        Side::N512 => m.lsqml_grad_512(stream, config, o, v, out, axis, ctl, g),
-                    }
-                }
-            })?;
-        }
-        Ok(())
-    }
-
-    /// The stack's shifted probe in place in `t`, `[nf_max * nprobe, ny, nx]` as
-    /// [`Kernels::shifted_rows_fwd`] left it: plane `fl * nprobe + p` becomes mode `p` of
-    /// frame `fl` moved by its offset, at the exit wave's stored pixels.
-    pub fn shift_w(
-        &self,
-        ctx: &ExecutionContext,
-        dims: &ViewDims,
-        stack: StackRef<'_>,
-        t: &mut DeviceBuffer<C32>,
-    ) -> Result<(), Error> {
-        let (sh, g) = (Shape::of(dims)?, dims.geom(stack)?);
-        let planes = g.nf_max as u64 * g.nprobe as u64;
-        if planes > GRID_Y_MAX as u64 {
-            return Err(Error::Shape(format!("{planes} planes exceed grid y")));
-        }
-        check_len("t", t, planes as usize * dims.n())?;
-        let config = LaunchConfig {
-            grid_dim: (g.ny / FUSED_COLS, planes as u32, 1),
-            block_dim: (FUSED_COLS * (g.nx / fft_ept(g.nx)), 1, 1),
-            shared_mem_bytes: smem(FUSED_COLS * (sh.row_smem / sh.rows))?,
-        };
-        let ctl = stack.ctl() as *const StackCtl;
-        let m = &self.module;
+        reads.push(w.storage());
+        let w = dptr::<C32, f32>(w).cast_const();
         self.base
-            .launch(ctx, &[stack.storage()], &[t.storage()], |stream| {
-                // SAFETY: `t` checked above; `Shape::of` checked the side's FFT.
-                unsafe {
-                    let t = dptr::<C32, f32>(t);
-                    match sh.nx {
-                        Side::N64 => m.lsqml_shift_w_64(stream, config, t, ctl, g),
-                        Side::N128 => m.lsqml_shift_w_128(stream, config, t, ctl, g),
-                        Side::N256 => m.lsqml_shift_w_256(stream, config, t, ctl, g),
-                        Side::N512 => m.lsqml_shift_w_512(stream, config, t, ctl, g),
-                    }
-                }
+            .launch(ctx, &reads, &[st.dots.storage()], |stream| {
+                // SAFETY: as `lsqml_dots`; `w` checked above.
+                unsafe { self.module.lsqml_dots_shifted(stream, config, p, w, ctl, g) }
             })
-    }
-
-    /// `pos`' offsets by epoch position from `offsets`, `[nframe, 2]` by frame, through
-    /// `order`'s permutation.
-    pub fn gather_offsets(
-        &self,
-        ctx: &ExecutionContext,
-        order: &EpochOrder,
-        offsets: &DeviceBuffer<f32>,
-        pos: &mut LsqmlPositions,
-    ) -> Result<(), Error> {
-        let nframe = pos.dims.nframe;
-        same_dims(&pos.dims, order.views().dims())?;
-        check_len("offsets", offsets, 2 * nframe as usize)?;
-        let ids = order.ids();
-        let config = grid_1d(2 * nframe as usize)?;
-        let reads = [offsets.storage(), ids.storage()];
-        self.base
-            .launch(ctx, &reads, &[pos.offsets.storage()], |stream| {
-                // SAFETY: both offsets hold `2 nframe` floats, `ids` the epoch's `nframe` frames.
-                unsafe {
-                    self.module.lsqml_pos_gather(
-                        stream,
-                        config,
-                        dptr::<f32, f32>(offsets).cast_const(),
-                        dptr::<u32, u32>(ids).cast_const(),
-                        dptr(&pos.offsets),
-                        nframe,
-                    )
-                }
-            })
-    }
-
-    /// pty-chi's position step of the batch's epoch positions `batch` from the
-    /// [`LsqmlChi::Moved`] sums of all its stacks, into `offsets`, `[nframe, 2]` by frame
-    /// through `order`; `[step, limit]` the fraction of the solved shift taken and the
-    /// largest step. `pos`' own offsets stay as gathered: the epoch moves each frame once.
-    pub fn position_step(
-        &self,
-        ctx: &ExecutionContext,
-        batch: Range<u32>,
-        order: &EpochOrder,
-        offsets: &mut DeviceBuffer<f32>,
-        [step, limit]: [f32; 2],
-        pos: &mut LsqmlPositions,
-    ) -> Result<(), Error> {
-        let span = span(&pos.dims, &batch)?;
-        same_dims(&pos.dims, order.views().dims())?;
-        let nframe = pos.dims.nframe;
-        check_len("offsets", offsets, 2 * nframe as usize)?;
-        let ids = order.ids();
-        let g = pos.dims.scan_geom();
-        let writes = [pos.sums.storage(), offsets.storage()];
-        self.base.launch(ctx, &[ids.storage()], &writes, |stream| {
-            // SAFETY: `span` lies in the scan's positions, `pos.sums` sized for every
-            // position's chunks, `offsets` checked above; one block.
-            unsafe {
-                self.module.lsqml_pos_step(
-                    stream,
-                    ONE_BLOCK,
-                    dptr(&pos.sums),
-                    span,
-                    dptr::<u32, u32>(ids).cast_const(),
-                    dptr(offsets),
-                    nframe,
-                    LsqmlPosRule { step, limit },
-                    g,
-                )
-            }
-        })
     }
 
     /// The step sizes of the batch's epoch positions `batch` from the [`Self::dots`] sums of
