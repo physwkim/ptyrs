@@ -91,6 +91,27 @@ pub const fn fused_col_threads(ny: u32) -> u32 {
 /// nx / fft_ept(nx)` threads each.
 pub const FUSED_ROW_THREADS: u32 = 128;
 
+/// Sets `fused_rows_inv_512`'s preferred shared-memory carveout in `module` to 32% (32 KB of
+/// sm_89's 100, three of its blocks). Left to the driver, the fourth block its registers allow
+/// takes a 64 KB carveout, and the L1 that leaves costs the kernel more than the block gains.
+pub fn pin_rows_inv_carveout(
+    module: &crate::kernels::LoadedModule,
+) -> Result<(), cuda_core::DriverError> {
+    use cuda_core::{IntoResult, sys};
+    let f = module
+        .as_cuda_module()
+        .load_function("fused_rows_inv_512")?;
+    // SAFETY: `f` keeps the module, and so the handle, alive through the call.
+    unsafe {
+        sys::cuFuncSetAttribute(
+            f.cu_function(),
+            sys::CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT,
+            32,
+        )
+    }
+    .result()
+}
+
 /// What a pass does, passed by value: `FUSED_*` bits and the DM `alpha`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
