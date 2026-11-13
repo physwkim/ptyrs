@@ -276,7 +276,7 @@ fn ml_matches_cpu() {
         let (scan, object, probe) = start(setup.frame, 2, true);
         let mut cpu = Ptycho::new(&scan, object.clone(), probe.clone()).unwrap();
         let mut gpu = GpuPtycho::new(&ctx(), &scan, object, probe, setup.options).unwrap();
-        cpu.ml(&params, 10).unwrap();
+        cpu.ml(&params, 10);
         gpu.ml(&params, 10).unwrap();
         assert_eq!(gpu.cycle(), cpu.cycle());
         let errs = [
@@ -503,7 +503,7 @@ fn switches_match_cpu(setup: Setup) {
         update_probe: false,
         ..ml
     };
-    cpu.ml(&ml, 3).unwrap();
+    cpu.ml(&ml, 3);
     gpu.ml(&ml, 3).unwrap();
     let step = Step {
         params: steps[1],
@@ -511,7 +511,7 @@ fn switches_match_cpu(setup: Setup) {
     };
     cpu.run(&step).unwrap();
     gpu.run(&step).unwrap();
-    cpu.ml(&only_obj, 3).unwrap();
+    cpu.ml(&only_obj, 3);
     gpu.ml(&only_obj, 3).unwrap();
     check(
         [
@@ -857,7 +857,7 @@ impl Cycles {
         match self {
             Cycles::Ap(a) => p.ap(&a, ncycle),
             Cycles::Dm(d) => p.dm(&d, ncycle),
-            Cycles::Ml(m) => p.ml(&m, ncycle).unwrap(),
+            Cycles::Ml(m) => p.ml(&m, ncycle),
         }
     }
 
@@ -1358,7 +1358,6 @@ fn features_are_refused_where_they_cannot_run() {
     cpu.set_features(moved.clone()).unwrap();
     gpu.set_features(&moved).unwrap();
     assert!(cpu.rpie(&ptychi::RPIE, 1).is_err());
-    assert!(cpu.ml(&MlParams::default(), 1).is_err());
     let (object, probe) = (gpu.object().unwrap(), gpu.probe().unwrap());
     for err in [
         gpu.ml(&MlParams::default(), 1).unwrap_err(),

@@ -106,9 +106,7 @@ impl Ptycho {
     /// `ncycle` ML cycles; keywords are `MlParams` fields.
     #[pyo3(signature = (ncycle, **params))]
     fn ml(&mut self, ncycle: usize, params: Option<&Bound<'_, PyDict>>) -> PyResult<()> {
-        self.inner
-            .ml(&crate::ml_params(params)?, ncycle)
-            .map_err(Error::from)?;
+        self.inner.ml(&crate::ml_params(params)?, ncycle);
         Ok(())
     }
 

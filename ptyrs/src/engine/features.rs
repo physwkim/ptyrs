@@ -33,13 +33,14 @@ pub struct Features {
     /// Per-frame position offsets `d`, `[nframe]` of `[dy, dx]` object pixels from each frame's
     /// view corner: the frame's probe modes are those of [`obj_probe_shift_to_psi`], `P·q`
     /// Fourier-moved by `d[f]` on the frame's own periodic grid (an offset past the frame
-    /// wraps), the object window staying at the corner. After each AP and DM cycle's object
-    /// and probe update, pty-chi's gradient position step from the exit-wave correction
-    /// `c = x − O·W` of the cycle's projection (`x` the new exit waves, `W` the moved probe
-    /// and `O` the object it was made from): per frame and axis, over the frame's views and
-    /// pixels, `Δ = 0.3·Re Σ conj(c)·O·∂W / (Σ |O·∂W|² + max_f Σ |O·∂W|²)` (0 where that is
-    /// 0) clipped to ±0.1, then `d += Δ − mean_f Δ`, which keeps the mean offset. pty-chi's
-    /// clip at 10 MADs of `Δ` is left out. ML refuses it.
+    /// wraps), the object window staying at the corner. After each AP, DM and ML cycle's
+    /// object and probe update, pty-chi's gradient position step from the exit-wave
+    /// correction `c = x − O·W` of the cycle's projection (`x` the new exit waves, `W` the
+    /// moved probe and `O` the object it was made from; ML, which projects nothing, takes the
+    /// magnitude projection of the estimate its cycle starts from): per frame and axis, over
+    /// the frame's views and pixels, `Δ = 0.3·Re Σ conj(c)·O·∂W / (Σ |O·∂W|² + max_f Σ
+    /// |O·∂W|²)` (0 where that is 0) clipped to ±0.1, then `d += Δ − mean_f Δ`, which keeps
+    /// the mean offset. pty-chi's clip at 10 MADs of `Δ` is left out.
     ///
     /// [`crate::engine::Lsqml`] models it on every slice through the moved probe and steps it
     /// as pty-chi's LSQML does, after each batch's object and probe update, and
