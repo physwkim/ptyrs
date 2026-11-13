@@ -5,7 +5,7 @@
     run_near.py compare <out>                             epochs and seconds to the target
 
 Run as micromamba run -n ptyrs-ref python -I refs/ptychi/run_near.py ..., `run` for timing
-through /home/stevek/work/ptyrs-scratch/tools/gpu2.sh, which pins GPU2.
+through the gpu2.sh lock wrapper, which pins GPU2.
 
 Checks the BH paper's claim (Carlsson, Nikitin, Wendt 2025) of about 10x less compute time than
 LSQML on near-field data, for which M3's far-field runs found no gain (DESIGN B7). The paper's

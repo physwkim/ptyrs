@@ -383,7 +383,7 @@
   "host": "sm-gpu"
  },
  "gpu_shared_with": [
-  "/home/stevek/work/ptyrs-wt-dist/target/debug/deps/ptyrs_dist-e57b1af6c88d91a9"
+  "ptyrs_dist-e57b1af6c88d91a9"
  ],
  "peak_memory_reserved_gib": 1.1640625,
  "llk_definition": "PyNX normalised LLK (see m3ref.py); icalc from pty-chi's forward model",
