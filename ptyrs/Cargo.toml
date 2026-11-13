@@ -13,9 +13,7 @@ ptyrs-kernels = { path = "../ptyrs-kernels" }
 cuda-core.workspace = true
 cuda-async.workspace = true
 cuda-bindings.workspace = true
-# Absolute like the workspace's cuda-rust paths, so worktrees resolve it; its cuda-core and
-# cuda-async are the workspace's.
-cutile = { path = "/home/stevek/work/cuda-rust/cutile-rs/cutile" }
+cutile.workspace = true
 num-complex.workspace = true
 thiserror.workspace = true
 rand.workspace = true
@@ -26,8 +24,7 @@ rust-hdf5 = { workspace = true, features = ["lz4"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 serde = { version = "1", features = ["derive"] }
 toml = "1"
-# Local epics-rs checkout, absolute like the cuda-rust paths in the workspace manifest.
-epics-pva-rs = { path = "/home/stevek/work/epics-rs/crates/epics-pva-rs" }
+epics-pva-rs.workspace = true
 # Unsafe (fast) block codec, still bounds-checked on decode.
 lz4_flex = { version = "0.11", default-features = false, features = ["std", "checked-decode"] }
 bytes = "1"
@@ -47,10 +44,11 @@ cudarc = { version = "0.19.10", default-features = false, features = ["cuda-1304
 cubecl-runtime = { version = "0.11.4", default-features = false, optional = true }
 
 [build-dependencies]
-cuda-artifact-finalizer = { path = "/home/stevek/work/cuda-rust/cuda-oxide/crates/cuda-artifact-finalizer" }
-nvjitlink-sys = { path = "/home/stevek/work/cuda-rust/cuda-oxide/crates/nvjitlink-sys" }
+cuda-artifact-finalizer.workspace = true
+nvjitlink-sys.workspace = true
 oxide-artifacts = "0.2.1"
 libloading = "0.8"
+serde_json = "1"
 cudarc = { version = "0.19.10", default-features = false, features = ["cuda-13040"], optional = true }
 
 [lints.clippy]

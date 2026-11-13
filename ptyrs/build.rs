@@ -3,7 +3,8 @@
 //!
 //! 1. A nested `cargo oxide build --emit-nvvm-ir` compiles ptyrs-kernels with the cuda-oxide
 //!    backend into `<target>/oxide-device`, writing `ptyrs_kernels.{ll,options,target}` to
-//!    `$OUT_DIR/device`.
+//!    `$OUT_DIR/device`. cargo-oxide is built into `<target>/oxide-cli` from the cuda-rust
+//!    checkout `cuda-device` resolves to, the one its backend is built from.
 //! 2. Every `ptyrs_cufft_c2c_f32_n{N}_e{EPT}_{fwd|inv}` the device code declares is defined in
 //!    the IR as a call to the libcufft device-API function with those traits. Its ID and the
 //!    API version come from libcufft's database string, not from constants here.
@@ -98,8 +99,7 @@ fn run() -> Res<()> {
     fs::create_dir_all(&nvvm_dir)?;
     let target_dir = env::var_os("CARGO_TARGET_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| workspace.join("target"))
-        .join("oxide-device");
+        .unwrap_or_else(|| workspace.join("target"));
 
     build_device_crate(workspace, &target_dir, &nvvm_dir, &arch)?;
     let (ir, options) = read_device_artifact(&nvvm_dir, &arch)?;
@@ -132,6 +132,55 @@ fn run() -> Res<()> {
     Ok(())
 }
 
+/// A cargo for the nested builds. Everything else the outer cargo, clippy or nextest set would
+/// redirect or break them; see [`KEEP_ENV`].
+fn nested_cargo(workspace: &Path) -> Command {
+    let cargo = env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
+    let mut cmd = Command::new(cargo);
+    cmd.current_dir(workspace).env_clear();
+    for key in KEEP_ENV {
+        if let Some(value) = env::var_os(key) {
+            cmd.env(key, value);
+        }
+    }
+    cmd
+}
+
+fn output_ok(mut cmd: Command, what: &str) -> Res<Vec<u8>> {
+    let output = cmd.output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "{what} failed ({}):\n{}{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        )
+        .into());
+    }
+    Ok(output.stdout)
+}
+
+/// cargo-oxide's manifest in the cuda-rust checkout cargo resolved `cuda-device` to: the pinned
+/// git commit, or the local clone a `.cargo/config.local.toml` replaces it with.
+fn cargo_oxide_manifest(workspace: &Path) -> Res<PathBuf> {
+    let mut cmd = nested_cargo(workspace);
+    cmd.args(["metadata", "--format-version=1", "--locked"]);
+    let metadata: serde_json::Value = serde_json::from_slice(&output_ok(cmd, "`cargo metadata`")?)?;
+    let device = metadata["packages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|p| p["name"] == "cuda-device")
+        .and_then(|p| p["manifest_path"].as_str())
+        .ok_or("`cargo metadata` lists no cuda-device")?;
+    // <checkout>/cuda-oxide/crates/cuda-device/Cargo.toml
+    let crates = Path::new(device)
+        .ancestors()
+        .nth(2)
+        .ok_or("cuda-device's manifest has no crates directory")?;
+    Ok(crates.join("cargo-oxide").join("Cargo.toml"))
+}
+
 /// Runs `cargo oxide build` on the device crate. The backend's options are part of the
 /// device crate's Cargo fingerprint (cargo-oxide hashes every `CUDA_OXIDE_*` variable,
 /// `CUDA_OXIDE_PTX_DIR` included), so a no-op build means `nvvm_dir` already holds the IR
@@ -142,32 +191,21 @@ fn build_device_crate(
     nvvm_dir: &Path,
     arch: &CudaArch,
 ) -> Res<()> {
-    let cargo = env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
-    let mut cmd = Command::new(cargo);
-    cmd.current_dir(workspace).env_clear();
-    for key in KEEP_ENV {
-        if let Some(value) = env::var_os(key) {
-            cmd.env(key, value);
-        }
-    }
+    let cargo_oxide = cargo_oxide_manifest(workspace)?;
+    let mut cmd = nested_cargo(workspace);
     cmd.env("CUDA_OXIDE_PTX_DIR", nvvm_dir)
-        .args(["oxide", "build", "--emit-nvvm-ir", "--arch"])
+        .args(["run", "--quiet", "--locked", "--manifest-path"])
+        .arg(&cargo_oxide)
+        .arg("--target-dir")
+        .arg(target_dir.join("oxide-cli"))
+        .args(["--", "build", "--emit-nvvm-ir", "--arch"])
         .arg(arch.sm())
         .args(["--device-codegen-crate", DEVICE_CRATE, "--cargo-target-dir"])
-        .arg(target_dir)
+        .arg(target_dir.join("oxide-device"))
         // Release: the legacy NVVM IR dialect for pre-Blackwell targets cannot carry the
         // debug metadata a dev-profile build attaches.
         .args(["--", "-p", DEVICE_PACKAGE, "--lib", "--release"]);
-    let output = cmd.output()?;
-    if !output.status.success() {
-        return Err(format!(
-            "`cargo oxide build` of {DEVICE_PACKAGE} failed ({}):\n{}{}",
-            output.status,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        )
-        .into());
-    }
+    output_ok(cmd, &format!("`cargo oxide build` of {DEVICE_PACKAGE}"))?;
     Ok(())
 }
 

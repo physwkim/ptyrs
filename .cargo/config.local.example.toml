@@ -1,0 +1,30 @@
+# Copy to config.local.toml (untracked) and fill in the paths. Every table is optional.
+
+# Build cuda-rust and epics-rs from local clones instead of GitHub. Source replacement keeps
+# Cargo.lock as tracked, but builds the pinned commit, not the working tree. Each `rev` must be
+# the pin in Cargo.toml; after a pin bump an entry that still names the old rev stops matching
+# and cargo fetches from GitHub again.
+[source.cuda-rust]
+git = "https://github.com/NVIDIA/cuda-rust.git"
+rev = "367bc0f8e671070e00eebc7e5498f3e8eebefc72"
+replace-with = "cuda-rust-local"
+
+[source.cuda-rust-local]
+git = "file:///path/to/cuda-rust"
+
+[source.epics-rs]
+git = "https://github.com/physwkim/epics-rs.git"
+rev = "55d3d654c60dc614d83e61839ebccdaf5ece3dc4"
+replace-with = "epics-rs-local"
+
+[source.epics-rs-local]
+git = "file:///path/to/epics-rs"
+
+[env]
+# The Python ptyrs-py builds against (pyo3 defaults to python3 on PATH). An environment
+# variable of the same name wins, here and in ptyrs-py/scripts/build.sh.
+PYO3_PYTHON = "/path/to/python3"
+
+[alias]
+# `cargo oxide` by hand; ptyrs/build.rs runs cargo-oxide from the pinned checkout without it.
+oxide = "run --quiet --manifest-path /path/to/cuda-rust/cuda-oxide/crates/cargo-oxide/Cargo.toml --"

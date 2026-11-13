@@ -2396,6 +2396,7 @@ dependencies = [
 [[package]]
 name = "cuda-artifact-finalizer"
 version = "0.3.0"
+source = "git+https://github.com/NVIDIA/cuda-rust.git?rev=367bc0f8e671070e00eebc7e5498f3e8eebefc72#367bc0f8e671070e00eebc7e5498f3e8eebefc72"
 dependencies = [
  "libnvvm-sys",
  "nvjitlink-sys",
@@ -2407,6 +2408,7 @@ dependencies = [
 [[package]]
 name = "cuda-async"
 version = "0.5.0"
+source = "git+https://github.com/NVIDIA/cuda-rust.git?rev=367bc0f8e671070e00eebc7e5498f3e8eebefc72#367bc0f8e671070e00eebc7e5498f3e8eebefc72"
 dependencies = [
  "anyhow",
  "cuda-bindings",
@@ -2422,6 +2424,7 @@ dependencies = [
 [[package]]
 name = "cuda-bindings"
 version = "0.5.0"
+source = "git+https://github.com/NVIDIA/cuda-rust.git?rev=367bc0f8e671070e00eebc7e5498f3e8eebefc72#367bc0f8e671070e00eebc7e5498f3e8eebefc72"
 dependencies = [
  "bindgen 0.72.1",
  "libloading 0.8.9",
@@ -2434,6 +2437,7 @@ dependencies = [
 [[package]]
 name = "cuda-core"
 version = "0.5.0"
+source = "git+https://github.com/NVIDIA/cuda-rust.git?rev=367bc0f8e671070e00eebc7e5498f3e8eebefc72#367bc0f8e671070e00eebc7e5498f3e8eebefc72"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -2447,6 +2451,7 @@ dependencies = [
 [[package]]
 name = "cuda-core-derive"
 version = "0.5.0"
+source = "git+https://github.com/NVIDIA/cuda-rust.git?rev=367bc0f8e671070e00eebc7e5498f3e8eebefc72#367bc0f8e671070e00eebc7e5498f3e8eebefc72"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2456,6 +2461,7 @@ dependencies = [
 [[package]]
 name = "cuda-device"
 version = "0.3.0"
+source = "git+https://github.com/NVIDIA/cuda-rust.git?rev=367bc0f8e671070e00eebc7e5498f3e8eebefc72#367bc0f8e671070e00eebc7e5498f3e8eebefc72"
 dependencies = [
  "bytemuck",
  "cuda-macros",
@@ -2465,6 +2471,7 @@ dependencies = [
 [[package]]
 name = "cuda-host"
 version = "0.3.0"
+source = "git+https://github.com/NVIDIA/cuda-rust.git?rev=367bc0f8e671070e00eebc7e5498f3e8eebefc72#367bc0f8e671070e00eebc7e5498f3e8eebefc72"
 dependencies = [
  "cuda-artifact-finalizer",
  "cuda-async",
@@ -2482,6 +2489,7 @@ dependencies = [
 [[package]]
 name = "cuda-macros"
 version = "0.3.0"
+source = "git+https://github.com/NVIDIA/cuda-rust.git?rev=367bc0f8e671070e00eebc7e5498f3e8eebefc72#367bc0f8e671070e00eebc7e5498f3e8eebefc72"
 dependencies = [
  "oxide-tile-export",
  "proc-macro2",
@@ -2493,10 +2501,12 @@ dependencies = [
 [[package]]
 name = "cuda-repr"
 version = "0.5.0"
+source = "git+https://github.com/NVIDIA/cuda-rust.git?rev=367bc0f8e671070e00eebc7e5498f3e8eebefc72#367bc0f8e671070e00eebc7e5498f3e8eebefc72"
 
 [[package]]
 name = "cuda-target-spec"
 version = "0.3.0"
+source = "git+https://github.com/NVIDIA/cuda-rust.git?rev=367bc0f8e671070e00eebc7e5498f3e8eebefc72#367bc0f8e671070e00eebc7e5498f3e8eebefc72"
 
 [[package]]
 name = "cudarc"
@@ -2510,6 +2520,7 @@ dependencies = [
 [[package]]
 name = "cutile"
 version = "0.5.0"
+source = "git+https://github.com/NVIDIA/cuda-rust.git?rev=367bc0f8e671070e00eebc7e5498f3e8eebefc72#367bc0f8e671070e00eebc7e5498f3e8eebefc72"
 dependencies = [
  "anyhow",
  "cuda-async",
@@ -2532,6 +2543,7 @@ dependencies = [
 [[package]]
 name = "cutile-compiler"
 version = "0.5.0"
+source = "git+https://github.com/NVIDIA/cuda-rust.git?rev=367bc0f8e671070e00eebc7e5498f3e8eebefc72#367bc0f8e671070e00eebc7e5498f3e8eebefc72"
 dependencies = [
  "anyhow",
  "cuda-async",
@@ -2552,6 +2564,7 @@ dependencies = [
 [[package]]
 name = "cutile-ir"
 version = "0.5.0"
+source = "git+https://github.com/NVIDIA/cuda-rust.git?rev=367bc0f8e671070e00eebc7e5498f3e8eebefc72#367bc0f8e671070e00eebc7e5498f3e8eebefc72"
 dependencies = [
  "half",
  "indexmap",
@@ -2562,6 +2575,7 @@ dependencies = [
 [[package]]
 name = "cutile-macro"
 version = "0.5.0"
+source = "git+https://github.com/NVIDIA/cuda-rust.git?rev=367bc0f8e671070e00eebc7e5498f3e8eebefc72#367bc0f8e671070e00eebc7e5498f3e8eebefc72"
 dependencies = [
  "convert_case 0.8.0",
  "cutile-compiler",
@@ -3026,6 +3040,7 @@ dependencies = [
 [[package]]
 name = "epics-base-rs"
 version = "0.34.1"
+source = "git+https://github.com/physwkim/epics-rs.git?rev=55d3d654c60dc614d83e61839ebccdaf5ece3dc4#55d3d654c60dc614d83e61839ebccdaf5ece3dc4"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3051,6 +3066,7 @@ dependencies = [
 [[package]]
 name = "epics-libcom-rs"
 version = "0.34.1"
+source = "git+https://github.com/physwkim/epics-rs.git?rev=55d3d654c60dc614d83e61839ebccdaf5ece3dc4#55d3d654c60dc614d83e61839ebccdaf5ece3dc4"
 dependencies = [
  "chrono",
  "hostname",
@@ -3066,6 +3082,7 @@ dependencies = [
 [[package]]
 name = "epics-macros-rs"
 version = "0.34.1"
+source = "git+https://github.com/physwkim/epics-rs.git?rev=55d3d654c60dc614d83e61839ebccdaf5ece3dc4#55d3d654c60dc614d83e61839ebccdaf5ece3dc4"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -3076,6 +3093,7 @@ dependencies = [
 [[package]]
 name = "epics-pva-rs"
 version = "0.34.1"
+source = "git+https://github.com/physwkim/epics-rs.git?rev=55d3d654c60dc614d83e61839ebccdaf5ece3dc4#55d3d654c60dc614d83e61839ebccdaf5ece3dc4"
 dependencies = [
  "arc-swap",
  "bytes",
@@ -3114,6 +3132,7 @@ dependencies = [
 [[package]]
 name = "epics-rtems-boot"
 version = "0.34.1"
+source = "git+https://github.com/physwkim/epics-rs.git?rev=55d3d654c60dc614d83e61839ebccdaf5ece3dc4#55d3d654c60dc614d83e61839ebccdaf5ece3dc4"
 dependencies = [
  "cc",
  "libc",
@@ -4424,6 +4443,7 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 [[package]]
 name = "libnvvm-sys"
 version = "0.3.0"
+source = "git+https://github.com/NVIDIA/cuda-rust.git?rev=367bc0f8e671070e00eebc7e5498f3e8eebefc72#367bc0f8e671070e00eebc7e5498f3e8eebefc72"
 dependencies = [
  "cuda-target-spec",
  "libloading 0.8.9",
@@ -4983,6 +5003,7 @@ dependencies = [
 [[package]]
 name = "nvjitlink-sys"
 version = "0.3.0"
+source = "git+https://github.com/NVIDIA/cuda-rust.git?rev=367bc0f8e671070e00eebc7e5498f3e8eebefc72#367bc0f8e671070e00eebc7e5498f3e8eebefc72"
 dependencies = [
  "libloading 0.8.9",
  "thiserror 2.0.21",
@@ -5234,6 +5255,7 @@ dependencies = [
 [[package]]
 name = "oxide-tile-export"
 version = "0.3.0"
+source = "git+https://github.com/NVIDIA/cuda-rust.git?rev=367bc0f8e671070e00eebc7e5498f3e8eebefc72#367bc0f8e671070e00eebc7e5498f3e8eebefc72"
 dependencies = [
  "serde",
  "serde_json",
@@ -5653,6 +5675,7 @@ dependencies = [
 [[package]]
 name = "ptx-parse"
 version = "0.3.0"
+source = "git+https://github.com/NVIDIA/cuda-rust.git?rev=367bc0f8e671070e00eebc7e5498f3e8eebefc72#367bc0f8e671070e00eebc7e5498f3e8eebefc72"
 
 [[package]]
 name = "ptyrs"
@@ -6160,6 +6183,7 @@ checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
 [[package]]
 name = "reserved-oxide-symbols"
 version = "0.3.0"
+source = "git+https://github.com/NVIDIA/cuda-rust.git?rev=367bc0f8e671070e00eebc7e5498f3e8eebefc72#367bc0f8e671070e00eebc7e5498f3e8eebefc72"
 
 [[package]]
 name = "rgb"
