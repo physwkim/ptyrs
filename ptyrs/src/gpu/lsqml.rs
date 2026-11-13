@@ -25,7 +25,7 @@ use std::ops::Range;
 
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig, RawDeviceBuffer};
-use ptyrs_kernels::fused::{FUSED_COLS, FusedCfg, FusedPtrs};
+use ptyrs_kernels::fused::{FUSED_COLS, FUSED_DOWN, FusedCfg, FusedPtrs};
 use ptyrs_kernels::grad::ObjProbePtrs;
 pub use ptyrs_kernels::lsqml::LSQML_REC;
 use ptyrs_kernels::lsqml::{
@@ -40,6 +40,15 @@ use crate::gpu::position::{ONE_BLOCK, chunk_grid, chunks, same_dims, span};
 use crate::gpu::{
     BhScan, C32, Error, Kernels, StackCtl, StackGeom, StackRef, UpdateSums, ViewAddr, ViewDims,
     Views, check_len, dptr,
+};
+
+/// The fused row passes' cfg: both walk the stack down, against the column pass between them,
+/// which walks up in grid order, so each pass starts on the frames the one before it touched
+/// last, still in L2, and the inverse pass ends where [`Kernels::psi_to_probe`]'s in-order sum
+/// starts.
+const ROWS: FusedCfg = FusedCfg {
+    flags: FUSED_DOWN,
+    alpha: 0.0,
 };
 
 /// The LSQML kernels, bound to the module a [`Kernels`] loaded.
@@ -286,7 +295,7 @@ impl LsqmlKernels {
             views.addr().storage(),
             stack.storage(),
         ];
-        let (ctl, cfg) = (stack.ctl() as *const StackCtl, FusedCfg::default());
+        let (ctl, cfg) = (stack.ctl() as *const StackCtl, ROWS);
         let m = &self.base.module;
         self.base.launch(ctx, &reads, &[work.storage()], |stream| {
             // SAFETY: lengths checked above; `Shape::of` checked the side's kernels and shared
@@ -369,7 +378,7 @@ impl LsqmlKernels {
             ..null_ptrs()
         };
         let reads = [scan.order.views().addr().storage(), stack.storage()];
-        let (ctl, cfg) = (stack.ctl() as *const StackCtl, FusedCfg::default());
+        let (ctl, cfg) = (stack.ctl() as *const StackCtl, ROWS);
         let m = &self.base.module;
         self.base.launch(ctx, &reads, &[work.storage()], |stream| {
             // SAFETY: `ColsLaunch::new` checked `work`; as in `forward`.
