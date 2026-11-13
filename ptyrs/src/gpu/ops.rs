@@ -1325,6 +1325,43 @@ impl Kernels {
         })
     }
 
+    /// RAAR's iterate over `n` elements (PyNX `RAARProj`): with `h = beta / 2`, sets `psi =
+    /// (1 - h) psi + h (2 po - iterate)` and `iterate` to the new `psi`. `psi` holds the last
+    /// cycle's projection of `iterate`, and `po` `obj_probe_to_psi` of the current object and
+    /// probe.
+    pub fn raar_iterate(
+        &self,
+        ctx: &ExecutionContext,
+        psi: &mut DeviceBuffer<C32>,
+        iterate: &mut DeviceBuffer<C32>,
+        po: &DeviceBuffer<C32>,
+        n: u32,
+        beta: f32,
+    ) -> Result<(), Error> {
+        check_len("psi", psi, n as usize)?;
+        check_len("iterate", iterate, n as usize)?;
+        check_len("po", po, n as usize)?;
+        if n == 0 {
+            return Ok(());
+        }
+        let config = grid_1d(n as usize)?;
+        let writes = [psi.storage(), iterate.storage()];
+        self.launch(ctx, &[po.storage()], &writes, |stream| {
+            // SAFETY: all three hold `n` values.
+            unsafe {
+                (self.module).raar_iterate(
+                    stream,
+                    config,
+                    dptr(psi),
+                    dptr(iterate),
+                    dptr(po),
+                    n,
+                    beta,
+                )
+            }
+        })
+    }
+
     /// `y += x` for the first `n` values.
     pub fn add_c32(
         &self,

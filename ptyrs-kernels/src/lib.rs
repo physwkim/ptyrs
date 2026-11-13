@@ -371,7 +371,7 @@ unsafe fn bin_tile_views(
 #[cuda_module]
 pub mod kernels {
     use super::*;
-    use crate::fused::{FusedCfg, FusedPtrs};
+    use crate::fused::{FusedCfg, FusedPtrs, raar_mix};
     use crate::pixel::*;
     use cuda_device::SharedArray;
 
@@ -999,6 +999,32 @@ pub mod kernels {
             let p1 = (a * o.0 - b * p.0, a * o.1 - b * p.1);
             store_c(psi, g, p1);
             store_c(po, g, (b * (o.0 - p1.0), b * (o.1 - p1.1)));
+        }
+    }
+
+    /// RAAR's iterate (PyNX `RAARProj`): with `h = beta / 2`, sets `psi = (1 - h) psi + h (2
+    /// po - iterate)` and `iterate` to the new `psi`, for `n` elements.
+    ///
+    /// # Safety
+    ///
+    /// `psi`, `iterate`, `po` hold `n` complex values.
+    #[kernel]
+    pub unsafe fn raar_iterate(
+        psi: *mut f32,
+        iterate: *mut f32,
+        po: *const f32,
+        n: u32,
+        beta: f32,
+    ) {
+        let g = global_index();
+        if g >= n as usize {
+            return;
+        }
+        unsafe {
+            let (s, it, o) = (load_c(psi, g), load_c(iterate, g), load_c(po, g));
+            let r = raar_mix(s, it, o, beta);
+            store_c(psi, g, r);
+            store_c(iterate, g, r);
         }
     }
 
