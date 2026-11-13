@@ -359,6 +359,19 @@ fn translate(a: &[C64], offset: [f64; 2], axis: Option<usize>, fft: &Fft2) -> Ve
 /// applies after them (`None` for none) and `T` [`translate`]'s move on the plane's periodic
 /// grid, which commutes with fftshift. The adjoint is the move by `−offset`.
 pub(crate) fn move_planes(p: &mut [C64], quad: Option<&[C64]>, offset: [f64; 2], fft: &Fft2) {
+    move_derivative(p, quad, offset, &[], fft);
+}
+
+/// [`move_planes`] differentiated over the offset components `axes` (`0` for `dy`, `1` for
+/// `dx`, repeats for higher orders): `conj(q)·∂T(q·p)`, the translation phase times
+/// `−2πi f_a` per listed axis.
+pub(crate) fn move_derivative(
+    p: &mut [C64],
+    quad: Option<&[C64]>,
+    offset: [f64; 2],
+    axes: &[usize],
+    fft: &Fft2,
+) {
     let shape = fft.shape();
     let n = shape[0] * shape[1];
     let phase = |p: &mut [C64], conj: bool| {
@@ -373,10 +386,12 @@ pub(crate) fn move_planes(p: &mut [C64], quad: Option<&[C64]>, offset: [f64; 2],
     phase(p, false);
     fft.forward(p);
     for plane in p.chunks_exact_mut(n) {
-        plane
-            .iter_mut()
-            .enumerate()
-            .for_each(|(j, p)| *p *= ramp(j, shape, offset).1);
+        plane.iter_mut().enumerate().for_each(|(j, p)| {
+            let (f, e) = ramp(j, shape, offset);
+            *p *= axes
+                .iter()
+                .fold(e, |e, &a| e * C64::new(0.0, -2.0 * PI * f[a]));
+        });
     }
     fft.inverse(p);
     phase(p, true);

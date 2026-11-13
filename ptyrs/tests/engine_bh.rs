@@ -7,7 +7,7 @@ use std::ops::Range;
 use std::slice;
 
 use ptyrs::base::{C64, Object, Probe, Stack};
-use ptyrs::engine::{Bh, BhBatch, BhParams, Optics, Ptycho, llk, obj_probe_to_psi};
+use ptyrs::engine::{Bh, BhBatch, BhParams, BhVector, Optics, Ptycho, llk, obj_probe_to_psi};
 
 #[path = "common/engine/mod.rs"]
 mod common;
@@ -59,9 +59,12 @@ fn dot(a: &[C64], b: &[C64]) -> f64 {
     a.iter().zip(b).map(|(a, b)| (a.conj() * b).re).sum()
 }
 
-/// The flat displacement of an object and a probe change, [`BhBatch`]'s layout.
-fn flat(o: &Stack<C64>, p: &Stack<C64>) -> Vec<C64> {
-    [o.as_slice(), p.as_slice()].concat()
+/// The displacement of an object and a probe change, [`BhBatch`]'s layout.
+fn flat(o: &Stack<C64>, p: &Stack<C64>) -> BhVector {
+    BhVector {
+        x: [o.as_slice(), p.as_slice()].concat(),
+        d: Vec::new(),
+    }
 }
 
 /// `x + t·d`.
@@ -104,9 +107,10 @@ fn grads_match_central_differences() {
         &optics,
         slice::from_ref(o),
         pr,
+        None,
     );
     let g = b.grads();
-    let (g_o, g_p) = g.split_at(o.as_slice().len());
+    let (g_o, g_p) = g.x.split_at(o.as_slice().len());
     let mut seed = 0x2545_f491_4f6c_dd1d;
     let (d_o, d_p) = (direction(o, &mut seed), direction(pr, &mut seed));
     let h = 1e-5;
@@ -134,13 +138,13 @@ fn hessian_matches_central_differences() {
     let (u_o, u_p) = (direction(o, &mut seed), direction(pr, &mut seed));
     let (v_o, v_p) = (direction(o, &mut seed), direction(pr, &mut seed));
     let (u, v) = (flat(&u_o, &u_p), flat(&v_o, &v_p));
-    let b = BhBatch::new(views, p.observed(), &optics, slice::from_ref(o), pr);
+    let b = BhBatch::new(views, p.observed(), &optics, slice::from_ref(o), pr, None);
     let (h_an, h_sym) = (b.hessian(&u, &v), b.hessian(&v, &u));
     assert!(rel(h_sym, h_an) < 1e-13, "H(u, v) {h_an} H(v, u) {h_sym}");
     let du = |t: f64| {
         let (o, pr) = (Object::new(moved(o, t, &v_o)), moved(pr, t, &v_p));
-        let g = BhBatch::new(views, p.observed(), &optics, &[o], &Probe::new(pr)).grads();
-        dot(&g, &u)
+        let g = BhBatch::new(views, p.observed(), &optics, &[o], &Probe::new(pr), None).grads();
+        g.dot(&u)
     };
     let h = 1e-6;
     let fd = (du(h) - du(-h)) / (2.0 * h);
