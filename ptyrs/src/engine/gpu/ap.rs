@@ -107,7 +107,7 @@ impl Bufs<'_> {
             let exit = Exit::Ap { far };
             let sums = FusedSums {
                 obj: obj.then_some(&mut *self.obj_sums),
-                shift: m.shift_sums(probe),
+                shift: m.shift_sums(probe, true),
                 ..FusedSums::default()
             };
             self.kernels

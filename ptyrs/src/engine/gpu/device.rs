@@ -25,6 +25,7 @@ use cuda_async::device_operation::{DeviceOp, ExecutionContext};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 
 use super::lsqml::{LsqmlBufs, LsqmlState, Pre};
+use super::ml::MlMoved;
 use super::rpie::RpieMoved;
 use super::{
     Epoch, Frames, GpuOptions, Tag, batch_stacks, plane_len, plans, split, stack_buf_len, stacks,
@@ -179,14 +180,14 @@ impl Modelled<'_> {
         }
     }
 
-    /// An AP projection's sums of the position model: each frame's position sums, and with
-    /// `probe` the shifted probe's update sums; none without a position.
-    pub fn shift_sums(&mut self, probe: bool) -> ShiftSums<'_> {
+    /// A fused pass's sums of the position model: with `probe` the shifted probe's update
+    /// sums, with `position` each frame's position sums; none without a position.
+    pub fn shift_sums(&mut self, probe: bool, position: bool) -> ShiftSums<'_> {
         match &mut self.position {
             Some(p) => ShiftSums {
                 probe: probe.then_some(&mut *p.probe),
-                position: Some(&mut *p.num),
-                position_den: Some(&mut *p.den),
+                position: position.then_some(&mut *p.num),
+                position_den: position.then_some(&mut *p.den),
             },
             None => ShiftSums::default(),
         }
@@ -441,6 +442,8 @@ struct MlState {
     /// The calculated photons over the unmasked pixels of every frame.
     icalc: DeviceBuffer<f32>,
     fields: GammaStacks,
+    /// The line search's moved probes, once an ML call has run under the position model.
+    moved: Option<MlMoved>,
 }
 
 /// An [`MlState`] lent to an epoch.
@@ -454,6 +457,7 @@ pub(super) struct MlBufs<'a> {
     pub gamma: &'a mut DeviceBuffer<f32>,
     pub icalc: &'a mut DeviceBuffer<f32>,
     pub fields: &'a mut GammaStacks,
+    pub moved: Option<&'a mut MlMoved>,
 }
 
 impl MlState {
@@ -479,6 +483,7 @@ impl MlState {
             gamma: pair()?,
             icalc: DeviceBuffer::zeroed(stream, 1)?,
             fields: GammaStacks::zeroed(stream, stack_len)?,
+            moved: None,
         })
     }
 
@@ -493,6 +498,7 @@ impl MlState {
             gamma: &mut self.gamma,
             icalc: &mut self.icalc,
             fields: &mut self.fields,
+            moved: self.moved.as_mut(),
         }
     }
 }
@@ -1280,14 +1286,22 @@ impl Device {
         Ok(EpochRun { cycle, graph })
     }
 
-    /// Builds the [`MlState`] if no ML call has yet.
+    /// Builds the [`MlState`] if no ML call has yet, and its [`MlMoved`] under the position
+    /// model if no ML call under it has yet.
     fn build_ml(&mut self) -> Result<(), EngineError> {
-        if self.ml.is_none() {
-            let dims = self.dims();
-            let stack_len = stack_buf_len(&dims, &self.table);
-            let lens = [self.obj.len(), self.probe.len()];
-            let state = MlState::new(&self.stream, &dims, self.stack_size, stack_len, lens)?;
-            self.ml = Some(Box::new(state));
+        let dims = self.dims();
+        let ml = match &mut self.ml {
+            Some(ml) => ml,
+            None => {
+                let stack_len = stack_buf_len(&dims, &self.table);
+                let lens = [self.obj.len(), self.probe.len()];
+                let state = MlState::new(&self.stream, &dims, self.stack_size, stack_len, lens)?;
+                self.ml.insert(Box::new(state))
+            }
+        };
+        if self.features.position.is_some() && ml.moved.is_none() {
+            let moved = MlMoved::new(&self.stream, &self.kernels, &dims, self.table.nf_max())?;
+            ml.moved = Some(moved);
         }
         Ok(())
     }
@@ -1339,8 +1353,8 @@ impl Device {
     pub fn scale_to_photons(&mut self, total: f32) -> Result<(), EngineError> {
         self.build_ml()?;
         let ctx = self.context();
-        let (mut bufs, _, _) = self.lend();
-        Ok(bufs.with_ml(|b, ml| b.scale_to_photons(&ctx, ml, total))?)
+        let (mut bufs, mut passes, _) = self.lend();
+        Ok(bufs.with_ml(|b, ml| b.scale_to_photons(&ctx, &mut passes, ml, total))?)
     }
 
     /// PyNX `ScaleObjProbe(absolute=False)` enqueued eagerly: `Σ|O|` and `Σ|P|` balanced,
