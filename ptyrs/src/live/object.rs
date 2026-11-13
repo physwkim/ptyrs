@@ -379,6 +379,12 @@ pub(crate) fn sleeping_event(ctx: &Arc<Context>) -> Result<Event, DriverError> {
     ))
 }
 
+/// A [`sleeping_event`] that also records when it completed, for
+/// [`Event::elapsed_time`].
+pub(crate) fn timed_sleeping_event(ctx: &Arc<Context>) -> Result<Event, DriverError> {
+    ctx.new_event_with_flags(Some(sys::CUevent_flags_enum_CU_EVENT_BLOCKING_SYNC))
+}
+
 /// A host copy of a [`LiveObject`], filled by [`LiveObject::snapshot`] and
 /// read only through [`wait`](Self::wait); dropping it also waits, so a
 /// queued copy never writes freed memory.
