@@ -1,11 +1,11 @@
-//! The GPU engine ([`ptyrs::engine::GpuPtycho`]): AP, DM, RAAR, ML, rPIE and BH in f32.
+//! The GPU engine ([`ptyrs::engine::GpuPtycho`]): AP, DM, RAAR, ML, rPIE, BH and LSQML in f32.
 
 use cuda_core::CudaContext;
 use numpy::{PyArray3, PyReadonlyArray3};
 use ptyrs::base::{C64, Object, Probe};
-use ptyrs::engine::{BhParams, GpuOptions};
+use ptyrs::engine::{BhParams, GpuOptions, LsqmlParams};
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyDict, PyList};
 
 use crate::{Error, Scan, history, llk_dict, params, stack_in, stack_out};
 
@@ -96,6 +96,32 @@ impl GpuPtycho {
             seed,
         };
         Ok(self.0.bh(&params, nepoch, calc_llk).map_err(Error::from)?)
+    }
+
+    /// `nepoch` LSQML epochs from a fresh LSQML (`cost` `"amplitude"` or `"poisson"`), an LLK
+    /// record every `calc_llk` epochs and after the last.
+    fn lsqml(
+        &mut self,
+        nepoch: usize,
+        calc_llk: usize,
+        batch_size: usize,
+        cost: &str,
+        seed: u64,
+    ) -> PyResult<()> {
+        let params = LsqmlParams {
+            batch_size,
+            cost: crate::cost(cost)?,
+            seed,
+        };
+        Ok(self
+            .0
+            .lsqml(&params, nepoch, calc_llk)
+            .map_err(Error::from)?)
+    }
+
+    /// The last LSQML epoch's steps as `Lsqml.epoch` returns them; none before an LSQML call.
+    fn lsqml_steps<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        crate::lsqml_steps(py, &self.0.lsqml_steps().map_err(Error::from)?)
     }
 
     #[getter]

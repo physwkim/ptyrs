@@ -5,7 +5,7 @@ use std::slice;
 
 use numpy::{PyArray1, PyArray3, PyArray4, PyArrayMethods, PyReadonlyArray3};
 use ptyrs::base::{C64, Object, Probe};
-use ptyrs::engine::{Cost, Llk, Optics, ProbeVariation, llk, obj_probe_to_psi};
+use ptyrs::engine::{Llk, Optics, ProbeVariation, llk, obj_probe_to_psi};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
@@ -181,19 +181,10 @@ pub(crate) struct Lsqml(ptyrs::engine::Lsqml);
 impl Lsqml {
     #[new]
     fn new(batch_size: usize, cost: &str, seed: u64) -> PyResult<Self> {
-        let cost = match cost {
-            "amplitude" => Cost::Amplitude,
-            "poisson" => Cost::Poisson,
-            _ => {
-                return Err(PyValueError::new_err(format!(
-                    "cost must be \"amplitude\" or \"poisson\", got {cost:?}"
-                )));
-            }
-        };
         Ok(Self(ptyrs::engine::Lsqml::new(
             ptyrs::engine::LsqmlParams {
                 batch_size,
-                cost,
+                cost: crate::cost(cost)?,
                 seed,
             },
         )))
@@ -219,16 +210,7 @@ impl Lsqml {
             &mut probe,
             &mut var,
         );
-        let steps = steps.iter().map(|s| {
-            let d = PyDict::new(py);
-            d.set_item("frames", PyArray1::from_slice(py, &s.frames))?;
-            d.set_item("a_far", PyArray1::from_slice(py, &s.a_far))?;
-            // the far-field model has one object slice
-            d.set_item("a_obj", PyArray1::from_slice(py, &s.a_obj[0]))?;
-            d.set_item("a_probe", PyArray1::from_slice(py, &s.a_probe))?;
-            Ok(d)
-        });
-        let steps = PyList::new(py, steps.collect::<PyResult<Vec<_>>>()?)?;
+        let steps = crate::lsqml_steps(py, &steps)?;
         Ok((stack_out(py, object.0)?, stack_out(py, probe.0)?, steps))
     }
 }

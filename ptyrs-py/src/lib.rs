@@ -10,7 +10,7 @@ mod cpu;
 mod gpu;
 
 use ::ptyrs::base::{C64, CoreError, Counts, Geometry, Positions, Stack};
-use ::ptyrs::engine::{EngineError, Llk, LlkRecord};
+use ::ptyrs::engine::{Cost, EngineError, Llk, LlkRecord, LsqmlStep};
 use numpy::{Element, PyArray1, PyArray3, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray3};
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
@@ -156,6 +156,31 @@ fn stack_in(a: PyReadonlyArray3<'_, C64>) -> Result<Stack<C64>, Error> {
 fn stack_out<'py, T: Element>(py: Python<'py>, s: Stack<T>) -> PyResult<Bound<'py, PyArray3<T>>> {
     let dims = s.dims();
     PyArray1::from_vec(py, s.into_vec()).reshape(dims)
+}
+
+/// `"amplitude"` or `"poisson"` as the engine's [`Cost`].
+fn cost(name: &str) -> PyResult<Cost> {
+    match name {
+        "amplitude" => Ok(Cost::Amplitude),
+        "poisson" => Ok(Cost::Poisson),
+        _ => Err(PyValueError::new_err(format!(
+            "cost must be \"amplitude\" or \"poisson\", got {name:?}"
+        ))),
+    }
+}
+
+/// LSQML steps as dicts of `frames`, `a_far`, `a_obj` (object slice 0) and `a_probe`.
+fn lsqml_steps<'py>(py: Python<'py>, steps: &[LsqmlStep]) -> PyResult<Bound<'py, PyList>> {
+    let steps = steps.iter().map(|s| {
+        let d = PyDict::new(py);
+        d.set_item("frames", PyArray1::from_slice(py, &s.frames))?;
+        d.set_item("a_far", PyArray1::from_slice(py, &s.a_far))?;
+        // the far-field model has one object slice
+        d.set_item("a_obj", PyArray1::from_slice(py, &s.a_obj[0]))?;
+        d.set_item("a_probe", PyArray1::from_slice(py, &s.a_probe))?;
+        Ok(d)
+    });
+    PyList::new(py, steps.collect::<PyResult<Vec<_>>>()?)
 }
 
 /// The engine's [`Llk`] as a dict of its fields.
