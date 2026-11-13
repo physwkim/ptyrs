@@ -19,7 +19,9 @@ use ptyrs_kernels::rpie::{WeightGeom, rpie_kernels};
 
 pub use ptyrs_kernels::rpie::POWER_CHUNK;
 
-use crate::gpu::{C32, Error, Kernels, StackCtl, StackRef, UpdateSums, ViewDims, check_len, dptr};
+use crate::gpu::{
+    C32, Error, Kernels, StackCtl, StackRef, UpdateSums, ViewDims, Views, check_len, dptr,
+};
 
 /// The rPIE kernels, bound to the module a [`Kernels`] loaded.
 #[derive(Clone, Debug)]
@@ -71,6 +73,51 @@ impl RpieKernels {
                     config,
                     dptr(psi),
                     dptr(counts),
+                    stack.ctl() as *const StackCtl,
+                    g,
+                )
+            }
+        })
+    }
+
+    /// Exit waves of each frame's own probe `w`, `[nf_max * nprobe, ny, nx]` in the exit
+    /// waves' layout with plane `fl * nprobe + p` mode `p` of frame `fl`, as
+    /// [`crate::gpu::LsqmlKernels::shift_w`] leaves the moved probe: `psi[kl] = O_v w[fl *
+    /// nprobe + v.probe]` for view `v = f0 * nmode + kl`, `O_v` and `psi` as in
+    /// [`Kernels::obj_probe_to_psi`].
+    pub fn obj_wave_to_psi(
+        &self,
+        ctx: &ExecutionContext,
+        views: &Views,
+        stack: StackRef<'_>,
+        obj: &DeviceBuffer<C32>,
+        w: &DeviceBuffer<C32>,
+        psi: &mut DeviceBuffer<C32>,
+    ) -> Result<(), Error> {
+        let d = views.dims();
+        let g = d.geom(stack)?;
+        let (n, nf_max) = (d.n(), g.nf_max as usize);
+        check_len("obj", obj, d.obj_len())?;
+        check_len("w", w, nf_max * d.nprobe as usize * n)?;
+        check_len("psi", psi, nf_max * d.nmode as usize * n)?;
+        let (_, config) = elems(nf_max * d.nmode as usize * n)?;
+        let reads = [
+            views.addr().storage(),
+            obj.storage(),
+            w.storage(),
+            stack.storage(),
+        ];
+        self.base.launch(ctx, &reads, &[psi.storage()], |stream| {
+            // SAFETY: lengths checked above; `Views::new` checked every view lies inside the
+            // object with valid mode indices.
+            unsafe {
+                self.module.rpie_obj_wave_to_psi(
+                    stream,
+                    config,
+                    dptr(obj),
+                    dptr(w),
+                    dptr(views.addr()),
+                    dptr(psi),
                     stack.ctl() as *const StackCtl,
                     g,
                 )
