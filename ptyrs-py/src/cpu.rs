@@ -8,7 +8,7 @@ use numpy::{
     PyReadonlyArray3,
 };
 use ptyrs::base::{C64, Object, Probe};
-use ptyrs::engine::{Llk, Optics, ProbeVariation, llk, obj_probe_to_psi};
+use ptyrs::engine::{Optics, ProbeVariation, obj_probe_to_psi};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
@@ -23,7 +23,8 @@ type Epoch<'py> = (
 );
 
 /// Far field `FT(fftshift(P·O·q))` of every view of `p`'s scan at `object` and `probe`, frame
-/// major and mode minor, zero frequency at `[0, 0]` (PyNX's `psi` layout).
+/// major and mode minor, zero frequency at `[0, 0]` (PyNX's `psi` layout); `p`'s features are
+/// not modelled.
 fn far_field(
     p: &ptyrs::engine::Ptycho,
     optics: &Optics,
@@ -37,13 +38,6 @@ fn far_field(
     psi
 }
 
-/// [`ptyrs::engine::Ptycho::llk`] of `object` and `probe` in place of `p`'s own.
-fn llk_of(p: &ptyrs::engine::Ptycho, optics: &Optics, object: &Object, probe: &Probe) -> Llk {
-    let psi = far_field(p, optics, object, probe);
-    let (addr, obs) = (p.addr(), p.observed());
-    llk(obs, 0..addr.nframe(), addr.nmode(), &psi).normalised(obs.nb_obs())
-}
-
 /// The CPU f64 reconstruction state of a scan from a starting object and probe
 /// (`ptyrs::engine::Ptycho`). Its scan also carries the LSQML and BH epochs and the forward model
 /// of arrays of the same shapes.
@@ -52,6 +46,8 @@ pub(crate) struct Ptycho {
     inner: ptyrs::engine::Ptycho,
     /// [`Optics::far_field`] of the scan: the engine's own quadratic phase and FFT.
     optics: Optics,
+    /// The scan `inner` was built on, for the engine's LLK of other arrays.
+    scan: ptyrs::base::Scan,
 }
 
 impl Ptycho {
@@ -89,6 +85,7 @@ impl Ptycho {
         Ok(Self {
             optics: Optics::far_field(&scan.0.geometry),
             inner,
+            scan: scan.0.clone(),
         })
     }
 
@@ -173,7 +170,7 @@ impl Ptycho {
     }
 
     /// Far field of every view at `object` and `probe`, `[nframe, nmode, ny, nx]` with zero
-    /// frequency at `[0, 0]`.
+    /// frequency at `[0, 0]`, without the features.
     fn forward<'py>(
         &self,
         py: Python<'py>,
@@ -187,7 +184,8 @@ impl Ptycho {
         PyArray1::from_vec(py, psi).reshape([addr.nframe(), addr.nmode(), ny, nx])
     }
 
-    /// Normalised PyNX LLK of `object` and `probe` over the scan.
+    /// Normalised PyNX LLK of `object` and `probe` over the scan, modelling this state's
+    /// features: the engine's LLK of a state of these arrays and features.
     fn llk<'py>(
         &self,
         py: Python<'py>,
@@ -195,7 +193,10 @@ impl Ptycho {
         probe: PyReadonlyArray3<'_, C64>,
     ) -> PyResult<Bound<'py, PyDict>> {
         let (object, probe) = self.modes(object, probe)?;
-        llk_dict(py, &llk_of(&self.inner, &self.optics, &object, &probe))
+        let mut at = ptyrs::engine::Ptycho::new(&self.scan, object, probe).map_err(Error::from)?;
+        at.set_features(self.inner.features().clone())
+            .map_err(Error::from)?;
+        llk_dict(py, &at.llk())
     }
 }
 
@@ -280,12 +281,14 @@ impl Bh {
 #[cfg(test)]
 mod tests {
     use ptyrs::base::{Geometry, required_obj_shape};
+    use ptyrs::engine::llk;
 
     use super::*;
 
-    /// The binding's LLK of given arrays is the engine's own LLK when they are its state.
+    /// `forward`'s far field of a featureless state's own arrays is the engine's model: its
+    /// LLK is the engine's.
     #[test]
-    fn llk_of_the_state_is_the_engine_llk() {
+    fn far_field_of_the_state_is_the_engine_model() {
         let g = Geometry::new(1.5e-10, 1.0, 75e-6, [16, 16]).unwrap();
         let pixel = g.pixel_size_object();
         let positions = ptyrs::base::sim::fermat(5, 3.0 * pixel[1]);
@@ -296,6 +299,9 @@ mod tests {
             ptyrs::engine::sim::simulate(g, positions, &object, &probe, 2e3, None, 3).unwrap();
         let p = ptyrs::engine::Ptycho::new(&scan, object, probe).unwrap();
         let optics = Optics::far_field(&g);
-        assert_eq!(llk_of(&p, &optics, p.object(), p.probe()), p.llk());
+        let psi = far_field(&p, &optics, p.object(), p.probe());
+        let (addr, obs) = (p.addr(), p.observed());
+        let got = llk(obs, 0..addr.nframe(), addr.nmode(), &psi).normalised(obs.nb_obs());
+        assert_eq!(got, p.llk());
     }
 }

@@ -2,14 +2,15 @@
 DM, RAAR, ML and rPIE on the GPU's fused passes against the CPU binding's f64, as the
 engine's own `tests/engine_gpu.rs` `features_match_cpu` compares them, to its 1e-4 (offsets
 to 1e-4 pixels); the background's detector order against the truth's, the offsets' axes
-against the binding's own forward model; the round trip and the refusals."""
+against the binding's own forward model; the LLK of given arrays under the features against
+numpy's; the round trip and the refusals."""
 
 import numpy as np
 import pytest
 
 import ptyrs
-from conftest import (DETECTOR_PIXEL, DEVICE, DISTANCE, MASKED, WAVELENGTH, make_truth, mask,
-                      rel, rel_l2, scaled_probe)
+from conftest import (DETECTOR_PIXEL, DEVICE, DISTANCE, MASKED, WAVELENGTH, intensity,
+                      make_truth, mask, rel, rel_l2, scaled_probe)
 
 N, NPOS = 64, 30  # the fused passes' smallest side
 NCYCLE = 20
@@ -129,24 +130,65 @@ def test_position_matches_cpu(featured, algorithm):
     assert (cpu.features["position"] ** 2).mean() < (d0 ** 2).mean()
 
 
+def object_plane_phase(p, obj, probe):
+    """`q`, the far field's object-plane phase, of `p`'s `forward` (`FT(fftshift(P·O·q))`)."""
+    psi = p.forward(np.ones_like(obj), np.ones_like(probe))[0, 0]
+    return np.fft.ifftshift(np.fft.ifft2(psi))
+
+
+def moved_probe(p, obj, probe, d):
+    """`probe` whose `P·q` is rolled by the whole-pixel offset `d` `[dy, dx]`."""
+    q = object_plane_phase(p, obj, probe)
+    return np.roll(probe * q, d, axis=(1, 2)) / q
+
+
 @pytest.mark.parametrize("axis", [0, 1])
 @pytest.mark.parametrize("step", [1, -2])
 def test_position_axes(featured, axis, step):
     """An offset of `step` whole pixels on `axis` (0 `dy`, 1 `dx`) of every frame models
-    `P·q` rolled by it (`q` the far field's object-plane phase, `forward` being
-    `FT(fftshift(P·O·q))`): the LLK record of an AP cycle's start is the binding's LLK of
-    that probe."""
+    `P·q` rolled by it: the LLK record of an AP cycle's start is the featureless LLK of that
+    probe."""
     scan, obj, probe = featured(False, False)
+    plain = ptyrs.Ptycho(scan, obj, probe)
+    d = np.zeros(2)
+    d[axis] = step
+    want = plain.llk(obj, moved_probe(plain, obj, probe, d.astype(int)))
     p = ptyrs.Ptycho(scan, obj, probe)
-    psi = p.forward(np.ones_like(obj), np.ones_like(probe))[0, 0]
-    q = np.fft.ifftshift(np.fft.ifft2(psi))
-    d = np.zeros((NPOS, 2))
-    d[:, axis] = step
-    p.set_features(position=d)
+    p.set_features(position=np.tile(d, (NPOS, 1)))
     p.ap(1, calc_llk=1, zero_phase_ramp=False)
-    want = p.llk(obj, np.roll(probe * q, step, axis=1 + axis) / q)
     for key in LLK:
         assert rel(p.history[key][0], want[key]) < 1e-10, key
+
+
+def test_llk_models_the_features():
+    """`Ptycho.llk` of given arrays models the state's features: PyNX's normalised LLK over
+    the unmasked pixels of `scale · I + background`, `I` the detector-order intensity of
+    `P·q` moved by a whole-pixel offset, against numpy's; set no features, the plain LLK."""
+    y, x, obj, probe, icalc = make_truth(N, NPOS)
+    rng = np.random.default_rng(9)
+    counts = mask(rng.poisson(icalc * 2e5 / icalc.sum(axis=(1, 2)).mean()).astype(np.uint16))
+    scan = ptyrs.Scan(counts, y, x, WAVELENGTH, DISTANCE, DETECTOR_PIXEL)
+    probe = scaled_probe(scan, counts, obj, probe)
+    plain = ptyrs.Ptycho(scan, obj, probe)
+    scale, background = flux(np.arange(NPOS)), truth_background()
+    calc = (scale[:, None, None] * intensity(plain, obj, moved_probe(plain, obj, probe, (1, -2)))
+            + background)
+    keep, iobs = counts != MASKED, counts.astype(np.float64)
+    assert (iobs[keep] == 0).any()
+    terms = dict(
+        poisson=calc - iobs + np.where(iobs > 0, iobs * np.log(np.maximum(iobs, 1) / calc), 0),
+        gaussian=(iobs - calc) ** 2 / (iobs + 1),
+        euclidian=4 * (np.sqrt(iobs) - np.sqrt(calc)) ** 2,
+    )
+    want = {k: v[keep].sum() / keep.sum() for k, v in terms.items()}
+    want["nb_photons_calc"] = calc[keep].sum()
+    p = ptyrs.Ptycho(scan, obj, probe)
+    p.set_features(scale=scale, background=background, position=np.tile([1.0, -2.0], (NPOS, 1)))
+    got = p.llk(obj, probe)
+    for key in LLK:
+        assert rel(got[key], want[key]) < 1e-10, key
+    p.set_features()
+    assert p.llk(obj, probe) == plain.llk(obj, probe)
 
 
 def test_features_round_trip_and_refusals(featured):
