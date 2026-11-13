@@ -219,21 +219,82 @@ impl Ptycho {
     }
 }
 
+/// `eigenmodes` `[k, ny, nx]` (k ≥ 1), `weights` `[nframe, k]` and `intensity` `[nframe]` as
+/// the engine's [`ProbeVariation`], `None` without eigenmodes and weights.
+fn variation(
+    eigenmodes: Option<PyReadonlyArray3<'_, C64>>,
+    weights: Option<PyReadonlyArray2<'_, f64>>,
+    intensity: Option<PyReadonlyArray1<'_, f64>>,
+) -> PyResult<Option<ProbeVariation>> {
+    let (eigenmodes, weights) = match (eigenmodes, weights) {
+        (Some(e), Some(w)) => (stack_in(e)?, w),
+        (None, None) if intensity.is_none() => return Ok(None),
+        (None, None) => return Err(PyValueError::new_err("intensity without eigenmodes")),
+        _ => {
+            return Err(PyValueError::new_err("eigenmodes and weights go together"));
+        }
+    };
+    let k = eigenmodes.len();
+    let w = weights.as_array();
+    if k == 0 || w.ncols() != k {
+        return Err(PyValueError::new_err(format!(
+            "weights must be [nframe, k] for k ≥ 1 eigenmodes, got {:?} for {k}",
+            w.shape()
+        )));
+    }
+    let var = ProbeVariation::new(eigenmodes, w.iter().copied().collect());
+    let Some(c) = intensity else {
+        return Ok(Some(var));
+    };
+    let c = c.as_array().to_vec();
+    if c.len() != w.nrows() {
+        return Err(PyValueError::new_err(format!(
+            "{} main-mode weights for {} weight rows",
+            c.len(),
+            w.nrows()
+        )));
+    }
+    Ok(Some(var.with_intensity(c)))
+}
+
+/// An error unless `var` holds weights for every frame of `nframe` and eigenmodes of `plane`.
+fn variation_fits(var: &ProbeVariation, nframe: usize, plane: [usize; 2]) -> PyResult<()> {
+    let e = var.eigenmodes();
+    let rows = var.weights().len() / e.len();
+    if rows != nframe || e.plane_shape() != plane {
+        return Err(PyValueError::new_err(format!(
+            "eigenmodes {:?} and {rows} weight rows for {nframe} frames of {plane:?} probe planes",
+            e.dims()
+        )));
+    }
+    Ok(())
+}
+
 /// LSQML across epochs (`ptyrs::engine::Lsqml`); `cost` is `"amplitude"` or `"poisson"`.
 /// With `position`, `[nframe, 2]` offsets as `Ptycho.set_features` takes them, every epoch
-/// models and refines them.
+/// models and refines them. With `eigenmodes` `U_i` `[k, ny, nx]` and `weights` `w_fi`
+/// `[nframe, k]`, it models and refines OPR of probe mode 0, frame `f` seeing
+/// `c_f·P_0 + Σ_i w_fi·U_i`, and with `intensity` `[nframe]` the main-mode weights `c_f` too
+/// (1 without); `Ptycho.llk` does not model it.
 #[pyclass]
-pub(crate) struct Lsqml(ptyrs::engine::Lsqml);
+pub(crate) struct Lsqml {
+    inner: ptyrs::engine::Lsqml,
+    var: Option<ProbeVariation>,
+}
 
 #[pymethods]
 impl Lsqml {
     #[new]
-    #[pyo3(signature = (batch_size, cost, seed, *, position = None))]
+    #[pyo3(signature = (batch_size, cost, seed, *, position = None, eigenmodes = None,
+                        weights = None, intensity = None))]
     fn new(
         batch_size: usize,
         cost: &str,
         seed: u64,
         position: Option<PyReadonlyArray2<'_, f64>>,
+        eigenmodes: Option<PyReadonlyArray3<'_, C64>>,
+        weights: Option<PyReadonlyArray2<'_, f64>>,
+        intensity: Option<PyReadonlyArray1<'_, f64>>,
     ) -> PyResult<Self> {
         let lsqml = ptyrs::engine::Lsqml::new(ptyrs::engine::LsqmlParams {
             batch_size,
@@ -241,18 +302,45 @@ impl Lsqml {
             seed,
         });
         let features = position_only(position)?;
-        Ok(Self(lsqml.with_features(features).map_err(Error::from)?))
+        Ok(Self {
+            inner: lsqml.with_features(features).map_err(Error::from)?,
+            var: variation(eigenmodes, weights, intensity)?,
+        })
     }
 
     /// The offsets as the last epoch left them, `None` without a position.
     #[getter]
     fn position<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyArray2<f64>>>> {
-        let d = self.0.features().position.clone();
+        let d = self.inner.features().position.clone();
         d.map(|d| crate::position_out(py, d)).transpose()
     }
 
-    /// One epoch over `ptycho`'s scan from `object` and `probe`, without probe variation;
-    /// returns the new object and probe and each batch's step sizes.
+    /// The eigenmodes as the last epoch left them, `None` without OPR.
+    #[getter]
+    fn eigenmodes<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyArray3<C64>>>> {
+        let e = self.var.as_ref().map(|v| v.eigenmodes().clone());
+        e.map(|e| stack_out(py, e)).transpose()
+    }
+
+    /// The weights as the last epoch left them, `None` without OPR.
+    #[getter]
+    fn weights<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyArray2<f64>>>> {
+        let w = self.var.as_ref().map(|v| {
+            let (w, k) = (v.weights(), v.eigenmodes().len());
+            PyArray1::from_slice(py, w).reshape([w.len() / k, k])
+        });
+        w.transpose()
+    }
+
+    /// The main-mode weights as the last epoch left them, `None` unless refined.
+    #[getter]
+    fn intensity<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyArray1<f64>>> {
+        let c = self.var.as_ref().and_then(|v| v.intensity());
+        c.map(|c| PyArray1::from_slice(py, c))
+    }
+
+    /// One epoch over `ptycho`'s scan from `object` and `probe`; returns the new object and
+    /// probe and each batch's step sizes.
     fn epoch<'py>(
         &mut self,
         py: Python<'py>,
@@ -262,15 +350,19 @@ impl Lsqml {
     ) -> PyResult<Epoch<'py>> {
         let (mut object, mut probe) = ptycho.modes(object, probe)?;
         let p = &ptycho.inner;
-        offsets_fit(self.0.features(), p.addr().nframe())?;
-        let mut var = ProbeVariation::none(probe.plane_shape());
-        let steps = self.0.epoch(
+        let (nframe, plane) = (p.addr().nframe(), probe.plane_shape());
+        offsets_fit(self.inner.features(), nframe)?;
+        if let Some(v) = &self.var {
+            variation_fits(v, nframe, plane)?;
+        }
+        let mut none = ProbeVariation::none(plane);
+        let steps = self.inner.epoch(
             p.addr(),
             p.observed(),
             &ptycho.optics,
             slice::from_mut(&mut object),
             &mut probe,
-            &mut var,
+            self.var.as_mut().unwrap_or(&mut none),
         );
         let steps = crate::lsqml_steps(py, &steps)?;
         Ok((stack_out(py, object.0)?, stack_out(py, probe.0)?, steps))

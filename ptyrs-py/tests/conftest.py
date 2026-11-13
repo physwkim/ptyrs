@@ -4,8 +4,9 @@ binding or an engine call.
     ptyrs-py/scripts/build.sh &&
         PYTHONDONTWRITEBYTECODE=1 $PYO3_PYTHON -m pytest -p no:cacheprovider ptyrs-py/tests
 
-The module is imported from PTYRS_PY (default ~/work/ptyrs-scratch/py, build.sh's OUT); GPU
-tests run on CUDA device PTYRS_DEVICE (default 0).
+The module is imported from PTYRS_PY (default ~/work/ptyrs-scratch/py, build.sh's OUT), where
+build.sh also leaves `examples/engine_reference.rs`' engine results; GPU tests run on CUDA
+device PTYRS_DEVICE (default 0).
 """
 
 import os
@@ -15,7 +16,8 @@ import numpy as np
 import pytest
 
 sys.dont_write_bytecode = True
-sys.path.insert(0, os.environ.get("PTYRS_PY", os.path.expanduser("~/work/ptyrs-scratch/py")))
+MODULE_DIR = os.environ.get("PTYRS_PY", os.path.expanduser("~/work/ptyrs-scratch/py"))
+sys.path.insert(0, MODULE_DIR)
 import ptyrs  # noqa: E402
 
 DEVICE = int(os.environ.get("PTYRS_DEVICE", "0"))

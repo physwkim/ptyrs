@@ -5735,6 +5735,7 @@ dependencies = [
  "numpy",
  "ptyrs",
  "pyo3",
+ "rust-hdf5",
 ]
 
 [[package]]
