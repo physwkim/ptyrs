@@ -679,14 +679,19 @@ pub mod lsqml_kernels {
             let s = unsafe { sums.add(k * (p0 as usize + i) * nchunk) };
             let mut tot = [0.0f32; LSQML_DOTS as usize];
             for c in 0..nchunk {
-                for (j, v) in tot.iter_mut().enumerate() {
-                    *v += unsafe { *s.add(k * c + j) };
+                // Unrolled, as every loop over `tot`, so it stays in registers.
+                #[unroll]
+                for j in 0..LSQML_DOTS {
+                    let j = j as usize;
+                    tot[j] += unsafe { *s.add(k * c + j) };
                 }
             }
             tot[0] += lambda;
             tot[1] += lambda;
-            for (j, &v) in tot.iter().enumerate() {
-                unsafe { *s.add(j) = v };
+            #[unroll]
+            for j in 0..LSQML_DOTS {
+                let j = j as usize;
+                unsafe { *s.add(j) = tot[j] };
             }
             acc[0] += tot[0];
             acc[1] += tot[1];

@@ -325,6 +325,8 @@ pub mod position_kernels {
             unsafe {
                 let ws = load_c(w, (fl * g.nprobe as usize + v.probe as usize) * n + at);
                 let ch = load_c(chi, fl * nmode * n + at);
+                // Unrolled so `acc` stays in registers.
+                #[unroll]
                 for ax in 0..2 {
                     let s = load_c(slopes, (2 * fl + ax) * n + i);
                     let gu = cmul(s, ws);
@@ -381,13 +383,19 @@ pub mod position_kernels {
             let at = unsafe { sums.add(k * (p0 + i) * nchunk) };
             let mut tot = [0.0f32; POSITION_SUMS as usize];
             for c in 0..nchunk {
-                for (j, v) in tot.iter_mut().enumerate() {
-                    *v += unsafe { *at.add(k * c + j) };
+                // Unrolled, as every loop over `tot` and `max`, so they stay in registers.
+                #[unroll]
+                for j in 0..POSITION_SUMS {
+                    let j = j as usize;
+                    tot[j] += unsafe { *at.add(k * c + j) };
                 }
             }
-            for (j, &v) in tot.iter().enumerate() {
-                unsafe { *at.add(j) = v };
+            #[unroll]
+            for j in 0..POSITION_SUMS {
+                let j = j as usize;
+                unsafe { *at.add(j) = tot[j] };
             }
+            #[unroll]
             for ax in 0..2 {
                 if tot[2 + ax] > max[ax] {
                     max[ax] = tot[2 + ax];
@@ -403,8 +411,8 @@ pub mod position_kernels {
         };
         let dx = |p: usize| {
             let at = unsafe { sums.add(k * p * nchunk) };
-            let d = |ax: usize| unsafe { step * *at.add(ax) / (*at.add(2 + ax) + max[ax]) };
-            [d(0), d(1)]
+            let d = |ax: usize, m: f32| unsafe { step * *at.add(ax) / (*at.add(2 + ax) + m) };
+            [d(0, max[0]), d(1, max[1])]
         };
         let mut acc = [0.0f32; 2];
         let mut i = t;
@@ -437,8 +445,11 @@ pub mod position_kernels {
             *s.add(t) = acc[0];
             *s.add(seg + t) = acc[1];
             crate::block_sum::<2>(s);
-            let mad = |ax: usize| (*s.add(ax * seg) + rest * mean[ax].abs()) / nframe as f32;
-            [(10.0 * mad(0)).min(limit), (10.0 * mad(1)).min(limit)]
+            let mad = |ax: usize, m: f32| (*s.add(ax * seg) + rest * m.abs()) / nframe as f32;
+            [
+                (10.0 * mad(0, mean[0])).min(limit),
+                (10.0 * mad(1, mean[1])).min(limit),
+            ]
         };
         let mut i = t;
         while i < len {
