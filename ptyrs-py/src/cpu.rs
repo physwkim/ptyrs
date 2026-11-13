@@ -4,16 +4,35 @@
 use std::slice;
 
 use numpy::{
-    PyArray1, PyArray3, PyArray4, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2,
+    PyArray1, PyArray2, PyArray3, PyArray4, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2,
     PyReadonlyArray3,
 };
 use ptyrs::base::{C64, Object, Probe};
-use ptyrs::engine::{Optics, ProbeVariation, obj_probe_to_psi};
+use ptyrs::engine::{Features, Optics, ProbeVariation, obj_probe_to_psi};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
 use crate::{Error, Scan, history, llk_dict, stack_in, stack_out};
+
+/// The features of `position`'s offsets alone, as LSQML and BH refine.
+fn position_only(position: Option<PyReadonlyArray2<'_, f64>>) -> PyResult<Features> {
+    Ok(Features {
+        position: position.map(crate::position_in).transpose()?,
+        ..Features::default()
+    })
+}
+
+/// An error unless `features` hold one offset per frame of `nframe`, if any.
+fn offsets_fit(features: &Features, nframe: usize) -> PyResult<()> {
+    match &features.position {
+        Some(d) if d.len() != nframe => Err(PyValueError::new_err(format!(
+            "{} position offsets for {nframe} frames",
+            d.len()
+        ))),
+        _ => Ok(()),
+    }
+}
 
 /// An epoch's new object and probe and its steps.
 type Epoch<'py> = (
@@ -201,20 +220,35 @@ impl Ptycho {
 }
 
 /// LSQML across epochs (`ptyrs::engine::Lsqml`); `cost` is `"amplitude"` or `"poisson"`.
+/// With `position`, `[nframe, 2]` offsets as `Ptycho.set_features` takes them, every epoch
+/// models and refines them.
 #[pyclass]
 pub(crate) struct Lsqml(ptyrs::engine::Lsqml);
 
 #[pymethods]
 impl Lsqml {
     #[new]
-    fn new(batch_size: usize, cost: &str, seed: u64) -> PyResult<Self> {
-        Ok(Self(ptyrs::engine::Lsqml::new(
-            ptyrs::engine::LsqmlParams {
-                batch_size,
-                cost: crate::cost(cost)?,
-                seed,
-            },
-        )))
+    #[pyo3(signature = (batch_size, cost, seed, *, position = None))]
+    fn new(
+        batch_size: usize,
+        cost: &str,
+        seed: u64,
+        position: Option<PyReadonlyArray2<'_, f64>>,
+    ) -> PyResult<Self> {
+        let lsqml = ptyrs::engine::Lsqml::new(ptyrs::engine::LsqmlParams {
+            batch_size,
+            cost: crate::cost(cost)?,
+            seed,
+        });
+        let features = position_only(position)?;
+        Ok(Self(lsqml.with_features(features).map_err(Error::from)?))
+    }
+
+    /// The offsets as the last epoch left them, `None` without a position.
+    #[getter]
+    fn position<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyArray2<f64>>>> {
+        let d = self.0.features().position.clone();
+        d.map(|d| crate::position_out(py, d)).transpose()
     }
 
     /// One epoch over `ptycho`'s scan from `object` and `probe`, without probe variation;
@@ -228,6 +262,7 @@ impl Lsqml {
     ) -> PyResult<Epoch<'py>> {
         let (mut object, mut probe) = ptycho.modes(object, probe)?;
         let p = &ptycho.inner;
+        offsets_fit(self.0.features(), p.addr().nframe())?;
         let mut var = ProbeVariation::none(probe.plane_shape());
         let steps = self.0.epoch(
             p.addr(),

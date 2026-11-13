@@ -128,6 +128,20 @@ def make_scenario(n=64, npos=30, nprobe=2, photons=2e5, seed=3):
     return scan, start_obj, start_probe, npos
 
 
+def drawn_offsets(npos):
+    """The engine tests' `drawn_offsets`: zero-mean offsets of up to 0.4 pixels per frame."""
+    f = np.arange(npos)
+    d = np.stack([0.4 * np.sin(1.7 * f + 0.3), 0.4 * np.cos(2.3 * f)], axis=1)
+    return d - d.mean(axis=0)
+
+
+def offsets_rel(a, b, start):
+    """`max |Δa − Δb| / max |Δb|` of the offsets' changes from `start`'s, as the engine tests'
+    `offsets_rel`."""
+    da, db = a - start, b - start
+    return np.abs(da - db).max() / np.abs(db).max()
+
+
 @pytest.fixture(scope="session")
 def scenario():
     return make_scenario()

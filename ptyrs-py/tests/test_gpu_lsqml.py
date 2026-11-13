@@ -1,34 +1,69 @@
 """GpuPtycho.lsqml and lsqml_steps against the CPU binding's f64 Lsqml from the same start,
 as the engine's own `tests/engine_gpu_lsqml.rs` compares them, to its 1e-4: each epoch's LLK
 record and the final arrays of 12 epochs, and after a fresh GPU run of each of the first 3,
-the last epoch's steps and the arrays."""
+the last epoch's steps and the arrays; M1 and fused passes, and the fused ones modelling
+`drawn_offsets`, whose changes are compared too. Each batch's step sizes are compared as a
+vector, to its largest: a frame's `a_probe` can be 1e-3 of the others' (its probe direction
+nearly orthogonal to its residual), and there the GPU's `f32` rounding of their size is
+1e-4 of its own."""
 
 import numpy as np
 import pytest
 
 import ptyrs
-from conftest import DEVICE, rel, rel_l2
+from conftest import DEVICE, drawn_offsets, offsets_rel, rel, rel_l2
 
 NEPOCH = 12  # epoch 11 keeps the preconditioner epoch 10 updated
 NEPOCH_STEPS = 3  # the preconditioner built, then updated
 TOL = 1e-4
 COSTS = pytest.mark.parametrize("cost", ["amplitude", "poisson"])
 BATCHES = pytest.mark.parametrize("batch", [30, 12, 4])
+RUNS = pytest.mark.parametrize("fused, moved", [(False, False), (True, False), (True, True)],
+                               ids=["m1", "fused", "position"])
+
+
+def start(scenario, moved):
+    """The scenario's scan, object and probe and, if `moved`, its `drawn_offsets`."""
+    scan, obj, probe, npos = scenario
+    return scan, obj, probe, drawn_offsets(npos) if moved else None
+
+
+def gpu_at(scan, obj, probe, fused, d0):
+    """A fresh GPU state of `obj` and `probe` modelling the offsets `d0`, if any."""
+    gpu = ptyrs.GpuPtycho(scan, obj, probe, DEVICE, stack_size=7, llk_slots=3, fused=fused)
+    if d0 is not None:
+        gpu.set_features(position=d0)
+    return gpu
+
+
+def steps_rel(a, b):
+    """`max |a − b| / max |b|` of one batch's step sizes."""
+    return np.abs(np.asarray(a) - b).max() / np.abs(b).max()
+
+
+def offsets_match(gpu, cpu, d0):
+    if d0 is None:
+        assert gpu.features["position"] is None and cpu.position is None
+        return
+    err = offsets_rel(gpu.features["position"], cpu.position, d0)
+    assert err < TOL, f"offsets: {err:.2e}"
 
 
 @COSTS
 @BATCHES
-def test_lsqml_matches_cpu(scenario, cost, batch):
-    scan, obj, probe, _ = scenario
+@RUNS
+def test_lsqml_matches_cpu(scenario, cost, batch, fused, moved):
+    scan, obj, probe, d0 = start(scenario, moved)
     state = ptyrs.Ptycho(scan, obj, probe)
-    cpu = ptyrs.Lsqml(batch, cost, 7)
+    cpu = ptyrs.Lsqml(batch, cost, 7, position=d0)
     o, p = obj, probe
     want = []
     for _ in range(NEPOCH):
         o, p, _ = cpu.epoch(state, o, p)
+        state.set_features(position=cpu.position)
         want.append(state.llk(o, p))
 
-    gpu = ptyrs.GpuPtycho(scan, obj, probe, DEVICE, stack_size=7, llk_slots=3)
+    gpu = gpu_at(scan, obj, probe, fused, d0)
     gpu.lsqml(NEPOCH, 1, batch, cost, 7)
     h = gpu.history
     assert list(h["cycle"]) == list(range(NEPOCH))
@@ -38,35 +73,46 @@ def test_lsqml_matches_cpu(scenario, cost, batch):
         assert err < TOL, f"llk {key}: {err:.2e}"
     assert rel_l2(gpu.object, o) < TOL
     assert rel_l2(gpu.probe, p) < TOL
+    offsets_match(gpu, cpu, d0)
     assert gpu.cycle == NEPOCH
 
 
 @COSTS
 @BATCHES
-def test_lsqml_steps_match_cpu(scenario, cost, batch):
-    scan, obj, probe, _ = scenario
+@RUNS
+def test_lsqml_steps_match_cpu(scenario, cost, batch, fused, moved):
+    scan, obj, probe, d0 = start(scenario, moved)
     state = ptyrs.Ptycho(scan, obj, probe)
-    cpu = ptyrs.Lsqml(batch, cost, 7)
+    cpu = ptyrs.Lsqml(batch, cost, 7, position=d0)
     o, p = obj, probe
     for nepoch in range(1, NEPOCH_STEPS + 1):
         o, p, want = cpu.epoch(state, o, p)
-        gpu = ptyrs.GpuPtycho(scan, obj, probe, DEVICE, stack_size=7, llk_slots=3)
+        gpu = gpu_at(scan, obj, probe, fused, d0)
         assert gpu.lsqml_steps() == []
         gpu.lsqml(nepoch, 0, batch, cost, 7)
         got = gpu.lsqml_steps()
         assert [list(s["frames"]) for s in got] == [list(s["frames"]) for s in want]
         for key in ("a_far", "a_obj", "a_probe"):
-            err = max(rel(g[key], w[key]).max() for g, w in zip(got, want))
+            err = max(steps_rel(g[key], w[key]) for g, w in zip(got, want))
             assert err < TOL, f"epoch {nepoch} {key}: {err:.2e}"
         assert rel_l2(gpu.object, o) < TOL
         assert rel_l2(gpu.probe, p) < TOL
+        offsets_match(gpu, cpu, d0)
 
 
 def test_lsqml_rejects(scenario):
-    scan, obj, probe, _ = scenario
+    scan, obj, probe, npos = scenario
     gpu = ptyrs.GpuPtycho(scan, obj, probe, DEVICE)
     with pytest.raises(ValueError, match="batch_size"):
         gpu.lsqml(1, 0, 0, "poisson", 7)
     with pytest.raises(ValueError, match="cost"):
         gpu.lsqml(1, 0, 8, "gauss", 7)
     assert gpu.cycle == 0 and len(gpu.history["cycle"]) == 0
+    assert ptyrs.Lsqml(8, "poisson", 7).position is None
+    with pytest.raises(ValueError, match=r"\[nframe, 2\]"):
+        ptyrs.Lsqml(8, "poisson", 7, position=np.zeros((npos, 3)))
+    with pytest.raises(ValueError, match="finite"):
+        ptyrs.Lsqml(8, "poisson", 7, position=np.full((npos, 2), np.nan))
+    short = ptyrs.Lsqml(8, "poisson", 7, position=np.zeros((npos - 1, 2)))
+    with pytest.raises(ValueError, match=f"{npos - 1} position offsets for {npos} frames"):
+        short.epoch(ptyrs.Ptycho(scan, obj, probe), obj, probe)

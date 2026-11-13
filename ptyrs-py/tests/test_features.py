@@ -9,8 +9,8 @@ import numpy as np
 import pytest
 
 import ptyrs
-from conftest import (DETECTOR_PIXEL, DEVICE, DISTANCE, MASKED, WAVELENGTH, intensity,
-                      make_truth, mask, rel, rel_l2, scaled_probe)
+from conftest import (DETECTOR_PIXEL, DEVICE, DISTANCE, MASKED, WAVELENGTH, drawn_offsets,
+                      intensity, make_truth, mask, rel, rel_l2, scaled_probe)
 
 N, NPOS = 64, 30  # the fused passes' smallest side
 NCYCLE = 20
@@ -50,13 +50,6 @@ def featured():
         return scan, obj, scaled_probe(scan, c, obj, probe)
 
     return start
-
-
-def drawn_offsets():
-    """Zero-mean offsets of up to 0.4 pixels per frame."""
-    f = np.arange(NPOS)
-    d = np.stack([0.4 * np.sin(1.7 * f + 0.3), 0.4 * np.cos(2.3 * f)], axis=1)
-    return d - d.mean(axis=0)
 
 
 def features_match_cpu(start, algorithm, params, ncycle, **features):
@@ -125,7 +118,7 @@ def test_position_matches_cpu(featured, algorithm):
     pty-chi's batches of 4."""
     params = CYCLES.get(algorithm, dict(obj_alpha=0.5, probe_alpha=0.5, batch_size=4,
                                         calc_llk=1))
-    d0 = drawn_offsets()
+    d0 = drawn_offsets(NPOS)
     cpu = features_match_cpu(featured(False, False), algorithm, params, NCYCLE, position=d0)
     assert (cpu.features["position"] ** 2).mean() < (d0 ** 2).mean()
 
@@ -206,7 +199,7 @@ def test_features_round_trip_and_refusals(featured):
     m1.set_features()
 
     half = dict(scale=np.full(NPOS, 0.5), background=2 + truth_background(),
-                position=drawn_offsets())
+                position=drawn_offsets(NPOS))
     cpu.set_features(**half)
     gpu.set_features(**half)
     for key, v in half.items():

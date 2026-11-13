@@ -12,7 +12,7 @@ mod gpu;
 use ::ptyrs::base::{C64, CoreError, Counts, Geometry, Positions, Stack};
 use ::ptyrs::engine::{BhStep, Cost, EngineError, Features, Llk, LlkRecord, LsqmlStep};
 use numpy::{
-    Element, PyArray1, PyArray3, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2,
+    Element, PyArray1, PyArray2, PyArray3, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2,
     PyReadonlyArray3,
 };
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
@@ -222,23 +222,28 @@ fn features_in(
             Ok(b.iter().copied().collect())
         })
         .transpose()?;
-    let position = position
-        .map(|d| {
-            let d = d.as_array();
-            if d.ncols() != 2 {
-                return Err(PyValueError::new_err(format!(
-                    "position offsets must be [nframe, 2], got {:?}",
-                    d.shape()
-                )));
-            }
-            Ok(d.rows().into_iter().map(|r| [r[0], r[1]]).collect())
-        })
-        .transpose()?;
     Ok(Features {
         scale: scale.map(|s| s.as_array().to_vec()),
         background,
-        position,
+        position: position.map(position_in).transpose()?,
     })
+}
+
+/// `[nframe, 2]` offsets `[dy, dx]` as the engine's [`Features::position`].
+fn position_in(d: PyReadonlyArray2<'_, f64>) -> PyResult<Vec<[f64; 2]>> {
+    let d = d.as_array();
+    if d.ncols() != 2 {
+        return Err(PyValueError::new_err(format!(
+            "position offsets must be [nframe, 2], got {:?}",
+            d.shape()
+        )));
+    }
+    Ok(d.rows().into_iter().map(|r| [r[0], r[1]]).collect())
+}
+
+/// [`Features::position`] as [`position_in`] takes it.
+fn position_out<'py>(py: Python<'py>, d: Vec<[f64; 2]>) -> PyResult<Bound<'py, PyArray2<f64>>> {
+    PyArray1::from_vec(py, d.concat()).reshape([d.len(), 2])
 }
 
 /// `features` as a dict of `scale`, `background` and `position` in [`features_in`]'s shapes,
@@ -254,9 +259,7 @@ fn features_out<'py>(
         .background
         .map(|b| PyArray1::from_vec(py, b).reshape(frame));
     d.set_item("background", background.transpose()?)?;
-    let position = f
-        .position
-        .map(|p| PyArray1::from_vec(py, p.concat()).reshape([p.len(), 2]));
+    let position = f.position.map(|p| position_out(py, p));
     d.set_item("position", position.transpose()?)?;
     Ok(d)
 }
