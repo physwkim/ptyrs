@@ -16,14 +16,16 @@
 //! column pass after it takes the probe sums' spectral terms, which [`ShiftedProbeSums`]
 //! carries across stacks until [`Kernels::shifted_probe_sums`] turns them into probe sums.
 
+use std::cell::Cell;
+
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig, RawDeviceBuffer};
 use ptyrs_kernels::fft_ept;
 use ptyrs_kernels::fused::{
-    FFT_SKEW, FUSED_BACKGROUND, FUSED_BACKGROUND_SUMS, FUSED_COLS, FUSED_DM, FUSED_GRAD, FUSED_LLK,
-    FUSED_MODEL_TERMS, FUSED_PROJECT, FUSED_ROW_THREADS, FUSED_SCALE, FUSED_SCALE_SUMS,
-    FUSED_SHIFT_DEN, FUSED_SHIFT_OBJ, FUSED_SHIFT_POSITION, FUSED_SHIFT_PROBE, FUSED_TO_PSI,
-    FusedCfg, FusedPtrs, col_slot_bytes, fused_col_threads, shift_stage_bytes,
+    FFT_SKEW, FUSED_BACKGROUND, FUSED_BACKGROUND_SUMS, FUSED_COLS, FUSED_DM, FUSED_DOWN,
+    FUSED_GRAD, FUSED_LLK, FUSED_MODEL_TERMS, FUSED_PROJECT, FUSED_ROW_THREADS, FUSED_SCALE,
+    FUSED_SCALE_SUMS, FUSED_SHIFT_DEN, FUSED_SHIFT_OBJ, FUSED_SHIFT_POSITION, FUSED_SHIFT_PROBE,
+    FUSED_TO_PSI, FusedCfg, FusedPtrs, col_slot_bytes, fused_col_threads, shift_stage_bytes,
 };
 use ptyrs_kernels::pixel::SumPtrs;
 
@@ -614,6 +616,10 @@ impl Kernels {
             ..run.ptrs(bufs, &far)
         };
         let dm_flag = if dm { FUSED_DM } else { 0 };
+        if dm {
+            // The inverse row pass walks with the column pass (`Run::walk_with`).
+            run.start_up();
+        }
         let flag = |on: bool, flag: u32| if on { flag } else { 0 };
         let shift_flags = match shift {
             Some(_) => {
@@ -679,6 +685,7 @@ impl Kernels {
             None => {
                 run.rows_inv(bufs, psi, p, cfg)?;
                 if let Some(sums) = probe_sums {
+                    debug_assert!(run.walked_down(), "psi_to_probe after an up walk");
                     self.psi_to_probe(ctx, inputs.views, stack, waves, inputs.obj, sums)?;
                 }
                 if let Some(sums) = obj_sums {
@@ -999,6 +1006,11 @@ struct Run<'a> {
     stack: StackRef<'a>,
     g: StackGeom,
     sh: Shape,
+    /// Whether the next frame pass walks the stack down ([`FUSED_DOWN`]), opposite to the
+    /// pass whose plane it reads back: the one before it, or the one before that under
+    /// [`Self::walk_with`]. A call starts down, or up with one such pass, so the pass before
+    /// an in-order frame sum walks down and the sum's first frames are the last touched.
+    down: Cell<bool>,
 }
 
 impl<'a> Run<'a> {
@@ -1033,7 +1045,38 @@ impl<'a> Run<'a> {
             stack,
             g,
             sh,
+            down: Cell::new(true),
         })
+    }
+
+    /// `cfg` for the next frame pass, walking the stack opposite to the pass before it.
+    fn walk(&self, cfg: FusedCfg) -> FusedCfg {
+        let down = self.down.get();
+        self.down.set(!down);
+        let flags = if down { FUSED_DOWN } else { 0 };
+        FusedCfg {
+            flags: cfg.flags | flags,
+            ..cfg
+        }
+    }
+
+    /// `cfg` for a frame pass walking the way the pass before it did, opposite to the one
+    /// before that, whose plane it reads back: under `FUSED_DM` the inverse row pass
+    /// re-reads the `psi` the forward one read, of which L2 holds only the tail, while the
+    /// column pass between leaves it all of `work` when one plane of the stack fits.
+    fn walk_with(&self, cfg: FusedCfg) -> FusedCfg {
+        self.down.set(!self.down.get());
+        self.walk(cfg)
+    }
+
+    /// Starts the walk up, for a call with one [`Self::walk_with`] pass.
+    fn start_up(&self) {
+        self.down.set(false);
+    }
+
+    /// Whether the last frame pass walked down, as the one before an in-order frame sum must.
+    fn walked_down(&self) -> bool {
+        !self.down.get()
     }
 
     /// [`Self::checked`] with `bufs` checked, and the shift model with its scratch.
@@ -1164,6 +1207,7 @@ impl<'a> Run<'a> {
         p: FusedPtrs,
         cfg: FusedCfg,
     ) -> Result<(), Error> {
+        let cfg = self.walk(cfg);
         let config = self.sh.rows(&self.g, true)?;
         let mut reads = vec![
             self.inputs.obj.storage(),
@@ -1212,6 +1256,7 @@ impl<'a> Run<'a> {
         p: FusedPtrs,
         cfg: FusedCfg,
     ) -> Result<(), Error> {
+        let cfg = self.walk(cfg);
         let config = self.sh.cols(&self.g, cfg.flags)?;
         let mut reads = vec![self.inputs.counts.storage(), self.stack.storage()];
         let mut writes = vec![];
@@ -1314,6 +1359,11 @@ impl<'a> Run<'a> {
         p: FusedPtrs,
         cfg: FusedCfg,
     ) -> Result<(), Error> {
+        let cfg = if cfg.flags & FUSED_DM != 0 {
+            self.walk_with(cfg)
+        } else {
+            self.walk(cfg)
+        };
         let config = self.sh.rows(&self.g, false)?;
         let mut reads = vec![self.inputs.views.addr().storage(), self.stack.storage()];
         let mut writes = vec![];
@@ -1411,7 +1461,8 @@ impl<'a> Run<'a> {
             Some(_) => FUSED_SHIFT_DEN | FUSED_SHIFT_POSITION,
             None => 0,
         };
-        let (ctl, g, cfg) = (self.ctl(), self.g, FusedCfg { flags, alpha: 0.0 });
+        let cfg = self.walk(FusedCfg { flags, alpha: 0.0 });
+        let (ctl, g) = (self.ctl(), self.g);
         self.k.launch(self.ctx, &reads, &writes, |stream| {
             // SAFETY: `Run::checked` checked the shift model against `g` and the callers `t`
             // and `t_dy`; the launch is the one `shift_pre` documents.
@@ -1448,6 +1499,7 @@ impl<'a> Run<'a> {
         p: FusedPtrs,
         cfg: FusedCfg,
     ) -> Result<(), Error> {
+        let cfg = self.walk(cfg);
         let config = self.sh.rows(&self.g, true)?;
         let mut reads = vec![
             self.inputs.obj.storage(),
@@ -1496,6 +1548,11 @@ impl<'a> Run<'a> {
         p: FusedPtrs,
         cfg: FusedCfg,
     ) -> Result<(), Error> {
+        let cfg = if cfg.flags & FUSED_DM != 0 {
+            self.walk_with(cfg)
+        } else {
+            self.walk(cfg)
+        };
         let config = LaunchConfig {
             shared_mem_bytes: self.sh.shift_row_smem(cfg.flags),
             ..self.sh.rows(&self.g, false)?
@@ -1581,6 +1638,7 @@ impl<'a> Run<'a> {
         p: FusedPtrs,
         cfg: FusedCfg,
     ) -> Result<(), Error> {
+        let cfg = self.walk(cfg);
         let config = self.sh.rows(&self.g, false)?;
         let (mut reads, writes) = self.shift_terms(sh, cfg.flags);
         reads.push(psi.storage());
@@ -1605,25 +1663,28 @@ impl<'a> Run<'a> {
         let config = self.sh.shift_cols(self.g.nprobe, self.g.nf_max)?;
         let reads = [sh.model.offsets.storage(), self.stack.storage()];
         let writes = [sh.scratch.adj.storage()];
-        let (ctl, g) = (self.ctl(), self.g);
+        let (ctl, g, cfg) = (self.ctl(), self.g, self.walk(FusedCfg::default()));
         self.k.launch(self.ctx, &reads, &writes, |stream| {
             // SAFETY: as in `shift_pre`, and `shift_rows_inv` wrote `X` of this stack; the
             // launch is the one `shift_post` documents.
             unsafe {
                 match self.sh.ny {
-                    Side::N64 => self.k.module.fused_shift_post_64(stream, config, p, ctl, g),
+                    Side::N64 => self
+                        .k
+                        .module
+                        .fused_shift_post_64(stream, config, p, ctl, g, cfg),
                     Side::N128 => self
                         .k
                         .module
-                        .fused_shift_post_128(stream, config, p, ctl, g),
+                        .fused_shift_post_128(stream, config, p, ctl, g, cfg),
                     Side::N256 => self
                         .k
                         .module
-                        .fused_shift_post_256(stream, config, p, ctl, g),
+                        .fused_shift_post_256(stream, config, p, ctl, g, cfg),
                     Side::N512 => self
                         .k
                         .module
-                        .fused_shift_post_512(stream, config, p, ctl, g),
+                        .fused_shift_post_512(stream, config, p, ctl, g, cfg),
                 }
             }
         })
@@ -1657,6 +1718,7 @@ impl<'a> Run<'a> {
         p: FusedPtrs,
         sums: &mut ShiftedProbeSums,
     ) -> Result<(), Error> {
+        debug_assert!(self.walked_down(), "shift_probe_sums after an up walk");
         let config = grid_1d(self.g.nprobe as usize * self.inputs.views.dims().n())?;
         let reads = [
             sh.scratch.adj.storage(),
