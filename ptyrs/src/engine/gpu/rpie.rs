@@ -3,15 +3,14 @@
 use std::sync::Arc;
 
 use crate::gpu::{
-    C32, EpochOrder, Error as GpuError, FusedBufs, FusedInputs, Kernels, Model, PositionKernels,
-    PositionRule, Positions, PowerMax, ProbeSpectrum, PsiSums, Shift, ShiftedProbeSums, Views,
-    Weight,
+    EpochOrder, Error as GpuError, FusedBufs, FusedInputs, Kernels, Model, PositionRule, PowerMax,
+    PsiSums, Views, Weight,
 };
 use cuda_async::device_operation::ExecutionContext;
-use cuda_core::{CudaStream, DeviceBuffer};
+use cuda_core::CudaStream;
 
-use super::device::{FeaturesMut, PositionLent, RpieBufs};
-use super::{Bufs, Epoch, GpuPtycho, plane_len};
+use super::device::{FeaturesMut, Moved, MovedLent, RpieBufs, moved_inputs, moved_shift};
+use super::{Bufs, Epoch, GpuPtycho};
 use crate::engine::features::{POSITION_LIMIT, POSITION_STEP};
 use crate::engine::ptycho::{Algorithm, llk_due};
 use crate::engine::{EngineError, RpieParams};
@@ -47,14 +46,12 @@ impl GpuPtycho {
     }
 }
 
-/// rPIE's state under the position model: a batch's moved probe `[nf_max * nprobe, ny, nx]`,
-/// the positions, the scan order they step in, their kernels, and the shifted sums' scratch.
+/// rPIE's state under the position model: a batch's moved probe, the scan order its offsets
+/// step in, and the shifted sums' scratch.
 pub(super) struct RpieMoved {
-    w: DeviceBuffer<C32>,
-    pos: Positions,
+    probes: Moved,
     /// Never set: rPIE's batches take the frames in scan order.
     order: EpochOrder,
-    kernels: PositionKernels,
     /// Its own, as a batch is one stack, which may outgrow the device's.
     fused: FusedBufs,
 }
@@ -68,87 +65,20 @@ impl RpieMoved {
         nf_max: u32,
     ) -> Result<Self, EngineError> {
         let dims = views.dims();
-        let wlen = nf_max as usize * dims.nprobe as usize * plane_len(dims);
         Ok(Self {
-            w: DeviceBuffer::zeroed(stream, wlen)?,
-            pos: Positions::zeroed(stream, dims, nf_max)?,
+            probes: Moved::new(stream, kernels, dims, nf_max, 1)?,
             order: EpochOrder::new(kernels, stream, views)?,
-            kernels: PositionKernels::load(kernels)?,
             fused: FusedBufs::with_shift(stream, dims, nf_max)?,
         })
     }
-}
 
-/// [`RpieMoved`] with the device's position buffers.
-struct MovedLent<'m> {
-    moved: &'m mut RpieMoved,
-    lent: PositionLent<'m>,
-}
-
-impl<'m> MovedLent<'m> {
-    /// For rPIE's `moved` state with the device's `features`: none without a position, an
-    /// error when the two disagree.
-    fn lend(
-        moved: Option<&'m mut RpieMoved>,
+    /// `moved` with the device's `features`, its scan order as its own.
+    fn lend<'m>(
+        moved: Option<&'m mut Self>,
         features: &'m mut FeaturesMut<'_>,
-    ) -> Result<Option<Self>, GpuError> {
-        match (moved, features.position_lent()) {
-            (None, None) => Ok(None),
-            (Some(moved), Some(lent)) => Ok(Some(Self { moved, lent })),
-            _ => Err(GpuError::Shape(
-                "rPIE state built for another position model".into(),
-            )),
-        }
-    }
-
-    /// The lend for one batch, with the spectra of `probe` it starts from (two launches).
-    fn batch(
-        self,
-        ctx: &ExecutionContext,
-        kernels: &Kernels,
-        probe: &'m DeviceBuffer<C32>,
-    ) -> Result<MovedBatch<'m>, GpuError> {
-        let PositionLent {
-            offsets,
-            spectrum,
-            probe_sums,
-        } = self.lent;
-        let dims = self.moved.order.views().dims();
-        Ok(MovedBatch {
-            spectrum: kernels.probe_spectrum(ctx, dims, probe, spectrum)?,
-            moved: self.moved,
-            offsets,
-            probe_sums,
-        })
-    }
-}
-
-/// [`MovedLent`] for one batch, with the spectra of the batch-start probe, which they borrow.
-struct MovedBatch<'m> {
-    moved: &'m mut RpieMoved,
-    /// By frame: the device's offsets, which the batch steps.
-    offsets: &'m mut DeviceBuffer<f32>,
-    probe_sums: &'m mut ShiftedProbeSums,
-    spectrum: ProbeSpectrum<'m>,
-}
-
-/// `base` under the batch's position model: the epoch's offsets `pos` and the batch-start
-/// `spectrum`.
-fn moved_inputs<'a>(
-    base: &FusedInputs<'a>,
-    pos: &'a Positions,
-    spectrum: ProbeSpectrum<'a>,
-) -> FusedInputs<'a> {
-    let shift = Shift {
-        offsets: pos.offsets(),
-        spectrum,
-    };
-    FusedInputs {
-        model: Model {
-            shift: Some(shift),
-            ..Model::default()
-        },
-        ..*base
+    ) -> Result<Option<MovedLent<'m, &'m EpochOrder>>, GpuError> {
+        let (moved, fused) = (moved.map(|m| ((&mut m.probes, &m.order), &mut m.fused))).unzip();
+        MovedLent::lend(moved, fused, features)
     }
 }
 
@@ -162,15 +92,9 @@ impl Bufs<'_> {
     ) -> Result<(), GpuError> {
         // Each frame is in one batch, stepped after its batch's passes: the offsets the epoch
         // starts from serve every batch.
-        let moved = rb.moved.as_deref_mut();
-        if let Some(m) = MovedLent::lend(moved, &mut self.features)? {
-            let RpieMoved {
-                pos,
-                order,
-                kernels,
-                ..
-            } = m.moved;
-            kernels.gather(ctx, order, m.lent.offsets, pos)?;
+        if let Some(mut m) = RpieMoved::lend(rb.moved.as_deref_mut(), &mut self.features)? {
+            let order = m.own;
+            m.gather(ctx, order)?;
         }
         for b in 0..rb.batches.len() {
             self.rpie_batch(ctx, params, rb, b)?;
@@ -194,8 +118,8 @@ impl Bufs<'_> {
         let nk = frames.nf() * dims.nmode;
         let len = frames.len;
         let (k, rk) = (self.kernels, self.rpie);
-        let moved = MovedLent::lend(rb.moved.as_deref_mut(), &mut self.features)?;
-        let mut moved = (moved.map(|m| m.batch(ctx, k, self.probe))).transpose()?;
+        let moved = RpieMoved::lend(rb.moved.as_deref_mut(), &mut self.features)?;
+        let mut moved = (moved.map(|m| m.batch(ctx, k, &dims, self.probe))).transpose()?;
         let base = FusedInputs {
             views: self.views,
             counts: self.counts,
@@ -207,12 +131,10 @@ impl Bufs<'_> {
         // Δ = IFT(ψ') − ψ, ψ = O_v W with W the moved probe under positions.
         match &mut moved {
             Some(m) => {
-                let RpieMoved {
-                    w, pos, kernels, ..
-                } = &mut *m.moved;
-                let inputs = moved_inputs(&base, pos, m.spectrum);
+                let inputs = moved_inputs(&base, moved_shift(m.pos, m.spectrum));
+                let w = &mut m.w[0];
                 k.shifted_rows_fwd(ctx, &inputs, stack, w, rb.dlt)?;
-                kernels.shift_w(ctx, &dims, stack, w)?;
+                m.kernels.shift_w(ctx, &dims, stack, w)?;
                 rk.obj_wave_to_psi(ctx, self.views, stack, self.obj, w, rb.psi)?;
             }
             None => k.obj_probe_to_psi(ctx, self.views, stack, self.obj, self.probe, rb.psi)?,
@@ -225,36 +147,34 @@ impl Bufs<'_> {
         if let Some(m) = &mut moved {
             // The slopes of the object the batch started from, against Δ before the probe
             // step weights it.
-            let RpieMoved {
-                w, pos, kernels, ..
-            } = &mut *m.moved;
-            kernels.sums(ctx, self.views, stack, self.obj, [&*rb.dlt, &*w], pos)?;
+            let chi_w = [&*rb.dlt, &m.w[0]];
+            m.kernels
+                .sums(ctx, self.views, stack, self.obj, chi_w, m.pos)?;
         }
 
         if params.obj_step.is_some() {
             match &mut moved {
                 // `conj(W) Δ / ((1 − a) |W|² + a max Σ_m |W_m|²)`, the max over the batch.
                 Some(m) => {
-                    let RpieMoved { w, pos, fused, .. } = &mut *m.moved;
                     let groups = PowerMax {
                         ngroup: frames.nf(),
                         nsum: dims.nprobe,
                         n,
                     };
-                    rk.power_max_all(ctx, w, groups, rb.max_chunks, rb.pmax)?;
+                    rk.power_max_all(ctx, &m.w[0], groups, rb.max_chunks, rb.pmax)?;
                     let spec = Weight {
                         nk,
                         n,
                         per_plane: false,
                         alpha: params.obj_alpha as f32,
                     };
-                    rk.weight(ctx, rb.dlt, w, rb.pmax, rb.psi, spec)?;
+                    rk.weight(ctx, rb.dlt, &m.w[0], rb.pmax, rb.psi, spec)?;
                     let sums = PsiSums {
                         obj: Some(&mut *self.obj_sums),
                         probe: None,
                     };
-                    let inputs = moved_inputs(&base, pos, m.spectrum);
-                    k.shifted_psi_sums(ctx, &inputs, stack, rb.psi, fused, sums)?;
+                    let inputs = moved_inputs(&base, moved_shift(m.pos, m.spectrum));
+                    k.shifted_psi_sums(ctx, &inputs, stack, rb.psi, m.fused, sums)?;
                 }
                 None => {
                     let groups = PowerMax {
@@ -296,9 +216,8 @@ impl Bufs<'_> {
                         obj: None,
                         probe: Some(&mut *m.probe_sums),
                     };
-                    let RpieMoved { pos, fused, .. } = &mut *m.moved;
-                    let inputs = moved_inputs(&base, pos, m.spectrum);
-                    k.shifted_psi_sums(ctx, &inputs, stack, rb.dlt, fused, sums)?;
+                    let inputs = moved_inputs(&base, moved_shift(m.pos, m.spectrum));
+                    k.shifted_psi_sums(ctx, &inputs, stack, rb.dlt, m.fused, sums)?;
                     k.shifted_probe_sums(ctx, &dims, m.probe_sums, self.probe_sums)?;
                 }
                 None => {
@@ -313,13 +232,8 @@ impl Bufs<'_> {
                 step: POSITION_STEP as f32,
                 limit: POSITION_LIMIT as f32,
             };
-            let RpieMoved {
-                pos,
-                order,
-                kernels,
-                ..
-            } = m.moved;
-            kernels.step(ctx, frames.range.clone(), order, m.offsets, rule, pos)?;
+            let batch = frames.range.clone();
+            m.kernels.step(ctx, batch, m.own, m.offsets, rule, m.pos)?;
         }
         if let Some(step) = params.obj_step {
             let s = step as f32;

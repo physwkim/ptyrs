@@ -14,10 +14,10 @@ use std::sync::Arc;
 use crate::fft::Plan2d;
 use crate::gpu::{
     BH_STEP, BackgroundSums, BhKernels, C32, CG_BLOCKS, Ended, EpochOrder, Error as GpuError,
-    FarSums, FusedBufs, GammaStacks, GradKernels, Kernels, LlkPartial, LlkRing, LlkScratch,
-    LlkTotals, Model, PositionPartial, PowerMax, PsiSums, RingDevice, RpieKernels, ScalePartial,
-    Shift, ShiftSums, ShiftedProbeSums, SpectrumBuf, StackTable, UpdateSums, ViewAddr, ViewDims,
-    Views,
+    FarSums, FusedBufs, FusedInputs, GammaStacks, GradKernels, Kernels, LlkPartial, LlkRing,
+    LlkScratch, LlkTotals, Model, PositionKernels, PositionPartial, Positions, PowerMax,
+    ProbeSpectrum, PsiSums, RingDevice, RpieKernels, ScalePartial, Shift, ShiftSums,
+    ShiftedProbeSums, SpectrumBuf, StackTable, UpdateSums, ViewAddr, ViewDims, Views,
 };
 use crate::tile::TileDots;
 use cuda_async::cuda_graph::CudaGraph;
@@ -147,12 +147,133 @@ struct PositionMut<'a> {
     den: &'a mut DeviceBuffer<PositionPartial>,
 }
 
-/// The position model's buffers lent by [`FeaturesMut::position_lent`] to a cycle that runs
-/// its own passes: the offsets by frame, the probe spectra and the shifted probe's sums.
-pub(super) struct PositionLent<'a> {
-    pub offsets: &'a mut DeviceBuffer<f32>,
-    pub spectrum: &'a mut SpectrumBuf,
-    pub probe_sums: &'a mut ShiftedProbeSums,
+/// The position model's state a cycle that runs its own passes owns: per batch slot the moved
+/// probes `[nf_max * nprobe, ny, nx]`, the offsets by epoch position and their kernels.
+pub(super) struct Moved {
+    w: Vec<DeviceBuffer<C32>>,
+    pos: Positions,
+    kernels: PositionKernels,
+}
+
+impl Moved {
+    /// For frames of `dims` in `slots` stacks per batch of up to `nf_max` frames each.
+    pub fn new(
+        stream: &Arc<CudaStream>,
+        kernels: &Kernels,
+        dims: &ViewDims,
+        nf_max: u32,
+        slots: usize,
+    ) -> Result<Self, EngineError> {
+        let wlen = nf_max as usize * dims.nprobe as usize * plane_len(dims);
+        Ok(Self {
+            w: (0..slots)
+                .map(|_| DeviceBuffer::zeroed(stream, wlen))
+                .collect::<Result<_, _>>()?,
+            pos: Positions::zeroed(stream, dims, nf_max)?,
+            kernels: PositionKernels::load(kernels)?,
+        })
+    }
+}
+
+/// A cycle's [`Moved`] lent with the device's position buffers: the offsets by frame, the
+/// probe spectra and the shifted probe's sums; `own` the cycle's other buffers of the model,
+/// `fused` the scratch of the shifted sums over its stacks.
+pub(super) struct MovedLent<'m, X> {
+    pub own: X,
+    fused: &'m mut FusedBufs,
+    w: &'m mut [DeviceBuffer<C32>],
+    pos: &'m mut Positions,
+    kernels: &'m PositionKernels,
+    offsets: &'m mut DeviceBuffer<f32>,
+    spectrum: &'m mut SpectrumBuf,
+    probe_sums: &'m mut ShiftedProbeSums,
+}
+
+impl<'m, X> MovedLent<'m, X> {
+    /// `moved` with `fused` and `features`' position buffers: none without a position, an
+    /// error when they disagree, as for a cycle's state built for another position model.
+    pub fn lend(
+        moved: Option<(&'m mut Moved, X)>,
+        fused: Option<&'m mut FusedBufs>,
+        features: &'m mut FeaturesMut<'_>,
+    ) -> Result<Option<Self>, GpuError> {
+        match (moved, features.position.as_mut(), fused) {
+            (None, None, _) => Ok(None),
+            (Some((m, own)), Some(p), Some(fused)) => Ok(Some(Self {
+                own,
+                fused,
+                w: &mut m.w,
+                pos: &mut m.pos,
+                kernels: &m.kernels,
+                offsets: &mut *p.offsets,
+                spectrum: &mut *p.spectrum,
+                probe_sums: &mut *p.probe_sums,
+            })),
+            _ => Err(GpuError::Shape(
+                "cycle state built for another position model".into(),
+            )),
+        }
+    }
+
+    /// The offsets by epoch position from the device's, through `order`, the epoch's.
+    pub fn gather(&mut self, ctx: &ExecutionContext, order: &EpochOrder) -> Result<(), GpuError> {
+        self.kernels.gather(ctx, order, self.offsets, self.pos)
+    }
+
+    /// The lend for one batch, with the spectra of `probe` it starts from (two launches).
+    pub fn batch(
+        self,
+        ctx: &ExecutionContext,
+        kernels: &Kernels,
+        dims: &ViewDims,
+        probe: &'m DeviceBuffer<C32>,
+    ) -> Result<MovedBatch<'m, X>, GpuError> {
+        Ok(MovedBatch {
+            spectrum: kernels.probe_spectrum(ctx, dims, probe, self.spectrum)?,
+            own: self.own,
+            fused: self.fused,
+            w: self.w,
+            pos: self.pos,
+            kernels: self.kernels,
+            offsets: self.offsets,
+            probe_sums: self.probe_sums,
+        })
+    }
+}
+
+/// [`MovedLent`] for one batch, with the spectra of the batch-start probe, which they borrow.
+pub(super) struct MovedBatch<'m, X> {
+    pub own: X,
+    pub fused: &'m mut FusedBufs,
+    /// The moved probes, one per stack of the batch.
+    pub w: &'m mut [DeviceBuffer<C32>],
+    pub pos: &'m mut Positions,
+    pub kernels: &'m PositionKernels,
+    /// By frame: the device's offsets, which the batch steps.
+    pub offsets: &'m mut DeviceBuffer<f32>,
+    pub probe_sums: &'m mut ShiftedProbeSums,
+    pub spectrum: ProbeSpectrum<'m>,
+}
+
+/// A batch's model of the probe, from its [`MovedBatch::pos`] and [`MovedBatch::spectrum`]
+/// alone, so its other fields stay free to borrow: the spectra moved by the offsets by epoch
+/// position.
+pub(super) fn moved_shift<'a>(pos: &'a Positions, spectrum: ProbeSpectrum<'a>) -> Shift<'a> {
+    Shift {
+        offsets: pos.offsets(),
+        spectrum,
+    }
+}
+
+/// `base` under the position model `shift`.
+pub(super) fn moved_inputs<'a>(base: &FusedInputs<'a>, shift: Shift<'a>) -> FusedInputs<'a> {
+    FusedInputs {
+        model: Model {
+            shift: Some(shift),
+            ..Model::default()
+        },
+        ..*base
+    }
 }
 
 /// The features lent to the passes of one cycle body by [`FeaturesMut::lend`]: the model
@@ -236,15 +357,6 @@ impl FeaturesMut<'_> {
     /// Whether the position is modelled, as [`Modelled::shifted`] of a lend.
     pub fn shifted(&self) -> bool {
         self.position.is_some()
-    }
-
-    /// The position model's buffers, if modelled.
-    pub fn position_lent(&mut self) -> Option<PositionLent<'_>> {
-        self.position.as_mut().map(|p| PositionLent {
-            offsets: &mut *p.offsets,
-            spectrum: &mut *p.spectrum,
-            probe_sums: &mut *p.probe_sums,
-        })
     }
 
     /// The per-frame intensity scale, if modelled.
@@ -360,6 +472,16 @@ enum Passes {
 pub(super) enum PassesMut<'a> {
     M1(M1Bufs<'a>),
     Fused(&'a mut FusedBufs),
+}
+
+impl PassesMut<'_> {
+    /// The fused passes' scratch, if the passes are fused.
+    pub fn fused(&mut self) -> Option<&mut FusedBufs> {
+        match self {
+            Self::M1(_) => None,
+            Self::Fused(f) => Some(f),
+        }
+    }
 }
 
 /// [`Passes::M1`] lent to a cycle.

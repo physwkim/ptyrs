@@ -6,13 +6,13 @@ use std::sync::Arc;
 
 use crate::gpu::{
     BhBatch, BhDisp, BhFieldsRef, BhMovedFarRef, BhMovesRef, BhNearMut, BhOffsets, BhPositions,
-    BhScan, BhVar, C32, EpochOrder, Error as GpuError, FusedBufs, FusedInputs, Kernels, Model,
-    PositionKernels, Positions, PsiSums, Shift, ShiftedProbeSums, SpectrumBuf, ViewDims,
+    BhScan, BhVar, C32, EpochOrder, Error as GpuError, FusedInputs, Kernels, Model, PsiSums,
+    SpectrumBuf, ViewDims,
 };
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaStream, DeviceBuffer};
 
-use super::device::{BhBufs, FeaturesMut, PassesMut, PositionLent};
+use super::device::{BhBufs, Moved, MovedBatch, MovedLent, PassesMut, moved_inputs, moved_shift};
 use super::{Bufs, GpuPtycho, plane_len};
 use crate::engine::features::POSITION_STEP;
 use crate::engine::ptycho::{Algorithm, llk_due};
@@ -62,16 +62,14 @@ impl GpuPtycho {
     }
 }
 
-/// BH's state under the position model: per batch slot the moved probes `[nf_max * nprobe,
-/// ny, nx]`, one stack's forward-FFT'd `conj(O) r`, the spectra of the step's probe parts
-/// (`u`'s, `v`'s), the offsets by epoch position, the offsets' step buffers and their kernels.
+/// BH's state under the position model: the moved probes, one stack's forward-FFT'd
+/// `conj(O) r`, the spectra of the step's probe parts (`u`'s, `v`'s) and the offsets' step
+/// buffers.
 pub(super) struct BhMoved {
-    w: Vec<DeviceBuffer<C32>>,
+    probes: Moved,
     y: DeviceBuffer<C32>,
     spectra: [SpectrumBuf; 2],
-    pos: Positions,
     off: BhPositions,
-    kernels: PositionKernels,
 }
 
 impl BhMoved {
@@ -85,107 +83,43 @@ impl BhMoved {
         slots: usize,
         stack_len: usize,
     ) -> Result<Self, EngineError> {
-        let wlen = nf_max as usize * dims.nprobe as usize * plane_len(dims);
-        let zeroed = |len| DeviceBuffer::<C32>::zeroed(stream, len);
         Ok(Self {
-            w: (0..slots).map(|_| zeroed(wlen)).collect::<Result<_, _>>()?,
-            y: zeroed(stack_len)?,
+            probes: Moved::new(stream, kernels, dims, nf_max, slots)?,
+            y: DeviceBuffer::zeroed(stream, stack_len)?,
             spectra: [
                 SpectrumBuf::zeroed(stream, dims)?,
                 SpectrumBuf::zeroed(stream, dims)?,
             ],
-            pos: Positions::zeroed(stream, dims, nf_max)?,
             off: BhPositions::zeroed(stream, dims)?,
-            kernels: PositionKernels::load(kernels)?,
         })
     }
-}
 
-/// [`BhMoved`] with the device's position buffers and the fused passes' scratch.
-struct MovedLent<'m> {
-    moved: &'m mut BhMoved,
-    lent: PositionLent<'m>,
-    fused: &'m mut FusedBufs,
-}
-
-impl<'m> MovedLent<'m> {
-    /// For BH's `moved` state with the device's `passes` and `features`: none without a
-    /// position, an error when the two disagree.
-    fn lend(
-        moved: Option<&'m mut BhMoved>,
-        passes: &'m mut PassesMut<'_>,
-        features: &'m mut FeaturesMut<'_>,
-    ) -> Result<Option<Self>, GpuError> {
-        match (moved, features.position_lent(), passes) {
-            (None, None, _) => Ok(None),
-            (Some(moved), Some(lent), PassesMut::Fused(fused)) => {
-                Ok(Some(Self { moved, lent, fused }))
-            }
-            _ => Err(GpuError::Shape(
-                "BH state built for another position model".into(),
-            )),
-        }
-    }
-
-    /// The lend for one batch over `order`, the epoch's, with the spectra of `probe` it starts
-    /// from (two launches).
-    fn batch(
-        self,
-        ctx: &ExecutionContext,
-        kernels: &Kernels,
-        probe: &'m DeviceBuffer<C32>,
+    /// Its [`Moved`] with its other buffers, the offsets a variable of the step over `order`,
+    /// the epoch's.
+    fn split<'m>(
+        &'m mut self,
         order: &'m EpochOrder,
         params: &BhParams,
-    ) -> Result<MovedBatch<'m>, GpuError> {
-        let PositionLent {
-            offsets,
-            spectrum,
-            probe_sums,
-        } = self.lent;
-        let BhMoved {
-            w,
-            y,
-            spectra,
-            pos,
-            off,
-            kernels: pk,
-        } = self.moved;
-        let shift = Shift {
-            offsets: pos.offsets(),
-            spectrum: kernels.probe_spectrum(ctx, order.views().dims(), probe, spectrum)?,
-        };
-        Ok(MovedBatch {
-            w,
-            y,
-            spectra,
-            kernels: pk,
-            shift,
+    ) -> (&'m mut Moved, BhOwn<'m>) {
+        let own = BhOwn {
+            y: &mut self.y,
+            spectra: &mut self.spectra,
             off: BhOffsets {
-                bufs: off,
+                bufs: &mut self.off,
                 order,
                 scale: params.position_rho.powi(2) as f32,
                 step: POSITION_STEP as f32,
             },
-            offsets,
-            probe_sums,
-            fused: self.fused,
-        })
+        };
+        (&mut self.probes, own)
     }
 }
 
-/// [`MovedLent`] for one batch: the estimate's moved probes, from the batch-start probe they
-/// borrow, and the offsets as a variable of the step.
-struct MovedBatch<'m> {
-    w: &'m mut [DeviceBuffer<C32>],
+/// [`BhMoved`]'s buffers besides its [`Moved`], lent to a batch.
+struct BhOwn<'m> {
     y: &'m mut DeviceBuffer<C32>,
     spectra: &'m mut [SpectrumBuf; 2],
-    kernels: &'m PositionKernels,
-    shift: Shift<'m>,
     off: BhOffsets<'m>,
-    /// By frame: the device's offsets, which the batch steps.
-    offsets: &'m mut DeviceBuffer<f32>,
-    probe_sums: &'m mut ShiftedProbeSums,
-    fused: &'m mut FusedBufs,
 }
 
 impl Bufs<'_> {
@@ -201,10 +135,9 @@ impl Bufs<'_> {
     ) -> Result<(), GpuError> {
         // Each frame is in one batch, stepped after its batch's passes: the offsets the epoch
         // starts from serve every batch.
-        let moved = bh.moved.as_deref_mut();
-        if let Some(m) = MovedLent::lend(moved, passes, &mut self.features)? {
-            let BhMoved { pos, kernels, .. } = m.moved;
-            kernels.gather(ctx, bh.order, m.lent.offsets, pos)?;
+        let moved = (bh.moved.as_deref_mut()).map(|m| (&mut m.probes, ()));
+        if let Some(mut m) = MovedLent::lend(moved, passes.fused(), &mut self.features)? {
+            m.gather(ctx, bh.order)?;
         }
         for b in 0..bh.batches.len() {
             self.bh_batch(ctx, passes, bh, params, b, cg)?;
@@ -232,9 +165,9 @@ impl Bufs<'_> {
         };
         let views = bh.order.views();
         let k = self.kernels;
-        let moved = MovedLent::lend(bh.moved.as_deref_mut(), passes, &mut self.features)?;
-        let mut moved =
-            (moved.map(|m| m.batch(ctx, k, self.probe, bh.order, params))).transpose()?;
+        let moved = (bh.moved.as_deref_mut()).map(|m| m.split(bh.order, params));
+        let moved = MovedLent::lend(moved, passes.fused(), &mut self.features)?;
+        let mut moved = (moved.map(|m| m.batch(ctx, k, &dims, self.probe))).transpose()?;
         let base = FusedInputs {
             views,
             counts: self.counts,
@@ -249,7 +182,7 @@ impl Bufs<'_> {
             let (psi, r) = (&mut bh.psi[i], &mut bh.r[i]);
             match &mut moved {
                 Some(m) => {
-                    let inputs = moved_inputs(&base, m.shift);
+                    let inputs = moved_inputs(&base, moved_shift(m.pos, m.spectrum));
                     let w = &mut m.w[i];
                     k.shifted_rows_fwd(ctx, &inputs, stack, w, bh.lu)?;
                     m.kernels.shift_w(ctx, &dims, stack, w)?;
@@ -263,15 +196,17 @@ impl Bufs<'_> {
             plan.inverse_inplace(ctx, r)?;
             match &mut moved {
                 Some(m) => {
-                    let inputs = moved_inputs(&base, m.shift);
+                    let shift = moved_shift(m.pos, m.spectrum);
+                    let inputs = moved_inputs(&base, shift);
                     let sums = PsiSums {
                         obj: Some(&mut *self.obj_sums),
                         probe: Some(&mut *m.probe_sums),
                     };
                     k.shifted_psi_sums(ctx, &inputs, stack, r, m.fused, sums)?;
-                    self.bh.obj_conj(ctx, views, stack, self.obj, r, m.y)?;
-                    plan.forward_inplace(ctx, m.y)?;
-                    self.bh.pos_grad(ctx, stack, m.y, &m.shift, &mut m.off)?;
+                    let BhOwn { y, off, .. } = &mut m.own;
+                    self.bh.obj_conj(ctx, views, stack, self.obj, r, y)?;
+                    plan.forward_inplace(ctx, y)?;
+                    self.bh.pos_grad(ctx, stack, y, &shift, off)?;
                 }
                 None => {
                     k.psi_to_obj(ctx, views, stack, r, self.probe, self.obj_sums)?;
@@ -298,12 +233,14 @@ impl Bufs<'_> {
         };
         let mut hess = None;
         if let Some(m) = &mut moved {
-            self.bh.pos_dots(ctx, &step, &d, &mut m.off, bh.parts)?;
-            let [su, sv] = &mut *m.spectra;
+            let shift = moved_shift(m.pos, m.spectrum);
+            let BhOwn { y, spectra, off } = &mut m.own;
+            self.bh.pos_dots(ctx, &step, &d, off, bh.parts)?;
+            let [su, sv] = &mut **spectra;
             let au = k.probe_spectrum(ctx, &dims, d.u[1], su)?;
             let av = (d.v.map(|v| k.probe_spectrum(ctx, &dims, v[1], sv))).transpose()?;
-            let mv = BhMovesRef::new(&d, m.shift, au, av, &m.off)?;
-            hess = Some((mv, &*m.w, &mut *m.y));
+            let mv = BhMovesRef::new(&d, shift, au, av, off)?;
+            hess = Some((mv, &*m.w, &mut **y));
         }
         for (i, s) in batch.clone().enumerate() {
             let stack = bh.table.at(s);
@@ -360,7 +297,9 @@ impl Bufs<'_> {
         // The offsets' update reads neither array, so it may precede their updates, which end
         // the borrow of the batch-start probe.
         if let Some(MovedBatch {
-            mut off, offsets, ..
+            own: BhOwn { mut off, .. },
+            offsets,
+            ..
         }) = moved
         {
             self.bh
@@ -387,16 +326,5 @@ impl Bufs<'_> {
             self.bh.update(ctx, var, bh.steps, step.record)?;
         }
         Ok(())
-    }
-}
-
-/// `base` under the batch's position model `shift`.
-fn moved_inputs<'a>(base: &FusedInputs<'a>, shift: Shift<'a>) -> FusedInputs<'a> {
-    FusedInputs {
-        model: Model {
-            shift: Some(shift),
-            ..Model::default()
-        },
-        ..*base
     }
 }
