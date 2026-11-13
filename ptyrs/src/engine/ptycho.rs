@@ -5,7 +5,10 @@ use std::ops::Range;
 
 use crate::base::{AddrTable, C64, Object, Probe, Scan, Stack};
 
-use crate::engine::features::{Model, Shifted, position_step};
+use crate::engine::features::{
+    EPS_POSITION, Model, Shifted, batch_position_step, gradient_directions, gradient_sums,
+    move_planes, position_step,
+};
 use crate::engine::ops::{
     Llk, accumulate_obj, accumulate_probe, apply_amplitude_with, cg_poisson_gamma_with, llk_with,
     natural, obj_probe_to_psi, poisson_grad_with, psi_to_obj_probe, quad_phase,
@@ -628,17 +631,23 @@ impl Ptycho {
 
     /// rPIE after pty-chi `RPIEReconstructor` with SGD, on consecutive batches of
     /// `batch_size` frames (pty-chi shuffles; this order is fixed). Needs one object mode.
-    /// Per batch, from the batch-start object and probe, with `Δ = IFT(ψ') − ψ` and
+    /// Per batch, from the batch-start object, probe and offsets, with `W_m` the view's probe
+    /// `P_m q` (moved by [`Features::position`] when set), `Δ = IFT(ψ') − ψ`, `ψ = W·O_win` and
     /// `ψ' = FT(ψ) / (sqrt(Σ_modes |FT ψ|²) + 1e-7) · sqrt(iobs + 1e-7)` (masked pixels keep
     /// `FT ψ`, so `Δ` is 0 there):
-    /// - object: `O[win] += obj_step · Σ_modes conj(P_m q) Δ_m / ((1 − α_o)|P_m|² + α_o·max Σ_m|P_m|²)`,
-    ///   summed over the batch;
-    /// - probe: `P_m += probe_step · mean_batch conj(O_win q) Δ_m / ((1 − α_p)|O_win|² + α_p·max|O_win|²)`.
+    /// - object: `O[win] += obj_step · Σ_modes conj(W_m) Δ_m / ((1 − α_o)|W_m|² + α_o·max Σ_m|W_m|²)`,
+    ///   summed over the batch, the max over the batch's frames and pixels;
+    /// - probe: `P_m += probe_step · mean_batch conj(q)·T_{−d}(conj(O_win) Δ_m /
+    ///   ((1 − α_p)|O_win|² + α_p·max|O_win|²))`, `T_{−d}` the adjoint of the move by the
+    ///   frame's offset (none without positions);
+    /// - positions: pty-chi's gradient correction as [`crate::engine::Lsqml`]'s, from the
+    ///   frame's mode-0 `W` and `Δ` (`chi`) and its object window, then its clipped SGD step.
     ///
     /// pty-chi has no `q` and an unnormalised FFT: its probe `P·q / sqrt(ny·nx)` gives the same
     /// far-field moduli, so the `1e-7` guards act alike and the iterates correspond exactly
-    /// (`scripts/compare_ptychi_rpie.py`). One LLK record (of the estimate after the epoch)
-    /// every `calc_llk` epochs and after the last.
+    /// (`scripts/compare_ptychi_rpie.py`, and `refs/f64/rpie_pos.py` with the positions, pty-chi
+    /// moving every probe mode). One LLK record (of the estimate after the epoch) every
+    /// `calc_llk` epochs and after the last. Of the [`Features`] it models the positions alone.
     pub fn rpie(&mut self, params: &RpieParams, nepoch: usize) -> Result<(), EngineError> {
         if self.addr.nobj() != 1 {
             return Err(EngineError::Invalid(
@@ -648,8 +657,10 @@ impl Ptycho {
         if params.batch_size == 0 {
             return Err(EngineError::Invalid("rPIE batch_size must be >= 1".into()));
         }
-        if self.features != Features::default() {
-            return Err(EngineError::Invalid("rPIE models no features".into()));
+        if self.features.scale.is_some() || self.features.background.is_some() {
+            return Err(EngineError::Invalid(
+                "rPIE models no intensity scale or background".into(),
+            ));
         }
         let nframe = self.addr.nframe();
         for ic in 0..nepoch {
@@ -675,13 +686,18 @@ impl Ptycho {
         let nxo = self.object.plane_shape()[1];
         let nbatch = frames.len();
         let views = &self.addr.views()[frames.start * nmode..frames.end * nmode];
+        let offsets = self.features.position.as_deref();
+        let shifted = offsets.map(|d| Shifted::new(views, &self.probe, &self.quad, d, &self.fft));
         let mut psi = vec![C64::default(); views.len() * n];
-        obj_probe_to_psi(views, &self.object, &self.probe, &self.quad, &mut psi);
+        match &shifted {
+            Some(s) => s.to_psi(views, &self.object, &mut psi),
+            None => obj_probe_to_psi(views, &self.object, &self.probe, &self.quad, &mut psi),
+        }
         let mut delta = psi.clone();
         self.fft.forward(&mut delta);
         for (o, block) in self
             .obs
-            .frames(frames)
+            .frames(frames.clone())
             .chunks_exact(n)
             .zip(delta.chunks_exact_mut(nmode * n))
         {
@@ -700,26 +716,36 @@ impl Ptycho {
         self.fft.inverse(&mut delta);
         delta.iter_mut().zip(&psi).for_each(|(d, p)| *d -= p);
 
+        // View k's probe at exit-wave index j and its squared modulus.
+        let wave = |k: usize, j: usize| -> (C64, f64) {
+            match &shifted {
+                Some(s) => {
+                    let w = s.wave(k)[j];
+                    (w, w.norm_sqr())
+                }
+                None => {
+                    let (i, _, _) = natural(j, ny, nx);
+                    let p = self.probe.plane(views[k].probe as usize)[i];
+                    (p * self.quad[i], p.norm_sqr())
+                }
+            }
+        };
         let mut d_obj = params
             .obj_step
             .map(|_| Stack::filled(self.object.dims(), C64::default()));
         if let Some(d_obj) = &mut d_obj {
-            let pmax = (0..n)
-                .map(|i| {
-                    (0..nmode)
-                        .map(|m| self.probe.plane(m)[i].norm_sqr())
-                        .sum::<f64>()
-                })
+            let pmax = (0..nbatch)
+                .flat_map(|b| (0..n).map(move |j| (b, j)))
+                .map(|(b, j)| (0..nmode).map(|m| wave(b * nmode + m, j).1).sum::<f64>())
                 .fold(0.0, f64::max);
             let a = params.obj_alpha;
             let d = d_obj.plane_mut(0);
-            for (v, dv) in views.iter().zip(delta.chunks_exact(n)) {
-                let p = self.probe.plane(v.probe as usize);
+            for (k, (v, dv)) in views.iter().zip(delta.chunks_exact(n)).enumerate() {
                 let (oy, ox) = (v.oy as usize, v.ox as usize);
                 for (j, dv) in dv.iter().enumerate() {
-                    let (i, y, x) = natural(j, ny, nx);
-                    let w = (p[i] * self.quad[i]).conj() / ((1.0 - a) * p[i].norm_sqr() + a * pmax);
-                    d[(oy + y) * nxo + ox + x] += w * dv;
+                    let (_, y, x) = natural(j, ny, nx);
+                    let (w, w2) = wave(k, j);
+                    d[(oy + y) * nxo + ox + x] += w.conj() / ((1.0 - a) * w2 + a * pmax) * dv;
                 }
             }
         }
@@ -729,12 +755,21 @@ impl Ptycho {
         if let Some(d_probe) = &mut d_probe {
             let a = params.probe_alpha;
             let ob = self.object.plane(0);
+            let mut frame = Stack::filled(self.probe.dims(), C64::default());
             for (fv, dv) in views.chunks_exact(nmode).zip(delta.chunks_exact(nmode * n)) {
                 let (oy, ox) = (fv[0].oy as usize, fv[0].ox as usize);
                 let win = |i: usize| ob[(oy + i / nx) * nxo + ox + i % nx];
                 let omax = (0..n).map(|i| win(i).norm_sqr()).fold(0.0, f64::max);
+                // Without positions the frame's direction adds straight into the sum.
+                let d = match offsets {
+                    Some(_) => {
+                        frame.as_mut_slice().fill(C64::default());
+                        &mut frame
+                    }
+                    None => &mut *d_probe,
+                };
                 for (v, dv) in fv.iter().zip(dv.chunks_exact(n)) {
-                    let d = d_probe.plane_mut(v.probe as usize);
+                    let d = d.plane_mut(v.probe as usize);
                     for (j, dv) in dv.iter().enumerate() {
                         let i = shift(j, ny, nx);
                         let o = win(i);
@@ -742,8 +777,30 @@ impl Ptycho {
                         d[i] += w * dv;
                     }
                 }
+                if let Some(offsets) = offsets {
+                    let [dy, dx] = offsets[fv[0].frame as usize];
+                    let moved = frame.as_mut_slice();
+                    move_planes(moved, Some(&self.quad), [-dy, -dx], &self.fft);
+                    (d_probe.as_mut_slice().iter_mut())
+                        .zip(&*moved)
+                        .for_each(|(d, m)| *d += m);
+                }
             }
         }
+        let d_pos = shifted.as_ref().map(|s| {
+            let sums: Vec<[[f64; 2]; 2]> = (0..nbatch)
+                .map(|b| {
+                    let k = b * nmode;
+                    let v = views[k];
+                    let o = self.object.plane(v.obj as usize);
+                    let patch: Vec<C64> = (0..n)
+                        .map(|i| o[(v.oy as usize + i / nx) * nxo + v.ox as usize + i % nx])
+                        .collect();
+                    gradient_sums(&patch, s.wave(k), &delta[k * n..(k + 1) * n], &self.fft)
+                })
+                .collect();
+            gradient_directions(&sums, EPS_POSITION * n as f64)
+        });
         if let (Some(step), Some(d)) = (params.obj_step, d_obj) {
             for (o, d) in self.object.as_mut_slice().iter_mut().zip(d.as_slice()) {
                 *o += d * step;
@@ -754,6 +811,10 @@ impl Ptycho {
             for (p, d) in self.probe.as_mut_slice().iter_mut().zip(d.as_slice()) {
                 *p += d * s;
             }
+        }
+        if let (Some(d), Some(delta)) = (&mut self.features.position, d_pos) {
+            let frames: Vec<usize> = frames.collect();
+            batch_position_step(d, &frames, &delta);
         }
     }
 }
