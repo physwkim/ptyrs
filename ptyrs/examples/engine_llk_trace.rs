@@ -124,7 +124,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let t = std::time::Instant::now();
         match algo.as_str() {
             "dm" => g.dm(&dm, ncycle)?,
-            "raar" => return Err("raar has no GPU path yet".into()),
+            "raar" => g.raar(&raar, ncycle)?,
             "ap" => g.ap(&AP, ncycle)?,
             "ml" => g.ml(&ML, ncycle)?,
             _ => g.rpie(&RPIE, ncycle)?,
