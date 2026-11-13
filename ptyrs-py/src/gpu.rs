@@ -85,7 +85,9 @@ impl GpuPtycho {
     }
 
     /// `nepoch` BH epochs from a fresh BH, an LLK record every `calc_llk` epochs and after
-    /// the last.
+    /// the last; `position_rho` as `Bh`'s, for the modelled position.
+    #[pyo3(signature = (nepoch, calc_llk, batch_size, probe_rho, seed, *,
+                        position_rho = crate::POSITION_RHO))]
     fn bh(
         &mut self,
         nepoch: usize,
@@ -93,11 +95,12 @@ impl GpuPtycho {
         batch_size: usize,
         probe_rho: f64,
         seed: u64,
+        position_rho: f64,
     ) -> PyResult<()> {
         let params = BhParams {
             batch_size,
             probe_rho,
-            position_rho: 0.1,
+            position_rho,
             seed,
         };
         Ok(self.0.bh(&params, nepoch, calc_llk).map_err(Error::from)?)

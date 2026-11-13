@@ -161,6 +161,9 @@ fn stack_out<'py, T: Element>(py: Python<'py>, s: Stack<T>) -> PyResult<Bound<'p
     PyArray1::from_vec(py, s.into_vec()).reshape(dims)
 }
 
+/// BH's default `position_rho`, pty-chi's `BHProbePositionOptions.rho`.
+const POSITION_RHO: f64 = 0.1;
+
 /// `"amplitude"` or `"poisson"` as the engine's [`Cost`].
 fn cost(name: &str) -> PyResult<Cost> {
     match name {

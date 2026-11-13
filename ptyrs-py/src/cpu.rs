@@ -277,20 +277,38 @@ impl Lsqml {
     }
 }
 
-/// BH across epochs (`ptyrs::engine::Bh`).
+/// BH across epochs (`ptyrs::engine::Bh`). With `position`, offsets as `Lsqml` takes them,
+/// every epoch models and refines them, their gradient weighted by `position_rho`².
 #[pyclass]
 pub(crate) struct Bh(ptyrs::engine::Bh);
 
 #[pymethods]
 impl Bh {
     #[new]
-    fn new(batch_size: usize, probe_rho: f64, seed: u64) -> Self {
-        Self(ptyrs::engine::Bh::new(ptyrs::engine::BhParams {
+    #[pyo3(signature = (batch_size, probe_rho, seed, *, position = None,
+                        position_rho = crate::POSITION_RHO))]
+    fn new(
+        batch_size: usize,
+        probe_rho: f64,
+        seed: u64,
+        position: Option<PyReadonlyArray2<'_, f64>>,
+        position_rho: f64,
+    ) -> PyResult<Self> {
+        let bh = ptyrs::engine::Bh::new(ptyrs::engine::BhParams {
             batch_size,
             probe_rho,
-            position_rho: 0.1,
+            position_rho,
             seed,
-        }))
+        });
+        let features = position_only(position)?;
+        Ok(Self(bh.with_features(features).map_err(Error::from)?))
+    }
+
+    /// The offsets as the last epoch left them, `None` without a position.
+    #[getter]
+    fn position<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyArray2<f64>>>> {
+        let d = self.0.features().position.clone();
+        d.map(|d| crate::position_out(py, d)).transpose()
     }
 
     /// One epoch over `ptycho`'s scan from `object` and `probe`; returns the new object and
@@ -304,6 +322,7 @@ impl Bh {
     ) -> PyResult<Epoch<'py>> {
         let (mut object, mut probe) = ptycho.modes(object, probe)?;
         let p = &ptycho.inner;
+        offsets_fit(self.0.features(), p.addr().nframe())?;
         let objects = slice::from_mut(&mut object);
         let steps = self
             .0
