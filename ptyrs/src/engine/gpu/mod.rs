@@ -55,12 +55,14 @@ use crate::engine::{
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GpuOptions {
     /// Frames per stack (the last stack may be shorter) for every pass but rPIE's, whose
-    /// batches are its own; PyNX's default is 16. `None`, the default, cuts each pass by bytes
-    /// instead: as many frames as fill 3/8 of the device's L2, the fastest share at frame
-    /// sides 256 and 512, with every per-stack buffer the pass touches. That is the shared
-    /// scratch alone in AP, the LLK pass and ML's gradient, and with it DM's carried exit
-    /// waves, RAAR's and its iterate; ML's line search, BH and LSQML count their own buffers,
-    /// and under the position model the shared scratch they shift through.
+    /// batches are its own, and at most this many for BH and LSQML, which cut each batch into
+    /// as few stacks as that takes, of lengths within a frame of each other; PyNX's default
+    /// is 16. `None`, the default, cuts each pass by bytes instead: as many frames as fill 3/8
+    /// of the device's L2, the fastest share at frame sides 256 and 512, with every per-stack
+    /// buffer the pass touches. That is the shared scratch alone in AP, the LLK pass and ML's
+    /// gradient, and with it DM's carried exit waves, RAAR's and its iterate; ML's line
+    /// search, BH and LSQML count their own buffers, and under the position model the shared
+    /// scratch they shift through.
     pub stack_size: Option<usize>,
     /// Replay every AP, DM and ML cycle, rPIE epoch and LLK pass from a CUDA graph captured once
     /// per kind of cycle instead of launching it kernel by kernel; both give the same bits.
@@ -222,9 +224,9 @@ impl Cut {
     }
 }
 
-/// The epoch positions `0 .. nframe` in batches of `size`, each cut into stacks of
-/// `stack_size` (the last batch, and a batch's last stack, may be shorter), and each batch's
-/// range of stack indices.
+/// The epoch positions `0 .. nframe` in batches of `size` (the last batch may be shorter),
+/// each cut by [`even_stacks`] into stacks of at most `stack_size`, and each batch's range of
+/// stack indices.
 fn batch_stacks(
     stream: &Arc<CudaStream>,
     dims: &ViewDims,
@@ -234,16 +236,16 @@ fn batch_stacks(
     let (mut ranges, mut lens, mut batches) = (Vec::new(), Vec::<u32>::new(), Vec::new());
     for (b, _) in split(dims.nframe, size).0 {
         let first = ranges.len();
-        let (sub, sub_lens) = split(b.end - b.start, stack_size);
-        for (r, i) in sub {
-            let plan = match lens.iter().position(|&l| l == sub_lens[i]) {
+        for r in even_stacks(b, stack_size) {
+            let nf = r.end - r.start;
+            let plan = match lens.iter().position(|&l| l == nf) {
                 Some(plan) => plan,
                 None => {
-                    lens.push(sub_lens[i]);
+                    lens.push(nf);
                     lens.len() - 1
                 }
             };
-            ranges.push((b.start + r.start..b.start + r.end, plan));
+            ranges.push((r, plan));
         }
         batches.push(first..ranges.len());
     }
@@ -254,6 +256,19 @@ fn batch_stacks(
         lens,
     };
     Ok((cut, batches))
+}
+
+/// `range` cut into as few consecutive stacks of at most `max` frames as it takes, longer
+/// ones first, their lengths within a frame of each other: a short tail stack would cost a
+/// full stack's launches for a few frames.
+fn even_stacks(range: Range<u32>, max: u32) -> impl Iterator<Item = Range<u32>> {
+    let len = range.end - range.start;
+    let k = len.div_ceil(max);
+    (0..k).scan(range.start, move |f0, s| {
+        let nf = len / k + u32::from(s < len % k);
+        *f0 += nf;
+        Some(*f0 - nf..*f0)
+    })
 }
 
 /// The table of `ranges` and their [`Frames`], each range with its plan index.
@@ -793,6 +808,27 @@ mod tests {
             obj: [1024; 2],
             quad_phase: 0.0,
         }
+    }
+
+    /// A batch of 96 at most 19 per stack is 6 stacks of 16, not 5 of 19 and one of 1; 30 at
+    /// 7 is 6, 6, 6, 6, 6; lengths that divide stay whole, and 5 frames at 8 are one stack.
+    #[test]
+    fn even_stacks_cut_a_batch_into_equal_lengths() {
+        let lens = |r: Range<u32>, max| {
+            let stacks: Vec<_> = even_stacks(r.clone(), max).collect();
+            assert_eq!(stacks.first().map(|s| s.start), Some(r.start));
+            assert_eq!(stacks.last().map(|s| s.end), Some(r.end));
+            assert!(stacks.windows(2).all(|w| w[0].end == w[1].start));
+            stacks.iter().map(|s| s.end - s.start).collect::<Vec<_>>()
+        };
+        assert_eq!(lens(0..96, 19), [16; 6]);
+        assert_eq!(lens(96..126, 7), [6; 5]);
+        assert_eq!(lens(0..64, 19), [16; 4]);
+        assert_eq!(lens(0..64, 18), [16; 4]);
+        assert_eq!(lens(0..65, 16), [13; 5]);
+        assert_eq!(lens(0..10, 4), [4, 3, 3]);
+        assert_eq!(lens(0..96, 16), [16; 6]);
+        assert_eq!(lens(3..8, 8), [5]);
     }
 
     /// 24 MiB of a 64 MiB L2 holds 24, 12, 8 and 6 frames of one to four two-mode exit-wave
