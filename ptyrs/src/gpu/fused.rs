@@ -23,9 +23,10 @@ use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig, RawDeviceBuffer};
 use ptyrs_kernels::fft_ept;
 use ptyrs_kernels::fused::{
     FFT_SKEW, FUSED_BACKGROUND, FUSED_BACKGROUND_SUMS, FUSED_COLS, FUSED_DM, FUSED_DOWN,
-    FUSED_GRAD, FUSED_LLK, FUSED_MODEL_TERMS, FUSED_PROJECT, FUSED_ROW_THREADS, FUSED_SCALE,
-    FUSED_SCALE_SUMS, FUSED_SHIFT_DEN, FUSED_SHIFT_OBJ, FUSED_SHIFT_POSITION, FUSED_SHIFT_PROBE,
-    FUSED_TO_PSI, FusedCfg, FusedPtrs, col_slot_bytes, fused_col_threads, shift_stage_bytes,
+    FUSED_GRAD, FUSED_ITERATE, FUSED_LLK, FUSED_MODEL_TERMS, FUSED_PROJECT, FUSED_RAAR,
+    FUSED_ROW_THREADS, FUSED_SCALE, FUSED_SCALE_SUMS, FUSED_SHIFT_DEN, FUSED_SHIFT_OBJ,
+    FUSED_SHIFT_POSITION, FUSED_SHIFT_PROBE, FUSED_TO_PSI, FusedCfg, FusedPtrs, col_slot_bytes,
+    fused_col_threads, shift_stage_bytes,
 };
 use ptyrs_kernels::pixel::SumPtrs;
 
@@ -524,7 +525,7 @@ pub struct PsiSums<'a> {
 }
 
 /// Which iteration [`Kernels::fused_project`] runs and where its new exit waves go. `psi`
-/// is a DM stack's exit waves, `[nf_max * nmode, ny, nx]` in the M1 layout.
+/// is a DM or RAAR stack's exit waves, `[nf_max * nmode, ny, nx]` in the M1 layout.
 pub enum Exit<'a> {
     /// AP: the projected exit waves `P(PO)` stay in [`FusedBufs::work`]. `far` gets the sums
     /// of the forward far field, the one [`Kernels::llk`] reads after `obj_probe_to_psi` and
@@ -546,6 +547,38 @@ pub enum Exit<'a> {
         psi: &'a mut DeviceBuffer<C32>,
         alpha: f32,
     },
+    /// The first RAAR cycle, from PyNX's start `psi = PO`: `iterate = PO` and `psi =
+    /// P(PO)`. `iterate` is laid out as `psi`; far sums as for [`Exit::DmFirst`].
+    RaarFirst {
+        psi: &'a mut DeviceBuffer<C32>,
+        iterate: &'a mut DeviceBuffer<C32>,
+    },
+    /// A RAAR cycle: with `R = (1 - beta / 2) psi + beta / 2 (2 PO - iterate)`, `iterate =
+    /// R` and `psi = P(R)`, as `raar_iterate` and projection compute it.
+    Raar {
+        psi: &'a mut DeviceBuffer<C32>,
+        iterate: &'a mut DeviceBuffer<C32>,
+        beta: f32,
+    },
+}
+
+/// The per-frame sets a DM or RAAR stack carries between cycles: `psi`, and RAAR's iterate.
+#[derive(Clone, Copy, Default)]
+struct Carried<'a> {
+    psi: Option<&'a DeviceBuffer<C32>>,
+    iterate: Option<&'a DeviceBuffer<C32>>,
+}
+
+impl<'a> Carried<'a> {
+    /// What the forward row pass under `flags` reads of the sets, then what it writes.
+    fn fwd_access(&self, flags: u32) -> (Vec<&'a RawDeviceBuffer>, Vec<&'a RawDeviceBuffer>) {
+        let on =
+            |b: Option<&'a DeviceBuffer<C32>>, set: bool| b.filter(|_| set).map(|b| b.storage());
+        let raar = flags & FUSED_RAAR != 0;
+        let reads = on(self.psi, flags & FUSED_DM != 0 || raar);
+        let writes = on(self.iterate, raar || flags & FUSED_ITERATE != 0);
+        (reads.into_iter().collect(), writes.into_iter().collect())
+    }
 }
 
 impl Kernels {
@@ -570,15 +603,52 @@ impl Kernels {
         let bufs = &*bufs;
         let (run, shift) = Run::new(self, ctx, *inputs, stack, bufs)?;
         let d = inputs.views.dims();
-        // `pass`: what the column pass does to the far field.
-        let (psi, far, dm, alpha, pass) = match exit {
-            Exit::Ap { far } => (None, far, false, 0.0, FUSED_PROJECT),
-            Exit::Grad { far } => (None, far, false, 0.0, FUSED_GRAD),
-            Exit::DmFirst { psi } => (Some(psi), FarSums::default(), false, 0.0, FUSED_PROJECT),
-            Exit::Dm { psi, alpha } => (Some(psi), FarSums::default(), true, alpha, FUSED_PROJECT),
+        // `fwd`: what the forward row pass makes of `PO`; `pass`: what the column pass does
+        // to the far field.
+        let none = FusedCfg::default();
+        let ((psi, iterate), far, fwd, pass) = match exit {
+            Exit::Ap { far } => ((None, None), far, none, FUSED_PROJECT),
+            Exit::Grad { far } => ((None, None), far, none, FUSED_GRAD),
+            Exit::DmFirst { psi } => ((Some(&*psi), None), FarSums::default(), none, FUSED_PROJECT),
+            Exit::Dm { psi, alpha } => {
+                let fwd = FusedCfg {
+                    flags: FUSED_DM,
+                    alpha,
+                    ..none
+                };
+                ((Some(&*psi), None), FarSums::default(), fwd, FUSED_PROJECT)
+            }
+            Exit::RaarFirst { psi, iterate } => {
+                let fwd = FusedCfg {
+                    flags: FUSED_ITERATE,
+                    ..none
+                };
+                (
+                    (Some(&*psi), Some(&*iterate)),
+                    FarSums::default(),
+                    fwd,
+                    FUSED_PROJECT,
+                )
+            }
+            Exit::Raar { psi, iterate, beta } => {
+                let fwd = FusedCfg {
+                    flags: FUSED_RAAR | FUSED_ITERATE,
+                    beta,
+                    ..none
+                };
+                (
+                    (Some(&*psi), Some(&*iterate)),
+                    FarSums::default(),
+                    fwd,
+                    FUSED_PROJECT,
+                )
+            }
         };
-        if let Some(psi) = &psi {
-            check_len("psi", psi, run.g.nf_max as usize * d.nmode as usize * d.n())?;
+        let carried = Carried { psi, iterate };
+        for (name, b) in [("psi", psi), ("iterate", iterate)] {
+            if let Some(b) = b {
+                check_len(name, b, run.g.nf_max as usize * d.nmode as usize * d.n())?;
+            }
         }
         run.check_far(&far)?;
         let FusedSums {
@@ -615,13 +685,13 @@ impl Kernels {
         for out in [&position, &position_den].into_iter().flatten() {
             check_len("position sums", out, d.nframe as usize)?;
         }
-        let psi = psi.as_deref();
         let p = FusedPtrs {
             psi: psi.map_or(std::ptr::null_mut(), dptr),
+            iterate: iterate.map_or(std::ptr::null_mut(), dptr),
             ..run.ptrs(bufs, &far)
         };
-        let dm_flag = if dm { FUSED_DM } else { 0 };
-        if dm {
+        let dm_flag = fwd.flags & FUSED_DM;
+        if dm_flag != 0 {
             // The inverse row pass walks with the column pass (`Run::walk_with`).
             run.start_up();
         }
@@ -637,34 +707,31 @@ impl Kernels {
             None => 0,
         };
 
-        let cfg = FusedCfg {
-            flags: dm_flag,
-            alpha,
-        };
         match &shift {
             Some(sh) => {
                 let slopes = FUSED_SHIFT_DEN | FUSED_SHIFT_POSITION;
                 let t_dy = (shift_flags & slopes != 0).then_some(&sh.scratch.adj);
                 run.shift_pre(&sh.model, &sh.scratch.t, t_dy, p)?;
-                run.shift_rows_fwd(&sh.scratch.t, &bufs.work, psi, p, cfg)?;
+                run.shift_rows_fwd(&sh.scratch.t, &bufs.work, carried, p, fwd)?;
             }
             None => {
                 if obj_sums.is_some() {
                     run.probe_terms(bufs, p)?;
                 }
-                run.rows_fwd(bufs, psi, p, cfg)?;
+                run.rows_fwd(bufs, carried, p, fwd)?;
             }
         }
         let cfg = FusedCfg {
             flags: pass | run.model_flags() | far.flags(),
-            alpha,
+            ..fwd
         };
         run.cols(bufs, &far, p, cfg)?;
         run.far_sums(bufs, far)?;
         let to_psi = if psi.is_some() { FUSED_TO_PSI } else { 0 };
+        // RAAR's inverse pass only stores `P(R)`: its mix is all in the forward pass.
         let cfg = FusedCfg {
             flags: dm_flag | to_psi | shift_flags,
-            alpha,
+            ..fwd
         };
         let waves = psi.unwrap_or(&bufs.work);
         match &shift {
@@ -738,6 +805,7 @@ impl Kernels {
         let cfg = FusedCfg {
             flags: flag(obj.is_some(), FUSED_SHIFT_OBJ) | flag(probe.is_some(), FUSED_SHIFT_PROBE),
             alpha: 0.0,
+            beta: 0.0,
         };
         run.shift_pre(&sh.model, &sh.scratch.t, None, p)?;
         run.shift_sums(sh, psi, p, cfg)?;
@@ -779,7 +847,7 @@ impl Kernels {
             ..run.input_ptrs()
         };
         run.shift_pre(&model, t, None, p)?;
-        run.shift_rows_fwd(t, work, None, p, FusedCfg::default())
+        run.shift_rows_fwd(t, work, Carried::default(), p, FusedCfg::default())
     }
 
     /// The stack's far sums of the far field of `PO`, the one `obj_probe_to_psi` and the FFT
@@ -800,13 +868,20 @@ impl Kernels {
         match &shift {
             Some(sh) => {
                 run.shift_pre(&sh.model, &sh.scratch.t, None, p)?;
-                run.shift_rows_fwd(&sh.scratch.t, &bufs.work, None, p, FusedCfg::default())?;
+                run.shift_rows_fwd(
+                    &sh.scratch.t,
+                    &bufs.work,
+                    Carried::default(),
+                    p,
+                    FusedCfg::default(),
+                )?;
             }
-            None => run.rows_fwd(bufs, None, p, FusedCfg::default())?,
+            None => run.rows_fwd(bufs, Carried::default(), p, FusedCfg::default())?,
         }
         let cfg = FusedCfg {
             flags: run.model_flags() | far.flags(),
             alpha: 0.0,
+            beta: 0.0,
         };
         run.cols(bufs, &far, p, cfg)?;
         run.far_sums(bufs, far)
@@ -1120,6 +1195,7 @@ impl<'a> Run<'a> {
             views: dptr(self.inputs.views.addr()),
             counts: dptr(self.inputs.counts),
             psi: null,
+            iterate: null,
             work: null,
             probe_q: null,
             probe_power: null,
@@ -1204,52 +1280,51 @@ impl<'a> Run<'a> {
         })
     }
 
-    /// Pass A into `bufs.work`; reads `psi` under `FUSED_DM`.
+    /// Pass A into `bufs.work`; reads and writes the `carried` sets `cfg` names.
     fn rows_fwd(
         &self,
         bufs: &FusedBufs,
-        psi: Option<&DeviceBuffer<C32>>,
+        carried: Carried<'_>,
         p: FusedPtrs,
         cfg: FusedCfg,
     ) -> Result<(), Error> {
         let cfg = self.walk(cfg);
         let config = self.sh.rows(&self.g, true)?;
+        let (sets, mut writes) = carried.fwd_access(cfg.flags);
         let mut reads = vec![
             self.inputs.obj.storage(),
             self.inputs.probe.storage(),
             self.inputs.views.addr().storage(),
             self.stack.storage(),
         ];
-        if cfg.flags & FUSED_DM != 0 {
-            reads.extend(psi.map(|b| b.storage()));
-        }
+        reads.extend(sets);
+        writes.push(bufs.work.storage());
         let (ctl, g) = (self.ctl(), self.g);
-        self.k
-            .launch(self.ctx, &reads, &[bufs.work.storage()], |stream| {
-                // SAFETY: `Run::new` and the caller checked every buffer the flags name;
-                // `Views::new` checked the views are canonical and inside the object; the
-                // launch is the one `rows_fwd` documents.
-                unsafe {
-                    match self.sh.nx {
-                        Side::N64 => self
-                            .k
-                            .module
-                            .fused_rows_fwd_64(stream, config, p, ctl, g, cfg),
-                        Side::N128 => self
-                            .k
-                            .module
-                            .fused_rows_fwd_128(stream, config, p, ctl, g, cfg),
-                        Side::N256 => self
-                            .k
-                            .module
-                            .fused_rows_fwd_256(stream, config, p, ctl, g, cfg),
-                        Side::N512 => self
-                            .k
-                            .module
-                            .fused_rows_fwd_512(stream, config, p, ctl, g, cfg),
-                    }
+        self.k.launch(self.ctx, &reads, &writes, |stream| {
+            // SAFETY: `Run::new` and the caller checked every buffer the flags name;
+            // `Views::new` checked the views are canonical and inside the object; the
+            // launch is the one `rows_fwd` documents.
+            unsafe {
+                match self.sh.nx {
+                    Side::N64 => self
+                        .k
+                        .module
+                        .fused_rows_fwd_64(stream, config, p, ctl, g, cfg),
+                    Side::N128 => self
+                        .k
+                        .module
+                        .fused_rows_fwd_128(stream, config, p, ctl, g, cfg),
+                    Side::N256 => self
+                        .k
+                        .module
+                        .fused_rows_fwd_256(stream, config, p, ctl, g, cfg),
+                    Side::N512 => self
+                        .k
+                        .module
+                        .fused_rows_fwd_512(stream, config, p, ctl, g, cfg),
                 }
-            })
+            }
+        })
     }
 
     /// Pass B on `bufs.work`; reads the model's buffers and writes `bufs.groups`,
@@ -1466,7 +1541,11 @@ impl<'a> Run<'a> {
             Some(_) => FUSED_SHIFT_DEN | FUSED_SHIFT_POSITION,
             None => 0,
         };
-        let cfg = self.walk(FusedCfg { flags, alpha: 0.0 });
+        let cfg = self.walk(FusedCfg {
+            flags,
+            alpha: 0.0,
+            beta: 0.0,
+        });
         let (ctl, g) = (self.ctl(), self.g);
         self.k.launch(self.ctx, &reads, &writes, |stream| {
             // SAFETY: `Run::checked` checked the shift model against `g` and the callers `t`
@@ -1495,53 +1574,52 @@ impl<'a> Run<'a> {
     }
 
     /// Pass A with the shifted probe from `t` into `work`, at `p.shift` and `p.work`; reads
-    /// `psi` under `FUSED_DM`.
+    /// and writes the `carried` sets `cfg` names.
     fn shift_rows_fwd(
         &self,
         t: &DeviceBuffer<C32>,
         work: &DeviceBuffer<C32>,
-        psi: Option<&DeviceBuffer<C32>>,
+        carried: Carried<'_>,
         p: FusedPtrs,
         cfg: FusedCfg,
     ) -> Result<(), Error> {
         let cfg = self.walk(cfg);
         let config = self.sh.rows(&self.g, true)?;
+        let (sets, mut writes) = carried.fwd_access(cfg.flags);
         let mut reads = vec![
             self.inputs.obj.storage(),
             self.inputs.views.addr().storage(),
             self.stack.storage(),
             t.storage(),
         ];
-        if cfg.flags & FUSED_DM != 0 {
-            reads.extend(psi.map(|b| b.storage()));
-        }
+        reads.extend(sets);
+        writes.push(work.storage());
         let (ctl, g) = (self.ctl(), self.g);
-        self.k
-            .launch(self.ctx, &reads, &[work.storage()], |stream| {
-                // SAFETY: as in `rows_fwd`, with the callers checking `t` and `work`, and
-                // `shift_pre` wrote `T` of this stack into `t`; the launch is the one
-                // `shift_rows_fwd` documents.
-                unsafe {
-                    match self.sh.nx {
-                        Side::N64 => self
-                            .k
-                            .module
-                            .fused_shift_rows_fwd_64(stream, config, p, ctl, g, cfg),
-                        Side::N128 => self
-                            .k
-                            .module
-                            .fused_shift_rows_fwd_128(stream, config, p, ctl, g, cfg),
-                        Side::N256 => self
-                            .k
-                            .module
-                            .fused_shift_rows_fwd_256(stream, config, p, ctl, g, cfg),
-                        Side::N512 => self
-                            .k
-                            .module
-                            .fused_shift_rows_fwd_512(stream, config, p, ctl, g, cfg),
-                    }
+        self.k.launch(self.ctx, &reads, &writes, |stream| {
+            // SAFETY: as in `rows_fwd`, with the callers checking `t` and `work`, and
+            // `shift_pre` wrote `T` of this stack into `t`; the launch is the one
+            // `shift_rows_fwd` documents.
+            unsafe {
+                match self.sh.nx {
+                    Side::N64 => self
+                        .k
+                        .module
+                        .fused_shift_rows_fwd_64(stream, config, p, ctl, g, cfg),
+                    Side::N128 => self
+                        .k
+                        .module
+                        .fused_shift_rows_fwd_128(stream, config, p, ctl, g, cfg),
+                    Side::N256 => self
+                        .k
+                        .module
+                        .fused_shift_rows_fwd_256(stream, config, p, ctl, g, cfg),
+                    Side::N512 => self
+                        .k
+                        .module
+                        .fused_shift_rows_fwd_512(stream, config, p, ctl, g, cfg),
                 }
-            })
+            }
+        })
     }
 
     /// Pass C with the shifted probe, as [`Self::rows_inv`], and the shift terms `cfg` names.

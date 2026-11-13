@@ -73,6 +73,11 @@ pub const FUSED_SHIFT_PROBE: u32 = 2048;
 pub const FUSED_SHIFT_POSITION: u32 = 4096;
 /// [`shift_pre`] writes `T_y` and [`shift_rows_inv`] the denominator sums `shift_den`.
 pub const FUSED_SHIFT_DEN: u32 = 8192;
+/// [`rows_fwd`] builds RAAR's iterate `R = (1 - h) psi + h (2 PO - iterate)`, `h = beta /
+/// 2`, instead of `PO` ([`raar_mix`]).
+pub const FUSED_RAAR: u32 = 16384;
+/// [`rows_fwd`] stores the waves it transforms, `PO` or `R`, to `iterate`.
+pub const FUSED_ITERATE: u32 = 32768;
 
 /// Columns of one frame a [`cols`] block transforms, for every mode.
 pub const FUSED_COLS: u32 = 8;
@@ -112,12 +117,26 @@ pub fn pin_rows_inv_carveout(
     .result()
 }
 
-/// What a pass does, passed by value: `FUSED_*` bits and the DM `alpha`.
+/// What a pass does, passed by value: `FUSED_*` bits, the DM `alpha` and the RAAR `beta`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct FusedCfg {
     pub flags: u32,
     pub alpha: f32,
+    pub beta: f32,
+}
+
+/// RAAR's iterate (PyNX `RAARProj`) from the projection `s`, the iterate `it` it was
+/// projected from and `o = PO`: `(1 - h) s + h (2 o - it)`, `h = beta / 2`; one function
+/// for the fused pass and `kernels::raar_iterate`.
+#[device]
+pub fn raar_mix(s: (f32, f32), it: (f32, f32), o: (f32, f32), beta: f32) -> (f32, f32) {
+    let h = 0.5 * beta;
+    let k = 1.0 - h;
+    (
+        k * s.0 + h * (2.0 * o.0 - it.0),
+        k * s.1 + h * (2.0 * o.1 - it.1),
+    )
 }
 
 /// The stack slot, of `count`, of a frame pass block: its grid row `blockIdx.y`, or `count -
@@ -148,8 +167,10 @@ pub struct FusedPtrs {
     pub views: *const ViewAddr,
     /// `[nframe, ny, nx]`, detector order.
     pub counts: *const u16,
-    /// The stack's DM exit waves, `[nf_max * nmode, ny, nx]`, origin at `[0, 0]`.
+    /// The stack's DM or RAAR exit waves, `[nf_max * nmode, ny, nx]`, origin at `[0, 0]`.
     pub psi: *mut f32,
+    /// The stack's RAAR iterate, laid out as `psi`.
+    pub iterate: *mut f32,
     /// The stack's transforms, `[nf_max * nmode, ny, nx]`.
     pub work: *mut f32,
     /// `P_p q`, `[nprobe, ny, nx]`, natural order.
@@ -315,9 +336,12 @@ unsafe fn row_fft_at<const NX: u32, const INV: bool>(
 /// Pass A: `work[kl, ys, :] = FFT_x(w[ys, :])` for view `k0 + kl` of the stack, `kl` of
 /// grid row `blockIdx.y` ([`FUSED_DOWN`]), and stored row `ys`, with `w = PO` as
 /// `kernels::obj_probe_to_psi` stores it or, under `FUSED_DM`, `w = (2 - a) PO - (1 - a)
-/// psi` as `kernels::dm_reflect` computes it. Reads `obj`, `probe`, `views` and under
-/// `FUSED_DM` `psi`; writes `work`. Grid `(ny / rows, nf_max * nmode)`, block
-/// `FUSED_ROW_THREADS`, dynamic shared memory `rows` row FFTs ([`FFT_SKEW`]).
+/// psi` as `kernels::dm_reflect` computes it, or under `FUSED_RAAR` `w = raar_mix(psi,
+/// iterate, PO)` as `kernels::raar_iterate` does; under `FUSED_ITERATE` `w` also goes to
+/// `iterate`. Reads `obj`, `probe`, `views`, under `FUSED_DM` `psi` and under `FUSED_RAAR`
+/// `psi` and `iterate`; writes `work`, and `iterate` under `FUSED_ITERATE`. Grid `(ny /
+/// rows, nf_max * nmode)`, block `FUSED_ROW_THREADS`, dynamic shared memory `rows` row FFTs
+/// ([`FFT_SKEW`]).
 ///
 /// # Safety
 ///
@@ -335,8 +359,8 @@ pub unsafe fn rows_fwd<const NX: u32>(
 
 /// [`rows_fwd`] with the shifted probe: `W_p = IDFT_x(T)` of the stored row of plane `fl *
 /// nprobe + p` of `shift` ([`shift_pre`]) in place of `P_p q`, so `w = O W` (`R = (2 - a) O
-/// W - (1 - a) psi` under `FUSED_DM`). Reads `shift` in place of `probe`; launch as
-/// [`rows_fwd`].
+/// W - (1 - a) psi` under `FUSED_DM`, `raar_mix(psi, iterate, O W)` under `FUSED_RAAR`).
+/// Reads `shift` in place of `probe`; launch as [`rows_fwd`].
 ///
 /// # Safety
 ///
@@ -372,6 +396,7 @@ unsafe fn rows_fwd_with<const NX: u32, const SHIFT: bool>(
     let y = (ys + ny / 2) % ny;
     let row = kl as usize * n + (ys * nx) as usize;
     let dm = cfg.flags & FUSED_DM != 0;
+    let (raar, iterate) = (cfg.flags & FUSED_RAAR != 0, cfg.flags & FUSED_ITERATE != 0);
     let (a, b) = (2.0 - cfg.alpha, 1.0 - cfg.alpha);
     let mut r = [0.0f32; 2 * FFT_EPT_MAX as usize];
     unsafe {
@@ -401,6 +426,13 @@ unsafe fn rows_fwd_with<const NX: u32, const SHIFT: bool>(
             if dm {
                 let s = load_c(p.psi, row + xs as usize);
                 w = (a * w.0 - b * s.0, a * w.1 - b * s.1);
+            }
+            if raar {
+                let at = row + xs as usize;
+                w = raar_mix(load_c(p.psi, at), load_c(p.iterate, at), w, cfg.beta);
+            }
+            if iterate {
+                store_c(p.iterate, row + xs as usize, w);
             }
             r[2 * i as usize] = w.0;
             r[2 * i as usize + 1] = w.1;

@@ -309,6 +309,7 @@ impl LsqmlKernels {
         let cfg = FusedCfg {
             flags: FORWARD,
             alpha: 0.0,
+            beta: 0.0,
         };
         let m = &self.base.module;
         self.base.launch(ctx, &reads, &[work.storage()], |stream| {
@@ -397,6 +398,7 @@ impl LsqmlKernels {
         let cfg = FusedCfg {
             flags: ROWS_INV,
             alpha: 0.0,
+            beta: 0.0,
         };
         let m = &self.base.module;
         self.base.launch(ctx, &reads, &[work.storage()], |stream| {
@@ -720,6 +722,7 @@ fn null_ptrs() -> FusedPtrs {
         views: std::ptr::null(),
         counts: std::ptr::null(),
         psi: std::ptr::null_mut(),
+        iterate: std::ptr::null_mut(),
         work: std::ptr::null_mut(),
         probe_q: std::ptr::null_mut(),
         probe_power: std::ptr::null_mut(),

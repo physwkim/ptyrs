@@ -3,7 +3,7 @@
 //!
 //! The operators follow PyNX `ptycho/cpu_operator.py` (far field, no background, no
 //! multibeam, no direct-beam frames) and run in `f64` / complex `f64` in one fixed order; rPIE
-//! follows pty-chi `reconstructors/pie.py`. [`Ptycho`] chains them into AP, DM and rPIE. A
+//! follows pty-chi `reconstructors/pie.py`. [`Ptycho`] chains them into AP, DM, RAAR and rPIE. A
 //! [`Plan`] runs a sequence of those loops on either backend. Their linear operators are
 //! admitted as [`LinearOp`]s through [`register`]'s dot test.
 //!
@@ -55,7 +55,9 @@ pub use ops::{
 };
 pub use plan::{Backend, Params, Plan, Step};
 pub use propagate::{AngularSpectrum, Fresnel, Optics, Propagator, Wavefield};
-pub use ptycho::{Algorithm, ApParams, DmParams, LlkRecord, MlParams, Ptycho, RpieParams};
+pub use ptycho::{
+    Algorithm, ApParams, DmParams, LlkRecord, MlParams, Ptycho, RaarParams, RpieParams,
+};
 
 /// Errors from building or running the engine.
 #[derive(Debug, thiserror::Error)]
