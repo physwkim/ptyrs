@@ -22,7 +22,7 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use ptyrs::base::frc::Frc;
-use ptyrs::base::{C64, Object, Probe, Scan};
+use ptyrs::base::{Object, Probe, Scan};
 use ptyrs::engine::{DmParams, Llk, Ptycho, RaarParams};
 
 #[path = "../tests/common/engine/scenario.rs"]
@@ -149,7 +149,7 @@ fn compare(dir: &Path) -> Result<(), Error> {
     let (truth, _) = ptyrs::io::read_modes(dir.join("truth.h5"))?;
     let corners = read_rows::<2>(&dir.join("views.txt"), 0)?;
     let region = [0, 1].map(|d| centres(corners.iter().map(|c| c[d] as usize)));
-    let shape = [region[0].len(), region[1].len()];
+    let shape = truth.0.plane_shape();
     println!(
         "FRC after {n} cycles over rows {:?}, columns {:?}:",
         region[0], region[1]
@@ -159,7 +159,7 @@ fn compare(dir: &Path) -> Result<(), Error> {
         ("truth vs ptyrs", &truth, &rust_final),
         ("truth vs PtyPy", &truth, &ptypy_final),
     ] {
-        let f = Frc::compute(&crop(a, &region), &crop(b, &region), shape)?;
+        let f = Frc::compute(a.plane(0), b.plane(0), shape, &region)?;
         let rings = &f.rings[1..];
         let min = rings.iter().map(|r| r.frc).fold(f64::INFINITY, f64::min);
         let mean = rings.iter().map(|r| r.frc).sum::<f64>() / rings.len() as f64;
@@ -234,17 +234,6 @@ fn ptypy_state(
 fn centres(corners: impl Iterator<Item = usize> + Clone) -> Range<usize> {
     let lo = corners.clone().min().unwrap_or(0) + FRAME / 2;
     lo..corners.max().unwrap_or(0) + FRAME / 2 + 1
-}
-
-fn crop(o: &Object, [rows, cols]: &[Range<usize>; 2]) -> Vec<C64> {
-    let nx = o.0.dims()[2];
-    rows.clone()
-        .flat_map(|y| {
-            o.0.as_slice()[y * nx + cols.start..y * nx + cols.end]
-                .iter()
-                .copied()
-        })
-        .collect()
 }
 
 /// The normalised Poisson, Gaussian, Euclidian LLK and photon count.
