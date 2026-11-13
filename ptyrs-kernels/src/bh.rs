@@ -296,8 +296,11 @@ pub mod bh_kernels {
             if count != MASKED {
                 let root = (count as f32).sqrt();
                 let t = unsafe { far_term(f.far, fl * nmode * n + at, n, nmode, cg, root) };
-                for (a, t) in acc.iter_mut().zip(t) {
-                    *a += t;
+                // Unrolled, as every loop over `acc`, so it stays in registers.
+                #[unroll]
+                for h in 0..BH_HESS {
+                    let h = h as usize;
+                    acc[h] += t[h];
                 }
             }
             d += PIXEL_THREADS as usize;
@@ -718,8 +721,11 @@ pub mod bh_kernels {
             if count != MASKED {
                 let root = (count as f32).sqrt();
                 let t = unsafe { far_term(f.far, fl * nmode * n + k, n, nmode, cg, root) };
-                for (a, t) in acc.iter_mut().zip(t) {
-                    *a += t;
+                // Unrolled, as every loop over `acc`, so it stays in registers.
+                #[unroll]
+                for h in 0..BH_HESS {
+                    let h = h as usize;
+                    acc[h] += t[h];
                 }
             }
             let (e, fr) = unsafe { ramp_at(mv.offsets, pos, k, ny, nx) };
