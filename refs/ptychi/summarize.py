@@ -30,6 +30,11 @@ def load():
     return runs
 
 
+def sweep_name(name):
+    """The sweep run whose settings a run has: a timing_ run repeats them on the timing GPU."""
+    return name.removeprefix("timing_")
+
+
 def summary_row(d):
     last = d["curve"][-1]
     noise = d["settings"].get("noise", "gaussian")
@@ -98,12 +103,12 @@ def main():
 
     sweeps = {}
     for noise in ("poisson", "gaussian"):
-        rows = {n: r for n, r in runs.items() if n.startswith(f"sweep_lsqml_{noise}_b")}
+        rows = {n: r for n, r in runs.items() if sweep_name(n).startswith(f"sweep_lsqml_{noise}_b")}
         if rows:
             sweeps[noise] = optimum(rows)
     out["lsqml_batch"] = sweeps
 
-    bh = {n: r for n, r in runs.items() if n.startswith("bh_sweep_")}
+    bh = {n: r for n, r in runs.items() if sweep_name(n).startswith("bh_sweep_")}
     if bh:
         out["bh"] = {"chosen": BH_CHOSEN, **optimum(bh)}
 
