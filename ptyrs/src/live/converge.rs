@@ -7,7 +7,7 @@
 //! positions alone. Outside it pixels are lit only by the probe's edges,
 //! which constrain them in neither run: on a 6×6 raster landed in batches,
 //! the live object holds the whole array's outer rings at 0.95 against the
-//! offline one, the scanned region's at 0.992. [`Clock::whole`] gives the
+//! offline one, the scanned region's at 0.995. [`Clock::whole`] gives the
 //! whole array's figure, to report beside the clock.
 //!
 //! [`SourceStats::scan_end`]: crate::live::pipeline::SourceStats::scan_end
@@ -71,8 +71,6 @@ impl From<CoreError> for ClockError {
 /// One scan's clock, started at its end.
 pub struct Clock {
     offline: Vec<C64>,
-    /// `offline` over the region.
-    cropped: Vec<C64>,
     shape: [usize; 2],
     region: [Range<usize>; 2],
     scan_end: i64,
@@ -92,22 +90,7 @@ impl Clock {
         region: [Range<usize>; 2],
         scan_end: i64,
     ) -> Result<Self, ClockError> {
-        if region
-            .iter()
-            .zip(shape)
-            .any(|(r, n)| r.is_empty() || r.end > n)
-        {
-            return Err(CoreError::Invalid(format!(
-                "region {region:?} is empty or leaves the {shape:?} object"
-            ))
-            .into());
-        }
-        let cropped = crop(offline, shape, &region)?;
-        let f = Frc::compute(
-            &cropped,
-            &crop(half, shape, &region)?,
-            region_shape(&region),
-        )?;
+        let f = Frc::compute(offline, half, shape, &region)?;
         if let Some(ring) = below(&f) {
             return Err(ClockError::Moving {
                 ring,
@@ -117,7 +100,6 @@ impl Clock {
         }
         Ok(Self {
             offline: offline.to_vec(),
-            cropped,
             shape,
             region,
             scan_end,
@@ -145,37 +127,21 @@ impl Clock {
     /// The lowest ring's FRC of `live` against the offline object over the
     /// region, the figure [`Self::check`] holds to [`MATCH`].
     pub fn region_frc(&self, live: &[C64]) -> Result<f64, CoreError> {
-        let live = crop(live, self.shape, &self.region)?;
-        let f = Frc::compute(&self.cropped, &live, region_shape(&self.region))?;
+        let f = Frc::compute(&self.offline, live, self.shape, &self.region)?;
         Ok(lowest(&f))
     }
 
     /// The lowest ring's FRC of `live` against the offline object over the
     /// whole array, region or not.
     pub fn whole(&self, live: &[C64]) -> Result<f64, CoreError> {
-        Ok(lowest(&Frc::compute(&self.offline, live, self.shape)?))
+        let all = self.shape.map(|n| 0..n);
+        Ok(lowest(&Frc::compute(
+            &self.offline,
+            live,
+            self.shape,
+            &all,
+        )?))
     }
-}
-
-/// `region`'s pixels of an object of `shape`.
-fn crop(obj: &[C64], shape: [usize; 2], region: &[Range<usize>; 2]) -> Result<Vec<C64>, CoreError> {
-    let [ny, nx] = shape;
-    if obj.len() != ny * nx {
-        return Err(CoreError::Invalid(format!(
-            "{} pixels for a {shape:?} object",
-            obj.len()
-        )));
-    }
-    let [rows, cols] = region;
-    Ok(rows
-        .clone()
-        .flat_map(|y| &obj[y * nx..][cols.clone()])
-        .copied()
-        .collect())
-}
-
-fn region_shape(region: &[Range<usize>; 2]) -> [usize; 2] {
-    region.clone().map(|r| r.len())
 }
 
 /// The first ring under [`SETTLED`].
