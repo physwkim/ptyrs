@@ -39,10 +39,11 @@ pub struct Features {
     /// and `O` the object it was made from): per frame and axis, over the frame's views and
     /// pixels, `Δ = 0.3·Re Σ conj(c)·O·∂W / (Σ |O·∂W|² + max_f Σ |O·∂W|²)` (0 where that is
     /// 0) clipped to ±0.1, then `d += Δ − mean_f Δ`, which keeps the mean offset. pty-chi's
-    /// clip at 10 MADs of `Δ` is left out. ML and rPIE refuse it.
+    /// clip at 10 MADs of `Δ` is left out. ML refuses it.
     ///
     /// [`crate::engine::Lsqml`] models it on every slice through the moved probe and steps it
-    /// as pty-chi's LSQML does, after each batch's object and probe update:
+    /// as pty-chi's LSQML does, after each batch's object and probe update, and
+    /// [`Ptycho::rpie`](crate::engine::Ptycho::rpie) as pty-chi's PIE does:
     /// [`crate::engine::LsqmlBatch::position_directions`] times 0.3 at the batch's frames, 0
     /// at the others, each axis clipped to `min(10·mean_f |dx − mean dx|, 0.1)` over all
     /// frames, with no mean subtracted. Both models are pty-chi's while every `|d| ≤ 1/2`,
@@ -398,6 +399,66 @@ pub fn obj_probe_shift_to_psi(p: &Ptycho, views: &[View], offsets: &[[f64; 2]], 
 /// pty-chi's position step size and per-axis update limit, in object pixels.
 pub(crate) const POSITION_STEP: f64 = 0.3;
 pub(crate) const POSITION_LIMIT: f64 = 0.1;
+/// pty-chi's floor of the position directions' denominator maximum, on its probe of
+/// `P·q/sqrt(intensity scale)`.
+pub(crate) const EPS_POSITION: f64 = 1e-6;
+
+/// pty-chi `PositionCorrection.get_gradient_update`'s sums over one frame (Fourier
+/// differentiation of the PATCH window): per axis `[y, x]`, `num = Σ Re(conj(∂O·w)·chi)` and
+/// `den = Σ |∂O·w|²`, with `∂O` the derivative of the natural-layout window `patch` taken as
+/// periodic, and `w` the wave it multiplies and `chi` its correction, both in exit-wave layout.
+pub(crate) fn gradient_sums(patch: &[C64], w: &[C64], chi: &[C64], fft: &Fft2) -> [[f64; 2]; 2] {
+    let [ny, nx] = fft.shape();
+    let grad = [0, 1].map(|axis| {
+        let mut g = patch.to_vec();
+        fft.forward(&mut g);
+        for (j, g) in g.iter_mut().enumerate() {
+            let f = [j / nx, j % nx];
+            *g *= C64::new(0.0, 2.0 * PI * freq(f[axis], [ny, nx][axis]));
+        }
+        fft.inverse(&mut g);
+        g
+    });
+    let mut sums = [[0.0; 2]; 2];
+    for (j, (w, c)) in w.iter().zip(chi).enumerate() {
+        let (i, _, _) = natural(j, ny, nx);
+        for (axis, g) in grad.iter().enumerate() {
+            let u = g[i] * w;
+            sums[0][axis] += (u.conj() * c).re;
+            sums[1][axis] += u.norm_sqr();
+        }
+    }
+    sums
+}
+
+/// pty-chi's gradient position direction `[Δy, Δx]` of every frame of a batch from its
+/// [`gradient_sums`]: `num / (den + max(max_batch den, eps))` per axis.
+pub(crate) fn gradient_directions(sums: &[[[f64; 2]; 2]], eps: f64) -> Vec<[f64; 2]> {
+    let max = [0, 1].map(|axis| sums.iter().map(|s| s[1][axis]).fold(eps, f64::max));
+    sums.iter()
+        .map(|[num, den]| [0, 1].map(|axis| num[axis] / (den[axis] + max[axis])))
+        .collect()
+}
+
+/// pty-chi's position step (`ProbePositions.step_optimizer`) from the batch `frames`'
+/// [`gradient_directions`] `delta` on the offsets `d` of every frame: its SGD step
+/// `dx = 0.3·delta` at the batch's frames, 0 at the others, then each axis clipped to
+/// `min(10·mean |dx − mean dx|, 0.1)` over every frame.
+pub(crate) fn batch_position_step(d: &mut [[f64; 2]], frames: &[usize], delta: &[[f64; 2]]) {
+    let mut dx = vec![[0.0; 2]; d.len()];
+    for (&f, delta) in frames.iter().zip(delta) {
+        dx[f] = delta.map(|v| POSITION_STEP * v);
+    }
+    let n = d.len() as f64;
+    for axis in 0..2 {
+        let mean = dx.iter().map(|x| x[axis]).sum::<f64>() / n;
+        let mad = dx.iter().map(|x| (x[axis] - mean).abs()).sum::<f64>() / n;
+        let limit = (10.0 * mad).min(POSITION_LIMIT);
+        for (d, x) in d.iter_mut().zip(&dx) {
+            d[axis] += x[axis].clamp(-limit, limit);
+        }
+    }
+}
 
 /// A probe under [`Features::position`]: its spectra and every view's moved probe `W`, which
 /// take the place of `q·P` in the operators of [`crate::engine::ops`].
@@ -457,6 +518,12 @@ impl Shifted {
         if let (Some(inertia), Some((num, norm))) = (obj_inertia, obj_acc) {
             blend(object, &num, &norm, inertia);
         }
+    }
+
+    /// `W` of the `k`th view of the views `self` was made for, in exit-wave layout.
+    pub(crate) fn wave(&self, k: usize) -> &[C64] {
+        let n = self.shape[0] * self.shape[1];
+        &self.waves[k * n..(k + 1) * n]
     }
 
     /// The object window of view `v` at shifted index `j`.

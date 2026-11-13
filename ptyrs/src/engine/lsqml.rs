@@ -9,11 +9,11 @@
 //! `1/(2σ)² = 1`. The exit waves reach the detector through an [`Optics`]; pty-chi's probe is
 //! the engine's over `√k`, `k` the propagator's [`crate::engine::Propagator::intensity_scale`].
 
-use std::f64::consts::PI;
-
 use crate::base::{AddrTable, C64, Object, Probe, Stack, View};
 
-use crate::engine::features::{POSITION_LIMIT, POSITION_STEP, freq, move_planes};
+use crate::engine::features::{
+    EPS_POSITION, batch_position_step, gradient_directions, gradient_sums, move_planes,
+};
 use crate::engine::ops::{natural, obj_probe_to_psi};
 use crate::engine::{
     Cost, EngineError, Features, Fft2, Observed, Optics, ProbeVariation, SliceWaves, random_batches,
@@ -24,9 +24,6 @@ use crate::engine::{
 const EPS_AMPLITUDE: f64 = 1e-9;
 const EPS_POISSON: f64 = 1e-6;
 const EPS_XI: f64 = 1e-5;
-/// pty-chi's floor on the position direction's denominator, `1e-6` on pty-chi's probe, times
-/// `k` on the engine's.
-const EPS_POSITION: f64 = 1e-6;
 /// pty-chi's `λ0` per pixel and mode in the step-size system times the probe's pixel count:
 /// `λ0 = 1.2e-7/(ny·nx)` on pty-chi's probe, `1.2e-7·k/(ny·nx)` on the engine's.
 const LAMBDA0: f64 = 1.2e-7;
@@ -252,34 +249,18 @@ impl<'a> LsqmlBatch<'a> {
                 let patch: Vec<C64> = (0..n)
                     .map(|i| o[(v.oy as usize + i / nx) * nxo + v.ox as usize + i % nx])
                     .collect();
-                let grad = [0, 1].map(|axis| {
-                    let mut g = patch.clone();
-                    fft.forward(&mut g);
-                    for (j, g) in g.iter_mut().enumerate() {
-                        let f = [j / nx, j % nx];
-                        *g *= C64::new(0.0, 2.0 * PI * freq(f[axis], [ny, nx][axis]));
-                    }
-                    fft.inverse(&mut g);
-                    g
-                });
-                let (w, chi) = (incident.plane(k), &self.chi[s][k * n..(k + 1) * n]);
-                let mut sums = [[0.0; 2]; 2];
-                for (j, c) in chi.iter().enumerate() {
-                    let (i, _, _) = natural(j, ny, nx);
-                    for (axis, g) in grad.iter().enumerate() {
-                        let u = g[i] * w[i] * q[i];
-                        sums[0][axis] += (u.conj() * c).re;
-                        sums[1][axis] += u.norm_sqr();
-                    }
-                }
-                sums
+                let w = incident.plane(k);
+                let wq: Vec<C64> = (0..n)
+                    .map(|j| {
+                        let (i, _, _) = natural(j, ny, nx);
+                        w[i] * q[i]
+                    })
+                    .collect();
+                gradient_sums(&patch, &wq, &self.chi[s][k * n..(k + 1) * n], &fft)
             })
             .collect();
         let eps = EPS_POSITION * self.optics.propagator().intensity_scale();
-        let max = [0, 1].map(|axis| sums.iter().map(|s| s[1][axis]).fold(eps, f64::max));
-        sums.iter()
-            .map(|[num, den]| [0, 1].map(|axis| num[axis] / (den[axis] + max[axis])))
-            .collect()
+        gradient_directions(&sums, eps)
     }
 
     /// Per slice and frame `a_obj`, and per frame `a_probe`, along the object directions
@@ -396,26 +377,6 @@ pub fn illumination(views: &[View], obj_dims: [usize; 3], probe: &Probe) -> Stac
         }
     }
     out
-}
-
-/// pty-chi's position step from the batch `frames`' [`LsqmlBatch::position_directions`]
-/// `delta` on the offsets `d` of every frame: its SGD step `dx = 0.3·delta` at the batch's
-/// frames, 0 at the others, then each axis clipped to `min(10·mean |dx − mean dx|, 0.1)`
-/// over every frame.
-fn position_step(d: &mut [[f64; 2]], frames: &[usize], delta: &[[f64; 2]]) {
-    let mut dx = vec![[0.0; 2]; d.len()];
-    for (&f, delta) in frames.iter().zip(delta) {
-        dx[f] = delta.map(|v| POSITION_STEP * v);
-    }
-    let n = d.len() as f64;
-    for axis in 0..2 {
-        let mean = dx.iter().map(|x| x[axis]).sum::<f64>() / n;
-        let mad = dx.iter().map(|x| (x[axis] - mean).abs()).sum::<f64>() / n;
-        let limit = (10.0 * mad).min(POSITION_LIMIT);
-        for (d, x) in d.iter_mut().zip(&dx) {
-            d[axis] += x[axis].clamp(-limit, limit);
-        }
-    }
 }
 
 /// MATLAB `trimmean(x, 10)` as pty-chi's `trim_mean`: the mean without the
@@ -556,7 +517,7 @@ impl Lsqml {
             .zip(d_probe.as_slice())
             .for_each(|(x, d)| *x += sp * d);
         if let (Some(d), Some(delta)) = (&mut self.features.position, d_pos) {
-            position_step(d, &frames, &delta);
+            batch_position_step(d, &frames, &delta);
         }
         LsqmlStep {
             frames,
