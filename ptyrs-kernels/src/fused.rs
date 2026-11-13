@@ -100,13 +100,14 @@ pub struct FusedCfg {
 }
 
 /// The stack slot, of `count`, of a frame pass block: its grid row `blockIdx.y`, or `count -
-/// 1 - blockIdx.y` under `FUSED_DOWN`; `None` past `count`, as in a stack short of `nf_max`.
+/// 1 - blockIdx.y` under [`FUSED_DOWN`] in `flags`; `None` past `count`, as in a stack short
+/// of `nf_max`.
 #[device]
-fn walk_slot(cfg: FusedCfg, count: u32) -> Option<u32> {
+pub(crate) fn walk_slot(flags: u32, count: u32) -> Option<u32> {
     let by = thread::blockIdx_y();
     if by >= count {
         None
-    } else if cfg.flags & FUSED_DOWN != 0 {
+    } else if flags & FUSED_DOWN != 0 {
         Some(count - 1 - by)
     } else {
         Some(by)
@@ -337,7 +338,7 @@ unsafe fn rows_fwd_with<const NX: u32, const SHIFT: bool>(
     cfg: FusedCfg,
 ) {
     let (f0, nf) = unsafe { stack_frames(ctl, g) };
-    let Some(kl) = walk_slot(cfg, nf * g.nmode) else {
+    let Some(kl) = walk_slot(cfg.flags, nf * g.nmode) else {
         return;
     };
     let (ny, nx) = (g.ny, NX);
@@ -430,7 +431,7 @@ pub unsafe fn cols<const NY: u32, const TERMS: u32>(
     cfg: FusedCfg,
 ) {
     let (f0, nf) = unsafe { stack_frames(ctl, g) };
-    let Some(fl) = walk_slot(cfg, nf) else {
+    let Some(fl) = walk_slot(cfg.flags, nf) else {
         return;
     };
     let (ny, nx, nmode) = (NY, g.nx, g.nmode);
@@ -655,7 +656,7 @@ pub unsafe fn rows_inv<const NX: u32>(
     cfg: FusedCfg,
 ) {
     let (f0, nf) = unsafe { stack_frames(ctl, g) };
-    let Some(fl) = walk_slot(cfg, nf) else {
+    let Some(fl) = walk_slot(cfg.flags, nf) else {
         return;
     };
     let (ny, nx) = (g.ny, NX);
@@ -875,7 +876,7 @@ pub unsafe fn shift_pre<const NY: u32>(
     cfg: FusedCfg,
 ) {
     let (f0, nf) = unsafe { stack_frames(ctl, g) };
-    let Some(fl) = walk_slot(cfg, nf) else {
+    let Some(fl) = walk_slot(cfg.flags, nf) else {
         return;
     };
     let (ny, nx) = (NY, g.nx);
@@ -1008,7 +1009,7 @@ unsafe fn shift_rows_inv_with<const NX: u32, const SUMS: bool>(
     cfg: FusedCfg,
 ) {
     let (f0, nf) = unsafe { stack_frames(ctl, g) };
-    let Some(fl) = walk_slot(cfg, nf) else {
+    let Some(fl) = walk_slot(cfg.flags, nf) else {
         return;
     };
     let (ny, nx) = (g.ny, NX);
@@ -1284,7 +1285,7 @@ pub unsafe fn shift_post<const NY: u32>(
     cfg: FusedCfg,
 ) {
     let (f0, nf) = unsafe { stack_frames(ctl, g) };
-    let Some(fl) = walk_slot(cfg, nf) else {
+    let Some(fl) = walk_slot(cfg.flags, nf) else {
         return;
     };
     let (ny, nx) = (NY, g.nx);

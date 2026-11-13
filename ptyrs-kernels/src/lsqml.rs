@@ -14,7 +14,7 @@ use cuda_device::{async_copy, device, shared::DynamicSharedArray, thread};
 use cuda_host::cuda_module;
 
 use crate::bh::{BhObs, store_sums};
-use crate::fused::{FUSED_COLS, FUSED_DOWN, col_fft};
+use crate::fused::{FUSED_COLS, col_fft, walk_slot};
 use crate::grad::{GAMMA_CHUNK, ObjProbePtrs};
 use crate::pixel::{
     MASKED, PIXEL_THREADS, StackCtl, StackGeom, ViewAddr, cmul, cmul_conj, load_c, psi_index,
@@ -39,21 +39,6 @@ pub const LSQML_DOTS: u32 = 6;
 pub const LSQML_XI: u32 = 2;
 /// Floats of one frame's step record: `a_far`, `a_obj`, `a_probe`.
 pub const LSQML_REC: u32 = 3;
-
-/// The stack slot, of `count`, of a frame pass block: its grid row `blockIdx.y`, or `count -
-/// 1 - blockIdx.y` under [`FUSED_DOWN`] in `flags`; `None` past `count`, as in a stack short
-/// of `nf_max`.
-#[device]
-fn frame_slot(flags: u32, count: u32) -> Option<u32> {
-    let by = thread::blockIdx_y();
-    if by >= count {
-        None
-    } else if flags & FUSED_DOWN != 0 {
-        Some(count - 1 - by)
-    } else {
-        Some(by)
-    }
-}
 
 /// pty-chi's offsets: on `√icalc` in the Gaussian residual, on `icalc` in the Poisson
 /// residual and in the Poisson `xi`.
@@ -112,7 +97,7 @@ pub struct LsqmlPre {
 
 /// The column pass, `fused::cols`' thread and shared-memory layout without its reduction
 /// slots: column FFT of the row transforms in columns `u = blockIdx.x * FUSED_COLS + c` of
-/// every mode `m` of frame `fl`, [`frame_slot`] of `flags`, then per far-field pixel `icalc =
+/// every mode `m` of frame `fl`, `walk_slot` of `flags`, then per far-field pixel `icalc =
 /// Σ_m |Psi_m|² / n` in ascending `m`, written at detector pixel `j` under [`LSQML_ICALC`].
 /// Under [`LSQML_CHI`] every mode is scaled by `−a_far[f0 + fl] c / n`, `c` the cost's
 /// residual of `obs` and `icalc`, 0 where masked, inverse column-FFT'd and stored; without it
@@ -128,7 +113,7 @@ pub struct LsqmlPre {
 #[device]
 pub unsafe fn cols<const NY: u32>(p: LsqmlCols, ctl: *const StackCtl, g: StackGeom, flags: u32) {
     let (f0, nf) = unsafe { stack_frames(ctl, g) };
-    let Some(fl) = frame_slot(flags, nf) else {
+    let Some(fl) = walk_slot(flags, nf) else {
         return;
     };
     let (ny, nx, nmode) = (NY, g.nx, g.nmode);
@@ -229,7 +214,7 @@ pub unsafe fn cols<const NY: u32>(p: LsqmlCols, ctl: *const StackCtl, g: StackGe
     }
 }
 
-/// The step-size sums of chunk `c = blockIdx.x` of frame `f0 + fl`, `fl` [`frame_slot`] of
+/// The step-size sums of chunk `c = blockIdx.x` of frame `f0 + fl`, `fl` `walk_slot` of
 /// `flags`, of [`lsqml_kernels::LoadedModule::lsqml_dots`], under `SHIFT` with the moved
 /// probe `W` of `w` in place of `P q` in `u`. `red` is `LSQML_DOTS` segments of
 /// `PIXEL_THREADS` shared floats.
@@ -258,7 +243,7 @@ unsafe fn dots<const SHIFT: bool>(
     let (ny, nx, nmode) = (g.ny, g.nx, g.nmode as usize);
     let n = ny as usize * nx as usize;
     // The whole block leaves together, before its first barrier.
-    let Some(fl) = frame_slot(flags, nf) else {
+    let Some(fl) = walk_slot(flags, nf) else {
         return;
     };
     let fl = fl as usize;
@@ -308,7 +293,7 @@ unsafe fn dots<const SHIFT: bool>(
 pub mod lsqml_kernels {
     use super::{
         EPS_XI, LAMBDA0, LSQML_DOTS, LSQML_REC, LSQML_XI, LsqmlCols, LsqmlDots, LsqmlFar, LsqmlPre,
-        cols, dots, frame_slot, store_sums,
+        cols, dots, store_sums, walk_slot,
     };
     use crate::bh::BhObs;
     use crate::grad::GAMMA_CHUNK;
@@ -486,7 +471,7 @@ pub mod lsqml_kernels {
     }
 
     /// The Poisson `a_far` sums of chunk `c = blockIdx.x` of frame `f0 + fl`, `fl`
-    /// [`frame_slot`] of `flags`, at `a′ = *prev`: over its unmasked detector pixels `d` in
+    /// `walk_slot` of `flags`, at `a′ = *prev`: over its unmasked detector pixels `d` in
     /// `c * GAMMA_CHUNK .. min((c + 1) * GAMMA_CHUNK, n)`, with `xi = 1 − obs / (icalc +
     /// 1e-5)`, `Σ xi (icalc − obs / (1 − a′ xi))` and `Σ xi² icalc`, to `out[2p .. 2p + 2]`,
     /// `p = (f0 + fl) * nchunk + c`.
@@ -510,7 +495,7 @@ pub mod lsqml_kernels {
         let (f0, nf) = unsafe { stack_frames(ctl, g) };
         let n = g.ny as usize * g.nx as usize;
         // The whole block leaves together, before its first barrier.
-        let Some(fl) = frame_slot(flags, nf) else {
+        let Some(fl) = walk_slot(flags, nf) else {
             return;
         };
         let fl = fl as usize;
@@ -615,7 +600,7 @@ pub mod lsqml_kernels {
         }
     }
 
-    /// The step-size sums of chunk `c = blockIdx.x` of frame `f0 + fl`, `fl` [`frame_slot`] of
+    /// The step-size sums of chunk `c = blockIdx.x` of frame `f0 + fl`, `fl` `walk_slot` of
     /// `flags`, over its modes and the pixels `d` in `c * GAMMA_CHUNK .. min((c + 1) *
     /// GAMMA_CHUNK, n)`: with view `w = views[(f0 + fl) * nmode + m]` and `q = exp(i quad
     /// r²)`, `u = dO_w P_w q` and `v = O_w dP_w q` (`x` the object and probe, `d` their
