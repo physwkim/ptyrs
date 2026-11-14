@@ -335,7 +335,8 @@ pub struct FusedInputs<'a> {
 /// The model intensity `calc` the counts are compared with, from the far field `Psi` of a
 /// frame's exit waves: `Default` is `I = sum_m |Psi_m|^2 / n` and leaves every pass's
 /// arithmetic as it is; each field set adds its term. Every pass that compares with the
-/// counts uses `calc`: the LLK, the projection and the gradient.
+/// counts uses `calc`: the LLK, the projection and the gradient. `Psi` is the far field `F
+/// w` of the exit waves `w`, or under [`Self::exit`] the propagator's `F V w`.
 #[derive(Clone, Copy, Default)]
 pub struct Model<'a> {
     /// Per-frame intensity scale `s`, `[nframe]`: `calc = s[f] I` for frame `f`.
@@ -345,6 +346,10 @@ pub struct Model<'a> {
     pub background: Option<&'a DeviceBuffer<f32>>,
     /// The position model: each frame's probe modes moved by the frame's offsets.
     pub shift: Option<Shift<'a>>,
+    /// The propagator's plane stage `V`: every pass that forms the detector field applies it
+    /// to the row transforms ahead of its column pass, and the projection and the gradient
+    /// its adjoint to the correction's after it. Unset is the far field, `V = 1`.
+    pub exit: Option<ExitPass<'a>>,
 }
 
 /// The position model. Probe mode `p` of frame `f` is `W_p = IDFT(A_p e_f)` (unnormalized
@@ -651,8 +656,10 @@ impl Kernels {
     /// not change a bit; only tiles whose run holds a view of the stack are read and
     /// written). With a
     /// [`Model::shift`], the shifted probe takes the place of `P_p q` and `sums.shift` gets
-    /// its sums. Up to nine launches, twelve with a shift; a stack with `nf == 0` writes
-    /// nothing but `bufs`.
+    /// its sums. Under a [`Model::exit`] the projection is at the detector of the propagator
+    /// `D F V`: its stage ahead of the column pass and the adjoint after it, so DM's and
+    /// RAAR's mixes stay in the exit plane. Up to nine launches, twelve with a shift, and the
+    /// stage's; a stack with `nf == 0` writes nothing but `bufs`.
     pub fn fused_project(
         &self,
         ctx: &ExecutionContext,
@@ -783,12 +790,16 @@ impl Kernels {
                 run.rows_fwd(bufs, carried, p, fwd)?;
             }
         }
+        run.stage(&bufs.work, false)?;
         let cfg = FusedCfg {
             flags: pass | run.model_flags() | far.flags(),
             ..fwd
         };
         run.cols(&bufs.work, bufs, &far, p, cfg)?;
         run.far_sums(bufs, far)?;
+        // The column pass left the correction's row transforms at the detector; DM's
+        // remainder joins it in the exit plane, in the inverse row pass.
+        run.stage(&bufs.work, true)?;
         // RAAR's inverse pass only stores `P(R)`: its mix is all in the forward pass.
         let cfg = FusedCfg {
             flags: dm_flag | shift_flags,
@@ -924,7 +935,9 @@ impl Kernels {
 
     /// The stack's far sums of the far field of `PO`, the one `obj_probe_to_psi` and the FFT
     /// give (with a [`Model::shift`], of `O W`), the LLK partials as [`Self::llk`] gives
-    /// them. Up to five launches, six with a shift; writes nothing but `far` and `bufs`.
+    /// them; under a [`Model::exit`], of the field at the detector of the propagator `D F
+    /// V`, its stage on the row transforms between the row and the column pass. Up to five
+    /// launches, six with a shift, and the stage's; writes nothing but `far` and `bufs`.
     pub fn fused_llk(
         &self,
         ctx: &ExecutionContext,
@@ -932,20 +945,6 @@ impl Kernels {
         stack: StackRef<'_>,
         bufs: &mut FusedBufs,
         far: FarSums<'_>,
-    ) -> Result<(), Error> {
-        self.propagated_llk(ctx, inputs, stack, bufs, far, None)
-    }
-
-    /// [`Self::fused_llk`] of the field at the detector of a propagator `D F V`: `exit`'s
-    /// stage `V` on the row transforms, between the row and the column pass.
-    pub fn propagated_llk(
-        &self,
-        ctx: &ExecutionContext,
-        inputs: &FusedInputs<'_>,
-        stack: StackRef<'_>,
-        bufs: &mut FusedBufs,
-        far: FarSums<'_>,
-        exit: Option<ExitPass<'_>>,
     ) -> Result<(), Error> {
         let bufs = &*bufs;
         let (run, shift) = Run::new(self, ctx, *inputs, stack, bufs)?;
@@ -964,18 +963,14 @@ impl Kernels {
             }
             None => run.rows_fwd(bufs, Carried::default(), p, FusedCfg::default())?,
         }
-        if let Some(e) = exit {
-            let d = inputs.views.dims();
-            e.kernels
-                .exit_on(ctx, d, stack, e.stage, &bufs.work, false)?;
-        }
+        run.stage(&bufs.work, false)?;
         run.rows_llk(&bufs.work, bufs, far, p)
     }
 
-    /// The column half of [`Self::propagated_llk`] over `rows`, `[nf_max * nmode, ny, nx]`,
-    /// in place of the row transforms it makes: the far sums of the field whose row
-    /// transforms, any stage applied, the caller left there. Of `inputs` the object, the
-    /// probe and a [`Model::shift`] are not read; `rows` is.
+    /// The column half of [`Self::fused_llk`] over `rows`, `[nf_max * nmode, ny, nx]`, in
+    /// place of the row transforms it makes: the far sums of the field whose row transforms,
+    /// any stage applied, the caller left there. Of `inputs` the object, the probe, a
+    /// [`Model::shift`] and a [`Model::exit`] are not read; `rows` is.
     pub fn rows_llk(
         &self,
         ctx: &ExecutionContext,
@@ -988,6 +983,7 @@ impl Kernels {
         let bufs = &*bufs;
         let model = Model {
             shift: None,
+            exit: None,
             ..inputs.model
         };
         let (run, _) = Run::new(self, ctx, FusedInputs { model, ..*inputs }, stack, bufs)?;
@@ -1245,6 +1241,17 @@ impl<'a> Run<'a> {
             sh,
             down: Cell::new(true),
         })
+    }
+
+    /// The [`Model::exit`] stage on the stack's row transforms in `work`, with `adjoint` its
+    /// adjoint: the one place a pass that forms the detector field takes it from.
+    fn stage(&self, work: &DeviceBuffer<C32>, adjoint: bool) -> Result<(), Error> {
+        let Some(e) = self.inputs.model.exit else {
+            return Ok(());
+        };
+        let d = self.inputs.views.dims();
+        e.kernels
+            .exit_on(self.ctx, d, self.stack, e.stage, work, adjoint)
     }
 
     /// `cfg` for the next frame pass, walking the stack opposite to the pass before it.
