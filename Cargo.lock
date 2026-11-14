@@ -2084,8 +2084,6 @@ dependencies = [
 [[package]]
 name = "cubecl-runtime"
 version = "0.11.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cc18c95e3b851f50f807c40056e02b70d46773ca478b97ae4e93516d97cf9933"
 dependencies = [
  "buildid",
  "bytemuck",
@@ -5714,6 +5712,7 @@ dependencies = [
  "rand 0.8.8",
  "rand_chacha 0.3.1",
  "rand_distr 0.4.3",
+ "rayon",
  "rust-hdf5",
  "rustfft",
  "serde",
