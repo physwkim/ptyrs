@@ -835,6 +835,7 @@ fn owned_views_update_only_the_owned_tiles() {
                 probe: None,
                 shift: ShiftSums {
                     probe: Some(&mut sh.probe),
+                    step: false,
                     position: Some(&mut sh.pos),
                     position_den: Some(&mut sh.den),
                 },
@@ -4269,6 +4270,7 @@ impl ShiftOut {
             probe: None,
             shift: ShiftSums {
                 probe: Some(&mut self.probe),
+                step: false,
                 position: Some(&mut self.pos),
                 position_den: den.then_some(&mut self.den),
             },

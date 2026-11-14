@@ -2121,6 +2121,237 @@ pub mod kernels {
     pub unsafe fn fused_shift_probe_rows_512(sums: SumPtrs, out: SumPtrs, ny: u32, quad: f32) {
         unsafe { crate::fused::shift_probe_rows::<512>(sums, out, ny, quad) }
     }
+    /// [`crate::fused::shift_norm`] for 64-point rows.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::shift_norm`].
+    #[kernel]
+    pub unsafe fn fused_shift_norm_64(
+        p: FusedPtrs,
+        norm: *mut f32,
+        ctl: *const StackCtl,
+        g: StackGeom,
+        cfg: FusedCfg,
+    ) {
+        unsafe { crate::fused::shift_norm::<64>(p, norm, ctl, g, cfg) }
+    }
+    /// [`crate::fused::shift_norm`] for 128-point rows.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::shift_norm`].
+    #[kernel]
+    pub unsafe fn fused_shift_norm_128(
+        p: FusedPtrs,
+        norm: *mut f32,
+        ctl: *const StackCtl,
+        g: StackGeom,
+        cfg: FusedCfg,
+    ) {
+        unsafe { crate::fused::shift_norm::<128>(p, norm, ctl, g, cfg) }
+    }
+    /// [`crate::fused::shift_norm`] for 256-point rows.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::shift_norm`].
+    #[kernel]
+    pub unsafe fn fused_shift_norm_256(
+        p: FusedPtrs,
+        norm: *mut f32,
+        ctl: *const StackCtl,
+        g: StackGeom,
+        cfg: FusedCfg,
+    ) {
+        unsafe { crate::fused::shift_norm::<256>(p, norm, ctl, g, cfg) }
+    }
+    /// [`crate::fused::shift_norm`] for 512-point rows.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::shift_norm`].
+    #[kernel]
+    pub unsafe fn fused_shift_norm_512(
+        p: FusedPtrs,
+        norm: *mut f32,
+        ctl: *const StackCtl,
+        g: StackGeom,
+        cfg: FusedCfg,
+    ) {
+        unsafe { crate::fused::shift_norm::<512>(p, norm, ctl, g, cfg) }
+    }
+
+    /// The direction of a probe step from its sums over `n` elements `[nprobe, ny, nx]`: with
+    /// `reg = inertia * f32::from_bits(*max_bits)` and `d = max(den + reg, 1e-12)`, `num`
+    /// becomes `s = num / d` and `den` zero, consumed; `parts[2 * blockIdx.x]` gets the
+    /// block's `sum |num|^2 / d` and `parts[2 * blockIdx.x + 1]` its `reg sum |s|^2`, fixed
+    /// trees over the block. One thread per element, block `(PIXEL_THREADS, 1, 1)`.
+    ///
+    /// # Safety
+    ///
+    /// `sums.num` holds `n` complex values, `sums.den` `n` floats, `max_bits` one `u32`,
+    /// `parts` two floats per block.
+    #[kernel]
+    pub unsafe fn probe_step_dir(
+        sums: SumPtrs,
+        n: u32,
+        max_bits: *const u32,
+        inertia: f32,
+        parts: *mut f32,
+    ) {
+        static mut RED: SharedArray<f32, 512> = SharedArray::UNINIT;
+        let (g, t) = (global_index(), thread::threadIdx_x() as usize);
+        let (mut slope, mut curv) = (0.0f32, 0.0f32);
+        if g < n as usize {
+            unsafe {
+                let reg = inertia * f32::from_bits(*max_bits);
+                let d = (*sums.den.add(g) + reg).max(1e-12);
+                let a = load_c(sums.num, g);
+                let s = (a.0 / d, a.1 / d);
+                slope = (a.0 * a.0 + a.1 * a.1) / d;
+                curv = reg * (s.0 * s.0 + s.1 * s.1);
+                store_c(sums.num, g, s);
+                *sums.den.add(g) = 0.0;
+            }
+        }
+        let s = (&raw mut RED).cast::<f32>();
+        unsafe {
+            *s.add(t) = slope;
+            *s.add(PIXEL_THREADS as usize + t) = curv;
+            block_sum::<2>(s);
+            if t == 0 {
+                let at = 2 * thread::blockIdx_x() as usize;
+                *parts.add(at) = *s;
+                *parts.add(at + 1) = *s.add(PIXEL_THREADS as usize);
+            }
+        }
+    }
+
+    /// `out[p * gridDim.x + c]` = the sum of chunk `c = blockIdx.x` of the `len` floats of
+    /// probe mode `p = blockIdx.y` in `norm` `[nprobe, len]`: elements `c * len / gridDim.x
+    /// .. (c + 1) * len / gridDim.x`, each thread its stride in ascending order, then a fixed
+    /// tree over the block. Block `(PIXEL_THREADS, 1, 1)`.
+    ///
+    /// # Safety
+    ///
+    /// `norm` holds `gridDim.y * len` floats, `out` `gridDim.y * gridDim.x`.
+    #[kernel]
+    pub unsafe fn probe_step_norm(norm: *const f32, len: u32, out: *mut f32) {
+        static mut RED: SharedArray<f32, 256> = SharedArray::UNINIT;
+        let t = thread::threadIdx_x() as usize;
+        let (c, nc) = (thread::blockIdx_x() as u64, thread::gridDim_x() as u64);
+        let pm = thread::blockIdx_y() as usize;
+        let (lo, hi) = (c * len as u64 / nc, (c + 1) * len as u64 / nc);
+        let mut a = 0.0f32;
+        let mut i = lo as usize + t;
+        while i < hi as usize {
+            a += unsafe { *norm.add(pm * len as usize + i) };
+            i += PIXEL_THREADS as usize;
+        }
+        let s = (&raw mut RED).cast::<f32>();
+        unsafe {
+            *s.add(t) = a;
+            block_sum::<1>(s);
+            if t == 0 {
+                *out.add(pm * nc as usize + c as usize) = *s;
+            }
+        }
+    }
+
+    /// The length of a probe step along its direction, per probe mode `p = blockIdx.x`: with
+    /// `slope` and `curv` the sums of [`probe_step_dir`]'s `nb` pairs of the mode and `norm`
+    /// that of its `nc` chunk sums of [`probe_step_norm`], `alpha[p] = slope / (curv + norm)`
+    /// if `slope > 0`, else 0. Each thread sums its stride in ascending order, then a fixed
+    /// tree over the block. Block `(PIXEL_THREADS, 1, 1)`.
+    ///
+    /// # Safety
+    ///
+    /// `parts` holds `gridDim.x * nb` pairs, `chunks` `gridDim.x * nc` floats, `alpha`
+    /// `gridDim.x`.
+    ///
+    /// [`probe_step_dir`]: LoadedModule::probe_step_dir
+    /// [`probe_step_norm`]: LoadedModule::probe_step_norm
+    #[kernel]
+    pub unsafe fn probe_step_alpha(
+        parts: *const f32,
+        nb: u32,
+        chunks: *const f32,
+        nc: u32,
+        alpha: *mut f32,
+    ) {
+        static mut RED: SharedArray<f32, 768> = SharedArray::UNINIT;
+        let t = thread::threadIdx_x() as usize;
+        let pm = thread::blockIdx_x() as usize;
+        let seg = PIXEL_THREADS as usize;
+        let (mut slope, mut curv, mut norm) = (0.0f32, 0.0f32, 0.0f32);
+        let mut i = t;
+        while i < nb as usize {
+            let at = 2 * (pm * nb as usize + i);
+            unsafe {
+                slope += *parts.add(at);
+                curv += *parts.add(at + 1);
+            }
+            i += seg;
+        }
+        let mut i = t;
+        while i < nc as usize {
+            norm += unsafe { *chunks.add(pm * nc as usize + i) };
+            i += seg;
+        }
+        let s = (&raw mut RED).cast::<f32>();
+        unsafe {
+            *s.add(t) = slope;
+            *s.add(seg + t) = curv;
+            *s.add(2 * seg + t) = norm;
+            block_sum::<3>(s);
+            if t == 0 {
+                let (slope, curv) = (*s, *s.add(seg) + *s.add(2 * seg));
+                *alpha.add(pm) = if slope > 0.0 { slope / curv } else { 0.0 };
+            }
+        }
+    }
+
+    /// `step[p, i] *= alpha[p]` over the `n` elements of `[nprobe, npix]`: the probe step of
+    /// [`probe_step_alpha`]'s length. One thread per element.
+    ///
+    /// # Safety
+    ///
+    /// `step` holds `n` complex values, `alpha` `n / npix` floats.
+    ///
+    /// [`probe_step_alpha`]: LoadedModule::probe_step_alpha
+    #[kernel]
+    pub unsafe fn probe_step_scale(step: *mut f32, n: u32, npix: u32, alpha: *const f32) {
+        let g = global_index();
+        if g >= n as usize {
+            return;
+        }
+        unsafe {
+            let a = *alpha.add(g / npix as usize);
+            let s = load_c(step, g);
+            store_c(step, g, (a * s.0, a * s.1));
+        }
+    }
+
+    /// `x += step` over `n` complex elements, then `step` is zeroed, consumed. One thread
+    /// per element.
+    ///
+    /// # Safety
+    ///
+    /// `x` and `step` hold `n` complex values.
+    #[kernel]
+    pub unsafe fn probe_step_add(x: *mut f32, step: *mut f32, n: u32) {
+        let g = global_index();
+        if g >= n as usize {
+            return;
+        }
+        unsafe {
+            let (a, s) = (load_c(x, g), load_c(step, g));
+            store_c(x, g, (a.0 + s.0, a.1 + s.1));
+            store_c(step, g, (0.0, 0.0));
+        }
+    }
+
     /// [`crate::fused::gather_shifted`].
     ///
     /// # Safety

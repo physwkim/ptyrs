@@ -210,6 +210,7 @@ impl Run {
                 probe: None,
                 shift: ShiftSums {
                     probe: Some(&mut self.shifted),
+                    step: false,
                     position: Some(&mut self.position),
                     position_den: Some(&mut self.position_den),
                 },
