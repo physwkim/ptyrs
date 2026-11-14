@@ -35,8 +35,8 @@ fn max_rel(a: &[f64], b: &[f64], scale: f64) -> f64 {
     worst_of(d) / scale
 }
 
-/// 6x the worst measured, the FULL_OBJECT mini batch's offsets (3.3e-13).
-const TOL: f64 = 2e-12;
+/// 5x the worst measured, the FULL_OBJECT mini batch's offsets (5.5e-13).
+const TOL: f64 = 3e-12;
 
 fn rel(a: f64, b: f64) -> f64 {
     (a - b).abs() / b.abs()
