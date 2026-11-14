@@ -8,7 +8,9 @@ not (package(ptyrs) & (
   | test(=dist::exchange::tests::add_f32_and_max_u32_read_peers)
   | test(=dist::exchange::tests::copy_runs_reads_every_peer)
   | test(=dist::exchange::tests::halo_pull_reads_every_peer)
+  | test(=dist::live::tests::every_gpu_copies_from_the_ring_in_place)
   | test(=dist::live::tests::gpus_exchange_the_halo_as_it_grows)
+  | test(=dist::live::tests::the_uploader_fills_each_store_in_the_order_the_plan_numbers_its_frames)
   | test(=dist::live_ap::tests::gpus_iterate_a_live_scan_as_one_gpu)
   | test(=dist::p2p::tests::bench_times_every_ordered_pair_and_checks_the_data)
   | test(=dist::synth::synthetic_accumulation_is_bit_identical_on_1_2_and_4_gpus)
@@ -22,5 +24,6 @@ not (package(ptyrs) & (
   | test(=dist::worker::tests::fence_orders_side_stream_work)
   | test(=dist::worker::tests::init_failure_is_reported)
   | test(=dist::worker::tests::run_returns_after_every_worker_is_done_with_its_borrows)
+  | test(=live::follow::tests::gpus_follow_a_stream_as_one_gpu_replays_its_landings)
 ))
 '''
