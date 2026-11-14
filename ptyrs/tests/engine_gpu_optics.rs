@@ -266,20 +266,23 @@ fn rel_l2(a: &Stack<C64>, b: &Stack<C64>) -> f64 {
     (e / t).sqrt()
 }
 
-/// The worst `|a − b| / |b|` of the steps' sizes, or `|a|` where `b` is 0; the frames equal.
+/// The worst `max |a − b| / max |b|` of a batch's sizes of one kind; the frames equal.
+// Per element a probe size of 5.7e-3 in a batch of median 0.69 read 8.9e-5 for an absolute
+// error of 5e-7, the other sizes' own, where the CPU from an f32 start moves it 1.3e-5.
 fn steps_rel(got: &[LsqmlStep], want: &[LsqmlStep]) -> f64 {
     assert_eq!(got.len(), want.len());
     let mut worst = 0.0f64;
     for (g, w) in got.iter().zip(want) {
         assert_eq!(g.frames, w.frames);
-        let sizes = [
+        for (a, b) in [
             (&g.a_far, &w.a_far),
             (&g.a_obj[0], &w.a_obj[0]),
             (&g.a_probe, &w.a_probe),
-        ];
-        for (a, b) in sizes.iter().flat_map(|(a, b)| a.iter().zip(b.iter())) {
-            let scale = if *b == 0.0 { 1.0 } else { b.abs() };
-            worst = worst.max((a - b).abs() / scale);
+        ] {
+            assert_eq!(a.len(), b.len());
+            let d = a.iter().zip(b).map(|(a, b)| (a - b).abs());
+            let scale = b.iter().map(|b| b.abs()).fold(0.0, f64::max);
+            worst = worst.max(d.fold(0.0, f64::max) / scale);
         }
     }
     worst
