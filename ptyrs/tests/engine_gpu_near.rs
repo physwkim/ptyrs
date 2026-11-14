@@ -3,10 +3,10 @@
 //! offsets enter by.
 
 use cuda_core::CudaContext;
-use ptyrs::base::{C64, Counts, Geometry, Scan, Stack, required_obj_shape, sim};
+use ptyrs::base::{C64, Counts, Geometry, Object, Probe, Scan, Stack, required_obj_shape, sim};
 use ptyrs::engine::{
-    ApParams, BhParams, Cost, DmParams, EngineError, Features, GpuPtycho, LsqmlParams, MlParams,
-    Optics, Ptycho, RaarParams, RpieParams, Sampling,
+    ApParams, BhParams, Cost, DmParams, EngineError, Features, GpuOptions, GpuPtycho, LsqmlParams,
+    MlParams, Optics, Ptycho, RaarParams, RpieParams, Sampling,
 };
 use ptyrs::gpu::FUSED_SIDES;
 
@@ -226,8 +226,8 @@ fn projections_match_cpu_under_every_propagator() {
                     cpu.set_features(f.clone()).unwrap();
                 }
                 on_cpu(&mut cpu, NCYCLE);
-                let want: Vec<f64> = cpu.history().iter().map(|r| r.llk.poisson).collect();
-                assert_eq!(want.len(), NCYCLE);
+                assert_eq!(cpu.history().len(), NCYCLE);
+                let want = Ended::cpu(&cpu);
                 for graph in [false, true] {
                     let what = format!("{name} {} features {label} graph {graph}", c.name);
                     let mut gpu = c.gpu(graph);
@@ -235,48 +235,150 @@ fn projections_match_cpu_under_every_propagator() {
                         gpu.set_features(f).unwrap();
                     }
                     on_gpu(&mut gpu, NCYCLE);
-                    let got: Vec<f64> = gpu.history().iter().map(|r| r.llk.poisson).collect();
-                    assert_eq!(got.len(), NCYCLE, "{what}");
-                    let (gf, cf) = (gpu.features().unwrap(), cpu.features());
-                    let scaled = |f: &Features| -> Vec<f64> {
-                        let (s, b) = (f.scale.iter().flatten(), f.background.iter().flatten());
-                        s.chain(b).copied().collect()
+                    assert_close(&what, &Ended::gpu(&gpu), &want, TOL);
+                }
+            }
+        }
+    }
+}
+
+/// A run's LLK records, object, probe and features after its calls.
+struct Ended {
+    llk: Vec<f64>,
+    object: Object,
+    probe: Probe,
+    features: Features,
+}
+
+impl Ended {
+    fn cpu(p: &Ptycho) -> Self {
+        Self {
+            llk: p.history().iter().map(|r| r.llk.poisson).collect(),
+            object: p.object().clone(),
+            probe: p.probe().clone(),
+            features: p.features().clone(),
+        }
+    }
+
+    fn gpu(g: &GpuPtycho) -> Self {
+        Self {
+            llk: g.history().iter().map(|r| r.llk.poisson).collect(),
+            object: g.object().unwrap(),
+            probe: g.probe().unwrap(),
+            features: g.features().unwrap(),
+        }
+    }
+}
+
+/// `got`'s records, object, probe, scale and background, and offsets (over the largest)
+/// against `want`'s, each within its `tol`.
+fn assert_close(what: &str, got: &Ended, want: &Ended, tol: [f64; 5]) {
+    assert_eq!(got.llk.len(), want.llk.len(), "{what}");
+    let scaled = |f: &Features| -> Vec<f64> {
+        let (s, b) = (f.scale.iter().flatten(), f.background.iter().flatten());
+        s.chain(b).copied().collect()
+    };
+    let moved =
+        |f: &Features| -> Vec<f64> { f.position.iter().flatten().flatten().copied().collect() };
+    let worst = |g: Vec<f64>, w: Vec<f64>| match w.is_empty() {
+        true => 0.0,
+        false => {
+            assert_eq!(g.len(), w.len(), "{what}");
+            worst_of(g.iter().zip(&w).map(|(g, w)| (g - w).abs()))
+                / worst_of(w.iter().map(|w| w.abs()))
+        }
+    };
+    let (gf, wf) = (&got.features, &want.features);
+    let errs = [
+        worst_of(
+            got.llk
+                .iter()
+                .zip(&want.llk)
+                .map(|(g, w)| (g - w).abs() / w),
+        ),
+        rel_l2(&got.object, &want.object),
+        rel_l2(&got.probe, &want.probe),
+        worst(scaled(gf), scaled(wf)),
+        worst(moved(gf), moved(wf)),
+    ];
+    eprintln!(
+        "{what}: llk {:.2e} object {:.2e} probe {:.2e} features {:.2e} offsets {:.2e}, llk {:.4e} -> {:.4e}",
+        errs[0],
+        errs[1],
+        errs[2],
+        errs[3],
+        errs[4],
+        want.llk[0],
+        want.llk[want.llk.len() - 1]
+    );
+    for ((name, e), tol) in ["llk", "object", "probe", "features", "offsets"]
+        .iter()
+        .zip(errs)
+        .zip(tol)
+    {
+        assert!(e < tol, "{what} {name}: {e:e}");
+    }
+}
+
+/// AP, DM and RAAR under each propagator with drawn offsets that sample the object, alone
+/// and with a scale and a background, against the CPU's under `Sampling::FullObject`,
+/// eagerly and from graphs, over stacks of 8 frames and a last of 6, as
+/// [`projections_match_cpu_under_every_propagator`] holds them; DM's and RAAR's carried exit
+/// waves in f16 against f32 over two cycles, from graphs.
+#[test]
+fn full_object_projections_match_cpu_under_every_propagator() {
+    const NCYCLE: usize = 8;
+    // Measured worst: LLK 1.8e-5, object 2.0e-3, probe 5.8e-4, features 1.5e-5, offsets
+    // 8.0e-6, from DM's drawn offsets under Fresnel, whose LLK rises on the CPU too.
+    const TOL: [f64; 5] = [6e-5, 6e-3, 2e-3, 5e-5, 2.5e-5];
+    const NCYCLE_F16: usize = 2;
+    // Measured worst: LLK 3.6e-4, object 2.0e-3, probe 4.0e-4, features 1.9e-4, offsets
+    // 1.4e-4.
+    const TOL_F16: [f64; 5] = [1.2e-3, 6e-3, 1.2e-3, 6e-4, 4.5e-4];
+    let frame = FUSED_SIDES[0] as usize;
+    let moved = Features {
+        position: Some(drawn_offsets()),
+        ..Features::default()
+    };
+    let modelled = Features {
+        scale: Some((0..NPOS).map(|f| 1.0 + 0.05 * (f as f64).sin()).collect()),
+        background: Some(vec![0.3; frame * frame]),
+        ..moved.clone()
+    };
+    let ctx = CudaContext::new(0).unwrap();
+    for c in cases() {
+        for (name, on_cpu, on_gpu) in PROJECTIONS {
+            for (label, features) in [("position", &moved), ("modelled", &modelled)] {
+                let run = |graph, psi_f16, ncycle| {
+                    let options = GpuOptions {
+                        graph,
+                        psi_f16,
+                        ..OPTIONS
                     };
-                    let moved = |f: &Features| -> Vec<f64> {
-                        f.position.iter().flatten().flatten().copied().collect()
-                    };
-                    let worst = |g: Vec<f64>, w: Vec<f64>| match w.is_empty() {
-                        true => 0.0,
-                        false => {
-                            assert_eq!(g.len(), w.len(), "{what}");
-                            worst_of(g.iter().zip(&w).map(|(g, w)| (g - w).abs()))
-                                / worst_of(w.iter().map(|w| w.abs()))
-                        }
-                    };
-                    let errs = [
-                        worst_of(got.iter().zip(&want).map(|(g, w)| (g - w).abs() / w)),
-                        rel_l2(&gpu.object().unwrap(), cpu.object()),
-                        rel_l2(&gpu.probe().unwrap(), cpu.probe()),
-                        worst(scaled(&gf), scaled(cf)),
-                        worst(moved(&gf), moved(cf)),
-                    ];
-                    eprintln!(
-                        "{what}: llk {:.2e} object {:.2e} probe {:.2e} features {:.2e} offsets {:.2e}, llk {:.4e} -> {:.4e}",
-                        errs[0],
-                        errs[1],
-                        errs[2],
-                        errs[3],
-                        errs[4],
-                        want[0],
-                        want[NCYCLE - 1]
-                    );
-                    for ((name, e), tol) in ["llk", "object", "probe", "features", "offsets"]
-                        .iter()
-                        .zip(errs)
-                        .zip(TOL)
-                    {
-                        assert!(e < tol, "{what} {name}: {e:e}");
-                    }
+                    let (object, probe, optics) = (c.object.clone(), c.probe.clone(), c.optics());
+                    let mut gpu =
+                        GpuPtycho::with_optics(&ctx, &c.scan, &optics, object, probe, options)
+                            .unwrap();
+                    gpu.set_sampling(Sampling::FullObject).unwrap();
+                    gpu.set_features(features).unwrap();
+                    on_gpu(&mut gpu, ncycle);
+                    Ended::gpu(&gpu)
+                };
+                let (object, probe) = (c.object.clone(), c.probe.clone());
+                let mut cpu = Ptycho::with_optics(&c.scan, c.optics(), object, probe).unwrap();
+                cpu.set_sampling(Sampling::FullObject);
+                cpu.set_features(features.clone()).unwrap();
+                on_cpu(&mut cpu, NCYCLE);
+                assert_eq!(cpu.history().len(), NCYCLE);
+                let want = Ended::cpu(&cpu);
+                for graph in [false, true] {
+                    let what = format!("{name} {} {label} graph {graph}", c.name);
+                    assert_close(&what, &run(graph, false, NCYCLE), &want, TOL);
+                }
+                if name != "AP" {
+                    let what = format!("{name} {} {label} f16 against f32", c.name);
+                    let want = run(true, false, NCYCLE_F16);
+                    assert_close(&what, &run(true, true, NCYCLE_F16), &want, TOL_F16);
                 }
             }
         }
@@ -432,12 +534,11 @@ fn sampling_round_trip_rebuilds_the_same_run() {
     assert_eq!(toggled.2, kept.2, "offsets");
 }
 
-/// While a position samples the object, which of the GPU passes only the LLK pass models
-/// yet, every algorithm and ML's gradients fail and change nothing, after a call of each,
-/// which built its run: switched to `Sampling::FullObject` after calls under `Patch` with the
-/// position, or the position set after calls under `FullObject` without one. Back under
-/// `Patch` the same calls give the records, arrays, gradients and offsets of a run never
-/// switched, bit for bit.
+/// While a position samples the object, the calls whose GPU passes do not model it yet fail
+/// and change nothing, after a call of each, which built its run: switched to
+/// `Sampling::FullObject` after calls under `Patch` with the position, or the position set
+/// after calls under `FullObject` without one. Back under `Patch` the same calls give the
+/// records, arrays, gradients and offsets of a run never switched, bit for bit.
 #[test]
 fn full_object_position_fails_every_pass_until_patch() {
     let c = &cases()[0];
@@ -452,10 +553,7 @@ fn full_object_position_fails_every_pass_until_patch() {
         seed: 7,
     };
     type Call<'a> = &'a dyn Fn(&mut GpuPtycho) -> Result<Vec<f64>, EngineError>;
-    let calls: [(&str, Call); 7] = [
-        ("AP", &|g| g.ap(&AP, 1).map(|()| Vec::new())),
-        ("DM", &|g| g.dm(&DM, 1).map(|()| Vec::new())),
-        ("RAAR", &|g| g.raar(&RAAR, 1).map(|()| Vec::new())),
+    let calls: &[(&str, Call)] = &[
         ("rPIE", &|g| g.rpie(&RPIE, 1).map(|()| Vec::new())),
         ("ML", &|g| {
             g.ml(&MlParams::default(), 1).map(|()| Vec::new())

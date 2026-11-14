@@ -7,7 +7,10 @@
 use cuda_device::{device, thread};
 use cuda_host::cuda_module;
 
-use crate::pixel::PIXEL_THREADS;
+use crate::pixel::{
+    PIXEL_THREADS, PositionPartial, PsiPtr, StackCtl, StackGeom, ViewAddr, cmul, cmul_conj, load_c,
+    load_psi, psi_index, quad_phase, stack_frames,
+};
 
 /// Blocks of every `cg_beta_parts` launch, and so the partial pairs each launch writes.
 pub const CG_BLOCKS: u32 = 1024;
@@ -46,9 +49,27 @@ pub struct NormPtrs {
     pub background: *const f32,
 }
 
+/// What [`grad_kernels::LoadedModule::window_position_sums`] reads and writes: `psi` a
+/// stack's exit waves `[nf_max * nmode, ny, nx]`, `probe` `[nprobe, ny, nx]`, `views` the
+/// scan's window views, `win` the stack's object windows and `dy`, `dx` their derivatives
+/// over the position's `y` and `x`, each the object `[nobj, nf_max * ny, nx]` the window views
+/// read, and `num`, `den` each frame's sums `[nframe]`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct WindowSums {
+    pub psi: PsiPtr,
+    pub probe: *const f32,
+    pub views: *const ViewAddr,
+    pub win: *const f32,
+    pub dy: *const f32,
+    pub dx: *const f32,
+    pub num: *mut PositionPartial,
+    pub den: *mut PositionPartial,
+}
+
 #[cuda_module]
 pub mod grad_kernels {
-    use super::{GAMMA_CHUNK, GammaPtrs, NormPtrs, ObjProbePtrs};
+    use super::{GAMMA_CHUNK, GammaPtrs, NormPtrs, ObjProbePtrs, WindowSums};
     use crate::pixel::*;
     use crate::*;
     use cuda_device::SharedArray;
@@ -555,6 +576,37 @@ pub mod grad_kernels {
         }
     }
 
+    /// Each frame's position sums of a stack whose offsets move the object's windows, not the
+    /// probe: frame `f0 + fl`, `fl = blockIdx.x`, gets per axis `num[f0 + fl] = Σ Re(conj(psi
+    /// − W O) W ∂O)` and `den[f0 + fl] = Σ |W ∂O|²` over its views' pixels, with `W` the
+    /// view's probe mode times the far-field phase, `O` its window and `∂O` the window's
+    /// derivative over the axis, and `psi` its exit wave. Each thread sums its pixels in
+    /// order, then a fixed tree sums the block. Frames past `nf` write nothing.
+    ///
+    /// # Safety
+    ///
+    /// `p` as [`WindowSums`] says, `psi` f32 pairs, the windows `nobj * nyo * nxo` values
+    /// each, `g` the window views' geometry, `ctl` one entry; grid `(nf_max, 1, 1)`, block
+    /// `(PIXEL_THREADS, 1, 1)`.
+    #[kernel]
+    pub unsafe fn window_position_sums(p: WindowSums, ctl: *const StackCtl, g: StackGeom) {
+        static mut RED: SharedArray<f32, 1024> = SharedArray::UNINIT;
+        unsafe { super::window_position_sums::<false>(p, ctl, g, (&raw mut RED).cast()) }
+    }
+
+    /// [`window_position_sums`] of f16 waves ([`load_psi`]).
+    ///
+    /// # Safety
+    ///
+    /// As [`window_position_sums`], with `psi` holding f16 pairs.
+    ///
+    /// [`window_position_sums`]: LoadedModule::window_position_sums
+    #[kernel]
+    pub unsafe fn window_position_sums_f16(p: WindowSums, ctl: *const StackCtl, g: StackGeom) {
+        static mut RED: SharedArray<f32, 1024> = SharedArray::UNINIT;
+        unsafe { super::window_position_sums::<true>(p, ctl, g, (&raw mut RED).cast()) }
+    }
+
     /// PyNX `cu_linear_comb_fcfc_gamma`: with `gamma = gamma_pair[0] / gamma_pair[1]`,
     /// `x += gamma d` if `gamma` is finite, else `x` stays and `d = -h` (with `h` this cycle's
     /// gradient, as `cg_beta_parts` leaves it).
@@ -595,6 +647,89 @@ fn position_axis_step(num: f32, den: f32, step: f32, limit: f32) -> f32 {
         }
     } else {
         0.0
+    }
+}
+
+/// `grad_kernels::window_position_sums` of waves in the format `HALF` names ([`load_psi`]),
+/// `s` its `4 * PIXEL_THREADS` shared floats.
+///
+/// # Safety
+///
+/// As `grad_kernels::window_position_sums`.
+#[device]
+unsafe fn window_position_sums<const HALF: bool>(
+    p: WindowSums,
+    ctl: *const StackCtl,
+    g: StackGeom,
+    s: *mut f32,
+) {
+    let WindowSums {
+        psi,
+        probe,
+        views,
+        win,
+        dy,
+        dx,
+        num,
+        den,
+    } = p;
+    let (f0, nf) = unsafe { stack_frames(ctl, g) };
+    let fl = thread::blockIdx_x();
+    // The whole block leaves together, before its first barrier.
+    if fl >= nf {
+        return;
+    }
+    let (ny, nx, nmode) = (g.ny, g.nx, g.nmode);
+    let n = ny as usize * nx as usize;
+    let (nxo, t) = (g.nxo as usize, thread::threadIdx_x() as usize);
+    let seg = PIXEL_THREADS as usize;
+    // `Re conj(c) u_y`, `Re conj(c) u_x`, `|u_y|^2`, `|u_x|^2`, `c = psi - W O`, `u = W ∂O`.
+    let mut acc = [0.0f32; 4];
+    for m in 0..nmode {
+        let kl = (fl * nmode + m) as usize;
+        let v = unsafe { *views.add(f0 as usize * nmode as usize + kl) };
+        let corner = (v.obj as usize * g.nyo as usize + v.oy as usize) * nxo + v.ox as usize;
+        let mut i = t;
+        while i < n {
+            let (y, x) = ((i / nx as usize) as u32, (i % nx as usize) as u32);
+            let at = corner + y as usize * nxo + x as usize;
+            let (p, o, d, ps) = unsafe {
+                (
+                    load_c(probe, v.probe as usize * n + i),
+                    load_c(win, at),
+                    [load_c(dy, at), load_c(dx, at)],
+                    load_psi::<HALF>(psi, kl * n + psi_index(y, x, ny, nx)),
+                )
+            };
+            let w = cmul(p, quad_phase(g.quad, y, x, ny, nx));
+            let wo = cmul(w, o);
+            let c = (ps.0 - wo.0, ps.1 - wo.1);
+            #[unroll]
+            for ax in 0..2 {
+                let u = cmul(w, d[ax]);
+                acc[ax] += cmul_conj(c, u).0;
+                acc[2 + ax] += u.0 * u.0 + u.1 * u.1;
+            }
+            i += seg;
+        }
+    }
+    unsafe {
+        *s.add(t) = acc[0];
+        *s.add(seg + t) = acc[1];
+        *s.add(2 * seg + t) = acc[2];
+        *s.add(3 * seg + t) = acc[3];
+        crate::block_sum::<4>(s);
+        if t == 0 {
+            let at = (f0 + fl) as usize;
+            *num.add(at) = PositionPartial {
+                dy: *s,
+                dx: *s.add(seg),
+            };
+            *den.add(at) = PositionPartial {
+                dy: *s.add(2 * seg),
+                dx: *s.add(3 * seg),
+            };
+        }
     }
 }
 

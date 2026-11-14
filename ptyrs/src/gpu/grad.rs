@@ -17,13 +17,14 @@
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig};
 pub use ptyrs_kernels::grad::{CG_BLOCKS, GAMMA_CHUNK};
-use ptyrs_kernels::grad::{GammaPtrs, NormPtrs, ObjProbePtrs, grad_kernels};
+use ptyrs_kernels::grad::{GammaPtrs, NormPtrs, ObjProbePtrs, WindowSums, grad_kernels};
 use ptyrs_kernels::pixel::{PIXEL_THREADS, PositionPartial, SumPtrs};
 
 use crate::gpu::ops::grid_1d;
+use crate::gpu::psi::check_waves;
 use crate::gpu::{
     C32, Error, Kernels, LlkPartial, Model, ScalePartial, StackCtl, StackRef, UpdateSums, ViewDims,
-    Views, check_len, dptr,
+    Views, Waves, check_len, dptr,
 };
 
 /// The line-search exit-wave stacks of [`GradKernels::gamma_fields`], each of `nf_max *
@@ -33,6 +34,16 @@ pub struct GammaStacks {
     pub po: DeviceBuffer<C32>,
     pub a: DeviceBuffer<C32>,
     pub b: DeviceBuffer<C32>,
+}
+
+/// A stack's object windows and the views that read them: `blocks` holds three blocks
+/// `[nobj, nf_max, ny, nx]` of [`crate::gpu::sampling::ObjectSampler::windows`], the windows
+/// and their derivatives over the position's `y` and `x`, and `views`
+/// ([`crate::gpu::sampling::window_views`]) read each block as their object.
+#[derive(Clone, Copy)]
+pub struct StackWindows<'a> {
+    pub views: &'a Views,
+    pub blocks: &'a DeviceBuffer<C32>,
 }
 
 /// The counts `[nframe, ny, nx]` that [`GradKernels::gamma_frames`] compares the line
@@ -617,6 +628,68 @@ impl GradKernels {
                         .cg_scale_step(stream, config, dptr(scale), dptr(sums), n)
                 }
             })
+    }
+
+    /// Each frame's position sums of the stack's exit waves `psi` against the object windows
+    /// its offsets sample: `num` and `den` `[nframe]` take per axis `Σ Re(conj(psi − W O) W
+    /// ∂O)` and `Σ |W ∂O|²` at the stack's frames, with `W` the probe mode times the
+    /// far-field phase, `O` the window and `∂O` its derivative over the position's axis.
+    /// `win`'s views read each of its blocks as the fused passes read the object, so `psi`
+    /// from the windows gives `num = 0`. pty-chi's `position_sums` of a full-object scan.
+    pub fn window_position_sums(
+        &self,
+        ctx: &ExecutionContext,
+        win: StackWindows<'_>,
+        stack: StackRef<'_>,
+        psi: &dyn Waves,
+        probe: &DeviceBuffer<C32>,
+        sums: [&mut DeviceBuffer<PositionPartial>; 2],
+    ) -> Result<(), Error> {
+        let dims = win.views.dims();
+        let g = dims.geom(stack)?;
+        let (n, nf_max, len) = (dims.n(), g.nf_max as usize, dims.obj_len());
+        let [num, den] = sums;
+        check_waves("psi", psi, nf_max * dims.nmode as usize * n)?;
+        check_len("probe", probe, dims.nprobe as usize * n)?;
+        check_len("win", win.blocks, 3 * len)?;
+        check_len("num", num, dims.nframe as usize)?;
+        check_len("den", den, dims.nframe as usize)?;
+        let config = LaunchConfig {
+            grid_dim: (g.nf_max, 1, 1),
+            block_dim: (PIXEL_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let reads = [
+            psi.raw(),
+            probe.storage(),
+            win.views.addr().storage(),
+            win.blocks.storage(),
+            stack.storage(),
+        ];
+        let writes = [num.storage(), den.storage()];
+        self.base.launch(ctx, &reads, &writes, |stream| {
+            // SAFETY: lengths checked above; `Views::new` checked every view lies inside a
+            // block with valid mode indices; one PIXEL_THREADS block per frame.
+            unsafe {
+                let block = |b: usize| dptr::<C32, f32>(win.blocks).wrapping_add(2 * b * len);
+                let p = WindowSums {
+                    psi: psi.ptr(),
+                    probe: dptr(probe),
+                    views: dptr(win.views.addr()),
+                    win: block(0),
+                    dy: block(1),
+                    dx: block(2),
+                    num: dptr(num),
+                    den: dptr(den),
+                };
+                let (m, ctl) = (&self.module, stack.ctl() as *const StackCtl);
+                if psi.half() {
+                    m.window_position_sums_f16(stream, config, p, ctl, g)
+                } else {
+                    m.window_position_sums(stream, config, p, ctl, g)
+                }
+            }
+        })
     }
 
     /// pty-chi's gradient step of the offsets `[nframe, 2]` (as [`crate::gpu::Shift`]'s) from
