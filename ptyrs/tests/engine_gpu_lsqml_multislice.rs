@@ -1,9 +1,11 @@
 //! GPU LSQML through a multislice object against the CPU's `f64` [`Lsqml`] from the same
 //! start: two and three slices under each of the far field, the angular spectrum and the
-//! Fresnel transform forward and back, without and with a modelled position, for both costs.
+//! Fresnel transform forward and back, without and with a modelled position, for both costs;
+//! and the LLK pass through the slices against the CPU's LLK of the same arrays.
 //! Frames are on the fused passes' smallest side, two incoherent probe modes, 30 Fermat
 //! positions in stacks of at most 8, so a batch of 12 ends in a stack of 4.
 
+use std::f64::consts::PI;
 use std::sync::Arc;
 
 use cuda_core::CudaContext;
@@ -11,8 +13,8 @@ use ptyrs::base::{
     AddrTable, C64, Counts, Geometry, Object, Probe, Scan, Stack, required_obj_shape,
 };
 use ptyrs::engine::{
-    ApParams, BhParams, Cost, Features, GpuOptions, GpuPtycho, Lsqml, LsqmlParams, LsqmlStep,
-    Observed, Optics, ProbeVariation, SliceWaves, Wavefield, shift,
+    ApParams, BhParams, Cost, Features, Fft2, GpuOptions, GpuPtycho, Llk, Lsqml, LsqmlParams,
+    LsqmlStep, Observed, Optics, ProbeVariation, SliceWaves, Wavefield, llk, shift,
 };
 use ptyrs::gpu::FUSED_SIDES;
 
@@ -164,6 +166,82 @@ impl Case {
         )
         .unwrap()
     }
+}
+
+impl Case {
+    /// The CPU's normalised LLK of `objects` and `probe`, the probe of each frame moved by
+    /// its entry of `offsets` as LSQML's position model moves it: `conj(q) T(q p)`, `T` the
+    /// Fourier translation and `q` the first slice's plane phase.
+    fn llk(&self, objects: &[Object], probe: &Probe, offsets: Option<&[[f64; 2]]>) -> Llk {
+        let (nframe, nmode) = (self.addr.nframe(), self.addr.nmode());
+        let psi = match offsets {
+            None => SliceWaves::new(&self.optics, self.addr.views(), objects, probe, None)
+                .psi()
+                .to_vec(),
+            Some(offsets) => {
+                let (fft, q) = (Fft2::new([FRAME, FRAME]), self.optics.slice_quad(0));
+                let freq = |i: usize| {
+                    (if i < FRAME / 2 {
+                        i as f64
+                    } else {
+                        i as f64 - FRAME as f64
+                    }) / FRAME as f64
+                };
+                let mut planes = Vec::with_capacity(nframe * probe.as_slice().len());
+                for d in offsets {
+                    let mut w = probe.as_slice().to_vec();
+                    for plane in w.as_chunks_mut::<{ FRAME * FRAME }>().0 {
+                        if let Some(q) = q {
+                            plane.iter_mut().zip(q).for_each(|(p, q)| *p *= q);
+                        }
+                    }
+                    fft.forward(&mut w);
+                    for (j, w) in w.iter_mut().enumerate() {
+                        let (fy, fx) = (freq(j % (FRAME * FRAME) / FRAME), freq(j % FRAME));
+                        *w *= C64::from_polar(1.0, -2.0 * PI * (fy * d[0] + fx * d[1]));
+                    }
+                    fft.inverse(&mut w);
+                    for plane in w.as_chunks_mut::<{ FRAME * FRAME }>().0 {
+                        if let Some(q) = q {
+                            plane.iter_mut().zip(q).for_each(|(p, q)| *p *= q.conj());
+                        }
+                    }
+                    planes.extend(w);
+                }
+                let dims = [nframe * NPROBE, FRAME, FRAME];
+                let moved = Probe::new(Stack::from_vec(dims, planes).unwrap());
+                let views: Vec<_> = (self.addr.views().iter())
+                    .map(|v| ptyrs::base::View {
+                        probe: v.frame * NPROBE as u32 + v.probe,
+                        ..*v
+                    })
+                    .collect();
+                SliceWaves::new(&self.optics, &views, objects, &moved, Some(offsets))
+                    .psi()
+                    .to_vec()
+            }
+        };
+        let mut psi = psi;
+        self.optics.exit().forward(&mut psi);
+        llk(&self.obs, 0..nframe, nmode, &psi).normalised(self.obs.nb_obs())
+    }
+}
+
+/// The worst of the four LLK values' relative errors.
+fn llk_rel(got: &Llk, want: &Llk) -> f64 {
+    worst_of(
+        [
+            (got.poisson, want.poisson),
+            (got.gaussian, want.gaussian),
+            (got.euclidian, want.euclidian),
+            (got.nb_photons_calc, want.nb_photons_calc),
+        ]
+        .map(|(g, w)| (g - w).abs() / w.abs()),
+    )
+}
+
+fn llk_bits(l: &Llk) -> [u64; 4] {
+    [l.poisson, l.gaussian, l.euclidian, l.nb_photons_calc].map(f64::to_bits)
 }
 
 /// `|a − b| / |b|` over the whole array.
@@ -333,6 +411,87 @@ fn sliced_lsqml_matches_cpu_under_fresnel_back() {
     matches_cpu(PROPAGATORS[3]);
 }
 
+/// The LLK pass through two and three slices gives the CPU's LLK of the same arrays under
+/// every propagator, without and with a position: of the start, and of what an LSQML epoch
+/// left, whose record is the pass's own. Graphs and eager launches leave the same bits.
+#[test]
+fn sliced_llk_matches_cpu() {
+    let params = LsqmlParams {
+        batch_size: 12,
+        cost: Cost::Poisson,
+        seed: 7,
+    };
+    for (propagator, nslice, position) in PROPAGATORS.into_iter().flat_map(|p| {
+        [2, 3]
+            .into_iter()
+            .flat_map(move |n| [false, true].map(move |m| (p, n, m)))
+    }) {
+        let c = case(optics(propagator, nslice));
+        let features = moved(position);
+        let run = |graph| {
+            let mut gpu = c.gpu(GpuOptions { graph, ..OPTIONS });
+            gpu.set_features(&features).unwrap();
+            let start = gpu.llk().unwrap();
+            gpu.lsqml(&params, 2, 1).unwrap();
+            let records: Vec<Llk> = gpu.history().iter().map(|r| r.llk).collect();
+            assert_eq!(records.len(), 2);
+            let end = gpu.llk().unwrap();
+            let (objects, probe) = (gpu.objects().unwrap(), gpu.probe().unwrap());
+            let offsets = gpu.features().unwrap().position;
+            let want = c.llk(&objects, &probe, offsets.as_deref());
+            (start, records, end, want)
+        };
+        let (start, records, end, want) = run(true);
+        let what = format!("{propagator} {nslice} slices position {position}");
+        assert!(
+            llk_bits(&records[1]) == llk_bits(&end),
+            "{what}: the epoch's record is not the pass's"
+        );
+        let first = c.llk(&c.objects, &c.probe, features.position.as_deref());
+        let errs = [llk_rel(&start, &first), llk_rel(&end, &want)];
+        eprintln!(
+            "{what}: start {:.2e} end {:.2e}, poisson {:.4e} -> {:.4e}",
+            errs[0], errs[1], start.poisson, end.poisson
+        );
+        // 5 times the worst of the 16 or more: 4.3e-6 at the start under angular spectrum,
+        // three slices, a position.
+        assert!(worst_of(errs) < 5e-5, "{what}: {errs:?}");
+        let eager = run(false);
+        let all = |r: &(Llk, Vec<Llk>, Llk, Llk)| {
+            [vec![r.0], r.1.clone(), vec![r.2]]
+                .concat()
+                .iter()
+                .map(llk_bits)
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            all(&(start, records, end, want)) == all(&eager),
+            "{what}: graphs and eager launches differ"
+        );
+    }
+}
+
+/// M1's launches take the LLK through the slices where the propagator has no plane stage:
+/// the far field and a Fresnel transform forward.
+#[test]
+fn sliced_llk_matches_cpu_without_the_fused_passes() {
+    for propagator in ["far field", "Fresnel"] {
+        let c = case(optics(propagator, 3));
+        let want = c.llk(&c.objects, &c.probe, None);
+        for graph in [true, false] {
+            let options = GpuOptions {
+                graph,
+                fused: false,
+                ..OPTIONS
+            };
+            let err = llk_rel(&c.gpu(options).llk().unwrap(), &want);
+            eprintln!("{propagator} graph {graph}: {err:.2e}");
+            // The worst is 1.9e-6, under the Fresnel transform.
+            assert!(err < 2e-5, "{propagator} graph {graph}: {err:e}");
+        }
+    }
+}
+
 fn bits(s: &Stack<C64>) -> Vec<[u64; 2]> {
     s.as_slice()
         .iter()
@@ -412,28 +571,16 @@ fn gpu_refuses_what_it_cannot_run_on_slices() {
     let mut gpu = case(optics("far field", 3)).gpu(OPTIONS);
     let before: Vec<_> = gpu.objects().unwrap().iter().map(|o| bits(o)).collect();
     let probe = bits(&gpu.probe().unwrap());
-    let params = LsqmlParams {
-        batch_size: 12,
-        cost: Cost::Poisson,
-        seed: 7,
-    };
     let bh = BhParams {
         batch_size: 12,
         probe_rho: 0.01,
         position_rho: 0.1,
         seed: 7,
     };
-    let only = "only LSQML runs a multislice object";
-    let e = gpu.llk().unwrap_err().to_string();
-    assert!(
-        e.contains("the LLK pass runs one object slice, got 3"),
-        "{e}"
-    );
-    let e = gpu.lsqml(&params, 2, 1).unwrap_err().to_string();
-    assert!(e.contains("no LLK pass runs a multislice object"), "{e}");
+    let only = "only LSQML and the LLK pass run a multislice object";
     let e = gpu.ap(&ApParams::default(), 1).unwrap_err().to_string();
     assert!(
-        e.contains("Ap runs one object slice") && e.contains(only),
+        e.contains("Ap runs one object slice, got 3") && e.contains(only),
         "{e}"
     );
     let e = gpu.dm(&Default::default(), 1).unwrap_err().to_string();

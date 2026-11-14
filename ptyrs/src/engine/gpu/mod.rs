@@ -38,8 +38,8 @@ use std::sync::Arc;
 use crate::base::{AddrTable, C64, Object, Probe, Scan, Stack};
 use crate::fft::Plan2d;
 use crate::gpu::{
-    C32, CG_BLOCKS, Ended, Error as GpuError, FarSums, FusedBufs, FusedInputs, ObjProbeScale,
-    RecordWriter, StackRef, StackTable, ViewAddr, ViewDims,
+    C32, CG_BLOCKS, Ended, Error as GpuError, FarSums, FusedBufs, FusedInputs, Model,
+    ObjProbeScale, RecordWriter, StackRef, StackTable, ViewAddr, ViewDims,
 };
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
@@ -434,8 +434,8 @@ impl GpuPtycho {
 
     /// [`Self::with_optics`] on a multislice object, `objects` its slices in the order the
     /// wave crosses them, one per slice of `optics` and all of one shape. More than one
-    /// slice runs LSQML alone ([`Self::lsqml`]), with one object mode and without LLK
-    /// records: every other algorithm and [`Self::llk`] fail on it.
+    /// slice runs LSQML alone ([`Self::lsqml`]), with one object mode: every other
+    /// algorithm fails on it.
     pub fn with_slices(
         ctx: &Arc<CudaContext>,
         scan: &Scan,
@@ -694,21 +694,30 @@ impl Bufs<'_> {
         let dims = *self.views.dims();
         match passes {
             PassesMut::M1(m1) => {
+                let (k, optics) = (self.kernels, self.exit.kernels);
                 for s in 0..self.scratch.len() {
                     let stack = self.scratch.at(s);
-                    self.kernels.obj_probe_to_psi(
-                        ctx, self.views, stack, self.obj, self.probe, m1.scratch,
-                    )?;
+                    let psi = match &mut self.slices {
+                        None => {
+                            k.obj_probe_to_psi(
+                                ctx, self.views, stack, self.obj, self.probe, m1.scratch,
+                            )?;
+                            &mut *m1.scratch
+                        }
+                        Some(sl) => {
+                            let inputs = FusedInputs {
+                                views: self.views,
+                                counts: self.counts,
+                                obj: self.obj,
+                                probe: self.probe,
+                                model: Model::default(),
+                            };
+                            sl.exit_waves(ctx, k, optics, &inputs, stack)?
+                        }
+                    };
                     let plan = self.scratch.frames[s].plan;
-                    m1.plans.get(plan).forward_inplace(ctx, m1.scratch)?;
-                    self.kernels.llk(
-                        ctx,
-                        stack,
-                        self.counts,
-                        m1.scratch,
-                        self.llk_scratch,
-                        self.llk,
-                    )?;
+                    m1.plans.get(plan).forward_inplace(ctx, psi)?;
+                    k.llk(ctx, stack, self.counts, psi, self.llk_scratch, self.llk)?;
                     rec.push(ctx, &dims, stack, self.llk)?;
                 }
             }
@@ -729,7 +738,16 @@ impl Bufs<'_> {
                         llk: Some(&mut *self.llk),
                         ..FarSums::default()
                     };
-                    self.kernels.fused_llk(ctx, &inputs, stack, f, far)?;
+                    match &mut self.slices {
+                        None => self.kernels.fused_llk(ctx, &inputs, stack, f, far)?,
+                        Some(sl) => {
+                            let (k, exit) = (self.kernels, self.exit);
+                            let rows = sl.exit_waves(ctx, k, exit.kernels, &inputs, stack)?;
+                            exit.kernels.rows(ctx, &dims, stack, rows, false)?;
+                            (exit.kernels).exit(ctx, &dims, stack, exit.stage, rows, false)?;
+                            k.rows_llk(ctx, &inputs, stack, rows, f, far)?;
+                        }
+                    }
                     rec.push(ctx, &dims, stack, self.llk)?;
                 }
             }
