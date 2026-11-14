@@ -27,6 +27,28 @@ impl Propagate<'_> {
         self.run(ctx, plan, stack, buf, false)
     }
 
+    /// `src` to the detector plane into `dst`, as [`Self::forward`] of a copy.
+    pub fn forward_from(
+        &self,
+        ctx: &ExecutionContext,
+        plan: &mut Plan2d,
+        stack: StackRef<'_>,
+        src: &DeviceBuffer<C32>,
+        dst: &mut DeviceBuffer<C32>,
+    ) -> Result<(), GpuError> {
+        match self.stage {
+            ExitStage::None => plan.forward(ctx, src, dst)?,
+            ExitStage::Reverse => plan.inverse(ctx, src, dst)?,
+            ExitStage::Transfer(tf) => {
+                plan.forward(ctx, src, dst)?;
+                self.kernels
+                    .transfer(ctx, &self.dims, stack, tf, dst, false)?;
+                plan.inverse_inplace(ctx, dst)?;
+            }
+        }
+        Ok(())
+    }
+
     /// The adjoint of [`Self::forward`].
     pub fn adjoint(
         &self,
