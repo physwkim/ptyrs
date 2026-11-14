@@ -7,14 +7,14 @@
 //! its start `object` and `probe` (`Ptycho::scale_obj_probe` of a flat object and the
 //! simulation's probe) and one group per LSQML run with probe variation, its `cost`,
 //! `batch_size` and `seed` as attributes: the start `eigenmodes`, `weights` and (`intensity`
-//! run) `intensity`, then for each epoch `e` of [`NEPOCH`] a group `epoch<e>` of the arrays it
+//! run) `intensity`, then for each epoch `e` of `NEPOCH` a group `epoch<e>` of the arrays it
 //! left (`object` `[nslice, nobj, nyo, nxo]`) and its steps, every batch's `frames`, `a_far`, `a_obj` (`[nslice, nframe]`) and
 //! `a_probe` concatenated and `batch_len`.
 //!
 //! `near.h5` holds a scan simulated through pty-chi's planar near field ([`Optics::free_space`]
 //! of the `wavelength`, `wave_pixel` and `distance` it names, `exit` `"free_space"`): its
 //! `counts`, `positions` at the object `pixel` and start `object` (`[nslice, nobj, nyo, nxo]`)
-//! and `probe`, then an `lsqml` and a `bh` group of [`NEPOCH`] epochs from that start, their
+//! and `probe`, then an `lsqml` and a `bh` group of `NEPOCH` epochs from that start, their
 //! parameters as attributes and each epoch's groups as in `opr.h5`, BH's steps as `frames`,
 //! `beta`, `alpha`, `top`, `bottom` and `batch_len`.
 //!

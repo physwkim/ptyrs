@@ -18,8 +18,8 @@ pub mod worker;
 pub use ap::{ApConfig, ApProblem, DistAp, NLEAF, RegionLoad};
 pub use exchange::{Exchange, Layout};
 pub use halo::{HaloBacker, HaloBufs, HaloRow, HaloRows};
-pub use live::{LivePlan, LiveRegion, Share};
-pub use live_ap::DistLiveAp;
+pub use live::{LivePlan, LiveRegion, LiveRoute, Share};
+pub use live_ap::{DistLiveAp, DistSnapshot};
 pub use partition::{Csr, DEFAULT_TILE, Partition, Region, Scheme, TileGrid};
 pub use worker::{Gpu, Workers};
 
