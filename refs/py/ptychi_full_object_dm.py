@@ -1,6 +1,7 @@
 """pty-chi DM and RAAR under its FULL_OBJECT shift operator against the engine's CPU DM and RAAR
 under Sampling::FullObject, on the near-field cases of ptyrs/tests/common/near.rs, in f64.
 
+    cargo run --release -p ptyrs --example engine_fullobj_dump -- <state>
     micromamba run -n ptyrs-ref python -I refs/py/ptychi_full_object_dm.py <state>
 
 <state> holds one directory per case (`as`, `fresnel`, `fresnel_back`: near.rs's angular
