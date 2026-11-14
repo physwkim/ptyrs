@@ -727,7 +727,9 @@ struct MlState {
     /// The line-search pairs of every frame's pixel chunks ([`crate::gpu::gamma_parts`]).
     gamma_parts: DeviceBuffer<f32>,
     gamma: DeviceBuffer<f32>,
-    /// The calculated photons over the unmasked pixels of every frame.
+    /// The calculated photons over the unmasked pixels of each frame.
+    photons: DeviceBuffer<f32>,
+    /// Their sum over the scan.
     icalc: DeviceBuffer<f32>,
     fields: GammaStacks,
     /// The line search's moved probes, once an ML call has run under the position model.
@@ -744,6 +746,7 @@ pub(super) struct MlBufs<'a> {
     pub beta: &'a mut DeviceBuffer<f32>,
     pub gamma_parts: &'a mut DeviceBuffer<f32>,
     pub gamma: &'a mut DeviceBuffer<f32>,
+    pub photons: &'a mut DeviceBuffer<f32>,
     pub icalc: &'a mut DeviceBuffer<f32>,
     pub fields: &'a mut GammaStacks,
     pub moved: Option<&'a mut MlMoved>,
@@ -778,6 +781,7 @@ impl MlState {
             beta: pair()?,
             gamma_parts: DeviceBuffer::zeroed(stream, 2 * crate::gpu::gamma_parts(dims)? as usize)?,
             gamma: pair()?,
+            photons: DeviceBuffer::zeroed(stream, dims.nframe as usize)?,
             icalc: DeviceBuffer::zeroed(stream, 1)?,
             fields: GammaStacks::zeroed(stream, cut.wave_len(dims))?,
             moved: (moved.then(|| MlMoved::new(stream, kernels, dims, cut.table.nf_max())))
@@ -796,6 +800,7 @@ impl MlState {
             beta: &mut self.beta,
             gamma_parts: &mut self.gamma_parts,
             gamma: &mut self.gamma,
+            photons: &mut self.photons,
             icalc: &mut self.icalc,
             fields: &mut self.fields,
             moved: self.moved.as_mut(),

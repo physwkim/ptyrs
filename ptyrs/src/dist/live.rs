@@ -6,7 +6,7 @@
 //! (invariant 5). A GPU's window holds every tile a frame touching its own tiles can read,
 //! planned or not, and its halo grows as frames read new tiles, so a frame off the plan
 //! lands wherever one GPU would take it. The split admits frames through the one-GPU scan's
-//! [`Gate`] on the whole object, so every GPU's batch ends at the frame one GPU's scan
+//! gate on the whole object, so every GPU's batch ends at the frame one GPU's scan
 //! refuses.
 
 use std::sync::Arc;
@@ -14,7 +14,7 @@ use std::sync::Arc;
 use cuda_core::{Context, Stream};
 
 use crate::gpu::{ViewAddr, ViewDims, view_tiles};
-use crate::live::scan::{Gate, Refusal, ScanShape};
+use crate::live::scan::{Gate, Refusal, ScanShape, off_view};
 
 use crate::dist::exchange::Pull;
 use crate::dist::halo::{Halo, HaloBufs, HaloRows, Window};
@@ -116,12 +116,13 @@ impl LivePlan {
                 dims.nframe
             ));
         }
-        if let Some((k, e)) = planned
-            .iter()
-            .enumerate()
-            .find_map(|(k, v)| dims.check_view(v).err().map(|e| (k, e)))
+        if let Some((f, v)) = (0..)
+            .zip(planned.chunks(nmode))
+            .find_map(|(f, views)| off_view(&dims, views).map(|v| (f, v)))
         {
-            return bad(format!("planned view {k}: {e}"));
+            return bad(format!(
+                "planned frame {f}: {v:?} is no view of it in {dims:?}"
+            ));
         }
         let to = |a: [u32; 2]| a.map(|n| n as usize);
         let grid = TileGrid::new(to(dims.obj), DEFAULT_TILE)?;
@@ -141,7 +142,7 @@ impl LivePlan {
         let mut frames = vec![Vec::new(); ngpu];
         let mut tiles = Vec::new();
         for (f, views) in planned.chunks(nmode).enumerate() {
-            touched(&dims, &grid, views, &mut tiles);
+            touched(&dims, &grid, &views[0], &mut tiles);
             for r in owners(run.owner(), &tiles, ngpu) {
                 frames[r].push(f as u32);
             }
@@ -254,7 +255,7 @@ impl LivePlan {
             if self.gate.admit(frame).is_err() {
                 break;
             }
-            touched(&self.dims, grid, frame, &mut tiles);
+            touched(&self.dims, grid, &frame[0], &mut tiles);
             for r in owners(self.run.owner(), &tiles, self.regions.len()) {
                 // Inside the object, the tiles a frame touches lie within its frame width of
                 // each other, so within region `r`'s partition halo of the one it owns.
@@ -274,18 +275,11 @@ impl LivePlan {
     }
 }
 
-/// The tiles of `grid` the views of one frame touch, by the kernels' rule, into `out`,
-/// ascending.
-fn touched(dims: &ViewDims, grid: &TileGrid, views: &[ViewAddr], out: &mut Vec<usize>) {
+/// The tiles of `grid` a frame at `view`'s position touches, by the kernels' rule, into
+/// `out`, ascending: every view of a frame is at its one position ([`off_view`]).
+fn touched(dims: &ViewDims, grid: &TileGrid, view: &ViewAddr, out: &mut Vec<usize>) {
     out.clear();
-    out.extend(
-        views
-            .iter()
-            .flat_map(|v| view_tiles(dims, v))
-            .map(|[ty, tx]| grid.id(ty as usize, tx as usize)),
-    );
-    out.sort_unstable();
-    out.dedup();
+    out.extend(view_tiles(dims, view).map(|[ty, tx]| grid.id(ty as usize, tx as usize)));
 }
 
 /// The owners of `tiles`, ascending.

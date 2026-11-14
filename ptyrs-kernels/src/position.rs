@@ -169,7 +169,7 @@ pub mod position_kernels {
     use super::{
         BatchSpan, EPS_POSITION, POSITION_SUMS, PositionRule, PositionSums, shift_w, slopes,
     };
-    use crate::bh::store_sums;
+    use crate::bh::{CHUNK_PIXELS, store_sums};
     use crate::grad::{GAMMA_CHUNK, block_max};
     use crate::pixel::*;
     use crate::*;
@@ -317,24 +317,45 @@ pub mod position_kernels {
         let end = n.min((c + 1) * chunk);
         let pos = f0 as usize + fl;
         let v = unsafe { *views.add(pos * nmode) };
+        let wp = (fl * g.nprobe as usize + v.probe as usize) * n;
         let mut acc = [0.0f32; POSITION_SUMS as usize];
-        let mut i = c * chunk + thread::threadIdx_x() as usize;
-        while i < end {
-            let (py, px) = ((i / nx as usize) as u32, (i % nx as usize) as u32);
-            let at = psi_index(py, px, ny, nx);
-            unsafe {
-                let ws = load_c(w, (fl * g.nprobe as usize + v.probe as usize) * n + at);
-                let ch = load_c(chi, fl * nmode * n + at);
-                // Unrolled so `acc` stays in registers.
-                #[unroll]
-                for ax in 0..2 {
-                    let s = load_c(slopes, (2 * fl + ax) * n + i);
-                    let gu = cmul(s, ws);
-                    acc[ax] += cmul_conj(gu, ch).0;
-                    acc[2 + ax] += gu.0 * gu.0 + gu.1 * gu.1;
+        let base = c * chunk + thread::threadIdx_x() as usize;
+        // Every load of a group is issued before its sums, which keep the pixel order.
+        const G: usize = 4;
+        #[unroll]
+        for grp in 0..CHUNK_PIXELS / G {
+            let i0 = base + grp * G * PIXEL_THREADS as usize;
+            let mut ld = [[(0.0f32, 0.0f32); 4]; G];
+            #[unroll]
+            for j in 0..G as u32 {
+                let j = j as usize;
+                let i = i0 + j * PIXEL_THREADS as usize;
+                if i < end {
+                    let at = psi_index(i as u32 / nx, i as u32 % nx, ny, nx);
+                    ld[j] = unsafe {
+                        [
+                            load_c(w, wp + at),
+                            load_c(chi, fl * nmode * n + at),
+                            load_c(slopes, 2 * fl * n + i),
+                            load_c(slopes, (2 * fl + 1) * n + i),
+                        ]
+                    };
                 }
             }
-            i += PIXEL_THREADS as usize;
+            #[unroll]
+            for j in 0..G as u32 {
+                let j = j as usize;
+                let i = i0 + j * PIXEL_THREADS as usize;
+                if i < end {
+                    let [ws, ch, ..] = ld[j];
+                    #[unroll]
+                    for ax in 0..2 {
+                        let gu = cmul(ld[j][2 + ax], ws);
+                        acc[ax] += cmul_conj(gu, ch).0;
+                        acc[2 + ax] += gu.0 * gu.0 + gu.1 * gu.1;
+                    }
+                }
+            }
         }
         let at = pos * n.div_ceil(chunk) + c;
         unsafe {

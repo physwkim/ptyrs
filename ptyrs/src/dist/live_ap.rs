@@ -13,11 +13,11 @@ use std::sync::Arc;
 
 use cuda_core::{Context, DeviceBuffer};
 
-use crate::gpu::{C32, Exit, FarSums, FusedBufs, FusedInputs, FusedSums, Kernels, Model, ViewAddr};
+use crate::gpu::{C32, FusedBufs, Kernels, ViewAddr};
 use crate::live::graph::LiveGraph;
 use crate::live::grow::{Backer, GrowTable};
 use crate::live::object::Snapshot;
-use crate::live::recon::ApConfig;
+use crate::live::recon::{ApConfig, capture_sweep};
 use crate::live::scan::{LiveScan, Refusal, ScanBacker};
 
 use crate::dist::exchange::{self, Exchange, Pull};
@@ -134,31 +134,7 @@ impl State {
             let s = &mut scan;
             LiveGraph::capture(&stream, move |c| s.advance(k, c))?
         };
-        let sweep = {
-            let (s, fused) = (&mut scan, &mut fused);
-            let (probe, counts) = (&probe, &counts_view);
-            LiveGraph::capture(&stream, move |c| {
-                let p = s.parts_mut();
-                for _ in 0..stacks {
-                    p.frames.sweep_step(c)?;
-                    let st = p.frames.sweep();
-                    let inputs = FusedInputs {
-                        views: p.views,
-                        counts,
-                        obj: p.pixels,
-                        probe,
-                        model: Model::default(),
-                    };
-                    let far = FarSums::default();
-                    let sums = FusedSums {
-                        obj: Some(&mut *p.sums),
-                        ..FusedSums::default()
-                    };
-                    k.fused_project(c, &inputs, st, Exit::Ap { far }, fused, sums)?;
-                }
-                Ok(())
-            })?
-        };
+        let sweep = capture_sweep(&mut scan, k, stacks, &probe, &counts_view, &mut fused, None)?;
         let den = {
             let s = &mut scan;
             LiveGraph::capture(&stream, move |c| {
