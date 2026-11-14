@@ -533,18 +533,21 @@ pub unsafe fn obj_corners(
     c
 }
 
-/// The sum of [`sample_obj`] over the corners `c` of [`obj_corners`].
+/// The sum of [`sample_obj`] over the corners `c` of [`obj_corners`]. Its adds are the
+/// `fma`s `sample_obj` contracts to: without loads between them NVVM may contract them
+/// otherwise.
 #[device]
 pub fn bilinear(c: [(f32, f32); 4], v: ViewAddr) -> (f32, f32) {
     let w = bilinear_weights(v.fy, v.fx);
+    let add = |acc: (f32, f32), w: f32, c: (f32, f32)| (fma(w, c.0, acc.0), fma(w, c.1, acc.1));
     let mut acc = (w[0] * c[0].0, w[0] * c[0].1);
     if v.fx != 0.0 {
-        acc = (acc.0 + w[1] * c[1].0, acc.1 + w[1] * c[1].1);
+        acc = add(acc, w[1], c[1]);
     }
     if v.fy != 0.0 {
-        acc = (acc.0 + w[2] * c[2].0, acc.1 + w[2] * c[2].1);
+        acc = add(acc, w[2], c[2]);
         if v.fx != 0.0 {
-            acc = (acc.0 + w[3] * c[3].0, acc.1 + w[3] * c[3].1);
+            acc = add(acc, w[3], c[3]);
         }
     }
     acc

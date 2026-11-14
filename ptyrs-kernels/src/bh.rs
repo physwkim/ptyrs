@@ -126,7 +126,8 @@ pub const BH_STEP: u32 = 4;
 pub mod bh_kernels {
     use super::{
         BH_EPS, BH_HESS, BH_STEP, BhDirs, BhFields, BhMovedFar, BhMoves, BhNear, BhObs, BhPosDirs,
-        CHUNK_PIXELS, add_im, far_add, far_tail, ramp_at, rates, unramp,
+        CHUNK_PIXELS, add_im, add_re, far_add, far_tail, near_prod, near_sum, ramp_at, rates,
+        re_conj, unramp,
     };
     use crate::grad::{GAMMA_CHUNK, ObjProbePtrs};
     use crate::pixel::*;
@@ -714,30 +715,39 @@ pub mod bh_kernels {
         let pos = f0 as usize + fl;
         let mut acc = [0.0f32; BH_HESS as usize];
         let mut d = c * chunk + thread::threadIdx_x() as usize;
+        // A pixel's loads of a mode are issued before its sums and stores, which keep the
+        // mode order.
         while d < end {
             let (py, px) = ((d / nx as usize) as u32, (d % nx as usize) as u32);
             let at = psi_index(py, px, ny, nx);
             for m in 0..nmode {
                 let j = (fl * nmode + m) * n + at;
-                unsafe {
-                    let v = *views.add(pos * nmode + m);
-                    let w = load_c(f.w, (fl * g.nprobe as usize + v.probe as usize) * n + at);
-                    let o = sample_obj(f.obj, v, py, px, g.nyo, g.nxo);
-                    let r = load_c(f.r, j);
-                    let uo = sample_obj(dirs.u.obj, v, py, px, g.nyo, g.nxo);
-                    let du = load_c(f.lu, j);
-                    acc[0] += 2.0 * cmul_conj(r, cmul(uo, du)).0;
-                    let (a, b) = (cmul(uo, w), cmul(o, du));
-                    store_c(f.lu, j, (a.0 + b.0, a.1 + b.1));
-                    if cg {
-                        let vo = sample_obj(dirs.v.obj, v, py, px, g.nyo, g.nxo);
-                        let dv = load_c(f.lv, j);
-                        let (a, b) = (cmul(uo, dv), cmul(vo, du));
-                        acc[1] += cmul_conj(r, (a.0 + b.0, a.1 + b.1)).0;
-                        acc[2] += 2.0 * cmul_conj(r, cmul(vo, dv)).0;
-                        let (a, b) = (cmul(vo, w), cmul(o, dv));
-                        store_c(f.lv, j, (a.0 + b.0, a.1 + b.1));
+                let v = unsafe { *views.add(pos * nmode + m) };
+                let wa = (fl * g.nprobe as usize + v.probe as usize) * n + at;
+                let (w, o, r, uo, du) = unsafe {
+                    (
+                        load_c(f.w, wa),
+                        obj_corners(f.obj, v, py, px, g.nyo, g.nxo),
+                        load_c(f.r, j),
+                        obj_corners(dirs.u.obj, v, py, px, g.nyo, g.nxo),
+                        load_c(f.lu, j),
+                    )
+                };
+                let (mut vo, mut dv) = ([(0.0, 0.0); 4], (0.0, 0.0));
+                if cg {
+                    unsafe {
+                        vo = obj_corners(dirs.v.obj, v, py, px, g.nyo, g.nxo);
+                        dv = load_c(f.lv, j);
                     }
+                }
+                let (o, uo) = (bilinear(o, v), bilinear(uo, v));
+                acc[0] = fma(re_conj(r, near_prod(uo, du)), 2.0, acc[0]);
+                unsafe { store_c(f.lu, j, near_sum(w, uo, du, o)) };
+                if cg {
+                    let vo = bilinear(vo, v);
+                    acc[1] = add_re(acc[1], r, near_sum(uo, dv, vo, du));
+                    acc[2] = fma(re_conj(r, near_prod(vo, dv)), 2.0, acc[2]);
+                    unsafe { store_c(f.lv, j, near_sum(w, vo, dv, o)) };
                 }
             }
             d += PIXEL_THREADS as usize;
@@ -925,6 +935,27 @@ pub(crate) fn add_re(s: f32, a: (f32, f32), b: (f32, f32)) -> f32 {
 #[device]
 pub(crate) fn add_im(s: f32, z: (f32, f32), a: (f32, f32)) -> f32 {
     fma(z.0, a.1, fma(z.1, a.0, s))
+}
+
+/// `x y` as NVVM contracted [`cmul`] in [`bh_kernels::LoadedModule::bh_pos_near`] while its
+/// sums sat between its loads; with the loads first it pairs them otherwise.
+#[device]
+fn near_prod(x: (f32, f32), y: (f32, f32)) -> (f32, f32) {
+    (fma(x.0, y.0, -(x.1 * y.1)), fma(x.1, y.0, x.0 * y.1))
+}
+
+/// `x y + p q`, `p q`'s imaginary part fused into `x y`'s as [`add_im`], pinned as
+/// [`near_prod`].
+#[device]
+fn near_sum(x: (f32, f32), y: (f32, f32), p: (f32, f32), q: (f32, f32)) -> (f32, f32) {
+    let (a, b) = (near_prod(x, y), near_prod(p, q));
+    (a.0 + b.0, add_im(a.1, p, q))
+}
+
+/// `Re(conj(a) b)`, pinned as [`near_prod`].
+#[device]
+fn re_conj(a: (f32, f32), b: (f32, f32)) -> f32 {
+    fma(a.0, b.0, a.1 * b.1)
 }
 
 /// Adds one mode's `psi`, `lu` and `lv` to the [`far_tail`] sums `s = [Σ |psi|², c_u, c_v,
