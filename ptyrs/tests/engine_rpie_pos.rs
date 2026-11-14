@@ -9,6 +9,9 @@ use ptyrs::engine::{Features, Ptycho, RpieParams};
 
 #[path = "common/engine/mod.rs"]
 mod common;
+#[path = "common/worst.rs"]
+mod worst;
+use worst::worst_of;
 
 fn table(text: &str) -> Vec<Vec<f64>> {
     text.lines()
@@ -19,11 +22,7 @@ fn table(text: &str) -> Vec<Vec<f64>> {
 /// `max |a − b| / max |b|`.
 fn max_rel(a: &[f64], b: &[f64]) -> f64 {
     assert_eq!(a.len(), b.len());
-    let d = a
-        .iter()
-        .zip(b)
-        .map(|(a, b)| (a - b).abs())
-        .fold(0.0, f64::max);
+    let d = worst_of(a.iter().zip(b).map(|(a, b)| (a - b).abs()));
     d / b.iter().map(|b| b.abs()).fold(0.0, f64::max)
 }
 

@@ -985,6 +985,7 @@ mod tests {
 
     use super::*;
     use crate::engine::llk;
+    use crate::worst::worst_of;
 
     fn poisson_sum(p: &Ptycho) -> f64 {
         let mut psi = p.calc_psi();
@@ -1063,7 +1064,7 @@ mod tests {
                 arr(p)[k] = o - dir;
                 let lm = poisson_sum(p);
                 arr(p)[k] = o;
-                err = err.max(((lp - lm) / (2.0 * h) - want).abs());
+                err = worst_of([err, ((lp - lm) / (2.0 * h) - want).abs()]);
             }
         }
         assert!(

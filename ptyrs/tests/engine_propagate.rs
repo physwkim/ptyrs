@@ -12,6 +12,10 @@
 use ptyrs::base::C64;
 use ptyrs::engine::{Propagator, Wavefield, shift};
 
+#[path = "common/worst.rs"]
+mod worst;
+use worst::worst_of;
+
 fn table(text: &str) -> Vec<Vec<f64>> {
     text.lines()
         .map(|l| l.split_whitespace().map(|v| v.parse().unwrap()).collect())
@@ -93,11 +97,7 @@ fn propagators_match_ptychi() {
             .map(|j| at(shift(j, ny, nx), 9) * k.sqrt())
             .collect();
         for (name, got, want) in [("forward", &x, &fwd), ("adjoint", &y, &bwd)] {
-            let d = got
-                .iter()
-                .zip(want)
-                .map(|(a, b)| (a - b).norm())
-                .fold(0.0, f64::max);
+            let d = worst_of(got.iter().zip(want).map(|(a, b)| (a - b).norm()));
             let m = want.iter().map(|b| b.norm()).fold(0.0, f64::max);
             assert!(d / m <= 1e-14, "case {} {name}: {:.3e}", c[0], d / m);
         }

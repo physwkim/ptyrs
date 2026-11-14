@@ -20,6 +20,9 @@ use ptyrs::gpu::FUSED_SIDES;
 
 #[path = "common/engine/mod.rs"]
 mod common;
+#[path = "common/worst.rs"]
+mod worst;
+use worst::worst_of;
 
 /// 30 positions: stacks of at most 8 cut them into 8, 8, 7 and 7 frames, and batches of 12 or
 /// 4 leave a shorter last one.
@@ -120,11 +123,7 @@ fn offsets_rel(a: &Features, b: &Features, start: &Features) -> f64 {
             .collect()
     };
     let (a, b) = (delta(a), delta(b));
-    let d = a
-        .iter()
-        .zip(&b)
-        .map(|(a, b)| (a - b).abs())
-        .fold(0.0, f64::max);
+    let d = worst_of(a.iter().zip(&b).map(|(a, b)| (a - b).abs()));
     d / b.iter().map(|b| b.abs()).fold(0.0, f64::max)
 }
 
@@ -193,14 +192,14 @@ fn steps_match_cpu(position: Option<Vec<[f64; 2]>>) {
                 .enumerate()
                 {
                     for (a, b) in a.iter().zip(b) {
-                        worst[i] = worst[i].max(rel(*a, *b));
+                        worst[i] = worst_of([worst[i], rel(*a, *b)]);
                     }
                 }
             }
-            worst[3] = worst[3].max(rel_l2(&gpu.object().unwrap(), &o));
-            worst[4] = worst[4].max(rel_l2(&gpu.probe().unwrap(), &p));
+            worst[3] = worst_of([worst[3], rel_l2(&gpu.object().unwrap(), &o)]);
+            worst[4] = worst_of([worst[4], rel_l2(&gpu.probe().unwrap(), &p)]);
             let offsets = offsets_rel(&gpu.features().unwrap(), cpu.features(), &features);
-            worst[5] = worst[5].max(offsets);
+            worst[5] = worst_of([worst[5], offsets]);
         }
         eprintln!(
             "lsqml steps {cost:?} graph {graph} batch {batch_size} position {}: a_far {:.2e} \
@@ -288,7 +287,7 @@ fn matches_cpu(position: Option<Vec<[f64; 2]>>) {
                 (g.llk.euclidian, w.llk.euclidian),
                 (g.llk.nb_photons_calc, w.llk.nb_photons_calc),
             ] {
-                llk = llk.max(rel(a, b));
+                llk = worst_of([llk, rel(a, b)]);
             }
         }
         let errs = [
@@ -326,7 +325,7 @@ fn steps_rel(got: &[LsqmlStep], want: &[LsqmlStep]) -> f64 {
             (&g.a_probe, &w.a_probe),
         ] {
             for (a, b) in a.iter().zip(b) {
-                worst = worst.max(rel(*a, *b));
+                worst = worst_of([worst, rel(*a, *b)]);
             }
         }
     }
