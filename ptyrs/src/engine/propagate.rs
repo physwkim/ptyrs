@@ -198,6 +198,26 @@ pub struct Fresnel {
     reverse: bool,
     /// `ny·nx·|C0|²`.
     scale: f64,
+    /// `B = exp(i·quad·(X² + Y²))` over the centred pixel; none unless the pixels are square.
+    quad: Option<f64>,
+}
+
+/// A [`Propagator`] as `D·Fft2·V·q`: `q = exp(i·quad·(X² + Y²))` over the centred pixel of the
+/// exit-wave plane, `V` its [`PlaneStage`], and `D` a unit-modulus detector factor, which
+/// drops out of every intensity and of `Uᴴ·w·U` for real detector weights `w`.
+pub struct FourierForm<'a> {
+    pub quad: f64,
+    pub stage: PlaneStage<'a>,
+}
+
+/// What a [`FourierForm`] applies between the plane's phase and [`Fft2`].
+pub enum PlaneStage<'a> {
+    None,
+    /// The index reversal on both axes, `Fft2²`.
+    Reverse,
+    /// `Fft2⁻¹·Fft2⁻¹·T·Fft2` of this transfer function `T`, on the unshifted `fftfreq`
+    /// grid and even in both frequencies.
+    Transfer(&'a [C64]),
 }
 
 impl Propagator {
@@ -284,6 +304,47 @@ impl Propagator {
         }
     }
 
+    /// This propagator through one [`Fft2`]. A Fresnel transform over pixels that are not
+    /// square has no such form, its plane phase being no `quad`, nor angular spectrum with an
+    /// evanescent band, where `Vᴴ·V` is not the identity the form's users take it for.
+    pub fn fourier_form(&self) -> Result<FourierForm<'_>, EngineError> {
+        let (quad, stage) = match self {
+            Self::Fourier(_) => (0.0, PlaneStage::None),
+            Self::AngularSpectrum(p) => {
+                if p.tf.contains(&C64::default()) {
+                    return Err(EngineError::Invalid(
+                        "angular spectrum with an evanescent band has no one-transform form".into(),
+                    ));
+                }
+                (0.0, PlaneStage::Transfer(&p.tf))
+            }
+            Self::Fresnel(p) => {
+                let quad = p.quad.ok_or_else(|| {
+                    EngineError::Invalid(
+                        "a Fresnel transform over pixels that are not square has no \
+                         one-transform form"
+                            .into(),
+                    )
+                })?;
+                let stage = if p.reverse {
+                    PlaneStage::Reverse
+                } else {
+                    PlaneStage::None
+                };
+                (quad, stage)
+            }
+        };
+        Ok(FourierForm { quad, stage })
+    }
+
+    /// Angular spectrum's transfer function, on the unshifted `fftfreq` grid.
+    pub fn transfer(&self) -> Option<&[C64]> {
+        match self {
+            Self::AngularSpectrum(p) => Some(&p.tf),
+            _ => None,
+        }
+    }
+
     fn fft(&self) -> &Fft2 {
         match self {
             Self::Fourier(fft) => fft,
@@ -351,6 +412,7 @@ impl Fresnel {
             b,
             reverse: w.distance < 0.0,
             scale: (ny * nx) as f64 * (c0 * c0),
+            quad: (ar == 1.0).then_some(PI * fr),
         }
     }
 }
