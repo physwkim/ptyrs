@@ -37,6 +37,7 @@ const OPTIONS: GpuOptions = GpuOptions {
     graph: true,
     llk_slots: 3,
     fused: true,
+    psi_f16: false,
 };
 
 fn ctx() -> Arc<CudaContext> {
@@ -77,14 +78,16 @@ struct Case {
     probe: Probe,
 }
 
-/// Counts of the test object split over the slices of `optics`, and a start off it: unit
-/// modulus and a random phase in -1/4..1/4 rad per slice, the probe's defocus cut by a third.
-fn case(optics: Optics, npos: usize) -> Case {
+/// Counts of the test object split over the slices of `optics`, in `nobj` incoherent modes,
+/// each past the first the conjugate of the one before at half its amplitude; and a start off
+/// it: unit modulus and a random phase in -1/4..1/4 rad per slice and mode, the probe's
+/// defocus cut by a third.
+fn case(optics: Optics, npos: usize, nobj: usize) -> Case {
     let (frame, pixel) = ([FRAME, FRAME], optics.pixel());
     let raw = ptyrs::base::sim::fermat(npos, FRAME as f64 / 8.0 * PIXEL);
     let positions = raw.pynx_preprocess(pixel);
     let shape = required_obj_shape(&positions, pixel, frame, 16);
-    let addr = AddrTable::new(&positions, pixel, frame, shape, NPROBE, 1).unwrap();
+    let addr = AddrTable::new(&positions, pixel, frame, shape, NPROBE, nobj).unwrap();
     let whole = ptyrs::base::sim::object(shape);
     let weights: &[f64] = match optics.nslice() {
         2 => &[0.6, 0.4],
@@ -94,8 +97,16 @@ fn case(optics: Optics, npos: usize) -> Case {
     let truth: Vec<Object> = weights
         .iter()
         .map(|&w| {
-            let data = whole.as_slice().iter().map(|c| c.powf(w)).collect();
-            Object::new(Stack::from_vec(whole.dims(), data).unwrap())
+            let first: Vec<C64> = whole.as_slice().iter().map(|c| c.powf(w)).collect();
+            let data = (0..nobj)
+                .flat_map(|o| {
+                    let (a, conj) = (0.5f64.powi(o as i32), o % 2 == 1);
+                    first
+                        .iter()
+                        .map(move |&c| a * if conj { c.conj() } else { c })
+                })
+                .collect();
+            Object::new(Stack::from_vec([nobj, shape[0], shape[1]], data).unwrap())
         })
         .collect();
     let mut probe = ptyrs::base::sim::probe(frame, NPROBE).unwrap();
@@ -322,11 +333,12 @@ fn offsets_rel(a: &Features, b: &Features, start: &Features) -> f64 {
 
 /// After [`NEPOCH`] epochs (the preconditioner built, then updated) in batches of 12, the
 /// last epoch's steps, every slice, the probe and the offsets' changes are the CPU's, for
-/// `propagator` after two and three slices, without and with a position, for both costs.
-fn matches_cpu(propagator: &str) {
+/// `propagator` after each of `nslices` slices of `nobj` modes, without and with a position,
+/// for both costs.
+fn matches_cpu(propagator: &str, nslices: &[usize], nobj: usize) {
     const NEPOCH: usize = 2;
-    for nslice in [2, 3] {
-        let c = case(optics(propagator, nslice), NPOS);
+    for &nslice in nslices {
+        let c = case(optics(propagator, nslice), NPOS, nobj);
         for (position, cost) in [false, true]
             .into_iter()
             .flat_map(|p| [Cost::Amplitude, Cost::Poisson].map(move |c| (p, c)))
@@ -369,7 +381,8 @@ fn matches_cpu(propagator: &str) {
                 rel_l2(&gpu.probe().unwrap(), &probe),
                 offsets_rel(&gpu.features().unwrap(), cpu.features(), &features),
             ];
-            let what = format!("{propagator} {nslice} slices {cost:?} position {position}");
+            let what =
+                format!("{propagator} {nslice} slices {nobj} modes {cost:?} position {position}");
             eprintln!(
                 "{what}: a_far {:.2e} a_probe {:.2e} a_obj {:.2e} objects {:.2e} probe {:.2e} \
                  offsets {:.2e}",
@@ -394,22 +407,43 @@ fn matches_cpu(propagator: &str) {
 
 #[test]
 fn sliced_lsqml_matches_cpu_in_the_far_field() {
-    matches_cpu(PROPAGATORS[0]);
+    matches_cpu(PROPAGATORS[0], &[2, 3], 1);
 }
 
 #[test]
 fn sliced_lsqml_matches_cpu_under_angular_spectrum() {
-    matches_cpu(PROPAGATORS[1]);
+    matches_cpu(PROPAGATORS[1], &[2, 3], 1);
 }
 
 #[test]
 fn sliced_lsqml_matches_cpu_under_fresnel() {
-    matches_cpu(PROPAGATORS[2]);
+    matches_cpu(PROPAGATORS[2], &[2, 3], 1);
 }
 
 #[test]
 fn sliced_lsqml_matches_cpu_under_fresnel_back() {
-    matches_cpu(PROPAGATORS[3]);
+    matches_cpu(PROPAGATORS[3], &[2, 3], 1);
+}
+
+/// Two object modes through three slices, each view's wave its own through every slice.
+#[test]
+fn sliced_lsqml_with_object_modes_matches_cpu_in_the_far_field() {
+    matches_cpu(PROPAGATORS[0], &[3], 2);
+}
+
+#[test]
+fn sliced_lsqml_with_object_modes_matches_cpu_under_angular_spectrum() {
+    matches_cpu(PROPAGATORS[1], &[3], 2);
+}
+
+#[test]
+fn sliced_lsqml_with_object_modes_matches_cpu_under_fresnel() {
+    matches_cpu(PROPAGATORS[2], &[3], 2);
+}
+
+#[test]
+fn sliced_lsqml_with_object_modes_matches_cpu_under_fresnel_back() {
+    matches_cpu(PROPAGATORS[3], &[3], 2);
 }
 
 /// The LLK pass through two and three slices gives the CPU's LLK of the same arrays under
@@ -417,17 +451,27 @@ fn sliced_lsqml_matches_cpu_under_fresnel_back() {
 /// left, whose record is the pass's own. Graphs and eager launches leave the same bits.
 #[test]
 fn sliced_llk_matches_cpu() {
+    llk_matches_cpu(&[2, 3], 1);
+}
+
+/// [`sliced_llk_matches_cpu`] through three slices of two object modes.
+#[test]
+fn sliced_llk_with_object_modes_matches_cpu() {
+    llk_matches_cpu(&[3], 2);
+}
+
+/// [`sliced_llk_matches_cpu`] after each of `nslices` slices of `nobj` modes.
+fn llk_matches_cpu(nslices: &[usize], nobj: usize) {
     let params = LsqmlParams {
         batch_size: 12,
         cost: Cost::Poisson,
         seed: 7,
     };
-    for (propagator, nslice, position) in PROPAGATORS.into_iter().flat_map(|p| {
-        [2, 3]
-            .into_iter()
-            .flat_map(move |n| [false, true].map(move |m| (p, n, m)))
-    }) {
-        let c = case(optics(propagator, nslice), NPOS);
+    for (propagator, nslice, position) in PROPAGATORS
+        .into_iter()
+        .flat_map(|p| (nslices.iter()).flat_map(move |&n| [false, true].map(move |m| (p, n, m))))
+    {
+        let c = case(optics(propagator, nslice), NPOS, nobj);
         let features = moved(position);
         let run = |graph| {
             let mut gpu = c.gpu(GpuOptions { graph, ..OPTIONS });
@@ -443,7 +487,7 @@ fn sliced_llk_matches_cpu() {
             (start, records, end, want)
         };
         let (start, records, end, want) = run(true);
-        let what = format!("{propagator} {nslice} slices position {position}");
+        let what = format!("{propagator} {nslice} slices {nobj} modes position {position}");
         assert!(
             llk_bits(&records[1]) == llk_bits(&end),
             "{what}: the epoch's record is not the pass's"
@@ -477,7 +521,7 @@ fn sliced_llk_matches_cpu() {
 #[test]
 fn sliced_llk_matches_cpu_without_the_fused_passes() {
     for propagator in ["far field", "Fresnel"] {
-        let c = case(optics(propagator, 3), NPOS);
+        let c = case(optics(propagator, 3), NPOS, 1);
         let want = c.llk(&c.objects, &c.probe, None);
         for graph in [true, false] {
             let options = GpuOptions {
@@ -504,7 +548,7 @@ fn bits(s: &Stack<C64>) -> Vec<[u64; 2]> {
 /// whose last stack is short (12 in stacks of 8) and whose every stack is (4 in stacks of 8).
 #[test]
 fn sliced_lsqml_is_bit_identical_with_graphs_and_without() {
-    let c = case(optics("angular spectrum", 3), NPOS);
+    let c = case(optics("angular spectrum", 3), NPOS, 1);
     let features = moved(true);
     for batch_size in [12, 4] {
         let params = LsqmlParams {
@@ -549,7 +593,7 @@ const NPOS_RECUT: usize = 300;
 /// it, and with it dropped. Dropped before any pass, it leaves a fresh start's LLK bits.
 #[test]
 fn sliced_llk_follows_the_stacks_a_position_recuts() {
-    let c = case(optics("angular spectrum", 3), NPOS_RECUT);
+    let c = case(optics("angular spectrum", 3), NPOS_RECUT, 1);
     let options = GpuOptions {
         stack_size: None,
         ..OPTIONS
@@ -601,7 +645,7 @@ fn sliced_llk_follows_the_stacks_a_position_recuts() {
 /// the pass launches anything, naming the cause and changing nothing.
 #[test]
 fn gpu_refuses_what_it_cannot_run_on_slices() {
-    let c = case(optics("angular spectrum", 3), NPOS);
+    let c = case(optics("angular spectrum", 3), NPOS, 1);
     let build = |optics: &Optics, objects: &[Object]| {
         GpuPtycho::with_slices(&ctx(), &c.scan, optics, objects, c.probe.clone(), OPTIONS)
             .err()
@@ -623,11 +667,8 @@ fn gpu_refuses_what_it_cannot_run_on_slices() {
     other[2] = ones([nmode, ny + 2, nx]);
     let e = build(&c.optics, &other);
     assert!(e.contains("differs from the first's"), "{e}");
-    let two = vec![ones([2, ny, nx]); 3];
-    let e = build(&c.optics, &two);
-    assert!(e.contains("a multislice object of one mode, got 2"), "{e}");
 
-    let mut gpu = case(optics("far field", 3), NPOS).gpu(OPTIONS);
+    let mut gpu = case(optics("far field", 3), NPOS, 1).gpu(OPTIONS);
     let before: Vec<_> = gpu.objects().unwrap().iter().map(|o| bits(o)).collect();
     let probe = bits(&gpu.probe().unwrap());
     let bh = BhParams {

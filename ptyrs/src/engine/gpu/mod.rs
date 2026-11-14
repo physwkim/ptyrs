@@ -39,7 +39,7 @@ use crate::base::{AddrTable, C64, Object, Probe, Scan, Stack};
 use crate::fft::Plan2d;
 use crate::gpu::{
     C32, CG_BLOCKS, Ended, Error as GpuError, FarSums, FusedBufs, FusedInputs, Model,
-    ObjProbeScale, RecordWriter, StackRef, StackTable, ViewAddr, ViewDims,
+    ObjProbeScale, RecordWriter, StackRef, StackTable, ViewAddr, ViewDims, Waves,
 };
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
@@ -59,12 +59,12 @@ pub struct GpuOptions {
     /// each pass cuts the scan, BH and LSQML each batch, into as few stacks as that takes, of
     /// lengths within a frame of each other; PyNX's default is 16. `None`, the default, cuts each
     /// pass by bytes instead: as many frames as fill 3/8 of the device's L2, the fastest share at
-    /// frame sides 256 and 512, with the buffers that more than one launch over a stack touches,
-    /// which stay in L2 between them. That is the shared scratch alone in AP, the LLK pass and ML's
-    /// gradient, and with it DM's and RAAR's carried exit waves (RAAR's iterate, touched once,
-    /// streams); ML's line search, BH and LSQML count their own buffers, and under the position
-    /// model BH and LSQML the shift planes they borrow from the shared scratch, whose stacks also
-    /// cap theirs.
+    /// frame sides 256 and 512, with the most bytes that the launches over a stack leave in L2
+    /// for later ones at any one point, but no fewer than keep the device's threads busy, ~3.4
+    /// pixels each. That is the shared scratch alone in AP, the LLK pass and ML's gradient, and
+    /// with it DM's and RAAR's carried exit waves (RAAR's iterate, touched once, streams); ML's
+    /// line search, BH and LSQML count their own buffers, and under the position model BH and
+    /// LSQML the shift planes they borrow from the shared scratch, whose stacks also cap theirs.
     pub stack_size: Option<usize>,
     /// Replay every AP, DM and ML cycle, rPIE epoch and LLK pass from a CUDA graph captured once
     /// per kind of cycle instead of launching it kernel by kernel; both give the same bits.
@@ -78,6 +78,11 @@ pub struct GpuOptions {
     /// [`crate::gpu::FUSED_SIDES`], and [`GpuPtycho::new`] fails on others) instead of M1's
     /// launch sequence. The two agree to rounding, not bit for bit.
     pub fused: bool,
+    /// Hold DM's and RAAR's carried exit waves and RAAR's iterate as f16 pairs, each value
+    /// times one power of two fixed from the counts at upload (DESIGN B5), and cut their
+    /// stacks at those 4 bytes per value. Fused passes only: M1's cuFFT transforms the waves
+    /// in place in f32, and [`GpuPtycho::new`] fails on `psi_f16` without [`Self::fused`].
+    pub psi_f16: bool,
 }
 
 impl Default for GpuOptions {
@@ -87,6 +92,7 @@ impl Default for GpuOptions {
             graph: true,
             llk_slots: 8,
             fused: true,
+            psi_f16: false,
         }
     }
 }
@@ -288,49 +294,112 @@ fn table_of(
     Ok((frames, table))
 }
 
-/// A per-frame buffer of a loop over stacks: its bytes per frame and how many of the passes
-/// over one stack (launches) of the loop's cycle touch it.
+/// A buffer of a loop over stacks: its bytes per frame, its bytes whatever the stack's frames,
+/// and the first and last of the passes over one stack (launches, numbered in order) that touch
+/// it. A call that transforms in chunks counts as the launches of one chunk, however many it
+/// takes. The loops sharing a cut number their passes in turn, so a buffer kept from one loop
+/// to the next is listed once for each: that reuse spans all of a batch's stacks, which no
+/// stack size keeps in L2.
 #[derive(Clone, Copy, Debug)]
 struct Streamed {
     bytes: usize,
-    passes: u32,
+    fixed: usize,
+    first: u32,
+    last: u32,
 }
 
 impl Streamed {
-    fn new(bytes: usize, passes: u32) -> Self {
-        Self { bytes, passes }
+    /// `bytes` per frame, touched by `passes`.
+    fn new(bytes: usize, passes: std::ops::RangeInclusive<u32>) -> Self {
+        Self {
+            bytes,
+            ..Self::fixed(0, passes)
+        }
+    }
+
+    /// `bytes` whatever the stack's frames, touched by `passes`. An `ObjectSampler` call from
+    /// pass `p` is `fixed(held, p..=p + 2)`, `held` the bytes it keeps across its launches:
+    /// one chunk's three, the last writing or the first reading the stack's planes; the next
+    /// launch is `p + 3`.
+    fn fixed(bytes: usize, passes: std::ops::RangeInclusive<u32>) -> Self {
+        Self {
+            bytes: 0,
+            fixed: bytes,
+            first: *passes.start(),
+            last: *passes.end(),
+        }
+    }
+
+    /// Whether it is live from pass `p` to the next: touched by `p` or an earlier pass and by a
+    /// later one.
+    fn live(self, p: u32) -> bool {
+        (self.first..self.last).contains(&p)
+    }
+
+    /// The shift planes of a [`Kernels::shifted_psi_sums`] from pass `p`: `shift_pre` writes
+    /// `T`, `shift_sums` reads it into the adjoint, object planes and power, `shift_post` and
+    /// the probe sums take the adjoint, the gather the rest.
+    fn shifted_psi_sums(dims: &ViewDims, p: u32) -> [Self; 3] {
+        let probe = plane_bytes::<C32>(dims, dims.nprobe);
+        let obj = plane_bytes::<C32>(dims, dims.nobj) + plane_bytes::<f32>(dims, 1);
+        [
+            Self::new(probe, p..=p + 1),
+            Self::new(probe, p + 1..=p + 3),
+            Self::new(obj, p + 1..=p + 4),
+        ]
     }
 }
 
 /// [`GpuOptions::stack_size`] on one device: a loop's frames per stack from the buffers its
-/// passes stream. Stacking keeps the buffers a stack's passes share in L2 from one pass to the
-/// next, so only the bytes per frame of buffers more than one pass touches fill the budget; a
-/// buffer one pass touches streams through either way.
+/// passes stream. Stacking keeps what one pass over a stack leaves for a later one in L2, so
+/// the budget holds what is live across every boundary between passes, its fixed bytes and its
+/// bytes per frame for each frame; a buffer one pass touches streams through either way. Below
+/// a floor of frames a pass leaves the device's threads short of work, whatever L2 holds.
 #[derive(Clone, Copy, Debug)]
 struct StackRule {
     size: Option<usize>,
     /// 3/8 of the device's L2, in bytes.
     budget: usize,
+    /// The fewest frames per stack that keep the device's threads busy.
+    floor: usize,
 }
 
 impl StackRule {
-    /// For `size` on a device of an `l2`-byte L2.
-    fn new(size: Option<usize>, l2: usize) -> Self {
+    /// For `size` on `ctx`'s device and frames of `dims`.
+    fn on(size: Option<usize>, ctx: &CudaContext, dims: &ViewDims) -> Result<Self, EngineError> {
+        let sms = ctx.multiprocessor_count()? as usize;
+        let threads = sms * ctx.max_threads_per_multiprocessor()? as usize;
+        Ok(Self::new(size, ctx.l2_cache_size_bytes()?, threads, dims))
+    }
+
+    /// For `size` on a device of an `l2`-byte L2 and `threads` resident threads, and frames of
+    /// `dims`. The floor holds ~3.4 pixels per thread, where the measured fastest stacks begin:
+    /// 2^19 pixels on 100 SMs of 1536 threads, 32, 8 and 2 frames at 128x128, 256x256 and
+    /// 512x512.
+    fn new(size: Option<usize>, l2: usize, threads: usize, dims: &ViewDims) -> Self {
         Self {
             size,
             budget: l2 / 8 * 3,
+            floor: (threads * 17 / 5).div_ceil(dims.n()),
         }
     }
 
-    /// Frames per stack of a loop over `bufs`: the given size, else as many frames of the
-    /// shared buffers as fit the budget, at least one.
+    /// Frames per stack of a loop over `bufs`: the given size, else the most that fit the
+    /// budget beside the fixed bytes at every boundary where frames' bytes are live, at least
+    /// the floor.
     fn frames(self, bufs: &[Streamed]) -> Result<u32, EngineError> {
-        let shared: usize = (bufs.iter().filter(|b| b.passes > 1))
-            .map(|b| b.bytes)
-            .sum();
-        let n = self
-            .size
-            .unwrap_or_else(|| (self.budget / shared.max(1)).max(1));
+        // What is live after a pass is live after the latest first pass up to it, a set that
+        // bounds the frames at least as tightly, so the first passes suffice.
+        let fit = (bufs.iter().map(|b| b.first))
+            .filter_map(|p| {
+                let live = || bufs.iter().filter(|b| b.live(p));
+                let per_frame: usize = live().map(|b| b.bytes).sum();
+                let fixed: usize = live().map(|b| b.fixed).sum();
+                (per_frame > 0).then(|| self.budget.saturating_sub(fixed) / per_frame)
+            })
+            .min()
+            .unwrap_or(self.budget);
+        let n = self.size.unwrap_or_else(|| fit.max(self.floor));
         to_u32("stack_size", n)
     }
 
@@ -434,8 +503,7 @@ impl GpuPtycho {
 
     /// [`Self::with_optics`] on a multislice object, `objects` its slices in the order the
     /// wave crosses them, one per slice of `optics` and all of one shape. More than one
-    /// slice runs LSQML alone ([`Self::lsqml`]), with one object mode: every other
-    /// algorithm fails on it.
+    /// slice runs LSQML alone ([`Self::lsqml`]): every other algorithm fails on it.
     pub fn with_slices(
         ctx: &Arc<CudaContext>,
         scan: &Scan,
@@ -457,12 +525,6 @@ impl GpuPtycho {
                 "object slice {:?} differs from the first's {:?}",
                 o.dims(),
                 object.dims()
-            )));
-        }
-        if objects.len() > 1 && object.nmode() != 1 {
-            return Err(EngineError::Invalid(format!(
-                "the GPU backend runs a multislice object of one mode, got {}",
-                object.nmode()
             )));
         }
         let g = scan.geometry;
@@ -818,7 +880,7 @@ impl Bufs<'_> {
         &mut self,
         ctx: &ExecutionContext,
         stack: StackRef<'_>,
-        psi: &DeviceBuffer<C32>,
+        psi: &dyn Waves,
         obj: bool,
         probe: bool,
     ) -> Result<(), GpuError> {
@@ -933,27 +995,97 @@ mod tests {
         assert_eq!(lens(3..8, 8), [5]);
     }
 
-    /// 24 MiB of a 64 MiB L2 holds 24, 12, 8 and 6 frames of one to four shared two-mode
-    /// exit-wave sets at 256x256, 6, 3, 2 and 1 at 512x512, and 16 of one and a half (a set
-    /// stored at half width); a set one pass touches does not count; a frame alone that
-    /// overfills it is one, and a given size wins.
+    /// 24 MiB of a 64 MiB L2 holds 24, 12, 8 and 6 frames of one to four two-mode exit-wave
+    /// sets live across one pass boundary at 256x256, 6, 3, 2 and 1 at 512x512, and 16 of one
+    /// and a half (a set stored at half width). A set one pass touches does not count, nor does
+    /// one handed on at a pass, while sets whose passes overlap add up. A frame alone that
+    /// overfills it is one; on 153600 threads four sets take the floor, 32, 8 and 2 frames at
+    /// 128x128, 256x256 and 512x512, and one set at 128x128 its fit, 96. A given size wins.
     #[test]
     fn stack_rule_fills_three_eighths_of_l2() {
         const L2: usize = 64 << 20;
-        let rule = StackRule::new(None, L2);
-        let sets = |wave, k, passes| vec![Streamed::new(wave, passes); k];
+        type Bufs<'a> = &'a [(usize, std::ops::RangeInclusive<u32>)];
+        let frames = |rule: StackRule, bufs: Bufs| {
+            let bufs: Vec<_> = bufs
+                .iter()
+                .map(|(b, p)| Streamed::new(*b, p.clone()))
+                .collect();
+            rule.frames(&bufs).unwrap()
+        };
         for (side, want) in [(256, [24, 12, 8, 6]), (512, [6, 3, 2, 1])] {
-            let wave = wave_bytes(&dims(side));
-            let frames = [1, 2, 3, 4].map(|k| rule.frames(&sets(wave, k, 2)).unwrap());
-            assert_eq!(frames, want);
+            let (rule, wave) = (
+                StackRule::new(None, L2, 1, &dims(side)),
+                wave_bytes(&dims(side)),
+            );
+            let k_sets = |k| frames(rule, &vec![(wave, 0..=1); k]);
+            assert_eq!([1, 2, 3, 4].map(k_sets), want);
         }
+        let (rule, wave) = (
+            StackRule::new(None, L2, 1, &dims(256)),
+            wave_bytes(&dims(256)),
+        );
+        assert_eq!(frames(rule, &[(wave, 0..=2), (wave, 1..=1)]), 24);
+        assert_eq!(frames(rule, &[(wave, 0..=1), (wave, 1..=2)]), 24);
+        assert_eq!(frames(rule, &[(wave, 0..=2), (wave, 1..=3)]), 12);
+        assert_eq!(frames(rule, &[(wave, 0..=1), (wave / 2, 0..=1)]), 16);
+        let big = [(wave_bytes(&dims(512)), 0..=1)];
+        assert_eq!(
+            frames(StackRule::new(None, 4 << 20, 1, &dims(512)), &big),
+            1
+        );
+        let floored = [128, 256, 512].map(|side| {
+            let rule = StackRule::new(None, L2, 153600, &dims(side));
+            frames(rule, &vec![(wave_bytes(&dims(side)), 0..=1); 4])
+        });
+        assert_eq!(floored, [32, 8, 2]);
+        let rule = StackRule::new(None, L2, 153600, &dims(128));
+        assert_eq!(frames(rule, &[(wave_bytes(&dims(128)), 0..=1)]), 96);
+        let given = StackRule::new(Some(16), L2, 153600, &dims(512));
+        assert_eq!(frames(given, &big), 16);
+    }
+
+    /// At 256x256 a two-mode set is 1 MiB a frame against a 24 MiB budget: one set live after
+    /// pass 0 and two after pass 2 fit 12 frames. 8 MiB fixed live after both passes binds
+    /// after 2, to 8 frames, as it does live there alone, and after 0 alone leaves 12; alone
+    /// after a pass it binds nothing. A sampler call's scratch over passes 0 to 2 does not meet
+    /// the block its last launch writes; held to pass 3 it does.
+    #[test]
+    fn a_fixed_entry_binds_where_frames_are_live_beside_it() {
+        const MIB: usize = 1 << 20;
+        let rule = StackRule::new(None, 64 * MIB, 1, &dims(256));
         let wave = wave_bytes(&dims(256));
-        let once = [sets(wave, 2, 3), sets(wave, 1, 1)].concat();
-        assert_eq!(rule.frames(&once).unwrap(), 12);
-        let half = [Streamed::new(wave, 2), Streamed::new(wave / 2, 2)];
-        assert_eq!(rule.frames(&half).unwrap(), 16);
-        let big = sets(wave_bytes(&dims(512)), 4, 2);
-        assert_eq!(StackRule::new(None, 4 << 20).frames(&big[..1]).unwrap(), 1);
-        assert_eq!(StackRule::new(Some(16), L2).frames(&big).unwrap(), 16);
+        assert_eq!(wave, MIB);
+        let sets = [0..=1, 2..=3, 2..=3].map(|p| Streamed::new(wave, p));
+        let with = |fixed: Streamed| rule.frames(&[sets.as_slice(), &[fixed]].concat()).unwrap();
+        assert_eq!(rule.frames(&sets).unwrap(), 12);
+        assert_eq!(with(Streamed::fixed(8 * MIB, 0..=3)), 8);
+        assert_eq!(with(Streamed::fixed(8 * MIB, 2..=3)), 8);
+        assert_eq!(with(Streamed::fixed(8 * MIB, 0..=1)), 12);
+        assert_eq!(with(Streamed::fixed(64 * MIB, 1..=2)), 12);
+        let block = Streamed::new(wave, 2..=3);
+        let call = |last| {
+            rule.frames(&[Streamed::fixed(23 * MIB, 0..=last), block])
+                .unwrap()
+        };
+        assert_eq!(call(2), 24);
+        assert_eq!(call(3), 1);
+    }
+
+    /// Fixed bytes past the budget beside a set leave no frame to fit, so the floor stands: 8
+    /// frames at 256x256 on 153600 threads, 1 on one thread; a given size still wins.
+    #[test]
+    fn the_floor_holds_under_a_fixed_entry_past_the_budget() {
+        const MIB: usize = 1 << 20;
+        let bufs = [
+            Streamed::new(wave_bytes(&dims(256)), 0..=1),
+            Streamed::fixed(32 * MIB, 0..=1),
+        ];
+        let frames = |size, threads| {
+            let rule = StackRule::new(size, 64 * MIB, threads, &dims(256));
+            rule.frames(&bufs).unwrap()
+        };
+        assert_eq!(frames(None, 153600), 8);
+        assert_eq!(frames(None, 1), 1);
+        assert_eq!(frames(Some(16), 153600), 16);
     }
 }

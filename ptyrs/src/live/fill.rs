@@ -1,24 +1,25 @@
 //! Predicted first values for object pixels (DESIGN.md §3 B6, §5 inv. 7).
 //!
-//! A [`PatchPredictor`] turns a batch's counts into one complex patch per
-//! frame, the centre of that frame's window on the object. [`PatchFill`]
-//! stitches a batch's patches into a [`Fill`]: the values of the pixels no
-//! earlier batch issued a prediction for, as rectangles in one pinned
-//! buffer, which [`crate::live::object::LiveObject::write_fill`] copies onto
-//! the object ahead of the batch's first epoch. The prediction is a first
-//! value only: the epochs that follow update it like any other pixel.
+//! A [`PatchPredictor`] turns frames' counts into one complex patch per
+//! frame, the centre of that frame's window on the object; one call takes
+//! the frames of every batch queued for it. [`PatchFill`] stitches a call's
+//! patches into a [`Fill`]: the values of the pixels no earlier call issued
+//! a prediction for, as rectangles in one pinned buffer, which
+//! [`crate::live::object::LiveObject::write_fill`] copies onto the object.
+//! The prediction is a first value only: the epochs that follow update it
+//! like any other pixel.
 //!
-//! Rule: first patch wins. A pixel takes a prediction once, from the first
-//! batch whose patches cover it, replacing whatever earlier epochs left
-//! there through the tails of neighbouring windows. `PatchFill` alone
-//! records which pixels those are.
+//! Rule: a pixel takes its first prediction when it lands, replacing
+//! whatever earlier epochs left there, including the epochs its own batch
+//! ran while waiting for the call. It takes one, from the first call whose
+//! patches cover it; `PatchFill` alone records which pixels those are.
 
 use std::f64::consts::PI;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use cuda_core::{Context, DriverError, PinnedHostBuffer};
 
-/// Predicts the object under the centre of each frame of a batch. It lives
+/// Predicts the object under the centre of each frame of a call. It lives
 /// outside the engine: only arrays cross (counts in, patches out).
 pub trait PatchPredictor: Send {
     /// `[py, px]`: the patch is the centre of a frame's window.
@@ -79,7 +80,7 @@ impl Drop for Lent {
     }
 }
 
-/// One batch's predictions for the pixels that had none: disjoint
+/// One call's predictions for the pixels that had none: disjoint
 /// rectangles over one pinned buffer. Clones share the buffer, one for each
 /// object the fill is written to; it returns to its [`PatchFill`] when the
 /// last of them drops, which an object that queued copies of it delays
@@ -132,8 +133,8 @@ pub struct PatchFill {
 }
 
 impl PatchFill {
-    /// For an object of `shape`, `patch`-sized predictions and batches of
-    /// up to `max_batch` frames, with `pool` fills in flight at most: one
+    /// For an object of `shape`, `patch`-sized predictions and calls of up
+    /// to `max_batch` frames, with `pool` fills in flight at most: one
     /// is in flight from [`Self::stitch`] until the objects it was written
     /// to ready tiles or take a fill after its copies ran.
     /// Everything [`Self::stitch`] needs is allocated here, pinned in `ctx`.
@@ -180,7 +181,7 @@ impl PatchFill {
         self.patch
     }
 
-    /// Batches [`Self::stitch`] turned away because every buffer was in
+    /// Calls [`Self::stitch`] turned away because every buffer was in
     /// flight.
     pub fn no_buffer(&self) -> u64 {
         self.no_buffer
@@ -192,7 +193,7 @@ impl PatchFill {
         self.issued[i / 64] >> (i % 64) & 1 == 1
     }
 
-    /// The fill of one batch: `patches` holds a patch for each of
+    /// The fill of one call: `patches` holds a patch for each of
     /// `corners`, the object pixel of its corner ([`patch_corner`]), in
     /// landing order. The pixels the patches cover that no prediction was
     /// issued for take the mean of the patches over them under the taper
@@ -202,10 +203,10 @@ impl PatchFill {
     /// had. Parts of a patch outside the object are ignored.
     ///
     /// `None`, with nothing issued, when no buffer is free: the pixels stay
-    /// open for a later batch.
+    /// open for a later call.
     pub fn stitch(&mut self, corners: &[[u32; 2]], patches: &[[f32; 2]]) -> Option<Fill> {
         let ([nyo, nxo], [py, px]) = (self.shape, self.patch);
-        assert!(corners.len() <= self.max_batch, "batch over max_batch");
+        assert!(corners.len() <= self.max_batch, "call over max_batch");
         assert_eq!(patches.len(), corners.len() * py * px);
         let taken = self
             .pool
@@ -368,7 +369,7 @@ pub(crate) mod standin {
         }
     }
 
-    /// The fill of a batch as the wiring builds it: `counts` and `views`,
+    /// The fill of one call as the wiring builds it: `counts` and `views`,
     /// `nmode` per frame, of its frames in landing order.
     pub(crate) fn batch_fill(
         pf: &mut PatchFill,
@@ -388,6 +389,9 @@ pub(crate) mod standin {
         pf.stitch(&corners, &out).expect("a buffer is free")
     }
 }
+
+#[cfg(test)]
+mod wired;
 
 #[cfg(test)]
 mod tests {

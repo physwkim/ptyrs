@@ -1,3 +1,4 @@
+#![warn(clippy::disallowed_methods)] // clippy.toml: CUDA devices only through ptyrs::nn::cuda
 use burn::prelude::*;
 use burn::tensor::DType;
 use cuda_core::{Context, DeviceBuffer};
@@ -15,7 +16,7 @@ fn host(t: &Tensor<2>) -> Vec<f32> {
 fn lend_aliases_burn_memory() {
     let ctx = Context::new(0).unwrap();
     let stream = ctx.new_stream().unwrap();
-    let device = Device::cuda(0);
+    let device = ptyrs::nn::cuda(0);
     let a = values(48, 0.25);
     // A computed tensor, so lend has to wait for burn's queued kernel.
     let t = Tensor::<2>::from_data(TensorData::new(a.clone(), [6, 8]), &device) * 2.0;
@@ -35,7 +36,7 @@ fn lend_aliases_burn_memory() {
 fn lend_makes_a_strided_view_row_major() {
     let ctx = Context::new(0).unwrap();
     let stream = ctx.new_stream().unwrap();
-    let device = Device::cuda(0);
+    let device = ptyrs::nn::cuda(0);
     let a = values(12, 1.0);
     let t = Tensor::<2>::from_data(TensorData::new(a.clone(), [3, 4]), &device).swap_dims(0, 1);
     let lent = lend(&t, &stream).unwrap();
@@ -50,7 +51,7 @@ fn lend_makes_a_strided_view_row_major() {
 fn lend_rejects_non_f32() {
     let ctx = Context::new(0).unwrap();
     let stream = ctx.new_stream().unwrap();
-    let t = Tensor::<2>::zeros([2, 2], &Device::cuda(0)).cast(DType::F16);
+    let t = Tensor::<2>::zeros([2, 2], &ptyrs::nn::cuda(0)).cast(DType::F16);
     assert!(matches!(
         lend(&t, &stream),
         Err(InteropError::DType(DType::F16))
@@ -61,7 +62,7 @@ fn lend_rejects_non_f32() {
 fn copy_in_copies_engine_memory() {
     let ctx = Context::new(0).unwrap();
     let stream = ctx.new_stream().unwrap();
-    let device = Device::cuda(0);
+    let device = ptyrs::nn::cuda(0);
     let a = values(48, 0.75);
     let mut engine = DeviceBuffer::from_host(&stream, &a).unwrap();
     let t = copy_in::<2>(&engine, [6, 8], &device, &stream).unwrap();
@@ -84,7 +85,7 @@ fn copy_in_rejects_wrong_length() {
     let stream = ctx.new_stream().unwrap();
     let engine = DeviceBuffer::from_host(&stream, &values(10, 1.0)).unwrap();
     assert!(matches!(
-        copy_in::<2>(&engine, [3, 4], &Device::cuda(0), &stream),
+        copy_in::<2>(&engine, [3, 4], &ptyrs::nn::cuda(0), &stream),
         Err(InteropError::Len {
             want: 12,
             have: 10,

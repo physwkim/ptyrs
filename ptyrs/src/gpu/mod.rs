@@ -35,6 +35,7 @@ mod bh;
 mod fused;
 mod grad;
 mod lsqml;
+mod opr;
 mod ops;
 mod optics;
 mod position;
@@ -57,12 +58,13 @@ pub use grad::{
 pub use lsqml::{
     LSQML_REC, LsqmlAt, LsqmlChi, LsqmlKernels, LsqmlNoise, LsqmlScan, LsqmlVar, SliceSteps,
 };
+pub use opr::{Opr, OprKernels, OprPlanes};
 pub use ops::{
     LLK_TREE_LEAVES, LlkPartial, LlkScratch, LlkSums, MASKED, OBJ_TILE, Permutation,
     PositionPartial, ScalePartial, StackCtl, StackGeom, StackRef, StackTable, UpdateSums, ViewAddr,
     ViewDims, Views, view_tiles,
 };
-pub use optics::{ExitPass, ExitStage, OpticsKernels, SlicePhase, SliceSource};
+pub use optics::{ExitPass, ExitStage, FrameWaves, OpticsKernels, SlicePhase, SliceSource};
 pub use position::{PositionKernels, PositionRule, Positions, Solve};
 pub use psi::{HalfWaves, Waves, half_scale};
 pub use ring::{Ended, FrameLlk, LlkRing, LlkTotals, RecordWriter, RingDevice, RingError};

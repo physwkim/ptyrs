@@ -10,6 +10,7 @@
 //! row per epoch, epoch 0 being the start.
 //!
 //! `cargo run --release -p ptyrs --features nn --example nn_m6_start -- <predictor_dir> <curves.tsv>`
+#![warn(clippy::disallowed_methods)] // clippy.toml: CUDA devices only through ptyrs::nn::cuda
 
 #[path = "common/nn/mod.rs"]
 mod common;
@@ -20,7 +21,6 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use burn::prelude::*;
 use ptyrs::base::{Object, Probe, Scan, sim};
 use ptyrs::engine::{DmParams, Ptycho, RpieParams};
 use ptyrs::nn::metric::{LLK_MARGIN, iterations_to_llk};
@@ -96,7 +96,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let dir = PathBuf::from(args.next().ok_or(usage)?);
     let curves = PathBuf::from(args.next().ok_or(usage)?);
-    let predictor = Predictor::load(&dir, &Device::cuda(0))?;
+    let predictor = Predictor::load(&dir, &ptyrs::nn::cuda(0))?;
     let frame = predictor.config().frame[0];
     let probe = sim::probe([frame, frame], 1)?;
     let mut cases = Vec::new();

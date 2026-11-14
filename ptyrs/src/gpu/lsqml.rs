@@ -19,7 +19,7 @@
 //! out: per stack [`Kernels::shifted_rows_fwd`] and its moved probe take the place of
 //! [`LsqmlKernels::forward`], [`Kernels::shifted_psi_sums`] and then
 //! [`Kernels::shifted_probe_sums`] that of the update sums, and [`LsqmlChi::Moved`] gives the
-//! dots the moved probe.
+//! dots the moved probe ([`FrameWaves::Probes`]).
 
 use std::ops::Range;
 
@@ -38,8 +38,8 @@ use crate::gpu::fused::{GRID_Y_MAX, Shape, Side, no_psi};
 use crate::gpu::ops::grid_1d;
 use crate::gpu::position::{ONE_BLOCK, chunk_grid, chunks, same_dims, span};
 use crate::gpu::{
-    BhScan, C32, Error, Kernels, StackCtl, StackGeom, StackRef, UpdateSums, ViewAddr, ViewDims,
-    Views, check_len, dptr,
+    BhScan, C32, Error, FrameWaves, Kernels, StackCtl, StackGeom, StackRef, UpdateSums, ViewAddr,
+    ViewDims, Views, check_len, dptr,
 };
 
 /// The walks of the frame passes over a stack, [`FUSED_DOWN`] or 0, each against the pass
@@ -165,14 +165,15 @@ fn trim(nb: u32) -> u32 {
     (nb as f64 * 0.1 / 2.0 - 0.5).ceil() as u32
 }
 
-/// A stack's exit-wave update `chi` ([`LsqmlKernels::chi`]) for [`LsqmlKernels::dots`]; under
-/// the position model with the stack's moved probe `w`
-/// ([`crate::gpu::PositionKernels::shift_w`]).
+/// A stack's exit-wave update `chi` ([`LsqmlKernels::chi`]) for [`LsqmlKernels::dots`]; with
+/// the waves `w` that stand for each view's `P q`: under the position model the stack's
+/// moved probe ([`crate::gpu::PositionKernels::shift_w`]), on a multislice object's deeper
+/// slice the wave entering it.
 pub enum LsqmlChi<'a> {
     Unmoved(&'a DeviceBuffer<C32>),
     Moved {
         chi: &'a DeviceBuffer<C32>,
-        w: &'a DeviceBuffer<C32>,
+        w: FrameWaves<'a>,
     },
 }
 
@@ -565,7 +566,7 @@ impl LsqmlKernels {
 
     /// The step-size sums of the stack's frames into `st` from its exit-wave update `chi`;
     /// `views` in epoch order. Under [`LsqmlChi::Moved`] the object direction's waves take
-    /// the moved probe.
+    /// its `w`.
     pub fn dots(
         &self,
         ctx: &ExecutionContext,
@@ -611,15 +612,14 @@ impl LsqmlKernels {
                     unsafe { self.module.lsqml_dots(stream, config, p, ctl, g, DOTS) }
                 });
         };
-        check_len("w", w, g.nf_max as usize * d.nprobe as usize * d.n())?;
+        let (w, waves) = w.planes(d, g.nf_max)?;
         reads.push(w.storage());
-        let w = dptr::<C32, f32>(w).cast_const();
         self.base
             .launch(ctx, &reads, &[st.dots.storage()], |stream| {
                 // SAFETY: as `lsqml_dots`; `w` checked above.
                 unsafe {
                     self.module
-                        .lsqml_dots_shifted(stream, config, p, w, ctl, g, DOTS)
+                        .lsqml_dots_shifted(stream, config, p, waves, ctl, g, DOTS)
                 }
             })
     }

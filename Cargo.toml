@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = ["ptyrs", "ptyrs-kernels", "ptyrs-py"]
+exclude = ["vendor"]
 
 [workspace.package]
 version = "0.0.1"
@@ -28,3 +29,8 @@ rand_chacha = "0.3"
 rand_distr = "0.4"
 rustfft = "6"
 rust-hdf5 = "0.7.13"
+
+[patch.crates-io]
+# Handle::can_mut counting only handle clones, and autotune results persisted per device part
+# and tuner crate version; goes once cubecl ships both.
+cubecl-runtime = { path = "vendor/cubecl-runtime" }
