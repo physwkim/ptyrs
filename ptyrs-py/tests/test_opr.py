@@ -50,7 +50,7 @@ def test_lsqml_opr_matches_engine(ref, run, views):
     start = variation(g)
     assert (start["intensity"] is not None) == (run == "intensity")
     lsqml = ptyrs.Lsqml(int(g.attrs["batch_size"]), g.attrs["cost"], int(g.attrs["seed"]),
-                        **{k: v for k, v in start.items() if v is not None})
+                        opr=(start["eigenmodes"], start["weights"], start["intensity"]))
     over = views_of(ref, views)
     o, pr = ref["object"][()][None], ref["probe"][()]
     epochs = sorted((k for k in g if k.startswith("epoch")), key=lambda k: int(k[5:]))
@@ -81,22 +81,22 @@ def test_lsqml_opr_refusals(ref):
     nframe = len(w)
     plain = ptyrs.Lsqml(4, "poisson", 7)
     assert plain.eigenmodes is None and plain.weights is None and plain.intensity is None
-    with pytest.raises(ValueError, match="go together"):
-        ptyrs.Lsqml(4, "poisson", 7, eigenmodes=e)
-    with pytest.raises(ValueError, match="go together"):
-        ptyrs.Lsqml(4, "poisson", 7, weights=w)
-    with pytest.raises(ValueError, match="intensity without eigenmodes"):
-        ptyrs.Lsqml(4, "poisson", 7, intensity=c)
+    # eigenmodes and weights always, and intensity in the third place even when None
+    with pytest.raises(ValueError, match="tuple of length 3"):
+        ptyrs.Lsqml(4, "poisson", 7, opr=(e, w))
+    for opr in ((e, None, c), (None, w, None)):
+        with pytest.raises(TypeError, match="opr"):
+            ptyrs.Lsqml(4, "poisson", 7, opr=opr)
     with pytest.raises(ValueError, match=r"\[nframe, k\] for k ≥ 1"):
-        ptyrs.Lsqml(4, "poisson", 7, eigenmodes=e[:0], weights=w[:, :0])
+        ptyrs.Lsqml(4, "poisson", 7, opr=(e[:0], w[:, :0], None))
     with pytest.raises(ValueError, match=r"\[nframe, k\] for k ≥ 1"):
-        ptyrs.Lsqml(4, "poisson", 7, eigenmodes=e[:1], weights=w)
+        ptyrs.Lsqml(4, "poisson", 7, opr=(e[:1], w, None))
     with pytest.raises(ValueError, match=f"{nframe - 1} main-mode weights for {nframe}"):
-        ptyrs.Lsqml(4, "poisson", 7, eigenmodes=e, weights=w, intensity=c[1:])
-    short = ptyrs.Lsqml(4, "poisson", 7, eigenmodes=e, weights=w[1:])
+        ptyrs.Lsqml(4, "poisson", 7, opr=(e, w, c[1:]))
+    short = ptyrs.Lsqml(4, "poisson", 7, opr=(e, w[1:], None))
     with pytest.raises(ValueError, match=f"{nframe - 1} weight rows for {nframe} frames"):
         short.epoch(p, o, pr)
-    small = ptyrs.Lsqml(4, "poisson", 7, eigenmodes=e[:, 1:, 1:], weights=w)
+    small = ptyrs.Lsqml(4, "poisson", 7, opr=(e[:, 1:, 1:], w, None))
     with pytest.raises(ValueError, match=r"of \[32, 32\] probe planes"):
         small.epoch(p, o, pr)
     np.testing.assert_array_equal(short.weights, w[1:])

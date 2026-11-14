@@ -448,21 +448,17 @@ impl Ptycho {
     }
 }
 
+/// `Lsqml`'s `opr`: eigenmodes, weights and main-mode weights.
+type Opr<'py> = (
+    PyReadonlyArray3<'py, C64>,
+    PyReadonlyArray2<'py, f64>,
+    Option<PyReadonlyArray1<'py, f64>>,
+);
+
 /// `eigenmodes` `[k, ny, nx]` (k ≥ 1), `weights` `[nframe, k]` and `intensity` `[nframe]` as
-/// the engine's [`ProbeVariation`], `None` without eigenmodes and weights.
-fn variation(
-    eigenmodes: Option<PyReadonlyArray3<'_, C64>>,
-    weights: Option<PyReadonlyArray2<'_, f64>>,
-    intensity: Option<PyReadonlyArray1<'_, f64>>,
-) -> PyResult<Option<ProbeVariation>> {
-    let (eigenmodes, weights) = match (eigenmodes, weights) {
-        (Some(e), Some(w)) => (stack_in(e)?, w),
-        (None, None) if intensity.is_none() => return Ok(None),
-        (None, None) => return Err(PyValueError::new_err("intensity without eigenmodes")),
-        _ => {
-            return Err(PyValueError::new_err("eigenmodes and weights go together"));
-        }
-    };
+/// the engine's [`ProbeVariation`].
+fn variation((eigenmodes, weights, intensity): Opr<'_>) -> PyResult<ProbeVariation> {
+    let eigenmodes = stack_in(eigenmodes)?;
     let k = eigenmodes.len();
     let w = weights.as_array();
     if k == 0 || w.ncols() != k {
@@ -473,7 +469,7 @@ fn variation(
     }
     let var = ProbeVariation::new(eigenmodes, w.iter().copied().collect());
     let Some(c) = intensity else {
-        return Ok(Some(var));
+        return Ok(var);
     };
     let c = c.as_array().to_vec();
     if c.len() != w.nrows() {
@@ -483,7 +479,7 @@ fn variation(
             w.nrows()
         )));
     }
-    Ok(Some(var.with_intensity(c)))
+    Ok(var.with_intensity(c))
 }
 
 /// An error unless `var` holds weights for every frame of `nframe` and eigenmodes of `plane`.
@@ -501,10 +497,11 @@ fn variation_fits(var: &ProbeVariation, nframe: usize, plane: [usize; 2]) -> PyR
 
 /// LSQML across epochs (`ptyrs::engine::Lsqml`); `cost` is `"amplitude"` or `"poisson"`.
 /// With `position`, `[nframe, 2]` offsets as `Ptycho.set_features` takes them, every epoch
-/// models and refines them. With `eigenmodes` `U_i` `[k, ny, nx]` and `weights` `w_fi`
-/// `[nframe, k]`, it models and refines OPR of probe mode 0, frame `f` seeing
-/// `c_f·P_0 + Σ_i w_fi·U_i`, and with `intensity` `[nframe]` the main-mode weights `c_f` too
-/// (1 without); `Ptycho.llk` does not model it.
+/// models and refines them. With `opr`, `(eigenmodes, weights, intensity)` of eigenmodes `U_i`
+/// `[k, ny, nx]`, weights `w_fi` `[nframe, k]` and main-mode weights `c_f` `[nframe]` or
+/// `None`, it models and refines OPR of probe mode 0, frame `f` seeing
+/// `c_f·P_0 + Σ_i w_fi·U_i`, and `c_f` too unless `None` (1 then); `Ptycho.llk` does not
+/// model it.
 #[pyclass]
 pub(crate) struct Lsqml {
     inner: ptyrs::engine::Lsqml,
@@ -514,16 +511,13 @@ pub(crate) struct Lsqml {
 #[pymethods]
 impl Lsqml {
     #[new]
-    #[pyo3(signature = (batch_size, cost, seed, *, position = None, eigenmodes = None,
-                        weights = None, intensity = None))]
+    #[pyo3(signature = (batch_size, cost, seed, *, position = None, opr = None))]
     fn new(
         batch_size: usize,
         cost: &str,
         seed: u64,
         position: Option<PyReadonlyArray2<'_, f64>>,
-        eigenmodes: Option<PyReadonlyArray3<'_, C64>>,
-        weights: Option<PyReadonlyArray2<'_, f64>>,
-        intensity: Option<PyReadonlyArray1<'_, f64>>,
+        opr: Option<Opr<'_>>,
     ) -> PyResult<Self> {
         let lsqml = ptyrs::engine::Lsqml::new(ptyrs::engine::LsqmlParams {
             batch_size,
@@ -534,7 +528,7 @@ impl Lsqml {
         let features = position_only(position)?;
         Ok(Self {
             inner: lsqml.with_features(features).map_err(Error::from)?,
-            var: variation(eigenmodes, weights, intensity)?,
+            var: opr.map(variation).transpose()?,
         })
     }
 
