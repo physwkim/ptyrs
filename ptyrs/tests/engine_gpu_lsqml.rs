@@ -20,12 +20,16 @@ use ptyrs::gpu::FUSED_SIDES;
 
 #[path = "common/engine/mod.rs"]
 mod common;
+#[path = "common/worst.rs"]
+mod worst;
+use worst::worst_of;
 
-/// 30 positions: stacks of 7 and batches of 12 or 4 leave a shorter last one.
+/// 30 positions: stacks of at most 8 cut them into 8, 8, 7 and 7 frames, and batches of 12 or
+/// 4 leave a shorter last one.
 const NPOS: usize = 30;
 
 const OPTIONS: GpuOptions = GpuOptions {
-    stack_size: Some(7),
+    stack_size: Some(8),
     graph: true,
     llk_slots: 3,
     fused: true,
@@ -119,11 +123,7 @@ fn offsets_rel(a: &Features, b: &Features, start: &Features) -> f64 {
             .collect()
     };
     let (a, b) = (delta(a), delta(b));
-    let d = a
-        .iter()
-        .zip(&b)
-        .map(|(a, b)| (a - b).abs())
-        .fold(0.0, f64::max);
+    let d = worst_of(a.iter().zip(&b).map(|(a, b)| (a - b).abs()));
     d / b.iter().map(|b| b.abs()).fold(0.0, f64::max)
 }
 
@@ -192,14 +192,14 @@ fn steps_match_cpu(position: Option<Vec<[f64; 2]>>) {
                 .enumerate()
                 {
                     for (a, b) in a.iter().zip(b) {
-                        worst[i] = worst[i].max(rel(*a, *b));
+                        worst[i] = worst_of([worst[i], rel(*a, *b)]);
                     }
                 }
             }
-            worst[3] = worst[3].max(rel_l2(&gpu.object().unwrap(), &o));
-            worst[4] = worst[4].max(rel_l2(&gpu.probe().unwrap(), &p));
+            worst[3] = worst_of([worst[3], rel_l2(&gpu.object().unwrap(), &o)]);
+            worst[4] = worst_of([worst[4], rel_l2(&gpu.probe().unwrap(), &p)]);
             let offsets = offsets_rel(&gpu.features().unwrap(), cpu.features(), &features);
-            worst[5] = worst[5].max(offsets);
+            worst[5] = worst_of([worst[5], offsets]);
         }
         eprintln!(
             "lsqml steps {cost:?} graph {graph} batch {batch_size} position {}: a_far {:.2e} \
@@ -287,7 +287,7 @@ fn matches_cpu(position: Option<Vec<[f64; 2]>>) {
                 (g.llk.euclidian, w.llk.euclidian),
                 (g.llk.nb_photons_calc, w.llk.nb_photons_calc),
             ] {
-                llk = llk.max(rel(a, b));
+                llk = worst_of([llk, rel(a, b)]);
             }
         }
         let errs = [
@@ -325,7 +325,7 @@ fn steps_rel(got: &[LsqmlStep], want: &[LsqmlStep]) -> f64 {
             (&g.a_probe, &w.a_probe),
         ] {
             for (a, b) in a.iter().zip(b) {
-                worst = worst.max(rel(*a, *b));
+                worst = worst_of([worst, rel(*a, *b)]);
             }
         }
     }
@@ -478,8 +478,8 @@ fn run_bits(g: &GpuPtycho) -> RunBits {
     }
 }
 
-/// With a position, 3 epochs leave the same bits in stacks of 7, 4 and every frame, and
-/// eagerly in stacks of 7.
+/// With a position, 3 epochs leave the same bits in stacks of 8, 4 and every frame, and
+/// eagerly in stacks of 8.
 #[test]
 fn lsqml_position_is_bit_identical_across_stack_splits() {
     let frame = FUSED_SIDES[0] as usize;
@@ -502,16 +502,16 @@ fn lsqml_position_is_bit_identical_across_stack_splits() {
             g.lsqml(&params, 3, 1).unwrap();
             run_bits(&g)
         };
-        let seven = run(7, true);
-        assert_eq!(seven.llk.len(), 3);
-        for (stack_size, graph) in [(4, true), (NPOS, true), (7, false)] {
+        let eight = run(8, true);
+        assert_eq!(eight.llk.len(), 3);
+        for (stack_size, graph) in [(4, true), (NPOS, true), (8, false)] {
             let other = run(stack_size, graph);
             let what = format!("{cost:?} batch {batch_size} stacks of {stack_size} graph {graph}");
-            assert!(other.steps == seven.steps, "{what}: steps differ");
-            assert!(other.llk == seven.llk, "{what}: LLK records differ");
-            assert!(other.object == seven.object, "{what}: object differs");
-            assert!(other.probe == seven.probe, "{what}: probe differs");
-            assert!(other.offsets == seven.offsets, "{what}: offsets differ");
+            assert!(other.steps == eight.steps, "{what}: steps differ");
+            assert!(other.llk == eight.llk, "{what}: LLK records differ");
+            assert!(other.object == eight.object, "{what}: object differs");
+            assert!(other.probe == eight.probe, "{what}: probe differs");
+            assert!(other.offsets == eight.offsets, "{what}: offsets differ");
         }
     }
 }

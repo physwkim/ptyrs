@@ -4,7 +4,7 @@
 use crate::base::{C64, Object, Probe, Stack, View};
 
 use crate::engine::{
-    EngineError, Propagator, SliceWaves, accumulate_obj, accumulate_probe, obj_probe_to_psi,
+    EngineError, Exit, Propagator, SliceWaves, accumulate_obj, accumulate_probe, obj_probe_to_psi,
 };
 
 /// A linear map `A` from `domain_len()` to `range_len()` complex values with its adjoint
@@ -220,11 +220,11 @@ impl LinearOp for SliceJacobian<'_> {
     }
 }
 
-/// [`SliceJacobian`] then the propagator `U` to the detector plane, the change of the
+/// [`SliceJacobian`] then the [`Exit`] `U` to the detector plane, the change of the
 /// detector-plane field; adjoint `Jᴴ·Uᴴ`, which takes [`crate::engine::BhBatch`]'s gradient back.
 pub(crate) struct FarJacobian<'a> {
     pub slices: SliceJacobian<'a>,
-    pub propagator: &'a Propagator,
+    pub exit: Exit<'a>,
 }
 
 impl LinearOp for FarJacobian<'_> {
@@ -236,11 +236,11 @@ impl LinearOp for FarJacobian<'_> {
     }
     fn forward(&self, x: &[C64], y: &mut [C64]) {
         self.slices.forward(x, y);
-        self.propagator.forward(y);
+        self.exit.forward(y);
     }
     fn adjoint(&self, y: &[C64], x: &mut [C64]) {
         let mut near = y.to_vec();
-        self.propagator.adjoint(&mut near);
+        self.exit.adjoint(&mut near);
         self.slices.adjoint(&near, x);
     }
 }

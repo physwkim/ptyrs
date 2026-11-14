@@ -434,14 +434,21 @@ fn index(
         })?;
         for j in 0..n as usize {
             let uid = a.uid[j];
-            pos.insert(
-                uid,
-                Pos {
-                    x: a.x[j],
-                    y: a.y[j],
-                    t_rx: t,
-                },
-            );
+            let p = Pos {
+                x: a.x[j],
+                y: a.y[j],
+                t_rx: t,
+            };
+            // The file is the record of the scan: one it cannot give is not a lost frame.
+            if !p.valid() {
+                return Err(format!(
+                    "frame {} (uid {uid}): position ({}, {}) is not a scan position",
+                    next + j as u64,
+                    p.x,
+                    p.y
+                ));
+            }
+            pos.insert(uid, p);
             let t_pub = (a.sec[j] as i64 + EPICS_EPOCH_S) * 1_000_000_000 + a.nsec[j] as i64;
             let job = Job {
                 index: next + j as u64,
@@ -514,6 +521,7 @@ mod tests {
 
     use super::*;
     use crate::live::codec::{Bslz4Scratch, bslz4_decompress_into_u16, bytemuck_u16_mut};
+    use crate::live::pos::Entry;
     use crate::live::sched::FairSched;
 
     /// Removed when the test ends, pass or fail.
@@ -738,6 +746,35 @@ mod tests {
         rep.unwrap();
         check(&got, &pos, 3, Codec::None);
         assert_eq!(st.rejected, 0);
+    }
+
+    /// A file whose frame has no scan position ends the run with an error
+    /// naming it, at each way out of [`Positions::valid`]; the frames before
+    /// it were queued.
+    ///
+    /// [`Positions::valid`]: crate::base::Positions::valid
+    #[test]
+    fn a_position_that_is_not_a_scan_position_is_an_error() {
+        let outside = 1e10f64.next_up();
+        for (name, bad) in [
+            ("nan", (f64::NAN, 0.0)),
+            ("inf", (0.0, f64::INFINITY)),
+            ("neg-inf", (f64::NEG_INFINITY, 0.0)),
+            ("outside", (0.0, -outside)),
+        ] {
+            let t = tmp(name);
+            let mut out = SwmrOut::create(&t.0, Codec::None, (W, H)).unwrap();
+            write(&mut out, Codec::None, 0..2);
+            let c = filtered_chunk(Codec::None, &frame(2), W, H);
+            out.append(&c, 2, bad, wall_of(2)).unwrap();
+            out.close().unwrap();
+            let (got, pos, rep, _) = follow(&cfg(&t.0, 1), 2, || {});
+            let e = rep.err().expect("the source fails");
+            assert!(e.contains("frame 2 (uid 2)"), "{name}: {e}");
+            assert!(e.contains("is not a scan position"), "{name}: {e}");
+            check(&got, &pos, 2, Codec::None);
+            assert_eq!(pos.lookup(2), Entry::Absent, "{name}");
+        }
     }
 
     /// A chunk whose lz4 framing does not hold the image is rejected and

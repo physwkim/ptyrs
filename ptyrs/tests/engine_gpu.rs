@@ -22,9 +22,12 @@ use ptyrs::gpu::{
 mod common;
 #[path = "common/ptychi/mod.rs"]
 mod ptychi;
+#[path = "common/worst.rs"]
+mod worst;
+use worst::worst_of;
 
-/// 30 positions: stacks of 7 and batches of 4 both leave a shorter last one. Three LLK
-/// slots: the ring wraps within every LLK-taking call.
+/// 30 positions: stacks of at most 8 cut them into 8, 8, 7 and 7 frames, and batches of 4
+/// leave a shorter last one. Three LLK slots: the ring wraps within every LLK-taking call.
 const NPOS: usize = 30;
 
 /// A frame side and the options run on it.
@@ -38,7 +41,7 @@ struct Setup {
 const M1: Setup = Setup {
     frame: 32,
     options: GpuOptions {
-        stack_size: Some(7),
+        stack_size: Some(8),
         graph: true,
         llk_slots: 3,
         fused: false,
@@ -114,7 +117,7 @@ fn llk_rel(g: &[LlkRecord], c: &[LlkRecord]) -> f64 {
             (g.llk.euclidian, c.llk.euclidian),
             (g.llk.nb_photons_calc, c.llk.nb_photons_calc),
         ] {
-            worst = worst.max((a - b).abs() / b.abs());
+            worst = worst_of([worst, (a - b).abs() / b.abs()]);
         }
     }
     worst
@@ -458,15 +461,16 @@ fn bh_steps_match_cpu() {
                     (g.bottom, w.bottom),
                 ] {
                     // a CPU 0 (β in steepest descent) must be an exact GPU 0
-                    worst[0] = worst[0].max(if b == 0.0 {
+                    let e = if b == 0.0 {
                         a.abs()
                     } else {
                         (a - b).abs() / b.abs()
-                    });
+                    };
+                    worst[0] = worst_of([worst[0], e]);
                 }
             }
-            worst[1] = worst[1].max(rel_l2(&gpu.object().unwrap(), &o));
-            worst[2] = worst[2].max(rel_l2(&gpu.probe().unwrap(), &p));
+            worst[1] = worst_of([worst[1], rel_l2(&gpu.object().unwrap(), &o)]);
+            worst[2] = worst_of([worst[2], rel_l2(&gpu.probe().unwrap(), &p)]);
         }
         eprintln!(
             "bh steps fused {} graph {graph} batch {batch_size}: step {:.2e} object {:.2e} probe {:.2e}",
@@ -655,8 +659,8 @@ fn gpu_rejects_what_it_cannot_run() {
 /// AP, DM, RAAR and ML cycles (AP's and ML's with an LLK, DM's, RAAR's and ML's first included), rPIE
 /// epochs and LLK passes replayed from captured graphs give the eager bits: the object, the
 /// probe and every LLK record read from the ring, across the parameter and algorithm switches
-/// that make a new capture and calls that reuse the last one, with a short last stack and
-/// batch, and the public LLK query between calls.
+/// that make a new capture and calls that reuse the last one, with stacks of two lengths and
+/// a short last batch, and the public LLK query between calls.
 #[test]
 fn graph_replays_bitwise_like_eager() {
     for setup in [M1, FUSED] {
@@ -1004,16 +1008,15 @@ fn features_match_cpu(
     let (g, c) = (gpu.features().unwrap(), cpu.features());
     let worst = |g: &Option<Vec<f64>>, c: &Option<Vec<f64>>| {
         assert_eq!(g.is_some(), c.is_some());
-        (g.iter().flatten().zip(c.iter().flatten()))
-            .map(|(a, b)| ((a - b) / b).abs())
-            .fold(0.0, f64::max)
+        worst_of((g.iter().flatten().zip(c.iter().flatten())).map(|(a, b)| ((a - b) / b).abs()))
     };
     let scale = worst(&g.scale, &c.scale);
     let background = worst(&g.background, &c.background);
     assert_eq!(g.position.is_some(), c.position.is_some());
-    let position = (g.position.iter().flatten().zip(c.position.iter().flatten()))
-        .flat_map(|(a, b)| [(a[0] - b[0]).abs(), (a[1] - b[1]).abs()])
-        .fold(0.0, f64::max);
+    let position = worst_of(
+        (g.position.iter().flatten().zip(c.position.iter().flatten()))
+            .flat_map(|(a, b)| [(a[0] - b[0]).abs(), (a[1] - b[1]).abs()]),
+    );
     println!(
         "{cycles:?}: llk {:.2e} object {:.2e} probe {:.2e} scale {scale:.2e} \
          background {background:.2e} position {position:.2e}",
@@ -1046,9 +1049,10 @@ fn scale_matches_cpu() {
     // Measured 2.2e-2, 9.3e-2 and 2.7e-2 from 0.67 at the start.
     for (cycles, flux_tol) in feature_cycles(1).into_iter().zip([0.05, 0.15, 0.05]) {
         let (cpu, plain) = features_match_cpu(cycles, &start, &ones, NCYCLE);
-        let off_flux = (cpu.features().scale.as_ref().unwrap().iter().enumerate())
-            .map(|(f, s)| (s * mean / flux(f) - 1.0).abs())
-            .fold(0.0, f64::max);
+        let off_flux = worst_of(
+            (cpu.features().scale.as_ref().unwrap().iter().enumerate())
+                .map(|(f, s)| (s * mean / flux(f) - 1.0).abs()),
+        );
         println!(
             "scale {cycles:?}: off flux {off_flux:.2e}; last llk {:.4e}, {:.4e} without",
             last_llk(&cpu),
@@ -1323,7 +1327,7 @@ fn rpie_position_matches_cpu() {
     );
 }
 
-/// rPIE under the position model in batches of 12, more frames than [`FUSED`]'s stacks of 7
+/// rPIE under the position model in batches of 12, more frames than [`FUSED`]'s stacks of 8
 /// hold, as [`features_match_cpu`] checks them.
 #[test]
 fn rpie_position_batch_over_stack() {
@@ -1459,11 +1463,12 @@ fn bh_position_matches_cpu() {
                     (g.bottom, w.bottom),
                 ] {
                     // a CPU 0 (β in steepest descent) must be an exact GPU 0
-                    step = step.max(if b == 0.0 {
+                    let e = if b == 0.0 {
                         a.abs()
                     } else {
                         (a - b).abs() / b.abs()
-                    });
+                    };
+                    step = worst_of([step, e]);
                 }
             }
             let errs = [
@@ -1472,9 +1477,9 @@ fn bh_position_matches_cpu() {
                 rel_l2(&gpu.probe().unwrap(), &p),
             ];
             let g = gpu.features().unwrap().position.unwrap();
-            let position = (g.iter().zip(&d))
-                .flat_map(|(a, b)| [(a[0] - b[0]).abs(), (a[1] - b[1]).abs()])
-                .fold(0.0, f64::max);
+            let position = worst_of(
+                (g.iter().zip(&d)).flat_map(|(a, b)| [(a[0] - b[0]).abs(), (a[1] - b[1]).abs()]),
+            );
             println!(
                 "bh position batch {batch_size} graph {graph}: llk {:.2e} object {:.2e} \
                  probe {:.2e} step {step:.2e} position {position:.2e}",
@@ -1545,7 +1550,7 @@ fn rpie_position_graphs_replay_bitwise_like_eager() {
 }
 
 /// DM, then RAAR, cycles modelling a position, two object-then-probe updates each, then ML
-/// cycles modelling it, give the bits of stacks of 7 frames with stacks of 4 and with one stack
+/// cycles modelling it, give the bits of stacks of 8 frames with stacks of 4 and with one stack
 /// of every frame: the object, the probe, the offsets and every LLK record.
 #[test]
 fn position_is_bit_identical_across_stack_splits() {
@@ -1577,26 +1582,58 @@ fn position_is_bit_identical_across_stack_splits() {
         ml.gpu(&mut g, 6);
         bit_state(&mut g)
     };
-    let seven = run(7);
-    assert_eq!(seven.llk.len(), 3 + 3 + 3 + 1);
+    let eight = run(8);
+    assert_eq!(eight.llk.len(), 3 + 3 + 3 + 1);
     for stack_size in [4, NPOS] {
         let other = run(stack_size);
         assert!(
-            other.llk == seven.llk,
+            other.llk == eight.llk,
             "stacks of {stack_size}: LLK records differ"
         );
         assert!(
-            other.object == seven.object,
+            other.object == eight.object,
             "stacks of {stack_size}: object differs"
         );
         assert!(
-            other.probe == seven.probe,
+            other.probe == eight.probe,
             "stacks of {stack_size}: probe differs"
         );
         assert!(
-            other.features == seven.features,
+            other.features == eight.features,
             "stacks of {stack_size}: offsets differ"
         );
+    }
+}
+
+/// ML cycles, the probe updated too, give the bits of stacks of 8 frames with stacks of 4,
+/// by M1's launches and by the fused passes: the object, the probe and every LLK record. The
+/// opening scale's photons are summed in frame order whatever the stacks.
+#[test]
+fn ml_is_bit_identical_across_stack_splits() {
+    let params = MlParams {
+        update_object: true,
+        update_probe: true,
+        calc_llk: 2,
+        zero_phase_ramp: false,
+    };
+    for setup in [M1, FUSED] {
+        let (scan, object, probe) = start(setup.frame, 2, true);
+        let run = |stack_size: usize| {
+            let options = GpuOptions {
+                stack_size: Some(stack_size),
+                ..setup.options
+            };
+            let mut g =
+                GpuPtycho::new(&ctx(), &scan, object.clone(), probe.clone(), options).unwrap();
+            g.ml(&params, 6).unwrap();
+            bit_state(&mut g)
+        };
+        let (eight, four) = (run(8), run(4));
+        assert!(!eight.llk.is_empty());
+        let what = if setup.options.fused { "fused" } else { "M1" };
+        assert!(four.llk == eight.llk, "{what}: LLK records differ");
+        assert!(four.object == eight.object, "{what}: object differs");
+        assert!(four.probe == eight.probe, "{what}: probe differs");
     }
 }
 
@@ -1604,7 +1641,7 @@ fn position_is_bit_identical_across_stack_splits() {
 /// the bytes each pass streams per frame under a position: 6 for the fused passes, 5 for DM
 /// and RAAR, 4 for ML's line search and LSQML, 2 for BH. AP, DM, RAAR and ML cycles modelling a
 /// scale and a position, and BH then LSQML epochs of every frame modelling a position, give
-/// the bits of stacks of 7 for all.
+/// the bits of stacks of 8 for all.
 #[test]
 fn default_stacks_give_the_bits_of_explicit_stacks() {
     let (scan, object, probe) = start(256, 2, false);
@@ -1653,16 +1690,16 @@ fn default_stacks_give_the_bits_of_explicit_stacks() {
         epochs.lsqml(&lsqml, 3, 1).unwrap();
         [bit_state(&mut cycles), bit_state(&mut epochs)]
     };
-    let (seven, default) = (run(Some(7)), run(None));
-    assert_eq!(seven[0].llk.len(), 4 * 3 + 1);
-    assert_eq!(seven[1].llk.len(), 3 + 3 + 1);
+    let (eight, default) = (run(Some(8)), run(None));
+    assert_eq!(eight[0].llk.len(), 4 * 3 + 1);
+    assert_eq!(eight[1].llk.len(), 3 + 3 + 1);
     for (k, what) in ["cycles", "epochs"].into_iter().enumerate() {
-        let (seven, default) = (&seven[k], &default[k]);
-        assert!(default.llk == seven.llk, "{what}: LLK records differ");
-        assert!(default.object == seven.object, "{what}: object differs");
-        assert!(default.probe == seven.probe, "{what}: probe differs");
+        let (eight, default) = (&eight[k], &default[k]);
+        assert!(default.llk == eight.llk, "{what}: LLK records differ");
+        assert!(default.object == eight.object, "{what}: object differs");
+        assert!(default.probe == eight.probe, "{what}: probe differs");
         assert!(
-            default.features == seven.features,
+            default.features == eight.features,
             "{what}: features differ"
         );
     }

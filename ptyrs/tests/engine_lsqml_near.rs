@@ -13,6 +13,10 @@ use ptyrs::engine::{
     Wavefield, illumination, llk, obj_probe_to_psi, shift,
 };
 
+#[path = "common/worst.rs"]
+mod worst;
+use worst::worst_of;
+
 const SHAPE: [usize; 2] = [24, 24];
 const OBJ: [usize; 2] = [40, 40];
 const NPROBE: usize = 2;
@@ -27,11 +31,7 @@ fn table(text: &str) -> Vec<Vec<f64>> {
 /// `max |a − b| / max |b|`.
 fn max_rel(a: &[f64], b: &[f64]) -> f64 {
     assert_eq!(a.len(), b.len());
-    let d = a
-        .iter()
-        .zip(b)
-        .map(|(a, b)| (a - b).abs())
-        .fold(0.0, f64::max);
+    let d = worst_of(a.iter().zip(b).map(|(a, b)| (a - b).abs()));
     d / b.iter().map(|b| b.abs()).fold(0.0, f64::max)
 }
 
@@ -90,8 +90,8 @@ fn state() -> State {
         .map(|c| {
             let w = Wavefield::new(SHAPE, c[1], [c[2], c[2]], c[3]).unwrap();
             let optics = Optics::free_space(&w);
-            let p = optics.propagator();
-            let kind = match p {
+            let p = optics.exit();
+            let kind = match Propagator::free_space(&w) {
                 Propagator::Fourier(_) => 0,
                 Propagator::AngularSpectrum(_) => 1,
                 Propagator::Fresnel(_) => 2,
@@ -128,7 +128,7 @@ fn state() -> State {
 fn propagated(views: &[View], c: &Case, object: &Object, probe: &Probe) -> Vec<C64> {
     let mut psi = vec![C64::default(); views.len() * probe.plane_len()];
     obj_probe_to_psi(views, object, probe, c.optics.quad(), &mut psi);
-    c.optics.propagator().forward(&mut psi);
+    c.optics.exit().forward(&mut psi);
     psi
 }
 

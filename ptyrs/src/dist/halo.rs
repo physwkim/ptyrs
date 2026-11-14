@@ -527,7 +527,7 @@ impl HaloBufs {
     /// an unpack on a side stream must not lease it against the main stream's kernels.
     ///
     /// # Safety
-    /// The window must be live at the address [`Self::new`] took, on `ctx`'s device, written
+    /// The window must be live at the address the buffers were made for, on `ctx`'s device, written
     /// before this on the stream and not written until it completes, and no peer may pull the
     /// send buffer meanwhile ([`crate::dist::Gpu::fence`]).
     pub unsafe fn pack(

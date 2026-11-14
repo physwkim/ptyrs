@@ -132,42 +132,59 @@ pub mod grad_kernels {
         }
     }
 
-    /// Adds the calculated photons of the stack's frames, `sum_fl s[f0 + fl] partials[fl].icalc`
-    /// over `fl < nf` in a fixed order, to `out[0]`; `s` is the per-frame intensity `scale`,
-    /// or 1 if it is null.
+    /// The calculated photons of each of the stack's frames, `out[f0 + fl] = s[f0 + fl]
+    /// partials[fl].icalc` for `fl < nf`; `s` is the per-frame intensity `scale`, or 1 if it
+    /// is null.
     ///
     /// # Safety
     ///
-    /// `partials` holds `nf_max` records, `out` and `ctl` one entry each, `scale` is null or
-    /// holds `nframe` floats; grid `(1, 1, 1)`, block `(PIXEL_THREADS, 1, 1)`.
+    /// `partials` holds `nf_max` records, `out` `nframe` floats, `ctl` one entry, `scale` is
+    /// null or holds `nframe` floats; grid `(1, 1, 1)`, block `(PIXEL_THREADS, 1, 1)`.
     #[kernel]
-    pub unsafe fn cg_icalc_add(
+    pub unsafe fn cg_icalc_frames(
         partials: *const LlkPartial,
         scale: *const f32,
         ctl: *const StackCtl,
         g: StackGeom,
         out: *mut f32,
     ) {
-        static mut RED: SharedArray<f32, 256> = SharedArray::UNINIT;
         let (f0, nf) = unsafe { stack_frames(ctl, g) };
+        let mut fl = thread::threadIdx_x() as usize;
+        while fl < nf as usize {
+            let f = f0 as usize + fl;
+            let icalc = unsafe { (*partials.add(fl)).icalc };
+            unsafe {
+                *out.add(f) = if scale.is_null() {
+                    icalc
+                } else {
+                    *scale.add(f) * icalc
+                };
+            }
+            fl += PIXEL_THREADS as usize;
+        }
+    }
+
+    /// `out[0] = sum_i x[i]` over `n` floats, in a fixed order.
+    ///
+    /// # Safety
+    ///
+    /// `x` holds `n` floats, `out` one; grid `(1, 1, 1)`, block `(PIXEL_THREADS, 1, 1)`.
+    #[kernel]
+    pub unsafe fn cg_sum_values(x: *const f32, n: u32, out: *mut f32) {
+        static mut RED: SharedArray<f32, 256> = SharedArray::UNINIT;
         let t = thread::threadIdx_x() as usize;
         let mut acc = 0.0f32;
-        let mut fl = t;
-        while fl < nf as usize {
-            let icalc = unsafe { (*partials.add(fl)).icalc };
-            acc += if scale.is_null() {
-                icalc
-            } else {
-                unsafe { *scale.add(f0 as usize + fl) * icalc }
-            };
-            fl += PIXEL_THREADS as usize;
+        let mut i = t;
+        while i < n as usize {
+            acc += unsafe { *x.add(i) };
+            i += PIXEL_THREADS as usize;
         }
         let s = (&raw mut RED).cast::<f32>();
         unsafe {
             *s.add(t) = acc;
             crate::block_sum::<1>(s);
             if t == 0 {
-                *out += *s;
+                *out = *s;
             }
         }
     }

@@ -36,7 +36,9 @@ mod fused;
 mod grad;
 mod lsqml;
 mod ops;
+mod optics;
 mod position;
+mod psi;
 mod ring;
 mod rpie;
 
@@ -58,8 +60,10 @@ pub use ops::{
     PositionPartial, ScalePartial, StackCtl, StackGeom, StackRef, StackTable, UpdateSums, ViewAddr,
     ViewDims, Views, view_tiles,
 };
-pub use position::{PositionKernels, PositionRule, Positions};
-pub use ring::{Ended, LlkRing, LlkTotals, RecordWriter, RingDevice, RingError};
+pub use optics::{ExitPass, ExitStage, OpticsKernels};
+pub use position::{PositionKernels, PositionRule, Positions, Solve};
+pub use psi::{HalfWaves, Waves, half_scale};
+pub use ring::{Ended, FrameLlk, LlkRing, LlkTotals, RecordWriter, RingDevice, RingError};
 pub use rpie::{POWER_CHUNK, PowerMax, RpieKernels, Weight};
 
 /// The linked device code: every `ptyrs-kernels` kernel plus the cuFFT functions they call.

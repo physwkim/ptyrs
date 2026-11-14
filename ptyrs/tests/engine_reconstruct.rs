@@ -7,6 +7,9 @@ use ptyrs::engine::{
 mod common;
 #[path = "common/ptychi/mod.rs"]
 mod ptychi;
+#[path = "common/worst.rs"]
+mod worst;
+use worst::worst_of;
 
 const PHOTONS: f64 = 1e5;
 
@@ -258,7 +261,7 @@ fn obj_grad_matches_ml_grad_reference() {
         let v: Vec<f64> = l.split_whitespace().map(|v| v.parse().unwrap()).collect();
         let want = C64::new(v[2], v[3]);
         let got = g.as_slice()[v[0] as usize * nx + v[1] as usize];
-        err = err.max((got - want).norm());
+        err = worst_of([err, (got - want).norm()]);
         max = max.max(want.norm());
         rows += 1;
     }

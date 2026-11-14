@@ -13,7 +13,8 @@ use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaStream, DeviceBuffer};
 
 use super::device::{BhBufs, Moved, MovedBatch, MovedLent, PassesMut, moved_inputs, moved_shift};
-use super::{Bufs, GpuPtycho, plane_len};
+use super::propagate::Propagate;
+use super::{Bufs, GpuPtycho};
 use crate::engine::features::POSITION_STEP;
 use crate::engine::ptycho::{Algorithm, llk_due};
 use crate::engine::{BhParams, BhStep, EngineError, random_batches};
@@ -155,7 +156,12 @@ impl Bufs<'_> {
         cg: bool,
     ) -> Result<(), GpuError> {
         let dims = *self.views.dims();
-        let rho2 = (params.probe_rho.powi(2) * plane_len(&dims) as f64) as f32;
+        let rho2 = (params.probe_rho.powi(2) * self.exit.scale as f64) as f32;
+        let prop = Propagate {
+            kernels: self.bh,
+            stage: self.exit.stage,
+            dims,
+        };
         let batch = bh.batches[b].clone();
         let scan = BhScan {
             order: bh.order,
@@ -189,9 +195,9 @@ impl Bufs<'_> {
                 }
                 None => k.obj_probe_to_psi(ctx, views, stack, self.obj, self.probe, psi)?,
             }
-            plan.forward_inplace(ctx, psi)?;
+            prop.forward(ctx, plan, stack, psi)?;
             self.bh.residual(ctx, scan, stack, psi, r)?;
-            plan.inverse_inplace(ctx, r)?;
+            prop.adjoint(ctx, plan, stack, r)?;
             match &mut moved {
                 Some(m) => {
                     let shift = moved_shift(m.pos, m.spectrum);
@@ -248,9 +254,9 @@ impl Bufs<'_> {
                     let x = [&*self.obj, &*self.probe];
                     self.bh
                         .far(ctx, views, stack, x, &d, [&mut *bh.lu, &mut *bh.lv])?;
-                    plan.forward_inplace(ctx, bh.lu)?;
+                    prop.forward(ctx, plan, stack, bh.lu)?;
                     if cg {
-                        plan.forward_inplace(ctx, bh.lv)?;
+                        prop.forward(ctx, plan, stack, bh.lv)?;
                     }
                     let f = BhFieldsRef {
                         psi: &bh.psi[i],
@@ -275,9 +281,9 @@ impl Bufs<'_> {
                         lv: bh.lv,
                     };
                     self.bh.pos_near(ctx, views, stack, near, &d, bh.parts)?;
-                    plan.forward_inplace(ctx, bh.lu)?;
+                    prop.forward(ctx, plan, stack, bh.lu)?;
                     if cg {
-                        plan.forward_inplace(ctx, bh.lv)?;
+                        prop.forward(ctx, plan, stack, bh.lv)?;
                     }
                     self.bh.obj_conj(ctx, views, stack, self.obj, &bh.r[i], y)?;
                     plan.forward_inplace(ctx, y)?;

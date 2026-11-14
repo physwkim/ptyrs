@@ -1,8 +1,9 @@
 //! A live AP scan on every visible GPU in NUMA order (DESIGN §7 M4): [`DistLiveAp`] over the
 //! M5 simulator's frames, 4096 frames of 256x256 at 32 px steps, two probe modes, the whole
-//! trajectory planned before the first frame. Frames land `batch` at a time, each batch
-//! followed by `epochs` epochs over every frame landed so far; prints per batch the frames
-//! new to each GPU, the halo rows each lists, the ms to land the batch and the ms per epoch,
+//! trajectory planned before the first frame. Frames go `batch` at a time through the ring
+//! and the uploader into the stores of the GPUs that iterate them, each batch followed by `epochs` epochs over every frame landed so far; prints per batch the frames
+//! new to each GPU, the halo rows each lists, the ms to upload and land the batch and the ms
+//! per epoch,
 //! and per run the graph recaptures after setup, the frames lost and a hash of the object
 //! bits, equal on 1, 2 and 4 GPUs.
 //!
@@ -14,15 +15,21 @@
 #![warn(clippy::disallowed_methods)]
 
 use std::error::Error;
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
+
+use cuda_core::Context;
 
 use ptyrs::dist::{DistLiveAp, Scheme, topo};
 use ptyrs::gpu::{C32, ViewAddr};
 use ptyrs::live::farfield::{Ptycho, PtychoSpec, ScanPath};
 use ptyrs::live::graph::WarmUp;
+use ptyrs::live::pos::{Pos, PosTable};
 use ptyrs::live::recon::{ApConfig, ViewPlacement};
+use ptyrs::live::ring::{Ring, UploaderConfig, run_region_uploader};
 use ptyrs::live::scan::ScanShape;
 
 const FRAME: usize = 256;
@@ -138,7 +145,7 @@ fn run(dir: &Path, pattern: &str, args: &[String]) -> Result<(), Box<dyn Error>>
     let devs = topo::devices()?;
     let ordinals = topo::numa_grouped(&devs);
     let t = Instant::now();
-    let mut ap = DistLiveAp::new(&ordinals, &cfg, &views, scheme, &probe)?;
+    let mut ap = DistLiveAp::new(&ordinals, &cfg, &views, scheme, &probe, false)?;
     let setup = t.elapsed().as_secs_f64();
     let warm = WarmUp::end();
     let ngpu = ap.ngpu();
@@ -163,6 +170,25 @@ fn run(dir: &Path, pattern: &str, args: &[String]) -> Result<(), Box<dyn Error>>
         "epoch ms"
     );
     let n = FRAME * FRAME;
+    let ctx = Context::new(ordinals[0])?;
+    let ring = Arc::new(Ring::new(&ctx, 2 * batch.max(64), n)?);
+    let table = Arc::new(PosTable::new(1 << 16));
+    let stop = Arc::new(AtomicBool::new(false));
+    let (tx, landed) = crossbeam_channel::unbounded();
+    let uploader = {
+        let (ring, table, stop) = (ring.clone(), table.clone(), stop.clone());
+        let (stores, route) = (ap.stores(), ap.route(place));
+        let up = UploaderConfig {
+            batch: NonZeroUsize::new(64).unwrap(),
+            flush_ns: 100_000,
+            idle: Duration::from_micros(20),
+            events: 4,
+            pos_wait_ns: 1_000_000_000,
+        };
+        std::thread::spawn(move || {
+            run_region_uploader(ring, stores, route, table, up, stop, Some(tx))
+        })
+    };
     let (mut at, mut epoch_ms) = (0, Vec::new());
     for k in 0.. {
         if at == POINTS {
@@ -171,7 +197,18 @@ fn run(dir: &Path, pattern: &str, args: &[String]) -> Result<(), Box<dyn Error>>
         let end = (at + batch).min(POINTS);
         let before = ap.landed().to_vec();
         let t = Instant::now();
-        ap.push(&views[2 * at..2 * end], &counts[at * n..end * n])?;
+        for k in at..end {
+            let (x, y) = pos[k];
+            table.insert(k as i32, Pos { x, y, t_rx: 0 });
+            let mut s = ring.reserve();
+            s.frame().copy_from_slice(&counts[k * n..(k + 1) * n]);
+            s.commit(k as i32, 0, 0);
+        }
+        let mut up = at;
+        while up < end {
+            up += landed.recv()?.n as usize;
+        }
+        ap.push(&views[2 * at..2 * end])?;
         ap.synchronize()?;
         let land = t.elapsed().as_secs_f64() * 1e3;
         let t = Instant::now();
@@ -195,7 +232,15 @@ fn run(dir: &Path, pattern: &str, args: &[String]) -> Result<(), Box<dyn Error>>
         );
         at = end;
     }
+    stop.store(true, Ordering::Release);
+    let up = uploader.join().expect("the uploader")?;
+    let stored: Vec<String> = up.regions.iter().map(|r| r.frames.to_string()).collect();
     let landed: Vec<String> = ap.landed().iter().map(u32::to_string).collect();
+    println!(
+        "  frames stored per GPU {}, uploader dropped {}",
+        stored.join("/"),
+        up.pos_missing
+    );
     println!(
         "  frames per GPU {}; recaptures {}, lost {}, closed {:?}; last epoch {:.2} ms; \
          after {} epochs: object hash {:016x}",

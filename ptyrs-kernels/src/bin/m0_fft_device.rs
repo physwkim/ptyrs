@@ -16,6 +16,10 @@ use nvjitlink_sys::{InputType, LibNvJitLink, Linker};
 use std::error::Error;
 use std::ffi::{c_char, c_int};
 
+#[path = "../../../ptyrs/tests/common/worst.rs"]
+mod worst;
+use worst::worst_of;
+
 type Res<T> = Result<T, Box<dyn Error>>;
 
 /// Complex elements per thread of every function linked here (all are EPT 16, BY_COMPONENT).
@@ -596,7 +600,7 @@ fn dft_lines(
 fn rel_err(gpu: &[f32], reference: &[[f64; 2]]) -> f64 {
     let (mut err, mut norm) = (0.0f64, 0.0f64);
     for (&[re, im], r) in gpu.as_chunks::<2>().0.iter().zip(reference) {
-        err = err.max((f64::from(re) - r[0]).hypot(f64::from(im) - r[1]));
+        err = worst_of([err, (f64::from(re) - r[0]).hypot(f64::from(im) - r[1])]);
         norm = norm.max(r[0].hypot(r[1]));
     }
     err / norm

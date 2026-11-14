@@ -30,11 +30,11 @@ use ptyrs_kernels::grad::ObjProbePtrs;
 pub use ptyrs_kernels::lsqml::LSQML_REC;
 use ptyrs_kernels::lsqml::{
     LSQML_CHI, LSQML_DOTS, LSQML_ICALC, LSQML_POISSON, LSQML_XI, LsqmlCols, LsqmlDots, LsqmlFar,
-    LsqmlPre, lsqml_kernels,
+    LsqmlPre, LsqmlRule, lsqml_kernels,
 };
 use ptyrs_kernels::pixel::PIXEL_THREADS;
 
-use crate::gpu::fused::{GRID_Y_MAX, Shape, Side};
+use crate::gpu::fused::{GRID_Y_MAX, Shape, Side, no_psi};
 use crate::gpu::ops::grid_1d;
 use crate::gpu::position::{ONE_BLOCK, chunk_grid, chunks, same_dims, span};
 use crate::gpu::{
@@ -238,6 +238,7 @@ impl LsqmlKernels {
         probe: &DeviceBuffer<C32>,
         st: &mut LsqmlScan,
         init: bool,
+        scale: f32,
     ) -> Result<(), Error> {
         let d = *views.dims();
         st.check(&d)?;
@@ -268,6 +269,7 @@ impl LsqmlKernels {
                     views.tile_ptrs(),
                     pre,
                     init.into(),
+                    scale,
                     d.scan_geom(),
                 )
             }
@@ -352,10 +354,10 @@ impl LsqmlKernels {
         self.cols(ctx, l, p, flags, &reads, &[icalc.storage()])
     }
 
-    /// The stack's exit-wave update `chi` from the row transforms [`Self::forward`] left in
-    /// `work`, into `work` in the layout [`Kernels::psi_to_obj`] reads: the column pass
-    /// scales each far-field pixel by `−a_far c / n` at the epoch position's `a_far` of `st`
-    /// (`c` `noise`'s residual), then the inverse fused row pass.
+    /// The row transforms of the stack's exit-wave update `chi` from those [`Self::forward`]
+    /// left in `work`, in place: the column pass scales each far-field pixel by `−a_far c /
+    /// n` at the epoch position's `a_far` of `st` (`c` `noise`'s residual). The propagator's
+    /// adjoint stage, then [`Self::back`], make them `chi`.
     pub fn chi(
         &self,
         ctx: &ExecutionContext,
@@ -385,15 +387,28 @@ impl LsqmlKernels {
             st.a_pos.storage(),
             stack.storage(),
         ];
-        self.cols(ctx, l, p, flags, &reads, &[work.storage()])?;
-        let (sh, g) = (Shape::of(&d)?, d.geom(stack)?);
+        self.cols(ctx, l, p, flags, &reads, &[work.storage()])
+    }
+
+    /// The stack's `work` from row transforms into the layout [`Kernels::psi_to_obj`] reads,
+    /// the inverse fused row pass; `views` in epoch order.
+    pub fn back(
+        &self,
+        ctx: &ExecutionContext,
+        views: &Views,
+        stack: StackRef<'_>,
+        work: &mut DeviceBuffer<C32>,
+    ) -> Result<(), Error> {
+        let d = views.dims();
+        let (sh, g) = (Shape::of(d)?, d.geom(stack)?);
+        check_len("work", work, g.nf_max as usize * d.nmode as usize * d.n())?;
         let config = sh.rows(&g, false)?;
         let p = FusedPtrs {
-            views: dptr::<ViewAddr, ViewAddr>(scan.order.views().addr()).cast_const(),
+            views: dptr::<ViewAddr, ViewAddr>(views.addr()).cast_const(),
             work: dptr(work),
             ..null_ptrs()
         };
-        let reads = [scan.order.views().addr().storage(), stack.storage()];
+        let reads = [views.addr().storage(), stack.storage()];
         let ctl = stack.ctl() as *const StackCtl;
         let cfg = FusedCfg {
             flags: ROWS_INV,
@@ -402,7 +417,7 @@ impl LsqmlKernels {
         };
         let m = &self.base.module;
         self.base.launch(ctx, &reads, &[work.storage()], |stream| {
-            // SAFETY: `ColsLaunch::new` checked `work`; as in `forward`.
+            // SAFETY: `work` checked above; as in `forward`.
             unsafe {
                 match sh.nx {
                     Side::N64 => m.fused_rows_inv_64(stream, config, p, ctl, g, cfg),
@@ -590,11 +605,16 @@ impl LsqmlKernels {
         ctx: &ExecutionContext,
         batch: Range<u32>,
         st: &mut LsqmlScan,
+        scale: f32,
     ) -> Result<(), Error> {
         let span = span(&st.dims, &batch)?;
         // pty-chi's `trim_mean`, the cut saturating at 0 for small batches.
         let trim = (span.nb as f64 * 0.1 / 2.0 - 0.5).ceil() as u32;
-        let g = st.dims.scan_geom();
+        let rule = LsqmlRule {
+            trim,
+            nmode: st.dims.nmode,
+            scale,
+        };
         let writes = [st.dots.storage(), st.rec.storage(), st.step.storage()];
         self.base
             .launch(ctx, &[st.a_pos.storage()], &writes, |stream| {
@@ -605,11 +625,10 @@ impl LsqmlKernels {
                         ONE_BLOCK,
                         dptr(&st.dots),
                         span,
-                        trim,
+                        rule,
                         dptr::<f32, f32>(&st.a_pos).cast_const(),
                         dptr(&st.rec),
                         dptr(&st.step),
-                        g,
                     )
                 }
             })
@@ -721,8 +740,8 @@ fn null_ptrs() -> FusedPtrs {
         probe: std::ptr::null(),
         views: std::ptr::null(),
         counts: std::ptr::null(),
-        psi: std::ptr::null_mut(),
-        iterate: std::ptr::null_mut(),
+        psi: no_psi(),
+        iterate: no_psi(),
         work: std::ptr::null_mut(),
         probe_q: std::ptr::null_mut(),
         probe_power: std::ptr::null_mut(),

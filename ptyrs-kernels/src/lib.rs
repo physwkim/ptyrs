@@ -17,6 +17,7 @@ pub mod bh;
 pub mod fused;
 pub mod grad;
 pub mod lsqml;
+pub mod optics;
 pub mod pixel;
 pub mod position;
 pub mod ring;
@@ -365,6 +366,109 @@ unsafe fn bin_tile_views(
             *slabs.len.add(t) = (len0 + added).min(cap);
         }
         (len0 + added).saturating_sub(cap)
+    }
+}
+
+/// What `kernels::psi_to_obj` does to object pixel `(y, x)` of a tile whose run of the stack
+/// is `lo .. end`, the closure [`for_each_stack_tile`] takes, for waves in the format `HALF`
+/// names ([`pixel::load_psi`]).
+///
+/// # Safety
+///
+/// As `kernels::psi_to_obj`, for the closure's calls too.
+#[device]
+unsafe fn psi_to_obj_pixel<const HALF: bool>(
+    psi: pixel::PsiPtr,
+    probe: *const f32,
+    views: *const pixel::ViewAddr,
+    tiles: pixel::TilePtrs,
+    sums: pixel::SumPtrs,
+    ctl: *const pixel::StackCtl,
+    g: pixel::StackGeom,
+) -> impl FnMut(u32, u32, u32, u32) {
+    let iobj = thread::blockIdx_z();
+    let n = g.ny as usize * g.nx as usize;
+    let (f0, nf) = unsafe { pixel::stack_frames(ctl, g) };
+    let (k0, nk) = (f0 * g.nmode, nf * g.nmode);
+    move |lo: u32, end: u32, y: u32, x: u32| unsafe {
+        if x >= g.nxo || y >= g.nyo {
+            return;
+        }
+        let px = (iobj as usize * g.nyo as usize + y as usize) * g.nxo as usize + x as usize;
+        let mut acc = pixel::load_c(sums.num, px);
+        let mut norm = *sums.den.add(px);
+        let mut j = lo;
+        while j < end {
+            let k = *tiles.views.add(j as usize);
+            let i = k.wrapping_sub(k0);
+            if i >= nk {
+                break;
+            }
+            j += 1;
+            let v = *views.add(k as usize);
+            if v.obj != iobj {
+                continue;
+            }
+            let plane = i as usize * n;
+            pixel::obj_pixel_sources(v, y, x, g.ny, g.nx, |pry, prx, w| {
+                let p = pixel::load_c(probe, v.probe as usize * n + (pry * g.nx + prx) as usize);
+                let q = pixel::quad_phase(g.quad, pry, prx, g.ny, g.nx);
+                let ps =
+                    pixel::load_psi::<HALF>(psi, plane + pixel::psi_index(pry, prx, g.ny, g.nx));
+                let u = pixel::cmul_conj(pixel::cmul(p, q), ps);
+                acc = (acc.0 + w * u.0, acc.1 + w * u.1);
+                norm += w * (p.0 * p.0 + p.1 * p.1);
+            });
+        }
+        pixel::store_c(sums.num, px, acc);
+        *sums.den.add(px) = norm;
+    }
+}
+
+/// `kernels::psi_to_probe` of waves in the format `HALF` names ([`pixel::load_psi`]).
+///
+/// # Safety
+///
+/// As `kernels::psi_to_probe`.
+#[device]
+unsafe fn psi_to_probe<const HALF: bool>(
+    psi: pixel::PsiPtr,
+    obj: *const f32,
+    views: *const pixel::ViewAddr,
+    sums: pixel::SumPtrs,
+    ctl: *const pixel::StackCtl,
+    g: pixel::StackGeom,
+) {
+    let (f0, nf) = unsafe { pixel::stack_frames(ctl, g) };
+    let n = g.ny as usize * g.nx as usize;
+    let t = global_index();
+    if t >= g.nprobe as usize * n {
+        return;
+    }
+    let (mode, i) = ((t / n) as u32, t % n);
+    let (y, x) = ((i / g.nx as usize) as u32, (i % g.nx as usize) as u32);
+    let q = pixel::quad_phase(g.quad, y, x, g.ny, g.nx);
+    let at = pixel::psi_index(y, x, g.ny, g.nx);
+    unsafe {
+        let mut acc = pixel::load_c(sums.num, t);
+        let mut norm = *sums.den.add(t);
+        let mut added = false;
+        let k0 = f0 as usize * g.nmode as usize;
+        for kl in 0..nf as usize * g.nmode as usize {
+            let v = *views.add(k0 + kl);
+            if v.probe != mode {
+                continue;
+            }
+            let o = pixel::sample_obj(obj, v, y, x, g.nyo, g.nxo);
+            let u = pixel::cmul_conj(pixel::cmul(o, q), pixel::load_psi::<HALF>(psi, kl * n + at));
+            acc = (acc.0 + u.0, acc.1 + u.1);
+            norm += o.0 * o.0 + o.1 * o.1;
+            added = true;
+        }
+        if added {
+            pixel::store_c(sums.num, t, acc);
+            *sums.den.add(t) = norm;
+        }
     }
 }
 
@@ -766,7 +870,7 @@ pub mod kernels {
     /// [`obj_probe_to_psi`]: LoadedModule::obj_probe_to_psi
     #[kernel]
     pub unsafe fn psi_to_obj(
-        psi: *const f32,
+        psi: PsiPtr,
         probe: *const f32,
         views: *const ViewAddr,
         tiles: TilePtrs,
@@ -776,43 +880,35 @@ pub mod kernels {
     ) {
         static mut SHARED: SharedArray<u32, STACK_TILE_SHARED> = SharedArray::UNINIT;
         let shared = (&raw mut SHARED).cast::<u32>();
-        let iobj = thread::blockIdx_z();
-        let n = g.ny as usize * g.nx as usize;
-        let (f0, nf) = unsafe { stack_frames(ctl, g) };
-        let (k0, nk) = (f0 * g.nmode, nf * g.nmode);
-        let pixel = |lo: u32, end: u32, y: u32, x: u32| unsafe {
-            if x >= g.nxo || y >= g.nyo {
-                return;
-            }
-            let px = (iobj as usize * g.nyo as usize + y as usize) * g.nxo as usize + x as usize;
-            let mut acc = load_c(sums.num, px);
-            let mut norm = *sums.den.add(px);
-            let mut j = lo;
-            while j < end {
-                let k = *tiles.views.add(j as usize);
-                let i = k.wrapping_sub(k0);
-                if i >= nk {
-                    break;
-                }
-                j += 1;
-                let v = *views.add(k as usize);
-                if v.obj != iobj {
-                    continue;
-                }
-                let plane = i as usize * n;
-                obj_pixel_sources(v, y, x, g.ny, g.nx, |pry, prx, w| {
-                    let p = load_c(probe, v.probe as usize * n + (pry * g.nx + prx) as usize);
-                    let q = quad_phase(g.quad, pry, prx, g.ny, g.nx);
-                    let ps = load_c(psi, plane + psi_index(pry, prx, g.ny, g.nx));
-                    let u = cmul_conj(cmul(p, q), ps);
-                    acc = (acc.0 + w * u.0, acc.1 + w * u.1);
-                    norm += w * (p.0 * p.0 + p.1 * p.1);
-                });
-            }
-            store_c(sums.num, px, acc);
-            *sums.den.add(px) = norm;
-        };
-        unsafe { for_each_stack_tile(views, tiles, shared, ctl, g, pixel) }
+        unsafe {
+            let pixel = super::psi_to_obj_pixel::<false>(psi, probe, views, tiles, sums, ctl, g);
+            for_each_stack_tile(views, tiles, shared, ctl, g, pixel)
+        }
+    }
+
+    /// [`psi_to_obj`] of f16 waves ([`load_psi`]).
+    ///
+    /// # Safety
+    ///
+    /// As [`psi_to_obj`], with `psi` holding f16 pairs.
+    ///
+    /// [`psi_to_obj`]: LoadedModule::psi_to_obj
+    #[kernel]
+    pub unsafe fn psi_to_obj_f16(
+        psi: PsiPtr,
+        probe: *const f32,
+        views: *const ViewAddr,
+        tiles: TilePtrs,
+        sums: SumPtrs,
+        ctl: *const StackCtl,
+        g: StackGeom,
+    ) {
+        static mut SHARED: SharedArray<u32, STACK_TILE_SHARED> = SharedArray::UNINIT;
+        let shared = (&raw mut SHARED).cast::<u32>();
+        unsafe {
+            let pixel = super::psi_to_obj_pixel::<true>(psi, probe, views, tiles, sums, ctl, g);
+            for_each_stack_tile(views, tiles, shared, ctl, g, pixel)
+        }
     }
 
     /// Adds the stack's probe-update sums to `sums` `[nprobe, ny, nx]`:
@@ -827,44 +923,33 @@ pub mod kernels {
     /// [`obj_probe_to_psi`]: LoadedModule::obj_probe_to_psi
     #[kernel]
     pub unsafe fn psi_to_probe(
-        psi: *const f32,
+        psi: PsiPtr,
         obj: *const f32,
         views: *const ViewAddr,
         sums: SumPtrs,
         ctl: *const StackCtl,
         g: StackGeom,
     ) {
-        let (f0, nf) = unsafe { stack_frames(ctl, g) };
-        let n = g.ny as usize * g.nx as usize;
-        let t = global_index();
-        if t >= g.nprobe as usize * n {
-            return;
-        }
-        let (mode, i) = ((t / n) as u32, t % n);
-        let (y, x) = ((i / g.nx as usize) as u32, (i % g.nx as usize) as u32);
-        let q = quad_phase(g.quad, y, x, g.ny, g.nx);
-        let at = psi_index(y, x, g.ny, g.nx);
-        unsafe {
-            let mut acc = load_c(sums.num, t);
-            let mut norm = *sums.den.add(t);
-            let mut added = false;
-            let k0 = f0 as usize * g.nmode as usize;
-            for kl in 0..nf as usize * g.nmode as usize {
-                let v = *views.add(k0 + kl);
-                if v.probe != mode {
-                    continue;
-                }
-                let o = sample_obj(obj, v, y, x, g.nyo, g.nxo);
-                let u = cmul_conj(cmul(o, q), load_c(psi, kl * n + at));
-                acc = (acc.0 + u.0, acc.1 + u.1);
-                norm += o.0 * o.0 + o.1 * o.1;
-                added = true;
-            }
-            if added {
-                store_c(sums.num, t, acc);
-                *sums.den.add(t) = norm;
-            }
-        }
+        unsafe { super::psi_to_probe::<false>(psi, obj, views, sums, ctl, g) }
+    }
+
+    /// [`psi_to_probe`] of f16 waves ([`load_psi`]).
+    ///
+    /// # Safety
+    ///
+    /// As [`psi_to_probe`], with `psi` holding f16 pairs.
+    ///
+    /// [`psi_to_probe`]: LoadedModule::psi_to_probe
+    #[kernel]
+    pub unsafe fn psi_to_probe_f16(
+        psi: PsiPtr,
+        obj: *const f32,
+        views: *const ViewAddr,
+        sums: SumPtrs,
+        ctl: *const StackCtl,
+        g: StackGeom,
+    ) {
+        unsafe { super::psi_to_probe::<true>(psi, obj, views, sums, ctl, g) }
     }
 
     /// `*out = max(*out, x[0..n] ...)` as `f32` bits, over the non-negative values of `x`
@@ -1076,7 +1161,21 @@ pub mod kernels {
         g: StackGeom,
         cfg: FusedCfg,
     ) {
-        unsafe { crate::fused::rows_fwd::<64>(p, ctl, g, cfg) }
+        unsafe { crate::fused::rows_fwd::<64, false>(p, ctl, g, cfg) }
+    }
+    /// [`crate::fused::rows_fwd`] for 64-point rows, of f16 waves.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::rows_fwd`].
+    #[kernel]
+    pub unsafe fn fused_rows_fwd_f16_64(
+        p: FusedPtrs,
+        ctl: *const StackCtl,
+        g: StackGeom,
+        cfg: FusedCfg,
+    ) {
+        unsafe { crate::fused::rows_fwd::<64, true>(p, ctl, g, cfg) }
     }
 
     /// [`crate::fused::rows_fwd`] for 128-point rows.
@@ -1091,7 +1190,21 @@ pub mod kernels {
         g: StackGeom,
         cfg: FusedCfg,
     ) {
-        unsafe { crate::fused::rows_fwd::<128>(p, ctl, g, cfg) }
+        unsafe { crate::fused::rows_fwd::<128, false>(p, ctl, g, cfg) }
+    }
+    /// [`crate::fused::rows_fwd`] for 128-point rows, of f16 waves.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::rows_fwd`].
+    #[kernel]
+    pub unsafe fn fused_rows_fwd_f16_128(
+        p: FusedPtrs,
+        ctl: *const StackCtl,
+        g: StackGeom,
+        cfg: FusedCfg,
+    ) {
+        unsafe { crate::fused::rows_fwd::<128, true>(p, ctl, g, cfg) }
     }
 
     /// [`crate::fused::rows_fwd`] for 256-point rows.
@@ -1106,7 +1219,21 @@ pub mod kernels {
         g: StackGeom,
         cfg: FusedCfg,
     ) {
-        unsafe { crate::fused::rows_fwd::<256>(p, ctl, g, cfg) }
+        unsafe { crate::fused::rows_fwd::<256, false>(p, ctl, g, cfg) }
+    }
+    /// [`crate::fused::rows_fwd`] for 256-point rows, of f16 waves.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::rows_fwd`].
+    #[kernel]
+    pub unsafe fn fused_rows_fwd_f16_256(
+        p: FusedPtrs,
+        ctl: *const StackCtl,
+        g: StackGeom,
+        cfg: FusedCfg,
+    ) {
+        unsafe { crate::fused::rows_fwd::<256, true>(p, ctl, g, cfg) }
     }
 
     /// [`crate::fused::rows_fwd`] for 512-point rows.
@@ -1121,7 +1248,21 @@ pub mod kernels {
         g: StackGeom,
         cfg: FusedCfg,
     ) {
-        unsafe { crate::fused::rows_fwd::<512>(p, ctl, g, cfg) }
+        unsafe { crate::fused::rows_fwd::<512, false>(p, ctl, g, cfg) }
+    }
+    /// [`crate::fused::rows_fwd`] for 512-point rows, of f16 waves.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::rows_fwd`].
+    #[kernel]
+    pub unsafe fn fused_rows_fwd_f16_512(
+        p: FusedPtrs,
+        ctl: *const StackCtl,
+        g: StackGeom,
+        cfg: FusedCfg,
+    ) {
+        unsafe { crate::fused::rows_fwd::<512, true>(p, ctl, g, cfg) }
     }
 
     /// [`crate::fused::cols`] for 64-point columns, without the model terms.
@@ -1244,7 +1385,21 @@ pub mod kernels {
         g: StackGeom,
         cfg: FusedCfg,
     ) {
-        unsafe { crate::fused::rows_inv::<64>(p, ctl, g, cfg) }
+        unsafe { crate::fused::rows_inv::<64, false>(p, ctl, g, cfg) }
+    }
+    /// [`crate::fused::rows_inv`] for 64-point rows, of f16 waves.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::rows_inv`].
+    #[kernel]
+    pub unsafe fn fused_rows_inv_f16_64(
+        p: FusedPtrs,
+        ctl: *const StackCtl,
+        g: StackGeom,
+        cfg: FusedCfg,
+    ) {
+        unsafe { crate::fused::rows_inv::<64, true>(p, ctl, g, cfg) }
     }
 
     /// [`crate::fused::rows_inv`] for 128-point rows.
@@ -1259,7 +1414,21 @@ pub mod kernels {
         g: StackGeom,
         cfg: FusedCfg,
     ) {
-        unsafe { crate::fused::rows_inv::<128>(p, ctl, g, cfg) }
+        unsafe { crate::fused::rows_inv::<128, false>(p, ctl, g, cfg) }
+    }
+    /// [`crate::fused::rows_inv`] for 128-point rows, of f16 waves.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::rows_inv`].
+    #[kernel]
+    pub unsafe fn fused_rows_inv_f16_128(
+        p: FusedPtrs,
+        ctl: *const StackCtl,
+        g: StackGeom,
+        cfg: FusedCfg,
+    ) {
+        unsafe { crate::fused::rows_inv::<128, true>(p, ctl, g, cfg) }
     }
 
     /// [`crate::fused::rows_inv`] for 256-point rows.
@@ -1274,7 +1443,21 @@ pub mod kernels {
         g: StackGeom,
         cfg: FusedCfg,
     ) {
-        unsafe { crate::fused::rows_inv::<256>(p, ctl, g, cfg) }
+        unsafe { crate::fused::rows_inv::<256, false>(p, ctl, g, cfg) }
+    }
+    /// [`crate::fused::rows_inv`] for 256-point rows, of f16 waves.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::rows_inv`].
+    #[kernel]
+    pub unsafe fn fused_rows_inv_f16_256(
+        p: FusedPtrs,
+        ctl: *const StackCtl,
+        g: StackGeom,
+        cfg: FusedCfg,
+    ) {
+        unsafe { crate::fused::rows_inv::<256, true>(p, ctl, g, cfg) }
     }
 
     /// [`crate::fused::rows_inv`] for 512-point rows.
@@ -1289,7 +1472,21 @@ pub mod kernels {
         g: StackGeom,
         cfg: FusedCfg,
     ) {
-        unsafe { crate::fused::rows_inv::<512>(p, ctl, g, cfg) }
+        unsafe { crate::fused::rows_inv::<512, false>(p, ctl, g, cfg) }
+    }
+    /// [`crate::fused::rows_inv`] for 512-point rows, of f16 waves.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::rows_inv`].
+    #[kernel]
+    pub unsafe fn fused_rows_inv_f16_512(
+        p: FusedPtrs,
+        ctl: *const StackCtl,
+        g: StackGeom,
+        cfg: FusedCfg,
+    ) {
+        unsafe { crate::fused::rows_inv::<512, true>(p, ctl, g, cfg) }
     }
 
     /// [`crate::fused::gather`].
@@ -1308,7 +1505,26 @@ pub mod kernels {
     ) {
         static mut SHARED: SharedArray<u32, STACK_TILE_SHARED> = SharedArray::UNINIT;
         let shared = (&raw mut SHARED).cast::<u32>();
-        unsafe { crate::fused::gather(p, tiles, sums, shared, ctl, g, cfg) }
+        unsafe { crate::fused::gather::<false>(p, tiles, sums, shared, ctl, g, cfg) }
+    }
+
+    /// [`crate::fused::gather`] of f16 waves.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::gather`].
+    #[kernel]
+    pub unsafe fn fused_gather_f16(
+        p: FusedPtrs,
+        tiles: TilePtrs,
+        sums: SumPtrs,
+        ctl: *const StackCtl,
+        g: StackGeom,
+        cfg: FusedCfg,
+    ) {
+        static mut SHARED: SharedArray<u32, STACK_TILE_SHARED> = SharedArray::UNINIT;
+        let shared = (&raw mut SHARED).cast::<u32>();
+        unsafe { crate::fused::gather::<true>(p, tiles, sums, shared, ctl, g, cfg) }
     }
 
     /// [`crate::fused::probe_terms`].
@@ -1393,7 +1609,21 @@ pub mod kernels {
         g: StackGeom,
         cfg: FusedCfg,
     ) {
-        unsafe { crate::fused::shift_rows_fwd::<64>(p, ctl, g, cfg) }
+        unsafe { crate::fused::shift_rows_fwd::<64, false>(p, ctl, g, cfg) }
+    }
+    /// [`crate::fused::shift_rows_fwd`] for 64-point rows, of f16 waves.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::shift_rows_fwd`].
+    #[kernel]
+    pub unsafe fn fused_shift_rows_fwd_f16_64(
+        p: FusedPtrs,
+        ctl: *const StackCtl,
+        g: StackGeom,
+        cfg: FusedCfg,
+    ) {
+        unsafe { crate::fused::shift_rows_fwd::<64, true>(p, ctl, g, cfg) }
     }
     /// [`crate::fused::shift_rows_fwd`] for 128-point rows.
     ///
@@ -1407,7 +1637,21 @@ pub mod kernels {
         g: StackGeom,
         cfg: FusedCfg,
     ) {
-        unsafe { crate::fused::shift_rows_fwd::<128>(p, ctl, g, cfg) }
+        unsafe { crate::fused::shift_rows_fwd::<128, false>(p, ctl, g, cfg) }
+    }
+    /// [`crate::fused::shift_rows_fwd`] for 128-point rows, of f16 waves.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::shift_rows_fwd`].
+    #[kernel]
+    pub unsafe fn fused_shift_rows_fwd_f16_128(
+        p: FusedPtrs,
+        ctl: *const StackCtl,
+        g: StackGeom,
+        cfg: FusedCfg,
+    ) {
+        unsafe { crate::fused::shift_rows_fwd::<128, true>(p, ctl, g, cfg) }
     }
     /// [`crate::fused::shift_rows_fwd`] for 256-point rows.
     ///
@@ -1421,7 +1665,21 @@ pub mod kernels {
         g: StackGeom,
         cfg: FusedCfg,
     ) {
-        unsafe { crate::fused::shift_rows_fwd::<256>(p, ctl, g, cfg) }
+        unsafe { crate::fused::shift_rows_fwd::<256, false>(p, ctl, g, cfg) }
+    }
+    /// [`crate::fused::shift_rows_fwd`] for 256-point rows, of f16 waves.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::shift_rows_fwd`].
+    #[kernel]
+    pub unsafe fn fused_shift_rows_fwd_f16_256(
+        p: FusedPtrs,
+        ctl: *const StackCtl,
+        g: StackGeom,
+        cfg: FusedCfg,
+    ) {
+        unsafe { crate::fused::shift_rows_fwd::<256, true>(p, ctl, g, cfg) }
     }
     /// [`crate::fused::shift_rows_fwd`] for 512-point rows.
     ///
@@ -1435,7 +1693,21 @@ pub mod kernels {
         g: StackGeom,
         cfg: FusedCfg,
     ) {
-        unsafe { crate::fused::shift_rows_fwd::<512>(p, ctl, g, cfg) }
+        unsafe { crate::fused::shift_rows_fwd::<512, false>(p, ctl, g, cfg) }
+    }
+    /// [`crate::fused::shift_rows_fwd`] for 512-point rows, of f16 waves.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::shift_rows_fwd`].
+    #[kernel]
+    pub unsafe fn fused_shift_rows_fwd_f16_512(
+        p: FusedPtrs,
+        ctl: *const StackCtl,
+        g: StackGeom,
+        cfg: FusedCfg,
+    ) {
+        unsafe { crate::fused::shift_rows_fwd::<512, true>(p, ctl, g, cfg) }
     }
     /// [`crate::fused::shift_rows_inv`] for 64-point rows.
     ///
@@ -1449,7 +1721,21 @@ pub mod kernels {
         g: StackGeom,
         cfg: FusedCfg,
     ) {
-        unsafe { crate::fused::shift_rows_inv::<64>(p, ctl, g, cfg) }
+        unsafe { crate::fused::shift_rows_inv::<64, false>(p, ctl, g, cfg) }
+    }
+    /// [`crate::fused::shift_rows_inv`] for 64-point rows, of f16 waves.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::shift_rows_inv`].
+    #[kernel]
+    pub unsafe fn fused_shift_rows_inv_f16_64(
+        p: FusedPtrs,
+        ctl: *const StackCtl,
+        g: StackGeom,
+        cfg: FusedCfg,
+    ) {
+        unsafe { crate::fused::shift_rows_inv::<64, true>(p, ctl, g, cfg) }
     }
     /// [`crate::fused::shift_rows_inv`] for 128-point rows.
     ///
@@ -1463,7 +1749,21 @@ pub mod kernels {
         g: StackGeom,
         cfg: FusedCfg,
     ) {
-        unsafe { crate::fused::shift_rows_inv::<128>(p, ctl, g, cfg) }
+        unsafe { crate::fused::shift_rows_inv::<128, false>(p, ctl, g, cfg) }
+    }
+    /// [`crate::fused::shift_rows_inv`] for 128-point rows, of f16 waves.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::shift_rows_inv`].
+    #[kernel]
+    pub unsafe fn fused_shift_rows_inv_f16_128(
+        p: FusedPtrs,
+        ctl: *const StackCtl,
+        g: StackGeom,
+        cfg: FusedCfg,
+    ) {
+        unsafe { crate::fused::shift_rows_inv::<128, true>(p, ctl, g, cfg) }
     }
     /// [`crate::fused::shift_rows_inv`] for 256-point rows.
     ///
@@ -1477,7 +1777,21 @@ pub mod kernels {
         g: StackGeom,
         cfg: FusedCfg,
     ) {
-        unsafe { crate::fused::shift_rows_inv::<256>(p, ctl, g, cfg) }
+        unsafe { crate::fused::shift_rows_inv::<256, false>(p, ctl, g, cfg) }
+    }
+    /// [`crate::fused::shift_rows_inv`] for 256-point rows, of f16 waves.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::shift_rows_inv`].
+    #[kernel]
+    pub unsafe fn fused_shift_rows_inv_f16_256(
+        p: FusedPtrs,
+        ctl: *const StackCtl,
+        g: StackGeom,
+        cfg: FusedCfg,
+    ) {
+        unsafe { crate::fused::shift_rows_inv::<256, true>(p, ctl, g, cfg) }
     }
     /// [`crate::fused::shift_rows_inv`] for 512-point rows.
     ///
@@ -1491,7 +1805,21 @@ pub mod kernels {
         g: StackGeom,
         cfg: FusedCfg,
     ) {
-        unsafe { crate::fused::shift_rows_inv::<512>(p, ctl, g, cfg) }
+        unsafe { crate::fused::shift_rows_inv::<512, false>(p, ctl, g, cfg) }
+    }
+    /// [`crate::fused::shift_rows_inv`] for 512-point rows, of f16 waves.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::shift_rows_inv`].
+    #[kernel]
+    pub unsafe fn fused_shift_rows_inv_f16_512(
+        p: FusedPtrs,
+        ctl: *const StackCtl,
+        g: StackGeom,
+        cfg: FusedCfg,
+    ) {
+        unsafe { crate::fused::shift_rows_inv::<512, true>(p, ctl, g, cfg) }
     }
     /// [`crate::fused::shift_sums`] for 64-point rows.
     ///
@@ -1505,7 +1833,21 @@ pub mod kernels {
         g: StackGeom,
         cfg: FusedCfg,
     ) {
-        unsafe { crate::fused::shift_sums::<64>(p, ctl, g, cfg) }
+        unsafe { crate::fused::shift_sums::<64, false>(p, ctl, g, cfg) }
+    }
+    /// [`crate::fused::shift_sums`] for 64-point rows, of f16 waves.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::shift_sums`].
+    #[kernel]
+    pub unsafe fn fused_shift_sums_f16_64(
+        p: FusedPtrs,
+        ctl: *const StackCtl,
+        g: StackGeom,
+        cfg: FusedCfg,
+    ) {
+        unsafe { crate::fused::shift_sums::<64, true>(p, ctl, g, cfg) }
     }
     /// [`crate::fused::shift_sums`] for 128-point rows.
     ///
@@ -1519,7 +1861,21 @@ pub mod kernels {
         g: StackGeom,
         cfg: FusedCfg,
     ) {
-        unsafe { crate::fused::shift_sums::<128>(p, ctl, g, cfg) }
+        unsafe { crate::fused::shift_sums::<128, false>(p, ctl, g, cfg) }
+    }
+    /// [`crate::fused::shift_sums`] for 128-point rows, of f16 waves.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::shift_sums`].
+    #[kernel]
+    pub unsafe fn fused_shift_sums_f16_128(
+        p: FusedPtrs,
+        ctl: *const StackCtl,
+        g: StackGeom,
+        cfg: FusedCfg,
+    ) {
+        unsafe { crate::fused::shift_sums::<128, true>(p, ctl, g, cfg) }
     }
     /// [`crate::fused::shift_sums`] for 256-point rows.
     ///
@@ -1533,7 +1889,21 @@ pub mod kernels {
         g: StackGeom,
         cfg: FusedCfg,
     ) {
-        unsafe { crate::fused::shift_sums::<256>(p, ctl, g, cfg) }
+        unsafe { crate::fused::shift_sums::<256, false>(p, ctl, g, cfg) }
+    }
+    /// [`crate::fused::shift_sums`] for 256-point rows, of f16 waves.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::shift_sums`].
+    #[kernel]
+    pub unsafe fn fused_shift_sums_f16_256(
+        p: FusedPtrs,
+        ctl: *const StackCtl,
+        g: StackGeom,
+        cfg: FusedCfg,
+    ) {
+        unsafe { crate::fused::shift_sums::<256, true>(p, ctl, g, cfg) }
     }
     /// [`crate::fused::shift_sums`] for 512-point rows.
     ///
@@ -1547,7 +1917,21 @@ pub mod kernels {
         g: StackGeom,
         cfg: FusedCfg,
     ) {
-        unsafe { crate::fused::shift_sums::<512>(p, ctl, g, cfg) }
+        unsafe { crate::fused::shift_sums::<512, false>(p, ctl, g, cfg) }
+    }
+    /// [`crate::fused::shift_sums`] for 512-point rows, of f16 waves.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::shift_sums`].
+    #[kernel]
+    pub unsafe fn fused_shift_sums_f16_512(
+        p: FusedPtrs,
+        ctl: *const StackCtl,
+        g: StackGeom,
+        cfg: FusedCfg,
+    ) {
+        unsafe { crate::fused::shift_sums::<512, true>(p, ctl, g, cfg) }
     }
     /// [`crate::fused::shift_post`] for 64-point columns.
     ///

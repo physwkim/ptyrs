@@ -12,11 +12,15 @@ use cuda_core::{CudaContext, CudaStream, DeviceBuffer, DeviceCopy, DriverError};
 use ptyrs::fft::{FftError, Plan2d};
 use ptyrs::gpu::{
     BackgroundSums, C32, Error, Exit, FUSED_SIDES, FarSums, FusedBufs, FusedInputs, FusedSums,
-    Kernels, Lines, LlkPartial, LlkScratch, LlkSums, MASKED, Model, OBJ_TILE, Permutation,
-    PositionPartial, ProbeSpectrum, PsiSums, ScalePartial, Shift, ShiftSums, ShiftedProbeSums,
-    SpectrumBuf, StackCtl, StackRef, StackTable, UpdateSums, ViewAddr, ViewDims, Views, lease,
-    record, view_tiles,
+    HalfWaves, Kernels, Lines, LlkPartial, LlkScratch, LlkSums, MASKED, Model, OBJ_TILE,
+    Permutation, PositionPartial, ProbeSpectrum, PsiSums, ScalePartial, Shift, ShiftSums,
+    ShiftedProbeSums, SpectrumBuf, StackCtl, StackRef, StackTable, UpdateSums, ViewAddr, ViewDims,
+    Views, Waves, half_scale, lease, record, view_tiles,
 };
+
+#[path = "common/worst.rs"]
+mod worst;
+use worst::worst_of;
 
 type Z = (f64, f64);
 
@@ -1419,11 +1423,11 @@ fn dm_reflect_and_add_match_f64() {
         .unwrap();
     let want: Vec<Z> = po_host.iter().map(|&c| z(c)).collect();
     let e_fix = rel_l2(&psi.to_host_vec(&stream).unwrap(), &want);
-    let rest = po
-        .to_host_vec(&stream)
-        .unwrap()
-        .iter()
-        .fold(0.0f32, |m, c| m.max(c.re.abs()).max(c.im.abs()));
+    let po = po.to_host_vec(&stream).unwrap();
+    let rest = worst_of(
+        po.iter()
+            .flat_map(|c| [c.re.abs() as f64, c.im.abs() as f64]),
+    );
     println!("dm_reflect fixed point: psi rel L2 {e_fix:.2e}, max |po| {rest:.2e}");
     assert!(e_fix < 1e-6 && rest < 1e-6);
 }
@@ -4713,6 +4717,285 @@ fn shifted_psi_sums_match_fused_project() {
                 );
             }
         }
+    }
+}
+
+/// Asserts each component of `got`, f16 waves read back, is `want`'s rounded to an f16 at
+/// `scale`: within half an ulp, `2^-11` of a normal value and `2^-25` of the scaled unit below.
+fn assert_half_rounded(what: &str, got: &[C32], want: &[C32], scale: f32) {
+    let mut worst = 0.0f64;
+    for (i, (g, w)) in got.iter().zip(want).enumerate() {
+        for (g, w) in [(g.re, w.re), (g.im, w.im)] {
+            let (g, w) = (g as f64, w as f64);
+            let bound = w.abs() * 2f64.powi(-11) + 2f64.powi(-25) / scale as f64;
+            assert!((g - w).abs() <= bound, "{what} value {i}: {g} vs {w}");
+            worst = worst.max((g - w).abs() / bound);
+        }
+    }
+    println!("{what}: worst {worst:.3} of the f16 rounding bound");
+}
+
+/// `num` and `den` of `got` against `want`'s, as relative L2 errors.
+fn update_sums_rel(stream: &CudaStream, got: &UpdateSums, want: &UpdateSums) -> (f64, f64) {
+    let num: Vec<Z> = want
+        .num
+        .to_host_vec(stream)
+        .unwrap()
+        .into_iter()
+        .map(z)
+        .collect();
+    let den: Vec<f64> = want
+        .den
+        .to_host_vec(stream)
+        .unwrap()
+        .into_iter()
+        .map(f64::from)
+        .collect();
+    (
+        rel_l2(&got.num.to_host_vec(stream).unwrap(), &num),
+        rel_l2_re(&got.den.to_host_vec(stream).unwrap(), &den),
+    )
+}
+
+/// The object's and the probe's sums of `u`, as a fused pass adds them.
+fn both_sums(u: &mut (UpdateSums, UpdateSums)) -> FusedSums<'_> {
+    FusedSums {
+        obj: Some(&mut u.0),
+        probe: Some(&mut u.1),
+        ..Default::default()
+    }
+}
+
+fn update_sums_bits(stream: &CudaStream, u: &UpdateSums) -> (Vec<(u32, u32)>, Vec<u32>) {
+    (
+        c32_bits(&u.num.to_host_vec(stream).unwrap()),
+        f32_bits(&u.den.to_host_vec(stream).unwrap()),
+    )
+}
+
+/// One build of a wave kernel reads both carried sets, so `fused_project` refuses `psi` and
+/// the RAAR iterate in different formats, before it writes anything.
+#[test]
+fn fused_project_refuses_psi_and_iterate_in_two_formats() {
+    let (stream, ex, k) = setup();
+    let (frame, modes) = FUSED_CASES[0];
+    let fs = FusedScan::new(&stream, frame, modes);
+    let s = &fs.s;
+    let table = one_stack(&stream, &s.d, 0..s.d.nframe);
+    let len = s.nk(&(0..s.d.nframe)) * s.n();
+    let mut bufs = FusedBufs::with_shift(&stream, &s.d, table.nf_max()).unwrap();
+    let mut half = HalfWaves::zeroed(&stream, len, 1.0).unwrap();
+    let mut full = DeviceBuffer::<C32>::zeroed(&stream, len).unwrap();
+    let mut refused = |exit: Exit<'_>| {
+        let r = k.fused_project(
+            &ex,
+            &fs.inputs(),
+            table.at(0),
+            exit,
+            &mut bufs,
+            FusedSums::default(),
+        );
+        assert!(
+            matches!(&r, Err(Error::Shape(m)) if m.contains("one format")),
+            "{r:?}"
+        );
+    };
+    refused(Exit::RaarFirst {
+        psi: &mut half,
+        iterate: &mut full,
+    });
+    refused(Exit::Raar {
+        psi: &mut full,
+        iterate: &mut half,
+        beta: 0.9,
+    });
+    assert!(
+        half.to_host_vec(&stream)
+            .unwrap()
+            .iter()
+            .all(|v| v.re == 0.0 && v.im == 0.0)
+    );
+    assert!(
+        full.to_host_vec(&stream)
+            .unwrap()
+            .iter()
+            .all(|v| v.re == 0.0 && v.im == 0.0)
+    );
+}
+
+/// DM's and RAAR's carried waves as f16 ([`HalfWaves`] at [`half_scale`] of the counts), on
+/// [`FUSED_CASES`]: every pass that stores them stores the f32 pass's values rounded, and
+/// every pass that reads them reads what an f32 buffer of the same values gives. The first
+/// cycles against the f32 ones; the later cycles, with and without a [`Model::shift`],
+/// against f32 runs started from the f16 waves' values, their fused sums to the rounding of
+/// the stored waves; `psi_to_obj`, `psi_to_probe` and `shifted_psi_sums` bit for bit.
+#[test]
+fn fused_f16_waves_round_the_f32_ones() {
+    let (stream, ex, k) = setup();
+    let (alpha, beta) = (0.02f32, 0.9f32);
+    for (frame, modes) in FUSED_CASES {
+        let fs = FusedScan::new(&stream, frame, modes);
+        let (s, n) = (&fs.s, fs.s.n());
+        let table = one_stack(&stream, &s.d, 0..s.d.nframe);
+        let stack = table.at(0);
+        let len = s.nk(&(0..s.d.nframe)) * n;
+        let frame_sum = |c: &[u16]| c.iter().filter(|&&c| c != MASKED).map(|&c| c as u64).sum();
+        let max_sum: u64 = fs.counts_host.chunks_exact(n).map(frame_sum).max().unwrap();
+        let scale = half_scale(max_sum);
+        println!("{frame:?} {modes:?}: frame sums up to {max_sum}, scale {scale}");
+        let half = || HalfWaves::zeroed(&stream, len, scale).unwrap();
+        let full = || DeviceBuffer::<C32>::zeroed(&stream, len).unwrap();
+        let host = |b: &DeviceBuffer<C32>| b.to_host_vec(&stream).unwrap();
+        let update = || {
+            (
+                UpdateSums::zeroed(&stream, s.obj.len()).unwrap(),
+                UpdateSums::zeroed(&stream, s.probe.len()).unwrap(),
+            )
+        };
+        let mut bufs = FusedBufs::with_shift(&stream, &s.d, table.nf_max()).unwrap();
+        let mut go = |inputs: &FusedInputs<'_>, exit: Exit<'_>, sums: FusedSums<'_>| {
+            k.fused_project(&ex, inputs, stack, exit, &mut bufs, sums)
+                .unwrap()
+        };
+        let what = |pass: &str| format!("{frame:?} {modes:?} {pass}");
+        let check_sums =
+            |pass: &str, got: &(UpdateSums, UpdateSums), want: &(UpdateSums, UpdateSums)| {
+                for (who, got, want) in [("object", &got.0, &want.0), ("probe", &got.1, &want.1)] {
+                    let (en, ed) = update_sums_rel(&stream, got, want);
+                    println!(
+                        "{} {who} sums: num rel L2 {en:.2e}, den {ed:.2e}",
+                        what(pass)
+                    );
+                    assert!(
+                        en < 5e-4 && ed < 5e-4,
+                        "{} {who}: {en:.2e}, {ed:.2e}",
+                        what(pass)
+                    );
+                }
+            };
+
+        // DM.
+        let (mut h, mut f) = (half(), full());
+        go(
+            &fs.inputs(),
+            Exit::DmFirst { psi: &mut h },
+            FusedSums::default(),
+        );
+        go(
+            &fs.inputs(),
+            Exit::DmFirst { psi: &mut f },
+            FusedSums::default(),
+        );
+        let start = h.to_host_vec(&stream).unwrap();
+        assert_half_rounded(&what("DM first"), &start, &host(&f), scale);
+        let mut f = up(&stream, &start);
+        let (mut hs, mut fsums) = (update(), update());
+        go(
+            &fs.inputs(),
+            Exit::Dm { psi: &mut h, alpha },
+            both_sums(&mut hs),
+        );
+        go(
+            &fs.inputs(),
+            Exit::Dm { psi: &mut f, alpha },
+            both_sums(&mut fsums),
+        );
+        let dm = h.to_host_vec(&stream).unwrap();
+        assert_half_rounded(&what("DM"), &dm, &host(&f), scale);
+        check_sums("DM", &hs, &fsums);
+
+        // The M1 sums of the f16 waves and of their values.
+        let same = up(&stream, &dm);
+        let (mut hs, mut fsums) = (update(), update());
+        k.psi_to_obj(&ex, &fs.views, stack, &h, &fs.probe, &mut hs.0)
+            .unwrap();
+        k.psi_to_obj(&ex, &fs.views, stack, &same, &fs.probe, &mut fsums.0)
+            .unwrap();
+        k.psi_to_probe(&ex, &fs.views, stack, &h, &fs.obj, &mut hs.1)
+            .unwrap();
+        k.psi_to_probe(&ex, &fs.views, stack, &same, &fs.obj, &mut fsums.1)
+            .unwrap();
+        assert!(
+            update_sums_bits(&stream, &hs.0) == update_sums_bits(&stream, &fsums.0),
+            "{}",
+            what("psi_to_obj")
+        );
+        assert!(
+            update_sums_bits(&stream, &hs.1) == update_sums_bits(&stream, &fsums.1),
+            "{}",
+            what("psi_to_probe")
+        );
+
+        // RAAR, both carried sets f16.
+        let (mut h, mut hi, mut f, mut fi) = (half(), half(), full(), full());
+        let first = Exit::RaarFirst {
+            psi: &mut h,
+            iterate: &mut hi,
+        };
+        go(&fs.inputs(), first, FusedSums::default());
+        let first = Exit::RaarFirst {
+            psi: &mut f,
+            iterate: &mut fi,
+        };
+        go(&fs.inputs(), first, FusedSums::default());
+        let start = h.to_host_vec(&stream).unwrap();
+        let start_it = hi.to_host_vec(&stream).unwrap();
+        assert_half_rounded(&what("RAAR first"), &start, &host(&f), scale);
+        assert_half_rounded(&what("RAAR first iterate"), &start_it, &host(&fi), scale);
+        let (mut f, mut fi) = (up(&stream, &start), up(&stream, &start_it));
+        let (mut hs, mut fsums) = (update(), update());
+        let exit = Exit::Raar {
+            psi: &mut h,
+            iterate: &mut hi,
+            beta,
+        };
+        go(&fs.inputs(), exit, both_sums(&mut hs));
+        let exit = Exit::Raar {
+            psi: &mut f,
+            iterate: &mut fi,
+            beta,
+        };
+        go(&fs.inputs(), exit, both_sums(&mut fsums));
+        let (raar, raar_it) = (
+            h.to_host_vec(&stream).unwrap(),
+            hi.to_host_vec(&stream).unwrap(),
+        );
+        assert_half_rounded(&what("RAAR"), &raar, &host(&f), scale);
+        assert_half_rounded(&what("RAAR iterate"), &raar_it, &host(&fi), scale);
+        check_sums("RAAR", &hs, &fsums);
+
+        // Shifted DM, from the RAAR waves.
+        let offsets = up(&stream, SHIFTS.as_flattened());
+        let mut spec = SpectrumBuf::zeroed(&stream, &s.d).unwrap();
+        let spectrum = k.probe_spectrum(&ex, &s.d, &fs.probe, &mut spec).unwrap();
+        let inputs = shifted_inputs(&fs, &offsets, spectrum);
+        let mut f = up(&stream, &raar);
+        let (mut ho, mut fo) = (ShiftOut::zeroed(&stream, s), ShiftOut::zeroed(&stream, s));
+        go(&inputs, Exit::Dm { psi: &mut h, alpha }, ho.sums(true));
+        go(&inputs, Exit::Dm { psi: &mut f, alpha }, fo.sums(true));
+        let shifted = h.to_host_vec(&stream).unwrap();
+        assert_half_rounded(&what("shifted DM"), &shifted, &host(&f), scale);
+        drop(go);
+        let same = up(&stream, &shifted);
+        let (mut ho, mut fo) = (ShiftOut::zeroed(&stream, s), ShiftOut::zeroed(&stream, s));
+        for (out, waves) in [(&mut ho, &h as &dyn Waves), (&mut fo, &same)] {
+            let sums = PsiSums {
+                obj: Some(&mut out.obj),
+                probe: Some(&mut out.probe),
+            };
+            k.shifted_psi_sums(&ex, &inputs, stack, waves, &mut bufs, sums)
+                .unwrap();
+        }
+        let bits = |o: &mut ShiftOut| {
+            o.update_bits(&stream, s, |sums, out| {
+                k.shifted_probe_sums(&ex, &s.d, sums, out).unwrap()
+            })
+        };
+        assert!(
+            bits(&mut ho) == bits(&mut fo),
+            "{}",
+            what("shifted_psi_sums")
+        );
     }
 }
 

@@ -61,7 +61,8 @@ pub use ptyrs_kernels::pixel::{
     LlkPartial, MASKED, OBJ_TILE, PositionPartial, ScalePartial, StackCtl, StackGeom, ViewAddr,
 };
 
-use crate::gpu::{C32, Error, Kernels, check_len, dptr, lease};
+use crate::gpu::psi::check_waves;
+use crate::gpu::{C32, Error, Kernels, Waves, check_len, dptr, lease};
 
 /// Geometry of a scan's views.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1074,20 +1075,20 @@ impl Kernels {
         ctx: &ExecutionContext,
         views: &Views,
         stack: StackRef<'_>,
-        psi: &DeviceBuffer<C32>,
+        psi: &dyn Waves,
         probe: &DeviceBuffer<C32>,
         sums: &mut UpdateSums,
     ) -> Result<(), Error> {
         let d = &views.dims;
         let g = d.geom(stack)?;
         let n = d.n();
-        check_len("psi", psi, g.nf_max as usize * d.nmode as usize * n)?;
+        check_waves("psi", psi, g.nf_max as usize * d.nmode as usize * n)?;
         check_len("probe", probe, d.nprobe as usize * n)?;
         sums.check(d.obj_len())?;
         let config = d.stack_tile_grid(g.nf_max)?;
         let [start, len, list] = views.tile_storages();
         let reads = [
-            psi.storage(),
+            psi.raw(),
             probe.storage(),
             views.addr.storage(),
             start,
@@ -1098,17 +1099,18 @@ impl Kernels {
         self.launch(ctx, &reads, &sums.storages(), |stream| {
             // SAFETY: lengths checked above; the tile lists were built from these views.
             unsafe {
-                self.module.psi_to_obj(
-                    stream,
-                    config,
-                    dptr(psi),
-                    dptr(probe),
-                    dptr(&views.addr),
+                let (m, ptr, probe, addr) =
+                    (&self.module, psi.ptr(), dptr(probe), dptr(&views.addr));
+                let (tiles, sums, ctl) = (
                     views.tile_ptrs(),
                     sums.ptrs(),
                     stack.ctl() as *const StackCtl,
-                    g,
-                )
+                );
+                if psi.half() {
+                    m.psi_to_obj_f16(stream, config, ptr, probe, addr, tiles, sums, ctl, g)
+                } else {
+                    m.psi_to_obj(stream, config, ptr, probe, addr, tiles, sums, ctl, g)
+                }
             }
         })
     }
@@ -1122,19 +1124,19 @@ impl Kernels {
         ctx: &ExecutionContext,
         views: &Views,
         stack: StackRef<'_>,
-        psi: &DeviceBuffer<C32>,
+        psi: &dyn Waves,
         obj: &DeviceBuffer<C32>,
         sums: &mut UpdateSums,
     ) -> Result<(), Error> {
         let d = &views.dims;
         let g = d.geom(stack)?;
         let n = d.n();
-        check_len("psi", psi, g.nf_max as usize * d.nmode as usize * n)?;
+        check_waves("psi", psi, g.nf_max as usize * d.nmode as usize * n)?;
         check_len("obj", obj, d.obj_len())?;
         sums.check(d.nprobe as usize * n)?;
         let config = grid_1d(d.nprobe as usize * n)?;
         let reads = [
-            psi.storage(),
+            psi.raw(),
             obj.storage(),
             views.addr.storage(),
             stack.storage(),
@@ -1142,16 +1144,13 @@ impl Kernels {
         self.launch(ctx, &reads, &sums.storages(), |stream| {
             // SAFETY: lengths checked above; `Views::new` checked every view.
             unsafe {
-                self.module.psi_to_probe(
-                    stream,
-                    config,
-                    dptr(psi),
-                    dptr(obj),
-                    dptr(&views.addr),
-                    sums.ptrs(),
-                    stack.ctl() as *const StackCtl,
-                    g,
-                )
+                let (m, ptr, obj, addr) = (&self.module, psi.ptr(), dptr(obj), dptr(&views.addr));
+                let (sums, ctl) = (sums.ptrs(), stack.ctl() as *const StackCtl);
+                if psi.half() {
+                    m.psi_to_probe_f16(stream, config, ptr, obj, addr, sums, ctl, g)
+                } else {
+                    m.psi_to_probe(stream, config, ptr, obj, addr, sums, ctl, g)
+                }
             }
         })
     }

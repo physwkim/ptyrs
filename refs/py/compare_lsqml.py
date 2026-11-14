@@ -7,8 +7,8 @@ init as it is, both sides over the engine's random_batches order, PyNX LLK per e
 DATA_DIR is refgen_gen_m3's output (ptyrs::refgen), DIR holds the module ptyrs-py/scripts/build.sh
 installs. Prints the start's far-field intensity difference (Ptycho.forward against pty-chi's
 forward model), each epoch's LLK of the noise model on both sides, and the first epoch each side
-reaches 1.01, 1.02 and 1.05 times the truth; exits 1 if those epochs differ. pty-chi's Gaussian
-noise model is the engine's Cost::Amplitude.
+reaches 1.01, 1.02 and 1.05 times the truth; exits 1 if those epochs differ, 2 if a side diverges
+(m3ref.exit_unless_converging). pty-chi's Gaussian noise model is the engine's Cost::Amplitude.
 
 Matched config, as in the M3 parity curves: pty-chi features ptyrs does not implement are off
 (object-probe ambiguity removal, mode orthogonalisation, the first-epoch probe intensity
@@ -135,11 +135,11 @@ def main():
 
     print(f"{args.name} LSQML {key} b{args.batch} seed {args.seed}: epoch, {key} LLK ptyrs, "
           f"pty-chi, relative difference")
-    o, pr = obj, probe
+    o, pr = obj[None], probe
     for e in range(args.epochs + 1):
         if e:
             t = time.perf_counter()
-            o, pr, _ = lsqml.epoch(p, o, pr)
+            o, pr, _ = lsqml.epoch(p.views, o, pr)
             wall["ptyrs"] += time.perf_counter() - t
             t = time.perf_counter()
             torch.randn = zeros
@@ -149,13 +149,14 @@ def main():
                 torch.randn = randn
             wall["pty-chi"] += time.perf_counter() - t
             assert sampler.epoch == e, (sampler.epoch, e)
-            curves["ptyrs"].append(p.llk(o, pr)[key])
+            curves["ptyrs"].append(p.llk(o[0], pr)[key])
             curves["pty-chi"].append(m3ref.evaluate(task)[key])
         x, y = curves["ptyrs"][e], curves["pty-chi"][e]
         print(f"{e:4d} {x:.10e} {y:.10e} {abs(x - y) / y:.1e}", flush=True)
         if not (np.isfinite(x) and np.isfinite(y)):
             break
 
+    m3ref.exit_unless_converging(curves)
     truth = ds.meta["llk_truth"][key]
     hits = {side: first_hits(c, truth) for side, c in curves.items()}
     print(f"torch.randn calls zeroed: {len(zeroed)}")

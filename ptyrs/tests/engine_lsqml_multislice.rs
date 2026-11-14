@@ -14,6 +14,10 @@ use ptyrs::engine::{
     Propagator, SliceWaves, Wavefield, illumination, llk, shift,
 };
 
+#[path = "common/worst.rs"]
+mod worst;
+use worst::worst_of;
+
 const SHAPE: [usize; 2] = [24, 24];
 const OBJ: [usize; 2] = [40, 40];
 const NPROBE: usize = 2;
@@ -29,11 +33,7 @@ fn table(text: &str) -> Vec<Vec<f64>> {
 /// `max |a − b| / max |b|`.
 fn max_rel(a: &[f64], b: &[f64]) -> f64 {
     assert_eq!(a.len(), b.len());
-    let d = a
-        .iter()
-        .zip(b)
-        .map(|(a, b)| (a - b).abs())
-        .fold(0.0, f64::max);
+    let d = worst_of(a.iter().zip(b).map(|(a, b)| (a - b).abs()));
     d / b.iter().map(|b| b.abs()).fold(0.0, f64::max)
 }
 
@@ -94,14 +94,19 @@ fn state() -> State {
         .iter()
         .map(|c| {
             // kind 0 is the far field at detector distance c[3], detector pixel λz/(ny·c[2])
-            let (optics, pixel) = if c[4] == 0.0 {
+            let (optics, pixel, kind) = if c[4] == 0.0 {
                 let lz = c[1] * c[3];
                 let g = Geometry::new(c[1], c[3], lz / (SHAPE[0] as f64 * c[2]), SHAPE).unwrap();
-                (Optics::far_field(&g), g.pixel_size_object())
+                (Optics::far_field(&g), g.pixel_size_object(), 0)
             } else {
                 let pixel = [c[2], c[2]];
                 let w = Wavefield::new(SHAPE, c[1], pixel, c[3]).unwrap();
-                (Optics::free_space(&w), pixel)
+                let kind = match Propagator::free_space(&w) {
+                    Propagator::Fourier(_) => 0,
+                    Propagator::AngularSpectrum(_) => 1,
+                    Propagator::Fresnel(_) => 2,
+                };
+                (Optics::free_space(&w), pixel, kind)
             };
             let gaps: Vec<_> = c[7..]
                 .iter()
@@ -109,12 +114,7 @@ fn state() -> State {
                 .collect();
             assert_eq!(gaps.len(), NSLICE - 1);
             let optics = optics.with_slices(&gaps).unwrap();
-            let p = optics.propagator();
-            let kind = match p {
-                Propagator::Fourier(_) => 0,
-                Propagator::AngularSpectrum(_) => 1,
-                Propagator::Fresnel(_) => 2,
-            };
+            let p = optics.exit();
             assert_eq!(kind, c[4] as usize, "kind of case {}", c[0]);
             assert!(
                 rel(p.intensity_scale(), c[5]) <= 1e-15,
@@ -145,10 +145,10 @@ fn state() -> State {
 
 /// Detector-plane exit waves of `views` through the slices.
 fn propagated(views: &[View], c: &Case, objects: &[Object], probe: &Probe) -> Vec<C64> {
-    let mut psi = SliceWaves::new(&c.optics, views, objects, probe)
+    let mut psi = SliceWaves::new(&c.optics, views, objects, probe, None)
         .psi()
         .to_vec();
-    c.optics.propagator().forward(&mut psi);
+    c.optics.exit().forward(&mut psi);
     psi
 }
 
@@ -371,8 +371,10 @@ fn step_matches_ptychi() {
 }
 
 /// [`step_matches_ptychi`] from the truth object with every frame moved by
-/// `lsqml_multislice_pos.py`'s offset and the positions refined, every case: the step, the
-/// changes and the offset changes, pty-chi's correction on the middle slice.
+/// `lsqml_multislice_pos.py`'s offset and the positions refined: the step, the changes and
+/// the offset changes, pty-chi's correction on the middle slice. The case whose exit has no
+/// plane phase only: pty-chi holds the phase where the probe moves, [`SliceWaves`] displaces
+/// it with the probe.
 #[test]
 fn step_with_positions_matches_ptychi() {
     let mut s = state();
@@ -392,7 +394,9 @@ fn step_with_positions_matches_ptychi() {
         "engine/data/lsqml_multislice_pos_offsets_f64.txt"
     ));
     let views = &s.addr.views()[..BATCH * s.addr.nmode()];
-    for (k, c) in s.cases.iter().enumerate() {
+    let plain = |c: &Case| c.optics.quad().iter().all(|q| *q == C64::new(1.0, 0.0));
+    assert_eq!(s.cases.iter().filter(|c| plain(c)).count(), 1);
+    for (k, c) in s.cases.iter().enumerate().filter(|(_, c)| plain(c)) {
         let offsets: Vec<_> = offsets.iter().filter(|r| r[0] == k as f64).collect();
         let at = |col: usize| -> Vec<[f64; 2]> {
             offsets.iter().map(|r| [r[col], r[col + 1]]).collect()
