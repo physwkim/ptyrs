@@ -6,7 +6,7 @@
 //! (invariant 5). A GPU's window holds every tile a frame touching its own tiles can read,
 //! planned or not, and its halo grows as frames read new tiles, so a frame off the plan
 //! lands wherever one GPU would take it. The split admits frames through the one-GPU scan's
-//! [`Gate`] on the whole object, so every GPU's batch ends at the frame one GPU's scan
+//! gate on the whole object, so every GPU's batch ends at the frame one GPU's scan
 //! refuses.
 
 use std::sync::Arc;

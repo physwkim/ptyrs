@@ -4,7 +4,7 @@
 //! [`Views::from_slabs`].
 //!
 //! `push` is the one write site of frames into the scan. It lands a frame
-//! only if its [`Gate`] admits it, and readies the tiles the frame touches
+//! only if its gate admits it, and readies the tiles the frame touches
 //! first. So every view the device reads is in range, `bin_views` never
 //! overflows a slab and the stack entry never needs the kernels' clamp.
 //! Frames land in order: the first frame refused closes the scan, and it
