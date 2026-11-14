@@ -900,7 +900,7 @@ impl MlState {
         moved: bool,
     ) -> Result<Self, EngineError> {
         // The fields po, a, b: `gamma_fields`, the transform, `gamma_frames`; under the
-        // position the moved probes of P and dP: `shifted_rows_fwd`, `shift_w`,
+        // position the moved probes of P and dP: `shifted_probe`, `shift_w`,
         // `obj_wave_to_psi`.
         let mut streamed = vec![Streamed::new(3 * wave_bytes(dims), 3)];
         if moved {
@@ -1028,7 +1028,7 @@ impl BhState {
         let dims = views.dims();
         // psi, r, lu, lv, each written by one pass and transformed or read by later ones;
         // under the position also y (`obj_conj`, the transform, `pos_grad`), the moved probes
-        // (`shifted_rows_fwd`, `shift_w`, `obj_wave_to_psi`) and the shift planes of the
+        // (`shifted_probe`, `shift_w`, `obj_wave_to_psi`) and the shift planes of the
         // shared scratch, which `shifted_psi_sums` writes and reads.
         let wave = wave_bytes(dims);
         let mut streamed = vec![Streamed::new(4 * wave, 3)];
