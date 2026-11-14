@@ -166,7 +166,10 @@ impl GpuPtycho {
         crate::lsqml_steps(py, &self.0.lsqml_steps().map_err(Error::from)?)
     }
 
-    /// As `Ptycho.set_features`, in `f32` on the device; with `fused=True` only.
+    /// As `Ptycho.set_features`, in `f32` on the device; with `fused=True` only. Refused
+    /// features (a `ValueError`) leave the current ones; after a device error (a
+    /// `RuntimeError`), the new ones may stay modelled, with the LLK pass run without its
+    /// graph, or be partly written.
     #[pyo3(signature = (*, scale = None, background = None, position = None))]
     fn set_features(
         &mut self,
