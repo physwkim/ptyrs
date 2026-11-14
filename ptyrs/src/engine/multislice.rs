@@ -429,6 +429,52 @@ mod tests {
         }
     }
 
+    /// [`SliceWaves::quad`] is the phase the forward model applies: on every slice, `psi_s`
+    /// of every view is its object patch times the wave entering the slice times
+    /// `quad(s, k)`, with the frames moved and not, through three slices and through two,
+    /// where LSQML's position slice `nslice / 2` is the last.
+    #[test]
+    fn quad_is_the_phase_of_every_slices_psi() {
+        let (addr, objects, probe) = setup();
+        let (views, [ny, nx], nxo) = (addr.views(), [8, 6], 12);
+        let gap = |pixel| [Wavefield::new([ny, nx], 1e-10, pixel, 5e-5).unwrap()];
+        let g = far_geometry();
+        let far = Optics::far_field(&g).with_slices(&gap(g.pixel_size_object()));
+        let w = Wavefield::new([ny, nx], 1e-10, [5e-8, 5e-8], 1e-3).unwrap();
+        let fresnel = Optics::free_space(&w).with_slices(&gap([5e-8, 5e-8]));
+        let mut all = optics();
+        all.extend([far.unwrap(), fresnel.unwrap()]);
+        assert_eq!(all.iter().filter(|o| o.nslice() == 2).count(), 2);
+        let mut displaced = 0;
+        for (optics, offsets) in all.iter().flat_map(|o| OFFSETS.map(|d| (o, d))) {
+            let objects = &objects[..optics.nslice()];
+            let last = objects.len() - 1;
+            let waves = SliceWaves::new(optics, views, objects, &probe, offsets);
+            for (s, object) in objects.iter().enumerate() {
+                let psi = waves.obj_tangent(s, object);
+                if s == last {
+                    assert_eq!(psi, waves.psi());
+                }
+                for (k, (v, psi)) in views.iter().zip(psi.chunks_exact(ny * nx)).enumerate() {
+                    let (o, q) = (object.plane(v.obj as usize), waves.quad(s, k));
+                    let w = waves.incident(s).plane(k);
+                    displaced += (s == last && q != optics.quad()) as usize;
+                    for (j, got) in psi.iter().enumerate() {
+                        let i = shift(j, ny, nx);
+                        let patch = o[(v.oy as usize + i / nx) * nxo + v.ox as usize + i % nx];
+                        let want = patch * w[i] * q[i];
+                        assert!(
+                            (got - want).norm() <= 1e-15 * want.norm(),
+                            "slice {s} view {k} pixel {j}: {got} against {want}"
+                        );
+                    }
+                }
+            }
+        }
+        // Every view of the three exits with a plane phase, under the offsets.
+        assert_eq!(displaced, 3 * views.len());
+    }
+
     #[test]
     fn one_slice_is_obj_probe_to_psi() {
         let (addr, objects, probe) = setup();
