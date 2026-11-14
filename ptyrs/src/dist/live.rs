@@ -14,6 +14,8 @@ use std::sync::Arc;
 use cuda_core::{Context, Stream};
 
 use crate::gpu::{ViewAddr, ViewDims, view_tiles};
+use crate::live::recon::ViewPlacement;
+use crate::live::ring::Route;
 use crate::live::scan::{Gate, Refusal, ScanShape, off_view};
 
 use crate::dist::exchange::Pull;
@@ -142,8 +144,7 @@ impl LivePlan {
         let mut frames = vec![Vec::new(); ngpu];
         let mut tiles = Vec::new();
         for (f, views) in planned.chunks(nmode).enumerate() {
-            touched(&dims, &grid, &views[0], &mut tiles);
-            for r in owners(run.owner(), &tiles, ngpu) {
+            for r in bits(lands(&dims, &grid, run.owner(), &views[0], &mut tiles)) {
                 frames[r].push(f as u32);
             }
         }
@@ -255,8 +256,13 @@ impl LivePlan {
             if self.gate.admit(frame).is_err() {
                 break;
             }
-            touched(&self.dims, grid, &frame[0], &mut tiles);
-            for r in owners(self.run.owner(), &tiles, self.regions.len()) {
+            for r in bits(lands(
+                &self.dims,
+                grid,
+                self.run.owner(),
+                &frame[0],
+                &mut tiles,
+            )) {
                 // Inside the object, the tiles a frame touches lie within its frame width of
                 // each other, so within region `r`'s partition halo of the one it owns.
                 self.halo.read(r, tiles.iter().copied(), shares);
@@ -273,20 +279,76 @@ impl LivePlan {
     pub fn closed(&self) -> Option<Refusal> {
         self.gate.closed()
     }
+
+    /// The regions a frame at a position lands on, positions placed by `place` as the
+    /// views given to [`Self::split`] are: what the uploader fills the regions' stores by.
+    /// It routes frames the gate refuses too; nothing reads their places, since a refusal
+    /// closes the plan for every frame after it.
+    pub fn route(&self, place: ViewPlacement) -> LiveRoute {
+        LiveRoute {
+            dims: self.dims,
+            grid: *self.run.grid(),
+            owner: self.run.owner().to_vec(),
+            nregion: self.regions.len(),
+            place,
+            view: Vec::new(),
+            tiles: Vec::new(),
+        }
+    }
 }
 
-/// The tiles of `grid` a frame at `view`'s position touches, by the kernels' rule, into
-/// `out`, ascending: every view of a frame is at its one position ([`off_view`]).
-fn touched(dims: &ViewDims, grid: &TileGrid, view: &ViewAddr, out: &mut Vec<usize>) {
-    out.clear();
-    out.extend(view_tiles(dims, view).map(|[ty, tx]| grid.id(ty as usize, tx as usize)));
+/// The regions a frame at `view`'s position lands on, bit `r` for region `r`: the owner of
+/// every tile it touches by the kernels' rule, which go into `tiles`, ascending; region 0
+/// for a frame off the object, which the gate refuses. Every view of a frame is at its one
+/// position ([`off_view`]). The plan's frame lists, [`LivePlan::split`] and the uploader's
+/// [`LiveRoute`] all route through here, so a region's frame index in the plan is its place
+/// in the region's store.
+fn lands(
+    dims: &ViewDims,
+    grid: &TileGrid,
+    owner: &[u32],
+    view: &ViewAddr,
+    tiles: &mut Vec<usize>,
+) -> u32 {
+    tiles.clear();
+    if dims.check_view(view).is_err() {
+        return 1;
+    }
+    tiles.extend(view_tiles(dims, view).map(|[ty, tx]| grid.id(ty as usize, tx as usize)));
+    tiles.iter().fold(0, |m, &t| m | 1 << owner[t])
 }
 
-/// The owners of `tiles`, ascending.
-fn owners(owner: &[u32], tiles: &[usize], n: usize) -> Vec<usize> {
-    let mut hit = vec![false; n];
-    tiles.iter().for_each(|&t| hit[owner[t] as usize] = true);
-    (0..n).filter(|&r| hit[r]).collect()
+fn bits(mask: u32) -> impl Iterator<Item = usize> {
+    (0..32).filter(move |r| mask >> r & 1 == 1)
+}
+
+/// A [`LivePlan`]'s routing of frames by position, for the uploader.
+pub struct LiveRoute {
+    dims: ViewDims,
+    grid: TileGrid,
+    owner: Vec<u32>,
+    nregion: usize,
+    place: ViewPlacement,
+    view: Vec<ViewAddr>,
+    tiles: Vec<usize>,
+}
+
+impl Route for LiveRoute {
+    fn nregion(&self) -> usize {
+        self.nregion
+    }
+
+    fn regions(&mut self, pos: (f64, f64)) -> u32 {
+        self.view.clear();
+        self.place.views(pos, 1, 1, &mut self.view);
+        lands(
+            &self.dims,
+            &self.grid,
+            &self.owner,
+            &self.view[0],
+            &mut self.tiles,
+        )
+    }
 }
 
 #[cfg(test)]
@@ -297,10 +359,15 @@ mod tests {
     use crate::dist::halo::{HaloBacker, HaloRows};
     use crate::dist::worker::{Workers, tests::gpus};
     use crate::live::graph::{LiveGraph, WarmUp};
+    use crate::live::pos::{Pos, PosTable};
     use crate::live::recon::ViewPlacement;
+    use crate::live::ring::{DeviceStore, Ring, UploaderConfig, run_region_uploader};
     use crate::live::scan::{LiveScan, ScanBacker};
+    use crate::live::stats::wall_ns;
     use cuda_core::DeviceBuffer;
-    use std::num::NonZeroU32;
+    use std::num::{NonZeroU32, NonZeroUsize};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
 
     const PIXEL: [f64; 2] = [1e-8, 1e-8];
     /// Slab slots no test here fills.
@@ -613,7 +680,7 @@ mod tests {
                                 continue;
                             }
                             let t = tiles_of(&dims, &[v], ntx, [0, 0]);
-                            for r in owners(owner, &t, ngpu) {
+                            for r in bits(t.iter().fold(0, |m, &t| m | 1 << owner[t])) {
                                 let g = &plan.regions()[r];
                                 let (ld, w) = (g.shape.dims(), g.window.shift(v));
                                 let what = format!("{name} on {ngpu}: region {r}, {v:?}");
@@ -930,6 +997,174 @@ mod tests {
             }
         }
         assert!(grew > 0, "no frame off the plan read a new tile");
+    }
+
+    fn uploader_cfg() -> UploaderConfig {
+        UploaderConfig {
+            batch: NonZeroUsize::new(8).unwrap(),
+            flush_ns: 100_000,
+            idle: Duration::from_micros(20),
+            events: 4,
+            pos_wait_ns: 2_000_000,
+        }
+    }
+
+    /// The uploader, routing by the plan, against the plan's split of the landed frames:
+    /// place `k` of region `r`'s store on its own GPU holds the frame the split numbers
+    /// `k` there, with frames dropped in between, frames on one region and on several.
+    #[test]
+    fn the_uploader_fills_each_store_in_the_order_the_plan_numbers_its_frames() {
+        let pos = sim::raster(12, 20, 8e-8);
+        let xy: Vec<(f64, f64)> = pos.x.iter().copied().zip(pos.y.iter().copied()).collect();
+        let (place, _) = ViewPlacement::plan(PIXEL, &xy);
+        let (shape, planned) = scan(pos, 32);
+        let se = 32 * 32;
+        let pixel = |uid: usize, j: usize| (uid * 7 + j) as u16;
+        let lost = |uid: usize| uid % 13 == 5;
+        let landed: Vec<usize> = (0..xy.len()).filter(|&u| !lost(u)).collect();
+        for ngpu in [2, 4] {
+            let mut plan = LivePlan::new(&shape, &planned, Scheme::Strips, ngpu, ROOM).unwrap();
+            let ctxs: Vec<Arc<Context>> = gpus(ngpu)
+                .into_iter()
+                .map(|o| Context::new(o).unwrap())
+                .collect();
+            let ring = Arc::new(Ring::new(&ctxs[0], xy.len(), se).unwrap());
+            let stores: Vec<Arc<DeviceStore>> = ctxs
+                .iter()
+                .map(|c| Arc::new(DeviceStore::new(c, xy.len(), se).unwrap()))
+                .collect();
+            let table = Arc::new(PosTable::new(1 << 10));
+            let stop = Arc::new(AtomicBool::new(false));
+            let (tx, rx) = crossbeam_channel::unbounded();
+            let up = {
+                let (ring, stores, table, stop) =
+                    (ring.clone(), stores.clone(), table.clone(), stop.clone());
+                let (route, cfg) = (plan.route(place), uploader_cfg());
+                std::thread::spawn(move || {
+                    run_region_uploader(ring, stores, route, table, cfg, stop, Some(tx))
+                })
+            };
+            for &u in &landed {
+                let (x, y) = xy[u];
+                let t_rx = wall_ns();
+                table.insert(u as i32, Pos { x, y, t_rx });
+            }
+            for u in 0..xy.len() {
+                let mut s = ring.reserve();
+                for (j, v) in s.frame().iter_mut().enumerate() {
+                    *v = pixel(u, j);
+                }
+                s.commit(u as i32, wall_ns(), 0);
+            }
+            stop.store(true, Ordering::Release);
+            let rep = up.join().unwrap().unwrap();
+            let want: Vec<i32> = landed.iter().map(|&u| u as i32).collect();
+            assert_eq!(rep.uids, want, "{ngpu} GPUs");
+            let mut views = Vec::new();
+            for b in rx.iter() {
+                for q in b.positions {
+                    place.views(q, 2, 1, &mut views);
+                }
+            }
+            let mut shares = vec![Share::default(); ngpu];
+            assert_eq!(
+                plan.split(&views, &mut shares).unwrap() as usize,
+                landed.len()
+            );
+            let on = |k: usize| {
+                shares
+                    .iter()
+                    .filter(|s| s.frames.contains(&(k as u32)))
+                    .count()
+            };
+            assert!((0..landed.len()).any(|k| on(k) == 1), "{ngpu} GPUs");
+            assert!((0..landed.len()).any(|k| on(k) > 1), "{ngpu} GPUs");
+            for (r, (share, store)) in shares.iter().zip(&stores).enumerate() {
+                let n = share.frames.len();
+                assert_eq!(rep.regions[r].frames, n as u64, "{ngpu} GPUs, region {r}");
+                let mut dev = vec![0u16; n * se];
+                store.read_frames(0..n as u64, &mut dev).unwrap();
+                for (k, (d, &f)) in dev.chunks(se).zip(&share.frames).enumerate() {
+                    let uid = landed[f as usize];
+                    assert!(
+                        d.iter().enumerate().all(|(j, &v)| v == pixel(uid, j)),
+                        "{ngpu} GPUs, region {r} place {k}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The ring, pinned by one GPU's context, is read in place by every GPU's copy engine
+    /// (host allocations are pinned for every context under unified addressing): queueing
+    /// a batch of 32 MiB to each of four GPUs returns long before a copy of it can have
+    /// run. From pageable memory the call stages it and takes about 4 ms.
+    #[test]
+    fn every_gpu_copies_from_the_ring_in_place() {
+        struct Everywhere(usize);
+        impl Route for Everywhere {
+            fn nregion(&self) -> usize {
+                self.0
+            }
+            fn regions(&mut self, _: (f64, f64)) -> u32 {
+                u32::MAX >> (32 - self.0)
+            }
+        }
+        let (se, batch, total) = (1 << 22, 4, 32);
+        let ctxs: Vec<Arc<Context>> = gpus(4)
+            .into_iter()
+            .map(|o| Context::new(o).unwrap())
+            .collect();
+        let ring = Arc::new(Ring::new(&ctxs[0], 2 * batch, se).unwrap());
+        let stores: Vec<Arc<DeviceStore>> = ctxs
+            .iter()
+            .map(|c| Arc::new(DeviceStore::new(c, total, se).unwrap()))
+            .collect();
+        let table = Arc::new(PosTable::new(64));
+        let stop = Arc::new(AtomicBool::new(false));
+        let cfg = UploaderConfig {
+            batch: NonZeroUsize::new(batch).unwrap(),
+            flush_ns: 1_000_000_000,
+            ..uploader_cfg()
+        };
+        let up = {
+            let (ring, stores, table, stop) =
+                (ring.clone(), stores.clone(), table.clone(), stop.clone());
+            std::thread::spawn(move || {
+                run_region_uploader(ring, stores, Everywhere(4), table, cfg, stop, None)
+            })
+        };
+        for u in 0..total as i32 {
+            let t_rx = wall_ns();
+            table.insert(
+                u,
+                Pos {
+                    x: 0.0,
+                    y: 0.0,
+                    t_rx,
+                },
+            );
+            let mut s = ring.reserve();
+            s.frame().fill(u as u16 + 1);
+            s.commit(u, t_rx, 0);
+        }
+        stop.store(true, Ordering::Release);
+        let rep = up.join().unwrap().unwrap();
+        assert_eq!(rep.frames, total as u64);
+        let mut dev = vec![0u16; se];
+        for (r, (g, store)) in rep.regions.iter().zip(&stores).enumerate() {
+            assert_eq!(g.frames, total as u64, "region {r}");
+            // 32 MiB over PCIe takes over 1 ms; a staged copy takes that inside the call.
+            let queued = g.enqueue.quantile_us(0.5).unwrap();
+            assert!(
+                queued < 500,
+                "region {r}: queueing a batch took {queued} us"
+            );
+            store
+                .read_frames(total as u64 - 1..total as u64, &mut dev)
+                .unwrap();
+            assert!(dev.iter().all(|&v| v == total as u16), "region {r}");
+        }
     }
 
     /// A frame off the object closes the plan: the frames before it and the halo rows they
