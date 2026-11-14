@@ -495,6 +495,64 @@ pub unsafe fn sample_obj(
     }
 }
 
+/// The loads of [`sample_obj`]: its four corners in [`bilinear_weights`] order, `(0, 0)` at
+/// those it does not read; [`bilinear`] is its sum. Apart, a walk can issue every load of a
+/// pixel before its first sum. `sample_obj` keeps its own interleaved form: as their
+/// composition it changes the register use of the other kernels that call it.
+///
+/// # Safety
+///
+/// As [`sample_obj`].
+#[device]
+pub unsafe fn obj_corners(
+    obj: *const f32,
+    v: ViewAddr,
+    pry: u32,
+    prx: u32,
+    nyo: u32,
+    nxo: u32,
+) -> [(f32, f32); 4] {
+    let plane = v.obj as usize * nyo as usize * nxo as usize;
+    let y0 = v.oy + pry;
+    let x0 = v.ox + prx;
+    let (y1, x1) = (y0 + 1, x0 + 1);
+    let at = |y: u32, x: u32| plane + y as usize * nxo as usize + x as usize;
+    let mut c = [(0.0f32, 0.0f32); 4];
+    unsafe {
+        c[0] = load_c(obj, at(y0, x0));
+        if v.fx != 0.0 {
+            c[1] = load_c(obj, at(y0, x1));
+        }
+        if v.fy != 0.0 {
+            c[2] = load_c(obj, at(y1, x0));
+            if v.fx != 0.0 {
+                c[3] = load_c(obj, at(y1, x1));
+            }
+        }
+    }
+    c
+}
+
+/// The sum of [`sample_obj`] over the corners `c` of [`obj_corners`]. Its adds are the
+/// `fma`s `sample_obj` contracts to: without loads between them NVVM may contract them
+/// otherwise.
+#[device]
+pub fn bilinear(c: [(f32, f32); 4], v: ViewAddr) -> (f32, f32) {
+    let w = bilinear_weights(v.fy, v.fx);
+    let add = |acc: (f32, f32), w: f32, c: (f32, f32)| (fma(w, c.0, acc.0), fma(w, c.1, acc.1));
+    let mut acc = (w[0] * c[0].0, w[0] * c[0].1);
+    if v.fx != 0.0 {
+        acc = add(acc, w[1], c[1]);
+    }
+    if v.fy != 0.0 {
+        acc = add(acc, w[2], c[2]);
+        if v.fx != 0.0 {
+            acc = add(acc, w[3], c[3]);
+        }
+    }
+    acc
+}
+
 /// Calls `f(pry, prx, weight)` for each probe pixel of view `v` whose bilinear sample reads
 /// object pixel `(y, x)`, in [`bilinear_weights`] order, skipping corners outside the frame
 /// or of zero weight. This is the exact transpose of [`sample_obj`]. A visitor, not an

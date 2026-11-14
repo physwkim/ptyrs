@@ -132,16 +132,14 @@ impl Bufs<'_> {
                     .lend(ctx, self.kernels, &dims, self.probe, self.exit)?;
                 for s in 0..w.cut.len() {
                     let stack = w.cut.at(s);
+                    let (psi, iterate) = w.fused(s);
                     let exit = match c.mix {
-                        Mix::Dm { alpha } => {
-                            let psi = &mut w.psi[s];
-                            match c.first {
-                                true => Exit::DmFirst { psi },
-                                false => Exit::Dm { psi, alpha },
-                            }
-                        }
+                        Mix::Dm { alpha } => match c.first {
+                            true => Exit::DmFirst { psi },
+                            false => Exit::Dm { psi, alpha },
+                        },
                         Mix::Raar { beta } => {
-                            let (_, psi, iterate) = w.raar(s);
+                            let iterate = iterate.expect("Device::new_run built the RAAR iterate");
                             match c.first {
                                 true => Exit::RaarFirst { psi, iterate },
                                 false => Exit::Raar { psi, iterate, beta },
@@ -179,7 +177,7 @@ impl Bufs<'_> {
                         }
                         _ => {
                             for s in 0..w.cut.len() {
-                                let (stack, psi) = (w.cut.at(s), &w.psi[s]);
+                                let (stack, psi) = (w.cut.at(s), w.psi(s));
                                 self.accumulate(ctx, stack, psi, o.is_some(), p.is_some())?;
                             }
                         }
@@ -217,7 +215,7 @@ impl Bufs<'_> {
                 probe: self.probe,
                 model: m.model,
             };
-            let (stack, psi) = (w.cut.at(s), &w.psi[s]);
+            let (stack, psi) = (w.cut.at(s), w.psi(s));
             if obj {
                 let sums = m.psi_sums(Some(&mut *self.obj_sums), None);
                 self.kernels
@@ -262,18 +260,17 @@ impl Bufs<'_> {
         alpha: f32,
         first: bool,
     ) -> Result<(), GpuError> {
-        let (stack, frames) = (w.cut.at(s), &w.cut.frames[s]);
-        let (plan, psi) = (w.plans.get(frames.plan), &mut w.psi[s]);
+        let (stack, len) = (w.cut.at(s), w.cut.frames[s].len);
+        let (plan, psi, _) = w.m1(s);
         let po = if first { &mut *psi } else { &mut *m1.scratch };
         self.kernels
             .obj_probe_to_psi(ctx, self.views, stack, self.obj, self.probe, po)?;
         if !first {
-            self.kernels
-                .dm_reflect(ctx, psi, m1.scratch, frames.len, alpha)?;
+            self.kernels.dm_reflect(ctx, psi, m1.scratch, len, alpha)?;
         }
         self.project(ctx, stack, plan, psi, None)?;
         if !first {
-            self.kernels.add_c32(ctx, psi, m1.scratch, frames.len)?;
+            self.kernels.add_c32(ctx, psi, m1.scratch, len)?;
         }
         Ok(())
     }

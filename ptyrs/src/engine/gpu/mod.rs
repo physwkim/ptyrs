@@ -39,7 +39,7 @@ use crate::base::{AddrTable, C64, Object, Probe, Scan, Stack};
 use crate::fft::Plan2d;
 use crate::gpu::{
     C32, CG_BLOCKS, Ended, Error as GpuError, FarSums, FusedBufs, FusedInputs, Model,
-    ObjProbeScale, RecordWriter, StackRef, StackTable, ViewAddr, ViewDims,
+    ObjProbeScale, RecordWriter, StackRef, StackTable, ViewAddr, ViewDims, Waves,
 };
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
@@ -78,6 +78,11 @@ pub struct GpuOptions {
     /// [`crate::gpu::FUSED_SIDES`], and [`GpuPtycho::new`] fails on others) instead of M1's
     /// launch sequence. The two agree to rounding, not bit for bit.
     pub fused: bool,
+    /// Hold DM's and RAAR's carried exit waves and RAAR's iterate as f16 pairs, each value
+    /// times one power of two fixed from the counts at upload (DESIGN B5), and cut their
+    /// stacks at those 4 bytes per value. Fused passes only: M1's cuFFT transforms the waves
+    /// in place in f32, and [`GpuPtycho::new`] fails on `psi_f16` without [`Self::fused`].
+    pub psi_f16: bool,
 }
 
 impl Default for GpuOptions {
@@ -87,6 +92,7 @@ impl Default for GpuOptions {
             graph: true,
             llk_slots: 8,
             fused: true,
+            psi_f16: false,
         }
     }
 }
@@ -434,8 +440,7 @@ impl GpuPtycho {
 
     /// [`Self::with_optics`] on a multislice object, `objects` its slices in the order the
     /// wave crosses them, one per slice of `optics` and all of one shape. More than one
-    /// slice runs LSQML alone ([`Self::lsqml`]), with one object mode: every other
-    /// algorithm fails on it.
+    /// slice runs LSQML alone ([`Self::lsqml`]): every other algorithm fails on it.
     pub fn with_slices(
         ctx: &Arc<CudaContext>,
         scan: &Scan,
@@ -457,12 +462,6 @@ impl GpuPtycho {
                 "object slice {:?} differs from the first's {:?}",
                 o.dims(),
                 object.dims()
-            )));
-        }
-        if objects.len() > 1 && object.nmode() != 1 {
-            return Err(EngineError::Invalid(format!(
-                "the GPU backend runs a multislice object of one mode, got {}",
-                object.nmode()
             )));
         }
         let g = scan.geometry;
@@ -818,7 +817,7 @@ impl Bufs<'_> {
         &mut self,
         ctx: &ExecutionContext,
         stack: StackRef<'_>,
-        psi: &DeviceBuffer<C32>,
+        psi: &dyn Waves,
         obj: bool,
         probe: bool,
     ) -> Result<(), GpuError> {

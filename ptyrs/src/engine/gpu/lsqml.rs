@@ -13,9 +13,9 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use crate::gpu::{
-    BhScan, C32, EpochOrder, Error as GpuError, FusedBufs, FusedInputs, Kernels, LSQML_REC,
-    LsqmlAt, LsqmlChi, LsqmlKernels, LsqmlNoise, LsqmlScan, LsqmlVar, Model, PositionRule, PsiSums,
-    ShiftProbe, SliceSource, SliceSteps, Solve, StackRef, StackTable, Views,
+    BhScan, C32, EpochOrder, Error as GpuError, FrameWaves, FusedBufs, FusedInputs, Kernels,
+    LSQML_REC, LsqmlAt, LsqmlChi, LsqmlKernels, LsqmlNoise, LsqmlScan, LsqmlVar, Model,
+    PositionRule, PsiSums, ShiftProbe, SliceSource, SliceSteps, Solve, StackRef, StackTable, Views,
 };
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaStream, DeviceBuffer};
@@ -160,7 +160,8 @@ impl LsqmlState {
     ) -> Result<Self, EngineError> {
         let dims = views.dims();
         // work: the forward pass, `chi`, the update sums, `dots`; icalc: `icalc` and `far`;
-        // under the position also the moved probes (`shifted_rows_fwd`, `shift_w`, `dots`)
+        // under the position also the moved probes (`shifted_rows_fwd`, or sliced
+        // `shifted_probe`, then `shift_w` and `dots`)
         // and the shift planes of the shared scratch, which `shifted_psi_sums` writes and
         // reads.
         let mut streamed = vec![
@@ -409,6 +410,7 @@ impl<'a> Bufs<'a> {
                 Some(m) => {
                     let inputs = moved_inputs(&base, moved_shift(m.pos, m.spectrum));
                     let w = &mut m.w[k];
+                    // Its row pass is the stack's forward pass: `exit` goes on from `work`.
                     self.kernels
                         .shifted_rows_fwd(ctx, &inputs, stack, w, work)?;
                     m.kernels.shift_w(ctx, views.dims(), stack, w)?;
@@ -487,13 +489,16 @@ impl<'a> Bufs<'a> {
             };
             let c = match &moved {
                 None => LsqmlChi::Unmoved(chi),
-                Some(m) => LsqmlChi::Moved { chi, w: &m.w[k] },
+                Some(m) => LsqmlChi::Moved {
+                    chi,
+                    w: FrameWaves::Probes(&m.w[k]),
+                },
             };
             l.kernels.dots(ctx, views, stack, at, c, l.scan)?;
             if let Some(m) = &mut moved {
                 // The slopes of the object the batch started from.
-                m.kernels
-                    .sums(ctx, views, stack, self.obj, [chi, &m.w[k]], m.pos)?;
+                let at = (chi, FrameWaves::Probes(&m.w[k]));
+                m.kernels.sums(ctx, views, stack, self.obj, at, m.pos)?;
             }
         }
         l.kernels
@@ -573,11 +578,9 @@ impl<'a> Bufs<'a> {
                 Some(m) => {
                     let inputs = moved_inputs(&base, moved_shift(m.pos, m.spectrum));
                     let pw = &mut m.w[k];
-                    // The row pass's own product, into `work`, is not read.
-                    self.kernels
-                        .shifted_rows_fwd(ctx, &inputs, stack, pw, work)?;
+                    self.kernels.shifted_probe(ctx, &inputs, stack, pw)?;
                     m.kernels.shift_w(ctx, d, stack, pw)?;
-                    let probe = SliceSource::Waves(pw);
+                    let probe = SliceSource::Waves(FrameWaves::Probes(pw));
                     ok.slice_mul(ctx, views, stack, self.obj, probe, &mut inc[0])?;
                     Some(m.pos.offsets())
                 }
@@ -586,7 +589,7 @@ impl<'a> Bufs<'a> {
                 ok.gap(ctx, d, stack, &sl.gaps[i - 1], &mut inc[i - 1], false)?;
                 let (src, rest) = inc[i - 1..].split_first_mut().expect("i <= last");
                 let dst = rest.first_mut().unwrap_or(&mut *work);
-                let src = SliceSource::Waves(src);
+                let src = SliceSource::Waves(FrameWaves::Views(src));
                 ok.slice_mul(ctx, views, stack, &sl.deeper[i - 1], src, dst)?;
             }
             if let Some(p) = slice_phase(quad, offsets) {
@@ -627,7 +630,7 @@ impl<'a> Bufs<'a> {
             }
             if let Some(m) = &mut moved {
                 let c = chi.get(pivot).unwrap_or(&*work);
-                let at = [c, &w.incident[k][pivot - 1]];
+                let at = (c, FrameWaves::Views(&w.incident[k][pivot - 1]));
                 m.kernels
                     .sums(ctx, views, stack, &sl.deeper[pivot - 1], at, m.pos)?;
             }
@@ -648,7 +651,7 @@ impl<'a> Bufs<'a> {
                 };
                 let c = LsqmlChi::Moved {
                     chi: w.chi[k].get(i).unwrap_or(&l.work[k]),
-                    w: &w.incident[k][i - 1],
+                    w: FrameWaves::Views(&w.incident[k][i - 1]),
                 };
                 lk.dots(ctx, views, l.table.at(s), at, c, l.scan)?;
             }
@@ -704,7 +707,10 @@ impl<'a> Bufs<'a> {
             let chi = &w.chi[k][0];
             let c = match &moved {
                 None => LsqmlChi::Unmoved(chi),
-                Some(m) => LsqmlChi::Moved { chi, w: &m.w[k] },
+                Some(m) => LsqmlChi::Moved {
+                    chi,
+                    w: FrameWaves::Probes(&m.w[k]),
+                },
             };
             lk.dots(ctx, views, l.table.at(s), at, c, l.scan)?;
         }

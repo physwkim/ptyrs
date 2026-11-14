@@ -3,8 +3,8 @@
 use std::sync::Arc;
 
 use crate::gpu::{
-    EpochOrder, Error as GpuError, FusedBufs, FusedInputs, Kernels, Model, PositionRule, PowerMax,
-    PsiSums, ShiftProbe, Solve, Views, Weight,
+    EpochOrder, Error as GpuError, FrameWaves, FusedBufs, FusedInputs, Kernels, Model,
+    PositionRule, PowerMax, PsiSums, ShiftProbe, Solve, Views, Weight,
 };
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::CudaStream;
@@ -137,7 +137,7 @@ impl Bufs<'_> {
             Some(m) => {
                 let inputs = moved_inputs(&base, moved_shift(m.pos, m.spectrum));
                 let w = &mut m.w[0];
-                k.shifted_rows_fwd(ctx, &inputs, stack, w, rb.dlt)?;
+                k.shifted_probe(ctx, &inputs, stack, w)?;
                 m.kernels.shift_w(ctx, &dims, stack, w)?;
                 rk.obj_wave_to_psi(ctx, self.views, stack, self.obj, w, rb.psi)?;
             }
@@ -151,7 +151,7 @@ impl Bufs<'_> {
         if let Some(m) = &mut moved {
             // The slopes of the object the batch started from, against Δ before the probe
             // step weights it.
-            let chi_w = [&*rb.dlt, &m.w[0]];
+            let chi_w = (&*rb.dlt, FrameWaves::Probes(&m.w[0]));
             m.kernels
                 .sums(ctx, self.views, stack, self.obj, chi_w, m.pos)?;
         }

@@ -29,7 +29,7 @@ use ptyrs::live::farfield::{Ptycho, PtychoSpec, ScanPath};
 use ptyrs::live::graph::WarmUp;
 use ptyrs::live::pos::{Pos, PosTable};
 use ptyrs::live::recon::{ApConfig, ViewPlacement};
-use ptyrs::live::ring::{Ring, UploaderConfig, run_region_uploader};
+use ptyrs::live::ring::{Landing, Ring, UploaderConfig, run_region_uploader};
 use ptyrs::live::scan::ScanShape;
 
 const FRAME: usize = 256;
@@ -177,7 +177,7 @@ fn run(dir: &Path, pattern: &str, args: &[String]) -> Result<(), Box<dyn Error>>
     let (tx, landed) = crossbeam_channel::unbounded();
     let uploader = {
         let (ring, table, stop) = (ring.clone(), table.clone(), stop.clone());
-        let (stores, route) = (ap.stores(), ap.route(place));
+        let landing = Landing::new(ap.stores(), ap.route(place));
         let up = UploaderConfig {
             batch: NonZeroUsize::new(64).unwrap(),
             flush_ns: 100_000,
@@ -185,9 +185,7 @@ fn run(dir: &Path, pattern: &str, args: &[String]) -> Result<(), Box<dyn Error>>
             events: 4,
             pos_wait_ns: 1_000_000_000,
         };
-        std::thread::spawn(move || {
-            run_region_uploader(ring, stores, route, table, up, stop, Some(tx))
-        })
+        std::thread::spawn(move || run_region_uploader(ring, landing, table, up, stop, Some(tx)))
     };
     let (mut at, mut epoch_ms) = (0, Vec::new());
     for k in 0.. {

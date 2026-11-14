@@ -27,10 +27,10 @@
 //! (`angular_spectrum`, `fresnel`, `fresnel_back`): the `wavelength`, `pixel` and `distance`
 //! of its [`Optics::free_space`] as attributes, a scan drawn through it (`counts`, raw `y` and
 //! `x`), the start `object` and `probe`, and for each algorithm a fresh [`GpuPtycho`] runs
-//! `NEPOCH` times from that start either a group of its name (the `object` and `probe` it
-//! left and the `poisson` LLK after each) or, where the engine refuses it, the attribute
-//! `<name>_error` of its error text. LSQML and BH run as in `near.h5`, the others at their
-//! defaults with `calc_llk` 1. `lsqml_sliced` is LSQML's run through the propagator after a
+//! `NEPOCH` times from that start a group of its name: the `object` and `probe` it left and
+//! the `poisson` LLK after each. LSQML and BH run as in `near.h5`, the others at their
+//! defaults with `calc_llk` 1; `dm_f16` and `raar_f16` are DM's and RAAR's under
+//! [`GpuOptions::psi_f16`]. `lsqml_sliced` is LSQML's run through the propagator after a
 //! 20 µm gap behind a first object slice, both slices the start object: the `objects`
 //! `[2, nobj, nyo, nxo]`, `probe` and `poisson` LLK it left. Its group `cpu` holds the CPU
 //! engine's [`Ptycho::with_optics`] from that start: the start's `llk` (`poisson`,
@@ -584,19 +584,12 @@ fn cpu_optics(
     )?;
     for (algorithm, run) in CPU_RUNS {
         let mut p = state()?;
-        match run(&mut p) {
-            Ok(()) => {
-                let at = cpu.create_group(algorithm)?;
-                write_stack(&at, "object", &p.object().0)?;
-                write_stack(&at, "probe", &p.probe().0)?;
-                let llk: Vec<f64> = p.history().iter().map(|r| r.llk.poisson).collect();
-                write(&at, "poisson", &[llk.len()], &llk)?;
-            }
-            Err(e @ EngineError::Invalid(_)) => {
-                cpu.set_attr_string(&format!("{algorithm}_error"), &e.to_string())?;
-            }
-            Err(e) => return Err(e.into()),
-        }
+        run(&mut p)?;
+        let at = cpu.create_group(algorithm)?;
+        write_stack(&at, "object", &p.object().0)?;
+        write_stack(&at, "probe", &p.probe().0)?;
+        let llk: Vec<f64> = p.history().iter().map(|r| r.llk.poisson).collect();
+        write(&at, "poisson", &[llk.len()], &llk)?;
     }
     let mut lsqml = Lsqml::new(LsqmlParams {
         batch_size: 5,
@@ -665,23 +658,28 @@ fn gpu_optics(path: &Path) -> Result<(), Box<dyn Error>> {
             raw,
             counts,
         )?;
-        for (algorithm, run) in GPU_RUNS {
-            let options = GpuOptions::default();
+        let f16 = GpuOptions {
+            psi_f16: true,
+            ..GpuOptions::default()
+        };
+        let runs = GPU_RUNS
+            .iter()
+            .map(|&(a, run)| (a.to_string(), run, GpuOptions::default()))
+            .chain(
+                GPU_RUNS
+                    .iter()
+                    .filter(|(a, _)| matches!(*a, "dm" | "raar"))
+                    .map(|&(a, run)| (format!("{a}_f16"), run, f16)),
+            );
+        for (algorithm, run, options) in runs {
             let mut gpu =
                 GpuPtycho::with_optics(&ctx, &scan, &optics, flat.clone(), p0.clone(), options)?;
-            match run(&mut gpu) {
-                Ok(()) => {
-                    let at = root.create_group(algorithm)?;
-                    write_stack(&at, "object", &gpu.object()?.0)?;
-                    write_stack(&at, "probe", &gpu.probe()?.0)?;
-                    let llk: Vec<f64> = gpu.history().iter().map(|r| r.llk.poisson).collect();
-                    write(&at, "poisson", &[llk.len()], &llk)?;
-                }
-                Err(e @ EngineError::Invalid(_)) => {
-                    root.set_attr_string(&format!("{algorithm}_error"), &e.to_string())?;
-                }
-                Err(e) => return Err(e.into()),
-            }
+            run(&mut gpu)?;
+            let at = root.create_group(&algorithm)?;
+            write_stack(&at, "object", &gpu.object()?.0)?;
+            write_stack(&at, "probe", &gpu.probe()?.0)?;
+            let llk: Vec<f64> = gpu.history().iter().map(|r| r.llk.poisson).collect();
+            write(&at, "poisson", &[llk.len()], &llk)?;
         }
         let gap = Wavefield::new(frame, wavelength, pixel, 2e-5)?;
         let sliced = optics.with_slices(&[gap])?;

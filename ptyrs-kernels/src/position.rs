@@ -9,6 +9,7 @@ use cuda_device::{device, shared::DynamicSharedArray, thread};
 use cuda_host::cuda_module;
 
 use crate::fused::{FUSED_COLS, col_fft};
+use crate::optics::WavePlanes;
 use crate::pixel::{StackCtl, StackGeom, ViewAddr, freq, load_c, stack_frames, store_c};
 use crate::{FFT_EPT_MAX, fft_ept};
 
@@ -37,17 +38,17 @@ pub struct PositionRule {
 }
 
 /// What [`position_kernels::LoadedModule::position_sums`] reads and writes: `chi` the
-/// stack's exit-wave update `[nf_max * nmode, ny, nx]` and `w` its moved probe `[nf_max *
-/// nprobe, ny, nx]`, both at the exit wave's stored pixels, `slopes` its frames' object
-/// slopes `[nf_max, 2, ny, nx]` ([`slopes`]), the epoch's `views`, and `sums` the
-/// [`POSITION_SUMS`] of every frame's chunks by epoch position.
+/// stack's exit-wave update `[nf_max * nmode, ny, nx]` and `w` its waves as [`WavePlanes`]
+/// says (the moved probe, or a multislice object's wave entering a slice), both at the exit
+/// wave's stored pixels, `slopes` its frames' object slopes `[nf_max, 2, ny, nx]`
+/// ([`slopes`]), and `sums` the [`POSITION_SUMS`] of every frame's chunks by epoch
+/// position.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct PositionSums {
     pub chi: *const f32,
-    pub w: *const f32,
+    pub w: WavePlanes,
     pub slopes: *const f32,
-    pub views: *const ViewAddr,
     pub sums: *mut f32,
 }
 
@@ -171,6 +172,7 @@ pub mod position_kernels {
     };
     use crate::bh::{CHUNK_PIXELS, store_sums};
     use crate::grad::{GAMMA_CHUNK, block_max};
+    use crate::optics::wave_plane;
     use crate::pixel::*;
     use crate::*;
     use cuda_device::SharedArray;
@@ -285,15 +287,14 @@ pub mod position_kernels {
 
     /// The position sums of chunk `c = blockIdx.x` of frame `f0 + fl`, `fl = blockIdx.y`,
     /// over the pixels `i` in `c * GAMMA_CHUNK .. min((c + 1) * GAMMA_CHUNK, n)` of its first
-    /// view `v` (mode 0): with `u_ax = slope_ax W_v` (the slope at `i`, `W` and `chi` at the
-    /// exit-wave index of `i`), `sums[4p .. 4p + 4]` gets the [`POSITION_SUMS`], `p = (f0 +
-    /// fl) * nchunk + c`.
+    /// view `v` (mode 0): with `u_ax = slope_ax W_v` (the slope at `i`, `W_v` the view's wave
+    /// of `w`, it and `chi` at the exit-wave index of `i`), `sums[4p .. 4p + 4]` gets the
+    /// [`POSITION_SUMS`], `p = (f0 + fl) * nchunk + c`.
     ///
     /// # Safety
     ///
-    /// `p` as [`PositionSums`] says for this stack, `views` `nframe * nmode` records, `sums`
-    /// `4 * nframe * nchunk` floats, `ctl` one entry; grid `(nchunk, nf_max, 1)`, block
-    /// `(PIXEL_THREADS, 1, 1)`.
+    /// `p` as [`PositionSums`] says for this stack, `sums` `4 * nframe * nchunk` floats,
+    /// `ctl` one entry; grid `(nchunk, nf_max, 1)`, block `(PIXEL_THREADS, 1, 1)`.
     #[kernel]
     pub unsafe fn position_sums(p: PositionSums, ctl: *const StackCtl, g: StackGeom) {
         static mut RED: SharedArray<f32, 1024> = SharedArray::UNINIT;
@@ -301,7 +302,6 @@ pub mod position_kernels {
             chi,
             w,
             slopes,
-            views,
             sums,
         } = p;
         let (f0, nf) = unsafe { stack_frames(ctl, g) };
@@ -316,8 +316,7 @@ pub mod position_kernels {
         let chunk = GAMMA_CHUNK as usize;
         let end = n.min((c + 1) * chunk);
         let pos = f0 as usize + fl;
-        let v = unsafe { *views.add(pos * nmode) };
-        let wp = (fl * g.nprobe as usize + v.probe as usize) * n;
+        let wp = wave_plane(w, fl, 0) * n;
         let mut acc = [0.0f32; POSITION_SUMS as usize];
         let base = c * chunk + thread::threadIdx_x() as usize;
         // Every load of a group is issued before its sums, which keep the pixel order.
@@ -334,7 +333,7 @@ pub mod position_kernels {
                     let at = psi_index(i as u32 / nx, i as u32 % nx, ny, nx);
                     ld[j] = unsafe {
                         [
-                            load_c(w, wp + at),
+                            load_c(w.w, wp + at),
                             load_c(chi, fl * nmode * n + at),
                             load_c(slopes, 2 * fl * n + i),
                             load_c(slopes, (2 * fl + 1) * n + i),
