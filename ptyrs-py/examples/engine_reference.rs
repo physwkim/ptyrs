@@ -1,7 +1,7 @@
 //! The engine's results the Python tests compare the bindings against, run here on the
 //! engine itself: `engine_reference <dir>` writes `<dir>/opr.h5`, `<dir>/near.h5`,
 //! `<dir>/multislice.h5` (the CPU engine's) and `<dir>/gpu_optics.h5` (the GPU engine's, on
-//! CUDA device `PTYRS_DEVICE`, default 0), h5py-readable (complex as `{r, i}`); `scripts/build.sh` runs it into the module's directory.
+//! CUDA device `PTYRS_DEVICE`, default 0, and the CPU engine's on the same scans), h5py-readable (complex as `{r, i}`); `scripts/build.sh` runs it into the module's directory.
 //!
 //! `opr.h5` holds a simulated far-field scan (`counts`, raw `y` and `x`, the geometry as root
 //! attributes), its `positions` `[nframe, 2]` as the views read them at the object `pixel`,
@@ -32,7 +32,11 @@
 //! `<name>_error` of its error text. LSQML and BH run as in `near.h5`, the others at their
 //! defaults with `calc_llk` 1. `lsqml_sliced` is LSQML's run through the propagator after a
 //! 20 µm gap behind a first object slice, both slices the start object: the `objects`
-//! `[2, nobj, nyo, nxo]`, `probe` and `poisson` LLK it left.
+//! `[2, nobj, nyo, nxo]`, `probe` and `poisson` LLK it left. Its group `cpu` holds the CPU
+//! engine's [`Ptycho::with_optics`] from that start: the start's `llk` (`poisson`,
+//! `gaussian`, `euclidian`, `nb_photons_calc`), a group per algorithm of AP, DM, RAAR, ML and
+//! rPIE laid out as the GPU's, and `lsqml`, the `objects` and `probe` LSQML's `NEPOCH` epochs
+//! over the state's own views and optics left.
 
 use std::error::Error;
 use std::path::Path;
@@ -503,8 +507,111 @@ const GPU_RUNS: [(&str, GpuRun); 7] = [
     }),
 ];
 
+/// One CPU algorithm call of `NEPOCH` cycles or epochs.
+type CpuRun = fn(&mut Ptycho) -> Result<(), EngineError>;
+
+const CPU_RUNS: [(&str, CpuRun); 5] = [
+    ("ap", |p| {
+        let params = ApParams {
+            calc_llk: 1,
+            ..Default::default()
+        };
+        p.ap(&params, NEPOCH);
+        Ok(())
+    }),
+    ("dm", |p| {
+        let params = DmParams {
+            calc_llk: 1,
+            ..Default::default()
+        };
+        p.dm(&params, NEPOCH);
+        Ok(())
+    }),
+    ("raar", |p| {
+        let params = RaarParams {
+            calc_llk: 1,
+            ..Default::default()
+        };
+        p.raar(&params, NEPOCH);
+        Ok(())
+    }),
+    ("ml", |p| {
+        let params = MlParams {
+            calc_llk: 1,
+            ..Default::default()
+        };
+        p.ml(&params, NEPOCH);
+        Ok(())
+    }),
+    ("rpie", |p| {
+        let params = RpieParams {
+            calc_llk: 1,
+            ..Default::default()
+        };
+        p.rpie(&params, NEPOCH)
+    }),
+];
+
+/// The CPU engine's runs of `gpu_optics.h5`'s group `cpu` under the free-space propagation
+/// `w`, from `start`.
+fn cpu_optics(
+    root: &H5Group,
+    scan: &Scan,
+    w: &Wavefield,
+    start: (&Object, &Probe),
+) -> Result<(), Box<dyn Error>> {
+    let state = || {
+        Ptycho::with_optics(
+            scan,
+            Optics::free_space(w),
+            start.0.clone(),
+            start.1.clone(),
+        )
+    };
+    let cpu = root.create_group("cpu")?;
+    let p = state()?;
+    let l = p.llk();
+    write(
+        &cpu,
+        "llk",
+        &[4],
+        &[l.poisson, l.gaussian, l.euclidian, l.nb_photons_calc],
+    )?;
+    for (algorithm, run) in CPU_RUNS {
+        let mut p = state()?;
+        match run(&mut p) {
+            Ok(()) => {
+                let at = cpu.create_group(algorithm)?;
+                write_stack(&at, "object", &p.object().0)?;
+                write_stack(&at, "probe", &p.probe().0)?;
+                let llk: Vec<f64> = p.history().iter().map(|r| r.llk.poisson).collect();
+                write(&at, "poisson", &[llk.len()], &llk)?;
+            }
+            Err(e @ EngineError::Invalid(_)) => {
+                cpu.set_attr_string(&format!("{algorithm}_error"), &e.to_string())?;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    let mut lsqml = Lsqml::new(LsqmlParams {
+        batch_size: 5,
+        cost: Cost::Poisson,
+        seed: 7,
+    })?;
+    let (mut objects, mut probe) = (vec![start.0.clone()], start.1.clone());
+    let mut none = ProbeVariation::none(probe.plane_shape());
+    for _ in 0..NEPOCH {
+        let (addr, obs) = (p.addr(), p.observed());
+        lsqml.epoch(addr, obs, p.optics(), &mut objects, &mut probe, &mut none);
+    }
+    let at = cpu.create_group("lsqml")?;
+    write_objects(&at, "objects", &objects)?;
+    write_stack(&at, "probe", &probe.0)?;
+    Ok(())
+}
+
 /// The GPU engine under an angular-spectrum propagator and a Fresnel transform forward and
-/// back, every algorithm from a fresh state.
+/// back, every algorithm from a fresh state, and the CPU engine's [`cpu_optics`].
 fn gpu_optics(path: &Path) -> Result<(), Box<dyn Error>> {
     let device = match std::env::var("PTYRS_DEVICE") {
         Ok(d) => d.parse()?,
@@ -520,7 +627,8 @@ fn gpu_optics(path: &Path) -> Result<(), Box<dyn Error>> {
         ("fresnel", 5e-3),
         ("fresnel_back", -5e-3),
     ] {
-        let optics = Optics::free_space(&Wavefield::new(frame, wavelength, pixel, distance)?);
+        let w = Wavefield::new(frame, wavelength, pixel, distance)?;
+        let optics = Optics::free_space(&w);
         let raw = fermat(20, side as f64 / 8.0 * pixel[1]);
         let positions = raw.pynx_preprocess(pixel);
         let shape = required_obj_shape(&positions, pixel, frame, 16);
@@ -586,6 +694,7 @@ fn gpu_optics(path: &Path) -> Result<(), Box<dyn Error>> {
         write_stack(&at, "probe", &gpu.probe()?.0)?;
         let llk: Vec<f64> = gpu.history().iter().map(|r| r.llk.poisson).collect();
         write(&at, "poisson", &[llk.len()], &llk)?;
+        cpu_optics(&root, &scan, &w, (&flat, &p0))?;
     }
     f.close()?;
     Ok(())
