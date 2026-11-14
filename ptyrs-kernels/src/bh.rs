@@ -16,11 +16,14 @@
 use cuda_device::{device, thread};
 use cuda_host::cuda_module;
 
-use crate::grad::ObjProbePtrs;
-use crate::pixel::{PIXEL_THREADS, cmul, cmul_conj, freq, load_c, ramp, zdiv};
+use crate::grad::{GAMMA_CHUNK, ObjProbePtrs};
+use crate::pixel::{PIXEL_THREADS, cmul, fma, freq, load_c, ramp, zdiv};
 
 /// pty-chi's offset on the modelled amplitude `A`.
 pub const BH_EPS: f32 = 1e-8;
+
+/// The pixels each thread of a `GAMMA_CHUNK` chunk sums, `PIXEL_THREADS` apart.
+pub(crate) const CHUNK_PIXELS: usize = (GAMMA_CHUNK / PIXEL_THREADS) as usize;
 
 /// The far fields of one BH stack the Hessian's far term reads, each `[nf_max * nmode, ny,
 /// nx]` in `obj_probe_to_psi`'s layout: `psi` its forward-FFT'd exit waves, `lu` and `lv`
@@ -123,7 +126,7 @@ pub const BH_STEP: u32 = 4;
 pub mod bh_kernels {
     use super::{
         BH_EPS, BH_HESS, BH_STEP, BhDirs, BhFields, BhMovedFar, BhMoves, BhNear, BhObs, BhPosDirs,
-        far_term, ramp_at, rates,
+        CHUNK_PIXELS, add_im, far_add, far_tail, far_term, ramp_at, rates, unramp,
     };
     use crate::grad::{GAMMA_CHUNK, ObjProbePtrs};
     use crate::pixel::*;
@@ -491,20 +494,49 @@ pub mod bh_kernels {
         let end = n.min((c + 1) * chunk);
         let pos = f0 as usize + fl;
         let mut acc = [0.0f32; 2];
-        let mut k = c * chunk + thread::threadIdx_x() as usize;
-        while k < end {
-            let (e, fr) = unsafe { ramp_at(offsets, pos, k, ny, nx) };
-            let mut im = 0.0f32;
-            for m in 0..nmode {
-                unsafe {
-                    let p = (*views.add(pos * nmode + m)).probe as usize;
-                    let z = cmul_conj(load_c(y, (fl * nmode + m) * n + k), e);
-                    im += cmul(z, load_c(a, p * n + k)).1;
+        let base = c * chunk + thread::threadIdx_x() as usize;
+        // A group's loads of a mode are issued before its sums; each pixel's `im` still adds
+        // its modes in order, and `acc` its pixels.
+        const G: usize = 4;
+        #[unroll]
+        for grp in 0..CHUNK_PIXELS / G {
+            let k0 = base + grp * G * PIXEL_THREADS as usize;
+            let (mut e, mut fr, mut im) =
+                ([(0.0f32, 0.0f32); G], [(0.0f32, 0.0f32); G], [0.0f32; G]);
+            #[unroll]
+            for j in 0..G {
+                let k = k0 + j * PIXEL_THREADS as usize;
+                if k < end {
+                    (e[j], fr[j]) = unsafe { ramp_at(offsets, pos, k, ny, nx) };
                 }
             }
-            acc[0] += fr.0 * im;
-            acc[1] += fr.1 * im;
-            k += PIXEL_THREADS as usize;
+            for m in 0..nmode {
+                let p = unsafe { (*views.add(pos * nmode + m)).probe } as usize;
+                let (mut yv, mut av) = ([(0.0f32, 0.0f32); G], [(0.0f32, 0.0f32); G]);
+                #[unroll]
+                for j in 0..G {
+                    let k = k0 + j * PIXEL_THREADS as usize;
+                    if k < end {
+                        unsafe {
+                            yv[j] = load_c(y, (fl * nmode + m) * n + k);
+                            av[j] = load_c(a, p * n + k);
+                        }
+                    }
+                }
+                #[unroll]
+                for j in 0..G {
+                    let z = unramp(yv[j], e[j]);
+                    im[j] = add_im(im[j], z, av[j]);
+                }
+            }
+            #[unroll]
+            for j in 0..G {
+                let k = k0 + j * PIXEL_THREADS as usize;
+                if k < end {
+                    acc[0] += fr[j].0 * im[j];
+                    acc[1] += fr[j].1 * im[j];
+                }
+            }
         }
         let o = unsafe { out.add(2 * (pos * n.div_ceil(chunk) + c)) };
         unsafe { super::store_sums::<2>((&raw mut RED).cast::<f32>(), acc, o) }
@@ -714,40 +746,85 @@ pub mod bh_kernels {
         let frame = unsafe { *mv.dirs.order.add(pos) } as usize;
         let s = mv.probe_scale;
         let mut acc = [0.0f32; BH_HESS as usize];
-        let mut d = c * chunk + thread::threadIdx_x() as usize;
-        while d < end {
-            let k = psi_index((d / nx as usize) as u32, (d % nx as usize) as u32, ny, nx);
-            let count = unsafe { *counts.add(frame * n + d) };
-            if count != MASKED {
-                let root = zsqrt(count as f32);
-                let t = unsafe { far_term(f.far, fl * nmode * n + k, n, nmode, cg, root) };
-                // Unrolled, as every loop over `acc`, so it stays in registers.
-                #[unroll]
-                for h in 0..BH_HESS {
-                    let h = h as usize;
-                    acc[h] += t[h];
+        let base = c * chunk + thread::threadIdx_x() as usize;
+        // A group's loads of a mode are issued before its sums; each pixel's sums still add
+        // its modes in order, and `acc` its pixels.
+        const G: usize = 1;
+        #[unroll]
+        for grp in 0..CHUNK_PIXELS / G {
+            let d0 = base + grp * G * PIXEL_THREADS as usize;
+            let mut count = [MASKED; G];
+            let (mut k, mut e, mut rate) =
+                ([0usize; G], [(0.0f32, 0.0f32); G], [(0.0f32, 0.0f32); G]);
+            #[unroll]
+            for j in 0..G {
+                let d = d0 + j * PIXEL_THREADS as usize;
+                if d < end {
+                    count[j] = unsafe { *counts.add(frame * n + d) };
+                    k[j] = psi_index(d as u32 / nx, d as u32 % nx, ny, nx);
+                    let fr;
+                    (e[j], fr) = unsafe { ramp_at(mv.offsets, pos, k[j], ny, nx) };
+                    rate[j] = unsafe { rates(mv.dirs, pos, fr) };
                 }
             }
-            let (e, fr) = unsafe { ramp_at(mv.offsets, pos, k, ny, nx) };
-            let (a_u, a_v) = unsafe { rates(mv.dirs, pos, fr) };
-            let (mut ra, mut iu, mut iv) = (0.0f32, 0.0f32, 0.0f32);
+            // Per pixel the `far_term` sums, then `ra`, `iu`, `iv`.
+            let (mut far, mut zs) = ([[0.0f32; 6]; G], [[0.0f32; 3]; G]);
             for m in 0..nmode {
-                unsafe {
-                    let p = (*views.add(pos * nmode + m)).probe as usize * n + k;
-                    let z = cmul_conj(load_c(f.y, (fl * nmode + m) * n + k), e);
-                    ra += cmul(z, load_c(mv.a, p)).0;
-                    iu += cmul(z, load_c(mv.au, p)).1;
+                let pm = unsafe { (*views.add(pos * nmode + m)).probe } as usize * n;
+                let jm = (fl * nmode + m) * n;
+                let mut ld = [[(0.0f32, 0.0f32); 7]; G];
+                #[unroll]
+                for j in 0..G {
+                    if d0 + j * PIXEL_THREADS as usize >= end {
+                        continue;
+                    }
+                    let (jk, pk) = (jm + k[j], pm + k[j]);
+                    unsafe {
+                        ld[j][0] = load_c(f.far.psi, jk);
+                        ld[j][1] = load_c(f.far.lu, jk);
+                        ld[j][3] = load_c(f.y, jk);
+                        ld[j][4] = load_c(mv.a, pk);
+                        ld[j][5] = load_c(mv.au, pk);
+                        if cg {
+                            ld[j][2] = load_c(f.far.lv, jk);
+                            ld[j][6] = load_c(mv.av, pk);
+                        }
+                    }
+                }
+                #[unroll]
+                for j in 0..G {
+                    let [p, lu, lv, y, a, au, av] = ld[j];
+                    far_add(&mut far[j], p, lu, lv, cg);
+                    let z = unramp(y, e[j]);
+                    zs[j][0] += cmul(z, a).0;
+                    zs[j][1] = add_im(zs[j][1], z, au);
                     if cg {
-                        iv += cmul(z, load_c(mv.av, p)).1;
+                        zs[j][2] = add_im(zs[j][2], z, av);
                     }
                 }
             }
-            acc[0] -= 2.0 * a_u * s * iu + a_u * a_u * ra;
-            if cg {
-                acc[1] -= a_v * s * iu + a_u * iv + a_u * a_v * ra;
-                acc[2] -= 2.0 * a_v * iv + a_v * a_v * ra;
+            #[unroll]
+            for j in 0..G {
+                if d0 + j * PIXEL_THREADS as usize >= end {
+                    continue;
+                }
+                if count[j] != MASKED {
+                    let t = far_tail(far[j], n, zsqrt(count[j] as f32));
+                    // Unrolled, as every loop over `acc`, so it stays in registers.
+                    #[unroll]
+                    for h in 0..BH_HESS {
+                        let h = h as usize;
+                        acc[h] += t[h];
+                    }
+                }
+                let ((a_u, a_v), [ra, iu, iv]) = (rate[j], zs[j]);
+                // The fused forms of `acc[0] -= 2 a_u s iu + a_u² ra` and its two `cg` terms.
+                acc[0] = fma(-(a_u * a_u), ra, fma(-(2.0 * a_u * s), iu, acc[0]));
+                if cg {
+                    acc[1] -= fma(a_u * a_v, ra, fma(a_v * s, iu, a_u * iv));
+                    acc[2] = fma(-(a_v * a_v), ra, fma(-(2.0 * a_v), iv, acc[2]));
+                }
             }
-            d += PIXEL_THREADS as usize;
         }
         let o = unsafe { out.add(BH_HESS as usize * (pos * n.div_ceil(chunk) + c)) };
         unsafe { super::add_sums::<3>((&raw mut RED).cast::<f32>(), acc, o) }
@@ -803,32 +880,62 @@ pub(crate) unsafe fn far_term(
     cg: bool,
     root: f32,
 ) -> [f32; 3] {
-    let inv_n = 1.0 / n as f32;
-    let (mut calc, mut cu, mut cv) = (0.0f32, 0.0f32, 0.0f32);
-    let (mut suu, mut suv, mut svv) = (0.0f32, 0.0f32, 0.0f32);
+    let mut s = [0.0f32; 6];
     for m in 0..nmode {
         let j = j + m * n;
         unsafe {
-            let (p, lu) = (load_c(f.psi, j), load_c(f.lu, j));
-            calc += p.0 * p.0 + p.1 * p.1;
-            cu += cmul_conj(p, lu).0;
-            suu += lu.0 * lu.0 + lu.1 * lu.1;
-            if cg {
-                let lv = load_c(f.lv, j);
-                cv += cmul_conj(p, lv).0;
-                suv += cmul_conj(lu, lv).0;
-                svv += lv.0 * lv.0 + lv.1 * lv.1;
-            }
+            let lv = if cg { load_c(f.lv, j) } else { (0.0, 0.0) };
+            far_add(&mut s, load_c(f.psi, j), load_c(f.lu, j), lv, cg);
         }
     }
-    let a = (calc * inv_n).sqrt() + BH_EPS;
+    far_tail(s, n, root)
+}
+
+/// `y conj(e)`, fused as [`add_im`].
+#[device]
+pub(crate) fn unramp(y: (f32, f32), e: (f32, f32)) -> (f32, f32) {
+    (fma(y.0, e.0, y.1 * e.1), fma(y.0, e.1, -(y.1 * e.0)))
+}
+
+/// `s + Re(conj(a) b)`, fused as [`add_im`].
+#[device]
+pub(crate) fn add_re(s: f32, a: (f32, f32), b: (f32, f32)) -> f32 {
+    fma(a.0, b.0, fma(a.1, b.1, s))
+}
+
+/// `s + Im(z a)`, each product fused into the sum in turn: the contraction of the per-pixel
+/// loop this replaced, which a grouped loop no longer gets by itself.
+#[device]
+pub(crate) fn add_im(s: f32, z: (f32, f32), a: (f32, f32)) -> f32 {
+    fma(z.0, a.1, fma(z.1, a.0, s))
+}
+
+/// Adds one mode's `psi`, `lu` and `lv` to the [`far_term`] sums `s = [Σ |psi|², c_u, c_v,
+/// Σ |lu|², Σ Re(conj(lu) lv), Σ |lv|²]`, the `lv` ones only with `cg`.
+#[device]
+pub(crate) fn far_add(s: &mut [f32; 6], p: (f32, f32), lu: (f32, f32), lv: (f32, f32), cg: bool) {
+    s[0] = add_re(s[0], p, p);
+    s[1] = add_re(s[1], p, lu);
+    s[3] = add_re(s[3], lu, lu);
+    if cg {
+        s[2] = add_re(s[2], p, lv);
+        s[4] = add_re(s[4], lu, lv);
+        s[5] = add_re(s[5], lv, lv);
+    }
+}
+
+/// [`far_term`] of the sums `s` of [`far_add`].
+#[device]
+pub(crate) fn far_tail(s: [f32; 6], n: usize, root: f32) -> [f32; 3] {
+    let inv_n = 1.0 / n as f32;
+    let a = (s[0] * inv_n).sqrt() + BH_EPS;
     let fa = 1.0 - zdiv(root, a);
     let k = zdiv(root, a * a * a);
-    let (cu, cv) = (cu * inv_n, cv * inv_n);
+    let (cu, cv) = (s[1] * inv_n, s[2] * inv_n);
     [
-        2.0 * (fa * suu * inv_n + k * cu * cu),
-        2.0 * (fa * suv * inv_n + k * cu * cv),
-        2.0 * (fa * svv * inv_n + k * cv * cv),
+        2.0 * (fa * s[3] * inv_n + k * cu * cu),
+        2.0 * (fa * s[4] * inv_n + k * cu * cv),
+        2.0 * (fa * s[5] * inv_n + k * cv * cv),
     ]
 }
 
