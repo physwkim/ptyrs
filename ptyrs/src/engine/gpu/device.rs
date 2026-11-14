@@ -17,8 +17,8 @@ use crate::gpu::{
     ExitPass, ExitStage, FarSums, FusedBufs, FusedInputs, GammaStacks, GradKernels, Kernels,
     LlkPartial, LlkRing, LlkScratch, LlkTotals, Model, OpticsKernels, PositionKernels,
     PositionPartial, Positions, PowerMax, ProbeSpectrum, PsiSums, RingDevice, RpieKernels,
-    ScalePartial, Shift, ShiftSums, ShiftedProbeSums, SpectrumBuf, StackTable, UpdateSums,
-    ViewAddr, ViewDims, Views,
+    ScalePartial, Shift, ShiftSums, ShiftedProbeSums, SlicePhase, SliceSource, SpectrumBuf,
+    StackRef, StackTable, UpdateSums, ViewAddr, ViewDims, Views,
 };
 use crate::tile::TileDots;
 use cuda_async::cuda_graph::CudaGraph;
@@ -66,7 +66,7 @@ pub(super) struct SliceUploads {
 }
 
 /// A multislice object's device state past its first slice, which is [`Device::obj`]; only
-/// LSQML runs it, and [`Device::one_slice`] gates every other pass.
+/// LSQML and the LLK pass run it, and [`Device::one_slice`] gates every other pass.
 struct Slices {
     deeper: Vec<DeviceBuffer<C32>>,
     gaps: Vec<DeviceBuffer<C32>>,
@@ -74,14 +74,68 @@ struct Slices {
     /// adjoint of waves already times the conjugate of what entered it.
     ones: DeviceBuffer<C32>,
     quad: f32,
+    /// Moves the probe the LLK pass sends through the slices.
+    position: PositionKernels,
 }
 
-/// [`Slices`] lent to a cycle.
+/// [`Slices`] lent to a cycle, with [`Shared::slice_waves`].
 pub(super) struct SlicesMut<'a> {
     pub deeper: &'a mut [DeviceBuffer<C32>],
     pub gaps: &'a [DeviceBuffer<C32>],
     pub ones: &'a DeviceBuffer<C32>,
     pub quad: f32,
+    position: &'a PositionKernels,
+    waves: &'a mut [DeviceBuffer<C32>; 2],
+}
+
+/// The last slice's plane phase of `quad` radians per squared pixel, moved with the probe by
+/// `offsets`; none of no phase.
+pub(super) fn slice_phase(
+    quad: f32,
+    offsets: Option<&DeviceBuffer<f32>>,
+) -> Option<SlicePhase<'_>> {
+    (quad != 0.0).then_some(SlicePhase { quad, offsets })
+}
+
+impl SlicesMut<'_> {
+    /// `stack`'s waves leaving the last slice, its plane phase on them, in a scratch stack's
+    /// buffer: of `inputs` the views, the first slice as its object, and the probe, moved
+    /// under a [`Model::shift`] by its offsets.
+    pub fn exit_waves(
+        &mut self,
+        ctx: &ExecutionContext,
+        kernels: &Kernels,
+        optics: &OpticsKernels,
+        inputs: &FusedInputs<'_>,
+        stack: StackRef<'_>,
+    ) -> Result<&mut DeviceBuffer<C32>, GpuError> {
+        let (views, d) = (inputs.views, inputs.views.dims());
+        let [a, b] = &mut *self.waves;
+        let offsets = match inputs.model.shift {
+            None => {
+                let probe = SliceSource::Probe(inputs.probe);
+                optics.slice_mul(ctx, views, stack, inputs.obj, probe, a)?;
+                None
+            }
+            Some(shift) => {
+                kernels.shifted_probe(ctx, inputs, stack, b)?;
+                self.position.shift_w(ctx, d, stack, b)?;
+                let probe = SliceSource::Waves(b);
+                optics.slice_mul(ctx, views, stack, inputs.obj, probe, a)?;
+                Some(shift.offsets)
+            }
+        };
+        let (mut src, mut dst) = (a, b);
+        for (obj, gap) in self.deeper.iter().zip(self.gaps) {
+            optics.gap(ctx, d, stack, gap, src, false)?;
+            optics.slice_mul(ctx, views, stack, obj, SliceSource::Waves(src), dst)?;
+            std::mem::swap(&mut src, &mut dst);
+        }
+        if let Some(p) = slice_phase(self.quad, offsets) {
+            optics.slice_phase(ctx, d, stack, p, src, false)?;
+        }
+        Ok(src)
+    }
 }
 
 /// Every buffer, module and plan a cycle launches on, and the graphs captured from them.
@@ -557,17 +611,21 @@ struct Shared {
     llk: DeviceBuffer<LlkPartial>,
     /// The chunk sums M1's [`Kernels::llk`] reduces a stack's frames through.
     llk_scratch: LlkScratch,
+    /// A multislice object's waves of one stack, from slice to slice in turn, each
+    /// `[nf_max * nmode, ny, nx]`.
+    slice_waves: Option<[DeviceBuffer<C32>; 2]>,
 }
 
 impl Shared {
     /// M2's fused passes (with `shift`, the position model's) or M1's scratch, `fused`
-    /// picking, cut by `rule`.
+    /// picking, and with `sliced` a multislice object's waves, cut by `rule`.
     fn new(
         stream: &Arc<CudaStream>,
         dims: &ViewDims,
         rule: StackRule,
         fused: bool,
         shift: bool,
+        sliced: bool,
     ) -> Result<Self, EngineError> {
         // M1's scratch: `obj_probe_to_psi`, the transforms and `apply_amplitude`; the fused
         // work planes: the row, column and inverse row passes; each shift plane: the pass that
@@ -576,8 +634,13 @@ impl Shared {
         if shift {
             streamed.push(Streamed::new(FusedBufs::shift_bytes(dims), 2));
         }
+        if sliced {
+            streamed.extend([Streamed::new(wave_bytes(dims), 3); 2]);
+        }
         let cut = rule.cut(stream, dims, &streamed)?;
         let nf_max = cut.table.nf_max();
+        let wave = || DeviceBuffer::zeroed(stream, cut.wave_len(dims));
+        let slice_waves = sliced.then(|| Ok::<_, EngineError>([wave()?, wave()?]));
         let passes = if fused {
             let f = match shift {
                 true => FusedBufs::with_shift(stream, dims, nf_max),
@@ -601,6 +664,7 @@ impl Shared {
             streamed,
             llk: DeviceBuffer::zeroed(stream, nf_max as usize)?,
             llk_scratch: LlkScratch::new(stream, dims, nf_max)?,
+            slice_waves: slice_waves.transpose()?,
             cut,
             passes,
         })
@@ -1204,7 +1268,7 @@ impl Device {
         let views = Views::new(&stream, dims, addrs)?;
         let tile = TileDots::new(&stream, &dims)?;
         let rule = StackRule::new(options.stack_size, ctx.l2_cache_size_bytes()?);
-        let shared = Shared::new(&stream, &dims, rule, options.fused, false)?;
+        let shared = Shared::new(&stream, &dims, rule, options.fused, false, slices.is_some())?;
         let slices = slices
             .map(|s| {
                 let upload = |v: &[Vec<C32>]| {
@@ -1218,6 +1282,7 @@ impl Device {
                     gaps: upload(&s.gaps)?,
                     ones: DeviceBuffer::from_host(&stream, &ones)?,
                     quad: s.quad,
+                    position: PositionKernels::load(&kernels)?,
                 })
             })
             .transpose()?;
@@ -1264,10 +1329,9 @@ impl Device {
         Ok(dev)
     }
 
-    /// With graphs, captures the LLK pass's graph; none of a multislice object, whose LLK
-    /// no pass takes.
+    /// With graphs, captures the LLK pass's graph.
     fn capture_llk(&mut self) -> Result<(), EngineError> {
-        if self.use_graph && self.slices.is_none() {
+        if self.use_graph {
             self.llk_graph = Some(self.capture(|bufs, passes, ring, ctx| {
                 bufs.forward_llk(ctx, passes, ring.record()).map(Some)
             })?);
@@ -1311,7 +1375,10 @@ impl Device {
         let stream = &self.stream;
         let dims = self.views.dims();
         let shared = (have.position.is_some() != position.is_some())
-            .then(|| Shared::new(stream, dims, self.rule, true, position.is_some()))
+            .then(|| {
+                let (moved, sliced) = (position.is_some(), self.slices.is_some());
+                Shared::new(stream, dims, self.rule, true, moved, sliced)
+            })
             .transpose()?;
         let nf_max = shared.as_ref().unwrap_or(&self.shared).cut.table.nf_max();
         let scale = scale
@@ -1414,20 +1481,16 @@ impl Device {
     }
 
     /// Fails on a multislice object for `what`, which models one slice: every pass but
-    /// LSQML's is enqueued behind this.
+    /// LSQML's and the LLK pass is enqueued behind this.
     fn one_slice(&self, what: &str) -> Result<(), EngineError> {
         match &self.slices {
             None => Ok(()),
             Some(s) => Err(EngineError::Invalid(format!(
-                "{what} runs one object slice, got {}: only LSQML runs a multislice object",
+                "{what} runs one object slice, got {}: only LSQML and the LLK pass run a \
+                 multislice object",
                 s.deeper.len() + 1
             ))),
         }
-    }
-
-    /// Whether the object has more than one slice.
-    pub fn sliced(&self) -> bool {
-        self.slices.is_some()
     }
 
     /// Overwrites the object in place, so every captured graph reads the new values.
@@ -1461,12 +1524,16 @@ impl Device {
             counts: &self.counts,
             obj: &mut self.obj,
             probe: &mut self.probe,
-            slices: self.slices.as_mut().map(|s| SlicesMut {
-                deeper: &mut s.deeper,
-                gaps: &s.gaps,
-                ones: &s.ones,
-                quad: s.quad,
-            }),
+            slices: (self.slices.as_mut())
+                .zip(self.shared.slice_waves.as_mut())
+                .map(|(s, waves)| SlicesMut {
+                    deeper: &mut s.deeper,
+                    gaps: &s.gaps,
+                    ones: &s.ones,
+                    quad: s.quad,
+                    position: &s.position,
+                    waves,
+                }),
             obj_sums: &mut self.obj_sums,
             probe_sums: &mut self.probe_sums,
             obj_len: self.obj_len,
@@ -1635,7 +1702,6 @@ impl Device {
     /// Enqueues the LLK record of the current estimate under `tag`, from the graph captured
     /// in [`Self::new`] or eagerly without graphs.
     pub fn llk_pass(&mut self, tag: Tag) -> Result<(), EngineError> {
-        self.one_slice("the LLK pass")?;
         let graph = self.llk_graph.take();
         let done = match &graph {
             Some(c) => self.replay(c, tag),
