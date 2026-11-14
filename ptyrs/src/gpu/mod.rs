@@ -38,6 +38,7 @@ mod lsqml;
 mod ops;
 mod optics;
 mod position;
+mod psi;
 mod ring;
 mod rpie;
 
@@ -61,6 +62,7 @@ pub use ops::{
 };
 pub use optics::{ExitStage, OpticsKernels};
 pub use position::{PositionKernels, PositionRule, Positions};
+pub use psi::Waves;
 pub use ring::{Ended, LlkRing, LlkTotals, RecordWriter, RingDevice, RingError};
 pub use rpie::{POWER_CHUNK, PowerMax, RpieKernels, Weight};
 

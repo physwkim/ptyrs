@@ -61,7 +61,8 @@ pub use ptyrs_kernels::pixel::{
     LlkPartial, MASKED, OBJ_TILE, PositionPartial, ScalePartial, StackCtl, StackGeom, ViewAddr,
 };
 
-use crate::gpu::{C32, Error, Kernels, check_len, dptr, lease};
+use crate::gpu::psi::check_waves;
+use crate::gpu::{C32, Error, Kernels, Waves, check_len, dptr, lease};
 
 /// Geometry of a scan's views.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1074,20 +1075,20 @@ impl Kernels {
         ctx: &ExecutionContext,
         views: &Views,
         stack: StackRef<'_>,
-        psi: &DeviceBuffer<C32>,
+        psi: &dyn Waves,
         probe: &DeviceBuffer<C32>,
         sums: &mut UpdateSums,
     ) -> Result<(), Error> {
         let d = &views.dims;
         let g = d.geom(stack)?;
         let n = d.n();
-        check_len("psi", psi, g.nf_max as usize * d.nmode as usize * n)?;
+        check_waves("psi", psi, g.nf_max as usize * d.nmode as usize * n)?;
         check_len("probe", probe, d.nprobe as usize * n)?;
         sums.check(d.obj_len())?;
         let config = d.stack_tile_grid(g.nf_max)?;
         let [start, len, list] = views.tile_storages();
         let reads = [
-            psi.storage(),
+            psi.raw(),
             probe.storage(),
             views.addr.storage(),
             start,
@@ -1101,7 +1102,7 @@ impl Kernels {
                 self.module.psi_to_obj(
                     stream,
                     config,
-                    dptr(psi),
+                    psi.ptr(),
                     dptr(probe),
                     dptr(&views.addr),
                     views.tile_ptrs(),
@@ -1122,19 +1123,19 @@ impl Kernels {
         ctx: &ExecutionContext,
         views: &Views,
         stack: StackRef<'_>,
-        psi: &DeviceBuffer<C32>,
+        psi: &dyn Waves,
         obj: &DeviceBuffer<C32>,
         sums: &mut UpdateSums,
     ) -> Result<(), Error> {
         let d = &views.dims;
         let g = d.geom(stack)?;
         let n = d.n();
-        check_len("psi", psi, g.nf_max as usize * d.nmode as usize * n)?;
+        check_waves("psi", psi, g.nf_max as usize * d.nmode as usize * n)?;
         check_len("obj", obj, d.obj_len())?;
         sums.check(d.nprobe as usize * n)?;
         let config = grid_1d(d.nprobe as usize * n)?;
         let reads = [
-            psi.storage(),
+            psi.raw(),
             obj.storage(),
             views.addr.storage(),
             stack.storage(),
@@ -1145,7 +1146,7 @@ impl Kernels {
                 self.module.psi_to_probe(
                     stream,
                     config,
-                    dptr(psi),
+                    psi.ptr(),
                     dptr(obj),
                     dptr(&views.addr),
                     sums.ptrs(),

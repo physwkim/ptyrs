@@ -645,7 +645,7 @@ mod tests {
     /// captured before the first frame: once the scan ends, the live object
     /// converges over the scanned region to the offline run over every
     /// frame, settled at 512 epochs, with no recapture. It crosses 0.99
-    /// about 125 epochs after the scan's end and goes on to 0.9996.
+    /// about 75 epochs after the scan's end and levels off at 0.9991.
     ///
     /// Steps of 8 px overlap the probe's 16 px by half. At 12 px AP's
     /// settled object moves by more than [`MATCH`] when the start moves by

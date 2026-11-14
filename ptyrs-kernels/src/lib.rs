@@ -767,7 +767,7 @@ pub mod kernels {
     /// [`obj_probe_to_psi`]: LoadedModule::obj_probe_to_psi
     #[kernel]
     pub unsafe fn psi_to_obj(
-        psi: *const f32,
+        psi: PsiPtr,
         probe: *const f32,
         views: *const ViewAddr,
         tiles: TilePtrs,
@@ -804,7 +804,7 @@ pub mod kernels {
                 obj_pixel_sources(v, y, x, g.ny, g.nx, |pry, prx, w| {
                     let p = load_c(probe, v.probe as usize * n + (pry * g.nx + prx) as usize);
                     let q = quad_phase(g.quad, pry, prx, g.ny, g.nx);
-                    let ps = load_c(psi, plane + psi_index(pry, prx, g.ny, g.nx));
+                    let ps = load_psi(psi, plane + psi_index(pry, prx, g.ny, g.nx));
                     let u = cmul_conj(cmul(p, q), ps);
                     acc = (acc.0 + w * u.0, acc.1 + w * u.1);
                     norm += w * (p.0 * p.0 + p.1 * p.1);
@@ -828,7 +828,7 @@ pub mod kernels {
     /// [`obj_probe_to_psi`]: LoadedModule::obj_probe_to_psi
     #[kernel]
     pub unsafe fn psi_to_probe(
-        psi: *const f32,
+        psi: PsiPtr,
         obj: *const f32,
         views: *const ViewAddr,
         sums: SumPtrs,
@@ -856,7 +856,7 @@ pub mod kernels {
                     continue;
                 }
                 let o = sample_obj(obj, v, y, x, g.nyo, g.nxo);
-                let u = cmul_conj(cmul(o, q), load_c(psi, kl * n + at));
+                let u = cmul_conj(cmul(o, q), load_psi(psi, kl * n + at));
                 acc = (acc.0 + u.0, acc.1 + u.1);
                 norm += o.0 * o.0 + o.1 * o.1;
                 added = true;

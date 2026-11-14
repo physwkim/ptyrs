@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Builds the `ptyrs` Python module without maturin and installs it as OUT/ptyrs<EXT_SUFFIX>.
+# Builds the `ptyrs` Python module without maturin and installs it as OUT/ptyrs<EXT_SUFFIX>,
+# with the engine results its tests compare against (examples/engine_reference.rs) in OUT.
 #   build.sh [OUT]    (OUT defaults to ~/work/ptyrs-scratch/py)
 # Import it with OUT on sys.path, under the interpreter in PYO3_PYTHON: the environment's, else
 # .cargo/config.local.toml's, else python3. It is exported so pyo3 builds against the same one.
@@ -17,4 +18,5 @@ cd "$root"
 PYO3_BUILD_EXTENSION_MODULE=1 cargo build --release -p ptyrs-py
 mkdir -p "$out"
 cp target/release/libptyrs_py.so "$out/ptyrs$suffix"
+PYO3_BUILD_EXTENSION_MODULE=1 cargo run -q --release -p ptyrs-py --example engine_reference -- "$out"
 echo "$out/ptyrs$suffix"
