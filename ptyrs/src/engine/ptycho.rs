@@ -236,7 +236,7 @@ impl Ptycho {
                 optics.nslice()
             )));
         }
-        if !is_unitary(&optics) {
+        if !optics.exit().adjoint_inverts() {
             return Err(EngineError::Invalid(
                 "Ptycho needs a unitary propagator; this one drops an evanescent band".into(),
             ));
@@ -1006,19 +1006,6 @@ impl Ptycho {
             batch_position_step(d, &frames, &delta);
         }
     }
-}
-
-/// Whether `optics`' exit transform is unitary: `Uᴴ·U` of one plane's unit impulse is
-/// `Fft2⁻¹·|T|²` of a constant under angular spectrum, the impulse again unless `T` has a
-/// zero, which moves its peak by at least `1/(ny·nx)`.
-fn is_unitary(optics: &Optics) -> bool {
-    let exit = optics.exit();
-    let [ny, nx] = exit.shape();
-    let mut plane = vec![C64::default(); ny * nx];
-    plane[0] = C64::new(1.0, 0.0);
-    exit.forward(&mut plane);
-    exit.adjoint(&mut plane);
-    (plane[0] - 1.0).norm() < 0.5 / (ny * nx) as f64
 }
 
 /// [`Ptycho::zero_phase_ramp`] of the given arrays, which the GPU backend also runs on its
