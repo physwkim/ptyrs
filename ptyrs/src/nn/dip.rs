@@ -187,9 +187,11 @@ impl<P: Prior> Dip<P> {
         })
     }
 
-    /// The network's current object, `[ny, nx, 2]` as [`ObjectLoss`] takes it.
+    /// The network's current object, `[ny, nx, 2]` as [`ObjectLoss`] takes it. Its forward is
+    /// untracked: a graph no backward consumes holds every activation until the next step's.
+    /// Batch norms still take the batch statistics, as in [`step`](Self::step).
     pub fn object(&self) -> Tensor<3> {
-        self.forward().inner()
+        self.net.clone().no_grad().object(self.code.clone()).inner()
     }
 
     /// One Adam step of size `lr` down `loss`, which is returned at the object before the step.
@@ -555,6 +557,26 @@ pub(crate) mod tests {
         let config = DipConfig::new([20, 28]).with_width(4).with_depth(2);
         let start = || host64(Dip::new(&config, &device).unwrap().object());
         assert!(start() == start(), "two networks of one config start apart");
+    }
+
+    /// The bytes `device`'s pool holds in tensors once its queued work is done.
+    fn in_use(device: &Device) -> u64 {
+        device.sync().unwrap();
+        device.memory_pool_usage().unwrap().bytes_in_use
+    }
+
+    /// A graph left by a look at the object would hold every activation until the next step's
+    /// backward.
+    #[test]
+    fn the_object_holds_no_graph() {
+        let device = crate::nn::cuda(0);
+        let config = DipConfig::new([64, 64]).with_width(8).with_depth(2);
+        let dip = Dip::new(&config, &device).unwrap();
+        // The first forward compiles, autotunes and fills cubecl's caches.
+        drop(dip.object());
+        let before = in_use(&device);
+        drop(dip.object());
+        assert_eq!(in_use(&device), before);
     }
 
     #[test]
