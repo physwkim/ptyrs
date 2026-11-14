@@ -13,9 +13,9 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use crate::gpu::{
-    BhScan, C32, EpochOrder, Error as GpuError, FrameWaves, FusedBufs, FusedInputs, Kernels,
-    LSQML_REC, LsqmlAt, LsqmlChi, LsqmlKernels, LsqmlNoise, LsqmlScan, LsqmlVar, Model,
-    PositionRule, PsiSums, ShiftProbe, SliceSource, SliceSteps, Solve, StackRef, StackTable, Views,
+    BhScan, C32, EpochOrder, Error as GpuError, FrameWaves, FusedInputs, Kernels, LSQML_REC,
+    LsqmlAt, LsqmlChi, LsqmlKernels, LsqmlNoise, LsqmlScan, LsqmlVar, Model, PositionRule, PsiSums,
+    ShiftProbe, SliceSource, SliceSteps, Solve, StackRef, StackTable, Views,
 };
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaStream, DeviceBuffer};
@@ -159,26 +159,27 @@ impl LsqmlState {
         deeper: usize,
     ) -> Result<Self, EngineError> {
         let dims = views.dims();
-        // work: the forward pass, `chi`, the update sums, `dots`; icalc: `icalc` and `far`;
-        // under the position also the moved probes (`shifted_rows_fwd`, or sliced
-        // `shifted_probe`, then `shift_w` and `dots`)
-        // and the shift planes of the shared scratch, which `shifted_psi_sums` writes and
-        // reads.
-        let mut streamed = vec![
-            Streamed::new(wave_bytes(dims), 3),
-            Streamed::new(plane_bytes::<f32>(dims, 1), 2),
-        ];
-        if scratch.is_some() {
-            streamed.extend([
-                Streamed::new(plane_bytes::<C32>(dims, dims.nprobe), 3),
-                Streamed::new(FusedBufs::shift_bytes(dims), 2),
-            ]);
-        }
-        if deeper > 0 {
-            // Of a multislice object, the wave entering a slice and its update, which the
-            // slice's product, adjoint, sums and `dots` touch.
-            streamed.extend([Streamed::new(wave_bytes(dims), 3); 2]);
-        }
+        // work: the forward pass (0), the exit wave, `chi`, the adjoint exit and back pass (4),
+        // then `psi_to_obj` and `psi_to_probe` (5, 6); icalc, which `far` reads batch-wide,
+        // streams. Under the position: work from `shifted_rows_fwd` (0, with the moved probes
+        // to `shift_w`) to the back pass (5), `shifted_psi_sums` from 6, then `dots` and the
+        // position sums (11, 12) read work and the moved probes again. The multislice loops
+        // hand on one wave per pass boundary, two under the position: no more than these.
+        let wave = wave_bytes(dims);
+        let streamed = match scratch {
+            None => vec![Streamed::new(wave, 0..=4), Streamed::new(wave, 5..=6)],
+            Some(_) => {
+                let probes = plane_bytes::<C32>(dims, dims.nprobe);
+                let mut s = vec![
+                    Streamed::new(wave, 0..=5),
+                    Streamed::new(probes, 0..=1),
+                    Streamed::new(wave, 11..=12),
+                    Streamed::new(probes, 11..=12),
+                ];
+                s.extend(Streamed::shifted_psi_sums(dims, 6));
+                s
+            }
+        };
         let frames = rule.frames(&streamed)?;
         let frames = scratch.map_or(frames, |s| frames.min(s));
         let (cut, batches) = batch_stacks(stream, dims, size, frames)?;

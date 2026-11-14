@@ -651,15 +651,26 @@ impl Shared {
         shift: bool,
         sliced: bool,
     ) -> Result<Self, EngineError> {
-        // M1's scratch: `obj_probe_to_psi`, the transforms and `apply_amplitude`; the fused
-        // work planes: the row, column and inverse row passes; each shift plane: the pass that
-        // writes it and a later one.
-        let mut streamed = vec![Streamed::new(wave_bytes(dims), if fused { 3 } else { 4 })];
+        // M1's scratch: `obj_probe_to_psi` (0), the transforms and `apply_amplitude` (to 3);
+        // the fused work planes: the row (0), column and inverse row passes and the sums over
+        // the waves (3). Under the position `shift_pre` writes `T`, and `T_y` into the adjoint
+        // planes, first (0); the inverse row pass (3) reads both and writes the adjoint, object
+        // planes and power, `shift_post` and the probe sums take the adjoint (4),
+        // `gather_shifted` the rest (5). Of a multislice object, the two waves its slices pass
+        // on, numbered after.
+        let wave = wave_bytes(dims);
+        let mut streamed = vec![Streamed::new(wave, if shift { 1..=3 } else { 0..=3 })];
         if shift {
-            streamed.push(Streamed::new(FusedBufs::shift_bytes(dims), 2));
+            let probe = plane_bytes::<C32>(dims, dims.nprobe);
+            let obj = plane_bytes::<C32>(dims, dims.nobj) + plane_bytes::<f32>(dims, 1);
+            streamed.extend([
+                Streamed::new(probe, 0..=3),
+                Streamed::new(probe, 0..=4),
+                Streamed::new(obj, 3..=5),
+            ]);
         }
         if sliced {
-            streamed.extend([Streamed::new(wave_bytes(dims), 3); 2]);
+            streamed.extend([Streamed::new(wave, 6..=7); 2]);
         }
         let cut = rule.cut(stream, dims, &streamed)?;
         let nf_max = cut.table.nf_max();
@@ -730,17 +741,21 @@ impl CarriedBufs {
         raar: bool,
         half: Option<f32>,
     ) -> Result<Self, EngineError> {
-        // The exit waves: read by the forward pass, written by the inverse one (M1: also
-        // `dm_reflect`, `add_c32`); the iterate: the forward row pass (M1: `raar_iterate`).
-        // `HalfWaves` hold a `u32` per value.
+        // The exit waves: read by the forward pass, written by the inverse one, the passes of
+        // the work planes (M1: also `dm_reflect`, `add_c32`); the iterate: the forward row
+        // pass alone (M1: `raar_iterate`). `HalfWaves` hold a `u32` per value.
         let wave = match half {
             Some(_) => plane_bytes::<u32>(dims, dims.nmode),
             None => wave_bytes(dims),
         };
+        let work = shared.streamed[0];
         let mut streamed = shared.streamed.clone();
-        streamed.push(Streamed::new(wave, 2));
+        streamed.push(Streamed {
+            bytes: wave,
+            ..work
+        });
         if raar {
-            streamed.push(Streamed::new(wave, 1));
+            streamed.push(Streamed::new(wave, work.first..=work.first));
         }
         let cut = rule.cut(stream, dims, &streamed)?;
         let len = cut.wave_len(dims);
@@ -962,13 +977,24 @@ impl MlState {
         lens: [usize; 2],
         moved: bool,
     ) -> Result<Self, EngineError> {
-        // The fields po, a, b: `gamma_fields`, the transform, `gamma_frames`; under the
-        // position the moved probes of P and dP: `shifted_probe`, `shift_w`,
-        // `obj_wave_to_psi`.
-        let mut streamed = vec![Streamed::new(3 * wave_bytes(dims), 3)];
-        if moved {
-            streamed.push(Streamed::new(2 * plane_bytes::<C32>(dims, dims.nprobe), 3));
-        }
+        // The fields po, a, b: `gamma_fields` (0), the transforms, `gamma_frames` (4). Under
+        // the position the moved probes of P and dP (`shifted_probe` 0 and 2, `shift_w` 1 and
+        // 3) give po, a (4, 5) and b (6, and 8 after `add_c32` 7) by `obj_wave_to_psi`, then
+        // the transforms (9 to 11) and `gamma_frames` (12).
+        let wave = wave_bytes(dims);
+        let streamed = match moved {
+            false => vec![Streamed::new(wave, 0..=4); 3],
+            true => {
+                let probe = plane_bytes::<C32>(dims, dims.nprobe);
+                vec![
+                    Streamed::new(probe, 0..=5),
+                    Streamed::new(probe, 2..=8),
+                    Streamed::new(wave, 4..=12),
+                    Streamed::new(wave, 5..=12),
+                    Streamed::new(wave, 6..=12),
+                ]
+            }
+        };
         let cut = rule.cut(stream, dims, &streamed)?;
         let zeroed = |len| DeviceBuffer::<C32>::zeroed(stream, len);
         let pair = || DeviceBuffer::<f32>::zeroed(stream, 2);
@@ -1089,19 +1115,36 @@ impl BhState {
         scratch: Option<u32>,
     ) -> Result<Self, EngineError> {
         let dims = views.dims();
-        // psi, r, lu, lv, each written by one pass and transformed or read by later ones;
-        // under the position also y (`obj_conj`, the transform, `pos_grad`), the moved probes
-        // (`shifted_probe`, `shift_w`, `obj_wave_to_psi`) and the shift planes of the
-        // shared scratch, which `shifted_psi_sums` writes and reads.
+        // The batch's two loops in turn. Without the position: psi (`obj_probe_to_psi` 0, the
+        // transform, the residual 2), r (the adjoint, the sums 4), lu and lv (`far` 5, the
+        // transforms, `hess_frames` 8). With it: the moved probes (`shifted_probe` 0,
+        // `shift_w`, `obj_wave_to_psi` 2), psi (the transform, the residual 4), r (the
+        // adjoint, `shifted_psi_sums` from 6, `obj_conj` 11), y (the transform, `pos_grad`
+        // 13); then lu and lv (`pos_spec` 14, the inverses, `pos_near`, the transforms,
+        // `pos_far` 22), r (`pos_near` 17, `obj_conj` 20) and y (the transform, `pos_far`).
         let wave = wave_bytes(dims);
-        let mut streamed = vec![Streamed::new(4 * wave, 3)];
-        if scratch.is_some() {
-            streamed.extend([
-                Streamed::new(wave, 3),
-                Streamed::new(plane_bytes::<C32>(dims, dims.nprobe), 3),
-                Streamed::new(FusedBufs::shift_bytes(dims), 2),
-            ]);
-        }
+        let streamed = match scratch {
+            None => vec![
+                Streamed::new(wave, 0..=2),
+                Streamed::new(wave, 2..=4),
+                Streamed::new(wave, 5..=8),
+                Streamed::new(wave, 5..=8),
+            ],
+            Some(_) => {
+                let mut s = vec![
+                    Streamed::new(plane_bytes::<C32>(dims, dims.nprobe), 0..=2),
+                    Streamed::new(wave, 2..=4),
+                    Streamed::new(wave, 4..=11),
+                    Streamed::new(wave, 11..=13),
+                    Streamed::new(wave, 14..=22),
+                    Streamed::new(wave, 14..=22),
+                    Streamed::new(wave, 17..=20),
+                    Streamed::new(wave, 20..=22),
+                ];
+                s.extend(Streamed::shifted_psi_sums(dims, 6));
+                s
+            }
+        };
         let frames = rule.frames(&streamed)?;
         let frames = scratch.map_or(frames, |s| frames.min(s));
         let (cut, batches) = batch_stacks(stream, dims, size, frames)?;
@@ -1366,7 +1409,7 @@ impl Device {
         };
         let views = Views::new(&stream, dims, addrs)?;
         let tile = TileDots::new(&stream, &dims)?;
-        let rule = StackRule::new(options.stack_size, ctx.l2_cache_size_bytes()?);
+        let rule = StackRule::on(options.stack_size, ctx, &dims)?;
         let shared = Shared::new(&stream, &dims, rule, options.fused, false, slices.is_some())?;
         let slices = slices
             .map(|s| {
