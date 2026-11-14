@@ -1,4 +1,5 @@
 //! The M6 measure on the LLK history of the engine's rPIE (CPU).
+#![warn(clippy::disallowed_methods)] // clippy.toml: CUDA devices only through ptyrs::nn::cuda
 
 use ptyrs::base::{AddrTable, Geometry, Object, Probe, Scan, required_obj_shape, sim};
 use ptyrs::engine::{Ptycho, RpieParams};

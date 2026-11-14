@@ -1,7 +1,8 @@
 # In live, every graph is captured through ptyrs::live::graph::LiveGraph::capture,
 # which counts it: a capture during a measurement breaks it (DESIGN.md §5 inv. 9).
-# Cargo.toml allows the lint; the live module and live's binaries, examples and
-# test warn on it again.
+# Burn's CUDA devices come from ptyrs::nn::cuda, which roots cubecl's caches first.
+# Cargo.toml allows the lint; the live and nn modules and their binaries, examples
+# and tests warn on it again.
 disallowed-methods = [
     { path = "cuda_async::cuda_graph::CudaGraph::capture", reason = "capture through LiveGraph::capture, which counts it" },
     { path = "cuda_async::cuda_graph::CudaGraph::scope", reason = "capture through LiveGraph::capture, which counts it" },
@@ -11,4 +12,5 @@ disallowed-methods = [
     { path = "cuda_bindings::cuStreamBeginCaptureToCig", reason = "capture through LiveGraph::capture, which counts it" },
     { path = "cuda_bindings::cuGraphInstantiateWithFlags", reason = "capture through LiveGraph::capture, which counts it" },
     { path = "cuda_bindings::cuGraphInstantiateWithParams", reason = "capture through LiveGraph::capture, which counts it" },
+    { path = "burn_tensor::Device::cuda", reason = "name CUDA devices through ptyrs::nn::cuda, which roots cubecl's caches first" },
 ]
