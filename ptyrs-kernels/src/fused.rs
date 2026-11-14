@@ -26,9 +26,10 @@
 use cuda_device::{async_copy, device, shared::DynamicSharedArray, thread};
 
 use crate::pixel::{
-    LlkPartial, MASKED, PositionPartial, ScalePartial, StackCtl, StackGeom, SumPtrs, TilePtrs,
-    ViewAddr, WARP, cmul, cmul_conj, freq, llk_add, load_c, obj_pixel_sources, psi_index,
-    quad_phase, ramp, sample_obj, stack_frames, store_c, zdiv, zsqrt,
+    LlkPartial, MASKED, PositionPartial, PsiPtr, ScalePartial, StackCtl, StackGeom, SumPtrs,
+    TilePtrs, ViewAddr, WARP, cmul, cmul_conj, freq, llk_add, load_c, load_psi, obj_pixel_sources,
+    psi_f32, psi_index, quad_phase, ramp, sample_obj, stack_frames, store_c, store_psi, zdiv,
+    zsqrt,
 };
 use crate::{FFT_EPT_MAX, fft_ept};
 
@@ -168,9 +169,9 @@ pub struct FusedPtrs {
     /// `[nframe, ny, nx]`, detector order.
     pub counts: *const u16,
     /// The stack's DM or RAAR exit waves, `[nf_max * nmode, ny, nx]`, origin at `[0, 0]`.
-    pub psi: *mut f32,
+    pub psi: PsiPtr,
     /// The stack's RAAR iterate, laid out as `psi`.
-    pub iterate: *mut f32,
+    pub iterate: PsiPtr,
     /// The stack's transforms, `[nf_max * nmode, ny, nx]`.
     pub work: *mut f32,
     /// `P_p q`, `[nprobe, ny, nx]`, natural order.
@@ -424,15 +425,15 @@ unsafe fn rows_fwd_with<const NX: u32, const SHIFT: bool>(
                 cmul(cmul(o, pr), quad_phase(g.quad, y, x, ny, nx))
             };
             if dm {
-                let s = load_c(p.psi, row + xs as usize);
+                let s = load_psi(p.psi, row + xs as usize);
                 w = (a * w.0 - b * s.0, a * w.1 - b * s.1);
             }
             if raar {
                 let at = row + xs as usize;
-                w = raar_mix(load_c(p.psi, at), load_c(p.iterate, at), w, cfg.beta);
+                w = raar_mix(load_psi(p.psi, at), load_psi(p.iterate, at), w, cfg.beta);
             }
             if iterate {
-                store_c(p.iterate, row + xs as usize, w);
+                store_psi(p.iterate, row + xs as usize, w);
             }
             r[2 * i as usize] = w.0;
             r[2 * i as usize + 1] = w.1;
@@ -681,11 +682,11 @@ pub unsafe fn cols<const NY: u32, const TERMS: u32>(
 /// Where [`rows_inv`] stores the new exit waves and [`gather`] reads them: `psi` under
 /// `FUSED_TO_PSI`, else `work`.
 #[device]
-fn new_waves(p: FusedPtrs, cfg: FusedCfg) -> *mut f32 {
+fn new_waves(p: FusedPtrs, cfg: FusedCfg) -> PsiPtr {
     if cfg.flags & FUSED_TO_PSI != 0 {
         p.psi
     } else {
-        p.work
+        psi_f32(p.work)
     }
 }
 
@@ -746,12 +747,12 @@ pub unsafe fn rows_inv<const NX: u32>(
                     let pr = load_c(p.probe, v.probe as usize * n + (y * nx + x) as usize);
                     let q = quad_phase(g.quad, y, x, ny, nx);
                     let po = cmul(cmul(sample_obj(p.obj, v, y, x, g.nyo, g.nxo), pr), q);
-                    let old = load_c(p.psi, at);
+                    let old = load_psi(p.psi, at);
                     let refl = (a * po.0 - b * old.0, a * po.1 - b * old.1);
                     let d = (b * (po.0 - refl.0), b * (po.1 - refl.1));
                     s = (s.0 + d.0, s.1 + d.1);
                 }
-                store_c(out, at, s);
+                store_psi(out, at, s);
             }
         }
     }
@@ -880,7 +881,7 @@ unsafe fn gather_with<const SHIFT: bool>(
                     for pm in 0..g.nprobe as usize {
                         let u = cmul_conj(
                             load_c(p.probe_q, pm * n + at),
-                            load_c(waves, plane + pm * n + ps),
+                            load_psi(waves, plane + pm * n + ps),
                         );
                         c = (c.0 + u.0, c.1 + u.1);
                     }
@@ -1160,7 +1161,7 @@ unsafe fn shift_rows_inv_with<const NX: u32, const SUMS: bool>(
                     let wi = (w[k], w[k + 1]);
                     let at = row + xs as usize;
                     let mut s = if SUMS {
-                        load_c(p.psi, at)
+                        load_psi(p.psi, at)
                     } else {
                         (r[k], r[k + 1])
                     };
@@ -1171,13 +1172,13 @@ unsafe fn shift_rows_inv_with<const NX: u32, const SUMS: bool>(
                     };
                     if dm {
                         let po = cmul(vo, wi);
-                        let old = load_c(p.psi, at);
+                        let old = load_psi(p.psi, at);
                         let refl = (a * po.0 - b * old.0, a * po.1 - b * old.1);
                         let d = (b * (po.0 - refl.0), b * (po.1 - refl.1));
                         s = (s.0 + d.0, s.1 + d.1);
                     }
                     if !SUMS {
-                        store_c(out, at, s);
+                        store_psi(out, at, s);
                     }
                     if obj_terms {
                         let ct = cplane + xs as usize;
