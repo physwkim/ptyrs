@@ -127,7 +127,7 @@ impl<'a> LsqmlBatch<'a> {
                 move_planes(p, q, d, &fft);
             }
         }
-        let waves = SliceWaves::new(optics, &uviews, objects, &uprobe);
+        let waves = SliceWaves::new(optics, &uviews, objects, &uprobe, offsets.as_deref());
         let prop = optics.exit();
         let mut chi = waves.psi().to_vec();
         prop.forward(&mut chi);
@@ -251,7 +251,7 @@ impl<'a> LsqmlBatch<'a> {
         let n = ny * nx;
         let nxo = self.objects[s].plane_shape()[1];
         let fft = Fft2::new([ny, nx]);
-        let (q, incident) = (self.waves.quad(s), self.waves.incident(s));
+        let incident = self.waves.incident(s);
         let sums: Vec<[[f64; 2]; 2]> = (0..self.frames.len())
             .map(|b| {
                 let k = b * self.nmode;
@@ -260,7 +260,7 @@ impl<'a> LsqmlBatch<'a> {
                 let patch: Vec<C64> = (0..n)
                     .map(|i| o[(v.oy as usize + i / nx) * nxo + v.ox as usize + i % nx])
                     .collect();
-                let w = incident.plane(k);
+                let (w, q) = (incident.plane(k), self.waves.quad(s, k));
                 let wq: Vec<C64> = (0..n)
                     .map(|j| {
                         let (i, _, _) = natural(j, ny, nx);
@@ -297,7 +297,7 @@ impl<'a> LsqmlBatch<'a> {
             self.views,
             &self.objects[0],
             d_probe,
-            self.waves.quad(0),
+            self.waves.quad(0, 0),
             &mut dpo,
         );
         let dop = self.waves.obj_tangent(0, &d_obj[0]);
