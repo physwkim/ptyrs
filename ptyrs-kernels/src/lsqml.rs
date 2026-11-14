@@ -16,6 +16,7 @@ use cuda_host::cuda_module;
 use crate::bh::{BhObs, store_sums};
 use crate::fused::{FUSED_COLS, col_fft, walk_slot};
 use crate::grad::{GAMMA_CHUNK, ObjProbePtrs};
+use crate::optics::{WavePlanes, wave_plane};
 use crate::pixel::{
     MASKED, PIXEL_THREADS, StackCtl, StackGeom, ViewAddr, cmul, cmul_conj, load_c, psi_index,
     quad_phase, sample_obj, stack_frames, store_c, zdiv, zsqrt,
@@ -227,18 +228,17 @@ pub unsafe fn cols<const NY: u32>(p: LsqmlCols, ctl: *const StackCtl, g: StackGe
 }
 
 /// The step-size sums of chunk `c = blockIdx.x` of frame `f0 + fl`, `fl` `walk_slot` of
-/// `flags`, of [`lsqml_kernels::LoadedModule::lsqml_dots`], under `SHIFT` with the moved
-/// probe `W` of `w` in place of `P q` in `u`. `red` is `LSQML_DOTS` segments of
-/// `PIXEL_THREADS` shared floats.
+/// `flags`, of [`lsqml_kernels::LoadedModule::lsqml_dots`], under `SHIFT` with the view's
+/// wave of `w` in place of `P q` in `u`. `red` is `LSQML_DOTS` segments of `PIXEL_THREADS`
+/// shared floats.
 ///
 /// # Safety
 ///
-/// As `lsqml_dots`, and under `SHIFT` `w` the stack's moved probe `[nf_max * nprobe, ny,
-/// nx]` at its stored pixels ([`crate::position::shift_w`]).
+/// As `lsqml_dots`, and under `SHIFT` `w` the stack's waves as [`WavePlanes`] says.
 #[device]
 unsafe fn dots<const SHIFT: bool>(
     p: LsqmlDots,
-    w_moved: *const f32,
+    w_in: WavePlanes,
     ctl: *const StackCtl,
     g: StackGeom,
     flags: u32,
@@ -277,10 +277,7 @@ unsafe fn dots<const SHIFT: bool>(
                 let d_o = sample_obj(d.obj, w, py, px, g.nyo, g.nxo);
                 let ch = load_c(chi, (fl * nmode + m) * n + at);
                 let u = if SHIFT {
-                    let ws = load_c(
-                        w_moved,
-                        (fl * g.nprobe as usize + w.probe as usize) * n + at,
-                    );
+                    let ws = load_c(w_in.w, wave_plane(w_in, fl, m) * n + at);
                     cmul(d_o, ws)
                 } else {
                     cmul(cmul(d_o, load_c(x.probe, pa)), q)
@@ -305,7 +302,7 @@ unsafe fn dots<const SHIFT: bool>(
 pub mod lsqml_kernels {
     use super::{
         EPS_XI, LAMBDA0, LSQML_DOTS, LSQML_REC, LSQML_XI, LsqmlCols, LsqmlDots, LsqmlFar, LsqmlPre,
-        LsqmlRule, cols, dots, store_sums, walk_slot,
+        LsqmlRule, WavePlanes, cols, dots, store_sums, walk_slot,
     };
     use crate::bh::{BhObs, CHUNK_PIXELS};
     use crate::grad::GAMMA_CHUNK;
@@ -639,27 +636,32 @@ pub mod lsqml_kernels {
     pub unsafe fn lsqml_dots(p: LsqmlDots, ctl: *const StackCtl, g: StackGeom, flags: u32) {
         static mut RED: SharedArray<f32, 1536> = SharedArray::UNINIT;
         let red = (&raw mut RED).cast::<f32>();
-        unsafe { dots::<false>(p, core::ptr::null(), ctl, g, flags, red) }
+        let none = WavePlanes {
+            w: core::ptr::null(),
+            nw: 1,
+        };
+        unsafe { dots::<false>(p, none, ctl, g, flags, red) }
     }
 
-    /// [`lsqml_dots`] with the moved probe `W_w` of `w` in place of `P_w q` in `u`.
+    /// [`lsqml_dots`] with view `w`'s wave of `waves` in place of `P_w q` in `u`: the moved
+    /// probe `W_w` ([`crate::position::shift_w`]), or a multislice object's wave entering a
+    /// slice.
     ///
     /// # Safety
     ///
-    /// As [`lsqml_dots`], `w` the stack's moved probe `[nf_max * nprobe, ny, nx]` at its
-    /// stored pixels ([`crate::position::shift_w`]).
+    /// As [`lsqml_dots`], `waves` the stack's as [`WavePlanes`] says.
     ///
     /// [`lsqml_dots`]: LoadedModule::lsqml_dots
     #[kernel]
     pub unsafe fn lsqml_dots_shifted(
         p: LsqmlDots,
-        w: *const f32,
+        waves: WavePlanes,
         ctl: *const StackCtl,
         g: StackGeom,
         flags: u32,
     ) {
         static mut RED: SharedArray<f32, 1536> = SharedArray::UNINIT;
-        unsafe { dots::<true>(p, w, ctl, g, flags, (&raw mut RED).cast::<f32>()) }
+        unsafe { dots::<true>(p, waves, ctl, g, flags, (&raw mut RED).cast::<f32>()) }
     }
 
     /// One batch's step sizes over its positions `p` from the [`lsqml_dots`] sums, each
