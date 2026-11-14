@@ -5714,6 +5714,7 @@ dependencies = [
  "rand 0.8.8",
  "rand_chacha 0.3.1",
  "rand_distr 0.4.3",
+ "rayon",
  "rust-hdf5",
  "rustfft",
  "serde",
