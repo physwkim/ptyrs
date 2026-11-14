@@ -379,6 +379,13 @@ pub struct TrainOptions {
     pub seed: u64,
     /// Directory [`train`] writes its state to after every epoch and resumes from when it holds
     /// one, so that a stopped run continues from its last finished epoch.
+    ///
+    /// The state holds the weights with their batch-norm running statistics, Adam's moments and
+    /// step, and the epochs finished; the resumed run replays those epochs' shuffles from `seed`,
+    /// so it continues the same optimisation batch for batch. Resumed in the same process, it
+    /// reproduces the uninterrupted run's losses to the bit. A new process tunes its kernels
+    /// afresh and may pick other convolutions, which round differently, so its losses are not
+    /// bit-equal to the uninterrupted run's.
     pub checkpoint: Option<PathBuf>,
 }
 
