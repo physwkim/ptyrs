@@ -15,7 +15,7 @@
 //! consumes the sums. An epoch starts with [`LsqmlKernels::start`] on a new run, and
 //! [`LsqmlKernels::precondition`] on pty-chi's schedule, or where each view samples the
 //! object at its offset [`LsqmlKernels::precondition_placed`]. The steps never leave the
-//! device.
+//! device. There the object passes read each stack's windows through [`window_views`].
 //!
 //! Under the position model the epoch's frames move as [`crate::gpu::PositionKernels`] lays
 //! out: per stack [`Kernels::shifted_rows_fwd`] and its moved probe take the place of
@@ -129,6 +129,17 @@ impl LsqmlScan {
         same_dims(&self.dims, dims)
     }
 
+    /// [`Self::check`] of views over any object: the scan's, or [`window_views`] of it.
+    fn check_frames(&self, dims: &ViewDims) -> Result<(), Error> {
+        same_dims(
+            &self.dims,
+            &ViewDims {
+                obj: self.dims.obj,
+                ..*dims
+            },
+        )
+    }
+
     fn far(&self, order: &DeviceBuffer<u32>) -> LsqmlFar {
         LsqmlFar {
             order: dptr::<u32, u32>(order).cast_const(),
@@ -177,6 +188,60 @@ pub enum LsqmlChi<'a> {
         chi: &'a DeviceBuffer<C32>,
         w: FrameWaves<'a>,
     },
+}
+
+/// The views over a stack's windows where each view samples the object at its offset: an
+/// all-modes block of [`ObjectSampler::windows`], plane `o * nf_max + fl` frame `f0 + fl`'s
+/// window on object mode `o`, is these views' object `[nobj, nf_max * ny, nx]`, epoch
+/// position `f0 + fl` at row `fl * ny`. `stacks` are the stack table's, consecutive from
+/// position 0 to `nframe`; every stack's views share the rows, and a stack launch reads its
+/// own.
+///
+/// [`ObjectSampler::windows`]: crate::gpu::sampling::ObjectSampler::windows
+pub fn window_views(
+    stream: &CudaStream,
+    dims: &ViewDims,
+    stacks: &[Range<u32>],
+) -> Result<Views, Error> {
+    dims.check()?;
+    let mut next = 0;
+    for r in stacks {
+        if r.start != next || r.is_empty() {
+            return Err(Error::Shape(format!(
+                "stack {r:?} does not follow position {next}"
+            )));
+        }
+        next = r.end;
+    }
+    if next != dims.nframe {
+        return Err(Error::Shape(format!(
+            "stacks end at {next}, the scan at {}",
+            dims.nframe
+        )));
+    }
+    let nf_max = stacks.iter().map(ExactSizeIterator::len).max().unwrap_or(0);
+    let [ny, nx] = dims.frame;
+    let rows = u32::try_from(nf_max * ny as usize)
+        .map_err(|_| Error::Shape(format!("{nf_max} windows of {ny} rows exceed u32")))?;
+    let addr: Vec<ViewAddr> = stacks
+        .iter()
+        .flat_map(|r| 0..r.end - r.start)
+        .flat_map(|fl| {
+            (0..dims.nmode).map(move |m| ViewAddr {
+                oy: fl * ny,
+                ox: 0,
+                fy: 0.0,
+                fx: 0.0,
+                probe: m % dims.nprobe,
+                obj: m / dims.nprobe,
+            })
+        })
+        .collect();
+    let windows = ViewDims {
+        obj: [rows, nx],
+        ..*dims
+    };
+    Views::new(stream, windows, &addr)
 }
 
 /// Values of the object and of the probe.
@@ -611,8 +676,8 @@ impl LsqmlKernels {
     }
 
     /// The step-size sums of the stack's frames into `st` from its exit-wave update `chi`;
-    /// `views` in epoch order. Under [`LsqmlChi::Moved`] the object direction's waves take
-    /// its `w`.
+    /// `views` in epoch order, the scan's or [`window_views`] with `at`'s objects the stack's
+    /// windows. Under [`LsqmlChi::Moved`] the object direction's waves take its `w`.
     pub fn dots(
         &self,
         ctx: &ExecutionContext,
@@ -623,7 +688,7 @@ impl LsqmlKernels {
         st: &mut LsqmlScan,
     ) -> Result<(), Error> {
         let d = views.dims();
-        st.check(d)?;
+        st.check_frames(d)?;
         let g = d.geom(stack)?;
         let c = match &chi {
             LsqmlChi::Unmoved(c) | LsqmlChi::Moved { chi: c, .. } => *c,

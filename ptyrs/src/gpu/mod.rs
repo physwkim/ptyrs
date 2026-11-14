@@ -57,6 +57,7 @@ pub use grad::{
 };
 pub use lsqml::{
     LSQML_REC, LsqmlAt, LsqmlChi, LsqmlKernels, LsqmlNoise, LsqmlScan, LsqmlVar, SliceSteps,
+    window_views,
 };
 pub use ops::{
     LLK_TREE_LEAVES, LlkPartial, LlkScratch, LlkSums, MASKED, OBJ_TILE, Permutation,
