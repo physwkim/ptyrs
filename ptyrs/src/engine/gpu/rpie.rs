@@ -137,7 +137,7 @@ impl Bufs<'_> {
             Some(m) => {
                 let inputs = moved_inputs(&base, moved_shift(m.pos, m.spectrum));
                 let w = &mut m.w[0];
-                k.shifted_rows_fwd(ctx, &inputs, stack, w, rb.dlt)?;
+                k.shifted_probe(ctx, &inputs, stack, w)?;
                 m.kernels.shift_w(ctx, &dims, stack, w)?;
                 rk.obj_wave_to_psi(ctx, self.views, stack, self.obj, w, rb.psi)?;
             }

@@ -1,5 +1,5 @@
 //! Checked launches of the position kernels (`ptyrs_kernels::position`): pty-chi's gradient
-//! position correction under the moved probe of [`Kernels::shifted_rows_fwd`], for any
+//! position correction under the moved probe of [`Kernels::shifted_probe`], for any
 //! method whose stacks hold epoch positions and whose exit-wave update `chi` is at the exit
 //! wave's stored pixels.
 //!
@@ -8,7 +8,7 @@
 //! The epoch starts with [`PositionKernels::gather`]; the shifted passes read
 //! [`Positions::offsets`] as [`crate::gpu::Shift::offsets`] for the whole epoch, so each frame
 //! moves once, in its batch. Per stack, [`PositionKernels::shift_w`] turns the probe rows
-//! [`Kernels::shifted_rows_fwd`] left into the moved probe `W`; with the stack's `chi`,
+//! [`Kernels::shifted_probe`] left into the moved probe `W`; with the stack's `chi`,
 //! [`PositionKernels::sums`] takes the object slopes and the stack's position sums against
 //! the object the batch started from. After the batch's update, [`PositionKernels::step`]
 //! steps its frames' offsets.
@@ -148,7 +148,7 @@ impl PositionKernels {
     }
 
     /// The stack's moved probe in place in `t`, `[nf_max * nprobe, ny, nx]` as
-    /// [`Kernels::shifted_rows_fwd`] left it: plane `fl * nprobe + p` becomes mode `p` of
+    /// [`Kernels::shifted_probe`] left it: plane `fl * nprobe + p` becomes mode `p` of
     /// frame `fl` moved by its offset, at the exit wave's stored pixels.
     pub fn shift_w(
         &self,

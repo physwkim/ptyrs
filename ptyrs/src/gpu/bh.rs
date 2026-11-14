@@ -17,7 +17,7 @@
 //!
 //! The offsets join the step as a third variable ([`BhOffsets`]), on the moved probes `W` of a
 //! [`Shift`] in epoch order (`crate::gpu::PositionKernels::gather`): the exit waves are `O W`
-//! (`Kernels::shifted_rows_fwd`, `PositionKernels::shift_w`, `RpieKernels::obj_wave_to_psi`),
+//! (`Kernels::shifted_probe`, `PositionKernels::shift_w`, `RpieKernels::obj_wave_to_psi`),
 //! the object and probe gradients `Kernels::shifted_psi_sums` of `r`. Per stack of the
 //! gradient pass, [`BhKernels::obj_conj`] of `r`, its forward FFT and [`BhKernels::pos_grad`];
 //! [`BhKernels::pos_dots`] after the dots. Per stack of the Hessian pass, in place of

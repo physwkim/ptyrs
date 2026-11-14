@@ -160,7 +160,8 @@ impl LsqmlState {
     ) -> Result<Self, EngineError> {
         let dims = views.dims();
         // work: the forward pass, `chi`, the update sums, `dots`; icalc: `icalc` and `far`;
-        // under the position also the moved probes (`shifted_rows_fwd`, `shift_w`, `dots`)
+        // under the position also the moved probes (`shifted_rows_fwd`, or sliced
+        // `shifted_probe`, then `shift_w` and `dots`)
         // and the shift planes of the shared scratch, which `shifted_psi_sums` writes and
         // reads.
         let mut streamed = vec![
@@ -409,6 +410,7 @@ impl<'a> Bufs<'a> {
                 Some(m) => {
                     let inputs = moved_inputs(&base, moved_shift(m.pos, m.spectrum));
                     let w = &mut m.w[k];
+                    // Its row pass is the stack's forward pass: `exit` goes on from `work`.
                     self.kernels
                         .shifted_rows_fwd(ctx, &inputs, stack, w, work)?;
                     m.kernels.shift_w(ctx, views.dims(), stack, w)?;
@@ -573,9 +575,7 @@ impl<'a> Bufs<'a> {
                 Some(m) => {
                     let inputs = moved_inputs(&base, moved_shift(m.pos, m.spectrum));
                     let pw = &mut m.w[k];
-                    // The row pass's own product, into `work`, is not read.
-                    self.kernels
-                        .shifted_rows_fwd(ctx, &inputs, stack, pw, work)?;
+                    self.kernels.shifted_probe(ctx, &inputs, stack, pw)?;
                     m.kernels.shift_w(ctx, d, stack, pw)?;
                     let probe = SliceSource::Waves(pw);
                     ok.slice_mul(ctx, views, stack, self.obj, probe, &mut inc[0])?;
