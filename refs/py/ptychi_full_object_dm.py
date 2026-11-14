@@ -11,7 +11,8 @@ engine's runs from it, little-endian f64, complex as `re im` pairs:
     counts.f64        [nframe, ny, nx], natural (centred) layout
     corners.f64       [nframe, 2], each frame's window corner (oy, ox)
     obj0.c128         [oy, ox], the start object; truth.c128 the object the counts are of
-    probe0.c128       [nmode, ny, nx], the start probe
+    probe0.c128       [nmode, ny, nx], the start probe; probe_truth.c128 the probe the counts
+                      are of
     offsets0.f64      [nframe, 2], near.rs's drawn_offsets
     <alg>_<label>_<n>_llk.f64     the engine's LLK history over n cycles (each cycle's start),
                                   then the normalised Poisson LLK of the arrays it ends on
@@ -43,6 +44,12 @@ probe's illumination at the corners at least ILLUM of its maximum): |c a e^(i g.
 with c and the phase ramp g fitted (a ramp on O with the opposite on P changes no frame's
 intensity), and the offsets' rms about their mean and the mean. Writes
 <state>/ptychi_full_object_dm.json with the curves of every run.
+
+First, the truth-start control: counts made by pty-chi's FULL_OBJECT forward model from the
+truth at the corners plus the drawn offsets (fractional) or plus whole-pixel ones
+(round(1.4 sin(1.7f + 0.3)), round(1.4 cos(2.3f)), mean kept), rounded half away from zero;
+then DM and RAAR from the truth with those offsets held. Where the truth is stable the LLK stays
+at the truth's (the curve's first point), or a little below it from the counts' rounding.
 """
 import importlib.util
 import json
@@ -89,12 +96,13 @@ class Case:
                                                       ("wavelength", "pixel", "distance"))
         nf, nm, ny, nx, oy, ox = (int(meta[k]) for k in ("nframe", "nmode", "ny", "nx", "oy",
                                                           "ox"))
-        self.nb_obs = int(meta["nb_obs"])
         self.counts = read(d / "counts.f64", (nf, ny, nx))
+        assert int(meta["nb_obs"]) == self.counts.size, "a mask"
         self.corners = read(d / "corners.f64", (nf, 2))
         self.obj0 = read(d / "obj0.c128", (oy, ox), True)
         self.truth = read(d / "truth.c128", (oy, ox), True)
         self.probe0 = read(d / "probe0.c128", (nm, ny, nx), True)
+        self.probe_truth = read(d / "probe_truth.c128", (nm, ny, nx), True)
         self.offsets0 = read(d / "offsets0.f64", (nf, 2))
         prop = pp.free_space((ny, nx), self.wavelength, self.pixel, self.pixel, self.distance)
         self.kind = type(prop).__name__
@@ -117,8 +125,9 @@ class Case:
                     offsets=read(f"{stem}_offsets.f64", (nf, 2)))
 
 
-def task(c, alg, offsets, moved):
-    """pty-chi's DM or RAAR task on case c from the corners plus offsets."""
+def task(c, alg, counts, obj, probe, offsets, moved):
+    """pty-chi's DM or RAAR task on case c's geometry from obj, probe and the corners plus
+    offsets."""
     import ptychi.api as api
     from ptychi.api.task import PtychographyTask
 
@@ -151,9 +160,9 @@ def task(c, alg, offsets, moved):
     pos = c.corners + offsets
     t = PtychographyTask(
         opts,
-        diffraction_data=c.counts.copy(),
-        object_data=c.obj0[None].copy(),
-        probe_data=(c.probe0 / np.sqrt(c.k))[None].copy(),
+        diffraction_data=counts.copy(),
+        object_data=obj[None].copy(),
+        probe_data=(probe / np.sqrt(c.k))[None].copy(),
         probe_position_y_px=pos[:, 0].copy(),
         probe_position_x_px=pos[:, 1].copy(),
     )
@@ -163,13 +172,17 @@ def task(c, alg, offsets, moved):
     return t
 
 
-def llk(t, c):
-    """The engine's normalised Poisson LLK of pty-chi's forward-model intensities."""
+def forward(t):
     import torch
     with torch.no_grad():
-        y = t.reconstructor.forward_model.forward(torch.arange(len(c.counts))).numpy()
-    n = c.counts
-    return np.where(n > 0, y - n + xlogy(n, n) - xlogy(n, y), y).sum() / c.nb_obs
+        frames = torch.arange(len(t.probe_positions.data))
+        return t.reconstructor.forward_model.forward(frames).numpy()
+
+
+def llk(t, counts):
+    """The engine's normalised Poisson LLK of pty-chi's forward-model intensities."""
+    y, n = forward(t), counts
+    return np.where(n > 0, y - n + xlogy(n, n) - xlogy(n, y), y).sum() / n.size
 
 
 def ended(t, c):
@@ -180,14 +193,33 @@ def ended(t, c):
 
 def ptychi(c, alg, offsets, moved):
     """pty-chi over the long run: the LLK curve and the arrays after SHORT and after all."""
-    t = task(c, alg, offsets, moved)
-    curve, short = [llk(t, c)], None
+    t = task(c, alg, c.counts, c.obj0, c.probe0, offsets, moved)
+    curve, short = [llk(t, c.counts)], None
     for e in range(c.long):
         t.run(1)
-        curve.append(llk(t, c))
+        curve.append(llk(t, c.counts))
         if e + 1 == SHORT:
             short = ended(t, c)
     return np.array(curve), short, ended(t, c)
+
+
+def whole_offsets(n):
+    f = np.arange(n)
+    d = np.stack([1.4 * np.sin(1.7 * f + 0.3), 1.4 * np.cos(2.3 * f)], 1)
+    return np.copysign(np.floor(np.abs(d) + 0.5), d)
+
+
+def truth_start(c, alg, offsets):
+    """pty-chi's LLK curve from the truth, offsets held, on counts made through FULL_OBJECT
+    from the truth at the corners plus offsets."""
+    y = forward(task(c, alg, c.counts, c.truth, c.probe_truth, offsets, False))
+    counts = np.floor(y + 0.5)
+    t = task(c, alg, counts, c.truth, c.probe_truth, offsets, False)
+    curve = [llk(t, counts)]
+    for _ in range(c.long):
+        t.run(1)
+        curve.append(llk(t, counts))
+    return np.array(curve)
 
 
 def obj_err(a, b, region):
@@ -236,7 +268,7 @@ def main():
     for c in cases:
         for label, d in (("fixed", 0 * c.offsets0), ("position", c.offsets0)):
             want = c.engine("dm", label, SHORT)["llk"][0]
-            got = llk(task(c, "dm", d, False), c)
+            got = llk(task(c, "dm", c.counts, c.obj0, c.probe0, d, False), c.counts)
             err = abs(got - want) / want
             print(f"{c.name} {label}: start LLK engine {want:.12e} pty-chi {got:.12e}, {err:.1e}")
             worst = max(worst, err)
@@ -244,6 +276,14 @@ def main():
         sys.exit(f"start LLK differs: {worst:.2e} > {START_BOUND:.0e}")
 
     out = {}
+    print(f"--- truth-start control: LLK after cycles {MARKS}")
+    for c in cases:
+        for name, d in (("drawn", c.offsets0), ("whole", whole_offsets(len(c.corners)))):
+            for alg in ("dm", "raar"):
+                curve = truth_start(c, alg, d)
+                print(f"  {c.name} {name} {alg}: {marks(curve)}, max/first "
+                      f"{np.nanmax(curve) / curve[0]:.3g}")
+                out[f"{c.name}/{alg}/truth_{name}"] = dict(ptychi=curve.tolist())
     for c in cases:
         print(f"--- {c.name}: {c.kind}, distance {c.distance:g} m, long run {c.long} cycles; "
               f"LLK after cycles {MARKS}")
