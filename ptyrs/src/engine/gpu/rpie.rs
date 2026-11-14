@@ -11,7 +11,7 @@ use cuda_core::CudaStream;
 
 use super::device::{FeaturesMut, Moved, MovedLent, RpieBufs, moved_inputs, moved_shift};
 use super::propagate::Propagate;
-use super::{Bufs, Epoch, GpuPtycho, plane_len};
+use super::{Bufs, Epoch, GpuPtycho};
 use crate::engine::features::{POSITION_LIMIT, POSITION_STEP};
 use crate::engine::ptycho::{Algorithm, llk_due};
 use crate::engine::{EngineError, RpieParams};
@@ -237,8 +237,7 @@ impl Bufs<'_> {
                     step: POSITION_STEP as f32,
                     limit: POSITION_LIMIT as f32,
                 },
-                // ε at the frame's pixel count under every propagator, as the CPU's.
-                scale: plane_len(self.views.dims()) as f32,
+                scale: self.exit.scale,
             };
             let batch = frames.range.clone();
             m.kernels.step(ctx, batch, m.own, m.offsets, solve, m.pos)?;

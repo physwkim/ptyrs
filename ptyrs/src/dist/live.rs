@@ -1057,7 +1057,7 @@ mod tests {
             for &u in &landed {
                 let (x, y) = xy[u];
                 let t_rx = wall_ns();
-                table.insert(u as i32, Pos { x, y, t_rx });
+                table.insert(u as i32, Pos::new(x, y, t_rx));
             }
             for u in 0..xy.len() {
                 let mut s = ring.reserve();
@@ -1154,14 +1154,7 @@ mod tests {
         };
         for u in 0..total as i32 {
             let t_rx = wall_ns();
-            table.insert(
-                u,
-                Pos {
-                    x: 0.0,
-                    y: 0.0,
-                    t_rx,
-                },
-            );
+            table.insert(u, Pos::new(0.0, 0.0, t_rx));
             let mut s = ring.reserve();
             s.frame().fill(u as u16 + 1);
             s.commit(u, t_rx, 0);

@@ -810,14 +810,14 @@ fn upload(
                     // SAFETY: slot `i` is committed and not yet released, so
                     // no worker writes it (see `Ring`).
                     unsafe {
-                        *ring.pos_ptr.add(2 * i) = p.x;
-                        *ring.pos_ptr.add(2 * i + 1) = p.y;
+                        *ring.pos_ptr.add(2 * i) = p.x();
+                        *ring.pos_ptr.add(2 * i + 1) = p.y();
                     }
-                    match p.t_rx - t_rx {
+                    match p.t_rx() - t_rx {
                         lag if lag > 0 => rep.pos_after_frame.record(lag),
                         _ => rep.pos_first += 1,
                     }
-                    routes[i] = route.regions((p.x, p.y));
+                    routes[i] = route.regions((p.x(), p.y()));
                     assert!(
                         routes[i] != 0 && routes[i] & !all == 0,
                         "route {:#b} of {} regions",
@@ -1058,14 +1058,7 @@ mod tests {
 
     fn post(pos: &PosTable, uid: i32) {
         let (x, y) = at(uid);
-        pos.insert(
-            uid,
-            Pos {
-                x,
-                y,
-                t_rx: wall_ns(),
-            },
-        );
+        pos.insert(uid, Pos::new(x, y, wall_ns()));
     }
 
     /// Commits triggers `uids`, each arriving now; their positions are posted
@@ -1270,14 +1263,7 @@ mod tests {
     }
 
     fn post_invalid(pos: &PosTable, uid: i32) {
-        pos.insert(
-            uid,
-            Pos {
-                x: f64::NAN,
-                y: 0.0,
-                t_rx: wall_ns(),
-            },
-        );
+        pos.insert(uid, Pos::new(f64::NAN, 0.0, wall_ns()));
     }
 
     /// The wait for a position that an invalid one must not take.
