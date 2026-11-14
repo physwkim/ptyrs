@@ -41,6 +41,7 @@ mod position;
 mod psi;
 mod ring;
 mod rpie;
+pub mod sampling;
 
 pub use crate::fft::C32;
 pub use bh::{
