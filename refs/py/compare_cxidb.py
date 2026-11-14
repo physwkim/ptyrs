@@ -1,6 +1,6 @@
-"""ptyrs GPU against PyNX CUDA DM and ML, pty-chi LSQML, BH and rPIE and PtyPy RAAR on measured
-data, CXIDB entry 65 (ALS 5.3.2, gold balls, 1 keV, 800 frames of 621x621 pixels, CC0), every
-side from one start, through the `ptyrs` module.
+"""ptyrs GPU against PyNX CUDA DM, ML and RAAR, pty-chi LSQML, BH and rPIE and PtyPy RAAR on
+measured data, CXIDB entry 65 (ALS 5.3.2, gold balls, 1 keV, 800 frames of 621x621 pixels,
+CC0), every side from one start, through the `ptyrs` module.
 
     python -I compare_cxidb.py prepare RAW OUT [--device 0] [--module DIR]
     python -I compare_cxidb.py dm OUT [--cycles 200] [--device 0] [--module DIR]
@@ -48,12 +48,13 @@ LSQML's and BH's batches in the engine's random_batches order, with compare_gpu_
 figures; every state's LLK is the CPU f64 Ptycho.llk. pty-chi shifts by PATCH at the engine's
 integer view corners, the positions the engine reconstructs on, so its FULL_OBJECT model is not
 needed. There is no truth: the figures are side against side.
-raar: GpuPtycho.raar (beta RAAR_BETA, no phase-ramp removal) against PtyPy's CPU f64 RAAR,
-compare_ptypy.py in a child (the checkout --ptypy on its PYTHONPATH, its files in OUT/raar_ptypy,
-its output in OUT/raar_ptypy.log), as examples/ptypy_compare.rs: ptyrs's LLK record of the
-estimate each cycle starts from (the CPU f64 Ptycho.llk for the last) against the CPU f64
-Ptycho.llk of PtyPy's state after each iteration. PtyPy's RAAR is not PyNX's for any beta
-(compare_ptypy.py), so the curves are side by side.
+raar: GpuPtycho.raar (beta RAAR_BETA, no phase-ramp removal: PtyPy has none) against PyNX CUDA
+RAAR with the same settings, the formula the engine follows, with dm's figures, and against
+PtyPy's CPU f64 RAAR, compare_ptypy.py in a child (the checkout --ptypy on its PYTHONPATH, its
+files in OUT/raar_ptypy, its output in OUT/raar_ptypy.log), as examples/ptypy_compare.rs: ptyrs's
+LLK record of the estimate each cycle starts from (the CPU f64 Ptycho.llk for the last) against
+the CPU f64 Ptycho.llk of PtyPy's state after each iteration. PtyPy's RAAR is not PyNX's for any
+beta (compare_ptypy.py), so its curve is side by side.
 
 Exits 1 if the starts differ (the LLK record of the start; pty-chi's start far field and its LLK
 of the start; PtyPy's start, which is init.h5's to the bit), 2 if a side diverges
@@ -277,7 +278,7 @@ def rel_l2(a, b):
 
 
 def pynx(args):
-    """The PyNX CUDA side of `dm` or `ml` in this process; writes OUT/<algo>_pynx*.h5."""
+    """The PyNX CUDA side of `dm`, `ml` or `raar` in this process; writes OUT/<algo>_pynx*.h5."""
     pm = sibling("ptyrs/scripts/engine", "compare_pynx_ml")
     cuop = pm.cuop
     tag = ""
@@ -290,7 +291,8 @@ def pynx(args):
         start = read_modes(f"{args.out}/init_ml.h5")
     build = (data.iobs(), (data.x, data.y), data.distance, data.pixel, data.wavelength, *start)
     ml = lambda: cuop.ML(update_object=True, update_probe=True, calc_llk=1)
-    runs = {"dm": [("pynx", lambda: cuop.DM(calc_llk=1), None)],
+    raar = lambda: cuop.RAAR(beta=RAAR_BETA, calc_llk=1, zero_phase_ramp=False)
+    runs = {"dm": [("pynx", lambda: cuop.DM(calc_llk=1), None)], "raar": [("pynx", raar, None)],
             "ml": [(f"pynx_stock{tag}", ml, True), (f"pynx_nohann{tag}", ml, False)]}[args.algo]
     if args.algo == "ml":
         # set_hann needs the processing unit, which a throwaway run sets up (compare_pynx_ml)
@@ -602,9 +604,10 @@ def ptypy_state(path, start, pixel):
 
 
 def run_raar(args):
-    """`raar`: GpuPtycho against PtyPy's CPU f64 RAAR from one start."""
+    """`raar`: GpuPtycho against PyNX CUDA RAAR and PtyPy's CPU f64 RAAR from one start."""
     import time
 
+    import h5py
     sys.path.insert(0, args.module)
     import ptyrs
     m3ref = sibling("refs/ptychi", "m3ref")
@@ -622,6 +625,9 @@ def run_raar(args):
     ours = np.vstack([history(gpu, n), [last[k] for k in KEYS]])
     del gpu
     write_modes(f"{args.out}/raar_ptyrs.h5", go, gp, llk=ours)
+    run_pynx(args, "raar")
+    with h5py.File(f"{args.out}/raar_pynx.h5", "r") as f:
+        sides = {"pynx": (f["llk"][()], f["object"][()], f["probe"][()])}
 
     d = f"{args.out}/raar_ptypy"
     os.makedirs(d, exist_ok=True)
@@ -657,17 +663,24 @@ def run_raar(args):
         theirs.append([l[k] for k in KEYS])
     theirs = np.array(theirs)
     write_modes(f"{args.out}/raar_ptypy.h5", o, p, llk=theirs)
+    sides["ptypy"] = theirs, o, p
     print("ptyrs: the GPU's record of the estimate each cycle starts from, the CPU f64 llk of "
-          "the last; PtyPy: the CPU f64 llk of its state after each iteration")
-    start = compare("PtyPy", ours, theirs)
-    (eo, ko), (ep, kp) = rel_l2(go, o), rel_l2(gp, p)
-    print(f"  final object rel L2 {eo:.3e} (scale {ko:.6f})  probe rel L2 {ep:.3e} "
-          f"(scale {kp:.6f})")
-    print(f"FRC of the final objects ({load_avg()}):")
-    frc(args.out, centres_region(data), "raar_ptyrs", "raar_ptypy")
+          "the last; PyNX: its record of the same; PtyPy: the CPU f64 llk of its state after "
+          "each iteration")
+    starts = []
+    for side, (llk, o, p) in sides.items():
+        starts.append(compare(side, ours[:len(llk)], llk))
+        (eo, ko), (ep, kp) = rel_l2(go, o), rel_l2(gp, p)
+        print(f"  final object rel L2 {eo:.3e} (scale {ko:.6f})  probe rel L2 {ep:.3e} "
+              f"(scale {kp:.6f})")
+    print(f"FRC of the final objects, ptyrs against each ({load_avg()}):")
+    region = centres_region(data)
+    for side in sides:
+        frc(args.out, region, "raar_ptyrs", f"raar_{side}")
     col = KEYS.index("gaussian")
-    m3ref.exit_unless_converging({"ptyrs": ours[:, col], "PtyPy": theirs[:, col]})
-    return same and start <= START_RTOL
+    m3ref.exit_unless_converging(
+        {"ptyrs": ours[:, col], **{side: v[0][:, col] for side, v in sides.items()}})
+    return same and max(starts) <= START_RTOL
 
 
 def main():
@@ -693,9 +706,10 @@ def main():
     q.add_argument("out")
     q.add_argument("--cycles", type=int, default=200)
     q.add_argument("--ptypy", default=os.path.expanduser("~/work/ptycho/ptypy"))
+    q.set_defaults(fix_gamma=False)
     q = sub.add_parser("pynx")
     q.add_argument("out")
-    q.add_argument("algo", choices=("dm", "ml"))
+    q.add_argument("algo", choices=("dm", "ml", "raar"))
     q.add_argument("--cycles", type=int, required=True)
     q.add_argument("--fix-gamma", action="store_true")
     for q in sub.choices.values():
