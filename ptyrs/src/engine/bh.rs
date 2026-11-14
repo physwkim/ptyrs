@@ -19,8 +19,8 @@ use crate::base::{AddrTable, C64, Object, Probe, Stack, View};
 use crate::engine::features::{POSITION_STEP, move_derivative, move_planes};
 use crate::engine::linop::FarJacobian;
 use crate::engine::{
-    EngineError, Features, Fft2, LinearOp, Observed, Optics, ProbeVariation, Sampling,
-    SliceJacobian, SliceWaves, random_batches,
+    EngineError, Features, Fft2, Observed, Optics, ProbeVariation, Sampling, SliceJacobian,
+    SliceWaves, random_batches,
 };
 
 /// pty-chi's offset on the modelled amplitude `A` in the residual and the Hessian.
@@ -294,13 +294,12 @@ impl<'a> BhBatch<'a> {
     /// where the last slice's phase moves with them ([`SliceWaves::phase_derivative`]),
     /// `Re⟨2·td, U·∂_a q/q·psi⟩`. Under [`Sampling::FullObject`] the offsets' is instead
     /// `Σ_s Σ_k Re⟨G_s,k, ∂_a S(O_s)_k⟩` over frame `b`'s views `k`, `G_s` that adjoint onto
-    /// what the views read of slice `s` (`SliceWaves::window_adjoint`).
+    /// what the views read of slice `s` (`SliceWaves::window_adjoint`), placed onto the slice
+    /// for its gradient.
     pub fn grads(&self) -> BhVector {
-        let op = self.jacobian();
         let y: Vec<C64> = self.td.iter().map(|t| 2.0 * t).collect();
-        let mut x = vec![C64::default(); op.domain_len()];
-        op.adjoint(&y, &mut x);
-        let copies = x.split_off(self.split());
+        let (windows, copies) = self.jacobian().window_adjoint(&y);
+        let copies = copies.as_slice();
         let block = self.probe_dims.iter().product::<usize>();
         let mut d: Vec<[f64; 2]> = match &self.position {
             Some(Position::Probe(m)) => (copies.chunks_exact(block).enumerate())
@@ -309,12 +308,9 @@ impl<'a> BhBatch<'a> {
             Some(Position::Object { first, .. }) => {
                 let n = self.probe_dims[1] * self.probe_dims[2];
                 let mut d = vec![[0.0; 2]; self.copy_dims[0] / self.probe_dims[0]];
-                let mut near = y.clone();
-                self.optics.exit().adjoint(&mut near);
-                for (s, chi) in self.waves.back_propagate(&near).iter().enumerate() {
-                    let g = self.waves.window_adjoint(s, chi);
+                for (g, first) in windows.iter().zip(first) {
                     for (k, g) in g.as_slice().chunks_exact(n).enumerate() {
-                        for (a, first) in first[s].iter().enumerate() {
+                        for (a, first) in first.iter().enumerate() {
                             d[k / self.nmode][a] += dot(g, first.plane(k));
                         }
                     }
@@ -335,6 +331,9 @@ impl<'a> BhBatch<'a> {
                 d[a] += dot(y, t);
             }
         }
+        let mut x: Vec<C64> = (windows.into_iter())
+            .flat_map(|g| self.waves.place(g).into_vec())
+            .collect();
         let mut probe = vec![C64::default(); block];
         for (b, g) in copies.chunks_exact(block).enumerate() {
             let g = self.moved(g, &[], -1.0, b);
