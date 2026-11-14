@@ -199,7 +199,7 @@ impl Dip {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use crate::base::{C64, Geometry, Object, Probe, Scan, Stack, required_obj_shape, sim};
     use crate::engine::{GpuOptions, GpuPtycho, Ptycho};
     use burn::module::{ModuleMapper, ModuleVisitor, Param};
@@ -434,7 +434,7 @@ mod tests {
     }
 
     /// Casts every float tensor to f64, keeping which ones take a gradient.
-    struct ToF64;
+    pub(crate) struct ToF64;
 
     impl ModuleMapper for ToF64 {
         fn map_float<const D: usize>(&mut self, param: Param<Tensor<D>>) -> Param<Tensor<D>> {
