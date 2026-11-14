@@ -63,7 +63,7 @@ pub use ops::{
 pub use optics::{ExitPass, ExitStage, OpticsKernels, SlicePhase, SliceSource};
 pub use position::{PositionKernels, PositionRule, Positions, Solve};
 pub use psi::{HalfWaves, Waves, half_scale};
-pub use ring::{Ended, LlkRing, LlkTotals, RecordWriter, RingDevice, RingError};
+pub use ring::{Ended, FrameLlk, LlkRing, LlkTotals, RecordWriter, RingDevice, RingError};
 pub use rpie::{POWER_CHUNK, PowerMax, RpieKernels, Weight};
 
 /// The linked device code: every `ptyrs-kernels` kernel plus the cuFFT functions they call.

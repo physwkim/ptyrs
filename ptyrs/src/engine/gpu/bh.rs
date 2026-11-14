@@ -4,16 +4,16 @@
 
 use std::sync::Arc;
 
-use crate::fft::Plan2d;
 use crate::gpu::{
-    BhBatch, BhDisp, BhFieldsRef, BhKernels, BhMovedFarRef, BhMovesRef, BhNearMut, BhOffsets,
-    BhPositions, BhScan, BhVar, C32, EpochOrder, Error as GpuError, ExitStage, FusedInputs,
-    Kernels, Model, PsiSums, SpectrumBuf, StackRef, ViewDims,
+    BhBatch, BhDisp, BhFieldsRef, BhMovedFarRef, BhMovesRef, BhNearMut, BhOffsets, BhPositions,
+    BhScan, BhVar, C32, EpochOrder, Error as GpuError, FusedInputs, Kernels, Model, PsiSums,
+    SpectrumBuf, ViewDims,
 };
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaStream, DeviceBuffer};
 
 use super::device::{BhBufs, Moved, MovedBatch, MovedLent, PassesMut, moved_inputs, moved_shift};
+use super::propagate::Propagate;
 use super::{Bufs, GpuPtycho};
 use crate::engine::features::POSITION_STEP;
 use crate::engine::ptycho::{Algorithm, llk_due};
@@ -111,62 +111,6 @@ impl BhMoved {
             },
         };
         (&mut self.probes, own)
-    }
-}
-
-/// The propagator `F V` of an [`ExitStage`] on a stack's whole planes, through the stack's
-/// plan and at the far field's norm, `√(ny nx)` times a unitary.
-#[derive(Clone, Copy)]
-struct Propagate<'a> {
-    kernels: &'a BhKernels,
-    stage: &'a ExitStage,
-    dims: ViewDims,
-}
-
-impl Propagate<'_> {
-    /// `buf` to the detector plane.
-    fn forward(
-        &self,
-        ctx: &ExecutionContext,
-        plan: &mut Plan2d,
-        stack: StackRef<'_>,
-        buf: &mut DeviceBuffer<C32>,
-    ) -> Result<(), GpuError> {
-        self.run(ctx, plan, stack, buf, false)
-    }
-
-    /// The adjoint of [`Self::forward`].
-    fn adjoint(
-        &self,
-        ctx: &ExecutionContext,
-        plan: &mut Plan2d,
-        stack: StackRef<'_>,
-        buf: &mut DeviceBuffer<C32>,
-    ) -> Result<(), GpuError> {
-        self.run(ctx, plan, stack, buf, true)
-    }
-
-    fn run(
-        &self,
-        ctx: &ExecutionContext,
-        plan: &mut Plan2d,
-        stack: StackRef<'_>,
-        buf: &mut DeviceBuffer<C32>,
-        adjoint: bool,
-    ) -> Result<(), GpuError> {
-        match self.stage {
-            // The reversal after a forward transform is the unnormalized inverse.
-            ExitStage::None if !adjoint => plan.forward_inplace(ctx, buf)?,
-            ExitStage::Reverse if adjoint => plan.forward_inplace(ctx, buf)?,
-            ExitStage::None | ExitStage::Reverse => plan.inverse_inplace(ctx, buf)?,
-            ExitStage::Transfer(tf) => {
-                plan.forward_inplace(ctx, buf)?;
-                self.kernels
-                    .transfer(ctx, &self.dims, stack, tf, buf, adjoint)?;
-                plan.inverse_inplace(ctx, buf)?;
-            }
-        }
-        Ok(())
     }
 }
 

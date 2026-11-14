@@ -489,18 +489,15 @@ fn bits(mask: u32) -> impl Iterator<Item = usize> {
     (0..32).filter(move |r| mask >> r & 1 == 1)
 }
 
-/// [`run_region_uploader`] with one store taking every frame; `ctx` is the
-/// store's.
+/// [`run_region_uploader`] with one store taking every frame.
 pub fn run_uploader(
     ring: Arc<Ring>,
-    ctx: Arc<Context>,
     store: Arc<DeviceStore>,
     pos: Arc<PosTable>,
     cfg: UploaderConfig,
     stop: Arc<AtomicBool>,
     batches: Option<Sender<FrameBatch>>,
 ) -> Result<UploadReport, GrowError> {
-    assert!(Arc::ptr_eq(&ctx, &store.ctx), "the store's context");
     run_region_uploader(ring, vec![store], Whole, pos, cfg, stop, batches)
 }
 
@@ -802,6 +799,7 @@ mod tests {
 
     use super::*;
     use crate::live::pos::Pos;
+    use crate::live::sent::sent;
 
     fn cfg() -> UploaderConfig {
         UploaderConfig {
@@ -869,21 +867,14 @@ mod tests {
 
     fn uploader(
         ring: &Arc<Ring>,
-        ctx: &Arc<Context>,
         store: &Arc<DeviceStore>,
         pos: &Arc<PosTable>,
         cfg: UploaderConfig,
         stop: &Arc<AtomicBool>,
         tx: Option<Sender<FrameBatch>>,
     ) -> std::thread::JoinHandle<Result<UploadReport, GrowError>> {
-        let (ring, ctx, store, pos, stop) = (
-            ring.clone(),
-            ctx.clone(),
-            store.clone(),
-            pos.clone(),
-            stop.clone(),
-        );
-        std::thread::spawn(move || run_uploader(ring, ctx, store, pos, cfg, stop, tx))
+        let (ring, store, pos, stop) = (ring.clone(), store.clone(), pos.clone(), stop.clone());
+        std::thread::spawn(move || run_uploader(ring, store, pos, cfg, stop, tx))
     }
 
     /// Every landed frame against what it was made from: the batches sent, in
@@ -949,7 +940,7 @@ mod tests {
         let pos = Arc::new(PosTable::new(1 << 10));
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, rx) = crossbeam_channel::unbounded();
-        let up = uploader(&ring, &ctx, &store, &pos, cfg(), &stop, Some(tx));
+        let up = uploader(&ring, &store, &pos, cfg(), &stop, Some(tx));
         // Four producers commit out of order.
         std::thread::scope(|sc| {
             for _ in 0..4 {
@@ -977,7 +968,7 @@ mod tests {
         let pos = Arc::new(PosTable::new(64));
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, rx) = crossbeam_channel::unbounded();
-        let up = uploader(&ring, &ctx, &store, &pos, cfg(), &stop, Some(tx));
+        let up = uploader(&ring, &store, &pos, cfg(), &stop, Some(tx));
         // 2 lands at once, 0 holds 1..=5 until its position is in, 4 and 5
         // posted before 3 land behind it.
         post(&pos, 2);
@@ -1026,7 +1017,7 @@ mod tests {
             pos_wait_ns: 2_000_000,
             ..cfg()
         };
-        let up = uploader(&ring, &ctx, &store, &pos, cfg, &stop, Some(tx));
+        let up = uploader(&ring, &store, &pos, cfg, &stop, Some(tx));
         for &uid in &landed {
             post(&pos, uid);
         }
@@ -1054,7 +1045,7 @@ mod tests {
         let pos = Arc::new(PosTable::new(64));
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, rx) = crossbeam_channel::unbounded();
-        let up = uploader(&ring, &ctx, &store, &pos, cfg(), &stop, Some(tx));
+        let up = uploader(&ring, &store, &pos, cfg(), &stop, Some(tx));
         for uid in 1..4 {
             post(&pos, uid);
         }
@@ -1092,7 +1083,7 @@ mod tests {
             pos_wait_ns: 3_600_000_000_000,
             ..cfg()
         };
-        let up = uploader(&ring, &ctx, &store, &pos, cfg, &stop, Some(tx));
+        let up = uploader(&ring, &store, &pos, cfg, &stop, Some(tx));
         for &uid in &landed {
             post(&pos, uid);
         }
@@ -1251,7 +1242,8 @@ mod tests {
         );
         // SAFETY: the gate lives until the end of the test.
         unsafe { gate.as_mut_ptr().write_volatile(1) };
-        assert_eq!(rx.recv().unwrap().n, 1);
+        let (batch, up) = sent(&rx, up);
+        assert_eq!(batch.n, 1);
         assert_eq!(ring.released.load(Ordering::Acquire), 1);
         stop.store(true, Ordering::Release);
         let rep = up.join().unwrap().unwrap();
@@ -1269,7 +1261,7 @@ mod tests {
         let store = Arc::new(DeviceStore::new(&ctx, 32, se).unwrap());
         let pos = Arc::new(PosTable::new(64));
         let stop = Arc::new(AtomicBool::new(false));
-        let up = uploader(&ring, &ctx, &store, &pos, cfg(), &stop, None);
+        let up = uploader(&ring, &store, &pos, cfg(), &stop, None);
         drop(store);
         produce(&ring, &pos, 33);
         stop.store(true, Ordering::Release);

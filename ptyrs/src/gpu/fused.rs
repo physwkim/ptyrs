@@ -581,6 +581,23 @@ struct Carried<'a> {
 }
 
 impl<'a> Carried<'a> {
+    /// Refuses `psi` and `iterate` in different formats: one build of a kernel reads both.
+    fn new(psi: Option<&'a dyn Waves>, iterate: Option<&'a dyn Waves>) -> Result<Self, Error> {
+        if let (Some(psi), Some(iterate)) = (psi, iterate)
+            && psi.half() != iterate.half()
+        {
+            return Err(Error::Shape(
+                "psi and the RAAR iterate must be in one format, f32 or f16".into(),
+            ));
+        }
+        Ok(Self { psi, iterate })
+    }
+
+    /// Whether the sets are f16: the build of the forward row pass that reads them.
+    fn half(&self) -> bool {
+        self.psi.is_some_and(|w| w.half())
+    }
+
     /// What the forward row pass under `flags` reads of the sets, then what it writes.
     fn fwd_access(&self, flags: u32) -> (Vec<&'a RawDeviceBuffer>, Vec<&'a RawDeviceBuffer>) {
         let on = |b: Option<&'a dyn Waves>, set: bool| b.filter(|_| set).map(|b| b.raw());
@@ -654,7 +671,7 @@ impl Kernels {
                 )
             }
         };
-        let carried = Carried { psi, iterate };
+        let carried = Carried::new(psi, iterate)?;
         for (name, b) in [("psi", psi), ("iterate", iterate)] {
             if let Some(b) = b {
                 check_waves(name, b, run.g.nf_max as usize * d.nmode as usize * d.n())?;
@@ -1328,29 +1345,22 @@ impl<'a> Run<'a> {
         ];
         reads.extend(sets);
         writes.push(bufs.work.storage());
-        let (ctl, g) = (self.ctl(), self.g);
+        let (ctl, g, half) = (self.ctl(), self.g, carried.half());
         self.k.launch(self.ctx, &reads, &writes, |stream| {
+            let m = &self.k.module;
             // SAFETY: `Run::new` and the caller checked every buffer the flags name;
             // `Views::new` checked the views are canonical and inside the object; the
             // launch is the one `rows_fwd` documents.
             unsafe {
-                match self.sh.nx {
-                    Side::N64 => self
-                        .k
-                        .module
-                        .fused_rows_fwd_64(stream, config, p, ctl, g, cfg),
-                    Side::N128 => self
-                        .k
-                        .module
-                        .fused_rows_fwd_128(stream, config, p, ctl, g, cfg),
-                    Side::N256 => self
-                        .k
-                        .module
-                        .fused_rows_fwd_256(stream, config, p, ctl, g, cfg),
-                    Side::N512 => self
-                        .k
-                        .module
-                        .fused_rows_fwd_512(stream, config, p, ctl, g, cfg),
+                match (self.sh.nx, half) {
+                    (Side::N64, false) => m.fused_rows_fwd_64(stream, config, p, ctl, g, cfg),
+                    (Side::N128, false) => m.fused_rows_fwd_128(stream, config, p, ctl, g, cfg),
+                    (Side::N256, false) => m.fused_rows_fwd_256(stream, config, p, ctl, g, cfg),
+                    (Side::N512, false) => m.fused_rows_fwd_512(stream, config, p, ctl, g, cfg),
+                    (Side::N64, true) => m.fused_rows_fwd_f16_64(stream, config, p, ctl, g, cfg),
+                    (Side::N128, true) => m.fused_rows_fwd_f16_128(stream, config, p, ctl, g, cfg),
+                    (Side::N256, true) => m.fused_rows_fwd_f16_256(stream, config, p, ctl, g, cfg),
+                    (Side::N512, true) => m.fused_rows_fwd_f16_512(stream, config, p, ctl, g, cfg),
                 }
             }
         })
@@ -1487,27 +1497,21 @@ impl<'a> Run<'a> {
             reads.push(self.inputs.obj.storage());
             reads.push(self.inputs.probe.storage());
         }
+        let half = psi.is_some_and(|w| w.half());
         let (ctl, g) = (self.ctl(), self.g);
         self.k.launch(self.ctx, &reads, &writes, |stream| {
+            let m = &self.k.module;
             // SAFETY: as in `rows_fwd`; the launch is the one `rows_inv` documents.
             unsafe {
-                match self.sh.nx {
-                    Side::N64 => self
-                        .k
-                        .module
-                        .fused_rows_inv_64(stream, config, p, ctl, g, cfg),
-                    Side::N128 => self
-                        .k
-                        .module
-                        .fused_rows_inv_128(stream, config, p, ctl, g, cfg),
-                    Side::N256 => self
-                        .k
-                        .module
-                        .fused_rows_inv_256(stream, config, p, ctl, g, cfg),
-                    Side::N512 => self
-                        .k
-                        .module
-                        .fused_rows_inv_512(stream, config, p, ctl, g, cfg),
+                match (self.sh.nx, half) {
+                    (Side::N64, false) => m.fused_rows_inv_64(stream, config, p, ctl, g, cfg),
+                    (Side::N128, false) => m.fused_rows_inv_128(stream, config, p, ctl, g, cfg),
+                    (Side::N256, false) => m.fused_rows_inv_256(stream, config, p, ctl, g, cfg),
+                    (Side::N512, false) => m.fused_rows_inv_512(stream, config, p, ctl, g, cfg),
+                    (Side::N64, true) => m.fused_rows_inv_f16_64(stream, config, p, ctl, g, cfg),
+                    (Side::N128, true) => m.fused_rows_inv_f16_128(stream, config, p, ctl, g, cfg),
+                    (Side::N256, true) => m.fused_rows_inv_f16_256(stream, config, p, ctl, g, cfg),
+                    (Side::N512, true) => m.fused_rows_inv_f16_512(stream, config, p, ctl, g, cfg),
                 }
             }
         })
@@ -1542,9 +1546,12 @@ impl<'a> Run<'a> {
             // `probe_q` and `probe_power` checked with the rest of `bufs`; the tile lists
             // were built from these views.
             unsafe {
-                self.k
-                    .module
-                    .fused_gather(stream, config, p, tiles, sums.ptrs(), ctl, g, cfg)
+                let (m, sums) = (&self.k.module, sums.ptrs());
+                if waves.half() {
+                    m.fused_gather_f16(stream, config, p, tiles, sums, ctl, g, cfg)
+                } else {
+                    m.fused_gather(stream, config, p, tiles, sums, ctl, g, cfg)
+                }
             }
         })
     }
@@ -1623,29 +1630,36 @@ impl<'a> Run<'a> {
         ];
         reads.extend(sets);
         writes.push(work.storage());
-        let (ctl, g) = (self.ctl(), self.g);
+        let (ctl, g, half) = (self.ctl(), self.g, carried.half());
         self.k.launch(self.ctx, &reads, &writes, |stream| {
+            let m = &self.k.module;
             // SAFETY: as in `rows_fwd`, with the callers checking `t` and `work`, and
             // `shift_pre` wrote `T` of this stack into `t`; the launch is the one
             // `shift_rows_fwd` documents.
             unsafe {
-                match self.sh.nx {
-                    Side::N64 => self
-                        .k
-                        .module
-                        .fused_shift_rows_fwd_64(stream, config, p, ctl, g, cfg),
-                    Side::N128 => self
-                        .k
-                        .module
-                        .fused_shift_rows_fwd_128(stream, config, p, ctl, g, cfg),
-                    Side::N256 => self
-                        .k
-                        .module
-                        .fused_shift_rows_fwd_256(stream, config, p, ctl, g, cfg),
-                    Side::N512 => self
-                        .k
-                        .module
-                        .fused_shift_rows_fwd_512(stream, config, p, ctl, g, cfg),
+                match (self.sh.nx, half) {
+                    (Side::N64, false) => m.fused_shift_rows_fwd_64(stream, config, p, ctl, g, cfg),
+                    (Side::N128, false) => {
+                        m.fused_shift_rows_fwd_128(stream, config, p, ctl, g, cfg)
+                    }
+                    (Side::N256, false) => {
+                        m.fused_shift_rows_fwd_256(stream, config, p, ctl, g, cfg)
+                    }
+                    (Side::N512, false) => {
+                        m.fused_shift_rows_fwd_512(stream, config, p, ctl, g, cfg)
+                    }
+                    (Side::N64, true) => {
+                        m.fused_shift_rows_fwd_f16_64(stream, config, p, ctl, g, cfg)
+                    }
+                    (Side::N128, true) => {
+                        m.fused_shift_rows_fwd_f16_128(stream, config, p, ctl, g, cfg)
+                    }
+                    (Side::N256, true) => {
+                        m.fused_shift_rows_fwd_f16_256(stream, config, p, ctl, g, cfg)
+                    }
+                    (Side::N512, true) => {
+                        m.fused_shift_rows_fwd_f16_512(stream, config, p, ctl, g, cfg)
+                    }
                 }
             }
         })
@@ -1689,29 +1703,37 @@ impl<'a> Run<'a> {
         if f & FUSED_SHIFT_POSITION != 0 {
             writes.push(s.grad_groups.storage());
         }
+        let half = psi.is_some_and(|w| w.half());
         let (ctl, g) = (self.ctl(), self.g);
         self.k.launch(self.ctx, &reads, &writes, |stream| {
+            let m = &self.k.module;
             // SAFETY: as in `rows_inv`, and `shift_pre` wrote `T` (and `T_y` under
             // `FUSED_SHIFT_DEN` or `FUSED_SHIFT_POSITION`) of this stack; the launch is the
             // one `shift_rows_inv` documents.
             unsafe {
-                match self.sh.nx {
-                    Side::N64 => self
-                        .k
-                        .module
-                        .fused_shift_rows_inv_64(stream, config, p, ctl, g, cfg),
-                    Side::N128 => self
-                        .k
-                        .module
-                        .fused_shift_rows_inv_128(stream, config, p, ctl, g, cfg),
-                    Side::N256 => self
-                        .k
-                        .module
-                        .fused_shift_rows_inv_256(stream, config, p, ctl, g, cfg),
-                    Side::N512 => self
-                        .k
-                        .module
-                        .fused_shift_rows_inv_512(stream, config, p, ctl, g, cfg),
+                match (self.sh.nx, half) {
+                    (Side::N64, false) => m.fused_shift_rows_inv_64(stream, config, p, ctl, g, cfg),
+                    (Side::N128, false) => {
+                        m.fused_shift_rows_inv_128(stream, config, p, ctl, g, cfg)
+                    }
+                    (Side::N256, false) => {
+                        m.fused_shift_rows_inv_256(stream, config, p, ctl, g, cfg)
+                    }
+                    (Side::N512, false) => {
+                        m.fused_shift_rows_inv_512(stream, config, p, ctl, g, cfg)
+                    }
+                    (Side::N64, true) => {
+                        m.fused_shift_rows_inv_f16_64(stream, config, p, ctl, g, cfg)
+                    }
+                    (Side::N128, true) => {
+                        m.fused_shift_rows_inv_f16_128(stream, config, p, ctl, g, cfg)
+                    }
+                    (Side::N256, true) => {
+                        m.fused_shift_rows_inv_f16_256(stream, config, p, ctl, g, cfg)
+                    }
+                    (Side::N512, true) => {
+                        m.fused_shift_rows_inv_f16_512(stream, config, p, ctl, g, cfg)
+                    }
                 }
             }
         })
@@ -1760,11 +1782,21 @@ impl<'a> Run<'a> {
             // SAFETY: as in `shift_rows_inv`, with `psi` checked to hold the stack's waves;
             // the launch is the one `shift_sums` documents.
             unsafe {
-                match self.sh.nx {
-                    Side::N64 => m.fused_shift_sums_64(stream, config, p, ctl, g, cfg),
-                    Side::N128 => m.fused_shift_sums_128(stream, config, p, ctl, g, cfg),
-                    Side::N256 => m.fused_shift_sums_256(stream, config, p, ctl, g, cfg),
-                    Side::N512 => m.fused_shift_sums_512(stream, config, p, ctl, g, cfg),
+                match (self.sh.nx, psi.half()) {
+                    (Side::N64, false) => m.fused_shift_sums_64(stream, config, p, ctl, g, cfg),
+                    (Side::N128, false) => m.fused_shift_sums_128(stream, config, p, ctl, g, cfg),
+                    (Side::N256, false) => m.fused_shift_sums_256(stream, config, p, ctl, g, cfg),
+                    (Side::N512, false) => m.fused_shift_sums_512(stream, config, p, ctl, g, cfg),
+                    (Side::N64, true) => m.fused_shift_sums_f16_64(stream, config, p, ctl, g, cfg),
+                    (Side::N128, true) => {
+                        m.fused_shift_sums_f16_128(stream, config, p, ctl, g, cfg)
+                    }
+                    (Side::N256, true) => {
+                        m.fused_shift_sums_f16_256(stream, config, p, ctl, g, cfg)
+                    }
+                    (Side::N512, true) => {
+                        m.fused_shift_sums_f16_512(stream, config, p, ctl, g, cfg)
+                    }
                 }
             }
         })

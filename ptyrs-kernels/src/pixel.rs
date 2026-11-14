@@ -357,15 +357,16 @@ pub unsafe fn store_c(p: *mut f32, i: usize, v: (f32, f32)) {
     unsafe { *p.cast::<F2>().add(i) = F2(v.0, v.1) };
 }
 
-/// A stack's exit waves as DM and RAAR carry them between cycles: interleaved complex `f32`
-/// at `ptr`, or under `half != 0` one packed `f16x2` per value (real part in the low half)
+/// A stack's exit waves as DM and RAAR carry them between cycles, in the format the
+/// kernel reading them is built for (`HALF` of [`load_psi`] and [`store_psi`]): interleaved
+/// complex `f32` at `ptr`, or one packed `f16x2` per value (real part in the low half)
 /// holding the value times `scale`. `scale` is a power of two and `unscale` its exact
-/// inverse, so the format adds f16 rounding of the value and nothing else.
+/// inverse, so the f16 format adds f16 rounding of the value and nothing else; an `f32`
+/// build reads neither.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PsiPtr {
     pub ptr: *mut f32,
-    pub half: u32,
     pub scale: f32,
     pub unscale: f32,
 }
@@ -390,20 +391,21 @@ pub fn half_to_f32(h: u32) -> f32 {
 pub fn psi_f32(ptr: *mut f32) -> PsiPtr {
     PsiPtr {
         ptr,
-        half: 0,
         scale: 1.0,
         unscale: 1.0,
     }
 }
 
-/// Complex value `i` of the waves `w`.
+/// Complex value `i` of the waves `w`, f16 pairs under `HALF`. The format is the build's,
+/// not the launch's: a switch at run time costs the `f32` kernels that store waves 1 to 7%.
 ///
 /// # Safety
 ///
-/// `w.ptr` must hold `i + 1` values of the format `w` names, 8-byte aligned.
+/// `w.ptr` must hold `i + 1` values of the format `HALF` names, 8-byte aligned (4-byte
+/// under `HALF`).
 #[device]
-pub unsafe fn load_psi(w: PsiPtr, i: usize) -> (f32, f32) {
-    if w.half != 0 {
+pub unsafe fn load_psi<const HALF: bool>(w: PsiPtr, i: usize) -> (f32, f32) {
+    if HALF {
         let packed = unsafe { *w.ptr.cast::<u32>().add(i) };
         let (re, im) = (half_to_f32(packed & 0xffff), half_to_f32(packed >> 16));
         (re * w.unscale, im * w.unscale)
@@ -416,8 +418,8 @@ pub unsafe fn load_psi(w: PsiPtr, i: usize) -> (f32, f32) {
 ///
 /// As [`load_psi`].
 #[device]
-pub unsafe fn store_psi(w: PsiPtr, i: usize, v: (f32, f32)) {
-    if w.half != 0 {
+pub unsafe fn store_psi<const HALF: bool>(w: PsiPtr, i: usize, v: (f32, f32)) {
+    if HALF {
         let packed = cvt_f16x2_f32(v.0 * w.scale, v.1 * w.scale);
         unsafe { *w.ptr.cast::<u32>().add(i) = packed };
     } else {
