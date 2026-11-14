@@ -16,8 +16,8 @@
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{DeviceBuffer, LaunchConfig};
 use ptyrs_kernels::optics::{
-    SLICE_CONJ, SLICE_MOVED, STAGE_COLS, STAGE_CONJ, STAGE_MUL, STAGE_POST_FWD, STAGE_POST_INV,
-    STAGE_PRE_FWD, STAGE_PRE_INV, optics_kernels,
+    SLICE_CONJ, SLICE_OFFSET, SLICE_PROBE, STAGE_COLS, STAGE_CONJ, STAGE_MUL, STAGE_POST_FWD,
+    STAGE_POST_INV, STAGE_PRE_FWD, STAGE_PRE_INV, optics_kernels,
 };
 
 use crate::gpu::fused::Side;
@@ -227,17 +227,17 @@ impl OpticsKernels {
         let len = g.nf_max as usize * d.nmode as usize * d.n();
         check_len("obj", obj, d.obj_len())?;
         check_len("dst", dst, len)?;
-        let (src, moved) = match src {
+        let (src, probe) = match src {
             SliceSource::Probe(p) => {
                 check_len("probe", p, d.nprobe as usize * d.n())?;
-                (p, SLICE_MOVED)
+                (p, SLICE_PROBE)
             }
             SliceSource::Waves(w) => {
                 check_len("waves", w, len)?;
                 (w, 0)
             }
         };
-        let flags = moved | conj;
+        let flags = probe | conj;
         let config = grid_1d(len)?;
         let reads = [
             src.storage(),
@@ -279,15 +279,15 @@ impl OpticsKernels {
         let len = g.nf_max as usize * d.nmode as usize * d.n();
         check_len("waves", waves, len)?;
         let mut reads = vec![stack.storage()];
-        let (at, moved) = match phase.offsets {
+        let (at, offset) = match phase.offsets {
             Some(o) => {
                 check_len("offsets", o, 2 * d.nframe as usize)?;
                 reads.push(o.storage());
-                (dptr::<f32, f32>(o).cast_const(), SLICE_MOVED)
+                (dptr::<f32, f32>(o).cast_const(), SLICE_OFFSET)
             }
             None => (std::ptr::null(), 0),
         };
-        let flags = moved | if adjoint { SLICE_CONJ } else { 0 };
+        let flags = offset | if adjoint { SLICE_CONJ } else { 0 };
         let config = grid_1d(len)?;
         let (m, ctl, quad) = (&self.module, stack.ctl() as *const StackCtl, phase.quad);
         self.base.launch(ctx, &reads, &[waves.storage()], |stream| {
