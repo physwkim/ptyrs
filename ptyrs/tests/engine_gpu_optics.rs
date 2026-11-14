@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use cuda_core::CudaContext;
 use ptyrs::base::{Geometry, Scan};
-use ptyrs::engine::{ApParams, GpuOptions, GpuPtycho};
+use ptyrs::engine::{GpuOptions, GpuPtycho};
 
 use ptyrs::base::{AddrTable, C64, Counts, Object, Probe, Stack, required_obj_shape};
 use ptyrs::engine::{
@@ -420,10 +420,9 @@ fn gpu_lsqml_matches_cpu_under_every_propagator() {
     }
 }
 
-/// Optics the GPU has no form for fail when the engine is built, naming the cause; a
-/// propagator with a plane stage fails every pass that does not run it, changing nothing.
+/// Optics the GPU has no form for fail when the engine is built, naming the cause.
 #[test]
-fn gpu_refuses_optics_and_passes_it_cannot_run() {
+fn gpu_refuses_optics_it_cannot_run() {
     let all = cases();
     let [c, slices] = ["angular spectrum", "three slices"]
         .map(|name| all.iter().find(|c| c.name == name).unwrap());
@@ -451,19 +450,4 @@ fn gpu_refuses_optics_and_passes_it_cannot_run() {
         (got.poisson - want).abs() < 1e-5 * want,
         "{got:?} vs {want:e}"
     );
-
-    let mut gpu = c.gpu(&c.optics, OPTIONS).unwrap();
-    let before = gpu.object().unwrap();
-    let moved = Features {
-        position: Some(vec![[0.0; 2]; c.addr.nframe()]),
-        ..Features::default()
-    };
-    gpu.set_features(&moved).unwrap();
-    let e = gpu.ap(&ApParams::default(), 1).unwrap_err().to_string();
-    assert!(
-        e.contains("Ap with a position runs no propagator with a plane stage"),
-        "{e}"
-    );
-    assert_eq!(gpu.object().unwrap().as_slice(), before.as_slice());
-    assert!(gpu.history().is_empty());
 }

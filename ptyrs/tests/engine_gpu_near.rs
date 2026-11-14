@@ -186,24 +186,34 @@ const PROJECTIONS: [Projections; 3] = [
     ),
 ];
 
-/// AP, DM and RAAR under each propagator against the CPU's at fixed positions, plain and
-/// stepping a scale and a background, eagerly and from graphs: each recorded LLK, and the
-/// object, the probe and the features after the last cycle.
+/// AP, DM and RAAR under each propagator against the CPU's, plain, stepping a scale and a
+/// background, and refining drawn offsets, eagerly and from graphs: each recorded LLK, and
+/// the object, the probe, the scale and background, and the offsets (over the largest) after
+/// the last cycle.
 #[test]
 fn projections_match_cpu_under_every_propagator() {
     const NCYCLE: usize = 8;
-    // Measured worst: LLK 6.7e-6, object 1.6e-6, probe 1.5e-6, features 1.7e-5.
-    const TOL: [f64; 4] = [4e-5, 1e-5, 1e-5, 1e-4];
+    // Measured worst: LLK 6.7e-6, object 1.6e-6, probe 2.3e-6, features 1.7e-5, offsets
+    // 7.3e-7.
+    const TOL: [f64; 5] = [4e-5, 1e-5, 1.5e-5, 1e-4, 4e-6];
     let stepped = |frame: usize| Features {
         scale: Some(vec![1.0; NPOS]),
         background: Some(vec![1.0; frame * frame]),
         position: None,
     };
+    let moved = Features {
+        position: Some(drawn_offsets()),
+        ..Features::default()
+    };
     for c in cases() {
         let [_, ny, _] = c.scan.counts.dims();
         let stepped = stepped(ny);
         for (name, on_cpu, on_gpu) in PROJECTIONS {
-            for features in [None, Some(&stepped)] {
+            for (label, features) in [
+                ("none", None),
+                ("stepped", Some(&stepped)),
+                ("moved", Some(&moved)),
+            ] {
                 let (object, probe) = (c.object.clone(), c.probe.clone());
                 let mut cpu = Ptycho::with_optics(&c.scan, c.optics(), object, probe).unwrap();
                 if let Some(f) = features {
@@ -213,11 +223,7 @@ fn projections_match_cpu_under_every_propagator() {
                 let want: Vec<f64> = cpu.history().iter().map(|r| r.llk.poisson).collect();
                 assert_eq!(want.len(), NCYCLE);
                 for graph in [false, true] {
-                    let what = format!(
-                        "{name} {} features {} graph {graph}",
-                        c.name,
-                        features.is_some()
-                    );
+                    let what = format!("{name} {} features {label} graph {graph}", c.name);
                     let mut gpu = c.gpu(graph);
                     if let Some(f) = features {
                         gpu.set_features(f).unwrap();
@@ -226,34 +232,39 @@ fn projections_match_cpu_under_every_propagator() {
                     let got: Vec<f64> = gpu.history().iter().map(|r| r.llk.poisson).collect();
                     assert_eq!(got.len(), NCYCLE, "{what}");
                     let (gf, cf) = (gpu.features().unwrap(), cpu.features());
-                    let flat = |f: &Features| -> Vec<f64> {
+                    let scaled = |f: &Features| -> Vec<f64> {
                         let (s, b) = (f.scale.iter().flatten(), f.background.iter().flatten());
                         s.chain(b).copied().collect()
                     };
-                    let (gf, cf) = (flat(&gf), flat(cf));
-                    assert_eq!(gf.len(), cf.len(), "{what}");
+                    let moved = |f: &Features| -> Vec<f64> {
+                        f.position.iter().flatten().flatten().copied().collect()
+                    };
+                    let worst = |g: Vec<f64>, w: Vec<f64>| match w.is_empty() {
+                        true => 0.0,
+                        false => {
+                            assert_eq!(g.len(), w.len(), "{what}");
+                            worst_of(g.iter().zip(&w).map(|(g, w)| (g - w).abs()))
+                                / worst_of(w.iter().map(|w| w.abs()))
+                        }
+                    };
                     let errs = [
                         worst_of(got.iter().zip(&want).map(|(g, w)| (g - w).abs() / w)),
                         rel_l2(&gpu.object().unwrap(), cpu.object()),
                         rel_l2(&gpu.probe().unwrap(), cpu.probe()),
-                        match cf.is_empty() {
-                            true => 0.0,
-                            false => {
-                                worst_of(gf.iter().zip(&cf).map(|(g, w)| (g - w).abs()))
-                                    / worst_of(cf.iter().map(|w| w.abs()))
-                            }
-                        },
+                        worst(scaled(&gf), scaled(cf)),
+                        worst(moved(&gf), moved(cf)),
                     ];
                     eprintln!(
-                        "{what}: llk {:.2e} object {:.2e} probe {:.2e} features {:.2e}, llk {:.4e} -> {:.4e}",
+                        "{what}: llk {:.2e} object {:.2e} probe {:.2e} features {:.2e} offsets {:.2e}, llk {:.4e} -> {:.4e}",
                         errs[0],
                         errs[1],
                         errs[2],
                         errs[3],
+                        errs[4],
                         want[0],
                         want[NCYCLE - 1]
                     );
-                    for ((name, e), tol) in ["llk", "object", "probe", "features"]
+                    for ((name, e), tol) in ["llk", "object", "probe", "features", "offsets"]
                         .iter()
                         .zip(errs)
                         .zip(TOL)
@@ -262,40 +273,6 @@ fn projections_match_cpu_under_every_propagator() {
                     }
                 }
             }
-        }
-    }
-}
-
-/// AP, DM and RAAR with a position are refused under a plane stage, before they touch
-/// anything, and run under the Fresnel transform, which has none.
-#[test]
-fn projections_with_a_position_are_refused_under_a_plane_stage() {
-    let moved = Features {
-        position: Some(drawn_offsets()),
-        ..Features::default()
-    };
-    for c in cases() {
-        let staged = c.name != "Fresnel";
-        let mut gpu = c.gpu(true);
-        gpu.set_features(&moved).unwrap();
-        let before = gpu.object().unwrap();
-        let runs = [
-            gpu.ap(&AP, 1).map_err(|e| e.to_string()),
-            gpu.dm(&DM, 1).map_err(|e| e.to_string()),
-            gpu.raar(&RAAR, 1).map_err(|e| e.to_string()),
-        ];
-        for (r, name) in runs.into_iter().zip(["Ap", "Dm", "Raar"]) {
-            match r {
-                Ok(()) => assert!(!staged, "{} {name} ran", c.name),
-                Err(e) => {
-                    let want = format!("{name} with a position runs no propagator");
-                    assert!(staged && e.contains(&want), "{} {name}: {e}", c.name);
-                }
-            }
-        }
-        if staged {
-            assert_eq!(gpu.object().unwrap().as_slice(), before.as_slice());
-            assert!(gpu.history().is_empty(), "{}", c.name);
         }
     }
 }
