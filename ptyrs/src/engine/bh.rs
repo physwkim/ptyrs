@@ -406,6 +406,7 @@ impl<'a> BhBatch<'a> {
                 cu += (self.psi[e].conj() * lu[e]).re;
                 cv += (self.psi[e].conj() * lv[e]).re;
             }
+            // pty-chi's d/a³, kept for BH parity: the cost `grads` differentiates has d/(A·a²).
             h += 2.0 * ((1.0 - d / a) * uv + d * cu * cv / (a * a * a));
         }
         h
