@@ -64,6 +64,9 @@ pub struct Ring {
     done: Box<[AtomicU64]>,
     meta: Box<[Meta]>,
     stalls: AtomicU64,
+    /// Frames that reached the head of the ring before their position did:
+    /// counted by the uploader the moment it starts waiting at one.
+    pos_waits: AtomicU64,
 }
 
 // SAFETY: the raw pointers address the pinned buffers this struct owns. A
@@ -123,6 +126,7 @@ impl Ring {
             done: (0..slots).map(|_| AtomicU64::new(0)).collect(),
             meta: (0..slots).map(|_| Meta::default()).collect(),
             stalls: AtomicU64::new(0),
+            pos_waits: AtomicU64::new(0),
         })
     }
 
@@ -151,6 +155,11 @@ impl Ring {
     /// Reservations that found the ring full.
     pub fn stalls(&self) -> u64 {
         self.stalls.load(Ordering::Relaxed)
+    }
+
+    /// Frames the uploader has waited at for their position, so far.
+    pub fn pos_waits(&self) -> u64 {
+        self.pos_waits.load(Ordering::Acquire)
     }
 
     /// Host copy of the ring, for end-of-run checks once every worker and
@@ -608,7 +617,7 @@ fn upload(
                     let crowded = ring.next.load(Ordering::Acquire) > joined + slots as u64;
                     if !crowded && wall_ns() - t_rx <= cfg.pos_wait_ns {
                         if waiting != Some(joined) {
-                            rep.pos_waits += 1;
+                            ring.pos_waits.fetch_add(1, Ordering::Release);
                             waiting = Some(joined);
                         }
                         break;
@@ -781,6 +790,7 @@ fn upload(
             std::thread::sleep(cfg.idle);
         }
     }
+    rep.pos_waits = ring.pos_waits();
     rep.bytes = lanes.iter().map(|l| l.rep.bytes).sum();
     rep.cpu_ns = thread_cpu_ns() - cpu0;
     Ok(rep)
@@ -788,6 +798,8 @@ fn upload(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use super::*;
     use crate::live::pos::Pos;
 
@@ -831,6 +843,15 @@ mod tests {
                 *v = pixel(uid, j);
             }
             s.commit(uid, wall_ns(), 0);
+        }
+    }
+
+    /// Waits for `event`, which the uploader or a GPU brings about.
+    fn until(what: &str, event: impl Fn() -> bool) {
+        let t = Instant::now();
+        while !event() {
+            assert!(t.elapsed() < Duration::from_secs(60), "{what}");
+            std::thread::yield_now();
         }
     }
 
@@ -961,7 +982,7 @@ mod tests {
         // posted before 3 land behind it.
         post(&pos, 2);
         commit(&ring, 0..6);
-        std::thread::sleep(Duration::from_millis(20));
+        until("the uploader waits at frame 0", || ring.pos_waits() == 1);
         assert!(
             rx.try_recv().is_err(),
             "a frame landed before frame 0's position"
@@ -970,8 +991,10 @@ mod tests {
         post(&pos, 1);
         post(&pos, 4);
         post(&pos, 5);
-        std::thread::sleep(Duration::from_millis(20));
+        until("the uploader waits at frame 3", || ring.pos_waits() == 2);
         stop.store(true, Ordering::Release);
+        // Time for the uploader to see the stop with frame 3 still waiting;
+        // too little only skips that, the counts below hold either way.
         std::thread::sleep(Duration::from_millis(20));
         post(&pos, 3);
         let rep = up.join().unwrap().unwrap();
@@ -1036,7 +1059,7 @@ mod tests {
             post(&pos, uid);
         }
         commit(&ring, 0..4);
-        std::thread::sleep(Duration::from_millis(20));
+        until("the uploader waits at frame 0", || ring.pos_waits() == 1);
         assert!(rx.try_recv().is_err(), "a frame landed before frame 0");
         post(&pos, 0);
         stop.store(true, Ordering::Release);
@@ -1215,10 +1238,12 @@ mod tests {
         };
         post(&pos, 0);
         commit(&ring, [0]);
-        std::thread::sleep(Duration::from_millis(100));
         let mut dev = vec![0u16; se];
-        stores[0].read_frames(0..1, &mut dev).unwrap();
-        assert!(dev.iter().enumerate().all(|(j, &v)| v == pixel(0, j)));
+        until("region 0 holds the frame", || {
+            let mut dev = vec![0u16; se];
+            stores[0].read_frames(0..1, &mut dev).unwrap();
+            dev.iter().enumerate().all(|(j, &v)| v == pixel(0, j))
+        });
         assert_eq!(ring.released.load(Ordering::Acquire), 0);
         assert!(
             rx.try_recv().is_err(),
