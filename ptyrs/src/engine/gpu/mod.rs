@@ -297,7 +297,7 @@ fn table_of(
 /// A buffer of a loop over stacks: its bytes per frame, its bytes whatever the stack's frames,
 /// and the first and last of the passes over one stack (launches, numbered in order) that touch
 /// it. A call that transforms in chunks counts as the launches of one chunk, however many it
-/// takes. The loops sharing a cut number their passes in turn, so a buffer kept from one loop
+/// takes, and is declared with its planes by [`Self::chunked`]. The loops sharing a cut number their passes in turn, so a buffer kept from one loop
 /// to the next is listed once for each: that reuse spans all of a batch's stacks, which no
 /// stack size keeps in L2.
 #[derive(Clone, Copy, Debug)]
@@ -317,10 +317,7 @@ impl Streamed {
         }
     }
 
-    /// `bytes` whatever the stack's frames, touched by `passes`. An `ObjectSampler` call from
-    /// pass `p` is `fixed(held, p..=p + 2)`, `held` the bytes it keeps across its launches:
-    /// one chunk's three, the last writing or the first reading the stack's planes; the next
-    /// launch is `p + 3`.
+    /// `bytes` whatever the stack's frames, touched by `passes`.
     fn fixed(bytes: usize, passes: std::ops::RangeInclusive<u32>) -> Self {
         Self {
             bytes: 0,
@@ -328,6 +325,24 @@ impl Streamed {
             first: *passes.start(),
             last: *passes.end(),
         }
+    }
+
+    /// A call over `passes` that transforms the stack in chunks, keeping `held` bytes whatever
+    /// the stack's frames across its launches, and the planes it `writes`, `(bytes per frame,
+    /// the last pass to read them)`, and `reads`, `(bytes per frame, the first pass to touch
+    /// them)`. Its chunks run one after another through every launch, so those planes span all
+    /// of them.
+    fn chunked(
+        held: usize,
+        passes: std::ops::RangeInclusive<u32>,
+        writes: &[(usize, u32)],
+        reads: &[(usize, u32)],
+    ) -> Vec<Self> {
+        let (first, last) = (*passes.start(), *passes.end());
+        let writes = (writes.iter()).map(|&(b, read)| Self::new(b, first..=read.max(last)));
+        let reads = (reads.iter()).map(|&(b, from)| Self::new(b, from.min(first)..=last));
+        let held = std::iter::once(Self::fixed(held, passes));
+        held.chain(writes).chain(reads).collect()
     }
 
     /// Whether it is live from pass `p` to the next: touched by `p` or an earlier pass and by a
@@ -1083,8 +1098,7 @@ mod tests {
     /// At 256x256 a two-mode set is 1 MiB a frame against a 24 MiB budget: one set live after
     /// pass 0 and two after pass 2 fit 12 frames. 8 MiB fixed live after both passes binds
     /// after 2, to 8 frames, as it does live there alone, and after 0 alone leaves 12; alone
-    /// after a pass it binds nothing. A sampler call's scratch over passes 0 to 2 does not meet
-    /// the block its last launch writes; held to pass 3 it does.
+    /// after a pass it binds nothing.
     #[test]
     fn a_fixed_entry_binds_where_frames_are_live_beside_it() {
         const MIB: usize = 1 << 20;
@@ -1098,13 +1112,33 @@ mod tests {
         assert_eq!(with(Streamed::fixed(8 * MIB, 2..=3)), 8);
         assert_eq!(with(Streamed::fixed(8 * MIB, 0..=1)), 12);
         assert_eq!(with(Streamed::fixed(64 * MIB, 1..=2)), 12);
-        let block = Streamed::new(wave, 2..=3);
-        let call = |last| {
-            rule.frames(&[Streamed::fixed(23 * MIB, 0..=last), block])
-                .unwrap()
-        };
-        assert_eq!(call(2), 24);
-        assert_eq!(call(3), 1);
+    }
+
+    /// At 256x256 a two-mode set is 1 MiB a frame against a 24 MiB budget: a lone chunked
+    /// call holding 23 MiB leaves it 1 frame, whether it writes the set for a later pass, reads
+    /// it from an earlier one, or writes it for a pass within its own; holding 8 MiB, 16.
+    #[test]
+    fn a_chunked_call_holds_its_bytes_beside_the_planes_it_reads_and_writes() {
+        const MIB: usize = 1 << 20;
+        let rule = StackRule::new(None, 64 * MIB, 1, &dims(256));
+        let wave = wave_bytes(&dims(256));
+        let frames = |call: Vec<Streamed>| rule.frames(&call).unwrap();
+        assert_eq!(
+            frames(Streamed::chunked(23 * MIB, 0..=2, &[(wave, 3)], &[])),
+            1
+        );
+        assert_eq!(
+            frames(Streamed::chunked(23 * MIB, 1..=3, &[], &[(wave, 0)])),
+            1
+        );
+        assert_eq!(
+            frames(Streamed::chunked(23 * MIB, 0..=2, &[(wave, 1)], &[])),
+            1
+        );
+        assert_eq!(
+            frames(Streamed::chunked(8 * MIB, 0..=2, &[(wave, 3)], &[])),
+            16
+        );
     }
 
     /// Fixed bytes past the budget beside a set leave no frame to fit, so the floor stands: 8
