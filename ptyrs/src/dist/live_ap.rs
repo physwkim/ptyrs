@@ -622,6 +622,7 @@ mod tests {
     use crate::live::recon::{LiveAp, ViewPlacement};
     use crate::live::ring::{FrameBatch, Ring, UploadReport, UploaderConfig, run_region_uploader};
     use crate::live::scan::ScanShape;
+    use crate::live::sent::sent;
 
     /// 64 px frames at `points` points 8 px apart.
     fn sim(path: ScanPath, points: usize) -> Ptycho {
@@ -772,7 +773,7 @@ mod tests {
         }
 
         /// Streams `frames` and returns once the uploader has landed them.
-        fn land(&self, c: &Case, frames: &Range<usize>) {
+        fn land(mut self, c: &Case, frames: &Range<usize>) -> Self {
             let n = self.ring.slot_elems();
             for k in frames.clone() {
                 let (x, y) = c.pos[k];
@@ -783,12 +784,14 @@ mod tests {
             }
             let mut at = frames.start;
             while at < frames.end {
-                let b = self.batches.recv().expect("the uploader runs");
+                let (b, uploader) = sent(&self.batches, self.uploader);
+                self.uploader = uploader;
                 assert_eq!(b.f0, at as u64);
                 assert_eq!(b.positions, c.pos[at..at + b.n as usize]);
                 at += b.n as usize;
             }
             assert_eq!(at, frames.end);
+            self
         }
 
         fn finish(self) -> UploadReport {
@@ -845,12 +848,12 @@ mod tests {
                 let mut ap =
                     DistLiveAp::new(&gpus(ngpu), &c.cfg, planned, scheme, &c.probe).unwrap();
                 let warm = WarmUp::end();
-                let feed = Feed::new(&ctx, &c, &ap);
+                let mut feed = Feed::new(&ctx, &c, &ap);
                 let mut grew = 0;
                 for (k, (b, want)) in batches.iter().zip(&want).enumerate() {
                     let v = views(b);
                     let before: Vec<usize> = ap.halo_rows().iter().map(|r| r[1]).collect();
-                    feed.land(&c, b);
+                    feed = feed.land(&c, b);
                     assert_eq!(ap.push(v).unwrap() as usize, b.len(), "{what}");
                     let moved = c.planned..c.planned + c.moved;
                     if b.start >= moved.start && b.end <= moved.end {

@@ -198,7 +198,23 @@ mod tests {
     use crate::live::graph::WarmUp;
     use crate::live::pos::{Pos, PosTable};
     use crate::live::ring::{Ring, UploaderConfig, run_uploader};
+    use crate::live::sent::sent;
     use std::num::NonZeroUsize;
+
+    /// A consumer that ends before its graph is captured shows its own error to the test
+    /// that waits for the graph.
+    #[test]
+    #[should_panic(expected = "the sending thread failed")]
+    fn a_consumer_that_cannot_capture_reports_its_own_error() {
+        let ctx = Context::new(0).expect("GPU 0");
+        let store = Arc::new(DeviceStore::new(&ctx, 0, 64).unwrap());
+        let (_tx, rx) = crossbeam_channel::unbounded();
+        let (cap_tx, cap_rx) = crossbeam_channel::bounded(1);
+        let batch = NonZeroU32::new(7).unwrap();
+        let consumer =
+            std::thread::spawn(move || run_checksum_consumer(ctx, store, batch, rx, cap_tx));
+        sent(&cap_rx, consumer);
+    }
 
     /// The input path feeds a graph captured before the first frame: frames
     /// fill the store under it and every frame is consumed exactly once, the
@@ -217,7 +233,7 @@ mod tests {
             let (ctx, store) = (ctx.clone(), store.clone());
             std::thread::spawn(move || run_checksum_consumer(ctx, store, batch, rx, cap_tx))
         };
-        cap_rx.recv().expect("the graph is captured");
+        let ((), consumer) = sent(&cap_rx, consumer);
         let warm = WarmUp::end();
         let uploader = {
             let (ring, ctx, stop, store) = (ring.clone(), ctx.clone(), stop.clone(), store.clone());

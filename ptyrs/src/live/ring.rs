@@ -802,6 +802,7 @@ mod tests {
 
     use super::*;
     use crate::live::pos::Pos;
+    use crate::live::sent::sent;
 
     fn cfg() -> UploaderConfig {
         UploaderConfig {
@@ -1251,7 +1252,8 @@ mod tests {
         );
         // SAFETY: the gate lives until the end of the test.
         unsafe { gate.as_mut_ptr().write_volatile(1) };
-        assert_eq!(rx.recv().unwrap().n, 1);
+        let (batch, up) = sent(&rx, up);
+        assert_eq!(batch.n, 1);
         assert_eq!(ring.released.load(Ordering::Acquire), 1);
         stop.store(true, Ordering::Release);
         let rep = up.join().unwrap().unwrap();
