@@ -524,11 +524,12 @@ fn norm_parts_add_up_both_arrays() {
     }
 }
 
-/// The stacks' frame partials add up into one total, each stack's `icalc` over its own `nf`
-/// records only (stack `3..5` leaves its third record out), each times its frame's scale when
-/// one is given; a scale of another frame count is refused.
+/// Each stack's frame partials land in its frames' slots, each stack's `icalc` over its own
+/// `nf` records only (stack `3..5` leaves its third record out), each times its frame's scale
+/// when one is given, and their sum is the scan's; a scale or slots of another frame count
+/// are refused.
 #[test]
-fn icalc_add_sums_each_stacks_frames() {
+fn icalc_frames_fill_each_stacks_slots() {
     let (stream, ctx, _, k) = setup();
     let (views, table) = scan(&stream);
     let rec = |icalc| LlkPartial {
@@ -538,25 +539,52 @@ fn icalc_add_sums_each_stacks_frames() {
         icalc,
     };
     let scale = up(&stream, &[1.0f32, 2.0, 3.0, 4.0, 5.0]);
-    for (scale, want) in [(None, 31.0), (Some(&scale), 129.0)] {
-        let mut out = up(&stream, &[0.0f32]);
+    for (scale, want) in [
+        (None, [1.0f32, 2.0, 4.0, 8.0, 16.0]),
+        (Some(&scale), [1.0, 4.0, 12.0, 32.0, 80.0]),
+    ] {
+        let mut out = up(&stream, &[-1.0f32; 5]);
         for (s, icalc) in [[1.0, 2.0, 4.0], [8.0, 16.0, 1000.0]]
             .into_iter()
             .enumerate()
         {
             let partials = up(&stream, &icalc.map(rec));
-            k.icalc_add(&ctx, views.dims(), table.at(s), &partials, scale, &mut out)
+            k.icalc_frames(&ctx, views.dims(), table.at(s), &partials, scale, &mut out)
                 .unwrap();
         }
-        assert_eq!(out.to_host_vec(&stream).unwrap(), [want]);
+        assert_eq!(out.to_host_vec(&stream).unwrap(), want);
+        let mut total = up(&stream, &[0.0f32]);
+        k.sum_values(&ctx, &out, &mut total).unwrap();
+        assert_eq!(
+            total.to_host_vec(&stream).unwrap(),
+            [want.iter().sum::<f32>()]
+        );
     }
-    let (partials, mut out) = (up(&stream, &[rec(1.0); 3]), up(&stream, &[0.0f32]));
-    let short = up(&stream, &[1.0f32; 4]);
+    let partials = up(&stream, &[rec(1.0); 3]);
     let dims = views.dims();
+    let (short, mut out) = (up(&stream, &[1.0f32; 4]), up(&stream, &[0.0f32; 5]));
     assert!(
-        k.icalc_add(&ctx, dims, table.at(0), &partials, Some(&short), &mut out)
+        k.icalc_frames(&ctx, dims, table.at(0), &partials, Some(&short), &mut out)
             .is_err()
     );
+    let mut four = up(&stream, &[0.0f32; 4]);
+    assert!(
+        k.icalc_frames(&ctx, dims, table.at(0), &partials, None, &mut four)
+            .is_err()
+    );
+}
+
+/// The sum of more values than a block has threads, each thread striding: integers, so the
+/// `f32` total is exact; an empty `out` is refused.
+#[test]
+fn sum_values_adds_every_value() {
+    let (stream, ctx, _, k) = setup();
+    let x: Vec<f32> = (0..1000u16).map(f32::from).collect();
+    let mut total = up(&stream, &[-1.0f32]);
+    k.sum_values(&ctx, &up(&stream, &x), &mut total).unwrap();
+    assert_eq!(total.to_host_vec(&stream).unwrap(), [499_500.0]);
+    let mut empty = DeviceBuffer::<f32>::zeroed(&stream, 0).unwrap();
+    assert!(k.sum_values(&ctx, &up(&stream, &x), &mut empty).is_err());
 }
 
 /// Every frame's scale times `ratio / intensity`, a frame of no intensity kept, then over

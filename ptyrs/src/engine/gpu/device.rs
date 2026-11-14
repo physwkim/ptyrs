@@ -14,10 +14,11 @@ use std::sync::Arc;
 use crate::fft::Plan2d;
 use crate::gpu::{
     BH_STEP, BackgroundSums, BhKernels, C32, CG_BLOCKS, Ended, EpochOrder, Error as GpuError,
-    FarSums, FusedBufs, FusedInputs, GammaStacks, GradKernels, Kernels, LlkPartial, LlkRing,
-    LlkScratch, LlkTotals, Model, PositionKernels, PositionPartial, Positions, PowerMax,
-    ProbeSpectrum, PsiSums, RingDevice, RpieKernels, ScalePartial, Shift, ShiftSums,
-    ShiftedProbeSums, SpectrumBuf, StackTable, UpdateSums, ViewAddr, ViewDims, Views,
+    ExitPass, ExitStage, FarSums, FusedBufs, FusedInputs, GammaStacks, GradKernels, Kernels,
+    LlkPartial, LlkRing, LlkScratch, LlkTotals, Model, OpticsKernels, PositionKernels,
+    PositionPartial, Positions, PowerMax, ProbeSpectrum, PsiSums, RingDevice, RpieKernels,
+    ScalePartial, Shift, ShiftSums, ShiftedProbeSums, SpectrumBuf, StackTable, UpdateSums,
+    ViewAddr, ViewDims, Views,
 };
 use crate::tile::TileDots;
 use cuda_async::cuda_graph::CudaGraph;
@@ -30,13 +31,24 @@ use super::ml::MlMoved;
 use super::rpie::RpieMoved;
 use super::{
     Cut, Epoch, Frames, GpuOptions, StackRule, Streamed, Tag, batch_stacks, plane_bytes, plane_len,
-    to_u32, wave_bytes,
+    to_c32, to_u32, wave_bytes,
 };
 use crate::engine::features::{POSITION_LIMIT, POSITION_STEP};
+use crate::engine::ptycho::Algorithm;
 use crate::engine::{
     ApParams, BhParams, BhStep, DmParams, EngineError, Features, LsqmlParams, LsqmlStep, MlParams,
-    RaarParams, RpieParams,
+    PlaneStage, RaarParams, RpieParams,
 };
+
+/// What [`Device::new`] uploads: the propagator's stage, the views' addresses, the counts
+/// and the starting arrays.
+pub(super) struct Uploads<'a> {
+    pub stage: PlaneStage<'a>,
+    pub addrs: &'a [ViewAddr],
+    pub counts: &'a [u16],
+    pub obj: &'a [C32],
+    pub probe: &'a [C32],
+}
 
 /// Every buffer, module and plan a cycle launches on, and the graphs captured from them.
 pub(super) struct Device {
@@ -45,6 +57,9 @@ pub(super) struct Device {
     rpie: RpieKernels,
     grad: GradKernels,
     bh: BhKernels,
+    optics: OpticsKernels,
+    /// The propagator's stage ahead of the transform every pass takes.
+    exit: ExitStage,
     /// BH's dot products, compiled by [`Device::new`] so no capture compiles a Tile kernel.
     tile: TileDots,
     views: Views,
@@ -727,7 +742,9 @@ struct MlState {
     /// The line-search pairs of every frame's pixel chunks ([`crate::gpu::gamma_parts`]).
     gamma_parts: DeviceBuffer<f32>,
     gamma: DeviceBuffer<f32>,
-    /// The calculated photons over the unmasked pixels of every frame.
+    /// The calculated photons over the unmasked pixels of each frame.
+    photons: DeviceBuffer<f32>,
+    /// Their sum over the scan.
     icalc: DeviceBuffer<f32>,
     fields: GammaStacks,
     /// The line search's moved probes, once an ML call has run under the position model.
@@ -744,6 +761,7 @@ pub(super) struct MlBufs<'a> {
     pub beta: &'a mut DeviceBuffer<f32>,
     pub gamma_parts: &'a mut DeviceBuffer<f32>,
     pub gamma: &'a mut DeviceBuffer<f32>,
+    pub photons: &'a mut DeviceBuffer<f32>,
     pub icalc: &'a mut DeviceBuffer<f32>,
     pub fields: &'a mut GammaStacks,
     pub moved: Option<&'a mut MlMoved>,
@@ -778,6 +796,7 @@ impl MlState {
             beta: pair()?,
             gamma_parts: DeviceBuffer::zeroed(stream, 2 * crate::gpu::gamma_parts(dims)? as usize)?,
             gamma: pair()?,
+            photons: DeviceBuffer::zeroed(stream, dims.nframe as usize)?,
             icalc: DeviceBuffer::zeroed(stream, 1)?,
             fields: GammaStacks::zeroed(stream, cut.wave_len(dims))?,
             moved: (moved.then(|| MlMoved::new(stream, kernels, dims, cut.table.nf_max())))
@@ -796,6 +815,7 @@ impl MlState {
             beta: &mut self.beta,
             gamma_parts: &mut self.gamma_parts,
             gamma: &mut self.gamma,
+            photons: &mut self.photons,
             icalc: &mut self.icalc,
             fields: &mut self.fields,
             moved: self.moved.as_mut(),
@@ -1063,6 +1083,7 @@ pub(super) struct Bufs<'a> {
     pub rpie: &'a RpieKernels,
     pub grad: &'a GradKernels,
     pub bh: &'a BhKernels,
+    pub exit: ExitPass<'a>,
     pub tile: &'a TileDots,
     pub views: &'a Views,
     pub counts: &'a DeviceBuffer<u16>,
@@ -1104,21 +1125,38 @@ impl Device {
     /// Loads the kernels and uploads the views, counts and starting arrays on a new stream of
     /// `ctx`; every pass cuts `0 .. nframe` by the [`StackRule`] of `ctx`'s L2, the LLK ring
     /// holds `options.llk_slots` records of every frame, its unmasked pixels counted here, and
-    /// `options.fused` picks the [`Passes`].
+    /// `options.fused` picks the [`Passes`], of which only the fused run a propagator's stage.
     pub fn new(
         ctx: &Arc<CudaContext>,
         dims: ViewDims,
-        addrs: &[ViewAddr],
-        counts: &[u16],
-        obj: &[C32],
-        probe: &[C32],
+        uploads: Uploads<'_>,
         options: GpuOptions,
     ) -> Result<Self, EngineError> {
+        let Uploads {
+            stage,
+            addrs,
+            counts,
+            obj,
+            probe,
+        } = uploads;
         let stream = ctx.new_stream()?;
         let kernels = Kernels::load(ctx)?;
         let rpie = RpieKernels::load(&kernels)?;
         let grad = GradKernels::load(&kernels)?;
         let bh = BhKernels::load(&kernels)?;
+        let optics = OpticsKernels::load(&kernels)?;
+        let exit = match stage {
+            PlaneStage::None => ExitStage::None,
+            _ if !options.fused => {
+                return Err(EngineError::Invalid(
+                    "a propagator with a plane stage needs GpuOptions { fused: true, .. }".into(),
+                ));
+            }
+            PlaneStage::Reverse => ExitStage::Reverse,
+            PlaneStage::Transfer(tf) => {
+                ExitStage::Transfer(DeviceBuffer::from_host(&stream, &to_c32(tf))?)
+            }
+        };
         let views = Views::new(&stream, dims, addrs)?;
         let tile = TileDots::new(&stream, &dims)?;
         let rule = StackRule::new(options.stack_size, ctx.l2_cache_size_bytes()?);
@@ -1142,6 +1180,8 @@ impl Device {
             rpie,
             grad,
             bh,
+            optics,
+            exit,
             tile,
             views,
             rule,
@@ -1325,6 +1365,10 @@ impl Device {
             rpie: &self.rpie,
             grad: &self.grad,
             bh: &self.bh,
+            exit: ExitPass {
+                kernels: &self.optics,
+                stage: &self.exit,
+            },
             tile: &self.tile,
             views: &self.views,
             counts: &self.counts,
@@ -1519,8 +1563,21 @@ impl Device {
         Ok(self.ring.flush(&self.context())?)
     }
 
+    /// Fails under a propagator with a plane stage, which of the passes only the LLK pass
+    /// runs: every other is enqueued behind this.
+    fn stageless(&self, algorithm: Algorithm) -> Result<(), EngineError> {
+        match self.exit {
+            ExitStage::None => Ok(()),
+            _ => Err(EngineError::Invalid(format!(
+                "{algorithm:?} runs no propagator with a plane stage: angular spectrum, or a \
+                 Fresnel transform back in distance"
+            ))),
+        }
+    }
+
     /// The buffers of `epoch`'s cycle, and with graphs its graph, captured from them.
     fn new_run(&mut self, epoch: Epoch) -> Result<EpochRun, EngineError> {
+        self.stageless(epoch.algorithm())?;
         let mut cycle = match epoch {
             Epoch::Ap { params, llk } => Cycle::Ap { params, llk },
             Epoch::Dm { params, first } => {
@@ -1637,6 +1694,7 @@ impl Device {
 
     /// [`Bufs::scale_to_photons`] enqueued eagerly, with `total` the unmasked observed photons.
     pub fn scale_to_photons(&mut self, total: f32) -> Result<(), EngineError> {
+        self.stageless(Algorithm::Ml)?;
         self.build_ml()?;
         let ctx = self.context();
         let (mut bufs, mut passes, _) = self.lend();
@@ -1654,6 +1712,7 @@ impl Device {
     /// The ML gradients of the current estimate, object then probe, as
     /// [`Bufs::ml_grad`] leaves them in the update sums; downloads them and zeroes the sums.
     pub fn ml_grads(&mut self) -> Result<[Vec<C32>; 2], EngineError> {
+        self.stageless(Algorithm::Ml)?;
         {
             let ctx = self.context();
             let (mut bufs, mut passes, _) = self.lend();

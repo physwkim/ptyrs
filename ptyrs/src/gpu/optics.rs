@@ -32,6 +32,13 @@ pub enum ExitStage {
     Transfer(DeviceBuffer<C32>),
 }
 
+/// An [`ExitStage`] lent to a pass with the kernels that run it.
+#[derive(Clone, Copy)]
+pub struct ExitPass<'a> {
+    pub kernels: &'a OpticsKernels,
+    pub stage: &'a ExitStage,
+}
+
 /// The propagator stage kernels, bound to the module a [`Kernels`] loaded.
 #[derive(Clone, Debug)]
 pub struct OpticsKernels {
@@ -61,6 +68,22 @@ impl OpticsKernels {
         work: &mut DeviceBuffer<C32>,
         adjoint: bool,
     ) -> Result<(), Error> {
+        self.exit_on(ctx, d, stack, stage, work, adjoint)
+    }
+
+    /// [`Self::exit`] on a `work` the caller holds for writing.
+    pub(crate) fn exit_on(
+        &self,
+        ctx: &ExecutionContext,
+        d: &ViewDims,
+        stack: StackRef<'_>,
+        stage: &ExitStage,
+        work: &DeviceBuffer<C32>,
+        adjoint: bool,
+    ) -> Result<(), Error> {
+        if matches!(stage, ExitStage::None) {
+            return Ok(());
+        }
         let l = Launch::new(d, stack, work)?;
         // Each transform is unnormalized, and a stage is a column and a row one.
         let scale = 1.0 / (d.n() as f32).sqrt();
@@ -115,7 +138,7 @@ impl OpticsKernels {
         ctx: &ExecutionContext,
         l: &Launch,
         stack: StackRef<'_>,
-        buf: &mut DeviceBuffer<C32>,
+        buf: &DeviceBuffer<C32>,
         mul: Option<(&DeviceBuffer<C32>, f32)>,
         flags: u32,
     ) -> Result<(), Error> {

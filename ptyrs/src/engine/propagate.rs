@@ -18,7 +18,11 @@ use crate::engine::{EngineError, Fft2, quad_phase, shift};
 /// object-plane phase that [`crate::engine::obj_probe_to_psi`] applies and `U` the [`Propagator`];
 /// through several object slices, [`crate::engine::SliceWaves`].
 pub struct Optics {
+    /// The object-plane pixel `[py, px]` in metres.
+    pixel: [f64; 2],
     quad: Vec<C64>,
+    /// `quad` is `exp(i·(c[0]·Y² + c[1]·X²))` over the centred pixel.
+    plane_quad: [f64; 2],
     propagator: Propagator,
     /// The in-object propagator from each slice to the next.
     gaps: Vec<Propagator>,
@@ -27,8 +31,11 @@ pub struct Optics {
 impl Optics {
     /// PyNX's far field: [`quad_phase`] and [`Propagator::Fourier`].
     pub fn far_field(g: &Geometry) -> Self {
+        let pixel = g.pixel_size_object();
         Self {
+            pixel,
             quad: quad_phase(g),
+            plane_quad: pixel.map(|p| PI * p * p / (g.wavelength * g.distance)),
             propagator: Propagator::Fourier(Fft2::new(g.frame)),
             gaps: Vec::new(),
         }
@@ -38,7 +45,9 @@ impl Optics {
     pub fn free_space(w: &Wavefield) -> Self {
         let [ny, nx] = w.shape;
         Self {
+            pixel: w.pixel,
             quad: vec![C64::new(1.0, 0.0); ny * nx],
+            plane_quad: [0.0; 2],
             propagator: Propagator::free_space(w),
             gaps: Vec::new(),
         }
@@ -66,6 +75,29 @@ impl Optics {
 
     pub fn quad(&self) -> &[C64] {
         &self.quad
+    }
+
+    /// The object-plane pixel `[py, px]` in metres, the unit of the views' corners.
+    pub fn pixel(&self) -> [f64; 2] {
+        self.pixel
+    }
+
+    /// The exit propagator's [`Propagator::fourier_form`] with [`Self::quad`] in its plane
+    /// phase; fails as that does, and where `quad` differs between the axes.
+    pub fn fourier_form(&self) -> Result<FourierForm<'_>, EngineError> {
+        let form = self.propagator.fourier_form()?;
+        let [cy, cx] = self.plane_quad;
+        if cy != cx {
+            return Err(EngineError::Invalid(
+                "an object-plane phase over pixels that are not square has no \
+                 one-transform form"
+                    .into(),
+            ));
+        }
+        Ok(FourierForm {
+            quad: cx + form.quad,
+            ..form
+        })
     }
 
     /// The object-plane phase slice `s` applies: [`Self::quad`] on the last slice, none on
