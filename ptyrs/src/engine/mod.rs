@@ -55,7 +55,8 @@ pub use ops::{
 };
 pub use plan::{Backend, Params, Plan, Step};
 pub use propagate::{
-    AngularSpectrum, Exit, FourierForm, Fresnel, Optics, PlaneStage, Propagator, Wavefield,
+    AngularSpectrum, Exit, FourierForm, Fresnel, MovedQuad, Optics, PlaneStage, Propagator,
+    Wavefield,
 };
 pub use ptycho::{
     Algorithm, ApParams, DmParams, LlkRecord, MlParams, Ptycho, RaarParams, RpieParams,
