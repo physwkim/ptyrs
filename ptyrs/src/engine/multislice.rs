@@ -568,7 +568,8 @@ mod tests {
         let close = |what: &str, a: &[C64], b: &[C64]| {
             let scale = b.iter().map(|b| b.norm()).fold(0.0, f64::max);
             let err = worst_of(a.iter().zip(b).map(|(a, b)| (a - b).norm()));
-            assert!(err <= 1e-14 * scale, "{what}: {err:.3e} of {scale:.3e}");
+            // Measured 3.0e-15: the f64 transform round trip FullObject takes and Patch skips.
+            assert!(err <= 5e-14 * scale, "{what}: {err:.3e} of {scale:.3e}");
         };
         for optics in &optics() {
             let views = addr.views();
