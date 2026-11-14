@@ -11,9 +11,9 @@
 //! [`ObjectSampler::windows`] writes a block `[modes, nf_max, ny, nx]` of a stack's windows,
 //! natural layout, `modes` every object mode ([`Modes::All`]) or the first: plane
 //! `o * nf_max + fl` holds frame `f0 + fl`'s window on object mode `o`. A block is so an
-//! object `[modes, nf_max * ny, nx]` of window views, which view `kl` reads as it reads the
-//! object, at object mode `v.obj`, corner `(kl / nmode * ny, 0)` and no fraction. The blocks
-//! of one buffer hold the slices, or the derivatives over `y` and `x`.
+//! object `[modes, nf_max * ny, nx]` of [`window_views`], which view `kl` reads as it reads
+//! the object, at object mode `v.obj`, corner `(kl / nmode * ny, 0)` and no fraction. The
+//! blocks of one buffer hold the slices, or the derivatives over `y` and `x`.
 //! [`ObjectSampler::place`] adds `W^H` of patches shaped as an all-modes block, each group's
 //! views summed as a scatter onto the window views leaves them, to one slice of the object:
 //! the exact adjoint of the windows.
@@ -21,6 +21,8 @@
 //! Each pass transforms `chunk` groups in a scratch of `chunk` object planes; a stack takes
 //! `ceil(nf_max * modes / chunk)` passes whatever its `nf`, so the launches can be captured
 //! once for every stack.
+
+use std::ops::Range;
 
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig};
@@ -42,6 +44,58 @@ fn elems(total: usize) -> Result<(u32, LaunchConfig), Error> {
     let n = u32::try_from(total)
         .map_err(|_| Error::Shape(format!("{total} elements exceed a 1D launch")))?;
     Ok((n, LaunchConfig::for_num_elems(n)))
+}
+
+/// The views over a stack's windows where each view samples the object at its offset: an
+/// all-modes block of [`ObjectSampler::windows`], plane `o * nf_max + fl` frame `f0 + fl`'s
+/// window on object mode `o`, is these views' object `[nobj, nf_max * ny, nx]`, epoch
+/// position `f0 + fl` at row `fl * ny`. `stacks` are the stack table's, consecutive from
+/// position 0 to `nframe`; every stack's views share the rows, and a stack launch reads its
+/// own.
+pub fn window_views(
+    stream: &CudaStream,
+    dims: &ViewDims,
+    stacks: &[Range<u32>],
+) -> Result<Views, Error> {
+    dims.check()?;
+    let mut next = 0;
+    for r in stacks {
+        if r.start != next || r.is_empty() {
+            return Err(Error::Shape(format!(
+                "stack {r:?} does not follow position {next}"
+            )));
+        }
+        next = r.end;
+    }
+    if next != dims.nframe {
+        return Err(Error::Shape(format!(
+            "stacks end at {next}, the scan at {}",
+            dims.nframe
+        )));
+    }
+    let nf_max = stacks.iter().map(ExactSizeIterator::len).max().unwrap_or(0);
+    let [ny, nx] = dims.frame;
+    let rows = u32::try_from(nf_max * ny as usize)
+        .map_err(|_| Error::Shape(format!("{nf_max} windows of {ny} rows exceed u32")))?;
+    let addr: Vec<ViewAddr> = stacks
+        .iter()
+        .flat_map(|r| 0..r.end - r.start)
+        .flat_map(|fl| {
+            (0..dims.nmode).map(move |m| ViewAddr {
+                oy: fl * ny,
+                ox: 0,
+                fy: 0.0,
+                fx: 0.0,
+                probe: m % dims.nprobe,
+                obj: m / dims.nprobe,
+            })
+        })
+        .collect();
+    let windows = ViewDims {
+        obj: [rows, nx],
+        ..*dims
+    };
+    Views::new(stream, windows, &addr)
 }
 
 /// Where a stack's views read the object: the scan's views, the stack and every frame's
