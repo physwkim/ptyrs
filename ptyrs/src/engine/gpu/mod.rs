@@ -294,33 +294,46 @@ fn table_of(
     Ok((frames, table))
 }
 
-/// A per-frame buffer of a loop over stacks: its bytes per frame and the first and last of the
-/// passes over one stack (launches, numbered in order) that touch it. The loops sharing a cut
-/// number their passes in turn, so a buffer kept from one loop to the next is listed once for
-/// each: that reuse spans all of a batch's stacks, which no stack size keeps in L2.
+/// A buffer of a loop over stacks: its bytes per frame, its bytes whatever the stack's frames,
+/// and the first and last of the passes over one stack (launches, numbered in order) that touch
+/// it. A call that transforms in chunks counts as the launches of one chunk, however many it
+/// takes. The loops sharing a cut number their passes in turn, so a buffer kept from one loop
+/// to the next is listed once for each: that reuse spans all of a batch's stacks, which no
+/// stack size keeps in L2.
 #[derive(Clone, Copy, Debug)]
 struct Streamed {
     bytes: usize,
+    fixed: usize,
     first: u32,
     last: u32,
 }
 
 impl Streamed {
+    /// `bytes` per frame, touched by `passes`.
     fn new(bytes: usize, passes: std::ops::RangeInclusive<u32>) -> Self {
         Self {
             bytes,
+            ..Self::fixed(0, passes)
+        }
+    }
+
+    /// `bytes` whatever the stack's frames, touched by `passes`. An `ObjectSampler` call from
+    /// pass `p` is `fixed(held, p..=p + 2)`, `held` the bytes it keeps across its launches:
+    /// one chunk's three, the last writing or the first reading the stack's planes; the next
+    /// launch is `p + 3`.
+    fn fixed(bytes: usize, passes: std::ops::RangeInclusive<u32>) -> Self {
+        Self {
+            bytes: 0,
+            fixed: bytes,
             first: *passes.start(),
             last: *passes.end(),
         }
     }
 
-    /// Its bytes if live from pass `p` to the next: touched by `p` or an earlier pass and by a
+    /// Whether it is live from pass `p` to the next: touched by `p` or an earlier pass and by a
     /// later one.
-    fn live(self, p: u32) -> usize {
-        match (self.first..self.last).contains(&p) {
-            true => self.bytes,
-            false => 0,
-        }
+    fn live(self, p: u32) -> bool {
+        (self.first..self.last).contains(&p)
     }
 
     /// The shift planes of a [`Kernels::shifted_psi_sums`] from pass `p`: `shift_pre` writes
@@ -339,9 +352,9 @@ impl Streamed {
 
 /// [`GpuOptions::stack_size`] on one device: a loop's frames per stack from the buffers its
 /// passes stream. Stacking keeps what one pass over a stack leaves for a later one in L2, so
-/// the budget holds the bytes per frame live across the fullest boundary between passes; a
-/// buffer one pass touches streams through either way. Below a floor of frames a pass leaves
-/// the device's threads short of work, whatever L2 holds.
+/// the budget holds what is live across every boundary between passes, its fixed bytes and its
+/// bytes per frame for each frame; a buffer one pass touches streams through either way. Below
+/// a floor of frames a pass leaves the device's threads short of work, whatever L2 holds.
 #[derive(Clone, Copy, Debug)]
 struct StackRule {
     size: Option<usize>,
@@ -371,17 +384,22 @@ impl StackRule {
         }
     }
 
-    /// Frames per stack of a loop over `bufs`: the given size, else as many frames of the
-    /// peak live bytes as fit the budget, at least the floor.
+    /// Frames per stack of a loop over `bufs`: the given size, else the most that fit the
+    /// budget beside the fixed bytes at every boundary where frames' bytes are live, at least
+    /// the floor.
     fn frames(self, bufs: &[Streamed]) -> Result<u32, EngineError> {
-        // The live bytes only grow at a buffer's first pass, so they peak at one.
-        let peak = (bufs.iter().map(|b| b.first))
-            .map(|p| bufs.iter().map(|b| b.live(p)).sum::<usize>())
-            .max()
-            .unwrap_or(0);
-        let n = self
-            .size
-            .unwrap_or_else(|| (self.budget / peak.max(1)).max(self.floor));
+        // What is live after a pass is live after the latest first pass up to it, a set that
+        // bounds the frames at least as tightly, so the first passes suffice.
+        let fit = (bufs.iter().map(|b| b.first))
+            .filter_map(|p| {
+                let live = || bufs.iter().filter(|b| b.live(p));
+                let per_frame: usize = live().map(|b| b.bytes).sum();
+                let fixed: usize = live().map(|b| b.fixed).sum();
+                (per_frame > 0).then(|| self.budget.saturating_sub(fixed) / per_frame)
+            })
+            .min()
+            .unwrap_or(self.budget);
+        let n = self.size.unwrap_or_else(|| fit.max(self.floor));
         to_u32("stack_size", n)
     }
 
@@ -1038,5 +1056,50 @@ mod tests {
         assert_eq!(frames(rule, &[(wave_bytes(&dims(128)), 0..=1)]), 96);
         let given = StackRule::new(Some(16), L2, 153600, &dims(512));
         assert_eq!(frames(given, &big), 16);
+    }
+
+    /// At 256x256 a two-mode set is 1 MiB a frame against a 24 MiB budget: one set live after
+    /// pass 0 and two after pass 2 fit 12 frames. 8 MiB fixed live after both passes binds
+    /// after 2, to 8 frames, as it does live there alone, and after 0 alone leaves 12; alone
+    /// after a pass it binds nothing. A sampler call's scratch over passes 0 to 2 does not meet
+    /// the block its last launch writes; held to pass 3 it does.
+    #[test]
+    fn a_fixed_entry_binds_where_frames_are_live_beside_it() {
+        const MIB: usize = 1 << 20;
+        let rule = StackRule::new(None, 64 * MIB, 1, &dims(256));
+        let wave = wave_bytes(&dims(256));
+        assert_eq!(wave, MIB);
+        let sets = [0..=1, 2..=3, 2..=3].map(|p| Streamed::new(wave, p));
+        let with = |fixed: Streamed| rule.frames(&[sets.as_slice(), &[fixed]].concat()).unwrap();
+        assert_eq!(rule.frames(&sets).unwrap(), 12);
+        assert_eq!(with(Streamed::fixed(8 * MIB, 0..=3)), 8);
+        assert_eq!(with(Streamed::fixed(8 * MIB, 2..=3)), 8);
+        assert_eq!(with(Streamed::fixed(8 * MIB, 0..=1)), 12);
+        assert_eq!(with(Streamed::fixed(64 * MIB, 1..=2)), 12);
+        let block = Streamed::new(wave, 2..=3);
+        let call = |last| {
+            rule.frames(&[Streamed::fixed(23 * MIB, 0..=last), block])
+                .unwrap()
+        };
+        assert_eq!(call(2), 24);
+        assert_eq!(call(3), 1);
+    }
+
+    /// Fixed bytes past the budget beside a set leave no frame to fit, so the floor stands: 8
+    /// frames at 256x256 on 153600 threads, 1 on one thread; a given size still wins.
+    #[test]
+    fn the_floor_holds_under_a_fixed_entry_past_the_budget() {
+        const MIB: usize = 1 << 20;
+        let bufs = [
+            Streamed::new(wave_bytes(&dims(256)), 0..=1),
+            Streamed::fixed(32 * MIB, 0..=1),
+        ];
+        let frames = |size, threads| {
+            let rule = StackRule::new(size, 64 * MIB, threads, &dims(256));
+            rule.frames(&bufs).unwrap()
+        };
+        assert_eq!(frames(None, 153600), 8);
+        assert_eq!(frames(None, 1), 1);
+        assert_eq!(frames(Some(16), 153600), 16);
     }
 }
