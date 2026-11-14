@@ -30,6 +30,7 @@ use std::sync::Arc;
 use rustfft::num_complex::{Complex32, Complex64};
 use rustfft::{Fft, FftPlanner};
 
+use crate::base::Positions;
 use crate::live::pipeline::Truth;
 use crate::live::synth::{Region, hash3, poisson, splitmix64, unit};
 
@@ -99,6 +100,14 @@ impl Ptycho {
         let scan = scan_points(spec.path, spec.points, spec.step);
         let lo = [0, 1].map(|a| scan.iter().map(|p| p[a]).min().unwrap());
         let hi = [0, 1].map(|a| scan.iter().map(|p| p[a]).max().unwrap());
+        // Every `position` is one of these extremes times `dx`, or between two.
+        let dx = spec.dx();
+        assert!(
+            lo.iter()
+                .chain(&hi)
+                .all(|&i| Positions::valid(i as f64 * dx)),
+            "scan of {lo:?}..={hi:?} object pixels of {dx} m leaves the position range"
+        );
         let shape = [1, 0].map(|a| (hi[a] - lo[a]) as usize + n);
         let offsets = scan
             .iter()
@@ -461,6 +470,15 @@ mod tests {
             );
             assert_eq!((x / dx).round() * dx, x, "point {k} off the pixel grid");
         }
+    }
+
+    /// A geometry whose object pixel is not finite gives no position.
+    #[test]
+    #[should_panic(expected = "leaves the position range")]
+    fn a_scan_outside_the_position_range_is_refused() {
+        let mut s = spec(32, ScanPath::Raster { cols: 7 }, 45, 5.0);
+        s.det_pixel = 0.0;
+        Ptycho::new(s);
     }
 
     #[test]
