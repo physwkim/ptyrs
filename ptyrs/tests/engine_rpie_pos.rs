@@ -2,10 +2,13 @@
 //! positions optimizable, `refs/f64/rpie_pos.py`, run on the state it reads: `cargo run
 //! --release -p ptyrs --example engine_llk_trace -- <dir> dm 1 2 32 40 4`, i.e.
 //! `common::dm_scenario(32, 40, 2, 2e5, 4.0)` after `scale_obj_probe`, with the reference's
-//! offsets. It writes `<dir>/rpie_pos_*_f64.txt`, saved to `tests/data`.
+//! offsets. It writes `<dir>/rpie_pos_*_f64.txt`, saved to `tests/data`. The same cases under
+//! pty-chi's FULL_OBJECT shift operator, [`Sampling::FullObject`] here, are
+//! `refs/py/ptychi_full_object.py`'s `<out>/rpie_full_object_*_f64.txt`, saved to
+//! `tests/engine/data`.
 
 use ptyrs::base::{C64, Stack};
-use ptyrs::engine::{Features, Ptycho, RpieParams};
+use ptyrs::engine::{Features, Ptycho, RpieParams, Sampling};
 
 #[path = "common/engine/mod.rs"]
 mod common;
@@ -46,12 +49,13 @@ fn assert_close(what: &str, got: &[f64], want: &[f64], tol: f64) {
     assert!(err < tol, "{what}: max rel {err:.3e}");
 }
 
-/// `nepoch` epochs of `params` from the reference's starting offsets against its object,
-/// probe and offset changes, `files` its obj, probe and offsets tables.
-fn assert_run(what: &str, params: RpieParams, nepoch: usize, files: [&str; 3]) {
+/// `nepoch` epochs of `params` under `sampling` from the reference's starting offsets against
+/// its object, probe and offset changes, `files` its obj, probe and offsets tables.
+fn assert_run(what: &str, sampling: Sampling, params: RpieParams, nepoch: usize, files: [&str; 3]) {
     let (scan, object, probe) = common::dm_scenario(32, 40, 2, 2e5, 4.0);
     let mut p = Ptycho::new(&scan, object, probe).unwrap();
     p.scale_obj_probe();
+    p.set_sampling(sampling);
     let rows = table(files[2]);
     let start = offsets(&rows, 1);
     p.set_features(Features {
@@ -84,24 +88,38 @@ fn assert_run(what: &str, params: RpieParams, nepoch: usize, files: [&str; 3]) {
         &format!("{what} offsets"),
         &delta(got),
         &delta(&want),
-        1e-12,
+        // 5x the worst measured (3.5e-13): pty-chi's absolute positions cost the change digits
+        2e-12,
     );
 }
 
 /// One epoch of two batches of 20 from offsets within 0.4.
+const STEP: RpieParams = RpieParams {
+    obj_step: Some(0.9),
+    probe_step: Some(0.8),
+    obj_alpha: 0.3,
+    probe_alpha: 0.2,
+    batch_size: 20,
+    calc_llk: 1,
+};
+
+/// Three epochs of ten batches of 4 from offsets within 0.15.
+const EPOCHS: RpieParams = RpieParams {
+    obj_step: Some(1.0),
+    probe_step: Some(1.0),
+    obj_alpha: 0.5,
+    probe_alpha: 0.5,
+    batch_size: 4,
+    calc_llk: 1,
+};
+
+/// [`STEP`] under PATCH.
 #[test]
 fn rpie_positions_step_matches_ptychi() {
-    let params = RpieParams {
-        obj_step: Some(0.9),
-        probe_step: Some(0.8),
-        obj_alpha: 0.3,
-        probe_alpha: 0.2,
-        batch_size: 20,
-        calc_llk: 1,
-    };
     assert_run(
         "step",
-        params,
+        Sampling::Patch,
+        STEP,
         1,
         [
             include_str!("engine/data/rpie_pos_step_obj_f64.txt"),
@@ -111,25 +129,50 @@ fn rpie_positions_step_matches_ptychi() {
     );
 }
 
-/// Three epochs of ten batches of 4 from offsets within 0.15.
+/// [`EPOCHS`] under PATCH.
 #[test]
 fn rpie_positions_epochs_match_ptychi() {
-    let params = RpieParams {
-        obj_step: Some(1.0),
-        probe_step: Some(1.0),
-        obj_alpha: 0.5,
-        probe_alpha: 0.5,
-        batch_size: 4,
-        calc_llk: 1,
-    };
     assert_run(
         "epochs",
-        params,
+        Sampling::Patch,
+        EPOCHS,
         3,
         [
             include_str!("engine/data/rpie_pos_epochs_obj_f64.txt"),
             include_str!("engine/data/rpie_pos_epochs_probe_f64.txt"),
             include_str!("engine/data/rpie_pos_epochs_offsets_f64.txt"),
+        ],
+    );
+}
+
+/// [`STEP`] under FULL_OBJECT.
+#[test]
+fn rpie_full_object_positions_step_matches_ptychi() {
+    assert_run(
+        "full-object step",
+        Sampling::FullObject,
+        STEP,
+        1,
+        [
+            include_str!("engine/data/rpie_full_object_step_obj_f64.txt"),
+            include_str!("engine/data/rpie_full_object_step_probe_f64.txt"),
+            include_str!("engine/data/rpie_full_object_step_offsets_f64.txt"),
+        ],
+    );
+}
+
+/// [`EPOCHS`] under FULL_OBJECT.
+#[test]
+fn rpie_full_object_positions_epochs_match_ptychi() {
+    assert_run(
+        "full-object epochs",
+        Sampling::FullObject,
+        EPOCHS,
+        3,
+        [
+            include_str!("engine/data/rpie_full_object_epochs_obj_f64.txt"),
+            include_str!("engine/data/rpie_full_object_epochs_probe_f64.txt"),
+            include_str!("engine/data/rpie_full_object_epochs_offsets_f64.txt"),
         ],
     );
 }
