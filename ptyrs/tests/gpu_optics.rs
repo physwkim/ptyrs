@@ -1,8 +1,10 @@
 //! The propagator stages against the CPU's `f64` [`Propagator`], on the fused passes'
 //! smallest side: around a host Fourier transform an exit stage gives the propagator's
 //! intensities and, back through its adjoint, `Uᴴ·w·U` for real detector weights; the
-//! in-object propagation gives angular spectrum and its adjoint. Frames of two modes in
-//! stacks of 3 and 2, the shorter leaving the last frame's planes as they were.
+//! in-object propagation gives angular spectrum and its adjoint. The slice launches give a
+//! multislice object's products, their adjoint, the displaced plane phase of the CPU's
+//! `Optics::moved_quad` and the row transforms. Frames of two modes in stacks of 3 and 2,
+//! the shorter leaving the last frame's planes as they were.
 
 use std::f64::consts::PI;
 use std::sync::Arc;
@@ -10,8 +12,11 @@ use std::sync::Arc;
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 use ptyrs::base::C64;
-use ptyrs::engine::{PlaneStage, Propagator, Wavefield, shift};
-use ptyrs::gpu::{C32, ExitStage, Kernels, OpticsKernels, StackTable, ViewDims};
+use ptyrs::engine::{Optics, PlaneStage, Propagator, Wavefield, shift};
+use ptyrs::gpu::{
+    C32, ExitStage, Kernels, OpticsKernels, SlicePhase, SliceSource, StackTable, ViewAddr,
+    ViewDims, Views,
+};
 
 #[path = "common/worst.rs"]
 mod worst;
@@ -261,6 +266,213 @@ fn gap_is_angular_spectrum_and_its_adjoint() {
                     "{shape:?}, adjoint {adjoint}, stack {s}: {err:.3e}"
                 );
             }
+        }
+    }
+}
+
+/// Views of every frame and mode on the object of [`dims`], windows at whole and fractional
+/// pixels.
+fn views() -> Vec<ViewAddr> {
+    (0..5u32)
+        .flat_map(|f| {
+            (0..NMODE as u32).map(move |m| ViewAddr {
+                oy: 3 + 5 * f,
+                ox: 27 - 4 * f,
+                fy: [0.0, 0.25, 0.5, 0.0, 0.875][f as usize],
+                fx: [0.0, 0.625, 0.0, 0.375, 0.125][f as usize],
+                probe: m,
+                obj: 0,
+            })
+        })
+        .collect()
+}
+
+/// The object's bilinear window of view `v` at natural pixel `j`.
+fn window(obj: &[C64], v: &ViewAddr, j: usize, nx: usize, nxo: usize) -> C64 {
+    let (fy, fx) = (v.fy as f64, v.fx as f64);
+    let at = |dy: usize, dx: usize| {
+        obj[(v.oy as usize + j / nx + dy) * nxo + v.ox as usize + j % nx + dx]
+    };
+    let corner = |w: f64, dy, dx| {
+        if w == 0.0 {
+            C64::default()
+        } else {
+            at(dy, dx) * w
+        }
+    };
+    corner((1.0 - fy) * (1.0 - fx), 0, 0)
+        + corner((1.0 - fy) * fx, 0, 1)
+        + corner(fy * (1.0 - fx), 1, 0)
+        + corner(fy * fx, 1, 1)
+}
+
+#[test]
+fn slice_products_are_the_windows_times_probe_or_waves() {
+    let (stream, ctx, k) = setup();
+    for shape in [[64, 64], [64, 128]] {
+        let [ny, nx] = shape;
+        let n = ny * nx;
+        let d = dims(shape);
+        let nxo = d.obj[1] as usize;
+        let table = StackTable::new(&stream, &d, &[0..3, 3..5]).unwrap();
+        let addr = views();
+        let on_device = Views::new(&stream, d, &addr).unwrap();
+        let obj = noise(d.obj[0] as usize * nxo, 11);
+        let probe = noise(NMODE * n, 13);
+        let waves = noise(NPLANE * n, 17);
+        let before = noise(NPLANE * n, 19);
+        let (dev_obj, dev_probe, dev_waves) =
+            (up(&stream, &obj), up(&stream, &probe), up(&stream, &waves));
+        for (s, f0, live) in [(0, 0, NPLANE), (1, 3, 2 * NMODE)] {
+            // Plane `kl`'s value at natural pixel `j`, placed at its stored pixel.
+            let want = |f: &dyn Fn(usize, usize, C64) -> C64| {
+                let mut out = before.clone();
+                for kl in 0..live {
+                    let v = &addr[f0 * NMODE + kl];
+                    for j in 0..n {
+                        out[kl * n + shift(j, ny, nx)] = f(kl, j, window(&obj, v, j, nx, nxo));
+                    }
+                }
+                out
+            };
+            let stored = |kl: usize, j: usize| waves[kl * n + shift(j, ny, nx)];
+            let cases: [(&str, Vec<C64>, Option<SliceSource<'_>>); 3] = [
+                (
+                    "probe",
+                    want(&|kl, j, o| o * probe[kl % NMODE * n + j]),
+                    Some(SliceSource::Probe(&dev_probe)),
+                ),
+                (
+                    "waves",
+                    want(&|kl, j, o| o * stored(kl, j)),
+                    Some(SliceSource::Waves(&dev_waves)),
+                ),
+                ("adjoint", want(&|kl, j, o| o.conj() * stored(kl, j)), None),
+            ];
+            for (name, want, src) in cases {
+                let mut dst = up(&stream, &before);
+                match src {
+                    Some(src) => {
+                        k.slice_mul(&ctx, &on_device, table.at(s), &dev_obj, src, &mut dst)
+                    }
+                    None => k.slice_adjoint(
+                        &ctx,
+                        &on_device,
+                        table.at(s),
+                        &dev_obj,
+                        &dev_waves,
+                        &mut dst,
+                    ),
+                }
+                .unwrap();
+                let got = down(&stream, &dst);
+                assert_eq!(
+                    got[live * n..],
+                    down(&stream, &up(&stream, &before))[live * n..],
+                    "{name}"
+                );
+                let err = max_rel(&got[..live * n], &want[..live * n]);
+                assert!(err < 2e-6, "{shape:?}, {name}, stack {s}: {err:.3e}");
+            }
+        }
+    }
+}
+
+#[test]
+fn slice_phase_is_the_cpu_moved_quad_but_for_a_frame_constant() {
+    let (stream, ctx, k) = setup();
+    let shape = [64, 64];
+    let [ny, nx] = shape;
+    let n = ny * nx;
+    let d = dims(shape);
+    let table = StackTable::new(&stream, &d, &[0..3, 3..5]).unwrap();
+    let w = |z| Wavefield::new(shape, 1e-10, [50e-9, 50e-9], z).unwrap();
+    let offsets: [[f64; 2]; 5] = [
+        [0.0, 0.0],
+        [1.75, -0.5],
+        [-2.25, 3.0],
+        [0.375, 0.625],
+        [-1.0, -1.5],
+    ];
+    let flat: Vec<f32> = offsets.iter().flatten().map(|&v| v as f32).collect();
+    let dev_offsets = DeviceBuffer::from_host(&stream, &flat).unwrap();
+    let x = noise(NPLANE * n, 23);
+    for z in [5e-3, -8e-3] {
+        let optics = Optics::free_space(&w(z)).with_slices(&[w(2e-5)]).unwrap();
+        let quad = optics.fourier_form().unwrap().quad;
+        assert_ne!(quad, 0.0);
+        for moved in [false, true] {
+            for (s, f0, live) in [(0, 0, NPLANE), (1, 3, 2 * NMODE)] {
+                // q(r − d) of each frame, less its constant exp(i quad |d|²).
+                let q: Vec<Vec<C64>> = (0..live / NMODE)
+                    .map(|fl| {
+                        if !moved {
+                            return optics.quad().to_vec();
+                        }
+                        let [dy, dx] = offsets[f0 + fl];
+                        let c = C64::from_polar(1.0, -quad * (dy * dy + dx * dx));
+                        let m = optics.moved_quad([dy, dx]).unwrap();
+                        m.quad.iter().map(|q| q * c).collect()
+                    })
+                    .collect();
+                for adjoint in [false, true] {
+                    let mut want = x.clone();
+                    for kl in 0..live {
+                        for j in 0..n {
+                            let q = q[kl / NMODE][j];
+                            want[kl * n + shift(j, ny, nx)] *= if adjoint { q.conj() } else { q };
+                        }
+                    }
+                    let phase = SlicePhase {
+                        quad: quad as f32,
+                        offsets: moved.then_some(&dev_offsets),
+                    };
+                    let mut waves = up(&stream, &x);
+                    k.slice_phase(&ctx, &d, table.at(s), phase, &mut waves, adjoint)
+                        .unwrap();
+                    let got = down(&stream, &waves);
+                    assert_eq!(got[live * n..], down(&stream, &up(&stream, &x))[live * n..]);
+                    let err = max_rel(&got[..live * n], &want[..live * n]);
+                    assert!(
+                        err < 5e-5,
+                        "z {z}, moved {moved}, adjoint {adjoint}, stack {s}: {err:.3e}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn rows_and_pair_are_the_row_transforms_and_the_conjugate_product() {
+    let (stream, ctx, k) = setup();
+    for shape in [[64, 64], [64, 128]] {
+        let n = shape[0] * shape[1];
+        let d = dims(shape);
+        let table = StackTable::new(&stream, &d, &[0..3, 3..5]).unwrap();
+        let (a, b) = (noise(NPLANE * n, 29), noise(NPLANE * n, 31));
+        let kept = down(&stream, &up(&stream, &a));
+        for (s, live) in [(0, NPLANE), (1, 2 * NMODE)] {
+            for inverse in [false, true] {
+                let mut waves = up(&stream, &a);
+                k.rows(&ctx, &d, table.at(s), &mut waves, inverse).unwrap();
+                let got = down(&stream, &waves);
+                assert_eq!(got[live * n..], kept[live * n..]);
+                let want = dft(&a, shape, true, inverse);
+                let err = max_rel(&got[..live * n], &want[..live * n]);
+                assert!(
+                    err < 2e-6,
+                    "{shape:?}, inverse {inverse}, stack {s}: {err:.3e}"
+                );
+            }
+            let mut dst = up(&stream, &a);
+            let pair = [&up(&stream, &a), &up(&stream, &b)];
+            k.slice_pair(&ctx, &d, table.at(s), pair, &mut dst).unwrap();
+            let got = down(&stream, &dst);
+            assert_eq!(got[live * n..], kept[live * n..]);
+            let want: Vec<C64> = a.iter().zip(&b).map(|(a, b)| a.conj() * b).collect();
+            let err = max_rel(&got[..live * n], &want[..live * n]);
+            assert!(err < 2e-6, "{shape:?}, pair, stack {s}: {err:.3e}");
         }
     }
 }
