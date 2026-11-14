@@ -1064,7 +1064,7 @@ mod tests {
         let warm = WarmUp::end();
         let table = Arc::new(PosTable::new(1 << 16));
         let uploader = {
-            let (ring, ctx, stop, store) = (ring.clone(), ctx.clone(), stop.clone(), store.clone());
+            let (ring, stop, store) = (ring.clone(), stop.clone(), store.clone());
             let table = table.clone();
             let up = UploaderConfig {
                 batch: NonZeroUsize::new(4).unwrap(),
@@ -1073,7 +1073,7 @@ mod tests {
                 events: 4,
                 pos_wait_ns: 1_000_000_000,
             };
-            std::thread::spawn(move || run_uploader(ring, ctx, store, table, up, stop, Some(tx)))
+            std::thread::spawn(move || run_uploader(ring, store, table, up, stop, Some(tx)))
         };
         let (mut k, mut scan_end) = (0, 0);
         for burst in [5, 1, 13, 0, 17] {

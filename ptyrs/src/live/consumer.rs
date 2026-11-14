@@ -236,7 +236,7 @@ mod tests {
         let ((), consumer) = sent(&cap_rx, consumer);
         let warm = WarmUp::end();
         let uploader = {
-            let (ring, ctx, stop, store) = (ring.clone(), ctx.clone(), stop.clone(), store.clone());
+            let (ring, stop, store) = (ring.clone(), stop.clone(), store.clone());
             let pos = pos.clone();
             let cfg = UploaderConfig {
                 batch: NonZeroUsize::new(5).unwrap(),
@@ -245,7 +245,7 @@ mod tests {
                 events: 4,
                 pos_wait_ns: 1_000_000_000,
             };
-            std::thread::spawn(move || run_uploader(ring, ctx, store, pos, cfg, stop, Some(tx)))
+            std::thread::spawn(move || run_uploader(ring, store, pos, cfg, stop, Some(tx)))
         };
         let frame = |seq: u64| -> Vec<u16> {
             (0..se)
