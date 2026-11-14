@@ -6,7 +6,7 @@
 
 use ptyrs::base::{C64, Scan};
 use ptyrs::engine::{
-    ApParams, Cost, DmParams, Features, Fft2, Ptycho, background_cost, background_grad,
+    ApParams, Cost, DmParams, Features, Fft2, Ptycho, Sampling, background_cost, background_grad,
     intensity_grad, llk, obj_probe_shift_to_psi, obj_probe_to_psi, position_grad, scale_psi, shift,
 };
 
@@ -98,6 +98,56 @@ fn position_matches_pos_grad_ref() {
         let want: Vec<f64> = rows.iter().flat_map(|r| [r[col], r[col + 1]]).collect();
         let e = max_rel(&got, &want);
         assert!(e < 1e-12, "{cost:?}: max rel {e:.3e}");
+    }
+}
+
+/// [`position_grad`] along a direction over every frame's offset against five-point central
+/// differences of the Poisson sum and of a quarter of the Euclidian sum, at the reference's
+/// offsets under either sampling.
+#[test]
+fn position_grad_matches_central_differences() {
+    let (scan, mut p) = state();
+    let rows = table(include_str!("engine/data/pos_grad_f64.txt"));
+    let offsets: Vec<[f64; 2]> = (rows.iter().enumerate())
+        .map(|(f, r)| {
+            let v = p.addr().frame_views(f)[0];
+            [r[1] - v.oy as f64, r[2] - v.ox as f64]
+        })
+        .collect();
+    let w: Vec<[f64; 2]> = (0..offsets.len())
+        .map(|f| [(1.3 * f as f64 + 0.2).sin(), (0.7 * f as f64).cos()])
+        .collect();
+    let fft = Fft2::new(scan.geometry.frame);
+    // Measured worst 2.3e-9 at 5e-4, the sums' rounding; 2.7e-8 at 1e-3, the step's.
+    let h = 5e-4;
+    for sampling in [Sampling::Patch, Sampling::FullObject] {
+        p.set_sampling(sampling);
+        let views = p.addr().views();
+        // The Poisson sum and a quarter of the Euclidian sum at `offsets + t·w`.
+        let costs = |t: f64| {
+            let d: Vec<[f64; 2]> = (offsets.iter().zip(&w))
+                .map(|(d, w)| [d[0] + t * w[0], d[1] + t * w[1]])
+                .collect();
+            let mut psi = vec![C64::default(); views.len() * p.probe().plane_len()];
+            obj_probe_shift_to_psi(&p, views, &d, &mut psi);
+            fft.forward(&mut psi);
+            let l = llk(p.observed(), 0..p.addr().nframe(), p.addr().nmode(), &psi);
+            [l.poisson, l.euclidian / 4.0]
+        };
+        let [p1, m1, p2, m2] = [h, -h, 2.0 * h, -2.0 * h].map(costs);
+        for (i, cost) in [Cost::Poisson, Cost::Amplitude].into_iter().enumerate() {
+            let fd = (8.0 * (p1[i] - m1[i]) - (p2[i] - m2[i])) / (12.0 * h);
+            let g = position_grad(&p, views, &offsets, cost);
+            let dot: f64 = (g.iter().zip(&w))
+                .map(|(g, w)| g[0] * w[0] + g[1] * w[1])
+                .sum();
+            let err = (dot - fd).abs() / fd.abs();
+            eprintln!("{sampling:?} {cost:?}: {dot:.6e} differences {fd:.6e}, {err:.3e}");
+            assert!(
+                err < 1e-8,
+                "{sampling:?} {cost:?}: {dot} differences {fd}, {err:.3e}"
+            );
+        }
     }
 }
 

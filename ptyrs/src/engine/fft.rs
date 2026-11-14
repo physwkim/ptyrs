@@ -6,6 +6,7 @@ use rustfft::{Fft, FftPlanner};
 /// Unitary 2D FFT over every `[ny, nx]` plane of a buffer (numpy `fftn` / `ifftn` with
 /// `axes=(-2, -1), norm="ortho"`): forward `X[k] = Σ_n x[n] e^{-2πi k·n/N} / √(ny·nx)`, inverse
 /// with `e^{+2πi …}` and the same scale. No shift is applied; `psi` stays FFT-shifted.
+#[derive(Clone)]
 pub struct Fft2 {
     shape: [usize; 2],
     /// `[forward, inverse]` along x (length `nx`) and along y (length `ny`).

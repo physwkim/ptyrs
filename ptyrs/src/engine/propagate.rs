@@ -175,6 +175,12 @@ impl Optics {
     pub fn nslice(&self) -> usize {
         self.gaps.len() + 1
     }
+
+    /// A finite propagation distance to the detector: a propagator other than
+    /// [`Propagator::Fourier`].
+    pub fn near_field(&self) -> bool {
+        !matches!(self.propagator, Propagator::Fourier(_))
+    }
 }
 
 /// An [`Optics`]' propagator less the plane phase it starts with, which [`Optics::quad`]
