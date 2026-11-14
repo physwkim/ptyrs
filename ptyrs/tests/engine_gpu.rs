@@ -12,7 +12,7 @@ use ptyrs::base::{C64, Counts, MASKED, Object, Probe, Scan, Stack};
 use ptyrs::engine::{
     Algorithm, ApParams, Backend, Bh, BhParams, BhStep, Cost, DmParams, EngineError, Features,
     GpuOptions, GpuPtycho, Llk, LlkRecord, Lsqml, LsqmlParams, MlParams, Observed, Optics, Params,
-    Ptycho, RaarParams, RpieParams, Step, llk,
+    Ptycho, RaarParams, RpieParams, Step, llk, obj_probe_shift_to_psi, shift,
 };
 use ptyrs::gpu::{
     C32, FUSED_SIDES, Kernels, LlkPartial, LlkRing, LlkScratch, StackTable, ViewDims,
@@ -1179,7 +1179,7 @@ fn position_matches_cpu() {
         ..Features::default()
     };
     let [ap, ..] = feature_cycles(1);
-    // Measured llk 1.1e-6, object 3.6e-6, probe 4.3e-6 and offsets 9.3e-8 pixels.
+    // Measured llk 1.1e-6, object 7.8e-7, probe 7.3e-7 and offsets 9.9e-8 pixels.
     let (cpu, _) = features_match_cpu(ap, &start, &moved, NCYCLE);
     let d = cpu.features().position.clone().unwrap();
     let llk = |r: &LlkRecord| r.llk.poisson;
@@ -1221,8 +1221,8 @@ fn dm_position_matches_cpu() {
         position: Some(d0.clone()),
         ..Features::default()
     };
-    // Measured llk 1.5e-6 and 1.2e-6, object 9.1e-6 and 1.7e-5, probe 6.7e-6 and 8.6e-6,
-    // offsets 5.4e-7 and 3.3e-7 pixels; rms offset 0.22 from 0.28 both.
+    // Measured llk 1.9e-6 and 1.3e-6, object 6.8e-6 and 1.1e-5, probe 4.9e-6 and 5.0e-6,
+    // offsets 2.9e-7 and 3.3e-7 pixels; rms offset 0.22 from 0.28 both.
     for loop_obj_probe in [1, 2] {
         let dm = Cycles::Dm(DmParams {
             calc_llk: 1,
@@ -1295,6 +1295,129 @@ fn raar_features_match_cpu() {
             rms(&d),
             rms(&d0)
         );
+    }
+}
+
+/// The far-field intensity of `p`'s object and probe moved by `offsets`, in detector order.
+fn moved_intensity(p: &Ptycho, offsets: &[[f64; 2]]) -> Vec<f64> {
+    let [_, ny, nx] = p.probe().dims();
+    let (n, nmode) = (ny * nx, p.addr().nmode());
+    let views = p.addr().views();
+    let mut psi = vec![C64::default(); views.len() * n];
+    obj_probe_shift_to_psi(p, views, offsets, &mut psi);
+    p.optics().exit().forward(&mut psi);
+    let mut out = vec![0.0; p.addr().nframe() * n];
+    for (out, block) in out.chunks_exact_mut(n).zip(psi.chunks_exact(nmode * n)) {
+        for (i, out) in out.iter_mut().enumerate() {
+            let j = shift(i, ny, nx);
+            *out = (0..nmode).map(|m| block[m * n + j].norm_sqr()).sum();
+        }
+    }
+    out
+}
+
+/// From the object, the probe and the [`drawn_offsets`] a scan's counts were drawn under,
+/// three cycles of AP, DM and RAAR (one and two object-then-probe updates) leave all three in
+/// place on the GPU as on the CPU. The counts are the model rounded to whole photons at a peak
+/// of 4e4 a pixel, so the truth is a fixed point up to that rounding, and the GPU stays within
+/// 1e-5 of the CPU there.
+#[test]
+fn the_truth_under_a_moved_probe_is_a_fixed_point() {
+    const PEAK: f64 = 4e4;
+    let (scan, mut object, mut probe) = start(FUSED.frame, 2, false);
+    let offsets = drawn_offsets();
+    let dims = scan.counts.dims();
+    let blank = Counts::from_raw(dims, vec![0; scan.counts.as_slice().len()]).unwrap();
+    let blank = Scan::new(scan.geometry, scan.positions.clone(), blank).unwrap();
+    let model = |object: &Object, probe: &Probe| {
+        let p = Ptycho::new(&blank, object.clone(), probe.clone()).unwrap();
+        moved_intensity(&p, &offsets)
+    };
+    let s = (PEAK / worst_of(model(&object, &probe))).powf(0.25);
+    object.as_mut_slice().iter_mut().for_each(|c| *c *= s);
+    probe.as_mut_slice().iter_mut().for_each(|c| *c *= s);
+    let rounded: Vec<f64> = model(&object, &probe).iter().map(|v| v.round()).collect();
+    let counts = Counts::from_f64(dims, &rounded, None).unwrap();
+    let scan = Scan::new(scan.geometry, scan.positions.clone(), counts).unwrap();
+    let truth = Features {
+        position: Some(offsets.clone()),
+        ..Features::default()
+    };
+    let ap = Cycles::Ap(ApParams {
+        obj_inertia: Some(0.01),
+        probe_inertia: Some(0.001),
+        calc_llk: 0,
+        zero_phase_ramp: false,
+    });
+    let dm = |loop_obj_probe| {
+        Cycles::Dm(DmParams {
+            loop_obj_probe,
+            zero_phase_ramp: false,
+            ..DmParams::default()
+        })
+    };
+    let raar = |loop_obj_probe| {
+        Cycles::Raar(RaarParams {
+            loop_obj_probe,
+            zero_phase_ramp: false,
+            ..RaarParams::default()
+        })
+    };
+    let moved = |a: &Stack<C64>, b: &Stack<C64>| {
+        let d = worst_of((a.as_slice().iter().zip(b.as_slice())).map(|(a, b)| (a - b).norm()));
+        d / worst_of(b.as_slice().iter().map(|b| b.norm()))
+    };
+    let walked = |d: &Features| {
+        worst_of(
+            (d.position.iter().flatten().zip(&offsets))
+                .flat_map(|(a, b)| [(a[0] - b[0]).abs(), (a[1] - b[1]).abs()]),
+        )
+    };
+    // Measured on both backends alike: object 2.3e-3 to 6.3e-3 of its largest modulus (the
+    // rounding, in the weakly lit pixels), probe 1.4e-4 to 2.6e-4, offsets 6.1e-6 to 1.2e-5
+    // pixels; the GPU 2.0e-7 from the CPU's object and 3.6e-7 from its probe at worst. A probe
+    // step from the sums of the unmoved probe drifts as little but ends 5.1e-5 (AP) and
+    // 1.1e-4 (DM) from the CPU's probe.
+    for cycles in [ap, dm(1), dm(2), raar(1), raar(2)] {
+        let mut cpu = Ptycho::new(&scan, object.clone(), probe.clone()).unwrap();
+        cpu.set_features(truth.clone()).unwrap();
+        let mut gpu =
+            GpuPtycho::new(&ctx(), &scan, object.clone(), probe.clone(), FUSED.options).unwrap();
+        gpu.set_features(&truth).unwrap();
+        cycles.cpu(&mut cpu, 3);
+        cycles.gpu(&mut gpu, 3);
+        let cpu_drift = [
+            moved(cpu.object(), &object),
+            moved(cpu.probe(), &probe),
+            walked(cpu.features()),
+        ];
+        let (o, p) = (gpu.object().unwrap(), gpu.probe().unwrap());
+        let gpu_drift = [
+            moved(&o, &object),
+            moved(&p, &probe),
+            walked(&gpu.features().unwrap()),
+        ];
+        let apart = [rel_l2(&o, cpu.object()), rel_l2(&p, cpu.probe())];
+        let show = |v: &[f64]| {
+            v.iter()
+                .map(|v| format!("{v:.2e}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        println!(
+            "{cycles:?}: drift of object, probe, offsets: gpu {} cpu {}; gpu from cpu {}",
+            show(&gpu_drift),
+            show(&cpu_drift),
+            show(&apart),
+        );
+        for drift in [gpu_drift, cpu_drift] {
+            for (d, bound) in drift.into_iter().zip([1e-2, 1e-3, 1e-4]) {
+                assert!(d < bound, "{cycles:?}: drift {d:e}");
+            }
+        }
+        for a in apart {
+            assert!(a < 1e-5, "{cycles:?}: gpu from cpu {a:e}");
+        }
     }
 }
 

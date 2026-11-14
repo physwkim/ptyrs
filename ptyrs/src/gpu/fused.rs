@@ -25,10 +25,10 @@ use ptyrs_kernels::fused::{
     FFT_SKEW, FUSED_BACKGROUND, FUSED_BACKGROUND_SUMS, FUSED_COLS, FUSED_DM, FUSED_DOWN,
     FUSED_GRAD, FUSED_ITERATE, FUSED_LLK, FUSED_MODEL_TERMS, FUSED_PROJECT, FUSED_RAAR,
     FUSED_ROW_THREADS, FUSED_SCALE, FUSED_SCALE_SUMS, FUSED_SHIFT_DEN, FUSED_SHIFT_OBJ,
-    FUSED_SHIFT_POSITION, FUSED_SHIFT_PROBE, FUSED_TO_PSI, FusedCfg, FusedPtrs, col_slot_bytes,
-    fused_col_threads, shift_stage_bytes,
+    FUSED_SHIFT_POSITION, FUSED_SHIFT_PROBE, FUSED_SHIFT_STEP, FUSED_STEP_CHUNKS, FUSED_TO_PSI,
+    FusedCfg, FusedPtrs, col_slot_bytes, fused_col_threads, shift_stage_bytes,
 };
-use ptyrs_kernels::pixel::{PsiPtr, SumPtrs, psi_f32};
+use ptyrs_kernels::pixel::{PIXEL_THREADS, PsiPtr, SumPtrs, psi_f32};
 
 use crate::gpu::ops::grid_1d;
 use crate::gpu::psi::check_waves;
@@ -418,21 +418,56 @@ pub struct ShiftedProbeSums {
     num: DeviceBuffer<C32>,
     /// `sum |O|^2`, `[nprobe, ny, nx]`.
     den: DeviceBuffer<f32>,
+    /// Scratch of [`Kernels::probe_step`]: the spectra of its direction, as `num`.
+    step: DeviceBuffer<C32>,
+    /// Its slope and curvature per block of [`PIXEL_THREADS`] probe pixels, `[len / 256, 2]`.
+    parts: DeviceBuffer<f32>,
+    /// `sum |O s|^2` per probe mode, frame and row block, `[nprobe, nframe, ny / rows]`.
+    norm: DeviceBuffer<f32>,
+    /// `norm` in [`FUSED_STEP_CHUNKS`] sums per probe mode.
+    chunks: DeviceBuffer<f32>,
+    /// The step length per probe mode.
+    alpha: DeviceBuffer<f32>,
 }
 
 impl ShiftedProbeSums {
     pub fn zeroed(stream: &CudaStream, dims: &ViewDims) -> Result<Self, Error> {
         let len = dims.nprobe as usize * dims.n();
+        let nprobe = dims.nprobe as usize;
         Ok(Self {
             num: DeviceBuffer::zeroed(stream, len)?,
             den: DeviceBuffer::zeroed(stream, len)?,
+            step: DeviceBuffer::zeroed(stream, len)?,
+            parts: DeviceBuffer::zeroed(stream, 2 * len.div_ceil(PIXEL_THREADS as usize))?,
+            norm: DeviceBuffer::zeroed(stream, nprobe * Self::norm_len(dims)?)?,
+            chunks: DeviceBuffer::zeroed(stream, nprobe * FUSED_STEP_CHUNKS as usize)?,
+            alpha: DeviceBuffer::zeroed(stream, nprobe)?,
         })
+    }
+
+    /// `norm`'s floats per probe mode.
+    fn norm_len(d: &ViewDims) -> Result<usize, Error> {
+        Ok(d.nframe as usize * (d.frame[0] / Shape::of(d)?.rows) as usize)
     }
 
     fn check(&self, d: &ViewDims) -> Result<(), Error> {
         let len = d.nprobe as usize * d.n();
         check_len("shifted probe sums num", &self.num, len)?;
-        check_len("shifted probe sums den", &self.den, len)
+        check_len("shifted probe sums den", &self.den, len)?;
+        check_len("probe step spectra", &self.step, len)?;
+        check_len(
+            "probe step parts",
+            &self.parts,
+            2 * len.div_ceil(PIXEL_THREADS as usize),
+        )?;
+        let nprobe = d.nprobe as usize;
+        check_len("probe step norm", &self.norm, nprobe * Self::norm_len(d)?)?;
+        check_len(
+            "probe step chunks",
+            &self.chunks,
+            nprobe * FUSED_STEP_CHUNKS as usize,
+        )?;
+        check_len("probe step lengths", &self.alpha, nprobe)
     }
 
     fn ptrs(&self) -> SumPtrs {
@@ -454,6 +489,9 @@ impl ShiftedProbeSums {
 pub struct ShiftSums<'a> {
     /// The probe sums, in place of [`FusedSums::probe`].
     pub probe: Option<&'a mut ShiftedProbeSums>,
+    /// With `probe`, its sums are of the correction `c` of `position` in place of `x`, for
+    /// [`Kernels::probe_step`]; nothing under [`Exit::Grad`].
+    pub step: bool,
     /// The position sums of the exit-wave correction `c`: `position[f0 + fl] = Re sum
     /// conj(c) O dW / d(dy, dx)` over the frame's views and pixels, for `fl < nf`;
     /// `[nframe]`, no other entry written. `c = x - O W`, the step from the waves the pass
@@ -726,6 +764,7 @@ impl Kernels {
             shift:
                 ShiftSums {
                     probe: shift_probe,
+                    step,
                     position,
                     position_den,
                 },
@@ -769,6 +808,7 @@ impl Kernels {
             Some(_) => {
                 flag(obj_sums.is_some(), FUSED_SHIFT_OBJ)
                     | flag(shift_probe.is_some(), FUSED_SHIFT_PROBE)
+                    | flag(step, FUSED_SHIFT_STEP)
                     | flag(position.is_some(), FUSED_SHIFT_POSITION)
                     | flag(position_den.is_some(), FUSED_SHIFT_DEN)
                     | (pass & FUSED_GRAD)
@@ -780,7 +820,7 @@ impl Kernels {
             Some(sh) => {
                 let slopes = FUSED_SHIFT_DEN | FUSED_SHIFT_POSITION;
                 let t_dy = (shift_flags & slopes != 0).then_some(&sh.scratch.adj);
-                run.shift_pre(&sh.model, &sh.scratch.t, t_dy, p)?;
+                run.shift_pre(&sh.model, sh.model.spectrum.a, &sh.scratch.t, t_dy, p)?;
                 run.shift_rows_fwd(&sh.scratch.t, &bufs.work, carried, p, fwd)?;
             }
             None => {
@@ -855,6 +895,39 @@ impl Kernels {
         bufs: &mut FusedBufs,
         sums: PsiSums<'_>,
     ) -> Result<(), Error> {
+        self.psi_sums(ctx, inputs, stack, psi, bufs, sums, false)
+    }
+
+    /// [`Self::shifted_psi_sums`] of the probe alone, of the step `psi - O W` from the waves
+    /// of the arrays of `inputs` in place of `psi`, as [`ShiftSums::step`]: the sums of
+    /// [`Self::probe_step`].
+    pub fn shifted_step_sums(
+        &self,
+        ctx: &ExecutionContext,
+        inputs: &FusedInputs<'_>,
+        stack: StackRef<'_>,
+        psi: &dyn Waves,
+        bufs: &mut FusedBufs,
+        probe: &mut ShiftedProbeSums,
+    ) -> Result<(), Error> {
+        let sums = PsiSums {
+            obj: None,
+            probe: Some(probe),
+        };
+        self.psi_sums(ctx, inputs, stack, psi, bufs, sums, true)
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    fn psi_sums(
+        &self,
+        ctx: &ExecutionContext,
+        inputs: &FusedInputs<'_>,
+        stack: StackRef<'_>,
+        psi: &dyn Waves,
+        bufs: &mut FusedBufs,
+        sums: PsiSums<'_>,
+        step: bool,
+    ) -> Result<(), Error> {
         let bufs = &*bufs;
         let (run, shift) = Run::new(self, ctx, *inputs, stack, bufs)?;
         let Some(sh) = &shift else {
@@ -875,11 +948,13 @@ impl Kernels {
         };
         let flag = |on: bool, flag: u32| if on { flag } else { 0 };
         let cfg = FusedCfg {
-            flags: flag(obj.is_some(), FUSED_SHIFT_OBJ) | flag(probe.is_some(), FUSED_SHIFT_PROBE),
+            flags: flag(obj.is_some(), FUSED_SHIFT_OBJ)
+                | flag(probe.is_some(), FUSED_SHIFT_PROBE)
+                | flag(step, FUSED_SHIFT_STEP),
             alpha: 0.0,
             beta: 0.0,
         };
-        run.shift_pre(&sh.model, &sh.scratch.t, None, p)?;
+        run.shift_pre(&sh.model, sh.model.spectrum.a, &sh.scratch.t, None, p)?;
         run.shift_sums(sh, psi, p, cfg)?;
         if let Some(sums) = probe {
             run.shift_post(sh, p)?;
@@ -952,7 +1027,7 @@ impl Kernels {
         let p = run.ptrs(bufs, &far);
         match &shift {
             Some(sh) => {
-                run.shift_pre(&sh.model, &sh.scratch.t, None, p)?;
+                run.shift_pre(&sh.model, sh.model.spectrum.a, &sh.scratch.t, None, p)?;
                 run.shift_rows_fwd(
                     &sh.scratch.t,
                     &bufs.work,
@@ -1073,39 +1148,51 @@ impl Kernels {
         probe: &'a DeviceBuffer<C32>,
         buf: &'a mut SpectrumBuf,
     ) -> Result<ProbeSpectrum<'a>, Error> {
-        let sh = Shape::of(dims)?;
         let len = dims.nprobe as usize * dims.n();
         check_len("probe", probe, len)?;
         check_len("spectrum", &buf.0, len)?;
+        self.spectrum_of(ctx, dims, probe, &buf.0)?;
+        Ok(ProbeSpectrum {
+            a: &buf.0,
+            probe,
+            key: ProbeSpectrum::key(dims),
+        })
+    }
+
+    /// `a = DFT(probe q) / n`, both `[nprobe, ny, nx]`, checked by the callers: the spectra
+    /// of [`Self::probe_spectrum`]. Two launches.
+    fn spectrum_of(
+        &self,
+        ctx: &ExecutionContext,
+        dims: &ViewDims,
+        probe: &DeviceBuffer<C32>,
+        a: &DeviceBuffer<C32>,
+    ) -> Result<(), Error> {
+        let sh = Shape::of(dims)?;
         let config = sh.plane_rows(dims.nprobe);
         let (ny, quad) = (dims.frame[0], dims.quad_phase);
-        let (src, a) = (dptr::<C32, f32>(probe).cast_const(), dptr(&buf.0));
-        self.launch(ctx, &[probe.storage()], &[buf.0.storage()], |stream| {
+        let (src, dst) = (dptr::<C32, f32>(probe).cast_const(), dptr(a));
+        self.launch(ctx, &[probe.storage()], &[a.storage()], |stream| {
             // SAFETY: both hold `[nprobe, ny, nx]`; the launch is the one `spectrum_rows`
             // documents.
             unsafe {
                 match sh.nx {
                     Side::N64 => self
                         .module
-                        .fused_spectrum_rows_64(stream, config, src, a, ny, quad),
+                        .fused_spectrum_rows_64(stream, config, src, dst, ny, quad),
                     Side::N128 => self
                         .module
-                        .fused_spectrum_rows_128(stream, config, src, a, ny, quad),
+                        .fused_spectrum_rows_128(stream, config, src, dst, ny, quad),
                     Side::N256 => self
                         .module
-                        .fused_spectrum_rows_256(stream, config, src, a, ny, quad),
+                        .fused_spectrum_rows_256(stream, config, src, dst, ny, quad),
                     Side::N512 => self
                         .module
-                        .fused_spectrum_rows_512(stream, config, src, a, ny, quad),
+                        .fused_spectrum_rows_512(stream, config, src, dst, ny, quad),
                 }
             }
         })?;
-        self.plane_fft(ctx, &sh, &buf.0, dims.nprobe, false, 1.0 / dims.n() as f32)?;
-        Ok(ProbeSpectrum {
-            a: &buf.0,
-            probe,
-            key: ProbeSpectrum::key(dims),
-        })
+        self.plane_fft(ctx, &sh, a, dims.nprobe, false, 1.0 / dims.n() as f32)
     }
 
     /// Adds the probe sums of a shifted probe, `sums`, to `out` `[nprobe, ny, nx]`: the
@@ -1148,6 +1235,170 @@ impl Kernels {
                 }
             }
         })
+    }
+
+    /// The probe step under a [`Model::shift`], PyNX's `ProbeNorm` where `A^H A` is not the
+    /// diagonal `sum |O|^2`: with `sums` the probe sums of the correction ([`ShiftSums::step`],
+    /// [`Self::shifted_step_sums`]) after [`Self::shifted_probe_sums`], `g = num` and `D =
+    /// max(den + reg, 1e-12)`, `reg = inertia * max(den)`, each probe mode's `sums.num`
+    /// becomes `alpha s`, `s = g / D` and `alpha = sum |g|^2 / D / (sum |O W_s|^2 + reg sum
+    /// |s|^2)`, `W_s` the mode's `s` moved to each frame of `stacks`, which must be every
+    /// stack of the scan; 0 where the first sum is not positive. `sums.den` is zeroed and
+    /// [`Self::probe_step_add`] takes the step. Reads the object of `inputs`, not its probe.
+    ///
+    /// Every sum is a fixed tree, so the split into stacks does not change a bit: the first
+    /// and the last over blocks of [`PIXEL_THREADS`] probe pixels, then strides of that
+    /// many blocks per mode; the middle one over each frame's row blocks, then
+    /// [`FUSED_STEP_CHUNKS`] chunks of them per mode. 8 launches and 2 per stack.
+    #[expect(clippy::too_many_arguments)]
+    pub fn probe_step<'s>(
+        &self,
+        ctx: &ExecutionContext,
+        inputs: &FusedInputs<'_>,
+        stacks: impl Iterator<Item = StackRef<'s>>,
+        bufs: &mut FusedBufs,
+        step: &mut ShiftedProbeSums,
+        sums: &mut UpdateSums,
+        inertia: f32,
+    ) -> Result<(), Error> {
+        let dims = inputs.views.dims();
+        let (npix, len) = (dims.n(), dims.nprobe as usize * dims.n());
+        step.check(dims)?;
+        sums.check(len)?;
+        let config = grid_1d(len)?;
+        // As `update_from_sums`.
+        let max_config = LaunchConfig {
+            grid_dim: (config.grid_dim.0.min(1024), 1, 1),
+            ..config
+        };
+        let UpdateSums { num, den, max_bits } = sums;
+        let n = len as u32;
+        crate::gpu::zero(ctx, max_bits)?;
+        self.launch(ctx, &[den.storage()], &[max_bits.storage()], |stream| {
+            // SAFETY: `den` holds `n` floats, `max_bits` one zeroed u32.
+            unsafe {
+                self.module
+                    .max_nonneg_f32(stream, max_config, dptr(den), n, dptr(max_bits))
+            }
+        })?;
+        let ptrs = SumPtrs {
+            num: dptr(num),
+            den: dptr(den),
+        };
+        let writes = [num.storage(), den.storage(), step.parts.storage()];
+        self.launch(ctx, &[max_bits.storage()], &writes, |stream| {
+            // SAFETY: the checks above sized the sums, and `parts` two floats per block.
+            unsafe {
+                self.module.probe_step_dir(
+                    stream,
+                    config,
+                    ptrs,
+                    n,
+                    dptr::<u32, u32>(max_bits).cast_const(),
+                    inertia,
+                    dptr(&step.parts),
+                )
+            }
+        })?;
+        self.spectrum_of(ctx, dims, num, &step.step)?;
+        for stack in stacks {
+            self.probe_step_norm(ctx, inputs, stack, bufs, step)?;
+        }
+        let per_mode = ShiftedProbeSums::norm_len(dims)? as u32;
+        let chunk_config = LaunchConfig {
+            grid_dim: (FUSED_STEP_CHUNKS, dims.nprobe, 1),
+            block_dim: (PIXEL_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let reads = [step.norm.storage()];
+        self.launch(ctx, &reads, &[step.chunks.storage()], |stream| {
+            // SAFETY: `check` sized `norm` `[nprobe, per_mode]` and `chunks` for the grid.
+            unsafe {
+                self.module.probe_step_norm(
+                    stream,
+                    chunk_config,
+                    dptr::<f32, f32>(&step.norm).cast_const(),
+                    per_mode,
+                    dptr(&step.chunks),
+                )
+            }
+        })?;
+        let alpha_config = LaunchConfig {
+            grid_dim: (dims.nprobe, 1, 1),
+            ..chunk_config
+        };
+        let nb = (npix / PIXEL_THREADS as usize) as u32;
+        let reads = [step.parts.storage(), step.chunks.storage()];
+        self.launch(ctx, &reads, &[step.alpha.storage()], |stream| {
+            // SAFETY: a frame is whole blocks of pixels, so `parts` holds `nb` pairs per
+            // mode; `chunks` and `alpha` as `check` sized them.
+            unsafe {
+                self.module.probe_step_alpha(
+                    stream,
+                    alpha_config,
+                    dptr::<f32, f32>(&step.parts).cast_const(),
+                    nb,
+                    dptr::<f32, f32>(&step.chunks).cast_const(),
+                    FUSED_STEP_CHUNKS,
+                    dptr(&step.alpha),
+                )
+            }
+        })?;
+        self.launch(ctx, &[step.alpha.storage()], &[num.storage()], |stream| {
+            // SAFETY: `num` holds `nprobe` planes of `npix`, `alpha` one float per plane.
+            unsafe {
+                self.module.probe_step_scale(
+                    stream,
+                    config,
+                    dptr(num),
+                    n,
+                    npix as u32,
+                    dptr::<f32, f32>(&step.alpha).cast_const(),
+                )
+            }
+        })
+    }
+
+    /// `probe += sums.num`, the step [`Self::probe_step`] left there, which is zeroed,
+    /// consumed.
+    pub fn probe_step_add(
+        &self,
+        ctx: &ExecutionContext,
+        probe: &mut DeviceBuffer<C32>,
+        sums: &mut UpdateSums,
+    ) -> Result<(), Error> {
+        let len = probe.len();
+        sums.check(len)?;
+        let config = grid_1d(len)?;
+        let writes = [probe.storage(), sums.num.storage()];
+        self.launch(ctx, &[], &writes, |stream| {
+            // SAFETY: both hold `len` complex values.
+            unsafe {
+                self.module
+                    .probe_step_add(stream, config, dptr(probe), dptr(&sums.num), len as u32)
+            }
+        })
+    }
+
+    /// `step.norm` of a stack's frames from `step.step`, against the object of `inputs`.
+    fn probe_step_norm(
+        &self,
+        ctx: &ExecutionContext,
+        inputs: &FusedInputs<'_>,
+        stack: StackRef<'_>,
+        bufs: &FusedBufs,
+        step: &ShiftedProbeSums,
+    ) -> Result<(), Error> {
+        let (run, shift) = Run::new(self, ctx, *inputs, stack, bufs)?;
+        let Some(sh) = &shift else {
+            return Err(Error::Shape("probe_step needs a Model::shift".into()));
+        };
+        let p = FusedPtrs {
+            spectrum: dptr::<C32, f32>(&step.step).cast_const(),
+            ..run.ptrs(bufs, &FarSums::default())
+        };
+        run.shift_pre(&sh.model, &step.step, &sh.scratch.t, None, p)?;
+        run.shift_norm(sh, p, &step.norm)
     }
 
     /// In-place column FFT of `nplane` planes `[ny, nx]` of `buf`, times `scale`.
@@ -1459,7 +1710,7 @@ impl<'a> Run<'a> {
             shift: dptr(t),
             ..self.input_ptrs()
         };
-        self.shift_pre(&model, t, None, p)?;
+        self.shift_pre(&model, model.spectrum.a, t, None, p)?;
         Ok(p)
     }
 
@@ -1669,20 +1920,17 @@ impl<'a> Run<'a> {
     }
 
     /// `T` of the stack's frames into `t`, at `p.shift`, and with `t_dy` `T_y` into it, at
-    /// `p.shift_adj`.
+    /// `p.shift_adj`, from the spectra `a` at `p.spectrum`.
     fn shift_pre(
         &self,
         model: &Shift<'_>,
+        a: &DeviceBuffer<C32>,
         t: &DeviceBuffer<C32>,
         t_dy: Option<&DeviceBuffer<C32>>,
         p: FusedPtrs,
     ) -> Result<(), Error> {
         let config = self.sh.shift_cols(self.g.nprobe, self.g.nf_max)?;
-        let reads = [
-            model.offsets.storage(),
-            model.spectrum.a.storage(),
-            self.stack.storage(),
-        ];
+        let reads = [model.offsets.storage(), a.storage(), self.stack.storage()];
         let mut writes = vec![t.storage()];
         writes.extend(t_dy.map(|b| b.storage()));
         let flags = match t_dy {
@@ -1909,6 +2157,42 @@ impl<'a> Run<'a> {
                 }
             }
         })
+    }
+
+    /// `norm` of the stack's frames from the `T` that [`Self::shift_pre`] left.
+    fn shift_norm(
+        &self,
+        sh: &Shifted<'_>,
+        p: FusedPtrs,
+        norm: &DeviceBuffer<f32>,
+    ) -> Result<(), Error> {
+        let cfg = self.walk(FusedCfg::default());
+        let rows = self.sh.rows(&self.g, false)?;
+        let config = LaunchConfig {
+            shared_mem_bytes: rows.shared_mem_bytes.max(4 * FUSED_ROW_THREADS),
+            ..rows
+        };
+        let reads = [
+            sh.scratch.t.storage(),
+            self.inputs.views.addr().storage(),
+            self.inputs.obj.storage(),
+            self.stack.storage(),
+        ];
+        let (out, ctl, g) = (dptr(norm), self.ctl(), self.g);
+        self.k
+            .launch(self.ctx, &reads, &[norm.storage()], |stream| {
+                let m = &self.k.module;
+                // SAFETY: as in `shift_sums`, `norm` checked by `ShiftedProbeSums::check`; the
+                // launch is the one `shift_norm` documents.
+                unsafe {
+                    match self.sh.nx {
+                        Side::N64 => m.fused_shift_norm_64(stream, config, p, out, ctl, g, cfg),
+                        Side::N128 => m.fused_shift_norm_128(stream, config, p, out, ctl, g, cfg),
+                        Side::N256 => m.fused_shift_norm_256(stream, config, p, out, ctl, g, cfg),
+                        Side::N512 => m.fused_shift_norm_512(stream, config, p, out, ctl, g, cfg),
+                    }
+                }
+            })
     }
 
     /// `G` from the `X` that [`Self::shift_rows_inv`] left.
