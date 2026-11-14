@@ -779,7 +779,9 @@ mod tests {
     use crate::live::grow::GrowError;
     use crate::live::pos::{Pos, PosTable};
     use crate::live::recon::{LiveAp, ViewPlacement};
-    use crate::live::ring::{FrameBatch, Ring, UploadReport, UploaderConfig, run_region_uploader};
+    use crate::live::ring::{
+        FrameBatch, Landing, Ring, UploadReport, UploaderConfig, run_region_uploader,
+    };
     use crate::live::scan::ScanShape;
     use crate::live::sent::sent;
 
@@ -917,9 +919,9 @@ mod tests {
             };
             let uploader = {
                 let (ring, table, stop) = (ring.clone(), table.clone(), stop.clone());
-                let (stores, route) = (ap.stores(), ap.route(c.place));
+                let landing = Landing::new(ap.stores(), ap.route(c.place));
                 std::thread::spawn(move || {
-                    run_region_uploader(ring, stores, route, table, up, stop, Some(tx))
+                    run_region_uploader(ring, landing, table, up, stop, Some(tx))
                 })
             };
             Self {
