@@ -37,6 +37,9 @@ pub enum ExitStage {
 pub struct ExitPass<'a> {
     pub kernels: &'a OpticsKernels,
     pub stage: &'a ExitStage,
+    /// The propagator's intensity scale `k`, `ny nx` in the far field: pty-chi's waves are
+    /// the passes' over `√(ny nx / k)`.
+    pub scale: f32,
 }
 
 /// The propagator stage kernels, bound to the module a [`Kernels`] loaded.

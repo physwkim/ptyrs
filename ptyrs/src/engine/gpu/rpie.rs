@@ -4,13 +4,13 @@ use std::sync::Arc;
 
 use crate::gpu::{
     EpochOrder, Error as GpuError, FusedBufs, FusedInputs, Kernels, Model, PositionRule, PowerMax,
-    PsiSums, Views, Weight,
+    PsiSums, Solve, Views, Weight,
 };
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::CudaStream;
 
 use super::device::{FeaturesMut, Moved, MovedLent, RpieBufs, moved_inputs, moved_shift};
-use super::{Bufs, Epoch, GpuPtycho};
+use super::{Bufs, Epoch, GpuPtycho, plane_len};
 use crate::engine::features::{POSITION_LIMIT, POSITION_STEP};
 use crate::engine::ptycho::{Algorithm, llk_due};
 use crate::engine::{EngineError, RpieParams};
@@ -226,12 +226,16 @@ impl Bufs<'_> {
         // The offsets' step reads neither array, so it may precede their steps, which end
         // the borrow of the batch-start probe.
         if let Some(m) = moved {
-            let rule = PositionRule {
-                step: POSITION_STEP as f32,
-                limit: POSITION_LIMIT as f32,
+            let solve = Solve {
+                rule: PositionRule {
+                    step: POSITION_STEP as f32,
+                    limit: POSITION_LIMIT as f32,
+                },
+                // ε at the frame's pixel count under every propagator, as the CPU's.
+                scale: plane_len(self.views.dims()) as f32,
             };
             let batch = frames.range.clone();
-            m.kernels.step(ctx, batch, m.own, m.offsets, rule, m.pos)?;
+            m.kernels.step(ctx, batch, m.own, m.offsets, solve, m.pos)?;
         }
         if let Some(step) = params.obj_step {
             let s = step as f32;
