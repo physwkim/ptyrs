@@ -201,7 +201,12 @@ impl LsqmlState {
         };
         let moved = match scratch {
             Some(s) => Some(Moved::new(
-                stream, kernels, dims, nf_max, slots, s.sampling,
+                stream,
+                kernels,
+                dims,
+                nf_max,
+                slots,
+                s.sampling.into(),
             )?),
             None => None,
         };

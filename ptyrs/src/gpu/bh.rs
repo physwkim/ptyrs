@@ -24,6 +24,18 @@
 //! [`BhKernels::far`] and [`BhKernels::hess_frames`]: [`BhKernels::pos_spec`], inverse FFTs,
 //! [`BhKernels::pos_near`], forward FFTs, [`BhKernels::obj_conj`] and its forward FFT, and
 //! [`BhKernels::pos_far`]. After the step, [`BhKernels::pos_update`].
+//!
+//! # Under full-object sampling
+//!
+//! The views read windows of the object at their offsets (`crate::gpu::sampling`), the
+//! estimate's taken per stack with their derivatives over `y` and `x` into three blocks, and
+//! [`BhFieldsRef::views`] are the windows' views (`crate::gpu::sampling::window_views`). Per
+//! stack of the gradient pass, after `r`'s inverse FFT: [`Kernels::psi_to_probe`] of `r` on
+//! the windows, [`BhKernels::win_grad`] and the patches placed onto the object sums. Per
+//! stack of the Hessian pass: the windows of `u_O` (and `v_O`) with their derivatives, of the
+//! estimate's second derivatives, [`BhKernels::win_lift`], then [`BhKernels::far`] and
+//! [`BhKernels::hess_frames`] on the lifted windows and [`BhKernels::win_hess`]. After the
+//! step, [`BhKernels::pos_update`].
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -32,10 +44,11 @@ use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaStream, DeviceBuffer, Event, LaunchConfig, PinnedHostBuffer, RawDeviceBuffer};
 pub use ptyrs_kernels::bh::{BH_HESS, BH_STEP};
 use ptyrs_kernels::bh::{
-    BhDirs, BhFar, BhFields, BhMovedFar, BhMoves, BhNear, BhObs, BhPosDirs, bh_kernels,
+    BhDirs, BhFar, BhFields, BhMovedFar, BhMoves, BhNear, BhObs, BhPosDirs, BhWinDerivs,
+    BhWinFields, bh_kernels,
 };
 use ptyrs_kernels::grad::{CG_BLOCKS, GAMMA_CHUNK, ObjProbePtrs};
-use ptyrs_kernels::pixel::{PIXEL_THREADS, SumPtrs};
+use ptyrs_kernels::pixel::{PIXEL_THREADS, StackGeom, SumPtrs};
 
 use crate::gpu::ops::grid_1d;
 use crate::gpu::position::{ONE_BLOCK, chunk_grid, same_dims, span};
@@ -214,8 +227,10 @@ impl BhDisp<'_> {
 
 /// One stack's fields the Hessian reads, each of `nf_max * nmode` planes like a stack's
 /// `psi`: the forward-FFT'd exit waves, the residual after its inverse FFT, and the
-/// forward-FFT'd derivatives along `u` and `v` (`lv` unread without `v`).
+/// forward-FFT'd derivatives along `u` and `v` (`lv` unread without `v`); and `views`, those
+/// the object is read through: the epoch's, or under full-object sampling the windows'.
 pub struct BhFieldsRef<'a> {
+    pub views: &'a Views,
     pub psi: &'a DeviceBuffer<C32>,
     pub r: &'a DeviceBuffer<C32>,
     pub lu: &'a DeviceBuffer<C32>,
@@ -397,6 +412,26 @@ pub struct BhMovedFarRef<'a> {
     pub y: &'a DeviceBuffer<C32>,
 }
 
+/// One stack under full-object sampling as [`BhKernels::win_grad`] and
+/// [`BhKernels::win_hess`] read it: the residual after its inverse FFT, in
+/// [`Kernels::obj_probe_to_psi`]'s layout, and the estimate's probe.
+#[derive(Clone, Copy)]
+pub struct BhWinRef<'a> {
+    pub r: &'a DeviceBuffer<C32>,
+    pub probe: &'a DeviceBuffer<C32>,
+}
+
+/// The windows [`BhKernels::win_hess`] reads, each three blocks of a stack's windows: the
+/// estimate's second derivatives over `(y, y)`, `(y, x)` and `(x, x)`, and `u_O`'s and for
+/// CG `v_O`'s windows, blocks 1 and 2 their derivatives over `y` and `x`. Without `v` the
+/// step is steepest descent.
+#[derive(Clone, Copy)]
+pub struct BhWinSecond<'a> {
+    pub second: &'a DeviceBuffer<C32>,
+    pub u: &'a DeviceBuffer<C32>,
+    pub v: Option<&'a DeviceBuffer<C32>>,
+}
+
 /// One array BH updates, of `n` values: the estimate, the last direction and the gradient
 /// sums, the gradient scaled by `scale` (the probe's `ρ²`).
 pub struct BhVar<'a> {
@@ -423,6 +458,11 @@ const HESS_FIRST: usize = POS_DOTS + 2;
 /// Chunks of [`GAMMA_CHUNK`] pixels per frame of `n` pixels.
 fn chunks(n: usize) -> usize {
     n.div_ceil(GAMMA_CHUNK as usize)
+}
+
+/// Values of one block of a stack's windows of `g.nf_max` frames over a scan of `dims`.
+fn window_block(dims: &ViewDims, g: &StackGeom) -> usize {
+    dims.nobj as usize * g.nf_max as usize * dims.n()
 }
 
 /// Values of the object and of the probe.
@@ -537,7 +577,8 @@ impl BhKernels {
     /// The Hessian triples `(H(u, u), H(u, v), H(v, v))` along `d` of the stack's frames (the
     /// last two 0 without `d.v`), each over a chunk of [`GAMMA_CHUNK`] pixels in a fixed-order
     /// block sum, into the triples of [`bh_parts`] at the frames' epoch positions; other
-    /// positions' triples are left as they are.
+    /// positions' triples are left as they are. `d`'s object parts are read through
+    /// `f.views`, which differ from the scan's only in their object.
     pub fn hess_frames(
         &self,
         ctx: &ExecutionContext,
@@ -547,7 +588,17 @@ impl BhKernels {
         d: &BhDisp<'_>,
         parts: &mut DeviceBuffer<f32>,
     ) -> Result<(), Error> {
-        let dims = scan.check()?;
+        let sd = scan.check()?;
+        let dims = f.views.dims();
+        if (ViewDims {
+            obj: sd.obj,
+            ..*dims
+        }) != *sd
+        {
+            return Err(Error::Shape(format!(
+                "views of {dims:?} for a scan of {sd:?}"
+            )));
+        }
         let g = dims.geom(stack)?;
         let n = dims.n();
         let len = g.nf_max as usize * dims.nmode as usize * n;
@@ -567,7 +618,7 @@ impl BhKernels {
             shared_mem_bytes: 0,
         };
         let mut reads = vec![
-            scan.order.views.addr().storage(),
+            f.views.addr().storage(),
             scan.counts.storage(),
             scan.order.ids.order().storage(),
             f.psi.storage(),
@@ -595,7 +646,7 @@ impl BhKernels {
                     config,
                     fields,
                     d.ptrs(),
-                    dptr::<ViewAddr, ViewAddr>(scan.order.views.addr()),
+                    dptr::<ViewAddr, ViewAddr>(f.views.addr()),
                     scan.obs(),
                     out,
                     stack.ctl() as *const StackCtl,
@@ -1070,6 +1121,188 @@ impl BhKernels {
                     .bh_pos_update(stream, config, span, dirs, dptr(offsets), step, off.step)
             }
         })
+    }
+
+    /// Under full-object sampling, the stack's object gradient patches into `patch` and its
+    /// offsets' gradient partials into `off`, from `f` and `win`, the estimate's windows and
+    /// their derivatives over `y` and `x` in blocks 0 to 2: per frame and object mode, `G =
+    /// Σ_p conj(q P_p) r` on the window, which [`crate::gpu::sampling::ObjectSampler::place`]
+    /// adds to the object as [`Kernels::psi_to_obj`] would, and per chunk of [`GAMMA_CHUNK`]
+    /// pixels of each frame the pair [`Self::pos_dots`] sums to `∂F/∂d`; other frames'
+    /// patches and partials are left as they are.
+    pub fn win_grad(
+        &self,
+        ctx: &ExecutionContext,
+        stack: StackRef<'_>,
+        f: BhWinRef<'_>,
+        win: &DeviceBuffer<C32>,
+        patch: &mut DeviceBuffer<C32>,
+        off: &mut BhOffsets<'_>,
+    ) -> Result<(), Error> {
+        let dims = off.check()?;
+        let g = dims.geom(stack)?;
+        let blk = window_block(dims, &g);
+        f.check(dims, &g)?;
+        check_len("win", win, 3 * blk)?;
+        check_len("patch", patch, blk)?;
+        let config = chunk_grid(&g, dims.n())?;
+        let reads = [
+            f.r.storage(),
+            f.probe.storage(),
+            win.storage(),
+            stack.storage(),
+        ];
+        let grads = &off.bufs.grads;
+        let writes = [patch.storage(), grads.storage()];
+        self.base.launch(ctx, &reads, &writes, |stream| {
+            // SAFETY: lengths checked above; `BhPositions::zeroed` sized `grads` for every
+            // epoch position's chunks; one block of PIXEL_THREADS per chunk and frame.
+            unsafe {
+                self.module.bh_win_grad(
+                    stream,
+                    config,
+                    f.ptrs(),
+                    dptr(win),
+                    dptr(patch),
+                    dptr(grads),
+                    stack.ctl() as *const StackCtl,
+                    g,
+                )
+            }
+        })
+    }
+
+    /// Under full-object sampling, lifts the windows of the step's object parts to the
+    /// windows' first-order changes: `hu += Σ_a u_da ∂_a S(O)` and with `hv` `hv += Σ_a v_da
+    /// ∂_a S(O)` on block 0 of each, `win` the estimate's windows and their derivatives over
+    /// `y` and `x`, `u_d` and `v_d` [`Self::pos_dots`]' and the last direction's offsets of
+    /// `off`. Frames outside the stack are left as they are.
+    pub fn win_lift(
+        &self,
+        ctx: &ExecutionContext,
+        stack: StackRef<'_>,
+        win: &DeviceBuffer<C32>,
+        hu: &mut DeviceBuffer<C32>,
+        hv: Option<&mut DeviceBuffer<C32>>,
+        off: &BhOffsets<'_>,
+    ) -> Result<(), Error> {
+        let dims = off.check()?;
+        let g = dims.geom(stack)?;
+        let blk = window_block(dims, &g);
+        check_len("win", win, 3 * blk)?;
+        check_len("hu", hu, blk)?;
+        if let Some(hv) = &hv {
+            check_len("hv", hv, blk)?;
+        }
+        let hv = hv.map(|b| &*b);
+        let dirs = off.dirs(hv.is_some());
+        let config = grid_1d(blk)?;
+        let b = &off.bufs;
+        let reads = [
+            win.storage(),
+            b.ud.storage(),
+            b.prev.storage(),
+            off.order.ids.order().storage(),
+            stack.storage(),
+        ];
+        let mut writes = vec![hu.storage()];
+        writes.extend(hv.map(|b| b.storage()));
+        // Without `hv`, `hu`'s pointer stands in for it; the kernel never writes it.
+        let hv = dptr(hv.unwrap_or(hu));
+        self.base.launch(ctx, &reads, &writes, |stream| {
+            // SAFETY: lengths checked above; `EpochOrder` holds frame ids below `nframe`.
+            unsafe {
+                self.module.bh_win_lift(
+                    stream,
+                    config,
+                    dptr(win),
+                    dptr(hu),
+                    hv,
+                    dirs,
+                    stack.ctl() as *const StackCtl,
+                    g,
+                )
+            }
+        })
+    }
+
+    /// Under full-object sampling, adds the windows' second-order terms to the Hessian triples
+    /// of [`Self::hess_frames`] along the step whose object parts' windows `w` holds: per
+    /// chunk of [`GAMMA_CHUNK`] pixels of each frame, `Σ Re(conj(r) q P o″)` with `o″(u, v) =
+    /// Σ_a (v_da ∂_a S(u_O) + u_da ∂_a S(v_O)) + Σ_ac u_da v_dc ∂_a ∂_c S(O)`, the last two of
+    /// the triple without `w.v` left as they are; `u_d` and `v_d` as [`Self::win_lift`] reads
+    /// them.
+    pub fn win_hess(
+        &self,
+        ctx: &ExecutionContext,
+        stack: StackRef<'_>,
+        f: BhWinRef<'_>,
+        w: &BhWinSecond<'_>,
+        off: &BhOffsets<'_>,
+        parts: &mut DeviceBuffer<f32>,
+    ) -> Result<(), Error> {
+        let dims = off.check()?;
+        let g = dims.geom(stack)?;
+        let blk = window_block(dims, &g);
+        f.check(dims, &g)?;
+        check_len("second", w.second, 3 * blk)?;
+        check_len("u windows", w.u, 3 * blk)?;
+        if let Some(v) = w.v {
+            check_len("v windows", v, 3 * blk)?;
+        }
+        check_len("parts", parts, bh_parts(dims))?;
+        let config = chunk_grid(&g, dims.n())?;
+        let b = &off.bufs;
+        let mut reads = vec![
+            f.r.storage(),
+            f.probe.storage(),
+            w.second.storage(),
+            w.u.storage(),
+            b.ud.storage(),
+            b.prev.storage(),
+            off.order.ids.order().storage(),
+            stack.storage(),
+        ];
+        reads.extend(w.v.map(|b| b.storage()));
+        let dirs = off.dirs(w.v.is_some());
+        let derivs = BhWinDerivs {
+            second: dptr(w.second),
+            du: dptr(w.u),
+            // Without `v`, `u`'s stand in; the kernel never reads them.
+            dv: dptr(w.v.unwrap_or(w.u)),
+        };
+        let out = dptr::<f32, f32>(parts).wrapping_add(HESS_FIRST);
+        self.base.launch(ctx, &reads, &[parts.storage()], |stream| {
+            // SAFETY: lengths checked above; the triples lie in `parts`; one block of
+            // PIXEL_THREADS per chunk and frame; `EpochOrder` holds frame ids below `nframe`.
+            unsafe {
+                self.module.bh_win_hess(
+                    stream,
+                    config,
+                    f.ptrs(),
+                    derivs,
+                    dirs,
+                    out,
+                    stack.ctl() as *const StackCtl,
+                    g,
+                )
+            }
+        })
+    }
+}
+
+impl BhWinRef<'_> {
+    fn check(&self, dims: &ViewDims, g: &StackGeom) -> Result<(), Error> {
+        let n = dims.n();
+        check_len("r", self.r, g.nf_max as usize * dims.nmode as usize * n)?;
+        check_len("probe", self.probe, dims.nprobe as usize * n)
+    }
+
+    fn ptrs(&self) -> BhWinFields {
+        BhWinFields {
+            r: dptr(self.r),
+            probe: dptr(self.probe),
+        }
     }
 }
 
