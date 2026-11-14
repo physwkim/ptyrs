@@ -326,22 +326,15 @@ fn joined(mapper: &mut Option<JoinHandle<Result<(), GrowError>>>) -> Result<(), 
 
 /// A live AP run the follow loop drives: a [`LiveAp`] on one GPU or a
 /// [`DistLiveAp`] on several.
-trait Engine {
+pub trait Solve {
     type Error: From<GrowError>;
     /// A host copy of the object.
     type Snap;
 
-    /// Lands the frames whose views are `views`.
-    fn push(&mut self, views: &[ViewAddr]) -> Result<(), Self::Error>;
     /// Queues an epoch over the frames landed, without waiting for it.
     fn epoch(&mut self) -> Result<(), Self::Error>;
     /// Epochs queued so far.
     fn epochs(&self) -> u64;
-    /// Wall ns the GPUs finished `epoch`, one of the last two queued; waits
-    /// for it.
-    fn end_of(&mut self, epoch: u64) -> Result<i64, Self::Error>;
-    /// How long stamping the clock [`Self::end_of`] reads took, ns.
-    fn clock_ns(&self) -> i64;
     fn new_snapshot(&mut self) -> Result<Self::Snap, Self::Error>;
     /// Queues a copy of the object after the epochs queued so far.
     fn snapshot(&mut self, snap: &mut Self::Snap) -> Result<(), Self::Error>;
@@ -349,6 +342,16 @@ trait Engine {
     fn pixels<'a>(&mut self, snap: &'a mut Self::Snap) -> Result<&'a [[f32; 2]], Self::Error>;
     /// `[ny, nx]` of the object.
     fn shape(&self) -> [usize; 2];
+}
+
+trait Engine: Solve {
+    /// Lands the frames whose views are `views`.
+    fn push(&mut self, views: &[ViewAddr]) -> Result<(), Self::Error>;
+    /// Wall ns the GPUs finished `epoch`, one of the last two queued; waits
+    /// for it.
+    fn end_of(&mut self, epoch: u64) -> Result<i64, Self::Error>;
+    /// How long stamping the clock [`Self::end_of`] reads took, ns.
+    fn clock_ns(&self) -> i64;
     /// Each epoch's LLK since the last read, waiting for them; `None` if
     /// the run records none.
     fn llk(&mut self) -> Result<Option<Vec<f64>>, Self::Error>;
@@ -372,13 +375,38 @@ struct One {
     clock_ns: i64,
 }
 
-impl Engine for One {
+impl Solve for LiveAp {
     type Error = GrowError;
     type Snap = Snapshot;
 
-    fn push(&mut self, views: &[ViewAddr]) -> Result<(), GrowError> {
-        self.live.push(views).map(drop)
+    fn epoch(&mut self) -> Result<(), GrowError> {
+        LiveAp::epoch(self)
     }
+
+    fn epochs(&self) -> u64 {
+        LiveAp::epochs(self)
+    }
+
+    fn new_snapshot(&mut self) -> Result<Snapshot, GrowError> {
+        LiveAp::new_snapshot(self)
+    }
+
+    fn snapshot(&mut self, snap: &mut Snapshot) -> Result<(), GrowError> {
+        LiveAp::snapshot(self, snap)
+    }
+
+    fn pixels<'a>(&mut self, snap: &'a mut Snapshot) -> Result<&'a [[f32; 2]], GrowError> {
+        Ok(snap.wait()?)
+    }
+
+    fn shape(&self) -> [usize; 2] {
+        self.scan().obj().shape()
+    }
+}
+
+impl Solve for One {
+    type Error = GrowError;
+    type Snap = Snapshot;
 
     fn epoch(&mut self) -> Result<(), GrowError> {
         let f = &self.fence[(self.live.epochs() % 2) as usize];
@@ -390,16 +418,6 @@ impl Engine for One {
         self.live.epochs()
     }
 
-    fn end_of(&mut self, epoch: u64) -> Result<i64, GrowError> {
-        let f = &self.fence[(epoch % 2) as usize];
-        f.synchronize()?;
-        Ok(self.t_anchor + (f64::from(self.anchor.elapsed_time(f)?) * 1e6) as i64)
-    }
-
-    fn clock_ns(&self) -> i64 {
-        self.clock_ns
-    }
-
     fn new_snapshot(&mut self) -> Result<Snapshot, GrowError> {
         self.live.new_snapshot()
     }
@@ -409,11 +427,27 @@ impl Engine for One {
     }
 
     fn pixels<'a>(&mut self, snap: &'a mut Snapshot) -> Result<&'a [[f32; 2]], GrowError> {
-        Ok(snap.wait()?)
+        self.live.pixels(snap)
     }
 
     fn shape(&self) -> [usize; 2] {
-        self.live.scan().obj().shape()
+        Solve::shape(&self.live)
+    }
+}
+
+impl Engine for One {
+    fn push(&mut self, views: &[ViewAddr]) -> Result<(), GrowError> {
+        self.live.push(views).map(drop)
+    }
+
+    fn end_of(&mut self, epoch: u64) -> Result<i64, GrowError> {
+        let f = &self.fence[(epoch % 2) as usize];
+        f.synchronize()?;
+        Ok(self.t_anchor + (f64::from(self.anchor.elapsed_time(f)?) * 1e6) as i64)
+    }
+
+    fn clock_ns(&self) -> i64 {
+        self.clock_ns
     }
 
     fn llk(&mut self) -> Result<Option<Vec<f64>>, GrowError> {
@@ -434,13 +468,9 @@ impl Engine for One {
     }
 }
 
-impl Engine for DistLiveAp {
+impl Solve for DistLiveAp {
     type Error = DistError;
     type Snap = DistSnapshot;
-
-    fn push(&mut self, views: &[ViewAddr]) -> Result<(), DistError> {
-        DistLiveAp::push(self, views).map(drop)
-    }
 
     fn epoch(&mut self) -> Result<(), DistError> {
         DistLiveAp::epoch(self)
@@ -448,14 +478,6 @@ impl Engine for DistLiveAp {
 
     fn epochs(&self) -> u64 {
         DistLiveAp::epochs(self)
-    }
-
-    fn end_of(&mut self, epoch: u64) -> Result<i64, DistError> {
-        DistLiveAp::end_of(self, epoch)
-    }
-
-    fn clock_ns(&self) -> i64 {
-        DistLiveAp::clock_ns(self)
     }
 
     fn new_snapshot(&mut self) -> Result<DistSnapshot, DistError> {
@@ -472,6 +494,20 @@ impl Engine for DistLiveAp {
 
     fn shape(&self) -> [usize; 2] {
         DistLiveAp::shape(self)
+    }
+}
+
+impl Engine for DistLiveAp {
+    fn push(&mut self, views: &[ViewAddr]) -> Result<(), DistError> {
+        DistLiveAp::push(self, views).map(drop)
+    }
+
+    fn end_of(&mut self, epoch: u64) -> Result<i64, DistError> {
+        DistLiveAp::end_of(self, epoch)
+    }
+
+    fn clock_ns(&self) -> i64 {
+        DistLiveAp::clock_ns(self)
     }
 
     fn llk(&mut self) -> Result<Option<Vec<f64>>, DistError> {
@@ -837,18 +873,56 @@ pub fn offline_ap(
     settle(&mut run, region, scan_end, max_epochs)
 }
 
+/// [`offline_ap`] over the regions of `scheme`, region `r` on the GPU of
+/// `stores[r]` and on its frames as the live run's uploader left them: the
+/// frames at `positions` routed as [`run_dist_consumer`] routes them. One
+/// store is [`offline_ap`] itself.
+pub fn offline_dist(
+    stores: &[Arc<DeviceStore>],
+    scheme: Scheme,
+    cfg: &FollowCfg,
+    positions: &[(f64, f64)],
+    region: [Range<usize>; 2],
+    scan_end: i64,
+    max_epochs: u64,
+) -> Result<Offline, DistError> {
+    if let [store] = stores {
+        let off = offline_ap(
+            store.ctx(),
+            store,
+            cfg,
+            positions,
+            region,
+            scan_end,
+            max_epochs,
+        );
+        return Ok(off?);
+    }
+    let planned = views_of(&cfg.ap, &cfg.place, &cfg.plan);
+    let mut run = DistLiveAp::on_stores(stores, &cfg.ap, &planned, scheme, &cfg.probe)?;
+    let views = views_of(&cfg.ap, &cfg.place, positions);
+    let took = run.push(&views)?;
+    if took as usize != positions.len() {
+        return Err(DistError::Partition(format!(
+            "the offline run took {took} of {} stored frames",
+            positions.len()
+        )));
+    }
+    settle(&mut run, region, scan_end, max_epochs)
+}
+
 /// Iterates `run`, every frame landed, to epochs `E` = `E0`, `2 E0`, … from
 /// its count `E0` now (1 when fresh) until its object at `E` matches the
 /// one at `E/2` over `region` to
 /// [`SETTLED`](crate::live::converge::SETTLED), the clock's reference; refused
 /// as still moving once the next doubling would pass `max_epochs`, after
 /// at least the check at `E` = 2.
-pub fn settle(
-    run: &mut LiveAp,
+pub fn settle<R: Solve>(
+    run: &mut R,
     region: [Range<usize>; 2],
     scan_end: i64,
     max_epochs: u64,
-) -> Result<Offline, GrowError> {
+) -> Result<Offline, R::Error> {
     let mut snap = run.new_snapshot()?;
     let mut half: Option<Vec<C64>> = None;
     let mut e = run.epochs().max(1);
@@ -857,8 +931,8 @@ pub fn settle(
             run.epoch()?;
         }
         run.snapshot(&mut snap)?;
-        let shape = snap.shape();
-        let now = plane(snap.wait()?, shape);
+        let shape = run.shape();
+        let now = plane(run.pixels(&mut snap)?, shape);
         if let Some(h) = &half {
             match Clock::new(&now, h, shape, region.clone(), scan_end) {
                 Err(ClockError::Moving { .. }) if 2 * e <= max_epochs => {}
@@ -1207,7 +1281,9 @@ mod tests {
     /// 2 and 4 GPUs, each GPU's store filled by the uploader with the frames
     /// the plan gives it: every frame lands with no recapture, epochs run
     /// while the scan lands, and the last kept object and the viewer's last
-    /// copy are one GPU's replay of the landings, bit for bit.
+    /// copy are one GPU's replay of the landings, bit for bit. The offline
+    /// run on those stores settles alike on 1, 2 and 4 GPUs: at the same
+    /// epochs, with the same verdict.
     #[test]
     fn gpus_follow_a_stream_as_one_gpu_replays_its_landings() {
         let p = Ptycho::new(PtychoSpec {
@@ -1232,6 +1308,8 @@ mod tests {
         };
         let cfg = FollowCfg::plan(&p, NonZeroU32::new(total as u32).unwrap(), &rc);
         let ctx = Context::new(0).expect("GPU 0");
+        // The one-GPU run's last object and what its offline run found.
+        let (mut probe_obj, mut one) = (None, None);
         for ngpu in [1, 2, 4] {
             let ordinals: Vec<usize> = (0..ngpu).collect();
             let ring = Arc::new(Ring::new(&ctx, 16, n * n).unwrap());
@@ -1255,6 +1333,7 @@ mod tests {
             };
             let (stores, route) = ready_rx.recv().expect("the graphs are captured");
             assert_eq!(stores.len(), ngpu);
+            let filled = stores.clone();
             let warm = WarmUp::end();
             let table = Arc::new(PosTable::new(1 << 16));
             let uploader = {
@@ -1333,6 +1412,27 @@ mod tests {
                 .filter(|(a, b)| a.map(f32::to_bits) != b.map(f32::to_bits))
                 .count();
             assert_eq!(diff, 0, "{ngpu} GPUs: pixels unlike the replay's");
+
+            // Capped, so the run may stop while still moving: what it found then
+            // names the ring and its FRC, which depend on the object as well.
+            let region = cfg.place.scanned(&pos, cfg.ap.shape.frame);
+            let off = offline_dist(&filled, Scheme::Strips, &cfg, &pos, region, 0, 16).unwrap();
+            let obj = &*probe_obj.get_or_insert_with(|| plane(&last.pixels, rep.shape));
+            let found = match off.clock {
+                Ok(c) => format!(
+                    "settled {:x}, scores {:x} {:x}",
+                    c.settled().to_bits(),
+                    c.region_frc(obj).unwrap().to_bits(),
+                    c.whole(obj).unwrap().to_bits()
+                ),
+                Err(e) => e.to_string(),
+            };
+            let found = (off.epochs, found);
+            assert_eq!(
+                &found,
+                one.get_or_insert_with(|| found.clone()),
+                "{ngpu} GPUs: the offline run"
+            );
         }
     }
 }

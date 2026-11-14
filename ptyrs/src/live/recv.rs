@@ -33,7 +33,7 @@ use crate::live::consumer::{ConsumerReport, checksum, run_checksum_consumer};
 use crate::live::eiger::{EigerFrames, Progress, PullReport, connect_pull, run_pull};
 use crate::live::farfield::ScanPath;
 use crate::live::follow::{
-    FollowCfg, FollowReport, Landing, Preview, ReconCfg, first_converged, offline_ap, plane,
+    FollowCfg, FollowReport, Landing, Preview, ReconCfg, first_converged, offline_dist, plane,
     run_dist_consumer,
 };
 use crate::live::graph::WarmUp;
@@ -489,14 +489,16 @@ fn stored_bad(
 }
 
 /// The `recv recon` line and whether a live object matched: the offline run
-/// on the stored frames of the one region, the only clock there is, the clock from `scan_end` over the scanned region,
-/// and the first kept snapshot it finds converged. `converged_ms` is host
+/// on the stored frames, over the same regions of `scheme` as the live run,
+/// the clock from `scan_end` over the scanned region, and the first kept
+/// snapshot it finds converged. `converged_ms` is host
 /// clock at both ends: from the last frame's arrival on the host
 /// (`scan_end`) to the host's receipt of that snapshot
 /// ([`Kept::taken`](crate::live::follow::Kept::taken)), when the result is
 /// in hand.
 fn recon_line(
     stores: &[Arc<DeviceStore>],
+    scheme: Scheme,
     follow: &FollowCfg,
     settle_max: u64,
     rep: &FollowReport,
@@ -532,13 +534,9 @@ fn recon_line(
         l += " clock=none no_scan_end";
         return Ok((l, false));
     };
-    let [store] = stores else {
-        write!(l, " clock=none no_offline_run_on_{}_regions", stores.len()).unwrap();
-        return Ok((l, false));
-    };
-    let off = offline_ap(
-        store.ctx(),
-        store,
+    let off = offline_dist(
+        stores,
+        scheme,
         follow,
         &rep.positions,
         region,
@@ -1083,6 +1081,7 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
         Consumed::Sums(_) => None,
         Consumed::Recon(r) => Some(recon_line(
             &stores,
+            scheme,
             &r.follow,
             r.settle_max,
             &r.rep,
