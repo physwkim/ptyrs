@@ -3,15 +3,19 @@
 //! reconstruction path goes through it.
 //!
 //! Arrays are row-major as in the engine: counts `[nframe, ny, nx]` in detector order,
-//! object `[nmode, nyo, nxo]` and probe `[nmode, ny, nx]` complex128 in PyNX convention,
-//! positions as the raw sample translations in metres (CXI `translation`).
+//! object `[nmode, nyo, nxo]` (`[nslice, nmode, nyo, nxo]` in epochs over `Views`) and probe
+//! `[nmode, ny, nx]` complex128 in PyNX convention, a `Scan`'s positions as the raw sample
+//! translations in metres (CXI `translation`).
 
 mod cpu;
 mod gpu;
 
 use ::ptyrs::base::{C64, CoreError, Counts, Geometry, Positions, Stack};
-use ::ptyrs::engine::{EngineError, Llk, LlkRecord};
-use numpy::{Element, PyArray1, PyArray3, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray3};
+use ::ptyrs::engine::{BhStep, Cost, EngineError, Features, Llk, LlkRecord, LsqmlStep};
+use numpy::{
+    Element, PyArray1, PyArray2, PyArray3, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2,
+    PyReadonlyArray3,
+};
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
@@ -158,6 +162,112 @@ fn stack_out<'py, T: Element>(py: Python<'py>, s: Stack<T>) -> PyResult<Bound<'p
     PyArray1::from_vec(py, s.into_vec()).reshape(dims)
 }
 
+/// BH's default `position_rho`, pty-chi's `BHProbePositionOptions.rho`.
+const POSITION_RHO: f64 = 0.1;
+
+/// `"amplitude"` or `"poisson"` as the engine's [`Cost`].
+fn cost(name: &str) -> PyResult<Cost> {
+    match name {
+        "amplitude" => Ok(Cost::Amplitude),
+        "poisson" => Ok(Cost::Poisson),
+        _ => Err(PyValueError::new_err(format!(
+            "cost must be \"amplitude\" or \"poisson\", got {name:?}"
+        ))),
+    }
+}
+
+/// LSQML steps as dicts of `frames`, `a_far`, `a_obj` (`[nslice, frames]`) and `a_probe`.
+fn lsqml_steps<'py>(py: Python<'py>, steps: &[LsqmlStep]) -> PyResult<Bound<'py, PyList>> {
+    let steps = steps.iter().map(|s| {
+        let d = PyDict::new(py);
+        d.set_item("frames", PyArray1::from_slice(py, &s.frames))?;
+        d.set_item("a_far", PyArray1::from_slice(py, &s.a_far))?;
+        let a_obj = PyArray1::from_vec(py, s.a_obj.concat());
+        d.set_item("a_obj", a_obj.reshape([s.a_obj.len(), s.frames.len()])?)?;
+        d.set_item("a_probe", PyArray1::from_slice(py, &s.a_probe))?;
+        Ok(d)
+    });
+    PyList::new(py, steps.collect::<PyResult<Vec<_>>>()?)
+}
+
+/// BH steps as dicts of `frames`, `beta`, `alpha`, `top` and `bottom`.
+fn bh_steps<'py>(py: Python<'py>, steps: &[BhStep]) -> PyResult<Bound<'py, PyList>> {
+    let steps = steps.iter().map(|s| {
+        let d = PyDict::new(py);
+        d.set_item("frames", PyArray1::from_slice(py, &s.frames))?;
+        d.set_item("beta", s.beta)?;
+        d.set_item("alpha", s.alpha)?;
+        d.set_item("top", s.top)?;
+        d.set_item("bottom", s.bottom)?;
+        Ok(d)
+    });
+    PyList::new(py, steps.collect::<PyResult<Vec<_>>>()?)
+}
+
+/// [`Features`] of `set_features`' keywords on `frame` (`[ny, nx]`) detector frames: `scale`
+/// `[nframe]`, `background` `[ny, nx]` in the counts' detector order and `position`
+/// `[nframe, 2]` offsets `[dy, dx]` in object pixels; each left out is not modelled. The
+/// engine checks the frame count and the values.
+fn features_in(
+    scale: Option<PyReadonlyArray1<'_, f64>>,
+    background: Option<PyReadonlyArray2<'_, f64>>,
+    position: Option<PyReadonlyArray2<'_, f64>>,
+    frame: [usize; 2],
+) -> PyResult<Features> {
+    let background = background
+        .map(|b| {
+            let b = b.as_array();
+            if b.dim() != frame.into() {
+                return Err(PyValueError::new_err(format!(
+                    "a background of {:?} for {frame:?} frames",
+                    b.shape()
+                )));
+            }
+            Ok(b.iter().copied().collect())
+        })
+        .transpose()?;
+    Ok(Features {
+        scale: scale.map(|s| s.as_array().to_vec()),
+        background,
+        position: position.map(position_in).transpose()?,
+    })
+}
+
+/// `[nframe, 2]` offsets `[dy, dx]` as the engine's [`Features::position`].
+fn position_in(d: PyReadonlyArray2<'_, f64>) -> PyResult<Vec<[f64; 2]>> {
+    let d = d.as_array();
+    if d.ncols() != 2 {
+        return Err(PyValueError::new_err(format!(
+            "position offsets must be [nframe, 2], got {:?}",
+            d.shape()
+        )));
+    }
+    Ok(d.rows().into_iter().map(|r| [r[0], r[1]]).collect())
+}
+
+/// [`Features::position`] as [`position_in`] takes it.
+fn position_out<'py>(py: Python<'py>, d: Vec<[f64; 2]>) -> PyResult<Bound<'py, PyArray2<f64>>> {
+    PyArray1::from_vec(py, d.concat()).reshape([d.len(), 2])
+}
+
+/// `features` as a dict of `scale`, `background` and `position` in [`features_in`]'s shapes,
+/// `None` for each not modelled.
+fn features_out<'py>(
+    py: Python<'py>,
+    f: Features,
+    frame: [usize; 2],
+) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("scale", f.scale.map(|s| PyArray1::from_vec(py, s)))?;
+    let background = f
+        .background
+        .map(|b| PyArray1::from_vec(py, b).reshape(frame));
+    d.set_item("background", background.transpose()?)?;
+    let position = f.position.map(|p| position_out(py, p));
+    d.set_item("position", position.transpose()?)?;
+    Ok(d)
+}
+
 /// The engine's [`Llk`] as a dict of its fields.
 fn llk_dict<'py>(py: Python<'py>, l: &Llk) -> PyResult<Bound<'py, PyDict>> {
     let d = PyDict::new(py);
@@ -184,6 +294,25 @@ fn history<'py>(py: Python<'py>, h: &[LlkRecord]) -> PyResult<Bound<'py, PyDict>
     Ok(d)
 }
 
+/// Counts `[nframe, ny, nx]` in detector order: uint16 with 65535 masked, or float64 integers
+/// with negative values masked.
+fn counts_in(counts: &Bound<'_, PyAny>) -> PyResult<Counts> {
+    if let Ok(c) = counts.extract::<PyReadonlyArray3<'_, u16>>() {
+        let c = c.as_array();
+        let (n, ny, nx) = c.dim();
+        Ok(Counts::from_raw([n, ny, nx], c.iter().copied().collect()).map_err(Error::from)?)
+    } else if let Ok(c) = counts.extract::<PyReadonlyArray3<'_, f64>>() {
+        let c = c.as_array();
+        let (n, ny, nx) = c.dim();
+        let values: Vec<f64> = c.iter().copied().collect();
+        Ok(Counts::from_f64([n, ny, nx], &values, None).map_err(Error::from)?)
+    } else {
+        Err(PyTypeError::new_err(
+            "counts must be a 3-D uint16 or float64 array",
+        ))
+    }
+}
+
 /// A far-field scan: counts `[nframe, ny, nx]` (uint16 with 65535 masked, or float64 integers
 /// with negative values masked), positions `y`, `x` in metres, and the geometry in metres.
 #[pyclass(frozen)]
@@ -200,20 +329,7 @@ impl Scan {
         distance: f64,
         detector_pixel: f64,
     ) -> PyResult<Self> {
-        let counts = if let Ok(c) = counts.extract::<PyReadonlyArray3<'_, u16>>() {
-            let c = c.as_array();
-            let (n, ny, nx) = c.dim();
-            Counts::from_raw([n, ny, nx], c.iter().copied().collect()).map_err(Error::from)?
-        } else if let Ok(c) = counts.extract::<PyReadonlyArray3<'_, f64>>() {
-            let c = c.as_array();
-            let (n, ny, nx) = c.dim();
-            let values: Vec<f64> = c.iter().copied().collect();
-            Counts::from_f64([n, ny, nx], &values, None).map_err(Error::from)?
-        } else {
-            return Err(PyTypeError::new_err(
-                "counts must be a 3-D uint16 or float64 array",
-            ));
-        };
+        let counts = counts_in(counts)?;
         let geometry = Geometry::new(wavelength, distance, detector_pixel, counts.frame_shape())
             .map_err(Error::from)?;
         let positions =
@@ -227,6 +343,9 @@ impl Scan {
 #[pymodule]
 fn ptyrs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Scan>()?;
+    m.add_class::<cpu::Wavefield>()?;
+    m.add_class::<cpu::Optics>()?;
+    m.add_class::<cpu::Views>()?;
     m.add_class::<cpu::Ptycho>()?;
     m.add_class::<cpu::Lsqml>()?;
     m.add_class::<cpu::Bh>()?;

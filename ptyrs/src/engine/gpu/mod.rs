@@ -2,9 +2,10 @@
 //! stream with the `ptyrs::gpu` pixel kernels and `ptyrs::fft` plans, in the call sequences the
 //! `crate::gpu` ops and rPIE docs give, and is checked against [`crate::engine::Ptycho`].
 //!
-//! The scan's frames are cut into stacks of consecutive frames, one [`StackTable`] entry each:
-//! every launch reads its stack's frames from the entry on the device. Each pass cuts its own
-//! stacks by the bytes it streams per frame ([`GpuOptions::stack_size`]). DM and RAAR keep
+//! The scan's frames are cut into stacks of consecutive frames, of lengths within a frame of
+//! each other, one [`StackTable`] entry each: every launch reads its stack's frames from the
+//! entry on the device. Each pass cuts its own stacks by the bytes it streams per frame
+//! ([`GpuOptions::stack_size`]). DM and RAAR keep
 //! each stack's exit waves across cycles (RAAR also its iterate), sized like PyNX's fixed
 //! stack for the longest stack. AP, DM and RAAR project a stack, ML
 //! takes a stack's gradient, and the LLK pass takes its partials, either by M2's fused passes
@@ -54,16 +55,16 @@ use crate::engine::{
 /// How [`GpuPtycho`] batches its work.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GpuOptions {
-    /// Frames per stack (the last stack may be shorter) for every pass but rPIE's, whose
-    /// batches are its own, and at most this many for BH and LSQML, which cut each batch into
-    /// as few stacks as that takes, of lengths within a frame of each other; PyNX's default
-    /// is 16. `None`, the default, cuts each pass by bytes instead: as many frames as fill 3/8
-    /// of the device's L2, the fastest share at frame sides 256 and 512, with the buffers that
-    /// more than one launch over a stack touches, which stay in L2 between them. That is the
-    /// shared scratch alone in AP, the LLK pass and ML's gradient, and with it DM's and RAAR's
-    /// carried exit waves (RAAR's iterate, touched once, streams); ML's line search, BH and
-    /// LSQML count their own buffers, and under the position model BH and LSQML the shift
-    /// planes they borrow from the shared scratch, whose stacks also cap theirs.
+    /// At most this many frames per stack for every pass but rPIE's, whose batches are its own:
+    /// each pass cuts the scan, BH and LSQML each batch, into as few stacks as that takes, of
+    /// lengths within a frame of each other; PyNX's default is 16. `None`, the default, cuts each
+    /// pass by bytes instead: as many frames as fill 3/8 of the device's L2, the fastest share at
+    /// frame sides 256 and 512, with the buffers that more than one launch over a stack touches,
+    /// which stay in L2 between them. That is the shared scratch alone in AP, the LLK pass and ML's
+    /// gradient, and with it DM's and RAAR's carried exit waves (RAAR's iterate, touched once,
+    /// streams); ML's line search, BH and LSQML count their own buffers, and under the position
+    /// model BH and LSQML the shift planes they borrow from the shared scratch, whose stacks also
+    /// cap theirs.
     pub stack_size: Option<usize>,
     /// Replay every AP, DM and ML cycle, rPIE epoch and LLK pass from a CUDA graph captured once
     /// per kind of cycle instead of launching it kernel by kernel; both give the same bits.
@@ -189,18 +190,6 @@ struct Cut {
 }
 
 impl Cut {
-    /// `0 .. nframe` cut into consecutive stacks of `size` frames, the last one shorter when
-    /// `size` does not divide `nframe`.
-    fn new(stream: &Arc<CudaStream>, dims: &ViewDims, size: u32) -> Result<Self, EngineError> {
-        let (ranges, lens) = split(dims.nframe, size);
-        let (frames, table) = table_of(stream, dims, ranges)?;
-        Ok(Self {
-            frames,
-            table,
-            lens,
-        })
-    }
-
     fn len(&self) -> usize {
         self.frames.len()
     }
@@ -225,19 +214,20 @@ impl Cut {
     }
 }
 
-/// The epoch positions `0 .. nframe` in batches of `size` (the last batch may be shorter),
-/// each cut by [`even_stacks`] into stacks of at most `stack_size`, and each batch's range of
-/// stack indices.
+/// Every cut of the frames into stacks: `0 .. nframe` in batches of `batch` (the last batch
+/// may be shorter), each cut by [`even_stacks`] into stacks of at most `max`, and each batch's
+/// range of stack indices. A pass over the scan is one batch of every frame; rPIE's batches
+/// are a stack each (`max` equal to `batch`).
 fn batch_stacks(
     stream: &Arc<CudaStream>,
     dims: &ViewDims,
-    size: u32,
-    stack_size: u32,
+    batch: u32,
+    max: u32,
 ) -> Result<(Cut, Vec<Range<usize>>), EngineError> {
     let (mut ranges, mut lens, mut batches) = (Vec::new(), Vec::<u32>::new(), Vec::new());
-    for (b, _) in split(dims.nframe, size).0 {
+    for f0 in (0..dims.nframe).step_by(batch as usize) {
         let first = ranges.len();
-        for r in even_stacks(b, stack_size) {
+        for r in even_stacks(f0..dims.nframe.min(f0 + batch), max) {
             let nf = r.end - r.start;
             let plan = match lens.iter().position(|&l| l == nf) {
                 Some(plan) => plan,
@@ -344,14 +334,14 @@ impl StackRule {
         to_u32("stack_size", n)
     }
 
-    /// `0 .. nframe` in stacks of [`Self::frames`] for `bufs`.
+    /// `0 .. nframe` in stacks of at most [`Self::frames`] for `bufs`.
     fn cut(
         self,
         stream: &Arc<CudaStream>,
         dims: &ViewDims,
         bufs: &[Streamed],
     ) -> Result<Cut, EngineError> {
-        Cut::new(stream, dims, self.frames(bufs)?)
+        Ok(batch_stacks(stream, dims, dims.nframe, self.frames(bufs)?)?.0)
     }
 }
 
@@ -363,27 +353,6 @@ fn plane_bytes<T>(dims: &ViewDims, planes: u32) -> usize {
 /// Bytes per frame of one exit-wave set, its `nmode` planes.
 fn wave_bytes(dims: &ViewDims) -> usize {
     plane_bytes::<C32>(dims, dims.nmode)
-}
-
-/// `0 .. nframe` in consecutive ranges of `size` frames, the last one shorter when `size`
-/// does not divide `nframe`, each with the index of its length in the returned lengths.
-fn split(nframe: u32, size: u32) -> (Vec<(Range<u32>, usize)>, Vec<u32>) {
-    let mut lens: Vec<u32> = Vec::new();
-    let mut ranges = Vec::new();
-    let mut f0 = 0;
-    while f0 < nframe {
-        let f1 = nframe.min(f0 + size);
-        let idx = match lens.iter().position(|&l| l == f1 - f0) {
-            Some(i) => i,
-            None => {
-                lens.push(f1 - f0);
-                lens.len() - 1
-            }
-        };
-        ranges.push((f0..f1, idx));
-        f0 = f1;
-    }
-    (ranges, lens)
 }
 
 fn plane_len(dims: &ViewDims) -> usize {

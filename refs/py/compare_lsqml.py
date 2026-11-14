@@ -135,11 +135,11 @@ def main():
 
     print(f"{args.name} LSQML {key} b{args.batch} seed {args.seed}: epoch, {key} LLK ptyrs, "
           f"pty-chi, relative difference")
-    o, pr = obj, probe
+    o, pr = obj[None], probe
     for e in range(args.epochs + 1):
         if e:
             t = time.perf_counter()
-            o, pr, _ = lsqml.epoch(p, o, pr)
+            o, pr, _ = lsqml.epoch(p.views, o, pr)
             wall["ptyrs"] += time.perf_counter() - t
             t = time.perf_counter()
             torch.randn = zeros
@@ -149,7 +149,7 @@ def main():
                 torch.randn = randn
             wall["pty-chi"] += time.perf_counter() - t
             assert sampler.epoch == e, (sampler.epoch, e)
-            curves["ptyrs"].append(p.llk(o, pr)[key])
+            curves["ptyrs"].append(p.llk(o[0], pr)[key])
             curves["pty-chi"].append(m3ref.evaluate(task)[key])
         x, y = curves["ptyrs"][e], curves["pty-chi"][e]
         print(f"{e:4d} {x:.10e} {y:.10e} {abs(x - y) / y:.1e}", flush=True)

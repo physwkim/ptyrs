@@ -21,11 +21,12 @@ use ptyrs::gpu::FUSED_SIDES;
 #[path = "common/engine/mod.rs"]
 mod common;
 
-/// 30 positions: stacks of 7 and batches of 12 or 4 leave a shorter last one.
+/// 30 positions: stacks of at most 8 cut them into 8, 8, 7 and 7 frames, and batches of 12 or
+/// 4 leave a shorter last one.
 const NPOS: usize = 30;
 
 const OPTIONS: GpuOptions = GpuOptions {
-    stack_size: Some(7),
+    stack_size: Some(8),
     graph: true,
     llk_slots: 3,
     fused: true,
@@ -478,8 +479,8 @@ fn run_bits(g: &GpuPtycho) -> RunBits {
     }
 }
 
-/// With a position, 3 epochs leave the same bits in stacks of 7, 4 and every frame, and
-/// eagerly in stacks of 7.
+/// With a position, 3 epochs leave the same bits in stacks of 8, 4 and every frame, and
+/// eagerly in stacks of 8.
 #[test]
 fn lsqml_position_is_bit_identical_across_stack_splits() {
     let frame = FUSED_SIDES[0] as usize;
@@ -502,16 +503,16 @@ fn lsqml_position_is_bit_identical_across_stack_splits() {
             g.lsqml(&params, 3, 1).unwrap();
             run_bits(&g)
         };
-        let seven = run(7, true);
-        assert_eq!(seven.llk.len(), 3);
-        for (stack_size, graph) in [(4, true), (NPOS, true), (7, false)] {
+        let eight = run(8, true);
+        assert_eq!(eight.llk.len(), 3);
+        for (stack_size, graph) in [(4, true), (NPOS, true), (8, false)] {
             let other = run(stack_size, graph);
             let what = format!("{cost:?} batch {batch_size} stacks of {stack_size} graph {graph}");
-            assert!(other.steps == seven.steps, "{what}: steps differ");
-            assert!(other.llk == seven.llk, "{what}: LLK records differ");
-            assert!(other.object == seven.object, "{what}: object differs");
-            assert!(other.probe == seven.probe, "{what}: probe differs");
-            assert!(other.offsets == seven.offsets, "{what}: offsets differ");
+            assert!(other.steps == eight.steps, "{what}: steps differ");
+            assert!(other.llk == eight.llk, "{what}: LLK records differ");
+            assert!(other.object == eight.object, "{what}: object differs");
+            assert!(other.probe == eight.probe, "{what}: probe differs");
+            assert!(other.offsets == eight.offsets, "{what}: offsets differ");
         }
     }
 }
