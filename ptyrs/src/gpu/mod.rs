@@ -60,7 +60,7 @@ pub use ops::{
     ViewDims, Views, view_tiles,
 };
 pub use position::{PositionKernels, PositionRule, Positions};
-pub use psi::Waves;
+pub use psi::{HalfWaves, Waves, half_scale};
 pub use ring::{Ended, LlkRing, LlkTotals, RecordWriter, RingDevice, RingError};
 pub use rpie::{POWER_CHUNK, PowerMax, RpieKernels, Weight};
 
