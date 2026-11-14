@@ -61,8 +61,8 @@ pub fn truth(
     let pixel = g.pixel_size_object();
     // CXI stores translations as f32: round first so a CXI round trip keeps them exactly
     let f = ptyrs::base::sim::fermat(npos, step * pixel[1]);
-    let round = |v: Vec<f64>| v.into_iter().map(|x| x as f32 as f64).collect();
-    let positions = Positions::new(round(f.y), round(f.x)).unwrap();
+    let round = |v: &[f64]| v.iter().map(|&x| x as f32 as f64).collect();
+    let positions = Positions::new(round(f.y()), round(f.x())).unwrap();
     let shape = required_obj_shape(&positions.pynx_preprocess(pixel), pixel, g.frame, 16);
     let object = ptyrs::base::sim::object(shape);
     let probe = ptyrs::base::sim::probe(g.frame, nprobe).unwrap();

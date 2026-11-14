@@ -49,8 +49,8 @@ fn export(src: &Path, out: &Path) -> Result<(), Box<dyn Error>> {
     let pixel = g.pixel_size_object();
     let f = sim::fermat(NFERMAT, 80.0 * pixel[1]);
     // CXI stores translations as f32
-    let round = |v: Vec<f64>| v.into_iter().map(|x| x as f32 as f64).collect();
-    let pos = Positions::new(round(f.y), round(f.x))?;
+    let round = |v: &[f64]| v.iter().map(|&x| x as f32 as f64).collect();
+    let pos = Positions::new(round(f.y()), round(f.x()))?;
     let shape = required_obj_shape(&pos.pynx_preprocess(pixel), pixel, g.frame, 16);
     let raw: Vec<u16> = std::fs::read(src.join(format!("fermat_{NFERMAT}_{FRAME}_{NMODE}.u16")))?
         .as_chunks::<2>()

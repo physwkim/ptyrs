@@ -162,10 +162,15 @@ fn opr(path: &Path) -> Result<(), Box<dyn Error>> {
         root.set_attr_numeric(name, &v)?;
     }
     write(&root, "counts", &scan.counts.dims(), scan.counts.as_slice())?;
-    write(&root, "y", &[nframe], &scan.positions.y)?;
-    write(&root, "x", &[nframe], &scan.positions.x)?;
+    write(&root, "y", &[nframe], scan.positions.y())?;
+    write(&root, "x", &[nframe], scan.positions.x())?;
     let at = scan.positions.pynx_preprocess(pixel);
-    let positions: Vec<f64> = at.y.iter().zip(&at.x).flat_map(|(y, x)| [*y, *x]).collect();
+    let positions: Vec<f64> = at
+        .y()
+        .iter()
+        .zip(at.x())
+        .flat_map(|(y, x)| [*y, *x])
+        .collect();
     write(&root, "positions", &[nframe, 2], &positions)?;
     write(&root, "pixel", &[2], &pixel)?;
     write_stack(&root, "object", &p.object().0)?;
@@ -274,9 +279,9 @@ fn optics_runs(
     let nframe = addr.nframe();
     write(root, "counts", &counts.dims(), counts.as_slice())?;
     let yx: Vec<f64> = positions
-        .y
+        .y()
         .iter()
-        .zip(&positions.x)
+        .zip(positions.x())
         .flat_map(|(y, x)| [*y, *x])
         .collect();
     write(root, "positions", &[nframe, 2], &yx)?;
@@ -540,8 +545,8 @@ fn gpu_optics(path: &Path) -> Result<(), Box<dyn Error>> {
         root.set_attr_numeric("distance", &distance)?;
         write(&root, "pixel", &[2], &pixel)?;
         write(&root, "counts", &counts.dims(), counts.as_slice())?;
-        write(&root, "y", &[raw.y.len()], &raw.y)?;
-        write(&root, "x", &[raw.x.len()], &raw.x)?;
+        write(&root, "y", &[raw.y().len()], raw.y())?;
+        write(&root, "x", &[raw.x().len()], raw.x())?;
         write_stack(&root, "object", &flat.0)?;
         write_stack(&root, "probe", &p0.0)?;
         // Of the geometry the engine reads the frame alone.

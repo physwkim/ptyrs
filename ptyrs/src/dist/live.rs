@@ -375,7 +375,12 @@ mod tests {
 
     /// The one-GPU scan of `frame`-pixel frames at `pos`, 2 probe modes, and its views.
     fn scan(pos: Positions, frame: u32) -> (ScanShape, Vec<ViewAddr>) {
-        let xy: Vec<(f64, f64)> = pos.x.iter().copied().zip(pos.y.iter().copied()).collect();
+        let xy: Vec<(f64, f64)> = pos
+            .x()
+            .iter()
+            .copied()
+            .zip(pos.y().iter().copied())
+            .collect();
         let (place, reach) = ViewPlacement::plan(PIXEL, &xy);
         let mut views = Vec::new();
         for &p in &xy {
@@ -1015,7 +1020,12 @@ mod tests {
     #[test]
     fn the_uploader_fills_each_store_in_the_order_the_plan_numbers_its_frames() {
         let pos = sim::raster(12, 20, 8e-8);
-        let xy: Vec<(f64, f64)> = pos.x.iter().copied().zip(pos.y.iter().copied()).collect();
+        let xy: Vec<(f64, f64)> = pos
+            .x()
+            .iter()
+            .copied()
+            .zip(pos.y().iter().copied())
+            .collect();
         let (place, _) = ViewPlacement::plan(PIXEL, &xy);
         let (shape, planned) = scan(pos, 32);
         let se = 32 * 32;
