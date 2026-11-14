@@ -402,7 +402,12 @@ impl<'a> SliceWaves<'a> {
     /// `delta_o_comb`, `Σ_views conj(q_s·in_s)·chi_s` scattered onto the slice
     /// ([`accumulate_obj`]), under [`Sampling::FullObject`] placed by the sampling's adjoint.
     pub fn obj_adjoint(&self, s: usize, chi_s: &[C64]) -> Stack<C64> {
-        let g = self.window_adjoint(s, chi_s);
+        self.place(self.window_adjoint(s, chi_s))
+    }
+
+    /// `g` on what the views read of a slice put onto the slice: `g` itself, under
+    /// [`Sampling::FullObject`] the sampling's adjoint.
+    pub(crate) fn place(&self, g: Stack<C64>) -> Stack<C64> {
         match &self.sampler {
             None => g,
             Some(sm) => sm.place(g.as_slice(), self.obj_dims[0]),
