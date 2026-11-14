@@ -165,14 +165,7 @@ impl Gate {
         if f >= d.nframe {
             return Some(Refusal::PastScan { frame: f });
         }
-        let (np, at) = (d.nprobe, |v: &ViewAddr| (v.oy, v.ox, v.fy, v.fx));
-        let off = |(m, v): &(u32, &ViewAddr)| {
-            d.check_view(v).is_err()
-                || v.probe != m % np
-                || v.obj != m / np
-                || at(v) != at(&frame[0])
-        };
-        if let Some((_, &view)) = (0..).zip(frame).find(off) {
+        if let Some(view) = off_view(d, frame) {
             return Some(Refusal::View { frame: f, view });
         }
         let ntx = d.tiles()[1] as usize;
@@ -188,6 +181,17 @@ impl Gate {
         }
         None
     }
+}
+
+/// The first view of `frame` that is not one of a frame of a scan of `d`:
+/// outside the object, not mode `m`'s probe and object, or not at the
+/// position of the frame's first view.
+pub(crate) fn off_view(d: &ViewDims, frame: &[ViewAddr]) -> Option<ViewAddr> {
+    let (np, at) = (d.nprobe, |v: &ViewAddr| (v.oy, v.ox, v.fy, v.fx));
+    let off = |(m, v): &(u32, &ViewAddr)| {
+        d.check_view(v).is_err() || v.probe != m % np || v.obj != m / np || at(v) != at(&frame[0])
+    };
+    (0..).zip(frame).find(off).map(|(_, &view)| view)
 }
 
 /// Backs a [`LiveScan`]'s memory for frames ahead of [`LiveScan::push`],
