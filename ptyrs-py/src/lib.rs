@@ -12,7 +12,7 @@ mod cpu;
 mod gpu;
 
 use ::ptyrs::base::{C64, CoreError, Counts, Geometry, Object, Positions, Stack};
-use ::ptyrs::engine::{BhStep, Cost, EngineError, Features, Llk, LlkRecord, LsqmlStep};
+use ::ptyrs::engine::{BhStep, Cost, EngineError, Features, Llk, LlkRecord, LsqmlStep, Sampling};
 use numpy::{
     Element, PyArray1, PyArray2, PyArray3, PyArray4, PyArrayMethods, PyReadonlyArray1,
     PyReadonlyArray2, PyReadonlyArray3, PyReadonlyArray4,
@@ -194,6 +194,26 @@ fn cost(name: &str) -> PyResult<Cost> {
         _ => Err(PyValueError::new_err(format!(
             "cost must be \"amplitude\" or \"poisson\", got {name:?}"
         ))),
+    }
+}
+
+/// pty-chi's `"patch"` or `"full_object"` (`ObjectPosOriginCoordsMethods`) as the engine's
+/// [`Sampling`].
+fn sampling(name: &str) -> PyResult<Sampling> {
+    match name {
+        "patch" => Ok(Sampling::Patch),
+        "full_object" => Ok(Sampling::FullObject),
+        _ => Err(PyValueError::new_err(format!(
+            "sampling must be \"patch\" or \"full_object\", got {name:?}"
+        ))),
+    }
+}
+
+/// [`Sampling`] as [`sampling`] takes it.
+fn sampling_name(s: Sampling) -> &'static str {
+    match s {
+        Sampling::Patch => "patch",
+        Sampling::FullObject => "full_object",
     }
 }
 

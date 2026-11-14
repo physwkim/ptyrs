@@ -375,6 +375,23 @@ impl Ptycho {
         crate::features_out(py, self.inner.features().clone(), frame)
     }
 
+    /// How the `position` feature's offsets enter the exit waves, in pty-chi's names:
+    /// `"patch"` moves the probe by them on a window of whole object pixels, `"full_object"`
+    /// samples the object at each view's corner plus offset by Fourier interpolation.
+    /// `Sampling::auto` (pty-chi's `AUTO`) of the optics, object and frame this state was
+    /// built with, unless set.
+    #[getter]
+    fn sampling(&self) -> &'static str {
+        crate::sampling_name(self.inner.sampling())
+    }
+
+    /// Enters the `position` offsets as `sampling`, `"patch"` or `"full_object"`, from here
+    /// on.
+    fn set_sampling(&mut self, sampling: &str) -> PyResult<()> {
+        self.inner.set_sampling(crate::sampling(sampling)?);
+        Ok(())
+    }
+
     #[getter]
     fn object<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray3<C64>>> {
         stack_out(py, self.inner.object().0.clone())
@@ -412,7 +429,8 @@ impl Ptycho {
     }
 
     /// Normalised PyNX LLK of `object` and `probe` over the scan, modelling this state's
-    /// features: the engine's LLK of a state of these arrays, features and optics.
+    /// features as it samples them: the engine's LLK of a state of these arrays, features,
+    /// sampling and optics.
     fn llk<'py>(
         &self,
         py: Python<'py>,
@@ -425,6 +443,7 @@ impl Ptycho {
         let mut at = at.map_err(Error::from)?;
         at.set_features(self.inner.features().clone())
             .map_err(Error::from)?;
+        at.set_sampling(self.inner.sampling());
         llk_dict(py, &at.llk())
     }
 }

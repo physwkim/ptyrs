@@ -184,6 +184,18 @@ impl GpuPtycho {
         crate::features_out(py, self.0.features().map_err(Error::from)?, self.1)
     }
 
+    /// As `Ptycho.sampling`.
+    #[getter]
+    fn sampling(&self) -> &'static str {
+        crate::sampling_name(self.0.sampling())
+    }
+
+    /// As `Ptycho.set_sampling`.
+    fn set_sampling(&mut self, sampling: &str) -> PyResult<()> {
+        let sampling = crate::sampling(sampling)?;
+        Ok(self.0.set_sampling(sampling).map_err(Error::from)?)
+    }
+
     /// The object, of a multislice object its first slice.
     #[getter]
     fn object<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray3<C64>>> {
