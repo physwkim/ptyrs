@@ -33,8 +33,8 @@ use ptyrs_kernels::pixel::{PsiPtr, SumPtrs, psi_f32};
 use crate::gpu::ops::grid_1d;
 use crate::gpu::psi::check_waves;
 use crate::gpu::{
-    C32, Error, Kernels, LlkPartial, PositionPartial, ScalePartial, StackCtl, StackGeom, StackRef,
-    UpdateSums, ViewDims, Views, Waves, block_fft, check_len, dptr,
+    C32, Error, ExitPass, Kernels, LlkPartial, PositionPartial, ScalePartial, StackCtl, StackGeom,
+    StackRef, UpdateSums, ViewDims, Views, Waves, block_fft, check_len, dptr,
 };
 
 /// Dynamic shared memory a block gets without opting in.
@@ -871,6 +871,20 @@ impl Kernels {
         bufs: &mut FusedBufs,
         far: FarSums<'_>,
     ) -> Result<(), Error> {
+        self.propagated_llk(ctx, inputs, stack, bufs, far, None)
+    }
+
+    /// [`Self::fused_llk`] of the field at the detector of a propagator `D F V`: `exit`'s
+    /// stage `V` on the row transforms, between the row and the column pass.
+    pub fn propagated_llk(
+        &self,
+        ctx: &ExecutionContext,
+        inputs: &FusedInputs<'_>,
+        stack: StackRef<'_>,
+        bufs: &mut FusedBufs,
+        far: FarSums<'_>,
+        exit: Option<ExitPass<'_>>,
+    ) -> Result<(), Error> {
         let bufs = &*bufs;
         let (run, shift) = Run::new(self, ctx, *inputs, stack, bufs)?;
         run.check_far(&far)?;
@@ -887,6 +901,11 @@ impl Kernels {
                 )?;
             }
             None => run.rows_fwd(bufs, Carried::default(), p, FusedCfg::default())?,
+        }
+        if let Some(e) = exit {
+            let d = inputs.views.dims();
+            e.kernels
+                .exit_on(ctx, d, stack, e.stage, &bufs.work, false)?;
         }
         let cfg = FusedCfg {
             flags: run.model_flags() | far.flags(),

@@ -1,8 +1,14 @@
 //! The near-field and multislice cases GPU LSQML is held to, on the fused passes' smallest
-//! side: an angular-spectrum propagator, a Fresnel transform, and three object slices under
-//! angular spectrum, each run by the CPU's `f64` [`Lsqml`] from a start off the truth its
-//! counts come from. Two incoherent probe modes, 30 Fermat positions, counts the truth's
-//! intensities rounded.
+//! side: an angular-spectrum propagator, a Fresnel transform forward and back, and three
+//! object slices under angular spectrum, each run by the CPU's `f64` [`Lsqml`] from a start
+//! off the truth its counts come from. Two incoherent probe modes, 30 Fermat positions,
+//! counts the truth's intensities rounded.
+
+use std::sync::Arc;
+
+use cuda_core::CudaContext;
+use ptyrs::base::{Geometry, Scan};
+use ptyrs::engine::{ApParams, GpuOptions, GpuPtycho};
 
 use ptyrs::base::{AddrTable, C64, Counts, Object, Probe, Stack, required_obj_shape};
 use ptyrs::engine::{
@@ -20,6 +26,8 @@ const PHOTONS: f64 = 2e5;
 
 struct Case {
     name: &'static str,
+    /// The frames and positions; of its geometry only the frame is the case's.
+    scan: Scan,
     addr: AddrTable,
     obs: Observed,
     optics: Optics,
@@ -81,8 +89,8 @@ fn wavefield(frame: usize, distance: f64) -> Wavefield {
 fn case(name: &'static str, frame: usize, optics: Optics, weights: &[f64]) -> Case {
     assert_eq!(optics.nslice(), weights.len());
     let pixel = [PIXEL, PIXEL];
-    let positions =
-        ptyrs::base::sim::fermat(NPOS, frame as f64 / 8.0 * PIXEL).pynx_preprocess(pixel);
+    let raw = ptyrs::base::sim::fermat(NPOS, frame as f64 / 8.0 * PIXEL);
+    let positions = raw.pynx_preprocess(pixel);
     let shape = required_obj_shape(&positions, pixel, [frame, frame], 16);
     let addr = AddrTable::new(&positions, pixel, [frame, frame], shape, NPROBE, 1).unwrap();
     let whole = ptyrs::base::sim::object(shape);
@@ -138,10 +146,12 @@ fn case(name: &'static str, frame: usize, optics: Optics, weights: &[f64]) -> Ca
             *v *= C64::from_polar(1.0, -0.5 * (u * u + w * w));
         }
     }
+    let geometry = Geometry::new(WAVELENGTH, 1.0, PIXEL, [frame, frame]).unwrap();
     Case {
         name,
         addr,
         obs: Observed::from_counts(&counts),
+        scan: Scan::new(geometry, raw, counts).unwrap(),
         optics,
         objects,
         probe,
@@ -162,6 +172,12 @@ fn cases() -> Vec<Case> {
             "Fresnel",
             frame,
             Optics::free_space(&wavefield(frame, 5e-3)),
+            &[1.0],
+        ),
+        case(
+            "Fresnel back",
+            frame,
+            Optics::free_space(&wavefield(frame, -5e-3)),
             &[1.0],
         ),
         case(
@@ -201,4 +217,86 @@ fn cpu_lsqml_descends_on_every_case() {
             }
         }
     }
+}
+
+const OPTIONS: GpuOptions = GpuOptions {
+    stack_size: Some(8),
+    graph: true,
+    llk_slots: 3,
+    fused: true,
+};
+
+fn ctx() -> Arc<CudaContext> {
+    CudaContext::new(0).expect("CUDA device 0")
+}
+
+impl Case {
+    fn gpu(&self, optics: &Optics, options: GpuOptions) -> Result<GpuPtycho, String> {
+        let (object, probe) = (self.objects[0].clone(), self.probe.clone());
+        GpuPtycho::with_optics(&ctx(), &self.scan, optics, object, probe, options)
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// The GPU's LLK of each one-slice start is the CPU's, with graphs and without.
+#[test]
+fn gpu_llk_is_the_cpus_under_every_propagator() {
+    for c in cases().iter().filter(|c| c.optics.nslice() == 1) {
+        let want = c.llk(&c.objects, &c.probe);
+        for graph in [true, false] {
+            let mut gpu = c.gpu(&c.optics, GpuOptions { graph, ..OPTIONS }).unwrap();
+            let got = gpu.llk().unwrap().poisson;
+            let err = (got - want).abs() / want;
+            eprintln!(
+                "{} graph {graph}: LLK {got:.6e}, CPU {want:.6e}, {err:.2e}",
+                c.name
+            );
+            assert!(err < 1e-5, "{} graph {graph}: {got:e} vs {want:e}", c.name);
+        }
+    }
+}
+
+/// Optics the GPU has no form for fail when the engine is built, naming the cause; a
+/// propagator with a plane stage fails every pass that does not run it, changing nothing.
+#[test]
+fn gpu_refuses_optics_and_passes_it_cannot_run() {
+    let all = cases();
+    let [c, slices] = ["angular spectrum", "three slices"]
+        .map(|name| all.iter().find(|c| c.name == name).unwrap());
+    let frame = c.probe.plane_shape();
+    let free = |pixel, z| Optics::free_space(&Wavefield::new(frame, WAVELENGTH, pixel, z).unwrap());
+    let refused = |optics: &Optics, options| c.gpu(optics, options).err().unwrap();
+
+    let e = refused(&free([PIXEL, 1.2 * PIXEL], 5e-3), OPTIONS);
+    assert!(e.contains("not square") && e.contains("6e-8"), "{e}");
+    let e = refused(&free([0.4 * WAVELENGTH; 2], 1e-9), OPTIONS);
+    assert!(e.contains("evanescent band"), "{e}");
+    let e = refused(&slices.optics, OPTIONS);
+    assert!(e.contains("one object slice"), "{e}");
+    let m1 = GpuOptions {
+        fused: false,
+        ..OPTIONS
+    };
+    let e = refused(&c.optics, m1);
+    assert!(e.contains("fused: true"), "{e}");
+    // A Fresnel transform forward in distance has no stage, and M1 runs it.
+    let fresnel = all.iter().find(|c| c.name == "Fresnel").unwrap();
+    let want = fresnel.llk(&fresnel.objects, &fresnel.probe);
+    let got = fresnel.gpu(&fresnel.optics, m1).unwrap().llk().unwrap();
+    assert!(
+        (got.poisson - want).abs() < 1e-5 * want,
+        "{got:?} vs {want:e}"
+    );
+
+    let mut gpu = c.gpu(&c.optics, OPTIONS).unwrap();
+    let before = gpu.object().unwrap();
+    let e = gpu.ap(&ApParams::default(), 1).unwrap_err().to_string();
+    assert!(
+        e.contains("Ap runs no propagator with a plane stage"),
+        "{e}"
+    );
+    assert!(gpu.ml(&Default::default(), 1).is_err());
+    assert!(gpu.ml_grads().is_err());
+    assert_eq!(gpu.object().unwrap().as_slice(), before.as_slice());
+    assert!(gpu.history().is_empty());
 }

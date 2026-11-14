@@ -31,7 +31,6 @@ mod ml;
 mod raar;
 mod rpie;
 
-use std::f64::consts::PI;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -44,11 +43,11 @@ use crate::gpu::{
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 
-use device::{Bufs, Device, NormBufs, PassesMut};
+use device::{Bufs, Device, NormBufs, PassesMut, Uploads};
 
 use crate::engine::ptycho::{Algorithm, LlkRecord, zero_phase_ramp};
 use crate::engine::{
-    ApParams, BhParams, DmParams, EngineError, Features, Fft2, Llk, LsqmlParams, MlParams,
+    ApParams, BhParams, DmParams, EngineError, Features, Fft2, Llk, LsqmlParams, MlParams, Optics,
     RaarParams, RpieParams,
 };
 
@@ -403,8 +402,8 @@ pub struct GpuPtycho {
 
 impl GpuPtycho {
     /// Uploads the scan's counts and views (as [`crate::engine::Ptycho::new`] builds them) and the
-    /// starting arrays to `ctx`, on a new stream. Frames must be square (cuFFT plans here are
-    /// `n x n`).
+    /// starting arrays to `ctx`, on a new stream, for the far field of the scan's geometry.
+    /// Frames must be square (cuFFT plans here are `n x n`).
     pub fn new(
         ctx: &Arc<CudaContext>,
         scan: &Scan,
@@ -412,8 +411,43 @@ impl GpuPtycho {
         probe: Probe,
         options: GpuOptions,
     ) -> Result<Self, EngineError> {
+        let optics = Optics::far_field(&scan.geometry);
+        Self::with_optics(ctx, scan, &optics, object, probe, options)
+    }
+
+    /// [`Self::new`] under `optics`, which give the object pixel of the scan's positions, the
+    /// exit waves' plane phase and the propagator in place of the scan geometry's far field;
+    /// of the geometry only the frame is read. Fails on optics without a
+    /// [`Optics::fourier_form`], and on more than one object slice.
+    pub fn with_optics(
+        ctx: &Arc<CudaContext>,
+        scan: &Scan,
+        optics: &Optics,
+        object: Object,
+        probe: Probe,
+        options: GpuOptions,
+    ) -> Result<Self, EngineError> {
         let g = scan.geometry;
         let [ny, nx] = g.frame;
+        if optics.propagator().shape() != g.frame {
+            return Err(EngineError::Invalid(format!(
+                "propagator plane {:?} differs from frame {:?}",
+                optics.propagator().shape(),
+                g.frame
+            )));
+        }
+        if optics.nslice() != 1 {
+            return Err(EngineError::Invalid(format!(
+                "the GPU backend runs one object slice, got {}",
+                optics.nslice()
+            )));
+        }
+        let pixel = optics.pixel();
+        let form = optics.fourier_form().map_err(|e| {
+            EngineError::Invalid(format!(
+                "the GPU backend cannot run these optics over object pixels {pixel:?}: {e}"
+            ))
+        })?;
         if ny != nx {
             return Err(EngineError::Invalid(format!(
                 "the GPU backend needs square frames, got {:?}",
@@ -430,7 +464,6 @@ impl GpuPtycho {
         if options.stack_size == Some(0) {
             return Err(EngineError::Invalid("stack_size must be >= 1".into()));
         }
-        let pixel = g.pixel_size_object();
         let positions = scan.positions.pynx_preprocess(pixel);
         let addr = AddrTable::new(
             &positions,
@@ -448,7 +481,7 @@ impl GpuPtycho {
             nobj: to_u32("object modes", addr.nobj())?,
             frame: [to_u32("frame side", ny)?, to_u32("frame side", nx)?],
             obj: [to_u32("object side", nyo)?, to_u32("object side", nxo)?],
-            quad_phase: (PI * pixel[1] * pixel[1] / (g.wavelength * g.distance)) as f32,
+            quad_phase: form.quad as f32,
         };
         let addrs: Vec<ViewAddr> = addr
             .views()
@@ -463,15 +496,14 @@ impl GpuPtycho {
             })
             .collect();
 
-        let dev = Device::new(
-            ctx,
-            dims,
-            &addrs,
-            scan.counts.as_slice(),
-            &to_c32(object.as_slice()),
-            &to_c32(probe.as_slice()),
-            options,
-        )?;
+        let uploads = Uploads {
+            stage: form.stage,
+            addrs: &addrs,
+            counts: scan.counts.as_slice(),
+            obj: &to_c32(object.as_slice()),
+            probe: &to_c32(probe.as_slice()),
+        };
+        let dev = Device::new(ctx, dims, uploads, options)?;
         Ok(Self {
             dev,
             obj_dims: object.dims(),
@@ -635,7 +667,9 @@ impl Bufs<'_> {
                         llk: Some(&mut *self.llk),
                         ..FarSums::default()
                     };
-                    self.kernels.fused_llk(ctx, &inputs, stack, f, far)?;
+                    let exit = Some(self.exit);
+                    self.kernels
+                        .propagated_llk(ctx, &inputs, stack, f, far, exit)?;
                     rec.push(ctx, &dims, stack, self.llk)?;
                 }
             }
@@ -664,7 +698,9 @@ impl Bufs<'_> {
                 model: m.model,
             };
             let far = m.far(llk.is_some().then_some(&mut *self.llk));
-            self.kernels.fused_llk(ctx, &inputs, stack, f, far)?;
+            let exit = Some(self.exit);
+            self.kernels
+                .propagated_llk(ctx, &inputs, stack, f, far, exit)?;
             if let Some(rec) = &mut llk {
                 rec.push(ctx, &dims, stack, self.llk)?;
             }
