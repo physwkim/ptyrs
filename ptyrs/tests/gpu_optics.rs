@@ -14,8 +14,8 @@ use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 use ptyrs::base::C64;
 use ptyrs::engine::{Optics, PlaneStage, Propagator, Wavefield, shift};
 use ptyrs::gpu::{
-    C32, ExitStage, Kernels, OpticsKernels, SlicePhase, SliceSource, StackTable, ViewAddr,
-    ViewDims, Views,
+    C32, ExitStage, FrameWaves, Kernels, OpticsKernels, SlicePhase, SliceSource, StackTable,
+    ViewAddr, ViewDims, Views,
 };
 
 #[path = "common/worst.rs"]
@@ -345,7 +345,7 @@ fn slice_products_are_the_windows_times_probe_or_waves() {
                 (
                     "waves",
                     want(&|kl, j, o| o * stored(kl, j)),
-                    Some(SliceSource::Waves(&dev_waves)),
+                    Some(SliceSource::Waves(FrameWaves::Views(&dev_waves))),
                 ),
                 ("adjoint", want(&|kl, j, o| o.conj() * stored(kl, j)), None),
             ];

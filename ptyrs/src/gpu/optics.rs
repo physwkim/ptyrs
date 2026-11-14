@@ -17,7 +17,7 @@ use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{DeviceBuffer, LaunchConfig};
 use ptyrs_kernels::optics::{
     SLICE_CONJ, SLICE_OFFSET, SLICE_PROBE, STAGE_COLS, STAGE_CONJ, STAGE_MUL, STAGE_POST_FWD,
-    STAGE_POST_INV, STAGE_PRE_FWD, STAGE_PRE_INV, optics_kernels,
+    STAGE_POST_INV, STAGE_PRE_FWD, STAGE_PRE_INV, WavePlanes, optics_kernels,
 };
 
 use crate::gpu::fused::Side;
@@ -39,13 +39,47 @@ pub enum ExitStage {
     Transfer(DeviceBuffer<C32>),
 }
 
+/// A stack's waves at the exit wave's stored pixels, by what each frame's planes hold: view
+/// `m` of a frame reads the `m % nw`th of its `nw` planes, its own or its probe mode's
+/// (`m % nprobe`).
+#[derive(Clone, Copy)]
+pub enum FrameWaves<'a> {
+    /// A plane per probe mode, `[nf_max * nprobe, ny, nx]`: the moved probe
+    /// ([`crate::gpu::PositionKernels::shift_w`]).
+    Probes(&'a DeviceBuffer<C32>),
+    /// A plane per view, `[nf_max * nmode, ny, nx]`: a multislice object's wave entering a
+    /// slice, or an exit-wave update.
+    Views(&'a DeviceBuffer<C32>),
+}
+
+impl<'a> FrameWaves<'a> {
+    /// The buffer and its planes as a kernel reads them, checked to hold `nf_max` frames
+    /// under `d`.
+    pub(super) fn planes(
+        self,
+        d: &ViewDims,
+        nf_max: u32,
+    ) -> Result<(&'a DeviceBuffer<C32>, WavePlanes), Error> {
+        let (w, nw) = match self {
+            Self::Probes(w) => (w, d.nprobe),
+            Self::Views(w) => (w, d.nmode),
+        };
+        check_len("waves", w, nf_max as usize * nw as usize * d.n())?;
+        let planes = WavePlanes {
+            w: dptr::<C32, f32>(w).cast_const(),
+            nw,
+        };
+        Ok((w, planes))
+    }
+}
+
 /// What a slice multiplies: [`OpticsKernels::slice_mul`]'s source.
 #[derive(Clone, Copy)]
 pub enum SliceSource<'a> {
     /// The probe, `[nprobe, ny, nx]` in the natural layout; each view reads its mode.
     Probe(&'a DeviceBuffer<C32>),
-    /// The stack's waves, `[nf_max * nmode, ny, nx]` at the exit wave's stored pixels.
-    Waves(&'a DeviceBuffer<C32>),
+    /// The stack's waves.
+    Waves(FrameWaves<'a>),
 }
 
 /// The exit plane's phase of a multislice object's last slice: `exp(i quad |r|²)`, `r` the
@@ -209,7 +243,7 @@ impl OpticsKernels {
         waves: &DeviceBuffer<C32>,
         dst: &mut DeviceBuffer<C32>,
     ) -> Result<(), Error> {
-        let src = (SliceSource::Waves(waves), SLICE_CONJ);
+        let src = (SliceSource::Waves(FrameWaves::Views(waves)), SLICE_CONJ);
         self.slice(ctx, views, stack, obj, src, dst)
     }
 
@@ -227,20 +261,24 @@ impl OpticsKernels {
         let len = g.nf_max as usize * d.nmode as usize * d.n();
         check_len("obj", obj, d.obj_len())?;
         check_len("dst", dst, len)?;
-        let (src, probe) = match src {
+        let (buf, src, probe) = match src {
             SliceSource::Probe(p) => {
                 check_len("probe", p, d.nprobe as usize * d.n())?;
-                (p, SLICE_PROBE)
+                let src = WavePlanes {
+                    w: dptr::<C32, f32>(p).cast_const(),
+                    nw: d.nprobe,
+                };
+                (p, src, SLICE_PROBE)
             }
             SliceSource::Waves(w) => {
-                check_len("waves", w, len)?;
-                (w, 0)
+                let (w, src) = w.planes(d, g.nf_max)?;
+                (w, src, 0)
             }
         };
         let flags = probe | conj;
         let config = grid_1d(len)?;
         let reads = [
-            src.storage(),
+            buf.storage(),
             obj.storage(),
             views.addr().storage(),
             stack.storage(),
@@ -253,7 +291,7 @@ impl OpticsKernels {
                     stream,
                     config,
                     dptr(dst),
-                    dptr::<C32, f32>(src).cast_const(),
+                    src,
                     dptr::<C32, f32>(obj).cast_const(),
                     dptr::<ViewAddr, ViewAddr>(views.addr()).cast_const(),
                     ctl,
