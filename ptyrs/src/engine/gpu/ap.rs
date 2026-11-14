@@ -2,7 +2,7 @@
 
 use crate::gpu::{
     Ended, Error as GpuError, Exit, FarSums, FusedBufs, FusedInputs, FusedSums, RecordWriter,
-    ShiftSums,
+    ShiftProbe,
 };
 use cuda_async::device_operation::ExecutionContext;
 
@@ -114,10 +114,7 @@ impl Bufs<'_> {
             let exit = Exit::Ap { far };
             let sums = FusedSums {
                 obj: obj.then_some(&mut *self.obj_sums),
-                shift: ShiftSums {
-                    step: true,
-                    ..m.shift_sums(probe, true)
-                },
+                shift: m.shift_sums(probe.then_some(ShiftProbe::Step as _), true),
                 ..FusedSums::default()
             };
             self.kernels
@@ -141,7 +138,7 @@ impl Bufs<'_> {
         };
         m.probe_sums(ctx, self.kernels, &dims, self.probe_sums)?;
         let model = m.model;
-        let Some(step) = m.shift_sums(true, false).probe else {
+        let Some(ShiftProbe::Step(step)) = m.shift_sums(Some(ShiftProbe::Step), false).probe else {
             return Ok(false);
         };
         let inputs = FusedInputs {

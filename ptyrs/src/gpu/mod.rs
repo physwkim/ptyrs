@@ -49,7 +49,7 @@ pub use bh::{
 };
 pub use fused::{
     BackgroundSums, Exit, FUSED_SIDES, FarSums, FusedBufs, FusedInputs, FusedSums, Model,
-    ProbeSpectrum, PsiSums, Shift, ShiftSums, ShiftedProbeSums, SpectrumBuf,
+    ProbeSpectrum, PsiSums, Shift, ShiftProbe, ShiftSums, ShiftedProbeSums, SpectrumBuf,
 };
 pub use grad::{
     CG_BLOCKS, GAMMA_CHUNK, GammaCounts, GammaStacks, GradKernels, ObjProbeScale, gamma_parts,

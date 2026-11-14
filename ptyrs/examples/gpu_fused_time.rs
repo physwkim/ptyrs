@@ -25,8 +25,8 @@ use ptyrs::base::{AddrTable, Geometry, Positions, required_obj_shape};
 use ptyrs::fft::Plan2d;
 use ptyrs::gpu::{
     C32, Error, Exit, FarSums, FusedBufs, FusedInputs, FusedSums, Kernels, Model, PositionPartial,
-    Shift, ShiftSums, ShiftedProbeSums, SpectrumBuf, StackTable, UpdateSums, ViewAddr, ViewDims,
-    Views, record,
+    Shift, ShiftProbe, ShiftSums, ShiftedProbeSums, SpectrumBuf, StackTable, UpdateSums, ViewAddr,
+    ViewDims, Views, record,
 };
 
 const WARMUP: usize = 5;
@@ -209,8 +209,7 @@ impl Run {
                 obj: Some(&mut self.obj_sums),
                 probe: None,
                 shift: ShiftSums {
-                    probe: Some(&mut self.shifted),
-                    step: false,
+                    probe: Some(ShiftProbe::Sums(&mut self.shifted)),
                     position: Some(&mut self.position),
                     position_den: Some(&mut self.position_den),
                 },

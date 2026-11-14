@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use crate::gpu::{
     EpochOrder, Error as GpuError, FusedBufs, FusedInputs, Kernels, Model, PositionRule, PowerMax,
-    PsiSums, Solve, Views, Weight,
+    PsiSums, ShiftProbe, Solve, Views, Weight,
 };
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::CudaStream;
@@ -218,7 +218,7 @@ impl Bufs<'_> {
                 Some(m) => {
                     let sums = PsiSums {
                         obj: None,
-                        probe: Some(&mut *m.probe_sums),
+                        probe: Some(ShiftProbe::Sums(&mut *m.probe_sums)),
                     };
                     let inputs = moved_inputs(&base, moved_shift(m.pos, m.spectrum));
                     k.shifted_psi_sums(ctx, &inputs, stack, rb.dlt, m.fused, sums)?;

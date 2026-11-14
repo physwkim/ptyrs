@@ -17,8 +17,8 @@ use crate::gpu::{
     ExitPass, ExitStage, FarSums, FusedBufs, FusedInputs, GammaStacks, GradKernels, Kernels,
     LlkPartial, LlkRing, LlkScratch, LlkTotals, Model, OpticsKernels, PositionKernels,
     PositionPartial, Positions, PowerMax, ProbeSpectrum, PsiSums, RingDevice, RpieKernels,
-    ScalePartial, Shift, ShiftSums, ShiftedProbeSums, SlicePhase, SliceSource, SpectrumBuf,
-    StackRef, StackTable, UpdateSums, ViewAddr, ViewDims, Views,
+    ScalePartial, Shift, ShiftProbe, ShiftSums, ShiftedProbeSums, SlicePhase, SliceSource,
+    SpectrumBuf, StackRef, StackTable, UpdateSums, ViewAddr, ViewDims, Views,
 };
 use crate::tile::TileDots;
 use cuda_async::cuda_graph::CudaGraph;
@@ -422,12 +422,16 @@ impl Modelled<'_> {
     }
 
     /// A fused pass's sums of the position model: with `probe` the shifted probe's update
-    /// sums, with `position` each frame's position sums; none without a position.
-    pub fn shift_sums(&mut self, probe: bool, position: bool) -> ShiftSums<'_> {
+    /// sums of that kind, with `position` each frame's position sums; none without a
+    /// position.
+    pub fn shift_sums<'c>(
+        &'c mut self,
+        probe: Option<fn(&'c mut ShiftedProbeSums) -> ShiftProbe<'c>>,
+        position: bool,
+    ) -> ShiftSums<'c> {
         match &mut self.position {
             Some(p) => ShiftSums {
-                probe: probe.then_some(&mut *p.probe),
-                step: false,
+                probe: probe.map(|kind| kind(&mut *p.probe)),
                 position: position.then_some(&mut *p.num),
                 position_den: position.then_some(&mut *p.den),
             },
@@ -442,13 +446,17 @@ impl Modelled<'_> {
     }
 
     /// The update sums of stored waves under the position model: `obj`, and with `probe`
-    /// the shifted probe's; the shifted probe's are none without a position.
-    pub fn psi_sums<'c>(&'c mut self, obj: Option<&'c mut UpdateSums>, probe: bool) -> PsiSums<'c> {
+    /// the shifted probe's of that kind; the shifted probe's are none without a position.
+    pub fn psi_sums<'c>(
+        &'c mut self,
+        obj: Option<&'c mut UpdateSums>,
+        probe: Option<fn(&'c mut ShiftedProbeSums) -> ShiftProbe<'c>>,
+    ) -> PsiSums<'c> {
         PsiSums {
             obj,
             probe: (self.position.as_mut())
-                .filter(|_| probe)
-                .map(|p| &mut *p.probe),
+                .zip(probe)
+                .map(|(p, kind)| kind(&mut *p.probe)),
         }
     }
 
