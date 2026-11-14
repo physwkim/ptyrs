@@ -436,7 +436,7 @@ fn gpu_refuses_optics_and_passes_it_cannot_run() {
     let e = refused(&free([0.4 * WAVELENGTH; 2], 1e-9), OPTIONS);
     assert!(e.contains("evanescent band"), "{e}");
     let e = refused(&slices.optics, OPTIONS);
-    assert!(e.contains("one object slice"), "{e}");
+    assert!(e.contains("1 object slices for optics of 3"), "{e}");
     let m1 = GpuOptions {
         fused: false,
         ..OPTIONS

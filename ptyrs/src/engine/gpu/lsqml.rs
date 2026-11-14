@@ -3,6 +3,11 @@
 //! the exit waves through the fused row passes and the propagator's stage around LSQML's
 //! column pass, the step sizes and every frame's `a_far` kept on the device. Under the position model the probe moves by
 //! each frame's offsets, and each batch steps its frames' offsets after its passes.
+//!
+//! A multislice object ([`crate::engine::SliceWaves`]) keeps, per stack of a batch, the wave
+//! entering every slice past the first and every slice's exit-wave update: slice 0 then
+//! steps with the probe as the one slice does, from its own update, and every other slice
+//! alone, from the wave that entered it.
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -10,7 +15,7 @@ use std::sync::Arc;
 use crate::gpu::{
     BhScan, C32, EpochOrder, Error as GpuError, FusedBufs, FusedInputs, Kernels, LSQML_REC,
     LsqmlAt, LsqmlChi, LsqmlKernels, LsqmlNoise, LsqmlScan, LsqmlVar, Model, PositionRule, PsiSums,
-    Solve, StackRef, StackTable, Views,
+    SlicePhase, SliceSource, SliceSteps, Solve, StackRef, StackTable, Views,
 };
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaStream, DeviceBuffer};
@@ -60,6 +65,11 @@ impl GpuPtycho {
                 "LSQML refines no intensity scale or background, as pty-chi's".into(),
             ));
         }
+        if self.dev.sliced() && (0..nepoch).any(|ic| llk_due(calc_llk, ic, nepoch)) {
+            return Err(EngineError::Invalid(
+                "no LLK pass runs a multislice object: LSQML on one takes calc_llk = 0".into(),
+            ));
+        }
         let nframe = self.dev.dims().nframe as usize;
         let size = params.batch_size.min(nframe);
         for ic in 0..nepoch {
@@ -107,6 +117,22 @@ pub(super) struct LsqmlState {
     scan: LsqmlScan,
     /// The position model's state, if the device models positions.
     moved: Option<Moved>,
+    /// A multislice object's waves, if the device's has more than one slice.
+    sliced: Option<SliceBufs>,
+}
+
+/// The waves of a batch through a multislice object of `n` slices, and the steps of its
+/// slices past the first.
+struct SliceBufs {
+    /// Per stack of a batch, the waves entering slices `1 .. n`.
+    incident: Vec<Vec<DeviceBuffer<C32>>>,
+    /// Per stack of a batch, the exit-wave updates of slices `0 .. n - 1`; the last slice's
+    /// is the stack's `work`.
+    chi: Vec<Vec<DeviceBuffer<C32>>>,
+    /// A stack's `conj(incident) chi` of one slice, which the object sums take.
+    pair: DeviceBuffer<C32>,
+    /// The steps of slices `1 .. n`.
+    steps: Vec<SliceSteps>,
 }
 
 /// An [`LsqmlState`] lent to an epoch.
@@ -120,12 +146,14 @@ pub(super) struct LsqmlBufs<'a> {
     order: &'a EpochOrder,
     scan: &'a mut LsqmlScan,
     moved: Option<&'a mut Moved>,
+    sliced: Option<&'a mut SliceBufs>,
 }
 
 impl LsqmlState {
     /// For `views` in batches of `size` frames, each cut into stacks by `rule`; under the
     /// position model, `scratch` holds the frames per stack of the shared scratch, whose shift
-    /// planes its sums borrow, which caps its stacks. The epoch order is the scan's.
+    /// planes its sums borrow, which caps its stacks; `deeper` counts the object's slices
+    /// past the first. The epoch order is the scan's.
     pub(super) fn new(
         stream: &Arc<CudaStream>,
         kernels: &Kernels,
@@ -133,6 +161,7 @@ impl LsqmlState {
         size: u32,
         rule: StackRule,
         scratch: Option<u32>,
+        deeper: usize,
     ) -> Result<Self, EngineError> {
         let dims = views.dims();
         // work: the forward pass, `chi`, the update sums, `dots`; icalc: `icalc` and `far`;
@@ -148,6 +177,11 @@ impl LsqmlState {
                 Streamed::new(plane_bytes::<C32>(dims, dims.nprobe), 3),
                 Streamed::new(FusedBufs::shift_bytes(dims), 2),
             ]);
+        }
+        if deeper > 0 {
+            // Of a multislice object, the wave entering a slice and its update, which the
+            // slice's product, adjoint, sums and `dots` touch.
+            streamed.extend([Streamed::new(wave_bytes(dims), 3); 2]);
         }
         let frames = rule.frames(&streamed)?;
         let frames = scratch.map_or(frames, |s| frames.min(s));
@@ -170,6 +204,25 @@ impl LsqmlState {
             Some(_) => Some(Moved::new(stream, kernels, dims, nf_max, slots)?),
             None => None,
         };
+        let sliced = match deeper {
+            0 => None,
+            _ => {
+                let per_slot = || -> Result<Vec<Vec<DeviceBuffer<C32>>>, EngineError> {
+                    (0..slots)
+                        .map(|_| (0..deeper).map(|_| Ok(DeviceBuffer::zeroed(stream, len)?)))
+                        .map(Iterator::collect)
+                        .collect()
+                };
+                Some(SliceBufs {
+                    incident: per_slot()?,
+                    chi: per_slot()?,
+                    pair: DeviceBuffer::zeroed(stream, len)?,
+                    steps: (0..deeper)
+                        .map(|_| SliceSteps::zeroed(stream, dims))
+                        .collect::<Result<_, _>>()?,
+                })
+            }
+        };
         Ok(Self {
             kernels: LsqmlKernels::load(kernels)?,
             size,
@@ -180,6 +233,7 @@ impl LsqmlState {
             order: EpochOrder::new(kernels, stream, views)?,
             scan: LsqmlScan::zeroed(stream, dims)?,
             moved,
+            sliced,
             batches,
             stacks,
             table,
@@ -217,15 +271,21 @@ impl LsqmlState {
             order: &self.order,
             scan: &mut self.scan,
             moved: self.moved.as_mut(),
+            sliced: self.sliced.as_mut(),
         }
     }
 
     /// The last epoch's steps, one per batch, read back: each batch's frames from the epoch
-    /// order and each position's `(a_far, a_obj, a_probe)` record.
+    /// order and each position's `(a_far, a_obj, a_probe)` record, with the `a_obj` of every
+    /// slice past the first after it.
     pub(super) fn steps(&self, stream: &CudaStream) -> Result<Vec<LsqmlStep>, EngineError> {
         let ids = self.order.ids().to_host_vec(stream)?;
         let records = self.scan.records().to_host_vec(stream)?;
         let records = records.as_chunks::<{ LSQML_REC as usize }>().0;
+        let deeper: Vec<Vec<f32>> = (self.sliced.iter())
+            .flat_map(|s| &s.steps)
+            .map(|s| s.a_obj().to_host_vec(stream))
+            .collect::<Result<_, _>>()?;
         Ok(self
             .batches
             .iter()
@@ -234,15 +294,24 @@ impl LsqmlState {
                     ..self.stacks[b.end - 1].range.end as usize;
                 let rec = &records[at.clone()];
                 let col = |i: usize| rec.iter().map(|r| f64::from(r[i])).collect();
+                let deeper = deeper
+                    .iter()
+                    .map(|a| a[at.clone()].iter().map(|&a| f64::from(a)).collect());
                 LsqmlStep {
-                    frames: ids[at].iter().map(|&f| f as usize).collect(),
                     a_far: col(0),
-                    a_obj: vec![col(1)],
+                    a_obj: std::iter::once(col(1)).chain(deeper).collect(),
                     a_probe: col(2),
+                    frames: ids[at].iter().map(|&f| f as usize).collect(),
                 }
             })
             .collect())
     }
+}
+
+/// The last slice's plane phase of `quad` radians per squared pixel, moved with the probe by
+/// `offsets`; none of no phase.
+fn slice_phase(quad: f32, offsets: Option<&DeviceBuffer<f32>>) -> Option<SlicePhase<'_>> {
+    (quad != 0.0).then_some(SlicePhase { quad, offsets })
 }
 
 impl<'a> Bufs<'a> {
@@ -296,7 +365,10 @@ impl<'a> Bufs<'a> {
             Cost::Poisson => LsqmlNoise::Poisson,
         };
         for b in 0..l.batches.len() {
-            self.lsqml_batch(ctx, passes, l, b, noise)?;
+            match l.sliced {
+                None => self.lsqml_batch(ctx, passes, l, b, noise)?,
+                Some(_) => self.lsqml_batch_sliced(ctx, passes, l, b, noise)?,
+            }
         }
         Ok(())
     }
@@ -459,5 +531,215 @@ impl<'a> Bufs<'a> {
         };
         l.kernels.update(ctx, l.scan, obj, probe)?;
         Ok(())
+    }
+
+    /// [`Self::lsqml_batch`] through a multislice object: every stack's waves through the
+    /// slices and their updates back; then the slices from the last to the second, each from
+    /// the wave that entered it, alone; and slice 0 with the probe as the one slice, its
+    /// object step shared with the others. Slice 0's passes read none of the others.
+    fn lsqml_batch_sliced(
+        &mut self,
+        ctx: &ExecutionContext,
+        passes: &mut PassesMut<'_>,
+        l: &mut LsqmlBufs<'a>,
+        b: usize,
+        noise: LsqmlNoise,
+    ) -> Result<(), GpuError> {
+        let batch = l.batches[b].clone();
+        let positions = l.stacks[batch.start].range.start..l.stacks[batch.end - 1].range.end;
+        let scan = BhScan {
+            order: l.order,
+            counts: self.counts,
+        };
+        let views = l.order.views();
+        let d = views.dims();
+        let moved = l.moved.as_deref_mut().map(|m| (m, ()));
+        let moved = MovedLent::lend(moved, passes.fused(), &mut self.features)?;
+        let mut moved = (moved.map(|m| m.batch(ctx, self.kernels, d, self.probe))).transpose()?;
+        let base = FusedInputs {
+            views,
+            counts: self.counts,
+            obj: self.obj,
+            probe: self.probe,
+            model: Model::default(),
+        };
+        let (lk, exit, ok) = (l.kernels, self.exit, self.exit.kernels);
+        let (Some(sl), Some(w)) = (self.slices.as_mut(), l.sliced.as_deref_mut()) else {
+            return Err(GpuError::Shape(
+                "LSQML state built for another slice count".into(),
+            ));
+        };
+        let last = sl.deeper.len();
+        let share = (last + 1) as f32;
+        // The last slice's plane phase, which moves with the probe.
+        let quad = sl.quad;
+        for (k, s) in batch.clone().enumerate() {
+            let (stack, work, inc) = (l.table.at(s), &mut l.work[k], &mut w.incident[k]);
+            let offsets = match &mut moved {
+                None => {
+                    let probe = SliceSource::Probe(self.probe);
+                    ok.slice_mul(ctx, views, stack, self.obj, probe, &mut inc[0])?;
+                    None
+                }
+                Some(m) => {
+                    let inputs = moved_inputs(&base, moved_shift(m.pos, m.spectrum));
+                    let pw = &mut m.w[k];
+                    // The row pass's own product, into `work`, is not read.
+                    self.kernels
+                        .shifted_rows_fwd(ctx, &inputs, stack, pw, work)?;
+                    m.kernels.shift_w(ctx, d, stack, pw)?;
+                    let probe = SliceSource::Waves(pw);
+                    ok.slice_mul(ctx, views, stack, self.obj, probe, &mut inc[0])?;
+                    Some(m.pos.offsets())
+                }
+            };
+            for i in 1..=last {
+                ok.gap(ctx, d, stack, &sl.gaps[i - 1], &mut inc[i - 1], false)?;
+                let (src, rest) = inc[i - 1..].split_first_mut().expect("i <= last");
+                let dst = rest.first_mut().unwrap_or(&mut *work);
+                let src = SliceSource::Waves(src);
+                ok.slice_mul(ctx, views, stack, &sl.deeper[i - 1], src, dst)?;
+            }
+            if let Some(p) = slice_phase(quad, offsets) {
+                ok.slice_phase(ctx, d, stack, p, work, false)?;
+            }
+            ok.rows(ctx, d, stack, work, false)?;
+            ok.exit(ctx, d, stack, exit.stage, work, false)?;
+            if noise == LsqmlNoise::Poisson {
+                lk.icalc(ctx, scan, stack, work, &mut l.icalc[k])?;
+            }
+        }
+        if noise == LsqmlNoise::Poisson {
+            let icalc: Vec<_> = batch
+                .clone()
+                .zip(l.icalc.iter())
+                .map(|(s, buf)| (l.table.at(s), buf))
+                .collect();
+            lk.far(ctx, scan, &icalc, positions.clone(), l.scan)?;
+        }
+        // Every slice's update: the last's from the detector plane, then back through the
+        // slices; the position sums, on the slice pty-chi corrects (`nslice / 2`), before
+        // any slice steps.
+        let pivot = last.div_ceil(2);
+        for (k, s) in batch.clone().enumerate() {
+            let (stack, work, chi) = (l.table.at(s), &mut l.work[k], &mut w.chi[k]);
+            lk.chi(ctx, scan, stack, noise, l.scan, work)?;
+            ok.exit(ctx, d, stack, exit.stage, work, true)?;
+            lk.back(ctx, views, stack, work)?;
+            let offsets = moved.as_ref().map(|m| m.pos.offsets());
+            if let Some(p) = slice_phase(quad, offsets) {
+                ok.slice_phase(ctx, d, stack, p, work, true)?;
+            }
+            for i in (0..last).rev() {
+                let (dst, rest) = chi[i..].split_first_mut().expect("i < last");
+                let src = rest.first().unwrap_or(&*work);
+                ok.slice_adjoint(ctx, views, stack, &sl.deeper[i], src, dst)?;
+                ok.gap(ctx, d, stack, &sl.gaps[i], dst, true)?;
+            }
+            if let Some(m) = &mut moved {
+                let c = chi.get(pivot).unwrap_or(&*work);
+                let at = [c, &w.incident[k][pivot - 1]];
+                m.kernels
+                    .sums(ctx, views, stack, &sl.deeper[pivot - 1], at, m.pos)?;
+            }
+        }
+        for i in (1..=last).rev() {
+            for (k, s) in batch.clone().enumerate() {
+                let stack = l.table.at(s);
+                let pair = [&w.incident[k][i - 1], w.chi[k].get(i).unwrap_or(&l.work[k])];
+                ok.slice_pair(ctx, d, stack, pair, &mut w.pair)?;
+                self.kernels
+                    .psi_to_obj(ctx, views, stack, &w.pair, sl.ones, self.obj_sums)?;
+            }
+            lk.dir_obj(ctx, l.scan, self.obj_sums)?;
+            for (k, s) in batch.clone().enumerate() {
+                let at = LsqmlAt {
+                    x: [&sl.deeper[i - 1], &*self.probe],
+                    d: [&self.obj_sums.num, &self.probe_sums.num],
+                };
+                let c = LsqmlChi::Moved {
+                    chi: w.chi[k].get(i).unwrap_or(&l.work[k]),
+                    w: &w.incident[k][i - 1],
+                };
+                lk.dots(ctx, views, l.table.at(s), at, c, l.scan)?;
+            }
+            let steps = &mut w.steps[i - 1];
+            lk.step_alone(
+                ctx,
+                positions.clone(),
+                l.scan,
+                share * d.nmode as f32,
+                steps,
+            )?;
+            let obj = LsqmlVar {
+                x: &mut sl.deeper[i - 1],
+                sums: &mut *self.obj_sums,
+            };
+            lk.update_alone(ctx, l.scan, obj, steps)?;
+        }
+
+        match &mut moved {
+            None => {
+                for (k, s) in batch.clone().enumerate() {
+                    let (stack, chi) = (l.table.at(s), &w.chi[k][0]);
+                    self.kernels
+                        .psi_to_obj(ctx, views, stack, chi, self.probe, self.obj_sums)?;
+                    self.kernels
+                        .psi_to_probe(ctx, views, stack, chi, self.obj, self.probe_sums)?;
+                }
+            }
+            Some(m) => {
+                for (k, s) in batch.clone().enumerate() {
+                    let inputs = moved_inputs(&base, moved_shift(m.pos, m.spectrum));
+                    let sums = PsiSums {
+                        obj: Some(&mut *self.obj_sums),
+                        probe: Some(&mut *m.probe_sums),
+                    };
+                    let (stack, chi) = (l.table.at(s), &w.chi[k][0]);
+                    self.kernels
+                        .shifted_psi_sums(ctx, &inputs, stack, chi, m.fused, sums)?;
+                }
+                self.kernels
+                    .shifted_probe_sums(ctx, d, m.probe_sums, self.probe_sums)?;
+            }
+        }
+        lk.dir_obj(ctx, l.scan, self.obj_sums)?;
+        let nb = positions.len() as f32;
+        self.kernels
+            .scale_c32(ctx, &mut self.probe_sums.num, self.probe_len, 1.0 / nb)?;
+        for (k, s) in batch.enumerate() {
+            let at = LsqmlAt {
+                x: [&*self.obj, &*self.probe],
+                d: [&self.obj_sums.num, &self.probe_sums.num],
+            };
+            let chi = &w.chi[k][0];
+            let c = match &moved {
+                None => LsqmlChi::Unmoved(chi),
+                Some(m) => LsqmlChi::Moved { chi, w: &m.w[k] },
+            };
+            lk.dots(ctx, views, l.table.at(s), at, c, l.scan)?;
+        }
+        lk.step(ctx, positions.clone(), l.scan, self.exit.scale)?;
+        lk.share(ctx, positions.clone(), l.scan, share)?;
+        if let Some(m) = moved {
+            let solve = Solve {
+                rule: PositionRule {
+                    step: POSITION_STEP as f32,
+                    limit: POSITION_LIMIT as f32,
+                },
+                scale: self.exit.scale,
+            };
+            m.kernels
+                .step(ctx, positions, l.order, m.offsets, solve, m.pos)?;
+        }
+        let obj = LsqmlVar {
+            x: &mut *self.obj,
+            sums: &mut *self.obj_sums,
+        };
+        let probe = LsqmlVar {
+            x: &mut *self.probe,
+            sums: &mut *self.probe_sums,
+        };
+        lk.update(ctx, l.scan, obj, probe)
     }
 }
