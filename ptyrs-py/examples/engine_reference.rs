@@ -1,6 +1,7 @@
-//! The CPU engine's results the Python tests compare the bindings against, run here on the
-//! engine itself: `engine_reference <dir>` writes `<dir>/opr.h5`, `<dir>/near.h5` and
-//! `<dir>/multislice.h5`, h5py-readable (complex as `{r, i}`); `scripts/build.sh` runs it into the module's directory.
+//! The engine's results the Python tests compare the bindings against, run here on the
+//! engine itself: `engine_reference <dir>` writes `<dir>/opr.h5`, `<dir>/near.h5`,
+//! `<dir>/multislice.h5` (the CPU engine's) and `<dir>/gpu_optics.h5` (the GPU engine's, on
+//! CUDA device `PTYRS_DEVICE`, default 0), h5py-readable (complex as `{r, i}`); `scripts/build.sh` runs it into the module's directory.
 //!
 //! `opr.h5` holds a simulated far-field scan (`counts`, raw `y` and `x`, the geometry as root
 //! attributes), its `positions` `[nframe, 2]` as the views read them at the object `pixel`,
@@ -21,19 +22,31 @@
 //! `multislice.h5` is laid out as `near.h5` for a scan through three object slices and PyNX's
 //! far field ([`Optics::with_slices`] of [`Optics::far_field`], `exit` `"far_field"` with its
 //! `detector_pixel`), the slice `gaps` in metres at the object pixel.
+//!
+//! `gpu_optics.h5` holds one group per near-field propagator the GPU engine runs
+//! (`angular_spectrum`, `fresnel`, `fresnel_back`): the `wavelength`, `pixel` and `distance`
+//! of its [`Optics::free_space`] as attributes, a scan drawn through it (`counts`, raw `y` and
+//! `x`), the start `object` and `probe`, and for each algorithm a fresh [`GpuPtycho`] runs
+//! `NEPOCH` times from that start either a group of its name (the `object` and `probe` it
+//! left and the `poisson` LLK after each) or, where the engine refuses it, the attribute
+//! `<name>_error` of its error text. LSQML and BH run as in `near.h5`, the others at their
+//! defaults with `calc_llk` 1.
 
 use std::error::Error;
 use std::path::Path;
 use std::slice;
 
+use cuda_core::CudaContext;
 use ptyrs::base::required_obj_shape;
 use ptyrs::base::sim::{fermat, object, poisson, probe};
-use ptyrs::base::{AddrTable, C64, Counts, Geometry, Object, Positions, Probe, Stack};
+use ptyrs::base::{AddrTable, C64, Counts, Geometry, Object, Positions, Probe, Scan, Stack};
 use ptyrs::engine::sim::simulate;
 use ptyrs::engine::{
-    Bh, BhParams, Cost, Lsqml, LsqmlParams, Observed, Optics, ProbeVariation, Ptycho, SliceWaves,
+    ApParams, Bh, BhParams, Cost, DmParams, EngineError, GpuOptions, GpuPtycho, Lsqml, LsqmlParams,
+    MlParams, Observed, Optics, ProbeVariation, Ptycho, RaarParams, RpieParams, SliceWaves,
     Wavefield, shift,
 };
+use ptyrs::gpu::FUSED_SIDES;
 use rust_hdf5::{Complex64, H5File, H5Group, H5Type};
 
 const NEPOCH: usize = 3;
@@ -430,6 +443,136 @@ fn multislice(path: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// One GPU algorithm call of `NEPOCH` cycles or epochs.
+type GpuRun = fn(&mut GpuPtycho) -> Result<(), EngineError>;
+
+const GPU_RUNS: [(&str, GpuRun); 7] = [
+    ("ap", |g| {
+        let params = ApParams {
+            calc_llk: 1,
+            ..Default::default()
+        };
+        g.ap(&params, NEPOCH)
+    }),
+    ("dm", |g| {
+        let params = DmParams {
+            calc_llk: 1,
+            ..Default::default()
+        };
+        g.dm(&params, NEPOCH)
+    }),
+    ("raar", |g| {
+        let params = RaarParams {
+            calc_llk: 1,
+            ..Default::default()
+        };
+        g.raar(&params, NEPOCH)
+    }),
+    ("ml", |g| {
+        let params = MlParams {
+            calc_llk: 1,
+            ..Default::default()
+        };
+        g.ml(&params, NEPOCH)
+    }),
+    ("rpie", |g| {
+        let params = RpieParams {
+            calc_llk: 1,
+            ..Default::default()
+        };
+        g.rpie(&params, NEPOCH)
+    }),
+    ("lsqml", |g| {
+        let params = LsqmlParams {
+            batch_size: 5,
+            cost: Cost::Poisson,
+            seed: 7,
+        };
+        g.lsqml(&params, NEPOCH, 1)
+    }),
+    ("bh", |g| {
+        let params = BhParams {
+            batch_size: 5,
+            probe_rho: 0.01,
+            position_rho: 0.1,
+            seed: 7,
+        };
+        g.bh(&params, NEPOCH, 1)
+    }),
+];
+
+/// The GPU engine under an angular-spectrum propagator and a Fresnel transform forward and
+/// back, every algorithm from a fresh state.
+fn gpu_optics(path: &Path) -> Result<(), Box<dyn Error>> {
+    let device = match std::env::var("PTYRS_DEVICE") {
+        Ok(d) => d.parse()?,
+        Err(_) => 0,
+    };
+    let ctx = CudaContext::new(device)?;
+    let side = FUSED_SIDES[0] as usize;
+    let frame = [side, side];
+    let (wavelength, pixel) = (1e-10, [5e-8, 5e-8]);
+    let f = H5File::create(path)?;
+    for (name, distance) in [
+        ("angular_spectrum", 1e-4),
+        ("fresnel", 5e-3),
+        ("fresnel_back", -5e-3),
+    ] {
+        let optics = Optics::free_space(&Wavefield::new(frame, wavelength, pixel, distance)?);
+        let raw = fermat(20, side as f64 / 8.0 * pixel[1]);
+        let positions = raw.pynx_preprocess(pixel);
+        let shape = required_obj_shape(&positions, pixel, frame, 16);
+        let truth = probe(frame, 2)?;
+        let addr = AddrTable::new(&positions, pixel, frame, shape, truth.nmode(), 1)?;
+        let (counts, scale) = draw(&addr, &optics, &[object(shape)], &truth, 2e5, 3)?;
+        let flat = Object::new(Stack::from_vec(
+            [1, shape[0], shape[1]],
+            vec![C64::new(1.0, 0.0); shape[0] * shape[1]],
+        )?);
+        let r = scale.sqrt();
+        let p0 = Probe::new(Stack::from_vec(
+            truth.dims(),
+            truth.as_slice().iter().map(|c| c * r).collect(),
+        )?);
+
+        let root = f.root_group().create_group(name)?;
+        root.set_attr_numeric("wavelength", &wavelength)?;
+        root.set_attr_numeric("distance", &distance)?;
+        write(&root, "pixel", &[2], &pixel)?;
+        write(&root, "counts", &counts.dims(), counts.as_slice())?;
+        write(&root, "y", &[raw.y.len()], &raw.y)?;
+        write(&root, "x", &[raw.x.len()], &raw.x)?;
+        write_stack(&root, "object", &flat.0)?;
+        write_stack(&root, "probe", &p0.0)?;
+        // Of the geometry the engine reads the frame alone.
+        let scan = Scan::new(
+            Geometry::new(wavelength, 1.0, pixel[1], frame)?,
+            raw,
+            counts,
+        )?;
+        for (algorithm, run) in GPU_RUNS {
+            let options = GpuOptions::default();
+            let mut gpu =
+                GpuPtycho::with_optics(&ctx, &scan, &optics, flat.clone(), p0.clone(), options)?;
+            match run(&mut gpu) {
+                Ok(()) => {
+                    let at = root.create_group(algorithm)?;
+                    write_stack(&at, "object", &gpu.object()?.0)?;
+                    write_stack(&at, "probe", &gpu.probe()?.0)?;
+                    let llk: Vec<f64> = gpu.history().iter().map(|r| r.llk.poisson).collect();
+                    write(&at, "poisson", &[llk.len()], &llk)?;
+                }
+                Err(e @ EngineError::Invalid(_)) => {
+                    root.set_attr_string(&format!("{algorithm}_error"), &e.to_string())?;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+    f.close()?;
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let dir = std::env::args()
         .nth(1)
@@ -437,5 +580,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     let dir = Path::new(&dir);
     opr(&dir.join("opr.h5"))?;
     near(&dir.join("near.h5"))?;
-    multislice(&dir.join("multislice.h5"))
+    multislice(&dir.join("multislice.h5"))?;
+    gpu_optics(&dir.join("gpu_optics.h5"))
 }
