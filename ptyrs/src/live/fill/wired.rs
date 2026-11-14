@@ -1,7 +1,8 @@
 //! The fill hook wired end to end: frames through the uploader into the
 //! consumer, each run against one GPU's replay of what became of each
-//! batch's fill.
+//! call's fill.
 
+use std::collections::VecDeque;
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,7 +15,7 @@ use super::standin::Wrong;
 use super::{PatchFill, PatchPredictor, patch_corner};
 use crate::dist::Scheme;
 use crate::live::farfield::{Ptycho, PtychoSpec, ScanPath};
-use crate::live::follow::{FillHook, FollowCfg, FollowReport, ReconCfg, run_dist_consumer};
+use crate::live::follow::{Fate, FillHook, FollowCfg, FollowReport, ReconCfg, run_dist_consumer};
 use crate::live::pos::{Pos, PosTable};
 use crate::live::recon::LiveAp;
 use crate::live::ring::{FrameBatch, Ring, UploaderConfig, run_region_uploader};
@@ -22,6 +23,7 @@ use crate::live::sent::sent;
 
 const PATCH: [usize; 2] = [32, 32];
 const BATCH: usize = 4;
+const PACK: usize = 3 * BATCH;
 
 /// [`Wrong`], refusing the calls `fail` (counted from 1) before predicting;
 /// its first call waits until `gate` fires or closes.
@@ -72,15 +74,14 @@ impl PatchPredictor for Refusing {
 struct Case {
     ngpu: usize,
     frames: usize,
-    /// [`FillHook::counts`] and [`FillHook::fills`].
+    /// [`FillHook::counts`] and [`FillHook::fills`]: no fill buffer, or
+    /// one per batch at least, so the pool runs dry always or never.
     counts: usize,
     fills: usize,
     fail: &'static [u64],
-    /// The predictor's first call holds its counts until a batch went by
-    /// without any.
+    /// The predictor's first call is held until a batch went by without
+    /// counts.
     gate: bool,
-    /// Batches, from 0, whose fill finds every buffer in flight.
-    no_buffer: &'static [usize],
     /// Positions planned; all when `None`.
     plan: Option<usize>,
     /// Between scan points, pixels.
@@ -96,33 +97,21 @@ impl Case {
             fills: frames,
             fail: &[],
             gate: false,
-            no_buffer: &[],
             plan: None,
             step: 8.0,
         }
     }
 }
 
-/// What each count of a [`crate::live::follow::FillReport`] should be.
-#[derive(Debug, Default, PartialEq)]
-struct Tally {
-    written: u64,
-    no_counts: u64,
-    failed: u64,
-    no_buffer: u64,
-    dropped: u64,
-    not_ready: usize,
-    predicted: u64,
-    error: Option<String>,
-}
-
-/// Streams `case.frames` of a 12-column raster through the uploader, in
-/// full batches of [`BATCH`] but the last, into the consumer filling with
-/// [`Refusing`] on `case.ngpu` GPUs, a relay between them recording which
-/// batches came with counts. Replays the landings on one GPU, each batch's
-/// fill predicted, refused, skipped or stitched as the relay and `case`
-/// say, and checks the run's fill report and its last kept object against
-/// the replay's, bit for bit. Returns the run's report.
+/// Streams a 12-column raster of `case.frames`, one frame short, through
+/// the uploader, in full batches of [`BATCH`] but the last, into the
+/// consumer filling with [`Refusing`] on `case.ngpu` GPUs, a relay between
+/// them recording which batches came with counts. Short, the scan ends once
+/// the uploader stops, so every call's fill reaches the run. Replays the
+/// landings on one GPU, each reported call taking the next batches with
+/// counts, predicted, refused, or stitched and queued, at the landing and
+/// epoch the run reports, and checks each call's fate and the run's last
+/// kept object against the replay's, bit for bit. Returns the run's report.
 fn run(case: Case) -> FollowReport {
     let p = Ptycho::new(PtychoSpec {
         n: 64,
@@ -176,6 +165,7 @@ fn run(case: Case) -> FollowReport {
         let hook = FillHook {
             predictor: Box::new(Refusing::new(case.fail, case.gate.then_some(gate_rx))),
             batch: BATCH,
+            pack: PACK,
             counts: case.counts,
             fills: case.fills,
         };
@@ -205,9 +195,10 @@ fn run(case: Case) -> FollowReport {
         };
         std::thread::spawn(move || run_region_uploader(ring, landing, table, up, stop, Some(up_tx)))
     };
+    let streamed = total - 1;
     let mut k = 0;
     for burst in [50, 1, 90, 0, 99] {
-        for _ in 0..burst.min(total - k) {
+        for _ in 0..burst.min(streamed - k) {
             let mut s = ring.reserve();
             s.frame()
                 .copy_from_slice(&counts[k * n * n..(k + 1) * n * n]);
@@ -218,30 +209,39 @@ fn run(case: Case) -> FollowReport {
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    assert_eq!(k, total);
+    assert_eq!(k, streamed);
     stop.store(true, Ordering::Release);
     let up = uploader.join().unwrap().unwrap();
     let rep = consumer.join().unwrap().unwrap();
     let had = relay.join().unwrap();
-    assert_eq!((up.frames, up.pos_missing), (total as u64, 0));
-    assert_eq!((rep.stored, rep.landed), (total as u64, total as u64));
+    assert_eq!((up.frames, up.pos_missing), (streamed as u64, 0));
+    assert_eq!((rep.stored, rep.landed), (streamed as u64, streamed as u64));
     let batches = rep.landings.len();
     assert_eq!((batches as u64, had.len()), (up.batches, batches));
-    assert_eq!(batches, total.div_ceil(BATCH));
+    assert_eq!(batches, streamed.div_ceil(BATCH));
     let dry = had.iter().filter(|h| !**h).count() as u64;
     assert_eq!(dry, up.counts_dry);
+    assert!(
+        case.fills == 0 || case.fills >= batches,
+        "a pool run dry by chance"
+    );
+    let fill = rep.fill.as_ref().unwrap();
+    assert_eq!(fill.no_counts, dry);
 
     ctx.bind_to_thread().unwrap();
     let st = ctx.new_stream().unwrap();
     let dev = DeviceBuffer::from_host(&st, &counts).unwrap();
     let mut live = LiveAp::new(&st, &cfg.ap, &cfg.probe, dev, false).unwrap();
     let mut backer = live.backer();
-    // Never dry: `case.no_buffer` names the batches the run found it so.
-    let mut pf = PatchFill::new(&ctx, rep.shape, PATCH, BATCH, batches).unwrap();
+    let mut pf = PatchFill::new(&ctx, rep.shape, PATCH, PACK, fill.calls.len()).unwrap();
     let mut pred = Refusing::new(case.fail, None);
     let (nmode, frame) = (cfg.ap.shape.nmode as usize, [n, n]);
     let (nprobe, nobj) = (cfg.ap.shape.nprobe, cfg.ap.shape.nobj);
-    let mut want = Tally::default();
+    let (mut error, mut not_ready) = (None, 0);
+    // The frames and patch corners of the batches landed with counts that
+    // no call took yet, in landing order.
+    let mut queued = VecDeque::new();
+    let mut calls = fill.calls.iter().peekable();
     let mut at = 0;
     for (i, &(epochs, upto)) in rep.landings.iter().enumerate() {
         while live.epochs() < epochs {
@@ -253,48 +253,60 @@ fn run(case: Case) -> FollowReport {
             cfg.place.views(q, nprobe, nobj, &mut v);
         }
         backer.back(&v).unwrap();
-        let whole = u64::from(live.push(&v).unwrap()) == upto - at;
+        assert_eq!(u64::from(live.push(&v).unwrap()), upto - at);
         at = upto;
-        if !had[i] {
-            want.no_counts += 1;
-            continue;
+        if had[i] {
+            let corners: Vec<[u32; 2]> = v
+                .chunks(nmode)
+                .map(|v| patch_corner([v[0].oy, v[0].ox], frame, PATCH))
+                .collect();
+            queued.push_back((a..b, corners));
         }
-        let corners: Vec<[u32; 2]> = v
-            .chunks(nmode)
-            .map(|v| patch_corner([v[0].oy, v[0].ox], frame, PATCH))
-            .collect();
-        let mut out = vec![[0.0; 2]; corners.len() * PATCH[0] * PATCH[1]];
-        if let Err(e) = pred.predict(&counts[a * n * n..b * n * n], frame, &mut out) {
-            want.failed += 1;
-            want.error.get_or_insert(e);
-            continue;
-        }
-        want.predicted += 1;
-        if case.no_buffer.contains(&i) {
-            want.no_buffer += 1;
-            continue;
-        }
-        let f = pf.stitch(&corners, &out).unwrap();
-        if whole {
-            want.written += 1;
-            want.not_ready += live.fill(f).unwrap();
-        } else {
-            want.dropped += 1;
+        // The fills that reached the run before the next batch.
+        while let Some(c) = calls.next_if(|c| c.landings == i + 1) {
+            while live.epochs() < c.epochs {
+                live.epoch().unwrap();
+            }
+            assert!(
+                c.batches as usize <= queued.len(),
+                "{c:?} before its batches"
+            );
+            let held: Vec<_> = queued.drain(..c.batches as usize).collect();
+            let frames: usize = held.iter().map(|(r, _)| r.len()).sum();
+            let end = held.last().map(|(r, _)| r.end as u64);
+            assert_eq!((c.frames as usize, Some(c.upto)), (frames, end), "{c:?}");
+            assert!(frames <= PACK, "{c:?}");
+            let cc: Vec<u16> = held
+                .iter()
+                .flat_map(|(r, _)| &counts[r.start * n * n..r.end * n * n])
+                .copied()
+                .collect();
+            let corners: Vec<[u32; 2]> = held.iter().flat_map(|(_, c)| c).copied().collect();
+            let mut out = vec![[0.0; 2]; frames * PATCH[0] * PATCH[1]];
+            let fate = match pred.predict(&cc, frame, &mut out) {
+                Err(e) => {
+                    error.get_or_insert(e);
+                    Fate::Failed
+                }
+                Ok(()) if case.fills == 0 => Fate::NoBuffer,
+                Ok(()) => {
+                    let f = pf.stitch(&corners, &out).unwrap();
+                    not_ready += live.fill(f).unwrap();
+                    Fate::Written
+                }
+            };
+            assert_eq!(c.fate, fate, "{} GPUs: {c:?}", case.ngpu);
         }
     }
-    let fill = rep.fill.as_ref().unwrap();
-    let got = Tally {
-        written: fill.written,
-        no_counts: fill.no_counts,
-        failed: fill.failed,
-        no_buffer: fill.no_buffer,
-        dropped: fill.dropped,
-        not_ready: fill.not_ready,
-        predicted: fill.predict.count(),
-        error: fill.error.clone(),
-    };
-    assert_eq!(got, want, "{} GPUs: the fill report", case.ngpu);
-    assert_eq!(fill.stitch.count(), want.predicted);
+    assert_eq!(calls.next(), None);
+    assert!(queued.is_empty(), "{} batches in no call", queued.len());
+    assert_eq!((&fill.error, fill.not_ready), (&error, not_ready));
+    let ncalls = fill.calls.len() as u64;
+    let stitched = ncalls - fill.of(Fate::Failed).0 as u64;
+    assert_eq!(
+        (fill.copy.count(), fill.predict.count(), fill.stitch.count()),
+        (ncalls, ncalls, stitched)
+    );
 
     let last = rep.kept.last().unwrap();
     while live.epochs() < last.epochs {
@@ -313,9 +325,9 @@ fn run(case: Case) -> FollowReport {
     rep
 }
 
-/// With one tap buffer, held by the predictor until a batch went by
-/// without counts, batches land unfilled while it is lent, and the tap
-/// lends again once the predictor let go.
+/// With one tap buffer, lent to a batch queued behind the predictor's
+/// first call, held until a batch went by without counts, batches land
+/// unfilled while it is lent, and the tap lends again once the call ended.
 #[test]
 fn batches_sent_without_counts_land_unfilled() {
     let rep = run(Case {
@@ -324,23 +336,24 @@ fn batches_sent_without_counts_land_unfilled() {
         ..Case::new(1, 240)
     });
     let fill = rep.fill.unwrap();
-    assert!(fill.no_counts >= 1 && fill.written >= 2, "{}", fill.written);
+    let written = fill.of(Fate::Written).0;
+    assert!(fill.no_counts >= 1 && written >= 2, "{written}");
 }
 
-/// With one fill buffer, the second of two batches finds it on the object
-/// still, under the first batch's copies, and lands unfilled.
+/// With no fill buffer, every call is predicted, finds none free, and
+/// leaves its batches' frames unfilled.
 #[test]
 fn a_fill_finding_no_buffer_free_is_skipped() {
     let rep = run(Case {
-        fills: 1,
-        no_buffer: &[1],
+        fills: 0,
         ..Case::new(1, 2 * BATCH)
     });
-    assert_eq!(rep.fill.unwrap().written, 1);
+    let fill = rep.fill.unwrap();
+    assert_eq!(fill.of(Fate::NoBuffer).1, rep.landings.len() as u64);
 }
 
-/// A predictor failing on its first and fourth calls leaves those batches
-/// unfilled and the run going, its first error reported.
+/// A predictor failing on its first and fourth calls leaves those calls'
+/// batches unfilled and the run going, its first error reported.
 #[test]
 fn a_failing_predictor_skips_its_batches_and_reports_its_first_error() {
     let rep = run(Case {
@@ -348,7 +361,7 @@ fn a_failing_predictor_skips_its_batches_and_reports_its_first_error() {
         ..Case::new(1, 240)
     });
     let fill = rep.fill.unwrap();
-    assert_eq!(fill.failed, 2);
+    assert_eq!(fill.of(Fate::Failed).0, 2);
     assert_eq!(fill.error.as_deref(), Some("call 1 refused"));
 }
 
