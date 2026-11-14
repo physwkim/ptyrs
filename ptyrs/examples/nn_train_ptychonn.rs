@@ -22,7 +22,8 @@ use common::scan;
 use ptyrs::base::{Object, Probe, sim};
 use ptyrs::nn::data::{random_object, structured_object};
 use ptyrs::nn::predictor::{
-    Patches, PredictorConfig, Samples, TrainOptions, mean_frame_total, object_patches, train,
+    CHANNELS, Patches, PredictorConfig, Samples, TrainOptions, mean_frame_total, object_patches,
+    train,
 };
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
@@ -80,18 +81,18 @@ fn pick(s: Samples, n: usize, seed: u64) -> Samples {
     idx.sort_unstable();
     let [_, py, px] = s.target.dims;
     let plane = py * px;
-    let gather = |v: &[f32]| -> Vec<f32> {
+    let gather = |v: &[f32], plane: usize| -> Vec<f32> {
         idx.iter()
             .flat_map(|&i| &v[i * plane..(i + 1) * plane])
             .copied()
             .collect()
     };
     Samples {
-        input: gather(&s.input),
+        input: gather(&s.input, CHANNELS * plane),
         target: Patches {
             dims: [n, py, px],
-            amp: gather(&s.target.amp),
-            phase: gather(&s.target.phase),
+            amp: gather(&s.target.amp, plane),
+            phase: gather(&s.target.phase, plane),
         },
     }
 }
