@@ -54,7 +54,7 @@ fn l1(a: &[f32], b: &[f32]) -> f64 {
 #[test]
 fn ptychonn_maps_images_to_amplitude_and_phase_of_the_same_size() {
     let device = Device::cuda(0);
-    let net = PtychoNN::new(8, 3, &device);
+    let net = PtychoNN::new(1, 8, 3, &device);
     assert_eq!(net.granule(), 8);
     let x = Tensor::<4>::random(
         [2, 1, 32, 24],

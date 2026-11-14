@@ -74,7 +74,7 @@ impl Decoder {
 }
 
 /// PtychoNN with `depth` encoder stages of `width << k` channels, each halving the image, and
-/// two mirror decoders. Input `[batch, 1, n, n]` with `n` a multiple of `2^depth`; output object
+/// two mirror decoders. Input `[batch, channels, n, n]` with `n` a multiple of `2^depth`; output object
 /// amplitude in `(0, 2)` (a flat object is 1) and phase in `(-π, π)`, each `[batch, 1, n, n]`.
 #[derive(Module, Debug)]
 pub struct PtychoNN {
@@ -84,12 +84,12 @@ pub struct PtychoNN {
 }
 
 impl PtychoNN {
-    pub fn new(width: usize, depth: usize, device: &Device) -> Self {
+    pub fn new(channels: usize, width: usize, depth: usize, device: &Device) -> Self {
         assert!(width >= 2 && depth >= 1, "width {width}, depth {depth}");
         let encoder = (0..depth)
             .map(|k| {
                 Block::new(
-                    if k == 0 { 1 } else { width << (k - 1) },
+                    if k == 0 { channels } else { width << (k - 1) },
                     width << k,
                     device,
                 )

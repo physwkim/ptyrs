@@ -3,8 +3,11 @@
 //!
 //! A frame of `[ny, nx]` detector pixels binned by `bin` becomes a `[ny/bin, nx/bin]` amplitude
 //! image; binning halves the real-space field of view the detector samples, so the network
-//! predicts the central `[ny/bin, nx/bin]` object pixels of the frame's window. A trained model
-//! holds for the probe and geometry of its training scans.
+//! predicts the central `[ny/bin, nx/bin]` object pixels of the frame's window. Binning also
+//! averages out the fringes between object points more than a `bin`-th of the window apart, which
+//! are what places structure finer than that inside the patch, so the network reads the unbinned
+//! centre of the frame as a second image. A trained model holds for the probe and geometry of its
+//! training scans.
 
 use std::f64::consts::PI;
 use std::path::{Path, PathBuf};
@@ -50,7 +53,7 @@ impl PredictorConfig {
 
     pub fn init(&self, device: &Device) -> Result<PtychoNN, NnError> {
         self.check()?;
-        Ok(PtychoNN::new(self.width, self.depth, device))
+        Ok(PtychoNN::new(CHANNELS, self.width, self.depth, device))
     }
 }
 
@@ -93,10 +96,15 @@ pub fn mean_frame_total(frames: &Counts) -> f64 {
     frames.total() / frames.nframe() as f64
 }
 
-/// Network input `[nframe, ny/bin, nx/bin]` from detector-order frames: each `bin × bin` block
-/// summed (a masked pixel counts as the block's unmasked mean, a fully masked block as 0),
-/// divided by `norm` ([`mean_frame_total`] of the scan) and by the binned pixel share, and
-/// square-rooted, so a frame of mean intensity has mean square amplitude 1.
+/// Images per frame in the network input.
+pub const CHANNELS: usize = 2;
+
+/// Network input `[nframe, CHANNELS, ny/bin, nx/bin]` from detector-order frames. Image 0 is the
+/// binned frame: each `bin × bin` block summed (a masked pixel counts as the block's unmasked
+/// mean, a fully masked block as 0), divided by `norm` ([`mean_frame_total`] of the scan) and by
+/// the binned pixel share, and square-rooted, so a frame of mean intensity has mean square
+/// amplitude 1. Image 1 is the unbinned `[ny/bin, nx/bin]` pixels about the zero frequency
+/// `[ny/2, nx/2]` on the same scale (a masked pixel is 0).
 pub fn diffraction_input(frames: &Counts, bin: usize, norm: f64) -> Result<Vec<f32>, NnError> {
     let [ny, nx] = frames.frame_shape();
     if bin == 0 || ny % bin != 0 || nx % bin != 0 {
@@ -109,7 +117,9 @@ pub fn diffraction_input(frames: &Counts, bin: usize, norm: f64) -> Result<Vec<f
     }
     let (by, bx) = (ny / bin, nx / bin);
     let scale = (by * bx) as f64 / norm;
-    let mut out = Vec::with_capacity(frames.nframe() * by * bx);
+    let fine = (ny * nx) as f64 / norm;
+    let (cy, cx) = (ny / 2 - by / 2, nx / 2 - bx / 2);
+    let mut out = Vec::with_capacity(frames.nframe() * CHANNELS * by * bx);
     for f in 0..frames.nframe() {
         let frame = frames.frame(f);
         for y in 0..by {
@@ -129,6 +139,13 @@ pub fn diffraction_input(frames: &Counts, bin: usize, norm: f64) -> Result<Vec<f
                 };
                 out.push((block * scale).sqrt() as f32);
             }
+        }
+        for y in 0..by {
+            let row = &frame[(cy + y) * nx + cx..][..bx];
+            out.extend(
+                row.iter()
+                    .map(|&v| (Counts::intensity(v).unwrap_or(0.0) * fine).sqrt() as f32),
+            );
         }
     }
     Ok(out)
@@ -209,7 +226,7 @@ pub fn stitch(patches: &Patches, addr: &AddrTable) -> Result<Object, NnError> {
     Ok(Object::new(Stack::from_vec([1, nyo, nxo], data)?))
 }
 
-/// Training pairs: network inputs `[n, py, px]` and the true patches.
+/// Training pairs: network inputs `[n, CHANNELS, py, px]` and the true patches.
 #[derive(Clone, Debug)]
 pub struct Samples {
     pub input: Vec<f32>,
@@ -374,9 +391,10 @@ pub struct EpochLoss {
     pub valid: Option<f64>,
 }
 
-fn tensor(values: &[f32], dims: [usize; 3], device: &Device) -> Tensor<4> {
+/// `values` as `[n, channels, py, px]` for `dims = [n, py, px]`.
+fn tensor(values: &[f32], channels: usize, dims: [usize; 3], device: &Device) -> Tensor<4> {
     Tensor::from_data(
-        TensorData::new(values.to_vec(), [dims[0], 1, dims[1], dims[2]]),
+        TensorData::new(values.to_vec(), [dims[0], channels, dims[1], dims[2]]),
         device,
     )
 }
@@ -390,7 +408,8 @@ pub(crate) fn host<const D: usize>(t: Tensor<D>) -> Result<Vec<f32>, NnError> {
 }
 
 /// [`PtychoNN`] behind a fixed standardisation of its input: the per-pixel mean of the training
-/// inputs is subtracted and the result multiplied by the inverse RMS spread about that mean.
+/// inputs is subtracted and the result multiplied by each image's inverse RMS spread about that
+/// mean.
 /// Every frame carries the probe's far field and the object only modulates it; removing the
 /// shared pattern lets training leave the mean patch several times sooner. The statistics are
 /// parameters only so that they are saved with the weights; they take no gradient.
@@ -402,11 +421,11 @@ struct Model {
 }
 
 impl Model {
-    /// `mean` is the `[py, px]` patch-shaped mean input.
+    /// `mean` is the `[CHANNELS, py, px]` mean input, `inv_spread` one value per image.
     fn new(
         config: &PredictorConfig,
         mean: Vec<f32>,
-        inv_spread: f32,
+        inv_spread: Vec<f32>,
         device: &Device,
     ) -> Result<Self, NnError> {
         let [py, px] = config.patch();
@@ -416,8 +435,8 @@ impl Model {
         };
         Ok(Self {
             net: config.init(device)?,
-            mean: fixed(mean, [1, 1, py, px]),
-            inv_spread: fixed(vec![inv_spread], [1, 1, 1, 1]),
+            mean: fixed(mean, [1, CHANNELS, py, px]),
+            inv_spread: fixed(inv_spread, [1, CHANNELS, 1, 1]),
         })
     }
 
@@ -427,35 +446,37 @@ impl Model {
     }
 }
 
-/// Per-pixel mean of `samples`' inputs and the inverse RMS spread about it.
-fn input_stats(samples: &Samples) -> Result<(Vec<f32>, f32), NnError> {
+/// Per-pixel mean of `samples`' inputs and each image's inverse RMS spread about it.
+fn input_stats(samples: &Samples) -> Result<(Vec<f32>, Vec<f32>), NnError> {
     let [n, py, px] = samples.target.dims;
     let plane = py * px;
-    let mut mean = vec![0.0f64; plane];
-    for frame in samples.input.chunks(plane) {
+    let mut mean = vec![0.0f64; CHANNELS * plane];
+    for frame in samples.input.chunks(mean.len()) {
         for (m, &x) in mean.iter_mut().zip(frame) {
             *m += f64::from(x) / n as f64;
         }
     }
-    let var = samples
-        .input
-        .chunks(plane)
-        .flat_map(|frame| {
-            frame
+    let mut var = [0.0f64; CHANNELS];
+    for frame in samples.input.chunks(mean.len()) {
+        for ((x, m), v) in frame
+            .chunks(plane)
+            .zip(mean.chunks(plane))
+            .zip(var.iter_mut())
+        {
+            *v += x
                 .iter()
-                .zip(&mean)
+                .zip(m)
                 .map(|(&x, m)| (f64::from(x) - m).powi(2))
-        })
-        .sum::<f64>()
-        / (n * plane) as f64;
-    if var.is_nan() || var == 0.0 {
-        return Err(NnError::Invalid(format!(
-            "training inputs have spread {var}"
-        )));
+                .sum::<f64>()
+                / (n * plane) as f64;
+        }
+    }
+    if let Some(v) = var.iter().find(|v| v.is_nan() || **v == 0.0) {
+        return Err(NnError::Invalid(format!("training inputs have spread {v}")));
     }
     Ok((
         mean.into_iter().map(|m| m as f32).collect(),
-        (1.0 / var.sqrt()) as f32,
+        var.iter().map(|v| (1.0 / v.sqrt()) as f32).collect(),
     ))
 }
 
@@ -496,9 +517,9 @@ pub fn train(
         (start, model, optim) = checkpoint.resume(dir, model, optim)?;
     }
     let dims = train.target.dims;
-    let x = tensor(&train.input, dims, &ad);
-    let amp = tensor(&train.target.amp, dims, &ad);
-    let phase = tensor(&train.target.phase, dims, &ad);
+    let x = tensor(&train.input, CHANNELS, dims, &ad);
+    let amp = tensor(&train.target.amp, 1, dims, &ad);
+    let phase = tensor(&train.target.phase, 1, dims, &ad);
     let mut rng = ChaCha8Rng::seed_from_u64(options.seed);
     let mut order: Vec<i64> = (0..dims[0] as i64).collect();
     // Each epoch shuffles the previous order: replay the finished ones.
@@ -582,11 +603,11 @@ impl Predictor {
         let plane = patch[0] * patch[1];
         let device = self.device();
         let mut out = Patches::empty(patch);
-        for chunk in input.chunks(CHUNK * plane) {
-            let n = chunk.len() / plane;
-            let (a, p) = self
-                .model
-                .forward(tensor(chunk, [n, patch[0], patch[1]], &device));
+        for chunk in input.chunks(CHUNK * CHANNELS * plane) {
+            let n = chunk.len() / (CHANNELS * plane);
+            let (a, p) =
+                self.model
+                    .forward(tensor(chunk, CHANNELS, [n, patch[0], patch[1]], &device));
             out.append(Patches {
                 dims: [n, patch[0], patch[1]],
                 amp: host(a)?,
@@ -618,9 +639,14 @@ impl Predictor {
             let dims = [m, py, px];
             let loss = l1(
                 &self.model,
-                tensor(&samples.input[r.clone()], dims, &device),
-                tensor(&samples.target.amp[r.clone()], dims, &device),
-                tensor(&samples.target.phase[r], dims, &device),
+                tensor(
+                    &samples.input[CHANNELS * r.start..CHANNELS * r.end],
+                    CHANNELS,
+                    dims,
+                    &device,
+                ),
+                tensor(&samples.target.amp[r.clone()], 1, dims, &device),
+                tensor(&samples.target.phase[r], 1, dims, &device),
             );
             sum += f64::from(loss.try_into_scalar::<f32>().map_err(burn_err)?) * m as f64;
         }
@@ -642,9 +668,14 @@ impl Predictor {
     pub fn load(dir: &Path, device: &Device) -> Result<Self, NnError> {
         let config = PredictorConfig::load(dir.join("predictor.json")).map_err(burn_err)?;
         let [py, px] = config.patch();
-        let model = Model::new(&config, vec![0.0; py * px], 1.0, device)?
-            .try_load_file(dir.join("predictor.bpk"))
-            .map_err(burn_err)?;
+        let model = Model::new(
+            &config,
+            vec![0.0; CHANNELS * py * px],
+            vec![1.0; CHANNELS],
+            device,
+        )?
+        .try_load_file(dir.join("predictor.bpk"))
+        .map_err(burn_err)?;
         Ok(Self { config, model })
     }
 }
@@ -668,9 +699,12 @@ mod tests {
         let norm = 8.0;
         let got = diffraction_input(&counts, 2, norm).unwrap();
         let block = [14.0, 22.0, 36.0 * 4.0 / 3.0, 0.0];
+        // The unbinned centre: rows 1..3, columns 1..3.
+        let centre = [6.0, 7.0, 0.0, 0.0];
         let want: Vec<f32> = block
             .iter()
             .map(|b: &f64| (b * 4.0 / norm).sqrt() as f32)
+            .chain(centre.iter().map(|c: &f64| (c * 16.0 / norm).sqrt() as f32))
             .collect();
         assert_eq!(got, want);
         assert!(diffraction_input(&counts, 3, norm).is_err());
