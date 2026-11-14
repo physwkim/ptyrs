@@ -482,6 +482,55 @@ fn full_object_ml_matches_cpu_under_every_propagator() {
     }
 }
 
+/// rPIE under each propagator with drawn offsets that sample the object, against the CPU's
+/// under `Sampling::FullObject`: each epoch's recorded LLK, and the object, the probe and the
+/// offsets after the last; the graphs replay the eager run bit for bit.
+#[test]
+fn full_object_rpie_matches_cpu_under_every_propagator() {
+    const NEPOCH: usize = 6;
+    // Measured worst: LLK 1.8e-6, object 3.6e-7, probe 4.7e-6, offsets 3.6e-7; rPIE models no
+    // scale or background.
+    const TOL: [f64; 5] = [1e-5, 2e-6, 2.5e-5, f64::MIN_POSITIVE, 2e-6];
+    let moved = Features {
+        position: Some(drawn_offsets()),
+        ..Features::default()
+    };
+    for c in cases() {
+        let (object, probe) = (c.object.clone(), c.probe.clone());
+        let mut cpu = Ptycho::with_optics(&c.scan, c.optics(), object, probe).unwrap();
+        cpu.set_sampling(Sampling::FullObject);
+        cpu.set_features(moved.clone()).unwrap();
+        cpu.rpie(&RPIE, NEPOCH).unwrap();
+        assert_eq!(cpu.history().len(), NEPOCH);
+        let want = Ended::cpu(&cpu);
+        let run = |graph| {
+            let mut gpu = c.gpu(graph);
+            gpu.set_sampling(Sampling::FullObject).unwrap();
+            gpu.set_features(&moved).unwrap();
+            gpu.rpie(&RPIE, NEPOCH).unwrap();
+            Ended::gpu(&gpu)
+        };
+        let (eager, graphs) = (run(false), run(true));
+        assert_close(&format!("rPIE {}", c.name), &eager, &want, TOL);
+        let what = format!("rPIE {} graph", c.name);
+        assert_eq!(graphs.llk, eager.llk, "{what}: LLK");
+        assert_eq!(
+            graphs.object.as_slice(),
+            eager.object.as_slice(),
+            "{what}: object"
+        );
+        assert_eq!(
+            graphs.probe.as_slice(),
+            eager.probe.as_slice(),
+            "{what}: probe"
+        );
+        assert_eq!(
+            graphs.features.position, eager.features.position,
+            "{what}: offsets"
+        );
+    }
+}
+
 /// The sampling is the CPU's [`Sampling::auto`] at build: `FullObject` of a near-field scan
 /// whose object is under 5/4 of the frame, `Patch` of the same scan in the far field and of
 /// a case's wider scan; `set_sampling` overrides it either way and back.
@@ -650,10 +699,7 @@ fn full_object_position_fails_every_pass_until_patch() {
         seed: 7,
     };
     type Call<'a> = &'a dyn Fn(&mut GpuPtycho) -> Result<Vec<f64>, EngineError>;
-    let calls: &[(&str, Call)] = &[
-        ("rPIE", &|g| g.rpie(&RPIE, 1).map(|()| Vec::new())),
-        ("BH", &|g| g.bh(&bh, 1, 1).map(|()| Vec::new())),
-    ];
+    let calls: &[(&str, Call)] = &[("BH", &|g| g.bh(&bh, 1, 1).map(|()| Vec::new()))];
     let run = |full_object_first: bool, switched: bool| {
         let mut gpu = c.gpu(true);
         let sampling = match switched {

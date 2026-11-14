@@ -1816,7 +1816,6 @@ pub(super) struct RpieBufs<'a> {
     pub pmax: &'a mut DeviceBuffer<f32>,
     /// A probe of ones, so `obj_probe_to_psi` yields the object windows.
     pub ones: &'a DeviceBuffer<C32>,
-    pub moved: Option<&'a mut RpieMoved>,
 }
 
 impl RpieScratch {
@@ -1834,6 +1833,7 @@ impl RpieScratch {
         let (cut, _) = batch_stacks(stream, dims, batch, batch)?;
         let len = cut.wave_len(dims);
         let plans = cut.plans(stream, dims)?;
+        let moved = (moved.map(|s| RpieMoved::new(stream, kernels, views, &cut, s))).transpose()?;
         let Cut {
             frames: batches,
             table,
@@ -1857,14 +1857,14 @@ impl RpieScratch {
             ptilde: DeviceBuffer::zeroed(stream, nprobe_values)?,
             pmax: DeviceBuffer::zeroed(stream, 1)?,
             ones: DeviceBuffer::from_host(stream, &vec![C32 { re: 1.0, im: 0.0 }; nprobe_values])?,
-            moved: (moved.map(|s| RpieMoved::new(stream, kernels, views, table.nf_max(), s)))
-                .transpose()?,
+            moved,
             table,
         })
     }
 
-    fn lend(&mut self) -> RpieBufs<'_> {
-        RpieBufs {
+    /// Its buffers, and apart the position model's state.
+    fn lend(&mut self) -> (RpieBufs<'_>, Option<&mut RpieMoved>) {
+        let bufs = RpieBufs {
             batches: &self.batches,
             n: self.n,
             table: &self.table,
@@ -1876,8 +1876,8 @@ impl RpieScratch {
             ptilde: &mut self.ptilde,
             pmax: &mut self.pmax,
             ones: &self.ones,
-            moved: self.moved.as_mut(),
-        }
+        };
+        (bufs, self.moved.as_mut())
     }
 }
 
@@ -2266,8 +2266,10 @@ impl Device {
     /// position as it is sampled, whether its run is built or reused.
     fn cycle_runs(&self, algorithm: Algorithm) -> Result<(), EngineError> {
         match algorithm {
-            Algorithm::Ap | Algorithm::Dm | Algorithm::Raar | Algorithm::Ml => Ok(()),
-            Algorithm::Rpie | Algorithm::Bh => self.patch_only(&format!("{algorithm:?}")),
+            Algorithm::Ap | Algorithm::Dm | Algorithm::Raar | Algorithm::Ml | Algorithm::Rpie => {
+                Ok(())
+            }
+            Algorithm::Bh => self.patch_only("Bh"),
             Algorithm::Lsqml => self.llk_runs(),
         }
     }
@@ -2835,7 +2837,10 @@ impl<'a> Bufs<'a> {
             Cycle::Raar { params, first } => self
                 .with_carried(|b, c| b.raar_cycle(ctx, passes, c, params, *first))
                 .map(|()| None),
-            Cycle::Rpie(p, scratch) => self.rpie_epoch(ctx, p, &mut scratch.lend()).map(|()| None),
+            Cycle::Rpie(p, scratch) => {
+                let (mut rb, moved) = scratch.lend();
+                self.rpie_epoch(ctx, p, &mut rb, moved).map(|()| None)
+            }
             Cycle::Ml { params, first, llk } => self.with_ml(|b, ml| {
                 b.ml_epoch(ctx, passes, ml, params, *first, llk.then(|| ring.record()))
             }),
