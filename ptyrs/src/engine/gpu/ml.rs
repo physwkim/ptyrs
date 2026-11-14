@@ -60,6 +60,13 @@ impl GpuPtycho {
         };
         Ok([widen(obj, self.obj_dims)?, widen(probe, self.probe_dims)?])
     }
+
+    /// [`Self::ml_grads`]' object gradient alone, into `dst`, a buffer of the object's length in
+    /// this reconstruction's context; waited for, so another stream may read `dst` on return.
+    pub fn ml_obj_grad_into(&mut self, dst: &mut DeviceBuffer<C32>) -> Result<(), EngineError> {
+        self.object_fits(self.obj_dims, dst.len())?;
+        self.dev.ml_obj_grad_into(dst)
+    }
 }
 
 /// The line search's moved probes under the position model, per stack: `w[0]` the

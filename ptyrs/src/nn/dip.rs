@@ -8,18 +8,24 @@
 //! and the polar chain rule is autodiff's.
 
 use std::f64::consts::PI;
+use std::sync::Arc;
 
 use burn::nn::PaddingConfig2d;
 use burn::nn::conv::{Conv2d, Conv2dConfig};
 use burn::optim::{AdamConfig, GradientsParams, ModuleOptimizer};
 use burn::prelude::*;
+use burn::tensor::DType;
 use burn::tensor::activation::tanh;
 use burn::tensor::module::{interpolate, max_pool2d};
 use burn::tensor::ops::{InterpolateMode, InterpolateOptions, MaxPoolOptions};
+use cuda_core::{CudaContext, Stream};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 
+use crate::base::{C64, Object, Probe, Scan, Stack};
+use crate::engine::{EngineError, GpuOptions, GpuPtycho};
 use crate::nn::NnError;
+use crate::nn::interop::{lend_complex, lend_out_complex};
 use crate::nn::ptychonn::Block;
 
 /// Shape of a DIP network.
@@ -137,6 +143,49 @@ pub trait ObjectLoss {
     fn gradient(&mut self, object: &Tensor<3>) -> Result<(f64, Tensor<3>), LossError>;
 }
 
+/// The engine's normalised Poisson LLK by its GPU reconstruction, whose object gradient is
+/// [`GpuPtycho::ml_grads`]' over the observed pixel count. The object crosses to the engine and
+/// the gradient back through [`crate::nn::interop`], in f32 and without leaving the device.
+pub struct GpuLoss {
+    ptycho: GpuPtycho,
+    nb_obs: f64,
+    stream: Arc<Stream>,
+}
+
+impl GpuLoss {
+    /// The loss of `scan` with `probe` fixed, for `[ny, nx]` objects in `ctx`, the context of
+    /// burn's device, by a reconstruction of `options`.
+    pub fn new(
+        ctx: &Arc<CudaContext>,
+        scan: &Scan,
+        [ny, nx]: [usize; 2],
+        probe: Probe,
+        options: GpuOptions,
+    ) -> Result<Self, EngineError> {
+        let object = Object::new(Stack::filled([1, ny, nx], C64::new(0.0, 0.0)));
+        Ok(Self {
+            ptycho: GpuPtycho::new(ctx, scan, object, probe, options)?,
+            nb_obs: scan.counts.nb_obs() as f64,
+            stream: ctx.default_stream(),
+        })
+    }
+}
+
+impl ObjectLoss for GpuLoss {
+    fn gradient(&mut self, object: &Tensor<3>) -> Result<(f64, Tensor<3>), LossError> {
+        let [ny, nx, _] = object.dims();
+        let o = object.clone().cast(DType::F32);
+        self.ptycho
+            .set_object_device([1, ny, nx], &*lend_complex(&o, &self.stream)?)?;
+        let llk = self.ptycho.llk()?.poisson;
+        let (g, mut lent) = lend_out_complex([ny, nx], &object.device(), &self.stream)?;
+        self.ptycho.ml_obj_grad_into(&mut lent)?;
+        // Releases `g`'s memory to burn, which can then divide it in place.
+        drop(lent);
+        Ok((llk, g.cast(object.dtype()) / self.nb_obs))
+    }
+}
+
 /// A DIP network, its fixed input code and its Adam state.
 pub struct Dip<P: Prior = DipNet> {
     net: P,
@@ -187,9 +236,11 @@ impl<P: Prior> Dip<P> {
         })
     }
 
-    /// The network's current object, `[ny, nx, 2]` as [`ObjectLoss`] takes it.
+    /// The network's current object, `[ny, nx, 2]` as [`ObjectLoss`] takes it. Its forward is
+    /// untracked: a graph no backward consumes holds every activation until the next step's.
+    /// Batch norms still take the batch statistics, as in [`step`](Self::step).
     pub fn object(&self) -> Tensor<3> {
-        self.forward().inner()
+        self.net.clone().no_grad().object(self.code.clone()).inner()
     }
 
     /// One Adam step of size `lr` down `loss`, which is returned at the object before the step.
@@ -229,11 +280,9 @@ impl<P: Prior> Dip<P> {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use crate::base::{C64, Geometry, Object, Probe, Scan, Stack, required_obj_shape, sim};
-    use crate::engine::{GpuOptions, GpuPtycho, Ptycho};
+    use crate::base::{Geometry, required_obj_shape, sim};
+    use crate::engine::Ptycho;
     use burn::module::{ModuleMapper, ModuleVisitor, Param};
-    use burn::tensor::DType;
-    use cuda_core::CudaContext;
 
     use super::*;
 
@@ -378,18 +427,13 @@ pub(crate) mod tests {
 
         /// The same LLK by the engine's GPU reconstruction (M1's launches: the fused passes
         /// take no 8-pixel frames).
-        fn gpu(&self) -> Gpu {
+        fn gpu(&self) -> GpuLoss {
             let options = GpuOptions {
                 fused: false,
                 ..GpuOptions::default()
             };
             let ctx = CudaContext::new(0).unwrap();
-            let start = object(&vec![0.0; 2 * Self::SHAPE[0] * Self::SHAPE[1]], Self::SHAPE);
-            Gpu {
-                ptycho: GpuPtycho::new(&ctx, &self.scan, start, self.probe.clone(), options)
-                    .unwrap(),
-                nb_obs: self.scan.counts.nb_obs() as f64,
-            }
+            GpuLoss::new(&ctx, &self.scan, Self::SHAPE, self.probe.clone(), options).unwrap()
         }
     }
 
@@ -397,26 +441,6 @@ pub(crate) mod tests {
     fn object(o: &[f64], [ny, nx]: [usize; 2]) -> Object {
         let data = o.chunks(2).map(|z| C64::new(z[0], z[1])).collect();
         Object::new(Stack::from_vec([1, ny, nx], data).unwrap())
-    }
-
-    /// The engine's GPU reconstruction as the loss: its normalised Poisson LLK, and
-    /// [`GpuPtycho::ml_grads`]' object gradient of the LLK sum over the observed pixel count.
-    struct Gpu {
-        ptycho: GpuPtycho,
-        nb_obs: f64,
-    }
-
-    impl ObjectLoss for Gpu {
-        fn gradient(&mut self, o: &Tensor<3>) -> Result<(f64, Tensor<3>), LossError> {
-            let [ny, nx, _] = o.dims();
-            self.ptycho
-                .set_object(&object(&host64(o.clone()), [ny, nx]))?;
-            let llk = self.ptycho.llk()?.poisson;
-            let [g, _] = self.ptycho.ml_grads()?;
-            let n = self.nb_obs;
-            let g = g.as_slice().iter().flat_map(|c| [c.re / n, c.im / n]);
-            Ok((llk, like(o, g.collect())))
-        }
     }
 
     /// `values` as a tensor of `object`'s shape, device and dtype.
@@ -557,6 +581,26 @@ pub(crate) mod tests {
         assert!(start() == start(), "two networks of one config start apart");
     }
 
+    /// The bytes `device`'s pool holds in tensors once its queued work is done.
+    fn in_use(device: &Device) -> u64 {
+        device.sync().unwrap();
+        device.memory_pool_usage().unwrap().bytes_in_use
+    }
+
+    /// A graph left by a look at the object would hold every activation until the next step's
+    /// backward.
+    #[test]
+    fn the_object_holds_no_graph() {
+        let device = crate::nn::cuda(0);
+        let config = DipConfig::new([64, 64]).with_width(8).with_depth(2);
+        let dip = Dip::new(&config, &device).unwrap();
+        // The first forward compiles, autotunes and fills cubecl's caches.
+        drop(dip.object());
+        let before = in_use(&device);
+        drop(dip.object());
+        assert_eq!(in_use(&device), before);
+    }
+
     #[test]
     fn weight_gradients_match_finite_differences() {
         let device = crate::nn::cuda(0);
@@ -686,5 +730,36 @@ pub(crate) mod tests {
             check_weight_grads(&dip, &mut tiny.gpu(), |o| tiny.llk(o), 2e-5),
             42
         );
+    }
+
+    /// [`GpuLoss`] moves the object to the engine and the gradient back on the device without
+    /// changing either: its LLK and gradient are the host path's to the bit, the gradient divided
+    /// in the network's dtype.
+    #[test]
+    fn the_gpu_loss_is_the_host_path_to_the_bit() {
+        let device = crate::nn::cuda(0);
+        let tiny = Tiny::new();
+        let mut loss = tiny.gpu();
+        let o = crate::nn::data::random_object(Tiny::SHAPE, 3);
+        let o: Vec<f64> = o.as_slice().iter().flat_map(|c| [c.re, c.im]).collect();
+        let [ny, nx] = Tiny::SHAPE;
+        for dtype in [DType::F64, DType::F32] {
+            let t: Tensor<3> =
+                Tensor::from_data(TensorData::new(o.clone(), [ny, nx, 2]), (&device, dtype));
+            let (llk, g) = loss.gradient(&t).unwrap();
+            assert_eq!(g.dtype(), dtype);
+
+            let host = object(&host64(t), Tiny::SHAPE);
+            loss.ptycho.set_object(&host).unwrap();
+            assert_eq!(llk, loss.ptycho.llk().unwrap().poisson, "{dtype:?}");
+            let [want, _] = loss.ptycho.ml_grads().unwrap();
+            let n = loss.nb_obs;
+            let want = want.as_slice().iter().flat_map(|c| [c.re, c.im]);
+            let want: Vec<f64> = match dtype {
+                DType::F64 => want.map(|v| v / n).collect(),
+                _ => want.map(|v| f64::from(v as f32 / n as f32)).collect(),
+            };
+            assert_eq!(host64(g), want, "{dtype:?}");
+        }
     }
 }

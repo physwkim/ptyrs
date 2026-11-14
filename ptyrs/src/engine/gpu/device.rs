@@ -1655,6 +1655,13 @@ impl Device {
         Ok(self.obj.copy_from_host(&self.stream, obj)?)
     }
 
+    /// [`Self::write_object`] from a device buffer of the object's length in this context,
+    /// copied on the stream and waited for, so `src` may be released or rewritten on return.
+    pub fn copy_object(&mut self, src: &DeviceBuffer<C32>) -> Result<(), EngineError> {
+        self.obj.copy_from_device_async(src, &self.stream)?;
+        Ok(self.stream.synchronize()?)
+    }
+
     /// Overwrites the object and probe in place.
     pub fn write_arrays(&mut self, obj: &[C32], probe: &[C32]) -> Result<(), EngineError> {
         self.one_slice("the phase ramp's removal")?;
@@ -2020,22 +2027,51 @@ impl Device {
     /// The ML gradients of the current estimate, object then probe, as
     /// [`Bufs::ml_grad`] leaves them in the update sums; downloads them and zeroes the sums.
     pub fn ml_grads(&mut self) -> Result<[Vec<C32>; 2], EngineError> {
+        self.ml_grad_sums([true, true], |stream, [obj, probe]| {
+            Ok([obj.to_host_vec(stream)?, probe.to_host_vec(stream)?])
+        })
+    }
+
+    /// The object's ML gradient alone, copied into `dst`, a buffer of the object's length in
+    /// this context; the stream is waited for on every exit, so another stream may read `dst`
+    /// once this returns.
+    pub fn ml_obj_grad_into(&mut self, dst: &mut DeviceBuffer<C32>) -> Result<(), EngineError> {
+        let copied = self.ml_grad_sums([true, false], |stream, [obj, _]| {
+            Ok(dst.copy_from_device_async(obj, stream)?)
+        });
+        let waited = self.stream.synchronize();
+        copied?;
+        Ok(waited?)
+    }
+
+    /// [`Bufs::ml_grad`] for `update` (object, probe), then `read` on the stream and the update
+    /// sums' numerators it leaves, object then probe. The sums are zeroed after `read`, or after
+    /// a pass or `read` that failed, so none is left for the next pass to add to.
+    fn ml_grad_sums<R>(
+        &mut self,
+        update: [bool; 2],
+        read: impl FnOnce(&Arc<CudaStream>, [&DeviceBuffer<C32>; 2]) -> Result<R, EngineError>,
+    ) -> Result<R, EngineError> {
         self.one_slice("ML's gradient")?;
-        {
+        let ran = {
             let ctx = self.context();
             let (mut bufs, mut passes, _) = self.lend();
-            bufs.ml_grad(&ctx, &mut passes, [true, true], None)?;
-        }
-        let grads = [
-            self.obj_sums.num.to_host_vec(&self.stream)?,
-            self.probe_sums.num.to_host_vec(&self.stream)?,
-        ];
+            bufs.ml_grad(&ctx, &mut passes, update, None)
+        };
+        let read = match ran {
+            Ok(_) => read(&self.stream, [&self.obj_sums.num, &self.probe_sums.num]),
+            Err(e) => Err(e.into()),
+        };
         let ctx = self.context();
-        for sums in [&mut self.obj_sums, &mut self.probe_sums] {
-            crate::gpu::zero(&ctx, &mut sums.num)?;
-            crate::gpu::zero(&ctx, &mut sums.den)?;
-        }
-        Ok(grads)
+        let zeroed = [&mut self.obj_sums, &mut self.probe_sums]
+            .into_iter()
+            .try_for_each(|sums| {
+                crate::gpu::zero(&ctx, &mut sums.num)?;
+                crate::gpu::zero(&ctx, &mut sums.den)
+            });
+        let read = read?;
+        zeroed?;
+        Ok(read)
     }
 
     /// `f` on the lent buffers, captured on a side stream, so nothing runs; with the record
