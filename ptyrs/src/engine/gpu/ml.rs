@@ -1,6 +1,7 @@
 //! PyNX ML (Poisson conjugate gradient) on the GPU. The opening scale and the gradient pass
 //! run as AP's projection does ([`super::GpuOptions::fused`]); the line search always by
-//! M1's launches, under a position by the moved probes of [`Kernels::shifted_rows_fwd`].
+//! M1's launches through [`Propagate`], under a position by the moved probes of
+//! [`Kernels::shifted_rows_fwd`].
 
 use std::sync::Arc;
 
@@ -13,6 +14,7 @@ use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaStream, DeviceBuffer};
 
 use super::device::{M1Bufs, MlBufs, PassesMut};
+use super::propagate::Propagate;
 use super::{Bufs, Epoch, GpuPtycho, plane_len};
 use crate::engine::ptycho::llk_due;
 use crate::engine::{EngineError, MlParams};
@@ -175,6 +177,11 @@ impl Bufs<'_> {
                 ));
             }
         };
+        let prop = Propagate {
+            kernels: self.bh,
+            stage: self.exit.stage,
+            dims,
+        };
         for s in 0..ml.cut.len() {
             let (stack, frames) = (ml.cut.at(s), &ml.cut.frames[s]);
             let d = [&ml.d[0], &ml.d[1]];
@@ -215,7 +222,7 @@ impl Bufs<'_> {
             }
             let plan = ml.plans.get(frames.plan);
             for f in [&mut ml.fields.po, &mut ml.fields.a, &mut ml.fields.b] {
-                plan.forward_inplace(ctx, f)?;
+                prop.forward(ctx, plan, stack, f)?;
             }
             self.grad
                 .gamma_frames(ctx, &dims, stack, obs, ml.fields, ml.gamma_parts)?;
@@ -405,8 +412,9 @@ impl Bufs<'_> {
                 // The exit waves' photons alone: icalc_add scales them, and
                 // scale_obj_probe takes the background's off the total.
                 let model = Model {
-                    shift: m.model.shift,
-                    ..Model::default()
+                    scale: None,
+                    background: None,
+                    ..m.model
                 };
                 for s in 0..self.scratch.len() {
                     let stack = self.scratch.at(s);
