@@ -56,7 +56,8 @@ def test_bh_steps_match_cpu(scenario, batch, fused, moved, rho):
 
 
 def test_bh_position_rho_and_refusals(scenario):
-    """`position_rho` reaches the offsets' step, and Bh refuses offsets as Lsqml does."""
+    """`position_rho` reaches the offsets' step, and Bh refuses empty batches and offsets as Lsqml
+    does."""
     scan, obj, probe, npos = scenario
     state = ptyrs.Ptycho(scan, obj, probe)
     d0 = drawn_offsets(npos)
@@ -67,6 +68,8 @@ def test_bh_position_rho_and_refusals(scenario):
         moved.append(bh.position)
     assert (moved[0] == moved[1]).all() and not np.allclose(moved[0], moved[2])
     assert ptyrs.Bh(4, 0.01, 7).position is None
+    with pytest.raises(ValueError, match="BH batch_size must be >= 1"):
+        ptyrs.Bh(0, 0.01, 7)
     with pytest.raises(ValueError, match=r"\[nframe, 2\]"):
         ptyrs.Bh(4, 0.01, 7, position=np.zeros((npos, 3)))
     with pytest.raises(ValueError, match="finite"):

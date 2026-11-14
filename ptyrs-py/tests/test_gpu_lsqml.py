@@ -109,6 +109,8 @@ def test_lsqml_rejects(scenario):
         gpu.lsqml(1, 0, 8, "gauss", 7)
     assert gpu.cycle == 0 and len(gpu.history["cycle"]) == 0
     assert ptyrs.Lsqml(8, "poisson", 7).position is None
+    with pytest.raises(ValueError, match="LSQML batch_size must be >= 1"):
+        ptyrs.Lsqml(0, "poisson", 7)
     with pytest.raises(ValueError, match=r"\[nframe, 2\]"):
         ptyrs.Lsqml(8, "poisson", 7, position=np.zeros((npos, 3)))
     with pytest.raises(ValueError, match="finite"):
