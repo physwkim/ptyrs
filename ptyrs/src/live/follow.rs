@@ -49,6 +49,8 @@ use crate::live::recon::{ApConfig, LiveAp, ViewPlacement};
 use crate::live::ring::{Counts, DeviceStore, FrameBatch, Landing, STORE_LEAD, Tap, Whole};
 use crate::live::scan::{ScanBacker, ScanShape, one_object_mode};
 use crate::live::stats::{Histogram, wall_ns};
+#[cfg(feature = "nn")]
+use crate::nn::{NnError, live::LivePredictor, predictor::Predictor};
 
 /// The reconstruction run on the received frames: `pty-recv --recon ap`
 /// and its `--recon-*` flags, or a `[recon]` table with the same keys.
@@ -72,6 +74,10 @@ pub struct ReconCfg {
     pub settle_max: u64,
     /// Publish the live results as PVs; off when unset.
     pub pv: Option<PvCfg>,
+    /// Fill each batch's first object values from its counts; off when
+    /// unset.
+    #[cfg(feature = "nn")]
+    pub fill: Option<FillCfg>,
 }
 
 impl Default for ReconCfg {
@@ -86,6 +92,8 @@ impl Default for ReconCfg {
             snaps: 200,
             settle_max: 8192,
             pv: None,
+            #[cfg(feature = "nn")]
+            fill: None,
         }
     }
 }
@@ -94,9 +102,18 @@ impl ReconCfg {
     /// `--recon ALGO --recon-nf-max --recon-stacks --recon-inertia --recon-chunk-mib
     /// --recon-snap-every --recon-snaps --recon-settle-max`, and
     /// `--recon-pv PREFIX --recon-pv-bin --recon-pv-period-ms
-    /// --recon-pv-llk-period-ms`; `None` without `--recon`.
+    /// --recon-pv-llk-period-ms`, and with the `nn` feature `--recon-fill DIR
+    /// --recon-fill-norm --recon-fill-counts --recon-fill-fills`; `None`
+    /// without `--recon`.
     pub fn from_args(a: &Args) -> Option<Self> {
         let algo = a.opt("recon")?;
+        // Flags nothing reads pass unseen; a run without its fill would look
+        // like one with it.
+        #[cfg(not(feature = "nn"))]
+        assert!(
+            a.opt::<String>("recon-fill").is_none(),
+            "--recon-fill needs the nn feature"
+        );
         let d = Self::default();
         Some(Self {
             algo,
@@ -116,6 +133,83 @@ impl ReconCfg {
                     ..p
                 }
             }),
+            #[cfg(feature = "nn")]
+            fill: a.opt("recon-fill").map(|predictor| {
+                let norm = a
+                    .opt("recon-fill-norm")
+                    .unwrap_or_else(|| panic!("--recon-fill needs --recon-fill-norm"));
+                let f = FillCfg::new(predictor, norm);
+                FillCfg {
+                    counts: a.get("recon-fill-counts", f.counts),
+                    fills: a.get("recon-fill-fills", f.fills),
+                    ..f
+                }
+            }),
+        })
+    }
+}
+
+/// The trained predictor of a filling run ([`FillHook`]): `--recon-fill DIR`
+/// and its `--recon-fill-*` flags, or a `[recon.fill]` table with the
+/// directory as `predictor` and the same keys.
+#[cfg(feature = "nn")]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct FillCfg {
+    /// What [`Predictor::save`] wrote.
+    pub predictor: std::path::PathBuf,
+    /// The mean frame total of a scan with this beam and exposure
+    /// ([`LivePredictor`]).
+    pub norm: f64,
+    /// [`FillHook::counts`].
+    #[serde(default = "FillCfg::counts")]
+    pub counts: usize,
+    /// [`FillHook::fills`].
+    #[serde(default = "FillCfg::fills")]
+    pub fills: usize,
+}
+
+#[cfg(feature = "nn")]
+impl FillCfg {
+    pub fn new(predictor: std::path::PathBuf, norm: f64) -> Self {
+        Self {
+            predictor,
+            norm,
+            counts: Self::counts(),
+            fills: Self::fills(),
+        }
+    }
+
+    fn counts() -> usize {
+        8
+    }
+
+    fn fills() -> usize {
+        128
+    }
+
+    /// Loads the predictor of `frame`s onto CUDA device `ordinal` and warms
+    /// it on `batch` frames, the uploader's batch, which takes seconds. Its
+    /// input threads take the calling thread's CPUs.
+    pub fn hook(
+        &self,
+        ordinal: usize,
+        frame: [usize; 2],
+        batch: usize,
+    ) -> Result<FillHook, NnError> {
+        let p = Predictor::load(&self.predictor, &burn::prelude::Device::cuda(ordinal))?;
+        // Otherwise every batch fails, and the run goes on unfilled.
+        if p.config().frame != frame {
+            return Err(NnError::Invalid(format!(
+                "a predictor of {:?} frames for {frame:?} frames",
+                p.config().frame
+            )));
+        }
+        Ok(FillHook {
+            predictor: Box::new(LivePredictor::new(p, self.norm, batch)?),
+            batch,
+            counts: self.counts,
+            fills: self.fills,
         })
     }
 }

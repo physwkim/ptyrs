@@ -33,7 +33,7 @@ use crate::live::consumer::{ConsumerReport, checksum, run_checksum_consumer};
 use crate::live::eiger::{EigerFrames, Progress, PullReport, connect_pull, run_pull};
 use crate::live::farfield::ScanPath;
 use crate::live::follow::{
-    FollowCfg, FollowReport, Preview, ReconCfg, first_converged, offline_dist, plane,
+    FillHook, FollowCfg, FollowReport, Preview, ReconCfg, first_converged, offline_dist, plane,
     run_dist_consumer,
 };
 use crate::live::graph::WarmUp;
@@ -301,6 +301,29 @@ impl fmt::Display for RecvError {
 }
 
 impl std::error::Error for RecvError {}
+
+/// The fill of a `--recon-fill` run: its predictor on `gpu`, the first
+/// region's, warmed on the uploader's batch.
+#[cfg(feature = "nn")]
+fn fill_hook(cfg: &RecvCfg, gpu: usize) -> Result<Option<FillHook>, RecvError> {
+    let Some(fc) = cfg.recon.as_ref().and_then(|rc| rc.fill.as_ref()) else {
+        return Ok(None);
+    };
+    let t = std::time::Instant::now();
+    let hook = fc
+        .hook(gpu, [cfg.crop; 2], cfg.batch.get())
+        .map_err(fail("fill predictor"))?;
+    eprintln!(
+        "recv fill predictor={} norm={} counts={} fills={} batch={} gpu={gpu} load_ms={:.0}",
+        fc.predictor.display(),
+        fc.norm,
+        fc.counts,
+        fc.fills,
+        hook.batch,
+        t.elapsed().as_secs_f64() * 1e3
+    );
+    Ok(Some(hook))
+}
 
 fn fail<E: fmt::Display>(what: &'static str) -> impl FnOnce(E) -> RecvError {
     move |e| RecvError {
@@ -664,6 +687,13 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
         },
         cfg.h2d_rtprio,
     ));
+    // Its input threads take this thread's CPUs: the whole list, not the
+    // runtime's.
+    place.enter(place.all.as_deref());
+    #[cfg(feature = "nn")]
+    let fill = fill_hook(cfg, ordinals[0])?;
+    #[cfg(not(feature = "nn"))]
+    let fill: Option<FillHook> = None;
     // The calling thread only polls for completion; it shares the runtime CPUs.
     place.enter(place.rt.as_deref());
     // Before the GPU setup, which takes seconds, so that a bad source stops
@@ -770,7 +800,7 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
                         .map_err(|e| e.to_string()),
                     Job::Recon(follow, settle_max) => {
                         let f = follow.clone();
-                        run_dist_consumer(&ordinals, scheme, f, brx, ready_tx, preview, None)
+                        run_dist_consumer(&ordinals, scheme, f, brx, ready_tx, preview, fill)
                             .map(|rep| {
                                 Consumed::Recon(Box::new(Recon {
                                     rep,
@@ -1188,6 +1218,11 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
         ),
     ));
     line(format_args!("recv rx_to_gpu {}", up.rx_to_gpu.summary()));
+    line(format_args!(
+        "recv counts_copy counts_dry={} {}",
+        up.counts_dry,
+        up.counts_copy.summary()
+    ));
     for (r, (reg, gpu)) in up.regions.iter().zip(&ordinals).enumerate() {
         line(format_args!(
             "recv region{r}_rx_to_gpu gpu={gpu} frames={} MiB={} {}",
@@ -1241,6 +1276,15 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
             line(format_args!(
                 "recv recon_store frames_bad={sum_bad} recaptures={recaptures}"
             ));
+            if let Some(f) = &r.rep.fill {
+                line(format_args!(
+                    "recv fill written={} no_counts={} failed={} error={:?} no_buffer={} \
+                     dropped={} not_ready={}",
+                    f.written, f.no_counts, f.failed, f.error, f.no_buffer, f.dropped, f.not_ready
+                ));
+                line(format_args!("recv fill_predict {}", f.predict.summary()));
+                line(format_args!("recv fill_stitch {}", f.stitch.summary()));
+            }
             let (to_epoch, epoch) = epoch_latency(&r.rep, &up.t_rx);
             line(format_args!("recv frame_to_epoch {}", to_epoch.summary()));
             line(format_args!(
@@ -1287,6 +1331,8 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
 mod tests {
     use super::*;
     use crate::live::follow::Algo;
+    #[cfg(feature = "nn")]
+    use crate::live::follow::FillCfg;
     use crate::live::model::{PathKind, PtychoCfg};
     use crate::live::pv_out::PvCfg;
     use crate::live::synth::Synth;
@@ -1319,6 +1365,33 @@ mod tests {
         };
         assert_eq!(flags(&["--recon", "ap", "--recon-pv", "X:"]), pv);
         assert_eq!(toml("[recon.pv]\nprefix = \"X:\""), pv);
+        #[cfg(feature = "nn")]
+        {
+            let fill = RecvCfg {
+                recon: Some(ReconCfg {
+                    fill: Some(FillCfg::new("/p".into(), 2.0)),
+                    ..ReconCfg::default()
+                }),
+                ..RecvCfg::default()
+            };
+            let f = [
+                "--recon",
+                "ap",
+                "--recon-fill",
+                "/p",
+                "--recon-fill-norm",
+                "2",
+            ];
+            assert_eq!(flags(&f), fill);
+            assert_eq!(toml("[recon.fill]\npredictor = \"/p\"\nnorm = 2.0"), fill);
+        }
+    }
+
+    #[cfg(not(feature = "nn"))]
+    #[test]
+    #[should_panic(expected = "--recon-fill needs the nn feature")]
+    fn a_fill_flag_without_the_nn_feature_is_refused() {
+        flags(&["--recon", "ap", "--recon-fill", "/p"]);
     }
 
     #[test]
@@ -1386,9 +1459,16 @@ mod tests {
                     period_ms: 100,
                     llk_period_ms: 700,
                 }),
+                #[cfg(feature = "nn")]
+                fill: Some(FillCfg {
+                    predictor: "/x/pred".into(),
+                    norm: 1234.5,
+                    counts: 4,
+                    fills: 64,
+                }),
             }),
         };
-        let f = flags(&[
+        let f = [
             "--frames",
             "1234",
             "--gpu",
@@ -1501,8 +1581,24 @@ mod tests {
             "100",
             "--recon-pv-llk-period-ms",
             "700",
-        ]);
-        let t = toml(
+        ];
+        let fill_flags = [
+            "--recon-fill",
+            "/x/pred",
+            "--recon-fill-norm",
+            "1234.5",
+            "--recon-fill-counts",
+            "4",
+            "--recon-fill-fills",
+            "64",
+        ];
+        let fill_flags: &[&str] = if cfg!(feature = "nn") {
+            &fill_flags
+        } else {
+            &[]
+        };
+        let f = flags(&[&f[..], fill_flags].concat());
+        let t = String::from(
             r#"
             frames = 1234
             gpu = 1
@@ -1568,6 +1664,15 @@ mod tests {
             llk-period-ms = 700
             "#,
         );
+        let fill_toml = r#"
+            [recon.fill]
+            predictor = "/x/pred"
+            norm = 1234.5
+            counts = 4
+            fills = 64
+            "#;
+        let fill_toml = if cfg!(feature = "nn") { fill_toml } else { "" };
+        let t = toml(&(t + fill_toml));
         assert_eq!(f, want);
         assert_eq!(t, want);
     }
