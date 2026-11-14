@@ -488,10 +488,7 @@ impl ShiftedProbeSums {
 #[derive(Default)]
 pub struct ShiftSums<'a> {
     /// The probe sums, in place of [`FusedSums::probe`].
-    pub probe: Option<&'a mut ShiftedProbeSums>,
-    /// With `probe`, its sums are of the correction `c` of `position` in place of `x`, for
-    /// [`Kernels::probe_step`]; nothing under [`Exit::Grad`].
-    pub step: bool,
+    pub probe: Option<ShiftProbe<'a>>,
     /// The position sums of the exit-wave correction `c`: `position[f0 + fl] = Re sum
     /// conj(c) O dW / d(dy, dx)` over the frame's views and pixels, for `fl < nf`;
     /// `[nframe]`, no other entry written. `c = x - O W`, the step from the waves the pass
@@ -501,6 +498,27 @@ pub struct ShiftSums<'a> {
     /// `position_den[f0 + fl] = sum |O|^2 |dW / d(dy, dx)|^2` over the frame's views and
     /// pixels, as `position`.
     pub position_den: Option<&'a mut DeviceBuffer<PositionPartial>>,
+}
+
+/// The shifted probe's sums a pass writes, and the waves they are of: `x` the new exit
+/// waves of [`Kernels::fused_project`] or the `psi` of [`Kernels::shifted_psi_sums`].
+pub enum ShiftProbe<'a> {
+    /// Of `x`.
+    Sums(&'a mut ShiftedProbeSums),
+    /// Of the correction `c = x - O W` in place of `x`, the step from the waves of the
+    /// arrays read, for [`Kernels::probe_step`]; under [`Exit::Grad`] `c = x`.
+    Step(&'a mut ShiftedProbeSums),
+}
+
+impl<'a> ShiftProbe<'a> {
+    /// The sums of `probe`, if any, and the shift flags that write them.
+    fn split(probe: Option<Self>) -> (Option<&'a mut ShiftedProbeSums>, u32) {
+        match probe {
+            None => (None, 0),
+            Some(Self::Sums(sums)) => (Some(sums), FUSED_SHIFT_PROBE),
+            Some(Self::Step(sums)) => (Some(sums), FUSED_SHIFT_PROBE | FUSED_SHIFT_STEP),
+        }
+    }
 }
 
 /// Sums of the forward far field's `calc` against the counts that
@@ -573,7 +591,7 @@ pub struct PsiSums<'a> {
     /// conj(W_p) x` and `den += sum_p |W_p|^2`, spread to the object.
     pub obj: Option<&'a mut UpdateSums>,
     /// As [`ShiftSums::probe`], against [`FusedInputs::obj`].
-    pub probe: Option<&'a mut ShiftedProbeSums>,
+    pub probe: Option<ShiftProbe<'a>>,
 }
 
 /// Which iteration [`Kernels::fused_project`] runs and where its new exit waves go. `psi`
@@ -764,11 +782,11 @@ impl Kernels {
             shift:
                 ShiftSums {
                     probe: shift_probe,
-                    step,
                     position,
                     position_den,
                 },
         } = sums;
+        let (shift_probe, probe_flags) = ShiftProbe::split(shift_probe);
         if let Some(sums) = &obj_sums {
             sums.check(d.obj_len())?;
         }
@@ -807,8 +825,7 @@ impl Kernels {
         let shift_flags = match shift {
             Some(_) => {
                 flag(obj_sums.is_some(), FUSED_SHIFT_OBJ)
-                    | flag(shift_probe.is_some(), FUSED_SHIFT_PROBE)
-                    | flag(step, FUSED_SHIFT_STEP)
+                    | probe_flags
                     | flag(position.is_some(), FUSED_SHIFT_POSITION)
                     | flag(position_den.is_some(), FUSED_SHIFT_DEN)
                     | (pass & FUSED_GRAD)
@@ -895,39 +912,6 @@ impl Kernels {
         bufs: &mut FusedBufs,
         sums: PsiSums<'_>,
     ) -> Result<(), Error> {
-        self.psi_sums(ctx, inputs, stack, psi, bufs, sums, false)
-    }
-
-    /// [`Self::shifted_psi_sums`] of the probe alone, of the step `psi - O W` from the waves
-    /// of the arrays of `inputs` in place of `psi`, as [`ShiftSums::step`]: the sums of
-    /// [`Self::probe_step`].
-    pub fn shifted_step_sums(
-        &self,
-        ctx: &ExecutionContext,
-        inputs: &FusedInputs<'_>,
-        stack: StackRef<'_>,
-        psi: &dyn Waves,
-        bufs: &mut FusedBufs,
-        probe: &mut ShiftedProbeSums,
-    ) -> Result<(), Error> {
-        let sums = PsiSums {
-            obj: None,
-            probe: Some(probe),
-        };
-        self.psi_sums(ctx, inputs, stack, psi, bufs, sums, true)
-    }
-
-    #[expect(clippy::too_many_arguments)]
-    fn psi_sums(
-        &self,
-        ctx: &ExecutionContext,
-        inputs: &FusedInputs<'_>,
-        stack: StackRef<'_>,
-        psi: &dyn Waves,
-        bufs: &mut FusedBufs,
-        sums: PsiSums<'_>,
-        step: bool,
-    ) -> Result<(), Error> {
         let bufs = &*bufs;
         let (run, shift) = Run::new(self, ctx, *inputs, stack, bufs)?;
         let Some(sh) = &shift else {
@@ -936,6 +920,7 @@ impl Kernels {
         let d = inputs.views.dims();
         check_waves("psi", psi, run.g.nf_max as usize * d.nmode as usize * d.n())?;
         let PsiSums { obj, probe } = sums;
+        let (probe, probe_flags) = ShiftProbe::split(probe);
         if let Some(sums) = &obj {
             sums.check(d.obj_len())?;
         }
@@ -948,9 +933,7 @@ impl Kernels {
         };
         let flag = |on: bool, flag: u32| if on { flag } else { 0 };
         let cfg = FusedCfg {
-            flags: flag(obj.is_some(), FUSED_SHIFT_OBJ)
-                | flag(probe.is_some(), FUSED_SHIFT_PROBE)
-                | flag(step, FUSED_SHIFT_STEP),
+            flags: flag(obj.is_some(), FUSED_SHIFT_OBJ) | probe_flags,
             alpha: 0.0,
             beta: 0.0,
         };
@@ -1238,8 +1221,8 @@ impl Kernels {
     }
 
     /// The probe step under a [`Model::shift`], PyNX's `ProbeNorm` where `A^H A` is not the
-    /// diagonal `sum |O|^2`: with `sums` the probe sums of the correction ([`ShiftSums::step`],
-    /// [`Self::shifted_step_sums`]) after [`Self::shifted_probe_sums`], `g = num` and `D =
+    /// diagonal `sum |O|^2`: with `sums` the probe sums of the correction ([`ShiftProbe::Step`])
+    /// after [`Self::shifted_probe_sums`], `g = num` and `D =
     /// max(den + reg, 1e-12)`, `reg = inertia * max(den)`, each probe mode's `sums.num`
     /// becomes `alpha s`, `s = g / D` and `alpha = sum |g|^2 / D / (sum |O W_s|^2 + reg sum
     /// |s|^2)`, `W_s` the mode's `s` moved to each frame of `stacks`, which must be every

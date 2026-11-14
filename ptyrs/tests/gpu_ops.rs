@@ -14,8 +14,9 @@ use ptyrs::gpu::{
     BackgroundSums, C32, Error, Exit, ExitPass, ExitStage, FUSED_SIDES, FarSums, FusedBufs,
     FusedInputs, FusedSums, HalfWaves, Kernels, Lines, LlkPartial, LlkScratch, LlkSums, MASKED,
     Model, OBJ_TILE, OpticsKernels, Permutation, PositionPartial, ProbeSpectrum, PsiSums,
-    ScalePartial, Shift, ShiftSums, ShiftedProbeSums, SpectrumBuf, StackCtl, StackRef, StackTable,
-    UpdateSums, ViewAddr, ViewDims, Views, Waves, half_scale, lease, record, view_tiles,
+    ScalePartial, Shift, ShiftProbe, ShiftSums, ShiftedProbeSums, SpectrumBuf, StackCtl, StackRef,
+    StackTable, UpdateSums, ViewAddr, ViewDims, Views, Waves, half_scale, lease, record,
+    view_tiles,
 };
 
 #[path = "common/worst.rs"]
@@ -834,8 +835,7 @@ fn owned_views_update_only_the_owned_tiles() {
                 obj: Some(&mut *shift),
                 probe: None,
                 shift: ShiftSums {
-                    probe: Some(&mut sh.probe),
-                    step: false,
+                    probe: Some(ShiftProbe::Sums(&mut sh.probe)),
                     position: Some(&mut sh.pos),
                     position_den: Some(&mut sh.den),
                 },
@@ -4269,8 +4269,7 @@ impl ShiftOut {
             obj: Some(&mut self.obj),
             probe: None,
             shift: ShiftSums {
-                probe: Some(&mut self.probe),
-                step: false,
+                probe: Some(ShiftProbe::Sums(&mut self.probe)),
                 position: Some(&mut self.pos),
                 position_den: den.then_some(&mut self.den),
             },
@@ -4678,7 +4677,7 @@ fn shifted_psi_sums_match_fused_project() {
                 ] {
                     let sums = PsiSums {
                         obj: o.then_some(&mut out.obj),
-                        probe: p.then_some(&mut out.probe),
+                        probe: p.then_some(ShiftProbe::Sums(&mut out.probe)),
                     };
                     k.shifted_psi_sums(&ex, &inputs, stack, &psi, &mut bufs, sums)
                         .unwrap();
@@ -4983,7 +4982,7 @@ fn fused_f16_waves_round_the_f32_ones() {
         for (out, waves) in [(&mut ho, &h as &dyn Waves), (&mut fo, &same)] {
             let sums = PsiSums {
                 obj: Some(&mut out.obj),
-                probe: Some(&mut out.probe),
+                probe: Some(ShiftProbe::Sums(&mut out.probe)),
             };
             k.shifted_psi_sums(&ex, &inputs, stack, waves, &mut bufs, sums)
                 .unwrap();
@@ -5462,7 +5461,7 @@ fn fused_shift_combinations_are_checked() {
         (
             "shifted probe sums",
             ShiftSums {
-                probe: Some(&mut *sp),
+                probe: Some(ShiftProbe::Sums(&mut *sp)),
                 ..ShiftSums::default()
             },
         ),
@@ -5510,7 +5509,7 @@ fn fused_shift_combinations_are_checked() {
     let mut short_sums = ShiftedProbeSums::zeroed(&stream, &one_probe).unwrap();
     let sums = FusedSums {
         shift: ShiftSums {
-            probe: Some(&mut short_sums),
+            probe: Some(ShiftProbe::Sums(&mut short_sums)),
             ..ShiftSums::default()
         },
         ..Default::default()
@@ -5543,7 +5542,7 @@ fn fused_shift_combinations_are_checked() {
         };
         let sums = PsiSums {
             obj: Some(&mut out.obj),
-            probe: Some(&mut out.probe),
+            probe: Some(ShiftProbe::Sums(&mut out.probe)),
         };
         let r = k.shifted_psi_sums(&ex, inputs, stack, psi, bufs, sums);
         refused(&format!("shifted_psi_sums, {what}"), r);
@@ -5560,7 +5559,7 @@ fn fused_shift_combinations_are_checked() {
             "probe sums of one probe",
             PsiSums {
                 obj: None,
-                probe: Some(&mut short_sums),
+                probe: Some(ShiftProbe::Sums(&mut short_sums)),
             },
         ),
     ] {
