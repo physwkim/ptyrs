@@ -25,7 +25,7 @@ use rand::SeedableRng;
 use rand::seq::SliceRandom;
 use rand_chacha::ChaCha8Rng;
 
-use crate::nn::ptychonn::PtychoNN;
+use crate::nn::ptychonn::{Folded, PtychoNN};
 use crate::nn::{NnError, burn_err};
 
 /// Shape of a predictor: the detector frame it reads, the binning, and the network size.
@@ -532,8 +532,8 @@ fn input_stats(samples: &Samples) -> Result<(Vec<f32>, Vec<f32>), NnError> {
     ))
 }
 
-fn l1(model: &Model, x: Tensor<4>, amp: Tensor<4>, phase: Tensor<4>) -> Tensor<1> {
-    let (a, p) = model.forward(x);
+/// The training loss of output `a`, `p` against targets `amp`, `phase`.
+fn l1(a: Tensor<4>, p: Tensor<4>, amp: Tensor<4>, phase: Tensor<4>) -> Tensor<1> {
     (a - amp).abs().mean() + (p - phase).abs().mean()
 }
 
@@ -584,9 +584,10 @@ pub fn train(
         for batch in order.chunks(options.batch) {
             let idx =
                 Tensor::<1, Int>::from_data(TensorData::new(batch.to_vec(), [batch.len()]), &ad);
+            let (a, p) = model.forward(x.clone().select(0, idx.clone()));
             let loss = l1(
-                &model,
-                x.clone().select(0, idx.clone()),
+                a,
+                p,
                 amp.clone().select(0, idx.clone()),
                 phase.clone().select(0, idx),
             );
@@ -597,13 +598,7 @@ pub fn train(
         let train_loss =
             f64::from(sum.try_into_scalar::<f32>().map_err(burn_err)?) / dims[0] as f64;
         let valid_loss = valid
-            .map(|v| {
-                Predictor {
-                    config: config.clone(),
-                    model: model.valid(),
-                }
-                .loss(v)
-            })
+            .map(|v| Predictor::new(config.clone(), model.valid()).loss(v))
             .transpose()?;
         if let Some(dir) = &options.checkpoint {
             checkpoint.epochs = epoch + 1;
@@ -615,29 +610,40 @@ pub fn train(
             valid: valid_loss,
         });
     }
-    Ok(Predictor {
-        config: config.clone(),
-        model: model.valid(),
-    })
+    Ok(Predictor::new(config.clone(), model.valid()))
 }
 
 /// Frames in, object patches out.
 #[derive(Debug)]
 pub struct Predictor {
     config: PredictorConfig,
+    /// What [`save`](Self::save) writes.
     model: Model,
+    /// What predicts: `model`'s network folded.
+    net: Folded,
 }
 
 /// Frames per network call.
 const CHUNK: usize = 512;
 
 impl Predictor {
+    fn new(config: PredictorConfig, model: Model) -> Self {
+        let net = model.net.fold();
+        Self { config, model, net }
+    }
+
     pub fn config(&self) -> &PredictorConfig {
         &self.config
     }
 
     fn device(&self) -> Device {
         self.model.devices()[0].clone()
+    }
+
+    /// The model's output for raw input `x`.
+    fn forward(&self, x: Tensor<4>) -> (Tensor<4>, Tensor<4>) {
+        self.net
+            .forward((x - self.model.mean.val()) * self.model.inv_spread.val())
     }
 
     /// Patches `[nframe, py, px]` for detector-order `frames` of a scan whose
@@ -668,9 +674,7 @@ impl Predictor {
         let mut out = Patches::empty(patch);
         for chunk in input.chunks(CHUNK * CHANNELS * plane) {
             let n = chunk.len() / (CHANNELS * plane);
-            let (a, p) =
-                self.model
-                    .forward(tensor(chunk, CHANNELS, [n, patch[0], patch[1]], &device));
+            let (a, p) = self.forward(tensor(chunk, CHANNELS, [n, patch[0], patch[1]], &device));
             out.append(Patches {
                 dims: [n, patch[0], patch[1]],
                 amp: host(a)?,
@@ -700,14 +704,15 @@ impl Predictor {
             let m = CHUNK.min(n - start);
             let r = start * plane..(start + m) * plane;
             let dims = [m, py, px];
+            let (a, p) = self.forward(tensor(
+                &samples.input[CHANNELS * r.start..CHANNELS * r.end],
+                CHANNELS,
+                dims,
+                &device,
+            ));
             let loss = l1(
-                &self.model,
-                tensor(
-                    &samples.input[CHANNELS * r.start..CHANNELS * r.end],
-                    CHANNELS,
-                    dims,
-                    &device,
-                ),
+                a,
+                p,
                 tensor(&samples.target.amp[r.clone()], 1, dims, &device),
                 tensor(&samples.target.phase[r], 1, dims, &device),
             );
@@ -739,7 +744,7 @@ impl Predictor {
         )?
         .try_load_file(dir.join("predictor.bpk"))
         .map_err(burn_err)?;
-        Ok(Self { config, model })
+        Ok(Self::new(config, model))
     }
 }
 
