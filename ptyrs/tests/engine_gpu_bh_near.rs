@@ -44,7 +44,7 @@ struct Case {
 
 /// Detector-plane exit waves of every view.
 fn propagated(addr: &AddrTable, optics: &Optics, object: &Object, probe: &Probe) -> Vec<C64> {
-    let mut psi = SliceWaves::new(optics, addr.views(), slice::from_ref(object), probe)
+    let mut psi = SliceWaves::new(optics, addr.views(), slice::from_ref(object), probe, None)
         .psi()
         .to_vec();
     optics.exit().forward(&mut psi);
