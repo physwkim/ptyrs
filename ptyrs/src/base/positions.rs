@@ -16,14 +16,19 @@ impl Positions {
                 x.len()
             )));
         }
-        if y.iter().chain(&x).any(|v| !v.is_finite() || v.abs() > 1e10) {
-            // PyNX treats |pos| > 1e10 as a direct-beam frame; the oracle does not model those.
+        if !y.iter().chain(&x).all(|&v| Self::valid(v)) {
             return Err(CoreError::Invalid(
                 "positions must be finite with |pos| <= 1e10 (direct-beam frames unsupported)"
                     .into(),
             ));
         }
         Ok(Self { y, x })
+    }
+
+    /// Whether `v`, metres, is a coordinate a scan position may have: finite, `|v| <= 1e10`.
+    /// PyNX treats `|pos| > 1e10` as a direct-beam frame; the oracle does not model those.
+    pub fn valid(v: f64) -> bool {
+        v.is_finite() && v.abs() <= 1e10
     }
 
     pub fn len(&self) -> usize {
