@@ -34,7 +34,6 @@ use super::{
     to_c32, to_u32, wave_bytes,
 };
 use crate::engine::features::{POSITION_LIMIT, POSITION_STEP};
-use crate::engine::ptycho::Algorithm;
 use crate::engine::{
     ApParams, BhParams, BhStep, DmParams, EngineError, Features, LsqmlParams, LsqmlStep, MlParams,
     PlaneStage, RaarParams, RpieParams,
@@ -1753,26 +1752,8 @@ impl Device {
         Ok(self.ring.flush(&self.context())?)
     }
 
-    /// Fails under a propagator with a plane stage for the passes that run none: the LLK
-    /// pass, LSQML's, BH's, rPIE's and ML's do, AP's, DM's and RAAR's at fixed positions
-    /// only, and every other is enqueued behind this.
-    fn stageless(&self, algorithm: Algorithm) -> Result<(), EngineError> {
-        let moved = self.features.position.is_some();
-        match (&self.exit, algorithm) {
-            (ExitStage::None, _)
-            | (_, Algorithm::Lsqml | Algorithm::Bh | Algorithm::Rpie | Algorithm::Ml) => Ok(()),
-            (_, Algorithm::Ap | Algorithm::Dm | Algorithm::Raar) if !moved => Ok(()),
-            _ => Err(EngineError::Invalid(format!(
-                "{algorithm:?}{} runs no propagator with a plane stage: angular spectrum, or a \
-                 Fresnel transform back in distance",
-                if moved { " with a position" } else { "" }
-            ))),
-        }
-    }
-
     /// The buffers of `epoch`'s cycle, and with graphs its graph, captured from them.
     fn new_run(&mut self, epoch: Epoch) -> Result<EpochRun, EngineError> {
-        self.stageless(epoch.algorithm())?;
         if !matches!(epoch, Epoch::Lsqml { .. }) {
             self.one_slice(&format!("{:?}", epoch.algorithm()))?;
         }

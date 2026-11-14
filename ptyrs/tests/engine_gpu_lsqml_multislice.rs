@@ -567,7 +567,6 @@ fn gpu_refuses_what_it_cannot_run_on_slices() {
     let e = build(&c.optics, &two);
     assert!(e.contains("a multislice object of one mode, got 2"), "{e}");
 
-    // The far field has no plane stage, whose own refusal would come first.
     let mut gpu = case(optics("far field", 3)).gpu(OPTIONS);
     let before: Vec<_> = gpu.objects().unwrap().iter().map(|o| bits(o)).collect();
     let probe = bits(&gpu.probe().unwrap());
