@@ -3,18 +3,19 @@
 //! reconstruction path goes through it.
 //!
 //! Arrays are row-major as in the engine: counts `[nframe, ny, nx]` in detector order,
-//! object `[nmode, nyo, nxo]` (`[nslice, nmode, nyo, nxo]` in epochs over `Views`) and probe
+//! object `[nmode, nyo, nxo]` (`[nslice, nmode, nyo, nxo]` in epochs over `Views` and for a
+//! multislice `GpuPtycho`) and probe
 //! `[nmode, ny, nx]` complex128 in PyNX convention, a `Scan`'s positions as the raw sample
 //! translations in metres (CXI `translation`).
 
 mod cpu;
 mod gpu;
 
-use ::ptyrs::base::{C64, CoreError, Counts, Geometry, Positions, Stack};
+use ::ptyrs::base::{C64, CoreError, Counts, Geometry, Object, Positions, Stack};
 use ::ptyrs::engine::{BhStep, Cost, EngineError, Features, Llk, LlkRecord, LsqmlStep};
 use numpy::{
-    Element, PyArray1, PyArray2, PyArray3, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2,
-    PyReadonlyArray3,
+    Element, PyArray1, PyArray2, PyArray3, PyArray4, PyArrayMethods, PyReadonlyArray1,
+    PyReadonlyArray2, PyReadonlyArray3, PyReadonlyArray4,
 };
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
@@ -160,6 +161,26 @@ fn stack_in(a: PyReadonlyArray3<'_, C64>) -> Result<Stack<C64>, Error> {
 fn stack_out<'py, T: Element>(py: Python<'py>, s: Stack<T>) -> PyResult<Bound<'py, PyArray3<T>>> {
     let dims = s.dims();
     PyArray1::from_vec(py, s.into_vec()).reshape(dims)
+}
+
+/// `a` `[nslice, nobj, nyo, nxo]` as an object's slices.
+fn objects_in(a: PyReadonlyArray4<'_, C64>) -> Result<Vec<Object>, Error> {
+    let a = a.as_array();
+    let (_, nobj, nyo, nxo) = a.dim();
+    a.outer_iter()
+        .map(|s| {
+            let s = Stack::from_vec([nobj, nyo, nxo], s.iter().copied().collect())?;
+            Ok(Object::new(s))
+        })
+        .collect()
+}
+
+/// `objects` as `[nslice, nobj, nyo, nxo]`.
+fn objects_out<'py>(py: Python<'py>, objects: Vec<Object>) -> PyResult<Bound<'py, PyArray4<C64>>> {
+    let [nobj, nyo, nxo] = objects[0].dims();
+    let nslice = objects.len();
+    let data = objects.into_iter().flat_map(|o| o.0.into_vec()).collect();
+    PyArray1::from_vec(py, data).reshape([nslice, nobj, nyo, nxo])
 }
 
 /// BH's default `position_rho`, pty-chi's `BHProbePositionOptions.rho`.

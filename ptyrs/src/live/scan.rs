@@ -23,6 +23,7 @@ use crate::gpu::{C32, Kernels, StackRef, UpdateSums, ViewAddr, ViewDims, Views, 
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{DeviceBuffer, Stream};
 
+use crate::live::fill::Fill;
 use crate::live::grow::{Backer, GrowError, GrowTable};
 use crate::live::object::{LiveObject, ObjectBacker};
 use crate::live::stack::LiveFrames;
@@ -192,6 +193,18 @@ pub(crate) fn off_view(d: &ViewDims, frame: &[ViewAddr]) -> Option<ViewAddr> {
         d.check_view(v).is_err() || v.probe != m % np || v.obj != m / np || at(v) != at(&frame[0])
     };
     (0..).zip(frame).find(off).map(|(_, &view)| view)
+}
+
+/// Whether a [`Fill`] can be written to an object of `d`: it has one mode.
+pub(crate) fn one_object_mode(d: &ViewDims) -> Result<(), GrowError> {
+    if d.nobj != 1 {
+        return Err(crate::gpu::Error::Shape(format!(
+            "a fill holds one object mode, the object has {}",
+            d.nobj
+        ))
+        .into());
+    }
+    Ok(())
 }
 
 /// Backs a [`LiveScan`]'s memory for frames ahead of [`LiveScan::push`],
@@ -389,6 +402,18 @@ impl LiveScan {
             self.gate.fail(first);
         }
         landed
+    }
+
+    /// Queues `fill` onto the object on the scan's stream
+    /// ([`LiveObject::write_fill`]), `origin` the object pixel of the scan's
+    /// pixel `(0, 0)`, `[0, 0]` unless the scan is a window of a larger
+    /// one; returns the fill's pixels on this scan's own tiles that were
+    /// not ready, 0 for the fill of a batch [`Self::push`] has landed
+    /// whole. A fill holds one object mode's values, so a scan of more is
+    /// refused untouched.
+    pub fn fill(&mut self, fill: Fill, origin: [usize; 2]) -> Result<usize, GrowError> {
+        one_object_mode(&self.dims)?;
+        self.obj.write_fill(fill, origin)
     }
 
     /// Queues on `ctx`'s stream, or records into its capture, the step of
@@ -803,6 +828,46 @@ mod tests {
             assert_eq!(scan.closed(), Some(Refusal::View { frame: 1, view }));
             assert_eq!((scan.landed(), scan.lost()), (1, 2));
         }
+    }
+
+    /// A fill holds one object mode: a scan of two refuses it, and its
+    /// pixels stay what they were.
+    #[test]
+    fn a_scan_of_two_object_modes_refuses_a_fill() {
+        use crate::live::fill::PatchFill;
+        use crate::live::object::Snapshot;
+
+        let ctx = Context::new(0).expect("GPU 0");
+        let s = ctx.new_stream().unwrap();
+        let one = NonZeroU32::new(1).unwrap();
+        let (flat, v) = ([0.75f32, -0.5], [3.0f32, 2.0]);
+        let run = |nobj: u32| {
+            let sh = ScanShape {
+                nmode: 2 * nobj,
+                nobj,
+                ..shape(3, [16, 16])
+            };
+            let mut scan = LiveScan::new(&s, &sh, one, 64, flat, 1).unwrap();
+            let [a, b] = raster(0, [16, 16]);
+            let frame: Vec<ViewAddr> = (0..nobj)
+                .flat_map(|obj| [ViewAddr { obj, ..a }, ViewAddr { obj, ..b }])
+                .collect();
+            let mut backer = scan.backer();
+            assert_eq!(push(&mut scan, &mut backer, &frame).unwrap(), 1);
+            let [ny, nx] = scan.dims().obj.map(|n| n as usize);
+            let mut pf = PatchFill::new(&ctx, [ny, nx], [4, 4], 1, 1).unwrap();
+            let fill = pf.stitch(&[[a.oy + 2, a.ox + 2]], &[v; 16]).unwrap();
+            let got = scan.fill(fill, [0, 0]);
+            let mut snap = Snapshot::new(scan.obj()).unwrap();
+            scan.obj().snapshot(&mut snap).unwrap();
+            let moved = snap.wait().unwrap().iter().filter(|&&p| p != flat).count();
+            (got, moved, scan.obj().fill_copies())
+        };
+        let (got, moved, copies) = run(2);
+        assert!(matches!(got, Err(GrowError::Gpu(_))), "{got:?}");
+        assert_eq!((moved, copies), (0, 0));
+        let (got, moved, copies) = run(1);
+        assert_eq!((got.unwrap(), moved, copies), (0, 16, 1));
     }
 
     /// A plan backed before the first frame maps what backing its frames as

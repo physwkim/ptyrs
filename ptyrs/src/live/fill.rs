@@ -147,6 +147,9 @@ impl PatchFill {
             .map(|_| {
                 Ok(Buffers {
                     values: PinnedHostBuffer::zeroed(ctx, most)?,
+                    // Issued blocks on a row are a patch wide or end at the
+                    // object's edge, so a row has at most one open run per
+                    // patch on it: `max_batch * patch[0]` rectangles at most.
                     rects: Vec::with_capacity(4 * max_batch * patch[0]),
                 })
             })
@@ -322,6 +325,65 @@ impl PatchFill {
             buffers: Some(b),
             pool: self.pool.clone(),
         })))
+    }
+}
+
+/// A stand-in predictor for the engines' tests.
+#[cfg(test)]
+pub(crate) mod standin {
+    use super::*;
+    use crate::gpu::ViewAddr;
+
+    /// Predicts what no object is: unit pixels of a phase hashed from the
+    /// pixel's place in the stream of predictions.
+    pub(crate) struct Wrong {
+        pub(crate) patch: [usize; 2],
+        pub(crate) issued: u64,
+    }
+
+    impl PatchPredictor for Wrong {
+        fn patch(&self) -> [usize; 2] {
+            self.patch
+        }
+
+        fn predict(
+            &mut self,
+            counts: &[u16],
+            frame: [usize; 2],
+            out: &mut [[f32; 2]],
+        ) -> Result<(), String> {
+            let n = counts.len() / (frame[0] * frame[1]);
+            if out.len() != n * self.patch[0] * self.patch[1] {
+                return Err(format!("{} values for {n} frames", out.len()));
+            }
+            for v in out {
+                self.issued += 1;
+                let h = self.issued.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40;
+                let phase = h as f32 / (1u32 << 24) as f32 * std::f32::consts::TAU;
+                *v = [phase.cos(), phase.sin()];
+            }
+            Ok(())
+        }
+    }
+
+    /// The fill of a batch as the wiring builds it: `counts` and `views`,
+    /// `nmode` per frame, of its frames in landing order.
+    pub(crate) fn batch_fill(
+        pf: &mut PatchFill,
+        pred: &mut dyn PatchPredictor,
+        counts: &[u16],
+        views: &[ViewAddr],
+        nmode: usize,
+        frame: [usize; 2],
+    ) -> Fill {
+        let patch = pred.patch();
+        let corners: Vec<[u32; 2]> = views
+            .chunks(nmode)
+            .map(|v| patch_corner([v[0].oy, v[0].ox], frame, patch))
+            .collect();
+        let mut out = vec![[0.0; 2]; corners.len() * patch[0] * patch[1]];
+        pred.predict(counts, frame, &mut out).unwrap();
+        pf.stitch(&corners, &out).expect("a buffer is free")
     }
 }
 

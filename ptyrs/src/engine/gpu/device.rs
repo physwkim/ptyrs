@@ -1746,14 +1746,13 @@ impl Device {
     }
 
     /// Fails under a propagator with a plane stage for the passes that run none: the LLK
-    /// pass, LSQML's, BH's and rPIE's do, AP's, DM's and RAAR's at fixed positions only, and
-    /// every other is enqueued behind this.
+    /// pass, LSQML's, BH's, rPIE's and ML's do, AP's, DM's and RAAR's at fixed positions
+    /// only, and every other is enqueued behind this.
     fn stageless(&self, algorithm: Algorithm) -> Result<(), EngineError> {
         let moved = self.features.position.is_some();
         match (&self.exit, algorithm) {
-            (ExitStage::None, _) | (_, Algorithm::Lsqml | Algorithm::Bh | Algorithm::Rpie) => {
-                Ok(())
-            }
+            (ExitStage::None, _)
+            | (_, Algorithm::Lsqml | Algorithm::Bh | Algorithm::Rpie | Algorithm::Ml) => Ok(()),
             (_, Algorithm::Ap | Algorithm::Dm | Algorithm::Raar) if !moved => Ok(()),
             _ => Err(EngineError::Invalid(format!(
                 "{algorithm:?}{} runs no propagator with a plane stage: angular spectrum, or a \
@@ -1886,7 +1885,6 @@ impl Device {
 
     /// [`Bufs::scale_to_photons`] enqueued eagerly, with `total` the unmasked observed photons.
     pub fn scale_to_photons(&mut self, total: f32) -> Result<(), EngineError> {
-        self.stageless(Algorithm::Ml)?;
         self.one_slice("ML's scaling")?;
         self.build_ml()?;
         let ctx = self.context();
@@ -1906,7 +1904,6 @@ impl Device {
     /// The ML gradients of the current estimate, object then probe, as
     /// [`Bufs::ml_grad`] leaves them in the update sums; downloads them and zeroes the sums.
     pub fn ml_grads(&mut self) -> Result<[Vec<C32>; 2], EngineError> {
-        self.stageless(Algorithm::Ml)?;
         self.one_slice("ML's gradient")?;
         {
             let ctx = self.context();
