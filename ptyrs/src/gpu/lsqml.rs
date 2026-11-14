@@ -137,6 +137,34 @@ impl LsqmlScan {
     }
 }
 
+/// The steps of one object slice past the first: every epoch position's `a_obj` of its last
+/// step, and the slice's last step.
+pub struct SliceSteps {
+    a: DeviceBuffer<f32>,
+    step: DeviceBuffer<f32>,
+}
+
+impl SliceSteps {
+    /// Zeroed steps for a scan of `dims`.
+    pub fn zeroed(stream: &CudaStream, dims: &ViewDims) -> Result<Self, Error> {
+        Ok(Self {
+            a: DeviceBuffer::zeroed(stream, dims.nframe as usize)?,
+            step: DeviceBuffer::zeroed(stream, 1)?,
+        })
+    }
+
+    /// The `a_obj` by epoch position.
+    pub fn a_obj(&self) -> &DeviceBuffer<f32> {
+        &self.a
+    }
+}
+
+/// pty-chi's `trim_mean` cut of a batch of `nb`: the values dropped at each end, saturating
+/// at 0 for small batches.
+fn trim(nb: u32) -> u32 {
+    (nb as f64 * 0.1 / 2.0 - 0.5).ceil() as u32
+}
+
 /// A stack's exit-wave update `chi` ([`LsqmlKernels::chi`]) for [`LsqmlKernels::dots`]; under
 /// the position model with the stack's moved probe `w`
 /// ([`crate::gpu::PositionKernels::shift_w`]).
@@ -608,10 +636,8 @@ impl LsqmlKernels {
         scale: f32,
     ) -> Result<(), Error> {
         let span = span(&st.dims, &batch)?;
-        // pty-chi's `trim_mean`, the cut saturating at 0 for small batches.
-        let trim = (span.nb as f64 * 0.1 / 2.0 - 0.5).ceil() as u32;
         let rule = LsqmlRule {
-            trim,
+            trim: trim(span.nb),
             nmode: st.dims.nmode,
             scale,
         };
@@ -634,6 +660,66 @@ impl LsqmlKernels {
             })
     }
 
+    /// The step sizes of the batch's epoch positions `batch` on an object slice past the
+    /// first, from the [`Self::dots`] sums of all its stacks at that slice: pty-chi's Eq. 23b
+    /// over `share` (slices times modes) into `out`, with the slice's step as
+    /// [`Self::step`] takes the object's.
+    pub fn step_alone(
+        &self,
+        ctx: &ExecutionContext,
+        batch: Range<u32>,
+        st: &LsqmlScan,
+        share: f32,
+        out: &mut SliceSteps,
+    ) -> Result<(), Error> {
+        let span = span(&st.dims, &batch)?;
+        check_len("a", &out.a, st.dims.nframe as usize)?;
+        let trim = trim(span.nb);
+        let writes = [out.a.storage(), out.step.storage()];
+        self.base
+            .launch(ctx, &[st.dots.storage()], &writes, |stream| {
+                // SAFETY: `span` lies in the scan's positions, `2 trim < nb`; one block.
+                unsafe {
+                    self.module.lsqml_step_alone(
+                        stream,
+                        ONE_BLOCK,
+                        dptr::<f32, f32>(&st.dots).cast_const(),
+                        span,
+                        trim,
+                        share,
+                        dptr(&out.a),
+                        dptr(&out.step),
+                    )
+                }
+            })
+    }
+
+    /// The last [`Self::step`]'s object steps of the batch over `share` slices: its records'
+    /// `a_obj` and the object step, divided by `share`.
+    pub fn share(
+        &self,
+        ctx: &ExecutionContext,
+        batch: Range<u32>,
+        st: &mut LsqmlScan,
+        share: f32,
+    ) -> Result<(), Error> {
+        let span = span(&st.dims, &batch)?;
+        let writes = [st.rec.storage(), st.step.storage()];
+        self.base.launch(ctx, &[], &writes, |stream| {
+            // SAFETY: `span` lies in the scan's positions; one block.
+            unsafe {
+                self.module.lsqml_step_share(
+                    stream,
+                    ONE_BLOCK,
+                    dptr(&st.rec),
+                    span,
+                    share,
+                    dptr(&st.step),
+                )
+            }
+        })
+    }
+
     /// `x += s num` with `s` the last [`Self::step`]'s object step for `obj` and its probe
     /// step for `probe`; consumes both update sums (zero after).
     pub fn update(
@@ -644,32 +730,48 @@ impl LsqmlKernels {
         probe: LsqmlVar<'_>,
     ) -> Result<(), Error> {
         for (var, n, at) in [(obj, lens(&st.dims)[0], 0), (probe, lens(&st.dims)[1], 1)] {
-            check_len("x", var.x, n)?;
-            var.sums.check(n)?;
-            let config = grid_1d(n)?;
-            let n = to_u32(n)?;
-            let step = dptr::<f32, f32>(&st.step).wrapping_add(at).cast_const();
-            let writes = [
-                var.x.storage(),
-                var.sums.num.storage(),
-                var.sums.den.storage(),
-            ];
-            self.base
-                .launch(ctx, &[st.step.storage()], &writes, |stream| {
-                    // SAFETY: lengths checked above; `st.step` holds both steps.
-                    unsafe {
-                        self.module.lsqml_update(
-                            stream,
-                            config,
-                            dptr(var.x),
-                            var.sums.ptrs(),
-                            n,
-                            step,
-                        )
-                    }
-                })?;
+            self.apply(ctx, var, n, (&st.step, at))?;
         }
         Ok(())
+    }
+
+    /// [`Self::update`] of one object slice past the first by the last
+    /// [`Self::step_alone`]'s step in `steps`.
+    pub fn update_alone(
+        &self,
+        ctx: &ExecutionContext,
+        st: &LsqmlScan,
+        obj: LsqmlVar<'_>,
+        steps: &SliceSteps,
+    ) -> Result<(), Error> {
+        self.apply(ctx, obj, lens(&st.dims)[0], (&steps.step, 0))
+    }
+
+    /// `x += s num` over `var`'s `n` values, `s` the float `at` of `step`; consumes the sums.
+    fn apply(
+        &self,
+        ctx: &ExecutionContext,
+        var: LsqmlVar<'_>,
+        n: usize,
+        (step, at): (&DeviceBuffer<f32>, usize),
+    ) -> Result<(), Error> {
+        check_len("x", var.x, n)?;
+        var.sums.check(n)?;
+        let config = grid_1d(n)?;
+        let n = to_u32(n)?;
+        let s = dptr::<f32, f32>(step).wrapping_add(at).cast_const();
+        let writes = [
+            var.x.storage(),
+            var.sums.num.storage(),
+            var.sums.den.storage(),
+        ];
+        self.base.launch(ctx, &[step.storage()], &writes, |stream| {
+            // SAFETY: lengths checked above; `step` holds more than `at` floats.
+            unsafe {
+                self.module
+                    .lsqml_update(stream, config, dptr(var.x), var.sums.ptrs(), n, s)
+            }
+        })
     }
 
     /// The column pass under `flags`, `reads` and `writes` its leases.

@@ -776,6 +776,99 @@ pub mod lsqml_kernels {
         }
     }
 
+    /// One batch's step sizes on an object slice past the first, pty-chi's Eq. 23b, over its
+    /// positions `p` from the [`lsqml_dots`] sums of the slice, each frame's chunks summed in
+    /// order: `a[p] = max(0.45 Σ Re(conj(u) chi) / Σ |u|² / share, 0)`, 0 where `Σ |u|²` is,
+    /// and `step[0]` their mean without the `trim` smallest and largest.
+    ///
+    /// # Safety
+    ///
+    /// `sums` holds `6 * span.nchunk` floats per position, `a` `nframe`, `step` one; `2 *
+    /// trim < span.nb`; grid `(1, 1, 1)`, block `(PIXEL_THREADS, 1, 1)`.
+    ///
+    /// [`lsqml_dots`]: LoadedModule::lsqml_dots
+    #[kernel]
+    pub unsafe fn lsqml_step_alone(
+        sums: *const f32,
+        span: BatchSpan,
+        trim: u32,
+        share: f32,
+        a: *mut f32,
+        step: *mut f32,
+    ) {
+        static mut RED: SharedArray<f32, 256> = SharedArray::UNINIT;
+        let t = thread::threadIdx_x() as usize;
+        let k = LSQML_DOTS as usize;
+        let (p0, nb) = (span.p0 as usize, span.nb);
+        let (len, nchunk) = (nb as usize, span.nchunk as usize);
+        let mut i = t;
+        while i < len {
+            let s = unsafe { sums.add(k * (p0 + i) * nchunk) };
+            let (mut num, mut den) = (0.0f32, 0.0f32);
+            for c in 0..nchunk {
+                unsafe {
+                    den += *s.add(k * c);
+                    num += *s.add(k * c + 4);
+                }
+            }
+            let v = if den > 0.0 {
+                (0.45 * num / den / share).max(0.0)
+            } else {
+                0.0
+            };
+            unsafe { *a.add(p0 + i) = v };
+            i += PIXEL_THREADS as usize;
+        }
+        // Every `a` written before the ranks read them.
+        thread::sync_threads();
+        let mut acc = [0.0f32; 1];
+        let mut i = t;
+        while i < len {
+            let ai = unsafe { *a.add(p0 + i) };
+            // The rank of `a` in the batch, ties by position.
+            let mut rank = 0u32;
+            for jj in 0..len {
+                let aj = unsafe { *a.add(p0 + jj) };
+                if aj < ai || (aj == ai && jj < i) {
+                    rank += 1;
+                }
+            }
+            if rank >= trim && rank < nb - trim {
+                acc[0] += ai;
+            }
+            i += PIXEL_THREADS as usize;
+        }
+        unsafe {
+            store_sums::<1>((&raw mut RED).cast::<f32>(), acc, step);
+            if t == 0 {
+                *step /= (nb - 2 * trim) as f32;
+            }
+        }
+    }
+
+    /// The object steps of the last [`lsqml_step`] over `share` slices: each of the batch's
+    /// `a_obj` in `rec` and `step[0]`, divided by `share`.
+    ///
+    /// # Safety
+    ///
+    /// `rec` holds `3 * nframe` floats, `step` one; grid `(1, 1, 1)`, block `(PIXEL_THREADS,
+    /// 1, 1)`.
+    ///
+    /// [`lsqml_step`]: LoadedModule::lsqml_step
+    #[kernel]
+    pub unsafe fn lsqml_step_share(rec: *mut f32, span: BatchSpan, share: f32, step: *mut f32) {
+        let t = thread::threadIdx_x() as usize;
+        let r = LSQML_REC as usize;
+        let mut i = t;
+        while i < span.nb as usize {
+            unsafe { *rec.add(r * (span.p0 as usize + i) + 1) /= share };
+            i += PIXEL_THREADS as usize;
+        }
+        if t == 0 {
+            unsafe { *step /= share };
+        }
+    }
+
     /// `x += step[0] num`, and the consumed sums are zero, for `n` elements.
     ///
     /// # Safety

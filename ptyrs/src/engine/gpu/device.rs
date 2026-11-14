@@ -48,8 +48,40 @@ pub(super) struct Uploads<'a> {
     pub scale: f32,
     pub addrs: &'a [ViewAddr],
     pub counts: &'a [u16],
+    /// The object, of a multislice object its first slice.
     pub obj: &'a [C32],
     pub probe: &'a [C32],
+    /// The rest of a multislice object.
+    pub slices: Option<SliceUploads>,
+}
+
+/// A multislice object past its first slice.
+pub(super) struct SliceUploads {
+    /// The slices after the first, each shaped as it.
+    pub deeper: Vec<Vec<C32>>,
+    /// Gap `s`'s transfer function, from slice `s` to `s + 1`: one per deeper slice.
+    pub gaps: Vec<Vec<C32>>,
+    /// The last slice's plane phase, radians per squared pixel.
+    pub quad: f32,
+}
+
+/// A multislice object's device state past its first slice, which is [`Device::obj`]; only
+/// LSQML runs it, and [`Device::one_slice`] gates every other pass.
+struct Slices {
+    deeper: Vec<DeviceBuffer<C32>>,
+    gaps: Vec<DeviceBuffer<C32>>,
+    /// A probe of ones `[nprobe, ny, nx]`: [`Kernels::psi_to_obj`] over it is a slice's
+    /// adjoint of waves already times the conjugate of what entered it.
+    ones: DeviceBuffer<C32>,
+    quad: f32,
+}
+
+/// [`Slices`] lent to a cycle.
+pub(super) struct SlicesMut<'a> {
+    pub deeper: &'a mut [DeviceBuffer<C32>],
+    pub gaps: &'a [DeviceBuffer<C32>],
+    pub ones: &'a DeviceBuffer<C32>,
+    pub quad: f32,
 }
 
 /// Every buffer, module and plan a cycle launches on, and the graphs captured from them.
@@ -70,6 +102,8 @@ pub(super) struct Device {
     counts: DeviceBuffer<u16>,
     obj: DeviceBuffer<C32>,
     probe: DeviceBuffer<C32>,
+    /// A multislice object's slices past `obj`; none of one slice.
+    slices: Option<Slices>,
     obj_sums: UpdateSums,
     probe_sums: UpdateSums,
     obj_len: u32,
@@ -1095,6 +1129,8 @@ pub(super) struct Bufs<'a> {
     pub counts: &'a DeviceBuffer<u16>,
     pub obj: &'a mut DeviceBuffer<C32>,
     pub probe: &'a mut DeviceBuffer<C32>,
+    /// A multislice object's slices past `obj`.
+    pub slices: Option<SlicesMut<'a>>,
     pub obj_sums: &'a mut UpdateSums,
     pub probe_sums: &'a mut UpdateSums,
     pub obj_len: u32,
@@ -1145,6 +1181,7 @@ impl Device {
             counts,
             obj,
             probe,
+            slices,
         } = uploads;
         let stream = ctx.new_stream()?;
         let kernels = Kernels::load(ctx)?;
@@ -1168,6 +1205,22 @@ impl Device {
         let tile = TileDots::new(&stream, &dims)?;
         let rule = StackRule::new(options.stack_size, ctx.l2_cache_size_bytes()?);
         let shared = Shared::new(&stream, &dims, rule, options.fused, false)?;
+        let slices = slices
+            .map(|s| {
+                let upload = |v: &[Vec<C32>]| {
+                    v.iter()
+                        .map(|v| DeviceBuffer::from_host(&stream, v))
+                        .collect::<Result<Vec<_>, _>>()
+                };
+                let ones = vec![C32 { re: 1.0, im: 0.0 }; probe.len()];
+                Ok::<_, EngineError>(Slices {
+                    deeper: upload(&s.deeper)?,
+                    gaps: upload(&s.gaps)?,
+                    ones: DeviceBuffer::from_host(&stream, &ones)?,
+                    quad: s.quad,
+                })
+            })
+            .transpose()?;
         let mut dev = Self {
             obj_len: to_u32("object length", obj.len())?,
             probe_len: to_u32("probe length", probe.len())?,
@@ -1181,6 +1234,7 @@ impl Device {
             counts: DeviceBuffer::from_host(&stream, counts)?,
             obj: DeviceBuffer::from_host(&stream, obj)?,
             probe: DeviceBuffer::from_host(&stream, probe)?,
+            slices,
             obj_sums: UpdateSums::zeroed(&stream, obj.len())?,
             probe_sums: UpdateSums::zeroed(&stream, probe.len())?,
             kernels,
@@ -1210,9 +1264,10 @@ impl Device {
         Ok(dev)
     }
 
-    /// With graphs, captures the LLK pass's graph.
+    /// With graphs, captures the LLK pass's graph; none of a multislice object, whose LLK
+    /// no pass takes.
     fn capture_llk(&mut self) -> Result<(), EngineError> {
-        if self.use_graph {
+        if self.use_graph && self.slices.is_none() {
             self.llk_graph = Some(self.capture(|bufs, passes, ring, ctx| {
                 bufs.forward_llk(ctx, passes, ring.record()).map(Some)
             })?);
@@ -1353,6 +1408,28 @@ impl Device {
         &self.probe
     }
 
+    /// A multislice object's slices past [`Self::obj`]; empty of one slice.
+    pub fn deeper(&self) -> &[DeviceBuffer<C32>] {
+        self.slices.as_ref().map_or(&[], |s| &s.deeper)
+    }
+
+    /// Fails on a multislice object for `what`, which models one slice: every pass but
+    /// LSQML's is enqueued behind this.
+    fn one_slice(&self, what: &str) -> Result<(), EngineError> {
+        match &self.slices {
+            None => Ok(()),
+            Some(s) => Err(EngineError::Invalid(format!(
+                "{what} runs one object slice, got {}: only LSQML runs a multislice object",
+                s.deeper.len() + 1
+            ))),
+        }
+    }
+
+    /// Whether the object has more than one slice.
+    pub fn sliced(&self) -> bool {
+        self.slices.is_some()
+    }
+
     /// Overwrites the object in place, so every captured graph reads the new values.
     pub fn write_object(&mut self, obj: &[C32]) -> Result<(), EngineError> {
         Ok(self.obj.copy_from_host(&self.stream, obj)?)
@@ -1360,6 +1437,7 @@ impl Device {
 
     /// Overwrites the object and probe in place.
     pub fn write_arrays(&mut self, obj: &[C32], probe: &[C32]) -> Result<(), EngineError> {
+        self.one_slice("the phase ramp's removal")?;
         self.write_object(obj)?;
         self.probe.copy_from_host(&self.stream, probe)?;
         Ok(())
@@ -1383,6 +1461,12 @@ impl Device {
             counts: &self.counts,
             obj: &mut self.obj,
             probe: &mut self.probe,
+            slices: self.slices.as_mut().map(|s| SlicesMut {
+                deeper: &mut s.deeper,
+                gaps: &s.gaps,
+                ones: &s.ones,
+                quad: s.quad,
+            }),
             obj_sums: &mut self.obj_sums,
             probe_sums: &mut self.probe_sums,
             obj_len: self.obj_len,
@@ -1551,6 +1635,7 @@ impl Device {
     /// Enqueues the LLK record of the current estimate under `tag`, from the graph captured
     /// in [`Self::new`] or eagerly without graphs.
     pub fn llk_pass(&mut self, tag: Tag) -> Result<(), EngineError> {
+        self.one_slice("the LLK pass")?;
         let graph = self.llk_graph.take();
         let done = match &graph {
             Some(c) => self.replay(c, tag),
@@ -1593,6 +1678,9 @@ impl Device {
     /// The buffers of `epoch`'s cycle, and with graphs its graph, captured from them.
     fn new_run(&mut self, epoch: Epoch) -> Result<EpochRun, EngineError> {
         self.stageless(epoch.algorithm())?;
+        if !matches!(epoch, Epoch::Lsqml { .. }) {
+            self.one_slice(&format!("{:?}", epoch.algorithm()))?;
+        }
         let mut cycle = match epoch {
             Epoch::Ap { params, llk } => Cycle::Ap { params, llk },
             Epoch::Dm { params, first } => {
@@ -1701,6 +1789,7 @@ impl Device {
                 size,
                 self.rule,
                 moved.then(|| self.shared.cut.table.nf_max()),
+                self.deeper().len(),
             )?;
             self.lsqml = Some(Box::new(state));
         }
@@ -1710,6 +1799,7 @@ impl Device {
     /// [`Bufs::scale_to_photons`] enqueued eagerly, with `total` the unmasked observed photons.
     pub fn scale_to_photons(&mut self, total: f32) -> Result<(), EngineError> {
         self.stageless(Algorithm::Ml)?;
+        self.one_slice("ML's scaling")?;
         self.build_ml()?;
         let ctx = self.context();
         let (mut bufs, mut passes, _) = self.lend();
@@ -1719,6 +1809,7 @@ impl Device {
     /// PyNX `ScaleObjProbe(absolute=False)` enqueued eagerly: `Σ|O|` and `Σ|P|` balanced,
     /// `O P` unchanged.
     pub fn balance_obj_probe(&mut self) -> Result<(), EngineError> {
+        self.one_slice("the object and probe balance")?;
         let ctx = self.context();
         let (mut bufs, _, _) = self.lend();
         Ok(bufs.scale_obj_probe(&ctx, None)?)
@@ -1728,6 +1819,7 @@ impl Device {
     /// [`Bufs::ml_grad`] leaves them in the update sums; downloads them and zeroes the sums.
     pub fn ml_grads(&mut self) -> Result<[Vec<C32>; 2], EngineError> {
         self.stageless(Algorithm::Ml)?;
+        self.one_slice("ML's gradient")?;
         {
             let ctx = self.context();
             let (mut bufs, mut passes, _) = self.lend();
