@@ -1,19 +1,23 @@
 """pty-chi against ptyrs through the `ptyrs` module: CPU f64 rPIE on one M3 dataset from its
-init as it is, with pty-chi's own rPIE parameters on both sides, PyNX LLK per epoch.
+init as it is, with the same rPIE parameters on both sides, PyNX LLK per epoch.
 
     python -I compare_rpie.py DATA_DIR [--name fermat_clean] [--llk gaussian|poisson|euclidian]
-        [--epochs 20] [--rtol 1e-4] [--module DIR]
+        [--batch 100] [--object-step 0.03] [--epochs 20] [--rtol 1e-4] [--module DIR]
     python -I compare_rpie.py DATA_DIR --ptychi-defaults [--seed 7] ...
 
 DATA_DIR is refgen_gen_m3's output (ptyrs::refgen), DIR holds the module ptyrs-py/scripts/build.sh
 installs. Prints the start's far-field intensity difference, each epoch's LLK on both sides and
-their relative difference; exits 1 at the first epoch past rtol.
+their relative difference; exits 1 at the first epoch past rtol, 2 if a side diverges
+(m3ref.exit_unless_converging).
 
-The rPIE parameters are read from pty-chi's RPIEOptions defaults (pty-chi 0605630) and handed to
-Ptycho.rpie. The rest is matched as in compare_lsqml.py: pty-chi features ptyrs does not implement
-are off (object-probe ambiguity removal, mode orthogonalisation), PATCH shifts at integer corners.
---ptychi-defaults runs pty-chi alone with its defaults otherwise untouched as well (shuffled
-batches seeded by --seed, ambiguity removal, orthogonalisation, AUTO shifts).
+--batch and --object-step go to both sides; the other rPIE parameters are read from pty-chi's
+RPIEOptions defaults (pty-chi 0605630) and handed to Ptycho.rpie. pty-chi's own object step, 1
+times the sum over a batch of 100 frames, diverges on this data with shuffled batches and with
+the engine's consecutive ones; --ptychi-defaults shows it. The rest is matched as in
+compare_lsqml.py: pty-chi features ptyrs does not implement are off (object-probe ambiguity
+removal, mode orthogonalisation), PATCH shifts at integer corners. --ptychi-defaults runs pty-chi
+alone with its defaults untouched (batch and object step, shuffled batches seeded by --seed,
+ambiguity removal, orthogonalisation, AUTO shifts).
 """
 
 import argparse
@@ -29,7 +33,7 @@ sys.path.insert(0, os.path.join(HERE, "..", "ptychi"))
 import m3ref  # noqa: E402
 
 
-def ptychi_task(ds, obj, probe, epochs, matched, seed):
+def ptychi_task(ds, obj, probe, args, matched):
     import ptychi.api as api
     from ptychi.api.task import PtychographyTask
 
@@ -44,12 +48,14 @@ def ptychi_task(ds, obj, probe, epochs, matched, seed):
     o.determine_position_origin_coords_by = api.ObjectPosOriginCoordsMethods.SPECIFIED
     o.position_origin_coords = [(ny - 1) / 2, (nx - 1) / 2]
     pr = opts.probe_options
-    r.num_epochs = epochs
+    r.num_epochs = args.epochs
     r.default_dtype = api.Dtypes.FLOAT64
     r.default_device = api.Devices.CPU
     r.allow_nondeterministic_algorithms = False
-    r.random_seed = seed
+    r.random_seed = args.seed
     if matched:
+        r.batch_size = args.batch
+        o.step_size = args.object_step
         o.remove_object_probe_ambiguity.enabled = False
         pr.orthogonalize_incoherent_modes.enabled = False
         pr.orthogonalize_opr_modes.enabled = False
@@ -99,7 +105,7 @@ def ptychi_icalc(task, chunk=64):
 
 
 def ptychi_defaults(ds, obj, probe, args):
-    task = ptychi_task(ds, obj, probe, args.epochs, False, args.seed)
+    task = ptychi_task(ds, obj, probe, args, False)
     print(f"{args.name} pty-chi rPIE defaults seed {args.seed}: epoch, {args.llk} LLK")
     for e in range(args.epochs + 1):
         if e:
@@ -115,6 +121,8 @@ def main():
     a.add_argument("data_dir")
     a.add_argument("--name", default="fermat_clean")
     a.add_argument("--llk", choices=("gaussian", "poisson", "euclidian"), default="gaussian")
+    a.add_argument("--batch", type=int, default=100)
+    a.add_argument("--object-step", type=float, default=0.03)
     a.add_argument("--epochs", type=int, default=20)
     a.add_argument("--rtol", type=float, default=1e-4)
     a.add_argument("--seed", type=int, default=7)
@@ -135,7 +143,7 @@ def main():
     scan = ptyrs.Scan(ds.counts, ds.y_m, ds.x_m, g["wavelength_m"], g["distance_m"],
                       g["detector_pixel_m"])
     p = ptyrs.Ptycho(scan, obj, probe)
-    task = ptychi_task(ds, obj, probe, args.epochs, True, args.seed)
+    task = ptychi_task(ds, obj, probe, args, True)
     params = rpie_params(task.options)
     rec = task.reconstructor
     rec.dataloader = DataLoader(rec.dataset, batch_size=params["batch_size"], shuffle=False)
@@ -149,16 +157,20 @@ def main():
     key = args.llk
     print(f"{args.name} rPIE {params}: epoch, {key} LLK ptyrs, pty-chi, relative difference")
     parted = None
+    curves = {"ptyrs": [], "pty-chi": []}
     for e in range(args.epochs + 1):
         if e:
             p.rpie(1, **params)
             task.run(n_epochs=1)
         x, y = p.llk(p.object, p.probe)[key], m3ref.evaluate(task)[key]
+        curves["ptyrs"].append(x)
+        curves["pty-chi"].append(y)
         d = abs(x - y) / abs(y)
         print(f"{e:4d} {x:.10e} {y:.10e} {d:.1e}", flush=True)
         if not d <= args.rtol:
             parted = e
             break
+    m3ref.exit_unless_converging(curves)
     if parted is not None:
         print(f"parted at epoch {parted} (rtol {args.rtol:g})")
     sys.exit(0 if parted is None else 1)

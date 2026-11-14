@@ -12,6 +12,9 @@ use ptyrs::engine::{
 
 #[path = "common/engine/mod.rs"]
 mod common;
+#[path = "common/worst.rs"]
+mod worst;
+use worst::worst_of;
 
 fn state() -> (Scan, Ptycho) {
     let (scan, object, probe) = common::dm_scenario(32, 40, 2, 2e5, 4.0);
@@ -29,11 +32,7 @@ fn table(text: &str) -> Vec<Vec<f64>> {
 /// `max |a − b| / max |b|`.
 fn max_rel(a: &[f64], b: &[f64]) -> f64 {
     assert_eq!(a.len(), b.len());
-    let d = a
-        .iter()
-        .zip(b)
-        .map(|(a, b)| (a - b).abs())
-        .fold(0.0, f64::max);
+    let d = worst_of(a.iter().zip(b).map(|(a, b)| (a - b).abs()));
     d / b.iter().map(|b| b.abs()).fold(0.0, f64::max)
 }
 
@@ -81,11 +80,7 @@ fn position_matches_pos_grad_ref() {
     obj_probe_to_psi(views, p.object(), p.probe(), p.quad(), &mut plain);
     let zero = vec![[0.0; 2]; offsets.len()];
     obj_probe_shift_to_psi(&p, views, &zero, &mut psi);
-    let d = psi
-        .iter()
-        .zip(&plain)
-        .map(|(a, b)| (a - b).norm())
-        .fold(0.0, f64::max);
+    let d = worst_of(psi.iter().zip(&plain).map(|(a, b)| (a - b).norm()));
     let m = plain.iter().map(|b| b.norm()).fold(0.0, f64::max);
     assert!(d / m < 1e-13, "zero offsets: max rel {}", d / m);
 

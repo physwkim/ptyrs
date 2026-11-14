@@ -327,6 +327,7 @@ mod tests {
 
     use super::*;
     use crate::base::sim;
+    use crate::worst::worst_of;
 
     /// `img(r - s)`, periodic, by a Fourier phase ramp.
     fn shifted(img: &[C64], shape: [usize; 2], s: [f64; 2]) -> Vec<C64> {
@@ -440,12 +441,10 @@ mod tests {
         let got_cross = f.crossing().unwrap();
         // A ring's correlation scatters by (1 - frc²) / sqrt(independent pixels); the Hann
         // window correlates each frequency with its neighbours, about 3 pixels per sample.
-        let worst_z = (0..nring)
-            .map(|r| {
-                let sigma = (1.0 - want[r] * want[r]) * (3.0 / cnt[r] as f64).sqrt();
-                (f.rings[r].frc - want[r]).abs() / sigma
-            })
-            .fold(0.0, f64::max);
+        let worst_z = worst_of((0..nring).map(|r| {
+            let sigma = (1.0 - want[r] * want[r]) * (3.0 / cnt[r] as f64).sqrt();
+            (f.rings[r].frc - want[r]).abs() / sigma
+        }));
         eprintln!(
             "crossing ring {got_cross}, predicted {want_cross}; worst ring {worst_z:.2} sigma; \
              shift {:?}, ramp {:?}",

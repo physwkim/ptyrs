@@ -16,6 +16,10 @@ use ptyrs::engine::{
 };
 use ptyrs::gpu::FUSED_SIDES;
 
+#[path = "common/worst.rs"]
+mod worst;
+use worst::worst_of;
+
 const NPOS: usize = 30;
 const NPROBE: usize = 2;
 const WAVELENGTH: f64 = 1e-10;
@@ -169,11 +173,12 @@ fn step_err(got: &[BhStep], want: &[BhStep]) -> f64 {
             (g.top, w.top),
             (g.bottom, w.bottom),
         ] {
-            worst = worst.max(if b == 0.0 {
+            let e = if b == 0.0 {
                 a.abs()
             } else {
                 (a - b).abs() / b.abs()
-            });
+            };
+            worst = worst_of([worst, e]);
         }
     }
     worst
@@ -214,7 +219,7 @@ fn bh_steps_match_cpu_under_every_propagator() {
                         (got - llk).abs() / llk,
                     ];
                     for (w, e) in worst.iter_mut().zip(errs) {
-                        *w = w.max(e);
+                        *w = worst_of([*w, e]);
                     }
                 }
             }
@@ -269,9 +274,9 @@ fn bh_position_matches_cpu_under_every_propagator() {
                 gpu.set_features(&moved).unwrap();
                 gpu.bh(&p, NEPOCH, 0).unwrap();
                 let got = gpu.features().unwrap().position.unwrap();
-                let offset = (got.iter().flatten().zip(want.iter().flatten()))
-                    .fold(0.0f64, |m, (g, w)| m.max((g - w).abs()))
-                    / scale;
+                let offset = worst_of(
+                    (got.iter().flatten().zip(want.iter().flatten())).map(|(g, w)| (g - w).abs()),
+                ) / scale;
                 let errs = [
                     step_err(&gpu.bh_steps().unwrap(), &steps),
                     rel_l2(&gpu.object().unwrap(), &o),

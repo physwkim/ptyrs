@@ -22,6 +22,9 @@ use ptyrs::gpu::{
 mod common;
 #[path = "common/ptychi/mod.rs"]
 mod ptychi;
+#[path = "common/worst.rs"]
+mod worst;
+use worst::worst_of;
 
 /// 30 positions: stacks of at most 8 cut them into 8, 8, 7 and 7 frames, and batches of 4
 /// leave a shorter last one. Three LLK slots: the ring wraps within every LLK-taking call.
@@ -114,7 +117,7 @@ fn llk_rel(g: &[LlkRecord], c: &[LlkRecord]) -> f64 {
             (g.llk.euclidian, c.llk.euclidian),
             (g.llk.nb_photons_calc, c.llk.nb_photons_calc),
         ] {
-            worst = worst.max((a - b).abs() / b.abs());
+            worst = worst_of([worst, (a - b).abs() / b.abs()]);
         }
     }
     worst
@@ -458,15 +461,16 @@ fn bh_steps_match_cpu() {
                     (g.bottom, w.bottom),
                 ] {
                     // a CPU 0 (β in steepest descent) must be an exact GPU 0
-                    worst[0] = worst[0].max(if b == 0.0 {
+                    let e = if b == 0.0 {
                         a.abs()
                     } else {
                         (a - b).abs() / b.abs()
-                    });
+                    };
+                    worst[0] = worst_of([worst[0], e]);
                 }
             }
-            worst[1] = worst[1].max(rel_l2(&gpu.object().unwrap(), &o));
-            worst[2] = worst[2].max(rel_l2(&gpu.probe().unwrap(), &p));
+            worst[1] = worst_of([worst[1], rel_l2(&gpu.object().unwrap(), &o)]);
+            worst[2] = worst_of([worst[2], rel_l2(&gpu.probe().unwrap(), &p)]);
         }
         eprintln!(
             "bh steps fused {} graph {graph} batch {batch_size}: step {:.2e} object {:.2e} probe {:.2e}",
@@ -1004,16 +1008,15 @@ fn features_match_cpu(
     let (g, c) = (gpu.features().unwrap(), cpu.features());
     let worst = |g: &Option<Vec<f64>>, c: &Option<Vec<f64>>| {
         assert_eq!(g.is_some(), c.is_some());
-        (g.iter().flatten().zip(c.iter().flatten()))
-            .map(|(a, b)| ((a - b) / b).abs())
-            .fold(0.0, f64::max)
+        worst_of((g.iter().flatten().zip(c.iter().flatten())).map(|(a, b)| ((a - b) / b).abs()))
     };
     let scale = worst(&g.scale, &c.scale);
     let background = worst(&g.background, &c.background);
     assert_eq!(g.position.is_some(), c.position.is_some());
-    let position = (g.position.iter().flatten().zip(c.position.iter().flatten()))
-        .flat_map(|(a, b)| [(a[0] - b[0]).abs(), (a[1] - b[1]).abs()])
-        .fold(0.0, f64::max);
+    let position = worst_of(
+        (g.position.iter().flatten().zip(c.position.iter().flatten()))
+            .flat_map(|(a, b)| [(a[0] - b[0]).abs(), (a[1] - b[1]).abs()]),
+    );
     println!(
         "{cycles:?}: llk {:.2e} object {:.2e} probe {:.2e} scale {scale:.2e} \
          background {background:.2e} position {position:.2e}",
@@ -1046,9 +1049,10 @@ fn scale_matches_cpu() {
     // Measured 2.2e-2, 9.3e-2 and 2.7e-2 from 0.67 at the start.
     for (cycles, flux_tol) in feature_cycles(1).into_iter().zip([0.05, 0.15, 0.05]) {
         let (cpu, plain) = features_match_cpu(cycles, &start, &ones, NCYCLE);
-        let off_flux = (cpu.features().scale.as_ref().unwrap().iter().enumerate())
-            .map(|(f, s)| (s * mean / flux(f) - 1.0).abs())
-            .fold(0.0, f64::max);
+        let off_flux = worst_of(
+            (cpu.features().scale.as_ref().unwrap().iter().enumerate())
+                .map(|(f, s)| (s * mean / flux(f) - 1.0).abs()),
+        );
         println!(
             "scale {cycles:?}: off flux {off_flux:.2e}; last llk {:.4e}, {:.4e} without",
             last_llk(&cpu),
@@ -1459,11 +1463,12 @@ fn bh_position_matches_cpu() {
                     (g.bottom, w.bottom),
                 ] {
                     // a CPU 0 (β in steepest descent) must be an exact GPU 0
-                    step = step.max(if b == 0.0 {
+                    let e = if b == 0.0 {
                         a.abs()
                     } else {
                         (a - b).abs() / b.abs()
-                    });
+                    };
+                    step = worst_of([step, e]);
                 }
             }
             let errs = [
@@ -1472,9 +1477,9 @@ fn bh_position_matches_cpu() {
                 rel_l2(&gpu.probe().unwrap(), &p),
             ];
             let g = gpu.features().unwrap().position.unwrap();
-            let position = (g.iter().zip(&d))
-                .flat_map(|(a, b)| [(a[0] - b[0]).abs(), (a[1] - b[1]).abs()])
-                .fold(0.0, f64::max);
+            let position = worst_of(
+                (g.iter().zip(&d)).flat_map(|(a, b)| [(a[0] - b[0]).abs(), (a[1] - b[1]).abs()]),
+            );
             println!(
                 "bh position batch {batch_size} graph {graph}: llk {:.2e} object {:.2e} \
                  probe {:.2e} step {step:.2e} position {position:.2e}",
