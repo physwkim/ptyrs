@@ -694,7 +694,9 @@ impl GpuPtycho {
     }
 
     /// Models and refines `features` from here on, as [`crate::engine::Ptycho::set_features`], in
-    /// `f32` on the device; with [`GpuOptions::fused`] only. An error leaves the current ones.
+    /// `f32` on the device; with [`GpuOptions::fused`] only. Rejected features leave the
+    /// current ones; after a device error, the new ones may stay modelled, with the LLK pass
+    /// run without its graph, or be partly written.
     pub fn set_features(&mut self, features: &Features) -> Result<(), EngineError> {
         let dims = self.dev.dims();
         let [ny, nx] = dims.frame.map(|n| n as usize);

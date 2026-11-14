@@ -1702,7 +1702,9 @@ impl Device {
     /// LLK pass's. Only the fused passes model features; a position that moves the probe
     /// ([`Sampling::Patch`]) also takes their scratch of a shift, which they drop again with
     /// it, and so recuts the stacks that stream that scratch and drops DM's or RAAR's
-    /// carried stacks, cut against it.
+    /// carried stacks, cut against it. Nothing changes if a buffer cannot be built; if the
+    /// recapture fails, `features` stay modelled and [`Self::llk_pass`] runs eagerly until a
+    /// later recapture; a failed write in place may leave the values before it written.
     pub fn set_features(&mut self, features: &Features) -> Result<(), EngineError> {
         if matches!(self.shared.passes, Passes::M1 { .. }) && *features != Features::default() {
             return Err(EngineError::Invalid(
@@ -1844,7 +1846,8 @@ impl Device {
     /// algorithm rebuilds under it, and, while a position is modelled, replaces what its
     /// offsets move, with the shared passes as [`Self::set_features`] does, and every run,
     /// whose graphs bind them; then it recaptures the LLK pass's graph. Nothing changes if a
-    /// buffer cannot be built.
+    /// buffer cannot be built; if the recapture fails, `sampling` stays entered with all of
+    /// the above, and [`Self::llk_pass`] runs eagerly until a later recapture.
     pub fn set_sampling(&mut self, sampling: Sampling) -> Result<(), EngineError> {
         if sampling == self.sampling {
             return Ok(());
