@@ -390,6 +390,9 @@ pub(crate) mod standin {
 }
 
 #[cfg(test)]
+mod wired;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::live::object::LiveObject;
