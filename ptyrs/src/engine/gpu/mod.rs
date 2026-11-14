@@ -28,6 +28,7 @@ mod device;
 mod dm;
 mod lsqml;
 mod ml;
+mod propagate;
 mod raar;
 mod rpie;
 
