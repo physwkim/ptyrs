@@ -35,6 +35,7 @@ use super::{
     to_c32, to_u32, wave_bytes,
 };
 use crate::engine::features::{POSITION_LIMIT, POSITION_STEP};
+use crate::engine::ptycho::Algorithm;
 use crate::engine::{
     ApParams, BhParams, BhStep, DmParams, EngineError, Features, LsqmlParams, LsqmlStep, MlParams,
     PlaneStage, RaarParams, RpieParams, Sampling,
@@ -1878,6 +1879,20 @@ impl Device {
         Ok(())
     }
 
+    /// Fails while `algorithm`'s cycle cannot model the position as it is sampled, whether
+    /// its run is built or reused: every algorithm's passes move the probe alone yet.
+    fn cycle_runs(&self, algorithm: Algorithm) -> Result<(), EngineError> {
+        match algorithm {
+            Algorithm::Ap
+            | Algorithm::Dm
+            | Algorithm::Raar
+            | Algorithm::Rpie
+            | Algorithm::Ml
+            | Algorithm::Bh
+            | Algorithm::Lsqml => self.patch_only(&format!("{algorithm:?}")),
+        }
+    }
+
     /// Fails for `what`, whose passes model a position by moving the probe alone, while a
     /// position is modelled under [`Sampling::FullObject`].
     fn patch_only(&self, what: &str) -> Result<(), EngineError> {
@@ -2105,6 +2120,7 @@ impl Device {
         cycle: usize,
         stage: impl FnOnce(&mut Self) -> Result<(), EngineError>,
     ) -> Result<(), EngineError> {
+        self.cycle_runs(epoch.algorithm())?;
         let mut runs = std::mem::take(&mut self.runs);
         runs.retain(|r| r.cycle.epoch().run() == epoch.run());
         if self.carried.as_ref().is_some_and(|c| !c.serves(epoch)) {
@@ -2169,7 +2185,6 @@ impl Device {
         if !matches!(epoch, Epoch::Lsqml { .. }) {
             self.one_slice(&what)?;
         }
-        self.patch_only(&what)?;
         let mut cycle = match epoch {
             Epoch::Ap { params, llk } => Cycle::Ap { params, llk },
             Epoch::Dm { params, first } => {

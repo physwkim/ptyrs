@@ -389,9 +389,10 @@ fn sampling_round_trip_rebuilds_the_same_run() {
 }
 
 /// While a position samples the object, which no GPU pass models yet, every algorithm, the
-/// LLK and ML's gradients fail and change nothing: back under `Sampling::Patch` the same
-/// calls give the records, arrays, gradients and offsets of a run never switched, bit for
-/// bit.
+/// LLK and ML's gradients fail and change nothing, after a call of each, which built its run:
+/// switched to `Sampling::FullObject` after calls under `Patch` with the position, or the
+/// position set after calls under `FullObject` without one. Back under `Patch` the same calls
+/// give the records, arrays, gradients and offsets of a run never switched, bit for bit.
 #[test]
 fn full_object_position_fails_every_pass_until_patch() {
     let c = &cases()[0];
@@ -428,17 +429,31 @@ fn full_object_position_fails_every_pass_until_patch() {
             Ok(parts.flat_map(|z| [z.re, z.im]).collect())
         }),
     ];
-    let run = |switched: bool| {
+    let run = |full_object_first: bool, switched: bool| {
         let mut gpu = c.gpu(true);
-        gpu.set_features(&moved).unwrap();
+        let sampling = match switched {
+            true => Sampling::FullObject,
+            false => Sampling::Patch,
+        };
+        match full_object_first {
+            true => gpu.set_sampling(sampling).unwrap(),
+            false => gpu.set_features(&moved).unwrap(),
+        }
+        for (what, call) in calls {
+            call(&mut gpu).unwrap_or_else(|e| panic!("{what} before: {e}"));
+        }
+        match full_object_first {
+            true => gpu.set_features(&moved).unwrap(),
+            false => gpu.set_sampling(sampling).unwrap(),
+        }
         if switched {
             let start = (gpu.object().unwrap(), gpu.probe().unwrap());
-            gpu.set_sampling(Sampling::FullObject).unwrap();
+            let records = gpu.history().len();
             for (what, call) in calls {
                 let e = call(&mut gpu).unwrap_err().to_string();
                 assert!(e.contains("Sampling::FullObject"), "{what}: {e}");
             }
-            assert!(gpu.history().is_empty(), "records");
+            assert_eq!(gpu.history().len(), records, "records");
             assert_eq!(gpu.object().unwrap().as_slice(), start.0.as_slice());
             assert_eq!(gpu.probe().unwrap().as_slice(), start.1.as_slice());
             gpu.set_sampling(Sampling::Patch).unwrap();
@@ -451,12 +466,16 @@ fn full_object_position_fails_every_pass_until_patch() {
         let arrays = (gpu.object().unwrap(), gpu.probe().unwrap());
         (values, records, arrays, gpu.features().unwrap().position)
     };
-    let (kept, switched) = (run(false), run(true));
-    for ((what, _), (s, k)) in calls.iter().zip(switched.0.iter().zip(&kept.0)) {
-        assert_eq!(s, k, "{what}");
+    for full_object_first in [false, true] {
+        let first = ["Patch", "FullObject"][usize::from(full_object_first)];
+        let (kept, switched) = (run(full_object_first, false), run(full_object_first, true));
+        for ((what, _), (s, k)) in calls.iter().zip(switched.0.iter().zip(&kept.0)) {
+            assert_eq!(s, k, "{first} first: {what}");
+        }
+        assert_eq!(switched.1, kept.1, "{first} first: records");
+        let (s, k) = (&switched.2, &kept.2);
+        assert_eq!(s.0.as_slice(), k.0.as_slice(), "{first} first: object");
+        assert_eq!(s.1.as_slice(), k.1.as_slice(), "{first} first: probe");
+        assert_eq!(switched.3, kept.3, "{first} first: offsets");
     }
-    assert_eq!(switched.1, kept.1, "records");
-    assert_eq!(switched.2.0.as_slice(), kept.2.0.as_slice(), "object");
-    assert_eq!(switched.2.1.as_slice(), kept.2.1.as_slice(), "probe");
-    assert_eq!(switched.3, kept.3, "offsets");
 }
