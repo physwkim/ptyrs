@@ -31,7 +31,8 @@ pub struct Case {
     pub scan: Scan,
     pub addr: AddrTable,
     pub obs: Observed,
-    pub optics: Optics,
+    /// From the object to the detector, in metres.
+    distance: f64,
     pub object: Object,
     pub probe: Probe,
 }
@@ -45,11 +46,16 @@ pub fn propagated(addr: &AddrTable, optics: &Optics, object: &Object, probe: &Pr
     psi
 }
 
+fn free_space(distance: f64) -> Optics {
+    let frame = FUSED_SIDES[0] as usize;
+    let field = Wavefield::new([frame, frame], WAVELENGTH, [PIXEL, PIXEL], distance).unwrap();
+    Optics::free_space(&field)
+}
+
 pub fn case(name: &'static str, distance: f64) -> Case {
     let frame = FUSED_SIDES[0] as usize;
     let pixel = [PIXEL, PIXEL];
-    let optics =
-        Optics::free_space(&Wavefield::new([frame, frame], WAVELENGTH, pixel, distance).unwrap());
+    let optics = free_space(distance);
     let raw = ptyrs::base::sim::fermat(NPOS, frame as f64 / 8.0 * PIXEL);
     let positions = raw.pynx_preprocess(pixel);
     let shape = required_obj_shape(&positions, pixel, [frame, frame], 16);
@@ -99,7 +105,7 @@ pub fn case(name: &'static str, distance: f64) -> Case {
         addr,
         obs: Observed::from_counts(&counts),
         scan: Scan::new(geometry, raw, counts).unwrap(),
-        optics,
+        distance,
         object,
         probe,
     }
@@ -116,9 +122,13 @@ pub fn cases() -> [Case; 3] {
 }
 
 impl Case {
+    pub fn optics(&self) -> Optics {
+        free_space(self.distance)
+    }
+
     /// The normalised Poisson LLK of `object` and `probe` over every frame.
     pub fn llk(&self, object: &Object, probe: &Probe) -> f64 {
-        let psi = propagated(&self.addr, &self.optics, object, probe);
+        let psi = propagated(&self.addr, &self.optics(), object, probe);
         llk(&self.obs, 0..self.addr.nframe(), self.addr.nmode(), &psi)
             .normalised(self.obs.nb_obs())
             .poisson
@@ -128,7 +138,7 @@ impl Case {
         let ctx: Arc<CudaContext> = CudaContext::new(0).expect("CUDA device 0");
         let options = GpuOptions { graph, ..OPTIONS };
         let (object, probe) = (self.object.clone(), self.probe.clone());
-        GpuPtycho::with_optics(&ctx, &self.scan, &self.optics, object, probe, options).unwrap()
+        GpuPtycho::with_optics(&ctx, &self.scan, &self.optics(), object, probe, options).unwrap()
     }
 }
 
