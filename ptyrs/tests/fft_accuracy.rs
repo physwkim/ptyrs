@@ -6,6 +6,10 @@ use cuda_core::{Context, DeviceBuffer};
 use ptyrs::fft::{C32, Plan2d};
 use rustfft::{FftPlanner, num_complex::Complex64};
 
+#[path = "common/worst.rs"]
+mod worst;
+use worst::worst_of;
+
 const N: usize = 256;
 const BATCH: usize = 64;
 
@@ -44,7 +48,7 @@ fn errors(gpu: &[C32], reference: &[Complex64]) -> (f64, f64) {
     let (mut max_err, mut max_ref, mut se, mut sr) = (0f64, 0f64, 0f64, 0f64);
     for (g, r) in gpu.iter().zip(reference) {
         let d = Complex64::new(g.re as f64, g.im as f64) - r;
-        max_err = max_err.max(d.norm());
+        max_err = worst_of([max_err, d.norm()]);
         max_ref = max_ref.max(r.norm());
         se += d.norm_sqr();
         sr += r.norm_sqr();
@@ -89,11 +93,11 @@ fn inplace_matches_out_of_place_and_roundtrip_scales_by_n2() {
     plan.inverse_inplace(&ex, &mut buf).unwrap();
     let back = buf.to_host_vec(&stream).unwrap();
     let s = (N * N) as f32;
-    let max = host
-        .iter()
-        .zip(&back)
-        .map(|(a, b)| ((b.re / s - a.re).powi(2) + (b.im / s - a.im).powi(2)).sqrt())
-        .fold(0f32, f32::max);
+    let max = worst_of(
+        (host.iter().zip(&back))
+            .map(|(a, b)| ((b.re / s - a.re).powi(2) + (b.im / s - a.im).powi(2)).sqrt())
+            .map(f64::from),
+    ) as f32;
     println!("roundtrip max abs err {max:e}");
     assert!(max < 1e-5);
 }

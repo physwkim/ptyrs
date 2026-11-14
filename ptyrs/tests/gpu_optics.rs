@@ -13,6 +13,10 @@ use ptyrs::base::C64;
 use ptyrs::engine::{PlaneStage, Propagator, Wavefield, shift};
 use ptyrs::gpu::{C32, ExitStage, Kernels, OpticsKernels, StackTable, ViewDims};
 
+#[path = "common/worst.rs"]
+mod worst;
+use worst::worst_of;
+
 const NMODE: usize = 2;
 /// Planes of the longest stack.
 const NPLANE: usize = 3 * NMODE;
@@ -93,11 +97,7 @@ fn down(stream: &CudaStream, b: &DeviceBuffer<C32>) -> Vec<C64> {
 /// `max |a − b| / max |b|`.
 fn max_rel(a: &[C64], b: &[C64]) -> f64 {
     assert_eq!(a.len(), b.len());
-    let d = a
-        .iter()
-        .zip(b)
-        .map(|(a, b)| (a - b).norm())
-        .fold(0.0, f64::max);
+    let d = worst_of(a.iter().zip(b).map(|(a, b)| (a - b).norm()));
     d / b.iter().map(|b| b.norm()).fold(0.0, f64::max)
 }
 

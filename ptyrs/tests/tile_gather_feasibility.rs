@@ -11,6 +11,10 @@ use std::sync::Arc;
 use cutile::api;
 use cutile::prelude::*;
 
+#[path = "common/worst.rs"]
+mod worst;
+use worst::worst_of;
+
 #[cutile::module]
 mod feasibility {
     use cutile::core::*;
@@ -302,11 +306,7 @@ fn tile_owned_gather_over_variable_view_lists() {
         bits(&want),
         "Tile gather differs from the ordered f32 sum"
     );
-    let err = got
-        .iter()
-        .zip(&want64)
-        .map(|(&g, &w)| (g as f64 - w).abs())
-        .fold(0.0f64, f64::max);
+    let err = worst_of(got.iter().zip(&want64).map(|(&g, &w)| (g as f64 - w).abs()));
     println!("tile_gather_sum: max |Tile - f64| {err:.2e}");
     assert!(err < 1e-4);
     assert_eq!(bits(&run()), bits(&got), "run to run");

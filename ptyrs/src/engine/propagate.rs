@@ -569,6 +569,7 @@ fn mul_planes(planes: &mut [C64], d: &[C64], conj: bool) {
 mod tests {
     use super::*;
     use crate::engine::linop::{Propagation, dot_error};
+    use crate::worst::worst_of;
 
     fn wavefield(pixel: [f64; 2], distance: f64) -> Wavefield {
         Wavefield::new([12, 16], 1e-10, pixel, distance).unwrap()
@@ -627,11 +628,7 @@ mod tests {
                 continue;
             }
             assert!((power(&y) / power(&x) - 1.0).abs() < 1e-14);
-            let d = back
-                .iter()
-                .zip(&x)
-                .map(|(u, v)| (u - v).norm())
-                .fold(0.0, f64::max);
+            let d = worst_of(back.iter().zip(&x).map(|(u, v)| (u - v).norm()));
             assert!(d < 1e-14, "adjoint does not invert: {d:.3e}");
         }
     }
@@ -704,7 +701,7 @@ mod tests {
                 move_planes(&mut moved, quad, OFFSET, &fft);
                 let model = intensity(&moved, [0.0; 2]);
                 let d = model.iter().zip(&truth).map(|(a, b)| (a - b).abs());
-                d.fold(0.0, f64::max) / truth.iter().copied().fold(0.0, f64::max)
+                worst_of(d) / truth.iter().copied().fold(0.0, f64::max)
             };
             let (with, without) = (err(optics.slice_quad(0)), err(None));
             assert!(with < 1e-6, "distance {distance}: {with:.3e}");

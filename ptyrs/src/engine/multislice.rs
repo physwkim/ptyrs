@@ -338,6 +338,7 @@ mod tests {
     use super::*;
     use crate::engine::linop::{dot_error, noise};
     use crate::engine::{SliceJacobian, Wavefield, register};
+    use crate::worst::worst_of;
 
     const NSLICE: usize = 3;
 
@@ -419,12 +420,12 @@ mod tests {
             let tangent = SliceWaves::new(optics, addr.views(), &objects, &probe, offsets)
                 .tangent(&d_obj, &d_probe);
             let scale = tangent.iter().map(|t| t.norm()).fold(0.0, f64::max);
-            let err = plus
-                .iter()
-                .zip(&minus)
-                .zip(&tangent)
-                .map(|((p, m), t)| ((p - m) / (2.0 * h) - t).norm())
-                .fold(0.0, f64::max);
+            let err = worst_of(
+                plus.iter()
+                    .zip(&minus)
+                    .zip(&tangent)
+                    .map(|((p, m), t)| ((p - m) / (2.0 * h) - t).norm()),
+            );
             assert!(err / scale < 1e-8, "tangent error {:.3e}", err / scale);
         }
     }
@@ -573,7 +574,7 @@ mod tests {
             let err = |offsets: Option<&[[f64; 2]]>| {
                 let model = intensity(&window, &moved, offsets);
                 let d = model.iter().zip(&truth).map(|(a, b)| (a - b).abs());
-                d.fold(0.0, f64::max) / truth.iter().copied().fold(0.0, f64::max)
+                worst_of(d) / truth.iter().copied().fold(0.0, f64::max)
             };
             let (with, without) = (err(Some(&[OFFSET])), err(None));
             assert!(with < 1e-6, "{name}: {with:.3e}");

@@ -12,6 +12,10 @@ use ptyrs::base::Geometry;
 use ptyrs::gpu::{C32, Kernels, StackTable, UpdateSums, ViewAddr, ViewDims, Views};
 use ptyrs::tile::TileKernels;
 
+#[path = "common/worst.rs"]
+mod worst;
+use worst::worst_of;
+
 const N: usize = 512;
 
 fn up<T: DeviceCopy>(stream: &CudaStream, host: &[T]) -> DeviceBuffer<T> {
@@ -33,10 +37,10 @@ fn check(what: &str, quad: f32, tile: &[(f32, f32)], simt: &[(f32, f32)]) {
         let (dy, dx) = ((i / N) as f64 - 256.0, (i % N) as f64 - 256.0);
         let a = quad as f64 * (dy * dy + dx * dx);
         let want = (a.cos(), -a.sin());
-        let d = (t.0 - s.0).abs().max((t.1 - s.1).abs()) as f64;
+        let d = worst_of([(t.0 - s.0).abs() as f64, (t.1 - s.1).abs() as f64]);
         assert!(d <= 4.0 * eps, "{what} pixel {i}: Tile {t:?}, SIMT {s:?}");
         for (who, g) in [("Tile", t), ("SIMT", s)] {
-            let e = (g.0 as f64 - want.0).abs().max((g.1 as f64 - want.1).abs());
+            let e = worst_of([(g.0 as f64 - want.0).abs(), (g.1 as f64 - want.1).abs()]);
             let bound = 2.0 * eps * a + 4.0 * eps;
             assert!(e <= bound, "{what} {who} pixel {i}: {g:?}, want {want:?}");
             vs_f64 = vs_f64.max(e);

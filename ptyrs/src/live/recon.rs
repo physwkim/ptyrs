@@ -383,6 +383,7 @@ mod tests {
     use super::*;
     use crate::live::farfield::{Ptycho, PtychoSpec, ScanPath};
     use crate::live::graph::WarmUp;
+    use crate::worst::worst_of;
 
     const FILL: [f32; 2] = [1.0, 0.0];
 
@@ -565,7 +566,7 @@ mod tests {
                 for y in 0..cy {
                     for x in 0..cx {
                         let (a, b) = (got[y * lx + x], want[y * obj[1] + x]);
-                        worst = worst.max((a - b).norm() / b.norm().max(1e-3));
+                        worst = worst_of([worst, (a - b).norm() / b.norm().max(1e-3)]);
                     }
                 }
                 assert_eq!(worst, 0.0, "after {} epochs of {stacks}", live.epochs());
