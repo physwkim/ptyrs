@@ -11,6 +11,8 @@ not (package(ptyrs) & (
   | test(=dist::live::tests::every_gpu_copies_from_the_ring_in_place)
   | test(=dist::live::tests::gpus_exchange_the_halo_as_it_grows)
   | test(=dist::live::tests::the_uploader_fills_each_store_in_the_order_the_plan_numbers_its_frames)
+  | test(=dist::live_ap::tests::fills_on_2_gpus_give_the_one_gpu_object)
+  | test(=dist::live_ap::tests::fills_on_4_gpus_give_the_one_gpu_object)
   | test(=dist::live_ap::tests::gpus_iterate_a_live_scan_as_one_gpu)
   | test(=dist::p2p::tests::bench_times_every_ordered_pair_and_checks_the_data)
   | test(=dist::synth::synthetic_accumulation_is_bit_identical_on_1_2_and_4_gpus)
