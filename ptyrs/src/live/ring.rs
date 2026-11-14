@@ -18,8 +18,10 @@
 //!
 //! On the device every landed frame has its own place in a [`DeviceStore`],
 //! the next one in landing order, so an uploaded frame is never overwritten
-//! (invariant 3) and its address is fixed and backed before the first frame
-//! (invariant 9).
+//! (invariant 3) and its address is fixed before the first frame and backed
+//! before its copy is queued (invariant 9). The uploader never backs a
+//! place: a store that grows has a mapper thread for that, and a batch
+//! whose places are not backed yet stays in the ring until they are.
 //!
 //! A scan cut over GPUs has one store per region. A [`Route`] says from a
 //! frame's position which regions it lands on, and the uploader copies it
@@ -30,15 +32,16 @@
 use std::collections::VecDeque;
 use std::num::NonZeroUsize;
 use std::ops::Range;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use crossbeam_channel::Sender;
 use cuda_bindings::CUdeviceptr;
 use cuda_core::{Context, DeviceBuffer, DriverError, Event, IntoResult, PinnedHostBuffer, Stream};
 
-use crate::live::grow::{GrowBuf, GrowError};
+use crate::live::grow::{Backer, GrowBuf, GrowError};
 use crate::live::pos::{Entry, PosTable};
 use crate::live::stats::{Histogram, thread_cpu_ns, wall_ns};
 
@@ -192,12 +195,94 @@ impl Drop for Ring {
     }
 }
 
+/// How far a store's frames are backed: the one value its mapper writes
+/// and the uploader reads.
+#[derive(Clone, Copy)]
+enum Mapped {
+    /// Places below this are backed.
+    Upto(u64),
+    /// The driver refused a chunk; no further place will be backed.
+    Failed(DriverError),
+}
+
+struct Edge {
+    mapped: Mapped,
+    /// Places the uploader has asked for, written by [`DeviceStore::want`].
+    wanted: u64,
+    /// The store is going: the mapper returns.
+    closed: bool,
+    /// The mapper backs nothing while set.
+    #[cfg(test)]
+    hold: bool,
+    /// What the mapper's next chunk fails with.
+    #[cfg(test)]
+    fail: Option<DriverError>,
+}
+
+struct Shared {
+    /// Never held across a driver call.
+    edge: Mutex<Edge>,
+    /// `wanted`, `closed` or a test hold changed.
+    moved: Condvar,
+}
+
+/// The mapper of a growing store, the only caller of the driver's
+/// allocation for it once the store is made: keeps `lead` places backed
+/// past the uploader's need, one chunk a time, until the last place is
+/// backed, a chunk fails or the store closes.
+fn map_ahead(
+    backer: &Backer,
+    sh: &Shared,
+    mut bytes: usize,
+    chunk: usize,
+    places: impl Fn(usize) -> u64,
+    lead: u64,
+    max_frames: u64,
+) {
+    loop {
+        {
+            let mut e = sh.edge.lock().unwrap();
+            loop {
+                let Mapped::Upto(n) = e.mapped else { return };
+                if e.closed || n >= max_frames {
+                    return;
+                }
+                #[cfg(test)]
+                let held = e.hold;
+                #[cfg(not(test))]
+                let held = false;
+                if !held && n < (e.wanted + lead).min(max_frames) {
+                    break;
+                }
+                e = sh.moved.wait(e).unwrap();
+            }
+            #[cfg(test)]
+            if let Some(err) = e.fail.take() {
+                e.mapped = Mapped::Failed(err);
+                return;
+            }
+        }
+        let mapped = match backer.back(bytes..bytes + chunk) {
+            Ok(()) => {
+                bytes += chunk;
+                Mapped::Upto(places(bytes))
+            }
+            Err(GrowError::Driver(e)) => Mapped::Failed(e),
+            Err(e) => unreachable!("chunk at byte {bytes} of the frame store: {e}"),
+        };
+        sh.edge.lock().unwrap().mapped = mapped;
+    }
+}
+
 /// Device side of the input: the frame at place `f` at `frames_ptr() + f *
 /// frame bytes`, its `(x, y)` as two f64 at `positions_ptr() + f * 16`, for
-/// `f < max_frames`. Backed whole when made, before the first frame: the
-/// driver's physical allocation now and then blocks its caller for over
-/// 100 ms (cuMemCreate, about once per 900 MiB handed out on GPU0), and on
-/// the uploader that held up every frame behind it.
+/// `f < max_frames`. The addresses are reserved whole when the store is
+/// made. [`Self::new`] also backs them whole, [`Self::growing`] the planned
+/// places and a lead, and a mapper thread backs the rest ahead of the
+/// frames: the driver's physical allocation now and then blocks its caller
+/// for over 100 ms (cuMemCreate, about once per 900 MiB handed out on
+/// GPU0), and on the uploader that held up every frame behind it. The
+/// positions, 16 bytes a frame, are backed whole either way.
 ///
 /// Shared through an `Arc`: whoever holds a pointer into the store holds
 /// the store, and its drop waits for queued work ([`GrowBuf`]), so no
@@ -207,25 +292,81 @@ pub struct DeviceStore {
     positions: GrowBuf,
     frame_elems: usize,
     max_frames: u64,
+    /// Places the mapper keeps backed past the uploader's need.
+    lead: u64,
+    shared: Arc<Shared>,
+    /// None once every place is backed when the store is made.
+    mapper: Option<JoinHandle<()>>,
     ctx: Arc<Context>,
 }
 
 impl DeviceStore {
+    /// A store backed whole before the first frame.
     pub fn new(
         ctx: &Arc<Context>,
         max_frames: usize,
         frame_elems: usize,
     ) -> Result<Self, GrowError> {
-        let backed = |bytes: usize| -> Result<GrowBuf, GrowError> {
-            let mut b = GrowBuf::new(ctx, bytes, bytes)?;
-            b.map(0..b.capacity())?;
-            Ok(b)
+        Self::growing(ctx, max_frames, frame_elems, max_frames, 0)
+    }
+
+    /// A store with `planned + lead` places backed before the first frame
+    /// (all of them if that reaches `max_frames`), the rest by its mapper
+    /// as the frames come: whenever fewer than `lead` places are backed
+    /// past the last one the uploader asked for. A scan that stays within
+    /// `planned` frames maps nothing while it runs.
+    pub fn growing(
+        ctx: &Arc<Context>,
+        max_frames: usize,
+        frame_elems: usize,
+        planned: usize,
+        lead: usize,
+    ) -> Result<Self, GrowError> {
+        let fb = frame_elems * 2;
+        let first = (planned + lead).min(max_frames);
+        let chunk = if first == max_frames {
+            max_frames * fb
+        } else {
+            lead.max(1) * fb
         };
+        let frames = GrowBuf::new(ctx, max_frames * fb, chunk)?;
+        let chunk = frames.chunk_bytes();
+        let backer = frames.backer();
+        let bytes = (first * fb).div_ceil(chunk).max(1) * chunk;
+        backer.back(0..bytes)?;
+        let positions = GrowBuf::new(ctx, max_frames * 16, max_frames * 16)?;
+        positions.backer().back(0..positions.capacity())?;
+        let max = max_frames as u64;
+        let places = move |bytes: usize| ((bytes / fb.max(1)) as u64).min(max);
+        let edge = places(bytes);
+        let shared = Arc::new(Shared {
+            edge: Mutex::new(Edge {
+                mapped: Mapped::Upto(edge),
+                wanted: 0,
+                closed: false,
+                #[cfg(test)]
+                hold: false,
+                #[cfg(test)]
+                fail: None,
+            }),
+            moved: Condvar::new(),
+        });
+        let lead = lead as u64;
+        let mapper = (edge < max).then(|| {
+            let sh = shared.clone();
+            std::thread::Builder::new()
+                .name("store-map".into())
+                .spawn(move || map_ahead(&backer, &sh, bytes, chunk, places, lead, max))
+                .expect("spawning the store's mapper")
+        });
         Ok(Self {
-            frames: backed(max_frames * frame_elems * 2)?,
-            positions: backed(max_frames * 16)?,
+            frames,
+            positions,
             frame_elems,
-            max_frames: max_frames as u64,
+            max_frames: max,
+            lead,
+            shared,
+            mapper,
             ctx: ctx.clone(),
         })
     }
@@ -268,19 +409,44 @@ impl DeviceStore {
         self.frames.mapped_bytes() + self.positions.mapped_bytes()
     }
 
-    /// Where the frames at places `places` and their positions go.
-    fn dst(&self, places: Range<u64>) -> Result<(CUdeviceptr, CUdeviceptr), GrowError> {
+    /// Whether places `..end` are backed, telling the mapper they are
+    /// needed if not. Never a driver call. Fails once the mapper has, and
+    /// for a place the store does not have.
+    fn want(&self, end: u64) -> Result<bool, GrowError> {
         let fb = (self.frame_elems * 2) as u64;
-        if places.end > self.max_frames {
+        if end > self.max_frames {
             return Err(GrowError::Capacity {
-                end: (places.end * fb) as usize,
+                end: (end * fb) as usize,
                 capacity: (self.max_frames * fb) as usize,
             });
         }
-        Ok((
-            self.frames_ptr() + places.start * fb,
-            self.positions_ptr() + places.start * 16,
-        ))
+        let mut e = self.shared.edge.lock().unwrap();
+        match e.mapped {
+            Mapped::Failed(err) => Err(GrowError::Driver(err)),
+            Mapped::Upto(n) => {
+                if end > e.wanted {
+                    e.wanted = end;
+                    if n < (end + self.lead).min(self.max_frames) {
+                        self.shared.moved.notify_one();
+                    }
+                }
+                Ok(n >= end)
+            }
+        }
+    }
+
+    /// Whether places `..end` are backed.
+    fn backed(&self, end: u64) -> bool {
+        matches!(self.shared.edge.lock().unwrap().mapped, Mapped::Upto(n) if n >= end)
+    }
+
+    /// Where the frames from place `place` on and their positions go.
+    fn dst(&self, place: u64) -> (CUdeviceptr, CUdeviceptr) {
+        let fb = (self.frame_elems * 2) as u64;
+        (
+            self.frames_ptr() + place * fb,
+            self.positions_ptr() + place * 16,
+        )
     }
 
     /// Synchronous copy of the frames at places `places` to `out`, for checks.
@@ -288,10 +454,9 @@ impl DeviceStore {
         let n = (places.end - places.start) as usize * self.frame_elems;
         assert_eq!(out.len(), n);
         let fb = (self.frame_elems * 2) as u64;
-        let range = (places.start * fb) as usize..(places.end * fb) as usize;
-        assert!(self.frames.is_ready(range));
+        assert!(self.backed(places.end));
         self.ctx.bind_to_thread()?;
-        // SAFETY: the source range is mapped (checked above; mappings are only
+        // SAFETY: the source range is backed (checked above; mappings are only
         // added while the store lives) and `out` holds its element count.
         unsafe {
             cuda_bindings::cuMemcpyDtoH_v2(
@@ -306,7 +471,7 @@ impl DeviceStore {
     /// Synchronous copy of the positions at places `0..n`, for checks.
     pub fn read_positions(&self, n: u64) -> Result<Vec<f64>, DriverError> {
         let mut v = vec![0f64; 2 * n as usize];
-        assert!(self.positions.is_ready(0..16 * n as usize));
+        assert!(n <= self.max_frames);
         self.ctx.bind_to_thread()?;
         // SAFETY: as in `read_frames`.
         unsafe {
@@ -314,6 +479,42 @@ impl DeviceStore {
         }
         .result()?;
         Ok(v)
+    }
+}
+
+#[cfg(test)]
+impl DeviceStore {
+    /// Places backed.
+    fn edge(&self) -> u64 {
+        match self.shared.edge.lock().unwrap().mapped {
+            Mapped::Upto(n) => n,
+            Mapped::Failed(e) => panic!("{e}"),
+        }
+    }
+
+    fn wanted(&self) -> u64 {
+        self.shared.edge.lock().unwrap().wanted
+    }
+
+    /// Stops the mapper before its next chunk, or lets it go on.
+    fn hold(&self, hold: bool) {
+        self.shared.edge.lock().unwrap().hold = hold;
+        self.shared.moved.notify_one();
+    }
+
+    /// The mapper's next chunk fails with `e`.
+    fn fail_next(&self, e: DriverError) {
+        self.shared.edge.lock().unwrap().fail = Some(e);
+    }
+}
+
+impl Drop for DeviceStore {
+    fn drop(&mut self) {
+        if let Some(mapper) = self.mapper.take() {
+            self.shared.edge.lock().unwrap().closed = true;
+            self.shared.moved.notify_one();
+            let _ = mapper.join();
+        }
     }
 }
 
@@ -362,6 +563,9 @@ pub struct UploadReport {
     /// Frame arrival → position arrival, for the rest that landed.
     pub pos_after_frame: Histogram,
     pub batches: u64,
+    /// Batches that stayed in the ring because a store's mapper had not
+    /// backed their places yet.
+    pub store_waits: u64,
     pub bytes: u64,
     pub max_inflight: usize,
     /// Monitor callback → H2D completion seen by the uploader, on the last
@@ -563,6 +767,7 @@ fn upload(
         pos_first: 0,
         pos_after_frame: Histogram::new(1_000_000),
         batches: 0,
+        store_waits: 0,
         bytes: 0,
         max_inflight: 0,
         rx_to_gpu: Histogram::new(200_000),
@@ -585,6 +790,8 @@ fn upload(
     let mut routes = vec![0u32; slots];
     // The frame last counted in `pos_waits`.
     let mut waiting = None;
+    // The batch last counted in `store_waits`, by its first sequence number.
+    let mut held = None;
     // The region whose context is current.
     let mut bound = usize::MAX;
     loop {
@@ -666,6 +873,20 @@ fn upload(
             }
             let run = &routes[s0..s0 + n];
             let took = run.iter().fold(0, |a, r| a | r);
+            // No copy is queued before every region has the batch's places
+            // backed; each is asked, so that every mapper hears its need.
+            let mut backed = true;
+            for r in bits(took) {
+                let len = run.iter().filter(|&&m| m >> r & 1 == 1).count() as u64;
+                backed &= lanes[r].store.want(lanes[r].placed + len)?;
+            }
+            if !backed {
+                if held != Some(issued) {
+                    rep.store_waits += 1;
+                    held = Some(issued);
+                }
+                break;
+            }
             let ev = free.pop().expect("checked non-empty");
             for r in bits(took) {
                 bind(lanes, &mut bound, r)?;
@@ -679,12 +900,12 @@ fn upload(
                         continue;
                     }
                     let len = run[k..].iter().take_while(|&&m| m & bit != 0).count();
-                    let places = lane.placed..lane.placed + len as u64;
-                    let (frames_dst, positions_dst) = lane.store.dst(places)?;
+                    let (frames_dst, positions_dst) = lane.store.dst(lane.placed);
                     // SAFETY: slots `s0 + k..s0 + k + len` are committed and
                     // not yet released, so no worker writes them until the
                     // event below completes; `dst` gave their places in this
-                    // region's store, whose context is current.
+                    // region's store, backed (`want` above) and in the
+                    // current context.
                     unsafe {
                         cuda_core::memcpy_htod_async(
                             frames_dst,
@@ -1334,6 +1555,227 @@ mod tests {
         assert_eq!(rep.frames, 1);
         stores[1].read_frames(0..1, &mut dev).unwrap();
         assert!(dev.iter().enumerate().all(|(j, &v)| v == pixel(0, j)));
+    }
+
+    /// Elements of a 2 MiB frame: a chunk of a growing store with a lead of
+    /// one frame.
+    const BIG: usize = 1 << 20;
+
+    /// A store of `max` [`BIG`] frames with a lead of one, its mapper held
+    /// back if `hold`.
+    fn growing(ctx: &Arc<Context>, max: usize, planned: usize, hold: bool) -> Arc<DeviceStore> {
+        let store = DeviceStore::growing(ctx, max, BIG, planned, 1).unwrap();
+        assert_eq!(store.frames.chunk_bytes(), BIG * 2, "one frame a chunk");
+        assert_eq!(store.edge(), planned as u64 + 1);
+        store.hold(hold);
+        Arc::new(store)
+    }
+
+    fn batch_of(n: usize) -> UploaderConfig {
+        UploaderConfig {
+            batch: NonZeroUsize::new(n).unwrap(),
+            ..cfg()
+        }
+    }
+
+    /// Triggers `uids` with their positions, committed.
+    fn arrive(ring: &Ring, pos: &PosTable, uids: std::ops::Range<i32>) {
+        uids.clone().for_each(|uid| post(pos, uid));
+        commit(ring, uids);
+    }
+
+    /// A batch whose last place is the last one backed lands with the
+    /// mapper held back; the next one waits in the ring for the mapper and
+    /// lands, late and with the same bytes, once it is let go.
+    #[test]
+    fn a_batch_past_the_backed_edge_waits_for_the_mapper() {
+        let ctx = Context::new(0).expect("GPU 0");
+        let ring = Arc::new(Ring::new(&ctx, 8, BIG).unwrap());
+        let store = growing(&ctx, 8, 2, true);
+        let backed = store.mapped_bytes();
+        let pos = Arc::new(PosTable::new(64));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = crossbeam_channel::unbounded();
+        arrive(&ring, &pos, 0..3);
+        let up = uploader(&ring, &store, &pos, batch_of(3), &stop, Some(tx));
+        let released = || ring.released.load(Ordering::Acquire);
+        until("places 0..3 land", || released() == 3);
+        arrive(&ring, &pos, 3..4);
+        until("the uploader asks for place 3", || store.wanted() == 4);
+        // Time for a copy the uploader must not queue; too little only
+        // skips that.
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!((released(), store.edge()), (3, 3));
+        assert_eq!(store.mapped_bytes(), backed);
+        store.hold(false);
+        stop.store(true, Ordering::Release);
+        let rep = up.join().unwrap().unwrap();
+        assert_eq!((rep.frames, rep.store_waits), (4, 1));
+        check_landed(&ring, &store, &rep, rx, &[0, 1, 2, 3]);
+    }
+
+    /// A batch for two regions, one of them not backed that far: neither
+    /// gets a copy before both are, and both stores are asked.
+    #[test]
+    fn a_batch_waits_for_every_region_it_is_routed_to() {
+        let ctx = Context::new(0).expect("GPU 0");
+        let ring = Arc::new(Ring::new(&ctx, 4, BIG).unwrap());
+        let stores = vec![
+            Arc::new(DeviceStore::new(&ctx, 4, BIG).unwrap()),
+            growing(&ctx, 4, 0, true),
+        ];
+        let pos = Arc::new(PosTable::new(64));
+        let stop = Arc::new(AtomicBool::new(false));
+        let up = {
+            let (ring, stores, pos, stop) =
+                (ring.clone(), stores.clone(), pos.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let route = ByUid(2, |_| 0b11);
+                run_region_uploader(ring, stores, route, pos, cfg(), stop, None)
+            })
+        };
+        let released = || ring.released.load(Ordering::Acquire);
+        arrive(&ring, &pos, 0..1);
+        until("frame 0 lands", || released() == 1);
+        arrive(&ring, &pos, 1..2);
+        until("both stores are asked for place 1", || {
+            stores.iter().all(|s| s.wanted() == 2)
+        });
+        std::thread::sleep(Duration::from_millis(20));
+        let mut dev = vec![0u16; BIG];
+        stores[0].read_frames(1..2, &mut dev).unwrap();
+        assert!(
+            dev.iter().enumerate().any(|(j, &v)| v != pixel(1, j)),
+            "region 0 was sent the frame before region 1 had its place"
+        );
+        assert_eq!(released(), 1);
+        stores[1].hold(false);
+        stop.store(true, Ordering::Release);
+        let rep = up.join().unwrap().unwrap();
+        assert_eq!((rep.frames, rep.store_waits), (2, 1));
+        for store in &stores {
+            store.read_frames(1..2, &mut dev).unwrap();
+            assert!(dev.iter().enumerate().all(|(j, &v)| v == pixel(1, j)));
+        }
+    }
+
+    /// A batch of more frames than the lead: the uploader's need, not the
+    /// lead, is what the mapper backs up to.
+    #[test]
+    fn a_batch_larger_than_the_lead_lands() {
+        let ctx = Context::new(0).expect("GPU 0");
+        let ring = Arc::new(Ring::new(&ctx, 8, BIG).unwrap());
+        // No plan: one place backed.
+        let store = growing(&ctx, 8, 0, false);
+        let pos = Arc::new(PosTable::new(64));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = crossbeam_channel::unbounded();
+        arrive(&ring, &pos, 0..5);
+        let up = uploader(&ring, &store, &pos, batch_of(5), &stop, Some(tx));
+        stop.store(true, Ordering::Release);
+        let rep = up.join().unwrap().unwrap();
+        assert_eq!((rep.frames, rep.batches, rep.store_waits), (5, 1, 1));
+        until("the lead past place 4", || store.edge() == 6);
+        assert_eq!(store.frames.mapped_bytes(), 6 * BIG * 2);
+        check_landed(&ring, &store, &rep, rx, &[0, 1, 2, 3, 4]);
+    }
+
+    /// A scan that stays within its plan maps nothing while it runs; its
+    /// first frame past the plan has its place and gets the mapper to back
+    /// one more.
+    #[test]
+    fn a_growing_store_maps_only_past_its_plan() {
+        let ctx = Context::new(0).expect("GPU 0");
+        let ring = Arc::new(Ring::new(&ctx, 8, BIG).unwrap());
+        let store = growing(&ctx, 8, 5, false);
+        let backed = store.mapped_bytes();
+        let whole = DeviceStore::new(&ctx, 8, BIG).unwrap().mapped_bytes();
+        assert_eq!(whole - backed, 2 * BIG * 2);
+        let pos = Arc::new(PosTable::new(64));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = crossbeam_channel::unbounded();
+        arrive(&ring, &pos, 0..5);
+        let up = uploader(&ring, &store, &pos, batch_of(5), &stop, Some(tx));
+        until("the planned frames land", || {
+            ring.released.load(Ordering::Acquire) == 5
+        });
+        assert_eq!((store.wanted(), store.edge()), (5, 6));
+        assert_eq!(store.mapped_bytes(), backed);
+        arrive(&ring, &pos, 5..6);
+        until("the lead past place 5", || store.edge() == 7);
+        stop.store(true, Ordering::Release);
+        let rep = up.join().unwrap().unwrap();
+        assert_eq!((rep.frames, rep.store_waits), (6, 0));
+        assert_eq!(store.mapped_bytes(), backed + BIG * 2);
+        check_landed(&ring, &store, &rep, rx, &[0, 1, 2, 3, 4, 5]);
+    }
+
+    /// A growing store filled to its last place is the whole-backed one,
+    /// and its mapper is done.
+    #[test]
+    fn a_growing_store_takes_its_last_place() {
+        let ctx = Context::new(0).expect("GPU 0");
+        let ring = Arc::new(Ring::new(&ctx, 4, BIG).unwrap());
+        let store = growing(&ctx, 8, 0, false);
+        let pos = Arc::new(PosTable::new(64));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let up = uploader(&ring, &store, &pos, cfg(), &stop, Some(tx));
+        arrive(&ring, &pos, 0..8);
+        stop.store(true, Ordering::Release);
+        let rep = up.join().unwrap().unwrap();
+        assert_eq!(rep.frames, 8);
+        assert_eq!(store.edge(), 8);
+        until("the mapper returns", || {
+            store.mapper.as_ref().unwrap().is_finished()
+        });
+        let whole = DeviceStore::new(&ctx, 8, BIG).unwrap();
+        assert!(whole.mapper.is_none());
+        assert_eq!(
+            (whole.edge(), whole.mapped_bytes()),
+            (8, store.mapped_bytes())
+        );
+        check_landed(&ring, &store, &rep, rx, &[0, 1, 2, 3, 4, 5, 6, 7]);
+    }
+
+    /// A plan that reaches the last place leaves nothing to a mapper.
+    #[test]
+    fn a_store_planned_whole_has_no_mapper() {
+        let ctx = Context::new(0).expect("GPU 0");
+        let store = DeviceStore::growing(&ctx, 8, BIG, 7, 1).unwrap();
+        assert!(store.mapper.is_none());
+        assert_eq!(store.edge(), 8);
+    }
+
+    /// The driver refusing the mapper a chunk reaches the uploader as that
+    /// error, at the first batch that needs the chunk.
+    #[test]
+    fn a_chunk_the_driver_refuses_fails_the_uploader() {
+        let ctx = Context::new(0).expect("GPU 0");
+        let ring = Arc::new(Ring::new(&ctx, 8, BIG).unwrap());
+        let store = growing(&ctx, 8, 0, false);
+        let refused = DriverError(cuda_bindings::cudaError_enum_CUDA_ERROR_OUT_OF_MEMORY);
+        store.fail_next(refused);
+        let pos = Arc::new(PosTable::new(64));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let up = uploader(&ring, &store, &pos, cfg(), &stop, Some(tx));
+        // Place 0 is backed; place 1 is the mapper's.
+        arrive(&ring, &pos, 0..1);
+        until("place 0 lands", || {
+            ring.released.load(Ordering::Acquire) == 1
+        });
+        arrive(&ring, &pos, 1..2);
+        match up.join().unwrap() {
+            Err(GrowError::Driver(e)) => assert!(e == refused, "{e}"),
+            Err(e) => panic!("{e}"),
+            Ok(r) => panic!("stored {} frames", r.frames),
+        }
+        assert_eq!(rx.iter().map(|b| b.n).sum::<u64>(), 1);
+        assert_eq!(
+            store.mapped_bytes(),
+            BIG * 2 + store.positions.mapped_bytes()
+        );
     }
 
     #[test]
