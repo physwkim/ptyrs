@@ -251,10 +251,10 @@ pub fn zsqrt(x: f32) -> f32 {
 }
 
 /// FFT-order frequency of bin `k` of `n` in cycles per pixel, `fftfreq`: `k / n` below
-/// `n / 2`, else `(k - n) / n`.
+/// `ceil(n / 2)`, else `(k - n) / n`.
 #[device]
 pub fn freq(k: u32, n: u32) -> f32 {
-    let k = if k < n / 2 {
+    let k = if k < n.div_ceil(2) {
         k as f32
     } else {
         k as f32 - n as f32

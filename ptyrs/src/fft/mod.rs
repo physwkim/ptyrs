@@ -27,14 +27,14 @@ pub enum FftError {
     Driver(cuda_core::DriverError),
     /// A cuda-async error, e.g. a lease refused because another stream holds the buffer.
     Device(DeviceError),
-    /// Buffer holds fewer than `n*n*batch` elements.
+    /// Buffer holds fewer than the plan's `ny*nx*batch` elements.
     BufferTooSmall {
         need: usize,
         have: usize,
     },
     /// A buffer, the plan and the execution context do not all belong to one context.
     ContextMismatch,
-    /// `n` or `batch` is zero or does not fit a C int.
+    /// A side or `batch` is zero, or a plane or `batch` does not fit a C int.
     BadShape,
     /// [`sys::LIBRARY`] could not be opened or lacks a function the binding calls.
     Load(&'static str),
@@ -114,26 +114,39 @@ impl Drop for Handle {
     }
 }
 
-/// Batched `n`×`n` C2C plan, in place or out of place.
+/// Batched `ny`×`nx` C2C plan over row-major planes, in place or out of place.
 ///
 /// Transforms are unnormalized in both directions (cuFFT convention): a forward
-/// followed by an inverse scales the data by `n*n`. Each transform is enqueued on the
+/// followed by an inverse scales the data by `ny*nx`. Each transform is enqueued on the
 /// stream of the `ExecutionContext` it is given and leases its buffers and the plan's work
 /// area there, like a `crate::gpu` launch, so it is legal inside `CudaGraph::capture`: the
 /// work area is allocated with the plan and nothing allocates at execution.
 pub struct Plan2d {
     handle: Arc<Handle>,
     work: DeviceBuffer<u8>,
-    n: usize,
+    /// `[ny, nx]`.
+    shape: [usize; 2],
     batch: usize,
 }
 
 impl Plan2d {
-    /// Plans in `stream`'s context and allocates the work area there (synchronously).
+    /// [`Self::with_shape`] of `n`×`n` planes.
     pub fn new(stream: &Stream, n: usize, batch: usize) -> Result<Self, FftError> {
-        let (ni, bi) = match (i32::try_from(n), i32::try_from(batch)) {
-            (Ok(n), Ok(b)) if n > 0 && b > 0 => (n, b),
-            _ => return Err(FftError::BadShape),
+        Self::with_shape(stream, [n, n], batch)
+    }
+
+    /// Plans `batch` planes of `shape = [ny, nx]` in `stream`'s context and allocates the work
+    /// area there (synchronously).
+    pub fn with_shape(stream: &Stream, shape: [usize; 2], batch: usize) -> Result<Self, FftError> {
+        let int = |v: usize| i32::try_from(v).ok().filter(|&v| v > 0);
+        let plane = shape[0].checked_mul(shape[1]);
+        let (Some(nyi), Some(nxi), Some(dist), Some(bi)) = (
+            int(shape[0]),
+            int(shape[1]),
+            plane.and_then(int),
+            int(batch),
+        ) else {
+            return Err(FftError::BadShape);
         };
         let lib = sys::cufft().map_err(FftError::Load)?;
         // cuFFT runs on the runtime API, which uses the driver's current context; the primary
@@ -144,7 +157,7 @@ impl Plan2d {
         check(unsafe { (lib.create)(&mut raw) })?;
         let handle = Arc::new(Handle { raw, ctx, lib });
         check(unsafe { (lib.set_auto_allocation)(raw, 0) })?;
-        let mut dims = [ni, ni];
+        let mut dims = [nyi, nxi];
         let mut work_size = 0;
         check(unsafe {
             (lib.make_plan_many)(
@@ -153,10 +166,10 @@ impl Plan2d {
                 dims.as_mut_ptr(),
                 std::ptr::null_mut(),
                 1,
-                ni * ni,
+                dist,
                 std::ptr::null_mut(),
                 1,
-                ni * ni,
+                dist,
                 sys::CUFFT_C2C,
                 bi,
                 &mut work_size,
@@ -167,20 +180,21 @@ impl Plan2d {
         Ok(Self {
             handle,
             work,
-            n,
+            shape,
             batch,
         })
     }
 
-    pub fn n(&self) -> usize {
-        self.n
+    /// `[ny, nx]`.
+    pub fn shape(&self) -> [usize; 2] {
+        self.shape
     }
     pub fn batch(&self) -> usize {
         self.batch
     }
 
     fn check_len(&self, b: &DeviceBuffer<C32>) -> Result<(), FftError> {
-        let need = self.n * self.n * self.batch;
+        let need = self.shape[0] * self.shape[1] * self.batch;
         if b.len() < need {
             return Err(FftError::BufferTooSmall {
                 need,
