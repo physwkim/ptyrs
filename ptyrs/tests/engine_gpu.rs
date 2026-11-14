@@ -45,6 +45,7 @@ const M1: Setup = Setup {
         graph: true,
         llk_slots: 3,
         fused: false,
+        psi_f16: false,
     },
 };
 
