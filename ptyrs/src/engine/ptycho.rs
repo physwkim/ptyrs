@@ -4,17 +4,17 @@
 use std::f64::consts::PI;
 use std::ops::Range;
 
-use crate::base::{AddrTable, C64, Object, Probe, Scan, Stack};
+use crate::base::{AddrTable, C64, Object, Probe, Scan, Stack, View};
 
 use crate::engine::features::{
-    EPS_POSITION, Model, Shifted, batch_position_step, gradient_directions, gradient_sums,
-    move_planes, position_step,
+    EPS_POSITION, Model, Shifted, batch_position_step, derivative_sums, gradient_directions,
+    gradient_sums, move_planes, position_step,
 };
 use crate::engine::ops::{
     Llk, accumulate_obj, accumulate_probe, apply_amplitude_with, cg_poisson_gamma_with, llk_with,
     natural, obj_probe_to_psi, poisson_grad_with, psi_to_obj_probe,
 };
-use crate::engine::{EngineError, Features, Fft2, Observed, Optics, shift};
+use crate::engine::{EngineError, Features, Fft2, Observed, Optics, Sampling, shift};
 
 /// Which loop recorded an [`LlkRecord`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -201,6 +201,8 @@ pub struct Ptycho {
     /// cycles.
     psi: Vec<C64>,
     features: Features,
+    /// How [`Features::position`] enters the exit waves.
+    sampling: Sampling,
     cycle: usize,
     history: Vec<LlkRecord>,
 }
@@ -259,6 +261,7 @@ impl Ptycho {
             object.nmode(),
         )?;
         let psi = vec![C64::default(); addr.views().len() * probe.plane_len()];
+        let sampling = Sampling::auto(&optics, object.plane_shape(), g.frame);
         Ok(Self {
             optics,
             obs: Observed::from_counts(&scan.counts),
@@ -268,9 +271,20 @@ impl Ptycho {
             probe,
             psi,
             features: Features::default(),
+            sampling,
             cycle: 0,
             history: Vec::new(),
         })
+    }
+
+    /// How [`Features::position`] enters the exit waves: [`Sampling::auto`] of the optics,
+    /// object and frame the engine was built with, unless set.
+    pub fn sampling(&self) -> Sampling {
+        self.sampling
+    }
+
+    pub fn set_sampling(&mut self, sampling: Sampling) {
+        self.sampling = sampling;
     }
 
     pub fn features(&self) -> &Features {
@@ -348,14 +362,21 @@ impl Ptycho {
         self.cycle
     }
 
-    /// The probe moved by [`Features::position`] for every view, if one is set.
+    /// [`Features::position`]'s model of every view under [`Self::sampling`], if one is set.
     fn shifted(&self) -> Option<Shifted> {
         let views = self.addr.views();
-        (self.features.position.as_deref())
-            .map(|d| Shifted::new(views, &self.probe, self.optics.quad(), d, &self.fft))
+        (self.features.position.as_deref()).map(|d| self.shifted_views(views, &self.probe, d))
     }
 
-    /// Exit waves `P·O·q` of every view, `P·q` moved by [`Features::position`], into `psi`.
+    /// `probe` under the offsets `d` (by frame) on `views` of the object, as
+    /// [`Self::sampling`] models them.
+    pub(crate) fn shifted_views(&self, views: &[View], probe: &Probe, d: &[[f64; 2]]) -> Shifted {
+        let obj = self.object.plane_shape();
+        let quad = self.optics.quad();
+        Shifted::new(views, probe, quad, d, self.sampling, obj, &self.fft)
+    }
+
+    /// Exit waves `P·O·q` of every view under [`Features::position`] into `psi`.
     fn to_psi(&self, shifted: Option<&Shifted>, psi: &mut [C64]) {
         let views = self.addr.views();
         match shifted {
@@ -371,8 +392,7 @@ impl Ptycho {
         psi
     }
 
-    /// [`psi_to_obj_probe`] of the exit waves `self.psi`, `P·q` moved by
-    /// [`Features::position`].
+    /// [`psi_to_obj_probe`] of the exit waves `self.psi` under [`Features::position`].
     fn update_from_psi(&mut self, obj_inertia: Option<f64>, probe_inertia: Option<f64>) {
         let views = self.addr.views();
         match self.shifted() {
@@ -397,8 +417,8 @@ impl Ptycho {
     }
 
     /// The numerators of the object's and the probe's back-projections of the object-plane
-    /// `psi`, [`accumulate_obj`] and [`accumulate_probe`] with `P·q` moved by
-    /// [`Features::position`]; an array not asked for gets zeros.
+    /// `psi`, [`accumulate_obj`] and [`accumulate_probe`] under [`Features::position`]; an
+    /// array not asked for gets zeros.
     fn back_project(&self, psi: &[C64], object: bool, probe: bool) -> [Stack<C64>; 2] {
         let views = self.addr.views();
         let (od, pd) = (self.object.dims(), self.probe.dims());
@@ -439,7 +459,7 @@ impl Ptycho {
     }
 
     /// [`Shifted::position_sums`] of the magnitude projection of the current estimate's exit
-    /// waves under `s`, the probe moved by [`Features::position`].
+    /// waves under `s`, [`Features::position`]'s model.
     fn projected_position_sums(&self, s: &Shifted) -> Vec<[[f64; 2]; 2]> {
         let mut psi = vec![C64::default(); self.psi.len()];
         self.to_psi(Some(s), &mut psi);
@@ -465,7 +485,7 @@ impl Ptycho {
     /// Gradient of the Poisson LLK sum ([`crate::engine::llk`], not normalised) of the current object
     /// and probe over the object's real and imaginary parts, packed as
     /// `∂L/∂Re O + i·∂L/∂Im O = 2·∂L/∂O*`: [`crate::engine::poisson_grad`] of the detector field,
-    /// the exit transform's adjoint, then [`accumulate_obj`]'s numerator (`P·q` moved by
+    /// the exit transform's adjoint, then [`accumulate_obj`]'s numerator (under
     /// [`Features::position`]). PyNX `ML`'s `obj_grad` is half of it.
     pub fn obj_grad(&self) -> Stack<C64> {
         let [g, _] = self.grads(true, false);
@@ -495,8 +515,8 @@ impl Ptycho {
         let mut b = a.clone();
         match self.features.position.as_deref() {
             Some(d) => {
-                let probe = Shifted::new(views, &self.probe, quad, d, &self.fft);
-                let d_probe = Shifted::new(views, &d_probe, quad, d, &self.fft);
+                let probe = self.shifted_views(views, &self.probe, d);
+                let d_probe = self.shifted_views(views, &d_probe, d);
                 probe.to_psi(views, &d_obj, &mut a);
                 d_probe.to_psi(views, &self.object, &mut b);
                 a.iter_mut().zip(&b).for_each(|(a, b)| *a += b);
@@ -569,7 +589,8 @@ impl Ptycho {
     /// `P *= exp(−2πi(dx·(x − nx/2)/nx + dy·(y − ny/2)/ny))` and
     /// `O *= exp(+2πi(dx·(x − nxo/2)/nx + dy·(y − nyo/2)/ny))` (integer halves). The two
     /// ramps cancel in every view up to a constant phase, so the LLK is unchanged, except that
-    /// [`Features::position`] moves a ramp of non-integer `dx` or `dy` as a periodic one.
+    /// [`Features::position`]'s sub-pixel model takes a ramp of non-integer `dx` or `dy` as a
+    /// periodic one.
     pub fn zero_phase_ramp(&mut self) {
         zero_phase_ramp(&self.fft, &mut self.object, &mut self.probe);
     }
@@ -813,14 +834,16 @@ impl Ptycho {
     /// rPIE after pty-chi `RPIEReconstructor` with SGD, on consecutive batches of
     /// `batch_size` frames (pty-chi shuffles; this order is fixed). Needs one object mode.
     /// Per batch, from the batch-start object, probe and offsets, with `W_m` the view's probe
-    /// `P_m q` (moved by [`Features::position`] when set), `Δ = IFT(ψ') − ψ`, `ψ = W·O_win` and
+    /// `P_m q` and `O_win` its object window under [`Features::position`] when set
+    /// ([`Self::sampling`]), `Δ = IFT(ψ') − ψ`, `ψ = W·O_win` and
     /// `ψ' = FT(ψ) / (sqrt(Σ_modes |FT ψ|²) + 1e-7) · sqrt(iobs + 1e-7)` (masked pixels keep
     /// `FT ψ`, so `Δ` is 0 there):
     /// - object: `O[win] += obj_step · Σ_modes conj(W_m) Δ_m / ((1 − α_o)|W_m|² + α_o·max Σ_m|W_m|²)`,
-    ///   summed over the batch, the max over the batch's frames and pixels;
+    ///   summed over the batch, the max over the batch's frames and pixels; under
+    ///   [`Sampling::FullObject`] each view's term is placed by the sampling's adjoint;
     /// - probe: `P_m += probe_step · mean_batch conj(q)·T_{−d}(conj(O_win) Δ_m /
-    ///   ((1 − α_p)|O_win|² + α_p·max|O_win|²))`, `T_{−d}` the adjoint of the move by the
-    ///   frame's offset (none without positions);
+    ///   ((1 − α_p)|O_win|² + α_p·max|O_win|²))`, `T_{−d}` the adjoint of the probe's move by
+    ///   the frame's offset (none without positions or under [`Sampling::FullObject`]);
     /// - positions: pty-chi's gradient correction as [`crate::engine::Lsqml`]'s, from the
     ///   frame's mode-0 `W` and `Δ` (`chi`) and its object window, then its clipped SGD step.
     ///
@@ -868,8 +891,10 @@ impl Ptycho {
         let nbatch = frames.len();
         let views = &self.addr.views()[frames.start * nmode..frames.end * nmode];
         let offsets = self.features.position.as_deref();
-        let shifted =
-            offsets.map(|d| Shifted::new(views, &self.probe, self.optics.quad(), d, &self.fft));
+        let shifted = offsets.map(|d| self.shifted_views(views, &self.probe, d));
+        let sampler = shifted.as_ref().and_then(Shifted::sampler);
+        // The offsets the probe moves by, under [`Sampling::Patch`].
+        let moves = offsets.filter(|_| sampler.is_none());
         let mut psi = vec![C64::default(); views.len() * n];
         match &shifted {
             Some(s) => s.to_psi(views, &self.object, &mut psi),
@@ -927,13 +952,29 @@ impl Ptycho {
                 .map(|(b, j)| (0..nmode).map(|m| wave(b * nmode + m, j).1).sum::<f64>())
                 .fold(0.0, f64::max);
             let a = params.obj_alpha;
-            let d = d_obj.plane_mut(0);
-            for (k, (v, dv)) in views.iter().zip(delta.chunks_exact(n)).enumerate() {
-                let (oy, ox) = (v.oy as usize, v.ox as usize);
-                for (j, dv) in dv.iter().enumerate() {
-                    let (_, y, x) = natural(j, ny, nx);
-                    let (w, w2) = wave(k, j);
-                    d[(oy + y) * nxo + ox + x] += w.conj() / ((1.0 - a) * w2 + a * pmax) * dv;
+            let step = |k: usize, j: usize, dv: &C64| {
+                let (w, w2) = wave(k, j);
+                w.conj() / ((1.0 - a) * w2 + a * pmax) * dv
+            };
+            match sampler {
+                Some(sampler) => {
+                    let mut patches = vec![C64::default(); delta.len()];
+                    for (k, dv) in delta.chunks_exact(n).enumerate() {
+                        for (j, dv) in dv.iter().enumerate() {
+                            patches[k * n + shift(j, ny, nx)] = step(k, j, dv);
+                        }
+                    }
+                    *d_obj = sampler.place(&patches, 1);
+                }
+                None => {
+                    let d = d_obj.plane_mut(0);
+                    for (k, (v, dv)) in views.iter().zip(delta.chunks_exact(n)).enumerate() {
+                        let (oy, ox) = (v.oy as usize, v.ox as usize);
+                        for (j, dv) in dv.iter().enumerate() {
+                            let (_, y, x) = natural(j, ny, nx);
+                            d[(oy + y) * nxo + ox + x] += step(k, j, dv);
+                        }
+                    }
                 }
             }
         }
@@ -943,13 +984,20 @@ impl Ptycho {
         if let Some(d_probe) = &mut d_probe {
             let a = params.probe_alpha;
             let ob = self.object.plane(0);
+            let windows = sampler.map(|s| s.windows(&self.object, &[]));
             let mut frame = Stack::filled(self.probe.dims(), C64::default());
-            for (fv, dv) in views.chunks_exact(nmode).zip(delta.chunks_exact(nmode * n)) {
+            for (b, (fv, dv)) in (views.chunks_exact(nmode))
+                .zip(delta.chunks_exact(nmode * n))
+                .enumerate()
+            {
                 let (oy, ox) = (fv[0].oy as usize, fv[0].ox as usize);
-                let win = |i: usize| ob[(oy + i / nx) * nxo + ox + i % nx];
+                let win = |i: usize| match &windows {
+                    Some(w) => w.plane(b * nmode)[i],
+                    None => ob[(oy + i / nx) * nxo + ox + i % nx],
+                };
                 let omax = (0..n).map(|i| win(i).norm_sqr()).fold(0.0, f64::max);
-                // Without positions the frame's direction adds straight into the sum.
-                let d = match offsets {
+                // Without a probe move the frame's direction adds straight into the sum.
+                let d = match moves {
                     Some(_) => {
                         frame.as_mut_slice().fill(C64::default());
                         &mut frame
@@ -966,7 +1014,7 @@ impl Ptycho {
                         d[i] += w * dv;
                     }
                 }
-                if let Some(offsets) = offsets {
+                if let Some(offsets) = moves {
                     let [dy, dx] = offsets[fv[0].frame as usize];
                     let moved = frame.as_mut_slice();
                     move_planes(moved, Some(self.optics.quad()), [-dy, -dx], &self.fft);
@@ -977,15 +1025,25 @@ impl Ptycho {
             }
         }
         let d_pos = shifted.as_ref().map(|s| {
+            let derivatives = sampler.map(|s| [0, 1].map(|a| s.windows(&self.object, &[a])));
             let sums: Vec<[[f64; 2]; 2]> = (0..nbatch)
                 .map(|b| {
                     let k = b * nmode;
+                    let chi = &delta[k * n..(k + 1) * n];
+                    if let Some([gy, gx]) = &derivatives {
+                        return derivative_sums(
+                            [gy.plane(k), gx.plane(k)],
+                            s.wave(k),
+                            chi,
+                            [ny, nx],
+                        );
+                    }
                     let v = views[k];
                     let o = self.object.plane(v.obj as usize);
                     let patch: Vec<C64> = (0..n)
                         .map(|i| o[(v.oy as usize + i / nx) * nxo + v.ox as usize + i % nx])
                         .collect();
-                    gradient_sums(&patch, s.wave(k), &delta[k * n..(k + 1) * n], &self.fft)
+                    gradient_sums(&patch, s.wave(k), chi, &self.fft)
                 })
                 .collect();
             gradient_directions(&sums, EPS_POSITION * self.optics.exit().intensity_scale())
@@ -1154,27 +1212,34 @@ mod tests {
     }
 
     /// Under the far field and each of [`wavefields`], [`grad_start`] and [`grad_start`] with
-    /// its probe moved by sub-pixel offsets of both signs.
+    /// sub-pixel offsets of both signs under either [`Sampling`].
     fn grad_starts() -> Vec<Ptycho> {
         let waves = std::iter::once(None).chain(wavefields().map(Some));
         waves
             .flat_map(|w| {
-                let mut moved = grad_start(w);
-                let d = (0..moved.addr.nframe())
-                    .map(|f| {
-                        [
-                            0.6 * (1.3 * f as f64 + 0.2).sin(),
-                            -0.45 * (0.7 * f as f64).cos(),
-                        ]
-                    })
-                    .collect();
-                moved
-                    .set_features(Features {
+                let moved = |sampling| {
+                    let mut p = grad_start(w);
+                    let d = (0..p.addr.nframe())
+                        .map(|f| {
+                            [
+                                0.6 * (1.3 * f as f64 + 0.2).sin(),
+                                -0.45 * (0.7 * f as f64).cos(),
+                            ]
+                        })
+                        .collect();
+                    p.set_sampling(sampling);
+                    p.set_features(Features {
                         position: Some(d),
                         ..Features::default()
                     })
                     .unwrap();
-                [grad_start(w), moved]
+                    p
+                };
+                [
+                    grad_start(w),
+                    moved(Sampling::Patch),
+                    moved(Sampling::FullObject),
+                ]
             })
             .collect()
     }
@@ -1302,9 +1367,14 @@ mod tests {
     type Offsets = fn(usize) -> [f64; 2];
 
     /// Five frames of a 3-pixel Fermat spiral over an object of random phase whose modulus is
-    /// `modulus(u)` of a uniform `u`, two probe modes, `offsets(frame)` modelled; the exit
-    /// waves are the truth's and the probe starts 30% away. Returns the truth's probe too.
-    fn overlap_start(modulus: Option<Modulus>, offsets: Option<Offsets>) -> (Ptycho, Probe) {
+    /// `modulus(u)` of a uniform `u`, two probe modes, `offsets(frame)` modelled as `sampling`
+    /// does; the exit waves are the truth's and the probe starts 30% away. Returns the truth's
+    /// probe too.
+    fn overlap_start(
+        modulus: Option<Modulus>,
+        offsets: Option<Offsets>,
+        sampling: Sampling,
+    ) -> (Ptycho, Probe) {
         let g = Geometry::new(1.5e-10, 1.0, 75e-6, [16, 16]).unwrap();
         let pixel = Optics::far_field(&g).pixel();
         let mut seed = 12345u64;
@@ -1326,6 +1396,7 @@ mod tests {
         let blank = Scan::new(g, positions, blank).unwrap();
         let mut p =
             Ptycho::with_optics(&blank, Optics::far_field(&g), object, probe.clone()).unwrap();
+        p.set_sampling(sampling);
         if let Some(offsets) = offsets {
             p.set_features(Features {
                 position: Some((0..dims[0]).map(offsets).collect()),
@@ -1357,25 +1428,31 @@ mod tests {
     }
 
     /// With offsets modelled and all zero the probe update is `blend`'s, with and without
-    /// inertia.
+    /// inertia, under either sampling.
     #[test]
     fn the_probe_update_under_zero_offsets_is_the_unmoved_one() {
-        for inertia in [0.0, 0.001] {
-            let (mut plain, _) = overlap_start(None, None);
-            let (mut still, _) = overlap_start(None, Some(|_| [0.0; 2]));
+        for (inertia, sampling) in [0.0, 0.001]
+            .into_iter()
+            .flat_map(|i| SAMPLINGS.map(|s| (i, s)))
+        {
+            let (mut plain, _) = overlap_start(None, None, Sampling::Patch);
+            let (mut still, _) = overlap_start(None, Some(|_| [0.0; 2]), sampling);
             plain.update_from_psi(None, Some(inertia));
             still.update_from_psi(None, Some(inertia));
             let (a, b) = (still.probe.as_slice(), plain.probe.as_slice());
             let d = worst_of(a.iter().zip(b).map(|(a, b)| (a - b).norm()))
                 / b.iter().map(|b| b.norm()).fold(0.0, f64::max);
-            eprintln!("inertia {inertia}: {d:.3e}");
-            assert!(d < 1e-14, "inertia {inertia}: {d:.3e}");
+            eprintln!("inertia {inertia} {sampling:?}: {d:.3e}");
+            assert!(d < 1e-14, "inertia {inertia} {sampling:?}: {d:.3e}");
         }
     }
 
+    const SAMPLINGS: [Sampling; 2] = [Sampling::Patch, Sampling::FullObject];
+
     /// On objects whose `Σ|O|²` does not bound the moved operator (a unit step diverges on
-    /// both), whole-pixel and fractional offsets, with and without inertia: the overlap error
-    /// rises at no update and falls over thirty, in each of the two probe modes' problems.
+    /// both), whole-pixel and fractional offsets under either sampling, with and without
+    /// inertia: the overlap error rises at no update and falls over thirty, in each of the two
+    /// probe modes' problems.
     #[test]
     fn the_overlap_error_never_rises_under_a_moved_probe() {
         let objects: [(&str, Modulus); 2] = [
@@ -1384,15 +1461,21 @@ mod tests {
         ];
         let moves: [(&str, Offsets); 2] = [("whole", whole), ("fractional", fractional)];
         for (object, modulus) in objects {
-            for (kind, offsets) in moves {
+            for ((kind, offsets), sampling) in moves.iter().flat_map(|m| SAMPLINGS.map(|s| (m, s)))
+            {
+                let kind = format!("{kind} {sampling:?}");
                 for inertia in [0.0, 0.05] {
-                    let (mut p, _) = overlap_start(Some(modulus), Some(offsets));
+                    let (mut p, _) = overlap_start(Some(modulus), Some(*offsets), sampling);
                     let first = overlap_error(&p);
                     let (mut before, mut rise) = (first, 0.0f64);
                     for _ in 0..30 {
                         p.update_from_psi(None, Some(inertia));
                         let now = overlap_error(&p);
-                        rise = rise.max(now / before);
+                        // Below 1e-24 of the start, which `blend` reaches under FullObject's
+                        // whole-pixel offsets, the error is rounding.
+                        if before > 1e-24 * first {
+                            rise = rise.max(now / before);
+                        }
                         before = now;
                     }
                     let fall = before / first;
@@ -1412,8 +1495,11 @@ mod tests {
     /// fit (`g = 0` exactly) there is no step and no `0/0`.
     #[test]
     fn the_probe_update_under_a_moved_probe_holds_the_solution() {
-        for inertia in [0.0, 0.001] {
-            let (mut p, truth) = overlap_start(Some(|u| 0.2 + 0.8 * u), Some(fractional));
+        for (inertia, sampling) in [0.0, 0.001]
+            .into_iter()
+            .flat_map(|i| SAMPLINGS.map(|s| (i, s)))
+        {
+            let (mut p, truth) = overlap_start(Some(|u| 0.2 + 0.8 * u), Some(fractional), sampling);
             p.probe = truth.clone();
             for _ in 0..3 {
                 p.update_from_psi(None, Some(inertia));
@@ -1421,8 +1507,8 @@ mod tests {
             let (a, b) = (p.probe.as_slice(), truth.as_slice());
             let d = worst_of(a.iter().zip(b).map(|(a, b)| (a - b).norm()))
                 / b.iter().map(|b| b.norm()).fold(0.0, f64::max);
-            eprintln!("inertia {inertia}: {d:.3e}");
-            assert!(d < 1e-13, "inertia {inertia}: {d:.3e}");
+            eprintln!("inertia {inertia} {sampling:?}: {d:.3e}");
+            assert!(d < 1e-13, "inertia {inertia} {sampling:?}: {d:.3e}");
 
             p.probe.as_mut_slice().fill(C64::default());
             p.psi.fill(C64::default());

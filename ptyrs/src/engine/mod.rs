@@ -32,6 +32,7 @@ mod ops;
 mod plan;
 mod propagate;
 mod ptycho;
+mod sampling;
 pub mod sim;
 
 pub use batch::random_batches;
@@ -61,6 +62,7 @@ pub use propagate::{
 pub use ptycho::{
     Algorithm, ApParams, DmParams, LlkRecord, MlParams, Ptycho, RaarParams, RpieParams,
 };
+pub use sampling::Sampling;
 
 /// Errors from building or running the engine.
 #[derive(Debug, thiserror::Error)]

@@ -5,13 +5,14 @@
 //! far field of [`Optics::far_field`], whose `q` multiplies the last slice) and the counts.
 //! pty-chi runs with `multislice_solve_obj_prb_step_size_jointly`, the step-size rule of
 //! [`LsqmlBatch::step_sizes`]. Every frame sits at a whole-pixel corner, except in
-//! `refs/f64/lsqml_multislice_pos.py`'s step (`lsqml_multislice_pos_*_f64.txt`), which moves
-//! each frame by a [`Features::position`] offset and refines it.
+//! `refs/f64/lsqml_multislice_pos.py`'s steps, which move each frame by a [`Features::position`]
+//! offset and refine it under pty-chi's PATCH (`lsqml_multislice_pos_*_f64.txt`) and
+//! FULL_OBJECT (`lsqml_multislice_pos_full_*_f64.txt`) shift operators.
 
 use ptyrs::base::{AddrTable, C64, Counts, Geometry, Object, Positions, Probe, Stack, View};
 use ptyrs::engine::{
     Cost, Features, Lsqml, LsqmlBatch, LsqmlParams, LsqmlStep, Observed, Optics, ProbeVariation,
-    Propagator, SliceWaves, Wavefield, illumination, llk, shift,
+    Propagator, Sampling, SliceWaves, Wavefield, illumination, llk, shift,
 };
 
 #[path = "common/worst.rs"]
@@ -370,13 +371,24 @@ fn step_matches_ptychi() {
     }
 }
 
+/// `lsqml_multislice_pos.py`'s files of one shift operator: the steps, the offsets and the
+/// object and probe changes.
+struct PosRefs {
+    steps: &'static str,
+    offsets: &'static str,
+    obj: &'static str,
+    probe: &'static str,
+}
+
 /// [`step_matches_ptychi`] from the truth object with every frame moved by
-/// `lsqml_multislice_pos.py`'s offset and the positions refined: the step, the changes and
-/// the offset changes, pty-chi's correction on the middle slice. The case whose exit has no
-/// plane phase only: pty-chi holds the phase where the probe moves, [`SliceWaves`] displaces
-/// it with the probe.
-#[test]
-fn step_with_positions_matches_ptychi() {
+/// `lsqml_multislice_pos.py`'s offset and the positions refined under `sampling`, against
+/// `refs` on the cases `cases` keeps: the step, the changes and the offset changes, pty-chi's
+/// correction on the middle slice. Returns how many cases it checked.
+fn assert_positions_step(
+    sampling: Sampling,
+    refs: PosRefs,
+    cases: impl Fn(&Case) -> bool,
+) -> usize {
     let mut s = state();
     let start = table(include_str!(
         "engine/data/lsqml_multislice_pos_start_f64.txt"
@@ -387,23 +399,18 @@ fn step_with_positions_matches_ptychi() {
             Object::new(stack([1, OBJ[0], OBJ[1]], &rows, 3))
         })
         .collect();
-    let rows = table(include_str!(
-        "engine/data/lsqml_multislice_pos_steps_f64.txt"
-    ));
-    let offsets = table(include_str!(
-        "engine/data/lsqml_multislice_pos_offsets_f64.txt"
-    ));
+    let (rows, offsets) = (table(refs.steps), table(refs.offsets));
     let views = &s.addr.views()[..BATCH * s.addr.nmode()];
-    let plain = |c: &Case| c.optics.quad().iter().all(|q| *q == C64::new(1.0, 0.0));
-    assert_eq!(s.cases.iter().filter(|c| plain(c)).count(), 1);
-    for (k, c) in s.cases.iter().enumerate().filter(|(_, c)| plain(c)) {
+    let mut checked = 0;
+    for (k, c) in s.cases.iter().enumerate().filter(|(_, c)| cases(c)) {
+        checked += 1;
         let offsets: Vec<_> = offsets.iter().filter(|r| r[0] == k as f64).collect();
         let at = |col: usize| -> Vec<[f64; 2]> {
             offsets.iter().map(|r| [r[col], r[col + 1]]).collect()
         };
         let (d0, want) = (at(2), at(4));
         let (mut objects, mut probe) = (s.objects.clone(), s.probe.clone());
-        let pre = illumination(s.addr.views(), objects[0].dims(), &probe);
+        let pre = sampling.illumination(s.addr.views(), objects[0].dims(), &probe, Some(&d0));
         let mut var = ProbeVariation::none(probe.plane_shape());
         let mut run = Lsqml::new(LsqmlParams {
             batch_size: BATCH,
@@ -411,6 +418,7 @@ fn step_with_positions_matches_ptychi() {
             seed: 0,
         })
         .unwrap()
+        .with_sampling(sampling)
         .with_preconditioner(pre)
         .with_features(Features {
             position: Some(d0.clone()),
@@ -419,15 +427,9 @@ fn step_with_positions_matches_ptychi() {
         .unwrap();
         let step = run.step(views, &c.obs, &c.optics, &mut objects, &mut probe, &mut var);
         let want_steps: Vec<_> = rows.iter().filter(|r| r[0] == k as f64).collect();
-        assert_step(&format!("case {k} positions"), &step, &want_steps, 1);
-        assert_changes(
-            &s,
-            k,
-            &objects,
-            &probe,
-            include_str!("engine/data/lsqml_multislice_pos_obj_f64.txt"),
-            include_str!("engine/data/lsqml_multislice_pos_probe_f64.txt"),
-        );
+        let what = format!("case {k} {sampling:?}");
+        assert_step(&format!("{what} positions"), &step, &want_steps, 1);
+        assert_changes(&s, k, &objects, &probe, refs.obj, refs.probe);
         let change = |d: &[[f64; 2]]| -> Vec<f64> {
             d.iter()
                 .zip(&d0)
@@ -436,9 +438,39 @@ fn step_with_positions_matches_ptychi() {
         };
         let got = run.features().position.as_ref().unwrap();
         let err = max_rel(&change(got), &change(&want));
-        eprintln!("case {k} offsets: max rel {err:.3e}");
-        assert!(err < 1e-11, "case {k} offsets: max rel {err:.3e}");
+        eprintln!("{what} offsets: max rel {err:.3e}");
+        assert!(err < 1e-11, "{what} offsets: max rel {err:.3e}");
     }
+    checked
+}
+
+/// [`assert_positions_step`] under PATCH. The case whose exit has no plane phase only:
+/// pty-chi holds the phase where the probe moves, [`SliceWaves`] displaces it with the probe.
+#[test]
+fn step_with_positions_matches_ptychi() {
+    let plain = |c: &Case| c.optics.quad().iter().all(|q| *q == C64::new(1.0, 0.0));
+    let refs = PosRefs {
+        steps: include_str!("engine/data/lsqml_multislice_pos_steps_f64.txt"),
+        offsets: include_str!("engine/data/lsqml_multislice_pos_offsets_f64.txt"),
+        obj: include_str!("engine/data/lsqml_multislice_pos_obj_f64.txt"),
+        probe: include_str!("engine/data/lsqml_multislice_pos_probe_f64.txt"),
+    };
+    assert_eq!(assert_positions_step(Sampling::Patch, refs, plain), 1);
+}
+
+/// [`assert_positions_step`] under FULL_OBJECT, every case: the probe and its exit stay put.
+#[test]
+fn step_with_full_object_positions_matches_ptychi() {
+    let refs = PosRefs {
+        steps: include_str!("engine/data/lsqml_multislice_pos_full_steps_f64.txt"),
+        offsets: include_str!("engine/data/lsqml_multislice_pos_full_offsets_f64.txt"),
+        obj: include_str!("engine/data/lsqml_multislice_pos_full_obj_f64.txt"),
+        probe: include_str!("engine/data/lsqml_multislice_pos_full_probe_f64.txt"),
+    };
+    assert_eq!(
+        assert_positions_step(Sampling::FullObject, refs, |_| true),
+        3
+    );
 }
 
 /// The reconstruction: [`Lsqml::epoch`]s of batches of 8 (seed 7) from the start against
