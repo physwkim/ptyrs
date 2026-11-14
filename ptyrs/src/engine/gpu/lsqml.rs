@@ -15,12 +15,12 @@ use std::sync::Arc;
 use crate::gpu::{
     BhScan, C32, EpochOrder, Error as GpuError, FusedBufs, FusedInputs, Kernels, LSQML_REC,
     LsqmlAt, LsqmlChi, LsqmlKernels, LsqmlNoise, LsqmlScan, LsqmlVar, Model, PositionRule, PsiSums,
-    SlicePhase, SliceSource, SliceSteps, Solve, StackRef, StackTable, Views,
+    SliceSource, SliceSteps, Solve, StackRef, StackTable, Views,
 };
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaStream, DeviceBuffer};
 
-use super::device::{Moved, MovedLent, PassesMut, moved_inputs, moved_shift};
+use super::device::{Moved, MovedLent, PassesMut, moved_inputs, moved_shift, slice_phase};
 use super::{
     Bufs, Cut, Frames, GpuPtycho, StackRule, Streamed, batch_stacks, plane_bytes, plane_len,
     wave_bytes,
@@ -63,11 +63,6 @@ impl GpuPtycho {
         if self.dev.has_stepped() {
             return Err(EngineError::Invalid(
                 "LSQML refines no intensity scale or background, as pty-chi's".into(),
-            ));
-        }
-        if self.dev.sliced() && (0..nepoch).any(|ic| llk_due(calc_llk, ic, nepoch)) {
-            return Err(EngineError::Invalid(
-                "no LLK pass runs a multislice object: LSQML on one takes calc_llk = 0".into(),
             ));
         }
         let nframe = self.dev.dims().nframe as usize;
@@ -306,12 +301,6 @@ impl LsqmlState {
             })
             .collect())
     }
-}
-
-/// The last slice's plane phase of `quad` radians per squared pixel, moved with the probe by
-/// `offsets`; none of no phase.
-fn slice_phase(quad: f32, offsets: Option<&DeviceBuffer<f32>>) -> Option<SlicePhase<'_>> {
-    (quad != 0.0).then_some(SlicePhase { quad, offsets })
 }
 
 impl<'a> Bufs<'a> {
