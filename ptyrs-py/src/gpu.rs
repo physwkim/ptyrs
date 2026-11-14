@@ -7,9 +7,11 @@ use ptyrs::engine::{BhParams, GpuOptions, LsqmlParams};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
+use crate::cpu::Optics;
 use crate::{Error, Scan, history, llk_dict, params, stack_in, stack_out};
 
-/// The GPU reconstruction state of a scan on CUDA device `device`; keywords are
+/// The GPU reconstruction state of a scan on CUDA device `device`, under `optics` in place of
+/// the far field of the scan's geometry if given (`GpuPtycho::with_optics`); keywords are
 /// `GpuOptions` fields.
 #[pyclass(unsendable)]
 pub(crate) struct GpuPtycho(
@@ -21,20 +23,27 @@ pub(crate) struct GpuPtycho(
 #[pymethods]
 impl GpuPtycho {
     #[new]
-    #[pyo3(signature = (scan, object, probe, device = 0, **options))]
+    #[pyo3(signature = (scan, object, probe, device = 0, optics = None, **options))]
     fn new(
         scan: &Scan,
         object: PyReadonlyArray3<'_, C64>,
         probe: PyReadonlyArray3<'_, C64>,
         device: usize,
+        optics: Option<&Bound<'_, Optics>>,
         options: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<Self> {
         let options = params!(GpuOptions, options, stack_size, graph, llk_slots, fused);
         let (object, probe) = (Object::new(stack_in(object)?), Probe::new(stack_in(probe)?));
         let ctx = CudaContext::new(device).map_err(|e| Error(e.into()))?;
+        let engine = match optics {
+            Some(o) => {
+                let optics = &o.get().inner;
+                ptyrs::engine::GpuPtycho::with_optics(&ctx, &scan.0, optics, object, probe, options)
+            }
+            None => ptyrs::engine::GpuPtycho::new(&ctx, &scan.0, object, probe, options),
+        };
         Ok(Self(
-            ptyrs::engine::GpuPtycho::new(&ctx, &scan.0, object, probe, options)
-                .map_err(Error::from)?,
+            engine.map_err(Error::from)?,
             scan.0.counts.frame_shape(),
         ))
     }
