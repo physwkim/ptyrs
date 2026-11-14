@@ -79,7 +79,13 @@ fn bh_steps_match_cpu_under_every_propagator() {
             let mut worst = [[0.0f64; 4]; 2];
             let mut last = start;
             for nepoch in 1..=NEPOCH {
-                let want = bh.epoch(&c.addr, &c.obs, &c.optics, slice::from_mut(&mut o), &mut pr);
+                let want = bh.epoch(
+                    &c.addr,
+                    &c.obs,
+                    &c.optics(),
+                    slice::from_mut(&mut o),
+                    &mut pr,
+                );
                 let llk = c.llk(&o, &pr);
                 last = llk;
                 for (graph, worst) in [false, true].into_iter().zip(&mut worst) {
@@ -125,7 +131,13 @@ fn bh_position_matches_cpu_under_every_propagator() {
             let (mut o, mut pr) = (c.object.clone(), c.probe.clone());
             let mut steps = Vec::new();
             for _ in 0..NEPOCH {
-                steps = bh.epoch(&c.addr, &c.obs, &c.optics, slice::from_mut(&mut o), &mut pr);
+                steps = bh.epoch(
+                    &c.addr,
+                    &c.obs,
+                    &c.optics(),
+                    slice::from_mut(&mut o),
+                    &mut pr,
+                );
             }
             let want = bh.features().position.clone().unwrap();
             let scale = want.iter().flatten().fold(0.0f64, |m, v| m.max(v.abs()));

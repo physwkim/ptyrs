@@ -201,6 +201,11 @@ impl Exit<'_> {
     pub fn adjoint(&self, planes: &mut [C64]) {
         self.0.before_plane(planes);
     }
+
+    /// [`Propagator::adjoint_inverts`] of the whole propagator.
+    pub fn adjoint_inverts(&self) -> bool {
+        self.0.adjoint_inverts()
+    }
 }
 
 /// One free-space propagation: pty-chi `WavefieldPropagatorParameters` in metres.
@@ -432,6 +437,15 @@ impl Propagator {
         }
     }
 
+    /// Whether [`Self::adjoint`] undoes [`Self::forward`]: not under angular spectrum with
+    /// an evanescent band, whose transfer function is 0 there.
+    pub fn adjoint_inverts(&self) -> bool {
+        match self {
+            Self::AngularSpectrum(p) => !p.tf.contains(&C64::default()),
+            Self::Fourier(_) | Self::Fresnel(_) => true,
+        }
+    }
+
     /// This propagator through one [`Fft2`]. A Fresnel transform over pixels that are not
     /// square has no such form, its plane phase being no `quad`, nor angular spectrum with an
     /// evanescent band, where `Vᴴ·V` is not the identity the form's users take it for.
@@ -439,7 +453,7 @@ impl Propagator {
         let (quad, stage) = match self {
             Self::Fourier(_) => (0.0, PlaneStage::None),
             Self::AngularSpectrum(p) => {
-                if p.tf.contains(&C64::default()) {
+                if !self.adjoint_inverts() {
                     return Err(EngineError::Invalid(
                         "angular spectrum with an evanescent band has no one-transform form".into(),
                     ));
@@ -611,6 +625,8 @@ mod tests {
 
     #[test]
     fn propagation_keeps_power_and_adjoint_inverts_it() {
+        let inverts: Vec<_> = propagators().iter().map(|p| p.adjoint_inverts()).collect();
+        assert_eq!(inverts, [true, true, true, true, true, false]);
         for p in &propagators() {
             let [ny, nx] = p.shape();
             let x = crate::engine::linop::noise(2 * ny * nx, 3);
@@ -621,9 +637,7 @@ mod tests {
             p.adjoint(&mut back);
             // Angular spectrum drops the evanescent band; only the 5e-7 m wavelength one has
             // one at these pixels.
-            if let Propagator::AngularSpectrum(a) = p
-                && a.tf.iter().any(|t| *t == C64::default())
-            {
+            if !p.adjoint_inverts() {
                 assert!(power(&y) < power(&x));
                 continue;
             }

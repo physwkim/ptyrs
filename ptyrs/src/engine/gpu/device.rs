@@ -382,13 +382,14 @@ impl FeaturesMut<'_> {
 
     /// The features lent to the passes of one cycle body over `probe`, which cannot change
     /// while they are: the model of every feature set, the position's after the spectra of
-    /// `probe` it moves (two launches), and the sums.
+    /// `probe` it moves (two launches) and the propagator's stage `exit`, and the sums.
     pub fn lend<'b>(
         &'b mut self,
         ctx: &ExecutionContext,
         kernels: &Kernels,
         dims: &ViewDims,
         probe: &'b DeviceBuffer<C32>,
+        exit: ExitPass<'b>,
     ) -> Result<Modelled<'b>, GpuError> {
         let (scale, scale_sums) = match &mut self.scale {
             Some(s) => (Some(&*s.values), Some(&mut *s.sums)),
@@ -418,6 +419,7 @@ impl FeaturesMut<'_> {
                 scale,
                 background,
                 shift,
+                exit: Some(exit),
             },
             scale: scale_sums,
             background: background_sums,
@@ -1570,16 +1572,20 @@ impl Device {
         Ok(self.ring.flush(&self.context())?)
     }
 
-    /// Fails under a propagator with a plane stage for the passes that run none; only the
-    /// LLK pass, LSQML's, BH's and rPIE's do, and every other is enqueued behind this.
+    /// Fails under a propagator with a plane stage for the passes that run none: the LLK
+    /// pass, LSQML's, BH's and rPIE's do, AP's, DM's and RAAR's at fixed positions only, and
+    /// every other is enqueued behind this.
     fn stageless(&self, algorithm: Algorithm) -> Result<(), EngineError> {
+        let moved = self.features.position.is_some();
         match (&self.exit, algorithm) {
             (ExitStage::None, _) | (_, Algorithm::Lsqml | Algorithm::Bh | Algorithm::Rpie) => {
                 Ok(())
             }
+            (_, Algorithm::Ap | Algorithm::Dm | Algorithm::Raar) if !moved => Ok(()),
             _ => Err(EngineError::Invalid(format!(
-                "{algorithm:?} runs no propagator with a plane stage: angular spectrum, or a \
-                 Fresnel transform back in distance"
+                "{algorithm:?}{} runs no propagator with a plane stage: angular spectrum, or a \
+                 Fresnel transform back in distance",
+                if moved { " with a position" } else { "" }
             ))),
         }
     }
