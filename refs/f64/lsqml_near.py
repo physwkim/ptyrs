@@ -8,7 +8,8 @@ amplitude and phase, a truth probe [2, 24, 24] (a diffuser-like mode 0 and a wea
 of the truth through that geometry's propagator, natural (centred) layout, as pty-chi reads
 them with fft_shift False. The start is an object of ones and the truth probe plus a smooth
 complex perturbation. GEOMETRIES (wavelength, pixel, distance) give an angular-spectrum
-propagator, a Fresnel transform and an angular spectrum with an evanescent band.
+propagator, a Fresnel transform, an angular spectrum with an evanescent band and a Fresnel
+transform back (a negative distance).
 
 In the engine's convention the exit wave is psi = U(P O_view), U pty-chi's propagate_forward
 over sqrt(k) (k its get_intensity_scaling_factor), so pty-chi's probe is P / sqrt(k), its
@@ -59,13 +60,15 @@ GRID = 4
 BATCH = 8
 BATCH_SEED = 7
 EPOCHS = 30
-EPOCH_CASES = (0, 1)
+EPOCH_CASES = (0, 1, 2, 3)
 ICALC_FRAMES = 4
 LAMBDA0 = 1.2e-7
 STEPS = (1e-4, 1e-5, 1e-6)
 # (wavelength, pixel, distance): angular spectrum, Fresnel transform, angular spectrum with an
-# evanescent band (lambda^2 (fy^2 + fx^2) > 1 in the frequency corners).
-GEOMETRIES = [(1e-10, 50e-9, 5e-4), (1e-10, 50e-9, 2e-3), (5e-7, 3e-7, 3e-6)]
+# evanescent band (lambda^2 (fy^2 + fx^2) > 1 in the frequency corners), Fresnel transform back.
+# New cases go last: each case's counts continue one generator.
+GEOMETRIES = [(1e-10, 50e-9, 5e-4), (1e-10, 50e-9, 2e-3), (5e-7, 3e-7, 3e-6),
+              (1e-10, 50e-9, -2e-3)]
 
 
 def sibling(name):

@@ -60,7 +60,7 @@ pub use ops::{
     PositionPartial, ScalePartial, StackCtl, StackGeom, StackRef, StackTable, UpdateSums, ViewAddr,
     ViewDims, Views, view_tiles,
 };
-pub use optics::{ExitPass, ExitStage, OpticsKernels};
+pub use optics::{ExitPass, ExitStage, OpticsKernels, SlicePhase, SliceSource};
 pub use position::{PositionKernels, PositionRule, Positions, Solve};
 pub use psi::{HalfWaves, Waves, half_scale};
 pub use ring::{Ended, FrameLlk, LlkRing, LlkTotals, RecordWriter, RingDevice, RingError};
