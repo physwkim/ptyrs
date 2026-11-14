@@ -44,7 +44,7 @@ use crate::live::pv_out::{AmpPhase, PvOut, publish};
 use crate::live::pva_source::{NtndFrames, PosStats, monitor_positions};
 use crate::live::ring::{DeviceStore, Ring, UploaderConfig, run_uploader};
 use crate::live::sched::FairSched;
-use crate::live::stats::{mono_ns, process_cpu_ns, wall_ns};
+use crate::live::stats::{Histogram, mono_ns, process_cpu_ns, wall_ns};
 use crate::live::swmr::{SwmrCfg, SwmrReport, run_swmr};
 use crate::live::synth::Region;
 
@@ -428,7 +428,11 @@ fn stored_bad(
 
 /// The `recv recon` line and whether a live object matched: the offline run
 /// on the stored frames, the clock from `scan_end` over the scanned region,
-/// and the first kept snapshot it finds converged.
+/// and the first kept snapshot it finds converged. `converged_ms` is host
+/// clock at both ends: from the last frame's arrival on the host
+/// (`scan_end`) to the host's receipt of that snapshot
+/// ([`Kept::taken`](crate::live::follow::Kept::taken)), when the result is
+/// in hand.
 fn recon_line(
     ctx: &Arc<Context>,
     store: &DeviceStore,
@@ -442,13 +446,6 @@ fn recon_line(
     let region = follow.place.scanned(&rep.positions, follow.ap.shape.frame);
     let [rows, cols] = &region;
     let scan_epochs = rep.scan_epochs.unwrap_or(0);
-    // Epoch time once the scan landed, from the kept snapshots' stamps.
-    let epoch_ms = match (rep.kept.first(), rep.kept.last()) {
-        (Some(a), Some(b)) if b.epochs > a.epochs => {
-            Some((b.taken - a.taken) as f64 / 1e6 / (b.epochs - a.epochs) as f64)
-        }
-        _ => None,
-    };
     let mut l = format!(
         "recv recon algo=ap nf_max={} stacks={} tile_cap={} stored={} landed={} scan_epochs={scan_epochs} \
          epochs={} snap_every={} kept={} epoch_ms={} object={ny}x{nx} obj_mapped_MiB={} \
@@ -461,7 +458,7 @@ fn recon_line(
         rep.epochs,
         follow.snap_every,
         rep.kept.len(),
-        Fig(epoch_ms, 3),
+        Fig(rep.epoch_ms(), 3),
         rep.obj_mapped_bytes >> 20,
         rep.plan_time.as_secs_f64() * 1e3,
         rep.plan_mapped_bytes >> 20,
@@ -521,6 +518,26 @@ fn recon_line(
         write!(l, " last_frc_region={r:.4} last_frc_whole={w:.4}").unwrap();
     }
     Ok((l, hit.is_some()))
+}
+
+/// Frame arrival (`t_rx`, by store place) → end of the first epoch that
+/// took the frame; and [`FollowReport::epochs_after_scan`].
+fn epoch_latency(rep: &FollowReport, t_rx: &[i64]) -> (Histogram, Histogram) {
+    let (mut to_epoch, mut epoch) = (Histogram::new(1_000_000), Histogram::new(1_000_000));
+    let mut f0 = 0;
+    for &(e, stored) in &rep.landings {
+        let landed = t_rx.get(f0 as usize..stored.min(rep.landed) as usize);
+        if let (Some(ts), Some(&done)) = (landed, rep.epoch_done.get(e as usize)) {
+            for t in ts {
+                to_epoch.record(done - t);
+            }
+        }
+        f0 = stored;
+    }
+    for t in rep.epochs_after_scan() {
+        epoch.record(t);
+    }
+    (to_epoch, epoch)
 }
 
 /// The frame source as [`run`] opens it before the GPU setup. Only ZMQ has
@@ -1066,6 +1083,10 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
         ),
     ));
     line(format_args!("recv rx_to_gpu {}", up.rx_to_gpu.summary()));
+    line(format_args!(
+        "recv rx_to_commit {}",
+        up.rx_to_commit.summary()
+    ));
     line(format_args!("recv pub_to_gpu {}", up.pub_to_gpu.summary()));
     line(format_args!(
         "recv commit_to_gpu {}",
@@ -1102,6 +1123,13 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
         Consumed::Recon(r) => {
             line(format_args!(
                 "recv recon_store frames_bad={sum_bad} recaptures={recaptures}"
+            ));
+            let (to_epoch, epoch) = epoch_latency(&r.rep, &up.t_rx);
+            line(format_args!("recv frame_to_epoch {}", to_epoch.summary()));
+            line(format_args!(
+                "recv epoch_after_scan {} clock_err_us={:.1}",
+                epoch.summary(),
+                r.rep.epoch_clock_ns as f64 / 1e3
             ));
             r.rep.stored != up.frames || r.rep.landed != r.rep.stored
         }

@@ -230,7 +230,8 @@ fn directions_match_central_differences() {
         batch_size: BATCH,
         cost: Cost::Poisson,
         seed: 0,
-    });
+    })
+    .unwrap();
     let views = &s.addr.views()[..BATCH * s.addr.nmode()];
     for (k, c) in s.cases.iter().enumerate().take(2) {
         let b = LsqmlBatch::new(
@@ -322,6 +323,7 @@ fn step_matches_ptychi() {
             cost: Cost::Poisson,
             seed: 0,
         })
+        .unwrap()
         .with_preconditioner(pre)
         .step(
             views,
@@ -361,7 +363,8 @@ fn reconstruction_matches_ptychi() {
             batch_size: BATCH,
             cost: Cost::Poisson,
             seed: 7,
-        });
+        })
+        .unwrap();
         let want: Vec<_> = trace.iter().filter(|r| r[0] == k as f64).collect();
         let epochs = want.len() - 1;
         let mut llks = vec![poisson_llk(&s, c, &object, &probe)];

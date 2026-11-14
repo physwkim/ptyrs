@@ -481,7 +481,7 @@ pub mod kernels {
                 inv_n
             } else {
                 let calc = mode_power(psi, plane0, nmode, n, at) * inv_n;
-                (obs as f32 / calc.max(1e-12)).sqrt() * inv_n
+                zsqrt(zdiv(obs as f32, calc.max(1e-12))) * inv_n
             };
             for m in 0..nmode as usize {
                 let j = (plane0 + m) * n + at;

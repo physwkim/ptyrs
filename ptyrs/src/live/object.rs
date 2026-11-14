@@ -10,11 +10,12 @@
 //! layout, are backed with those rows and start at zero. The
 //! `tile_views` slabs of [`crate::gpu::Views`] are in storage the live side
 //! owns: tile
-//! `t = ty * ntx + tx` of [`OBJ_TILE`] pixels per side has the `cap` slots
-//! `tile_views[t * cap..]`, and its run is the first `tile_len[t]` of them,
-//! appended on the device by `bin_views`. Slots past the run are never read.
-//! [`LiveObject::init_tiles`] readies a backed tile before any view on it is
-//! binned, so `tile_len[t] > 0` only for ready tiles.
+//! `t = ty * ntx + tx` of [`OBJ_TILE`] pixels per side has the slots
+//! `tile_views[start[t]..start[t + 1]]`, `cap` for each tile the object bins
+//! and none for the others, packed in tile order; its run is the first
+//! `tile_len[t]` of them, appended on the device by `bin_views`. Slots past
+//! the run are never read. [`LiveObject::init_tiles`] readies a backed tile
+//! before any view on it is binned, so `tile_len[t] > 0` only for ready tiles.
 //!
 //! Every access goes through the storage's lease, on the object's stream.
 
@@ -29,14 +30,15 @@ use cuda_core::{Context, DeviceBuffer, DriverError, Event, IntoResult, PinnedHos
 use crate::live::grow::{Backer, GrowBuf, GrowError};
 
 /// Where a [`LiveObject`]'s tiles sit in its buffers.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Layout {
     nobj: usize,
     /// `[nyo, nxo]`.
     shape: [usize; 2],
     /// `[nty, ntx]`.
     tiles: [usize; 2],
-    cap: usize,
+    /// Tile `t`'s slab is slots `start[t]..start[t + 1]` of `tile_views`.
+    start: Arc<[u32]>,
 }
 
 impl Layout {
@@ -59,10 +61,11 @@ impl Layout {
         (0..self.nobj).map(move |z| (z * nyo + rows.start) * nxo..(z * nyo + rows.end) * nxo)
     }
 
-    /// The bytes of tile `[ty, tx]`'s slab in `tile_views`.
+    /// The bytes of tile `[ty, tx]`'s slab in `tile_views`, empty for a tile
+    /// without one.
     fn slab(&self, [ty, tx]: [usize; 2]) -> Range<usize> {
-        let (at, slab) = ((ty * self.tiles[1] + tx) * self.cap * 4, self.cap * 4);
-        at..at + slab
+        let t = ty * self.tiles[1] + tx;
+        self.start[t] as usize * 4..self.start[t + 1] as usize * 4
     }
 }
 
@@ -121,10 +124,7 @@ pub struct LiveObject {
 }
 
 impl LiveObject {
-    /// Reserves `nobj` planes of `shape` pixels, their update sums and `cap`
-    /// view slots per tile, backed `chunk` bytes at a time by
-    /// [`Self::backer`]; fills and copies run on `stream`. Nothing of the
-    /// object, the sums or the slabs is backed yet.
+    /// [`Self::owned`] with a slab on every tile.
     pub fn new(
         stream: &Arc<Stream>,
         nobj: usize,
@@ -133,15 +133,51 @@ impl LiveObject {
         fill: [f32; 2],
         chunk: usize,
     ) -> Result<Self, GrowError> {
+        let [nty, ntx] = shape.map(|n| n.div_ceil(OBJ_TILE as usize));
+        let all: Vec<u32> = (0..(nty * ntx) as u32).collect();
+        Self::owned(stream, nobj, shape, cap, fill, chunk, &all)
+    }
+
+    /// Reserves `nobj` planes of `shape` pixels, their update sums and `cap`
+    /// view slots for each tile of `own`, ascending tile ids, backed `chunk`
+    /// bytes at a time by [`Self::backer`]; fills and copies run on
+    /// `stream`. Nothing of the object, the sums or the slabs is backed yet.
+    pub fn owned(
+        stream: &Arc<Stream>,
+        nobj: usize,
+        shape: [usize; 2],
+        cap: usize,
+        fill: [f32; 2],
+        chunk: usize,
+        own: &[u32],
+    ) -> Result<Self, GrowError> {
         let ctx = stream.context();
         let [nyo, nxo] = shape;
         let t = OBJ_TILE as usize;
         let tiles = [nyo.div_ceil(t), nxo.div_ceil(t)];
         let ntiles = tiles[0] * tiles[1];
-        assert!(
-            ntiles * cap <= u32::MAX as usize,
-            "{ntiles} tiles of {cap} slots pass u32 offsets"
-        );
+        let bad = |m: String| GrowError::from(crate::gpu::Error::Shape(m));
+        let (mut owned, mut start) = (own.iter().peekable(), vec![0u32]);
+        for t in 0..ntiles as u32 {
+            let slab = if owned.next_if_eq(&&t).is_some() {
+                cap
+            } else {
+                0
+            };
+            let end = start[t as usize] as usize + slab;
+            let end = u32::try_from(end).map_err(|_| {
+                bad(format!(
+                    "{} slabs of {cap} slots pass u32 offsets",
+                    own.len()
+                ))
+            })?;
+            start.push(end);
+        }
+        if owned.peek().is_some() {
+            return Err(bad(format!(
+                "own tiles {own:?} are not ascending ids under {ntiles}"
+            )));
+        }
         let len = nobj * nyo * nxo;
         let obj = GrowBuf::new(ctx, len * 8, chunk)?;
         let num = GrowBuf::new(ctx, len * 8, chunk)?;
@@ -157,12 +193,12 @@ impl LiveObject {
             num,
             den,
             sums,
-            tile_views: GrowBuf::new(ctx, ntiles * cap * 4, chunk)?,
+            tile_views: GrowBuf::new(ctx, start[ntiles] as usize * 4, chunk)?,
             layout: Layout {
                 nobj,
                 shape,
                 tiles,
-                cap,
+                start: start.into(),
             },
             fill,
             stream: stream.clone(),
@@ -171,15 +207,15 @@ impl LiveObject {
 
     /// A backer of this object's tiles, for another thread.
     pub fn backer(&self) -> ObjectBacker {
-        let l = self.layout;
+        let l = self.layout.clone();
         ObjectBacker {
             obj: self.obj.backer(),
             num: self.num.backer(),
             den: self.den.backer(),
             tile_views: self.tile_views.backer(),
-            layout: l,
             rows: vec![false; l.tiles[0]],
             slabs: vec![false; l.tiles[0] * l.tiles[1]],
+            layout: l,
         }
     }
 
@@ -202,15 +238,20 @@ impl LiveObject {
         &self.sums
     }
 
-    /// The slabs, typed for `Views::from_parts` with [`Self::cap`].
+    /// The slabs, typed for `Views::from_slabs` with [`Self::slab_starts`].
     ///
     /// # Safety
     /// Work through the views may only touch the slab of a tile
     /// [`Self::init_tiles`] readied.
     pub unsafe fn tile_views(&self) -> Result<DeviceBuffer<u32>, DriverError> {
-        let ntiles = self.layout.tiles[0] * self.layout.tiles[1];
+        let n = self.layout.start[self.layout.start.len() - 1] as usize;
         // SAFETY: forwarded to the caller.
-        unsafe { self.tile_views.typed(ntiles * self.layout.cap) }
+        unsafe { self.tile_views.typed(n) }
+    }
+
+    /// Tile `t`'s slab is slots `start[t]..start[t + 1]` of [`Self::tile_views`].
+    pub fn slab_starts(&self) -> &[u32] {
+        &self.layout.start
     }
 
     pub fn nobj(&self) -> usize {
@@ -225,10 +266,6 @@ impl LiveObject {
     /// `[nty, ntx]` tiles of [`OBJ_TILE`] pixels per side.
     pub fn tiles(&self) -> [usize; 2] {
         self.layout.tiles
-    }
-
-    pub fn cap(&self) -> usize {
-        self.layout.cap
     }
 
     /// Object bytes backed so far, every plane.
@@ -312,7 +349,7 @@ impl LiveObject {
     /// behind the work already queued there, and returns without waiting
     /// for it; [`Snapshot::wait`] reads the result.
     pub fn snapshot(&self, snap: &mut Snapshot) -> Result<(), GrowError> {
-        let l = self.layout;
+        let l = &self.layout;
         assert_eq!(
             (snap.nobj, snap.shape),
             (l.nobj, l.shape),
@@ -379,6 +416,12 @@ pub(crate) fn sleeping_event(ctx: &Arc<Context>) -> Result<Event, DriverError> {
     ))
 }
 
+/// A [`sleeping_event`] that also records when it completed, for
+/// [`Event::elapsed_time`].
+pub(crate) fn timed_sleeping_event(ctx: &Arc<Context>) -> Result<Event, DriverError> {
+    ctx.new_event_with_flags(Some(sys::CUevent_flags_enum_CU_EVENT_BLOCKING_SYNC))
+}
+
 /// A host copy of a [`LiveObject`], filled by [`LiveObject::snapshot`] and
 /// read only through [`wait`](Self::wait); dropping it also waits, so a
 /// queued copy never writes freed memory.
@@ -395,7 +438,7 @@ pub struct Snapshot {
 impl Snapshot {
     pub fn new(o: &LiveObject) -> Result<Self, DriverError> {
         let ctx = o.stream.context();
-        let l = o.layout;
+        let l = &o.layout;
         let [nyo, nxo] = l.shape;
         Ok(Self {
             buf: PinnedHostBuffer::zeroed(ctx, l.nobj * nyo * nxo)?,

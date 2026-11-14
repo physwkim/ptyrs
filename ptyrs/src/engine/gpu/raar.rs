@@ -3,7 +3,7 @@
 use crate::gpu::Error as GpuError;
 use cuda_async::device_operation::ExecutionContext;
 
-use super::device::{M1Bufs, PassesMut};
+use super::device::{CarriedMut, M1Bufs, PassesMut};
 use super::dm::{Carried, Mix};
 use super::{Bufs, Epoch, GpuPtycho};
 use crate::engine::{EngineError, RaarParams};
@@ -24,11 +24,12 @@ impl GpuPtycho {
 }
 
 impl Bufs<'_> {
-    /// One RAAR cycle enqueued on `ctx`; `first` for cycle 0 of a call.
+    /// One RAAR cycle on `w`'s stacks enqueued on `ctx`; `first` for cycle 0 of a call.
     pub(super) fn raar_cycle(
         &mut self,
         ctx: &ExecutionContext,
         passes: &mut PassesMut<'_>,
+        w: &mut CarriedMut<'_>,
         params: &RaarParams,
         first: bool,
     ) -> Result<(), GpuError> {
@@ -40,25 +41,26 @@ impl Bufs<'_> {
             inertia: [params.obj_inertia, params.probe_inertia],
             loops: params.loop_obj_probe,
         };
-        self.carried_cycle(ctx, passes, &c)
+        self.carried_cycle(ctx, passes, w, &c)
     }
 
-    /// Stack `s`'s RAAR exit waves and iterate by M1's launches.
+    /// `w`'s stack `s`'s RAAR exit waves and iterate by M1's launches, `PO` through the
+    /// shared scratch.
     pub(super) fn raar_m1(
         &mut self,
         ctx: &ExecutionContext,
         m1: &mut M1Bufs<'_>,
+        w: &mut CarriedMut<'_>,
         s: usize,
         beta: f32,
         first: bool,
     ) -> Result<(), GpuError> {
-        let (st, iterate) = self.stacks.raar(s);
-        let len = st.frames.len;
-        let (views, stack) = (self.views, self.table.at(s));
-        let (obj, probe) = (&*self.obj, &*self.probe);
+        let (stack, frames) = (w.cut.at(s), &w.cut.frames[s]);
+        let (plans, psi, iterate) = w.raar(s);
+        let (views, obj, probe) = (self.views, &*self.obj, &*self.probe);
         if first {
             // `R = PO`, into both sets.
-            for out in [&mut *st.psi, &mut *iterate] {
+            for out in [&mut *psi, &mut *iterate] {
                 self.kernels
                     .obj_probe_to_psi(ctx, views, stack, obj, probe, out)?;
             }
@@ -66,8 +68,8 @@ impl Bufs<'_> {
             self.kernels
                 .obj_probe_to_psi(ctx, views, stack, obj, probe, m1.scratch)?;
             self.kernels
-                .raar_iterate(ctx, st.psi, iterate, m1.scratch, len, beta)?;
+                .raar_iterate(ctx, psi, iterate, m1.scratch, frames.len, beta)?;
         }
-        self.project(ctx, m1, s, None)
+        self.project(ctx, stack, plans.get(frames.plan), psi, None)
     }
 }

@@ -339,6 +339,9 @@ pub struct UploadReport {
     pub max_inflight: usize,
     /// Monitor callback → H2D completion seen by the uploader.
     pub rx_to_gpu: Histogram,
+    /// Monitor callback → worker commit into the pinned ring, the span the
+    /// Python baseline's `rx_to_ring` times.
+    pub rx_to_commit: Histogram,
     /// Simulator `dataTimeStamp` → H2D completion.
     pub pub_to_gpu: Histogram,
     /// Worker commit → H2D completion (batching + copy + poll).
@@ -346,6 +349,8 @@ pub struct UploadReport {
     pub cpu_ns: i64,
     /// uid of every landed frame, by store place.
     pub uids: Vec<i32>,
+    /// Monitor callback wall time of every landed frame, by store place.
+    pub t_rx: Vec<i64>,
 }
 
 /// A batch copy in flight: frames `seq0..seq0 + n` of the ring to places
@@ -394,10 +399,12 @@ pub fn run_uploader(
         bytes: 0,
         max_inflight: 0,
         rx_to_gpu: Histogram::new(200_000),
+        rx_to_commit: Histogram::new(200_000),
         pub_to_gpu: Histogram::new(200_000),
         commit_to_gpu: Histogram::new(200_000),
         cpu_ns: 0,
         uids: Vec::new(),
+        t_rx: Vec::new(),
     };
     let cpu0 = thread_cpu_ns();
     // Sequence numbers below `joined` are committed and landing or dropped,
@@ -527,11 +534,14 @@ pub fn run_uploader(
             };
             for seq in seqs {
                 let m = &ring.meta[at(seq)];
-                rep.rx_to_gpu.record(t - m.t_rx.load(Ordering::Relaxed));
+                let t_rx = m.t_rx.load(Ordering::Relaxed);
+                let t_commit = m.t_commit.load(Ordering::Relaxed);
+                rep.rx_to_gpu.record(t - t_rx);
+                rep.rx_to_commit.record(t_commit - t_rx);
                 rep.pub_to_gpu.record(t - m.t_pub.load(Ordering::Relaxed));
-                rep.commit_to_gpu
-                    .record(t - m.t_commit.load(Ordering::Relaxed));
+                rep.commit_to_gpu.record(t - t_commit);
                 rep.uids.push(m.uid.load(Ordering::Relaxed));
+                rep.t_rx.push(t_rx);
             }
             rep.frames += f.n;
             ring.released.store(f.release, Ordering::Release);

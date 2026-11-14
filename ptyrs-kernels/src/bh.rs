@@ -17,7 +17,7 @@ use cuda_device::{device, thread};
 use cuda_host::cuda_module;
 
 use crate::grad::ObjProbePtrs;
-use crate::pixel::{PIXEL_THREADS, cmul, cmul_conj, freq, load_c, ramp};
+use crate::pixel::{PIXEL_THREADS, cmul, cmul_conj, freq, load_c, ramp, zdiv};
 
 /// pty-chi's offset on the modelled amplitude `A`.
 pub const BH_EPS: f32 = 1e-8;
@@ -167,7 +167,7 @@ pub mod bh_kernels {
                 0.0
             } else {
                 let a = (mode_power(psi, plane0, nmode, n, at) * inv_n).sqrt() + BH_EPS;
-                2.0 * (1.0 - (count as f32).sqrt() / a) * inv_n
+                2.0 * (1.0 - zdiv(zsqrt(count as f32), a)) * inv_n
             };
             for m in 0..nmode as usize {
                 let j = (plane0 + m) * n + at;
@@ -294,7 +294,7 @@ pub mod bh_kernels {
             }
             let count = unsafe { *obs.counts.add(frame * n + d) };
             if count != MASKED {
-                let root = (count as f32).sqrt();
+                let root = zsqrt(count as f32);
                 let t = unsafe { far_term(f.far, fl * nmode * n + at, n, nmode, cg, root) };
                 // Unrolled, as every loop over `acc`, so it stays in registers.
                 #[unroll]
@@ -719,7 +719,7 @@ pub mod bh_kernels {
             let k = psi_index((d / nx as usize) as u32, (d % nx as usize) as u32, ny, nx);
             let count = unsafe { *counts.add(frame * n + d) };
             if count != MASKED {
-                let root = (count as f32).sqrt();
+                let root = zsqrt(count as f32);
                 let t = unsafe { far_term(f.far, fl * nmode * n + k, n, nmode, cg, root) };
                 // Unrolled, as every loop over `acc`, so it stays in registers.
                 #[unroll]
@@ -822,8 +822,8 @@ pub(crate) unsafe fn far_term(
         }
     }
     let a = (calc * inv_n).sqrt() + BH_EPS;
-    let fa = 1.0 - root / a;
-    let k = root / (a * a * a);
+    let fa = 1.0 - zdiv(root, a);
+    let k = zdiv(root, a * a * a);
     let (cu, cv) = (cu * inv_n, cv * inv_n);
     [
         2.0 * (fa * suu * inv_n + k * cu * cu),

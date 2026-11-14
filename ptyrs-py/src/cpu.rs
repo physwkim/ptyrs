@@ -502,7 +502,8 @@ impl Lsqml {
             batch_size,
             cost: crate::cost(cost)?,
             seed,
-        });
+        })
+        .map_err(Error::from)?;
         let features = position_only(position)?;
         Ok(Self {
             inner: lsqml.with_features(features).map_err(Error::from)?,
@@ -592,7 +593,8 @@ impl Bh {
             probe_rho,
             position_rho,
             seed,
-        });
+        })
+        .map_err(Error::from)?;
         let features = position_only(position)?;
         Ok(Self(bh.with_features(features).map_err(Error::from)?))
     }

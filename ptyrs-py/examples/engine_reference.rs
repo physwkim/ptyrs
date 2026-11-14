@@ -174,7 +174,7 @@ fn opr(path: &Path) -> Result<(), Box<dyn Error>> {
         let (mut object, mut probe) = (p.object().clone(), p.probe().clone());
         let mut var = variation(probe.plane(0), g.frame, nframe, intensity);
         write_variation(&group, &var)?;
-        let mut lsqml = Lsqml::new(params);
+        let mut lsqml = Lsqml::new(params)?;
         for e in 1..=NEPOCH {
             let objects = slice::from_mut(&mut object);
             let steps = lsqml.epoch(
@@ -291,7 +291,7 @@ fn optics_runs(
     group.set_attr_numeric("batch_size", &(params.batch_size as u64))?;
     group.set_attr_numeric("seed", &params.seed)?;
     let (mut objects, mut probe) = (start.clone(), p0.clone());
-    let mut lsqml = Lsqml::new(params);
+    let mut lsqml = Lsqml::new(params)?;
     let mut none = ProbeVariation::none(frame);
     for e in 1..=NEPOCH {
         let steps = lsqml.epoch(&addr, &obs, optics, &mut objects, &mut probe, &mut none);
@@ -327,7 +327,7 @@ fn optics_runs(
     group.set_attr_numeric("probe_rho", &params.probe_rho)?;
     group.set_attr_numeric("seed", &params.seed)?;
     let (mut objects, mut probe) = (start, p0);
-    let mut bh = Bh::new(params);
+    let mut bh = Bh::new(params)?;
     for e in 1..=NEPOCH {
         let steps = bh.epoch(&addr, &obs, optics, &mut objects, &mut probe);
         let at = group.create_group(&format!("epoch{e}"))?;

@@ -28,7 +28,7 @@ use cuda_device::{async_copy, device, shared::DynamicSharedArray, thread};
 use crate::pixel::{
     LlkPartial, MASKED, PositionPartial, ScalePartial, StackCtl, StackGeom, SumPtrs, TilePtrs,
     ViewAddr, WARP, cmul, cmul_conj, freq, llk_add, load_c, obj_pixel_sources, psi_index,
-    quad_phase, ramp, sample_obj, stack_frames, store_c,
+    quad_phase, ramp, sample_obj, stack_frames, store_c, zdiv, zsqrt,
 };
 use crate::{FFT_EPT_MAX, fft_ept};
 
@@ -577,7 +577,7 @@ pub unsafe fn cols<const NY: u32, const TERMS: u32>(
                 *p.background_ratio.add(fl as usize * n + j) = if obs == MASKED {
                     0.0
                 } else {
-                    obs as f32 / calc.max(1e-12)
+                    zdiv(obs as f32, calc.max(1e-12))
                 };
             }
             if m == 0 && obs != MASKED {
@@ -587,15 +587,15 @@ pub unsafe fn cols<const NY: u32, const TERMS: u32>(
                 }
                 if sums {
                     sacc.intensity += intensity;
-                    sacc.ratio += obs * intensity / calc.max(1e-12);
-                    sacc.amplitude += (obs * intensity).sqrt();
+                    sacc.ratio += zdiv(obs * intensity, calc.max(1e-12));
+                    sacc.amplitude += zsqrt(obs * intensity);
                 }
             }
             if project {
                 let scale = if obs == MASKED {
                     inv_n
                 } else {
-                    (obs as f32 / calc.max(1e-12)).sqrt() * inv_n
+                    zsqrt(zdiv(obs as f32, calc.max(1e-12))) * inv_n
                 };
                 r[2 * i as usize] *= scale;
                 r[2 * i as usize + 1] *= scale;
@@ -604,7 +604,7 @@ pub unsafe fn cols<const NY: u32, const TERMS: u32>(
                 let scale = if obs == MASKED {
                     0.0
                 } else {
-                    2.0 * sf * (1.0 - obs as f32 / calc.max(1e-12)) * inv_n
+                    2.0 * sf * (1.0 - zdiv(obs as f32, calc.max(1e-12))) * inv_n
                 };
                 r[2 * i as usize] *= scale;
                 r[2 * i as usize + 1] *= scale;

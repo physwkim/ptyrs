@@ -28,14 +28,14 @@ use std::time::{Duration, Instant};
 use crate::base::{C64, CoreError};
 use crate::gpu::{C32, ViewAddr};
 use crossbeam_channel::{Receiver, Sender, TryRecvError};
-use cuda_core::Context;
+use cuda_core::{Context, DriverError, Event};
 use serde::Deserialize;
 
 use crate::live::args::Args;
 use crate::live::converge::{Clock, ClockError};
 use crate::live::farfield::Ptycho;
 use crate::live::grow::GrowError;
-use crate::live::object::{Snapshot, sleeping_event};
+use crate::live::object::{Snapshot, timed_sleeping_event};
 use crate::live::pv_out::PvCfg;
 use crate::live::recon::{ApConfig, LiveAp, ViewPlacement};
 use crate::live::ring::{DeviceStore, FrameBatch};
@@ -249,6 +249,30 @@ pub struct FollowReport {
     /// Per batch, the epochs queued before it landed and the frames stored
     /// with it: the schedule that, replayed, gives the same object.
     pub landings: Vec<(u64, u64)>,
+    /// Wall time, ns, each epoch finished on the GPU, by epoch.
+    pub epoch_done: Vec<i64>,
+    /// How long stamping the clock of `epoch_done` took: its error bound.
+    pub epoch_clock_ns: i64,
+}
+
+impl FollowReport {
+    /// GPU time, ns, of each epoch queued once the scan had landed, from
+    /// [`Self::epoch_done`]: the only source of epoch time. The first epoch
+    /// has no end before it to time from.
+    pub fn epochs_after_scan(&self) -> impl Iterator<Item = i64> + '_ {
+        let from = self
+            .scan_epochs
+            .map_or(self.epoch_done.len(), |s| s.max(1) as usize - 1);
+        self.epoch_done[from..].windows(2).map(|w| w[1] - w[0])
+    }
+
+    /// Mean of [`Self::epochs_after_scan`], ms.
+    pub fn epoch_ms(&self) -> Option<f64> {
+        let (n, ns) = self
+            .epochs_after_scan()
+            .fold((0u64, 0i64), |(n, ns), t| (n + 1, ns + t));
+        (n > 0).then(|| ns as f64 / 1e6 / n as f64)
+    }
 }
 
 /// The views of the frames at `positions`.
@@ -345,7 +369,7 @@ pub fn run_ap_consumer(
         )
     };
     let mut snaps = [live.new_snapshot()?, live.new_snapshot()?];
-    let fence = [sleeping_event(&ctx)?, sleeping_event(&ctx)?];
+    let fence = [timed_sleeping_event(&ctx)?, timed_sleeping_event(&ctx)?];
     let mut view = match preview {
         Some(p) => Some((p, live.new_snapshot()?)),
         None => None,
@@ -355,6 +379,17 @@ pub fn run_ap_consumer(
     let mut viewing: Option<u64> = None;
     let mut viewed: Option<Instant> = None;
     let mut llk_sent: Option<Instant> = None;
+    // Epoch ends are timed from `anchor`, stamped on the idle stream.
+    let anchor = ctx.new_event()?;
+    stream.synchronize()?;
+    let t0 = wall_ns();
+    anchor.record(&stream)?;
+    anchor.synchronize()?;
+    let t_anchor = wall_ns();
+    let done_at = |f: &Event| -> Result<i64, DriverError> {
+        Ok(t_anchor + (f64::from(anchor.elapsed_time(f)?) * 1e6) as i64)
+    };
+    let mut epoch_done = Vec::new();
     let _ = captured.send(());
 
     let mut positions: Vec<(f64, f64)> = Vec::with_capacity(shape.nframe as usize);
@@ -407,6 +442,9 @@ pub fn run_ap_consumer(
             let f = &fence[(live.epochs() % 2) as usize];
             // The epoch two before this one has finished.
             f.synchronize()?;
+            if live.epochs() >= 2 {
+                epoch_done.push(done_at(f)?);
+            }
             // So has a copy queued after the epoch before that one, behind
             // its fence: it is sent without waiting.
             if let Some(e) = viewing
@@ -458,6 +496,10 @@ pub fn run_ap_consumer(
     // Nothing may still read the store once this returns.
     stream.synchronize()?;
     fed?;
+    // Each fence follows one of the last two epochs.
+    for e in epoch_done.len() as u64..live.epochs() {
+        epoch_done.push(done_at(&fence[(e % 2) as usize])?);
+    }
     // The viewer's last LLK and copy are those of the last epoch.
     if let Some((p, mut snap)) = view
         && live.epochs() > 0
@@ -481,6 +523,8 @@ pub fn run_ap_consumer(
         plan_time,
         plan_mapped_bytes,
         landings,
+        epoch_done,
+        epoch_clock_ns: t_anchor - t0,
     })
 }
 
@@ -595,7 +639,8 @@ pub fn plane(px: &[[f32; 2]], shape: [usize; 2]) -> Vec<C64> {
 }
 
 /// The first of `kept`, in order, that `clock` finds converged, with its
-/// time from the scan's end; checked on `threads` threads.
+/// time from the scan's end to [`Kept::taken`], both host clock; checked on
+/// `threads` threads.
 pub fn first_converged(
     clock: &Clock,
     kept: &[Kept],
@@ -897,5 +942,24 @@ mod tests {
             .unwrap();
         assert_eq!(i, first);
         assert_eq!(after.as_nanos() as i64, rep.kept[i].taken - s.scan_end);
+    }
+
+    /// The reported epoch time is the GPU fences' over the epochs after the
+    /// scan landed. Every epoch has an end, in order, each before the host
+    /// held a snapshot that follows it.
+    #[test]
+    fn the_epoch_time_is_the_gpu_fences_after_the_scan() {
+        let rep = streamed(None).rep;
+        let (e, s) = (rep.epochs as usize, rep.scan_epochs.unwrap() as usize);
+        assert!(s > 0, "no epoch ran while the scan landed");
+        let done = &rep.epoch_done;
+        assert_eq!(done.len(), e);
+        assert!(done.windows(2).all(|w| w[0] < w[1]));
+        // CUDA times events to about 0.5 µs.
+        for k in &rep.kept {
+            assert!(done[k.epochs as usize - 1] <= k.taken + rep.epoch_clock_ns + 1_000);
+        }
+        let gpu = (done[e - 1] - done[s - 1]) as f64 / 1e6 / (e - s) as f64;
+        assert_eq!(rep.epoch_ms(), Some(gpu));
     }
 }

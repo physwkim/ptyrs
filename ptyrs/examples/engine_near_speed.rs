@@ -121,7 +121,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     batch_size: batch.parse()?,
                     cost: Cost::Amplitude,
                     seed: SEED,
-                })),
+                })?),
                 ProbeVariation::none(s.probe.plane_shape()),
             ),
             ["bh", batch, rho] => Method::Bh(Bh::new(BhParams {
@@ -129,7 +129,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 probe_rho: rho.parse()?,
                 position_rho: 0.1,
                 seed: SEED,
-            })),
+            })?),
             _ => return Err(usage.into()),
         };
         let (mut object, mut probe) = (s.object.clone(), s.probe.clone());

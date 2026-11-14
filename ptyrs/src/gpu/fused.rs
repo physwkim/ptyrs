@@ -293,6 +293,14 @@ impl FusedBufs {
         Ok(bufs)
     }
 
+    /// Bytes per frame of `nf_max` of the shift scratch [`Self::with_shift`] adds to the work
+    /// planes of [`Self::new`] (`nmode` complex planes per frame): `T`, the adjoint, the
+    /// object planes and the power.
+    pub fn shift_bytes(dims: &ViewDims) -> usize {
+        let n = dims.n();
+        (2 * dims.nprobe + dims.nobj) as usize * n * size_of::<C32>() + n * size_of::<f32>()
+    }
+
     /// The stack's transforms. After an AP [`Kernels::fused_project`], its projected exit
     /// waves in the layout of M1 `psi` (origin at `[0, 0]`, plane `kl` view `f0 * nmode +
     /// kl`), what [`Kernels::psi_to_probe`] takes.

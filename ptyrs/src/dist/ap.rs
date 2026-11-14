@@ -23,7 +23,7 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use crate::base::{AddrTable, View};
+use crate::base::AddrTable;
 use crate::gpu::{
     C32, Exit, FarSums, FusedBufs, FusedInputs, FusedSums, Kernels, LlkPartial, LlkSums, Model,
     StackTable, UpdateSums, ViewAddr, ViewDims, Views, view_tiles,
@@ -31,8 +31,9 @@ use crate::gpu::{
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{Context, DeviceBuffer, Stream};
 
-use crate::dist::exchange::{self, Pull, Run, Runs};
-use crate::dist::{DEFAULT_TILE, DistError, Exchange, Gpu, Partition, Scheme, TileGrid, Workers};
+use crate::dist::exchange::{self, Pull, Run};
+use crate::dist::halo::{Halo, HaloBufs, HaloRows, Window, peers, view_addr};
+use crate::dist::{DEFAULT_TILE, DistError, Exchange, Gpu, Partition, Scheme, Workers};
 
 /// Leaf regions every run is cut from; a run uses 1, 2 or 4 GPUs.
 pub const NLEAF: usize = 4;
@@ -71,79 +72,6 @@ struct Stack {
     frames: Range<u32>,
 }
 
-/// The part of the object a region's GPU holds: the bounding box of its own tiles and the
-/// halo tiles it reads, in whole tiles, so its kernel tiles are the object's shifted.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Window {
-    /// First object pixel `[y, x]`.
-    at: [usize; 2],
-    /// `[ny, nx]` pixels per object mode.
-    shape: [usize; 2],
-}
-
-impl Window {
-    fn new(grid: &TileGrid, tiles: impl IntoIterator<Item = usize>) -> Self {
-        let (mut lo, mut hi) = ([usize::MAX; 2], [0; 2]);
-        for t in tiles {
-            let c = grid.coords(t);
-            for a in 0..2 {
-                lo[a] = lo[a].min(c[a]);
-                hi[a] = hi[a].max(c[a] + 1);
-            }
-        }
-        let (obj, tile) = (grid.obj(), grid.tile());
-        let at = lo.map(|l| l * tile);
-        Self {
-            at,
-            shape: [0, 1].map(|a| (hi[a] * tile).min(obj[a]) - at[a]),
-        }
-    }
-
-    fn len(&self, nobj: usize) -> usize {
-        nobj * self.shape[0] * self.shape[1]
-    }
-
-    /// Index in the window's `[nobj, ny, nx]` of object pixel `(y, x)` of mode `m`.
-    fn index(&self, m: usize, y: usize, x: usize) -> usize {
-        let [dy, dx] = [(y, 0), (x, 1)].map(|(p, a)| {
-            p.checked_sub(self.at[a])
-                .filter(|&d| d < self.shape[a])
-                .expect("pixel inside the window")
-        });
-        (m * self.shape[0] + dy) * self.shape[1] + dx
-    }
-
-    /// The window of the `[nobj, nyo, nxo]` object `obj`.
-    fn crop(&self, obj: &[C32], [nyo, nxo]: [usize; 2]) -> Vec<C32> {
-        let ([y0, x0], [ny, nx]) = (self.at, self.shape);
-        let mut out = Vec::with_capacity(self.len(obj.len() / (nyo * nxo)));
-        for plane in obj.chunks_exact(nyo * nxo) {
-            for y in y0..y0 + ny {
-                out.extend_from_slice(&plane[y * nxo + x0..][..nx]);
-            }
-        }
-        out
-    }
-
-    /// Index of `grid` tile `t` among the window's tiles, numbered as the kernels number the
-    /// tiles of an object of the window's shape.
-    fn tile(&self, grid: &TileGrid, t: usize) -> u32 {
-        let tile = grid.tile();
-        let ([ty, tx], [y0, x0]) = (grid.coords(t), self.at.map(|p| p / tile));
-        ((ty - y0) * self.shape[1].div_ceil(tile) + tx - x0) as u32
-    }
-
-    /// `v` with offsets into the window.
-    fn view(&self, v: &View) -> ViewAddr {
-        let shift = |o: u32, a: usize| o - self.at[a] as u32;
-        ViewAddr {
-            oy: shift(v.oy, 0),
-            ox: shift(v.ox, 1),
-            ..view_addr(v)
-        }
-    }
-}
-
 /// One region's share, fixed at setup.
 struct RegionPlan {
     window: Window,
@@ -164,27 +92,6 @@ struct RegionPlan {
     owned: Vec<u32>,
 }
 
-/// `len` object pixels of mode `m` from `(y, x)` on.
-#[derive(Clone)]
-struct HaloRow {
-    m: usize,
-    y: usize,
-    x: usize,
-    len: usize,
-}
-
-/// The object rows region `recv` reads from region `owner`'s tiles. `owner` packs them from
-/// word `send_at` of its send buffer on; `recv` pulls them to word `recv_at` of its receive
-/// buffer and unpacks them into its window.
-struct HaloSeg {
-    recv: usize,
-    owner: usize,
-    rows: Vec<HaloRow>,
-    words: u64,
-    send_at: u64,
-    recv_at: u64,
-}
-
 struct Plan {
     run: Partition,
     /// Leaves per region.
@@ -194,8 +101,9 @@ struct Plan {
     probe_inertia: Option<f32>,
     calc_llk: usize,
     regions: Vec<RegionPlan>,
-    /// By receiver, then owner.
-    halo: Vec<HaloSeg>,
+    halo: Halo,
+    /// Per region, the halo rows it packs and unpacks.
+    halo_rows: Vec<HaloRows>,
 }
 
 impl Plan {
@@ -343,7 +251,15 @@ impl Plan {
                 own,
             });
         }
-        let halo = halo_segs(&run, &regions, dims.nobj as usize);
+        let mut halo = Halo::new(
+            &run,
+            regions.iter().map(|rp| rp.halo_read.as_slice()),
+            dims.nobj as usize,
+        );
+        let mut halo_rows = vec![HaloRows::default(); regions.len()];
+        for (r, rp) in regions.iter().enumerate() {
+            halo.read(r, rp.halo_read.iter().map(|&t| t as usize), &mut halo_rows);
+        }
         Ok(Self {
             run,
             k,
@@ -353,6 +269,7 @@ impl Plan {
             calc_llk: cfg.calc_llk,
             regions,
             halo,
+            halo_rows,
         })
     }
 
@@ -369,160 +286,6 @@ impl Plan {
     fn np(&self) -> usize {
         self.dims().nprobe as usize * self.n()
     }
-
-    /// Words of region `r`'s halo send and receive buffers.
-    fn halo_words(&self, r: usize) -> [u64; 2] {
-        let sum = |f: &dyn Fn(&HaloSeg) -> bool| -> u64 {
-            self.halo.iter().filter(|s| f(s)).map(|s| s.words).sum()
-        };
-        [sum(&|s| s.owner == r), sum(&|s| s.recv == r)]
-    }
-
-    /// `[byte offset in region r's window, buffer word, words]` of every row of the segments
-    /// `pick` selects, laid out in the buffer from word `at(segment)` on.
-    fn halo_rows(
-        &self,
-        r: usize,
-        pick: impl Fn(&HaloSeg) -> bool,
-        at: fn(&HaloSeg) -> u64,
-    ) -> impl Iterator<Item = [u64; 3]> {
-        let win = self.regions[r].window;
-        self.halo
-            .iter()
-            .filter(move |s| pick(s))
-            .flat_map(move |s| {
-                let mut w = at(s);
-                s.rows.iter().map(move |row| {
-                    let (off, len) = (win.index(row.m, row.y, row.x), row.len as u64);
-                    w += len;
-                    [(off * size_of::<C32>()) as u64, w - len, len]
-                })
-            })
-    }
-
-    /// Runs copying region `r`'s object rows that others read into its send buffer.
-    fn halo_pack(&self, r: usize, obj: u64, send: u64) -> Vec<Run> {
-        self.halo_rows(r, |s| s.owner == r, |s| s.send_at)
-            .map(|[off, w, len]| Run {
-                dst: send + w * 8,
-                src: obj + off,
-                len,
-            })
-            .collect()
-    }
-
-    /// Runs copying region `r`'s receive buffer into the halo rows of its object.
-    fn halo_unpack(&self, r: usize, obj: u64, recv: u64) -> Vec<Run> {
-        self.halo_rows(r, |s| s.recv == r, |s| s.recv_at)
-            .map(|[off, w, len]| Run {
-                dst: obj + off,
-                src: recv + w * 8,
-                len,
-            })
-            .collect()
-    }
-
-    /// Copy-engine pulls of region `r`'s receive buffer from the owners' send buffers, in
-    /// [`peers`] order.
-    fn halo_pulls(&self, r: usize, ptrs: &[Ptrs]) -> Vec<Pull> {
-        peers(r, ptrs.len())
-            .flat_map(|o| {
-                self.halo
-                    .iter()
-                    .filter(move |s| s.recv == r && s.owner == o)
-            })
-            .map(|s| {
-                let o = &ptrs[s.owner];
-                Pull {
-                    dst: ptrs[r].halo_recv + s.recv_at * 8,
-                    src: o.halo_send + s.send_at * 8,
-                    bytes: (s.words * 8) as usize,
-                    from: o.ctx.clone(),
-                }
-            })
-            .collect()
-    }
-}
-
-/// The regions other than `r` of `n`, from `r + 1` on, wrapping: at each step of pull lists
-/// in this order every region reads a different source, where in index order all would read
-/// region 0 first and queue on its link.
-fn peers(r: usize, n: usize) -> impl Iterator<Item = usize> {
-    (1..n).map(move |i| (r + i) % n)
-}
-
-/// A view as the kernels take it; integer offsets only.
-fn view_addr(v: &View) -> ViewAddr {
-    ViewAddr {
-        oy: v.oy,
-        ox: v.ox,
-        fy: 0.0,
-        fx: 0.0,
-        probe: v.probe,
-        obj: v.obj,
-    }
-}
-
-/// The halo segments of `regions`: each pixel row of consecutive read halo tiles with one
-/// owner, every object mode; receive buffers hold the owners in order, send buffers the
-/// receivers.
-fn halo_segs(run: &Partition, regions: &[RegionPlan], nobj: usize) -> Vec<HaloSeg> {
-    let grid = run.grid();
-    let [nyo, nxo] = grid.obj();
-    let tile = grid.tile();
-    let owner = run.owner();
-    let n = regions.len();
-    let mut send_at = vec![0; n];
-    let mut segs = Vec::new();
-    for (r, rp) in regions.iter().enumerate() {
-        let mut rows = vec![Vec::new(); n];
-        let read = &rp.halo_read;
-        for m in 0..nobj {
-            let mut i = 0;
-            while i < read.len() {
-                let t0 = read[i] as usize;
-                let [ty, tx0] = grid.coords(t0);
-                let o = owner[t0] as usize;
-                let mut tx1 = tx0;
-                while let Some(&t) = read.get(i + 1) {
-                    let t = t as usize;
-                    if grid.coords(t) != [ty, tx1 + 1] || owner[t] as usize != o {
-                        break;
-                    }
-                    tx1 += 1;
-                    i += 1;
-                }
-                i += 1;
-                let (x, x1) = (tx0 * tile, ((tx1 + 1) * tile).min(nxo));
-                for y in ty * tile..((ty + 1) * tile).min(nyo) {
-                    rows[o].push(HaloRow {
-                        m,
-                        y,
-                        x,
-                        len: x1 - x,
-                    });
-                }
-            }
-        }
-        let mut recv_at = 0;
-        for (o, rows) in rows.into_iter().enumerate() {
-            let words: u64 = rows.iter().map(|w| w.len as u64).sum();
-            if words == 0 {
-                continue;
-            }
-            segs.push(HaloSeg {
-                recv: r,
-                owner: o,
-                rows,
-                words,
-                send_at: send_at[o],
-                recv_at,
-            });
-            send_at[o] += words;
-            recv_at += words;
-        }
-    }
-    segs
 }
 
 /// Device addresses a region exposes to its peers.
@@ -647,15 +410,6 @@ impl Tree {
     }
 }
 
-/// A region's side of the halo exchange: it packs what others read of its tiles into `send`
-/// and unpacks what it pulled from the owners into `recv`.
-struct Halo {
-    send: DeviceBuffer<u64>,
-    recv: DeviceBuffer<u64>,
-    pack: Runs,
-    unpack: Runs,
-}
-
 struct State {
     k: Kernels,
     ex: Exchange,
@@ -663,7 +417,7 @@ struct State {
     table: StackTable,
     counts: DeviceBuffer<u16>,
     obj: DeviceBuffer<C32>,
-    halo: Halo,
+    halo: HaloBufs,
     probe: DeviceBuffer<C32>,
     bufs: FusedBufs,
     /// Per own stack.
@@ -712,20 +466,22 @@ impl State {
             .transpose()?;
         let obj = rp.window.crop(&data.object, plan.run.grid().obj());
         let obj = DeviceBuffer::from_host(stream, &obj)?;
-        let halo = {
-            let r = gpu.region();
-            let [send, recv] = plan
-                .halo_words(r)
-                .map(|w| DeviceBuffer::<u64>::zeroed(stream, (w as usize).max(1)));
-            let (send, recv) = (send?, recv?);
-            let o = obj.cu_deviceptr();
-            Halo {
-                pack: Runs::new(stream, &plan.halo_pack(r, o, send.cu_deviceptr()))?,
-                unpack: Runs::new(stream, &plan.halo_unpack(r, o, recv.cu_deviceptr()))?,
-                send,
-                recv,
-            }
-        };
+        let rows = &plan.halo_rows[gpu.region()];
+        let nrow = [rows.pack.len(), rows.unpack.len()];
+        // Every row is listed here, so one chunk backs each list.
+        let chunk = nrow[0].max(nrow[1]) * size_of::<Run>();
+        let mut halo = HaloBufs::new(
+            stream,
+            plan.halo.words(gpu.region()),
+            nrow.map(|n| n as u64),
+            rp.window,
+            obj.cu_deviceptr(),
+            chunk,
+        )?;
+        halo.backer().back(rows)?;
+        halo.push(rows)?;
+        // The side stream's unpack leases the lists pushed here, on the main stream.
+        gpu.synchronize()?;
         Ok(Self {
             k: Kernels::load(gpu.ctx())?,
             ex: Exchange::load(gpu.ctx())?,
@@ -752,10 +508,11 @@ impl State {
     }
 
     fn ptrs(&self) -> Ptrs {
+        let [halo_send, halo_recv] = self.halo.ptrs();
         Ptrs {
             ctx: self.obj.context().clone(),
-            halo_send: self.halo.send.cu_deviceptr(),
-            halo_recv: self.halo.recv.cu_deviceptr(),
+            halo_send,
+            halo_recv,
             max_bits: self
                 .obj_sums
                 .as_ref()
@@ -800,7 +557,9 @@ impl State {
             .map(|o| if o == r { ptrs[r].max_bits } else { word(o) })
             .collect();
         Ok(Links {
-            halo: plan.halo_pulls(r, ptrs),
+            halo: plan.halo.pulls(r, ptrs.len(), ptrs[r].halo_recv, |o| {
+                (ptrs[o].ctx.clone(), ptrs[o].halo_send)
+            }),
             tree,
             max: if self.obj_sums.is_some() {
                 max
@@ -912,9 +671,10 @@ impl State {
         }
         if let Some((sums, inertia)) = obj_update {
             k.normalize_obj(&ctx, views, obj, sums, gmax, inertia)?;
-            // SAFETY: the runs address this region's object and send buffer, which its peers
-            // last pulled on their side streams, joined before the fence.
-            unsafe { ex.copy_runs(&stream, &halo.pack)? };
+            // SAFETY: the rows address this region's object, updated just above on this
+            // stream, and its send buffer, which its peers last pulled on their side streams,
+            // joined before the fence.
+            unsafe { halo.pack(ex, &ctx)? };
         }
         if let (Some(t), Some(inertia)) = (tree.as_mut(), plan.probe_inertia) {
             gpu.join()?;
@@ -931,7 +691,7 @@ impl State {
             // touched by nothing else until that join: the interior stacks read own tiles only.
             gpu.side(|s| unsafe {
                 exchange::pull(s, &links.halo)?;
-                ex.copy_runs(s, &halo.unpack)
+                Ok(halo.unpack(ex, &ExecutionContext::new(s.clone()))?)
             })?;
         }
         drop(ctx);
@@ -1196,22 +956,6 @@ mod tests {
             bits(&ap.probe().unwrap()),
             llk_bits(ap.history()),
         )
-    }
-
-    #[test]
-    fn peers_read_a_different_source_at_each_step() {
-        for n in [1, 2, 4] {
-            for r in 0..n {
-                let mut all: Vec<usize> = peers(r, n).collect();
-                all.sort();
-                assert_eq!(all, (0..n).filter(|&o| o != r).collect::<Vec<_>>());
-            }
-            for step in 0..n - 1 {
-                let mut src: Vec<usize> = (0..n).map(|r| peers(r, n).nth(step).unwrap()).collect();
-                src.sort();
-                assert_eq!(src, (0..n).collect::<Vec<_>>(), "n {n} step {step}");
-            }
-        }
     }
 
     /// Object, probe and every LLK are the same bits on 1, 2 and 4 GPUs, for a spiral cut in
