@@ -330,7 +330,8 @@ impl PositionKernels {
         let nframe = pos.dims.nframe;
         check_len("offsets", offsets, 2 * nframe as usize)?;
         let ids = order.ids();
-        let g = pos.dims.scan_geom();
+        // The far field's intensity scale.
+        let scale = (pos.dims.frame[0] * pos.dims.frame[1]) as f32;
         let writes = [pos.sums.storage(), offsets.storage()];
         self.base.launch(ctx, &[ids.storage()], &writes, |stream| {
             // SAFETY: `span` lies in the scan's positions, `pos.sums` sized for every
@@ -345,7 +346,7 @@ impl PositionKernels {
                     dptr(offsets),
                     nframe,
                     rule,
-                    g,
+                    scale,
                 )
             }
         })
