@@ -8,10 +8,10 @@
 //! tiles and view records, before handing it on: a scan inside its plan
 //! makes no growth call, which would hold the driver lock against the
 //! epochs' own calls, and growing past it never stalls them on the call.
-//! With a [`FillHook`] the mapper also predicts each batch's patches from
-//! the counts the uploader tapped and stitches them into a [`Fill`], which
-//! is queued onto the object right behind the batch's landing, ahead of
-//! its first epoch.
+//! With a [`FillHook`] the mapper also hands the counts the uploader tapped
+//! to a filler thread, whose predict call takes every batch queued for it
+//! and whose stitched patches, a [`Fill`], are queued onto the object as
+//! soon as the follow loop has them, as [`crate::live::fill`]'s rule says.
 //!
 //! Once every frame of the scan has landed, or the uploader stopped with
 //! some missing, it goes on iterating and keeps a host copy of the object
@@ -103,7 +103,8 @@ impl ReconCfg {
     /// --recon-snap-every --recon-snaps --recon-settle-max`, and
     /// `--recon-pv PREFIX --recon-pv-bin --recon-pv-period-ms
     /// --recon-pv-llk-period-ms`, and with the `nn` feature `--recon-fill DIR
-    /// --recon-fill-norm --recon-fill-counts --recon-fill-fills`; `None`
+    /// --recon-fill-norm --recon-fill-pack --recon-fill-counts
+    /// --recon-fill-fills`; `None`
     /// without `--recon`.
     pub fn from_args(a: &Args) -> Option<Self> {
         let algo = a.opt("recon")?;
@@ -140,6 +141,7 @@ impl ReconCfg {
                     .unwrap_or_else(|| panic!("--recon-fill needs --recon-fill-norm"));
                 let f = FillCfg::new(predictor, norm);
                 FillCfg {
+                    pack: a.get("recon-fill-pack", f.pack),
                     counts: a.get("recon-fill-counts", f.counts),
                     fills: a.get("recon-fill-fills", f.fills),
                     ..f
@@ -161,6 +163,9 @@ pub struct FillCfg {
     /// The mean frame total of a scan with this beam and exposure
     /// ([`LivePredictor`]).
     pub norm: f64,
+    /// [`FillHook::pack`].
+    #[serde(default = "FillCfg::pack")]
+    pub pack: usize,
     /// [`FillHook::counts`].
     #[serde(default = "FillCfg::counts")]
     pub counts: usize,
@@ -175,13 +180,22 @@ impl FillCfg {
         Self {
             predictor,
             norm,
+            pack: Self::pack(),
             counts: Self::counts(),
             fills: Self::fills(),
         }
     }
 
+    // The padded call takes ~8 ms at 32 frames and ~5 ms at 16: 16 falls
+    // behind a 3 kHz scan, 32 keeps up.
+    fn pack() -> usize {
+        32
+    }
+
+    // The batches queued while a call runs hold one each: up to `pack`
+    // one-frame batches, twice over.
     fn counts() -> usize {
-        8
+        64
     }
 
     fn fills() -> usize {
@@ -189,8 +203,8 @@ impl FillCfg {
     }
 
     /// Loads the predictor of `frame`s onto CUDA device `ordinal` and warms
-    /// it on `batch` frames, the uploader's batch, which takes seconds. Its
-    /// input threads take the calling thread's CPUs.
+    /// it on calls of `pack` frames, which takes seconds, for the uploader's
+    /// batches of `batch`. Its input threads take the calling thread's CPUs.
     pub fn hook(
         &self,
         ordinal: usize,
@@ -198,7 +212,7 @@ impl FillCfg {
         batch: usize,
     ) -> Result<FillHook, NnError> {
         let p = Predictor::load(&self.predictor, &burn::prelude::Device::cuda(ordinal))?;
-        // Otherwise every batch fails, and the run goes on unfilled.
+        // Otherwise every call fails, and the run goes on unfilled.
         if p.config().frame != frame {
             return Err(NnError::Invalid(format!(
                 "a predictor of {:?} frames for {frame:?} frames",
@@ -206,8 +220,9 @@ impl FillCfg {
             )));
         }
         Ok(FillHook {
-            predictor: Box::new(LivePredictor::new(p, self.norm, batch)?),
+            predictor: Box::new(LivePredictor::new(p, self.norm, self.pack)?),
             batch,
+            pack: self.pack,
             counts: self.counts,
             fills: self.fills,
         })
@@ -360,7 +375,7 @@ pub struct FollowReport {
     pub epoch_done: Vec<i64>,
     /// How long stamping the clock of `epoch_done` took: its error bound.
     pub epoch_clock_ns: i64,
-    /// What became of each batch's fill; `None` unless the run filled.
+    /// What became of the batches' fills; `None` unless the run filled.
     pub fill: Option<FillReport>,
 }
 
@@ -384,7 +399,7 @@ impl FollowReport {
     }
 }
 
-/// What a filling run predicts each batch's first object values with
+/// What a filling run predicts its frames' first object values with
 /// ([`crate::live::fill`]). Its uploader takes the [`Tap`] the run's
 /// [`Landing`] carries.
 pub struct FillHook {
@@ -392,6 +407,9 @@ pub struct FillHook {
     /// Frames per batch at most: at least the uploader's
     /// [`UploaderConfig::batch`](crate::live::ring::UploaderConfig::batch).
     pub batch: usize,
+    /// Frames one predict call takes at most, at least `batch`: the
+    /// predictor's batch and [`PatchFill::new`]'s `max_batch`.
+    pub pack: usize,
     /// Batches' counts lent at once ([`Tap::buffers`]).
     pub counts: usize,
     /// Fills in flight at once ([`PatchFill::new`]'s `pool`).
@@ -407,97 +425,133 @@ impl FillHook {
     }
 }
 
-/// What became of the batches' fills: each batch the run received counts
-/// once, in `written`, `no_counts`, `failed`, `no_buffer` or `dropped`.
+/// What became of the fills: each batch the run received is counted once,
+/// in `no_counts` or in the call of `calls` that predicted it, once the
+/// call's fill reached the run.
 pub struct FillReport {
-    /// Fills queued onto the object.
-    pub written: u64,
     /// Batches the uploader sent without counts, every tap buffer lent.
     pub no_counts: u64,
-    /// Batches the predictor failed on; `error` is the first failure.
-    pub failed: u64,
+    /// Each predict call whose fill reached the run, in order.
+    pub calls: Vec<Call>,
+    /// The first failure of the predictor.
     pub error: Option<String>,
-    /// Batches whose fill found every buffer in flight.
-    pub no_buffer: u64,
-    /// Fills of batches the scan did not take whole, never queued.
-    pub dropped: u64,
     /// Pixels of the queued fills whose tiles were not ready.
     pub not_ready: usize,
-    /// Time predicting one batch took, ns.
+    /// Time copying one call's counts together took, ns.
+    pub copy: Histogram,
+    /// Time one predict call took, ns.
     pub predict: Histogram,
-    /// Time stitching one batch's patches took, ns.
+    /// Time stitching one call's patches took, ns.
     pub stitch: Histogram,
+}
+
+/// One predict call: every batch queued for it when it started, up to
+/// [`FillHook::pack`] frames, in landing order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Call {
+    pub batches: u32,
+    pub frames: u32,
+    /// Frames stored up to the end of its last batch.
+    pub upto: u64,
+    /// Batches landed and epochs queued before its fill reached the run.
+    pub landings: usize,
+    pub epochs: u64,
+    pub fate: Fate,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fate {
+    /// Its fill was queued onto the object.
+    Written,
+    /// The predictor failed.
+    Failed,
+    /// Every fill buffer was in flight.
+    NoBuffer,
+    /// The scan did not take all its frames; the fill was never queued.
+    Dropped,
 }
 
 impl FillReport {
     fn new() -> Self {
         Self {
-            written: 0,
             no_counts: 0,
-            failed: 0,
+            calls: Vec::new(),
             error: None,
-            no_buffer: 0,
-            dropped: 0,
             not_ready: 0,
+            copy: Histogram::new(1_000_000),
             predict: Histogram::new(1_000_000),
             stitch: Histogram::new(1_000_000),
         }
     }
 
-    /// Counts a batch's fill, `whole` if the scan took the batch whole;
-    /// returns the fill to queue.
-    fn count(&mut self, p: Predicted, whole: bool) -> Option<Fill> {
-        let fill = match p {
-            Predicted::NoCounts => {
-                self.no_counts += 1;
-                return None;
-            }
-            Predicted::Failed(e) => {
-                self.failed += 1;
+    /// Calls of `fate`, and the batches they held.
+    pub fn of(&self, fate: Fate) -> (usize, u64) {
+        self.calls
+            .iter()
+            .filter(|c| c.fate == fate)
+            .fold((0, 0), |(n, b), c| (n + 1, b + u64::from(c.batches)))
+    }
+
+    /// Counts `p`, which reached the run after `landings` batches landed
+    /// and `epochs` epochs were queued, `taken` if the scan took all its
+    /// frames; returns the fill to queue.
+    fn count(&mut self, p: Packed, taken: bool, landings: usize, epochs: u64) -> Option<Fill> {
+        self.copy.record(p.copy_ns);
+        self.predict.record(p.predict_ns);
+        let (fate, fill) = match p.predicted {
+            Err(e) => {
                 self.error.get_or_insert(e);
-                return None;
+                (Fate::Failed, None)
             }
-            Predicted::Stitched {
-                fill,
-                predict_ns,
-                stitch_ns,
-            } => {
-                self.predict.record(predict_ns);
+            Ok((fill, stitch_ns)) => {
                 self.stitch.record(stitch_ns);
-                fill
+                match fill {
+                    None => (Fate::NoBuffer, None),
+                    Some(f) if taken => (Fate::Written, Some(f)),
+                    Some(_) => (Fate::Dropped, None),
+                }
             }
         };
-        match fill {
-            None => self.no_buffer += 1,
-            Some(f) if whole => {
-                self.written += 1;
-                return Some(f);
-            }
-            Some(_) => self.dropped += 1,
-        }
-        None
+        self.calls.push(Call {
+            batches: p.batches,
+            frames: p.frames,
+            upto: p.upto,
+            landings,
+            epochs,
+            fate,
+        });
+        fill
     }
 }
 
-/// What the mapper made of a batch's fill.
-enum Predicted {
-    /// The uploader sent the batch without counts.
-    NoCounts,
-    Failed(String),
-    /// `fill` is `None` when every fill buffer was in flight.
-    Stitched {
-        fill: Option<Fill>,
-        predict_ns: i64,
-        stitch_ns: i64,
-    },
+/// A batch's counts, tapped for the filler, and the corner of its frames'
+/// windows, view `[oy, ox]` of mode 0.
+struct Tapped {
+    counts: Counts,
+    windows: Vec<[u32; 2]>,
+    upto: u64,
 }
 
-/// A filling run's predictor and stitcher, driven by the mapper.
+/// What the filler made of one call.
+struct Packed {
+    batches: u32,
+    frames: u32,
+    upto: u64,
+    copy_ns: i64,
+    predict_ns: i64,
+    /// The fill, `None` when every fill buffer was in flight, and the time
+    /// stitching it took, ns; or the predictor's failure.
+    predicted: Result<(Option<Fill>, i64), String>,
+}
+
+/// A filling run's predictor and stitcher, driven by the filler.
 struct Predicting {
     predictor: Box<dyn PatchPredictor>,
     stitch: PatchFill,
     frame: [usize; 2],
-    nmode: usize,
+    pack: usize,
+    /// The counts, corners and patches of the call being packed.
+    counts: Vec<u16>,
     corners: Vec<[u32; 2]>,
     patches: Vec<[f32; 2]>,
 }
@@ -520,47 +574,98 @@ impl Predicting {
             ))
             .into());
         }
+        // A batch the call cannot take would wait for ever.
+        if hook.pack < hook.batch {
+            return Err(crate::gpu::Error::Shape(format!(
+                "calls of {} frames for batches of {}",
+                hook.pack, hook.batch
+            ))
+            .into());
+        }
         Ok(Self {
-            stitch: PatchFill::new(ctx, shape, patch, hook.batch, hook.fills)?,
+            stitch: PatchFill::new(ctx, shape, patch, hook.pack, hook.fills)?,
             predictor: hook.predictor,
             frame,
-            nmode: ap.shape.nmode as usize,
-            corners: Vec::with_capacity(hook.batch),
-            patches: Vec::with_capacity(hook.batch * patch[0] * patch[1]),
+            pack: hook.pack,
+            counts: Vec::with_capacity(hook.pack * frame[0] * frame[1]),
+            corners: Vec::with_capacity(hook.pack),
+            patches: Vec::with_capacity(hook.pack * patch[0] * patch[1]),
         })
     }
 
-    /// The fill of the batch whose frames have `views`, from their
-    /// `counts`.
-    fn predict(&mut self, counts: Option<Counts>, views: &[ViewAddr]) -> Predicted {
-        let Some(counts) = counts else {
-            return Predicted::NoCounts;
-        };
+    /// Whether the call being packed has room for `t`.
+    fn fits(&self, t: &Tapped) -> bool {
+        self.corners.len() + t.windows.len() <= self.pack
+    }
+
+    /// Adds `t` to the call being packed; its counts go back to the
+    /// uploader's tap.
+    fn add(&mut self, t: Tapped) {
         let patch = self.stitch.patch();
-        self.corners.clear();
+        self.counts.extend_from_slice(t.counts.as_slice());
         self.corners.extend(
-            views
-                .chunks(self.nmode)
-                .map(|v| patch_corner([v[0].oy, v[0].ox], self.frame, patch)),
+            t.windows
+                .iter()
+                .map(|&w| patch_corner(w, self.frame, patch)),
         );
+    }
+
+    /// Predicts and stitches the call packed, `batches` batches up to frame
+    /// `upto`, its counts copied in `copy_ns`, and empties it.
+    fn call(&mut self, batches: u32, upto: u64, copy_ns: i64) -> Packed {
+        let patch = self.stitch.patch();
         self.patches
             .resize(self.corners.len() * patch[0] * patch[1], [0.0; 2]);
         let t = wall_ns();
         let predicted = self
             .predictor
-            .predict(counts.as_slice(), self.frame, &mut self.patches);
+            .predict(&self.counts, self.frame, &mut self.patches);
         let predict_ns = wall_ns() - t;
-        // Lent back to the uploader's tap.
-        drop(counts);
-        if let Err(e) = predicted {
-            return Predicted::Failed(e);
-        }
-        let t = wall_ns();
-        let fill = self.stitch.stitch(&self.corners, &self.patches);
-        Predicted::Stitched {
-            fill,
+        let predicted = predicted.map(|()| {
+            let t = wall_ns();
+            let fill = self.stitch.stitch(&self.corners, &self.patches);
+            (fill, wall_ns() - t)
+        });
+        let frames = self.corners.len() as u32;
+        self.counts.clear();
+        self.corners.clear();
+        Packed {
+            batches,
+            frames,
+            upto,
+            copy_ns,
             predict_ns,
-            stitch_ns: wall_ns() - t,
+            predicted,
+        }
+    }
+}
+
+/// Packs every batch `tapped` queued while the last call ran into one call,
+/// up to `p.pack` frames, a batch that does not fit opening the next, and
+/// hands each call's fill on, until `tapped` closes or `fwd`'s receiver
+/// goes.
+fn fill_ahead(mut p: Predicting, tapped: Receiver<Tapped>, fwd: Sender<Handed>) {
+    let mut next = None;
+    while let Some(first) = next.take().or_else(|| tapped.recv().ok()) {
+        let t = wall_ns();
+        let mut upto = first.upto;
+        p.add(first);
+        let mut batches = 1;
+        for b in tapped.try_iter() {
+            if !p.fits(&b) {
+                next = Some(b);
+                break;
+            }
+            upto = b.upto;
+            p.add(b);
+            batches += 1;
+        }
+        let copy_ns = wall_ns() - t;
+        if fwd
+            .send(Handed::Fill(p.call(batches, upto, copy_ns)))
+            .is_err()
+        {
+            break;
         }
     }
 }
@@ -575,54 +680,94 @@ fn views_of(cfg: &ApConfig, place: &ViewPlacement, positions: &[(f64, f64)]) -> 
     out
 }
 
-/// What the mapper does to each batch before its landing.
+/// What the run does to each batch apart from its landing.
 struct Ahead {
     /// Backs the batch's frames, if the run does not itself.
     backer: Option<ScanBacker>,
-    /// Predicts the batch's fill, if the run fills.
+    /// Predicts the batches' fills, if the run fills.
     predicting: Option<Predicting>,
 }
 
-/// A batch handed on with its views and, if the run fills, its fill.
-type Handed = (FrameBatch, Vec<ViewAddr>, Option<Predicted>);
+/// What the follow loop is handed, in the order the mapper and the filler
+/// sent it: a call's fill comes after the batches it holds.
+enum Handed {
+    /// A batch, its views, and whether the run fills but the uploader sent
+    /// it without counts.
+    Batch {
+        batch: FrameBatch,
+        views: Vec<ViewAddr>,
+        dry: bool,
+    },
+    Fill(Packed),
+}
 
-/// Does `ahead`'s work on each batch, then hands it on, until `batches`
-/// closes or `fwd`'s receiver goes.
+/// Backs each batch with `backer`, if given, then hands it on, its counts,
+/// if `tap` is given, to the filler, until `batches` closes or `fwd`'s
+/// receiver goes.
 fn back_ahead(
-    mut ahead: Ahead,
+    mut backer: Option<ScanBacker>,
+    tap: Option<Sender<Tapped>>,
     ap: ApConfig,
     place: ViewPlacement,
     batches: Receiver<FrameBatch>,
     fwd: Sender<Handed>,
 ) -> Result<(), GrowError> {
+    let nmode = ap.shape.nmode as usize;
     // Dropped once the scan's last frame is backed: frames past it never
     // land, and the consumer may finish before `batches` closes.
     for mut b in batches {
         let views = views_of(&ap, &place, &b.positions);
-        if let Some(k) = &mut ahead.backer {
+        if let Some(k) = &mut backer {
             k.back(&views)?;
             if b.f0 + b.n >= u64::from(ap.shape.nframe) {
-                ahead.backer = None;
+                backer = None;
             }
         }
-        let predicted = ahead
-            .predicting
-            .as_mut()
-            .map(|p| p.predict(b.counts.take(), &views));
-        if fwd.send((b, views, predicted)).is_err() {
+        let tapped = tap.as_ref().zip(b.counts.take()).map(|(tx, counts)| {
+            let windows = views.chunks(nmode).map(|v| [v[0].oy, v[0].ox]);
+            let t = Tapped {
+                counts,
+                windows: windows.collect(),
+                upto: b.f0 + b.n,
+            };
+            (tx, t)
+        });
+        let dry = tap.is_some() && tapped.is_none();
+        // The batch first, so its fill follows it.
+        if fwd
+            .send(Handed::Batch {
+                batch: b,
+                views,
+                dry,
+            })
+            .is_err()
+        {
+            break;
+        }
+        // The filler is gone only once the follow loop is.
+        if let Some((tx, t)) = tapped
+            && tx.send(t).is_err()
+        {
             break;
         }
     }
     Ok(())
 }
 
-/// The mapper's outcome, once it stopped handing batches on.
-fn joined(mapper: &mut Option<JoinHandle<Result<(), GrowError>>>) -> Result<(), GrowError> {
-    match mapper.take().map(JoinHandle::join) {
-        Some(Ok(r)) => r,
-        Some(Err(panic)) => std::panic::resume_unwind(panic),
-        None => Ok(()),
-    }
+/// `thread`'s outcome, once it ended.
+fn joined<T>(thread: &mut Option<JoinHandle<T>>) -> Option<T> {
+    thread
+        .take()
+        .map(|t| t.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
+}
+
+/// The mapper's outcome, once it and the filler stopped handing on.
+fn ended(
+    filler: &mut Option<JoinHandle<()>>,
+    mapper: &mut Option<JoinHandle<Result<(), GrowError>>>,
+) -> Result<(), GrowError> {
+    joined(filler);
+    joined(mapper).unwrap_or(Ok(()))
 }
 
 /// A live AP run the follow loop drives: a [`LiveAp`] on one GPU or a
@@ -999,8 +1144,8 @@ pub fn run_dist_consumer(
 }
 
 /// Lands the batches into `live` and iterates it, as [`run_ap_consumer`]
-/// says, `prep` done to each batch ahead of its landing and its fill, if
-/// any, queued right behind it; `ready` is called once the run can take
+/// says, `prep` done to each batch ahead of its landing and the fills, if
+/// any, queued as they come; `ready` is called once the run can take
 /// frames, which ends the setup the consumer `entered`.
 fn follow<R: Engine>(
     mut live: R,
@@ -1015,15 +1160,30 @@ fn follow<R: Engine>(
     let (plan_time, plan_mapped_bytes) = (live.plan_time()?, live.mapped_bytes()?);
     let mut fills = prep.predicting.is_some().then(FillReport::new);
     let (fwd, ahead) = crossbeam_channel::unbounded();
+    let (tap, mut filler) = match prep.predicting {
+        Some(p) => {
+            let (tx, tapped) = crossbeam_channel::unbounded();
+            let fwd = fwd.clone();
+            let filler = std::thread::Builder::new()
+                .name("filler".into())
+                .spawn(move || fill_ahead(p, tapped, fwd))
+                .expect("spawn the filler");
+            (Some(tx), Some(filler))
+        }
+        None => (None, None),
+    };
     let mut mapper = {
-        let (ap, place) = (cfg.ap, cfg.place);
+        let (ap, place, backer) = (cfg.ap, cfg.place, prep.backer);
         Some(
             std::thread::Builder::new()
                 .name("backer".into())
-                .spawn(move || back_ahead(prep, ap, place, batches, fwd))
+                .spawn(move || back_ahead(backer, tap, ap, place, batches, fwd))
                 .expect("spawn the backer"),
         )
     };
+    // Frames stored before the first batch the scan did not take whole: the
+    // scan takes none after it.
+    let mut cut: Option<u64> = None;
     let mut snaps = [live.new_snapshot()?, live.new_snapshot()?];
     let mut view = match preview {
         Some(p) => Some((p, live.new_snapshot()?)),
@@ -1051,37 +1211,49 @@ fn follow<R: Engine>(
             // Block for frames only while none has come.
             if open && positions.is_empty() {
                 match ahead.recv() {
-                    Ok(b) => got.push(b),
+                    Ok(h) => got.push(h),
                     Err(_) => {
                         open = false;
-                        joined(&mut mapper)?;
+                        ended(&mut filler, &mut mapper)?;
                     }
                 }
             }
             while open {
                 match ahead.try_recv() {
-                    Ok(b) => got.push(b),
+                    Ok(h) => got.push(h),
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
                         open = false;
-                        joined(&mut mapper)?;
+                        ended(&mut filler, &mut mapper)?;
                     }
                 }
             }
-            for (b, views, predicted) in got.drain(..) {
-                assert_eq!(
-                    b.f0,
-                    positions.len() as u64,
-                    "batches arrive in order and without gaps"
-                );
-                let took = live.push(&views)?;
-                if let (Some(r), Some(p)) = (&mut fills, predicted)
-                    && let Some(f) = r.count(p, u64::from(took) == b.n)
-                {
-                    r.not_ready += live.fill(f)?;
+            for h in got.drain(..) {
+                match h {
+                    Handed::Batch { batch, views, dry } => {
+                        assert_eq!(
+                            batch.f0,
+                            positions.len() as u64,
+                            "batches arrive in order and without gaps"
+                        );
+                        let took = live.push(&views)?;
+                        if u64::from(took) < batch.n {
+                            cut.get_or_insert(batch.f0);
+                        }
+                        if let Some(r) = &mut fills {
+                            r.no_counts += u64::from(dry);
+                        }
+                        positions.extend(batch.positions);
+                        landings.push((live.epochs(), positions.len() as u64));
+                    }
+                    Handed::Fill(p) => {
+                        let r = fills.as_mut().expect("only a filling run fills");
+                        let taken = cut.is_none_or(|c| p.upto <= c);
+                        if let Some(f) = r.count(p, taken, landings.len(), live.epochs()) {
+                            r.not_ready += live.fill(f)?;
+                        }
+                    }
                 }
-                positions.extend(b.positions);
-                landings.push((live.epochs(), positions.len() as u64));
             }
             if positions.is_empty() {
                 return Ok(());
@@ -1823,15 +1995,40 @@ mod tests {
         }
     }
 
-    /// A 12-column raster streamed through the uploader into the consumer
-    /// filling with a stand-in predictor on `ngpu` GPUs, frame `cut`, if
-    /// given, off the object: the uploader taps every batch's counts for
-    /// the predictor, each batch landed whole has its fill queued behind
-    /// it and the rest have theirs dropped, and the last kept object is one
-    /// GPU's replay of the landings with the replayed predictor's fills
-    /// queued behind the batches landed whole, bit for bit.
-    fn fills_follow_whole_batches(ngpu: usize, cut: Option<usize>) {
+    /// [`Wrong`], its calls held until `open`: batches queue meanwhile.
+    struct Held(Wrong, Arc<AtomicBool>);
+
+    impl PatchPredictor for Held {
+        fn patch(&self) -> [usize; 2] {
+            self.0.patch()
+        }
+
+        fn predict(
+            &mut self,
+            counts: &[u16],
+            frame: [usize; 2],
+            out: &mut [[f32; 2]],
+        ) -> Result<(), String> {
+            while !self.1.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            self.0.predict(counts, frame, out)
+        }
+    }
+
+    /// A 12-column raster streamed, one frame short, through the uploader
+    /// into the consumer filling with a stand-in predictor on `ngpu` GPUs,
+    /// frame `cut`, if given, off the object, the predictor held until the
+    /// third burst is in: the uploader taps every batch's counts, each call
+    /// takes the batches queued while the last one ran, a call of batches
+    /// landed whole has its fill queued once it comes and the rest have
+    /// theirs dropped, and the last kept object is one GPU's replay of the
+    /// landings with the replayed calls' fills queued where the run queued
+    /// them, bit for bit. Short, the scan ends once the uploader stops: no
+    /// fill comes after the run.
+    fn fills_follow_whole_calls(ngpu: usize, cut: Option<usize>) {
         const PATCH: [usize; 2] = [32, 32];
+        const PACK: usize = 12;
         let p = Ptycho::new(PtychoSpec {
             n: 64,
             path: ScanPath::Raster { cols: 12 },
@@ -1862,16 +2059,21 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, rx) = crossbeam_channel::unbounded();
         let (ready_tx, ready_rx) = crossbeam_channel::bounded(1);
+        let open = Arc::new(AtomicBool::new(false));
         let consumer = {
             let cfg = cfg.clone();
             let ordinals: Vec<usize> = (0..ngpu).collect();
-            // A batch holds a frame at least: no batch finds a pool dry.
+            // A call holds a frame at least: no call finds a pool dry.
             let hook = FillHook {
-                predictor: Box::new(Wrong {
-                    patch: PATCH,
-                    issued: 0,
-                }),
+                predictor: Box::new(Held(
+                    Wrong {
+                        patch: PATCH,
+                        issued: 0,
+                    },
+                    open.clone(),
+                )),
                 batch: 4,
+                pack: PACK,
                 counts: total,
                 fills: total,
             };
@@ -1904,7 +2106,7 @@ mod tests {
             })
         };
         let mut k = 0;
-        for burst in [50, 1, 90, 0, 99] {
+        for (i, burst) in [50, 1, 90, 0, 98].into_iter().enumerate() {
             for _ in 0..burst {
                 let mut s = ring.reserve();
                 s.frame()
@@ -1915,32 +2117,54 @@ mod tests {
                 k += 1;
             }
             std::thread::sleep(Duration::from_millis(20));
+            open.store(i >= 2, Ordering::Release);
         }
-        assert_eq!(k, total);
+        let streamed = total - 1;
+        assert_eq!(k, streamed);
         stop.store(true, Ordering::Release);
         let up = uploader.join().unwrap().unwrap();
         assert_eq!(
             (up.frames, up.pos_missing, up.counts_dry),
-            (total as u64, 0, 0)
+            (streamed as u64, 0, 0)
         );
         assert_eq!(up.counts_copy.count(), up.batches);
         let rep = consumer.join().unwrap().unwrap();
-        let landed = cut.unwrap_or(total) as u64;
-        assert_eq!((rep.stored, rep.landed), (total as u64, landed));
+        let landed = cut.unwrap_or(streamed) as u64;
+        assert_eq!((rep.stored, rep.landed), (streamed as u64, landed));
         let batches = rep.landings.len() as u64;
         assert_eq!(batches, up.batches);
         let whole = rep.landings.iter().filter(|l| l.1 <= landed).count() as u64;
         assert_eq!(whole < batches, cut.is_some());
         let fill = rep.fill.as_ref().unwrap();
+        assert_eq!(fill.no_counts, 0);
+        // Every batch in one call, in order.
+        let mut at = 0;
+        for c in &fill.calls {
+            assert_eq!(c.upto - u64::from(c.frames), at);
+            assert!(c.frames as usize <= PACK);
+            at = c.upto;
+        }
+        assert_eq!(at, streamed as u64);
+        let held: u64 = fill.calls.iter().map(|c| u64::from(c.batches)).sum();
+        assert_eq!(held, batches);
+        assert!(fill.calls.iter().any(|c| c.batches > 1), "no call packed");
+        // Frames stored before the batch the scan did not take whole.
+        let cut_at = rep.landings.iter().map(|l| l.1).filter(|&u| u <= landed);
+        let cut_at = cut_at.max().unwrap_or(0);
+        for c in &fill.calls {
+            let fate = if c.upto <= cut_at {
+                Fate::Written
+            } else {
+                Fate::Dropped
+            };
+            assert_eq!(c.fate, fate, "{c:?}");
+        }
+        assert_eq!(fill.of(Fate::Dropped).0 > 0, cut.is_some());
+        assert_eq!((fill.not_ready, fill.error.as_deref()), (0, None));
+        let calls = fill.calls.len() as u64;
         assert_eq!(
-            (fill.written, fill.dropped, fill.not_ready),
-            (whole, batches - whole, 0)
-        );
-        assert_eq!((fill.no_counts, fill.no_buffer, fill.failed), (0, 0, 0));
-        assert_eq!(fill.error, None);
-        assert_eq!(
-            (fill.predict.count(), fill.stitch.count()),
-            (batches, batches)
+            (fill.copy.count(), fill.predict.count(), fill.stitch.count()),
+            (calls, calls, calls)
         );
 
         ctx.bind_to_thread().unwrap();
@@ -1948,34 +2172,44 @@ mod tests {
         let dev = cuda_core::DeviceBuffer::from_host(&st, &counts).unwrap();
         let mut run = LiveAp::new(&st, &cfg.ap, &cfg.probe, dev, false).unwrap();
         let mut backer = run.backer();
-        let mut pf = PatchFill::new(&ctx, rep.shape, PATCH, 4, batches as usize).unwrap();
+        let mut pf = PatchFill::new(&ctx, rep.shape, PATCH, PACK, fill.calls.len()).unwrap();
         let mut wrong = Wrong {
             patch: PATCH,
             issued: 0,
         };
         let nmode = cfg.ap.shape.nmode as usize;
+        let mut calls = fill.calls.iter().peekable();
         let mut at = 0;
-        for &(epochs, upto) in &rep.landings {
+        for (i, &(epochs, upto)) in rep.landings.iter().enumerate() {
             while run.epochs() < epochs {
                 run.epoch().unwrap();
             }
             let (a, b) = (at as usize, upto as usize);
             let v = views_of(&cfg.ap, &cfg.place, &pos[a..b]);
             backer.back(&v).unwrap();
-            let took = run.push(&v).unwrap();
-            let f = batch_fill(
-                &mut pf,
-                &mut wrong,
-                &counts[a * n * n..b * n * n],
-                &v,
-                nmode,
-                [n, n],
-            );
-            if u64::from(took) == upto - at {
-                assert_eq!(run.fill(f).unwrap(), 0);
-            }
+            run.push(&v).unwrap();
             at = upto;
+            // The fills that came before the next batch.
+            while let Some(c) = calls.next_if(|c| c.landings == i + 1) {
+                while run.epochs() < c.epochs {
+                    run.epoch().unwrap();
+                }
+                let (a, b) = ((c.upto - u64::from(c.frames)) as usize, c.upto as usize);
+                let v = views_of(&cfg.ap, &cfg.place, &pos[a..b]);
+                let f = batch_fill(
+                    &mut pf,
+                    &mut wrong,
+                    &counts[a * n * n..b * n * n],
+                    &v,
+                    nmode,
+                    [n, n],
+                );
+                if c.fate == Fate::Written {
+                    assert_eq!(run.fill(f).unwrap(), 0);
+                }
+            }
         }
+        assert_eq!(calls.next(), None);
         let last = rep.kept.last().unwrap();
         while run.epochs() < last.epochs {
             run.epoch().unwrap();
@@ -1993,13 +2227,13 @@ mod tests {
     }
 
     #[test]
-    fn a_filling_run_queues_whole_batches_fills_and_drops_a_cut_ones() {
-        fills_follow_whole_batches(1, Some(150));
+    fn a_filling_run_queues_whole_calls_fills_and_drops_a_cut_ones() {
+        fills_follow_whole_calls(1, Some(150));
     }
 
     #[test]
     fn a_filling_run_on_two_gpus_is_one_gpus_replay() {
-        fills_follow_whole_batches(2, None);
+        fills_follow_whole_calls(2, None);
     }
 
     /// A scan of 2 * STORE_LEAD + 64 frames with 64 planned, streamed into

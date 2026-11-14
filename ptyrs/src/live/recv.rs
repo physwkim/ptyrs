@@ -33,8 +33,8 @@ use crate::live::consumer::{ConsumerReport, checksum, run_checksum_consumer};
 use crate::live::eiger::{EigerFrames, Progress, PullReport, connect_pull, run_pull};
 use crate::live::farfield::ScanPath;
 use crate::live::follow::{
-    FillHook, FollowCfg, FollowReport, Preview, ReconCfg, first_converged, offline_dist, plane,
-    run_dist_consumer,
+    Fate, FillHook, FollowCfg, FollowReport, Preview, ReconCfg, first_converged, offline_dist,
+    plane, run_dist_consumer,
 };
 use crate::live::graph::WarmUp;
 use crate::live::handoff::work_queue;
@@ -303,7 +303,7 @@ impl fmt::Display for RecvError {
 impl std::error::Error for RecvError {}
 
 /// The fill of a `--recon-fill` run: its predictor on `gpu`, the first
-/// region's, warmed on the uploader's batch.
+/// region's, warmed on its calls' frames.
 #[cfg(feature = "nn")]
 fn fill_hook(cfg: &RecvCfg, gpu: usize) -> Result<Option<FillHook>, RecvError> {
     let Some(fc) = cfg.recon.as_ref().and_then(|rc| rc.fill.as_ref()) else {
@@ -314,9 +314,11 @@ fn fill_hook(cfg: &RecvCfg, gpu: usize) -> Result<Option<FillHook>, RecvError> {
         .hook(gpu, [cfg.crop; 2], cfg.batch.get())
         .map_err(fail("fill predictor"))?;
     eprintln!(
-        "recv fill predictor={} norm={} counts={} fills={} batch={} gpu={gpu} load_ms={:.0}",
+        "recv fill predictor={} norm={} pack={} counts={} fills={} batch={} gpu={gpu} \
+         load_ms={:.0}",
         fc.predictor.display(),
         fc.norm,
+        hook.pack,
         fc.counts,
         fc.fills,
         hook.batch,
@@ -609,6 +611,17 @@ fn recon_line(
 
 /// Frame arrival (`t_rx`, by store place) → end of the first epoch that
 /// took the frame; and [`FollowReport::epochs_after_scan`].
+/// `n`, p50, p90 and max of `v`.
+fn spread(v: impl Iterator<Item = u64>) -> String {
+    let mut v: Vec<u64> = v.collect();
+    v.sort_unstable();
+    let q = |q: f64| v[((q * v.len() as f64).ceil() as usize).clamp(1, v.len()) - 1];
+    match v.last() {
+        None => "n=0".into(),
+        Some(max) => format!("n={} p50={} p90={} max={max}", v.len(), q(0.5), q(0.9)),
+    }
+}
+
 fn epoch_latency(rep: &FollowReport, t_rx: &[i64]) -> (Histogram, Histogram) {
     let (mut to_epoch, mut epoch) = (Histogram::new(1_000_000), Histogram::new(1_000_000));
     let mut f0 = 0;
@@ -1277,11 +1290,28 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
                 "recv recon_store frames_bad={sum_bad} recaptures={recaptures}"
             ));
             if let Some(f) = &r.rep.fill {
+                let (written, covered) = f.of(Fate::Written);
                 line(format_args!(
-                    "recv fill written={} no_counts={} failed={} error={:?} no_buffer={} \
-                     dropped={} not_ready={}",
-                    f.written, f.no_counts, f.failed, f.error, f.no_buffer, f.dropped, f.not_ready
+                    "recv fill batches={} covered={covered} no_counts={} calls={} \
+                     written={written} failed={} no_buffer={} dropped={} not_ready={} error={:?}",
+                    r.rep.landings.len(),
+                    f.no_counts,
+                    f.calls.len(),
+                    f.of(Fate::Failed).0,
+                    f.of(Fate::NoBuffer).0,
+                    f.of(Fate::Dropped).0,
+                    f.not_ready,
+                    f.error
                 ));
+                let frames = f.calls.iter().map(|c| u64::from(c.frames));
+                line(format_args!("recv fill_call_frames {}", spread(frames)));
+                // Epochs queued between a call's last batch landing and its fill.
+                let lag = f.calls.iter().filter_map(|c| {
+                    let i = r.rep.landings.partition_point(|l| l.1 < c.upto);
+                    r.rep.landings.get(i).map(|l| c.epochs - l.0)
+                });
+                line(format_args!("recv fill_lag_epochs {}", spread(lag)));
+                line(format_args!("recv fill_copy {}", f.copy.summary()));
                 line(format_args!("recv fill_predict {}", f.predict.summary()));
                 line(format_args!("recv fill_stitch {}", f.stitch.summary()));
             }
@@ -1463,6 +1493,7 @@ mod tests {
                 fill: Some(FillCfg {
                     predictor: "/x/pred".into(),
                     norm: 1234.5,
+                    pack: 24,
                     counts: 4,
                     fills: 64,
                 }),
@@ -1587,6 +1618,8 @@ mod tests {
             "/x/pred",
             "--recon-fill-norm",
             "1234.5",
+            "--recon-fill-pack",
+            "24",
             "--recon-fill-counts",
             "4",
             "--recon-fill-fills",
@@ -1668,6 +1701,7 @@ mod tests {
             [recon.fill]
             predictor = "/x/pred"
             norm = 1234.5
+            pack = 24
             counts = 4
             fills = 64
             "#;
