@@ -244,7 +244,7 @@ mod tests {
 
     #[test]
     fn folding_scales_each_weight_and_shifts_each_bias() {
-        let device = Device::cuda(0);
+        let device = crate::nn::cuda(0);
         let net = normalised_net(&device);
         let folded = net.fold();
         let blocks = net
@@ -291,7 +291,7 @@ mod tests {
     /// convolutions.
     #[test]
     fn folded_network_gives_the_networks_output() {
-        let device = Device::cuda(0);
+        let device = crate::nn::cuda(0);
         device.seed(1);
         // In f64, not f32: there autotune may pick tensor-core convolutions, which round
         // operands to TF32, and the two networks part by up to 6e-3 depending on its picks.

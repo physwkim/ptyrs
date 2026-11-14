@@ -13,6 +13,7 @@
 //!
 //! `cargo run --release -p ptyrs --features nn --example nn_dip_ptychi -- <data_dir> <out_dir>
 //! [f64|f32] [iterations=100] [lr=1e-3] [name=fermat_clean]`
+#![warn(clippy::disallowed_methods)] // clippy.toml: CUDA devices only through ptyrs::nn::cuda
 
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -340,7 +341,7 @@ fn main() -> Result<(), LossError> {
     let scan = read_cxi(data_dir.join(format!("{name}.cxi")))?;
     let (_, probe) = read_modes(data_dir.join(format!("{name}_truth.h5")))?;
     let nb_obs = scan.counts.nb_obs() as f64;
-    let device = Device::cuda(0).autodiff();
+    let device = ptyrs::nn::cuda(0).autodiff();
     let w = Weights {
         file: H5File::open(out_dir.join("dip_init.h5"))?,
         device: device.clone(),

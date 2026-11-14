@@ -10,6 +10,7 @@
 //! same object pixels, so fewer frames from more scans give more distinct objects for the same
 //! epoch time. Writes the predictor to `out_dir`, and after every epoch the training state to
 //! `out_dir/checkpoint`, from which the same command resumes a stopped run.
+#![warn(clippy::disallowed_methods)] // clippy.toml: CUDA devices only through ptyrs::nn::cuda
 
 #[path = "common/nn/mod.rs"]
 mod common;
@@ -17,7 +18,6 @@ mod common;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use burn::prelude::*;
 use common::scan;
 use ptyrs::base::{Object, Probe, sim};
 use ptyrs::nn::data::{random_object, structured_object};
@@ -120,7 +120,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         next(5000)?,
     );
 
-    let device = Device::cuda(0);
+    let device = ptyrs::nn::cuda(0);
     let probe = sim::probe([frame, frame], 1)?;
     let config = PredictorConfig::new([frame, frame], bin).with_width(width);
     let t = Instant::now();

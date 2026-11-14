@@ -151,7 +151,7 @@ pub enum TuneCacheResult {
 impl<K: AutotuneKey> TuneCache<K> {
     pub(crate) fn new(
         #[cfg_attr(not(persistence), allow(unused_variables))] name: &str,
-        #[cfg_attr(not(persistence), allow(unused_variables))] device_id: &str,
+        #[cfg_attr(not(persistence), allow(unused_variables))] part: &str,
     ) -> Self {
         #[cfg(persistence)]
         {
@@ -159,7 +159,7 @@ impl<K: AutotuneKey> TuneCache<K> {
             use alloc::format;
 
             let config = crate::config::CubeClRuntimeConfig::get();
-            let namespace = Namespace::scoped("autotune", format!("{device_id}/{name}"));
+            let namespace = Namespace::scoped("autotune", format!("{part}/{name}"));
             let table = namespace.as_str().into();
 
             if config.autotune.disable_cache {
