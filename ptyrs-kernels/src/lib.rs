@@ -22,6 +22,7 @@ pub mod pixel;
 pub mod position;
 pub mod ring;
 pub mod rpie;
+pub mod sampling;
 
 /// Complex elements per thread of the in-kernel FFT of `n` points (cuFFT device API,
 /// BY_COMPONENT), which runs on `n / fft_ept(n)` threads. Sides to 256 take 8: at 16, a fused
