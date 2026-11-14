@@ -501,7 +501,9 @@ fn variation_fits(var: &ProbeVariation, nframe: usize, plane: [usize; 2]) -> PyR
 /// `[k, ny, nx]`, weights `w_fi` `[nframe, k]` and main-mode weights `c_f` `[nframe]` or
 /// `None`, it models and refines OPR of probe mode 0, frame `f` seeing
 /// `c_f·P_0 + Σ_i w_fi·U_i`, and `c_f` too unless `None` (1 then); `Ptycho.llk` does not
-/// model it.
+/// model it. The offsets enter as `sampling`, `"patch"` or `"full_object"` as
+/// `Ptycho.set_sampling` takes it, and without, as `Sampling::auto` of the optics, object and
+/// probe of the first epoch.
 #[pyclass]
 pub(crate) struct Lsqml {
     inner: ptyrs::engine::Lsqml,
@@ -511,13 +513,14 @@ pub(crate) struct Lsqml {
 #[pymethods]
 impl Lsqml {
     #[new]
-    #[pyo3(signature = (batch_size, cost, seed, *, position = None, opr = None))]
+    #[pyo3(signature = (batch_size, cost, seed, *, position = None, opr = None, sampling = None))]
     fn new(
         batch_size: usize,
         cost: &str,
         seed: u64,
         position: Option<PyReadonlyArray2<'_, f64>>,
         opr: Option<Opr<'_>>,
+        sampling: Option<&str>,
     ) -> PyResult<Self> {
         let lsqml = ptyrs::engine::Lsqml::new(ptyrs::engine::LsqmlParams {
             batch_size,
@@ -525,6 +528,10 @@ impl Lsqml {
             seed,
         })
         .map_err(Error::from)?;
+        let lsqml = match sampling.map(crate::sampling).transpose()? {
+            Some(s) => lsqml.with_sampling(s),
+            None => lsqml,
+        };
         let features = position_only(position)?;
         Ok(Self {
             inner: lsqml.with_features(features).map_err(Error::from)?,
@@ -593,7 +600,8 @@ impl Lsqml {
 }
 
 /// BH across epochs (`ptyrs::engine::Bh`). With `position`, offsets as `Lsqml` takes them,
-/// every epoch models and refines them, their gradient weighted by `position_rho`².
+/// every epoch models and refines them, their gradient weighted by `position_rho`², entered
+/// as `sampling` as `Lsqml` takes it.
 #[pyclass]
 pub(crate) struct Bh(ptyrs::engine::Bh);
 
@@ -601,13 +609,14 @@ pub(crate) struct Bh(ptyrs::engine::Bh);
 impl Bh {
     #[new]
     #[pyo3(signature = (batch_size, probe_rho, seed, *, position = None,
-                        position_rho = crate::POSITION_RHO))]
+                        position_rho = crate::POSITION_RHO, sampling = None))]
     fn new(
         batch_size: usize,
         probe_rho: f64,
         seed: u64,
         position: Option<PyReadonlyArray2<'_, f64>>,
         position_rho: f64,
+        sampling: Option<&str>,
     ) -> PyResult<Self> {
         let bh = ptyrs::engine::Bh::new(ptyrs::engine::BhParams {
             batch_size,
@@ -616,6 +625,10 @@ impl Bh {
             seed,
         })
         .map_err(Error::from)?;
+        let bh = match sampling.map(crate::sampling).transpose()? {
+            Some(s) => bh.with_sampling(s),
+            None => bh,
+        };
         let features = position_only(position)?;
         Ok(Self(bh.with_features(features).map_err(Error::from)?))
     }
