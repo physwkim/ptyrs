@@ -195,6 +195,11 @@ impl Drop for Ring {
     }
 }
 
+/// Places a growing store keeps backed past the last frame asked for, for
+/// a store fed from a detector: a third of a second at 3 kHz, past the
+/// longest stall measured in a mapping call (230 ms, DESIGN.md B6).
+pub const STORE_LEAD: usize = 1024;
+
 /// How far a store's frames are backed: the one value its mapper writes
 /// and the uploader reads.
 #[derive(Clone, Copy)]
