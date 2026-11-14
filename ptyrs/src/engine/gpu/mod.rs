@@ -703,7 +703,9 @@ impl GpuPtycho {
     }
 
     /// Enters [`Features::position`] as `sampling` in every call from here on, as
-    /// [`crate::engine::Ptycho::set_sampling`].
+    /// [`crate::engine::Ptycho::set_sampling`]. Nothing changes if a device buffer cannot be
+    /// built; if the LLK pass's graph cannot be recaptured, the new sampling stays and the LLK
+    /// pass runs without its graph until a later recapture.
     pub fn set_sampling(&mut self, sampling: Sampling) -> Result<(), EngineError> {
         self.dev.set_sampling(sampling)
     }
