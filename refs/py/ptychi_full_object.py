@@ -9,12 +9,16 @@ whole object's periodic Fourier interpolant; the object's update is placed by th
 adjoint, and the positions' gradient is the interpolant's derivative. rPIE runs rpie_pos.py's
 cases (`step`, `epochs`) through its `ptychi`, BH bh_pos.py's (`full`: CG on one batch of every
 frame, `mini`: GD on batches of 16, both in the engine's batch order) through `bh` here, each
-with FULL_OBJECT in place of PATCH and from that script's offsets.
+with FULL_OBJECT in place of PATCH and from that script's offsets. rPIE's `odd` is `step` on the
+76 x 80 object plane less its first row and column: both sides odd, so the interpolant has a
+middle frequency (n - 1) / (2 n) on each, and every window one pixel nearer the origin, so on
+the same pixels.
 
 At zero offsets the two operators sample the same windows. The script runs one batch of every
-frame under each there, FULL_OBJECT's position derivatives taken PATCH's way (from the window's
-own interpolant), and exits non-zero unless every change, and BH's alpha, top and bottom, agree
-to ZERO_BOUND; it prints how far the full-object derivatives move the offsets' change.
+frame under each there, on both planes, FULL_OBJECT's position derivatives taken PATCH's way
+(from the window's own interpolant), and exits non-zero unless every change, and BH's alpha, top
+and bottom, agree to ZERO_BOUND; it prints how far the full-object derivatives move the offsets'
+change.
 
 Writes, every complex value `re im`, in the engine's convention:
     <out>/rpie_full_object_<case>_{obj,probe,offsets}_f64.txt     as rpie_pos.py's files
@@ -239,21 +243,27 @@ def main():
     iobs, _, _, _, wavelength, obj0, probe = args
     m = mg.Model(*args)
     obj = obj0[0]
+    odd0 = obj0[:, 1:, 1:]
+    m_odd = mg.Model(*args[:5], odd0, probe)
+    assert (m_odd.corners == m.corners - 1).all() and odd0.shape[1] % 2 and odd0.shape[2] % 2
     nframe = len(m.corners)
-    worst = at_zero(m, iobs, wavelength, obj, probe)
+    worst = max(at_zero(m, iobs, wavelength, obj, probe),
+                at_zero(m_odd, iobs, wavelength, odd0[0], probe))
     if not worst <= ZERO_BOUND:
         sys.exit(f"FULL_OBJECT departs from PATCH at zero offsets: {worst:.3e} > {ZERO_BOUND:.0e}")
 
     unit = np.random.default_rng(1).uniform(-1, 1, (nframe, 2))
-    for case, scale, prm, nepoch in (
-            ("step", rpie_pos.OFFSET, rpie_pos.STEP_PARAMS, 1),
-            ("epochs", rpie_pos.EPOCH_OFFSET, rpie_pos.EPOCH_PARAMS, rpie_pos.EPOCHS)):
+    for case, mc, o0, scale, prm, nepoch in (
+            ("step", m, obj0, rpie_pos.OFFSET, rpie_pos.STEP_PARAMS, 1),
+            ("epochs", m, obj0, rpie_pos.EPOCH_OFFSET, rpie_pos.EPOCH_PARAMS, rpie_pos.EPOCHS),
+            ("odd", m_odd, odd0, rpie_pos.OFFSET, rpie_pos.STEP_PARAMS, 1)):
         d0 = scale * unit
         with Operator("FULL_OBJECT"):
-            o1, p1, d1, peak, nbatch = rpie_pos.ptychi(m, iobs, wavelength, obj0, d0, prm, nepoch)
-        print(f"--- rPIE {case}: {nepoch} epoch(s), {nbatch} batches, {prm}, max |offset| over "
-              f"the run {peak:.4f}, max |offset change| {np.abs(d1 - d0).max():.4f}")
-        write(out, f"rpie_full_object_{case}", obj, probe, d0, d1, o1, p1)
+            o1, p1, d1, peak, nbatch = rpie_pos.ptychi(mc, iobs, wavelength, o0, d0, prm, nepoch)
+        print(f"--- rPIE {case}: {o0.shape[1:]} object, {nepoch} epoch(s), {nbatch} batches, "
+              f"{prm}, max |offset| over the run {peak:.4f}, max |offset change| "
+              f"{np.abs(d1 - d0).max():.4f}")
+        write(out, f"rpie_full_object_{case}", o0[0], probe, d0, d1, o1, p1)
 
     d0 = 0.5 + bh_pos.OFFSET * unit
     for case, size, cg in bh_pos.CASES:

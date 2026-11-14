@@ -5,9 +5,9 @@
 //! offsets. It writes `<dir>/rpie_pos_*_f64.txt`, saved to `tests/data`. The same cases under
 //! pty-chi's FULL_OBJECT shift operator, [`Sampling::FullObject`] here, are
 //! `refs/py/ptychi_full_object.py`'s `<out>/rpie_full_object_*_f64.txt`, saved to
-//! `tests/engine/data`.
+//! `tests/engine/data`, with one on an odd-sided object plane.
 
-use ptyrs::base::{C64, Stack};
+use ptyrs::base::{C64, Object, Stack};
 use ptyrs::engine::{Features, Ptycho, RpieParams, Sampling};
 
 #[path = "common/engine/mod.rs"]
@@ -49,12 +49,35 @@ fn assert_close(what: &str, got: &[f64], want: &[f64], tol: f64) {
     assert!(err < tol, "{what}: max rel {err:.3e}");
 }
 
-/// `nepoch` epochs of `params` under `sampling` from the reference's starting offsets against
-/// its object, probe and offset changes, `files` its obj, probe and offsets tables.
-fn assert_run(what: &str, sampling: Sampling, params: RpieParams, nepoch: usize, files: [&str; 3]) {
+/// The scenario after `scale_obj_probe`; with `odd`, on its 76 x 80 object plane less the first
+/// row and column, both sides odd, every window one pixel nearer the origin and so on the same
+/// pixels.
+fn scenario(odd: bool) -> Ptycho {
     let (scan, object, probe) = common::dm_scenario(32, 40, 2, 2e5, 4.0);
     let mut p = Ptycho::new(&scan, object, probe).unwrap();
     p.scale_obj_probe();
+    if !odd {
+        return p;
+    }
+    let [_, ny, nx] = p.object().dims();
+    let plane = (p.object().plane(0).chunks(nx).skip(1))
+        .flat_map(|row| &row[1..])
+        .copied()
+        .collect();
+    let object = Object::new(Stack::from_vec([1, ny - 1, nx - 1], plane).unwrap());
+    Ptycho::new(&scan, object, p.probe().clone()).unwrap()
+}
+
+/// `nepoch` epochs of `params` on `p` under `sampling` from the reference's starting offsets
+/// against its object, probe and offset changes, `files` its obj, probe and offsets tables.
+fn assert_run(
+    what: &str,
+    mut p: Ptycho,
+    sampling: Sampling,
+    params: RpieParams,
+    nepoch: usize,
+    files: [&str; 3],
+) {
     p.set_sampling(sampling);
     let rows = table(files[2]);
     let start = offsets(&rows, 1);
@@ -118,6 +141,7 @@ const EPOCHS: RpieParams = RpieParams {
 fn rpie_positions_step_matches_ptychi() {
     assert_run(
         "step",
+        scenario(false),
         Sampling::Patch,
         STEP,
         1,
@@ -134,6 +158,7 @@ fn rpie_positions_step_matches_ptychi() {
 fn rpie_positions_epochs_match_ptychi() {
     assert_run(
         "epochs",
+        scenario(false),
         Sampling::Patch,
         EPOCHS,
         3,
@@ -150,6 +175,7 @@ fn rpie_positions_epochs_match_ptychi() {
 fn rpie_full_object_positions_step_matches_ptychi() {
     assert_run(
         "full-object step",
+        scenario(false),
         Sampling::FullObject,
         STEP,
         1,
@@ -166,6 +192,7 @@ fn rpie_full_object_positions_step_matches_ptychi() {
 fn rpie_full_object_positions_epochs_match_ptychi() {
     assert_run(
         "full-object epochs",
+        scenario(false),
         Sampling::FullObject,
         EPOCHS,
         3,
@@ -173,6 +200,23 @@ fn rpie_full_object_positions_epochs_match_ptychi() {
             include_str!("engine/data/rpie_full_object_epochs_obj_f64.txt"),
             include_str!("engine/data/rpie_full_object_epochs_probe_f64.txt"),
             include_str!("engine/data/rpie_full_object_epochs_offsets_f64.txt"),
+        ],
+    );
+}
+
+/// [`STEP`] under FULL_OBJECT on the 75 x 79 plane, whose middle frequencies are positive.
+#[test]
+fn rpie_full_object_odd_plane_matches_ptychi() {
+    assert_run(
+        "full-object odd plane",
+        scenario(true),
+        Sampling::FullObject,
+        STEP,
+        1,
+        [
+            include_str!("engine/data/rpie_full_object_odd_obj_f64.txt"),
+            include_str!("engine/data/rpie_full_object_odd_probe_f64.txt"),
+            include_str!("engine/data/rpie_full_object_odd_offsets_f64.txt"),
         ],
     );
 }
