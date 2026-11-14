@@ -7,7 +7,7 @@ pty-chi's two shift operators.
 
     micromamba run -n ptyrs-ref python -I refs/f64/lsqml_near_pos.py <dir>
 
-<dir> holds lsqml_near.py's files (refs/f64 or ptyrs/tests/engine/data), whose start probe,
+<dir> holds lsqml_near.py's files (ptyrs/tests/engine/data), whose start probe,
 corners, cases and counts are read here; its truth object is made again by its make_state.
 pty-chi's PATCH model keeps the window at the corner and moves the probe by d (|d| < 1/2), and
 takes the position gradient from the window's own periodic interpolant. Its FULL_OBJECT model
