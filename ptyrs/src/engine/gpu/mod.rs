@@ -800,15 +800,22 @@ impl Bufs<'_> {
                 }
             }
             PassesMut::Fused(f) => {
-                let m = self
-                    .features
-                    .lend(ctx, self.kernels, &dims, self.probe, self.exit)?;
+                let mut m = self.features.lend(
+                    ctx,
+                    self.kernels,
+                    &dims,
+                    self.obj,
+                    self.probe,
+                    self.exit,
+                )?;
                 for s in 0..self.scratch.len() {
                     let stack = self.scratch.at(s);
+                    let windows = self.windows.as_deref_mut();
+                    let (views, obj) = m.object(ctx, (self.views, self.obj), stack, windows)?;
                     let inputs = FusedInputs {
-                        views: self.views,
+                        views,
                         counts: self.counts,
-                        obj: self.obj,
+                        obj,
                         probe: self.probe,
                         model: m.model,
                     };
@@ -843,15 +850,17 @@ impl Bufs<'_> {
         mut llk: Option<RecordWriter<'_>>,
     ) -> Result<Option<Ended>, GpuError> {
         let dims = *self.views.dims();
-        let mut m = self
-            .features
-            .lend(ctx, self.kernels, &dims, self.probe, self.exit)?;
+        let mut m =
+            self.features
+                .lend(ctx, self.kernels, &dims, self.obj, self.probe, self.exit)?;
         for s in 0..self.scratch.len() {
             let stack = self.scratch.at(s);
+            let windows = self.windows.as_deref_mut();
+            let (views, obj) = m.object(ctx, (self.views, self.obj), stack, windows)?;
             let inputs = FusedInputs {
-                views: self.views,
+                views,
                 counts: self.counts,
-                obj: self.obj,
+                obj,
                 probe: self.probe,
                 model: m.model,
             };

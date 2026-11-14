@@ -341,6 +341,50 @@ fn sampling_is_the_cpus_auto_until_set() {
     }
 }
 
+/// The LLK of drawn offsets that sample the object under each propagator, with the position
+/// alone and with a scale and a background, against the CPU's, eagerly and from the graph,
+/// over stacks of 8 frames and a last of 6. Under `Sampling::Patch` the CPU's is 7e-5 to 6e-2
+/// off.
+#[test]
+fn full_object_llk_matches_cpu_under_every_propagator() {
+    // Worst measured 8.7e-7 (angular spectrum, position alone).
+    const TOL: f64 = 5e-6;
+    let frame = FUSED_SIDES[0] as usize;
+    let moved = Features {
+        position: Some(drawn_offsets()),
+        ..Features::default()
+    };
+    let modelled = Features {
+        scale: Some((0..NPOS).map(|f| 1.0 + 0.05 * (f as f64).sin()).collect()),
+        background: Some(vec![0.3; frame * frame]),
+        ..moved.clone()
+    };
+    for c in cases() {
+        for (named, features) in [("position", &moved), ("modelled", &modelled)] {
+            let (object, probe) = (c.object.clone(), c.probe.clone());
+            let mut cpu = Ptycho::with_optics(&c.scan, c.optics(), object, probe).unwrap();
+            cpu.set_sampling(Sampling::FullObject);
+            cpu.set_features(features.clone()).unwrap();
+            let want = cpu.llk().poisson;
+            cpu.set_sampling(Sampling::Patch);
+            let patch = cpu.llk().poisson;
+            for graph in [false, true] {
+                let what = format!("{} {named} graph {graph}", c.name);
+                let mut gpu = c.gpu(graph);
+                gpu.set_sampling(Sampling::FullObject).unwrap();
+                gpu.set_features(features).unwrap();
+                let got = gpu.llk().unwrap().poisson;
+                let e = (got - want).abs() / want;
+                eprintln!(
+                    "{what}: {e:.2e}, llk {want:.6e}, Patch {:.2e} off",
+                    (patch - want).abs() / want
+                );
+                assert!(e < TOL, "{what}: {e:e}");
+            }
+        }
+    }
+}
+
 /// `set_sampling` there and back between the calls of a run that models positions drops the
 /// runs, graphs and states built under it; their rebuilds give the records, arrays and
 /// offsets of the run left alone bit for bit.
@@ -388,11 +432,12 @@ fn sampling_round_trip_rebuilds_the_same_run() {
     assert_eq!(toggled.2, kept.2, "offsets");
 }
 
-/// While a position samples the object, which no GPU pass models yet, every algorithm, the
-/// LLK and ML's gradients fail and change nothing, after a call of each, which built its run:
-/// switched to `Sampling::FullObject` after calls under `Patch` with the position, or the
-/// position set after calls under `FullObject` without one. Back under `Patch` the same calls
-/// give the records, arrays, gradients and offsets of a run never switched, bit for bit.
+/// While a position samples the object, which of the GPU passes only the LLK pass models
+/// yet, every algorithm and ML's gradients fail and change nothing, after a call of each,
+/// which built its run: switched to `Sampling::FullObject` after calls under `Patch` with the
+/// position, or the position set after calls under `FullObject` without one. Back under
+/// `Patch` the same calls give the records, arrays, gradients and offsets of a run never
+/// switched, bit for bit.
 #[test]
 fn full_object_position_fails_every_pass_until_patch() {
     let c = &cases()[0];
@@ -412,7 +457,7 @@ fn full_object_position_fails_every_pass_until_patch() {
         seed: 7,
     };
     type Call<'a> = &'a dyn Fn(&mut GpuPtycho) -> Result<Vec<f64>, EngineError>;
-    let calls: [(&str, Call); 9] = [
+    let calls: [(&str, Call); 8] = [
         ("AP", &|g| g.ap(&AP, 1).map(|()| Vec::new())),
         ("DM", &|g| g.dm(&DM, 1).map(|()| Vec::new())),
         ("RAAR", &|g| g.raar(&RAAR, 1).map(|()| Vec::new())),
@@ -422,7 +467,6 @@ fn full_object_position_fails_every_pass_until_patch() {
         }),
         ("BH", &|g| g.bh(&bh, 1, 1).map(|()| Vec::new())),
         ("LSQML", &|g| g.lsqml(&lsqml, 1, 1).map(|()| Vec::new())),
-        ("LLK", &|g| g.llk().map(|l| vec![l.poisson])),
         ("ML gradients", &|g| {
             let grads = g.ml_grads()?;
             let parts = grads.iter().flat_map(|s| s.as_slice().iter());
