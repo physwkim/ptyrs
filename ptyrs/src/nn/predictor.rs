@@ -111,7 +111,11 @@ pub const CHANNELS: usize = 2;
 /// amplitude 1. Image 1 is the unbinned `[ny/bin, nx/bin]` pixels about the zero frequency
 /// `[ny/2, nx/2]` on the same scale (a masked pixel is 0).
 pub fn diffraction_input(frames: &Counts, bin: usize, norm: f64) -> Result<Vec<f32>, NnError> {
-    let [ny, nx] = frames.frame_shape();
+    input(frames.as_slice(), frames.frame_shape(), bin, norm)
+}
+
+/// [`diffraction_input`] of whole `[ny, nx]` frames in one slice.
+fn input(frames: &[u16], [ny, nx]: [usize; 2], bin: usize, norm: f64) -> Result<Vec<f32>, NnError> {
     if bin == 0 || ny % bin != 0 || nx % bin != 0 {
         return Err(NnError::Invalid(format!(
             "frame [{ny}, {nx}] is not a multiple of bin {bin}"
@@ -124,9 +128,8 @@ pub fn diffraction_input(frames: &Counts, bin: usize, norm: f64) -> Result<Vec<f
     let scale = (by * bx) as f64 / norm;
     let fine = (ny * nx) as f64 / norm;
     let (cy, cx) = (ny / 2 - by / 2, nx / 2 - bx / 2);
-    let mut out = Vec::with_capacity(frames.nframe() * CHANNELS * by * bx);
-    for f in 0..frames.nframe() {
-        let frame = frames.frame(f);
+    let mut out = Vec::with_capacity(frames.len() / (bin * bin) * CHANNELS);
+    for frame in frames.chunks_exact(ny * nx) {
         for y in 0..by {
             for x in 0..bx {
                 let (mut sum, mut n) = (0.0, 0usize);
@@ -640,14 +643,25 @@ impl Predictor {
     /// Patches `[nframe, py, px]` for detector-order `frames` of a scan whose
     /// [`mean_frame_total`] is `norm`.
     pub fn predict(&self, frames: &Counts, norm: f64) -> Result<Patches, NnError> {
-        if frames.frame_shape() != self.config.frame {
+        self.predict_raw(frames.as_slice(), frames.frame_shape(), norm)
+    }
+
+    /// [`predict`](Self::predict) for whole `frame`-shaped frames in one slice, a masked pixel
+    /// holding [`crate::base::MASKED`].
+    pub fn predict_raw(
+        &self,
+        frames: &[u16],
+        frame: [usize; 2],
+        norm: f64,
+    ) -> Result<Patches, NnError> {
+        if frame != self.config.frame || !frames.len().is_multiple_of(frame[0] * frame[1]) {
             return Err(NnError::Invalid(format!(
-                "frame {:?} differs from predictor frame {:?}",
-                frames.frame_shape(),
+                "{} counts of frame {frame:?} for predictor frame {:?}",
+                frames.len(),
                 self.config.frame
             )));
         }
-        let input = diffraction_input(frames, self.config.bin, norm)?;
+        let input = input(frames, frame, self.config.bin, norm)?;
         let patch = self.config.patch();
         let plane = patch[0] * patch[1];
         let device = self.device();
