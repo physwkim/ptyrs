@@ -195,6 +195,16 @@ impl SliceJacobian<'_> {
         let probe = Probe::new(Stack::from_vec(self.probe_dims, p.to_vec()).expect("probe"));
         (objects, probe)
     }
+
+    /// [`LinearOp::adjoint`] short of [`SliceWaves::place`]: per slice its
+    /// [`SliceWaves::window_adjoint`], onto what the views read, and the probe's part.
+    pub(crate) fn window_adjoint(&self, y: &[C64]) -> (Vec<Stack<C64>>, Stack<C64>) {
+        let chi = self.waves.back_propagate(y);
+        let windows = (chi.iter().enumerate())
+            .map(|(s, chi)| self.waves.window_adjoint(s, chi))
+            .collect();
+        (windows, self.waves.probe_adjoint(&chi[0]).0)
+    }
 }
 
 impl LinearOp for SliceJacobian<'_> {
@@ -210,13 +220,13 @@ impl LinearOp for SliceJacobian<'_> {
         y.copy_from_slice(&self.waves.tangent(&objects, &probe));
     }
     fn adjoint(&self, y: &[C64], x: &mut [C64]) {
-        let chi = self.waves.back_propagate(y);
+        let (windows, probe) = self.window_adjoint(y);
         let len = self.obj_dims.iter().product::<usize>();
         let (o, p) = x.split_at_mut(self.nslice * len);
-        for (s, o) in o.chunks_exact_mut(len).enumerate() {
-            o.copy_from_slice(self.waves.obj_adjoint(s, &chi[s]).as_slice());
+        for (o, g) in o.chunks_exact_mut(len).zip(windows) {
+            o.copy_from_slice(self.waves.place(g).as_slice());
         }
-        p.copy_from_slice(self.waves.probe_adjoint(&chi[0]).0.as_slice());
+        p.copy_from_slice(probe.as_slice());
     }
 }
 
@@ -225,6 +235,20 @@ impl LinearOp for SliceJacobian<'_> {
 pub(crate) struct FarJacobian<'a> {
     pub slices: SliceJacobian<'a>,
     pub exit: Exit<'a>,
+}
+
+impl FarJacobian<'_> {
+    /// `Uᴴ y`, a change of the detector-plane field back at the exit waves.
+    fn near(&self, y: &[C64]) -> Vec<C64> {
+        let mut near = y.to_vec();
+        self.exit.adjoint(&mut near);
+        near
+    }
+
+    /// [`SliceJacobian::window_adjoint`] of `Uᴴ y`.
+    pub(crate) fn window_adjoint(&self, y: &[C64]) -> (Vec<Stack<C64>>, Stack<C64>) {
+        self.slices.window_adjoint(&self.near(y))
+    }
 }
 
 impl LinearOp for FarJacobian<'_> {
@@ -239,9 +263,7 @@ impl LinearOp for FarJacobian<'_> {
         self.exit.forward(y);
     }
     fn adjoint(&self, y: &[C64], x: &mut [C64]) {
-        let mut near = y.to_vec();
-        self.exit.adjoint(&mut near);
-        self.slices.adjoint(&near, x);
+        self.slices.adjoint(&self.near(y), x);
     }
 }
 

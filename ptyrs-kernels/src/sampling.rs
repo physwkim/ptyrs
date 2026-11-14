@@ -4,10 +4,11 @@
 //! past the plane's edge wrapping.
 //!
 //! A pass reads `modes` object modes per frame, `nobj` or the first only: its stack's point
-//! `q = fl * modes + o` is object mode `o` at frame `f0 + fl`'s position, which every view of
-//! the frame shares (`Views` checks it); the views `(f0 + fl) * nmode + o * nprobe + p` read
-//! its window. A launch covers the pass `p0 .. p0 + npass` of the points, each in its
-//! `[nyo, nxo]` plane of a scratch buffer; points from `nf * modes` on are skipped.
+//! `q = o * nf_max + fl`, object-mode major, is object mode `o` at frame `f0 + fl`'s position,
+//! which every view of the frame shares (`Views` checks it); the views `(f0 + fl) * nmode + o *
+//! nprobe + p` read its window, plane `q` of a window buffer. A launch covers the pass `p0 ..
+//! p0 + npass` of the points, each in its `[nyo, nxo]` plane of a scratch buffer; the points
+//! of frames from `nf` on are skipped.
 
 use cuda_device::device;
 use cuda_host::cuda_module;
@@ -47,8 +48,9 @@ fn axis(c: u32, d: f32) -> Axis {
     }
 }
 
-/// Object mode and position of point `q` of the stack at frame `f0`: view `(f0 + q / modes) *
-/// nmode + (q % modes) * nprobe`'s corner and fraction plus its frame's offset.
+/// Object mode and position of point `q` of the stack at frame `f0`: view
+/// `(f0 + q % nf_max) * nmode + (q / nf_max) * nprobe`'s corner and fraction plus its frame's
+/// offset.
 ///
 /// # Safety
 ///
@@ -60,9 +62,8 @@ unsafe fn point(
     f0: u32,
     q: u32,
     g: StackGeom,
-    modes: u32,
 ) -> (u32, Axis, Axis) {
-    let (f, o) = ((f0 + q / modes) as usize, q % modes);
+    let (f, o) = ((f0 + q % g.nf_max) as usize, q / g.nf_max);
     unsafe {
         let v = *views.add(f * g.nmode as usize + (o * g.nprobe) as usize);
         let (dy, dx) = (*offsets.add(2 * f), *offsets.add(2 * f + 1));
@@ -119,7 +120,7 @@ pub mod sampling_kernels {
     use crate::*;
 
     /// `scratch[i] = spectra[o] * phase(q) / (nyo * nxo)` for every pass point `q = p0 + i`
-    /// below `nf * modes`, `o` its object mode, `phase` its sampling phase of the pass's
+    /// of a frame below `nf`, `o` its object mode, `phase` its sampling phase of the pass's
     /// derivative order: an unnormalized inverse FFT of `scratch` leaves each point's plane
     /// interpolated at its position. One thread per element of `[npass, nyo, nxo]`.
     ///
@@ -145,23 +146,23 @@ pub mod sampling_kernels {
         }
         let (i, j) = (t / n, t % n);
         let q = s.p0 + i as u32;
-        if q >= nf * s.modes {
+        if q % g.nf_max >= nf {
             return;
         }
         unsafe {
-            let (o, y, x) = point(views, offsets, f0, q, g, s.modes);
+            let (o, y, x) = point(views, offsets, f0, q, g);
             let e = phase(j as u32, g.nyo, g.nxo, y, x, s, 1.0 / n as f32);
             store_c(scratch, t, cmul(load_c(spectra, o as usize * n + j), e));
         }
     }
 
     /// The pass's windows out of the inverse-FFT'd `scratch`: `win[q, y, x] = scratch[i, y,
-    /// x]` for pass point `q = p0 + i` below `nf * modes`, `(y, x)` in `[ny, nx]`. One thread
-    /// per element of `[npass, ny, nx]`.
+    /// x]` for pass point `q = p0 + i` of a frame below `nf`, `(y, x)` in `[ny, nx]`. One
+    /// thread per element of `[npass, ny, nx]`.
     ///
     /// # Safety
     ///
-    /// `scratch` `[npass, nyo, nxo]`, `win` `[nf_max * modes, ny, nx]`, `ctl` one entry.
+    /// `scratch` `[npass, nyo, nxo]`, `win` `[modes * nf_max, ny, nx]`, `ctl` one entry.
     #[kernel]
     pub unsafe fn sample_crop(
         scratch: *const f32,
@@ -178,7 +179,7 @@ pub mod sampling_kernels {
         }
         let (i, w) = (t / nw, t % nw);
         let q = s.p0 + i as u32;
-        if q >= nf * s.modes {
+        if q % g.nf_max >= nf {
             return;
         }
         let (y, x) = (w / g.nx as usize, w % g.nx as usize);
@@ -186,15 +187,14 @@ pub mod sampling_kernels {
         unsafe { store_c(win, q as usize * nw + w, load_c(scratch, at)) };
     }
 
-    /// Each pass point's views' patches summed and embedded at its plane's origin:
-    /// `scratch[i, y, x] = sum_p patches[kl + p, y, x]` over `(y, x)` in `[ny, nx]`, else 0,
-    /// `kl = fl * nmode + o * nprobe` for point `q = p0 + i = fl * modes + o`, `modes` all
-    /// `nobj`; 0 for a point from `nf * modes` on. One thread per element of `[npass, nyo,
+    /// Each pass point's patch embedded at its plane's origin: `scratch[i, y, x] = patches[q,
+    /// y, x]` over `(y, x)` in `[ny, nx]`, else 0, for pass point `q = p0 + i`, `modes` all
+    /// `nobj`; 0 for a point of a frame from `nf` on. One thread per element of `[npass, nyo,
     /// nxo]`.
     ///
     /// # Safety
     ///
-    /// `patches` `[nf_max * nmode, ny, nx]`, `scratch` `[npass, nyo, nxo]`, `ctl` one entry.
+    /// `patches` `[nobj * nf_max, ny, nx]`, `scratch` `[npass, nyo, nxo]`, `ctl` one entry.
     #[kernel]
     pub unsafe fn place_embed(
         patches: *const f32,
@@ -212,22 +212,16 @@ pub mod sampling_kernels {
         let (i, j) = (t / n, t % n);
         let q = s.p0 + i as u32;
         let (y, x) = ((j / g.nxo as usize) as u32, (j % g.nxo as usize) as u32);
-        let mut acc = (0.0, 0.0);
-        if q < nf * s.modes && y < g.ny && x < g.nx {
-            let (fl, o) = (q / s.modes, q % s.modes);
-            let kl = (fl * g.nmode + o * g.nprobe) as usize;
+        let mut v = (0.0, 0.0);
+        if q % g.nf_max < nf && y < g.ny && x < g.nx {
             let nw = g.ny as usize * g.nx as usize;
-            let w = (y * g.nx + x) as usize;
-            for p in 0..g.nprobe as usize {
-                let v = unsafe { load_c(patches, (kl + p) * nw + w) };
-                acc = (acc.0 + v.0, acc.1 + v.1);
-            }
+            v = unsafe { load_c(patches, q as usize * nw + (y * g.nx + x) as usize) };
         }
-        unsafe { store_c(scratch, t, acc) };
+        unsafe { store_c(scratch, t, v) };
     }
 
     /// `acc[o] += conj(phase(q)) * scratch[i]` over the pass points `q = p0 + i` of object
-    /// mode `o` below `nf * modes`, `modes` all `nobj`, in ascending `q`: the forward-FFT'd
+    /// mode `o` and a frame below `nf`, `modes` all `nobj`, in ascending `q`: the forward-FFT'd
     /// embedded patches moved back by each point's position. One thread per element of
     /// `[nobj, nyo, nxo]`.
     ///
@@ -255,17 +249,16 @@ pub mod sampling_kernels {
             return;
         }
         let (o, j) = ((t / n) as u32, t % n);
-        let end = (s.p0 + s.npass).min(nf * s.modes);
-        let mut q = s.p0 + (o + s.modes - s.p0 % s.modes) % s.modes;
+        let first = o * g.nf_max;
+        let end = (s.p0 + s.npass).min(first + nf);
         let mut a = unsafe { load_c(acc, t) };
-        while q < end {
+        for q in s.p0.max(first)..end {
             unsafe {
-                let (_, y, x) = point(views, offsets, f0, q, g, s.modes);
+                let (_, y, x) = point(views, offsets, f0, q, g);
                 let e = phase(j as u32, g.nyo, g.nxo, y, x, s, 1.0);
                 let v = cmul_conj(e, load_c(scratch, (q - s.p0) as usize * n + j));
                 a = (a.0 + v.0, a.1 + v.1);
             }
-            q += s.modes;
         }
         unsafe { store_c(acc, t, a) };
     }
@@ -319,7 +312,8 @@ pub mod sampling_kernels {
     ///
     /// # Safety
     ///
-    /// `views` `nframe * nmode` records, `offsets` `[nframe, 2]`, `acc` `[nobj, nyo, nxo]`.
+    /// `g` the scan's geometry, `nf_max == nframe`; `views` `nframe * nmode` records, `offsets`
+    /// `[nframe, 2]`, `acc` `[nobj, nyo, nxo]`.
     #[kernel]
     pub unsafe fn illum_phase(
         views: *const ViewAddr,
@@ -343,7 +337,7 @@ pub mod sampling_kernels {
         let mut sum = (0.0, 0.0);
         for f in 0..g.nframe {
             unsafe {
-                let (_, y, x) = point(views, offsets, 0, f * nobj, g, nobj);
+                let (_, y, x) = point(views, offsets, 0, f, g);
                 let e = phase(t as u32, g.nyo, g.nxo, y, x, s, 1.0);
                 sum = (sum.0 + e.0, sum.1 - e.1);
             }

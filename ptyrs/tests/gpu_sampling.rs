@@ -218,13 +218,29 @@ fn slice_object(obj: &[C32], s: usize) -> Object {
     Object::new(Stack::from_vec([NOBJ, OBJ[0], OBJ[1]], data).unwrap())
 }
 
-/// The planes of a `[nf_max * modes, ny, nx]` block that the views of `nf` frames read, in
-/// view order: view `fl * nmode + m` reads plane `fl * modes + m / nprobe`.
-fn per_view(block: &[C32], nf: usize, modes: usize) -> Vec<C64> {
+/// The plane of a `[nobj, nf_max, ny, nx]` block that view `k` of a stack reads: view `fl *
+/// nmode + m` reads plane `m / nprobe * nf_max + fl`.
+fn plane_of(k: usize) -> usize {
+    k % NMODE / NPROBE * NF_MAX + k / NMODE
+}
+
+/// The planes of an all-modes block that the views of `nf` frames read, in view order.
+fn per_view(block: &[C32], nf: usize) -> Vec<C64> {
+    (0..nf * NMODE)
+        .flat_map(|k| block[plane_of(k) * N..][..N].iter().copied().map(c64))
+        .collect()
+}
+
+/// Per view of `nf` frames, its group's patch of a `[nobj, nf_max, ny, nx]` buffer on the
+/// group's first view and zero on the others, whose `W^H` is the group's.
+fn group_patches(patches: &[C32], nf: usize) -> Vec<C64> {
     (0..nf * NMODE)
         .flat_map(|k| {
-            let q = k / NMODE * modes + k % NMODE / NPROBE;
-            block[q * N..][..N].iter().copied().map(c64)
+            let first = k % NPROBE == 0;
+            let plane = &patches[plane_of(k) * N..][..N];
+            plane
+                .iter()
+                .map(move |&c| if first { c64(c) } else { C64::default() })
         })
         .collect()
 }
@@ -237,17 +253,19 @@ fn first_views(per_view: &[C64]) -> Vec<C64> {
 
 const SENTINEL: C32 = C32 { re: 7.0, im: -3.0 };
 
-/// Every block of `win` past the first `nf * modes` planes of `written` blocks still holds
-/// the sentinel.
-fn untouched(win: &[C32], blocks: &[usize], nf: usize, modes: usize) -> bool {
-    let len = NF_MAX * modes * N;
+/// Every plane of `win`'s `[modes, nf_max, ny, nx]` blocks still holds the sentinel but those
+/// of the first `nf` frames in the `written` blocks.
+fn untouched(win: &[C32], written: &[usize], nf: usize, modes: usize) -> bool {
+    let len = modes * NF_MAX * N;
     win.chunks_exact(len).enumerate().all(|(b, block)| {
-        let from = if blocks.contains(&b) {
-            nf * modes * N
-        } else {
-            0
-        };
-        block[from..].iter().all(|&c| c == SENTINEL)
+        block
+            .as_chunks::<N>()
+            .0
+            .iter()
+            .enumerate()
+            .all(|(q, plane)| {
+                (written.contains(&b) && q % NF_MAX < nf) || plane.iter().all(|&c| c == SENTINEL)
+            })
     })
 }
 
@@ -277,7 +295,7 @@ fn windows_match_the_cpu_sampler_on_every_slice() {
         let got = g.down(&win);
         for slice in 0..NSLICE as usize {
             let want = cpu_windows(&slice_object(&host, slice), frames.clone(), [0.0; 2]);
-            let e = rel(&per_view(&got[slice * len..], nf, NOBJ), &want);
+            let e = rel(&per_view(&got[slice * len..], nf), &want);
             assert!(e < 2e-6, "stack {s} slice {slice}: {e:.2e}");
         }
         assert!(untouched(&got, &[0, 1], nf, NOBJ), "stack {s}");
@@ -351,7 +369,7 @@ fn derivative_windows_match_cpu_differences() {
                     Modes::First => first_views(&want),
                 };
                 let views = match modes {
-                    Modes::All => per_view(&got[b * len..], nf, m),
+                    Modes::All => per_view(&got[b * len..], nf),
                     Modes::First => (got[b * len..][..nf * N].iter().copied().map(c64)).collect(),
                 };
                 let e = rel(&views, &want);
@@ -370,8 +388,8 @@ fn place_adds_the_cpu_adjoint_to_one_slice() {
     for (s, frames) in stacks().into_iter().enumerate() {
         let frames = frames.start as usize..frames.end as usize;
         let nf = frames.len();
-        // Planes past the stack's views hold values `place` must not read.
-        let patches = noise(NF_MAX * NMODE * N, 11 + s as u64);
+        // Planes past the stack's frames hold values `place` must not read.
+        let patches = noise(NOBJ * NF_MAX * N, 11 + s as u64);
         let mut obj = up(&g.stream, &obj0);
         sampler
             .place(&g.ctx, g.at(s), &up(&g.stream, &patches), 1, &mut obj)
@@ -379,8 +397,7 @@ fn place_adds_the_cpu_adjoint_to_one_slice() {
         let got = g.down(&obj);
         let len = NOBJ * PLANE;
         assert_eq!(got[..len], obj0[..len], "stack {s}: slice 0 changed");
-        let views: Vec<C64> = patches[..nf * NMODE * N].iter().copied().map(c64).collect();
-        let placed = cpu_place(&views, frames);
+        let placed = cpu_place(&group_patches(&patches, nf), frames);
         let want: Vec<C64> = (obj0[len..].iter().zip(&placed))
             .map(|(&o, p)| c64(o) + p)
             .collect();
@@ -398,9 +415,8 @@ fn place_is_the_adjoint_of_windows() {
     sampler
         .spectra(&g.ctx, &up(&g.stream, &x), &mut spectra)
         .unwrap();
-    for (s, frames) in stacks().into_iter().enumerate() {
-        let nf = frames.len();
-        let y = noise(NF_MAX * NMODE * N, 17 + s as u64);
+    for s in 0..stacks().len() {
+        let y = noise(NOBJ * NF_MAX * N, 17 + s as u64);
         let mut win = DeviceBuffer::zeroed(&g.stream, NF_MAX * NOBJ * N).unwrap();
         let block = WindowBlock {
             slice: 1,
@@ -415,8 +431,11 @@ fn place_is_the_adjoint_of_windows() {
         sampler
             .place(&g.ctx, g.at(s), &up(&g.stream, &y), 1, &mut placed)
             .unwrap();
-        let wx = per_view(&g.down(&win), nf, NOBJ);
-        let lhs: C64 = (wx.iter().zip(&y)).map(|(a, &b)| a.conj() * c64(b)).sum();
+        // The windows past the stack's frames stay zero, and `place` reads no `y` there.
+        let wx = g.down(&win);
+        let lhs: C64 = (wx.iter().zip(&y))
+            .map(|(&a, &b)| c64(a).conj() * c64(b))
+            .sum();
         let len = NOBJ * PLANE;
         let rhs: C64 = (x[len..].iter().zip(&g.down(&placed)[len..]))
             .map(|(&a, &b)| c64(a).conj() * c64(b))
