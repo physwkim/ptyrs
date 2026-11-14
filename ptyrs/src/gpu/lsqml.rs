@@ -30,7 +30,7 @@ use ptyrs_kernels::grad::ObjProbePtrs;
 pub use ptyrs_kernels::lsqml::LSQML_REC;
 use ptyrs_kernels::lsqml::{
     LSQML_CHI, LSQML_DOTS, LSQML_ICALC, LSQML_POISSON, LSQML_XI, LsqmlCols, LsqmlDots, LsqmlFar,
-    LsqmlPre, lsqml_kernels,
+    LsqmlPre, LsqmlRule, lsqml_kernels,
 };
 use ptyrs_kernels::pixel::PIXEL_THREADS;
 
@@ -268,6 +268,8 @@ impl LsqmlKernels {
                     views.tile_ptrs(),
                     pre,
                     init.into(),
+                    // The far field's intensity scale.
+                    (d.frame[0] * d.frame[1]) as f32,
                     d.scan_geom(),
                 )
             }
@@ -594,7 +596,13 @@ impl LsqmlKernels {
         let span = span(&st.dims, &batch)?;
         // pty-chi's `trim_mean`, the cut saturating at 0 for small batches.
         let trim = (span.nb as f64 * 0.1 / 2.0 - 0.5).ceil() as u32;
-        let g = st.dims.scan_geom();
+        let [ny, nx] = st.dims.frame;
+        let rule = LsqmlRule {
+            trim,
+            nmode: st.dims.nmode,
+            // The far field's intensity scale.
+            scale: (ny * nx) as f32,
+        };
         let writes = [st.dots.storage(), st.rec.storage(), st.step.storage()];
         self.base
             .launch(ctx, &[st.a_pos.storage()], &writes, |stream| {
@@ -605,11 +613,10 @@ impl LsqmlKernels {
                         ONE_BLOCK,
                         dptr(&st.dots),
                         span,
-                        trim,
+                        rule,
                         dptr::<f32, f32>(&st.a_pos).cast_const(),
                         dptr(&st.rec),
                         dptr(&st.step),
-                        g,
                     )
                 }
             })

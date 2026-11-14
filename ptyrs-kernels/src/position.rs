@@ -369,7 +369,7 @@ pub mod position_kernels {
 
     /// pty-chi's position step on the batch's positions `p` from the [`position_sums`],
     /// each frame's chunks summed in order (and left in its chunk 0): per axis `Δ = num /
-    /// (den + max(1e-6 ny nx, max_batch den))` and `dx = rule.step Δ`, 0 at the scan's other
+    /// (den + max(1e-6 scale, max_batch den))` and `dx = rule.step Δ`, 0 at the scan's other
     /// frames, then `offsets[order[p]] += clamp(dx, ±min(10 mean |dx − mean dx|,
     /// rule.limit))`, both means over the scan's `nframe` frames.
     ///
@@ -388,7 +388,7 @@ pub mod position_kernels {
         offsets: *mut f32,
         nframe: u32,
         rule: PositionRule,
-        g: StackGeom,
+        scale: f32,
     ) {
         static mut RED: SharedArray<f32, 1024> = SharedArray::UNINIT;
         let PositionRule { step, limit } = rule;
@@ -397,7 +397,7 @@ pub mod position_kernels {
         let k = POSITION_SUMS as usize;
         let (p0, len, nchunk) = (span.p0 as usize, span.nb as usize, span.nchunk as usize);
         let s = (&raw mut RED).cast::<f32>();
-        let eps = EPS_POSITION * g.ny as f32 * g.nx as f32;
+        let eps = EPS_POSITION * scale;
         let mut max = [eps; 2];
         let mut i = t;
         while i < len {
