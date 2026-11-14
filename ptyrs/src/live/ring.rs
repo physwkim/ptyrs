@@ -490,19 +490,19 @@ impl DeviceStore {
 #[cfg(test)]
 impl DeviceStore {
     /// Places backed.
-    fn edge(&self) -> u64 {
+    pub(crate) fn edge(&self) -> u64 {
         match self.shared.edge.lock().unwrap().mapped {
             Mapped::Upto(n) => n,
             Mapped::Failed(e) => panic!("{e}"),
         }
     }
 
-    fn wanted(&self) -> u64 {
+    pub(crate) fn wanted(&self) -> u64 {
         self.shared.edge.lock().unwrap().wanted
     }
 
     /// Stops the mapper before its next chunk, or lets it go on.
-    fn hold(&self, hold: bool) {
+    pub(crate) fn hold(&self, hold: bool) {
         self.shared.edge.lock().unwrap().hold = hold;
         self.shared.moved.notify_one();
     }

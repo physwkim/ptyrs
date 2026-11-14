@@ -1,6 +1,6 @@
 //! PyNX DM on the GPU, and the cycle it shares with RAAR.
 
-use crate::gpu::{Error as GpuError, Exit, FusedBufs, FusedInputs, FusedSums};
+use crate::gpu::{Error as GpuError, Exit, FusedBufs, FusedInputs, FusedSums, ShiftProbe};
 use cuda_async::device_operation::ExecutionContext;
 
 use super::device::{CarriedMut, M1Bufs, PassesMut};
@@ -157,7 +157,7 @@ impl Bufs<'_> {
                     };
                     let sums = FusedSums {
                         obj: summed.then_some(&mut *self.obj_sums),
-                        shift: m.shift_sums(false, true),
+                        shift: m.shift_sums(None, true),
                         ..FusedSums::default()
                     };
                     self.kernels
@@ -219,13 +219,14 @@ impl Bufs<'_> {
             };
             let (stack, psi) = (w.cut.at(s), &w.psi[s]);
             if obj {
-                let sums = m.psi_sums(Some(&mut *self.obj_sums), false);
+                let sums = m.psi_sums(Some(&mut *self.obj_sums), None);
                 self.kernels
                     .shifted_psi_sums(ctx, &inputs, stack, psi, f, sums)?;
             }
-            if let (Some(_), Some(step)) = (probe, m.shift_sums(true, false).probe) {
+            if probe.is_some() {
+                let sums = m.psi_sums(None, Some(ShiftProbe::Step));
                 self.kernels
-                    .shifted_step_sums(ctx, &inputs, stack, psi, f, step)?;
+                    .shifted_psi_sums(ctx, &inputs, stack, psi, f, sums)?;
             }
         }
         let Some(inertia) = probe else {
@@ -233,7 +234,7 @@ impl Bufs<'_> {
         };
         m.probe_sums(ctx, self.kernels, &dims, self.probe_sums)?;
         let model = m.model;
-        let Some(step) = m.shift_sums(true, false).probe else {
+        let Some(ShiftProbe::Step(step)) = m.shift_sums(Some(ShiftProbe::Step), false).probe else {
             return Ok(());
         };
         let inputs = FusedInputs {

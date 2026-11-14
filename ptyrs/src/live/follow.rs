@@ -1453,4 +1453,162 @@ mod tests {
             );
         }
     }
+
+    /// A scan of 2 * STORE_LEAD + 64 frames with 64 planned, streamed into
+    /// the one-GPU consumer: the store backs 2 * STORE_LEAD places before
+    /// the first frame (plan and lead, in whole chunks of STORE_LEAD frames)
+    /// and its mapper the rest during the scan. Held back, the mapper keeps
+    /// the uploader waiting at the edge with the frames in the ring; let go,
+    /// every frame lands with its counts, and the last kept object and the
+    /// LLKs are the replay's on counts uploaded whole, bit for bit.
+    #[test]
+    fn a_scan_past_its_plan_grows_the_one_gpu_store_mid_scan() {
+        let p = Ptycho::new(PtychoSpec {
+            n: 64,
+            path: ScanPath::Raster { cols: 8 },
+            points: 64,
+            step: 8.0,
+            photons: 1e6,
+            seed: 5,
+            wavelength: 1.5498e-10,
+            distance: 5.0,
+            det_pixel: 75e-6,
+        });
+        let (n, total) = (64usize, 2 * STORE_LEAD + 64);
+        let edge = 2 * STORE_LEAD as u64;
+        let pos: Vec<(f64, f64)> = (0..total).map(|k| p.position(k % p.points())).collect();
+        let frames: Vec<Vec<u16>> = (0..p.points()).map(|k| p.frame(k)).collect();
+        let counts: Vec<u16> = (0..total)
+            .flat_map(|k| frames[k % p.points()].iter().copied())
+            .collect();
+        let rc = ReconCfg {
+            nf_max: NonZeroU32::new(64).unwrap(),
+            snap_every: NonZeroU32::new(5).unwrap(),
+            snaps: 2,
+            ..ReconCfg::default()
+        };
+        let mut cfg = FollowCfg::plan(&p, NonZeroU32::new(total as u32).unwrap(), &rc);
+        cfg.plan.truncate(64);
+        let ctx = Context::new(0).expect("GPU 0");
+        let ring = Arc::new(Ring::new(&ctx, 16, n * n).unwrap());
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let (ready_tx, ready_rx) = crossbeam_channel::bounded(1);
+        let (view_tx, view_rx) = crossbeam_channel::bounded(1);
+        let viewer = std::thread::spawn(move || view_rx.iter().count());
+        let (llk_tx, llk_rx) = crossbeam_channel::unbounded::<Vec<f64>>();
+        let consumer = {
+            let cfg = cfg.clone();
+            let preview = Some(Preview {
+                period: Duration::from_millis(10),
+                tx: view_tx,
+                llk_period: Duration::from_millis(10),
+                llk: llk_tx,
+            });
+            std::thread::spawn(move || {
+                run_dist_consumer(&[0], Scheme::Strips, cfg, rx, ready_tx, preview)
+            })
+        };
+        let ((stores, route), consumer) = sent(&ready_rx, consumer);
+        let store = stores[0].clone();
+        assert_eq!(store.edge(), edge);
+        store.hold(true);
+        let table = Arc::new(PosTable::new(1 << 16));
+        let uploader = {
+            let (ring, stop, table) = (ring.clone(), stop.clone(), table.clone());
+            let up = UploaderConfig {
+                batch: NonZeroUsize::new(16).unwrap(),
+                flush_ns: 100_000,
+                idle: Duration::from_micros(20),
+                events: 4,
+                pos_wait_ns: 1_000_000_000,
+            };
+            std::thread::spawn(move || {
+                run_region_uploader(ring, stores, route, table, up, stop, Some(tx))
+            })
+        };
+        let producer = {
+            let (ring, table) = (ring.clone(), table.clone());
+            let (pos, counts) = (pos.clone(), counts.clone());
+            std::thread::spawn(move || {
+                for (k, &(x, y)) in pos.iter().enumerate() {
+                    let mut s = ring.reserve();
+                    s.frame()
+                        .copy_from_slice(&counts[k * n * n..(k + 1) * n * n]);
+                    table.insert(k as i32, Pos::new(x, y, 0));
+                    s.commit(k as i32, 0, 0);
+                }
+            })
+        };
+        let t = Instant::now();
+        while store.wanted() <= edge {
+            assert!(
+                t.elapsed() < Duration::from_secs(60),
+                "never asked past the edge"
+            );
+            std::thread::yield_now();
+        }
+        // Time for a copy past the edge the uploader must not queue; too
+        // little only skips that.
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(
+            !producer.is_finished(),
+            "the ring took every frame past the edge"
+        );
+        assert_eq!(store.edge(), edge);
+        store.hold(false);
+        producer.join().unwrap();
+        stop.store(true, Ordering::Release);
+        let up = uploader.join().unwrap().unwrap();
+        assert_eq!((up.frames, up.pos_missing), (total as u64, 0));
+        assert_eq!(up.store_waits, 1);
+        assert_eq!(store.edge(), total as u64);
+        let rep = consumer.join().unwrap().unwrap();
+        assert!(viewer.join().unwrap() > 0);
+        let llk: Vec<u64> = llk_rx.iter().flatten().map(f64::to_bits).collect();
+        assert_eq!((rep.stored, rep.landed), (total as u64, total as u64));
+        let mut dev = vec![0u16; counts.len()];
+        store.read_frames(0..total as u64, &mut dev).unwrap();
+        assert!(dev == counts, "the store's frames are not the counts sent");
+
+        ctx.bind_to_thread().unwrap();
+        let st = ctx.new_stream().unwrap();
+        let whole = cuda_core::DeviceBuffer::from_host(&st, &counts).unwrap();
+        let mut run = LiveAp::new(&st, &cfg.ap, &cfg.probe, whole, true).unwrap();
+        let mut backer = run.backer();
+        let mut at = 0;
+        for &(epochs, upto) in &rep.landings {
+            while run.epochs() < epochs {
+                run.epoch().unwrap();
+            }
+            let v = views_of(&cfg.ap, &cfg.place, &pos[at as usize..upto as usize]);
+            backer.back(&v).unwrap();
+            run.push(&v).unwrap();
+            at = upto;
+        }
+        let last = rep.kept.last().unwrap();
+        while run.epochs() < last.epochs {
+            run.epoch().unwrap();
+        }
+        let mut snap = run.new_snapshot().unwrap();
+        run.snapshot(&mut snap).unwrap();
+        let got = snap.wait().unwrap();
+        let diff = got[..last.pixels.len()]
+            .iter()
+            .zip(&last.pixels)
+            .filter(|(a, b)| a.map(f32::to_bits) != b.map(f32::to_bits))
+            .count();
+        assert_eq!(
+            diff, 0,
+            "pixels unlike the replay's on counts uploaded whole"
+        );
+        let replayed: Vec<u64> = run
+            .llk()
+            .unwrap()
+            .unwrap()
+            .iter()
+            .map(|(_, l)| l.to_bits())
+            .collect();
+        assert_eq!(replayed, llk, "LLKs unlike the replay's");
+    }
 }
