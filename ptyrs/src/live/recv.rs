@@ -1109,7 +1109,7 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
         Consumed::Sums(c) => c.consumed,
         Consumed::Recon(r) => r.rep.landed,
     };
-    let rx_lost = FrameLoss::new(&st, wr.decode_err, up.pos_missing, consumed);
+    let rx_lost = FrameLoss::new(&st, wr.decode_err, up.pos_missing, up.pos_invalid, consumed);
     let mut s = String::new();
     // Writing to a String cannot fail.
     let mut line = |args: fmt::Arguments| {
@@ -1120,7 +1120,7 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
         "recv expected={frames} received_unique={} gpu_frames={} lost={lost} rx_lost={} \
          unaccounted={} dup={} beyond={} \
          gap_events={} gap_frames={} out_of_order={} queue_full={} rejected={} placeholders={} \
-         decode_err={} pos_missing={} pos_crowded={} pos_waits={} pos_updates={} pos_rejected={}",
+         decode_err={} pos_missing={} pos_invalid={} pos_crowded={} pos_waits={} pos_updates={} pos_rejected={}",
         st.unique,
         up.frames,
         rx_lost.total(),
@@ -1135,6 +1135,7 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
         st.placeholders,
         wr.decode_err,
         up.pos_missing,
+        up.pos_invalid,
         up.pos_crowded,
         up.pos_waits,
         ps.updates,

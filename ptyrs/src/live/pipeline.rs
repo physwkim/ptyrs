@@ -209,27 +209,41 @@ pub struct FrameLoss {
     pub decode_err: u64,
     /// Frames the uploader dropped because their position did not come in time.
     pub pos_missing: u64,
+    /// Frames the uploader dropped because their position is no scan position.
+    pub pos_invalid: u64,
     /// Received, not consumed on the GPU and in none of the counts above.
     pub unaccounted: u64,
 }
 
 impl FrameLoss {
     /// From the source's counts, the workers' decode errors, the uploader's
-    /// frames without a position and the frames the GPU consumed, once
-    /// every worker and the uploader have drained.
-    pub fn new(st: &SourceStats, decode_err: u64, pos_missing: u64, on_gpu: u64) -> Self {
-        let counted = st.queue_full + decode_err + pos_missing;
+    /// frames without a position and with an invalid one, and the frames the
+    /// GPU consumed, once every worker and the uploader have drained.
+    pub fn new(
+        st: &SourceStats,
+        decode_err: u64,
+        pos_missing: u64,
+        pos_invalid: u64,
+        on_gpu: u64,
+    ) -> Self {
+        let counted = st.queue_full + decode_err + pos_missing + pos_invalid;
         Self {
             rejected: st.rejected,
             queue_full: st.queue_full,
             decode_err,
             pos_missing,
+            pos_invalid,
             unaccounted: st.unique.saturating_sub(on_gpu).saturating_sub(counted),
         }
     }
 
     pub fn total(&self) -> u64 {
-        self.rejected + self.queue_full + self.decode_err + self.pos_missing + self.unaccounted
+        self.rejected
+            + self.queue_full
+            + self.decode_err
+            + self.pos_missing
+            + self.pos_invalid
+            + self.unaccounted
     }
 }
 
@@ -478,17 +492,22 @@ mod tests {
             rejected,
             ..SourceStats::new(10)
         };
-        let none = FrameLoss::new(&st(0, 0), 0, 0, 10);
+        let none = FrameLoss::new(&st(0, 0), 0, 0, 0, 10);
         assert_eq!((none, none.total()), (FrameLoss::default(), 0));
-        let counted = FrameLoss::new(&st(1, 0), 2, 3, 4);
+        let counted = FrameLoss::new(&st(1, 0), 2, 2, 1, 4);
         assert_eq!(
-            (counted.queue_full, counted.decode_err, counted.pos_missing),
-            (1, 2, 3)
+            (
+                counted.queue_full,
+                counted.decode_err,
+                counted.pos_missing,
+                counted.pos_invalid
+            ),
+            (1, 2, 2, 1)
         );
         assert_eq!((counted.unaccounted, counted.total()), (0, 6));
-        let silent = FrameLoss::new(&st(1, 0), 0, 0, 7);
+        let silent = FrameLoss::new(&st(1, 0), 0, 0, 0, 7);
         assert_eq!((silent.unaccounted, silent.total()), (2, 3));
-        let rejected = FrameLoss::new(&st(0, 1), 0, 0, 10);
+        let rejected = FrameLoss::new(&st(0, 1), 0, 0, 0, 10);
         assert_eq!((rejected.rejected, rejected.total()), (1, 1));
     }
 }
