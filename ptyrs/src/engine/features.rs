@@ -517,6 +517,13 @@ impl Shifted {
 
     /// [`crate::engine::psi_to_obj_probe`] with the sums of [`Self::accumulate_obj`] and
     /// [`Self::accumulate_probe`], both from the arrays on entry; `self` is of `probe`.
+    ///
+    /// The probe solves `min ‖psi − A·P'‖² + reg·‖P' − P‖²` with `A` [`Self::to_psi`] and `reg`
+    /// as in `blend`, which `blend` does exactly when nothing moves. Under a move `A^H·A` is
+    /// not the diagonal `Σ|O|²`, so each probe mode takes the first conjugate-gradient step
+    /// preconditioned by `D = Σ|O|² + reg`: `P += α·s`, `s = g / D`, `g = A^H(psi − A·P)`,
+    /// `α = <g, s> / (‖A·s‖² + reg·‖s‖²)`. The overlap error `‖psi − A·P‖²` cannot rise, the
+    /// fixed points are `g = 0`, and with no move `α = 1` and this is `blend`.
     pub(crate) fn psi_to_obj_probe(
         &self,
         views: &[View],
@@ -528,8 +535,45 @@ impl Shifted {
     ) {
         let obj_acc = obj_inertia.map(|_| self.accumulate_obj(views, object.dims(), psi));
         if let Some(inertia) = probe_inertia {
-            let (num, norm) = self.accumulate_probe(views, object, probe.dims(), psi, fft);
-            blend(probe, &num, &norm, inertia);
+            let n = self.shape[0] * self.shape[1];
+            let mut residual = vec![C64::default(); psi.len()];
+            self.to_psi(views, object, &mut residual);
+            for (r, x) in residual.iter_mut().zip(psi) {
+                *r = x - *r;
+            }
+            let (num, norm) = self.accumulate_probe(views, object, probe.dims(), &residual, fft);
+            let reg = norm.as_slice().iter().fold(0.0, |a: f64, &b| a.max(b)) * inertia;
+            let mut step = Probe::new(num);
+            let nmode = probe.dims()[0];
+            // Per probe mode: `<g, s>`, then `‖A·s‖² + reg·‖s‖²`.
+            let (mut slope, mut curvature) = (vec![0.0; nmode], vec![0.0; nmode]);
+            for (m, (s, w)) in (step.as_mut_slice().chunks_exact_mut(n))
+                .zip(norm.as_slice().chunks_exact(n))
+                .enumerate()
+            {
+                for (s, w) in s.iter_mut().zip(w) {
+                    let d = (w + reg).max(1e-12);
+                    slope[m] += s.norm_sqr() / d;
+                    *s /= d;
+                    curvature[m] += reg * s.norm_sqr();
+                }
+            }
+            let moved = Shifted::new(views, &step, &self.quad, &self.offsets, fft);
+            moved.to_psi(views, object, &mut residual);
+            for (v, x) in views.iter().zip(residual.chunks_exact(n)) {
+                curvature[v.probe as usize] += x.iter().map(|c| c.norm_sqr()).sum::<f64>();
+            }
+            for (m, (p, s)) in (probe.as_mut_slice().chunks_exact_mut(n))
+                .zip(step.as_slice().chunks_exact(n))
+                .enumerate()
+            {
+                if slope[m] > 0.0 {
+                    let alpha = slope[m] / curvature[m];
+                    for (p, s) in p.iter_mut().zip(s) {
+                        *p += s * alpha;
+                    }
+                }
+            }
         }
         if let (Some(inertia), Some((num, norm))) = (obj_inertia, obj_acc) {
             blend(object, &num, &norm, inertia);

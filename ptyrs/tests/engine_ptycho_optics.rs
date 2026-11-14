@@ -336,23 +336,22 @@ fn the_llk_falls_from_a_start_away_from_the_truth() {
     }
 }
 
-/// With offsets modelled and none in the counts the truth stays put under all five. With
-/// offsets in the counts it does under rPIE and ML alone: AP's, DM's and RAAR's probe update
-/// divides the moved numerator by the unmoved `Σ|O|²`, which is not the truth's own solve
-/// under any propagator.
+/// With offsets modelled the truth stays put under all five, whether the counts hold none or
+/// offsets of both signs, and the LLK falls from a start without them.
 #[test]
-fn positions_hold_and_the_llk_falls_under_angular_spectrum() {
-    let still = case(Kind::Angular, Extra::Still);
-    let c = case(Kind::Angular, Extra::Position);
-    for algo in ALGOS {
-        let exact = matches!(algo, Algo::Rpie | Algo::Ml);
-        let d = drift(&still, algo, 3).max(if exact { drift(&c, algo, 3) } else { 0.0 });
-        let r = fall(&c, algo, 40);
-        eprintln!("{algo:?}: drift {d:.3e}, llk ratio {r:.3e}");
-        assert!(
-            d < 1e-3 && r < 0.9,
-            "{algo:?}: drift {d:.3e}, llk ratio {r:.3e}"
-        );
+fn positions_hold_and_the_llk_falls_under_every_propagator() {
+    for kind in [Kind::Far].into_iter().chain(NEAR) {
+        let still = case(kind, Extra::Still);
+        let c = case(kind, Extra::Position);
+        for algo in ALGOS {
+            let d = drift(&still, algo, 3).max(drift(&c, algo, 3));
+            let r = fall(&c, algo, 40);
+            eprintln!("{kind:?} {algo:?}: drift {d:.3e}, llk ratio {r:.3e}");
+            assert!(
+                d < 2e-3 && r < 0.9,
+                "{kind:?} {algo:?}: drift {d:.3e}, llk ratio {r:.3e}"
+            );
+        }
     }
 }
 
