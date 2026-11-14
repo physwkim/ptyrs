@@ -2262,16 +2262,13 @@ impl Device {
         Ok(())
     }
 
-    /// Fails while `algorithm`'s cycle cannot model the position as it is sampled, whether
-    /// its run is built or reused, and for the LLK records its calls tag, which DM and RAAR
-    /// take before a cycle: AP's, DM's, RAAR's and ML's passes sample the object's windows,
-    /// the others' move the probe alone yet.
+    /// Fails while `algorithm`'s cycle, or the LLK records its calls tag, cannot model the
+    /// position as it is sampled, whether its run is built or reused.
     fn cycle_runs(&self, algorithm: Algorithm) -> Result<(), EngineError> {
         match algorithm {
             Algorithm::Ap | Algorithm::Dm | Algorithm::Raar | Algorithm::Ml => Ok(()),
-            Algorithm::Rpie | Algorithm::Bh | Algorithm::Lsqml => {
-                self.patch_only(&format!("{algorithm:?}"))
-            }
+            Algorithm::Rpie | Algorithm::Bh => self.patch_only(&format!("{algorithm:?}")),
+            Algorithm::Lsqml => self.llk_runs(),
         }
     }
 

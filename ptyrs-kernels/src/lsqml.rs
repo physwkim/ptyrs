@@ -99,7 +99,9 @@ pub struct LsqmlRule {
 }
 
 /// The object preconditioner: `pre` `[nobj, nyo, nxo]` floats, `max_bits` its maximum as
-/// `f32` bits, `count_max` the brightest frame's photons.
+/// `f32` bits, `count_max` the brightest frame's photons. Its update from an illumination `I`
+/// is pty-chi's mean of `I` and the last `pre`, or on a new run `I · count_max / (4 n
+/// scale)`, `n` the frame's pixels and `scale` the propagator's intensity scale.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct LsqmlPre {
@@ -298,11 +300,31 @@ unsafe fn dots<const SHIFT: bool>(
     unsafe { store_sums::<6>(red, acc, out.add(LSQML_DOTS as usize * at)) }
 }
 
+/// The [`LsqmlPre`] update of element `px` from its illumination `illum`, a new run with
+/// `init != 0`; written and returned.
+///
+/// # Safety
+///
+/// `pre` as [`LsqmlPre`] says, `px` inside it.
+#[device]
+unsafe fn pre_update(pre: LsqmlPre, px: usize, illum: f32, init: u32, scale: f32, n: usize) -> f32 {
+    unsafe {
+        let old = if init != 0 {
+            illum * (*pre.count_max as f32 / (4.0 * n as f32 * scale))
+        } else {
+            *pre.pre.add(px)
+        };
+        let out = (old + illum) / 2.0;
+        *pre.pre.add(px) = out;
+        out
+    }
+}
+
 #[cuda_module]
 pub mod lsqml_kernels {
     use super::{
         EPS_XI, LAMBDA0, LSQML_DOTS, LSQML_REC, LSQML_XI, LsqmlCols, LsqmlDots, LsqmlFar, LsqmlPre,
-        LsqmlRule, WavePlanes, cols, dots, store_sums, walk_slot,
+        LsqmlRule, WavePlanes, cols, dots, pre_update, store_sums, walk_slot,
     };
     use crate::bh::{BhObs, CHUNK_PIXELS};
     use crate::grad::GAMMA_CHUNK;
@@ -406,13 +428,12 @@ pub mod lsqml_kernels {
         }
     }
 
-    /// pty-chi's object preconditioner over every view of `views`: with `I = Σ_v |P[v.probe]
-    /// (y − v.oy, x − v.ox)|²` over the views of object mode `blockIdx.z` whose integer
-    /// window holds object pixel `(y, x)`, `pre = (I · power / (4 n scale) + I) / 2` with
-    /// `init != 0` (`power = *count_max`, `scale` the propagator's intensity scale, `n` in the
-    /// far field),
-    /// else `pre = (pre + I) / 2`; every pixel of the object is written, and the new maximum merged into `*max_bits`, which must start at zero. Grid
-    /// `(ntx, nty, nobj)` of `OBJ_TILE` tiles, block `(OBJ_TILE, OBJ_TILE, 1)`.
+    /// pty-chi's object preconditioner over every view of `views`: the [`LsqmlPre`] update,
+    /// a new run with `init != 0`, of `I = Σ_v |P[v.probe] (y − v.oy, x − v.ox)|²` over the
+    /// views of object mode `blockIdx.z` whose integer window holds object pixel `(y, x)`
+    /// (`scale` is `n` in the far field); every pixel of the object is written, and the new
+    /// maximum merged into `*max_bits`, which must start at zero. Grid `(ntx, nty, nobj)` of
+    /// `OBJ_TILE` tiles, block `(OBJ_TILE, OBJ_TILE, 1)`.
     ///
     /// # Safety
     ///
@@ -447,16 +468,39 @@ pub mod lsqml_kernels {
                     }
                 }
                 let px = (iobj as usize * nyo as usize + y as usize) * nxo as usize + x as usize;
-                let old = if init != 0 {
-                    illum * (*pre.count_max as f32 / (4.0 * n as f32 * scale))
-                } else {
-                    *pre.pre.add(px)
-                };
-                out = (old + illum) / 2.0;
-                *pre.pre.add(px) = out;
+                out = pre_update(pre, px, illum, init, scale, n);
             }
         }
         let t = (thread::threadIdx_y() * OBJ_TILE + thread::threadIdx_x()) as usize;
+        unsafe { block_max_into((&raw mut RED).cast::<f32>(), t, out, pre.max_bits) }
+    }
+
+    /// [`lsqml_pre`] where each view samples the object at its offset: `I` is `illum`, the
+    /// sampler's illumination map. One thread per element of `pre`'s `len = nobj nyo nxo`, `n`
+    /// the frame's pixels; `*max_bits` must start at zero.
+    ///
+    /// # Safety
+    ///
+    /// `illum` holds `len` floats, `pre` as [`LsqmlPre`] says for `len`; block
+    /// `(PIXEL_THREADS, 1, 1)`.
+    ///
+    /// [`lsqml_pre`]: crate::lsqml::lsqml_kernels::LoadedModule::lsqml_pre
+    #[kernel]
+    pub unsafe fn lsqml_pre_map(
+        illum: *const f32,
+        pre: LsqmlPre,
+        init: u32,
+        scale: f32,
+        n: u32,
+        len: u32,
+    ) {
+        static mut RED: SharedArray<f32, 256> = SharedArray::UNINIT;
+        let i = global_index();
+        let mut out = 0.0f32;
+        if i < len as usize {
+            unsafe { out = pre_update(pre, i, *illum.add(i), init, scale, n as usize) };
+        }
+        let t = thread::threadIdx_x() as usize;
         unsafe { block_max_into((&raw mut RED).cast::<f32>(), t, out, pre.max_bits) }
     }
 

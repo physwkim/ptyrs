@@ -15,7 +15,7 @@ use ptyrs::base::{
 };
 use ptyrs::engine::{
     ApParams, BhParams, Cost, Features, Fft2, GpuOptions, GpuPtycho, Llk, Lsqml, LsqmlParams,
-    LsqmlStep, Observed, Optics, ProbeVariation, SliceWaves, Wavefield, llk, shift,
+    LsqmlStep, Observed, Optics, ProbeVariation, Sampling, SliceWaves, Wavefield, llk, shift,
 };
 use ptyrs::gpu::FUSED_SIDES;
 
@@ -695,6 +695,24 @@ fn gpu_refuses_what_it_cannot_run_on_slices() {
     assert!(e.contains(only), "{e}");
     let e = gpu.ml_grads().unwrap_err().to_string();
     assert!(e.contains(only), "{e}");
+    // The LLK pass samples no slice yet, and LSQML takes its records.
+    gpu.set_features(&moved(true)).unwrap();
+    gpu.set_sampling(Sampling::FullObject).unwrap();
+    let offsets = gpu.features().unwrap().position;
+    let params = LsqmlParams {
+        batch_size: 12,
+        cost: Cost::Poisson,
+        seed: 7,
+    };
+    let sampled = "the multislice LLK pass models a position by moving the probe";
+    let e = gpu.lsqml(&params, 1, 0).unwrap_err().to_string();
+    assert!(e.contains(sampled), "{e}");
+    let e = gpu.llk().unwrap_err().to_string();
+    assert!(e.contains(sampled), "{e}");
+    assert!(
+        gpu.features().unwrap().position == offsets,
+        "a refused pass changed the offsets"
+    );
 
     let after: Vec<_> = gpu.objects().unwrap().iter().map(|o| bits(o)).collect();
     assert!(after == before, "a refused pass changed the object");
