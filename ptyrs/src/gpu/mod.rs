@@ -36,6 +36,7 @@ mod fused;
 mod grad;
 mod lsqml;
 mod ops;
+mod optics;
 mod position;
 mod psi;
 mod ring;
@@ -59,6 +60,7 @@ pub use ops::{
     PositionPartial, ScalePartial, StackCtl, StackGeom, StackRef, StackTable, UpdateSums, ViewAddr,
     ViewDims, Views, view_tiles,
 };
+pub use optics::{ExitStage, OpticsKernels};
 pub use position::{PositionKernels, PositionRule, Positions};
 pub use psi::Waves;
 pub use ring::{Ended, LlkRing, LlkTotals, RecordWriter, RingDevice, RingError};
