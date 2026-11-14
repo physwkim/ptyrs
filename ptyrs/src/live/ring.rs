@@ -14,6 +14,7 @@
 //! its position is dropped `pos_wait_ns` after it arrived, or sooner, as soon
 //! as a worker needs its slot: a missing position holds the frames behind it
 //! only while the ring has room for them, so it never costs another frame.
+//! One whose position arrived but is no scan position is dropped at once.
 //!
 //! On the device every landed frame has its own place in a [`DeviceStore`],
 //! the next one in landing order, so an uploaded frame is never overwritten
@@ -38,7 +39,7 @@ use cuda_bindings::CUdeviceptr;
 use cuda_core::{Context, DeviceBuffer, DriverError, Event, IntoResult, PinnedHostBuffer, Stream};
 
 use crate::live::grow::{GrowBuf, GrowError};
-use crate::live::pos::PosTable;
+use crate::live::pos::{Entry, PosTable};
 use crate::live::stats::{Histogram, thread_cpu_ns, wall_ns};
 
 #[derive(Default)]
@@ -348,6 +349,9 @@ pub struct UploadReport {
     pub frames: u64,
     /// Frames dropped because their position did not come in time.
     pub pos_missing: u64,
+    /// Frames dropped because the position that came is no scan position
+    /// ([`Entry::Invalid`]); none of them waited.
+    pub pos_invalid: u64,
     /// Of `pos_missing`, those dropped before `pos_wait_ns` because a worker
     /// needed their slot.
     pub pos_crowded: u64,
@@ -553,6 +557,7 @@ fn upload(
     let mut rep = UploadReport {
         frames: 0,
         pos_missing: 0,
+        pos_invalid: 0,
         pos_crowded: 0,
         pos_waits: 0,
         pos_first: 0,
@@ -588,8 +593,8 @@ fn upload(
             let i = at(joined);
             let m = &ring.meta[i];
             let t_rx = m.t_rx.load(Ordering::Relaxed);
-            match pos.get(m.uid.load(Ordering::Relaxed)) {
-                Some(p) => {
+            match pos.lookup(m.uid.load(Ordering::Relaxed)) {
+                Entry::Valid(p) => {
                     // SAFETY: slot `i` is committed and not yet released, so
                     // no worker writes it (see `Ring`).
                     unsafe {
@@ -608,7 +613,12 @@ fn upload(
                         lanes.len()
                     );
                 }
-                None => {
+                Entry::Invalid => {
+                    rep.pos_invalid += 1;
+                    m.place.store(0, Ordering::Relaxed);
+                    routes[i] = 0;
+                }
+                Entry::Absent => {
                     // Sequence `joined + slots` is reserved: a worker waits
                     // for this frame's slot.
                     let crowded = ring.next.load(Ordering::Acquire) > joined + slots as u64;
@@ -1031,6 +1041,80 @@ mod tests {
         );
         assert_eq!(ring.stalls(), 0);
         check_landed(&ring, &store, &rep, rx, &landed);
+    }
+
+    fn post_invalid(pos: &PosTable, uid: i32) {
+        pos.insert(
+            uid,
+            Pos {
+                x: f64::NAN,
+                y: 0.0,
+                t_rx: wall_ns(),
+            },
+        );
+    }
+
+    /// The wait for a position that an invalid one must not take.
+    fn long_wait() -> UploaderConfig {
+        UploaderConfig {
+            pos_wait_ns: 3_600_000_000_000,
+            ..cfg()
+        }
+    }
+
+    /// A frame whose position is already in, and is no scan position, is
+    /// dropped when it arrives, without waiting and not as a missing one;
+    /// the valid ones behind it in the same pass land in order.
+    #[test]
+    fn a_frame_with_an_invalid_position_is_dropped_at_once() {
+        let ctx = Context::new(0).expect("GPU 0");
+        let se = 4096;
+        let ring = Arc::new(Ring::new(&ctx, 8, se).unwrap());
+        let store = Arc::new(DeviceStore::new(&ctx, 4, se).unwrap());
+        let pos = Arc::new(PosTable::new(64));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = crossbeam_channel::unbounded();
+        for uid in [0, 1, 3, 4] {
+            post(&pos, uid);
+        }
+        post_invalid(&pos, 2);
+        // All five are committed before the uploader's first pass.
+        commit(&ring, 0..5);
+        let up = uploader(&ring, &store, &pos, long_wait(), &stop, Some(tx));
+        stop.store(true, Ordering::Release);
+        let rep = up.join().unwrap().unwrap();
+        assert_eq!(
+            (rep.frames, rep.pos_invalid, rep.pos_missing, rep.pos_waits),
+            (4, 1, 0, 0)
+        );
+        check_landed(&ring, &store, &rep, rx, &[0, 1, 3, 4]);
+    }
+
+    /// An invalid position that comes while its frame waits at the head of
+    /// the ring drops the frame then, and the frames it held land.
+    #[test]
+    fn an_invalid_position_ends_its_frames_wait() {
+        let ctx = Context::new(0).expect("GPU 0");
+        let se = 4096;
+        let ring = Arc::new(Ring::new(&ctx, 4, se).unwrap());
+        let store = Arc::new(DeviceStore::new(&ctx, 2, se).unwrap());
+        let pos = Arc::new(PosTable::new(64));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let up = uploader(&ring, &store, &pos, long_wait(), &stop, Some(tx));
+        post(&pos, 1);
+        post(&pos, 2);
+        commit(&ring, 0..3);
+        until("the uploader waits at frame 0", || ring.pos_waits() == 1);
+        assert!(rx.try_recv().is_err(), "a frame landed before frame 0");
+        post_invalid(&pos, 0);
+        stop.store(true, Ordering::Release);
+        let rep = up.join().unwrap().unwrap();
+        assert_eq!(
+            (rep.frames, rep.pos_invalid, rep.pos_missing, rep.pos_waits),
+            (2, 1, 0, 1)
+        );
+        check_landed(&ring, &store, &rep, rx, &[1, 2]);
     }
 
     /// A full ring behind a frame still without its position holds it until
