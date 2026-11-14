@@ -111,8 +111,9 @@ fn assert_run(
         &format!("{what} offsets"),
         &delta(got),
         &delta(&want),
-        // 5x the worst measured (3.5e-13): pty-chi's absolute positions cost the change digits
-        2e-12,
+        // 5x the worst measured, the PATCH step's (5.1e-13): pty-chi's absolute positions cost
+        // the change digits
+        3e-12,
     );
 }
 
