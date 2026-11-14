@@ -102,8 +102,9 @@ fn position_matches_pos_grad_ref() {
 }
 
 /// [`position_grad`] along a direction over every frame's offset against five-point central
-/// differences of the Poisson sum and of a quarter of the Euclidian sum, at the reference's
-/// offsets under either sampling.
+/// differences at `h` and `2h`, Richardson-combined to cancel their `h⁴` truncation, of the
+/// Poisson sum and of a quarter of the Euclidian sum, at the reference's offsets under either
+/// sampling.
 #[test]
 fn position_grad_matches_central_differences() {
     let (scan, mut p) = state();
@@ -118,8 +119,8 @@ fn position_grad_matches_central_differences() {
         .map(|f| [(1.3 * f as f64 + 0.2).sin(), (0.7 * f as f64).cos()])
         .collect();
     let fft = Fft2::new(scan.geometry.frame);
-    // Measured worst 2.3e-9 at 5e-4, the sums' rounding; 2.7e-8 at 1e-3, the step's.
-    let h = 5e-4;
+    // Measured worst 7.2e-10 here, 1.7e-9 within 7% of it: the sums' rounding and the h⁶ term.
+    let h = 1e-3;
     for sampling in [Sampling::Patch, Sampling::FullObject] {
         p.set_sampling(sampling);
         let views = p.addr().views();
@@ -134,9 +135,16 @@ fn position_grad_matches_central_differences() {
             let l = llk(p.observed(), 0..p.addr().nframe(), p.addr().nmode(), &psi);
             [l.poisson, l.euclidian / 4.0]
         };
-        let [p1, m1, p2, m2] = [h, -h, 2.0 * h, -2.0 * h].map(costs);
+        // `f(kh) − f(−kh)` for k = 1, 2, 4.
+        let diff = [h, 2.0 * h, 4.0 * h].map(|t| {
+            let (a, b) = (costs(t), costs(-t));
+            [a[0] - b[0], a[1] - b[1]]
+        });
         for (i, cost) in [Cost::Poisson, Cost::Amplitude].into_iter().enumerate() {
-            let fd = (8.0 * (p1[i] - m1[i]) - (p2[i] - m2[i])) / (12.0 * h);
+            // The five-point difference at `2ᵏh`.
+            let five =
+                |k: usize| (8.0 * diff[k][i] - diff[k + 1][i]) / (12.0 * h * (1 << k) as f64);
+            let fd = (16.0 * five(0) - five(1)) / 15.0;
             let g = position_grad(&p, views, &offsets, cost);
             let dot: f64 = (g.iter().zip(&w))
                 .map(|(g, w)| g[0] * w[0] + g[1] * w[1])
