@@ -15,7 +15,7 @@ use std::sync::Arc;
 use crate::gpu::{
     BhScan, C32, EpochOrder, Error as GpuError, FusedBufs, FusedInputs, Kernels, LSQML_REC,
     LsqmlAt, LsqmlChi, LsqmlKernels, LsqmlNoise, LsqmlScan, LsqmlVar, Model, PositionRule, PsiSums,
-    SliceSource, SliceSteps, Solve, StackRef, StackTable, Views,
+    ShiftProbe, SliceSource, SliceSteps, Solve, StackRef, StackTable, Views,
 };
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaStream, DeviceBuffer};
@@ -461,7 +461,7 @@ impl<'a> Bufs<'a> {
                     let inputs = moved_inputs(&base, moved_shift(m.pos, m.spectrum));
                     let sums = PsiSums {
                         obj: Some(&mut *self.obj_sums),
-                        probe: Some(&mut *m.probe_sums),
+                        probe: Some(ShiftProbe::Sums(&mut *m.probe_sums)),
                     };
                     let stack = l.table.at(s);
                     self.kernels
@@ -682,7 +682,7 @@ impl<'a> Bufs<'a> {
                     let inputs = moved_inputs(&base, moved_shift(m.pos, m.spectrum));
                     let sums = PsiSums {
                         obj: Some(&mut *self.obj_sums),
-                        probe: Some(&mut *m.probe_sums),
+                        probe: Some(ShiftProbe::Sums(&mut *m.probe_sums)),
                     };
                     let (stack, chi) = (l.table.at(s), &w.chi[k][0]);
                     self.kernels
