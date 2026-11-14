@@ -138,6 +138,12 @@ unsafe fn mode_power(psi: *const f32, plane0: usize, nmode: u32, n: usize, at: u
     s
 }
 
+/// The pixels each thread of an `LLK_CHUNK` chunk sums, `PIXEL_THREADS` apart.
+const LLK_PIXELS: usize = (pixel::LLK_CHUNK / pixel::PIXEL_THREADS) as usize;
+/// The pixels of an [`LLK_PIXELS`] walk whose loads are issued together: four, with `u32`
+/// offsets, keep the `llk` kernel at 40 registers, six blocks per SM; all eight took 80.
+const LLK_GROUP: usize = 4;
+
 /// Block-shared `u32`s [`for_each_stack_tile`] takes: per owned tile its index and run
 /// bounds, then their count.
 const STACK_TILE_SHARED: usize = 3 * pixel::STACK_TILE_CANDIDATES as usize + 1;
@@ -632,16 +638,44 @@ pub mod kernels {
         let t = thread::threadIdx_x() as usize;
         let plane0 = fl * nmode as usize;
         let inv_n = 1.0 / n as f32;
+        let base = c * chunk + t;
+        // `LLK_GROUP` pixels at a time: a mode's loads of the group, masked pixels' too, are
+        // issued before its sums, which keep the pixel and mode order.
         let mut acc = LlkPartial::default();
-        let mut d = c * chunk + t;
-        while d < end {
-            let at = psi_index((d / nx as usize) as u32, (d % nx as usize) as u32, ny, nx);
-            let obs = unsafe { *counts.add((f0 as usize + fl) * n + d) };
-            if obs != MASKED {
-                let calc = (unsafe { mode_power(psi, plane0, nmode, n, at) } * inv_n).max(0.0);
-                llk_add(&mut acc, obs as f32, calc);
+        for gi in 0..LLK_PIXELS / LLK_GROUP {
+            let base = base + gi * LLK_GROUP * PIXEL_THREADS as usize;
+            let (mut obs, mut at) = ([MASKED; LLK_GROUP], [0u32; LLK_GROUP]);
+            #[unroll]
+            for i in 0..LLK_GROUP {
+                let d = base + i * PIXEL_THREADS as usize;
+                if d < end {
+                    obs[i] = unsafe { *counts.add((f0 as usize + fl) * n + d) };
+                    at[i] = psi_index((d / nx as usize) as u32, (d % nx as usize) as u32, ny, nx)
+                        as u32;
+                }
             }
-            d += PIXEL_THREADS as usize;
+            let mut power = [0.0f32; LLK_GROUP];
+            for m in 0..nmode as usize {
+                let mut v = [(0.0f32, 0.0f32); LLK_GROUP];
+                #[unroll]
+                for i in 0..LLK_GROUP {
+                    let d = base + i * PIXEL_THREADS as usize;
+                    if d < end {
+                        v[i] = unsafe { load_c(psi, (plane0 + m) * n + at[i] as usize) };
+                    }
+                }
+                #[unroll]
+                for i in 0..LLK_GROUP {
+                    // `mode_power`'s sum as NVVM contracts it there.
+                    power[i] = fma(v[i].0, v[i].0, fma(v[i].1, v[i].1, power[i]));
+                }
+            }
+            #[unroll]
+            for i in 0..LLK_GROUP {
+                if obs[i] != MASKED {
+                    llk_add(&mut acc, obs[i] as f32, (power[i] * inv_n).max(0.0));
+                }
+            }
         }
         let s = (&raw mut RED).cast::<f32>();
         let seg = PIXEL_THREADS as usize;
