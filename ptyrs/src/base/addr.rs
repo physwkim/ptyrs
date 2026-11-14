@@ -143,8 +143,8 @@ pub fn required_obj_shape(
         len.div_ceil(4) * 4
     };
     [
-        axis(&positions.y, pixel[0], frame[0]),
-        axis(&positions.x, pixel[1], frame[1]),
+        axis(positions.y(), pixel[0], frame[0]),
+        axis(positions.x(), pixel[1], frame[1]),
     ]
 }
 
@@ -186,7 +186,7 @@ mod tests {
         let p = Positions::new(vec![-3.2, 1.0, 9.49], vec![0.0, 5.1, -7.5]).unwrap();
         for margin in [0, 1, 4, 16] {
             let obj = required_obj_shape(&p, [1.0, 1.0], [16, 16], margin);
-            for (y, x) in p.y.iter().zip(&p.x) {
+            for (y, x) in p.y().iter().zip(p.x()) {
                 for (axis, d) in [(0, *y), (1, *x)] {
                     let c = view_corner(obj[axis], 16, d).unwrap();
                     assert!(c + 16 < obj[axis], "margin {margin} axis {axis} shift {d}");

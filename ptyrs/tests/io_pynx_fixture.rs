@@ -31,6 +31,6 @@ fn reads_pynx_written_cxi() {
     for i in 0..nz {
         let x = (i as f64 * 1.1e-7 + 1e-9 / 3.0) as f32 as f64;
         let y = (-(i as f64) * 0.7e-7) as f32 as f64;
-        assert_eq!((scan.positions.x[i], scan.positions.y[i]), (x, y));
+        assert_eq!((scan.positions.x()[i], scan.positions.y()[i]), (x, y));
     }
 }

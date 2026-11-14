@@ -1,10 +1,11 @@
 use crate::base::CoreError;
 
-/// Scan positions in metres (sample translation; x = columns, y = rows).
+/// Scan positions in metres (sample translation; x = columns, y = rows), each coordinate
+/// [`Positions::valid`] from [`Positions::new`] on.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Positions {
-    pub y: Vec<f64>,
-    pub x: Vec<f64>,
+    y: Vec<f64>,
+    x: Vec<f64>,
 }
 
 impl Positions {
@@ -29,6 +30,14 @@ impl Positions {
     /// PyNX treats `|pos| > 1e10` as a direct-beam frame; the oracle does not model those.
     pub fn valid(v: f64) -> bool {
         v.is_finite() && v.abs() <= 1e10
+    }
+
+    pub fn y(&self) -> &[f64] {
+        &self.y
+    }
+
+    pub fn x(&self) -> &[f64] {
+        &self.x
     }
 
     pub fn len(&self) -> usize {
