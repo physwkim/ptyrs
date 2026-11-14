@@ -708,26 +708,28 @@ fn upload(
             rep.batches += 1;
             progressed = true;
         }
-        while let Some(f) = inflight.front_mut() {
-            let seqs = f.seq0..f.seq0 + f.n;
-            for r in bits(f.wait) {
+        // A region's copies complete in the order queued: from its first
+        // unfinished batch on, so that a region waiting on none is timed
+        // without the others.
+        for r in 0..lanes.len() {
+            for f in inflight.iter_mut().filter(|f| f.wait >> r & 1 == 1) {
                 bind(lanes, &mut bound, r)?;
                 let lane = &mut lanes[r];
                 if !lane.events[f.ev].query()? {
-                    continue;
+                    break;
                 }
                 f.wait &= !(1 << r);
                 let t = wall_ns();
-                for seq in seqs.clone().filter(|&s| routes[at(s)] >> r & 1 == 1) {
+                for seq in (f.seq0..f.seq0 + f.n).filter(|&s| routes[at(s)] >> r & 1 == 1) {
                     let t_rx = ring.meta[at(seq)].t_rx.load(Ordering::Relaxed);
                     lane.rep.rx_to_gpu.record(t - t_rx);
                     lane.rep.frames += 1;
                 }
                 progressed = true;
             }
-            if f.wait != 0 {
-                break;
-            }
+        }
+        while let Some(f) = inflight.front().filter(|f| f.wait == 0) {
+            let seqs = f.seq0..f.seq0 + f.n;
             // Every region that takes the batch holds it.
             let t = wall_ns();
             let positions = match batches {
