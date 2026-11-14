@@ -418,6 +418,35 @@ pub mod bh_kernels {
         }
     }
 
+    /// `buf *= scale T`, or with `conj != 0` `buf *= scale conj(T)`, on every plane of the
+    /// stack: an angular-spectrum propagator between its two transforms. One thread per
+    /// element of `[nf_max * nmode, ny, nx]`.
+    ///
+    /// # Safety
+    ///
+    /// `buf` `[nf_max * nmode, ny, nx]`, `tf` `[ny, nx]`, `ctl` one entry.
+    #[kernel]
+    pub unsafe fn bh_transfer(
+        buf: *mut f32,
+        tf: *const f32,
+        scale: f32,
+        conj: u32,
+        ctl: *const StackCtl,
+        g: StackGeom,
+    ) {
+        let (_, nf) = unsafe { stack_frames(ctl, g) };
+        let n = g.ny as usize * g.nx as usize;
+        let t = global_index();
+        if t >= nf as usize * g.nmode as usize * n {
+            return;
+        }
+        unsafe {
+            let (re, im) = load_c(tf, t % n);
+            let im = if conj != 0 { -im } else { im };
+            store_c(buf, t, cmul(load_c(buf, t), (scale * re, scale * im)));
+        }
+    }
+
     /// `y = conj(O_v) r` of every view `v` of the stack in `obj_probe_to_psi`'s layout, `O_v`
     /// the object `v` samples at the natural pixel stored at each index (the probe-side
     /// gradient of a moved probe before its forward FFT). One thread per element of `[nf_max *

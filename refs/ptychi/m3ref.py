@@ -38,6 +38,7 @@ at every state checked.
 
 import json
 import os
+import sys
 import time
 
 import h5py
@@ -185,6 +186,20 @@ def run_epochs(task, epochs, log=None, extra=None):
         if not np.isfinite(row["gaussian"]):
             break
     return curve
+
+
+def exit_unless_converging(curves):
+    """Exit 2 if a side of `curves` (side -> its LLK per epoch, the start first) is not finite
+    or ends above its start: two runs that diverge together agree and are no comparison."""
+    for side, c in curves.items():
+        bad = next((e for e, v in enumerate(c) if not np.isfinite(v)), None)
+        if bad is not None:
+            print(f"{side} diverged: LLK {c[bad]} at epoch {bad}")
+            sys.exit(2)
+        if c[-1] > c[0]:
+            print(f"{side} diverged: LLK {c[-1]:.4e} at epoch {len(c) - 1}, {c[0]:.4e} at the "
+                  f"start")
+            sys.exit(2)
 
 
 def finite(x):

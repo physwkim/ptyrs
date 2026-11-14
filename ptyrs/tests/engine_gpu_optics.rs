@@ -17,6 +17,10 @@ use ptyrs::engine::{
 };
 use ptyrs::gpu::FUSED_SIDES;
 
+#[path = "common/worst.rs"]
+mod worst;
+use worst::worst_of;
+
 const NPOS: usize = 30;
 const NPROBE: usize = 2;
 const WAVELENGTH: f64 = 1e-10;
@@ -282,7 +286,7 @@ fn steps_rel(got: &[LsqmlStep], want: &[LsqmlStep]) -> f64 {
             assert_eq!(a.len(), b.len());
             let d = a.iter().zip(b).map(|(a, b)| (a - b).abs());
             let scale = b.iter().map(|b| b.abs()).fold(0.0, f64::max);
-            worst = worst.max(d.fold(0.0, f64::max) / scale);
+            worst = worst_of([worst, worst_of(d) / scale]);
         }
     }
     worst
@@ -353,7 +357,7 @@ fn gpu_lsqml_matches_cpu_under_every_propagator() {
                     let mut gpu = c.gpu(&c.optics, options).unwrap();
                     gpu.set_features(&features).unwrap();
                     gpu.lsqml(&params, epoch + 1, 0).unwrap();
-                    steps = steps.max(steps_rel(&gpu.lsqml_steps().unwrap(), &want));
+                    steps = worst_of([steps, steps_rel(&gpu.lsqml_steps().unwrap(), &want)]);
                 }
             }
 
@@ -366,9 +370,7 @@ fn gpu_lsqml_matches_cpu_under_every_propagator() {
             } else {
                 let got = gpu.history().iter().map(|r| r.llk.poisson);
                 assert_eq!(got.len(), NEPOCH);
-                got.zip(&trace)
-                    .map(|(g, w)| (g - w).abs() / w)
-                    .fold(0.0, f64::max)
+                worst_of(got.zip(&trace).map(|(g, w)| (g - w).abs() / w))
             };
             let offsets = match (&features.position, cpu.features().position.as_ref()) {
                 (Some(start), Some(want)) => {
@@ -381,7 +383,7 @@ fn gpu_lsqml_matches_cpu_under_every_propagator() {
                     };
                     let (a, b) = (delta(&got), delta(want));
                     let d = a.iter().zip(&b).map(|(a, b)| (a - b).abs());
-                    d.fold(0.0, f64::max) / b.iter().map(|b| b.abs()).fold(0.0, f64::max)
+                    worst_of(d) / b.iter().map(|b| b.abs()).fold(0.0, f64::max)
                 }
                 _ => 0.0,
             };
