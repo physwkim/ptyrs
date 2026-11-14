@@ -249,11 +249,16 @@ pub struct FollowReport {
     pub positions: Vec<(f64, f64)>,
     pub kept: Vec<Kept>,
     pub obj_mapped_bytes: usize,
-    /// Time backing the plan took, before the first frame.
+    /// Time backing the planned views took, before the first frame; on
+    /// several GPUs their times summed, as `plan_mapped_bytes` sums their
+    /// bytes, though they back theirs at once.
     pub plan_time: Duration,
     /// Object bytes mapped once the plan was backed; the scan grew it to
     /// `obj_mapped_bytes`.
     pub plan_mapped_bytes: usize,
+    /// Wall time from the consumer's entry to its sending what lets the
+    /// first frame in.
+    pub setup_time: Duration,
     /// Per batch, the epochs queued before it landed and the frames stored
     /// with it: the schedule that, replayed, gives the same object.
     pub landings: Vec<(u64, u64)>,
@@ -565,6 +570,8 @@ trait Engine: Solve {
     fn landed(&self) -> u64;
     /// Object bytes mapped.
     fn mapped_bytes(&mut self) -> Result<usize, Self::Error>;
+    /// How long backing the planned views took ([`FollowReport::plan_time`]).
+    fn plan_time(&mut self) -> Result<Duration, Self::Error>;
     /// Waits for everything queued.
     fn synchronize(&mut self) -> Result<(), Self::Error>;
 }
@@ -579,6 +586,9 @@ struct One {
     anchor: Event,
     t_anchor: i64,
     clock_ns: i64,
+    plan_time: Duration,
+    /// The counts `live` reads.
+    _store: Arc<DeviceStore>,
 }
 
 impl Solve for LiveAp {
@@ -673,6 +683,10 @@ impl Engine for One {
         Ok(self.live.scan().obj().mapped_bytes())
     }
 
+    fn plan_time(&mut self) -> Result<Duration, GrowError> {
+        Ok(self.plan_time)
+    }
+
     fn synchronize(&mut self) -> Result<(), GrowError> {
         Ok(self.stream.synchronize()?)
     }
@@ -737,6 +751,10 @@ impl Engine for DistLiveAp {
         DistLiveAp::mapped_bytes(self)
     }
 
+    fn plan_time(&mut self) -> Result<Duration, DistError> {
+        DistLiveAp::plan_time(self)
+    }
+
     fn synchronize(&mut self) -> Result<(), DistError> {
         DistLiveAp::synchronize(self)
     }
@@ -754,79 +772,83 @@ pub fn run_ap_consumer(
     captured: Sender<()>,
     preview: Option<Preview>,
 ) -> Result<FollowReport, GrowError> {
-    follow_one(ctx, store, cfg, batches, preview, None, || {
+    let entered = Instant::now();
+    let (run, ahead) = One::new(ctx, store, &cfg, None, preview.is_some())?;
+    follow(run, ahead, entered, &cfg, batches, preview, |_| {
         let _ = captured.send(());
     })
 }
 
-/// [`run_ap_consumer`], filling with `fill` if given, calling `ready` once
-/// the graphs are captured.
-fn follow_one(
-    ctx: Arc<Context>,
-    store: Arc<DeviceStore>,
-    cfg: FollowCfg,
-    batches: Receiver<FrameBatch>,
-    preview: Option<Preview>,
-    fill: Option<FillHook>,
-    ready: impl FnOnce(),
-) -> Result<FollowReport, GrowError> {
-    ctx.bind_to_thread()?;
-    let stream = ctx.new_stream()?;
-    let shape = cfg.ap.shape;
-    let elems = shape.frame[0] as usize * shape.frame[1] as usize;
-    if store.frame_elems() != elems || store.max_frames() < u64::from(shape.nframe) {
-        return Err(crate::gpu::Error::Shape(format!(
-            "a store of {} frames of {} pixels for a scan of {} frames of {:?}",
-            store.max_frames(),
-            store.frame_elems(),
-            shape.nframe,
-            shape.frame
-        ))
-        .into());
+impl One {
+    /// [`run_ap_consumer`]'s run, its plan backed and graphs captured,
+    /// recording each epoch's LLK with `llk`, and what its mapper does
+    /// ahead of it, filling with `fill` if given.
+    fn new(
+        ctx: Arc<Context>,
+        store: Arc<DeviceStore>,
+        cfg: &FollowCfg,
+        fill: Option<FillHook>,
+        llk: bool,
+    ) -> Result<(Self, Ahead), GrowError> {
+        ctx.bind_to_thread()?;
+        let stream = ctx.new_stream()?;
+        let shape = cfg.ap.shape;
+        let elems = shape.frame[0] as usize * shape.frame[1] as usize;
+        if store.frame_elems() != elems || store.max_frames() < u64::from(shape.nframe) {
+            return Err(crate::gpu::Error::Shape(format!(
+                "a store of {} frames of {} pixels for a scan of {} frames of {:?}",
+                store.max_frames(),
+                store.frame_elems(),
+                shape.nframe,
+                shape.frame
+            ))
+            .into());
+        }
+        // SAFETY: an epoch reads only landed frames, whose copies into the
+        // store completed before the uploader sent their batch.
+        let counts = unsafe { store.frames_view()? };
+        let live = LiveAp::new(&stream, &cfg.ap, &cfg.probe, counts, llk)?;
+        let predicting = match fill {
+            Some(h) => Some(Predicting::new(h, &ctx, &cfg.ap, Solve::shape(&live))?),
+            None => None,
+        };
+        // The plan is backed before `captured` lets the first frame in; from
+        // here on only the mapper grows device memory, past the plan.
+        let mut backer = live.backer();
+        let t = Instant::now();
+        backer.plan(&views_of(&cfg.ap, &cfg.place, &cfg.plan))?;
+        let plan_time = t.elapsed();
+        let fence = [timed_sleeping_event(&ctx)?, timed_sleeping_event(&ctx)?];
+        // Stamped on the idle stream.
+        let anchor = ctx.new_event()?;
+        stream.synchronize()?;
+        let t0 = wall_ns();
+        anchor.record(&stream)?;
+        anchor.synchronize()?;
+        let t_anchor = wall_ns();
+        let run = One {
+            live,
+            stream,
+            fence,
+            anchor,
+            t_anchor,
+            clock_ns: t_anchor - t0,
+            plan_time,
+            _store: store,
+        };
+        let ahead = Ahead {
+            backer: Some(backer),
+            predicting,
+        };
+        Ok((run, ahead))
     }
-    // SAFETY: an epoch reads only landed frames, whose copies into the
-    // store completed before the uploader sent their batch.
-    let counts = unsafe { store.frames_view()? };
-    let live = LiveAp::new(&stream, &cfg.ap, &cfg.probe, counts, preview.is_some())?;
-    let predicting = match fill {
-        Some(h) => Some(Predicting::new(h, &ctx, &cfg.ap, Solve::shape(&live))?),
-        None => None,
-    };
-    // The plan is backed before `captured` lets the first frame in; from
-    // here on only the mapper grows device memory, past the plan.
-    let mut backer = live.backer();
-    let t = Instant::now();
-    backer.plan(&views_of(&cfg.ap, &cfg.place, &cfg.plan))?;
-    let plan_time = t.elapsed();
-    let fence = [timed_sleeping_event(&ctx)?, timed_sleeping_event(&ctx)?];
-    // Stamped on the idle stream.
-    let anchor = ctx.new_event()?;
-    stream.synchronize()?;
-    let t0 = wall_ns();
-    anchor.record(&stream)?;
-    anchor.synchronize()?;
-    let t_anchor = wall_ns();
-    let run = One {
-        live,
-        stream,
-        fence,
-        anchor,
-        t_anchor,
-        clock_ns: t_anchor - t0,
-    };
-    let ahead = Ahead {
-        backer: Some(backer),
-        predicting,
-    };
-    follow(run, ahead, plan_time, &cfg, batches, preview, |_| ready())
 }
 
 /// Live AP on the GPUs `ordinals`, on stores of its own, filling with
 /// `fill` if given; the [`Landing`] the uploader takes is sent on `ready`
 /// once its graphs are captured and dropped unsent if that fails. One GPU
 /// runs as [`run_ap_consumer`] does. More split the object by `scheme`,
-/// region `r` on `ordinals[r]`, and [`FollowReport::plan_time`] is the
-/// whole setup's.
+/// region `r` on `ordinals[r]`.
 pub fn run_dist_consumer(
     ordinals: &[usize],
     scheme: Scheme,
@@ -836,6 +858,7 @@ pub fn run_dist_consumer(
     preview: Option<Preview>,
     fill: Option<FillHook>,
 ) -> Result<FollowReport, DistError> {
+    let entered = Instant::now();
     let tap = fill.as_ref().map(FillHook::tap);
     if let [one] = *ordinals {
         let ctx = Context::new(one)?;
@@ -852,11 +875,11 @@ pub fn run_dist_consumer(
             tap,
             ..Landing::new(vec![store.clone()], Whole)
         };
-        return Ok(follow_one(ctx, store, cfg, batches, preview, fill, || {
+        let (run, ahead) = One::new(ctx, store, &cfg, fill, preview.is_some())?;
+        return Ok(follow(run, ahead, entered, &cfg, batches, preview, |_| {
             let _ = ready.send(landing);
         })?);
     }
-    let t = Instant::now();
     let planned = views_of(&cfg.ap, &cfg.place, &cfg.plan);
     let llk = preview.is_some();
     let run = DistLiveAp::new(ordinals, &cfg.ap, &planned, scheme, &cfg.probe, llk)?;
@@ -868,13 +891,12 @@ pub fn run_dist_consumer(
         }
         None => None,
     };
-    let plan_time = t.elapsed();
     let place = cfg.place;
     let ahead = Ahead {
         backer: None,
         predicting,
     };
-    follow(run, ahead, plan_time, &cfg, batches, preview, |run| {
+    follow(run, ahead, entered, &cfg, batches, preview, |run| {
         let _ = ready.send(Landing {
             tap,
             ..Landing::new(run.stores(), run.route(place))
@@ -885,18 +907,18 @@ pub fn run_dist_consumer(
 /// Lands the batches into `live` and iterates it, as [`run_ap_consumer`]
 /// says, `prep` done to each batch ahead of its landing and its fill, if
 /// any, queued right behind it; `ready` is called once the run can take
-/// frames.
+/// frames, which ends the setup the consumer `entered`.
 fn follow<R: Engine>(
     mut live: R,
     prep: Ahead,
-    plan_time: Duration,
+    entered: Instant,
     cfg: &FollowCfg,
     batches: Receiver<FrameBatch>,
     preview: Option<Preview>,
     ready: impl FnOnce(&R),
 ) -> Result<FollowReport, R::Error> {
     let shape = cfg.ap.shape;
-    let plan_mapped_bytes = live.mapped_bytes()?;
+    let (plan_time, plan_mapped_bytes) = (live.plan_time()?, live.mapped_bytes()?);
     let mut fills = prep.predicting.is_some().then(FillReport::new);
     let (fwd, ahead) = crossbeam_channel::unbounded();
     let mut mapper = {
@@ -920,6 +942,7 @@ fn follow<R: Engine>(
     let mut llk_sent: Option<Instant> = None;
     let mut epoch_done = Vec::new();
     ready(&live);
+    let setup_time = entered.elapsed();
 
     let mut positions: Vec<(f64, f64)> = Vec::with_capacity(shape.nframe as usize);
     let mut kept = Vec::with_capacity(cfg.snaps);
@@ -1053,6 +1076,7 @@ fn follow<R: Engine>(
         obj_mapped_bytes: live.mapped_bytes()?,
         plan_time,
         plan_mapped_bytes,
+        setup_time,
         landings,
         epoch_done,
         epoch_clock_ns: live.clock_ns(),
@@ -1630,6 +1654,8 @@ mod tests {
             assert_eq!(warm.recaptures(), 0, "{ngpu} GPUs");
             assert_eq!(rep.positions, pos);
             assert_eq!((rep.stored, rep.landed), (total as u64, total as u64));
+            // Each GPU backs its planned views inside the setup.
+            assert!(rep.plan_time <= rep.setup_time * ngpu as u32, "{ngpu} GPUs");
             let scan_epochs = rep.scan_epochs.unwrap();
             assert!(scan_epochs > 0, "no epoch ran while the scan landed");
             assert_eq!(rep.kept.len(), 3);

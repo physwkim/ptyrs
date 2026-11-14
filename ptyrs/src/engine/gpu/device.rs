@@ -15,10 +15,11 @@ use crate::fft::Plan2d;
 use crate::gpu::{
     BH_STEP, BackgroundSums, BhKernels, C32, CG_BLOCKS, Ended, EpochOrder, Error as GpuError,
     ExitPass, ExitStage, FarSums, FrameWaves, FusedBufs, FusedInputs, GammaStacks, GradKernels,
-    Kernels, LlkPartial, LlkRing, LlkScratch, LlkTotals, Model, OpticsKernels, PositionKernels,
-    PositionPartial, Positions, PowerMax, ProbeSpectrum, PsiSums, RingDevice, RpieKernels,
-    ScalePartial, Shift, ShiftProbe, ShiftSums, ShiftedProbeSums, SlicePhase, SliceSource,
-    SpectrumBuf, StackRef, StackTable, UpdateSums, ViewAddr, ViewDims, Views,
+    HalfWaves, Kernels, LlkPartial, LlkRing, LlkScratch, LlkTotals, MASKED, Model, OpticsKernels,
+    PositionKernels, PositionPartial, Positions, PowerMax, ProbeSpectrum, PsiSums, RingDevice,
+    RpieKernels, ScalePartial, Shift, ShiftProbe, ShiftSums, ShiftedProbeSums, SlicePhase,
+    SliceSource, SpectrumBuf, StackRef, StackTable, UpdateSums, ViewAddr, ViewDims, Views, Waves,
+    half_scale,
 };
 use crate::tile::TileDots;
 use cuda_async::cuda_graph::CudaGraph;
@@ -183,6 +184,8 @@ pub(super) struct Device {
     /// DM's or RAAR's carried stacks: built by the first run of either and dropped by
     /// [`Self::steady_with`] once no run, whose graphs bind them, is left.
     carried: Option<Box<CarriedBufs>>,
+    /// Under [`GpuOptions::psi_f16`], the scale of the carried stacks' [`HalfWaves`].
+    half: Option<f32>,
     norms: NormBufs,
     ring: LlkRing<Tag>,
     use_graph: bool,
@@ -648,15 +651,26 @@ impl Shared {
         shift: bool,
         sliced: bool,
     ) -> Result<Self, EngineError> {
-        // M1's scratch: `obj_probe_to_psi`, the transforms and `apply_amplitude`; the fused
-        // work planes: the row, column and inverse row passes; each shift plane: the pass that
-        // writes it and a later one.
-        let mut streamed = vec![Streamed::new(wave_bytes(dims), if fused { 3 } else { 4 })];
+        // M1's scratch: `obj_probe_to_psi` (0), the transforms and `apply_amplitude` (to 3);
+        // the fused work planes: the row (0), column and inverse row passes and the sums over
+        // the waves (3). Under the position `shift_pre` writes `T`, and `T_y` into the adjoint
+        // planes, first (0); the inverse row pass (3) reads both and writes the adjoint, object
+        // planes and power, `shift_post` and the probe sums take the adjoint (4),
+        // `gather_shifted` the rest (5). Of a multislice object, the two waves its slices pass
+        // on, numbered after.
+        let wave = wave_bytes(dims);
+        let mut streamed = vec![Streamed::new(wave, if shift { 1..=3 } else { 0..=3 })];
         if shift {
-            streamed.push(Streamed::new(FusedBufs::shift_bytes(dims), 2));
+            let probe = plane_bytes::<C32>(dims, dims.nprobe);
+            let obj = plane_bytes::<C32>(dims, dims.nobj) + plane_bytes::<f32>(dims, 1);
+            streamed.extend([
+                Streamed::new(probe, 0..=3),
+                Streamed::new(probe, 0..=4),
+                Streamed::new(obj, 3..=5),
+            ]);
         }
         if sliced {
-            streamed.extend([Streamed::new(wave_bytes(dims), 3); 2]);
+            streamed.extend([Streamed::new(wave, 6..=7); 2]);
         }
         let cut = rule.cut(stream, dims, &streamed)?;
         let nf_max = cut.table.nf_max();
@@ -695,55 +709,96 @@ impl Shared {
 /// one call to the next.
 struct CarriedBufs {
     cut: Cut,
-    /// M1's plans, one per stack length of `cut`; none for the fused passes.
-    plans: Vec<Plan2d>,
-    /// Exit waves of each stack's views; planes past `nf * nmode` stay zero.
-    psi: Vec<DeviceBuffer<C32>>,
-    /// RAAR's iterate, laid out as `psi`.
-    iterate: Option<Vec<DeviceBuffer<C32>>>,
+    sets: Sets,
+}
+
+/// One stack's carried waves for the fused passes, in either format.
+type AnyWaves = Box<dyn Waves + Send + Sync>;
+
+/// Each stack's exit waves, planes past `nf * nmode` zero, and RAAR's iterate laid out alike.
+enum Sets {
+    /// M1's: f32, which its cuFFT plans, one per stack length of the cut, transform in place.
+    M1 {
+        plans: Vec<Plan2d>,
+        psi: Vec<DeviceBuffer<C32>>,
+        iterate: Option<Vec<DeviceBuffer<C32>>>,
+    },
+    /// The fused passes': f32, or [`HalfWaves`] under [`GpuOptions::psi_f16`].
+    Fused {
+        psi: Vec<AnyWaves>,
+        iterate: Option<Vec<AnyWaves>>,
+    },
 }
 
 impl CarriedBufs {
-    /// DM's, or with `raar` RAAR's, against `shared`.
+    /// DM's, or with `raar` RAAR's, against `shared`; for the fused passes [`HalfWaves`] at
+    /// `half` if some.
     fn new(
         stream: &Arc<CudaStream>,
         dims: &ViewDims,
         rule: StackRule,
         shared: &Shared,
         raar: bool,
+        half: Option<f32>,
     ) -> Result<Self, EngineError> {
-        // The exit waves: read by the forward pass, written by the inverse one (M1: also
-        // `dm_reflect`, `add_c32`); the iterate: the forward row pass (M1: `raar_iterate`).
-        let wave = wave_bytes(dims);
+        // The exit waves: read by the forward pass, written by the inverse one, the passes of
+        // the work planes (M1: also `dm_reflect`, `add_c32`); the iterate: the forward row
+        // pass alone (M1: `raar_iterate`). `HalfWaves` hold a `u32` per value.
+        let wave = match half {
+            Some(_) => plane_bytes::<u32>(dims, dims.nmode),
+            None => wave_bytes(dims),
+        };
+        let work = shared.streamed[0];
         let mut streamed = shared.streamed.clone();
-        streamed.push(Streamed::new(wave, 2));
+        streamed.push(Streamed {
+            bytes: wave,
+            ..work
+        });
         if raar {
-            streamed.push(Streamed::new(wave, 1));
+            streamed.push(Streamed::new(wave, work.first..=work.first));
         }
         let cut = rule.cut(stream, dims, &streamed)?;
-        let plans = match shared.passes {
-            Passes::M1 { .. } => cut.plans(stream, dims)?,
-            Passes::Fused(_) => Vec::new(),
-        };
         let len = cut.wave_len(dims);
-        let set = || -> Result<Vec<DeviceBuffer<C32>>, EngineError> {
-            Ok((0..cut.len())
-                .map(|_| DeviceBuffer::zeroed(stream, len))
-                .collect::<Result<_, _>>()?)
+        let full = || DeviceBuffer::<C32>::zeroed(stream, len);
+        let sets = match shared.passes {
+            Passes::M1 { .. } => {
+                let set = || {
+                    (0..cut.len())
+                        .map(|_| full())
+                        .collect::<Result<Vec<_>, _>>()
+                };
+                Sets::M1 {
+                    plans: cut.plans(stream, dims)?,
+                    psi: set()?,
+                    iterate: raar.then(set).transpose()?,
+                }
+            }
+            Passes::Fused(_) => {
+                let one = || -> Result<AnyWaves, GpuError> {
+                    Ok(match half {
+                        None => Box::new(full()?),
+                        Some(scale) => Box::new(HalfWaves::zeroed(stream, len, scale)?),
+                    })
+                };
+                let set = || (0..cut.len()).map(|_| one()).collect::<Result<Vec<_>, _>>();
+                Sets::Fused {
+                    psi: set()?,
+                    iterate: raar.then(set).transpose()?,
+                }
+            }
         };
-        Ok(Self {
-            psi: set()?,
-            iterate: raar.then(set).transpose()?,
-            plans,
-            cut,
-        })
+        Ok(Self { cut, sets })
     }
 
     /// Whether these are the buffers `epoch`'s cycle binds.
     fn serves(&self, epoch: Epoch) -> bool {
+        let raar = match &self.sets {
+            Sets::M1 { iterate, .. } => iterate.is_some(),
+            Sets::Fused { iterate, .. } => iterate.is_some(),
+        };
         match epoch {
-            Epoch::Dm { .. } => self.iterate.is_none(),
-            Epoch::Raar { .. } => self.iterate.is_some(),
+            Epoch::Dm { .. } => !raar,
+            Epoch::Raar { .. } => raar,
             _ => false,
         }
     }
@@ -751,9 +806,7 @@ impl CarriedBufs {
     fn lend(&mut self) -> CarriedMut<'_> {
         CarriedMut {
             cut: &self.cut,
-            plans: Plans(&mut self.plans),
-            psi: &mut self.psi,
-            iterate: self.iterate.as_deref_mut(),
+            sets: &mut self.sets,
         }
     }
 }
@@ -761,24 +814,48 @@ impl CarriedBufs {
 /// [`CarriedBufs`] lent to a cycle.
 pub(super) struct CarriedMut<'a> {
     pub cut: &'a Cut,
-    pub plans: Plans<'a>,
-    pub psi: &'a mut [DeviceBuffer<C32>],
-    iterate: Option<&'a mut [DeviceBuffer<C32>]>,
+    sets: &'a mut Sets,
 }
 
-impl<'a> CarriedMut<'a> {
-    /// The plans, and stack `s`'s carried exit waves and RAAR iterate, for a RAAR cycle.
-    pub fn raar(
+impl CarriedMut<'_> {
+    /// Stack `s`'s carried exit waves.
+    pub fn psi(&self, s: usize) -> &dyn Waves {
+        match &*self.sets {
+            Sets::M1 { psi, .. } => &psi[s],
+            Sets::Fused { psi, .. } => &*psi[s],
+        }
+    }
+
+    /// The fused passes' exit waves of stack `s`, and RAAR's iterate if the sets are RAAR's.
+    pub fn fused(&mut self, s: usize) -> (&mut dyn Waves, Option<&mut dyn Waves>) {
+        let Sets::Fused { psi, iterate } = &mut *self.sets else {
+            unreachable!("CarriedBufs::new builds the fused passes' sets for theirs");
+        };
+        (
+            &mut *psi[s],
+            iterate.as_mut().map(|i| &mut *i[s] as &mut dyn Waves),
+        )
+    }
+
+    /// M1's plan for stack `s`, its exit waves, and RAAR's iterate if the sets are RAAR's.
+    pub fn m1(
         &mut self,
         s: usize,
     ) -> (
-        &mut Plans<'a>,
+        &mut Plan2d,
         &mut DeviceBuffer<C32>,
-        &mut DeviceBuffer<C32>,
+        Option<&mut DeviceBuffer<C32>>,
     ) {
-        let iterate =
-            (self.iterate.as_deref_mut()).expect("Device::new_run built the RAAR iterate");
-        (&mut self.plans, &mut self.psi[s], &mut iterate[s])
+        let Sets::M1 {
+            plans,
+            psi,
+            iterate,
+        } = &mut *self.sets
+        else {
+            unreachable!("CarriedBufs::new builds M1's sets for M1's passes");
+        };
+        let plan = &mut plans[self.cut.frames[s].plan];
+        (plan, &mut psi[s], iterate.as_mut().map(|i| &mut i[s]))
     }
 }
 
@@ -900,13 +977,24 @@ impl MlState {
         lens: [usize; 2],
         moved: bool,
     ) -> Result<Self, EngineError> {
-        // The fields po, a, b: `gamma_fields`, the transform, `gamma_frames`; under the
-        // position the moved probes of P and dP: `shifted_probe`, `shift_w`,
-        // `obj_wave_to_psi`.
-        let mut streamed = vec![Streamed::new(3 * wave_bytes(dims), 3)];
-        if moved {
-            streamed.push(Streamed::new(2 * plane_bytes::<C32>(dims, dims.nprobe), 3));
-        }
+        // The fields po, a, b: `gamma_fields` (0), the transforms, `gamma_frames` (4). Under
+        // the position the moved probes of P and dP (`shifted_probe` 0 and 2, `shift_w` 1 and
+        // 3) give po, a (4, 5) and b (6, and 8 after `add_c32` 7) by `obj_wave_to_psi`, then
+        // the transforms (9 to 11) and `gamma_frames` (12).
+        let wave = wave_bytes(dims);
+        let streamed = match moved {
+            false => vec![Streamed::new(wave, 0..=4); 3],
+            true => {
+                let probe = plane_bytes::<C32>(dims, dims.nprobe);
+                vec![
+                    Streamed::new(probe, 0..=5),
+                    Streamed::new(probe, 2..=8),
+                    Streamed::new(wave, 4..=12),
+                    Streamed::new(wave, 5..=12),
+                    Streamed::new(wave, 6..=12),
+                ]
+            }
+        };
         let cut = rule.cut(stream, dims, &streamed)?;
         let zeroed = |len| DeviceBuffer::<C32>::zeroed(stream, len);
         let pair = || DeviceBuffer::<f32>::zeroed(stream, 2);
@@ -1027,19 +1115,36 @@ impl BhState {
         scratch: Option<u32>,
     ) -> Result<Self, EngineError> {
         let dims = views.dims();
-        // psi, r, lu, lv, each written by one pass and transformed or read by later ones;
-        // under the position also y (`obj_conj`, the transform, `pos_grad`), the moved probes
-        // (`shifted_probe`, `shift_w`, `obj_wave_to_psi`) and the shift planes of the
-        // shared scratch, which `shifted_psi_sums` writes and reads.
+        // The batch's two loops in turn. Without the position: psi (`obj_probe_to_psi` 0, the
+        // transform, the residual 2), r (the adjoint, the sums 4), lu and lv (`far` 5, the
+        // transforms, `hess_frames` 8). With it: the moved probes (`shifted_probe` 0,
+        // `shift_w`, `obj_wave_to_psi` 2), psi (the transform, the residual 4), r (the
+        // adjoint, `shifted_psi_sums` from 6, `obj_conj` 11), y (the transform, `pos_grad`
+        // 13); then lu and lv (`pos_spec` 14, the inverses, `pos_near`, the transforms,
+        // `pos_far` 22), r (`pos_near` 17, `obj_conj` 20) and y (the transform, `pos_far`).
         let wave = wave_bytes(dims);
-        let mut streamed = vec![Streamed::new(4 * wave, 3)];
-        if scratch.is_some() {
-            streamed.extend([
-                Streamed::new(wave, 3),
-                Streamed::new(plane_bytes::<C32>(dims, dims.nprobe), 3),
-                Streamed::new(FusedBufs::shift_bytes(dims), 2),
-            ]);
-        }
+        let streamed = match scratch {
+            None => vec![
+                Streamed::new(wave, 0..=2),
+                Streamed::new(wave, 2..=4),
+                Streamed::new(wave, 5..=8),
+                Streamed::new(wave, 5..=8),
+            ],
+            Some(_) => {
+                let mut s = vec![
+                    Streamed::new(plane_bytes::<C32>(dims, dims.nprobe), 0..=2),
+                    Streamed::new(wave, 2..=4),
+                    Streamed::new(wave, 4..=11),
+                    Streamed::new(wave, 11..=13),
+                    Streamed::new(wave, 14..=22),
+                    Streamed::new(wave, 14..=22),
+                    Streamed::new(wave, 17..=20),
+                    Streamed::new(wave, 20..=22),
+                ];
+                s.extend(Streamed::shifted_psi_sums(dims, 6));
+                s
+            }
+        };
         let frames = rule.frames(&streamed)?;
         let frames = scratch.map_or(frames, |s| frames.min(s));
         let (cut, batches) = batch_stacks(stream, dims, size, frames)?;
@@ -1249,7 +1354,8 @@ impl Device {
     /// Loads the kernels and uploads the views, counts and starting arrays on a new stream of
     /// `ctx`; every pass cuts `0 .. nframe` by the [`StackRule`] of `ctx`'s L2, the LLK ring
     /// holds `options.llk_slots` records of every frame, its unmasked pixels counted here, and
-    /// `options.fused` picks the [`Passes`], of which only the fused run a propagator's stage.
+    /// `options.fused` picks the [`Passes`], of which only the fused run a propagator's stage
+    /// or hold the carried waves in f16 ([`GpuOptions::psi_f16`]).
     pub fn new(
         ctx: &Arc<CudaContext>,
         dims: ViewDims,
@@ -1283,9 +1389,27 @@ impl Device {
                 ExitStage::Transfer(DeviceBuffer::from_host(&stream, &to_c32(tf))?)
             }
         };
+        let half = match (options.psi_f16, options.fused) {
+            (false, _) => None,
+            (true, false) => {
+                return Err(EngineError::Invalid(
+                    "psi_f16 needs GpuOptions { fused: true, .. }".into(),
+                ));
+            }
+            (true, true) => {
+                let unmasked = |f: &[u16]| -> u64 {
+                    f.iter()
+                        .filter(|&&c| c != MASKED)
+                        .map(|&c| u64::from(c))
+                        .sum()
+                };
+                let frames = counts.chunks_exact(plane_len(&dims));
+                Some(half_scale(frames.map(unmasked).max().unwrap_or(0)))
+            }
+        };
         let views = Views::new(&stream, dims, addrs)?;
         let tile = TileDots::new(&stream, &dims)?;
-        let rule = StackRule::new(options.stack_size, ctx.l2_cache_size_bytes()?);
+        let rule = StackRule::on(options.stack_size, ctx, &dims)?;
         let shared = Shared::new(&stream, &dims, rule, options.fused, false, slices.is_some())?;
         let slices = slices
             .map(|s| {
@@ -1333,6 +1457,7 @@ impl Device {
             rule,
             shared,
             carried: None,
+            half,
             use_graph: options.graph,
             runs: Vec::new(),
             llk_graph: None,
@@ -1806,7 +1931,8 @@ impl Device {
     fn build_carried(&mut self, raar: bool) -> Result<(), EngineError> {
         if self.carried.is_none() {
             let dims = self.dims();
-            let c = CarriedBufs::new(&self.stream, &dims, self.rule, &self.shared, raar)?;
+            let (rule, half) = (self.rule, self.half);
+            let c = CarriedBufs::new(&self.stream, &dims, rule, &self.shared, raar, half)?;
             self.carried = Some(Box::new(c));
         }
         Ok(())

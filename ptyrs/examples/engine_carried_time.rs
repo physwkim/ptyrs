@@ -3,11 +3,12 @@
 //! behind DESIGN's stack-rule and RAAR numbers.
 //!
 //! `cargo run --release -p ptyrs --example engine_carried_time -- <dir> <algos> <ncycle> <sizes>
-//! <repeats> [fused|m1] [pos]`: for each comma-separated algorithm (`ap`, `dm`, `raar`, `ml`,
+//! <repeats> [fused|f16|m1] [pos]`: for each comma-separated algorithm (`ap`, `dm`, `raar`, `ml`,
 //! `bh`, `lsqml`; BH and Poisson LSQML in batches of 96 frames) and size (`default` for
 //! `GpuOptions::stack_size: None`), 5 untimed cycles (epochs), then `repeats` timed calls of
 //! `ncycle`; prints the median ms per cycle and a hash of the final object, probe, offsets and
-//! one LLK pass's record. `pos` models positions from zero offsets (fused only).
+//! one LLK pass's record. `f16` is `fused` with [`GpuOptions::psi_f16`]; `pos` models
+//! positions from zero offsets (fused passes only).
 
 use std::error::Error;
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -86,15 +87,16 @@ fn cycles(g: &mut GpuPtycho, algo: &str, n: usize) -> Result<(), EngineError> {
 fn main() -> Result<(), Box<dyn Error>> {
     let a: Vec<String> = std::env::args().skip(1).collect();
     let usage =
-        "usage: engine_carried_time <dir> <algos> <ncycle> <sizes> <repeats> [fused|m1] [pos]";
+        "usage: engine_carried_time <dir> <algos> <ncycle> <sizes> <repeats> [fused|f16|m1] [pos]";
     if a.len() < 5 {
         return Err(usage.into());
     }
     let dir = Path::new(&a[0]);
     let (ncycle, repeats): (usize, usize) = (a[2].parse()?, a[4].parse()?);
-    let fused = match a.get(5).map(String::as_str) {
-        None | Some("fused") => true,
-        Some("m1") => false,
+    let (mode, fused, psi_f16) = match a.get(5).map(String::as_str) {
+        None | Some("fused") => ("fused", true, false),
+        Some("f16") => ("f16", true, true),
+        Some("m1") => ("m1", false, false),
         _ => return Err(usage.into()),
     };
     let pos = match a.get(6).map(String::as_str) {
@@ -113,6 +115,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 stack_size,
                 graph: true,
                 fused,
+                psi_f16,
                 ..GpuOptions::default()
             };
             let mut g = GpuPtycho::new(&ctx, &scan, object.clone(), probe.clone(), options)?;
@@ -152,8 +155,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             let runs: Vec<String> = ms.iter().map(|m| format!("{m:.3}")).collect();
             ms.sort_by(f64::total_cmp);
             println!(
-                "{algo} size {size} {}{}: {nframe} frames, median {:.3} ms/cycle (runs {}) over {ncycle} cycles, hash {:016x}, llk {:.6e}",
-                if fused { "fused" } else { "m1" },
+                "{algo} size {size} {mode}{}: {nframe} frames, median {:.3} ms/cycle (runs {}) over {ncycle} cycles, hash {:016x}, llk {:.6e}",
                 if pos { " pos" } else { "" },
                 ms[ms.len() / 2],
                 runs.join(" "),
