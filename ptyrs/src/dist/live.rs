@@ -361,7 +361,7 @@ mod tests {
     use crate::live::graph::{LiveGraph, WarmUp};
     use crate::live::pos::{Pos, PosTable};
     use crate::live::recon::ViewPlacement;
-    use crate::live::ring::{DeviceStore, Ring, UploaderConfig, run_region_uploader};
+    use crate::live::ring::{DeviceStore, Landing, Ring, UploaderConfig, run_region_uploader};
     use crate::live::scan::{LiveScan, ScanBacker};
     use crate::live::stats::wall_ns;
     use cuda_core::DeviceBuffer;
@@ -1049,15 +1049,15 @@ mod tests {
             let up = {
                 let (ring, stores, table, stop) =
                     (ring.clone(), stores.clone(), table.clone(), stop.clone());
-                let (route, cfg) = (plan.route(place), uploader_cfg());
+                let (landing, cfg) = (Landing::new(stores, plan.route(place)), uploader_cfg());
                 std::thread::spawn(move || {
-                    run_region_uploader(ring, stores, route, table, cfg, stop, Some(tx))
+                    run_region_uploader(ring, landing, table, cfg, stop, Some(tx))
                 })
             };
             for &u in &landed {
                 let (x, y) = xy[u];
                 let t_rx = wall_ns();
-                table.insert(u as i32, Pos { x, y, t_rx });
+                table.insert(u as i32, Pos::new(x, y, t_rx));
             }
             for u in 0..xy.len() {
                 let mut s = ring.reserve();
@@ -1148,20 +1148,12 @@ mod tests {
         let up = {
             let (ring, stores, table, stop) =
                 (ring.clone(), stores.clone(), table.clone(), stop.clone());
-            std::thread::spawn(move || {
-                run_region_uploader(ring, stores, Everywhere(4), table, cfg, stop, None)
-            })
+            let landing = Landing::new(stores, Everywhere(4));
+            std::thread::spawn(move || run_region_uploader(ring, landing, table, cfg, stop, None))
         };
         for u in 0..total as i32 {
             let t_rx = wall_ns();
-            table.insert(
-                u,
-                Pos {
-                    x: 0.0,
-                    y: 0.0,
-                    t_rx,
-                },
-            );
+            table.insert(u, Pos::new(0.0, 0.0, t_rx));
             let mut s = ring.reserve();
             s.frame().fill(u as u16 + 1);
             s.commit(u, t_rx, 0);

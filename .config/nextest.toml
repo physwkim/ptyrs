@@ -14,6 +14,7 @@ not (package(ptyrs) & (
   | test(=dist::live_ap::tests::fills_on_2_gpus_give_the_one_gpu_object)
   | test(=dist::live_ap::tests::fills_on_4_gpus_give_the_one_gpu_object)
   | test(=dist::live_ap::tests::gpus_iterate_a_live_scan_as_one_gpu)
+  | test(=dist::live_ap::tests::stores_that_grow_mid_scan_give_the_one_gpu_object)
   | test(=dist::p2p::tests::bench_times_every_ordered_pair_and_checks_the_data)
   | test(=dist::synth::synthetic_accumulation_is_bit_identical_on_1_2_and_4_gpus)
   | test(=dist::tomo::tests::a_failing_angle_releases_the_waiting_workers)
@@ -26,6 +27,7 @@ not (package(ptyrs) & (
   | test(=dist::worker::tests::fence_orders_side_stream_work)
   | test(=dist::worker::tests::init_failure_is_reported)
   | test(=dist::worker::tests::run_returns_after_every_worker_is_done_with_its_borrows)
+  | test(=live::follow::tests::a_filling_run_on_two_gpus_is_one_gpus_replay)
   | test(=live::follow::tests::gpus_follow_a_stream_as_one_gpu_replays_its_landings)
 ))
 '''

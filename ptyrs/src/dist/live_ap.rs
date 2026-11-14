@@ -29,7 +29,7 @@ use crate::live::graph::LiveGraph;
 use crate::live::grow::GrowError;
 use crate::live::object::{Snapshot, timed_sleeping_event};
 use crate::live::recon::{ApConfig, LLK_SLOTS, ViewPlacement, capture_sweep};
-use crate::live::ring::DeviceStore;
+use crate::live::ring::{DeviceStore, STORE_LEAD};
 use crate::live::scan::{LiveScan, Refusal, ScanBacker, one_object_mode};
 use crate::live::stats::wall_ns;
 
@@ -159,7 +159,13 @@ impl State {
                     gpu.ctx().ordinal()
                 )));
             }
-            None => Arc::new(DeviceStore::new(gpu.ctx(), d.nframe as usize, n)?),
+            None => Arc::new(DeviceStore::growing(
+                gpu.ctx(),
+                d.nframe as usize,
+                n,
+                region.frames.len(),
+                STORE_LEAD,
+            )?),
         };
         // SAFETY: the fused pass reads the counts of landed frames only, each in the store
         // before its views are pushed ([`DistLiveAp::push`]).
@@ -421,7 +427,8 @@ impl DistLiveAp {
     /// An empty scan of `cfg.shape` split by `scheme` over `ordinals` (1, 2 or 4 GPUs, region
     /// `r` on `ordinals[r]`) from its first frames' views `planned`, with the fixed `probe`
     /// (`[nprobe, ny, nx]`); backs the plan and captures every graph, which record each
-    /// epoch's LLK with `llk` ([`Self::llk`]).
+    /// epoch's LLK with `llk` ([`Self::llk`]). Each GPU's store backs its planned frames and
+    /// [`STORE_LEAD`] more before the first frame lands, the rest as the frames come.
     pub fn new(
         ordinals: &[usize],
         cfg: &ApConfig,
@@ -772,7 +779,9 @@ mod tests {
     use crate::live::grow::GrowError;
     use crate::live::pos::{Pos, PosTable};
     use crate::live::recon::{LiveAp, ViewPlacement};
-    use crate::live::ring::{FrameBatch, Ring, UploadReport, UploaderConfig, run_region_uploader};
+    use crate::live::ring::{
+        FrameBatch, Landing, Ring, UploadReport, UploaderConfig, run_region_uploader,
+    };
     use crate::live::scan::ScanShape;
     use crate::live::sent::sent;
 
@@ -910,9 +919,9 @@ mod tests {
             };
             let uploader = {
                 let (ring, table, stop) = (ring.clone(), table.clone(), stop.clone());
-                let (stores, route) = (ap.stores(), ap.route(c.place));
+                let landing = Landing::new(ap.stores(), ap.route(c.place));
                 std::thread::spawn(move || {
-                    run_region_uploader(ring, stores, route, table, up, stop, Some(tx))
+                    run_region_uploader(ring, landing, table, up, stop, Some(tx))
                 })
             };
             Self {
@@ -929,7 +938,7 @@ mod tests {
             let n = self.ring.slot_elems();
             for k in frames.clone() {
                 let (x, y) = c.pos[k];
-                self.table.insert(k as i32, Pos { x, y, t_rx: 0 });
+                self.table.insert(k as i32, Pos::new(x, y, 0));
                 let mut s = self.ring.reserve();
                 s.frame().copy_from_slice(&c.counts[k * n..(k + 1) * n]);
                 s.commit(k as i32, 0, 0);
@@ -1140,6 +1149,77 @@ mod tests {
         }
         feed.finish();
         assert_eq!((ap.lost(), ap.closed()), (0, None));
+    }
+
+    /// The raster of [`gpus_iterate_a_live_scan_as_one_gpu`] on stores that back their
+    /// planned frames and one more before the first frame lands, then a chunk at a time as
+    /// the uploader reaches the edge: on 1, 2 and 4 GPUs the stores grow while the scan
+    /// lands, and the object is one GPU's on counts uploaded whole after every batch, bit for
+    /// bit.
+    #[test]
+    fn stores_that_grow_mid_scan_give_the_one_gpu_object() {
+        let ctx = Context::new(0).expect("GPU 0");
+        let c = case(&sim(ScanPath::Raster { cols: 12 }, 240));
+        let batches = batches(&c);
+        let (nmode, n) = (c.cfg.shape.nmode as usize, 64 * 64);
+        let views = |b: &Range<usize>| &c.views[b.start * nmode..b.end * nmode];
+        let st = ctx.new_stream().unwrap();
+        let dev = DeviceBuffer::from_host(&st, &c.counts).unwrap();
+        let mut one = LiveAp::new(&st, &c.cfg, &c.probe, dev, false).unwrap();
+        let (mut snap, mut backer) = (one.new_snapshot().unwrap(), one.backer());
+        let mut want = Vec::new();
+        for b in &batches {
+            let v = views(b);
+            backer.back(v).unwrap();
+            assert_eq!(one.push(v).unwrap() as usize, b.len());
+            one.epoch().unwrap();
+            one.snapshot(&mut snap).unwrap();
+            want.push(bits(snap.wait().unwrap()));
+        }
+
+        let (nframe, planned) = (c.cfg.shape.nframe as usize, &c.views[..c.planned * nmode]);
+        for ngpu in [1, 2, 4] {
+            let plan =
+                LivePlan::new(&c.cfg.shape, planned, Scheme::Strips, ngpu, c.cfg.cap).unwrap();
+            let stores: Vec<Arc<DeviceStore>> = gpus(ngpu)
+                .into_iter()
+                .zip(plan.regions())
+                .map(|(o, r)| {
+                    let ctx = Context::new(o).unwrap();
+                    Arc::new(DeviceStore::growing(&ctx, nframe, n, r.frames.len(), 1).unwrap())
+                })
+                .collect();
+            let first: Vec<u64> = stores.iter().map(|s| s.edge()).collect();
+            let mut ap =
+                DistLiveAp::on_stores(&stores, &c.cfg, planned, Scheme::Strips, &c.probe, false)
+                    .unwrap();
+            let mut feed = Feed::new(&ctx, &c, &ap);
+            for (k, (b, want)) in batches.iter().zip(&want).enumerate() {
+                feed = feed.land(&c, b);
+                assert_eq!(ap.push(views(b)).unwrap() as usize, b.len());
+                ap.epoch().unwrap();
+                let got = bits(&ap.object().unwrap());
+                let diff = got.iter().zip(want).filter(|(g, w)| g != w).count();
+                assert_eq!(
+                    diff, 0,
+                    "{ngpu} GPUs: pixels unlike one GPU's after batch {k}"
+                );
+            }
+            let up = feed.finish();
+            let placed: Vec<u64> = up.regions.iter().map(|r| r.frames).collect();
+            let edges: Vec<u64> = stores.iter().map(|s| s.edge()).collect();
+            for (r, ((&p, &f), &e)) in placed.iter().zip(&first).zip(&edges).enumerate() {
+                assert!(
+                    p > f,
+                    "{ngpu} GPUs: region {r} took {p} frames, inside its first {f}"
+                );
+                assert!(
+                    e >= p,
+                    "{ngpu} GPUs: region {r} backs {e} places for {p} frames"
+                );
+            }
+            assert_eq!((ap.lost(), ap.closed()), (0, None));
+        }
     }
 
     #[test]

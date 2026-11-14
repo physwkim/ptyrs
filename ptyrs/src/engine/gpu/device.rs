@@ -34,7 +34,6 @@ use super::{
     to_c32, to_u32, wave_bytes,
 };
 use crate::engine::features::{POSITION_LIMIT, POSITION_STEP};
-use crate::engine::ptycho::Algorithm;
 use crate::engine::{
     ApParams, BhParams, BhStep, DmParams, EngineError, Features, LsqmlParams, LsqmlStep, MlParams,
     PlaneStage, RaarParams, RpieParams,
@@ -901,7 +900,7 @@ impl MlState {
         moved: bool,
     ) -> Result<Self, EngineError> {
         // The fields po, a, b: `gamma_fields`, the transform, `gamma_frames`; under the
-        // position the moved probes of P and dP: `shifted_rows_fwd`, `shift_w`,
+        // position the moved probes of P and dP: `shifted_probe`, `shift_w`,
         // `obj_wave_to_psi`.
         let mut streamed = vec![Streamed::new(3 * wave_bytes(dims), 3)];
         if moved {
@@ -1029,7 +1028,7 @@ impl BhState {
         let dims = views.dims();
         // psi, r, lu, lv, each written by one pass and transformed or read by later ones;
         // under the position also y (`obj_conj`, the transform, `pos_grad`), the moved probes
-        // (`shifted_rows_fwd`, `shift_w`, `obj_wave_to_psi`) and the shift planes of the
+        // (`shifted_probe`, `shift_w`, `obj_wave_to_psi`) and the shift planes of the
         // shared scratch, which `shifted_psi_sums` writes and reads.
         let wave = wave_bytes(dims);
         let mut streamed = vec![Streamed::new(4 * wave, 3)];
@@ -1753,26 +1752,8 @@ impl Device {
         Ok(self.ring.flush(&self.context())?)
     }
 
-    /// Fails under a propagator with a plane stage for the passes that run none: the LLK
-    /// pass, LSQML's, BH's, rPIE's and ML's do, AP's, DM's and RAAR's at fixed positions
-    /// only, and every other is enqueued behind this.
-    fn stageless(&self, algorithm: Algorithm) -> Result<(), EngineError> {
-        let moved = self.features.position.is_some();
-        match (&self.exit, algorithm) {
-            (ExitStage::None, _)
-            | (_, Algorithm::Lsqml | Algorithm::Bh | Algorithm::Rpie | Algorithm::Ml) => Ok(()),
-            (_, Algorithm::Ap | Algorithm::Dm | Algorithm::Raar) if !moved => Ok(()),
-            _ => Err(EngineError::Invalid(format!(
-                "{algorithm:?}{} runs no propagator with a plane stage: angular spectrum, or a \
-                 Fresnel transform back in distance",
-                if moved { " with a position" } else { "" }
-            ))),
-        }
-    }
-
     /// The buffers of `epoch`'s cycle, and with graphs its graph, captured from them.
     fn new_run(&mut self, epoch: Epoch) -> Result<EpochRun, EngineError> {
-        self.stageless(epoch.algorithm())?;
         if !matches!(epoch, Epoch::Lsqml { .. }) {
             self.one_slice(&format!("{:?}", epoch.algorithm()))?;
         }

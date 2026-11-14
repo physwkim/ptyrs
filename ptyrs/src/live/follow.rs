@@ -8,6 +8,10 @@
 //! tiles and view records, before handing it on: a scan inside its plan
 //! makes no growth call, which would hold the driver lock against the
 //! epochs' own calls, and growing past it never stalls them on the call.
+//! With a [`FillHook`] the mapper also predicts each batch's patches from
+//! the counts the uploader tapped and stitches them into a [`Fill`], which
+//! is queued onto the object right behind the batch's landing, ahead of
+//! its first epoch.
 //!
 //! Once every frame of the scan has landed, or the uploader stopped with
 //! some missing, it goes on iterating and keeps a host copy of the object
@@ -37,13 +41,14 @@ use crate::dist::{DistError, DistLiveAp, DistSnapshot, Scheme};
 use crate::live::args::Args;
 use crate::live::converge::{Clock, ClockError};
 use crate::live::farfield::Ptycho;
+use crate::live::fill::{Fill, PatchFill, PatchPredictor, patch_corner};
 use crate::live::grow::GrowError;
 use crate::live::object::{Snapshot, timed_sleeping_event};
 use crate::live::pv_out::PvCfg;
 use crate::live::recon::{ApConfig, LiveAp, ViewPlacement};
-use crate::live::ring::{DeviceStore, FrameBatch, Route, STORE_LEAD, Whole};
-use crate::live::scan::{ScanBacker, ScanShape};
-use crate::live::stats::wall_ns;
+use crate::live::ring::{Counts, DeviceStore, FrameBatch, Landing, STORE_LEAD, Tap, Whole};
+use crate::live::scan::{ScanBacker, ScanShape, one_object_mode};
+use crate::live::stats::{Histogram, wall_ns};
 
 /// The reconstruction run on the received frames: `pty-recv --recon ap`
 /// and its `--recon-*` flags, or a `[recon]` table with the same keys.
@@ -256,6 +261,8 @@ pub struct FollowReport {
     pub epoch_done: Vec<i64>,
     /// How long stamping the clock of `epoch_done` took: its error bound.
     pub epoch_clock_ns: i64,
+    /// What became of each batch's fill; `None` unless the run filled.
+    pub fill: Option<FillReport>,
 }
 
 impl FollowReport {
@@ -278,6 +285,187 @@ impl FollowReport {
     }
 }
 
+/// What a filling run predicts each batch's first object values with
+/// ([`crate::live::fill`]). Its uploader takes the [`Tap`] the run's
+/// [`Landing`] carries.
+pub struct FillHook {
+    pub predictor: Box<dyn PatchPredictor>,
+    /// Frames per batch at most: at least the uploader's
+    /// [`UploaderConfig::batch`](crate::live::ring::UploaderConfig::batch).
+    pub batch: usize,
+    /// Batches' counts lent at once ([`Tap::buffers`]).
+    pub counts: usize,
+    /// Fills in flight at once ([`PatchFill::new`]'s `pool`).
+    pub fills: usize,
+}
+
+impl FillHook {
+    fn tap(&self) -> Tap {
+        Tap {
+            buffers: self.counts,
+            batch: self.batch,
+        }
+    }
+}
+
+/// What became of the batches' fills: each batch the run received counts
+/// once, in `written`, `no_counts`, `failed`, `no_buffer` or `dropped`.
+pub struct FillReport {
+    /// Fills queued onto the object.
+    pub written: u64,
+    /// Batches the uploader sent without counts, every tap buffer lent.
+    pub no_counts: u64,
+    /// Batches the predictor failed on; `error` is the first failure.
+    pub failed: u64,
+    pub error: Option<String>,
+    /// Batches whose fill found every buffer in flight.
+    pub no_buffer: u64,
+    /// Fills of batches the scan did not take whole, never queued.
+    pub dropped: u64,
+    /// Pixels of the queued fills whose tiles were not ready.
+    pub not_ready: usize,
+    /// Time predicting one batch took, ns.
+    pub predict: Histogram,
+    /// Time stitching one batch's patches took, ns.
+    pub stitch: Histogram,
+}
+
+impl FillReport {
+    fn new() -> Self {
+        Self {
+            written: 0,
+            no_counts: 0,
+            failed: 0,
+            error: None,
+            no_buffer: 0,
+            dropped: 0,
+            not_ready: 0,
+            predict: Histogram::new(1_000_000),
+            stitch: Histogram::new(1_000_000),
+        }
+    }
+
+    /// Counts a batch's fill, `whole` if the scan took the batch whole;
+    /// returns the fill to queue.
+    fn count(&mut self, p: Predicted, whole: bool) -> Option<Fill> {
+        let fill = match p {
+            Predicted::NoCounts => {
+                self.no_counts += 1;
+                return None;
+            }
+            Predicted::Failed(e) => {
+                self.failed += 1;
+                self.error.get_or_insert(e);
+                return None;
+            }
+            Predicted::Stitched {
+                fill,
+                predict_ns,
+                stitch_ns,
+            } => {
+                self.predict.record(predict_ns);
+                self.stitch.record(stitch_ns);
+                fill
+            }
+        };
+        match fill {
+            None => self.no_buffer += 1,
+            Some(f) if whole => {
+                self.written += 1;
+                return Some(f);
+            }
+            Some(_) => self.dropped += 1,
+        }
+        None
+    }
+}
+
+/// What the mapper made of a batch's fill.
+enum Predicted {
+    /// The uploader sent the batch without counts.
+    NoCounts,
+    Failed(String),
+    /// `fill` is `None` when every fill buffer was in flight.
+    Stitched {
+        fill: Option<Fill>,
+        predict_ns: i64,
+        stitch_ns: i64,
+    },
+}
+
+/// A filling run's predictor and stitcher, driven by the mapper.
+struct Predicting {
+    predictor: Box<dyn PatchPredictor>,
+    stitch: PatchFill,
+    frame: [usize; 2],
+    nmode: usize,
+    corners: Vec<[u32; 2]>,
+    patches: Vec<[f32; 2]>,
+}
+
+impl Predicting {
+    /// For a run under `ap` on an object of `shape` pixels, its fills
+    /// pinned in `ctx`.
+    fn new(
+        hook: FillHook,
+        ctx: &Arc<Context>,
+        ap: &ApConfig,
+        shape: [usize; 2],
+    ) -> Result<Self, GrowError> {
+        one_object_mode(&ap.shape.dims())?;
+        let frame = ap.shape.frame.map(|n| n as usize);
+        let patch = hook.predictor.patch();
+        if (0..2).any(|a| patch[a] == 0 || patch[a] > frame[a]) {
+            return Err(crate::gpu::Error::Shape(format!(
+                "a {patch:?} patch of a {frame:?} frame"
+            ))
+            .into());
+        }
+        Ok(Self {
+            stitch: PatchFill::new(ctx, shape, patch, hook.batch, hook.fills)?,
+            predictor: hook.predictor,
+            frame,
+            nmode: ap.shape.nmode as usize,
+            corners: Vec::with_capacity(hook.batch),
+            patches: Vec::with_capacity(hook.batch * patch[0] * patch[1]),
+        })
+    }
+
+    /// The fill of the batch whose frames have `views`, from their
+    /// `counts`.
+    fn predict(&mut self, counts: Option<Counts>, views: &[ViewAddr]) -> Predicted {
+        let Some(counts) = counts else {
+            return Predicted::NoCounts;
+        };
+        let patch = self.stitch.patch();
+        self.corners.clear();
+        self.corners.extend(
+            views
+                .chunks(self.nmode)
+                .map(|v| patch_corner([v[0].oy, v[0].ox], self.frame, patch)),
+        );
+        self.patches
+            .resize(self.corners.len() * patch[0] * patch[1], [0.0; 2]);
+        let t = wall_ns();
+        let predicted = self
+            .predictor
+            .predict(counts.as_slice(), self.frame, &mut self.patches);
+        let predict_ns = wall_ns() - t;
+        // Lent back to the uploader's tap.
+        drop(counts);
+        if let Err(e) = predicted {
+            return Predicted::Failed(e);
+        }
+        let t = wall_ns();
+        let fill = self.stitch.stitch(&self.corners, &self.patches);
+        Predicted::Stitched {
+            fill,
+            predict_ns,
+            stitch_ns: wall_ns() - t,
+        }
+    }
+}
+
 /// The views of the frames at `positions`.
 fn views_of(cfg: &ApConfig, place: &ViewPlacement, positions: &[(f64, f64)]) -> Vec<ViewAddr> {
     let (nprobe, nobj) = (cfg.shape.nprobe, cfg.shape.nobj);
@@ -288,27 +476,41 @@ fn views_of(cfg: &ApConfig, place: &ViewPlacement, positions: &[(f64, f64)]) -> 
     out
 }
 
-/// Backs each batch's frames through `backer`, if the run has one, then
-/// hands the batch on with its views, until `batches` closes or `ahead`'s
-/// receiver goes.
+/// What the mapper does to each batch before its landing.
+struct Ahead {
+    /// Backs the batch's frames, if the run does not itself.
+    backer: Option<ScanBacker>,
+    /// Predicts the batch's fill, if the run fills.
+    predicting: Option<Predicting>,
+}
+
+/// A batch handed on with its views and, if the run fills, its fill.
+type Handed = (FrameBatch, Vec<ViewAddr>, Option<Predicted>);
+
+/// Does `ahead`'s work on each batch, then hands it on, until `batches`
+/// closes or `fwd`'s receiver goes.
 fn back_ahead(
-    mut backer: Option<ScanBacker>,
+    mut ahead: Ahead,
     ap: ApConfig,
     place: ViewPlacement,
     batches: Receiver<FrameBatch>,
-    ahead: Sender<(FrameBatch, Vec<ViewAddr>)>,
+    fwd: Sender<Handed>,
 ) -> Result<(), GrowError> {
     // Dropped once the scan's last frame is backed: frames past it never
     // land, and the consumer may finish before `batches` closes.
-    for b in batches {
+    for mut b in batches {
         let views = views_of(&ap, &place, &b.positions);
-        if let Some(k) = &mut backer {
+        if let Some(k) = &mut ahead.backer {
             k.back(&views)?;
             if b.f0 + b.n >= u64::from(ap.shape.nframe) {
-                backer = None;
+                ahead.backer = None;
             }
         }
-        if ahead.send((b, views)).is_err() {
+        let predicted = ahead
+            .predicting
+            .as_mut()
+            .map(|p| p.predict(b.counts.take(), &views));
+        if fwd.send((b, views, predicted)).is_err() {
             break;
         }
     }
@@ -345,8 +547,12 @@ pub trait Solve {
 }
 
 trait Engine: Solve {
-    /// Lands the frames whose views are `views`.
-    fn push(&mut self, views: &[ViewAddr]) -> Result<(), Self::Error>;
+    /// Lands the frames whose views are `views`; returns how many the scan
+    /// took.
+    fn push(&mut self, views: &[ViewAddr]) -> Result<u32, Self::Error>;
+    /// Queues `fill` onto the object behind the epochs queued so far;
+    /// returns its pixels whose tiles were not ready.
+    fn fill(&mut self, fill: Fill) -> Result<usize, Self::Error>;
     /// Wall ns the GPUs finished `epoch`, one of the last two queued; waits
     /// for it.
     fn end_of(&mut self, epoch: u64) -> Result<i64, Self::Error>;
@@ -436,8 +642,12 @@ impl Solve for One {
 }
 
 impl Engine for One {
-    fn push(&mut self, views: &[ViewAddr]) -> Result<(), GrowError> {
-        self.live.push(views).map(drop)
+    fn push(&mut self, views: &[ViewAddr]) -> Result<u32, GrowError> {
+        self.live.push(views)
+    }
+
+    fn fill(&mut self, fill: Fill) -> Result<usize, GrowError> {
+        self.live.fill(fill)
     }
 
     fn end_of(&mut self, epoch: u64) -> Result<i64, GrowError> {
@@ -498,8 +708,12 @@ impl Solve for DistLiveAp {
 }
 
 impl Engine for DistLiveAp {
-    fn push(&mut self, views: &[ViewAddr]) -> Result<(), DistError> {
-        DistLiveAp::push(self, views).map(drop)
+    fn push(&mut self, views: &[ViewAddr]) -> Result<u32, DistError> {
+        DistLiveAp::push(self, views)
+    }
+
+    fn fill(&mut self, fill: Fill) -> Result<usize, DistError> {
+        DistLiveAp::fill(self, fill)
     }
 
     fn end_of(&mut self, epoch: u64) -> Result<i64, DistError> {
@@ -540,18 +754,20 @@ pub fn run_ap_consumer(
     captured: Sender<()>,
     preview: Option<Preview>,
 ) -> Result<FollowReport, GrowError> {
-    follow_one(ctx, store, cfg, batches, preview, || {
+    follow_one(ctx, store, cfg, batches, preview, None, || {
         let _ = captured.send(());
     })
 }
 
-/// [`run_ap_consumer`], calling `ready` once the graphs are captured.
+/// [`run_ap_consumer`], filling with `fill` if given, calling `ready` once
+/// the graphs are captured.
 fn follow_one(
     ctx: Arc<Context>,
     store: Arc<DeviceStore>,
     cfg: FollowCfg,
     batches: Receiver<FrameBatch>,
     preview: Option<Preview>,
+    fill: Option<FillHook>,
     ready: impl FnOnce(),
 ) -> Result<FollowReport, GrowError> {
     ctx.bind_to_thread()?;
@@ -572,6 +788,10 @@ fn follow_one(
     // store completed before the uploader sent their batch.
     let counts = unsafe { store.frames_view()? };
     let live = LiveAp::new(&stream, &cfg.ap, &cfg.probe, counts, preview.is_some())?;
+    let predicting = match fill {
+        Some(h) => Some(Predicting::new(h, &ctx, &cfg.ap, Solve::shape(&live))?),
+        None => None,
+    };
     // The plan is backed before `captured` lets the first frame in; from
     // here on only the mapper grows device memory, past the plan.
     let mut backer = live.backer();
@@ -594,16 +814,15 @@ fn follow_one(
         t_anchor,
         clock_ns: t_anchor - t0,
     };
-    follow(run, Some(backer), plan_time, &cfg, batches, preview, |_| {
-        ready()
-    })
+    let ahead = Ahead {
+        backer: Some(backer),
+        predicting,
+    };
+    follow(run, ahead, plan_time, &cfg, batches, preview, |_| ready())
 }
 
-/// Each region's store and the route the uploader lands the frames by
-/// ([`run_region_uploader`](crate::live::ring::run_region_uploader)).
-pub type Landing = (Vec<Arc<DeviceStore>>, Box<dyn Route>);
-
-/// Live AP on the GPUs `ordinals`, on stores of its own, sent on `ready`
+/// Live AP on the GPUs `ordinals`, on stores of its own, filling with
+/// `fill` if given; the [`Landing`] the uploader takes is sent on `ready`
 /// once its graphs are captured and dropped unsent if that fails. One GPU
 /// runs as [`run_ap_consumer`] does. More split the object by `scheme`,
 /// region `r` on `ordinals[r]`, and [`FollowReport::plan_time`] is the
@@ -615,7 +834,9 @@ pub fn run_dist_consumer(
     batches: Receiver<FrameBatch>,
     ready: Sender<Landing>,
     preview: Option<Preview>,
+    fill: Option<FillHook>,
 ) -> Result<FollowReport, DistError> {
+    let tap = fill.as_ref().map(FillHook::tap);
     if let [one] = *ordinals {
         let ctx = Context::new(one)?;
         let shape = cfg.ap.shape;
@@ -627,8 +848,11 @@ pub fn run_dist_consumer(
             cfg.plan.len(),
             STORE_LEAD,
         )?);
-        let landing: Landing = (vec![store.clone()], Box::new(Whole));
-        return Ok(follow_one(ctx, store, cfg, batches, preview, || {
+        let landing = Landing {
+            tap,
+            ..Landing::new(vec![store.clone()], Whole)
+        };
+        return Ok(follow_one(ctx, store, cfg, batches, preview, fill, || {
             let _ = ready.send(landing);
         })?);
     }
@@ -636,19 +860,35 @@ pub fn run_dist_consumer(
     let planned = views_of(&cfg.ap, &cfg.place, &cfg.plan);
     let llk = preview.is_some();
     let run = DistLiveAp::new(ordinals, &cfg.ap, &planned, scheme, &cfg.probe, llk)?;
+    // Pinned memory is the same to every context under unified addressing.
+    let predicting = match fill {
+        Some(h) => {
+            let ctx = Context::new(ordinals[0])?;
+            Some(Predicting::new(h, &ctx, &cfg.ap, run.shape())?)
+        }
+        None => None,
+    };
     let plan_time = t.elapsed();
     let place = cfg.place;
-    follow(run, None, plan_time, &cfg, batches, preview, |run| {
-        let _ = ready.send((run.stores(), Box::new(run.route(place))));
+    let ahead = Ahead {
+        backer: None,
+        predicting,
+    };
+    follow(run, ahead, plan_time, &cfg, batches, preview, |run| {
+        let _ = ready.send(Landing {
+            tap,
+            ..Landing::new(run.stores(), run.route(place))
+        });
     })
 }
 
 /// Lands the batches into `live` and iterates it, as [`run_ap_consumer`]
-/// says; `backer` backs each batch ahead of its landing if the run does not
-/// itself, and `ready` is called once the run can take frames.
+/// says, `prep` done to each batch ahead of its landing and its fill, if
+/// any, queued right behind it; `ready` is called once the run can take
+/// frames.
 fn follow<R: Engine>(
     mut live: R,
-    backer: Option<ScanBacker>,
+    prep: Ahead,
     plan_time: Duration,
     cfg: &FollowCfg,
     batches: Receiver<FrameBatch>,
@@ -657,13 +897,14 @@ fn follow<R: Engine>(
 ) -> Result<FollowReport, R::Error> {
     let shape = cfg.ap.shape;
     let plan_mapped_bytes = live.mapped_bytes()?;
+    let mut fills = prep.predicting.is_some().then(FillReport::new);
     let (fwd, ahead) = crossbeam_channel::unbounded();
     let mut mapper = {
         let (ap, place) = (cfg.ap, cfg.place);
         Some(
             std::thread::Builder::new()
                 .name("backer".into())
-                .spawn(move || back_ahead(backer, ap, place, batches, fwd))
+                .spawn(move || back_ahead(prep, ap, place, batches, fwd))
                 .expect("spawn the backer"),
         )
     };
@@ -710,13 +951,18 @@ fn follow<R: Engine>(
                     }
                 }
             }
-            for (b, views) in got.drain(..) {
+            for (b, views, predicted) in got.drain(..) {
                 assert_eq!(
                     b.f0,
                     positions.len() as u64,
                     "batches arrive in order and without gaps"
                 );
-                live.push(&views)?;
+                let took = live.push(&views)?;
+                if let (Some(r), Some(p)) = (&mut fills, predicted)
+                    && let Some(f) = r.count(p, u64::from(took) == b.n)
+                {
+                    r.not_ready += live.fill(f)?;
+                }
                 positions.extend(b.positions);
                 landings.push((live.epochs(), positions.len() as u64));
             }
@@ -810,6 +1056,7 @@ fn follow<R: Engine>(
         landings,
         epoch_done,
         epoch_clock_ns: live.clock_ns(),
+        fill: fills,
     })
 }
 
@@ -1002,6 +1249,7 @@ mod tests {
 
     use super::*;
     use crate::live::farfield::{Ptycho, PtychoSpec, ScanPath};
+    use crate::live::fill::standin::{Wrong, batch_fill};
     use crate::live::graph::WarmUp;
     use crate::live::pos::{Pos, PosTable};
     use crate::live::ring::{Ring, UploaderConfig, run_region_uploader, run_uploader};
@@ -1090,7 +1338,7 @@ mod tests {
                 let mut s = ring.reserve();
                 s.frame().copy_from_slice(&p.frame(k));
                 let (x, y) = pos[k];
-                table.insert(k as i32, Pos { x, y, t_rx: 0 });
+                table.insert(k as i32, Pos::new(x, y, 0));
                 s.commit(k as i32, 0, 0);
                 k += 1;
             }
@@ -1337,12 +1585,13 @@ mod tests {
                     llk: llk_tx,
                 });
                 std::thread::spawn(move || {
-                    run_dist_consumer(&ordinals, Scheme::Strips, cfg, rx, ready_tx, preview)
+                    run_dist_consumer(&ordinals, Scheme::Strips, cfg, rx, ready_tx, preview, None)
                 })
             };
-            let ((stores, route), consumer) = sent(&ready_rx, consumer);
-            assert_eq!(stores.len(), ngpu);
-            let filled = stores.clone();
+            let (landing, consumer) = sent(&ready_rx, consumer);
+            assert_eq!(landing.stores.len(), ngpu);
+            assert!(landing.tap.is_none());
+            let filled = landing.stores.clone();
             let warm = WarmUp::end();
             let table = Arc::new(PosTable::new(1 << 16));
             let uploader = {
@@ -1355,7 +1604,7 @@ mod tests {
                     pos_wait_ns: 1_000_000_000,
                 };
                 std::thread::spawn(move || {
-                    run_region_uploader(ring, stores, route, table, up, stop, Some(tx))
+                    run_region_uploader(ring, landing, table, up, stop, Some(tx))
                 })
             };
             let mut k = 0;
@@ -1365,7 +1614,7 @@ mod tests {
                     s.frame()
                         .copy_from_slice(&counts[k * n * n..(k + 1) * n * n]);
                     let (x, y) = pos[k];
-                    table.insert(k as i32, Pos { x, y, t_rx: 0 });
+                    table.insert(k as i32, Pos::new(x, y, 0));
                     s.commit(k as i32, 0, 0);
                     k += 1;
                 }
@@ -1454,6 +1703,185 @@ mod tests {
         }
     }
 
+    /// A 12-column raster streamed through the uploader into the consumer
+    /// filling with a stand-in predictor on `ngpu` GPUs, frame `cut`, if
+    /// given, off the object: the uploader taps every batch's counts for
+    /// the predictor, each batch landed whole has its fill queued behind
+    /// it and the rest have theirs dropped, and the last kept object is one
+    /// GPU's replay of the landings with the replayed predictor's fills
+    /// queued behind the batches landed whole, bit for bit.
+    fn fills_follow_whole_batches(ngpu: usize, cut: Option<usize>) {
+        const PATCH: [usize; 2] = [32, 32];
+        let p = Ptycho::new(PtychoSpec {
+            n: 64,
+            path: ScanPath::Raster { cols: 12 },
+            points: 240,
+            step: 8.0,
+            photons: 1e6,
+            seed: 5,
+            wavelength: 1.5498e-10,
+            distance: 5.0,
+            det_pixel: 75e-6,
+        });
+        let (n, total) = (64usize, p.points());
+        let mut pos: Vec<(f64, f64)> = (0..total).map(|k| p.position(k)).collect();
+        let counts: Vec<u16> = (0..total).flat_map(|k| p.frame(k)).collect();
+        let rc = ReconCfg {
+            nf_max: NonZeroU32::new(8).unwrap(),
+            snap_every: NonZeroU32::new(5).unwrap(),
+            snaps: 3,
+            ..ReconCfg::default()
+        };
+        let cfg = FollowCfg::plan(&p, NonZeroU32::new(total as u32).unwrap(), &rc);
+        if let Some(c) = cut {
+            // Before the object's origin: its views' corner is u32::MAX.
+            pos[c] = (-1e-3, -1e-3);
+        }
+        let ctx = Context::new(0).expect("GPU 0");
+        let ring = Arc::new(Ring::new(&ctx, 16, n * n).unwrap());
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let (ready_tx, ready_rx) = crossbeam_channel::bounded(1);
+        let consumer = {
+            let cfg = cfg.clone();
+            let ordinals: Vec<usize> = (0..ngpu).collect();
+            // A batch holds a frame at least: no batch finds a pool dry.
+            let hook = FillHook {
+                predictor: Box::new(Wrong {
+                    patch: PATCH,
+                    issued: 0,
+                }),
+                batch: 4,
+                counts: total,
+                fills: total,
+            };
+            std::thread::spawn(move || {
+                run_dist_consumer(
+                    &ordinals,
+                    Scheme::Strips,
+                    cfg,
+                    rx,
+                    ready_tx,
+                    None,
+                    Some(hook),
+                )
+            })
+        };
+        let (landing, consumer) = sent(&ready_rx, consumer);
+        assert_eq!(landing.tap.map(|t| (t.buffers, t.batch)), Some((total, 4)));
+        let table = Arc::new(PosTable::new(1 << 16));
+        let uploader = {
+            let (ring, stop, table) = (ring.clone(), stop.clone(), table.clone());
+            let up = UploaderConfig {
+                batch: NonZeroUsize::new(4).unwrap(),
+                flush_ns: 100_000,
+                idle: Duration::from_micros(20),
+                events: 4,
+                pos_wait_ns: 1_000_000_000,
+            };
+            std::thread::spawn(move || {
+                run_region_uploader(ring, landing, table, up, stop, Some(tx))
+            })
+        };
+        let mut k = 0;
+        for burst in [50, 1, 90, 0, 99] {
+            for _ in 0..burst {
+                let mut s = ring.reserve();
+                s.frame()
+                    .copy_from_slice(&counts[k * n * n..(k + 1) * n * n]);
+                let (x, y) = pos[k];
+                table.insert(k as i32, Pos::new(x, y, 0));
+                s.commit(k as i32, 0, 0);
+                k += 1;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(k, total);
+        stop.store(true, Ordering::Release);
+        let up = uploader.join().unwrap().unwrap();
+        assert_eq!(
+            (up.frames, up.pos_missing, up.counts_dry),
+            (total as u64, 0, 0)
+        );
+        assert_eq!(up.counts_copy.count(), up.batches);
+        let rep = consumer.join().unwrap().unwrap();
+        let landed = cut.unwrap_or(total) as u64;
+        assert_eq!((rep.stored, rep.landed), (total as u64, landed));
+        let batches = rep.landings.len() as u64;
+        assert_eq!(batches, up.batches);
+        let whole = rep.landings.iter().filter(|l| l.1 <= landed).count() as u64;
+        assert_eq!(whole < batches, cut.is_some());
+        let fill = rep.fill.as_ref().unwrap();
+        assert_eq!(
+            (fill.written, fill.dropped, fill.not_ready),
+            (whole, batches - whole, 0)
+        );
+        assert_eq!((fill.no_counts, fill.no_buffer, fill.failed), (0, 0, 0));
+        assert_eq!(fill.error, None);
+        assert_eq!(
+            (fill.predict.count(), fill.stitch.count()),
+            (batches, batches)
+        );
+
+        ctx.bind_to_thread().unwrap();
+        let st = ctx.new_stream().unwrap();
+        let dev = cuda_core::DeviceBuffer::from_host(&st, &counts).unwrap();
+        let mut run = LiveAp::new(&st, &cfg.ap, &cfg.probe, dev, false).unwrap();
+        let mut backer = run.backer();
+        let mut pf = PatchFill::new(&ctx, rep.shape, PATCH, 4, batches as usize).unwrap();
+        let mut wrong = Wrong {
+            patch: PATCH,
+            issued: 0,
+        };
+        let nmode = cfg.ap.shape.nmode as usize;
+        let mut at = 0;
+        for &(epochs, upto) in &rep.landings {
+            while run.epochs() < epochs {
+                run.epoch().unwrap();
+            }
+            let (a, b) = (at as usize, upto as usize);
+            let v = views_of(&cfg.ap, &cfg.place, &pos[a..b]);
+            backer.back(&v).unwrap();
+            let took = run.push(&v).unwrap();
+            let f = batch_fill(
+                &mut pf,
+                &mut wrong,
+                &counts[a * n * n..b * n * n],
+                &v,
+                nmode,
+                [n, n],
+            );
+            if u64::from(took) == upto - at {
+                assert_eq!(run.fill(f).unwrap(), 0);
+            }
+            at = upto;
+        }
+        let last = rep.kept.last().unwrap();
+        while run.epochs() < last.epochs {
+            run.epoch().unwrap();
+        }
+        let mut snap = run.new_snapshot().unwrap();
+        run.snapshot(&mut snap).unwrap();
+        assert_eq!(rep.shape, snap.shape());
+        let got = snap.wait().unwrap();
+        let diff = got[..last.pixels.len()]
+            .iter()
+            .zip(&last.pixels)
+            .filter(|(a, b)| a.map(f32::to_bits) != b.map(f32::to_bits))
+            .count();
+        assert_eq!(diff, 0, "{ngpu} GPUs: pixels unlike the replay's");
+    }
+
+    #[test]
+    fn a_filling_run_queues_whole_batches_fills_and_drops_a_cut_ones() {
+        fills_follow_whole_batches(1, Some(150));
+    }
+
+    #[test]
+    fn a_filling_run_on_two_gpus_is_one_gpus_replay() {
+        fills_follow_whole_batches(2, None);
+    }
+
     /// A scan of 2 * STORE_LEAD + 64 frames with 64 planned, streamed into
     /// the one-GPU consumer: the store backs 2 * STORE_LEAD places before
     /// the first frame (plan and lead, in whole chunks of STORE_LEAD frames)
@@ -1506,11 +1934,11 @@ mod tests {
                 llk: llk_tx,
             });
             std::thread::spawn(move || {
-                run_dist_consumer(&[0], Scheme::Strips, cfg, rx, ready_tx, preview)
+                run_dist_consumer(&[0], Scheme::Strips, cfg, rx, ready_tx, preview, None)
             })
         };
-        let ((stores, route), consumer) = sent(&ready_rx, consumer);
-        let store = stores[0].clone();
+        let (landing, consumer) = sent(&ready_rx, consumer);
+        let store = landing.stores[0].clone();
         assert_eq!(store.edge(), edge);
         store.hold(true);
         let table = Arc::new(PosTable::new(1 << 16));
@@ -1524,7 +1952,7 @@ mod tests {
                 pos_wait_ns: 1_000_000_000,
             };
             std::thread::spawn(move || {
-                run_region_uploader(ring, stores, route, table, up, stop, Some(tx))
+                run_region_uploader(ring, landing, table, up, stop, Some(tx))
             })
         };
         let producer = {
@@ -1535,7 +1963,7 @@ mod tests {
                     let mut s = ring.reserve();
                     s.frame()
                         .copy_from_slice(&counts[k * n * n..(k + 1) * n * n]);
-                    table.insert(k as i32, Pos { x, y, t_rx: 0 });
+                    table.insert(k as i32, Pos::new(x, y, 0));
                     s.commit(k as i32, 0, 0);
                 }
             })
