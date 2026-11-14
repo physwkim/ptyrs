@@ -12,8 +12,8 @@ use ptyrs::engine::{ApParams, GpuOptions, GpuPtycho};
 
 use ptyrs::base::{AddrTable, C64, Counts, Object, Probe, Stack, required_obj_shape};
 use ptyrs::engine::{
-    Cost, Lsqml, LsqmlParams, LsqmlStep, Observed, Optics, ProbeVariation, SliceWaves, Wavefield,
-    llk, shift,
+    Cost, Features, Lsqml, LsqmlParams, LsqmlStep, Observed, Optics, ProbeVariation, SliceWaves,
+    Wavefield, llk, shift,
 };
 use ptyrs::gpu::FUSED_SIDES;
 
@@ -252,6 +252,165 @@ fn gpu_llk_is_the_cpus_under_every_propagator() {
                 c.name
             );
             assert!(err < 1e-5, "{} graph {graph}: {got:e} vs {want:e}", c.name);
+        }
+    }
+}
+
+/// `|a − b| / |b|` over the whole array.
+fn rel_l2(a: &Stack<C64>, b: &Stack<C64>) -> f64 {
+    let (mut e, mut t) = (0.0, 0.0);
+    for (x, y) in a.as_slice().iter().zip(b.as_slice()) {
+        e += (x - y).norm_sqr();
+        t += y.norm_sqr();
+    }
+    (e / t).sqrt()
+}
+
+/// The worst `|a − b| / |b|` of the steps' sizes, or `|a|` where `b` is 0; the frames equal.
+fn steps_rel(got: &[LsqmlStep], want: &[LsqmlStep]) -> f64 {
+    assert_eq!(got.len(), want.len());
+    let mut worst = 0.0f64;
+    for (g, w) in got.iter().zip(want) {
+        assert_eq!(g.frames, w.frames);
+        let sizes = [
+            (&g.a_far, &w.a_far),
+            (&g.a_obj[0], &w.a_obj[0]),
+            (&g.a_probe, &w.a_probe),
+        ];
+        for (a, b) in sizes.iter().flat_map(|(a, b)| a.iter().zip(b.iter())) {
+            let scale = if *b == 0.0 { 1.0 } else { b.abs() };
+            worst = worst.max((a - b).abs() / scale);
+        }
+    }
+    worst
+}
+
+/// Offsets drawn about their mean, up to 0.4 pixel per axis.
+fn drawn_offsets() -> Vec<[f64; 2]> {
+    let mut d: Vec<[f64; 2]> = (0..NPOS)
+        .map(|f| {
+            let f = f as f64;
+            [0.4 * (1.7 * f + 0.3).sin(), 0.4 * (2.3 * f).cos()]
+        })
+        .collect();
+    for axis in 0..2 {
+        let mean = d.iter().map(|d| d[axis]).sum::<f64>() / NPOS as f64;
+        d.iter_mut().for_each(|d| d[axis] -= mean);
+    }
+    d
+}
+
+/// GPU LSQML under every one-slice propagator against the CPU's from the same start, as
+/// `engine_gpu_lsqml` holds the far field: the steps of each of the first epochs from a fresh
+/// run without graphs, and with them the LLK after every epoch, the arrays and, modelling
+/// the position, the offsets' changes.
+#[test]
+fn gpu_lsqml_matches_cpu_under_every_propagator() {
+    const NEPOCH: usize = 12;
+    const NSTEPS: usize = 3;
+    for c in cases().iter().filter(|c| c.optics.nslice() == 1) {
+        for (cost, batch_size, position) in [
+            (Cost::Amplitude, 12, false),
+            (Cost::Poisson, 12, false),
+            (Cost::Poisson, NPOS, false),
+            (Cost::Amplitude, 4, true),
+            (Cost::Poisson, 12, true),
+        ] {
+            let params = LsqmlParams {
+                batch_size,
+                cost,
+                seed: 7,
+            };
+            let features = Features {
+                position: position.then(drawn_offsets),
+                ..Features::default()
+            };
+            let (mut objects, mut probe) = (c.objects.clone(), c.probe.clone());
+            let mut var = ProbeVariation::none(probe.plane_shape());
+            let mut cpu = Lsqml::new(params)
+                .unwrap()
+                .with_features(features.clone())
+                .unwrap();
+            let (mut steps, mut trace) = (0.0f64, Vec::new());
+            for epoch in 0..NEPOCH {
+                let want = cpu.epoch(
+                    &c.addr,
+                    &c.obs,
+                    &c.optics,
+                    &mut objects,
+                    &mut probe,
+                    &mut var,
+                );
+                trace.push(c.llk(&objects, &probe));
+                if epoch < NSTEPS {
+                    let options = GpuOptions {
+                        graph: false,
+                        ..OPTIONS
+                    };
+                    let mut gpu = c.gpu(&c.optics, options).unwrap();
+                    gpu.set_features(&features).unwrap();
+                    gpu.lsqml(&params, epoch + 1, 0).unwrap();
+                    steps = steps.max(steps_rel(&gpu.lsqml_steps().unwrap(), &want));
+                }
+            }
+
+            let mut gpu = c.gpu(&c.optics, OPTIONS).unwrap();
+            gpu.set_features(&features).unwrap();
+            gpu.lsqml(&params, NEPOCH, 1).unwrap();
+            // The CPU's LLK here is the unmoved probe's.
+            let llk = if position {
+                0.0
+            } else {
+                let got = gpu.history().iter().map(|r| r.llk.poisson);
+                assert_eq!(got.len(), NEPOCH);
+                got.zip(&trace)
+                    .map(|(g, w)| (g - w).abs() / w)
+                    .fold(0.0, f64::max)
+            };
+            let offsets = match (&features.position, cpu.features().position.as_ref()) {
+                (Some(start), Some(want)) => {
+                    let got = gpu.features().unwrap().position.unwrap();
+                    let delta = |d: &[[f64; 2]]| -> Vec<f64> {
+                        d.iter()
+                            .zip(start)
+                            .flat_map(|(d, s)| [d[0] - s[0], d[1] - s[1]])
+                            .collect()
+                    };
+                    let (a, b) = (delta(&got), delta(want));
+                    let d = a.iter().zip(&b).map(|(a, b)| (a - b).abs());
+                    d.fold(0.0, f64::max) / b.iter().map(|b| b.abs()).fold(0.0, f64::max)
+                }
+                _ => 0.0,
+            };
+            let errs = [
+                llk,
+                rel_l2(&gpu.object().unwrap(), &objects[0]),
+                rel_l2(&gpu.probe().unwrap(), &probe),
+                steps,
+                offsets,
+            ];
+            eprintln!(
+                "{} {cost:?} batch {batch_size} position {position}: llk {:.2e} object {:.2e} \
+                 probe {:.2e} steps {:.2e} offsets {:.2e}, poisson llk {:.4e} -> {:.4e}",
+                c.name,
+                errs[0],
+                errs[1],
+                errs[2],
+                errs[3],
+                errs[4],
+                trace[0],
+                trace[NEPOCH - 1]
+            );
+            for (what, e) in ["llk", "object", "probe", "steps", "offsets"]
+                .into_iter()
+                .zip(errs)
+            {
+                assert!(
+                    e < 1e-4,
+                    "{} {cost:?} batch {batch_size} position {position} {what}: {e:e}",
+                    c.name
+                );
+            }
         }
     }
 }

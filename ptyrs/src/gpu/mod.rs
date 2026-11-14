@@ -61,7 +61,7 @@ pub use ops::{
     ViewDims, Views, view_tiles,
 };
 pub use optics::{ExitPass, ExitStage, OpticsKernels};
-pub use position::{PositionKernels, PositionRule, Positions};
+pub use position::{PositionKernels, PositionRule, Positions, Solve};
 pub use psi::{HalfWaves, Waves, half_scale};
 pub use ring::{Ended, LlkRing, LlkTotals, RecordWriter, RingDevice, RingError};
 pub use rpie::{POWER_CHUNK, PowerMax, RpieKernels, Weight};

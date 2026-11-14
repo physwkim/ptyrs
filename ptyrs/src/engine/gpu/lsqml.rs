@@ -1,7 +1,7 @@
-//! pty-chi LSQML on the GPU ([`crate::engine::Lsqml`]) on the far-field Fourier path, incoherent
+//! pty-chi LSQML on the GPU ([`crate::engine::Lsqml`]) through the device's propagator, incoherent
 //! probe modes and no probe variation, in the call sequence of `crate::gpu::LsqmlKernels`:
-//! the exit waves through the fused row passes around LSQML's column pass, the step sizes
-//! and every frame's `a_far` kept on the device. Under the position model the probe moves by
+//! the exit waves through the fused row passes and the propagator's stage around LSQML's
+//! column pass, the step sizes and every frame's `a_far` kept on the device. Under the position model the probe moves by
 //! each frame's offsets, and each batch steps its frames' offsets after its passes.
 
 use std::ops::Range;
@@ -10,7 +10,7 @@ use std::sync::Arc;
 use crate::gpu::{
     BhScan, C32, EpochOrder, Error as GpuError, FusedBufs, FusedInputs, Kernels, LSQML_REC,
     LsqmlAt, LsqmlChi, LsqmlKernels, LsqmlNoise, LsqmlScan, LsqmlVar, Model, PositionRule, PsiSums,
-    StackTable, Views,
+    Solve, StackRef, StackTable, Views,
 };
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaStream, DeviceBuffer};
@@ -272,15 +272,16 @@ impl<'a> Bufs<'a> {
         params: &LsqmlParams,
         pre: Pre,
     ) -> Result<(), GpuError> {
+        let k = self.exit.scale;
         match pre {
             Pre::Init => {
                 l.kernels.start(ctx, self.counts, l.scan)?;
                 l.kernels
-                    .precondition(ctx, self.views, self.probe, l.scan, true)?;
+                    .precondition(ctx, self.views, self.probe, l.scan, true, k)?;
             }
             Pre::Update => {
                 l.kernels
-                    .precondition(ctx, self.views, self.probe, l.scan, false)?;
+                    .precondition(ctx, self.views, self.probe, l.scan, false, k)?;
             }
             Pre::Keep => {}
         }
@@ -329,6 +330,15 @@ impl<'a> Bufs<'a> {
             probe: self.probe,
             model: Model::default(),
         };
+        // Row transforms at the detector plane into `chi`: the column pass, the propagator's
+        // adjoint stage and the inverse row pass.
+        let (lk, exit) = (l.kernels, self.exit);
+        let chi = |st: &LsqmlScan, stack: StackRef<'_>, work: &mut DeviceBuffer<C32>| {
+            lk.chi(ctx, scan, stack, noise, st, work)?;
+            exit.kernels
+                .exit(ctx, views.dims(), stack, exit.stage, work, true)?;
+            lk.back(ctx, views, stack, work)
+        };
         for (k, s) in batch.clone().enumerate() {
             let (stack, work) = (l.table.at(s), &mut l.work[k]);
             match &mut moved {
@@ -343,8 +353,10 @@ impl<'a> Bufs<'a> {
                     m.kernels.shift_w(ctx, views.dims(), stack, w)?;
                 }
             }
+            exit.kernels
+                .exit(ctx, views.dims(), stack, exit.stage, work, false)?;
             match noise {
-                LsqmlNoise::Gaussian => l.kernels.chi(ctx, scan, stack, noise, l.scan, work)?,
+                LsqmlNoise::Gaussian => chi(l.scan, stack, work)?,
                 LsqmlNoise::Poisson => l.kernels.icalc(ctx, scan, stack, work, &mut l.icalc[k])?,
             }
         }
@@ -357,9 +369,7 @@ impl<'a> Bufs<'a> {
             l.kernels
                 .far(ctx, scan, &icalc, positions.clone(), l.scan)?;
             for (k, s) in batch.clone().enumerate() {
-                let stack = l.table.at(s);
-                l.kernels
-                    .chi(ctx, scan, stack, noise, l.scan, &mut l.work[k])?;
+                chi(l.scan, l.table.at(s), &mut l.work[k])?;
             }
         }
 
@@ -425,15 +435,19 @@ impl<'a> Bufs<'a> {
                     .sums(ctx, views, stack, self.obj, [chi, &m.w[k]], m.pos)?;
             }
         }
-        l.kernels.step(ctx, positions.clone(), l.scan)?;
+        l.kernels
+            .step(ctx, positions.clone(), l.scan, self.exit.scale)?;
         // Before the update, as the batch's spectra borrow the probe; the step reads neither.
         if let Some(m) = moved {
-            let rule = PositionRule {
-                step: POSITION_STEP as f32,
-                limit: POSITION_LIMIT as f32,
+            let solve = Solve {
+                rule: PositionRule {
+                    step: POSITION_STEP as f32,
+                    limit: POSITION_LIMIT as f32,
+                },
+                scale: self.exit.scale,
             };
             m.kernels
-                .step(ctx, positions, l.order, m.offsets, rule, m.pos)?;
+                .step(ctx, positions, l.order, m.offsets, solve, m.pos)?;
         }
         let obj = LsqmlVar {
             x: &mut *self.obj,

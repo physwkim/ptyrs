@@ -498,6 +498,7 @@ impl GpuPtycho {
 
         let uploads = Uploads {
             stage: form.stage,
+            scale: optics.exit().intensity_scale() as f32,
             addrs: &addrs,
             counts: scan.counts.as_slice(),
             obj: &to_c32(object.as_slice()),

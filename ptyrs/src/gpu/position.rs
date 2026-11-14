@@ -31,6 +31,16 @@ use crate::gpu::{
     check_len, dptr,
 };
 
+/// How [`PositionKernels::step`] solves and takes a shift.
+#[derive(Clone, Copy)]
+pub struct Solve {
+    /// The fraction of the solved shift taken and the largest step.
+    pub rule: PositionRule,
+    /// What pty-chi's `1e-6` on the slopes' denominator is times: the intensity scale of the
+    /// waves the slopes are of.
+    pub scale: f32,
+}
+
 /// The position kernels, bound to the module a [`Kernels`] loaded.
 #[derive(Clone, Debug)]
 pub struct PositionKernels {
@@ -313,16 +323,15 @@ impl PositionKernels {
     }
 
     /// pty-chi's position step of the batch's epoch positions `batch` from the [`Self::sums`]
-    /// of all its stacks, into `offsets`, `[nframe, 2]` by frame through `order`; `rule` the
-    /// fraction of the solved shift taken and the largest step. `pos`' own offsets stay as
-    /// gathered: the epoch moves each frame once.
+    /// of all its stacks, into `offsets`, `[nframe, 2]` by frame through `order`; `solve`
+    /// how the shift is solved and taken. `pos`' own offsets stay as gathered: the epoch moves each frame once.
     pub fn step(
         &self,
         ctx: &ExecutionContext,
         batch: Range<u32>,
         order: &EpochOrder,
         offsets: &mut DeviceBuffer<f32>,
-        rule: PositionRule,
+        solve: Solve,
         pos: &mut Positions,
     ) -> Result<(), Error> {
         let span = span(&pos.dims, &batch)?;
@@ -330,8 +339,6 @@ impl PositionKernels {
         let nframe = pos.dims.nframe;
         check_len("offsets", offsets, 2 * nframe as usize)?;
         let ids = order.ids();
-        // The far field's intensity scale.
-        let scale = (pos.dims.frame[0] * pos.dims.frame[1]) as f32;
         let writes = [pos.sums.storage(), offsets.storage()];
         self.base.launch(ctx, &[ids.storage()], &writes, |stream| {
             // SAFETY: `span` lies in the scan's positions, `pos.sums` sized for every
@@ -345,8 +352,8 @@ impl PositionKernels {
                     dptr::<u32, u32>(ids).cast_const(),
                     dptr(offsets),
                     nframe,
-                    rule,
-                    scale,
+                    solve.rule,
+                    solve.scale,
                 )
             }
         })

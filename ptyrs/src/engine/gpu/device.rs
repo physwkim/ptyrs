@@ -44,6 +44,8 @@ use crate::engine::{
 /// and the starting arrays.
 pub(super) struct Uploads<'a> {
     pub stage: PlaneStage<'a>,
+    /// The propagator's intensity scale.
+    pub scale: f32,
     pub addrs: &'a [ViewAddr],
     pub counts: &'a [u16],
     pub obj: &'a [C32],
@@ -60,6 +62,8 @@ pub(super) struct Device {
     optics: OpticsKernels,
     /// The propagator's stage ahead of the transform every pass takes.
     exit: ExitStage,
+    /// The propagator's intensity scale.
+    scale: f32,
     /// BH's dot products, compiled by [`Device::new`] so no capture compiles a Tile kernel.
     tile: TileDots,
     views: Views,
@@ -1134,6 +1138,7 @@ impl Device {
     ) -> Result<Self, EngineError> {
         let Uploads {
             stage,
+            scale,
             addrs,
             counts,
             obj,
@@ -1182,6 +1187,7 @@ impl Device {
             bh,
             optics,
             exit,
+            scale,
             tile,
             views,
             rule,
@@ -1368,6 +1374,7 @@ impl Device {
             exit: ExitPass {
                 kernels: &self.optics,
                 stage: &self.exit,
+                scale: self.scale,
             },
             tile: &self.tile,
             views: &self.views,
@@ -1563,11 +1570,11 @@ impl Device {
         Ok(self.ring.flush(&self.context())?)
     }
 
-    /// Fails under a propagator with a plane stage, which of the passes only the LLK pass
-    /// runs: every other is enqueued behind this.
+    /// Fails under a propagator with a plane stage for the passes that run none; only the
+    /// LLK pass and LSQML's do, and every other is enqueued behind this.
     fn stageless(&self, algorithm: Algorithm) -> Result<(), EngineError> {
-        match self.exit {
-            ExitStage::None => Ok(()),
+        match (&self.exit, algorithm) {
+            (ExitStage::None, _) | (_, Algorithm::Lsqml) => Ok(()),
             _ => Err(EngineError::Invalid(format!(
                 "{algorithm:?} runs no propagator with a plane stage: angular spectrum, or a \
                  Fresnel transform back in distance"

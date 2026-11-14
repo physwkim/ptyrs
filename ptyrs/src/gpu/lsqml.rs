@@ -238,6 +238,7 @@ impl LsqmlKernels {
         probe: &DeviceBuffer<C32>,
         st: &mut LsqmlScan,
         init: bool,
+        scale: f32,
     ) -> Result<(), Error> {
         let d = *views.dims();
         st.check(&d)?;
@@ -268,8 +269,7 @@ impl LsqmlKernels {
                     views.tile_ptrs(),
                     pre,
                     init.into(),
-                    // The far field's intensity scale.
-                    (d.frame[0] * d.frame[1]) as f32,
+                    scale,
                     d.scan_geom(),
                 )
             }
@@ -354,10 +354,10 @@ impl LsqmlKernels {
         self.cols(ctx, l, p, flags, &reads, &[icalc.storage()])
     }
 
-    /// The stack's exit-wave update `chi` from the row transforms [`Self::forward`] left in
-    /// `work`, into `work` in the layout [`Kernels::psi_to_obj`] reads: the column pass
-    /// scales each far-field pixel by `−a_far c / n` at the epoch position's `a_far` of `st`
-    /// (`c` `noise`'s residual), then the inverse fused row pass.
+    /// The row transforms of the stack's exit-wave update `chi` from those [`Self::forward`]
+    /// left in `work`, in place: the column pass scales each far-field pixel by `−a_far c /
+    /// n` at the epoch position's `a_far` of `st` (`c` `noise`'s residual). The propagator's
+    /// adjoint stage, then [`Self::back`], make them `chi`.
     pub fn chi(
         &self,
         ctx: &ExecutionContext,
@@ -387,15 +387,28 @@ impl LsqmlKernels {
             st.a_pos.storage(),
             stack.storage(),
         ];
-        self.cols(ctx, l, p, flags, &reads, &[work.storage()])?;
-        let (sh, g) = (Shape::of(&d)?, d.geom(stack)?);
+        self.cols(ctx, l, p, flags, &reads, &[work.storage()])
+    }
+
+    /// The stack's `work` from row transforms into the layout [`Kernels::psi_to_obj`] reads,
+    /// the inverse fused row pass; `views` in epoch order.
+    pub fn back(
+        &self,
+        ctx: &ExecutionContext,
+        views: &Views,
+        stack: StackRef<'_>,
+        work: &mut DeviceBuffer<C32>,
+    ) -> Result<(), Error> {
+        let d = views.dims();
+        let (sh, g) = (Shape::of(d)?, d.geom(stack)?);
+        check_len("work", work, g.nf_max as usize * d.nmode as usize * d.n())?;
         let config = sh.rows(&g, false)?;
         let p = FusedPtrs {
-            views: dptr::<ViewAddr, ViewAddr>(scan.order.views().addr()).cast_const(),
+            views: dptr::<ViewAddr, ViewAddr>(views.addr()).cast_const(),
             work: dptr(work),
             ..null_ptrs()
         };
-        let reads = [scan.order.views().addr().storage(), stack.storage()];
+        let reads = [views.addr().storage(), stack.storage()];
         let ctl = stack.ctl() as *const StackCtl;
         let cfg = FusedCfg {
             flags: ROWS_INV,
@@ -404,7 +417,7 @@ impl LsqmlKernels {
         };
         let m = &self.base.module;
         self.base.launch(ctx, &reads, &[work.storage()], |stream| {
-            // SAFETY: `ColsLaunch::new` checked `work`; as in `forward`.
+            // SAFETY: `work` checked above; as in `forward`.
             unsafe {
                 match sh.nx {
                     Side::N64 => m.fused_rows_inv_64(stream, config, p, ctl, g, cfg),
@@ -592,16 +605,15 @@ impl LsqmlKernels {
         ctx: &ExecutionContext,
         batch: Range<u32>,
         st: &mut LsqmlScan,
+        scale: f32,
     ) -> Result<(), Error> {
         let span = span(&st.dims, &batch)?;
         // pty-chi's `trim_mean`, the cut saturating at 0 for small batches.
         let trim = (span.nb as f64 * 0.1 / 2.0 - 0.5).ceil() as u32;
-        let [ny, nx] = st.dims.frame;
         let rule = LsqmlRule {
             trim,
             nmode: st.dims.nmode,
-            // The far field's intensity scale.
-            scale: (ny * nx) as f32,
+            scale,
         };
         let writes = [st.dots.storage(), st.rec.storage(), st.step.storage()];
         self.base
