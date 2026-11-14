@@ -11,6 +11,10 @@ use rand_distr::{Distribution, Poisson};
 use crate::base::{C64, CoreError, Counts, MASKED, MAX_COUNT, Object, Positions, Probe, Stack};
 
 /// Rectangular raster of `ny × nx` points with spacing `step` (metres), centred on 0, y-major.
+///
+/// # Panics
+///
+/// If a point is not [`Positions::valid`].
 pub fn raster(ny: usize, nx: usize, step: f64) -> Positions {
     let (mut y, mut x) = (Vec::with_capacity(ny * nx), Vec::with_capacity(ny * nx));
     for iy in 0..ny {
@@ -19,11 +23,15 @@ pub fn raster(ny: usize, nx: usize, step: f64) -> Positions {
             x.push((ix as f64 - (nx as f64 - 1.0) / 2.0) * step);
         }
     }
-    Positions { y, x }
+    Positions::new(y, x).expect("raster step")
 }
 
 /// Fermat spiral of `n` points, `r_k = c·sqrt(k)`, `θ_k = k·golden angle`, with `c` chosen so
 /// the mean nearest-neighbour spacing is about `step` (metres).
+///
+/// # Panics
+///
+/// If a point is not [`Positions::valid`].
 pub fn fermat(n: usize, step: f64) -> Positions {
     let golden = PI * (3.0 - 5f64.sqrt());
     let c = step / PI.sqrt();
@@ -33,7 +41,7 @@ pub fn fermat(n: usize, step: f64) -> Positions {
             (r * t.sin(), r * t.cos())
         })
         .unzip();
-    Positions { y, x }
+    Positions::new(y, x).expect("Fermat step")
 }
 
 fn smoothstep(e0: f64, e1: f64, v: f64) -> f64 {
@@ -181,15 +189,15 @@ mod tests {
         for i in 0..f.len() {
             let d = (0..f.len())
                 .filter(|&j| j != i)
-                .map(|j| (f.x[i] - f.x[j]).hypot(f.y[i] - f.y[j]))
+                .map(|j| (f.x()[i] - f.x()[j]).hypot(f.y()[i] - f.y()[j]))
                 .fold(f64::INFINITY, f64::min);
             nn += d;
         }
         let mean = nn / f.len() as f64;
         assert!((0.7..1.3).contains(&mean), "mean spacing {mean}");
         let r = raster(2, 3, 2.0);
-        assert_eq!(r.y, vec![-1.0, -1.0, -1.0, 1.0, 1.0, 1.0]);
-        assert_eq!(r.x, vec![-2.0, 0.0, 2.0, -2.0, 0.0, 2.0]);
+        assert_eq!(r.y(), vec![-1.0, -1.0, -1.0, 1.0, 1.0, 1.0]);
+        assert_eq!(r.x(), vec![-2.0, 0.0, 2.0, -2.0, 0.0, 2.0]);
     }
 
     #[test]

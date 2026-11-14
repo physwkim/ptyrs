@@ -349,8 +349,8 @@ fn scene(
     let pixel = g.pixel_size_object();
     let step = (frame / FRAME_PER_STEP) as f64;
     let f = ptyrs::base::sim::fermat(NPOS, step * pixel[1]);
-    let round = |v: Vec<f64>| v.into_iter().map(|x| x as f32 as f64).collect();
-    let positions = Positions::new(round(f.y), round(f.x))?.pynx_preprocess(pixel);
+    let round = |v: &[f64]| v.iter().map(|&x| x as f32 as f64).collect();
+    let positions = Positions::new(round(f.y()), round(f.x()))?.pynx_preprocess(pixel);
     let shape = required_obj_shape(&positions, pixel, g.frame, 16);
     let addr = AddrTable::new(&positions, pixel, g.frame, shape, NPROBE, 1)?;
     let dims = ViewDims {

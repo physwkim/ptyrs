@@ -69,7 +69,13 @@ pub fn write_cxi(path: impl AsRef<Path>, scan: &Scan) -> Result<(), IoError> {
     let sample = nx_group(&entry, "sample_1", "NXsample")?;
     let geometry_1 = sample.create_group("geometry_1")?;
     let mut xyz = vec![0f32; 3 * nframe];
-    for (i, (x, y)) in scan.positions.x.iter().zip(&scan.positions.y).enumerate() {
+    for (i, (x, y)) in scan
+        .positions
+        .x()
+        .iter()
+        .zip(scan.positions.y())
+        .enumerate()
+    {
         xyz[i] = *x as f32;
         xyz[nframe + i] = *y as f32;
     }
@@ -310,10 +316,10 @@ mod tests {
         assert_eq!(r.geometry.distance, s.geometry.distance);
         assert_eq!(r.geometry.detector_pixel, s.geometry.detector_pixel);
         assert!((r.geometry.wavelength / s.geometry.wavelength - 1.0).abs() < 1e-15);
-        for (a, b) in r.positions.x.iter().zip(&s.positions.x) {
+        for (a, b) in r.positions.x().iter().zip(s.positions.x()) {
             assert_eq!(*a, *b as f32 as f64);
         }
-        for (a, b) in r.positions.y.iter().zip(&s.positions.y) {
+        for (a, b) in r.positions.y().iter().zip(s.positions.y()) {
             assert_eq!(*a, *b as f32 as f64);
         }
     }
