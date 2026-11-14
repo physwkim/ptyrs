@@ -1,8 +1,7 @@
-//! The object passes on [`window_views`] over each stack's windows, cut from the object at
-//! whole-pixel views in the sampler's layout, against the same passes on the scan's views:
-//! the forward pass, the object sums placed back by the host, the probe sums, and the step
-//! records of the step-size sums. Frames of two probe and two object modes in stacks of 3
-//! and 2, the shorter leaving noise in its last window rows.
+//! The step-size sums on [`window_views`] over each stack's windows, cut from the object at
+//! whole-pixel views in the sampler's layout, against the same sums on the scan's views,
+//! through the step records. Frames of two probe and two object modes in stacks of 3 and 2,
+//! the shorter leaving noise in its last window rows.
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -10,9 +9,9 @@ use std::sync::Arc;
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 use ptyrs::base::C64;
+use ptyrs::gpu::sampling::window_views;
 use ptyrs::gpu::{
-    C32, Kernels, LsqmlAt, LsqmlChi, LsqmlKernels, LsqmlScan, StackTable, UpdateSums, ViewAddr,
-    ViewDims, Views, window_views,
+    C32, Kernels, LsqmlAt, LsqmlChi, LsqmlKernels, LsqmlScan, StackTable, ViewAddr, ViewDims, Views,
 };
 
 #[path = "common/worst.rs"]
@@ -103,13 +102,6 @@ fn up(stream: &CudaStream, v: &[C64]) -> DeviceBuffer<C32> {
     DeviceBuffer::from_host(stream, &host).unwrap()
 }
 
-fn down(stream: &CudaStream, b: &DeviceBuffer<C32>) -> Vec<C64> {
-    let host = b.to_host_vec(stream).unwrap();
-    host.iter()
-        .map(|c| C64::new(c.re as f64, c.im as f64))
-        .collect()
-}
-
 /// Object `[nobj, nyo, nxo]` pixel `(y, x)` of frame `f`'s window on object mode `o`.
 fn at(o: usize, f: usize, y: usize, x: usize) -> usize {
     let [oy, ox] = corner(f);
@@ -136,119 +128,6 @@ fn windows(obj: &[C64], s: usize) -> Vec<C64> {
 fn rel(got: &[C64], want: &[C64]) -> f64 {
     let d = worst_of(got.iter().zip(want).map(|(g, w)| (g - w).norm()));
     d / want.iter().fold(0.0f64, |m, w| m.max(w.norm()))
-}
-
-#[test]
-fn window_views_need_the_stacks_to_partition_the_scan() {
-    let (stream, ..) = setup();
-    for stacks in [
-        &[0..3, 4..5][..],
-        &STACKS[..1],
-        &[0..3, 3..3, 3..5],
-        &[0..3, 3..6],
-    ] {
-        assert!(
-            window_views(&stream, &dims(), stacks).is_err(),
-            "{stacks:?} passed"
-        );
-    }
-    let w = window_views(&stream, &dims(), &STACKS).unwrap();
-    assert_eq!(w.dims().obj, [(NF_MAX * SHAPE[0]) as u32, SHAPE[1] as u32]);
-}
-
-#[test]
-fn forward_on_windows_is_forward_on_the_object() {
-    let (stream, ctx, _, k) = setup();
-    let d = dims();
-    let (views, wviews) = (
-        Views::new(&stream, d, &views()).unwrap(),
-        window_views(&stream, &d, &STACKS).unwrap(),
-    );
-    let table = StackTable::new(&stream, &d, &STACKS).unwrap();
-    let obj = noise(NOBJ * PLANE, 3);
-    let probe = up(&stream, &noise(NPROBE * N, 5));
-    let dev_obj = up(&stream, &obj);
-    for (s, r) in STACKS.iter().enumerate() {
-        let win = up(&stream, &windows(&obj, s));
-        let mut want = DeviceBuffer::<C32>::zeroed(&stream, WAVES).unwrap();
-        let mut got = DeviceBuffer::<C32>::zeroed(&stream, WAVES).unwrap();
-        k.forward(&ctx, &views, table.at(s), &dev_obj, &probe, &mut want)
-            .unwrap();
-        k.forward(&ctx, &wviews, table.at(s), &win, &probe, &mut got)
-            .unwrap();
-        let len = r.len() * NMODE * N;
-        let e = rel(&down(&stream, &got)[..len], &down(&stream, &want)[..len]);
-        assert!(e < 1e-6, "stack {s}: max rel {e:e}");
-    }
-}
-
-#[test]
-fn sums_on_windows_place_as_on_the_object() {
-    let (stream, ctx, kernels, _) = setup();
-    let d = dims();
-    let (views, wviews) = (
-        Views::new(&stream, d, &views()).unwrap(),
-        window_views(&stream, &d, &STACKS).unwrap(),
-    );
-    let table = StackTable::new(&stream, &d, &STACKS).unwrap();
-    let obj = noise(NOBJ * PLANE, 3);
-    let (dev_obj, probe) = (up(&stream, &obj), up(&stream, &noise(NPROBE * N, 5)));
-    let mut obj_sums = UpdateSums::zeroed(&stream, NOBJ * PLANE).unwrap();
-    let mut probe_sums = UpdateSums::zeroed(&stream, NPROBE * N).unwrap();
-    let mut wprobe_sums = UpdateSums::zeroed(&stream, NPROBE * N).unwrap();
-    let (mut num, mut den) = (vec![C64::default(); NOBJ * PLANE], vec![0.0; NOBJ * PLANE]);
-    for (s, r) in STACKS.iter().enumerate() {
-        let psi = up(&stream, &noise(WAVES, 10 + s as u64));
-        let win = up(&stream, &windows(&obj, s));
-        let stack = table.at(s);
-        kernels
-            .psi_to_obj(&ctx, &views, stack, &psi, &probe, &mut obj_sums)
-            .unwrap();
-        kernels
-            .psi_to_probe(&ctx, &views, stack, &psi, &dev_obj, &mut probe_sums)
-            .unwrap();
-        kernels
-            .psi_to_probe(&ctx, &wviews, stack, &psi, &win, &mut wprobe_sums)
-            .unwrap();
-        let mut wsums = UpdateSums::zeroed(&stream, WIN).unwrap();
-        kernels
-            .psi_to_obj(&ctx, &wviews, stack, &psi, &probe, &mut wsums)
-            .unwrap();
-        let (wnum, wden) = (
-            down(&stream, &wsums.num),
-            wsums.den.to_host_vec(&stream).unwrap(),
-        );
-        for o in 0..NOBJ {
-            for fl in 0..r.len() {
-                for i in 0..N {
-                    let (w, f) = ((o * NF_MAX + fl) * N + i, r.start as usize + fl);
-                    let a = at(o, f, i / SHAPE[1], i % SHAPE[1]);
-                    num[a] += wnum[w];
-                    den[a] += wden[w] as f64;
-                }
-            }
-        }
-    }
-    let e = rel(&num, &down(&stream, &obj_sums.num));
-    assert!(e < 1e-5, "object num: max rel {e:e}");
-    let want: Vec<C64> = (obj_sums.den.to_host_vec(&stream).unwrap())
-        .iter()
-        .map(|&v| C64::new(v as f64, 0.0))
-        .collect();
-    let got: Vec<C64> = den.iter().map(|&v| C64::new(v, 0.0)).collect();
-    let e = rel(&got, &want);
-    assert!(e < 1e-5, "object den: max rel {e:e}");
-    let e = rel(
-        &down(&stream, &wprobe_sums.num),
-        &down(&stream, &probe_sums.num),
-    );
-    assert!(e < 1e-5, "probe num: max rel {e:e}");
-    let real = |b: &DeviceBuffer<f32>| -> Vec<C64> {
-        let h = b.to_host_vec(&stream).unwrap();
-        h.iter().map(|&v| C64::new(v as f64, 0.0)).collect()
-    };
-    let e = rel(&real(&wprobe_sums.den), &real(&probe_sums.den));
-    assert!(e < 1e-5, "probe den: max rel {e:e}");
 }
 
 #[test]

@@ -22,6 +22,8 @@
 //! [`LsqmlKernels::forward`], [`Kernels::shifted_psi_sums`] and then
 //! [`Kernels::shifted_probe_sums`] that of the update sums, and [`LsqmlChi::Moved`] gives the
 //! dots the moved probe ([`FrameWaves::Probes`]).
+//!
+//! [`window_views`]: crate::gpu::sampling::window_views
 
 use std::ops::Range;
 
@@ -130,6 +132,8 @@ impl LsqmlScan {
     }
 
     /// [`Self::check`] of views over any object: the scan's, or [`window_views`] of it.
+    ///
+    /// [`window_views`]: crate::gpu::sampling::window_views
     fn check_frames(&self, dims: &ViewDims) -> Result<(), Error> {
         same_dims(
             &self.dims,
@@ -188,60 +192,6 @@ pub enum LsqmlChi<'a> {
         chi: &'a DeviceBuffer<C32>,
         w: FrameWaves<'a>,
     },
-}
-
-/// The views over a stack's windows where each view samples the object at its offset: an
-/// all-modes block of [`ObjectSampler::windows`], plane `o * nf_max + fl` frame `f0 + fl`'s
-/// window on object mode `o`, is these views' object `[nobj, nf_max * ny, nx]`, epoch
-/// position `f0 + fl` at row `fl * ny`. `stacks` are the stack table's, consecutive from
-/// position 0 to `nframe`; every stack's views share the rows, and a stack launch reads its
-/// own.
-///
-/// [`ObjectSampler::windows`]: crate::gpu::sampling::ObjectSampler::windows
-pub fn window_views(
-    stream: &CudaStream,
-    dims: &ViewDims,
-    stacks: &[Range<u32>],
-) -> Result<Views, Error> {
-    dims.check()?;
-    let mut next = 0;
-    for r in stacks {
-        if r.start != next || r.is_empty() {
-            return Err(Error::Shape(format!(
-                "stack {r:?} does not follow position {next}"
-            )));
-        }
-        next = r.end;
-    }
-    if next != dims.nframe {
-        return Err(Error::Shape(format!(
-            "stacks end at {next}, the scan at {}",
-            dims.nframe
-        )));
-    }
-    let nf_max = stacks.iter().map(ExactSizeIterator::len).max().unwrap_or(0);
-    let [ny, nx] = dims.frame;
-    let rows = u32::try_from(nf_max * ny as usize)
-        .map_err(|_| Error::Shape(format!("{nf_max} windows of {ny} rows exceed u32")))?;
-    let addr: Vec<ViewAddr> = stacks
-        .iter()
-        .flat_map(|r| 0..r.end - r.start)
-        .flat_map(|fl| {
-            (0..dims.nmode).map(move |m| ViewAddr {
-                oy: fl * ny,
-                ox: 0,
-                fy: 0.0,
-                fx: 0.0,
-                probe: m % dims.nprobe,
-                obj: m / dims.nprobe,
-            })
-        })
-        .collect();
-    let windows = ViewDims {
-        obj: [rows, nx],
-        ..*dims
-    };
-    Views::new(stream, windows, &addr)
 }
 
 /// Values of the object and of the probe.
@@ -678,6 +628,8 @@ impl LsqmlKernels {
     /// The step-size sums of the stack's frames into `st` from its exit-wave update `chi`;
     /// `views` in epoch order, the scan's or [`window_views`] with `at`'s objects the stack's
     /// windows. Under [`LsqmlChi::Moved`] the object direction's waves take its `w`.
+    ///
+    /// [`window_views`]: crate::gpu::sampling::window_views
     pub fn dots(
         &self,
         ctx: &ExecutionContext,
