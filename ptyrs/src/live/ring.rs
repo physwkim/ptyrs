@@ -220,6 +220,11 @@ impl DeviceStore {
         })
     }
 
+    /// The context that owns the store.
+    pub fn ctx(&self) -> &Arc<Context> {
+        &self.ctx
+    }
+
     pub fn frames_ptr(&self) -> CUdeviceptr {
         self.frames.ptr()
     }
@@ -361,6 +366,9 @@ pub struct UploadReport {
     pub uids: Vec<i32>,
     /// Monitor callback wall time of every landed frame, by landing index.
     pub t_rx: Vec<i64>,
+    /// The regions every landed frame went to, by landing index: bit `r`
+    /// for region `r`, as its [`Route`] gave them.
+    pub routes: Vec<u32>,
     pub regions: Vec<RegionReport>,
 }
 
@@ -387,6 +395,16 @@ impl Route for Whole {
 
     fn regions(&mut self, _: (f64, f64)) -> u32 {
         1
+    }
+}
+
+impl<R: Route + ?Sized> Route for Box<R> {
+    fn nregion(&self) -> usize {
+        (**self).nregion()
+    }
+
+    fn regions(&mut self, pos: (f64, f64)) -> u32 {
+        (**self).regions(pos)
     }
 }
 
@@ -543,6 +561,7 @@ fn upload(
         cpu_ns: 0,
         uids: Vec::new(),
         t_rx: Vec::new(),
+        routes: Vec::new(),
         regions: Vec::new(),
     };
     let cpu0 = thread_cpu_ns();
@@ -733,6 +752,7 @@ fn upload(
                 rep.commit_to_gpu.record(t - t_commit);
                 rep.uids.push(m.uid.load(Ordering::Relaxed));
                 rep.t_rx.push(t_rx);
+                rep.routes.push(routes[at(seq)]);
             }
             rep.frames += f.n;
             ring.released.store(f.release, Ordering::Release);

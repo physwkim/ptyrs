@@ -1077,6 +1077,14 @@ mod tests {
                     .filter(|s| s.frames.contains(&(k as u32)))
                     .count()
             };
+            let routed: Vec<u32> = (0..landed.len() as u32)
+                .map(|k| {
+                    (0..ngpu)
+                        .filter(|&r| shares[r].frames.contains(&k))
+                        .fold(0, |m, r| m | 1 << r)
+                })
+                .collect();
+            assert_eq!(rep.routes, routed, "{ngpu} GPUs");
             assert!((0..landed.len()).any(|k| on(k) == 1), "{ngpu} GPUs");
             assert!((0..landed.len()).any(|k| on(k) > 1), "{ngpu} GPUs");
             for (r, (share, store)) in shares.iter().zip(&stores).enumerate() {

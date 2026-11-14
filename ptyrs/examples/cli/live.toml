@@ -5,6 +5,9 @@
 frames = 30000
 # CUDA device ordinal among CUDA_VISIBLE_DEVICES.
 gpu = 0
+# GPUs a reconstruction splits the object over: one is `gpu`, more are the
+# first `gpus` visible ones in NUMA order.
+gpus = 1
 # PVA server of <prefix>FRAME (source "pva") and <prefix>POS (pva, zmq).
 addr = "127.0.0.1:15075"
 prefix = "PTY:"
@@ -27,7 +30,7 @@ batch = 16
 flush-us = 500
 idle-us = 50
 ring-slots = 1024
-# Device store capacity; `frames` when unset.
+# Device store capacity of the checksum run, `frames` when unset.
 # store-frames = 30000
 graph-batch = 32
 rt-threads = 1

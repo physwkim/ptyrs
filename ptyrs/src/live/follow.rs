@@ -33,7 +33,7 @@ use crossbeam_channel::{Receiver, Sender, TryRecvError};
 use cuda_core::{Context, Event, Stream};
 use serde::Deserialize;
 
-use crate::dist::{DistError, DistLiveAp, DistSnapshot, LiveRoute, Scheme};
+use crate::dist::{DistError, DistLiveAp, DistSnapshot, Scheme};
 use crate::live::args::Args;
 use crate::live::converge::{Clock, ClockError};
 use crate::live::farfield::Ptycho;
@@ -41,7 +41,7 @@ use crate::live::grow::GrowError;
 use crate::live::object::{Snapshot, timed_sleeping_event};
 use crate::live::pv_out::PvCfg;
 use crate::live::recon::{ApConfig, LiveAp, ViewPlacement};
-use crate::live::ring::{DeviceStore, FrameBatch};
+use crate::live::ring::{DeviceStore, FrameBatch, Route, Whole};
 use crate::live::scan::{ScanBacker, ScanShape};
 use crate::live::stats::wall_ns;
 
@@ -503,6 +503,20 @@ pub fn run_ap_consumer(
     captured: Sender<()>,
     preview: Option<Preview>,
 ) -> Result<FollowReport, GrowError> {
+    follow_one(ctx, store, cfg, batches, preview, || {
+        let _ = captured.send(());
+    })
+}
+
+/// [`run_ap_consumer`], calling `ready` once the graphs are captured.
+fn follow_one(
+    ctx: Arc<Context>,
+    store: Arc<DeviceStore>,
+    cfg: FollowCfg,
+    batches: Receiver<FrameBatch>,
+    preview: Option<Preview>,
+    ready: impl FnOnce(),
+) -> Result<FollowReport, GrowError> {
     ctx.bind_to_thread()?;
     let stream = ctx.new_stream()?;
     let shape = cfg.ap.shape;
@@ -544,32 +558,44 @@ pub fn run_ap_consumer(
         clock_ns: t_anchor - t0,
     };
     follow(run, Some(backer), plan_time, &cfg, batches, preview, |_| {
-        let _ = captured.send(());
+        ready()
     })
 }
 
-/// Live AP as [`run_ap_consumer`] runs it, with the object split by
-/// `scheme` over the GPUs `ordinals`, region `r` on `ordinals[r]`. Sends on
-/// `ready`, once its graphs are captured, each region's store and the route
-/// the uploader lands the frames by
-/// ([`run_region_uploader`](crate::live::ring::run_region_uploader)), and
-/// drops it unsent if that fails. The run records no LLK: `preview.llk` is
-/// sent nothing. [`FollowReport::plan_time`] is the whole setup's.
+/// Each region's store and the route the uploader lands the frames by
+/// ([`run_region_uploader`](crate::live::ring::run_region_uploader)).
+pub type Landing = (Vec<Arc<DeviceStore>>, Box<dyn Route>);
+
+/// Live AP on the GPUs `ordinals`, on stores of its own, sent on `ready`
+/// once its graphs are captured and dropped unsent if that fails. One GPU
+/// runs as [`run_ap_consumer`] does. More split the object by `scheme`,
+/// region `r` on `ordinals[r]`, and record no LLK: `preview.llk` is sent
+/// nothing, and [`FollowReport::plan_time`] is the whole setup's.
 pub fn run_dist_consumer(
     ordinals: &[usize],
     scheme: Scheme,
     cfg: FollowCfg,
     batches: Receiver<FrameBatch>,
-    ready: Sender<(Vec<Arc<DeviceStore>>, LiveRoute)>,
+    ready: Sender<Landing>,
     preview: Option<Preview>,
 ) -> Result<FollowReport, DistError> {
+    if let [one] = *ordinals {
+        let ctx = Context::new(one)?;
+        let shape = cfg.ap.shape;
+        let elems = shape.frame[0] as usize * shape.frame[1] as usize;
+        let store = Arc::new(DeviceStore::new(&ctx, shape.nframe as usize, elems)?);
+        let landing: Landing = (vec![store.clone()], Box::new(Whole));
+        return Ok(follow_one(ctx, store, cfg, batches, preview, || {
+            let _ = ready.send(landing);
+        })?);
+    }
     let t = Instant::now();
     let planned = views_of(&cfg.ap, &cfg.place, &cfg.plan);
     let run = DistLiveAp::new(ordinals, &cfg.ap, &planned, scheme, &cfg.probe)?;
     let plan_time = t.elapsed();
     let place = cfg.place;
     follow(run, None, plan_time, &cfg, batches, preview, |run| {
-        let _ = ready.send((run.stores(), run.route(place)));
+        let _ = ready.send((run.stores(), Box::new(run.route(place))));
     })
 }
 
@@ -1263,7 +1289,8 @@ mod tests {
             assert_eq!((up.frames, up.pos_missing), (total as u64, 0));
             let rep = consumer.join().unwrap().unwrap();
             let views = viewer.join().unwrap();
-            assert_eq!(llk_rx.iter().count(), 0, "a run over GPUs records no LLK");
+            // Only the one-GPU run records LLK.
+            assert_eq!(llk_rx.iter().count() == 0, ngpu > 1, "{ngpu} GPUs");
             assert_eq!(warm.recaptures(), 0, "{ngpu} GPUs");
             assert_eq!(rep.positions, pos);
             assert_eq!((rep.stored, rep.landed), (total as u64, total as u64));
