@@ -5,8 +5,8 @@
 use cuda_core::CudaContext;
 use ptyrs::base::{C64, Counts, Geometry, Scan, Stack, required_obj_shape, sim};
 use ptyrs::engine::{
-    ApParams, BhParams, Cost, DmParams, Features, GpuPtycho, LsqmlParams, MlParams, Optics, Ptycho,
-    RaarParams, RpieParams, Sampling,
+    ApParams, BhParams, Cost, DmParams, EngineError, Features, GpuPtycho, LsqmlParams, MlParams,
+    Optics, Ptycho, RaarParams, RpieParams, Sampling,
 };
 use ptyrs::gpu::FUSED_SIDES;
 
@@ -386,4 +386,77 @@ fn sampling_round_trip_rebuilds_the_same_run() {
     assert_eq!(toggled.1.0.as_slice(), kept.1.0.as_slice(), "object");
     assert_eq!(toggled.1.1.as_slice(), kept.1.1.as_slice(), "probe");
     assert_eq!(toggled.2, kept.2, "offsets");
+}
+
+/// While a position samples the object, which no GPU pass models yet, every algorithm, the
+/// LLK and ML's gradients fail and change nothing: back under `Sampling::Patch` the same
+/// calls give the records, arrays, gradients and offsets of a run never switched, bit for
+/// bit.
+#[test]
+fn full_object_position_fails_every_pass_until_patch() {
+    let c = &cases()[0];
+    let moved = Features {
+        position: Some(drawn_offsets()),
+        ..Features::default()
+    };
+    let bh = BhParams {
+        batch_size: 8,
+        probe_rho: 0.01,
+        position_rho: 0.1,
+        seed: 7,
+    };
+    let lsqml = LsqmlParams {
+        batch_size: 8,
+        cost: Cost::Poisson,
+        seed: 7,
+    };
+    type Call<'a> = &'a dyn Fn(&mut GpuPtycho) -> Result<Vec<f64>, EngineError>;
+    let calls: [(&str, Call); 9] = [
+        ("AP", &|g| g.ap(&AP, 1).map(|()| Vec::new())),
+        ("DM", &|g| g.dm(&DM, 1).map(|()| Vec::new())),
+        ("RAAR", &|g| g.raar(&RAAR, 1).map(|()| Vec::new())),
+        ("rPIE", &|g| g.rpie(&RPIE, 1).map(|()| Vec::new())),
+        ("ML", &|g| {
+            g.ml(&MlParams::default(), 1).map(|()| Vec::new())
+        }),
+        ("BH", &|g| g.bh(&bh, 1, 1).map(|()| Vec::new())),
+        ("LSQML", &|g| g.lsqml(&lsqml, 1, 1).map(|()| Vec::new())),
+        ("LLK", &|g| g.llk().map(|l| vec![l.poisson])),
+        ("ML gradients", &|g| {
+            let grads = g.ml_grads()?;
+            let parts = grads.iter().flat_map(|s| s.as_slice().iter());
+            Ok(parts.flat_map(|z| [z.re, z.im]).collect())
+        }),
+    ];
+    let run = |switched: bool| {
+        let mut gpu = c.gpu(true);
+        gpu.set_features(&moved).unwrap();
+        if switched {
+            let start = (gpu.object().unwrap(), gpu.probe().unwrap());
+            gpu.set_sampling(Sampling::FullObject).unwrap();
+            for (what, call) in calls {
+                let e = call(&mut gpu).unwrap_err().to_string();
+                assert!(e.contains("Sampling::FullObject"), "{what}: {e}");
+            }
+            assert!(gpu.history().is_empty(), "records");
+            assert_eq!(gpu.object().unwrap().as_slice(), start.0.as_slice());
+            assert_eq!(gpu.probe().unwrap().as_slice(), start.1.as_slice());
+            gpu.set_sampling(Sampling::Patch).unwrap();
+        }
+        let values: Vec<Vec<f64>> = calls
+            .iter()
+            .map(|(_, call)| call(&mut gpu).unwrap())
+            .collect();
+        let records: Vec<f64> = gpu.history().iter().map(|r| r.llk.poisson).collect();
+        let arrays = (gpu.object().unwrap(), gpu.probe().unwrap());
+        (values, records, arrays, gpu.features().unwrap().position)
+    };
+    let (kept, switched) = (run(false), run(true));
+    for ((what, _), (s, k)) in calls.iter().zip(switched.0.iter().zip(&kept.0)) {
+        assert_eq!(s, k, "{what}");
+    }
+    assert_eq!(switched.1, kept.1, "records");
+    assert_eq!(switched.2.0.as_slice(), kept.2.0.as_slice(), "object");
+    assert_eq!(switched.2.1.as_slice(), kept.2.1.as_slice(), "probe");
+    assert_eq!(switched.3, kept.3, "offsets");
 }
