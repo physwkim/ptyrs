@@ -2,8 +2,8 @@
 //! generates the state and runs pty-chi on it, writing `lsqml_near_*_f64.txt`, saved to
 //! `tests/data`. Its cases share the start object, probe and corners and differ in geometry
 //! and counts: 0 an angular-spectrum propagator, 1 a Fresnel transform, 2 an angular spectrum
-//! with an evanescent band, 3 a Fresnel transform back. Every frame sits at a whole-pixel corner, so pty-chi's PATCH
-//! extraction and the engine's views read the same pixels.
+//! with an evanescent band, 3 a Fresnel transform back. Every frame sits at a whole-pixel
+//! corner, so pty-chi's PATCH extraction and the engine's views read the same pixels.
 
 use std::slice;
 
