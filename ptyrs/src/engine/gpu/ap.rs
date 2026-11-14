@@ -87,7 +87,9 @@ impl Bufs<'_> {
         probe: bool,
     ) -> Result<(), GpuError> {
         let dims = *self.views.dims();
-        let mut m = self.features.lend(ctx, self.kernels, &dims, self.probe)?;
+        let mut m = self
+            .features
+            .lend(ctx, self.kernels, &dims, self.probe, self.exit)?;
         for s in 0..self.scratch.len() {
             let stack = self.scratch.at(s);
             let inputs = FusedInputs {

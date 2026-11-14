@@ -5039,8 +5039,8 @@ fn shifted_rows_fwd_matches_fused_llk_and_f64() {
 }
 
 /// `shifted_probe`'s `t` is `shifted_rows_fwd`'s, and `rows_llk` over `shifted_rows_fwd`'s
-/// row transforms, a stage applied, gives `propagated_llk`'s far sums under a scale and a
-/// background, bit for bit, from bufs without the shift scratch; on [`FUSED_CASES`].
+/// row transforms, a stage applied, gives `fused_llk`'s far sums under a [`Model::exit`], a
+/// scale and a background, neither half reading the stage, bit for bit, from bufs without the shift scratch; on [`FUSED_CASES`].
 #[test]
 fn shifted_probe_and_rows_llk_are_the_halves_of_their_wholes() {
     let (stream, ex, k) = setup();
@@ -5076,6 +5076,13 @@ fn shifted_probe_and_rows_llk_are_the_halves_of_their_wholes() {
                 stage,
                 scale: n as f32,
             });
+            let inputs = FusedInputs {
+                model: Model {
+                    exit,
+                    ..inputs.model
+                },
+                ..inputs
+            };
             let zl = || DeviceBuffer::<LlkPartial>::zeroed(&stream, 3).unwrap();
             let zs = || DeviceBuffer::<ScalePartial>::zeroed(&stream, 5).unwrap();
             let zb = || BackgroundSums::zeroed(&stream, &s.d, 3).unwrap();
@@ -5089,8 +5096,7 @@ fn shifted_probe_and_rows_llk_are_the_halves_of_their_wholes() {
                     background: Some(&mut bg),
                     ..far_both(&mut llk, &mut sums)
                 };
-                k.propagated_llk(&ex, &inputs, stack, &mut whole, far, exit)
-                    .unwrap();
+                k.fused_llk(&ex, &inputs, stack, &mut whole, far).unwrap();
                 k.shifted_rows_fwd(&ex, &inputs, stack, &mut t, &mut rows)
                     .unwrap();
                 k.shifted_probe(&ex, &inputs, stack, &mut t_alone).unwrap();
