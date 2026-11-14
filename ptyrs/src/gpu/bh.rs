@@ -706,6 +706,43 @@ impl BhKernels {
             })
     }
 
+    /// `buf *= T / √(ny nx)` on the stack's planes `[nf_max * nmode, ny, nx]`, or with `conj`
+    /// by `conj(T)`: between a forward and an inverse FFT of `buf` this makes them angular
+    /// spectrum of the transfer function `tf`, `[ny, nx]` on the unshifted frequency grid,
+    /// at the far field's norm, or its adjoint.
+    pub fn transfer(
+        &self,
+        ctx: &ExecutionContext,
+        dims: &ViewDims,
+        stack: StackRef<'_>,
+        tf: &DeviceBuffer<C32>,
+        buf: &mut DeviceBuffer<C32>,
+        conj: bool,
+    ) -> Result<(), Error> {
+        let g = dims.geom(stack)?;
+        let len = g.nf_max as usize * dims.nmode as usize * dims.n();
+        check_len("transfer function", tf, dims.n())?;
+        check_len("buf", buf, len)?;
+        let config = grid_1d(len)?;
+        let scale = 1.0 / (dims.n() as f32).sqrt();
+        let reads = [tf.storage(), stack.storage()];
+        self.base.launch(ctx, &reads, &[buf.storage()], |stream| {
+            // SAFETY: lengths checked above.
+            unsafe {
+                self.module.bh_transfer(
+                    stream,
+                    config,
+                    dptr(buf),
+                    dptr::<_, f32>(tf).cast_const(),
+                    scale,
+                    conj as u32,
+                    stack.ctl() as *const StackCtl,
+                    g,
+                )
+            }
+        })
+    }
+
     /// `y = conj(O_v) r` of each view `v` of the stack, `[nf_max * nmode, ny, nx]` in
     /// [`Kernels::obj_probe_to_psi`]'s layout like `r`, `O_v` the object `v` samples at each
     /// stored pixel: before its forward FFT, what [`Self::pos_grad`] and [`Self::pos_far`]
