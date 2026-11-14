@@ -2044,8 +2044,8 @@ impl Device {
             | Algorithm::Raar
             | Algorithm::Rpie
             | Algorithm::Ml
-            | Algorithm::Bh
-            | Algorithm::Lsqml => self.patch_only(&format!("{algorithm:?}")),
+            | Algorithm::Bh => self.patch_only(&format!("{algorithm:?}")),
+            Algorithm::Lsqml => self.llk_runs(),
         }
     }
 

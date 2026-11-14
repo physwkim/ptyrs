@@ -451,13 +451,8 @@ fn full_object_position_fails_every_pass_until_patch() {
         position_rho: 0.1,
         seed: 7,
     };
-    let lsqml = LsqmlParams {
-        batch_size: 8,
-        cost: Cost::Poisson,
-        seed: 7,
-    };
     type Call<'a> = &'a dyn Fn(&mut GpuPtycho) -> Result<Vec<f64>, EngineError>;
-    let calls: [(&str, Call); 8] = [
+    let calls: [(&str, Call); 7] = [
         ("AP", &|g| g.ap(&AP, 1).map(|()| Vec::new())),
         ("DM", &|g| g.dm(&DM, 1).map(|()| Vec::new())),
         ("RAAR", &|g| g.raar(&RAAR, 1).map(|()| Vec::new())),
@@ -466,7 +461,6 @@ fn full_object_position_fails_every_pass_until_patch() {
             g.ml(&MlParams::default(), 1).map(|()| Vec::new())
         }),
         ("BH", &|g| g.bh(&bh, 1, 1).map(|()| Vec::new())),
-        ("LSQML", &|g| g.lsqml(&lsqml, 1, 1).map(|()| Vec::new())),
         ("ML gradients", &|g| {
             let grads = g.ml_grads()?;
             let parts = grads.iter().flat_map(|s| s.as_slice().iter());
