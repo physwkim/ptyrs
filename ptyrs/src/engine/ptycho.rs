@@ -236,7 +236,7 @@ impl Ptycho {
                 optics.nslice()
             )));
         }
-        if !is_unitary(&optics) {
+        if !optics.exit().adjoint_inverts() {
             return Err(EngineError::Invalid(
                 "Ptycho needs a unitary propagator; this one drops an evanescent band".into(),
             ));
@@ -733,8 +733,10 @@ impl Ptycho {
     /// [`Ptycho::cg_gamma`] and `O += γ·d_O`, `P += γ·d_P`, or, for a `γ` that is not
     /// finite, no update and `d = −g` (PyNX `cu_linear_comb_fcfc_gamma`). PyNX CUDA keeps
     /// `−g / 2`, which changes neither `β` nor the step, and Hann-filters it in the far field;
-    /// this does not filter. As in PyNX, a negative curvature `den` is not guarded: far from
-    /// the solution (a flat object) the step can climb, so ML follows DM or AP.
+    /// this does not filter. As in PyNX, `γ` is one Newton step along `d` with no line search:
+    /// it can overshoot and raise the LLK for a cycle on a direction Polak–Ribière has grown,
+    /// as well as under a negative curvature `den`, which is not guarded (far from the
+    /// solution, a flat object), so ML follows DM or AP.
     ///
     /// [`Features::position`] takes AP's and DM's step, not PyNX ML's `update_pos` (which
     /// moves the scan positions themselves): its sums from the magnitude projection of the
@@ -1004,19 +1006,6 @@ impl Ptycho {
             batch_position_step(d, &frames, &delta);
         }
     }
-}
-
-/// Whether `optics`' exit transform is unitary: `Uᴴ·U` of one plane's unit impulse is
-/// `Fft2⁻¹·|T|²` of a constant under angular spectrum, the impulse again unless `T` has a
-/// zero, which moves its peak by at least `1/(ny·nx)`.
-fn is_unitary(optics: &Optics) -> bool {
-    let exit = optics.exit();
-    let [ny, nx] = exit.shape();
-    let mut plane = vec![C64::default(); ny * nx];
-    plane[0] = C64::new(1.0, 0.0);
-    exit.forward(&mut plane);
-    exit.adjoint(&mut plane);
-    (plane[0] - 1.0).norm() < 0.5 / (ny * nx) as f64
 }
 
 /// [`Ptycho::zero_phase_ramp`] of the given arrays, which the GPU backend also runs on its
@@ -1307,5 +1296,138 @@ mod tests {
             (gamma - newton).abs() < 1e-5 * gamma.abs(),
             "gamma {gamma} newton {newton}"
         );
+    }
+
+    type Modulus = fn(f64) -> f64;
+    type Offsets = fn(usize) -> [f64; 2];
+
+    /// Five frames of a 3-pixel Fermat spiral over an object of random phase whose modulus is
+    /// `modulus(u)` of a uniform `u`, two probe modes, `offsets(frame)` modelled; the exit
+    /// waves are the truth's and the probe starts 30% away. Returns the truth's probe too.
+    fn overlap_start(modulus: Option<Modulus>, offsets: Option<Offsets>) -> (Ptycho, Probe) {
+        let g = Geometry::new(1.5e-10, 1.0, 75e-6, [16, 16]).unwrap();
+        let pixel = Optics::far_field(&g).pixel();
+        let mut seed = 12345u64;
+        let mut uniform = move || {
+            seed = (seed.wrapping_mul(6364136223846793005)).wrapping_add(1442695040888963407);
+            (seed >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let positions = crate::base::sim::fermat(5, 3.0 * pixel[1]);
+        let shape = required_obj_shape(&positions.pynx_preprocess(pixel), pixel, g.frame, 0);
+        let mut object = crate::base::sim::object(shape);
+        if let Some(modulus) = modulus {
+            for v in object.as_mut_slice() {
+                *v = C64::from_polar(modulus(uniform()), 2.0 * PI * uniform());
+            }
+        }
+        let probe = crate::base::sim::probe(g.frame, 2).unwrap();
+        let dims = [positions.len(), 16, 16];
+        let blank = Counts::from_raw(dims, vec![0; dims.iter().product()]).unwrap();
+        let blank = Scan::new(g, positions, blank).unwrap();
+        let mut p =
+            Ptycho::with_optics(&blank, Optics::far_field(&g), object, probe.clone()).unwrap();
+        if let Some(offsets) = offsets {
+            p.set_features(Features {
+                position: Some((0..dims[0]).map(offsets).collect()),
+                ..Features::default()
+            })
+            .unwrap();
+        }
+        p.psi = p.calc_psi();
+        for v in p.probe.as_mut_slice() {
+            *v += C64::new(uniform() - 0.5, uniform() - 0.5) * 0.3;
+        }
+        (p, probe)
+    }
+
+    /// `‖psi − A·P‖²` of the exit waves held in `p.psi`.
+    fn overlap_error(p: &Ptycho) -> f64 {
+        (p.calc_psi().iter().zip(&p.psi))
+            .map(|(a, b)| (a - b).norm_sqr())
+            .sum()
+    }
+
+    fn fractional(f: usize) -> [f64; 2] {
+        let f = f as f64;
+        [(1.3 * f + 0.2).sin(), -(0.7 * f).cos()]
+    }
+
+    fn whole(f: usize) -> [f64; 2] {
+        [(f % 5) as f64 - 2.0, ((2 * f + 1) % 3) as f64 - 1.0]
+    }
+
+    /// With offsets modelled and all zero the probe update is `blend`'s, with and without
+    /// inertia.
+    #[test]
+    fn the_probe_update_under_zero_offsets_is_the_unmoved_one() {
+        for inertia in [0.0, 0.001] {
+            let (mut plain, _) = overlap_start(None, None);
+            let (mut still, _) = overlap_start(None, Some(|_| [0.0; 2]));
+            plain.update_from_psi(None, Some(inertia));
+            still.update_from_psi(None, Some(inertia));
+            let (a, b) = (still.probe.as_slice(), plain.probe.as_slice());
+            let d = worst_of(a.iter().zip(b).map(|(a, b)| (a - b).norm()))
+                / b.iter().map(|b| b.norm()).fold(0.0, f64::max);
+            eprintln!("inertia {inertia}: {d:.3e}");
+            assert!(d < 1e-14, "inertia {inertia}: {d:.3e}");
+        }
+    }
+
+    /// On objects whose `Σ|O|²` does not bound the moved operator (a unit step diverges on
+    /// both), whole-pixel and fractional offsets, with and without inertia: the overlap error
+    /// rises at no update and falls over thirty, in each of the two probe modes' problems.
+    #[test]
+    fn the_overlap_error_never_rises_under_a_moved_probe() {
+        let objects: [(&str, Modulus); 2] = [
+            ("decades", |u| (10f64).powf(-3.0 * u)),
+            ("binary", |u| if u < 0.5 { 0.0 } else { 1.0 }),
+        ];
+        let moves: [(&str, Offsets); 2] = [("whole", whole), ("fractional", fractional)];
+        for (object, modulus) in objects {
+            for (kind, offsets) in moves {
+                for inertia in [0.0, 0.05] {
+                    let (mut p, _) = overlap_start(Some(modulus), Some(offsets));
+                    let first = overlap_error(&p);
+                    let (mut before, mut rise) = (first, 0.0f64);
+                    for _ in 0..30 {
+                        p.update_from_psi(None, Some(inertia));
+                        let now = overlap_error(&p);
+                        rise = rise.max(now / before);
+                        before = now;
+                    }
+                    let fall = before / first;
+                    eprintln!("{object} {kind} inertia {inertia}: rise {rise:.6}, fall {fall:.3e}");
+                    // Without inertia the pixels the binary object leaves dark move slowly.
+                    let bound = if inertia == 0.0 { 1.0 } else { 0.2 };
+                    assert!(
+                        rise <= 1.0 && fall < bound,
+                        "{object} {kind} inertia {inertia}: rise {rise:.6}, fall {fall:.3e}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// At the solution the residual is rounding and the step keeps the probe; with nothing to
+    /// fit (`g = 0` exactly) there is no step and no `0/0`.
+    #[test]
+    fn the_probe_update_under_a_moved_probe_holds_the_solution() {
+        for inertia in [0.0, 0.001] {
+            let (mut p, truth) = overlap_start(Some(|u| 0.2 + 0.8 * u), Some(fractional));
+            p.probe = truth.clone();
+            for _ in 0..3 {
+                p.update_from_psi(None, Some(inertia));
+            }
+            let (a, b) = (p.probe.as_slice(), truth.as_slice());
+            let d = worst_of(a.iter().zip(b).map(|(a, b)| (a - b).norm()))
+                / b.iter().map(|b| b.norm()).fold(0.0, f64::max);
+            eprintln!("inertia {inertia}: {d:.3e}");
+            assert!(d < 1e-13, "inertia {inertia}: {d:.3e}");
+
+            p.probe.as_mut_slice().fill(C64::default());
+            p.psi.fill(C64::default());
+            p.update_from_psi(None, Some(inertia));
+            assert!(p.probe.as_slice().iter().all(|c| *c == C64::default()));
+        }
     }
 }

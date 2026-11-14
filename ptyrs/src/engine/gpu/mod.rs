@@ -38,13 +38,13 @@ use std::sync::Arc;
 use crate::base::{AddrTable, C64, Object, Probe, Scan, Stack};
 use crate::fft::Plan2d;
 use crate::gpu::{
-    C32, CG_BLOCKS, Ended, Error as GpuError, FarSums, FusedBufs, FusedInputs, ObjProbeScale,
-    RecordWriter, StackRef, StackTable, ViewAddr, ViewDims,
+    C32, CG_BLOCKS, Ended, Error as GpuError, FarSums, FusedBufs, FusedInputs, Model,
+    ObjProbeScale, RecordWriter, StackRef, StackTable, ViewAddr, ViewDims,
 };
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 
-use device::{Bufs, Device, NormBufs, PassesMut, Uploads};
+use device::{Bufs, Device, NormBufs, PassesMut, SliceUploads, Uploads};
 
 use crate::engine::ptycho::{Algorithm, LlkRecord, zero_phase_ramp};
 use crate::engine::{
@@ -419,7 +419,8 @@ impl GpuPtycho {
     /// [`Self::new`] under `optics`, which give the object pixel of the scan's positions, the
     /// exit waves' plane phase and the propagator in place of the scan geometry's far field;
     /// of the geometry only the frame is read. Fails on optics without a
-    /// [`Optics::fourier_form`], and on more than one object slice.
+    /// [`Optics::fourier_form`], and on more than one object slice, which
+    /// [`Self::with_slices`] takes.
     pub fn with_optics(
         ctx: &Arc<CudaContext>,
         scan: &Scan,
@@ -428,6 +429,42 @@ impl GpuPtycho {
         probe: Probe,
         options: GpuOptions,
     ) -> Result<Self, EngineError> {
+        Self::with_slices(ctx, scan, optics, &[object], probe, options)
+    }
+
+    /// [`Self::with_optics`] on a multislice object, `objects` its slices in the order the
+    /// wave crosses them, one per slice of `optics` and all of one shape. More than one
+    /// slice runs LSQML alone ([`Self::lsqml`]), with one object mode: every other
+    /// algorithm fails on it.
+    pub fn with_slices(
+        ctx: &Arc<CudaContext>,
+        scan: &Scan,
+        optics: &Optics,
+        objects: &[Object],
+        probe: Probe,
+        options: GpuOptions,
+    ) -> Result<Self, EngineError> {
+        if objects.len() != optics.nslice() {
+            return Err(EngineError::Invalid(format!(
+                "{} object slices for optics of {}",
+                objects.len(),
+                optics.nslice()
+            )));
+        }
+        let object = &objects[0];
+        if let Some(o) = objects.iter().find(|o| o.dims() != object.dims()) {
+            return Err(EngineError::Invalid(format!(
+                "object slice {:?} differs from the first's {:?}",
+                o.dims(),
+                object.dims()
+            )));
+        }
+        if objects.len() > 1 && object.nmode() != 1 {
+            return Err(EngineError::Invalid(format!(
+                "the GPU backend runs a multislice object of one mode, got {}",
+                object.nmode()
+            )));
+        }
         let g = scan.geometry;
         let [ny, nx] = g.frame;
         if optics.exit().shape() != g.frame {
@@ -435,12 +472,6 @@ impl GpuPtycho {
                 "propagator plane {:?} differs from frame {:?}",
                 optics.exit().shape(),
                 g.frame
-            )));
-        }
-        if optics.nslice() != 1 {
-            return Err(EngineError::Invalid(format!(
-                "the GPU backend runs one object slice, got {}",
-                optics.nslice()
             )));
         }
         let pixel = optics.pixel();
@@ -482,8 +513,26 @@ impl GpuPtycho {
             nobj: to_u32("object modes", addr.nobj())?,
             frame: [to_u32("frame side", ny)?, to_u32("frame side", nx)?],
             obj: [to_u32("object side", nyo)?, to_u32("object side", nxo)?],
-            quad_phase: form.quad as f32,
+            // A multislice object's waves take the phase on the last slice, by
+            // `OpticsKernels::slice_phase`; no pass over the views does.
+            quad_phase: if objects.len() == 1 {
+                form.quad as f32
+            } else {
+                0.0
+            },
         };
+        let slices = (objects.len() > 1).then(|| SliceUploads {
+            deeper: objects[1..].iter().map(|o| to_c32(o.as_slice())).collect(),
+            gaps: (optics.gaps().iter())
+                .map(|p| {
+                    to_c32(
+                        p.transfer()
+                            .expect("Optics::with_slices builds angular spectrum"),
+                    )
+                })
+                .collect(),
+            quad: form.quad as f32,
+        });
         let addrs: Vec<ViewAddr> = addr
             .views()
             .iter()
@@ -504,6 +553,7 @@ impl GpuPtycho {
             counts: scan.counts.as_slice(),
             obj: &to_c32(object.as_slice()),
             probe: &to_c32(probe.as_slice()),
+            slices,
         };
         let dev = Device::new(ctx, dims, uploads, options)?;
         Ok(Self {
@@ -517,7 +567,7 @@ impl GpuPtycho {
         })
     }
 
-    /// The object, read back from the device.
+    /// The object, of a multislice object its first slice, read back from the device.
     pub fn object(&self) -> Result<Object, EngineError> {
         Ok(Object::new(download(
             self.dev.stream(),
@@ -526,9 +576,17 @@ impl GpuPtycho {
         )?))
     }
 
-    /// Replaces the object between algorithm calls, which start from it as from the one
-    /// [`Self::new`] uploads; fails, changing nothing, when its dims differ from the current
-    /// object's.
+    /// The object's slices in the order the wave crosses them, read back from the device.
+    pub fn objects(&self) -> Result<Vec<Object>, EngineError> {
+        std::iter::once(self.dev.obj())
+            .chain(self.dev.deeper())
+            .map(|b| Ok(Object::new(download(self.dev.stream(), b, self.obj_dims)?)))
+            .collect()
+    }
+
+    /// Replaces the object, of a multislice object its first slice, between algorithm calls,
+    /// which start from it as from the one [`Self::new`] uploads; fails, changing nothing,
+    /// when its dims differ from the current object's.
     pub fn set_object(&mut self, object: &Object) -> Result<(), EngineError> {
         if object.dims() != self.obj_dims {
             return Err(EngineError::Invalid(format!(
@@ -636,21 +694,30 @@ impl Bufs<'_> {
         let dims = *self.views.dims();
         match passes {
             PassesMut::M1(m1) => {
+                let (k, optics) = (self.kernels, self.exit.kernels);
                 for s in 0..self.scratch.len() {
                     let stack = self.scratch.at(s);
-                    self.kernels.obj_probe_to_psi(
-                        ctx, self.views, stack, self.obj, self.probe, m1.scratch,
-                    )?;
+                    let psi = match &mut self.slices {
+                        None => {
+                            k.obj_probe_to_psi(
+                                ctx, self.views, stack, self.obj, self.probe, m1.scratch,
+                            )?;
+                            &mut *m1.scratch
+                        }
+                        Some(sl) => {
+                            let inputs = FusedInputs {
+                                views: self.views,
+                                counts: self.counts,
+                                obj: self.obj,
+                                probe: self.probe,
+                                model: Model::default(),
+                            };
+                            sl.exit_waves(ctx, k, optics, &inputs, stack)?
+                        }
+                    };
                     let plan = self.scratch.frames[s].plan;
-                    m1.plans.get(plan).forward_inplace(ctx, m1.scratch)?;
-                    self.kernels.llk(
-                        ctx,
-                        stack,
-                        self.counts,
-                        m1.scratch,
-                        self.llk_scratch,
-                        self.llk,
-                    )?;
+                    m1.plans.get(plan).forward_inplace(ctx, psi)?;
+                    k.llk(ctx, stack, self.counts, psi, self.llk_scratch, self.llk)?;
                     rec.push(ctx, &dims, stack, self.llk)?;
                 }
             }
@@ -671,7 +738,16 @@ impl Bufs<'_> {
                         llk: Some(&mut *self.llk),
                         ..FarSums::default()
                     };
-                    self.kernels.fused_llk(ctx, &inputs, stack, f, far)?;
+                    match &mut self.slices {
+                        None => self.kernels.fused_llk(ctx, &inputs, stack, f, far)?,
+                        Some(sl) => {
+                            let (k, exit) = (self.kernels, self.exit);
+                            let rows = sl.exit_waves(ctx, k, exit.kernels, &inputs, stack)?;
+                            exit.kernels.rows(ctx, &dims, stack, rows, false)?;
+                            (exit.kernels).exit(ctx, &dims, stack, exit.stage, rows, false)?;
+                            k.rows_llk(ctx, &inputs, stack, rows, f, far)?;
+                        }
+                    }
                     rec.push(ctx, &dims, stack, self.llk)?;
                 }
             }

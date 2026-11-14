@@ -1,10 +1,9 @@
 """GpuPtycho under near-field Optics against the GPU engine's own runs from the same scan and
 start, `examples/engine_reference.rs`' `gpu_optics.h5`: an angular-spectrum propagator and a
 Fresnel transform forward and back. Every algorithm the engine ran leaves its object, probe
-and LLK records, exactly, as one device runs both; one it refused (a propagator with a
-plane stage, under the algorithms that run none yet) raises its error text. A Fresnel
-transform forward has no plane stage and runs every algorithm, and LSQML and BH run under
-all three."""
+and LLK records, exactly, as one device runs both; one it refused raises its error text. A
+Fresnel transform forward has no plane stage and runs every algorithm; under the other two
+ML alone is refused."""
 
 import os
 
@@ -34,20 +33,25 @@ def case(request):
         yield request.param, f[request.param]
 
 
-def gpu_of(g, **options):
-    """A fresh GPU state of `g`'s scan and start under its optics."""
+def gpu_of(g, sliced=False, **options):
+    """A fresh GPU state of `g`'s scan and start under its optics; `sliced`, with a second
+    object slice, the start object, 20 µm behind the first (`lsqml_sliced`)."""
     a, counts = g.attrs, g["counts"][()]
-    w = ptyrs.Wavefield(counts.shape[1:], a["wavelength"], g["pixel"][()], a["distance"])
+    shape, pixel = counts.shape[1:], g["pixel"][()]
+    optics = ptyrs.Optics.free_space(ptyrs.Wavefield(shape, a["wavelength"], pixel, a["distance"]))
+    obj = g["object"][()]
+    if sliced:
+        optics = optics.with_slices([ptyrs.Wavefield(shape, a["wavelength"], pixel, 2e-5)])
+        obj = np.stack([obj, obj])
     # of the scan's geometry the engine reads the frame alone under optics
-    scan = ptyrs.Scan(counts, g["y"][()], g["x"][()], a["wavelength"], 1.0, g["pixel"][1])
-    return ptyrs.GpuPtycho(scan, g["object"][()], g["probe"][()], DEVICE,
-                           optics=ptyrs.Optics.free_space(w), **options)
+    scan = ptyrs.Scan(counts, g["y"][()], g["x"][()], a["wavelength"], 1.0, pixel[1])
+    return ptyrs.GpuPtycho(scan, obj, g["probe"][()], DEVICE, optics=optics, **options)
 
 
 @pytest.mark.parametrize("algorithm", list(RUNS))
 def test_matches_engine_or_raises_its_error(case, algorithm):
     name, g = case
-    assert algorithm in g or (name != "fresnel" and algorithm not in ("lsqml", "bh"))
+    assert algorithm in g or (name != "fresnel" and algorithm == "ml")
     gpu = gpu_of(g)
     if algorithm not in g:
         want = g.attrs[f"{algorithm}_error"]
@@ -62,6 +66,23 @@ def test_matches_engine_or_raises_its_error(case, algorithm):
     assert len(want["poisson"]) == NEPOCH
     np.testing.assert_array_equal(gpu.history["poisson"], want["poisson"][()])
     np.testing.assert_array_equal(gpu.object, want["object"][()])
+    np.testing.assert_array_equal(gpu.probe, want["probe"][()])
+
+
+def test_multislice_lsqml_matches_engine(case):
+    """A `[nslice, nmode, nyo, nxo]` object runs LSQML as the engine's `with_slices` does,
+    `object` its first slice, with its LLK records; DM, as every other algorithm, is refused."""
+    _, g = case
+    gpu = gpu_of(g, sliced=True)
+    with pytest.raises(ValueError, match="Dm runs one object slice, got 2"):
+        gpu.dm(NEPOCH)
+    gpu.lsqml(NEPOCH, 1, 5, "poisson", 7)
+    want = g["lsqml_sliced"]
+    assert len(want["poisson"]) == NEPOCH
+    np.testing.assert_array_equal(gpu.history["poisson"], want["poisson"][()])
+    objects = gpu.objects
+    np.testing.assert_array_equal(objects, want["objects"][()])
+    np.testing.assert_array_equal(gpu.object, objects[0])
     np.testing.assert_array_equal(gpu.probe, want["probe"][()])
 
 
@@ -81,14 +102,17 @@ def test_absent_optics_is_the_far_field(scenario):
 
 
 def test_refused_optics_raise_at_construction(case):
-    """Optics the GPU has no form for, and a plane stage without fused passes."""
+    """Sliced optics with one object slice, an object of neither 3 nor 4 axes, and a plane
+    stage without fused passes."""
     name, g = case
     a, counts = g.attrs, g["counts"][()]
     scan = ptyrs.Scan(counts, g["y"][()], g["x"][()], a["wavelength"], 1.0, g["pixel"][1])
     w = ptyrs.Wavefield(counts.shape[1:], a["wavelength"], g["pixel"][()], a["distance"])
     start = g["object"][()], g["probe"][()], DEVICE
-    with pytest.raises(ValueError, match="one object slice"):
+    with pytest.raises(ValueError, match="1 object slices for optics of 2"):
         ptyrs.GpuPtycho(scan, *start, optics=ptyrs.Optics.free_space(w).with_slices([w]))
+    with pytest.raises(TypeError, match=r"object must be complex128 \[nmode"):
+        ptyrs.GpuPtycho(scan, start[0][None, None], *start[1:])
     if name != "fresnel":
         with pytest.raises(ValueError, match="fused: true"):
             gpu_of(g, fused=False)

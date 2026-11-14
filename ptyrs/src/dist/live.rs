@@ -375,7 +375,12 @@ mod tests {
 
     /// The one-GPU scan of `frame`-pixel frames at `pos`, 2 probe modes, and its views.
     fn scan(pos: Positions, frame: u32) -> (ScanShape, Vec<ViewAddr>) {
-        let xy: Vec<(f64, f64)> = pos.x.iter().copied().zip(pos.y.iter().copied()).collect();
+        let xy: Vec<(f64, f64)> = pos
+            .x()
+            .iter()
+            .copied()
+            .zip(pos.y().iter().copied())
+            .collect();
         let (place, reach) = ViewPlacement::plan(PIXEL, &xy);
         let mut views = Vec::new();
         for &p in &xy {
@@ -1015,7 +1020,12 @@ mod tests {
     #[test]
     fn the_uploader_fills_each_store_in_the_order_the_plan_numbers_its_frames() {
         let pos = sim::raster(12, 20, 8e-8);
-        let xy: Vec<(f64, f64)> = pos.x.iter().copied().zip(pos.y.iter().copied()).collect();
+        let xy: Vec<(f64, f64)> = pos
+            .x()
+            .iter()
+            .copied()
+            .zip(pos.y().iter().copied())
+            .collect();
         let (place, _) = ViewPlacement::plan(PIXEL, &xy);
         let (shape, planned) = scan(pos, 32);
         let se = 32 * 32;
@@ -1047,7 +1057,7 @@ mod tests {
             for &u in &landed {
                 let (x, y) = xy[u];
                 let t_rx = wall_ns();
-                table.insert(u as i32, Pos { x, y, t_rx });
+                table.insert(u as i32, Pos::new(x, y, t_rx));
             }
             for u in 0..xy.len() {
                 let mut s = ring.reserve();
@@ -1144,14 +1154,7 @@ mod tests {
         };
         for u in 0..total as i32 {
             let t_rx = wall_ns();
-            table.insert(
-                u,
-                Pos {
-                    x: 0.0,
-                    y: 0.0,
-                    t_rx,
-                },
-            );
+            table.insert(u, Pos::new(0.0, 0.0, t_rx));
             let mut s = ring.reserve();
             s.frame().fill(u as u16 + 1);
             s.commit(u, t_rx, 0);

@@ -1,18 +1,22 @@
 //! The GPU engine ([`ptyrs::engine::GpuPtycho`]): AP, DM, RAAR, ML, rPIE, BH and LSQML in f32.
 
 use cuda_core::CudaContext;
-use numpy::{PyArray3, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArray3};
+use numpy::{
+    PyArray3, PyArray4, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArray3, PyReadonlyArray4,
+};
 use ptyrs::base::{C64, Object, Probe};
 use ptyrs::engine::{BhParams, GpuOptions, LsqmlParams};
+use pyo3::exceptions::PyTypeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
 use crate::cpu::Optics;
-use crate::{Error, Scan, history, llk_dict, params, stack_in, stack_out};
+use crate::{Error, Scan, history, llk_dict, objects_in, objects_out, params, stack_in, stack_out};
 
 /// The GPU reconstruction state of a scan on CUDA device `device`, under `optics` in place of
-/// the far field of the scan's geometry if given (`GpuPtycho::with_optics`); keywords are
-/// `GpuOptions` fields.
+/// the far field of the scan's geometry if given; keywords are `GpuOptions` fields. `object`
+/// is `[nmode, nyo, nxo]`, or `[nslice, nmode, nyo, nxo]` with a slice per slice of `optics`
+/// (`GpuPtycho::with_slices`: more than one runs LSQML alone, of one mode).
 #[pyclass(unsendable)]
 pub(crate) struct GpuPtycho(
     ptyrs::engine::GpuPtycho,
@@ -26,22 +30,36 @@ impl GpuPtycho {
     #[pyo3(signature = (scan, object, probe, device = 0, optics = None, **options))]
     fn new(
         scan: &Scan,
-        object: PyReadonlyArray3<'_, C64>,
+        object: &Bound<'_, PyAny>,
         probe: PyReadonlyArray3<'_, C64>,
         device: usize,
         optics: Option<&Bound<'_, Optics>>,
         options: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<Self> {
         let options = params!(GpuOptions, options, stack_size, graph, llk_slots, fused);
-        let (object, probe) = (Object::new(stack_in(object)?), Probe::new(stack_in(probe)?));
-        let ctx = CudaContext::new(device).map_err(|e| Error(e.into()))?;
-        let engine = match optics {
-            Some(o) => {
-                let optics = &o.get().inner;
-                ptyrs::engine::GpuPtycho::with_optics(&ctx, &scan.0, optics, object, probe, options)
+        let objects = match object.extract::<PyReadonlyArray4<'_, C64>>() {
+            Ok(a) => objects_in(a)?,
+            Err(_) => {
+                let a = object.extract::<PyReadonlyArray3<'_, C64>>().map_err(|_| {
+                    PyTypeError::new_err(
+                        "object must be complex128 [nmode, nyo, nxo] or [nslice, nmode, nyo, nxo]",
+                    )
+                })?;
+                vec![Object::new(stack_in(a)?)]
             }
-            None => ptyrs::engine::GpuPtycho::new(&ctx, &scan.0, object, probe, options),
         };
+        let probe = Probe::new(stack_in(probe)?);
+        let far;
+        let optics = match optics {
+            Some(o) => &o.get().inner,
+            None => {
+                far = ptyrs::engine::Optics::far_field(&scan.0.geometry);
+                &far
+            }
+        };
+        let ctx = CudaContext::new(device).map_err(|e| Error(e.into()))?;
+        let engine =
+            ptyrs::engine::GpuPtycho::with_slices(&ctx, &scan.0, optics, &objects, probe, options);
         Ok(Self(
             engine.map_err(Error::from)?,
             scan.0.counts.frame_shape(),
@@ -164,9 +182,16 @@ impl GpuPtycho {
         crate::features_out(py, self.0.features().map_err(Error::from)?, self.1)
     }
 
+    /// The object, of a multislice object its first slice.
     #[getter]
     fn object<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray3<C64>>> {
         stack_out(py, self.0.object().map_err(Error::from)?.0)
+    }
+
+    /// The object's slices `[nslice, nmode, nyo, nxo]` in the order the wave crosses them.
+    #[getter]
+    fn objects<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray4<C64>>> {
+        objects_out(py, self.0.objects().map_err(Error::from)?)
     }
 
     #[getter]

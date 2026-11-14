@@ -199,7 +199,7 @@ fn run(dir: &Path, pattern: &str, args: &[String]) -> Result<(), Box<dyn Error>>
         let t = Instant::now();
         for k in at..end {
             let (x, y) = pos[k];
-            table.insert(k as i32, Pos { x, y, t_rx: 0 });
+            table.insert(k as i32, Pos::new(x, y, 0));
             let mut s = ring.reserve();
             s.frame().copy_from_slice(&counts[k * n..(k + 1) * n]);
             s.commit(k as i32, 0, 0);

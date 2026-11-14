@@ -17,8 +17,8 @@ use crate::gpu::{
     ExitPass, ExitStage, FarSums, FusedBufs, FusedInputs, GammaStacks, GradKernels, Kernels,
     LlkPartial, LlkRing, LlkScratch, LlkTotals, Model, OpticsKernels, PositionKernels,
     PositionPartial, Positions, PowerMax, ProbeSpectrum, PsiSums, RingDevice, RpieKernels,
-    ScalePartial, Shift, ShiftSums, ShiftedProbeSums, SpectrumBuf, StackTable, UpdateSums,
-    ViewAddr, ViewDims, Views,
+    ScalePartial, Shift, ShiftProbe, ShiftSums, ShiftedProbeSums, SlicePhase, SliceSource,
+    SpectrumBuf, StackRef, StackTable, UpdateSums, ViewAddr, ViewDims, Views,
 };
 use crate::tile::TileDots;
 use cuda_async::cuda_graph::CudaGraph;
@@ -48,8 +48,109 @@ pub(super) struct Uploads<'a> {
     pub scale: f32,
     pub addrs: &'a [ViewAddr],
     pub counts: &'a [u16],
+    /// The object, of a multislice object its first slice.
     pub obj: &'a [C32],
     pub probe: &'a [C32],
+    /// The rest of a multislice object.
+    pub slices: Option<SliceUploads>,
+}
+
+/// A multislice object past its first slice.
+pub(super) struct SliceUploads {
+    /// The slices after the first, each shaped as it.
+    pub deeper: Vec<Vec<C32>>,
+    /// Gap `s`'s transfer function, from slice `s` to `s + 1`: one per deeper slice.
+    pub gaps: Vec<Vec<C32>>,
+    /// The last slice's plane phase, radians per squared pixel.
+    pub quad: f32,
+}
+
+/// A multislice object's device state past its first slice, which is [`Device::obj`]; only
+/// LSQML and the LLK pass run it, and [`Device::one_slice`] gates every other pass.
+struct Slices {
+    deeper: Vec<DeviceBuffer<C32>>,
+    gaps: Vec<DeviceBuffer<C32>>,
+    /// A probe of ones `[nprobe, ny, nx]`: [`Kernels::psi_to_obj`] over it is a slice's
+    /// adjoint of waves already times the conjugate of what entered it.
+    ones: DeviceBuffer<C32>,
+    quad: f32,
+    /// Moves the probe the LLK pass sends through the slices.
+    position: PositionKernels,
+    /// One stack's waves, from slice to slice in turn, each a [`Cut::wave_len`] of
+    /// [`Shared::cut`], which counts them.
+    waves: [DeviceBuffer<C32>; 2],
+}
+
+impl Slices {
+    /// The two waves of a stack of `cut`.
+    fn waves(
+        stream: &Arc<CudaStream>,
+        cut: &Cut,
+        dims: &ViewDims,
+    ) -> Result<[DeviceBuffer<C32>; 2], EngineError> {
+        let wave = || DeviceBuffer::zeroed(stream, cut.wave_len(dims));
+        Ok([wave()?, wave()?])
+    }
+}
+
+/// [`Slices`] lent to a cycle.
+pub(super) struct SlicesMut<'a> {
+    pub deeper: &'a mut [DeviceBuffer<C32>],
+    pub gaps: &'a [DeviceBuffer<C32>],
+    pub ones: &'a DeviceBuffer<C32>,
+    pub quad: f32,
+    position: &'a PositionKernels,
+    waves: &'a mut [DeviceBuffer<C32>; 2],
+}
+
+/// The last slice's plane phase of `quad` radians per squared pixel, moved with the probe by
+/// `offsets`; none of no phase.
+pub(super) fn slice_phase(
+    quad: f32,
+    offsets: Option<&DeviceBuffer<f32>>,
+) -> Option<SlicePhase<'_>> {
+    (quad != 0.0).then_some(SlicePhase { quad, offsets })
+}
+
+impl SlicesMut<'_> {
+    /// `stack`'s waves leaving the last slice, its plane phase on them, in a scratch stack's
+    /// buffer: of `inputs` the views, the first slice as its object, and the probe, moved
+    /// under a [`Model::shift`] by its offsets.
+    pub fn exit_waves(
+        &mut self,
+        ctx: &ExecutionContext,
+        kernels: &Kernels,
+        optics: &OpticsKernels,
+        inputs: &FusedInputs<'_>,
+        stack: StackRef<'_>,
+    ) -> Result<&mut DeviceBuffer<C32>, GpuError> {
+        let (views, d) = (inputs.views, inputs.views.dims());
+        let [a, b] = &mut *self.waves;
+        let offsets = match inputs.model.shift {
+            None => {
+                let probe = SliceSource::Probe(inputs.probe);
+                optics.slice_mul(ctx, views, stack, inputs.obj, probe, a)?;
+                None
+            }
+            Some(shift) => {
+                kernels.shifted_probe(ctx, inputs, stack, b)?;
+                self.position.shift_w(ctx, d, stack, b)?;
+                let probe = SliceSource::Waves(b);
+                optics.slice_mul(ctx, views, stack, inputs.obj, probe, a)?;
+                Some(shift.offsets)
+            }
+        };
+        let (mut src, mut dst) = (a, b);
+        for (obj, gap) in self.deeper.iter().zip(self.gaps) {
+            optics.gap(ctx, d, stack, gap, src, false)?;
+            optics.slice_mul(ctx, views, stack, obj, SliceSource::Waves(src), dst)?;
+            std::mem::swap(&mut src, &mut dst);
+        }
+        if let Some(p) = slice_phase(self.quad, offsets) {
+            optics.slice_phase(ctx, d, stack, p, src, false)?;
+        }
+        Ok(src)
+    }
 }
 
 /// Every buffer, module and plan a cycle launches on, and the graphs captured from them.
@@ -70,6 +171,8 @@ pub(super) struct Device {
     counts: DeviceBuffer<u16>,
     obj: DeviceBuffer<C32>,
     probe: DeviceBuffer<C32>,
+    /// A multislice object's slices past `obj`; none of one slice.
+    slices: Option<Slices>,
     obj_sums: UpdateSums,
     probe_sums: UpdateSums,
     obj_len: u32,
@@ -319,11 +422,16 @@ impl Modelled<'_> {
     }
 
     /// A fused pass's sums of the position model: with `probe` the shifted probe's update
-    /// sums, with `position` each frame's position sums; none without a position.
-    pub fn shift_sums(&mut self, probe: bool, position: bool) -> ShiftSums<'_> {
+    /// sums of that kind, with `position` each frame's position sums; none without a
+    /// position.
+    pub fn shift_sums<'c>(
+        &'c mut self,
+        probe: Option<fn(&'c mut ShiftedProbeSums) -> ShiftProbe<'c>>,
+        position: bool,
+    ) -> ShiftSums<'c> {
         match &mut self.position {
             Some(p) => ShiftSums {
-                probe: probe.then_some(&mut *p.probe),
+                probe: probe.map(|kind| kind(&mut *p.probe)),
                 position: position.then_some(&mut *p.num),
                 position_den: position.then_some(&mut *p.den),
             },
@@ -338,13 +446,17 @@ impl Modelled<'_> {
     }
 
     /// The update sums of stored waves under the position model: `obj`, and with `probe`
-    /// the shifted probe's; the shifted probe's are none without a position.
-    pub fn psi_sums<'c>(&'c mut self, obj: Option<&'c mut UpdateSums>, probe: bool) -> PsiSums<'c> {
+    /// the shifted probe's of that kind; the shifted probe's are none without a position.
+    pub fn psi_sums<'c>(
+        &'c mut self,
+        obj: Option<&'c mut UpdateSums>,
+        probe: Option<fn(&'c mut ShiftedProbeSums) -> ShiftProbe<'c>>,
+    ) -> PsiSums<'c> {
         PsiSums {
             obj,
             probe: (self.position.as_mut())
-                .filter(|_| probe)
-                .map(|p| &mut *p.probe),
+                .zip(probe)
+                .map(|(p, kind)| kind(&mut *p.probe)),
         }
     }
 
@@ -527,13 +639,14 @@ struct Shared {
 
 impl Shared {
     /// M2's fused passes (with `shift`, the position model's) or M1's scratch, `fused`
-    /// picking, cut by `rule`.
+    /// picking, cut by `rule` with, if `sliced`, a multislice object's [`Slices::waves`].
     fn new(
         stream: &Arc<CudaStream>,
         dims: &ViewDims,
         rule: StackRule,
         fused: bool,
         shift: bool,
+        sliced: bool,
     ) -> Result<Self, EngineError> {
         // M1's scratch: `obj_probe_to_psi`, the transforms and `apply_amplitude`; the fused
         // work planes: the row, column and inverse row passes; each shift plane: the pass that
@@ -541,6 +654,9 @@ impl Shared {
         let mut streamed = vec![Streamed::new(wave_bytes(dims), if fused { 3 } else { 4 })];
         if shift {
             streamed.push(Streamed::new(FusedBufs::shift_bytes(dims), 2));
+        }
+        if sliced {
+            streamed.extend([Streamed::new(wave_bytes(dims), 3); 2]);
         }
         let cut = rule.cut(stream, dims, &streamed)?;
         let nf_max = cut.table.nf_max();
@@ -1095,6 +1211,8 @@ pub(super) struct Bufs<'a> {
     pub counts: &'a DeviceBuffer<u16>,
     pub obj: &'a mut DeviceBuffer<C32>,
     pub probe: &'a mut DeviceBuffer<C32>,
+    /// A multislice object's slices past `obj`.
+    pub slices: Option<SlicesMut<'a>>,
     pub obj_sums: &'a mut UpdateSums,
     pub probe_sums: &'a mut UpdateSums,
     pub obj_len: u32,
@@ -1145,6 +1263,7 @@ impl Device {
             counts,
             obj,
             probe,
+            slices,
         } = uploads;
         let stream = ctx.new_stream()?;
         let kernels = Kernels::load(ctx)?;
@@ -1167,7 +1286,25 @@ impl Device {
         let views = Views::new(&stream, dims, addrs)?;
         let tile = TileDots::new(&stream, &dims)?;
         let rule = StackRule::new(options.stack_size, ctx.l2_cache_size_bytes()?);
-        let shared = Shared::new(&stream, &dims, rule, options.fused, false)?;
+        let shared = Shared::new(&stream, &dims, rule, options.fused, false, slices.is_some())?;
+        let slices = slices
+            .map(|s| {
+                let upload = |v: &[Vec<C32>]| {
+                    v.iter()
+                        .map(|v| DeviceBuffer::from_host(&stream, v))
+                        .collect::<Result<Vec<_>, _>>()
+                };
+                let ones = vec![C32 { re: 1.0, im: 0.0 }; probe.len()];
+                Ok::<_, EngineError>(Slices {
+                    deeper: upload(&s.deeper)?,
+                    gaps: upload(&s.gaps)?,
+                    ones: DeviceBuffer::from_host(&stream, &ones)?,
+                    quad: s.quad,
+                    position: PositionKernels::load(&kernels)?,
+                    waves: Slices::waves(&stream, &shared.cut, &dims)?,
+                })
+            })
+            .transpose()?;
         let mut dev = Self {
             obj_len: to_u32("object length", obj.len())?,
             probe_len: to_u32("probe length", probe.len())?,
@@ -1181,6 +1318,7 @@ impl Device {
             counts: DeviceBuffer::from_host(&stream, counts)?,
             obj: DeviceBuffer::from_host(&stream, obj)?,
             probe: DeviceBuffer::from_host(&stream, probe)?,
+            slices,
             obj_sums: UpdateSums::zeroed(&stream, obj.len())?,
             probe_sums: UpdateSums::zeroed(&stream, probe.len())?,
             kernels,
@@ -1255,10 +1393,23 @@ impl Device {
         }
         let stream = &self.stream;
         let dims = self.views.dims();
+        // A new cut resizes the slices' waves with it.
         let shared = (have.position.is_some() != position.is_some())
-            .then(|| Shared::new(stream, dims, self.rule, true, position.is_some()))
+            .then(|| {
+                let (moved, sliced) = (position.is_some(), self.slices.is_some());
+                let shared = Shared::new(stream, dims, self.rule, true, moved, sliced)?;
+                let waves = (self.slices.as_ref())
+                    .map(|_| Slices::waves(stream, &shared.cut, dims))
+                    .transpose()?;
+                Ok::<_, EngineError>((shared, waves))
+            })
             .transpose()?;
-        let nf_max = shared.as_ref().unwrap_or(&self.shared).cut.table.nf_max();
+        let nf_max = shared
+            .as_ref()
+            .map_or(&self.shared, |s| &s.0)
+            .cut
+            .table
+            .nf_max();
         let scale = scale
             .map(|v| {
                 Ok::<_, EngineError>(ScaleBufs {
@@ -1298,8 +1449,11 @@ impl Device {
             background,
             position,
         };
-        if let Some(shared) = shared {
+        if let Some((shared, waves)) = shared {
             self.shared = shared;
+            if let Some((s, waves)) = self.slices.as_mut().zip(waves) {
+                s.waves = waves;
+            }
             self.carried = None;
         }
         self.capture_llk()?;
@@ -1353,6 +1507,24 @@ impl Device {
         &self.probe
     }
 
+    /// A multislice object's slices past [`Self::obj`]; empty of one slice.
+    pub fn deeper(&self) -> &[DeviceBuffer<C32>] {
+        self.slices.as_ref().map_or(&[], |s| &s.deeper)
+    }
+
+    /// Fails on a multislice object for `what`, which models one slice: every pass but
+    /// LSQML's and the LLK pass is enqueued behind this.
+    fn one_slice(&self, what: &str) -> Result<(), EngineError> {
+        match &self.slices {
+            None => Ok(()),
+            Some(s) => Err(EngineError::Invalid(format!(
+                "{what} runs one object slice, got {}: only LSQML and the LLK pass run a \
+                 multislice object",
+                s.deeper.len() + 1
+            ))),
+        }
+    }
+
     /// Overwrites the object in place, so every captured graph reads the new values.
     pub fn write_object(&mut self, obj: &[C32]) -> Result<(), EngineError> {
         Ok(self.obj.copy_from_host(&self.stream, obj)?)
@@ -1360,6 +1532,7 @@ impl Device {
 
     /// Overwrites the object and probe in place.
     pub fn write_arrays(&mut self, obj: &[C32], probe: &[C32]) -> Result<(), EngineError> {
+        self.one_slice("the phase ramp's removal")?;
         self.write_object(obj)?;
         self.probe.copy_from_host(&self.stream, probe)?;
         Ok(())
@@ -1383,6 +1556,14 @@ impl Device {
             counts: &self.counts,
             obj: &mut self.obj,
             probe: &mut self.probe,
+            slices: self.slices.as_mut().map(|s| SlicesMut {
+                deeper: &mut s.deeper,
+                gaps: &s.gaps,
+                ones: &s.ones,
+                quad: s.quad,
+                position: &s.position,
+                waves: &mut s.waves,
+            }),
             obj_sums: &mut self.obj_sums,
             probe_sums: &mut self.probe_sums,
             obj_len: self.obj_len,
@@ -1573,14 +1754,13 @@ impl Device {
     }
 
     /// Fails under a propagator with a plane stage for the passes that run none: the LLK
-    /// pass, LSQML's, BH's and rPIE's do, AP's, DM's and RAAR's at fixed positions only, and
-    /// every other is enqueued behind this.
+    /// pass, LSQML's, BH's, rPIE's and ML's do, AP's, DM's and RAAR's at fixed positions
+    /// only, and every other is enqueued behind this.
     fn stageless(&self, algorithm: Algorithm) -> Result<(), EngineError> {
         let moved = self.features.position.is_some();
         match (&self.exit, algorithm) {
-            (ExitStage::None, _) | (_, Algorithm::Lsqml | Algorithm::Bh | Algorithm::Rpie) => {
-                Ok(())
-            }
+            (ExitStage::None, _)
+            | (_, Algorithm::Lsqml | Algorithm::Bh | Algorithm::Rpie | Algorithm::Ml) => Ok(()),
             (_, Algorithm::Ap | Algorithm::Dm | Algorithm::Raar) if !moved => Ok(()),
             _ => Err(EngineError::Invalid(format!(
                 "{algorithm:?}{} runs no propagator with a plane stage: angular spectrum, or a \
@@ -1593,6 +1773,9 @@ impl Device {
     /// The buffers of `epoch`'s cycle, and with graphs its graph, captured from them.
     fn new_run(&mut self, epoch: Epoch) -> Result<EpochRun, EngineError> {
         self.stageless(epoch.algorithm())?;
+        if !matches!(epoch, Epoch::Lsqml { .. }) {
+            self.one_slice(&format!("{:?}", epoch.algorithm()))?;
+        }
         let mut cycle = match epoch {
             Epoch::Ap { params, llk } => Cycle::Ap { params, llk },
             Epoch::Dm { params, first } => {
@@ -1701,6 +1884,7 @@ impl Device {
                 size,
                 self.rule,
                 moved.then(|| self.shared.cut.table.nf_max()),
+                self.deeper().len(),
             )?;
             self.lsqml = Some(Box::new(state));
         }
@@ -1709,7 +1893,7 @@ impl Device {
 
     /// [`Bufs::scale_to_photons`] enqueued eagerly, with `total` the unmasked observed photons.
     pub fn scale_to_photons(&mut self, total: f32) -> Result<(), EngineError> {
-        self.stageless(Algorithm::Ml)?;
+        self.one_slice("ML's scaling")?;
         self.build_ml()?;
         let ctx = self.context();
         let (mut bufs, mut passes, _) = self.lend();
@@ -1719,6 +1903,7 @@ impl Device {
     /// PyNX `ScaleObjProbe(absolute=False)` enqueued eagerly: `Σ|O|` and `Σ|P|` balanced,
     /// `O P` unchanged.
     pub fn balance_obj_probe(&mut self) -> Result<(), EngineError> {
+        self.one_slice("the object and probe balance")?;
         let ctx = self.context();
         let (mut bufs, _, _) = self.lend();
         Ok(bufs.scale_obj_probe(&ctx, None)?)
@@ -1727,7 +1912,7 @@ impl Device {
     /// The ML gradients of the current estimate, object then probe, as
     /// [`Bufs::ml_grad`] leaves them in the update sums; downloads them and zeroes the sums.
     pub fn ml_grads(&mut self) -> Result<[Vec<C32>; 2], EngineError> {
-        self.stageless(Algorithm::Ml)?;
+        self.one_slice("ML's gradient")?;
         {
             let ctx = self.context();
             let (mut bufs, mut passes, _) = self.lend();

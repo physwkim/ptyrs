@@ -63,6 +63,15 @@ impl Layout {
         (0..self.nobj).map(move |z| (z * nyo + rows.start) * nxo..(z * nyo + rows.end) * nxo)
     }
 
+    /// How many of the pixels `xs` of row `y` lie on tiles with a slab.
+    fn binned(&self, y: usize, xs: &Range<usize>) -> usize {
+        let t = OBJ_TILE as usize;
+        (xs.start / t..=(xs.end - 1) / t)
+            .filter(|&tx| !self.slab([y / t, tx]).is_empty())
+            .map(|tx| xs.end.min((tx + 1) * t) - xs.start.max(tx * t))
+            .sum()
+    }
+
     /// The bytes of tile `[ty, tx]`'s slab in `tile_views`, empty for a tile
     /// without one.
     fn slab(&self, [ty, tx]: [usize; 2]) -> Range<usize> {
@@ -377,9 +386,12 @@ impl LiveObject {
     /// first epoch. `origin` is the object pixel `[y, x]` of this object's
     /// pixel `(0, 0)`, `[0, 0]` unless the object is a window of a larger
     /// one; what `fill` holds outside the window is another object's.
-    /// Rows not ready are skipped, never backed, and the pixels skipped
-    /// are returned: they start flat when they are readied. The object has
-    /// one mode: who builds a run with a predictor refuses any other.
+    /// Rows not ready are skipped, never backed, and start flat when they
+    /// are readied; returned are the skipped pixels on the tiles this
+    /// object bins, so over the windows of a split object each skipped
+    /// pixel counts once, at its owner. The object has one mode:
+    /// [`LiveScan::fill`](crate::live::scan::LiveScan::fill) refuses any
+    /// other.
     ///
     /// The object keeps `fill` until an event behind its copies passed, so
     /// its buffer cannot be reused under a pending copy, whatever this
@@ -422,7 +434,7 @@ impl LiveObject {
     }
 
     /// Queues the copies of the newest held fill; returns the pixels on
-    /// rows not ready.
+    /// rows not ready of tiles with a slab.
     fn queue_fill(&mut self, [oy, ox]: [usize; 2]) -> Result<usize, GrowError> {
         let fill = &self.held.back().expect("write_fill holds one").fill;
         let [nyo, nxo] = self.layout.shape;
@@ -446,7 +458,7 @@ impl LiveObject {
             let mut y = ys.start;
             while y < ys.end {
                 if !ready(y) {
-                    skipped += xs.len();
+                    skipped += self.layout.binned(y, &xs);
                     y += 1;
                     continue;
                 }
@@ -732,6 +744,12 @@ mod tests {
         let fill = pf.stitch(&[[2000, 0]], &vec![v; 64]).unwrap();
         assert_eq!(o.write_fill(fill, [100, 1020]).unwrap(), 0);
         assert_eq!(o.fill_copies(), 2);
+        // An object binning tile column 1 only: of 8 pixels a row over
+        // columns 12..20 not ready, the 4 on its tile count.
+        let own: Vec<u32> = (0..64).map(|ty| ty * 64 + 1).collect();
+        let mut part = LiveObject::owned(&s, 1, [n, n], 4, flat, 1, &own).unwrap();
+        let fill = pf.stitch(&[[600, 12]], &vec![v; 64]).unwrap();
+        assert_eq!(part.write_fill(fill, [0, 0]).unwrap(), 8 * 4);
         let mut snap = Snapshot::new(&o).unwrap();
         o.snapshot(&mut snap).unwrap();
         let px = snap.wait().unwrap();

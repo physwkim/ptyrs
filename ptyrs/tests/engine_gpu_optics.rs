@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use cuda_core::CudaContext;
 use ptyrs::base::{Geometry, Scan};
-use ptyrs::engine::{GpuOptions, GpuPtycho};
+use ptyrs::engine::{ApParams, GpuOptions, GpuPtycho};
 
 use ptyrs::base::{AddrTable, C64, Counts, Object, Probe, Stack, required_obj_shape};
 use ptyrs::engine::{
@@ -436,7 +436,7 @@ fn gpu_refuses_optics_and_passes_it_cannot_run() {
     let e = refused(&free([0.4 * WAVELENGTH; 2], 1e-9), OPTIONS);
     assert!(e.contains("evanescent band"), "{e}");
     let e = refused(&slices.optics, OPTIONS);
-    assert!(e.contains("one object slice"), "{e}");
+    assert!(e.contains("1 object slices for optics of 3"), "{e}");
     let m1 = GpuOptions {
         fused: false,
         ..OPTIONS
@@ -454,12 +454,16 @@ fn gpu_refuses_optics_and_passes_it_cannot_run() {
 
     let mut gpu = c.gpu(&c.optics, OPTIONS).unwrap();
     let before = gpu.object().unwrap();
-    let e = gpu.ml(&Default::default(), 1).unwrap_err().to_string();
+    let moved = Features {
+        position: Some(vec![[0.0; 2]; c.addr.nframe()]),
+        ..Features::default()
+    };
+    gpu.set_features(&moved).unwrap();
+    let e = gpu.ap(&ApParams::default(), 1).unwrap_err().to_string();
     assert!(
-        e.contains("Ml runs no propagator with a plane stage"),
+        e.contains("Ap with a position runs no propagator with a plane stage"),
         "{e}"
     );
-    assert!(gpu.ml_grads().is_err());
     assert_eq!(gpu.object().unwrap().as_slice(), before.as_slice());
     assert!(gpu.history().is_empty());
 }
