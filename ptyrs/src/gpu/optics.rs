@@ -6,18 +6,25 @@
 //! turns them into the row transforms of the staged waves before the column pass, and after
 //! it, as the adjoint, the correction's back; the far field and a forward Fresnel transform
 //! have no stage and launch nothing.
+//!
+//! A multislice object's waves never pass the fused row pass, which multiplies one object
+//! by the probe: [`OpticsKernels::slice_mul`] is a slice's product and its adjoint,
+//! [`OpticsKernels::slice_phase`] the exit plane's phase, [`OpticsKernels::rows`] the row
+//! transform the column pass takes and gives, and [`OpticsKernels::slice_pair`] the object
+//! adjoint's integrand.
 
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{DeviceBuffer, LaunchConfig};
 use ptyrs_kernels::optics::{
-    STAGE_COLS, STAGE_CONJ, STAGE_MUL, STAGE_POST_FWD, STAGE_POST_INV, STAGE_PRE_FWD,
-    STAGE_PRE_INV, optics_kernels,
+    SLICE_CONJ, SLICE_MOVED, STAGE_COLS, STAGE_CONJ, STAGE_MUL, STAGE_POST_FWD, STAGE_POST_INV,
+    STAGE_PRE_FWD, STAGE_PRE_INV, optics_kernels,
 };
 
 use crate::gpu::fused::Side;
 use crate::gpu::ops::grid_1d;
 use crate::gpu::{
-    C32, Error, Kernels, StackCtl, StackGeom, StackRef, ViewDims, block_fft, check_len, dptr,
+    C32, Error, Kernels, StackCtl, StackGeom, StackRef, ViewAddr, ViewDims, Views, block_fft,
+    check_len, dptr,
 };
 
 /// What a propagator applies to the exit-wave plane ahead of the fused transform `F`, the
@@ -30,6 +37,28 @@ pub enum ExitStage {
     /// `V = F⁻¹ F⁻¹ T F`, angular spectrum of the transfer function `T`, `[ny, nx]` on the
     /// unshifted frequency grid and even in both frequencies.
     Transfer(DeviceBuffer<C32>),
+}
+
+/// What a slice multiplies: [`OpticsKernels::slice_mul`]'s source.
+#[derive(Clone, Copy)]
+pub enum SliceSource<'a> {
+    /// The probe, `[nprobe, ny, nx]` in the natural layout; each view reads its mode.
+    Probe(&'a DeviceBuffer<C32>),
+    /// The stack's waves, `[nf_max * nmode, ny, nx]` at the exit wave's stored pixels.
+    Waves(&'a DeviceBuffer<C32>),
+}
+
+/// The exit plane's phase of a multislice object's last slice: `exp(i quad |r|²)`, `r` the
+/// pixel from the frame's centre.
+#[derive(Clone, Copy)]
+pub struct SlicePhase<'a> {
+    /// Radians per squared pixel.
+    pub quad: f32,
+    /// Each frame's probe move `(dy, dx)` in pixels, `[nframe, 2]` by epoch position: the
+    /// phase is then displaced with the probe, times `exp(-2i quad r·d)`. The frame's
+    /// constant `exp(i quad |d|²)` is left out; no intensity sees it and the conjugate takes
+    /// back what was applied.
+    pub offsets: Option<&'a DeviceBuffer<f32>>,
 }
 
 /// An [`ExitStage`] lent to a pass with the kernels that run it.
@@ -133,6 +162,171 @@ impl OpticsKernels {
         self.stage(ctx, &l, stack, waves, None, STAGE_PRE_FWD)?;
         self.stage(ctx, &l, stack, waves, Some((tf, 1.0 / d.n() as f32)), flags)?;
         self.stage(ctx, &l, stack, waves, None, STAGE_PRE_INV)
+    }
+
+    /// The unnormalized row transforms of `stack`'s planes of `waves`, `[nf_max * nmode, ny,
+    /// nx]`, in place: forward what the fused row pass leaves of its product, with `inverse`
+    /// what it makes of the column pass's back.
+    pub fn rows(
+        &self,
+        ctx: &ExecutionContext,
+        d: &ViewDims,
+        stack: StackRef<'_>,
+        waves: &mut DeviceBuffer<C32>,
+        inverse: bool,
+    ) -> Result<(), Error> {
+        let l = Launch::new(d, stack, waves)?;
+        let flags = if inverse {
+            STAGE_PRE_INV
+        } else {
+            STAGE_PRE_FWD
+        };
+        self.stage(ctx, &l, stack, waves, None, flags)
+    }
+
+    /// A slice's product over `stack`'s views into `dst`, `[nf_max * nmode, ny, nx]` at the
+    /// exit wave's stored pixels: each view's bilinear window of `obj` times `src`.
+    pub fn slice_mul(
+        &self,
+        ctx: &ExecutionContext,
+        views: &Views,
+        stack: StackRef<'_>,
+        obj: &DeviceBuffer<C32>,
+        src: SliceSource<'_>,
+        dst: &mut DeviceBuffer<C32>,
+    ) -> Result<(), Error> {
+        self.slice(ctx, views, stack, obj, (src, 0), dst)
+    }
+
+    /// The adjoint of [`Self::slice_mul`] over waves: each view's window of `obj`,
+    /// conjugated, times `waves` into `dst`, both `[nf_max * nmode, ny, nx]`.
+    pub fn slice_adjoint(
+        &self,
+        ctx: &ExecutionContext,
+        views: &Views,
+        stack: StackRef<'_>,
+        obj: &DeviceBuffer<C32>,
+        waves: &DeviceBuffer<C32>,
+        dst: &mut DeviceBuffer<C32>,
+    ) -> Result<(), Error> {
+        let src = (SliceSource::Waves(waves), SLICE_CONJ);
+        self.slice(ctx, views, stack, obj, src, dst)
+    }
+
+    fn slice(
+        &self,
+        ctx: &ExecutionContext,
+        views: &Views,
+        stack: StackRef<'_>,
+        obj: &DeviceBuffer<C32>,
+        (src, conj): (SliceSource<'_>, u32),
+        dst: &mut DeviceBuffer<C32>,
+    ) -> Result<(), Error> {
+        let d = views.dims();
+        let g = d.geom(stack)?;
+        let len = g.nf_max as usize * d.nmode as usize * d.n();
+        check_len("obj", obj, d.obj_len())?;
+        check_len("dst", dst, len)?;
+        let (src, moved) = match src {
+            SliceSource::Probe(p) => {
+                check_len("probe", p, d.nprobe as usize * d.n())?;
+                (p, SLICE_MOVED)
+            }
+            SliceSource::Waves(w) => {
+                check_len("waves", w, len)?;
+                (w, 0)
+            }
+        };
+        let flags = moved | conj;
+        let config = grid_1d(len)?;
+        let reads = [
+            src.storage(),
+            obj.storage(),
+            views.addr().storage(),
+            stack.storage(),
+        ];
+        let (m, ctl) = (&self.module, stack.ctl() as *const StackCtl);
+        self.base.launch(ctx, &reads, &[dst.storage()], |stream| {
+            // SAFETY: the lengths checked above; `Views` checked each window.
+            unsafe {
+                m.optics_slice_mul(
+                    stream,
+                    config,
+                    dptr(dst),
+                    dptr::<C32, f32>(src).cast_const(),
+                    dptr::<C32, f32>(obj).cast_const(),
+                    dptr::<ViewAddr, ViewAddr>(views.addr()).cast_const(),
+                    ctl,
+                    g,
+                    flags,
+                )
+            }
+        })
+    }
+
+    /// `phase` on `stack`'s planes of `waves`, `[nf_max * nmode, ny, nx]` at the exit wave's
+    /// stored pixels, in place; with `adjoint` its conjugate.
+    pub fn slice_phase(
+        &self,
+        ctx: &ExecutionContext,
+        d: &ViewDims,
+        stack: StackRef<'_>,
+        phase: SlicePhase<'_>,
+        waves: &mut DeviceBuffer<C32>,
+        adjoint: bool,
+    ) -> Result<(), Error> {
+        let g = d.geom(stack)?;
+        let len = g.nf_max as usize * d.nmode as usize * d.n();
+        check_len("waves", waves, len)?;
+        let mut reads = vec![stack.storage()];
+        let (at, moved) = match phase.offsets {
+            Some(o) => {
+                check_len("offsets", o, 2 * d.nframe as usize)?;
+                reads.push(o.storage());
+                (dptr::<f32, f32>(o).cast_const(), SLICE_MOVED)
+            }
+            None => (std::ptr::null(), 0),
+        };
+        let flags = moved | if adjoint { SLICE_CONJ } else { 0 };
+        let config = grid_1d(len)?;
+        let (m, ctl, quad) = (&self.module, stack.ctl() as *const StackCtl, phase.quad);
+        self.base.launch(ctx, &reads, &[waves.storage()], |stream| {
+            // SAFETY: the lengths checked above.
+            unsafe { m.optics_slice_phase(stream, config, dptr(waves), at, ctl, g, quad, flags) }
+        })
+    }
+
+    /// `dst = conj(a) b` over `stack`'s planes, all `[nf_max * nmode, ny, nx]`.
+    pub fn slice_pair(
+        &self,
+        ctx: &ExecutionContext,
+        d: &ViewDims,
+        stack: StackRef<'_>,
+        [a, b]: [&DeviceBuffer<C32>; 2],
+        dst: &mut DeviceBuffer<C32>,
+    ) -> Result<(), Error> {
+        let g = d.geom(stack)?;
+        let len = g.nf_max as usize * d.nmode as usize * d.n();
+        for (what, buf) in [("a", a), ("b", b), ("dst", &*dst)] {
+            check_len(what, buf, len)?;
+        }
+        let config = grid_1d(len)?;
+        let reads = [a.storage(), b.storage(), stack.storage()];
+        let (m, ctl) = (&self.module, stack.ctl() as *const StackCtl);
+        self.base.launch(ctx, &reads, &[dst.storage()], |stream| {
+            // SAFETY: the lengths checked above.
+            unsafe {
+                m.optics_slice_pair(
+                    stream,
+                    config,
+                    dptr(dst),
+                    dptr::<C32, f32>(a).cast_const(),
+                    dptr::<C32, f32>(b).cast_const(),
+                    ctl,
+                    g,
+                )
+            }
+        })
     }
 
     /// One line pass of `flags` over `buf`, multiplying by `mul`'s plane times its scale.
