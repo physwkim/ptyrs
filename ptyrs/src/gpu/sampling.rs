@@ -188,6 +188,24 @@ impl ObjectSampler {
         self.nslice
     }
 
+    /// The bytes [`Self::windows`] holds across a chunk's shift, transform and crop whatever
+    /// the stack's frames: the scratch, and the one slice of spectra every chunk's shift reads.
+    pub fn windows_held(&self) -> usize {
+        self.scratch_bytes() + self.dims.obj_len() * size_of::<C32>()
+    }
+
+    /// The bytes of the scratch, `chunk` object planes, which [`Self::place`] holds across a
+    /// chunk's embed, transform and accumulate.
+    pub fn scratch_bytes(&self) -> usize {
+        self.scratch.len() * size_of::<C32>()
+    }
+
+    /// The bytes of the accumulator, `nobj` object planes, which [`Self::place`] holds from
+    /// zeroing it through every chunk's accumulate to adding it onto the object.
+    pub fn acc_bytes(&self) -> usize {
+        self.acc.len() * size_of::<C32>()
+    }
+
     /// The unnormalized spectra `DFT(obj)` of the object planes, `[nslice, nobj, nyo, nxo]`,
     /// which [`Self::windows`] reads.
     pub fn spectra(

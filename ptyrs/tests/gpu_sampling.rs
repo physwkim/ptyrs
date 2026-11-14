@@ -519,6 +519,15 @@ fn illumination_matches_the_cpu_map() {
     }
 }
 
+#[test]
+fn held_bytes_are_whole_object_planes() {
+    let (g, sampler) = Gpu::new(SIDES[1]);
+    let plane = g.plane() * size_of::<C32>();
+    assert_eq!(sampler.scratch_bytes(), CHUNK as usize * plane);
+    assert_eq!(sampler.acc_bytes(), NOBJ * plane);
+    assert_eq!(sampler.windows_held(), (CHUNK as usize + NOBJ) * plane);
+}
+
 /// The object passes on [`window_views`] over each stack's windows, cut from the object at
 /// whole-pixel views in the sampler's layout, against the same passes on the scan's views:
 /// the forward pass, the object sums placed back by the host and the probe sums. Frames of
