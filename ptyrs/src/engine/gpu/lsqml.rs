@@ -919,7 +919,7 @@ impl<'a> Bufs<'a> {
                 "LSQML state built for another slice count".into(),
             ));
         };
-        let last = sl.deeper.len();
+        let last = self.deeper.len();
         let share = (last + 1) as f32;
         // The last slice's plane phase, which moves with the probe.
         let quad = sl.quad;
@@ -946,7 +946,7 @@ impl<'a> Bufs<'a> {
                 let (src, rest) = inc[i - 1..].split_first_mut().expect("i <= last");
                 let dst = rest.first_mut().unwrap_or(&mut *work);
                 let src = SliceSource::Waves(FrameWaves::Views(src));
-                ok.slice_mul(ctx, views, stack, &sl.deeper[i - 1], src, dst)?;
+                ok.slice_mul(ctx, views, stack, &self.deeper[i - 1], src, dst)?;
             }
             if let Some(p) = slice_phase(quad, offsets) {
                 ok.slice_phase(ctx, d, stack, p, work, false)?;
@@ -981,14 +981,14 @@ impl<'a> Bufs<'a> {
             for i in (0..last).rev() {
                 let (dst, rest) = chi[i..].split_first_mut().expect("i < last");
                 let src = rest.first().unwrap_or(&*work);
-                ok.slice_adjoint(ctx, views, stack, &sl.deeper[i], src, dst)?;
+                ok.slice_adjoint(ctx, views, stack, &self.deeper[i], src, dst)?;
                 ok.gap(ctx, d, stack, &sl.gaps[i], dst, true)?;
             }
             if let Some(m) = &mut moved {
                 let c = chi.get(pivot).unwrap_or(&*work);
                 let at = (c, FrameWaves::Views(&w.incident[k][pivot - 1]));
                 m.kernels
-                    .sums(ctx, views, stack, &sl.deeper[pivot - 1], at, m.pos)?;
+                    .sums(ctx, views, stack, &self.deeper[pivot - 1], at, m.pos)?;
             }
         }
         for i in (1..=last).rev() {
@@ -1002,7 +1002,7 @@ impl<'a> Bufs<'a> {
             lk.dir_obj(ctx, l.scan, self.obj_sums)?;
             for (k, s) in batch.clone().enumerate() {
                 let at = LsqmlAt {
-                    x: [&sl.deeper[i - 1], &*self.probe],
+                    x: [&self.deeper[i - 1], &*self.probe],
                     d: [&self.obj_sums.num, &self.probe_sums.num],
                 };
                 let c = LsqmlChi::Moved {
@@ -1020,7 +1020,7 @@ impl<'a> Bufs<'a> {
                 steps,
             )?;
             let obj = LsqmlVar {
-                x: &mut sl.deeper[i - 1],
+                x: &mut self.deeper[i - 1],
                 sums: &mut *self.obj_sums,
             };
             lk.update_alone(ctx, l.scan, obj, steps)?;
@@ -1118,7 +1118,7 @@ impl<'a> Bufs<'a> {
                 "LSQML state built for another slice count".into(),
             ));
         };
-        let last = sl.deeper.len();
+        let last = self.deeper.len();
         let share = (last + 1) as f32;
         let quad = sl.quad;
         let pivot = last.div_ceil(2);
@@ -1126,7 +1126,7 @@ impl<'a> Bufs<'a> {
         for i in (0..=last).filter(|&i| i != pivot).chain([pivot]) {
             let obj = match i {
                 0 => &*self.obj,
-                i => &sl.deeper[i - 1],
+                i => &self.deeper[i - 1],
             };
             let at = batch.clone().map(|s| points(views, table.at(s), &*p.pos));
             w.sample(ctx, at, obj, i)?;
@@ -1217,7 +1217,7 @@ impl<'a> Bufs<'a> {
                 steps,
             )?;
             let obj = LsqmlVar {
-                x: &mut sl.deeper[i - 1],
+                x: &mut self.deeper[i - 1],
                 sums: &mut *self.obj_sums,
             };
             lk.update_alone(ctx, l.scan, obj, steps)?;

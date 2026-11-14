@@ -44,7 +44,7 @@ use crate::gpu::{
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 
-use device::{Bufs, Device, NormBufs, PassesMut, SliceUploads, Uploads};
+use device::{Bufs, Device, NormBufs, PassesMut, SliceUploads, Sliced, Uploads};
 
 use crate::engine::ptycho::{Algorithm, LlkRecord, zero_phase_ramp};
 use crate::engine::{
@@ -805,7 +805,7 @@ impl Bufs<'_> {
                                 probe: self.probe,
                                 model: Model::default(),
                             };
-                            sl.exit_waves(ctx, k, optics, &inputs, stack)?
+                            sl.exit_waves(ctx, k, optics, &inputs, self.deeper, stack)?
                         }
                     };
                     let plan = self.scratch.frames[s].plan;
@@ -815,22 +815,26 @@ impl Bufs<'_> {
                 }
             }
             PassesMut::Fused(f) => {
-                let mut m = self.features.lend(
+                let whole = Sliced {
+                    first: self.obj,
+                    deeper: self.deeper,
+                };
+                let mut m = (self.features).lend(
                     ctx,
                     self.kernels,
                     &dims,
-                    self.obj,
+                    &whole,
                     self.probe,
                     self.exit,
                 )?;
                 for s in 0..self.scratch.len() {
                     let stack = self.scratch.at(s);
                     let windows = self.windows.as_deref_mut();
-                    let (views, obj) = m.object(ctx, (self.views, self.obj), stack, windows)?;
+                    let (views, obj) = m.slices(ctx, (self.views, whole), stack, windows)?;
                     let inputs = FusedInputs {
                         views,
                         counts: self.counts,
-                        obj,
+                        obj: obj.first,
                         probe: self.probe,
                         model: m.model,
                     };
@@ -842,7 +846,8 @@ impl Bufs<'_> {
                         None => self.kernels.fused_llk(ctx, &inputs, stack, f, far)?,
                         Some(sl) => {
                             let (k, exit) = (self.kernels, self.exit);
-                            let rows = sl.exit_waves(ctx, k, exit.kernels, &inputs, stack)?;
+                            let rows =
+                                sl.exit_waves(ctx, k, exit.kernels, &inputs, obj.deeper, stack)?;
                             exit.kernels.rows(ctx, &dims, stack, rows, false)?;
                             (exit.kernels).exit(ctx, &dims, stack, exit.stage, rows, false)?;
                             k.rows_llk(ctx, &inputs, stack, rows, f, far)?;

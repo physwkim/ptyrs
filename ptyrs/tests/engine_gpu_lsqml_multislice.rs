@@ -1,7 +1,8 @@
 //! GPU LSQML through a multislice object against the CPU's `f64` [`Lsqml`] from the same
 //! start: two and three slices under each of the far field, the angular spectrum and the
-//! Fresnel transform forward and back, without and with a modelled position, for both costs;
-//! and the LLK pass through the slices against the CPU's LLK of the same arrays.
+//! Fresnel transform forward and back, without and with a modelled position, which moves the
+//! probe or samples the object, for both costs; and the LLK pass through the slices against
+//! the CPU's LLK of the same arrays.
 //! Frames are on the fused passes' smallest side, two incoherent probe modes, 30 Fermat
 //! positions in stacks of at most 8, so a batch of 12 ends in a stack of 4; 300 positions in
 //! stacks the device sizes take the waves a position recuts.
@@ -237,6 +238,29 @@ impl Case {
         self.optics.exit().forward(&mut psi);
         llk(&self.obs, 0..nframe, nmode, &psi).normalised(self.obs.nb_obs())
     }
+
+    /// The CPU's normalised LLK of `objects` and `probe` under [`Sampling::FullObject`]: every
+    /// slice read at each view's corner plus its frame's entry of `offsets`.
+    fn full_object_llk(&self, objects: &[Object], probe: &Probe, offsets: &[[f64; 2]]) -> Llk {
+        let (views, sampling) = (self.addr.views(), Sampling::FullObject);
+        let waves =
+            SliceWaves::with_sampling(&self.optics, views, objects, probe, Some(offsets), sampling);
+        let mut psi = waves.psi().to_vec();
+        self.optics.exit().forward(&mut psi);
+        let (nframe, nmode) = (self.addr.nframe(), self.addr.nmode());
+        llk(&self.obs, 0..nframe, nmode, &psi).normalised(self.obs.nb_obs())
+    }
+
+    /// Whether some view of `offsets` reads past the object's edge.
+    fn past_edge(&self, offsets: &[[f64; 2]]) -> bool {
+        let [_, ny, nx] = self.objects[0].dims();
+        let last = [(ny - FRAME) as f64, (nx - FRAME) as f64];
+        self.addr.views().iter().any(|v| {
+            let d = offsets[v.frame as usize];
+            let at = [v.oy as f64 + d[0], v.ox as f64 + d[1]];
+            at.iter().zip(last).any(|(&a, l)| a < 0.0 || a > l)
+        })
+    }
 }
 
 /// The worst of the four LLK values' relative errors.
@@ -333,15 +357,19 @@ fn offsets_rel(a: &Features, b: &Features, start: &Features) -> f64 {
 
 /// After [`NEPOCH`] epochs (the preconditioner built, then updated) in batches of 12, the
 /// last epoch's steps, every slice, the probe and the offsets' changes are the CPU's, for
-/// `propagator` after each of `nslices` slices of `nobj` modes, without and with a position,
-/// for both costs.
-fn matches_cpu(propagator: &str, nslices: &[usize], nobj: usize) {
+/// `propagator` after each of `nslices` slices of `nobj` modes, for both costs: without and
+/// with a position entered as [`Sampling::Patch`], or with one entered as `sampling`.
+fn matches_cpu(propagator: &str, nslices: &[usize], nobj: usize, sampling: Sampling) {
     const NEPOCH: usize = 2;
+    // Without a position the sampling changes nothing.
+    let positions: &[bool] = match sampling {
+        Sampling::Patch => &[false, true],
+        Sampling::FullObject => &[true],
+    };
     for &nslice in nslices {
         let c = case(optics(propagator, nslice), NPOS, nobj);
-        for (position, cost) in [false, true]
-            .into_iter()
-            .flat_map(|p| [Cost::Amplitude, Cost::Poisson].map(move |c| (p, c)))
+        for (position, cost) in
+            (positions.iter()).flat_map(|&p| [Cost::Amplitude, Cost::Poisson].map(move |c| (p, c)))
         {
             let params = LsqmlParams {
                 batch_size: 12,
@@ -354,7 +382,8 @@ fn matches_cpu(propagator: &str, nslices: &[usize], nobj: usize) {
             let mut cpu = Lsqml::new(params)
                 .unwrap()
                 .with_features(features.clone())
-                .unwrap();
+                .unwrap()
+                .with_sampling(sampling);
             let mut want = Vec::new();
             for _ in 0..NEPOCH {
                 want = cpu.epoch(
@@ -368,6 +397,7 @@ fn matches_cpu(propagator: &str, nslices: &[usize], nobj: usize) {
             }
             let mut gpu = c.gpu(OPTIONS);
             gpu.set_features(&features).unwrap();
+            gpu.set_sampling(sampling).unwrap();
             gpu.lsqml(&params, NEPOCH, 0).unwrap();
             let got = gpu.objects().unwrap();
             assert_eq!(got.len(), nslice);
@@ -381,15 +411,18 @@ fn matches_cpu(propagator: &str, nslices: &[usize], nobj: usize) {
                 rel_l2(&gpu.probe().unwrap(), &probe),
                 offsets_rel(&gpu.features().unwrap(), cpu.features(), &features),
             ];
-            let what =
-                format!("{propagator} {nslice} slices {nobj} modes {cost:?} position {position}");
+            let what = format!(
+                "{propagator} {nslice} slices {nobj} modes {cost:?} position {position} \
+                 {sampling:?}"
+            );
             eprintln!(
                 "{what}: a_far {:.2e} a_probe {:.2e} a_obj {:.2e} objects {:.2e} probe {:.2e} \
                  offsets {:.2e}",
                 errs[0], errs[1], errs[2], errs[3], errs[4], errs[5]
             );
-            // Each bound is 5 times the worst of the 32 runs or more: `a_far` 2.8e-5 and the
-            // offsets 1.9e-5 under the Fresnel transform back, three slices, Poisson, a position.
+            // Each bound is 5 times the worst of the 72 runs or more: `a_far` 2.8e-5 and the
+            // offsets 1.9e-5 under the Fresnel transform back, three slices, Poisson, a position
+            // that moves the probe; of one that samples the object, `a_far` 1.2e-5 there.
             let bounds = [
                 ("a_far", 2e-4),
                 ("a_probe", 5e-5),
@@ -407,43 +440,59 @@ fn matches_cpu(propagator: &str, nslices: &[usize], nobj: usize) {
 
 #[test]
 fn sliced_lsqml_matches_cpu_in_the_far_field() {
-    matches_cpu(PROPAGATORS[0], &[2, 3], 1);
+    matches_cpu(PROPAGATORS[0], &[2, 3], 1, Sampling::Patch);
 }
 
 #[test]
 fn sliced_lsqml_matches_cpu_under_angular_spectrum() {
-    matches_cpu(PROPAGATORS[1], &[2, 3], 1);
+    matches_cpu(PROPAGATORS[1], &[2, 3], 1, Sampling::Patch);
 }
 
 #[test]
 fn sliced_lsqml_matches_cpu_under_fresnel() {
-    matches_cpu(PROPAGATORS[2], &[2, 3], 1);
+    matches_cpu(PROPAGATORS[2], &[2, 3], 1, Sampling::Patch);
 }
 
 #[test]
 fn sliced_lsqml_matches_cpu_under_fresnel_back() {
-    matches_cpu(PROPAGATORS[3], &[2, 3], 1);
+    matches_cpu(PROPAGATORS[3], &[2, 3], 1, Sampling::Patch);
 }
 
 /// Two object modes through three slices, each view's wave its own through every slice.
 #[test]
 fn sliced_lsqml_with_object_modes_matches_cpu_in_the_far_field() {
-    matches_cpu(PROPAGATORS[0], &[3], 2);
+    matches_cpu(PROPAGATORS[0], &[3], 2, Sampling::Patch);
 }
 
 #[test]
 fn sliced_lsqml_with_object_modes_matches_cpu_under_angular_spectrum() {
-    matches_cpu(PROPAGATORS[1], &[3], 2);
+    matches_cpu(PROPAGATORS[1], &[3], 2, Sampling::Patch);
 }
 
 #[test]
 fn sliced_lsqml_with_object_modes_matches_cpu_under_fresnel() {
-    matches_cpu(PROPAGATORS[2], &[3], 2);
+    matches_cpu(PROPAGATORS[2], &[3], 2, Sampling::Patch);
 }
 
 #[test]
 fn sliced_lsqml_with_object_modes_matches_cpu_under_fresnel_back() {
-    matches_cpu(PROPAGATORS[3], &[3], 2);
+    matches_cpu(PROPAGATORS[3], &[3], 2, Sampling::Patch);
+}
+
+/// A position that samples the object: every slice's windows, under each propagator.
+#[test]
+fn sliced_full_object_lsqml_matches_cpu() {
+    for propagator in PROPAGATORS {
+        matches_cpu(propagator, &[2, 3], 1, Sampling::FullObject);
+    }
+}
+
+/// [`sliced_full_object_lsqml_matches_cpu`] through three slices of two object modes.
+#[test]
+fn sliced_full_object_lsqml_with_object_modes_matches_cpu() {
+    for propagator in PROPAGATORS {
+        matches_cpu(propagator, &[3], 2, Sampling::FullObject);
+    }
 }
 
 /// The LLK pass through two and three slices gives the CPU's LLK of the same arrays under
@@ -451,31 +500,65 @@ fn sliced_lsqml_with_object_modes_matches_cpu_under_fresnel_back() {
 /// left, whose record is the pass's own. Graphs and eager launches leave the same bits.
 #[test]
 fn sliced_llk_matches_cpu() {
-    llk_matches_cpu(&[2, 3], 1);
+    llk_matches_cpu(&[2, 3], 1, Sampling::Patch);
 }
 
 /// [`sliced_llk_matches_cpu`] through three slices of two object modes.
 #[test]
 fn sliced_llk_with_object_modes_matches_cpu() {
-    llk_matches_cpu(&[3], 2);
+    llk_matches_cpu(&[3], 2, Sampling::Patch);
 }
 
-/// [`sliced_llk_matches_cpu`] after each of `nslices` slices of `nobj` modes.
-fn llk_matches_cpu(nslices: &[usize], nobj: usize) {
+/// [`sliced_llk_matches_cpu`] with a position that samples the object: every slice's windows,
+/// at offsets of a fraction of a pixel and at ones that carry views past the object's edge.
+#[test]
+fn sliced_full_object_llk_matches_cpu() {
+    llk_matches_cpu(&[2, 3], 1, Sampling::FullObject);
+}
+
+/// [`sliced_full_object_llk_matches_cpu`] through three slices of two object modes.
+#[test]
+fn sliced_full_object_llk_with_object_modes_matches_cpu() {
+    llk_matches_cpu(&[3], 2, Sampling::FullObject);
+}
+
+/// [`drawn_offsets`] scaled to carry views past the object's edge.
+const PAST_EDGE: f64 = 50.0;
+
+/// [`sliced_llk_matches_cpu`] after each of `nslices` slices of `nobj` modes: without and
+/// with a position entered as [`Sampling::Patch`], or at [`drawn_offsets`] and at
+/// [`PAST_EDGE`] times them entered as `sampling`.
+fn llk_matches_cpu(nslices: &[usize], nobj: usize, sampling: Sampling) {
     let params = LsqmlParams {
         batch_size: 12,
         cost: Cost::Poisson,
         seed: 7,
     };
-    for (propagator, nslice, position) in PROPAGATORS
+    let scales: &[Option<f64>] = match sampling {
+        Sampling::Patch => &[None, Some(1.0)],
+        Sampling::FullObject => &[Some(1.0), Some(PAST_EDGE)],
+    };
+    for (propagator, nslice, scale) in PROPAGATORS
         .into_iter()
-        .flat_map(|p| (nslices.iter()).flat_map(move |&n| [false, true].map(move |m| (p, n, m))))
+        .flat_map(|p| (nslices.iter()).flat_map(move |&n| scales.iter().map(move |&s| (p, n, s))))
     {
         let c = case(optics(propagator, nslice), NPOS, nobj);
-        let features = moved(position);
+        let features = Features {
+            position: scale.map(|s| {
+                (drawn_offsets(NPOS).iter())
+                    .map(|d| d.map(|d| s * d))
+                    .collect()
+            }),
+            ..Features::default()
+        };
+        let cpu = |objects: &[Object], probe: &Probe, offsets: Option<&[[f64; 2]]>| match sampling {
+            Sampling::Patch => c.llk(objects, probe, offsets),
+            Sampling::FullObject => c.full_object_llk(objects, probe, offsets.expect("a position")),
+        };
         let run = |graph| {
             let mut gpu = c.gpu(GpuOptions { graph, ..OPTIONS });
             gpu.set_features(&features).unwrap();
+            gpu.set_sampling(sampling).unwrap();
             let start = gpu.llk().unwrap();
             gpu.lsqml(&params, 2, 1).unwrap();
             let records: Vec<Llk> = gpu.history().iter().map(|r| r.llk).collect();
@@ -483,23 +566,29 @@ fn llk_matches_cpu(nslices: &[usize], nobj: usize) {
             let end = gpu.llk().unwrap();
             let (objects, probe) = (gpu.objects().unwrap(), gpu.probe().unwrap());
             let offsets = gpu.features().unwrap().position;
-            let want = c.llk(&objects, &probe, offsets.as_deref());
+            let want = cpu(&objects, &probe, offsets.as_deref());
             (start, records, end, want)
         };
         let (start, records, end, want) = run(true);
-        let what = format!("{propagator} {nslice} slices {nobj} modes position {position}");
+        let what =
+            format!("{propagator} {nslice} slices {nobj} modes offsets {scale:?} {sampling:?}");
+        if scale == Some(PAST_EDGE) {
+            let offsets = features.position.as_deref().expect("a position");
+            assert!(c.past_edge(offsets), "{what}: no view reads past the edge");
+        }
         assert!(
             llk_bits(&records[1]) == llk_bits(&end),
             "{what}: the epoch's record is not the pass's"
         );
-        let first = c.llk(&c.objects, &c.probe, features.position.as_deref());
+        let first = cpu(&c.objects, &c.probe, features.position.as_deref());
         let errs = [llk_rel(&start, &first), llk_rel(&end, &want)];
         eprintln!(
             "{what}: start {:.2e} end {:.2e}, poisson {:.4e} -> {:.4e}",
             errs[0], errs[1], start.poisson, end.poisson
         );
-        // 5 times the worst of the 16 or more: 4.3e-6 at the start under angular spectrum,
-        // three slices, a position.
+        // 5 times the worst of the 48 or more: 4.3e-6 at the start under angular spectrum,
+        // three slices, a position that moves the probe; 3.5e-6 there of one that samples the
+        // object.
         assert!(worst_of(errs) < 5e-5, "{what}: {errs:?}");
         let eager = run(false);
         let all = |r: &(Llk, Vec<Llk>, Llk, Llk)| {
@@ -695,24 +784,6 @@ fn gpu_refuses_what_it_cannot_run_on_slices() {
     assert!(e.contains(only), "{e}");
     let e = gpu.ml_grads().unwrap_err().to_string();
     assert!(e.contains(only), "{e}");
-    // The LLK pass samples no slice yet, and LSQML takes its records.
-    gpu.set_features(&moved(true)).unwrap();
-    gpu.set_sampling(Sampling::FullObject).unwrap();
-    let offsets = gpu.features().unwrap().position;
-    let params = LsqmlParams {
-        batch_size: 12,
-        cost: Cost::Poisson,
-        seed: 7,
-    };
-    let sampled = "the multislice LLK pass models a position by moving the probe";
-    let e = gpu.lsqml(&params, 1, 0).unwrap_err().to_string();
-    assert!(e.contains(sampled), "{e}");
-    let e = gpu.llk().unwrap_err().to_string();
-    assert!(e.contains(sampled), "{e}");
-    assert!(
-        gpu.features().unwrap().position == offsets,
-        "a refused pass changed the offsets"
-    );
 
     let after: Vec<_> = gpu.objects().unwrap().iter().map(|o| bits(o)).collect();
     assert!(after == before, "a refused pass changed the object");
