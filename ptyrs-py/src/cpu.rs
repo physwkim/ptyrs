@@ -6,13 +6,13 @@ use numpy::{
     PyArray1, PyArray2, PyArray3, PyArray4, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2,
     PyReadonlyArray3, PyReadonlyArray4,
 };
-use ptyrs::base::{AddrTable, C64, Geometry, Object, Positions, Probe, Stack};
+use ptyrs::base::{AddrTable, C64, Geometry, Object, Positions, Probe};
 use ptyrs::engine::{Features, Observed, ProbeVariation, obj_probe_to_psi};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
-use crate::{Error, Scan, history, llk_dict, stack_in, stack_out};
+use crate::{Error, Scan, history, llk_dict, objects_in, objects_out, stack_in, stack_out};
 
 /// The features of `position`'s offsets alone, as LSQML and BH refine.
 fn position_only(position: Option<PyReadonlyArray2<'_, f64>>) -> PyResult<Features> {
@@ -167,14 +167,7 @@ impl Views {
                 want.1
             )));
         }
-        let objects = o.outer_iter().map(|s| {
-            let s = Stack::from_vec([a.nobj(), nyo, nxo], s.iter().copied().collect());
-            Ok(Object::new(s.map_err(Error::from)?))
-        });
-        Ok((
-            objects.collect::<PyResult<_>>()?,
-            Probe::new(stack_in(probe)?),
-        ))
+        Ok((objects_in(object)?, Probe::new(stack_in(probe)?)))
     }
 }
 
@@ -221,14 +214,6 @@ impl Views {
             optics: optics.unbind(),
         })
     }
-}
-
-/// `objects` as `[nslice, nobj, nyo, nxo]`.
-fn objects_out<'py>(py: Python<'py>, objects: Vec<Object>) -> PyResult<Bound<'py, PyArray4<C64>>> {
-    let [nobj, nyo, nxo] = objects[0].dims();
-    let nslice = objects.len();
-    let data = objects.into_iter().flat_map(|o| o.0.into_vec()).collect();
-    PyArray1::from_vec(py, data).reshape([nslice, nobj, nyo, nxo])
 }
 
 /// Far field `FT(fftshift(P·O·q))` of every view of `p`'s scan at `object` and `probe`, frame

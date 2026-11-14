@@ -30,7 +30,9 @@
 //! `NEPOCH` times from that start either a group of its name (the `object` and `probe` it
 //! left and the `poisson` LLK after each) or, where the engine refuses it, the attribute
 //! `<name>_error` of its error text. LSQML and BH run as in `near.h5`, the others at their
-//! defaults with `calc_llk` 1.
+//! defaults with `calc_llk` 1. `lsqml_sliced` is LSQML's run through the propagator after a
+//! 20 µm gap behind a first object slice, both slices the start object: the `objects`
+//! `[2, nobj, nyo, nxo]`, `probe` and `poisson` LLK it left.
 
 use std::error::Error;
 use std::path::Path;
@@ -568,6 +570,22 @@ fn gpu_optics(path: &Path) -> Result<(), Box<dyn Error>> {
                 Err(e) => return Err(e.into()),
             }
         }
+        let gap = Wavefield::new(frame, wavelength, pixel, 2e-5)?;
+        let sliced = optics.with_slices(&[gap])?;
+        let objects = [flat.clone(), flat.clone()];
+        let options = GpuOptions::default();
+        let mut gpu = GpuPtycho::with_slices(&ctx, &scan, &sliced, &objects, p0.clone(), options)?;
+        let params = LsqmlParams {
+            batch_size: 5,
+            cost: Cost::Poisson,
+            seed: 7,
+        };
+        gpu.lsqml(&params, NEPOCH, 1)?;
+        let at = root.create_group("lsqml_sliced")?;
+        write_objects(&at, "objects", &gpu.objects()?)?;
+        write_stack(&at, "probe", &gpu.probe()?.0)?;
+        let llk: Vec<f64> = gpu.history().iter().map(|r| r.llk.poisson).collect();
+        write(&at, "poisson", &[llk.len()], &llk)?;
     }
     f.close()?;
     Ok(())
