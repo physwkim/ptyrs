@@ -13,30 +13,33 @@ use worst::worst_of;
 const N: usize = 256;
 const BATCH: usize = 64;
 
-/// Unnormalized 2D DFT of every frame in f64 (row pass then column pass).
-fn reference(input: &[C32], inverse: bool) -> Vec<Complex64> {
+/// Unnormalized 2D DFT of every `[ny, nx]` frame in f64 (row pass then column pass).
+fn reference(input: &[C32], [ny, nx]: [usize; 2], inverse: bool) -> Vec<Complex64> {
     let mut planner = FftPlanner::<f64>::new();
-    let fft = if inverse {
-        planner.plan_fft_inverse(N)
-    } else {
-        planner.plan_fft_forward(N)
+    let mut plan = |n| {
+        if inverse {
+            planner.plan_fft_inverse(n)
+        } else {
+            planner.plan_fft_forward(n)
+        }
     };
+    let (rows, cols) = (plan(nx), plan(ny));
     let mut out: Vec<Complex64> = input
         .iter()
         .map(|c| Complex64::new(c.re as f64, c.im as f64))
         .collect();
-    let mut col = vec![Complex64::default(); N];
-    for frame in out.chunks_mut(N * N) {
-        for row in frame.chunks_mut(N) {
-            fft.process(row);
+    let mut col = vec![Complex64::default(); ny];
+    for frame in out.chunks_mut(ny * nx) {
+        for row in frame.chunks_mut(nx) {
+            rows.process(row);
         }
-        for x in 0..N {
-            for y in 0..N {
-                col[y] = frame[y * N + x];
+        for x in 0..nx {
+            for y in 0..ny {
+                col[y] = frame[y * nx + x];
             }
-            fft.process(&mut col);
-            for y in 0..N {
-                frame[y * N + x] = col[y];
+            cols.process(&mut col);
+            for y in 0..ny {
+                frame[y * nx + x] = col[y];
             }
         }
     }
@@ -75,9 +78,40 @@ fn batched_256_forward_inverse_match_f64_reference() {
             plan.forward(&ex, &d_in, &mut d_out).unwrap();
         }
         let gpu = d_out.to_host_vec(&stream).unwrap();
-        let (max_rel, rms_rel) = errors(&gpu, &reference(&host, inverse));
+        let (max_rel, rms_rel) = errors(&gpu, &reference(&host, [N, N], inverse));
         println!("inverse={inverse}: max-rel {max_rel:.3e}, rms-rel {rms_rel:.3e}");
         assert!(max_rel <= 1e-5, "inverse={inverse}: max-rel {max_rel:e}");
+    }
+}
+
+/// `ny != nx` planes are row-major `[ny, nx]`: a plan over the transposed shape fails here.
+#[test]
+fn rectangular_forward_inverse_match_f64_reference() {
+    const SHAPE: [usize; 2] = [48, 80];
+    let ctx = Context::new(0).unwrap();
+    let stream = ctx.new_stream().unwrap();
+    let mut plan = Plan2d::with_shape(&stream, SHAPE, 3).unwrap();
+    assert_eq!(plan.shape(), SHAPE);
+    let ex = ExecutionContext::new(stream.clone());
+    let host = common::random_c32(SHAPE[0] * SHAPE[1] * 3, 11);
+    let d_in = DeviceBuffer::from_host(&stream, &host).unwrap();
+    let mut d_out = DeviceBuffer::<C32>::zeroed(&stream, host.len()).unwrap();
+    for inverse in [false, true] {
+        if inverse {
+            plan.inverse(&ex, &d_in, &mut d_out).unwrap();
+        } else {
+            plan.forward(&ex, &d_in, &mut d_out).unwrap();
+        }
+        let gpu = d_out.to_host_vec(&stream).unwrap();
+        let (max_rel, rms_rel) = errors(&gpu, &reference(&host, SHAPE, inverse));
+        println!("inverse={inverse}: max-rel {max_rel:.3e}, rms-rel {rms_rel:.3e}");
+        assert!(max_rel <= 1e-5, "inverse={inverse}: max-rel {max_rel:e}");
+    }
+    for bad in [[0, 80], [48, 0]] {
+        assert!(matches!(
+            Plan2d::with_shape(&stream, bad, 1),
+            Err(ptyrs::fft::FftError::BadShape)
+        ));
     }
 }
 
