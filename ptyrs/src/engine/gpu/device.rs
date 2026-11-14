@@ -412,6 +412,7 @@ impl Modelled<'_> {
         match &mut self.position {
             Some(p) => ShiftSums {
                 probe: probe.then_some(&mut *p.probe),
+                step: false,
                 position: position.then_some(&mut *p.num),
                 position_den: position.then_some(&mut *p.den),
             },
