@@ -307,6 +307,11 @@ fn matches_cpu(propagator: &str, nslices: &[usize], nobj: usize) {
     }
 }
 
+/// Three slices in one batch end above their start, LLK 22.28 → 22.60, by BH's own step rule:
+/// the first CG step (second epoch) takes pty-chi's `α = top / bottom` (`bh.py`) with no line
+/// search, and along it the amplitude cost goes 6.9e5 → 1.9e6 where the quadratic model says
+/// 1.3e5. The gradient and Hessian match finite differences along that step; one slice falls
+/// every epoch, and three reach 5.6 by the sixth.
 #[test]
 fn sliced_bh_matches_cpu_in_the_far_field() {
     matches_cpu(PROPAGATORS[0], &[2, 3], 1);
