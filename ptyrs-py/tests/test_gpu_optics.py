@@ -1,9 +1,7 @@
 """GpuPtycho under near-field Optics against the GPU engine's own runs from the same scan and
 start, `examples/engine_reference.rs`' `gpu_optics.h5`: an angular-spectrum propagator and a
-Fresnel transform forward and back. Every algorithm the engine ran leaves its object, probe
-and LLK records, exactly, as one device runs both; one it refused raises its error text. A
-Fresnel transform forward has no plane stage and runs every algorithm; under the other two
-ML alone is refused."""
+Fresnel transform forward and back. Every algorithm leaves the engine's object, probe and LLK
+records, exactly, as one device runs both."""
 
 import os
 
@@ -49,18 +47,9 @@ def gpu_of(g, sliced=False, **options):
 
 
 @pytest.mark.parametrize("algorithm", list(RUNS))
-def test_matches_engine_or_raises_its_error(case, algorithm):
-    name, g = case
-    assert algorithm in g or (name != "fresnel" and algorithm == "ml")
+def test_matches_engine(case, algorithm):
+    _, g = case
     gpu = gpu_of(g)
-    if algorithm not in g:
-        want = g.attrs[f"{algorithm}_error"]
-        assert "runs no propagator with a plane stage" in want
-        with pytest.raises(ValueError) as e:
-            RUNS[algorithm](gpu)
-        assert str(e.value) == want
-        np.testing.assert_array_equal(gpu.object, g["object"][()].astype(np.complex64))
-        return
     RUNS[algorithm](gpu)
     want = g[algorithm]
     assert len(want["poisson"]) == NEPOCH
