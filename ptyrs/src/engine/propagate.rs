@@ -32,6 +32,15 @@ pub struct Optics {
     gaps: Vec<Propagator>,
 }
 
+/// [`Optics::quad`] displaced by a frame's offset `d`, `q(r − d)`, with its derivatives over
+/// `d`: `∂_a q = i·slope[a]·q` and `∂_a ∂_c q = (i·curve[a]·δ_ac − slope[a]·slope[c])·q`.
+pub struct MovedQuad {
+    /// Natural layout, as [`Optics::quad`].
+    pub quad: Vec<C64>,
+    pub slope: [Vec<f64>; 2],
+    pub curve: [f64; 2],
+}
+
 impl Optics {
     /// PyNX's far field: [`quad_phase`] and [`Propagator::Fourier`].
     pub fn far_field(g: &Geometry) -> Self {
@@ -116,6 +125,40 @@ impl Optics {
     /// others.
     pub fn slice_quad(&self, s: usize) -> Option<&[C64]> {
         (s + 1 == self.nslice()).then_some(&self.quad[..])
+    }
+
+    /// The last slice's plane phase for a frame whose probe was moved by `offset` (`[dy, dx]`
+    /// pixels) ahead of an earlier slice: [`Self::quad`] displaced as the probe is. `None` at
+    /// one slice, where the probe's move carries the phase ([`Self::slice_quad`]).
+    pub fn moved_quad(&self, offset: [f64; 2]) -> Option<MovedQuad> {
+        if self.nslice() == 1 {
+            return None;
+        }
+        let [ny, nx] = self.propagator.shape();
+        let c = self.plane_quad;
+        let at = |i: usize| {
+            [
+                (i / nx) as f64 - (ny / 2) as f64,
+                (i % nx) as f64 - (nx / 2) as f64,
+            ]
+        };
+        let slope = [0, 1].map(|a| {
+            (0..ny * nx)
+                .map(|i| -2.0 * c[a] * (at(i)[a] - offset[a]))
+                .collect()
+        });
+        let quad = (self.quad.iter().enumerate())
+            .map(|(i, q)| {
+                let r = at(i);
+                let phase = |a: usize| c[a] * offset[a] * (offset[a] - 2.0 * r[a]);
+                q * C64::from_polar(1.0, phase(0) + phase(1))
+            })
+            .collect();
+        Some(MovedQuad {
+            quad,
+            slope,
+            curve: c.map(|c| 2.0 * c),
+        })
     }
 
     /// What takes the last slice's exit waves, [`Self::quad`] on them, to the detector.

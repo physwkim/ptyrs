@@ -222,7 +222,7 @@ fn draw(
     photons: f64,
     seed: u64,
 ) -> Result<(Counts, f64), Box<dyn Error>> {
-    let mut psi = SliceWaves::new(optics, addr.views(), objects, probe)
+    let mut psi = SliceWaves::new(optics, addr.views(), objects, probe, None)
         .psi()
         .to_vec();
     optics.exit().forward(&mut psi);
