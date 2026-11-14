@@ -30,6 +30,7 @@ use crate::gpu::{
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{DeviceBuffer, Stream};
 
+use crate::live::fill::Fill;
 use crate::live::graph::LiveGraph;
 use crate::live::grow::GrowError;
 use crate::live::object::Snapshot;
@@ -175,6 +176,15 @@ impl LiveAp {
     /// counts must be in `counts` when the next epoch runs.
     pub fn push(&mut self, views: &[ViewAddr]) -> Result<u32, GrowError> {
         self.scan.push(views)
+    }
+
+    /// Queues `fill` onto the object behind the epochs queued so far
+    /// ([`LiveScan::fill`]), so the next epoch starts from it; returns the
+    /// fill's pixels not ready, 0 for the fill of a batch [`Self::push`]
+    /// has landed whole. An epoch is queued whole by one [`Self::epoch`],
+    /// on the same stream, so a fill never lands inside one.
+    pub fn fill(&mut self, fill: Fill) -> Result<usize, GrowError> {
+        self.scan.fill(fill, [0, 0])
     }
 
     /// Queues one epoch over every frame landed so far, without waiting.
@@ -382,6 +392,8 @@ mod tests {
 
     use super::*;
     use crate::live::farfield::{Ptycho, PtychoSpec, ScanPath};
+    use crate::live::fill::PatchFill;
+    use crate::live::fill::standin::{Wrong, batch_fill};
     use crate::live::graph::WarmUp;
     use crate::worst::worst_of;
 
@@ -656,6 +668,113 @@ mod tests {
         assert_eq!(whole.scan().obj().mapped_bytes(), 64 << 20);
         assert_eq!((grown.scan().lost(), whole.scan().lost()), (0, 0));
         assert_eq!(warm.recaptures(), 0);
+    }
+
+    /// On an object backed as the scan reaches new rows, the fill of each
+    /// batch, queued right after its push, skips no pixel, and before the
+    /// batch's first epoch every pixel of it holds its prediction.
+    #[test]
+    fn a_fill_after_a_push_lands_whole_before_the_next_epoch() {
+        let p = sim(64, 2, 500, 24.0);
+        let (views, shape, _) = planned(&p);
+        let counts = frames(&p);
+        let ctx = Context::new(0).expect("GPU 0");
+        let st = ctx.new_stream().unwrap();
+        let dev = DeviceBuffer::from_host(&st, &counts).unwrap();
+        let mut live = LiveAp::new(&st, &config(shape, 32), &probe(&p), dev, false).unwrap();
+        let [nyo, nxo] = shape.dims().obj.map(|n| n as usize);
+        // A buffer for each batch: one comes back only once its copies ran.
+        let mut pf = PatchFill::new(&ctx, [nyo, nxo], [32, 32], 233, 6).unwrap();
+        let mut wrong = Wrong {
+            patch: [32, 32],
+            issued: 0,
+        };
+        let (mut snap, mut b) = (live.new_snapshot().unwrap(), live.backer());
+        let mapped = live.scan().obj().mapped_bytes();
+        let (mut at, mut filled) = (0, 0);
+        for batch in [40, 7, 130, 0, 90, 233] {
+            let v = &views[2 * at..2 * (at + batch)];
+            b.back(v).unwrap();
+            assert_eq!(live.push(v).unwrap(), batch as u32);
+            let c = &counts[at * 64 * 64..(at + batch) * 64 * 64];
+            let fill = batch_fill(&mut pf, &mut wrong, c, v, 2, [64, 64]);
+            at += batch;
+            assert_eq!(live.fill(fill.clone()).unwrap(), 0, "after {at} frames");
+            live.snapshot(&mut snap).unwrap();
+            let px = snap.wait().unwrap();
+            let mut bad = 0;
+            for r in fill.rects() {
+                for (i, want) in fill.values()[r.at..][..(r.h * r.w) as usize]
+                    .iter()
+                    .enumerate()
+                {
+                    let (y, x) = (r.y as usize + i / r.w as usize, i % r.w as usize);
+                    bad += (px[y * nxo + r.x as usize + x] != *want) as usize;
+                }
+            }
+            assert_eq!(bad, 0, "after {at} frames");
+            filled += fill.pixels();
+            for _ in 0..3 {
+                live.epoch().unwrap();
+            }
+        }
+        assert_eq!(at, p.points());
+        assert!(filled > 0 && pf.no_buffer() == 0);
+        assert!(live.scan().obj().mapped_bytes() > mapped);
+    }
+
+    /// A wrong prediction is only a start: with every batch filled by
+    /// unit pixels of random phase, the LLK is 39 times the flat-start
+    /// run's at the scan's end (15 epochs) and 3.2e-3 above it 200 epochs
+    /// later (1.9e-2 after 100, 8.9e-4 after 400).
+    #[test]
+    fn a_wrong_fill_is_only_a_start() {
+        let p = sim(64, 6, 36, 8.0);
+        let (views, shape, _) = planned(&p);
+        let counts = frames(&p);
+        let ctx = Context::new(0).expect("GPU 0");
+        let (scan_end, after) = (15, 200);
+        let run = |wrong: bool| -> Vec<f64> {
+            let st = ctx.new_stream().unwrap();
+            let dev = DeviceBuffer::from_host(&st, &counts).unwrap();
+            let mut live = LiveAp::new(&st, &config(shape, 16), &probe(&p), dev, true).unwrap();
+            let obj = shape.dims().obj.map(|n| n as usize);
+            // A buffer for each batch: one comes back only once its copies ran.
+            let mut pf = PatchFill::new(&ctx, obj, [32, 32], 17, 5).unwrap();
+            let mut pred = Wrong {
+                patch: [32, 32],
+                issued: 0,
+            };
+            let (mut at, mut b) = (0, live.backer());
+            for batch in [5, 1, 13, 0, 17] {
+                let v = &views[2 * at..2 * (at + batch)];
+                b.back(v).unwrap();
+                assert_eq!(live.push(v).unwrap(), batch as u32);
+                if wrong {
+                    let c = &counts[at * 64 * 64..(at + batch) * 64 * 64];
+                    let fill = batch_fill(&mut pf, &mut pred, c, v, 2, [64, 64]);
+                    assert_eq!(live.fill(fill).unwrap(), 0);
+                }
+                at += batch;
+                for _ in 0..3 {
+                    live.epoch().unwrap();
+                }
+            }
+            assert_eq!(live.epochs(), scan_end as u64);
+            // Record `e` is the LLK after `e` epochs.
+            for _ in 0..=after {
+                live.epoch().unwrap();
+            }
+            let llk = live.llk().unwrap().unwrap();
+            llk.into_iter().map(|(_, l)| l).collect()
+        };
+        let (flat, wrong) = (run(false), run(true));
+        assert!(
+            wrong[scan_end] > 10.0 * flat[scan_end],
+            "the fill was no worse a start"
+        );
+        let excess = wrong[scan_end + after] / flat[scan_end + after] - 1.0;
+        assert!(excess.abs() < 2e-2, "LLK {excess:e} off the flat run's");
     }
 
     /// Frames landed in uneven batches with epochs between, from graphs
