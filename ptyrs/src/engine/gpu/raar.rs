@@ -55,8 +55,9 @@ impl Bufs<'_> {
         beta: f32,
         first: bool,
     ) -> Result<(), GpuError> {
-        let (stack, frames) = (w.cut.at(s), &w.cut.frames[s]);
-        let (plans, psi, iterate) = w.raar(s);
+        let (stack, len) = (w.cut.at(s), w.cut.frames[s].len);
+        let (plan, psi, iterate) = w.m1(s);
+        let iterate = iterate.expect("Device::new_run built the RAAR iterate");
         let (views, obj, probe) = (self.views, &*self.obj, &*self.probe);
         if first {
             // `R = PO`, into both sets.
@@ -68,8 +69,8 @@ impl Bufs<'_> {
             self.kernels
                 .obj_probe_to_psi(ctx, views, stack, obj, probe, m1.scratch)?;
             self.kernels
-                .raar_iterate(ctx, psi, iterate, m1.scratch, frames.len, beta)?;
+                .raar_iterate(ctx, psi, iterate, m1.scratch, len, beta)?;
         }
-        self.project(ctx, stack, plans.get(frames.plan), psi, None)
+        self.project(ctx, stack, plan, psi, None)
     }
 }

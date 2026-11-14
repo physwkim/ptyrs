@@ -533,6 +533,7 @@ mod tests {
                 graph: true,
                 llk_slots: 8,
                 fused: true,
+                psi_f16: false,
             };
             let mut engine = GpuPtycho::new(&ctx, &scan, start, truth, opts).unwrap();
             let params = ApParams {
