@@ -503,7 +503,8 @@ impl GpuPtycho {
 
     /// [`Self::with_optics`] on a multislice object, `objects` its slices in the order the
     /// wave crosses them, one per slice of `optics` and all of one shape. More than one
-    /// slice runs LSQML alone ([`Self::lsqml`]): every other algorithm fails on it.
+    /// slice runs LSQML ([`Self::lsqml`]) and BH without the position model ([`Self::bh`])
+    /// alone: every other algorithm fails on it.
     pub fn with_slices(
         ctx: &Arc<CudaContext>,
         scan: &Scan,

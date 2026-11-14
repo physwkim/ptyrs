@@ -18,8 +18,8 @@ use std::sync::{Arc, Once};
 
 pub use crate::gpu::Error;
 use crate::gpu::{
-    BhDisp, C32, CG_BLOCKS, LLK_TREE_LEAVES, LlkPartial, StackGeom, StackRef, StackTable,
-    UpdateSums, ViewDims, Views, gamma_parts, lease,
+    BhArray, BhDisp, BhParts, C32, CG_BLOCKS, LLK_TREE_LEAVES, LlkPartial, StackGeom, StackRef,
+    StackTable, UpdateSums, ViewDims, Views, gamma_parts, lease,
 };
 use cuda_async::device_buffer::DevicePointer;
 use cuda_core::sys::CUdeviceptr;
@@ -1801,9 +1801,9 @@ fn dot_lens(dims: &ViewDims) -> Result<[i32; 2], Error> {
     Ok(lens)
 }
 
-/// BH's dot products over a scan of one [`ViewDims`], [`Self::dots`], which has no SIMT
-/// form. [`Self::new`] compiles it for the object's and the probe's lengths, with and
-/// without `v`, and nothing else.
+/// BH's dot products over a scan of one [`ViewDims`], [`Self::dots`] and
+/// [`Self::slice_dots`], which have no SIMT form. [`Self::new`] compiles them for the
+/// object's and the probe's lengths, with and without `v`, and nothing else.
 pub struct TileDots {
     /// Complex values of the object and of the probe.
     lens: [i32; 2],
@@ -1825,36 +1825,53 @@ impl TileDots {
     }
 
     /// BH's dot products of the step along `d`, `⟨u, Pu⟩` and (CG) `⟨u, v⟩`, as block
-    /// partials into the first `2 CG_BLOCKS` pairs of `parts`, object then probe.
+    /// partials into the object's and the probe's dot pairs of `parts`.
     pub fn dots(
         &self,
         ctx: &ExecutionContext,
         d: &BhDisp<'_>,
-        parts: &mut DeviceBuffer<f32>,
+        parts: &mut BhParts,
     ) -> Result<(), Error> {
-        check_len("parts", parts, 4 * CG_BLOCKS as usize)?;
-        for (i, n) in self.lens.into_iter().enumerate() {
-            let (g, prev) = (d.u[i], d.v.map(|v| v[i]));
-            check_len("u", g, n as usize)?;
-            if let Some(v) = prev {
-                check_len("v", v, n as usize)?;
-            }
-            // Without `v`, `u` stands in for it, unread.
-            let at = [
-                addr("u", g)?,
-                addr("v", prev.unwrap_or(g))?,
-                pairs_at(parts, i * CG_BLOCKS as usize)?,
-            ];
-            let reads: Vec<_> = [Some(g), prev]
-                .into_iter()
-                .flatten()
-                .map(|b| b.storage())
-                .collect();
-            lease(ctx, &reads, &[parts.storage()])?;
-            let scale = if i == 0 { 1.0 } else { d.u_scale };
-            self.dots_run(Run::Launch(ctx), at, n, scale, prev.is_some())?;
+        let arrays = [(BhArray::Object, 1.0), (BhArray::Probe, d.u_scale)];
+        for (i, (a, scale)) in arrays.into_iter().enumerate() {
+            let (u, v) = (d.u[i], d.v.map(|v| v[i]));
+            let at = (a, self.lens[i]);
+            self.array_dots(ctx, at, [u, v.unwrap_or(u)], scale, v.is_some(), parts)?;
         }
         Ok(())
+    }
+
+    /// [`Self::dots`] of slice `s` past the first along its parts `u` and (CG) `v`, unscaled,
+    /// into its dot pairs of `parts`.
+    pub fn slice_dots(
+        &self,
+        ctx: &ExecutionContext,
+        s: usize,
+        u: &DeviceBuffer<C32>,
+        v: Option<&DeviceBuffer<C32>>,
+        parts: &mut BhParts,
+    ) -> Result<(), Error> {
+        let at = (BhArray::Slice(s), self.lens[0]);
+        self.array_dots(ctx, at, [u, v.unwrap_or(u)], 1.0, v.is_some(), parts)
+    }
+
+    /// Array `a`'s dot partials of `n` values; without `cg`, `v` is `u`, unread.
+    fn array_dots(
+        &self,
+        ctx: &ExecutionContext,
+        (a, n): (BhArray, i32),
+        [u, v]: [&DeviceBuffer<C32>; 2],
+        scale: f32,
+        cg: bool,
+        parts: &mut BhParts,
+    ) -> Result<(), Error> {
+        let first = parts.dots(a)?;
+        check_len("u", u, n as usize)?;
+        check_len("v", v, n as usize)?;
+        let at = [addr("u", u)?, addr("v", v)?, pairs_at(parts.buf(), first)?];
+        let reads = [u.storage(), v.storage()];
+        lease(ctx, &reads[..1 + usize::from(cg)], &[parts.buf().storage()])?;
+        self.dots_run(Run::Launch(ctx), at, n, scale, cg)
     }
 
     fn dots_run(
@@ -1865,8 +1882,9 @@ impl TileDots {
         scale: f32,
         cg: bool,
     ) -> Result<(), Error> {
-        // SAFETY: a launch comes from `dots`, which checked that `g` holds `n` complex values,
-        // `prev` too when `cg`, and `out` `CG_BLOCKS` pairs, and leased them on `ctx`.
+        // SAFETY: a launch comes from `array_dots`, which checked that `g` and `prev` hold `n`
+        // complex values and took `out` from `BhParts::dots`, `CG_BLOCKS` pairs, and leased
+        // them on `ctx`.
         unsafe {
             run!(
                 run,

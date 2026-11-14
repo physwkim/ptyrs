@@ -14,20 +14,20 @@ use std::sync::Arc;
 use crate::fft::Plan2d;
 use crate::gpu::sampling::{Modes, ObjectSampler, StackPoints, WindowBlock, window_views};
 use crate::gpu::{
-    BH_STEP, BackgroundSums, BhKernels, C32, CG_BLOCKS, Ended, EpochOrder, Error as GpuError,
-    ExitPass, ExitStage, FarSums, FrameWaves, FusedBufs, FusedInputs, GammaStacks, GradKernels,
-    HalfWaves, Kernels, LlkPartial, LlkRing, LlkScratch, LlkTotals, MASKED, Model, OpticsKernels,
-    PositionKernels, PositionPartial, Positions, PowerMax, ProbeSpectrum, PsiSums, RingDevice,
-    RpieKernels, ScalePartial, Shift, ShiftProbe, ShiftSums, ShiftedProbeSums, SlicePhase,
-    SliceSource, SpectrumBuf, StackRef, StackTable, UpdateSums, ViewAddr, ViewDims, Views, Waves,
-    half_scale,
+    BH_STEP, BackgroundSums, BhKernels, BhParts, C32, CG_BLOCKS, Ended, EpochOrder,
+    Error as GpuError, ExitPass, ExitStage, FarSums, FrameWaves, FusedBufs, FusedInputs,
+    GammaStacks, GradKernels, HalfWaves, Kernels, LlkPartial, LlkRing, LlkScratch, LlkTotals,
+    MASKED, Model, OpticsKernels, PositionKernels, PositionPartial, Positions, PowerMax,
+    ProbeSpectrum, PsiSums, RingDevice, RpieKernels, ScalePartial, Shift, ShiftProbe, ShiftSums,
+    ShiftedProbeSums, SlicePhase, SliceSource, SpectrumBuf, StackRef, StackTable, UpdateSums,
+    ViewAddr, ViewDims, Views, Waves, half_scale,
 };
 use crate::tile::TileDots;
 use cuda_async::cuda_graph::CudaGraph;
 use cuda_async::device_operation::{DeviceOp, ExecutionContext};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 
-use super::bh::BhMoved;
+use super::bh::{BhMoved, BhSliced};
 use super::lsqml::{LsqmlBufs, LsqmlState, Pre};
 use super::ml::MlMoved;
 use super::rpie::RpieMoved;
@@ -68,7 +68,7 @@ pub(super) struct SliceUploads {
 }
 
 /// A multislice object's device state past its first slice, which is [`Device::obj`]; only
-/// LSQML and the LLK pass run it, and [`Device::one_slice`] gates every other pass.
+/// LSQML, BH and the LLK pass run it, and [`Device::one_slice`] gates every other pass.
 struct Slices {
     deeper: Vec<DeviceBuffer<C32>>,
     gaps: Vec<DeviceBuffer<C32>>,
@@ -1444,12 +1444,14 @@ struct BhState {
     prev: [DeviceBuffer<C32>; 2],
     /// The scan frame at each epoch position, and the views in that order.
     order: EpochOrder,
-    /// One step's partial sums ([`crate::gpu::bh_parts`]).
-    parts: DeviceBuffer<f32>,
+    /// One step's partial sums.
+    parts: BhParts,
     /// The epoch's step records, one per batch.
     steps: DeviceBuffer<f32>,
     /// The state of the position model, if modelled.
     moved: Option<BhMoved>,
+    /// A multislice object's waves and slice sums, if the device's has more than one slice.
+    sliced: Option<BhSliced>,
 }
 
 /// A [`BhState`] lent to an epoch.
@@ -1465,23 +1467,24 @@ pub(super) struct BhBufs<'a> {
     pub lv: &'a mut DeviceBuffer<C32>,
     pub prev: &'a mut [DeviceBuffer<C32>; 2],
     pub order: &'a EpochOrder,
-    pub parts: &'a mut DeviceBuffer<f32>,
+    pub parts: &'a mut BhParts,
     pub steps: &'a mut DeviceBuffer<f32>,
     pub moved: Option<&'a mut BhMoved>,
+    pub sliced: Option<&'a mut BhSliced>,
 }
 
 impl BhState {
-    /// For `views` in batches of `size` frames, each cut into stacks by `rule`, and arrays of
-    /// `lens = [object, probe]` values; under the position model, `scratch` holds the frames
-    /// per stack of the shared scratch, whose shift planes its sums borrow, which caps its
-    /// stacks, and the device's sampling. The epoch order is the scan's.
+    /// For `views` in batches of `size` frames, each cut into stacks by `rule`, through an
+    /// object of `deeper` slices past the first; under the position model, `scratch` holds
+    /// the frames per stack of the shared scratch, whose shift planes its sums borrow, which
+    /// caps its stacks, and the device's sampling. The epoch order is the scan's.
     fn new(
         stream: &Arc<CudaStream>,
         kernels: &Kernels,
         views: &Views,
         size: u32,
         rule: StackRule,
-        lens: [usize; 2],
+        deeper: usize,
         scratch: Option<MovedScratch>,
     ) -> Result<Self, EngineError> {
         let dims = views.dims();
@@ -1499,15 +1502,23 @@ impl BhState {
         // accumulate 18, the inverse and the add); then the windows of `u_O` and `v_O` (six
         // sampler calls from 21), `win_lift` 39, lu and lv (`far` 40, the transforms,
         // `hess_frames` 43), the second derivatives (three sampler calls from 44) and r and
-        // the derivatives' windows to `win_hess` 53.
+        // the derivatives' windows to `win_hess` 53. Through a multislice object the first
+        // loop hands on two waves per pass boundary, the second lu, lv and the three second
+        // derivatives of the exit waves from slice to slice.
         let wave = wave_bytes(dims);
         let streamed = match scratch.map(|s| s.sampling) {
-            None => vec![
-                Streamed::new(wave, 0..=2),
-                Streamed::new(wave, 2..=4),
-                Streamed::new(wave, 5..=8),
-                Streamed::new(wave, 5..=8),
-            ],
+            None => {
+                let mut s = vec![
+                    Streamed::new(wave, 0..=2),
+                    Streamed::new(wave, 2..=4),
+                    Streamed::new(wave, 5..=8),
+                    Streamed::new(wave, 5..=8),
+                ];
+                if deeper > 0 {
+                    s.extend([Streamed::new(wave, 5..=8); 3]);
+                }
+                s
+            }
             Some(MovedSampling::FullObject { held, scratch, acc }) => {
                 let win = Windows::bytes(dims);
                 let calls = [0, 3, 6, 21, 24, 27, 30, 33, 36, 44, 47, 50];
@@ -1570,6 +1581,9 @@ impl BhState {
         let slots = batches.iter().map(|b| b.len()).max().unwrap_or(0);
         let moved = (scratch.map(|s| BhMoved::new(stream, kernels, dims, &cut, slots, s.sampling)))
             .transpose()?;
+        let sliced = (deeper > 0)
+            .then(|| BhSliced::new(stream, dims, len, slots, deeper))
+            .transpose()?;
         let Cut {
             frames: stacks,
             table,
@@ -1583,14 +1597,18 @@ impl BhState {
             r: (0..slots).map(|_| zeroed(len)).collect::<Result<_, _>>()?,
             lu: zeroed(len)?,
             lv: zeroed(len)?,
-            prev: [zeroed(lens[0])?, zeroed(lens[1])?],
+            prev: [
+                zeroed(dims.obj_len())?,
+                zeroed(dims.nprobe as usize * dims.n())?,
+            ],
             order: EpochOrder::new(kernels, stream, views)?,
-            parts: DeviceBuffer::zeroed(stream, crate::gpu::bh_parts(dims))?,
+            parts: BhParts::zeroed(stream, dims, deeper)?,
             steps: DeviceBuffer::zeroed(stream, BH_STEP as usize * batches.len())?,
             batches,
             stacks,
             table,
             moved,
+            sliced,
         })
     }
 
@@ -1610,6 +1628,7 @@ impl BhState {
             parts: &mut self.parts,
             steps: &mut self.steps,
             moved: self.moved.as_mut(),
+            sliced: self.sliced.as_mut(),
         }
     }
 }
@@ -2169,12 +2188,12 @@ impl Device {
     }
 
     /// Fails on a multislice object for `what`, which models one slice: every pass but
-    /// LSQML's and the LLK pass is enqueued behind this.
+    /// LSQML's, BH's and the LLK pass is enqueued behind this.
     fn one_slice(&self, what: &str) -> Result<(), EngineError> {
         match &self.slices {
             None => Ok(()),
             Some(s) => Err(EngineError::Invalid(format!(
-                "{what} runs one object slice, got {}: only LSQML and the LLK pass run a \
+                "{what} runs one object slice, got {}: only LSQML, BH and the LLK pass run a \
                  multislice object",
                 s.deeper.len() + 1
             ))),
@@ -2418,7 +2437,7 @@ impl Device {
     /// The buffers of `epoch`'s cycle, and with graphs its graph, captured from them.
     fn new_run(&mut self, epoch: Epoch) -> Result<EpochRun, EngineError> {
         let what = format!("{:?}", epoch.algorithm());
-        if !matches!(epoch, Epoch::Lsqml { .. }) {
+        if !matches!(epoch, Epoch::Lsqml { .. } | Epoch::Bh { .. }) {
             self.one_slice(&what)?;
         }
         let mut cycle = match epoch {
@@ -2499,15 +2518,25 @@ impl Device {
         let dims = self.dims();
         let size = to_u32("batch_size", params.batch_size.min(dims.nframe as usize))?;
         let moved = self.features.positioned();
+        let deeper = self.deeper().len();
+        if moved && deeper > 0 {
+            let what = match self.moved_scratch().sampling {
+                MovedSampling::FullObject { .. } => "under Sampling::FullObject",
+                MovedSampling::Patch => "with the position model under Sampling::Patch",
+            };
+            return Err(EngineError::Invalid(format!(
+                "BH {what} runs one object slice, got {}",
+                deeper + 1
+            )));
+        }
         if (self.bh_state.as_ref()).is_none_or(|s| s.size != size || s.moved.is_some() != moved) {
-            let lens = [self.obj.len(), self.probe.len()];
             let state = BhState::new(
                 &self.stream,
                 &self.kernels,
                 &self.views,
                 size,
                 self.rule,
-                lens,
+                deeper,
                 moved.then(|| self.moved_scratch()),
             )?;
             self.bh_state = Some(Box::new(state));

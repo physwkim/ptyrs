@@ -146,6 +146,41 @@ pub struct BhWinDerivs {
     pub dv: *const f32,
 }
 
+/// A stack's derivatives through a multislice object, each `[nf_max * nmode, ny, nx]` in
+/// `obj_probe_to_psi`'s layout: `lu` and `lv` the waves' along `u` and `v`, `muu`, `muv` and
+/// `mvv` their second derivatives along `(u, u)`, `(u, v)` and `(v, v)`. Without `cg` only
+/// `lu` and `muu` are read or written.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct BhTangents {
+    pub lu: *mut f32,
+    pub lv: *mut f32,
+    pub muu: *mut f32,
+    pub muv: *mut f32,
+    pub mvv: *mut f32,
+}
+
+/// A slice of a multislice object and what enters it: with `probe != 0` the probe array,
+/// each view's wave its probe, else one wave per view as [`BhTangents`]'.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct BhSliceIn {
+    pub slice: *const f32,
+    pub entry: *const f32,
+    pub probe: u32,
+}
+
+/// The exit waves' second derivatives along `(u, u)`, `(u, v)` and `(v, v)` that
+/// [`bh_kernels::LoadedModule::bh_sliced_hess_frames`] reads, laid out as [`BhTangents`]';
+/// without `cg` only `uu`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct BhSecond {
+    pub uu: *const f32,
+    pub uv: *const f32,
+    pub vv: *const f32,
+}
+
 /// Floats a [`bh_kernels::LoadedModule::bh_hess_frames`] block writes: the partial `H(u, u)`,
 /// `H(u, v)`, `H(v, v)`.
 pub const BH_HESS: u32 = 3;
@@ -156,8 +191,8 @@ pub const BH_STEP: u32 = 4;
 pub mod bh_kernels {
     use super::{
         BH_EPS, BH_HESS, BH_STEP, BhDirs, BhFields, BhMovedFar, BhMoves, BhNear, BhObs, BhPosDirs,
-        BhWinDerivs, BhWinFields, CHUNK_PIXELS, add_im, add_re, far_add, far_tail, near_prod,
-        near_sum, ramp_at, rates, re_conj, unramp,
+        BhSecond, BhSliceIn, BhTangents, BhWinDerivs, BhWinFields, CHUNK_PIXELS, add_im, add_re,
+        far_add, far_tail, near_prod, near_sum, ramp_at, rates, re_conj, unramp,
     };
     use crate::grad::{GAMMA_CHUNK, ObjProbePtrs};
     use crate::pixel::*;
@@ -341,6 +376,157 @@ pub mod bh_kernels {
                     let (a, b) = (cmul(up, vo), cmul(vp, uo));
                     acc[1] += cmul(rq, (a.0 + b.0, a.1 + b.1)).0;
                     acc[2] += 2.0 * cmul(rq, cmul(vp, vo)).0;
+                }
+                far_add(&mut far, p, lu, lv, cg);
+            }
+            if count != MASKED {
+                let t = far_tail(far, n, zsqrt(count as f32));
+                // Unrolled, as every loop over `acc`, so it stays in registers.
+                #[unroll]
+                for h in 0..BH_HESS {
+                    let h = h as usize;
+                    acc[h] += t[h];
+                }
+            }
+            d += PIXEL_THREADS as usize;
+        }
+        let o = unsafe { out.add(BH_HESS as usize * (pos * n.div_ceil(chunk) + c)) };
+        unsafe { super::store_sums::<3>((&raw mut RED).cast::<f32>(), acc, o) }
+    }
+
+    /// The stack's derivatives `t` through one slice `S` of a multislice object, in place:
+    /// the slice's exit `S w` of the wave `w` entering it changes along `u` by `S l_u + u_S w`
+    /// and to second order along `(u, v)` by `S m_uv + u_S l_v + v_S l_u`, with `l_u`, `l_v`,
+    /// `m_uv` those of `w` and `u_S`, `v_S` the bilinear windows of `dirs.u.obj`, `dirs.v.obj`
+    /// for view `views[f0 * nmode + kl]`, `S` `s.slice`. With `s.probe != 0` the slice is the
+    /// first, `w` the view's probe of `s.entry`, `l_u = u_scale * dirs.u.probe`, `l_v =
+    /// dirs.v.probe` and `m = 0`, and `t` is only written; else `w` is `s.entry`'s value and
+    /// the rest `t`'s. One thread per element of `[nf_max * nmode, ny, nx]`.
+    ///
+    /// # Safety
+    ///
+    /// `s.slice` `[nobj, nyo, nxo]`, `dirs` as [`BhDirs`] says (its probe parts unread without
+    /// `s.probe`), `s.entry` `[nprobe, ny, nx]` with `s.probe` else as `t`'s, `t` as
+    /// [`BhTangents`] says, `views` `nframe * nmode` records in range for those shapes, `ctl`
+    /// one entry.
+    #[kernel]
+    pub unsafe fn bh_slice_tangent(
+        s: BhSliceIn,
+        dirs: BhDirs,
+        t: BhTangents,
+        views: *const ViewAddr,
+        ctl: *const StackCtl,
+        g: StackGeom,
+    ) {
+        let (f0, nf) = unsafe { stack_frames(ctl, g) };
+        let n = g.ny as usize * g.nx as usize;
+        let i = global_index();
+        if i >= nf as usize * g.nmode as usize * n {
+            return;
+        }
+        let (kl, d) = (i / n, i % n);
+        let (py, px) = ((d / g.nx as usize) as u32, (d % g.nx as usize) as u32);
+        let j = kl * n + psi_index(py, px, g.ny, g.nx);
+        let cg = dirs.cg != 0;
+        let add = |a: (f32, f32), b: (f32, f32)| (a.0 + b.0, a.1 + b.1);
+        let zero = (0.0, 0.0);
+        unsafe {
+            let w = *views.add(f0 as usize * g.nmode as usize + kl);
+            let x = sample_obj(s.slice, w, py, px, g.nyo, g.nxo);
+            let us = sample_obj(dirs.u.obj, w, py, px, g.nyo, g.nxo);
+            let vs = if cg {
+                sample_obj(dirs.v.obj, w, py, px, g.nyo, g.nxo)
+            } else {
+                zero
+            };
+            let (e, lu, lv, [muu, muv, mvv]) = if s.probe != 0 {
+                let at = w.probe as usize * n + d;
+                let up = load_c(dirs.u.probe, at);
+                let lv = if cg { load_c(dirs.v.probe, at) } else { zero };
+                let lu = (dirs.u_scale * up.0, dirs.u_scale * up.1);
+                (load_c(s.entry, at), lu, lv, [zero; 3])
+            } else if cg {
+                let m = [load_c(t.muu, j), load_c(t.muv, j), load_c(t.mvv, j)];
+                (load_c(s.entry, j), load_c(t.lu, j), load_c(t.lv, j), m)
+            } else {
+                let m = [load_c(t.muu, j), zero, zero];
+                (load_c(s.entry, j), load_c(t.lu, j), zero, m)
+            };
+            let twice = |a: (f32, f32)| (2.0 * a.0, 2.0 * a.1);
+            store_c(t.lu, j, add(cmul(x, lu), cmul(us, e)));
+            store_c(t.muu, j, add(cmul(x, muu), twice(cmul(us, lu))));
+            if cg {
+                store_c(t.lv, j, add(cmul(x, lv), cmul(vs, e)));
+                let cross = add(cmul(us, lv), cmul(vs, lu));
+                store_c(t.muv, j, add(cmul(x, muv), cross));
+                store_c(t.mvv, j, add(cmul(x, mvv), twice(cmul(vs, lv))));
+            }
+        }
+    }
+
+    /// [`bh_hess_frames`] through a multislice object: the near term is `Σ Re(conj(r) m)`, `m`
+    /// the exit waves' second derivatives of [`bh_slice_tangent`] and `r` the residual after
+    /// its inverse FFT and the adjoint of the last slice's plane phase, which the exit waves'
+    /// derivatives in `f.far` carry; `g.quad` is unread.
+    ///
+    /// # Safety
+    ///
+    /// Each of `f` and `m` `[nf_max * nmode, ny, nx]` (`f.far.lv`, `m.uv`, `m.vv` unread
+    /// without `cg`), `obs` as [`BhObs`] says, `out` `3 * nframe * nchunk` floats, `ctl` one
+    /// entry; grid `(nchunk, nf_max, 1)`, block `(PIXEL_THREADS, 1, 1)`.
+    ///
+    /// [`bh_hess_frames`]: LoadedModule::bh_hess_frames
+    /// [`bh_slice_tangent`]: LoadedModule::bh_slice_tangent
+    #[kernel]
+    pub unsafe fn bh_sliced_hess_frames(
+        f: BhFields,
+        m: BhSecond,
+        cg: u32,
+        obs: BhObs,
+        out: *mut f32,
+        ctl: *const StackCtl,
+        g: StackGeom,
+    ) {
+        static mut RED: SharedArray<f32, 768> = SharedArray::UNINIT;
+        let (f0, nf) = unsafe { stack_frames(ctl, g) };
+        let (ny, nx, nmode) = (g.ny, g.nx, g.nmode as usize);
+        let n = ny as usize * nx as usize;
+        let fl = thread::blockIdx_y() as usize;
+        // The whole block leaves together, before its first barrier.
+        if fl >= nf as usize {
+            return;
+        }
+        let cg = cg != 0;
+        let c = thread::blockIdx_x() as usize;
+        let chunk = GAMMA_CHUNK as usize;
+        let end = n.min((c + 1) * chunk);
+        let pos = f0 as usize + fl;
+        let frame = unsafe { *obs.order.add(pos) } as usize;
+        let mut acc = [0.0f32; BH_HESS as usize];
+        let mut d = c * chunk + thread::threadIdx_x() as usize;
+        while d < end {
+            let count = unsafe { *obs.counts.add(frame * n + d) };
+            let at = psi_index((d / nx as usize) as u32, (d % nx as usize) as u32, ny, nx);
+            let mut far = [0.0f32; 6];
+            for md in 0..nmode {
+                let j = (fl * nmode + md) * n + at;
+                let (r, uu, p, lu) = unsafe {
+                    (
+                        load_c(f.r, j),
+                        load_c(m.uu, j),
+                        load_c(f.far.psi, j),
+                        load_c(f.far.lu, j),
+                    )
+                };
+                acc[0] += re_conj(r, uu);
+                let mut lv = (0.0, 0.0);
+                if cg {
+                    let (uv, vv) = unsafe {
+                        lv = load_c(f.far.lv, j);
+                        (load_c(m.uv, j), load_c(m.vv, j))
+                    };
+                    acc[1] += re_conj(r, uv);
+                    acc[2] += re_conj(r, vv);
                 }
                 far_add(&mut far, p, lu, lv, cg);
             }
