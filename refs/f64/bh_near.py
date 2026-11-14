@@ -4,8 +4,8 @@
 
 The state and counts are lsqml_near.py's (start object of ones, start probe, 16 whole-pixel
 corners, per geometry the Poisson counts of the truth), regenerated from its seed, and its
-GEOMETRIES: an angular-spectrum propagator, a Fresnel transform and an angular spectrum with an
-evanescent band. Per geometry pty-chi's BHReconstructor runs EPOCHS epochs of the engine's
+GEOMETRIES: an angular-spectrum propagator, a Fresnel transform, an angular spectrum with an
+evanescent band and a Fresnel transform back. Per geometry pty-chi's BHReconstructor runs EPOCHS epochs of the engine's
 random_batches(16, size, SEED, epoch) with probe rho RHO and positions fixed, in two methods:
 "full", CG with one batch of every frame per epoch, and "mini", GD with batches of 6, 6 and 4.
 
@@ -14,7 +14,7 @@ get_intensity_scaling_factor, and its psi_far is U psi with U unitary, so d, A a
 residual are the engine's; its probe gradient and direction are sqrt(k) times the engine's
 probe-variable ones at rho_e = rho sqrt(k), and the object, alpha, beta, top = -<G, eta> and
 bottom = H(eta, eta) are the same, once gradientF carries k on the residual. pty-chi applies k
-there only for FourierPropagator, so the Fresnel case runs with that factor added.
+there only for FourierPropagator, so the Fresnel cases run with that factor added.
 
 Writes, per case C (geometry) and method M (0 full, 1 mini), every complex value `re im`:
     <dir>/bh_near_steps_f64.txt  `C M step epoch count beta alpha top bottom f_0 ..`, one row
