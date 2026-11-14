@@ -301,6 +301,7 @@ M6 측정(GPU2, 스택 16): 물체 갱신은 Tile 24–26 µs, SIMT 10–11 µs�
 
 - 시뮬레이션 데이터(정답이 있는 물체·프로브)와 공개 CXI 데이터(CXIDB)를 공용 입력으로 씁니다.
 - 같은 입력·초기값으로 pty-chi(LSQML, BH, rPIE), PyNX(DM, ML), PtyPy(DM, RAAR)를 돌려 반복별 LLK 곡선과 최종 FRC를 비교합니다. 이 패키지들이 정답 비교 기준입니다.
+- CXIDB 65(ALS 5.3.2 금 입자, 256² 799프레임)에서 같은 시작점·위치·마스크로 ptyrs GPU를 비교한 결과입니다(`refs/py/compare_cxidb.py`; LLK 최대 상대차, 최종 물체 rel L2, 스캔 중심 영역 FRC 최소 고리 순). PyNX CUDA DM 200사이클은 4.9e-3, 1.1e-2, 0.98이고, 같은 설정의 PyNX CUDA RAAR(β 0.9)는 3.5e-5, 1.1e-5, 1.0입니다. PyNX ML(AP 20사이클 뒤 100사이클)은 PyNX의 Hann 필터를 끄면 6.0e-3, 1.0e-2, 0.99이고, 기본 설정의 PyNX는 몇 사이클 안에 멈춥니다. pty-chi CPU f64 20에폭은 엔진의 정수 뷰 모서리에서 PATCH로 맞춰 FULL_OBJECT 없이 LSQML Gaussian(배치 32) 1.3e-7, BH(배치 96, GD) 3.9e-6, rPIE(배치 100) 2.5e-7이고, 셋 다 물체 rel L2 5.4e-7 이하, FRC 1.0입니다. 이 셋의 LLK는 셋이 내리는 진폭 오차(Euclidian)로 보며, BH는 두 쪽 모두 Gaussian LLK가 오릅니다. PtyPy RAAR(β 0.9)는 반복식이 달라 시작 LLK(1.5e-9)만 맞고 곡선은 나란히 둡니다. 200사이클 뒤 Gaussian LLK는 ptyrs 329, PtyPy 91, Poisson LLK는 ptyrs 70.9, PtyPy 137(시작 76.7)이고, FRC 최소 0.49, 평균 0.83입니다. PtyPy DM은 시뮬레이션(M1)에서만 비교했습니다.
 - B3 덕분에 ptyrs끼리는 비트 단위 회귀 테스트가 가능하고, 1·2·4 GPU 결과가 같은 기종에서 비트 단위로 일치하는지도 검사합니다(불변식 8).
 - 호스트 입력 경로는 같은 기계에서 같은 일(pvaPy 수신 + 해제 + 크롭 + GPU 전송)을 하는 Python 기준선과 처리량·CPU 사용량을 비교합니다.
 - 하드웨어 비교 기준은 데이터센터 GPU(A100 또는 H100) 1장에서 같은 데이터로 PyNX·pty-chi를 돌린 반복당 처리량입니다(§0 접는 조건 3).
