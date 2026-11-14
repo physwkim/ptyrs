@@ -5,9 +5,10 @@
 The state and counts are lsqml_near.py's (start object of ones, start probe, 16 whole-pixel
 corners, per geometry the Poisson counts of the truth), regenerated from its seed, and its
 GEOMETRIES: an angular-spectrum propagator, a Fresnel transform, an angular spectrum with an
-evanescent band and a Fresnel transform back. Per geometry pty-chi's BHReconstructor runs EPOCHS epochs of the engine's
-random_batches(16, size, SEED, epoch) with probe rho RHO and positions fixed, in two methods:
-"full", CG with one batch of every frame per epoch, and "mini", GD with batches of 6, 6 and 4.
+evanescent band and a Fresnel transform back. Per geometry pty-chi's BHReconstructor runs
+EPOCHS epochs of the engine's random_batches(16, size, SEED, epoch) with probe rho RHO and
+positions fixed, in two methods: "full", CG with one batch of every frame per epoch, and
+"mini", GD with batches of 6, 6 and 4.
 
 In the engine's convention (lsqml_near.py) pty-chi's probe is P / sqrt(k), k its
 get_intensity_scaling_factor, and its psi_far is U psi with U unitary, so d, A and the
