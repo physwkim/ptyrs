@@ -14,8 +14,10 @@ pub trait Waves {
     fn values(&self) -> usize;
     /// The allocation a launch leases.
     fn raw(&self) -> &RawDeviceBuffer;
-    /// The address and format the kernels take.
+    /// The address the kernels take, and the f16 scale.
     fn ptr(&self) -> PsiPtr;
+    /// Whether the values are f16 pairs: which build of a wave kernel reads and writes them.
+    fn half(&self) -> bool;
 }
 
 impl Waves for DeviceBuffer<C32> {
@@ -29,6 +31,10 @@ impl Waves for DeviceBuffer<C32> {
 
     fn ptr(&self) -> PsiPtr {
         psi_f32(dptr(self))
+    }
+
+    fn half(&self) -> bool {
+        false
     }
 }
 
@@ -91,10 +97,13 @@ impl Waves for HalfWaves {
     fn ptr(&self) -> PsiPtr {
         PsiPtr {
             ptr: dptr(&self.buf),
-            half: 1,
             scale: self.scale,
             unscale: 1.0 / self.scale,
         }
+    }
+
+    fn half(&self) -> bool {
+        true
     }
 }
 
