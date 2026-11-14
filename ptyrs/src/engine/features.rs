@@ -9,7 +9,8 @@ use std::ops::Range;
 use crate::base::{C64, Object, Probe, Stack, View};
 
 use crate::engine::ops::{blend, natural};
-use crate::engine::{EngineError, Fft2, Observed, Ptycho, shift};
+use crate::engine::sampling::Sampler;
+use crate::engine::{EngineError, Fft2, Observed, Ptycho, Sampling, shift};
 
 /// The features of a reconstruction's model intensity, each modelled and refined while set;
 /// `Default` sets none and leaves every loop's arithmetic as it is without features.
@@ -31,24 +32,26 @@ pub struct Features {
     /// background's photons out of both sums.
     pub background: Option<Vec<f64>>,
     /// Per-frame position offsets `d`, `[nframe]` of `[dy, dx]` object pixels from each frame's
-    /// view corner: the frame's probe modes are those of [`obj_probe_shift_to_psi`], `P·q`
+    /// view corner, entering the exit waves `O·W` of [`obj_probe_shift_to_psi`] as the
+    /// engine's [`Sampling`] models them: under [`Sampling::Patch`] the probe modes `W = P·q`
     /// Fourier-moved by `d[f]` on the frame's own periodic grid (an offset past the frame
-    /// wraps), the object window staying at the corner. After each AP, DM and ML cycle's
-    /// object and probe update, pty-chi's gradient position step from the exit-wave
-    /// correction `c = x − O·W` of the cycle's projection (`x` the new exit waves, `W` the
-    /// moved probe and `O` the object it was made from; ML, which projects nothing, takes the
+    /// wraps), the object window `O` staying at the corner; under [`Sampling::FullObject`]
+    /// `W = P·q` and `O` the object sampled at the corner plus `d[f]`. After each AP, DM and
+    /// ML cycle's object and probe update, pty-chi's gradient position step from the
+    /// exit-wave correction `c = x − O·W` of the cycle's projection (`x` the new exit waves,
+    /// `O·W` of the object and probe it was made from; ML, which projects nothing, takes the
     /// magnitude projection of the estimate its cycle starts from): per frame and axis, over
-    /// the frame's views and pixels, `Δ = 0.3·Re Σ conj(c)·O·∂W / (Σ |O·∂W|² + max_f Σ
-    /// |O·∂W|²)` (0 where that is 0) clipped to ±0.1, then `d += Δ − mean_f Δ`, which keeps
-    /// the mean offset. pty-chi's clip at 10 MADs of `Δ` is left out.
+    /// the frame's views and pixels, `Δ = 0.3·Re Σ conj(c)·∂ψ / (Σ |∂ψ|² + max_f Σ |∂ψ|²)`
+    /// (0 where that is 0) with `∂ψ = ∂(O·W)/∂d`, clipped to ±0.1, then `d += Δ − mean_f Δ`,
+    /// which keeps the mean offset. pty-chi's clip at 10 MADs of `Δ` is left out.
     ///
-    /// [`crate::engine::Lsqml`] models it on every slice through the moved probe and steps it
-    /// as pty-chi's LSQML does, after each batch's object and probe update, and
+    /// [`crate::engine::Lsqml`] models it on every slice and steps it as pty-chi's LSQML does,
+    /// after each batch's object and probe update, and
     /// [`Ptycho::rpie`](crate::engine::Ptycho::rpie) as pty-chi's PIE does:
     /// [`crate::engine::LsqmlBatch::position_directions`] times 0.3 at the batch's frames, 0
     /// at the others, each axis clipped to `min(10·mean_f |dx − mean dx|, 0.1)` over all
-    /// frames, with no mean subtracted. Both models are pty-chi's while every `|d| ≤ 1/2`,
-    /// past which pty-chi moves the window to the nearest pixel.
+    /// frames, with no mean subtracted. [`Sampling::Patch`] is pty-chi's while every
+    /// `|d| ≤ 1/2`, past which pty-chi moves the window to the nearest pixel.
     pub position: Option<Vec<[f64; 2]>>,
 }
 
@@ -398,18 +401,19 @@ pub(crate) fn move_derivative(
 }
 
 /// [`crate::engine::obj_probe_to_psi`] with frame `f` at its view corner plus `offsets[f]` (`[dy, dx]`
-/// object pixels), pty-chi LSQML's sub-pixel position model: the window stays on whole object
-/// pixels and every probe mode `P·q` is Fourier-translated by the offset on its own periodic
-/// grid, `W = DFT⁻¹(DFT(P·q)·exp(−2πi f·offset))` with `f` numpy's `fftfreq`:
-/// `psi[k] = fftshift(W[probe_k, frame_k] · O[obj_k, win_k])`.
+/// object pixels) under `p`'s [`Ptycho::sampling`]. Under [`Sampling::Patch`], pty-chi's
+/// `PATCH`, the window stays on whole object pixels and every probe mode `P·q` is
+/// Fourier-translated by the offset on its own periodic grid,
+/// `W = DFT⁻¹(DFT(P·q)·exp(−2πi f·offset))` with `f` numpy's `fftfreq`:
+/// `psi[k] = fftshift(W[probe_k, frame_k] · O[obj_k, win_k])`. Under [`Sampling::FullObject`]
+/// `W` is `P·q` and the window is sampled at the corner plus the offset.
 ///
 /// `views` are those of `p` to model, `p`'s object, probe and quadratic phase the state; `psi`
 /// holds one object-plane plane per view and is overwritten; with zero offsets it is
 /// [`crate::engine::obj_probe_to_psi`] up to FFT rounding.
 pub fn obj_probe_shift_to_psi(p: &Ptycho, views: &[View], offsets: &[[f64; 2]], psi: &mut [C64]) {
-    let (object, probe) = (p.object(), p.probe());
-    let fft = &Fft2::new(probe.plane_shape());
-    Shifted::new(views, probe, p.quad(), offsets, fft).to_psi(views, object, psi);
+    let shifted = p.shifted_views(views, p.probe(), offsets);
+    shifted.to_psi(views, p.object(), psi);
 }
 
 /// pty-chi's position step size and per-axis update limit, in object pixels.
@@ -435,6 +439,17 @@ pub(crate) fn gradient_sums(patch: &[C64], w: &[C64], chi: &[C64], fft: &Fft2) -
         fft.inverse(&mut g);
         g
     });
+    derivative_sums([&grad[0], &grad[1]], w, chi, [ny, nx])
+}
+
+/// [`gradient_sums`] of the window's derivatives `grad` (`[∂O/∂y, ∂O/∂x]`, natural layout,
+/// `[ny, nx]`), under [`Sampling::FullObject`] those of the sampled window.
+pub(crate) fn derivative_sums(
+    grad: [&[C64]; 2],
+    w: &[C64],
+    chi: &[C64],
+    [ny, nx]: [usize; 2],
+) -> [[f64; 2]; 2] {
     let mut sums = [[0.0; 2]; 2];
     for (j, (w, c)) in w.iter().zip(chi).enumerate() {
         let (i, _, _) = natural(j, ny, nx);
@@ -476,42 +491,130 @@ pub(crate) fn batch_position_step(d: &mut [[f64; 2]], frames: &[usize], delta: &
     }
 }
 
-/// A probe under [`Features::position`]: its spectra and every view's moved probe `W`, which
-/// take the place of `q·P` in the operators of [`crate::engine::ops`].
+/// How a [`Shifted`] models the offsets, its [`Sampling`].
+enum Mover {
+    /// [`Sampling::Patch`]: the probe moves; [`probe_spectra`] of it.
+    Probe(Vec<C64>),
+    /// [`Sampling::FullObject`]: each view samples the object at its position.
+    Object(Sampler),
+}
+
+/// The object windows a [`Shifted`] reads of one object.
+enum Windows<'o> {
+    /// The object itself, read at each view's corner.
+    Integer(&'o Object),
+    /// One sampled window per view, natural layout.
+    Sampled(Object),
+}
+
+impl Windows<'_> {
+    /// View `k`'s (`v`'s) window at shifted index `j` of a `[ny, nx]` plane.
+    fn at(&self, k: usize, v: &View, [ny, nx]: [usize; 2], j: usize) -> C64 {
+        let (i, y, x) = natural(j, ny, nx);
+        match self {
+            Self::Integer(o) => {
+                let nxo = o.plane_shape()[1];
+                o.plane(v.obj as usize)[(v.oy as usize + y) * nxo + v.ox as usize + x]
+            }
+            Self::Sampled(w) => w.plane(k)[i],
+        }
+    }
+}
+
+/// A probe under [`Features::position`] on a set of views: every view's wave `W`, which takes
+/// the place of `q·P` in the operators of [`crate::engine::ops`], and the object window it
+/// multiplies. Under [`Sampling::Patch`] `W` is `q·P` moved by the frame's offset and the
+/// window the integer one; under [`Sampling::FullObject`] `W` is `q·P` and the window is
+/// sampled at the corner plus the offset.
 pub(crate) struct Shifted {
     shape: [usize; 2],
     offsets: Vec<[f64; 2]>,
-    /// The quadratic phase `q` the probe was moved with.
+    /// The quadratic phase `q` of the waves.
     quad: Vec<C64>,
-    /// [`probe_spectra`] of the probe.
-    spectra: Vec<C64>,
+    mover: Mover,
     /// `W` of every view, one shifted plane per view.
     waves: Vec<C64>,
 }
 
 impl Shifted {
-    /// `probe` (with the quadratic phase `quad`) moved by `offsets` for every view of `views`.
+    /// `probe` (with the quadratic phase `quad`) under `offsets` (by frame) for every view of
+    /// `views` on `[nyo, nxo]` object planes `obj`, as `sampling` models them.
     pub(crate) fn new(
         views: &[View],
         probe: &Probe,
         quad: &[C64],
         offsets: &[[f64; 2]],
+        sampling: Sampling,
+        obj: [usize; 2],
+        fft: &Fft2,
+    ) -> Self {
+        let mover = match sampling {
+            Sampling::Patch => Mover::Probe(probe_spectra(probe, quad, fft)),
+            Sampling::FullObject => {
+                let d = views.iter().map(|v| offsets[v.frame as usize]);
+                Mover::Object(Sampler::new(obj, probe.plane_shape(), views, d))
+            }
+        };
+        Self::with_mover(views, probe, quad, offsets, mover, fft)
+    }
+
+    fn with_mover(
+        views: &[View],
+        probe: &Probe,
+        quad: &[C64],
+        offsets: &[[f64; 2]],
+        mover: Mover,
         fft: &Fft2,
     ) -> Self {
         let shape = probe.plane_shape();
         let n = shape[0] * shape[1];
-        let spectra = probe_spectra(probe, quad, fft);
         let mut waves = Vec::with_capacity(views.len() * n);
         for v in views {
-            let a = &spectra[v.probe as usize * n..][..n];
-            waves.extend(translate(a, offsets[v.frame as usize], None, fft));
+            match &mover {
+                Mover::Probe(spectra) => {
+                    let a = &spectra[v.probe as usize * n..][..n];
+                    waves.extend(translate(a, offsets[v.frame as usize], None, fft));
+                }
+                Mover::Object(_) => {
+                    let p = probe.plane(v.probe as usize);
+                    waves.extend((0..n).map(|j| {
+                        let (i, _, _) = natural(j, shape[0], shape[1]);
+                        p[i] * quad[i]
+                    }));
+                }
+            }
         }
         Self {
             shape,
             offsets: offsets.to_vec(),
             quad: quad.to_vec(),
-            spectra,
+            mover,
             waves,
+        }
+    }
+
+    /// `self` at `probe`: the same views, offsets and model.
+    pub(crate) fn with_probe(&self, views: &[View], probe: &Probe, fft: &Fft2) -> Self {
+        let mover = match &self.mover {
+            Mover::Probe(_) => Mover::Probe(probe_spectra(probe, &self.quad, fft)),
+            Mover::Object(s) => Mover::Object(s.clone()),
+        };
+        Self::with_mover(views, probe, &self.quad, &self.offsets, mover, fft)
+    }
+
+    /// The sampling of [`Sampling::FullObject`], `None` under [`Sampling::Patch`].
+    pub(crate) fn sampler(&self) -> Option<&Sampler> {
+        match &self.mover {
+            Mover::Probe(_) => None,
+            Mover::Object(s) => Some(s),
+        }
+    }
+
+    /// The windows of `object` the views read.
+    fn windows<'o>(&self, object: &'o Object) -> Windows<'o> {
+        match &self.mover {
+            Mover::Probe(_) => Windows::Integer(object),
+            Mover::Object(s) => Windows::Sampled(s.windows(object, &[])),
         }
     }
 
@@ -523,7 +626,8 @@ impl Shifted {
     /// not the diagonal `Σ|O|²`, so each probe mode takes the first conjugate-gradient step
     /// preconditioned by `D = Σ|O|² + reg`: `P += α·s`, `s = g / D`, `g = A^H(psi − A·P)`,
     /// `α = <g, s> / (‖A·s‖² + reg·‖s‖²)`. The overlap error `‖psi − A·P‖²` cannot rise, the
-    /// fixed points are `g = 0`, and with no move `α = 1` and this is `blend`.
+    /// fixed points are `g = 0`, and with no move (no offsets, or [`Sampling::FullObject`])
+    /// `α = 1` and this is `blend`. The object takes `blend` of its sums under either model.
     pub(crate) fn psi_to_obj_probe(
         &self,
         views: &[View],
@@ -558,7 +662,7 @@ impl Shifted {
                     curvature[m] += reg * s.norm_sqr();
                 }
             }
-            let moved = Shifted::new(views, &step, &self.quad, &self.offsets, fft);
+            let moved = self.with_probe(views, &step, fft);
             moved.to_psi(views, object, &mut residual);
             for (v, x) in views.iter().zip(residual.chunks_exact(n)) {
                 curvature[v.probe as usize] += x.iter().map(|c| c.norm_sqr()).sum::<f64>();
@@ -586,15 +690,8 @@ impl Shifted {
         &self.waves[k * n..(k + 1) * n]
     }
 
-    /// The object window of view `v` at shifted index `j`.
-    fn window(&self, object: &Object, v: &View, j: usize) -> C64 {
-        let [ny, nx] = self.shape;
-        let (_, y, x) = natural(j, ny, nx);
-        let nxo = object.plane_shape()[1];
-        object.plane(v.obj as usize)[(v.oy as usize + y) * nxo + v.ox as usize + x]
-    }
-
-    /// [`crate::engine::obj_probe_to_psi`] with `W` in place of `q·P`: `psi[k] = W[k]·O[win_k]`.
+    /// [`crate::engine::obj_probe_to_psi`] with `W` in place of `q·P` and the model's windows:
+    /// `psi[k] = W[k]·O[win_k]`.
     pub(crate) fn to_psi(&self, views: &[View], object: &Object, psi: &mut [C64]) {
         let n = self.shape[0] * self.shape[1];
         assert_eq!(
@@ -602,19 +699,20 @@ impl Shifted {
             views.len() * n,
             "psi must hold one plane per view"
         );
-        for ((v, out), w) in views
-            .iter()
-            .zip(psi.chunks_exact_mut(n))
+        let win = self.windows(object);
+        for (k, ((v, out), w)) in (views.iter().zip(psi.chunks_exact_mut(n)))
             .zip(self.waves.chunks_exact(n))
+            .enumerate()
         {
             for (j, (out, w)) in out.iter_mut().zip(w).enumerate() {
-                *out = w * self.window(object, v, j);
+                *out = w * win.at(k, v, self.shape, j);
             }
         }
     }
 
     /// [`crate::engine::accumulate_obj`] with `W` in place of `q·P`: `num += psi·conj(W)`,
-    /// `norm += |W|²`.
+    /// `norm += |W|²` on each view's window, under [`Sampling::FullObject`] placed by the
+    /// sampling's adjoint with `norm`'s real part floored at 0.
     pub(crate) fn accumulate_obj(
         &self,
         views: &[View],
@@ -625,6 +723,22 @@ impl Shifted {
         let n = ny * nx;
         let nxo = obj_dims[2];
         assert_eq!(psi.len(), views.len() * n);
+        if let Mover::Object(s) = &self.mover {
+            let mut num = vec![C64::default(); psi.len()];
+            let mut norm = vec![0.0; psi.len()];
+            for (k, (x, w)) in psi
+                .chunks_exact(n)
+                .zip(self.waves.chunks_exact(n))
+                .enumerate()
+            {
+                for (j, (x, w)) in x.iter().zip(w).enumerate() {
+                    let i = k * n + shift(j, ny, nx);
+                    num[i] = x * w.conj();
+                    norm[i] = w.norm_sqr();
+                }
+            }
+            return (s.place(&num, obj_dims[0]), s.place_norm(&norm, obj_dims[0]));
+        }
         let mut num = Stack::filled(obj_dims, C64::default());
         let mut norm = Stack::filled(obj_dims, 0.0);
         for ((v, x), w) in views
@@ -651,6 +765,8 @@ impl Shifted {
     /// `num = conj(q)·Σ_f DFT⁻¹(DFT(Y_f)·conj(exp(−2πi f·d[f])))` with
     /// `Y_f = Σ conj(O[win])·psi` over the frame's views of that mode, summed in the spectrum
     /// frame by frame, and `norm = Σ |O[win]|²` as the unmoved one. The probe does not enter.
+    /// Under [`Sampling::FullObject`] nothing moves and `num = conj(q)·Σ_f Y_f` of the sampled
+    /// windows.
     pub(crate) fn accumulate_probe(
         &self,
         views: &[View],
@@ -662,6 +778,8 @@ impl Shifted {
         let [_, ny, nx] = probe_dims;
         let n = ny * nx;
         assert_eq!(psi.len(), views.len() * n);
+        let win = self.windows(object);
+        let moves = matches!(self.mover, Mover::Probe(_));
         let mut spectrum = Stack::filled(probe_dims, C64::default());
         let mut norm = Stack::filled(probe_dims, 0.0);
         let mut y = Stack::filled(probe_dims, C64::default());
@@ -669,28 +787,38 @@ impl Shifted {
         for frame_views in views.chunk_by(|a, b| a.frame == b.frame) {
             let offset = self.offsets[frame_views[0].frame as usize];
             y.as_mut_slice().fill(C64::default());
-            for (v, x) in frame_views.iter().zip(psi[start * n..].chunks_exact(n)) {
+            for (k, (v, x)) in (frame_views.iter().zip(psi[start * n..].chunks_exact(n)))
+                .enumerate()
+                .map(|(k, vx)| (start + k, vx))
+            {
                 let (y, norm) = (
                     y.plane_mut(v.probe as usize),
                     norm.plane_mut(v.probe as usize),
                 );
                 for (j, x) in x.iter().enumerate() {
-                    let o = self.window(object, v, j);
+                    let o = win.at(k, v, [ny, nx], j);
                     y[j] += o.conj() * x;
                     norm[shift(j, ny, nx)] += o.norm_sqr();
                 }
             }
             start += frame_views.len();
-            fft.forward(y.as_mut_slice());
+            if moves {
+                fft.forward(y.as_mut_slice());
+            }
             for (s, y) in
                 (spectrum.as_mut_slice().chunks_exact_mut(n)).zip(y.as_slice().chunks_exact(n))
             {
                 for (j, (s, y)) in s.iter_mut().zip(y).enumerate() {
-                    *s += y * ramp(j, [ny, nx], offset).1.conj();
+                    *s += match moves {
+                        true => y * ramp(j, [ny, nx], offset).1.conj(),
+                        false => *y,
+                    };
                 }
             }
         }
-        fft.inverse(spectrum.as_mut_slice());
+        if moves {
+            fft.inverse(spectrum.as_mut_slice());
+        }
         let mut num = Stack::filled(probe_dims, C64::default());
         for (num, s) in
             (num.as_mut_slice().chunks_exact_mut(n)).zip(spectrum.as_slice().chunks_exact(n))
@@ -703,10 +831,41 @@ impl Shifted {
         (num, norm)
     }
 
+    /// Per view of `views`, the exit wave's derivative over its frame's offset component
+    /// `axis`, in exit-wave layout: `O[win]·∂W` under [`Sampling::Patch`], `W·∂O[win]` with the
+    /// sampled window's derivative under [`Sampling::FullObject`].
+    fn derivatives(&self, views: &[View], object: &Object, axis: usize, fft: &Fft2) -> Vec<C64> {
+        let [ny, nx] = self.shape;
+        let n = ny * nx;
+        let mut out = Vec::with_capacity(views.len() * n);
+        match &self.mover {
+            Mover::Probe(spectra) => {
+                let win = Windows::Integer(object);
+                for (k, v) in views.iter().enumerate() {
+                    let a = &spectra[v.probe as usize * n..][..n];
+                    let dw = translate(a, self.offsets[v.frame as usize], Some(axis), fft);
+                    out.extend(
+                        dw.iter()
+                            .enumerate()
+                            .map(|(j, dw)| win.at(k, v, self.shape, j) * dw),
+                    );
+                }
+            }
+            Mover::Object(s) => {
+                let dwin = s.windows(object, &[axis]);
+                for (k, w) in self.waves.chunks_exact(n).enumerate() {
+                    let d = dwin.plane(k);
+                    out.extend(w.iter().enumerate().map(|(j, w)| w * d[shift(j, ny, nx)]));
+                }
+            }
+        }
+        out
+    }
+
     /// Per frame of the offsets, `[num, den]` of the position step of [`Features::position`]
-    /// over the frame's views of `views` and pixels: `num[a] = Re Σ conj(c)·O·∂W/∂d[a]` with
-    /// `c = x − O·W`, `x` the new exit waves `psi` and `O` the object the projection read, and
-    /// `den[a] = Σ |O·∂W/∂d[a]|²`.
+    /// over the frame's views of `views` and pixels: `num[a] = Re Σ conj(c)·∂psi/∂d[a]` with
+    /// `c = x − O·W`, `x` the new exit waves `psi`, `O` the object window the projection read
+    /// and `∂psi` [`Self::derivatives`], and `den[a] = Σ |∂psi/∂d[a]|²`.
     pub(crate) fn position_sums(
         &self,
         views: &[View],
@@ -716,20 +875,18 @@ impl Shifted {
     ) -> Vec<[[f64; 2]; 2]> {
         let n = self.shape[0] * self.shape[1];
         assert_eq!(psi.len(), views.len() * n);
+        let win = self.windows(object);
+        let dpsi = [0, 1].map(|axis| self.derivatives(views, object, axis, fft));
         let mut sums = vec![[[0.0; 2]; 2]; self.offsets.len()];
-        for ((v, x), w) in views
-            .iter()
-            .zip(psi.chunks_exact(n))
+        for (k, ((v, x), w)) in (views.iter().zip(psi.chunks_exact(n)))
             .zip(self.waves.chunks_exact(n))
+            .enumerate()
         {
-            let f = v.frame as usize;
-            let a = &self.spectra[v.probe as usize * n..][..n];
-            let [num, den] = &mut sums[f];
+            let [num, den] = &mut sums[v.frame as usize];
             for (axis, (num, den)) in num.iter_mut().zip(den).enumerate() {
-                let dw = translate(a, self.offsets[f], Some(axis), fft);
-                for (j, ((x, w), dw)) in x.iter().zip(w).zip(&dw).enumerate() {
-                    let o = self.window(object, v, j);
-                    let odw = o * dw;
+                let dpsi = &dpsi[axis][k * n..(k + 1) * n];
+                for (j, ((x, w), odw)) in x.iter().zip(w).zip(dpsi).enumerate() {
+                    let o = win.at(k, v, self.shape, j);
                     *num += ((x - w * o).conj() * odw).re;
                     *den += odw.norm_sqr();
                 }
@@ -764,7 +921,8 @@ pub(crate) fn position_step(d: &mut [[f64; 2]], sums: &[[[f64; 2]; 2]]) {
 
 /// Gradient of `cost` over the offsets of [`obj_probe_shift_to_psi`]: `[∂C/∂dy, ∂C/∂dx]` for
 /// every frame of `offsets` (zero for a frame without views),
-/// `Σ_views Σ Re(conj(g)·V·∂W/∂offset)` with `V` the object window and
+/// `Σ_views Σ Re(conj(g)·∂psi/∂offset)` with `∂psi` `V·∂W` (`V` the object window) under
+/// [`Sampling::Patch`] and `W·∂V` under [`Sampling::FullObject`], and
 /// `g = 2·∂C/∂exit* = 2·DFT⁻¹(slope·psi)` from the far field `psi` of the frame's modes against
 /// `p`'s observed intensities.
 pub fn position_grad(
@@ -776,12 +934,12 @@ pub fn position_grad(
     let (object, probe, obs) = (p.object(), p.probe(), p.observed());
     let [ny, nx] = probe.plane_shape();
     let n = ny * nx;
-    let nxo = object.plane_shape()[1];
     let fft = &Fft2::new([ny, nx]);
+    let shifted = p.shifted_views(views, probe, offsets);
     let mut g = vec![C64::default(); views.len() * n];
-    obj_probe_shift_to_psi(p, views, offsets, &mut g);
+    shifted.to_psi(views, object, &mut g);
     fft.forward(&mut g);
-    let a = probe_spectra(probe, p.quad(), fft);
+    let dpsi = [0, 1].map(|axis| shifted.derivatives(views, object, axis, fft));
     let mut grad = vec![[0.0; 2]; offsets.len()];
     let mut start = 0;
     for frame_views in views.chunk_by(|a, b| a.frame == b.frame) {
@@ -799,19 +957,11 @@ pub fn position_grad(
             }
         }
         fft.inverse(block);
-        for (v, g) in frame_views.iter().zip(block.chunks_exact(n)) {
-            let o = object.plane(v.obj as usize);
+        for (k, g) in (start - nmode..start).zip(block.chunks_exact(n)) {
             for (axis, grad) in grad[f].iter_mut().enumerate() {
-                let dw = translate(&a[v.probe as usize * n..][..n], offsets[f], Some(axis), fft);
-                *grad += g
-                    .iter()
-                    .zip(&dw)
-                    .enumerate()
-                    .map(|(j, (g, dw))| {
-                        let (_, y, x) = natural(j, ny, nx);
-                        let v = o[(v.oy as usize + y) * nxo + v.ox as usize + x];
-                        (g.conj() * v * dw).re
-                    })
+                let dpsi = &dpsi[axis][k * n..(k + 1) * n];
+                *grad += (g.iter().zip(dpsi))
+                    .map(|(g, d)| (g.conj() * d).re)
                     .sum::<f64>();
             }
         }

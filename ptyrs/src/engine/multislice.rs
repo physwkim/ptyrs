@@ -11,13 +11,18 @@
 //! so a frame whose probe is moved by an offset takes the phase displaced by it. At one
 //! slice the probe's move carries the phase; with more, the last slice applies the frame's
 //! [`Optics::moved_quad`].
+//!
+//! Under [`Sampling::FullObject`] nothing moves: every slice is read through each view's
+//! window sampled at its corner plus the frame's offset ([`Sampler`]), and the maps of an
+//! object change take that sampling, or its adjoint, around the same model on the windows.
 
 use std::borrow::Cow;
 
 use crate::base::{C64, Object, Probe, Stack, View};
 
 use crate::engine::ops::{accumulate_obj, accumulate_probe, obj_probe_to_psi};
-use crate::engine::{MovedQuad, Optics, shift};
+use crate::engine::sampling::Sampler;
+use crate::engine::{MovedQuad, Optics, Sampling, shift};
 
 /// The frames' displaced plane phase on the last slice.
 struct Moved {
@@ -30,7 +35,10 @@ struct Moved {
 /// entering each slice and the exit wave.
 pub struct SliceWaves<'a> {
     optics: &'a Optics,
-    objects: &'a [Object],
+    /// Per slice, what the views read: the slice's object, or under [`Sampling::FullObject`]
+    /// its sampled windows, plane `k` view `k`'s.
+    objects: Cow<'a, [Object]>,
+    /// The views on [`Self::objects`].
     views: Vec<View>,
     probe_dims: [usize; 3],
     /// `views` with view `k` reading plane `k`, the layout of [`Self::incident`].
@@ -42,19 +50,47 @@ pub struct SliceWaves<'a> {
     unit: Vec<C64>,
     /// `Some` where the last slice's phase differs between the frames.
     moved: Option<Moved>,
+    /// The windows' sampling under [`Sampling::FullObject`].
+    sampler: Option<Sampler>,
+    /// A slice's object dims.
+    obj_dims: [usize; 3],
+}
+
+/// Per view of `views`, the index of its frame among the frames of `views` in their order.
+fn local_frames(views: &[View]) -> Vec<usize> {
+    let mut frame = Vec::with_capacity(views.len());
+    for (k, v) in views.iter().enumerate() {
+        let next = k > 0 && v.frame != views[k - 1].frame;
+        frame.push(frame.last().map_or(0, |&f| f + next as usize));
+    }
+    frame
 }
 
 impl<'a> SliceWaves<'a> {
     /// `objects` holds one object per slice of `optics`, all of one shape; view `k` reads
     /// probe plane `views[k].probe` and object mode `views[k].obj` of every slice. `offsets`
     /// holds, per frame of `views` in their order, the offset its probe planes were moved by
-    /// (`None` for unmoved planes).
+    /// (`None` for unmoved planes): [`Self::with_sampling`] under [`Sampling::Patch`].
     pub fn new(
         optics: &'a Optics,
         views: &[View],
         objects: &'a [Object],
         probe: &Probe,
         offsets: Option<&[[f64; 2]]>,
+    ) -> Self {
+        Self::with_sampling(optics, views, objects, probe, offsets, Sampling::Patch)
+    }
+
+    /// [`Self::new`] with `offsets` modelled as `sampling` does: under [`Sampling::FullObject`]
+    /// the probe planes are unmoved and every slice is read at each view's corner plus its
+    /// frame's offset.
+    pub fn with_sampling(
+        optics: &'a Optics,
+        views: &[View],
+        objects: &'a [Object],
+        probe: &Probe,
+        offsets: Option<&[[f64; 2]]>,
+        sampling: Sampling,
     ) -> Self {
         assert_eq!(
             objects.len(),
@@ -65,6 +101,29 @@ impl<'a> SliceWaves<'a> {
         assert_eq!(probe.plane_shape(), optics.exit().shape());
         let [ny, nx] = probe.plane_shape();
         let n = ny * nx;
+        let obj_dims = objects[0].dims();
+        let frames = local_frames(views);
+        if let Some(offsets) = offsets {
+            assert_eq!(frames.last().map_or(0, |f| f + 1), offsets.len());
+        }
+        let sampler = (offsets.filter(|_| sampling == Sampling::FullObject)).map(|d| {
+            let d = frames.iter().map(|&f| d[f]);
+            Sampler::new([obj_dims[1], obj_dims[2]], [ny, nx], views, d)
+        });
+        let (objects, views): (Cow<'a, [Object]>, Vec<View>) = match &sampler {
+            None => (Cow::Borrowed(objects), views.to_vec()),
+            Some(sm) => (
+                objects.iter().map(|o| sm.windows(o, &[])).collect(),
+                (views.iter().enumerate())
+                    .map(|(k, v)| View {
+                        obj: k as u32,
+                        oy: 0,
+                        ox: 0,
+                        ..*v
+                    })
+                    .collect(),
+            ),
+        };
         let own: Vec<View> = views
             .iter()
             .enumerate()
@@ -86,30 +145,29 @@ impl<'a> SliceWaves<'a> {
             gap.forward(&mut psi);
             incident.push(Probe::new(reshift(&psi, dims)));
         }
-        let moved = offsets.and_then(|offsets| {
+        let moved = (offsets.filter(|_| sampler.is_none())).and_then(|offsets| {
             let quads: Option<Vec<MovedQuad>> =
                 offsets.iter().map(|&d| optics.moved_quad(d)).collect();
-            let mut frame = Vec::with_capacity(views.len());
-            for (k, v) in views.iter().enumerate() {
-                let next = k > 0 && v.frame != views[k - 1].frame;
-                frame.push(frame.last().map_or(0, |&f| f + next as usize));
-            }
-            assert_eq!(frame.last().map_or(0, |f| f + 1), offsets.len());
-            quads.map(|quads| Moved { frame, quads })
+            quads.map(|quads| Moved {
+                frame: frames,
+                quads,
+            })
         });
         let mut waves = Self {
             optics,
             objects,
-            views: views.to_vec(),
+            views,
             probe_dims: probe.dims(),
             own,
             incident,
             psi: Vec::new(),
             unit,
             moved,
+            sampler,
+            obj_dims,
         };
-        let last = objects.len() - 1;
-        waves.to_psi(last, &objects[last], &waves.incident[last], &mut psi);
+        let last = waves.objects.len() - 1;
+        waves.to_psi(last, &waves.objects[last], &waves.incident[last], &mut psi);
         waves.psi = psi;
         waves
     }
@@ -230,7 +288,31 @@ impl<'a> SliceWaves<'a> {
     /// The change of the exit waves along a change `d_objects` of every slice and `d_probe`
     /// of the probe (planes as the probe's): the linearisation of [`Self::new`] at this state.
     pub fn tangent(&self, d_objects: &[Object], d_probe: &Probe) -> Vec<C64> {
-        self.tangent_waves(d_objects, d_probe).1
+        self.tangent_windows(&self.windows(d_objects), d_probe)
+    }
+
+    /// [`Self::tangent`] of a change `d_windows` of what the views read, [`Self::read`]'s.
+    pub(crate) fn tangent_windows(&self, d_windows: &[Object], d_probe: &Probe) -> Vec<C64> {
+        self.tangent_waves(d_windows, d_probe).1
+    }
+
+    /// Every slice's change `d` (`[nslice]`, object space) as the views read it.
+    fn windows<'d>(&self, d: &'d [Object]) -> Cow<'d, [Object]> {
+        match &self.sampler {
+            None => Cow::Borrowed(d),
+            Some(sm) => d.iter().map(|d| sm.windows(d, &[])).collect(),
+        }
+    }
+
+    /// The views and what they read on slice `s`: the slice's object, or under
+    /// [`Sampling::FullObject`] its sampled windows.
+    pub(crate) fn read(&self, s: usize) -> (&[View], &Object) {
+        (&self.views, &self.objects[s])
+    }
+
+    /// The windows' sampling under [`Sampling::FullObject`].
+    pub(crate) fn sampler(&self) -> Option<&Sampler> {
+        self.sampler.as_ref()
     }
 
     /// The derivatives of the exit waves along two changes `u` and `v`, each
@@ -239,6 +321,16 @@ impl<'a> SliceWaves<'a> {
     /// `q_s·O_s` times the mixed change of the wave entering it, `w_u,s` being that wave's
     /// change along `u`; at one slice `J″(u, v) = q·(u_O·v_P + v_O·u_P)`.
     pub fn second_order(&self, u: (&[Object], &Probe), v: (&[Object], &Probe)) -> [Vec<C64>; 3] {
+        let (uw, vw) = (self.windows(u.0), self.windows(v.0));
+        self.second_order_windows((&uw, u.1), (&vw, v.1))
+    }
+
+    /// [`Self::second_order`] of changes of what the views read, [`Self::read`]'s.
+    pub(crate) fn second_order_windows(
+        &self,
+        u: (&[Object], &Probe),
+        v: (&[Object], &Probe),
+    ) -> [Vec<C64>; 3] {
         let (wu, ju) = self.tangent_waves(u.0, u.1);
         let (wv, jv) = self.tangent_waves(v.0, v.1);
         let dims = self.incident[0].dims();
@@ -278,7 +370,7 @@ impl<'a> SliceWaves<'a> {
         let mut out = vec![C64::default(); self.psi.len()];
         for (s, (o, d)) in self.objects.iter().zip(d_objects).enumerate() {
             self.to_psi(s, o, &waves[s], &mut out);
-            self.obj_tangent(s, d)
+            self.window_tangent(s, d)
                 .iter()
                 .zip(out.iter_mut())
                 .for_each(|(t, o)| *o += t);
@@ -293,6 +385,14 @@ impl<'a> SliceWaves<'a> {
     /// The change of `psi_s` along `d` on slice `s` with the wave entering it held: `dop` of
     /// pty-chi's step sizes.
     pub fn obj_tangent(&self, s: usize, d: &Object) -> Vec<C64> {
+        match &self.sampler {
+            None => self.window_tangent(s, d),
+            Some(sm) => self.window_tangent(s, &sm.windows(d, &[])),
+        }
+    }
+
+    /// [`Self::obj_tangent`] of a change `d` of what the views read on slice `s`.
+    pub(crate) fn window_tangent(&self, s: usize, d: &Object) -> Vec<C64> {
         let mut out = vec![C64::default(); self.psi.len()];
         self.to_psi(s, d, &self.incident[s], &mut out);
         out
@@ -300,15 +400,25 @@ impl<'a> SliceWaves<'a> {
 
     /// Slice `s`'s object direction from its `chi_s` of [`Self::back_propagate`]: pty-chi's
     /// `delta_o_comb`, `Σ_views conj(q_s·in_s)·chi_s` scattered onto the slice
-    /// ([`accumulate_obj`]).
+    /// ([`accumulate_obj`]), under [`Sampling::FullObject`] placed by the sampling's adjoint.
     pub fn obj_adjoint(&self, s: usize, chi_s: &[C64]) -> Stack<C64> {
+        let g = self.window_adjoint(s, chi_s);
+        match &self.sampler {
+            None => g,
+            Some(sm) => sm.place(g.as_slice(), self.obj_dims[0]),
+        }
+    }
+
+    /// [`Self::obj_adjoint`] onto what the views read on slice `s`, [`Self::read`]'s.
+    pub(crate) fn window_adjoint(&self, s: usize, chi_s: &[C64]) -> Stack<C64> {
         let dims = self.objects[s].dims();
         let chi = self.dephased(s, chi_s);
         accumulate_obj(&self.own, dims, &self.incident[s], self.shared(s), &chi).0
     }
 
     /// The probe direction from slice 0's `chi_0` and `Σ|O_0|²` per plane:
-    /// [`accumulate_probe`] over the views on slice 0.
+    /// [`accumulate_probe`] over the views on slice 0, its sampled windows under
+    /// [`Sampling::FullObject`].
     pub fn probe_adjoint(&self, chi_0: &[C64]) -> (Stack<C64>, Stack<f64>) {
         accumulate_probe(
             &self.views,
@@ -357,6 +467,13 @@ mod tests {
     const OFFSETS: [Option<&[[f64; 2]]>; 2] =
         [None, Some(&[[0.3, -0.2], [-0.45, 0.1], [0.2, 0.4]])];
 
+    /// No offsets, and the three frames' under either sampling.
+    const CASES: [(Option<&[[f64; 2]]>, Sampling); 3] = [
+        (OFFSETS[0], Sampling::Patch),
+        (OFFSETS[1], Sampling::Patch),
+        (OFFSETS[1], Sampling::FullObject),
+    ];
+
     fn far_geometry() -> Geometry {
         Geometry::new(1e-10, 1.0, 1e-4, [8, 6]).unwrap()
     }
@@ -375,8 +492,10 @@ mod tests {
     #[test]
     fn slice_jacobian_registers_as_the_adjoint_of_the_tangent() {
         let (addr, objects, probe) = setup();
-        for (optics, offsets) in optics().iter().flat_map(|o| OFFSETS.map(|d| (o, d))) {
-            let waves = SliceWaves::new(optics, addr.views(), &objects, &probe, offsets);
+        for (optics, (offsets, sampling)) in optics().iter().flat_map(|o| CASES.map(|c| (o, c))) {
+            let views = addr.views();
+            let waves =
+                SliceWaves::with_sampling(optics, views, &objects, &probe, offsets, sampling);
             let op = SliceJacobian {
                 waves: &waves,
                 obj_dims: objects[0].dims(),
@@ -400,7 +519,12 @@ mod tests {
             a.iter().zip(d).map(|(a, d)| a + d * t).collect()
         };
         let h = 1e-5;
-        for (optics, offsets) in optics().iter().flat_map(|o| OFFSETS.map(|d| (o, d))) {
+        for (optics, (offsets, sampling)) in optics().iter().flat_map(|o| CASES.map(|c| (o, c))) {
+            let waves = |o: &[Object], p: &Probe| {
+                SliceWaves::with_sampling(optics, addr.views(), o, p, offsets, sampling)
+                    .psi()
+                    .to_vec()
+            };
             let psi_at = |t: f64| {
                 let o: Vec<Object> = objects
                     .iter()
@@ -412,13 +536,13 @@ mod tests {
                     .collect();
                 let v = moved(probe.as_slice(), d_probe.as_slice(), t);
                 let p = Probe::new(Stack::from_vec(probe.dims(), v).unwrap());
-                SliceWaves::new(optics, addr.views(), &o, &p, offsets)
-                    .psi()
-                    .to_vec()
+                waves(&o, &p)
             };
             let (plus, minus) = (psi_at(h), psi_at(-h));
-            let tangent = SliceWaves::new(optics, addr.views(), &objects, &probe, offsets)
-                .tangent(&d_obj, &d_probe);
+            let views = addr.views();
+            let tangent =
+                SliceWaves::with_sampling(optics, views, &objects, &probe, offsets, sampling)
+                    .tangent(&d_obj, &d_probe);
             let scale = tangent.iter().map(|t| t.norm()).fold(0.0, f64::max);
             let err = worst_of(
                 plus.iter()
@@ -427,6 +551,102 @@ mod tests {
                     .map(|((p, m), t)| ((p - m) / (2.0 * h) - t).norm()),
             );
             assert!(err / scale < 1e-8, "tangent error {:.3e}", err / scale);
+        }
+    }
+
+    /// Without offsets [`Sampling::FullObject`] reads the windows at their corners, as
+    /// [`Sampling::Patch`] does: the same waves and adjoints.
+    #[test]
+    fn full_object_without_offsets_is_patch() {
+        let (addr, objects, probe) = setup();
+        let zero = [[0.0; 2]; 3];
+        let close = |what: &str, a: &[C64], b: &[C64]| {
+            let scale = b.iter().map(|b| b.norm()).fold(0.0, f64::max);
+            let err = worst_of(a.iter().zip(b).map(|(a, b)| (a - b).norm()));
+            assert!(err <= 1e-14 * scale, "{what}: {err:.3e} of {scale:.3e}");
+        };
+        for optics in &optics() {
+            let views = addr.views();
+            let patch = SliceWaves::new(optics, views, &objects, &probe, None);
+            let full = Sampling::FullObject;
+            let full =
+                SliceWaves::with_sampling(optics, views, &objects, &probe, Some(&zero), full);
+            close("psi", full.psi(), patch.psi());
+            let chi = noise(patch.psi().len(), 7);
+            let (back, want) = (full.back_propagate(&chi), patch.back_propagate(&chi));
+            for s in 0..NSLICE {
+                close("chi", &back[s], &want[s]);
+                let adjoint = full.obj_adjoint(s, &back[s]);
+                close(
+                    "object",
+                    adjoint.as_slice(),
+                    patch.obj_adjoint(s, &want[s]).as_slice(),
+                );
+            }
+            let ((got, got_norm), (want, want_norm)) =
+                (full.probe_adjoint(&back[0]), patch.probe_adjoint(&want[0]));
+            close("probe", got.as_slice(), want.as_slice());
+            let re = |n: &Stack<f64>| n.as_slice().iter().map(|&n| C64::new(n, 0.0)).collect();
+            let (got_norm, want_norm): (Vec<C64>, Vec<C64>) = (re(&got_norm), re(&want_norm));
+            close("probe norm", &got_norm, &want_norm);
+        }
+    }
+
+    /// Under [`Sampling::FullObject`] a frame's offset displaces its sample under the fixed
+    /// probe and plane phase: its exit waves are the unmoved ones of the slices translated by
+    /// it, for slices periodic and band-limited on the object plane.
+    #[test]
+    fn a_full_object_offset_is_the_displaced_sample() {
+        use std::f64::consts::PI;
+
+        let (addr, _, probe) = setup();
+        let [nyo, nxo] = [14, 12];
+        let slices = |at: [f64; 2]| -> Vec<Object> {
+            (0..NSLICE as u64)
+                .map(|s| {
+                    // Six terms per mode below the Nyquist indices 7 and 6.
+                    let terms: Vec<(C64, [f64; 2])> = noise(24, 50 + s)
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|[c, k]| (0.3 * c, [(6.0 * k.re).round(), (5.0 * k.im).round()]))
+                        .collect();
+                    let v = (0..2 * nyo * nxo)
+                        .map(|i| {
+                            let (m, j) = (i / (nyo * nxo), i % (nyo * nxo));
+                            let t = [(j / nxo) as f64 + at[0], (j % nxo) as f64 + at[1]];
+                            let wave = |&(c, k): &(C64, [f64; 2])| {
+                                let f = k[0] * t[0] / nyo as f64 + k[1] * t[1] / nxo as f64;
+                                c * C64::from_polar(1.0, 2.0 * PI * f)
+                            };
+                            C64::new(1.0, 0.0) + terms[6 * m..][..6].iter().map(wave).sum::<C64>()
+                        })
+                        .collect();
+                    Object::new(Stack::from_vec([2, nyo, nxo], v).unwrap())
+                })
+                .collect()
+        };
+        let objects = slices([0.0; 2]);
+        for optics in &optics() {
+            for (f, &at) in OFFSETS[1].unwrap().iter().enumerate() {
+                let views: Vec<View> = (addr.views().iter())
+                    .filter(|v| v.frame as usize == f)
+                    .copied()
+                    .collect();
+                let full = Sampling::FullObject;
+                let got =
+                    SliceWaves::with_sampling(optics, &views, &objects, &probe, Some(&[at]), full);
+                let displaced = slices(at);
+                let want = SliceWaves::new(optics, &views, &displaced, &probe, None);
+                let scale = want.psi().iter().map(|w| w.norm()).fold(0.0, f64::max);
+                let err = worst_of(
+                    got.psi()
+                        .iter()
+                        .zip(want.psi())
+                        .map(|(g, w)| (g - w).norm()),
+                );
+                assert!(err < 1e-12 * scale, "frame {f}: {err:.3e} of {scale:.3e}");
+            }
         }
     }
 
