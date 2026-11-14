@@ -694,7 +694,9 @@ impl GpuPtycho {
     }
 
     /// Models and refines `features` from here on, as [`crate::engine::Ptycho::set_features`], in
-    /// `f32` on the device; with [`GpuOptions::fused`] only. An error leaves the current ones.
+    /// `f32` on the device; with [`GpuOptions::fused`] only. Rejected features leave the
+    /// current ones; after a device error, the new ones may stay modelled, with the LLK pass
+    /// run without its graph, or be partly written.
     pub fn set_features(&mut self, features: &Features) -> Result<(), EngineError> {
         let dims = self.dev.dims();
         let [ny, nx] = dims.frame.map(|n| n as usize);
@@ -798,15 +800,22 @@ impl Bufs<'_> {
                 }
             }
             PassesMut::Fused(f) => {
-                let m = self
-                    .features
-                    .lend(ctx, self.kernels, &dims, self.probe, self.exit)?;
+                let mut m = self.features.lend(
+                    ctx,
+                    self.kernels,
+                    &dims,
+                    self.obj,
+                    self.probe,
+                    self.exit,
+                )?;
                 for s in 0..self.scratch.len() {
                     let stack = self.scratch.at(s);
+                    let windows = self.windows.as_deref_mut();
+                    let (views, obj) = m.object(ctx, (self.views, self.obj), stack, windows)?;
                     let inputs = FusedInputs {
-                        views: self.views,
+                        views,
                         counts: self.counts,
-                        obj: self.obj,
+                        obj,
                         probe: self.probe,
                         model: m.model,
                     };
@@ -841,15 +850,17 @@ impl Bufs<'_> {
         mut llk: Option<RecordWriter<'_>>,
     ) -> Result<Option<Ended>, GpuError> {
         let dims = *self.views.dims();
-        let mut m = self
-            .features
-            .lend(ctx, self.kernels, &dims, self.probe, self.exit)?;
+        let mut m =
+            self.features
+                .lend(ctx, self.kernels, &dims, self.obj, self.probe, self.exit)?;
         for s in 0..self.scratch.len() {
             let stack = self.scratch.at(s);
+            let windows = self.windows.as_deref_mut();
+            let (views, obj) = m.object(ctx, (self.views, self.obj), stack, windows)?;
             let inputs = FusedInputs {
-                views: self.views,
+                views,
                 counts: self.counts,
-                obj: self.obj,
+                obj,
                 probe: self.probe,
                 model: m.model,
             };
