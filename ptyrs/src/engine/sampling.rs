@@ -186,7 +186,8 @@ mod tests {
     use crate::engine::linop::noise;
     use crate::worst::worst_of;
 
-    const OBJ: [usize; 2] = [12, 10];
+    /// Odd rows: index 5 of 11 is frequency +5/11, which one term of each mode reads.
+    const OBJ: [usize; 2] = [11, 10];
     const WINDOW: [usize; 2] = [6, 5];
 
     /// Two probe modes at one point of object mode 0, then object mode 1 past the plane's
@@ -287,7 +288,8 @@ mod tests {
     #[test]
     fn place_is_the_adjoint_of_windows() {
         let sm = Sampler::new(OBJ, WINDOW, &views(), OFFSETS);
-        let object = Object::new(Stack::from_vec([2, OBJ[0], OBJ[1]], noise(240, 1)).unwrap());
+        let n = OBJ[0] * OBJ[1];
+        let object = Object::new(Stack::from_vec([2, OBJ[0], OBJ[1]], noise(2 * n, 1)).unwrap());
         let patches = noise(4 * WINDOW[0] * WINDOW[1], 2);
         let dot = |a: &[C64], b: &[C64]| a.iter().zip(b).map(|(a, b)| a.conj() * b).sum::<C64>();
         let lhs = dot(sm.windows(&object, &[]).as_slice(), &patches);

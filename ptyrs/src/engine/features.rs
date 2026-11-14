@@ -304,14 +304,16 @@ impl Cost {
     }
 }
 
-/// numpy `fftfreq`: cycles per pixel of DFT index `k` on an axis of `n`, Nyquist at −1/2.
+/// torch `fftfreq(n)[k]`, computed as torch does, `k·(1/n)` with `k` wrapped to `−⌊n/2⌋..`:
+/// cycles per pixel of DFT index `k`, Nyquist at −1/2 on an even axis; an odd one's middle
+/// index `(n - 1) / 2` is positive.
 pub(crate) fn freq(k: usize, n: usize) -> f64 {
-    let k = if k < n / 2 {
+    let k = if k < n.div_ceil(2) {
         k as f64
     } else {
         k as f64 - n as f64
     };
-    k / n as f64
+    k * (1.0 / n as f64)
 }
 
 /// `DFT(fftshift(P[m]·q))` of every probe mode, one plane per mode.
@@ -1080,4 +1082,21 @@ pub fn background_grad(
         grad[j] += cost.slope(iobs, icalc)
     });
     grad
+}
+
+#[cfg(test)]
+mod tests {
+    use super::freq;
+
+    /// The device's `freq` puts the split where this one does, on odd sides too.
+    #[test]
+    fn device_freq_matches_on_every_side() {
+        for n in 1..=12u32 {
+            for k in 0..n {
+                let got = f64::from(ptyrs_kernels::pixel::freq(k, n));
+                let want = freq(k as usize, n as usize);
+                assert!((got - want).abs() <= 1e-7, "n {n} k {k}: {got} vs {want}");
+            }
+        }
+    }
 }
