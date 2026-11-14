@@ -34,7 +34,7 @@ use ptyrs_kernels::lsqml::{
 };
 use ptyrs_kernels::pixel::PIXEL_THREADS;
 
-use crate::gpu::fused::{GRID_Y_MAX, Shape, Side};
+use crate::gpu::fused::{GRID_Y_MAX, Shape, Side, no_psi};
 use crate::gpu::ops::grid_1d;
 use crate::gpu::position::{ONE_BLOCK, chunk_grid, chunks, same_dims, span};
 use crate::gpu::{
@@ -721,8 +721,8 @@ fn null_ptrs() -> FusedPtrs {
         probe: std::ptr::null(),
         views: std::ptr::null(),
         counts: std::ptr::null(),
-        psi: std::ptr::null_mut(),
-        iterate: std::ptr::null_mut(),
+        psi: no_psi(),
+        iterate: no_psi(),
         work: std::ptr::null_mut(),
         probe_q: std::ptr::null_mut(),
         probe_power: std::ptr::null_mut(),
