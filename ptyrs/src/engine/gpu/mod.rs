@@ -434,8 +434,7 @@ impl GpuPtycho {
 
     /// [`Self::with_optics`] on a multislice object, `objects` its slices in the order the
     /// wave crosses them, one per slice of `optics` and all of one shape. More than one
-    /// slice runs LSQML alone ([`Self::lsqml`]), with one object mode: every other
-    /// algorithm fails on it.
+    /// slice runs LSQML alone ([`Self::lsqml`]): every other algorithm fails on it.
     pub fn with_slices(
         ctx: &Arc<CudaContext>,
         scan: &Scan,
@@ -457,12 +456,6 @@ impl GpuPtycho {
                 "object slice {:?} differs from the first's {:?}",
                 o.dims(),
                 object.dims()
-            )));
-        }
-        if objects.len() > 1 && object.nmode() != 1 {
-            return Err(EngineError::Invalid(format!(
-                "the GPU backend runs a multislice object of one mode, got {}",
-                object.nmode()
             )));
         }
         let g = scan.geometry;

@@ -59,7 +59,7 @@ pub struct PtychoSpec {
     pub n: usize,
     pub path: ScanPath,
     pub points: usize,
-    /// Scan step, object pixels.
+    /// Scan step, object pixels, finite and positive.
     pub step: f64,
     /// Incident photons per frame.
     pub photons: f64,
@@ -96,6 +96,11 @@ impl Ptycho {
             (1..=i32::MAX as usize).contains(&spec.points),
             "{} points",
             spec.points
+        );
+        assert!(
+            spec.step.is_finite() && spec.step > 0.0,
+            "scan step {} must be finite and positive",
+            spec.step
         );
         let scan = scan_points(spec.path, spec.points, spec.step);
         let lo = [0, 1].map(|a| scan.iter().map(|p| p[a]).min().unwrap());
@@ -479,6 +484,20 @@ mod tests {
         let mut s = spec(32, ScanPath::Raster { cols: 7 }, 45, 5.0);
         s.det_pixel = 0.0;
         Ptycho::new(s);
+    }
+
+    /// A NaN step would round every point to the scan centre.
+    #[test]
+    fn a_step_that_is_not_finite_and_positive_is_refused() {
+        for step in [f64::NAN, f64::INFINITY, 0.0, -5.0] {
+            let s = spec(32, ScanPath::Fermat, 45, step);
+            let e = std::panic::catch_unwind(|| Ptycho::new(s)).err();
+            let msg = e.and_then(|e| e.downcast::<String>().ok());
+            assert_eq!(
+                msg.as_deref().map(String::as_str),
+                Some(format!("scan step {step} must be finite and positive").as_str())
+            );
+        }
     }
 
     #[test]

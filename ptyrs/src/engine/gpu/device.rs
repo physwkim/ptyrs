@@ -14,8 +14,8 @@ use std::sync::Arc;
 use crate::fft::Plan2d;
 use crate::gpu::{
     BH_STEP, BackgroundSums, BhKernels, C32, CG_BLOCKS, Ended, EpochOrder, Error as GpuError,
-    ExitPass, ExitStage, FarSums, FusedBufs, FusedInputs, GammaStacks, GradKernels, Kernels,
-    LlkPartial, LlkRing, LlkScratch, LlkTotals, Model, OpticsKernels, PositionKernels,
+    ExitPass, ExitStage, FarSums, FrameWaves, FusedBufs, FusedInputs, GammaStacks, GradKernels,
+    Kernels, LlkPartial, LlkRing, LlkScratch, LlkTotals, Model, OpticsKernels, PositionKernels,
     PositionPartial, Positions, PowerMax, ProbeSpectrum, PsiSums, RingDevice, RpieKernels,
     ScalePartial, Shift, ShiftProbe, ShiftSums, ShiftedProbeSums, SlicePhase, SliceSource,
     SpectrumBuf, StackRef, StackTable, UpdateSums, ViewAddr, ViewDims, Views,
@@ -134,7 +134,7 @@ impl SlicesMut<'_> {
             Some(shift) => {
                 kernels.shifted_probe(ctx, inputs, stack, b)?;
                 self.position.shift_w(ctx, d, stack, b)?;
-                let probe = SliceSource::Waves(b);
+                let probe = SliceSource::Waves(FrameWaves::Probes(b));
                 optics.slice_mul(ctx, views, stack, inputs.obj, probe, a)?;
                 Some(shift.offsets)
             }
@@ -142,7 +142,8 @@ impl SlicesMut<'_> {
         let (mut src, mut dst) = (a, b);
         for (obj, gap) in self.deeper.iter().zip(self.gaps) {
             optics.gap(ctx, d, stack, gap, src, false)?;
-            optics.slice_mul(ctx, views, stack, obj, SliceSource::Waves(src), dst)?;
+            let waves = SliceSource::Waves(FrameWaves::Views(src));
+            optics.slice_mul(ctx, views, stack, obj, waves, dst)?;
             std::mem::swap(&mut src, &mut dst);
         }
         if let Some(p) = slice_phase(self.quad, offsets) {
