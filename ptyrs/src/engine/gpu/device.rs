@@ -1571,10 +1571,10 @@ impl Device {
     }
 
     /// Fails under a propagator with a plane stage for the passes that run none; only the
-    /// LLK pass and LSQML's do, and every other is enqueued behind this.
+    /// LLK pass, LSQML's and BH's do, and every other is enqueued behind this.
     fn stageless(&self, algorithm: Algorithm) -> Result<(), EngineError> {
         match (&self.exit, algorithm) {
-            (ExitStage::None, _) | (_, Algorithm::Lsqml) => Ok(()),
+            (ExitStage::None, _) | (_, Algorithm::Lsqml | Algorithm::Bh) => Ok(()),
             _ => Err(EngineError::Invalid(format!(
                 "{algorithm:?} runs no propagator with a plane stage: angular spectrum, or a \
                  Fresnel transform back in distance"
