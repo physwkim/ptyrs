@@ -655,7 +655,9 @@ impl Bufs<'_> {
                 }
             }
             PassesMut::Fused(f) => {
-                let m = self.features.lend(ctx, self.kernels, &dims, self.probe)?;
+                let m = self
+                    .features
+                    .lend(ctx, self.kernels, &dims, self.probe, self.exit)?;
                 for s in 0..self.scratch.len() {
                     let stack = self.scratch.at(s);
                     let inputs = FusedInputs {
@@ -669,9 +671,7 @@ impl Bufs<'_> {
                         llk: Some(&mut *self.llk),
                         ..FarSums::default()
                     };
-                    let exit = Some(self.exit);
-                    self.kernels
-                        .propagated_llk(ctx, &inputs, stack, f, far, exit)?;
+                    self.kernels.fused_llk(ctx, &inputs, stack, f, far)?;
                     rec.push(ctx, &dims, stack, self.llk)?;
                 }
             }
@@ -689,7 +689,9 @@ impl Bufs<'_> {
         mut llk: Option<RecordWriter<'_>>,
     ) -> Result<Option<Ended>, GpuError> {
         let dims = *self.views.dims();
-        let mut m = self.features.lend(ctx, self.kernels, &dims, self.probe)?;
+        let mut m = self
+            .features
+            .lend(ctx, self.kernels, &dims, self.probe, self.exit)?;
         for s in 0..self.scratch.len() {
             let stack = self.scratch.at(s);
             let inputs = FusedInputs {
@@ -700,9 +702,7 @@ impl Bufs<'_> {
                 model: m.model,
             };
             let far = m.far(llk.is_some().then_some(&mut *self.llk));
-            let exit = Some(self.exit);
-            self.kernels
-                .propagated_llk(ctx, &inputs, stack, f, far, exit)?;
+            self.kernels.fused_llk(ctx, &inputs, stack, f, far)?;
             if let Some(rec) = &mut llk {
                 rec.push(ctx, &dims, stack, self.llk)?;
             }
