@@ -512,7 +512,7 @@ fn recon_line(
     let mut l = format!(
         "recv recon algo=ap nf_max={} stacks={} tile_cap={} stored={} landed={} scan_epochs={scan_epochs} \
          epochs={} snap_every={} kept={} epoch_ms={} object={ny}x{nx} obj_mapped_MiB={} \
-         plan_ms={:.1} plan_MiB={} crop=window_centre_bbox region_rows={}..{} region_cols={}..{}",
+         plan_ms={:.1} plan_MiB={} setup_ms={:.1} crop=window_centre_bbox region_rows={}..{} region_cols={}..{}",
         follow.ap.nf_max,
         follow.ap.stacks,
         follow.ap.cap,
@@ -525,6 +525,7 @@ fn recon_line(
         rep.obj_mapped_bytes >> 20,
         rep.plan_time.as_secs_f64() * 1e3,
         rep.plan_mapped_bytes >> 20,
+        rep.setup_time.as_secs_f64() * 1e3,
         rows.start,
         rows.end,
         cols.start,

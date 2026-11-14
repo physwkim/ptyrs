@@ -36,7 +36,9 @@ impl GpuPtycho {
         optics: Option<&Bound<'_, Optics>>,
         options: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<Self> {
-        let options = params!(GpuOptions, options, stack_size, graph, llk_slots, fused);
+        let options = params!(
+            GpuOptions, options, stack_size, graph, llk_slots, fused, psi_f16
+        );
         let objects = match object.extract::<PyReadonlyArray4<'_, C64>>() {
             Ok(a) => objects_in(a)?,
             Err(_) => {

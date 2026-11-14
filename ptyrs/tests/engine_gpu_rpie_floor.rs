@@ -99,6 +99,7 @@ fn rpie_position_floor_matches_cpu_under_every_propagator() {
         graph: false,
         llk_slots: 3,
         fused: true,
+        psi_f16: false,
     };
     let cases = [
         ("angular spectrum", 1e-4),

@@ -17,6 +17,7 @@
 //! lowest region holding it, in the one-GPU scan's frame order, so the sum is one GPU's.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{Context, DeviceBuffer, Event};
@@ -51,6 +52,8 @@ struct State {
     halo_backer: HaloBacker,
     scan: LiveScan,
     scan_backer: ScanBacker,
+    /// How long backing the region's planned views took.
+    plan_time: Duration,
     /// The counts of the region's frames in landing order, which the uploader fills.
     store: Arc<DeviceStore>,
     counts_view: DeviceBuffer<u16>,
@@ -138,7 +141,9 @@ impl State {
         let d = *scan.dims();
         let n = (d.frame[0] * d.frame[1]) as usize;
         let mut scan_backer = scan.backer();
+        let t = Instant::now();
         scan_backer.plan(&region.planned)?;
+        let plan_time = t.elapsed();
         let store = match store {
             Some(s)
                 if s.frame_elems() == n
@@ -253,6 +258,7 @@ impl State {
             halo,
             scan,
             scan_backer,
+            plan_time,
             store,
             counts_view,
             _kernels: kernels,
@@ -718,6 +724,13 @@ impl DistLiveAp {
     pub fn mapped_bytes(&self) -> Result<usize, DistError> {
         let b = self.workers.run(|_, st| Ok(st.scan.obj().mapped_bytes()))?;
         Ok(b.into_iter().sum())
+    }
+
+    /// How long backing the planned views took, summed over the GPUs, as
+    /// [`Self::mapped_bytes`] sums their bytes; they back theirs at once.
+    pub fn plan_time(&self) -> Result<Duration, DistError> {
+        let t = self.workers.run(|_, st| Ok(st.plan_time))?;
+        Ok(t.into_iter().sum())
     }
 
     pub fn ngpu(&self) -> usize {
