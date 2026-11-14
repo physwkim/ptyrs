@@ -12,6 +12,7 @@ use std::f64::consts::PI;
 
 use crate::base::{C64, Geometry};
 
+use crate::engine::features::freq;
 use crate::engine::{EngineError, Fft2, quad_phase, shift};
 
 /// The exit-wave model of the pty-chi algorithms: `psi = E(P·O·q)` per view, with `q` the
@@ -513,9 +514,9 @@ impl AngularSpectrum {
         let i2piz = 2.0 * PI * w.distance_wlu();
         let mut tf = Vec::with_capacity(ny * nx);
         for y in 0..ny {
-            let fy = fftfreq(y, ny);
+            let fy = freq(y, ny);
             for x in 0..nx {
-                let fx = fftfreq(x, nx);
+                let fx = freq(x, nx);
                 let ratio = (fx * fx + (ar * fy) * (ar * fy)) / (width * width);
                 tf.push(if ratio < 1.0 {
                     C64::from_polar(1.0, i2piz * (1.0 - ratio).sqrt())
@@ -564,16 +565,6 @@ impl Fresnel {
             plane_quad: [PI * fr / (ar * ar), PI * fr],
         }
     }
-}
-
-/// torch `fftfreq(n)[k]`, computed as torch does: `k·(1/n)` with `k` wrapped to `−n/2..`.
-fn fftfreq(k: usize, n: usize) -> f64 {
-    let k = if k < n.div_ceil(2) {
-        k as f64
-    } else {
-        k as f64 - n as f64
-    };
-    k * (1.0 / n as f64)
 }
 
 /// Multiplies every plane of `planes` by `d` (or `conj(d)`) pointwise.
