@@ -1,3 +1,4 @@
+use alloc::sync::Arc;
 use cubecl_common::device::ServiceId;
 use cubecl_environment::stream::StreamId;
 use cubecl_zspace::{Shape, Strides};
@@ -26,6 +27,11 @@ pub struct Handle {
     pub stream: StreamId,
     /// Length of the underlying buffer ignoring offsets
     pub(crate) size: u64,
+    /// Shared by this handle and its clones, and by nothing else: the
+    /// runtime's own references go through `memory` or a binding, so what
+    /// [`can_mut`](Self::can_mut) counts does not depend on how far the
+    /// device thread has got.
+    holders: Arc<()>,
 }
 
 impl core::fmt::Debug for Handle {
@@ -50,12 +56,15 @@ impl Clone for Handle {
             offset_end: self.offset_end,
             stream: self.stream,
             size: self.size,
+            holders: self.holders.clone(),
         }
     }
 }
 
 impl Handle {
-    /// Creates a new handle of the given size.
+    /// Creates a new handle of the given size, with holders of its own:
+    /// handles already over `id` do not count toward its
+    /// [`can_mut`](Self::can_mut), nor it toward theirs.
     pub fn from_memory(
         id: ManagedMemoryHandle,
         service: ServiceId,
@@ -69,6 +78,7 @@ impl Handle {
             offset_end: None,
             stream,
             size,
+            holders: Arc::new(()),
         }
     }
     /// Creates a new handle of the given size.
@@ -80,11 +90,12 @@ impl Handle {
             offset_end: None,
             stream,
             size,
+            holders: Arc::new(()),
         }
     }
     /// Checks whether the handle can be mutated in-place without affecting other computation.
     pub fn can_mut(&self) -> bool {
-        self.memory.can_mut()
+        Arc::strong_count(&self.holders) == 1
     }
 
     /// Returns the [`BufferBinding`] corresponding to the current handle.

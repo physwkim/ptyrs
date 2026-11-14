@@ -29,3 +29,7 @@ rand_chacha = "0.3"
 rand_distr = "0.4"
 rustfft = "6"
 rust-hdf5 = "0.7.13"
+
+[patch.crates-io]
+# Handle::can_mut counting only handle clones; goes once cubecl ships the fix.
+cubecl-runtime = { path = "vendor/cubecl-runtime" }
