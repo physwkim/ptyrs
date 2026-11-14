@@ -25,6 +25,8 @@ pub mod recv;
 pub mod ring;
 pub mod scan;
 pub mod sched;
+#[cfg(test)]
+pub(crate) mod sent;
 pub mod stack;
 pub mod stats;
 pub mod swmr;

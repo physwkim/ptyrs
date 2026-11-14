@@ -511,7 +511,8 @@ impl Engine for DistLiveAp {
     }
 
     fn llk(&mut self) -> Result<Option<Vec<f64>>, DistError> {
-        Ok(None)
+        let llk = DistLiveAp::llk(self)?;
+        Ok(llk.map(|l| l.into_iter().map(|(_, l)| l).collect()))
     }
 
     fn landed(&self) -> u64 {
@@ -605,8 +606,8 @@ pub type Landing = (Vec<Arc<DeviceStore>>, Box<dyn Route>);
 /// Live AP on the GPUs `ordinals`, on stores of its own, sent on `ready`
 /// once its graphs are captured and dropped unsent if that fails. One GPU
 /// runs as [`run_ap_consumer`] does. More split the object by `scheme`,
-/// region `r` on `ordinals[r]`, and record no LLK: `preview.llk` is sent
-/// nothing, and [`FollowReport::plan_time`] is the whole setup's.
+/// region `r` on `ordinals[r]`, and [`FollowReport::plan_time`] is the
+/// whole setup's.
 pub fn run_dist_consumer(
     ordinals: &[usize],
     scheme: Scheme,
@@ -627,7 +628,8 @@ pub fn run_dist_consumer(
     }
     let t = Instant::now();
     let planned = views_of(&cfg.ap, &cfg.place, &cfg.plan);
-    let run = DistLiveAp::new(ordinals, &cfg.ap, &planned, scheme, &cfg.probe)?;
+    let llk = preview.is_some();
+    let run = DistLiveAp::new(ordinals, &cfg.ap, &planned, scheme, &cfg.probe, llk)?;
     let plan_time = t.elapsed();
     let place = cfg.place;
     follow(run, None, plan_time, &cfg, batches, preview, |run| {
@@ -899,7 +901,7 @@ pub fn offline_dist(
         return Ok(off?);
     }
     let planned = views_of(&cfg.ap, &cfg.place, &cfg.plan);
-    let mut run = DistLiveAp::on_stores(stores, &cfg.ap, &planned, scheme, &cfg.probe)?;
+    let mut run = DistLiveAp::on_stores(stores, &cfg.ap, &planned, scheme, &cfg.probe, false)?;
     let views = views_of(&cfg.ap, &cfg.place, positions);
     let took = run.push(&views)?;
     if took as usize != positions.len() {
@@ -997,6 +999,7 @@ mod tests {
     use crate::live::graph::WarmUp;
     use crate::live::pos::{Pos, PosTable};
     use crate::live::ring::{Ring, UploaderConfig, run_region_uploader, run_uploader};
+    use crate::live::sent::sent;
 
     struct Streamed {
         ctx: Arc<Context>,
@@ -1009,22 +1012,6 @@ mod tests {
         views: Vec<View>,
         /// The LLK history the viewer was sent.
         llk: Vec<f64>,
-    }
-
-    /// What `consumer` sends once it can take frames, or its own error if it
-    /// ended before that.
-    fn ready<T, R, E: std::fmt::Debug>(
-        rx: Receiver<T>,
-        consumer: std::thread::JoinHandle<Result<R, E>>,
-    ) -> (T, std::thread::JoinHandle<Result<R, E>>) {
-        match rx.recv() {
-            Ok(sent) => (sent, consumer),
-            Err(_) => match consumer.join() {
-                Ok(Err(e)) => panic!("the consumer failed before it could take frames: {e:?}"),
-                Ok(Ok(_)) => panic!("the consumer ended before it could take frames"),
-                Err(p) => std::panic::resume_unwind(p),
-            },
-        }
     }
 
     /// A 6x6 raster of 64x64 frames, two probe modes, streamed through the
@@ -1073,11 +1060,11 @@ mod tests {
             });
             std::thread::spawn(move || run_ap_consumer(ctx, store, cfg, rx, cap_tx, preview))
         };
-        let ((), consumer) = ready(cap_rx, consumer);
+        let ((), consumer) = sent(&cap_rx, consumer);
         let warm = WarmUp::end();
         let table = Arc::new(PosTable::new(1 << 16));
         let uploader = {
-            let (ring, ctx, stop, store) = (ring.clone(), ctx.clone(), stop.clone(), store.clone());
+            let (ring, stop, store) = (ring.clone(), stop.clone(), store.clone());
             let table = table.clone();
             let up = UploaderConfig {
                 batch: NonZeroUsize::new(4).unwrap(),
@@ -1086,7 +1073,7 @@ mod tests {
                 events: 4,
                 pos_wait_ns: 1_000_000_000,
             };
-            std::thread::spawn(move || run_uploader(ring, ctx, store, table, up, stop, Some(tx)))
+            std::thread::spawn(move || run_uploader(ring, store, table, up, stop, Some(tx)))
         };
         let (mut k, mut scan_end) = (0, 0);
         for burst in [5, 1, 13, 0, 17] {
@@ -1347,7 +1334,7 @@ mod tests {
                     run_dist_consumer(&ordinals, Scheme::Strips, cfg, rx, ready_tx, preview)
                 })
             };
-            let ((stores, route), consumer) = ready(ready_rx, consumer);
+            let ((stores, route), consumer) = sent(&ready_rx, consumer);
             assert_eq!(stores.len(), ngpu);
             let filled = stores.clone();
             let warm = WarmUp::end();
@@ -1384,8 +1371,7 @@ mod tests {
             assert_eq!((up.frames, up.pos_missing), (total as u64, 0));
             let rep = consumer.join().unwrap().unwrap();
             let views = viewer.join().unwrap();
-            // Only the one-GPU run records LLK.
-            assert_eq!(llk_rx.iter().count() == 0, ngpu > 1, "{ngpu} GPUs");
+            let llk: Vec<u64> = llk_rx.iter().flatten().map(f64::to_bits).collect();
             assert_eq!(warm.recaptures(), 0, "{ngpu} GPUs");
             assert_eq!(rep.positions, pos);
             assert_eq!((rep.stored, rep.landed), (total as u64, total as u64));
@@ -1403,7 +1389,7 @@ mod tests {
             ctx.bind_to_thread().unwrap();
             let st = ctx.new_stream().unwrap();
             let dev = cuda_core::DeviceBuffer::from_host(&st, &counts).unwrap();
-            let mut run = LiveAp::new(&st, &cfg.ap, &cfg.probe, dev, false).unwrap();
+            let mut run = LiveAp::new(&st, &cfg.ap, &cfg.probe, dev, true).unwrap();
             let mut backer = run.backer();
             let mut at = 0;
             for &(epochs, upto) in &rep.landings {
@@ -1428,6 +1414,16 @@ mod tests {
                 .filter(|(a, b)| a.map(f32::to_bits) != b.map(f32::to_bits))
                 .count();
             assert_eq!(diff, 0, "{ngpu} GPUs: pixels unlike the replay's");
+            let replayed = run.llk().unwrap().unwrap();
+            assert!(
+                replayed
+                    .iter()
+                    .map(|(_, l)| l.to_bits())
+                    .eq(llk.iter().copied()),
+                "{ngpu} GPUs: {} LLKs sent, {} replayed, or unlike",
+                llk.len(),
+                replayed.len()
+            );
 
             // Capped, so the run may stop while still moving: what it found then
             // names the ring and its FRC, which depend on the object as well.
