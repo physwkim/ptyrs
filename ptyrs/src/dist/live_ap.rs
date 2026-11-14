@@ -11,15 +11,23 @@
 //! and the update of its own tiles. A region's own tiles bin the frames one GPU bins there,
 //! in the same order, and its frames read the owners' pixels of the last update, so its own
 //! tiles hold one GPU's object bit for bit after every epoch.
+//!
+//! With LLK recording each GPU's sweep also writes its frames' LLK partials into its own
+//! [`LlkRing`], and [`DistLiveAp::llk`] sums them on the host: each frame once, from the
+//! lowest region holding it, in the one-GPU scan's frame order, so the sum is one GPU's.
 
 use std::sync::Arc;
 
+use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{Context, DeviceBuffer, Event};
 
-use crate::gpu::{C32, FusedBufs, Kernels, ViewAddr};
+use crate::gpu::{
+    C32, Ended, FrameLlk, FusedBufs, Kernels, LlkPartial, LlkRing, LlkTotals, ViewAddr,
+};
 use crate::live::graph::LiveGraph;
+use crate::live::grow::GrowError;
 use crate::live::object::{Snapshot, timed_sleeping_event};
-use crate::live::recon::{ApConfig, ViewPlacement, capture_sweep};
+use crate::live::recon::{ApConfig, LLK_SLOTS, ViewPlacement, capture_sweep};
 use crate::live::ring::DeviceStore;
 use crate::live::scan::{LiveScan, Refusal, ScanBacker};
 use crate::live::stats::wall_ns;
@@ -37,6 +45,7 @@ struct State {
     sweep: LiveGraph,
     den: LiveGraph,
     update: LiveGraph,
+    llk: Option<RegionLlk>,
     halo: HaloBufs,
     halo_backer: HaloBacker,
     scan: LiveScan,
@@ -67,6 +76,25 @@ struct State {
     stacks: u32,
 }
 
+/// A region's record of each epoch's LLK over the frames it holds.
+struct RegionLlk {
+    ring: LlkRing<u64>,
+    _partials: DeviceBuffer<LlkPartial>,
+    /// The update graph ends a record each replay.
+    ended: Ended,
+}
+
+/// Which region's partials count for each frame of the scan, and the records not yet read.
+#[derive(Default)]
+struct Counted {
+    /// Per region, `(its frame, the scan's frame)` of the frames it is the lowest region
+    /// to hold, ascending: every frame taken is in exactly one list.
+    frames: Vec<Vec<(u32, u32)>>,
+    /// `(epoch, frames taken when it was queued)` of the epochs queued since the last
+    /// [`DistLiveAp::llk`].
+    queued: Vec<(u64, u32)>,
+}
+
 /// What a region's GPU exposes to the others' exchange.
 struct Ptrs {
     ctx: Arc<Context>,
@@ -91,6 +119,7 @@ impl State {
         cfg: &ApConfig,
         probe: &[C32],
         store: Option<Arc<DeviceStore>>,
+        llk: bool,
     ) -> Result<Self, DistError> {
         let stream = gpu.stream().clone();
         let kernels = Kernels::load(gpu.ctx())?;
@@ -161,7 +190,23 @@ impl State {
             let s = &mut scan;
             LiveGraph::capture(&stream, move |c| s.advance(k, c))?
         };
-        let sweep = capture_sweep(&mut scan, k, stacks, &probe, &counts_view, &mut fused, None)?;
+        let mut bufs = if llk {
+            Some((
+                LlkRing::new(&kernels, &stream, &d, LLK_SLOTS)?,
+                DeviceBuffer::zeroed(&stream, nf_max.get() as usize)?,
+            ))
+        } else {
+            None
+        };
+        // One writer for every record: the sweep graph pushes through it and the update
+        // graph ends it.
+        let mut rec = bufs
+            .as_mut()
+            .map(|(ring, partials)| (ring.device().record(), partials));
+        let sweep = {
+            let llk = rec.as_mut().map(|(w, partials)| (w, &mut **partials));
+            capture_sweep(&mut scan, k, stacks, &probe, &counts_view, &mut fused, llk)?
+        };
         let den = {
             let s = &mut scan;
             LiveGraph::capture(&stream, move |c| {
@@ -169,14 +214,25 @@ impl State {
                 k.obj_den_max(c, p.views, p.sums)
             })?
         };
+        let mut ended = None;
         let update = {
-            let (s, gmax, inertia) = (&mut scan, &gmax, cfg.inertia);
+            let (s, gmax, inertia, ended) = (&mut scan, &gmax, cfg.inertia, &mut ended);
+            let w = rec.map(|(w, _)| w);
             LiveGraph::capture(&stream, move |c| {
                 let p = s.parts_mut();
                 k.normalize_obj(c, p.views, p.pixels, p.sums, gmax, inertia)?;
-                p.frames.rewind(c)
+                p.frames.rewind(c)?;
+                if let Some(w) = w {
+                    *ended = Some(w.end(c)?);
+                }
+                Ok(())
             })?
         };
+        let llk = bufs.map(|(ring, partials)| RegionLlk {
+            ring,
+            _partials: partials,
+            ended: ended.expect("the update capture ends the record"),
+        });
         let snap = Snapshot::new(scan.obj())?;
         Ok(Self {
             pack,
@@ -185,6 +241,7 @@ impl State {
             sweep,
             den,
             update,
+            llk,
             halo_backer: halo.backer(),
             halo,
             scan,
@@ -275,9 +332,9 @@ impl State {
         Ok(self.t_anchor + (f64::from(self.anchor.elapsed_time(f)?) * 1e6) as i64)
     }
 
-    /// Queues one epoch over the frames landed so far, two fences, and after it the
-    /// event of `parity`.
-    fn epoch(&mut self, gpu: &mut Gpu, parity: usize) -> Result<(), DistError> {
+    /// Queues epoch `epoch` over the frames landed so far, two fences, and after it the
+    /// event of its parity.
+    fn epoch(&mut self, gpu: &mut Gpu, epoch: u64) -> Result<(), DistError> {
         let links = self
             .links
             .as_ref()
@@ -290,9 +347,16 @@ impl State {
         unsafe { exchange::pull(&stream, &links.halo)? };
         self.unpack.replay()?;
         let (landed, nf) = (self.scan.landed(), self.scan.frames().nf_max());
+        let binned = self.binned;
         while self.binned < landed {
             self.ingest.replay()?;
             self.binned = (self.binned + nf).min(landed);
+        }
+        let ctx = ExecutionContext::new(self.scan.stream().clone());
+        if let Some(l) = &mut self.llk {
+            l.ring
+                .device()
+                .count(&ctx, binned..landed, &self._counts_view)?;
         }
         for _ in 0..landed.div_ceil(nf).div_ceil(self.stacks) {
             self.sweep.replay()?;
@@ -308,7 +372,20 @@ impl State {
                 .max_u32(&stream, self.gmax.cu_deviceptr(), &links.max_srcs)?;
         }
         self.update.replay()?;
-        Ok(self.fence[parity].record(&stream)?)
+        if let Some(l) = &mut self.llk {
+            l.ring
+                .enqueued(&ctx, &l.ended, epoch, landed)
+                .map_err(GrowError::from)?;
+        }
+        Ok(self.fence[(epoch % 2) as usize].record(&stream)?)
+    }
+
+    /// Every record counted since the last call, each as the region's frames; waits for
+    /// them.
+    fn llk(&mut self) -> Result<Vec<(u64, Vec<FrameLlk>)>, DistError> {
+        let l = self.llk.as_mut().expect("the run records LLK on every GPU");
+        let ctx = ExecutionContext::new(self.scan.stream().clone());
+        Ok(l.ring.flush_frames(&ctx).map_err(GrowError::from)?)
     }
 }
 
@@ -333,6 +410,8 @@ pub struct DistLiveAp {
     taken: u64,
     epochs: u64,
     clock_ns: i64,
+    /// With LLK recording.
+    llk: Option<Counted>,
     /// A push or epoch failed part-way: the GPUs may disagree, so every later call fails.
     failed: bool,
 }
@@ -340,15 +419,17 @@ pub struct DistLiveAp {
 impl DistLiveAp {
     /// An empty scan of `cfg.shape` split by `scheme` over `ordinals` (1, 2 or 4 GPUs, region
     /// `r` on `ordinals[r]`) from its first frames' views `planned`, with the fixed `probe`
-    /// (`[nprobe, ny, nx]`); backs the plan and captures every graph.
+    /// (`[nprobe, ny, nx]`); backs the plan and captures every graph, which record each
+    /// epoch's LLK with `llk` ([`Self::llk`]).
     pub fn new(
         ordinals: &[usize],
         cfg: &ApConfig,
         planned: &[ViewAddr],
         scheme: Scheme,
         probe: &[C32],
+        llk: bool,
     ) -> Result<Self, DistError> {
-        Self::build(ordinals, cfg, planned, scheme, probe, None)
+        Self::build(ordinals, cfg, planned, scheme, probe, None, llk)
     }
 
     /// [`Self::new`] on the GPUs of `stores`, region `r` reading its frames' counts from
@@ -360,10 +441,11 @@ impl DistLiveAp {
         planned: &[ViewAddr],
         scheme: Scheme,
         probe: &[C32],
+        llk: bool,
     ) -> Result<Self, DistError> {
         let ordinals: Vec<usize> = stores.iter().map(|s| s.ctx().ordinal()).collect();
         let stores = Some(Arc::new(stores.to_vec()));
-        Self::build(&ordinals, cfg, planned, scheme, probe, stores)
+        Self::build(&ordinals, cfg, planned, scheme, probe, stores, llk)
     }
 
     fn build(
@@ -373,13 +455,14 @@ impl DistLiveAp {
         scheme: Scheme,
         probe: &[C32],
         stores: Option<Arc<Vec<Arc<DeviceStore>>>>,
+        llk: bool,
     ) -> Result<Self, DistError> {
         let plan = LivePlan::new(&cfg.shape, planned, scheme, ordinals.len(), cfg.cap)?;
         let regions: Arc<Vec<LiveRegion>> = Arc::new(plan.regions().to_vec());
         let (cfg, probe) = (*cfg, Arc::new(probe.to_vec()));
         let workers = Workers::spawn(ordinals, move |gpu| {
             let store = stores.as_ref().map(|s| s[gpu.region()].clone());
-            State::new(gpu, &regions[gpu.region()], &cfg, &probe, store)
+            State::new(gpu, &regions[gpu.region()], &cfg, &probe, store, llk)
         })?;
         let ptrs = workers.run(|gpu, st| Ok(st.ptrs(gpu)))?;
         let halo: Vec<Vec<Pull>> = (0..ptrs.len())
@@ -407,6 +490,10 @@ impl DistLiveAp {
             taken: 0,
             epochs: 0,
             clock_ns: clock_ns.unwrap_or(0),
+            llk: llk.then(|| Counted {
+                frames: vec![Vec::new(); nregion],
+                queued: Vec::new(),
+            }),
             failed: false,
         })
     }
@@ -440,6 +527,16 @@ impl DistLiveAp {
         let mut shares = vec![Share::default(); self.plan.nregion()];
         let took = self.plan.split(views, &mut shares)?;
         self.lost += (views.len() / nmode) as u64 - u64::from(took);
+        if let Some(c) = &mut self.llk {
+            let mut counted = vec![false; took as usize];
+            for (r, share) in shares.iter().enumerate() {
+                for (at, &f) in (self.landed[r]..).zip(&share.frames) {
+                    if !std::mem::replace(&mut counted[f as usize], true) {
+                        c.frames[r].push((at, self.taken as u32 + f));
+                    }
+                }
+            }
+        }
         self.taken += u64::from(took);
         self.failed = true;
         let got = self.workers.run(|gpu, st| st.push(&shares[gpu.region()]))?;
@@ -455,11 +552,44 @@ impl DistLiveAp {
     pub fn epoch(&mut self) -> Result<(), DistError> {
         self.check()?;
         self.failed = true;
-        let parity = (self.epochs % 2) as usize;
-        self.workers.run(|gpu, st| st.epoch(gpu, parity))?;
+        let epoch = self.epochs;
+        self.workers.run(|gpu, st| st.epoch(gpu, epoch))?;
         self.failed = false;
+        if let Some(c) = &mut self.llk {
+            c.queued.push((epoch, self.taken as u32));
+        }
         self.epochs += 1;
         Ok(())
+    }
+
+    /// `(e, llk)` for each epoch queued since the last call, oldest first, as
+    /// [`LiveAp::llk`](crate::live::recon::LiveAp::llk) gives them on one GPU, bit for
+    /// bit. Waits for those epochs. `None` unless the run was asked to record it.
+    pub fn llk(&mut self) -> Result<Option<Vec<(u64, f64)>>, DistError> {
+        self.check()?;
+        if self.llk.is_none() {
+            return Ok(None);
+        }
+        let recs = self.workers.run(|_, st| st.llk())?;
+        let c = self.llk.as_mut().expect("checked above");
+        let none = FrameLlk {
+            llk: LlkPartial::default(),
+            nobs: 0,
+        };
+        let mut out = Vec::with_capacity(c.queued.len());
+        for (k, (e, taken)) in c.queued.drain(..).enumerate() {
+            let mut all = vec![none; taken as usize];
+            for (own, recs) in c.frames.iter().zip(&recs) {
+                let (tag, held) = &recs[k];
+                assert_eq!(*tag, e, "every GPU records every epoch");
+                for &(at, f) in own.iter().take_while(|&&(_, f)| f < taken) {
+                    all[f as usize] = held[at as usize];
+                }
+            }
+            let t = LlkTotals::of(&all);
+            out.push((e, t.sums.poisson / t.nb_obs as f64));
+        }
+        Ok(Some(out))
     }
 
     /// Wall ns the slowest GPU finished `epoch`, one of the last two queued; waits for it.
@@ -827,7 +957,7 @@ mod tests {
             let views = |b: &Range<usize>| &c.views[b.start * nmode..b.end * nmode];
             let st = ctx.new_stream().unwrap();
             let dev = DeviceBuffer::from_host(&st, &c.counts).unwrap();
-            let mut one = LiveAp::new(&st, &c.cfg, &c.probe, dev, false).unwrap();
+            let mut one = LiveAp::new(&st, &c.cfg, &c.probe, dev, true).unwrap();
             let (mut snap, mut backer) = (one.new_snapshot().unwrap(), one.backer());
             let mut want = Vec::new();
             for b in &batches {
@@ -841,12 +971,17 @@ mod tests {
                 want.push(bits(snap.wait().unwrap()));
             }
             assert_eq!(one.scan().lost(), 0, "{name}");
+            let llk_bits = |l: Vec<(u64, f64)>| -> Vec<(u64, u64)> {
+                l.into_iter().map(|(e, l)| (e, l.to_bits())).collect()
+            };
+            let want_llk = llk_bits(one.llk().unwrap().unwrap());
+            assert_eq!(want_llk.len(), 2 * batches.len(), "{name}");
 
             for ngpu in [1, 2, 4] {
                 let what = format!("{name} on {ngpu}");
                 let planned = &c.views[..c.planned * nmode];
                 let mut ap =
-                    DistLiveAp::new(&gpus(ngpu), &c.cfg, planned, scheme, &c.probe).unwrap();
+                    DistLiveAp::new(&gpus(ngpu), &c.cfg, planned, scheme, &c.probe, true).unwrap();
                 let warm = WarmUp::end();
                 let mut feed = Feed::new(&ctx, &c, &ap);
                 let mut grew = 0;
@@ -877,6 +1012,8 @@ mod tests {
                 assert_eq!(warm.recaptures(), 0, "{what}");
                 assert_eq!((ap.lost(), ap.closed()), (0, None), "{what}");
                 assert_eq!(ap.epochs(), 2 * batches.len() as u64, "{what}");
+                let llk = llk_bits(ap.llk().unwrap().unwrap());
+                assert_eq!(llk, want_llk, "{what}: LLK unlike one GPU's");
                 if ngpu > 1 {
                     assert!(grew > 0, "{what}: no moved frame read a new halo tile");
                 }

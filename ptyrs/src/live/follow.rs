@@ -511,7 +511,8 @@ impl Engine for DistLiveAp {
     }
 
     fn llk(&mut self) -> Result<Option<Vec<f64>>, DistError> {
-        Ok(None)
+        let llk = DistLiveAp::llk(self)?;
+        Ok(llk.map(|l| l.into_iter().map(|(_, l)| l).collect()))
     }
 
     fn landed(&self) -> u64 {
@@ -605,8 +606,8 @@ pub type Landing = (Vec<Arc<DeviceStore>>, Box<dyn Route>);
 /// Live AP on the GPUs `ordinals`, on stores of its own, sent on `ready`
 /// once its graphs are captured and dropped unsent if that fails. One GPU
 /// runs as [`run_ap_consumer`] does. More split the object by `scheme`,
-/// region `r` on `ordinals[r]`, and record no LLK: `preview.llk` is sent
-/// nothing, and [`FollowReport::plan_time`] is the whole setup's.
+/// region `r` on `ordinals[r]`, and [`FollowReport::plan_time`] is the
+/// whole setup's.
 pub fn run_dist_consumer(
     ordinals: &[usize],
     scheme: Scheme,
@@ -627,7 +628,8 @@ pub fn run_dist_consumer(
     }
     let t = Instant::now();
     let planned = views_of(&cfg.ap, &cfg.place, &cfg.plan);
-    let run = DistLiveAp::new(ordinals, &cfg.ap, &planned, scheme, &cfg.probe)?;
+    let llk = preview.is_some();
+    let run = DistLiveAp::new(ordinals, &cfg.ap, &planned, scheme, &cfg.probe, llk)?;
     let plan_time = t.elapsed();
     let place = cfg.place;
     follow(run, None, plan_time, &cfg, batches, preview, |run| {
@@ -899,7 +901,7 @@ pub fn offline_dist(
         return Ok(off?);
     }
     let planned = views_of(&cfg.ap, &cfg.place, &cfg.plan);
-    let mut run = DistLiveAp::on_stores(stores, &cfg.ap, &planned, scheme, &cfg.probe)?;
+    let mut run = DistLiveAp::on_stores(stores, &cfg.ap, &planned, scheme, &cfg.probe, false)?;
     let views = views_of(&cfg.ap, &cfg.place, positions);
     let took = run.push(&views)?;
     if took as usize != positions.len() {
@@ -1369,8 +1371,7 @@ mod tests {
             assert_eq!((up.frames, up.pos_missing), (total as u64, 0));
             let rep = consumer.join().unwrap().unwrap();
             let views = viewer.join().unwrap();
-            // Only the one-GPU run records LLK.
-            assert_eq!(llk_rx.iter().count() == 0, ngpu > 1, "{ngpu} GPUs");
+            let llk: Vec<u64> = llk_rx.iter().flatten().map(f64::to_bits).collect();
             assert_eq!(warm.recaptures(), 0, "{ngpu} GPUs");
             assert_eq!(rep.positions, pos);
             assert_eq!((rep.stored, rep.landed), (total as u64, total as u64));
@@ -1388,7 +1389,7 @@ mod tests {
             ctx.bind_to_thread().unwrap();
             let st = ctx.new_stream().unwrap();
             let dev = cuda_core::DeviceBuffer::from_host(&st, &counts).unwrap();
-            let mut run = LiveAp::new(&st, &cfg.ap, &cfg.probe, dev, false).unwrap();
+            let mut run = LiveAp::new(&st, &cfg.ap, &cfg.probe, dev, true).unwrap();
             let mut backer = run.backer();
             let mut at = 0;
             for &(epochs, upto) in &rep.landings {
@@ -1413,6 +1414,16 @@ mod tests {
                 .filter(|(a, b)| a.map(f32::to_bits) != b.map(f32::to_bits))
                 .count();
             assert_eq!(diff, 0, "{ngpu} GPUs: pixels unlike the replay's");
+            let replayed = run.llk().unwrap().unwrap();
+            assert!(
+                replayed
+                    .iter()
+                    .map(|(_, l)| l.to_bits())
+                    .eq(llk.iter().copied()),
+                "{ngpu} GPUs: {} LLKs sent, {} replayed, or unlike",
+                llk.len(),
+                replayed.len()
+            );
 
             // Capped, so the run may stop while still moving: what it found then
             // names the ring and its FRC, which depend on the object as well.

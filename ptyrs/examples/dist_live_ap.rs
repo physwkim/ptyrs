@@ -145,7 +145,7 @@ fn run(dir: &Path, pattern: &str, args: &[String]) -> Result<(), Box<dyn Error>>
     let devs = topo::devices()?;
     let ordinals = topo::numa_grouped(&devs);
     let t = Instant::now();
-    let mut ap = DistLiveAp::new(&ordinals, &cfg, &views, scheme, &probe)?;
+    let mut ap = DistLiveAp::new(&ordinals, &cfg, &views, scheme, &probe, false)?;
     let setup = t.elapsed().as_secs_f64();
     let warm = WarmUp::end();
     let ngpu = ap.ngpu();
