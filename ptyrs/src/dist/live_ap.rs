@@ -52,7 +52,7 @@ struct State {
     scan_backer: ScanBacker,
     /// The counts of the region's frames in landing order, which the uploader fills.
     store: Arc<DeviceStore>,
-    _counts_view: DeviceBuffer<u16>,
+    counts_view: DeviceBuffer<u16>,
     _kernels: Kernels,
     ex: Exchange,
     _probe: DeviceBuffer<C32>,
@@ -247,7 +247,7 @@ impl State {
             scan,
             scan_backer,
             store,
-            _counts_view: counts_view,
+            counts_view,
             _kernels: kernels,
             ex,
             _probe: probe,
@@ -356,7 +356,7 @@ impl State {
         if let Some(l) = &mut self.llk {
             l.ring
                 .device()
-                .count(&ctx, binned..landed, &self._counts_view)?;
+                .count(&ctx, binned..landed, &self.counts_view)?;
         }
         for _ in 0..landed.div_ceil(nf).div_ceil(self.stacks) {
             self.sweep.replay()?;
