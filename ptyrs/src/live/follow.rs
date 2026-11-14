@@ -1090,7 +1090,7 @@ mod tests {
                 let mut s = ring.reserve();
                 s.frame().copy_from_slice(&p.frame(k));
                 let (x, y) = pos[k];
-                table.insert(k as i32, Pos { x, y, t_rx: 0 });
+                table.insert(k as i32, Pos::new(x, y, 0));
                 s.commit(k as i32, 0, 0);
                 k += 1;
             }
@@ -1365,7 +1365,7 @@ mod tests {
                     s.frame()
                         .copy_from_slice(&counts[k * n * n..(k + 1) * n * n]);
                     let (x, y) = pos[k];
-                    table.insert(k as i32, Pos { x, y, t_rx: 0 });
+                    table.insert(k as i32, Pos::new(x, y, 0));
                     s.commit(k as i32, 0, 0);
                     k += 1;
                 }
@@ -1535,7 +1535,7 @@ mod tests {
                     let mut s = ring.reserve();
                     s.frame()
                         .copy_from_slice(&counts[k * n * n..(k + 1) * n * n]);
-                    table.insert(k as i32, Pos { x, y, t_rx: 0 });
+                    table.insert(k as i32, Pos::new(x, y, 0));
                     s.commit(k as i32, 0, 0);
                 }
             })
