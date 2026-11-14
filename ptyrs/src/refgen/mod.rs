@@ -310,6 +310,11 @@ fn pairs(p: &Positions, scale: [f64; 2]) -> Value {
 }
 
 /// Simulates `spec`. Counts above `MAX_COUNT` are an error (lower `photons_per_frame`).
+///
+/// # Panics
+///
+/// For a `step_px` that puts a scan position outside [`Positions::valid`]: NaN, infinite, or
+/// so large that a point lands more than 1e10 m from the centre.
 pub fn generate(spec: &Spec) -> Result<Generated, RefgenError> {
     let g = spec.geometry;
     let [ny, nx] = g.frame;
