@@ -8,6 +8,11 @@
 //! are what places structure finer than that inside the patch, so the network reads the unbinned
 //! centre of the frame as a second image. A trained model holds for the probe and geometry of its
 //! training scans.
+//!
+//! The phase output is the phase detail, [`phase_detail`]: one frame does not fix the phase
+//! level of its patch, and a start that carries a level without the structure on it slows rPIE
+//! below the flat start. The stitched start therefore has zero phase at scales beyond
+//! [`DETAIL_SIGMA`] of the patch.
 
 use std::f64::consts::PI;
 use std::path::{Path, PathBuf};
@@ -57,7 +62,7 @@ impl PredictorConfig {
     }
 }
 
-/// Object patches `[n, py, px]` as amplitude and phase.
+/// Object patches `[n, py, px]` as amplitude and phase detail ([`phase_detail`]).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Patches {
     pub dims: [usize; 3],
@@ -161,18 +166,62 @@ fn patch_corner(addr: &AddrTable, f: usize, patch: [usize; 2]) -> [usize; 2] {
     ]
 }
 
+/// Sigma of the blur [`phase_detail`] removes, as a fraction of the patch side: at bin 4 the
+/// intensity width of `sim::probe`, the spot over which a frame leaves the phase level open.
+pub const DETAIL_SIGMA: f64 = 1.0 / 4.0;
+
+/// The phase of object mode 0 minus its Gaussian blur of `sigma` pixels, the blur renormalised
+/// over the pixels inside the object at its edges.
+pub fn phase_detail(object: &Object, sigma: f64) -> Vec<f32> {
+    let [ny, nx] = object.plane_shape();
+    let phase: Vec<f64> = object.plane(0).iter().map(|c| c.arg()).collect();
+    let r = (4.0 * sigma).ceil() as usize;
+    let kernel: Vec<f64> = (0..=2 * r)
+        .map(|i| (-((i as f64 - r as f64) / sigma).powi(2) / 2.0).exp())
+        .collect();
+    // One pass along a line of `len` pixels `step` apart.
+    let pass = |src: &[f64], dst: &mut [f64], start: usize, step: usize, len: usize| {
+        for i in 0..len {
+            let (lo, hi) = (i.saturating_sub(r), (i + r).min(len - 1));
+            let (mut sum, mut weight) = (0.0, 0.0);
+            for j in lo..=hi {
+                let k = kernel[j + r - i];
+                sum += k * src[start + j * step];
+                weight += k;
+            }
+            dst[start + i * step] = sum / weight;
+        }
+    };
+    let mut rows = vec![0.0; ny * nx];
+    for y in 0..ny {
+        pass(&phase, &mut rows, y * nx, 1, nx);
+    }
+    let mut blur = vec![0.0; ny * nx];
+    for x in 0..nx {
+        pass(&rows, &mut blur, x, nx, ny);
+    }
+    phase
+        .iter()
+        .zip(blur)
+        .map(|(p, b)| (p - b) as f32)
+        .collect()
+}
+
 /// The true patches of object mode 0 at every frame of `addr`: the predictor's training target.
+/// The detail is taken on the whole object before the patches are cut.
 pub fn object_patches(object: &Object, addr: &AddrTable, patch: [usize; 2]) -> Patches {
     let nxo = object.plane_shape()[1];
     let plane = object.plane(0);
+    let sigma = DETAIL_SIGMA * patch[0].min(patch[1]) as f64;
+    let detail = phase_detail(object, sigma);
     let mut out = Patches::empty(patch);
     for f in 0..addr.nframe() {
         let [cy, cx] = patch_corner(addr, f, patch);
         for y in 0..patch[0] {
-            for c in &plane[(cy + y) * nxo + cx..][..patch[1]] {
-                out.amp.push(c.norm() as f32);
-                out.phase.push(c.arg() as f32);
-            }
+            let row = (cy + y) * nxo + cx;
+            out.amp
+                .extend(plane[row..][..patch[1]].iter().map(|c| c.norm() as f32));
+            out.phase.extend(&detail[row..][..patch[1]]);
         }
     }
     out.dims[0] = addr.nframe();
@@ -712,6 +761,18 @@ mod tests {
     }
 
     #[test]
+    fn phase_detail_removes_the_level_and_keeps_a_step() {
+        let phase = |x: usize| if x < 32 { 0.3 } else { 0.9 };
+        let data = (0..64 * 64).map(|i| C64::from_polar(0.7, phase(i % 64)));
+        let object = Object::new(Stack::from_vec([1, 64, 64], data.collect()).unwrap());
+        let d = phase_detail(&object, 4.0);
+        // Far from the step the level is gone; across it half the step stays on each side.
+        assert!(d[10 * 64 + 5].abs() < 1e-6 && d[10 * 64 + 60].abs() < 1e-6);
+        assert!((d[10 * 64 + 31] + 0.27).abs() < 0.02, "{}", d[10 * 64 + 31]);
+        assert!((d[10 * 64 + 32] - 0.27).abs() < 0.02, "{}", d[10 * 64 + 32]);
+    }
+
+    #[test]
     fn mean_frame_total_skips_masked() {
         let counts = Counts::from_raw([2, 1, 2], vec![3, MASKED, 4, 5]).unwrap();
         assert_eq!(mean_frame_total(&counts), 6.0);
@@ -725,6 +786,7 @@ mod tests {
         let object = crate::nn::data::random_object([32, 32], 4);
         let patches = object_patches(&object, &addr, [8, 8]);
         assert_eq!(patches.dims, [3, 8, 8]);
+        let detail = phase_detail(&object, DETAIL_SIGMA * 8.0);
         let back = stitch(&patches, &addr).unwrap();
         let mut covered = vec![false; 32 * 32];
         for f in 0..3 {
@@ -735,7 +797,11 @@ mod tests {
         }
         assert!(covered.iter().any(|c| !c));
         for (i, (b, o)) in back.as_slice().iter().zip(object.as_slice()).enumerate() {
-            let want = if covered[i] { *o } else { C64::new(1.0, 0.0) };
+            let want = if covered[i] {
+                C64::from_polar(o.norm(), f64::from(detail[i]))
+            } else {
+                C64::new(1.0, 0.0)
+            };
             assert!((b - want).norm() < 1e-6, "pixel {i}: {b} vs {want}");
         }
         let short = Patches {
