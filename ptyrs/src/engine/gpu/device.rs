@@ -36,7 +36,6 @@ use super::{
     to_c32, to_u32, wave_bytes,
 };
 use crate::engine::features::{POSITION_LIMIT, POSITION_STEP};
-use crate::engine::ptycho::Algorithm;
 use crate::engine::{
     ApParams, BhParams, BhStep, DmParams, EngineError, Features, LsqmlParams, LsqmlStep, MlParams,
     PlaneStage, RaarParams, RpieParams, Sampling,
@@ -225,12 +224,6 @@ impl FeatureBufs {
     /// What the position model adds to the shared passes.
     fn scratch(&self) -> PositionScratch {
         PositionScratch::of(self.position.as_ref().map(|p| &p.mover))
-    }
-
-    /// Whether the position model samples the object at the offsets, which only some fused
-    /// passes model yet.
-    fn samples_object(&self) -> bool {
-        matches!(self.scratch(), PositionScratch::Windows { .. })
     }
 }
 
@@ -1983,7 +1976,6 @@ pub(super) struct RpieBufs<'a> {
     pub pmax: &'a mut DeviceBuffer<f32>,
     /// A probe of ones, so `obj_probe_to_psi` yields the object windows.
     pub ones: &'a DeviceBuffer<C32>,
-    pub moved: Option<&'a mut RpieMoved>,
 }
 
 impl RpieScratch {
@@ -2001,6 +1993,7 @@ impl RpieScratch {
         let (cut, _) = batch_stacks(stream, dims, batch, batch)?;
         let len = cut.wave_len(dims);
         let plans = cut.plans(stream, dims)?;
+        let moved = (moved.map(|s| RpieMoved::new(stream, kernels, views, &cut, s))).transpose()?;
         let Cut {
             frames: batches,
             table,
@@ -2024,14 +2017,14 @@ impl RpieScratch {
             ptilde: DeviceBuffer::zeroed(stream, nprobe_values)?,
             pmax: DeviceBuffer::zeroed(stream, 1)?,
             ones: DeviceBuffer::from_host(stream, &vec![C32 { re: 1.0, im: 0.0 }; nprobe_values])?,
-            moved: (moved.map(|s| RpieMoved::new(stream, kernels, views, table.nf_max(), s)))
-                .transpose()?,
+            moved,
             table,
         })
     }
 
-    fn lend(&mut self) -> RpieBufs<'_> {
-        RpieBufs {
+    /// Its buffers, and apart the position model's state.
+    fn lend(&mut self) -> (RpieBufs<'_>, Option<&mut RpieMoved>) {
+        let bufs = RpieBufs {
             batches: &self.batches,
             n: self.n,
             table: &self.table,
@@ -2043,8 +2036,8 @@ impl RpieScratch {
             ptilde: &mut self.ptilde,
             pmax: &mut self.pmax,
             ones: &self.ones,
-            moved: self.moved.as_mut(),
-        }
+        };
+        (bufs, self.moved.as_mut())
     }
 }
 
@@ -2427,32 +2420,6 @@ impl Device {
         Ok(())
     }
 
-    /// Fails while `algorithm`'s cycle, or the LLK records its calls tag, cannot model the
-    /// position as it is sampled, whether its run is built or reused.
-    fn cycle_runs(&self, algorithm: Algorithm) -> Result<(), EngineError> {
-        match algorithm {
-            Algorithm::Ap
-            | Algorithm::Dm
-            | Algorithm::Raar
-            | Algorithm::Ml
-            | Algorithm::Lsqml
-            | Algorithm::Bh => Ok(()),
-            Algorithm::Rpie => self.patch_only(&format!("{algorithm:?}")),
-        }
-    }
-
-    /// Fails for `what`, whose passes model a position by moving the probe alone, while a
-    /// position is modelled under [`Sampling::FullObject`].
-    fn patch_only(&self, what: &str) -> Result<(), EngineError> {
-        if self.features.samples_object() {
-            return Err(EngineError::Invalid(format!(
-                "{what} models a position by moving the probe, not under \
-                 Sampling::FullObject: set_sampling(Sampling::Patch) runs it"
-            )));
-        }
-        Ok(())
-    }
-
     /// Whether some feature takes a step from far sums: the scale or the background.
     pub fn has_stepped(&self) -> bool {
         let f = &self.features;
@@ -2681,7 +2648,6 @@ impl Device {
         cycle: usize,
         stage: impl FnOnce(&mut Self) -> Result<(), EngineError>,
     ) -> Result<(), EngineError> {
-        self.cycle_runs(epoch.algorithm())?;
         let mut runs = std::mem::take(&mut self.runs);
         runs.retain(|r| r.cycle.epoch().run() == epoch.run());
         if self.carried.as_ref().is_some_and(|c| !c.serves(epoch)) {
@@ -2716,12 +2682,8 @@ impl Device {
     }
 
     /// Enqueues the LLK record of the current estimate under `tag`, from the graph captured
-    /// in [`Self::new`] or eagerly without graphs; none while the tag's algorithm cannot
-    /// cycle ([`Self::cycle_runs`]).
+    /// in [`Self::new`] or eagerly without graphs.
     pub fn llk_pass(&mut self, tag: Tag) -> Result<(), EngineError> {
-        if let Some((_, algorithm)) = tag {
-            self.cycle_runs(algorithm)?;
-        }
         let graph = self.llk_graph.take();
         let done = match &graph {
             Some(c) => self.replay(c, tag),
@@ -3014,7 +2976,10 @@ impl<'a> Bufs<'a> {
             Cycle::Raar { params, first } => self
                 .with_carried(|b, c| b.raar_cycle(ctx, passes, c, params, *first))
                 .map(|()| None),
-            Cycle::Rpie(p, scratch) => self.rpie_epoch(ctx, p, &mut scratch.lend()).map(|()| None),
+            Cycle::Rpie(p, scratch) => {
+                let (mut rb, moved) = scratch.lend();
+                self.rpie_epoch(ctx, p, &mut rb, moved).map(|()| None)
+            }
             Cycle::Ml { params, first, llk } => self.with_ml(|b, ml| {
                 b.ml_epoch(ctx, passes, ml, params, *first, llk.then(|| ring.record()))
             }),
