@@ -650,14 +650,31 @@ impl GpuPtycho {
     /// which start from it as from the one [`Self::new`] uploads; fails, changing nothing,
     /// when its dims differ from the current object's.
     pub fn set_object(&mut self, object: &Object) -> Result<(), EngineError> {
-        if object.dims() != self.obj_dims {
+        self.object_fits(object.dims(), object.as_slice().len())?;
+        self.dev.write_object(&to_c32(object.as_slice()))
+    }
+
+    /// [`Self::set_object`] from `src`, an object of `dims` in this reconstruction's context
+    /// whose writes from other streams have finished; the copy is waited for, so `src` may be
+    /// released or rewritten on return.
+    pub fn set_object_device(
+        &mut self,
+        dims: [usize; 3],
+        src: &DeviceBuffer<C32>,
+    ) -> Result<(), EngineError> {
+        self.object_fits(dims, src.len())?;
+        self.dev.copy_object(src)
+    }
+
+    /// Fails unless an object of `dims` held in `len` values is the current object's shape.
+    fn object_fits(&self, dims: [usize; 3], len: usize) -> Result<(), EngineError> {
+        if dims != self.obj_dims || len != dims.iter().product::<usize>() {
             return Err(EngineError::Invalid(format!(
-                "object {:?} differs from the reconstruction's {:?}",
-                object.dims(),
+                "object {dims:?} of {len} values differs from the reconstruction's {:?}",
                 self.obj_dims
             )));
         }
-        self.dev.write_object(&to_c32(object.as_slice()))
+        Ok(())
     }
 
     /// The probe, read back from the device.

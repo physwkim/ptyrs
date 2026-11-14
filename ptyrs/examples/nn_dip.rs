@@ -19,11 +19,10 @@ use std::io::{BufWriter, Write};
 use std::sync::Arc;
 use std::time::Instant;
 
-use burn::prelude::*;
 use cuda_core::CudaContext;
-use ptyrs::base::{C64, Object, Probe, Scan, Stack, sim};
+use ptyrs::base::{Object, Probe, Scan, sim};
 use ptyrs::engine::{DmParams, GpuOptions, GpuPtycho, MlParams, Ptycho};
-use ptyrs::nn::dip::{Dip, DipConfig, LossError, ObjectLoss};
+use ptyrs::nn::dip::{Dip, DipConfig, GpuLoss, LossError, ObjectLoss};
 use ptyrs::nn::metric::{LLK_MARGIN, iterations_to_llk};
 use ptyrs::nn::predictor::flat_object;
 
@@ -35,40 +34,6 @@ const DM_CYCLES: usize = 1;
 const AT: [usize; 7] = [0, 10, 20, 50, 100, 200, 500];
 /// ML iterations whose LLK becomes DIP's target.
 const NS: [usize; 2] = [20, 100];
-
-/// The engine's normalised Poisson LLK and its object gradient: `ml_grads` gives that of the
-/// LLK sum.
-struct GpuLoss {
-    ptycho: GpuPtycho,
-    nb_obs: f64,
-}
-
-impl ObjectLoss for GpuLoss {
-    fn gradient(&mut self, object: &Tensor<3>) -> Result<(f64, Tensor<3>), LossError> {
-        let [ny, nx, _] = object.dims();
-        let host = object
-            .to_data()
-            .convert::<f64>()
-            .try_into_vec::<f64>()
-            .map_err(|e| format!("{e:?}"))?;
-        let data = host.chunks(2).map(|z| C64::new(z[0], z[1])).collect();
-        self.ptycho
-            .set_object(&Object::new(Stack::from_vec([1, ny, nx], data)?))?;
-        let llk = self.ptycho.llk()?.poisson;
-        let [g, _] = self.ptycho.ml_grads()?;
-        let n = self.nb_obs;
-        let g: Vec<f64> = g
-            .as_slice()
-            .iter()
-            .flat_map(|c| [c.re / n, c.im / n])
-            .collect();
-        let g = TensorData::new(g, object.shape());
-        Ok((
-            llk,
-            Tensor::from_data(g, (&object.device(), object.dtype())),
-        ))
-    }
-}
 
 /// The LLK of the flat start and after each of `n` iterations, [`DM_CYCLES`] of DM then ML.
 fn ml(
@@ -103,21 +68,16 @@ fn ml(
     Ok(llk)
 }
 
-/// The LLK after each of `0..=n` DIP steps of size `lr`.
+/// The LLK after each of `0..=n` DIP steps of size `lr`, for `[ny, nx]` objects.
 fn dip(
     ctx: &Arc<CudaContext>,
     scan: &Scan,
-    start: Object,
+    [ny, nx]: [usize; 2],
     probe: &Probe,
     n: usize,
     lr: f64,
 ) -> Result<Vec<f64>, LossError> {
-    let [_, ny, nx] = start.dims();
-    let ptycho = GpuPtycho::new(ctx, scan, start, probe.clone(), GpuOptions::default())?;
-    let mut loss = GpuLoss {
-        ptycho,
-        nb_obs: scan.counts.nb_obs() as f64,
-    };
+    let mut loss = GpuLoss::new(ctx, scan, [ny, nx], probe.clone(), GpuOptions::default())?;
     let mut net = Dip::new(&DipConfig::new([ny, nx]), &ptyrs::nn::cuda(0))?;
     let mut llk = Vec::with_capacity(n + 1);
     for _ in 0..n {
@@ -152,10 +112,10 @@ fn main() -> Result<(), LossError> {
         let at_truth = Ptycho::new(&scan, truth, probe.clone())?.llk().poisson;
         let flat = flat_object(&addr);
         let t = Instant::now();
-        let ml = ml(&ctx, &scan, flat.clone(), &probe, n)?;
+        let ml = ml(&ctx, &scan, flat, &probe, n)?;
         let t_ml = t.elapsed().as_secs_f64();
         let t = Instant::now();
-        let dip = dip(&ctx, &scan, flat, &probe, n, lr)?;
+        let dip = dip(&ctx, &scan, addr.obj_shape(), &probe, n, lr)?;
         let t_dip = t.elapsed().as_secs_f64();
         for (alg, llk) in [("ml", &ml), ("dip", &dip)] {
             for (i, l) in llk.iter().enumerate() {

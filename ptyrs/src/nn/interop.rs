@@ -25,6 +25,8 @@ use cuda_core::{
     Stream, sys,
 };
 
+use crate::gpu::C32;
+
 type CudaServer = <CudaRuntime as Runtime>::Server;
 
 #[derive(Debug, thiserror::Error)]
@@ -39,6 +41,8 @@ pub enum InteropError {
     Driver(#[from] DriverError),
     #[error("burn's buffer is not in the cuda-rust stream's context")]
     Context,
+    #[error("a complex tensor is [ny, nx, 2], got {0:?}")]
+    Complex(Vec<usize>),
     #[error("shape {shape:?} holds {want} values, buffer has {have}")]
     Len {
         shape: Vec<usize>,
@@ -71,6 +75,11 @@ unsafe impl<R: Send + 'static> DeviceAllocation for BurnAllocation<R> {
     }
 }
 
+/// A value made of f32s, every bit pattern of which is valid: what burn's f32 memory is lent as.
+trait F32s: DeviceCopy {}
+impl F32s for f32 {}
+impl F32s for C32 {}
+
 /// A burn tensor's memory lent to cuda-rust to read, by [`lend`]: it derefs to the buffer but
 /// gives no `&mut`, since a tensor burn first made contiguous is lent as that copy, which a write
 /// would not reach. [`lend_out`] lends memory to write.
@@ -92,6 +101,22 @@ pub fn lend<const D: usize>(
     tensor: &Tensor<D>,
     stream: &Stream,
 ) -> Result<Lent<f32>, InteropError> {
+    lend_as(tensor, stream)
+}
+
+/// [`lend`] of a `[ny, nx, 2]` tensor, real and imaginary parts interleaved, as the `ny * nx`
+/// complex values of the engine's layout.
+pub fn lend_complex(tensor: &Tensor<3>, stream: &Stream) -> Result<Lent<C32>, InteropError> {
+    if tensor.dims()[2] != 2 {
+        return Err(InteropError::Complex(tensor.dims().to_vec()));
+    }
+    lend_as(tensor, stream)
+}
+
+fn lend_as<T: F32s, const D: usize>(
+    tensor: &Tensor<D>,
+    stream: &Stream,
+) -> Result<Lent<T>, InteropError> {
     let cube = into_contiguous(primitive(tensor)?);
     Ok(Lent(alias(cube, &tensor.device(), stream)?))
 }
@@ -103,6 +128,24 @@ pub fn lend_out<const D: usize>(
     device: &Device,
     stream: &Stream,
 ) -> Result<(Tensor<D>, DeviceBuffer<f32>), InteropError> {
+    lend_out_as(shape, device, stream)
+}
+
+/// [`lend_out`] of a `[ny, nx, 2]` tensor, lent as the `ny * nx` complex values of the engine's
+/// layout, real and imaginary parts interleaved.
+pub fn lend_out_complex(
+    [ny, nx]: [usize; 2],
+    device: &Device,
+    stream: &Stream,
+) -> Result<(Tensor<3>, DeviceBuffer<C32>), InteropError> {
+    lend_out_as([ny, nx, 2], device, stream)
+}
+
+fn lend_out_as<T: F32s, const D: usize>(
+    shape: [usize; D],
+    device: &Device,
+    stream: &Stream,
+) -> Result<(Tensor<D>, DeviceBuffer<T>), InteropError> {
     // burn pads the rows of a fresh tensor of two or more dims; a flat one is row-major, and
     // reshaping a row-major tensor keeps its memory.
     let flat = Tensor::<1>::empty([shape.iter().product::<usize>()], (device, DType::F32));
@@ -124,11 +167,11 @@ fn primitive<const D: usize>(tensor: &Tensor<D>) -> Result<CubeTensor, InteropEr
 
 /// `cube`'s memory as a buffer, once burn's queued work on `device`, its device, has finished;
 /// fails unless `cube` is laid out in rows, as the buffer would not hold its values.
-fn alias(
+fn alias<T: F32s>(
     cube: CubeTensor,
     device: &Device,
     stream: &Stream,
-) -> Result<DeviceBuffer<f32>, InteropError> {
+) -> Result<DeviceBuffer<T>, InteropError> {
     if cube.meta.is_tiled() || !cube.is_contiguous() {
         return Err(InteropError::Burn(format!(
             "a {:?} tensor not laid out in rows",
@@ -174,9 +217,9 @@ fn alias(
         _hold: Mutex::new((cube, resource)),
     };
     let storage = RawDeviceBuffer::foreign(Arc::new(allocation), bytes);
-    // SAFETY: burn initialised all `len` f32 values (its queued work has finished) and the
-    // allocation is cubecl's, so it is f32-aligned.
-    Ok(unsafe { DeviceBuffer::from_storage(storage, len)? })
+    // SAFETY: any bits are a valid `T`, burn's queued writes have finished, and `bytes` holds
+    // `bytes / size_of::<T>()` values (`from_storage` fails on a remainder or misalignment).
+    Ok(unsafe { DeviceBuffer::from_storage(storage, bytes / size_of::<T>())? })
 }
 
 /// Copies an engine-owned buffer into a new burn tensor of `shape` on `device`: one

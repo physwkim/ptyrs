@@ -4,7 +4,7 @@
 //! Adam (torch's epsilon) on the engine's Poisson LLK with the truth probe fixed. Fails if the
 //! network's start object differs from pty-chi's by more than 1e-10 (f64) or 1e-2 (f32) of its
 //! largest modulus. Writes `<out_dir>/ptyrs_<dtype>.tsv` (iteration, LLK after it with 0 the start,
-//! synchronised seconds of the step and of its loss, host copies included) and the last object
+//! synchronised seconds of the step and of its loss, any host copies included) and the last object
 //! to `<out_dir>/ptyrs_<dtype>_object.h5`.
 //!
 //! `f64` runs the network in f64 on the CPU engine's f64 loss (`Ptycho`), the curve against
@@ -31,9 +31,9 @@ use burn::tensor::module::max_pool2d;
 use burn::tensor::ops::MaxPoolOptions;
 use cuda_core::CudaContext;
 use ptyrs::base::{C64, Object, Probe, Scan, Stack};
-use ptyrs::engine::{GpuOptions, GpuPtycho, Ptycho};
+use ptyrs::engine::{GpuOptions, Ptycho};
 use ptyrs::io::{read_cxi, read_modes, write_modes};
-use ptyrs::nn::dip::{Dip, LossError, ObjectLoss, Prior};
+use ptyrs::nn::dip::{Dip, GpuLoss, LossError, ObjectLoss, Prior};
 use rust_hdf5::H5File;
 
 /// pty-chi's `DoubleConv`: (3×3 convolution without bias, batch normalisation, ReLU) twice. On
@@ -239,21 +239,6 @@ impl ObjectLoss for CpuLoss<'_> {
     }
 }
 
-/// The same on the GPU, whose engine computes in f32.
-struct GpuLoss {
-    ptycho: GpuPtycho,
-    nb_obs: f64,
-}
-
-impl ObjectLoss for GpuLoss {
-    fn gradient(&mut self, object: &Tensor<3>) -> Result<(f64, Tensor<3>), LossError> {
-        self.ptycho.set_object(&to_object(object)?)?;
-        let llk = self.ptycho.llk()?.poisson;
-        let [g, _] = self.ptycho.ml_grads()?;
-        Ok((llk, to_tensor(&g, self.nb_obs, object)))
-    }
-}
-
 /// `loss` and the seconds of its last call, from the object's device synchronised: the forward
 /// that made the object is not counted.
 struct Timed<L> {
@@ -391,16 +376,9 @@ fn main() -> Result<(), LossError> {
         train(&mut dip, &device, loss, n, lr, &mut rows)?
     } else {
         let ctx = CudaContext::new(0)?;
-        let start = to_object(&dip.object())?;
-        let ptycho = GpuPtycho::new(&ctx, &scan, start, probe.clone(), GpuOptions::default())?;
-        train(
-            &mut dip,
-            &device,
-            GpuLoss { ptycho, nb_obs },
-            n,
-            lr,
-            &mut rows,
-        )?
+        let [ny, nx, _] = dip.object().dims();
+        let loss = GpuLoss::new(&ctx, &scan, [ny, nx], probe.clone(), GpuOptions::default())?;
+        train(&mut dip, &device, loss, n, lr, &mut rows)?
     };
 
     let mut f = BufWriter::new(File::create(out_dir.join(format!("ptyrs_{tag}.tsv")))?);
