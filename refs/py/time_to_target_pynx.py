@@ -2,21 +2,21 @@
 DM, RAAR or ML with compare_cxidb.py's matched settings, both sides driven from Python, every run
 through gpu2.sh.
 
-    python -I time_to_target_pynx.py OUT {dm,raar,ml} [--long 1000] [--runs 3] [--module DIR]
-        [--gpu2 PATH] [--log OUT/ttt]
+    python -I time_to_target_pynx.py OUT {dm,raar,ml} [--long 1000] [--runs 3] [--target LLK]
+        [--module DIR] [--gpu2 PATH] [--log OUT/ttt]
 
 time_to_target.py's rules: one long run of --long cycles per side sets the target, 1.01 times the
-lower of the two final LLKs, and each side then runs from the same start until --runs counted
-runs have reached it. The LLK is PyNX's normalised one, which both sides record: the Gaussian for
-DM and RAAR, the Poisson for ML, the one ML minimises (PyNX's ML gradient is Poisson only), as its
-Gaussian rises on these counts. The runs alternate ABBA (ptyrs, PyNX, PyNX, ptyrs, ...), each a
-process of its own in a gpu2.sh hold of at most HOLD_S seconds, on CPUs 48-71 with 24 threads.
-A run counts when gpu2.sh calls it clean and CPUs 48-71 were under BUSY busy over it (/proc/stat;
-the run itself takes one or two of them): PyNX launches its kernels from one Python thread, and
-its time per cycle tracks the load on that thread's CPU. Before each run the parent waits until
-those CPUs were under QUIET over WINDOW_S. Prints every run with its busy fraction and the load
-average at its end, the medians of the counted runs, and both long runs' curves; logs and a JSON
-summary go to --log.
+lower of the two final LLKs, and each side then runs from the same start until --runs counted runs
+have reached it; --target gives the target in place of the long runs. The LLK is PyNX's normalised
+one, which both sides record: the Gaussian for DM and RAAR, the Poisson for ML, the one ML
+minimises (PyNX's ML gradient is Poisson only), as its Gaussian rises on these counts. The runs
+alternate ABBA (ptyrs, PyNX, PyNX, ptyrs, ...), each a process of its own in a gpu2.sh hold of at
+most HOLD_S seconds, on CPUs 48-71 with 24 threads. A run counts when gpu2.sh calls it clean and
+CPUs 48-71 were under BUSY busy over it (/proc/stat; the run itself takes one or two of them): PyNX
+launches its kernels from one Python thread, and its time per cycle tracks the load on that
+thread's CPU. Before each run the parent waits until those CPUs were under QUIET over WINDOW_S.
+Prints every run with its busy fraction and the load average at its end, the medians of the counted
+runs, and the long runs' curves; logs and a JSON summary go to --log.
 
 A run (--worker) imports its side (imports_s), reads OUT/scan.cxi and the start (read_s) and
 puts the state on the GPU (setup_s, from the read, synchronised; for PyNX its CUDA context and
@@ -253,7 +253,7 @@ def main():
     a.add_argument("--gpu2", default=os.path.join(SCRATCH, "tools", "gpu2.sh"))
     a.add_argument("--log", help="default OUT/ttt")
     a.add_argument("--worker", choices=SIDES, dest="side", help=argparse.SUPPRESS)
-    a.add_argument("--target", type=float, help=argparse.SUPPRESS)
+    a.add_argument("--target", type=float, help="the target LLK, with no long runs")
     args = a.parse_args()
     if args.side:
         return worker(args)
@@ -261,28 +261,15 @@ def main():
     args.log = args.log or os.path.join(args.out, "ttt")
     os.makedirs(args.log, exist_ok=True)
     name, key = TARGET[args.algo], LLK.index(TARGET[args.algo])
-    print(f"{args.algo}: {args.long} cycles per long run, {name} LLK ({cx.load_avg()})",
+    print(f"{args.algo}: {args.long} cycles per LLK pass, {name} LLK ({cx.load_avg()})",
           flush=True)
-    long, final = {}, {}
-    for side in SIDES:
-        r = run(args, side, "long", None)
-        long[side] = r["llk"]
-        final[side] = r["llk"][-1][key]
-        print(f"{side:5s} long run: {name} LLK {final[side]:.6f} after {len(r['llk']) - 1} "
-              f"cycles, {r['status']}, load {r['load']}", flush=True)
-    target = FACTOR * min(final.values())
-    print(f"target {FACTOR:g} x {min(final.values()):.6f} = {target:.6f}")
-    for side in SIDES:
-        n = next((c for c, v in enumerate(long[side]) if v[key] <= target), None)
-        print(f"{side:5s} long run reaches it at cycle {n}")
-    every = max(1, args.long // 20)
-    print(f"long runs' {name} LLK by cycle: cycle ptyrs pynx")
-    for c in sorted({*range(0, args.long, every), args.long - 1}):
-        print(f"  {c:5d} {long['ptyrs'][c][key]:.6f} {long['pynx'][c][key]:.6f}")
-
-    summary = {"algo": args.algo, "long_cycles": args.long, "llk": name, "final_llk": final,
-               "target": target, "curves": {"columns": LLK, **long},
-               "runs": {s: [] for s in SIDES}, "discarded": {s: [] for s in SIDES}}
+    if args.target is None:
+        target, summary = long_runs(args, name, key)
+    else:
+        target, summary = args.target, {}
+        print(f"target {target:.6f}, given")
+    summary.update(algo=args.algo, llk=name, target=target, runs={s: [] for s in SIDES},
+                   discarded={s: [] for s in SIDES})
     tries = {s: 0 for s in SIDES}
     k = 0
     while any(len(summary["runs"][s]) < args.runs and tries[s] < 3 * args.runs for s in SIDES):
@@ -318,6 +305,28 @@ def main():
     print(path)
     if any(len(summary["runs"][s]) < args.runs for s in SIDES):
         sys.exit(f"fewer than {args.runs} counted runs on a side")
+
+
+def long_runs(args, name, key):
+    """One long run per side: the target, 1.01 times the lower final, and the summary's fields."""
+    long, final = {}, {}
+    for side in SIDES:
+        r = run(args, side, "long", None)
+        long[side] = r["llk"]
+        final[side] = r["llk"][-1][key]
+        print(f"{side:5s} long run: {name} LLK {final[side]:.6f} after {len(r['llk']) - 1} "
+              f"cycles, {r['status']}, load {r['load']}", flush=True)
+    target = FACTOR * min(final.values())
+    print(f"target {FACTOR:g} x {min(final.values()):.6f} = {target:.6f}")
+    for side in SIDES:
+        n = next((c for c, v in enumerate(long[side]) if v[key] <= target), None)
+        print(f"{side:5s} long run reaches it at cycle {n}")
+    every = max(1, args.long // 20)
+    print(f"long runs' {name} LLK by cycle: cycle ptyrs pynx")
+    for c in sorted({*range(0, args.long, every), args.long - 1}):
+        print(f"  {c:5d} {long['ptyrs'][c][key]:.6f} {long['pynx'][c][key]:.6f}")
+    return target, {"long_cycles": args.long, "final_llk": final,
+                    "curves": {"columns": LLK, **long}}
 
 
 if __name__ == "__main__":
