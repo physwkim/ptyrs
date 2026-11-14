@@ -49,7 +49,7 @@ use device::{Bufs, Device, NormBufs, PassesMut, SliceUploads, Uploads};
 use crate::engine::ptycho::{Algorithm, LlkRecord, zero_phase_ramp};
 use crate::engine::{
     ApParams, BhParams, DmParams, EngineError, Features, Fft2, Llk, LsqmlParams, MlParams, Optics,
-    RaarParams, RpieParams,
+    RaarParams, RpieParams, Sampling,
 };
 
 /// How [`GpuPtycho`] batches its work.
@@ -599,7 +599,8 @@ impl GpuPtycho {
             probe: &to_c32(probe.as_slice()),
             slices,
         };
-        let dev = Device::new(ctx, dims, uploads, options)?;
+        let sampling = Sampling::auto(optics, object.plane_shape(), g.frame);
+        let dev = Device::new(ctx, dims, uploads, options, sampling)?;
         Ok(Self {
             dev,
             obj_dims: object.dims(),
@@ -659,6 +660,19 @@ impl GpuPtycho {
     /// The features modelled, read back from the device.
     pub fn features(&self) -> Result<Features, EngineError> {
         self.dev.features()
+    }
+
+    /// How [`Features::position`] enters the exit waves, as
+    /// [`crate::engine::Ptycho::sampling`]: [`Sampling::auto`] of the optics, object and frame
+    /// the engine was built with, unless set.
+    pub fn sampling(&self) -> Sampling {
+        self.dev.sampling()
+    }
+
+    /// Enters [`Features::position`] as `sampling` in every call from here on, as
+    /// [`crate::engine::Ptycho::set_sampling`].
+    pub fn set_sampling(&mut self, sampling: Sampling) -> Result<(), EngineError> {
+        self.dev.set_sampling(sampling)
     }
 
     /// Models and refines `features` from here on, as [`crate::engine::Ptycho::set_features`], in

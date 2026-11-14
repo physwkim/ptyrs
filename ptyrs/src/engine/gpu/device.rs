@@ -37,7 +37,7 @@ use super::{
 use crate::engine::features::{POSITION_LIMIT, POSITION_STEP};
 use crate::engine::{
     ApParams, BhParams, BhStep, DmParams, EngineError, Features, LsqmlParams, LsqmlStep, MlParams,
-    PlaneStage, RaarParams, RpieParams,
+    PlaneStage, RaarParams, RpieParams, Sampling,
 };
 
 /// What [`Device::new`] uploads: the propagator's stage, the views' addresses, the counts
@@ -200,6 +200,9 @@ pub(super) struct Device {
     /// LSQML's state, built by the first LSQML call and replaced only for another batch size.
     lsqml: Option<Box<LsqmlState>>,
     features: FeatureBufs,
+    /// How a position's offsets enter the exit waves. Every state and graph built under a
+    /// position model was built under it: [`Self::set_sampling`] drops the others.
+    sampling: Sampling,
 }
 
 /// The features' device state as [`Device::set_features`] last set it: each modelled
@@ -1355,12 +1358,14 @@ impl Device {
     /// `ctx`; every pass cuts `0 .. nframe` by the [`StackRule`] of `ctx`'s L2, the LLK ring
     /// holds `options.llk_slots` records of every frame, its unmasked pixels counted here, and
     /// `options.fused` picks the [`Passes`], of which only the fused run a propagator's stage
-    /// or hold the carried waves in f16 ([`GpuOptions::psi_f16`]).
+    /// or hold the carried waves in f16 ([`GpuOptions::psi_f16`]); a position model's offsets
+    /// enter as `sampling`.
     pub fn new(
         ctx: &Arc<CudaContext>,
         dims: ViewDims,
         uploads: Uploads<'_>,
         options: GpuOptions,
+        sampling: Sampling,
     ) -> Result<Self, EngineError> {
         let Uploads {
             stage,
@@ -1465,6 +1470,7 @@ impl Device {
             bh_state: None,
             lsqml: None,
             features: FeatureBufs::default(),
+            sampling,
             stream,
         };
         let ctx = dev.context();
@@ -1603,6 +1609,38 @@ impl Device {
                 })
                 .transpose()?,
         })
+    }
+
+    pub fn sampling(&self) -> Sampling {
+        self.sampling
+    }
+
+    /// Enters a position's offsets as `sampling` from here on. Another sampling drops ML's,
+    /// BH's and LSQML's states built under a position model, which the next call of their
+    /// algorithm rebuilds under it, and, while a position is modelled, every run, whose
+    /// graphs bind its passes, and DM's or RAAR's carried stacks; then it recaptures the LLK
+    /// pass's graph.
+    pub fn set_sampling(&mut self, sampling: Sampling) -> Result<(), EngineError> {
+        if sampling == self.sampling {
+            return Ok(());
+        }
+        self.sampling = sampling;
+        if self.ml.as_ref().is_some_and(|s| s.moved.is_some()) {
+            self.ml = None;
+        }
+        if self.bh_state.as_ref().is_some_and(|s| s.moved.is_some()) {
+            self.bh_state = None;
+        }
+        if self.lsqml.as_ref().is_some_and(|s| s.moved()) {
+            self.lsqml = None;
+        }
+        if self.features.position.is_some() {
+            self.runs.clear();
+            self.llk_graph = None;
+            self.carried = None;
+            self.capture_llk()?;
+        }
+        Ok(())
     }
 
     /// Whether some feature takes a step from far sums: the scale or the background.
