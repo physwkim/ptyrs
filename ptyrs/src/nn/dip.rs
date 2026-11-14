@@ -551,7 +551,7 @@ pub(crate) mod tests {
 
     #[test]
     fn one_config_gives_one_start() {
-        let device = Device::cuda(0);
+        let device = crate::nn::cuda(0);
         let config = DipConfig::new([20, 28]).with_width(4).with_depth(2);
         let start = || host64(Dip::new(&config, &device).unwrap().object());
         assert!(start() == start(), "two networks of one config start apart");
@@ -559,7 +559,7 @@ pub(crate) mod tests {
 
     #[test]
     fn weight_gradients_match_finite_differences() {
-        let device = Device::cuda(0);
+        let device = crate::nn::cuda(0);
         let shape = [20, 28];
         let config = DipConfig::new(shape)
             .with_width(4)
@@ -578,7 +578,7 @@ pub(crate) mod tests {
 
     #[test]
     fn steps_fit_a_target_object() {
-        let device = Device::cuda(0);
+        let device = crate::nn::cuda(0);
         let shape = [24, 40];
         let config = DipConfig::new(shape).with_width(8).with_depth(2);
         let mut dip = Dip::new(&config, &device).unwrap();
@@ -614,7 +614,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_prior_takes_the_adam_step_of_its_config() {
-        let device = Device::cuda(0);
+        let device = crate::nn::cuda(0);
         let ad = device.clone().autodiff();
         let shape = [3, 5, 2];
         let mut rng = ChaCha8Rng::seed_from_u64(4);
@@ -656,7 +656,7 @@ pub(crate) mod tests {
 
     #[test]
     fn weight_gradients_from_the_engine_llk_match_finite_differences() {
-        let device = Device::cuda(0);
+        let device = crate::nn::cuda(0);
         let config = DipConfig::new(Tiny::SHAPE)
             .with_width(4)
             .with_depth(2)
@@ -675,7 +675,7 @@ pub(crate) mod tests {
     /// `ml_grads_match_cpu`).
     #[test]
     fn weight_gradients_from_the_engine_gpu_gradient_match_finite_differences() {
-        let device = Device::cuda(0);
+        let device = crate::nn::cuda(0);
         let config = DipConfig::new(Tiny::SHAPE)
             .with_width(4)
             .with_depth(2)

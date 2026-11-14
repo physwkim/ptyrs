@@ -385,6 +385,103 @@ fn full_object_projections_match_cpu_under_every_propagator() {
     }
 }
 
+const ML: MlParams = MlParams {
+    update_object: true,
+    update_probe: true,
+    calc_llk: 1,
+    zero_phase_ramp: false,
+};
+
+/// Drawn offsets that sample the object, alone and with a scale and a background, over
+/// frames of `frame` pixels a side.
+fn full_object_models(frame: usize) -> [(&'static str, Features); 2] {
+    let moved = Features {
+        position: Some(drawn_offsets()),
+        ..Features::default()
+    };
+    let modelled = Features {
+        scale: Some((0..NPOS).map(|f| 1.0 + 0.05 * (f as f64).sin()).collect()),
+        background: Some(vec![0.3; frame * frame]),
+        ..moved.clone()
+    };
+    [("position", moved), ("modelled", modelled)]
+}
+
+/// ML's opening scale (a call of no cycle), then the gradients of the scaled estimate, under
+/// each propagator and [`full_object_models`], against the CPU's under
+/// `Sampling::FullObject`.
+#[test]
+fn full_object_ml_scale_and_grads_match_cpu_under_every_propagator() {
+    // Measured worst: object 6.2e-8, probe 9.3e-8, object gradient 1.7e-6, probe gradient
+    // 4.0e-6.
+    const TOL: [f64; 4] = [2.5e-7, 4e-7, 6e-6, 1.5e-5];
+    let frame = FUSED_SIDES[0] as usize;
+    for c in cases() {
+        for (label, features) in full_object_models(frame) {
+            let what = format!("{} {label}", c.name);
+            let (object, probe) = (c.object.clone(), c.probe.clone());
+            let mut cpu = Ptycho::with_optics(&c.scan, c.optics(), object, probe).unwrap();
+            cpu.set_sampling(Sampling::FullObject);
+            cpu.set_features(features.clone()).unwrap();
+            cpu.ml(&ML, 0);
+            let mut gpu = c.gpu(true);
+            gpu.set_sampling(Sampling::FullObject).unwrap();
+            gpu.set_features(&features).unwrap();
+            gpu.ml(&ML, 0).unwrap();
+            let [go, gp] = gpu.ml_grads().unwrap();
+            let errs = [
+                rel_l2(&gpu.object().unwrap(), cpu.object()),
+                rel_l2(&gpu.probe().unwrap(), cpu.probe()),
+                rel_l2(&go, &cpu.obj_grad()),
+                rel_l2(&gp, &cpu.probe_grad()),
+            ];
+            eprintln!(
+                "{what}: object {:.2e} probe {:.2e} object grad {:.2e} probe grad {:.2e}",
+                errs[0], errs[1], errs[2], errs[3]
+            );
+            for ((name, e), tol) in ["object", "probe", "object grad", "probe grad"]
+                .iter()
+                .zip(errs)
+                .zip(TOL)
+            {
+                assert!(e < tol, "{what} {name}: {e:e}");
+            }
+        }
+    }
+}
+
+/// ML cycles under each propagator and [`full_object_models`] against the CPU's under
+/// `Sampling::FullObject`, eagerly and from graphs: each recorded LLK, and the object, the
+/// probe and the features after the last cycle.
+#[test]
+fn full_object_ml_matches_cpu_under_every_propagator() {
+    const NCYCLE: usize = 8;
+    // Measured worst: LLK 1.4e-5, object 2.9e-6, probe 1.5e-7, features 4.9e-6, offsets
+    // 1.9e-6, each but the features' under the Fresnel transform back with a scale and a
+    // background.
+    const TOL: [f64; 5] = [5e-5, 1.2e-5, 6e-7, 2e-5, 8e-6];
+    let frame = FUSED_SIDES[0] as usize;
+    for c in cases() {
+        for (label, features) in full_object_models(frame) {
+            let (object, probe) = (c.object.clone(), c.probe.clone());
+            let mut cpu = Ptycho::with_optics(&c.scan, c.optics(), object, probe).unwrap();
+            cpu.set_sampling(Sampling::FullObject);
+            cpu.set_features(features.clone()).unwrap();
+            cpu.ml(&ML, NCYCLE);
+            assert_eq!(cpu.history().len(), NCYCLE);
+            let want = Ended::cpu(&cpu);
+            for graph in [false, true] {
+                let what = format!("ML {} {label} graph {graph}", c.name);
+                let mut gpu = c.gpu(graph);
+                gpu.set_sampling(Sampling::FullObject).unwrap();
+                gpu.set_features(&features).unwrap();
+                gpu.ml(&ML, NCYCLE).unwrap();
+                assert_close(&what, &Ended::gpu(&gpu), &want, TOL);
+            }
+        }
+    }
+}
+
 /// The sampling is the CPU's [`Sampling::auto`] at build: `FullObject` of a near-field scan
 /// whose object is under 5/4 of the frame, `Patch` of the same scan in the far field and of
 /// a case's wider scan; `set_sampling` overrides it either way and back.
@@ -538,7 +635,7 @@ fn sampling_round_trip_rebuilds_the_same_run() {
 /// and change nothing, after a call of each, which built its run: switched to
 /// `Sampling::FullObject` after calls under `Patch` with the position, or the position set
 /// after calls under `FullObject` without one. Back under `Patch` the same calls give the
-/// records, arrays, gradients and offsets of a run never switched, bit for bit.
+/// records, arrays and offsets of a run never switched, bit for bit.
 #[test]
 fn full_object_position_fails_every_pass_until_patch() {
     let c = &cases()[0];
@@ -555,15 +652,7 @@ fn full_object_position_fails_every_pass_until_patch() {
     type Call<'a> = &'a dyn Fn(&mut GpuPtycho) -> Result<Vec<f64>, EngineError>;
     let calls: &[(&str, Call)] = &[
         ("rPIE", &|g| g.rpie(&RPIE, 1).map(|()| Vec::new())),
-        ("ML", &|g| {
-            g.ml(&MlParams::default(), 1).map(|()| Vec::new())
-        }),
         ("BH", &|g| g.bh(&bh, 1, 1).map(|()| Vec::new())),
-        ("ML gradients", &|g| {
-            let grads = g.ml_grads()?;
-            let parts = grads.iter().flat_map(|s| s.as_slice().iter());
-            Ok(parts.flat_map(|z| [z.re, z.im]).collect())
-        }),
     ];
     let run = |full_object_first: bool, switched: bool| {
         let mut gpu = c.gpu(true);
