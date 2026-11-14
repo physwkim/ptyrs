@@ -1,0 +1,99 @@
+[package]
+authors = ["louisfd <louisfd94@gmail.com>", "Nathaniel Simard"]
+categories = ["science"]
+description = "The runtime API of CubeCL: clients, devices, handles and everything a kernel launch needs."
+edition.workspace = true
+keywords = ["deep-learning", "machine-learning", "data"]
+license.workspace = true
+name = "cubecl-runtime"
+readme.workspace = true
+repository = "https://github.com/tracel-ai/cubecl/tree/main/crates/cubecl-runtime"
+version.workspace = true
+
+
+[lints]
+workspace = true
+
+
+[features]
+autotune-checks = []
+persistence = ["std", "cubecl-environment/persistence"]
+channel-cell = []
+channel-mpsc = []
+channel-mutex = []
+default = [
+    "std",
+    "channel-mutex",
+    "channel-mpsc",
+    "channel-cell",
+    "persistence",
+    "cubecl-common/default",
+]
+exclusive-memory-only = []
+profile-tracy = ["dep:tracy-client"]
+std = ["cubecl-common/std", "cubecl-environment/std", "toml", "thiserror/std"]
+tokio = ["cubecl-environment/tokio"]
+
+tracing = ["dep:tracing", "cubecl-common/tracing", "cubecl-ir/tracing"]
+
+[dependencies]
+# Runtime Deps
+log = { workspace = true }
+tracing = { workspace = true, features = ["attributes"], optional = true }
+
+bytemuck = { workspace = true }
+cfg-if = { workspace = true }
+# `serde` and `hash` are needed unconditionally (StableHash in id/kernel/
+# compiler, PartialEq on BenchmarkComputations) — not just by the persistent
+# cache, so they can't live only in the desktop target section below.
+cubecl-common = { path = "../cubecl-common", version = "0.11.4", default-features = false, features = [
+    "serde",
+    "hash",
+] }
+cubecl-environment = { path = "../cubecl-environment", version = "0.11.4", default-features = false }
+cubecl-ir = { path = "../cubecl-ir", version = "0.11.4", default-features = false, features = [
+    "serde",
+] }
+cubecl-zspace = { path = "../cubecl-zspace", version = "0.11.4", default-features = false }
+cubecl-monitoring = { path = "../cubecl-monitoring", version = "0.11.4", default-features = false }
+
+derive-new = { workspace = true }
+derive_more = { workspace = true, features = ["eq"] }
+hashbrown = { workspace = true }
+itertools = { workspace = true }
+pliron = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+smallvec = { workspace = true }
+toml = { workspace = true, optional = true }
+
+foldhash = { workspace = true }
+buildid = { workspace = true }
+thiserror = { workspace = true }
+
+futures-util = { workspace = true, default-features = false }
+
+# Persistent cache deps - has to match the cfg(std_io) cfg.
+[target.'cfg(any(target_os = "windows", target_os = "linux", target_os = "macos", target_os = "android"))'.dependencies]
+cubecl-common = { path = "../cubecl-common", version = "0.11.4", default-features = false, features = [
+    "serde",
+    "hash",
+] }
+cubecl-environment = { path = "../cubecl-environment", version = "0.11.4", default-features = false }
+serde_json = { workspace = true, features = ["std"] }
+
+# Tracy if enabled.
+tracy-client = { workspace = true, optional = true }
+
+# The tuner resolves async autotune samples on the browser event loop.
+[target.'cfg(target_family = "wasm")'.dependencies]
+wasm-bindgen-futures = { workspace = true }
+
+[dev-dependencies]
+rand = { workspace = true, features = ["thread_rng"] }
+serde_json = { workspace = true, features = ["std"] }
+serial_test = { workspace = true }
+tempfile = { workspace = true }
+test-log = { workspace = true, features = ["trace"] }
+
+[build-dependencies]
+cfg_aliases = { workspace = true }
