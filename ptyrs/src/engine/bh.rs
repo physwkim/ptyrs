@@ -368,7 +368,8 @@ impl<'a> BhBatch<'a> {
     /// `Σ Re(conj(2·td)·L_uv) + 2 Σ_unmasked [(1 − d/A)·Σ_m Re(conj(L_u)·L_v) + (d/A)·c_u·c_v]`
     /// with `L_u = U·J u′`, `u′` the slices' and the copies' first-order change along `u`,
     /// `L_uv = U·(J″(u′, v′) + J(0, p″))` ([`SliceWaves::second_order`]) with `p″` the copies'
-    /// second-order change, both with the offsets' [`Self::phase_terms`], `c_u = Σ_m Re(conj(U psi/A)·L_u)` and `d = √iobs`.
+    /// second-order change, both with the offsets' `phase_terms`,
+    /// `c_u = Σ_m Re(conj(U psi/A)·L_u)` and `d = √iobs`.
     pub fn hessian(&self, u: &BhVector, v: &BhVector) -> f64 {
         let n = self.probe_dims[1] * self.probe_dims[2];
         let (uo, up) = self.lift(u);
