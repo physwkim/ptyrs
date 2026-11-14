@@ -8,14 +8,15 @@
 //! nxo]`, and its [`ObjectSampler::spectra`] are taken once for the windows of every stack.
 //!
 //! The views of a frame on one object mode share one position, a group.
-//! [`ObjectSampler::windows`] writes a block `[nf_max * modes, ny, nx]` of a stack's
-//! windows, natural layout, `modes` every object mode ([`Modes::All`]) or the first: plane
-//! `fl * modes + o` holds frame `f0 + fl`'s window on object mode `o`. A kernel that reads
-//! `sample_obj(obj, v, y, x, ..)` for view `kl` reads pixel `y * nx + x` of plane `nobj *
-//! (kl / nmode) + v.obj` of an all-modes block instead. The blocks of one buffer hold the
-//! slices, or the derivatives over `y` and `x`. [`ObjectSampler::place`] adds `W^H` of
-//! per-view patches `[nf_max * nmode, ny, nx]`, as a scatter over the stack's views leaves
-//! them, to one slice of the object, summing each group's in the spectrum.
+//! [`ObjectSampler::windows`] writes a block `[modes, nf_max, ny, nx]` of a stack's windows,
+//! natural layout, `modes` every object mode ([`Modes::All`]) or the first: plane
+//! `o * nf_max + fl` holds frame `f0 + fl`'s window on object mode `o`. A block is so an
+//! object `[modes, nf_max * ny, nx]` of window views, which view `kl` reads as it reads the
+//! object, at object mode `v.obj`, corner `(kl / nmode * ny, 0)` and no fraction. The blocks
+//! of one buffer hold the slices, or the derivatives over `y` and `x`.
+//! [`ObjectSampler::place`] adds `W^H` of patches shaped as an all-modes block, each group's
+//! views summed as a scatter onto the window views leaves them, to one slice of the object:
+//! the exact adjoint of the windows.
 //!
 //! Each pass transforms `chunk` groups in a scratch of `chunk` object planes; a stack takes
 //! `ceil(nf_max * modes / chunk)` passes whatever its `nf`, so the launches can be captured
@@ -69,7 +70,7 @@ pub struct WindowBlock {
     /// The derivative's order over the position's `y` and `x`, `[0, 0]` for the windows.
     pub order: [u32; 2],
     pub modes: Modes,
-    /// The block of the output, `[.., nf_max * modes, ny, nx]`, written.
+    /// The block of the output, `[.., modes, nf_max, ny, nx]`, written.
     pub block: u32,
 }
 
@@ -220,9 +221,9 @@ impl ObjectSampler {
     }
 
     /// Adds `W^H patches` to `slice` of `obj`, `[nslice, nobj, nyo, nxo]`: the patches of the
-    /// stack's views at `at`, `[nf_max * nmode, ny, nx]` natural layout, plane `kl` view `f0 *
-    /// nmode + kl`'s, placed back onto the object planes; the adjoint of [`Self::windows`] of
-    /// every mode without derivative, a group's views summed.
+    /// stack's groups at `at`, `[nobj, nf_max, ny, nx]` natural layout, plane `o * nf_max + fl`
+    /// frame `f0 + fl`'s on object mode `o`, placed back onto the object planes; the adjoint
+    /// of [`Self::windows`] of every mode without derivative.
     pub fn place(
         &mut self,
         ctx: &ExecutionContext,
@@ -241,7 +242,7 @@ impl ObjectSampler {
         check_len(
             "patches",
             patches,
-            g.nf_max as usize * g.nmode as usize * self.dims.n(),
+            self.dims.nobj as usize * g.nf_max as usize * self.dims.n(),
         )?;
         check_len("obj", obj, self.object_len())?;
         let slice = self.slice(slice)?;
