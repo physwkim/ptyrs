@@ -101,7 +101,7 @@ struct Moves {
 /// The amplitude cost of a batch of views at one state of the slices, probe and offsets, and
 /// its derivatives: `F = Σ_frames Σ_unmasked (A − √iobs)²` with `A = √(Σ_m |U psi_m|²)`,
 /// `psi` the exit waves of [`SliceWaves`] at frame `b`'s probe `M_b(P)` and `U` the
-/// [`Optics::propagator`]. `views` are whole frames of an [`AddrTable`], each frame's views in
+/// [`Optics::exit`]. `views` are whole frames of an [`AddrTable`], each frame's views in
 /// its order. Every frame reads its own copy of the probe, the probe moved by the frame's
 /// offset (`M_b` the identity without offsets), and the derivatives over the probe and the
 /// offsets go through those copies.
@@ -169,7 +169,7 @@ impl<'a> BhBatch<'a> {
         });
         let waves = SliceWaves::new(optics, &uviews, objects, &copies);
         let mut psi = waves.psi().to_vec();
-        optics.propagator().forward(&mut psi);
+        optics.exit().forward(&mut psi);
         let mut td = psi.clone();
         let (mut amp, mut root) = (Vec::new(), Vec::new());
         for (fv, block) in views
@@ -216,7 +216,7 @@ impl<'a> BhBatch<'a> {
                 nslice: self.optics.nslice(),
                 probe_dims: self.copy_dims,
             },
-            propagator: self.optics.propagator(),
+            exit: self.optics.exit(),
         }
     }
 
@@ -334,9 +334,9 @@ impl<'a> BhBatch<'a> {
             let t = self.waves.tangent(&zero, &self.second(m, u, v));
             luv.iter_mut().zip(&t).for_each(|(l, t)| *l += t);
         }
-        let propagator = self.optics.propagator();
+        let exit = self.optics.exit();
         for l in [&mut lu, &mut lv, &mut luv] {
-            propagator.forward(l);
+            exit.forward(l);
         }
         let mut h: f64 = self
             .td
@@ -435,7 +435,7 @@ impl Bh {
         }
         let size = self.params.batch_size.min(nframe);
         let full = size == nframe;
-        let rho2 = self.params.probe_rho.powi(2) * optics.propagator().intensity_scale();
+        let rho2 = self.params.probe_rho.powi(2) * optics.exit().intensity_scale();
         let pos_rho2 = self.params.position_rho.powi(2);
         let len = objects[0].as_slice().len();
         let split = objects.len() * len;
@@ -551,15 +551,12 @@ mod tests {
             ms.unwrap(),
             far.unwrap(),
         ];
-        let kinds: Vec<_> = all
-            .iter()
-            .map(|o| match o.propagator() {
-                Propagator::Fourier(_) => 'F',
-                Propagator::AngularSpectrum(_) => 'A',
-                Propagator::Fresnel(_) => 'T',
-            })
-            .collect();
-        assert_eq!(kinds, ['A', 'T', 'A', 'F']);
+        let kinds = [1e-4, 1e-3].map(|d| match Propagator::free_space(&near([5e-8; 2], d)) {
+            Propagator::Fourier(_) => 'F',
+            Propagator::AngularSpectrum(_) => 'A',
+            Propagator::Fresnel(_) => 'T',
+        });
+        assert_eq!(kinds, ['A', 'T']);
         all
     }
 
@@ -602,7 +599,7 @@ mod tests {
         let mut psi = SliceWaves::new(optics, &views, objects, &copies)
             .psi()
             .to_vec();
-        optics.propagator().forward(&mut psi);
+        optics.exit().forward(&mut psi);
         psi
     }
 

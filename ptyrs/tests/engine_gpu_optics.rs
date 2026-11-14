@@ -77,7 +77,7 @@ fn propagated(addr: &AddrTable, optics: &Optics, objects: &[Object], probe: &Pro
     let mut psi = SliceWaves::new(optics, addr.views(), objects, probe)
         .psi()
         .to_vec();
-    optics.propagator().forward(&mut psi);
+    optics.exit().forward(&mut psi);
     psi
 }
 
@@ -196,7 +196,7 @@ fn cases() -> Vec<Case> {
 #[test]
 fn cpu_lsqml_descends_on_every_case() {
     for c in cases() {
-        c.optics.propagator().fourier_form().unwrap();
+        c.optics.fourier_form().unwrap();
         for cost in [Cost::Amplitude, Cost::Poisson] {
             let params = LsqmlParams {
                 batch_size: 12,

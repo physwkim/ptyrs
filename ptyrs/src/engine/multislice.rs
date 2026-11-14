@@ -4,7 +4,7 @@
 //! The wave entering slice 0 is the view's probe plane. Slice `s` multiplies the wave entering
 //! it by its object window, giving `psi_s`, which reaches slice `s + 1` through
 //! [`Optics::gaps`]`[s]`; the last slice's `psi` is the exit wave. [`Optics::quad`] multiplies
-//! the last slice only, where the wave leaves the object for [`Optics::propagator`]. One slice
+//! the last slice only, where the wave leaves the object for [`Optics::exit`]. One slice
 //! is [`obj_probe_to_psi`] itself.
 
 use crate::base::{C64, Object, Probe, Stack, View};
@@ -38,7 +38,7 @@ impl<'a> SliceWaves<'a> {
             "one object per slice of the optics"
         );
         assert!(objects.iter().all(|o| o.dims() == objects[0].dims()));
-        assert_eq!(probe.plane_shape(), optics.propagator().shape());
+        assert_eq!(probe.plane_shape(), optics.exit().shape());
         let [ny, nx] = probe.plane_shape();
         let n = ny * nx;
         let own: Vec<View> = views
@@ -82,7 +82,7 @@ impl<'a> SliceWaves<'a> {
         }
     }
 
-    /// The exit waves, one shifted plane per view, before [`Optics::propagator`].
+    /// The exit waves, one shifted plane per view, before [`Optics::exit`].
     pub fn psi(&self) -> &[C64] {
         &self.psi
     }

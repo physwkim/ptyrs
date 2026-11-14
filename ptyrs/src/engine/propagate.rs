@@ -14,9 +14,13 @@ use crate::base::{C64, Geometry};
 
 use crate::engine::{EngineError, Fft2, quad_phase, shift};
 
-/// The exit-wave model of the pty-chi algorithms: `psi = U(P·O·q)` per view, with `q` the
-/// object-plane phase that [`crate::engine::obj_probe_to_psi`] applies and `U` the [`Propagator`];
+/// The exit-wave model of the pty-chi algorithms: `psi = E(P·O·q)` per view, with `q` the
+/// plane phase that [`crate::engine::obj_probe_to_psi`] applies and `E` the [`Exit`] after it;
 /// through several object slices, [`crate::engine::SliceWaves`].
+///
+/// `q` is every phase the exit transform has in front of it, the far field's [`quad_phase`]
+/// or the Fresnel transform's `B`: fixed in the lab frame as the probe is, so a probe moved
+/// by a frame's offset moves with all of it.
 pub struct Optics {
     /// The object-plane pixel `[py, px]` in metres.
     pixel: [f64; 2],
@@ -41,14 +45,25 @@ impl Optics {
         }
     }
 
-    /// pty-chi's planar model: no object-plane phase and [`Propagator::free_space`].
+    /// pty-chi's planar model, [`Propagator::free_space`]: its plane phase is the Fresnel
+    /// transform's, none under the other two.
     pub fn free_space(w: &Wavefield) -> Self {
         let [ny, nx] = w.shape;
+        let propagator = Propagator::free_space(w);
+        let mut quad = vec![C64::new(1.0, 0.0); ny * nx];
+        let mut plane_quad = [0.0; 2];
+        if let Propagator::Fresnel(p) = &propagator {
+            // `B` is in the shifted layout, the plane phase in the natural one.
+            for (j, b) in p.b.iter().enumerate() {
+                quad[shift(j, ny, nx)] = *b;
+            }
+            plane_quad = p.plane_quad;
+        }
         Self {
             pixel: w.pixel,
-            quad: vec![C64::new(1.0, 0.0); ny * nx],
-            plane_quad: [0.0; 2],
-            propagator: Propagator::free_space(w),
+            quad,
+            plane_quad,
+            propagator,
             gaps: Vec::new(),
         }
     }
@@ -82,8 +97,8 @@ impl Optics {
         self.pixel
     }
 
-    /// The exit propagator's [`Propagator::fourier_form`] with [`Self::quad`] in its plane
-    /// phase; fails as that does, and where `quad` differs between the axes.
+    /// [`Self::exit`] after [`Self::quad`] through one [`Fft2`]; fails as
+    /// [`Propagator::fourier_form`] does, and where `quad` differs between the axes.
     pub fn fourier_form(&self) -> Result<FourierForm<'_>, EngineError> {
         let form = self.propagator.fourier_form()?;
         let [cy, cx] = self.plane_quad;
@@ -94,20 +109,18 @@ impl Optics {
                     .into(),
             ));
         }
-        Ok(FourierForm {
-            quad: cx + form.quad,
-            ..form
-        })
+        Ok(FourierForm { quad: cx, ..form })
     }
 
-    /// The object-plane phase slice `s` applies: [`Self::quad`] on the last slice, none on
-    /// the others.
+    /// The plane phase slice `s` applies: [`Self::quad`] on the last slice, none on the
+    /// others.
     pub fn slice_quad(&self, s: usize) -> Option<&[C64]> {
         (s + 1 == self.nslice()).then_some(&self.quad[..])
     }
 
-    pub fn propagator(&self) -> &Propagator {
-        &self.propagator
+    /// What takes the last slice's exit waves, [`Self::quad`] on them, to the detector.
+    pub fn exit(&self) -> Exit<'_> {
+        Exit(&self.propagator)
     }
 
     /// The in-object propagators, gap `s` from slice `s` to `s + 1`.
@@ -118,6 +131,32 @@ impl Optics {
     /// The object slices the wave crosses, `gaps().len() + 1`.
     pub fn nslice(&self) -> usize {
         self.gaps.len() + 1
+    }
+}
+
+/// An [`Optics`]' propagator less the plane phase it starts with, which [`Optics::quad`]
+/// holds: the whole of it but for the Fresnel transform, there `x ↦ a·Fft2(x)`.
+#[derive(Clone, Copy)]
+pub struct Exit<'a>(&'a Propagator);
+
+impl Exit<'_> {
+    pub fn shape(&self) -> [usize; 2] {
+        self.0.shape()
+    }
+
+    /// [`Propagator::intensity_scale`] of the whole propagator.
+    pub fn intensity_scale(&self) -> f64 {
+        self.0.intensity_scale()
+    }
+
+    /// Every plane in `planes` (length a multiple of `ny * nx`) to the detector.
+    pub fn forward(&self, planes: &mut [C64]) {
+        self.0.after_plane(planes);
+    }
+
+    /// The adjoint of [`Self::forward`], as [`Propagator::adjoint`] its inverse.
+    pub fn adjoint(&self, planes: &mut [C64]) {
+        self.0.before_plane(planes);
     }
 }
 
@@ -230,8 +269,8 @@ pub struct Fresnel {
     reverse: bool,
     /// `ny·nx·|C0|²`.
     scale: f64,
-    /// `B = exp(i·quad·(X² + Y²))` over the centred pixel; none unless the pixels are square.
-    quad: Option<f64>,
+    /// `B = exp(i·(c[0]·Y² + c[1]·X²))` over the centred pixel.
+    plane_quad: [f64; 2],
 }
 
 /// A [`Propagator`] as `D·Fft2·V·q`: `q = exp(i·quad·(X² + Y²))` over the centred pixel of the
@@ -295,6 +334,14 @@ impl Propagator {
 
     /// Propagates every plane in `planes` (length a multiple of `ny * nx`).
     pub fn forward(&self, planes: &mut [C64]) {
+        if let Self::Fresnel(p) = self {
+            mul_planes(planes, &p.b, false);
+        }
+        self.after_plane(planes);
+    }
+
+    /// [`Self::forward`] of planes that carry the Fresnel transform's `B` already.
+    fn after_plane(&self, planes: &mut [C64]) {
         match self {
             Self::Fourier(fft) => fft.forward(planes),
             Self::AngularSpectrum(p) => {
@@ -303,7 +350,6 @@ impl Propagator {
                 p.fft.inverse(planes);
             }
             Self::Fresnel(p) => {
-                mul_planes(planes, &p.b, false);
                 if p.reverse {
                     p.fft.inverse(planes)
                 } else {
@@ -317,6 +363,14 @@ impl Propagator {
     /// The adjoint of [`Self::forward`], also its inverse except on angular spectrum's
     /// evanescent band.
     pub fn adjoint(&self, planes: &mut [C64]) {
+        self.before_plane(planes);
+        if let Self::Fresnel(p) = self {
+            mul_planes(planes, &p.b, true);
+        }
+    }
+
+    /// The adjoint of [`Self::after_plane`].
+    fn before_plane(&self, planes: &mut [C64]) {
         match self {
             Self::Fourier(fft) => fft.inverse(planes),
             Self::AngularSpectrum(p) => {
@@ -331,7 +385,6 @@ impl Propagator {
                 } else {
                     p.fft.inverse(planes)
                 }
-                mul_planes(planes, &p.b, true);
             }
         }
     }
@@ -351,7 +404,8 @@ impl Propagator {
                 (0.0, PlaneStage::Transfer(&p.tf))
             }
             Self::Fresnel(p) => {
-                let quad = p.quad.ok_or_else(|| {
+                let [cy, cx] = p.plane_quad;
+                let quad = (cy == cx).then_some(cx).ok_or_else(|| {
                     EngineError::Invalid(
                         "a Fresnel transform over pixels that are not square has no \
                          one-transform form"
@@ -444,7 +498,7 @@ impl Fresnel {
             b,
             reverse: w.distance < 0.0,
             scale: (ny * nx) as f64 * (c0 * c0),
-            quad: (ar == 1.0).then_some(PI * fr),
+            plane_quad: [PI * fr / (ar * ar), PI * fr],
         }
     }
 }
@@ -547,5 +601,71 @@ mod tests {
         assert!(Wavefield::new([12, 16], 1e-10, [1e-8, 1e-8], f64::NEG_INFINITY).is_err());
         let far = wavefield([1e-8, 1e-8], f64::INFINITY);
         assert!(Propagator::angular_spectrum(&far).is_err());
+    }
+
+    /// A sample displaced by a fraction of a pixel under a fixed probe and Fresnel plane
+    /// phase is what an offset stands for, and the probe moved with [`Optics::quad`] gives
+    /// its intensities, forward and back in distance; moved without the phase (pty-chi
+    /// PATCH) it does not.
+    #[test]
+    fn a_moved_probe_is_the_displaced_sample_under_a_fresnel_transform() {
+        use crate::engine::features::move_planes;
+        use crate::engine::linop::noise;
+
+        const N: usize = 64;
+        const OFFSET: [f64; 2] = [0.3, -0.45];
+        // A band-limited object of period 256, so it has a value between its pixels.
+        let terms: Vec<(C64, [f64; 2])> = noise(24, 3)
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|[c, k]| (0.15 * c, [k.re, k.im].map(|k| (12.0 * k).round())))
+            .collect();
+        let object = |y: f64, x: f64| {
+            let wave = |&(c, k): &(C64, [f64; 2])| {
+                c * C64::from_polar(1.0, 2.0 * PI * (k[0] * y + k[1] * x) / 256.0)
+            };
+            C64::new(1.0, 0.0) + terms.iter().map(wave).sum::<C64>()
+        };
+        let centred = |i: usize| [i / N, i % N].map(|v| v as f64 - (N / 2) as f64);
+        let probe: Vec<C64> = (0..N * N)
+            .map(|i| {
+                let [y, x] = centred(i);
+                let r2 = y * y + x * x;
+                C64::from_polar(
+                    (-r2 / 49.0).exp(),
+                    0.04 * r2 + 0.5 * (y / 3.0).sin() - 0.3 * (x / 4.0).cos(),
+                )
+            })
+            .collect();
+        let fft = Fft2::new([N, N]);
+        for distance in [5e-3, -8e-3] {
+            let w = Wavefield::new([N, N], 1e-10, [50e-9, 50e-9], distance).unwrap();
+            assert!(matches!(Propagator::free_space(&w), Propagator::Fresnel(_)));
+            let optics = Optics::free_space(&w);
+            // Intensities of `probe · O(· + at) · q` in the window.
+            let intensity = |probe: &[C64], at: [f64; 2]| -> Vec<f64> {
+                let mut psi: Vec<C64> = (0..N * N)
+                    .map(|j| {
+                        let i = shift(j, N, N);
+                        let [y, x] = centred(i);
+                        probe[i] * object(y + at[0], x + at[1]) * optics.quad()[i]
+                    })
+                    .collect();
+                optics.exit().forward(&mut psi);
+                psi.iter().map(|c| c.norm_sqr()).collect()
+            };
+            let truth = intensity(&probe, OFFSET);
+            let err = |quad: Option<&[C64]>| {
+                let mut moved = probe.clone();
+                move_planes(&mut moved, quad, OFFSET, &fft);
+                let model = intensity(&moved, [0.0; 2]);
+                let d = model.iter().zip(&truth).map(|(a, b)| (a - b).abs());
+                d.fold(0.0, f64::max) / truth.iter().copied().fold(0.0, f64::max)
+            };
+            let (with, without) = (err(optics.slice_quad(0)), err(None));
+            assert!(with < 1e-6, "distance {distance}: {with:.3e}");
+            assert!(without > 1e-3, "distance {distance}: {without:.3e}");
+        }
     }
 }

@@ -429,10 +429,10 @@ impl GpuPtycho {
     ) -> Result<Self, EngineError> {
         let g = scan.geometry;
         let [ny, nx] = g.frame;
-        if optics.propagator().shape() != g.frame {
+        if optics.exit().shape() != g.frame {
             return Err(EngineError::Invalid(format!(
                 "propagator plane {:?} differs from frame {:?}",
-                optics.propagator().shape(),
+                optics.exit().shape(),
                 g.frame
             )));
         }

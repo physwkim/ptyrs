@@ -225,7 +225,7 @@ fn draw(
     let mut psi = SliceWaves::new(optics, addr.views(), objects, probe)
         .psi()
         .to_vec();
-    optics.propagator().forward(&mut psi);
+    optics.exit().forward(&mut psi);
     let ([ny, nx], nframe, nmode) = (addr.frame_shape(), addr.nframe(), addr.nmode());
     let n = ny * nx;
     let mut intensity: Vec<f64> = psi

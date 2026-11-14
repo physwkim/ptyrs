@@ -128,7 +128,7 @@ impl<'a> LsqmlBatch<'a> {
             }
         }
         let waves = SliceWaves::new(optics, &uviews, objects, &uprobe);
-        let prop = optics.propagator();
+        let prop = optics.exit();
         let mut chi = waves.psi().to_vec();
         prop.forward(&mut chi);
         let iobs: Vec<&[Option<f64>]> = frames.iter().map(|&f| obs.frames(f..f + 1)).collect();
@@ -270,7 +270,7 @@ impl<'a> LsqmlBatch<'a> {
                 gradient_sums(&patch, &wq, &self.chi[s][k * n..(k + 1) * n], &fft)
             })
             .collect();
-        let eps = EPS_POSITION * self.optics.propagator().intensity_scale();
+        let eps = EPS_POSITION * self.optics.exit().intensity_scale();
         gradient_directions(&sums, eps)
     }
 
@@ -301,7 +301,7 @@ impl<'a> LsqmlBatch<'a> {
             &mut dpo,
         );
         let dop = self.waves.obj_tangent(0, &d_obj[0]);
-        let lambda0 = LAMBDA0 * self.optics.propagator().intensity_scale() / n as f64;
+        let lambda0 = LAMBDA0 * self.optics.exit().intensity_scale() / n as f64;
         let sums: Vec<[f64; 6]> = dop
             .chunks_exact(block)
             .zip(dpo.chunks_exact(block))
@@ -574,7 +574,7 @@ impl Lsqml {
             let illum = illumination(addr.views(), objects[0].dims(), probe);
             let pre = self.preconditioner.take().unwrap_or_else(|| {
                 let n = probe.plane_len() as f64;
-                let k = optics.propagator().intensity_scale();
+                let k = optics.exit().intensity_scale();
                 let power = (0..nframe)
                     .map(|f| obs.frames(f..f + 1).iter().flatten().sum::<f64>())
                     .fold(0.0, f64::max);
