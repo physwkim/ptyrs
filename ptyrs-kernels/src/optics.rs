@@ -10,12 +10,16 @@
 //! transforms; the in-object propagation of a multislice gap is the same line pass three
 //! times over plain planes.
 //!
-//! A multislice object is a product per slice with that gap between: [`optics_kernels::
-//! optics_slice_mul`] is a slice's product and its adjoint, [`optics_kernels::
-//! optics_slice_phase`] the exit plane's phase, which the fused row pass applies only to a
-//! single slice, and [`optics_kernels::optics_slice_pair`] the object adjoint's integrand.
+//! A multislice object is a product per slice with that gap between: [`optics_slice_mul`]
+//! is a slice's product and its adjoint, [`optics_slice_phase`] the exit plane's phase,
+//! which the fused row pass applies only to a single slice, and [`optics_slice_pair`] the
+//! object adjoint's integrand.
 //!
 //! A stack's planes are its `nf * nmode` views; planes past them are not touched.
+//!
+//! [`optics_slice_mul`]: optics_kernels::LoadedModule::optics_slice_mul
+//! [`optics_slice_phase`]: optics_kernels::LoadedModule::optics_slice_phase
+//! [`optics_slice_pair`]: optics_kernels::LoadedModule::optics_slice_pair
 
 use cuda_device::{device, shared::DynamicSharedArray, thread};
 use cuda_host::cuda_module;
@@ -39,13 +43,17 @@ pub const STAGE_POST_FWD: u32 = 32;
 /// An inverse FFT of each line after the multiplication; never with `STAGE_POST_FWD`.
 pub const STAGE_POST_INV: u32 = 64;
 
-/// [`optics_kernels::optics_slice_mul`], [`optics_kernels::optics_slice_phase`]: by the
-/// conjugate of the object window or of the phase.
+/// [`optics_slice_mul`], [`optics_slice_phase`]: by the conjugate of the object window or
+/// of the phase.
+///
+/// [`optics_slice_mul`]: optics_kernels::LoadedModule::optics_slice_mul
+/// [`optics_slice_phase`]: optics_kernels::LoadedModule::optics_slice_phase
 pub const SLICE_CONJ: u32 = 1;
-/// [`optics_kernels::optics_slice_mul`]: `src` is the probe, `[nprobe, ny, nx]` in the
-/// natural layout, each view reading its mode; without it the stack's waves.
+/// [`optics_kernels::LoadedModule::optics_slice_mul`]: `src` is the probe, `[nprobe, ny,
+/// nx]` in the natural layout, each view reading its mode; without it the stack's waves.
 pub const SLICE_PROBE: u32 = 2;
-/// [`optics_kernels::optics_slice_phase`]: each frame's phase is displaced by its offset.
+/// [`optics_kernels::LoadedModule::optics_slice_phase`]: each frame's phase is displaced
+/// by its offset.
 pub const SLICE_OFFSET: u32 = 2;
 
 /// One line pass in place over the stack's planes of `buf`, `[nf_max * nmode, ny, nx]`: per
