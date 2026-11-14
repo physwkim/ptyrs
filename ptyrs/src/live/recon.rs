@@ -56,7 +56,7 @@ pub struct ApConfig {
 
 /// The LLK records the ring holds; each batch of half of them is copied to
 /// the host while later epochs run.
-const LLK_SLOTS: u32 = 8;
+pub(crate) const LLK_SLOTS: u32 = 8;
 
 /// The device side of each epoch's LLK record.
 struct LlkBufs {
