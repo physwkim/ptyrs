@@ -295,7 +295,7 @@ pub mod lsqml_kernels {
         EPS_XI, LAMBDA0, LSQML_DOTS, LSQML_REC, LSQML_XI, LsqmlCols, LsqmlDots, LsqmlFar, LsqmlPre,
         cols, dots, store_sums, walk_slot,
     };
-    use crate::bh::BhObs;
+    use crate::bh::{BhObs, CHUNK_PIXELS};
     use crate::grad::GAMMA_CHUNK;
     use crate::pixel::*;
     use crate::position::BatchSpan;
@@ -507,16 +507,25 @@ pub mod lsqml_kernels {
         unsafe {
             let a = *prev;
             let frame = *obs.order.add(pos) as usize;
-            let mut d = c * chunk + thread::threadIdx_x() as usize;
-            while d < end {
-                let count = *obs.counts.add(frame * n + d);
-                if count != MASKED {
-                    let (yt, yp) = (count as f32, *icalc.add(fl * n + d));
+            let base = c * chunk + thread::threadIdx_x() as usize;
+            // Every load is issued before the sums, which keep the pixel order.
+            let (mut cnt, mut yp) = ([MASKED; CHUNK_PIXELS], [0.0f32; CHUNK_PIXELS]);
+            #[unroll]
+            for i in 0..CHUNK_PIXELS {
+                let d = base + i * PIXEL_THREADS as usize;
+                if d < end {
+                    cnt[i] = *obs.counts.add(frame * n + d);
+                    yp[i] = *icalc.add(fl * n + d);
+                }
+            }
+            #[unroll]
+            for i in 0..CHUNK_PIXELS {
+                if cnt[i] != MASKED {
+                    let (yt, yp) = (cnt[i] as f32, yp[i]);
                     let xi = 1.0 - zdiv(yt, yp + EPS_XI);
                     acc[0] += xi * (yp - zdiv(yt, 1.0 - a * xi));
                     acc[1] += xi * xi * yp;
                 }
-                d += PIXEL_THREADS as usize;
             }
             let o = out.add(LSQML_XI as usize * (pos * n.div_ceil(chunk) + c));
             store_sums::<2>((&raw mut RED).cast::<f32>(), acc, o);
