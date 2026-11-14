@@ -1,9 +1,7 @@
 """GpuPtycho under near-field Optics against the GPU engine's own runs from the same scan and
 start, `examples/engine_reference.rs`' `gpu_optics.h5`: an angular-spectrum propagator and a
-Fresnel transform forward and back. Every algorithm the engine ran leaves its object, probe
-and LLK records, exactly, as one device runs both; one it refused raises its error text. A
-Fresnel transform forward has no plane stage and runs every algorithm; under the other two
-ML alone is refused."""
+Fresnel transform forward and back. Every algorithm, and DM and RAAR with `psi_f16`, leaves
+the engine's object, probe and LLK records, exactly, as one device runs both."""
 
 import os
 
@@ -48,21 +46,15 @@ def gpu_of(g, sliced=False, **options):
     return ptyrs.GpuPtycho(scan, obj, g["probe"][()], DEVICE, optics=optics, **options)
 
 
-@pytest.mark.parametrize("algorithm", list(RUNS))
-def test_matches_engine_or_raises_its_error(case, algorithm):
-    name, g = case
-    assert algorithm in g or (name != "fresnel" and algorithm == "ml")
-    gpu = gpu_of(g)
-    if algorithm not in g:
-        want = g.attrs[f"{algorithm}_error"]
-        assert "runs no propagator with a plane stage" in want
-        with pytest.raises(ValueError) as e:
-            RUNS[algorithm](gpu)
-        assert str(e.value) == want
-        np.testing.assert_array_equal(gpu.object, g["object"][()].astype(np.complex64))
-        return
+@pytest.mark.parametrize("algorithm, f16",
+                         [(a, False) for a in RUNS] + [("dm", True), ("raar", True)])
+def test_matches_engine(case, algorithm, f16):
+    _, g = case
+    gpu = gpu_of(g, psi_f16=f16)
     RUNS[algorithm](gpu)
-    want = g[algorithm]
+    want = g[algorithm + "_f16" * f16]
+    # the f16 groups are no copy of the f32 ones
+    assert not f16 or not np.array_equal(want["object"][()], g[algorithm]["object"][()])
     assert len(want["poisson"]) == NEPOCH
     np.testing.assert_array_equal(gpu.history["poisson"], want["poisson"][()])
     np.testing.assert_array_equal(gpu.object, want["object"][()])
@@ -99,6 +91,12 @@ def test_absent_optics_is_the_far_field(scenario):
     for run in runs[1:]:
         for got, want in zip(run, runs[0]):
             np.testing.assert_array_equal(got, want)
+
+
+def test_psi_f16_without_fused_is_refused(scenario):
+    scan, obj, probe, _ = scenario
+    with pytest.raises(ValueError, match="psi_f16 needs"):
+        ptyrs.GpuPtycho(scan, obj, probe, DEVICE, fused=False, psi_f16=True)
 
 
 def test_refused_optics_raise_at_construction(case):

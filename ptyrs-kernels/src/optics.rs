@@ -56,6 +56,23 @@ pub const SLICE_PROBE: u32 = 2;
 /// by its offset.
 pub const SLICE_OFFSET: u32 = 2;
 
+/// A stack's waves `w`, `[nf_max * nw, ny, nx]` at the exit wave's stored pixels: `nw`
+/// planes per frame, `nmode` for a wave per view and `nprobe` for one per probe mode. View
+/// `m` of a frame reads [`wave_plane`], its own or its probe mode's (`m % nprobe`).
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct WavePlanes {
+    pub w: *const f32,
+    pub nw: u32,
+}
+
+/// The plane of `w` view `m` of frame `fl` reads: `fl * nw + m % nw`.
+#[device]
+pub fn wave_plane(w: WavePlanes, fl: usize, m: usize) -> usize {
+    let nw = w.nw as usize;
+    fl * nw + m % nw
+}
+
 /// One line pass in place over the stack's planes of `buf`, `[nf_max * nmode, ny, nx]`: per
 /// line of `N` points the `flags`' FFT (unnormalized, forward `exp(-2 pi i jk / N)`), the
 /// multiplication by the `[ny, nx]` plane `mul`, and their second FFT. Block `(N /
@@ -140,7 +157,7 @@ pub unsafe fn stage<const N: u32>(
 
 #[cuda_module]
 pub mod optics_kernels {
-    use super::{SLICE_CONJ, SLICE_OFFSET, SLICE_PROBE, stage};
+    use super::{SLICE_CONJ, SLICE_OFFSET, SLICE_PROBE, WavePlanes, stage, wave_plane};
     use crate::pixel::*;
     use crate::*;
 
@@ -242,18 +259,19 @@ pub mod optics_kernels {
 
     /// A slice's product over the stack's views: `dst`'s plane of view `k` is `obj`'s
     /// bilinear window of that view times `src` (under `SLICE_CONJ` the window's conjugate
-    /// times it), `src` the probe under `SLICE_PROBE`, else the stack's waves. `dst` and the
-    /// waves are `[nf_max * nmode, ny, nx]` at the exit wave's stored pixels, `views` in
-    /// epoch order. One thread per value of `dst`.
+    /// times it), `src.w` the probe under `SLICE_PROBE` (`src.nw` unread), else the stack's
+    /// waves. `dst` is `[nf_max * nmode, ny, nx]` at the exit wave's stored pixels, `views`
+    /// in epoch order. One thread per value of `dst`.
     ///
     /// # Safety
     ///
-    /// `dst` and `src` hold their shapes for `g`, `obj` `[nobj, nyo, nxo]`, `views` the
-    /// scan's, each window inside the object; `ctl` one entry.
+    /// `dst` and `src` hold their shapes for `g`, `src.nw` `nmode` or `nprobe` unless under
+    /// `SLICE_PROBE`, `obj` `[nobj, nyo, nxo]`, `views` the scan's, each window inside the
+    /// object; `ctl` one entry.
     #[kernel]
     pub unsafe fn optics_slice_mul(
         dst: *mut f32,
-        src: *const f32,
+        src: WavePlanes,
         obj: *const f32,
         views: *const ViewAddr,
         ctl: *const StackCtl,
@@ -268,21 +286,22 @@ pub mod optics_kernels {
         }
         let (kl, j) = (i / n, i % n);
         let (y, x) = (j as u32 / g.nx, j as u32 % g.nx);
-        let at = kl * n + psi_index(y, x, g.ny, g.nx);
+        let s = psi_index(y, x, g.ny, g.nx);
         unsafe {
             let v = *views.add(f0 as usize * g.nmode as usize + kl);
             let o = sample_obj(obj, v, y, x, g.nyo, g.nxo);
             let w = if flags & SLICE_PROBE != 0 {
-                load_c(src, v.probe as usize * n + j)
+                load_c(src.w, v.probe as usize * n + j)
             } else {
-                load_c(src, at)
+                let nmode = g.nmode as usize;
+                load_c(src.w, wave_plane(src, kl / nmode, kl % nmode) * n + s)
             };
             let w = if flags & SLICE_CONJ != 0 {
                 cmul_conj(o, w)
             } else {
                 cmul(o, w)
             };
-            store_c(dst, at, w);
+            store_c(dst, kl * n + s, w);
         }
     }
 

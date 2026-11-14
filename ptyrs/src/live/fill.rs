@@ -37,9 +37,11 @@ pub trait PatchPredictor: Send {
 }
 
 /// The object pixel of the corner of the patch of a frame whose window
-/// starts at `view` (`[oy, ox]`).
+/// starts at `view` (`[oy, ox]`). It saturates at `u32::MAX`, where a view
+/// placed outside every object stays, so [`PatchFill::stitch`] clips its
+/// patch whole.
 pub fn patch_corner(view: [u32; 2], frame: [usize; 2], patch: [usize; 2]) -> [u32; 2] {
-    [0, 1].map(|a| view[a] + ((frame[a] - patch[a]) / 2) as u32)
+    [0, 1].map(|a| view[a].saturating_add(((frame[a] - patch[a]) / 2) as u32))
 }
 
 /// Object pixels `y..y + h`, `x..x + w`, whose values are the `h * w`
@@ -420,6 +422,29 @@ mod tests {
     #[test]
     fn patch_corner_centres_the_patch_in_the_window() {
         assert_eq!(patch_corner([10, 20], [16, 32], [8, 8]), [14, 32]);
+    }
+
+    /// A view at `u32::MAX`, where `ViewPlacement::views` puts a corner
+    /// outside `0..u32::MAX`, or just short of it gives the patch corner
+    /// `u32::MAX`, a patch the stitch leaves out whole beside one inside
+    /// the object.
+    #[test]
+    fn a_corner_at_u32_max_stays_outside_the_object() {
+        let far = patch_corner([u32::MAX, u32::MAX - 1], [16, 32], PATCH);
+        assert_eq!(far, [u32::MAX, u32::MAX]);
+        let mut pf = stitcher(1);
+        let fill = pf.stitch(&[[4, 6], far], &flat([1.0, 0.0]).repeat(2));
+        let fill = fill.expect("a buffer is free");
+        assert_eq!(
+            fill.rects(),
+            [Rect {
+                y: 4,
+                x: 6,
+                h: 8,
+                w: 8,
+                at: 0
+            }]
+        );
     }
 
     /// One patch gives its own values on one rectangle; two patches of a

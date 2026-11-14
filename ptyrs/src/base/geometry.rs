@@ -42,12 +42,21 @@ impl Geometry {
                 "frame shape {frame:?} must be even and non-zero"
             )));
         }
-        Ok(Self {
+        let g = Self {
             wavelength,
             distance,
             detector_pixel,
             frame,
-        })
+        };
+        // Each input can be in range while λz / (n · detector_pixel) underflows, overflows or
+        // is inf / inf.
+        let pixel = g.pixel_size_object();
+        if !pixel.iter().all(|&p| p.is_finite() && p > 0.0) {
+            return Err(CoreError::Invalid(format!(
+                "object pixel size {pixel:?} must be finite and > 0"
+            )));
+        }
+        Ok(g)
     }
 
     /// Object-plane pixel size `[py, px] = λz / (n · detector_pixel)` per axis
@@ -88,5 +97,28 @@ mod tests {
     #[test]
     fn rejects_odd_frame() {
         assert!(Geometry::new(1e-10, 1.0, 1e-4, [255, 256]).is_err());
+    }
+
+    fn rejects_pixel(wavelength: f64, distance: f64, detector_pixel: f64) {
+        let e = Geometry::new(wavelength, distance, detector_pixel, [256, 256]).unwrap_err();
+        assert!(e.to_string().contains("object pixel size"), "{e}");
+    }
+
+    /// λz underflows to 0.
+    #[test]
+    fn rejects_zero_object_pixel() {
+        rejects_pixel(1e-200, 1e-200, 75e-6);
+    }
+
+    /// λz overflows to inf.
+    #[test]
+    fn rejects_infinite_object_pixel() {
+        rejects_pixel(1e200, 1e200, 75e-6);
+    }
+
+    /// λz and n · detector_pixel both overflow: inf / inf.
+    #[test]
+    fn rejects_nan_object_pixel() {
+        rejects_pixel(1e200, 1e200, 1e308);
     }
 }

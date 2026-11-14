@@ -1,5 +1,5 @@
 //! Checked launches of the position kernels (`ptyrs_kernels::position`): pty-chi's gradient
-//! position correction under the moved probe of [`Kernels::shifted_rows_fwd`], for any
+//! position correction under the moved probe of [`Kernels::shifted_probe`], for any
 //! method whose stacks hold epoch positions and whose exit-wave update `chi` is at the exit
 //! wave's stored pixels.
 //!
@@ -8,7 +8,7 @@
 //! The epoch starts with [`PositionKernels::gather`]; the shifted passes read
 //! [`Positions::offsets`] as [`crate::gpu::Shift::offsets`] for the whole epoch, so each frame
 //! moves once, in its batch. Per stack, [`PositionKernels::shift_w`] turns the probe rows
-//! [`Kernels::shifted_rows_fwd`] left into the moved probe `W`; with the stack's `chi`,
+//! [`Kernels::shifted_probe`] left into the moved probe `W`; with the stack's `chi`,
 //! [`PositionKernels::sums`] takes the object slopes and the stack's position sums against
 //! the object the batch started from. After the batch's update, [`PositionKernels::step`]
 //! steps its frames' offsets.
@@ -27,8 +27,8 @@ use ptyrs_kernels::position::{BatchSpan, POSITION_SUMS, PositionSums, position_k
 use crate::gpu::fused::{GRID_Y_MAX, SMEM_MAX, Shape, Side};
 use crate::gpu::ops::grid_1d;
 use crate::gpu::{
-    C32, EpochOrder, Error, Kernels, StackCtl, StackGeom, StackRef, ViewAddr, ViewDims, Views,
-    check_len, dptr,
+    C32, EpochOrder, Error, FrameWaves, Kernels, StackCtl, StackGeom, StackRef, ViewAddr, ViewDims,
+    Views, check_len, dptr,
 };
 
 /// How [`PositionKernels::step`] solves and takes a shift.
@@ -148,7 +148,7 @@ impl PositionKernels {
     }
 
     /// The stack's moved probe in place in `t`, `[nf_max * nprobe, ny, nx]` as
-    /// [`Kernels::shifted_rows_fwd`] left it: plane `fl * nprobe + p` becomes mode `p` of
+    /// [`Kernels::shifted_probe`] left it: plane `fl * nprobe + p` becomes mode `p` of
     /// frame `fl` moved by its offset, at the exit wave's stored pixels.
     pub fn shift_w(
         &self,
@@ -187,16 +187,16 @@ impl PositionKernels {
 
     /// The position sums of the stack's frames into `pos`: each frame's first view (mode 0)
     /// of its exit-wave update `chi`, `[nf_max * nmode, ny, nx]`, against `u = ∂O W`, the
-    /// slopes of `obj` at that view times its moved probe `w`, `[nf_max * nprobe, ny, nx]`
-    /// ([`Self::shift_w`]); `chi` and `w` at the exit wave's stored pixels, `views` in epoch
-    /// order.
+    /// slopes of `obj` at that view times its wave of `w`: the moved probe ([`Self::shift_w`]),
+    /// or a multislice object's wave entering the slice `obj`; `chi` at the exit wave's
+    /// stored pixels, `views` in epoch order.
     pub fn sums(
         &self,
         ctx: &ExecutionContext,
         views: &Views,
         stack: StackRef<'_>,
         obj: &DeviceBuffer<C32>,
-        [chi, w]: [&DeviceBuffer<C32>; 2],
+        (chi, w): (&DeviceBuffer<C32>, FrameWaves<'_>),
         pos: &mut Positions,
     ) -> Result<(), Error> {
         let d = views.dims();
@@ -205,7 +205,7 @@ impl PositionKernels {
         let nf = g.nf_max as usize;
         check_len("obj", obj, d.obj_len())?;
         check_len("chi", chi, nf * d.nmode as usize * d.n())?;
-        check_len("w", w, nf * d.nprobe as usize * d.n())?;
+        let (w, waves) = w.planes(d, g.nf_max)?;
         check_len("slopes", &pos.slopes, 2 * nf * d.n())?;
         self.slopes(ctx, views, stack, obj, &mut pos.slopes)?;
         let config = chunk_grid(&g, d.n())?;
@@ -213,14 +213,12 @@ impl PositionKernels {
             chi.storage(),
             w.storage(),
             pos.slopes.storage(),
-            views.addr().storage(),
             stack.storage(),
         ];
         let p = PositionSums {
             chi: dptr::<C32, f32>(chi).cast_const(),
-            w: dptr::<C32, f32>(w).cast_const(),
+            w: waves,
             slopes: dptr::<C32, f32>(&pos.slopes).cast_const(),
-            views: dptr::<ViewAddr, ViewAddr>(views.addr()).cast_const(),
             sums: dptr(&pos.sums),
         };
         let ctl = stack.ctl() as *const StackCtl;

@@ -13,7 +13,7 @@
 //! [`RpieKernels::step`], which consumes the sums, only after both sums are taken.
 //!
 //! Under the position model `W = T_d(P q)` is each frame's moved probe, which
-//! `shifted_rows_fwd` and [`crate::gpu::PositionKernels::shift_w`] leave; `psi` is
+//! `shifted_probe` and [`crate::gpu::PositionKernels::shift_w`] leave; `psi` is
 //! [`RpieKernels::obj_wave_to_psi`] of it. The object step weights `dlt` by `W` against
 //! [`RpieKernels::power_max_all`] of `W` over the batch and takes `shifted_psi_sums` of it;
 //! the probe step takes the weighted `dlt` through `shifted_psi_sums` and

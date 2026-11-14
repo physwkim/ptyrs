@@ -33,6 +33,7 @@ const OPTIONS: GpuOptions = GpuOptions {
     graph: true,
     llk_slots: 3,
     fused: true,
+    psi_f16: false,
 };
 
 fn ctx() -> Arc<CudaContext> {
