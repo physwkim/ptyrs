@@ -2,7 +2,7 @@
 use burn::prelude::*;
 use burn::tensor::DType;
 use cuda_core::{Context, DeviceBuffer};
-use ptyrs::nn::interop::{InteropError, copy_in, lend};
+use ptyrs::nn::interop::{InteropError, copy_in, lend, lend_out};
 
 fn values(n: usize, scale: f32) -> Vec<f32> {
     (0..n).map(|i| scale * i as f32 - 3.5).collect()
@@ -13,23 +13,33 @@ fn host(t: &Tensor<2>) -> Vec<f32> {
 }
 
 #[test]
-fn lend_aliases_burn_memory() {
+fn lend_reads_burn_memory() {
     let ctx = Context::new(0).unwrap();
     let stream = ctx.new_stream().unwrap();
     let device = ptyrs::nn::cuda(0);
     let a = values(48, 0.25);
     // A computed tensor, so lend has to wait for burn's queued kernel.
     let t = Tensor::<2>::from_data(TensorData::new(a.clone(), [6, 8]), &device) * 2.0;
-    let mut lent = lend(&t, &stream).unwrap();
+    let lent = lend(&t, &stream).unwrap();
     let want: Vec<f32> = a.iter().map(|v| v * 2.0).collect();
     assert_eq!(lent.to_host_vec(&stream).unwrap(), want);
+}
 
-    // A cuda-rust write through the lent buffer shows in the burn tensor: same memory.
-    let b = values(48, -0.5);
+#[test]
+fn lend_out_writes_show_in_its_tensor() {
+    let ctx = Context::new(0).unwrap();
+    let stream = ctx.new_stream().unwrap();
+    let device = ptyrs::nn::cuda(0);
+    // burn pads the rows of two values of a fresh tensor of this shape.
+    let (t, mut lent) = lend_out([16, 16, 2], &device, &stream).unwrap();
+    assert_eq!(t.dims(), [16, 16, 2]);
+    let b = values(512, -0.5);
     let src = DeviceBuffer::from_host(&stream, &b).unwrap();
     lent.copy_from_device_async(&src, &stream).unwrap();
     stream.synchronize().unwrap();
-    assert_eq!(host(&t), b);
+    drop(lent);
+    let doubled: Vec<f32> = b.iter().map(|v| v * 2.0).collect();
+    assert_eq!((t * 2.0).to_data().try_to_vec::<f32>().unwrap(), doubled);
 }
 
 #[test]
@@ -77,6 +87,17 @@ fn copy_in_copies_engine_memory() {
     // And burn keeps computing on it.
     let doubled: Vec<f32> = a.iter().map(|v| v * 2.0).collect();
     assert_eq!(host(&(t * 2.0)), doubled);
+}
+
+#[test]
+fn copy_in_fills_a_tensor_burn_lays_out_in_padded_rows() {
+    // A fresh [16, 16, 2] tensor of burn's has its rows of two values padded.
+    let ctx = Context::new(0).unwrap();
+    let stream = ctx.new_stream().unwrap();
+    let a = values(512, 0.5);
+    let engine = DeviceBuffer::from_host(&stream, &a).unwrap();
+    let t = copy_in::<3>(&engine, [16, 16, 2], &ptyrs::nn::cuda(0), &stream).unwrap();
+    assert_eq!(t.to_data().try_to_vec::<f32>().unwrap(), a);
 }
 
 #[test]
