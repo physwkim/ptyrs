@@ -1,12 +1,18 @@
 //! The GPU passes that run a propagator's plane stage besides LSQML's and BH's (rPIE's, and
-//! AP's, DM's and RAAR's), on the cases of `common/near.rs`.
+//! AP's, DM's and RAAR's), on the cases of `common/near.rs`, and the sampling a position's
+//! offsets enter by.
 
-use ptyrs::base::{C64, Stack};
-use ptyrs::engine::{ApParams, DmParams, Features, GpuPtycho, Ptycho, RaarParams, RpieParams};
+use cuda_core::CudaContext;
+use ptyrs::base::{C64, Counts, Geometry, Scan, Stack, required_obj_shape, sim};
+use ptyrs::engine::{
+    ApParams, BhParams, Cost, DmParams, EngineError, Features, GpuPtycho, LsqmlParams, MlParams,
+    Optics, Ptycho, RaarParams, RpieParams, Sampling,
+};
+use ptyrs::gpu::FUSED_SIDES;
 
 #[path = "common/near.rs"]
 mod near;
-use near::{NPOS, cases, drawn_offsets};
+use near::{NPOS, OPTIONS, PIXEL, WAVELENGTH, cases, drawn_offsets};
 
 #[path = "common/worst.rs"]
 mod worst;
@@ -275,4 +281,182 @@ fn projections_match_cpu_under_every_propagator() {
             }
         }
     }
+}
+
+/// The sampling is the CPU's [`Sampling::auto`] at build: `FullObject` of a near-field scan
+/// whose object is under 5/4 of the frame, `Patch` of the same scan in the far field and of
+/// a case's wider scan; `set_sampling` overrides it either way and back.
+#[test]
+fn sampling_is_the_cpus_auto_until_set() {
+    let frame = FUSED_SIDES[0] as usize;
+    let pixel = [PIXEL, PIXEL];
+    let raw = sim::fermat(NPOS, PIXEL / 2.0);
+    let shape = required_obj_shape(&raw.pynx_preprocess(pixel), pixel, [frame, frame], 4);
+    let counts = vec![0.0; NPOS * frame * frame];
+    let counts = Counts::from_f64([NPOS, frame, frame], &counts, None).unwrap();
+    let geometry = Geometry::new(WAVELENGTH, 1.0, PIXEL, [frame, frame]).unwrap();
+    let tight = Scan::new(geometry, raw, counts).unwrap();
+    let wide = &cases()[1];
+    let far = || Optics::far_field(&tight.geometry);
+    let near = || wide.optics();
+    let ctx = CudaContext::new(0).unwrap();
+    let runs: [(_, _, _, &dyn Fn() -> Optics, _); 3] = [
+        (
+            "tight near",
+            &tight,
+            sim::object(shape),
+            &near,
+            Sampling::FullObject,
+        ),
+        (
+            "tight far",
+            &tight,
+            sim::object(shape),
+            &far,
+            Sampling::Patch,
+        ),
+        (
+            "wide near",
+            &wide.scan,
+            wide.object.clone(),
+            &near,
+            Sampling::Patch,
+        ),
+    ];
+    for (what, scan, object, optics, auto) in runs {
+        let probe = wide.probe.clone();
+        let cpu = Ptycho::with_optics(scan, optics(), object.clone(), probe.clone()).unwrap();
+        assert_eq!(cpu.sampling(), auto, "{what}: CPU");
+        let mut gpu =
+            GpuPtycho::with_optics(&ctx, scan, &optics(), object, probe, OPTIONS).unwrap();
+        assert_eq!(gpu.sampling(), auto, "{what}");
+        let other = match auto {
+            Sampling::Patch => Sampling::FullObject,
+            Sampling::FullObject => Sampling::Patch,
+        };
+        for s in [other, auto] {
+            gpu.set_sampling(s).unwrap();
+            assert_eq!(gpu.sampling(), s, "{what}");
+        }
+    }
+}
+
+/// `set_sampling` there and back between the calls of a run that models positions drops the
+/// runs, graphs and states built under it; their rebuilds give the records, arrays and
+/// offsets of the run left alone bit for bit.
+#[test]
+fn sampling_round_trip_rebuilds_the_same_run() {
+    let c = &cases()[0];
+    let moved = Features {
+        position: Some(drawn_offsets()),
+        ..Features::default()
+    };
+    let bh = BhParams {
+        batch_size: 8,
+        probe_rho: 0.01,
+        position_rho: 0.1,
+        seed: 7,
+    };
+    let lsqml = LsqmlParams {
+        batch_size: 8,
+        cost: Cost::Poisson,
+        seed: 7,
+    };
+    let run = |toggle: bool| {
+        let mut gpu = c.gpu(true);
+        gpu.set_features(&moved).unwrap();
+        let mut records = Vec::new();
+        for _ in 0..2 {
+            gpu.dm(&DmParams::default(), 2).unwrap();
+            gpu.ml(&MlParams::default(), 2).unwrap();
+            gpu.bh(&bh, 1, 1).unwrap();
+            gpu.lsqml(&lsqml, 1, 1).unwrap();
+            if toggle {
+                gpu.set_sampling(Sampling::FullObject).unwrap();
+                gpu.set_sampling(Sampling::Patch).unwrap();
+            }
+            records.push(gpu.llk().unwrap().poisson);
+        }
+        records.extend(gpu.history().iter().map(|r| r.llk.poisson));
+        let arrays = (gpu.object().unwrap(), gpu.probe().unwrap());
+        (records, arrays, gpu.features().unwrap().position)
+    };
+    let (kept, toggled) = (run(false), run(true));
+    assert_eq!(toggled.0, kept.0, "records");
+    assert_eq!(toggled.1.0.as_slice(), kept.1.0.as_slice(), "object");
+    assert_eq!(toggled.1.1.as_slice(), kept.1.1.as_slice(), "probe");
+    assert_eq!(toggled.2, kept.2, "offsets");
+}
+
+/// While a position samples the object, which no GPU pass models yet, every algorithm, the
+/// LLK and ML's gradients fail and change nothing: back under `Sampling::Patch` the same
+/// calls give the records, arrays, gradients and offsets of a run never switched, bit for
+/// bit.
+#[test]
+fn full_object_position_fails_every_pass_until_patch() {
+    let c = &cases()[0];
+    let moved = Features {
+        position: Some(drawn_offsets()),
+        ..Features::default()
+    };
+    let bh = BhParams {
+        batch_size: 8,
+        probe_rho: 0.01,
+        position_rho: 0.1,
+        seed: 7,
+    };
+    let lsqml = LsqmlParams {
+        batch_size: 8,
+        cost: Cost::Poisson,
+        seed: 7,
+    };
+    type Call<'a> = &'a dyn Fn(&mut GpuPtycho) -> Result<Vec<f64>, EngineError>;
+    let calls: [(&str, Call); 9] = [
+        ("AP", &|g| g.ap(&AP, 1).map(|()| Vec::new())),
+        ("DM", &|g| g.dm(&DM, 1).map(|()| Vec::new())),
+        ("RAAR", &|g| g.raar(&RAAR, 1).map(|()| Vec::new())),
+        ("rPIE", &|g| g.rpie(&RPIE, 1).map(|()| Vec::new())),
+        ("ML", &|g| {
+            g.ml(&MlParams::default(), 1).map(|()| Vec::new())
+        }),
+        ("BH", &|g| g.bh(&bh, 1, 1).map(|()| Vec::new())),
+        ("LSQML", &|g| g.lsqml(&lsqml, 1, 1).map(|()| Vec::new())),
+        ("LLK", &|g| g.llk().map(|l| vec![l.poisson])),
+        ("ML gradients", &|g| {
+            let grads = g.ml_grads()?;
+            let parts = grads.iter().flat_map(|s| s.as_slice().iter());
+            Ok(parts.flat_map(|z| [z.re, z.im]).collect())
+        }),
+    ];
+    let run = |switched: bool| {
+        let mut gpu = c.gpu(true);
+        gpu.set_features(&moved).unwrap();
+        if switched {
+            let start = (gpu.object().unwrap(), gpu.probe().unwrap());
+            gpu.set_sampling(Sampling::FullObject).unwrap();
+            for (what, call) in calls {
+                let e = call(&mut gpu).unwrap_err().to_string();
+                assert!(e.contains("Sampling::FullObject"), "{what}: {e}");
+            }
+            assert!(gpu.history().is_empty(), "records");
+            assert_eq!(gpu.object().unwrap().as_slice(), start.0.as_slice());
+            assert_eq!(gpu.probe().unwrap().as_slice(), start.1.as_slice());
+            gpu.set_sampling(Sampling::Patch).unwrap();
+        }
+        let values: Vec<Vec<f64>> = calls
+            .iter()
+            .map(|(_, call)| call(&mut gpu).unwrap())
+            .collect();
+        let records: Vec<f64> = gpu.history().iter().map(|r| r.llk.poisson).collect();
+        let arrays = (gpu.object().unwrap(), gpu.probe().unwrap());
+        (values, records, arrays, gpu.features().unwrap().position)
+    };
+    let (kept, switched) = (run(false), run(true));
+    for ((what, _), (s, k)) in calls.iter().zip(switched.0.iter().zip(&kept.0)) {
+        assert_eq!(s, k, "{what}");
+    }
+    assert_eq!(switched.1, kept.1, "records");
+    assert_eq!(switched.2.0.as_slice(), kept.2.0.as_slice(), "object");
+    assert_eq!(switched.2.1.as_slice(), kept.2.1.as_slice(), "probe");
+    assert_eq!(switched.3, kept.3, "offsets");
 }

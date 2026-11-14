@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use crate::engine::sampling::Sampling;
 use crate::gpu::{
     EpochOrder, Error as GpuError, FrameWaves, FusedBufs, FusedInputs, Kernels, Model,
     PositionRule, PowerMax, PsiSums, ShiftProbe, Solve, Views, Weight,
@@ -9,7 +10,9 @@ use crate::gpu::{
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::CudaStream;
 
-use super::device::{FeaturesMut, Moved, MovedLent, RpieBufs, moved_inputs, moved_shift};
+use super::device::{
+    FeaturesMut, Moved, MovedLent, PositionLent, RpieBufs, moved_inputs, moved_shift,
+};
 use super::propagate::Propagate;
 use super::{Bufs, Epoch, GpuPtycho};
 use crate::engine::features::{POSITION_LIMIT, POSITION_STEP};
@@ -46,28 +49,33 @@ impl GpuPtycho {
 }
 
 /// rPIE's state under the position model: a batch's moved probe, the scan order its offsets
-/// step in, and the shifted sums' scratch.
+/// step in, and under [`Sampling::Patch`] the shifted sums' scratch.
 pub(super) struct RpieMoved {
     probes: Moved,
     /// Never set: rPIE's batches take the frames in scan order.
     order: EpochOrder,
     /// Its own, as a batch is one stack, which may outgrow the device's.
-    fused: FusedBufs,
+    fused: Option<FusedBufs>,
 }
 
 impl RpieMoved {
-    /// For `views` in batches of up to `nf_max` frames.
+    /// For `views` in batches of up to `nf_max` frames under `sampling`.
     pub(super) fn new(
         stream: &Arc<CudaStream>,
         kernels: &Kernels,
         views: &Views,
         nf_max: u32,
+        sampling: Sampling,
     ) -> Result<Self, EngineError> {
         let dims = views.dims();
+        let fused = match sampling {
+            Sampling::Patch => Some(FusedBufs::with_shift(stream, dims, nf_max)?),
+            Sampling::FullObject => None,
+        };
         Ok(Self {
-            probes: Moved::new(stream, kernels, dims, nf_max, 1)?,
+            probes: Moved::new(stream, kernels, dims, nf_max, 1, sampling)?,
             order: EpochOrder::new(kernels, stream, views)?,
-            fused: FusedBufs::with_shift(stream, dims, nf_max)?,
+            fused,
         })
     }
 
@@ -75,9 +83,9 @@ impl RpieMoved {
     fn lend<'m>(
         moved: Option<&'m mut Self>,
         features: &'m mut FeaturesMut<'_>,
-    ) -> Result<Option<MovedLent<'m, &'m EpochOrder>>, GpuError> {
-        let (moved, fused) = (moved.map(|m| ((&mut m.probes, &m.order), &mut m.fused))).unzip();
-        MovedLent::lend(moved, fused, features)
+    ) -> Result<Option<PositionLent<'m, &'m EpochOrder>>, GpuError> {
+        let (moved, fused) = (moved.map(|m| ((&mut m.probes, &m.order), m.fused.as_mut()))).unzip();
+        PositionLent::lend(moved, fused.flatten(), features)
     }
 }
 
@@ -92,7 +100,7 @@ impl Bufs<'_> {
         // Each frame is in one batch, stepped after its batch's passes: the offsets the epoch
         // starts from serve every batch.
         if let Some(mut m) = RpieMoved::lend(rb.moved.as_deref_mut(), &mut self.features)? {
-            let order = m.own;
+            let order = *m.own();
             m.gather(ctx, order)?;
         }
         for b in 0..rb.batches.len() {
@@ -123,6 +131,7 @@ impl Bufs<'_> {
             dims,
         };
         let moved = RpieMoved::lend(rb.moved.as_deref_mut(), &mut self.features)?;
+        let moved = (moved.map(MovedLent::try_from)).transpose()?;
         let mut moved = (moved.map(|m| m.batch(ctx, k, &dims, self.probe))).transpose()?;
         let base = FusedInputs {
             views: self.views,
