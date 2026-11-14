@@ -1,12 +1,17 @@
-"""ptyrs GPU against PyNX CUDA DM and ML and against pty-chi LSQML on measured data, CXIDB entry
-65 (ALS 5.3.2, gold balls, 1 keV, 800 frames of 621x621 pixels, CC0), every side from one start,
-through the `ptyrs` module.
+"""ptyrs GPU against PyNX CUDA DM and ML, pty-chi LSQML, BH and rPIE and PtyPy RAAR on measured
+data, CXIDB entry 65 (ALS 5.3.2, gold balls, 1 keV, 800 frames of 621x621 pixels, CC0), every
+side from one start, through the `ptyrs` module.
 
     python -I compare_cxidb.py prepare RAW OUT [--device 0] [--module DIR]
     python -I compare_cxidb.py dm OUT [--cycles 200] [--device 0] [--module DIR]
     python -I compare_cxidb.py ml OUT [--cycles 100] [--fix-gamma] [--device 0] [--module DIR]
     python -I compare_cxidb.py lsqml OUT [--epochs 20] [--batch 32] [--seed 7] [--device 0]
         [--module DIR]
+    python -I compare_cxidb.py bh OUT [--epochs 20] [--batch 96] [--seed 7] [--device 0]
+        [--module DIR]
+    python -I compare_cxidb.py rpie OUT [--epochs 20] [--batch 100] [--object-step 0.03]
+        [--seed 7] [--device 0] [--module DIR]
+    python -I compare_cxidb.py raar OUT [--cycles 200] [--ptypy DIR] [--device 0] [--module DIR]
 
 RAW is the entry's AuBalls_700ms_30nmStep_3_full.cxi, read with h5py alone. ptyrs::io::read_cxi
 refuses it (its 621-pixel frames are odd, its translation is [N, 3] where read_cxi takes [3, N]),
@@ -35,14 +40,25 @@ ml: WARMUP GPU AP cycles from init.h5 (OUT/init_ml.h5), then GpuPtycho.ml agains
 stock and with its Hann filter off, compare_pynx_ml.py's figures; --fix-gamma as there. On this
 data the stock ML stops moving within a few cycles, so its figures are well above the Hann-off
 ones.
-lsqml: GpuPtycho.lsqml("amplitude") against pty-chi CPU f64 LSQML Gaussian
-(compare_lsqml.ptychi_task, the mask as its valid_pixel_mask), both over the engine's
-random_batches order, with compare_gpu_multislice.py's figures; every state's LLK is the CPU f64
-Ptycho.llk. There is no truth: the figures are side against side.
+lsqml, bh, rpie: GpuPtycho.lsqml("amplitude"), .bh and .rpie against pty-chi CPU f64 LSQML
+Gaussian (compare_lsqml.ptychi_task), BH (refs/f64/bh_step.py's options, probe rho BH_RHO; GD
+on mini-batches, CG on one batch of every frame, as the engine) and rPIE (compare_rpie.ptychi_task
+and rpie_params: consecutive batches, its object step), the mask as pty-chi's valid_pixel_mask,
+LSQML's and BH's batches in the engine's random_batches order, with compare_gpu_multislice.py's
+figures; every state's LLK is the CPU f64 Ptycho.llk. pty-chi shifts by PATCH at the engine's
+integer view corners, the positions the engine reconstructs on, so its FULL_OBJECT model is not
+needed. There is no truth: the figures are side against side.
+raar: GpuPtycho.raar (beta RAAR_BETA, no phase-ramp removal) against PtyPy's CPU f64 RAAR,
+compare_ptypy.py in a child (the checkout --ptypy on its PYTHONPATH, its files in OUT/raar_ptypy,
+its output in OUT/raar_ptypy.log), as examples/ptypy_compare.rs: ptyrs's LLK record of the
+estimate each cycle starts from (the CPU f64 Ptycho.llk for the last) against the CPU f64
+Ptycho.llk of PtyPy's state after each iteration. PtyPy's RAAR is not PyNX's for any beta
+(compare_ptypy.py), so the curves are side by side.
 
 Exits 1 if the starts differ (the LLK record of the start; pty-chi's start far field and its LLK
-of the start), 2 if a side diverges (m3ref.exit_unless_converging): ML's on the Poisson LLK,
-DM's and LSQML's on the Gaussian.
+of the start; PtyPy's start, which is init.h5's to the bit), 2 if a side diverges
+(m3ref.exit_unless_converging): ML's on the Poisson LLK, LSQML's, BH's and rPIE's on
+the Euclidian (COST), DM's and RAAR's on the Gaussian.
 """
 import argparse
 import importlib.util
@@ -71,9 +87,16 @@ WARMUP = 20
 KEYS = ("poisson", "gaussian", "euclidian", "nb_photons_calc")
 # the start's LLK record, ptyrs against PyNX: 5x the worst measured (2.1e-6, DM's Poisson)
 START_RTOL = 1.1e-5
-# pty-chi's start far field and its own Gaussian LLK of the start against ptyrs CPU f64: 5x the
-# worst measured (1.5e-15, 6.1e-13)
+# pty-chi's start far field and its own COST LLK of the start against ptyrs CPU f64: 5x the
+# worst measured (1.5e-15, 6.3e-13)
 FAR_RTOL, LLK_RTOL = 1e-14, 4e-12
+# the LLK LSQML, BH and rPIE descend, the amplitude misfit (pty-chi's Gaussian noise model is on
+# amplitudes): on CXIDB 65 BH's Gaussian LLK, on intensities, rises while this one falls
+COST = "euclidian"
+# engine_bh_m3.rs's and bh_step.py's (pty-chi's ProbeOptions.rho)
+BH_RHO = 0.01
+# RaarParams::default().beta, PyNX's
+RAAR_BETA = 0.9
 CXI = {
     "data": "entry_1/instrument_1/detector_1/data",
     "dark": "entry_1/instrument_1/detector_1/data_dark",
@@ -297,12 +320,17 @@ def run_pynx(args, algo):
         raise subprocess.CalledProcessError(rc, cmd)
 
 
+def corners(data):
+    """The engine's view corners (y, x), PyNX's: the positions it preprocesses, rounded."""
+    m3ref = sibling("refs/ptychi", "m3ref")
+    pos = m3ref.pynx_positions(data.x, data.y, (FRAME, FRAME), data.geometry)
+    return ((np.array(data.obj.shape[-2:]) - FRAME) // 2 + np.round(pos)).astype(int)
+
+
 def centres_region(data):
     """Rows and columns spanned by the window centres (ptypy_compare's region)."""
-    m3ref = sibling("refs/ptychi", "m3ref")
-    pos = np.round(m3ref.pynx_positions(data.x, data.y, (FRAME, FRAME), data.geometry))
-    corner = (np.array(data.obj.shape[-2:]) - FRAME) // 2 + pos + FRAME // 2
-    return [(int(corner[:, d].min()), int(corner[:, d].max()) + 1) for d in (0, 1)]
+    centre = corners(data) + FRAME // 2
+    return [(int(centre[:, d].min()), int(centre[:, d].max()) + 1) for d in (0, 1)]
 
 
 def frc(out, region, a, b):
@@ -323,7 +351,7 @@ def compare(name, ours, theirs):
         print(f"  {k:16s} {v.max():.3e} (cycle {int(v.argmax())})")
     for c in sorted({0, 1, 2, 5, 10, 20, len(r) // 2, len(r) - 1}):
         if c < len(r):
-            print(f"  cycle {c:4d} poisson ptyrs {ours[c, 0]:.10e} PyNX {theirs[c, 0]:.10e} "
+            print(f"  cycle {c:4d} poisson ptyrs {ours[c, 0]:.10e} {name} {theirs[c, 0]:.10e} "
                   f"rel {r[c, 0]:.2e}")
     return r[0].max()
 
@@ -376,11 +404,11 @@ def run_cuda(args, algo):
     return max(starts) <= START_RTOL
 
 
-def ptychi_task(data, obj, probe, batch, epochs):
-    """compare_lsqml.ptychi_task (Gaussian) on `data`, its mask as pty-chi's valid_pixel_mask;
-    the task and m3ref.Dataset stand-in it was built from."""
-    lsqml = sibling("refs/py", "compare_lsqml")
-    m3ref = lsqml.m3ref
+def ptychi_task(data, obj, probe, build):
+    """`build(ds, obj, probe)`, a pty-chi task builder as compare_lsqml.ptychi_task's, on the
+    m3ref.Dataset stand-in `ds` of `data`, its mask as pty-chi's valid_pixel_mask; the task and
+    `ds`."""
+    m3ref = sibling("refs/ptychi", "m3ref")
     import ptychi.api.task as at
 
     ds = object.__new__(m3ref.Dataset)
@@ -396,13 +424,57 @@ def ptychi_task(data, obj, probe, batch, epochs):
 
     at.PtychographyTask = masked
     try:
-        return lsqml.ptychi_task(ds, obj, probe, "gaussian", batch, epochs), ds, lsqml
+        return build(ds, obj, probe), ds
     finally:
         at.PtychographyTask = real
 
 
-def run_lsqml(args):
+def bh_task(ds, obj, probe, corner, batch, epochs):
+    """pty-chi's BH with refs/f64/bh_step.ptychi_run's options at the view corners `corner`: CG
+    on one batch of every frame, GD on smaller ones, as the engine (pty-chi's mini-batch CG steps
+    along directions built from other batches' cached pieces, DESIGN B7)."""
+    import ptychi.api as api
+    from ptychi.api.task import PtychographyTask
+
+    ny, nx = ds.frame
+    opts = api.BHOptions()
+    opts.data_options.wavelength_m = ds.geometry["wavelength_m"]
+    opts.data_options.fft_shift = True
+    o = opts.object_options
+    o.optimizable = True
+    o.pixel_size_m = ds.pixel
+    o.determine_position_origin_coords_by = api.ObjectPosOriginCoordsMethods.SPECIFIED
+    o.position_origin_coords = [(ny - 1) / 2, (nx - 1) / 2]
+    o.remove_object_probe_ambiguity.enabled = False
+    pr = opts.probe_options
+    pr.optimizable = True
+    pr.rho = BH_RHO
+    pr.orthogonalize_incoherent_modes.enabled = False
+    pr.orthogonalize_opr_modes.enabled = False
+    opts.probe_position_options.optimizable = False
+    r = opts.reconstructor_options
+    r.method = "CG" if batch >= len(ds.counts) else "GD"
+    r.batch_size = batch
+    r.num_epochs = epochs
+    r.default_dtype = api.Dtypes.FLOAT64
+    r.default_device = api.Devices.CPU
+    r.allow_nondeterministic_algorithms = False
+    r.forward_model_options.shift_operator = api.ShiftOperators.PATCH
+    r.forward_model_options.pad_for_shift = 4
+    return PtychographyTask(
+        opts,
+        diffraction_data=ds.counts.astype(np.float64),
+        object_data=obj.copy(),
+        probe_data=ds.probe_to_ptychi(probe)[None],
+        probe_position_y_px=corner[:, 0].astype(np.float64),
+        probe_position_x_px=corner[:, 1].astype(np.float64),
+    )
+
+
+def run_ptychi(args):
+    """`lsqml`, `bh` or `rpie`: GpuPtycho against pty-chi CPU f64 from one start."""
     import time
+    from types import SimpleNamespace
 
     import torch
     import ptychi.utils as utils
@@ -412,16 +484,38 @@ def run_lsqml(args):
     import ptyrs
     torch.set_default_dtype(torch.float64)
     utils.set_default_complex_dtype(torch.complex128)
-    rb = sibling("refs/f64", "random_batches")
+    lsqml = sibling("refs/py", "compare_lsqml")
+    m3ref = lsqml.m3ref
     data = Data(args.out)
     scan = data.scan(ptyrs)
     obj, probe = data.obj, data.probe
     cpu = ptyrs.Ptycho(scan, obj, probe)
-    task, ds, lsqml = ptychi_task(data, obj, probe, args.batch, args.epochs)
-    m3ref = lsqml.m3ref
-    sampler = rb.Sampler(len(data.counts), args.batch, args.seed)
+    algo, batch, seed = args.cmd, args.batch, args.seed
+    sampler = None
+    if algo == "rpie":
+        rpie = sibling("refs/py", "compare_rpie")
+        opts = SimpleNamespace(batch=batch, object_step=args.object_step, epochs=args.epochs,
+                               seed=seed)
+        task, ds = ptychi_task(data, obj, probe, lambda *s: rpie.ptychi_task(*s, opts, True))
+        params = dict(rpie.rpie_params(task.options), calc_llk=1)
+        steps = lambda gpu, e: gpu.rpie(e, **params)
+        what = f"rPIE {params}"
+    else:
+        sampler = sibling("refs/f64", "random_batches").Sampler(len(data.counts), batch, seed)
+        if algo == "lsqml":
+            build = lambda *s: lsqml.ptychi_task(*s, "gaussian", batch, args.epochs)
+            steps = lambda gpu, e: gpu.lsqml(e, 1, batch, "amplitude", seed)
+            what = f"LSQML Gaussian batch {batch} seed {seed}"
+        else:
+            build = lambda *s: bh_task(*s, corners(data), batch, args.epochs)
+            steps = lambda gpu, e: gpu.bh(e, 1, batch, BH_RHO, seed)
+            what = f"BH batch {batch} seed {seed} probe rho {BH_RHO}"
+        task, ds = ptychi_task(data, obj, probe, build)
     rec = task.reconstructor
-    rec.dataloader = DataLoader(rec.dataset, batch_sampler=sampler)
+    rec.dataloader = (DataLoader(rec.dataset, batch_size=batch, shuffle=False) if sampler is None
+                      else DataLoader(rec.dataset, batch_sampler=sampler))
+    if algo == "bh":
+        what += f" (pty-chi {task.options.reconstructor_options.method})"
 
     ours = (np.abs(cpu.forward(obj, probe)) ** 2).sum(axis=1)
     theirs = lsqml.ptychi_icalc(task)
@@ -429,11 +523,11 @@ def run_lsqml(args):
     valid = rec.dataset.valid_pixel_mask.numpy()
     sums = m3ref.llk_sums(torch.from_numpy(theirs[:, valid]),
                           rec.dataset.patterns[:, torch.from_numpy(valid)])
-    start = cpu.llk(obj, probe)["gaussian"]
-    llk = abs(float(sums["gaussian"] / sums["nb_obs"]) / start - 1)
-    print(f"start: far-field intensity max |ptyrs - pty-chi| / max pty-chi {far:.2e}; Gaussian "
-          f"LLK ptyrs CPU f64 {start:.10e}, pty-chi's own over its valid pixels {llk:.1e} from "
-          "it", flush=True)
+    start = cpu.llk(obj, probe)[COST]
+    llk = abs(float(sums[COST] / sums["nb_obs"]) / start - 1)
+    print(f"{what}, {len(data.counts)} frames\nstart: far-field intensity max |ptyrs - pty-chi| "
+          f"/ max pty-chi {far:.2e}; {COST} LLK ptyrs CPU f64 {start:.10e}, pty-chi's own over "
+          f"its valid pixels {llk:.1e} from it", flush=True)
     del ours, theirs
 
     curves = {"ptyrs": [start], "pty-chi": [start]}
@@ -450,28 +544,27 @@ def run_lsqml(args):
             task.run(1)
         finally:
             torch.randn = randn
-        assert sampler.epoch == e, (sampler.epoch, e)
+        assert sampler is None or sampler.epoch == e, (sampler.epoch, e)
         o = task.get_data_to_cpu("object", as_numpy=True)
         p = ds.probe_from_ptychi(task.get_data_to_cpu("probe", as_numpy=True)[0])
-        curves["pty-chi"].append(cpu.llk(o, p)["gaussian"])
+        curves["pty-chi"].append(cpu.llk(o, p)[COST])
         print(f"pty-chi epoch {e}: {(time.perf_counter() - wall) / e:.1f} s/epoch ({load_avg()})",
               flush=True)
-    write_modes(f"{args.out}/lsqml_ptychi.h5", o, p)
+    write_modes(f"{args.out}/{algo}_ptychi.h5", o, p)
 
     own = []
     for e in range(1, args.epochs + 1):
         gpu = ptyrs.GpuPtycho(scan, obj, probe, args.device)
-        gpu.lsqml(e, 1, args.batch, "amplitude", args.seed)
-        h = np.asarray(gpu.history["gaussian"])
+        steps(gpu, e)
+        h = np.asarray(gpu.history[COST])
         assert len(h) == e, (len(h), e)
         own.append(h[-1])
         go, gp = gpu.object, gpu.probe
-        curves["ptyrs"].append(cpu.llk(go, gp)["gaussian"])
+        curves["ptyrs"].append(cpu.llk(go, gp)[COST])
     assert (np.array(own) == h).all(), "a shorter GPU run is not the longest run's prefix"
-    write_modes(f"{args.out}/lsqml_ptyrs.h5", go, gp)
+    write_modes(f"{args.out}/{algo}_ptyrs.h5", go, gp)
 
-    print(f"LSQML Gaussian batch {args.batch} seed {args.seed}: epoch, Gaussian LLK GPU, "
-          f"pty-chi, relative difference ({load_avg()})")
+    print(f"{what}: epoch, {COST} LLK GPU, pty-chi, relative difference ({load_avg()})")
     a, b = (np.array(curves[s]) for s in ("ptyrs", "pty-chi"))
     for e, (x, y) in enumerate(zip(a, b)):
         print(f"{e:4d} {x:.10e} {y:.10e} {abs(x - y) / y:.1e}")
@@ -481,9 +574,100 @@ def run_lsqml(args):
           f"records from the f64 llk of its states {np.abs(np.array(own) / a[1:] - 1).max():.1e}"
           f"; {len(zeroed)} torch.randn calls zeroed")
     print(f"FRC of the final objects ({load_avg()}):")
-    frc(args.out, centres_region(data), "lsqml_ptyrs", "lsqml_ptychi")
+    frc(args.out, centres_region(data), f"{algo}_ptyrs", f"{algo}_ptychi")
     m3ref.exit_unless_converging(curves)
     return far <= FAR_RTOL and llk <= LLK_RTOL
+
+
+def ptypy_state(path, start, pixel):
+    """compare_ptypy.py's state in the .ptyr `path` on ptyrs's pixels, as ptypy_compare.rs's
+    ptypy_state: the object moved by its storage origin, the pixels outside PtyPy's storage
+    (which no view reads) at `start`'s; `pixel` is ptyrs's object pixel."""
+    import h5py
+    with h5py.File(path, "r") as f:
+        (ob,) = f["content/obj"].values()
+        (pr,) = f["content/probe"].values()
+        o, psize, origin = ob["data"][()], ob["_psize"][()], ob["_origin"][()]
+        probe = pr["data"][()]
+    shift = -origin / psize
+    off = np.round(shift).astype(int)
+    assert np.abs(psize / pixel - 1).max() < 1e-12 and np.abs(shift - off).max() < 1e-6, (
+        path, psize, origin, pixel)
+    obj = start.copy()
+    lo = np.maximum(-off, 0)
+    hi = np.minimum(obj.shape[-2:], np.array(o.shape[-2:]) - off)
+    obj[:, lo[0]:hi[0], lo[1]:hi[1]] = o[:, lo[0] + off[0]:hi[0] + off[0],
+                                         lo[1] + off[1]:hi[1] + off[1]]
+    return obj, probe
+
+
+def run_raar(args):
+    """`raar`: GpuPtycho against PtyPy's CPU f64 RAAR from one start."""
+    import time
+
+    sys.path.insert(0, args.module)
+    import ptyrs
+    m3ref = sibling("refs/ptychi", "m3ref")
+    data = Data(args.out)
+    scan = data.scan(ptyrs)
+    obj, probe = data.obj, data.probe
+    cpu = ptyrs.Ptycho(scan, obj, probe)
+    n = args.cycles
+    print(f"raar: {len(data.counts)} frames, {n} cycles, beta {RAAR_BETA} ({load_avg()})",
+          flush=True)
+    gpu = ptyrs.GpuPtycho(scan, obj, probe, args.device)
+    gpu.raar(n, beta=RAAR_BETA, calc_llk=1, zero_phase_ramp=False)
+    go, gp = gpu.object, gpu.probe
+    last = cpu.llk(go, gp)
+    ours = np.vstack([history(gpu, n), [last[k] for k in KEYS]])
+    del gpu
+    write_modes(f"{args.out}/raar_ptyrs.h5", go, gp, llk=ours)
+
+    d = f"{args.out}/raar_ptypy"
+    os.makedirs(d, exist_ok=True)
+    for name in ("scan.cxi", "init.h5"):
+        if not os.path.lexists(f"{d}/{name}"):
+            os.symlink(f"../{name}", f"{d}/{name}")
+    np.savetxt(f"{d}/views.txt", corners(data), fmt="%d")
+    with open(f"{d}/algo.txt", "w") as f:
+        f.write(f"raar {RAAR_BETA}\n")
+    cmd = [sys.executable, "-P", os.path.join(ROOT, "ptyrs/scripts/engine/compare_ptypy.py"), d,
+           str(n)]
+    log = f"{args.out}/raar_ptypy.log"
+    wall = time.perf_counter()
+    with open(log, "w") as f:
+        rc = subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT,
+                            env=dict(os.environ, PYTHONPATH=args.ptypy)).returncode
+    with open(log) as f:
+        lines = f.read().splitlines()
+    if rc:
+        print("\n".join(lines[-20:]))
+        raise subprocess.CalledProcessError(rc, cmd)
+    print(f"PtyPy RAAR: {(time.perf_counter() - wall) / max(n, 1):.1f} s/iteration ({load_avg()}); "
+          + next(x for x in lines if x.startswith("offset")), flush=True)
+
+    pixel = data.wavelength * data.distance / (FRAME * data.pixel)
+    theirs = []
+    for i in range(n + 1):
+        o, p = ptypy_state(f"{d}/ptypy/ptypy_{i:04d}.ptyr", obj, pixel)
+        if i == 0:
+            same = (o == obj).all() and (p == probe).all()
+            print(f"start: PtyPy's state 0 is init.h5's object and probe: {same}")
+        l = cpu.llk(o, p)
+        theirs.append([l[k] for k in KEYS])
+    theirs = np.array(theirs)
+    write_modes(f"{args.out}/raar_ptypy.h5", o, p, llk=theirs)
+    print("ptyrs: the GPU's record of the estimate each cycle starts from, the CPU f64 llk of "
+          "the last; PtyPy: the CPU f64 llk of its state after each iteration")
+    start = compare("PtyPy", ours, theirs)
+    (eo, ko), (ep, kp) = rel_l2(go, o), rel_l2(gp, p)
+    print(f"  final object rel L2 {eo:.3e} (scale {ko:.6f})  probe rel L2 {ep:.3e} "
+          f"(scale {kp:.6f})")
+    print(f"FRC of the final objects ({load_avg()}):")
+    frc(args.out, centres_region(data), "raar_ptyrs", "raar_ptypy")
+    col = KEYS.index("gaussian")
+    m3ref.exit_unless_converging({"ptyrs": ours[:, col], "PtyPy": theirs[:, col]})
+    return same and start <= START_RTOL
 
 
 def main():
@@ -498,11 +682,17 @@ def main():
         q.add_argument("out")
         q.add_argument("--cycles", type=int, default=n)
         q.add_argument("--fix-gamma", action="store_true")
-    q = sub.add_parser("lsqml")
+    for name, batch in (("lsqml", 32), ("bh", 96), ("rpie", 100)):
+        q = sub.add_parser(name)
+        q.add_argument("out")
+        q.add_argument("--epochs", type=int, default=20)
+        q.add_argument("--batch", type=int, default=batch)
+        q.add_argument("--seed", type=int, default=7)
+    q.add_argument("--object-step", type=float, default=0.03)
+    q = sub.add_parser("raar")
     q.add_argument("out")
-    q.add_argument("--epochs", type=int, default=20)
-    q.add_argument("--batch", type=int, default=32)
-    q.add_argument("--seed", type=int, default=7)
+    q.add_argument("--cycles", type=int, default=200)
+    q.add_argument("--ptypy", default=os.path.expanduser("~/work/ptycho/ptypy"))
     q = sub.add_parser("pynx")
     q.add_argument("out")
     q.add_argument("algo", choices=("dm", "ml"))
@@ -516,8 +706,10 @@ def main():
         prepare(args)
     elif args.cmd == "pynx":
         pynx(args)
-    elif not (run_lsqml(args) if args.cmd == "lsqml" else run_cuda(args, args.cmd)):
-        sys.exit(1)
+    else:
+        run = {"raar": run_raar, "lsqml": run_ptychi, "bh": run_ptychi, "rpie": run_ptychi}
+        if not (run[args.cmd](args) if args.cmd in run else run_cuda(args, args.cmd)):
+            sys.exit(1)
 
 
 if __name__ == "__main__":
