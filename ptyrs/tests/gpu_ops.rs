@@ -4769,6 +4769,56 @@ fn update_sums_bits(stream: &CudaStream, u: &UpdateSums) -> (Vec<(u32, u32)>, Ve
     )
 }
 
+/// One build of a wave kernel reads both carried sets, so `fused_project` refuses `psi` and
+/// the RAAR iterate in different formats, before it writes anything.
+#[test]
+fn fused_project_refuses_psi_and_iterate_in_two_formats() {
+    let (stream, ex, k) = setup();
+    let (frame, modes) = FUSED_CASES[0];
+    let fs = FusedScan::new(&stream, frame, modes);
+    let s = &fs.s;
+    let table = one_stack(&stream, &s.d, 0..s.d.nframe);
+    let len = s.nk(&(0..s.d.nframe)) * s.n();
+    let mut bufs = FusedBufs::with_shift(&stream, &s.d, table.nf_max()).unwrap();
+    let mut half = HalfWaves::zeroed(&stream, len, 1.0).unwrap();
+    let mut full = DeviceBuffer::<C32>::zeroed(&stream, len).unwrap();
+    let mut refused = |exit: Exit<'_>| {
+        let r = k.fused_project(
+            &ex,
+            &fs.inputs(),
+            table.at(0),
+            exit,
+            &mut bufs,
+            FusedSums::default(),
+        );
+        assert!(
+            matches!(&r, Err(Error::Shape(m)) if m.contains("one format")),
+            "{r:?}"
+        );
+    };
+    refused(Exit::RaarFirst {
+        psi: &mut half,
+        iterate: &mut full,
+    });
+    refused(Exit::Raar {
+        psi: &mut full,
+        iterate: &mut half,
+        beta: 0.9,
+    });
+    assert!(
+        half.to_host_vec(&stream)
+            .unwrap()
+            .iter()
+            .all(|v| v.re == 0.0 && v.im == 0.0)
+    );
+    assert!(
+        full.to_host_vec(&stream)
+            .unwrap()
+            .iter()
+            .all(|v| v.re == 0.0 && v.im == 0.0)
+    );
+}
+
 /// DM's and RAAR's carried waves as f16 ([`HalfWaves`] at [`half_scale`] of the counts), on
 /// [`FUSED_CASES`]: every pass that stores them stores the f32 pass's values rounded, and
 /// every pass that reads them reads what an f32 buffer of the same values gives. The first

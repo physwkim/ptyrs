@@ -1099,17 +1099,18 @@ impl Kernels {
         self.launch(ctx, &reads, &sums.storages(), |stream| {
             // SAFETY: lengths checked above; the tile lists were built from these views.
             unsafe {
-                self.module.psi_to_obj(
-                    stream,
-                    config,
-                    psi.ptr(),
-                    dptr(probe),
-                    dptr(&views.addr),
+                let (m, ptr, probe, addr) =
+                    (&self.module, psi.ptr(), dptr(probe), dptr(&views.addr));
+                let (tiles, sums, ctl) = (
                     views.tile_ptrs(),
                     sums.ptrs(),
                     stack.ctl() as *const StackCtl,
-                    g,
-                )
+                );
+                if psi.half() {
+                    m.psi_to_obj_f16(stream, config, ptr, probe, addr, tiles, sums, ctl, g)
+                } else {
+                    m.psi_to_obj(stream, config, ptr, probe, addr, tiles, sums, ctl, g)
+                }
             }
         })
     }
@@ -1143,16 +1144,13 @@ impl Kernels {
         self.launch(ctx, &reads, &sums.storages(), |stream| {
             // SAFETY: lengths checked above; `Views::new` checked every view.
             unsafe {
-                self.module.psi_to_probe(
-                    stream,
-                    config,
-                    psi.ptr(),
-                    dptr(obj),
-                    dptr(&views.addr),
-                    sums.ptrs(),
-                    stack.ctl() as *const StackCtl,
-                    g,
-                )
+                let (m, ptr, obj, addr) = (&self.module, psi.ptr(), dptr(obj), dptr(&views.addr));
+                let (sums, ctl) = (sums.ptrs(), stack.ctl() as *const StackCtl);
+                if psi.half() {
+                    m.psi_to_probe_f16(stream, config, ptr, obj, addr, sums, ctl, g)
+                } else {
+                    m.psi_to_probe(stream, config, ptr, obj, addr, sums, ctl, g)
+                }
             }
         })
     }
