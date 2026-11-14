@@ -8,7 +8,8 @@ use std::sync::Arc;
 use crate::base::{C64, Stack};
 use crate::gpu::{
     C32, CG_BLOCKS, Ended, Error as GpuError, Exit, FarSums, FusedBufs, FusedInputs, FusedSums,
-    GammaCounts, Kernels, Model, PositionKernels, RecordWriter, Shift, SpectrumBuf, ViewDims,
+    GammaCounts, Kernels, Model, PositionKernels, RecordWriter, Shift, ShiftProbe, SpectrumBuf,
+    ViewDims,
 };
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaStream, DeviceBuffer};
@@ -262,7 +263,7 @@ impl Bufs<'_> {
                 far: FarSums::default(),
             };
             let sums = FusedSums {
-                shift: m.shift_sums(false, true),
+                shift: m.shift_sums(None, true),
                 ..FusedSums::default()
             };
             self.kernels
@@ -324,7 +325,7 @@ impl Bufs<'_> {
             let sums = FusedSums {
                 obj: update[0].then_some(&mut *self.obj_sums),
                 probe: (update[1] && !shifted).then_some(&mut *self.probe_sums),
-                shift: m.shift_sums(update[1], false),
+                shift: m.shift_sums(update[1].then_some(ShiftProbe::Sums as _), false),
             };
             self.kernels
                 .fused_project(ctx, &inputs, stack, exit, f, sums)?;
