@@ -90,6 +90,7 @@ impl State {
         region: &LiveRegion,
         cfg: &ApConfig,
         probe: &[C32],
+        store: Option<Arc<DeviceStore>>,
     ) -> Result<Self, DistError> {
         let stream = gpu.stream().clone();
         let kernels = Kernels::load(gpu.ctx())?;
@@ -108,7 +109,28 @@ impl State {
         let n = (d.frame[0] * d.frame[1]) as usize;
         let mut scan_backer = scan.backer();
         scan_backer.plan(&region.planned)?;
-        let store = Arc::new(DeviceStore::new(gpu.ctx(), d.nframe as usize, n)?);
+        let store = match store {
+            Some(s)
+                if s.frame_elems() == n
+                    && s.max_frames() >= u64::from(d.nframe)
+                    && s.ctx().ordinal() == gpu.ctx().ordinal() =>
+            {
+                s
+            }
+            Some(s) => {
+                return Err(DistError::Partition(format!(
+                    "a store of {} {}-pixel frames on GPU {} for region {}: {} {n}-pixel \
+                     frames on GPU {}",
+                    s.max_frames(),
+                    s.frame_elems(),
+                    s.ctx().ordinal(),
+                    gpu.region(),
+                    d.nframe,
+                    gpu.ctx().ordinal()
+                )));
+            }
+            None => Arc::new(DeviceStore::new(gpu.ctx(), d.nframe as usize, n)?),
+        };
         // SAFETY: the fused pass reads the counts of landed frames only, each in the store
         // before its views are pushed ([`DistLiveAp::push`]).
         let counts_view = unsafe { store.frames_view()? };
@@ -326,11 +348,38 @@ impl DistLiveAp {
         scheme: Scheme,
         probe: &[C32],
     ) -> Result<Self, DistError> {
+        Self::build(ordinals, cfg, planned, scheme, probe, None)
+    }
+
+    /// [`Self::new`] on the GPUs of `stores`, region `r` reading its frames' counts from
+    /// `stores[r]`: the stores of an earlier run of the same plan, whose frames the caller
+    /// pushes again in the order they landed.
+    pub fn on_stores(
+        stores: &[Arc<DeviceStore>],
+        cfg: &ApConfig,
+        planned: &[ViewAddr],
+        scheme: Scheme,
+        probe: &[C32],
+    ) -> Result<Self, DistError> {
+        let ordinals: Vec<usize> = stores.iter().map(|s| s.ctx().ordinal()).collect();
+        let stores = Some(Arc::new(stores.to_vec()));
+        Self::build(&ordinals, cfg, planned, scheme, probe, stores)
+    }
+
+    fn build(
+        ordinals: &[usize],
+        cfg: &ApConfig,
+        planned: &[ViewAddr],
+        scheme: Scheme,
+        probe: &[C32],
+        stores: Option<Arc<Vec<Arc<DeviceStore>>>>,
+    ) -> Result<Self, DistError> {
         let plan = LivePlan::new(&cfg.shape, planned, scheme, ordinals.len(), cfg.cap)?;
         let regions: Arc<Vec<LiveRegion>> = Arc::new(plan.regions().to_vec());
         let (cfg, probe) = (*cfg, Arc::new(probe.to_vec()));
         let workers = Workers::spawn(ordinals, move |gpu| {
-            State::new(gpu, &regions[gpu.region()], &cfg, &probe)
+            let store = stores.as_ref().map(|s| s[gpu.region()].clone());
+            State::new(gpu, &regions[gpu.region()], &cfg, &probe, store)
         })?;
         let ptrs = workers.run(|gpu, st| Ok(st.ptrs(gpu)))?;
         let halo: Vec<Vec<Pull>> = (0..ptrs.len())
