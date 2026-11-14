@@ -27,6 +27,7 @@ not (package(ptyrs) & (
   | test(=dist::worker::tests::fence_orders_side_stream_work)
   | test(=dist::worker::tests::init_failure_is_reported)
   | test(=dist::worker::tests::run_returns_after_every_worker_is_done_with_its_borrows)
+  | test(=live::follow::tests::a_filling_run_on_two_gpus_is_one_gpus_replay)
   | test(=live::follow::tests::gpus_follow_a_stream_as_one_gpu_replays_its_landings)
 ))
 '''

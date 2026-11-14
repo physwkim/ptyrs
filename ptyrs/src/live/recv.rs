@@ -33,7 +33,7 @@ use crate::live::consumer::{ConsumerReport, checksum, run_checksum_consumer};
 use crate::live::eiger::{EigerFrames, Progress, PullReport, connect_pull, run_pull};
 use crate::live::farfield::ScanPath;
 use crate::live::follow::{
-    FollowCfg, FollowReport, Landing, Preview, ReconCfg, first_converged, offline_dist, plane,
+    FollowCfg, FollowReport, Preview, ReconCfg, first_converged, offline_dist, plane,
     run_dist_consumer,
 };
 use crate::live::graph::WarmUp;
@@ -45,7 +45,7 @@ use crate::live::pipeline::{
 use crate::live::pos::PosTable;
 use crate::live::pv_out::{AmpPhase, PvOut, publish};
 use crate::live::pva_source::{NtndFrames, PosStats, monitor_positions};
-use crate::live::ring::{DeviceStore, Ring, UploaderConfig, Whole, run_region_uploader};
+use crate::live::ring::{DeviceStore, Landing, Ring, UploaderConfig, Whole, run_region_uploader};
 use crate::live::sched::FairSched;
 use crate::live::stats::{Histogram, mono_ns, process_cpu_ns, wall_ns};
 use crate::live::swmr::{SwmrCfg, SwmrReport, run_swmr};
@@ -769,7 +769,7 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
                         .map_err(|e| e.to_string()),
                     Job::Recon(follow, settle_max) => {
                         let f = follow.clone();
-                        run_dist_consumer(&ordinals, scheme, f, brx, ready_tx, preview)
+                        run_dist_consumer(&ordinals, scheme, f, brx, ready_tx, preview, None)
                             .map(|rep| {
                                 Consumed::Recon(Box::new(Recon {
                                     rep,
@@ -788,16 +788,17 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
     let landing = match &sums {
         Some(store) => cap_rx
             .recv()
-            .map(|()| -> Landing { (vec![store.clone()], Box::new(Whole)) })
+            .map(|()| Landing::new(vec![store.clone()], Whole))
             .ok(),
         None => ready_rx.recv().ok(),
     };
-    let Some((stores, route)) = landing else {
+    let Some(landing) = landing else {
         let failed = consumer.join().unwrap().err();
         return Err(fail("graph capture")(failed.unwrap_or_else(|| {
             "the consumer ended before its capture".to_string()
         })));
     };
+    let stores = landing.stores.clone();
     let warm = WarmUp::end();
     // From here on every exit, failed or not, goes through the one shutdown
     // below: the source and its Sender go, the workers drain, the uploader
@@ -806,12 +807,12 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
     let pos = Arc::new(PosTable::new(1 << 16));
     let uploader = {
         let (ring, stop, place) = (ring.clone(), stop.clone(), place.clone());
-        let (stores, pos) = (stores.clone(), pos.clone());
+        let pos = pos.clone();
         std::thread::Builder::new()
             .name("h2d".into())
             .spawn(move || {
                 place.enter_h2d();
-                run_region_uploader(ring, stores, route, pos, ucfg, stop, Some(btx))
+                run_region_uploader(ring, landing, pos, ucfg, stop, Some(btx))
             })
             .unwrap()
     };
