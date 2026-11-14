@@ -193,7 +193,10 @@ impl GpuPtycho {
         crate::sampling_name(self.0.sampling())
     }
 
-    /// As `Ptycho.set_sampling`.
+    /// As `Ptycho.set_sampling`. After a device error (a `RuntimeError`) the current sampling
+    /// stays if the new one's buffers could not be built; else the new one is entered, and
+    /// the LLK pass runs without its graph until a later `set_features` or `set_sampling`
+    /// captures it again.
     fn set_sampling(&mut self, sampling: &str) -> PyResult<()> {
         let sampling = crate::sampling(sampling)?;
         Ok(self.0.set_sampling(sampling).map_err(Error::from)?)
