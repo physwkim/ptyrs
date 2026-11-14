@@ -133,7 +133,7 @@ pub fn on_position(
     match check_position_layout(desc).and_then(|()| parse_position(body, order)) {
         Ok((Some(uid), Some(x), Some(y))) if uid >= 0 => {
             let t_rx = wall_ns();
-            table.insert(uid, Pos { x, y, t_rx });
+            table.insert(uid, Pos::new(x, y, t_rx));
             s.updates += 1;
         }
         Ok((Some(uid), ..)) if uid < 0 => {}

@@ -256,14 +256,7 @@ mod tests {
             let mut s = ring.reserve();
             let seq = s.seq();
             s.frame().copy_from_slice(&frame(seq));
-            pos.insert(
-                seq as i32,
-                Pos {
-                    x: 0.0,
-                    y: 0.0,
-                    t_rx: 0,
-                },
-            );
+            pos.insert(seq as i32, Pos::new(0.0, 0.0, 0));
             s.commit(seq as i32, 0, 0);
             std::thread::sleep(Duration::from_micros(200));
         }
