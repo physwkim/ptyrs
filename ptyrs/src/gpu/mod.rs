@@ -54,7 +54,8 @@ pub use fused::{
     ProbeSpectrum, PsiSums, Shift, ShiftProbe, ShiftSums, ShiftedProbeSums, SpectrumBuf,
 };
 pub use grad::{
-    CG_BLOCKS, GAMMA_CHUNK, GammaCounts, GammaStacks, GradKernels, ObjProbeScale, gamma_parts,
+    CG_BLOCKS, GAMMA_CHUNK, GammaCounts, GammaStacks, GradKernels, ObjProbeScale, StackWindows,
+    gamma_parts,
 };
 pub use lsqml::{
     LSQML_REC, LsqmlAt, LsqmlChi, LsqmlKernels, LsqmlNoise, LsqmlScan, LsqmlVar, SliceSteps,
