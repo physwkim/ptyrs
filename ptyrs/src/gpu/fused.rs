@@ -573,6 +573,41 @@ pub(super) fn no_psi() -> PsiPtr {
     psi_f32(std::ptr::null_mut())
 }
 
+/// Where pass C stores a stack's new exit waves and the sums' passes read them: `psi`, or
+/// with none `bufs.work`. `FUSED_TO_PSI`, the kernel build and the leases of those passes
+/// all follow from it.
+#[derive(Clone, Copy)]
+struct NewWaves<'a>(Option<&'a dyn Waves>);
+
+impl<'a> NewWaves<'a> {
+    /// `cfg` with `FUSED_TO_PSI` as the waves go.
+    fn cfg(self, cfg: FusedCfg) -> FusedCfg {
+        let to_psi = if self.0.is_some() { FUSED_TO_PSI } else { 0 };
+        FusedCfg {
+            flags: cfg.flags & !FUSED_TO_PSI | to_psi,
+            ..cfg
+        }
+    }
+
+    /// Whether the waves are f16, which `bufs.work` never is.
+    fn half(self) -> bool {
+        self.0.is_some_and(|w| w.half())
+    }
+
+    fn waves(self, bufs: &'a FusedBufs) -> &'a dyn Waves {
+        self.0.unwrap_or(&bufs.work)
+    }
+
+    /// What pass C reads besides, then what it writes: `bufs.work` is its input, and
+    /// without a `psi` its output.
+    fn leases(self, bufs: &'a FusedBufs) -> (Option<&'a RawDeviceBuffer>, &'a RawDeviceBuffer) {
+        match self.0 {
+            Some(psi) => (Some(bufs.work.storage()), psi.raw()),
+            None => (None, bufs.work.storage()),
+        }
+    }
+}
+
 /// The per-frame sets a DM or RAAR stack carries between cycles: `psi`, and RAAR's iterate.
 #[derive(Clone, Copy, Default)]
 struct Carried<'a> {
@@ -595,7 +630,7 @@ impl<'a> Carried<'a> {
 
     /// Whether the sets are f16: the build of the forward row pass that reads them.
     fn half(&self) -> bool {
-        self.psi.is_some_and(|w| w.half())
+        self.psi.or(self.iterate).is_some_and(|w| w.half())
     }
 
     /// What the forward row pass under `flags` reads of the sets, then what it writes.
@@ -754,16 +789,15 @@ impl Kernels {
         };
         run.cols(&bufs.work, bufs, &far, p, cfg)?;
         run.far_sums(bufs, far)?;
-        let to_psi = if psi.is_some() { FUSED_TO_PSI } else { 0 };
         // RAAR's inverse pass only stores `P(R)`: its mix is all in the forward pass.
         let cfg = FusedCfg {
-            flags: dm_flag | to_psi | shift_flags,
+            flags: dm_flag | shift_flags,
             ..fwd
         };
-        let waves: &dyn Waves = psi.unwrap_or(&bufs.work);
+        let out = NewWaves(psi);
         match &shift {
             Some(sh) => {
-                run.shift_rows_inv(sh, bufs, psi, p, cfg)?;
+                run.shift_rows_inv(sh, bufs, out, p, cfg)?;
                 if shift_probe.is_some() {
                     run.shift_post(sh, p)?;
                 }
@@ -778,17 +812,17 @@ impl Kernels {
                     run.shift_probe_sums(sh, p, sums)?;
                 }
                 if let Some(sums) = obj_sums {
-                    run.gather_shifted(sh, p, cfg, sums)?;
+                    run.gather_shifted(sh, p, out.cfg(cfg), sums)?;
                 }
             }
             None => {
-                run.rows_inv(bufs, psi, p, cfg)?;
+                run.rows_inv(bufs, out, p, cfg)?;
                 if let Some(sums) = probe_sums {
                     debug_assert!(run.walked_down(), "psi_to_probe after an up walk");
-                    self.psi_to_probe(ctx, inputs.views, stack, waves, inputs.obj, sums)?;
+                    self.psi_to_probe(ctx, inputs.views, stack, out.waves(bufs), inputs.obj, sums)?;
                 }
                 if let Some(sums) = obj_sums {
-                    run.gather(bufs, waves, p, cfg, sums)?;
+                    run.gather(bufs, out, p, cfg, sums)?;
                 }
             }
         }
@@ -1543,15 +1577,16 @@ impl<'a> Run<'a> {
         Ok(())
     }
 
-    /// Pass C from `bufs.work` to `psi` (under `FUSED_TO_PSI`) or back to `bufs.work`;
-    /// reads `psi`, the probe and the object under `FUSED_DM`.
+    /// Pass C from `bufs.work` to `out`; reads `psi`, the probe and the object under
+    /// `FUSED_DM`.
     fn rows_inv(
         &self,
         bufs: &FusedBufs,
-        psi: Option<&dyn Waves>,
+        out: NewWaves<'_>,
         p: FusedPtrs,
         cfg: FusedCfg,
     ) -> Result<(), Error> {
+        let cfg = out.cfg(cfg);
         let cfg = if cfg.flags & FUSED_DM != 0 {
             self.walk_with(cfg)
         } else {
@@ -1559,19 +1594,14 @@ impl<'a> Run<'a> {
         };
         let config = self.sh.rows(&self.g, false)?;
         let mut reads = vec![self.inputs.views.addr().storage(), self.stack.storage()];
-        let mut writes = vec![];
-        match psi {
-            Some(psi) if cfg.flags & FUSED_TO_PSI != 0 => {
-                reads.push(bufs.work.storage());
-                writes.push(psi.raw());
-            }
-            _ => writes.push(bufs.work.storage()),
-        }
+        let (work, write) = out.leases(bufs);
+        reads.extend(work);
+        let writes = [write];
         if cfg.flags & FUSED_DM != 0 {
             reads.push(self.inputs.obj.storage());
             reads.push(self.inputs.probe.storage());
         }
-        let half = psi.is_some_and(|w| w.half());
+        let half = out.half();
         let (ctl, g) = (self.ctl(), self.g);
         self.k.launch(self.ctx, &reads, &writes, |stream| {
             let m = &self.k.module;
@@ -1591,20 +1621,21 @@ impl<'a> Run<'a> {
         })
     }
 
-    /// The object sums from `waves`, the new exit waves pass C stored under `cfg`, and
-    /// `bufs.probe_q` and `bufs.probe_power`.
+    /// The object sums from `out`, the new exit waves pass C stored, and `bufs.probe_q` and
+    /// `bufs.probe_power`.
     fn gather(
         &self,
         bufs: &FusedBufs,
-        waves: &dyn Waves,
+        out: NewWaves<'_>,
         p: FusedPtrs,
         cfg: FusedCfg,
         sums: &mut UpdateSums,
     ) -> Result<(), Error> {
+        let cfg = out.cfg(cfg);
         let views = self.inputs.views;
         let [start, len, list] = views.tile_storages();
         let reads = [
-            waves.raw(),
+            out.waves(bufs).raw(),
             bufs.probe_q.storage(),
             bufs.probe_power.storage(),
             views.addr().storage(),
@@ -1616,12 +1647,12 @@ impl<'a> Run<'a> {
         let config = views.dims().stack_tile_grid(self.g.nf_max)?;
         let (tiles, ctl, g) = (views.tile_ptrs(), self.ctl(), self.g);
         self.k.launch(self.ctx, &reads, &sums.storages(), |stream| {
-            // SAFETY: as `psi_to_obj`, with `waves` where `cfg` has pass C store them and
+            // SAFETY: as `psi_to_obj`, with the waves where `cfg` has pass C store them and
             // `probe_q` and `probe_power` checked with the rest of `bufs`; the tile lists
             // were built from these views.
             unsafe {
                 let (m, sums) = (&self.k.module, sums.ptrs());
-                if waves.half() {
+                if out.half() {
                     m.fused_gather_f16(stream, config, p, tiles, sums, ctl, g, cfg)
                 } else {
                     m.fused_gather(stream, config, p, tiles, sums, ctl, g, cfg)
@@ -1744,10 +1775,11 @@ impl<'a> Run<'a> {
         &self,
         sh: &Shifted<'_>,
         bufs: &FusedBufs,
-        psi: Option<&dyn Waves>,
+        out: NewWaves<'_>,
         p: FusedPtrs,
         cfg: FusedCfg,
     ) -> Result<(), Error> {
+        let cfg = out.cfg(cfg);
         let cfg = if cfg.flags & FUSED_DM != 0 {
             self.walk_with(cfg)
         } else {
@@ -1759,13 +1791,9 @@ impl<'a> Run<'a> {
         };
         let f = cfg.flags;
         let (mut reads, mut writes) = self.shift_terms(sh, f);
-        match psi {
-            Some(psi) if f & FUSED_TO_PSI != 0 => {
-                reads.push(bufs.work.storage());
-                writes.push(psi.raw());
-            }
-            _ => writes.push(bufs.work.storage()),
-        }
+        let (work, write) = out.leases(bufs);
+        reads.extend(work);
+        writes.push(write);
         let s = sh.scratch;
         // Under `FUSED_SHIFT_PROBE` `shift_terms` already lists `T_y`'s plane as written.
         if f & FUSED_SHIFT_PROBE == 0 && f & (FUSED_SHIFT_DEN | FUSED_SHIFT_POSITION) != 0 {
@@ -1777,7 +1805,7 @@ impl<'a> Run<'a> {
         if f & FUSED_SHIFT_POSITION != 0 {
             writes.push(s.grad_groups.storage());
         }
-        let half = psi.is_some_and(|w| w.half());
+        let half = out.half();
         let (ctl, g) = (self.ctl(), self.g);
         self.k.launch(self.ctx, &reads, &writes, |stream| {
             let m = &self.k.module;
