@@ -752,7 +752,7 @@ impl Kernels {
             flags: pass | run.model_flags() | far.flags(),
             ..fwd
         };
-        run.cols(bufs, &far, p, cfg)?;
+        run.cols(&bufs.work, bufs, &far, p, cfg)?;
         run.far_sums(bufs, far)?;
         let to_psi = if psi.is_some() { FUSED_TO_PSI } else { 0 };
         // RAAR's inverse pass only stores `P(R)`: its mix is all in the forward pass.
@@ -851,7 +851,7 @@ impl Kernels {
     /// as [`Self::fused_llk`] leaves them for its column pass; and `T` into `t`, `[nf_max *
     /// nprobe, ny, nx]`: `W_p` of frame `fl` is the unnormalized row IDFT of plane `fl *
     /// nprobe + p`, in the exit waves' layout. The model's scale and background are not read.
-    /// Two launches.
+    /// Two launches, the first [`Self::shifted_probe`]'s.
     pub fn shifted_rows_fwd(
         &self,
         ctx: &ExecutionContext,
@@ -861,20 +861,31 @@ impl Kernels {
         work: &mut DeviceBuffer<C32>,
     ) -> Result<(), Error> {
         let run = Run::checked(self, ctx, *inputs, stack)?;
-        let Some(model) = inputs.model.shift else {
-            return Err(Error::Shape("shifted_rows_fwd needs a Model::shift".into()));
-        };
         let d = inputs.views.dims();
-        let (n, nf) = (d.n(), run.g.nf_max as usize);
-        check_len("t", t, nf * d.nprobe as usize * n)?;
-        check_len("work", work, nf * d.nmode as usize * n)?;
+        check_len(
+            "work",
+            work,
+            run.g.nf_max as usize * d.nmode as usize * d.n(),
+        )?;
         let p = FusedPtrs {
-            shift: dptr(t),
             work: dptr(work),
-            ..run.input_ptrs()
+            ..run.shifted_probe(t)?
         };
-        run.shift_pre(&model, t, None, p)?;
         run.shift_rows_fwd(t, work, Carried::default(), p, FusedCfg::default())
+    }
+
+    /// The first launch of [`Self::shifted_rows_fwd`] alone: `T` into `t`, as there, from
+    /// the [`Model::shift`] of `inputs`. The object is not read.
+    pub fn shifted_probe(
+        &self,
+        ctx: &ExecutionContext,
+        inputs: &FusedInputs<'_>,
+        stack: StackRef<'_>,
+        t: &mut DeviceBuffer<C32>,
+    ) -> Result<(), Error> {
+        Run::checked(self, ctx, *inputs, stack)?
+            .shifted_probe(t)
+            .map(drop)
     }
 
     /// The stack's far sums of the far field of `PO`, the one `obj_probe_to_psi` and the FFT
@@ -924,13 +935,40 @@ impl Kernels {
             e.kernels
                 .exit_on(ctx, d, stack, e.stage, &bufs.work, false)?;
         }
-        let cfg = FusedCfg {
-            flags: run.model_flags() | far.flags(),
-            alpha: 0.0,
-            beta: 0.0,
+        run.rows_llk(&bufs.work, bufs, far, p)
+    }
+
+    /// The column half of [`Self::propagated_llk`] over `rows`, `[nf_max * nmode, ny, nx]`,
+    /// in place of the row transforms it makes: the far sums of the field whose row
+    /// transforms, any stage applied, the caller left there. Of `inputs` the object, the
+    /// probe and a [`Model::shift`] are not read; `rows` is.
+    pub fn rows_llk(
+        &self,
+        ctx: &ExecutionContext,
+        inputs: &FusedInputs<'_>,
+        stack: StackRef<'_>,
+        rows: &mut DeviceBuffer<C32>,
+        bufs: &mut FusedBufs,
+        far: FarSums<'_>,
+    ) -> Result<(), Error> {
+        let bufs = &*bufs;
+        let model = Model {
+            shift: None,
+            ..inputs.model
         };
-        run.cols(bufs, &far, p, cfg)?;
-        run.far_sums(bufs, far)
+        let (run, _) = Run::new(self, ctx, FusedInputs { model, ..*inputs }, stack, bufs)?;
+        run.check_far(&far)?;
+        let d = inputs.views.dims();
+        check_len(
+            "rows",
+            rows,
+            run.g.nf_max as usize * d.nmode as usize * d.n(),
+        )?;
+        let p = FusedPtrs {
+            work: dptr(rows),
+            ..run.ptrs(bufs, &far)
+        };
+        run.rows_llk(rows, bufs, far, p)
     }
 
     /// Poisson's fixed-point background step from `sums`, `b[j] = b[j] sum[j] / nobs[j]`
@@ -1366,10 +1404,46 @@ impl<'a> Run<'a> {
         })
     }
 
-    /// Pass B on `bufs.work`; reads the model's buffers and writes `bufs.groups`,
+    /// `T` of the stack's frames into `t` from the inputs' [`Model::shift`], and the
+    /// addresses of the launch, `t` at `shift`.
+    fn shifted_probe(&self, t: &DeviceBuffer<C32>) -> Result<FusedPtrs, Error> {
+        let Some(model) = self.inputs.model.shift else {
+            return Err(Error::Shape(
+                "the shifted probe needs a Model::shift".into(),
+            ));
+        };
+        let d = self.inputs.views.dims();
+        check_len("t", t, self.g.nf_max as usize * d.nprobe as usize * d.n())?;
+        let p = FusedPtrs {
+            shift: dptr(t),
+            ..self.input_ptrs()
+        };
+        self.shift_pre(&model, t, None, p)?;
+        Ok(p)
+    }
+
+    /// The `far` sums of the field whose row transforms `work`, at `p.work`, holds.
+    fn rows_llk(
+        &self,
+        work: &DeviceBuffer<C32>,
+        bufs: &FusedBufs,
+        far: FarSums<'_>,
+        p: FusedPtrs,
+    ) -> Result<(), Error> {
+        let cfg = FusedCfg {
+            flags: self.model_flags() | far.flags(),
+            alpha: 0.0,
+            beta: 0.0,
+        };
+        self.cols(work, bufs, &far, p, cfg)?;
+        self.far_sums(bufs, far)
+    }
+
+    /// Pass B on `work`, at `p.work`; reads the model's buffers and writes `bufs.groups`,
     /// `bufs.scale_groups` and the background ratios of `far` under their flags.
     fn cols(
         &self,
+        work: &DeviceBuffer<C32>,
         bufs: &FusedBufs,
         far: &FarSums<'_>,
         p: FusedPtrs,
@@ -1380,9 +1454,9 @@ impl<'a> Run<'a> {
         let mut reads = vec![self.inputs.counts.storage(), self.stack.storage()];
         let mut writes = vec![];
         if cfg.flags & (FUSED_PROJECT | FUSED_GRAD) != 0 {
-            writes.push(bufs.work.storage());
+            writes.push(work.storage());
         } else {
-            reads.push(bufs.work.storage());
+            reads.push(work.storage());
         }
         if cfg.flags & FUSED_SCALE != 0 {
             reads.extend(self.inputs.model.scale.map(|b| b.storage()));

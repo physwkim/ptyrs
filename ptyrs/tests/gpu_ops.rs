@@ -11,11 +11,11 @@ use cuda_async::error::DeviceError;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, DeviceCopy, DriverError};
 use ptyrs::fft::{FftError, Plan2d};
 use ptyrs::gpu::{
-    BackgroundSums, C32, Error, Exit, FUSED_SIDES, FarSums, FusedBufs, FusedInputs, FusedSums,
-    HalfWaves, Kernels, Lines, LlkPartial, LlkScratch, LlkSums, MASKED, Model, OBJ_TILE,
-    Permutation, PositionPartial, ProbeSpectrum, PsiSums, ScalePartial, Shift, ShiftSums,
-    ShiftedProbeSums, SpectrumBuf, StackCtl, StackRef, StackTable, UpdateSums, ViewAddr, ViewDims,
-    Views, Waves, half_scale, lease, record, view_tiles,
+    BackgroundSums, C32, Error, Exit, ExitPass, ExitStage, FUSED_SIDES, FarSums, FusedBufs,
+    FusedInputs, FusedSums, HalfWaves, Kernels, Lines, LlkPartial, LlkScratch, LlkSums, MASKED,
+    Model, OBJ_TILE, OpticsKernels, Permutation, PositionPartial, ProbeSpectrum, PsiSums,
+    ScalePartial, Shift, ShiftSums, ShiftedProbeSums, SpectrumBuf, StackCtl, StackRef, StackTable,
+    UpdateSums, ViewAddr, ViewDims, Views, Waves, half_scale, lease, record, view_tiles,
 };
 
 #[path = "common/worst.rs"]
@@ -5034,6 +5034,92 @@ fn shifted_rows_fwd_matches_fused_llk_and_f64() {
                 println!("shifted_rows_fwd W {frame:?} frame {f}: rel L2 {err:.2e}");
                 assert!(err < 1e-5, "{frame:?} frame {f}: W rel L2 {err:.2e}");
             }
+        }
+    }
+}
+
+/// `shifted_probe`'s `t` is `shifted_rows_fwd`'s, and `rows_llk` over `shifted_rows_fwd`'s
+/// row transforms, a stage applied, gives `propagated_llk`'s far sums under a scale and a
+/// background, bit for bit, from bufs without the shift scratch; on [`FUSED_CASES`].
+#[test]
+fn shifted_probe_and_rows_llk_are_the_halves_of_their_wholes() {
+    let (stream, ex, k) = setup();
+    let optics = OpticsKernels::load(&k).unwrap();
+    for (frame, modes) in FUSED_CASES {
+        let (fs, _) = FusedScan::shifted(&stream, frame, modes);
+        let (s, n) = (&fs.s, fs.s.n());
+        let np = s.d.nprobe as usize;
+        let offsets = up(&stream, SHIFTS.as_flattened());
+        let mut spec = SpectrumBuf::zeroed(&stream, &s.d).unwrap();
+        let spectrum = k.probe_spectrum(&ex, &s.d, &fs.probe, &mut spec).unwrap();
+        let scale = up(&stream, &[0.7f32, 1.3, 1.0, 0.9, 1.1]);
+        let background = up(&stream, &vec![0.5f32; n]);
+        let shifted = shifted_inputs(&fs, &offsets, spectrum);
+        let inputs = FusedInputs {
+            model: Model {
+                scale: Some(&scale),
+                background: Some(&background),
+                ..shifted.model
+            },
+            ..shifted
+        };
+        let stacks = [0..3, 3..5];
+        let table = StackTable::new(&stream, &s.d, &stacks).unwrap();
+        let mut whole = FusedBufs::with_shift(&stream, &s.d, 3).unwrap();
+        let mut half = FusedBufs::new(&stream, &s.d, 3).unwrap();
+        let zt = || DeviceBuffer::<C32>::zeroed(&stream, 3 * np * n).unwrap();
+        let (mut t, mut t_alone) = (zt(), zt());
+        let mut rows = DeviceBuffer::<C32>::zeroed(&stream, s.nk(&(0..3)) * n).unwrap();
+        for stage in [None, Some(ExitStage::Reverse)] {
+            let exit = stage.as_ref().map(|stage| ExitPass {
+                kernels: &optics,
+                stage,
+                scale: n as f32,
+            });
+            let zl = || DeviceBuffer::<LlkPartial>::zeroed(&stream, 3).unwrap();
+            let zs = || DeviceBuffer::<ScalePartial>::zeroed(&stream, 5).unwrap();
+            let zb = || BackgroundSums::zeroed(&stream, &s.d, 3).unwrap();
+            let (mut llk, mut llk_half) = (zl(), zl());
+            let (mut sums, mut sums_half) = (zs(), zs());
+            let (mut bg, mut bg_half) = (zb(), zb());
+            for (i, frames) in stacks.iter().enumerate() {
+                let stack = table.at(i);
+                let what = format!("{frame:?} {frames:?} stage {}", stage.is_some());
+                let far = FarSums {
+                    background: Some(&mut bg),
+                    ..far_both(&mut llk, &mut sums)
+                };
+                k.propagated_llk(&ex, &inputs, stack, &mut whole, far, exit)
+                    .unwrap();
+                k.shifted_rows_fwd(&ex, &inputs, stack, &mut t, &mut rows)
+                    .unwrap();
+                k.shifted_probe(&ex, &inputs, stack, &mut t_alone).unwrap();
+                let len = (frames.end - frames.start) as usize * np * n;
+                let bits =
+                    |b: &DeviceBuffer<C32>| c32_bits(&b.to_host_vec(&stream).unwrap()[..len]);
+                assert!(bits(&t_alone) == bits(&t), "{what}: t differs");
+                if let Some(stage) = &stage {
+                    optics
+                        .exit(&ex, &s.d, stack, stage, &mut rows, false)
+                        .unwrap();
+                }
+                let far = FarSums {
+                    background: Some(&mut bg_half),
+                    ..far_both(&mut llk_half, &mut sums_half)
+                };
+                k.rows_llk(&ex, &inputs, stack, &mut rows, &mut half, far)
+                    .unwrap();
+                let l = |b: &DeviceBuffer<LlkPartial>| llk_bits(&b.to_host_vec(&stream).unwrap());
+                assert!(l(&llk_half) == l(&llk), "{what}: LLK partials differ");
+            }
+            let sc = |b: &DeviceBuffer<ScalePartial>| scale_bits(&b.to_host_vec(&stream).unwrap());
+            assert!(sc(&sums_half) == sc(&sums), "{frame:?}: scale sums differ");
+            let b = |b: &BackgroundSums| f32_bits(&b.sum.to_host_vec(&stream).unwrap());
+            assert!(b(&bg_half) == b(&bg), "{frame:?}: background sums differ");
+            assert!(
+                b(&bg).iter().any(|&v| v != 0),
+                "{frame:?}: no background sum"
+            );
         }
     }
 }

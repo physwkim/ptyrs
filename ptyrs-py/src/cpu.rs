@@ -76,7 +76,7 @@ impl Exit {
 /// several object slices (`with_slices`).
 #[pyclass(frozen)]
 pub(crate) struct Optics {
-    inner: ptyrs::engine::Optics,
+    pub(crate) inner: ptyrs::engine::Optics,
     exit: Exit,
 }
 
