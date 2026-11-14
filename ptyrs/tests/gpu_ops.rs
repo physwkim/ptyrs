@@ -18,6 +18,10 @@ use ptyrs::gpu::{
     Views, Waves, half_scale, lease, record, view_tiles,
 };
 
+#[path = "common/worst.rs"]
+mod worst;
+use worst::worst_of;
+
 type Z = (f64, f64);
 
 /// A stream, an eager execution context on it (its leases end when the test drops it) and
@@ -1419,11 +1423,11 @@ fn dm_reflect_and_add_match_f64() {
         .unwrap();
     let want: Vec<Z> = po_host.iter().map(|&c| z(c)).collect();
     let e_fix = rel_l2(&psi.to_host_vec(&stream).unwrap(), &want);
-    let rest = po
-        .to_host_vec(&stream)
-        .unwrap()
-        .iter()
-        .fold(0.0f32, |m, c| m.max(c.re.abs()).max(c.im.abs()));
+    let po = po.to_host_vec(&stream).unwrap();
+    let rest = worst_of(
+        po.iter()
+            .flat_map(|c| [c.re.abs() as f64, c.im.abs() as f64]),
+    );
     println!("dm_reflect fixed point: psi rel L2 {e_fix:.2e}, max |po| {rest:.2e}");
     assert!(e_fix < 1e-6 && rest < 1e-6);
 }
