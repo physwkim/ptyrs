@@ -929,7 +929,7 @@ mod tests {
             let n = self.ring.slot_elems();
             for k in frames.clone() {
                 let (x, y) = c.pos[k];
-                self.table.insert(k as i32, Pos { x, y, t_rx: 0 });
+                self.table.insert(k as i32, Pos::new(x, y, 0));
                 let mut s = self.ring.reserve();
                 s.frame().copy_from_slice(&c.counts[k * n..(k + 1) * n]);
                 s.commit(k as i32, 0, 0);

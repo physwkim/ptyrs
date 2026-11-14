@@ -434,21 +434,16 @@ fn index(
         })?;
         for j in 0..n as usize {
             let uid = a.uid[j];
-            let p = Pos {
-                x: a.x[j],
-                y: a.y[j],
-                t_rx: t,
-            };
             // The file is the record of the scan: one it cannot give is not a lost frame.
-            if !p.valid() {
+            let Some(p) = Pos::new(a.x[j], a.y[j], t) else {
                 return Err(format!(
                     "frame {} (uid {uid}): position ({}, {}) is not a scan position",
                     next + j as u64,
-                    p.x,
-                    p.y
+                    a.x[j],
+                    a.y[j]
                 ));
-            }
-            pos.insert(uid, p);
+            };
+            pos.insert(uid, Some(p));
             let t_pub = (a.sec[j] as i64 + EPICS_EPOCH_S) * 1_000_000_000 + a.nsec[j] as i64;
             let job = Job {
                 index: next + j as u64,
@@ -630,8 +625,8 @@ mod tests {
             assert_eq!(decoded(w), bytemuck_u16(&frame(w.uid)), "uid {}", w.uid);
             assert_eq!(w.t_pub, wall_of(w.uid));
             let p = pos.get(w.uid).expect("position posted");
-            assert_eq!((p.x, p.y), pos_of(w.uid));
-            assert!(p.t_rx <= w.t_rx, "uid {}: frame before position", w.uid);
+            assert_eq!((p.x(), p.y()), pos_of(w.uid));
+            assert!(p.t_rx() <= w.t_rx, "uid {}: frame before position", w.uid);
         }
         // One stamp per read, in queue order: a closed file's frames are
         // all visible at one instant but are not received at one.

@@ -1,6 +1,6 @@
 """pty-chi BH and Gaussian LSQML on a near-field case: epochs and GPU time to 1% of the truth LLK.
 
-    run_near.py run <out> [--only RUN,...] [--epochs N]   pty-chi on the visible GPU, <out>/<run>.json
+    run_near.py run <out> [--only RUN,...] [--epochs N]   pty-chi, visible GPU, <out>/<run>.json
     run_near.py ptyrs <out> [--epochs N]                  ptyrs CPU f64, <out>/ptyrs_<spec>.txt
     run_near.py compare <out>                             epochs and seconds to the target
     run_near.py run <out> --case fresnel|fresnel_back     pty-chi on a Fresnel case
