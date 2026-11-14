@@ -51,11 +51,14 @@ impl Positions {
     /// PyNX `PtychoData.__init__` position preprocessing: subtract the mean, then if every
     /// position shares one sub-pixel offset (within 0.02 px), remove it and snap to whole
     /// object pixels. `pixel` is `[py, px]` from [`crate::base::Geometry::pixel_size_object`].
+    ///
+    /// # Panics
+    ///
+    /// For an infinite `pixel`, whose snap gives NaN, or a position more than 1e10 m from
+    /// the scan's mean: either leaves a coordinate outside [`Positions::valid`].
     pub fn pynx_preprocess(&self, pixel: [f64; 2]) -> Positions {
-        Positions {
-            y: pynx_axis(&self.y, pixel[0]),
-            x: pynx_axis(&self.x, pixel[1]),
-        }
+        Positions::new(pynx_axis(&self.y, pixel[0]), pynx_axis(&self.x, pixel[1]))
+            .expect("preprocessed positions")
     }
 
     /// Positions in object pixels, `[y, x]` per frame.
@@ -142,5 +145,24 @@ mod tests {
     #[test]
     fn rejects_direct_beam_marker() {
         assert!(Positions::new(vec![2e10], vec![0.0]).is_err());
+    }
+
+    #[test]
+    #[should_panic(expected = "preprocessed positions")]
+    fn preprocess_panics_for_an_infinite_pixel() {
+        let x = vec![0.0, 1e-8];
+        Positions::new(x.clone(), x)
+            .unwrap()
+            .pynx_preprocess([f64::INFINITY; 2]);
+    }
+
+    #[test]
+    #[should_panic(expected = "preprocessed positions")]
+    fn preprocess_panics_beyond_1e10_m_from_the_mean() {
+        // mean 1e10 / 3: the last position lands 4e10 / 3 m from it
+        let x = vec![1e10, 1e10, -1e10];
+        Positions::new(x.clone(), x)
+            .unwrap()
+            .pynx_preprocess([1e-8; 2]);
     }
 }
