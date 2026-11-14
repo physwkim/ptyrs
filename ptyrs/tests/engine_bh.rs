@@ -90,7 +90,7 @@ fn cost(p: &Ptycho, optics: &Optics, frames: Range<usize>, object: &Object, prob
     let views = batch(p, frames.clone());
     let mut psi = vec![C64::default(); views.len() * probe.plane_len()];
     obj_probe_to_psi(views, object, probe, optics.quad(), &mut psi);
-    optics.propagator().forward(&mut psi);
+    optics.exit().forward(&mut psi);
     llk(p.observed(), frames, p.addr().nmode(), &psi).euclidian / 4.0
 }
 

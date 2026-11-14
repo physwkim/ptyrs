@@ -192,7 +192,7 @@ impl Views {
     ) -> PyResult<Self> {
         let counts = crate::counts_in(counts)?;
         let [nframe, ny, nx] = counts.dims();
-        let plane = optics.get().inner.propagator().shape();
+        let plane = optics.get().inner.exit().shape();
         if [ny, nx] != plane {
             return Err(PyValueError::new_err(format!(
                 "{:?} frames on the optics' {plane:?} plane",
@@ -243,7 +243,7 @@ fn far_field(
     let views = p.addr().views();
     let mut psi = vec![C64::default(); views.len() * probe.plane_len()];
     obj_probe_to_psi(views, object, probe, optics.quad(), &mut psi);
-    optics.propagator().forward(&mut psi);
+    optics.exit().forward(&mut psi);
     psi
 }
 

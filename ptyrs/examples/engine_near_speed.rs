@@ -99,7 +99,7 @@ fn llk_of(s: &State, object: &Object, probe: &Probe) -> Llk {
     let views = s.addr.views();
     let mut psi = vec![C64::default(); views.len() * probe.plane_len()];
     obj_probe_to_psi(views, object, probe, s.optics.quad(), &mut psi);
-    s.optics.propagator().forward(&mut psi);
+    s.optics.exit().forward(&mut psi);
     llk(&s.obs, 0..s.addr.nframe(), s.addr.nmode(), &psi).normalised(s.obs.nb_obs())
 }
 

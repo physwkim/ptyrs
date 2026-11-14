@@ -94,14 +94,19 @@ fn state() -> State {
         .iter()
         .map(|c| {
             // kind 0 is the far field at detector distance c[3], detector pixel λz/(ny·c[2])
-            let (optics, pixel) = if c[4] == 0.0 {
+            let (optics, pixel, kind) = if c[4] == 0.0 {
                 let lz = c[1] * c[3];
                 let g = Geometry::new(c[1], c[3], lz / (SHAPE[0] as f64 * c[2]), SHAPE).unwrap();
-                (Optics::far_field(&g), g.pixel_size_object())
+                (Optics::far_field(&g), g.pixel_size_object(), 0)
             } else {
                 let pixel = [c[2], c[2]];
                 let w = Wavefield::new(SHAPE, c[1], pixel, c[3]).unwrap();
-                (Optics::free_space(&w), pixel)
+                let kind = match Propagator::free_space(&w) {
+                    Propagator::Fourier(_) => 0,
+                    Propagator::AngularSpectrum(_) => 1,
+                    Propagator::Fresnel(_) => 2,
+                };
+                (Optics::free_space(&w), pixel, kind)
             };
             let gaps: Vec<_> = c[7..]
                 .iter()
@@ -109,12 +114,7 @@ fn state() -> State {
                 .collect();
             assert_eq!(gaps.len(), NSLICE - 1);
             let optics = optics.with_slices(&gaps).unwrap();
-            let p = optics.propagator();
-            let kind = match p {
-                Propagator::Fourier(_) => 0,
-                Propagator::AngularSpectrum(_) => 1,
-                Propagator::Fresnel(_) => 2,
-            };
+            let p = optics.exit();
             assert_eq!(kind, c[4] as usize, "kind of case {}", c[0]);
             assert!(
                 rel(p.intensity_scale(), c[5]) <= 1e-15,
@@ -148,7 +148,7 @@ fn propagated(views: &[View], c: &Case, objects: &[Object], probe: &Probe) -> Ve
     let mut psi = SliceWaves::new(&c.optics, views, objects, probe)
         .psi()
         .to_vec();
-    c.optics.propagator().forward(&mut psi);
+    c.optics.exit().forward(&mut psi);
     psi
 }
 

@@ -74,7 +74,7 @@ fn state() -> (AddrTable, Object, Probe, Vec<(Optics, Observed)>) {
         .map(|c| {
             let w = Wavefield::new(SHAPE, c[1], [c[2], c[2]], c[3]).unwrap();
             let optics = Optics::free_space(&w);
-            let kind = match optics.propagator() {
+            let kind = match Propagator::free_space(&w) {
                 Propagator::Fourier(_) => 0,
                 Propagator::AngularSpectrum(_) => 1,
                 Propagator::Fresnel(_) => 2,
