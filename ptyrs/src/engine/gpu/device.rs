@@ -1125,8 +1125,8 @@ impl Shared {
         // the adjoint planes, first (0); the inverse row pass (3) reads both and writes the
         // adjoint, object planes and power, `shift_post` and the probe sums take the adjoint
         // (4), `gather_shifted` the rest (5). Under its windows, as AP runs a stack: the
-        // sampler's launches, three a block, write the windows (2) and their derivatives over
-        // `y` (5) and `x` (8); two memsets zero the window sums (9, 10), which the fused passes
+        // sampler's calls, three launches each, write the windows (0 to 2) and their
+        // derivatives over `y` (3 to 5) and `x` (6 to 8); two memsets zero the window sums (9, 10), which the fused passes
         // (11 to 14) add to; the position sums (15) read the work planes and the three blocks,
         // the probe sums (16) the work planes and the windows; placing the window sums back
         // takes six launches (17 to 22). The LLK pass and DM's and RAAR's updates run a subset.
@@ -1146,16 +1146,15 @@ impl Shared {
                 ]
             }
             PositionScratch::Windows { sample, place } => {
-                let block = Windows::bytes(dims);
-                vec![
-                    Streamed::new(wave, 11..=16),
-                    Streamed::new(block, 2..=16),
-                    Streamed::new(block, 5..=15),
-                    Streamed::new(block, 8..=15),
-                    Streamed::new(Windows::sums_bytes(dims), 9..=18),
-                    Streamed::fixed(sample, 0..=8),
-                    Streamed::fixed(place, 17..=22),
+                let (block, sums) = (Windows::bytes(dims), Windows::sums_bytes(dims));
+                [
+                    vec![Streamed::new(wave, 11..=16)],
+                    Streamed::chunked(sample, 0..=2, &[(block, 16)], &[]),
+                    Streamed::chunked(sample, 3..=5, &[(block, 15)], &[]),
+                    Streamed::chunked(sample, 6..=8, &[(block, 15)], &[]),
+                    Streamed::chunked(place, 17..=22, &[], &[(sums, 9)]),
                 ]
+                .concat()
             }
         };
         if sliced {
