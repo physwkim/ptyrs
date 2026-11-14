@@ -3,6 +3,7 @@
 
 use std::f64::consts::PI;
 
+use burn::module::Param;
 use burn::nn::conv::{Conv2d, Conv2dConfig};
 use burn::nn::{BatchNorm, BatchNormConfig, PaddingConfig2d};
 use burn::prelude::*;
@@ -40,6 +41,69 @@ impl Block {
         let x = relu(self.na.forward(self.a.forward(x)));
         relu(self.nb.forward(self.b.forward(x)))
     }
+
+    fn fold(&self) -> [Conv2d; 2] {
+        [fold(&self.a, &self.na), fold(&self.b, &self.nb)]
+    }
+}
+
+/// `c` followed by `n` at its running statistics as one convolution.
+fn fold(c: &Conv2d, n: &BatchNorm) -> Conv2d {
+    let [co] = n.gamma.shape().dims();
+    let s = n.gamma.val() / (n.running_var.value() + n.epsilon).sqrt();
+    let bias = c.bias.as_ref().expect("Block's convolutions carry a bias");
+    Conv2d {
+        weight: Param::from_tensor(c.weight.val() * s.clone().reshape([co, 1, 1, 1])),
+        bias: Some(Param::from_tensor(
+            (bias.val() - n.running_mean.value()) * s + n.beta.val(),
+        )),
+        ..c.clone()
+    }
+}
+
+/// One stage of [`run`]: a [`Block`], or its two convolutions with the normalisation folded in.
+trait Stage {
+    fn forward(&self, x: Tensor<4>) -> Tensor<4>;
+}
+
+impl Stage for Block {
+    fn forward(&self, x: Tensor<4>) -> Tensor<4> {
+        Block::forward(self, x)
+    }
+}
+
+impl Stage for [Conv2d; 2] {
+    fn forward(&self, x: Tensor<4>) -> Tensor<4> {
+        relu(self[1].forward(relu(self[0].forward(x))))
+    }
+}
+
+/// The decoder's stages, each followed by a nearest 2× upsampling, then its output convolution.
+fn decode<S: Stage>(stages: &[S], out: &Conv2d, mut x: Tensor<4>) -> Tensor<4> {
+    for s in stages {
+        let [_, _, h, w] = x.dims();
+        x = interpolate(
+            s.forward(x),
+            InterpolateOptions::new(InterpolateMode::Nearest).with_output_size([2 * h, 2 * w]),
+        );
+    }
+    out.forward(x)
+}
+
+/// The network over its stages: the encoder's, each followed by a 2× max pool, then each
+/// decoder's with its output convolution and range map.
+fn run<S: Stage>(
+    encoder: &[S],
+    amp: (&[S], &Conv2d),
+    phase: (&[S], &Conv2d),
+    mut x: Tensor<4>,
+) -> (Tensor<4>, Tensor<4>) {
+    for s in encoder {
+        x = max_pool2d(s.forward(x), MaxPoolOptions::new([2, 2]));
+    }
+    let a = sigmoid(decode(amp.0, amp.1, x.clone())) * 2.0;
+    let p = tanh(decode(phase.0, phase.1, x)) * PI;
+    (a, p)
 }
 
 /// Upsampling decoder ending in one output channel (before its range map).
@@ -61,20 +125,16 @@ impl Decoder {
         Self { blocks, out }
     }
 
-    fn forward(&self, mut x: Tensor<4>) -> Tensor<4> {
-        for b in &self.blocks {
-            let [_, _, h, w] = x.dims();
-            x = interpolate(
-                b.forward(x),
-                InterpolateOptions::new(InterpolateMode::Nearest).with_output_size([2 * h, 2 * w]),
-            );
-        }
-        self.out.forward(x)
+    fn fold(&self) -> (Vec<[Conv2d; 2]>, Conv2d) {
+        (
+            self.blocks.iter().map(Block::fold).collect(),
+            self.out.clone(),
+        )
     }
 }
 
 /// PtychoNN with `depth` encoder stages of `width << k` channels, each halving the image, and
-/// two mirror decoders. Input `[batch, 1, n, n]` with `n` a multiple of `2^depth`; output object
+/// two mirror decoders. Input `[batch, channels, n, n]` with `n` a multiple of `2^depth`; output object
 /// amplitude in `(0, 2)` (a flat object is 1) and phase in `(-π, π)`, each `[batch, 1, n, n]`.
 #[derive(Module, Debug)]
 pub struct PtychoNN {
@@ -84,12 +144,12 @@ pub struct PtychoNN {
 }
 
 impl PtychoNN {
-    pub fn new(width: usize, depth: usize, device: &Device) -> Self {
+    pub fn new(channels: usize, width: usize, depth: usize, device: &Device) -> Self {
         assert!(width >= 2 && depth >= 1, "width {width}, depth {depth}");
         let encoder = (0..depth)
             .map(|k| {
                 Block::new(
-                    if k == 0 { 1 } else { width << (k - 1) },
+                    if k == 0 { channels } else { width << (k - 1) },
                     width << k,
                     device,
                 )
@@ -107,12 +167,138 @@ impl PtychoNN {
         1 << self.encoder.len()
     }
 
-    pub fn forward(&self, mut x: Tensor<4>) -> (Tensor<4>, Tensor<4>) {
-        for b in &self.encoder {
-            x = max_pool2d(b.forward(x), MaxPoolOptions::new([2, 2]));
+    pub fn forward(&self, x: Tensor<4>) -> (Tensor<4>, Tensor<4>) {
+        run(
+            &self.encoder,
+            (&self.amp.blocks, &self.amp.out),
+            (&self.phase.blocks, &self.phase.out),
+            x,
+        )
+    }
+
+    /// The inference copy of the network at its batch-norm running statistics.
+    pub(crate) fn fold(&self) -> Folded {
+        Folded {
+            encoder: self.encoder.iter().map(Block::fold).collect(),
+            amp: self.amp.fold(),
+            phase: self.phase.fold(),
         }
-        let amp = sigmoid(self.amp.forward(x.clone())) * 2.0;
-        let phase = tanh(self.phase.forward(x)) * PI;
-        (amp, phase)
+    }
+}
+
+/// [`PtychoNN`] at inference, each batch normalisation folded into the convolution before it.
+/// On a device without autodiff batch normalisation applies its fixed running statistics, so
+/// the copy gives the network's output to rounding without the normalisation's kernels.
+#[derive(Debug)]
+pub(crate) struct Folded {
+    encoder: Vec<[Conv2d; 2]>,
+    amp: (Vec<[Conv2d; 2]>, Conv2d),
+    phase: (Vec<[Conv2d; 2]>, Conv2d),
+}
+
+impl Folded {
+    pub(crate) fn forward(&self, x: Tensor<4>) -> (Tensor<4>, Tensor<4>) {
+        run(
+            &self.encoder,
+            (&self.amp.0, &self.amp.1),
+            (&self.phase.0, &self.phase.1),
+            x,
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::nn::predictor::host;
+    use burn::module::RunningState;
+    use burn::tensor::Distribution;
+
+    /// A small network whose batch normalisations hold drawn statistics, not the identity they
+    /// start at.
+    fn normalised_net(device: &Device) -> PtychoNN {
+        let mut net = PtychoNN::new(2, 4, 2, device);
+        let draw = |n, lo, hi| Tensor::<1>::random([n], Distribution::Uniform(lo, hi), device);
+        for b in net
+            .encoder
+            .iter_mut()
+            .chain(&mut net.amp.blocks)
+            .chain(&mut net.phase.blocks)
+        {
+            for n in [&mut b.na, &mut b.nb] {
+                let [c] = n.gamma.shape().dims();
+                n.gamma = Param::from_tensor(draw(c, 0.5, 2.0));
+                n.beta = Param::from_tensor(draw(c, -1.0, 1.0));
+                n.running_mean = RunningState::new(draw(c, -1.0, 1.0));
+                n.running_var = RunningState::new(draw(c, 0.2, 3.0));
+            }
+        }
+        net
+    }
+
+    fn h<const D: usize>(t: Tensor<D>) -> Vec<f64> {
+        host(t).unwrap().into_iter().map(f64::from).collect()
+    }
+
+    #[test]
+    fn folding_scales_each_weight_and_shifts_each_bias() {
+        let device = Device::cuda(0);
+        let net = normalised_net(&device);
+        let folded = net.fold();
+        let blocks = net
+            .encoder
+            .iter()
+            .chain(&net.amp.blocks)
+            .chain(&net.phase.blocks);
+        let stages = folded
+            .encoder
+            .iter()
+            .chain(&folded.amp.0)
+            .chain(&folded.phase.0);
+        // Elementwise f32 arithmetic, a few roundings deep.
+        let tol = 4.0 * f64::from(f32::EPSILON);
+        for (b, f) in blocks.zip(stages) {
+            for (c, n, f) in [(&b.a, &b.na, &f[0]), (&b.b, &b.nb, &f[1])] {
+                let [w, fw] = [&c.weight, &f.weight].map(|p| h(p.val()));
+                let [b, fb] = [&c.bias, &f.bias].map(|p| h(p.as_ref().unwrap().val()));
+                let [g, beta, mean, var] = [
+                    n.gamma.val(),
+                    n.beta.val(),
+                    n.running_mean.value(),
+                    n.running_var.value(),
+                ]
+                .map(h);
+                let per = w.len() / g.len();
+                for k in 0..g.len() {
+                    let s = g[k] / (var[k] + n.epsilon).sqrt();
+                    for i in k * per..(k + 1) * per {
+                        let want = w[i] * s;
+                        let d = (fw[i] - want).abs();
+                        assert!(d <= tol * want.abs(), "weight {i}: {} vs {want}", fw[i]);
+                    }
+                    let want = (b[k] - mean[k]) * s + beta[k];
+                    let d = (fb[k] - want).abs();
+                    let size = (b[k] - mean[k]).abs() * s + beta[k].abs();
+                    assert!(d <= tol * size, "bias {k}: {} vs {want}", fb[k]);
+                }
+            }
+        }
+    }
+
+    /// The end-to-end guard on what the parameters leave out: layer order, padding, the output
+    /// convolutions.
+    #[test]
+    fn folded_network_gives_the_networks_output() {
+        let device = Device::cuda(0);
+        let net = normalised_net(&device);
+        let x = Tensor::<4>::random([3, 2, 16, 16], Distribution::Normal(0.0, 1.0), &device);
+        let (a, p) = net.forward(x.clone());
+        let (fa, fp) = net.fold().forward(x);
+        for (want, got) in [(a, fa), (p, fp)] {
+            let d = (want - got).abs().max().into_scalar::<f32>();
+            // Autotune may pick tensor-core convolutions, which round f32 operands to TF32's
+            // 11-bit significand, so the scaled weights round apart from the unscaled ones.
+            assert!(d < 2e-3, "folded output differs by {d}");
+        }
     }
 }
