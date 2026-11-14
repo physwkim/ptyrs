@@ -4999,6 +4999,131 @@ fn fused_f16_waves_round_the_f32_ones() {
     }
 }
 
+/// What [`HalfWaves`] at `scale` hold for a stored component `w`: `w scale` in f32, kept
+/// within the finite f16 range, rounded to nearest even; a NaN for a NaN.
+fn half_stored(w: f32, scale: f32) -> f32 {
+    let x = (w * scale).clamp(-65504.0, 65504.0);
+    if x.is_nan() {
+        return x;
+    }
+    let exp = ((x.to_bits() >> 23) & 0xff) as i32 - 127;
+    let quantum = 2f64.powi((exp - 10).max(-24));
+    ((x as f64 / quantum).round_ties_even() * quantum) as f32 * (1.0 / scale)
+}
+
+/// A component beyond the f16 range is stored as the largest finite f16 of its sign and a
+/// NaN as a NaN: RAAR's first `iterate`, which is `PO`, of a unit object and a probe set to
+/// the values on both sides of each boundary, against the f32 pass's values through
+/// [`half_stored`].
+#[test]
+fn fused_f16_waves_saturate() {
+    let (stream, ex, k) = setup();
+    let d = ViewDims {
+        nframe: 1,
+        nmode: 1,
+        nprobe: 1,
+        nobj: 1,
+        frame: [64, 128],
+        obj: [64, 128],
+        quad_phase: 0.0,
+    };
+    let mut s = Scan::new(d, &[(0, 0, 0.0, 0.0)], 1.0);
+    let (n, scale) = (s.n(), 32768.0f32);
+    let (max, ulp) = (65504.0f32, 1.0 / 256.0);
+    // Scaled values: the largest finite f16, its f32 neighbours, the last value that rounds
+    // to it and the first that rounded to an infinity, one far outside, and the infinity a
+    // finite value's product with the scale overflows to.
+    let edges = [
+        max - ulp,
+        max,
+        max + ulp,
+        65520.0 - ulp,
+        65520.0,
+        1e9,
+        f32::INFINITY,
+    ];
+    s.obj.fill(C32 { re: 1.0, im: 0.0 });
+    for (i, v) in s.probe.iter_mut().enumerate() {
+        let part = |j: usize| match j % 16 {
+            15 => f32::NAN,
+            j if j < 14 => {
+                (edges[j / 2] / scale).min(f32::MAX) * if j % 2 == 0 { 1.0 } else { -1.0 }
+            }
+            _ => (j as f32 * 0.37).sin(),
+        };
+        *v = C32 {
+            re: part(i),
+            im: part(i / 16),
+        };
+    }
+    let (views, counts) = (
+        Views::new(&stream, s.d, &s.views).unwrap(),
+        up(&stream, &vec![1u16; n]),
+    );
+    let (obj, probe) = (up(&stream, &s.obj), up(&stream, &s.probe));
+    let inputs = FusedInputs {
+        views: &views,
+        counts: &counts,
+        obj: &obj,
+        probe: &probe,
+        model: Model::default(),
+    };
+    let table = one_stack(&stream, &s.d, 0..1);
+    let mut bufs = FusedBufs::new(&stream, &s.d, table.nf_max()).unwrap();
+    let mut go = |exit: Exit<'_>| {
+        k.fused_project(
+            &ex,
+            &inputs,
+            table.at(0),
+            exit,
+            &mut bufs,
+            FusedSums::default(),
+        )
+        .unwrap()
+    };
+    let (mut h, mut hi) = (
+        HalfWaves::zeroed(&stream, n, scale).unwrap(),
+        HalfWaves::zeroed(&stream, n, scale).unwrap(),
+    );
+    let (mut f, mut fi) = (
+        DeviceBuffer::<C32>::zeroed(&stream, n).unwrap(),
+        DeviceBuffer::<C32>::zeroed(&stream, n).unwrap(),
+    );
+    go(Exit::RaarFirst {
+        psi: &mut h,
+        iterate: &mut hi,
+    });
+    go(Exit::RaarFirst {
+        psi: &mut f,
+        iterate: &mut fi,
+    });
+    let (got, want) = (
+        hi.to_host_vec(&stream).unwrap(),
+        fi.to_host_vec(&stream).unwrap(),
+    );
+    // Components seen: NaN, in range, at each of `edges` with either sign.
+    let mut seen = [0usize; 16];
+    for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+        for (g, w) in [(g.re, w.re), (g.im, w.im)] {
+            let stored = half_stored(w, scale);
+            assert!(
+                g.to_bits() == stored.to_bits() || (g.is_nan() && stored.is_nan()),
+                "value {i}: {w} stored as {g}, not {stored}"
+            );
+            assert!(g.is_nan() == w.is_nan() && (g.is_finite() || !w.is_finite()));
+            let x = w * scale;
+            let edge = edges.iter().position(|&e| x.abs() == e);
+            match edge {
+                _ if x.is_nan() => seen[14] += 1,
+                Some(e) => seen[2 * e + usize::from(x < 0.0)] += 1,
+                None => seen[15] += 1,
+            }
+        }
+    }
+    println!("components per class: {seen:?}");
+    assert!(seen.iter().all(|&c| c > 0), "{seen:?}");
+}
+
 /// `shifted_rows_fwd`'s `work` is `fused_llk`'s row pass bit for bit, and the row IDFT of
 /// its `t` the f64 shifted probe at [`SHIFTS`], on [`FUSED_CASES`].
 #[test]

@@ -414,13 +414,27 @@ pub unsafe fn load_psi<const HALF: bool>(w: PsiPtr, i: usize) -> (f32, f32) {
     }
 }
 
+/// The largest finite f16.
+const HALF_MAX: f32 = 65504.0;
+
+/// `x` within the finite f16 range, a NaN as it is: `clamp` keeps a NaN, where `fminf` and
+/// `fmaxf` return the bound.
+#[device]
+fn half_saturate(x: f32) -> f32 {
+    x.clamp(-HALF_MAX, HALF_MAX)
+}
+
+/// Stores `v` as complex value `i` of the waves `w`. Under `HALF` a component beyond the
+/// f16 range is stored as the largest finite f16 of its sign, so no finite wave is read
+/// back as an infinity; a NaN stays one.
+///
 /// # Safety
 ///
 /// As [`load_psi`].
 #[device]
 pub unsafe fn store_psi<const HALF: bool>(w: PsiPtr, i: usize, v: (f32, f32)) {
     if HALF {
-        let packed = cvt_f16x2_f32(v.0 * w.scale, v.1 * w.scale);
+        let packed = cvt_f16x2_f32(half_saturate(v.0 * w.scale), half_saturate(v.1 * w.scale));
         unsafe { *w.ptr.cast::<u32>().add(i) = packed };
     } else {
         unsafe { store_c(w.ptr, i, v) };

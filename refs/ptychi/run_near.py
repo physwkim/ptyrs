@@ -3,6 +3,9 @@
     run_near.py run <out> [--only RUN,...] [--epochs N]   pty-chi on the visible GPU, <out>/<run>.json
     run_near.py ptyrs <out> [--epochs N]                  ptyrs CPU f64, <out>/ptyrs_<spec>.txt
     run_near.py compare <out>                             epochs and seconds to the target
+    run_near.py run <out> --case fresnel|fresnel_back     pty-chi on a Fresnel case
+    run_near.py gpu <out> --case ... [--module DIR]       ptyrs GPU f32 on it
+    run_near.py compare <out> --case ...                  epochs to the target and the LLK curves
 
 Run as micromamba run -n ptyrs-ref python -I refs/ptychi/run_near.py ..., `run` for timing
 through the gpu2.sh lock wrapper, which pins GPU2.
@@ -28,6 +31,19 @@ Runs: LSQML at every batch in BATCHES; BH at every batch in BATCHES and probe rh
 CG at 16 (one batch per epoch) and steepest descent below (DESIGN B7). RHOS brackets the best
 probe rho at every batch, 10 in a ptyrs scan from 0.001 to 1000; pty-chi's suggested near-field
 value 1 reaches the target only at 16, in 78 epochs.
+
+The Fresnel cases (--case) hold ptyrs' GPU engine to pty-chi in float32, for epochs and LLK
+curves, not time: no lock, and wall_s is no timing figure. The GPU's fused passes take frames of
+64 pixels, so a case is lsqml_near.py's state at 64x64 on a 104x104 object, its 16 corners
+mirrored through the centre (their mean is the centre, which ptyrs' PyNX position preprocessing
+then leaves alone), through FRESNEL's Fresnel transform forward or back. `gpu` runs it through
+the `ptyrs` module's GpuPtycho (--module, the directory ptyrs-py/scripts/build.sh installs
+into), whose LLK is the device's own after each epoch; `compare --case` exits 2 if a side of a
+run diverges
+(m3ref.exit_unless_converging) and 1 if the two reach the target EPOCH_SLACK or more epochs
+apart. pty-chi's BH runs these cases with the factor k of refs/f64/bh_near.py on its gradient's
+residual: as released it applies k under the far field alone and diverges here (107 times the
+truth's LLK after one CG epoch at rho 20, 8e8 times after two).
 """
 
 import argparse
@@ -56,6 +72,11 @@ SEED = 7
 TARGET = 1.01
 EPOCHS = 300
 RHOS = (5, 7, 10, 14, 20)
+# (wavelength, pixel, distance) of the Fresnel cases, at the distances of ptyrs' GPU near-field
+# tests (tests/common/near.rs).
+FRESNEL = {"fresnel": (1e-10, 50e-9, 5e-3), "fresnel_back": (1e-10, 50e-9, -1e-2)}
+FRESNEL_SHAPE, FRESNEL_OBJ = (64, 64), (104, 104)
+EPOCH_SLACK = 2
 
 
 def load_lsqml_near():
@@ -83,21 +104,42 @@ def runs():
 
 
 class Case:
-    """The start, counts, float64 propagator and truth LLK of lsqml_near.py's case 0."""
+    """The start, counts, float64 propagator and truth LLK of lsqml_near.py's case 0, or of
+    the Fresnel case `key` (module docstring); `ln` is the lsqml_near module of its shapes."""
 
-    def __init__(self):
+    def __init__(self, key=None):
         torch.set_default_dtype(torch.float64)
         utils.set_default_complex_dtype(torch.complex128)
-        truth_obj, truth_probe, self.probe, self.corners, rng = ln.make_state()
-        self.obj = np.ones(ln.OBJ, complex)
-        self.g = ln.Geometry(*ln.GEOMETRIES[0])
-        self.counts = ln.counts_of(self.g, truth_obj, truth_probe, self.corners, rng)
+        self.key, self.ln = key, ln
+        if key is not None:
+            self.ln = load_lsqml_near()
+            self.ln.SHAPE, self.ln.OBJ = FRESNEL_SHAPE, FRESNEL_OBJ
+        truth_obj, truth_probe, self.probe, self.corners, rng = self.ln.make_state()
+        if key is not None:
+            half = self.corners[:NFRAME // 2]
+            span = np.array(FRESNEL_OBJ) - np.array(FRESNEL_SHAPE)
+            self.corners = np.concatenate([half, span - half])
+            assert len({tuple(c) for c in self.corners}) == NFRAME
+        self.prefix = "" if key is None else key + "_"
+        self.obj = np.ones(self.ln.OBJ, complex)
+        self.g = self.ln.Geometry(*(ln.GEOMETRIES[0] if key is None else FRESNEL[key]))
+        self.counts = self.ln.counts_of(self.g, truth_obj, truth_probe, self.corners, rng)
         self.truth = self.llk(truth_obj, truth_probe)
         self.truth_state = truth_obj, truth_probe
 
     def llk(self, obj, probe):
         """m3ref.evaluate's PyNX LLK of every frame, in float64."""
-        icalc = ln.icalc(self.g, obj.astype(complex), probe.astype(complex), self.corners)
+        # pty-chi's Fresnel transform casts its output to the default complex dtype, which a
+        # float32 task has set to complex64.
+        keep = torch.get_default_dtype(), utils.get_default_complex_dtype()
+        torch.set_default_dtype(torch.float64)
+        utils.set_default_complex_dtype(torch.complex128)
+        try:
+            icalc = self.ln.icalc(self.g, obj.astype(complex), probe.astype(complex),
+                                  self.corners)
+        finally:
+            torch.set_default_dtype(keep[0])
+            utils.set_default_complex_dtype(keep[1])
         tot = m3ref.llk_sums(torch.from_numpy(icalc), torch.from_numpy(self.counts))
         tot = {k: v.item() for k, v in tot.items()}
         nb = tot["nb_obs"]
@@ -109,7 +151,7 @@ class Case:
 def build(case, algo, batch, rho):
     """pty-chi's task in float32 on the GPU, with lsqml_near.task's options (Gaussian model) or
     bh_near.task's."""
-    ny, nx = ln.SHAPE
+    ny, nx = case.ln.SHAPE
     g = case.g
     if algo == "lsqml":
         o = api.LSQMLOptions()
@@ -153,6 +195,11 @@ def build(case, algo, batch, rho):
     rec = task.reconstructor
     rec.dataloader = DataLoader(rec.dataset,
                                 batch_sampler=ln.rb.Sampler(len(case.corners), batch, SEED))
+    if algo != "lsqml" and g.kind == 2:
+        # As refs/f64/bh_near.py: pty-chi scales gradientF's residual by k only for
+        # FourierPropagator, and without it BH diverges under a Fresnel transform.
+        stock = type(rec).gradientF
+        rec.gradientF = lambda psi_far, d: g.k * stock(rec, psi_far, d)
     return task
 
 
@@ -172,7 +219,7 @@ def run(case, out, name, algo, batch, rho, epochs):
             if curve[-1]["gaussian"] <= goal or not np.isfinite(curve[-1]["gaussian"]):
                 break
     last = curve[-1]
-    print(f"{name}: {last['epoch']} epochs {last['wall_s']:.3f} s gaussian "
+    print(f"{case.prefix}{name}: {last['epoch']} epochs {last['wall_s']:.3f} s gaussian "
           f"{last['gaussian'] / case.truth['gaussian']:.4f}x truth, randn {zero.calls}, "
           f"shared {sorted(watch.seen)}", flush=True)
     m3ref.dump({
@@ -191,7 +238,7 @@ def run(case, out, name, algo, batch, rho, epochs):
         "llk_truth": case.truth,
         "time_to_target": m3ref.time_to_target(curve, case.truth),
         "curve": curve,
-    }, os.path.join(out, name + ".json"))
+    }, os.path.join(out, case.prefix + name + ".json"))
     del task
     torch.cuda.empty_cache()
 
@@ -201,13 +248,47 @@ def first(gaussian, goal):
     return next((e for e, v in enumerate(gaussian) if v <= goal), None)
 
 
-def compare(out):
-    truth = Case().truth["gaussian"]
+def gpu(case, out, epochs, module):
+    """Every run of the case in float32 through the `ptyrs` module in `module`: the device's
+    LLK from the start to `epochs`, and its last against the float64 LLK of the end state."""
+    sys.path.insert(0, module)
+    import ptyrs
+
+    g = case.g
+    assert g.kind == 2, g.kind
+    shape = case.ln.SHAPE
+    # corner = (object - frame) / 2 + position
+    at = (case.corners - (np.array(case.ln.OBJ) - np.array(shape)) // 2) * g.pixel
+    # of the scan's geometry the engine reads the frame alone under optics
+    scan = ptyrs.Scan(case.counts, at[:, 0], at[:, 1], g.wavelength, 1.0, g.pixel)
+    w = ptyrs.Wavefield(shape, g.wavelength, [g.pixel, g.pixel], g.distance)
+    for _, batch, rho, spec in runs().values():
+        dev = ptyrs.GpuPtycho(scan, case.obj[None], case.probe, 0,
+                              optics=ptyrs.Optics.free_space(w), stack_size=8)
+        start = dev.llk()
+        if rho is None:
+            dev.lsqml(epochs, 1, batch, "amplitude", SEED)
+        else:
+            dev.bh(epochs, 1, batch, float(rho), SEED)
+        h = dev.history
+        rows = [[start[k], *h[k]] for k in ("poisson", "gaussian", "euclidian")]
+        path = os.path.join(out, f"ptyrs_gpu_{case.prefix}{spec.replace(':', '_')}.txt")
+        np.savetxt(path, np.column_stack([np.arange(epochs + 1), *rows]),
+                   fmt=["%d", "%.9e", "%.9e", "%.9e"])
+        end = case.llk(dev.object[0], dev.probe)["gaussian"]
+        print(f"{case.prefix}{spec}: Gaussian LLK of the end {rows[1][-1]:.6e} on the device, "
+              f"{end:.6e} in float64 ({abs(rows[1][-1] - end) / end:.1e})", flush=True)
+
+
+def compare(out, key=None):
+    case = Case(key)
+    truth = case.truth["gaussian"]
     goal = TARGET * truth
     rows = {}
     for name, (algo, batch, rho, spec) in runs().items():
-        path = os.path.join(out, name + ".json")
-        mine = os.path.join(out, f"ptyrs_{spec.replace(':', '_')}.txt")
+        path = os.path.join(out, case.prefix + name + ".json")
+        stem = "ptyrs_" if key is None else f"ptyrs_gpu_{key}_"
+        mine = os.path.join(out, f"{stem}{spec.replace(':', '_')}.txt")
         if not os.path.exists(path):
             continue
         with open(path) as f:
@@ -226,6 +307,10 @@ def compare(out):
             n = min(len(curve), len(t))
             ours = np.array([r["gaussian"] for r in curve[:n]])
             row["max_rel_llk_diff"] = float(np.max(np.abs(ours - t[:n, 2]) / t[:n, 2]))
+            if key is not None:
+                m3ref.exit_unless_converging(
+                    {f"{name} ptyrs": t[:, 2],
+                     f"{name} pty-chi": [r["gaussian"] for r in curve]})
         rows[name] = row
     print(f"truth Gaussian LLK {truth:.6f}, target {TARGET} x truth")
     print(f"{'run':22s} {'epochs':>6s} {'ptyrs':>6s} {'s':>8s} {'s/epoch':>8s} clean  llk diff")
@@ -257,7 +342,15 @@ def compare(out):
                 print(f"  LSQML / {family}: epochs {le['epochs'] / be['epochs']:.2f}x, "
                       f"seconds {lw['wall_s'] / bw['wall_s']:.2f}x")
     m3ref.dump({"truth_gaussian": truth, "target": TARGET, "runs": rows, "best": best},
-               os.path.join(out, "summary.json"))
+               os.path.join(out, case.prefix + "summary.json"))
+    if key is not None:
+        apart = {n: (r["epochs"], r["ptyrs_epochs"]) for n, r in rows.items()
+                 if (r["epochs"] is None) != (r["ptyrs_epochs"] is None)
+                 or (r["epochs"] is not None
+                     and abs(r["epochs"] - r["ptyrs_epochs"]) >= EPOCH_SLACK)}
+        if apart:
+            print(f"epochs to the target (pty-chi, ptyrs) {EPOCH_SLACK} or more apart: {apart}")
+            sys.exit(1)
 
 
 def main():
@@ -273,11 +366,17 @@ def main():
     p.add_argument("--epochs", type=int, default=EPOCHS)
     c = sub.add_parser("compare")
     c.add_argument("out")
+    gp = sub.add_parser("gpu")
+    gp.add_argument("out")
+    gp.add_argument("--epochs", type=int, default=EPOCHS)
+    gp.add_argument("--module", default=os.path.expanduser("~/work/ptyrs-scratch/py"))
+    for s, required in ((r, False), (c, False), (gp, True)):
+        s.add_argument("--case", choices=sorted(FRESNEL), default=None, required=required)
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     all_runs = runs()
     if a.cmd == "run":
-        case = Case()
+        case = Case(a.case)
         for name in (all_runs if a.only is None else a.only.split(",")):
             algo, batch, rho, _ = all_runs[name]
             run(case, a.out, name, algo, batch, rho, a.epochs)
@@ -288,8 +387,10 @@ def main():
         subprocess.run(["cargo", "run", "--release", "-p", "ptyrs", "--example",
                         "engine_near_speed", "--", os.path.abspath(a.out), str(a.epochs), *specs],
                        cwd=ROOT, check=True)
+    elif a.cmd == "gpu":
+        gpu(Case(a.case), a.out, a.epochs, a.module)
     else:
-        compare(a.out)
+        compare(a.out, a.case)
 
 
 if __name__ == "__main__":
