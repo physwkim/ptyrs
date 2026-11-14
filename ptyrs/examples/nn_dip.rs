@@ -9,6 +9,7 @@
 //! [`LLK_MARGIN`] of ML's LLK after N ([`iterations_to_llk`]).
 //!
 //! `cargo run --release -p ptyrs --features nn --example nn_dip -- <curves.tsv> [iterations=1000] [lr=0.01]`
+#![warn(clippy::disallowed_methods)] // clippy.toml: CUDA devices only through ptyrs::nn::cuda
 
 #[path = "common/nn/mod.rs"]
 mod common;
@@ -117,7 +118,7 @@ fn dip(
         ptycho,
         nb_obs: scan.counts.nb_obs() as f64,
     };
-    let mut net = Dip::new(&DipConfig::new([ny, nx]), &Device::cuda(0))?;
+    let mut net = Dip::new(&DipConfig::new([ny, nx]), &ptyrs::nn::cuda(0))?;
     let mut llk = Vec::with_capacity(n + 1);
     for _ in 0..n {
         llk.push(net.step(&mut loss, lr)?);

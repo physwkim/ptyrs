@@ -1,4 +1,5 @@
 //! The predictor on scans from `ptyrs::engine::sim::simulate` (GPU).
+#![warn(clippy::disallowed_methods)] // clippy.toml: CUDA devices only through ptyrs::nn::cuda
 
 use std::path::{Path, PathBuf};
 
@@ -55,7 +56,7 @@ fn l1(a: &[f32], b: &[f32]) -> f64 {
 
 #[test]
 fn ptychonn_maps_images_to_amplitude_and_phase_of_the_same_size() {
-    let device = Device::cuda(0);
+    let device = ptyrs::nn::cuda(0);
     let net = PtychoNN::new(1, 8, 3, &device);
     assert_eq!(net.granule(), 8);
     let x = Tensor::<4>::random(
@@ -74,7 +75,7 @@ fn ptychonn_maps_images_to_amplitude_and_phase_of_the_same_size() {
 
 #[test]
 fn config_rejects_frames_the_network_cannot_tile() {
-    let device = Device::cuda(0);
+    let device = ptyrs::nn::cuda(0);
     assert!(PredictorConfig::new([64, 64], 2).init(&device).is_ok());
     assert!(PredictorConfig::new([64, 60], 2).init(&device).is_err());
     assert!(PredictorConfig::new([64, 64], 0).init(&device).is_err());
@@ -84,7 +85,7 @@ fn config_rejects_frames_the_network_cannot_tile() {
 fn trained_predictor_keeps_its_fit_at_inference_and_after_reload() {
     const SCANS: u64 = 5;
     const EPOCHS: usize = 30;
-    let device = Device::cuda(0);
+    let device = ptyrs::nn::cuda(0);
     let probe = sim::probe([FRAME, FRAME], 1).unwrap();
     let config = config();
     let train_set = samples(&config, &probe, 0..SCANS);
@@ -155,7 +156,7 @@ fn trained_predictor_keeps_its_fit_at_inference_and_after_reload() {
 
 #[test]
 fn a_resumed_run_continues_from_its_last_epoch() {
-    let device = Device::cuda(0);
+    let device = ptyrs::nn::cuda(0);
     let probe = sim::probe([FRAME, FRAME], 1).unwrap();
     let config = config();
     let train_set = samples(&config, &probe, 0..2);
