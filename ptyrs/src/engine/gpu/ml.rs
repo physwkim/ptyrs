@@ -143,7 +143,9 @@ impl Bufs<'_> {
         // γ along d, then the step. Under a position, the fields are those of the moved
         // probes W of P and W' of dP: po = O W, a = dO W + O W', b = dO W'.
         let dims = *self.views.dims();
-        let m = self.features.lend(ctx, self.kernels, &dims, self.probe)?;
+        let m = self
+            .features
+            .lend(ctx, self.kernels, &dims, self.probe, self.exit)?;
         let obs = GammaCounts {
             counts: self.counts,
             model: Model {
@@ -238,7 +240,9 @@ impl Bufs<'_> {
         f: &mut FusedBufs,
     ) -> Result<(), GpuError> {
         let dims = *self.views.dims();
-        let mut m = self.features.lend(ctx, self.kernels, &dims, self.probe)?;
+        let mut m = self
+            .features
+            .lend(ctx, self.kernels, &dims, self.probe, self.exit)?;
         for s in 0..self.scratch.len() {
             let inputs = FusedInputs {
                 views: self.views,
@@ -292,7 +296,9 @@ impl Bufs<'_> {
         mut llk: Option<&mut RecordWriter<'_>>,
     ) -> Result<(), GpuError> {
         let dims = *self.views.dims();
-        let mut m = self.features.lend(ctx, self.kernels, &dims, self.probe)?;
+        let mut m = self
+            .features
+            .lend(ctx, self.kernels, &dims, self.probe, self.exit)?;
         for s in 0..self.scratch.len() {
             let stack = self.scratch.at(s);
             let inputs = FusedInputs {
@@ -393,7 +399,9 @@ impl Bufs<'_> {
                 }
             }
             PassesMut::Fused(f) => {
-                let m = self.features.lend(ctx, self.kernels, &dims, self.probe)?;
+                let m = self
+                    .features
+                    .lend(ctx, self.kernels, &dims, self.probe, self.exit)?;
                 // The exit waves' photons alone: icalc_add scales them, and
                 // scale_obj_probe takes the background's off the total.
                 let model = Model {
