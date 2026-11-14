@@ -643,17 +643,8 @@ fn full_object_position_fails_every_pass_until_patch() {
         position: Some(drawn_offsets()),
         ..Features::default()
     };
-    let bh = BhParams {
-        batch_size: 8,
-        probe_rho: 0.01,
-        position_rho: 0.1,
-        seed: 7,
-    };
     type Call<'a> = &'a dyn Fn(&mut GpuPtycho) -> Result<Vec<f64>, EngineError>;
-    let calls: &[(&str, Call)] = &[
-        ("rPIE", &|g| g.rpie(&RPIE, 1).map(|()| Vec::new())),
-        ("BH", &|g| g.bh(&bh, 1, 1).map(|()| Vec::new())),
-    ];
+    let calls: &[(&str, Call)] = &[("rPIE", &|g| g.rpie(&RPIE, 1).map(|()| Vec::new()))];
     let run = |full_object_first: bool, switched: bool| {
         let mut gpu = c.gpu(true);
         let sampling = match switched {

@@ -3,8 +3,8 @@
 //! the exit waves through the fused row passes and the propagator's stage around LSQML's
 //! column pass, the step sizes and every frame's `a_far` kept on the device. Under the position model the probe moves by
 //! each frame's offsets, and each batch steps its frames' offsets after its passes; under
-//! [`Sampling::FullObject`] the probe stays and the views read windows of the object the
-//! sampler interpolates at each frame's corner and offset instead.
+//! [`crate::engine::Sampling::FullObject`] the probe stays and the views read windows of
+//! the object the sampler interpolates at each frame's corner and offset instead.
 //!
 //! A multislice object ([`crate::engine::SliceWaves`]) keeps, per stack of a batch, the wave
 //! entering every slice past the first and every slice's exit-wave update: slice 0 then
@@ -25,7 +25,8 @@ use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaStream, DeviceBuffer};
 
 use super::device::{
-    Moved, MovedLent, MovedScratch, PassesMut, PositionLent, moved_inputs, moved_shift, slice_phase,
+    Moved, MovedLent, MovedSampling, MovedScratch, PassesMut, PositionLent, moved_inputs,
+    moved_shift, slice_phase,
 };
 use super::{
     Bufs, Cut, Frames, GpuPtycho, StackRule, Streamed, batch_stacks, plane_bytes, plane_len,
@@ -33,7 +34,7 @@ use super::{
 };
 use crate::engine::features::{POSITION_LIMIT, POSITION_STEP};
 use crate::engine::ptycho::{Algorithm, llk_due};
-use crate::engine::{Cost, EngineError, LsqmlParams, LsqmlStep, Sampling, random_batches};
+use crate::engine::{Cost, EngineError, LsqmlParams, LsqmlStep, random_batches};
 
 /// What an epoch does to the object preconditioner before its batches, on
 /// [`crate::engine::Lsqml::epoch`]'s schedule: the first epoch of a call builds it, epochs 1–9 and
@@ -127,10 +128,10 @@ enum Reading {
     /// Each view's patch at its corner.
     Patch,
     /// The patches through the probe moved by each frame's modelled offset
-    /// ([`Sampling::Patch`]).
+    /// ([`crate::engine::Sampling::Patch`]).
     Moved(Box<Moved>),
     /// Each view's window of the object at its corner and modelled offset
-    /// ([`Sampling::FullObject`]).
+    /// ([`crate::engine::Sampling::FullObject`]).
     Windows {
         moved: Box<Moved>,
         windows: Box<Windows>,
@@ -138,7 +139,8 @@ enum Reading {
 }
 
 impl Reading {
-    /// The position model's state and, under [`Sampling::FullObject`], the windows'.
+    /// The position model's state and, under [`crate::engine::Sampling::FullObject`], the
+    /// windows'.
     fn split(&mut self) -> (Option<&mut Moved>, Option<&mut Windows>) {
         match self {
             Self::Patch => (None, None),
@@ -326,9 +328,9 @@ pub(super) struct LsqmlBufs<'a> {
 impl LsqmlState {
     /// For `views` in batches of `size` frames, each cut into stacks by `rule`; under the
     /// position model, `scratch` holds the frames per stack of the shared scratch and the
-    /// device's sampling: under [`Sampling::Patch`] the moved probe's sums borrow its shift
-    /// planes, which caps the state's stacks. `deeper` counts the object's slices past the
-    /// first. The epoch order is the scan's.
+    /// device's sampling: under [`crate::engine::Sampling::Patch`] the moved probe's sums
+    /// borrow its shift planes, which caps the state's stacks. `deeper` counts the object's
+    /// slices past the first. The epoch order is the scan's.
     pub(super) fn new(
         stream: &Arc<CudaStream>,
         kernels: &Kernels,
@@ -358,7 +360,7 @@ impl LsqmlState {
         let streamed = match scratch {
             None => vec![Streamed::new(wave, 0..=4), Streamed::new(wave, 5..=6)],
             Some(MovedScratch {
-                sampling: Sampling::Patch,
+                sampling: MovedSampling::Patch,
                 ..
             }) => {
                 let probes = plane_bytes::<C32>(dims, dims.nprobe);
@@ -372,7 +374,7 @@ impl LsqmlState {
                 s
             }
             Some(MovedScratch {
-                sampling: Sampling::FullObject,
+                sampling: MovedSampling::FullObject { .. },
                 ..
             }) => {
                 let plane1 = plane_bytes::<C32>(dims, 1);
@@ -401,7 +403,7 @@ impl LsqmlState {
         let frames = match scratch {
             Some(MovedScratch {
                 frames: shared,
-                sampling: Sampling::Patch,
+                sampling: MovedSampling::Patch,
             }) => frames.min(shared),
             _ => frames,
         };
@@ -424,7 +426,12 @@ impl LsqmlState {
             None => Reading::Patch,
             Some(s) => {
                 let moved = Box::new(Moved::new(
-                    stream, kernels, dims, nf_max, slots, s.sampling,
+                    stream,
+                    kernels,
+                    dims,
+                    nf_max,
+                    slots,
+                    s.sampling.into(),
                 )?);
                 match sampler {
                     None => Reading::Moved(moved),

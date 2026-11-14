@@ -505,7 +505,31 @@ impl Moved {
 #[derive(Clone, Copy, Debug)]
 pub(super) struct MovedScratch {
     pub frames: u32,
-    pub sampling: Sampling,
+    pub sampling: MovedSampling,
+}
+
+/// The device's [`Sampling`] as [`MovedScratch`] holds it: under [`Sampling::FullObject`],
+/// the bytes the device's sampler keeps across its calls.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum MovedSampling {
+    Patch,
+    FullObject {
+        /// [`ObjectSampler::windows_held`].
+        held: usize,
+        /// [`ObjectSampler::scratch_bytes`].
+        scratch: usize,
+        /// [`ObjectSampler::acc_bytes`].
+        acc: usize,
+    },
+}
+
+impl From<MovedSampling> for Sampling {
+    fn from(s: MovedSampling) -> Self {
+        match s {
+            MovedSampling::Patch => Self::Patch,
+            MovedSampling::FullObject { .. } => Self::FullObject,
+        }
+    }
 }
 
 /// A cycle's [`Moved`] lent with the device's position buffers, by the device's [`Sampling`]:
@@ -552,12 +576,14 @@ impl<'m, X> PositionLent<'m, X> {
                 spectrum,
                 probe_sums,
             }))),
-            (MovedProbes::FullObject, Mover::Object { .. }, _) => {
+            (MovedProbes::FullObject, Mover::Object { sampler, spectra }, _) => {
                 Ok(Some(Self::FullObject(SampledLent {
                     own,
                     pos,
                     kernels,
                     offsets: &mut *p.offsets,
+                    sampler,
+                    spectra: &mut spectra[0],
                 })))
             }
             _ => Err(another_model()),
@@ -602,13 +628,17 @@ impl<'m, X> TryFrom<PositionLent<'m, X>> for MovedLent<'m, X> {
 }
 
 /// [`PositionLent::FullObject`]: a cycle's [`Moved`] lent with the device's offsets by frame,
-/// which sample the object's windows; `own` the cycle's other buffers of the model.
+/// which sample the object's windows, and its sampler; `own` the cycle's other buffers of the
+/// model.
 pub(super) struct SampledLent<'m, X> {
     pub own: X,
     pub pos: &'m mut Positions,
     pub kernels: &'m PositionKernels,
     /// By frame: the device's offsets, which the cycle steps.
     pub offsets: &'m mut DeviceBuffer<f32>,
+    pub sampler: &'m mut ObjectSampler,
+    /// `[nobj, nyo, nxo]`, the spectra [`ObjectSampler::windows`] reads.
+    pub spectra: &'m mut DeviceBuffer<C32>,
 }
 
 impl<X> SampledLent<'_, X> {
@@ -1791,15 +1821,53 @@ impl BhState {
         // adjoint, `shifted_psi_sums` from 6, `obj_conj` 11), y (the transform, `pos_grad`
         // 13); then lu and lv (`pos_spec` 14, the inverses, `pos_near`, the transforms,
         // `pos_far` 22), r (`pos_near` 17, `obj_conj` 20) and y (the transform, `pos_far`).
+        // Under full-object sampling: the estimate's windows (three sampler calls from 0, 3, 6
+        // writing blocks 0 to 2), psi (`obj_probe_to_psi` 9, the transform, the residual 11),
+        // r (the adjoint, `psi_to_probe` 13, `win_grad` 14, which reads blocks 1 and 2), the
+        // patches (`win_grad`, `place` 15 to 20: zeroing, a chunk's embed 16, transform and
+        // accumulate 18, the inverse and the add); then the windows of `u_O` and `v_O` (six
+        // sampler calls from 21), `win_lift` 39, lu and lv (`far` 40, the transforms,
+        // `hess_frames` 43), the second derivatives (three sampler calls from 44) and r and
+        // the derivatives' windows to `win_hess` 53.
         let wave = wave_bytes(dims);
-        let streamed = match scratch {
+        let streamed = match scratch.map(|s| s.sampling) {
             None => vec![
                 Streamed::new(wave, 0..=2),
                 Streamed::new(wave, 2..=4),
                 Streamed::new(wave, 5..=8),
                 Streamed::new(wave, 5..=8),
             ],
-            Some(_) => {
+            Some(MovedSampling::FullObject { held, scratch, acc }) => {
+                let win = Windows::bytes(dims);
+                let calls = [0, 3, 6, 21, 24, 27, 30, 33, 36, 44, 47, 50];
+                let mut s: Vec<_> = (calls.into_iter())
+                    .map(|p| Streamed::fixed(held, p..=p + 2))
+                    .collect();
+                s.extend([
+                    Streamed::new(win, 2..=13),
+                    Streamed::new(win, 5..=14),
+                    Streamed::new(win, 8..=14),
+                    Streamed::new(wave, 9..=11),
+                    Streamed::new(wave, 11..=14),
+                    Streamed::new(win, 14..=16),
+                    Streamed::fixed(scratch, 16..=18),
+                    Streamed::fixed(acc, 15..=20),
+                    Streamed::new(win, 23..=43),
+                    Streamed::new(win, 26..=53),
+                    Streamed::new(win, 29..=53),
+                    Streamed::new(win, 32..=43),
+                    Streamed::new(win, 35..=53),
+                    Streamed::new(win, 38..=53),
+                    Streamed::new(wave, 40..=43),
+                    Streamed::new(wave, 40..=43),
+                    Streamed::new(wave, 43..=53),
+                    Streamed::new(win, 46..=53),
+                    Streamed::new(win, 49..=53),
+                    Streamed::new(win, 52..=53),
+                ]);
+                s
+            }
+            Some(MovedSampling::Patch) => {
                 let mut s = vec![
                     Streamed::new(plane_bytes::<C32>(dims, dims.nprobe), 0..=2),
                     Streamed::new(wave, 2..=4),
@@ -1815,30 +1883,28 @@ impl BhState {
             }
         };
         let frames = rule.frames(&streamed)?;
-        let frames = scratch.map_or(frames, |s| frames.min(s.frames));
+        // Only the shift's sums borrow the shared scratch.
+        let frames = match scratch {
+            Some(
+                s @ MovedScratch {
+                    sampling: MovedSampling::Patch,
+                    ..
+                },
+            ) => frames.min(s.frames),
+            _ => frames,
+        };
         let (cut, batches) = batch_stacks(stream, dims, size, frames)?;
         let len = cut.wave_len(dims);
         let plans = cut.plans(stream, dims)?;
+        let slots = batches.iter().map(|b| b.len()).max().unwrap_or(0);
+        let moved = (scratch.map(|s| BhMoved::new(stream, kernels, dims, &cut, slots, s.sampling)))
+            .transpose()?;
         let Cut {
             frames: stacks,
             table,
             ..
         } = cut;
-        let slots = batches.iter().map(|b| b.len()).max().unwrap_or(0);
         let zeroed = |len| DeviceBuffer::<C32>::zeroed(stream, len);
-        let moved = scratch
-            .map(|s| {
-                BhMoved::new(
-                    stream,
-                    kernels,
-                    dims,
-                    table.nf_max(),
-                    slots,
-                    len,
-                    s.sampling,
-                )
-            })
-            .transpose()?;
         Ok(Self {
             size,
             plans,
@@ -2365,10 +2431,13 @@ impl Device {
     /// position as it is sampled, whether its run is built or reused.
     fn cycle_runs(&self, algorithm: Algorithm) -> Result<(), EngineError> {
         match algorithm {
-            Algorithm::Ap | Algorithm::Dm | Algorithm::Raar | Algorithm::Ml | Algorithm::Lsqml => {
-                Ok(())
-            }
-            Algorithm::Rpie | Algorithm::Bh => self.patch_only(&format!("{algorithm:?}")),
+            Algorithm::Ap
+            | Algorithm::Dm
+            | Algorithm::Raar
+            | Algorithm::Ml
+            | Algorithm::Lsqml
+            | Algorithm::Bh => Ok(()),
+            Algorithm::Rpie => self.patch_only(&format!("{algorithm:?}")),
         }
     }
 
@@ -2800,9 +2869,17 @@ impl Device {
 
     /// The position model's [`MovedScratch`] for a cycle that runs its own passes.
     fn moved_scratch(&self) -> MovedScratch {
+        let sampling = match self.features.position.as_ref().map(|p| &p.mover) {
+            Some(Mover::Object { sampler, .. }) => MovedSampling::FullObject {
+                held: sampler.windows_held(),
+                scratch: sampler.scratch_bytes(),
+                acc: sampler.acc_bytes(),
+            },
+            _ => MovedSampling::Patch,
+        };
         MovedScratch {
             frames: self.shared.cut.table.nf_max(),
-            sampling: self.sampling,
+            sampling,
         }
     }
 
