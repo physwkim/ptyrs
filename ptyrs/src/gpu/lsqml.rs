@@ -13,7 +13,9 @@
 //! [`LsqmlKernels::dir_obj`] and the probe sums' `num` scaled by `1 / nb`; per stack
 //! [`LsqmlKernels::dots`], then [`LsqmlKernels::step`] and [`LsqmlKernels::update`], which
 //! consumes the sums. An epoch starts with [`LsqmlKernels::start`] on a new run, and
-//! [`LsqmlKernels::precondition`] on pty-chi's schedule. The steps never leave the device.
+//! [`LsqmlKernels::precondition`] on pty-chi's schedule, or where each view samples the
+//! object at its offset [`LsqmlKernels::precondition_placed`]. The steps never leave the
+//! device.
 //!
 //! Under the position model the epoch's frames move as [`crate::gpu::PositionKernels`] lays
 //! out: per stack [`Kernels::shifted_rows_fwd`] and its moved probe take the place of
@@ -300,6 +302,50 @@ impl LsqmlKernels {
                     init.into(),
                     scale,
                     d.scan_geom(),
+                )
+            }
+        })
+    }
+
+    /// [`Self::precondition`] where each view samples the object at its offset and the probe
+    /// stays put: the illumination is `illum`, the object's shape, the sampler's
+    /// [`ObjectSampler::illumination`].
+    ///
+    /// [`ObjectSampler::illumination`]: crate::gpu::sampling::ObjectSampler::illumination
+    pub fn precondition_placed(
+        &self,
+        ctx: &ExecutionContext,
+        illum: &DeviceBuffer<f32>,
+        st: &mut LsqmlScan,
+        init: bool,
+        scale: f32,
+    ) -> Result<(), Error> {
+        let d = st.dims;
+        let len = d.obj_len();
+        check_len("illum", illum, len)?;
+        crate::gpu::zero(ctx, &mut st.pre_max)?;
+        let config = grid_1d(len)?;
+        let (n, len) = (to_u32(d.n())?, to_u32(len)?);
+        let reads = [illum.storage(), st.count_max.storage()];
+        let writes = [st.pre.storage(), st.pre_max.storage()];
+        self.base.launch(ctx, &reads, &writes, |stream| {
+            let pre = LsqmlPre {
+                pre: dptr(&st.pre),
+                max_bits: dptr(&st.pre_max),
+                count_max: dptr::<u64, u64>(&st.count_max).cast_const(),
+            };
+            // SAFETY: `illum` and `pre` hold the object's `len` pixels; `grid_1d`'s blocks are
+            // PIXEL_THREADS.
+            unsafe {
+                self.module.lsqml_pre_map(
+                    stream,
+                    config,
+                    dptr::<f32, f32>(illum).cast_const(),
+                    pre,
+                    init.into(),
+                    scale,
+                    n,
+                    len,
                 )
             }
         })
