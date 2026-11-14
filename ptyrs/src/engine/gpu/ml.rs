@@ -365,8 +365,8 @@ impl Bufs<'_> {
     /// [`crate::engine::Ptycho::scale_obj_probe`] on the device, `total` being the unmasked observed
     /// photons: the calculated photons of the exit waves over the same unmasked pixels, each
     /// frame's times its intensity scale (stack by stack, by the LLK pass `passes` hold, the
-    /// fused one under the position model), then [`Bufs::scale_obj_probe`], all without a
-    /// host sync.
+    /// fused one under the position model) and summed in frame order, then
+    /// [`Bufs::scale_obj_probe`], all without a host sync.
     pub(super) fn scale_to_photons(
         &mut self,
         ctx: &ExecutionContext,
@@ -374,7 +374,6 @@ impl Bufs<'_> {
         ml: &mut MlBufs<'_>,
         total: f32,
     ) -> Result<(), GpuError> {
-        crate::gpu::zero(ctx, ml.icalc)?;
         let dims = *self.views.dims();
         match passes {
             PassesMut::M1(m1) => {
@@ -390,7 +389,7 @@ impl Bufs<'_> {
                         .llk(ctx, stack, self.counts, psi, self.llk_scratch, self.llk)?;
                     let scale = self.features.scale();
                     self.grad
-                        .icalc_add(ctx, &dims, stack, self.llk, scale, ml.icalc)?;
+                        .icalc_frames(ctx, &dims, stack, self.llk, scale, ml.photons)?;
                 }
             }
             PassesMut::Fused(f) => {
@@ -415,11 +414,18 @@ impl Bufs<'_> {
                         ..FarSums::default()
                     };
                     self.kernels.fused_llk(ctx, &inputs, stack, f, far)?;
-                    self.grad
-                        .icalc_add(ctx, &dims, stack, self.llk, m.model.scale, ml.icalc)?;
+                    self.grad.icalc_frames(
+                        ctx,
+                        &dims,
+                        stack,
+                        self.llk,
+                        m.model.scale,
+                        ml.photons,
+                    )?;
                 }
             }
         }
+        self.grad.sum_values(ctx, ml.photons, ml.icalc)?;
         self.scale_obj_probe(ctx, Some((&*ml.icalc, total)))
     }
 }
