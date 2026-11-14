@@ -280,6 +280,7 @@ M6 측정(GPU2, 스택 16): 물체 갱신은 Tile 24–26 µs, SIMT 10–11 µs�
 | sim::object | DM 프로브 갱신 | 185 | 미도달 (미도달) | 미도달 (미도달) | 99 | 134–164 (159) | 163–165 (164) |
 
 - DIP 가중치 기울기는 엔진 GPU 물체 기울기를 거쳐도 CPU f64 LLK의 중심 차분과 기울기 대비 2.6e-6 이내(허용 2e-5)로 맞습니다(`ptyrs/src/nn/dip.rs`의 `weight_gradients_from_the_engine_gpu_gradient_match_finite_differences`, 16×16 물체·25프레임, 매개변수 텐서 42개 전부, CPU 기울기로는 1.3e-7).
+- pty-chi(0605630) `DIPPlanarObject`의 기본 UNet(가중치 17,279,746개)을 burn으로 다시 지어 torch가 내보낸 가중치·입력 코드에서 `Dip::with_prior`로 학습하면(852² fermat_clean, 참 프로브 고정, Adam lr 1e-3, 손실은 CPU f64 엔진), f64 시작 물체는 pty-chi와 4.9e-14, LLK는 1회 뒤 1.1e-8로 맞고, 이후 차이가 반복마다 약 10배씩 커져 100회 중 최대 1.6e-2, 100회 뒤 8.6e-5, 위상 차이는 탐침 중심 상자에서 rms 3.3e-2 rad입니다. 같은 시작에서 다시 돌린 pty-chi는 100회 내내 2.8e-11 이내이므로, 이 차이는 pty-chi의 실행 간 흔들림이 아니라 두 구현의 차이(반올림, burn Adam의 f32 β·ε)가 쌓인 것입니다. pty-chi 쪽 손실은 기본값인 로그 세기 입력 `PoissonNLLLoss()`(`src/ptychi/maps.py:78`, `reconstructors/ad_general.py:43`) 대신 바꿔 넣은 로그 없는 Poisson 손실 `PoissonNLLLoss(log_input=False)`입니다. GPU2 f32 반복당 시간은 ptyrs 0.534 s(엔진 손실 0.019 s), pty-chi 0.414 s(cuDNN 기본 TF32)로 ptyrs가 1.29배 느리고, ptyrs 첫 반복은 cubecl autotune으로 88 s, 최대 메모리(nvidia-smi)는 25.0 대 14.1 GiB입니다(`ptyrs/examples/nn_dip_ptychi.rs`, `refs/py/compare_dip_ptychi.py`).
 
 ---
 
