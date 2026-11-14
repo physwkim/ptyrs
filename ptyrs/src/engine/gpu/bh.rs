@@ -17,6 +17,7 @@ use super::propagate::Propagate;
 use super::{Bufs, GpuPtycho};
 use crate::engine::features::POSITION_STEP;
 use crate::engine::ptycho::{Algorithm, llk_due};
+use crate::engine::sampling::Sampling;
 use crate::engine::{BhParams, BhStep, EngineError, random_batches};
 
 impl GpuPtycho {
@@ -73,7 +74,7 @@ pub(super) struct BhMoved {
 
 impl BhMoved {
     /// For frames of `dims` in `slots` stacks per batch of up to `nf_max` frames each, and
-    /// stack buffers of `stack_len` values.
+    /// stack buffers of `stack_len` values, under `sampling`.
     pub(super) fn new(
         stream: &Arc<CudaStream>,
         kernels: &Kernels,
@@ -81,9 +82,10 @@ impl BhMoved {
         nf_max: u32,
         slots: usize,
         stack_len: usize,
+        sampling: Sampling,
     ) -> Result<Self, EngineError> {
         Ok(Self {
-            probes: Moved::new(stream, kernels, dims, nf_max, slots)?,
+            probes: Moved::new(stream, kernels, dims, nf_max, slots, sampling)?,
             y: DeviceBuffer::zeroed(stream, stack_len)?,
             spectra: [
                 SpectrumBuf::zeroed(stream, dims)?,

@@ -20,7 +20,9 @@ use crate::gpu::{
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaStream, DeviceBuffer};
 
-use super::device::{Moved, MovedLent, PassesMut, moved_inputs, moved_shift, slice_phase};
+use super::device::{
+    Moved, MovedLent, MovedScratch, PassesMut, moved_inputs, moved_shift, slice_phase,
+};
 use super::{
     Bufs, Cut, Frames, GpuPtycho, StackRule, Streamed, batch_stacks, plane_bytes, plane_len,
     wave_bytes,
@@ -147,15 +149,15 @@ pub(super) struct LsqmlBufs<'a> {
 impl LsqmlState {
     /// For `views` in batches of `size` frames, each cut into stacks by `rule`; under the
     /// position model, `scratch` holds the frames per stack of the shared scratch, whose shift
-    /// planes its sums borrow, which caps its stacks; `deeper` counts the object's slices
-    /// past the first. The epoch order is the scan's.
+    /// planes its sums borrow, which caps its stacks, and the device's sampling; `deeper`
+    /// counts the object's slices past the first. The epoch order is the scan's.
     pub(super) fn new(
         stream: &Arc<CudaStream>,
         kernels: &Kernels,
         views: &Views,
         size: u32,
         rule: StackRule,
-        scratch: Option<u32>,
+        scratch: Option<MovedScratch>,
         deeper: usize,
     ) -> Result<Self, EngineError> {
         let dims = views.dims();
@@ -181,7 +183,7 @@ impl LsqmlState {
             }
         };
         let frames = rule.frames(&streamed)?;
-        let frames = scratch.map_or(frames, |s| frames.min(s));
+        let frames = scratch.map_or(frames, |s| frames.min(s.frames));
         let (cut, batches) = batch_stacks(stream, dims, size, frames)?;
         let len = cut.wave_len(dims);
         let Cut {
@@ -198,7 +200,9 @@ impl LsqmlState {
                 .collect::<Result<_, _>>()?)
         };
         let moved = match scratch {
-            Some(_) => Some(Moved::new(stream, kernels, dims, nf_max, slots)?),
+            Some(s) => Some(Moved::new(
+                stream, kernels, dims, nf_max, slots, s.sampling,
+            )?),
             None => None,
         };
         let sliced = match deeper {

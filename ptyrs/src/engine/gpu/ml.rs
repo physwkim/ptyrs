@@ -116,7 +116,7 @@ impl Bufs<'_> {
             _ => None,
         };
         if let PassesMut::Fused(f) = passes
-            && self.features.shifted()
+            && self.features.positioned()
         {
             self.projected_position_sums(ctx, f)?;
         }
