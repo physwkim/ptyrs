@@ -74,9 +74,9 @@ pub enum ObjProbeScale<'a> {
     /// PyNX `ScaleObjProbe(absolute=False)`: `s = 1`.
     Relative,
     /// PyNX `ScaleObjProbe(absolute=True)`: `s = sqrt((total - background) / icalc)`, with
-    /// `icalc` the unmasked calculated photons of [`GradKernels::icalc_add`], `total` the
-    /// unmasked observed photons and `background` the background's of
-    /// [`GradKernels::background_photons`] (0 for `None`).
+    /// `icalc` the unmasked calculated photons, [`GradKernels::sum_values`] of
+    /// [`GradKernels::icalc_frames`], `total` the unmasked observed photons and `background`
+    /// the background's of [`GradKernels::background_photons`] (0 for `None`).
     Absolute {
         icalc: &'a DeviceBuffer<f32>,
         total: f32,
@@ -170,9 +170,34 @@ impl GradKernels {
             })
     }
 
+    /// `out[0] = sum x`, over every value of `x` in a fixed order.
+    pub fn sum_values(
+        &self,
+        ctx: &ExecutionContext,
+        x: &DeviceBuffer<f32>,
+        out: &mut DeviceBuffer<f32>,
+    ) -> Result<(), Error> {
+        let n = u32::try_from(x.len())
+            .map_err(|_| Error::Shape(format!("{} values to sum, over u32", x.len())))?;
+        check_len("out", out, 1)?;
+        let config = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (PIXEL_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        self.base
+            .launch(ctx, &[x.storage()], &[out.storage()], |stream| {
+                // SAFETY: `x` holds `n` floats, `out` one; one PIXEL_THREADS block.
+                unsafe {
+                    self.module
+                        .cg_sum_values(stream, config, dptr(x), n, dptr(out))
+                }
+            })
+    }
+
     /// Adds `(sum |x|, sum |x|^2)` over the first `n` values of `x` to the first `CG_BLOCKS`
     /// pairs of `parts`, as block partials that [`Self::sum_parts`] totals; zero `parts` to
-    /// start a sum, then add arrays or stacks in a fixed order.
+    /// start a sum, then add whole arrays in a fixed order.
     pub fn norm_parts(
         &self,
         ctx: &ExecutionContext,
@@ -197,11 +222,12 @@ impl GradKernels {
             })
     }
 
-    /// Adds the calculated photons of the stack's frames, the `icalc` of the `partials`
-    /// [`Kernels::llk`] wrote for it, each frame's times its intensity `scale` (`[nframe]`)
-    /// if given, to `out[0]`; zero `out` to start a scan, then add its stacks in order.
-    /// Masked pixels are left out, as in the LLK.
-    pub fn icalc_add(
+    /// The calculated photons of each of the stack's frames, the `icalc` of the `partials`
+    /// [`Kernels::llk`] wrote for it times its intensity `scale` (`[nframe]`) if given, into
+    /// its slot of `out` (`[nframe]`); masked pixels are left out, as in the LLK. Once every
+    /// stack has written, [`Self::sum_values`] of `out` is the scan's, in frame order whatever
+    /// the stacks.
+    pub fn icalc_frames(
         &self,
         ctx: &ExecutionContext,
         dims: &ViewDims,
@@ -215,7 +241,7 @@ impl GradKernels {
         if let Some(scale) = scale {
             check_len("scale", scale, dims.nframe as usize)?;
         }
-        check_len("out", out, 1)?;
+        check_len("out", out, dims.nframe as usize)?;
         let config = LaunchConfig {
             grid_dim: (1, 1, 1),
             block_dim: (PIXEL_THREADS, 1, 1),
@@ -226,7 +252,7 @@ impl GradKernels {
         self.base.launch(ctx, &reads, &[out.storage()], |stream| {
             // SAFETY: lengths checked above; one PIXEL_THREADS block.
             unsafe {
-                self.module.cg_icalc_add(
+                self.module.cg_icalc_frames(
                     stream,
                     config,
                     dptr(partials),

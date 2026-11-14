@@ -1600,6 +1600,38 @@ fn position_is_bit_identical_across_stack_splits() {
     }
 }
 
+/// ML cycles, the probe updated too, give the bits of stacks of 8 frames with stacks of 4,
+/// by M1's launches and by the fused passes: the object, the probe and every LLK record. The
+/// opening scale's photons are summed in frame order whatever the stacks.
+#[test]
+fn ml_is_bit_identical_across_stack_splits() {
+    let params = MlParams {
+        update_object: true,
+        update_probe: true,
+        calc_llk: 2,
+        zero_phase_ramp: false,
+    };
+    for setup in [M1, FUSED] {
+        let (scan, object, probe) = start(setup.frame, 2, true);
+        let run = |stack_size: usize| {
+            let options = GpuOptions {
+                stack_size: Some(stack_size),
+                ..setup.options
+            };
+            let mut g =
+                GpuPtycho::new(&ctx(), &scan, object.clone(), probe.clone(), options).unwrap();
+            g.ml(&params, 6).unwrap();
+            bit_state(&mut g)
+        };
+        let (eight, four) = (run(8), run(4));
+        assert!(!eight.llk.is_empty());
+        let what = if setup.options.fused { "fused" } else { "M1" };
+        assert!(four.llk == eight.llk, "{what}: LLK records differ");
+        assert!(four.object == eight.object, "{what}: object differs");
+        assert!(four.probe == eight.probe, "{what}: probe differs");
+    }
+}
+
 /// On a 64 MiB L2 the default stack size cuts 30 frames of 256x256 with two probe modes by
 /// the bytes each pass streams per frame under a position: 6 for the fused passes, 5 for DM
 /// and RAAR, 4 for ML's line search and LSQML, 2 for BH. AP, DM, RAAR and ML cycles modelling a
