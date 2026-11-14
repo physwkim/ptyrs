@@ -44,8 +44,9 @@ pub const STAGE_POST_INV: u32 = 64;
 pub const SLICE_CONJ: u32 = 1;
 /// [`optics_kernels::optics_slice_mul`]: `src` is the probe, `[nprobe, ny, nx]` in the
 /// natural layout, each view reading its mode; without it the stack's waves.
+pub const SLICE_PROBE: u32 = 2;
 /// [`optics_kernels::optics_slice_phase`]: each frame's phase is displaced by its offset.
-pub const SLICE_MOVED: u32 = 2;
+pub const SLICE_OFFSET: u32 = 2;
 
 /// One line pass in place over the stack's planes of `buf`, `[nf_max * nmode, ny, nx]`: per
 /// line of `N` points the `flags`' FFT (unnormalized, forward `exp(-2 pi i jk / N)`), the
@@ -131,7 +132,7 @@ pub unsafe fn stage<const N: u32>(
 
 #[cuda_module]
 pub mod optics_kernels {
-    use super::{SLICE_CONJ, SLICE_MOVED, stage};
+    use super::{SLICE_CONJ, SLICE_OFFSET, SLICE_PROBE, stage};
     use crate::pixel::*;
     use crate::*;
 
@@ -233,7 +234,7 @@ pub mod optics_kernels {
 
     /// A slice's product over the stack's views: `dst`'s plane of view `k` is `obj`'s
     /// bilinear window of that view times `src` (under `SLICE_CONJ` the window's conjugate
-    /// times it), `src` the probe under `SLICE_MOVED`, else the stack's waves. `dst` and the
+    /// times it), `src` the probe under `SLICE_PROBE`, else the stack's waves. `dst` and the
     /// waves are `[nf_max * nmode, ny, nx]` at the exit wave's stored pixels, `views` in
     /// epoch order. One thread per value of `dst`.
     ///
@@ -263,7 +264,7 @@ pub mod optics_kernels {
         unsafe {
             let v = *views.add(f0 as usize * g.nmode as usize + kl);
             let o = sample_obj(obj, v, y, x, g.nyo, g.nxo);
-            let w = if flags & SLICE_MOVED != 0 {
+            let w = if flags & SLICE_PROBE != 0 {
                 load_c(src, v.probe as usize * n + j)
             } else {
                 load_c(src, at)
@@ -279,7 +280,7 @@ pub mod optics_kernels {
 
     /// The exit plane's phase on the stack's planes of `buf`, `[nf_max * nmode, ny, nx]` at
     /// the exit wave's stored pixels, in place: each value times `exp(i quad |r|^2)`, `r`
-    /// the pixel from the frame's centre, and under `SLICE_MOVED` times `exp(-2i quad r.d)`,
+    /// the pixel from the frame's centre, and under `SLICE_OFFSET` times `exp(-2i quad r.d)`,
     /// `d` the frame's `(dy, dx)` of `offsets`, `[nframe, 2]` by epoch position: the phase
     /// displaced by `d` but for the frame's constant `exp(i quad |d|^2)`, which no intensity
     /// sees and the conjugate takes back. Under `SLICE_CONJ` by the conjugate of all that.
@@ -287,7 +288,7 @@ pub mod optics_kernels {
     ///
     /// # Safety
     ///
-    /// `buf` holds its shape for `g`, `offsets` its own under `SLICE_MOVED`; `ctl` one entry.
+    /// `buf` holds its shape for `g`, `offsets` its own under `SLICE_OFFSET`; `ctl` one entry.
     #[kernel]
     pub unsafe fn optics_slice_phase(
         buf: *mut f32,
@@ -307,7 +308,7 @@ pub mod optics_kernels {
         let (y, x) = (j as u32 / g.nx, j as u32 % g.nx);
         let mut q = quad_phase(quad, y, x, g.ny, g.nx);
         unsafe {
-            if flags & SLICE_MOVED != 0 {
+            if flags & SLICE_OFFSET != 0 {
                 let f = f0 as usize + kl / g.nmode as usize;
                 let (dy, dx) = (*offsets.add(2 * f), *offsets.add(2 * f + 1));
                 // `freq` of the stored index is the centred pixel over the side.
