@@ -1,6 +1,8 @@
 //! The live AP consumer (DESIGN.md §3 B6, §7 M5): lands each frame batch
 //! the uploader sends into a [`LiveAp`] and runs epochs over the landed
 //! frames between batches, from graphs captured before the first frame.
+//! [`run_dist_consumer`] runs the same loop over a [`DistLiveAp`], one GPU
+//! per region of the object, each fed its own frames by the uploader.
 //! The object the scan's plan reaches is backed before the first frame,
 //! and a mapper thread backs what each batch needs beyond it, its object
 //! tiles and view records, before handing it on: a scan inside its plan
@@ -28,17 +30,18 @@ use std::time::{Duration, Instant};
 use crate::base::{C64, CoreError};
 use crate::gpu::{C32, ViewAddr};
 use crossbeam_channel::{Receiver, Sender, TryRecvError};
-use cuda_core::Context;
+use cuda_core::{Context, Event, Stream};
 use serde::Deserialize;
 
+use crate::dist::{DistError, DistLiveAp, DistSnapshot, Scheme};
 use crate::live::args::Args;
 use crate::live::converge::{Clock, ClockError};
 use crate::live::farfield::Ptycho;
 use crate::live::grow::GrowError;
-use crate::live::object::{Snapshot, sleeping_event};
+use crate::live::object::{Snapshot, timed_sleeping_event};
 use crate::live::pv_out::PvCfg;
 use crate::live::recon::{ApConfig, LiveAp, ViewPlacement};
-use crate::live::ring::{DeviceStore, FrameBatch};
+use crate::live::ring::{DeviceStore, FrameBatch, Route, Whole};
 use crate::live::scan::{ScanBacker, ScanShape};
 use crate::live::stats::wall_ns;
 
@@ -249,6 +252,30 @@ pub struct FollowReport {
     /// Per batch, the epochs queued before it landed and the frames stored
     /// with it: the schedule that, replayed, gives the same object.
     pub landings: Vec<(u64, u64)>,
+    /// Wall time, ns, each epoch finished on the GPU, by epoch.
+    pub epoch_done: Vec<i64>,
+    /// How long stamping the clock of `epoch_done` took: its error bound.
+    pub epoch_clock_ns: i64,
+}
+
+impl FollowReport {
+    /// GPU time, ns, of each epoch queued once the scan had landed, from
+    /// [`Self::epoch_done`]: the only source of epoch time. The first epoch
+    /// has no end before it to time from.
+    pub fn epochs_after_scan(&self) -> impl Iterator<Item = i64> + '_ {
+        let from = self
+            .scan_epochs
+            .map_or(self.epoch_done.len(), |s| s.max(1) as usize - 1);
+        self.epoch_done[from..].windows(2).map(|w| w[1] - w[0])
+    }
+
+    /// Mean of [`Self::epochs_after_scan`], ms.
+    pub fn epoch_ms(&self) -> Option<f64> {
+        let (n, ns) = self
+            .epochs_after_scan()
+            .fold((0u64, 0i64), |(n, ns), t| (n + 1, ns + t));
+        (n > 0).then(|| ns as f64 / 1e6 / n as f64)
+    }
 }
 
 /// The views of the frames at `positions`.
@@ -261,10 +288,11 @@ fn views_of(cfg: &ApConfig, place: &ViewPlacement, positions: &[(f64, f64)]) -> 
     out
 }
 
-/// Backs each batch's frames through `backer`, then hands the batch on with
-/// its views, until `batches` closes or `ahead`'s receiver goes.
+/// Backs each batch's frames through `backer`, if the run has one, then
+/// hands the batch on with its views, until `batches` closes or `ahead`'s
+/// receiver goes.
 fn back_ahead(
-    backer: ScanBacker,
+    mut backer: Option<ScanBacker>,
     ap: ApConfig,
     place: ViewPlacement,
     batches: Receiver<FrameBatch>,
@@ -272,7 +300,6 @@ fn back_ahead(
 ) -> Result<(), GrowError> {
     // Dropped once the scan's last frame is backed: frames past it never
     // land, and the consumer may finish before `batches` closes.
-    let mut backer = Some(backer);
     for b in batches {
         let views = views_of(&ap, &place, &b.positions);
         if let Some(k) = &mut backer {
@@ -297,6 +324,210 @@ fn joined(mapper: &mut Option<JoinHandle<Result<(), GrowError>>>) -> Result<(), 
     }
 }
 
+/// A live AP run the follow loop drives: a [`LiveAp`] on one GPU or a
+/// [`DistLiveAp`] on several.
+pub trait Solve {
+    type Error: From<GrowError>;
+    /// A host copy of the object.
+    type Snap;
+
+    /// Queues an epoch over the frames landed, without waiting for it.
+    fn epoch(&mut self) -> Result<(), Self::Error>;
+    /// Epochs queued so far.
+    fn epochs(&self) -> u64;
+    fn new_snapshot(&mut self) -> Result<Self::Snap, Self::Error>;
+    /// Queues a copy of the object after the epochs queued so far.
+    fn snapshot(&mut self, snap: &mut Self::Snap) -> Result<(), Self::Error>;
+    /// Waits for the copy queued last into `snap`: `[nobj, ny, nx]`.
+    fn pixels<'a>(&mut self, snap: &'a mut Self::Snap) -> Result<&'a [[f32; 2]], Self::Error>;
+    /// `[ny, nx]` of the object.
+    fn shape(&self) -> [usize; 2];
+}
+
+trait Engine: Solve {
+    /// Lands the frames whose views are `views`.
+    fn push(&mut self, views: &[ViewAddr]) -> Result<(), Self::Error>;
+    /// Wall ns the GPUs finished `epoch`, one of the last two queued; waits
+    /// for it.
+    fn end_of(&mut self, epoch: u64) -> Result<i64, Self::Error>;
+    /// How long stamping the clock [`Self::end_of`] reads took, ns.
+    fn clock_ns(&self) -> i64;
+    /// Each epoch's LLK since the last read, waiting for them; `None` if
+    /// the run records none.
+    fn llk(&mut self) -> Result<Option<Vec<f64>>, Self::Error>;
+    /// Frames the scan took.
+    fn landed(&self) -> u64;
+    /// Object bytes mapped.
+    fn mapped_bytes(&mut self) -> Result<usize, Self::Error>;
+    /// Waits for everything queued.
+    fn synchronize(&mut self) -> Result<(), Self::Error>;
+}
+
+/// A [`LiveAp`] and the fences that time its epochs.
+struct One {
+    live: LiveAp,
+    stream: Arc<Stream>,
+    /// Recorded after the epochs of each parity.
+    fence: [Event; 2],
+    /// Epoch ends are timed from `anchor`, stamped at wall ns `t_anchor`.
+    anchor: Event,
+    t_anchor: i64,
+    clock_ns: i64,
+}
+
+impl Solve for LiveAp {
+    type Error = GrowError;
+    type Snap = Snapshot;
+
+    fn epoch(&mut self) -> Result<(), GrowError> {
+        LiveAp::epoch(self)
+    }
+
+    fn epochs(&self) -> u64 {
+        LiveAp::epochs(self)
+    }
+
+    fn new_snapshot(&mut self) -> Result<Snapshot, GrowError> {
+        LiveAp::new_snapshot(self)
+    }
+
+    fn snapshot(&mut self, snap: &mut Snapshot) -> Result<(), GrowError> {
+        LiveAp::snapshot(self, snap)
+    }
+
+    fn pixels<'a>(&mut self, snap: &'a mut Snapshot) -> Result<&'a [[f32; 2]], GrowError> {
+        Ok(snap.wait()?)
+    }
+
+    fn shape(&self) -> [usize; 2] {
+        self.scan().obj().shape()
+    }
+}
+
+impl Solve for One {
+    type Error = GrowError;
+    type Snap = Snapshot;
+
+    fn epoch(&mut self) -> Result<(), GrowError> {
+        let f = &self.fence[(self.live.epochs() % 2) as usize];
+        self.live.epoch()?;
+        Ok(f.record(&self.stream)?)
+    }
+
+    fn epochs(&self) -> u64 {
+        self.live.epochs()
+    }
+
+    fn new_snapshot(&mut self) -> Result<Snapshot, GrowError> {
+        self.live.new_snapshot()
+    }
+
+    fn snapshot(&mut self, snap: &mut Snapshot) -> Result<(), GrowError> {
+        self.live.snapshot(snap)
+    }
+
+    fn pixels<'a>(&mut self, snap: &'a mut Snapshot) -> Result<&'a [[f32; 2]], GrowError> {
+        self.live.pixels(snap)
+    }
+
+    fn shape(&self) -> [usize; 2] {
+        Solve::shape(&self.live)
+    }
+}
+
+impl Engine for One {
+    fn push(&mut self, views: &[ViewAddr]) -> Result<(), GrowError> {
+        self.live.push(views).map(drop)
+    }
+
+    fn end_of(&mut self, epoch: u64) -> Result<i64, GrowError> {
+        let f = &self.fence[(epoch % 2) as usize];
+        f.synchronize()?;
+        Ok(self.t_anchor + (f64::from(self.anchor.elapsed_time(f)?) * 1e6) as i64)
+    }
+
+    fn clock_ns(&self) -> i64 {
+        self.clock_ns
+    }
+
+    fn llk(&mut self) -> Result<Option<Vec<f64>>, GrowError> {
+        let llk = self.live.llk()?;
+        Ok(llk.map(|l| l.into_iter().map(|(_, l)| l).collect()))
+    }
+
+    fn landed(&self) -> u64 {
+        u64::from(self.live.scan().landed())
+    }
+
+    fn mapped_bytes(&mut self) -> Result<usize, GrowError> {
+        Ok(self.live.scan().obj().mapped_bytes())
+    }
+
+    fn synchronize(&mut self) -> Result<(), GrowError> {
+        Ok(self.stream.synchronize()?)
+    }
+}
+
+impl Solve for DistLiveAp {
+    type Error = DistError;
+    type Snap = DistSnapshot;
+
+    fn epoch(&mut self) -> Result<(), DistError> {
+        DistLiveAp::epoch(self)
+    }
+
+    fn epochs(&self) -> u64 {
+        DistLiveAp::epochs(self)
+    }
+
+    fn new_snapshot(&mut self) -> Result<DistSnapshot, DistError> {
+        DistLiveAp::new_snapshot(self)
+    }
+
+    fn snapshot(&mut self, snap: &mut DistSnapshot) -> Result<(), DistError> {
+        DistLiveAp::snapshot(self, snap)
+    }
+
+    fn pixels<'a>(&mut self, snap: &'a mut DistSnapshot) -> Result<&'a [[f32; 2]], DistError> {
+        self.wait(snap)
+    }
+
+    fn shape(&self) -> [usize; 2] {
+        DistLiveAp::shape(self)
+    }
+}
+
+impl Engine for DistLiveAp {
+    fn push(&mut self, views: &[ViewAddr]) -> Result<(), DistError> {
+        DistLiveAp::push(self, views).map(drop)
+    }
+
+    fn end_of(&mut self, epoch: u64) -> Result<i64, DistError> {
+        DistLiveAp::end_of(self, epoch)
+    }
+
+    fn clock_ns(&self) -> i64 {
+        DistLiveAp::clock_ns(self)
+    }
+
+    fn llk(&mut self) -> Result<Option<Vec<f64>>, DistError> {
+        let llk = DistLiveAp::llk(self)?;
+        Ok(llk.map(|l| l.into_iter().map(|(_, l)| l).collect()))
+    }
+
+    fn landed(&self) -> u64 {
+        self.taken()
+    }
+
+    fn mapped_bytes(&mut self) -> Result<usize, DistError> {
+        DistLiveAp::mapped_bytes(self)
+    }
+
+    fn synchronize(&mut self) -> Result<(), DistError> {
+        DistLiveAp::synchronize(self)
+    }
+}
+
 /// Live AP on `store`'s frames as `batches` say they landed, until the
 /// uploader drops its sender and `cfg.snaps` snapshots are kept, with
 /// copies to `preview` if given. Sends on `captured` once its graphs are
@@ -308,6 +539,20 @@ pub fn run_ap_consumer(
     batches: Receiver<FrameBatch>,
     captured: Sender<()>,
     preview: Option<Preview>,
+) -> Result<FollowReport, GrowError> {
+    follow_one(ctx, store, cfg, batches, preview, || {
+        let _ = captured.send(());
+    })
+}
+
+/// [`run_ap_consumer`], calling `ready` once the graphs are captured.
+fn follow_one(
+    ctx: Arc<Context>,
+    store: Arc<DeviceStore>,
+    cfg: FollowCfg,
+    batches: Receiver<FrameBatch>,
+    preview: Option<Preview>,
+    ready: impl FnOnce(),
 ) -> Result<FollowReport, GrowError> {
     ctx.bind_to_thread()?;
     let stream = ctx.new_stream()?;
@@ -326,26 +571,97 @@ pub fn run_ap_consumer(
     // SAFETY: an epoch reads only landed frames, whose copies into the
     // store completed before the uploader sent their batch.
     let counts = unsafe { store.frames_view()? };
-    let mut live = LiveAp::new(&stream, &cfg.ap, &cfg.probe, counts, preview.is_some())?;
+    let live = LiveAp::new(&stream, &cfg.ap, &cfg.probe, counts, preview.is_some())?;
     // The plan is backed before `captured` lets the first frame in; from
     // here on only the mapper grows device memory, past the plan.
     let mut backer = live.backer();
     let t = Instant::now();
     backer.plan(&views_of(&cfg.ap, &cfg.place, &cfg.plan))?;
     let plan_time = t.elapsed();
-    let plan_mapped_bytes = live.scan().obj().mapped_bytes();
+    let fence = [timed_sleeping_event(&ctx)?, timed_sleeping_event(&ctx)?];
+    // Stamped on the idle stream.
+    let anchor = ctx.new_event()?;
+    stream.synchronize()?;
+    let t0 = wall_ns();
+    anchor.record(&stream)?;
+    anchor.synchronize()?;
+    let t_anchor = wall_ns();
+    let run = One {
+        live,
+        stream,
+        fence,
+        anchor,
+        t_anchor,
+        clock_ns: t_anchor - t0,
+    };
+    follow(run, Some(backer), plan_time, &cfg, batches, preview, |_| {
+        ready()
+    })
+}
+
+/// Each region's store and the route the uploader lands the frames by
+/// ([`run_region_uploader`](crate::live::ring::run_region_uploader)).
+pub type Landing = (Vec<Arc<DeviceStore>>, Box<dyn Route>);
+
+/// Live AP on the GPUs `ordinals`, on stores of its own, sent on `ready`
+/// once its graphs are captured and dropped unsent if that fails. One GPU
+/// runs as [`run_ap_consumer`] does. More split the object by `scheme`,
+/// region `r` on `ordinals[r]`, and [`FollowReport::plan_time`] is the
+/// whole setup's.
+pub fn run_dist_consumer(
+    ordinals: &[usize],
+    scheme: Scheme,
+    cfg: FollowCfg,
+    batches: Receiver<FrameBatch>,
+    ready: Sender<Landing>,
+    preview: Option<Preview>,
+) -> Result<FollowReport, DistError> {
+    if let [one] = *ordinals {
+        let ctx = Context::new(one)?;
+        let shape = cfg.ap.shape;
+        let elems = shape.frame[0] as usize * shape.frame[1] as usize;
+        let store = Arc::new(DeviceStore::new(&ctx, shape.nframe as usize, elems)?);
+        let landing: Landing = (vec![store.clone()], Box::new(Whole));
+        return Ok(follow_one(ctx, store, cfg, batches, preview, || {
+            let _ = ready.send(landing);
+        })?);
+    }
+    let t = Instant::now();
+    let planned = views_of(&cfg.ap, &cfg.place, &cfg.plan);
+    let llk = preview.is_some();
+    let run = DistLiveAp::new(ordinals, &cfg.ap, &planned, scheme, &cfg.probe, llk)?;
+    let plan_time = t.elapsed();
+    let place = cfg.place;
+    follow(run, None, plan_time, &cfg, batches, preview, |run| {
+        let _ = ready.send((run.stores(), Box::new(run.route(place))));
+    })
+}
+
+/// Lands the batches into `live` and iterates it, as [`run_ap_consumer`]
+/// says; `backer` backs each batch ahead of its landing if the run does not
+/// itself, and `ready` is called once the run can take frames.
+fn follow<R: Engine>(
+    mut live: R,
+    backer: Option<ScanBacker>,
+    plan_time: Duration,
+    cfg: &FollowCfg,
+    batches: Receiver<FrameBatch>,
+    preview: Option<Preview>,
+    ready: impl FnOnce(&R),
+) -> Result<FollowReport, R::Error> {
+    let shape = cfg.ap.shape;
+    let plan_mapped_bytes = live.mapped_bytes()?;
     let (fwd, ahead) = crossbeam_channel::unbounded();
     let mut mapper = {
-        let (b, ap, place) = (backer, cfg.ap, cfg.place);
+        let (ap, place) = (cfg.ap, cfg.place);
         Some(
             std::thread::Builder::new()
                 .name("backer".into())
-                .spawn(move || back_ahead(b, ap, place, batches, fwd))
+                .spawn(move || back_ahead(backer, ap, place, batches, fwd))
                 .expect("spawn the backer"),
         )
     };
     let mut snaps = [live.new_snapshot()?, live.new_snapshot()?];
-    let fence = [sleeping_event(&ctx)?, sleeping_event(&ctx)?];
     let mut view = match preview {
         Some(p) => Some((p, live.new_snapshot()?)),
         None => None,
@@ -355,7 +671,8 @@ pub fn run_ap_consumer(
     let mut viewing: Option<u64> = None;
     let mut viewed: Option<Instant> = None;
     let mut llk_sent: Option<Instant> = None;
-    let _ = captured.send(());
+    let mut epoch_done = Vec::new();
+    ready(&live);
 
     let mut positions: Vec<(f64, f64)> = Vec::with_capacity(shape.nframe as usize);
     let mut kept = Vec::with_capacity(cfg.snaps);
@@ -364,7 +681,7 @@ pub fn run_ap_consumer(
     let mut pending: Option<(usize, u64)> = None;
     let mut next_snap = 0usize;
     let mut landings = Vec::new();
-    let fed = (|| -> Result<(), GrowError> {
+    let fed = (|| -> Result<(), R::Error> {
         let mut got = Vec::new();
         while kept.len() + usize::from(pending.is_some()) < cfg.snaps {
             // Block for frames only while none has come.
@@ -404,9 +721,10 @@ pub fn run_ap_consumer(
             if done && scan_epochs.is_none() {
                 scan_epochs = Some(live.epochs());
             }
-            let f = &fence[(live.epochs() % 2) as usize];
             // The epoch two before this one has finished.
-            f.synchronize()?;
+            if live.epochs() >= 2 {
+                epoch_done.push(live.end_of(live.epochs() - 2)?);
+            }
             // So has a copy queued after the epoch before that one, behind
             // its fence: it is sent without waiting.
             if let Some(e) = viewing
@@ -415,7 +733,7 @@ pub fn run_ap_consumer(
             {
                 viewing = None;
                 // Only this thread sends, so only a viewer gone refuses it.
-                if p.tx.try_send(view_of(snap, e)?).is_err() {
+                if p.tx.try_send(view_of(&mut live, snap, e)?).is_err() {
                     view = None;
                 }
             }
@@ -429,7 +747,6 @@ pub fn run_ap_consumer(
                 }
             }
             live.epoch()?;
-            f.record(&stream)?;
             if let Some((p, snap)) = &mut view
                 && viewing.is_none()
                 && p.tx.is_empty()
@@ -446,18 +763,22 @@ pub fn run_ap_consumer(
                 next_snap ^= 1;
                 live.snapshot(&mut snaps[i])?;
                 if let Some((j, epochs)) = pending.replace((i, live.epochs())) {
-                    kept.push(keep(&mut snaps[j], epochs)?);
+                    kept.push(keep(&mut live, &mut snaps[j], epochs)?);
                 }
             }
         }
         if let Some((i, epochs)) = pending.take() {
-            kept.push(keep(&mut snaps[i], epochs)?);
+            kept.push(keep(&mut live, &mut snaps[i], epochs)?);
         }
         Ok(())
     })();
-    // Nothing may still read the store once this returns.
-    stream.synchronize()?;
+    // Nothing may still read the stores once this returns.
+    live.synchronize()?;
     fed?;
+    // Each fence follows one of the last two epochs.
+    for e in epoch_done.len() as u64..live.epochs() {
+        epoch_done.push(live.end_of(e)?);
+    }
     // The viewer's last LLK and copy are those of the last epoch.
     if let Some((p, mut snap)) = view
         && live.epochs() > 0
@@ -466,35 +787,36 @@ pub fn run_ap_consumer(
         if viewing != Some(live.epochs()) {
             live.snapshot(&mut snap)?;
         }
-        let _ = p.tx.send(view_of(&mut snap, live.epochs())?);
+        let epochs = live.epochs();
+        let _ = p.tx.send(view_of(&mut live, &mut snap, epochs)?);
     }
-    let [ny, nx] = snaps[0].shape();
     Ok(FollowReport {
         stored: positions.len() as u64,
-        landed: u64::from(live.scan().landed()),
+        landed: live.landed(),
         epochs: live.epochs(),
         scan_epochs,
-        shape: [ny, nx],
+        shape: live.shape(),
         positions,
         kept,
-        obj_mapped_bytes: live.scan().obj().mapped_bytes(),
+        obj_mapped_bytes: live.mapped_bytes()?,
         plan_time,
         plan_mapped_bytes,
         landings,
+        epoch_done,
+        epoch_clock_ns: live.clock_ns(),
     })
 }
 
-/// Sends `live`'s LLK of the epochs queued since the last read, waiting for
-/// them; false once the receiver is gone.
-fn send_llk(live: &mut LiveAp, tx: &Sender<Vec<f64>>) -> Result<bool, GrowError> {
-    let llk = live.llk()?.expect("a run with a preview records its LLK");
-    Ok(tx.send(llk.into_iter().map(|(_, l)| l).collect()).is_ok())
+/// Sends `live`'s LLK of the epochs queued since the last read, if it
+/// records any, waiting for them; false once the receiver is gone.
+fn send_llk<R: Engine>(live: &mut R, tx: &Sender<Vec<f64>>) -> Result<bool, R::Error> {
+    Ok(live.llk()?.is_none_or(|llk| tx.send(llk).is_ok()))
 }
 
 /// Waits for `snap`, which follows `epochs`, and copies its object 0.
-fn view_of(snap: &mut Snapshot, epochs: u64) -> Result<View, GrowError> {
-    let shape = snap.shape();
-    let px = snap.wait()?;
+fn view_of<R: Engine>(live: &mut R, snap: &mut R::Snap, epochs: u64) -> Result<View, R::Error> {
+    let shape = live.shape();
+    let px = live.pixels(snap)?;
     Ok(View {
         epochs,
         shape,
@@ -503,9 +825,9 @@ fn view_of(snap: &mut Snapshot, epochs: u64) -> Result<View, GrowError> {
 }
 
 /// Waits for `snap` and copies its object 0, stamped now.
-fn keep(snap: &mut Snapshot, epochs: u64) -> Result<Kept, GrowError> {
-    let [ny, nx] = snap.shape();
-    let px = snap.wait()?;
+fn keep<R: Engine>(live: &mut R, snap: &mut R::Snap, epochs: u64) -> Result<Kept, R::Error> {
+    let [ny, nx] = live.shape();
+    let px = live.pixels(snap)?;
     let taken = wall_ns();
     Ok(Kept {
         taken,
@@ -553,18 +875,56 @@ pub fn offline_ap(
     settle(&mut run, region, scan_end, max_epochs)
 }
 
+/// [`offline_ap`] over the regions of `scheme`, region `r` on the GPU of
+/// `stores[r]` and on its frames as the live run's uploader left them: the
+/// frames at `positions` routed as [`run_dist_consumer`] routes them. One
+/// store is [`offline_ap`] itself.
+pub fn offline_dist(
+    stores: &[Arc<DeviceStore>],
+    scheme: Scheme,
+    cfg: &FollowCfg,
+    positions: &[(f64, f64)],
+    region: [Range<usize>; 2],
+    scan_end: i64,
+    max_epochs: u64,
+) -> Result<Offline, DistError> {
+    if let [store] = stores {
+        let off = offline_ap(
+            store.ctx(),
+            store,
+            cfg,
+            positions,
+            region,
+            scan_end,
+            max_epochs,
+        );
+        return Ok(off?);
+    }
+    let planned = views_of(&cfg.ap, &cfg.place, &cfg.plan);
+    let mut run = DistLiveAp::on_stores(stores, &cfg.ap, &planned, scheme, &cfg.probe, false)?;
+    let views = views_of(&cfg.ap, &cfg.place, positions);
+    let took = run.push(&views)?;
+    if took as usize != positions.len() {
+        return Err(DistError::Partition(format!(
+            "the offline run took {took} of {} stored frames",
+            positions.len()
+        )));
+    }
+    settle(&mut run, region, scan_end, max_epochs)
+}
+
 /// Iterates `run`, every frame landed, to epochs `E` = `E0`, `2 E0`, … from
 /// its count `E0` now (1 when fresh) until its object at `E` matches the
 /// one at `E/2` over `region` to
 /// [`SETTLED`](crate::live::converge::SETTLED), the clock's reference; refused
 /// as still moving once the next doubling would pass `max_epochs`, after
 /// at least the check at `E` = 2.
-pub fn settle(
-    run: &mut LiveAp,
+pub fn settle<R: Solve>(
+    run: &mut R,
     region: [Range<usize>; 2],
     scan_end: i64,
     max_epochs: u64,
-) -> Result<Offline, GrowError> {
+) -> Result<Offline, R::Error> {
     let mut snap = run.new_snapshot()?;
     let mut half: Option<Vec<C64>> = None;
     let mut e = run.epochs().max(1);
@@ -573,8 +933,8 @@ pub fn settle(
             run.epoch()?;
         }
         run.snapshot(&mut snap)?;
-        let shape = snap.shape();
-        let now = plane(snap.wait()?, shape);
+        let shape = run.shape();
+        let now = plane(run.pixels(&mut snap)?, shape);
         if let Some(h) = &half {
             match Clock::new(&now, h, shape, region.clone(), scan_end) {
                 Err(ClockError::Moving { .. }) if 2 * e <= max_epochs => {}
@@ -595,7 +955,8 @@ pub fn plane(px: &[[f32; 2]], shape: [usize; 2]) -> Vec<C64> {
 }
 
 /// The first of `kept`, in order, that `clock` finds converged, with its
-/// time from the scan's end; checked on `threads` threads.
+/// time from the scan's end to [`Kept::taken`], both host clock; checked on
+/// `threads` threads.
 pub fn first_converged(
     clock: &Clock,
     kept: &[Kept],
@@ -637,7 +998,8 @@ mod tests {
     use crate::live::farfield::{Ptycho, PtychoSpec, ScanPath};
     use crate::live::graph::WarmUp;
     use crate::live::pos::{Pos, PosTable};
-    use crate::live::ring::{Ring, UploaderConfig, run_uploader};
+    use crate::live::ring::{Ring, UploaderConfig, run_region_uploader, run_uploader};
+    use crate::live::sent::sent;
 
     struct Streamed {
         ctx: Arc<Context>,
@@ -698,11 +1060,11 @@ mod tests {
             });
             std::thread::spawn(move || run_ap_consumer(ctx, store, cfg, rx, cap_tx, preview))
         };
-        cap_rx.recv().expect("the graphs are captured");
+        let ((), consumer) = sent(&cap_rx, consumer);
         let warm = WarmUp::end();
         let table = Arc::new(PosTable::new(1 << 16));
         let uploader = {
-            let (ring, ctx, stop, store) = (ring.clone(), ctx.clone(), stop.clone(), store.clone());
+            let (ring, stop, store) = (ring.clone(), stop.clone(), store.clone());
             let table = table.clone();
             let up = UploaderConfig {
                 batch: NonZeroUsize::new(4).unwrap(),
@@ -711,7 +1073,7 @@ mod tests {
                 events: 4,
                 pos_wait_ns: 1_000_000_000,
             };
-            std::thread::spawn(move || run_uploader(ring, ctx, store, table, up, stop, Some(tx)))
+            std::thread::spawn(move || run_uploader(ring, store, table, up, stop, Some(tx)))
         };
         let (mut k, mut scan_end) = (0, 0);
         for burst in [5, 1, 13, 0, 17] {
@@ -897,5 +1259,192 @@ mod tests {
             .unwrap();
         assert_eq!(i, first);
         assert_eq!(after.as_nanos() as i64, rep.kept[i].taken - s.scan_end);
+    }
+
+    /// The reported epoch time is the GPU fences' over the epochs after the
+    /// scan landed. Every epoch has an end, in order, each before the host
+    /// held a snapshot that follows it.
+    #[test]
+    fn the_epoch_time_is_the_gpu_fences_after_the_scan() {
+        let rep = streamed(None).rep;
+        let (e, s) = (rep.epochs as usize, rep.scan_epochs.unwrap() as usize);
+        assert!(s > 0, "no epoch ran while the scan landed");
+        let done = &rep.epoch_done;
+        assert_eq!(done.len(), e);
+        assert!(done.windows(2).all(|w| w[0] < w[1]));
+        // CUDA times events to about 0.5 µs.
+        for k in &rep.kept {
+            assert!(done[k.epochs as usize - 1] <= k.taken + rep.epoch_clock_ns + 1_000);
+        }
+        let gpu = (done[e - 1] - done[s - 1]) as f64 / 1e6 / (e - s) as f64;
+        assert_eq!(rep.epoch_ms(), Some(gpu));
+    }
+
+    /// A 12-column raster streamed through the ring into the consumer on 1,
+    /// 2 and 4 GPUs, each GPU's store filled by the uploader with the frames
+    /// the plan gives it: every frame lands with no recapture, epochs run
+    /// while the scan lands, and the last kept object and the viewer's last
+    /// copy are one GPU's replay of the landings, bit for bit. The offline
+    /// run on those stores settles alike on 1, 2 and 4 GPUs: at the same
+    /// epochs, with the same verdict.
+    #[test]
+    fn gpus_follow_a_stream_as_one_gpu_replays_its_landings() {
+        let p = Ptycho::new(PtychoSpec {
+            n: 64,
+            path: ScanPath::Raster { cols: 12 },
+            points: 240,
+            step: 8.0,
+            photons: 1e6,
+            seed: 5,
+            wavelength: 1.5498e-10,
+            distance: 5.0,
+            det_pixel: 75e-6,
+        });
+        let (n, total) = (64usize, p.points());
+        let pos: Vec<(f64, f64)> = (0..total).map(|k| p.position(k)).collect();
+        let counts: Vec<u16> = (0..total).flat_map(|k| p.frame(k)).collect();
+        let rc = ReconCfg {
+            nf_max: NonZeroU32::new(8).unwrap(),
+            snap_every: NonZeroU32::new(5).unwrap(),
+            snaps: 3,
+            ..ReconCfg::default()
+        };
+        let cfg = FollowCfg::plan(&p, NonZeroU32::new(total as u32).unwrap(), &rc);
+        let ctx = Context::new(0).expect("GPU 0");
+        // The one-GPU run's last object and what its offline run found.
+        let (mut probe_obj, mut one) = (None, None);
+        for ngpu in [1, 2, 4] {
+            let ordinals: Vec<usize> = (0..ngpu).collect();
+            let ring = Arc::new(Ring::new(&ctx, 16, n * n).unwrap());
+            let stop = Arc::new(AtomicBool::new(false));
+            let (tx, rx) = crossbeam_channel::unbounded();
+            let (ready_tx, ready_rx) = crossbeam_channel::bounded(1);
+            let (view_tx, view_rx) = crossbeam_channel::bounded(1);
+            let viewer = std::thread::spawn(move || view_rx.iter().collect::<Vec<View>>());
+            let (llk_tx, llk_rx) = crossbeam_channel::unbounded::<Vec<f64>>();
+            let consumer = {
+                let cfg = cfg.clone();
+                let preview = Some(Preview {
+                    period: Duration::from_millis(10),
+                    tx: view_tx,
+                    llk_period: Duration::from_millis(10),
+                    llk: llk_tx,
+                });
+                std::thread::spawn(move || {
+                    run_dist_consumer(&ordinals, Scheme::Strips, cfg, rx, ready_tx, preview)
+                })
+            };
+            let ((stores, route), consumer) = sent(&ready_rx, consumer);
+            assert_eq!(stores.len(), ngpu);
+            let filled = stores.clone();
+            let warm = WarmUp::end();
+            let table = Arc::new(PosTable::new(1 << 16));
+            let uploader = {
+                let (ring, stop, table) = (ring.clone(), stop.clone(), table.clone());
+                let up = UploaderConfig {
+                    batch: NonZeroUsize::new(4).unwrap(),
+                    flush_ns: 100_000,
+                    idle: Duration::from_micros(20),
+                    events: 4,
+                    pos_wait_ns: 1_000_000_000,
+                };
+                std::thread::spawn(move || {
+                    run_region_uploader(ring, stores, route, table, up, stop, Some(tx))
+                })
+            };
+            let mut k = 0;
+            for burst in [50, 1, 90, 0, 99] {
+                for _ in 0..burst {
+                    let mut s = ring.reserve();
+                    s.frame()
+                        .copy_from_slice(&counts[k * n * n..(k + 1) * n * n]);
+                    let (x, y) = pos[k];
+                    table.insert(k as i32, Pos { x, y, t_rx: 0 });
+                    s.commit(k as i32, 0, 0);
+                    k += 1;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert_eq!(k, total);
+            stop.store(true, Ordering::Release);
+            let up = uploader.join().unwrap().unwrap();
+            assert_eq!((up.frames, up.pos_missing), (total as u64, 0));
+            let rep = consumer.join().unwrap().unwrap();
+            let views = viewer.join().unwrap();
+            let llk: Vec<u64> = llk_rx.iter().flatten().map(f64::to_bits).collect();
+            assert_eq!(warm.recaptures(), 0, "{ngpu} GPUs");
+            assert_eq!(rep.positions, pos);
+            assert_eq!((rep.stored, rep.landed), (total as u64, total as u64));
+            let scan_epochs = rep.scan_epochs.unwrap();
+            assert!(scan_epochs > 0, "no epoch ran while the scan landed");
+            assert_eq!(rep.kept.len(), 3);
+            let last = rep.kept.last().unwrap();
+            assert_eq!((rep.epochs, last.epochs), (scan_epochs + 15, rep.epochs));
+            assert_eq!(rep.epoch_done.len() as u64, rep.epochs);
+            assert!(rep.epoch_done.windows(2).all(|w| w[0] < w[1]));
+            let end = views.last().unwrap();
+            assert_eq!(end.epochs, last.epochs);
+            assert_eq!((end.shape, &end.pixels[..]), (rep.shape, &last.pixels[..]));
+
+            ctx.bind_to_thread().unwrap();
+            let st = ctx.new_stream().unwrap();
+            let dev = cuda_core::DeviceBuffer::from_host(&st, &counts).unwrap();
+            let mut run = LiveAp::new(&st, &cfg.ap, &cfg.probe, dev, true).unwrap();
+            let mut backer = run.backer();
+            let mut at = 0;
+            for &(epochs, upto) in &rep.landings {
+                while run.epochs() < epochs {
+                    run.epoch().unwrap();
+                }
+                let v = views_of(&cfg.ap, &cfg.place, &pos[at as usize..upto as usize]);
+                backer.back(&v).unwrap();
+                run.push(&v).unwrap();
+                at = upto;
+            }
+            while run.epochs() < last.epochs {
+                run.epoch().unwrap();
+            }
+            let mut snap = run.new_snapshot().unwrap();
+            run.snapshot(&mut snap).unwrap();
+            assert_eq!(rep.shape, snap.shape());
+            let got = snap.wait().unwrap();
+            let diff = got[..last.pixels.len()]
+                .iter()
+                .zip(&last.pixels)
+                .filter(|(a, b)| a.map(f32::to_bits) != b.map(f32::to_bits))
+                .count();
+            assert_eq!(diff, 0, "{ngpu} GPUs: pixels unlike the replay's");
+            let replayed = run.llk().unwrap().unwrap();
+            assert!(
+                replayed
+                    .iter()
+                    .map(|(_, l)| l.to_bits())
+                    .eq(llk.iter().copied()),
+                "{ngpu} GPUs: {} LLKs sent, {} replayed, or unlike",
+                llk.len(),
+                replayed.len()
+            );
+
+            // Capped, so the run may stop while still moving: what it found then
+            // names the ring and its FRC, which depend on the object as well.
+            let region = cfg.place.scanned(&pos, cfg.ap.shape.frame);
+            let off = offline_dist(&filled, Scheme::Strips, &cfg, &pos, region, 0, 16).unwrap();
+            let obj = &*probe_obj.get_or_insert_with(|| plane(&last.pixels, rep.shape));
+            let found = match off.clock {
+                Ok(c) => format!(
+                    "settled {:x}, scores {:x} {:x}",
+                    c.settled().to_bits(),
+                    c.region_frc(obj).unwrap().to_bits(),
+                    c.whole(obj).unwrap().to_bits()
+                ),
+                Err(e) => e.to_string(),
+            };
+            let found = (off.epochs, found);
+            assert_eq!(
+                &found,
+                one.get_or_insert_with(|| found.clone()),
+                "{ngpu} GPUs: the offline run"
+            );
+        }
     }
 }

@@ -27,11 +27,14 @@ use epics_pva_rs::client_native::PvaClient;
 use epics_pva_rs::server_native::{PvaServer, PvaServerConfig, SharedSource};
 use serde::Deserialize;
 
+use crate::dist::{Scheme, topo};
 use crate::live::args::Args;
 use crate::live::consumer::{ConsumerReport, checksum, run_checksum_consumer};
 use crate::live::eiger::{EigerFrames, Progress, PullReport, connect_pull, run_pull};
+use crate::live::farfield::ScanPath;
 use crate::live::follow::{
-    FollowCfg, FollowReport, Preview, ReconCfg, first_converged, offline_ap, plane, run_ap_consumer,
+    FollowCfg, FollowReport, Landing, Preview, ReconCfg, first_converged, offline_dist, plane,
+    run_dist_consumer,
 };
 use crate::live::graph::WarmUp;
 use crate::live::handoff::work_queue;
@@ -42,9 +45,9 @@ use crate::live::pipeline::{
 use crate::live::pos::PosTable;
 use crate::live::pv_out::{AmpPhase, PvOut, publish};
 use crate::live::pva_source::{NtndFrames, PosStats, monitor_positions};
-use crate::live::ring::{DeviceStore, Ring, UploaderConfig, run_uploader};
+use crate::live::ring::{DeviceStore, Ring, UploaderConfig, Whole, run_region_uploader};
 use crate::live::sched::FairSched;
-use crate::live::stats::{mono_ns, process_cpu_ns, wall_ns};
+use crate::live::stats::{Histogram, mono_ns, process_cpu_ns, wall_ns};
 use crate::live::swmr::{SwmrCfg, SwmrReport, run_swmr};
 use crate::live::synth::Region;
 
@@ -55,6 +58,10 @@ pub struct RecvCfg {
     pub frames: u64,
     /// CUDA device ordinal among `CUDA_VISIBLE_DEVICES`.
     pub gpu: usize,
+    /// GPUs a reconstruction splits the object over: one is `gpu`, more are
+    /// the first `gpus` visible ones in NUMA order, a raster cut in strips
+    /// and a Fermat spiral in sectors.
+    pub gpus: usize,
     pub source: SourceCfg,
     /// PVA server of `<prefix>FRAME` (source pva) and `<prefix>POS` (pva, zmq).
     pub addr: SocketAddr,
@@ -87,7 +94,8 @@ pub struct RecvCfg {
     pub flush_us: i64,
     pub idle_us: u64,
     pub ring_slots: usize,
-    /// Device store capacity; `frames` when unset.
+    /// Device store capacity of the checksum run, `frames` when unset; a
+    /// reconstruction's stores hold `frames`.
     pub store_frames: Option<usize>,
     pub graph_batch: NonZeroU32,
     pub rt_threads: usize,
@@ -113,6 +121,7 @@ impl Default for RecvCfg {
         Self {
             frames: 30_000,
             gpu: 0,
+            gpus: 1,
             source: SourceCfg::Pva,
             addr: ([127, 0, 0, 1], 15075).into(),
             prefix: "PTY:".into(),
@@ -244,6 +253,7 @@ impl RecvCfg {
         Self {
             frames: a.get("frames", d.frames),
             gpu: a.get("gpu", d.gpu),
+            gpus: a.get("gpus", d.gpus),
             source,
             addr: a.get("addr", d.addr),
             prefix: a.str("prefix", &d.prefix),
@@ -344,6 +354,13 @@ impl RecvReport {
     }
 }
 
+/// What the graph thread does with the stored frames: checksums those of
+/// the store, or reconstructs with a settle limit.
+enum Job {
+    Sums(Arc<DeviceStore>),
+    Recon(FollowCfg, u64),
+}
+
 /// What the graph thread did with the stored frames.
 enum Consumed {
     Sums(ConsumerReport),
@@ -381,7 +398,52 @@ fn follow_cfg(cfg: &RecvCfg, model: &Model, rc: &ReconCfg) -> Result<FollowCfg, 
     Ok(FollowCfg::plan(p, nframe, rc))
 }
 
-/// Stored frames, sequence number `s` holding trigger `uids[s]`, that differ
+/// The GPUs the run lands frames on, region `r` on the `r`-th, and how a
+/// reconstruction cuts the object over them.
+fn regions(cfg: &RecvCfg, model: &Model) -> Result<(Vec<usize>, Scheme), RecvError> {
+    let refuse = |cause: String| RecvError {
+        what: "gpus",
+        cause,
+    };
+    let scheme = match model {
+        Model::Ptycho(p) if matches!(p.spec().path, ScanPath::Fermat) => {
+            Scheme::Sectors { centre: None }
+        }
+        _ => Scheme::Strips,
+    };
+    if cfg.gpus == 1 {
+        return Ok((vec![cfg.gpu], scheme));
+    }
+    if cfg.gpus == 0 || cfg.recon.is_none() {
+        return Err(refuse(format!(
+            "{}: only a reconstruction runs on more than one",
+            cfg.gpus
+        )));
+    }
+    let devs = topo::devices().map_err(fail("GPU topology"))?;
+    let order = topo::numa_grouped(&devs);
+    if order.len() < cfg.gpus {
+        return Err(refuse(format!("{} of {} visible", cfg.gpus, order.len())));
+    }
+    Ok((order[..cfg.gpus].to_vec(), scheme))
+}
+
+/// The landing indices of the frames each of `nregion` stores holds, in the
+/// order of their places there; `routes` as in
+/// [`UploadReport::routes`](crate::live::ring::UploadReport::routes).
+fn region_frames(routes: &[u32], nregion: usize) -> Vec<Vec<u64>> {
+    (0..nregion)
+        .map(|r| {
+            (0u64..)
+                .zip(routes)
+                .filter(|&(_, m)| m >> r & 1 == 1)
+                .map(|(f, _)| f)
+                .collect()
+        })
+        .collect()
+}
+
+/// Stored frames, place `s` holding trigger `uids[s]`, that differ
 /// from their synthesis over `r`; read back a slab at a time and compared
 /// on `threads` threads.
 fn stored_bad(
@@ -427,11 +489,16 @@ fn stored_bad(
 }
 
 /// The `recv recon` line and whether a live object matched: the offline run
-/// on the stored frames, the clock from `scan_end` over the scanned region,
-/// and the first kept snapshot it finds converged.
+/// on the stored frames, over the same regions of `scheme` as the live run,
+/// the clock from `scan_end` over the scanned region, and the first kept
+/// snapshot it finds converged. `converged_ms` is host
+/// clock at both ends: from the last frame's arrival on the host
+/// (`scan_end`) to the host's receipt of that snapshot
+/// ([`Kept::taken`](crate::live::follow::Kept::taken)), when the result is
+/// in hand.
 fn recon_line(
-    ctx: &Arc<Context>,
-    store: &DeviceStore,
+    stores: &[Arc<DeviceStore>],
+    scheme: Scheme,
     follow: &FollowCfg,
     settle_max: u64,
     rep: &FollowReport,
@@ -442,13 +509,6 @@ fn recon_line(
     let region = follow.place.scanned(&rep.positions, follow.ap.shape.frame);
     let [rows, cols] = &region;
     let scan_epochs = rep.scan_epochs.unwrap_or(0);
-    // Epoch time once the scan landed, from the kept snapshots' stamps.
-    let epoch_ms = match (rep.kept.first(), rep.kept.last()) {
-        (Some(a), Some(b)) if b.epochs > a.epochs => {
-            Some((b.taken - a.taken) as f64 / 1e6 / (b.epochs - a.epochs) as f64)
-        }
-        _ => None,
-    };
     let mut l = format!(
         "recv recon algo=ap nf_max={} stacks={} tile_cap={} stored={} landed={} scan_epochs={scan_epochs} \
          epochs={} snap_every={} kept={} epoch_ms={} object={ny}x{nx} obj_mapped_MiB={} \
@@ -461,7 +521,7 @@ fn recon_line(
         rep.epochs,
         follow.snap_every,
         rep.kept.len(),
-        Fig(epoch_ms, 3),
+        Fig(rep.epoch_ms(), 3),
         rep.obj_mapped_bytes >> 20,
         rep.plan_time.as_secs_f64() * 1e3,
         rep.plan_mapped_bytes >> 20,
@@ -474,9 +534,9 @@ fn recon_line(
         l += " clock=none no_scan_end";
         return Ok((l, false));
     };
-    let off = offline_ap(
-        ctx,
-        store,
+    let off = offline_dist(
+        stores,
+        scheme,
         follow,
         &rep.positions,
         region,
@@ -523,6 +583,26 @@ fn recon_line(
     Ok((l, hit.is_some()))
 }
 
+/// Frame arrival (`t_rx`, by store place) → end of the first epoch that
+/// took the frame; and [`FollowReport::epochs_after_scan`].
+fn epoch_latency(rep: &FollowReport, t_rx: &[i64]) -> (Histogram, Histogram) {
+    let (mut to_epoch, mut epoch) = (Histogram::new(1_000_000), Histogram::new(1_000_000));
+    let mut f0 = 0;
+    for &(e, stored) in &rep.landings {
+        let landed = t_rx.get(f0 as usize..stored.min(rep.landed) as usize);
+        if let (Some(ts), Some(&done)) = (landed, rep.epoch_done.get(e as usize)) {
+            for t in ts {
+                to_epoch.record(done - t);
+            }
+        }
+        f0 = stored;
+    }
+    for t in rep.epochs_after_scan() {
+        epoch.record(t);
+    }
+    (to_epoch, epoch)
+}
+
 /// The frame source as [`run`] opens it before the GPU setup. Only ZMQ has
 /// anything to open: PVA connects lazily and the SWMR file may not exist
 /// before its writer starts.
@@ -559,6 +639,7 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
         .as_ref()
         .map(|rc| Ok::<_, RecvError>((follow_cfg(cfg, &model, rc)?, rc.settle_max)))
         .transpose()?;
+    let (ordinals, scheme) = regions(cfg, &model)?;
     let truth: Arc<dyn Truth> = Arc::new(model);
     let ucfg = UploaderConfig {
         batch: cfg.batch,
@@ -603,16 +684,8 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
         }),
     };
 
-    let ctx = Context::new(cfg.gpu).map_err(fail("CUDA context"))?;
+    let ctx = Context::new(ordinals[0]).map_err(fail("CUDA context"))?;
     let ring = Arc::new(Ring::new(&ctx, cfg.ring_slots, crop * crop).map_err(fail("pinned ring"))?);
-    let store = Arc::new(
-        DeviceStore::new(
-            &ctx,
-            cfg.store_frames.unwrap_or(frames as usize),
-            crop * crop,
-        )
-        .map_err(fail("device store"))?,
-    );
     // The live results' PVs, served on a runtime of their own: the frame
     // sources' runtime stops at the scan's end, the live run later. The
     // publisher posts the probe now and each object copy the live run hands
@@ -665,55 +738,80 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
     };
     let (btx, brx) = crossbeam_channel::unbounded();
     let (cap_tx, cap_rx) = crossbeam_channel::bounded(1);
+    let (ready_tx, ready_rx) = crossbeam_channel::bounded::<Landing>(1);
+    // The checksum graph reads a store made here; a reconstruction makes
+    // its regions' own.
+    let job = match follow {
+        None => Job::Sums(Arc::new(
+            DeviceStore::new(
+                &ctx,
+                cfg.store_frames.unwrap_or(frames as usize),
+                crop * crop,
+            )
+            .map_err(fail("device store"))?,
+        )),
+        Some((follow, settle_max)) => Job::Recon(follow, settle_max),
+    };
+    let sums = match &job {
+        Job::Sums(store) => Some(store.clone()),
+        Job::Recon(..) => None,
+    };
     let consumer = {
-        let (ctx, store, place) = (ctx.clone(), store.clone(), place.clone());
+        let (ctx, place, ordinals) = (ctx.clone(), place.clone(), ordinals.clone());
         let batch = cfg.graph_batch;
         std::thread::Builder::new()
             .name("graph".into())
             .spawn(move || {
                 place.enter(place.rt.as_deref());
-                match follow {
-                    None => {
-                        run_checksum_consumer(ctx, store, batch, brx, cap_tx).map(Consumed::Sums)
-                    }
-                    Some((follow, settle_max)) => {
+                match job {
+                    Job::Sums(store) => run_checksum_consumer(ctx, store, batch, brx, cap_tx)
+                        .map(Consumed::Sums)
+                        .map_err(|e| e.to_string()),
+                    Job::Recon(follow, settle_max) => {
                         let f = follow.clone();
-                        run_ap_consumer(ctx, store, f, brx, cap_tx, preview).map(|rep| {
-                            Consumed::Recon(Box::new(Recon {
-                                rep,
-                                follow,
-                                settle_max,
-                            }))
-                        })
+                        run_dist_consumer(&ordinals, scheme, f, brx, ready_tx, preview)
+                            .map(|rep| {
+                                Consumed::Recon(Box::new(Recon {
+                                    rep,
+                                    follow,
+                                    settle_max,
+                                }))
+                            })
+                            .map_err(|e| e.to_string())
                     }
                 }
             })
             .unwrap()
     };
-    // The warm-up ends once the graph is captured, before any source starts.
-    let warm = match cap_rx.recv() {
-        Ok(()) => WarmUp::end(),
-        Err(_) => {
-            let failed = consumer.join().unwrap().err();
-            return Err(fail("graph capture")(failed.map_or_else(
-                || "the consumer ended before its capture".to_string(),
-                |e| e.to_string(),
-            )));
-        }
+    // The warm-up ends once the graphs are captured, before any source
+    // starts.
+    let landing = match &sums {
+        Some(store) => cap_rx
+            .recv()
+            .map(|()| -> Landing { (vec![store.clone()], Box::new(Whole)) })
+            .ok(),
+        None => ready_rx.recv().ok(),
     };
+    let Some((stores, route)) = landing else {
+        let failed = consumer.join().unwrap().err();
+        return Err(fail("graph capture")(failed.unwrap_or_else(|| {
+            "the consumer ended before its capture".to_string()
+        })));
+    };
+    let warm = WarmUp::end();
     // From here on every exit, failed or not, goes through the one shutdown
     // below: the source and its Sender go, the workers drain, the uploader
     // lands what they committed and the consumer sees its last batch.
     let stop = Arc::new(AtomicBool::new(false));
     let pos = Arc::new(PosTable::new(1 << 16));
     let uploader = {
-        let (ring, ctx, stop, place) = (ring.clone(), ctx.clone(), stop.clone(), place.clone());
-        let (store, pos) = (store.clone(), pos.clone());
+        let (ring, stop, place) = (ring.clone(), stop.clone(), place.clone());
+        let (stores, pos) = (stores.clone(), pos.clone());
         std::thread::Builder::new()
             .name("h2d".into())
             .spawn(move || {
                 place.enter_h2d();
-                run_uploader(ring, ctx, store, pos, ucfg, stop, Some(btx))
+                run_region_uploader(ring, stores, route, pos, ucfg, stop, Some(btx))
             })
             .unwrap()
     };
@@ -881,24 +979,39 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
     place.enter(place.all.as_deref());
 
     // End-to-end check of the landed frames the ring still holds: their
-    // place in the device store against the host ring slot and against a
-    // fresh synthesis of the same crop; the position and uid of every stored
-    // frame.
+    // copy in the store of every region they landed on against the host ring
+    // slot and against a fresh synthesis of the same crop; the position and
+    // uid of every frame of every store.
     let se = crop * crop;
     let host = ring.host_frames();
+    let held = region_frames(&up.routes, stores.len());
+    let region_uids: Vec<Vec<i32>> = held
+        .iter()
+        .map(|h| h.iter().map(|&f| up.uids[f as usize]).collect())
+        .collect();
     let filled: Vec<(usize, u64, i32)> = (0..ring.slots())
         .filter_map(|i| ring.slot(i).map(|(f, uid)| (i, f, uid)))
         .collect();
-    let mut dev = vec![0u16; filled.len() * se];
-    for (k, &(_, f, _)) in filled.iter().enumerate() {
-        store
-            .read_frames(f..f + 1, &mut dev[k * se..(k + 1) * se])
+    // Slot, uid, region and place there of every copy.
+    let copies: Vec<(usize, i32, usize, u64)> = filled
+        .iter()
+        .flat_map(|&(i, f, uid)| {
+            let (held, on) = (&held, up.routes[f as usize]);
+            (0..stores.len())
+                .filter(move |r| on >> r & 1 == 1)
+                .map(move |r| (i, uid, r, held[r].partition_point(|&g| g < f) as u64))
+        })
+        .collect();
+    let mut dev = vec![0u16; copies.len() * se];
+    for (&(_, _, r, at), dev) in copies.iter().zip(dev.chunks_mut(se)) {
+        stores[r]
+            .read_frames(at..at + 1, dev)
             .map_err(fail("store readback"))?;
     }
     let threads = std::thread::available_parallelism().map_or(8, |n| n.get());
-    let per = filled.len().div_ceil(threads).max(1);
+    let per = copies.len().div_ceil(threads).max(1);
     let (h2d_bad, e2e_bad): (usize, usize) = std::thread::scope(|sc| {
-        filled
+        copies
             .chunks(per)
             .zip(dev.chunks(per * se))
             .map(|(chunk, dev)| {
@@ -906,7 +1019,7 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
                 sc.spawn(move || {
                     let mut buf = vec![0u16; se];
                     let (mut h2d, mut e2e) = (0, 0);
-                    for (&(i, _, uid), d) in chunk.iter().zip(dev.chunks(se)) {
+                    for (&(i, uid, ..), d) in chunk.iter().zip(dev.chunks(se)) {
                         h2d += usize::from(host[i * se..(i + 1) * se] != *d);
                         truth.fill(uid, geom.crop_region(), &mut buf);
                         e2e += usize::from(buf[..] != *d);
@@ -919,17 +1032,19 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
             .map(|h| h.join().unwrap())
             .fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1))
     });
-    let dpos = store
-        .read_positions(up.frames)
-        .map_err(fail("store readback"))?;
-    let store_pos_bad = up
-        .uids
-        .iter()
-        .enumerate()
-        .filter(|&(s, &uid)| (dpos[2 * s], dpos[2 * s + 1]) != truth.position(uid))
-        .count();
-    // Every stored frame as the graph saw it, or as the store holds it for
-    // the reconstruction, against its synthesis.
+    let mut store_pos_bad = 0;
+    for (store, uids) in stores.iter().zip(&region_uids) {
+        let dpos = store
+            .read_positions(uids.len() as u64)
+            .map_err(fail("store readback"))?;
+        store_pos_bad += uids
+            .iter()
+            .enumerate()
+            .filter(|&(s, &uid)| (dpos[2 * s], dpos[2 * s + 1]) != truth.position(uid))
+            .count();
+    }
+    // Every stored frame as the graph saw it, or as each region's store
+    // holds it for the reconstruction, against its synthesis.
     let sum_bad: usize = match &cons {
         Consumed::Sums(cons) => {
             let per = up.uids.len().div_ceil(threads).max(1);
@@ -956,13 +1071,17 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
                     .sum()
             })
         }
-        Consumed::Recon(_) => stored_bad(&store, &up.uids, &*truth, geom.crop_region(), threads)?,
+        Consumed::Recon(_) => stores
+            .iter()
+            .zip(&region_uids)
+            .map(|(store, uids)| stored_bad(store, uids, &*truth, geom.crop_region(), threads))
+            .sum::<Result<usize, _>>()?,
     };
     let recon = match &cons {
         Consumed::Sums(_) => None,
         Consumed::Recon(r) => Some(recon_line(
-            &ctx,
-            &store,
+            &stores,
+            scheme,
             &r.follow,
             r.settle_max,
             &r.rep,
@@ -990,7 +1109,7 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
         Consumed::Sums(c) => c.consumed,
         Consumed::Recon(r) => r.rep.landed,
     };
-    let rx_lost = FrameLoss::new(&st, wr.decode_err, up.pos_missing, consumed);
+    let rx_lost = FrameLoss::new(&st, wr.decode_err, up.pos_missing, up.pos_invalid, consumed);
     let mut s = String::new();
     // Writing to a String cannot fail.
     let mut line = |args: fmt::Arguments| {
@@ -1001,7 +1120,7 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
         "recv expected={frames} received_unique={} gpu_frames={} lost={lost} rx_lost={} \
          unaccounted={} dup={} beyond={} \
          gap_events={} gap_frames={} out_of_order={} queue_full={} rejected={} placeholders={} \
-         decode_err={} pos_missing={} pos_crowded={} pos_waits={} pos_updates={} pos_rejected={}",
+         decode_err={} pos_missing={} pos_invalid={} pos_crowded={} pos_waits={} pos_updates={} pos_rejected={}",
         st.unique,
         up.frames,
         rx_lost.total(),
@@ -1016,6 +1135,7 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
         st.placeholders,
         wr.decode_err,
         up.pos_missing,
+        up.pos_invalid,
         up.pos_crowded,
         up.pos_waits,
         ps.updates,
@@ -1066,6 +1186,22 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
         ),
     ));
     line(format_args!("recv rx_to_gpu {}", up.rx_to_gpu.summary()));
+    for (r, (reg, gpu)) in up.regions.iter().zip(&ordinals).enumerate() {
+        line(format_args!(
+            "recv region{r}_rx_to_gpu gpu={gpu} frames={} MiB={} {}",
+            reg.frames,
+            reg.bytes >> 20,
+            reg.rx_to_gpu.summary()
+        ));
+        line(format_args!(
+            "recv region{r}_enqueue {}",
+            reg.enqueue.summary()
+        ));
+    }
+    line(format_args!(
+        "recv rx_to_commit {}",
+        up.rx_to_commit.summary()
+    ));
     line(format_args!("recv pub_to_gpu {}", up.pub_to_gpu.summary()));
     line(format_args!(
         "recv commit_to_gpu {}",
@@ -1085,7 +1221,7 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
         wr.verify_bad,
         filled.len(),
         up.uids.len(),
-        store.mapped_bytes() >> 20,
+        stores.iter().map(|s| s.mapped_bytes()).sum::<usize>() >> 20,
     ));
     let consumed_bad = usize::from(match &cons {
         Consumed::Sums(c) => {
@@ -1102,6 +1238,13 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
         Consumed::Recon(r) => {
             line(format_args!(
                 "recv recon_store frames_bad={sum_bad} recaptures={recaptures}"
+            ));
+            let (to_epoch, epoch) = epoch_latency(&r.rep, &up.t_rx);
+            line(format_args!("recv frame_to_epoch {}", to_epoch.summary()));
+            line(format_args!(
+                "recv epoch_after_scan {} clock_err_us={:.1}",
+                epoch.summary(),
+                r.rep.epoch_clock_ns as f64 / 1e3
             ));
             r.rep.stored != up.frames || r.rep.landed != r.rep.stored
         }
@@ -1182,6 +1325,7 @@ mod tests {
         let want = RecvCfg {
             frames: 1234,
             gpu: 1,
+            gpus: 2,
             source: SourceCfg::H5(H5Cfg {
                 path: "/x/scan.h5".into(),
                 readers: 2,
@@ -1313,6 +1457,8 @@ mod tests {
             "256",
             "--store-frames",
             "2000",
+            "--gpus",
+            "2",
             "--graph-batch",
             "8",
             "--rt-threads",
@@ -1375,6 +1521,7 @@ mod tests {
             idle-us = 20
             ring-slots = 256
             store-frames = 2000
+            gpus = 2
             graph-batch = 8
             rt-threads = 2
             cpus = "2-5"
@@ -1553,5 +1700,47 @@ mod tests {
         }
         let synth = ModelCfg::default().build();
         assert!(follow_cfg(&ok, &synth, &rc).is_err());
+    }
+
+    /// One GPU is `gpu` whatever runs on it; any other count is refused
+    /// before a device is opened unless a reconstruction takes it. A raster
+    /// is cut in strips, a Fermat spiral in sectors.
+    #[test]
+    fn one_gpu_is_the_ordinal_given_and_more_need_a_reconstruction() {
+        let raster = RecvCfg {
+            gpu: 3,
+            model: ModelCfg::Ptycho(PtychoCfg {
+                path: PathKind::Raster,
+                ..PtychoCfg::default()
+            }),
+            ..RecvCfg::default()
+        };
+        let got = regions(&raster, &raster.model.build()).unwrap();
+        assert_eq!(got, (vec![3], Scheme::Strips));
+        let fermat = RecvCfg {
+            model: ModelCfg::Ptycho(PtychoCfg {
+                path: PathKind::Fermat,
+                ..PtychoCfg::default()
+            }),
+            ..RecvCfg::default()
+        };
+        let got = regions(&fermat, &fermat.model.build()).unwrap();
+        assert_eq!(got, (vec![0], Scheme::Sectors { centre: None }));
+        for gpus in [0, 2] {
+            let c = RecvCfg {
+                gpus,
+                ..raster.clone()
+            };
+            let e = regions(&c, &c.model.build()).unwrap_err().to_string();
+            assert!(e.starts_with(&format!("gpus: {gpus}")), "{e}");
+        }
+    }
+
+    /// A region's store holds the frames routed to it in landing order: a
+    /// frame on one region, on two, and a region with none.
+    #[test]
+    fn a_stores_places_are_its_frames_in_landing_order() {
+        let held = region_frames(&[0b01, 0b10, 0b11, 0b01], 3);
+        assert_eq!(held, [vec![0, 2, 3], vec![1, 2], vec![]]);
     }
 }

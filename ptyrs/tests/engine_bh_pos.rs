@@ -12,6 +12,9 @@ use ptyrs::engine::{Bh, BhParams, Features, Optics, Ptycho};
 
 #[path = "common/engine/mod.rs"]
 mod common;
+#[path = "common/worst.rs"]
+mod worst;
+use worst::worst_of;
 
 fn table(text: &str) -> Vec<Vec<f64>> {
     text.lines()
@@ -20,14 +23,14 @@ fn table(text: &str) -> Vec<Vec<f64>> {
 }
 
 fn max_abs(a: &[f64]) -> f64 {
-    a.iter().map(|a| a.abs()).fold(0.0, f64::max)
+    worst_of(a.iter().map(|a| a.abs()))
 }
 
 /// `max |a − b| / scale`.
 fn max_rel(a: &[f64], b: &[f64], scale: f64) -> f64 {
     assert_eq!(a.len(), b.len());
     let d = a.iter().zip(b).map(|(a, b)| (a - b).abs());
-    d.fold(0.0, f64::max) / scale
+    worst_of(d) / scale
 }
 
 fn rel(a: f64, b: f64) -> f64 {
@@ -72,7 +75,7 @@ fn assert_model(batch_size: usize, steps: &str, obj: &str, probe: &str, table_of
         position_rho: 2.0,
         seed: 7,
     };
-    let mut bh = Bh::new(params).with_features(features).unwrap();
+    let mut bh = Bh::new(params).unwrap().with_features(features).unwrap();
     let (o0, p0) = (p.object().clone(), p.probe().clone());
     let (mut object, mut pr) = (o0.clone(), p0.clone());
     let mut got = Vec::new();

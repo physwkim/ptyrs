@@ -4,12 +4,15 @@
 //!   `save_ptycho_data_cxi` writes and `pynx-ptycho-cxi` reads.
 //! - [`write_modes`] / [`read_modes`]: an object and probe pair (for example the initial
 //!   values a run starts from) as complex128 datasets h5py reads as `complex128` arrays.
+//! - [`read_ptyr`]: the object and probe of a PtyPy `.ptyr` reconstruction file.
 
 mod cxi;
 mod modes;
+mod ptyr;
 
 pub use cxi::{read_cxi, write_cxi};
 pub use modes::{read_modes, write_modes};
+pub use ptyr::{Ptyr, read_ptyr};
 
 /// Errors from reading or writing ptyrs files.
 #[derive(Debug, thiserror::Error)]

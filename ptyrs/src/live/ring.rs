@@ -14,11 +14,18 @@
 //! its position is dropped `pos_wait_ns` after it arrived, or sooner, as soon
 //! as a worker needs its slot: a missing position holds the frames behind it
 //! only while the ring has room for them, so it never costs another frame.
+//! One whose position arrived but is no scan position is dropped at once.
 //!
 //! On the device every landed frame has its own place in a [`DeviceStore`],
 //! the next one in landing order, so an uploaded frame is never overwritten
 //! (invariant 3) and its address is fixed and backed before the first frame
 //! (invariant 9).
+//!
+//! A scan cut over GPUs has one store per region. A [`Route`] says from a
+//! frame's position which regions it lands on, and the uploader copies it
+//! from the ring straight into each of those regions' stores, at the
+//! region's next place: no GPU holds another's frames. One store taking
+//! every frame ([`Whole`]) is the one-region case of the same loop.
 
 use std::collections::VecDeque;
 use std::num::NonZeroUsize;
@@ -29,10 +36,10 @@ use std::time::Duration;
 
 use crossbeam_channel::Sender;
 use cuda_bindings::CUdeviceptr;
-use cuda_core::{Context, DeviceBuffer, DriverError, Event, IntoResult, PinnedHostBuffer};
+use cuda_core::{Context, DeviceBuffer, DriverError, Event, IntoResult, PinnedHostBuffer, Stream};
 
 use crate::live::grow::{GrowBuf, GrowError};
-use crate::live::pos::PosTable;
+use crate::live::pos::{Entry, PosTable};
 use crate::live::stats::{Histogram, thread_cpu_ns, wall_ns};
 
 #[derive(Default)]
@@ -41,8 +48,8 @@ struct Meta {
     t_rx: AtomicI64,
     t_pub: AtomicI64,
     t_commit: AtomicI64,
-    /// Store place + 1 of the slot's frame once it landed, 0 once it dropped;
-    /// written by the uploader only.
+    /// Landing index + 1 of the slot's frame once it landed, 0 once it
+    /// dropped; written by the uploader only.
     place: AtomicU64,
 }
 
@@ -58,6 +65,9 @@ pub struct Ring {
     done: Box<[AtomicU64]>,
     meta: Box<[Meta]>,
     stalls: AtomicU64,
+    /// Frames that reached the head of the ring before their position did:
+    /// counted by the uploader the moment it starts waiting at one.
+    pos_waits: AtomicU64,
 }
 
 // SAFETY: the raw pointers address the pinned buffers this struct owns. A
@@ -117,6 +127,7 @@ impl Ring {
             done: (0..slots).map(|_| AtomicU64::new(0)).collect(),
             meta: (0..slots).map(|_| Meta::default()).collect(),
             stalls: AtomicU64::new(0),
+            pos_waits: AtomicU64::new(0),
         })
     }
 
@@ -147,6 +158,11 @@ impl Ring {
         self.stalls.load(Ordering::Relaxed)
     }
 
+    /// Frames the uploader has waited at for their position, so far.
+    pub fn pos_waits(&self) -> u64 {
+        self.pos_waits.load(Ordering::Acquire)
+    }
+
     /// Host copy of the ring, for end-of-run checks once every worker and
     /// the uploader have stopped.
     pub fn host_frames(&self) -> &[u16] {
@@ -157,8 +173,9 @@ impl Ring {
         self.pos.as_slice()
     }
 
-    /// `(store place, uid)` of the frame last committed to slot `i` if it
-    /// landed, for end-of-run checks once the uploader has stopped.
+    /// `(landing index, uid)` of the frame last committed to slot `i` if it
+    /// landed, for end-of-run checks once the uploader has stopped: its
+    /// place in the store when one store takes every frame.
     pub fn slot(&self, i: usize) -> Option<(u64, i32)> {
         let m = &self.meta[i];
         let place = m.place.load(Ordering::Relaxed);
@@ -169,7 +186,8 @@ impl Ring {
 
 impl Drop for Ring {
     fn drop(&mut self) {
-        // An uploader that returned an error left its copies out of the slots queued.
+        // The uploader waits for its own copies; this covers anyone else's
+        // queued on the ring's context.
         let _ = self.frames.context().synchronize();
     }
 }
@@ -210,6 +228,11 @@ impl DeviceStore {
             max_frames: max_frames as u64,
             ctx: ctx.clone(),
         })
+    }
+
+    /// The context that owns the store.
+    pub fn ctx(&self) -> &Arc<Context> {
+        &self.ctx
     }
 
     pub fn frames_ptr(&self) -> CUdeviceptr {
@@ -294,8 +317,9 @@ impl DeviceStore {
     }
 }
 
-/// The frames at places `f0..f0 + n` are in the [`DeviceStore`]. Batches are
-/// sent in place order and without gaps.
+/// The frames of landing indices `f0..f0 + n` are in the [`DeviceStore`] of
+/// every region they are routed to. Batches are sent in landing order and
+/// without gaps.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FrameBatch {
     pub f0: u64,
@@ -325,6 +349,9 @@ pub struct UploadReport {
     pub frames: u64,
     /// Frames dropped because their position did not come in time.
     pub pos_missing: u64,
+    /// Frames dropped because the position that came is no scan position
+    /// ([`Entry::Invalid`]); none of them waited.
+    pub pos_invalid: u64,
     /// Of `pos_missing`, those dropped before `pos_wait_ns` because a worker
     /// needed their slot.
     pub pos_crowded: u64,
@@ -337,55 +364,200 @@ pub struct UploadReport {
     pub batches: u64,
     pub bytes: u64,
     pub max_inflight: usize,
-    /// Monitor callback → H2D completion seen by the uploader.
+    /// Monitor callback → H2D completion seen by the uploader, on the last
+    /// of the frame's regions.
     pub rx_to_gpu: Histogram,
+    /// Monitor callback → worker commit into the pinned ring, the span the
+    /// Python baseline's `rx_to_ring` times.
+    pub rx_to_commit: Histogram,
     /// Simulator `dataTimeStamp` → H2D completion.
     pub pub_to_gpu: Histogram,
     /// Worker commit → H2D completion (batching + copy + poll).
     pub commit_to_gpu: Histogram,
     pub cpu_ns: i64,
-    /// uid of every landed frame, by store place.
+    /// uid of every landed frame, by landing index.
     pub uids: Vec<i32>,
+    /// Monitor callback wall time of every landed frame, by landing index.
+    pub t_rx: Vec<i64>,
+    /// The regions every landed frame went to, by landing index: bit `r`
+    /// for region `r`, as its [`Route`] gave them.
+    pub routes: Vec<u32>,
+    pub regions: Vec<RegionReport>,
 }
 
-/// A batch copy in flight: frames `seq0..seq0 + n` of the ring to places
-/// `f0..f0 + n`; its completion releases the ring up to `release`, past
-/// any frames dropped after it.
+/// Decides from a frame's position the regions it lands on. The uploader
+/// gives each region's store the frames routed to it, in landing order, so a
+/// frame's place there is the number of frames routed to the region before
+/// it: whoever numbers a region's frames must count with the same rule.
+pub trait Route: Send {
+    /// Regions, at most 32.
+    fn nregion(&self) -> usize;
+
+    /// Bit `r` set for every region the frame at `pos`, `(x, y)` m, lands
+    /// on; at least one.
+    fn regions(&mut self, pos: (f64, f64)) -> u32;
+}
+
+/// One region takes every frame.
+pub struct Whole;
+
+impl Route for Whole {
+    fn nregion(&self) -> usize {
+        1
+    }
+
+    fn regions(&mut self, _: (f64, f64)) -> u32 {
+        1
+    }
+}
+
+impl<R: Route + ?Sized> Route for Box<R> {
+    fn nregion(&self) -> usize {
+        (**self).nregion()
+    }
+
+    fn regions(&mut self, pos: (f64, f64)) -> u32 {
+        (**self).regions(pos)
+    }
+}
+
+/// One region's share of an [`UploadReport`].
+pub struct RegionReport {
+    /// Frames landed in its store.
+    pub frames: u64,
+    pub bytes: u64,
+    /// Monitor callback → completion of the frame's copy into this region,
+    /// seen by the uploader.
+    pub rx_to_gpu: Histogram,
+    /// Time the uploader spent queueing one batch's copies to this region:
+    /// the copy's own time if the driver staged it instead of reading the
+    /// ring in place.
+    pub enqueue: Histogram,
+}
+
+/// A batch in flight: frames `seq0..seq0 + n` of the ring, landing indices
+/// `f0..f0 + n`, copied to every region one of them is routed to; its
+/// completion on all of them releases the ring up to `release`, past any
+/// frames dropped after it.
 struct Flight {
+    /// Its event in every region's pool.
     ev: usize,
     seq0: u64,
     f0: u64,
     n: u64,
     release: u64,
+    /// Regions whose copy has not been seen complete.
+    wait: u32,
 }
 
-/// Run until `stop` is set and everything reserved has landed in `store` or
-/// dropped; each landed batch is sent to `batches` if given, which should be
-/// unbounded: a full channel stalls the uploader. Frames land in sequence
-/// order, each once its position is in `pos`.
+/// The uploader's side of one region.
+struct Lane {
+    store: Arc<DeviceStore>,
+    stream: Arc<Stream>,
+    events: Vec<Event>,
+    /// Places taken in the store.
+    placed: u64,
+    rep: RegionReport,
+}
+
+impl Lane {
+    fn new(store: Arc<DeviceStore>, events: usize) -> Result<Self, DriverError> {
+        store.ctx.bind_to_thread()?;
+        Ok(Self {
+            stream: store.ctx.new_stream()?,
+            events: (0..events)
+                .map(|_| store.ctx.new_event_with_flags(None))
+                .collect::<Result<_, _>>()?,
+            store,
+            placed: 0,
+            rep: RegionReport {
+                frames: 0,
+                bytes: 0,
+                rx_to_gpu: Histogram::new(200_000),
+                enqueue: Histogram::new(200_000),
+            },
+        })
+    }
+}
+
+/// Makes region `r`'s context current, `bound` being the one that is.
+fn bind(lanes: &[Lane], bound: &mut usize, r: usize) -> Result<(), DriverError> {
+    if *bound != r {
+        lanes[r].store.ctx.bind_to_thread()?;
+        *bound = r;
+    }
+    Ok(())
+}
+
+fn bits(mask: u32) -> impl Iterator<Item = usize> {
+    (0..32).filter(move |r| mask >> r & 1 == 1)
+}
+
+/// [`run_region_uploader`] with one store taking every frame.
 pub fn run_uploader(
     ring: Arc<Ring>,
-    ctx: Arc<Context>,
     store: Arc<DeviceStore>,
     pos: Arc<PosTable>,
     cfg: UploaderConfig,
     stop: Arc<AtomicBool>,
     batches: Option<Sender<FrameBatch>>,
 ) -> Result<UploadReport, GrowError> {
-    ctx.bind_to_thread()?;
-    let stream = ctx.new_stream()?;
+    run_region_uploader(ring, vec![store], Whole, pos, cfg, stop, batches)
+}
+
+/// Run until `stop` is set and everything reserved has landed or dropped;
+/// each landed batch is sent to `batches` if given, which should be
+/// unbounded: a full channel stalls the uploader. Frames land in sequence
+/// order, each once its position is in `pos`, in `stores[r]` for every
+/// region `r` that `route` gives its position, and a batch is sent once all
+/// of them hold it. Waits for its copies on every exit.
+pub fn run_region_uploader(
+    ring: Arc<Ring>,
+    stores: Vec<Arc<DeviceStore>>,
+    mut route: impl Route,
+    pos: Arc<PosTable>,
+    cfg: UploaderConfig,
+    stop: Arc<AtomicBool>,
+    batches: Option<Sender<FrameBatch>>,
+) -> Result<UploadReport, GrowError> {
+    assert_eq!(stores.len(), route.nregion());
+    assert!((1..=32).contains(&stores.len()));
+    let mut lanes = Vec::with_capacity(stores.len());
+    for store in stores {
+        assert_eq!(store.frame_elems, ring.slot_elems);
+        lanes.push(Lane::new(store, cfg.events)?);
+    }
+    let out = upload(&ring, &mut lanes, &mut route, &pos, cfg, &stop, batches);
+    // The copies read the ring and write the stores: neither may go before them.
+    let drained = lanes.iter().try_for_each(|l| {
+        l.store.ctx.bind_to_thread()?;
+        l.stream.synchronize()
+    });
+    let mut rep = out?;
+    drained?;
+    rep.regions = lanes.into_iter().map(|l| l.rep).collect();
+    Ok(rep)
+}
+
+fn upload(
+    ring: &Ring,
+    lanes: &mut [Lane],
+    route: &mut impl Route,
+    pos: &PosTable,
+    cfg: UploaderConfig,
+    stop: &AtomicBool,
+    batches: Option<Sender<FrameBatch>>,
+) -> Result<UploadReport, GrowError> {
     let slots = ring.slots;
     let se = ring.slot_elems;
-    assert_eq!(store.frame_elems, se);
+    let all = u32::MAX >> (32 - lanes.len());
     let at = |seq: u64| (seq % slots as u64) as usize;
-    let events: Vec<Event> = (0..cfg.events)
-        .map(|_| ctx.new_event_with_flags(None))
-        .collect::<Result<_, _>>()?;
     let mut free: Vec<usize> = (0..cfg.events).collect();
     let mut inflight: VecDeque<Flight> = VecDeque::with_capacity(cfg.events);
     let mut rep = UploadReport {
         frames: 0,
         pos_missing: 0,
+        pos_invalid: 0,
         pos_crowded: 0,
         pos_waits: 0,
         pos_first: 0,
@@ -394,26 +566,35 @@ pub fn run_uploader(
         bytes: 0,
         max_inflight: 0,
         rx_to_gpu: Histogram::new(200_000),
+        rx_to_commit: Histogram::new(200_000),
         pub_to_gpu: Histogram::new(200_000),
         commit_to_gpu: Histogram::new(200_000),
         cpu_ns: 0,
         uids: Vec::new(),
+        t_rx: Vec::new(),
+        routes: Vec::new(),
+        regions: Vec::new(),
     };
     let cpu0 = thread_cpu_ns();
-    // Sequence numbers below `joined` are committed and landing or dropped,
-    // as `lands` says for those from `issued` on; `placed` places are taken.
-    let (mut joined, mut issued, mut placed) = (0u64, 0u64, 0u64);
-    let mut lands = vec![false; slots];
+    // Sequence numbers below `joined` are committed and landing or dropped;
+    // those below `issued` are queued or dropped; `landed` frames have a
+    // landing index.
+    let (mut joined, mut issued, mut landed) = (0u64, 0u64, 0u64);
+    // The regions each slot's frame lands on, none if it dropped: set when
+    // the frame is joined and good until its slot is released.
+    let mut routes = vec![0u32; slots];
     // The frame last counted in `pos_waits`.
     let mut waiting = None;
+    // The region whose context is current.
+    let mut bound = usize::MAX;
     loop {
         let mut progressed = false;
         while ring.done[at(joined)].load(Ordering::Acquire) == joined + 1 {
             let i = at(joined);
             let m = &ring.meta[i];
             let t_rx = m.t_rx.load(Ordering::Relaxed);
-            match pos.get(m.uid.load(Ordering::Relaxed)) {
-                Some(p) => {
+            match pos.lookup(m.uid.load(Ordering::Relaxed)) {
+                Entry::Valid(p) => {
                     // SAFETY: slot `i` is committed and not yet released, so
                     // no worker writes it (see `Ring`).
                     unsafe {
@@ -424,15 +605,26 @@ pub fn run_uploader(
                         lag if lag > 0 => rep.pos_after_frame.record(lag),
                         _ => rep.pos_first += 1,
                     }
-                    lands[i] = true;
+                    routes[i] = route.regions((p.x, p.y));
+                    assert!(
+                        routes[i] != 0 && routes[i] & !all == 0,
+                        "route {:#b} of {} regions",
+                        routes[i],
+                        lanes.len()
+                    );
                 }
-                None => {
+                Entry::Invalid => {
+                    rep.pos_invalid += 1;
+                    m.place.store(0, Ordering::Relaxed);
+                    routes[i] = 0;
+                }
+                Entry::Absent => {
                     // Sequence `joined + slots` is reserved: a worker waits
                     // for this frame's slot.
                     let crowded = ring.next.load(Ordering::Acquire) > joined + slots as u64;
                     if !crowded && wall_ns() - t_rx <= cfg.pos_wait_ns {
                         if waiting != Some(joined) {
-                            rep.pos_waits += 1;
+                            ring.pos_waits.fetch_add(1, Ordering::Release);
                             waiting = Some(joined);
                         }
                         break;
@@ -440,7 +632,7 @@ pub fn run_uploader(
                     rep.pos_missing += 1;
                     rep.pos_crowded += crowded as u64;
                     m.place.store(0, Ordering::Relaxed);
-                    lands[i] = false;
+                    routes[i] = 0;
                 }
             }
             joined += 1;
@@ -449,8 +641,8 @@ pub fn run_uploader(
         let stopping = stop.load(Ordering::Acquire);
         while joined > issued && !free.is_empty() {
             let s0 = at(issued);
-            if !lands[s0] {
-                // No place in the store; the slot goes back once the copies
+            if routes[s0] == 0 {
+                // No place in a store; the slot goes back once the copies
                 // before it are done.
                 issued += 1;
                 match inflight.back_mut() {
@@ -463,56 +655,99 @@ pub fn run_uploader(
             let most = ((joined - issued) as usize)
                 .min(cfg.batch.get())
                 .min(slots - s0);
-            let n = lands[s0..s0 + most].iter().take_while(|&&l| l).count();
+            let n = routes[s0..s0 + most]
+                .iter()
+                .take_while(|&&r| r != 0)
+                .count();
             let grows = issued + n as u64 == joined && n < cfg.batch.get();
             let waited = wall_ns() - ring.meta[s0].t_commit.load(Ordering::Relaxed);
             if grows && !stopping && waited < cfg.flush_ns {
                 break;
             }
-            let (frames_dst, positions_dst) = store.dst(placed..placed + n as u64)?;
-            // SAFETY: slots `s0..s0 + n` are committed and not yet released,
-            // so no worker writes them until the event below completes; `dst`
-            // gave places `placed..placed + n` in the store.
-            unsafe {
-                cuda_core::memcpy_htod_async(
-                    frames_dst,
-                    ring.frames_ptr.add(s0 * se),
-                    n * se,
-                    &stream,
-                )?;
-                cuda_core::memcpy_htod_async(
-                    positions_dst,
-                    ring.pos_ptr.add(s0 * 2),
-                    n * 2,
-                    &stream,
-                )?;
+            let run = &routes[s0..s0 + n];
+            let took = run.iter().fold(0, |a, r| a | r);
+            let ev = free.pop().expect("checked non-empty");
+            for r in bits(took) {
+                bind(lanes, &mut bound, r)?;
+                let lane = &mut lanes[r];
+                let bit = 1u32 << r;
+                let t = wall_ns();
+                let mut k = 0;
+                while k < n {
+                    if run[k] & bit == 0 {
+                        k += 1;
+                        continue;
+                    }
+                    let len = run[k..].iter().take_while(|&&m| m & bit != 0).count();
+                    let places = lane.placed..lane.placed + len as u64;
+                    let (frames_dst, positions_dst) = lane.store.dst(places)?;
+                    // SAFETY: slots `s0 + k..s0 + k + len` are committed and
+                    // not yet released, so no worker writes them until the
+                    // event below completes; `dst` gave their places in this
+                    // region's store, whose context is current.
+                    unsafe {
+                        cuda_core::memcpy_htod_async(
+                            frames_dst,
+                            ring.frames_ptr.add((s0 + k) * se),
+                            len * se,
+                            &lane.stream,
+                        )?;
+                        cuda_core::memcpy_htod_async(
+                            positions_dst,
+                            ring.pos_ptr.add((s0 + k) * 2),
+                            len * 2,
+                            &lane.stream,
+                        )?;
+                    }
+                    lane.placed += len as u64;
+                    lane.rep.bytes += len as u64 * (se as u64 * 2 + 16);
+                    k += len;
+                }
+                lane.events[ev].record(&lane.stream)?;
+                lane.rep.enqueue.record(wall_ns() - t);
             }
             for (k, m) in ring.meta[s0..s0 + n].iter().enumerate() {
-                m.place.store(placed + k as u64 + 1, Ordering::Relaxed);
+                m.place.store(landed + k as u64 + 1, Ordering::Relaxed);
             }
-            let ev = free.pop().expect("checked non-empty");
-            events[ev].record(&stream)?;
             let n = n as u64;
             inflight.push_back(Flight {
                 ev,
                 seq0: issued,
-                f0: placed,
+                f0: landed,
                 n,
                 release: issued + n,
+                wait: took,
             });
             rep.max_inflight = rep.max_inflight.max(inflight.len());
             issued += n;
-            placed += n;
+            landed += n;
             rep.batches += 1;
-            rep.bytes += n * (se as u64 * 2 + 16);
             progressed = true;
         }
-        while let Some(f) = inflight.front() {
-            if !events[f.ev].query()? {
-                break;
+        // A region's copies complete in the order queued: from its first
+        // unfinished batch on, so that a region waiting on none is timed
+        // without the others.
+        for r in 0..lanes.len() {
+            for f in inflight.iter_mut().filter(|f| f.wait >> r & 1 == 1) {
+                bind(lanes, &mut bound, r)?;
+                let lane = &mut lanes[r];
+                if !lane.events[f.ev].query()? {
+                    break;
+                }
+                f.wait &= !(1 << r);
+                let t = wall_ns();
+                for seq in (f.seq0..f.seq0 + f.n).filter(|&s| routes[at(s)] >> r & 1 == 1) {
+                    let t_rx = ring.meta[at(seq)].t_rx.load(Ordering::Relaxed);
+                    lane.rep.rx_to_gpu.record(t - t_rx);
+                    lane.rep.frames += 1;
+                }
+                progressed = true;
             }
-            let t = wall_ns();
+        }
+        while let Some(f) = inflight.front().filter(|f| f.wait == 0) {
             let seqs = f.seq0..f.seq0 + f.n;
+            // Every region that takes the batch holds it.
+            let t = wall_ns();
             let positions = match batches {
                 // SAFETY: the slots are committed and not yet released, so
                 // no worker writes them (see `Ring`).
@@ -527,11 +762,15 @@ pub fn run_uploader(
             };
             for seq in seqs {
                 let m = &ring.meta[at(seq)];
-                rep.rx_to_gpu.record(t - m.t_rx.load(Ordering::Relaxed));
+                let t_rx = m.t_rx.load(Ordering::Relaxed);
+                let t_commit = m.t_commit.load(Ordering::Relaxed);
+                rep.rx_to_gpu.record(t - t_rx);
+                rep.rx_to_commit.record(t_commit - t_rx);
                 rep.pub_to_gpu.record(t - m.t_pub.load(Ordering::Relaxed));
-                rep.commit_to_gpu
-                    .record(t - m.t_commit.load(Ordering::Relaxed));
+                rep.commit_to_gpu.record(t - t_commit);
                 rep.uids.push(m.uid.load(Ordering::Relaxed));
+                rep.t_rx.push(t_rx);
+                rep.routes.push(routes[at(seq)]);
             }
             rep.frames += f.n;
             ring.released.store(f.release, Ordering::Release);
@@ -558,14 +797,19 @@ pub fn run_uploader(
             std::thread::sleep(cfg.idle);
         }
     }
+    rep.pos_waits = ring.pos_waits();
+    rep.bytes = lanes.iter().map(|l| l.rep.bytes).sum();
     rep.cpu_ns = thread_cpu_ns() - cpu0;
     Ok(rep)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use super::*;
     use crate::live::pos::Pos;
+    use crate::live::sent::sent;
 
     fn cfg() -> UploaderConfig {
         UploaderConfig {
@@ -610,6 +854,15 @@ mod tests {
         }
     }
 
+    /// Waits for `event`, which the uploader or a GPU brings about.
+    fn until(what: &str, event: impl Fn() -> bool) {
+        let t = Instant::now();
+        while !event() {
+            assert!(t.elapsed() < Duration::from_secs(60), "{what}");
+            std::thread::yield_now();
+        }
+    }
+
     fn produce(ring: &Ring, pos: &PosTable, n: usize) {
         for _ in 0..n {
             let mut s = ring.reserve();
@@ -624,21 +877,14 @@ mod tests {
 
     fn uploader(
         ring: &Arc<Ring>,
-        ctx: &Arc<Context>,
         store: &Arc<DeviceStore>,
         pos: &Arc<PosTable>,
         cfg: UploaderConfig,
         stop: &Arc<AtomicBool>,
         tx: Option<Sender<FrameBatch>>,
     ) -> std::thread::JoinHandle<Result<UploadReport, GrowError>> {
-        let (ring, ctx, store, pos, stop) = (
-            ring.clone(),
-            ctx.clone(),
-            store.clone(),
-            pos.clone(),
-            stop.clone(),
-        );
-        std::thread::spawn(move || run_uploader(ring, ctx, store, pos, cfg, stop, tx))
+        let (ring, store, pos, stop) = (ring.clone(), store.clone(), pos.clone(), stop.clone());
+        std::thread::spawn(move || run_uploader(ring, store, pos, cfg, stop, tx))
     }
 
     /// Every landed frame against what it was made from: the batches sent, in
@@ -704,7 +950,7 @@ mod tests {
         let pos = Arc::new(PosTable::new(1 << 10));
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, rx) = crossbeam_channel::unbounded();
-        let up = uploader(&ring, &ctx, &store, &pos, cfg(), &stop, Some(tx));
+        let up = uploader(&ring, &store, &pos, cfg(), &stop, Some(tx));
         // Four producers commit out of order.
         std::thread::scope(|sc| {
             for _ in 0..4 {
@@ -732,12 +978,12 @@ mod tests {
         let pos = Arc::new(PosTable::new(64));
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, rx) = crossbeam_channel::unbounded();
-        let up = uploader(&ring, &ctx, &store, &pos, cfg(), &stop, Some(tx));
+        let up = uploader(&ring, &store, &pos, cfg(), &stop, Some(tx));
         // 2 lands at once, 0 holds 1..=5 until its position is in, 4 and 5
         // posted before 3 land behind it.
         post(&pos, 2);
         commit(&ring, 0..6);
-        std::thread::sleep(Duration::from_millis(20));
+        until("the uploader waits at frame 0", || ring.pos_waits() == 1);
         assert!(
             rx.try_recv().is_err(),
             "a frame landed before frame 0's position"
@@ -746,8 +992,10 @@ mod tests {
         post(&pos, 1);
         post(&pos, 4);
         post(&pos, 5);
-        std::thread::sleep(Duration::from_millis(20));
+        until("the uploader waits at frame 3", || ring.pos_waits() == 2);
         stop.store(true, Ordering::Release);
+        // Time for the uploader to see the stop with frame 3 still waiting;
+        // too little only skips that, the counts below hold either way.
         std::thread::sleep(Duration::from_millis(20));
         post(&pos, 3);
         let rep = up.join().unwrap().unwrap();
@@ -779,7 +1027,7 @@ mod tests {
             pos_wait_ns: 2_000_000,
             ..cfg()
         };
-        let up = uploader(&ring, &ctx, &store, &pos, cfg, &stop, Some(tx));
+        let up = uploader(&ring, &store, &pos, cfg, &stop, Some(tx));
         for &uid in &landed {
             post(&pos, uid);
         }
@@ -795,6 +1043,80 @@ mod tests {
         check_landed(&ring, &store, &rep, rx, &landed);
     }
 
+    fn post_invalid(pos: &PosTable, uid: i32) {
+        pos.insert(
+            uid,
+            Pos {
+                x: f64::NAN,
+                y: 0.0,
+                t_rx: wall_ns(),
+            },
+        );
+    }
+
+    /// The wait for a position that an invalid one must not take.
+    fn long_wait() -> UploaderConfig {
+        UploaderConfig {
+            pos_wait_ns: 3_600_000_000_000,
+            ..cfg()
+        }
+    }
+
+    /// A frame whose position is already in, and is no scan position, is
+    /// dropped when it arrives, without waiting and not as a missing one;
+    /// the valid ones behind it in the same pass land in order.
+    #[test]
+    fn a_frame_with_an_invalid_position_is_dropped_at_once() {
+        let ctx = Context::new(0).expect("GPU 0");
+        let se = 4096;
+        let ring = Arc::new(Ring::new(&ctx, 8, se).unwrap());
+        let store = Arc::new(DeviceStore::new(&ctx, 4, se).unwrap());
+        let pos = Arc::new(PosTable::new(64));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = crossbeam_channel::unbounded();
+        for uid in [0, 1, 3, 4] {
+            post(&pos, uid);
+        }
+        post_invalid(&pos, 2);
+        // All five are committed before the uploader's first pass.
+        commit(&ring, 0..5);
+        let up = uploader(&ring, &store, &pos, long_wait(), &stop, Some(tx));
+        stop.store(true, Ordering::Release);
+        let rep = up.join().unwrap().unwrap();
+        assert_eq!(
+            (rep.frames, rep.pos_invalid, rep.pos_missing, rep.pos_waits),
+            (4, 1, 0, 0)
+        );
+        check_landed(&ring, &store, &rep, rx, &[0, 1, 3, 4]);
+    }
+
+    /// An invalid position that comes while its frame waits at the head of
+    /// the ring drops the frame then, and the frames it held land.
+    #[test]
+    fn an_invalid_position_ends_its_frames_wait() {
+        let ctx = Context::new(0).expect("GPU 0");
+        let se = 4096;
+        let ring = Arc::new(Ring::new(&ctx, 4, se).unwrap());
+        let store = Arc::new(DeviceStore::new(&ctx, 2, se).unwrap());
+        let pos = Arc::new(PosTable::new(64));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let up = uploader(&ring, &store, &pos, long_wait(), &stop, Some(tx));
+        post(&pos, 1);
+        post(&pos, 2);
+        commit(&ring, 0..3);
+        until("the uploader waits at frame 0", || ring.pos_waits() == 1);
+        assert!(rx.try_recv().is_err(), "a frame landed before frame 0");
+        post_invalid(&pos, 0);
+        stop.store(true, Ordering::Release);
+        let rep = up.join().unwrap().unwrap();
+        assert_eq!(
+            (rep.frames, rep.pos_invalid, rep.pos_missing, rep.pos_waits),
+            (2, 1, 0, 1)
+        );
+        check_landed(&ring, &store, &rep, rx, &[1, 2]);
+    }
+
     /// A full ring behind a frame still without its position holds it until
     /// its position comes within the wait, and it lands: no slot is needed
     /// past the ring.
@@ -807,12 +1129,12 @@ mod tests {
         let pos = Arc::new(PosTable::new(64));
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, rx) = crossbeam_channel::unbounded();
-        let up = uploader(&ring, &ctx, &store, &pos, cfg(), &stop, Some(tx));
+        let up = uploader(&ring, &store, &pos, cfg(), &stop, Some(tx));
         for uid in 1..4 {
             post(&pos, uid);
         }
         commit(&ring, 0..4);
-        std::thread::sleep(Duration::from_millis(20));
+        until("the uploader waits at frame 0", || ring.pos_waits() == 1);
         assert!(rx.try_recv().is_err(), "a frame landed before frame 0");
         post(&pos, 0);
         stop.store(true, Ordering::Release);
@@ -845,7 +1167,7 @@ mod tests {
             pos_wait_ns: 3_600_000_000_000,
             ..cfg()
         };
-        let up = uploader(&ring, &ctx, &store, &pos, cfg, &stop, Some(tx));
+        let up = uploader(&ring, &store, &pos, cfg, &stop, Some(tx));
         for &uid in &landed {
             post(&pos, uid);
         }
@@ -860,6 +1182,160 @@ mod tests {
         check_landed(&ring, &store, &rep, rx, &landed);
     }
 
+    /// Routes trigger `uid`, whose position is `at(uid)`, by `f(uid)`.
+    struct ByUid(usize, fn(i32) -> u32);
+
+    impl Route for ByUid {
+        fn nregion(&self) -> usize {
+            self.0
+        }
+
+        fn regions(&mut self, pos: (f64, f64)) -> u32 {
+            (self.1)(pos.0 as i32)
+        }
+    }
+
+    /// Three regions' stores: a frame routed to one region lands there only, one routed to
+    /// two lands in both, each at the region's next place; frames without a position,
+    /// dropped between landed runs, take no place anywhere; region 2 gets its first frame
+    /// at trigger 60, so every batch before has none for it.
+    #[test]
+    fn a_frame_lands_in_the_store_of_every_region_it_is_routed_to() {
+        let ctx = Context::new(0).expect("GPU 0");
+        let (se, total) = (4096, 120);
+        let lost = |uid: i32| uid % 7 == 0 || (30..33).contains(&uid);
+        let to: fn(i32) -> u32 = |uid| match (uid >= 60, uid % 3) {
+            (false, 0) => 0b001,
+            (false, 1) => 0b010,
+            (false, _) => 0b011,
+            (true, 0) => 0b100,
+            (true, 1) => 0b110,
+            (true, _) => 0b111,
+        };
+        let landed: Vec<i32> = (0..total).filter(|&u| !lost(u)).collect();
+        let ring = Arc::new(Ring::new(&ctx, total as usize, se).unwrap());
+        let stores: Vec<Arc<DeviceStore>> = (0..3)
+            .map(|_| Arc::new(DeviceStore::new(&ctx, landed.len(), se).unwrap()))
+            .collect();
+        let pos = Arc::new(PosTable::new(256));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let cfg = UploaderConfig {
+            pos_wait_ns: 2_000_000,
+            ..cfg()
+        };
+        let up = {
+            let (ring, stores, pos, stop) =
+                (ring.clone(), stores.clone(), pos.clone(), stop.clone());
+            std::thread::spawn(move || {
+                run_region_uploader(ring, stores, ByUid(3, to), pos, cfg, stop, Some(tx))
+            })
+        };
+        for &uid in &landed {
+            post(&pos, uid);
+        }
+        commit(&ring, 0..total);
+        stop.store(true, Ordering::Release);
+        let rep = up.join().unwrap().unwrap();
+        assert_eq!(rep.uids, landed);
+        let mut next = 0;
+        for b in rx.iter() {
+            assert_eq!(b.f0, next);
+            let want: Vec<(f64, f64)> = landed[next as usize..(next + b.n) as usize]
+                .iter()
+                .map(|&u| at(u))
+                .collect();
+            assert_eq!(b.positions, want);
+            next += b.n;
+        }
+        assert_eq!(next, landed.len() as u64);
+        for (r, store) in stores.iter().enumerate() {
+            let mine: Vec<i32> = landed
+                .iter()
+                .copied()
+                .filter(|&u| to(u) >> r & 1 == 1)
+                .collect();
+            assert!(!mine.is_empty());
+            let n = mine.len() as u64;
+            assert_eq!(rep.regions[r].frames, n, "region {r}");
+            assert_eq!(rep.regions[r].rx_to_gpu.count(), n, "region {r}");
+            let mut dev = vec![0u16; mine.len() * se];
+            store.read_frames(0..n, &mut dev).unwrap();
+            let p = store.read_positions(n).unwrap();
+            for (k, (d, &uid)) in dev.chunks(se).zip(&mine).enumerate() {
+                assert!(
+                    d.iter().enumerate().all(|(j, &v)| v == pixel(uid, j)),
+                    "region {r} place {k}"
+                );
+                assert_eq!((p[2 * k], p[2 * k + 1]), at(uid), "region {r} place {k}");
+            }
+        }
+    }
+
+    /// A frame routed to two regions, the second one's stream held behind a gate: its
+    /// slot is not released and its batch not sent while only the first region holds it.
+    #[test]
+    fn a_slot_is_released_once_the_slowest_region_holds_its_frame() {
+        let ctx = Context::new(0).expect("GPU 0");
+        let se = 4096;
+        let ring = Arc::new(Ring::new(&ctx, 4, se).unwrap());
+        let stores: Vec<Arc<DeviceStore>> = (0..2)
+            .map(|_| Arc::new(DeviceStore::new(&ctx, 4, se).unwrap()))
+            .collect();
+        let pos = Arc::new(PosTable::new(64));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut gate = PinnedHostBuffer::<u32>::zeroed(&ctx, 1).unwrap();
+        let gate_at = gate.as_ptr() as u64;
+        let up = {
+            let (ring, stores, pos, stop) =
+                (ring.clone(), stores.clone(), pos.clone(), stop.clone());
+            std::thread::spawn(move || -> Result<UploadReport, GrowError> {
+                let mut lanes = Vec::new();
+                for s in stores {
+                    lanes.push(Lane::new(s, 4)?);
+                }
+                // SAFETY: the gate outlives the uploader, joined below.
+                unsafe {
+                    cuda_bindings::cuStreamWaitValue32_v2(
+                        lanes[1].stream.cu_stream(),
+                        gate_at,
+                        1,
+                        cuda_bindings::CUstreamWaitValue_flags_enum_CU_STREAM_WAIT_VALUE_GEQ,
+                    )
+                    .result()?;
+                }
+                let mut route = ByUid(2, |_| 0b11);
+                let out = upload(&ring, &mut lanes, &mut route, &pos, cfg(), &stop, Some(tx));
+                lanes.iter().try_for_each(|l| l.stream.synchronize())?;
+                out
+            })
+        };
+        post(&pos, 0);
+        commit(&ring, [0]);
+        let mut dev = vec![0u16; se];
+        until("region 0 holds the frame", || {
+            let mut dev = vec![0u16; se];
+            stores[0].read_frames(0..1, &mut dev).unwrap();
+            dev.iter().enumerate().all(|(j, &v)| v == pixel(0, j))
+        });
+        assert_eq!(ring.released.load(Ordering::Acquire), 0);
+        assert!(
+            rx.try_recv().is_err(),
+            "sent before region 1 held the frame"
+        );
+        // SAFETY: the gate lives until the end of the test.
+        unsafe { gate.as_mut_ptr().write_volatile(1) };
+        let (batch, up) = sent(&rx, up);
+        assert_eq!(batch.n, 1);
+        assert_eq!(ring.released.load(Ordering::Acquire), 1);
+        stop.store(true, Ordering::Release);
+        let rep = up.join().unwrap().unwrap();
+        assert_eq!(rep.frames, 1);
+        stores[1].read_frames(0..1, &mut dev).unwrap();
+        assert!(dev.iter().enumerate().all(|(j, &v)| v == pixel(0, j)));
+    }
+
     #[test]
     fn a_frame_past_the_store_fails_the_uploader() {
         let ctx = Context::new(0).expect("GPU 0");
@@ -869,7 +1345,7 @@ mod tests {
         let store = Arc::new(DeviceStore::new(&ctx, 32, se).unwrap());
         let pos = Arc::new(PosTable::new(64));
         let stop = Arc::new(AtomicBool::new(false));
-        let up = uploader(&ring, &ctx, &store, &pos, cfg(), &stop, None);
+        let up = uploader(&ring, &store, &pos, cfg(), &stop, None);
         drop(store);
         produce(&ring, &pos, 33);
         stop.store(true, Ordering::Release);

@@ -9,6 +9,7 @@ pub mod consumer;
 pub mod converge;
 pub mod eiger;
 pub mod farfield;
+pub mod fill;
 pub mod follow;
 pub mod graph;
 pub mod grow;
@@ -25,6 +26,8 @@ pub mod recv;
 pub mod ring;
 pub mod scan;
 pub mod sched;
+#[cfg(test)]
+pub(crate) mod sent;
 pub mod stack;
 pub mod stats;
 pub mod swmr;

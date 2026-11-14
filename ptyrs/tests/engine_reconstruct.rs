@@ -1,10 +1,15 @@
 use ptyrs::base::{C64, Geometry, Object, Probe, Scan, Stack, required_obj_shape};
-use ptyrs::engine::{Algorithm, ApParams, DmParams, LlkRecord, MlParams, Ptycho, RpieParams};
+use ptyrs::engine::{
+    Algorithm, ApParams, DmParams, LlkRecord, MlParams, Ptycho, RaarParams, RpieParams,
+};
 
 #[path = "common/engine/mod.rs"]
 mod common;
 #[path = "common/ptychi/mod.rs"]
 mod ptychi;
+#[path = "common/worst.rs"]
+mod worst;
+use worst::worst_of;
 
 const PHOTONS: f64 = 1e5;
 
@@ -126,6 +131,26 @@ fn dm_converges_and_records_on_schedule() {
     assert!(end < start / 10.0, "start {start} end {end} truth {truth}");
 }
 
+#[test]
+fn raar_converges_and_records_on_schedule() {
+    let c = case(1, false);
+    let truth = c.truth;
+    let mut p = Ptycho::new(&c.scan, flat_object(&c.object), c.probe.clone()).unwrap();
+    p.scale_obj_probe();
+    let start = p.llk().poisson;
+    let params = RaarParams {
+        calc_llk: 10,
+        ..RaarParams::default()
+    };
+    p.raar(&params, 101);
+    let cycles: Vec<usize> = p.history().iter().map(|r| r.cycle).collect();
+    assert_eq!(cycles, (0..=100).step_by(10).collect::<Vec<_>>());
+    assert!(p.history().iter().all(|r| r.algorithm == Algorithm::Raar));
+    let end = p.history().last().unwrap().llk.poisson;
+    assert_eq!(p.cycle(), 101);
+    assert!(end < start / 10.0, "start {start} end {end} truth {truth}");
+}
+
 /// The parity scenario at 32 pixels and 40 positions, scaled.
 fn parity_start() -> Ptycho {
     let (scan, object, probe) = common::dm_scenario(32, 40, 1, 2e5, 4.0);
@@ -177,6 +202,23 @@ fn dm_llk_matches_pynx() {
     assert_history_matches(rest, 1, include_str!("engine/data/dm_pynx_f64.txt"));
 }
 
+/// RAAR against PyNX `cpu_operator` promoted to f64 (`scripts/compare_pynx.py <dir> raar`),
+/// cycles 0-19 of `engine_llk_trace -- <dir> raar 20 1 32 40`, saved from
+/// `<dir>/llk_pynx_raar_f64.txt`; lagged by one cycle as DM's.
+#[test]
+fn raar_llk_matches_pynx() {
+    let mut p = parity_start();
+    let start = p.llk();
+    let params = RaarParams {
+        calc_llk: 1,
+        ..RaarParams::default()
+    };
+    p.raar(&params, 21);
+    let (first, rest) = p.history().split_first().unwrap();
+    assert_eq!((first.cycle, first.llk), (0, start));
+    assert_history_matches(rest, 1, include_str!("engine/data/raar_pynx_f64.txt"));
+}
+
 /// rPIE against pty-chi `RPIEReconstructor` in f64 (`scripts/compare_ptychi_rpie.py <dir>`),
 /// epochs 0-19 of `cargo run --release -p ptyrs --example engine_llk_trace -- <dir> rpie 20 1
 /// 32 40`, saved from `<dir>/llk_ptychi.txt` to `tests/data/rpie_ptychi_f64.txt`.
@@ -219,7 +261,7 @@ fn obj_grad_matches_ml_grad_reference() {
         let v: Vec<f64> = l.split_whitespace().map(|v| v.parse().unwrap()).collect();
         let want = C64::new(v[2], v[3]);
         let got = g.as_slice()[v[0] as usize * nx + v[1] as usize];
-        err = err.max((got - want).norm());
+        err = worst_of([err, (got - want).norm()]);
         max = max.max(want.norm());
         rows += 1;
     }

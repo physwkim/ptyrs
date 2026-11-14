@@ -201,7 +201,7 @@ pub mod rpie_kernels {
             let m = *mx.add(k * g.mstride as usize);
             let d = (1.0 - g.alpha) * (wv.0 * wv.0 + wv.1 * wv.1) + g.alpha * m;
             let v = load_c(x, t);
-            store_c(out, t, (v.0 / d, v.1 / d));
+            store_c(out, t, (zdiv(v.0, d), zdiv(v.1, d)));
         }
     }
 

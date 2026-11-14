@@ -38,6 +38,17 @@ pub struct LsqmlParams {
     pub seed: u64,
 }
 
+impl LsqmlParams {
+    /// The check every LSQML run makes of its params, on the CPU and the GPU: a batch has
+    /// frames.
+    pub(crate) fn validate(&self) -> Result<(), EngineError> {
+        if self.batch_size == 0 {
+            return Err(EngineError::Invalid("LSQML batch_size must be >= 1".into()));
+        }
+        Ok(())
+    }
+}
+
 /// One batch's step sizes, per frame of the batch in its order.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LsqmlStep {
@@ -116,8 +127,8 @@ impl<'a> LsqmlBatch<'a> {
                 move_planes(p, q, d, &fft);
             }
         }
-        let waves = SliceWaves::new(optics, &uviews, objects, &uprobe);
-        let prop = optics.propagator();
+        let waves = SliceWaves::new(optics, &uviews, objects, &uprobe, offsets.as_deref());
+        let prop = optics.exit();
         let mut chi = waves.psi().to_vec();
         prop.forward(&mut chi);
         let iobs: Vec<&[Option<f64>]> = frames.iter().map(|&f| obs.frames(f..f + 1)).collect();
@@ -240,7 +251,7 @@ impl<'a> LsqmlBatch<'a> {
         let n = ny * nx;
         let nxo = self.objects[s].plane_shape()[1];
         let fft = Fft2::new([ny, nx]);
-        let (q, incident) = (self.waves.quad(s), self.waves.incident(s));
+        let incident = self.waves.incident(s);
         let sums: Vec<[[f64; 2]; 2]> = (0..self.frames.len())
             .map(|b| {
                 let k = b * self.nmode;
@@ -249,7 +260,7 @@ impl<'a> LsqmlBatch<'a> {
                 let patch: Vec<C64> = (0..n)
                     .map(|i| o[(v.oy as usize + i / nx) * nxo + v.ox as usize + i % nx])
                     .collect();
-                let w = incident.plane(k);
+                let (w, q) = (incident.plane(k), self.waves.quad(s, k));
                 let wq: Vec<C64> = (0..n)
                     .map(|j| {
                         let (i, _, _) = natural(j, ny, nx);
@@ -259,7 +270,7 @@ impl<'a> LsqmlBatch<'a> {
                 gradient_sums(&patch, &wq, &self.chi[s][k * n..(k + 1) * n], &fft)
             })
             .collect();
-        let eps = EPS_POSITION * self.optics.propagator().intensity_scale();
+        let eps = EPS_POSITION * self.optics.exit().intensity_scale();
         gradient_directions(&sums, eps)
     }
 
@@ -286,11 +297,11 @@ impl<'a> LsqmlBatch<'a> {
             self.views,
             &self.objects[0],
             d_probe,
-            self.waves.quad(0),
+            self.waves.quad(0, 0),
             &mut dpo,
         );
         let dop = self.waves.obj_tangent(0, &d_obj[0]);
-        let lambda0 = LAMBDA0 * self.optics.propagator().intensity_scale() / n as f64;
+        let lambda0 = LAMBDA0 * self.optics.exit().intensity_scale() / n as f64;
         let sums: Vec<[f64; 6]> = dop
             .chunks_exact(block)
             .zip(dpo.chunks_exact(block))
@@ -402,15 +413,16 @@ pub struct Lsqml {
 }
 
 impl Lsqml {
-    pub fn new(params: LsqmlParams) -> Self {
-        assert!(params.batch_size > 0, "batch_size must be positive");
-        Self {
+    /// A run from its first epoch, `Err` on a `batch_size` of 0.
+    pub fn new(params: LsqmlParams) -> Result<Self, EngineError> {
+        params.validate()?;
+        Ok(Self {
             params,
             epochs: 0,
             preconditioner: None,
             a_far: Vec::new(),
             features: Features::default(),
-        }
+        })
     }
 
     /// This run modelling and refining `features`, which hold one entry per frame of the scan
@@ -562,7 +574,7 @@ impl Lsqml {
             let illum = illumination(addr.views(), objects[0].dims(), probe);
             let pre = self.preconditioner.take().unwrap_or_else(|| {
                 let n = probe.plane_len() as f64;
-                let k = optics.propagator().intensity_scale();
+                let k = optics.exit().intensity_scale();
                 let power = (0..nframe)
                     .map(|f| obs.frames(f..f + 1).iter().flatten().sum::<f64>())
                     .fold(0.0, f64::max);

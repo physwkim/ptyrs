@@ -221,6 +221,25 @@ pub struct LlkTotals {
     pub nb_obs: usize,
 }
 
+impl LlkTotals {
+    /// The totals of `frames`, summed in their order.
+    pub fn of(frames: &[FrameLlk]) -> Self {
+        let partials: Vec<LlkPartial> = frames.iter().map(|f| f.llk).collect();
+        Self {
+            sums: LlkSums::from_partials(&partials),
+            nframe: frames.len() as u32,
+            nb_obs: frames.iter().map(|f| f.nobs as usize).sum(),
+        }
+    }
+}
+
+/// One frame of a record read back: its partials and its unmasked pixels.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FrameLlk {
+    pub llk: LlkPartial,
+    pub nobs: u32,
+}
+
 /// What [`RecordWriter::end`] returns: the launches that wrote it end one record each time
 /// they run, eagerly or as a graph captured from them, and [`LlkRing::enqueued`] counts one
 /// record per run.
@@ -249,8 +268,8 @@ pub struct LlkRing<T> {
     /// The copies not yet read, oldest first: each one's end record and the event after it;
     /// their ranges tile `read .. copied`.
     copies: VecDeque<(u64, Event)>,
-    /// Records read since the last flush or poll.
-    done: Vec<(T, LlkTotals)>,
+    /// Records read since the last flush or poll, each as its frames `0 .. nframe`.
+    done: Vec<(T, Vec<FrameLlk>)>,
 }
 
 impl<T> LlkRing<T> {
@@ -337,6 +356,15 @@ impl<T> LlkRing<T> {
     /// The tags and totals of every record counted since the last flush or poll, in order:
     /// enqueues the copy of the records not yet copied and waits for every copy.
     pub fn flush(&mut self, ctx: &ExecutionContext) -> Result<Vec<(T, LlkTotals)>, RingError> {
+        Ok(totals(self.flush_frames(ctx)?))
+    }
+
+    /// [`Self::flush`] with each record as its frames, for a caller that sums the frames
+    /// of several rings: a scan split over GPUs, each frame taken from one of them.
+    pub fn flush_frames(
+        &mut self,
+        ctx: &ExecutionContext,
+    ) -> Result<Vec<(T, Vec<FrameLlk>)>, RingError> {
         if self.copied < self.next {
             self.copy_out(ctx)?;
         }
@@ -358,7 +386,7 @@ impl<T> LlkRing<T> {
         if self.copied < self.next && self.next - self.read <= self.dev.nslot as u64 {
             self.copy_out(ctx)?;
         }
-        Ok(std::mem::take(&mut self.done))
+        Ok(totals(std::mem::take(&mut self.done)))
     }
 
     fn batch(&self) -> u64 {
@@ -421,7 +449,7 @@ impl<T> LlkRing<T> {
         let tags: Vec<(T, u32)> = self.tags.drain(..(end - first) as usize).collect();
         for (k, (tag, nframe)) in (first..end).zip(tags) {
             match self.parse(k, nframe) {
-                Ok(totals) => self.done.push((tag, totals)),
+                Ok(frames) => self.done.push((tag, frames)),
                 Err(e) => {
                     self.done.clear();
                     return Err(e);
@@ -431,16 +459,14 @@ impl<T> LlkRing<T> {
         Ok(())
     }
 
-    /// Record `k`'s totals over frames `0 .. nframe` from its host slot, whose copy has
-    /// completed.
-    fn parse(&self, k: u64, nframe: u32) -> Result<LlkTotals, RingError> {
+    /// Record `k`'s frames `0 .. nframe` from its host slot, whose copy has completed.
+    fn parse(&self, k: u64, nframe: u32) -> Result<Vec<FrameLlk>, RingError> {
         let at = (k % self.dev.nslot as u64) as usize * self.dev.nframe as usize;
         // SAFETY: the slot lies in `host`, its copy has completed, and no later copy into it
         // is enqueued before it is read; `nframe` is at most the slot's frames.
         let recs =
             unsafe { std::slice::from_raw_parts(self.host.as_ptr().add(at), nframe as usize) };
-        let mut partials = Vec::with_capacity(recs.len());
-        let mut nb_obs = 0;
+        let mut frames = Vec::with_capacity(recs.len());
         for (frame, r) in recs.iter().enumerate() {
             if r.seq != k {
                 return Err(RingError::Stamp {
@@ -452,15 +478,19 @@ impl<T> LlkRing<T> {
             if r.nobs == UNCOUNTED {
                 return Err(RingError::Uncounted { record: k, frame });
             }
-            partials.push(r.llk);
-            nb_obs += r.nobs as usize;
+            frames.push(FrameLlk {
+                llk: r.llk,
+                nobs: r.nobs,
+            });
         }
-        Ok(LlkTotals {
-            sums: LlkSums::from_partials(&partials),
-            nframe,
-            nb_obs,
-        })
+        Ok(frames)
     }
+}
+
+fn totals<T>(done: Vec<(T, Vec<FrameLlk>)>) -> Vec<(T, LlkTotals)> {
+    done.into_iter()
+        .map(|(tag, frames)| (tag, LlkTotals::of(&frames)))
+        .collect()
 }
 
 impl<T> Drop for LlkRing<T> {

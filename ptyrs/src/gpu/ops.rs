@@ -61,7 +61,8 @@ pub use ptyrs_kernels::pixel::{
     LlkPartial, MASKED, OBJ_TILE, PositionPartial, ScalePartial, StackCtl, StackGeom, ViewAddr,
 };
 
-use crate::gpu::{C32, Error, Kernels, check_len, dptr, lease};
+use crate::gpu::psi::check_waves;
+use crate::gpu::{C32, Error, Kernels, Waves, check_len, dptr, lease};
 
 /// Geometry of a scan's views.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -410,17 +411,50 @@ impl Views {
     }
 
     /// Views over device storage the caller keeps filling and backing: `addr` takes the
-    /// records of frames as they land, and `tile_views` holds `ntiles` slabs of `cap` slots,
-    /// tile `t`'s from slot `t * cap`, so it owns every tile, or none when `cap` is 0. Every
-    /// run starts empty; only binning ([`Kernels::bin_views`], [`Kernels::reorder_views`])
-    /// writes runs. Checks `dims`, that `addr` holds `nframe * nmode` records and
-    /// `tile_views` `ntiles * cap` slots.
+    /// records of frames as they land, and `tile_views` holds tile `t`'s slab at slots
+    /// `start[t] .. start[t + 1]`, so the tiles with an empty slab are not owned. Every run
+    /// starts empty; only binning ([`Kernels::bin_views`], [`Kernels::reorder_views`])
+    /// writes runs. Checks `dims`, that `addr` holds `nframe * nmode` records, `start`
+    /// `ntiles + 1` ascending offsets and `tile_views` `start[ntiles]` slots.
     ///
     /// # Safety
     ///
     /// Whenever a launch runs, every record it reads passes the checks of [`Self::new`], and
     /// the slab of every tile those views touch is device memory; a launch touches no other
     /// slab.
+    pub unsafe fn from_slabs(
+        stream: &CudaStream,
+        dims: ViewDims,
+        addr: DeviceBuffer<ViewAddr>,
+        tile_views: DeviceBuffer<u32>,
+        start: &[u32],
+    ) -> Result<Self, Error> {
+        dims.check()?;
+        let ntiles = dims.ntiles();
+        check_len("addr", &addr, dims.nframe as usize * dims.nmode as usize)?;
+        if start.len() != ntiles + 1 || !start.is_sorted() {
+            return Err(Error::Shape(format!(
+                "{} slab starts, need {} ascending offsets",
+                start.len(),
+                ntiles + 1
+            )));
+        }
+        check_len("tile_views", &tile_views, start[ntiles] as usize)?;
+        Ok(Self {
+            dims,
+            addr,
+            tile_start: DeviceBuffer::from_host(stream, start)?,
+            tile_views,
+            tile_len: DeviceBuffer::zeroed(stream, ntiles)?,
+        })
+    }
+
+    /// [`Self::from_slabs`] with `ntiles` slabs of `cap` slots, tile `t`'s from slot
+    /// `t * cap`, so it owns every tile, or none when `cap` is 0.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::from_slabs`].
     pub unsafe fn from_parts(
         stream: &CudaStream,
         dims: ViewDims,
@@ -430,19 +464,12 @@ impl Views {
     ) -> Result<Self, Error> {
         dims.check()?;
         let ntiles = dims.ntiles();
-        check_len("addr", &addr, dims.nframe as usize * dims.nmode as usize)?;
         let start = (0..=ntiles as u64)
             .map(|t| u32::try_from(t * u64::from(cap)))
             .collect::<Result<Vec<u32>, _>>()
             .map_err(|_| Error::Shape(format!("{ntiles} slabs of {cap} slots overflow u32")))?;
-        check_len("tile_views", &tile_views, start[ntiles] as usize)?;
-        Ok(Self {
-            dims,
-            addr,
-            tile_start: DeviceBuffer::from_host(stream, &start)?,
-            tile_views,
-            tile_len: DeviceBuffer::zeroed(stream, ntiles)?,
-        })
+        // SAFETY: the caller keeps `from_slabs`' contract, which this layout does not change.
+        unsafe { Self::from_slabs(stream, dims, addr, tile_views, &start) }
     }
 
     /// Views for [`Kernels::reorder_views`] of `src`: its dims, frames and tile slabs, so
@@ -963,7 +990,7 @@ impl Kernels {
         ];
         let slabs = views.tile_slabs();
         self.launch(ctx, &reads, &writes, |stream| {
-            // SAFETY: `Views::new` or the `from_parts` contract keeps the stack's views
+            // SAFETY: `Views::new` or the `from_slabs` contract keeps the stack's views
             // inside the object; every constructor leaves each run within its slab, and
             // binning keeps it there; `overflow` holds one u32.
             unsafe {
@@ -1028,7 +1055,7 @@ impl Kernels {
         let (slabs, g) = (dst.tile_slabs(), d.scan_geom());
         self.launch(ctx, &reads, &writes, |stream| {
             // SAFETY: every view of `dst` is one it held or one of `src`'s, each of the same
-            // dims and inside the object by `Views::new` or the `from_parts` contract; the
+            // dims and inside the object by `Views::new` or the `from_slabs` contract; the
             // runs start empty, each within its slab.
             unsafe {
                 self.module
@@ -1048,20 +1075,20 @@ impl Kernels {
         ctx: &ExecutionContext,
         views: &Views,
         stack: StackRef<'_>,
-        psi: &DeviceBuffer<C32>,
+        psi: &dyn Waves,
         probe: &DeviceBuffer<C32>,
         sums: &mut UpdateSums,
     ) -> Result<(), Error> {
         let d = &views.dims;
         let g = d.geom(stack)?;
         let n = d.n();
-        check_len("psi", psi, g.nf_max as usize * d.nmode as usize * n)?;
+        check_waves("psi", psi, g.nf_max as usize * d.nmode as usize * n)?;
         check_len("probe", probe, d.nprobe as usize * n)?;
         sums.check(d.obj_len())?;
         let config = d.stack_tile_grid(g.nf_max)?;
         let [start, len, list] = views.tile_storages();
         let reads = [
-            psi.storage(),
+            psi.raw(),
             probe.storage(),
             views.addr.storage(),
             start,
@@ -1072,17 +1099,18 @@ impl Kernels {
         self.launch(ctx, &reads, &sums.storages(), |stream| {
             // SAFETY: lengths checked above; the tile lists were built from these views.
             unsafe {
-                self.module.psi_to_obj(
-                    stream,
-                    config,
-                    dptr(psi),
-                    dptr(probe),
-                    dptr(&views.addr),
+                let (m, ptr, probe, addr) =
+                    (&self.module, psi.ptr(), dptr(probe), dptr(&views.addr));
+                let (tiles, sums, ctl) = (
                     views.tile_ptrs(),
                     sums.ptrs(),
                     stack.ctl() as *const StackCtl,
-                    g,
-                )
+                );
+                if psi.half() {
+                    m.psi_to_obj_f16(stream, config, ptr, probe, addr, tiles, sums, ctl, g)
+                } else {
+                    m.psi_to_obj(stream, config, ptr, probe, addr, tiles, sums, ctl, g)
+                }
             }
         })
     }
@@ -1096,19 +1124,19 @@ impl Kernels {
         ctx: &ExecutionContext,
         views: &Views,
         stack: StackRef<'_>,
-        psi: &DeviceBuffer<C32>,
+        psi: &dyn Waves,
         obj: &DeviceBuffer<C32>,
         sums: &mut UpdateSums,
     ) -> Result<(), Error> {
         let d = &views.dims;
         let g = d.geom(stack)?;
         let n = d.n();
-        check_len("psi", psi, g.nf_max as usize * d.nmode as usize * n)?;
+        check_waves("psi", psi, g.nf_max as usize * d.nmode as usize * n)?;
         check_len("obj", obj, d.obj_len())?;
         sums.check(d.nprobe as usize * n)?;
         let config = grid_1d(d.nprobe as usize * n)?;
         let reads = [
-            psi.storage(),
+            psi.raw(),
             obj.storage(),
             views.addr.storage(),
             stack.storage(),
@@ -1116,16 +1144,13 @@ impl Kernels {
         self.launch(ctx, &reads, &sums.storages(), |stream| {
             // SAFETY: lengths checked above; `Views::new` checked every view.
             unsafe {
-                self.module.psi_to_probe(
-                    stream,
-                    config,
-                    dptr(psi),
-                    dptr(obj),
-                    dptr(&views.addr),
-                    sums.ptrs(),
-                    stack.ctl() as *const StackCtl,
-                    g,
-                )
+                let (m, ptr, obj, addr) = (&self.module, psi.ptr(), dptr(obj), dptr(&views.addr));
+                let (sums, ctl) = (sums.ptrs(), stack.ctl() as *const StackCtl);
+                if psi.half() {
+                    m.psi_to_probe_f16(stream, config, ptr, obj, addr, sums, ctl, g)
+                } else {
+                    m.psi_to_probe(stream, config, ptr, obj, addr, sums, ctl, g)
+                }
             }
         })
     }
@@ -1321,6 +1346,43 @@ impl Kernels {
             unsafe {
                 self.module
                     .dm_reflect(stream, config, dptr(psi), dptr(po), n, alpha)
+            }
+        })
+    }
+
+    /// RAAR's iterate over `n` elements (PyNX `RAARProj`): with `h = beta / 2`, sets `psi =
+    /// (1 - h) psi + h (2 po - iterate)` and `iterate` to the new `psi`. `psi` holds the last
+    /// cycle's projection of `iterate`, and `po` `obj_probe_to_psi` of the current object and
+    /// probe.
+    pub fn raar_iterate(
+        &self,
+        ctx: &ExecutionContext,
+        psi: &mut DeviceBuffer<C32>,
+        iterate: &mut DeviceBuffer<C32>,
+        po: &DeviceBuffer<C32>,
+        n: u32,
+        beta: f32,
+    ) -> Result<(), Error> {
+        check_len("psi", psi, n as usize)?;
+        check_len("iterate", iterate, n as usize)?;
+        check_len("po", po, n as usize)?;
+        if n == 0 {
+            return Ok(());
+        }
+        let config = grid_1d(n as usize)?;
+        let writes = [psi.storage(), iterate.storage()];
+        self.launch(ctx, &[po.storage()], &writes, |stream| {
+            // SAFETY: all three hold `n` values.
+            unsafe {
+                (self.module).raar_iterate(
+                    stream,
+                    config,
+                    dptr(psi),
+                    dptr(iterate),
+                    dptr(po),
+                    n,
+                    beta,
+                )
             }
         })
     }

@@ -1,9 +1,9 @@
-"""PyNX DM or AP on the scan and starting point written by `cargo run --example engine_llk_trace`.
+"""PyNX DM, RAAR or AP on the scan and starting point written by `cargo run --example engine_llk_trace`.
 
-Usage: python -I compare_pynx.py <dir> <dm|ap> [--cuda] [--no-cpu] [--time N]
+Usage: python -I compare_pynx.py <dir> <dm|raar|ap> [--cuda] [--no-cpu] [--time N]
 
-Reads <dir>/scan.cxi, init.h5, llk_rust.txt and final_rust.h5. Runs DM(calc_llk=1), or
-AP(update_probe=True, calc_llk=1), for as many cycles as the Rust run with
+Reads <dir>/scan.cxi, init.h5, llk_rust.txt and final_rust.h5. Runs DM(calc_llk=1),
+RAAR(calc_llk=1) or AP(update_probe=True, calc_llk=1), for as many cycles as the Rust run with
   - f64: PyNX cpu_operator with every complex64/float32 promoted to complex128/float64,
   - f32: the stock PyNX cpu_operator,
   - cuda (with --cuda): the PyNX CUDA operator,
@@ -84,6 +84,7 @@ def rel_l2(a, b):
 def main():
     d, algo = sys.argv[1], sys.argv[2]
     make = {"dm": lambda op: op.DM(calc_llk=1),
+            "raar": lambda op: op.RAAR(calc_llk=1),
             "ap": lambda op: op.AP(update_object=True, update_probe=True, calc_llk=1)}[algo]
     rust = np.loadtxt(f"{d}/llk_rust.txt", ndmin=2)
     ncycle = len(rust)
@@ -98,10 +99,10 @@ def main():
     # update, so its record at cycle c is Rust's at c + 1. Rust and the CUDA DM run
     # ScaleObjProbe(absolute=False) after each LLK and the cpu_operator DM does not; it only
     # trades scale between object and probe, which DM is covariant under, so the final arrays
-    # are compared up to a complex scale. AP records the LLK of the estimate before the update
-    # on both CPU and CUDA.
+    # are compared up to a complex scale. RAAR is DM's case on both. AP records the LLK of the
+    # estimate before the update on both CPU and CUDA.
     flags = sys.argv[3:]
-    cpu_lag = 1 if algo == "dm" else 0
+    cpu_lag = 1 if algo in ("dm", "raar") else 0
     runs = [] if "--no-cpu" in flags else [("f64", cpu_operator_f64(), True, cpu_lag),
                                            ("f32", cpu32, False, cpu_lag)]
     if "--cuda" in flags:
@@ -132,6 +133,7 @@ def main():
         import pynx.ptycho.cu_operator as cuop
         ntime = int(flags[flags.index("--time") + 1])
         algo_op = {"dm": lambda: cuop.DM(calc_llk=0, zero_phase_ramp=False),
+                   "raar": lambda: cuop.RAAR(calc_llk=0, zero_phase_ramp=False),
                    "ap": lambda: cuop.AP(update_object=True, update_probe=True, calc_llk=0,
                                          zero_phase_ramp=False)}[algo]
         p = build(*args, f64=False)

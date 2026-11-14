@@ -99,7 +99,7 @@ fn llk_of(s: &State, object: &Object, probe: &Probe) -> Llk {
     let views = s.addr.views();
     let mut psi = vec![C64::default(); views.len() * probe.plane_len()];
     obj_probe_to_psi(views, object, probe, s.optics.quad(), &mut psi);
-    s.optics.propagator().forward(&mut psi);
+    s.optics.exit().forward(&mut psi);
     llk(&s.obs, 0..s.addr.nframe(), s.addr.nmode(), &psi).normalised(s.obs.nb_obs())
 }
 
@@ -121,7 +121,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     batch_size: batch.parse()?,
                     cost: Cost::Amplitude,
                     seed: SEED,
-                })),
+                })?),
                 ProbeVariation::none(s.probe.plane_shape()),
             ),
             ["bh", batch, rho] => Method::Bh(Bh::new(BhParams {
@@ -129,7 +129,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 probe_rho: rho.parse()?,
                 position_rho: 0.1,
                 seed: SEED,
-            })),
+            })?),
             _ => return Err(usage.into()),
         };
         let (mut object, mut probe) = (s.object.clone(), s.probe.clone());

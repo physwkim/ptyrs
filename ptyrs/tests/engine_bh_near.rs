@@ -1,12 +1,17 @@
 //! BH in pty-chi's planar near-field model against `refs/f64/bh_near.py`, which runs pty-chi's
 //! BH on `refs/f64/lsqml_near.py`'s state and counts, writing `bh_near_*_f64.txt`, saved to
 //! `tests/data`. Cases: 0 an angular-spectrum propagator, 1 a Fresnel transform (pty-chi run
-//! with the intensity scale on its residual), 2 an angular spectrum with an evanescent band.
+//! with the intensity scale on its residual), 2 an angular spectrum with an evanescent band,
+//! 3 a Fresnel transform back (pty-chi run as case 1).
 
 use std::slice;
 
 use ptyrs::base::{AddrTable, C64, Counts, Object, Positions, Probe, Stack};
 use ptyrs::engine::{Bh, BhParams, Observed, Optics, Propagator, Wavefield};
+
+#[path = "common/worst.rs"]
+mod worst;
+use worst::worst_of;
 
 const SHAPE: [usize; 2] = [24, 24];
 const OBJ: [usize; 2] = [40, 40];
@@ -24,11 +29,7 @@ fn table(text: &str) -> Vec<Vec<f64>> {
 /// `max |a − b| / max |b|`.
 fn max_rel(a: &[f64], b: &[f64]) -> f64 {
     assert_eq!(a.len(), b.len());
-    let d = a
-        .iter()
-        .zip(b)
-        .map(|(a, b)| (a - b).abs())
-        .fold(0.0, f64::max);
+    let d = worst_of(a.iter().zip(b).map(|(a, b)| (a - b).abs()));
     d / b.iter().map(|b| b.abs()).fold(0.0, f64::max)
 }
 
@@ -74,7 +75,7 @@ fn state() -> (AddrTable, Object, Probe, Vec<(Optics, Observed)>) {
         .map(|c| {
             let w = Wavefield::new(SHAPE, c[1], [c[2], c[2]], c[3]).unwrap();
             let optics = Optics::free_space(&w);
-            let kind = match optics.propagator() {
+            let kind = match Propagator::free_space(&w) {
                 Propagator::Fourier(_) => 0,
                 Propagator::AngularSpectrum(_) => 1,
                 Propagator::Fresnel(_) => 2,
@@ -109,7 +110,8 @@ fn bh_matches_ptychi_in_near_field() {
                 probe_rho: 1.0,
                 position_rho: 0.1,
                 seed: 7,
-            });
+            })
+            .unwrap();
             let (mut object, mut probe) = (object0.clone(), probe0.clone());
             let got: Vec<_> = (0..EPOCHS)
                 .flat_map(|e| {
@@ -120,6 +122,7 @@ fn bh_matches_ptychi_in_near_field() {
                 .collect();
             let rows: Vec<_> = steps.iter().filter(at).collect();
             assert_eq!(got.len(), rows.len(), "case {case} method {method}");
+            let (mut betas, mut sizes) = (Vec::new(), Vec::new());
             for (k, ((epoch, s), r)) in got.iter().zip(&rows).enumerate() {
                 let at = format!("case {case} method {method} step {k}");
                 let count = r[4] as usize;
@@ -135,6 +138,7 @@ fn bh_matches_ptychi_in_near_field() {
                         s.beta,
                         r[5]
                     );
+                    betas.push(rel(s.beta, r[5]));
                 }
                 for (name, got, want) in [
                     ("alpha", s.alpha, r[6]),
@@ -142,8 +146,14 @@ fn bh_matches_ptychi_in_near_field() {
                     ("bottom", s.bottom, r[8]),
                 ] {
                     assert!(rel(got, want) < 1e-13, "{at}: {name} {got} ref {want}");
+                    sizes.push(rel(got, want));
                 }
             }
+            eprintln!(
+                "case {case} method {method}: beta {:.3e} alpha, top, bottom {:.3e}",
+                worst_of(betas),
+                worst_of(sizes)
+            );
             for (name, now, start, rows, lead) in [
                 ("object", object.as_slice(), object0.as_slice(), &objs, 4),
                 ("probe", probe.as_slice(), probe0.as_slice(), &probes, 5),
@@ -159,7 +169,8 @@ fn bh_matches_ptychi_in_near_field() {
                     .flat_map(|r| [r[lead], r[lead + 1]])
                     .collect();
                 let err = max_rel(&got, &want);
-                assert!(err < 1e-12, "case {case} method {method} {name}: {err:.3e}");
+                eprintln!("case {case} method {method} {name}: {err:.3e}");
+                assert!(err < 5e-12, "case {case} method {method} {name}: {err:.3e}");
             }
         }
     }

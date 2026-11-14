@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 use crate::gpu::{
     C32, Ended, Exit, FarSums, FusedBufs, FusedInputs, FusedSums, Kernels, LlkPartial, LlkRing,
-    Model, ViewAddr,
+    Model, RecordWriter, ViewAddr,
 };
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{DeviceBuffer, Stream};
@@ -56,7 +56,7 @@ pub struct ApConfig {
 
 /// The LLK records the ring holds; each batch of half of them is copied to
 /// the host while later epochs run.
-const LLK_SLOTS: u32 = 8;
+pub(crate) const LLK_SLOTS: u32 = 8;
 
 /// The device side of each epoch's LLK record.
 struct LlkBufs {
@@ -127,35 +127,8 @@ impl LiveAp {
             .as_mut()
             .map(|b| (b.ring.device().record(), &mut b.partials));
         let sweep = {
-            let (s, fused, rec) = (&mut scan, &mut fused, &mut rec);
-            let (probe, counts) = (&probe, &counts);
-            LiveGraph::capture(stream, move |c| {
-                let p = s.parts_mut();
-                for _ in 0..stacks {
-                    p.frames.sweep_step(c)?;
-                    let st = p.frames.sweep();
-                    let inputs = FusedInputs {
-                        views: p.views,
-                        counts,
-                        obj: p.pixels,
-                        probe,
-                        model: Model::default(),
-                    };
-                    let far = FarSums {
-                        llk: rec.as_mut().map(|(_, partials)| &mut **partials),
-                        ..FarSums::default()
-                    };
-                    let sums = FusedSums {
-                        obj: Some(&mut *p.sums),
-                        ..FusedSums::default()
-                    };
-                    k.fused_project(c, &inputs, st, Exit::Ap { far }, fused, sums)?;
-                    if let Some((w, partials)) = rec.as_mut() {
-                        w.push(c, &d, st, partials)?;
-                    }
-                }
-                Ok(())
-            })?
+            let llk = rec.as_mut().map(|(w, partials)| (w, &mut **partials));
+            capture_sweep(&mut scan, k, stacks, &probe, &counts, &mut fused, llk)?
         };
         let mut ended = None;
         let update = {
@@ -271,6 +244,49 @@ impl LiveAp {
     }
 }
 
+/// Captures the sweep graph of `scan`, on its stream: `stacks` steps of its
+/// sweep entry, each through the fused AP pass with `probe` and the frames'
+/// `counts` into the object sums. With `llk`, a record and the buffer of one
+/// stack's partials, each stack's LLK partials are pushed into the record.
+pub(crate) fn capture_sweep(
+    scan: &mut LiveScan,
+    k: &Kernels,
+    stacks: u32,
+    probe: &DeviceBuffer<C32>,
+    counts: &DeviceBuffer<u16>,
+    fused: &mut FusedBufs,
+    mut llk: Option<(&mut RecordWriter<'_>, &mut DeviceBuffer<LlkPartial>)>,
+) -> Result<LiveGraph, GrowError> {
+    let (stream, d) = (scan.stream().clone(), *scan.dims());
+    LiveGraph::capture(&stream, move |c| {
+        let p = scan.parts_mut();
+        for _ in 0..stacks {
+            p.frames.sweep_step(c)?;
+            let st = p.frames.sweep();
+            let inputs = FusedInputs {
+                views: p.views,
+                counts,
+                obj: p.pixels,
+                probe,
+                model: Model::default(),
+            };
+            let far = FarSums {
+                llk: llk.as_mut().map(|(_, partials)| &mut **partials),
+                ..FarSums::default()
+            };
+            let sums = FusedSums {
+                obj: Some(&mut *p.sums),
+                ..FusedSums::default()
+            };
+            k.fused_project(c, &inputs, st, Exit::Ap { far }, fused, sums)?;
+            if let Some((w, partials)) = llk.as_mut() {
+                w.push(c, &d, st, partials)?;
+            }
+        }
+        Ok(())
+    })
+}
+
 /// Where a scan position puts a frame in the live object: the corner of its
 /// window is the position in object pixels plus a fixed origin, rounded half
 /// to even like the engine's views.
@@ -367,6 +383,7 @@ mod tests {
     use super::*;
     use crate::live::farfield::{Ptycho, PtychoSpec, ScanPath};
     use crate::live::graph::WarmUp;
+    use crate::worst::worst_of;
 
     const FILL: [f32; 2] = [1.0, 0.0];
 
@@ -549,7 +566,7 @@ mod tests {
                 for y in 0..cy {
                     for x in 0..cx {
                         let (a, b) = (got[y * lx + x], want[y * obj[1] + x]);
-                        worst = worst.max((a - b).norm() / b.norm().max(1e-3));
+                        worst = worst_of([worst, (a - b).norm() / b.norm().max(1e-3)]);
                     }
                 }
                 assert_eq!(worst, 0.0, "after {} epochs of {stacks}", live.epochs());
@@ -645,7 +662,7 @@ mod tests {
     /// captured before the first frame: once the scan ends, the live object
     /// converges over the scanned region to the offline run over every
     /// frame, settled at 512 epochs, with no recapture. It crosses 0.99
-    /// about 125 epochs after the scan's end and goes on to 0.9996.
+    /// about 75 epochs after the scan's end and levels off at 0.9991.
     ///
     /// Steps of 8 px overlap the probe's 16 px by half. At 12 px AP's
     /// settled object moves by more than [`MATCH`] when the start moves by

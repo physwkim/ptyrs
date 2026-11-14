@@ -26,9 +26,10 @@
 use cuda_device::{async_copy, device, shared::DynamicSharedArray, thread};
 
 use crate::pixel::{
-    LlkPartial, MASKED, PositionPartial, ScalePartial, StackCtl, StackGeom, SumPtrs, TilePtrs,
-    ViewAddr, WARP, cmul, cmul_conj, freq, llk_add, load_c, obj_pixel_sources, psi_index,
-    quad_phase, ramp, sample_obj, stack_frames, store_c,
+    LlkPartial, MASKED, PositionPartial, PsiPtr, ScalePartial, StackCtl, StackGeom, SumPtrs,
+    TilePtrs, ViewAddr, WARP, cmul, cmul_conj, freq, llk_add, load_c, load_psi, obj_pixel_sources,
+    psi_f32, psi_index, quad_phase, ramp, sample_obj, stack_frames, store_c, store_psi, zdiv,
+    zsqrt,
 };
 use crate::{FFT_EPT_MAX, fft_ept};
 
@@ -73,6 +74,11 @@ pub const FUSED_SHIFT_PROBE: u32 = 2048;
 pub const FUSED_SHIFT_POSITION: u32 = 4096;
 /// [`shift_pre`] writes `T_y` and [`shift_rows_inv`] the denominator sums `shift_den`.
 pub const FUSED_SHIFT_DEN: u32 = 8192;
+/// [`rows_fwd`] builds RAAR's iterate `R = (1 - h) psi + h (2 PO - iterate)`, `h = beta /
+/// 2`, instead of `PO` ([`raar_mix`]).
+pub const FUSED_RAAR: u32 = 16384;
+/// [`rows_fwd`] stores the waves it transforms, `PO` or `R`, to `iterate`.
+pub const FUSED_ITERATE: u32 = 32768;
 
 /// Columns of one frame a [`cols`] block transforms, for every mode.
 pub const FUSED_COLS: u32 = 8;
@@ -112,12 +118,26 @@ pub fn pin_rows_inv_carveout(
     .result()
 }
 
-/// What a pass does, passed by value: `FUSED_*` bits and the DM `alpha`.
+/// What a pass does, passed by value: `FUSED_*` bits, the DM `alpha` and the RAAR `beta`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct FusedCfg {
     pub flags: u32,
     pub alpha: f32,
+    pub beta: f32,
+}
+
+/// RAAR's iterate (PyNX `RAARProj`) from the projection `s`, the iterate `it` it was
+/// projected from and `o = PO`: `(1 - h) s + h (2 o - it)`, `h = beta / 2`; one function
+/// for the fused pass and `kernels::raar_iterate`.
+#[device]
+pub fn raar_mix(s: (f32, f32), it: (f32, f32), o: (f32, f32), beta: f32) -> (f32, f32) {
+    let h = 0.5 * beta;
+    let k = 1.0 - h;
+    (
+        k * s.0 + h * (2.0 * o.0 - it.0),
+        k * s.1 + h * (2.0 * o.1 - it.1),
+    )
 }
 
 /// The stack slot, of `count`, of a frame pass block: its grid row `blockIdx.y`, or `count -
@@ -148,8 +168,11 @@ pub struct FusedPtrs {
     pub views: *const ViewAddr,
     /// `[nframe, ny, nx]`, detector order.
     pub counts: *const u16,
-    /// The stack's DM exit waves, `[nf_max * nmode, ny, nx]`, origin at `[0, 0]`.
-    pub psi: *mut f32,
+    /// The stack's DM or RAAR exit waves, `[nf_max * nmode, ny, nx]`, origin at `[0, 0]`, in
+    /// the format of the kernel's `HALF`.
+    pub psi: PsiPtr,
+    /// The stack's RAAR iterate, laid out and held as `psi`.
+    pub iterate: PsiPtr,
     /// The stack's transforms, `[nf_max * nmode, ny, nx]`.
     pub work: *mut f32,
     /// `P_p q`, `[nprobe, ny, nx]`, natural order.
@@ -315,44 +338,47 @@ unsafe fn row_fft_at<const NX: u32, const INV: bool>(
 /// Pass A: `work[kl, ys, :] = FFT_x(w[ys, :])` for view `k0 + kl` of the stack, `kl` of
 /// grid row `blockIdx.y` ([`FUSED_DOWN`]), and stored row `ys`, with `w = PO` as
 /// `kernels::obj_probe_to_psi` stores it or, under `FUSED_DM`, `w = (2 - a) PO - (1 - a)
-/// psi` as `kernels::dm_reflect` computes it. Reads `obj`, `probe`, `views` and under
-/// `FUSED_DM` `psi`; writes `work`. Grid `(ny / rows, nf_max * nmode)`, block
-/// `FUSED_ROW_THREADS`, dynamic shared memory `rows` row FFTs ([`FFT_SKEW`]).
+/// psi` as `kernels::dm_reflect` computes it, or under `FUSED_RAAR` `w = raar_mix(psi,
+/// iterate, PO)` as `kernels::raar_iterate` does; under `FUSED_ITERATE` `w` also goes to
+/// `iterate`. Reads `obj`, `probe`, `views`, under `FUSED_DM` `psi` and under `FUSED_RAAR`
+/// `psi` and `iterate`; writes `work`, and `iterate` under `FUSED_ITERATE`. Grid `(ny /
+/// rows, nf_max * nmode)`, block `FUSED_ROW_THREADS`, dynamic shared memory `rows` row FFTs
+/// ([`FFT_SKEW`]).
 ///
 /// # Safety
 ///
 /// `NX == g.nx`; the buffers it reads and writes hold their shapes for `g`; `ctl` one entry;
 /// launch as above.
 #[device]
-pub unsafe fn rows_fwd<const NX: u32>(
+pub unsafe fn rows_fwd<const NX: u32, const HALF: bool>(
     p: FusedPtrs,
     ctl: *const StackCtl,
     g: StackGeom,
     cfg: FusedCfg,
 ) {
-    unsafe { rows_fwd_with::<NX, false>(p, ctl, g, cfg) }
+    unsafe { rows_fwd_with::<NX, false, HALF>(p, ctl, g, cfg) }
 }
 
 /// [`rows_fwd`] with the shifted probe: `W_p = IDFT_x(T)` of the stored row of plane `fl *
 /// nprobe + p` of `shift` ([`shift_pre`]) in place of `P_p q`, so `w = O W` (`R = (2 - a) O
-/// W - (1 - a) psi` under `FUSED_DM`). Reads `shift` in place of `probe`; launch as
-/// [`rows_fwd`].
+/// W - (1 - a) psi` under `FUSED_DM`, `raar_mix(psi, iterate, O W)` under `FUSED_RAAR`).
+/// Reads `shift` in place of `probe`; launch as [`rows_fwd`].
 ///
 /// # Safety
 ///
 /// As [`rows_fwd`], and `shift` holds [`shift_pre`]'s `T` of this stack.
 #[device]
-pub unsafe fn shift_rows_fwd<const NX: u32>(
+pub unsafe fn shift_rows_fwd<const NX: u32, const HALF: bool>(
     p: FusedPtrs,
     ctl: *const StackCtl,
     g: StackGeom,
     cfg: FusedCfg,
 ) {
-    unsafe { rows_fwd_with::<NX, true>(p, ctl, g, cfg) }
+    unsafe { rows_fwd_with::<NX, true, HALF>(p, ctl, g, cfg) }
 }
 
 #[device]
-unsafe fn rows_fwd_with<const NX: u32, const SHIFT: bool>(
+unsafe fn rows_fwd_with<const NX: u32, const SHIFT: bool, const HALF: bool>(
     p: FusedPtrs,
     ctl: *const StackCtl,
     g: StackGeom,
@@ -372,6 +398,7 @@ unsafe fn rows_fwd_with<const NX: u32, const SHIFT: bool>(
     let y = (ys + ny / 2) % ny;
     let row = kl as usize * n + (ys * nx) as usize;
     let dm = cfg.flags & FUSED_DM != 0;
+    let (raar, iterate) = (cfg.flags & FUSED_RAAR != 0, cfg.flags & FUSED_ITERATE != 0);
     let (a, b) = (2.0 - cfg.alpha, 1.0 - cfg.alpha);
     let mut r = [0.0f32; 2 * FFT_EPT_MAX as usize];
     unsafe {
@@ -399,8 +426,20 @@ unsafe fn rows_fwd_with<const NX: u32, const SHIFT: bool>(
                 cmul(cmul(o, pr), quad_phase(g.quad, y, x, ny, nx))
             };
             if dm {
-                let s = load_c(p.psi, row + xs as usize);
+                let s = load_psi::<HALF>(p.psi, row + xs as usize);
                 w = (a * w.0 - b * s.0, a * w.1 - b * s.1);
+            }
+            if raar {
+                let at = row + xs as usize;
+                w = raar_mix(
+                    load_psi::<HALF>(p.psi, at),
+                    load_psi::<HALF>(p.iterate, at),
+                    w,
+                    cfg.beta,
+                );
+            }
+            if iterate {
+                store_psi::<HALF>(p.iterate, row + xs as usize, w);
             }
             r[2 * i as usize] = w.0;
             r[2 * i as usize + 1] = w.1;
@@ -545,7 +584,7 @@ pub unsafe fn cols<const NY: u32, const TERMS: u32>(
                 *p.background_ratio.add(fl as usize * n + j) = if obs == MASKED {
                     0.0
                 } else {
-                    obs as f32 / calc.max(1e-12)
+                    zdiv(obs as f32, calc.max(1e-12))
                 };
             }
             if m == 0 && obs != MASKED {
@@ -555,15 +594,15 @@ pub unsafe fn cols<const NY: u32, const TERMS: u32>(
                 }
                 if sums {
                     sacc.intensity += intensity;
-                    sacc.ratio += obs * intensity / calc.max(1e-12);
-                    sacc.amplitude += (obs * intensity).sqrt();
+                    sacc.ratio += zdiv(obs * intensity, calc.max(1e-12));
+                    sacc.amplitude += zsqrt(obs * intensity);
                 }
             }
             if project {
                 let scale = if obs == MASKED {
                     inv_n
                 } else {
-                    (obs as f32 / calc.max(1e-12)).sqrt() * inv_n
+                    zsqrt(zdiv(obs as f32, calc.max(1e-12))) * inv_n
                 };
                 r[2 * i as usize] *= scale;
                 r[2 * i as usize + 1] *= scale;
@@ -572,7 +611,7 @@ pub unsafe fn cols<const NY: u32, const TERMS: u32>(
                 let scale = if obs == MASKED {
                     0.0
                 } else {
-                    2.0 * sf * (1.0 - obs as f32 / calc.max(1e-12)) * inv_n
+                    2.0 * sf * (1.0 - zdiv(obs as f32, calc.max(1e-12))) * inv_n
                 };
                 r[2 * i as usize] *= scale;
                 r[2 * i as usize + 1] *= scale;
@@ -647,13 +686,13 @@ pub unsafe fn cols<const NY: u32, const TERMS: u32>(
 }
 
 /// Where [`rows_inv`] stores the new exit waves and [`gather`] reads them: `psi` under
-/// `FUSED_TO_PSI`, else `work`.
+/// `FUSED_TO_PSI`, else `work`, which holds `f32` only: an f16 build has `psi`.
 #[device]
-fn new_waves(p: FusedPtrs, cfg: FusedCfg) -> *mut f32 {
-    if cfg.flags & FUSED_TO_PSI != 0 {
+fn new_waves<const HALF: bool>(p: FusedPtrs, cfg: FusedCfg) -> PsiPtr {
+    if HALF || cfg.flags & FUSED_TO_PSI != 0 {
         p.psi
     } else {
-        p.work
+        psi_f32(p.work)
     }
 }
 
@@ -670,7 +709,7 @@ fn new_waves(p: FusedPtrs, cfg: FusedCfg) -> *mut f32 {
 /// `NX == g.nx`; the buffers it reads and writes hold their shapes for `g`; `ctl` one entry;
 /// launch as above.
 #[device]
-pub unsafe fn rows_inv<const NX: u32>(
+pub unsafe fn rows_inv<const NX: u32, const HALF: bool>(
     p: FusedPtrs,
     ctl: *const StackCtl,
     g: StackGeom,
@@ -688,7 +727,7 @@ pub unsafe fn rows_inv<const NX: u32>(
     let tpf = nx / ept;
     let y = (ys + ny / 2) % ny;
     let dm = cfg.flags & FUSED_DM != 0;
-    let out = new_waves(p, cfg);
+    let out = new_waves::<HALF>(p, cfg);
     let (a, b) = (2.0 - cfg.alpha, 1.0 - cfg.alpha);
     let k0 = (f0 + fl) * g.nmode;
     let mut r = [0.0f32; 2 * FFT_EPT_MAX as usize];
@@ -714,12 +753,12 @@ pub unsafe fn rows_inv<const NX: u32>(
                     let pr = load_c(p.probe, v.probe as usize * n + (y * nx + x) as usize);
                     let q = quad_phase(g.quad, y, x, ny, nx);
                     let po = cmul(cmul(sample_obj(p.obj, v, y, x, g.nyo, g.nxo), pr), q);
-                    let old = load_c(p.psi, at);
+                    let old = load_psi::<HALF>(p.psi, at);
                     let refl = (a * po.0 - b * old.0, a * po.1 - b * old.1);
                     let d = (b * (po.0 - refl.0), b * (po.1 - refl.1));
                     s = (s.0 + d.0, s.1 + d.1);
                 }
-                store_c(out, at, s);
+                store_psi::<HALF>(out, at, s);
             }
         }
     }
@@ -767,7 +806,7 @@ pub unsafe fn probe_terms(p: FusedPtrs, g: StackGeom) {
 /// `probe_power` as [`probe_terms`] wrote them for this probe in place of `probe`; `shared`
 /// as `for_each_stack_tile` needs.
 #[device]
-pub unsafe fn gather(
+pub unsafe fn gather<const HALF: bool>(
     p: FusedPtrs,
     tiles: TilePtrs,
     sums: SumPtrs,
@@ -776,7 +815,7 @@ pub unsafe fn gather(
     g: StackGeom,
     cfg: FusedCfg,
 ) {
-    unsafe { gather_with::<false>(p, tiles, sums, shared, ctl, g, cfg) }
+    unsafe { gather_with::<false, HALF>(p, tiles, sums, shared, ctl, g, cfg) }
 }
 
 /// [`gather`] with the shifted probe: `c_(f, o)` is read from `shift_obj` and the
@@ -797,11 +836,11 @@ pub unsafe fn gather_shifted(
     g: StackGeom,
     cfg: FusedCfg,
 ) {
-    unsafe { gather_with::<true>(p, tiles, sums, shared, ctl, g, cfg) }
+    unsafe { gather_with::<true, false>(p, tiles, sums, shared, ctl, g, cfg) }
 }
 
 #[device]
-unsafe fn gather_with<const SHIFT: bool>(
+unsafe fn gather_with<const SHIFT: bool, const HALF: bool>(
     p: FusedPtrs,
     tiles: TilePtrs,
     sums: SumPtrs,
@@ -812,7 +851,7 @@ unsafe fn gather_with<const SHIFT: bool>(
 ) {
     let iobj = thread::blockIdx_z();
     let n = g.ny as usize * g.nx as usize;
-    let waves = new_waves(p, cfg);
+    let waves = new_waves::<HALF>(p, cfg);
     let (f0, nf) = unsafe { stack_frames(ctl, g) };
     let (k0, nk) = (f0 * g.nmode, nf * g.nmode);
     let pixel = |lo: u32, end: u32, y: u32, x: u32| unsafe {
@@ -848,7 +887,7 @@ unsafe fn gather_with<const SHIFT: bool>(
                     for pm in 0..g.nprobe as usize {
                         let u = cmul_conj(
                             load_c(p.probe_q, pm * n + at),
-                            load_c(waves, plane + pm * n + ps),
+                            load_psi::<HALF>(waves, plane + pm * n + ps),
                         );
                         c = (c.0 + u.0, c.1 + u.1);
                     }
@@ -993,13 +1032,13 @@ pub unsafe fn shift_pre<const NY: u32>(
 /// `FUSED_SHIFT_DEN` or `FUSED_SHIFT_POSITION`) of this stack, and the buffers the flags name
 /// holding their shapes.
 #[device]
-pub unsafe fn shift_rows_inv<const NX: u32>(
+pub unsafe fn shift_rows_inv<const NX: u32, const HALF: bool>(
     p: FusedPtrs,
     ctl: *const StackCtl,
     g: StackGeom,
     cfg: FusedCfg,
 ) {
-    unsafe { shift_rows_inv_with::<NX, false>(p, ctl, g, cfg) }
+    unsafe { shift_rows_inv_with::<NX, false, HALF>(p, ctl, g, cfg) }
 }
 
 /// [`shift_rows_inv`]'s `FUSED_SHIFT_OBJ` and `FUSED_SHIFT_PROBE` terms of the waves `x` a
@@ -1012,18 +1051,18 @@ pub unsafe fn shift_rows_inv<const NX: u32>(
 ///
 /// As [`shift_rows_inv`], with `psi` holding the stack's waves in place of `work`.
 #[device]
-pub unsafe fn shift_sums<const NX: u32>(
+pub unsafe fn shift_sums<const NX: u32, const HALF: bool>(
     p: FusedPtrs,
     ctl: *const StackCtl,
     g: StackGeom,
     cfg: FusedCfg,
 ) {
-    unsafe { shift_rows_inv_with::<NX, true>(p, ctl, g, cfg) }
+    unsafe { shift_rows_inv_with::<NX, true, HALF>(p, ctl, g, cfg) }
 }
 
 /// [`shift_rows_inv`], or under `SUMS` [`shift_sums`].
 #[device]
-unsafe fn shift_rows_inv_with<const NX: u32, const SUMS: bool>(
+unsafe fn shift_rows_inv_with<const NX: u32, const SUMS: bool, const HALF: bool>(
     p: FusedPtrs,
     ctl: *const StackCtl,
     g: StackGeom,
@@ -1055,7 +1094,7 @@ unsafe fn shift_rows_inv_with<const NX: u32, const SUMS: bool>(
     let grad = flags & FUSED_GRAD != 0;
     let adjoint = probe || position;
     let slopes = den || position;
-    let out = new_waves(p, cfg);
+    let out = new_waves::<HALF>(p, cfg);
     let (a, b) = (2.0 - cfg.alpha, 1.0 - cfg.alpha);
     let k0 = (f0 + fl) * g.nmode;
     let srow = (ys * nx) as usize;
@@ -1128,7 +1167,7 @@ unsafe fn shift_rows_inv_with<const NX: u32, const SUMS: bool>(
                     let wi = (w[k], w[k + 1]);
                     let at = row + xs as usize;
                     let mut s = if SUMS {
-                        load_c(p.psi, at)
+                        load_psi::<HALF>(p.psi, at)
                     } else {
                         (r[k], r[k + 1])
                     };
@@ -1139,13 +1178,13 @@ unsafe fn shift_rows_inv_with<const NX: u32, const SUMS: bool>(
                     };
                     if dm {
                         let po = cmul(vo, wi);
-                        let old = load_c(p.psi, at);
+                        let old = load_psi::<HALF>(p.psi, at);
                         let refl = (a * po.0 - b * old.0, a * po.1 - b * old.1);
                         let d = (b * (po.0 - refl.0), b * (po.1 - refl.1));
                         s = (s.0 + d.0, s.1 + d.1);
                     }
                     if !SUMS {
-                        store_c(out, at, s);
+                        store_psi::<HALF>(out, at, s);
                     }
                     if obj_terms {
                         let ct = cplane + xs as usize;

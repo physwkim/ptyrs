@@ -1,12 +1,13 @@
-//! The GPU backend (DESIGN §7 M1): [`GpuPtycho`] runs AP, DM, rPIE, ML and BH in `f32` on one CUDA
+//! The GPU backend (DESIGN §7 M1): [`GpuPtycho`] runs AP, DM, RAAR, rPIE, ML and BH in `f32` on one CUDA
 //! stream with the `ptyrs::gpu` pixel kernels and `ptyrs::fft` plans, in the call sequences the
 //! `crate::gpu` ops and rPIE docs give, and is checked against [`crate::engine::Ptycho`].
 //!
-//! The scan's frames are cut into stacks of consecutive frames, one [`StackTable`] entry each:
-//! every launch reads its stack's frames from the entry on the device. The passes that stream
-//! one exit-wave set per frame take stacks up to twice as long as the rest
-//! ([`GpuOptions::stack_size`]). Each stack keeps its own exit waves (DM carries them across
-//! cycles), sized like PyNX's fixed stack for the longest stack. AP and DM project a stack, ML
+//! The scan's frames are cut into stacks of consecutive frames, of lengths within a frame of
+//! each other, one [`StackTable`] entry each: every launch reads its stack's frames from the
+//! entry on the device. Each pass cuts its own stacks by the bytes it streams per frame
+//! ([`GpuOptions::stack_size`]). DM and RAAR keep
+//! each stack's exit waves across cycles (RAAR also its iterate), sized like PyNX's fixed
+//! stack for the longest stack. AP, DM and RAAR project a stack, ML
 //! takes a stack's gradient, and the LLK pass takes its partials, either by M2's fused passes
 //! over one scratch set or by the M1 launch sequence ([`GpuOptions::fused`]), whose one scratch
 //! stack serves all and whose stacks of one length share a cuFFT plan, which transforms only
@@ -15,7 +16,7 @@
 //! reads back to the host: an LLK record goes, stack by stack, into the device's
 //! [`crate::gpu::LlkRing`], whose copies download while later cycles run, and the host reads
 //! the records at the end of each algorithm call (or of [`GpuPtycho::llk`]), the arrays only
-//! when asked for. Every cycle, AP's with an LLK and DM's first included, and the LLK pass
+//! when asked for. Every cycle, AP's with an LLK and DM's and RAAR's first included, and the LLK pass
 //! replay a captured CUDA graph (DESIGN B2, [`GpuOptions::graph`]): one per [`Epoch`], kept
 //! with the buffers it captured until another algorithm or other parameters need new ones,
 //! and the LLK pass's for the life of the device state. Each algorithm is its own module over
@@ -27,9 +28,10 @@ mod device;
 mod dm;
 mod lsqml;
 mod ml;
+mod propagate;
+mod raar;
 mod rpie;
 
-use std::f64::consts::PI;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -37,28 +39,32 @@ use crate::base::{AddrTable, C64, Object, Probe, Scan, Stack};
 use crate::fft::Plan2d;
 use crate::gpu::{
     C32, CG_BLOCKS, Ended, Error as GpuError, FarSums, FusedBufs, FusedInputs, ObjProbeScale,
-    RecordWriter, StackTable, ViewAddr, ViewDims,
+    RecordWriter, StackRef, StackTable, ViewAddr, ViewDims,
 };
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 
-use device::{Bufs, Device, M1Bufs, NormBufs, PassesMut};
+use device::{Bufs, Device, NormBufs, PassesMut, Uploads};
 
 use crate::engine::ptycho::{Algorithm, LlkRecord, zero_phase_ramp};
 use crate::engine::{
-    ApParams, BhParams, DmParams, EngineError, Features, Fft2, Llk, LsqmlParams, MlParams,
-    RpieParams,
+    ApParams, BhParams, DmParams, EngineError, Features, Fft2, Llk, LsqmlParams, MlParams, Optics,
+    RaarParams, RpieParams,
 };
 
 /// How [`GpuPtycho`] batches its work.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GpuOptions {
-    /// Frames per stack (the last stack may be shorter) for every pass; PyNX's default is 16.
-    /// `None`, the default, cuts by bytes instead, so a stack's exit waves fill 3/8 of the
-    /// device's L2, the fastest share at frame sides 256 and 512: one set of them per frame
-    /// where a pass streams one (the fused passes' shared scratch in AP, the LLK pass and ML's
-    /// gradient; LSQML's own), two where it streams two (DM's carried waves, ML's line search,
-    /// M1's launches, BH's stacks).
+    /// At most this many frames per stack for every pass but rPIE's, whose batches are its own:
+    /// each pass cuts the scan, BH and LSQML each batch, into as few stacks as that takes, of
+    /// lengths within a frame of each other; PyNX's default is 16. `None`, the default, cuts each
+    /// pass by bytes instead: as many frames as fill 3/8 of the device's L2, the fastest share at
+    /// frame sides 256 and 512, with the buffers that more than one launch over a stack touches,
+    /// which stay in L2 between them. That is the shared scratch alone in AP, the LLK pass and ML's
+    /// gradient, and with it DM's and RAAR's carried exit waves (RAAR's iterate, touched once,
+    /// streams); ML's line search, BH and LSQML count their own buffers, and under the position
+    /// model BH and LSQML the shift planes they borrow from the shared scratch, whose stacks also
+    /// cap theirs.
     pub stack_size: Option<usize>,
     /// Replay every AP, DM and ML cycle, rPIE epoch and LLK pass from a CUDA graph captured once
     /// per kind of cycle instead of launching it kernel by kernel; both give the same bits.
@@ -93,6 +99,8 @@ enum Epoch {
     Ap { params: ApParams, llk: bool },
     /// A DM cycle; `first` for cycle 0 of a call.
     Dm { params: DmParams, first: bool },
+    /// A RAAR cycle; `first` for cycle 0 of a call.
+    Raar { params: RaarParams, first: bool },
     /// An rPIE epoch.
     Rpie(RpieParams),
     /// An ML cycle; `first` for cycle 0 of a call, with `llk` it takes the LLK of the
@@ -116,6 +124,7 @@ impl Epoch {
         match self {
             Self::Ap { .. } => Algorithm::Ap,
             Self::Dm { .. } => Algorithm::Dm,
+            Self::Raar { .. } => Algorithm::Raar,
             Self::Rpie(_) => Algorithm::Rpie,
             Self::Ml { .. } => Algorithm::Ml,
             Self::Bh { .. } => Algorithm::Bh,
@@ -128,6 +137,10 @@ impl Epoch {
         match self {
             Self::Ap { params, .. } => Self::Ap { params, llk: false },
             Self::Dm { params, .. } => Self::Dm {
+                params,
+                first: false,
+            },
+            Self::Raar { params, .. } => Self::Raar {
                 params,
                 first: false,
             },
@@ -168,45 +181,85 @@ impl Frames {
     }
 }
 
-/// Stacks, the table of their entries and their distinct lengths, in the order
-/// [`Frames::plan`] indexes them.
-type Stacked = (Vec<Frames>, StackTable, Vec<u32>);
-
-/// `0 .. nframe` cut into consecutive ranges of `size` frames, the last one shorter when
-/// `size` does not divide `nframe`.
-fn stacks(stream: &Arc<CudaStream>, dims: &ViewDims, size: u32) -> Result<Stacked, EngineError> {
-    let (ranges, lens) = split(dims.nframe, size);
-    let (frames, table) = table_of(stream, dims, ranges)?;
-    Ok((frames, table, lens))
+/// Stacks of consecutive frames: their [`Frames`], the table of their entries and their
+/// distinct lengths, in the order [`Frames::plan`] indexes them.
+struct Cut {
+    frames: Vec<Frames>,
+    table: StackTable,
+    lens: Vec<u32>,
 }
 
-/// The epoch positions `0 .. nframe` in batches of `size`, each cut into stacks of
-/// `stack_size` (the last batch, and a batch's last stack, may be shorter), and each batch's
-/// range of stack indices.
+impl Cut {
+    fn len(&self) -> usize {
+        self.frames.len()
+    }
+
+    fn at(&self, s: usize) -> StackRef<'_> {
+        self.table.at(s)
+    }
+
+    /// Values of the longest stack's exit waves, what each wave buffer of the cut holds.
+    fn wave_len(&self, dims: &ViewDims) -> usize {
+        self.table.nf_max() as usize * dims.nmode as usize * plane_len(dims)
+    }
+
+    /// One cuFFT plan per stack length, in [`Frames::plan`]'s order.
+    fn plans(&self, stream: &Arc<CudaStream>, dims: &ViewDims) -> Result<Vec<Plan2d>, EngineError> {
+        let nmode = dims.nmode as usize;
+        Ok(self
+            .lens
+            .iter()
+            .map(|&nf| Plan2d::new(stream, dims.frame[0] as usize, nf as usize * nmode))
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+}
+
+/// Every cut of the frames into stacks: `0 .. nframe` in batches of `batch` (the last batch
+/// may be shorter), each cut by [`even_stacks`] into stacks of at most `max`, and each batch's
+/// range of stack indices. A pass over the scan is one batch of every frame; rPIE's batches
+/// are a stack each (`max` equal to `batch`).
 fn batch_stacks(
     stream: &Arc<CudaStream>,
     dims: &ViewDims,
-    size: u32,
-    stack_size: u32,
-) -> Result<(Stacked, Vec<Range<usize>>), EngineError> {
+    batch: u32,
+    max: u32,
+) -> Result<(Cut, Vec<Range<usize>>), EngineError> {
     let (mut ranges, mut lens, mut batches) = (Vec::new(), Vec::<u32>::new(), Vec::new());
-    for (b, _) in split(dims.nframe, size).0 {
+    for f0 in (0..dims.nframe).step_by(batch as usize) {
         let first = ranges.len();
-        let (sub, sub_lens) = split(b.end - b.start, stack_size);
-        for (r, i) in sub {
-            let plan = match lens.iter().position(|&l| l == sub_lens[i]) {
+        for r in even_stacks(f0..dims.nframe.min(f0 + batch), max) {
+            let nf = r.end - r.start;
+            let plan = match lens.iter().position(|&l| l == nf) {
                 Some(plan) => plan,
                 None => {
-                    lens.push(sub_lens[i]);
+                    lens.push(nf);
                     lens.len() - 1
                 }
             };
-            ranges.push((b.start + r.start..b.start + r.end, plan));
+            ranges.push((r, plan));
         }
         batches.push(first..ranges.len());
     }
     let (frames, table) = table_of(stream, dims, ranges)?;
-    Ok(((frames, table, lens), batches))
+    let cut = Cut {
+        frames,
+        table,
+        lens,
+    };
+    Ok((cut, batches))
+}
+
+/// `range` cut into as few consecutive stacks of at most `max` frames as it takes, longer
+/// ones first, their lengths within a frame of each other: a short tail stack would cost a
+/// full stack's launches for a few frames.
+fn even_stacks(range: Range<u32>, max: u32) -> impl Iterator<Item = Range<u32>> {
+    let len = range.end - range.start;
+    let k = len.div_ceil(max);
+    (0..k).scan(range.start, move |f0, s| {
+        let nf = len / k + u32::from(s < len % k);
+        *f0 += nf;
+        Some(*f0 - nf..*f0)
+    })
 }
 
 /// The table of `ranges` and their [`Frames`], each range with its plan index.
@@ -235,65 +288,71 @@ fn table_of(
     Ok((frames, table))
 }
 
-/// One cuFFT plan per stack length of [`stacks`].
-fn plans(
-    stream: &Arc<CudaStream>,
-    dims: &ViewDims,
-    lens: &[u32],
-) -> Result<Vec<Plan2d>, EngineError> {
-    let nmode = dims.nmode as usize;
-    Ok(lens
-        .iter()
-        .map(|&nf| Plan2d::new(stream, dims.frame[0] as usize, nf as usize * nmode))
-        .collect::<Result<Vec<_>, _>>()?)
+/// A per-frame buffer of a loop over stacks: its bytes per frame and how many of the passes
+/// over one stack (launches) of the loop's cycle touch it.
+#[derive(Clone, Copy, Debug)]
+struct Streamed {
+    bytes: usize,
+    passes: u32,
 }
 
-/// Frames per stack, `[wide, carry]`: `size` for both when given, else, for an `l2`-byte L2,
-/// as many as fill 3/8 of it with one exit-wave set per frame (the passes that stream one)
-/// and with two (the rest), at least one each ([`GpuOptions::stack_size`]).
-fn stack_frames(size: Option<usize>, l2: usize, dims: &ViewDims) -> Result<[u32; 2], EngineError> {
-    let set = dims.nmode as usize * plane_len(dims) * size_of::<C32>();
-    let cap = l2 / 8 * 3;
-    let frames = match size {
-        Some(n) => [n; 2],
-        None => [1, 2].map(|sets| (cap / (sets * set)).max(1)),
-    };
-    Ok([
-        to_u32("stack_size", frames[0])?,
-        to_u32("stack_size", frames[1])?,
-    ])
-}
-
-/// The longest stack of either cut: the frames every buffer that more than one cut indexes
-/// holds.
-fn nf_max(wide: &StackTable, carry: &StackTable) -> u32 {
-    wide.nf_max().max(carry.nf_max())
-}
-
-/// Values of `nf_max` frames' exit waves, what every stack buffer holds.
-fn stack_buf_len(dims: &ViewDims, table: &StackTable) -> usize {
-    table.nf_max() as usize * dims.nmode as usize * plane_len(dims)
-}
-
-/// `0 .. nframe` in consecutive ranges of `size` frames, the last one shorter when `size`
-/// does not divide `nframe`, each with the index of its length in the returned lengths.
-fn split(nframe: u32, size: u32) -> (Vec<(Range<u32>, usize)>, Vec<u32>) {
-    let mut lens: Vec<u32> = Vec::new();
-    let mut ranges = Vec::new();
-    let mut f0 = 0;
-    while f0 < nframe {
-        let f1 = nframe.min(f0 + size);
-        let idx = match lens.iter().position(|&l| l == f1 - f0) {
-            Some(i) => i,
-            None => {
-                lens.push(f1 - f0);
-                lens.len() - 1
-            }
-        };
-        ranges.push((f0..f1, idx));
-        f0 = f1;
+impl Streamed {
+    fn new(bytes: usize, passes: u32) -> Self {
+        Self { bytes, passes }
     }
-    (ranges, lens)
+}
+
+/// [`GpuOptions::stack_size`] on one device: a loop's frames per stack from the buffers its
+/// passes stream. Stacking keeps the buffers a stack's passes share in L2 from one pass to the
+/// next, so only the bytes per frame of buffers more than one pass touches fill the budget; a
+/// buffer one pass touches streams through either way.
+#[derive(Clone, Copy, Debug)]
+struct StackRule {
+    size: Option<usize>,
+    /// 3/8 of the device's L2, in bytes.
+    budget: usize,
+}
+
+impl StackRule {
+    /// For `size` on a device of an `l2`-byte L2.
+    fn new(size: Option<usize>, l2: usize) -> Self {
+        Self {
+            size,
+            budget: l2 / 8 * 3,
+        }
+    }
+
+    /// Frames per stack of a loop over `bufs`: the given size, else as many frames of the
+    /// shared buffers as fit the budget, at least one.
+    fn frames(self, bufs: &[Streamed]) -> Result<u32, EngineError> {
+        let shared: usize = (bufs.iter().filter(|b| b.passes > 1))
+            .map(|b| b.bytes)
+            .sum();
+        let n = self
+            .size
+            .unwrap_or_else(|| (self.budget / shared.max(1)).max(1));
+        to_u32("stack_size", n)
+    }
+
+    /// `0 .. nframe` in stacks of at most [`Self::frames`] for `bufs`.
+    fn cut(
+        self,
+        stream: &Arc<CudaStream>,
+        dims: &ViewDims,
+        bufs: &[Streamed],
+    ) -> Result<Cut, EngineError> {
+        Ok(batch_stacks(stream, dims, dims.nframe, self.frames(bufs)?)?.0)
+    }
+}
+
+/// Bytes per frame of `planes` frame planes of `T`.
+fn plane_bytes<T>(dims: &ViewDims, planes: u32) -> usize {
+    planes as usize * plane_len(dims) * size_of::<T>()
+}
+
+/// Bytes per frame of one exit-wave set, its `nmode` planes.
+fn wave_bytes(dims: &ViewDims) -> usize {
+    plane_bytes::<C32>(dims, dims.nmode)
 }
 
 fn plane_len(dims: &ViewDims) -> usize {
@@ -344,8 +403,8 @@ pub struct GpuPtycho {
 
 impl GpuPtycho {
     /// Uploads the scan's counts and views (as [`crate::engine::Ptycho::new`] builds them) and the
-    /// starting arrays to `ctx`, on a new stream. Frames must be square (cuFFT plans here are
-    /// `n x n`).
+    /// starting arrays to `ctx`, on a new stream, for the far field of the scan's geometry.
+    /// Frames must be square (cuFFT plans here are `n x n`).
     pub fn new(
         ctx: &Arc<CudaContext>,
         scan: &Scan,
@@ -353,8 +412,43 @@ impl GpuPtycho {
         probe: Probe,
         options: GpuOptions,
     ) -> Result<Self, EngineError> {
+        let optics = Optics::far_field(&scan.geometry);
+        Self::with_optics(ctx, scan, &optics, object, probe, options)
+    }
+
+    /// [`Self::new`] under `optics`, which give the object pixel of the scan's positions, the
+    /// exit waves' plane phase and the propagator in place of the scan geometry's far field;
+    /// of the geometry only the frame is read. Fails on optics without a
+    /// [`Optics::fourier_form`], and on more than one object slice.
+    pub fn with_optics(
+        ctx: &Arc<CudaContext>,
+        scan: &Scan,
+        optics: &Optics,
+        object: Object,
+        probe: Probe,
+        options: GpuOptions,
+    ) -> Result<Self, EngineError> {
         let g = scan.geometry;
         let [ny, nx] = g.frame;
+        if optics.exit().shape() != g.frame {
+            return Err(EngineError::Invalid(format!(
+                "propagator plane {:?} differs from frame {:?}",
+                optics.exit().shape(),
+                g.frame
+            )));
+        }
+        if optics.nslice() != 1 {
+            return Err(EngineError::Invalid(format!(
+                "the GPU backend runs one object slice, got {}",
+                optics.nslice()
+            )));
+        }
+        let pixel = optics.pixel();
+        let form = optics.fourier_form().map_err(|e| {
+            EngineError::Invalid(format!(
+                "the GPU backend cannot run these optics over object pixels {pixel:?}: {e}"
+            ))
+        })?;
         if ny != nx {
             return Err(EngineError::Invalid(format!(
                 "the GPU backend needs square frames, got {:?}",
@@ -371,7 +465,6 @@ impl GpuPtycho {
         if options.stack_size == Some(0) {
             return Err(EngineError::Invalid("stack_size must be >= 1".into()));
         }
-        let pixel = g.pixel_size_object();
         let positions = scan.positions.pynx_preprocess(pixel);
         let addr = AddrTable::new(
             &positions,
@@ -389,7 +482,7 @@ impl GpuPtycho {
             nobj: to_u32("object modes", addr.nobj())?,
             frame: [to_u32("frame side", ny)?, to_u32("frame side", nx)?],
             obj: [to_u32("object side", nyo)?, to_u32("object side", nxo)?],
-            quad_phase: (PI * pixel[1] * pixel[1] / (g.wavelength * g.distance)) as f32,
+            quad_phase: form.quad as f32,
         };
         let addrs: Vec<ViewAddr> = addr
             .views()
@@ -404,15 +497,15 @@ impl GpuPtycho {
             })
             .collect();
 
-        let dev = Device::new(
-            ctx,
-            dims,
-            &addrs,
-            scan.counts.as_slice(),
-            &to_c32(object.as_slice()),
-            &to_c32(probe.as_slice()),
-            options,
-        )?;
+        let uploads = Uploads {
+            stage: form.stage,
+            scale: optics.exit().intensity_scale() as f32,
+            addrs: &addrs,
+            counts: scan.counts.as_slice(),
+            obj: &to_c32(object.as_slice()),
+            probe: &to_c32(probe.as_slice()),
+        };
+        let dev = Device::new(ctx, dims, uploads, options)?;
         Ok(Self {
             dev,
             obj_dims: object.dims(),
@@ -543,12 +636,12 @@ impl Bufs<'_> {
         let dims = *self.views.dims();
         match passes {
             PassesMut::M1(m1) => {
-                for s in 0..self.stacks.len() {
-                    let stack = self.table.at(s);
+                for s in 0..self.scratch.len() {
+                    let stack = self.scratch.at(s);
                     self.kernels.obj_probe_to_psi(
                         ctx, self.views, stack, self.obj, self.probe, m1.scratch,
                     )?;
-                    let plan = self.stacks.get(s).frames.plan;
+                    let plan = self.scratch.frames[s].plan;
                     m1.plans.get(plan).forward_inplace(ctx, m1.scratch)?;
                     self.kernels.llk(
                         ctx,
@@ -562,9 +655,11 @@ impl Bufs<'_> {
                 }
             }
             PassesMut::Fused(f) => {
-                let m = self.features.lend(ctx, self.kernels, &dims, self.probe)?;
-                for s in 0..self.wide.len() {
-                    let stack = self.wide.at(s);
+                let m = self
+                    .features
+                    .lend(ctx, self.kernels, &dims, self.probe, self.exit)?;
+                for s in 0..self.scratch.len() {
+                    let stack = self.scratch.at(s);
                     let inputs = FusedInputs {
                         views: self.views,
                         counts: self.counts,
@@ -594,9 +689,11 @@ impl Bufs<'_> {
         mut llk: Option<RecordWriter<'_>>,
     ) -> Result<Option<Ended>, GpuError> {
         let dims = *self.views.dims();
-        let mut m = self.features.lend(ctx, self.kernels, &dims, self.probe)?;
-        for s in 0..self.wide.len() {
-            let stack = self.wide.at(s);
+        let mut m = self
+            .features
+            .lend(ctx, self.kernels, &dims, self.probe, self.exit)?;
+        for s in 0..self.scratch.len() {
+            let stack = self.scratch.at(s);
             let inputs = FusedInputs {
                 views: self.views,
                 counts: self.counts,
@@ -615,43 +712,40 @@ impl Bufs<'_> {
         Ok(ended)
     }
 
-    /// M1 Fourier-modulus projection of stack `s`'s exit waves in place: FFT,
-    /// `apply_amplitude`, inverse FFT. With `llk`, the stack's LLK partials of the forward
-    /// stack go into that record first.
+    /// M1 Fourier-modulus projection of `stack`'s exit waves `psi` in place by `plan`, its
+    /// length's: FFT, `apply_amplitude`, inverse FFT. With `llk`, the stack's LLK partials of
+    /// the forward stack go into that record first.
     fn project(
         &mut self,
         ctx: &ExecutionContext,
-        m1: &mut M1Bufs<'_>,
-        s: usize,
+        stack: StackRef<'_>,
+        plan: &mut Plan2d,
+        psi: &mut DeviceBuffer<C32>,
         llk: Option<&mut RecordWriter<'_>>,
     ) -> Result<(), GpuError> {
         let dims = *self.views.dims();
-        let stack = self.table.at(s);
-        let st = self.stacks.get(s);
-        let plan = m1.plans.get(st.frames.plan);
-        plan.forward_inplace(ctx, st.psi)?;
+        plan.forward_inplace(ctx, psi)?;
         if let Some(rec) = llk {
             self.kernels
-                .llk(ctx, stack, self.counts, st.psi, self.llk_scratch, self.llk)?;
+                .llk(ctx, stack, self.counts, psi, self.llk_scratch, self.llk)?;
             rec.push(ctx, &dims, stack, self.llk)?;
         }
         self.kernels
-            .apply_amplitude(ctx, &dims, stack, self.counts, st.psi)?;
-        plan.inverse_inplace(ctx, st.psi)?;
+            .apply_amplitude(ctx, &dims, stack, self.counts, psi)?;
+        plan.inverse_inplace(ctx, psi)?;
         Ok(())
     }
 
-    /// Adds stack `s`'s object and/or probe update sums (PyNX `Psi2Obj`, `Psi2Probe`) from its
-    /// exit waves and the current arrays.
+    /// Adds `stack`'s object and/or probe update sums (PyNX `Psi2Obj`, `Psi2Probe`) from its
+    /// exit waves `psi` and the current arrays.
     fn accumulate(
         &mut self,
         ctx: &ExecutionContext,
-        s: usize,
+        stack: StackRef<'_>,
+        psi: &DeviceBuffer<C32>,
         obj: bool,
         probe: bool,
     ) -> Result<(), GpuError> {
-        let stack = self.table.at(s);
-        let psi = self.stacks.get(s).psi;
         if obj {
             self.kernels
                 .psi_to_obj(ctx, self.views, stack, psi, self.probe, self.obj_sums)?;
@@ -742,14 +836,48 @@ mod tests {
         }
     }
 
-    /// Two modes' exit waves in 24 MiB of a 64 MiB L2: 24 and 12 frames of 256x256, 6 and 3
-    /// of 512x512, and one each when a frame alone overfills the share; a given size wins.
+    /// A batch of 96 at most 19 per stack is 6 stacks of 16, not 5 of 19 and one of 1; 30 at
+    /// 7 is 6, 6, 6, 6, 6; lengths that divide stay whole, and 5 frames at 8 are one stack.
     #[test]
-    fn stack_frames_fill_three_eighths_of_l2() {
+    fn even_stacks_cut_a_batch_into_equal_lengths() {
+        let lens = |r: Range<u32>, max| {
+            let stacks: Vec<_> = even_stacks(r.clone(), max).collect();
+            assert_eq!(stacks.first().map(|s| s.start), Some(r.start));
+            assert_eq!(stacks.last().map(|s| s.end), Some(r.end));
+            assert!(stacks.windows(2).all(|w| w[0].end == w[1].start));
+            stacks.iter().map(|s| s.end - s.start).collect::<Vec<_>>()
+        };
+        assert_eq!(lens(0..96, 19), [16; 6]);
+        assert_eq!(lens(96..126, 7), [6; 5]);
+        assert_eq!(lens(0..64, 19), [16; 4]);
+        assert_eq!(lens(0..64, 18), [16; 4]);
+        assert_eq!(lens(0..65, 16), [13; 5]);
+        assert_eq!(lens(0..10, 4), [4, 3, 3]);
+        assert_eq!(lens(0..96, 16), [16; 6]);
+        assert_eq!(lens(3..8, 8), [5]);
+    }
+
+    /// 24 MiB of a 64 MiB L2 holds 24, 12, 8 and 6 frames of one to four shared two-mode
+    /// exit-wave sets at 256x256, 6, 3, 2 and 1 at 512x512, and 16 of one and a half (a set
+    /// stored at half width); a set one pass touches does not count; a frame alone that
+    /// overfills it is one, and a given size wins.
+    #[test]
+    fn stack_rule_fills_three_eighths_of_l2() {
         const L2: usize = 64 << 20;
-        assert_eq!(stack_frames(None, L2, &dims(256)).unwrap(), [24, 12]);
-        assert_eq!(stack_frames(None, L2, &dims(512)).unwrap(), [6, 3]);
-        assert_eq!(stack_frames(None, 4 << 20, &dims(512)).unwrap(), [1, 1]);
-        assert_eq!(stack_frames(Some(16), L2, &dims(512)).unwrap(), [16, 16]);
+        let rule = StackRule::new(None, L2);
+        let sets = |wave, k, passes| vec![Streamed::new(wave, passes); k];
+        for (side, want) in [(256, [24, 12, 8, 6]), (512, [6, 3, 2, 1])] {
+            let wave = wave_bytes(&dims(side));
+            let frames = [1, 2, 3, 4].map(|k| rule.frames(&sets(wave, k, 2)).unwrap());
+            assert_eq!(frames, want);
+        }
+        let wave = wave_bytes(&dims(256));
+        let once = [sets(wave, 2, 3), sets(wave, 1, 1)].concat();
+        assert_eq!(rule.frames(&once).unwrap(), 12);
+        let half = [Streamed::new(wave, 2), Streamed::new(wave / 2, 2)];
+        assert_eq!(rule.frames(&half).unwrap(), 16);
+        let big = sets(wave_bytes(&dims(512)), 4, 2);
+        assert_eq!(StackRule::new(None, 4 << 20).frames(&big[..1]).unwrap(), 1);
+        assert_eq!(StackRule::new(Some(16), L2).frames(&big).unwrap(), 16);
     }
 }

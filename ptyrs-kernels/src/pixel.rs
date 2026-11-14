@@ -6,6 +6,7 @@
 //! [`psi_index`]. The same map takes an FFT-order frequency to its detector pixel (zero
 //! frequency at `[ny/2, nx/2]`), because for even sizes the shift is its own inverse.
 
+use cuda_device::convert::cvt_f16x2_f32;
 use cuda_device::device;
 
 /// Object tiles of the deterministic object gather are `OBJ_TILE x OBJ_TILE` pixels.
@@ -229,6 +230,26 @@ pub struct PositionPartial {
 // SAFETY: repr(C) of two f32, no padding; every bit pattern is a valid value.
 unsafe impl cuda_core::DeviceCopy for PositionPartial {}
 
+/// `num / den`, bit for bit for every input. IEEE division takes an out-of-line slow path
+/// for a zero `num`, which zero counts make common; here it divides `2^-24` instead and
+/// `num * (2^-24 / den)` is exactly `0 / den`: signed zero, or NaN for a zero or NaN `den`
+/// (`2^-24` keeps the quotient finite for a subnormal `den`).
+#[device]
+pub fn zdiv(num: f32, den: f32) -> f32 {
+    let zero = num == 0.0;
+    let q = if zero { 5.9604645e-8 } else { num } / den;
+    if zero { num * q } else { q }
+}
+
+/// `x.sqrt()`, bit for bit for every input, without the out-of-line slow path that a zero
+/// `x` takes.
+#[device]
+pub fn zsqrt(x: f32) -> f32 {
+    let zero = x == 0.0;
+    let r = if zero { 1.0 } else { x }.sqrt();
+    if zero { x } else { r }
+}
+
 /// FFT-order frequency of bin `k` of `n` in cycles per pixel, `fftfreq`: `k / n` below
 /// `n / 2`, else `(k - n) / n`.
 #[device]
@@ -238,7 +259,7 @@ pub fn freq(k: u32, n: u32) -> f32 {
     } else {
         k as f32 - n as f32
     };
-    k / n as f32
+    zdiv(k, n as f32)
 }
 
 /// `exp(-2 pi i d freq(k, n))` as `(cos, sin)`: bin `k`'s factor of a shift by `d` pixels.
@@ -257,10 +278,18 @@ fn cos_sin_pi(x: f32) -> (f32, f32) {
     unsafe { (__nv_cospif(x), __nv_sinpif(x)) }
 }
 
+/// `a * b + c` rounded once, for a sum whose FMA nesting must not be left to contraction.
+#[device]
+pub fn fma(a: f32, b: f32, c: f32) -> f32 {
+    // SAFETY: libdevice function of three f32, no side effects.
+    unsafe { __nv_fmaf(a, b, c) }
+}
+
 #[device]
 unsafe extern "C" {
     fn __nv_cospif(x: f32) -> f32;
     fn __nv_sinpif(x: f32) -> f32;
+    fn __nv_fmaf(x: f32, y: f32, z: f32) -> f32;
 }
 
 /// Adds an unmasked pixel of count `obs` and calculated intensity `calc >= 0` to `acc`:
@@ -274,7 +303,7 @@ pub fn llk_add(acc: &mut LlkPartial, obs: f32, calc: f32) {
         calc - obs + obs * (obs / calc).ln()
     };
     acc.gaussian += (obs - calc) * (obs - calc) / (obs + 1.0);
-    let e = obs.sqrt() - calc.sqrt();
+    let e = zsqrt(obs) - calc.sqrt();
     acc.euclidean += 4.0 * e * e;
     acc.icalc += calc;
 }
@@ -326,6 +355,76 @@ pub unsafe fn load_c(p: *const f32, i: usize) -> (f32, f32) {
 #[device]
 pub unsafe fn store_c(p: *mut f32, i: usize, v: (f32, f32)) {
     unsafe { *p.cast::<F2>().add(i) = F2(v.0, v.1) };
+}
+
+/// A stack's exit waves as DM and RAAR carry them between cycles, in the format the
+/// kernel reading them is built for (`HALF` of [`load_psi`] and [`store_psi`]): interleaved
+/// complex `f32` at `ptr`, or one packed `f16x2` per value (real part in the low half)
+/// holding the value times `scale`. `scale` is a power of two and `unscale` its exact
+/// inverse, so the f16 format adds f16 rounding of the value and nothing else; an `f32`
+/// build reads neither.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PsiPtr {
+    pub ptr: *mut f32,
+    pub scale: f32,
+    pub unscale: f32,
+}
+
+/// The value of the IEEE half in the low 16 bits of `h`, exactly. In integers: the NVVM IR
+/// the kernels are built through has no scalar `f16`.
+#[device]
+pub fn half_to_f32(h: u32) -> f32 {
+    let (e, m) = ((h >> 10) & 0x1f, h & 0x3ff);
+    let magnitude = if e == 0 {
+        (m as f32 * (1.0 / 16_777_216.0)).to_bits()
+    } else if e == 0x1f {
+        0x7f80_0000 | (m << 13)
+    } else {
+        ((e + 112) << 23) | (m << 13)
+    };
+    f32::from_bits(((h & 0x8000) << 16) | magnitude)
+}
+
+/// The `f32` waves at `ptr`.
+#[device]
+pub fn psi_f32(ptr: *mut f32) -> PsiPtr {
+    PsiPtr {
+        ptr,
+        scale: 1.0,
+        unscale: 1.0,
+    }
+}
+
+/// Complex value `i` of the waves `w`, f16 pairs under `HALF`. The format is the build's,
+/// not the launch's: a switch at run time costs the `f32` kernels that store waves 1 to 7%.
+///
+/// # Safety
+///
+/// `w.ptr` must hold `i + 1` values of the format `HALF` names, 8-byte aligned (4-byte
+/// under `HALF`).
+#[device]
+pub unsafe fn load_psi<const HALF: bool>(w: PsiPtr, i: usize) -> (f32, f32) {
+    if HALF {
+        let packed = unsafe { *w.ptr.cast::<u32>().add(i) };
+        let (re, im) = (half_to_f32(packed & 0xffff), half_to_f32(packed >> 16));
+        (re * w.unscale, im * w.unscale)
+    } else {
+        unsafe { load_c(w.ptr, i) }
+    }
+}
+
+/// # Safety
+///
+/// As [`load_psi`].
+#[device]
+pub unsafe fn store_psi<const HALF: bool>(w: PsiPtr, i: usize, v: (f32, f32)) {
+    if HALF {
+        let packed = cvt_f16x2_f32(v.0 * w.scale, v.1 * w.scale);
+        unsafe { *w.ptr.cast::<u32>().add(i) = packed };
+    } else {
+        unsafe { store_c(w.ptr, i, v) };
+    }
 }
 
 /// Bilinear weights of the four object pixels a sample reads, in the order

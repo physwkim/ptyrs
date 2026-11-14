@@ -9,6 +9,10 @@ use ptyrs::gpu::{
     ViewDims, Views, Weight,
 };
 
+#[path = "common/worst.rs"]
+mod worst;
+use worst::worst_of;
+
 /// A stream, an eager execution context on it and the rPIE kernels.
 fn setup() -> (Arc<CudaStream>, ExecutionContext, RpieKernels) {
     let ctx = CudaContext::new(0).expect("CUDA device 0");
@@ -46,13 +50,10 @@ fn norm2(c: C32) -> f64 {
 /// Largest `|got - want| / max(|want|, floor)` over complex elements.
 fn max_rel(got: &[C32], want: &[(f64, f64)], floor: f64) -> f64 {
     assert_eq!(got.len(), want.len());
-    got.iter()
-        .zip(want)
-        .map(|(g, w)| {
-            let e = ((g.re as f64 - w.0).powi(2) + (g.im as f64 - w.1).powi(2)).sqrt();
-            e / (w.0.hypot(w.1)).max(floor)
-        })
-        .fold(0.0, f64::max)
+    worst_of(got.iter().zip(want).map(|(g, w)| {
+        let e = ((g.re as f64 - w.0).powi(2) + (g.im as f64 - w.1).powi(2)).sqrt();
+        e / (w.0.hypot(w.1)).max(floor)
+    }))
 }
 
 #[test]

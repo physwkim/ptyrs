@@ -55,17 +55,14 @@ impl Bufs<'_> {
         };
         match passes {
             PassesMut::M1(m1) => {
-                for s in 0..self.stacks.len() {
-                    self.kernels.obj_probe_to_psi(
-                        ctx,
-                        self.views,
-                        self.table.at(s),
-                        self.obj,
-                        self.probe,
-                        self.stacks.get(s).psi,
-                    )?;
-                    self.project(ctx, m1, s, llk.as_mut())?;
-                    self.accumulate(ctx, s, o.is_some(), p.is_some())?;
+                for s in 0..self.scratch.len() {
+                    let stack = self.scratch.at(s);
+                    let psi = &mut *m1.scratch;
+                    self.kernels
+                        .obj_probe_to_psi(ctx, self.views, stack, self.obj, self.probe, psi)?;
+                    let plan = m1.plans.get(self.scratch.frames[s].plan);
+                    self.project(ctx, stack, plan, psi, llk.as_mut())?;
+                    self.accumulate(ctx, stack, psi, o.is_some(), p.is_some())?;
                 }
             }
             PassesMut::Fused(f) => self.fused_ap(ctx, f, llk.as_mut(), o.is_some(), p.is_some())?,
@@ -90,9 +87,11 @@ impl Bufs<'_> {
         probe: bool,
     ) -> Result<(), GpuError> {
         let dims = *self.views.dims();
-        let mut m = self.features.lend(ctx, self.kernels, &dims, self.probe)?;
-        for s in 0..self.wide.len() {
-            let stack = self.wide.at(s);
+        let mut m = self
+            .features
+            .lend(ctx, self.kernels, &dims, self.probe, self.exit)?;
+        for s in 0..self.scratch.len() {
+            let stack = self.scratch.at(s);
             let inputs = FusedInputs {
                 views: self.views,
                 counts: self.counts,

@@ -4,13 +4,14 @@ use std::sync::Arc;
 
 use crate::gpu::{
     EpochOrder, Error as GpuError, FusedBufs, FusedInputs, Kernels, Model, PositionRule, PowerMax,
-    PsiSums, Views, Weight,
+    PsiSums, Solve, Views, Weight,
 };
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::CudaStream;
 
 use super::device::{FeaturesMut, Moved, MovedLent, RpieBufs, moved_inputs, moved_shift};
-use super::{Bufs, Epoch, GpuPtycho};
+use super::propagate::Propagate;
+use super::{Bufs, Epoch, GpuPtycho, plane_len};
 use crate::engine::features::{POSITION_LIMIT, POSITION_STEP};
 use crate::engine::ptycho::{Algorithm, llk_due};
 use crate::engine::{EngineError, RpieParams};
@@ -26,9 +27,7 @@ impl GpuPtycho {
                 "rPIE needs exactly one object mode".into(),
             ));
         }
-        if params.batch_size == 0 {
-            return Err(EngineError::Invalid("rPIE batch_size must be >= 1".into()));
-        }
+        params.validate()?;
         if self.dev.has_stepped() {
             return Err(EngineError::Invalid(
                 "rPIE models no intensity scale or background".into(),
@@ -118,6 +117,11 @@ impl Bufs<'_> {
         let nk = frames.nf() * dims.nmode;
         let len = frames.len;
         let (k, rk) = (self.kernels, self.rpie);
+        let prop = Propagate {
+            kernels: self.bh,
+            stage: self.exit.stage,
+            dims,
+        };
         let moved = RpieMoved::lend(rb.moved.as_deref_mut(), &mut self.features)?;
         let mut moved = (moved.map(|m| m.batch(ctx, k, &dims, self.probe))).transpose()?;
         let base = FusedInputs {
@@ -128,7 +132,7 @@ impl Bufs<'_> {
             model: Model::default(),
         };
 
-        // Δ = IFT(ψ') − ψ, ψ = O_v W with W the moved probe under positions.
+        // Δ = Aᴴ ψ' / n − ψ, A the propagator, ψ = O_v W with W the moved probe under positions.
         match &mut moved {
             Some(m) => {
                 let inputs = moved_inputs(&base, moved_shift(m.pos, m.spectrum));
@@ -139,9 +143,9 @@ impl Bufs<'_> {
             }
             None => k.obj_probe_to_psi(ctx, self.views, stack, self.obj, self.probe, rb.psi)?,
         }
-        plan.forward(ctx, rb.psi, rb.dlt)?;
+        prop.forward_from(ctx, plan, stack, rb.psi, rb.dlt)?;
         rk.amplitude(ctx, &dims, stack, self.counts, rb.dlt)?;
-        plan.inverse_inplace(ctx, rb.dlt)?;
+        prop.adjoint(ctx, plan, stack, rb.dlt)?;
         k.scale_c32(ctx, rb.psi, len, -1.0)?;
         k.add_c32(ctx, rb.dlt, rb.psi, len)?;
         if let Some(m) = &mut moved {
@@ -228,12 +232,16 @@ impl Bufs<'_> {
         // The offsets' step reads neither array, so it may precede their steps, which end
         // the borrow of the batch-start probe.
         if let Some(m) = moved {
-            let rule = PositionRule {
-                step: POSITION_STEP as f32,
-                limit: POSITION_LIMIT as f32,
+            let solve = Solve {
+                rule: PositionRule {
+                    step: POSITION_STEP as f32,
+                    limit: POSITION_LIMIT as f32,
+                },
+                // ε at the frame's pixel count under every propagator, as the CPU's.
+                scale: plane_len(self.views.dims()) as f32,
             };
             let batch = frames.range.clone();
-            m.kernels.step(ctx, batch, m.own, m.offsets, rule, m.pos)?;
+            m.kernels.step(ctx, batch, m.own, m.offsets, solve, m.pos)?;
         }
         if let Some(step) = params.obj_step {
             let s = step as f32;

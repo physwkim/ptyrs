@@ -1,36 +1,50 @@
-//! The GPU engine ([`ptyrs::engine::GpuPtycho`]): AP, DM, ML, rPIE and BH in f32.
+//! The GPU engine ([`ptyrs::engine::GpuPtycho`]): AP, DM, RAAR, ML, rPIE, BH and LSQML in f32.
 
 use cuda_core::CudaContext;
-use numpy::{PyArray3, PyReadonlyArray3};
+use numpy::{PyArray3, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArray3};
 use ptyrs::base::{C64, Object, Probe};
-use ptyrs::engine::{BhParams, GpuOptions};
+use ptyrs::engine::{BhParams, GpuOptions, LsqmlParams};
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyDict, PyList};
 
+use crate::cpu::Optics;
 use crate::{Error, Scan, history, llk_dict, params, stack_in, stack_out};
 
-/// The GPU reconstruction state of a scan on CUDA device `device`; keywords are
+/// The GPU reconstruction state of a scan on CUDA device `device`, under `optics` in place of
+/// the far field of the scan's geometry if given (`GpuPtycho::with_optics`); keywords are
 /// `GpuOptions` fields.
 #[pyclass(unsendable)]
-pub(crate) struct GpuPtycho(ptyrs::engine::GpuPtycho);
+pub(crate) struct GpuPtycho(
+    ptyrs::engine::GpuPtycho,
+    /// The scan's frame shape `[ny, nx]`, which the engine keeps on the device.
+    [usize; 2],
+);
 
 #[pymethods]
 impl GpuPtycho {
     #[new]
-    #[pyo3(signature = (scan, object, probe, device = 0, **options))]
+    #[pyo3(signature = (scan, object, probe, device = 0, optics = None, **options))]
     fn new(
         scan: &Scan,
         object: PyReadonlyArray3<'_, C64>,
         probe: PyReadonlyArray3<'_, C64>,
         device: usize,
+        optics: Option<&Bound<'_, Optics>>,
         options: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<Self> {
         let options = params!(GpuOptions, options, stack_size, graph, llk_slots, fused);
         let (object, probe) = (Object::new(stack_in(object)?), Probe::new(stack_in(probe)?));
         let ctx = CudaContext::new(device).map_err(|e| Error(e.into()))?;
+        let engine = match optics {
+            Some(o) => {
+                let optics = &o.get().inner;
+                ptyrs::engine::GpuPtycho::with_optics(&ctx, &scan.0, optics, object, probe, options)
+            }
+            None => ptyrs::engine::GpuPtycho::new(&ctx, &scan.0, object, probe, options),
+        };
         Ok(Self(
-            ptyrs::engine::GpuPtycho::new(&ctx, &scan.0, object, probe, options)
-                .map_err(Error::from)?,
+            engine.map_err(Error::from)?,
+            scan.0.counts.frame_shape(),
         ))
     }
 
@@ -49,6 +63,15 @@ impl GpuPtycho {
         Ok(self
             .0
             .dm(&crate::dm_params(params)?, ncycle)
+            .map_err(Error::from)?)
+    }
+
+    /// `ncycle` RAAR cycles; keywords are `RaarParams` fields.
+    #[pyo3(signature = (ncycle, **params))]
+    fn raar(&mut self, ncycle: usize, params: Option<&Bound<'_, PyDict>>) -> PyResult<()> {
+        Ok(self
+            .0
+            .raar(&crate::raar_params(params)?, ncycle)
             .map_err(Error::from)?)
     }
 
@@ -71,7 +94,9 @@ impl GpuPtycho {
     }
 
     /// `nepoch` BH epochs from a fresh BH, an LLK record every `calc_llk` epochs and after
-    /// the last.
+    /// the last; `position_rho` as `Bh`'s, for the modelled position.
+    #[pyo3(signature = (nepoch, calc_llk, batch_size, probe_rho, seed, *,
+                        position_rho = crate::POSITION_RHO))]
     fn bh(
         &mut self,
         nepoch: usize,
@@ -79,14 +104,64 @@ impl GpuPtycho {
         batch_size: usize,
         probe_rho: f64,
         seed: u64,
+        position_rho: f64,
     ) -> PyResult<()> {
         let params = BhParams {
             batch_size,
             probe_rho,
-            position_rho: 0.1,
+            position_rho,
             seed,
         };
         Ok(self.0.bh(&params, nepoch, calc_llk).map_err(Error::from)?)
+    }
+
+    /// The last BH epoch's steps as `Bh.epoch` returns them; none before a BH call.
+    fn bh_steps<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        crate::bh_steps(py, &self.0.bh_steps().map_err(Error::from)?)
+    }
+
+    /// `nepoch` LSQML epochs from a fresh LSQML (`cost` `"amplitude"` or `"poisson"`), an LLK
+    /// record every `calc_llk` epochs and after the last.
+    fn lsqml(
+        &mut self,
+        nepoch: usize,
+        calc_llk: usize,
+        batch_size: usize,
+        cost: &str,
+        seed: u64,
+    ) -> PyResult<()> {
+        let params = LsqmlParams {
+            batch_size,
+            cost: crate::cost(cost)?,
+            seed,
+        };
+        Ok(self
+            .0
+            .lsqml(&params, nepoch, calc_llk)
+            .map_err(Error::from)?)
+    }
+
+    /// The last LSQML epoch's steps as `Lsqml.epoch` returns them; none before an LSQML call.
+    fn lsqml_steps<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        crate::lsqml_steps(py, &self.0.lsqml_steps().map_err(Error::from)?)
+    }
+
+    /// As `Ptycho.set_features`, in `f32` on the device; with `fused=True` only.
+    #[pyo3(signature = (*, scale = None, background = None, position = None))]
+    fn set_features(
+        &mut self,
+        scale: Option<PyReadonlyArray1<'_, f64>>,
+        background: Option<PyReadonlyArray2<'_, f64>>,
+        position: Option<PyReadonlyArray2<'_, f64>>,
+    ) -> PyResult<()> {
+        let features = crate::features_in(scale, background, position, self.1)?;
+        Ok(self.0.set_features(&features).map_err(Error::from)?)
+    }
+
+    /// As `Ptycho.features`, read back from the device.
+    #[getter]
+    fn features<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        crate::features_out(py, self.0.features().map_err(Error::from)?, self.1)
     }
 
     #[getter]

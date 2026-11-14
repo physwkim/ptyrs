@@ -13,6 +13,9 @@ use ptyrs::engine::{
 
 #[path = "common/engine/mod.rs"]
 mod common;
+#[path = "common/worst.rs"]
+mod worst;
+use worst::worst_of;
 
 fn state() -> (Ptycho, Optics) {
     let (scan, object, probe) = common::dm_scenario(32, 40, 2, 2e5, 4.0);
@@ -30,11 +33,7 @@ fn table(text: &str) -> Vec<Vec<f64>> {
 /// `max |a − b| / max |b|`.
 fn max_rel(a: &[f64], b: &[f64]) -> f64 {
     assert_eq!(a.len(), b.len());
-    let d = a
-        .iter()
-        .zip(b)
-        .map(|(a, b)| (a - b).abs())
-        .fold(0.0, f64::max);
+    let d = worst_of(a.iter().zip(b).map(|(a, b)| (a - b).abs()));
     d / b.iter().map(|b| b.abs()).fold(0.0, f64::max)
 }
 
@@ -166,7 +165,7 @@ fn assert_step_ref(cost: Cost, noise: usize, opr: bool) {
         cost,
         seed: 0,
     };
-    let run = Lsqml::new(params).with_preconditioner(pre);
+    let run = Lsqml::new(params).unwrap().with_preconditioner(pre);
     let mut run = with_positions(run, &offsets(&offset_rows, 1));
     let s = run.step(
         &views(&p, &frames),
@@ -230,7 +229,8 @@ fn assert_epochs_ref(cost: Cost, noise: usize) {
         batch_size: 16,
         cost,
         seed: 7,
-    });
+    })
+    .unwrap();
     let mut run = with_positions(run, &offsets(&offset_rows, 1));
     let rows = table(include_str!("engine/data/lsqml_pos_epochs_steps_f64.txt"));
     let mut next = 0;
@@ -282,6 +282,7 @@ fn with_features_refuses_what_ptychi_lsqml_lacks() {
             cost: Cost::Poisson,
             seed: 0,
         })
+        .unwrap()
     };
     let refused = [
         Features {

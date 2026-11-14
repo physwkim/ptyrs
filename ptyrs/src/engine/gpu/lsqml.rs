@@ -1,21 +1,25 @@
-//! pty-chi LSQML on the GPU ([`crate::engine::Lsqml`]) on the far-field Fourier path, incoherent
+//! pty-chi LSQML on the GPU ([`crate::engine::Lsqml`]) through the device's propagator, incoherent
 //! probe modes and no probe variation, in the call sequence of `crate::gpu::LsqmlKernels`:
-//! the exit waves through the fused row passes around LSQML's column pass, the step sizes
-//! and every frame's `a_far` kept on the device. Under the position model the probe moves by
+//! the exit waves through the fused row passes and the propagator's stage around LSQML's
+//! column pass, the step sizes and every frame's `a_far` kept on the device. Under the position model the probe moves by
 //! each frame's offsets, and each batch steps its frames' offsets after its passes.
 
 use std::ops::Range;
 use std::sync::Arc;
 
 use crate::gpu::{
-    BhScan, C32, EpochOrder, Error as GpuError, FusedInputs, Kernels, LSQML_REC, LsqmlAt, LsqmlChi,
-    LsqmlKernels, LsqmlNoise, LsqmlScan, LsqmlVar, Model, PositionRule, PsiSums, StackTable, Views,
+    BhScan, C32, EpochOrder, Error as GpuError, FusedBufs, FusedInputs, Kernels, LSQML_REC,
+    LsqmlAt, LsqmlChi, LsqmlKernels, LsqmlNoise, LsqmlScan, LsqmlVar, Model, PositionRule, PsiSums,
+    Solve, StackRef, StackTable, Views,
 };
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaStream, DeviceBuffer};
 
 use super::device::{Moved, MovedLent, PassesMut, moved_inputs, moved_shift};
-use super::{Bufs, Frames, GpuPtycho, batch_stacks, plane_len, stack_buf_len};
+use super::{
+    Bufs, Cut, Frames, GpuPtycho, StackRule, Streamed, batch_stacks, plane_bytes, plane_len,
+    wave_bytes,
+};
 use crate::engine::features::{POSITION_LIMIT, POSITION_STEP};
 use crate::engine::ptycho::{Algorithm, llk_due};
 use crate::engine::{Cost, EngineError, LsqmlParams, LsqmlStep, random_batches};
@@ -50,9 +54,7 @@ impl GpuPtycho {
         nepoch: usize,
         calc_llk: usize,
     ) -> Result<(), EngineError> {
-        if params.batch_size == 0 {
-            return Err(EngineError::Invalid("LSQML batch_size must be >= 1".into()));
-        }
+        params.validate()?;
         if self.dev.has_stepped() {
             return Err(EngineError::Invalid(
                 "LSQML refines no intensity scale or background, as pty-chi's".into(),
@@ -93,7 +95,7 @@ pub(super) struct LsqmlState {
     size: u32,
     /// Each batch's range of `stacks`.
     batches: Vec<Range<usize>>,
-    /// The batches cut into stacks as long as the device's wide ones, one table entry each.
+    /// The batches cut into stacks by the bytes a stack's passes touch, one table entry each.
     stacks: Vec<Frames>,
     table: StackTable,
     /// A batch's row transforms, then exit-wave updates, one per stack of a batch.
@@ -121,19 +123,41 @@ pub(super) struct LsqmlBufs<'a> {
 }
 
 impl LsqmlState {
-    /// For `views` in batches of `size` frames cut into stacks of `stack_size`, `moved` under
-    /// the position model; the epoch order is the scan's.
+    /// For `views` in batches of `size` frames, each cut into stacks by `rule`; under the
+    /// position model, `scratch` holds the frames per stack of the shared scratch, whose shift
+    /// planes its sums borrow, which caps its stacks. The epoch order is the scan's.
     pub(super) fn new(
         stream: &Arc<CudaStream>,
         kernels: &Kernels,
         views: &Views,
         size: u32,
-        stack_size: u32,
-        moved: bool,
+        rule: StackRule,
+        scratch: Option<u32>,
     ) -> Result<Self, EngineError> {
         let dims = views.dims();
-        let ((stacks, table, _), batches) = batch_stacks(stream, dims, size, stack_size)?;
-        let len = stack_buf_len(dims, &table);
+        // work: the forward pass, `chi`, the update sums, `dots`; icalc: `icalc` and `far`;
+        // under the position also the moved probes (`shifted_rows_fwd`, `shift_w`, `dots`)
+        // and the shift planes of the shared scratch, which `shifted_psi_sums` writes and
+        // reads.
+        let mut streamed = vec![
+            Streamed::new(wave_bytes(dims), 3),
+            Streamed::new(plane_bytes::<f32>(dims, 1), 2),
+        ];
+        if scratch.is_some() {
+            streamed.extend([
+                Streamed::new(plane_bytes::<C32>(dims, dims.nprobe), 3),
+                Streamed::new(FusedBufs::shift_bytes(dims), 2),
+            ]);
+        }
+        let frames = rule.frames(&streamed)?;
+        let frames = scratch.map_or(frames, |s| frames.min(s));
+        let (cut, batches) = batch_stacks(stream, dims, size, frames)?;
+        let len = cut.wave_len(dims);
+        let Cut {
+            frames: stacks,
+            table,
+            ..
+        } = cut;
         let nf_max = table.nf_max();
         let icalc_len = nf_max as usize * plane_len(dims);
         let slots = batches.iter().map(|b| b.len()).max().unwrap_or(0);
@@ -142,9 +166,9 @@ impl LsqmlState {
                 .map(|_| DeviceBuffer::zeroed(stream, len))
                 .collect::<Result<_, _>>()?)
         };
-        let moved = match moved {
-            true => Some(Moved::new(stream, kernels, dims, nf_max, slots)?),
-            false => None,
+        let moved = match scratch {
+            Some(_) => Some(Moved::new(stream, kernels, dims, nf_max, slots)?),
+            None => None,
         };
         Ok(Self {
             kernels: LsqmlKernels::load(kernels)?,
@@ -248,15 +272,16 @@ impl<'a> Bufs<'a> {
         params: &LsqmlParams,
         pre: Pre,
     ) -> Result<(), GpuError> {
+        let k = self.exit.scale;
         match pre {
             Pre::Init => {
                 l.kernels.start(ctx, self.counts, l.scan)?;
                 l.kernels
-                    .precondition(ctx, self.views, self.probe, l.scan, true)?;
+                    .precondition(ctx, self.views, self.probe, l.scan, true, k)?;
             }
             Pre::Update => {
                 l.kernels
-                    .precondition(ctx, self.views, self.probe, l.scan, false)?;
+                    .precondition(ctx, self.views, self.probe, l.scan, false, k)?;
             }
             Pre::Keep => {}
         }
@@ -305,6 +330,15 @@ impl<'a> Bufs<'a> {
             probe: self.probe,
             model: Model::default(),
         };
+        // Row transforms at the detector plane into `chi`: the column pass, the propagator's
+        // adjoint stage and the inverse row pass.
+        let (lk, exit) = (l.kernels, self.exit);
+        let chi = |st: &LsqmlScan, stack: StackRef<'_>, work: &mut DeviceBuffer<C32>| {
+            lk.chi(ctx, scan, stack, noise, st, work)?;
+            exit.kernels
+                .exit(ctx, views.dims(), stack, exit.stage, work, true)?;
+            lk.back(ctx, views, stack, work)
+        };
         for (k, s) in batch.clone().enumerate() {
             let (stack, work) = (l.table.at(s), &mut l.work[k]);
             match &mut moved {
@@ -319,8 +353,10 @@ impl<'a> Bufs<'a> {
                     m.kernels.shift_w(ctx, views.dims(), stack, w)?;
                 }
             }
+            exit.kernels
+                .exit(ctx, views.dims(), stack, exit.stage, work, false)?;
             match noise {
-                LsqmlNoise::Gaussian => l.kernels.chi(ctx, scan, stack, noise, l.scan, work)?,
+                LsqmlNoise::Gaussian => chi(l.scan, stack, work)?,
                 LsqmlNoise::Poisson => l.kernels.icalc(ctx, scan, stack, work, &mut l.icalc[k])?,
             }
         }
@@ -333,9 +369,7 @@ impl<'a> Bufs<'a> {
             l.kernels
                 .far(ctx, scan, &icalc, positions.clone(), l.scan)?;
             for (k, s) in batch.clone().enumerate() {
-                let stack = l.table.at(s);
-                l.kernels
-                    .chi(ctx, scan, stack, noise, l.scan, &mut l.work[k])?;
+                chi(l.scan, l.table.at(s), &mut l.work[k])?;
             }
         }
 
@@ -401,15 +435,19 @@ impl<'a> Bufs<'a> {
                     .sums(ctx, views, stack, self.obj, [chi, &m.w[k]], m.pos)?;
             }
         }
-        l.kernels.step(ctx, positions.clone(), l.scan)?;
+        l.kernels
+            .step(ctx, positions.clone(), l.scan, self.exit.scale)?;
         // Before the update, as the batch's spectra borrow the probe; the step reads neither.
         if let Some(m) = moved {
-            let rule = PositionRule {
-                step: POSITION_STEP as f32,
-                limit: POSITION_LIMIT as f32,
+            let solve = Solve {
+                rule: PositionRule {
+                    step: POSITION_STEP as f32,
+                    limit: POSITION_LIMIT as f32,
+                },
+                scale: self.exit.scale,
             };
             m.kernels
-                .step(ctx, positions, l.order, m.offsets, rule, m.pos)?;
+                .step(ctx, positions, l.order, m.offsets, solve, m.pos)?;
         }
         let obj = LsqmlVar {
             x: &mut *self.obj,

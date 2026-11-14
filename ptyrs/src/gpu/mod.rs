@@ -36,7 +36,9 @@ mod fused;
 mod grad;
 mod lsqml;
 mod ops;
+mod optics;
 mod position;
+mod psi;
 mod ring;
 mod rpie;
 
@@ -52,14 +54,18 @@ pub use fused::{
 pub use grad::{
     CG_BLOCKS, GAMMA_CHUNK, GammaCounts, GammaStacks, GradKernels, ObjProbeScale, gamma_parts,
 };
-pub use lsqml::{LSQML_REC, LsqmlAt, LsqmlChi, LsqmlKernels, LsqmlNoise, LsqmlScan, LsqmlVar};
+pub use lsqml::{
+    LSQML_REC, LsqmlAt, LsqmlChi, LsqmlKernels, LsqmlNoise, LsqmlScan, LsqmlVar, SliceSteps,
+};
 pub use ops::{
     LLK_TREE_LEAVES, LlkPartial, LlkScratch, LlkSums, MASKED, OBJ_TILE, Permutation,
     PositionPartial, ScalePartial, StackCtl, StackGeom, StackRef, StackTable, UpdateSums, ViewAddr,
     ViewDims, Views, view_tiles,
 };
-pub use position::{PositionKernels, PositionRule, Positions};
-pub use ring::{Ended, LlkRing, LlkTotals, RecordWriter, RingDevice, RingError};
+pub use optics::{ExitPass, ExitStage, OpticsKernels, SlicePhase, SliceSource};
+pub use position::{PositionKernels, PositionRule, Positions, Solve};
+pub use psi::{HalfWaves, Waves, half_scale};
+pub use ring::{Ended, FrameLlk, LlkRing, LlkTotals, RecordWriter, RingDevice, RingError};
 pub use rpie::{POWER_CHUNK, PowerMax, RpieKernels, Weight};
 
 /// The linked device code: every `ptyrs-kernels` kernel plus the cuFFT functions they call.

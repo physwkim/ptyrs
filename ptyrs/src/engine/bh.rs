@@ -43,6 +43,16 @@ pub struct BhParams {
     pub seed: u64,
 }
 
+impl BhParams {
+    /// The check every BH run makes of its params, on the CPU and the GPU: a batch has frames.
+    pub(crate) fn validate(&self) -> Result<(), EngineError> {
+        if self.batch_size == 0 {
+            return Err(EngineError::Invalid("BH batch_size must be >= 1".into()));
+        }
+        Ok(())
+    }
+}
+
 /// One batch's step, as pty-chi computes it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct BhStep {
@@ -91,7 +101,7 @@ struct Moves {
 /// The amplitude cost of a batch of views at one state of the slices, probe and offsets, and
 /// its derivatives: `F = Σ_frames Σ_unmasked (A − √iobs)²` with `A = √(Σ_m |U psi_m|²)`,
 /// `psi` the exit waves of [`SliceWaves`] at frame `b`'s probe `M_b(P)` and `U` the
-/// [`Optics::propagator`]. `views` are whole frames of an [`AddrTable`], each frame's views in
+/// [`Optics::exit`]. `views` are whole frames of an [`AddrTable`], each frame's views in
 /// its order. Every frame reads its own copy of the probe, the probe moved by the frame's
 /// offset (`M_b` the identity without offsets), and the derivatives over the probe and the
 /// offsets go through those copies.
@@ -157,9 +167,9 @@ impl<'a> BhBatch<'a> {
                 second,
             }
         });
-        let waves = SliceWaves::new(optics, &uviews, objects, &copies);
+        let waves = SliceWaves::new(optics, &uviews, objects, &copies, offsets);
         let mut psi = waves.psi().to_vec();
-        optics.propagator().forward(&mut psi);
+        optics.exit().forward(&mut psi);
         let mut td = psi.clone();
         let (mut amp, mut root) = (Vec::new(), Vec::new());
         for (fv, block) in views
@@ -206,7 +216,7 @@ impl<'a> BhBatch<'a> {
                 nslice: self.optics.nslice(),
                 probe_dims: self.copy_dims,
             },
-            propagator: self.optics.propagator(),
+            exit: self.optics.exit(),
         }
     }
 
@@ -232,7 +242,9 @@ impl<'a> BhBatch<'a> {
 
     /// `2·∂F/∂x*` over every slice and the probe and `∂F/∂d` per frame, so `⟨g, u⟩` is the
     /// derivative of `F` along the displacement `u`: `Jᴴ·Uᴴ` of `2·td` gives `g_b` per frame
-    /// copy, the probe's is `Σ_b M_bᴴ g_b` and frame `b`'s offsets' `Re⟨g_b, ∂_a M_b(P)⟩`.
+    /// copy, the probe's is `Σ_b M_bᴴ g_b` and frame `b`'s offsets' `Re⟨g_b, ∂_a M_b(P)⟩` plus,
+    /// where the last slice's phase moves with them ([`SliceWaves::phase_derivative`]),
+    /// `Re⟨2·td, U·∂_a q/q·psi⟩`.
     pub fn grads(&self) -> BhVector {
         let op = self.jacobian();
         let y: Vec<C64> = self.td.iter().map(|t| 2.0 * t).collect();
@@ -240,12 +252,24 @@ impl<'a> BhBatch<'a> {
         op.adjoint(&y, &mut x);
         let copies = x.split_off(self.split());
         let block = self.probe_dims.iter().product::<usize>();
-        let d = match &self.moves {
+        let mut d: Vec<[f64; 2]> = match &self.moves {
             Some(m) => (copies.chunks_exact(block).enumerate())
                 .map(|(b, g)| [0, 1].map(|a| dot(g, &m.first[a][b * block..][..block])))
                 .collect(),
             None => Vec::new(),
         };
+        // the offsets' part through the last slice's phase
+        let frame = self.nmode * self.probe_dims[1] * self.probe_dims[2];
+        for a in 0..2 {
+            let Some(mut t) = self.waves.phase_derivative(&[a], self.waves.psi()) else {
+                break;
+            };
+            self.optics.exit().forward(&mut t);
+            for ((d, y), t) in (d.iter_mut().zip(y.chunks_exact(frame))).zip(t.chunks_exact(frame))
+            {
+                d[a] += dot(y, t);
+            }
+        }
         let mut probe = vec![C64::default(); block];
         for (b, g) in copies.chunks_exact(block).enumerate() {
             let g = self.moved(g, &[], -1.0, b);
@@ -303,12 +327,49 @@ impl<'a> BhBatch<'a> {
         Probe::new(Stack::from_vec(self.copy_dims, copies).unwrap())
     }
 
+    /// The offsets' part of `[J u, J v, J″(u, v)]` through the last slice's phase `q_b`, with
+    /// `D_a = ∂_a q_b / q_b` ([`SliceWaves::phase_derivative`]): `Σ_a u_da·D_a psi` on the
+    /// first two and `Σ_a D_a (v_da·J u + u_da·J v) + Σ_ac u_da·v_dc·∂_a ∂_c q_b / q_b·psi`
+    /// on the third, from the first two before their own.
+    fn phase_terms(&self, u: &BhVector, v: &BhVector, [lu, lv, luv]: [&mut Vec<C64>; 3]) {
+        let waves = &self.waves;
+        let frame = self.nmode * self.probe_dims[1] * self.probe_dims[2];
+        let add = |l: &mut [C64], t: &[C64], s: &dyn Fn(usize) -> f64| {
+            for (b, (l, t)) in (l.chunks_exact_mut(frame).zip(t.chunks_exact(frame))).enumerate() {
+                let s = s(b);
+                l.iter_mut().zip(t).for_each(|(l, t)| *l += s * t);
+            }
+        };
+        let (mut du, mut dv) = (
+            vec![C64::default(); lu.len()],
+            vec![C64::default(); lv.len()],
+        );
+        for a in 0..2 {
+            let Some(t) = waves.phase_derivative(&[a], waves.psi()) else {
+                return;
+            };
+            add(&mut du, &t, &|b| u.d[b][a]);
+            add(&mut dv, &t, &|b| v.d[b][a]);
+            for (l, w) in [(&*lu, v), (&*lv, u)] {
+                let t = waves.phase_derivative(&[a], l).unwrap();
+                add(luv, &t, &|b| w.d[b][a]);
+            }
+            for c in 0..2 {
+                let t = waves.phase_derivative(&[a, c], waves.psi()).unwrap();
+                add(luv, &t, &|b| u.d[b][a] * v.d[b][c]);
+            }
+        }
+        lu.iter_mut().zip(&du).for_each(|(l, d)| *l += d);
+        lv.iter_mut().zip(&dv).for_each(|(l, d)| *l += d);
+    }
+
     /// The second derivative of `F` along the displacements `u` and `v`, pty-chi's bilinear
     /// Hessian with `A + EPS` in place of `A`:
     /// `Σ Re(conj(2·td)·L_uv) + 2 Σ_unmasked [(1 − d/A)·Σ_m Re(conj(L_u)·L_v) + (d/A)·c_u·c_v]`
     /// with `L_u = U·J u′`, `u′` the slices' and the copies' first-order change along `u`,
     /// `L_uv = U·(J″(u′, v′) + J(0, p″))` ([`SliceWaves::second_order`]) with `p″` the copies'
-    /// second-order change, `c_u = Σ_m Re(conj(U psi/A)·L_u)` and `d = √iobs`.
+    /// second-order change, both with the offsets' `phase_terms`,
+    /// `c_u = Σ_m Re(conj(U psi/A)·L_u)` and `d = √iobs`.
     pub fn hessian(&self, u: &BhVector, v: &BhVector) -> f64 {
         let n = self.probe_dims[1] * self.probe_dims[2];
         let (uo, up) = self.lift(u);
@@ -323,10 +384,11 @@ impl<'a> BhBatch<'a> {
                 .collect();
             let t = self.waves.tangent(&zero, &self.second(m, u, v));
             luv.iter_mut().zip(&t).for_each(|(l, t)| *l += t);
+            self.phase_terms(u, v, [&mut lu, &mut lv, &mut luv]);
         }
-        let propagator = self.optics.propagator();
+        let exit = self.optics.exit();
         for l in [&mut lu, &mut lv, &mut luv] {
-            propagator.forward(l);
+            exit.forward(l);
         }
         let mut h: f64 = self
             .td
@@ -367,14 +429,15 @@ pub struct Bh {
 }
 
 impl Bh {
-    pub fn new(params: BhParams) -> Self {
-        assert!(params.batch_size > 0, "batch_size must be positive");
-        Self {
+    /// A run from its first epoch, `Err` on a `batch_size` of 0.
+    pub fn new(params: BhParams) -> Result<Self, EngineError> {
+        params.validate()?;
+        Ok(Self {
             params,
             features: Features::default(),
             epochs: 0,
             prev: None,
-        }
+        })
     }
 
     /// This run modelling and refining `features`, which hold one entry per frame of the scan
@@ -424,7 +487,7 @@ impl Bh {
         }
         let size = self.params.batch_size.min(nframe);
         let full = size == nframe;
-        let rho2 = self.params.probe_rho.powi(2) * optics.propagator().intensity_scale();
+        let rho2 = self.params.probe_rho.powi(2) * optics.exit().intensity_scale();
         let pos_rho2 = self.params.position_rho.powi(2);
         let len = objects[0].as_slice().len();
         let split = objects.len() * len;
@@ -540,15 +603,12 @@ mod tests {
             ms.unwrap(),
             far.unwrap(),
         ];
-        let kinds: Vec<_> = all
-            .iter()
-            .map(|o| match o.propagator() {
-                Propagator::Fourier(_) => 'F',
-                Propagator::AngularSpectrum(_) => 'A',
-                Propagator::Fresnel(_) => 'T',
-            })
-            .collect();
-        assert_eq!(kinds, ['A', 'T', 'A', 'F']);
+        let kinds = [1e-4, 1e-3].map(|d| match Propagator::free_space(&near([5e-8; 2], d)) {
+            Propagator::Fourier(_) => 'F',
+            Propagator::AngularSpectrum(_) => 'A',
+            Propagator::Fresnel(_) => 'T',
+        });
+        assert_eq!(kinds, ['A', 'T']);
         all
     }
 
@@ -588,10 +648,10 @@ mod tests {
                 move_planes(p, optics.slice_quad(0), d, &fft);
             }
         }
-        let mut psi = SliceWaves::new(optics, &views, objects, &copies)
+        let mut psi = SliceWaves::new(optics, &views, objects, &copies, offsets)
             .psi()
             .to_vec();
-        optics.propagator().forward(&mut psi);
+        optics.exit().forward(&mut psi);
         psi
     }
 

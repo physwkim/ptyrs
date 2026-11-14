@@ -17,6 +17,9 @@ use ptyrs::engine::{
 
 #[path = "common/engine/mod.rs"]
 mod common;
+#[path = "common/worst.rs"]
+mod worst;
+use worst::worst_of;
 
 fn state() -> (Ptycho, Optics) {
     let (scan, object, probe) = common::dm_scenario(32, 40, 2, 2e5, 4.0);
@@ -34,12 +37,16 @@ fn table(text: &str) -> Vec<Vec<f64>> {
 /// `max |a − b| / max |b|`.
 fn max_rel(a: &[f64], b: &[f64]) -> f64 {
     assert_eq!(a.len(), b.len());
-    let d = a
-        .iter()
-        .zip(b)
-        .map(|(a, b)| (a - b).abs())
-        .fold(0.0, f64::max);
+    let d = worst_of(a.iter().zip(b).map(|(a, b)| (a - b).abs()));
     d / b.iter().map(|b| b.abs()).fold(0.0, f64::max)
+}
+
+#[test]
+fn max_rel_is_nan_of_a_nan_element() {
+    let want = [1e-7, 1.0, 3e-7];
+    assert!(max_rel(&[1e-7, 1.0, 4e-7], &want) < 2e-7);
+    assert!(max_rel(&[1e-7, f64::NAN, 3e-7], &want).is_nan());
+    assert!(max_rel(&want, &[1e-7, f64::NAN, 3e-7]).is_nan());
 }
 
 fn rel(a: f64, b: f64) -> f64 {
@@ -149,7 +156,8 @@ fn directions_match_central_differences() {
             batch_size: FRAMES.len(),
             cost,
             seed: 0,
-        });
+        })
+        .unwrap();
         let b = LsqmlBatch::new(
             &run,
             batch(&p, FRAMES),
@@ -199,7 +207,7 @@ fn assert_ref(cost: Cost, obj: &str, probe: &str, steps: &str) {
         cost,
         seed: 0,
     };
-    let s = Lsqml::new(params).with_preconditioner(pre).step(
+    let s = Lsqml::new(params).unwrap().with_preconditioner(pre).step(
         batch(&p, FRAMES),
         p.observed(),
         &optics,
@@ -286,7 +294,8 @@ fn assert_epochs_ref(cost: Cost, obj: &str, probe: &str, steps: &str) {
         batch_size: 16,
         cost,
         seed: 7,
-    });
+    })
+    .unwrap();
     let rows = table(steps);
     let mut next = 0;
     for e in 0..3 {
@@ -352,7 +361,8 @@ fn epoch_follows_ptychi_preconditioner_schedule() {
         batch_size: 20,
         cost: Cost::Poisson,
         seed: 7,
-    });
+    })
+    .unwrap();
     assert!(lsqml.preconditioner().is_none());
     let (mut object, mut pr) = (p.object().clone(), p.probe().clone());
     let mut seed = 0x9e37_79b9_7f4a_7c15;

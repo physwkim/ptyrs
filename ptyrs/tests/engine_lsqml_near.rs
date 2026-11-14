@@ -2,8 +2,8 @@
 //! generates the state and runs pty-chi on it, writing `lsqml_near_*_f64.txt`, saved to
 //! `tests/data`. Its cases share the start object, probe and corners and differ in geometry
 //! and counts: 0 an angular-spectrum propagator, 1 a Fresnel transform, 2 an angular spectrum
-//! with an evanescent band. Every frame sits at a whole-pixel corner, so pty-chi's PATCH
-//! extraction and the engine's views read the same pixels.
+//! with an evanescent band, 3 a Fresnel transform back. Every frame sits at a whole-pixel
+//! corner, so pty-chi's PATCH extraction and the engine's views read the same pixels.
 
 use std::slice;
 
@@ -12,6 +12,10 @@ use ptyrs::engine::{
     Cost, Lsqml, LsqmlBatch, LsqmlParams, LsqmlStep, Observed, Optics, ProbeVariation, Propagator,
     Wavefield, illumination, llk, obj_probe_to_psi, shift,
 };
+
+#[path = "common/worst.rs"]
+mod worst;
+use worst::worst_of;
 
 const SHAPE: [usize; 2] = [24, 24];
 const OBJ: [usize; 2] = [40, 40];
@@ -27,11 +31,7 @@ fn table(text: &str) -> Vec<Vec<f64>> {
 /// `max |a − b| / max |b|`.
 fn max_rel(a: &[f64], b: &[f64]) -> f64 {
     assert_eq!(a.len(), b.len());
-    let d = a
-        .iter()
-        .zip(b)
-        .map(|(a, b)| (a - b).abs())
-        .fold(0.0, f64::max);
+    let d = worst_of(a.iter().zip(b).map(|(a, b)| (a - b).abs()));
     d / b.iter().map(|b| b.abs()).fold(0.0, f64::max)
 }
 
@@ -90,8 +90,8 @@ fn state() -> State {
         .map(|c| {
             let w = Wavefield::new(SHAPE, c[1], [c[2], c[2]], c[3]).unwrap();
             let optics = Optics::free_space(&w);
-            let p = optics.propagator();
-            let kind = match p {
+            let p = optics.exit();
+            let kind = match Propagator::free_space(&w) {
                 Propagator::Fourier(_) => 0,
                 Propagator::AngularSpectrum(_) => 1,
                 Propagator::Fresnel(_) => 2,
@@ -128,7 +128,7 @@ fn state() -> State {
 fn propagated(views: &[View], c: &Case, object: &Object, probe: &Probe) -> Vec<C64> {
     let mut psi = vec![C64::default(); views.len() * probe.plane_len()];
     obj_probe_to_psi(views, object, probe, c.optics.quad(), &mut psi);
-    c.optics.propagator().forward(&mut psi);
+    c.optics.exit().forward(&mut psi);
     psi
 }
 
@@ -218,7 +218,7 @@ fn moved(x: &Stack<C64>, t: f64, d: &Stack<C64>) -> Stack<C64> {
 }
 
 /// `−2·obj_direction` and `−2·BATCH·probe_direction` against central differences of
-/// [`weighted_cost`] with `w` the batch's `a_far`, cases 0 and 1. Case 2's directions are not
+/// [`weighted_cost`] with `w` the batch's `a_far`, cases 0, 1 and 3. Case 2's directions are not
 /// a gradient: its `UᴴU` is the projection off the evanescent band, so `chi` keeps
 /// `−(1 − UᴴU)·psi` (pty-chi Eq. 19), which the step test checks against pty-chi instead.
 #[test]
@@ -230,9 +230,10 @@ fn directions_match_central_differences() {
         batch_size: BATCH,
         cost: Cost::Poisson,
         seed: 0,
-    });
+    })
+    .unwrap();
     let views = &s.addr.views()[..BATCH * s.addr.nmode()];
-    for (k, c) in s.cases.iter().enumerate().take(2) {
+    for (k, c) in s.cases.iter().enumerate().filter(|&(k, _)| k != 2) {
         let b = LsqmlBatch::new(
             &run,
             views,
@@ -322,6 +323,7 @@ fn step_matches_ptychi() {
             cost: Cost::Poisson,
             seed: 0,
         })
+        .unwrap()
         .with_preconditioner(pre)
         .step(
             views,
@@ -345,23 +347,23 @@ fn step_matches_ptychi() {
 }
 
 /// The reconstruction: [`Lsqml::epoch`]s of batches of 8 (seed 7) from the start against
-/// pty-chi's run of them with its own preconditioner schedule, cases 0 and 1: every step,
-/// the normalised Poisson LLK after every epoch, the changes over the run, and the epoch
-/// whose LLK first reaches the truth's.
+/// pty-chi's run of them with its own preconditioner schedule, every case: every step, the
+/// normalised Poisson LLK after every epoch, the changes over the run, and the epoch whose
+/// LLK first reaches the truth's, which case 2's 30 epochs do not on either side.
 #[test]
 fn reconstruction_matches_ptychi() {
     let s = state();
     let steps = table(include_str!("engine/data/lsqml_near_epochs_steps_f64.txt"));
     let trace = table(include_str!("engine/data/lsqml_near_llk_f64.txt"));
-    for k in [0, 1] {
-        let c = &s.cases[k];
+    for (k, c) in s.cases.iter().enumerate() {
         let (mut object, mut probe) = (s.object.clone(), s.probe.clone());
         let mut var = ProbeVariation::none(probe.plane_shape());
         let mut lsqml = Lsqml::new(LsqmlParams {
             batch_size: BATCH,
             cost: Cost::Poisson,
             seed: 7,
-        });
+        })
+        .unwrap();
         let want: Vec<_> = trace.iter().filter(|r| r[0] == k as f64).collect();
         let epochs = want.len() - 1;
         let mut llks = vec![poisson_llk(&s, c, &object, &probe)];
@@ -397,7 +399,8 @@ fn reconstruction_matches_ptychi() {
             llks[0], llks[epochs], c.truth_llk
         );
         assert_eq!(got, ptychi, "case {k}");
-        assert!(got.is_some(), "case {k}");
+        assert_eq!(got.is_some(), k != 2, "case {k}");
+        assert!(llks[epochs] < llks[0], "case {k}");
         assert_changes(
             &s,
             k,

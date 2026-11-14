@@ -1,4 +1,5 @@
-//! [`Ptycho`]: the reconstruction state and the AP, DM and rPIE loops built on the operators.
+//! [`Ptycho`]: the reconstruction state and the AP, DM, RAAR and rPIE loops built on the
+//! operators.
 
 use std::f64::consts::PI;
 use std::ops::Range;
@@ -11,15 +12,16 @@ use crate::engine::features::{
 };
 use crate::engine::ops::{
     Llk, accumulate_obj, accumulate_probe, apply_amplitude_with, cg_poisson_gamma_with, llk_with,
-    natural, obj_probe_to_psi, poisson_grad_with, psi_to_obj_probe, quad_phase,
+    natural, obj_probe_to_psi, poisson_grad_with, psi_to_obj_probe,
 };
-use crate::engine::{EngineError, Features, Fft2, Observed, shift};
+use crate::engine::{EngineError, Features, Fft2, Observed, Optics, shift};
 
 /// Which loop recorded an [`LlkRecord`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Algorithm {
     Ap,
     Dm,
+    Raar,
     Rpie,
     Ml,
     Bh,
@@ -89,6 +91,32 @@ impl Default for DmParams {
     }
 }
 
+/// PyNX `RAAR` parameters. An inertia of `None` leaves that array fixed.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RaarParams {
+    pub obj_inertia: Option<f64>,
+    pub probe_inertia: Option<f64>,
+    /// Relaxation `β` (PyNX default 0.9).
+    pub beta: f64,
+    /// Object-then-probe updates per cycle (PyNX `loop_obj_probe`).
+    pub loop_obj_probe: usize,
+    pub calc_llk: usize,
+    pub zero_phase_ramp: bool,
+}
+
+impl Default for RaarParams {
+    fn default() -> Self {
+        Self {
+            obj_inertia: Some(0.01),
+            probe_inertia: Some(0.001),
+            beta: 0.9,
+            loop_obj_probe: 1,
+            calc_llk: 0,
+            zero_phase_ramp: true,
+        }
+    }
+}
+
 /// PyNX `ML` parameters, Poisson noise without regularisation; the background and the
 /// positions are [`Features`].
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -126,6 +154,17 @@ pub struct RpieParams {
     pub calc_llk: usize,
 }
 
+impl RpieParams {
+    /// The check every rPIE run makes of its params, on the CPU and the GPU: a batch has
+    /// frames.
+    pub(crate) fn validate(&self) -> Result<(), EngineError> {
+        if self.batch_size == 0 {
+            return Err(EngineError::Invalid("rPIE batch_size must be >= 1".into()));
+        }
+        Ok(())
+    }
+}
+
 impl Default for RpieParams {
     fn default() -> Self {
         Self {
@@ -139,21 +178,27 @@ impl Default for RpieParams {
     }
 }
 
-/// Reconstruction state for one far-field scan: object, probe, the persistent exit-wave stack
-/// and the LLK history.
+/// Reconstruction state for one scan under its [`Optics`]: object, probe, the persistent
+/// exit-wave stack and the LLK history.
 ///
 /// Positions go through [`crate::base::Positions::pynx_preprocess`] and become an
 /// [`AddrTable`] once; the probe frame must match the detector frame. Object mode `m / nprobe`
 /// and probe mode `m % nprobe` make view mode `m` (PyNX `_obj_psidx`, `_probe_psidx`).
 /// The model intensity, every LLK and gradient included, is that of [`Ptycho::features`].
+///
+/// Exit waves reach the detector, and come back, through one private pair over the
+/// [`Optics`]' exit transform and its adjoint alone.
 pub struct Ptycho {
     addr: AddrTable,
-    quad: Vec<C64>,
+    optics: Optics,
     obs: Observed,
+    /// The probe frame's transform, for the probe's moves and [`zero_phase_ramp`]; it
+    /// propagates nothing.
     fft: Fft2,
     object: Object,
     probe: Probe,
-    /// Object-plane exit waves, one shifted plane per view; DM carries it across cycles.
+    /// Object-plane exit waves, one shifted plane per view; DM and RAAR carry it across
+    /// cycles.
     psi: Vec<C64>,
     features: Features,
     cycle: usize,
@@ -161,8 +206,41 @@ pub struct Ptycho {
 }
 
 impl Ptycho {
+    /// The scan under the far field of its geometry, [`Optics::far_field`].
     pub fn new(scan: &Scan, object: Object, probe: Probe) -> Result<Self, EngineError> {
+        Self::with_optics(scan, Optics::far_field(&scan.geometry), object, probe)
+    }
+
+    /// [`Self::new`] under `optics`, which give the object pixel of the scan's positions, the
+    /// exit waves' plane phase and the propagator in place of the scan geometry's far field;
+    /// of the geometry only the frame is read. Fails on more than one object slice, and on a
+    /// propagator that is not unitary (angular spectrum with an evanescent band): the
+    /// projections take the exit transform's adjoint for its inverse.
+    pub fn with_optics(
+        scan: &Scan,
+        optics: Optics,
+        object: Object,
+        probe: Probe,
+    ) -> Result<Self, EngineError> {
         let g = scan.geometry;
+        if optics.exit().shape() != g.frame {
+            return Err(EngineError::Invalid(format!(
+                "propagator plane {:?} differs from frame {:?}",
+                optics.exit().shape(),
+                g.frame
+            )));
+        }
+        if optics.nslice() != 1 {
+            return Err(EngineError::Invalid(format!(
+                "Ptycho runs one object slice, got {}",
+                optics.nslice()
+            )));
+        }
+        if !is_unitary(&optics) {
+            return Err(EngineError::Invalid(
+                "Ptycho needs a unitary propagator; this one drops an evanescent band".into(),
+            ));
+        }
         if probe.plane_shape() != g.frame {
             return Err(EngineError::Invalid(format!(
                 "probe plane {:?} differs from frame {:?}",
@@ -170,7 +248,7 @@ impl Ptycho {
                 g.frame
             )));
         }
-        let pixel = g.pixel_size_object();
+        let pixel = optics.pixel();
         let positions = scan.positions.pynx_preprocess(pixel);
         let addr = AddrTable::new(
             &positions,
@@ -182,7 +260,7 @@ impl Ptycho {
         )?;
         let psi = vec![C64::default(); addr.views().len() * probe.plane_len()];
         Ok(Self {
-            quad: quad_phase(&g),
+            optics,
             obs: Observed::from_counts(&scan.counts),
             fft: Fft2::new(g.frame),
             addr,
@@ -227,10 +305,37 @@ impl Ptycho {
         &self.obs
     }
 
-    /// The far-field quadratic phase [`quad_phase`] of the scan's geometry, which every exit
-    /// wave carries.
+    /// The plane phase [`Optics::quad`], which every exit wave carries.
     pub fn quad(&self) -> &[C64] {
-        &self.quad
+        self.optics.quad()
+    }
+
+    pub fn optics(&self) -> &Optics {
+        &self.optics
+    }
+
+    /// Exit-plane waves, every mode's plane of `frames` in order, to the detector. The one
+    /// way there, with [`Self::to_exit`] the one way back; a term of the transform that
+    /// differs by frame belongs in this pair.
+    fn to_detector(optics: &Optics, frames: Range<usize>, planes: &mut [C64]) {
+        let exit = optics.exit();
+        let [ny, nx] = exit.shape();
+        assert!(planes.len().is_multiple_of(frames.len() * ny * nx));
+        exit.forward(planes);
+    }
+
+    /// The adjoint of [`Self::to_detector`], its inverse: [`Self::with_optics`] takes unitary
+    /// propagators alone.
+    fn to_exit(optics: &Optics, frames: Range<usize>, planes: &mut [C64]) {
+        let exit = optics.exit();
+        let [ny, nx] = exit.shape();
+        assert!(planes.len().is_multiple_of(frames.len() * ny * nx));
+        exit.adjoint(planes);
+    }
+
+    /// Every frame of the scan.
+    fn frames(&self) -> Range<usize> {
+        0..self.addr.nframe()
     }
 
     /// LLK records in the order they were taken.
@@ -247,7 +352,7 @@ impl Ptycho {
     fn shifted(&self) -> Option<Shifted> {
         let views = self.addr.views();
         (self.features.position.as_deref())
-            .map(|d| Shifted::new(views, &self.probe, &self.quad, d, &self.fft))
+            .map(|d| Shifted::new(views, &self.probe, self.optics.quad(), d, &self.fft))
     }
 
     /// Exit waves `P·O·q` of every view, `P·q` moved by [`Features::position`], into `psi`.
@@ -255,7 +360,7 @@ impl Ptycho {
         let views = self.addr.views();
         match shifted {
             Some(s) => s.to_psi(views, &self.object, psi),
-            None => obj_probe_to_psi(views, &self.object, &self.probe, &self.quad, psi),
+            None => obj_probe_to_psi(views, &self.object, &self.probe, self.optics.quad(), psi),
         }
     }
 
@@ -281,7 +386,7 @@ impl Ptycho {
             ),
             None => psi_to_obj_probe(
                 views,
-                &self.quad,
+                self.optics.quad(),
                 &self.psi,
                 &mut self.object,
                 &mut self.probe,
@@ -302,7 +407,7 @@ impl Ptycho {
             match (object, &shifted) {
                 (false, _) => Stack::filled(od, C64::default()),
                 (true, Some(s)) => s.accumulate_obj(views, od, psi).0,
-                (true, None) => accumulate_obj(views, od, &self.probe, &self.quad, psi).0,
+                (true, None) => accumulate_obj(views, od, &self.probe, self.optics.quad(), psi).0,
             },
             match (probe, &shifted) {
                 (false, _) => Stack::filled(pd, C64::default()),
@@ -310,7 +415,9 @@ impl Ptycho {
                     s.accumulate_probe(views, &self.object, pd, psi, &self.fft)
                         .0
                 }
-                (true, None) => accumulate_probe(views, &self.object, pd, &self.quad, psi).0,
+                (true, None) => {
+                    accumulate_probe(views, &self.object, pd, self.optics.quad(), psi).0
+                }
             },
         ]
     }
@@ -319,7 +426,7 @@ impl Ptycho {
     /// then `get_llk(norm=True)`); the exit-wave stack is left as it is.
     pub fn llk(&self) -> Llk {
         let mut psi = self.calc_psi();
-        self.fft.forward(&mut psi);
+        Self::to_detector(&self.optics, self.frames(), &mut psi);
         let (nframe, nmode) = (self.addr.nframe(), self.addr.nmode());
         llk_with(
             &self.obs,
@@ -336,30 +443,30 @@ impl Ptycho {
     fn projected_position_sums(&self, s: &Shifted) -> Vec<[[f64; 2]; 2]> {
         let mut psi = vec![C64::default(); self.psi.len()];
         self.to_psi(Some(s), &mut psi);
-        self.fft.forward(&mut psi);
+        Self::to_detector(&self.optics, self.frames(), &mut psi);
         let (nframe, nmode) = (self.addr.nframe(), self.addr.nmode());
         let model = Model::of(&self.features, &self.obs);
         apply_amplitude_with(&self.obs, 0..nframe, nmode, &mut psi, model);
-        self.fft.inverse(&mut psi);
+        Self::to_exit(&self.optics, self.frames(), &mut psi);
         s.position_sums(self.addr.views(), &self.object, &psi, &self.fft)
     }
 
-    /// [`Features::step`] from the far field of the current object and probe, if some
+    /// [`Features::step`] from the detector field of the current object and probe, if some
     /// feature takes one.
     fn step_features(&mut self) {
         if !self.features.stepped() {
             return;
         }
         let mut psi = self.calc_psi();
-        self.fft.forward(&mut psi);
+        Self::to_detector(&self.optics, self.frames(), &mut psi);
         self.features.step(&self.obs, self.addr.nmode(), &psi);
     }
 
     /// Gradient of the Poisson LLK sum ([`crate::engine::llk`], not normalised) of the current object
     /// and probe over the object's real and imaginary parts, packed as
-    /// `∂L/∂Re O + i·∂L/∂Im O = 2·∂L/∂O*`: [`crate::engine::poisson_grad`] of the far field, inverse
-    /// FFT, then [`accumulate_obj`]'s numerator (`P·q` moved by [`Features::position`]). PyNX
-    /// `ML`'s `obj_grad` is half of it.
+    /// `∂L/∂Re O + i·∂L/∂Im O = 2·∂L/∂O*`: [`crate::engine::poisson_grad`] of the detector field,
+    /// the exit transform's adjoint, then [`accumulate_obj`]'s numerator (`P·q` moved by
+    /// [`Features::position`]). PyNX `ML`'s `obj_grad` is half of it.
     pub fn obj_grad(&self) -> Stack<C64> {
         let [g, _] = self.grads(true, false);
         g
@@ -372,7 +479,7 @@ impl Ptycho {
         g
     }
 
-    /// [`Ptycho::obj_grad`] and [`Ptycho::probe_grad`] from one far field; an array not asked
+    /// [`Ptycho::obj_grad`] and [`Ptycho::probe_grad`] from one detector field; an array not asked
     /// for gets zeros.
     fn grads(&self, object: bool, probe: bool) -> [Stack<C64>; 2] {
         self.back_project(&self.grad_psi(), object, probe)
@@ -381,7 +488,7 @@ impl Ptycho {
     /// [`crate::engine::cg_poisson_gamma`] of the current object and probe along `(d_obj, d_probe)`,
     /// under the features' model.
     pub fn cg_gamma(&self, d_obj: &Stack<C64>, d_probe: &Stack<C64>) -> (f64, f64) {
-        let (views, quad) = (self.addr.views(), &self.quad[..]);
+        let (views, quad) = (self.addr.views(), self.optics.quad());
         let (d_obj, d_probe) = (Object::new(d_obj.clone()), Probe::new(d_probe.clone()));
         let mut po = self.calc_psi();
         let mut a = vec![C64::default(); po.len()];
@@ -403,7 +510,7 @@ impl Ptycho {
             }
         }
         for x in [&mut po, &mut a, &mut b] {
-            self.fft.forward(x);
+            Self::to_detector(&self.optics, self.frames(), x);
         }
         let (nframe, nmode) = (self.addr.nframe(), self.addr.nmode());
         let model = Model::of(&self.features, &self.obs);
@@ -413,7 +520,7 @@ impl Ptycho {
     /// The object-plane `2·∂L/∂psi*` both gradients back-project.
     fn grad_psi(&self) -> Vec<C64> {
         let mut psi = self.calc_psi();
-        self.fft.forward(&mut psi);
+        Self::to_detector(&self.optics, self.frames(), &mut psi);
         let (nframe, nmode) = (self.addr.nframe(), self.addr.nmode());
         poisson_grad_with(
             &self.obs,
@@ -422,7 +529,7 @@ impl Ptycho {
             &mut psi,
             Model::of(&self.features, &self.obs),
         );
-        self.fft.inverse(&mut psi);
+        Self::to_exit(&self.optics, self.frames(), &mut psi);
         psi
     }
 
@@ -456,7 +563,8 @@ impl Ptycho {
         self.object.as_mut_slice().iter_mut().for_each(|c| *c *= fo);
     }
 
-    /// PyNX `ZeroPhaseRamp`: centre the probe's far field. With `(cy, cx)` the centre of mass
+    /// PyNX `ZeroPhaseRamp`: centre the probe's spectrum, its far field whatever the
+    /// [`Optics`]. With `(cy, cx)` the centre of mass
     /// of `Σ_modes |fftshift(FT(fftshift(P)))|²`, `dx = cx − nx/2`, `dy = cy − ny/2`:
     /// `P *= exp(−2πi(dx·(x − nx/2)/nx + dy·(y − ny/2)/ny))` and
     /// `O *= exp(+2πi(dx·(x − nxo/2)/nx + dy·(y − nyo/2)/ny))` (integer halves). The two
@@ -477,7 +585,7 @@ impl Ptycho {
             let mut psi = std::mem::take(&mut self.psi);
             self.to_psi(shifted.as_ref(), &mut psi);
             self.psi = psi;
-            self.fft.forward(&mut self.psi);
+            Self::to_detector(&self.optics, 0..nframe, &mut self.psi);
             let l = llk_due(params.calc_llk, ic, ncycle).then(|| {
                 let model = Model::of(&self.features, &self.obs);
                 llk_with(&self.obs, 0..nframe, nmode, &self.psi, model).normalised(nb_obs)
@@ -485,7 +593,7 @@ impl Ptycho {
             self.features.step(&self.obs, nmode, &self.psi);
             let model = Model::of(&self.features, &self.obs);
             apply_amplitude_with(&self.obs, 0..nframe, nmode, &mut self.psi, model);
-            self.fft.inverse(&mut self.psi);
+            Self::to_exit(&self.optics, 0..nframe, &mut self.psi);
             let sums = (shifted.as_ref())
                 .map(|s| s.position_sums(self.addr.views(), &self.object, &self.psi, &self.fft));
             self.update_from_psi(params.obj_inertia, params.probe_inertia);
@@ -530,27 +638,17 @@ impl Ptycho {
                     *r = *s;
                 }
             }
-            self.fft.forward(&mut self.psi);
+            Self::to_detector(&self.optics, 0..nframe, &mut self.psi);
             let model = Model::of(&self.features, &self.obs);
             apply_amplitude_with(&self.obs, 0..nframe, nmode, &mut self.psi, model);
-            self.fft.inverse(&mut self.psi);
+            Self::to_exit(&self.optics, 0..nframe, &mut self.psi);
             if ic > 0 {
                 for ((s, r), p) in self.psi.iter_mut().zip(&refl).zip(&po) {
                     *s += (p - r) * (1.0 - a);
                 }
             }
-            let sums = (shifted.as_ref())
-                .map(|s| s.position_sums(self.addr.views(), &self.object, &self.psi, &self.fft));
-            for _ in 0..params.loop_obj_probe {
-                for (o, p) in [(params.obj_inertia, None), (None, params.probe_inertia)] {
-                    if o.is_some() || p.is_some() {
-                        self.update_from_psi(o, p);
-                    }
-                }
-            }
-            if let (Some(d), Some(sums)) = (&mut self.features.position, sums) {
-                position_step(d, &sums);
-            }
+            let inertia = [params.obj_inertia, params.probe_inertia];
+            self.update_obj_probe(shifted.as_ref(), inertia, params.loop_obj_probe);
             if let Some(l) = l {
                 self.record(Algorithm::Dm, l);
                 self.split_scale(1.0);
@@ -559,6 +657,70 @@ impl Ptycho {
         }
         if params.zero_phase_ramp {
             self.zero_phase_ramp();
+        }
+    }
+
+    /// PyNX `RAAR(...)**ncycle` with `b = beta`. Cycle 0 starts from `psi = PO`; later cycles
+    /// mix the carried projection `psi` with the carried iterate `it` it was projected from:
+    /// `psi ← (1 − b/2)·psi + (b/2)·(2·PO − it)`, which becomes the next `it`, then magnitude
+    /// projection `Π_F`. The update, the position step, the LLK record and the balance
+    /// after it are DM's ([`Ptycho::dm`]), from the projection.
+    pub fn raar(&mut self, params: &RaarParams, ncycle: usize) {
+        let (nframe, nmode) = (self.addr.nframe(), self.addr.nmode());
+        let h = 0.5 * params.beta;
+        let mut po = vec![C64::default(); self.psi.len()];
+        let mut iterate = vec![C64::default(); self.psi.len()];
+        for ic in 0..ncycle {
+            let l = llk_due(params.calc_llk, ic, ncycle).then(|| self.llk());
+            self.step_features();
+            let shifted = self.shifted();
+            self.to_psi(shifted.as_ref(), &mut po);
+            if ic == 0 {
+                self.psi.copy_from_slice(&po);
+            } else {
+                for ((s, it), p) in self.psi.iter_mut().zip(&iterate).zip(&po) {
+                    *s = *s * (1.0 - h) + (p * 2.0 - it) * h;
+                }
+            }
+            iterate.copy_from_slice(&self.psi);
+            Self::to_detector(&self.optics, 0..nframe, &mut self.psi);
+            let model = Model::of(&self.features, &self.obs);
+            apply_amplitude_with(&self.obs, 0..nframe, nmode, &mut self.psi, model);
+            Self::to_exit(&self.optics, 0..nframe, &mut self.psi);
+            let inertia = [params.obj_inertia, params.probe_inertia];
+            self.update_obj_probe(shifted.as_ref(), inertia, params.loop_obj_probe);
+            if let Some(l) = l {
+                self.record(Algorithm::Raar, l);
+                self.split_scale(1.0);
+            }
+            self.cycle += 1;
+        }
+        if params.zero_phase_ramp {
+            self.zero_phase_ramp();
+        }
+    }
+
+    /// DM's and RAAR's update from the exit waves `self.psi`: their position sums under
+    /// `shifted`, `loops` times an object-only then a probe-only [`psi_to_obj_probe`] with
+    /// `inertia` (object, probe), so the probe update sees the new object, then the step of
+    /// [`Features::position`].
+    fn update_obj_probe(
+        &mut self,
+        shifted: Option<&Shifted>,
+        inertia: [Option<f64>; 2],
+        loops: usize,
+    ) {
+        let sums =
+            shifted.map(|s| s.position_sums(self.addr.views(), &self.object, &self.psi, &self.fft));
+        for _ in 0..loops {
+            for (o, p) in [(inertia[0], None), (None, inertia[1])] {
+                if o.is_some() || p.is_some() {
+                    self.update_from_psi(o, p);
+                }
+            }
+        }
+        if let (Some(d), Some(sums)) = (&mut self.features.position, sums) {
+            position_step(d, &sums);
         }
     }
 
@@ -663,17 +825,17 @@ impl Ptycho {
     /// pty-chi has no `q` and an unnormalised FFT: its probe `P·q / sqrt(ny·nx)` gives the same
     /// far-field moduli, so the `1e-7` guards act alike and the iterates correspond exactly
     /// (`scripts/compare_ptychi_rpie.py`, and `refs/f64/rpie_pos.py` with the positions, pty-chi
-    /// moving every probe mode). One LLK record (of the estimate after the epoch) every
-    /// `calc_llk` epochs and after the last. Of the [`Features`] it models the positions alone.
+    /// moving every probe mode). Under other [`Optics`] `FT` and `IFT` are their exit transform
+    /// and its adjoint, and pty-chi's probe is `P·q / sqrt(k)`, `k` their `intensity_scale`. One
+    /// LLK record (of the estimate after the epoch) every `calc_llk` epochs and after the last.
+    /// Of the [`Features`] it models the positions alone.
     pub fn rpie(&mut self, params: &RpieParams, nepoch: usize) -> Result<(), EngineError> {
         if self.addr.nobj() != 1 {
             return Err(EngineError::Invalid(
                 "rPIE needs exactly one object mode".into(),
             ));
         }
-        if params.batch_size == 0 {
-            return Err(EngineError::Invalid("rPIE batch_size must be >= 1".into()));
-        }
+        params.validate()?;
         if self.features.scale.is_some() || self.features.background.is_some() {
             return Err(EngineError::Invalid(
                 "rPIE models no intensity scale or background".into(),
@@ -704,14 +866,21 @@ impl Ptycho {
         let nbatch = frames.len();
         let views = &self.addr.views()[frames.start * nmode..frames.end * nmode];
         let offsets = self.features.position.as_deref();
-        let shifted = offsets.map(|d| Shifted::new(views, &self.probe, &self.quad, d, &self.fft));
+        let shifted =
+            offsets.map(|d| Shifted::new(views, &self.probe, self.optics.quad(), d, &self.fft));
         let mut psi = vec![C64::default(); views.len() * n];
         match &shifted {
             Some(s) => s.to_psi(views, &self.object, &mut psi),
-            None => obj_probe_to_psi(views, &self.object, &self.probe, &self.quad, &mut psi),
+            None => obj_probe_to_psi(
+                views,
+                &self.object,
+                &self.probe,
+                self.optics.quad(),
+                &mut psi,
+            ),
         }
         let mut delta = psi.clone();
-        self.fft.forward(&mut delta);
+        Self::to_detector(&self.optics, frames.clone(), &mut delta);
         for (o, block) in self
             .obs
             .frames(frames.clone())
@@ -730,7 +899,7 @@ impl Ptycho {
                 }
             }
         }
-        self.fft.inverse(&mut delta);
+        Self::to_exit(&self.optics, frames.clone(), &mut delta);
         delta.iter_mut().zip(&psi).for_each(|(d, p)| *d -= p);
 
         // View k's probe at exit-wave index j and its squared modulus.
@@ -743,7 +912,7 @@ impl Ptycho {
                 None => {
                     let (i, _, _) = natural(j, ny, nx);
                     let p = self.probe.plane(views[k].probe as usize)[i];
-                    (p * self.quad[i], p.norm_sqr())
+                    (p * self.optics.quad()[i], p.norm_sqr())
                 }
             }
         };
@@ -790,14 +959,15 @@ impl Ptycho {
                     for (j, dv) in dv.iter().enumerate() {
                         let i = shift(j, ny, nx);
                         let o = win(i);
-                        let w = (o * self.quad[i]).conj() / ((1.0 - a) * o.norm_sqr() + a * omax);
+                        let w = (o * self.optics.quad()[i]).conj()
+                            / ((1.0 - a) * o.norm_sqr() + a * omax);
                         d[i] += w * dv;
                     }
                 }
                 if let Some(offsets) = offsets {
                     let [dy, dx] = offsets[fv[0].frame as usize];
                     let moved = frame.as_mut_slice();
-                    move_planes(moved, Some(&self.quad), [-dy, -dx], &self.fft);
+                    move_planes(moved, Some(self.optics.quad()), [-dy, -dx], &self.fft);
                     (d_probe.as_mut_slice().iter_mut())
                         .zip(&*moved)
                         .for_each(|(d, m)| *d += m);
@@ -816,7 +986,7 @@ impl Ptycho {
                     gradient_sums(&patch, s.wave(k), &delta[k * n..(k + 1) * n], &self.fft)
                 })
                 .collect();
-            gradient_directions(&sums, EPS_POSITION * n as f64)
+            gradient_directions(&sums, EPS_POSITION * self.optics.exit().intensity_scale())
         });
         if let (Some(step), Some(d)) = (params.obj_step, d_obj) {
             for (o, d) in self.object.as_mut_slice().iter_mut().zip(d.as_slice()) {
@@ -834,6 +1004,19 @@ impl Ptycho {
             batch_position_step(d, &frames, &delta);
         }
     }
+}
+
+/// Whether `optics`' exit transform is unitary: `Uᴴ·U` of one plane's unit impulse is
+/// `Fft2⁻¹·|T|²` of a constant under angular spectrum, the impulse again unless `T` has a
+/// zero, which moves its peak by at least `1/(ny·nx)`.
+fn is_unitary(optics: &Optics) -> bool {
+    let exit = optics.exit();
+    let [ny, nx] = exit.shape();
+    let mut plane = vec![C64::default(); ny * nx];
+    plane[0] = C64::new(1.0, 0.0);
+    exit.forward(&mut plane);
+    exit.adjoint(&mut plane);
+    (plane[0] - 1.0).norm() < 0.5 / (ny * nx) as f64
 }
 
 /// [`Ptycho::zero_phase_ramp`] of the given arrays, which the GPU backend also runs on its
@@ -889,22 +1072,38 @@ fn apply_ramp(a: &mut Stack<C64>, ry: &[f64], rx: &[f64]) {
 
 #[cfg(test)]
 mod tests {
-    use crate::base::{Geometry, required_obj_shape};
+    use crate::base::{Counts, Geometry, Positions, required_obj_shape};
 
     use super::*;
-    use crate::engine::llk;
+    use crate::engine::{Propagator, Wavefield, llk};
+    use crate::worst::worst_of;
 
     fn poisson_sum(p: &Ptycho) -> f64 {
         let mut psi = p.calc_psi();
-        p.fft.forward(&mut psi);
+        Ptycho::to_detector(&p.optics, p.frames(), &mut psi);
         llk(&p.obs, 0..p.addr.nframe(), p.addr.nmode(), &psi).poisson
     }
 
-    /// Two object and two probe modes, masked detector pixels and pixels with zero counts, the
-    /// object away from the truth, scaled.
-    fn grad_start() -> Ptycho {
-        let g = Geometry::new(1.5e-10, 1.0, 75e-6, [16, 16]).unwrap();
-        let pixel = g.pixel_size_object();
+    /// One wavefield per propagator kind other than the far field: angular spectrum, a
+    /// Fresnel transform, and one back over pixels that are not square.
+    fn wavefields() -> [Wavefield; 3] {
+        let w = |pixel, distance| Wavefield::new([16, 16], 1.5e-10, pixel, distance).unwrap();
+        let waves = [
+            w([50e-9, 50e-9], 1e-4),
+            w([50e-9, 50e-9], 1.25e-3),
+            w([40e-9, 50e-9], -1.6e-3),
+        ];
+        let kinds = waves.map(|w| match Propagator::free_space(&w) {
+            Propagator::Fourier(_) => 'F',
+            Propagator::AngularSpectrum(_) => 'A',
+            Propagator::Fresnel(_) => 'T',
+        });
+        assert_eq!(kinds, ['A', 'T', 'T']);
+        waves
+    }
+
+    /// [`grad_start`]'s positions, truth, probe and detector mask over object pixels `pixel`.
+    fn truth(g: &Geometry, pixel: [f64; 2]) -> (Positions, Object, Probe, Vec<bool>) {
         let positions = crate::base::sim::fermat(5, 3.0 * pixel[1]);
         let shape = required_obj_shape(&positions.pynx_preprocess(pixel), pixel, g.frame, 0);
         let one = crate::base::sim::object(shape);
@@ -915,8 +1114,42 @@ mod tests {
         let mut mask = vec![false; 256];
         mask[8 * 16 + 9] = true;
         mask[3 * 16 + 5] = true;
-        let scan = crate::engine::sim::simulate(g, positions, &truth, &probe, 2e3, Some(&mask), 3)
-            .unwrap();
+        (positions, truth, probe, mask)
+    }
+
+    /// Two object and two probe modes, masked detector pixels and pixels with zero counts, the
+    /// object away from the truth, scaled; under `wave`'s optics, the far field without one,
+    /// the counts drawn from the truth through the same optics.
+    fn grad_start(wave: Option<Wavefield>) -> Ptycho {
+        let g = Geometry::new(1.5e-10, 1.0, 75e-6, [16, 16]).unwrap();
+        let optics = || match &wave {
+            Some(w) => Optics::free_space(w),
+            None => Optics::far_field(&g),
+        };
+        let (positions, truth, probe, mask) = truth(&g, optics().pixel());
+        let dims = [positions.len(), 16, 16];
+        let blank = Counts::from_raw(dims, vec![0; dims.iter().product()]).unwrap();
+        let blank = Scan::new(g, positions.clone(), blank).unwrap();
+        let at_truth = Ptycho::with_optics(&blank, optics(), truth.clone(), probe.clone()).unwrap();
+        let mut psi = at_truth.calc_psi();
+        Ptycho::to_detector(&at_truth.optics, at_truth.frames(), &mut psi);
+        let nmode = at_truth.addr.nmode();
+        let mut intensity = vec![0.0; dims.iter().product()];
+        for (out, block) in intensity
+            .as_chunks_mut::<256>()
+            .0
+            .iter_mut()
+            .zip(psi.chunks_exact(nmode * 256))
+        {
+            for (i, out) in out.iter_mut().enumerate() {
+                let j = shift(i, 16, 16);
+                *out = (0..nmode).map(|m| block[m * 256 + j].norm_sqr()).sum();
+            }
+        }
+        let scale = 2e3 / (intensity.iter().sum::<f64>() / dims[0] as f64);
+        intensity.iter_mut().for_each(|v| *v *= scale);
+        let counts = crate::base::sim::poisson(dims, &intensity, Some(&mask), 3).unwrap();
+        let scan = Scan::new(g, positions, counts).unwrap();
         let start = truth
             .as_slice()
             .iter()
@@ -924,31 +1157,49 @@ mod tests {
             .map(|(i, v)| v * C64::from_polar(0.9, 0.4 * (0.37 * i as f64).sin()))
             .collect();
         let start = Object::new(Stack::from_vec(truth.dims(), start).unwrap());
-        let mut p = Ptycho::new(&scan, start, probe).unwrap();
+        let mut p = Ptycho::with_optics(&scan, optics(), start, probe).unwrap();
         p.scale_obj_probe();
         let obs = p.obs.frames(0..p.addr.nframe());
         assert!(obs.contains(&None) && obs.contains(&Some(0.0)));
         p
     }
 
-    /// [`grad_start`] and [`grad_start`] with its probe moved by sub-pixel offsets of both signs.
-    fn grad_starts() -> [Ptycho; 2] {
-        let mut moved = grad_start();
-        let d = (0..moved.addr.nframe())
-            .map(|f| {
-                [
-                    0.6 * (1.3 * f as f64 + 0.2).sin(),
-                    -0.45 * (0.7 * f as f64).cos(),
-                ]
+    /// Under the far field and each of [`wavefields`], [`grad_start`] and [`grad_start`] with
+    /// its probe moved by sub-pixel offsets of both signs.
+    fn grad_starts() -> Vec<Ptycho> {
+        let waves = std::iter::once(None).chain(wavefields().map(Some));
+        waves
+            .flat_map(|w| {
+                let mut moved = grad_start(w);
+                let d = (0..moved.addr.nframe())
+                    .map(|f| {
+                        [
+                            0.6 * (1.3 * f as f64 + 0.2).sin(),
+                            -0.45 * (0.7 * f as f64).cos(),
+                        ]
+                    })
+                    .collect();
+                moved
+                    .set_features(Features {
+                        position: Some(d),
+                        ..Features::default()
+                    })
+                    .unwrap();
+                [grad_start(w), moved]
             })
-            .collect();
-        moved
-            .set_features(Features {
-                position: Some(d),
-                ..Features::default()
-            })
+            .collect()
+    }
+
+    /// The far field's counts are [`crate::engine::sim::simulate`]'s.
+    #[test]
+    fn far_field_start_is_the_simulated_scan() {
+        let g = Geometry::new(1.5e-10, 1.0, 75e-6, [16, 16]).unwrap();
+        let p = grad_start(None);
+        let (positions, truth, probe, mask) = truth(&g, g.pixel_size_object());
+        let scan = crate::engine::sim::simulate(g, positions, &truth, &probe, 2e3, Some(&mask), 3)
             .unwrap();
-        [grad_start(), moved]
+        let obs = Observed::from_counts(&scan.counts);
+        assert_eq!(obs.frames(0..obs.nframe()), p.obs.frames(0..obs.nframe()));
     }
 
     /// `grad` against central differences of the Poisson LLK sum in the real and imaginary
@@ -971,9 +1222,10 @@ mod tests {
                 arr(p)[k] = o - dir;
                 let lm = poisson_sum(p);
                 arr(p)[k] = o;
-                err = err.max(((lp - lm) / (2.0 * h) - want).abs());
+                err = worst_of([err, ((lp - lm) / (2.0 * h) - want).abs()]);
             }
         }
+        eprintln!("max |fd - grad| / max |grad| {:.3e}", err / gmax);
         assert!(
             err < 1e-6 * gmax,
             "max |fd - grad| {err:e}, max |grad| {gmax:e}"
@@ -1046,6 +1298,11 @@ mod tests {
         };
         let (lm, l0, lp) = (phi(-h), phi(0.0), phi(h));
         let newton = -((lp - lm) / (2.0 * h)) / ((lp - 2.0 * l0 + lm) / (h * h));
+        eprintln!(
+            "num {:.3e} gamma {:.3e}",
+            (num + dot).abs() / dot.abs(),
+            (gamma - newton).abs() / gamma.abs()
+        );
         assert!(
             (gamma - newton).abs() < 1e-5 * gamma.abs(),
             "gamma {gamma} newton {newton}"

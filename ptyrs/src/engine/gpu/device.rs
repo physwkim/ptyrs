@@ -14,10 +14,11 @@ use std::sync::Arc;
 use crate::fft::Plan2d;
 use crate::gpu::{
     BH_STEP, BackgroundSums, BhKernels, C32, CG_BLOCKS, Ended, EpochOrder, Error as GpuError,
-    FarSums, FusedBufs, FusedInputs, GammaStacks, GradKernels, Kernels, LlkPartial, LlkRing,
-    LlkScratch, LlkTotals, Model, PositionKernels, PositionPartial, Positions, PowerMax,
-    ProbeSpectrum, PsiSums, RingDevice, RpieKernels, ScalePartial, Shift, ShiftSums,
-    ShiftedProbeSums, SpectrumBuf, StackTable, UpdateSums, ViewAddr, ViewDims, Views,
+    ExitPass, ExitStage, FarSums, FusedBufs, FusedInputs, GammaStacks, GradKernels, Kernels,
+    LlkPartial, LlkRing, LlkScratch, LlkTotals, Model, OpticsKernels, PositionKernels,
+    PositionPartial, Positions, PowerMax, ProbeSpectrum, PsiSums, RingDevice, RpieKernels,
+    ScalePartial, Shift, ShiftSums, ShiftedProbeSums, SpectrumBuf, StackTable, UpdateSums,
+    ViewAddr, ViewDims, Views,
 };
 use crate::tile::TileDots;
 use cuda_async::cuda_graph::CudaGraph;
@@ -29,14 +30,27 @@ use super::lsqml::{LsqmlBufs, LsqmlState, Pre};
 use super::ml::MlMoved;
 use super::rpie::RpieMoved;
 use super::{
-    Epoch, Frames, GpuOptions, Tag, batch_stacks, nf_max, plane_len, plans, split, stack_buf_len,
-    stack_frames, stacks, to_u32,
+    Cut, Epoch, Frames, GpuOptions, StackRule, Streamed, Tag, batch_stacks, plane_bytes, plane_len,
+    to_c32, to_u32, wave_bytes,
 };
 use crate::engine::features::{POSITION_LIMIT, POSITION_STEP};
+use crate::engine::ptycho::Algorithm;
 use crate::engine::{
     ApParams, BhParams, BhStep, DmParams, EngineError, Features, LsqmlParams, LsqmlStep, MlParams,
-    RpieParams,
+    PlaneStage, RaarParams, RpieParams,
 };
+
+/// What [`Device::new`] uploads: the propagator's stage, the views' addresses, the counts
+/// and the starting arrays.
+pub(super) struct Uploads<'a> {
+    pub stage: PlaneStage<'a>,
+    /// The propagator's intensity scale.
+    pub scale: f32,
+    pub addrs: &'a [ViewAddr],
+    pub counts: &'a [u16],
+    pub obj: &'a [C32],
+    pub probe: &'a [C32],
+}
 
 /// Every buffer, module and plan a cycle launches on, and the graphs captured from them.
 pub(super) struct Device {
@@ -45,6 +59,11 @@ pub(super) struct Device {
     rpie: RpieKernels,
     grad: GradKernels,
     bh: BhKernels,
+    optics: OpticsKernels,
+    /// The propagator's stage ahead of the transform every pass takes.
+    exit: ExitStage,
+    /// The propagator's intensity scale.
+    scale: f32,
     /// BH's dot products, compiled by [`Device::new`] so no capture compiles a Tile kernel.
     tile: TileDots,
     views: Views,
@@ -55,28 +74,20 @@ pub(super) struct Device {
     probe_sums: UpdateSums,
     obj_len: u32,
     probe_len: u32,
-    table: StackTable,
-    stacks: Vec<StackBufs>,
-    /// The stacks of the fused passes that stream only the shared scratch, up to twice as
-    /// long as `stacks` ([`stack_frames`]).
-    wide: StackTable,
-    passes: Passes,
-    /// One stack's LLK partials, on their way into the ring.
-    llk: DeviceBuffer<LlkPartial>,
-    /// The chunk sums M1's [`Kernels::llk`] reduces a stack's frames through.
-    llk_scratch: LlkScratch,
+    /// [`GpuOptions::stack_size`] on this device's L2: every cut below is its.
+    rule: StackRule,
+    shared: Shared,
+    /// DM's or RAAR's carried stacks: built by the first run of either and dropped by
+    /// [`Self::steady_with`] once no run, whose graphs bind them, is left.
+    carried: Option<Box<CarriedBufs>>,
     norms: NormBufs,
     ring: LlkRing<Tag>,
     use_graph: bool,
     /// The epochs run since the parameters last changed, all of one [`Epoch::run`].
     runs: Vec<EpochRun>,
-    /// Frames per stack of `stacks`, for the [`MlState`] plans and BH's stacks.
-    stack_size: u32,
-    /// Frames per stack of `wide`, for LSQML's stacks, which stream one exit-wave set.
-    wide_size: u32,
     /// With graphs, the LLK pass's graph.
     llk_graph: Option<Captured>,
-    /// ML's state, built by the first ML call and never replaced.
+    /// ML's state, built by the first ML call and replaced only for another position model.
     ml: Option<Box<MlState>>,
     /// BH's state, built by the first BH call and replaced only for another batch size.
     bh_state: Option<Box<BhState>>,
@@ -371,13 +382,14 @@ impl FeaturesMut<'_> {
 
     /// The features lent to the passes of one cycle body over `probe`, which cannot change
     /// while they are: the model of every feature set, the position's after the spectra of
-    /// `probe` it moves (two launches), and the sums.
+    /// `probe` it moves (two launches) and the propagator's stage `exit`, and the sums.
     pub fn lend<'b>(
         &'b mut self,
         ctx: &ExecutionContext,
         kernels: &Kernels,
         dims: &ViewDims,
         probe: &'b DeviceBuffer<C32>,
+        exit: ExitPass<'b>,
     ) -> Result<Modelled<'b>, GpuError> {
         let (scale, scale_sums) = match &mut self.scale {
             Some(s) => (Some(&*s.values), Some(&mut *s.sums)),
@@ -407,6 +419,7 @@ impl FeaturesMut<'_> {
                 scale,
                 background,
                 shift,
+                exit: Some(exit),
             },
             scale: scale_sums,
             background: background_sums,
@@ -495,6 +508,164 @@ pub(super) struct M1Bufs<'a> {
     pub scratch: &'a mut DeviceBuffer<C32>,
 }
 
+/// The [`Passes`] every algorithm shares, the stacks of the passes that stream their scratch
+/// alone, and the LLK buffers those passes fill, built together, so the scratch and the LLK
+/// buffers hold the longest of those stacks. DM's and RAAR's stacks count the scratch's
+/// buffers with their own, and the position model's BH and LSQML stacks, whose sums borrow its
+/// shift planes, are capped at its stacks, so no stack that touches it is longer.
+struct Shared {
+    /// The scratch's buffers.
+    streamed: Vec<Streamed>,
+    /// AP's, the LLK pass's, ML's gradient's and opening scale's stacks.
+    cut: Cut,
+    passes: Passes,
+    /// One stack's LLK partials, on their way into the ring.
+    llk: DeviceBuffer<LlkPartial>,
+    /// The chunk sums M1's [`Kernels::llk`] reduces a stack's frames through.
+    llk_scratch: LlkScratch,
+}
+
+impl Shared {
+    /// M2's fused passes (with `shift`, the position model's) or M1's scratch, `fused`
+    /// picking, cut by `rule`.
+    fn new(
+        stream: &Arc<CudaStream>,
+        dims: &ViewDims,
+        rule: StackRule,
+        fused: bool,
+        shift: bool,
+    ) -> Result<Self, EngineError> {
+        // M1's scratch: `obj_probe_to_psi`, the transforms and `apply_amplitude`; the fused
+        // work planes: the row, column and inverse row passes; each shift plane: the pass that
+        // writes it and a later one.
+        let mut streamed = vec![Streamed::new(wave_bytes(dims), if fused { 3 } else { 4 })];
+        if shift {
+            streamed.push(Streamed::new(FusedBufs::shift_bytes(dims), 2));
+        }
+        let cut = rule.cut(stream, dims, &streamed)?;
+        let nf_max = cut.table.nf_max();
+        let passes = if fused {
+            let f = match shift {
+                true => FusedBufs::with_shift(stream, dims, nf_max),
+                false => FusedBufs::new(stream, dims, nf_max),
+            };
+            let f = f.map_err(|e| match e {
+                GpuError::Shape(m) if shift => EngineError::Invalid(format!("position model: {m}")),
+                GpuError::Shape(m) => EngineError::Invalid(format!(
+                    "{m}; GpuOptions {{ fused: false, .. }} runs M1's launches instead"
+                )),
+                e => e.into(),
+            })?;
+            Passes::Fused(Box::new(f))
+        } else {
+            Passes::M1 {
+                plans: cut.plans(stream, dims)?,
+                scratch: DeviceBuffer::zeroed(stream, cut.wave_len(dims))?,
+            }
+        };
+        Ok(Self {
+            streamed,
+            llk: DeviceBuffer::zeroed(stream, nf_max as usize)?,
+            llk_scratch: LlkScratch::new(stream, dims, nf_max)?,
+            cut,
+            passes,
+        })
+    }
+}
+
+/// DM's or RAAR's stacks and the exit waves each carries across cycles, with RAAR's iterate,
+/// cut by the carried exit waves and the shared scratch; the iterate, which one pass reads and
+/// writes, does not count. Cycle 0 of a call overwrites both sets, so nothing is carried from
+/// one call to the next.
+struct CarriedBufs {
+    cut: Cut,
+    /// M1's plans, one per stack length of `cut`; none for the fused passes.
+    plans: Vec<Plan2d>,
+    /// Exit waves of each stack's views; planes past `nf * nmode` stay zero.
+    psi: Vec<DeviceBuffer<C32>>,
+    /// RAAR's iterate, laid out as `psi`.
+    iterate: Option<Vec<DeviceBuffer<C32>>>,
+}
+
+impl CarriedBufs {
+    /// DM's, or with `raar` RAAR's, against `shared`.
+    fn new(
+        stream: &Arc<CudaStream>,
+        dims: &ViewDims,
+        rule: StackRule,
+        shared: &Shared,
+        raar: bool,
+    ) -> Result<Self, EngineError> {
+        // The exit waves: read by the forward pass, written by the inverse one (M1: also
+        // `dm_reflect`, `add_c32`); the iterate: the forward row pass (M1: `raar_iterate`).
+        let wave = wave_bytes(dims);
+        let mut streamed = shared.streamed.clone();
+        streamed.push(Streamed::new(wave, 2));
+        if raar {
+            streamed.push(Streamed::new(wave, 1));
+        }
+        let cut = rule.cut(stream, dims, &streamed)?;
+        let plans = match shared.passes {
+            Passes::M1 { .. } => cut.plans(stream, dims)?,
+            Passes::Fused(_) => Vec::new(),
+        };
+        let len = cut.wave_len(dims);
+        let set = || -> Result<Vec<DeviceBuffer<C32>>, EngineError> {
+            Ok((0..cut.len())
+                .map(|_| DeviceBuffer::zeroed(stream, len))
+                .collect::<Result<_, _>>()?)
+        };
+        Ok(Self {
+            psi: set()?,
+            iterate: raar.then(set).transpose()?,
+            plans,
+            cut,
+        })
+    }
+
+    /// Whether these are the buffers `epoch`'s cycle binds.
+    fn serves(&self, epoch: Epoch) -> bool {
+        match epoch {
+            Epoch::Dm { .. } => self.iterate.is_none(),
+            Epoch::Raar { .. } => self.iterate.is_some(),
+            _ => false,
+        }
+    }
+
+    fn lend(&mut self) -> CarriedMut<'_> {
+        CarriedMut {
+            cut: &self.cut,
+            plans: Plans(&mut self.plans),
+            psi: &mut self.psi,
+            iterate: self.iterate.as_deref_mut(),
+        }
+    }
+}
+
+/// [`CarriedBufs`] lent to a cycle.
+pub(super) struct CarriedMut<'a> {
+    pub cut: &'a Cut,
+    pub plans: Plans<'a>,
+    pub psi: &'a mut [DeviceBuffer<C32>],
+    iterate: Option<&'a mut [DeviceBuffer<C32>]>,
+}
+
+impl<'a> CarriedMut<'a> {
+    /// The plans, and stack `s`'s carried exit waves and RAAR iterate, for a RAAR cycle.
+    pub fn raar(
+        &mut self,
+        s: usize,
+    ) -> (
+        &mut Plans<'a>,
+        &mut DeviceBuffer<C32>,
+        &mut DeviceBuffer<C32>,
+    ) {
+        let iterate =
+            (self.iterate.as_deref_mut()).expect("Device::new_run built the RAAR iterate");
+        (&mut self.plans, &mut self.psi[s], &mut iterate[s])
+    }
+}
+
 /// A cycle with the buffers only it uses, and with graphs the graph captured for it.
 struct EpochRun {
     cycle: Cycle,
@@ -514,8 +685,14 @@ enum Cycle {
         params: ApParams,
         llk: bool,
     },
+    /// Its buffers are the device's [`CarriedBufs`], which every DM epoch shares.
     Dm {
         params: DmParams,
+        first: bool,
+    },
+    /// Its buffers are the device's [`CarriedBufs`], which every RAAR epoch shares.
+    Raar {
+        params: RaarParams,
         first: bool,
     },
     Rpie(RpieParams, Box<RpieScratch>),
@@ -544,6 +721,7 @@ impl Cycle {
         match *self {
             Self::Ap { params, llk } => Epoch::Ap { params, llk },
             Self::Dm { params, first } => Epoch::Dm { params, first },
+            Self::Raar { params, first } => Epoch::Raar { params, first },
             Self::Rpie(p, _) => Epoch::Rpie(p),
             Self::Ml { params, first, llk } => Epoch::Ml { params, first, llk },
             Self::Bh { params, cg } => Epoch::Bh { params, cg },
@@ -552,10 +730,13 @@ impl Cycle {
     }
 }
 
-/// ML's conjugate-gradient state and scratch, sized by the device alone, so one state serves
-/// the graphs of every ML epoch; each call's first epoch resets the state.
+/// ML's conjugate-gradient state and line-search scratch, sized by the device and the
+/// position model alone, so one state serves the graphs of every ML epoch of that model; each
+/// call's first epoch resets the state.
 struct MlState {
-    /// One plan per stack length, indexed by [`Frames::plan`].
+    /// The line search's stacks, cut by its fields and moved probes.
+    cut: Cut,
+    /// One plan per stack length of `cut`, indexed by [`Frames::plan`].
     plans: Vec<Plan2d>,
     /// The last cycle's gradient, object then probe.
     h: [DeviceBuffer<C32>; 2],
@@ -567,7 +748,9 @@ struct MlState {
     /// The line-search pairs of every frame's pixel chunks ([`crate::gpu::gamma_parts`]).
     gamma_parts: DeviceBuffer<f32>,
     gamma: DeviceBuffer<f32>,
-    /// The calculated photons over the unmasked pixels of every frame.
+    /// The calculated photons over the unmasked pixels of each frame.
+    photons: DeviceBuffer<f32>,
+    /// Their sum over the scan.
     icalc: DeviceBuffer<f32>,
     fields: GammaStacks,
     /// The line search's moved probes, once an ML call has run under the position model.
@@ -576,6 +759,7 @@ struct MlState {
 
 /// An [`MlState`] lent to an epoch.
 pub(super) struct MlBufs<'a> {
+    pub cut: &'a Cut,
     pub plans: Plans<'a>,
     pub h: &'a mut [DeviceBuffer<C32>; 2],
     pub d: &'a mut [DeviceBuffer<C32>; 2],
@@ -583,40 +767,53 @@ pub(super) struct MlBufs<'a> {
     pub beta: &'a mut DeviceBuffer<f32>,
     pub gamma_parts: &'a mut DeviceBuffer<f32>,
     pub gamma: &'a mut DeviceBuffer<f32>,
+    pub photons: &'a mut DeviceBuffer<f32>,
     pub icalc: &'a mut DeviceBuffer<f32>,
     pub fields: &'a mut GammaStacks,
     pub moved: Option<&'a mut MlMoved>,
 }
 
 impl MlState {
-    /// For the device's stacks of `stack_size` frames, whose buffers hold `stack_len` values,
-    /// and arrays of `lens = [object, probe]` values.
+    /// For frames of `dims` cut by `rule`, arrays of `lens = [object, probe]` values and with
+    /// `moved` the position model.
     fn new(
         stream: &Arc<CudaStream>,
+        kernels: &Kernels,
         dims: &ViewDims,
-        stack_size: u32,
-        stack_len: usize,
+        rule: StackRule,
         lens: [usize; 2],
+        moved: bool,
     ) -> Result<Self, EngineError> {
-        let (_, plan_lens) = split(dims.nframe, stack_size);
+        // The fields po, a, b: `gamma_fields`, the transform, `gamma_frames`; under the
+        // position the moved probes of P and dP: `shifted_rows_fwd`, `shift_w`,
+        // `obj_wave_to_psi`.
+        let mut streamed = vec![Streamed::new(3 * wave_bytes(dims), 3)];
+        if moved {
+            streamed.push(Streamed::new(2 * plane_bytes::<C32>(dims, dims.nprobe), 3));
+        }
+        let cut = rule.cut(stream, dims, &streamed)?;
         let zeroed = |len| DeviceBuffer::<C32>::zeroed(stream, len);
         let pair = || DeviceBuffer::<f32>::zeroed(stream, 2);
         Ok(Self {
-            plans: plans(stream, dims, &plan_lens)?,
+            plans: cut.plans(stream, dims)?,
             h: [zeroed(lens[0])?, zeroed(lens[1])?],
             d: [zeroed(lens[0])?, zeroed(lens[1])?],
             parts: DeviceBuffer::zeroed(stream, 4 * CG_BLOCKS as usize)?,
             beta: pair()?,
             gamma_parts: DeviceBuffer::zeroed(stream, 2 * crate::gpu::gamma_parts(dims)? as usize)?,
             gamma: pair()?,
+            photons: DeviceBuffer::zeroed(stream, dims.nframe as usize)?,
             icalc: DeviceBuffer::zeroed(stream, 1)?,
-            fields: GammaStacks::zeroed(stream, stack_len)?,
-            moved: None,
+            fields: GammaStacks::zeroed(stream, cut.wave_len(dims))?,
+            moved: (moved.then(|| MlMoved::new(stream, kernels, dims, cut.table.nf_max())))
+                .transpose()?,
+            cut,
         })
     }
 
     fn lend(&mut self) -> MlBufs<'_> {
         MlBufs {
+            cut: &self.cut,
             plans: Plans(&mut self.plans),
             h: &mut self.h,
             d: &mut self.d,
@@ -624,6 +821,7 @@ impl MlState {
             beta: &mut self.beta,
             gamma_parts: &mut self.gamma_parts,
             gamma: &mut self.gamma,
+            photons: &mut self.photons,
             icalc: &mut self.icalc,
             fields: &mut self.fields,
             moved: self.moved.as_mut(),
@@ -657,7 +855,7 @@ struct BhState {
     size: u32,
     /// Each batch's range of `stacks`.
     batches: Vec<Range<usize>>,
-    /// The batches cut into stacks of the device's stack size, one table entry each.
+    /// The batches cut into stacks, one table entry each.
     stacks: Vec<Frames>,
     table: StackTable,
     /// One plan per stack length, indexed by [`Frames::plan`].
@@ -699,29 +897,51 @@ pub(super) struct BhBufs<'a> {
 }
 
 impl BhState {
-    /// For `views` in batches of `size` frames cut into stacks of `stack_size`, arrays of
-    /// `lens = [object, probe]` values and with `moved` the position model; the epoch order
-    /// is the scan's.
+    /// For `views` in batches of `size` frames, each cut into stacks by `rule`, and arrays of
+    /// `lens = [object, probe]` values; under the position model, `scratch` holds the frames
+    /// per stack of the shared scratch, whose shift planes its sums borrow, which caps its
+    /// stacks. The epoch order is the scan's.
     fn new(
         stream: &Arc<CudaStream>,
         kernels: &Kernels,
         views: &Views,
         size: u32,
-        stack_size: u32,
+        rule: StackRule,
         lens: [usize; 2],
-        moved: bool,
+        scratch: Option<u32>,
     ) -> Result<Self, EngineError> {
         let dims = views.dims();
-        let ((stacks, table, plan_lens), batches) = batch_stacks(stream, dims, size, stack_size)?;
-        let len = stack_buf_len(dims, &table);
+        // psi, r, lu, lv, each written by one pass and transformed or read by later ones;
+        // under the position also y (`obj_conj`, the transform, `pos_grad`), the moved probes
+        // (`shifted_rows_fwd`, `shift_w`, `obj_wave_to_psi`) and the shift planes of the
+        // shared scratch, which `shifted_psi_sums` writes and reads.
+        let wave = wave_bytes(dims);
+        let mut streamed = vec![Streamed::new(4 * wave, 3)];
+        if scratch.is_some() {
+            streamed.extend([
+                Streamed::new(wave, 3),
+                Streamed::new(plane_bytes::<C32>(dims, dims.nprobe), 3),
+                Streamed::new(FusedBufs::shift_bytes(dims), 2),
+            ]);
+        }
+        let frames = rule.frames(&streamed)?;
+        let frames = scratch.map_or(frames, |s| frames.min(s));
+        let (cut, batches) = batch_stacks(stream, dims, size, frames)?;
+        let len = cut.wave_len(dims);
+        let plans = cut.plans(stream, dims)?;
+        let Cut {
+            frames: stacks,
+            table,
+            ..
+        } = cut;
         let slots = batches.iter().map(|b| b.len()).max().unwrap_or(0);
         let zeroed = |len| DeviceBuffer::<C32>::zeroed(stream, len);
-        let moved = moved
+        let moved = (scratch.is_some())
             .then(|| BhMoved::new(stream, kernels, dims, table.nf_max(), slots, len))
             .transpose()?;
         Ok(Self {
             size,
-            plans: plans(stream, dims, &plan_lens)?,
+            plans,
             psi: (0..slots).map(|_| zeroed(len)).collect::<Result<_, _>>()?,
             r: (0..slots).map(|_| zeroed(len)).collect::<Result<_, _>>()?,
             lu: zeroed(len)?,
@@ -811,9 +1031,15 @@ impl RpieScratch {
         moved: bool,
     ) -> Result<Self, EngineError> {
         let dims = views.dims();
-        let (batches, table, lens) =
-            stacks(stream, dims, to_u32("batch_size", params.batch_size)?)?;
-        let len = stack_buf_len(dims, &table);
+        let batch = to_u32("batch_size", params.batch_size)?;
+        let (cut, _) = batch_stacks(stream, dims, batch, batch)?;
+        let len = cut.wave_len(dims);
+        let plans = cut.plans(stream, dims)?;
+        let Cut {
+            frames: batches,
+            table,
+            ..
+        } = cut;
         let nk_max = table.nf_max() as usize * dims.nmode as usize;
         let n = to_u32("frame size", plane_len(dims))?;
         let max_groups = PowerMax {
@@ -824,7 +1050,7 @@ impl RpieScratch {
         Ok(Self {
             batches,
             n,
-            plans: plans(stream, dims, &lens)?,
+            plans,
             psi: DeviceBuffer::zeroed(stream, len)?,
             dlt: DeviceBuffer::zeroed(stream, len)?,
             max_chunks: DeviceBuffer::zeroed(stream, max_groups.chunks())?,
@@ -856,13 +1082,6 @@ impl RpieScratch {
     }
 }
 
-/// One stack's buffers, sized like every stack's for the table's `nf_max` frames.
-struct StackBufs {
-    frames: Frames,
-    /// Exit waves of the stack's views; planes past `nf * nmode` stay zero.
-    psi: DeviceBuffer<C32>,
-}
-
 /// The [`Device`] lent to a cycle, but for its [`PassesMut`]: references only, so a cycle
 /// launches on every buffer but rebinding a field leaves the `Device` as it was.
 pub(super) struct Bufs<'a> {
@@ -870,6 +1089,7 @@ pub(super) struct Bufs<'a> {
     pub rpie: &'a RpieKernels,
     pub grad: &'a GradKernels,
     pub bh: &'a BhKernels,
+    pub exit: ExitPass<'a>,
     pub tile: &'a TileDots,
     pub views: &'a Views,
     pub counts: &'a DeviceBuffer<u16>,
@@ -879,10 +1099,10 @@ pub(super) struct Bufs<'a> {
     pub probe_sums: &'a mut UpdateSums,
     pub obj_len: u32,
     pub probe_len: u32,
-    pub table: &'a StackTable,
-    pub stacks: Stacks<'a>,
-    /// The stacks of the fused passes that stream only the shared scratch.
-    pub wide: &'a StackTable,
+    /// The stacks of the passes that stream the shared scratch alone.
+    pub scratch: &'a Cut,
+    /// DM's or RAAR's carried stacks, once a run of either has built them.
+    pub carried: Option<CarriedMut<'a>>,
     /// A stack's LLK partials, which [`crate::gpu::RecordWriter::push`] then copies into the
     /// record.
     pub llk: &'a mut DeviceBuffer<LlkPartial>,
@@ -898,29 +1118,6 @@ pub(super) struct Bufs<'a> {
     pub features: FeaturesMut<'a>,
 }
 
-/// The stacks lent to a cycle, one at a time.
-pub(super) struct Stacks<'a>(&'a mut [StackBufs]);
-
-/// Stack `s` lent to a cycle.
-pub(super) struct StackMut<'a> {
-    pub frames: &'a Frames,
-    pub psi: &'a mut DeviceBuffer<C32>,
-}
-
-impl Stacks<'_> {
-    pub fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    pub fn get(&mut self, s: usize) -> StackMut<'_> {
-        let st = &mut self.0[s];
-        StackMut {
-            frames: &st.frames,
-            psi: &mut st.psi,
-        }
-    }
-}
-
 /// The cuFFT plans lent to a cycle, by [`Frames::plan`].
 pub(super) struct Plans<'a>(&'a mut [Plan2d]);
 
@@ -932,59 +1129,48 @@ impl Plans<'_> {
 
 impl Device {
     /// Loads the kernels and uploads the views, counts and starting arrays on a new stream of
-    /// `ctx`; the stacks cut `0 .. nframe` as [`stack_frames`] gives for `ctx`'s L2, the LLK ring
+    /// `ctx`; every pass cuts `0 .. nframe` by the [`StackRule`] of `ctx`'s L2, the LLK ring
     /// holds `options.llk_slots` records of every frame, its unmasked pixels counted here, and
-    /// `options.fused` picks the [`Passes`].
+    /// `options.fused` picks the [`Passes`], of which only the fused run a propagator's stage.
     pub fn new(
         ctx: &Arc<CudaContext>,
         dims: ViewDims,
-        addrs: &[ViewAddr],
-        counts: &[u16],
-        obj: &[C32],
-        probe: &[C32],
+        uploads: Uploads<'_>,
         options: GpuOptions,
     ) -> Result<Self, EngineError> {
+        let Uploads {
+            stage,
+            scale,
+            addrs,
+            counts,
+            obj,
+            probe,
+        } = uploads;
         let stream = ctx.new_stream()?;
         let kernels = Kernels::load(ctx)?;
         let rpie = RpieKernels::load(&kernels)?;
         let grad = GradKernels::load(&kernels)?;
         let bh = BhKernels::load(&kernels)?;
-        let views = Views::new(&stream, dims, addrs)?;
-        let tile = TileDots::new(&stream, &dims)?;
-        let [wide_size, stack_size] =
-            stack_frames(options.stack_size, ctx.l2_cache_size_bytes()?, &dims)?;
-        let (frames, table, lens) = stacks(&stream, &dims, stack_size)?;
-        let wide = stacks(&stream, &dims, wide_size)?.1;
-        let len = stack_buf_len(&dims, &table);
-        let nf_max = nf_max(&wide, &table);
-        let passes = if options.fused {
-            let f = FusedBufs::new(&stream, &dims, nf_max).map_err(|e| match e {
-                GpuError::Shape(m) => EngineError::Invalid(format!(
-                    "{m}; GpuOptions {{ fused: false, .. }} runs M1's launches instead"
-                )),
-                e => e.into(),
-            })?;
-            Passes::Fused(Box::new(f))
-        } else {
-            Passes::M1 {
-                plans: plans(&stream, &dims, &lens)?,
-                scratch: DeviceBuffer::zeroed(&stream, len)?,
+        let optics = OpticsKernels::load(&kernels)?;
+        let exit = match stage {
+            PlaneStage::None => ExitStage::None,
+            _ if !options.fused => {
+                return Err(EngineError::Invalid(
+                    "a propagator with a plane stage needs GpuOptions { fused: true, .. }".into(),
+                ));
+            }
+            PlaneStage::Reverse => ExitStage::Reverse,
+            PlaneStage::Transfer(tf) => {
+                ExitStage::Transfer(DeviceBuffer::from_host(&stream, &to_c32(tf))?)
             }
         };
-        let stacks = frames
-            .into_iter()
-            .map(|frames| {
-                Ok(StackBufs {
-                    frames,
-                    psi: DeviceBuffer::zeroed(&stream, len)?,
-                })
-            })
-            .collect::<Result<Vec<_>, EngineError>>()?;
+        let views = Views::new(&stream, dims, addrs)?;
+        let tile = TileDots::new(&stream, &dims)?;
+        let rule = StackRule::new(options.stack_size, ctx.l2_cache_size_bytes()?);
+        let shared = Shared::new(&stream, &dims, rule, options.fused, false)?;
         let mut dev = Self {
             obj_len: to_u32("object length", obj.len())?,
             probe_len: to_u32("probe length", probe.len())?,
-            llk: DeviceBuffer::zeroed(&stream, nf_max as usize)?,
-            llk_scratch: LlkScratch::new(&stream, &dims, table.nf_max())?,
             norms: NormBufs::zeroed(&stream)?,
             ring: LlkRing::new(
                 &kernels,
@@ -1001,12 +1187,14 @@ impl Device {
             rpie,
             grad,
             bh,
+            optics,
+            exit,
+            scale,
             tile,
             views,
-            table,
-            stacks,
-            wide,
-            passes,
+            rule,
+            shared,
+            carried: None,
             use_graph: options.graph,
             runs: Vec::new(),
             llk_graph: None,
@@ -1014,8 +1202,6 @@ impl Device {
             bh_state: None,
             lsqml: None,
             features: FeatureBufs::default(),
-            stack_size,
-            wide_size,
             stream,
         };
         let ctx = dev.context();
@@ -1038,9 +1224,10 @@ impl Device {
     /// values of the features already set are written in place; other features replace the
     /// buffers, and so first drop every graph, which addresses them, and then recapture the
     /// LLK pass's. Only the fused passes model features; a position also takes their
-    /// scratch of a shift, which they drop again with it.
+    /// scratch of a shift, which they drop again with it, and so recuts the stacks that
+    /// stream that scratch and drops DM's or RAAR's carried stacks, cut against it.
     pub fn set_features(&mut self, features: &Features) -> Result<(), EngineError> {
-        if matches!(self.passes, Passes::M1 { .. }) && *features != Features::default() {
+        if matches!(self.shared.passes, Passes::M1 { .. }) && *features != Features::default() {
             return Err(EngineError::Invalid(
                 "features need GpuOptions { fused: true, .. }".into(),
             ));
@@ -1067,7 +1254,11 @@ impl Device {
             return Ok(());
         }
         let stream = &self.stream;
-        let nf_max = nf_max(&self.wide, &self.table);
+        let dims = self.views.dims();
+        let shared = (have.position.is_some() != position.is_some())
+            .then(|| Shared::new(stream, dims, self.rule, true, position.is_some()))
+            .transpose()?;
+        let nf_max = shared.as_ref().unwrap_or(&self.shared).cut.table.nf_max();
         let scale = scale
             .map(|v| {
                 Ok::<_, EngineError>(ScaleBufs {
@@ -1083,25 +1274,12 @@ impl Device {
                 nobs.copy_from_device_async(pixel_frames, stream)?;
                 Ok::<_, EngineError>(BackgroundBufs {
                     values: DeviceBuffer::from_host(stream, &v)?,
-                    sums: BackgroundSums::zeroed(stream, self.views.dims(), nf_max)?,
+                    sums: BackgroundSums::zeroed(stream, dims, nf_max)?,
                     nobs,
                     photons: DeviceBuffer::zeroed(stream, 1)?,
                 })
             })
             .transpose()?;
-        let dims = self.views.dims();
-        let passes = if have.position.is_some() == position.is_some() {
-            None
-        } else {
-            let bufs = match position {
-                Some(_) => FusedBufs::with_shift(stream, dims, nf_max),
-                None => FusedBufs::new(stream, dims, nf_max),
-            };
-            Some(Passes::Fused(Box::new(bufs.map_err(|e| match e {
-                GpuError::Shape(m) => EngineError::Invalid(format!("position model: {m}")),
-                e => e.into(),
-            })?)))
-        };
         let position = position
             .map(|v| {
                 Ok::<_, EngineError>(PositionBufs {
@@ -1120,8 +1298,9 @@ impl Device {
             background,
             position,
         };
-        if let Some(passes) = passes {
-            self.passes = passes;
+        if let Some(shared) = shared {
+            self.shared = shared;
+            self.carried = None;
         }
         self.capture_llk()?;
         Ok(())
@@ -1194,6 +1373,11 @@ impl Device {
             rpie: &self.rpie,
             grad: &self.grad,
             bh: &self.bh,
+            exit: ExitPass {
+                kernels: &self.optics,
+                stage: &self.exit,
+                scale: self.scale,
+            },
             tile: &self.tile,
             views: &self.views,
             counts: &self.counts,
@@ -1203,11 +1387,10 @@ impl Device {
             probe_sums: &mut self.probe_sums,
             obj_len: self.obj_len,
             probe_len: self.probe_len,
-            table: &self.table,
-            stacks: Stacks(&mut self.stacks),
-            wide: &self.wide,
-            llk: &mut self.llk,
-            llk_scratch: &mut self.llk_scratch,
+            scratch: &self.shared.cut,
+            carried: self.carried.as_deref_mut().map(CarriedBufs::lend),
+            llk: &mut self.shared.llk,
+            llk_scratch: &mut self.shared.llk_scratch,
             norms: &mut self.norms,
             ml: self.ml.as_deref_mut().map(MlState::lend),
             bh_state: self.bh_state.as_deref_mut().map(BhState::lend),
@@ -1232,7 +1415,7 @@ impl Device {
                 }),
             },
         };
-        let passes = match &mut self.passes {
+        let passes = match &mut self.shared.passes {
             Passes::M1 { plans, scratch } => PassesMut::M1(M1Bufs {
                 plans: Plans(plans),
                 scratch,
@@ -1334,6 +1517,10 @@ impl Device {
     ) -> Result<(), EngineError> {
         let mut runs = std::mem::take(&mut self.runs);
         runs.retain(|r| r.cycle.epoch().run() == epoch.run());
+        if self.carried.as_ref().is_some_and(|c| !c.serves(epoch)) {
+            // The runs left are all of `epoch.run()`, so none binds them.
+            self.carried = None;
+        }
         let at = match runs.iter().position(|r| r.cycle.epoch() == epoch) {
             Some(at) => Ok(at),
             None => self.new_run(epoch).map(|run| {
@@ -1385,11 +1572,37 @@ impl Device {
         Ok(self.ring.flush(&self.context())?)
     }
 
+    /// Fails under a propagator with a plane stage for the passes that run none: the LLK
+    /// pass, LSQML's, BH's and rPIE's do, AP's, DM's and RAAR's at fixed positions only, and
+    /// every other is enqueued behind this.
+    fn stageless(&self, algorithm: Algorithm) -> Result<(), EngineError> {
+        let moved = self.features.position.is_some();
+        match (&self.exit, algorithm) {
+            (ExitStage::None, _) | (_, Algorithm::Lsqml | Algorithm::Bh | Algorithm::Rpie) => {
+                Ok(())
+            }
+            (_, Algorithm::Ap | Algorithm::Dm | Algorithm::Raar) if !moved => Ok(()),
+            _ => Err(EngineError::Invalid(format!(
+                "{algorithm:?}{} runs no propagator with a plane stage: angular spectrum, or a \
+                 Fresnel transform back in distance",
+                if moved { " with a position" } else { "" }
+            ))),
+        }
+    }
+
     /// The buffers of `epoch`'s cycle, and with graphs its graph, captured from them.
     fn new_run(&mut self, epoch: Epoch) -> Result<EpochRun, EngineError> {
+        self.stageless(epoch.algorithm())?;
         let mut cycle = match epoch {
             Epoch::Ap { params, llk } => Cycle::Ap { params, llk },
-            Epoch::Dm { params, first } => Cycle::Dm { params, first },
+            Epoch::Dm { params, first } => {
+                self.build_carried(false)?;
+                Cycle::Dm { params, first }
+            }
+            Epoch::Raar { params, first } => {
+                self.build_carried(true)?;
+                Cycle::Raar { params, first }
+            }
             Epoch::Rpie(p) => {
                 let moved = self.features.position.is_some();
                 let scratch = RpieScratch::new(
@@ -1423,22 +1636,27 @@ impl Device {
         Ok(EpochRun { cycle, graph })
     }
 
-    /// Builds the [`MlState`] if no ML call has yet, and its [`MlMoved`] under the position
-    /// model if no ML call under it has yet.
+    /// Builds DM's, or with `raar` RAAR's, [`CarriedBufs`] unless [`Self::steady_with`] kept
+    /// them for this run.
+    fn build_carried(&mut self, raar: bool) -> Result<(), EngineError> {
+        if self.carried.is_none() {
+            let dims = self.dims();
+            let c = CarriedBufs::new(&self.stream, &dims, self.rule, &self.shared, raar)?;
+            self.carried = Some(Box::new(c));
+        }
+        Ok(())
+    }
+
+    /// Builds the [`MlState`] for the position model unless it is built. One of the other
+    /// model is replaced only after [`Self::set_features`] has dropped every run, so no
+    /// graph captured from it survives.
     fn build_ml(&mut self) -> Result<(), EngineError> {
-        let dims = self.dims();
-        let ml = match &mut self.ml {
-            Some(ml) => ml,
-            None => {
-                let stack_len = stack_buf_len(&dims, &self.table);
-                let lens = [self.obj.len(), self.probe.len()];
-                let state = MlState::new(&self.stream, &dims, self.stack_size, stack_len, lens)?;
-                self.ml.insert(Box::new(state))
-            }
-        };
-        if self.features.position.is_some() && ml.moved.is_none() {
-            let moved = MlMoved::new(&self.stream, &self.kernels, &dims, self.table.nf_max())?;
-            ml.moved = Some(moved);
+        let moved = self.features.position.is_some();
+        if (self.ml.as_ref()).is_none_or(|ml| ml.moved.is_some() != moved) {
+            let lens = [self.obj.len(), self.probe.len()];
+            let dims = self.dims();
+            let state = MlState::new(&self.stream, &self.kernels, &dims, self.rule, lens, moved)?;
+            self.ml = Some(Box::new(state));
         }
         Ok(())
     }
@@ -1458,9 +1676,9 @@ impl Device {
                 &self.kernels,
                 &self.views,
                 size,
-                self.stack_size,
+                self.rule,
                 lens,
-                moved,
+                moved.then(|| self.shared.cut.table.nf_max()),
             )?;
             self.bh_state = Some(Box::new(state));
         }
@@ -1481,8 +1699,8 @@ impl Device {
                 &self.kernels,
                 &self.views,
                 size,
-                self.wide_size,
-                moved,
+                self.rule,
+                moved.then(|| self.shared.cut.table.nf_max()),
             )?;
             self.lsqml = Some(Box::new(state));
         }
@@ -1491,6 +1709,7 @@ impl Device {
 
     /// [`Bufs::scale_to_photons`] enqueued eagerly, with `total` the unmasked observed photons.
     pub fn scale_to_photons(&mut self, total: f32) -> Result<(), EngineError> {
+        self.stageless(Algorithm::Ml)?;
         self.build_ml()?;
         let ctx = self.context();
         let (mut bufs, mut passes, _) = self.lend();
@@ -1508,11 +1727,11 @@ impl Device {
     /// The ML gradients of the current estimate, object then probe, as
     /// [`Bufs::ml_grad`] leaves them in the update sums; downloads them and zeroes the sums.
     pub fn ml_grads(&mut self) -> Result<[Vec<C32>; 2], EngineError> {
-        self.build_ml()?;
+        self.stageless(Algorithm::Ml)?;
         {
             let ctx = self.context();
             let (mut bufs, mut passes, _) = self.lend();
-            bufs.with_ml(|b, ml| b.ml_grad(&ctx, &mut passes, ml, [true, true], None))?;
+            bufs.ml_grad(&ctx, &mut passes, [true, true], None)?;
         }
         let grads = [
             self.obj_sums.num.to_host_vec(&self.stream)?,
@@ -1577,6 +1796,17 @@ impl<'a> Bufs<'a> {
         r
     }
 
+    /// `f` on these buffers and DM's or RAAR's carried stacks, lent apart.
+    pub(super) fn with_carried<R>(
+        &mut self,
+        f: impl FnOnce(&mut Self, &mut CarriedMut<'a>) -> R,
+    ) -> R {
+        let mut c = (self.carried.take()).expect("Device::new_run built the carried stacks");
+        let r = f(self, &mut c);
+        self.carried = Some(c);
+        r
+    }
+
     /// `f` on these buffers and BH's state, lent apart.
     pub(super) fn with_bh<R>(&mut self, f: impl FnOnce(&mut Self, &mut BhBufs<'a>) -> R) -> R {
         let mut bh = self
@@ -1601,9 +1831,12 @@ impl<'a> Bufs<'a> {
             Cycle::Ap { params, llk } => {
                 self.ap_cycle(ctx, passes, params, llk.then(|| ring.record()))
             }
-            Cycle::Dm { params, first } => {
-                self.dm_cycle(ctx, passes, params, *first).map(|()| None)
-            }
+            Cycle::Dm { params, first } => self
+                .with_carried(|b, c| b.dm_cycle(ctx, passes, c, params, *first))
+                .map(|()| None),
+            Cycle::Raar { params, first } => self
+                .with_carried(|b, c| b.raar_cycle(ctx, passes, c, params, *first))
+                .map(|()| None),
             Cycle::Rpie(p, scratch) => self.rpie_epoch(ctx, p, &mut scratch.lend()).map(|()| None),
             Cycle::Ml { params, first, llk } => self.with_ml(|b, ml| {
                 b.ml_epoch(ctx, passes, ml, params, *first, llk.then(|| ring.record()))

@@ -12,7 +12,7 @@ use crate::gpu::{
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaStream, DeviceBuffer};
 
-use super::device::{MlBufs, PassesMut};
+use super::device::{M1Bufs, MlBufs, PassesMut};
 use super::{Bufs, Epoch, GpuPtycho, plane_len};
 use crate::engine::ptycho::llk_due;
 use crate::engine::{EngineError, MlParams};
@@ -117,7 +117,7 @@ impl Bufs<'_> {
         {
             self.projected_position_sums(ctx, f)?;
         }
-        let ended = self.ml_grad(ctx, passes, ml, update, llk)?.or(stepped);
+        let ended = self.ml_grad(ctx, passes, update, llk)?.or(stepped);
 
         // β from the gradients in the sums and the last ones in h (then h = g), and d.
         let lens = [self.obj_len, self.probe_len];
@@ -143,7 +143,9 @@ impl Bufs<'_> {
         // γ along d, then the step. Under a position, the fields are those of the moved
         // probes W of P and W' of dP: po = O W, a = dO W + O W', b = dO W'.
         let dims = *self.views.dims();
-        let m = self.features.lend(ctx, self.kernels, &dims, self.probe)?;
+        let m = self
+            .features
+            .lend(ctx, self.kernels, &dims, self.probe, self.exit)?;
         let obs = GammaCounts {
             counts: self.counts,
             model: Model {
@@ -173,9 +175,8 @@ impl Bufs<'_> {
                 ));
             }
         };
-        for s in 0..self.stacks.len() {
-            let stack = self.table.at(s);
-            let frames = &self.stacks.get(s).frames;
+        for s in 0..ml.cut.len() {
+            let (stack, frames) = (ml.cut.at(s), &ml.cut.frames[s]);
             let d = [&ml.d[0], &ml.d[1]];
             match &mut moved {
                 None => {
@@ -239,8 +240,10 @@ impl Bufs<'_> {
         f: &mut FusedBufs,
     ) -> Result<(), GpuError> {
         let dims = *self.views.dims();
-        let mut m = self.features.lend(ctx, self.kernels, &dims, self.probe)?;
-        for s in 0..self.wide.len() {
+        let mut m = self
+            .features
+            .lend(ctx, self.kernels, &dims, self.probe, self.exit)?;
+        for s in 0..self.scratch.len() {
             let inputs = FusedInputs {
                 views: self.views,
                 counts: self.counts,
@@ -256,7 +259,7 @@ impl Bufs<'_> {
                 ..FusedSums::default()
             };
             self.kernels
-                .fused_project(ctx, &inputs, self.wide.at(s), exit, f, sums)?;
+                .fused_project(ctx, &inputs, self.scratch.at(s), exit, f, sums)?;
         }
         Ok(())
     }
@@ -269,15 +272,14 @@ impl Bufs<'_> {
         &mut self,
         ctx: &ExecutionContext,
         passes: &mut PassesMut<'_>,
-        ml: &mut MlBufs<'_>,
         update: [bool; 2],
         mut llk: Option<RecordWriter<'_>>,
     ) -> Result<Option<Ended>, GpuError> {
         match passes {
             PassesMut::Fused(f) => self.fused_grad(ctx, f, update, llk.as_mut())?,
-            PassesMut::M1(_) => {
-                for s in 0..self.stacks.len() {
-                    self.m1_grad(ctx, ml, s, update, llk.as_mut())?;
+            PassesMut::M1(m1) => {
+                for s in 0..self.scratch.len() {
+                    self.m1_grad(ctx, m1, s, update, llk.as_mut())?;
                 }
             }
         }
@@ -294,9 +296,11 @@ impl Bufs<'_> {
         mut llk: Option<&mut RecordWriter<'_>>,
     ) -> Result<(), GpuError> {
         let dims = *self.views.dims();
-        let mut m = self.features.lend(ctx, self.kernels, &dims, self.probe)?;
-        for s in 0..self.wide.len() {
-            let stack = self.wide.at(s);
+        let mut m = self
+            .features
+            .lend(ctx, self.kernels, &dims, self.probe, self.exit)?;
+        for s in 0..self.scratch.len() {
+            let stack = self.scratch.at(s);
             let inputs = FusedInputs {
                 views: self.views,
                 counts: self.counts,
@@ -327,23 +331,23 @@ impl Bufs<'_> {
         Ok(())
     }
 
-    /// Stack `s` of [`Self::ml_grad`] by M1's launches in `ml.fields.po`: exit waves, forward
+    /// Stack `s` of [`Self::ml_grad`] by M1's launches in its scratch: exit waves, forward
     /// FFT, the LLK partials, [`crate::gpu::GradKernels::poisson_grad`], inverse FFT,
     /// back-projection.
     fn m1_grad(
         &mut self,
         ctx: &ExecutionContext,
-        ml: &mut MlBufs<'_>,
+        m1: &mut M1Bufs<'_>,
         s: usize,
         update: [bool; 2],
         llk: Option<&mut RecordWriter<'_>>,
     ) -> Result<(), GpuError> {
         let dims = *self.views.dims();
-        let stack = self.table.at(s);
-        let psi = &mut ml.fields.po;
+        let stack = self.scratch.at(s);
+        let psi = &mut *m1.scratch;
         self.kernels
             .obj_probe_to_psi(ctx, self.views, stack, self.obj, self.probe, psi)?;
-        let plan = ml.plans.get(self.stacks.get(s).frames.plan);
+        let plan = m1.plans.get(self.scratch.frames[s].plan);
         plan.forward_inplace(ctx, psi)?;
         if let Some(rec) = llk {
             self.kernels
@@ -367,8 +371,8 @@ impl Bufs<'_> {
     /// [`crate::engine::Ptycho::scale_obj_probe`] on the device, `total` being the unmasked observed
     /// photons: the calculated photons of the exit waves over the same unmasked pixels, each
     /// frame's times its intensity scale (stack by stack, by the LLK pass `passes` hold, the
-    /// fused one under the position model), then [`Bufs::scale_obj_probe`], all without a
-    /// host sync.
+    /// fused one under the position model) and summed in frame order, then
+    /// [`Bufs::scale_obj_probe`], all without a host sync.
     pub(super) fn scale_to_photons(
         &mut self,
         ctx: &ExecutionContext,
@@ -376,35 +380,36 @@ impl Bufs<'_> {
         ml: &mut MlBufs<'_>,
         total: f32,
     ) -> Result<(), GpuError> {
-        crate::gpu::zero(ctx, ml.icalc)?;
         let dims = *self.views.dims();
         match passes {
-            PassesMut::M1(_) => {
-                let psi = &mut ml.fields.po;
-                for s in 0..self.stacks.len() {
-                    let stack = self.table.at(s);
+            PassesMut::M1(m1) => {
+                let psi = &mut *m1.scratch;
+                for s in 0..self.scratch.len() {
+                    let stack = self.scratch.at(s);
                     self.kernels
                         .obj_probe_to_psi(ctx, self.views, stack, self.obj, self.probe, psi)?;
-                    ml.plans
-                        .get(self.stacks.get(s).frames.plan)
+                    m1.plans
+                        .get(self.scratch.frames[s].plan)
                         .forward_inplace(ctx, psi)?;
                     self.kernels
                         .llk(ctx, stack, self.counts, psi, self.llk_scratch, self.llk)?;
                     let scale = self.features.scale();
                     self.grad
-                        .icalc_add(ctx, &dims, stack, self.llk, scale, ml.icalc)?;
+                        .icalc_frames(ctx, &dims, stack, self.llk, scale, ml.photons)?;
                 }
             }
             PassesMut::Fused(f) => {
-                let m = self.features.lend(ctx, self.kernels, &dims, self.probe)?;
+                let m = self
+                    .features
+                    .lend(ctx, self.kernels, &dims, self.probe, self.exit)?;
                 // The exit waves' photons alone: icalc_add scales them, and
                 // scale_obj_probe takes the background's off the total.
                 let model = Model {
                     shift: m.model.shift,
                     ..Model::default()
                 };
-                for s in 0..self.stacks.len() {
-                    let stack = self.table.at(s);
+                for s in 0..self.scratch.len() {
+                    let stack = self.scratch.at(s);
                     let inputs = FusedInputs {
                         views: self.views,
                         counts: self.counts,
@@ -417,11 +422,18 @@ impl Bufs<'_> {
                         ..FarSums::default()
                     };
                     self.kernels.fused_llk(ctx, &inputs, stack, f, far)?;
-                    self.grad
-                        .icalc_add(ctx, &dims, stack, self.llk, m.model.scale, ml.icalc)?;
+                    self.grad.icalc_frames(
+                        ctx,
+                        &dims,
+                        stack,
+                        self.llk,
+                        m.model.scale,
+                        ml.photons,
+                    )?;
                 }
             }
         }
+        self.grad.sum_values(ctx, ml.photons, ml.icalc)?;
         self.scale_obj_probe(ctx, Some((&*ml.icalc, total)))
     }
 }
