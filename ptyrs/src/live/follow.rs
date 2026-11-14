@@ -1011,6 +1011,22 @@ mod tests {
         llk: Vec<f64>,
     }
 
+    /// What `consumer` sends once it can take frames, or its own error if it
+    /// ended before that.
+    fn ready<T, R, E: std::fmt::Debug>(
+        rx: Receiver<T>,
+        consumer: std::thread::JoinHandle<Result<R, E>>,
+    ) -> (T, std::thread::JoinHandle<Result<R, E>>) {
+        match rx.recv() {
+            Ok(sent) => (sent, consumer),
+            Err(_) => match consumer.join() {
+                Ok(Err(e)) => panic!("the consumer failed before it could take frames: {e:?}"),
+                Ok(Ok(_)) => panic!("the consumer ended before it could take frames"),
+                Err(p) => std::panic::resume_unwind(p),
+            },
+        }
+    }
+
     /// A 6x6 raster of 64x64 frames, two probe modes, streamed through the
     /// ring and the uploader in bursts 20 ms apart into the consumer, which
     /// hands a viewer copies at least `preview` apart if given.
@@ -1057,7 +1073,7 @@ mod tests {
             });
             std::thread::spawn(move || run_ap_consumer(ctx, store, cfg, rx, cap_tx, preview))
         };
-        cap_rx.recv().expect("the graphs are captured");
+        let ((), consumer) = ready(cap_rx, consumer);
         let warm = WarmUp::end();
         let table = Arc::new(PosTable::new(1 << 16));
         let uploader = {
@@ -1331,7 +1347,7 @@ mod tests {
                     run_dist_consumer(&ordinals, Scheme::Strips, cfg, rx, ready_tx, preview)
                 })
             };
-            let (stores, route) = ready_rx.recv().expect("the graphs are captured");
+            let ((stores, route), consumer) = ready(ready_rx, consumer);
             assert_eq!(stores.len(), ngpu);
             let filled = stores.clone();
             let warm = WarmUp::end();

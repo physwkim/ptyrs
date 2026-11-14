@@ -6,11 +6,25 @@
 //! [`Optics::gaps`]`[s]`; the last slice's `psi` is the exit wave. [`Optics::quad`] multiplies
 //! the last slice only, where the wave leaves the object for [`Optics::exit`]. One slice
 //! is [`obj_probe_to_psi`] itself.
+//!
+//! The probe and the plane phase are fixed in the lab frame and the slices sit on the window,
+//! so a frame whose probe is moved by an offset takes the phase displaced by it. At one
+//! slice the probe's move carries the phase; with more, the last slice applies the frame's
+//! [`Optics::moved_quad`].
+
+use std::borrow::Cow;
 
 use crate::base::{C64, Object, Probe, Stack, View};
 
 use crate::engine::ops::{accumulate_obj, accumulate_probe, obj_probe_to_psi};
-use crate::engine::{Optics, shift};
+use crate::engine::{MovedQuad, Optics, shift};
+
+/// The frames' displaced plane phase on the last slice.
+struct Moved {
+    /// Per view, its frame's entry of `quads`.
+    frame: Vec<usize>,
+    quads: Vec<MovedQuad>,
+}
 
 /// The waves of `views` through the slices of an [`Optics`] at one object and probe: the wave
 /// entering each slice and the exit wave.
@@ -26,12 +40,22 @@ pub struct SliceWaves<'a> {
     /// The exit waves, one shifted plane per view.
     psi: Vec<C64>,
     unit: Vec<C64>,
+    /// `Some` where the last slice's phase differs between the frames.
+    moved: Option<Moved>,
 }
 
 impl<'a> SliceWaves<'a> {
     /// `objects` holds one object per slice of `optics`, all of one shape; view `k` reads
-    /// probe plane `views[k].probe` and object mode `views[k].obj` of every slice.
-    pub fn new(optics: &'a Optics, views: &[View], objects: &'a [Object], probe: &Probe) -> Self {
+    /// probe plane `views[k].probe` and object mode `views[k].obj` of every slice. `offsets`
+    /// holds, per frame of `views` in their order, the offset its probe planes were moved by
+    /// (`None` for unmoved planes).
+    pub fn new(
+        optics: &'a Optics,
+        views: &[View],
+        objects: &'a [Object],
+        probe: &Probe,
+        offsets: Option<&[[f64; 2]]>,
+    ) -> Self {
         assert_eq!(
             objects.len(),
             optics.nslice(),
@@ -62,24 +86,99 @@ impl<'a> SliceWaves<'a> {
             gap.forward(&mut psi);
             incident.push(Probe::new(reshift(&psi, dims)));
         }
-        let last = objects.len() - 1;
-        obj_probe_to_psi(
-            &own,
-            &objects[last],
-            &incident[last],
-            optics.quad(),
-            &mut psi,
-        );
-        Self {
+        let moved = offsets.and_then(|offsets| {
+            let quads: Option<Vec<MovedQuad>> =
+                offsets.iter().map(|&d| optics.moved_quad(d)).collect();
+            let mut frame = Vec::with_capacity(views.len());
+            for (k, v) in views.iter().enumerate() {
+                let next = k > 0 && v.frame != views[k - 1].frame;
+                frame.push(frame.last().map_or(0, |&f| f + next as usize));
+            }
+            assert_eq!(frame.last().map_or(0, |f| f + 1), offsets.len());
+            quads.map(|quads| Moved { frame, quads })
+        });
+        let mut waves = Self {
             optics,
             objects,
             views: views.to_vec(),
             probe_dims: probe.dims(),
             own,
             incident,
-            psi,
+            psi: Vec::new(),
             unit,
+            moved,
+        };
+        let last = objects.len() - 1;
+        waves.to_psi(last, &objects[last], &waves.incident[last], &mut psi);
+        waves.psi = psi;
+        waves
+    }
+
+    /// `q_s·o·w` per view on slice `s`: `o` a slice's object, `w` one natural-layout plane
+    /// per view.
+    fn to_psi(&self, s: usize, o: &Object, w: &Probe, out: &mut [C64]) {
+        obj_probe_to_psi(&self.own, o, w, self.shared(s), out);
+        if let Some(m) = self.frames(s) {
+            let [ny, nx] = w.plane_shape();
+            for (k, plane) in out.chunks_exact_mut(ny * nx).enumerate() {
+                let q = &m.quads[m.frame[k]].quad;
+                (plane.iter_mut().enumerate()).for_each(|(j, p)| *p *= q[shift(j, ny, nx)]);
+            }
         }
+    }
+
+    /// `chi` (one shifted plane per view) for the adjoints on slice `s`, which apply
+    /// `conj(shared(s))`: times the conjugate of what [`Self::to_psi`] applies past it.
+    fn dephased<'c>(&self, s: usize, chi: &'c [C64]) -> Cow<'c, [C64]> {
+        let Some(m) = self.frames(s) else {
+            return Cow::Borrowed(chi);
+        };
+        let [_, ny, nx] = self.incident[0].dims();
+        let mut out = chi.to_vec();
+        for (k, plane) in out.chunks_exact_mut(ny * nx).enumerate() {
+            let q = &m.quads[m.frame[k]].quad;
+            (plane.iter_mut().enumerate()).for_each(|(j, p)| *p *= q[shift(j, ny, nx)].conj());
+        }
+        Cow::Owned(out)
+    }
+
+    /// The frames' displaced phase where slice `s` applies it.
+    fn frames(&self, s: usize) -> Option<&Moved> {
+        self.moved.as_ref().filter(|_| s + 1 == self.objects.len())
+    }
+
+    /// The phase slice `s` applies to every view alike: 1 where it applies none or the
+    /// frames' own.
+    fn shared(&self, s: usize) -> &[C64] {
+        match self.frames(s) {
+            Some(_) => &self.unit,
+            None => self.optics.slice_quad(s).unwrap_or(&self.unit),
+        }
+    }
+
+    /// `w` (one shifted plane per view) times the derivative of the last slice's phase over
+    /// its frame's offset components `axes` (one or two) over the phase itself: applied to
+    /// [`Self::psi`], the exit waves' derivative over the offsets through the phase. `None`
+    /// where the phase does not move with the offsets.
+    pub fn phase_derivative(&self, axes: &[usize], w: &[C64]) -> Option<Vec<C64>> {
+        let m = self.moved.as_ref()?;
+        let [_, ny, nx] = self.incident[0].dims();
+        let mut out = w.to_vec();
+        for (k, plane) in out.chunks_exact_mut(ny * nx).enumerate() {
+            let q = &m.quads[m.frame[k]];
+            for (j, p) in plane.iter_mut().enumerate() {
+                let i = shift(j, ny, nx);
+                *p *= match *axes {
+                    [a] => C64::new(0.0, q.slope[a][i]),
+                    [a, c] => {
+                        let curve = if a == c { q.curve[a] } else { 0.0 };
+                        C64::new(-q.slope[a][i] * q.slope[c][i], curve)
+                    }
+                    _ => panic!("one or two offset components"),
+                };
+            }
+        }
+        Some(out)
     }
 
     /// The exit waves, one shifted plane per view, before [`Optics::exit`].
@@ -87,10 +186,13 @@ impl<'a> SliceWaves<'a> {
         &self.psi
     }
 
-    /// The object-plane phase slice `s` applies ([`Optics::slice_quad`]), 1 where it applies
-    /// none.
-    pub fn quad(&self, s: usize) -> &[C64] {
-        self.optics.slice_quad(s).unwrap_or(&self.unit)
+    /// The object-plane phase slice `s` applies to view `k`'s wave, natural layout: 1 where
+    /// it applies none.
+    pub fn quad(&self, s: usize, k: usize) -> &[C64] {
+        match self.frames(s) {
+            Some(m) => &m.quads[m.frame[k]].quad,
+            None => self.shared(s),
+        }
     }
 
     /// The wave entering slice `s`, one natural-layout plane per view; slice 0's is the views'
@@ -109,9 +211,14 @@ impl<'a> SliceWaves<'a> {
         let dims = self.incident[0].dims();
         let mut out = vec![chi.to_vec()];
         for s in (0..n - 1).rev() {
-            let up = out.last().unwrap();
-            let (h, _) =
-                accumulate_probe(&self.own, &self.objects[s + 1], dims, self.quad(s + 1), up);
+            let up = self.dephased(s + 1, out.last().unwrap());
+            let (h, _) = accumulate_probe(
+                &self.own,
+                &self.objects[s + 1],
+                dims,
+                self.shared(s + 1),
+                &up,
+            );
             let mut g = reshift(h.as_slice(), dims).into_vec();
             self.optics.gaps()[s].adjoint(&mut g);
             out.push(g);
@@ -140,13 +247,12 @@ impl<'a> SliceWaves<'a> {
         // the mixed change of the wave entering slice s, zero at slice 0
         let mut wave: Option<Probe> = None;
         for (s, o) in self.objects.iter().enumerate() {
-            let q = self.quad(s);
             match &wave {
-                Some(w) => obj_probe_to_psi(&self.own, o, w, q, &mut out),
+                Some(w) => self.to_psi(s, o, w, &mut out),
                 None => out.fill(C64::default()),
             }
             for (d, w) in [(&u.0[s], &wv[s]), (&v.0[s], &wu[s])] {
-                obj_probe_to_psi(&self.own, d, w, q, &mut cross);
+                self.to_psi(s, d, w, &mut cross);
                 out.iter_mut().zip(&cross).for_each(|(o, c)| *o += c);
             }
             if let Some(gap) = self.optics.gaps().get(s) {
@@ -171,7 +277,7 @@ impl<'a> SliceWaves<'a> {
         let mut waves = vec![Probe::new(Stack::from_vec(dims, entry).unwrap())];
         let mut out = vec![C64::default(); self.psi.len()];
         for (s, (o, d)) in self.objects.iter().zip(d_objects).enumerate() {
-            obj_probe_to_psi(&self.own, o, &waves[s], self.quad(s), &mut out);
+            self.to_psi(s, o, &waves[s], &mut out);
             self.obj_tangent(s, d)
                 .iter()
                 .zip(out.iter_mut())
@@ -188,7 +294,7 @@ impl<'a> SliceWaves<'a> {
     /// pty-chi's step sizes.
     pub fn obj_tangent(&self, s: usize, d: &Object) -> Vec<C64> {
         let mut out = vec![C64::default(); self.psi.len()];
-        obj_probe_to_psi(&self.own, d, &self.incident[s], self.quad(s), &mut out);
+        self.to_psi(s, d, &self.incident[s], &mut out);
         out
     }
 
@@ -197,7 +303,8 @@ impl<'a> SliceWaves<'a> {
     /// ([`accumulate_obj`]).
     pub fn obj_adjoint(&self, s: usize, chi_s: &[C64]) -> Stack<C64> {
         let dims = self.objects[s].dims();
-        accumulate_obj(&self.own, dims, &self.incident[s], self.quad(s), chi_s).0
+        let chi = self.dephased(s, chi_s);
+        accumulate_obj(&self.own, dims, &self.incident[s], self.shared(s), &chi).0
     }
 
     /// The probe direction from slice 0's `chi_0` and `Σ|O_0|²` per plane:
@@ -207,8 +314,8 @@ impl<'a> SliceWaves<'a> {
             &self.views,
             &self.objects[0],
             self.probe_dims,
-            self.quad(0),
-            chi_0,
+            self.shared(0),
+            &self.dephased(0, chi_0),
         )
     }
 }
@@ -245,6 +352,10 @@ mod tests {
         (addr, objects, probe)
     }
 
+    /// No offsets, and the three frames'.
+    const OFFSETS: [Option<&[[f64; 2]]>; 2] =
+        [None, Some(&[[0.3, -0.2], [-0.45, 0.1], [0.2, 0.4]])];
+
     fn far_geometry() -> Geometry {
         Geometry::new(1e-10, 1.0, 1e-4, [8, 6]).unwrap()
     }
@@ -263,8 +374,8 @@ mod tests {
     #[test]
     fn slice_jacobian_registers_as_the_adjoint_of_the_tangent() {
         let (addr, objects, probe) = setup();
-        for optics in &optics() {
-            let waves = SliceWaves::new(optics, addr.views(), &objects, &probe);
+        for (optics, offsets) in optics().iter().flat_map(|o| OFFSETS.map(|d| (o, d))) {
+            let waves = SliceWaves::new(optics, addr.views(), &objects, &probe, offsets);
             let op = SliceJacobian {
                 waves: &waves,
                 obj_dims: objects[0].dims(),
@@ -288,7 +399,7 @@ mod tests {
             a.iter().zip(d).map(|(a, d)| a + d * t).collect()
         };
         let h = 1e-5;
-        for optics in &optics() {
+        for (optics, offsets) in optics().iter().flat_map(|o| OFFSETS.map(|d| (o, d))) {
             let psi_at = |t: f64| {
                 let o: Vec<Object> = objects
                     .iter()
@@ -300,11 +411,13 @@ mod tests {
                     .collect();
                 let v = moved(probe.as_slice(), d_probe.as_slice(), t);
                 let p = Probe::new(Stack::from_vec(probe.dims(), v).unwrap());
-                SliceWaves::new(optics, addr.views(), &o, &p).psi().to_vec()
+                SliceWaves::new(optics, addr.views(), &o, &p, offsets)
+                    .psi()
+                    .to_vec()
             };
             let (plus, minus) = (psi_at(h), psi_at(-h));
-            let tangent =
-                SliceWaves::new(optics, addr.views(), &objects, &probe).tangent(&d_obj, &d_probe);
+            let tangent = SliceWaves::new(optics, addr.views(), &objects, &probe, offsets)
+                .tangent(&d_obj, &d_probe);
             let scale = tangent.iter().map(|t| t.norm()).fold(0.0, f64::max);
             let err = plus
                 .iter()
@@ -321,7 +434,7 @@ mod tests {
         let (addr, objects, probe) = setup();
         let optics = Optics::far_field(&far_geometry());
         let views = addr.views();
-        let waves = SliceWaves::new(&optics, views, &objects[..1], &probe);
+        let waves = SliceWaves::new(&optics, views, &objects[..1], &probe, None);
         let mut psi = vec![C64::default(); views.len() * 48];
         obj_probe_to_psi(views, &objects[0], &probe, optics.quad(), &mut psi);
         assert_eq!(waves.psi(), &psi[..]);
@@ -329,5 +442,96 @@ mod tests {
         assert_eq!(waves.back_propagate(&chi), vec![chi.clone()]);
         let (num, _) = accumulate_obj(views, objects[0].dims(), &probe, optics.quad(), &chi);
         assert_eq!(waves.obj_adjoint(0, &chi).as_slice(), num.as_slice());
+    }
+
+    /// A two-slice sample displaced by a fraction of a pixel under a fixed probe and plane
+    /// phase is what an offset stands for: the probe moved ahead of the first slice and the
+    /// phase displaced on the last ([`Optics::moved_quad`]) give its intensities under a
+    /// Fresnel transform either way in distance and in the far field; the phase left
+    /// unmoved does not.
+    #[test]
+    fn a_moved_probe_is_the_displaced_sample_through_two_slices() {
+        use std::f64::consts::PI;
+
+        use crate::engine::Fft2;
+        use crate::engine::features::move_planes;
+
+        const N: usize = 64;
+        const OFFSET: [f64; 2] = [0.3, -0.45];
+        let centred = |i: usize| [i / N, i % N].map(|v| v as f64 - (N / 2) as f64);
+        // Band-limited slices of period 256, so they have a value between their pixels.
+        let slices = |at: [f64; 2]| -> Vec<Object> {
+            (0..2)
+                .map(|s| {
+                    let terms: Vec<(C64, [f64; 2])> = noise(24, 3 + s)
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|[c, k]| (0.15 * c, [k.re, k.im].map(|k| (12.0 * k).round())))
+                        .collect();
+                    let v = (0..N * N)
+                        .map(|i| {
+                            let [y, x] = centred(i);
+                            let wave = |&(c, k): &(C64, [f64; 2])| {
+                                let t = k[0] * (y + at[0]) + k[1] * (x + at[1]);
+                                c * C64::from_polar(1.0, 2.0 * PI * t / 256.0)
+                            };
+                            C64::new(1.0, 0.0) + terms.iter().map(wave).sum::<C64>()
+                        })
+                        .collect();
+                    Object::new(Stack::from_vec([1, N, N], v).unwrap())
+                })
+                .collect()
+        };
+        let probe: Vec<C64> = (0..N * N)
+            .map(|i| {
+                let [y, x] = centred(i);
+                let r2 = y * y + x * x;
+                C64::from_polar(
+                    (-r2 / 49.0).exp(),
+                    0.04 * r2 + 0.5 * (y / 3.0).sin() - 0.3 * (x / 4.0).cos(),
+                )
+            })
+            .collect();
+        let view = [View {
+            frame: 0,
+            mode: 0,
+            probe: 0,
+            obj: 0,
+            oy: 0,
+            ox: 0,
+        }];
+        let pixel = [50e-9; 2];
+        let near = |d| Optics::free_space(&Wavefield::new([N, N], 1e-10, pixel, d).unwrap());
+        let far = Geometry::new(1e-10, 5e-3, 1e-10 * 5e-3 / (N as f64 * pixel[0]), [N, N]);
+        let far = Optics::far_field(&far.unwrap());
+        assert!((far.pixel()[0] / pixel[0] - 1.0).abs() < 1e-12);
+        let gap = [Wavefield::new([N, N], 1e-10, pixel, 2e-4).unwrap()];
+        for (name, optics) in [("Fresnel", near(5e-3)), ("back", near(-8e-3)), ("far", far)] {
+            assert!(
+                optics.quad().iter().any(|q| (q - 1.0).norm() > 0.5),
+                "{name}"
+            );
+            let optics = optics.with_slices(&gap).unwrap();
+            let intensity = |objects: &[Object], probe: &[C64], offsets: Option<&[[f64; 2]]>| {
+                let probe = Probe::new(Stack::from_vec([1, N, N], probe.to_vec()).unwrap());
+                let waves = SliceWaves::new(&optics, &view, objects, &probe, offsets);
+                let mut psi = waves.psi().to_vec();
+                optics.exit().forward(&mut psi);
+                psi.iter().map(|c| c.norm_sqr()).collect::<Vec<f64>>()
+            };
+            let truth = intensity(&slices(OFFSET), &probe, None);
+            let mut moved = probe.clone();
+            move_planes(&mut moved, optics.slice_quad(0), OFFSET, &Fft2::new([N, N]));
+            let window = slices([0.0; 2]);
+            let err = |offsets: Option<&[[f64; 2]]>| {
+                let model = intensity(&window, &moved, offsets);
+                let d = model.iter().zip(&truth).map(|(a, b)| (a - b).abs());
+                d.fold(0.0, f64::max) / truth.iter().copied().fold(0.0, f64::max)
+            };
+            let (with, without) = (err(Some(&[OFFSET])), err(None));
+            assert!(with < 1e-6, "{name}: {with:.3e}");
+            assert!(without > 1e-3, "{name}: {without:.3e}");
+        }
     }
 }
