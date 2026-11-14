@@ -1005,7 +1005,8 @@ impl RpieScratch {
         moved: bool,
     ) -> Result<Self, EngineError> {
         let dims = views.dims();
-        let cut = Cut::new(stream, dims, to_u32("batch_size", params.batch_size)?)?;
+        let batch = to_u32("batch_size", params.batch_size)?;
+        let (cut, _) = batch_stacks(stream, dims, batch, batch)?;
         let len = cut.wave_len(dims);
         let plans = cut.plans(stream, dims)?;
         let Cut {

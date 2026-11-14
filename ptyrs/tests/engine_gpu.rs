@@ -23,8 +23,8 @@ mod common;
 #[path = "common/ptychi/mod.rs"]
 mod ptychi;
 
-/// 30 positions: stacks of 7 and batches of 4 both leave a shorter last one. Three LLK
-/// slots: the ring wraps within every LLK-taking call.
+/// 30 positions: stacks of at most 8 cut them into 8, 8, 7 and 7 frames, and batches of 4
+/// leave a shorter last one. Three LLK slots: the ring wraps within every LLK-taking call.
 const NPOS: usize = 30;
 
 /// A frame side and the options run on it.
@@ -38,7 +38,7 @@ struct Setup {
 const M1: Setup = Setup {
     frame: 32,
     options: GpuOptions {
-        stack_size: Some(7),
+        stack_size: Some(8),
         graph: true,
         llk_slots: 3,
         fused: false,
@@ -655,8 +655,8 @@ fn gpu_rejects_what_it_cannot_run() {
 /// AP, DM, RAAR and ML cycles (AP's and ML's with an LLK, DM's, RAAR's and ML's first included), rPIE
 /// epochs and LLK passes replayed from captured graphs give the eager bits: the object, the
 /// probe and every LLK record read from the ring, across the parameter and algorithm switches
-/// that make a new capture and calls that reuse the last one, with a short last stack and
-/// batch, and the public LLK query between calls.
+/// that make a new capture and calls that reuse the last one, with stacks of two lengths and
+/// a short last batch, and the public LLK query between calls.
 #[test]
 fn graph_replays_bitwise_like_eager() {
     for setup in [M1, FUSED] {
@@ -1323,7 +1323,7 @@ fn rpie_position_matches_cpu() {
     );
 }
 
-/// rPIE under the position model in batches of 12, more frames than [`FUSED`]'s stacks of 7
+/// rPIE under the position model in batches of 12, more frames than [`FUSED`]'s stacks of 8
 /// hold, as [`features_match_cpu`] checks them.
 #[test]
 fn rpie_position_batch_over_stack() {
@@ -1545,7 +1545,7 @@ fn rpie_position_graphs_replay_bitwise_like_eager() {
 }
 
 /// DM, then RAAR, cycles modelling a position, two object-then-probe updates each, then ML
-/// cycles modelling it, give the bits of stacks of 7 frames with stacks of 4 and with one stack
+/// cycles modelling it, give the bits of stacks of 8 frames with stacks of 4 and with one stack
 /// of every frame: the object, the probe, the offsets and every LLK record.
 #[test]
 fn position_is_bit_identical_across_stack_splits() {
@@ -1577,24 +1577,24 @@ fn position_is_bit_identical_across_stack_splits() {
         ml.gpu(&mut g, 6);
         bit_state(&mut g)
     };
-    let seven = run(7);
-    assert_eq!(seven.llk.len(), 3 + 3 + 3 + 1);
+    let eight = run(8);
+    assert_eq!(eight.llk.len(), 3 + 3 + 3 + 1);
     for stack_size in [4, NPOS] {
         let other = run(stack_size);
         assert!(
-            other.llk == seven.llk,
+            other.llk == eight.llk,
             "stacks of {stack_size}: LLK records differ"
         );
         assert!(
-            other.object == seven.object,
+            other.object == eight.object,
             "stacks of {stack_size}: object differs"
         );
         assert!(
-            other.probe == seven.probe,
+            other.probe == eight.probe,
             "stacks of {stack_size}: probe differs"
         );
         assert!(
-            other.features == seven.features,
+            other.features == eight.features,
             "stacks of {stack_size}: offsets differ"
         );
     }
@@ -1604,7 +1604,7 @@ fn position_is_bit_identical_across_stack_splits() {
 /// the bytes each pass streams per frame under a position: 6 for the fused passes, 5 for DM
 /// and RAAR, 4 for ML's line search and LSQML, 2 for BH. AP, DM, RAAR and ML cycles modelling a
 /// scale and a position, and BH then LSQML epochs of every frame modelling a position, give
-/// the bits of stacks of 7 for all.
+/// the bits of stacks of 8 for all.
 #[test]
 fn default_stacks_give_the_bits_of_explicit_stacks() {
     let (scan, object, probe) = start(256, 2, false);
@@ -1653,16 +1653,16 @@ fn default_stacks_give_the_bits_of_explicit_stacks() {
         epochs.lsqml(&lsqml, 3, 1).unwrap();
         [bit_state(&mut cycles), bit_state(&mut epochs)]
     };
-    let (seven, default) = (run(Some(7)), run(None));
-    assert_eq!(seven[0].llk.len(), 4 * 3 + 1);
-    assert_eq!(seven[1].llk.len(), 3 + 3 + 1);
+    let (eight, default) = (run(Some(8)), run(None));
+    assert_eq!(eight[0].llk.len(), 4 * 3 + 1);
+    assert_eq!(eight[1].llk.len(), 3 + 3 + 1);
     for (k, what) in ["cycles", "epochs"].into_iter().enumerate() {
-        let (seven, default) = (&seven[k], &default[k]);
-        assert!(default.llk == seven.llk, "{what}: LLK records differ");
-        assert!(default.object == seven.object, "{what}: object differs");
-        assert!(default.probe == seven.probe, "{what}: probe differs");
+        let (eight, default) = (&eight[k], &default[k]);
+        assert!(default.llk == eight.llk, "{what}: LLK records differ");
+        assert!(default.object == eight.object, "{what}: object differs");
+        assert!(default.probe == eight.probe, "{what}: probe differs");
         assert!(
-            default.features == seven.features,
+            default.features == eight.features,
             "{what}: features differ"
         );
     }
