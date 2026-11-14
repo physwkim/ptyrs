@@ -17,6 +17,7 @@ pub mod bh;
 pub mod fused;
 pub mod grad;
 pub mod lsqml;
+pub mod opr;
 pub mod optics;
 pub mod pixel;
 pub mod position;

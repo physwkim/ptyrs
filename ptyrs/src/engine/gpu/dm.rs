@@ -127,9 +127,14 @@ impl Bufs<'_> {
                     let _ = self.step_features(ctx, f, None)?;
                 }
                 let dims = *self.views.dims();
-                let mut m = self
-                    .features
-                    .lend(ctx, self.kernels, &dims, self.probe, self.exit)?;
+                let mut m = self.features.lend(
+                    ctx,
+                    self.kernels,
+                    &dims,
+                    self.obj,
+                    self.probe,
+                    self.exit,
+                )?;
                 for s in 0..w.cut.len() {
                     let stack = w.cut.at(s);
                     let (psi, iterate) = w.fused(s);
@@ -204,9 +209,9 @@ impl Bufs<'_> {
         probe: Option<f64>,
     ) -> Result<(), GpuError> {
         let dims = *self.views.dims();
-        let mut m = self
-            .features
-            .lend(ctx, self.kernels, &dims, self.probe, self.exit)?;
+        let mut m =
+            self.features
+                .lend(ctx, self.kernels, &dims, self.obj, self.probe, self.exit)?;
         for s in 0..w.cut.len() {
             let inputs = FusedInputs {
                 views: self.views,

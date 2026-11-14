@@ -95,9 +95,9 @@ impl Bufs<'_> {
     ) -> Result<bool, GpuError> {
         let probe = probe_inertia.is_some();
         let dims = *self.views.dims();
-        let mut m = self
-            .features
-            .lend(ctx, self.kernels, &dims, self.probe, self.exit)?;
+        let mut m =
+            self.features
+                .lend(ctx, self.kernels, &dims, self.obj, self.probe, self.exit)?;
         for s in 0..self.scratch.len() {
             let stack = self.scratch.at(s);
             let inputs = FusedInputs {
