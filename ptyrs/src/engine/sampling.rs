@@ -186,7 +186,9 @@ mod tests {
     use crate::engine::linop::noise;
     use crate::worst::worst_of;
 
-    /// Odd rows: index 5 of 11 is frequency +5/11, which one term of each mode reads.
+    /// Odd rows: index 5 of 11 is frequency +5/11, which one term of each mode reads. Even
+    /// columns: index 5 of 10 is the Nyquist, −1/2, which object mode 1's `k_x = −5` term reads
+    /// as `exp(−iπx)`; its sign shows only off whole pixels and in its derivatives.
     const OBJ: [usize; 2] = [11, 10];
     const WINDOW: [usize; 2] = [6, 5];
 
@@ -211,8 +213,8 @@ mod tests {
 
     const OFFSETS: [[f64; 2]; 4] = [[0.3, -0.2], [0.3, -0.2], [-0.45, 0.35], [0.0, 0.0]];
 
-    /// Per object mode, the terms `(c, k)` of a trigonometric polynomial below the planes'
-    /// Nyquist indices.
+    /// Per object mode, the terms `(c, k)` of a trigonometric polynomial on the planes'
+    /// frequencies.
     fn terms(mode: usize) -> &'static [(C64, [f64; 2])] {
         const TERMS: [&[(C64, [f64; 2])]; 2] = [
             &[
@@ -225,6 +227,7 @@ mod tests {
                 (C64::new(0.7, 0.2), [0.0, 1.0]),
                 (C64::new(-0.2, 0.35), [-2.0, 3.0]),
                 (C64::new(0.45, 0.05), [5.0, -4.0]),
+                (C64::new(-0.3, 0.25), [3.0, -5.0]),
             ],
         ];
         TERMS[mode]
@@ -258,7 +261,7 @@ mod tests {
         let views = views();
         let sm = Sampler::new(OBJ, WINDOW, &views, OFFSETS);
         assert_eq!(sm.dims(), [4, py, px]);
-        for axes in [&[][..], &[0], &[1], &[0, 1], &[1, 1]] {
+        for axes in [&[][..], &[0], &[1], &[0, 1], &[0, 0], &[1, 1]] {
             let got = sm.windows(&object, axes);
             let mut scale: f64 = 0.0;
             let err = worst_of(
