@@ -115,48 +115,80 @@ pub fn diffraction_input(frames: &Counts, bin: usize, norm: f64) -> Result<Vec<f
 }
 
 /// [`diffraction_input`] of whole `[ny, nx]` frames in one slice.
-fn input(frames: &[u16], [ny, nx]: [usize; 2], bin: usize, norm: f64) -> Result<Vec<f32>, NnError> {
-    if bin == 0 || ny % bin != 0 || nx % bin != 0 {
-        return Err(NnError::Invalid(format!(
-            "frame [{ny}, {nx}] is not a multiple of bin {bin}"
-        )));
-    }
-    if norm.is_nan() || norm <= 0.0 {
-        return Err(NnError::Invalid(format!("norm {norm} must be positive")));
-    }
-    let (by, bx) = (ny / bin, nx / bin);
-    let scale = (by * bx) as f64 / norm;
-    let fine = (ny * nx) as f64 / norm;
-    let (cy, cx) = (ny / 2 - by / 2, nx / 2 - bx / 2);
-    let mut out = Vec::with_capacity(frames.len() / (bin * bin) * CHANNELS);
-    for frame in frames.chunks_exact(ny * nx) {
-        for y in 0..by {
-            for x in 0..bx {
-                let (mut sum, mut n) = (0.0, 0usize);
-                for dy in 0..bin {
-                    let row = &frame[(y * bin + dy) * nx + x * bin..][..bin];
-                    for v in row.iter().filter_map(|&v| Counts::intensity(v)) {
-                        sum += v;
-                        n += 1;
-                    }
-                }
-                let block = if n == 0 {
-                    0.0
-                } else {
-                    sum * (bin * bin) as f64 / n as f64
-                };
-                out.push((block * scale).sqrt() as f32);
-            }
-        }
-        for y in 0..by {
-            let row = &frame[(cy + y) * nx + cx..][..bx];
-            out.extend(
-                row.iter()
-                    .map(|&v| (Counts::intensity(v).unwrap_or(0.0) * fine).sqrt() as f32),
-            );
-        }
+fn input(frames: &[u16], frame: [usize; 2], bin: usize, norm: f64) -> Result<Vec<f32>, NnError> {
+    let scale = InputScale::new(frame, bin, norm)?;
+    let mut out = vec![0.0; frames.len() / (frame[0] * frame[1]) * scale.len()];
+    for (f, o) in frames
+        .chunks_exact(frame[0] * frame[1])
+        .zip(out.chunks_exact_mut(scale.len()))
+    {
+        scale.frame(f, o);
     }
     Ok(out)
+}
+
+/// [`diffraction_input`] one frame at a time, for frames of one shape, binning and norm.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct InputScale {
+    frame: [usize; 2],
+    bin: usize,
+    scale: f64,
+    fine: f64,
+}
+
+impl InputScale {
+    pub(crate) fn new([ny, nx]: [usize; 2], bin: usize, norm: f64) -> Result<Self, NnError> {
+        if bin == 0 || ny % bin != 0 || nx % bin != 0 {
+            return Err(NnError::Invalid(format!(
+                "frame [{ny}, {nx}] is not a multiple of bin {bin}"
+            )));
+        }
+        if norm.is_nan() || norm <= 0.0 {
+            return Err(NnError::Invalid(format!("norm {norm} must be positive")));
+        }
+        Ok(Self {
+            frame: [ny, nx],
+            bin,
+            scale: ((ny / bin) * (nx / bin)) as f64 / norm,
+            fine: (ny * nx) as f64 / norm,
+        })
+    }
+
+    /// Input values per frame.
+    pub(crate) fn len(&self) -> usize {
+        CHANNELS * (self.frame[0] / self.bin) * (self.frame[1] / self.bin)
+    }
+
+    /// The input of one frame into `out`, [`len`](Self::len) values.
+    pub(crate) fn frame(&self, frame: &[u16], out: &mut [f32]) {
+        let ([ny, nx], bin) = (self.frame, self.bin);
+        let (by, bx) = (ny / bin, nx / bin);
+        let (cy, cx) = (ny / 2 - by / 2, nx / 2 - bx / 2);
+        let (binned, centre) = out.split_at_mut(by * bx);
+        for (i, o) in binned.iter_mut().enumerate() {
+            let (y, x) = (i / bx, i % bx);
+            let (mut sum, mut n) = (0.0, 0usize);
+            for dy in 0..bin {
+                let row = &frame[(y * bin + dy) * nx + x * bin..][..bin];
+                for v in row.iter().filter_map(|&v| Counts::intensity(v)) {
+                    sum += v;
+                    n += 1;
+                }
+            }
+            let block = if n == 0 {
+                0.0
+            } else {
+                sum * (bin * bin) as f64 / n as f64
+            };
+            *o = (block * self.scale).sqrt() as f32;
+        }
+        for (y, o) in centre.chunks_exact_mut(bx).enumerate() {
+            let row = &frame[(cy + y) * nx + cx..][..bx];
+            for (o, &v) in o.iter_mut().zip(row) {
+                *o = (Counts::intensity(v).unwrap_or(0.0) * self.fine).sqrt() as f32;
+            }
+        }
+    }
 }
 
 /// Top-left corner in the object of frame `f`'s patch: the centre `patch` of its view window.
@@ -660,6 +692,18 @@ impl Predictor {
         frame: [usize; 2],
         norm: f64,
     ) -> Result<Patches, NnError> {
+        self.check_frames(frames, frame)?;
+        let input = input(frames, frame, self.config.bin, norm)?;
+        let plane = self.config.patch().iter().product::<usize>();
+        let mut out = Patches::empty(self.config.patch());
+        for chunk in input.chunks(CHUNK * CHANNELS * plane) {
+            out.append(self.network(chunk)?);
+        }
+        Ok(out)
+    }
+
+    /// Fails unless `frames` is whole frames of this predictor's `frame`.
+    pub(crate) fn check_frames(&self, frames: &[u16], frame: [usize; 2]) -> Result<(), NnError> {
         if frame != self.config.frame || !frames.len().is_multiple_of(frame[0] * frame[1]) {
             return Err(NnError::Invalid(format!(
                 "{} counts of frame {frame:?} for predictor frame {:?}",
@@ -667,21 +711,19 @@ impl Predictor {
                 self.config.frame
             )));
         }
-        let input = input(frames, frame, self.config.bin, norm)?;
-        let patch = self.config.patch();
-        let plane = patch[0] * patch[1];
-        let device = self.device();
-        let mut out = Patches::empty(patch);
-        for chunk in input.chunks(CHUNK * CHANNELS * plane) {
-            let n = chunk.len() / (CHANNELS * plane);
-            let (a, p) = self.forward(tensor(chunk, CHANNELS, [n, patch[0], patch[1]], &device));
-            out.append(Patches {
-                dims: [n, patch[0], patch[1]],
-                amp: host(a)?,
-                phase: host(p)?,
-            });
-        }
-        Ok(out)
+        Ok(())
+    }
+
+    /// The patches of `input`, whole frames of [`diffraction_input`], in one network call.
+    pub(crate) fn network(&self, input: &[f32]) -> Result<Patches, NnError> {
+        let [py, px] = self.config.patch();
+        let n = input.len() / (CHANNELS * py * px);
+        let (a, p) = self.forward(tensor(input, CHANNELS, [n, py, px], &self.device()));
+        Ok(Patches {
+            dims: [n, py, px],
+            amp: host(a)?,
+            phase: host(p)?,
+        })
     }
 
     /// The object initial value for a scan: [`predict`](Self::predict) then [`stitch`].
