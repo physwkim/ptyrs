@@ -1,7 +1,7 @@
 //! PyNX ML (Poisson conjugate gradient) on the GPU. The opening scale and the gradient pass
 //! run as AP's projection does ([`super::GpuOptions::fused`]); the line search always by
 //! M1's launches through [`Propagate`], under a position by the moved probes of
-//! [`Kernels::shifted_rows_fwd`].
+//! [`Kernels::shifted_probe`].
 
 use std::sync::Arc;
 
@@ -207,9 +207,7 @@ impl Bufs<'_> {
                                 ..m.model
                             },
                         };
-                        let work = &mut ml.fields.po;
-                        self.kernels
-                            .shifted_rows_fwd(ctx, &inputs, stack, w, work)?;
+                        self.kernels.shifted_probe(ctx, &inputs, stack, w)?;
                         kernels.shift_w(ctx, &dims, stack, w)?;
                     }
                     let (rk, f) = (self.rpie, &mut *ml.fields);

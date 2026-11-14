@@ -3,7 +3,8 @@
 //! Fresnel transform forward and back, without and with a modelled position, for both costs;
 //! and the LLK pass through the slices against the CPU's LLK of the same arrays.
 //! Frames are on the fused passes' smallest side, two incoherent probe modes, 30 Fermat
-//! positions in stacks of at most 8, so a batch of 12 ends in a stack of 4.
+//! positions in stacks of at most 8, so a batch of 12 ends in a stack of 4; 300 positions in
+//! stacks the device sizes take the waves a position recuts.
 
 use std::f64::consts::PI;
 use std::sync::Arc;
@@ -78,9 +79,9 @@ struct Case {
 
 /// Counts of the test object split over the slices of `optics`, and a start off it: unit
 /// modulus and a random phase in -1/4..1/4 rad per slice, the probe's defocus cut by a third.
-fn case(optics: Optics) -> Case {
+fn case(optics: Optics, npos: usize) -> Case {
     let (frame, pixel) = ([FRAME, FRAME], optics.pixel());
-    let raw = ptyrs::base::sim::fermat(NPOS, FRAME as f64 / 8.0 * PIXEL);
+    let raw = ptyrs::base::sim::fermat(npos, FRAME as f64 / 8.0 * PIXEL);
     let positions = raw.pynx_preprocess(pixel);
     let shape = required_obj_shape(&positions, pixel, frame, 16);
     let addr = AddrTable::new(&positions, pixel, frame, shape, NPROBE, 1).unwrap();
@@ -281,15 +282,15 @@ fn steps_rel(got: &[LsqmlStep], want: &[LsqmlStep]) -> [f64; 3] {
 }
 
 /// Offsets drawn about their mean, up to 0.4 pixel per axis.
-fn drawn_offsets() -> Vec<[f64; 2]> {
-    let mut d: Vec<[f64; 2]> = (0..NPOS)
+fn drawn_offsets(npos: usize) -> Vec<[f64; 2]> {
+    let mut d: Vec<[f64; 2]> = (0..npos)
         .map(|f| {
             let f = f as f64;
             [0.4 * (1.7 * f + 0.3).sin(), 0.4 * (2.3 * f).cos()]
         })
         .collect();
     for axis in 0..2 {
-        let mean = d.iter().map(|d| d[axis]).sum::<f64>() / NPOS as f64;
+        let mean = d.iter().map(|d| d[axis]).sum::<f64>() / npos as f64;
         d.iter_mut().for_each(|d| d[axis] -= mean);
     }
     d
@@ -297,7 +298,7 @@ fn drawn_offsets() -> Vec<[f64; 2]> {
 
 fn moved(position: bool) -> Features {
     Features {
-        position: position.then(drawn_offsets),
+        position: position.then(|| drawn_offsets(NPOS)),
         ..Features::default()
     }
 }
@@ -325,7 +326,7 @@ fn offsets_rel(a: &Features, b: &Features, start: &Features) -> f64 {
 fn matches_cpu(propagator: &str) {
     const NEPOCH: usize = 2;
     for nslice in [2, 3] {
-        let c = case(optics(propagator, nslice));
+        let c = case(optics(propagator, nslice), NPOS);
         for (position, cost) in [false, true]
             .into_iter()
             .flat_map(|p| [Cost::Amplitude, Cost::Poisson].map(move |c| (p, c)))
@@ -426,7 +427,7 @@ fn sliced_llk_matches_cpu() {
             .into_iter()
             .flat_map(move |n| [false, true].map(move |m| (p, n, m)))
     }) {
-        let c = case(optics(propagator, nslice));
+        let c = case(optics(propagator, nslice), NPOS);
         let features = moved(position);
         let run = |graph| {
             let mut gpu = c.gpu(GpuOptions { graph, ..OPTIONS });
@@ -476,7 +477,7 @@ fn sliced_llk_matches_cpu() {
 #[test]
 fn sliced_llk_matches_cpu_without_the_fused_passes() {
     for propagator in ["far field", "Fresnel"] {
-        let c = case(optics(propagator, 3));
+        let c = case(optics(propagator, 3), NPOS);
         let want = c.llk(&c.objects, &c.probe, None);
         for graph in [true, false] {
             let options = GpuOptions {
@@ -503,7 +504,7 @@ fn bits(s: &Stack<C64>) -> Vec<[u64; 2]> {
 /// whose last stack is short (12 in stacks of 8) and whose every stack is (4 in stacks of 8).
 #[test]
 fn sliced_lsqml_is_bit_identical_with_graphs_and_without() {
-    let c = case(optics("angular spectrum", 3));
+    let c = case(optics("angular spectrum", 3), NPOS);
     let features = moved(true);
     for batch_size in [12, 4] {
         let params = LsqmlParams {
@@ -537,11 +538,70 @@ fn sliced_lsqml_is_bit_identical_with_graphs_and_without() {
     }
 }
 
+/// Positions whose stacks a position model shortens where the device sizes them: on the test
+/// GPU's 64 MiB L2, 3 stacks of 100 without one and 5 of 60 with one; of the L2 sizes up to
+/// 256 MiB, only 144 to 149 MiB cut them alike.
+const NPOS_RECUT: usize = 300;
+
+/// Without a [`GpuOptions::stack_size`], setting a position cuts the shared stacks, and the
+/// slices' waves with them, shorter, and dropping it cuts them back: the LLK pass through three
+/// slices gives the CPU's LLK of the same arrays with the position, after an LSQML epoch with
+/// it, and with it dropped. Dropped before any pass, it leaves a fresh start's LLK bits.
+#[test]
+fn sliced_llk_follows_the_stacks_a_position_recuts() {
+    let c = case(optics("angular spectrum", 3), NPOS_RECUT);
+    let options = GpuOptions {
+        stack_size: None,
+        ..OPTIONS
+    };
+    let features = Features {
+        position: Some(drawn_offsets(NPOS_RECUT)),
+        ..Features::default()
+    };
+    let params = LsqmlParams {
+        batch_size: 100,
+        cost: Cost::Poisson,
+        seed: 7,
+    };
+    let mut gpu = c.gpu(options);
+    gpu.set_features(&features).unwrap();
+    let start = gpu.llk().unwrap();
+    gpu.lsqml(&params, 1, 0).unwrap();
+    let (objects, probe) = (gpu.objects().unwrap(), gpu.probe().unwrap());
+    let offsets = gpu.features().unwrap().position.unwrap();
+    let stepped = gpu.llk().unwrap();
+    gpu.set_features(&Features::default()).unwrap();
+    let dropped = gpu.llk().unwrap();
+    let errs = [
+        llk_rel(
+            &start,
+            &c.llk(&c.objects, &c.probe, features.position.as_deref()),
+        ),
+        llk_rel(&stepped, &c.llk(&objects, &probe, Some(&offsets))),
+        llk_rel(&dropped, &c.llk(&objects, &probe, None)),
+    ];
+    eprintln!(
+        "start {:.2e} stepped {:.2e} dropped {:.2e}",
+        errs[0], errs[1], errs[2]
+    );
+    // 10 times the worst or more: 4.7e-6 at the start.
+    assert!(worst_of(errs) < 5e-5, "{errs:?}");
+
+    let fresh = c.gpu(options).llk().unwrap();
+    let mut back = c.gpu(options);
+    back.set_features(&features).unwrap();
+    back.set_features(&Features::default()).unwrap();
+    assert!(
+        llk_bits(&back.llk().unwrap()) == llk_bits(&fresh),
+        "dropping the position differs from a fresh start"
+    );
+}
+
 /// What the GPU does not run on a multislice object fails when the engine is built or before
 /// the pass launches anything, naming the cause and changing nothing.
 #[test]
 fn gpu_refuses_what_it_cannot_run_on_slices() {
-    let c = case(optics("angular spectrum", 3));
+    let c = case(optics("angular spectrum", 3), NPOS);
     let build = |optics: &Optics, objects: &[Object]| {
         GpuPtycho::with_slices(&ctx(), &c.scan, optics, objects, c.probe.clone(), OPTIONS)
             .err()
@@ -567,7 +627,7 @@ fn gpu_refuses_what_it_cannot_run_on_slices() {
     let e = build(&c.optics, &two);
     assert!(e.contains("a multislice object of one mode, got 2"), "{e}");
 
-    let mut gpu = case(optics("far field", 3)).gpu(OPTIONS);
+    let mut gpu = case(optics("far field", 3), NPOS).gpu(OPTIONS);
     let before: Vec<_> = gpu.objects().unwrap().iter().map(|o| bits(o)).collect();
     let probe = bits(&gpu.probe().unwrap());
     let bh = BhParams {

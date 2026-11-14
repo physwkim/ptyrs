@@ -112,6 +112,16 @@ fn small(name: &str) -> Spec {
     }
 }
 
+/// The panic `generate` documents for a step that leaves the scan undefined.
+#[test]
+#[should_panic(expected = "raster step")]
+fn generate_panics_on_nan_step() {
+    let _ = generate(&Spec {
+        step_px: f64::NAN,
+        ..small("nan")
+    });
+}
+
 /// Every feature on: deterministic, true positions on whole pixels after PyNX preprocessing,
 /// nominal ones off them, and the four files read back as written.
 #[test]
