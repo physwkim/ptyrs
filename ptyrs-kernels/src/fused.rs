@@ -79,6 +79,12 @@ pub const FUSED_SHIFT_DEN: u32 = 8192;
 pub const FUSED_RAAR: u32 = 16384;
 /// [`rows_fwd`] stores the waves it transforms, `PO` or `R`, to `iterate`.
 pub const FUSED_ITERATE: u32 = 32768;
+/// With [`FUSED_SHIFT_PROBE`], the shifted probe's sums are of the step `x - O W` from the
+/// waves of the current arrays in place of `x`; no effect under [`FUSED_GRAD`].
+pub const FUSED_SHIFT_STEP: u32 = 65536;
+
+/// Blocks per probe mode of the `probe_step_norm` kernel.
+pub const FUSED_STEP_CHUNKS: u32 = 64;
 
 /// Columns of one frame a [`cols`] block transforms, for every mode.
 pub const FUSED_COLS: u32 = 8;
@@ -1014,8 +1020,10 @@ pub unsafe fn shift_pre<const NY: u32>(
 /// stores it (the DM add-back with `O W_p`). Under `FUSED_SHIFT_OBJ` `shift_power[fl] =
 /// sum_p |W_p|^2` and `shift_obj[fl * nobj + o] = sum_p conj(W_p) x`, both in ascending
 /// `p`. Under `FUSED_SHIFT_PROBE` `shift_adj`'s row gets `X = DFT_x(sum_o conj(O_o) x)`,
-/// `o` ascending, in place of the `T_y` row it has read. With the slopes `dW / dx =
-/// IDFT_x(T (-2 pi i freq(kx, nx)))` and `dW / dy = IDFT_x(T_y)`, under `FUSED_SHIFT_DEN`
+/// `o` ascending, in place of the `T_y` row it has read; with `FUSED_SHIFT_STEP` too and
+/// without `FUSED_GRAD`, of `sum_o conj(O_o) (x - O_o W_p)` taken as below. With the slopes
+/// `dW / dx = IDFT_x(T (-2 pi i freq(kx, nx)))` and `dW / dy = IDFT_x(T_y)`, under
+/// `FUSED_SHIFT_DEN`
 /// `shift_den[fl, blockIdx.x]` gets the block's `sum |O_o|^2 |dW_p / d_ax|^2` over its
 /// pixels, `o` and `p`, and under `FUSED_SHIFT_POSITION` `shift_grad[fl, blockIdx.x]` the
 /// block's `Re sum conj(x - O_o W_p) O_o dW_p / d_ax`, `x` alone under `FUSED_GRAD`; the
@@ -1043,8 +1051,8 @@ pub unsafe fn shift_rows_inv<const NX: u32, const HALF: bool>(
 
 /// [`shift_rows_inv`]'s `FUSED_SHIFT_OBJ` and `FUSED_SHIFT_PROBE` terms of the waves `x` a
 /// stack's `psi` holds, its stored rows as [`rows_inv`] stores them: no transform, no new
-/// waves; the other flags are ignored. Reads `psi`, `views`, `shift`, and `obj` under
-/// `FUSED_SHIFT_PROBE`; writes what the flags name. Grid `(ny / rows, nf_max)`, block
+/// waves; `FUSED_SHIFT_STEP` as there, the other flags are ignored. Reads `psi`, `views`,
+/// `shift`, and `obj` under `FUSED_SHIFT_PROBE`; writes what the flags name. Grid `(ny / rows, nf_max)`, block
 /// `FUSED_ROW_THREADS`, dynamic shared memory `rows` row FFTs ([`FFT_SKEW`]).
 ///
 /// # Safety
@@ -1082,7 +1090,7 @@ unsafe fn shift_rows_inv_with<const NX: u32, const SUMS: bool, const HALF: bool>
     let nobj = g.nmode / g.nprobe;
     // A constant mask: the sums build has no new waves and no slope rows.
     let flags = if SUMS {
-        cfg.flags & (FUSED_SHIFT_OBJ | FUSED_SHIFT_PROBE)
+        cfg.flags & (FUSED_SHIFT_OBJ | FUSED_SHIFT_PROBE | FUSED_SHIFT_STEP)
     } else {
         cfg.flags
     };
@@ -1092,6 +1100,7 @@ unsafe fn shift_rows_inv_with<const NX: u32, const SUMS: bool, const HALF: bool>
     let position = flags & FUSED_SHIFT_POSITION != 0;
     let den = flags & FUSED_SHIFT_DEN != 0;
     let grad = flags & FUSED_GRAD != 0;
+    let step = probe && !grad && flags & FUSED_SHIFT_STEP != 0;
     let adjoint = probe || position;
     let slopes = den || position;
     let out = new_waves::<HALF>(p, cfg);
@@ -1205,7 +1214,7 @@ unsafe fn shift_rows_inv_with<const NX: u32, const SUMS: bool, const HALF: bool>
                 }
             }
             let mut vn = [0.0f32; FFT_EPT_MAX as usize];
-            if slopes {
+            if slopes || step {
                 for o in 0..nobj {
                     let v = *p.views.add((k0 + o * g.nprobe + pm) as usize);
                     #[unroll]
@@ -1223,6 +1232,17 @@ unsafe fn shift_rows_inv_with<const NX: u32, const SUMS: bool, const HALF: bool>
                 for k in 0..2 * ept as usize {
                     w[k] = if grad {
                         acc[k]
+                    } else {
+                        acc[k] - vn[k / 2] * w[k]
+                    };
+                }
+            }
+            if step {
+                // The probe's sums are of the same correction `c`.
+                #[unroll]
+                for k in 0..2 * ept as usize {
+                    acc[k] = if position {
+                        w[k]
                     } else {
                         acc[k] - vn[k / 2] * w[k]
                     };
@@ -1323,6 +1343,94 @@ unsafe fn shift_rows_inv_with<const NX: u32, const SUMS: bool, const HALF: bool>
                     *p.shift_grad.add(at) = sum(2);
                 }
             }
+        }
+    }
+}
+
+/// The exit-wave power of a probe step: with `shift` holding [`shift_pre`]'s `T` of the
+/// step's spectra, `W_p = IDFT_x(T)` its probe mode `p` moved to frame `fl` of grid row
+/// `blockIdx.y` ([`FUSED_DOWN`]), `norm[(p * nframe + f0 + fl) * gridDim.x + blockIdx.x]`
+/// gets the block's `sum |O_o|^2 |W_p|^2` over its pixels and `o`, a fixed tree over the
+/// block: `|O W_p|^2` of the frame's views of `p`. Reads `shift`, `views` and `obj`. Grid
+/// `(ny / rows, nf_max)`, block `FUSED_ROW_THREADS`, dynamic shared memory the larger of
+/// `rows` row FFTs ([`FFT_SKEW`]) and `4 * FUSED_ROW_THREADS` bytes.
+///
+/// # Safety
+///
+/// As [`shift_sums`], `norm` holding `nprobe * nframe * gridDim.x` floats.
+#[device]
+pub unsafe fn shift_norm<const NX: u32>(
+    p: FusedPtrs,
+    norm: *mut f32,
+    ctl: *const StackCtl,
+    g: StackGeom,
+    cfg: FusedCfg,
+) {
+    let (f0, nf) = unsafe { stack_frames(ctl, g) };
+    let Some(fl) = walk_slot(cfg.flags, nf) else {
+        return;
+    };
+    let (ny, nx) = (g.ny, NX);
+    let n = ny as usize * nx as usize;
+    let lane = row_lane::<NX>();
+    let (ys, t) = (lane.ys, lane.f);
+    let ept = const { fft_ept(NX) };
+    let tpf = nx / ept;
+    let y = (ys + ny / 2) % ny;
+    let nobj = g.nmode / g.nprobe;
+    let k0 = (f0 + fl) * g.nmode;
+    let srow = (ys * nx) as usize;
+    let nt = FUSED_ROW_THREADS;
+    let tid = thread::threadIdx_x();
+    let mut w = [0.0f32; 2 * FFT_EPT_MAX as usize];
+    unsafe {
+        let smem = DynamicSharedArray::<u8, 16>::get();
+        let slots = smem.cast::<f32>();
+        for pm in 0..g.nprobe {
+            let trow = (fl * g.nprobe + pm) as usize * n + srow;
+            #[unroll]
+            for i in 0..ept {
+                let v = load_c(p.shift, trow + (t + i * tpf) as usize);
+                w[2 * i as usize] = v.0;
+                w[2 * i as usize + 1] = v.1;
+            }
+            row_fft_at::<NX, true>(&mut w, smem, lane);
+            thread::sync_threads();
+            let mut vn = [0.0f32; FFT_EPT_MAX as usize];
+            for o in 0..nobj {
+                let v = *p.views.add((k0 + o * g.nprobe + pm) as usize);
+                #[unroll]
+                for i in 0..ept {
+                    let x = (t + i * tpf + nx / 2) % nx;
+                    let vo = sample_obj(p.obj, v, y, x, g.nyo, g.nxo);
+                    vn[i as usize] += vo.0 * vo.0 + vo.1 * vo.1;
+                }
+            }
+            let mut d = 0.0f32;
+            #[unroll]
+            for i in 0..ept {
+                let k = 2 * i as usize;
+                d += vn[i as usize] * (w[k] * w[k] + w[k + 1] * w[k + 1]);
+            }
+            // Slot of pixel `(b, f)`, as [`shift_rows_inv`]'s tree.
+            *slots.add((lane.b * tpf + t) as usize) = d;
+            let mut half = nt / 2;
+            while half > 0 {
+                thread::sync_threads();
+                if tid < half {
+                    let s = slots.add(tid as usize);
+                    *s += *s.add(half as usize);
+                }
+                half /= 2;
+            }
+            thread::sync_threads();
+            if tid == 0 {
+                let frame = (pm * g.nframe + f0 + fl) as usize;
+                let at = frame * thread::gridDim_x() as usize + thread::blockIdx_x() as usize;
+                *norm.add(at) = *slots;
+            }
+            // The next mode's FFT takes the slots.
+            thread::sync_threads();
         }
     }
 }

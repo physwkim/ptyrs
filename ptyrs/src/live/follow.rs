@@ -41,7 +41,7 @@ use crate::live::grow::GrowError;
 use crate::live::object::{Snapshot, timed_sleeping_event};
 use crate::live::pv_out::PvCfg;
 use crate::live::recon::{ApConfig, LiveAp, ViewPlacement};
-use crate::live::ring::{DeviceStore, FrameBatch, Route, Whole};
+use crate::live::ring::{DeviceStore, FrameBatch, Route, STORE_LEAD, Whole};
 use crate::live::scan::{ScanBacker, ScanShape};
 use crate::live::stats::wall_ns;
 
@@ -620,7 +620,13 @@ pub fn run_dist_consumer(
         let ctx = Context::new(one)?;
         let shape = cfg.ap.shape;
         let elems = shape.frame[0] as usize * shape.frame[1] as usize;
-        let store = Arc::new(DeviceStore::new(&ctx, shape.nframe as usize, elems)?);
+        let store = Arc::new(DeviceStore::growing(
+            &ctx,
+            shape.nframe as usize,
+            elems,
+            cfg.plan.len(),
+            STORE_LEAD,
+        )?);
         let landing: Landing = (vec![store.clone()], Box::new(Whole));
         return Ok(follow_one(ctx, store, cfg, batches, preview, || {
             let _ = ready.send(landing);

@@ -170,10 +170,12 @@ impl Bufs<'_> {
                 if o.is_none() && p.is_none() {
                     continue;
                 }
+                let mut p = p;
                 if !std::mem::take(&mut summed) {
                     match passes {
                         PassesMut::Fused(f) if self.features.shifted() => {
-                            self.shifted_sums(ctx, f, w, o.is_some(), p.is_some())?;
+                            // The probe's step is taken there.
+                            self.shifted_sums(ctx, f, w, o.is_some(), p.take())?;
                         }
                         _ => {
                             for s in 0..w.cut.len() {
@@ -190,16 +192,18 @@ impl Bufs<'_> {
         Ok(())
     }
 
-    /// The object and/or probe update sums of every stack's carried exit waves in `w` under
-    /// the position model, against the current arrays: the probe moved anew, since an update
-    /// may have changed it; the shifted probe's sums become probe sums after the last stack.
+    /// The object update sums of every stack's carried exit waves in `w` under the position
+    /// model, against the current arrays: the probe moved anew, since an update may have
+    /// changed it. With `probe` its inertia, the probe's step of
+    /// [`crate::gpu::Kernels::probe_step`] from them instead, taken here against the current
+    /// object.
     fn shifted_sums(
         &mut self,
         ctx: &ExecutionContext,
         f: &mut FusedBufs,
         w: &CarriedMut<'_>,
         obj: bool,
-        probe: bool,
+        probe: Option<f64>,
     ) -> Result<(), GpuError> {
         let dims = *self.views.dims();
         let mut m = self
@@ -213,14 +217,38 @@ impl Bufs<'_> {
                 probe: self.probe,
                 model: m.model,
             };
-            let sums = m.psi_sums(obj.then_some(&mut *self.obj_sums), probe);
-            self.kernels
-                .shifted_psi_sums(ctx, &inputs, w.cut.at(s), &w.psi[s], f, sums)?;
+            let (stack, psi) = (w.cut.at(s), &w.psi[s]);
+            if obj {
+                let sums = m.psi_sums(Some(&mut *self.obj_sums), false);
+                self.kernels
+                    .shifted_psi_sums(ctx, &inputs, stack, psi, f, sums)?;
+            }
+            if let (Some(_), Some(step)) = (probe, m.shift_sums(true, false).probe) {
+                self.kernels
+                    .shifted_step_sums(ctx, &inputs, stack, psi, f, step)?;
+            }
         }
-        if probe {
-            m.probe_sums(ctx, self.kernels, &dims, self.probe_sums)?;
-        }
-        Ok(())
+        let Some(inertia) = probe else {
+            return Ok(());
+        };
+        m.probe_sums(ctx, self.kernels, &dims, self.probe_sums)?;
+        let model = m.model;
+        let Some(step) = m.shift_sums(true, false).probe else {
+            return Ok(());
+        };
+        let inputs = FusedInputs {
+            views: self.views,
+            counts: self.counts,
+            obj: self.obj,
+            probe: self.probe,
+            model,
+        };
+        let stacks = (0..w.cut.len()).map(|s| w.cut.at(s));
+        let sums = &mut *self.probe_sums;
+        self.kernels
+            .probe_step(ctx, &inputs, stacks, f, step, sums, inertia as f32)?;
+        self.kernels
+            .probe_step_add(ctx, self.probe, self.probe_sums)
     }
 
     /// `w`'s stack `s`'s DM exit waves by M1's launches, `PO` through the shared scratch.
