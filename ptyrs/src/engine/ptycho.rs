@@ -733,8 +733,10 @@ impl Ptycho {
     /// [`Ptycho::cg_gamma`] and `O += γ·d_O`, `P += γ·d_P`, or, for a `γ` that is not
     /// finite, no update and `d = −g` (PyNX `cu_linear_comb_fcfc_gamma`). PyNX CUDA keeps
     /// `−g / 2`, which changes neither `β` nor the step, and Hann-filters it in the far field;
-    /// this does not filter. As in PyNX, a negative curvature `den` is not guarded: far from
-    /// the solution (a flat object) the step can climb, so ML follows DM or AP.
+    /// this does not filter. As in PyNX, `γ` is one Newton step along `d` with no line search:
+    /// it can overshoot and raise the LLK for a cycle on a direction Polak–Ribière has grown,
+    /// as well as under a negative curvature `den`, which is not guarded (far from the
+    /// solution, a flat object), so ML follows DM or AP.
     ///
     /// [`Features::position`] takes AP's and DM's step, not PyNX ML's `update_pos` (which
     /// moves the scan positions themselves): its sums from the magnitude projection of the
