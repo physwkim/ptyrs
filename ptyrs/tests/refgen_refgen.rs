@@ -146,7 +146,7 @@ fn generate_writes_consistent_files() {
     write(&dir, &a).unwrap();
     let scan = ptyrs::io::read_cxi(dir.join("small.cxi")).unwrap();
     assert_eq!(scan.counts, a.scan.counts);
-    for (r, w) in scan.positions.x.iter().zip(&a.scan.positions.x) {
+    for (r, w) in scan.positions.x().iter().zip(a.scan.positions.x()) {
         assert!((r - w).abs() <= 1e-7 * w.abs().max(1e-12), "{r} vs {w}");
     }
     let (o, p) = ptyrs::io::read_modes(dir.join("small_truth.h5")).unwrap();

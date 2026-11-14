@@ -76,9 +76,24 @@ struct Slices {
     quad: f32,
     /// Moves the probe the LLK pass sends through the slices.
     position: PositionKernels,
+    /// One stack's waves, from slice to slice in turn, each a [`Cut::wave_len`] of
+    /// [`Shared::cut`], which counts them.
+    waves: [DeviceBuffer<C32>; 2],
 }
 
-/// [`Slices`] lent to a cycle, with [`Shared::slice_waves`].
+impl Slices {
+    /// The two waves of a stack of `cut`.
+    fn waves(
+        stream: &Arc<CudaStream>,
+        cut: &Cut,
+        dims: &ViewDims,
+    ) -> Result<[DeviceBuffer<C32>; 2], EngineError> {
+        let wave = || DeviceBuffer::zeroed(stream, cut.wave_len(dims));
+        Ok([wave()?, wave()?])
+    }
+}
+
+/// [`Slices`] lent to a cycle.
 pub(super) struct SlicesMut<'a> {
     pub deeper: &'a mut [DeviceBuffer<C32>],
     pub gaps: &'a [DeviceBuffer<C32>],
@@ -620,14 +635,11 @@ struct Shared {
     llk: DeviceBuffer<LlkPartial>,
     /// The chunk sums M1's [`Kernels::llk`] reduces a stack's frames through.
     llk_scratch: LlkScratch,
-    /// A multislice object's waves of one stack, from slice to slice in turn, each
-    /// `[nf_max * nmode, ny, nx]`.
-    slice_waves: Option<[DeviceBuffer<C32>; 2]>,
 }
 
 impl Shared {
     /// M2's fused passes (with `shift`, the position model's) or M1's scratch, `fused`
-    /// picking, and with `sliced` a multislice object's waves, cut by `rule`.
+    /// picking, cut by `rule` with, if `sliced`, a multislice object's [`Slices::waves`].
     fn new(
         stream: &Arc<CudaStream>,
         dims: &ViewDims,
@@ -648,8 +660,6 @@ impl Shared {
         }
         let cut = rule.cut(stream, dims, &streamed)?;
         let nf_max = cut.table.nf_max();
-        let wave = || DeviceBuffer::zeroed(stream, cut.wave_len(dims));
-        let slice_waves = sliced.then(|| Ok::<_, EngineError>([wave()?, wave()?]));
         let passes = if fused {
             let f = match shift {
                 true => FusedBufs::with_shift(stream, dims, nf_max),
@@ -673,7 +683,6 @@ impl Shared {
             streamed,
             llk: DeviceBuffer::zeroed(stream, nf_max as usize)?,
             llk_scratch: LlkScratch::new(stream, dims, nf_max)?,
-            slice_waves: slice_waves.transpose()?,
             cut,
             passes,
         })
@@ -1292,6 +1301,7 @@ impl Device {
                     ones: DeviceBuffer::from_host(&stream, &ones)?,
                     quad: s.quad,
                     position: PositionKernels::load(&kernels)?,
+                    waves: Slices::waves(&stream, &shared.cut, &dims)?,
                 })
             })
             .transpose()?;
@@ -1383,13 +1393,23 @@ impl Device {
         }
         let stream = &self.stream;
         let dims = self.views.dims();
+        // A new cut resizes the slices' waves with it.
         let shared = (have.position.is_some() != position.is_some())
             .then(|| {
                 let (moved, sliced) = (position.is_some(), self.slices.is_some());
-                Shared::new(stream, dims, self.rule, true, moved, sliced)
+                let shared = Shared::new(stream, dims, self.rule, true, moved, sliced)?;
+                let waves = (self.slices.as_ref())
+                    .map(|_| Slices::waves(stream, &shared.cut, dims))
+                    .transpose()?;
+                Ok::<_, EngineError>((shared, waves))
             })
             .transpose()?;
-        let nf_max = shared.as_ref().unwrap_or(&self.shared).cut.table.nf_max();
+        let nf_max = shared
+            .as_ref()
+            .map_or(&self.shared, |s| &s.0)
+            .cut
+            .table
+            .nf_max();
         let scale = scale
             .map(|v| {
                 Ok::<_, EngineError>(ScaleBufs {
@@ -1429,8 +1449,11 @@ impl Device {
             background,
             position,
         };
-        if let Some(shared) = shared {
+        if let Some((shared, waves)) = shared {
             self.shared = shared;
+            if let Some((s, waves)) = self.slices.as_mut().zip(waves) {
+                s.waves = waves;
+            }
             self.carried = None;
         }
         self.capture_llk()?;
@@ -1533,16 +1556,14 @@ impl Device {
             counts: &self.counts,
             obj: &mut self.obj,
             probe: &mut self.probe,
-            slices: (self.slices.as_mut())
-                .zip(self.shared.slice_waves.as_mut())
-                .map(|(s, waves)| SlicesMut {
-                    deeper: &mut s.deeper,
-                    gaps: &s.gaps,
-                    ones: &s.ones,
-                    quad: s.quad,
-                    position: &s.position,
-                    waves,
-                }),
+            slices: self.slices.as_mut().map(|s| SlicesMut {
+                deeper: &mut s.deeper,
+                gaps: &s.gaps,
+                ones: &s.ones,
+                quad: s.quad,
+                position: &s.position,
+                waves: &mut s.waves,
+            }),
             obj_sums: &mut self.obj_sums,
             probe_sums: &mut self.probe_sums,
             obj_len: self.obj_len,

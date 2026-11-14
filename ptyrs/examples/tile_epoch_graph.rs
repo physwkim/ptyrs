@@ -90,8 +90,8 @@ fn scan() -> (ViewDims, Vec<ViewAddr>) {
     let g = Geometry::new(1.5e-10, 1.0, 75e-6, [N as usize; 2]).unwrap();
     let pixel = g.pixel_size_object();
     let f = fermat(NPOS as usize, STEP * pixel[1]);
-    let round = |v: Vec<f64>| v.into_iter().map(|x| x as f32 as f64).collect();
-    let pos = Positions::new(round(f.y), round(f.x))
+    let round = |v: &[f64]| v.iter().map(|&x| x as f32 as f64).collect();
+    let pos = Positions::new(round(f.y()), round(f.x()))
         .unwrap()
         .pynx_preprocess(pixel);
     let obj = required_obj_shape(&pos, pixel, g.frame, 16);

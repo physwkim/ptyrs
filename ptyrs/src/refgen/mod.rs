@@ -301,8 +301,9 @@ pub fn textured_object(shape: [usize; 2]) -> Object {
 
 fn pairs(p: &Positions, scale: [f64; 2]) -> Value {
     json!(
-        p.y.iter()
-            .zip(&p.x)
+        p.y()
+            .iter()
+            .zip(p.x())
             .map(|(y, x)| [y / scale[0], x / scale[1]])
             .collect::<Vec<_>>()
     )
@@ -326,7 +327,7 @@ pub fn generate(spec: &Spec) -> Result<Generated, RefgenError> {
         Pattern::Fermat { n } => sim::fermat(n, spec.step_px * pixel[1]),
     };
     let snap = |v: &[f64], p: f64| v.iter().map(|x| (x / p).round() * p).collect::<Vec<_>>();
-    let truth_pos = Positions::new(snap(&base.y, pixel[0]), snap(&base.x, pixel[1]))?;
+    let truth_pos = Positions::new(snap(base.y(), pixel[0]), snap(base.x(), pixel[1]))?;
     let nframe = truth_pos.len();
     let nominal = if spec.position_error_px > 0.0 {
         let mut r = rng(spec.seed, 1);
@@ -338,8 +339,8 @@ pub fn generate(spec: &Spec) -> Result<Generated, RefgenError> {
                 .map(|(x, e)| x + (e - m) * spec.position_error_px * p)
                 .collect::<Vec<_>>()
         };
-        let y = axis(&truth_pos.y, pixel[0]);
-        let x = axis(&truth_pos.x, pixel[1]);
+        let y = axis(truth_pos.y(), pixel[0]);
+        let x = axis(truth_pos.x(), pixel[1]);
         Positions::new(y, x)?
     } else {
         truth_pos.clone()
@@ -349,10 +350,10 @@ pub fn generate(spec: &Spec) -> Result<Generated, RefgenError> {
     // True positions in the frame a reconstruction from the nominal ones works in (PyNX
     // subtracts the mean; the snap of `truth_pp` may differ from this by a common sub-pixel).
     let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
-    let (my, mx) = (mean(&nominal.y), mean(&nominal.x));
+    let (my, mx) = (mean(nominal.y()), mean(nominal.x()));
     let in_nominal_frame = Positions::new(
-        truth_pos.y.iter().map(|y| y - my).collect(),
-        truth_pos.x.iter().map(|x| x - mx).collect(),
+        truth_pos.y().iter().map(|y| y - my).collect(),
+        truth_pos.x().iter().map(|x| x - mx).collect(),
     )?;
 
     // One object covering the true windows (with fly offsets) and the nominal ones.
@@ -360,12 +361,12 @@ pub fn generate(spec: &Spec) -> Result<Generated, RefgenError> {
         *spec.fly_px.iter().min().unwrap() as f64,
         *spec.fly_px.iter().max().unwrap() as f64,
     );
-    let mut cover_y = truth_pp.y.clone();
-    let mut cover_x: Vec<f64> = truth_pp.x.iter().map(|x| x + fmin * pixel[1]).collect();
-    cover_y.extend(&truth_pp.y);
-    cover_x.extend(truth_pp.x.iter().map(|x| x + fmax * pixel[1]));
-    cover_y.extend(&nominal_pp.y);
-    cover_x.extend(&nominal_pp.x);
+    let mut cover_y = truth_pp.y().to_vec();
+    let mut cover_x: Vec<f64> = truth_pp.x().iter().map(|x| x + fmin * pixel[1]).collect();
+    cover_y.extend(truth_pp.y());
+    cover_x.extend(truth_pp.x().iter().map(|x| x + fmax * pixel[1]));
+    cover_y.extend(nominal_pp.y());
+    cover_x.extend(nominal_pp.x());
     let obj_shape = required_obj_shape(&Positions::new(cover_y, cover_x)?, pixel, g.frame, 16);
     let object = textured_object(obj_shape);
     let probe = sim::probe(g.frame, spec.nmode)?;
@@ -405,9 +406,9 @@ pub fn generate(spec: &Spec) -> Result<Generated, RefgenError> {
         }
         // `obj_shape` was sized over these same windows, fly offsets included.
         let corner = |obj, n, d| view_corner(obj, n, d).expect("object covers every true window");
-        let oy = corner(obj_shape[0], ny, truth_pp.y[f] / pixel[0]);
+        let oy = corner(obj_shape[0], ny, truth_pp.y()[f] / pixel[0]);
         for &d in &spec.fly_px {
-            let ox = corner(obj_shape[1], nx, truth_pp.x[f] / pixel[1] + d as f64);
+            let ox = corner(obj_shape[1], nx, truth_pp.x()[f] / pixel[1] + d as f64);
             far.accumulate(&modes, object.plane(0), obj_shape[1], [oy, ox], w, out);
         }
     }
