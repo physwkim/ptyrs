@@ -6,13 +6,17 @@ through gpu2.sh.
         [--gpu2 PATH] [--log OUT/ttt]
 
 time_to_target.py's rules: one long run of --long cycles per side sets the target, 1.01 times the
-lower of the two final LLKs, and each side then runs from the same start until --runs runs that
-gpu2.sh calls clean have reached it. The LLK is PyNX's normalised one, which both sides record:
-the Gaussian for DM and RAAR, the Poisson for ML, the one ML minimises (PyNX's ML gradient is
-Poisson only), as its Gaussian rises on these counts. The runs alternate ABBA (ptyrs, PyNX, PyNX,
-ptyrs, ...), each a process of its own in a gpu2.sh hold of at most HOLD_S seconds, on CPUs
-48-71 with 24 threads. Prints every run with the load average at its end, the medians of the
-clean runs, and both long runs' curves; logs and a JSON summary go to --log.
+lower of the two final LLKs, and each side then runs from the same start until --runs counted
+runs have reached it. The LLK is PyNX's normalised one, which both sides record: the Gaussian for
+DM and RAAR, the Poisson for ML, the one ML minimises (PyNX's ML gradient is Poisson only), as its
+Gaussian rises on these counts. The runs alternate ABBA (ptyrs, PyNX, PyNX, ptyrs, ...), each a
+process of its own in a gpu2.sh hold of at most HOLD_S seconds, on CPUs 48-71 with 24 threads.
+A run counts when gpu2.sh calls it clean and CPUs 48-71 were under BUSY busy over it (/proc/stat;
+the run itself takes one or two of them): PyNX launches its kernels from one Python thread, and
+its time per cycle tracks the load on that thread's CPU. Before each run the parent waits until
+those CPUs were under QUIET over WINDOW_S. Prints every run with its busy fraction and the load
+average at its end, the medians of the counted runs, and both long runs' curves; logs and a JSON
+summary go to --log.
 
 A run (--worker) imports its side (imports_s), reads OUT/scan.cxi and the start (read_s) and
 puts the state on the GPU (setup_s, from the read, synchronised; for PyNX its CUDA context and
@@ -51,9 +55,12 @@ RAAR_BETA = cx.RAAR_BETA
 LLK = ("gaussian", "poisson")
 TARGET = {"dm": "gaussian", "raar": "gaussian", "ml": "poisson"}
 HOLD_S = 295  # under gpu2.sh's five-minute hold
-CPUS, THREADS = "48-71", "24"
+CPUS, CORES, THREADS = "48-71", range(48, 72), "24"
+BUSY = 0.15
+QUIET = BUSY - 2 / len(CORES)  # room for the run's own one or two CPUs
+WINDOW_S, POLL_S = 10, 30
 SIDES = ("ptyrs", "pynx")
-LINES = {"imports_s", "read_s", "setup_s", "llk", "target", "wall_s", "end_llk", "load"}
+LINES = {"imports_s", "read_s", "setup_s", "llk", "target", "wall_s", "end_llk", "load", "busy"}
 SCRATCH = os.path.expanduser("~/work/ptyrs-scratch")
 
 
@@ -126,8 +133,38 @@ def load():
     return "{:.2f} {:.2f} {:.2f}".format(*os.getloadavg())
 
 
+def cpu_times():
+    """Busy and total jiffies of CORES (/proc/stat; idle and iowait are not busy)."""
+    busy = total = 0
+    with open("/proc/stat") as f:
+        for line in f:
+            w = line.split()
+            if w[0][:3] == "cpu" and w[0][3:].isdigit() and int(w[0][3:]) in CORES:
+                t = [int(x) for x in w[1:9]]
+                total += sum(t)
+                busy += sum(t) - t[3] - t[4]
+    return busy, total
+
+
+def busy_since(t0):
+    busy, total = cpu_times()
+    return (busy - t0[0]) / (total - t0[1])
+
+
+def quiet():
+    """Wait until CORES were under QUIET over WINDOW_S; the seconds waited."""
+    t = time.perf_counter()
+    while True:
+        c = cpu_times()
+        time.sleep(WINDOW_S)
+        if busy_since(c) < QUIET:
+            return time.perf_counter() - t
+        time.sleep(POLL_S)
+
+
 def worker(args):
     """One run of one side, printing the lines `parse` reads."""
+    cpu = cpu_times()
     side = (Ptyrs if args.side == "ptyrs" else Pynx)(args.algo, args.module)
     print(f"imports_s {time.perf_counter() - T0}")
     t = time.perf_counter()
@@ -142,8 +179,12 @@ def worker(args):
     for c, v in enumerate(curve):
         print(f"llk {c} {v[0]} {v[1]}")
     print(f"load {load()}")
-    if args.target is None:
-        return
+    if args.target is not None:
+        to_target(args, side, data, start, curve)
+    print(f"busy {busy_since(cpu)}")
+
+
+def to_target(args, side, data, start, curve):
     key = LLK.index(TARGET[args.algo])
     n = next((c for c, v in enumerate(curve) if v[key] <= args.target), None)
     print(f"target {'none' if n is None else n}", flush=True)
@@ -241,7 +282,7 @@ def main():
 
     summary = {"algo": args.algo, "long_cycles": args.long, "llk": name, "final_llk": final,
                "target": target, "curves": {"columns": LLK, **long},
-               "runs": {s: [] for s in SIDES}}
+               "runs": {s: [] for s in SIDES}, "discarded": {s: [] for s in SIDES}}
     tries = {s: 0 for s in SIDES}
     k = 0
     while any(len(summary["runs"][s]) < args.runs and tries[s] < 3 * args.runs for s in SIDES):
@@ -249,23 +290,26 @@ def main():
         k += 1
         if len(summary["runs"][side]) == args.runs or tries[side] == 3 * args.runs:
             continue
+        waited = quiet()
         r = run(args, side, f"run{tries[side]}", target)
         tries[side] += 1
         wall, n = r.get("wall_s"), r.get("cycles")
-        r["s_per_cycle"] = None if wall is None else wall / n
-        print(f"{side:5s} run {tries[side] - 1}: {r['status']}, setup {r['setup_s']:.3f} s "
-              f"(files {r['read_s']:.3f} s, imports {r['imports_s']:.3f} s), cycles {n}, wall "
+        r.update(s_per_cycle=None if wall is None else wall / n, waited_s=waited,
+                 counted=r["clean"] and r["busy"] < BUSY)
+        print(f"{side:5s} run {tries[side] - 1}: {r['status']}, CPUs {CPUS} "
+              f"{100 * r['busy']:.1f}% busy, {'counted' if r['counted'] else 'discarded'}, "
+              f"setup {r['setup_s']:.3f} s (files {r['read_s']:.3f} s, imports "
+              f"{r['imports_s']:.3f} s), cycles {n}, wall "
               + ("-" if wall is None else f"{wall:.3f} s ({1e3 * wall / n:.3f} ms/cycle), "
                  f"end {name} LLK {r['end_llk'][key]:.6f}") + f", load {r['load']}", flush=True)
         del r["llk"]
-        if r["clean"]:
-            summary["runs"][side].append(r)
-    print("median of the clean runs: cycles to target, wall to target, time per cycle, setup "
+        summary["runs" if r["counted"] else "discarded"][side].append(r)
+    print("median of the counted runs: cycles to target, wall to target, time per cycle, setup "
           "(files)")
     for side in SIDES:
         rows = summary["runs"][side]
         wall, per = median(rows, "wall_s"), median(rows, "s_per_cycle")
-        print(f"{side:5s} {len(rows)} clean: {median(rows, 'cycles')} cycles, "
+        print(f"{side:5s} {len(rows)} counted: {median(rows, 'cycles')} cycles, "
               + ("-" if wall is None else f"{wall:.3f} s, {1e3 * per:.3f} ms/cycle")
               + f", setup {median(rows, 'setup_s'):.3f} s ({median(rows, 'read_s'):.3f} s)")
     path = os.path.join(args.log, f"{args.algo}.json")
@@ -273,7 +317,7 @@ def main():
         json.dump(summary, f, indent=1)
     print(path)
     if any(len(summary["runs"][s]) < args.runs for s in SIDES):
-        sys.exit(f"fewer than {args.runs} clean runs on a side")
+        sys.exit(f"fewer than {args.runs} counted runs on a side")
 
 
 if __name__ == "__main__":
