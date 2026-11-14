@@ -237,7 +237,9 @@ mod tests {
         let (fa, fp) = net.fold().forward(x);
         for (want, got) in [(a, fa), (p, fp)] {
             let d = (want - got).abs().max().into_scalar::<f32>();
-            assert!(d < 1e-4, "folded output differs by {d}");
+            // Autotune may pick tensor-core convolutions, which round f32 operands to TF32's
+            // 11-bit significand, so the scaled weights round apart from the unscaled ones.
+            assert!(d < 2e-3, "folded output differs by {d}");
         }
     }
 }
