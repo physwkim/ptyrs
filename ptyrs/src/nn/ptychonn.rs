@@ -210,14 +210,15 @@ impl Folded {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::nn::predictor::host;
     use burn::module::RunningState;
     use burn::tensor::Distribution;
 
-    #[test]
-    fn folded_network_gives_the_networks_output() {
-        let device = Device::cuda(0);
-        let mut net = PtychoNN::new(2, 4, 2, &device);
-        let draw = |n, lo, hi| Tensor::<1>::random([n], Distribution::Uniform(lo, hi), &device);
+    /// A small network whose batch normalisations hold drawn statistics, not the identity they
+    /// start at.
+    fn normalised_net(device: &Device) -> PtychoNN {
+        let mut net = PtychoNN::new(2, 4, 2, device);
+        let draw = |n, lo, hi| Tensor::<1>::random([n], Distribution::Uniform(lo, hi), device);
         for b in net
             .encoder
             .iter_mut()
@@ -232,6 +233,64 @@ mod tests {
                 n.running_var = RunningState::new(draw(c, 0.2, 3.0));
             }
         }
+        net
+    }
+
+    fn h<const D: usize>(t: Tensor<D>) -> Vec<f64> {
+        host(t).unwrap().into_iter().map(f64::from).collect()
+    }
+
+    #[test]
+    fn folding_scales_each_weight_and_shifts_each_bias() {
+        let device = Device::cuda(0);
+        let net = normalised_net(&device);
+        let folded = net.fold();
+        let blocks = net
+            .encoder
+            .iter()
+            .chain(&net.amp.blocks)
+            .chain(&net.phase.blocks);
+        let stages = folded
+            .encoder
+            .iter()
+            .chain(&folded.amp.0)
+            .chain(&folded.phase.0);
+        // Elementwise f32 arithmetic, a few roundings deep.
+        let tol = 4.0 * f64::from(f32::EPSILON);
+        for (b, f) in blocks.zip(stages) {
+            for (c, n, f) in [(&b.a, &b.na, &f[0]), (&b.b, &b.nb, &f[1])] {
+                let [w, fw] = [&c.weight, &f.weight].map(|p| h(p.val()));
+                let [b, fb] = [&c.bias, &f.bias].map(|p| h(p.as_ref().unwrap().val()));
+                let [g, beta, mean, var] = [
+                    n.gamma.val(),
+                    n.beta.val(),
+                    n.running_mean.value(),
+                    n.running_var.value(),
+                ]
+                .map(h);
+                let per = w.len() / g.len();
+                for k in 0..g.len() {
+                    let s = g[k] / (var[k] + n.epsilon).sqrt();
+                    for i in k * per..(k + 1) * per {
+                        let want = w[i] * s;
+                        let d = (fw[i] - want).abs();
+                        assert!(d <= tol * want.abs(), "weight {i}: {} vs {want}", fw[i]);
+                    }
+                    let want = (b[k] - mean[k]) * s + beta[k];
+                    let d = (fb[k] - want).abs();
+                    let size = (b[k] - mean[k]).abs() * s + beta[k].abs();
+                    assert!(d <= tol * size, "bias {k}: {} vs {want}", fb[k]);
+                }
+            }
+        }
+    }
+
+    /// The end-to-end guard on what the parameters leave out: layer order, padding, the output
+    /// convolutions.
+    #[test]
+    fn folded_network_gives_the_networks_output() {
+        let device = Device::cuda(0);
+        let net = normalised_net(&device);
         let x = Tensor::<4>::random([3, 2, 16, 16], Distribution::Normal(0.0, 1.0), &device);
         let (a, p) = net.forward(x.clone());
         let (fa, fp) = net.fold().forward(x);
