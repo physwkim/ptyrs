@@ -77,6 +77,10 @@ name = "nn_dip"
 required-features = ["nn"]
 
 [[example]]
+name = "nn_dip_ptychi"
+required-features = ["nn"]
+
+[[example]]
 name = "nn_m6_start"
 required-features = ["nn"]
 

@@ -41,14 +41,23 @@ pub struct DipConfig {
     pub seed: u64,
 }
 
-/// U-Net: `depth` encoder stages with skip connections into a mirror decoder, then one 3×3
-/// convolution to the raw amplitude and phase channels.
+/// The network of a [`Dip`] with its output map.
+pub trait Prior: Module {
+    /// The object from the fixed input `code`, in the weights' autodiff graph: `[ny, nx, 2]`
+    /// with real and imaginary parts interleaved, as [`ObjectLoss`] takes it.
+    fn object(&self, code: Tensor<4>) -> Tensor<3>;
+}
+
+/// [`Dip::new`]'s U-Net: `depth` encoder stages with skip connections into a mirror decoder,
+/// then one 3×3 convolution to the raw amplitude and phase channels, mapped to amplitude in
+/// `(0, 2)` and phase in `(-π, π)` and cropped to the object.
 #[derive(Module, Debug)]
-struct DipNet {
+pub struct DipNet {
     down: Vec<Block>,
     bottom: Block,
     up: Vec<Block>,
     out: Conv2d,
+    shape: [usize; 2],
 }
 
 impl DipNet {
@@ -73,10 +82,11 @@ impl DipNet {
             bottom: Block::new(top, top, device),
             up,
             out,
+            shape: c.shape,
         }
     }
 
-    fn forward(&self, mut x: Tensor<4>) -> Tensor<4> {
+    fn raw(&self, mut x: Tensor<4>) -> Tensor<4> {
         let mut skips = Vec::with_capacity(self.down.len());
         for b in &self.down {
             let s = b.forward(x);
@@ -96,6 +106,25 @@ impl DipNet {
     }
 }
 
+impl Prior for DipNet {
+    fn object(&self, code: Tensor<4>) -> Tensor<3> {
+        let [ny, nx] = self.shape;
+        let raw = self.raw(code);
+        // 2·sigmoid(x), as 1 + tanh(x/2): burn's sigmoid computes in f32 whatever the dtype.
+        let amp = tanh(
+            raw.clone()
+                .slice([0..1, 0..1, 0..ny, 0..nx])
+                .reshape([ny, nx])
+                * 0.5,
+        ) + 1.0;
+        let phase = tanh(raw.slice([0..1, 1..2, 0..ny, 0..nx]).reshape([ny, nx])) * PI;
+        Tensor::stack(
+            vec![amp.clone() * phase.clone().cos(), amp * phase.sin()],
+            2,
+        )
+    }
+}
+
 /// Whatever an [`ObjectLoss`] fails with.
 pub type LossError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -109,9 +138,8 @@ pub trait ObjectLoss {
 }
 
 /// A DIP network, its fixed input code and its Adam state.
-pub struct Dip {
-    shape: [usize; 2],
-    net: DipNet,
+pub struct Dip<P: Prior = DipNet> {
+    net: P,
     code: Tensor<4>,
     optim: ModuleOptimizer,
 }
@@ -136,16 +164,30 @@ impl Dip {
         let code: Vec<f32> = (0..config.code * cy * cx)
             .map(|_| 0.1 * rng.r#gen::<f32>())
             .collect();
+        Self::with_prior(
+            DipNet::new(config, &ad),
+            Tensor::from_data(TensorData::new(code, [1, config.code, cy, cx]), &ad),
+            &AdamConfig::new(),
+        )
+    }
+}
+
+impl<P: Prior> Dip<P> {
+    /// `prior` trained from the input `code` by Adam of `adam`. Both must be on an autodiff
+    /// device ([`Device::autodiff`]): elsewhere the weights would take no gradient.
+    pub fn with_prior(prior: P, code: Tensor<4>, adam: &AdamConfig) -> Result<Self, NnError> {
+        let mut devices = prior.devices().into_iter().chain([code.device()]);
+        if let Some(d) = devices.find(|d| !d.is_autodiff()) {
+            return Err(NnError::Invalid(format!("DIP on {d:?}, without autodiff")));
+        }
         Ok(Self {
-            shape: config.shape,
-            net: DipNet::new(config, &ad),
-            code: Tensor::from_data(TensorData::new(code, [1, config.code, cy, cx]), &ad),
-            optim: AdamConfig::new().init(),
+            net: prior,
+            code,
+            optim: adam.init(),
         })
     }
 
-    /// The network's current object, `[ny, nx, 2]` as [`ObjectLoss`] takes it: amplitude in
-    /// `(0, 2)`, phase in `(-π, π)`.
+    /// The network's current object, `[ny, nx, 2]` as [`ObjectLoss`] takes it.
     pub fn object(&self) -> Tensor<3> {
         self.forward().inner()
     }
@@ -159,20 +201,7 @@ impl Dip {
 
     /// The object in the weights' autodiff graph.
     fn forward(&self) -> Tensor<3> {
-        let [ny, nx] = self.shape;
-        let raw = self.net.forward(self.code.clone());
-        // 2·sigmoid(x), as 1 + tanh(x/2): burn's sigmoid computes in f32 whatever the dtype.
-        let amp = tanh(
-            raw.clone()
-                .slice([0..1, 0..1, 0..ny, 0..nx])
-                .reshape([ny, nx])
-                * 0.5,
-        ) + 1.0;
-        let phase = tanh(raw.slice([0..1, 1..2, 0..ny, 0..nx]).reshape([ny, nx])) * PI;
-        Tensor::stack(
-            vec![amp.clone() * phase.clone().cos(), amp * phase.sin()],
-            2,
-        )
+        self.net.object(self.code.clone())
     }
 
     /// `loss` at the current object and its weight gradient, that of `⟨O(θ), g⟩`.
@@ -473,7 +502,6 @@ pub(crate) mod tests {
         };
         let net = dip.net.clone().map(&mut shift);
         let shifted = Dip {
-            shape: dip.shape,
             net,
             code: dip.code.clone(),
             optim: AdamConfig::new().init(),
@@ -570,6 +598,60 @@ pub(crate) mod tests {
             dip.step(&mut Transposed, 1e-2),
             Err(NnError::Invalid(_))
         ));
+    }
+
+    /// The object as its own parameters, so that one Adam step on it is the textbook one.
+    #[derive(Module, Debug)]
+    struct Pixels {
+        o: Param<Tensor<3>>,
+    }
+
+    impl Prior for Pixels {
+        fn object(&self, _code: Tensor<4>) -> Tensor<3> {
+            self.o.val()
+        }
+    }
+
+    #[test]
+    fn a_prior_takes_the_adam_step_of_its_config() {
+        let device = Device::cuda(0);
+        let ad = device.clone().autodiff();
+        let shape = [3, 5, 2];
+        let mut rng = ChaCha8Rng::seed_from_u64(4);
+        let mut draw = || -> Vec<f64> { (0..30).map(|_| rng.gen_range(-1.0..1.0)).collect() };
+        let (start, target) = (draw(), draw());
+        let pixels = |d: &Device| Pixels {
+            o: Param::from_tensor(Tensor::from_data(
+                TensorData::new(start.clone(), shape),
+                (d, DType::F64),
+            )),
+        };
+        let code = |d: &Device| Tensor::<4>::zeros([1, 1, 1, 1], d);
+        let adam = AdamConfig::new();
+        assert!(matches!(
+            Dip::with_prior(pixels(&device), code(&ad), &adam),
+            Err(NnError::Invalid(_))
+        ));
+        assert!(matches!(
+            Dip::with_prior(pixels(&ad), code(&device), &adam),
+            Err(NnError::Invalid(_))
+        ));
+
+        // lr·g/(|g| + 0.5), against about lr·sign(g) at the default epsilon of 1e-5.
+        let (eps, lr) = (0.5_f32, 0.1);
+        let mut dip = Dip::with_prior(pixels(&ad), code(&ad), &adam.with_epsilon(eps)).unwrap();
+        dip.step(&mut Fit(target.clone()), lr).unwrap();
+        let got = host64(dip.object());
+        for k in 0..start.len() {
+            // The first step's bias corrections leave the gradient over its magnitude.
+            let g = start[k] - target[k];
+            let want = start[k] - lr * g / (g.abs() + f64::from(eps));
+            assert!(
+                (got[k] - want).abs() < 1e-6 * lr,
+                "pixel {k}: {} vs {want}",
+                got[k]
+            );
+        }
     }
 
     #[test]
