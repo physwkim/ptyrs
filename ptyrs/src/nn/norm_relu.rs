@@ -13,6 +13,7 @@ use burn::backend::tensor::FloatTensor;
 use burn::backend::{Autodiff, AutodiffBackend, Backend, Dispatch, backend_extension};
 use burn::nn::BatchNorm;
 use burn::prelude::*;
+use burn::tensor::DType;
 use burn::tensor::activation::relu;
 use burn_cubecl::CubeBackend;
 use burn_cubecl::cubecl::prelude::{CubeCount, CubeDim, InputScalar};
@@ -26,15 +27,16 @@ use crate::nn::grid::grid;
 /// `[rows, channels]` view of `x`, which costs none of the transposing copy a channels-first view
 /// does.
 ///
-/// On an autodiff device with `n` training, the batch statistics, the running-statistics update
-/// and the gradients are burn's; elsewhere this is burn's own inference path. Accumulation runs
-/// in the activation's float type, so the fused path is for f32 and f64.
+/// On an autodiff device with `n` training and `x` in f32 or f64, the batch statistics, the
+/// running-statistics update and the gradients are burn's; elsewhere this is burn's own path. The
+/// kernels sum in the activation's float type, which in f16 or bf16 loses the batch sums.
 pub fn norm_relu<const D: usize>(n: &BatchNorm, x: Tensor<D>) -> Tensor<D> {
     let dims = x.dims();
     let cols = dims[D - 1];
     let x = x.reshape([dims[..D - 1].iter().product(), cols]);
     let device = x.device();
-    let y = if device.is_autodiff() && n.training.is_enabled() {
+    let wide = matches!(x.dtype(), DType::F32 | DType::F64);
+    let y = if device.is_autodiff() && n.training.is_enabled() && wide {
         // burn's batch_norm_train checks; the kernels read γ and β at every channel.
         assert_eq!(n.gamma.dims(), [cols], "invalid batch norm gamma shape");
         assert_eq!(n.beta.dims(), [cols], "invalid batch norm beta shape");
@@ -839,6 +841,18 @@ mod tests {
                 mean.len() == cols && mean.iter().all(|v| v.is_nan()),
                 "{mean:?}"
             );
+        }
+    }
+
+    /// f16 and bf16 take burn's path, which sums wider than the activation, so they match it bit
+    /// for bit.
+    #[test]
+    fn half_precision_takes_burns_path() {
+        for dtype in [DType::F16, DType::BF16] {
+            let (p, x, w) = inputs(1013, 24, dtype, false);
+            // The first call may autotune burn's kernels; the second runs those it picked.
+            compare(&p, &x, &w, 1e-2);
+            compare(&p, &x, &w, 0.0);
         }
     }
 

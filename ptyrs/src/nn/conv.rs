@@ -22,6 +22,7 @@ use burn::module::{
 use burn::nn::conv::Conv2d;
 use burn::nn::{BatchNorm, PaddingConfig2d};
 use burn::prelude::*;
+use burn::tensor::DType;
 use burn::tensor::ops::ConvOptions;
 use burn_cubecl::CubeBackend;
 use burn_cubecl::cubecl::prelude::CubeDim;
@@ -48,11 +49,14 @@ impl Conv {
     /// and give that memory as a permuted view, so neither permutation copies.
     ///
     /// On an autodiff device a 3×3 convolution of stride 1, dilation 1, one group and one pixel
-    /// of padding on every side takes its output and its input and bias gradients from the same
-    /// burn calls, and its weight gradient from `weight_grad`; anything else is burn's throughout.
+    /// of padding on every side, in f32 or f64, takes its output and its input and bias gradients
+    /// from the same burn calls, and its weight gradient from `weight_grad`; anything else is
+    /// burn's throughout. `weight_grad` sums in the activation's float type, too narrow in f16 or
+    /// bf16.
     pub fn forward(&self, x: Tensor<4>) -> Tensor<4> {
         let c = &self.0;
-        if !(x.device().is_autodiff() && is_3x3_same(c)) {
+        let wide = matches!(x.dtype(), DType::F32 | DType::F64);
+        if !(x.device().is_autodiff() && is_3x3_same(c) && wide) {
             return c.forward(x.permute([0, 3, 1, 2])).permute([0, 2, 3, 1]);
         }
         let (x, weight) = (x.into_dispatch(), c.weight.val().into_dispatch());
@@ -788,6 +792,23 @@ mod tests {
             let dw = Tensor::<4>::from_primitive::<CubeBackend>(dw);
             assert_eq!(dw.dims(), [co, ci, 3, 3]);
             assert_eq!(host(dw), vec![0.0; co * ci * 9], "{:?}", [n, h, w, ci, co]);
+        }
+    }
+
+    /// f16 and bf16 take burn's path, which sums wider than the activation, so they match it bit
+    /// for bit.
+    #[test]
+    fn half_precision_takes_burns_path() {
+        let c = case(2, 33, 40, 8, 16);
+        let device = crate::nn::cuda(0).autodiff();
+        let inputs = inputs(c, &device);
+        for dtype in [DType::F16, DType::BF16] {
+            // burn's autotune may pick its kernel on the first call of a shape; pick it first.
+            run(c, &inputs, dtype, false);
+            let (fused, burn) = (run(c, &inputs, dtype, true), run(c, &inputs, dtype, false));
+            for (name, (a, b)) in ["y", "dx", "dw", "db"].iter().zip(fused.iter().zip(&burn)) {
+                assert!(a == b, "{dtype:?}: {name} differs");
+            }
         }
     }
 
