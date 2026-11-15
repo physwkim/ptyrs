@@ -3,15 +3,14 @@
 
 use std::f64::consts::PI;
 
-use burn::module::Param;
-use burn::nn::conv::{Conv2d, Conv2dConfig};
+use burn::nn::conv::Conv2dConfig;
 use burn::nn::{BatchNorm, BatchNormConfig, PaddingConfig2d};
 use burn::prelude::*;
 use burn::tensor::activation::{relu, sigmoid, tanh};
 use burn::tensor::module::{interpolate, max_pool2d};
 use burn::tensor::ops::{InterpolateMode, InterpolateOptions, MaxPoolOptions};
 
-use crate::nn::conv::conv;
+use crate::nn::conv::Conv;
 use crate::nn::norm_relu::norm_relu;
 
 /// Two 3×3 same-padded convolutions, each followed by batch normalisation and ReLU, on
@@ -19,9 +18,9 @@ use crate::nn::norm_relu::norm_relu;
 /// epochs at the mean patch: the object shows only as a small modulation of the probe's far field.
 #[derive(Module, Debug)]
 pub(crate) struct Block {
-    a: Conv2d,
+    a: Conv,
     na: BatchNorm,
-    b: Conv2d,
+    b: Conv,
     nb: BatchNorm,
 }
 
@@ -31,6 +30,7 @@ impl Block {
             Conv2dConfig::new([cin, cout], [3, 3])
                 .with_padding(PaddingConfig2d::Same)
                 .init(device)
+                .into()
         };
         Self {
             a: conv(cin, cout),
@@ -41,12 +41,12 @@ impl Block {
     }
 
     pub(crate) fn forward(&self, x: Tensor<4>) -> Tensor<4> {
-        let x = norm_relu(&self.na, conv(&self.a, x));
-        norm_relu(&self.nb, conv(&self.b, x))
+        let x = norm_relu(&self.na, self.a.forward(x));
+        norm_relu(&self.nb, self.b.forward(x))
     }
 
-    fn fold(&self) -> [Conv2d; 2] {
-        [fold(&self.a, &self.na), fold(&self.b, &self.nb)]
+    fn fold(&self) -> [Conv; 2] {
+        [self.a.fold(&self.na), self.b.fold(&self.nb)]
     }
 }
 
@@ -55,20 +55,6 @@ impl Block {
 /// permuted view, so neither permutation copies.
 pub(crate) fn channels_first(x: Tensor<4>, f: impl FnOnce(Tensor<4>) -> Tensor<4>) -> Tensor<4> {
     f(x.permute([0, 3, 1, 2])).permute([0, 2, 3, 1])
-}
-
-/// `c` followed by `n` at its running statistics as one convolution.
-fn fold(c: &Conv2d, n: &BatchNorm) -> Conv2d {
-    let [co] = n.gamma.shape().dims();
-    let s = n.gamma.val() / (n.running_var.value() + n.epsilon).sqrt();
-    let bias = c.bias.as_ref().expect("Block's convolutions carry a bias");
-    Conv2d {
-        weight: Param::from_tensor(c.weight.val() * s.clone().reshape([co, 1, 1, 1])),
-        bias: Some(Param::from_tensor(
-            (bias.val() - n.running_mean.value()) * s + n.beta.val(),
-        )),
-        ..c.clone()
-    }
 }
 
 /// One stage of [`run`]: a [`Block`], or its two convolutions with the normalisation folded in.
@@ -82,15 +68,15 @@ impl Stage for Block {
     }
 }
 
-impl Stage for [Conv2d; 2] {
+impl Stage for [Conv; 2] {
     fn forward(&self, x: Tensor<4>) -> Tensor<4> {
-        relu(conv(&self[1], relu(conv(&self[0], x))))
+        relu(self[1].forward(relu(self[0].forward(x))))
     }
 }
 
 /// The decoder's stages on channels-last `x`, each followed by a nearest 2× upsampling, then its
 /// output convolution to `[batch, 1, h, w]`.
-fn decode<S: Stage>(stages: &[S], out: &Conv2d, mut x: Tensor<4>) -> Tensor<4> {
+fn decode<S: Stage>(stages: &[S], out: &Conv, mut x: Tensor<4>) -> Tensor<4> {
     for s in stages {
         let [_, h, w, _] = x.dims();
         x = channels_first(s.forward(x), |x| {
@@ -100,15 +86,15 @@ fn decode<S: Stage>(stages: &[S], out: &Conv2d, mut x: Tensor<4>) -> Tensor<4> {
             )
         });
     }
-    out.forward(x.permute([0, 3, 1, 2]))
+    out.forward(x).permute([0, 3, 1, 2])
 }
 
 /// The network over its stages: the encoder's, each followed by a 2× max pool, then each
 /// decoder's with its output convolution and range map. The stages run channels-last.
 fn run<S: Stage>(
     encoder: &[S],
-    amp: (&[S], &Conv2d),
-    phase: (&[S], &Conv2d),
+    amp: (&[S], &Conv),
+    phase: (&[S], &Conv),
     x: Tensor<4>,
 ) -> (Tensor<4>, Tensor<4>) {
     let mut x = x.permute([0, 2, 3, 1]);
@@ -124,7 +110,7 @@ fn run<S: Stage>(
 #[derive(Module, Debug)]
 struct Decoder {
     blocks: Vec<Block>,
-    out: Conv2d,
+    out: Conv,
 }
 
 impl Decoder {
@@ -135,11 +121,12 @@ impl Decoder {
             .collect();
         let out = Conv2dConfig::new([top >> depth, 1], [3, 3])
             .with_padding(PaddingConfig2d::Same)
-            .init(device);
+            .init(device)
+            .into();
         Self { blocks, out }
     }
 
-    fn fold(&self) -> (Vec<[Conv2d; 2]>, Conv2d) {
+    fn fold(&self) -> (Vec<[Conv; 2]>, Conv) {
         (
             self.blocks.iter().map(Block::fold).collect(),
             self.out.clone(),
@@ -205,9 +192,9 @@ impl PtychoNN {
 /// the copy gives the network's output to rounding without the normalisation's kernels.
 #[derive(Debug)]
 pub(crate) struct Folded {
-    encoder: Vec<[Conv2d; 2]>,
-    amp: (Vec<[Conv2d; 2]>, Conv2d),
-    phase: (Vec<[Conv2d; 2]>, Conv2d),
+    encoder: Vec<[Conv; 2]>,
+    amp: (Vec<[Conv; 2]>, Conv),
+    phase: (Vec<[Conv; 2]>, Conv),
 }
 
 impl Folded {
@@ -226,7 +213,7 @@ mod tests {
     use super::*;
     use crate::nn::dip::tests::ToF64;
     use crate::nn::predictor::host;
-    use burn::module::RunningState;
+    use burn::module::{Param, RunningState};
     use burn::tensor::{DType, Distribution};
 
     /// A small network whose batch normalisations hold drawn statistics, not the identity they
@@ -275,8 +262,8 @@ mod tests {
         let tol = 4.0 * f64::from(f32::EPSILON);
         for (b, f) in blocks.zip(stages) {
             for (c, n, f) in [(&b.a, &b.na, &f[0]), (&b.b, &b.nb, &f[1])] {
-                let [w, fw] = [&c.weight, &f.weight].map(|p| h(p.val()));
-                let [b, fb] = [&c.bias, &f.bias].map(|p| h(p.as_ref().unwrap().val()));
+                let [w, fw] = [c.weight(), f.weight()].map(|p| h(p.val()));
+                let [b, fb] = [c.bias(), f.bias()].map(|p| h(p.unwrap().val()));
                 let [g, beta, mean, var] = [
                     n.gamma.val(),
                     n.beta.val(),

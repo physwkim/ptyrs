@@ -14,8 +14,12 @@ use burn::backend::cubecl::dtype_to_storage_type;
 use burn::backend::ops::{FloatTensorOps, ModuleOps};
 use burn::backend::tensor::FloatTensor;
 use burn::backend::{Autodiff, Backend, Dispatch, backend_extension};
-use burn::nn::PaddingConfig2d;
+use burn::module::{
+    Content, Devices, DisplaySettings, ModuleDisplay, ModuleDisplayDefault, ModuleMapper,
+    ModuleVisitor, Param,
+};
 use burn::nn::conv::Conv2d;
+use burn::nn::{BatchNorm, PaddingConfig2d};
 use burn::prelude::*;
 use burn::tensor::ops::ConvOptions;
 use burn_cubecl::CubeBackend;
@@ -24,22 +28,121 @@ use burn_cubecl::kernel::into_contiguous;
 use burn_cubecl::ops::numeric::empty_device_contiguous_dtype;
 use burn_cubecl::tensor::CubeTensor;
 
-/// `c` on channels-last `x`, `[batch, h, w, channels]`: `c.forward` on the channels-first view,
-/// permuted back. burn's CUDA convolutions run channels-last and take and give that memory as a
-/// permuted view, so neither permutation copies.
-///
-/// On an autodiff device a 3×3 convolution of stride 1, dilation 1, one group and one pixel of
-/// padding on every side takes its output and its input and bias gradients from the same burn
-/// calls, and its weight gradient from `weight_grad`; anything else is burn's throughout.
-pub fn conv(c: &Conv2d, x: Tensor<4>) -> Tensor<4> {
-    if !(x.device().is_autodiff() && is_3x3_same(c)) {
-        return c.forward(x.permute([0, 3, 1, 2])).permute([0, 2, 3, 1]);
+/// A convolution of the networks, whose only forward is [`Conv::forward`]. Its record is the
+/// [`Conv2d`]'s it wraps, field for field, so saved networks read the same.
+#[derive(Clone, Debug)]
+pub struct Conv(Conv2d);
+
+impl From<Conv2d> for Conv {
+    fn from(c: Conv2d) -> Self {
+        Self(c)
     }
-    let (x, weight) = (x.into_dispatch(), c.weight.val().into_dispatch());
-    Tensor::<4>::from_dispatch(match &c.bias {
-        None => <Dispatch as ConvOps>::conv3x3(x, weight),
-        Some(b) => <Dispatch as ConvOps>::conv3x3_bias(x, weight, b.val().into_dispatch()),
-    })
+}
+
+impl Conv {
+    /// The convolution on channels-last `x`, `[batch, h, w, channels]`: `Conv2d::forward` on the
+    /// channels-first view, permuted back. burn's CUDA convolutions run channels-last and take
+    /// and give that memory as a permuted view, so neither permutation copies.
+    ///
+    /// On an autodiff device a 3×3 convolution of stride 1, dilation 1, one group and one pixel
+    /// of padding on every side takes its output and its input and bias gradients from the same
+    /// burn calls, and its weight gradient from `weight_grad`; anything else is burn's throughout.
+    pub fn forward(&self, x: Tensor<4>) -> Tensor<4> {
+        let c = &self.0;
+        if !(x.device().is_autodiff() && is_3x3_same(c)) {
+            return c.forward(x.permute([0, 3, 1, 2])).permute([0, 2, 3, 1]);
+        }
+        let (x, weight) = (x.into_dispatch(), c.weight.val().into_dispatch());
+        Tensor::<4>::from_dispatch(match &c.bias {
+            None => <Dispatch as ConvOps>::conv3x3(x, weight),
+            Some(b) => <Dispatch as ConvOps>::conv3x3_bias(x, weight, b.val().into_dispatch()),
+        })
+    }
+
+    /// The weight, `[out channels, in channels, kh, kw]`.
+    pub fn weight(&self) -> &Param<Tensor<4>> {
+        &self.0.weight
+    }
+
+    pub fn bias(&self) -> Option<&Param<Tensor<1>>> {
+        self.0.bias.as_ref()
+    }
+
+    /// This convolution followed by `n` at its running statistics as one convolution.
+    pub(crate) fn fold(&self, n: &BatchNorm) -> Self {
+        let c = &self.0;
+        let [co] = n.gamma.shape().dims();
+        let s = n.gamma.val() / (n.running_var.value() + n.epsilon).sqrt();
+        let bias = c
+            .bias
+            .as_ref()
+            .expect("a folded convolution carries a bias");
+        Self(Conv2d {
+            weight: Param::from_tensor(c.weight.val() * s.clone().reshape([co, 1, 1, 1])),
+            bias: Some(Param::from_tensor(
+                (bias.val() - n.running_mean.value()) * s + n.beta.val(),
+            )),
+            ..c.clone()
+        })
+    }
+}
+
+impl Module for Conv {
+    fn collect_devices(&self, devices: Devices) -> Devices {
+        self.0.collect_devices(devices)
+    }
+
+    fn fork(self, device: &Device) -> Self {
+        Self(self.0.fork(device))
+    }
+
+    fn to_device(self, device: &Device) -> Self {
+        Self(self.0.to_device(device))
+    }
+
+    fn train(self) -> Self {
+        Self(self.0.train())
+    }
+
+    fn valid(&self) -> Self {
+        Self(self.0.valid())
+    }
+
+    fn materialize(self) -> Self {
+        Self(self.0.materialize())
+    }
+
+    fn num_params(&self) -> usize {
+        Module::num_params(&self.0)
+    }
+
+    fn visit<V: ModuleVisitor>(&self, visitor: &mut V) {
+        self.0.visit(visitor)
+    }
+
+    fn map<M: ModuleMapper>(self, mapper: &mut M) -> Self {
+        Self(self.0.map(mapper))
+    }
+}
+
+impl ModuleDisplayDefault for Conv {
+    fn content(&self, content: Content) -> Option<Content> {
+        self.0.content(content)
+    }
+
+    fn num_params(&self) -> usize {
+        Module::num_params(self)
+    }
+}
+
+impl ModuleDisplay for Conv {
+    fn custom_settings(&self) -> Option<DisplaySettings> {
+        self.0.custom_settings()
+    }
+
+    fn custom_content(&self, content: Content) -> Option<Content> {
+        self.0.custom_content(content)
+    }
 }
 
 /// Whether `c` is a 3×3 convolution of stride 1, dilation 1 and one group, padded by one pixel on
@@ -526,8 +629,8 @@ mod tests {
     }
 
     /// The output and the input, weight and bias gradients of `Σ y·g`, `y` the convolution of
-    /// `inputs` in `dtype` through [`conv`] if `fused`, else through `Conv2d::forward`. A gradient
-    /// not asked for is empty.
+    /// `inputs` in `dtype` through [`Conv::forward`] if `fused`, else through `Conv2d::forward`. A
+    /// gradient not asked for is empty.
     fn run(c: Case, inputs: &[Tensor<4>; 4], dtype: DType, fused: bool) -> [Vec<f64>; 4] {
         let [x, weight, bias, g] = inputs.clone().map(|t| t.cast(dtype));
         let mut conv2d = Conv2dConfig::new([c.ci, c.co], [3, 3])
@@ -543,7 +646,7 @@ mod tests {
             x.clone()
         };
         let y = if fused {
-            conv(&conv2d, view)
+            Conv(conv2d.clone()).forward(view)
         } else {
             conv2d
                 .forward(view.permute([0, 3, 1, 2]))
@@ -569,9 +672,9 @@ mod tests {
         (err, scale)
     }
 
-    /// [`conv`] against burn's path: the output and the input and bias gradients are the same
-    /// burn calls, so bit for bit; the weight gradient to `1e-12` of its largest magnitude in f64,
-    /// and to `2e-5` of the f64 one in f32.
+    /// [`Conv::forward`] against burn's path: the output and the input and bias gradients are the
+    /// same burn calls, so bit for bit; the weight gradient to `1e-12` of its largest magnitude in
+    /// f64, and to `2e-5` of the f64 one in f32.
     fn agrees(c: Case) {
         let device = crate::nn::cuda(0).autodiff();
         let inputs = inputs(c, &device);
@@ -631,6 +734,13 @@ mod tests {
             strided: true,
             ..case(2, 11, 37, 6, 9)
         });
+    }
+
+    /// Every convolution PtychoNN runs at its defaults.
+    #[test]
+    fn ptychonn_convolutions() {
+        // The decoders' output convolution, whose f32 weight gradient from burn is off by 4.8e-5.
+        agrees(case(32, 64, 64, 16, 1));
     }
 
     #[test]

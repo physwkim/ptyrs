@@ -21,7 +21,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use burn::module::{Param, RunningState};
-use burn::nn::conv::{Conv2d, Conv2dConfig};
+use burn::nn::conv::Conv2dConfig;
 use burn::nn::{BatchNorm, BatchNormConfig, PaddingConfig2d};
 use burn::optim::AdamConfig;
 use burn::prelude::*;
@@ -32,7 +32,7 @@ use cuda_core::CudaContext;
 use ptyrs::base::{C64, Object, Probe, Scan, Stack};
 use ptyrs::engine::{GpuOptions, Ptycho};
 use ptyrs::io::{read_cxi, read_modes, write_modes};
-use ptyrs::nn::conv::conv;
+use ptyrs::nn::conv::Conv;
 use ptyrs::nn::dip::{Dip, GpuLoss, LossError, ObjectLoss, Prior};
 use ptyrs::nn::norm_relu::norm_relu;
 use rust_hdf5::H5File;
@@ -42,16 +42,16 @@ use rust_hdf5::H5File;
 /// statistics, as torch's in train mode.
 #[derive(Module, Debug)]
 struct DoubleConv {
-    c0: Conv2d,
+    c0: Conv,
     n1: BatchNorm,
-    c3: Conv2d,
+    c3: Conv,
     n4: BatchNorm,
 }
 
 impl DoubleConv {
     fn forward(&self, x: Tensor<4>) -> Tensor<4> {
-        let x = norm_relu(&self.n1, conv(&self.c0, x));
-        norm_relu(&self.n4, conv(&self.c3, x))
+        let x = norm_relu(&self.n1, self.c0.forward(x));
+        norm_relu(&self.n4, self.c3.forward(x))
     }
 }
 
@@ -70,7 +70,7 @@ struct UNet {
     inc: DoubleConv,
     down: Vec<DoubleConv>,
     up: Vec<DoubleConv>,
-    outc: Conv2d,
+    outc: Conv,
 }
 
 impl UNet {
@@ -88,7 +88,7 @@ impl UNet {
             let x_up = upsample(upsample(x, 2, w), 1, h);
             x = u.forward(Tensor::cat(vec![s, x_up], 3));
         }
-        conv(&self.outc, x)
+        self.outc.forward(x)
     }
 }
 
@@ -159,7 +159,7 @@ impl Weights {
         Ok(Tensor::from_data(data, (&self.device, self.dtype)))
     }
 
-    fn conv(&self, name: &str, bias: bool) -> Result<Conv2d, LossError> {
+    fn conv(&self, name: &str, bias: bool) -> Result<Conv, LossError> {
         let weight: Tensor<4> = self.tensor(&format!("{name}.weight"))?;
         let [cout, cin, kh, kw] = weight.dims();
         let (ph, pw) = (kh / 2, kw / 2);
@@ -171,7 +171,7 @@ impl Weights {
         if bias {
             c.bias = Some(Param::from_tensor(self.tensor(&format!("{name}.bias"))?));
         }
-        Ok(c)
+        Ok(c.into())
     }
 
     /// torch's `BatchNorm2d` at its defaults, which are burn's: epsilon 1e-5, momentum 0.1.

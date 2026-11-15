@@ -11,7 +11,7 @@ use std::f64::consts::PI;
 use std::sync::Arc;
 
 use burn::nn::PaddingConfig2d;
-use burn::nn::conv::{Conv2d, Conv2dConfig};
+use burn::nn::conv::Conv2dConfig;
 use burn::optim::{AdamConfig, GradientsParams, ModuleOptimizer};
 use burn::prelude::*;
 use burn::tensor::DType;
@@ -25,7 +25,7 @@ use rand_chacha::ChaCha8Rng;
 use crate::base::{C64, Object, Probe, Scan, Stack};
 use crate::engine::{EngineError, GpuOptions, GpuPtycho};
 use crate::nn::NnError;
-use crate::nn::conv::conv;
+use crate::nn::conv::Conv;
 use crate::nn::interop::{lend_complex, lend_out_complex};
 use crate::nn::ptychonn::{Block, channels_first};
 
@@ -63,7 +63,7 @@ pub struct DipNet {
     down: Vec<Block>,
     bottom: Block,
     up: Vec<Block>,
-    out: Conv2d,
+    out: Conv,
     shape: [usize; 2],
 }
 
@@ -83,7 +83,8 @@ impl DipNet {
             .collect();
         let out = Conv2dConfig::new([w(0), 2], [3, 3])
             .with_padding(PaddingConfig2d::Same)
-            .init(device);
+            .init(device)
+            .into();
         Self {
             down,
             bottom: Block::new(top, top, device),
@@ -113,7 +114,7 @@ impl DipNet {
             });
             x = b.forward(Tensor::cat(vec![x_up, s], 3));
         }
-        conv(&self.out, x)
+        self.out.forward(x)
     }
 }
 
