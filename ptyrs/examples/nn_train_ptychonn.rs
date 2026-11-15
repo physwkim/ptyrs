@@ -22,8 +22,7 @@ use common::scan;
 use ptyrs::base::{Object, Probe, sim};
 use ptyrs::nn::data::{random_object, structured_object};
 use ptyrs::nn::predictor::{
-    CHANNELS, Patches, PredictorConfig, Samples, TrainOptions, mean_frame_total, object_patches,
-    train,
+    PredictorConfig, Samples, TrainOptions, mean_frame_total, object_patches, train,
 };
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
@@ -48,13 +47,13 @@ fn samples(
             .chunks(seeds.len().div_ceil(threads).max(1))
             .map(|chunk| {
                 s.spawn(move || {
-                    let mut part = Samples::new(config);
+                    let mut part = Samples::new(config).unwrap();
                     for &seed in chunk {
                         let (scan, object, addr) =
                             scan(config.frame[0], probe, seed, Some(draw(shape, seed)));
-                        let mut all = Samples::new(config);
-                        all.push_scan(config, &scan.counts, &object, &addr).unwrap();
-                        part.extend(pick(all, per_scan, seed));
+                        let mut all = Samples::new(config).unwrap();
+                        all.push_scan(&scan.counts, &object, &addr).unwrap();
+                        part.extend(pick(all, per_scan, seed)).unwrap();
                     }
                     part
                 })
@@ -62,9 +61,9 @@ fn samples(
             .collect();
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
-    let mut all = Samples::new(config);
+    let mut all = Samples::new(config).unwrap();
     for p in parts {
-        all.extend(p);
+        all.extend(p).unwrap();
     }
     all
 }
@@ -79,22 +78,7 @@ fn pick(s: Samples, n: usize, seed: u64) -> Samples {
     rng.set_stream(1);
     let mut idx = rand::seq::index::sample(&mut rng, s.len(), n).into_vec();
     idx.sort_unstable();
-    let [_, py, px] = s.target.dims;
-    let plane = py * px;
-    let gather = |v: &[f32], plane: usize| -> Vec<f32> {
-        idx.iter()
-            .flat_map(|&i| &v[i * plane..(i + 1) * plane])
-            .copied()
-            .collect()
-    };
-    Samples {
-        input: gather(&s.input, CHANNELS * plane),
-        target: Patches {
-            dims: [n, py, px],
-            amp: gather(&s.target.amp, plane),
-            phase: gather(&s.target.phase, plane),
-        },
-    }
+    s.select(&idx)
 }
 
 fn l1(a: &[f32], b: &[f32]) -> f64 {
@@ -137,7 +121,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         (STRUCTURED..STRUCTURED + structured as u64).collect(),
         per_scan,
         structured_object,
-    ));
+    ))?;
     let valid_set = samples(
         &config,
         &probe,
@@ -180,15 +164,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for (name, _, scan, truth, addr, _) in common::held_out(frame, &probe) {
         let patches = predictor.predict(&scan.counts, mean_frame_total(&scan.counts))?;
-        let want = object_patches(&truth, &addr, config.patch());
-        let ones = vec![1.0; want.amp.len()];
-        let zeros = vec![0.0; want.amp.len()];
+        let want = object_patches(&truth, &addr, config.patch())?;
+        let ones = vec![1.0; want.amp().len()];
+        let zeros = vec![0.0; want.amp().len()];
         println!(
             "{name:12} amp L1 pred {:.4} flat {:.4}   phase L1 pred {:.4} flat {:.4}",
-            l1(&patches.amp, &want.amp),
-            l1(&ones, &want.amp),
-            l1(&patches.phase, &want.phase),
-            l1(&zeros, &want.phase)
+            l1(patches.amp(), want.amp()),
+            l1(&ones, want.amp()),
+            l1(patches.phase(), want.phase()),
+            l1(&zeros, want.phase())
         );
     }
     Ok(())

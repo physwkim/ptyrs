@@ -12,6 +12,13 @@ use super::{AutotuneError, AutotuneKey, AutotuneOutcome};
 use alloc::string::String;
 use cubecl_environment::collections::HashMap;
 
+/// The vendored crates' changes to what their kernels compute, as a segment of every autotune
+/// namespace: a tuner's name carries only its declaring crate's version, which such a change
+/// leaves alone, so a pick timed on the old kernels would be served to the new (a tf32 mma pick,
+/// say, which fails on the f32 operands cubek-matmul now keeps, and panics). Changes with each.
+#[cfg(persistence)]
+const VENDORED_KERNELS: &str = "cubek-matmul-f32";
+
 #[derive(Debug)]
 pub(crate) enum CacheEntry {
     Done {
@@ -159,7 +166,8 @@ impl<K: AutotuneKey> TuneCache<K> {
             use alloc::format;
 
             let config = crate::config::CubeClRuntimeConfig::get();
-            let namespace = Namespace::scoped("autotune", format!("{part}/{name}"));
+            let namespace =
+                Namespace::scoped("autotune", format!("{part}/{VENDORED_KERNELS}/{name}"));
             let table = namespace.as_str().into();
 
             if config.autotune.disable_cache {

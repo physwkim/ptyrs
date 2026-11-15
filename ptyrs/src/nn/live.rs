@@ -32,13 +32,15 @@ pub struct LivePredictor {
 }
 
 impl LivePredictor {
-    /// Tunes and warms the network on `batch` frames before it returns, which takes seconds.
+    /// Tunes and warms the network on `batch` frames before it returns, which takes seconds;
+    /// fails unless one network call holds them.
     pub fn new(predictor: Predictor, norm: f64, batch: usize) -> Result<Self, NnError> {
         if batch == 0 {
             return Err(NnError::Invalid("batch of 0 frames".into()));
         }
+        predictor.check_call(batch)?;
         let config = predictor.config();
-        let scale = InputScale::new(config.frame, config.bin, norm)?;
+        let scale = InputScale::new(config.frame, config.input, config.bin, norm)?;
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(THREADS)
             .build()
@@ -56,19 +58,13 @@ impl LivePredictor {
     }
 }
 
-/// The network input of `counts`, whole frames of `fsz` values, into `input`: one task per frame
-/// on `pool`.
-fn par_input(
-    pool: &rayon::ThreadPool,
-    scale: &InputScale,
-    fsz: usize,
-    counts: &[u16],
-    input: &mut [f32],
-) {
+/// The network input of `counts`, whole frames of `scale`'s, into `input`: one task per frame on
+/// `pool`.
+fn par_input(pool: &rayon::ThreadPool, scale: &InputScale, counts: &[u16], input: &mut [f32]) {
     pool.install(|| {
         input
             .par_chunks_exact_mut(scale.len())
-            .zip(counts.par_chunks_exact(fsz))
+            .zip(counts.par_chunks_exact(scale.area()))
             .with_max_len(1)
             .for_each(|(o, f)| scale.frame(f, o))
     });
@@ -88,7 +84,7 @@ impl PatchPredictor for LivePredictor {
         self.predictor
             .check_frames(counts, frame)
             .map_err(|e| e.to_string())?;
-        let n = counts.len() / (frame[0] * frame[1]);
+        let n = counts.len() / self.scale.area();
         let batch = self.input.len() / self.scale.len();
         if n > batch {
             return Err(format!("{n} frames for a batch of {batch}"));
@@ -104,7 +100,6 @@ impl PatchPredictor for LivePredictor {
         par_input(
             &self.pool,
             &self.scale,
-            frame[0] * frame[1],
             counts,
             &mut self.input[..n * self.scale.len()],
         );
@@ -112,7 +107,10 @@ impl PatchPredictor for LivePredictor {
             .predictor
             .network(&self.input)
             .map_err(|e| e.to_string())?;
-        for (o, (a, p)) in out.iter_mut().zip(patches.amp.iter().zip(&patches.phase)) {
+        for (o, (a, p)) in out
+            .iter_mut()
+            .zip(patches.amp().iter().zip(patches.phase()))
+        {
             *o = [a * p.cos(), a * p.sin()];
         }
         Ok(())
@@ -123,7 +121,17 @@ impl PatchPredictor for LivePredictor {
 mod tests {
     use super::*;
     use crate::base::{Counts, MASKED};
-    use crate::nn::predictor::diffraction_input;
+    use crate::nn::predictor::tests::{untrained, wide_frames};
+    use crate::nn::predictor::{Input, diffraction_input};
+
+    /// A batch past the frames one network call holds is refused before its input is made; it
+    /// ran in one call that failed past cubecl's buffer or the kernels' 2³² elements.
+    #[test]
+    fn a_batch_past_one_call_is_refused() {
+        let predictor = untrained(&wide_frames(), &crate::nn::cuda(0));
+        let got = LivePredictor::new(predictor, 1e6, 512);
+        assert!(matches!(got, Err(NnError::Invalid(_))));
+    }
 
     #[test]
     fn par_input_is_diffraction_input() {
@@ -142,17 +150,18 @@ mod tests {
             .collect();
         let want = diffraction_input(
             &Counts::from_raw([n, ny, nx], data.clone()).unwrap(),
+            Input::BinnedCentre,
             bin,
             norm,
         )
         .unwrap();
-        let scale = InputScale::new([ny, nx], bin, norm).unwrap();
+        let scale = InputScale::new([ny, nx], Input::BinnedCentre, bin, norm).unwrap();
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(THREADS)
             .build()
             .unwrap();
         let mut got = vec![f32::NAN; want.len()];
-        par_input(&pool, &scale, ny * nx, &data, &mut got);
+        par_input(&pool, &scale, &data, &mut got);
         assert_eq!(
             got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
             want.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
