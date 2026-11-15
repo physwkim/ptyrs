@@ -375,6 +375,23 @@ impl Ptycho {
         crate::features_out(py, self.inner.features().clone(), frame)
     }
 
+    /// How the `position` feature's offsets enter the exit waves, in pty-chi's names:
+    /// `"patch"` moves the probe by them on a window of whole object pixels, `"full_object"`
+    /// samples the object at each view's corner plus offset by Fourier interpolation.
+    /// `Sampling::auto` (pty-chi's `AUTO`) of the optics, object and frame this state was
+    /// built with, unless set.
+    #[getter]
+    fn sampling(&self) -> &'static str {
+        crate::sampling_name(self.inner.sampling())
+    }
+
+    /// Enters the `position` offsets as `sampling`, `"patch"` or `"full_object"`, from here
+    /// on.
+    fn set_sampling(&mut self, sampling: &str) -> PyResult<()> {
+        self.inner.set_sampling(crate::sampling(sampling)?);
+        Ok(())
+    }
+
     #[getter]
     fn object<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray3<C64>>> {
         stack_out(py, self.inner.object().0.clone())
@@ -412,7 +429,8 @@ impl Ptycho {
     }
 
     /// Normalised PyNX LLK of `object` and `probe` over the scan, modelling this state's
-    /// features: the engine's LLK of a state of these arrays, features and optics.
+    /// features as it samples them: the engine's LLK of a state of these arrays, features,
+    /// sampling and optics.
     fn llk<'py>(
         &self,
         py: Python<'py>,
@@ -425,25 +443,22 @@ impl Ptycho {
         let mut at = at.map_err(Error::from)?;
         at.set_features(self.inner.features().clone())
             .map_err(Error::from)?;
+        at.set_sampling(self.inner.sampling());
         llk_dict(py, &at.llk())
     }
 }
 
+/// `Lsqml`'s `opr`: eigenmodes, weights and main-mode weights.
+type Opr<'py> = (
+    PyReadonlyArray3<'py, C64>,
+    PyReadonlyArray2<'py, f64>,
+    Option<PyReadonlyArray1<'py, f64>>,
+);
+
 /// `eigenmodes` `[k, ny, nx]` (k ≥ 1), `weights` `[nframe, k]` and `intensity` `[nframe]` as
-/// the engine's [`ProbeVariation`], `None` without eigenmodes and weights.
-fn variation(
-    eigenmodes: Option<PyReadonlyArray3<'_, C64>>,
-    weights: Option<PyReadonlyArray2<'_, f64>>,
-    intensity: Option<PyReadonlyArray1<'_, f64>>,
-) -> PyResult<Option<ProbeVariation>> {
-    let (eigenmodes, weights) = match (eigenmodes, weights) {
-        (Some(e), Some(w)) => (stack_in(e)?, w),
-        (None, None) if intensity.is_none() => return Ok(None),
-        (None, None) => return Err(PyValueError::new_err("intensity without eigenmodes")),
-        _ => {
-            return Err(PyValueError::new_err("eigenmodes and weights go together"));
-        }
-    };
+/// the engine's [`ProbeVariation`].
+fn variation((eigenmodes, weights, intensity): Opr<'_>) -> PyResult<ProbeVariation> {
+    let eigenmodes = stack_in(eigenmodes)?;
     let k = eigenmodes.len();
     let w = weights.as_array();
     if k == 0 || w.ncols() != k {
@@ -454,7 +469,7 @@ fn variation(
     }
     let var = ProbeVariation::new(eigenmodes, w.iter().copied().collect());
     let Some(c) = intensity else {
-        return Ok(Some(var));
+        return Ok(var);
     };
     let c = c.as_array().to_vec();
     if c.len() != w.nrows() {
@@ -464,7 +479,7 @@ fn variation(
             w.nrows()
         )));
     }
-    Ok(Some(var.with_intensity(c)))
+    Ok(var.with_intensity(c))
 }
 
 /// An error unless `var` holds weights for every frame of `nframe` and eigenmodes of `plane`.
@@ -482,10 +497,13 @@ fn variation_fits(var: &ProbeVariation, nframe: usize, plane: [usize; 2]) -> PyR
 
 /// LSQML across epochs (`ptyrs::engine::Lsqml`); `cost` is `"amplitude"` or `"poisson"`.
 /// With `position`, `[nframe, 2]` offsets as `Ptycho.set_features` takes them, every epoch
-/// models and refines them. With `eigenmodes` `U_i` `[k, ny, nx]` and `weights` `w_fi`
-/// `[nframe, k]`, it models and refines OPR of probe mode 0, frame `f` seeing
-/// `c_f·P_0 + Σ_i w_fi·U_i`, and with `intensity` `[nframe]` the main-mode weights `c_f` too
-/// (1 without); `Ptycho.llk` does not model it.
+/// models and refines them. With `opr`, `(eigenmodes, weights, intensity)` of eigenmodes `U_i`
+/// `[k, ny, nx]`, weights `w_fi` `[nframe, k]` and main-mode weights `c_f` `[nframe]` or
+/// `None`, it models and refines OPR of probe mode 0, frame `f` seeing
+/// `c_f·P_0 + Σ_i w_fi·U_i`, and `c_f` too unless `None` (1 then); `Ptycho.llk` does not
+/// model it. The offsets enter as `sampling`, `"patch"` or `"full_object"` as
+/// `Ptycho.set_sampling` takes it, and without, as `Sampling::auto` of the optics, object and
+/// probe of the first epoch.
 #[pyclass]
 pub(crate) struct Lsqml {
     inner: ptyrs::engine::Lsqml,
@@ -495,16 +513,14 @@ pub(crate) struct Lsqml {
 #[pymethods]
 impl Lsqml {
     #[new]
-    #[pyo3(signature = (batch_size, cost, seed, *, position = None, eigenmodes = None,
-                        weights = None, intensity = None))]
+    #[pyo3(signature = (batch_size, cost, seed, *, position = None, opr = None, sampling = None))]
     fn new(
         batch_size: usize,
         cost: &str,
         seed: u64,
         position: Option<PyReadonlyArray2<'_, f64>>,
-        eigenmodes: Option<PyReadonlyArray3<'_, C64>>,
-        weights: Option<PyReadonlyArray2<'_, f64>>,
-        intensity: Option<PyReadonlyArray1<'_, f64>>,
+        opr: Option<Opr<'_>>,
+        sampling: Option<&str>,
     ) -> PyResult<Self> {
         let lsqml = ptyrs::engine::Lsqml::new(ptyrs::engine::LsqmlParams {
             batch_size,
@@ -512,10 +528,14 @@ impl Lsqml {
             seed,
         })
         .map_err(Error::from)?;
+        let lsqml = match sampling.map(crate::sampling).transpose()? {
+            Some(s) => lsqml.with_sampling(s),
+            None => lsqml,
+        };
         let features = position_only(position)?;
         Ok(Self {
             inner: lsqml.with_features(features).map_err(Error::from)?,
-            var: variation(eigenmodes, weights, intensity)?,
+            var: opr.map(variation).transpose()?,
         })
     }
 
@@ -580,7 +600,8 @@ impl Lsqml {
 }
 
 /// BH across epochs (`ptyrs::engine::Bh`). With `position`, offsets as `Lsqml` takes them,
-/// every epoch models and refines them, their gradient weighted by `position_rho`².
+/// every epoch models and refines them, their gradient weighted by `position_rho`², entered
+/// as `sampling` as `Lsqml` takes it.
 #[pyclass]
 pub(crate) struct Bh(ptyrs::engine::Bh);
 
@@ -588,13 +609,14 @@ pub(crate) struct Bh(ptyrs::engine::Bh);
 impl Bh {
     #[new]
     #[pyo3(signature = (batch_size, probe_rho, seed, *, position = None,
-                        position_rho = crate::POSITION_RHO))]
+                        position_rho = crate::POSITION_RHO, sampling = None))]
     fn new(
         batch_size: usize,
         probe_rho: f64,
         seed: u64,
         position: Option<PyReadonlyArray2<'_, f64>>,
         position_rho: f64,
+        sampling: Option<&str>,
     ) -> PyResult<Self> {
         let bh = ptyrs::engine::Bh::new(ptyrs::engine::BhParams {
             batch_size,
@@ -603,6 +625,10 @@ impl Bh {
             seed,
         })
         .map_err(Error::from)?;
+        let bh = match sampling.map(crate::sampling).transpose()? {
+            Some(s) => bh.with_sampling(s),
+            None => bh,
+        };
         let features = position_only(position)?;
         Ok(Self(bh.with_features(features).map_err(Error::from)?))
     }

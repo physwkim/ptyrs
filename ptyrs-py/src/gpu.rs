@@ -166,7 +166,10 @@ impl GpuPtycho {
         crate::lsqml_steps(py, &self.0.lsqml_steps().map_err(Error::from)?)
     }
 
-    /// As `Ptycho.set_features`, in `f32` on the device; with `fused=True` only.
+    /// As `Ptycho.set_features`, in `f32` on the device; with `fused=True` only. Refused
+    /// features (a `ValueError`) leave the current ones; after a device error (a
+    /// `RuntimeError`), the new ones may stay modelled, with the LLK pass run without its
+    /// graph, or be partly written.
     #[pyo3(signature = (*, scale = None, background = None, position = None))]
     fn set_features(
         &mut self,
@@ -182,6 +185,21 @@ impl GpuPtycho {
     #[getter]
     fn features<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         crate::features_out(py, self.0.features().map_err(Error::from)?, self.1)
+    }
+
+    /// As `Ptycho.sampling`.
+    #[getter]
+    fn sampling(&self) -> &'static str {
+        crate::sampling_name(self.0.sampling())
+    }
+
+    /// As `Ptycho.set_sampling`. After a device error (a `RuntimeError`) the current sampling
+    /// stays if the new one's buffers could not be built; else the new one is entered, and
+    /// the LLK pass runs without its graph until a later `set_features` or `set_sampling`
+    /// captures it again.
+    fn set_sampling(&mut self, sampling: &str) -> PyResult<()> {
+        let sampling = crate::sampling(sampling)?;
+        Ok(self.0.set_sampling(sampling).map_err(Error::from)?)
     }
 
     /// The object, of a multislice object its first slice.
