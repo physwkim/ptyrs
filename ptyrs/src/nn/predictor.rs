@@ -17,7 +17,7 @@
 use std::f64::consts::PI;
 use std::path::{Path, PathBuf};
 
-use crate::base::{AddrTable, C64, Counts, Object, Stack};
+use crate::base::{AddrTable, C64, Counts, Frame, Object, Stack};
 use burn::module::{Module, Param};
 use burn::optim::{AdamConfig, GradientsParams, ModuleOptimizer};
 use burn::prelude::*;
@@ -106,7 +106,7 @@ impl PredictorConfig {
                 ));
             }
         };
-        frame_area(frame)?;
+        Frame::new(frame).map_err(|e| NnError::Invalid(e.to_string()))?;
         Ok(act)
     }
 
@@ -240,19 +240,13 @@ pub fn diffraction_input(
     bin: usize,
     norm: f64,
 ) -> Result<Vec<f32>, NnError> {
-    frames_input(
-        frames.as_slice(),
-        frames.frame_shape().sides(),
-        input,
-        bin,
-        norm,
-    )
+    frames_input(frames.as_slice(), frames.frame_shape(), input, bin, norm)
 }
 
 /// [`diffraction_input`] of whole `[ny, nx]` frames in one slice.
 fn frames_input(
     frames: &[u16],
-    frame: [usize; 2],
+    frame: Frame,
     input: Input,
     bin: usize,
     norm: f64,
@@ -268,19 +262,12 @@ fn frames_input(
     Ok(out)
 }
 
-/// The pixels of a `[ny, nx]` frame; fails past `usize`, where the product wrapped. A frame's
-/// area is formed here alone.
-fn frame_area([ny, nx]: [usize; 2]) -> Result<usize, NnError> {
-    ny.checked_mul(nx)
-        .ok_or_else(|| NnError::Invalid(format!("frame [{ny}, {nx}] of pixels past usize")))
-}
-
 /// [`diffraction_input`] one frame at a time, for frames of one shape, input, binning and norm.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct InputScale {
     frame: [usize; 2],
     bin: usize,
-    /// [`frame_area`] of `frame`.
+    /// `frame`'s area.
     area: usize,
     len: usize,
     scale: f64,
@@ -288,13 +275,9 @@ pub(crate) struct InputScale {
 }
 
 impl InputScale {
-    pub(crate) fn new(
-        [ny, nx]: [usize; 2],
-        input: Input,
-        bin: usize,
-        norm: f64,
-    ) -> Result<Self, NnError> {
-        if bin == 0 || ny == 0 || nx == 0 || ny % bin != 0 || nx % bin != 0 {
+    pub(crate) fn new(frame: Frame, input: Input, bin: usize, norm: f64) -> Result<Self, NnError> {
+        let [ny, nx] = frame.sides();
+        if bin == 0 || ny % bin != 0 || nx % bin != 0 {
             return Err(NnError::Invalid(format!(
                 "frame [{ny}, {nx}] is not a positive multiple of bin {bin}"
             )));
@@ -302,7 +285,7 @@ impl InputScale {
         if norm.is_nan() || norm <= 0.0 {
             return Err(NnError::Invalid(format!("norm {norm} must be positive")));
         }
-        let area = frame_area([ny, nx])?;
+        let area = frame.area();
         // At most `area`.
         let binned = (ny / bin) * (nx / bin);
         let len = input.images().checked_mul(binned).ok_or_else(|| {
@@ -1016,6 +999,8 @@ fn most_frames(act: Activations, pass: Pass, buffer: u64, memory: u64) -> usize 
 #[derive(Debug)]
 pub struct Predictor {
     config: PredictorConfig,
+    /// `config`'s frame.
+    frame: Frame,
     /// What [`save`](Self::save) writes.
     model: Model,
     /// What predicts: `model`'s network folded.
@@ -1029,6 +1014,7 @@ impl Predictor {
         let frames = config.frames_per_call(&model.devices()[0], Pass::Predict)?;
         let net = model.net.fold();
         Ok(Self {
+            frame: Frame::new(config.frame)?,
             config,
             model,
             net,
@@ -1038,6 +1024,10 @@ impl Predictor {
 
     pub fn config(&self) -> &PredictorConfig {
         &self.config
+    }
+
+    pub(crate) fn frame(&self) -> Frame {
+        self.frame
     }
 
     fn device(&self) -> Device {
@@ -1065,7 +1055,7 @@ impl Predictor {
     ) -> Result<Patches, NnError> {
         self.check_frames(frames, frame)?;
         let config = &self.config;
-        let input = frames_input(frames, frame, config.input, config.bin, norm)?;
+        let input = frames_input(frames, self.frame, config.input, config.bin, norm)?;
         let plane = config.patch().iter().product::<usize>();
         let mut out = Patches::empty(config.patch());
         for chunk in input.chunks(self.frames * config.input.images() * plane) {
@@ -1076,7 +1066,7 @@ impl Predictor {
 
     /// Fails unless `frames` is whole frames of this predictor's `frame`.
     pub(crate) fn check_frames(&self, frames: &[u16], frame: [usize; 2]) -> Result<(), NnError> {
-        if frame != self.config.frame || !frames.len().is_multiple_of(frame_area(frame)?) {
+        if frame != self.frame || !frames.len().is_multiple_of(self.frame.area()) {
             return Err(NnError::Invalid(format!(
                 "{} counts of frame {frame:?} for predictor frame {:?}",
                 frames.len(),

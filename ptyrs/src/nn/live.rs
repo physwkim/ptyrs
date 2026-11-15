@@ -40,7 +40,7 @@ impl LivePredictor {
         }
         predictor.check_call(batch)?;
         let config = predictor.config();
-        let scale = InputScale::new(config.frame, config.input, config.bin, norm)?;
+        let scale = InputScale::new(predictor.frame(), config.input, config.bin, norm)?;
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(THREADS)
             .build()
@@ -120,7 +120,7 @@ impl PatchPredictor for LivePredictor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::base::{Counts, MASKED};
+    use crate::base::{Counts, Frame, MASKED};
     use crate::nn::predictor::tests::{untrained, wide_frames};
     use crate::nn::predictor::{Input, diffraction_input};
 
@@ -155,7 +155,8 @@ mod tests {
             norm,
         )
         .unwrap();
-        let scale = InputScale::new([ny, nx], Input::BinnedCentre, bin, norm).unwrap();
+        let frame = Frame::new([ny, nx]).unwrap();
+        let scale = InputScale::new(frame, Input::BinnedCentre, bin, norm).unwrap();
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(THREADS)
             .build()
