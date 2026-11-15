@@ -23,7 +23,7 @@ use std::slice;
 use std::time::Instant;
 
 use ptyrs::base::{C64, Counts, Object, Probe, Scan, sim};
-use ptyrs::engine::{DmParams, Feature, Features, Ptycho, RaarParams, Sampling, SliceWaves, shift};
+use ptyrs::engine::{DmParams, Feature, Features, Ptycho, RaarParams, Sampling, SliceWaves};
 
 #[path = "../tests/common/near_cases.rs"]
 mod near;
@@ -69,16 +69,7 @@ fn truth_scan(c: &near::Case, object: &Object, probe: &Probe, offsets: &[[f64; 2
     let waves = SliceWaves::with_sampling(&optics, views, objects, probe, at, Sampling::FullObject);
     let mut psi = waves.psi().to_vec();
     optics.exit().forward(&mut psi);
-    let [nframe, ny, nx] = c.scan.counts.dims();
-    let (n, nmode) = (ny * nx, c.addr.nmode());
-    let mut counts = vec![0.0; nframe * n];
-    for (f, block) in psi.chunks_exact(nmode * n).enumerate() {
-        for j in 0..n {
-            let icalc: f64 = (0..nmode).map(|m| block[m * n + j].norm_sqr()).sum();
-            counts[f * n + shift(j, ny, nx)] = icalc.round();
-        }
-    }
-    let counts = Counts::from_f64([nframe, ny, nx], &counts, None).unwrap();
+    let counts = near::rounded_counts(&psi, c.addr.nmode(), c.scan.counts.dims());
     Scan {
         counts,
         ..c.scan.clone()
