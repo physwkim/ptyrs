@@ -11,8 +11,8 @@
 
 use ptyrs::base::{AddrTable, C64, Counts, Geometry, Object, Positions, Probe, Stack, View};
 use ptyrs::engine::{
-    Cost, Features, Lsqml, LsqmlBatch, LsqmlParams, LsqmlStep, Observed, Optics, ProbeVariation,
-    Propagator, Sampling, SliceWaves, Wavefield, illumination, llk, shift,
+    Cost, Feature, Features, Lsqml, LsqmlBatch, LsqmlParams, LsqmlStep, Observed, Optics,
+    ProbeVariation, Propagator, Sampling, SliceWaves, Wavefield, illumination, llk, shift,
 };
 
 #[path = "common/worst.rs"]
@@ -421,7 +421,7 @@ fn assert_positions_step(
         .with_sampling(sampling)
         .with_preconditioner(pre)
         .with_features(Features {
-            position: Some(d0.clone()),
+            position: Some(Feature::refined(d0.clone())),
             ..Features::default()
         })
         .unwrap();
@@ -436,7 +436,7 @@ fn assert_positions_step(
                 .flat_map(|(d, s)| [d[0] - s[0], d[1] - s[1]])
                 .collect()
         };
-        let got = run.features().position.as_ref().unwrap();
+        let got = &run.features().position.as_ref().unwrap().values;
         let err = max_rel(&change(got), &change(&want));
         eprintln!("{what} offsets: max rel {err:.3e}");
         assert!(err < 1e-11, "{what} offsets: max rel {err:.3e}");

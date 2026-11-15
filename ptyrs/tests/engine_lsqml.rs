@@ -11,8 +11,8 @@ use std::slice;
 
 use ptyrs::base::{C64, Object, Probe, Stack, View};
 use ptyrs::engine::{
-    Cost, Fft2, Lsqml, LsqmlBatch, LsqmlParams, Optics, ProbeVariation, Ptycho, illumination,
-    obj_probe_to_psi, random_batches,
+    Cost, Feature, Fft2, Lsqml, LsqmlBatch, LsqmlParams, Optics, ProbeVariation, Ptycho,
+    illumination, obj_probe_to_psi, random_batches,
 };
 
 #[path = "common/engine/mod.rs"]
@@ -369,7 +369,7 @@ fn epoch_follows_ptychi_preconditioner_schedule() {
     let eigenmodes = direction(&Stack::filled([3, 32, 32], C64::new(1.0, 0.0)), &mut seed);
     let weights = direction(&Stack::filled([1, 40, 3], C64::new(1e-3, 0.0)), &mut seed);
     let weights = weights.as_slice().iter().map(|w| w.re).collect();
-    let mut var = ProbeVariation::new(eigenmodes, weights);
+    let mut var = ProbeVariation::new(eigenmodes, Feature::refined(weights));
     let start = var.clone();
     let n = pr.plane_len() as f64;
     let power = (0..addr.nframe())

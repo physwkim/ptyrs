@@ -3,20 +3,21 @@
 use std::sync::Arc;
 
 use crate::engine::sampling::Sampling;
-use crate::gpu::sampling::{Modes, WindowBlock, window_views};
+use crate::gpu::sampling::{Modes, StackPoints, WindowBlock, window_views};
 use crate::gpu::{
     C32, EpochOrder, Error as GpuError, FrameWaves, FusedBufs, FusedInputs, Kernels, Model,
-    PositionRule, PowerMax, PsiSums, RpieKernels, ShiftProbe, SliceSource, Solve, UpdateSums,
-    Views, Weight,
+    PositionRule, PositionStep, PowerMax, PsiSums, RpieKernels, ShiftProbe, SliceSource, Solve,
+    UpdateSums, Views, Weight,
 };
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaStream, DeviceBuffer};
 
 use super::device::{
-    FeaturesMut, Moved, MovedLent, PositionLent, RpieBufs, another_model, moved_inputs, moved_shift,
+    FeaturesMut, Moved, MovedLent, MovedScratch, PositionLent, RpieBufs, another_model,
+    moved_inputs, moved_shift,
 };
 use super::propagate::Propagate;
-use super::{Bufs, Cut, Epoch, GpuPtycho, plane_len};
+use super::{Bufs, Cut, Epoch, GpuPtycho};
 use crate::engine::features::{POSITION_LIMIT, POSITION_STEP};
 use crate::engine::ptycho::{Algorithm, llk_due};
 use crate::engine::{EngineError, RpieParams};
@@ -33,7 +34,7 @@ impl GpuPtycho {
             ));
         }
         params.validate()?;
-        if self.dev.has_stepped() {
+        if self.dev.models_scale_or_background() {
             return Err(EngineError::Invalid(
                 "rPIE models no intensity scale or background".into(),
             ));
@@ -51,12 +52,14 @@ impl GpuPtycho {
 }
 
 /// rPIE's state under the position model: a batch's moved probe, the scan order its offsets
-/// step in, and what its batches read by the device's [`Sampling`].
+/// step in, what its batches read by the device's [`Sampling`], and the offsets' step if the
+/// position is refined.
 pub(super) struct RpieMoved {
     probes: Moved,
     /// Never set: rPIE's batches take the frames in scan order.
     order: EpochOrder,
     read: RpieRead,
+    step: Option<PositionStep>,
 }
 
 /// What rPIE's batches read under the position model, by the device's [`Sampling`].
@@ -69,27 +72,26 @@ enum RpieRead {
 }
 
 /// rPIE's windows under [`Sampling::FullObject`]: the views over its batches' windows, a
-/// batch's windows `[nobj, nf_max, ny, nx]`, the views' object, their derivatives over the
-/// position's `y` and `x` on object mode 0, `[2, nf_max, ny, nx]`, and the object's sums over
-/// the windows.
+/// batch's windows `[nobj, nf_max, ny, nx]`, the views' object, and the object's sums over the
+/// windows.
 struct RpieWindows {
     views: Views,
     win: DeviceBuffer<C32>,
-    deriv: DeviceBuffer<C32>,
     sums: UpdateSums,
 }
 
 impl RpieMoved {
-    /// For `cut`'s batches, one stack each, of `views` under `sampling`.
+    /// For `cut`'s batches, one stack each, of `views` under the position model by `moved`.
     pub(super) fn new(
         stream: &Arc<CudaStream>,
         kernels: &Kernels,
         views: &Views,
         cut: &Cut,
-        sampling: Sampling,
+        moved: MovedScratch,
     ) -> Result<Self, EngineError> {
         let dims = views.dims();
         let nf_max = cut.table.nf_max();
+        let sampling = moved.sampling.into();
         let read = match sampling {
             Sampling::Patch => {
                 RpieRead::Patch(Box::new(FusedBufs::with_shift(stream, dims, nf_max)?))
@@ -100,7 +102,6 @@ impl RpieMoved {
                 let len = views.dims().obj_len();
                 RpieRead::FullObject(Box::new(RpieWindows {
                     win: DeviceBuffer::zeroed(stream, len)?,
-                    deriv: DeviceBuffer::zeroed(stream, 2 * nf_max as usize * plane_len(dims))?,
                     sums: UpdateSums::zeroed(stream, len)?,
                     views,
                 }))
@@ -110,25 +111,45 @@ impl RpieMoved {
             probes: Moved::new(stream, kernels, dims, nf_max, 1, sampling)?,
             order: EpochOrder::new(kernels, stream, views)?,
             read,
+            step: (moved.refined)
+                .then(|| PositionStep::zeroed(stream, dims, nf_max))
+                .transpose()?,
         })
     }
 
-    /// `moved` apart: what [`RpieLend::lend`] lends with the device's features, and under
+    /// `moved` apart: what [`RpieLend::lend`] lends with the device's `features`, under
     /// [`Sampling::FullObject`] the windows, which a batch reads while the features are lent
-    /// to sample them.
-    fn split(moved: Option<&mut Self>) -> (RpieLend<'_>, Option<&mut RpieWindows>) {
+    /// to sample them, and the offsets' step as `features` refine the position: an error when
+    /// `moved` was built for the other.
+    fn split<'m>(
+        moved: Option<&'m mut Self>,
+        features: &FeaturesMut<'_>,
+    ) -> Result<RpieSplit<'m>, GpuError> {
         let Some(m) = moved else {
-            return (RpieLend(None, None), None);
+            return Ok((RpieLend(None, None), None, features.own_step(None)?));
         };
         let (fused, windows) = match &mut m.read {
             RpieRead::Patch(f) => (Some(&mut **f), None),
             RpieRead::FullObject(w) => (None, Some(&mut **w)),
         };
-        (RpieLend(Some((&mut m.probes, &m.order)), fused), windows)
+        let step = features.own_step(m.step.as_mut())?;
+        Ok((
+            RpieLend(Some((&mut m.probes, &m.order)), fused),
+            windows,
+            step,
+        ))
     }
 }
 
-/// [`RpieMoved`] but its windows: its [`Moved`], its scan order and the shifted sums' scratch.
+/// [`RpieMoved::split`]: its lend, its windows and its step.
+type RpieSplit<'m> = (
+    RpieLend<'m>,
+    Option<&'m mut RpieWindows>,
+    Option<&'m mut PositionStep>,
+);
+
+/// [`RpieMoved`] but its windows and step: its [`Moved`], its scan order and the shifted sums'
+/// scratch.
 struct RpieLend<'m>(
     Option<(&'m mut Moved, &'m EpochOrder)>,
     Option<&'m mut FusedBufs>,
@@ -176,15 +197,17 @@ impl<'a> Bufs<'a> {
     ) -> Result<(), GpuError> {
         // Each frame is in one batch, stepped after its batch's passes: the offsets the epoch
         // starts from serve every batch.
-        let (lend, _) = RpieMoved::split(moved.as_deref_mut());
+        let (lend, ..) = RpieMoved::split(moved.as_deref_mut(), &self.features)?;
         if let Some(mut m) = lend.lend(&mut self.features)? {
             let order = *m.own();
             m.gather(ctx, order)?;
         }
         for b in 0..rb.batches.len() {
-            match RpieMoved::split(moved.as_deref_mut()) {
-                (lend, None) => self.rpie_batch(ctx, params, rb, b, lend)?,
-                (lend, Some(w)) => self.rpie_window_batch(ctx, params, rb, b, lend, w)?,
+            match RpieMoved::split(moved.as_deref_mut(), &self.features)? {
+                (lend, None, step) => self.rpie_batch(ctx, params, rb, b, (lend, step))?,
+                (lend, Some(w), step) => {
+                    self.rpie_window_batch(ctx, params, rb, b, (lend, step), w)?
+                }
             }
         }
         Ok(())
@@ -204,14 +227,14 @@ impl<'a> Bufs<'a> {
     }
 
     /// One batch of an epoch enqueued on `ctx`, its views on the object; with `lend` under
-    /// [`Sampling::Patch`], each frame's probe moved by its offset.
+    /// [`Sampling::Patch`], each frame's probe moved by its offset, which `step` steps.
     fn rpie_batch(
         &mut self,
         ctx: &ExecutionContext,
         params: &RpieParams,
         rb: &mut RpieBufs<'_>,
         b: usize,
-        lend: RpieLend<'_>,
+        (lend, mut step): (RpieLend<'_>, Option<&mut PositionStep>),
     ) -> Result<(), GpuError> {
         let l = self.launch();
         let Launch { k, rk, .. } = l;
@@ -242,12 +265,12 @@ impl<'a> Bufs<'a> {
             None => k.obj_probe_to_psi(ctx, self.views, stack, self.obj, self.probe, rb.psi)?,
         }
         rb.delta(ctx, l, b)?;
-        if let Some(m) = &mut moved {
+        if let (Some(m), Some(step)) = (&moved, step.as_deref_mut()) {
             // The slopes of the object the batch started from, against Δ before the probe
             // step weights it.
             let chi_w = (&*rb.dlt, FrameWaves::Probes(&m.w[0]));
             m.kernels
-                .sums(ctx, self.views, stack, self.obj, chi_w, m.pos)?;
+                .sums(ctx, self.views, stack, self.obj, chi_w, step)?;
         }
 
         if params.obj_step.is_some() {
@@ -300,30 +323,34 @@ impl<'a> Bufs<'a> {
         }
         // The offsets' step reads neither array, so it may precede their steps, which end
         // the borrow of the batch-start probe.
-        if let Some(m) = moved {
+        if let (Some(m), Some(step)) = (moved, step) {
             let batch = frames.range.clone();
             let solve = solve(self.exit.scale);
-            m.kernels.step(ctx, batch, m.own, m.offsets, solve, m.pos)?;
+            let offsets = m.offsets;
+            m.kernels.step(ctx, batch, m.own, offsets, solve, step)?;
         }
         self.rpie_steps(ctx, params, frames.nf())
     }
 
     /// [`Self::rpie_batch`] under [`Sampling::FullObject`], its views on `w`, the windows of the
-    /// batch-start object sampled at the offsets `lend` steps: the probe stays, the object's
-    /// sums are placed back from the windows, and the position sums read their derivatives.
+    /// batch-start object sampled at the offsets `lend` lends and `step` steps: the probe
+    /// stays, the object's sums are placed back from the windows, and the position sums read
+    /// their derivatives.
     fn rpie_window_batch(
         &mut self,
         ctx: &ExecutionContext,
         params: &RpieParams,
         rb: &mut RpieBufs<'_>,
         b: usize,
-        lend: RpieLend<'_>,
+        (lend, mut step): (RpieLend<'_>, Option<&mut PositionStep>),
         w: &mut RpieWindows,
     ) -> Result<(), GpuError> {
         let l = self.launch();
         let (frames, stack) = (&rb.batches[b], rb.table.at(b));
         let dims = l.prop.dims;
-        let mut m = (self.features).lend(ctx, l.k, &dims, self.obj, self.probe, self.exit)?;
+        let mut m = (self.features)
+            .lend(ctx, l.k, &dims, self.obj, self.probe, self.exit)?
+            .one_slice(rb.one);
         let block = |order, modes, block| WindowBlock {
             slice: 0,
             order,
@@ -338,10 +365,6 @@ impl<'a> Bufs<'a> {
             block([0, 0], Modes::All, 0),
             &mut w.win,
         )?;
-        for (axis, order) in (0..).zip([[1, 0], [0, 1]]) {
-            let at = block(order, Modes::First, axis);
-            m.windows_of(ctx, self.views, stack, None, at, &mut w.deriv)?;
-        }
         l.k.obj_probe_to_psi(ctx, &w.views, stack, &w.win, self.probe, rb.psi)?;
         rb.delta(ctx, l, b)?;
         if params.obj_step.is_some() {
@@ -354,16 +377,33 @@ impl<'a> Bufs<'a> {
         let Some(PositionLent::FullObject(s)) = lend.lend(&mut self.features)? else {
             return Err(another_model());
         };
-        // The slopes of the windows the batch started from, against Δ before the probe step
-        // weights it.
-        let at = (&*rb.dlt, SliceSource::Probe(self.probe));
-        (s.kernels).derivative_sums(ctx, self.views, stack, &w.deriv, at, s.pos)?;
+        if let Some(step) = step.as_deref_mut() {
+            // The slopes of the windows the batch started from, against Δ before the probe
+            // step weights it.
+            let points = StackPoints {
+                views: self.views,
+                stack,
+                offsets: s.offsets,
+            };
+            let derivatives = |out: &mut DeviceBuffer<C32>| {
+                for (axis, order) in (0..).zip([[1, 0], [0, 1]]) {
+                    let at = block(order, Modes::First, axis);
+                    s.sampler.windows(ctx, points, s.spectra, at, out)?;
+                }
+                Ok(())
+            };
+            let at = (&*rb.dlt, SliceSource::Probe(self.probe));
+            (s.kernels).derivative_sums(ctx, self.views, stack, derivatives, at, step)?;
+        }
         if params.probe_step.is_some() {
             rb.probe_weight(ctx, l, b, (&w.views, &w.win), params.probe_alpha)?;
             (l.k).psi_to_probe(ctx, &w.views, stack, rb.dlt, &w.win, self.probe_sums)?;
         }
-        let solve = solve(self.exit.scale);
-        (s.kernels).step(ctx, frames.range.clone(), s.own, s.offsets, solve, s.pos)?;
+        if let Some(step) = step {
+            let solve = solve(self.exit.scale);
+            let offsets = s.offsets;
+            (s.kernels).step(ctx, frames.range.clone(), s.own, offsets, solve, step)?;
+        }
         self.rpie_steps(ctx, params, frames.nf())
     }
 

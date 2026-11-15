@@ -2,8 +2,9 @@
 //! CPU f64 operators over the arrays and layout of [`crate::engine::ops`]: [`LsqmlBatch`] holds one
 //! batch's update directions at one state, and [`Lsqml`], holding pty-chi's object
 //! preconditioner, takes the step with pty-chi's per-frame 2×2 step sizes and the
-//! [`ProbeVariation`] step ([`Lsqml::step`]) and runs the epochs. Of the [`Features`], pty-chi's
-//! LSQML refines the positions alone ([`Lsqml::with_features`]).
+//! [`ProbeVariation`] step ([`Lsqml::step`]), runs the epochs and gives the LLK of the model it
+//! steps ([`Lsqml::llk`]). Of the [`Features`], pty-chi's LSQML refines the positions alone
+//! ([`Lsqml::with_features`]).
 //!
 //! The noise model is a [`Cost`]: [`Cost::Amplitude`] is pty-chi's Gaussian model with weight
 //! `1/(2σ)² = 1`. The exit waves reach the detector through an [`Optics`]; pty-chi's probe is
@@ -15,7 +16,7 @@ use crate::engine::features::{
     EPS_POSITION, batch_position_step, derivative_sums, gradient_directions, gradient_sums,
     move_planes,
 };
-use crate::engine::ops::{natural, obj_probe_to_psi};
+use crate::engine::ops::{Llk, llk, natural, obj_probe_to_psi};
 use crate::engine::{
     Cost, EngineError, Features, Fft2, Observed, Optics, ProbeVariation, Sampling, SliceWaves,
     random_batches,
@@ -109,40 +110,12 @@ impl<'a> LsqmlBatch<'a> {
     ) -> Self {
         let cost = run.params.cost;
         let n = probe.plane_len();
-        let nmode = views
-            .iter()
-            .take_while(|v| v.frame == views[0].frame)
-            .count();
-        assert_eq!(views.len() % nmode, 0, "views must be whole frames");
-        let frames: Vec<usize> = views
-            .chunks_exact(nmode)
-            .map(|fv| {
-                assert!(fv.iter().all(|v| v.frame == fv[0].frame));
-                fv[0].frame as usize
-            })
-            .collect();
-        let (uviews, mut uprobe) = var.unique(views, probe);
-        let offsets = (run.features.position.as_ref())
-            .map(|d| frames.iter().map(|&f| d[f]).collect::<Vec<_>>());
-        let sampling = (run.sampling).unwrap_or_else(|| {
-            Sampling::auto(optics, objects[0].plane_shape(), probe.plane_shape())
-        });
-        let moves = offsets.clone().filter(|_| sampling == Sampling::Patch);
-        if let Some(moves) = &moves {
-            let fft = Fft2::new(probe.plane_shape());
-            let q = optics.slice_quad(0);
-            for (p, &d) in (uprobe.as_mut_slice().chunks_exact_mut(probe.len() * n)).zip(moves) {
-                move_planes(p, q, d, &fft);
-            }
-        }
-        let waves = SliceWaves::with_sampling(
-            optics,
-            &uviews,
-            objects,
-            &uprobe,
-            offsets.as_deref(),
-            sampling,
-        );
+        let UniqueWaves {
+            frames,
+            nmode,
+            moves,
+            waves,
+        } = run.unique_waves(views, optics, objects, probe, var);
         let prop = optics.exit();
         let mut chi = waves.psi().to_vec();
         prop.forward(&mut chi);
@@ -424,6 +397,18 @@ fn trim_mean(x: &[f64]) -> f64 {
     kept.iter().sum::<f64>() / kept.len() as f64
 }
 
+/// The exit waves of [`Lsqml::unique_waves`] and what they were taken under.
+struct UniqueWaves<'a> {
+    /// The frames of the views, in order.
+    frames: Vec<usize>,
+    /// Views per frame.
+    nmode: usize,
+    /// The frames' [`Features::position`] offsets where they move the probe, under
+    /// [`Sampling::Patch`].
+    moves: Option<Vec<[f64; 2]>>,
+    waves: SliceWaves<'a>,
+}
+
 /// LSQML state across epochs: the parameters, the epoch count, pty-chi's object
 /// preconditioner, every frame's `a_far` from its last step and the features it refines.
 #[derive(Clone)]
@@ -470,16 +455,17 @@ impl Lsqml {
         })
     }
 
-    /// This run modelling and refining `features`, which hold one entry per frame of the scan
-    /// it runs on. pty-chi's LSQML refines the positions alone; it has neither a per-frame
-    /// intensity scale nor a detector background, and those are refused.
+    /// This run modelling `features`, refining those set to, which hold one entry per frame
+    /// of the scan it runs on. pty-chi's LSQML models the positions alone; it has neither a
+    /// per-frame intensity scale nor a detector background, and those are refused, held or
+    /// not.
     pub fn with_features(self, features: Features) -> Result<Self, EngineError> {
         if features.scale.is_some() || features.background.is_some() {
             return Err(EngineError::Invalid(
-                "LSQML refines no intensity scale or background, as pty-chi's".into(),
+                "LSQML models no intensity scale or background, as pty-chi's".into(),
             ));
         }
-        if let Some(d) = &features.position
+        if let Some(d) = features.offsets()
             && !d.iter().flatten().all(|d| d.is_finite())
         {
             return Err(EngineError::Invalid(
@@ -492,6 +478,80 @@ impl Lsqml {
     /// The features as the last step left them.
     pub fn features(&self) -> &Features {
         &self.features
+    }
+
+    /// The model [`Self::step`] updates, over `views` (whole frames, in order): the
+    /// [`SliceWaves`] at each frame's own probe ([`ProbeVariation::unique`]) under the frame's
+    /// [`Features::position`] offset as the run's sampling models it, [`Sampling::auto`] of
+    /// the optics, object and probe before the first step fixes one.
+    fn unique_waves<'a>(
+        &self,
+        views: &[View],
+        optics: &'a Optics,
+        objects: &'a [Object],
+        probe: &Probe,
+        var: &ProbeVariation,
+    ) -> UniqueWaves<'a> {
+        let nmode = views
+            .iter()
+            .take_while(|v| v.frame == views[0].frame)
+            .count();
+        assert_eq!(views.len() % nmode, 0, "views must be whole frames");
+        let frames: Vec<usize> = views
+            .chunks_exact(nmode)
+            .map(|fv| {
+                assert!(fv.iter().all(|v| v.frame == fv[0].frame));
+                fv[0].frame as usize
+            })
+            .collect();
+        let (uviews, mut uprobe) = var.unique(views, probe);
+        let offsets =
+            (self.features.offsets()).map(|d| frames.iter().map(|&f| d[f]).collect::<Vec<_>>());
+        let sampling = (self.sampling).unwrap_or_else(|| {
+            Sampling::auto(optics, objects[0].plane_shape(), probe.plane_shape())
+        });
+        let moves = offsets.clone().filter(|_| sampling == Sampling::Patch);
+        if let Some(moves) = &moves {
+            let fft = Fft2::new(probe.plane_shape());
+            let q = optics.slice_quad(0);
+            let frame = probe.len() * probe.plane_len();
+            for (p, &d) in (uprobe.as_mut_slice().chunks_exact_mut(frame)).zip(moves) {
+                move_planes(p, q, d, &fft);
+            }
+        }
+        let waves = SliceWaves::with_sampling(
+            optics,
+            &uviews,
+            objects,
+            &uprobe,
+            offsets.as_deref(),
+            sampling,
+        );
+        UniqueWaves {
+            frames,
+            nmode,
+            moves,
+            waves,
+        }
+    }
+
+    /// The normalised LLK of `objects` (one per slice of `optics`), `probe` and `var` over
+    /// every frame of `addr`, of the model [`Self::step`] updates ([`LsqmlBatch`]'s exit
+    /// waves, each frame's own probe), through `optics`' exit transform; with
+    /// [`ProbeVariation::none`], the shared probe's.
+    pub fn llk(
+        &self,
+        addr: &AddrTable,
+        obs: &Observed,
+        optics: &Optics,
+        objects: &[Object],
+        probe: &Probe,
+        var: &ProbeVariation,
+    ) -> Llk {
+        let w = self.unique_waves(addr.views(), optics, objects, probe, var);
+        let mut psi = w.waves.psi().to_vec();
+        optics.exit().forward(&mut psi);
+        llk(obs, 0..addr.nframe(), addr.nmode(), &psi).normalised(obs.nb_obs())
     }
 
     /// Frame `f`'s `a_far` from its last [`Self::step`], 1/2 before its first.
@@ -515,8 +575,8 @@ impl Lsqml {
     /// `P += mean(a_probe)·dP` and `var`'s eigenmodes and batch weights by [`ProbeVariation`]'s
     /// OPR step on slice 0, all from the state on entry; the frames' [`Self::a_far`] become the
     /// batch's. With [`Features::position`], `dP` is the mean of the adjoint-moved frame
-    /// directions ([`LsqmlBatch::adjoint_move`]), and the offsets take pty-chi's position step
-    /// after the object and probe ([`Features::position`]). The first step fixes the run's
+    /// directions ([`LsqmlBatch::adjoint_move`]), and refined offsets take pty-chi's position
+    /// step after the object and probe ([`Features::position`]). The first step fixes the run's
     /// sampling ([`Self::with_sampling`]).
     pub fn step(
         &mut self,
@@ -549,11 +609,7 @@ impl Lsqml {
         let moved = b.adjoint_move(&d);
         let d_probe = Probe::new(frame_mean(&moved, np));
         let (a_obj, a_probe) = b.step_sizes(&d_obj, &d_probe);
-        let d_pos = self
-            .features
-            .position
-            .as_ref()
-            .map(|_| b.position_directions());
+        let d_pos = (self.features.position_refined()).then(|| b.position_directions());
         let (a_far, frames) = (b.a_far().to_vec(), b.frames().to_vec());
         for (&f, &a) in frames.iter().zip(&a_far) {
             if self.a_far.len() <= f {
@@ -575,7 +631,7 @@ impl Lsqml {
             .iter_mut()
             .zip(d_probe.as_slice())
             .for_each(|(x, d)| *x += sp * d);
-        if let (Some(d), Some(delta)) = (&mut self.features.position, d_pos) {
+        if let (Some(d), Some(delta)) = (self.features.refined_offsets(), d_pos) {
             batch_position_step(d, &frames, &delta);
         }
         LsqmlStep {
@@ -614,12 +670,12 @@ impl Lsqml {
         var: &mut ProbeVariation,
     ) -> Vec<LsqmlStep> {
         let (nframe, nmode) = (addr.nframe(), addr.nmode());
-        if let Some(d) = &self.features.position {
+        if let Some(d) = self.features.offsets() {
             assert_eq!(d.len(), nframe, "one position offset per frame");
         }
         let sampling = self.sampling(optics, &objects[0], probe);
         if self.epochs < 10 || self.epochs.is_multiple_of(10) {
-            let offsets = self.features.position.as_deref();
+            let offsets = self.features.offsets();
             let illum = sampling.illumination(addr.views(), objects[0].dims(), probe, offsets);
             let pre = self.preconditioner.take().unwrap_or_else(|| {
                 let n = probe.plane_len() as f64;

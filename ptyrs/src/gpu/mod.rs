@@ -46,9 +46,9 @@ pub mod sampling;
 
 pub use crate::fft::C32;
 pub use bh::{
-    BH_HESS, BH_STEP, BhArray, BhBatch, BhDisp, BhEntry, BhFieldsRef, BhKernels, BhMovedFarRef,
-    BhMovesRef, BhNearMut, BhOffsets, BhParts, BhPositions, BhScan, BhSecondRef, BhTangentsMut,
-    BhVar, BhWinRef, BhWinSecond, EpochOrder,
+    BH_HESS, BH_STEP, BhArray, BhBatch, BhDisp, BhEntry, BhFarRef, BhFieldsRef, BhKernels,
+    BhMovedFarRef, BhMovedRef, BhMovesRef, BhNearMut, BhOffsets, BhParts, BhPositions, BhScan,
+    BhSecondRef, BhTangentsMut, BhVar, BhWinRef, BhWinSecond, EpochOrder,
 };
 pub use fused::{
     BackgroundSums, Exit, FUSED_SIDES, FarSums, FusedBufs, FusedInputs, FusedSums, Model,
@@ -71,7 +71,7 @@ pub use optics::{
     BandCarry, BandedTransfer, ExitPass, ExitStage, FrameWaves, OpticsKernels, SlicePhase,
     SliceSource,
 };
-pub use position::{PositionKernels, PositionRule, Positions, Solve};
+pub use position::{PositionKernels, PositionRule, PositionStep, Positions, Solve};
 pub use psi::{HalfWaves, Waves, half_scale};
 pub use ring::{Ended, FrameLlk, LlkRing, LlkTotals, RecordWriter, RingDevice, RingError};
 pub use rpie::{POWER_CHUNK, PowerMax, RpieKernels, Weight};

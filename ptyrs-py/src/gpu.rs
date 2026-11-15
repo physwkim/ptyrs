@@ -170,14 +170,15 @@ impl GpuPtycho {
     /// features (a `ValueError`) leave the current ones; after a device error (a
     /// `RuntimeError`), the new ones may stay modelled, with the LLK pass run without its
     /// graph, or be partly written.
-    #[pyo3(signature = (*, scale = None, background = None, position = None))]
+    #[pyo3(signature = (*, scale = None, background = None, position = None, hold = Vec::new()))]
     fn set_features(
         &mut self,
         scale: Option<PyReadonlyArray1<'_, f64>>,
         background: Option<PyReadonlyArray2<'_, f64>>,
         position: Option<PyReadonlyArray2<'_, f64>>,
+        hold: Vec<String>,
     ) -> PyResult<()> {
-        let features = crate::features_in(scale, background, position, self.1)?;
+        let features = crate::features_in(scale, background, position, &hold, self.1)?;
         Ok(self.0.set_features(&features).map_err(Error::from)?)
     }
 

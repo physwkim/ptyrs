@@ -5,15 +5,16 @@
 //! 40 4`, i.e. `common::dm_scenario(32, 40, 2, 2e5, 4.0)` after `scale_obj_probe`, with the
 //! references' eigenmodes and weights. They write `<dir>/opr_{eigen,weights,values}_f64.txt`,
 //! `<dir>/lsqml_opr_{eigen,weights,obj,probe,steps,values}_f64.txt` and the same
-//! `lsqml_opr_int_` files, saved to `tests/engine/data`.
+//! `lsqml_opr_int_` files, saved to `tests/engine/data`. [`Lsqml::llk`] is also held against
+//! [`Ptycho::llk`] at a per-frame intensity scale.
 
 use std::ops::Range;
 use std::slice;
 
 use ptyrs::base::{C64, Stack, View};
 use ptyrs::engine::{
-    Cost, Fft2, Llk, Lsqml, LsqmlParams, LsqmlStep, Optics, ProbeVariation, Ptycho, illumination,
-    llk, obj_probe_to_psi, opr_weight_grad,
+    Cost, Feature, Features, Fft2, Llk, Lsqml, LsqmlParams, LsqmlStep, Optics, ProbeVariation,
+    Ptycho, Sampling, illumination, llk, obj_probe_to_psi, opr_weight_grad,
 };
 
 #[path = "common/engine/mod.rs"]
@@ -154,9 +155,9 @@ impl Ref {
 
     /// The reference's eigenmodes `U` and main-mode weights `c` with eigenmode weights `w`.
     fn variation_with(&self, w: Vec<f64>) -> ProbeVariation {
-        let var = ProbeVariation::new(self.eigenmodes(self.u[0]), w);
+        let var = ProbeVariation::new(self.eigenmodes(self.u[0]), Feature::refined(w));
         match self.c {
-            Some([c, ..]) => var.with_intensity(self.column(c)),
+            Some([c, ..]) => var.with_intensity(Feature::refined(self.column(c))),
             None => var,
         }
     }
@@ -202,6 +203,104 @@ fn costs_match_opr_refs() {
     }
 }
 
+/// [`Lsqml::llk`] of each reference's variation against its `L` and `F` over every frame: the
+/// LLK of LSQML's model reads each frame's own probe.
+#[test]
+fn lsqml_llk_matches_opr_refs() {
+    let (p, optics) = state();
+    let run = Lsqml::new(LsqmlParams {
+        batch_size: 40,
+        cost: Cost::Poisson,
+        seed: 0,
+    })
+    .unwrap();
+    let objects = slice::from_ref(p.object());
+    for r in [&OPR, &LSQML_OPR, &LSQML_OPR_INT] {
+        let ref_ = table(r.values)[0].clone();
+        let var = r.variation();
+        let got = run.llk(p.addr(), p.observed(), &optics, objects, p.probe(), &var);
+        let nb_obs = ref_[0];
+        let el = rel(got.poisson * nb_obs, ref_[1]);
+        let ef = rel(got.euclidian * nb_obs / 4.0, ref_[2]);
+        assert!(
+            el < 1e-13 && ef < 1e-13,
+            "{}: L {el:.3e} F {ef:.3e}",
+            r.name
+        );
+    }
+}
+
+/// [`Lsqml::llk`] of held offsets under each sampling against [`Ptycho::llk`]. With one probe
+/// mode and one eigenmode `U = P`, frame `f`'s own probe `c_f·P + w_f·U` is `P` at the
+/// intensity scale `(c_f + w_f)²`, which `Ptycho` models; without a variation it is `Ptycho`'s
+/// LLK as it is.
+#[test]
+fn lsqml_llk_matches_ptycho_at_each_frames_scale() {
+    let (scan, object, probe) = common::dm_scenario(32, 40, 1, 2e5, 4.0);
+    let mut p = Ptycho::new(&scan, object, probe).unwrap();
+    p.scale_obj_probe();
+    let (object, probe) = (p.object().clone(), p.probe().clone());
+    let nframe = p.addr().nframe();
+    let d: Vec<[f64; 2]> = (0..nframe)
+        .map(|f| [0.4 * (0.7 * f as f64).sin(), 0.4 * (1.3 * f as f64).cos()])
+        .collect();
+    let [_, ny, nx] = object.dims();
+    let inside = p.addr().views().iter().all(|v| {
+        let at = d[v.frame as usize];
+        let at = [v.oy as f64 + at[0], v.ox as f64 + at[1]];
+        (0.0..=(ny - 32) as f64).contains(&at[0]) && (0.0..=(nx - 32) as f64).contains(&at[1])
+    });
+    assert!(inside, "a view reads past the object's edge");
+    let c: Vec<f64> = (0..nframe).map(|f| 1.0 + 0.05 * (f % 3) as f64).collect();
+    let w: Vec<f64> = (0..nframe).map(|f| 0.1 * (f % 5) as f64 - 0.2).collect();
+    let scale = c.iter().zip(&w).map(|(c, w)| (c + w).powi(2)).collect();
+    let u = Stack::from_vec([1, 32, 32], probe.plane(0).to_vec()).unwrap();
+    let var = ProbeVariation::new(u, Feature::held(w)).with_intensity(Feature::held(c));
+    let none = ProbeVariation::none([32, 32]);
+    let runs = [
+        ("none", &none, None),
+        ("scaled", &var, Some(Feature::held(scale))),
+    ];
+    let position = Some(Feature::held(d));
+    for sampling in [Sampling::Patch, Sampling::FullObject] {
+        let run = Lsqml::new(LsqmlParams {
+            batch_size: nframe,
+            cost: Cost::Poisson,
+            seed: 0,
+        })
+        .unwrap()
+        .with_sampling(sampling)
+        .with_features(Features {
+            position: position.clone(),
+            ..Features::default()
+        })
+        .unwrap();
+        p.set_sampling(sampling);
+        for (named, var, scale) in runs.clone() {
+            let objects = slice::from_ref(&object);
+            let got = run.llk(p.addr(), p.observed(), p.optics(), objects, &probe, var);
+            p.set_features(Features {
+                position: position.clone(),
+                scale,
+                ..Features::default()
+            })
+            .unwrap();
+            let want = p.llk();
+            let err = worst_of(
+                [
+                    (got.poisson, want.poisson),
+                    (got.gaussian, want.gaussian),
+                    (got.euclidian, want.euclidian),
+                    (got.nb_photons_calc, want.nb_photons_calc),
+                ]
+                .map(|(g, w)| rel(g, w)),
+            );
+            eprintln!("{sampling:?} {named}: max rel {err:.3e}");
+            assert!(err < 1e-12, "{sampling:?} {named}: max rel {err:.3e}");
+        }
+    }
+}
+
 /// [`opr_weight_grad`] against each reference's `dL/dw` and `dF/dw` and against central
 /// differences of each frame's cost in its own weights, one eigenmode at a time.
 #[test]
@@ -236,6 +335,7 @@ fn weight_grad_matches_refs_and_central_differences() {
             let shifted = |i: usize, t: f64| {
                 let w = var
                     .weights()
+                    .values
                     .iter()
                     .enumerate()
                     .map(|(j, w)| if j % r.k == i { w + t } else { *w })
@@ -328,11 +428,18 @@ fn assert_variation(r: &Ref, var: &ProbeVariation, frames: &[usize], noise: usiz
     assert!(err < 1e-13, "{} eigenmodes: max rel {err:.3e}", r.name);
     let (start, want) = (r.weights(r.w[0]), r.weights(r.w[3 + noise]));
     let name = format!("{} w", r.name);
-    assert_change(&name, var.weights(), &start, &want, r.k, frames);
+    assert_change(&name, &var.weights().values, &start, &want, r.k, frames);
     match (r.c, var.intensity()) {
         (Some(c), Some(got)) => {
             let (start, want) = (r.column(c[0]), r.column(c[1 + noise]));
-            assert_change(&format!("{} c", r.name), got, &start, &want, 1, frames);
+            assert_change(
+                &format!("{} c", r.name),
+                &got.values,
+                &start,
+                &want,
+                1,
+                frames,
+            );
         }
         (c, got) => assert_eq!(c.is_some(), got.is_some(), "{} c", r.name),
     }
@@ -427,9 +534,46 @@ fn single_frame_batch_moves_only_main_mode_weights() {
             Some([c, cg, _]) => {
                 let got = var.intensity().unwrap();
                 let name = format!("{} c", r.name);
-                assert_change(&name, got, &r.column(c), &r.column(cg), 1, &[3]);
+                assert_change(&name, &got.values, &r.column(c), &r.column(cg), 1, &[3]);
             }
             None => assert_eq!(var, start, "{}", r.name),
         }
+    }
+}
+
+/// Held weights or main-mode weights keep their values through a step; the rest of it, the
+/// eigenmodes' move from the held weights among it, is the step with them refined, bit for
+/// bit.
+#[test]
+fn held_weights_and_intensity_keep_their_values() {
+    let (p, optics) = state();
+    let r = &LSQML_OPR_INT;
+    let rows = table(LSQML_OPR_INT_STEP[0]);
+    let frames: Vec<usize> = rows.iter().map(|r| r[0] as usize).collect();
+    let start = r.variation();
+    let mut refined = start.clone();
+    let want = step(&p, &optics, Cost::Poisson, &frames, &mut refined);
+    let (w, c) = (start.weights(), start.intensity().unwrap());
+    assert_ne!(refined.weights().values, w.values);
+    assert_ne!(refined.intensity().unwrap().values, c.values);
+    assert_ne!(refined.eigenmodes(), start.eigenmodes());
+    for [hold_w, hold_c] in [[true, false], [false, true], [true, true]] {
+        let name = format!("hold weights {hold_w}, intensity {hold_c}");
+        let feature = |f: &Feature<Vec<f64>>, hold: bool| Feature {
+            values: f.values.clone(),
+            refine: !hold,
+        };
+        let var = ProbeVariation::new(start.eigenmodes().clone(), feature(w, hold_w));
+        let mut var = var.with_intensity(feature(c, hold_c));
+        let got = step(&p, &optics, Cost::Poisson, &frames, &mut var);
+        assert_eq!(got, want, "{name}: step, object and probe");
+        assert_eq!(var.eigenmodes(), refined.eigenmodes(), "{name}: eigenmodes");
+        let kept = |hold: bool, start: &Feature<Vec<f64>>, moved: &Feature<Vec<f64>>| {
+            feature(if hold { start } else { moved }, hold)
+        };
+        let want_w = kept(hold_w, w, refined.weights());
+        assert_eq!(*var.weights(), want_w, "{name}: weights");
+        let want_c = kept(hold_c, c, refined.intensity().unwrap());
+        assert_eq!(var.intensity(), Some(&want_c), "{name}: main-mode weights");
     }
 }

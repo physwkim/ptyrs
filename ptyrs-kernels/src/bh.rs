@@ -11,7 +11,9 @@
 //! `W` the probe moved by each frame's offsets (`ptyrs::gpu::Shift`): `W = IDFT(A e)` with
 //! `A` the probe's spectra and `e` the frame's ramp, so along a probe change `Au` and an
 //! offsets change `u_d` it changes by `δ_u W = IDFT(e (Au + i a_u A))`, `a_u = −2π (u_y fy +
-//! u_x fx)`. The `bh_pos_*` kernels take the offsets as a third variable of the step.
+//! u_x fx)`. The `bh_pos_*` kernels take the offsets as a third variable of the step; with
+//! the offsets held (moved, not stepped) `bh_moved_spec` and `bh_moved_far` stand in for
+//! `bh_pos_spec` and `bh_pos_far`, their terms at `a_u = a_v = 0`.
 //!
 //! Under full-object sampling (`ptyrs::engine::Sampling::FullObject`) the exit waves are
 //! `W(O) P`, `W` a view's window of the object at its offsets (`crate::sampling`), read as
@@ -19,7 +21,8 @@
 //! reads probe `m % nprobe` and object mode `m / nprobe` (`ptyrs::gpu::window_views`). Along
 //! `u` the windows change by `S(u_O) + Σ_a u_da ∂_a S(O)` and to second order by `Σ_a (v_da
 //! ∂_a S(u_O) + u_da ∂_a S(v_O)) + Σ_ac u_da v_dc ∂_a ∂_c S(O)`; the `bh_win_*` kernels
-//! take the offsets on these.
+//! take the offsets on these, and with the offsets held `bh_win_obj_grad` is `bh_win_grad`'s
+//! object part alone.
 
 use cuda_device::{device, thread};
 use cuda_host::cuda_module;
@@ -102,6 +105,20 @@ pub struct BhMoves {
     pub offsets: *const f32,
     pub probe_scale: f32,
     pub dirs: BhPosDirs,
+}
+
+/// What [`bh_kernels::LoadedModule::bh_moved_spec`] reads of the moved probes with the
+/// offsets held, each spectrum `[nprobe, ny, nx]` in FFT order: `au` `u`'s probe part `Au`
+/// unscaled and, with `cg != 0`, `av` `v`'s (else unread); `offsets` `[nframe, 2]` by epoch
+/// position, those of the exit waves; `probe_scale` `u`'s probe part over `Au`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct BhMovedProbes {
+    pub au: *const f32,
+    pub av: *const f32,
+    pub offsets: *const f32,
+    pub probe_scale: f32,
+    pub cg: u32,
 }
 
 /// The observations of a scan in epoch order: `counts` `[nframe, ny, nx]` in the scan's own
@@ -200,9 +217,10 @@ pub const BH_STEP: u32 = 4;
 #[cuda_module]
 pub mod bh_kernels {
     use super::{
-        BH_EPS, BH_HESS, BH_STEP, BhDirs, BhFields, BhMovedFar, BhMoves, BhNear, BhObs, BhPartials,
-        BhPosDirs, BhSecond, BhSliceIn, BhTangents, BhWinDerivs, BhWinFields, CHUNK_PIXELS, add_im,
-        add_re, far_add, far_tail, near_prod, near_sum, ramp_at, rates, re_conj, unramp,
+        BH_EPS, BH_HESS, BH_STEP, BhDirs, BhFar, BhFields, BhMovedFar, BhMovedProbes, BhMoves,
+        BhNear, BhObs, BhPartials, BhPosDirs, BhSecond, BhSliceIn, BhTangents, BhWinDerivs,
+        BhWinFields, CHUNK_PIXELS, add_im, add_patch, add_re, far_add, far_tail, near_prod,
+        near_sum, ramp_at, rates, re_conj, unramp,
     };
     use crate::grad::{GAMMA_CHUNK, ObjProbePtrs};
     use crate::pixel::*;
@@ -892,10 +910,53 @@ pub mod bh_kernels {
             let (a_u, a_v) = rates(mv.dirs, pos, fr);
             let (a, au) = (load_c(mv.a, p), load_c(mv.au, p));
             let s = mv.probe_scale;
-            store_c(lu, t, cmul(e, (s * au.0 - a_u * a.1, s * au.1 + a_u * a.0)));
+            store_c(
+                lu,
+                t,
+                near_prod(e, (s * au.0 - a_u * a.1, s * au.1 + a_u * a.0)),
+            );
             if mv.dirs.cg != 0 {
                 let av = load_c(mv.av, p);
-                store_c(lv, t, cmul(e, (av.0 - a_v * a.1, av.1 + a_v * a.0)));
+                store_c(lv, t, near_prod(e, (av.0 - a_v * a.1, av.1 + a_v * a.0)));
+            }
+        }
+    }
+
+    /// [`bh_pos_spec`] with the offsets held: `lu = e s Au_p` and with `mv.cg` `lv = e Av_p`
+    /// (else `lv` is not written), reading no rates and no `A_p`. One thread per element of
+    /// `[nf_max * nmode, ny, nx]`.
+    ///
+    /// # Safety
+    ///
+    /// `mv` as [`BhMovedProbes`] says, `views` the epoch's, `lu`, `lv` `[nf_max * nmode, ny,
+    /// nx]`, `ctl` one entry.
+    ///
+    /// [`bh_pos_spec`]: LoadedModule::bh_pos_spec
+    #[kernel]
+    pub unsafe fn bh_moved_spec(
+        mv: BhMovedProbes,
+        views: *const ViewAddr,
+        lu: *mut f32,
+        lv: *mut f32,
+        ctl: *const StackCtl,
+        g: StackGeom,
+    ) {
+        let (f0, nf) = unsafe { stack_frames(ctl, g) };
+        let (ny, nx, nmode) = (g.ny, g.nx, g.nmode as usize);
+        let n = ny as usize * nx as usize;
+        let t = global_index();
+        if t >= nf as usize * nmode * n {
+            return;
+        }
+        let (kl, k) = (t / n, t % n);
+        let pos = f0 as usize + kl / nmode;
+        unsafe {
+            let p = (*views.add(f0 as usize * nmode + kl)).probe as usize * n + k;
+            let (e, _) = ramp_at(mv.offsets, pos, k, ny, nx);
+            let (au, s) = (load_c(mv.au, p), mv.probe_scale);
+            store_c(lu, t, near_prod(e, (s * au.0, s * au.1)));
+            if mv.cg != 0 {
+                store_c(lv, t, near_prod(e, load_c(mv.av, p)));
             }
         }
     }
@@ -1111,6 +1172,75 @@ pub mod bh_kernels {
         unsafe { super::add_sums::<3>((&raw mut RED).cast::<f32>(), acc, o) }
     }
 
+    /// [`bh_pos_far`] with the offsets held: adds to the triple [`bh_pos_near`] wrote of chunk
+    /// `c = blockIdx.x` of frame `f0 + fl`, `fl = blockIdx.y`, only the far term of
+    /// [`bh_hess_frames`] at the chunk's unmasked detector pixels, its last two with `cg != 0`
+    /// (else 0).
+    ///
+    /// # Safety
+    ///
+    /// Each of `f` `[nf_max * nmode, ny, nx]` (`lv` unread without `cg`), `obs` as [`BhObs`]
+    /// says, `out` `3 * nframe * nchunk` floats, `ctl` one entry; grid `(nchunk, nf_max, 1)`,
+    /// block `(PIXEL_THREADS, 1, 1)`.
+    ///
+    /// [`bh_pos_far`]: LoadedModule::bh_pos_far
+    /// [`bh_pos_near`]: LoadedModule::bh_pos_near
+    /// [`bh_hess_frames`]: LoadedModule::bh_hess_frames
+    #[kernel]
+    pub unsafe fn bh_moved_far(
+        f: BhFar,
+        cg: u32,
+        obs: BhObs,
+        out: *mut f32,
+        ctl: *const StackCtl,
+        g: StackGeom,
+    ) {
+        static mut RED: SharedArray<f32, 768> = SharedArray::UNINIT;
+        let (f0, nf) = unsafe { stack_frames(ctl, g) };
+        let (ny, nx, nmode) = (g.ny, g.nx, g.nmode as usize);
+        let n = ny as usize * nx as usize;
+        let fl = thread::blockIdx_y() as usize;
+        // The whole block leaves together, before its first barrier.
+        if fl >= nf as usize {
+            return;
+        }
+        let cg = cg != 0;
+        let c = thread::blockIdx_x() as usize;
+        let chunk = GAMMA_CHUNK as usize;
+        let end = n.min((c + 1) * chunk);
+        let pos = f0 as usize + fl;
+        let frame = unsafe { *obs.order.add(pos) } as usize;
+        let mut acc = [0.0f32; BH_HESS as usize];
+        let mut d = c * chunk + thread::threadIdx_x() as usize;
+        while d < end {
+            let count = unsafe { *obs.counts.add(frame * n + d) };
+            if count != MASKED {
+                let k = psi_index(d as u32 / nx, d as u32 % nx, ny, nx);
+                let mut far = [0.0f32; 6];
+                for m in 0..nmode {
+                    let j = (fl * nmode + m) * n + k;
+                    let (p, lu) = unsafe { (load_c(f.psi, j), load_c(f.lu, j)) };
+                    let lv = if cg {
+                        unsafe { load_c(f.lv, j) }
+                    } else {
+                        (0.0, 0.0)
+                    };
+                    far_add(&mut far, p, lu, lv, cg);
+                }
+                let t = far_tail(far, n, zsqrt(count as f32));
+                // Unrolled, as every loop over `acc`, so it stays in registers.
+                #[unroll]
+                for h in 0..BH_HESS {
+                    let h = h as usize;
+                    acc[h] += t[h];
+                }
+            }
+            d += PIXEL_THREADS as usize;
+        }
+        let o = unsafe { out.add(BH_HESS as usize * (pos * n.div_ceil(chunk) + c)) };
+        unsafe { super::add_sums::<3>((&raw mut RED).cast::<f32>(), acc, o) }
+    }
+
     /// The offsets' update of one batch from `step = (β, α, ..)` of [`bh_step`]: per position
     /// `p` of `span`, frame `f = order[p]` and axis `a`, `D = β prev[2f + a] − ud[2p + a]`,
     /// `offsets[2f + a] += step_size α D` (pty-chi's position step size, unclipped) and
@@ -1194,8 +1324,7 @@ pub mod bh_kernels {
                 for p in 0..nprobe {
                     let j = (fl * nmode + o * nprobe + p) * n + at;
                     let (pv, r) = unsafe { (load_c(f.probe, p * n + d), load_c(f.r, j)) };
-                    let u = cmul_conj(cmul(pv, q), r);
-                    gs = (gs.0 + u.0, gs.1 + u.1);
+                    gs = add_patch(gs, q, pv, r);
                 }
                 let k = (o * g.nf_max as usize + fl) * n + d;
                 unsafe {
@@ -1211,6 +1340,46 @@ pub mod bh_kernels {
         let o = unsafe { part.out.add(2 * (row * n.div_ceil(chunk) + c)) };
         let acc = [s * acc[0], s * acc[1]];
         unsafe { super::store_sums::<2>((&raw mut RED).cast::<f32>(), acc, o) }
+    }
+
+    /// [`bh_win_grad`]'s object gradient patches alone, for the offsets held: per value `k =
+    /// (o nf_max + fl) n + d` of a block `[nobj, nf_max, ny, nx]` of a frame `f0 + fl` of the
+    /// stack, `patch[k] = Σ_p conj(q P_p) r_m`, `m = o nprobe + p`. Patches of frames outside
+    /// the stack are not written. One thread per value of a block.
+    ///
+    /// # Safety
+    ///
+    /// `f` as [`BhWinFields`] says, `patch` one block `[nobj, nf_max, ny, nx]`, `ctl` one entry.
+    ///
+    /// [`bh_win_grad`]: LoadedModule::bh_win_grad
+    #[kernel]
+    pub unsafe fn bh_win_obj_grad(
+        f: BhWinFields,
+        patch: *mut f32,
+        ctl: *const StackCtl,
+        g: StackGeom,
+    ) {
+        let (_, nf) = unsafe { stack_frames(ctl, g) };
+        let (ny, nx, nmode, nprobe) = (g.ny, g.nx, g.nmode as usize, g.nprobe as usize);
+        let (n, nf_max) = (ny as usize * nx as usize, g.nf_max as usize);
+        let k = global_index();
+        if k >= nmode / nprobe * nf_max * n {
+            return;
+        }
+        let (o, fl, d) = (k / n / nf_max, k / n % nf_max, k % n);
+        if fl >= nf as usize {
+            return;
+        }
+        let (py, px) = ((d / nx as usize) as u32, (d % nx as usize) as u32);
+        let at = psi_index(py, px, ny, nx);
+        let q = quad_phase(g.quad, py, px, ny, nx);
+        let mut gs = (0.0f32, 0.0f32);
+        for p in 0..nprobe {
+            let j = (fl * nmode + o * nprobe + p) * n + at;
+            let (pv, r) = unsafe { (load_c(f.probe, p * n + d), load_c(f.r, j)) };
+            gs = add_patch(gs, q, pv, r);
+        }
+        unsafe { store_c(patch, k, gs) };
     }
 
     /// The windows' first-order changes under full-object sampling, from `S(u_O)` in block 0
@@ -1367,7 +1536,8 @@ pub(crate) fn add_im(s: f32, z: (f32, f32), a: (f32, f32)) -> f32 {
 }
 
 /// `x y` as NVVM contracted [`cmul`] in [`bh_kernels::LoadedModule::bh_pos_near`] while its
-/// sums sat between its loads; with the loads first it pairs them otherwise.
+/// sums sat between its loads; with the loads first it pairs them otherwise. It also pins
+/// `bh_pos_spec`'s products as NVVM contracted them, which `bh_moved_spec` must match.
 #[device]
 fn near_prod(x: (f32, f32), y: (f32, f32)) -> (f32, f32) {
     (fma(x.0, y.0, -(x.1 * y.1)), fma(x.1, y.0, x.0 * y.1))
@@ -1379,6 +1549,15 @@ fn near_prod(x: (f32, f32), y: (f32, f32)) -> (f32, f32) {
 fn near_sum(x: (f32, f32), y: (f32, f32), p: (f32, f32), q: (f32, f32)) -> (f32, f32) {
     let (a, b) = (near_prod(x, y), near_prod(p, q));
     (a.0 + b.0, add_im(a.1, p, q))
+}
+
+/// `s + conj(q p) r`, `q p` as [`near_prod`] and the real part as [`add_re`]: the forms NVVM
+/// contracted [`bh_kernels::LoadedModule::bh_win_grad`]'s loop to, which
+/// `bh_win_obj_grad` must match bit for bit.
+#[device]
+fn add_patch(s: (f32, f32), q: (f32, f32), p: (f32, f32), r: (f32, f32)) -> (f32, f32) {
+    let w = near_prod(q, p);
+    (add_re(s.0, w, r), s.1 + fma(w.0, r.1, -(w.1 * r.0)))
 }
 
 /// `Re(conj(a) b)`, pinned as [`near_prod`].
@@ -1412,10 +1591,11 @@ pub(crate) fn far_tail(s: [f32; 6], n: usize, root: f32) -> [f32; 3] {
     let fa = 1.0 - zdiv(root, a);
     let k = zdiv(root, a * a * a);
     let (cu, cv) = (s[1] * inv_n, s[2] * inv_n);
+    // Fused as NVVM contracted them, so `bh_moved_far` stays `bh_pos_far` bit for bit.
     [
-        2.0 * (fa * s[3] * inv_n + k * cu * cu),
-        2.0 * (fa * s[4] * inv_n + k * cu * cv),
-        2.0 * (fa * s[5] * inv_n + k * cv * cv),
+        2.0 * fma(fa * s[3], inv_n, k * cu * cu),
+        2.0 * fma(fa * s[4], inv_n, k * cu * cv),
+        2.0 * fma(fa * s[5], inv_n, k * cv * cv),
     ]
 }
 

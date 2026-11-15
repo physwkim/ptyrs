@@ -1,8 +1,8 @@
 //! GPU LSQML through a multislice object against the CPU's `f64` [`Lsqml`] from the same
-//! start: two and three slices under each of the far field, the angular spectrum and the
-//! Fresnel transform forward and back, without and with a modelled position, which moves the
-//! probe or samples the object, for both costs; and the LLK pass through the slices against
-//! the CPU's LLK of the same arrays.
+//! start: two and three slices under each of the far field, the angular spectrum without and
+//! with an evanescent band and the Fresnel transform forward and back, without and with a
+//! modelled position, which moves the probe or samples the object, for both costs; and the
+//! LLK pass through the slices against the CPU's LLK of the same arrays.
 //! Frames are on the fused passes' smallest side, two incoherent probe modes, 30 Fermat
 //! positions in stacks of at most 8, so a batch of 12 ends in a stack of 4; 300 positions in
 //! stacks the device sizes take the waves a position recuts.
@@ -15,8 +15,8 @@ use ptyrs::base::{
     AddrTable, C64, Counts, Geometry, Object, Probe, Scan, Stack, required_obj_shape,
 };
 use ptyrs::engine::{
-    ApParams, Cost, Features, Fft2, GpuOptions, GpuPtycho, Llk, Lsqml, LsqmlParams, LsqmlStep,
-    Observed, Optics, ProbeVariation, Sampling, SliceWaves, Wavefield, llk, shift,
+    ApParams, Cost, Feature, Features, Fft2, GpuOptions, GpuPtycho, Llk, Lsqml, LsqmlParams,
+    LsqmlStep, Observed, Optics, ProbeVariation, Sampling, SliceWaves, Wavefield, llk, shift,
 };
 use ptyrs::gpu::FUSED_SIDES;
 
@@ -31,7 +31,16 @@ const PIXEL: f64 = 50e-9;
 /// Photons the probe sends through a frame.
 const PHOTONS: f64 = 2e5;
 const FRAME: usize = FUSED_SIDES[0] as usize;
-const PROPAGATORS: [&str; 4] = ["far field", "angular spectrum", "Fresnel", "Fresnel back"];
+/// A wavelength whose angular spectrum over [`PIXEL`] drops the corners of the frequency
+/// grid, `λ / pixel` the CPU's near case's 5/3.
+const BAND_WAVELENGTH: f64 = PIXEL / 0.6;
+const PROPAGATORS: [&str; 5] = [
+    "far field",
+    "angular spectrum",
+    "Fresnel",
+    "Fresnel back",
+    "evanescent band",
+];
 
 const OPTIONS: GpuOptions = GpuOptions {
     stack_size: Some(8),
@@ -55,13 +64,25 @@ fn wavefield(distance: f64) -> Wavefield {
     Wavefield::new([FRAME, FRAME], WAVELENGTH, [PIXEL, PIXEL], distance).unwrap()
 }
 
-/// `propagator` after `nslice` slices 20 µm, then 30 µm apart.
+/// `propagator` after `nslice` slices 20 µm, then 30 µm apart; the gaps at [`WAVELENGTH`]
+/// under every one, so an evanescent band is the exit's alone.
 fn optics(propagator: &str, nslice: usize) -> Optics {
+    let band = || {
+        let pixel = [PIXEL, PIXEL];
+        Wavefield::new(
+            [FRAME, FRAME],
+            BAND_WAVELENGTH,
+            pixel,
+            6.0 * BAND_WAVELENGTH,
+        )
+        .unwrap()
+    };
     let exit = match propagator {
         "far field" => Optics::far_field(&geometry()),
         "angular spectrum" => Optics::free_space(&wavefield(1e-4)),
         "Fresnel" => Optics::free_space(&wavefield(5e-3)),
         "Fresnel back" => Optics::free_space(&wavefield(-5e-3)),
+        "evanescent band" => Optics::free_space(&band()),
         other => panic!("no propagator {other}"),
     };
     let gaps = [wavefield(2e-5), wavefield(3e-5)];
@@ -333,7 +354,7 @@ fn drawn_offsets(npos: usize) -> Vec<[f64; 2]> {
 
 fn moved(position: bool) -> Features {
     Features {
-        position: position.then(|| drawn_offsets(NPOS)),
+        position: position.then(|| Feature::refined(drawn_offsets(NPOS))),
         ..Features::default()
     }
 }
@@ -346,11 +367,11 @@ fn offsets_rel(a: &Features, b: &Features, start: &Features) -> f64 {
     };
     let delta = |d: &[[f64; 2]]| -> Vec<f64> {
         d.iter()
-            .zip(s)
+            .zip(&s.values)
             .flat_map(|(d, s)| [d[0] - s[0], d[1] - s[1]])
             .collect()
     };
-    let (a, b) = (delta(a), delta(b));
+    let (a, b) = (delta(&a.values), delta(&b.values));
     let d = worst_of(a.iter().zip(&b).map(|(a, b)| (a - b).abs()));
     d / b.iter().map(|b| b.abs()).fold(0.0, f64::max)
 }
@@ -420,7 +441,7 @@ fn matches_cpu(propagator: &str, nslices: &[usize], nobj: usize, sampling: Sampl
                  offsets {:.2e}",
                 errs[0], errs[1], errs[2], errs[3], errs[4], errs[5]
             );
-            // Each bound is 5 times the worst of the 72 runs or more: `a_far` 2.8e-5 and the
+            // Each bound is 5 times the worst of the 90 runs or more: `a_far` 2.8e-5 and the
             // offsets 1.9e-5 under the Fresnel transform back, three slices, Poisson, a position
             // that moves the probe; of one that samples the object, `a_far` 1.2e-5 there.
             let bounds = [
@@ -458,6 +479,11 @@ fn sliced_lsqml_matches_cpu_under_fresnel_back() {
     matches_cpu(PROPAGATORS[3], &[2, 3], 1, Sampling::Patch);
 }
 
+#[test]
+fn sliced_lsqml_matches_cpu_under_an_evanescent_band() {
+    matches_cpu(PROPAGATORS[4], &[2, 3], 1, Sampling::Patch);
+}
+
 /// Two object modes through three slices, each view's wave its own through every slice.
 #[test]
 fn sliced_lsqml_with_object_modes_matches_cpu_in_the_far_field() {
@@ -477,6 +503,11 @@ fn sliced_lsqml_with_object_modes_matches_cpu_under_fresnel() {
 #[test]
 fn sliced_lsqml_with_object_modes_matches_cpu_under_fresnel_back() {
     matches_cpu(PROPAGATORS[3], &[3], 2, Sampling::Patch);
+}
+
+#[test]
+fn sliced_lsqml_with_object_modes_matches_cpu_under_an_evanescent_band() {
+    matches_cpu(PROPAGATORS[4], &[3], 2, Sampling::Patch);
 }
 
 /// A position that samples the object: every slice's windows, under each propagator.
@@ -545,9 +576,11 @@ fn llk_matches_cpu(nslices: &[usize], nobj: usize, sampling: Sampling) {
         let c = case(optics(propagator, nslice), NPOS, nobj);
         let features = Features {
             position: scale.map(|s| {
-                (drawn_offsets(NPOS).iter())
-                    .map(|d| d.map(|d| s * d))
-                    .collect()
+                Feature::refined(
+                    (drawn_offsets(NPOS).iter())
+                        .map(|d| d.map(|d| s * d))
+                        .collect(),
+                )
             }),
             ..Features::default()
         };
@@ -566,21 +599,29 @@ fn llk_matches_cpu(nslices: &[usize], nobj: usize, sampling: Sampling) {
             let end = gpu.llk().unwrap();
             let (objects, probe) = (gpu.objects().unwrap(), gpu.probe().unwrap());
             let offsets = gpu.features().unwrap().position;
-            let want = cpu(&objects, &probe, offsets.as_deref());
+            let want = cpu(&objects, &probe, offsets.as_ref().map(|d| &d.values[..]));
             (start, records, end, want)
         };
         let (start, records, end, want) = run(true);
         let what =
             format!("{propagator} {nslice} slices {nobj} modes offsets {scale:?} {sampling:?}");
         if scale == Some(PAST_EDGE) {
-            let offsets = features.position.as_deref().expect("a position");
+            let offsets = features
+                .position
+                .as_ref()
+                .map(|d| &d.values[..])
+                .expect("a position");
             assert!(c.past_edge(offsets), "{what}: no view reads past the edge");
         }
         assert!(
             llk_bits(&records[1]) == llk_bits(&end),
             "{what}: the epoch's record is not the pass's"
         );
-        let first = cpu(&c.objects, &c.probe, features.position.as_deref());
+        let first = cpu(
+            &c.objects,
+            &c.probe,
+            features.position.as_ref().map(|d| &d.values[..]),
+        );
         let errs = [llk_rel(&start, &first), llk_rel(&end, &want)];
         eprintln!(
             "{what}: start {:.2e} end {:.2e}, poisson {:.4e} -> {:.4e}",
@@ -660,7 +701,7 @@ fn sliced_lsqml_is_bit_identical_with_graphs_and_without() {
                 })
                 .collect();
             let objects: Vec<_> = g.objects().unwrap().iter().map(|o| bits(o)).collect();
-            let offsets = f64s(&g.features().unwrap().position.unwrap().concat());
+            let offsets = f64s(&g.features().unwrap().position.unwrap().values.concat());
             (steps, objects, bits(&g.probe().unwrap()), offsets)
         };
         let (graphs, eager) = (run(true), run(false));
@@ -688,7 +729,7 @@ fn sliced_llk_follows_the_stacks_a_position_recuts() {
         ..OPTIONS
     };
     let features = Features {
-        position: Some(drawn_offsets(NPOS_RECUT)),
+        position: Some(Feature::refined(drawn_offsets(NPOS_RECUT))),
         ..Features::default()
     };
     let params = LsqmlParams {
@@ -701,14 +742,18 @@ fn sliced_llk_follows_the_stacks_a_position_recuts() {
     let start = gpu.llk().unwrap();
     gpu.lsqml(&params, 1, 0).unwrap();
     let (objects, probe) = (gpu.objects().unwrap(), gpu.probe().unwrap());
-    let offsets = gpu.features().unwrap().position.unwrap();
+    let offsets = gpu.features().unwrap().position.unwrap().values;
     let stepped = gpu.llk().unwrap();
     gpu.set_features(&Features::default()).unwrap();
     let dropped = gpu.llk().unwrap();
     let errs = [
         llk_rel(
             &start,
-            &c.llk(&c.objects, &c.probe, features.position.as_deref()),
+            &c.llk(
+                &c.objects,
+                &c.probe,
+                features.position.as_ref().map(|d| &d.values[..]),
+            ),
         ),
         llk_rel(&stepped, &c.llk(&objects, &probe, Some(&offsets))),
         llk_rel(&dropped, &c.llk(&objects, &probe, None)),
@@ -782,6 +827,48 @@ fn gpu_refuses_what_it_cannot_run_on_slices() {
     assert!(
         bits(&gpu.probe().unwrap()) == probe,
         "a refused pass changed the probe"
+    );
+    assert!(gpu.history().is_empty());
+    assert_eq!(gpu.cycle(), 0);
+}
+
+/// Under [`Sampling::FullObject`] a pass that models one slice would sample the windows of
+/// the first slice alone as the whole object; on a multislice object each is refused before
+/// it launches anything, changing neither the arrays nor the offsets.
+#[test]
+fn gpu_refuses_one_slice_windows_of_slices() {
+    let c = case(optics("angular spectrum", 3), NPOS, 1);
+    let mut gpu = c.gpu(OPTIONS);
+    gpu.set_features(&moved(true)).unwrap();
+    gpu.set_sampling(Sampling::FullObject).unwrap();
+    let before: Vec<_> = gpu.objects().unwrap().iter().map(|o| bits(o)).collect();
+    let probe = bits(&gpu.probe().unwrap());
+    let offsets = gpu.features().unwrap().position;
+
+    let refused = [
+        ("Ap", gpu.ap(&ApParams::default(), 1).unwrap_err()),
+        ("Dm", gpu.dm(&Default::default(), 1).unwrap_err()),
+        ("Raar", gpu.raar(&Default::default(), 1).unwrap_err()),
+        ("Rpie", gpu.rpie(&Default::default(), 1).unwrap_err()),
+        ("ML's scaling", gpu.ml(&Default::default(), 1).unwrap_err()),
+        ("ML's gradient", gpu.ml_grads().unwrap_err()),
+    ];
+    let only = "only LSQML, BH and the LLK pass run a multislice object";
+    for (what, e) in refused {
+        let e = e.to_string();
+        let named = format!("{what} runs one object slice, got 3");
+        assert!(e.contains(&named) && e.contains(only), "{e}");
+    }
+
+    let after: Vec<_> = gpu.objects().unwrap().iter().map(|o| bits(o)).collect();
+    assert!(after == before, "a refused pass changed the object");
+    assert!(
+        bits(&gpu.probe().unwrap()) == probe,
+        "a refused pass changed the probe"
+    );
+    assert!(
+        gpu.features().unwrap().position == offsets,
+        "a refused pass moved the offsets"
     );
     assert!(gpu.history().is_empty());
     assert_eq!(gpu.cycle(), 0);

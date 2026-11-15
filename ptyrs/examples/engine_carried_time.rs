@@ -17,8 +17,8 @@ use std::time::Instant;
 
 use cuda_core::CudaContext;
 use ptyrs::engine::{
-    ApParams, BhParams, Cost, DmParams, EngineError, Features, GpuOptions, GpuPtycho, LsqmlParams,
-    MlParams, RaarParams,
+    ApParams, BhParams, Cost, DmParams, EngineError, Feature, Features, GpuOptions, GpuPtycho,
+    LsqmlParams, MlParams, RaarParams,
 };
 use ptyrs::io::{read_cxi, read_modes};
 
@@ -121,7 +121,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             let mut g = GpuPtycho::new(&ctx, &scan, object.clone(), probe.clone(), options)?;
             if pos {
                 g.set_features(&Features {
-                    position: Some(vec![[0.0; 2]; nframe]),
+                    position: Some(Feature::refined(vec![[0.0; 2]; nframe])),
                     ..Features::default()
                 })?;
             }
@@ -141,7 +141,13 @@ fn main() -> Result<(), Box<dyn Error>> {
                     (v.re.to_bits(), v.im.to_bits()).hash(&mut h);
                 }
             }
-            for d in g.features()?.position.iter().flatten().flatten() {
+            for d in g
+                .features()?
+                .position
+                .iter()
+                .flat_map(|d| &d.values)
+                .flatten()
+            {
                 d.to_bits().hash(&mut h);
             }
             for v in [

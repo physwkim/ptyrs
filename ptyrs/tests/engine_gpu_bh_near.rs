@@ -1,20 +1,51 @@
 //! GPU BH under the propagators with a plane stage against the CPU's `f64` [`Bh`] from the
-//! same start, on the cases of `common/near.rs`.
+//! same start, on the cases of `common/near.rs` and on angular spectrum with an evanescent
+//! band, which BH carries as the CPU's does.
 
 use std::slice;
 
-use ptyrs::base::{C64, Stack};
-use ptyrs::engine::{Bh, BhParams, BhStep, Features, Ptycho, Sampling};
+use ptyrs::base::{C64, Object, Probe, Stack};
+use ptyrs::engine::{Bh, BhParams, BhStep, Feature, Features, Sampling, SliceWaves, llk};
 
 #[path = "common/near.rs"]
 mod near;
-use near::{NPOS, cases, drawn_offsets};
+use near::{Case, NPOS, PIXEL, cases, drawn_offsets};
 #[path = "common/worst.rs"]
 mod worst;
 use worst::worst_of;
 
 /// The far-field GPU-against-CPU BH tests' bound on steps, arrays and LLK.
 const TOL: f64 = 1e-4;
+/// A wavelength whose angular spectrum over [`PIXEL`] drops the corners of the frequency
+/// grid, `λ / pixel` the CPU's near case's 5/3.
+const BAND_WAVELENGTH: f64 = PIXEL / 0.6;
+
+/// [`cases`] and angular spectrum with an evanescent band.
+fn bh_cases() -> impl Iterator<Item = Case> {
+    let band = near::case("evanescent band", BAND_WAVELENGTH, 6.0 * BAND_WAVELENGTH);
+    cases().into_iter().chain([band])
+}
+
+/// The CPU's normalised Poisson LLK of `object` and `probe` under `Sampling::FullObject`, the
+/// object read at each view's corner plus its frame's entry of `offsets`.
+fn full_object_llk(c: &Case, object: &Object, probe: &Probe, offsets: &[[f64; 2]]) -> f64 {
+    let (optics, views) = (c.optics(), c.addr.views());
+    let offsets = (!offsets.is_empty()).then_some(offsets);
+    let objects = slice::from_ref(object);
+    let waves = SliceWaves::with_sampling(
+        &optics,
+        views,
+        objects,
+        probe,
+        offsets,
+        Sampling::FullObject,
+    );
+    let mut psi = waves.psi().to_vec();
+    optics.exit().forward(&mut psi);
+    llk(&c.obs, 0..c.addr.nframe(), c.addr.nmode(), &psi)
+        .normalised(c.obs.nb_obs())
+        .poisson
+}
 
 fn params(batch_size: usize) -> BhParams {
     BhParams {
@@ -70,7 +101,7 @@ fn check(what: &str, names: &[&str], errs: &[f64]) {
 #[test]
 fn bh_steps_match_cpu_under_every_propagator() {
     const NEPOCH: usize = 3;
-    for c in cases() {
+    for c in bh_cases() {
         for batch_size in [NPOS, 4] {
             let p = params(batch_size);
             let mut bh = Bh::new(p).unwrap();
@@ -115,70 +146,86 @@ fn bh_steps_match_cpu_under_every_propagator() {
     }
 }
 
-/// BH refining positions from drawn offsets under each propagator, eagerly and from graphs:
-/// after four epochs the last epoch's steps, the arrays and the offsets.
+/// BH refining and holding positions from drawn offsets under each propagator, eagerly and
+/// from graphs: after four epochs the last epoch's steps, the arrays and the offsets, which
+/// held keep the bits they were set with.
 #[test]
 fn bh_position_matches_cpu_under_every_propagator() {
     const NEPOCH: usize = 4;
-    let moved = Features {
-        position: Some(drawn_offsets()),
-        ..Features::default()
-    };
-    for c in cases() {
-        for batch_size in [NPOS, 4] {
-            let p = params(batch_size);
-            let mut bh = Bh::new(p).unwrap().with_features(moved.clone()).unwrap();
-            let (mut o, mut pr) = (c.object.clone(), c.probe.clone());
-            let mut steps = Vec::new();
-            for _ in 0..NEPOCH {
-                steps = bh.epoch(
-                    &c.addr,
-                    &c.obs,
-                    &c.optics(),
-                    slice::from_mut(&mut o),
-                    &mut pr,
-                );
-            }
-            let want = bh.features().position.clone().unwrap();
-            let scale = want.iter().flatten().fold(0.0f64, |m, v| m.max(v.abs()));
-            for graph in [false, true] {
-                let mut gpu = c.gpu(graph);
-                gpu.set_features(&moved).unwrap();
-                gpu.bh(&p, NEPOCH, 0).unwrap();
-                let got = gpu.features().unwrap().position.unwrap();
-                let offset = worst_of(
-                    (got.iter().flatten().zip(want.iter().flatten())).map(|(g, w)| (g - w).abs()),
-                ) / scale;
-                let errs = [
-                    step_err(&gpu.bh_steps().unwrap(), &steps),
-                    rel_l2(&gpu.object().unwrap(), &o),
-                    rel_l2(&gpu.probe().unwrap(), &pr),
-                    offset,
-                ];
-                let what = format!("{} positions batch {batch_size} graph {graph}", c.name);
-                eprintln!(
-                    "{what}: step {:.2e} object {:.2e} probe {:.2e} offset {:.2e}",
-                    errs[0], errs[1], errs[2], errs[3]
-                );
-                check(&what, &["step", "object", "probe", "offset"], &errs);
+    let d0 = drawn_offsets();
+    for c in bh_cases() {
+        for position in [Feature::refined(d0.clone()), Feature::held(d0.clone())] {
+            let named = if position.refine { "refined" } else { "held" };
+            let moved = Features {
+                position: Some(position),
+                ..Features::default()
+            };
+            for batch_size in [NPOS, 4] {
+                let p = params(batch_size);
+                let mut bh = Bh::new(p).unwrap().with_features(moved.clone()).unwrap();
+                let (mut o, mut pr) = (c.object.clone(), c.probe.clone());
+                let mut steps = Vec::new();
+                for _ in 0..NEPOCH {
+                    steps = bh.epoch(
+                        &c.addr,
+                        &c.obs,
+                        &c.optics(),
+                        slice::from_mut(&mut o),
+                        &mut pr,
+                    );
+                }
+                let want = bh.features().position.clone().unwrap().values;
+                let scale = want.iter().flatten().fold(0.0f64, |m, v| m.max(v.abs()));
+                for graph in [false, true] {
+                    let mut gpu = c.gpu(graph);
+                    gpu.set_features(&moved).unwrap();
+                    let set = gpu.features().unwrap().position.unwrap();
+                    gpu.bh(&p, NEPOCH, 0).unwrap();
+                    let got = gpu.features().unwrap().position.unwrap();
+                    let what = format!("{} {named} batch {batch_size} graph {graph}", c.name);
+                    if !set.refine {
+                        assert!(got.values == set.values, "{what}: held offsets moved");
+                    }
+                    let offset = worst_of(
+                        (got.values.iter().flatten().zip(want.iter().flatten()))
+                            .map(|(g, w)| (g - w).abs()),
+                    ) / scale;
+                    let errs = [
+                        step_err(&gpu.bh_steps().unwrap(), &steps),
+                        rel_l2(&gpu.object().unwrap(), &o),
+                        rel_l2(&gpu.probe().unwrap(), &pr),
+                        offset,
+                    ];
+                    eprintln!(
+                        "{what}: step {:.2e} object {:.2e} probe {:.2e} offset {:.2e}",
+                        errs[0], errs[1], errs[2], errs[3]
+                    );
+                    check(&what, &["step", "object", "probe", "offset"], &errs);
+                }
             }
         }
     }
 }
 
 /// BH under `Sampling::FullObject` under each propagator, eagerly and from graphs, still and
-/// refining drawn offsets that sample the object: after four epochs the last epoch's steps,
-/// the arrays, the offsets and the LLK the GPU records after it, against the CPU's under the
-/// same sampling.
+/// refining or holding drawn offsets that sample the object: after four epochs the last
+/// epoch's steps, the arrays, the offsets and the LLK the GPU records after it, against the
+/// CPU's under the same sampling.
 #[test]
 fn bh_full_object_matches_cpu_under_every_propagator() {
     const NEPOCH: usize = 4;
-    let moved = Features {
-        position: Some(drawn_offsets()),
+    let moved = |position| Features {
+        position: Some(position),
         ..Features::default()
     };
-    for c in cases() {
-        for (named, features) in [("still", Features::default()), ("positions", moved.clone())] {
+    let d0 = drawn_offsets();
+    let runs = [
+        ("still", Features::default()),
+        ("positions", moved(Feature::refined(d0.clone()))),
+        ("held", moved(Feature::held(d0))),
+    ];
+    for c in bh_cases() {
+        for (named, features) in runs.clone() {
             for batch_size in [NPOS, 4] {
                 let p = params(batch_size);
                 let mut bh = Bh::new(p)
@@ -197,20 +244,23 @@ fn bh_full_object_matches_cpu_under_every_propagator() {
                         &mut pr,
                     );
                 }
-                let want = bh.features().clone();
-                let mut cpu =
-                    Ptycho::with_optics(&c.scan, c.optics(), o.clone(), pr.clone()).unwrap();
-                cpu.set_sampling(Sampling::FullObject);
-                cpu.set_features(want.clone()).unwrap();
-                let llk = cpu.llk().poisson;
-                let want = want.position.unwrap_or_default();
+                let want = bh.features().position.clone();
+                let want = want.map(|d| d.values).unwrap_or_default();
+                let llk = full_object_llk(&c, &o, &pr, &want);
                 let scale = want.iter().flatten().fold(0.0f64, |m, v| m.max(v.abs()));
                 for graph in [false, true] {
                     let mut gpu = c.gpu(graph);
                     gpu.set_sampling(Sampling::FullObject).unwrap();
                     gpu.set_features(&features).unwrap();
+                    let set = gpu.features().unwrap().position;
                     gpu.bh(&p, NEPOCH, 1).unwrap();
-                    let got = gpu.features().unwrap().position.unwrap_or_default();
+                    let got = gpu.features().unwrap().position;
+                    let what = format!("{} {named} batch {batch_size} graph {graph}", c.name);
+                    if let Some(set) = set.filter(|d| !d.refine) {
+                        let kept = got.as_ref().is_some_and(|d| d.values == set.values);
+                        assert!(kept, "{what}: held offsets moved");
+                    }
+                    let got = got.map(|d| d.values).unwrap_or_default();
                     assert_eq!(got.len(), want.len());
                     let offset = worst_of(
                         (got.iter().flatten().zip(want.iter().flatten()))
@@ -224,7 +274,6 @@ fn bh_full_object_matches_cpu_under_every_propagator() {
                         offset,
                         (recorded - llk).abs() / llk,
                     ];
-                    let what = format!("{} {named} batch {batch_size} graph {graph}", c.name);
                     eprintln!(
                         "{what}: step {:.2e} object {:.2e} probe {:.2e} offset {:.2e} llk {:.2e}",
                         errs[0], errs[1], errs[2], errs[3], errs[4]

@@ -163,6 +163,7 @@ fn exit_stages_give_the_propagators_intensities_and_gram() {
             PlaneStage::None => ExitStage::None,
             PlaneStage::Reverse => ExitStage::Reverse,
             PlaneStage::Transfer(tf) => ExitStage::Transfer(up(&stream, tf)),
+            PlaneStage::Banded(_) => panic!("{name}: the Gram check needs a unitary stage"),
         };
         // The plane phase, shifted layout.
         let q: Vec<C64> = (0..n)

@@ -3,7 +3,7 @@
 use crate::gpu::Error as GpuError;
 use cuda_async::device_operation::ExecutionContext;
 
-use super::device::{CarriedMut, M1Bufs, PassesMut};
+use super::device::{CarriedMut, M1Bufs, OneSlice, PassesMut};
 use super::dm::{Carried, Mix};
 use super::{Bufs, Epoch, GpuPtycho};
 use crate::engine::{EngineError, RaarParams};
@@ -32,6 +32,7 @@ impl Bufs<'_> {
         w: &mut CarriedMut<'_>,
         params: &RaarParams,
         first: bool,
+        one: OneSlice,
     ) -> Result<(), GpuError> {
         let c = Carried {
             mix: Mix::Raar {
@@ -40,6 +41,7 @@ impl Bufs<'_> {
             first,
             inertia: [params.obj_inertia, params.probe_inertia],
             loops: params.loop_obj_probe,
+            one,
         };
         self.carried_cycle(ctx, passes, w, &c)
     }

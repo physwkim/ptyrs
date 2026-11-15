@@ -13,7 +13,8 @@ use ptyrs::base::{
     AddrTable, C64, Counts, Geometry, Object, Probe, Scan, Stack, required_obj_shape, sim,
 };
 use ptyrs::engine::{
-    Features, GpuOptions, GpuPtycho, Optics, Ptycho, RpieParams, SliceWaves, Wavefield, shift,
+    Feature, Features, GpuOptions, GpuPtycho, Optics, Ptycho, RpieParams, SliceWaves, Wavefield,
+    shift,
 };
 use ptyrs::gpu::FUSED_SIDES;
 
@@ -90,7 +91,7 @@ fn rpie_position_floor_matches_cpu_under_every_propagator() {
         })
         .collect();
     let moved = Features {
-        position: Some(start.clone()),
+        position: Some(Feature::refined(start.clone())),
         ..Features::default()
     };
     let ctx = CudaContext::new(0).expect("CUDA device 0");
@@ -117,8 +118,8 @@ fn rpie_position_floor_matches_cpu_under_every_propagator() {
         cpu.set_features(moved.clone()).unwrap();
         cpu.rpie(&RPIE, 2).unwrap();
 
-        let got = gpu.features().unwrap().position.unwrap();
-        let want = cpu.features().position.clone().unwrap();
+        let got = gpu.features().unwrap().position.unwrap().values;
+        let want = cpu.features().position.clone().unwrap().values;
         let flat = |d: &[[f64; 2]]| d.iter().flatten().copied().collect::<Vec<_>>();
         let (got, want, start) = (flat(&got), flat(&want), flat(&start));
         let off = worst_of(got.iter().zip(&want).map(|(g, w)| (g - w).abs()));

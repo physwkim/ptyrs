@@ -1,19 +1,22 @@
 //! The near-field and multislice cases GPU LSQML is held to, on the fused passes' smallest
-//! side: an angular-spectrum propagator, a Fresnel transform forward and back, and three
-//! object slices under angular spectrum, each run by the CPU's `f64` [`Lsqml`] from a start
-//! off the truth its counts come from. Two incoherent probe modes, 30 Fermat positions,
-//! counts the truth's intensities rounded.
+//! side: an angular-spectrum propagator with and without an evanescent band, a Fresnel
+//! transform forward and back, and three object slices under angular spectrum, each run by the
+//! CPU's `f64` [`Lsqml`] from a start off the truth its counts come from. Two incoherent probe
+//! modes, 30 Fermat positions, counts the truth's intensities rounded.
 
 use std::sync::Arc;
 
 use cuda_core::CudaContext;
 use ptyrs::base::{Geometry, Scan};
-use ptyrs::engine::{GpuOptions, GpuPtycho};
+use ptyrs::engine::{
+    ApParams, DmParams, GpuOptions, GpuPtycho, MlParams, PlaneStage, RaarParams, RpieParams,
+    Sampling,
+};
 
 use ptyrs::base::{AddrTable, C64, Counts, Object, Probe, Stack, required_obj_shape};
 use ptyrs::engine::{
-    Cost, Features, Lsqml, LsqmlParams, LsqmlStep, Observed, Optics, ProbeVariation, SliceWaves,
-    Wavefield, llk, shift,
+    Cost, Feature, Features, Lsqml, LsqmlParams, LsqmlStep, Observed, Optics, ProbeVariation,
+    SliceWaves, Wavefield, llk, shift,
 };
 use ptyrs::gpu::FUSED_SIDES;
 
@@ -25,6 +28,9 @@ const NPOS: usize = 30;
 const NPROBE: usize = 2;
 const WAVELENGTH: f64 = 1e-10;
 const PIXEL: f64 = 50e-9;
+/// A wavelength whose angular spectrum over [`PIXEL`] drops the corners of the frequency
+/// grid, `λ / pixel` the CPU's near case's 5/3.
+const BAND_WAVELENGTH: f64 = PIXEL / 0.6;
 /// Photons the probe sends through a frame.
 const PHOTONS: f64 = 2e5;
 
@@ -165,6 +171,13 @@ fn case(name: &'static str, frame: usize, optics: Optics, weights: &[f64]) -> Ca
 fn cases() -> Vec<Case> {
     let frame = FUSED_SIDES[0] as usize;
     let gaps = [wavefield(frame, 2e-5), wavefield(frame, 3e-5)];
+    let band = Wavefield::new(
+        [frame, frame],
+        BAND_WAVELENGTH,
+        [PIXEL, PIXEL],
+        6.0 * BAND_WAVELENGTH,
+    )
+    .unwrap();
     vec![
         case(
             "angular spectrum",
@@ -172,6 +185,7 @@ fn cases() -> Vec<Case> {
             Optics::free_space(&wavefield(frame, 1e-4)),
             &[1.0],
         ),
+        case("evanescent band", frame, Optics::free_space(&band), &[1.0]),
         case(
             "Fresnel",
             frame,
@@ -311,18 +325,20 @@ fn drawn_offsets() -> Vec<[f64; 2]> {
 /// GPU LSQML under every one-slice propagator against the CPU's from the same start, as
 /// `engine_gpu_lsqml` holds the far field: the steps of each of the first epochs from a fresh
 /// run without graphs, and with them the LLK after every epoch, the arrays and, modelling
-/// the position, the offsets' changes.
+/// the position, the offsets' changes. A position enters as [`Sampling::Patch`], and once
+/// as [`Sampling::FullObject`].
 #[test]
 fn gpu_lsqml_matches_cpu_under_every_propagator() {
     const NEPOCH: usize = 12;
     const NSTEPS: usize = 3;
     for c in cases().iter().filter(|c| c.optics.nslice() == 1) {
-        for (cost, batch_size, position) in [
-            (Cost::Amplitude, 12, false),
-            (Cost::Poisson, 12, false),
-            (Cost::Poisson, NPOS, false),
-            (Cost::Amplitude, 4, true),
-            (Cost::Poisson, 12, true),
+        for (cost, batch_size, position, sampling) in [
+            (Cost::Amplitude, 12, false, Sampling::Patch),
+            (Cost::Poisson, 12, false, Sampling::Patch),
+            (Cost::Poisson, NPOS, false, Sampling::Patch),
+            (Cost::Amplitude, 4, true, Sampling::Patch),
+            (Cost::Poisson, 12, true, Sampling::Patch),
+            (Cost::Poisson, 12, true, Sampling::FullObject),
         ] {
             let params = LsqmlParams {
                 batch_size,
@@ -330,7 +346,7 @@ fn gpu_lsqml_matches_cpu_under_every_propagator() {
                 seed: 7,
             };
             let features = Features {
-                position: position.then(drawn_offsets),
+                position: position.then(|| Feature::refined(drawn_offsets())),
                 ..Features::default()
             };
             let (mut objects, mut probe) = (c.objects.clone(), c.probe.clone());
@@ -338,7 +354,8 @@ fn gpu_lsqml_matches_cpu_under_every_propagator() {
             let mut cpu = Lsqml::new(params)
                 .unwrap()
                 .with_features(features.clone())
-                .unwrap();
+                .unwrap()
+                .with_sampling(sampling);
             let (mut steps, mut trace) = (0.0f64, Vec::new());
             for epoch in 0..NEPOCH {
                 let want = cpu.epoch(
@@ -357,6 +374,7 @@ fn gpu_lsqml_matches_cpu_under_every_propagator() {
                     };
                     let mut gpu = c.gpu(&c.optics, options).unwrap();
                     gpu.set_features(&features).unwrap();
+                    gpu.set_sampling(sampling).unwrap();
                     gpu.lsqml(&params, epoch + 1, 0).unwrap();
                     steps = worst_of([steps, steps_rel(&gpu.lsqml_steps().unwrap(), &want)]);
                 }
@@ -364,6 +382,7 @@ fn gpu_lsqml_matches_cpu_under_every_propagator() {
 
             let mut gpu = c.gpu(&c.optics, OPTIONS).unwrap();
             gpu.set_features(&features).unwrap();
+            gpu.set_sampling(sampling).unwrap();
             gpu.lsqml(&params, NEPOCH, 1).unwrap();
             // The CPU's LLK here is the unmoved probe's.
             let llk = if position {
@@ -375,14 +394,14 @@ fn gpu_lsqml_matches_cpu_under_every_propagator() {
             };
             let offsets = match (&features.position, cpu.features().position.as_ref()) {
                 (Some(start), Some(want)) => {
-                    let got = gpu.features().unwrap().position.unwrap();
+                    let got = gpu.features().unwrap().position.unwrap().values;
                     let delta = |d: &[[f64; 2]]| -> Vec<f64> {
                         d.iter()
-                            .zip(start)
+                            .zip(&start.values)
                             .flat_map(|(d, s)| [d[0] - s[0], d[1] - s[1]])
                             .collect()
                     };
-                    let (a, b) = (delta(&got), delta(want));
+                    let (a, b) = (delta(&got), delta(&want.values));
                     let d = a.iter().zip(&b).map(|(a, b)| (a - b).abs());
                     worst_of(d) / b.iter().map(|b| b.abs()).fold(0.0, f64::max)
                 }
@@ -396,8 +415,9 @@ fn gpu_lsqml_matches_cpu_under_every_propagator() {
                 offsets,
             ];
             eprintln!(
-                "{} {cost:?} batch {batch_size} position {position}: llk {:.2e} object {:.2e} \
-                 probe {:.2e} steps {:.2e} offsets {:.2e}, poisson llk {:.4e} -> {:.4e}",
+                "{} {cost:?} batch {batch_size} position {position} {sampling:?}: llk {:.2e} \
+                 object {:.2e} probe {:.2e} steps {:.2e} offsets {:.2e}, poisson llk {:.4e} -> \
+                 {:.4e}",
                 c.name,
                 errs[0],
                 errs[1],
@@ -413,7 +433,8 @@ fn gpu_lsqml_matches_cpu_under_every_propagator() {
             {
                 assert!(
                     e < 1e-4,
-                    "{} {cost:?} batch {batch_size} position {position} {what}: {e:e}",
+                    "{} {cost:?} batch {batch_size} position {position} {sampling:?} {what}: \
+                     {e:e}",
                     c.name
                 );
             }
@@ -433,8 +454,6 @@ fn gpu_refuses_optics_it_cannot_run() {
 
     let e = refused(&free([PIXEL, 1.2 * PIXEL], 5e-3), OPTIONS);
     assert!(e.contains("not square") && e.contains("6e-8"), "{e}");
-    let e = refused(&free([0.4 * WAVELENGTH; 2], 1e-9), OPTIONS);
-    assert!(e.contains("evanescent band"), "{e}");
     let e = refused(&slices.optics, OPTIONS);
     assert!(e.contains("1 object slices for optics of 3"), "{e}");
     let m1 = GpuOptions {
@@ -451,4 +470,48 @@ fn gpu_refuses_optics_it_cannot_run() {
         (got.poisson - want).abs() < 1e-5 * want,
         "{got:?} vs {want:e}"
     );
+}
+
+/// Under a propagator that drops an evanescent band, every algorithm that takes its adjoint
+/// for its inverse fails before it changes the arrays, as the CPU's `Ptycho` does; ML before
+/// its photon scaling.
+#[test]
+fn gpu_refuses_what_an_evanescent_band_breaks() {
+    let all = cases();
+    let c = all.iter().find(|c| c.name == "evanescent band").unwrap();
+    let form = c.optics.fourier_form().unwrap();
+    assert!(matches!(form.stage, PlaneStage::Banded(_)));
+    let mut gpu = c.gpu(&c.optics, OPTIONS).unwrap();
+    let (object, probe) = (gpu.object().unwrap(), gpu.probe().unwrap());
+    type Run = fn(&mut GpuPtycho) -> Option<String>;
+    let runs: [(&str, Run); 6] = [
+        ("AP", |g| {
+            g.ap(&ApParams::default(), 1).err().map(|e| e.to_string())
+        }),
+        ("DM", |g| {
+            g.dm(&DmParams::default(), 1).err().map(|e| e.to_string())
+        }),
+        ("RAAR", |g| {
+            g.raar(&RaarParams::default(), 1)
+                .err()
+                .map(|e| e.to_string())
+        }),
+        ("rPIE", |g| {
+            g.rpie(&RpieParams::default(), 1)
+                .err()
+                .map(|e| e.to_string())
+        }),
+        ("ML", |g| {
+            g.ml(&MlParams::default(), 1).err().map(|e| e.to_string())
+        }),
+        ("ML's gradients", |g| {
+            g.ml_grads().err().map(|e| e.to_string())
+        }),
+    ];
+    for (name, run) in runs {
+        let e = run(&mut gpu).unwrap_or_else(|| panic!("{name} ran"));
+        assert!(e.contains("needs a unitary propagator"), "{name}: {e}");
+    }
+    assert_eq!(rel_l2(&gpu.object().unwrap(), &object), 0.0);
+    assert_eq!(rel_l2(&gpu.probe().unwrap(), &probe), 0.0);
 }

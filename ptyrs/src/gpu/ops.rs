@@ -1280,6 +1280,36 @@ impl Kernels {
         self.normalize_obj_tiles(ctx, views, obj, (num, den), max_bits, inertia)
     }
 
+    /// The sums [`Self::update_obj_from_sums`] leaves, without its update: zeroes the sums of
+    /// the object tiles with a non-empty run, the only ones a stack adds to, and touches no
+    /// other. It discards the sums of an update a cycle began and never applied.
+    pub fn clear_obj_sums(
+        &self,
+        ctx: &ExecutionContext,
+        views: &Views,
+        sums: &mut UpdateSums,
+    ) -> Result<(), Error> {
+        let d = &views.dims;
+        let UpdateSums { num, den, .. } = sums;
+        check_len("sums.num", num, d.obj_len())?;
+        check_len("sums.den", den, d.obj_len())?;
+        let config = d.tile_grid();
+        let [nyo, nxo] = d.obj;
+        let tile_len = &views.tile_len;
+        let ptrs = SumPtrs {
+            num: dptr(num),
+            den: dptr(den),
+        };
+        let writes = [num.storage(), den.storage()];
+        self.launch(ctx, &[tile_len.storage()], &writes, |stream| {
+            // SAFETY: both sums checked above; `tile_len` holds the tiles of `views`.
+            unsafe {
+                self.module
+                    .clear_tiles(stream, config, ptrs, dptr(tile_len), nyo, nxo)
+            }
+        })
+    }
+
     /// [`Self::normalize_obj`] over `sums` as `(num, den)`, so that
     /// [`Self::update_obj_from_sums`] can pass the max word of the same [`UpdateSums`].
     fn normalize_obj_tiles(

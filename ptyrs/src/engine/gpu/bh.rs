@@ -1,23 +1,24 @@
 //! pty-chi BH on the GPU ([`crate::engine::Bh`]), in the call sequence of `crate::gpu::BhKernels`, its
 //! dot products by `crate::tile::TileDots`; the step's scalars stay on the device. Under
-//! [`crate::engine::Features::position`] the offsets join the step, on the moved probes or under
-//! [`crate::engine::Sampling::FullObject`] the object's windows.
+//! [`crate::engine::Features::position`] the offsets move the probes or under
+//! [`crate::engine::Sampling::FullObject`] sample the object's windows, and refined they join
+//! the step.
 
 use std::sync::Arc;
 
 use crate::gpu::sampling::{Modes, StackPoints, WindowBlock, window_views};
 use crate::gpu::{
-    BhBatch, BhDisp, BhEntry, BhFieldsRef, BhMovedFarRef, BhMovesRef, BhNearMut, BhOffsets,
-    BhPositions, BhScan, BhSecondRef, BhTangentsMut, BhVar, BhWinRef, BhWinSecond, C32, EpochOrder,
-    Error as GpuError, FrameWaves, FusedInputs, Kernels, Model, PsiSums, ShiftProbe, SliceSource,
-    SpectrumBuf, UpdateSums, ViewDims, Views,
+    BhBatch, BhDisp, BhEntry, BhFarRef, BhFieldsRef, BhMovedFarRef, BhMovedRef, BhMovesRef,
+    BhNearMut, BhOffsets, BhPositions, BhScan, BhSecondRef, BhTangentsMut, BhVar, BhWinRef,
+    BhWinSecond, C32, EpochOrder, Error as GpuError, FrameWaves, FusedInputs, Kernels, Model,
+    PsiSums, ShiftProbe, SliceSource, SpectrumBuf, UpdateSums, ViewDims, Views,
 };
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaStream, DeviceBuffer, DriverError};
 
 use super::device::{
-    BhBufs, Moved, MovedBatch, MovedLent, MovedSampling, PassesMut, PositionLent, SampledLent,
-    another_model, moved_inputs, moved_shift, slice_phase,
+    BhBufs, FeaturesMut, Moved, MovedBatch, MovedLent, MovedSampling, MovedScratch, PassesMut,
+    PositionLent, SampledLent, another_model, moved_inputs, moved_shift, slice_phase,
 };
 use super::propagate::Propagate;
 use super::{Bufs, Cut, GpuPtycho};
@@ -36,9 +37,9 @@ impl GpuPtycho {
         calc_llk: usize,
     ) -> Result<(), EngineError> {
         params.validate()?;
-        if self.dev.has_stepped() {
+        if self.dev.models_scale_or_background() {
             return Err(EngineError::Invalid(
-                "BH refines no intensity scale or background, as pty-chi's".into(),
+                "BH models no intensity scale or background, as pty-chi's".into(),
             ));
         }
         let nframe = self.dev.dims().nframe as usize;
@@ -67,37 +68,45 @@ impl GpuPtycho {
     }
 }
 
-/// BH's state under the position model: the moved probes, the offsets' step buffers and what
-/// the offsets move, by the device's [`crate::engine::Sampling`].
+/// BH's state under the position model: the moved probes and what the offsets move, by the
+/// device's [`crate::engine::Sampling`], with the offsets' step exactly when they are refined.
 pub(super) struct BhMoved {
     probes: Moved,
     by: BhBy,
-    off: BhPositions,
 }
 
 /// What BH's offsets move.
 enum BhBy {
-    /// [`crate::engine::Sampling::Patch`]: the probe, with one stack's forward-FFT'd
-    /// `conj(O) r` and the spectra of the step's probe parts (`u`'s, `v`'s).
+    /// [`crate::engine::Sampling::Patch`]: the probe, with the spectra of the step's probe
+    /// parts (`u`'s, `v`'s).
     Shift {
-        y: DeviceBuffer<C32>,
         spectra: [SpectrumBuf; 2],
+        step: Option<BhShiftStep>,
     },
     /// [`crate::engine::Sampling::FullObject`]: the object's windows.
-    Windows(Box<BhWindows>),
+    Windows {
+        w: Box<BhWindows>,
+        step: Option<BhWinStep>,
+    },
 }
 
-/// BH's windows under [`crate::engine::Sampling::FullObject`]: each three blocks `[nobj,
-/// nf_max, ny, nx]` of a stack's windows and their derivatives over `y` and `x`, unless said
-/// otherwise. A spectrum is `[nobj, nyo, nxo]`, the sampler's of one slice.
+/// The offsets' step under [`crate::engine::Sampling::Patch`]: their buffers and one stack's
+/// forward-FFT'd `conj(O) r`.
+struct BhShiftStep {
+    off: BhPositions,
+    y: DeviceBuffer<C32>,
+}
+
+/// BH's windows under [`crate::engine::Sampling::FullObject`]: each, unless said otherwise,
+/// blocks `[nobj, nf_max, ny, nx]` of a stack's windows and, while the offsets are refined,
+/// their derivatives over `y` and `x` ([`first`]). A spectrum is `[nobj, nyo, nxo]`, the
+/// sampler's of one slice.
 struct BhWindows {
     /// The views that read a stack's windows.
     views: Views,
     /// The estimate's, per stack of a batch and slice, kept from the gradient pass to the
     /// Hessian's.
     win: Vec<Vec<DeviceBuffer<C32>>>,
-    /// The estimate's second derivatives over `(y, y)`, `(y, x)` and `(x, x)`.
-    second: DeviceBuffer<C32>,
     /// `u_O`'s and `v_O`'s, block 0 lifted by [`crate::gpu::BhKernels::win_lift`].
     hu: DeviceBuffer<C32>,
     hv: DeviceBuffer<C32>,
@@ -109,8 +118,15 @@ struct BhWindows {
     deeper: Vec<DeviceBuffer<C32>>,
 }
 
+/// The offsets' step under [`crate::engine::Sampling::FullObject`]: their buffers and the
+/// estimate's second derivatives over `(y, y)`, `(y, x)` and `(x, x)`.
+struct BhWinStep {
+    off: BhPositions,
+    second: DeviceBuffer<C32>,
+}
+
 impl BhMoved {
-    /// For frames of `dims` in `cut`'s stacks, `slots` per batch, under `sampling`, through
+    /// For frames of `dims` in `cut`'s stacks, `slots` per batch, as `moved` asks, through
     /// `deeper` slices past the first, which only [`crate::engine::Sampling::FullObject`]
     /// reads.
     pub(super) fn new(
@@ -119,47 +135,61 @@ impl BhMoved {
         dims: &ViewDims,
         cut: &Cut,
         slots: usize,
-        (sampling, deeper): (MovedSampling, usize),
+        (moved, deeper): (MovedScratch, usize),
     ) -> Result<Self, EngineError> {
         let zeroed = |len| DeviceBuffer::<C32>::zeroed(stream, len);
         let spectrum = || zeroed(dims.obj_len());
-        let (by, nslice) = match sampling {
-            MovedSampling::Patch => {
-                let y = zeroed(cut.wave_len(dims))?;
-                let spectra = [
+        let refined = moved.refined;
+        let by = match moved.sampling {
+            MovedSampling::Patch => BhBy::Shift {
+                spectra: [
                     SpectrumBuf::zeroed(stream, dims)?,
                     SpectrumBuf::zeroed(stream, dims)?,
-                ];
-                (BhBy::Shift { y, spectra }, 1)
-            }
+                ],
+                step: (refined)
+                    .then(|| {
+                        Ok::<_, EngineError>(BhShiftStep {
+                            off: BhPositions::zeroed(stream, dims, 1)?,
+                            y: zeroed(cut.wave_len(dims))?,
+                        })
+                    })
+                    .transpose()?,
+            },
             MovedSampling::FullObject { .. } => {
                 let stacks: Vec<_> = cut.frames.iter().map(|f| f.range.clone()).collect();
                 let views = window_views(stream, dims, &stacks)?;
                 let blk = views.dims().obj_len();
                 let nslice = deeper + 1;
+                let first = first(refined).count() * blk;
                 let win = (0..slots)
-                    .map(|_| (0..nslice).map(|_| zeroed(3 * blk)).collect())
+                    .map(|_| (0..nslice).map(|_| zeroed(first)).collect())
                     .collect::<Result<_, _>>()?;
-                let w = BhWindows {
+                let w = Box::new(BhWindows {
                     views,
                     win,
-                    second: zeroed(3 * blk)?,
-                    hu: zeroed(3 * blk)?,
-                    hv: zeroed(3 * blk)?,
+                    hu: zeroed(first)?,
+                    hv: zeroed(first)?,
                     patch: zeroed(blk)?,
                     spectra: (0..nslice)
                         .map(|_| Ok([spectrum()?, spectrum()?]))
                         .collect::<Result<_, DriverError>>()?,
                     deeper: (0..deeper).map(|_| spectrum()).collect::<Result<_, _>>()?,
-                };
-                (BhBy::Windows(Box::new(w)), nslice)
+                });
+                let step = (refined)
+                    .then(|| {
+                        Ok::<_, EngineError>(BhWinStep {
+                            off: BhPositions::zeroed(stream, dims, nslice)?,
+                            second: zeroed(3 * blk)?,
+                        })
+                    })
+                    .transpose()?;
+                BhBy::Windows { w, step }
             }
         };
         let nf_max = cut.table.nf_max();
         Ok(Self {
-            probes: Moved::new(stream, kernels, dims, nf_max, slots, sampling.into())?,
+            probes: Moved::new(stream, kernels, dims, nf_max, slots, moved.sampling.into())?,
             by,
-            off: BhPositions::zeroed(stream, dims, nslice)?,
         })
     }
 
@@ -167,48 +197,67 @@ impl BhMoved {
     pub(super) fn reads(&self) -> Sampling {
         match self.by {
             BhBy::Shift { .. } => Sampling::Patch,
-            BhBy::Windows(_) => Sampling::FullObject,
+            BhBy::Windows { .. } => Sampling::FullObject,
         }
     }
 
-    /// Its [`Moved`], what the offsets move and the offsets, a variable of the step over
-    /// `order`, the epoch's.
-    fn split<'m>(
-        &'m mut self,
-        order: &'m EpochOrder,
-        params: &BhParams,
-    ) -> (&'m mut Moved, &'m mut BhBy, BhOffsets<'m>) {
-        let off = BhOffsets {
-            bufs: &mut self.off,
-            order,
-            scale: params.position_rho.powi(2) as f32,
-            step: POSITION_STEP as f32,
-        };
-        (&mut self.probes, &mut self.by, off)
+    /// Whether it was built to step the offsets.
+    pub(super) fn refined(&self) -> bool {
+        match &self.by {
+            BhBy::Shift { step, .. } => step.is_some(),
+            BhBy::Windows { step, .. } => step.is_some(),
+        }
     }
 
-    /// [`Self::split`] under [`crate::engine::Sampling::Patch`]; an error under the other.
+    /// Its [`Moved`] and its other buffers under [`crate::engine::Sampling::Patch`], with the
+    /// offsets' step over `order`, the epoch's, as `features` refine them; an error under the
+    /// other sampling or refine.
     fn split_shift<'m>(
         &'m mut self,
         order: &'m EpochOrder,
         params: &BhParams,
+        features: &FeaturesMut<'_>,
     ) -> Result<(&'m mut Moved, BhOwn<'m>), GpuError> {
-        match self.split(order, params) {
-            (m, BhBy::Shift { y, spectra }, off) => Ok((m, BhOwn { y, spectra, off })),
-            _ => Err(another_model()),
-        }
+        let BhBy::Shift { spectra, step } = &mut self.by else {
+            return Err(another_model());
+        };
+        let step = (features.own_step(step.as_mut())?).map(|BhShiftStep { off, y }| BhShiftOwn {
+            off: offsets(off, order, params),
+            y,
+        });
+        Ok((&mut self.probes, BhOwn { spectra, step }))
     }
 
-    /// [`Self::split`] under [`crate::engine::Sampling::FullObject`]; an error under the other.
+    /// [`Self::split_shift`] under [`crate::engine::Sampling::FullObject`].
     fn split_windows<'m>(
         &'m mut self,
         order: &'m EpochOrder,
         params: &BhParams,
+        features: &FeaturesMut<'_>,
     ) -> Result<(&'m mut Moved, BhWinOwn<'m>), GpuError> {
-        match self.split(order, params) {
-            (m, BhBy::Windows(w), off) => Ok((m, BhWinOwn { w, off })),
-            _ => Err(another_model()),
-        }
+        let BhBy::Windows { w, step } = &mut self.by else {
+            return Err(another_model());
+        };
+        let step =
+            (features.own_step(step.as_mut())?).map(|BhWinStep { off, second }| BhWinStepOwn {
+                off: offsets(off, order, params),
+                second,
+            });
+        Ok((&mut self.probes, BhWinOwn { w, step }))
+    }
+}
+
+/// `bufs` as a variable of the step over `order`, the epoch's.
+fn offsets<'m>(
+    bufs: &'m mut BhPositions,
+    order: &'m EpochOrder,
+    params: &BhParams,
+) -> BhOffsets<'m> {
+    BhOffsets {
+        bufs,
+        order,
+        scale: params.position_rho.powi(2) as f32,
+        step: POSITION_STEP as f32,
     }
 }
 
@@ -258,16 +307,34 @@ impl BhSliced {
 /// [`BhMoved`]'s buffers besides its [`Moved`] under [`crate::engine::Sampling::Patch`], lent
 /// to a batch.
 struct BhOwn<'m> {
-    y: &'m mut DeviceBuffer<C32>,
     spectra: &'m mut [SpectrumBuf; 2],
+    step: Option<BhShiftOwn<'m>>,
+}
+
+/// [`BhShiftStep`] lent to a batch.
+struct BhShiftOwn<'m> {
     off: BhOffsets<'m>,
+    y: &'m mut DeviceBuffer<C32>,
 }
 
 /// [`BhMoved`]'s buffers besides its [`Moved`] under [`crate::engine::Sampling::FullObject`],
 /// lent to a batch.
 struct BhWinOwn<'m> {
     w: &'m mut BhWindows,
+    step: Option<BhWinStepOwn<'m>>,
+}
+
+/// [`BhWinStep`] lent to a batch.
+struct BhWinStepOwn<'m> {
     off: BhOffsets<'m>,
+    second: &'m mut DeviceBuffer<C32>,
+}
+
+/// What a batch's Hessian pass reads of the moved probes: refined, the offsets' step and its
+/// `y`; held, the offsets alone.
+enum MovedHess<'a> {
+    Stepped(BhMovesRef<'a>, &'a mut DeviceBuffer<C32>),
+    Held(BhMovedRef<'a>),
 }
 
 /// The estimate's windows and their derivatives over `y` and `x`, by block.
@@ -283,6 +350,12 @@ fn blocks(orders: [[u32; 2]; 3]) -> impl Iterator<Item = WindowBlock> {
         modes: Modes::All,
         block,
     })
+}
+
+/// The blocks of [`FIRST`] the batches read: the windows' derivatives only while the offsets
+/// are `refined`.
+fn first(refined: bool) -> impl Iterator<Item = WindowBlock> {
+    blocks(FIRST).take(if refined { FIRST.len() } else { 1 })
 }
 
 /// Batch `b`'s step over `bh`'s epoch order, with the offsets a variable of it if `positions`.
@@ -351,8 +424,9 @@ impl Bufs<'_> {
         };
         let views = bh.order.views();
         let k = self.kernels;
-        let step = batch_step(bh, b, bh.moved.is_some());
-        let moved = (bh.moved.as_deref_mut()).map(|m| m.split_shift(bh.order, params));
+        let step = batch_step(bh, b, (bh.moved.as_deref()).is_some_and(BhMoved::refined));
+        let features = &self.features;
+        let moved = (bh.moved.as_deref_mut()).map(|m| m.split_shift(bh.order, params, features));
         let moved = MovedLent::lend(moved.transpose()?, passes.fused(), &mut self.features)?;
         let mut moved = (moved.map(|m| m.batch(ctx, k, &dims, self.probe))).transpose()?;
         let base = FusedInputs {
@@ -389,10 +463,11 @@ impl Bufs<'_> {
                         probe: Some(ShiftProbe::Sums(&mut *m.probe_sums)),
                     };
                     k.shifted_psi_sums(ctx, &inputs, stack, r, m.fused, sums)?;
-                    let BhOwn { y, off, .. } = &mut m.own;
-                    self.bh.obj_conj(ctx, views, stack, self.obj, r, y)?;
-                    plan.forward_inplace(ctx, y)?;
-                    self.bh.pos_grad(ctx, stack, y, &shift, off)?;
+                    if let Some(BhShiftOwn { off, y }) = &mut m.own.step {
+                        self.bh.obj_conj(ctx, views, stack, self.obj, r, y)?;
+                        plan.forward_inplace(ctx, y)?;
+                        self.bh.pos_grad(ctx, stack, y, &shift, off)?;
+                    }
                 }
                 None => {
                     k.psi_to_obj(ctx, views, stack, r, self.probe, self.obj_sums)?;
@@ -413,13 +488,20 @@ impl Bufs<'_> {
         let mut hess = None;
         if let Some(m) = &mut moved {
             let shift = moved_shift(m.pos, m.spectrum);
-            let BhOwn { y, spectra, off } = &mut m.own;
-            self.bh.pos_dots(ctx, &step, &d, off, bh.parts)?;
+            let BhOwn { spectra, step: own } = &mut m.own;
+            if let Some(BhShiftOwn { off, .. }) = own {
+                self.bh.pos_dots(ctx, &step, &d, off, bh.parts)?;
+            }
             let [su, sv] = &mut **spectra;
             let au = k.probe_spectrum(ctx, &dims, d.u[1], su)?;
             let av = (d.v.map(|v| k.probe_spectrum(ctx, &dims, v[1], sv))).transpose()?;
-            let mv = BhMovesRef::new(&d, shift, au, av, off)?;
-            hess = Some((mv, &*m.w, &mut **y));
+            let mh = match own {
+                Some(BhShiftOwn { off, y }) => {
+                    MovedHess::Stepped(BhMovesRef::new(&d, shift, au, av, off)?, y)
+                }
+                None => MovedHess::Held(BhMovedRef::new(&d, bh.order, shift.offsets, au, av)?),
+            };
+            hess = Some((mh, &*m.w));
         }
         for (i, s) in batch.clone().enumerate() {
             let stack = bh.table.at(s);
@@ -442,9 +524,12 @@ impl Bufs<'_> {
                     };
                     self.bh.hess_frames(ctx, scan, stack, &f, &d, bh.parts)?;
                 }
-                Some((mv, w, y)) => {
-                    self.bh
-                        .pos_spec(ctx, stack, mv, [&mut *bh.lu, &mut *bh.lv])?;
+                Some((mh, w)) => {
+                    let l = [&mut *bh.lu, &mut *bh.lv];
+                    match mh {
+                        MovedHess::Stepped(mv, _) => self.bh.pos_spec(ctx, stack, mv, l)?,
+                        MovedHess::Held(mv) => self.bh.moved_spec(ctx, stack, mv, l)?,
+                    }
                     plan.inverse_inplace(ctx, bh.lu)?;
                     if cg {
                         plan.inverse_inplace(ctx, bh.lv)?;
@@ -461,15 +546,27 @@ impl Bufs<'_> {
                     if cg {
                         prop.forward(ctx, plan, stack, bh.lv)?;
                     }
-                    self.bh.obj_conj(ctx, views, stack, self.obj, &bh.r[i], y)?;
-                    plan.forward_inplace(ctx, y)?;
-                    let f = BhMovedFarRef {
-                        psi: &bh.psi[i],
-                        lu: bh.lu,
-                        lv: bh.lv,
-                        y,
-                    };
-                    self.bh.pos_far(ctx, self.counts, stack, &f, mv, bh.parts)?;
+                    match mh {
+                        MovedHess::Stepped(mv, y) => {
+                            self.bh.obj_conj(ctx, views, stack, self.obj, &bh.r[i], y)?;
+                            plan.forward_inplace(ctx, y)?;
+                            let f = BhMovedFarRef {
+                                psi: &bh.psi[i],
+                                lu: bh.lu,
+                                lv: bh.lv,
+                                y,
+                            };
+                            self.bh.pos_far(ctx, self.counts, stack, &f, mv, bh.parts)?;
+                        }
+                        MovedHess::Held(_) => {
+                            let f = BhFarRef {
+                                psi: &bh.psi[i],
+                                lu: bh.lu,
+                                lv: cg.then_some(&*bh.lv),
+                            };
+                            self.bh.moved_far(ctx, scan, stack, &f, bh.parts)?;
+                        }
+                    }
                 }
             }
         }
@@ -477,7 +574,11 @@ impl Bufs<'_> {
         // The offsets' update reads neither array, so it may precede their updates, which end
         // the borrow of the batch-start probe.
         if let Some(MovedBatch {
-            own: BhOwn { mut off, .. },
+            own:
+                BhOwn {
+                    step: Some(BhShiftOwn { mut off, .. }),
+                    ..
+                },
             offsets,
             ..
         }) = moved
@@ -513,14 +614,15 @@ impl Bufs<'_> {
         };
         let views = bh.order.views();
         let k = self.kernels;
-        let step = batch_step(bh, b, true);
-        let moved = (bh.moved.as_deref_mut()).map(|m| m.split_windows(bh.order, params));
+        let step = batch_step(bh, b, (bh.moved.as_deref()).is_some_and(BhMoved::refined));
+        let features = &self.features;
+        let moved = (bh.moved.as_deref_mut()).map(|m| m.split_windows(bh.order, params, features));
         let lent = PositionLent::lend(moved.transpose()?, None, &mut self.features)?;
         let Some(PositionLent::FullObject(lent)) = lent else {
             return Err(another_model());
         };
         let SampledLent {
-            own: BhWinOwn { w, mut off },
+            own: BhWinOwn { w, step: mut own },
             pos,
             offsets,
             sampler,
@@ -530,7 +632,6 @@ impl Bufs<'_> {
         let BhWindows {
             views: wv,
             win: wins,
-            second,
             hu,
             hv,
             patch,
@@ -538,6 +639,7 @@ impl Bufs<'_> {
             ..
         } = w;
         let wv = &*wv;
+        let refined = own.is_some();
         let [su, sv] = &mut sp[0];
         let at = |stack| StackPoints {
             views,
@@ -551,7 +653,7 @@ impl Bufs<'_> {
             let stack = bh.table.at(s);
             let plan = bh.plans.get(bh.stacks[s].plan);
             let (psi, r, win) = (&mut bh.psi[i], &mut bh.r[i], &mut wins[i][0]);
-            for block in blocks(FIRST) {
+            for block in first(refined) {
                 sampler.windows(ctx, at(stack), spectra, block, win)?;
             }
             k.obj_probe_to_psi(ctx, wv, stack, win, self.probe, psi)?;
@@ -563,7 +665,10 @@ impl Bufs<'_> {
                 r,
                 probe: self.probe,
             };
-            self.bh.win_grad(ctx, stack, f, (win, 0), patch, &mut off)?;
+            match &mut own {
+                Some(o) => (self.bh).win_grad(ctx, stack, f, (win, 0), patch, &mut o.off)?,
+                None => self.bh.win_obj_grad(ctx, &dims, stack, f, patch)?,
+            }
             sampler.place(ctx, at(stack), patch, 0, &mut self.obj_sums.num)?;
         }
 
@@ -573,7 +678,9 @@ impl Bufs<'_> {
             v: cg.then_some([&bh.prev[0], &bh.prev[1]]),
         };
         self.tile.dots(ctx, &d, bh.parts)?;
-        self.bh.pos_dots(ctx, &step, &d, &mut off, bh.parts)?;
+        if let Some(o) = &mut own {
+            self.bh.pos_dots(ctx, &step, &d, &mut o.off, bh.parts)?;
+        }
         sampler.spectra(ctx, d.u[0], su)?;
         if let Some(v) = d.v {
             sampler.spectra(ctx, v[0], sv)?;
@@ -582,16 +689,19 @@ impl Bufs<'_> {
             let stack = bh.table.at(s);
             let plan = bh.plans.get(bh.stacks[s].plan);
             let win = &wins[i][0];
-            for block in blocks(FIRST) {
+            for block in first(refined) {
                 sampler.windows(ctx, at(stack), su, block, hu)?;
             }
             if cg {
-                for block in blocks(FIRST) {
+                for block in first(refined) {
                     sampler.windows(ctx, at(stack), sv, block, hv)?;
                 }
             }
-            self.bh
-                .win_lift(ctx, stack, win, hu, cg.then_some(&mut *hv), &off)?;
+            // Refined, `hu` and `hv` are lifted by the offsets' parts of the step.
+            if let Some(o) = &own {
+                self.bh
+                    .win_lift(ctx, stack, win, hu, cg.then_some(&mut *hv), &o.off)?;
+            }
             let lifted = BhDisp {
                 u: [&*hu, d.u[1]],
                 v: d.v.map(|v| [&*hv, v[1]]),
@@ -613,23 +723,27 @@ impl Bufs<'_> {
             };
             self.bh
                 .hess_frames(ctx, scan, stack, &f, &lifted, bh.parts)?;
-            for block in blocks(SECOND) {
-                sampler.windows(ctx, at(stack), spectra, block, second)?;
+            if let Some(BhWinStepOwn { off, second }) = &mut own {
+                for block in blocks(SECOND) {
+                    sampler.windows(ctx, at(stack), spectra, block, second)?;
+                }
+                let f = BhWinRef {
+                    r: &bh.r[i],
+                    probe: self.probe,
+                };
+                let w = BhWinSecond {
+                    second,
+                    u: hu,
+                    v: cg.then_some(&*hv),
+                };
+                self.bh.win_hess(ctx, stack, f, &w, off, bh.parts)?;
             }
-            let f = BhWinRef {
-                r: &bh.r[i],
-                probe: self.probe,
-            };
-            let w = BhWinSecond {
-                second,
-                u: hu,
-                v: cg.then_some(&*hv),
-            };
-            self.bh.win_hess(ctx, stack, f, &w, &off, bh.parts)?;
         }
         self.bh.step(ctx, &dims, bh.parts, &d, &step, bh.steps)?;
-        self.bh
-            .pos_update(ctx, &step, &mut off, offsets, bh.steps)?;
+        if let Some(BhWinStepOwn { mut off, .. }) = own {
+            self.bh
+                .pos_update(ctx, &step, &mut off, offsets, bh.steps)?;
+        }
         self.bh_update(ctx, bh, rho2, step.record)
     }
 
@@ -660,7 +774,7 @@ impl Bufs<'_> {
         };
         let views = bh.order.views();
         let (k, ok) = (self.kernels, self.exit.kernels);
-        let step = batch_step(bh, b, true);
+        let step = batch_step(bh, b, (bh.moved.as_deref()).is_some_and(BhMoved::refined));
         let (Some(sl), Some(w)) = (self.slices.as_ref(), bh.sliced.as_deref_mut()) else {
             return Err(GpuError::Shape(
                 "BH state built for another slice count".into(),
@@ -674,13 +788,14 @@ impl Bufs<'_> {
         } = w;
         let deeper = self.deeper.len();
         let phase = slice_phase(sl.quad, None);
-        let moved = (bh.moved.as_deref_mut()).map(|m| m.split_windows(bh.order, params));
+        let features = &self.features;
+        let moved = (bh.moved.as_deref_mut()).map(|m| m.split_windows(bh.order, params, features));
         let lent = PositionLent::lend(moved.transpose()?, None, &mut self.features)?;
         let Some(PositionLent::FullObject(lent)) = lent else {
             return Err(another_model());
         };
         let SampledLent {
-            own: BhWinOwn { w, mut off },
+            own: BhWinOwn { w, step: mut own },
             pos,
             offsets,
             sampler,
@@ -690,7 +805,6 @@ impl Bufs<'_> {
         let BhWindows {
             views: wv,
             win: wins,
-            second,
             hu,
             hv,
             patch,
@@ -715,8 +829,8 @@ impl Bufs<'_> {
             let plan = bh.plans.get(bh.stacks[s].plan);
             let (inc, psi, r) = (&mut incident[i], &mut bh.psi[i], &mut bh.r[i]);
             let win = &mut wins[i];
-            // A slice's windows ahead of the wave through it, their derivatives ahead of the
-            // residual back through it.
+            // A slice's windows ahead of the wave through it, their derivatives, refined, ahead
+            // of the residual back through it.
             for block in blocks(FIRST).take(1) {
                 sampler.windows(ctx, at(stack), ospec[0], block, &mut win[0])?;
             }
@@ -749,30 +863,38 @@ impl Bufs<'_> {
                 let c = if t == 0 { &*r } else { held };
                 let sw = &mut win[j + 1];
                 ok.slice_pair(ctx, &dims, stack, [&inc[j], c], x)?;
-                for block in blocks(FIRST).skip(1) {
-                    sampler.windows(ctx, at(stack), ospec[j + 1], block, sw)?;
-                }
                 let f = BhWinRef {
                     r: x,
                     probe: sl.ones,
                 };
-                self.bh
-                    .win_grad(ctx, stack, f, (sw, j + 1), patch, &mut off)?;
+                match &mut own {
+                    Some(o) => {
+                        for block in blocks(FIRST).skip(1) {
+                            sampler.windows(ctx, at(stack), ospec[j + 1], block, sw)?;
+                        }
+                        (self.bh).win_grad(ctx, stack, f, (sw, j + 1), patch, &mut o.off)?;
+                    }
+                    None => self.bh.win_obj_grad(ctx, &dims, stack, f, patch)?,
+                }
                 sampler.place(ctx, at(stack), patch, 0, &mut grads[j].num)?;
                 ok.slice_adjoint(ctx, wv, stack, sw, c, x)?;
                 ok.gap(ctx, &dims, stack, &sl.gaps[j], x, true)?;
             }
             let c = &work[(deeper - 1) % 2];
             k.psi_to_probe(ctx, wv, stack, c, &win[0], self.probe_sums)?;
-            for block in blocks(FIRST).skip(1) {
-                sampler.windows(ctx, at(stack), ospec[0], block, &mut win[0])?;
-            }
             let f = BhWinRef {
                 r: c,
                 probe: self.probe,
             };
-            self.bh
-                .win_grad(ctx, stack, f, (&win[0], 0), patch, &mut off)?;
+            match &mut own {
+                Some(o) => {
+                    for block in blocks(FIRST).skip(1) {
+                        sampler.windows(ctx, at(stack), ospec[0], block, &mut win[0])?;
+                    }
+                    (self.bh).win_grad(ctx, stack, f, (&win[0], 0), patch, &mut o.off)?;
+                }
+                None => self.bh.win_obj_grad(ctx, &dims, stack, f, patch)?,
+            }
             sampler.place(ctx, at(stack), patch, 0, &mut self.obj_sums.num)?;
         }
 
@@ -785,7 +907,9 @@ impl Bufs<'_> {
         for (j, (g, v)) in grads.iter().zip(&*prev).enumerate() {
             (self.tile).slice_dots(ctx, j, &g.num, cg.then_some(v), bh.parts)?;
         }
-        self.bh.pos_dots(ctx, &step, &d, &mut off, bh.parts)?;
+        if let Some(o) = &mut own {
+            self.bh.pos_dots(ctx, &step, &d, &mut o.off, bh.parts)?;
+        }
         // Slice `s`'s spectra of its parts of `u` and `v`.
         let us = std::iter::once(d.u[0]).chain(grads.iter().map(|g| &g.num));
         for ([su, _], u) in sp.iter_mut().zip(us) {
@@ -822,8 +946,11 @@ impl Bufs<'_> {
                         sampler.windows(ctx, at(stack), sv, block, hv)?;
                     }
                 }
-                self.bh
-                    .win_lift(ctx, stack, &win[l], hu, cg.then_some(&mut *hv), &off)?;
+                // Refined, `hu` and `hv` are lifted by the offsets' parts of the step.
+                if let Some(o) = &own {
+                    let hv = cg.then_some(&mut *hv);
+                    (self.bh).win_lift(ctx, stack, &win[l], hu, hv, &o.off)?;
+                }
                 let lifted = BhDisp {
                     u: [&*hu, d.u[1]],
                     v: d.v.map(|v| [&*hv, v[1]]),
@@ -857,6 +984,9 @@ impl Bufs<'_> {
                 cg: cg.then(|| [&t.m[1], &t.m[2]]),
             };
             (self.bh).sliced_hess_frames(ctx, scan, stack, &f, &m, bh.parts)?;
+            let Some(BhWinStepOwn { off, second }) = &mut own else {
+                continue;
+            };
             // Each slice's terms in its windows' second derivatives, from the residual at its
             // exit again: they add onto the frames' sums `sliced_hess_frames` stored.
             for (n, l) in (0..=deeper).rev().enumerate() {
@@ -891,7 +1021,7 @@ impl Bufs<'_> {
                     u: hu,
                     v: cg.then_some(&*hv),
                 };
-                self.bh.win_hess(ctx, stack, f, &w, &off, bh.parts)?;
+                self.bh.win_hess(ctx, stack, f, &w, off, bh.parts)?;
                 if l > 0 {
                     ok.slice_adjoint(ctx, wv, stack, &win[l], c, x)?;
                     ok.gap(ctx, &dims, stack, &sl.gaps[l - 1], x, true)?;
@@ -899,8 +1029,10 @@ impl Bufs<'_> {
             }
         }
         self.bh.step(ctx, &dims, bh.parts, &d, &step, bh.steps)?;
-        self.bh
-            .pos_update(ctx, &step, &mut off, offsets, bh.steps)?;
+        if let Some(BhWinStepOwn { mut off, .. }) = own {
+            self.bh
+                .pos_update(ctx, &step, &mut off, offsets, bh.steps)?;
+        }
         self.bh_update(ctx, bh, rho2, step.record)
     }
 

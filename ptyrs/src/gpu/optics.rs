@@ -43,12 +43,14 @@ pub enum ExitStage {
     /// `V = F⁻¹ F⁻¹ T F`, angular spectrum of the transfer function `T`, `[ny, nx]` on the
     /// unshifted frequency grid and even in both frequencies.
     Transfer(DeviceBuffer<C32>),
+    /// [`Self::Transfer`] of a `T` with an evanescent band.
+    Banded(BandedTransfer),
 }
 
 /// [`ExitStage::Transfer`] of a transfer function with an evanescent band, the pixels where
 /// it is 0, and each band pixel's slot in a plane's carry.
 pub struct BandedTransfer {
-    tf: DeviceBuffer<C32>,
+    pub(crate) tf: DeviceBuffer<C32>,
     /// `[ny, nx]`: the pixel's slot, [`OFF_BAND`] off the band.
     slots: DeviceBuffer<u32>,
     nband: u32,
@@ -177,7 +179,8 @@ impl OpticsKernels {
 
     /// `stage` on `stack`'s row transforms in `work`, `[nf_max * nmode, ny, nx]`: the row
     /// transforms of `V w` from those of the exit waves `w`, or with `adjoint` those of
-    /// `Vᴴ c` from the correction's.
+    /// `Vᴴ c` from the correction's. [`ExitStage::Banded`] runs as its transfer function
+    /// alone; [`Self::exit_banded`] carries its band.
     pub fn exit(
         &self,
         ctx: &ExecutionContext,
@@ -218,12 +221,12 @@ impl OpticsKernels {
                     })
             }
             // `F_x V w = F_x⁻¹ T F_y⁻¹ (F_x w)`, `T` being even, and its adjoint.
-            ExitStage::Transfer(tf) if adjoint => {
+            ExitStage::Transfer(tf) | ExitStage::Banded(BandedTransfer { tf, .. }) if adjoint => {
                 self.stage(ctx, &l, stack, work, None, STAGE_PRE_FWD)?;
                 let flags = STAGE_COLS | STAGE_MUL | STAGE_CONJ | STAGE_POST_FWD;
                 self.stage(ctx, &l, stack, work, Some(Mul::plain(tf, scale)), flags)
             }
-            ExitStage::Transfer(tf) => {
+            ExitStage::Transfer(tf) | ExitStage::Banded(BandedTransfer { tf, .. }) => {
                 let flags = STAGE_COLS | STAGE_PRE_INV | STAGE_MUL;
                 self.stage(ctx, &l, stack, work, Some(Mul::plain(tf, scale)), flags)?;
                 self.stage(ctx, &l, stack, work, None, STAGE_PRE_INV)

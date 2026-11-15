@@ -10,7 +10,7 @@
 use std::slice;
 
 use ptyrs::base::C64;
-use ptyrs::engine::{Bh, BhParams, Features, Optics, Ptycho, Sampling};
+use ptyrs::engine::{Bh, BhParams, Feature, Features, Optics, Ptycho, Sampling};
 
 #[path = "common/engine/mod.rs"]
 mod common;
@@ -79,7 +79,7 @@ fn assert_model(
     let rows = table(table_offsets);
     let start = offsets(&rows, 1);
     let features = Features {
-        position: Some(start.clone()),
+        position: Some(Feature::refined(start.clone())),
         ..Features::default()
     };
     let params = BhParams {
@@ -139,7 +139,7 @@ fn assert_model(
             .flat_map(|(d, s)| [d[0] - s[0], d[1] - s[1]])
             .collect()
     };
-    let got = bh.features().position.as_ref().unwrap();
+    let got = &bh.features().position.as_ref().unwrap().values;
     let want = delta(&offsets(&rows, 3));
     assert_close("offsets", &delta(got), &want, max_abs(&want), TOL);
 }
