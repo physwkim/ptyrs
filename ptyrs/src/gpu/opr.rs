@@ -9,7 +9,7 @@ use std::ops::Range;
 use std::ptr;
 
 use cuda_async::device_operation::ExecutionContext;
-use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig};
+use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig, RawDeviceBuffer};
 use ptyrs_kernels::fused::ProbeSrc;
 use ptyrs_kernels::opr::{OPR_SUMS, OprFrames, OprScan, opr_kernels};
 use ptyrs_kernels::pixel::PIXEL_THREADS;
@@ -200,6 +200,40 @@ impl OwnModes<'_> {
             p0: self.positions.start,
             nb: nb as u32,
         })
+    }
+}
+
+/// The probe `[nprobe, ny, nx]` a pass's frames read: shared by all of them, or with each
+/// frame's mode 0 from its [`OwnModes`] plane instead.
+#[derive(Clone, Copy)]
+pub enum FrameProbe<'a> {
+    Shared(&'a DeviceBuffer<C32>),
+    Own(&'a DeviceBuffer<C32>, &'a OwnModes<'a>),
+}
+
+impl<'a> FrameProbe<'a> {
+    /// The probe planes; `Own` reads only modes `1..` of them.
+    pub(super) fn probe(self) -> &'a DeviceBuffer<C32> {
+        match self {
+            Self::Shared(p) | Self::Own(p, _) => p,
+        }
+    }
+
+    /// The buffers a kernel reading [`Self::src`] reads.
+    pub(super) fn storages(self) -> impl Iterator<Item = &'a RawDeviceBuffer> {
+        let own = match self {
+            Self::Shared(_) => None,
+            Self::Own(_, own) => Some(own.planes.storage()),
+        };
+        std::iter::once(self.probe().storage()).chain(own)
+    }
+
+    /// The probe of planes of `n` pixels as a kernel reads it.
+    pub(super) fn src(self, n: usize) -> Result<ProbeSrc, Error> {
+        match self {
+            Self::Shared(p) => Ok(shared_src(p)),
+            Self::Own(p, own) => own.src(p, n),
+        }
     }
 }
 

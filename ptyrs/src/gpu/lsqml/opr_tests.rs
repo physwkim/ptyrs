@@ -1,5 +1,5 @@
-//! The LSQML launchers under OPR. The dots on each frame's own probe mode 0,
-//! [`OprKernels::unique`]'s planes as [`OwnModes`], against the same launchers on the
+//! The LSQML launchers under OPR. The forward row pass and the dots on each frame's own probe
+//! mode 0, [`OprKernels::unique`]'s planes as [`OwnModes`], against the same launchers on the
 //! shared-probe path one frame at a time, each frame on its own probe as
 //! `ProbeVariation::unique` gives it: both read the same values in the same order, so they
 //! agree bit for bit. Each frame's probe direction against the CPU's over those views, and bit
@@ -16,7 +16,7 @@ use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 use super::{FrameDirs, LsqmlAt, LsqmlChi, LsqmlKernels, LsqmlScan};
 use crate::base::{C64, Feature, Object, Probe, Stack, View};
 use crate::engine::{ProbeVariation, accumulate_probe};
-use crate::gpu::opr::OwnModes;
+use crate::gpu::opr::{FrameProbe, OwnModes};
 use crate::gpu::{
     C32, EpochOrder, Kernels, Opr, OprKernels, StackTable, UpdateSums, ViewAddr, ViewDims, Views,
 };
@@ -131,6 +131,13 @@ fn up(stream: &CudaStream, z: &[C64]) -> DeviceBuffer<C32> {
 
 fn bits(v: &[f32]) -> Vec<u32> {
     v.iter().map(|x| x.to_bits()).collect()
+}
+
+fn c_bits(v: &[C32]) -> Vec<u32> {
+    v.iter()
+        .flat_map(|c| [c.re, c.im])
+        .map(f32::to_bits)
+        .collect()
 }
 
 /// The largest difference over the largest magnitude of `want`.
@@ -283,20 +290,34 @@ fn stacks(
     })
 }
 
-/// The dots of each batch frame alone, on the shared probe with its own mode 0 from `own`.
-fn frames(g: &Gpu, x: &Inputs, probe: &Probe, own: &DeviceBuffer<C32>) -> [Vec<u32>; 2] {
+/// Each batch frame's probe alone: the shared probe with its own mode 0 from `own`.
+fn frame_probes(g: &Gpu, probe: &Probe, own: &DeviceBuffer<C32>) -> Vec<DeviceBuffer<C32>> {
     let own = own.to_host_vec(&g.stream).unwrap();
     let shared = c32(probe.as_slice());
-    let single: Vec<Range<u32>> = BATCH.map(|p| p..p + 1).collect();
-    let table = StackTable::new(&g.stream, &dims(), &single).unwrap();
-    dots(g, |st| {
-        for (b, p) in BATCH.enumerate() {
-            let chi = up(&g.stream, x.frame_chi(p));
-            let mode0 = &own[b * N..(b + 1) * N];
+    own.as_chunks::<N>()
+        .0
+        .iter()
+        .map(|mode0| {
             let probe: Vec<C32> = mode0.iter().chain(&shared[N..]).copied().collect();
-            let probe = DeviceBuffer::from_host(&g.stream, &probe).unwrap();
+            DeviceBuffer::from_host(&g.stream, &probe).unwrap()
+        })
+        .collect()
+}
+
+/// The batch's frames one stack each.
+fn single() -> Vec<Range<u32>> {
+    BATCH.map(|p| p..p + 1).collect()
+}
+
+/// The dots of each batch frame alone, on the shared probe with its own mode 0 from `own`.
+fn frames(g: &Gpu, x: &Inputs, probe: &Probe, own: &DeviceBuffer<C32>) -> [Vec<u32>; 2] {
+    let probes = frame_probes(g, probe, own);
+    let table = StackTable::new(&g.stream, &dims(), &single()).unwrap();
+    dots(g, |st| {
+        for ((b, p), probe) in BATCH.enumerate().zip(&probes) {
+            let chi = up(&g.stream, x.frame_chi(p));
             let at = LsqmlAt {
-                x: [&x.obj, &probe],
+                x: [&x.obj, probe],
                 d: [&x.d_obj, &x.d_probe],
             };
             let chi = LsqmlChi::Unmoved(&chi);
@@ -305,6 +326,47 @@ fn frames(g: &Gpu, x: &Inputs, probe: &Probe, own: &DeviceBuffer<C32>) -> [Vec<u
                 .unwrap();
         }
     })
+}
+
+/// The batch's row-transformed exit waves, `[NB NMODE, n]`: [`LsqmlKernels::forward_frames`]
+/// of stack `s` of `stacks` on `probes[s]`.
+fn exit_waves(g: &Gpu, x: &Inputs, stacks: &[Range<u32>], probes: &[FrameProbe<'_>]) -> Vec<C32> {
+    let table = StackTable::new(&g.stream, &dims(), stacks).unwrap();
+    let nf_max = stacks.iter().map(|r| r.len()).max().unwrap();
+    let mut work = DeviceBuffer::<C32>::zeroed(&g.stream, nf_max * NMODE * N).unwrap();
+    let mut out = Vec::new();
+    for (s, (r, &probe)) in stacks.iter().zip(probes).enumerate() {
+        let views = g.order.views();
+        g.lsqml
+            .forward_frames(&g.ctx, views, table.at(s), &x.obj, probe, &mut work)
+            .unwrap();
+        out.extend_from_slice(&work.to_host_vec(&g.stream).unwrap()[..r.len() * NMODE * N]);
+    }
+    out
+}
+
+#[test]
+fn forward_on_own_modes_matches_each_frame_alone() {
+    let g = gpu();
+    let (var, probe) = variation();
+    let planes = own_planes(&g, &var, &probe);
+    let x = inputs(&g.stream);
+    let shared = up(&g.stream, probe.as_slice());
+    let own = OwnModes {
+        planes: &planes,
+        positions: BATCH,
+    };
+    let got = exit_waves(&g, &x, &STACKS, &[FrameProbe::Own(&shared, &own); 2]);
+    let probes = frame_probes(&g, &probe, &planes);
+    let alone: Vec<_> = probes.iter().map(FrameProbe::Shared).collect();
+    let want = exit_waves(&g, &x, &single(), &alone);
+    assert_eq!(c_bits(&got), c_bits(&want));
+    let plain = exit_waves(&g, &x, &STACKS, &[FrameProbe::Shared(&shared); 2]);
+    assert_ne!(
+        c_bits(&plain),
+        c_bits(&got),
+        "the own modes left the waves as on the shared probe"
+    );
 }
 
 #[test]
@@ -386,8 +448,7 @@ fn frame_dirs_match_the_cpu_and_psi_to_probe_frame_by_frame() {
         .collect();
     let err = rel(vv.iter().map(|&v| C64::new(v as f64, 0.0)), &want);
     assert!(err <= 2e-7, "vv against the CPU's: {err:e}");
-    let single: Vec<Range<u32>> = BATCH.map(|p| p..p + 1).collect();
-    let table = StackTable::new(&g.stream, &dims(), &single).unwrap();
+    let table = StackTable::new(&g.stream, &dims(), &single()).unwrap();
     for (b, p) in BATCH.enumerate() {
         let mut sums = UpdateSums::zeroed(&g.stream, NP * N).unwrap();
         let chi = up(&g.stream, x.frame_chi(p));
@@ -404,10 +465,9 @@ fn frame_dirs_match_the_cpu_and_psi_to_probe_frame_by_frame() {
         let num = sums.num.to_host_vec(&g.stream).unwrap();
         let den = sums.den.to_host_vec(&g.stream).unwrap();
         let plane = b * N..(b + 1) * N;
-        let parts = |v: &[C32]| bits(&v.iter().flat_map(|c| [c.re, c.im]).collect::<Vec<_>>());
         assert_eq!(
-            parts(&d[plane.clone()]),
-            parts(&num[..N]),
+            c_bits(&d[plane.clone()]),
+            c_bits(&num[..N]),
             "d at position {p}"
         );
         assert_eq!(bits(&vv[plane]), bits(&den[..N]), "vv at position {p}");

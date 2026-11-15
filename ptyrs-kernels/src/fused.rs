@@ -170,8 +170,8 @@ pub(crate) fn walk_slot(flags: u32, count: u32) -> Option<u32> {
 pub struct FusedPtrs {
     /// `[nobj, nyo, nxo]`, natural order.
     pub obj: *const f32,
-    /// `[nprobe, ny, nx]`, natural order.
-    pub probe: *const f32,
+    /// `[nprobe, ny, nx]`, natural order, mode 0 by frame as [`ProbeSrc`] says.
+    pub probe: ProbeSrc,
     /// The scan's `nframe * nmode` views.
     pub views: *const ViewAddr,
     /// `[nframe, ny, nx]`, detector order.
@@ -460,7 +460,8 @@ unsafe fn rows_fwd_with<const NX: u32, const SHIFT: bool, const HALF: bool>(
             let mut w = if SHIFT {
                 cmul(o, (r[2 * i as usize], r[2 * i as usize + 1]))
             } else {
-                let pr = load_c(p.probe, v.probe as usize * n + (y * nx + x) as usize);
+                let at = (y * nx + x) as usize;
+                let pr = load_probe(p.probe, v.probe, f0 + kl / g.nmode, n, at);
                 cmul(cmul(o, pr), quad_phase(g.quad, y, x, ny, nx))
             };
             if dm {
@@ -788,7 +789,8 @@ pub unsafe fn rows_inv<const NX: u32, const HALF: bool>(
                 let at = row + xs as usize;
                 if dm {
                     let x = (xs + nx / 2) % nx;
-                    let pr = load_c(p.probe, v.probe as usize * n + (y * nx + x) as usize);
+                    let px = (y * nx + x) as usize;
+                    let pr = load_probe(p.probe, v.probe, f0 + fl, n, px);
                     let q = quad_phase(g.quad, y, x, ny, nx);
                     let po = cmul(cmul(sample_obj(p.obj, v, y, x, g.nyo, g.nxo), pr), q);
                     let old = load_psi::<HALF>(p.psi, at);
@@ -803,12 +805,12 @@ pub unsafe fn rows_inv<const NX: u32, const HALF: bool>(
 }
 
 /// The probe terms of [`gather`], one thread per natural pixel `(y, x)` of the frame:
-/// `probe_power = sum_p |P_p|^2` in ascending `p`, and `probe_q[p] = P_p q`. Reads `probe`;
-/// writes `probe_q` and `probe_power`.
+/// `probe_power = sum_p |P_p|^2` in ascending `p`, and `probe_q[p] = P_p q`. Reads
+/// `probe.probe`, a probe every frame shares; writes `probe_q` and `probe_power`.
 ///
 /// # Safety
 ///
-/// `probe`, `probe_q` and `probe_power` hold their shapes for `g`.
+/// `probe.probe`, `probe_q` and `probe_power` hold their shapes for `g`.
 #[device]
 pub unsafe fn probe_terms(p: FusedPtrs, g: StackGeom) {
     let (ny, nx) = (g.ny, g.nx);
@@ -821,7 +823,7 @@ pub unsafe fn probe_terms(p: FusedPtrs, g: StackGeom) {
     let q = quad_phase(g.quad, y, x, ny, nx);
     let mut s = 0.0f32;
     for pm in 0..g.nprobe as usize {
-        let v = unsafe { load_c(p.probe, pm * n + i) };
+        let v = unsafe { load_c(p.probe.probe, pm * n + i) };
         s += v.0 * v.0 + v.1 * v.1;
         unsafe { store_c(p.probe_q, pm * n + i, cmul(v, q)) };
     }

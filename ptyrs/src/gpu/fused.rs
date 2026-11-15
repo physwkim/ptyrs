@@ -30,6 +30,7 @@ use ptyrs_kernels::fused::{
 };
 use ptyrs_kernels::pixel::{PIXEL_THREADS, PsiPtr, SumPtrs, psi_f32};
 
+use crate::gpu::opr::shared_src;
 use crate::gpu::ops::grid_1d;
 use crate::gpu::psi::check_waves;
 use crate::gpu::{
@@ -1567,7 +1568,7 @@ impl<'a> Run<'a> {
         let null = std::ptr::null_mut();
         FusedPtrs {
             obj: dptr(self.inputs.obj),
-            probe: dptr(self.inputs.probe),
+            probe: shared_src(self.inputs.probe),
             views: dptr(self.inputs.views.addr()),
             counts: dptr(self.inputs.counts),
             psi: no_psi(),

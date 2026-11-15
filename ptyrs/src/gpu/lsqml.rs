@@ -29,7 +29,7 @@ use std::ops::Range;
 
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig, RawDeviceBuffer};
-use ptyrs_kernels::fused::{FUSED_COLS, FUSED_DOWN, FusedCfg, FusedPtrs};
+use ptyrs_kernels::fused::{FUSED_COLS, FUSED_DOWN, FusedCfg, FusedPtrs, ProbeSrc};
 use ptyrs_kernels::grad::ObjProbePtrs;
 pub use ptyrs_kernels::lsqml::LSQML_REC;
 use ptyrs_kernels::lsqml::{
@@ -39,7 +39,7 @@ use ptyrs_kernels::lsqml::{
 use ptyrs_kernels::pixel::PIXEL_THREADS;
 
 use crate::gpu::fused::{GRID_Y_MAX, Shape, Side, no_psi};
-use crate::gpu::opr::{OwnModes, shared_src};
+use crate::gpu::opr::{FrameProbe, OwnModes, shared_src};
 use crate::gpu::ops::grid_1d;
 use crate::gpu::position::{ONE_BLOCK, chunk_grid, chunks, same_dims, span};
 use crate::gpu::{
@@ -394,26 +394,36 @@ impl LsqmlKernels {
         probe: &DeviceBuffer<C32>,
         work: &mut DeviceBuffer<C32>,
     ) -> Result<(), Error> {
+        let probe = FrameProbe::Shared(probe);
+        self.forward_frames(ctx, views, stack, obj, probe, work)
+    }
+
+    /// [`Self::forward`] with the frames' probe from `probe`.
+    pub fn forward_frames(
+        &self,
+        ctx: &ExecutionContext,
+        views: &Views,
+        stack: StackRef<'_>,
+        obj: &DeviceBuffer<C32>,
+        probe: FrameProbe<'_>,
+        work: &mut DeviceBuffer<C32>,
+    ) -> Result<(), Error> {
         let d = views.dims();
         let (sh, g) = (Shape::of(d)?, d.geom(stack)?);
         let [no, np] = lens(d);
         check_len("obj", obj, no)?;
-        check_len("probe", probe, np)?;
+        check_len("probe", probe.probe(), np)?;
         check_len("work", work, g.nf_max as usize * d.nmode as usize * d.n())?;
         let config = sh.rows(&g, true)?;
+        let mut reads = vec![obj.storage(), views.addr().storage(), stack.storage()];
+        reads.extend(probe.storages());
         let p = FusedPtrs {
             obj: dptr::<C32, f32>(obj).cast_const(),
-            probe: dptr::<C32, f32>(probe).cast_const(),
+            probe: probe.src(d.n())?,
             views: dptr::<ViewAddr, ViewAddr>(views.addr()).cast_const(),
             work: dptr(work),
             ..null_ptrs()
         };
-        let reads = [
-            obj.storage(),
-            probe.storage(),
-            views.addr().storage(),
-            stack.storage(),
-        ];
         let ctl = stack.ctl() as *const StackCtl;
         let cfg = FusedCfg {
             flags: FORWARD,
@@ -978,7 +988,12 @@ impl ColsLaunch {
 fn null_ptrs() -> FusedPtrs {
     FusedPtrs {
         obj: std::ptr::null(),
-        probe: std::ptr::null(),
+        probe: ProbeSrc {
+            probe: std::ptr::null(),
+            mode0: std::ptr::null(),
+            p0: 0,
+            nb: 1,
+        },
         views: std::ptr::null(),
         counts: std::ptr::null(),
         psi: no_psi(),
