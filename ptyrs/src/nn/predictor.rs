@@ -6,8 +6,8 @@
 //! predicts the central `[ny/bin, nx/bin]` object pixels of the frame's window. Binning also
 //! averages out the fringes between object points more than a `bin`-th of the window apart, which
 //! are what places structure finer than that inside the patch, so the network reads the unbinned
-//! centre of the frame as a second image. A trained model holds for the probe and geometry of its
-//! training scans.
+//! centre of the frame as a second image ([`Input`]). A trained model holds for the probe and
+//! geometry of its training scans.
 //!
 //! The phase output is the phase detail, [`phase_detail`]: one frame does not fix the phase
 //! level of its patch, and a start that carries a level without the structure on it slows rPIE
@@ -28,11 +28,33 @@ use rand_chacha::ChaCha8Rng;
 use crate::nn::ptychonn::{Folded, PtychoNN};
 use crate::nn::{NnError, burn_err};
 
-/// Shape of a predictor: the detector frame it reads, the binning, and the network size.
+/// The images [`diffraction_input`] makes of each frame.
+#[derive(Config, Copy, Debug, PartialEq, Eq)]
+pub enum Input {
+    /// The binned frame alone, what predictors read before the centre was added.
+    Binned,
+    /// The binned frame, then its unbinned centre.
+    BinnedCentre,
+}
+
+impl Input {
+    /// Images per frame.
+    pub fn images(self) -> usize {
+        match self {
+            Input::Binned => 1,
+            Input::BinnedCentre => 2,
+        }
+    }
+}
+
+/// Shape of a predictor: the detector frame it reads, the binning, its input and the network
+/// size.
 #[derive(Config, Debug, PartialEq)]
 pub struct PredictorConfig {
     pub frame: [usize; 2],
     pub bin: usize,
+    #[config(default = "Input::BinnedCentre")]
+    pub input: Input,
     #[config(default = 32)]
     pub width: usize,
     #[config(default = 3)]
@@ -58,7 +80,12 @@ impl PredictorConfig {
 
     pub fn init(&self, device: &Device) -> Result<PtychoNN, NnError> {
         self.check()?;
-        Ok(PtychoNN::new(CHANNELS, self.width, self.depth, device))
+        Ok(PtychoNN::new(
+            self.input.images(),
+            self.width,
+            self.depth,
+            device,
+        ))
     }
 }
 
@@ -101,22 +128,30 @@ pub fn mean_frame_total(frames: &Counts) -> f64 {
     frames.total() / frames.nframe() as f64
 }
 
-/// Images per frame in the network input.
-pub const CHANNELS: usize = 2;
-
-/// Network input `[nframe, CHANNELS, ny/bin, nx/bin]` from detector-order frames. Image 0 is the
-/// binned frame: each `bin × bin` block summed (a masked pixel counts as the block's unmasked
-/// mean, a fully masked block as 0), divided by `norm` ([`mean_frame_total`] of the scan) and by
-/// the binned pixel share, and square-rooted, so a frame of mean intensity has mean square
-/// amplitude 1. Image 1 is the unbinned `[ny/bin, nx/bin]` pixels about the zero frequency
-/// `[ny/2, nx/2]` on the same scale (a masked pixel is 0).
-pub fn diffraction_input(frames: &Counts, bin: usize, norm: f64) -> Result<Vec<f32>, NnError> {
-    input(frames.as_slice(), frames.frame_shape(), bin, norm)
+/// Network input `[nframe, input.images(), ny/bin, nx/bin]` from detector-order frames. Image 0
+/// is the binned frame: each `bin × bin` block summed (a masked pixel counts as the block's
+/// unmasked mean, a fully masked block as 0), divided by `norm` ([`mean_frame_total`] of the
+/// scan) and by the binned pixel share, and square-rooted, so a frame of mean intensity has mean
+/// square amplitude 1. Image 1 of [`Input::BinnedCentre`] is the unbinned `[ny/bin, nx/bin]`
+/// pixels about the zero frequency `[ny/2, nx/2]` on the same scale (a masked pixel is 0).
+pub fn diffraction_input(
+    frames: &Counts,
+    input: Input,
+    bin: usize,
+    norm: f64,
+) -> Result<Vec<f32>, NnError> {
+    frames_input(frames.as_slice(), frames.frame_shape(), input, bin, norm)
 }
 
 /// [`diffraction_input`] of whole `[ny, nx]` frames in one slice.
-fn input(frames: &[u16], frame: [usize; 2], bin: usize, norm: f64) -> Result<Vec<f32>, NnError> {
-    let scale = InputScale::new(frame, bin, norm)?;
+fn frames_input(
+    frames: &[u16],
+    frame: [usize; 2],
+    input: Input,
+    bin: usize,
+    norm: f64,
+) -> Result<Vec<f32>, NnError> {
+    let scale = InputScale::new(frame, input, bin, norm)?;
     let mut out = vec![0.0; frames.len() / (frame[0] * frame[1]) * scale.len()];
     for (f, o) in frames
         .chunks_exact(frame[0] * frame[1])
@@ -127,17 +162,23 @@ fn input(frames: &[u16], frame: [usize; 2], bin: usize, norm: f64) -> Result<Vec
     Ok(out)
 }
 
-/// [`diffraction_input`] one frame at a time, for frames of one shape, binning and norm.
+/// [`diffraction_input`] one frame at a time, for frames of one shape, input, binning and norm.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct InputScale {
     frame: [usize; 2],
+    input: Input,
     bin: usize,
     scale: f64,
     fine: f64,
 }
 
 impl InputScale {
-    pub(crate) fn new([ny, nx]: [usize; 2], bin: usize, norm: f64) -> Result<Self, NnError> {
+    pub(crate) fn new(
+        [ny, nx]: [usize; 2],
+        input: Input,
+        bin: usize,
+        norm: f64,
+    ) -> Result<Self, NnError> {
         if bin == 0 || ny % bin != 0 || nx % bin != 0 {
             return Err(NnError::Invalid(format!(
                 "frame [{ny}, {nx}] is not a multiple of bin {bin}"
@@ -148,6 +189,7 @@ impl InputScale {
         }
         Ok(Self {
             frame: [ny, nx],
+            input,
             bin,
             scale: ((ny / bin) * (nx / bin)) as f64 / norm,
             fine: (ny * nx) as f64 / norm,
@@ -156,7 +198,7 @@ impl InputScale {
 
     /// Input values per frame.
     pub(crate) fn len(&self) -> usize {
-        CHANNELS * (self.frame[0] / self.bin) * (self.frame[1] / self.bin)
+        self.input.images() * (self.frame[0] / self.bin) * (self.frame[1] / self.bin)
     }
 
     /// The input of one frame into `out`, [`len`](Self::len) values.
@@ -182,6 +224,7 @@ impl InputScale {
             };
             *o = (block * self.scale).sqrt() as f32;
         }
+        // Empty for `Input::Binned`.
         for (y, o) in centre.chunks_exact_mut(bx).enumerate() {
             let row = &frame[(cy + y) * nx + cx..][..bx];
             for (o, &v) in o.iter_mut().zip(row) {
@@ -310,7 +353,7 @@ pub fn stitch(patches: &Patches, addr: &AddrTable) -> Result<Object, NnError> {
     Ok(Object::new(Stack::from_vec([1, nyo, nxo], data)?))
 }
 
-/// Training pairs: network inputs `[n, CHANNELS, py, px]` and the true patches.
+/// Training pairs: network inputs `[n, input.images(), py, px]` and the true patches.
 #[derive(Clone, Debug)]
 pub struct Samples {
     pub input: Vec<f32>,
@@ -348,7 +391,7 @@ impl Samples {
                 addr.nframe()
             )));
         }
-        let input = diffraction_input(frames, config.bin, mean_frame_total(frames))?;
+        let input = diffraction_input(frames, config.input, config.bin, mean_frame_total(frames))?;
         self.input.extend(input);
         self.target
             .append(object_patches(object, addr, config.patch()));
@@ -444,7 +487,9 @@ impl Checkpoint {
             Err(e) => return Err(e.into()),
         };
         let state = dir.join(name);
-        let saved = Checkpoint::load(state.join("checkpoint.json")).map_err(burn_err)?;
+        let mut json = read_json(&state.join("checkpoint.json"))?;
+        settle_input(&mut json["config"], &state.join("model.bpk"))?;
+        let saved: Checkpoint = serde_json::from_value(json).map_err(burn_err)?;
         let own = Checkpoint {
             config: self.config.clone(),
             epochs: saved.epochs,
@@ -482,6 +527,45 @@ pub struct EpochLoss {
     pub valid: Option<f64>,
 }
 
+/// The JSON value of the file `path`.
+fn read_json(path: &Path) -> Result<serde_json::Value, NnError> {
+    serde_json::from_slice(&std::fs::read(path)?)
+        .map_err(|e| NnError::Invalid(format!("{}: {e}", path.display())))
+}
+
+/// Fills in the `input` of a [`PredictorConfig`]'s JSON `config` from the images the input mean
+/// in `weights` holds, when the file predates the field: the configs of the one-image and the
+/// two-image input read alike there.
+fn settle_input(config: &mut serde_json::Value, weights: &Path) -> Result<(), NnError> {
+    let Some(fields) = config.as_object_mut() else {
+        return Err(NnError::Invalid(format!("predictor config {config}")));
+    };
+    if fields.contains_key("input") {
+        return Ok(());
+    }
+    let mean = burn_pack::Reader::from_file(weights)
+        .and_then(burn_pack::Reader::into_tensors)
+        .map_err(burn_err)?
+        .into_iter()
+        .find(|t| t.name == "mean")
+        .ok_or_else(|| NnError::Invalid(format!("{} holds no input mean", weights.display())))?;
+    let input = match mean.shape[1] {
+        1 => Input::Binned,
+        2 => Input::BinnedCentre,
+        n => {
+            return Err(NnError::Invalid(format!(
+                "{} holds an input of {n} images",
+                weights.display()
+            )));
+        }
+    };
+    fields.insert(
+        "input".into(),
+        serde_json::to_value(input).map_err(burn_err)?,
+    );
+    Ok(())
+}
+
 /// `values` as `[n, channels, py, px]` for `dims = [n, py, px]`.
 fn tensor(values: &[f32], channels: usize, dims: [usize; 3], device: &Device) -> Tensor<4> {
     Tensor::from_data(
@@ -512,7 +596,7 @@ struct Model {
 }
 
 impl Model {
-    /// `mean` is the `[CHANNELS, py, px]` mean input, `inv_spread` one value per image.
+    /// `mean` is the `[images, py, px]` mean input, `inv_spread` one value per image.
     fn new(
         config: &PredictorConfig,
         mean: Vec<f32>,
@@ -520,14 +604,15 @@ impl Model {
         device: &Device,
     ) -> Result<Self, NnError> {
         let [py, px] = config.patch();
+        let images = config.input.images();
         let fixed = |values: Vec<f32>, shape: [usize; 4]| {
             Param::from_tensor(Tensor::from_data(TensorData::new(values, shape), device))
                 .set_require_grad(false)
         };
         Ok(Self {
             net: config.init(device)?,
-            mean: fixed(mean, [1, CHANNELS, py, px]),
-            inv_spread: fixed(inv_spread, [1, CHANNELS, 1, 1]),
+            mean: fixed(mean, [1, images, py, px]),
+            inv_spread: fixed(inv_spread, [1, images, 1, 1]),
         })
     }
 
@@ -537,17 +622,18 @@ impl Model {
     }
 }
 
-/// Per-pixel mean of `samples`' inputs and each image's inverse RMS spread about it.
-fn input_stats(samples: &Samples) -> Result<(Vec<f32>, Vec<f32>), NnError> {
+/// Per-pixel mean of `samples`' inputs of `images` images and each image's inverse RMS spread
+/// about it.
+fn input_stats(samples: &Samples, images: usize) -> Result<(Vec<f32>, Vec<f32>), NnError> {
     let [n, py, px] = samples.target.dims;
     let plane = py * px;
-    let mut mean = vec![0.0f64; CHANNELS * plane];
+    let mut mean = vec![0.0f64; images * plane];
     for frame in samples.input.chunks(mean.len()) {
         for (m, &x) in mean.iter_mut().zip(frame) {
             *m += f64::from(x) / n as f64;
         }
     }
-    let mut var = [0.0f64; CHANNELS];
+    let mut var = vec![0.0f64; images];
     for frame in samples.input.chunks(mean.len()) {
         for ((x, m), v) in frame
             .chunks(plane)
@@ -593,7 +679,7 @@ pub fn train(
     }
     let ad = device.clone().autodiff();
     ad.seed(options.seed);
-    let (mean, inv_spread) = input_stats(train)?;
+    let (mean, inv_spread) = input_stats(train, config.input.images())?;
     let mut model = Model::new(config, mean, inv_spread, &ad)?;
     let mut optim = AdamConfig::new().init();
     let mut checkpoint = Checkpoint {
@@ -608,7 +694,7 @@ pub fn train(
         (start, model, optim) = checkpoint.resume(dir, model, optim)?;
     }
     let dims = train.target.dims;
-    let x = tensor(&train.input, CHANNELS, dims, &ad);
+    let x = tensor(&train.input, config.input.images(), dims, &ad);
     let amp = tensor(&train.target.amp, 1, dims, &ad);
     let phase = tensor(&train.target.phase, 1, dims, &ad);
     let mut rng = ChaCha8Rng::seed_from_u64(options.seed);
@@ -700,10 +786,11 @@ impl Predictor {
         norm: f64,
     ) -> Result<Patches, NnError> {
         self.check_frames(frames, frame)?;
-        let input = input(frames, frame, self.config.bin, norm)?;
-        let plane = self.config.patch().iter().product::<usize>();
-        let mut out = Patches::empty(self.config.patch());
-        for chunk in input.chunks(CHUNK * CHANNELS * plane) {
+        let config = &self.config;
+        let input = frames_input(frames, frame, config.input, config.bin, norm)?;
+        let plane = config.patch().iter().product::<usize>();
+        let mut out = Patches::empty(config.patch());
+        for chunk in input.chunks(CHUNK * config.input.images() * plane) {
             out.append(self.network(chunk)?);
         }
         Ok(out)
@@ -724,8 +811,9 @@ impl Predictor {
     /// The patches of `input`, whole frames of [`diffraction_input`], in one network call.
     pub(crate) fn network(&self, input: &[f32]) -> Result<Patches, NnError> {
         let [py, px] = self.config.patch();
-        let n = input.len() / (CHANNELS * py * px);
-        let (a, p) = self.forward(tensor(input, CHANNELS, [n, py, px], &self.device()));
+        let images = self.config.input.images();
+        let n = input.len() / (images * py * px);
+        let (a, p) = self.forward(tensor(input, images, [n, py, px], &self.device()));
         Ok(Patches {
             dims: [n, py, px],
             amp: host(a)?,
@@ -748,14 +836,15 @@ impl Predictor {
         let device = self.device();
         let [n, py, px] = samples.target.dims;
         let plane = py * px;
+        let images = self.config.input.images();
         let mut sum = 0.0;
         for start in (0..n).step_by(CHUNK) {
             let m = CHUNK.min(n - start);
             let r = start * plane..(start + m) * plane;
             let dims = [m, py, px];
             let (a, p) = self.forward(tensor(
-                &samples.input[CHANNELS * r.start..CHANNELS * r.end],
-                CHANNELS,
+                &samples.input[images * r.start..images * r.end],
+                images,
                 dims,
                 &device,
             ));
@@ -783,15 +872,19 @@ impl Predictor {
 
     /// Reads a predictor [`save`](Self::save) wrote, onto `device`.
     pub fn load(dir: &Path, device: &Device) -> Result<Self, NnError> {
-        let config = PredictorConfig::load(dir.join("predictor.json")).map_err(burn_err)?;
+        let weights = dir.join("predictor.bpk");
+        let mut json = read_json(&dir.join("predictor.json"))?;
+        settle_input(&mut json, &weights)?;
+        let config: PredictorConfig = serde_json::from_value(json).map_err(burn_err)?;
         let [py, px] = config.patch();
+        let images = config.input.images();
         let model = Model::new(
             &config,
-            vec![0.0; CHANNELS * py * px],
-            vec![1.0; CHANNELS],
+            vec![0.0; images * py * px],
+            vec![1.0; images],
             device,
         )?
-        .try_load_file(dir.join("predictor.bpk"))
+        .try_load_file(weights)
         .map_err(burn_err)?;
         Ok(Self::new(config, model))
     }
@@ -814,7 +907,7 @@ mod tests {
         ];
         let counts = Counts::from_raw([1, 4, 4], frame).unwrap();
         let norm = 8.0;
-        let got = diffraction_input(&counts, 2, norm).unwrap();
+        let got = diffraction_input(&counts, Input::BinnedCentre, 2, norm).unwrap();
         let block = [14.0, 22.0, 36.0 * 4.0 / 3.0, 0.0];
         // The unbinned centre: rows 1..3, columns 1..3.
         let centre = [6.0, 7.0, 0.0, 0.0];
@@ -824,8 +917,10 @@ mod tests {
             .chain(centre.iter().map(|c: &f64| (c * 16.0 / norm).sqrt() as f32))
             .collect();
         assert_eq!(got, want);
-        assert!(diffraction_input(&counts, 3, norm).is_err());
-        assert!(diffraction_input(&counts, 2, 0.0).is_err());
+        let binned = diffraction_input(&counts, Input::Binned, 2, norm).unwrap();
+        assert_eq!(binned, want[..4]);
+        assert!(diffraction_input(&counts, Input::BinnedCentre, 3, norm).is_err());
+        assert!(diffraction_input(&counts, Input::BinnedCentre, 2, 0.0).is_err());
     }
 
     #[test]

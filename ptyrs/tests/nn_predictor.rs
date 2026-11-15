@@ -10,7 +10,8 @@ use ptyrs::nn::NnError;
 use ptyrs::nn::data::random_object;
 use ptyrs::nn::live::LivePredictor;
 use ptyrs::nn::predictor::{
-    Predictor, PredictorConfig, Samples, TrainOptions, mean_frame_total, object_patches, train,
+    Input, Predictor, PredictorConfig, Samples, TrainOptions, mean_frame_total, object_patches,
+    train,
 };
 use ptyrs::nn::ptychonn::PtychoNN;
 
@@ -44,6 +45,19 @@ fn samples(config: &PredictorConfig, probe: &Probe, seeds: std::ops::Range<u64>)
         s.push_scan(config, &scan.counts, &object, &addr).unwrap();
     }
     s
+}
+
+/// Removes the `input` field from the config in the JSON file `path` (at `at` inside it), as
+/// files saved before the field read.
+fn strip_input(path: &Path, at: Option<&str>) {
+    let mut json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    let config = match at {
+        Some(key) => &mut json[key],
+        None => &mut json,
+    };
+    config.as_object_mut().unwrap().remove("input").unwrap();
+    std::fs::write(path, json.to_string()).unwrap();
 }
 
 fn l1(a: &[f32], b: &[f32]) -> f64 {
@@ -181,6 +195,8 @@ fn a_resumed_run_continues_from_its_last_epoch() {
 
     let (whole, straight) = run(&options(3, 7, None), &train_set).unwrap();
     let (first, _) = run(&options(2, 7, Some(&dir)), &train_set).unwrap();
+    // A checkpoint saved before the config named its input resumes too.
+    strip_input(&dir.join("epoch-2/checkpoint.json"), Some("config"));
     let (rest, resumed) = run(&options(3, 7, Some(&dir)), &train_set).unwrap();
     assert_eq!([first, rest].concat(), whole);
     let (scan, ..) = scan(&probe, 0);
@@ -201,4 +217,34 @@ fn a_resumed_run_continues_from_its_last_epoch() {
     let others = samples(&config, &probe, 2..4);
     assert_eq!(others.len(), train_set.len());
     assert!(run(&options(4, 7, Some(&dir)), &others).is_err());
+}
+
+#[test]
+fn a_predictor_saved_without_its_input_loads_with_the_one_its_weights_hold() {
+    let device = ptyrs::nn::cuda(0);
+    let probe = sim::probe([FRAME, FRAME], 1).unwrap();
+    let (scan, ..) = scan(&probe, 0);
+    let norm = mean_frame_total(&scan.counts);
+    let options = TrainOptions {
+        epochs: 1,
+        batch: 16,
+        lr: 1e-3,
+        seed: 7,
+        checkpoint: None,
+    };
+    for input in [Input::Binned, Input::BinnedCentre] {
+        let config = config().with_input(input);
+        let train_set = samples(&config, &probe, 0..1);
+        let predictor = train(&config, &options, &train_set, None, &device, |_| {}).unwrap();
+        let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("ptyrs-nn-predictor-{input:?}"));
+        predictor.save(&dir).unwrap();
+        strip_input(&dir.join("predictor.json"), None);
+        let back = Predictor::load(&dir, &device).unwrap();
+        assert_eq!(back.config(), &config);
+        assert_eq!(
+            back.predict(&scan.counts, norm).unwrap(),
+            predictor.predict(&scan.counts, norm).unwrap()
+        );
+    }
 }

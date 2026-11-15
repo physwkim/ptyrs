@@ -22,8 +22,7 @@ use common::scan;
 use ptyrs::base::{Object, Probe, sim};
 use ptyrs::nn::data::{random_object, structured_object};
 use ptyrs::nn::predictor::{
-    CHANNELS, Patches, PredictorConfig, Samples, TrainOptions, mean_frame_total, object_patches,
-    train,
+    Patches, PredictorConfig, Samples, TrainOptions, mean_frame_total, object_patches, train,
 };
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
@@ -88,7 +87,7 @@ fn pick(s: Samples, n: usize, seed: u64) -> Samples {
             .collect()
     };
     Samples {
-        input: gather(&s.input, CHANNELS * plane),
+        input: gather(&s.input, s.input.len() / s.len()),
         target: Patches {
             dims: [n, py, px],
             amp: gather(&s.target.amp, plane),

@@ -5689,6 +5689,7 @@ version = "0.0.1"
 dependencies = [
  "burn",
  "burn-cubecl",
+ "burn-pack",
  "bytes",
  "crossbeam-channel",
  "cubecl-runtime",

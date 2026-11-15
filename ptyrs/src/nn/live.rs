@@ -38,7 +38,7 @@ impl LivePredictor {
             return Err(NnError::Invalid("batch of 0 frames".into()));
         }
         let config = predictor.config();
-        let scale = InputScale::new(config.frame, config.bin, norm)?;
+        let scale = InputScale::new(config.frame, config.input, config.bin, norm)?;
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(THREADS)
             .build()
@@ -123,7 +123,7 @@ impl PatchPredictor for LivePredictor {
 mod tests {
     use super::*;
     use crate::base::{Counts, MASKED};
-    use crate::nn::predictor::diffraction_input;
+    use crate::nn::predictor::{Input, diffraction_input};
 
     #[test]
     fn par_input_is_diffraction_input() {
@@ -142,11 +142,12 @@ mod tests {
             .collect();
         let want = diffraction_input(
             &Counts::from_raw([n, ny, nx], data.clone()).unwrap(),
+            Input::BinnedCentre,
             bin,
             norm,
         )
         .unwrap();
-        let scale = InputScale::new([ny, nx], bin, norm).unwrap();
+        let scale = InputScale::new([ny, nx], Input::BinnedCentre, bin, norm).unwrap();
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(THREADS)
             .build()
