@@ -36,10 +36,11 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use crate::base::{AddrTable, C64, Object, Probe, Scan, Stack};
+use crate::fault;
 use crate::fft::Plan2d;
 use crate::gpu::{
-    C32, CG_BLOCKS, Ended, Error as GpuError, FarSums, FusedBufs, FusedInputs, Model,
-    ObjProbeScale, RecordWriter, StackRef, StackTable, ViewAddr, ViewDims, Waves,
+    C32, CG_BLOCKS, Error as GpuError, FarSums, FusedBufs, FusedInputs, Model, ObjProbeScale,
+    RecordWriter, StackRef, StackTable, ViewAddr, ViewDims, Waves,
 };
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
@@ -803,8 +804,8 @@ impl Bufs<'_> {
         &mut self,
         ctx: &ExecutionContext,
         passes: &mut PassesMut<'_>,
-        mut rec: RecordWriter<'_>,
-    ) -> Result<Ended, GpuError> {
+        mut rec: RecordWriter<'_, Tag>,
+    ) -> Result<(), GpuError> {
         let dims = *self.views.dims();
         match passes {
             PassesMut::M1(m1) => {
@@ -889,9 +890,9 @@ impl Bufs<'_> {
         &mut self,
         ctx: &ExecutionContext,
         f: &mut FusedBufs,
-        mut llk: Option<RecordWriter<'_>>,
+        mut llk: Option<RecordWriter<'_, Tag>>,
         one: OneSlice,
-    ) -> Result<Option<Ended>, GpuError> {
+    ) -> Result<(), GpuError> {
         let dims = *self.views.dims();
         let mut m = (self.features)
             .lend(ctx, self.kernels, &dims, self.obj, self.probe, self.exit)?
@@ -913,9 +914,12 @@ impl Bufs<'_> {
                 rec.push(ctx, &dims, stack, self.llk)?;
             }
         }
-        let ended = llk.map(|w| w.end(ctx)).transpose()?;
+        if let Some(w) = llk {
+            w.end(ctx)?;
+        }
+        fault::at(fault::Exit::Feature)?;
         self.features.step(ctx, self.kernels, self.grad)?;
-        Ok(ended)
+        Ok(())
     }
 
     /// M1 Fourier-modulus projection of `stack`'s exit waves `psi` in place by `plan`, its
@@ -927,7 +931,7 @@ impl Bufs<'_> {
         stack: StackRef<'_>,
         plan: &mut Plan2d,
         psi: &mut DeviceBuffer<C32>,
-        llk: Option<&mut RecordWriter<'_>>,
+        llk: Option<&mut RecordWriter<'_, Tag>>,
     ) -> Result<(), GpuError> {
         let dims = *self.views.dims();
         plan.forward_inplace(ctx, psi)?;

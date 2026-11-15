@@ -1,15 +1,15 @@
 //! PyNX AP on the GPU.
 
 use crate::gpu::{
-    Ended, Error as GpuError, Exit, FarSums, FusedBufs, FusedInputs, FusedSums, RecordWriter,
-    ShiftProbe,
+    Error as GpuError, Exit, FarSums, FusedBufs, FusedInputs, FusedSums, RecordWriter, ShiftProbe,
 };
 use cuda_async::device_operation::ExecutionContext;
 
 use super::device::{OneSlice, PassesMut, Sample};
-use super::{Bufs, Epoch, GpuPtycho};
+use super::{Bufs, Epoch, GpuPtycho, Tag};
 use crate::engine::ptycho::llk_due;
 use crate::engine::{ApParams, EngineError};
+use crate::fault;
 
 impl GpuPtycho {
     /// [`crate::engine::Ptycho::ap`]: per stack, exit waves of the current estimate, projection (the
@@ -49,16 +49,15 @@ impl Bufs<'_> {
         ctx: &ExecutionContext,
         passes: &mut PassesMut<'_>,
         params: &ApParams,
-        mut llk: Option<RecordWriter<'_>>,
+        mut llk: Option<RecordWriter<'_, Tag>>,
         one: OneSlice,
-    ) -> Result<Option<Ended>, GpuError> {
+    ) -> Result<(), GpuError> {
         let (o, mut p) = (params.obj_inertia, params.probe_inertia);
-        let stepped = match passes {
-            PassesMut::Fused(f) if self.features.stepped() => {
-                self.step_features(ctx, f, llk.take(), one)?
-            }
-            _ => None,
-        };
+        if let PassesMut::Fused(f) = passes
+            && self.features.stepped()
+        {
+            self.step_features(ctx, f, llk.take(), one)?;
+        }
         match passes {
             PassesMut::M1(m1) => {
                 for s in 0..self.scratch.len() {
@@ -77,10 +76,14 @@ impl Bufs<'_> {
                 }
             }
         }
-        let ended = llk.map(|w| w.end(ctx)).transpose()?.or(stepped);
+        if let Some(w) = llk {
+            w.end(ctx)?;
+        }
+        fault::at(fault::Exit::ApSums)?;
         self.apply_sums(ctx, o, p)?;
+        fault::at(fault::Exit::ApPositions)?;
         self.features.position_step(ctx, self.grad)?;
-        Ok(ended)
+        Ok(())
     }
 
     /// The stacks of an AP cycle by the fused passes: per stack the projection with its LLK
@@ -95,7 +98,7 @@ impl Bufs<'_> {
         &mut self,
         ctx: &ExecutionContext,
         f: &mut FusedBufs,
-        mut llk: Option<&mut RecordWriter<'_>>,
+        mut llk: Option<&mut RecordWriter<'_, Tag>>,
         obj: bool,
         probe_inertia: Option<f64>,
         one: OneSlice,

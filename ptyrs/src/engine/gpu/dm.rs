@@ -7,6 +7,7 @@ use super::device::{CarriedMut, M1Bufs, OneSlice, PassesMut, Sample, another_mod
 use super::{Bufs, Epoch, GpuPtycho};
 use crate::engine::ptycho::llk_due;
 use crate::engine::{DmParams, EngineError};
+use crate::fault;
 
 impl GpuPtycho {
     /// [`crate::engine::Ptycho::dm`]. Cycle 0 of a call projects `PO` itself (the reflection maps
@@ -119,6 +120,7 @@ impl Bufs<'_> {
         match passes {
             PassesMut::M1(m1) => {
                 for s in 0..w.cut.len() {
+                    fault::at(fault::Exit::DmStack)?;
                     match c.mix {
                         Mix::Dm { alpha } => self.dm_m1(ctx, m1, w, s, alpha, c.first)?,
                         Mix::Raar { beta } => self.raar_m1(ctx, m1, w, s, beta, c.first)?,
@@ -128,14 +130,14 @@ impl Bufs<'_> {
             PassesMut::Fused(f) => {
                 summed = c.loops > 0 && obj_inertia.is_some();
                 if self.features.stepped() {
-                    // No record, so nothing ended.
-                    let _ = self.step_features(ctx, f, None, c.one)?;
+                    self.step_features(ctx, f, None, c.one)?;
                 }
                 let dims = *self.views.dims();
                 let mut m = (self.features)
                     .lend(ctx, self.kernels, &dims, self.obj, self.probe, self.exit)?
                     .one_slice(c.one);
                 for s in 0..w.cut.len() {
+                    fault::at(fault::Exit::DmStack)?;
                     let stack = w.cut.at(s);
                     let (psi, iterate, windows) = w.fused(s);
                     let exit = match c.mix {

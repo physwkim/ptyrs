@@ -1,46 +1,49 @@
 //! The LLK ring: records come back in order with the totals of their own partials and the
 //! unmasked pixels of their frames, across wraps and copies that overlap later records; a
 //! record of the first frames reads only those; a record with a frame not written for it is
-//! a stamp error, as is one ended a number of times other than the host counts it, and one
-//! with a frame never counted is an uncounted error. A poll returns the records whose copies
-//! have completed without waiting for the rest. Each detector pixel's frame count holds the
-//! counted frames unmasked there, each once, in any layout and order of counted ranges.
+//! a stamp error, and one with a frame never counted is an uncounted error. A record counts
+//! exactly when its advance is enqueued, eagerly or by a graph's replay: a call that fails
+//! before it counts nothing and its number is voided, so a retry reads only its own frames.
+//! A begin that fails counts the void it enqueued and nothing else. A poll returns the
+//! records whose copies have completed without waiting for the rest. Each detector pixel's
+//! frame count holds the counted frames unmasked there, each once, in any layout and order of
+//! counted ranges.
 
+use std::ffi::c_void;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Sender};
 
-use cuda_async::device_operation::ExecutionContext;
+use cuda_async::cuda_graph::CudaGraph;
+use cuda_async::device_operation::{DeviceOp, ExecutionContext};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 use ptyrs::gpu::{
     Ended, Error, Kernels, LlkPartial, LlkRing, LlkSums, LlkTotals, MASKED, RingError, StackTable,
-    ViewDims,
+    ViewDims, record,
 };
 
 const NFRAME: u32 = 10;
 /// Stacks of 4, 4 and 2 frames.
 const STACKS: [std::ops::Range<u32>; 3] = [0..4, 4..8, 8..10];
 
-/// One record as a body writes it: which stacks push through its writer, and how many
-/// writers end (the first pushes, later ones are empty; none drops it unended). The host
-/// counts it once, of frames `0 .. nframe`, with the latest [`Ended`], as it counts a graph
-/// replay with the token of the capture.
+/// One eager record of frames `0 .. nframe`: which stacks push through its writer, and
+/// whether it ends or is dropped unended, as a call that fails before its end drops it.
 struct Record {
     push: [bool; 3],
-    ends: usize,
+    end: bool,
     nframe: u32,
 }
 
 const WHOLE: Record = Record {
     push: [true; 3],
-    ends: 1,
+    end: true,
     nframe: NFRAME,
 };
 
-/// A record of frames `0 .. nframe` pushed by the stacks `push` asks for, ended once.
+/// A record of frames `0 .. nframe` pushed by the stacks `push` asks for, ended.
 fn first(push: [bool; 3], nframe: u32) -> Record {
     Record {
         push,
-        ends: 1,
+        end: true,
         nframe,
     }
 }
@@ -122,7 +125,6 @@ struct Fixture {
     dims: ViewDims,
     table: StackTable,
     ring: LlkRing<usize>,
-    ended: Option<Ended>,
     counts: DeviceBuffer<u16>,
 }
 
@@ -152,7 +154,6 @@ fn fixture_counting(nslot: u32, counted: [bool; 3]) -> Fixture {
         dims,
         table,
         ring,
-        ended: None,
         counts: dev_counts,
     }
 }
@@ -192,8 +193,7 @@ impl Fixture {
         staged: &[Vec<DeviceBuffer<LlkPartial>>],
     ) {
         for (i, rec) in records.iter().enumerate() {
-            let dev = self.ring.device();
-            let mut writer = dev.record();
+            let mut writer = self.ring.record(&self.ctx, r0 + i, rec.nframe).unwrap();
             for (s, staging) in staged[i].iter().enumerate() {
                 if rec.push[s] {
                     writer
@@ -201,19 +201,53 @@ impl Fixture {
                         .unwrap();
                 }
             }
-            if rec.ends == 0 {
-                drop(writer);
-            } else {
-                self.ended = Some(writer.end(&self.ctx).unwrap());
-                for _ in 1..rec.ends {
-                    self.ended = Some(dev.record().end(&self.ctx).unwrap());
-                }
+            if rec.end {
+                writer.end(&self.ctx).unwrap();
             }
-            let ended = self.ended.as_ref().expect("an earlier record ended");
-            self.ring
-                .enqueued(&self.ctx, ended, r0 + i, rec.nframe)
-                .unwrap();
         }
+    }
+
+    /// A graph of record `r`'s pushes of every stack and its end, captured on a side stream,
+    /// so nothing runs, with the [`Ended`] the capture left.
+    fn capture(&mut self, r: usize) -> (CudaGraph<()>, Vec<DeviceBuffer<LlkPartial>>, Ended) {
+        let staged = self.stage(r, 1).remove(0);
+        let side = self.stream.context().new_stream().unwrap();
+        let mut ended = None;
+        let (ring, dims, table) = (&mut self.ring, &self.dims, &self.table);
+        let op = record(|ctx| {
+            let mut writer = ring.capture(&mut ended);
+            for (s, staging) in staged.iter().enumerate() {
+                writer.push(ctx, dims, table.at(s), staging)?;
+            }
+            writer.end(ctx)
+        });
+        let graph = CudaGraph::capture(side, op).unwrap();
+        (graph, staged, ended.expect("the capture ended its record"))
+    }
+
+    /// Replays `graph`, whose capture left `ended`, as the record of every frame under `tag`.
+    fn replay(&mut self, graph: &CudaGraph<()>, ended: &Ended, tag: usize) {
+        let stream = &self.stream;
+        let launch = || Ok::<_, RingError>(graph.launch().sync_on(stream).map_err(Error::from)?);
+        self.ring
+            .replay(&self.ctx, ended, tag, NFRAME, launch)
+            .unwrap();
+    }
+
+    /// The stream of a context the ring's kernels do not share, on the same device: every
+    /// launch on it fails before it enqueues.
+    fn foreign(&self) -> ExecutionContext {
+        let cuda = self.stream.context();
+        // SAFETY: `cuda` retains the context the borrow names and is its owner.
+        let other = unsafe {
+            CudaContext::borrow_with_owner(
+                cuda.cu_ctx() as *mut c_void,
+                cuda.cu_device(),
+                cuda.ordinal() + 1,
+                cuda.clone(),
+            )
+        };
+        ExecutionContext::new(other.new_stream().unwrap())
     }
 
     fn flush(&mut self) -> Result<Vec<(usize, LlkTotals)>, RingError> {
@@ -249,7 +283,7 @@ impl Fixture {
     }
 }
 
-fn check_whole(got: &[(usize, LlkTotals)], tags: std::ops::Range<usize>) {
+fn check_whole(got: &[(usize, LlkTotals)], tags: impl IntoIterator<Item = usize>) {
     assert_eq!(
         got.iter().map(|(t, _)| *t).collect::<Vec<_>>(),
         Vec::from_iter(tags)
@@ -335,8 +369,9 @@ fn a_record_of_the_first_frames_reads_only_those() {
     f.enqueue(3, &[first([true, false, false], 5)]);
     assert_eq!(stamp(f.flush().unwrap_err()), (3, 4, u64::MAX));
 
-    let ended = f.ended.take().unwrap();
-    let e = f.ring.enqueued(&f.ctx, &ended, 4, NFRAME + 1).unwrap_err();
+    let Err(e) = f.ring.record(&f.ctx, 4, NFRAME + 1) else {
+        panic!("a record past the ring's frames began");
+    };
     assert!(matches!(e, RingError::Gpu(Error::Shape(_))), "{e}");
 }
 
@@ -372,7 +407,7 @@ fn stamp(e: RingError) -> (u64, usize, u64) {
 fn skipped_push_is_a_stamp_error() {
     let skip = Record {
         push: [true, false, true],
-        ends: 1,
+        end: true,
         nframe: NFRAME,
     };
     let mut f = fixture(3);
@@ -382,37 +417,169 @@ fn skipped_push_is_a_stamp_error() {
     let mut f = fixture(3);
     let skip = Record {
         push: [true, true, false],
-        ends: 1,
+        end: true,
         nframe: NFRAME,
     };
     f.enqueue(0, &[WHOLE, WHOLE, WHOLE, WHOLE, skip]);
     assert_eq!(stamp(f.flush().unwrap_err()), (4, 8, 1));
 }
 
-/// A body that ends two records, or none, where the host counts one, moves the later records
-/// off their slots.
+/// A call that fails before its advance is enqueued counts nothing, and the retry reads
+/// only its own frames: an eager record whose end fails after every push, and a replay whose
+/// launch fails. The failed number is voided, so a retry that pushes fewer frames is a stamp
+/// error, not a read of the failed call's frames; an end that never began voids nothing.
 #[test]
-fn ends_out_of_step_with_counts_are_a_stamp_error() {
-    let twice = Record {
-        push: [true; 3],
-        ends: 2,
-        nframe: NFRAME,
-    };
+fn a_call_failing_before_its_advance_counts_nothing() {
     let mut f = fixture(4);
-    f.enqueue(0, &[WHOLE, twice, WHOLE]);
-    assert_eq!(stamp(f.flush().unwrap_err()), (2, 0, u64::MAX));
+    let foreign = f.foreign();
+    let staged = f.stage(0, 2);
+    let mut writer = f.ring.record(&f.ctx, 0, NFRAME).unwrap();
+    for (s, staging) in staged[0].iter().enumerate() {
+        writer
+            .push(&f.ctx, &f.dims, f.table.at(s), staging)
+            .unwrap();
+    }
+    assert!(matches!(writer.end(&foreign), Err(Error::ContextMismatch)));
+    f.enqueue_staged(1, &[WHOLE], &staged[1..]);
+    check_whole(&f.flush().unwrap(), 1..2);
 
-    // Record 2 lands on record 1's slot and stamp, so record 1 reads with record 2's values;
-    // only record 2's empty slot shows it, and the flush returns none of them.
-    let none = Record {
-        push: [true; 3],
-        ends: 0,
+    let (graph, _staged, ended) = f.capture(2);
+    let failed = f.ring.replay(&f.ctx, &ended, 2, NFRAME, || {
+        Err(RingError::from(Error::ContextMismatch))
+    });
+    assert!(matches!(
+        failed,
+        Err(RingError::Gpu(Error::ContextMismatch))
+    ));
+    f.replay(&graph, &ended, 2);
+    check_whole(&f.flush().unwrap(), 2..3);
+
+    // The failed call stamps every frame of slot 0 with number 4, which a retry under the
+    // same number would read as its own; voided, the retry is number 5, in slot 1, where
+    // record 1 left frame 8.
+    let staged = f.stage(3, 1);
+    let mut writer = f.ring.record(&f.ctx, 3, NFRAME).unwrap();
+    for (s, staging) in staged[0].iter().enumerate() {
+        writer
+            .push(&f.ctx, &f.dims, f.table.at(s), staging)
+            .unwrap();
+    }
+    drop(writer);
+    let skip = Record {
+        push: [true, true, false],
+        end: true,
         nframe: NFRAME,
     };
-    let mut f = fixture(4);
-    f.enqueue(0, &[WHOLE, none, WHOLE]);
-    assert_eq!(stamp(f.flush().unwrap_err()), (2, 0, u64::MAX));
-    assert!(f.flush().unwrap().is_empty());
+    f.enqueue(3, &[skip]);
+    assert_eq!(stamp(f.flush().unwrap_err()), (5, 8, 1));
+}
+
+/// A record begun and dropped unended leaves frames stamped with its number, which the next
+/// begin voids with an advance of its own: in one slot, where the void copy is the record
+/// read next, and in three, where it lands mid-batch. The records after it read their own
+/// totals and the void shows in no flush.
+#[test]
+fn a_dirty_number_is_voided_by_the_next_begin() {
+    for nslot in [1, 3] {
+        let mut f = fixture(nslot);
+        let dropped = Record {
+            push: [true; 3],
+            end: false,
+            nframe: NFRAME,
+        };
+        f.enqueue(0, &[WHOLE, dropped]);
+        f.enqueue(2, &[WHOLE, WHOLE]);
+        let got = f.flush().unwrap();
+        assert_eq!(
+            got.iter().map(|(t, _)| *t).collect::<Vec<_>>(),
+            [0, 2, 3],
+            "nslot {nslot}"
+        );
+        for (r, t) in &got {
+            let want = LlkSums::from_partials(&partials(*r));
+            assert_eq!(bits(&t.sums), bits(&want), "nslot {nslot}, record {r}");
+        }
+    }
+}
+
+/// A begin that fails before its record leaves the retry its number, and the retry reads only
+/// its own totals: one whose void of a dropped record's number fails leaves the number dirty
+/// for the retry to void, and one whose copy of the record before it fails leaves that record
+/// for the retry to copy.
+#[test]
+fn a_begin_failing_before_its_void_or_copy_leaves_them_to_the_retry() {
+    let mut f = fixture(1);
+    let foreign = f.foreign();
+    let dropped = Record {
+        push: [true; 3],
+        end: false,
+        nframe: NFRAME,
+    };
+    f.enqueue(0, &[WHOLE, dropped]);
+    let Err(e) = f.ring.record(&foreign, 2, NFRAME) else {
+        panic!("a begin whose void failed began");
+    };
+    assert!(matches!(e, RingError::Gpu(Error::ContextMismatch)), "{e}");
+    f.enqueue(2, &[WHOLE]);
+    check_whole(&f.flush().unwrap(), [0, 2]);
+
+    f.enqueue(3, &[WHOLE]);
+    let Err(e) = f.ring.record(&foreign, 4, NFRAME) else {
+        panic!("a begin whose copy failed began");
+    };
+    assert!(matches!(e, RingError::Gpu(Error::ContextMismatch)), "{e}");
+    f.enqueue(4, &[WHOLE]);
+    check_whole(&f.flush().unwrap(), [3, 4]);
+}
+
+/// A begin whose void is enqueued, then whose copy of the record before it reads that
+/// record's stamp error, keeps the void counted: the retry is the number after it and reads
+/// only its own totals, and the void shows in no flush.
+#[test]
+fn a_void_before_a_failed_copy_stays_counted() {
+    let mut f = fixture(1);
+    let dropped = Record {
+        push: [true; 3],
+        end: false,
+        nframe: NFRAME,
+    };
+    f.enqueue(0, &[first([true, true, false], NFRAME), dropped]);
+    let Err(e) = f.ring.record(&f.ctx, 2, NFRAME) else {
+        panic!("a begin whose copy read a stamp error began");
+    };
+    assert_eq!(stamp(e), (0, 8, u64::MAX));
+    f.enqueue(2, &[WHOLE]);
+    check_whole(&f.flush().unwrap(), [2]);
+}
+
+/// `n` replays of a captured record count `n` records, each with the capture's partials,
+/// across a wrap of the ring; a capture counts nothing and runs no advance, whether it is
+/// kept or fails after its end.
+#[test]
+fn each_replay_counts_one_record() {
+    let mut f = fixture(3);
+    let side = f.stream.context().new_stream().unwrap();
+    let mut ended = None;
+    let ring = &mut f.ring;
+    let op = record(|ctx| {
+        ring.capture(&mut ended).end(ctx)?;
+        Err::<(), _>(Error::ContextMismatch)
+    });
+    assert!(CudaGraph::capture(side, op).is_err());
+    let (graph, _staged, ended) = f.capture(7);
+    assert!(f.flush().unwrap().is_empty(), "a capture counts nothing");
+    for r in 0..5 {
+        f.replay(&graph, &ended, r);
+    }
+    let got = f.flush().unwrap();
+    assert_eq!(
+        got.iter().map(|(t, _)| *t).collect::<Vec<_>>(),
+        [0, 1, 2, 3, 4]
+    );
+    for (r, t) in &got {
+        let want = LlkSums::from_partials(&partials(7));
+        assert_eq!(bits(&t.sums), bits(&want), "replay {r}");
+    }
 }
 
 /// Counting adds each frame to its unmasked pixels' frame counts once: the first two stacks'
