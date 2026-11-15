@@ -227,6 +227,11 @@ impl FeatureBufs {
         self.position.is_some()
     }
 
+    /// Whether the position is modelled and refined.
+    fn position_refined(&self) -> bool {
+        (self.position.as_ref()).is_some_and(|p| p.partials.is_some())
+    }
+
     /// The scale's, background's and position's [`Feature::refine`], none for one not
     /// modelled.
     fn refine(&self) -> [Option<bool>; 3] {
@@ -239,7 +244,7 @@ impl FeatureBufs {
 
     /// What the position model adds to the shared passes.
     fn scratch(&self) -> PositionScratch {
-        let refined = self.refine()[2] == Some(true);
+        let refined = self.position_refined();
         PositionScratch::of(self.position.as_ref().map(|p| &p.mover), refined)
     }
 
@@ -2705,7 +2710,7 @@ impl Device {
                 Mover::new(&self.stream, &self.kernels, dims, sampling)
             })
             .transpose()?;
-        let refined = self.features.refine()[2] == Some(true);
+        let refined = self.features.position_refined();
         let shared = self.reshared(mover.as_ref(), refined)?;
         self.sampling = sampling;
         if self.ml.as_ref().is_some_and(|s| s.position.is_some()) {
@@ -3169,7 +3174,7 @@ impl Device {
         MovedScratch {
             frames: self.shared.cut.table.nf_max(),
             sampling,
-            refined: self.features.refine()[2] == Some(true),
+            refined: self.features.position_refined(),
         }
     }
 
