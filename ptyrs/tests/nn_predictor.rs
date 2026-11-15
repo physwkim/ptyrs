@@ -4,6 +4,7 @@
 use std::path::{Path, PathBuf};
 
 use burn::prelude::*;
+use burn::tensor::DType;
 use ptyrs::base::{AddrTable, Geometry, Object, Probe, Scan, required_obj_shape, sim};
 use ptyrs::live::fill::PatchPredictor;
 use ptyrs::nn::NnError;
@@ -249,6 +250,57 @@ fn a_predictor_saved_without_its_input_loads_with_the_one_its_weights_hold() {
         assert_eq!(
             back.predict(&scan.counts, norm).unwrap(),
             predictor.predict(&scan.counts, norm).unwrap()
+        );
+    }
+}
+
+/// A checkpoint whose JSON is not an object is refused, not indexed into.
+#[test]
+fn a_checkpoint_that_is_not_an_object_is_refused() {
+    let device = ptyrs::nn::cuda(0);
+    let probe = sim::probe([FRAME, FRAME], 1).unwrap();
+    let config = config();
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ptyrs-nn-checkpoint-array");
+    std::fs::create_dir_all(dir.join("epoch-1")).unwrap();
+    std::fs::write(dir.join("latest"), "epoch-1").unwrap();
+    std::fs::write(dir.join("epoch-1/checkpoint.json"), "[]").unwrap();
+    let options = TrainOptions {
+        epochs: 1,
+        batch: 16,
+        lr: 1e-3,
+        seed: 7,
+        checkpoint: Some(dir),
+    };
+    let train_set = samples(&config, &probe, 0..1);
+    let got = train(&config, &options, &train_set, None, &device, |_| {});
+    assert!(matches!(got, Err(NnError::Invalid(_))));
+}
+
+/// Weights whose input mean has fewer than two axes, read for a config that does not name its
+/// input, are refused, not indexed into.
+#[test]
+fn an_input_mean_of_under_two_axes_is_refused() {
+    let device = ptyrs::nn::cuda(0);
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ptyrs-nn-predictor-flat-mean");
+    std::fs::create_dir_all(&dir).unwrap();
+    config().save(dir.join("predictor.json")).unwrap();
+    strip_input(&dir.join("predictor.json"), None);
+    for shape in [vec![], vec![4]] {
+        let data = TensorData::new(vec![0.0f32; shape.iter().product()], shape.clone());
+        let mean = burn_pack::Tensor::new(
+            "mean".into(),
+            DType::F32,
+            shape.clone(),
+            None,
+            data.into_bytes(),
+        );
+        burn_pack::Writer::new(vec![mean])
+            .write_to_file(dir.join("predictor.bpk"))
+            .unwrap();
+        let got = Predictor::load(&dir, &device);
+        assert!(
+            matches!(got, Err(NnError::Invalid(_))),
+            "mean of shape {shape:?}"
         );
     }
 }

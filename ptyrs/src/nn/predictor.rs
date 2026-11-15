@@ -552,8 +552,12 @@ impl Checkpoint {
             Err(e) => return Err(e.into()),
         };
         let state = dir.join(name);
-        let mut json = read_json(&state.join("checkpoint.json"))?;
-        settle_input(&mut json["config"], &state.join("model.bpk"))?;
+        let file = state.join("checkpoint.json");
+        let mut json = read_json(&file)?;
+        let config = json.get_mut("config").ok_or_else(|| {
+            NnError::Invalid(format!("{} holds no predictor config", file.display()))
+        })?;
+        settle_input(config, &state.join("model.bpk"))?;
         let saved: Checkpoint = serde_json::from_value(json).map_err(burn_err)?;
         let own = Checkpoint {
             config: self.config.clone(),
@@ -614,12 +618,12 @@ fn settle_input(config: &mut serde_json::Value, weights: &Path) -> Result<(), Nn
         .into_iter()
         .find(|t| t.name == "mean")
         .ok_or_else(|| NnError::Invalid(format!("{} holds no input mean", weights.display())))?;
-    let input = match mean.shape[1] {
-        1 => Input::Binned,
-        2 => Input::BinnedCentre,
-        n => {
+    let input = match mean.shape.as_slice() {
+        [_, 1, ..] => Input::Binned,
+        [_, 2, ..] => Input::BinnedCentre,
+        shape => {
             return Err(NnError::Invalid(format!(
-                "{} holds an input of {n} images",
+                "{} holds an input mean of shape {shape:?}",
                 weights.display()
             )));
         }
