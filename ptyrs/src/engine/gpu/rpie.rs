@@ -348,7 +348,9 @@ impl<'a> Bufs<'a> {
         let l = self.launch();
         let (frames, stack) = (&rb.batches[b], rb.table.at(b));
         let dims = l.prop.dims;
-        let mut m = (self.features).lend(ctx, l.k, &dims, self.obj, self.probe, self.exit)?;
+        let mut m = (self.features)
+            .lend(ctx, l.k, &dims, self.obj, self.probe, self.exit)?
+            .one_slice(rb.one);
         let block = |order, modes, block| WindowBlock {
             slice: 0,
             order,

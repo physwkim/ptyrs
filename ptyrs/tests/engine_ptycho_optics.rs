@@ -6,8 +6,8 @@
 
 use ptyrs::base::{C64, Counts, Geometry, Object, Probe, Scan, Stack, required_obj_shape, sim};
 use ptyrs::engine::{
-    ApParams, DmParams, Feature, Features, MlParams, Optics, Propagator, Ptycho, RaarParams,
-    RpieParams, Wavefield, obj_probe_shift_to_psi, shift,
+    ApParams, DmParams, Feature, Features, MlParams, Optics, PlaneStage, Propagator, Ptycho,
+    RaarParams, RpieParams, Wavefield, obj_probe_shift_to_psi, shift,
 };
 
 #[path = "common/worst.rs"]
@@ -384,7 +384,11 @@ fn with_optics_refuses_what_ptycho_cannot_run() {
             .expect("refused")
     };
     let evanescent = Wavefield::new(FRAME, 5e-7, [3e-7, 3e-7], 1.5e-6).unwrap();
-    assert!(Propagator::free_space(&evanescent).fourier_form().is_err());
+    let banded = Propagator::free_space(&evanescent);
+    assert!(matches!(
+        banded.fourier_form().unwrap().stage,
+        PlaneStage::Banded(_)
+    ));
     assert!(refused(Optics::free_space(&evanescent)).contains("unitary"));
     let gap = Wavefield::new(FRAME, WAVELENGTH, [50e-9, 50e-9], 1e-6).unwrap();
     let sliced = optics(Kind::Angular).with_slices(&[gap]).unwrap();

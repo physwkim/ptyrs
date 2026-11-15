@@ -346,6 +346,68 @@ impl<S: Send + 'static> Workers<S> {
 
 type Body<'a, S, R> = dyn Fn(&mut Gpu, &mut S) -> Result<R, DistError> + Sync + 'a;
 
+/// A run's workers and whether a call that changes their state failed, which only
+/// [`Gated::change`] marks.
+pub(crate) struct Gated<S: Send + 'static> {
+    workers: Workers<S>,
+    /// A call through [`Self::change`] failed part-way: the GPUs may disagree, so every later
+    /// call but [`Self::drain`] fails.
+    failed: bool,
+}
+
+impl<S: Send + 'static> Gated<S> {
+    pub(crate) fn new(workers: Workers<S>) -> Self {
+        Self {
+            workers,
+            failed: false,
+        }
+    }
+
+    /// [`DistError::Aborted`] once a call through [`Self::change`] has failed.
+    pub(crate) fn check(&self) -> Result<(), DistError> {
+        if self.failed {
+            return Err(DistError::Aborted);
+        }
+        Ok(())
+    }
+
+    /// `f` on every GPU, writing state a later call reads: refused once a change has failed,
+    /// and failing on any GPU fails every later call.
+    pub(crate) fn change<R, F>(&mut self, f: F) -> Result<Vec<R>, DistError>
+    where
+        R: Send + 'static,
+        F: Fn(&mut Gpu, &mut S) -> Result<R, DistError> + Sync,
+    {
+        self.check()?;
+        self.failed = true;
+        let r = self.workers.run(f)?;
+        self.failed = false;
+        Ok(r)
+    }
+
+    /// `f` on every GPU, writing nothing a later call reads: refused once a change has
+    /// failed.
+    pub(crate) fn read<R, F>(&self, f: F) -> Result<Vec<R>, DistError>
+    where
+        R: Send + 'static,
+        F: Fn(&mut Gpu, &mut S) -> Result<R, DistError> + Sync,
+    {
+        self.check()?;
+        self.workers.run(f)
+    }
+
+    /// Waits for every GPU's queued work, after a failed change too, so that nothing the run
+    /// queued still reads or writes its buffers once this returns.
+    pub(crate) fn drain(&self) -> Result<(), DistError> {
+        self.workers.run(|gpu, _| gpu.synchronize())?;
+        Ok(())
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.workers.len()
+    }
+}
+
 /// The channel a run's jobs report on. Dropping it waits until every job has run or been
 /// dropped, so a closure the jobs borrow outlives them.
 struct Results<T> {

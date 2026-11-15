@@ -33,7 +33,9 @@ use cuda_core::{Context, DeviceBuffer, Stream};
 
 use crate::dist::exchange::{self, Pull, Run};
 use crate::dist::halo::{Halo, HaloBufs, HaloRows, Window, peers, view_addr};
+use crate::dist::worker::Gated;
 use crate::dist::{DEFAULT_TILE, DistError, Exchange, Gpu, Partition, Scheme, Workers};
+use crate::fault;
 
 /// Leaf regions every run is cut from; a run uses 1, 2 or 4 GPUs.
 pub const NLEAF: usize = 4;
@@ -676,6 +678,7 @@ impl State {
             // joined before the fence.
             unsafe { halo.pack(ex, &ctx)? };
         }
+        fault::at(fault::Exit::DistUpdate)?;
         if let (Some(t), Some(inertia)) = (tree.as_mut(), plan.probe_inertia) {
             gpu.join()?;
             k.update_from_sums(&ctx, probe, &mut t.root, np, inertia)?;
@@ -729,7 +732,7 @@ pub struct RegionLoad {
 
 /// AP over 1, 2 or 4 GPUs, one region each.
 pub struct DistAp {
-    workers: Workers<State>,
+    gpus: Gated<State>,
     plan: Arc<Plan>,
     cycle: usize,
     history: Vec<(usize, LlkSums)>,
@@ -759,15 +762,17 @@ impl DistAp {
             probe: problem.probe,
         });
         let p = plan.clone();
-        let workers = Workers::spawn(ordinals, move |gpu| State::new(gpu, &p, &data))?;
-        let ptrs = Arc::new(workers.run(|_, st| Ok(st.ptrs()))?);
+        let mut gpus = Gated::new(Workers::spawn(ordinals, move |gpu| {
+            State::new(gpu, &p, &data)
+        })?);
+        let ptrs = Arc::new(gpus.read(|_, st| Ok(st.ptrs()))?);
         let p = plan.clone();
-        workers.run(move |gpu, st| {
+        gpus.change(move |gpu, st| {
             st.links = Some(st.links(gpu, &p, &ptrs)?);
             Ok(())
         })?;
         Ok(Self {
-            workers,
+            gpus,
             plan,
             cycle: 0,
             history: Vec::new(),
@@ -775,7 +780,7 @@ impl DistAp {
     }
 
     pub fn ngpu(&self) -> usize {
-        self.workers.len()
+        self.gpus.len()
     }
 
     /// Per region, in region order.
@@ -803,7 +808,7 @@ impl DistAp {
         let plan = self.plan.clone();
         let calc = plan.calc_llk;
         let due = move |ic: usize| calc > 0 && (ic.is_multiple_of(calc) || ic + 1 == ncycle);
-        let out = self.workers.run(move |gpu, st| {
+        let out = self.gpus.change(move |gpu, st| {
             let mut out = Vec::new();
             for ic in 0..ncycle {
                 let p = st.cycle(gpu, &plan, due(ic))?;
@@ -839,8 +844,8 @@ impl DistAp {
     /// The object `[nobj, nyo, nxo]`, each tile from its owner.
     pub fn object(&self) -> Result<Vec<C32>, DistError> {
         let objs = self
-            .workers
-            .run(|gpu, st| Ok(st.obj.to_host_vec(gpu.stream())?))?;
+            .gpus
+            .read(|gpu, st| Ok(st.obj.to_host_vec(gpu.stream())?))?;
         let grid = self.plan.run.grid();
         let [nyo, nxo] = grid.obj();
         let tile = grid.tile();
@@ -864,8 +869,8 @@ impl DistAp {
     /// The probe `[nprobe, ny, nx]`; every region holds the same.
     pub fn probe(&self) -> Result<Vec<C32>, DistError> {
         let mut p = self
-            .workers
-            .run(|gpu, st| Ok(st.probe.to_host_vec(gpu.stream())?))?;
+            .gpus
+            .read(|gpu, st| Ok(st.probe.to_host_vec(gpu.stream())?))?;
         Ok(p.swap_remove(0))
     }
 }
@@ -1225,5 +1230,32 @@ mod tests {
         let p = rel_l2(&gpu.probe().unwrap(), cpu.probe().as_slice());
         eprintln!("object rel L2 {o:.2e}, probe rel L2 {p:.2e}");
         assert!(o < 1e-4 && p < 1e-4);
+    }
+
+    /// A cycle failing on one GPU between its object and probe updates, so that the GPUs
+    /// disagree on the probe, aborts the run: every later call is refused, the reads too. Two
+    /// regions on one GPU, so the one-GPU suite runs it.
+    #[test]
+    fn a_cycle_failing_on_one_gpu_aborts_the_run() {
+        let (scan, p) = case(128, 1, |px| sim::fermat(100, 10.0 * px));
+        let cfg = ApConfig {
+            scheme: Scheme::Sectors { centre: None },
+            stack: 8,
+            obj_inertia: Some(0.01),
+            probe_inertia: Some(0.001),
+            calc_llk: 0,
+        };
+        let mut ap = DistAp::new(&[0, 0], problem(&scan, &p), cfg).unwrap();
+        let armed = fault::arm(fault::Exit::DistUpdate, 1);
+        let r = ap.run(2);
+        assert!(armed.fired());
+        drop(armed);
+        assert!(
+            matches!(r, Err(DistError::Gpu(crate::gpu::Error::Driver(d))) if d == fault::REFUSAL),
+            "{r:?}"
+        );
+        assert!(matches!(ap.run(1), Err(DistError::Aborted)));
+        assert!(matches!(ap.object(), Err(DistError::Aborted)));
+        assert!(matches!(ap.probe(), Err(DistError::Aborted)));
     }
 }
