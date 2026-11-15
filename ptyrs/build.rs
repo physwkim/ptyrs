@@ -146,8 +146,7 @@ fn run(toolkit: &Toolkit) -> Res<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|| workspace.join("target"));
 
-    let rlib = build_device_crate(workspace, toolkit, &target_dir, &arch)?;
-    let (ir, options) = read_device_artifact(&rlib, &arch)?;
+    let (ir, options) = build_device_crate(workspace, toolkit, &target_dir, &arch)?;
 
     let cufft = CufftDevice::load(&libcufft)?;
     let (ir, ffts) = define_block_ffts(&ir, &cufft, arch.capability())?;
@@ -228,21 +227,26 @@ fn cargo_oxide_manifest(workspace: &Path, toolkit: &Toolkit) -> Res<PathBuf> {
     Ok(crates.join("cargo-oxide").join("Cargo.toml"))
 }
 
-/// Runs `cargo oxide build` on the device crate and returns its rlib. The IR is read from the
-/// rlib, the output a no-op build verifies, not from the files the backend also writes:
-/// those can be gone while the build counts itself fresh.
+/// Runs `cargo oxide build` on the device crate and returns the IR and compile options it
+/// embedded in its rlib. The IR is read from the rlib, the output a no-op build verifies, not
+/// from the files the backend also writes: those can be gone while the build counts itself
+/// fresh.
 fn build_device_crate(
     workspace: &Path,
     toolkit: &Toolkit,
     target_dir: &Path,
     arch: &CudaArch,
-) -> Res<PathBuf> {
+) -> Res<(String, FinalizationOptions)> {
     let cargo_oxide = cargo_oxide_manifest(workspace, toolkit)?;
-    // One per arch, so every rlib in it is of this arch: in a shared one a build of another
-    // arch can replace the rlib between this nested build and its read. Fixed otherwise, as
-    // cargo-oxide fingerprints it: one per OUT_DIR rebuilt the device crate and its
-    // dependencies for every profile and feature set of ptyrs.
+    // One per arch, so every rlib in it is of this arch and a switch of arch keeps the other's
+    // build. Fixed otherwise, as cargo-oxide fingerprints it: one per OUT_DIR rebuilt the
+    // device crate and its dependencies for every profile and feature set of ptyrs.
     let device_dir = target_dir.join("oxide-device").join(arch.sm());
+    fs::create_dir_all(&device_dir)?;
+    // Held through the read: once this nested build exits, cargo lets a build of other sources
+    // (another checkout, or an edit since) replace the rlib.
+    let lock = fs::File::create(device_dir.join("ptyrs.lock"))?;
+    lock.lock()?;
     let mut cmd = nested_cargo(workspace, toolkit);
     cmd.env("CUDA_OXIDE_PTX_DIR", device_dir.join("emit"))
         .args(["run", "--quiet", "--locked", "--manifest-path"])
@@ -276,7 +280,7 @@ fn build_device_crate(
             .filter_map(|f| f.as_str())
             .find(|f| f.ends_with(".rlib"))
         {
-            return Ok(rlib.into());
+            return read_device_artifact(Path::new(rlib), arch);
         }
     }
     Err(format!("the nested build reports no rlib of {DEVICE_PACKAGE}").into())
