@@ -17,6 +17,10 @@ use ptyrs::engine::{
 };
 use ptyrs::gpu::FUSED_SIDES;
 
+#[path = "common/worst.rs"]
+mod worst;
+use worst::worst_of;
+
 const NPOS: usize = 30;
 const NPROBE: usize = 2;
 const WAVELENGTH: f64 = 1e-10;
@@ -326,8 +330,7 @@ impl Ended {
             self.records, self.end
         );
         if let Some(floor) = floor {
-            let all = self.records.iter().chain([&self.end]);
-            let worst = all.fold(0.0f64, |m, &v| m.max(v));
+            let worst = worst_of(self.records.iter().chain([&self.end]).copied());
             assert!(worst < 1.02 * floor, "{what}: {worst} over {floor}");
         } else {
             for (i, w) in self.records.windows(2).enumerate() {
@@ -349,14 +352,12 @@ impl Ended {
     fn errors(&self, want: &Ended) -> [f64; 5] {
         assert_eq!(self.records.len(), want.records.len());
         let rel = |g: f64, w: f64| (g - w).abs() / w;
-        let llk = (self.records.iter())
-            .zip(&want.records)
-            .fold(0.0f64, |m, (&g, &w)| m.max(rel(g, w)));
+        let llk = worst_of((self.records.iter().zip(&want.records)).map(|(&g, &w)| rel(g, w)));
         let offsets = match (&self.offsets, &want.offsets) {
             (Some(g), Some(w)) => {
                 let pairs = || g.iter().flatten().zip(w.iter().flatten());
-                let worst = pairs().fold(0.0f64, |m, (g, w)| m.max((g - w).abs()));
-                worst / w.iter().flatten().fold(0.0f64, |m, w| m.max(w.abs()))
+                worst_of(pairs().map(|(g, w)| (g - w).abs()))
+                    / worst_of(pairs().map(|(_, w)| w.abs()))
             }
             _ => 0.0,
         };
