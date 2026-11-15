@@ -1605,6 +1605,43 @@ mod tests {
         }
     }
 
+    /// The slot `weight_parts`' step `t` stages the row of `x` read at step `t - 1` in.
+    fn staged(t: u32) -> usize {
+        ((t - 1) % 3) as usize
+    }
+
+    /// The slot `weight_parts`' tap `ky` reads at step `t`.
+    fn tapped(t: u32, ky: u32) -> usize {
+        (t.checked_add(ky).unwrap() % 3) as usize
+    }
+
+    /// `weight_parts`' ring of three rows of `x` over the last band of the images of
+    /// [`weight_gradient_rows_near_2_32_stay_in_32_bits`]: each tap reads the row it sums. Slots
+    /// counted from the image's first row wrapped past 2³² at 2³² - 1 rows, where 2³² ≡ 1 (mod 3),
+    /// and the last step's middle tap read the zero row below the image in place of its last.
+    #[test]
+    fn weight_gradient_ring_near_2_32_rows() {
+        for h in [u32::MAX - 510, u32::MAX] {
+            let [_, rows, blocks] =
+                bands_of(1, h as usize, 1, 1).map(|v| u32::try_from(v).unwrap());
+            let y0 = (blocks - 1).checked_mul(rows).unwrap();
+            let reads = (h - y0).checked_add(2).unwrap();
+            // The row of `x`, counted from the band's first, that each slot holds.
+            let mut ring = [None; 3];
+            for t in 0..=reads {
+                if t >= 1 {
+                    ring[staged(t)] = Some(t - 1);
+                }
+                if t >= 3 {
+                    for ky in 0..3 {
+                        let want = Some(t - 3 + ky);
+                        assert_eq!(ring[tapped(t, ky)], want, "{h} rows, step {t}, tap {ky}");
+                    }
+                }
+            }
+        }
+    }
+
     /// f16 and bf16 take burn's path, which sums wider than the activation, so they match it bit
     /// for bit.
     #[test]
