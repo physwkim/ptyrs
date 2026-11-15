@@ -2,8 +2,8 @@
 //! references in f64: [`BhKernels::phase_grad`] and [`BhKernels::phase_tangent`] against the
 //! derivatives of the plane phase `OpticsKernels::slice_phase` puts on the exit waves, its
 //! rates measured from that kernel; [`BhKernels::pos_second`] against central differences of
-//! [`BhKernels::pos_spec`]; the moved probes' entry against the waves that hold them; and the
-//! partials' segments.
+//! [`BhKernels::pos_spec`]; the probes `PositionKernels::shift_w` moved, as the entry, against
+//! waves holding the probes moved on the host; and the partials' segments.
 
 use std::f64::consts::TAU;
 
@@ -11,7 +11,9 @@ use cuda_core::CudaContext;
 
 use super::*;
 use crate::base::C64;
-use crate::gpu::{OpticsKernels, SlicePhase, SpectrumBuf, StackTable};
+use crate::gpu::{
+    FusedInputs, Model, OpticsKernels, PositionKernels, SlicePhase, SpectrumBuf, StackTable,
+};
 
 const NFRAME: usize = 5;
 const NMODE: usize = 4;
@@ -128,11 +130,6 @@ impl Fixture {
     fn host(&self, b: &DeviceBuffer<C32>) -> Vec<C64> {
         let h = b.to_host_vec(&self.stream).unwrap();
         h.into_iter().map(c64).collect()
-    }
-
-    fn floats(&self, b: &DeviceBuffer<C32>) -> Vec<f32> {
-        let h = b.to_host_vec(&self.stream).unwrap();
-        h.iter().flat_map(|c| [c.re, c.im]).collect()
     }
 
     fn offsets(&self, d: &[f32]) -> DeviceBuffer<f32> {
@@ -639,11 +636,18 @@ fn pos_second_is_the_change_of_pos_spec_cg() {
     pos_second_case(true);
 }
 
-/// `slice_tangent` entered by the moved probes as by the waves that hold each view's: the
-/// same values bit for bit.
+/// Whole-pixel offsets `(dy, dx)` by epoch position, a different one for each frame: the
+/// probe each moves is `P q` rolled, exact on the host.
+const ROLLS: [[i32; 2]; NFRAME] = [[1, -2], [3, 0], [-1, 4], [2, 2], [0, -3]];
+
+/// `slice_tangent` entered by the probes `shift_w` moved as by waves that hold each view's
+/// probe moved on the host, `P_p q` rolled by its frame's [`ROLLS`]: the same values to f32
+/// rounding, so a plane read for another frame or probe fails.
 fn moved_entry_case(cg: bool) {
     let fx = fixture();
-    let obj = fx.dims.obj_len();
+    let (ctx, dims) = (&fx.ctx, &fx.dims);
+    let position = PositionKernels::load(&fx.kernels).unwrap();
+    let obj = dims.obj_len();
     let [u, v] = [1, 3].map(|s| [fx.field(obj, s).0, fx.field(NPROBE * N, s + 1).0]);
     let d = BhDisp {
         u: [&u[0], &u[1]],
@@ -651,19 +655,65 @@ fn moved_entry_case(cg: bool) {
         v: cg.then_some([&v[0], &v[1]]),
     };
     let slice = fx.field(obj, 5).0;
+    let (probe, probe_h) = fx.field(NPROBE * N, 6);
+    let mut spec = SpectrumBuf::zeroed(&fx.stream, dims).unwrap();
+    let spectrum = fx
+        .kernels
+        .probe_spectrum(ctx, dims, &probe, &mut spec)
+        .unwrap();
+    let offsets: Vec<f32> = ROLLS.as_flattened().iter().map(|&o| o as f32).collect();
+    let offsets = fx.offsets(&offsets);
+    let counts = DeviceBuffer::<u16>::zeroed(&fx.stream, NFRAME * N).unwrap();
+    let inputs = FusedInputs {
+        views: fx.order.views(),
+        counts: &counts,
+        obj: &slice,
+        probe: &probe,
+        model: Model {
+            shift: Some(Shift {
+                offsets: &offsets,
+                spectrum,
+            }),
+            ..Model::default()
+        },
+    };
+    // Probe `p` moved by epoch position `pos`'s roll at natural pixel `(y, x)`: `P_p q` at
+    // `(y, x)` less the roll, circularly; `q` centred as `probe_spectrum` takes it.
+    let [ny, nx] = SHAPE.map(|n| n as i32);
+    let moved_at = |pos: usize, p: usize, y: usize, x: usize| {
+        let [dy, dx] = ROLLS[pos];
+        let (sy, sx) = (
+            (y as i32 - dy).rem_euclid(ny),
+            (x as i32 - dx).rem_euclid(nx),
+        );
+        let (cy, cx) = (f64::from(sy - ny / 2), f64::from(sx - nx / 2));
+        let q = C64::from_polar(1.0, f64::from(dims.quad_phase) * (cy * cy + cx * cx));
+        probe_h[p * N + (sy * nx + sx) as usize] * q
+    };
     for (s, frames) in STACKS.iter().enumerate() {
-        let seed = 10 * s as u64 + 10;
-        let moved = c32s(&noise(2 * entry_len(BH_ENTRY_MOVED), seed));
-        let waves: Vec<C32> = (0..FIELD)
-            .map(|i| {
-                let (kl, at) = (i / N, i % N);
-                let v = fx.views[(frames.start as usize * NMODE + kl).min(NFRAME * NMODE - 1)];
-                moved[(kl / NMODE * NPROBE + v.probe as usize) * N + at]
-            })
-            .collect();
+        let (seed, stack) = (10 * s as u64 + 10, fx.table.at(s));
+        let mut moved = fx.field(entry_len(BH_ENTRY_MOVED), seed).0;
+        fx.kernels
+            .shifted_probe(ctx, &inputs, stack, &mut moved)
+            .unwrap();
+        position.shift_w(ctx, dims, stack, &mut moved).unwrap();
+        // The planes past the stack's frames hold noise.
+        let mut waves = c32s(&noise(2 * FIELD, seed + 6));
+        for kl in 0..frames.len() * NMODE {
+            let pos = frames.start as usize + kl / NMODE;
+            let p = fx.views[pos * NMODE + kl % NMODE].probe as usize;
+            for i in 0..N {
+                let (y, x) = (i / SHAPE[1], i % SHAPE[1]);
+                let w = moved_at(pos, p, y, x);
+                waves[kl * N + stored(y, x)] = C32 {
+                    re: w.re as f32,
+                    im: w.im as f32,
+                };
+            }
+        }
+        let waves = DeviceBuffer::from_host(&fx.stream, &waves).unwrap();
         let fields = [1, 2, 3, 4, 5].map(|i| fx.field(FIELD, seed + i).0);
-        let run = |e: &[C32], kind: u32| {
-            let e = DeviceBuffer::from_host(&fx.stream, e).unwrap();
+        let run = |e: &DeviceBuffer<C32>, kind: u32| {
             let [mut lu, mut lv, muu, muv, mvv] = fields.each_ref().map(|f| f.clone_on(&fx));
             let mut m = [muu, muv, mvv];
             let mut t = BhTangentsMut {
@@ -673,22 +723,15 @@ fn moved_entry_case(cg: bool) {
             };
             let views = fx.order.views();
             fx.bh
-                .slice_tangent(
-                    &fx.ctx,
-                    views,
-                    fx.table.at(s),
-                    (&slice, entry(kind, &e)),
-                    &d,
-                    &mut t,
-                )
+                .slice_tangent(ctx, views, stack, (&slice, entry(kind, e)), &d, &mut t)
                 .unwrap();
-            [&lu, &lv, &m[0], &m[1], &m[2]].map(|b| fx.floats(b))
+            [&lu, &lv, &m[0], &m[1], &m[2]].map(|b| fx.host(b))
         };
         let (got, want) = (run(&moved, BH_ENTRY_MOVED), run(&waves, BH_ENTRY_WAVES));
         for (b, name) in ["lu", "lv", "muu", "muv", "mvv"].into_iter().enumerate() {
-            assert!(got[b] == want[b], "stack {s} {name}");
+            close(&format!("stack {s} {name}"), &got[b], &want[b], 1e-5);
         }
-        assert_ne!(got[0], fx.floats(&fields[0]), "stack {s}: lu not written");
+        assert_ne!(got[0], fx.host(&fields[0]), "stack {s}: lu not written");
     }
 }
 
