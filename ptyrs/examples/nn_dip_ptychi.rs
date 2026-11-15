@@ -358,6 +358,11 @@ fn main() -> Result<(), LossError> {
         )
         .into());
     }
+    // f64::max drops NaN and an infinite modulus excuses any difference, so the comparison below
+    // holds only between finite objects.
+    if start.iter().chain(&object0).any(|v| !v.is_finite()) {
+        return Err("a start object is not finite".into());
+    }
     let d = start
         .iter()
         .zip(&object0)
@@ -371,8 +376,7 @@ fn main() -> Result<(), LossError> {
         "start object against pty-chi's: max difference / max modulus {:.2e}",
         d / size
     );
-    // f64::max drops NaN, so a non-finite start is caught here, not by d.
-    if start.iter().any(|v| !v.is_finite()) || d > start_tol(dtype) * size {
+    if d > start_tol(dtype) * size {
         return Err("start objects differ".into());
     }
 
