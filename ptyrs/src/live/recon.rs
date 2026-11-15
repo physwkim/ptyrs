@@ -14,10 +14,15 @@
 //! write nothing, so the sweep's last replay may run short.
 //!
 //! With LLK recording, each epoch is also one record of an [`LlkRing`]: one
-//! launch outside the graphs counts the unmasked pixels of the frames binned
-//! since the last epoch, the sweep graph pushes each stack's LLK partials,
+//! launch outside the graphs counts the unmasked pixels of the frames landed
+//! since the last count, the sweep graph pushes each stack's LLK partials,
 //! which the fused pass takes from its forward far field as the engine's AP
 //! cycle does, and the update graph ends the record.
+//!
+//! An epoch that fails before its update replay is queued leaves object sums
+//! half added and the sweep part way; the next epoch discards both, as the
+//! update would have left them, and starts over, so it never resumes the
+//! failed one and its record covers every frame.
 
 use std::num::NonZeroU32;
 use std::ops::Range;
@@ -69,6 +74,8 @@ struct EpochLlk {
     bufs: LlkBufs,
     /// The update graph ends a record each replay.
     ended: Ended,
+    /// Frames whose count is queued.
+    counted: u32,
 }
 
 pub struct LiveAp {
@@ -78,7 +85,7 @@ pub struct LiveAp {
     update: LiveGraph,
     llk: Option<EpochLlk>,
     scan: LiveScan,
-    _kernels: Kernels,
+    kernels: Kernels,
     _probe: DeviceBuffer<C32>,
     _fused: FusedBufs,
     counts: DeviceBuffer<u16>,
@@ -86,7 +93,11 @@ pub struct LiveAp {
     binned: u32,
     /// Stacks per sweep replay.
     stacks: u32,
+    /// Update replays queued.
     epochs: u64,
+    /// Whether an epoch's sweep replays may have been queued without its
+    /// update: the object sums and the sweep entry are part way.
+    begun: bool,
 }
 
 impl LiveAp {
@@ -124,23 +135,23 @@ impl LiveAp {
         };
         // One writer for every record: the sweep graph pushes through it and
         // the update graph ends it.
+        let mut ended = None;
         let mut rec = bufs
             .as_mut()
-            .map(|b| (b.ring.device().record(), &mut b.partials));
+            .map(|b| (b.ring.capture(&mut ended), &mut b.partials));
         let sweep = {
             let llk = rec.as_mut().map(|(w, partials)| (w, &mut **partials));
             capture_sweep(&mut scan, k, stacks, &probe, &counts, &mut fused, llk)?
         };
-        let mut ended = None;
         let update = {
-            let (s, inertia, ended) = (&mut scan, cfg.inertia, &mut ended);
+            let (s, inertia) = (&mut scan, cfg.inertia);
             let w = rec.map(|(w, _)| w);
             LiveGraph::capture(stream, move |c| {
                 let p = s.parts_mut();
                 k.update_obj_from_sums(c, p.views, p.pixels, p.sums, inertia)?;
                 p.frames.rewind(c)?;
                 if let Some(w) = w {
-                    *ended = Some(w.end(c)?);
+                    w.end(c)?;
                 }
                 Ok(())
             })?
@@ -148,6 +159,7 @@ impl LiveAp {
         let llk = bufs.map(|bufs| EpochLlk {
             bufs,
             ended: ended.expect("the update capture ends the record"),
+            counted: 0,
         });
         Ok(Self {
             ingest,
@@ -155,13 +167,14 @@ impl LiveAp {
             update,
             llk,
             scan,
-            _kernels: kernels,
+            kernels,
             _probe: probe,
             _fused: fused,
             counts,
             binned: 0,
             stacks,
             epochs: 0,
+            begun: false,
         })
     }
 
@@ -187,30 +200,72 @@ impl LiveAp {
         self.scan.fill(fill, [0, 0])
     }
 
-    /// Queues one epoch over every frame landed so far, without waiting.
+    /// Queues one epoch over every frame landed so far, without waiting. After
+    /// an error, the next call starts the epoch over.
     pub fn epoch(&mut self) -> Result<(), GrowError> {
+        self.bin()?;
+        self.count()?;
         let (landed, nf) = (self.scan.landed(), self.scan.frames().nf_max());
-        let binned = self.binned;
+        let replays = landed.div_ceil(nf).div_ceil(self.stacks);
+        self.sweep_and_update(|sweep| (0..replays).try_for_each(|_| sweep.replay()))
+    }
+
+    /// Bins the frames landed since the last bin, one ingest replay per stack
+    /// of them.
+    fn bin(&mut self) -> Result<(), GrowError> {
+        let (landed, nf) = (self.scan.landed(), self.scan.frames().nf_max());
         while self.binned < landed {
             self.ingest.replay()?;
             self.binned = (self.binned + nf).min(landed);
         }
-        let ctx = ExecutionContext::new(self.scan.stream().clone());
-        if let Some(l) = &mut self.llk {
-            l.bufs
-                .ring
-                .device()
-                .count(&ctx, binned..landed, &self.counts)?;
-        }
-        for _ in 0..landed.div_ceil(nf).div_ceil(self.stacks) {
-            self.sweep.replay()?;
-        }
-        self.update.replay()?;
-        if let Some(l) = &mut self.llk {
-            l.bufs.ring.enqueued(&ctx, &l.ended, self.epochs, landed)?;
-        }
-        self.epochs += 1;
         Ok(())
+    }
+
+    /// Counts the frames landed since the last count, for the LLK records.
+    fn count(&mut self) -> Result<(), GrowError> {
+        let Some(l) = &mut self.llk else {
+            return Ok(());
+        };
+        let landed = self.scan.landed();
+        let ctx = ExecutionContext::new(self.scan.stream().clone());
+        l.bufs
+            .ring
+            .device()
+            .count(&ctx, l.counted..landed, &self.counts)?;
+        l.counted = landed;
+        Ok(())
+    }
+
+    /// The epoch's `sweeps`, then its update, after discarding what an epoch
+    /// that failed before its update left (the object sums and the sweep
+    /// entry), so this one starts over. With LLK recording, the two are the
+    /// record of every landed frame under the updates queued before it.
+    fn sweep_and_update(
+        &mut self,
+        sweeps: impl FnOnce(&LiveGraph) -> Result<(), GrowError>,
+    ) -> Result<(), GrowError> {
+        let ctx = ExecutionContext::new(self.scan.stream().clone());
+        if self.begun {
+            let p = self.scan.parts_mut();
+            self.kernels.clear_obj_sums(&ctx, p.views, p.sums)?;
+            p.frames.rewind(&ctx)?;
+            self.begun = false;
+        }
+        let (landed, tag) = (self.scan.landed(), self.epochs);
+        let (sweep, update) = (&self.sweep, &self.update);
+        let (begun, epochs) = (&mut self.begun, &mut self.epochs);
+        let launch = || -> Result<(), GrowError> {
+            *begun = true;
+            sweeps(sweep)?;
+            update.replay()?;
+            *begun = false;
+            *epochs += 1;
+            Ok(())
+        };
+        match &mut self.llk {
+            Some(l) => l.bufs.ring.replay(&ctx, &l.ended, tag, landed, launch),
+            None => launch(),
+        }
     }
 
     /// `(e, llk)` for each epoch queued since the last call, oldest first:
@@ -265,7 +320,7 @@ pub(crate) fn capture_sweep(
     probe: &DeviceBuffer<C32>,
     counts: &DeviceBuffer<u16>,
     fused: &mut FusedBufs,
-    mut llk: Option<(&mut RecordWriter<'_>, &mut DeviceBuffer<LlkPartial>)>,
+    mut llk: Option<(&mut RecordWriter<'_, u64>, &mut DeviceBuffer<LlkPartial>)>,
 ) -> Result<LiveGraph, GrowError> {
     let (stream, d) = (scan.stream().clone(), *scan.dims());
     LiveGraph::capture(&stream, move |c| {
@@ -776,6 +831,76 @@ mod tests {
         );
         let excess = wrong[scan_end + after] / flat[scan_end + after] - 1.0;
         assert!(excess.abs() < 2e-2, "LLK {excess:e} off the flat run's");
+    }
+
+    /// Two runs of 36 frames in 3 stacks of 16, swept 2 stacks a replay,
+    /// with every frame landed: the object and LLK of each must match.
+    fn twin_runs(p: &Ptycho) -> [LiveAp; 2] {
+        let (views, shape, _) = planned(p);
+        let ctx = Context::new(0).expect("GPU 0");
+        [(); 2].map(|_| {
+            let st = ctx.new_stream().unwrap();
+            let dev = DeviceBuffer::from_host(&st, &frames(p)).unwrap();
+            let mut live = LiveAp::new(&st, &config(shape, 16), &probe(p), dev, true).unwrap();
+            live.backer().back(&views).unwrap();
+            assert_eq!(live.push(&views).unwrap(), p.points() as u32);
+            live
+        })
+    }
+
+    /// Whether two runs hold the same object, bit for bit, and the same
+    /// LLK records.
+    fn same_runs(a: &mut LiveAp, b: &mut LiveAp) {
+        let (mut sa, mut sb) = (a.new_snapshot().unwrap(), b.new_snapshot().unwrap());
+        a.snapshot(&mut sa).unwrap();
+        b.snapshot(&mut sb).unwrap();
+        assert!(
+            sa.wait().unwrap() == sb.wait().unwrap(),
+            "the objects differ"
+        );
+        let bits = |l: Vec<(u64, f64)>| -> Vec<(u64, u64)> {
+            l.into_iter().map(|(e, l)| (e, l.to_bits())).collect()
+        };
+        let (la, lb) = (a.llk().unwrap().unwrap(), b.llk().unwrap().unwrap());
+        assert_eq!(bits(la), bits(lb));
+    }
+
+    /// An epoch that fails after the first of its two sweep replays, every
+    /// frame binned and counted, restarts: the retry discards the sums and
+    /// sweep cursor it left, and its begun LLK record, so two epochs after it are a clean run's two,
+    /// numbered from 0, and the failed one counts no epoch.
+    #[test]
+    fn an_epoch_failed_mid_sweep_restarts() {
+        let p = sim(64, 6, 36, 8.0);
+        let [mut failed, mut clean] = twin_runs(&p);
+        failed.bin().unwrap();
+        failed.count().unwrap();
+        let e = failed.sweep_and_update(|sweep| {
+            sweep.replay()?;
+            Err(GrowError::Failed)
+        });
+        assert!(matches!(e, Err(GrowError::Failed)), "{e:?}");
+        assert_eq!(failed.epochs(), 0);
+        for live in [&mut failed, &mut clean] {
+            for _ in 0..2 {
+                live.epoch().unwrap();
+            }
+        }
+        assert_eq!(failed.epochs(), 2);
+        same_runs(&mut failed, &mut clean);
+    }
+
+    /// Frames binned whose count did not follow are counted by the next
+    /// epoch, which reads their LLK as a clean run's.
+    #[test]
+    fn frames_binned_but_not_counted_are_counted_next() {
+        let p = sim(64, 6, 36, 8.0);
+        let [mut failed, mut clean] = twin_runs(&p);
+        failed.bin().unwrap();
+        for live in [&mut failed, &mut clean] {
+            live.epoch().unwrap();
+        }
+        same_runs(&mut failed, &mut clean);
     }
 
     /// Frames landed in uneven batches with epochs between, from graphs

@@ -23,7 +23,7 @@ use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{Context, DeviceBuffer, Event};
 
 use crate::gpu::{
-    C32, Ended, FrameLlk, FusedBufs, Kernels, LlkPartial, LlkRing, LlkTotals, ViewAddr,
+    C32, Ended, FrameLlk, FusedBufs, Kernels, LlkPartial, LlkRing, LlkTotals, RingError, ViewAddr,
 };
 use crate::live::fill::Fill;
 use crate::live::graph::LiveGraph;
@@ -78,6 +78,12 @@ struct State {
     binned: u32,
     /// Stacks per sweep replay.
     stacks: u32,
+}
+
+impl From<RingError> for DistError {
+    fn from(e: RingError) -> Self {
+        GrowError::from(e).into()
+    }
 }
 
 /// A region's record of each epoch's LLK over the frames it holds.
@@ -212,9 +218,10 @@ impl State {
         };
         // One writer for every record: the sweep graph pushes through it and the update
         // graph ends it.
+        let mut ended = None;
         let mut rec = bufs
             .as_mut()
-            .map(|(ring, partials)| (ring.device().record(), partials));
+            .map(|(ring, partials)| (ring.capture(&mut ended), partials));
         let sweep = {
             let llk = rec.as_mut().map(|(w, partials)| (w, &mut **partials));
             capture_sweep(&mut scan, k, stacks, &probe, &counts_view, &mut fused, llk)?
@@ -226,16 +233,15 @@ impl State {
                 k.obj_den_max(c, p.views, p.sums)
             })?
         };
-        let mut ended = None;
         let update = {
-            let (s, gmax, inertia, ended) = (&mut scan, &gmax, cfg.inertia, &mut ended);
+            let (s, gmax, inertia) = (&mut scan, &gmax, cfg.inertia);
             let w = rec.map(|(w, _)| w);
             LiveGraph::capture(&stream, move |c| {
                 let p = s.parts_mut();
                 k.normalize_obj(c, p.views, p.pixels, p.sums, gmax, inertia)?;
                 p.frames.rewind(c)?;
                 if let Some(w) = w {
-                    *ended = Some(w.end(c)?);
+                    w.end(c)?;
                 }
                 Ok(())
             })?
@@ -371,24 +377,25 @@ impl State {
                 .device()
                 .count(&ctx, binned..landed, &self.counts_view)?;
         }
-        for _ in 0..landed.div_ceil(nf).div_ceil(self.stacks) {
-            self.sweep.replay()?;
-        }
-        self.den.replay()?;
-        gpu.fence()?;
-        // SAFETY: each pull reads a region's `max_bits` word, written before the fence and
-        // rewritten only after the next epoch's first fence; every source of the max is then
-        // local, and the update graph reads `gmax` after it on this stream.
-        unsafe {
-            exchange::pull(&stream, &links.max)?;
-            self.ex
-                .max_u32(&stream, self.gmax.cu_deviceptr(), &links.max_srcs)?;
-        }
-        self.update.replay()?;
-        if let Some(l) = &mut self.llk {
-            l.ring
-                .enqueued(&ctx, &l.ended, epoch, landed)
-                .map_err(GrowError::from)?;
+        let mut launch = || -> Result<(), DistError> {
+            for _ in 0..landed.div_ceil(nf).div_ceil(self.stacks) {
+                self.sweep.replay()?;
+            }
+            self.den.replay()?;
+            gpu.fence()?;
+            // SAFETY: each pull reads a region's `max_bits` word, written before the fence
+            // and rewritten only after the next epoch's first fence; every source of the max
+            // is then local, and the update graph reads `gmax` after it on this stream.
+            unsafe {
+                exchange::pull(&stream, &links.max)?;
+                self.ex
+                    .max_u32(&stream, self.gmax.cu_deviceptr(), &links.max_srcs)?;
+            }
+            Ok(self.update.replay()?)
+        };
+        match &mut self.llk {
+            Some(l) => l.ring.replay(&ctx, &l.ended, epoch, landed, launch)?,
+            None => launch()?,
         }
         Ok(self.fence[(epoch % 2) as usize].record(&stream)?)
     }

@@ -4,9 +4,9 @@
 //! [`Device::set_features`], which drops every graph before and recaptures the LLK pass's
 //! after: a graph replays on the buffers the eager cycle would use, and other buffers mean
 //! another `Device`, or other features, which start with no graph. The device also owns the
-//! LLK ring and its count of records: a record is counted once per enqueued run of a cycle
-//! or pass that ended it, as the [`Ended`] its body returned shows, eagerly or kept from the
-//! capture of its graph.
+//! LLK ring, which counts a record once per enqueued run of a cycle or pass that ends one:
+//! an eager run through [`LlkRing::record`], a graph's replay through [`LlkRing::replay`]
+//! with the [`Ended`] its capture left.
 
 use std::marker::PhantomData;
 use std::ops::Range;
@@ -21,7 +21,7 @@ use crate::gpu::{
     Error as GpuError, ExitPass, ExitStage, FarSums, FrameWaves, FusedBufs, FusedInputs,
     GammaStacks, GradKernels, HalfWaves, Kernels, LlkPartial, LlkRing, LlkScratch, LlkTotals,
     MASKED, Model, OpticsKernels, PositionKernels, PositionPartial, Positions, PowerMax,
-    ProbeSpectrum, PsiSums, RingDevice, RpieKernels, ScalePartial, Shift, ShiftProbe, ShiftSums,
+    ProbeSpectrum, PsiSums, RecordWriter, RpieKernels, ScalePartial, Shift, ShiftProbe, ShiftSums,
     ShiftedProbeSums, SlicePhase, SliceSource, SpectrumBuf, StackRef, StackTable, StackWindows,
     UpdateSums, ViewAddr, ViewDims, Views, Waves, half_scale,
 };
@@ -208,6 +208,9 @@ pub(super) struct Device {
     /// another reading of the object: with or without the position model, and its sampling.
     lsqml: Option<Box<LsqmlState>>,
     features: FeatureBufs,
+    /// A call through [`Self::summing`] began adding to the update sums and failed before
+    /// consuming them; the next such call discards what it left.
+    begun: bool,
     /// How a position's offsets enter the exit waves. Every state and graph built under a
     /// position model was built under it: [`Self::set_sampling`] drops the others.
     sampling: Sampling,
@@ -259,6 +262,22 @@ impl FeatureBufs {
             && solve.is_none()
         {
             *solve = Some(Box::new(ObjectSolve::new(stream, sampler)?));
+        }
+        Ok(())
+    }
+
+    /// Zeroes the sums the passes add to across stacks; the per-frame ones each pass
+    /// overwrites.
+    fn clear_sums(&mut self, ctx: &ExecutionContext) -> Result<(), GpuError> {
+        if let Some(sums) = self.background.as_mut().and_then(|b| b.sums.as_mut()) {
+            sums.clear(ctx)?;
+        }
+        if let Some(PositionBufs {
+            mover: Mover::Probe { probe_sums, .. },
+            ..
+        }) = &mut self.position
+        {
+            probe_sums.clear(ctx)?;
         }
         Ok(())
     }
@@ -1723,7 +1742,7 @@ struct EpochRun {
     graph: Option<Captured>,
 }
 
-/// A graph and the record its body ended when captured, if any: each replay ends it again.
+/// A graph and, if its body ended a record when captured, the [`Ended`] each replay counts.
 struct Captured {
     graph: CudaGraph<()>,
     ended: Option<Ended>,
@@ -1771,6 +1790,14 @@ enum Cycle {
 }
 
 impl Cycle {
+    /// Whether each cycle ends an LLK record.
+    fn records(&self) -> bool {
+        matches!(
+            self,
+            Self::Ap { llk: true, .. } | Self::Ml { llk: true, .. }
+        )
+    }
+
     fn epoch(&self) -> Epoch {
         match *self {
             Self::Ap { params, llk, .. } => Epoch::Ap { params, llk },
@@ -2555,6 +2582,7 @@ impl Device {
             bh_state: None,
             lsqml: None,
             features: FeatureBufs::default(),
+            begun: false,
             sampling,
             stream,
         };
@@ -2567,8 +2595,8 @@ impl Device {
     /// With graphs, captures the LLK pass's graph.
     fn capture_llk(&mut self) -> Result<(), EngineError> {
         if self.use_graph {
-            self.llk_graph = Some(self.capture(|bufs, passes, ring, ctx| {
-                bufs.forward_llk(ctx, passes, ring.record()).map(Some)
+            self.llk_graph = Some(self.capture(|bufs, passes, ring, ended, ctx| {
+                bufs.forward_llk(ctx, passes, ring.capture(ended))
             })?);
         }
         Ok(())
@@ -2881,7 +2909,7 @@ impl Device {
 
     /// Lends every buffer, and apart the passes' own and the ring the cycle writes its records
     /// through.
-    fn lend(&mut self) -> (Bufs<'_>, PassesMut<'_>, &mut RingDevice) {
+    fn lend(&mut self) -> (Bufs<'_>, PassesMut<'_>, &mut LlkRing<Tag>) {
         let (deeper, slices) = match self.slices.as_mut() {
             Some(s) => {
                 let slices = SlicesMut {
@@ -2950,7 +2978,7 @@ impl Device {
             }),
             Passes::Fused(f) => PassesMut::Fused(f),
         };
-        (bufs, passes, self.ring.device())
+        (bufs, passes, &mut self.ring)
     }
 
     /// Enqueues one `epoch` cycle, numbered `cycle`: replays the graph captured for it, or
@@ -3060,17 +3088,18 @@ impl Device {
             stage(self)?;
             let run = &mut runs[at];
             let tag = Some((cycle, epoch.algorithm()));
-            match &run.graph {
-                Some(c) => self.replay(c, tag),
+            self.summing(|dev| match &run.graph {
+                Some(c) => dev.replay(c, tag),
                 None => {
-                    let ctx = self.context();
-                    let (mut bufs, mut passes, ring) = self.lend();
-                    match bufs.cycle(&ctx, &mut passes, ring, &mut run.cycle) {
-                        Ok(ended) => self.count(ended.as_ref(), tag),
-                        Err(e) => Err(e.into()),
-                    }
+                    let (ctx, nframe) = (dev.context(), dev.dims().nframe);
+                    let records = run.cycle.records();
+                    let (mut bufs, mut passes, ring) = dev.lend();
+                    let llk = records
+                        .then(|| ring.record(&ctx, tag, nframe))
+                        .transpose()?;
+                    Ok(bufs.cycle(&ctx, &mut passes, llk, &mut run.cycle)?)
                 }
-            }
+            })
         });
         self.runs = runs;
         done
@@ -3083,12 +3112,11 @@ impl Device {
         let done = match &graph {
             Some(c) => self.replay(c, tag),
             None => {
-                let ctx = self.context();
+                let (ctx, nframe) = (self.context(), self.dims().nframe);
                 let (mut bufs, mut passes, ring) = self.lend();
-                match bufs.forward_llk(&ctx, &mut passes, ring.record()) {
-                    Ok(ended) => self.count(Some(&ended), tag),
-                    Err(e) => Err(e.into()),
-                }
+                ring.record(&ctx, tag, nframe)
+                    .map_err(EngineError::from)
+                    .and_then(|rec| Ok(bufs.forward_llk(&ctx, &mut passes, rec)?))
             }
         };
         self.llk_graph = graph;
@@ -3155,7 +3183,10 @@ impl Device {
             }
         };
         let graph = if self.use_graph {
-            Some(self.capture(|bufs, passes, ring, ctx| bufs.cycle(ctx, passes, ring, &mut cycle))?)
+            Some(self.capture(|bufs, passes, ring, ended, ctx| {
+                let llk = cycle.records().then(|| ring.capture(ended));
+                bufs.cycle(ctx, passes, llk, &mut cycle)
+            })?)
         } else {
             None
         };
@@ -3307,8 +3338,8 @@ impl Device {
     }
 
     /// [`Bufs::ml_grad`] for `update` (object, probe), then `read` on the stream and the update
-    /// sums' numerators it leaves, object then probe. The sums are zeroed after `read`, or after
-    /// a pass or `read` that failed, so none is left for the next pass to add to.
+    /// sums' numerators it leaves, object then probe. The sums are zeroed after `read`; a pass or
+    /// `read` that failed leaves them for [`Self::summing`] to discard before the next adds.
     fn ml_grad_sums<R>(
         &mut self,
         update: [bool; 2],
@@ -3316,66 +3347,77 @@ impl Device {
     ) -> Result<R, EngineError> {
         let one = self.one_slice("ML's gradient")?;
         self.unitary("ML's gradient")?;
-        let ran = {
-            let ctx = self.context();
-            let (mut bufs, mut passes, _) = self.lend();
-            bufs.ml_grad(&ctx, &mut passes, update, None, one)
-        };
-        let read = match ran {
-            Ok(_) => read(&self.stream, [&self.obj_sums.num, &self.probe_sums.num]),
-            Err(e) => Err(e.into()),
-        };
-        let ctx = self.context();
-        let zeroed = [&mut self.obj_sums, &mut self.probe_sums]
-            .into_iter()
-            .try_for_each(|sums| {
-                crate::gpu::zero(&ctx, &mut sums.num)?;
-                crate::gpu::zero(&ctx, &mut sums.den)
-            });
-        let read = read?;
-        zeroed?;
-        Ok(read)
+        self.summing(|dev| {
+            {
+                let ctx = dev.context();
+                let (mut bufs, mut passes, _) = dev.lend();
+                bufs.ml_grad(&ctx, &mut passes, update, None, one)?;
+            }
+            let r = read(&dev.stream, [&dev.obj_sums.num, &dev.probe_sums.num])?;
+            let ctx = dev.context();
+            dev.zero_sums(&ctx)?;
+            Ok(r)
+        })
     }
 
-    /// `f` on the lent buffers, captured on a side stream, so nothing runs; with the record
-    /// it ended.
+    /// `f`, which adds to the update sums and consumes them, from zero sums: a call that
+    /// failed before consuming them leaves them begun, and this discards them first, so a
+    /// retry restarts the work rather than adding to what the failed call left.
+    fn summing<R>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> Result<R, EngineError>,
+    ) -> Result<R, EngineError> {
+        if self.begun {
+            let ctx = self.context();
+            self.zero_sums(&ctx)?;
+            self.features.clear_sums(&ctx)?;
+        }
+        self.begun = true;
+        let r = f(self)?;
+        self.begun = false;
+        Ok(r)
+    }
+
+    fn zero_sums(&mut self, ctx: &ExecutionContext) -> Result<(), GpuError> {
+        for sums in [&mut self.obj_sums, &mut self.probe_sums] {
+            crate::gpu::zero(ctx, &mut sums.num)?;
+            crate::gpu::zero(ctx, &mut sums.den)?;
+        }
+        Ok(())
+    }
+
+    /// `f` on the lent buffers, captured on a side stream, so nothing runs; with the
+    /// [`Ended`] its record's end left in the slot `f` is lent, if it ended one through
+    /// [`LlkRing::capture`].
     fn capture(
         &mut self,
         f: impl FnOnce(
             &mut Bufs<'_>,
             &mut PassesMut<'_>,
-            &mut RingDevice,
+            &mut LlkRing<Tag>,
+            &mut Option<Ended>,
             &ExecutionContext,
-        ) -> Result<Option<Ended>, GpuError>
+        ) -> Result<(), GpuError>
         + Send,
     ) -> Result<Captured, EngineError> {
         let side = self.kernels.context().new_stream()?;
         let (mut bufs, mut passes, ring) = self.lend();
         let mut ended = None;
-        let op = crate::gpu::record(|ctx| {
-            ended = Some(f(&mut bufs, &mut passes, ring, ctx)?);
-            Ok(())
-        });
+        let op = crate::gpu::record(|ctx| f(&mut bufs, &mut passes, ring, &mut ended, ctx));
         let graph = CudaGraph::capture(side, op).map_err(GpuError::from)?;
-        let ended = ended.expect("a capture that succeeded ran its body once");
         Ok(Captured { graph, ended })
     }
 
-    /// Enqueues `c`'s graph on the stream and counts the record it ends, if any, under `tag`.
+    /// Enqueues `c`'s graph on the stream, counting the record it ends, if any, under `tag`.
     fn replay(&mut self, c: &Captured, tag: Tag) -> Result<(), EngineError> {
+        let (ctx, nframe) = (self.context(), self.dims().nframe);
         // SAFETY: the context holds the replay's leases on every captured buffer until the
         // stream has run it, so no other stream can touch them meanwhile.
-        unsafe { c.graph.launch().execute(&self.context()) }.map_err(GpuError::from)?;
-        self.count(c.ended.as_ref(), tag)
-    }
-
-    /// Counts under `tag` the record a run just enqueued ended, if it ended one.
-    fn count(&mut self, ended: Option<&Ended>, tag: Tag) -> Result<(), EngineError> {
-        if let Some(ended) = ended {
-            let nframe = self.dims().nframe;
-            self.ring.enqueued(&self.context(), ended, tag, nframe)?;
+        let launch = || Ok(unsafe { c.graph.launch().execute(&ctx) }.map_err(GpuError::from)?);
+        match &c.ended {
+            Some(ended) => self.ring.replay(&ctx, ended, tag, nframe, launch),
+            None => launch(),
         }
-        Ok(())
     }
 }
 
@@ -3410,38 +3452,125 @@ impl<'a> Bufs<'a> {
         r
     }
 
-    /// One cycle of `cycle` enqueued on `ctx`, and the LLK record it ends: an AP cycle with
-    /// `llk` writes one through `ring`, no other cycle touches it.
+    /// One cycle of `cycle` enqueued on `ctx`; `llk`, given when [`Cycle::records`], is the
+    /// record it writes and ends, which no other cycle touches.
     fn cycle(
         &mut self,
         ctx: &ExecutionContext,
         passes: &mut PassesMut<'_>,
-        ring: &mut RingDevice,
+        llk: Option<RecordWriter<'_, Tag>>,
         cycle: &mut Cycle,
-    ) -> Result<Option<Ended>, GpuError> {
+    ) -> Result<(), GpuError> {
         match cycle {
-            Cycle::Ap { params, llk, one } => {
-                self.ap_cycle(ctx, passes, params, llk.then(|| ring.record()), *one)
+            Cycle::Ap { params, one, .. } => self.ap_cycle(ctx, passes, params, llk, *one),
+            Cycle::Dm { params, first, one } => {
+                self.with_carried(|b, c| b.dm_cycle(ctx, passes, c, params, *first, *one))
             }
-            Cycle::Dm { params, first, one } => self
-                .with_carried(|b, c| b.dm_cycle(ctx, passes, c, params, *first, *one))
-                .map(|()| None),
-            Cycle::Raar { params, first, one } => self
-                .with_carried(|b, c| b.raar_cycle(ctx, passes, c, params, *first, *one))
-                .map(|()| None),
+            Cycle::Raar { params, first, one } => {
+                self.with_carried(|b, c| b.raar_cycle(ctx, passes, c, params, *first, *one))
+            }
             Cycle::Rpie(p, scratch) => {
                 let (mut rb, moved) = scratch.lend();
-                self.rpie_epoch(ctx, p, &mut rb, moved).map(|()| None)
+                self.rpie_epoch(ctx, p, &mut rb, moved)
             }
-            Cycle::Ml { params, first, llk } => self.with_ml(|b, ml| {
-                b.ml_epoch(ctx, passes, ml, params, *first, llk.then(|| ring.record()))
+            Cycle::Ml { params, first, .. } => {
+                self.with_ml(|b, ml| b.ml_epoch(ctx, passes, ml, params, *first, llk))
+            }
+            Cycle::Bh { params, cg } => {
+                self.with_bh(|b, bh| b.bh_epoch(ctx, passes, bh, params, *cg))
+            }
+            Cycle::Lsqml { params, pre } => self.lsqml_epoch(ctx, passes, params, *pre),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::base::required_obj_shape;
+    use crate::base::{C64, Counts, Geometry, Object, Positions, Probe, Scan, Stack};
+    use crate::engine::{Backend, GpuPtycho, Params, Step};
+    use crate::live::farfield::{Ptycho, PtychoSpec, ScanPath};
+
+    /// An engine on a simulated 32-pixel raster of 36 points, its object flat.
+    fn engine(ctx: &Arc<CudaContext>, graph: bool) -> GpuPtycho {
+        let n = 32;
+        let p = Ptycho::new(PtychoSpec {
+            n,
+            path: ScanPath::Raster { cols: 6 },
+            points: 36,
+            step: 6.0,
+            photons: 1e6,
+            seed: 5,
+            wavelength: 1.5498e-10,
+            distance: 5.0,
+            det_pixel: 75e-6,
+        });
+        let s = p.spec();
+        let g = Geometry::new(s.wavelength, s.distance, s.det_pixel, [n, n]).unwrap();
+        let (x, y): (Vec<f64>, Vec<f64>) = (0..p.points()).map(|k| p.position(k)).unzip();
+        let counts = (0..p.points()).flat_map(|k| p.frame(k)).collect();
+        let scan = Scan::new(
+            g,
+            Positions::new(y, x).unwrap(),
+            Counts::from_raw([p.points(), n, n], counts).unwrap(),
+        )
+        .unwrap();
+        let pixel = g.pixel_size_object();
+        let obj = required_obj_shape(&scan.positions.pynx_preprocess(pixel), pixel, [n, n], 0);
+        let object = Object::new(Stack::filled([1, obj[0], obj[1]], C64::new(1.0, 0.0)));
+        let probe = p.probe().iter().map(|c| C64::new(c.re.into(), c.im.into()));
+        let probe = Probe::new(Stack::from_vec([2, n, n], probe.collect()).unwrap());
+        let options = GpuOptions {
+            stack_size: Some(8),
+            graph,
+            llk_slots: 4,
+            fused: false,
+            psi_f16: false,
+        };
+        GpuPtycho::new(ctx, &scan, object, probe, options).unwrap()
+    }
+
+    /// What a call through [`Device::summing`] added to the update sums before failing never
+    /// reaches the next: AP cycles after it, launched or replayed, are bit for bit those of
+    /// an engine it never ran on.
+    #[test]
+    fn a_failed_summing_call_leaves_its_retry_no_sums() {
+        let ctx = CudaContext::new(0).expect("GPU 0");
+        let step = Step {
+            params: Params::Ap(ApParams {
+                obj_inertia: Some(0.01),
+                probe_inertia: Some(0.01),
+                calc_llk: 1,
+                zero_phase_ramp: false,
             }),
-            Cycle::Bh { params, cg } => self
-                .with_bh(|b, bh| b.bh_epoch(ctx, passes, bh, params, *cg))
-                .map(|()| None),
-            Cycle::Lsqml { params, pre } => {
-                self.lsqml_epoch(ctx, passes, params, *pre).map(|()| None)
+            count: 2,
+        };
+        for graph in [false, true] {
+            let [mut failed, mut clean] = [(); 2].map(|()| engine(&ctx, graph));
+            let r = failed.dev.summing(|dev| {
+                for sums in [&mut dev.obj_sums, &mut dev.probe_sums] {
+                    let num = vec![C32 { re: 1.0, im: 1.0 }; sums.num.len()];
+                    sums.num.copy_from_host(&dev.stream, &num)?;
+                    sums.den
+                        .copy_from_host(&dev.stream, &vec![1.0; sums.den.len()])?;
+                }
+                Err::<(), _>(EngineError::Invalid("injected".into()))
+            });
+            assert!(matches!(r, Err(EngineError::Invalid(_))), "{graph}");
+            for e in [&mut failed, &mut clean] {
+                e.run(&step).unwrap();
             }
+            let bits = |e: &GpuPtycho| {
+                let (o, p) = (e.object().unwrap(), e.probe().unwrap());
+                let llk = e.history().iter().map(|r| r.llk.poisson.to_bits());
+                let px = o.as_slice().iter().chain(p.as_slice());
+                let px = px.flat_map(|c| [c.re.to_bits(), c.im.to_bits()]);
+                (px.collect::<Vec<_>>(), llk.collect::<Vec<_>>())
+            };
+            let (f, c) = (bits(&failed), bits(&clean));
+            assert_eq!(f.1.len(), 2, "{graph}");
+            assert!(f == c, "graph {graph}: the retry differs from a clean run");
         }
     }
 }

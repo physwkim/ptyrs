@@ -9,7 +9,7 @@ use std::sync::Arc;
 use crate::base::{C64, Stack};
 use crate::gpu::sampling::{Modes, WindowBlock, window_views};
 use crate::gpu::{
-    C32, CG_BLOCKS, Ended, Error as GpuError, Exit, FarSums, FusedBufs, FusedInputs, FusedSums,
+    C32, CG_BLOCKS, Error as GpuError, Exit, FarSums, FusedBufs, FusedInputs, FusedSums,
     GammaCounts, Kernels, Model, PositionKernels, RecordWriter, Shift, ShiftProbe, SpectrumBuf,
     ViewDims, Views,
 };
@@ -18,7 +18,7 @@ use cuda_core::{CudaStream, DeviceBuffer};
 
 use super::device::{M1Bufs, MlBufs, OneSlice, PassesMut, Sample};
 use super::propagate::Propagate;
-use super::{Bufs, Cut, Epoch, GpuPtycho, plane_len};
+use super::{Bufs, Cut, Epoch, GpuPtycho, Tag, plane_len};
 use crate::engine::ptycho::llk_due;
 use crate::engine::{EngineError, MlParams};
 
@@ -165,26 +165,25 @@ impl Bufs<'_> {
         ml: &mut MlBufs<'_>,
         params: &MlParams,
         first: bool,
-        mut llk: Option<RecordWriter<'_>>,
-    ) -> Result<Option<Ended>, GpuError> {
+        mut llk: Option<RecordWriter<'_, Tag>>,
+    ) -> Result<(), GpuError> {
         let (update, one) = ([params.update_object, params.update_probe], ml.one);
         if first {
             for b in ml.h.iter_mut().chain(ml.d.iter_mut()) {
                 crate::gpu::zero(ctx, b)?;
             }
         }
-        let stepped = match passes {
-            PassesMut::Fused(f) if self.features.stepped() => {
-                self.step_features(ctx, f, llk.take(), one)?
-            }
-            _ => None,
-        };
+        if let PassesMut::Fused(f) = passes
+            && self.features.stepped()
+        {
+            self.step_features(ctx, f, llk.take(), one)?;
+        }
         if let PassesMut::Fused(f) = passes
             && self.features.position_refined()
         {
             self.projected_position_sums(ctx, f, one)?;
         }
-        let ended = self.ml_grad(ctx, passes, update, llk, one)?.or(stepped);
+        self.ml_grad(ctx, passes, update, llk, one)?;
 
         // β from the gradients in the sums and the last ones in h (then h = g), and d.
         let lens = [self.obj_len, self.probe_len];
@@ -321,7 +320,7 @@ impl Bufs<'_> {
             }
         }
         self.features.position_step(ctx, self.grad)?;
-        Ok(ended)
+        Ok(())
     }
 
     /// Each frame's position sums of the estimate under the model, from the AP projection of
@@ -378,15 +377,15 @@ impl Bufs<'_> {
     /// The Poisson gradients of the estimate into the update sums' `num` (object, probe, as
     /// `update` asks), stack by stack, with the LLK partials into `llk` if given; by the
     /// fused passes' [`Exit::Grad`] or by M1's launches (which model no features), as
-    /// `passes` holds. Returns the ended record.
+    /// `passes` holds, then ends that record.
     pub(super) fn ml_grad(
         &mut self,
         ctx: &ExecutionContext,
         passes: &mut PassesMut<'_>,
         update: [bool; 2],
-        mut llk: Option<RecordWriter<'_>>,
+        mut llk: Option<RecordWriter<'_, Tag>>,
         one: OneSlice,
-    ) -> Result<Option<Ended>, GpuError> {
+    ) -> Result<(), GpuError> {
         match passes {
             PassesMut::Fused(f) => self.fused_grad(ctx, f, update, llk.as_mut(), one)?,
             PassesMut::M1(m1) => {
@@ -395,7 +394,10 @@ impl Bufs<'_> {
                 }
             }
         }
-        llk.map(|w| w.end(ctx)).transpose()
+        if let Some(w) = llk {
+            w.end(ctx)?;
+        }
+        Ok(())
     }
 
     /// The stacks of [`Self::ml_grad`] by one fused pass each; with a position, the shifted
@@ -407,7 +409,7 @@ impl Bufs<'_> {
         ctx: &ExecutionContext,
         f: &mut FusedBufs,
         update: [bool; 2],
-        mut llk: Option<&mut RecordWriter<'_>>,
+        mut llk: Option<&mut RecordWriter<'_, Tag>>,
         one: OneSlice,
     ) -> Result<(), GpuError> {
         let dims = *self.views.dims();
@@ -483,7 +485,7 @@ impl Bufs<'_> {
         m1: &mut M1Bufs<'_>,
         s: usize,
         update: [bool; 2],
-        llk: Option<&mut RecordWriter<'_>>,
+        llk: Option<&mut RecordWriter<'_, Tag>>,
     ) -> Result<(), GpuError> {
         let dims = *self.views.dims();
         let stack = self.scratch.at(s);

@@ -128,8 +128,7 @@ impl Bufs<'_> {
             PassesMut::Fused(f) => {
                 summed = c.loops > 0 && obj_inertia.is_some();
                 if self.features.stepped() {
-                    // No record, so nothing ended.
-                    let _ = self.step_features(ctx, f, None, c.one)?;
+                    self.step_features(ctx, f, None, c.one)?;
                 }
                 let dims = *self.views.dims();
                 let mut m = (self.features)
