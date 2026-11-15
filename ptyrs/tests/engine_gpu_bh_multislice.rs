@@ -1,20 +1,22 @@
 //! GPU BH through a multislice object against the CPU's `f64` [`Bh`] from the same start: two
 //! and three slices under each of the far field, the angular spectrum and the Fresnel
 //! transform forward and back, and three slices of two object modes, without a position and
-//! with one that samples the object, refined or held; and its refusal of a position that moves
-//! the probe.
+//! with one that samples the object, refined or held; with one that moves the probe, refined in
+//! a case per boundary of its kernels and held in one; and a run with a position under the
+//! sampling the engine picks.
 //! Frames are on the fused passes' smallest side, two incoherent probe modes, 30 Fermat
 //! positions in stacks of at most 8, so a batch of 12 ends in a stack of 4.
 
+use std::f64::consts::PI;
 use std::sync::Arc;
 
 use cuda_core::CudaContext;
 use ptyrs::base::{
-    AddrTable, C64, Counts, Geometry, Object, Probe, Scan, Stack, required_obj_shape,
+    AddrTable, C64, Counts, Geometry, Object, Probe, Scan, Stack, View, required_obj_shape,
 };
 use ptyrs::engine::{
-    Bh, BhParams, BhStep, Feature, Features, GpuOptions, GpuPtycho, Observed, Optics, Sampling,
-    SliceWaves, Wavefield, llk, shift,
+    Bh, BhParams, BhStep, Feature, Features, Fft2, GpuOptions, GpuPtycho, Observed, Optics,
+    Sampling, SliceWaves, Wavefield, llk, shift,
 };
 use ptyrs::gpu::FUSED_SIDES;
 
@@ -178,11 +180,30 @@ impl Case {
         .unwrap()
     }
 
-    /// The CPU's normalised Poisson LLK of `objects` and `probe`, with `offsets` under
-    /// [`Sampling::FullObject`].
-    fn llk(&self, objects: &[Object], probe: &Probe, offsets: Option<&[[f64; 2]]>) -> f64 {
-        let (nframe, nmode, views) = (self.addr.nframe(), self.addr.nmode(), self.addr.views());
-        let sampling = Sampling::FullObject;
+    /// The CPU's normalised Poisson LLK of `objects` and `probe`, with `offsets` as `sampling`
+    /// models them: under [`Sampling::Patch`] each frame reads its own planes of
+    /// [`moved_probe`].
+    fn llk(
+        &self,
+        objects: &[Object],
+        probe: &Probe,
+        offsets: Option<&[[f64; 2]]>,
+        sampling: Sampling,
+    ) -> f64 {
+        let (nframe, nmode) = (self.addr.nframe(), self.addr.nmode());
+        let moved = offsets.filter(|_| sampling == Sampling::Patch).map(|d| {
+            let views: Vec<View> = (self.addr.views().iter())
+                .map(|v| View {
+                    probe: v.frame * NPROBE as u32 + v.probe,
+                    ..*v
+                })
+                .collect();
+            (moved_probe(probe, d), views)
+        });
+        let (probe, views) = match &moved {
+            Some((p, v)) => (p, &v[..]),
+            None => (probe, self.addr.views()),
+        };
         let waves =
             SliceWaves::with_sampling(&self.optics, views, objects, probe, offsets, sampling);
         let mut psi = waves.psi().to_vec();
@@ -235,11 +256,31 @@ fn step_err(got: &[BhStep], want: &[BhStep]) -> f64 {
     worst
 }
 
-fn bits(s: &Stack<C64>) -> Vec<[u64; 2]> {
-    s.as_slice()
-        .iter()
-        .map(|v| [v.re.to_bits(), v.im.to_bits()])
-        .collect()
+/// `probe`'s planes moved by each entry of `offsets` (`[dy, dx]` pixels) in turn, as BH's
+/// position model moves them ahead of the first of two or more slices, which applies no plane
+/// phase: `DFT⁻¹(DFT(p)·exp(−2πi f·offset))`.
+fn moved_probe(probe: &Probe, offsets: &[[f64; 2]]) -> Probe {
+    let fft = Fft2::new([FRAME, FRAME]);
+    let freq = |i: usize| {
+        (if i < FRAME / 2 {
+            i as f64
+        } else {
+            i as f64 - FRAME as f64
+        }) / FRAME as f64
+    };
+    let mut planes = Vec::with_capacity(offsets.len() * probe.as_slice().len());
+    for d in offsets {
+        let mut w = probe.as_slice().to_vec();
+        fft.forward(&mut w);
+        for (j, w) in w.iter_mut().enumerate() {
+            let (fy, fx) = (freq(j % (FRAME * FRAME) / FRAME), freq(j % FRAME));
+            *w *= C64::from_polar(1.0, -2.0 * PI * (fy * d[0] + fx * d[1]));
+        }
+        fft.inverse(&mut w);
+        planes.extend(w);
+    }
+    let dims = [offsets.len() * NPROBE, FRAME, FRAME];
+    Probe::new(Stack::from_vec(dims, planes).unwrap())
 }
 
 /// Offsets drawn about their mean, up to 0.4 pixel per axis.
@@ -282,12 +323,18 @@ fn offsets_rel(a: &Features, b: &Features, start: &Features) -> f64 {
 /// steps, every slice, the probe, the LLK the GPU records after it and, with `position`, the
 /// offsets' changes are the CPU's, for `propagator` after each of `nslices` slices of `nobj`
 /// modes: in one batch of every frame (CG from the second epoch) and in batches of 12, the
-/// last of 6. A `position` refines or holds drawn offsets under [`Sampling::FullObject`];
-/// held, they keep the bits they were set with.
-fn matches_cpu(propagator: &str, nslices: &[usize], nobj: usize, position: Option<Feature<()>>) {
+/// last of 6. A `position` refines or holds drawn offsets under its sampling; held, they keep
+/// the bits they were set with.
+fn matches_cpu(
+    propagator: &str,
+    nslices: &[usize],
+    nobj: usize,
+    position: Option<Feature<Sampling>>,
+) {
     const NEPOCH: usize = 3;
+    let sampling = position.map_or(Sampling::FullObject, |d| d.values);
     let features = Features {
-        position: position.map(|d| d.map(|()| drawn_offsets(NPOS))),
+        position: position.map(|d| d.map(|_| drawn_offsets(NPOS))),
         ..Features::default()
     };
     let named = match &features.position {
@@ -301,7 +348,7 @@ fn matches_cpu(propagator: &str, nslices: &[usize], nobj: usize, position: Optio
             let p = params(batch_size);
             let mut bh = Bh::new(p)
                 .unwrap()
-                .with_sampling(Sampling::FullObject)
+                .with_sampling(sampling)
                 .with_features(features.clone())
                 .unwrap();
             let (mut objects, mut probe) = (c.objects.clone(), c.probe.clone());
@@ -309,6 +356,7 @@ fn matches_cpu(propagator: &str, nslices: &[usize], nobj: usize, position: Optio
                 &objects,
                 &probe,
                 features.position.as_ref().map(|d| &d.values[..]),
+                sampling,
             );
             let mut steps = Vec::new();
             for _ in 0..NEPOCH {
@@ -318,16 +366,17 @@ fn matches_cpu(propagator: &str, nslices: &[usize], nobj: usize, position: Optio
                 &objects,
                 &probe,
                 bh.features().position.as_ref().map(|d| &d.values[..]),
+                sampling,
             );
             for graph in [false, true] {
                 let what = format!(
-                    "{propagator} {nslice} slices {nobj} modes {named} batch {batch_size} \
-                     graph {graph}"
+                    "{propagator} {nslice} slices {nobj} modes {named} {sampling:?} batch \
+                     {batch_size} graph {graph}"
                 );
                 let mut gpu = c.gpu(GpuOptions { graph, ..OPTIONS });
                 if features.position.is_some() {
                     gpu.set_features(&features).unwrap();
-                    gpu.set_sampling(Sampling::FullObject).unwrap();
+                    gpu.set_sampling(sampling).unwrap();
                 }
                 let set = gpu.features().unwrap().position;
                 gpu.bh(&p, NEPOCH, 1).unwrap();
@@ -357,7 +406,10 @@ fn matches_cpu(propagator: &str, nslices: &[usize], nobj: usize, position: Optio
                 // back, two slices, batches of 12), 9.4e-8, 1.6e-6 (far field, three slices of
                 // two modes) and offsets 1.9e-5 (Fresnel, three slices). Held: 6.5e-5 (far
                 // field, three slices: a CG step at β 11 as the LLK rises, which a refined
-                // position at a zero rho matches bit for bit), 2.8e-7, 8.9e-8 and 1.9e-6.
+                // position at a zero rho matches bit for bit), 2.8e-7, 8.9e-8 and 1.9e-6. Moving
+                // the probe: 2.3e-5 (Fresnel back), 2.3e-7 (the same in batches of 12), 8.4e-8
+                // (far field, two object modes, batches of 12), 2.7e-6 (Fresnel back) and
+                // offsets 1.5e-5 (Fresnel back, batches of 12).
                 let bounds = [
                     ("step", 2e-4),
                     ("objects", 1e-6),
@@ -412,73 +464,157 @@ fn sliced_bh_with_object_modes_matches_cpu_under_fresnel() {
 /// A position that samples the object: every slice's windows.
 #[test]
 fn sliced_full_object_bh_matches_cpu_in_the_far_field() {
-    matches_cpu(PROPAGATORS[0], &[2, 3], 1, Some(Feature::refined(())));
+    matches_cpu(
+        PROPAGATORS[0],
+        &[2, 3],
+        1,
+        Some(Feature::refined(Sampling::FullObject)),
+    );
 }
 
 #[test]
 fn sliced_full_object_bh_matches_cpu_under_angular_spectrum() {
-    matches_cpu(PROPAGATORS[1], &[2, 3], 1, Some(Feature::refined(())));
+    matches_cpu(
+        PROPAGATORS[1],
+        &[2, 3],
+        1,
+        Some(Feature::refined(Sampling::FullObject)),
+    );
 }
 
 #[test]
 fn sliced_full_object_bh_matches_cpu_under_fresnel() {
-    matches_cpu(PROPAGATORS[2], &[2, 3], 1, Some(Feature::refined(())));
+    matches_cpu(
+        PROPAGATORS[2],
+        &[2, 3],
+        1,
+        Some(Feature::refined(Sampling::FullObject)),
+    );
 }
 
 #[test]
 fn sliced_full_object_bh_matches_cpu_under_fresnel_back() {
-    matches_cpu(PROPAGATORS[3], &[2, 3], 1, Some(Feature::refined(())));
+    matches_cpu(
+        PROPAGATORS[3],
+        &[2, 3],
+        1,
+        Some(Feature::refined(Sampling::FullObject)),
+    );
 }
 
 #[test]
 fn sliced_full_object_bh_with_object_modes_matches_cpu_in_the_far_field() {
-    matches_cpu(PROPAGATORS[0], &[3], 2, Some(Feature::refined(())));
+    matches_cpu(
+        PROPAGATORS[0],
+        &[3],
+        2,
+        Some(Feature::refined(Sampling::FullObject)),
+    );
 }
 
 #[test]
 fn sliced_full_object_bh_with_object_modes_matches_cpu_under_fresnel() {
-    matches_cpu(PROPAGATORS[2], &[3], 2, Some(Feature::refined(())));
+    matches_cpu(
+        PROPAGATORS[2],
+        &[3],
+        2,
+        Some(Feature::refined(Sampling::FullObject)),
+    );
 }
 
 /// The position held: only the windows themselves, and no offsets' step.
 #[test]
 fn sliced_full_object_bh_held_matches_cpu_in_the_far_field() {
-    matches_cpu(PROPAGATORS[0], &[2, 3], 1, Some(Feature::held(())));
+    matches_cpu(
+        PROPAGATORS[0],
+        &[2, 3],
+        1,
+        Some(Feature::held(Sampling::FullObject)),
+    );
 }
 
 #[test]
 fn sliced_full_object_bh_held_matches_cpu_under_fresnel_back() {
-    matches_cpu(PROPAGATORS[3], &[2, 3], 1, Some(Feature::held(())));
+    matches_cpu(
+        PROPAGATORS[3],
+        &[2, 3],
+        1,
+        Some(Feature::held(Sampling::FullObject)),
+    );
 }
 
 #[test]
 fn sliced_full_object_bh_held_with_object_modes_matches_cpu_in_the_far_field() {
-    matches_cpu(PROPAGATORS[0], &[3], 2, Some(Feature::held(())));
+    matches_cpu(
+        PROPAGATORS[0],
+        &[3],
+        2,
+        Some(Feature::held(Sampling::FullObject)),
+    );
 }
 
-/// BH with a position that moves the probe through more than one slice fails before it
-/// launches anything, naming the cause and changing nothing.
+/// A position that moves the probe, one case per boundary of its kernels: the far field's
+/// quad through two deeper slices and two object modes.
 #[test]
-fn sliced_bh_refuses_the_position_model() {
+fn sliced_patch_bh_with_object_modes_matches_cpu_in_the_far_field() {
+    matches_cpu(
+        PROPAGATORS[0],
+        &[3],
+        2,
+        Some(Feature::refined(Sampling::Patch)),
+    );
+}
+
+/// A negative Fresnel quad.
+#[test]
+fn sliced_patch_bh_matches_cpu_under_fresnel_back() {
+    matches_cpu(
+        PROPAGATORS[3],
+        &[3],
+        1,
+        Some(Feature::refined(Sampling::Patch)),
+    );
+}
+
+/// No quad, so the last slice's phase adds nothing to the offsets' gradient and Hessian: the
+/// probe move alone, through one deeper slice.
+#[test]
+fn sliced_patch_bh_matches_cpu_under_angular_spectrum() {
+    matches_cpu(
+        PROPAGATORS[1],
+        &[2],
+        1,
+        Some(Feature::refined(Sampling::Patch)),
+    );
+}
+
+/// The same offsets held: they move the probe into the waves, only the slices and the probe
+/// step.
+#[test]
+fn sliced_patch_bh_held_matches_cpu_in_the_far_field() {
+    matches_cpu(
+        PROPAGATORS[0],
+        &[3],
+        1,
+        Some(Feature::held(Sampling::Patch)),
+    );
+}
+
+/// BH with a position through more than one slice runs under the sampling the engine picks,
+/// [`Sampling::Patch`] in the far field, and moves the offsets.
+#[test]
+fn sliced_bh_runs_the_position_model_by_default() {
     let mut gpu = case(optics("far field", 3), NPOS, 1).gpu(OPTIONS);
-    let before: Vec<_> = gpu.objects().unwrap().iter().map(|o| bits(o)).collect();
-    let probe = bits(&gpu.probe().unwrap());
+    assert_eq!(gpu.sampling(), Sampling::Patch);
+    let start = drawn_offsets(NPOS);
     let moved = Features {
-        position: Some(Feature::refined(drawn_offsets(NPOS))),
+        position: Some(Feature::refined(start.clone())),
         ..Features::default()
     };
     gpu.set_features(&moved).unwrap();
-    let p = params(12);
-    let e = gpu.bh(&p, 1, 1).unwrap_err().to_string();
-    let patch = "BH with the position model under Sampling::Patch runs one object slice, got 3";
-    assert!(e.contains(patch), "{e}");
-
-    let after: Vec<_> = gpu.objects().unwrap().iter().map(|o| bits(o)).collect();
-    assert!(after == before, "a refused pass changed the object");
-    assert!(
-        bits(&gpu.probe().unwrap()) == probe,
-        "a refused pass changed the probe"
-    );
-    assert!(gpu.history().is_empty());
-    assert_eq!(gpu.cycle(), 0);
+    gpu.bh(&params(12), 1, 1).unwrap();
+    assert_eq!(gpu.cycle(), 1);
+    assert!(gpu.history().last().unwrap().llk.poisson.is_finite());
+    let got = gpu.features().unwrap().position.unwrap().values;
+    assert!(got != start, "the offsets did not move");
 }

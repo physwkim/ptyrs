@@ -2074,12 +2074,25 @@ impl BhState {
         // `sliced_hess_frames` 65, and per slice from the last its derivatives' windows (four
         // calls from 67, 91) and second derivatives (three from 79, 103) to `win_hess` (88,
         // 112), r to `slice_adjoint` 89, the work wave from `slice_pair` 66 and from it to the
-        // first slice's `win_hess`. A slice past the second repeats the second's passes,
-        // booked once. Held, the offsets' passes drop out and the others keep their numbers:
-        // r ends at `shifted_psi_sums`' 7, and lu and lv at `moved_far`, in `pos_far`'s place
-        // right after their transforms (20); under full-object sampling only block 0's windows
-        // are sampled, `win_obj_grad` takes `win_grad`'s place, and `win_lift`, the second
-        // derivatives and `win_hess` drop out, through a multislice object everything from 66.
+        // first slice's `win_hess`. With the moved probes through two slices: the moved probes
+        // (`shifted_probe` 0, `shift_w`, `slice_mul` 2), the wave entering the second slice
+        // (the gap 3, `slice_mul` 4, `phase_grad` 10, `slice_pair` 11), psi (the phase 5, the
+        // transform, the residual 7), r (the adjoint, the phase's, `phase_grad`, `slice_pair`,
+        // `slice_adjoint` 13), the work wave from `slice_pair` to `psi_to_obj` 12 and from
+        // `slice_adjoint` (the gap) to `shifted_psi_sums` from 15 and `obj_conj` 20, y (the
+        // transform, `pos_grad` 22); then lu and lv (`pos_spec` 23, the inverses, the
+        // slices' `slice_tangent` 30 and 36 with the gaps between, `phase_tangent` 37, the
+        // phase, the transforms, `sliced_hess_frames` 42), the three second derivatives alike
+        // from `pos_second` 24, and the entering wave again from 36 to 37. A slice past the
+        // second repeats the second's passes, booked once. Held, the offsets' passes drop out
+        // and the others keep their numbers: r ends at `shifted_psi_sums`' 7, and lu and lv
+        // at `moved_far`, in `pos_far`'s place right after their transforms (20); under
+        // full-object sampling only block 0's windows are sampled, `win_obj_grad` takes
+        // `win_grad`'s place, and `win_lift`, the second derivatives and `win_hess` drop out,
+        // through a multislice object everything from 66; with the moved probes through a
+        // multislice object the work wave ends at `shifted_psi_sums`' 16, `moved_spec` and the
+        // second derivatives' zeroing take `pos_spec`'s and `pos_second`'s places, and the
+        // entering wave is not read again.
         let wave = wave_bytes(dims);
         let refined = scratch.is_some_and(|s| s.refined);
         let streamed = match scratch.map(|s| s.sampling) {
@@ -2188,6 +2201,28 @@ impl BhState {
                 if refined {
                     s.push(Streamed::new(wave, 43..=53));
                 }
+                s
+            }
+            Some(MovedSampling::Patch) if deeper > 0 => {
+                let mut s = vec![
+                    Streamed::new(plane_bytes::<C32>(dims, dims.nprobe), 0..=2),
+                    Streamed::new(wave, 2..=11),
+                    Streamed::new(wave, 4..=7),
+                    Streamed::new(wave, 7..=13),
+                    Streamed::new(wave, 11..=12),
+                ];
+                if refined {
+                    s.extend([
+                        Streamed::new(wave, 13..=20),
+                        Streamed::new(wave, 20..=22),
+                        Streamed::new(wave, 36..=37),
+                    ]);
+                } else {
+                    s.push(Streamed::new(wave, 13..=16));
+                }
+                s.extend(Streamed::shifted_psi_sums(dims, 15));
+                s.extend([Streamed::new(wave, 23..=42); 2]);
+                s.extend([Streamed::new(wave, 24..=42); 3]);
                 s
             }
             Some(MovedSampling::Patch) => {
@@ -3232,12 +3267,6 @@ impl Device {
         let reads = self.features.positioned().then_some(self.sampling);
         let [.., position] = self.features.refine();
         let deeper = self.deeper().len();
-        if reads == Some(Sampling::Patch) && deeper > 0 {
-            return Err(EngineError::Invalid(format!(
-                "BH with the position model under Sampling::Patch runs one object slice, got {}",
-                deeper + 1
-            )));
-        }
         if (self.bh_state.as_ref())
             .is_none_or(|s| s.size != size || s.reads() != reads || s.position() != position)
         {
