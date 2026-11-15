@@ -334,6 +334,10 @@ fn weight_grad(x: CubeTensor, dy: CubeTensor, bias: bool) -> (CubeTensor, Option
         [n, h, w],
         "an output gradient over the input's pixels"
     );
+    assert_eq!(
+        dy.dtype, x.dtype,
+        "an output gradient in the input's float type"
+    );
     // `dw` and `db`, checked before their counts are multiplied out.
     check_elements(&[x.meta.shape(), dy.meta.shape(), &[co, ci, 9], &[co]]);
     let lw = co * ci * 9;
@@ -434,10 +438,23 @@ const GROUPS: usize = 8;
 /// an f64 cube within 48 KiB of shared memory.
 fn conv3x3(x: CubeTensor, wk: CubeTensor, bias: Option<CubeTensor>) -> CubeTensor {
     let [n, h, w, a] = x.meta.shape().dims();
-    let [_, _, b] = wk.meta.shape().dims();
+    let [wa, _, b] = wk.meta.shape().dims();
+    // The kernel reads `wk` and `bias` at `x`'s channels and in its float type.
+    assert_eq!(wa, a, "an input over the weight's input channels");
+    let bias_shape = bias.as_ref().map(|t| &t.meta.shape()[..]);
+    assert!(
+        bias_shape.is_none_or(|s| s == [b]),
+        "a bias of one value per output channel"
+    );
+    assert!(
+        [Some(&wk), bias.as_ref()]
+            .into_iter()
+            .flatten()
+            .all(|t| t.dtype == x.dtype),
+        "a weight and bias in the input's float type"
+    );
     // `wk` is `arrange`'s, which checked it.
-    let bias_shape = bias.as_ref().map_or(&[][..], |t| &t.meta.shape()[..]);
-    check_elements(&[x.meta.shape(), bias_shape, &[n, h, w, b]]);
+    check_elements(&[x.meta.shape(), bias_shape.unwrap_or(&[]), &[n, h, w, b]]);
     let client = x.client.clone();
     let y = empty_device_contiguous_dtype(
         client.clone(),
@@ -489,8 +506,10 @@ fn conv3x3(x: CubeTensor, wk: CubeTensor, bias: Option<CubeTensor>) -> CubeTenso
 /// `weight`, `[co, ci, 3, 3]`, as the `[ci, 9, co]` `conv3x3` reads for the forward, or, `flip`ped,
 /// as the `[co, 9, ci]` of the input gradient, whose tap `t` is the forward's `8 - t`.
 fn arrange(weight: CubeTensor, flip: bool) -> CubeTensor {
-    let [co, ci, _, _] = weight.meta.shape().dims();
-    check_elements(&[weight.meta.shape(), &[co, ci, 9]]);
+    let [co, ci, kh, kw] = weight.meta.shape().dims();
+    assert_eq!([kh, kw], [3, 3], "a 3×3 weight");
+    // `wk` holds as many elements.
+    check_elements(&[weight.meta.shape()]);
     let shape = if flip { [co, 9, ci] } else { [ci, 9, co] };
     let client = weight.client.clone();
     let wk = empty_device_contiguous_dtype(
@@ -1365,6 +1384,70 @@ mod tests {
     #[should_panic(expected = "a launch of fewer than 2³² elements per tensor")]
     fn bias_gradient_of_2_32_elements() {
         weight_grad(empty([0, 1, 1, 0]), empty([0, 1, 1, 1 << 32]), true);
+    }
+
+    /// A 3×3 same-padded convolution of `ci` to `co` channels with a bias, on `device`.
+    fn conv(ci: usize, co: usize, device: &Device) -> Conv2d {
+        Conv2dConfig::new([ci, co], [3, 3])
+            .with_padding(PaddingConfig2d::Same)
+            .init(device)
+    }
+
+    /// Ones of `shape` in f32 on `device`.
+    fn ones<const D: usize>(shape: [usize; D], device: &Device) -> Tensor<D> {
+        Tensor::ones(shape, (device, DType::F32))
+    }
+
+    /// burn's `Conv2d::forward` refuses it too; the kernel would read the weight past its end.
+    #[test]
+    #[should_panic(expected = "an input over the weight's input channels")]
+    fn an_input_of_other_channels() {
+        let device = crate::nn::cuda(0);
+        Conv(conv(1, 8, &device)).forward(ones([1, 8, 8, 16], &device));
+    }
+
+    #[test]
+    #[should_panic(expected = "an input over the weight's input channels")]
+    fn an_input_of_other_channels_under_autodiff() {
+        let device = crate::nn::cuda(0).autodiff();
+        Conv(conv(1, 8, &device)).forward(ones([1, 8, 8, 16], &device));
+    }
+
+    #[test]
+    #[should_panic(expected = "a bias of one value per output channel")]
+    fn a_short_bias() {
+        let device = crate::nn::cuda(0);
+        let mut c = conv(1, 4, &device);
+        c.bias = Some(Param::from_tensor(ones([3], &device)));
+        Conv(c).forward(ones([1, 8, 8, 1], &device));
+    }
+
+    #[test]
+    #[should_panic(expected = "a weight and bias in the input's float type")]
+    fn a_weight_of_another_float_type() {
+        let device = crate::nn::cuda(0);
+        let mut c = conv(1, 4, &device);
+        c.weight = Param::from_tensor(c.weight.val().cast(DType::F16));
+        Conv(c).forward(ones([1, 8, 8, 1], &device));
+    }
+
+    /// A record whose weight is not 3×3 under a 3×3 configuration.
+    #[test]
+    #[should_panic(expected = "a 3×3 weight")]
+    fn a_weight_of_other_taps() {
+        let device = crate::nn::cuda(0);
+        let mut c = conv(1, 4, &device);
+        c.weight = Param::from_tensor(ones([4, 1, 1, 1], &device));
+        Conv(c).forward(ones([1, 8, 8, 1], &device));
+    }
+
+    #[test]
+    #[should_panic(expected = "an output gradient in the input's float type")]
+    fn weight_gradient_of_another_float_type() {
+        let dy = Tensor::<4>::ones([1, 1, 2, 1], (&crate::nn::cuda(0), DType::F64))
+            .try_into_primitive::<CubeBackend>()
+            .unwrap();
+        weight_grad(broadcast([1, 1, 2, 1]), dy, false);
     }
 
     /// The kernel reads the output gradient at the input's pixels, so it refuses one over others.
