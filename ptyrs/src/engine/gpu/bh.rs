@@ -21,7 +21,7 @@ use super::device::{
     PositionLent, SampledLent, another_model, moved_inputs, moved_shift, slice_phase,
 };
 use super::propagate::Propagate;
-use super::{Bufs, Cut, GpuPtycho};
+use super::{Bufs, Cut, Device, GpuPtycho};
 use crate::engine::features::POSITION_STEP;
 use crate::engine::ptycho::{Algorithm, llk_due};
 use crate::engine::{BhParams, BhStep, EngineError, Sampling, random_batches};
@@ -36,35 +36,39 @@ impl GpuPtycho {
         nepoch: usize,
         calc_llk: usize,
     ) -> Result<(), EngineError> {
-        params.validate()?;
-        if self.dev.models_scale_or_background() {
-            return Err(EngineError::Invalid(
-                "BH models no intensity scale or background, as pty-chi's".into(),
-            ));
-        }
-        let nframe = self.dev.dims().nframe as usize;
-        let full = params.batch_size >= nframe;
-        for ic in 0..nepoch {
-            let order: Vec<u32> = random_batches(nframe, params.batch_size, params.seed, ic as u64)
-                .concat()
-                .into_iter()
-                .map(|f| f as u32)
-                .collect();
-            self.dev
-                .bh_epoch(*params, full && ic > 0, self.cycle, &order)?;
-            if llk_due(calc_llk, ic, nepoch) {
-                self.dev.llk_pass(Some((self.cycle, Algorithm::Bh)))?;
+        let check = |dev: &Device| {
+            params.validate()?;
+            if dev.models_scale_or_background() {
+                return Err(EngineError::Invalid(
+                    "BH models no intensity scale or background, as pty-chi's".into(),
+                ));
             }
-            self.cycle += 1;
-        }
-        self.collect()?;
-        Ok(())
+            Ok(())
+        };
+        self.call(false, check, |dev, cycle| {
+            let nframe = dev.dims().nframe as usize;
+            let full = params.batch_size >= nframe;
+            for ic in 0..nepoch {
+                let order: Vec<u32> =
+                    random_batches(nframe, params.batch_size, params.seed, ic as u64)
+                        .concat()
+                        .into_iter()
+                        .map(|f| f as u32)
+                        .collect();
+                dev.bh_epoch(*params, full && ic > 0, *cycle, &order)?;
+                if llk_due(calc_llk, ic, nepoch) {
+                    dev.llk_pass(Some((*cycle, Algorithm::Bh)))?;
+                }
+                *cycle += 1;
+            }
+            Ok(())
+        })
     }
 
     /// The steps of the last BH epoch, as [`crate::engine::Bh::epoch`] returns them, read back from
     /// the device; none before a BH call.
     pub fn bh_steps(&self) -> Result<Vec<BhStep>, EngineError> {
-        self.dev.bh_steps()
+        self.dev.checked()?.bh_steps()
     }
 }
 

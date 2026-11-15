@@ -78,6 +78,11 @@ pub enum EngineError {
     Ring(#[from] crate::gpu::RingError),
     #[error("cuFFT: {0}")]
     Fft(#[from] crate::fft::FftError),
+    /// A [`GpuPtycho`] call failed past its checks, so the device state may be part-changed;
+    /// every later call that enqueues work is refused. Downloads still run: rebuild with
+    /// [`GpuPtycho::new`], e.g. from [`GpuPtycho::object`] and [`GpuPtycho::probe`].
+    #[error("aborted: an earlier call failed part-way; rebuild the engine")]
+    Aborted,
 }
 
 impl From<cuda_core::DriverError> for EngineError {

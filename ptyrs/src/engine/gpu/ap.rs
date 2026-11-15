@@ -25,19 +25,21 @@ impl GpuPtycho {
     /// object sums are placed back from them, and the object update divides by the
     /// illumination map.
     pub fn ap(&mut self, params: &ApParams, ncycle: usize) -> Result<(), EngineError> {
-        for ic in 0..ncycle {
-            let epoch = Epoch::Ap {
-                params: *params,
-                llk: llk_due(params.calc_llk, ic, ncycle),
-            };
-            self.dev.steady(epoch, self.cycle)?;
-            self.cycle += 1;
-        }
-        self.collect()?;
-        if params.zero_phase_ramp {
-            self.zero_phase_ramp()?;
-        }
-        Ok(())
+        self.call(
+            params.zero_phase_ramp,
+            |dev| dev.one_unitary("Ap"),
+            |dev, cycle| {
+                for ic in 0..ncycle {
+                    let epoch = Epoch::Ap {
+                        params: *params,
+                        llk: llk_due(params.calc_llk, ic, ncycle),
+                    };
+                    dev.steady(epoch, *cycle)?;
+                    *cycle += 1;
+                }
+                Ok(())
+            },
+        )
     }
 }
 
