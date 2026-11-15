@@ -1982,8 +1982,13 @@ impl BhState {
         // calls from 67, 91) and second derivatives (three from 79, 103) to `win_hess` (88,
         // 112), r to `slice_adjoint` 89, the work wave from `slice_pair` 66 and from it to the
         // first slice's `win_hess`. A slice past the second repeats the second's passes,
-        // booked once.
+        // booked once. Held, the offsets' passes drop out and the others keep their numbers:
+        // r ends at `shifted_psi_sums`' 7, and lu and lv at `moved_far`, in `pos_far`'s place
+        // right after their transforms (20); under full-object sampling only block 0's windows
+        // are sampled, `win_obj_grad` takes `win_grad`'s place, and `win_lift`, the second
+        // derivatives and `win_hess` drop out, through a multislice object everything from 66.
         let wave = wave_bytes(dims);
+        let refined = scratch.is_some_and(|s| s.refined);
         let streamed = match scratch.map(|s| s.sampling) {
             None => {
                 let mut s = vec![
@@ -1999,34 +2004,38 @@ impl BhState {
             }
             Some(MovedSampling::FullObject { held, scratch, acc }) if deeper > 0 => {
                 let win = Windows::bytes(dims);
-                let calls = [
-                    (0, 28),
-                    (5, 26),
-                    (13, 19),
-                    (16, 19),
-                    (29, 35),
-                    (32, 35),
-                    (42, 49),
-                    (45, 49),
-                    (55, 62),
-                    (58, 62),
-                    (67, 88),
-                    (70, 88),
-                    (73, 88),
-                    (76, 88),
-                    (79, 88),
-                    (82, 88),
-                    (85, 88),
-                    (91, 112),
-                    (94, 112),
-                    (97, 112),
-                    (100, 112),
-                    (103, 112),
-                    (106, 112),
-                    (109, 112),
-                ];
-                let mut s: Vec<_> = (calls.into_iter())
-                    .flat_map(|(p, read)| Streamed::chunked(held, p..=p + 2, &[(win, read)], &[]))
+                let calls: &[_] = if refined {
+                    &[
+                        (0, 28),
+                        (5, 26),
+                        (13, 19),
+                        (16, 19),
+                        (29, 35),
+                        (32, 35),
+                        (42, 49),
+                        (45, 49),
+                        (55, 62),
+                        (58, 62),
+                        (67, 88),
+                        (70, 88),
+                        (73, 88),
+                        (76, 88),
+                        (79, 88),
+                        (82, 88),
+                        (85, 88),
+                        (91, 112),
+                        (94, 112),
+                        (97, 112),
+                        (100, 112),
+                        (103, 112),
+                        (106, 112),
+                        (109, 112),
+                    ]
+                } else {
+                    &[(0, 28), (5, 26), (42, 49), (45, 49), (55, 62), (58, 62)]
+                };
+                let mut s: Vec<_> = (calls.iter())
+                    .flat_map(|&(p, read)| Streamed::chunked(held, p..=p + 2, &[(win, read)], &[]))
                     .collect();
                 for p in [20, 36] {
                     s.extend(Streamed::chunked(acc, p..=p + 5, &[], &[(win, p - 1)]));
@@ -2038,34 +2047,42 @@ impl BhState {
                     Streamed::new(wave, 10..=26),
                     Streamed::new(wave, 12..=19),
                     Streamed::new(wave, 26..=35),
-                    Streamed::new(win, 62..=89),
-                    Streamed::new(wave, 62..=66),
-                    Streamed::new(wave, 65..=89),
-                    Streamed::new(wave, 66..=88),
-                    Streamed::new(wave, 89..=112),
                 ]);
+                if refined {
+                    s.extend([
+                        Streamed::new(win, 62..=89),
+                        Streamed::new(wave, 62..=66),
+                        Streamed::new(wave, 65..=89),
+                        Streamed::new(wave, 66..=88),
+                        Streamed::new(wave, 89..=112),
+                    ]);
+                }
                 s.extend([Streamed::new(wave, 49..=65); 5]);
                 s
             }
             Some(MovedSampling::FullObject { held, scratch, acc }) => {
                 let win = Windows::bytes(dims);
                 // Each sampler call's first pass, and the last to read the block it writes.
-                let calls = [
-                    (0, 13),
-                    (3, 14),
-                    (6, 14),
-                    (21, 43),
-                    (24, 53),
-                    (27, 53),
-                    (30, 43),
-                    (33, 53),
-                    (36, 53),
-                    (44, 53),
-                    (47, 53),
-                    (50, 53),
-                ];
-                let mut s: Vec<_> = (calls.into_iter())
-                    .flat_map(|(p, read)| Streamed::chunked(held, p..=p + 2, &[(win, read)], &[]))
+                let calls: &[_] = if refined {
+                    &[
+                        (0, 13),
+                        (3, 14),
+                        (6, 14),
+                        (21, 43),
+                        (24, 53),
+                        (27, 53),
+                        (30, 43),
+                        (33, 53),
+                        (36, 53),
+                        (44, 53),
+                        (47, 53),
+                        (50, 53),
+                    ]
+                } else {
+                    &[(0, 13), (21, 43), (30, 43)]
+                };
+                let mut s: Vec<_> = (calls.iter())
+                    .flat_map(|&(p, read)| Streamed::chunked(held, p..=p + 2, &[(win, read)], &[]))
                     .collect();
                 s.extend(Streamed::chunked(acc, 15..=20, &[], &[(win, 14)]));
                 s.extend([
@@ -2074,21 +2091,33 @@ impl BhState {
                     Streamed::new(wave, 11..=14),
                     Streamed::new(wave, 40..=43),
                     Streamed::new(wave, 40..=43),
-                    Streamed::new(wave, 43..=53),
                 ]);
+                if refined {
+                    s.push(Streamed::new(wave, 43..=53));
+                }
                 s
             }
             Some(MovedSampling::Patch) => {
                 let mut s = vec![
                     Streamed::new(plane_bytes::<C32>(dims, dims.nprobe), 0..=2),
                     Streamed::new(wave, 2..=4),
-                    Streamed::new(wave, 4..=11),
-                    Streamed::new(wave, 11..=13),
-                    Streamed::new(wave, 14..=22),
-                    Streamed::new(wave, 14..=22),
-                    Streamed::new(wave, 17..=20),
-                    Streamed::new(wave, 20..=22),
                 ];
+                if refined {
+                    s.extend([
+                        Streamed::new(wave, 4..=11),
+                        Streamed::new(wave, 11..=13),
+                        Streamed::new(wave, 14..=22),
+                        Streamed::new(wave, 14..=22),
+                        Streamed::new(wave, 17..=20),
+                        Streamed::new(wave, 20..=22),
+                    ]);
+                } else {
+                    s.extend([
+                        Streamed::new(wave, 4..=7),
+                        Streamed::new(wave, 14..=20),
+                        Streamed::new(wave, 14..=20),
+                    ]);
+                }
                 s.extend(Streamed::shifted_psi_sums(dims, 6));
                 s
             }

@@ -1,7 +1,8 @@
 //! GPU BH through a multislice object against the CPU's `f64` [`Bh`] from the same start: two
 //! and three slices under each of the far field, the angular spectrum and the Fresnel
 //! transform forward and back, and three slices of two object modes, without a position and
-//! with one that samples the object; and its refusal of a position that moves the probe.
+//! with one that samples the object, refined or held; and its refusal of a position that moves
+//! the probe.
 //! Frames are on the fused passes' smallest side, two incoherent probe modes, 30 Fermat
 //! positions in stacks of at most 8, so a batch of 12 ends in a stack of 4.
 
@@ -256,12 +257,16 @@ fn drawn_offsets(npos: usize) -> Vec<[f64; 2]> {
     d
 }
 
-/// `max |Δa − Δb| / max |Δb|` of the offsets' changes from `start`; 0 without a position.
+/// `max |Δa − Δb| / max |Δb|` of the offsets' changes from `start`; 0 without a position or
+/// with a held one, whose offsets do not change.
 fn offsets_rel(a: &Features, b: &Features, start: &Features) -> f64 {
     let (Some(a), Some(b), Some(s)) = (&a.position, &b.position, &start.position) else {
         assert_eq!(a.position.is_some(), b.position.is_some());
         return 0.0;
     };
+    if !s.refine {
+        return 0.0;
+    }
     let delta = |d: &[[f64; 2]]| -> Vec<f64> {
         d.iter()
             .zip(&s.values)
@@ -277,12 +282,18 @@ fn offsets_rel(a: &Features, b: &Features, start: &Features) -> f64 {
 /// steps, every slice, the probe, the LLK the GPU records after it and, with `position`, the
 /// offsets' changes are the CPU's, for `propagator` after each of `nslices` slices of `nobj`
 /// modes: in one batch of every frame (CG from the second epoch) and in batches of 12, the
-/// last of 6. A `position` is drawn offsets refined under [`Sampling::FullObject`].
-fn matches_cpu(propagator: &str, nslices: &[usize], nobj: usize, position: bool) {
+/// last of 6. A `position` refines or holds drawn offsets under [`Sampling::FullObject`];
+/// held, they keep the bits they were set with.
+fn matches_cpu(propagator: &str, nslices: &[usize], nobj: usize, position: Option<Feature<()>>) {
     const NEPOCH: usize = 3;
     let features = Features {
-        position: position.then(|| Feature::refined(drawn_offsets(NPOS))),
+        position: position.map(|d| d.map(|()| drawn_offsets(NPOS))),
         ..Features::default()
+    };
+    let named = match &features.position {
+        None => "still",
+        Some(d) if d.refine => "refined",
+        Some(_) => "held",
     };
     for &nslice in nslices {
         let c = case(optics(propagator, nslice), NPOS, nobj);
@@ -309,12 +320,22 @@ fn matches_cpu(propagator: &str, nslices: &[usize], nobj: usize, position: bool)
                 bh.features().position.as_ref().map(|d| &d.values[..]),
             );
             for graph in [false, true] {
+                let what = format!(
+                    "{propagator} {nslice} slices {nobj} modes {named} batch {batch_size} \
+                     graph {graph}"
+                );
                 let mut gpu = c.gpu(GpuOptions { graph, ..OPTIONS });
-                if position {
+                if features.position.is_some() {
                     gpu.set_features(&features).unwrap();
                     gpu.set_sampling(Sampling::FullObject).unwrap();
                 }
+                let set = gpu.features().unwrap().position;
                 gpu.bh(&p, NEPOCH, 1).unwrap();
+                if let Some(set) = set.filter(|d| !d.refine) {
+                    let got = gpu.features().unwrap().position;
+                    let kept = got.is_some_and(|d| d.values == set.values);
+                    assert!(kept, "{what}: held offsets moved");
+                }
                 let got = gpu.objects().unwrap();
                 assert_eq!(got.len(), nslice);
                 let recorded = gpu.history().last().unwrap().llk.poisson;
@@ -325,10 +346,6 @@ fn matches_cpu(propagator: &str, nslices: &[usize], nobj: usize, position: bool)
                     (recorded - llk).abs() / llk,
                     offsets_rel(&gpu.features().unwrap(), bh.features(), &features),
                 ];
-                let what = format!(
-                    "{propagator} {nslice} slices {nobj} modes position {position} \
-                     batch {batch_size} graph {graph}"
-                );
                 eprintln!(
                     "{what}: step {:.2e} objects {:.2e} probe {:.2e} llk {:.2e} offsets {:.2e}, \
                      llk {start:.4e} -> {llk:.4e}",
@@ -338,9 +355,11 @@ fn matches_cpu(propagator: &str, nslices: &[usize], nobj: usize, position: bool)
                 // of 12), 8.5e-8 (far field, two object modes) and 2.3e-6 (Fresnel back, three
                 // slices). With a position: 1.3e-5 (far field, three slices), 3.0e-7 (Fresnel
                 // back, two slices, batches of 12), 9.4e-8, 1.6e-6 (far field, three slices of
-                // two modes) and offsets 1.9e-5 (Fresnel, three slices).
+                // two modes) and offsets 1.9e-5 (Fresnel, three slices). Held: 6.5e-5 (far
+                // field, three slices: a CG step at β 11 as the LLK rises, which a refined
+                // position at a zero rho matches bit for bit), 2.8e-7, 8.9e-8 and 1.9e-6.
                 let bounds = [
-                    ("step", 5e-5),
+                    ("step", 2e-4),
                     ("objects", 1e-6),
                     ("probe", 5e-7),
                     ("llk", 2e-5),
@@ -361,64 +380,80 @@ fn matches_cpu(propagator: &str, nslices: &[usize], nobj: usize, position: bool)
 /// every epoch, and three reach 5.6 by the sixth.
 #[test]
 fn sliced_bh_matches_cpu_in_the_far_field() {
-    matches_cpu(PROPAGATORS[0], &[2, 3], 1, false);
+    matches_cpu(PROPAGATORS[0], &[2, 3], 1, None);
 }
 
 #[test]
 fn sliced_bh_matches_cpu_under_angular_spectrum() {
-    matches_cpu(PROPAGATORS[1], &[2, 3], 1, false);
+    matches_cpu(PROPAGATORS[1], &[2, 3], 1, None);
 }
 
 #[test]
 fn sliced_bh_matches_cpu_under_fresnel() {
-    matches_cpu(PROPAGATORS[2], &[2, 3], 1, false);
+    matches_cpu(PROPAGATORS[2], &[2, 3], 1, None);
 }
 
 #[test]
 fn sliced_bh_matches_cpu_under_fresnel_back() {
-    matches_cpu(PROPAGATORS[3], &[2, 3], 1, false);
+    matches_cpu(PROPAGATORS[3], &[2, 3], 1, None);
 }
 
 /// Two object modes through three slices, each view's wave its own through every slice.
 #[test]
 fn sliced_bh_with_object_modes_matches_cpu_in_the_far_field() {
-    matches_cpu(PROPAGATORS[0], &[3], 2, false);
+    matches_cpu(PROPAGATORS[0], &[3], 2, None);
 }
 
 #[test]
 fn sliced_bh_with_object_modes_matches_cpu_under_fresnel() {
-    matches_cpu(PROPAGATORS[2], &[3], 2, false);
+    matches_cpu(PROPAGATORS[2], &[3], 2, None);
 }
 
 /// A position that samples the object: every slice's windows.
 #[test]
 fn sliced_full_object_bh_matches_cpu_in_the_far_field() {
-    matches_cpu(PROPAGATORS[0], &[2, 3], 1, true);
+    matches_cpu(PROPAGATORS[0], &[2, 3], 1, Some(Feature::refined(())));
 }
 
 #[test]
 fn sliced_full_object_bh_matches_cpu_under_angular_spectrum() {
-    matches_cpu(PROPAGATORS[1], &[2, 3], 1, true);
+    matches_cpu(PROPAGATORS[1], &[2, 3], 1, Some(Feature::refined(())));
 }
 
 #[test]
 fn sliced_full_object_bh_matches_cpu_under_fresnel() {
-    matches_cpu(PROPAGATORS[2], &[2, 3], 1, true);
+    matches_cpu(PROPAGATORS[2], &[2, 3], 1, Some(Feature::refined(())));
 }
 
 #[test]
 fn sliced_full_object_bh_matches_cpu_under_fresnel_back() {
-    matches_cpu(PROPAGATORS[3], &[2, 3], 1, true);
+    matches_cpu(PROPAGATORS[3], &[2, 3], 1, Some(Feature::refined(())));
 }
 
 #[test]
 fn sliced_full_object_bh_with_object_modes_matches_cpu_in_the_far_field() {
-    matches_cpu(PROPAGATORS[0], &[3], 2, true);
+    matches_cpu(PROPAGATORS[0], &[3], 2, Some(Feature::refined(())));
 }
 
 #[test]
 fn sliced_full_object_bh_with_object_modes_matches_cpu_under_fresnel() {
-    matches_cpu(PROPAGATORS[2], &[3], 2, true);
+    matches_cpu(PROPAGATORS[2], &[3], 2, Some(Feature::refined(())));
+}
+
+/// The position held: only the windows themselves, and no offsets' step.
+#[test]
+fn sliced_full_object_bh_held_matches_cpu_in_the_far_field() {
+    matches_cpu(PROPAGATORS[0], &[2, 3], 1, Some(Feature::held(())));
+}
+
+#[test]
+fn sliced_full_object_bh_held_matches_cpu_under_fresnel_back() {
+    matches_cpu(PROPAGATORS[3], &[2, 3], 1, Some(Feature::held(())));
+}
+
+#[test]
+fn sliced_full_object_bh_held_with_object_modes_matches_cpu_in_the_far_field() {
+    matches_cpu(PROPAGATORS[0], &[3], 2, Some(Feature::held(())));
 }
 
 /// BH with a position that moves the probe through more than one slice fails before it

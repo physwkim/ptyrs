@@ -1746,13 +1746,14 @@ fn position_is_bit_identical_across_stack_splits() {
     }
 }
 
-/// DM, ML and LSQML holding a position, then switched to refining it, give the bits of a fresh
-/// start from the arrays they left, refining it from the outset, under either sampling: the
-/// object, the probe, the offsets and the LLK records after the switch. The switch drops what
-/// was cut for the held position: the shared passes' scratch, DM's carried stacks and LSQML's
+/// DM, ML, BH and LSQML holding a position, then switched to refining it, or refining it,
+/// then switched to holding it, give the bits of a fresh start from the arrays they left with
+/// the position as switched from the outset, under either sampling: the object, the probe,
+/// the offsets and the LLK records after the switch. The switch drops what was cut for the
+/// position it leaves: the shared passes' scratch, DM's carried stacks, BH's and LSQML's
 /// state.
 #[test]
-fn held_to_refined_position_gives_a_fresh_runs_bits() {
+fn position_refine_switch_gives_a_fresh_runs_bits() {
     let (scan, object, probe) = featured_start(2, false, false);
     let position = |refine| Features {
         position: Some(Feature {
@@ -1763,6 +1764,12 @@ fn held_to_refined_position_gives_a_fresh_runs_bits() {
     };
     let (held, refined) = (position(false), position(true));
     let [_, dm, ml] = feature_cycles(2);
+    let bh = BhParams {
+        batch_size: 4,
+        probe_rho: 0.01,
+        position_rho: 0.1,
+        seed: 7,
+    };
     let lsqml = LsqmlParams {
         batch_size: 12,
         cost: Cost::Poisson,
@@ -1771,39 +1778,44 @@ fn held_to_refined_position_gives_a_fresh_runs_bits() {
     let run = |g: &mut GpuPtycho| {
         dm.gpu(g, 2);
         ml.gpu(g, 2);
+        g.bh(&bh, 2, 1).unwrap();
         g.lsqml(&lsqml, 2, 1).unwrap();
     };
-    for sampling in [Sampling::Patch, Sampling::FullObject] {
-        let new = |object, probe| {
-            let mut g = GpuPtycho::new(&ctx(), &scan, object, probe, FUSED.options).unwrap();
-            g.set_sampling(sampling).unwrap();
-            g
-        };
-        let mut switched = new(object.clone(), probe.clone());
-        switched.set_features(&held).unwrap();
-        run(&mut switched);
-        let before = switched.history().len();
-        let mut fresh = new(switched.object().unwrap(), switched.probe().unwrap());
-        for g in [&mut switched, &mut fresh] {
-            g.set_features(&refined).unwrap();
-            run(g);
+    let switches = [
+        ("held to refined", &held, &refined),
+        ("refined to held", &refined, &held),
+    ];
+    for (named, from, to) in switches {
+        for sampling in [Sampling::Patch, Sampling::FullObject] {
+            let what = format!("{sampling:?} {named}");
+            let new = |object, probe| {
+                let mut g = GpuPtycho::new(&ctx(), &scan, object, probe, FUSED.options).unwrap();
+                g.set_sampling(sampling).unwrap();
+                g
+            };
+            let mut switched = new(object.clone(), probe.clone());
+            switched.set_features(from).unwrap();
+            run(&mut switched);
+            let before = switched.history().len();
+            let mut fresh = new(switched.object().unwrap(), switched.probe().unwrap());
+            for g in [&mut switched, &mut fresh] {
+                g.set_features(to).unwrap();
+                run(g);
+            }
+            let (switched, fresh) = (bit_state(&mut switched), bit_state(&mut fresh));
+            let llk = |r: &[(RecordTag, [u64; 4])]| r.iter().map(|r| r.1).collect::<Vec<_>>();
+            assert_eq!(fresh.llk.len(), 2 + 2 + 2 + 2 + 1);
+            assert!(
+                llk(&switched.llk[before..]) == llk(&fresh.llk),
+                "{what}: LLK records differ"
+            );
+            assert!(switched.object == fresh.object, "{what}: object differs");
+            assert!(switched.probe == fresh.probe, "{what}: probe differs");
+            assert!(
+                switched.features == fresh.features,
+                "{what}: offsets differ"
+            );
         }
-        let (switched, fresh) = (bit_state(&mut switched), bit_state(&mut fresh));
-        let llk = |r: &[(RecordTag, [u64; 4])]| r.iter().map(|r| r.1).collect::<Vec<_>>();
-        assert_eq!(fresh.llk.len(), 2 + 2 + 2 + 1);
-        assert!(
-            llk(&switched.llk[before..]) == llk(&fresh.llk),
-            "{sampling:?}: LLK records differ"
-        );
-        assert!(
-            switched.object == fresh.object,
-            "{sampling:?}: object differs"
-        );
-        assert!(switched.probe == fresh.probe, "{sampling:?}: probe differs");
-        assert!(
-            switched.features == fresh.features,
-            "{sampling:?}: offsets differ"
-        );
     }
 }
 
