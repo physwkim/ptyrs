@@ -300,6 +300,25 @@ impl<C: CheckpointStrategy> ConvOps for Autodiff<CubeBackend, C> {
     }
 }
 
+/// Panics unless each tensor of `shapes`, the shapes of every tensor a launch reads or writes,
+/// holds fewer than 2³² elements: the kernels index them with 32 bits, and cubecl's launch panics
+/// with no message past that.
+fn check_elements(shapes: &[&[usize]]) {
+    let fits = |shape: &&[usize]| {
+        let len = shape.iter().try_fold(1usize, |p, &d| p.checked_mul(d));
+        len.is_some_and(|len| u32::try_from(len).is_ok())
+    };
+    assert!(
+        shapes.iter().all(fits),
+        "a convolution of fewer than 2³² elements per tensor"
+    );
+}
+
+/// A kernel's size argument. Past [`check_elements`] it is below 2³² unless a tensor is empty.
+fn u(v: usize) -> u32 {
+    u32::try_from(v).expect("a convolution size below 2³²")
+}
+
 /// Input channels per cube, one per lane of a warp.
 const LANES: usize = 32;
 /// Warps per cube.
@@ -320,7 +339,6 @@ const CUBES: usize = 512;
 /// `[bands, co·ci·9]` tensor, followed by the band's sums of `dy` from the cubes of `a = 0` if
 /// `bias`; a second kernel adds the bands in order, so the result does not depend on scheduling.
 fn weight_grad(x: CubeTensor, dy: CubeTensor, bias: bool) -> (CubeTensor, Option<CubeTensor>) {
-    let (x, dy) = (into_contiguous(x), into_contiguous(dy));
     let [n, h, w, ci] = x.meta.shape().dims();
     let [_, _, _, co] = dy.meta.shape().dims();
     // The cubes of `a = 0` sum the bias gradient, so they are there even for no input channels.
@@ -334,6 +352,14 @@ fn weight_grad(x: CubeTensor, dy: CubeTensor, bias: bool) -> (CubeTensor, Option
     let cubes = across * bands * down;
     let lw = co * ci * 9;
     let len = lw + if bias { co } else { 0 };
+    check_elements(&[
+        &[n, h, w, ci],
+        &[n, h, w, co],
+        &[bands, len],
+        &[co, ci, 9],
+        &[co],
+    ]);
+    let (x, dy) = (into_contiguous(x), into_contiguous(dy));
     let dtype = dtype_to_storage_type(x.dtype);
     let client = x.client.clone();
     let empty = |shape: Shape| {
@@ -342,7 +368,6 @@ fn weight_grad(x: CubeTensor, dy: CubeTensor, bias: bool) -> (CubeTensor, Option
     let parts = empty([bands, len].into());
     let dw = empty([co, ci, 3, 3].into());
     let db = bias.then(|| empty([co].into()));
-    let u = |v: usize| u32::try_from(v).expect("a weight gradient of fewer than 2³² elements");
     // SAFETY: every index the kernels form is below its tensor's length: pixels are masked against
     // the image, channels against `ci` and `co`, bands against `n` images and elements against
     // `lw` and `len`.
@@ -404,9 +429,10 @@ const GROUPS: usize = 8;
 /// eleven pixels a pass whatever the warps, and no more than 32 bytes of them a pixel, which keeps
 /// an f64 cube within 48 KiB of shared memory.
 fn conv3x3(x: CubeTensor, wk: CubeTensor, bias: Option<CubeTensor>) -> CubeTensor {
-    let x = into_contiguous(x);
     let [n, h, w, a] = x.meta.shape().dims();
     let [_, _, b] = wk.meta.shape().dims();
+    check_elements(&[&[n, h, w, a], &[a, 9, b], &[b], &[n, h, w, b]]);
+    let x = into_contiguous(x);
     let groups = b.div_ceil(PER).next_power_of_two().min(GROUPS);
     let chunk = groups.min(32 / x.dtype.size());
     let (across, down) = (w.div_ceil(COLS), h.div_ceil(ROWS));
@@ -420,7 +446,6 @@ fn conv3x3(x: CubeTensor, wk: CubeTensor, bias: Option<CubeTensor>) -> CubeTenso
         x.dtype,
     );
     let dtype = dtype_to_storage_type(x.dtype);
-    let u = |v: usize| u32::try_from(v).expect("a convolution of fewer than 2³² elements");
     // SAFETY: every index the kernel forms is below its tensor's length: halo pixels are masked
     // against the image, channels against `a` and `b`, and stores against the image and `b`.
     unsafe {
@@ -454,8 +479,9 @@ fn conv3x3(x: CubeTensor, wk: CubeTensor, bias: Option<CubeTensor>) -> CubeTenso
 /// `weight`, `[co, ci, 3, 3]`, as the `[ci, 9, co]` `conv3x3` reads for the forward, or, `flip`ped,
 /// as the `[co, 9, ci]` of the input gradient, whose tap `t` is the forward's `8 - t`.
 fn arrange(weight: CubeTensor, flip: bool) -> CubeTensor {
-    let weight = into_contiguous(weight);
     let [co, ci, _, _] = weight.meta.shape().dims();
+    check_elements(&[&[co, ci, 9]]);
+    let weight = into_contiguous(weight);
     let shape = if flip { [co, 9, ci] } else { [ci, 9, co] };
     let client = weight.client.clone();
     let wk = empty_device_contiguous_dtype(
@@ -465,7 +491,6 @@ fn arrange(weight: CubeTensor, flip: bool) -> CubeTensor {
         weight.dtype,
     );
     let len = co * ci * 9;
-    let u = |v: usize| u32::try_from(v).expect("a weight of fewer than 2³² elements");
     let dtype = dtype_to_storage_type(weight.dtype);
     // SAFETY: the kernel reads and writes element `i < len` of tensors of `len` elements.
     unsafe {
@@ -1201,6 +1226,68 @@ mod tests {
             let pixels = (n * h * w) as f64;
             assert_eq!(host(db), vec![pixels; co], "{:?}", [n, h, w, ci, co]);
         }
+    }
+
+    #[test]
+    fn just_under_2_32_elements_fit() {
+        check_elements(&[&[65535, 65537]]);
+    }
+
+    #[test]
+    #[should_panic(expected = "a convolution of fewer than 2³² elements per tensor")]
+    fn exactly_2_32_elements_do_not() {
+        check_elements(&[&[65535, 65537], &[1 << 16, 1 << 16]]);
+    }
+
+    #[test]
+    #[should_panic(expected = "a convolution of fewer than 2³² elements per tensor")]
+    fn an_element_count_past_usize_does_not_fit() {
+        check_elements(&[&[1 << 32, 1 << 32]]);
+    }
+
+    /// A tensor of `shape` that is one element seen through zero strides, so a launch site's check
+    /// meets it at its size without allocating it.
+    fn broadcast(shape: [usize; 4]) -> CubeTensor {
+        Tensor::<4>::ones([1, 1, 1, 1], (&crate::nn::cuda(0), DType::F32))
+            .expand(shape)
+            .try_into_primitive::<CubeBackend>()
+            .unwrap()
+    }
+
+    #[test]
+    #[should_panic(expected = "a convolution of fewer than 2³² elements per tensor")]
+    fn convolution_input_of_2_32_elements() {
+        forward(
+            broadcast([1, 1 << 15, 1 << 16, 2]),
+            broadcast([1, 2, 3, 3]),
+            None,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "a convolution of fewer than 2³² elements per tensor")]
+    fn convolution_output_of_2_32_elements() {
+        forward(
+            broadcast([1, 1 << 15, 1 << 16, 1]),
+            broadcast([2, 1, 3, 3]),
+            None,
+        );
+    }
+
+    /// 9·2²⁸ weights over two bands of 32 columns: the input, output gradient and weight gradient
+    /// fit, the partials do not.
+    #[test]
+    #[should_panic(expected = "a convolution of fewer than 2³² elements per tensor")]
+    fn weight_gradient_partials_of_more_than_2_32_elements() {
+        let side = [1, 1, 64, 1 << 14];
+        weight_grad(broadcast(side), broadcast(side), false);
+    }
+
+    /// 2¹⁶ · 7282 · 9 weights, just past 2³².
+    #[test]
+    #[should_panic(expected = "a convolution of fewer than 2³² elements per tensor")]
+    fn arranged_weight_of_more_than_2_32_elements() {
+        arrange(broadcast([1 << 16, 7282, 3, 3]), false);
     }
 
     /// f16 and bf16 take burn's path, which sums wider than the activation, so they match it bit
