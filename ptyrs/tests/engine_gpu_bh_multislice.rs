@@ -2,8 +2,8 @@
 //! and three slices under each of the far field, the angular spectrum and the Fresnel
 //! transform forward and back, and three slices of two object modes, without a position and
 //! with one that samples the object, refined or held; with one that moves the probe, refined in
-//! a case per boundary of its kernels and held in one; and a run with a position under the
-//! sampling the engine picks.
+//! a case per boundary of its kernels and per sign of the Fresnel quad, and held in one; and a
+//! run with a position under the sampling the engine picks.
 //! Frames are on the fused passes' smallest side, two incoherent probe modes, 30 Fermat
 //! positions in stacks of at most 8, so a batch of 12 ends in a stack of 4.
 
@@ -561,6 +561,18 @@ fn sliced_patch_bh_with_object_modes_matches_cpu_in_the_far_field() {
         PROPAGATORS[0],
         &[3],
         2,
+        Some(Feature::refined(Sampling::Patch)),
+    );
+}
+
+/// A positive Fresnel quad. The far field's is too small to show the last slice's phase in
+/// the offsets' Hessian (`phase_tangent`); without it this case and the negative one fail.
+#[test]
+fn sliced_patch_bh_matches_cpu_under_fresnel() {
+    matches_cpu(
+        PROPAGATORS[2],
+        &[2],
+        1,
         Some(Feature::refined(Sampling::Patch)),
     );
 }
