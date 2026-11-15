@@ -383,21 +383,16 @@ impl LsqmlState {
                 let plane1 = plane_bytes::<C32>(dims, 1);
                 let win = plane_bytes::<C32>(dims, dims.nobj);
                 let den = plane_bytes::<f32>(dims, dims.nobj);
-                vec![
-                    Streamed::fixed(held, 0..=2),
-                    Streamed::new(wave, 3..=7),
-                    Streamed::new(wave, 8..=18),
-                    Streamed::fixed(held, 9..=11),
-                    Streamed::fixed(held, 12..=14),
-                    Streamed::new(plane1, 11..=15),
-                    Streamed::new(plane1, 14..=15),
-                    Streamed::new(den, 16..=18),
-                    Streamed::new(win, 17..=20),
-                    Streamed::fixed(acc, 19..=24),
-                    Streamed::fixed(scratch, 20..=22),
-                    Streamed::fixed(held, 25..=27),
-                    Streamed::new(win, 27..=28),
+                [
+                    Streamed::chunked(held, 0..=2, &[(win, 2)], &[]),
+                    vec![Streamed::new(wave, 3..=7), Streamed::new(wave, 8..=18)],
+                    Streamed::chunked(held, 9..=11, &[(plane1, 15)], &[]),
+                    Streamed::chunked(held, 12..=14, &[(plane1, 15)], &[]),
+                    vec![Streamed::new(den, 16..=18), Streamed::fixed(acc, 19..=24)],
+                    Streamed::chunked(scratch, 20..=22, &[], &[(win, 17)]),
+                    Streamed::chunked(held, 25..=27, &[(win, 28)], &[]),
                 ]
+                .concat()
             }
         };
         let frames = rule.frames(&streamed)?;
