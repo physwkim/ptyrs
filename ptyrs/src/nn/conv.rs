@@ -33,7 +33,7 @@ use burn_cubecl::kernel::into_contiguous;
 use burn_cubecl::ops::numeric::{empty_device_contiguous_dtype, zeros_client};
 use burn_cubecl::tensor::CubeTensor;
 
-use crate::nn::grid::{check_elements, grid};
+use crate::nn::grid::{check_elements, check_operands, grid};
 
 /// A convolution of the networks, whose only forward is [`Conv::forward`]. Its record is the
 /// [`Conv2d`]'s it wraps, field for field, so saved networks read the same.
@@ -331,17 +331,9 @@ const CUBES: usize = 512;
 /// width.
 fn weight_grad(x: CubeTensor, dy: CubeTensor, bias: bool) -> (CubeTensor, Option<CubeTensor>) {
     let [n, h, w, ci] = x.meta.shape().dims();
-    let [dn, dh, dw, co] = dy.meta.shape().dims();
+    let [.., co] = dy.meta.shape().dims::<4>();
     // The kernel reads `dy` at `x`'s pixels.
-    assert_eq!(
-        [dn, dh, dw],
-        [n, h, w],
-        "an output gradient over the input's pixels"
-    );
-    assert_eq!(
-        dy.dtype, x.dtype,
-        "an output gradient in the input's float type"
-    );
+    check_operands(&x, &[(&dy, &[n, h, w, co])]);
     // `dw` and `db`, checked before their counts are multiplied out.
     check_elements(&[x.meta.shape(), dy.meta.shape(), &[co, ci, 9], &[co]]);
     let lw = co * ci * 9;
@@ -455,23 +447,15 @@ const GROUPS: usize = 8;
 /// an f64 cube within 48 KiB of shared memory.
 fn conv3x3(x: CubeTensor, wk: CubeTensor, bias: Option<CubeTensor>) -> CubeTensor {
     let [n, h, w, a] = x.meta.shape().dims();
-    let [wa, _, b] = wk.meta.shape().dims();
-    // The kernel reads `wk` and `bias` at `x`'s channels and in its float type.
-    assert_eq!(wa, a, "an input over the weight's input channels");
-    let bias_shape = bias.as_ref().map(|t| &t.meta.shape()[..]);
-    assert!(
-        bias_shape.is_none_or(|s| s == [b]),
-        "a bias of one value per output channel"
-    );
-    assert!(
-        [Some(&wk), bias.as_ref()]
-            .into_iter()
-            .flatten()
-            .all(|t| t.dtype == x.dtype),
-        "a weight and bias in the input's float type"
-    );
+    let [.., b] = wk.meta.shape().dims::<3>();
+    // The kernel reads `wk` and `bias` at `x`'s channels.
+    let (wk_shape, bias_shape) = ([a, 9, b], [b]);
+    let mut operands = vec![(&wk, &wk_shape[..])];
+    operands.extend(bias.as_ref().map(|t| (t, &bias_shape[..])));
+    check_operands(&x, &operands);
     // `wk` is `arrange`'s, which checked it.
-    check_elements(&[x.meta.shape(), bias_shape.unwrap_or(&[]), &[n, h, w, b]]);
+    let bias_shape = if bias.is_some() { &bias_shape[..] } else { &[] };
+    check_elements(&[x.meta.shape(), bias_shape, &[n, h, w, b]]);
     let client = x.client.clone();
     let y = empty_device_contiguous_dtype(
         client.clone(),
@@ -1427,21 +1411,21 @@ mod tests {
 
     /// burn's `Conv2d::forward` refuses it too; the kernel would read the weight past its end.
     #[test]
-    #[should_panic(expected = "an input over the weight's input channels")]
+    #[should_panic(expected = "an operand of the shape its kernels index")]
     fn an_input_of_other_channels() {
         let device = crate::nn::cuda(0);
         Conv(conv(1, 8, &device)).forward(ones([1, 8, 8, 16], &device));
     }
 
     #[test]
-    #[should_panic(expected = "an input over the weight's input channels")]
+    #[should_panic(expected = "an operand of the shape its kernels index")]
     fn an_input_of_other_channels_under_autodiff() {
         let device = crate::nn::cuda(0).autodiff();
         Conv(conv(1, 8, &device)).forward(ones([1, 8, 8, 16], &device));
     }
 
     #[test]
-    #[should_panic(expected = "a bias of one value per output channel")]
+    #[should_panic(expected = "an operand of the shape its kernels index")]
     fn a_short_bias() {
         let device = crate::nn::cuda(0);
         let mut c = conv(1, 4, &device);
@@ -1450,7 +1434,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "a weight and bias in the input's float type")]
+    #[should_panic(expected = "an operand in the input's float type")]
     fn a_weight_of_another_float_type() {
         let device = crate::nn::cuda(0);
         let mut c = conv(1, 4, &device);
@@ -1469,7 +1453,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "an output gradient in the input's float type")]
+    #[should_panic(expected = "an operand in the input's float type")]
     fn weight_gradient_of_another_float_type() {
         let dy = Tensor::<4>::ones([1, 1, 2, 1], (&crate::nn::cuda(0), DType::F64))
             .try_into_primitive::<CubeBackend>()
@@ -1479,7 +1463,7 @@ mod tests {
 
     /// The kernel reads the output gradient at the input's pixels, so it refuses one over others.
     #[test]
-    #[should_panic(expected = "an output gradient over the input's pixels")]
+    #[should_panic(expected = "an operand of the shape its kernels index")]
     fn weight_gradient_over_other_pixels() {
         weight_grad(broadcast([1, 1, 2, 1]), broadcast([1, 1, 1, 1]), false);
     }

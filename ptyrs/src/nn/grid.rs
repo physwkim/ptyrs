@@ -5,6 +5,7 @@
 
 use burn_cubecl::cubecl::client::Client;
 use burn_cubecl::cubecl::prelude::CubeCount;
+use burn_cubecl::tensor::CubeTensor;
 
 /// A grid of at least `cubes` cubes within the limits of `client`'s device, filling X first.
 pub(super) fn grid(client: &Client, cubes: usize) -> CubeCount {
@@ -20,6 +21,20 @@ pub(super) fn grid(client: &Client, cubes: usize) -> CubeCount {
 pub(super) fn fits(shape: &[usize]) -> bool {
     let len = shape.iter().try_fold(1usize, |p, &d| p.checked_mul(d));
     len.is_some_and(|len| u32::try_from(len).is_ok())
+}
+
+/// Panics unless each of `operands`, every tensor a launch reads besides `x` and does not make
+/// itself, has the shape paired with it and `x`'s float type: the kernels index an operand as of
+/// that shape and read it as `x`'s float type.
+pub(super) fn check_operands(x: &CubeTensor, operands: &[(&CubeTensor, &[usize])]) {
+    for &(t, shape) in operands {
+        assert_eq!(
+            &t.meta.shape()[..],
+            shape,
+            "an operand of the shape its kernels index"
+        );
+        assert_eq!(t.dtype, x.dtype, "an operand in the input's float type");
+    }
 }
 
 /// Panics unless each tensor of `shapes`, the shapes of every tensor a launch reads or writes,

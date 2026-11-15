@@ -21,7 +21,7 @@ use burn_cubecl::kernel::into_contiguous;
 use burn_cubecl::ops::numeric::empty_device_contiguous_dtype;
 use burn_cubecl::tensor::CubeTensor;
 
-use crate::nn::grid::{check_elements, grid};
+use crate::nn::grid::{check_elements, check_operands, grid};
 
 /// `relu(n.forward(x))` for channels-last `x`, whose last axis is `n`'s channels. It runs on the
 /// `[rows, channels]` view of `x`, which costs none of the transposing copy a channels-first view
@@ -37,9 +37,6 @@ pub fn norm_relu<const D: usize>(n: &BatchNorm, x: Tensor<D>) -> Tensor<D> {
     let device = x.device();
     let wide = matches!(x.dtype(), DType::F32 | DType::F64);
     let y = if device.is_autodiff() && n.training.is_enabled() && wide {
-        // burn's batch_norm_train checks; the kernels read γ and β at every channel.
-        assert_eq!(n.gamma.dims(), [cols], "invalid batch norm gamma shape");
-        assert_eq!(n.beta.dims(), [cols], "invalid batch norm beta shape");
         let (y, mean, var) = <Dispatch as NormReluOps>::norm_relu(
             x.into_dispatch(),
             n.gamma.val().into_dispatch(),
@@ -231,8 +228,10 @@ fn empty(like: &CubeTensor, shape: impl Into<Shape>) -> CubeTensor {
 }
 
 fn forward(x: CubeTensor, gamma: CubeTensor, beta: CubeTensor, epsilon: f64) -> Saved {
+    let [rows, cols] = x.meta.shape().dims();
+    // The kernels read γ and β at every channel.
+    check_operands(&x, &[(&gamma, &[cols]), (&beta, &[cols])]);
     let Some(g) = Grid::new(&x, &[&gamma, &beta]) else {
-        let rows = x.meta.shape()[0];
         let (y, mean, var) = (empty(&x, [rows, 0]), empty(&x, [0]), empty(&x, [0]));
         return Saved {
             x,
@@ -329,8 +328,10 @@ fn backward(
     epsilon: f64,
     dy: CubeTensor,
 ) -> [CubeTensor; 3] {
+    // The rest are `forward`'s.
+    let [rows, cols] = x.meta.shape().dims();
+    check_operands(&x, &[(&dy, &[rows, cols])]);
     let Some(g) = Grid::new(&x, &[&gamma, &y, &mean, &var, &dy]) else {
-        let rows = x.meta.shape()[0];
         return [empty(&x, [rows, 0]), empty(&x, [0]), empty(&x, [0])];
     };
     let (x, gamma, dy) = (
@@ -1021,10 +1022,10 @@ mod tests {
         }
     }
 
-    /// A γ or β of another width than `x`'s channels is refused as burn refuses it, before the
-    /// kernels read past it and the running statistics take `x`'s width.
+    /// A γ or β of another width than `x`'s channels is refused before the kernels read past it
+    /// and the running statistics take `x`'s width.
     #[test]
-    #[should_panic(expected = "invalid batch norm gamma shape")]
+    #[should_panic(expected = "an operand of the shape its kernels index")]
     fn refuses_a_gamma_of_another_width() {
         let device = crate::nn::cuda(0).autodiff();
         let n = BatchNormConfig::new(1).init(&device);
@@ -1032,12 +1033,43 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "invalid batch norm beta shape")]
+    #[should_panic(expected = "an operand of the shape its kernels index")]
     fn refuses_a_beta_of_another_width() {
         let device = crate::nn::cuda(0).autodiff();
         let mut n = BatchNormConfig::new(16).init(&device);
         n.beta = Param::from_tensor(Tensor::<1>::zeros([1], &device));
         norm_relu(&n, Tensor::<2>::ones([8, 16], &device));
+    }
+
+    /// The kernels read γ and β as `x`'s float type: an f16 γ and β under f32 put the output off
+    /// by up to 3.1.
+    #[test]
+    #[should_panic(expected = "an operand in the input's float type")]
+    fn refuses_a_gamma_and_beta_of_another_float_type() {
+        let device = crate::nn::cuda(0).autodiff();
+        let mut n = BatchNormConfig::new(16).init(&device);
+        n.gamma = Param::from_tensor(Tensor::ones([16], (&device, DType::F16)));
+        n.beta = Param::from_tensor(Tensor::zeros([16], (&device, DType::F16)));
+        norm_relu(&n, Tensor::<2>::ones([8, 16], (&device, DType::F32)));
+    }
+
+    #[test]
+    #[should_panic(expected = "an operand in the input's float type")]
+    fn refuses_a_beta_of_another_float_type() {
+        let device = crate::nn::cuda(0).autodiff();
+        let mut n = BatchNormConfig::new(16).init(&device);
+        n.beta = Param::from_tensor(Tensor::zeros([16], (&device, DType::F64)));
+        norm_relu(&n, Tensor::<2>::ones([8, 16], (&device, DType::F32)));
+    }
+
+    #[test]
+    #[should_panic(expected = "an operand in the input's float type")]
+    fn refuses_an_output_gradient_of_another_float_type() {
+        let dy = Tensor::<2>::ones([8, 16], (&crate::nn::cuda(0), DType::F64))
+            .try_into_primitive::<CubeBackend>()
+            .unwrap();
+        let (a, c) = (broadcast([8, 16]), || broadcast([16]));
+        backward(a.clone(), c(), a, c(), c(), 1e-5, dy);
     }
 
     #[test]
