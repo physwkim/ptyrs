@@ -8,6 +8,7 @@
 //! or pass that ended it, as the [`Ended`] its body returned shows, eagerly or kept from the
 //! capture of its graph.
 
+use std::marker::PhantomData;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -798,15 +799,27 @@ pub(super) fn moved_inputs<'a>(base: &FusedInputs<'a>, shift: Shift<'a>) -> Fuse
     }
 }
 
+/// Proof that the device's object has one slice, made only by [`Device::one_slice`]: a lend
+/// narrowed by one ([`Modelled::one_slice`]) reads the object's first slice as the whole
+/// object.
+#[derive(Clone, Copy)]
+pub(super) struct OneSlice(());
+
+/// A lend over an object of any slice count, which reads its slices by [`Modelled::sliced`].
+#[derive(Clone, Copy)]
+pub(super) struct AnySlices;
+
 /// The features lent to the passes of one cycle body by [`FeaturesMut::lend`]: the model
 /// every pass that compares with the counts reads, what samples the object it reads, and the
-/// sums the passes write.
-pub(super) struct Modelled<'b> {
+/// sums the passes write; `K`, [`OneSlice`] or [`AnySlices`], is what the lend may read of
+/// the object.
+pub(super) struct Modelled<'b, K> {
     pub model: Model<'b>,
     sampled: Option<Sampled<'b>>,
     scale: Option<&'b mut DeviceBuffer<ScalePartial>>,
     background: Option<&'b mut BackgroundSums>,
     position: Option<PositionSums<'b>>,
+    slices: PhantomData<K>,
 }
 
 /// An object's first slice and the slices past it, none of one slice.
@@ -842,7 +855,7 @@ struct PositionSums<'b> {
     partials: Option<&'b mut PositionPartials>,
 }
 
-impl Modelled<'_> {
+impl Modelled<'_, OneSlice> {
     /// The views and object a fused pass over `stack` reads, of `base`, the scan's views and
     /// the object the lend took: `base`, or under [`Sampling::FullObject`] the stack's windows
     /// sampled into `windows`, its cut's, by [`Self::windows`].
@@ -859,70 +872,6 @@ impl Modelled<'_> {
                 Some(w) => (w.read.views, w.read.blocks),
             },
         )
-    }
-
-    /// What the passes over each stack read of `base`, the scan's views and the object's
-    /// slices, the first the one the lend took: `base`, or under [`Sampling::FullObject`]
-    /// `windows`, its cut's, after the spectra of each slice past the first beside their
-    /// windows ([`Self::spectra_of`], one transform a slice). Their disagreement is an error,
-    /// as for a cut built under another position model, and so are windows of another slice
-    /// count.
-    pub fn sliced<'w>(
-        &mut self,
-        ctx: &ExecutionContext,
-        base: (&'w Views, Sliced<'w>),
-        windows: Option<&'w mut Windows>,
-    ) -> Result<SlicedRead<'w>, GpuError> {
-        let (views, obj) = base;
-        let w = match (&self.sampled, windows) {
-            (None, None) => return Ok(SlicedRead::Base(views, obj)),
-            (Some(_), Some(w)) => w,
-            _ => return Err(another_model()),
-        };
-        if w.deeper.len() != obj.deeper.len() {
-            return Err(GpuError::Shape(format!(
-                "windows of {} slices for an object of {}",
-                1 + w.deeper.len(),
-                1 + obj.deeper.len()
-            )));
-        }
-        for (slice, spectra) in obj.deeper.iter().zip(&mut w.spectra) {
-            self.spectra_of(ctx, slice, spectra)?;
-        }
-        Ok(SlicedRead::Windows(views, w))
-    }
-
-    /// The views and every slice the passes over `stack` read of `read`: its base, or each
-    /// slice's windows of the stack sampled into its windows, three launches per
-    /// [`SAMPLER_CHUNK`] groups a slice ([`Self::windows_of`]).
-    pub fn slices<'r>(
-        &mut self,
-        ctx: &ExecutionContext,
-        read: &'r mut SlicedRead<'_>,
-        stack: StackRef<'_>,
-    ) -> Result<(&'r Views, Sliced<'r>), GpuError> {
-        let (views, w) = match read {
-            SlicedRead::Base(views, obj) => return Ok((*views, *obj)),
-            SlicedRead::Windows(views, w) => (*views, &mut **w),
-        };
-        let block = WindowBlock {
-            slice: 0,
-            order: [0, 0],
-            modes: Modes::All,
-            block: 0,
-        };
-        self.windows_of(ctx, views, stack, None, block, &mut w.blocks)?;
-        for (spectra, win) in w.spectra.iter().zip(&mut w.deeper) {
-            self.windows_of(ctx, views, stack, Some(spectra), block, win)?;
-        }
-        let deeper = &w.deeper;
-        Ok((
-            &w.views,
-            Sliced {
-                first: &w.blocks,
-                deeper,
-            },
-        ))
     }
 
     /// Under [`Sampling::FullObject`], `stack`'s windows over the scan's `views` lent from
@@ -992,19 +941,6 @@ impl Modelled<'_> {
         s.sampler.place(ctx, at, patches, 0, out)
     }
 
-    /// Under [`Sampling::FullObject`], the spectra of the object planes `obj` into `out`,
-    /// which [`Self::windows_of`] samples from, by the lend's sampler
-    /// ([`ObjectSampler::spectra`], one transform); an error otherwise.
-    pub fn spectra_of(
-        &mut self,
-        ctx: &ExecutionContext,
-        obj: &DeviceBuffer<C32>,
-        out: &mut DeviceBuffer<C32>,
-    ) -> Result<(), GpuError> {
-        let s = self.sampled.as_mut().ok_or_else(another_model)?;
-        s.sampler.spectra(ctx, obj, out)
-    }
-
     /// Under [`Sampling::FullObject`], `block` of `stack`'s windows over the scan's `views`
     /// into `out`, sampled at the stack's offsets from `spectra` ([`Self::spectra_of`]), or
     /// without, from those of the object the lend took ([`ObjectSampler::windows`], three
@@ -1018,14 +954,7 @@ impl Modelled<'_> {
         block: WindowBlock,
         out: &mut DeviceBuffer<C32>,
     ) -> Result<(), GpuError> {
-        let s = self.sampled.as_mut().ok_or_else(another_model)?;
-        let at = StackPoints {
-            views,
-            stack,
-            offsets: s.offsets,
-        };
-        s.sampler
-            .windows(ctx, at, spectra.unwrap_or(s.spectra), block, out)
+        self.sample_windows(ctx, views, stack, spectra, block, out)
     }
 
     /// Under [`Sampling::FullObject`], each of `stack`'s frames' position sums of `psi`
@@ -1048,6 +977,128 @@ impl Modelled<'_> {
             return Ok(());
         };
         grad.window_position_sums(ctx, w, stack, psi, probe, [&mut q.num, &mut q.den])
+    }
+}
+
+impl<'b> Modelled<'b, AnySlices> {
+    /// This lend, reading the object it took as the whole object, which `_one` proves.
+    pub fn one_slice(self, _one: OneSlice) -> Modelled<'b, OneSlice> {
+        let Self {
+            model,
+            sampled,
+            scale,
+            background,
+            position,
+            slices: _,
+        } = self;
+        Modelled {
+            model,
+            sampled,
+            scale,
+            background,
+            position,
+            slices: PhantomData,
+        }
+    }
+
+    /// What the passes over each stack read of `base`, the scan's views and the object's
+    /// slices, the first the one the lend took: `base`, or under [`Sampling::FullObject`]
+    /// `windows`, its cut's, after the spectra of each slice past the first beside their
+    /// windows ([`Self::spectra_of`], one transform a slice). Their disagreement is an error,
+    /// as for a cut built under another position model, and so are windows of another slice
+    /// count.
+    pub fn sliced<'w>(
+        &mut self,
+        ctx: &ExecutionContext,
+        base: (&'w Views, Sliced<'w>),
+        windows: Option<&'w mut Windows>,
+    ) -> Result<SlicedRead<'w>, GpuError> {
+        let (views, obj) = base;
+        let w = match (&self.sampled, windows) {
+            (None, None) => return Ok(SlicedRead::Base(views, obj)),
+            (Some(_), Some(w)) => w,
+            _ => return Err(another_model()),
+        };
+        if w.deeper.len() != obj.deeper.len() {
+            return Err(GpuError::Shape(format!(
+                "windows of {} slices for an object of {}",
+                1 + w.deeper.len(),
+                1 + obj.deeper.len()
+            )));
+        }
+        for (slice, spectra) in obj.deeper.iter().zip(&mut w.spectra) {
+            self.spectra_of(ctx, slice, spectra)?;
+        }
+        Ok(SlicedRead::Windows(views, w))
+    }
+
+    /// The views and every slice the passes over `stack` read of `read`: its base, or each
+    /// slice's windows of the stack sampled into its windows, three launches per
+    /// [`SAMPLER_CHUNK`] groups a slice, as [`Modelled::windows_of`].
+    pub fn slices<'r>(
+        &mut self,
+        ctx: &ExecutionContext,
+        read: &'r mut SlicedRead<'_>,
+        stack: StackRef<'_>,
+    ) -> Result<(&'r Views, Sliced<'r>), GpuError> {
+        let (views, w) = match read {
+            SlicedRead::Base(views, obj) => return Ok((*views, *obj)),
+            SlicedRead::Windows(views, w) => (*views, &mut **w),
+        };
+        let block = WindowBlock {
+            slice: 0,
+            order: [0, 0],
+            modes: Modes::All,
+            block: 0,
+        };
+        self.sample_windows(ctx, views, stack, None, block, &mut w.blocks)?;
+        for (spectra, win) in w.spectra.iter().zip(&mut w.deeper) {
+            self.sample_windows(ctx, views, stack, Some(spectra), block, win)?;
+        }
+        let deeper = &w.deeper;
+        Ok((
+            &w.views,
+            Sliced {
+                first: &w.blocks,
+                deeper,
+            },
+        ))
+    }
+}
+
+impl<K> Modelled<'_, K> {
+    /// Under [`Sampling::FullObject`], the spectra of the object planes `obj` into `out`,
+    /// which [`Self::windows_of`] samples from, by the lend's sampler
+    /// ([`ObjectSampler::spectra`], one transform); an error otherwise.
+    pub fn spectra_of(
+        &mut self,
+        ctx: &ExecutionContext,
+        obj: &DeviceBuffer<C32>,
+        out: &mut DeviceBuffer<C32>,
+    ) -> Result<(), GpuError> {
+        let s = self.sampled.as_mut().ok_or_else(another_model)?;
+        s.sampler.spectra(ctx, obj, out)
+    }
+
+    /// [`Modelled::windows_of`] for a lend of any slice count, whose `None` reads the slice
+    /// the lend took.
+    fn sample_windows(
+        &mut self,
+        ctx: &ExecutionContext,
+        views: &Views,
+        stack: StackRef<'_>,
+        spectra: Option<&DeviceBuffer<C32>>,
+        block: WindowBlock,
+        out: &mut DeviceBuffer<C32>,
+    ) -> Result<(), GpuError> {
+        let s = self.sampled.as_mut().ok_or_else(another_model)?;
+        let at = StackPoints {
+            views,
+            stack,
+            offsets: s.offsets,
+        };
+        s.sampler
+            .windows(ctx, at, spectra.unwrap_or(s.spectra), block, out)
     }
 
     /// The far sums of `llk` and of every stepped feature.
@@ -1164,7 +1215,8 @@ impl FeaturesMut<'_> {
     /// cannot change while they are: the model of every feature set, the position's shift
     /// after the spectra of `probe` it moves (two launches) if it moves the probe, or the
     /// sampler after the spectra of `obj` (one transform) if it samples the object, and the
-    /// propagator's stage `exit`, and the sums.
+    /// propagator's stage `exit`, and the sums. It reads `obj` as one slice of any count;
+    /// [`Modelled::one_slice`] narrows it to read `obj` as the whole object.
     pub fn lend<'b>(
         &'b mut self,
         ctx: &ExecutionContext,
@@ -1173,7 +1225,7 @@ impl FeaturesMut<'_> {
         obj: &DeviceBuffer<C32>,
         probe: &'b DeviceBuffer<C32>,
         exit: ExitPass<'b>,
-    ) -> Result<Modelled<'b>, GpuError> {
+    ) -> Result<Modelled<'b, AnySlices>, GpuError> {
         let (scale, scale_sums) = match &mut self.scale {
             Some(s) => (Some(&*s.values), s.sums.as_deref_mut()),
             None => (None, None),
@@ -1226,6 +1278,7 @@ impl FeaturesMut<'_> {
             scale: scale_sums,
             background: background_sums,
             position,
+            slices: PhantomData,
         })
     }
 
@@ -1682,16 +1735,19 @@ enum Cycle {
     Ap {
         params: ApParams,
         llk: bool,
+        one: OneSlice,
     },
     /// Its buffers are the device's [`CarriedBufs`], which every DM epoch shares.
     Dm {
         params: DmParams,
         first: bool,
+        one: OneSlice,
     },
     /// Its buffers are the device's [`CarriedBufs`], which every RAAR epoch shares.
     Raar {
         params: RaarParams,
         first: bool,
+        one: OneSlice,
     },
     Rpie(RpieParams, Box<RpieScratch>),
     /// Its buffers are the device's [`MlState`], which every ML epoch shares.
@@ -1717,9 +1773,9 @@ enum Cycle {
 impl Cycle {
     fn epoch(&self) -> Epoch {
         match *self {
-            Self::Ap { params, llk } => Epoch::Ap { params, llk },
-            Self::Dm { params, first } => Epoch::Dm { params, first },
-            Self::Raar { params, first } => Epoch::Raar { params, first },
+            Self::Ap { params, llk, .. } => Epoch::Ap { params, llk },
+            Self::Dm { params, first, .. } => Epoch::Dm { params, first },
+            Self::Raar { params, first, .. } => Epoch::Raar { params, first },
             Self::Rpie(p, _) => Epoch::Rpie(p),
             Self::Ml { params, first, llk } => Epoch::Ml { params, first, llk },
             Self::Bh { params, cg } => Epoch::Bh { params, cg },
@@ -1730,7 +1786,7 @@ impl Cycle {
 
 /// ML's conjugate-gradient state and line-search scratch, sized by the device and the
 /// position model alone, so one state serves the graphs of every ML epoch of that model; each
-/// call's first epoch resets the state.
+/// call's first epoch resets the state. ML runs an object of `one` slice.
 struct MlState {
     /// The line search's stacks, cut by its fields and moved probes.
     cut: Cut,
@@ -1753,6 +1809,7 @@ struct MlState {
     fields: GammaStacks,
     /// What the line search adds under the position model it was built for.
     position: Option<MlPosition>,
+    one: OneSlice,
 }
 
 /// An [`MlState`] lent to an epoch.
@@ -1769,6 +1826,7 @@ pub(super) struct MlBufs<'a> {
     pub icalc: &'a mut DeviceBuffer<f32>,
     pub fields: &'a mut GammaStacks,
     pub position: Option<&'a mut MlPosition>,
+    pub one: OneSlice,
 }
 
 impl MlState {
@@ -1781,6 +1839,7 @@ impl MlState {
         rule: StackRule,
         lens: [usize; 2],
         position: PositionScratch,
+        one: OneSlice,
     ) -> Result<Self, EngineError> {
         // The fields po, a, b: `gamma_fields` (0), the transforms, `gamma_frames` (4). Under
         // the moved probe those of P and dP (`shifted_probe` 0 and 2, `shift_w` 1 and 3) give
@@ -1837,6 +1896,7 @@ impl MlState {
             fields: GammaStacks::zeroed(stream, cut.wave_len(dims))?,
             position,
             cut,
+            one,
         })
     }
 
@@ -1854,6 +1914,7 @@ impl MlState {
             icalc: &mut self.icalc,
             fields: &mut self.fields,
             position: self.position.as_mut(),
+            one: self.one,
         }
     }
 
@@ -2209,7 +2270,7 @@ impl BhState {
 }
 
 /// rPIE's batches (one table entry and plan length each) and buffers, sized for the longest
-/// batch.
+/// batch, for an object of `one` slice.
 struct RpieScratch {
     batches: Vec<Frames>,
     /// Values per frame plane.
@@ -2226,6 +2287,7 @@ struct RpieScratch {
     ones: DeviceBuffer<C32>,
     /// The position model's state, if the device models positions.
     moved: Option<RpieMoved>,
+    one: OneSlice,
 }
 
 /// An [`RpieScratch`] lent to an epoch.
@@ -2248,6 +2310,7 @@ pub(super) struct RpieBufs<'a> {
     pub pmax: &'a mut DeviceBuffer<f32>,
     /// A probe of ones, so `obj_probe_to_psi` yields the object windows.
     pub ones: &'a DeviceBuffer<C32>,
+    pub one: OneSlice,
 }
 
 impl RpieScratch {
@@ -2259,6 +2322,7 @@ impl RpieScratch {
         params: &RpieParams,
         nprobe_values: usize,
         moved: Option<MovedScratch>,
+        one: OneSlice,
     ) -> Result<Self, EngineError> {
         let dims = views.dims();
         let batch = to_u32("batch_size", params.batch_size)?;
@@ -2291,6 +2355,7 @@ impl RpieScratch {
             ones: DeviceBuffer::from_host(stream, &vec![C32 { re: 1.0, im: 0.0 }; nprobe_values])?,
             moved,
             table,
+            one,
         })
     }
 
@@ -2308,6 +2373,7 @@ impl RpieScratch {
             ptilde: &mut self.ptilde,
             pmax: &mut self.pmax,
             ones: &self.ones,
+            one: self.one,
         };
         (bufs, self.moved.as_mut())
     }
@@ -2765,11 +2831,12 @@ impl Device {
         1 + self.deeper().len()
     }
 
-    /// Fails on a multislice object for `what`, which models one slice: every pass but
-    /// LSQML's, BH's and the LLK pass is enqueued behind this.
-    fn one_slice(&self, what: &str) -> Result<(), EngineError> {
+    /// The proof that the object has one slice, which `what` models; fails on a multislice
+    /// object. Every pass but LSQML's, BH's and the LLK pass is enqueued behind this, which
+    /// holds while the device lives: nothing changes its slice count.
+    fn one_slice(&self, what: &str) -> Result<OneSlice, EngineError> {
         match &self.slices {
-            None => Ok(()),
+            None => Ok(OneSlice(())),
             Some(s) => Err(EngineError::Invalid(format!(
                 "{what} runs one object slice, got {}: only LSQML, BH and the LLK pass run a \
                  multislice object",
@@ -3022,25 +3089,26 @@ impl Device {
     /// The buffers of `epoch`'s cycle, and with graphs its graph, captured from them.
     fn new_run(&mut self, epoch: Epoch) -> Result<EpochRun, EngineError> {
         let what = format!("{:?}", epoch.algorithm());
-        if !matches!(epoch, Epoch::Lsqml { .. } | Epoch::Bh { .. }) {
-            self.one_slice(&what)?;
-        }
         let mut cycle = match epoch {
             Epoch::Ap { params, llk } => {
+                let one = self.one_slice(&what)?;
                 self.features.build_solve(&self.stream)?;
-                Cycle::Ap { params, llk }
+                Cycle::Ap { params, llk, one }
             }
             Epoch::Dm { params, first } => {
+                let one = self.one_slice(&what)?;
                 self.build_carried(false)?;
                 self.features.build_solve(&self.stream)?;
-                Cycle::Dm { params, first }
+                Cycle::Dm { params, first, one }
             }
             Epoch::Raar { params, first } => {
+                let one = self.one_slice(&what)?;
                 self.build_carried(true)?;
                 self.features.build_solve(&self.stream)?;
-                Cycle::Raar { params, first }
+                Cycle::Raar { params, first, one }
             }
             Epoch::Rpie(p) => {
+                let one = self.one_slice(&what)?;
                 let moved = self.features.positioned().then(|| self.moved_scratch());
                 let scratch = RpieScratch::new(
                     &self.stream,
@@ -3049,11 +3117,13 @@ impl Device {
                     &p,
                     self.probe.len(),
                     moved,
+                    one,
                 )?;
                 Cycle::Rpie(p, Box::new(scratch))
             }
             Epoch::Ml { params, first, llk } => {
-                self.build_ml()?;
+                let one = self.one_slice(&what)?;
+                self.build_ml(one)?;
                 Cycle::Ml { params, first, llk }
             }
             Epoch::Bh { params, cg } => {
@@ -3089,13 +3159,13 @@ impl Device {
     /// search's moved probes if it moves the probe, its windows if it samples the object.
     /// One of another model is replaced only after [`Self::set_features`] or
     /// [`Self::set_sampling`] has dropped every run, so no graph captured from it survives.
-    fn build_ml(&mut self) -> Result<(), EngineError> {
+    fn build_ml(&mut self, one: OneSlice) -> Result<(), EngineError> {
         let position = self.features.scratch();
         if !(self.ml.as_ref()).is_some_and(|ml| ml.fits(position)) {
             let lens = [self.obj.len(), self.probe.len()];
             let dims = self.dims();
             let (stream, kernels) = (&self.stream, &self.kernels);
-            let state = MlState::new(stream, kernels, &dims, self.rule, lens, position)?;
+            let state = MlState::new(stream, kernels, &dims, self.rule, lens, position, one)?;
             self.ml = Some(Box::new(state));
         }
         Ok(())
@@ -3180,8 +3250,8 @@ impl Device {
 
     /// [`Bufs::scale_to_photons`] enqueued eagerly, with `total` the unmasked observed photons.
     pub fn scale_to_photons(&mut self, total: f32) -> Result<(), EngineError> {
-        self.one_slice("ML's scaling")?;
-        self.build_ml()?;
+        let one = self.one_slice("ML's scaling")?;
+        self.build_ml(one)?;
         let ctx = self.context();
         let (mut bufs, mut passes, _) = self.lend();
         Ok(bufs.with_ml(|b, ml| b.scale_to_photons(&ctx, &mut passes, ml, total))?)
@@ -3224,11 +3294,11 @@ impl Device {
         update: [bool; 2],
         read: impl FnOnce(&Arc<CudaStream>, [&DeviceBuffer<C32>; 2]) -> Result<R, EngineError>,
     ) -> Result<R, EngineError> {
-        self.one_slice("ML's gradient")?;
+        let one = self.one_slice("ML's gradient")?;
         let ran = {
             let ctx = self.context();
             let (mut bufs, mut passes, _) = self.lend();
-            bufs.ml_grad(&ctx, &mut passes, update, None)
+            bufs.ml_grad(&ctx, &mut passes, update, None, one)
         };
         let read = match ran {
             Ok(_) => read(&self.stream, [&self.obj_sums.num, &self.probe_sums.num]),
@@ -3329,14 +3399,14 @@ impl<'a> Bufs<'a> {
         cycle: &mut Cycle,
     ) -> Result<Option<Ended>, GpuError> {
         match cycle {
-            Cycle::Ap { params, llk } => {
-                self.ap_cycle(ctx, passes, params, llk.then(|| ring.record()))
+            Cycle::Ap { params, llk, one } => {
+                self.ap_cycle(ctx, passes, params, llk.then(|| ring.record()), *one)
             }
-            Cycle::Dm { params, first } => self
-                .with_carried(|b, c| b.dm_cycle(ctx, passes, c, params, *first))
+            Cycle::Dm { params, first, one } => self
+                .with_carried(|b, c| b.dm_cycle(ctx, passes, c, params, *first, *one))
                 .map(|()| None),
-            Cycle::Raar { params, first } => self
-                .with_carried(|b, c| b.raar_cycle(ctx, passes, c, params, *first))
+            Cycle::Raar { params, first, one } => self
+                .with_carried(|b, c| b.raar_cycle(ctx, passes, c, params, *first, *one))
                 .map(|()| None),
             Cycle::Rpie(p, scratch) => {
                 let (mut rb, moved) = scratch.lend();

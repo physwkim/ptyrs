@@ -6,7 +6,7 @@ use crate::gpu::{
 };
 use cuda_async::device_operation::ExecutionContext;
 
-use super::device::{PassesMut, Sample};
+use super::device::{OneSlice, PassesMut, Sample};
 use super::{Bufs, Epoch, GpuPtycho};
 use crate::engine::ptycho::llk_due;
 use crate::engine::{ApParams, EngineError};
@@ -50,11 +50,12 @@ impl Bufs<'_> {
         passes: &mut PassesMut<'_>,
         params: &ApParams,
         mut llk: Option<RecordWriter<'_>>,
+        one: OneSlice,
     ) -> Result<Option<Ended>, GpuError> {
         let (o, mut p) = (params.obj_inertia, params.probe_inertia);
         let stepped = match passes {
             PassesMut::Fused(f) if self.features.stepped() => {
-                self.step_features(ctx, f, llk.take())?
+                self.step_features(ctx, f, llk.take(), one)?
             }
             _ => None,
         };
@@ -71,7 +72,7 @@ impl Bufs<'_> {
                 }
             }
             PassesMut::Fused(f) => {
-                if self.fused_ap(ctx, f, llk.as_mut(), o.is_some(), p)? {
+                if self.fused_ap(ctx, f, llk.as_mut(), o.is_some(), p, one)? {
                     p = None;
                 }
             }
@@ -97,12 +98,13 @@ impl Bufs<'_> {
         mut llk: Option<&mut RecordWriter<'_>>,
         obj: bool,
         probe_inertia: Option<f64>,
+        one: OneSlice,
     ) -> Result<bool, GpuError> {
         let probe = probe_inertia.is_some();
         let dims = *self.views.dims();
-        let mut m =
-            self.features
-                .lend(ctx, self.kernels, &dims, self.obj, self.probe, self.exit)?;
+        let mut m = (self.features)
+            .lend(ctx, self.kernels, &dims, self.obj, self.probe, self.exit)?
+            .one_slice(one);
         for s in 0..self.scratch.len() {
             let stack = self.scratch.at(s);
             let windows = self.windows.as_deref_mut();

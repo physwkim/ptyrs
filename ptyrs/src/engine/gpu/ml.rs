@@ -16,7 +16,7 @@ use crate::gpu::{
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaStream, DeviceBuffer};
 
-use super::device::{M1Bufs, MlBufs, PassesMut, Sample};
+use super::device::{M1Bufs, MlBufs, OneSlice, PassesMut, Sample};
 use super::propagate::Propagate;
 use super::{Bufs, Cut, Epoch, GpuPtycho, plane_len};
 use crate::engine::ptycho::llk_due;
@@ -167,7 +167,7 @@ impl Bufs<'_> {
         first: bool,
         mut llk: Option<RecordWriter<'_>>,
     ) -> Result<Option<Ended>, GpuError> {
-        let update = [params.update_object, params.update_probe];
+        let (update, one) = ([params.update_object, params.update_probe], ml.one);
         if first {
             for b in ml.h.iter_mut().chain(ml.d.iter_mut()) {
                 crate::gpu::zero(ctx, b)?;
@@ -175,16 +175,16 @@ impl Bufs<'_> {
         }
         let stepped = match passes {
             PassesMut::Fused(f) if self.features.stepped() => {
-                self.step_features(ctx, f, llk.take())?
+                self.step_features(ctx, f, llk.take(), one)?
             }
             _ => None,
         };
         if let PassesMut::Fused(f) = passes
             && self.features.position_refined()
         {
-            self.projected_position_sums(ctx, f)?;
+            self.projected_position_sums(ctx, f, one)?;
         }
-        let ended = self.ml_grad(ctx, passes, update, llk)?.or(stepped);
+        let ended = self.ml_grad(ctx, passes, update, llk, one)?.or(stepped);
 
         // β from the gradients in the sums and the last ones in h (then h = g), and d.
         let lens = [self.obj_len, self.probe_len];
@@ -211,9 +211,9 @@ impl Bufs<'_> {
         // probes W of P and W' of dP: po = O W, a = dO W + O W', b = dO W'; under the windows,
         // those of the windows of O and dO.
         let dims = *self.views.dims();
-        let mut m =
-            self.features
-                .lend(ctx, self.kernels, &dims, self.obj, self.probe, self.exit)?;
+        let mut m = (self.features)
+            .lend(ctx, self.kernels, &dims, self.obj, self.probe, self.exit)?
+            .one_slice(one);
         let obs = GammaCounts {
             counts: self.counts,
             model: Model {
@@ -332,11 +332,12 @@ impl Bufs<'_> {
         &mut self,
         ctx: &ExecutionContext,
         f: &mut FusedBufs,
+        one: OneSlice,
     ) -> Result<(), GpuError> {
         let dims = *self.views.dims();
-        let mut m =
-            self.features
-                .lend(ctx, self.kernels, &dims, self.obj, self.probe, self.exit)?;
+        let mut m = (self.features)
+            .lend(ctx, self.kernels, &dims, self.obj, self.probe, self.exit)?
+            .one_slice(one);
         for s in 0..self.scratch.len() {
             let stack = self.scratch.at(s);
             let exit = Exit::Ap {
@@ -384,9 +385,10 @@ impl Bufs<'_> {
         passes: &mut PassesMut<'_>,
         update: [bool; 2],
         mut llk: Option<RecordWriter<'_>>,
+        one: OneSlice,
     ) -> Result<Option<Ended>, GpuError> {
         match passes {
-            PassesMut::Fused(f) => self.fused_grad(ctx, f, update, llk.as_mut())?,
+            PassesMut::Fused(f) => self.fused_grad(ctx, f, update, llk.as_mut(), one)?,
             PassesMut::M1(m1) => {
                 for s in 0..self.scratch.len() {
                     self.m1_grad(ctx, m1, s, update, llk.as_mut())?;
@@ -406,11 +408,12 @@ impl Bufs<'_> {
         f: &mut FusedBufs,
         update: [bool; 2],
         mut llk: Option<&mut RecordWriter<'_>>,
+        one: OneSlice,
     ) -> Result<(), GpuError> {
         let dims = *self.views.dims();
-        let mut m =
-            self.features
-                .lend(ctx, self.kernels, &dims, self.obj, self.probe, self.exit)?;
+        let mut m = (self.features)
+            .lend(ctx, self.kernels, &dims, self.obj, self.probe, self.exit)?
+            .one_slice(one);
         for s in 0..self.scratch.len() {
             let stack = self.scratch.at(s);
             let windows = self.windows.as_deref_mut();
@@ -540,14 +543,9 @@ impl Bufs<'_> {
                 }
             }
             PassesMut::Fused(f) => {
-                let mut m = self.features.lend(
-                    ctx,
-                    self.kernels,
-                    &dims,
-                    self.obj,
-                    self.probe,
-                    self.exit,
-                )?;
+                let mut m = (self.features)
+                    .lend(ctx, self.kernels, &dims, self.obj, self.probe, self.exit)?
+                    .one_slice(ml.one);
                 // The exit waves' photons alone: icalc_add scales them, and
                 // scale_obj_probe takes the background's off the total.
                 let model = Model {

@@ -800,3 +800,45 @@ fn gpu_refuses_what_it_cannot_run_on_slices() {
     assert!(gpu.history().is_empty());
     assert_eq!(gpu.cycle(), 0);
 }
+
+/// Under [`Sampling::FullObject`] a pass that models one slice would sample the windows of
+/// the first slice alone as the whole object; on a multislice object each is refused before
+/// it launches anything, changing neither the arrays nor the offsets.
+#[test]
+fn gpu_refuses_one_slice_windows_of_slices() {
+    let c = case(optics("angular spectrum", 3), NPOS, 1);
+    let mut gpu = c.gpu(OPTIONS);
+    gpu.set_features(&moved(true)).unwrap();
+    gpu.set_sampling(Sampling::FullObject).unwrap();
+    let before: Vec<_> = gpu.objects().unwrap().iter().map(|o| bits(o)).collect();
+    let probe = bits(&gpu.probe().unwrap());
+    let offsets = gpu.features().unwrap().position;
+
+    let refused = [
+        ("Ap", gpu.ap(&ApParams::default(), 1).unwrap_err()),
+        ("Dm", gpu.dm(&Default::default(), 1).unwrap_err()),
+        ("Raar", gpu.raar(&Default::default(), 1).unwrap_err()),
+        ("Rpie", gpu.rpie(&Default::default(), 1).unwrap_err()),
+        ("ML's scaling", gpu.ml(&Default::default(), 1).unwrap_err()),
+        ("ML's gradient", gpu.ml_grads().unwrap_err()),
+    ];
+    let only = "only LSQML, BH and the LLK pass run a multislice object";
+    for (what, e) in refused {
+        let e = e.to_string();
+        let named = format!("{what} runs one object slice, got 3");
+        assert!(e.contains(&named) && e.contains(only), "{e}");
+    }
+
+    let after: Vec<_> = gpu.objects().unwrap().iter().map(|o| bits(o)).collect();
+    assert!(after == before, "a refused pass changed the object");
+    assert!(
+        bits(&gpu.probe().unwrap()) == probe,
+        "a refused pass changed the probe"
+    );
+    assert!(
+        gpu.features().unwrap().position == offsets,
+        "a refused pass moved the offsets"
+    );
+    assert!(gpu.history().is_empty());
+    assert_eq!(gpu.cycle(), 0);
+}

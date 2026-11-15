@@ -44,7 +44,7 @@ use crate::gpu::{
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 
-use device::{Bufs, Device, NormBufs, PassesMut, SliceUploads, Sliced, Uploads};
+use device::{Bufs, Device, NormBufs, OneSlice, PassesMut, SliceUploads, Sliced, Uploads};
 
 use crate::engine::ptycho::{Algorithm, LlkRecord, zero_phase_ramp};
 use crate::engine::{
@@ -889,11 +889,12 @@ impl Bufs<'_> {
         ctx: &ExecutionContext,
         f: &mut FusedBufs,
         mut llk: Option<RecordWriter<'_>>,
+        one: OneSlice,
     ) -> Result<Option<Ended>, GpuError> {
         let dims = *self.views.dims();
-        let mut m =
-            self.features
-                .lend(ctx, self.kernels, &dims, self.obj, self.probe, self.exit)?;
+        let mut m = (self.features)
+            .lend(ctx, self.kernels, &dims, self.obj, self.probe, self.exit)?
+            .one_slice(one);
         for s in 0..self.scratch.len() {
             let stack = self.scratch.at(s);
             let windows = self.windows.as_deref_mut();
