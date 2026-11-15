@@ -43,7 +43,7 @@ pub fn shift(j: usize, ny: usize, nx: usize) -> usize {
 
 /// PyNX far-field quadratic phase `exp(iπ/(λz)·((x-nx/2)²px² + (y-ny/2)²py²))`, natural order.
 pub fn quad_phase(geometry: &Geometry) -> Vec<C64> {
-    let [ny, nx] = geometry.frame;
+    let [ny, nx] = geometry.frame.sides();
     let [py, px] = geometry.pixel_size_object();
     let f = PI / (geometry.wavelength * geometry.distance);
     let mut q = Vec::with_capacity(ny * nx);
@@ -72,10 +72,10 @@ pub struct Far {
 
 impl Far {
     pub fn new(geometry: &Geometry) -> Self {
-        let [ny, nx] = geometry.frame;
+        let [ny, nx] = geometry.frame.sides();
         let mut planner = FftPlanner::new();
         Self {
-            frame: geometry.frame,
+            frame: geometry.frame.sides(),
             quad: quad_phase(geometry),
             fx: planner.plan_fft_forward(nx),
             fy: planner.plan_fft_forward(ny),
@@ -317,7 +317,7 @@ fn pairs(p: &Positions, scale: [f64; 2]) -> Value {
 /// so large that a point lands more than 1e10 m from the centre.
 pub fn generate(spec: &Spec) -> Result<Generated, RefgenError> {
     let g = spec.geometry;
-    let [ny, nx] = g.frame;
+    let [ny, nx] = g.frame.sides();
     let plane = ny * nx;
     let pixel = g.pixel_size_object();
     if spec.fly_px.is_empty() {
@@ -372,9 +372,14 @@ pub fn generate(spec: &Spec) -> Result<Generated, RefgenError> {
     cover_x.extend(truth_pp.x().iter().map(|x| x + fmax * pixel[1]));
     cover_y.extend(nominal_pp.y());
     cover_x.extend(nominal_pp.x());
-    let obj_shape = required_obj_shape(&Positions::new(cover_y, cover_x)?, pixel, g.frame, 16);
+    let obj_shape = required_obj_shape(
+        &Positions::new(cover_y, cover_x)?,
+        pixel,
+        g.frame.sides(),
+        16,
+    );
     let object = textured_object(obj_shape);
-    let probe = sim::probe(g.frame, spec.nmode)?;
+    let probe = sim::probe(g.frame.sides(), spec.nmode)?;
 
     // Probe variation of mode 0.
     let sigma = ny.min(nx) as f64 / 12.0;
@@ -427,7 +432,7 @@ pub fn generate(spec: &Spec) -> Result<Generated, RefgenError> {
     } else {
         vec![1.0; nframe]
     };
-    let bg = spec.background.map(|b| b.plane(g.frame));
+    let bg = spec.background.map(|b| b.plane(g.frame.sides()));
     for (out, &s) in intensity.chunks_exact_mut(plane).zip(&flux) {
         out.iter_mut().for_each(|v| *v *= scale * s);
         if let Some(bg) = &bg {
@@ -449,7 +454,7 @@ pub fn generate(spec: &Spec) -> Result<Generated, RefgenError> {
     let mut weights = vec![1.0];
     weights.resize(spec.init_nmode, 0.1);
     let init_probe = hermite_modes(
-        g.frame,
+        g.frame.sides(),
         &weights,
         1.2 * sigma,
         sigma,
@@ -467,7 +472,7 @@ pub fn generate(spec: &Spec) -> Result<Generated, RefgenError> {
             "wavelength_m": g.wavelength,
             "distance_m": g.distance,
             "detector_pixel_m": g.detector_pixel,
-            "frame": g.frame,
+            "frame": g.frame.sides(),
             "pixel_size_object_m": pixel,
         },
         "pattern": match spec.pattern {

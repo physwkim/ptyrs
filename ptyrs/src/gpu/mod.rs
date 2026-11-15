@@ -47,12 +47,13 @@ pub mod sampling;
 pub use crate::fft::C32;
 pub use bh::{
     BH_HESS, BH_STEP, BhArray, BhBatch, BhDisp, BhEntry, BhFarRef, BhFieldsRef, BhKernels,
-    BhMovedFarRef, BhMovedRef, BhMovesRef, BhNearMut, BhOffsets, BhParts, BhPositions, BhScan,
-    BhSecondRef, BhTangentsMut, BhVar, BhWinRef, BhWinSecond, EpochOrder,
+    BhLastSlice, BhMovedFarRef, BhMovedRef, BhMovesRef, BhNearMut, BhOffsets, BhParts, BhPositions,
+    BhScan, BhSecondRef, BhTangentsMut, BhVar, BhWinRef, BhWinSecond, EpochOrder,
 };
 pub use fused::{
     BackgroundSums, Exit, FUSED_SIDES, FarSums, FusedBufs, FusedInputs, FusedSums, Model,
-    ProbeSpectrum, PsiSums, Shift, ShiftProbe, ShiftSums, ShiftedProbeSums, SpectrumBuf,
+    ProbeSpectrum, PsiSums, Shift, ShiftProbe, ShiftSums, ShiftedNumSums, ShiftedProbes,
+    ShiftedStepSums, ShiftedSums, SpectrumBuf,
 };
 pub use grad::{
     CG_BLOCKS, GAMMA_CHUNK, GammaCounts, GammaStacks, GradKernels, ObjProbeScale, StackWindows,
@@ -64,8 +65,8 @@ pub use lsqml::{
 pub use opr::{Opr, OprKernels, OprPlanes};
 pub use ops::{
     LLK_TREE_LEAVES, LlkPartial, LlkScratch, LlkSums, MASKED, OBJ_TILE, Permutation,
-    PositionPartial, ScalePartial, StackCtl, StackGeom, StackRef, StackTable, UpdateSums, ViewAddr,
-    ViewDims, Views, view_tiles,
+    PositionPartial, ScalePartial, StackCtl, StackGeom, StackRef, StackTable, SumTarget, Sums,
+    UpdateSums, ViewAddr, ViewDims, Views, view_tiles,
 };
 pub use optics::{
     BandCarry, BandedTransfer, ExitPass, ExitStage, FrameWaves, OpticsKernels, SlicePhase,

@@ -63,9 +63,14 @@ pub fn truth(
     let f = ptyrs::base::sim::fermat(npos, step * pixel[1]);
     let round = |v: &[f64]| v.iter().map(|&x| x as f32 as f64).collect();
     let positions = Positions::new(round(f.y()), round(f.x())).unwrap();
-    let shape = required_obj_shape(&positions.pynx_preprocess(pixel), pixel, g.frame, 16);
+    let shape = required_obj_shape(
+        &positions.pynx_preprocess(pixel),
+        pixel,
+        g.frame.sides(),
+        16,
+    );
     let object = ptyrs::base::sim::object(shape);
-    let probe = ptyrs::base::sim::probe(g.frame, nprobe).unwrap();
+    let probe = ptyrs::base::sim::probe(g.frame.sides(), nprobe).unwrap();
     let sim = ptyrs::engine::sim::simulate_truth(g, positions, &object, &probe, photons, None, 1)
         .unwrap();
     (sim, object, probe)

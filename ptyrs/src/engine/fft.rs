@@ -9,16 +9,24 @@ use rustfft::{Fft, FftPlanner};
 #[derive(Clone)]
 pub struct Fft2 {
     shape: [usize; 2],
+    /// `ny · nx`.
+    plane: usize,
     /// `[forward, inverse]` along x (length `nx`) and along y (length `ny`).
     x: [Arc<dyn Fft<f64>>; 2],
     y: [Arc<dyn Fft<f64>>; 2],
 }
 
 impl Fft2 {
+    /// # Panics
+    ///
+    /// If `ny · nx` passes `usize`; a [`crate::base::Frame`] or a stack plane never does.
     pub fn new(shape: [usize; 2]) -> Self {
+        let plane = (shape[0].checked_mul(shape[1]))
+            .unwrap_or_else(|| panic!("a {shape:?} plane has more than usize pixels"));
         let mut planner = FftPlanner::new();
         Self {
             shape,
+            plane,
             x: [
                 planner.plan_fft_forward(shape[1]),
                 planner.plan_fft_inverse(shape[1]),
@@ -34,6 +42,11 @@ impl Fft2 {
         self.shape
     }
 
+    /// `ny · nx`.
+    pub fn plane_len(&self) -> usize {
+        self.plane
+    }
+
     /// Forward transform of every plane in `planes` (length a multiple of `ny * nx`).
     pub fn forward(&self, planes: &mut [C64]) {
         self.run(planes, 0);
@@ -46,7 +59,7 @@ impl Fft2 {
 
     fn run(&self, planes: &mut [C64], dir: usize) {
         let [ny, nx] = self.shape;
-        let n = ny * nx;
+        let n = self.plane;
         assert_eq!(
             planes.len() % n,
             0,

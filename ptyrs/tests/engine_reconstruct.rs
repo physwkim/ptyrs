@@ -30,9 +30,9 @@ fn case_with(frame: usize, nmode: usize, masked: bool) -> Case {
     let g = Geometry::new(1.5e-10, 1.0, 75e-6, [frame, frame]).unwrap();
     let pixel = g.pixel_size_object();
     let pos = ptyrs::base::sim::fermat(40, 2.5 * pixel[1]);
-    let shape = required_obj_shape(&pos.pynx_preprocess(pixel), pixel, g.frame, 4);
+    let shape = required_obj_shape(&pos.pynx_preprocess(pixel), pixel, g.frame.sides(), 4);
     let object = ptyrs::base::sim::object(shape);
-    let probe = ptyrs::base::sim::probe(g.frame, nmode).unwrap();
+    let probe = ptyrs::base::sim::probe(g.frame.sides(), nmode).unwrap();
     let mask: Option<Vec<bool>> = masked.then(|| {
         (0..frame * frame)
             .map(|i| i % frame == 20 || i / frame == 3)

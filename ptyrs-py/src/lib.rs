@@ -431,8 +431,13 @@ impl Scan {
         detector_pixel: f64,
     ) -> PyResult<Self> {
         let counts = counts_in(counts)?;
-        let geometry = Geometry::new(wavelength, distance, detector_pixel, counts.frame_shape())
-            .map_err(Error::from)?;
+        let geometry = Geometry::new(
+            wavelength,
+            distance,
+            detector_pixel,
+            counts.frame_shape().sides(),
+        )
+        .map_err(Error::from)?;
         let positions =
             Positions::new(y.as_array().to_vec(), x.as_array().to_vec()).map_err(Error::from)?;
         Ok(Self(

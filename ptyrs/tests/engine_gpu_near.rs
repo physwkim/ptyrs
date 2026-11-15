@@ -3,7 +3,9 @@
 //! offsets enter by.
 
 use cuda_core::CudaContext;
-use ptyrs::base::{C64, Counts, Geometry, Object, Probe, Scan, Stack, required_obj_shape, sim};
+use ptyrs::base::{
+    C64, Counts, Geometry, Object, Probe, Scan, Stack, View, required_obj_shape, sim,
+};
 use ptyrs::engine::{
     ApParams, BhParams, Cost, DmParams, Feature, Features, GpuOptions, GpuPtycho, LsqmlParams,
     MlParams, Optics, Ptycho, RaarParams, RpieParams, Sampling,
@@ -23,6 +25,16 @@ fn rel_l2(a: &Stack<C64>, b: &Stack<C64>) -> f64 {
     for (x, y) in a.as_slice().iter().zip(b.as_slice()) {
         e += (x - y).norm_sqr();
         t += y.norm_sqr();
+    }
+    (e / t).sqrt()
+}
+
+/// [`rel_l2`] with each pixel's squares weighted by `weight`'s.
+fn weighted_l2(a: &Stack<C64>, b: &Stack<C64>, weight: &Stack<f64>) -> f64 {
+    let (mut e, mut t) = (0.0, 0.0);
+    for ((x, y), w) in (a.as_slice().iter().zip(b.as_slice())).zip(weight.as_slice()) {
+        e += w * (x - y).norm_sqr();
+        t += w * y.norm_sqr();
     }
     (e / t).sqrt()
 }
@@ -199,7 +211,7 @@ const PROJECTIONS: [Projections; 3] = [
 #[test]
 fn projections_match_cpu_under_every_propagator() {
     const NCYCLE: usize = 8;
-    // Measured worst: LLK 6.7e-6, object 1.6e-6, probe 2.3e-6, features 1.7e-5, offsets
+    // Measured worst: LLK 6.7e-6, object 1.6e-6, probe 2.3e-6, features 1.74e-5, offsets
     // 7.3e-7.
     const TOL: [f64; 5] = [4e-5, 1e-5, 1.5e-5, 1e-4, 4e-6];
     let stepped = |frame: usize| Features {
@@ -268,6 +280,22 @@ impl Ended {
             features: g.features().unwrap(),
         }
     }
+
+    /// `Σ |P|²` of the probe this run ends on, over `views` at the offsets it ends on: the
+    /// weight the counts put on each object pixel. Away from the views only the inertia holds
+    /// `Sampling::FullObject`'s object, where the solve's `f32` errors grow a hundredfold.
+    fn illumination(&self, views: &[View]) -> Stack<f64> {
+        let offsets = (self.features.position.as_ref()).map(|p| p.values.as_slice());
+        Sampling::FullObject.illumination(views, self.object.dims(), &self.probe, offsets)
+    }
+}
+
+/// `got`'s object within `tol` of `want`'s, weighted by `lit`, an [`Ended::illumination`]: the
+/// band the counts see, which [`assert_close`]'s whole plane leaves to the dark band's errors.
+fn assert_lit(what: &str, got: &Ended, want: &Ended, lit: &Stack<f64>, tol: f64) {
+    let e = weighted_l2(&got.object, &want.object, lit);
+    eprintln!("{what}: lit object {e:.2e}");
+    assert!(e < tol, "{what} lit object: {e:e}");
 }
 
 /// `got`'s records, object, probe, scale and background, and offsets (over the largest)
@@ -351,17 +379,20 @@ fn full_object_projections_match_cpu_under_fresnel_back() {
 /// and with a scale and a background, against the CPU's under `Sampling::FullObject`,
 /// eagerly and from graphs, over stacks of 8 frames and a last of 6, as
 /// [`projections_match_cpu_under_every_propagator`] holds them; DM's and RAAR's carried exit
-/// waves in f16 against f32 over two cycles, from graphs. A test per propagator, so the
-/// three run side by side: the CPU's object solve is most of each.
+/// waves in f16 against f32 over two cycles, from graphs. The object over the whole plane and
+/// weighted by [`Ended::illumination`] of the run compared against. A test per propagator, so
+/// the three run side by side: the CPU's object solve is most of each.
 fn full_object_projections_match_cpu(c: &Case) {
     const NCYCLE: usize = 8;
-    // Measured worst: LLK 1.8e-5, object 2.0e-3, probe 5.8e-4, features 1.5e-5, offsets
-    // 8.0e-6, from DM's drawn offsets under Fresnel, whose LLK rises on the CPU too.
-    const TOL: [f64; 5] = [6e-5, 6e-3, 2e-3, 5e-5, 2.5e-5];
+    // Five-run worst: LLK 6.18e-6, object 1.22e-5 over the whole plane (most of it the dark
+    // band's) and 1.85e-6 weighted, probe 1.90e-6, features 1.12e-5, offsets 5.77e-7.
+    const TOL: [f64; 5] = [1.9e-5, 3.7e-5, 5.8e-6, 3.4e-5, 1.8e-6];
+    const TOL_LIT: f64 = 5.6e-6;
     const NCYCLE_F16: usize = 2;
-    // Measured worst: LLK 3.6e-4, object 2.0e-3, probe 4.0e-4, features 1.9e-4, offsets
-    // 1.4e-4.
-    const TOL_F16: [f64; 5] = [1.2e-3, 6e-3, 1.2e-3, 6e-4, 4.5e-4];
+    // Five-run worst: LLK 2.61e-5, object 1.18e-4 over the whole plane and 1.77e-4 weighted,
+    // probe 5.74e-5, features 7.40e-5, offsets 5.48e-5.
+    const TOL_F16: [f64; 5] = [7.9e-5, 3.6e-4, 1.8e-4, 2.3e-4, 1.7e-4];
+    const TOL_F16_LIT: f64 = 5.4e-4;
     let frame = FUSED_SIDES[0] as usize;
     let moved = Features {
         position: Some(Feature::refined(drawn_offsets())),
@@ -398,14 +429,20 @@ fn full_object_projections_match_cpu(c: &Case) {
             on_cpu(&mut cpu, NCYCLE);
             assert_eq!(cpu.history().len(), NCYCLE);
             let want = Ended::cpu(&cpu);
+            let lit = want.illumination(c.addr.views());
             for graph in [false, true] {
                 let what = format!("{name} {} {label} graph {graph}", c.name);
-                assert_close(&what, &run(graph, false, NCYCLE), &want, TOL);
+                let got = run(graph, false, NCYCLE);
+                assert_close(&what, &got, &want, TOL);
+                assert_lit(&what, &got, &want, &lit, TOL_LIT);
             }
             if name != "AP" {
                 let what = format!("{name} {} {label} f16 against f32", c.name);
                 let want = run(true, false, NCYCLE_F16);
-                assert_close(&what, &run(true, true, NCYCLE_F16), &want, TOL_F16);
+                let got = run(true, true, NCYCLE_F16);
+                assert_close(&what, &got, &want, TOL_F16);
+                let lit = want.illumination(c.addr.views());
+                assert_lit(&what, &got, &want, &lit, TOL_F16_LIT);
             }
         }
     }
@@ -440,9 +477,9 @@ fn full_object_models(frame: usize) -> [(&'static str, Features); 2] {
 /// `Sampling::FullObject`.
 #[test]
 fn full_object_ml_scale_and_grads_match_cpu_under_every_propagator() {
-    // Measured worst: object 6.2e-8, probe 9.3e-8, object gradient 1.7e-6, probe gradient
-    // 4.0e-6.
-    const TOL: [f64; 4] = [2.5e-7, 4e-7, 6e-6, 1.5e-5];
+    // Five-run worst: object 6.19e-8, probe 9.29e-8, object gradient 1.66e-6, probe gradient
+    // 3.97e-6.
+    const TOL: [f64; 4] = [1.9e-7, 2.8e-7, 5e-6, 1.2e-5];
     let frame = FUSED_SIDES[0] as usize;
     for c in cases() {
         for (label, features) in full_object_models(frame) {
@@ -484,10 +521,9 @@ fn full_object_ml_scale_and_grads_match_cpu_under_every_propagator() {
 #[test]
 fn full_object_ml_matches_cpu_under_every_propagator() {
     const NCYCLE: usize = 8;
-    // Measured worst: LLK 1.4e-5, object 2.9e-6, probe 1.5e-7, features 4.9e-6, offsets
-    // 1.9e-6, each but the features' under the Fresnel transform back with a scale and a
-    // background.
-    const TOL: [f64; 5] = [5e-5, 1.2e-5, 6e-7, 2e-5, 8e-6];
+    // Five-run worst: LLK 1.38e-5, object 2.94e-6, probe 1.52e-7, features 4.93e-6, offsets
+    // 1.85e-6, each under the Fresnel transform back with a scale and a background.
+    const TOL: [f64; 5] = [4.2e-5, 8.9e-6, 4.6e-7, 1.5e-5, 5.6e-6];
     let frame = FUSED_SIDES[0] as usize;
     for c in cases() {
         for (label, features) in full_object_models(frame) {
@@ -516,9 +552,9 @@ fn full_object_ml_matches_cpu_under_every_propagator() {
 #[test]
 fn full_object_rpie_matches_cpu_under_every_propagator() {
     const NEPOCH: usize = 6;
-    // Measured worst: LLK 1.8e-6, object 3.6e-7, probe 4.7e-6, offsets 3.6e-7; rPIE models no
-    // scale or background.
-    const TOL: [f64; 5] = [1e-5, 2e-6, 2.5e-5, f64::MIN_POSITIVE, 2e-6];
+    // Five-run worst: LLK 1.83e-6, object 3.64e-7, probe 4.73e-6, offsets 3.60e-7; rPIE models
+    // no scale or background.
+    const TOL: [f64; 5] = [5.6e-6, 1.1e-6, 1.5e-5, f64::MIN_POSITIVE, 1.1e-6];
     let moved = Features {
         position: Some(Feature::refined(drawn_offsets())),
         ..Features::default()
@@ -623,8 +659,8 @@ fn sampling_is_the_cpus_auto_until_set() {
 /// off.
 #[test]
 fn full_object_llk_matches_cpu_under_every_propagator() {
-    // Worst measured 8.7e-7 (angular spectrum, position alone).
-    const TOL: f64 = 5e-6;
+    // Five-run worst 8.71e-7 (angular spectrum, position alone).
+    const TOL: f64 = 2.7e-6;
     let frame = FUSED_SIDES[0] as usize;
     let moved = Features {
         position: Some(Feature::refined(drawn_offsets())),

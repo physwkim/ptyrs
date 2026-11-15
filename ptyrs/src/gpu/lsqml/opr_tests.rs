@@ -33,7 +33,7 @@ use crate::gpu::opr::{FrameProbe, OwnModes};
 use crate::gpu::{
     C32, EpochOrder, Error, Exit, FarSums, FusedBufs, FusedInputs, FusedSums, Kernels, LlkPartial,
     LlkSums, Model, Opr, OprKernels, OpticsKernels, PositionKernels, PositionRule, PositionStep,
-    ProbeSpectrum, PsiSums, Shift, ShiftProbe, ShiftSums, ShiftedProbeSums, SliceSource, Solve,
+    ProbeSpectrum, PsiSums, Shift, ShiftProbe, ShiftSums, ShiftedNumSums, SliceSource, Solve,
     SpectrumBuf, StackTable, UpdateSums, ViewAddr, ViewDims, Views,
 };
 use crate::worst::worst_of;
@@ -717,7 +717,7 @@ fn shifted_probe_on_own_spectra_matches_the_cpu_and_each_frame_alone() {
 
 /// The batch's [`FrameMoves`] and the probe sums [`Kernels::shifted_probe_sums`] takes from
 /// what `stacks` added at [`OFFSETS`] on the shared probe, under [`ShiftProbe::Frames`] when
-/// `frames`, else under [`ShiftProbe::Sums`] with no moves: with `project` the AP projection
+/// `frames`, else under [`ShiftProbe::Num`] with no moves: with `project` the AP projection
 /// of [`Kernels::fused_project`], else [`Kernels::shifted_psi_sums`] of each stack's waves,
 /// the batch frames' `chi` from `x`. Every plane of the moves starts as NaN.
 fn moves(
@@ -726,7 +726,7 @@ fn moves(
     stacks: &[Range<u32>],
     frames: bool,
     project: bool,
-) -> (Option<Vec<C32>>, UpdateSums) {
+) -> (Option<Vec<C32>>, DeviceBuffer<C32>) {
     let d = dims();
     let (_, probe) = variation();
     let probe = up(&g.stream, probe.as_slice());
@@ -754,7 +754,7 @@ fn moves(
     };
     let table = StackTable::new(&g.stream, &d, stacks).unwrap();
     let mut bufs = FusedBufs::with_shift(&g.stream, &d, table.nf_max()).unwrap();
-    let mut sums = ShiftedProbeSums::zeroed(&g.stream, &d).unwrap();
+    let mut sums = ShiftedNumSums::zeroed(&g.stream, &d).unwrap();
     let nan = C32 {
         re: f32::NAN,
         im: f32::NAN,
@@ -770,7 +770,7 @@ fn moves(
                     positions: BATCH,
                 },
             },
-            false => ShiftProbe::Sums(&mut sums),
+            false => ShiftProbe::Num(&mut sums),
         };
         if project {
             let sums = FusedSums {
@@ -801,25 +801,22 @@ fn moves(
             .shifted_psi_sums(&g.ctx, &inputs, table.at(s), &psi, &mut bufs, sums)
             .unwrap();
     }
-    let mut out = UpdateSums::zeroed(&g.stream, NP * N).unwrap();
+    let mut out = DeviceBuffer::zeroed(&g.stream, NP * N).unwrap();
     (g.kernels)
         .shifted_probe_sums(&g.ctx, &d, &mut sums, &mut out)
         .unwrap();
     (frames.then(|| moved.to_host_vec(&g.stream).unwrap()), out)
 }
 
-/// The bits of probe sums.
-fn sum_bits(g: &Gpu, sums: &UpdateSums) -> [Vec<u32>; 2] {
-    [
-        c_bits(&sums.num.to_host_vec(&g.stream).unwrap()),
-        bits(&sums.den.to_host_vec(&g.stream).unwrap()),
-    ]
+/// The bits of a probe numerator.
+fn sum_bits(g: &Gpu, num: &DeviceBuffer<C32>) -> Vec<u32> {
+    c_bits(&num.to_host_vec(&g.stream).unwrap())
 }
 
 /// Each batch frame's own addend of probe mode 0 to the shifted probe sums, taken back alone:
 /// the CPU's move of the frame's direction back by its offsets ([`LsqmlBatch::adjoint_move`]),
 /// over stacks straddling the batch whose frames outside it must write nothing, launched
-/// last; the sums as under [`ShiftProbe::Sums`].
+/// last; the sums as under [`ShiftProbe::Num`].
 #[test]
 fn frame_moves_match_the_cpu_and_leave_the_sums() {
     let g = gpu();
@@ -844,7 +841,7 @@ fn frame_moves_match_the_cpu_and_leave_the_sums() {
 }
 
 /// [`Kernels::fused_project`]'s moves under [`ShiftProbe::Frames`]: each frame's addend of the
-/// probe sums it leaves, which they sum to, and those sums as under [`ShiftProbe::Sums`].
+/// probe sums it leaves, which they sum to, and those sums as under [`ShiftProbe::Num`].
 #[test]
 fn projected_frame_moves_sum_to_the_probe_sums() {
     let g = gpu();
@@ -858,7 +855,7 @@ fn projected_frame_moves_sum_to_the_probe_sums() {
             .map(|b| C64::new(moved[b * N + i].re.into(), moved[b * N + i].im.into()))
             .sum::<C64>()
     });
-    let num = sums.num.to_host_vec(&g.stream).unwrap();
+    let num = sums.to_host_vec(&g.stream).unwrap();
     let want: Vec<C64> = (num[..N].iter())
         .map(|z| C64::new(z.re.into(), z.im.into()))
         .collect();

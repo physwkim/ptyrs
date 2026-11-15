@@ -133,7 +133,7 @@ fn run(case: Case) -> FollowReport {
         snaps: 3,
         ..ReconCfg::default()
     };
-    let mut cfg = FollowCfg::plan(&p, NonZeroU32::new(total as u32).unwrap(), &rc);
+    let mut cfg = FollowCfg::plan(&p, NonZeroU32::new(total as u32).unwrap(), &rc).unwrap();
     if let Some(k) = case.plan {
         cfg.plan.truncate(k);
     }
@@ -235,8 +235,8 @@ fn run(case: Case) -> FollowReport {
     let mut backer = live.backer();
     let mut pf = PatchFill::new(&ctx, rep.shape, PATCH, PACK, fill.calls.len()).unwrap();
     let mut pred = Refusing::new(case.fail, None);
-    let (nmode, frame) = (cfg.ap.shape.nmode as usize, [n, n]);
-    let (nprobe, nobj) = (cfg.ap.shape.nprobe, cfg.ap.shape.nobj);
+    let (nmode, frame) = (cfg.ap.shape.nmode() as usize, [n, n]);
+    let (nprobe, nobj) = (cfg.ap.shape.nprobe(), cfg.ap.shape.nobj());
     let (mut error, mut not_ready) = (None, 0);
     // The frames and patch corners of the batches landed with counts that
     // no call took yet, in landing order.

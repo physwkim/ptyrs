@@ -1,0 +1,53 @@
+[package]
+authors = ["louisfd <louisfd94@gmail.com>"]
+categories = ["science", "mathematics", "algorithms"]
+description = "CubeK: Matrix Multiplication Kernels"
+edition.workspace = true
+keywords = []
+license.workspace = true
+name = "cubek-matmul"
+readme.workspace = true
+repository = "https://github.com/tracel-ai/cubek/tree/main/crates/cubek-matmul"
+version.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = ["std", "tiled", "multi-level", "cubecl/default"]
+std = ["cubecl/std"]
+
+# The two kernel architectures. At least one is required; both are on by default.
+tiled = ["dep:cubek-tile"]
+multi-level = []
+
+heavy = []
+extended = ["heavy"]
+full = ["extended", "benchmarks"]
+
+cpu-reference = ["dep:cubek-test-utils", "cubek-std/testing"]
+# Enables `pub mod benchmarks` — catalogues for the gemm, gemv, and
+# quantized_matmul subcategories. Off by default; the top-level `benchmarks`
+# crate turns it on.
+benchmarks = ["cpu-reference", "dep:cubek-quant", "cubecl/test-runtime"]
+
+[dependencies]
+cubek-quant = { workspace = true, optional = true, features = ["kernels"] }
+cubek-std = { workspace = true }
+cubek-tile = { workspace = true, optional = true }
+cubek-test-utils = { workspace = true, optional = true }
+
+cubecl = { workspace = true, features = ["stdlib"] }
+cubecl-common = { workspace = true }
+
+bytemuck = { workspace = true }
+half = { workspace = true, features = ["bytemuck"] }
+serde = { workspace = true }
+
+[dev-dependencies]
+# Enable reference helpers for tests without publishing a versioned self-dependency.
+cubek-matmul = { path = ".", default-features = false, features = ["cpu-reference"] }
+cubek-test-utils = { workspace = true }
+cubek-quant = { workspace = true, features = ["kernels"] }
+
+cubecl = { workspace = true, features = ["test-runtime"] }

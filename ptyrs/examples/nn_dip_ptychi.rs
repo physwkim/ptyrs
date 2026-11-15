@@ -21,61 +21,72 @@ use std::path::Path;
 use std::time::Instant;
 
 use burn::module::{Param, RunningState};
-use burn::nn::conv::{Conv2d, Conv2dConfig};
+use burn::nn::conv::Conv2dConfig;
 use burn::nn::{BatchNorm, BatchNormConfig, PaddingConfig2d};
 use burn::optim::AdamConfig;
 use burn::prelude::*;
 use burn::tensor::DType;
-use burn::tensor::activation::relu;
 use burn::tensor::module::max_pool2d;
 use burn::tensor::ops::MaxPoolOptions;
 use cuda_core::CudaContext;
 use ptyrs::base::{C64, Object, Probe, Scan, Stack};
 use ptyrs::engine::{GpuOptions, Ptycho};
 use ptyrs::io::{read_cxi, read_modes, write_modes};
+use ptyrs::nn::conv::Conv;
 use ptyrs::nn::dip::{Dip, GpuLoss, LossError, ObjectLoss, Prior};
+use ptyrs::nn::norm_relu::norm_relu;
 use rust_hdf5::H5File;
 
-/// pty-chi's `DoubleConv`: (3×3 convolution without bias, batch normalisation, ReLU) twice. On
-/// an autodiff device the normalisation takes the batch statistics, as torch's in train mode.
+/// pty-chi's `DoubleConv`: (3×3 convolution without bias, batch normalisation, ReLU) twice, on
+/// channels-last `[1, h, w, channels]`. On an autodiff device the normalisation takes the batch
+/// statistics, as torch's in train mode.
 #[derive(Module, Debug)]
 struct DoubleConv {
-    c0: Conv2d,
+    c0: Conv,
     n1: BatchNorm,
-    c3: Conv2d,
+    c3: Conv,
     n4: BatchNorm,
 }
 
 impl DoubleConv {
     fn forward(&self, x: Tensor<4>) -> Tensor<4> {
-        let x = relu(self.n1.forward(self.c0.forward(x)));
-        relu(self.n4.forward(self.c3.forward(x)))
+        let x = norm_relu(&self.n1, self.c0.forward(x));
+        norm_relu(&self.n4, self.c3.forward(x))
     }
+}
+
+/// `f`, an operation on `[batch, channels, h, w]`, on channels-last `x`. burn's CUDA
+/// convolutions and pools run channels-last and take and give that memory as a permuted view, so
+/// neither permutation copies.
+fn channels_first(x: Tensor<4>, f: impl FnOnce(Tensor<4>) -> Tensor<4>) -> Tensor<4> {
+    f(x.permute([0, 3, 1, 2])).permute([0, 2, 3, 1])
 }
 
 /// pty-chi's `UNet` (`reconstructors/nn/models/unet.py`) at its defaults, bilinear upsampling
 /// and skip connections: `inc`, `down1..4` (2× max pool then a [`DoubleConv`]), `up1..4`
-/// ([`upsample`] beside the skip, then a [`DoubleConv`]) and the 1×1 `outc`.
+/// ([`upsample`] beside the skip, then a [`DoubleConv`]) and the 1×1 `outc`, run channels-last.
 #[derive(Module, Debug)]
 struct UNet {
     inc: DoubleConv,
     down: Vec<DoubleConv>,
     up: Vec<DoubleConv>,
-    outc: Conv2d,
+    outc: Conv,
 }
 
 impl UNet {
-    fn raw(&self, x: Tensor<4>) -> Tensor<4> {
-        let mut skips = vec![self.inc.forward(x)];
+    /// The raw channels-last `[1, h, w, 2]` of `code`, `[1, channels, h, w]`.
+    fn raw(&self, code: Tensor<4>) -> Tensor<4> {
+        let mut skips = vec![self.inc.forward(code.permute([0, 2, 3, 1]))];
         for d in &self.down {
             let last = skips.last().expect("inc's output").clone();
-            skips.push(d.forward(max_pool2d(last, MaxPoolOptions::new([2, 2]))));
+            let x = channels_first(last, |x| max_pool2d(x, MaxPoolOptions::new([2, 2])));
+            skips.push(d.forward(x));
         }
         let mut x = skips.pop().expect("down4's output");
         for (u, s) in self.up.iter().zip(skips.into_iter().rev()) {
-            let [_, _, h, w] = s.dims();
-            let x_up = upsample(upsample(x, 3, w), 2, h);
-            x = u.forward(Tensor::cat(vec![s, x_up], 1));
+            let [_, h, w, _] = s.dims();
+            let x_up = upsample(upsample(x, 2, w), 1, h);
+            x = u.forward(Tensor::cat(vec![s, x_up], 3));
         }
         self.outc.forward(x)
     }
@@ -86,9 +97,9 @@ impl UNet {
 impl Prior for UNet {
     fn object(&self, code: Tensor<4>) -> Tensor<3> {
         let raw = self.raw(code);
-        let [_, _, ny, nx] = raw.dims();
-        let amp = raw.clone().narrow(1, 0, 1).reshape([ny, nx]);
-        let phase = raw.narrow(1, 1, 1).reshape([ny, nx]);
+        let [_, ny, nx, _] = raw.dims();
+        let amp = raw.clone().narrow(3, 0, 1).reshape([ny, nx]);
+        let phase = raw.narrow(3, 1, 1).reshape([ny, nx]);
         Tensor::stack(
             vec![amp.clone() * phase.clone().cos(), amp * phase.sin()],
             2,
@@ -148,7 +159,7 @@ impl Weights {
         Ok(Tensor::from_data(data, (&self.device, self.dtype)))
     }
 
-    fn conv(&self, name: &str, bias: bool) -> Result<Conv2d, LossError> {
+    fn conv(&self, name: &str, bias: bool) -> Result<Conv, LossError> {
         let weight: Tensor<4> = self.tensor(&format!("{name}.weight"))?;
         let [cout, cin, kh, kw] = weight.dims();
         let (ph, pw) = (kh / 2, kw / 2);
@@ -160,7 +171,7 @@ impl Weights {
         if bias {
             c.bias = Some(Param::from_tensor(self.tensor(&format!("{name}.bias"))?));
         }
-        Ok(c)
+        Ok(c.into())
     }
 
     /// torch's `BatchNorm2d` at its defaults, which are burn's: epsilon 1e-5, momentum 0.1.
@@ -301,10 +312,10 @@ fn train(
     Ok(last)
 }
 
-/// Largest start-object difference from pty-chi's, relative to its largest modulus: f32
-/// convolutions may round operands to TF32 on either side.
+/// Largest start-object difference from pty-chi's, relative to its largest modulus. pty-chi's
+/// start object is f64, so in f32 the difference is ptyrs's own rounding.
 fn start_tol(dtype: DType) -> f64 {
-    if dtype == DType::F64 { 1e-10 } else { 1e-2 }
+    if dtype == DType::F64 { 1e-10 } else { 1e-4 }
 }
 
 fn main() -> Result<(), LossError> {
@@ -347,6 +358,11 @@ fn main() -> Result<(), LossError> {
         )
         .into());
     }
+    // f64::max drops NaN and an infinite modulus excuses any difference, so the comparison below
+    // holds only between finite objects.
+    if start.iter().chain(&object0).any(|v| !v.is_finite()) {
+        return Err("a start object is not finite".into());
+    }
     let d = start
         .iter()
         .zip(&object0)
@@ -360,8 +376,7 @@ fn main() -> Result<(), LossError> {
         "start object against pty-chi's: max difference / max modulus {:.2e}",
         d / size
     );
-    // f64::max drops NaN, so a non-finite start is caught here, not by d.
-    if start.iter().any(|v| !v.is_finite()) || d > start_tol(dtype) * size {
+    if d > start_tol(dtype) * size {
         return Err("start objects differ".into());
     }
 

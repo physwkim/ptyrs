@@ -7,8 +7,7 @@ use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, DeviceCopy};
 use ptyrs::gpu::{
     C32, CG_BLOCKS, GAMMA_CHUNK, GammaCounts, GammaStacks, GradKernels, Kernels, LlkPartial,
-    MASKED, Model, ObjProbeScale, ScalePartial, StackTable, UpdateSums, ViewAddr, ViewDims, Views,
-    gamma_parts,
+    MASKED, Model, ObjProbeScale, ScalePartial, StackTable, ViewAddr, ViewDims, Views, gamma_parts,
 };
 
 /// A stream, an eager execution context on it, the M1 kernels and the CG kernels.
@@ -86,18 +85,17 @@ fn beta_sums_both_arrays_and_keeps_the_gradient() {
 }
 
 /// `d = β d - g` for a positive `β`, and the reset `d = -g` for a negative, infinite and
-/// NaN quotient; the gradient sums are zero after.
+/// NaN quotient; the gradient is zero after.
 #[test]
 fn direction_combines_or_resets_and_consumes_the_gradient() {
     let (stream, ctx, _, k) = setup();
     let n = 1000usize;
     let (d0, g) = (noise(n, 7, 2.0), noise(n, 11, 3.0));
-    let den: Vec<f32> = (0..n).map(|i| i as f32).collect();
     for (b_num, b_den) in [(3.0f32, 2.0f32), (-1.0, 2.0), (1.0, 0.0), (0.0, 0.0)] {
         let mut d = up(&stream, &d0);
-        let mut sums = UpdateSums::new(up(&stream, &g), up(&stream, &den), &stream).unwrap();
+        let mut grad = up(&stream, &g);
         let beta = up(&stream, &[b_num, b_den]);
-        k.direction(&ctx, &mut d, &mut sums, n as u32, &beta)
+        k.direction(&ctx, &mut d, &mut grad, n as u32, &beta)
             .unwrap();
         let got = d.to_host_vec(&stream).unwrap();
         let b = b_num / b_den;
@@ -114,15 +112,8 @@ fn direction_combines_or_resets_and_consumes_the_gradient() {
         } else {
             assert_eq!(got, neg(&g), "beta pair ({b_num}, {b_den})");
         }
-        let num = sums.num.to_host_vec(&stream).unwrap();
-        assert!(num.iter().all(|c| *c == C32::default()));
-        assert!(
-            sums.den
-                .to_host_vec(&stream)
-                .unwrap()
-                .iter()
-                .all(|v| *v == 0.0)
-        );
+        let left = grad.to_host_vec(&stream).unwrap();
+        assert!(left.iter().all(|c| *c == C32::default()));
     }
 }
 

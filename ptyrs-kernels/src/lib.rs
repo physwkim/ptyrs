@@ -379,13 +379,13 @@ unsafe fn bin_tile_views(
 
 /// What `kernels::psi_to_obj` does to object pixel `(y, x)` of a tile whose run of the stack
 /// is `lo .. end`, the closure [`for_each_stack_tile`] takes, for waves in the format `HALF`
-/// names ([`pixel::load_psi`]).
+/// names ([`pixel::load_psi`]); without `DEN`, `sums.den` is neither read nor written.
 ///
 /// # Safety
 ///
 /// As `kernels::psi_to_obj`, for the closure's calls too.
 #[device]
-unsafe fn psi_to_obj_pixel<const HALF: bool>(
+unsafe fn psi_to_obj_pixel<const HALF: bool, const DEN: bool>(
     psi: pixel::PsiPtr,
     probe: fused::ProbeSrc,
     views: *const pixel::ViewAddr,
@@ -404,7 +404,7 @@ unsafe fn psi_to_obj_pixel<const HALF: bool>(
         }
         let px = (iobj as usize * g.nyo as usize + y as usize) * g.nxo as usize + x as usize;
         let mut acc = pixel::load_c(sums.num, px);
-        let mut norm = *sums.den.add(px);
+        let mut norm = if DEN { *sums.den.add(px) } else { 0.0 };
         let mut j = lo;
         while j < end {
             let k = *tiles.views.add(j as usize);
@@ -430,17 +430,20 @@ unsafe fn psi_to_obj_pixel<const HALF: bool>(
             });
         }
         pixel::store_c(sums.num, px, acc);
-        *sums.den.add(px) = norm;
+        if DEN {
+            *sums.den.add(px) = norm;
+        }
     }
 }
 
-/// `kernels::psi_to_probe` of waves in the format `HALF` names ([`pixel::load_psi`]).
+/// `kernels::psi_to_probe` of waves in the format `HALF` names ([`pixel::load_psi`]);
+/// without `DEN`, `sums.den` is neither read nor written.
 ///
 /// # Safety
 ///
 /// As `kernels::psi_to_probe`.
 #[device]
-unsafe fn psi_to_probe<const HALF: bool>(
+unsafe fn psi_to_probe<const HALF: bool, const DEN: bool>(
     psi: pixel::PsiPtr,
     obj: *const f32,
     views: *const pixel::ViewAddr,
@@ -460,7 +463,7 @@ unsafe fn psi_to_probe<const HALF: bool>(
     let at = pixel::psi_index(y, x, g.ny, g.nx);
     unsafe {
         let mut acc = pixel::load_c(sums.num, t);
-        let mut norm = *sums.den.add(t);
+        let mut norm = if DEN { *sums.den.add(t) } else { 0.0 };
         let mut added = false;
         let k0 = f0 as usize * g.nmode as usize;
         for kl in 0..nf as usize * g.nmode as usize {
@@ -476,7 +479,9 @@ unsafe fn psi_to_probe<const HALF: bool>(
         }
         if added {
             pixel::store_c(sums.num, t, acc);
-            *sums.den.add(t) = norm;
+            if DEN {
+                *sums.den.add(t) = norm;
+            }
         }
     }
 }
@@ -920,7 +925,8 @@ pub mod kernels {
         static mut SHARED: SharedArray<u32, STACK_TILE_SHARED> = SharedArray::UNINIT;
         let shared = (&raw mut SHARED).cast::<u32>();
         unsafe {
-            let pixel = super::psi_to_obj_pixel::<false>(psi, probe, views, tiles, sums, ctl, g);
+            let pixel =
+                super::psi_to_obj_pixel::<false, true>(psi, probe, views, tiles, sums, ctl, g);
             for_each_stack_tile(views, tiles, shared, ctl, g, pixel)
         }
     }
@@ -945,7 +951,68 @@ pub mod kernels {
         static mut SHARED: SharedArray<u32, STACK_TILE_SHARED> = SharedArray::UNINIT;
         let shared = (&raw mut SHARED).cast::<u32>();
         unsafe {
-            let pixel = super::psi_to_obj_pixel::<true>(psi, probe, views, tiles, sums, ctl, g);
+            let pixel =
+                super::psi_to_obj_pixel::<true, true>(psi, probe, views, tiles, sums, ctl, g);
+            for_each_stack_tile(views, tiles, shared, ctl, g, pixel)
+        }
+    }
+
+    /// [`psi_to_obj`] into a window's numerator `num` alone, `[nobj, nyo, nxo]` complex.
+    ///
+    /// # Safety
+    ///
+    /// As [`psi_to_obj`], with `num` in place of `sums`.
+    ///
+    /// [`psi_to_obj`]: LoadedModule::psi_to_obj
+    #[kernel]
+    pub unsafe fn psi_to_obj_num(
+        psi: PsiPtr,
+        probe: ProbeSrc,
+        views: *const ViewAddr,
+        tiles: TilePtrs,
+        num: *mut f32,
+        ctl: *const StackCtl,
+        g: StackGeom,
+    ) {
+        static mut SHARED: SharedArray<u32, STACK_TILE_SHARED> = SharedArray::UNINIT;
+        let shared = (&raw mut SHARED).cast::<u32>();
+        let sums = SumPtrs {
+            num,
+            den: core::ptr::null_mut(),
+        };
+        unsafe {
+            let pixel =
+                super::psi_to_obj_pixel::<false, false>(psi, probe, views, tiles, sums, ctl, g);
+            for_each_stack_tile(views, tiles, shared, ctl, g, pixel)
+        }
+    }
+
+    /// [`psi_to_obj_num`] of f16 waves ([`load_psi`]).
+    ///
+    /// # Safety
+    ///
+    /// As [`psi_to_obj_num`], with `psi` holding f16 pairs.
+    ///
+    /// [`psi_to_obj_num`]: LoadedModule::psi_to_obj_num
+    #[kernel]
+    pub unsafe fn psi_to_obj_num_f16(
+        psi: PsiPtr,
+        probe: ProbeSrc,
+        views: *const ViewAddr,
+        tiles: TilePtrs,
+        num: *mut f32,
+        ctl: *const StackCtl,
+        g: StackGeom,
+    ) {
+        static mut SHARED: SharedArray<u32, STACK_TILE_SHARED> = SharedArray::UNINIT;
+        let shared = (&raw mut SHARED).cast::<u32>();
+        let sums = SumPtrs {
+            num,
+            den: core::ptr::null_mut(),
+        };
+        unsafe {
+            let pixel =
+                super::psi_to_obj_pixel::<true, false>(psi, probe, views, tiles, sums, ctl, g);
             for_each_stack_tile(views, tiles, shared, ctl, g, pixel)
         }
     }
@@ -969,7 +1036,7 @@ pub mod kernels {
         ctl: *const StackCtl,
         g: StackGeom,
     ) {
-        unsafe { super::psi_to_probe::<false>(psi, obj, views, sums, ctl, g) }
+        unsafe { super::psi_to_probe::<false, true>(psi, obj, views, sums, ctl, g) }
     }
 
     /// [`psi_to_probe`] of f16 waves ([`load_psi`]).
@@ -988,7 +1055,53 @@ pub mod kernels {
         ctl: *const StackCtl,
         g: StackGeom,
     ) {
-        unsafe { super::psi_to_probe::<true>(psi, obj, views, sums, ctl, g) }
+        unsafe { super::psi_to_probe::<true, true>(psi, obj, views, sums, ctl, g) }
+    }
+
+    /// [`psi_to_probe`] into a numerator `num` alone, `[nprobe, ny, nx]` complex.
+    ///
+    /// # Safety
+    ///
+    /// As [`psi_to_probe`], with `num` in place of `sums`.
+    ///
+    /// [`psi_to_probe`]: LoadedModule::psi_to_probe
+    #[kernel]
+    pub unsafe fn psi_to_probe_num(
+        psi: PsiPtr,
+        obj: *const f32,
+        views: *const ViewAddr,
+        num: *mut f32,
+        ctl: *const StackCtl,
+        g: StackGeom,
+    ) {
+        let sums = SumPtrs {
+            num,
+            den: core::ptr::null_mut(),
+        };
+        unsafe { super::psi_to_probe::<false, false>(psi, obj, views, sums, ctl, g) }
+    }
+
+    /// [`psi_to_probe_num`] of f16 waves ([`load_psi`]).
+    ///
+    /// # Safety
+    ///
+    /// As [`psi_to_probe_num`], with `psi` holding f16 pairs.
+    ///
+    /// [`psi_to_probe_num`]: LoadedModule::psi_to_probe_num
+    #[kernel]
+    pub unsafe fn psi_to_probe_num_f16(
+        psi: PsiPtr,
+        obj: *const f32,
+        views: *const ViewAddr,
+        num: *mut f32,
+        ctl: *const StackCtl,
+        g: StackGeom,
+    ) {
+        let sums = SumPtrs {
+            num,
+            den: core::ptr::null_mut(),
+        };
+        unsafe { super::psi_to_probe::<true, false>(psi, obj, views, sums, ctl, g) }
     }
 
     /// `*out = max(*out, x[0..n] ...)` as `f32` bits, over the non-negative values of `x`
@@ -1575,7 +1688,7 @@ pub mod kernels {
     ) {
         static mut SHARED: SharedArray<u32, STACK_TILE_SHARED> = SharedArray::UNINIT;
         let shared = (&raw mut SHARED).cast::<u32>();
-        unsafe { crate::fused::gather::<false>(p, tiles, sums, shared, ctl, g, cfg) }
+        unsafe { crate::fused::gather::<false, true>(p, tiles, sums, shared, ctl, g, cfg) }
     }
 
     /// [`crate::fused::gather`] of f16 waves.
@@ -1594,7 +1707,55 @@ pub mod kernels {
     ) {
         static mut SHARED: SharedArray<u32, STACK_TILE_SHARED> = SharedArray::UNINIT;
         let shared = (&raw mut SHARED).cast::<u32>();
-        unsafe { crate::fused::gather::<true>(p, tiles, sums, shared, ctl, g, cfg) }
+        unsafe { crate::fused::gather::<true, true>(p, tiles, sums, shared, ctl, g, cfg) }
+    }
+
+    /// [`crate::fused::gather`] into a window's numerator `num` alone.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::gather`], with `num` `[nobj, nyo, nxo]` complex in place of `sums`.
+    #[kernel]
+    pub unsafe fn fused_gather_num(
+        p: FusedPtrs,
+        tiles: TilePtrs,
+        num: *mut f32,
+        ctl: *const StackCtl,
+        g: StackGeom,
+        cfg: FusedCfg,
+    ) {
+        static mut SHARED: SharedArray<u32, STACK_TILE_SHARED> = SharedArray::UNINIT;
+        let shared = (&raw mut SHARED).cast::<u32>();
+        let sums = SumPtrs {
+            num,
+            den: core::ptr::null_mut(),
+        };
+        unsafe { crate::fused::gather::<false, false>(p, tiles, sums, shared, ctl, g, cfg) }
+    }
+
+    /// [`fused_gather_num`] of f16 waves.
+    ///
+    /// # Safety
+    ///
+    /// As [`fused_gather_num`].
+    ///
+    /// [`fused_gather_num`]: LoadedModule::fused_gather_num
+    #[kernel]
+    pub unsafe fn fused_gather_num_f16(
+        p: FusedPtrs,
+        tiles: TilePtrs,
+        num: *mut f32,
+        ctl: *const StackCtl,
+        g: StackGeom,
+        cfg: FusedCfg,
+    ) {
+        static mut SHARED: SharedArray<u32, STACK_TILE_SHARED> = SharedArray::UNINIT;
+        let shared = (&raw mut SHARED).cast::<u32>();
+        let sums = SumPtrs {
+            num,
+            den: core::ptr::null_mut(),
+        };
+        unsafe { crate::fused::gather::<true, false>(p, tiles, sums, shared, ctl, g, cfg) }
     }
 
     /// [`crate::fused::probe_terms`].
@@ -2162,7 +2323,27 @@ pub mod kernels {
     /// As [`crate::fused::shift_probe_rows`].
     #[kernel]
     pub unsafe fn fused_shift_probe_rows_64(sums: SumPtrs, out: SumPtrs, ny: u32, quad: f32) {
-        unsafe { crate::fused::shift_probe_rows::<64>(sums, out, ny, quad) }
+        unsafe { crate::fused::shift_probe_rows::<64, true>(sums, out, ny, quad) }
+    }
+    /// [`crate::fused::shift_probe_rows`] for 64-point rows, numerators alone.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::shift_probe_rows`], with `sums` and `out` numerators.
+    #[kernel]
+    pub unsafe fn fused_shift_probe_rows_num_64(sums: *mut f32, out: *mut f32, ny: u32, quad: f32) {
+        let none = core::ptr::null_mut();
+        let (sums, out) = (
+            SumPtrs {
+                num: sums,
+                den: none,
+            },
+            SumPtrs {
+                num: out,
+                den: none,
+            },
+        );
+        unsafe { crate::fused::shift_probe_rows::<64, false>(sums, out, ny, quad) }
     }
     /// [`crate::fused::shift_probe_rows`] for 128-point rows.
     ///
@@ -2171,7 +2352,32 @@ pub mod kernels {
     /// As [`crate::fused::shift_probe_rows`].
     #[kernel]
     pub unsafe fn fused_shift_probe_rows_128(sums: SumPtrs, out: SumPtrs, ny: u32, quad: f32) {
-        unsafe { crate::fused::shift_probe_rows::<128>(sums, out, ny, quad) }
+        unsafe { crate::fused::shift_probe_rows::<128, true>(sums, out, ny, quad) }
+    }
+    /// [`crate::fused::shift_probe_rows`] for 128-point rows, numerators alone.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::shift_probe_rows`], with `sums` and `out` numerators.
+    #[kernel]
+    pub unsafe fn fused_shift_probe_rows_num_128(
+        sums: *mut f32,
+        out: *mut f32,
+        ny: u32,
+        quad: f32,
+    ) {
+        let none = core::ptr::null_mut();
+        let (sums, out) = (
+            SumPtrs {
+                num: sums,
+                den: none,
+            },
+            SumPtrs {
+                num: out,
+                den: none,
+            },
+        );
+        unsafe { crate::fused::shift_probe_rows::<128, false>(sums, out, ny, quad) }
     }
     /// [`crate::fused::shift_probe_rows`] for 256-point rows.
     ///
@@ -2180,7 +2386,32 @@ pub mod kernels {
     /// As [`crate::fused::shift_probe_rows`].
     #[kernel]
     pub unsafe fn fused_shift_probe_rows_256(sums: SumPtrs, out: SumPtrs, ny: u32, quad: f32) {
-        unsafe { crate::fused::shift_probe_rows::<256>(sums, out, ny, quad) }
+        unsafe { crate::fused::shift_probe_rows::<256, true>(sums, out, ny, quad) }
+    }
+    /// [`crate::fused::shift_probe_rows`] for 256-point rows, numerators alone.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::shift_probe_rows`], with `sums` and `out` numerators.
+    #[kernel]
+    pub unsafe fn fused_shift_probe_rows_num_256(
+        sums: *mut f32,
+        out: *mut f32,
+        ny: u32,
+        quad: f32,
+    ) {
+        let none = core::ptr::null_mut();
+        let (sums, out) = (
+            SumPtrs {
+                num: sums,
+                den: none,
+            },
+            SumPtrs {
+                num: out,
+                den: none,
+            },
+        );
+        unsafe { crate::fused::shift_probe_rows::<256, false>(sums, out, ny, quad) }
     }
     /// [`crate::fused::shift_probe_rows`] for 512-point rows.
     ///
@@ -2189,7 +2420,32 @@ pub mod kernels {
     /// As [`crate::fused::shift_probe_rows`].
     #[kernel]
     pub unsafe fn fused_shift_probe_rows_512(sums: SumPtrs, out: SumPtrs, ny: u32, quad: f32) {
-        unsafe { crate::fused::shift_probe_rows::<512>(sums, out, ny, quad) }
+        unsafe { crate::fused::shift_probe_rows::<512, true>(sums, out, ny, quad) }
+    }
+    /// [`crate::fused::shift_probe_rows`] for 512-point rows, numerators alone.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::shift_probe_rows`], with `sums` and `out` numerators.
+    #[kernel]
+    pub unsafe fn fused_shift_probe_rows_num_512(
+        sums: *mut f32,
+        out: *mut f32,
+        ny: u32,
+        quad: f32,
+    ) {
+        let none = core::ptr::null_mut();
+        let (sums, out) = (
+            SumPtrs {
+                num: sums,
+                den: none,
+            },
+            SumPtrs {
+                num: out,
+                den: none,
+            },
+        );
+        unsafe { crate::fused::shift_probe_rows::<512, false>(sums, out, ny, quad) }
     }
     /// [`crate::fused::shift_moved_cols`] for 64-point columns.
     ///
@@ -2554,7 +2810,32 @@ pub mod kernels {
     ) {
         static mut SHARED: SharedArray<u32, STACK_TILE_SHARED> = SharedArray::UNINIT;
         let shared = (&raw mut SHARED).cast::<u32>();
-        unsafe { crate::fused::gather_shifted(p, tiles, sums, shared, ctl, g, cfg) }
+        unsafe { crate::fused::gather_shifted::<true>(p, tiles, sums, shared, ctl, g, cfg) }
+    }
+
+    /// [`fused_gather_shifted`] into a numerator `num` alone.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::gather_shifted`], with `num` in place of `sums`.
+    ///
+    /// [`fused_gather_shifted`]: LoadedModule::fused_gather_shifted
+    #[kernel]
+    pub unsafe fn fused_gather_shifted_num(
+        p: FusedPtrs,
+        tiles: TilePtrs,
+        num: *mut f32,
+        ctl: *const StackCtl,
+        g: StackGeom,
+        cfg: FusedCfg,
+    ) {
+        static mut SHARED: SharedArray<u32, STACK_TILE_SHARED> = SharedArray::UNINIT;
+        let shared = (&raw mut SHARED).cast::<u32>();
+        let sums = SumPtrs {
+            num,
+            den: core::ptr::null_mut(),
+        };
+        unsafe { crate::fused::gather_shifted::<false>(p, tiles, sums, shared, ctl, g, cfg) }
     }
 
     /// [`crate::fused::shift_probe_sums`].
@@ -2569,7 +2850,26 @@ pub mod kernels {
         ctl: *const StackCtl,
         g: StackGeom,
     ) {
-        unsafe { crate::fused::shift_probe_sums(p, sums, ctl, g) }
+        unsafe { crate::fused::shift_probe_sums::<true>(p, sums, ctl, g) }
+    }
+
+    /// [`crate::fused::shift_probe_sums`] into a numerator `num` alone.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::shift_probe_sums`], with `num` in place of `sums`.
+    #[kernel]
+    pub unsafe fn fused_shift_probe_sums_num(
+        p: FusedPtrs,
+        num: *mut f32,
+        ctl: *const StackCtl,
+        g: StackGeom,
+    ) {
+        let sums = SumPtrs {
+            num,
+            den: core::ptr::null_mut(),
+        };
+        unsafe { crate::fused::shift_probe_sums::<false>(p, sums, ctl, g) }
     }
 
     /// Per-frame position sums from `ngroup` partials per frame: `out[f0 + fl]` is the sum of

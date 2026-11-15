@@ -51,7 +51,7 @@ fn export(src: &Path, out: &Path) -> Result<(), Box<dyn Error>> {
     // CXI stores translations as f32
     let round = |v: &[f64]| v.iter().map(|&x| x as f32 as f64).collect();
     let pos = Positions::new(round(f.y()), round(f.x()))?;
-    let shape = required_obj_shape(&pos.pynx_preprocess(pixel), pixel, g.frame, 16);
+    let shape = required_obj_shape(&pos.pynx_preprocess(pixel), pixel, g.frame.sides(), 16);
     let raw: Vec<u16> = std::fs::read(src.join(format!("fermat_{NFERMAT}_{FRAME}_{NMODE}.u16")))?
         .as_chunks::<2>()
         .0
@@ -60,7 +60,7 @@ fn export(src: &Path, out: &Path) -> Result<(), Box<dyn Error>> {
         .collect();
     let counts = Counts::from_raw([NFERMAT, FRAME, FRAME], raw)?;
     let total: f64 = counts.as_slice().iter().map(|&c| f64::from(c)).sum();
-    let probe = sim::probe(g.frame, NMODE)?;
+    let probe = sim::probe(g.frame.sides(), NMODE)?;
     let p2: f64 = probe.as_slice().iter().map(C64::norm_sqr).sum();
     let s = (total / (NFERMAT as f64 * p2)).sqrt();
     let probe = Probe::new(Stack::from_vec(

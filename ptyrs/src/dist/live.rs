@@ -171,10 +171,7 @@ impl LivePlan {
                 .map(|&v| window.shift(v))
                 .collect();
             regions.push(LiveRegion {
-                shape: ScanShape {
-                    reach: [0, 1].map(|a| (window.shape[a] - frame[a] - 1) as u32),
-                    ..*shape
-                },
+                shape: shape.with_reach([0, 1].map(|a| (window.shape[a] - frame[a] - 1) as u32))?,
                 own: g
                     .own
                     .iter()
@@ -386,15 +383,8 @@ mod tests {
         for &p in &xy {
             place.views(p, 2, 1, &mut views);
         }
-        let shape = ScanShape {
-            nframe: xy.len() as u32,
-            nmode: 2,
-            nprobe: 2,
-            nobj: 1,
-            frame: [frame; 2],
-            reach,
-            quad_phase: 0.0,
-        };
+        let frame = [frame as usize; 2];
+        let shape = ScanShape::new(xy.len() as u32, 2, 1, frame, reach, 0.0).unwrap();
         (shape, views)
     }
 
@@ -455,7 +445,7 @@ mod tests {
     /// the other, and a frame between them that reads tiles of both.
     fn far() -> (ScanShape, Vec<ViewAddr>, Vec<ViewAddr>) {
         let (shape, views) = scan(sim::raster(4, 2, 8e-8), 32);
-        let nmode = shape.nmode as usize;
+        let nmode = shape.nmode() as usize;
         let moved = |d: u32| -> Vec<ViewAddr> {
             views
                 .iter()
@@ -463,11 +453,9 @@ mod tests {
                 .collect()
         };
         let both = [views.clone(), moved(200)].concat();
-        let shape = ScanShape {
-            nframe: shape.nframe * 8,
-            reach: [shape.reach[0], shape.reach[1] + 200],
-            ..shape
-        };
+        let reach = [shape.reach()[0], shape.reach()[1] + 200];
+        let shape = shape.with_nframe(shape.nframe() * 8).unwrap();
+        let shape = shape.with_reach(reach).unwrap();
         (shape, both, moved(100)[..nmode].to_vec())
     }
 
@@ -587,8 +575,8 @@ mod tests {
                 let mut shares = vec![Share::default(); ngpu];
                 let mut local: Vec<Vec<(u32, Vec<ViewAddr>)>> = vec![Vec::new(); ngpu];
                 let (mut start, mut sizes) = (0, [1, 7, 64, 3].iter().cycle());
-                while start < shape.nframe as usize {
-                    let end = (start + sizes.next().unwrap()).min(shape.nframe as usize);
+                while start < shape.nframe() as usize {
+                    let end = (start + sizes.next().unwrap()).min(shape.nframe() as usize);
                     plan.split(&views[start * nmode..end * nmode], &mut shares)
                         .unwrap();
                     for (r, s) in shares.iter().enumerate() {
@@ -604,7 +592,7 @@ mod tests {
                 let ntx = grid.dims()[1];
                 let one: Vec<Vec<usize>> = (0..grid.len())
                     .map(|t| {
-                        (0..shape.nframe as usize)
+                        (0..shape.nframe() as usize)
                             .filter(|&f| {
                                 let v = &views[f * nmode..][..nmode];
                                 tiles_of(&dims, v, ntx, [0, 0]).contains(&t)
@@ -716,10 +704,8 @@ mod tests {
                 .map(|d| jittered(&dims, &views, d))
                 .concat();
             assert!(!off.is_empty(), "{name}");
-            let shape = ScanShape {
-                nframe: shape.nframe + (off.len() / nmode) as u32,
-                ..shape
-            };
+            let nframe = shape.nframe() + (off.len() / nmode) as u32;
+            let shape = shape.with_nframe(nframe).unwrap();
             for ngpu in [2, 4] {
                 let what = format!("{name} on {ngpu}");
                 let mut plan = LivePlan::new(&shape, &views, scheme, ngpu, ROOM).unwrap();
@@ -816,10 +802,8 @@ mod tests {
                     let dims = shape.dims();
                     let off = [[5, -9], [-13, 11], [0, 17]].map(|d| jittered(&dims, &views, d));
                     let off = off.concat();
-                    let shape = ScanShape {
-                        nframe: shape.nframe + (off.len() / dims.nmode as usize) as u32,
-                        ..shape
-                    };
+                    let nframe = shape.nframe() + (off.len() / dims.nmode as usize) as u32;
+                    let shape = shape.with_nframe(nframe).unwrap();
                     (name, shape, views, off, scheme)
                 })
                 .collect();
@@ -1214,17 +1198,14 @@ mod tests {
         let s = ctx.new_stream().unwrap();
         let one = NonZeroU32::new(1).unwrap();
         let (_, shape, views, scheme) = cases().swap_remove(0);
-        let (nmode, fill) = (shape.nmode as usize, [1.0, 0.0]);
-        let k = shape.nframe as usize / 2;
+        let (nmode, fill) = (shape.nmode() as usize, [1.0, 0.0]);
+        let k = shape.nframe() as usize / 2;
         let cap = shape.tile_cap(&views);
         let mut off = views.clone();
         off[k * nmode..][..nmode]
             .iter_mut()
             .for_each(|v| v.oy = u32::MAX);
-        let short = ScanShape {
-            nframe: k as u32,
-            ..shape
-        };
+        let short = shape.with_nframe(k as u32).unwrap();
         for (what, sh, planned, cap, pushed) in [
             ("off the object", shape, &views[..], cap, &off),
             ("a full slab", shape, &views[..], cap - 1, &views),

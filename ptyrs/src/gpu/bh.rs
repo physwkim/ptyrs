@@ -52,20 +52,21 @@ use std::sync::Arc;
 
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaStream, DeviceBuffer, Event, LaunchConfig, PinnedHostBuffer, RawDeviceBuffer};
-pub use ptyrs_kernels::bh::{BH_HESS, BH_STEP};
 use ptyrs_kernels::bh::{
-    BhDirs, BhFar, BhFields, BhMovedFar, BhMovedProbes, BhMoves, BhNear, BhObs, BhPartials,
-    BhPosDirs, BhSecond, BhSliceIn, BhTangents, BhWinDerivs, BhWinFields, bh_kernels,
+    BH_ENTRY_MOVED, BH_ENTRY_PROBE, BH_ENTRY_WAVES, BhDirs, BhFar, BhFields, BhMovedFar,
+    BhMovedProbes, BhMoves, BhNear, BhObs, BhPartials, BhPosDirs, BhSecond, BhSliceIn, BhTangents,
+    BhWinDerivs, BhWinFields, bh_kernels,
 };
+pub use ptyrs_kernels::bh::{BH_HESS, BH_STEP};
 use ptyrs_kernels::grad::{CG_BLOCKS, GAMMA_CHUNK, ObjProbePtrs};
-use ptyrs_kernels::pixel::{PIXEL_THREADS, StackGeom, SumPtrs};
+use ptyrs_kernels::pixel::{PIXEL_THREADS, StackGeom};
 use ptyrs_kernels::position::BatchSpan;
 
 use crate::gpu::ops::grid_1d;
 use crate::gpu::position::{ONE_BLOCK, chunk_grid, same_dims, span};
 use crate::gpu::{
-    C32, Error, Kernels, Permutation, ProbeSpectrum, Shift, StackCtl, StackRef, UpdateSums,
-    ViewAddr, ViewDims, Views, check_len, dptr,
+    C32, Error, Kernels, Permutation, ProbeSpectrum, Shift, StackCtl, StackRef, ViewAddr, ViewDims,
+    Views, check_len, dptr,
 };
 
 /// The BH kernels, bound to the module a [`Kernels`] loaded.
@@ -238,14 +239,35 @@ impl BhDisp<'_> {
 
 /// One stack's fields the Hessian reads, each of `nf_max * nmode` planes like a stack's
 /// `psi`: the forward-FFT'd exit waves, the residual after its inverse FFT, and the
-/// forward-FFT'd derivatives along `u` and `v` (`lv` unread without `v`); and `views`, those
-/// the object is read through: the epoch's, or under full-object sampling the windows'.
+/// forward-FFT'd derivatives along `u` and, with CG, `v`; and `views`, those the object is
+/// read through: the epoch's, or under full-object sampling the windows'.
 pub struct BhFieldsRef<'a> {
     pub views: &'a Views,
     pub psi: &'a DeviceBuffer<C32>,
     pub r: &'a DeviceBuffer<C32>,
     pub lu: &'a DeviceBuffer<C32>,
-    pub lv: &'a DeviceBuffer<C32>,
+    pub lv: Option<&'a DeviceBuffer<C32>>,
+}
+
+impl BhFieldsRef<'_> {
+    /// The fields a Hessian launch with `cg` or without reads, each checked as `len` long
+    /// ([`touched`]): their storages and pointers.
+    fn read(&self, cg: bool, len: usize) -> Result<(Vec<&RawDeviceBuffer>, BhFields), Error> {
+        for (what, b) in [("psi", self.psi), ("r", self.r)] {
+            check_len(what, b, len)?;
+        }
+        let lv = (["lv"], self.lv.map(|b| [b]));
+        let (l, lu, [lv]) = touched(("lu", self.lu), lv, cg, len)?;
+        let mut storages = vec![self.psi.storage(), self.r.storage()];
+        storages.extend(l);
+        let far = BhFar {
+            psi: dptr(self.psi),
+            lu,
+            lv,
+        };
+        let r = dptr(self.r);
+        Ok((storages, BhFields { far, r }))
+    }
 }
 
 /// The wave entering a slice of [`BhKernels::slice_tangent`].
@@ -253,18 +275,104 @@ pub struct BhFieldsRef<'a> {
 pub enum BhEntry<'a> {
     /// The first slice's, the probe `[nprobe, ny, nx]`.
     Probe(&'a DeviceBuffer<C32>),
+    /// The first slice's under the position model, the stack's moved probes of `nf_max *
+    /// nprobe` planes (`crate::gpu::PositionKernels::shift_w`).
+    Moved(&'a DeviceBuffer<C32>),
     /// A later slice's, the stack's waves that entered it, of `nf_max * nmode` planes like
     /// its `psi`.
     Waves(&'a DeviceBuffer<C32>),
 }
 
+impl<'a> BhEntry<'a> {
+    /// Slice `x` entered by `self` as the kernels read them, checked for `g` under `dims`,
+    /// with the two buffers' storages.
+    fn slice_in(
+        self,
+        x: &'a DeviceBuffer<C32>,
+        dims: &ViewDims,
+        g: &StackGeom,
+    ) -> Result<(BhSliceIn, [&'a RawDeviceBuffer; 2]), Error> {
+        let nf_max = g.nf_max as usize;
+        let (what, e, planes, kind) = match self {
+            Self::Probe(p) => ("probe", p, dims.nprobe as usize, BH_ENTRY_PROBE),
+            Self::Moved(w) => (
+                "moved probes",
+                w,
+                nf_max * dims.nprobe as usize,
+                BH_ENTRY_MOVED,
+            ),
+            Self::Waves(w) => ("waves", w, nf_max * dims.nmode as usize, BH_ENTRY_WAVES),
+        };
+        check_len("slice", x, dims.obj_len())?;
+        check_len(what, e, planes * dims.n())?;
+        let s = BhSliceIn {
+            slice: dptr(x),
+            entry: dptr(e),
+            kind,
+        };
+        Ok((s, [x.storage(), e.storage()]))
+    }
+}
+
+/// A multislice object's last slice under the position model, whose exit plane's phase moves
+/// with the offsets ([`crate::gpu::SlicePhase::offsets`]): `slice`, the wave `entry` entering
+/// it, and `quad`, the phase's ([`crate::gpu::SlicePhase::quad`]).
+#[derive(Clone, Copy)]
+pub struct BhLastSlice<'a> {
+    pub slice: &'a DeviceBuffer<C32>,
+    pub entry: BhEntry<'a>,
+    pub quad: f32,
+}
+
 /// One stack's derivatives through a multislice object, each of `nf_max * nmode` planes
-/// like its `psi`: `lu`, `lv` along `u` and `v`, `m` the second derivatives along `(u, u)`,
-/// `(u, v)` and `(v, v)`.
+/// like its `psi`: `lu` along `u`, `muu` the second along `(u, u)`, and with CG `cg`: `lv`
+/// along `v` and the second along `(u, v)` and `(v, v)`.
 pub struct BhTangentsMut<'a> {
     pub lu: &'a mut DeviceBuffer<C32>,
-    pub lv: &'a mut DeviceBuffer<C32>,
-    pub m: &'a mut [DeviceBuffer<C32>; 3],
+    pub muu: &'a mut DeviceBuffer<C32>,
+    pub cg: Option<[&'a mut DeviceBuffer<C32>; 3]>,
+}
+
+impl BhTangentsMut<'_> {
+    /// `lu` and with CG `lv`, as [`BhKernels::pos_spec`] writes them.
+    pub fn first(&mut self) -> (&mut DeviceBuffer<C32>, Option<&mut DeviceBuffer<C32>>) {
+        (&mut *self.lu, self.cg.as_mut().map(|[lv, ..]| &mut **lv))
+    }
+
+    /// `muu` and with CG the second derivatives along `(u, v)` and `(v, v)`, as
+    /// [`BhKernels::pos_second`] writes them.
+    pub fn second(&mut self) -> (&mut DeviceBuffer<C32>, Option<[&mut DeviceBuffer<C32>; 2]>) {
+        let m = self.cg.as_mut().map(|[_, uv, vv]| [&mut **uv, &mut **vv]);
+        (&mut *self.muu, m)
+    }
+
+    /// The second derivatives as [`BhKernels::sliced_hess_frames`] reads them.
+    pub fn second_ref(&self) -> BhSecondRef<'_> {
+        BhSecondRef {
+            uu: self.muu,
+            cg: self.cg.as_ref().map(|[_, uv, vv]| [&**uv, &**vv]),
+        }
+    }
+
+    /// The tangents a launch with `cg` or without touches, each checked as `len` long
+    /// ([`touched`]); their storages and pointers.
+    fn touched(&self, cg: bool, len: usize) -> Result<(Vec<&RawDeviceBuffer>, BhTangents), Error> {
+        let lv = (["lv"], self.cg.as_ref().map(|[lv, ..]| [&**lv]));
+        let (mut s, lu, [lv]) = touched(("lu", &*self.lu), lv, cg, len)?;
+        let m = self.second_ref();
+        let (m, muu, [muv, mvv]) = touched(("muu", m.uu), (["muv", "mvv"], m.cg), cg, len)?;
+        s.extend(m);
+        Ok((
+            s,
+            BhTangents {
+                lu,
+                lv,
+                muu,
+                muv,
+                mvv,
+            },
+        ))
+    }
 }
 
 /// The exit waves' second derivatives [`BhKernels::sliced_hess_frames`] reads, each of
@@ -298,14 +406,15 @@ impl BhBatch {
     }
 }
 
-/// The offsets' buffers of BH under the position model for a scan of `dims` through an object
-/// of `nslice` slices: the partials of [`BhKernels::pos_grad`] or [`BhKernels::win_grad`],
-/// `u`'s offsets by epoch position, and the last direction's by scan frame, which with CG are
-/// `v`'s.
+/// The offsets' buffers of BH under the position model for a scan of `dims`: the gradient
+/// partials in `nseg` segments of each frame's row, each written by one of
+/// [`BhKernels::pos_grad`], [`BhKernels::win_grad`] (a segment per slice) or
+/// [`BhKernels::phase_grad`], `u`'s offsets by epoch position, and the last direction's by
+/// scan frame, which with CG are `v`'s.
 pub struct BhPositions {
     dims: ViewDims,
-    nslice: usize,
-    /// `[nframe, nslice, nchunk, 2]` by epoch position, a segment of a frame's row per slice.
+    nseg: usize,
+    /// `[nframe, nseg, nchunk, 2]` by epoch position.
     grads: DeviceBuffer<f32>,
     /// `[nframe, 2]` by epoch position.
     ud: DeviceBuffer<f32>,
@@ -314,18 +423,30 @@ pub struct BhPositions {
 }
 
 impl BhPositions {
-    pub fn zeroed(stream: &CudaStream, dims: &ViewDims, nslice: usize) -> Result<Self, Error> {
+    pub fn zeroed(stream: &CudaStream, dims: &ViewDims, nseg: usize) -> Result<Self, Error> {
         dims.check()?;
-        if nslice == 0 {
-            return Err(Error::Shape("no object slice".into()));
+        if nseg == 0 {
+            return Err(Error::Shape("no gradient segment".into()));
         }
         let nframe = dims.nframe as usize;
         Ok(Self {
             dims: *dims,
-            nslice,
-            grads: DeviceBuffer::zeroed(stream, 2 * nframe * nslice * chunks(dims.n()))?,
+            nseg,
+            grads: DeviceBuffer::zeroed(stream, 2 * nframe * nseg * chunks(dims.n()))?,
             ud: DeviceBuffer::zeroed(stream, 2 * nframe)?,
             prev: DeviceBuffer::zeroed(stream, 2 * nframe)?,
+        })
+    }
+
+    /// Segment `seg` of the partials, as the kernels write it.
+    fn partials(&self, seg: usize) -> Result<BhPartials, Error> {
+        if seg >= self.nseg {
+            return Err(Error::Shape(format!("segment {seg} of {}", self.nseg)));
+        }
+        Ok(BhPartials {
+            out: dptr(&self.grads),
+            seg: seg as u32,
+            nseg: self.nseg as u32,
         })
     }
 }
@@ -505,22 +626,22 @@ impl<'a> BhMovedRef<'a> {
 /// One stack under the position model as [`BhKernels::pos_near`] reads it, each in
 /// [`Kernels::obj_probe_to_psi`]'s layout: the object, the moved probes `w` (`[nf_max *
 /// nprobe, ny, nx]`, as `crate::gpu::PositionKernels::shift_w` leaves them), the residual
-/// after its inverse FFT, and `lu`, `lv` the inverse-FFT'd [`BhKernels::pos_spec`].
+/// after its inverse FFT, and `lu` and with CG `lv` the inverse-FFT'd [`BhKernels::pos_spec`].
 pub struct BhNearMut<'a> {
     pub obj: &'a DeviceBuffer<C32>,
     pub w: &'a DeviceBuffer<C32>,
     pub r: &'a DeviceBuffer<C32>,
     pub lu: &'a mut DeviceBuffer<C32>,
-    pub lv: &'a mut DeviceBuffer<C32>,
+    pub lv: Option<&'a mut DeviceBuffer<C32>>,
 }
 
 /// One stack's far fields [`BhKernels::pos_far`] reads, each of `nf_max * nmode` planes: the
-/// forward-FFT'd exit waves, the forward-FFT'd [`BhKernels::pos_near`] `lu` and `lv` (`lv`
-/// unread without CG), and the forward-FFT'd [`BhKernels::obj_conj`] of the residual.
+/// forward-FFT'd exit waves, the forward-FFT'd [`BhKernels::pos_near`] `lu` and with CG `lv`,
+/// and the forward-FFT'd [`BhKernels::obj_conj`] of the residual.
 pub struct BhMovedFarRef<'a> {
     pub psi: &'a DeviceBuffer<C32>,
     pub lu: &'a DeviceBuffer<C32>,
-    pub lv: &'a DeviceBuffer<C32>,
+    pub lv: Option<&'a DeviceBuffer<C32>>,
     pub y: &'a DeviceBuffer<C32>,
 }
 
@@ -554,12 +675,12 @@ pub struct BhWinSecond<'a> {
     pub v: Option<&'a DeviceBuffer<C32>>,
 }
 
-/// One array BH updates, of `n` values: the estimate, the last direction and the gradient
-/// sums, the gradient scaled by `scale` (the probe's `ρ²`).
+/// One array BH updates, of `n` values: the estimate, the last direction and the gradient,
+/// scaled by `scale` (the probe's `ρ²`).
 pub struct BhVar<'a> {
     pub x: &'a mut DeviceBuffer<C32>,
     pub prev: &'a mut DeviceBuffer<C32>,
-    pub g: &'a mut UpdateSums,
+    pub g: &'a mut DeviceBuffer<C32>,
     pub n: u32,
     pub scale: f32,
 }
@@ -689,6 +810,30 @@ fn window_block(dims: &ViewDims, g: &StackGeom) -> usize {
     dims.nobj as usize * g.nf_max as usize * dims.n()
 }
 
+/// A launch's buffers along a step, `cg` its CG: `first`, and `with_cg`, named, which every BH
+/// kernel touches only with CG and a launch takes exactly with it. Each is checked as `len`
+/// long under its name; returns their storages, to lease, and their pointers, `first`'s
+/// standing in for `with_cg`'s without CG, which the kernels never read.
+fn touched<'b, const N: usize>(
+    first: (&str, &'b DeviceBuffer<C32>),
+    (names, with_cg): ([&str; N], Option<[&'b DeviceBuffer<C32>; N]>),
+    cg: bool,
+    len: usize,
+) -> Result<(Vec<&'b RawDeviceBuffer>, *mut f32, [*mut f32; N]), Error> {
+    if with_cg.is_some() != cg {
+        let names = names.join(", ");
+        return Err(Error::Shape(format!("{names} given exactly with CG")));
+    }
+    let named = with_cg.map(|b| names.into_iter().zip(b));
+    let mut storages = Vec::with_capacity(1 + N);
+    for (what, b) in std::iter::once(first).chain(named.into_iter().flatten()) {
+        check_len(what, b, len)?;
+        storages.push(b.storage());
+    }
+    let ptrs = with_cg.map_or([dptr(first.1); N], |b| b.map(dptr));
+    Ok((storages, dptr(first.1), ptrs))
+}
+
 /// Values of the object and of the probe.
 fn lens(dims: &ViewDims) -> [u32; 2] {
     // `Views::new` checked both fit the kernels' u32 indices.
@@ -749,8 +894,8 @@ impl BhKernels {
     }
 
     /// The stack's far-field derivatives before their forward FFT, in
-    /// [`Kernels::obj_probe_to_psi`]'s layout, at `x = [O, P]`: `l[0] = q (u_P O + P u_O)` and,
-    /// with `d.v`, `l[1]` likewise along `v` (else `l[1]` is left as it is).
+    /// [`Kernels::obj_probe_to_psi`]'s layout, at `x = [O, P]`: `lu = q (u_P O + P u_O)` and,
+    /// with `d.v`, `lv` likewise along `v`.
     pub fn far(
         &self,
         ctx: &ExecutionContext,
@@ -758,7 +903,7 @@ impl BhKernels {
         stack: StackRef<'_>,
         x: [&DeviceBuffer<C32>; 2],
         d: &BhDisp<'_>,
-        l: [&mut DeviceBuffer<C32>; 2],
+        (lu, lv): (&mut DeviceBuffer<C32>, Option<&mut DeviceBuffer<C32>>),
     ) -> Result<(), Error> {
         let dims = views.dims();
         let g = dims.geom(stack)?;
@@ -767,14 +912,12 @@ impl BhKernels {
             check_len(what, b, n as usize)?;
         }
         d.check(dims)?;
-        let [lu, lv] = l;
-        check_len("lu", lu, len)?;
-        check_len("lv", lv, len)?;
+        let lv = (["lv"], lv.as_deref().map(|b| [b]));
+        let (writes, lu, [lv]) = touched(("lu", &*lu), lv, d.v.is_some(), len)?;
         let config = grid_1d(len)?;
         let mut reads = vec![views.addr().storage(), stack.storage()];
         reads.extend(x.iter().map(|b| b.storage()));
         reads.extend(d.storages());
-        let writes = [lu.storage(), lv.storage()];
         self.base.launch(ctx, &reads, &writes, |stream| {
             let x = ObjProbePtrs {
                 obj: dptr(x[0]),
@@ -789,8 +932,8 @@ impl BhKernels {
                     x,
                     d.ptrs(),
                     dptr::<ViewAddr, ViewAddr>(views.addr()),
-                    dptr(lu),
-                    dptr(lv),
+                    lu,
+                    lv,
                     stack.ctl() as *const StackCtl,
                     g,
                 )
@@ -826,9 +969,7 @@ impl BhKernels {
         let g = dims.geom(stack)?;
         let n = dims.n();
         let len = g.nf_max as usize * dims.nmode as usize * n;
-        for (what, b) in [("psi", f.psi), ("r", f.r), ("lu", f.lu), ("lv", f.lv)] {
-            check_len(what, b, len)?;
-        }
+        let (read, fields) = f.read(d.v.is_some(), len)?;
         d.check(dims)?;
         parts.check(dims)?;
         let config = hess_grid(g.nf_max, n)?;
@@ -836,24 +977,13 @@ impl BhKernels {
             f.views.addr().storage(),
             scan.counts.storage(),
             scan.order.ids.order().storage(),
-            f.psi.storage(),
-            f.r.storage(),
-            f.lu.storage(),
-            f.lv.storage(),
             stack.storage(),
         ];
+        reads.extend(read);
         reads.extend(d.storages());
         let out = parts.ptr(parts.hess(0));
         self.base
             .launch(ctx, &reads, &[parts.buf.storage()], |stream| {
-                let fields = BhFields {
-                    far: BhFar {
-                        psi: dptr(f.psi),
-                        lu: dptr(f.lu),
-                        lv: dptr(f.lv),
-                    },
-                    r: dptr(f.r),
-                };
                 // SAFETY: lengths checked above; one block of PIXEL_THREADS per chunk and frame;
                 // `EpochOrder` holds frame ids below `nframe`.
                 unsafe {
@@ -878,7 +1008,8 @@ impl BhKernels {
     /// u_x l_v + v_x l_u`, `u_x` and `v_x` the slice's parts `d.u[0]`, `d.v[0]` through
     /// `views`. Entered by the probe, `l_u` and `l_v` are `d`'s probe parts (`u`'s times
     /// `d.u_scale`), `m` is 0 and `t` only written; else `t` holds `w`'s and `d`'s probe parts
-    /// are unread. Without `d.v` only `t.lu` and `t.m[0]`.
+    /// are unread (entered by the moved probes, `t` holds theirs: the inverse FFTs of
+    /// [`Self::pos_spec`] and [`Self::pos_second`]). `t.cg` is given exactly with `d.v`.
     pub fn slice_tangent(
         &self,
         ctx: &ExecutionContext,
@@ -891,57 +1022,21 @@ impl BhKernels {
         let dims = views.dims();
         let g = dims.geom(stack)?;
         let len = g.nf_max as usize * dims.nmode as usize * dims.n();
-        let [obj_len, probe_len] = lens(dims).map(|n| n as usize);
-        check_len("slice", x, obj_len)?;
+        let (s, entered) = entry.slice_in(x, dims, &g)?;
         d.check(dims)?;
-        let (e, probe) = match entry {
-            BhEntry::Probe(p) => (check_len("probe", p, probe_len).map(|_| p)?, 1),
-            BhEntry::Waves(w) => (check_len("waves", w, len).map(|_| w)?, 0),
-        };
-        let [muu, muv, mvv] = &mut *t.m;
-        let waves = [
-            ("lu", &*t.lu),
-            ("lv", &*t.lv),
-            ("muu", &*muu),
-            ("muv", &*muv),
-        ];
-        for (what, b) in waves.into_iter().chain([("mvv", &*mvv)]) {
-            check_len(what, b, len)?;
-        }
+        let (writes, t) = t.touched(d.v.is_some(), len)?;
         let config = grid_1d(len)?;
-        let mut reads = vec![
-            views.addr().storage(),
-            stack.storage(),
-            x.storage(),
-            e.storage(),
-        ];
+        let mut reads = vec![views.addr().storage(), stack.storage()];
+        reads.extend(entered);
         reads.extend(d.storages());
-        let writes = [
-            t.lu.storage(),
-            t.lv.storage(),
-            muu.storage(),
-            muv.storage(),
-            mvv.storage(),
-        ];
         self.base.launch(ctx, &reads, &writes, |stream| {
-            let t = BhTangents {
-                lu: dptr(t.lu),
-                lv: dptr(t.lv),
-                muu: dptr(muu),
-                muv: dptr(muv),
-                mvv: dptr(mvv),
-            };
             // SAFETY: lengths checked above; `Views::new` checked every view lies inside the
             // object with valid mode indices.
             unsafe {
                 self.module.bh_slice_tangent(
                     stream,
                     config,
-                    BhSliceIn {
-                        slice: dptr(x),
-                        entry: dptr(e),
-                        probe,
-                    },
+                    s,
                     d.ptrs(),
                     t,
                     dptr::<ViewAddr, ViewAddr>(views.addr()),
@@ -954,8 +1049,8 @@ impl BhKernels {
 
     /// [`Self::hess_frames`] through a multislice object: the near term from `m`, the exit
     /// waves' second derivatives of [`Self::slice_tangent`], and `f.r` with the adjoint of
-    /// the last slice's plane phase already on it, as on `f.lu` and `f.lv` its phase; with
-    /// `m.cg` it reads `f.lv`.
+    /// the last slice's plane phase already on it, as on `f.lu` and `f.lv` its phase; `f.lv`
+    /// is given exactly with `m.cg`.
     pub fn sliced_hess_frames(
         &self,
         ctx: &ExecutionContext,
@@ -969,42 +1064,22 @@ impl BhKernels {
         let g = dims.geom(stack)?;
         let n = dims.n();
         let len = g.nf_max as usize * dims.nmode as usize * n;
-        let [uv, vv] = m.cg.unwrap_or([m.uu; 2]);
-        let fields = [("psi", f.psi), ("r", f.r), ("lu", f.lu), ("lv", f.lv)];
-        let second = [("muu", m.uu), ("muv", uv), ("mvv", vv)];
-        for (what, b) in fields.into_iter().chain(second) {
-            check_len(what, b, len)?;
-        }
+        let cg = m.cg.is_some();
+        let (read, fields) = f.read(cg, len)?;
+        let (second, uu, [uv, vv]) = touched(("muu", m.uu), (["muv", "mvv"], m.cg), cg, len)?;
         parts.check(dims)?;
         let config = hess_grid(g.nf_max, n)?;
-        let reads = [
+        let mut reads = vec![
             scan.counts.storage(),
             scan.order.ids.order().storage(),
-            f.psi.storage(),
-            f.r.storage(),
-            f.lu.storage(),
-            f.lv.storage(),
-            m.uu.storage(),
-            uv.storage(),
-            vv.storage(),
             stack.storage(),
         ];
+        reads.extend(read);
+        reads.extend(second);
+        let second = BhSecond { uu, uv, vv };
         let out = parts.ptr(parts.hess(0));
         self.base
             .launch(ctx, &reads, &[parts.buf.storage()], |stream| {
-                let fields = BhFields {
-                    far: BhFar {
-                        psi: dptr(f.psi),
-                        lu: dptr(f.lu),
-                        lv: dptr(f.lv),
-                    },
-                    r: dptr(f.r),
-                };
-                let second = BhSecond {
-                    uu: dptr(m.uu),
-                    uv: dptr(uv),
-                    vv: dptr(vv),
-                };
                 // SAFETY: lengths checked above; one block of PIXEL_THREADS per chunk and frame;
                 // `EpochOrder` holds frame ids below `nframe`.
                 unsafe {
@@ -1013,7 +1088,7 @@ impl BhKernels {
                         config,
                         fields,
                         second,
-                        m.cg.is_some().into(),
+                        cg.into(),
                         scan.obs(),
                         out,
                         stack.ctl() as *const StackCtl,
@@ -1077,7 +1152,7 @@ impl BhKernels {
     }
 
     /// `var`'s step from record `record` of `steps`: `D = β prev − scale g`, `x += α D`,
-    /// `prev = D`; consumes the gradient sums (zero after).
+    /// `prev = D`; consumes the gradient (zero after).
     pub fn update(
         &self,
         ctx: &ExecutionContext,
@@ -1088,25 +1163,16 @@ impl BhKernels {
         let n = var.n as usize;
         check_len("x", var.x, n)?;
         check_len("prev", var.prev, n)?;
-        var.g.check(n)?;
+        check_len("g", var.g, n)?;
         check_len("steps", steps, step_len(record))?;
         if n == 0 {
             return Ok(());
         }
         let config = LaunchConfig::for_num_elems(var.n);
         let step = dptr::<f32, f32>(steps).wrapping_add(step_len(record) - BH_STEP as usize);
-        let writes = [
-            var.x.storage(),
-            var.prev.storage(),
-            var.g.num.storage(),
-            var.g.den.storage(),
-        ];
+        let writes = [var.x.storage(), var.prev.storage(), var.g.storage()];
         self.base
             .launch(ctx, &[steps.storage()], &writes, |stream| {
-                let g = SumPtrs {
-                    num: dptr(&var.g.num),
-                    den: dptr(&var.g.den),
-                };
                 // SAFETY: lengths checked above.
                 unsafe {
                     self.module.bh_update(
@@ -1114,7 +1180,7 @@ impl BhKernels {
                         config,
                         dptr(var.x),
                         dptr(var.prev),
-                        g,
+                        dptr(var.g),
                         var.n,
                         var.scale,
                         step,
@@ -1204,19 +1270,21 @@ impl BhKernels {
         })
     }
 
-    /// The offsets' gradient partials of the stack's frames into `off`, from `y` the
-    /// forward-FFT'd [`Self::obj_conj`] of its residual and `shift` the estimate's moved
-    /// probes: per chunk of [`GAMMA_CHUNK`] pixels of each frame, the pair [`Self::pos_dots`]
-    /// sums to `∂F/∂d`; other frames' partials are left as they are.
+    /// The offsets' gradient partials of the stack's frames into segment `seg` of `off`'s,
+    /// from `y` the forward-FFT'd [`Self::obj_conj`] of its residual and `shift` the
+    /// estimate's moved probes: per chunk of [`GAMMA_CHUNK`] pixels of each frame, the pair
+    /// [`Self::pos_dots`] sums with the other segments' to `∂F/∂d`; other frames' partials,
+    /// and other segments', are left as they are.
     pub fn pos_grad(
         &self,
         ctx: &ExecutionContext,
         stack: StackRef<'_>,
         y: &DeviceBuffer<C32>,
         shift: &Shift<'_>,
-        off: &mut BhOffsets<'_>,
+        (off, seg): (&mut BhOffsets<'_>, usize),
     ) -> Result<(), Error> {
         let dims = off.check()?;
+        let part = off.bufs.partials(seg)?;
         let g = dims.geom(stack)?;
         let n = dims.n();
         check_len("y", y, g.nf_max as usize * dims.nmode as usize * n)?;
@@ -1235,7 +1303,8 @@ impl BhKernels {
         let grads = &off.bufs.grads;
         self.base.launch(ctx, &reads, &[grads.storage()], |stream| {
             // SAFETY: lengths checked above; `BhPositions::zeroed` sized `grads` for every
-            // epoch position's chunks; one block of PIXEL_THREADS per chunk and frame.
+            // epoch position's chunks of every segment, of which `part` is one; one block of
+            // PIXEL_THREADS per chunk and frame.
             unsafe {
                 self.module.bh_pos_grad(
                     stream,
@@ -1244,7 +1313,7 @@ impl BhKernels {
                     dptr(a),
                     dptr(shift.offsets),
                     dptr::<ViewAddr, ViewAddr>(views),
-                    dptr(grads),
+                    part,
                     stack.ctl() as *const StackCtl,
                     g,
                 )
@@ -1266,9 +1335,9 @@ impl BhKernels {
         batch.positions()?;
         let dims = off.check()?;
         let span = span(dims, &batch.frames)?;
-        // A frame's row of partials holds every slice's chunks.
+        // A frame's row of partials holds every segment's chunks.
         let span = BatchSpan {
-            nchunk: span.nchunk * off.bufs.nslice as u32,
+            nchunk: span.nchunk * off.bufs.nseg as u32,
             ..span
         };
         parts.check(dims)?;
@@ -1299,47 +1368,82 @@ impl BhKernels {
     }
 
     /// The spectra of the stack's moved probes' first-order changes along the step's `u`
-    /// into `l[0]` and with CG `v` into `l[1]` (else `l[1]` is left as it is), one per view in
-    /// [`Kernels::obj_probe_to_psi`]'s layout, ready for their inverse FFT.
+    /// into `lu` and with CG `v` into `lv`, one per view in [`Kernels::obj_probe_to_psi`]'s
+    /// layout, ready for their inverse FFT.
     pub fn pos_spec(
         &self,
         ctx: &ExecutionContext,
         stack: StackRef<'_>,
         mv: &BhMovesRef<'_>,
-        l: [&mut DeviceBuffer<C32>; 2],
+        (lu, lv): (&mut DeviceBuffer<C32>, Option<&mut DeviceBuffer<C32>>),
     ) -> Result<(), Error> {
         let dims = mv.check()?;
         let g = dims.geom(stack)?;
         let len = g.nf_max as usize * dims.nmode as usize * dims.n();
-        let [lu, lv] = l;
-        check_len("lu", lu, len)?;
-        check_len("lv", lv, len)?;
+        let lv = (["lv"], lv.as_deref().map(|b| [b]));
+        let (writes, lu, [lv]) = touched(("lu", &*lu), lv, mv.av.is_some(), len)?;
         let config = grid_1d(len)?;
         let mut reads = mv.storages();
         reads.push(stack.storage());
         let views = mv.off.order.views.addr();
-        self.base
-            .launch(ctx, &reads, &[lu.storage(), lv.storage()], |stream| {
-                // SAFETY: lengths checked above; `Views::new` checked every view's probe mode.
-                unsafe {
-                    self.module.bh_pos_spec(
-                        stream,
-                        config,
-                        mv.ptrs(),
-                        dptr::<ViewAddr, ViewAddr>(views),
-                        dptr(lu),
-                        dptr(lv),
-                        stack.ctl() as *const StackCtl,
-                        g,
-                    )
-                }
-            })
+        self.base.launch(ctx, &reads, &writes, |stream| {
+            // SAFETY: lengths checked above; `Views::new` checked every view's probe mode.
+            unsafe {
+                self.module.bh_pos_spec(
+                    stream,
+                    config,
+                    mv.ptrs(),
+                    dptr::<ViewAddr, ViewAddr>(views),
+                    lu,
+                    lv,
+                    stack.ctl() as *const StackCtl,
+                    g,
+                )
+            }
+        })
+    }
+
+    /// The spectra of the stack's moved probes' second-order changes along the step's `(u,
+    /// u)` into `muu` and with CG `(u, v)`, `(v, v)` into `m`'s two, laid out as
+    /// [`Self::pos_spec`]'s and ready for their inverse FFT.
+    pub fn pos_second(
+        &self,
+        ctx: &ExecutionContext,
+        stack: StackRef<'_>,
+        mv: &BhMovesRef<'_>,
+        (muu, m): (&mut DeviceBuffer<C32>, Option<[&mut DeviceBuffer<C32>; 2]>),
+    ) -> Result<(), Error> {
+        let dims = mv.check()?;
+        let g = dims.geom(stack)?;
+        let len = g.nf_max as usize * dims.nmode as usize * dims.n();
+        let m = (["muv", "mvv"], m.as_ref().map(|[uv, vv]| [&**uv, &**vv]));
+        let (writes, muu, [muv, mvv]) = touched(("muu", &*muu), m, mv.av.is_some(), len)?;
+        let config = grid_1d(len)?;
+        let mut reads = mv.storages();
+        reads.push(stack.storage());
+        let views = mv.off.order.views.addr();
+        self.base.launch(ctx, &reads, &writes, |stream| {
+            // SAFETY: lengths checked above; `Views::new` checked every view's probe mode.
+            unsafe {
+                self.module.bh_pos_second(
+                    stream,
+                    config,
+                    mv.ptrs(),
+                    dptr::<ViewAddr, ViewAddr>(views),
+                    muu,
+                    muv,
+                    mvv,
+                    stack.ctl() as *const StackCtl,
+                    g,
+                )
+            }
+        })
     }
 
     /// The near Hessian triples along `d` of the stack's frames under the position model
-    /// into those of [`BhParts`], as [`Self::hess_frames`] places them, from `f.lu`, `f.lv`
-    /// the inverse-FFT'd [`Self::pos_spec`]; then in place the exit waves' first-order
-    /// changes `lu = u_O W + O δ_u W` and with `d.v` `lv` likewise, ready for their forward
+    /// into those of [`BhParts`], as [`Self::hess_frames`] places them, from `f.lu` and with
+    /// `d.v` `f.lv`, the inverse-FFT'd [`Self::pos_spec`]; then in place the exit waves'
+    /// first-order changes `lu = u_O W + O δ_u W` and `lv` likewise, ready for their forward
     /// FFT. `views` are the epoch's.
     pub fn pos_near(
         &self,
@@ -1356,9 +1460,9 @@ impl BhKernels {
         let len = g.nf_max as usize * dims.nmode as usize * n;
         check_len("obj", f.obj, dims.obj_len())?;
         check_len("w", f.w, g.nf_max as usize * dims.nprobe as usize * n)?;
-        for (what, b) in [("r", f.r), ("lu", &*f.lu), ("lv", &*f.lv)] {
-            check_len(what, b, len)?;
-        }
+        check_len("r", f.r, len)?;
+        let lv = (["lv"], f.lv.as_deref().map(|b| [b]));
+        let (mut writes, lu, [lv]) = touched(("lu", &*f.lu), lv, d.v.is_some(), len)?;
         d.check(dims)?;
         parts.check(dims)?;
         let config = chunk_grid(&g, n)?;
@@ -1370,15 +1474,15 @@ impl BhKernels {
             stack.storage(),
         ];
         reads.extend(d.storages());
-        let writes = [f.lu.storage(), f.lv.storage(), parts.buf.storage()];
+        writes.push(parts.buf.storage());
         let out = parts.ptr(parts.hess(0));
         self.base.launch(ctx, &reads, &writes, |stream| {
             let near = BhNear {
                 obj: dptr(f.obj),
                 w: dptr(f.w),
                 r: dptr(f.r),
-                lu: dptr(&*f.lu),
-                lv: dptr(&*f.lv),
+                lu,
+                lv,
             };
             // SAFETY: lengths checked above; one block of PIXEL_THREADS per chunk and frame;
             // `Views::new` checked every view lies inside the object with valid modes.
@@ -1414,32 +1518,33 @@ impl BhKernels {
         let n = dims.n();
         check_len("counts", counts, dims.nframe as usize * n)?;
         let len = g.nf_max as usize * dims.nmode as usize * n;
-        for (what, b) in [("psi", f.psi), ("lu", f.lu), ("lv", f.lv), ("y", f.y)] {
+        for (what, b) in [("psi", f.psi), ("y", f.y)] {
             check_len(what, b, len)?;
         }
+        let lv = (["lv"], f.lv.map(|b| [b]));
+        let (l, lu, [lv]) = touched(("lu", f.lu), lv, mv.av.is_some(), len)?;
         parts.check(dims)?;
         let config = chunk_grid(&g, n)?;
         let mut reads = mv.storages();
         reads.extend([
             counts.storage(),
             f.psi.storage(),
-            f.lu.storage(),
-            f.lv.storage(),
             f.y.storage(),
             stack.storage(),
         ]);
+        reads.extend(l);
+        let far = BhMovedFar {
+            far: BhFar {
+                psi: dptr(f.psi),
+                lu,
+                lv,
+            },
+            y: dptr(f.y),
+        };
         let views = mv.off.order.views.addr();
         let out = parts.ptr(parts.hess(0));
         self.base
             .launch(ctx, &reads, &[parts.buf.storage()], |stream| {
-                let far = BhMovedFar {
-                    far: BhFar {
-                        psi: dptr(f.psi),
-                        lu: dptr(f.lu),
-                        lv: dptr(f.lv),
-                    },
-                    y: dptr(f.y),
-                };
                 // SAFETY: lengths checked above; one block of PIXEL_THREADS per chunk and frame;
                 // `EpochOrder` holds frame ids below `nframe`.
                 unsafe {
@@ -1458,41 +1563,39 @@ impl BhKernels {
             })
     }
 
-    /// [`Self::pos_spec`] with the offsets held: `l[0] = e s Au_p` and with CG `l[1] = e
-    /// Av_p` (else `l[1]` is left as it is), `e` each frame's ramp of `mv`'s offsets.
+    /// [`Self::pos_spec`] with the offsets held: `lu = e s Au_p` and with CG `lv = e Av_p`, `e`
+    /// each frame's ramp of `mv`'s offsets.
     pub fn moved_spec(
         &self,
         ctx: &ExecutionContext,
         stack: StackRef<'_>,
         mv: &BhMovedRef<'_>,
-        l: [&mut DeviceBuffer<C32>; 2],
+        (lu, lv): (&mut DeviceBuffer<C32>, Option<&mut DeviceBuffer<C32>>),
     ) -> Result<(), Error> {
         let dims = mv.check()?;
         let g = dims.geom(stack)?;
         let len = g.nf_max as usize * dims.nmode as usize * dims.n();
-        let [lu, lv] = l;
-        check_len("lu", lu, len)?;
-        check_len("lv", lv, len)?;
+        let lv = (["lv"], lv.as_deref().map(|b| [b]));
+        let (writes, lu, [lv]) = touched(("lu", &*lu), lv, mv.av.is_some(), len)?;
         let config = grid_1d(len)?;
         let mut reads = mv.storages();
         reads.push(stack.storage());
         let views = mv.order.views.addr();
-        self.base
-            .launch(ctx, &reads, &[lu.storage(), lv.storage()], |stream| {
-                // SAFETY: lengths checked above; `Views::new` checked every view's probe mode.
-                unsafe {
-                    self.module.bh_moved_spec(
-                        stream,
-                        config,
-                        mv.ptrs(),
-                        dptr::<ViewAddr, ViewAddr>(views),
-                        dptr(lu),
-                        dptr(lv),
-                        stack.ctl() as *const StackCtl,
-                        g,
-                    )
-                }
-            })
+        self.base.launch(ctx, &reads, &writes, |stream| {
+            // SAFETY: lengths checked above; `Views::new` checked every view's probe mode.
+            unsafe {
+                self.module.bh_moved_spec(
+                    stream,
+                    config,
+                    mv.ptrs(),
+                    dptr::<ViewAddr, ViewAddr>(views),
+                    lu,
+                    lv,
+                    stack.ctl() as *const StackCtl,
+                    g,
+                )
+            }
+        })
     }
 
     /// [`Self::pos_far`] with the offsets held: adds to the stack's frames' triples
@@ -1590,20 +1693,19 @@ impl BhKernels {
     }
 
     /// Under full-object sampling, the stack's object gradient patches into `patch` and its
-    /// offsets' gradient partials into `off`, from `f` and `win`, the estimate's windows of
-    /// `slice` and their derivatives over `y` and `x` in blocks 0 to 2: per frame and object
-    /// mode, `G = Σ_p conj(q P_p) r` on the window, which
+    /// offsets' gradient partials into segment `seg` of `off`'s, from `f` and `win`, the
+    /// estimate's windows of a slice and their derivatives over `y` and `x` in blocks 0 to 2:
+    /// per frame and object mode, `G = Σ_p conj(q P_p) r` on the window, which
     /// [`crate::gpu::sampling::ObjectSampler::place`] adds to the slice as
     /// [`Kernels::psi_to_obj`] would, and per chunk of [`GAMMA_CHUNK`] pixels of each frame
-    /// the pair [`Self::pos_dots`] sums to `∂F/∂d`, in the slice's own segment of the frame's
-    /// partials; other frames' patches and partials, and other slices' partials, are left as
-    /// they are.
+    /// the pair [`Self::pos_dots`] sums with the other segments' to `∂F/∂d`; other frames'
+    /// patches and partials, and other segments' partials, are left as they are.
     pub fn win_grad(
         &self,
         ctx: &ExecutionContext,
         stack: StackRef<'_>,
         f: BhWinRef<'_>,
-        (win, slice): (&DeviceBuffer<C32>, usize),
+        (win, seg): (&DeviceBuffer<C32>, usize),
         patch: &mut DeviceBuffer<C32>,
         off: &mut BhOffsets<'_>,
     ) -> Result<(), Error> {
@@ -1611,10 +1713,7 @@ impl BhKernels {
         let g = dims.geom(stack)?;
         let blk = window_block(dims, &g);
         f.check(dims, &g)?;
-        let nslice = off.bufs.nslice;
-        if slice >= nslice {
-            return Err(Error::Shape(format!("slice {slice} of {nslice}")));
-        }
+        let part = off.bufs.partials(seg)?;
         check_len("win", win, 3 * blk)?;
         check_len("patch", patch, blk)?;
         let config = chunk_grid(&g, dims.n())?;
@@ -1627,9 +1726,9 @@ impl BhKernels {
         let grads = &off.bufs.grads;
         let writes = [patch.storage(), grads.storage()];
         self.base.launch(ctx, &reads, &writes, |stream| {
-            // SAFETY: lengths and the slice checked above; `BhPositions::zeroed` sized `grads`
-            // for every epoch position's chunks of every slice; one block of PIXEL_THREADS per
-            // chunk and frame.
+            // SAFETY: lengths checked above; `BhPositions::zeroed` sized `grads` for every
+            // epoch position's chunks of every segment, of which `part` is one; one block of
+            // PIXEL_THREADS per chunk and frame.
             unsafe {
                 self.module.bh_win_grad(
                     stream,
@@ -1637,11 +1736,103 @@ impl BhKernels {
                     f.ptrs(),
                     dptr(win),
                     dptr(patch),
-                    BhPartials {
-                        out: dptr(grads),
-                        slice: slice as u32,
-                        nslice: nslice as u32,
-                    },
+                    part,
+                    stack.ctl() as *const StackCtl,
+                    g,
+                )
+            }
+        })
+    }
+
+    /// The stack's offsets' gradient partials of `last`'s plane phase into segment `seg` of
+    /// `off`'s, from `r` the residual after its inverse FFT and the phase's adjoint: per
+    /// chunk of [`GAMMA_CHUNK`] pixels of each frame the pair [`Self::pos_dots`] sums with
+    /// the other segments' to `∂F/∂d`; other frames' partials, and other segments', are left
+    /// as they are. `off`'s views are those the slice is read through.
+    pub fn phase_grad(
+        &self,
+        ctx: &ExecutionContext,
+        stack: StackRef<'_>,
+        last: BhLastSlice<'_>,
+        r: &DeviceBuffer<C32>,
+        (off, seg): (&mut BhOffsets<'_>, usize),
+    ) -> Result<(), Error> {
+        let dims = off.check()?;
+        let g = dims.geom(stack)?;
+        let n = dims.n();
+        let (s, entered) = last.entry.slice_in(last.slice, dims, &g)?;
+        check_len("r", r, g.nf_max as usize * dims.nmode as usize * n)?;
+        let part = off.bufs.partials(seg)?;
+        let config = chunk_grid(&g, n)?;
+        let views = off.order.views.addr();
+        let mut reads = vec![r.storage(), views.storage(), stack.storage()];
+        reads.extend(entered);
+        let grads = &off.bufs.grads;
+        self.base.launch(ctx, &reads, &[grads.storage()], |stream| {
+            // SAFETY: lengths checked above; `Views::new` checked every view lies inside the
+            // object with valid mode indices; `BhPositions::zeroed` sized `grads` for every
+            // epoch position's chunks of every segment, of which `part` is one; one block of
+            // PIXEL_THREADS per chunk and frame.
+            unsafe {
+                self.module.bh_phase_grad(
+                    stream,
+                    config,
+                    s,
+                    dptr(r),
+                    dptr::<ViewAddr, ViewAddr>(views),
+                    last.quad,
+                    part,
+                    stack.ctl() as *const StackCtl,
+                    g,
+                )
+            }
+        })
+    }
+
+    /// The stack's derivatives `t` along `d` through `last`'s plane phase, in place with the
+    /// phase itself left out: on entry those of the slice's exit ([`Self::slice_tangent`]),
+    /// after it those of the exit waves once [`crate::gpu::OpticsKernels::slice_phase`] puts
+    /// the phase on `t.lu` and its `lv` and its adjoint is on the residual, as
+    /// [`Self::sliced_hess_frames`] reads them. Of `d` only whether it has `v` is read, and
+    /// `t.cg` is given exactly with it. `off`'s views are those the slice is read through.
+    pub fn phase_tangent(
+        &self,
+        ctx: &ExecutionContext,
+        stack: StackRef<'_>,
+        last: BhLastSlice<'_>,
+        off: &BhOffsets<'_>,
+        d: &BhDisp<'_>,
+        t: &mut BhTangentsMut<'_>,
+    ) -> Result<(), Error> {
+        let dims = off.check()?;
+        let g = dims.geom(stack)?;
+        let len = g.nf_max as usize * dims.nmode as usize * dims.n();
+        let (s, entered) = last.entry.slice_in(last.slice, dims, &g)?;
+        let (writes, t) = t.touched(d.v.is_some(), len)?;
+        let config = grid_1d(len)?;
+        let b = &off.bufs;
+        let views = off.order.views.addr();
+        let mut reads = vec![
+            views.storage(),
+            stack.storage(),
+            b.ud.storage(),
+            b.prev.storage(),
+            off.order.ids.order().storage(),
+        ];
+        reads.extend(entered);
+        let dirs = off.dirs(d.v.is_some());
+        self.base.launch(ctx, &reads, &writes, |stream| {
+            // SAFETY: lengths checked above; `Views::new` checked every view lies inside the
+            // object with valid mode indices; `EpochOrder` holds frame ids below `nframe`.
+            unsafe {
+                self.module.bh_phase_tangent(
+                    stream,
+                    config,
+                    s,
+                    dirs,
+                    t,
+                    dptr::<ViewAddr, ViewAddr>(views),
+                    last.quad,
                     stack.ctl() as *const StackCtl,
                     g,
                 )
@@ -1820,3 +2011,6 @@ impl BhWinRef<'_> {
 fn step_len(record: u32) -> usize {
     BH_STEP as usize * (record as usize + 1)
 }
+
+#[cfg(test)]
+mod tests;

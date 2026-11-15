@@ -25,7 +25,7 @@ use ptyrs::base::{AddrTable, Geometry, Positions, required_obj_shape};
 use ptyrs::fft::Plan2d;
 use ptyrs::gpu::{
     C32, Error, Exit, FarSums, FusedBufs, FusedInputs, FusedSums, Kernels, Model, PositionPartial,
-    Shift, ShiftProbe, ShiftSums, ShiftedProbeSums, SpectrumBuf, StackTable, UpdateSums, ViewAddr,
+    Shift, ShiftProbe, ShiftSums, ShiftedStepSums, SpectrumBuf, StackTable, UpdateSums, ViewAddr,
     ViewDims, Views, record,
 };
 
@@ -77,7 +77,7 @@ struct Run {
     obj_sums: UpdateSums,
     probe_sums: UpdateSums,
     spectrum: SpectrumBuf,
-    shifted: ShiftedProbeSums,
+    shifted: ShiftedStepSums,
     position: DeviceBuffer<PositionPartial>,
     position_den: DeviceBuffer<PositionPartial>,
 }
@@ -134,7 +134,7 @@ impl Run {
             obj_sums: UpdateSums::zeroed(stream, obj.len())?,
             probe_sums: UpdateSums::zeroed(stream, probe.len())?,
             spectrum: SpectrumBuf::zeroed(stream, d)?,
-            shifted: ShiftedProbeSums::zeroed(stream, d)?,
+            shifted: ShiftedStepSums::zeroed(stream, d)?,
             position: DeviceBuffer::zeroed(stream, d.nframe as usize)?,
             position_den: DeviceBuffer::zeroed(stream, d.nframe as usize)?,
             table,
@@ -209,7 +209,7 @@ impl Run {
                 obj: Some(&mut self.obj_sums),
                 probe: None,
                 shift: ShiftSums {
-                    probe: Some(ShiftProbe::Sums(&mut self.shifted)),
+                    probe: Some(ShiftProbe::Step(&mut self.shifted)),
                     position: Some(&mut self.position),
                     position_den: Some(&mut self.position_den),
                 },
@@ -350,8 +350,8 @@ fn scene(
     let f = ptyrs::base::sim::fermat(NPOS, step * pixel[1]);
     let round = |v: &[f64]| v.iter().map(|&x| x as f32 as f64).collect();
     let positions = Positions::new(round(f.y()), round(f.x()))?.pynx_preprocess(pixel);
-    let shape = required_obj_shape(&positions, pixel, g.frame, 16);
-    let addr = AddrTable::new(&positions, pixel, g.frame, shape, NPROBE, 1)?;
+    let shape = required_obj_shape(&positions, pixel, g.frame.sides(), 16);
+    let addr = AddrTable::new(&positions, pixel, g.frame.sides(), shape, NPROBE, 1)?;
     let dims = ViewDims {
         nframe: NPOS as u32,
         nmode: NPROBE as u32,
@@ -393,7 +393,7 @@ fn scene(
         .collect();
     // Scaled so a frame's far field holds about 2e5 photons.
     let scale = (2e5f64).sqrt();
-    let probe: Vec<C32> = ptyrs::base::sim::probe(g.frame, NPROBE)?
+    let probe: Vec<C32> = ptyrs::base::sim::probe(g.frame.sides(), NPROBE)?
         .as_slice()
         .iter()
         .map(|c| C32 {

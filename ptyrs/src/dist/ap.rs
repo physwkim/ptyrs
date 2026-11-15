@@ -26,7 +26,7 @@ use std::sync::Arc;
 use crate::base::AddrTable;
 use crate::gpu::{
     C32, Exit, FarSums, FusedBufs, FusedInputs, FusedSums, Kernels, LlkPartial, LlkSums, Model,
-    StackTable, UpdateSums, ViewAddr, ViewDims, Views, view_tiles,
+    StackTable, SumTarget, UpdateSums, ViewAddr, ViewDims, Views, view_tiles,
 };
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{Context, DeviceBuffer, Stream};
@@ -442,7 +442,7 @@ struct Data {
 }
 
 impl State {
-    fn new(gpu: &mut Gpu, plan: &Plan, data: &Data) -> Result<Self, DistError> {
+    fn new(gpu: &Gpu, plan: &Plan, data: &Data) -> Result<Self, DistError> {
         let rp = &plan.regions[gpu.region()];
         let stream = gpu.stream();
         let n = plan.n();
@@ -628,8 +628,10 @@ impl State {
                 _ => None,
             };
             let sums = FusedSums {
-                obj: obj_sums.as_mut(),
-                probe: mine.and_then(|_| leaf_sums.get_mut(st.leaf - r * plan.k)),
+                obj: obj_sums.as_mut().map(|s| s as &mut dyn SumTarget),
+                probe: mine
+                    .and_then(|_| leaf_sums.get_mut(st.leaf - r * plan.k))
+                    .map(|s| s as &mut dyn SumTarget),
                 ..Default::default()
             };
             let far = FarSums {
@@ -896,9 +898,9 @@ mod tests {
         let g = Geometry::new(1.5e-10, 1.0, 75e-6, [frame, frame]).unwrap();
         let pixel = g.pixel_size_object();
         let pos = positions(pixel[1]);
-        let shape = required_obj_shape(&pos.pynx_preprocess(pixel), pixel, g.frame, 4);
+        let shape = required_obj_shape(&pos.pynx_preprocess(pixel), pixel, g.frame.sides(), 4);
         let object = sim::object(shape);
-        let probe = sim::probe(g.frame, nmode).unwrap();
+        let probe = sim::probe(g.frame.sides(), nmode).unwrap();
         let scan = crate::engine::sim::simulate(g, pos, &object, &probe, PHOTONS, None, 7).unwrap();
         let mut x = 0x9e37_79b9_7f4a_7c15_u64;
         let phase: Vec<C64> = (0..object.as_slice().len())
@@ -1254,8 +1256,8 @@ mod tests {
             matches!(r, Err(DistError::Gpu(crate::gpu::Error::Driver(d))) if d == fault::REFUSAL),
             "{r:?}"
         );
-        assert!(matches!(ap.run(1), Err(DistError::Aborted)));
-        assert!(matches!(ap.object(), Err(DistError::Aborted)));
-        assert!(matches!(ap.probe(), Err(DistError::Aborted)));
+        assert!(matches!(ap.run(1), Err(DistError::Poisoned)));
+        assert!(matches!(ap.object(), Err(DistError::Poisoned)));
+        assert!(matches!(ap.probe(), Err(DistError::Poisoned)));
     }
 }

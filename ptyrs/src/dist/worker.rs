@@ -7,7 +7,7 @@
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
 use cuda_core::{Context, Event, IntoResult, Stream, sys};
@@ -86,7 +86,7 @@ impl Gpu {
     /// the host so every record is enqueued, then make the main stream wait on every peer's
     /// event. All workers of a run must call it the same number of times.
     pub fn fence(&mut self) -> Result<(), DistError> {
-        let events = self.shared.events.get().ok_or(DistError::Aborted)?;
+        let events = &self.shared.events;
         // Alternate two events: a peer can only re-record parity p after the next fence's
         // rendezvous, which this worker reaches only after enqueuing its waits on parity p.
         let p = self.fences % 2;
@@ -113,7 +113,8 @@ fn wait_event(stream: &Stream, event: &Event) -> Result<(), DistError> {
 
 struct Shared {
     rendezvous: Rendezvous,
-    events: OnceLock<Vec<[Event; 2]>>,
+    /// Each region's two fence events, made before any worker starts.
+    events: Vec<[Event; 2]>,
 }
 
 /// Host barrier of the `n` workers. A worker that fails, panics or finishes while others
@@ -213,9 +214,11 @@ pub struct Workers<S: Send + 'static> {
 
 impl<S: Send + 'static> Workers<S> {
     /// Starts one thread per ordinal; each builds its state with `init` on its own thread.
+    /// `init` sees its [`Gpu`] shared, so it cannot [`Gpu::fence`]: the rendezvous counts
+    /// only jobs' fences.
     pub fn spawn<I>(ordinals: &[usize], init: I) -> Result<Self, DistError>
     where
-        I: Fn(&mut Gpu) -> Result<S, DistError> + Send + Sync + 'static,
+        I: Fn(&Gpu) -> Result<S, DistError> + Send + Sync + 'static,
     {
         if ordinals.is_empty() {
             return Err(DistError::Partition("no GPUs".into()));
@@ -231,13 +234,17 @@ impl<S: Send + 'static> Workers<S> {
             .map(|(_, c)| c.clone())
             .collect();
         enable_all_pairs(&distinct)?;
+        let events = ctxs
+            .iter()
+            .map(|c| Ok([c.new_event_with_flags(None)?, c.new_event_with_flags(None)?]))
+            .collect::<Result<_, DistError>>()?;
         let shared = Arc::new(Shared {
             rendezvous: Rendezvous {
                 n: ordinals.len(),
                 state: Mutex::default(),
                 cv: Condvar::new(),
             },
-            events: OnceLock::new(),
+            events,
         });
         let init = Arc::new(init);
         let (ready_tx, ready_rx) = channel();
@@ -257,21 +264,19 @@ impl<S: Send + 'static> Workers<S> {
             workers.handles.push(handle);
         }
         drop(ready_tx);
-        let mut events: Vec<Option<[Event; 2]>> = (0..ordinals.len()).map(|_| None).collect();
+        let mut reported = vec![false; ordinals.len()];
         let mut first_err = None;
-        for _ in 0..ordinals.len() {
-            match ready_rx.recv() {
-                Ok((r, Ok(e))) => events[r] = Some(e),
-                Ok((_, Err(e))) => first_err = first_err.or(Some(e)),
-                Err(_) => first_err = first_err.or(Some(DistError::Aborted)),
+        for (r, res) in ready_rx {
+            reported[r] = true;
+            if let Err(e) = res {
+                first_err = first_err.or(Some(e));
             }
         }
-        if let Some(e) = first_err {
-            return Err(e);
+        let lost = reported.iter().position(|&r| !r).map(thread_ended);
+        match first_err.or(lost) {
+            Some(e) => Err(e),
+            None => Ok(workers),
         }
-        let events = events.into_iter().map(Option::unwrap).collect();
-        let _ = shared.events.set(events);
-        Ok(workers)
     }
 
     pub fn len(&self) -> usize {
@@ -297,6 +302,9 @@ impl<S: Send + 'static> Workers<S> {
         // unwinding included, before every job has run or been dropped.
         let f: &'static Body<'static, S, R> = unsafe { std::mem::transmute(f) };
         let mut results = Results::new();
+        // Regions up to this one were handed the job or found their worker gone; the rest
+        // never run.
+        let mut reached = self.len();
         for (region, s) in self.senders.iter().enumerate() {
             let tx = results.sender();
             let job: Job<S> = Box::new(move |gpu, state| {
@@ -317,6 +325,7 @@ impl<S: Send + 'static> Workers<S> {
                 // The worker is gone: release the ones already started, unsent ones report
                 // `Aborted`.
                 self.shared.rendezvous.depart(false);
+                reached = region + 1;
                 break;
             }
         }
@@ -326,8 +335,15 @@ impl<S: Send + 'static> Workers<S> {
         }
         let mut results = Vec::with_capacity(out.len());
         let mut err: Option<DistError> = None;
-        for res in out {
-            match res.unwrap_or(Err(DistError::Aborted)) {
+        for (region, res) in out.into_iter().enumerate() {
+            let res = res.unwrap_or_else(|| {
+                Err(if region < reached {
+                    thread_ended(region)
+                } else {
+                    DistError::Aborted
+                })
+            });
+            match res {
                 Ok(v) => results.push(v),
                 Err(e) => {
                     // Keep the first root cause; workers it released report `Aborted`.
@@ -363,10 +379,10 @@ impl<S: Send + 'static> Gated<S> {
         }
     }
 
-    /// [`DistError::Aborted`] once a call through [`Self::change`] has failed.
+    /// [`DistError::Poisoned`] once a call through [`Self::change`] has failed.
     pub(crate) fn check(&self) -> Result<(), DistError> {
         if self.failed {
-            return Err(DistError::Aborted);
+            return Err(DistError::Poisoned);
         }
         Ok(())
     }
@@ -450,7 +466,7 @@ impl<S: Send + 'static> Drop for Workers<S> {
     }
 }
 
-type Ready = Sender<(usize, Result<[Event; 2], DistError>)>;
+type Ready = Sender<(usize, Result<(), DistError>)>;
 
 fn worker<S, I>(
     region: usize,
@@ -460,15 +476,11 @@ fn worker<S, I>(
     ready: Ready,
     jobs: Receiver<Job<S>>,
 ) where
-    I: Fn(&mut Gpu) -> Result<S, DistError>,
+    I: Fn(&Gpu) -> Result<S, DistError>,
 {
-    let setup = || -> Result<(Gpu, [Event; 2]), DistError> {
+    let setup = || -> Result<Gpu, DistError> {
         ctx.bind_to_thread()?;
         let stream = ctx.new_stream()?;
-        let events = [
-            ctx.new_event_with_flags(None)?,
-            ctx.new_event_with_flags(None)?,
-        ];
         let side = Side {
             stream: ctx.new_stream_with_priority(ctx.stream_priority_range()?.greatest())?,
             fork: ctx.new_event_with_flags(None)?,
@@ -482,12 +494,12 @@ fn worker<S, I>(
             shared,
             fences: 0,
         };
-        Ok((gpu, events))
+        Ok(gpu)
     };
     let started = catch_unwind(AssertUnwindSafe(|| {
-        let (mut gpu, events) = setup()?;
-        let state = init(&mut gpu)?;
-        Ok((gpu, events, state))
+        let gpu = setup()?;
+        let state = init(&gpu)?;
+        Ok((gpu, state))
     }))
     .unwrap_or_else(|p| {
         Err(DistError::Panic {
@@ -496,8 +508,8 @@ fn worker<S, I>(
         })
     });
     let (mut gpu, mut state) = match started {
-        Ok((gpu, events, state)) => {
-            let _ = ready.send((region, Ok(events)));
+        Ok((gpu, state)) => {
+            let _ = ready.send((region, Ok(())));
             (gpu, state)
         }
         Err(e) => {
@@ -511,6 +523,15 @@ fn worker<S, I>(
     }
     let _ = gpu.synchronize();
     drop(state);
+}
+
+/// Region `region`'s worker thread ended without reporting, which only a panic outside its
+/// `catch_unwind` does.
+fn thread_ended(region: usize) -> DistError {
+    DistError::Panic {
+        region,
+        msg: "its worker thread ended".into(),
+    }
 }
 
 fn panic_msg(p: &Box<dyn std::any::Any + Send>) -> String {

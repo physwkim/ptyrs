@@ -113,15 +113,7 @@ fn run(dir: &Path, pattern: &str, args: &[String]) -> Result<(), Box<dyn Error>>
     for &q in &pos {
         place.views(q, 2, 1, &mut views);
     }
-    let shape = ScanShape {
-        nframe: POINTS as u32,
-        nmode: 2,
-        nprobe: 2,
-        nobj: 1,
-        frame: [FRAME as u32; 2],
-        reach,
-        quad_phase: 0.0,
-    };
+    let shape = ScanShape::new(POINTS as u32, 2, 1, [FRAME; 2], reach, 0.0)?;
     let cfg = ApConfig {
         shape,
         nf_max: NonZeroU32::new(32).unwrap(),

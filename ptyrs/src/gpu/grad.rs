@@ -18,13 +18,13 @@ use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig};
 pub use ptyrs_kernels::grad::{CG_BLOCKS, GAMMA_CHUNK};
 use ptyrs_kernels::grad::{GammaPtrs, NormPtrs, ObjProbePtrs, WindowSums, grad_kernels};
-use ptyrs_kernels::pixel::{PIXEL_THREADS, PositionPartial, SumPtrs};
+use ptyrs_kernels::pixel::{PIXEL_THREADS, PositionPartial};
 
 use crate::gpu::ops::grid_1d;
 use crate::gpu::psi::check_waves;
 use crate::gpu::{
-    C32, Error, Kernels, LlkPartial, Model, ScalePartial, StackCtl, StackRef, UpdateSums, ViewDims,
-    Views, Waves, check_len, dptr,
+    C32, Error, Kernels, LlkPartial, Model, ScalePartial, StackCtl, StackRef, ViewDims, Views,
+    Waves, check_len, dptr,
 };
 
 /// The line-search exit-wave stacks of [`GradKernels::gamma_fields`], each of `nf_max *
@@ -379,33 +379,28 @@ impl GradKernels {
     }
 
     /// `d = β d - g` with `β = beta[0] / beta[1]`, or 0 where that is negative or not finite;
-    /// consumes the gradient sums `g` (zero after).
+    /// consumes the gradient `g` (zero after).
     pub fn direction(
         &self,
         ctx: &ExecutionContext,
         d: &mut DeviceBuffer<C32>,
-        g: &mut UpdateSums,
+        g: &mut DeviceBuffer<C32>,
         n: u32,
         beta: &DeviceBuffer<f32>,
     ) -> Result<(), Error> {
         check_len("d", d, n as usize)?;
-        check_len("g.num", &g.num, n as usize)?;
-        check_len("g.den", &g.den, n as usize)?;
+        check_len("g", g, n as usize)?;
         check_len("beta", beta, 2)?;
         if n == 0 {
             return Ok(());
         }
         let config = LaunchConfig::for_num_elems(n);
-        let writes = [d.storage(), g.num.storage(), g.den.storage()];
+        let writes = [d.storage(), g.storage()];
         self.base.launch(ctx, &[beta.storage()], &writes, |stream| {
-            let g = SumPtrs {
-                num: dptr(&g.num),
-                den: dptr(&g.den),
-            };
             // SAFETY: lengths checked above.
             unsafe {
                 self.module
-                    .cg_direction(stream, config, dptr(d), g, n, dptr(beta))
+                    .cg_direction(stream, config, dptr(d), dptr(g), n, dptr(beta))
             }
         })
     }

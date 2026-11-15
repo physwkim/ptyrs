@@ -2,6 +2,7 @@
 
 use crate::gpu::{
     Error as GpuError, Exit, FarSums, FusedBufs, FusedInputs, FusedSums, RecordWriter, ShiftProbe,
+    ShiftedProbes, ShiftedStepSums,
 };
 use cuda_async::device_operation::ExecutionContext;
 
@@ -25,19 +26,21 @@ impl GpuPtycho {
     /// object sums are placed back from them, and the object update divides by the
     /// illumination map.
     pub fn ap(&mut self, params: &ApParams, ncycle: usize) -> Result<(), EngineError> {
-        for ic in 0..ncycle {
-            let epoch = Epoch::Ap {
-                params: *params,
-                llk: llk_due(params.calc_llk, ic, ncycle),
-            };
-            self.dev.steady(epoch, self.cycle)?;
-            self.cycle += 1;
-        }
-        self.collect()?;
-        if params.zero_phase_ramp {
-            self.zero_phase_ramp()?;
-        }
-        Ok(())
+        self.call(
+            params.zero_phase_ramp,
+            |dev| dev.one_unitary("Ap"),
+            |dev, cycle| {
+                for ic in 0..ncycle {
+                    let epoch = Epoch::Ap {
+                        params: *params,
+                        llk: llk_due(params.calc_llk, ic, ncycle),
+                    };
+                    dev.steady(epoch, *cycle)?;
+                    *cycle += 1;
+                }
+                Ok(())
+            },
+        )
     }
 }
 
@@ -118,14 +121,14 @@ impl Bufs<'_> {
                     counts: self.counts,
                     obj: read.blocks,
                     probe: self.probe,
-                    model: m.model,
+                    model: m.model(),
                 };
                 let far = FarSums {
                     llk: llk.is_some().then_some(&mut *self.llk),
                     ..FarSums::default()
                 };
                 let sums = FusedSums {
-                    obj: obj.then(|| w.zeroed_sums(ctx)).transpose()?,
+                    obj: obj.then(|| w.zeroed_patches(ctx)).transpose()?,
                     ..FusedSums::default()
                 };
                 (self.kernels).fused_project(ctx, &inputs, stack, Exit::Ap { far }, f, sums)?;
@@ -153,7 +156,7 @@ impl Bufs<'_> {
                 counts: self.counts,
                 obj: self.obj,
                 probe: self.probe,
-                model: m.model,
+                model: m.model(),
             };
             let far = FarSums {
                 llk: llk.is_some().then_some(&mut *self.llk),
@@ -162,7 +165,7 @@ impl Bufs<'_> {
             let exit = Exit::Ap { far };
             let sums = FusedSums {
                 obj: obj.then_some(&mut *self.obj_sums),
-                shift: m.shift_sums(probe.then_some(ShiftProbe::Step as _), true),
+                shift: m.shift_sums(probe.then_some(ShiftedProbes::step as _), true),
                 ..FusedSums::default()
             };
             self.kernels
@@ -184,9 +187,10 @@ impl Bufs<'_> {
         let Some(inertia) = probe_inertia else {
             return Ok(false);
         };
-        m.probe_sums(ctx, self.kernels, &dims, self.probe_sums)?;
-        let model = m.model;
-        let Some(ShiftProbe::Step(step)) = m.shift_sums(Some(ShiftProbe::Step), false).probe else {
+        m.probe_sums::<ShiftedStepSums>(ctx, self.kernels, &dims, self.probe_sums)?;
+        let model = m.model();
+        let Some(ShiftProbe::Step(step)) = m.shift_sums(Some(ShiftedProbes::step), false).probe
+        else {
             return Ok(false);
         };
         let inputs = FusedInputs {

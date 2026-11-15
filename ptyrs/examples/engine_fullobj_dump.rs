@@ -5,19 +5,25 @@
 //! (default 8 200) writes per case `<out>/<case>/`: `meta.txt` (`key value` lines),
 //! `counts.f64` `[nframe, ny, nx]` natural layout, `corners.f64` `[nframe, 2]`, `obj0.c128`,
 //! `probe0.c128`, `truth.c128`, `probe_truth.c128`, `offsets0.f64` `[nframe, 2]` (the drawn
-//! offsets) and per run, without and with the drawn offsets as `position`,
-//! `<alg>_<fixed|position>_<ncycle>_{llk,offsets}.f64`, `_{obj,probe}.c128`: the LLK history
-//! (each cycle's start) then the LLK of the arrays the run ends on. Little-endian f64; complex
-//! as `re im` pairs. `tests/engine_gpu_near.rs`'s DM and RAAR without the closing
-//! `zero_phase_ramp`, which runs after the last cycle only and, under `position`, changes the
-//! LLK of the state it ends on.
+//! offsets), `offsets_whole.f64` (whole-pixel ones: `round(1.4 sin(1.7f + 0.3))`,
+//! `round(1.4 cos(2.3f))`, mean kept) and `counts_truth_<drawn|whole>.f64`, the truth's
+//! intensities at the corners plus those offsets under `FullObject`, rounded half away from
+//! zero. Per run, `<alg>_<label>_<ncycle>_{llk,offsets}.f64`, `_{obj,probe}.c128`: the LLK
+//! history (each cycle's start) then the LLK of the arrays the run ends on. From the start
+//! object and probe on `counts.f64`, label `fixed` (no offsets), `position` (the drawn offsets,
+//! refined) and `held` (the drawn offsets, held); from the truth on
+//! `counts_truth_<drawn|whole>.f64`, `truth_<drawn|whole>` (those offsets, held).
+//! Little-endian f64; complex as `re im` pairs. `tests/engine_gpu_near.rs`'s DM and RAAR
+//! without the closing `zero_phase_ramp`, which runs after the last cycle only and, with
+//! offsets, changes the LLK of the state it ends on.
 
 use std::fs;
 use std::path::Path;
+use std::slice;
 use std::time::Instant;
 
-use ptyrs::base::{C64, sim};
-use ptyrs::engine::{DmParams, Feature, Features, Ptycho, RaarParams, Sampling};
+use ptyrs::base::{C64, Counts, Object, Probe, Scan, sim};
+use ptyrs::engine::{DmParams, Feature, Features, Ptycho, RaarParams, Sampling, SliceWaves};
 
 #[path = "../tests/common/near_cases.rs"]
 mod near;
@@ -49,6 +55,27 @@ fn put_c(path: &Path, v: &[C64]) {
     put(path, v.iter().flat_map(|c| [c.re, c.im]));
 }
 
+fn whole_offsets(n: usize) -> Vec<[f64; 2]> {
+    let d = |f: f64| [1.4 * (1.7 * f + 0.3).sin(), 1.4 * (2.3 * f).cos()];
+    (0..n).map(|f| d(f as f64).map(f64::round)).collect()
+}
+
+/// `c`'s scan with the counts of `object` and `probe` at the corners plus `offsets`.
+fn truth_scan(c: &near::Case, object: &Object, probe: &Probe, offsets: &[[f64; 2]]) -> Scan {
+    let optics = c.optics();
+    let views = c.addr.views();
+    let objects = slice::from_ref(object);
+    let at = Some(offsets);
+    let waves = SliceWaves::with_sampling(&optics, views, objects, probe, at, Sampling::FullObject);
+    let mut psi = waves.psi().to_vec();
+    optics.exit().forward(&mut psi);
+    let counts = near::rounded_counts(&psi, c.addr.nmode(), c.scan.counts.dims());
+    Scan {
+        counts,
+        ..c.scan.clone()
+    }
+}
+
 fn main() {
     let mut args = std::env::args().skip(1);
     let out = std::path::PathBuf::from(
@@ -76,10 +103,13 @@ fn main() {
             c.obs.nb_obs()
         );
         fs::write(dir.join("meta.txt"), meta).unwrap();
-        let counts = (0..nframe).flat_map(|f| {
-            (c.scan.counts.frame(f).iter()).map(|&v| ptyrs::base::Counts::intensity(v).unwrap())
-        });
-        put(&dir.join("counts.f64"), counts);
+        let put_counts = |name: &str, scan: &Scan| {
+            let counts = (0..nframe).flat_map(|f| {
+                (scan.counts.frame(f).iter()).map(|&v| Counts::intensity(v).unwrap())
+            });
+            put(&dir.join(name), counts);
+        };
+        put_counts("counts.f64", &c.scan);
         let corners = (0..nframe).flat_map(|f| {
             let v = &c.addr.frame_views(f)[0];
             [v.oy as f64, v.ox as f64]
@@ -87,23 +117,49 @@ fn main() {
         put(&dir.join("corners.f64"), corners);
         put_c(&dir.join("obj0.c128"), c.object.as_slice());
         put_c(&dir.join("probe0.c128"), c.probe.as_slice());
-        put_c(&dir.join("truth.c128"), sim::object([oy, ox]).as_slice());
+        let truth = sim::object([oy, ox]);
+        put_c(&dir.join("truth.c128"), truth.as_slice());
         let mut truth_probe = sim::probe([ny, nx], nmode).unwrap();
         (truth_probe.as_mut_slice().iter_mut()).for_each(|v| *v *= near::PHOTONS.sqrt());
         put_c(&dir.join("probe_truth.c128"), truth_probe.as_slice());
+        let (drawn, whole) = (near::drawn_offsets(), whole_offsets(nframe));
+        put(&dir.join("offsets0.f64"), drawn.iter().flatten().copied());
         put(
-            &dir.join("offsets0.f64"),
-            near::drawn_offsets().into_iter().flatten(),
+            &dir.join("offsets_whole.f64"),
+            whole.iter().flatten().copied(),
         );
+        let truth_drawn = truth_scan(&c, &truth, &truth_probe, &drawn);
+        let truth_whole = truth_scan(&c, &truth, &truth_probe, &whole);
+        put_counts("counts_truth_drawn.f64", &truth_drawn);
+        put_counts("counts_truth_whole.f64", &truth_whole);
+        let start = (&c.object, &c.probe);
+        let from_truth = (&truth, &truth_probe);
+        let runs = [
+            ("fixed", &c.scan, start, None),
+            ("position", &c.scan, start, Some(Feature::refined(&drawn))),
+            ("held", &c.scan, start, Some(Feature::held(&drawn))),
+            (
+                "truth_drawn",
+                &truth_drawn,
+                from_truth,
+                Some(Feature::held(&drawn)),
+            ),
+            (
+                "truth_whole",
+                &truth_whole,
+                from_truth,
+                Some(Feature::held(&whole)),
+            ),
+        ];
         for &ncycle in &ncycles {
             for alg in ["dm", "raar"] {
-                for label in ["fixed", "position"] {
-                    let (object, probe) = (c.object.clone(), c.probe.clone());
-                    let mut cpu = Ptycho::with_optics(&c.scan, c.optics(), object, probe).unwrap();
+                for (label, scan, (object, probe), position) in runs {
+                    let (object, probe) = (object.clone(), probe.clone());
+                    let mut cpu = Ptycho::with_optics(scan, c.optics(), object, probe).unwrap();
                     cpu.set_sampling(Sampling::FullObject);
-                    if label == "position" {
+                    if let Some(p) = position {
                         let f = Features {
-                            position: Some(Feature::refined(near::drawn_offsets())),
+                            position: Some(p.map(Vec::clone)),
                             ..Features::default()
                         };
                         cpu.set_features(f).unwrap();
@@ -138,14 +194,12 @@ fn main() {
                         &dir.join(format!("{stem}_offsets.f64")),
                         d.into_iter().flatten(),
                     );
+                    let min = llk.iter().copied().fold(f64::INFINITY, f64::min);
                     println!(
-                        "{slug} {stem}: llk {:.4} -> {:.4} (min {:.4} at {}), {secs:.2} s",
+                        "{slug} {stem}: llk {:.4} -> {:.4} (min {min:.4} at {}), {secs:.2} s",
                         llk[0],
                         llk[ncycle],
-                        llk.iter().copied().fold(f64::INFINITY, f64::min),
-                        llk.iter()
-                            .position(|&v| v == llk.iter().copied().fold(f64::INFINITY, f64::min))
-                            .unwrap()
+                        llk.iter().position(|&v| v == min).unwrap()
                     );
                 }
             }

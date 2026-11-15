@@ -613,7 +613,8 @@ fn a_tune_is_recorded_in_order_with_its_walls() {
     assert_eq!(tune.entry.key, key);
     assert_eq!(tune.entry.checksum, set.compute_checksum());
     assert_eq!(tune.winner, fastest_index);
-    assert!(tune.table.starts_with("autotune/") && tune.table.ends_with("device0/recorded"));
+    assert!(tune.table.starts_with("autotune/") && tune.table.contains("/device0/"));
+    assert!(tune.table.ends_with("/recorded"));
     let names: Vec<&str> = tune
         .trials
         .iter()

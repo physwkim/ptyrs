@@ -1,8 +1,9 @@
-//! The exits a call can fail at part-way, which a retry must start from: after its LLK
-//! record's advance is enqueued, before it counts its frames for one, or mid-update, between
-//! a DM or RAAR projection's stacks or an object solve's steps, leaving its waves or object
-//! part updated; or on one GPU of a distributed run, which every later call must refuse.
-//! [`at`] is a no-op outside `cfg(test)`; a unit test arms one exit with [`arm`] to make it
+//! The exits a call can fail at: part-way, after its LLK record's advance is enqueued, before
+//! it counts its frames for one, or mid-update, between a DM or RAAR projection's stacks or an
+//! object solve's steps, leaving its waves or object part updated, on one GPU or one of a
+//! distributed run's, after which every later call must refuse; or in a read or a build,
+//! which must leave the engine as it was.
+//! [`at`] is a no-op outside `cfg(test)`; a unit test arms one exit with `arm` to make it
 //! fail once, so the failure runs through the call's own wrapper.
 
 /// A point [`at`] marks.
@@ -14,6 +15,8 @@ pub(crate) enum Exit {
     ApPositions,
     /// ML's gradient pass's, after its record ends.
     MlGrad,
+    /// ML's gradient pass's, before each stack.
+    MlStack,
     /// The features' step's, after its LLK pass's record ends and before the step.
     Feature,
     /// A distributed live AP epoch's, after its record's replay and before its parity's
@@ -32,6 +35,18 @@ pub(crate) enum Exit {
     LiveCount,
     /// The full-object object solve's, before each conjugate-gradient step.
     Solve,
+    /// An epoch run's build, before its buffers are built.
+    RunBuild,
+    /// An epoch's, after its stage and before its cycle is enqueued.
+    Launch,
+    /// The phase ramp's removal's, after the object is written and before the probe is.
+    RampWrite,
+    /// The features' write in place, after the scale's and before the background's.
+    FeatureCopy,
+    /// The shared passes' rebuild for another position model's, after they are built.
+    Reshare,
+    /// A graph's capture's, before it begins.
+    Capture,
 }
 
 #[cfg(not(test))]
@@ -81,9 +96,18 @@ mod armed {
     }
 
     /// Arms `exit` to fail its hit after `pass` others, once, until the guard drops. Armed
-    /// for the process, since dist's exits run on its workers' threads: nextest runs each
-    /// test in a process of its own.
+    /// for the process, since dist's exits run on its workers' threads, so it panics unless
+    /// nextest runs this test in a process of its own: under `cargo test` the exit would fire
+    /// in whichever concurrent test hits it.
     pub(crate) fn arm(exit: Exit, pass: usize) -> Armed {
+        assert!(
+            matches!(
+                std::env::var("NEXTEST_EXECUTION_MODE").as_deref(),
+                Ok("process-per-test")
+            ),
+            "fault::arm arms every thread of the process, so it needs a process of the \
+             arming test's own: run it under cargo nextest"
+        );
         let hold = ARMING.lock().unwrap_or_else(PoisonError::into_inner);
         *armed() = Some((exit, pass, false));
         Armed { _hold: hold }

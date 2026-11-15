@@ -24,7 +24,7 @@ pub use array::{C64, Object, Probe, Stack};
 pub use counts::{Counts, MASKED, MAX_COUNT};
 pub use error::CoreError;
 pub use feature::Feature;
-pub use geometry::Geometry;
+pub use geometry::{Frame, Geometry};
 pub use positions::Positions;
 pub use scan::Scan;
 pub use scan_pattern::ScanPattern;

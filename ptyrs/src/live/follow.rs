@@ -269,23 +269,17 @@ impl FollowCfg {
     /// its point `u % p.points()`: one object, `p`'s probe modes held fixed,
     /// the object placed, its tile slots sized and its plan set from those
     /// positions.
-    pub fn plan(p: &Ptycho, nframe: NonZeroU32, rc: &ReconCfg) -> Self {
+    pub fn plan(p: &Ptycho, nframe: NonZeroU32, rc: &ReconCfg) -> Result<Self, crate::gpu::Error> {
         let n = p.spec().n;
         let dx = p.spec().dx();
         let pos: Vec<(f64, f64)> = (0..nframe.get() as usize)
             .map(|u| p.position(u % p.points()))
             .collect();
         let (place, reach) = ViewPlacement::plan([dx, dx], &pos);
-        let nprobe = (p.probe().len() / (n * n)) as u32;
-        let shape = ScanShape {
-            nframe: nframe.get(),
-            nmode: nprobe,
-            nprobe,
-            nobj: 1,
-            frame: [n as u32; 2],
-            reach,
-            quad_phase: 0.0,
-        };
+        let nprobe = p.probe().len() / (n * n);
+        let nprobe = u32::try_from(nprobe)
+            .map_err(|_| crate::gpu::Error::Shape(format!("{nprobe} probe modes pass u32")))?;
+        let shape = ScanShape::new(nframe.get(), nprobe, 1, [n; 2], reach, 0.0)?;
         let mut ap = ApConfig {
             shape,
             nf_max: rc.nf_max.min(nframe),
@@ -296,7 +290,7 @@ impl FollowCfg {
             stacks: rc.stacks,
         };
         ap.cap = shape.tile_cap(&views_of(&ap, &place, &pos));
-        Self {
+        Ok(Self {
             ap,
             probe: p
                 .probe()
@@ -307,7 +301,7 @@ impl FollowCfg {
             plan: pos,
             snap_every: rc.snap_every,
             snaps: rc.snaps,
-        }
+        })
     }
 }
 
@@ -566,7 +560,7 @@ impl Predicting {
         shape: [usize; 2],
     ) -> Result<Self, GrowError> {
         one_object_mode(&ap.shape.dims())?;
-        let frame = ap.shape.frame.map(|n| n as usize);
+        let frame = ap.shape.frame();
         let patch = hook.predictor.patch();
         if (0..2).any(|a| patch[a] == 0 || patch[a] > frame[a]) {
             return Err(crate::gpu::Error::Shape(format!(
@@ -582,12 +576,15 @@ impl Predicting {
             ))
             .into());
         }
+        let counts = hook.pack.checked_mul(frame.area()).ok_or_else(|| {
+            crate::gpu::Error::Shape(format!("{} frames of {frame:?} pass usize", hook.pack))
+        })?;
         Ok(Self {
             stitch: PatchFill::new(ctx, shape, patch, hook.pack, hook.fills)?,
             predictor: hook.predictor,
-            frame,
+            frame: frame.sides(),
             pack: hook.pack,
-            counts: Vec::with_capacity(hook.pack * frame[0] * frame[1]),
+            counts: Vec::with_capacity(counts),
             corners: Vec::with_capacity(hook.pack),
             patches: Vec::with_capacity(hook.pack * patch[0] * patch[1]),
         })
@@ -672,7 +669,7 @@ fn fill_ahead(mut p: Predicting, tapped: Receiver<Tapped>, fwd: Sender<Handed>) 
 
 /// The views of the frames at `positions`.
 fn views_of(cfg: &ApConfig, place: &ViewPlacement, positions: &[(f64, f64)]) -> Vec<ViewAddr> {
-    let (nprobe, nobj) = (cfg.shape.nprobe, cfg.shape.nobj);
+    let (nprobe, nobj) = (cfg.shape.nprobe(), cfg.shape.nobj());
     let mut out = Vec::with_capacity(positions.len() * (nprobe * nobj) as usize);
     for &p in positions {
         place.views(p, nprobe, nobj, &mut out);
@@ -712,14 +709,14 @@ fn back_ahead(
     batches: Receiver<FrameBatch>,
     fwd: Sender<Handed>,
 ) -> Result<(), GrowError> {
-    let nmode = ap.shape.nmode as usize;
+    let nmode = ap.shape.nmode() as usize;
     // Dropped once the scan's last frame is backed: frames past it never
     // land, and the consumer may finish before `batches` closes.
     for mut b in batches {
         let views = views_of(&ap, &place, &b.positions);
         if let Some(k) = &mut backer {
             k.back(&views)?;
-            if b.f0 + b.n >= u64::from(ap.shape.nframe) {
+            if b.f0 + b.n >= u64::from(ap.shape.nframe()) {
                 backer = None;
             }
         }
@@ -1032,14 +1029,14 @@ impl One {
         ctx.bind_to_thread()?;
         let stream = ctx.new_stream()?;
         let shape = cfg.ap.shape;
-        let elems = shape.frame[0] as usize * shape.frame[1] as usize;
-        if store.frame_elems() != elems || store.max_frames() < u64::from(shape.nframe) {
+        let elems = shape.frame().area();
+        if store.frame_elems() != elems || store.max_frames() < u64::from(shape.nframe()) {
             return Err(crate::gpu::Error::Shape(format!(
                 "a store of {} frames of {} pixels for a scan of {} frames of {:?}",
                 store.max_frames(),
                 store.frame_elems(),
-                shape.nframe,
-                shape.frame
+                shape.nframe(),
+                shape.frame()
             ))
             .into());
         }
@@ -1102,10 +1099,10 @@ pub fn run_dist_consumer(
     if let [one] = *ordinals {
         let ctx = Context::new(one)?;
         let shape = cfg.ap.shape;
-        let elems = shape.frame[0] as usize * shape.frame[1] as usize;
+        let elems = shape.frame().area();
         let store = Arc::new(DeviceStore::growing(
             &ctx,
-            shape.nframe as usize,
+            shape.nframe() as usize,
             elems,
             cfg.plan.len(),
             STORE_LEAD,
@@ -1198,7 +1195,7 @@ fn follow<R: Engine>(
     ready(&live);
     let setup_time = entered.elapsed();
 
-    let mut positions: Vec<(f64, f64)> = Vec::with_capacity(shape.nframe as usize);
+    let mut positions: Vec<(f64, f64)> = Vec::with_capacity(shape.nframe() as usize);
     let mut kept = Vec::with_capacity(cfg.snaps);
     let (mut open, mut scan_epochs) = (true, None);
     // The snapshot buffer queued last and the epochs it follows.
@@ -1258,7 +1255,7 @@ fn follow<R: Engine>(
             if positions.is_empty() {
                 return Ok(());
             }
-            let done = positions.len() as u64 == u64::from(shape.nframe) || !open;
+            let done = positions.len() as u64 == u64::from(shape.nframe()) || !open;
             if done && scan_epochs.is_none() {
                 scan_epochs = Some(live.epochs());
             }
@@ -1399,16 +1396,17 @@ pub fn offline_ap(
     ctx.bind_to_thread()?;
     let stream = ctx.new_stream()?;
     let mut ap = cfg.ap;
-    ap.shape.nframe = u32::try_from(positions.len())
+    let nframe = u32::try_from(positions.len())
         .ok()
-        .filter(|&n| n <= cfg.ap.shape.nframe)
+        .filter(|&n| n <= cfg.ap.shape.nframe())
         .ok_or_else(|| {
             crate::gpu::Error::Shape(format!(
                 "{} frames for a scan of {}",
                 positions.len(),
-                cfg.ap.shape.nframe
+                cfg.ap.shape.nframe()
             ))
         })?;
+    ap.shape = ap.shape.with_nframe(nframe)?;
     // SAFETY: every frame read is stored, and nothing writes the store now.
     let counts = unsafe { store.frames_view()? };
     let mut run = LiveAp::new(&stream, &ap, &cfg.probe, counts, false)?;
@@ -1581,8 +1579,8 @@ mod tests {
             snaps: 80,
             ..ReconCfg::default()
         };
-        let cfg = FollowCfg::plan(&p, NonZeroU32::new(total as u32).unwrap(), &rc);
-        assert_eq!((cfg.ap.shape.nmode, cfg.ap.shape.nprobe), (2, 2));
+        let cfg = FollowCfg::plan(&p, NonZeroU32::new(total as u32).unwrap(), &rc).unwrap();
+        assert_eq!((cfg.ap.shape.nmode(), cfg.ap.shape.nprobe()), (2, 2));
 
         let ctx = Context::new(0).expect("GPU 0");
         let ring = Arc::new(Ring::new(&ctx, 16, n * n).unwrap());
@@ -1778,7 +1776,7 @@ mod tests {
     fn the_offline_run_settles_and_the_search_finds_the_first_match() {
         let s = streamed(None);
         let rep = &s.rep;
-        let region = s.cfg.place.scanned(&rep.positions, s.cfg.ap.shape.frame);
+        let region = s.cfg.place.scanned(&rep.positions, s.cfg.ap.shape.frame());
         let offline = |max| {
             let r = region.clone();
             offline_ap(&s.ctx, &s.store, &s.cfg, &rep.positions, r, s.scan_end, max).unwrap()
@@ -1853,7 +1851,7 @@ mod tests {
             snaps: 3,
             ..ReconCfg::default()
         };
-        let cfg = FollowCfg::plan(&p, NonZeroU32::new(total as u32).unwrap(), &rc);
+        let cfg = FollowCfg::plan(&p, NonZeroU32::new(total as u32).unwrap(), &rc).unwrap();
         let ctx = Context::new(0).expect("GPU 0");
         // The one-GPU run's last object and what its offline run found.
         let (mut probe_obj, mut one) = (None, None);
@@ -1974,7 +1972,7 @@ mod tests {
 
             // Capped, so the run may stop while still moving: what it found then
             // names the ring and its FRC, which depend on the object as well.
-            let region = cfg.place.scanned(&pos, cfg.ap.shape.frame);
+            let region = cfg.place.scanned(&pos, cfg.ap.shape.frame());
             let off = offline_dist(&filled, Scheme::Strips, &cfg, &pos, region, 0, 16).unwrap();
             let obj = &*probe_obj.get_or_insert_with(|| plane(&last.pixels, rep.shape));
             let found = match off.clock {
@@ -2049,7 +2047,7 @@ mod tests {
             snaps: 3,
             ..ReconCfg::default()
         };
-        let cfg = FollowCfg::plan(&p, NonZeroU32::new(total as u32).unwrap(), &rc);
+        let cfg = FollowCfg::plan(&p, NonZeroU32::new(total as u32).unwrap(), &rc).unwrap();
         if let Some(c) = cut {
             // Before the object's origin: its views' corner is u32::MAX.
             pos[c] = (-1e-3, -1e-3);
@@ -2177,7 +2175,7 @@ mod tests {
             patch: PATCH,
             issued: 0,
         };
-        let nmode = cfg.ap.shape.nmode as usize;
+        let nmode = cfg.ap.shape.nmode() as usize;
         let mut calls = fill.calls.iter().peekable();
         let mut at = 0;
         for (i, &(epochs, upto)) in rep.landings.iter().enumerate() {
@@ -2269,7 +2267,7 @@ mod tests {
             snaps: 2,
             ..ReconCfg::default()
         };
-        let mut cfg = FollowCfg::plan(&p, NonZeroU32::new(total as u32).unwrap(), &rc);
+        let mut cfg = FollowCfg::plan(&p, NonZeroU32::new(total as u32).unwrap(), &rc).unwrap();
         cfg.plan.truncate(64);
         let ctx = Context::new(0).expect("GPU 0");
         let ring = Arc::new(Ring::new(&ctx, 16, n * n).unwrap());
