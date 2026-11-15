@@ -22,10 +22,11 @@ use crate::engine::{
     Cost, Features, Lsqml, LsqmlBatch, LsqmlParams, Observed, Optics, ProbeVariation, Sampling,
     accumulate_probe,
 };
-use crate::gpu::fused::OwnSpectrumBuf;
+use crate::gpu::fused::{FrameMoves, OwnSpectrumBuf};
 use crate::gpu::opr::{FrameProbe, OwnModes};
 use crate::gpu::{
-    C32, EpochOrder, FusedInputs, Kernels, Model, Opr, OprKernels, ProbeSpectrum, Shift,
+    C32, EpochOrder, Exit, FarSums, FusedBufs, FusedInputs, FusedSums, Kernels, Model, Opr,
+    OprKernels, ProbeSpectrum, PsiSums, Shift, ShiftProbe, ShiftSums, ShiftedProbeSums,
     SpectrumBuf, StackTable, UpdateSums, ViewAddr, ViewDims, Views,
 };
 use crate::worst::worst_of;
@@ -695,4 +696,156 @@ fn shifted_probe_on_own_spectra_matches_the_cpu_and_each_frame_alone() {
         c_bits(&got),
         "the own spectra left T as on the shared spectra"
     );
+}
+
+/// The batch's [`FrameMoves`] and the probe sums [`Kernels::shifted_probe_sums`] takes from
+/// what `stacks` added at [`OFFSETS`] on the shared probe, under [`ShiftProbe::Frames`] when
+/// `frames`, else under [`ShiftProbe::Sums`] with no moves: with `project` the AP projection
+/// of [`Kernels::fused_project`], else [`Kernels::shifted_psi_sums`] of each stack's waves,
+/// the batch frames' `chi` from `x`. Every plane of the moves starts as NaN.
+fn moves(
+    g: &Gpu,
+    x: &Inputs,
+    stacks: &[Range<u32>],
+    frames: bool,
+    project: bool,
+) -> (Option<Vec<C32>>, UpdateSums) {
+    let d = dims();
+    let (_, probe) = variation();
+    let probe = up(&g.stream, probe.as_slice());
+    let mut buf = SpectrumBuf::zeroed(&g.stream, &d).unwrap();
+    let spectrum = (g.kernels)
+        .probe_spectrum(&g.ctx, &d, &probe, &mut buf)
+        .unwrap();
+    let counts: Vec<u16> = (noise(NFRAME * N, 40).iter())
+        .map(|z| ((z.re + 1.0) * 40.0) as u16)
+        .collect();
+    let counts = DeviceBuffer::from_host(&g.stream, &counts).unwrap();
+    let offsets = DeviceBuffer::from_host(&g.stream, OFFSETS.as_flattened()).unwrap();
+    let inputs = FusedInputs {
+        views: g.order.views(),
+        counts: &counts,
+        obj: &x.obj,
+        probe: &probe,
+        model: Model {
+            shift: Some(Shift {
+                offsets: &offsets,
+                spectrum,
+            }),
+            ..Model::default()
+        },
+    };
+    let table = StackTable::new(&g.stream, &d, stacks).unwrap();
+    let mut bufs = FusedBufs::with_shift(&g.stream, &d, table.nf_max()).unwrap();
+    let mut sums = ShiftedProbeSums::zeroed(&g.stream, &d).unwrap();
+    let nan = C32 {
+        re: f32::NAN,
+        im: f32::NAN,
+    };
+    let mut moved = DeviceBuffer::from_host(&g.stream, &vec![nan; NB * N]).unwrap();
+    let m = NMODE * N;
+    for (s, r) in stacks.iter().enumerate() {
+        let probe = match frames {
+            true => ShiftProbe::Frames {
+                sums: &mut sums,
+                moved: FrameMoves {
+                    planes: &mut moved,
+                    positions: BATCH,
+                },
+            },
+            false => ShiftProbe::Sums(&mut sums),
+        };
+        if project {
+            let sums = FusedSums {
+                shift: ShiftSums {
+                    probe: Some(probe),
+                    ..ShiftSums::default()
+                },
+                ..FusedSums::default()
+            };
+            let exit = Exit::Ap {
+                far: FarSums::default(),
+            };
+            (g.kernels)
+                .fused_project(&g.ctx, &inputs, table.at(s), exit, &mut bufs, sums)
+                .unwrap();
+            continue;
+        }
+        let mut chi = noise(NF_MAX * m, 30 + s as u64);
+        for (fl, p) in r.clone().enumerate().filter(|(_, p)| BATCH.contains(p)) {
+            chi[fl * m..(fl + 1) * m].copy_from_slice(x.frame_chi(p));
+        }
+        let psi = up(&g.stream, &chi);
+        let sums = PsiSums {
+            obj: None,
+            probe: Some(probe),
+        };
+        (g.kernels)
+            .shifted_psi_sums(&g.ctx, &inputs, table.at(s), &psi, &mut bufs, sums)
+            .unwrap();
+    }
+    let mut out = UpdateSums::zeroed(&g.stream, NP * N).unwrap();
+    (g.kernels)
+        .shifted_probe_sums(&g.ctx, &d, &mut sums, &mut out)
+        .unwrap();
+    (frames.then(|| moved.to_host_vec(&g.stream).unwrap()), out)
+}
+
+/// The bits of probe sums.
+fn sum_bits(g: &Gpu, sums: &UpdateSums) -> [Vec<u32>; 2] {
+    [
+        c_bits(&sums.num.to_host_vec(&g.stream).unwrap()),
+        bits(&sums.den.to_host_vec(&g.stream).unwrap()),
+    ]
+}
+
+/// Each batch frame's own addend of probe mode 0 to the shifted probe sums, taken back alone:
+/// the CPU's move of the frame's direction back by its offsets ([`LsqmlBatch::adjoint_move`]),
+/// over stacks straddling the batch whose frames outside it must write nothing, launched
+/// last; the sums as under [`ShiftProbe::Sums`].
+#[test]
+fn frame_moves_match_the_cpu_and_leave_the_sums() {
+    let g = gpu();
+    let x = inputs(&g.stream);
+    let stacks = [3..6, 6..7, 1..3, 0..BATCH.start];
+    let (moved, sums) = moves(&g, &x, &stacks, true, false);
+    let (_, plain) = moves(&g, &x, &stacks, false, false);
+    assert_eq!(sum_bits(&g, &sums), sum_bits(&g, &plain), "the probe sums");
+    let (var, probe) = variation();
+    let (views, _) = var.unique(&batch_views(), &probe);
+    let object = Object::new(Stack::from_vec([NOBJ, OBJ[0], OBJ[1]], obj()).unwrap());
+    let optics = optics();
+    let psi: Vec<C64> = BATCH.flat_map(|p| x.frame_chi(p).to_vec()).collect();
+    let shape = [NB * NP, SHAPE[0], SHAPE[1]];
+    let (d, _) = accumulate_probe(&views, &object, shape, optics.quad(), &psi);
+    let back = cpu_move_back(&d, OFFSETS.map(|o| o.map(f64::from)));
+    let want: Vec<C64> = (0..NB).flat_map(|b| back.plane(b * NP).to_vec()).collect();
+    let got = moved.unwrap().into_iter();
+    let err = rel(got.map(|m| C64::new(m.re.into(), m.im.into())), &want);
+    eprintln!("moves against the CPU's: {err:.3e}");
+    assert!(err <= 2e-6, "moves against the CPU's: {err:e}");
+}
+
+/// [`Kernels::fused_project`]'s moves under [`ShiftProbe::Frames`]: each frame's addend of the
+/// probe sums it leaves, which they sum to, and those sums as under [`ShiftProbe::Sums`].
+#[test]
+fn projected_frame_moves_sum_to_the_probe_sums() {
+    let g = gpu();
+    let x = inputs(&g.stream);
+    let (moved, sums) = moves(&g, &x, &STACKS, true, true);
+    let (_, plain) = moves(&g, &x, &STACKS, false, true);
+    assert_eq!(sum_bits(&g, &sums), sum_bits(&g, &plain), "the probe sums");
+    let moved = moved.unwrap();
+    let got = (0..N).map(|i| {
+        (0..NB)
+            .map(|b| C64::new(moved[b * N + i].re.into(), moved[b * N + i].im.into()))
+            .sum::<C64>()
+    });
+    let num = sums.num.to_host_vec(&g.stream).unwrap();
+    let want: Vec<C64> = (num[..N].iter())
+        .map(|z| C64::new(z.re.into(), z.im.into()))
+        .collect();
+    let err = rel(got, &want);
+    eprintln!("summed moves against the probe sums: {err:.3e}");
+    assert!(err <= 2e-6, "summed moves against the probe sums: {err:e}");
 }

@@ -486,6 +486,7 @@ pub mod kernels {
     use super::*;
     use crate::fused::{FusedCfg, FusedPtrs, ProbeSrc, raar_mix};
     use crate::pixel::*;
+    use crate::position::BatchSpan;
     use cuda_device::SharedArray;
 
     // M1 pixel kernels. Shapes, orders and the FFT scaling convention are documented on the
@@ -2189,6 +2190,122 @@ pub mod kernels {
     #[kernel]
     pub unsafe fn fused_shift_probe_rows_512(sums: SumPtrs, out: SumPtrs, ny: u32, quad: f32) {
         unsafe { crate::fused::shift_probe_rows::<512>(sums, out, ny, quad) }
+    }
+    /// [`crate::fused::shift_moved_cols`] for 64-point columns.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::shift_moved_cols`].
+    #[kernel]
+    pub unsafe fn fused_shift_moved_cols_64(
+        p: FusedPtrs,
+        moved: *mut f32,
+        span: BatchSpan,
+        ctl: *const StackCtl,
+        g: StackGeom,
+    ) {
+        unsafe { crate::fused::shift_moved_cols::<64>(p, moved, span, ctl, g) }
+    }
+    /// [`crate::fused::shift_moved_cols`] for 128-point columns.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::shift_moved_cols`].
+    #[kernel]
+    pub unsafe fn fused_shift_moved_cols_128(
+        p: FusedPtrs,
+        moved: *mut f32,
+        span: BatchSpan,
+        ctl: *const StackCtl,
+        g: StackGeom,
+    ) {
+        unsafe { crate::fused::shift_moved_cols::<128>(p, moved, span, ctl, g) }
+    }
+    /// [`crate::fused::shift_moved_cols`] for 256-point columns.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::shift_moved_cols`].
+    #[kernel]
+    pub unsafe fn fused_shift_moved_cols_256(
+        p: FusedPtrs,
+        moved: *mut f32,
+        span: BatchSpan,
+        ctl: *const StackCtl,
+        g: StackGeom,
+    ) {
+        unsafe { crate::fused::shift_moved_cols::<256>(p, moved, span, ctl, g) }
+    }
+    /// [`crate::fused::shift_moved_cols`] for 512-point columns.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::shift_moved_cols`].
+    #[kernel]
+    pub unsafe fn fused_shift_moved_cols_512(
+        p: FusedPtrs,
+        moved: *mut f32,
+        span: BatchSpan,
+        ctl: *const StackCtl,
+        g: StackGeom,
+    ) {
+        unsafe { crate::fused::shift_moved_cols::<512>(p, moved, span, ctl, g) }
+    }
+    /// [`crate::fused::shift_moved_rows`] for 64-point rows.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::shift_moved_rows`].
+    #[kernel]
+    pub unsafe fn fused_shift_moved_rows_64(
+        moved: *mut f32,
+        span: BatchSpan,
+        ctl: *const StackCtl,
+        g: StackGeom,
+    ) {
+        unsafe { crate::fused::shift_moved_rows::<64>(moved, span, ctl, g) }
+    }
+    /// [`crate::fused::shift_moved_rows`] for 128-point rows.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::shift_moved_rows`].
+    #[kernel]
+    pub unsafe fn fused_shift_moved_rows_128(
+        moved: *mut f32,
+        span: BatchSpan,
+        ctl: *const StackCtl,
+        g: StackGeom,
+    ) {
+        unsafe { crate::fused::shift_moved_rows::<128>(moved, span, ctl, g) }
+    }
+    /// [`crate::fused::shift_moved_rows`] for 256-point rows.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::shift_moved_rows`].
+    #[kernel]
+    pub unsafe fn fused_shift_moved_rows_256(
+        moved: *mut f32,
+        span: BatchSpan,
+        ctl: *const StackCtl,
+        g: StackGeom,
+    ) {
+        unsafe { crate::fused::shift_moved_rows::<256>(moved, span, ctl, g) }
+    }
+    /// [`crate::fused::shift_moved_rows`] for 512-point rows.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::shift_moved_rows`].
+    #[kernel]
+    pub unsafe fn fused_shift_moved_rows_512(
+        moved: *mut f32,
+        span: BatchSpan,
+        ctl: *const StackCtl,
+        g: StackGeom,
+    ) {
+        unsafe { crate::fused::shift_moved_rows::<512>(moved, span, ctl, g) }
     }
     /// [`crate::fused::shift_norm`] for 64-point rows.
     ///

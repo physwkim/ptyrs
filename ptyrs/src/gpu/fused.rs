@@ -17,6 +17,7 @@
 //! carries across stacks until [`Kernels::shifted_probe_sums`] turns them into probe sums.
 
 use std::cell::Cell;
+use std::ops::Range;
 
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig, RawDeviceBuffer};
@@ -30,9 +31,11 @@ use ptyrs_kernels::fused::{
     shift_stage_bytes,
 };
 use ptyrs_kernels::pixel::{PIXEL_THREADS, PsiPtr, SumPtrs, psi_f32};
+use ptyrs_kernels::position::BatchSpan;
 
 use crate::gpu::opr::OwnModes;
 use crate::gpu::ops::grid_1d;
+use crate::gpu::position::span;
 use crate::gpu::psi::check_waves;
 use crate::gpu::{
     C32, Error, ExitPass, Kernels, LlkPartial, PositionPartial, ScalePartial, StackCtl, StackGeom,
@@ -146,7 +149,7 @@ impl Shape {
         (shift_stage_bytes(flags, self.nx as u32) + self.row_smem).max(16 * FUSED_ROW_THREADS)
     }
 
-    /// `rows_fwd` (one block row per view) or `rows_inv` (per frame).
+    /// `rows_fwd` (one block row per view), or `rows_inv` or `shift_moved_rows` (per frame).
     pub(crate) fn rows(&self, g: &StackGeom, per_view: bool) -> Result<LaunchConfig, Error> {
         let planes = g.nf_max as u64 * if per_view { g.nmode as u64 } else { 1 };
         if planes > GRID_Y_MAX {
@@ -200,7 +203,8 @@ impl Shape {
         }
     }
 
-    /// `shift_cols` over `nplane` planes `[ny, nx]`.
+    /// `shift_cols` over `nplane` planes `[ny, nx]`, or `shift_moved_cols` over `nplane`
+    /// frames.
     fn plane_cols(&self, nplane: u32) -> LaunchConfig {
         let (ny, nx) = (self.ny as u32, self.nx as u32);
         LaunchConfig {
@@ -570,16 +574,46 @@ pub enum ShiftProbe<'a> {
     /// Of the correction `c = x - O W` in place of `x`, the step from the waves of the
     /// arrays read, for [`Kernels::probe_step`]; under [`Exit::Grad`] `c = x`.
     Step(&'a mut ShiftedProbeSums),
+    /// Of `x` as [`Self::Sums`], and each frame's own addend of probe mode 0 into `moved`.
+    Frames {
+        sums: &'a mut ShiftedProbeSums,
+        moved: FrameMoves<'a>,
+    },
 }
 
 impl<'a> ShiftProbe<'a> {
-    /// The sums of `probe`, if any, and the shift flags that write them.
-    fn split(probe: Option<Self>) -> (Option<&'a mut ShiftedProbeSums>, u32) {
+    /// The sums of `probe`, if any, its frames' moves, and the shift flags that write them.
+    fn split(
+        probe: Option<Self>,
+    ) -> (
+        Option<&'a mut ShiftedProbeSums>,
+        Option<FrameMoves<'a>>,
+        u32,
+    ) {
         match probe {
-            None => (None, 0),
-            Some(Self::Sums(sums)) => (Some(sums), FUSED_SHIFT_PROBE),
-            Some(Self::Step(sums)) => (Some(sums), FUSED_SHIFT_PROBE | FUSED_SHIFT_STEP),
+            None => (None, None, 0),
+            Some(Self::Sums(sums)) => (Some(sums), None, FUSED_SHIFT_PROBE),
+            Some(Self::Step(sums)) => (Some(sums), None, FUSED_SHIFT_PROBE | FUSED_SHIFT_STEP),
+            Some(Self::Frames { sums, moved }) => (Some(sums), Some(moved), FUSED_SHIFT_PROBE),
         }
+    }
+}
+
+/// Each frame's own addend of probe mode 0 to [`ShiftProbe::Frames`]' sums, taken back alone
+/// as [`Kernels::shifted_probe_sums`] takes back their sum, for OPR: `planes`, `[nb, n]` in
+/// the natural layout, plane `b` the frame at epoch position `positions.start + b`, gets
+/// `conj(q) IDFT(G) / n` of that frame's `G`. A frame outside `positions` writes nothing.
+pub struct FrameMoves<'a> {
+    pub planes: &'a mut DeviceBuffer<C32>,
+    pub positions: Range<u32>,
+}
+
+impl FrameMoves<'_> {
+    /// The batch of `positions`, errors unless `planes` holds it for `d`.
+    fn span(&self, d: &ViewDims) -> Result<BatchSpan, Error> {
+        let span = span(d, &self.positions)?;
+        check_len("frame moves", self.planes, span.nb as usize * d.n())?;
+        Ok(span)
     }
 }
 
@@ -781,8 +815,9 @@ impl Kernels {
     /// [`Model::shift`], the shifted probe takes the place of `P_p q` and `sums.shift` gets
     /// its sums. Under a [`Model::exit`] the projection is at the detector of the propagator
     /// `D F V`: its stage ahead of the column pass and the adjoint after it, so DM's and
-    /// RAAR's mixes stay in the exit plane. Up to nine launches, twelve with a shift, and the
-    /// stage's; a stack with `nf == 0` writes nothing but `bufs`.
+    /// RAAR's mixes stay in the exit plane. Up to nine launches, twelve with a shift and
+    /// fourteen under [`ShiftProbe::Frames`], and the stage's; a stack with `nf == 0` writes
+    /// nothing but `bufs`.
     pub fn fused_project(
         &self,
         ctx: &ExecutionContext,
@@ -853,7 +888,10 @@ impl Kernels {
                     position_den,
                 },
         } = sums;
-        let (shift_probe, probe_flags) = ShiftProbe::split(shift_probe);
+        let (shift_probe, moved, probe_flags) = ShiftProbe::split(shift_probe);
+        let moved = moved
+            .map(|m| m.span(d).map(|s| (s, m.planes)))
+            .transpose()?;
         if let Some(sums) = &obj_sums {
             sums.check(d.obj_len())?;
         }
@@ -946,6 +984,9 @@ impl Kernels {
                 if let Some(sums) = shift_probe {
                     run.shift_probe_sums(sh, p, sums)?;
                 }
+                if let Some((span, planes)) = moved {
+                    run.shift_moves(sh, p, span, planes)?;
+                }
                 if let Some(sums) = obj_sums {
                     run.gather_shifted(sh, p, out.cfg(cfg), sums)?;
                 }
@@ -969,7 +1010,8 @@ impl Kernels {
     /// what [`Self::fused_project`] adds to [`FusedSums::obj`] and [`ShiftSums::probe`] from
     /// the waves it leaves, in its order, so that the split into stacks does not change a
     /// bit. Another kernel build: the sums match `fused_project`'s to rounding, not bit for
-    /// bit. Up to five launches; writes nothing but `sums` and `bufs`.
+    /// bit. Up to five launches, seven under [`ShiftProbe::Frames`]; writes nothing but `sums`
+    /// and `bufs`.
     pub fn shifted_psi_sums(
         &self,
         ctx: &ExecutionContext,
@@ -987,7 +1029,10 @@ impl Kernels {
         let d = inputs.views.dims();
         check_waves("psi", psi, run.g.nf_max as usize * d.nmode as usize * d.n())?;
         let PsiSums { obj, probe } = sums;
-        let (probe, probe_flags) = ShiftProbe::split(probe);
+        let (probe, moved, probe_flags) = ShiftProbe::split(probe);
+        let moved = moved
+            .map(|m| m.span(d).map(|s| (s, m.planes)))
+            .transpose()?;
         if let Some(sums) = &obj {
             sums.check(d.obj_len())?;
         }
@@ -1009,6 +1054,9 @@ impl Kernels {
         if let Some(sums) = probe {
             run.shift_post(sh, p)?;
             run.shift_probe_sums(sh, p, sums)?;
+        }
+        if let Some((span, planes)) = moved {
+            run.shift_moves(sh, p, span, planes)?;
         }
         if let Some(sums) = obj {
             run.gather_shifted(sh, p, cfg, sums)?;
@@ -2380,6 +2428,63 @@ impl<'a> Run<'a> {
                     .fused_shift_probe_sums(stream, config, p, ptrs, ctl, g)
             }
         })
+    }
+
+    /// Each of the stack's frames in `span` takes its `G` of probe mode 0 back into
+    /// `planes`, [`FrameMoves::planes`].
+    fn shift_moves(
+        &self,
+        sh: &Shifted<'_>,
+        p: FusedPtrs,
+        span: BatchSpan,
+        planes: &mut DeviceBuffer<C32>,
+    ) -> Result<(), Error> {
+        let rows = self.sh.rows(&self.g, false)?;
+        let cols = self.sh.plane_cols(self.g.nf_max);
+        let (moved, ctl, g) = (dptr(planes), self.ctl(), self.g);
+        let reads = [sh.scratch.adj.storage(), self.stack.storage()];
+        let m = &self.k.module;
+        self.k
+            .launch(self.ctx, &reads, &[planes.storage()], |stream| {
+                // SAFETY: `shift_post` wrote `G` of this stack, `FrameMoves::span` checked
+                // `planes`; the launch is the one `shift_moved_cols` documents.
+                unsafe {
+                    match self.sh.ny {
+                        Side::N64 => {
+                            m.fused_shift_moved_cols_64(stream, cols, p, moved, span, ctl, g)
+                        }
+                        Side::N128 => {
+                            m.fused_shift_moved_cols_128(stream, cols, p, moved, span, ctl, g)
+                        }
+                        Side::N256 => {
+                            m.fused_shift_moved_cols_256(stream, cols, p, moved, span, ctl, g)
+                        }
+                        Side::N512 => {
+                            m.fused_shift_moved_cols_512(stream, cols, p, moved, span, ctl, g)
+                        }
+                    }
+                }
+            })?;
+        let reads = [self.stack.storage()];
+        self.k
+            .launch(self.ctx, &reads, &[planes.storage()], |stream| {
+                // SAFETY: as above, `shift_moved_cols` wrote the stack's planes; the launch is the
+                // one `shift_moved_rows` documents.
+                unsafe {
+                    match self.sh.nx {
+                        Side::N64 => m.fused_shift_moved_rows_64(stream, rows, moved, span, ctl, g),
+                        Side::N128 => {
+                            m.fused_shift_moved_rows_128(stream, rows, moved, span, ctl, g)
+                        }
+                        Side::N256 => {
+                            m.fused_shift_moved_rows_256(stream, rows, moved, span, ctl, g)
+                        }
+                        Side::N512 => {
+                            m.fused_shift_moved_rows_512(stream, rows, moved, span, ctl, g)
+                        }
+                    }
+                }
+            })
     }
 
     /// The object sums from the shift terms of [`Self::shift_rows_inv`].
