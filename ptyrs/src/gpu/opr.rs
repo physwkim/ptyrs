@@ -9,7 +9,8 @@ use std::ops::Range;
 use std::ptr;
 
 use cuda_async::device_operation::ExecutionContext;
-use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig};
+use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig, RawDeviceBuffer};
+use ptyrs_kernels::fused::{ProbeSrc, shared_probe};
 use ptyrs_kernels::opr::{OPR_SUMS, OprFrames, OprScan, opr_kernels};
 use ptyrs_kernels::pixel::PIXEL_THREADS;
 use ptyrs_kernels::position::BatchSpan;
@@ -172,6 +173,73 @@ impl Opr {
         // In bounds: `i < k` and the buffer holds `k n` values.
         dptr::<C32, f32>(&self.eigenmodes).wrapping_add(2 * i as usize * self.n)
     }
+}
+
+/// Mode 0 of each frame's own probe over a run of epoch positions: [`OprKernels::unique`]'s
+/// `planes`, `[nb, n]`, plane `b` at position `positions.start + b`.
+#[derive(Clone)]
+pub struct OwnModes<'a> {
+    pub planes: &'a DeviceBuffer<C32>,
+    pub positions: Range<u32>,
+}
+
+impl OwnModes<'_> {
+    /// `probe` with these planes of `n` pixels for its mode 0, as a kernel reads it.
+    pub(super) fn src(&self, probe: &DeviceBuffer<C32>, n: usize) -> Result<ProbeSrc, Error> {
+        let nb = self.positions.len();
+        if nb == 0 {
+            let p = &self.positions;
+            return Err(Error::Shape(format!(
+                "own probe modes at no positions, {p:?}"
+            )));
+        }
+        check_len("own probe modes", self.planes, nb * n)?;
+        Ok(ProbeSrc {
+            probe: dptr::<C32, f32>(probe).cast_const(),
+            mode0: dptr::<C32, f32>(self.planes).cast_const(),
+            p0: self.positions.start,
+            nb: nb as u32,
+        })
+    }
+}
+
+/// The probe `[nprobe, ny, nx]` a pass's frames read: shared by all of them, or with each
+/// frame's mode 0 from its [`OwnModes`] plane instead.
+#[derive(Clone, Copy)]
+pub enum FrameProbe<'a> {
+    Shared(&'a DeviceBuffer<C32>),
+    Own(&'a DeviceBuffer<C32>, &'a OwnModes<'a>),
+}
+
+impl<'a> FrameProbe<'a> {
+    /// The probe planes; `Own` reads only modes `1..` of them.
+    pub(super) fn probe(self) -> &'a DeviceBuffer<C32> {
+        match self {
+            Self::Shared(p) | Self::Own(p, _) => p,
+        }
+    }
+
+    /// The buffers a kernel reading [`Self::src`] reads.
+    pub(super) fn storages(self) -> impl Iterator<Item = &'a RawDeviceBuffer> {
+        let own = match self {
+            Self::Shared(_) => None,
+            Self::Own(_, own) => Some(own.planes.storage()),
+        };
+        std::iter::once(self.probe().storage()).chain(own)
+    }
+
+    /// The probe of planes of `n` pixels as a kernel reads it.
+    pub(super) fn src(self, n: usize) -> Result<ProbeSrc, Error> {
+        match self {
+            Self::Shared(p) => Ok(shared_src(p)),
+            Self::Own(p, own) => own.src(p, n),
+        }
+    }
+}
+
+/// `probe` shared by every frame, as a kernel reads it.
+pub(super) fn shared_src(probe: &DeviceBuffer<C32>) -> ProbeSrc {
+    shared_probe(dptr::<C32, f32>(probe).cast_const())
 }
 
 /// A batch's per-frame mode-0 planes for [`OprKernels::step`], each `[nb, n]` by batch frame

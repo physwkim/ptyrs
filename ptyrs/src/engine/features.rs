@@ -102,11 +102,6 @@ impl Features {
         Ok(())
     }
 
-    /// Whether an intensity scale or a detector background is modelled, refined or held.
-    pub(crate) fn models_scale_or_background(&self) -> bool {
-        self.scale.is_some() || self.background.is_some()
-    }
-
     /// Whether some feature takes a step before each cycle: a refined scale or background.
     pub(crate) fn stepped(&self) -> bool {
         let refined = |f: &Option<Feature<_>>| f.as_ref().is_some_and(|f| f.refine);
@@ -126,6 +121,11 @@ impl Features {
     /// Whether a position is refined.
     pub(crate) fn position_refined(&self) -> bool {
         self.position.as_ref().is_some_and(|d| d.refine)
+    }
+
+    /// Whether an intensity scale or a detector background is modelled, refined or held.
+    pub(crate) fn models_scale_or_background(&self) -> bool {
+        self.scale.is_some() || self.background.is_some()
     }
 
     /// Every refined feature's step before a cycle models it, from the far field `psi` of the
