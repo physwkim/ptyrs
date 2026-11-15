@@ -3887,7 +3887,9 @@ mod tests {
     /// full-object sampling each slice's window beside its wave: 1 MiB and 0.5 MiB a frame at
     /// 256x256 against a 24 MiB budget. Whatever the position model, held or refined, the
     /// stack [`BhState`] books holds them through 10 slices; without full-object sampling it
-    /// books them exactly from 7, where the first loop outweighs the second.
+    /// books them exactly from 7, where the first loop outweighs the second. Refined under
+    /// full-object sampling, the second loop holds five waves besides the wave and window of
+    /// each slice past the first, and the stack holds those too.
     #[test]
     fn bh_books_a_held_wave_per_slice() {
         let dims = ViewDims {
@@ -3913,14 +3915,15 @@ mod tests {
                 refined,
             })
         };
+        let patch = MovedSampling::Patch;
         let arms = [
-            ("unmoved", None, wave),
-            ("held patch", moved(MovedSampling::Patch, false), wave),
-            ("refined patch", moved(MovedSampling::Patch, true), wave),
-            ("held full object", moved(full, false), wave + win),
-            ("refined full object", moved(full, true), wave + win),
+            ("unmoved", None, wave, false),
+            ("held patch", moved(patch, false), wave, false),
+            ("refined patch", moved(patch, true), wave, false),
+            ("held full object", moved(full, false), wave + win, false),
+            ("refined full object", moved(full, true), wave + win, true),
         ];
-        for (name, scratch, per_slice) in arms {
+        for (name, scratch, per_slice, sliced_second) in arms {
             for n in 2..=10 {
                 let frames = rule.frames(&BhState::streamed(&dims, n - 1, scratch)) as usize;
                 let held = n * per_slice;
@@ -3931,6 +3934,14 @@ mod tests {
                 );
                 if n >= 7 && per_slice == wave {
                     assert_eq!(frames, rule.budget / held, "{name}, {n} slices");
+                }
+                if sliced_second {
+                    let second = 5 * wave + (n - 1) * per_slice;
+                    assert!(
+                        frames * second <= rule.budget,
+                        "{name}, {n} slices: {frames} frames hold {} bytes in the second loop",
+                        frames * second
+                    );
                 }
             }
         }
