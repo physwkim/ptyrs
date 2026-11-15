@@ -10,7 +10,7 @@
 //!   ([`Views::new`] checks it): `nmode = nprobe * nobj`, mode `m` multiplies probe mode
 //!   `m % nprobe` and object mode `m / nprobe`, and all views of a frame sample the object
 //!   at one position. A stack is frames
-//!   `f0 .. f0 + nf`, a [`StackCtl`] entry of a [`StackTable`] that the kernels read when they
+//!   `f0 .. f0 + nf`, a [`StackCtl`] entry (a [`StackRef`]) that the kernels read when they
 //!   run, not when they are launched or captured. Per-stack buffers are sized by the table's
 //!   `nf_max`: `psi` holds `nf_max * nmode` planes, plane `kl < nf * nmode` being view
 //!   `f0 * nmode + kl`; planes and records past the stack are left as they are, and a stack
@@ -179,7 +179,7 @@ impl ViewDims {
     /// of `nframe` frames: the [`StackGeom`] a stack kernel takes by value.
     pub fn geom(&self, stack: StackRef<'_>) -> Result<StackGeom, Error> {
         self.check()?;
-        let t = stack.table;
+        let t = stack.e;
         if t.nframe != self.nframe {
             return Err(Error::Shape(format!(
                 "stack table made for {} frames, dims have {}",
@@ -211,11 +211,14 @@ impl ViewDims {
 /// [`StackCtl`] entries on the device, for a scan of `nframe` frames, each stack at most
 /// `nf_max` frames. A kernel reads its entry when it runs and clamps it to `nf <= nf_max`,
 /// `f0 + nf <= nframe`.
-pub struct StackTable {
+struct Entries {
     ctl: DeviceBuffer<StackCtl>,
     nframe: u32,
     nf_max: u32,
 }
+
+/// Stack entries fixed when the table is made; nothing writes them afterwards.
+pub struct StackTable(Entries);
 
 impl StackTable {
     /// One entry per range, each a non-empty part of `0 .. dims.nframe`; `nf_max` is the
@@ -240,17 +243,39 @@ impl StackTable {
             .map(|c| c.nf)
             .max()
             .ok_or_else(|| Error::Shape("no stacks".into()))?;
-        Ok(Self {
+        Ok(Self(Entries {
             ctl: DeviceBuffer::from_host(stream, &ctl)?,
             nframe: dims.nframe,
             nf_max,
-        })
+        }))
     }
 
-    /// One entry, `{ f0: 0, nf: 0 }`, for the caller's own device code to rewrite between
-    /// runs (through [`Self::ptr`], leased through [`Self::storage`]); `nf_max` in
-    /// `1 ..= dims.nframe`.
-    pub fn device(stream: &CudaStream, dims: &ViewDims, nf_max: u32) -> Result<Self, Error> {
+    pub fn len(&self) -> usize {
+        self.0.ctl.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.ctl.is_empty()
+    }
+
+    pub fn nf_max(&self) -> u32 {
+        self.0.nf_max
+    }
+
+    /// Entry `s`; panics if `s >= self.len()`.
+    pub fn at(&self, s: usize) -> StackRef<'_> {
+        assert!(s < self.len(), "stack {s} of a {}-entry table", self.len());
+        StackRef { e: &self.0, s }
+    }
+}
+
+/// One stack entry, `{ f0: 0, nf: 0 }` when made, for its owner's device code to rewrite
+/// between runs through [`Self::ptr`], leased through [`Self::storage`].
+pub struct DeviceStackTable(Entries);
+
+impl DeviceStackTable {
+    /// `nf_max` in `1 ..= dims.nframe`.
+    pub fn new(stream: &CudaStream, dims: &ViewDims, nf_max: u32) -> Result<Self, Error> {
         dims.check()?;
         if nf_max == 0 || nf_max > dims.nframe {
             return Err(Error::Shape(format!(
@@ -258,62 +283,54 @@ impl StackTable {
                 dims.nframe
             )));
         }
-        Ok(Self {
+        Ok(Self(Entries {
             ctl: DeviceBuffer::zeroed(stream, 1)?,
             nframe: dims.nframe,
             nf_max,
-        })
-    }
-
-    pub fn len(&self) -> usize {
-        self.ctl.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.ctl.is_empty()
+        }))
     }
 
     pub fn nf_max(&self) -> u32 {
-        self.nf_max
+        self.0.nf_max
     }
 
-    /// Entry `s`; panics if `s >= self.len()`.
-    pub fn at(&self, s: usize) -> StackRef<'_> {
-        assert!(s < self.len(), "stack {s} of a {}-entry table", self.len());
-        StackRef { table: self, s }
+    /// The entry.
+    pub fn stack(&self) -> StackRef<'_> {
+        StackRef { e: &self.0, s: 0 }
     }
 
-    /// Device address of entry 0; entry `s` is `s * size_of::<StackCtl>()` bytes on.
+    /// Device address of the entry.
     pub fn ptr(&self) -> CUdeviceptr {
-        self.ctl.cu_deviceptr()
+        self.0.ctl.cu_deviceptr()
     }
 
-    /// The entries' storage, for leasing a write to them.
+    /// The entry's storage, for leasing a write to it.
     pub fn storage(&self) -> &RawDeviceBuffer {
-        self.ctl.storage()
+        self.0.ctl.storage()
     }
 }
 
-/// Entry `s` of a [`StackTable`], what a stack launch takes.
+/// Entry `s` of a [`StackTable`] or the entry of a [`DeviceStackTable`], what a stack launch
+/// takes.
 #[derive(Clone, Copy)]
 pub struct StackRef<'a> {
-    table: &'a StackTable,
+    e: &'a Entries,
     s: usize,
 }
 
 impl StackRef<'_> {
     pub fn nf_max(&self) -> u32 {
-        self.table.nf_max
+        self.e.nf_max
     }
 
     /// Device address of this entry's [`StackCtl`], a stack kernel's `ctl` argument.
     pub fn ctl(&self) -> CUdeviceptr {
-        self.table.ptr() + (self.s * size_of::<StackCtl>()) as CUdeviceptr
+        self.e.ctl.cu_deviceptr() + (self.s * size_of::<StackCtl>()) as CUdeviceptr
     }
 
     /// The whole table's storage, for leasing a read of the entry around a launch.
     pub fn storage(&self) -> &RawDeviceBuffer {
-        self.table.ctl.storage()
+        self.e.ctl.storage()
     }
 }
 

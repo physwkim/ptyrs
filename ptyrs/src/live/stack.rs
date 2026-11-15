@@ -1,5 +1,5 @@
 //! The frames a live graph replay works on (DESIGN.md §3 B2). The kernels
-//! read a [`StackTable`] entry when they run; the host only lands frames,
+//! read a [`DeviceStackTable`] entry when they run; the host only lands frames,
 //! through [`LiveFrames::land`], and replays graphs that move the entries.
 //! Two entries walk the landed frames: the ingest entry ([`LiveFrames::step`])
 //! takes each landed frame once, for binning; the sweep entry
@@ -16,7 +16,7 @@ use std::ffi::c_void;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
-use crate::gpu::{StackRef, StackTable, ViewDims};
+use crate::gpu::{DeviceStackTable, StackRef, ViewDims};
 use cuda_async::device_operation::ExecutionContext;
 use cuda_bindings as sys;
 use cuda_core::{DeviceBuffer, Function, IntoResult, Stream, launch_kernel_on_stream};
@@ -53,8 +53,8 @@ const PTX: &str = r#"
 /// The landed count and the stack entries of one live scan, on one stream:
 /// `land` and graphs the steps are recorded into must run there.
 pub struct LiveFrames {
-    table: StackTable,
-    sweep: StackTable,
+    table: DeviceStackTable,
+    sweep: DeviceStackTable,
     landed: DeviceBuffer<u32>,
     func: Function,
     count: u32,
@@ -71,8 +71,8 @@ impl LiveFrames {
         nf_max: NonZeroU32,
     ) -> Result<Self, GrowError> {
         let ctx = stream.context();
-        let table = StackTable::device(stream, dims, nf_max.get())?;
-        let sweep = StackTable::device(stream, dims, nf_max.get())?;
+        let table = DeviceStackTable::new(stream, dims, nf_max.get())?;
+        let sweep = DeviceStackTable::new(stream, dims, nf_max.get())?;
         let landed = DeviceBuffer::zeroed(stream, 1)?;
         let func = ctx
             .load_module_from_ptx_src(PTX)?
@@ -90,12 +90,12 @@ impl LiveFrames {
 
     /// The ingest entry.
     pub fn stack(&self) -> StackRef<'_> {
-        self.table.at(0)
+        self.table.stack()
     }
 
     /// The sweep entry.
     pub fn sweep(&self) -> StackRef<'_> {
-        self.sweep.at(0)
+        self.sweep.stack()
     }
 
     pub fn stream(&self) -> &Arc<Stream> {
@@ -171,7 +171,11 @@ impl LiveFrames {
         Ok(())
     }
 
-    fn next(&self, ctx: &ExecutionContext, table: &StackTable) -> Result<(), crate::gpu::Error> {
+    fn next(
+        &self,
+        ctx: &ExecutionContext,
+        table: &DeviceStackTable,
+    ) -> Result<(), crate::gpu::Error> {
         self.same_context(ctx)?;
         crate::gpu::lease(ctx, &[self.landed.storage()], &[table.storage()])?;
         let (mut ctl, mut landed, mut nf_max) =

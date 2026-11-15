@@ -11,9 +11,9 @@ use cuda_async::error::DeviceError;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, DeviceCopy, DriverError};
 use ptyrs::fft::{FftError, Plan2d};
 use ptyrs::gpu::{
-    BackgroundSums, C32, Error, Exit, ExitPass, ExitStage, FUSED_SIDES, FarSums, FusedBufs,
-    FusedInputs, FusedSums, HalfWaves, Kernels, Lines, LlkPartial, LlkScratch, LlkSums, MASKED,
-    Model, OBJ_TILE, OpticsKernels, Permutation, PositionPartial, ProbeSpectrum, PsiSums,
+    BackgroundSums, C32, DeviceStackTable, Error, Exit, ExitPass, ExitStage, FUSED_SIDES, FarSums,
+    FusedBufs, FusedInputs, FusedSums, HalfWaves, Kernels, Lines, LlkPartial, LlkScratch, LlkSums,
+    MASKED, Model, OBJ_TILE, OpticsKernels, Permutation, PositionPartial, ProbeSpectrum, PsiSums,
     ScalePartial, Shift, ShiftProbe, ShiftSums, ShiftedNumSums, ShiftedProbes, ShiftedStepSums,
     SpectrumBuf, StackCtl, StackRef, StackTable, UpdateSums, ViewAddr, ViewDims, Views, Waves,
     half_scale, lease, record, view_tiles,
@@ -57,7 +57,7 @@ fn up<T: DeviceCopy>(stream: &CudaStream, host: &[T]) -> DeviceBuffer<T> {
 
 /// Writes `table`'s one entry on `stream`, leased like a launch. A replay that reads it must
 /// run on the same stream: a non-blocking stream does not wait for another stream's write.
-fn set_entry(stream: &Arc<CudaStream>, table: &StackTable, f0: u32, nf: u32) {
+fn set_entry(stream: &Arc<CudaStream>, table: &DeviceStackTable, f0: u32, nf: u32) {
     let ctl = [StackCtl { f0, nf }];
     record(|ctx| {
         lease(ctx, &[], &[table.storage()])?;
@@ -1704,7 +1704,10 @@ fn views_and_frame_ranges_are_checked() {
     }
     for nf_max in [0, 6] {
         assert!(
-            table_err(StackTable::device(&stream, &s.d, nf_max)),
+            matches!(
+                DeviceStackTable::new(&stream, &s.d, nf_max),
+                Err(Error::Shape(_))
+            ),
             "nf_max {nf_max}"
         );
     }
@@ -1947,12 +1950,12 @@ fn one_graph_runs_whichever_stack_its_entry_holds() {
     record(|ctx| eager.clear(ctx)).sync_on(&stream).unwrap();
     want.push(eager.bits(&stream));
 
-    let dev = StackTable::device(&stream, &s.d, 3).unwrap();
+    let dev = DeviceStackTable::new(&stream, &s.d, 3).unwrap();
     let mut it = StackRun::new(&stream, &s, dev.nf_max());
     let side = k.context().new_stream().unwrap();
     let graph = CudaGraph::capture(
         side.clone(),
-        record(|ctx| it.run(ctx, &k, &views, dev.at(0), &counts)),
+        record(|ctx| it.run(ctx, &k, &views, dev.stack(), &counts)),
     )
     .unwrap();
     let entries = [(0, 3), (3, 2), (1, 3), (4, 3), (9, 2)];
@@ -1974,13 +1977,13 @@ fn empty_stack_replay_writes_nothing() {
     let s = scan();
     let views = Views::new(&stream, s.d, &s.views).unwrap();
     let counts = up(&stream, &counts(s.d.nframe as usize * s.n()));
-    let dev = StackTable::device(&stream, &s.d, 3).unwrap();
+    let dev = DeviceStackTable::new(&stream, &s.d, 3).unwrap();
     let mut it = StackRun::new(&stream, &s, dev.nf_max());
     it.fill_noise(&stream);
     let side = k.context().new_stream().unwrap();
     let graph = CudaGraph::capture(
         side.clone(),
-        record(|ctx| it.ops(ctx, &k, &views, dev.at(0), &counts)),
+        record(|ctx| it.ops(ctx, &k, &views, dev.stack(), &counts)),
     )
     .unwrap();
     let start = it.bits(&stream);
@@ -2039,7 +2042,7 @@ fn bin_views_appends_each_stack_to_the_tile_slabs() {
     let plist = packed.tile_views().to_host_vec(&stream).unwrap();
     let ntiles = plen.len();
     let full = *plen.iter().max().unwrap();
-    let dev = StackTable::device(&stream, &d, 9).unwrap();
+    let dev = DeviceStackTable::new(&stream, &d, 9).unwrap();
     let side = k.context().new_stream().unwrap();
     for cap in [full, full - 1] {
         let unset = vec![u32::MAX; ntiles * cap as usize];
@@ -2051,7 +2054,7 @@ fn bin_views_appends_each_stack_to_the_tile_slabs() {
         let mut overflow = up(&stream, &[0u32]);
         let graph = CudaGraph::capture(
             side.clone(),
-            record(|ctx| k.bin_views(ctx, &mut views, dev.at(0), &mut overflow)),
+            record(|ctx| k.bin_views(ctx, &mut views, dev.stack(), &mut overflow)),
         )
         .unwrap();
         let state = |views: &Views, overflow: &DeviceBuffer<u32>| {
@@ -3318,7 +3321,7 @@ fn fused_empty_stack_replay_writes_nothing() {
     let (stream, _, k) = setup();
     let fs = FusedScan::new(&stream, [256, 128], [2, 2]);
     let (s, n) = (&fs.s, fs.s.n());
-    let dev = StackTable::device(&stream, &s.d, 3).unwrap();
+    let dev = DeviceStackTable::new(&stream, &s.d, 3).unwrap();
     let mut bufs = FusedBufs::new(&stream, &s.d, 3).unwrap();
     let mut psi = up(&stream, &noise(s.nk(&(0..3)) * n, 70, 1.0));
     let mut raar_psi = up(&stream, &noise(s.nk(&(0..3)) * n, 81, 1.0));
@@ -3374,7 +3377,7 @@ fn fused_empty_stack_replay_writes_nothing() {
                 probe: Some(&mut ap_probe),
                 ..Default::default()
             };
-            k.fused_project(ctx, &inputs, dev.at(0), ap, &mut bufs, sums)?;
+            k.fused_project(ctx, &inputs, dev.stack(), ap, &mut bufs, sums)?;
             let dm = Exit::Dm {
                 psi: &mut psi,
                 alpha: 0.02,
@@ -3384,7 +3387,7 @@ fn fused_empty_stack_replay_writes_nothing() {
                 probe: Some(&mut dm_probe),
                 ..Default::default()
             };
-            k.fused_project(ctx, &inputs, dev.at(0), dm, &mut bufs, sums)?;
+            k.fused_project(ctx, &inputs, dev.stack(), dm, &mut bufs, sums)?;
             let raar = Exit::Raar {
                 psi: &mut raar_psi,
                 iterate: &mut iterate,
@@ -3393,7 +3396,7 @@ fn fused_empty_stack_replay_writes_nothing() {
             k.fused_project(
                 ctx,
                 &inputs,
-                dev.at(0),
+                dev.stack(),
                 raar,
                 &mut bufs,
                 FusedSums::default(),
@@ -5345,7 +5348,7 @@ fn fused_shift_empty_stack_replay_writes_nothing() {
     let (stream, _, k) = setup();
     let fs = FusedScan::new(&stream, [256, 128], [2, 2]);
     let (s, n) = (&fs.s, fs.s.n());
-    let dev = StackTable::device(&stream, &s.d, 3).unwrap();
+    let dev = DeviceStackTable::new(&stream, &s.d, 3).unwrap();
     let mut bufs = FusedBufs::with_shift(&stream, &s.d, 3).unwrap();
     let offsets = up(&stream, SHIFTS.as_flattened());
     let side = k.context().new_stream().unwrap();
@@ -5403,12 +5406,12 @@ fn fused_shift_empty_stack_replay_writes_nothing() {
                     ..FarSums::default()
                 },
             };
-            k.fused_project(ctx, &inputs, dev.at(0), exit, &mut bufs, ap.sums(true))?;
+            k.fused_project(ctx, &inputs, dev.stack(), exit, &mut bufs, ap.sums(true))?;
             let exit = Exit::Dm {
                 psi: &mut psi,
                 alpha: 0.02,
             };
-            k.fused_project(ctx, &inputs, dev.at(0), exit, &mut bufs, dm.sums(true))
+            k.fused_project(ctx, &inputs, dev.stack(), exit, &mut bufs, dm.sums(true))
         }),
     )
     .unwrap();

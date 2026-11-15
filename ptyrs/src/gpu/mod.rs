@@ -64,9 +64,9 @@ pub use lsqml::{
 };
 pub use opr::{Opr, OprKernels, OprPlanes};
 pub use ops::{
-    LLK_TREE_LEAVES, LlkPartial, LlkScratch, LlkSums, MASKED, OBJ_TILE, Permutation,
-    PositionPartial, ScalePartial, StackCtl, StackGeom, StackRef, StackTable, SumTarget, Sums,
-    UpdateSums, ViewAddr, ViewDims, Views, view_tiles,
+    DeviceStackTable, LLK_TREE_LEAVES, LlkPartial, LlkScratch, LlkSums, MASKED, OBJ_TILE,
+    Permutation, PositionPartial, ScalePartial, StackCtl, StackGeom, StackRef, StackTable,
+    SumTarget, Sums, UpdateSums, ViewAddr, ViewDims, Views, view_tiles,
 };
 pub use optics::{
     BandCarry, BandedTransfer, ExitPass, ExitStage, FrameWaves, OpticsKernels, SlicePhase,
