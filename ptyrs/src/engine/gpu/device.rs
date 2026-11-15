@@ -1840,7 +1840,21 @@ impl BhState {
         // `hess_frames` 43), the second derivatives (three sampler calls from 44) and r and
         // the derivatives' windows to `win_hess` 53. Through a multislice object the first
         // loop hands on two waves per pass boundary, the second lu, lv and the three second
-        // derivatives of the exit waves from slice to slice.
+        // derivatives of the exit waves from slice to slice. Under full-object sampling as
+        // well, through two slices: a slice's window (sampler call 0, 5) ahead of its wave
+        // (`slice_mul` 3, 8; the gap 4), psi (the transform, the residual 10), r (the adjoint,
+        // `slice_pair` 12, `slice_adjoint` 26), then per slice from the last its derivatives'
+        // windows (13 and 16, 29 and 32) to `win_grad` (19, 35), whose patches `place` takes
+        // (20, 36), and the work wave from `slice_pair` to `win_grad` and from `slice_adjoint`
+        // 26 to the first slice's `psi_to_probe` 28 and `win_grad`; then per slice the windows
+        // of `u_O` and `v_O` (42 and 45, 55 and 58) to `win_lift` and `slice_tangent` (49,
+        // 62), the second's window and entering wave read there again by `slice_adjoint` 89
+        // and `slice_pair` 66, lu, lv and the three second derivatives from 49 to
+        // `sliced_hess_frames` 65, and per slice from the last its derivatives' windows (four
+        // calls from 67, 91) and second derivatives (three from 79, 103) to `win_hess` (88,
+        // 112), r to `slice_adjoint` 89, the work wave from `slice_pair` 66 and from it to the
+        // first slice's `win_hess`. A slice past the second repeats the second's passes,
+        // booked once.
         let wave = wave_bytes(dims);
         let streamed = match scratch.map(|s| s.sampling) {
             None => {
@@ -1853,6 +1867,56 @@ impl BhState {
                 if deeper > 0 {
                     s.extend([Streamed::new(wave, 5..=8); 3]);
                 }
+                s
+            }
+            Some(MovedSampling::FullObject { held, scratch, acc }) if deeper > 0 => {
+                let win = Windows::bytes(dims);
+                let calls = [
+                    (0, 28),
+                    (5, 26),
+                    (13, 19),
+                    (16, 19),
+                    (29, 35),
+                    (32, 35),
+                    (42, 49),
+                    (45, 49),
+                    (55, 62),
+                    (58, 62),
+                    (67, 88),
+                    (70, 88),
+                    (73, 88),
+                    (76, 88),
+                    (79, 88),
+                    (82, 88),
+                    (85, 88),
+                    (91, 112),
+                    (94, 112),
+                    (97, 112),
+                    (100, 112),
+                    (103, 112),
+                    (106, 112),
+                    (109, 112),
+                ];
+                let mut s: Vec<_> = (calls.into_iter())
+                    .flat_map(|(p, read)| Streamed::chunked(held, p..=p + 2, &[(win, read)], &[]))
+                    .collect();
+                for p in [20, 36] {
+                    s.extend(Streamed::chunked(acc, p..=p + 5, &[], &[(win, p - 1)]));
+                    s.push(Streamed::fixed(scratch, p + 1..=p + 3));
+                }
+                s.extend([
+                    Streamed::new(wave, 3..=12),
+                    Streamed::new(wave, 8..=10),
+                    Streamed::new(wave, 10..=26),
+                    Streamed::new(wave, 12..=19),
+                    Streamed::new(wave, 26..=35),
+                    Streamed::new(win, 62..=89),
+                    Streamed::new(wave, 62..=66),
+                    Streamed::new(wave, 65..=89),
+                    Streamed::new(wave, 66..=88),
+                    Streamed::new(wave, 89..=112),
+                ]);
+                s.extend([Streamed::new(wave, 49..=65); 5]);
                 s
             }
             Some(MovedSampling::FullObject { held, scratch, acc }) => {
@@ -1916,8 +1980,9 @@ impl BhState {
         let len = cut.wave_len(dims);
         let plans = cut.plans(stream, dims)?;
         let slots = batches.iter().map(|b| b.len()).max().unwrap_or(0);
-        let moved = (scratch.map(|s| BhMoved::new(stream, kernels, dims, &cut, slots, s.sampling)))
-            .transpose()?;
+        let moved = (scratch
+            .map(|s| BhMoved::new(stream, kernels, dims, &cut, slots, (s.sampling, deeper))))
+        .transpose()?;
         let sliced = (deeper > 0)
             .then(|| BhSliced::new(stream, dims, len, slots, deeper))
             .transpose()?;
@@ -2831,13 +2896,9 @@ impl Device {
         let size = to_u32("batch_size", params.batch_size.min(dims.nframe as usize))?;
         let reads = self.features.positioned().then_some(self.sampling);
         let deeper = self.deeper().len();
-        if let Some(sampling) = reads.filter(|_| deeper > 0) {
-            let what = match sampling {
-                Sampling::FullObject => "under Sampling::FullObject",
-                Sampling::Patch => "with the position model under Sampling::Patch",
-            };
+        if reads == Some(Sampling::Patch) && deeper > 0 {
             return Err(EngineError::Invalid(format!(
-                "BH {what} runs one object slice, got {}",
+                "BH with the position model under Sampling::Patch runs one object slice, got {}",
                 deeper + 1
             )));
         }

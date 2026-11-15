@@ -134,6 +134,16 @@ pub struct BhWinFields {
     pub probe: *const f32,
 }
 
+/// The offsets' gradient partials of one slice: `out` `2 * nframe * nslice * nchunk` floats,
+/// a frame's row `nslice` segments of `nchunk` pairs, of which `slice < nslice` writes its own.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct BhPartials {
+    pub out: *mut f32,
+    pub slice: u32,
+    pub nslice: u32,
+}
+
 /// The windows [`bh_kernels::LoadedModule::bh_win_hess`] reads, each three blocks `[nobj,
 /// nf_max, ny, nx]`: `second` the estimate's second derivatives over `(y, y)`, `(y, x)` and
 /// `(x, x)`; `du` and with `cg` `dv` those of `u_O` and `v_O`, blocks 1 and 2 their
@@ -190,9 +200,9 @@ pub const BH_STEP: u32 = 4;
 #[cuda_module]
 pub mod bh_kernels {
     use super::{
-        BH_EPS, BH_HESS, BH_STEP, BhDirs, BhFields, BhMovedFar, BhMoves, BhNear, BhObs, BhPosDirs,
-        BhSecond, BhSliceIn, BhTangents, BhWinDerivs, BhWinFields, CHUNK_PIXELS, add_im, add_re,
-        far_add, far_tail, near_prod, near_sum, ramp_at, rates, re_conj, unramp,
+        BH_EPS, BH_HESS, BH_STEP, BhDirs, BhFields, BhMovedFar, BhMoves, BhNear, BhObs, BhPartials,
+        BhPosDirs, BhSecond, BhSliceIn, BhTangents, BhWinDerivs, BhWinFields, CHUNK_PIXELS, add_im,
+        add_re, far_add, far_tail, near_prod, near_sum, ramp_at, rates, re_conj, unramp,
     };
     use crate::grad::{GAMMA_CHUNK, ObjProbePtrs};
     use crate::pixel::*;
@@ -1134,18 +1144,20 @@ pub mod bh_kernels {
     }
 
     /// The object gradient's patches and the offsets' gradient partials of chunk `c =
-    /// blockIdx.x` of frame `f0 + fl`, `fl = blockIdx.y`, under full-object sampling: at probe
-    /// pixel `d` of the chunk and per object mode `o`, `G = Σ_p conj(q P_p) r_m`, `m = o
-    /// nprobe + p`, into `patch[k]`, `k = (o nf_max + fl) n + d`, and `out[2p .. 2p + 2] = Σ
-    /// Re(conj(G) win[(1 + a) blk + k]) / 2π` over the chunk's pixels and the object modes,
-    /// `blk` a block's values, `p = (f0 + fl) * nchunk + c`: the partials [`bh_pos_dots`] sums
-    /// to `∂F/∂d`. Patches of frames outside the stack are not written.
+    /// blockIdx.x` of frame `f0 + fl`, `fl = blockIdx.y`, under full-object sampling, for
+    /// slice `part.slice`: at probe pixel `d` of the chunk and per object mode `o`, `G = Σ_p
+    /// conj(q P_p) r_m`, `m = o nprobe + p`, into `patch[k]`, `k = (o nf_max + fl) n + d`, and
+    /// `part.out[2p .. 2p + 2] = Σ Re(conj(G) win[(1 + a) blk + k]) / 2π` over the chunk's
+    /// pixels and the object modes, `blk` a block's values, `p = ((f0 + fl) part.nslice +
+    /// part.slice) nchunk + c`: the slice's segment of the frame's row, which [`bh_pos_dots`]
+    /// sums with the other slices' to `∂F/∂d`. Patches of frames outside the stack are not
+    /// written.
     ///
     /// # Safety
     ///
     /// `f` as [`BhWinFields`] says, `win` three blocks `[nobj, nf_max, ny, nx]` (block 0
-    /// unread), `patch` one, `out` `2 * nframe * nchunk` floats, `ctl` one entry; grid
-    /// `(nchunk, nf_max, 1)`, block `(PIXEL_THREADS, 1, 1)`.
+    /// unread), `patch` one, `part` as [`BhPartials`] says, `ctl` one entry; grid `(nchunk,
+    /// nf_max, 1)`, block `(PIXEL_THREADS, 1, 1)`.
     ///
     /// [`bh_pos_dots`]: LoadedModule::bh_pos_dots
     #[kernel]
@@ -1153,7 +1165,7 @@ pub mod bh_kernels {
         f: BhWinFields,
         win: *const f32,
         patch: *mut f32,
-        out: *mut f32,
+        part: BhPartials,
         ctl: *const StackCtl,
         g: StackGeom,
     ) {
@@ -1195,7 +1207,8 @@ pub mod bh_kernels {
             d += PIXEL_THREADS as usize;
         }
         let s = 0.5 * core::f32::consts::FRAC_1_PI;
-        let o = unsafe { out.add(2 * (pos * n.div_ceil(chunk) + c)) };
+        let row = pos * part.nslice as usize + part.slice as usize;
+        let o = unsafe { part.out.add(2 * (row * n.div_ceil(chunk) + c)) };
         let acc = [s * acc[0], s * acc[1]];
         unsafe { super::store_sums::<2>((&raw mut RED).cast::<f32>(), acc, o) }
     }

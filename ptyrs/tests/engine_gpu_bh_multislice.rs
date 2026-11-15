@@ -1,8 +1,9 @@
 //! GPU BH through a multislice object against the CPU's `f64` [`Bh`] from the same start: two
 //! and three slices under each of the far field, the angular spectrum and the Fresnel
-//! transform forward and back, and three slices of two object modes; and its refusal under the
-//! position model. Frames are on the fused passes' smallest side, two incoherent probe modes,
-//! 30 Fermat positions in stacks of at most 8, so a batch of 12 ends in a stack of 4.
+//! transform forward and back, and three slices of two object modes, without a position and
+//! with one that samples the object; and its refusal of a position that moves the probe.
+//! Frames are on the fused passes' smallest side, two incoherent probe modes, 30 Fermat
+//! positions in stacks of at most 8, so a batch of 12 ends in a stack of 4.
 
 use std::sync::Arc;
 
@@ -176,12 +177,14 @@ impl Case {
         .unwrap()
     }
 
-    /// The CPU's normalised Poisson LLK of `objects` and `probe`.
-    fn llk(&self, objects: &[Object], probe: &Probe) -> f64 {
-        let (nframe, nmode) = (self.addr.nframe(), self.addr.nmode());
-        let mut psi = SliceWaves::new(&self.optics, self.addr.views(), objects, probe, None)
-            .psi()
-            .to_vec();
+    /// The CPU's normalised Poisson LLK of `objects` and `probe`, with `offsets` under
+    /// [`Sampling::FullObject`].
+    fn llk(&self, objects: &[Object], probe: &Probe, offsets: Option<&[[f64; 2]]>) -> f64 {
+        let (nframe, nmode, views) = (self.addr.nframe(), self.addr.nmode(), self.addr.views());
+        let sampling = Sampling::FullObject;
+        let waves =
+            SliceWaves::with_sampling(&self.optics, views, objects, probe, offsets, sampling);
+        let mut psi = waves.psi().to_vec();
         self.optics.exit().forward(&mut psi);
         let llk = llk(&self.obs, 0..nframe, nmode, &psi).normalised(self.obs.nb_obs());
         llk.poisson
@@ -253,26 +256,56 @@ fn drawn_offsets(npos: usize) -> Vec<[f64; 2]> {
     d
 }
 
+/// `max |Δa − Δb| / max |Δb|` of the offsets' changes from `start`; 0 without a position.
+fn offsets_rel(a: &Features, b: &Features, start: &Features) -> f64 {
+    let (Some(a), Some(b), Some(s)) = (&a.position, &b.position, &start.position) else {
+        assert_eq!(a.position.is_some(), b.position.is_some());
+        return 0.0;
+    };
+    let delta = |d: &[[f64; 2]]| -> Vec<f64> {
+        d.iter()
+            .zip(s)
+            .flat_map(|(d, s)| [d[0] - s[0], d[1] - s[1]])
+            .collect()
+    };
+    let (a, b) = (delta(a), delta(b));
+    let d = worst_of(a.iter().zip(&b).map(|(a, b)| (a - b).abs()));
+    d / b.iter().map(|b| b.abs()).fold(0.0, f64::max)
+}
+
 /// After [`NEPOCH`] epochs from a fresh GPU run, eagerly and from graphs, the last epoch's
-/// steps, every slice, the probe and the LLK the GPU records after it are the CPU's, for
-/// `propagator` after each of `nslices` slices of `nobj` modes: in one batch of every frame
-/// (CG from the second epoch) and in batches of 12, the last of 6.
-fn matches_cpu(propagator: &str, nslices: &[usize], nobj: usize) {
+/// steps, every slice, the probe, the LLK the GPU records after it and, with `position`, the
+/// offsets' changes are the CPU's, for `propagator` after each of `nslices` slices of `nobj`
+/// modes: in one batch of every frame (CG from the second epoch) and in batches of 12, the
+/// last of 6. A `position` is drawn offsets refined under [`Sampling::FullObject`].
+fn matches_cpu(propagator: &str, nslices: &[usize], nobj: usize, position: bool) {
     const NEPOCH: usize = 3;
+    let features = Features {
+        position: position.then(|| drawn_offsets(NPOS)),
+        ..Features::default()
+    };
     for &nslice in nslices {
         let c = case(optics(propagator, nslice), NPOS, nobj);
         for batch_size in [NPOS, 12] {
             let p = params(batch_size);
-            let mut bh = Bh::new(p).unwrap();
+            let mut bh = Bh::new(p)
+                .unwrap()
+                .with_sampling(Sampling::FullObject)
+                .with_features(features.clone())
+                .unwrap();
             let (mut objects, mut probe) = (c.objects.clone(), c.probe.clone());
-            let start = c.llk(&objects, &probe);
+            let start = c.llk(&objects, &probe, features.position.as_deref());
             let mut steps = Vec::new();
             for _ in 0..NEPOCH {
                 steps = bh.epoch(&c.addr, &c.obs, &c.optics, &mut objects, &mut probe);
             }
-            let llk = c.llk(&objects, &probe);
+            let llk = c.llk(&objects, &probe, bh.features().position.as_deref());
             for graph in [false, true] {
                 let mut gpu = c.gpu(GpuOptions { graph, ..OPTIONS });
+                if position {
+                    gpu.set_features(&features).unwrap();
+                    gpu.set_sampling(Sampling::FullObject).unwrap();
+                }
                 gpu.bh(&p, NEPOCH, 1).unwrap();
                 let got = gpu.objects().unwrap();
                 assert_eq!(got.len(), nslice);
@@ -282,22 +315,28 @@ fn matches_cpu(propagator: &str, nslices: &[usize], nobj: usize) {
                     worst_of(got.iter().zip(&objects).map(|(g, w)| rel_l2(g, w))),
                     rel_l2(&gpu.probe().unwrap(), &probe),
                     (recorded - llk).abs() / llk,
+                    offsets_rel(&gpu.features().unwrap(), bh.features(), &features),
                 ];
                 let what = format!(
-                    "{propagator} {nslice} slices {nobj} modes batch {batch_size} graph {graph}"
+                    "{propagator} {nslice} slices {nobj} modes position {position} \
+                     batch {batch_size} graph {graph}"
                 );
                 eprintln!(
-                    "{what}: step {:.2e} objects {:.2e} probe {:.2e} llk {:.2e}, llk {start:.4e} -> {llk:.4e}",
-                    errs[0], errs[1], errs[2], errs[3]
+                    "{what}: step {:.2e} objects {:.2e} probe {:.2e} llk {:.2e} offsets {:.2e}, \
+                     llk {start:.4e} -> {llk:.4e}",
+                    errs[0], errs[1], errs[2], errs[3], errs[4]
                 );
                 // The worst are 7.1e-6 (Fresnel back, two slices), 1.8e-7 (the same in batches
                 // of 12), 8.5e-8 (far field, two object modes) and 2.3e-6 (Fresnel back, three
-                // slices).
+                // slices). With a position: 1.3e-5 (far field, three slices), 3.0e-7 (Fresnel
+                // back, two slices, batches of 12), 9.4e-8, 1.6e-6 (far field, three slices of
+                // two modes) and offsets 1.9e-5 (Fresnel, three slices).
                 let bounds = [
                     ("step", 5e-5),
                     ("objects", 1e-6),
                     ("probe", 5e-7),
                     ("llk", 2e-5),
+                    ("offsets", 2e-4),
                 ];
                 for ((name, bound), e) in bounds.into_iter().zip(errs) {
                     assert!(e < bound, "{what} {name}: {e:e}");
@@ -314,37 +353,68 @@ fn matches_cpu(propagator: &str, nslices: &[usize], nobj: usize) {
 /// every epoch, and three reach 5.6 by the sixth.
 #[test]
 fn sliced_bh_matches_cpu_in_the_far_field() {
-    matches_cpu(PROPAGATORS[0], &[2, 3], 1);
+    matches_cpu(PROPAGATORS[0], &[2, 3], 1, false);
 }
 
 #[test]
 fn sliced_bh_matches_cpu_under_angular_spectrum() {
-    matches_cpu(PROPAGATORS[1], &[2, 3], 1);
+    matches_cpu(PROPAGATORS[1], &[2, 3], 1, false);
 }
 
 #[test]
 fn sliced_bh_matches_cpu_under_fresnel() {
-    matches_cpu(PROPAGATORS[2], &[2, 3], 1);
+    matches_cpu(PROPAGATORS[2], &[2, 3], 1, false);
 }
 
 #[test]
 fn sliced_bh_matches_cpu_under_fresnel_back() {
-    matches_cpu(PROPAGATORS[3], &[2, 3], 1);
+    matches_cpu(PROPAGATORS[3], &[2, 3], 1, false);
 }
 
 /// Two object modes through three slices, each view's wave its own through every slice.
 #[test]
 fn sliced_bh_with_object_modes_matches_cpu_in_the_far_field() {
-    matches_cpu(PROPAGATORS[0], &[3], 2);
+    matches_cpu(PROPAGATORS[0], &[3], 2, false);
 }
 
 #[test]
 fn sliced_bh_with_object_modes_matches_cpu_under_fresnel() {
-    matches_cpu(PROPAGATORS[2], &[3], 2);
+    matches_cpu(PROPAGATORS[2], &[3], 2, false);
 }
 
-/// BH with the position model through more than one slice fails before it launches anything,
-/// under either sampling, naming the cause and changing nothing.
+/// A position that samples the object: every slice's windows.
+#[test]
+fn sliced_full_object_bh_matches_cpu_in_the_far_field() {
+    matches_cpu(PROPAGATORS[0], &[2, 3], 1, true);
+}
+
+#[test]
+fn sliced_full_object_bh_matches_cpu_under_angular_spectrum() {
+    matches_cpu(PROPAGATORS[1], &[2, 3], 1, true);
+}
+
+#[test]
+fn sliced_full_object_bh_matches_cpu_under_fresnel() {
+    matches_cpu(PROPAGATORS[2], &[2, 3], 1, true);
+}
+
+#[test]
+fn sliced_full_object_bh_matches_cpu_under_fresnel_back() {
+    matches_cpu(PROPAGATORS[3], &[2, 3], 1, true);
+}
+
+#[test]
+fn sliced_full_object_bh_with_object_modes_matches_cpu_in_the_far_field() {
+    matches_cpu(PROPAGATORS[0], &[3], 2, true);
+}
+
+#[test]
+fn sliced_full_object_bh_with_object_modes_matches_cpu_under_fresnel() {
+    matches_cpu(PROPAGATORS[2], &[3], 2, true);
+}
+
+/// BH with a position that moves the probe through more than one slice fails before it
+/// launches anything, naming the cause and changing nothing.
 #[test]
 fn sliced_bh_refuses_the_position_model() {
     let mut gpu = case(optics("far field", 3), NPOS, 1).gpu(OPTIONS);
@@ -359,10 +429,6 @@ fn sliced_bh_refuses_the_position_model() {
     let e = gpu.bh(&p, 1, 1).unwrap_err().to_string();
     let patch = "BH with the position model under Sampling::Patch runs one object slice, got 3";
     assert!(e.contains(patch), "{e}");
-    gpu.set_sampling(Sampling::FullObject).unwrap();
-    let e = gpu.bh(&p, 1, 1).unwrap_err().to_string();
-    let full = "BH under Sampling::FullObject runs one object slice, got 3";
-    assert!(e.contains(full), "{e}");
 
     let after: Vec<_> = gpu.objects().unwrap().iter().map(|o| bits(o)).collect();
     assert!(after == before, "a refused pass changed the object");

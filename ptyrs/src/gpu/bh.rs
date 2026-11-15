@@ -44,11 +44,12 @@ use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaStream, DeviceBuffer, Event, LaunchConfig, PinnedHostBuffer, RawDeviceBuffer};
 pub use ptyrs_kernels::bh::{BH_HESS, BH_STEP};
 use ptyrs_kernels::bh::{
-    BhDirs, BhFar, BhFields, BhMovedFar, BhMoves, BhNear, BhObs, BhPosDirs, BhSecond, BhSliceIn,
-    BhTangents, BhWinDerivs, BhWinFields, bh_kernels,
+    BhDirs, BhFar, BhFields, BhMovedFar, BhMoves, BhNear, BhObs, BhPartials, BhPosDirs, BhSecond,
+    BhSliceIn, BhTangents, BhWinDerivs, BhWinFields, bh_kernels,
 };
 use ptyrs_kernels::grad::{CG_BLOCKS, GAMMA_CHUNK, ObjProbePtrs};
 use ptyrs_kernels::pixel::{PIXEL_THREADS, StackGeom, SumPtrs};
+use ptyrs_kernels::position::BatchSpan;
 
 use crate::gpu::ops::grid_1d;
 use crate::gpu::position::{ONE_BLOCK, chunk_grid, same_dims, span};
@@ -287,12 +288,14 @@ impl BhBatch {
     }
 }
 
-/// The offsets' buffers of BH under the position model for a scan of `dims`: the partials of
-/// [`BhKernels::pos_grad`], `u`'s offsets by epoch position, and the last direction's by scan
-/// frame, which with CG are `v`'s.
+/// The offsets' buffers of BH under the position model for a scan of `dims` through an object
+/// of `nslice` slices: the partials of [`BhKernels::pos_grad`] or [`BhKernels::win_grad`],
+/// `u`'s offsets by epoch position, and the last direction's by scan frame, which with CG are
+/// `v`'s.
 pub struct BhPositions {
     dims: ViewDims,
-    /// `[nframe, nchunk, 2]` by epoch position.
+    nslice: usize,
+    /// `[nframe, nslice, nchunk, 2]` by epoch position, a segment of a frame's row per slice.
     grads: DeviceBuffer<f32>,
     /// `[nframe, 2]` by epoch position.
     ud: DeviceBuffer<f32>,
@@ -301,12 +304,16 @@ pub struct BhPositions {
 }
 
 impl BhPositions {
-    pub fn zeroed(stream: &CudaStream, dims: &ViewDims) -> Result<Self, Error> {
+    pub fn zeroed(stream: &CudaStream, dims: &ViewDims, nslice: usize) -> Result<Self, Error> {
         dims.check()?;
+        if nslice == 0 {
+            return Err(Error::Shape("no object slice".into()));
+        }
         let nframe = dims.nframe as usize;
         Ok(Self {
             dims: *dims,
-            grads: DeviceBuffer::zeroed(stream, 2 * nframe * chunks(dims.n()))?,
+            nslice,
+            grads: DeviceBuffer::zeroed(stream, 2 * nframe * nslice * chunks(dims.n()))?,
             ud: DeviceBuffer::zeroed(stream, 2 * nframe)?,
             prev: DeviceBuffer::zeroed(stream, 2 * nframe)?,
         })
@@ -1170,6 +1177,11 @@ impl BhKernels {
         batch.positions()?;
         let dims = off.check()?;
         let span = span(dims, &batch.frames)?;
+        // A frame's row of partials holds every slice's chunks.
+        let span = BatchSpan {
+            nchunk: span.nchunk * off.bufs.nslice as u32,
+            ..span
+        };
         parts.check(dims)?;
         let dirs = off.dirs(d.v.is_some());
         let b = &off.bufs;
@@ -1395,18 +1407,20 @@ impl BhKernels {
     }
 
     /// Under full-object sampling, the stack's object gradient patches into `patch` and its
-    /// offsets' gradient partials into `off`, from `f` and `win`, the estimate's windows and
-    /// their derivatives over `y` and `x` in blocks 0 to 2: per frame and object mode, `G =
-    /// Σ_p conj(q P_p) r` on the window, which [`crate::gpu::sampling::ObjectSampler::place`]
-    /// adds to the object as [`Kernels::psi_to_obj`] would, and per chunk of [`GAMMA_CHUNK`]
-    /// pixels of each frame the pair [`Self::pos_dots`] sums to `∂F/∂d`; other frames'
-    /// patches and partials are left as they are.
+    /// offsets' gradient partials into `off`, from `f` and `win`, the estimate's windows of
+    /// `slice` and their derivatives over `y` and `x` in blocks 0 to 2: per frame and object
+    /// mode, `G = Σ_p conj(q P_p) r` on the window, which
+    /// [`crate::gpu::sampling::ObjectSampler::place`] adds to the slice as
+    /// [`Kernels::psi_to_obj`] would, and per chunk of [`GAMMA_CHUNK`] pixels of each frame
+    /// the pair [`Self::pos_dots`] sums to `∂F/∂d`, in the slice's own segment of the frame's
+    /// partials; other frames' patches and partials, and other slices' partials, are left as
+    /// they are.
     pub fn win_grad(
         &self,
         ctx: &ExecutionContext,
         stack: StackRef<'_>,
         f: BhWinRef<'_>,
-        win: &DeviceBuffer<C32>,
+        (win, slice): (&DeviceBuffer<C32>, usize),
         patch: &mut DeviceBuffer<C32>,
         off: &mut BhOffsets<'_>,
     ) -> Result<(), Error> {
@@ -1414,6 +1428,10 @@ impl BhKernels {
         let g = dims.geom(stack)?;
         let blk = window_block(dims, &g);
         f.check(dims, &g)?;
+        let nslice = off.bufs.nslice;
+        if slice >= nslice {
+            return Err(Error::Shape(format!("slice {slice} of {nslice}")));
+        }
         check_len("win", win, 3 * blk)?;
         check_len("patch", patch, blk)?;
         let config = chunk_grid(&g, dims.n())?;
@@ -1426,8 +1444,9 @@ impl BhKernels {
         let grads = &off.bufs.grads;
         let writes = [patch.storage(), grads.storage()];
         self.base.launch(ctx, &reads, &writes, |stream| {
-            // SAFETY: lengths checked above; `BhPositions::zeroed` sized `grads` for every
-            // epoch position's chunks; one block of PIXEL_THREADS per chunk and frame.
+            // SAFETY: lengths and the slice checked above; `BhPositions::zeroed` sized `grads`
+            // for every epoch position's chunks of every slice; one block of PIXEL_THREADS per
+            // chunk and frame.
             unsafe {
                 self.module.bh_win_grad(
                     stream,
@@ -1435,7 +1454,11 @@ impl BhKernels {
                     f.ptrs(),
                     dptr(win),
                     dptr(patch),
-                    dptr(grads),
+                    BhPartials {
+                        out: dptr(grads),
+                        slice: slice as u32,
+                        nslice: nslice as u32,
+                    },
                     stack.ctl() as *const StackCtl,
                     g,
                 )
