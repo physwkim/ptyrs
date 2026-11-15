@@ -261,13 +261,13 @@ impl Windows {
     }
 
     /// The derivatives along `y` then `x` of the stack's windows at `at` of object mode 0
-    /// of the slice whose spectra `spectra` holds, into `step`'s slopes.
+    /// of the slice whose spectra `spectra` holds, into `slopes`.
     fn derivatives(
         &self,
         ctx: &ExecutionContext,
         (sampler, spectra): (&mut ObjectSampler, &DeviceBuffer<C32>),
         at: StackPoints<'_>,
-        step: &mut PositionStep,
+        slopes: &mut DeviceBuffer<C32>,
     ) -> Result<(), GpuError> {
         for (block, order) in [[1, 0], [0, 1]].into_iter().enumerate() {
             let block = WindowBlock {
@@ -276,7 +276,7 @@ impl Windows {
                 modes: Modes::First,
                 block: block as u32,
             };
-            sampler.windows(ctx, at, spectra, block, step.slopes_mut())?;
+            sampler.windows(ctx, at, spectra, block, slopes)?;
         }
         Ok(())
     }
@@ -886,14 +886,12 @@ impl<'a> Bufs<'a> {
             )?;
             if let Some(step) = step.as_deref_mut() {
                 // The slopes of the windows the batch started from.
-                w.derivatives(
-                    ctx,
-                    (p.sampler, p.spectra),
-                    points(views, stack, p.pos),
-                    step,
-                )?;
+                let derivatives = |out: &mut _| {
+                    let at = points(views, stack, p.pos);
+                    w.derivatives(ctx, (p.sampler, p.spectra), at, out)
+                };
                 let at = (work, SliceSource::Probe(self.probe));
-                (p.kernels).derivative_sums(ctx, views, stack, at, step)?;
+                (p.kernels).derivative_sums(ctx, views, stack, derivatives, at, step)?;
             }
             let at = points(views, stack, p.pos);
             w.place(ctx, p.sampler, at, work, self.probe, &mut self.obj_sums.num)?;
@@ -1223,18 +1221,16 @@ impl<'a> Bufs<'a> {
                 ok.gap(ctx, d, stack, &sl.gaps[i], dst, true)?;
             }
             if let Some(step) = step.as_deref_mut() {
-                w.derivatives(
-                    ctx,
-                    (p.sampler, p.spectra),
-                    points(views, stack, p.pos),
-                    step,
-                )?;
+                let derivatives = |out: &mut _| {
+                    let at = points(views, stack, p.pos);
+                    w.derivatives(ctx, (p.sampler, p.spectra), at, out)
+                };
                 let c = chi.get(pivot).unwrap_or(&*work);
                 let at = (
                     c,
                     SliceSource::Waves(FrameWaves::Views(&sw.incident[k][pivot - 1])),
                 );
-                (p.kernels).derivative_sums(ctx, views, stack, at, step)?;
+                (p.kernels).derivative_sums(ctx, views, stack, derivatives, at, step)?;
             }
         }
         for i in (1..=last).rev() {

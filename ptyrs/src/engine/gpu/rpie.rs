@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use crate::engine::sampling::Sampling;
-use crate::gpu::sampling::{Modes, WindowBlock, window_views};
+use crate::gpu::sampling::{Modes, StackPoints, WindowBlock, window_views};
 use crate::gpu::{
     C32, EpochOrder, Error as GpuError, FrameWaves, FusedBufs, FusedInputs, Kernels, Model,
     PositionRule, PositionStep, PowerMax, PsiSums, RpieKernels, ShiftProbe, SliceSource, Solve,
@@ -363,12 +363,6 @@ impl<'a> Bufs<'a> {
             block([0, 0], Modes::All, 0),
             &mut w.win,
         )?;
-        if let Some(step) = step.as_deref_mut() {
-            for (axis, order) in (0..).zip([[1, 0], [0, 1]]) {
-                let at = block(order, Modes::First, axis);
-                m.windows_of(ctx, self.views, stack, None, at, step.slopes_mut())?;
-            }
-        }
         l.k.obj_probe_to_psi(ctx, &w.views, stack, &w.win, self.probe, rb.psi)?;
         rb.delta(ctx, l, b)?;
         if params.obj_step.is_some() {
@@ -384,8 +378,20 @@ impl<'a> Bufs<'a> {
         if let Some(step) = step.as_deref_mut() {
             // The slopes of the windows the batch started from, against Δ before the probe
             // step weights it.
+            let points = StackPoints {
+                views: self.views,
+                stack,
+                offsets: s.offsets,
+            };
+            let derivatives = |out: &mut DeviceBuffer<C32>| {
+                for (axis, order) in (0..).zip([[1, 0], [0, 1]]) {
+                    let at = block(order, Modes::First, axis);
+                    s.sampler.windows(ctx, points, s.spectra, at, out)?;
+                }
+                Ok(())
+            };
             let at = (&*rb.dlt, SliceSource::Probe(self.probe));
-            (s.kernels).derivative_sums(ctx, self.views, stack, at, step)?;
+            (s.kernels).derivative_sums(ctx, self.views, stack, derivatives, at, step)?;
         }
         if params.probe_step.is_some() {
             rb.probe_weight(ctx, l, b, (&w.views, &w.win), params.probe_alpha)?;

@@ -222,10 +222,11 @@ fn run(src: Source, quad_phase: f32) -> (Vec<f64>, Vec<f64>) {
         let deriv = noise(2 * NF_MAX * N, seed + 11);
         let (dev_chi, dev_waves) = (up(&stream, &chi), up(&stream, &waves));
         let at = table.at(s);
-        if matches!(src, Source::Waves | Source::Probe) {
-            let slopes = state.slopes_mut();
-            slopes.copy_from_host(&stream, &c32s(&deriv)).unwrap();
-        }
+        // The stack's derivatives, written by the call that reads them.
+        let derivatives = |slopes: &mut DeviceBuffer<C32>| {
+            slopes.copy_from_host(&stream, &c32s(&deriv))?;
+            Ok(())
+        };
         match src {
             Source::Slopes => {
                 let w = FrameWaves::Probes(&dev_waves);
@@ -233,11 +234,11 @@ fn run(src: Source, quad_phase: f32) -> (Vec<f64>, Vec<f64>) {
             }
             Source::Waves => {
                 let w = SliceSource::Waves(FrameWaves::Views(&dev_waves));
-                k.derivative_sums(&ctx, &views, at, (&dev_chi, w), &mut state)
+                k.derivative_sums(&ctx, &views, at, derivatives, (&dev_chi, w), &mut state)
             }
             Source::Probe => {
                 let w = SliceSource::Probe(&dev_probe);
-                k.derivative_sums(&ctx, &views, at, (&dev_chi, w), &mut state)
+                k.derivative_sums(&ctx, &views, at, derivatives, (&dev_chi, w), &mut state)
             }
         }
         .unwrap();

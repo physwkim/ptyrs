@@ -95,11 +95,6 @@ impl PositionStep {
             slopes: DeviceBuffer::zeroed(stream, 2 * nf_max as usize * dims.n())?,
         })
     }
-
-    /// The derivatives [`PositionKernels::derivative_sums`] reads, for the caller to write.
-    pub fn slopes_mut(&mut self) -> &mut DeviceBuffer<C32> {
-        &mut self.slopes
-    }
 }
 
 /// Errors unless state built for `have` serves views of `dims`.
@@ -233,24 +228,25 @@ impl PositionKernels {
     }
 
     /// The position sums of the stack's frames into `step` where each view samples its object
-    /// at its offset and the probe stays put: [`Self::sums`] with the slopes `step`'s as the
-    /// caller wrote them ([`PositionStep::slopes_mut`]), the derivatives along `y` then `x` of
-    /// each frame's sampled window (object mode 0) in the natural layout. `w` is the wave
-    /// entering the slice: with [`SliceSource::Probe`] probe mode 0 times the exit's quadratic
-    /// phase.
+    /// at its offset and the probe stays put: [`Self::sums`] against the slopes `derivatives`
+    /// writes for this stack into `step`'s, the derivatives along `y` then `x` of each
+    /// frame's sampled window (object mode 0) in the natural layout. `w` is the wave entering
+    /// the slice: with [`SliceSource::Probe`] probe mode 0 times the exit's quadratic phase.
     pub fn derivative_sums(
         &self,
         ctx: &ExecutionContext,
         views: &Views,
         stack: StackRef<'_>,
+        derivatives: impl FnOnce(&mut DeviceBuffer<C32>) -> Result<(), Error>,
         (chi, w): (&DeviceBuffer<C32>, SliceSource<'_>),
         step: &mut PositionStep,
     ) -> Result<(), Error> {
         self.check_slopes(views, stack, step)?;
+        derivatives(&mut step.slopes)?;
         self.launch_sums(ctx, views, stack, &step.slopes, (chi, w), &mut step.sums)
     }
 
-    /// Errors unless `step` serves `views` and holds the stack's slopes.
+    /// Errors unless `step` serves `views` and has room for the stack's slopes.
     fn check_slopes(
         &self,
         views: &Views,
