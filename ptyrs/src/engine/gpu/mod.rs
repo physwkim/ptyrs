@@ -366,6 +366,8 @@ impl Streamed {
     /// The shift planes of a [`Kernels::shifted_psi_sums`] from pass `p`: `shift_pre` writes
     /// `T`, `shift_sums` reads it into the adjoint, object planes and power, `shift_post` and
     /// the probe sums take the adjoint, the gather the rest.
+    ///
+    /// [`Kernels::shifted_psi_sums`]: crate::gpu::Kernels::shifted_psi_sums
     fn shifted_psi_sums(dims: &ViewDims, p: u32) -> [Self; 3] {
         let probe = plane_bytes::<C32>(dims, dims.nprobe);
         let obj = plane_bytes::<C32>(dims, dims.nobj) + plane_bytes::<f32>(dims, 1);

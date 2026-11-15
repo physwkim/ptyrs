@@ -3,7 +3,7 @@
 //! object solve's steps, leaving its waves or object part updated, on one GPU or one of a
 //! distributed run's, after which every later call must refuse; or in a read or a build,
 //! which must leave the engine as it was.
-//! [`at`] is a no-op outside `cfg(test)`; a unit test arms one exit with [`arm`] to make it
+//! [`at`] is a no-op outside `cfg(test)`; a unit test arms one exit with `arm` to make it
 //! fail once, so the failure runs through the call's own wrapper.
 
 /// A point [`at`] marks.

@@ -452,7 +452,7 @@ struct ScaleBufs {
 struct BackgroundBufs {
     values: DeviceBuffer<f32>,
     sums: Option<BackgroundSums>,
-    /// A copy of the ring's [`RingDevice::pixel_frames`], final once [`Device::new`] has
+    /// A copy of the ring's [`LlkRing::pixel_frames`], final once [`Device::new`] has
     /// counted every frame.
     nobs: DeviceBuffer<u32>,
     /// `[1]`, written by [`FeaturesMut::background_photons`].
