@@ -169,9 +169,10 @@ struct Grid {
 impl Grid {
     /// The grid over `x`, `[rows, cols]`, for launches that also read `inputs`, once
     /// [`check_elements`] passed every tensor they read or write: `x`, `inputs`, the `[rows, cols]`
-    /// output and the `[cols]` statistics. The `[groups, cols]` partials need no check of their
-    /// own: `groups` is at most `rows`, or 1 over no rows.
-    fn new(x: &CubeTensor, inputs: &[&CubeTensor]) -> Self {
+    /// output and the `[cols]` statistics. None over no channels, where they have nothing to write.
+    /// The `[groups, cols]` partials need no check of their own: `groups` is at most `rows`, or 1
+    /// over no rows.
+    fn new(x: &CubeTensor, inputs: &[&CubeTensor]) -> Option<Self> {
         let [rows, cols] = x.meta.shape().dims();
         let (out, stats) = ([rows, cols], [cols]);
         let shapes: Vec<&[usize]> = [x]
@@ -181,6 +182,9 @@ impl Grid {
             .chain([&out[..], &stats[..]])
             .collect();
         check_elements(&shapes);
+        if cols == 0 {
+            return None;
+        }
         let tx = cols.next_power_of_two().min(32);
         let ty = UNITS / tx;
         let blocks = cols.div_ceil(tx);
@@ -188,7 +192,7 @@ impl Grid {
         // Group 0 writes each channel's statistics and its dγ and dβ, so it exists over no rows.
         let groups = rows.div_ceil(chunk).max(1);
         let cubes = groups * blocks;
-        Self {
+        Some(Self {
             rows,
             cols,
             chunk,
@@ -196,27 +200,41 @@ impl Grid {
             cubes,
             count: grid(&x.client, cubes),
             dim: CubeDim::new_2d(tx as u32, ty as u32),
-        }
+        })
     }
 
-    /// `rows`, `cols`, `chunk`, `groups` and `cubes` as the kernels take them.
+    /// `rows`, `cols`, `chunk`, `groups` and `cubes` as the kernels take them. The `[cols]`
+    /// statistics bound `cols`, and over rows `x` bounds `rows`, `chunk` (at most `rows` or 2048)
+    /// and `cubes` (at most `rows · cols`), or over none `cubes` is `cols`' blocks.
     fn sizes(&self) -> [u32; 5] {
         [self.rows, self.cols, self.chunk, self.groups, self.cubes]
-            .map(|n| u32::try_from(n).expect("a norm_relu activation of fewer than 2³² rows"))
-    }
-
-    fn empty(&self, like: &CubeTensor, shape: impl Into<Shape>) -> CubeTensor {
-        empty_device_contiguous_dtype(
-            like.client.clone(),
-            like.device.clone(),
-            shape.into(),
-            like.dtype,
-        )
+            .map(|n| u32::try_from(n).expect("a norm_relu size below 2³²"))
     }
 }
 
+/// An uninitialised tensor of `shape` on `like`'s device, in its float type.
+fn empty(like: &CubeTensor, shape: impl Into<Shape>) -> CubeTensor {
+    empty_device_contiguous_dtype(
+        like.client.clone(),
+        like.device.clone(),
+        shape.into(),
+        like.dtype,
+    )
+}
+
 fn forward(x: CubeTensor, gamma: CubeTensor, beta: CubeTensor, epsilon: f64) -> Saved {
-    let g = Grid::new(&x, &[&gamma, &beta]);
+    let Some(g) = Grid::new(&x, &[&gamma, &beta]) else {
+        let rows = x.meta.shape()[0];
+        let (y, mean, var) = (empty(&x, [rows, 0]), empty(&x, [0]), empty(&x, [0]));
+        return Saved {
+            x,
+            gamma,
+            y,
+            mean,
+            var,
+            epsilon,
+        };
+    };
     let (x, gamma, beta) = (
         into_contiguous(x),
         into_contiguous(gamma),
@@ -224,11 +242,11 @@ fn forward(x: CubeTensor, gamma: CubeTensor, beta: CubeTensor, epsilon: f64) -> 
     );
     let dtype = dtype_to_storage_type(x.dtype);
     let client = x.client.clone();
-    let sums = g.empty(&x, [g.groups, g.cols]);
-    let squares = g.empty(&x, [g.groups, g.cols]);
-    let y = g.empty(&x, [g.rows, g.cols]);
-    let mean = g.empty(&x, [g.cols]);
-    let var = g.empty(&x, [g.cols]);
+    let sums = empty(&x, [g.groups, g.cols]);
+    let squares = empty(&x, [g.groups, g.cols]);
+    let y = empty(&x, [g.rows, g.cols]);
+    let mean = empty(&x, [g.cols]);
+    let var = empty(&x, [g.cols]);
     let [rows, cols, chunk, groups, cubes] = g.sizes();
     // SAFETY: every index the kernels form is below its tensor's length: rows and channels are
     // masked against `rows` and `cols`, partial rows against `groups`.
@@ -303,7 +321,10 @@ fn backward(
     epsilon: f64,
     dy: CubeTensor,
 ) -> [CubeTensor; 3] {
-    let g = Grid::new(&x, &[&gamma, &y, &mean, &var, &dy]);
+    let Some(g) = Grid::new(&x, &[&gamma, &y, &mean, &var, &dy]) else {
+        let rows = x.meta.shape()[0];
+        return [empty(&x, [rows, 0]), empty(&x, [0]), empty(&x, [0])];
+    };
     let (x, gamma, dy) = (
         into_contiguous(x),
         into_contiguous(gamma),
@@ -311,11 +332,11 @@ fn backward(
     );
     let dtype = dtype_to_storage_type(x.dtype);
     let client = x.client.clone();
-    let shifts = g.empty(&x, [g.groups, g.cols]);
-    let scales = g.empty(&x, [g.groups, g.cols]);
-    let dx = g.empty(&x, [g.rows, g.cols]);
-    let dgamma = g.empty(&x, [g.cols]);
-    let dbeta = g.empty(&x, [g.cols]);
+    let shifts = empty(&x, [g.groups, g.cols]);
+    let scales = empty(&x, [g.groups, g.cols]);
+    let dx = empty(&x, [g.rows, g.cols]);
+    let dgamma = empty(&x, [g.cols]);
+    let dbeta = empty(&x, [g.cols]);
     let [rows, cols, chunk, groups, cubes] = g.sizes();
     let eps = InputScalar::new(epsilon, dtype);
     // SAFETY: as in `forward`; `y`, `mean` and `var` are the packed tensors it wrote.
@@ -813,12 +834,13 @@ mod tests {
     }
 
     /// The kernels at zero sizes: over no rows each channel's mean and variance are 0/0, NaN as
-    /// burn's, and its dγ and dβ zero; over no channels every output is empty. burn's own
-    /// elementwise kernels fail on an empty matrix, so the kernels are called directly.
+    /// burn's, and its dγ and dβ zero; over no channels, even of 2³² rows, every output is empty
+    /// and nothing launches. burn's own elementwise kernels fail on an empty matrix, so the
+    /// kernels are called directly.
     #[test]
     fn kernels_at_zero_sizes() {
         let device = crate::nn::cuda(0);
-        for (rows, cols) in [(0, 8), (8, 0), (0, 0)] {
+        for (rows, cols) in [(0, 8), (8, 0), (0, 0), (1 << 32, 0)] {
             let x = cube([rows, cols], &device);
             let gamma = cube([cols], &device);
             let s = forward(x, gamma, cube([cols], &device), 1e-5);

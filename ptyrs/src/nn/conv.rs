@@ -29,7 +29,7 @@ use burn::tensor::DType;
 use burn_cubecl::CubeBackend;
 use burn_cubecl::cubecl::prelude::CubeDim;
 use burn_cubecl::kernel::into_contiguous;
-use burn_cubecl::ops::numeric::empty_device_contiguous_dtype;
+use burn_cubecl::ops::numeric::{empty_device_contiguous_dtype, zeros_client};
 use burn_cubecl::tensor::CubeTensor;
 
 use crate::nn::grid::{check_elements, grid};
@@ -300,7 +300,8 @@ impl<C: CheckpointStrategy> ConvOps for Autodiff<CubeBackend, C> {
     }
 }
 
-/// A kernel's size argument. Past [`check_elements`] it is below 2³² unless a tensor is empty.
+/// A kernel's size argument. Each launch site checks its tensors, returns before launching if it
+/// has nothing to write, and so passes only sizes its nonempty tensors bound below 2³².
 fn u(v: usize) -> u32 {
     u32::try_from(v).expect("a convolution size below 2³²")
 }
@@ -335,24 +336,39 @@ fn weight_grad(x: CubeTensor, dy: CubeTensor, bias: bool) -> (CubeTensor, Option
     );
     // `dw` and `db`, checked before their counts are multiplied out.
     check_elements(&[x.meta.shape(), dy.meta.shape(), &[co, ci, 9], &[co]]);
+    let lw = co * ci * 9;
+    let len = lw + if bias { co } else { 0 };
+    let client = x.client.clone();
+    let (device, float) = (x.device.clone(), x.dtype);
+    let empty =
+        |shape: Shape| empty_device_contiguous_dtype(client.clone(), device.clone(), shape, float);
+    if len == 0 {
+        return (
+            empty([co, ci, 3, 3].into()),
+            bias.then(|| empty([co].into())),
+        );
+    }
+    if n == 0 || h == 0 || w == 0 {
+        let zeros = |shape: Shape| zeros_client(client.clone(), device.clone(), shape, float);
+        return (
+            zeros([co, ci, 3, 3].into()),
+            bias.then(|| zeros([co].into())),
+        );
+    }
+    // Past here `len` ≥ 1 needs `co` ≥ 1, so `dy` bounds `n`, `h`, `w` and `co`, and `[co, ci, 9]`
+    // bounds `ci`; `across · down` is at most `len`, so `[bands, len]` bounds the rest.
     // The cubes of `a = 0` sum the bias gradient, so they are there even for no input channels.
     let (across, down) = (ci.div_ceil(LANES).max(1), co.div_ceil(PER * WARPS));
     let strips = w.div_ceil(LANES);
-    // A band holds at least one row; no pixels make no bands, and no output channels no cubes.
-    let split = (CUBES / (across * down * n * strips).max(1)).clamp(1, h.max(1));
-    let rows = h.div_ceil(split).max(1);
+    // A band holds at least one row.
+    let split = (CUBES / (across * down * n * strips)).clamp(1, h);
+    let rows = h.div_ceil(split);
     let blocks = h.div_ceil(rows);
     let bands = n * blocks * strips;
     let cubes = across * bands * down;
-    let lw = co * ci * 9;
-    let len = lw + if bias { co } else { 0 };
     check_elements(&[&[bands, len]]);
     let (x, dy) = (into_contiguous(x), into_contiguous(dy));
-    let dtype = dtype_to_storage_type(x.dtype);
-    let client = x.client.clone();
-    let empty = |shape: Shape| {
-        empty_device_contiguous_dtype(client.clone(), x.device.clone(), shape, x.dtype)
-    };
+    let dtype = dtype_to_storage_type(float);
     let parts = empty([bands, len].into());
     let dw = empty([co, ci, 3, 3].into());
     let db = bias.then(|| empty([co].into()));
@@ -422,12 +438,6 @@ fn conv3x3(x: CubeTensor, wk: CubeTensor, bias: Option<CubeTensor>) -> CubeTenso
     // `wk` is `arrange`'s, which checked it.
     let bias_shape = bias.as_ref().map_or(&[][..], |t| &t.meta.shape()[..]);
     check_elements(&[x.meta.shape(), bias_shape, &[n, h, w, b]]);
-    let x = into_contiguous(x);
-    let groups = b.div_ceil(PER).next_power_of_two().min(GROUPS);
-    let chunk = groups.min(32 / x.dtype.size());
-    let (across, down) = (w.div_ceil(COLS), h.div_ceil(ROWS));
-    let tiles = n * down * across;
-    let cubes = tiles * b.div_ceil(PER * groups);
     let client = x.client.clone();
     let y = empty_device_contiguous_dtype(
         client.clone(),
@@ -435,6 +445,16 @@ fn conv3x3(x: CubeTensor, wk: CubeTensor, bias: Option<CubeTensor>) -> CubeTenso
         [n, h, w, b].into(),
         x.dtype,
     );
+    // Past here `y` bounds `h`, `w`, `b`, `tiles` and `cubes`, and `x` bounds `a`.
+    if [n, h, w, b].contains(&0) {
+        return y;
+    }
+    let x = into_contiguous(x);
+    let groups = b.div_ceil(PER).next_power_of_two().min(GROUPS);
+    let chunk = groups.min(32 / x.dtype.size());
+    let (across, down) = (w.div_ceil(COLS), h.div_ceil(ROWS));
+    let tiles = n * down * across;
+    let cubes = tiles * b.div_ceil(PER * groups);
     let dtype = dtype_to_storage_type(x.dtype);
     // SAFETY: every index the kernel forms is below its tensor's length: halo pixels are masked
     // against the image, channels against `a` and `b`, and stores against the image and `b`.
@@ -471,7 +491,6 @@ fn conv3x3(x: CubeTensor, wk: CubeTensor, bias: Option<CubeTensor>) -> CubeTenso
 fn arrange(weight: CubeTensor, flip: bool) -> CubeTensor {
     let [co, ci, _, _] = weight.meta.shape().dims();
     check_elements(&[weight.meta.shape(), &[co, ci, 9]]);
-    let weight = into_contiguous(weight);
     let shape = if flip { [co, 9, ci] } else { [ci, 9, co] };
     let client = weight.client.clone();
     let wk = empty_device_contiguous_dtype(
@@ -481,6 +500,10 @@ fn arrange(weight: CubeTensor, flip: bool) -> CubeTensor {
         weight.dtype,
     );
     let len = co * ci * 9;
+    if len == 0 {
+        return wk;
+    }
+    let weight = into_contiguous(weight);
     let dtype = dtype_to_storage_type(weight.dtype);
     // SAFETY: the kernel reads and writes element `i < len` of tensors of `len` elements.
     unsafe {
@@ -1203,6 +1226,7 @@ mod tests {
         };
         for [n, h, w, ci, co] in [
             [0, 5, 6, 2, 3],
+            [0, 5, 6, 0, 3],
             [2, 0, 6, 2, 3],
             [2, 5, 0, 2, 3],
             [2, 5, 6, 0, 3],
@@ -1232,6 +1256,30 @@ mod tests {
         Tensor::<D>::empty(shape, (&crate::nn::cuda(0), DType::F32))
             .try_into_primitive::<CubeBackend>()
             .unwrap()
+    }
+
+    /// A launch with nothing to write does not launch, so an empty tensor with a dimension of 2³²
+    /// or more passes no size of 2³² to a kernel.
+    #[test]
+    fn empty_launches_past_2_32() {
+        let big = 1 << 32;
+        let shape = |t: &CubeTensor| t.meta.shape().to_vec();
+        let y = forward(empty([0, big, 1, 1]), broadcast([1, 1, 3, 3]), None);
+        assert_eq!(shape(&y), [0, big, 1, 1]);
+        assert_eq!(shape(&arrange(empty([0, big, 3, 3]), false)), [big, 9, 0]);
+        // No pixels: zero gradients.
+        let (dw, db) = weight_grad(empty([0, big, 1, 1]), empty([0, big, 1, 1]), true);
+        let (dw, db) = (Tensor::<4>::from_primitive::<CubeBackend>(dw), db.unwrap());
+        assert_eq!(dw.dims(), [1, 1, 3, 3]);
+        assert_eq!(host(dw), vec![0.0; 9]);
+        assert_eq!(host(Tensor::<1>::from_primitive::<CubeBackend>(db)), [0.0]);
+        // No channels over 2³⁴ bands: empty gradients.
+        let side = [1 << 9, 1 << 9, 1 << 21, 0];
+        let (dw, db) = weight_grad(empty(side), empty(side), true);
+        assert_eq!(
+            (shape(&dw), shape(&db.unwrap())),
+            (vec![0, 0, 3, 3], vec![0])
+        );
     }
 
     #[test]
