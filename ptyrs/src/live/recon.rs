@@ -35,6 +35,7 @@ use crate::gpu::{
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{DeviceBuffer, Stream};
 
+use crate::fault;
 use crate::live::fill::Fill;
 use crate::live::graph::LiveGraph;
 use crate::live::grow::GrowError;
@@ -228,6 +229,7 @@ impl LiveAp {
         };
         let landed = self.scan.landed();
         let ctx = ExecutionContext::new(self.scan.stream().clone());
+        fault::at(fault::Exit::LiveCount)?;
         l.bufs
             .ring
             .device()
@@ -834,8 +836,9 @@ mod tests {
     }
 
     /// Two runs of 36 frames in 3 stacks of 16, swept 2 stacks a replay,
-    /// with every frame landed: the object and LLK of each must match.
-    fn twin_runs(p: &Ptycho) -> [LiveAp; 2] {
+    /// with the first `landed` frames landed: the object and LLK of each
+    /// must match.
+    fn twin_runs(p: &Ptycho, landed: usize) -> [LiveAp; 2] {
         let (views, shape, _) = planned(p);
         let ctx = Context::new(0).expect("GPU 0");
         [(); 2].map(|_| {
@@ -843,7 +846,7 @@ mod tests {
             let dev = DeviceBuffer::from_host(&st, &frames(p)).unwrap();
             let mut live = LiveAp::new(&st, &config(shape, 16), &probe(p), dev, true).unwrap();
             live.backer().back(&views).unwrap();
-            assert_eq!(live.push(&views).unwrap(), p.points() as u32);
+            assert_eq!(live.push(&views[..2 * landed]).unwrap(), landed as u32);
             live
         })
     }
@@ -867,12 +870,13 @@ mod tests {
 
     /// An epoch that fails after the first of its two sweep replays, every
     /// frame binned and counted, restarts: the retry discards the sums and
-    /// sweep cursor it left, and its begun LLK record, so two epochs after it are a clean run's two,
-    /// numbered from 0, and the failed one counts no epoch.
+    /// sweep cursor it left, and its begun LLK record, so two epochs after
+    /// it are a clean run's two, numbered from 0, and the failed one counts
+    /// no epoch.
     #[test]
     fn an_epoch_failed_mid_sweep_restarts() {
         let p = sim(64, 6, 36, 8.0);
-        let [mut failed, mut clean] = twin_runs(&p);
+        let [mut failed, mut clean] = twin_runs(&p, p.points());
         failed.bin().unwrap();
         failed.count().unwrap();
         let e = failed.sweep_and_update(|sweep| {
@@ -895,10 +899,131 @@ mod tests {
     #[test]
     fn frames_binned_but_not_counted_are_counted_next() {
         let p = sim(64, 6, 36, 8.0);
-        let [mut failed, mut clean] = twin_runs(&p);
+        let [mut failed, mut clean] = twin_runs(&p, p.points());
         failed.bin().unwrap();
         for live in [&mut failed, &mut clean] {
             live.epoch().unwrap();
+        }
+        same_runs(&mut failed, &mut clean);
+    }
+
+    /// An epoch whose count is refused counts no epoch and leaves its
+    /// frames uncounted, so the next epoch counts them and reads their LLK
+    /// as a clean run's.
+    #[test]
+    fn an_epoch_whose_count_failed_counts_its_frames_next() {
+        let p = sim(64, 6, 36, 8.0);
+        let [mut failed, mut clean] = twin_runs(&p, p.points());
+        let armed = fault::arm(fault::Exit::LiveCount, 0);
+        let e = failed.epoch();
+        assert!(armed.fired());
+        drop(armed);
+        let refused = matches!(
+            &e,
+            Err(GrowError::Gpu(crate::gpu::Error::Driver(d))) if *d == fault::REFUSAL
+        );
+        assert!(refused, "{e:?}");
+        assert_eq!(failed.epochs(), 0);
+        for live in [&mut failed, &mut clean] {
+            for _ in 0..2 {
+                live.epoch().unwrap();
+            }
+        }
+        same_runs(&mut failed, &mut clean);
+    }
+
+    /// A [`LiveAp::sweep_and_update`] that fails after `sweeps` sweep
+    /// replays.
+    fn fail_after(live: &mut LiveAp, sweeps: u32) {
+        let e = live.sweep_and_update(|sweep| {
+            (0..sweeps).try_for_each(|_| sweep.replay())?;
+            Err(GrowError::Failed)
+        });
+        assert!(matches!(e, Err(GrowError::Failed)), "{e:?}");
+    }
+
+    /// Epochs failing in a row, one before any sweep replay and two after
+    /// one, each void their begun record: an LLK read after them returns
+    /// none, and two epochs after them are a clean run's two.
+    #[test]
+    fn epochs_failed_in_a_row_leave_no_record() {
+        let p = sim(64, 6, 36, 8.0);
+        let [mut failed, mut clean] = twin_runs(&p, p.points());
+        failed.bin().unwrap();
+        failed.count().unwrap();
+        for sweeps in [0, 1, 1] {
+            fail_after(&mut failed, sweeps);
+        }
+        let read = failed.llk().unwrap().unwrap();
+        assert!(read.is_empty(), "{read:?}");
+        assert_eq!(failed.epochs(), 0);
+        for live in [&mut failed, &mut clean] {
+            for _ in 0..2 {
+                live.epoch().unwrap();
+            }
+        }
+        same_runs(&mut failed, &mut clean);
+    }
+
+    /// An epoch that fails after both its sweep replays, as one whose
+    /// update replay is refused does, restarts as one failed mid-sweep.
+    #[test]
+    fn an_epoch_failed_after_its_sweeps_restarts() {
+        let p = sim(64, 6, 36, 8.0);
+        let [mut failed, mut clean] = twin_runs(&p, p.points());
+        failed.bin().unwrap();
+        failed.count().unwrap();
+        fail_after(&mut failed, 2);
+        assert_eq!(failed.epochs(), 0);
+        for live in [&mut failed, &mut clean] {
+            for _ in 0..2 {
+                live.epoch().unwrap();
+            }
+        }
+        same_runs(&mut failed, &mut clean);
+    }
+
+    /// More failed epochs than the ring has slots, so batches of void
+    /// records alone are copied and the records after them reuse slots the
+    /// voids left part pushed: the epochs after them are a clean run's, and
+    /// so is one after a read.
+    #[test]
+    fn void_records_past_the_ring_are_skipped() {
+        let p = sim(64, 6, 36, 8.0);
+        let [mut failed, mut clean] = twin_runs(&p, p.points());
+        failed.bin().unwrap();
+        failed.count().unwrap();
+        for k in 0..2 * LLK_SLOTS + 3 {
+            fail_after(&mut failed, k % 3);
+        }
+        for live in [&mut failed, &mut clean] {
+            for _ in 0..2 {
+                live.epoch().unwrap();
+            }
+        }
+        same_runs(&mut failed, &mut clean);
+        for live in [&mut failed, &mut clean] {
+            live.epoch().unwrap();
+        }
+        same_runs(&mut failed, &mut clean);
+    }
+
+    /// An epoch that fails after sweeping the first 20 frames, retried once
+    /// 16 more have landed, records all 36 as a clean run's.
+    #[test]
+    fn an_epoch_retried_over_more_frames_records_them_all() {
+        let p = sim(64, 6, 36, 8.0);
+        let (views, ..) = planned(&p);
+        let [mut failed, mut clean] = twin_runs(&p, 20);
+        failed.bin().unwrap();
+        failed.count().unwrap();
+        // 20 frames are 2 stacks, one sweep replay.
+        fail_after(&mut failed, 1);
+        for live in [&mut failed, &mut clean] {
+            assert_eq!(live.push(&views[2 * 20..]).unwrap(), 16);
+            for _ in 0..2 {
+                live.epoch().unwrap();
+            }
         }
         same_runs(&mut failed, &mut clean);
     }
