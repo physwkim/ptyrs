@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{Context, DeviceBuffer, Event};
 
+use crate::fault;
 use crate::gpu::{
     C32, Ended, FrameLlk, FusedBufs, Kernels, LlkPartial, LlkRing, LlkTotals, RingError, ViewAddr,
 };
@@ -397,6 +398,7 @@ impl State {
             Some(l) => l.ring.replay(&ctx, &l.ended, epoch, landed, launch)?,
             None => launch()?,
         }
+        fault::at(fault::Exit::DistFence)?;
         Ok(self.fence[(epoch % 2) as usize].record(&stream)?)
     }
 
@@ -1240,6 +1242,34 @@ mod tests {
             }
             assert_eq!((ap.lost(), ap.closed()), (0, None));
         }
+    }
+
+    /// An epoch failing on one GPU after its record's replay, before its fence event, returns
+    /// that GPU's error, with no wait on the other and no fence mismatch, and the run refuses
+    /// every later call, as the GPUs may disagree. Two regions on one GPU, so the one-GPU
+    /// suite runs it.
+    #[test]
+    fn an_epoch_failing_after_its_record_aborts_the_run() {
+        let ctx = Context::new(0).expect("GPU 0");
+        let c = case(&sim(ScanPath::Raster { cols: 12 }, 240));
+        let planned = &c.views[..c.planned * c.cfg.shape.nmode as usize];
+        let mut ap =
+            DistLiveAp::new(&[0, 0], &c.cfg, planned, Scheme::Strips, &c.probe, true).unwrap();
+        let feed = Feed::new(&ctx, &c, &ap).land(&c, &(0..c.planned));
+        assert_eq!(ap.push(planned).unwrap() as usize, c.planned);
+        ap.epoch().unwrap();
+        let armed = fault::arm(fault::Exit::DistFence, 0);
+        let r = ap.epoch();
+        assert!(armed.fired());
+        drop(armed);
+        assert!(
+            matches!(r, Err(DistError::Gpu(crate::gpu::Error::Driver(d))) if d == fault::REFUSAL),
+            "{r:?}"
+        );
+        assert!(matches!(ap.epoch(), Err(DistError::Aborted)));
+        assert!(matches!(ap.llk(), Err(DistError::Aborted)));
+        assert!(matches!(ap.object(), Err(DistError::Aborted)));
+        feed.finish();
     }
 
     #[test]

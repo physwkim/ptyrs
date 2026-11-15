@@ -3,11 +3,10 @@
 //! record of the first frames reads only those; a record with a frame not written for it is
 //! a stamp error, and one with a frame never counted is an uncounted error. A record counts
 //! exactly when its advance is enqueued, eagerly or by a graph's replay: a call that fails
-//! before it counts nothing and its number is voided, so a retry reads only its own frames;
-//! one that fails after it keeps its record, so a retry shows it twice. A poll returns the
-//! records whose copies have completed without waiting for the rest. Each detector pixel's
-//! frame count holds the counted frames unmasked there, each once, in any layout and order of
-//! counted ranges.
+//! before it counts nothing and its number is voided, so a retry reads only its own frames.
+//! A poll returns the records whose copies have completed without waiting for the rest. Each
+//! detector pixel's frame count holds the counted frames unmasked there, each once, in any
+//! layout and order of counted ranges.
 
 use std::ffi::c_void;
 use std::sync::Arc;
@@ -472,27 +471,6 @@ fn a_call_failing_before_its_advance_counts_nothing() {
     };
     f.enqueue(3, &[skip]);
     assert_eq!(stamp(f.flush().unwrap_err()), (5, 8, 1));
-}
-
-/// A call that fails after its advance is enqueued keeps its record under its tag, so the
-/// retry under the same tag shows the cycle twice, each with its own totals: an eager end and
-/// a replay.
-#[test]
-fn a_call_failing_after_its_advance_keeps_its_record() {
-    let mut f = fixture(4);
-    let failed_call = |f: &mut Fixture, r: usize| -> Result<(), RingError> {
-        f.enqueue(r, &[WHOLE]);
-        Err(Error::ContextMismatch.into())
-    };
-    assert!(failed_call(&mut f, 0).is_err());
-    f.enqueue(0, &[WHOLE]);
-    check_whole(&f.flush().unwrap(), [0, 0]);
-
-    let (graph, _staged, ended) = f.capture(1);
-    for _ in 0..2 {
-        f.replay(&graph, &ended, 1);
-    }
-    check_whole(&f.flush().unwrap(), [1, 1]);
 }
 
 /// A record begun and dropped unended leaves frames stamped with its number, which the next

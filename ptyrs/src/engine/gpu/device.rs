@@ -3487,14 +3487,18 @@ impl<'a> Bufs<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cuda_async::error::DeviceError;
+
     use crate::base::required_obj_shape;
     use crate::base::{C64, Counts, Geometry, Object, Positions, Probe, Scan, Stack};
-    use crate::engine::{Backend, GpuPtycho, Params, Step};
+    use crate::engine::{Backend, Feature, Features, GpuPtycho, MlParams, Params, Step};
+    use crate::fault::{self, Exit};
     use crate::live::farfield::{Ptycho, PtychoSpec, ScanPath};
 
-    /// An engine on a simulated 32-pixel raster of 36 points, its object flat.
-    fn engine(ctx: &Arc<CudaContext>, graph: bool) -> GpuPtycho {
-        let n = 32;
+    /// An engine on a simulated raster of 36 points, its object flat: 32-pixel frames, or the
+    /// fused passes' smallest, 64.
+    fn engine(ctx: &Arc<CudaContext>, graph: bool, fused: bool) -> GpuPtycho {
+        let n = if fused { 64 } else { 32 };
         let p = Ptycho::new(PtychoSpec {
             n,
             path: ScanPath::Raster { cols: 6 },
@@ -3525,7 +3529,7 @@ mod tests {
             stack_size: Some(8),
             graph,
             llk_slots: 4,
-            fused: false,
+            fused,
             psi_f16: false,
         };
         GpuPtycho::new(ctx, &scan, object, probe, options).unwrap()
@@ -3547,7 +3551,7 @@ mod tests {
             count: 2,
         };
         for graph in [false, true] {
-            let [mut failed, mut clean] = [(); 2].map(|()| engine(&ctx, graph));
+            let [mut failed, mut clean] = [(); 2].map(|()| engine(&ctx, graph, false));
             let r = failed.dev.summing(|dev| {
                 for sums in [&mut dev.obj_sums, &mut dev.probe_sums] {
                     let num = vec![C32 { re: 1.0, im: 1.0 }; sums.num.len()];
@@ -3571,6 +3575,98 @@ mod tests {
             let (f, c) = (bits(&failed), bits(&clean));
             assert_eq!(f.1.len(), 2, "{graph}");
             assert!(f == c, "graph {graph}: the retry differs from a clean run");
+        }
+    }
+
+    /// A call failing at an exit after its record's advance keeps that record under its
+    /// cycle's tag, and its retry records the cycle again: AP's cycle before and after its
+    /// update sums are applied, ML's gradient pass and the features' step. The failed
+    /// engine's history is the failed record, then those of an engine that applied what the
+    /// failed call did (the cycle after its sums are applied; ML's photon scaling, which every
+    /// ML call starts with) and ran the retry, whose arrays it ends with bit for bit. Under
+    /// graphs the exits run only in the capture, which fails and counts nothing.
+    #[test]
+    fn a_call_failing_after_its_advance_keeps_its_record() {
+        let ctx = CudaContext::new(0).expect("GPU 0");
+        let ap = ApParams {
+            obj_inertia: Some(0.01),
+            probe_inertia: Some(0.01),
+            calc_llk: 1,
+            zero_phase_ramp: false,
+        };
+        let ml = MlParams {
+            update_object: true,
+            update_probe: true,
+            calc_llk: 1,
+            zero_phase_ramp: false,
+        };
+        let background = Features {
+            background: Some(Feature::refined(vec![1.0; 64 * 64])),
+            ..Features::default()
+        };
+        let run = |e: &mut GpuPtycho, exit: Exit, ncycle: usize| match exit {
+            Exit::MlGrad => e.ml(&ml, ncycle),
+            _ => e.ap(&ap, ncycle),
+        };
+        let bits = |e: &GpuPtycho| {
+            let (o, p) = (e.object().unwrap(), e.probe().unwrap());
+            let px = o.as_slice().iter().chain(p.as_slice());
+            px.flat_map(|c| [c.re.to_bits(), c.im.to_bits()])
+                .collect::<Vec<_>>()
+        };
+        let llk = |e: &GpuPtycho| -> Vec<u64> {
+            let h = e.history().iter();
+            h.map(|r| r.llk.poisson.to_bits()).collect()
+        };
+        for exit in [Exit::ApSums, Exit::ApPositions, Exit::MlGrad, Exit::Feature] {
+            for graph in [false, true] {
+                let what = format!("{exit:?}, graph {graph}");
+                let [mut failed, mut clean, mut first] = [(); 3].map(|()| {
+                    // The features step only in the fused passes.
+                    let mut e = engine(&ctx, graph, exit == Exit::Feature);
+                    if exit == Exit::Feature {
+                        e.set_features(&background).unwrap();
+                    }
+                    e
+                });
+                let armed = fault::arm(exit, 0);
+                let r = run(&mut failed, exit, 2);
+                assert!(armed.fired(), "{what}");
+                // A capture returns its closure's error as the device operation's.
+                let refused = match &r {
+                    Err(EngineError::Gpu(
+                        GpuError::Driver(d) | GpuError::Device(DeviceError::Driver(d)),
+                    )) => *d == fault::REFUSAL,
+                    _ => false,
+                };
+                assert!(refused, "{what}: {r:?}");
+                drop(armed);
+                run(&mut failed, exit, 2).unwrap();
+
+                // The cycles the failed call applied, each recording, as a call of its own.
+                let applied = match exit {
+                    Exit::ApPositions if !graph => Some(1),
+                    Exit::MlGrad => Some(0),
+                    _ => None,
+                };
+                if let Some(n) = applied {
+                    run(&mut clean, exit, n).unwrap();
+                }
+                run(&mut clean, exit, 2).unwrap();
+                let mut want = llk(&clean).split_off(applied.unwrap_or(0));
+                if !graph {
+                    run(&mut first, exit, 1).unwrap();
+                    want.insert(0, llk(&first)[0]);
+                }
+                let tags: Vec<usize> = failed.history().iter().map(|r| r.cycle).collect();
+                assert_eq!(
+                    tags,
+                    if graph { vec![0, 1] } else { vec![0, 0, 1] },
+                    "{what}"
+                );
+                assert_eq!(llk(&failed), want, "{what}: LLK");
+                assert!(bits(&failed) == bits(&clean), "{what}: the arrays");
+            }
         }
     }
 }

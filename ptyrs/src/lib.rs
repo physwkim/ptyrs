@@ -4,6 +4,7 @@
 pub mod base;
 pub mod dist;
 pub mod engine;
+mod fault;
 pub mod fft;
 pub mod gpu;
 pub mod io;

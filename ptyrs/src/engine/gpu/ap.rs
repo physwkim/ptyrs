@@ -9,6 +9,7 @@ use super::device::{OneSlice, PassesMut, Sample};
 use super::{Bufs, Epoch, GpuPtycho, Tag};
 use crate::engine::ptycho::llk_due;
 use crate::engine::{ApParams, EngineError};
+use crate::fault;
 
 impl GpuPtycho {
     /// [`crate::engine::Ptycho::ap`]: per stack, exit waves of the current estimate, projection (the
@@ -78,7 +79,9 @@ impl Bufs<'_> {
         if let Some(w) = llk {
             w.end(ctx)?;
         }
+        fault::at(fault::Exit::ApSums)?;
         self.apply_sums(ctx, o, p)?;
+        fault::at(fault::Exit::ApPositions)?;
         self.features.position_step(ctx, self.grad)?;
         Ok(())
     }

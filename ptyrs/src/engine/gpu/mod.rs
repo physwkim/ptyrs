@@ -36,6 +36,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use crate::base::{AddrTable, C64, Object, Probe, Scan, Stack};
+use crate::fault;
 use crate::fft::Plan2d;
 use crate::gpu::{
     C32, CG_BLOCKS, Error as GpuError, FarSums, FusedBufs, FusedInputs, Model, ObjProbeScale,
@@ -916,6 +917,7 @@ impl Bufs<'_> {
         if let Some(w) = llk {
             w.end(ctx)?;
         }
+        fault::at(fault::Exit::Feature)?;
         self.features.step(ctx, self.kernels, self.grad)?;
         Ok(())
     }

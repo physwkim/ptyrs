@@ -21,6 +21,7 @@ use super::propagate::Propagate;
 use super::{Bufs, Cut, Epoch, GpuPtycho, Tag, plane_len};
 use crate::engine::ptycho::llk_due;
 use crate::engine::{EngineError, MlParams};
+use crate::fault;
 
 impl GpuPtycho {
     /// [`crate::engine::Ptycho::ml`]: [`crate::engine::Ptycho::scale_obj_probe`] once, then per cycle the
@@ -397,7 +398,7 @@ impl Bufs<'_> {
         if let Some(w) = llk {
             w.end(ctx)?;
         }
-        Ok(())
+        fault::at(fault::Exit::MlGrad)
     }
 
     /// The stacks of [`Self::ml_grad`] by one fused pass each; with a position, the shifted
