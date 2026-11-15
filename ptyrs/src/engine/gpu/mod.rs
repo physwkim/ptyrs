@@ -58,7 +58,9 @@ use crate::engine::{
 pub struct GpuOptions {
     /// At most this many frames per stack for every pass but rPIE's, whose batches are its own:
     /// each pass cuts the scan, BH and LSQML each batch, into as few stacks as that takes, of
-    /// lengths within a frame of each other; PyNX's default is 16. `None`, the default, cuts each
+    /// lengths within a frame of each other; PyNX's default is 16. [`GpuPtycho::new`] refuses a
+    /// size whose stack, or the scan if it has fewer frames, holds more exit-wave values than
+    /// u32 indexes. `None`, the default, cuts each
     /// pass by bytes instead: as many frames as fill 3/8 of the device's L2, the fastest share at
     /// frame sides 256 and 512, with the most bytes that the launches over a stack leave in L2
     /// for later ones at any one point, but no fewer than keep the device's threads busy, ~3.4
@@ -280,19 +282,22 @@ fn table_of(
         dims,
         &ranges.iter().map(|(r, _)| r.clone()).collect::<Vec<_>>(),
     )?;
-    let nmode = dims.nmode as usize;
     let frames = ranges
         .into_iter()
         .map(|(range, plan)| {
-            let len = (range.end - range.start) as usize * nmode * plane_len(dims);
             Ok(Frames {
+                len: stack_len(dims, (range.end - range.start) as usize)?,
                 range,
                 plan,
-                len: to_u32("stack length", len)?,
             })
         })
         .collect::<Result<Vec<_>, EngineError>>()?;
     Ok((frames, table))
+}
+
+/// The values of a stack of `nf` frames' exit waves.
+fn stack_len(dims: &ViewDims, nf: usize) -> Result<u32, EngineError> {
+    to_u32("stack length", nf * dims.nmode as usize * plane_len(dims))
 }
 
 /// A buffer of a loop over stacks: its bytes per frame, its bytes whatever the stack's frames,
@@ -378,6 +383,9 @@ struct StackRule {
     budget: usize,
     /// The fewest frames per stack that keep the device's threads busy.
     floor: usize,
+    /// The most frames per stack: the scan's, at most those whose exit waves [`stack_len`]
+    /// indexes.
+    most: u32,
 }
 
 impl StackRule {
@@ -385,25 +393,35 @@ impl StackRule {
     fn on(size: Option<usize>, ctx: &CudaContext, dims: &ViewDims) -> Result<Self, EngineError> {
         let sms = ctx.multiprocessor_count()? as usize;
         let threads = sms * ctx.max_threads_per_multiprocessor()? as usize;
-        Ok(Self::new(size, ctx.l2_cache_size_bytes()?, threads, dims))
+        Self::new(size, ctx.l2_cache_size_bytes()?, threads, dims)
     }
 
     /// For `size` on a device of an `l2`-byte L2 and `threads` resident threads, and frames of
-    /// `dims`. The floor holds ~3.4 pixels per thread, where the measured fastest stacks begin:
-    /// 2^19 pixels on 100 SMs of 1536 threads, 32, 8 and 2 frames at 128x128, 256x256 and
-    /// 512x512.
-    fn new(size: Option<usize>, l2: usize, threads: usize, dims: &ViewDims) -> Self {
-        Self {
+    /// `dims`; refused if a stack of `size` frames, or of one, fewer if the scan has fewer,
+    /// overflows [`stack_len`], so no stack a call cuts by it does. The floor holds ~3.4 pixels
+    /// per thread, where the measured fastest stacks begin: 2^19 pixels on 100 SMs of 1536
+    /// threads, 32, 8 and 2 frames at 128x128, 256x256 and 512x512.
+    fn new(
+        size: Option<usize>,
+        l2: usize,
+        threads: usize,
+        dims: &ViewDims,
+    ) -> Result<Self, EngineError> {
+        let nframe = dims.nframe as usize;
+        stack_len(dims, size.unwrap_or(1).min(nframe))?;
+        let fits = u32::MAX as usize / (dims.nmode as usize * plane_len(dims));
+        Ok(Self {
             size,
             budget: l2 / 8 * 3,
             floor: (threads * 17 / 5).div_ceil(dims.n()),
-        }
+            most: dims.nframe.min(fits as u32),
+        })
     }
 
     /// Frames per stack of a loop over `bufs`: the given size, else the most that fit the
     /// budget beside the fixed bytes at every boundary where frames' bytes are live, at least
-    /// the floor.
-    fn frames(self, bufs: &[Streamed]) -> Result<u32, EngineError> {
+    /// the floor; at most [`Self::most`].
+    fn frames(self, bufs: &[Streamed]) -> u32 {
         // What is live after a pass is live after the latest first pass up to it, a set that
         // bounds the frames at least as tightly, so the first passes suffice.
         let fit = (bufs.iter().map(|b| b.first))
@@ -416,7 +434,7 @@ impl StackRule {
             .min()
             .unwrap_or(self.budget);
         let n = self.size.unwrap_or_else(|| fit.max(self.floor));
-        to_u32("stack_size", n)
+        n.min(self.most as usize) as u32
     }
 
     /// `0 .. nframe` in stacks of at most [`Self::frames`] for `bufs`.
@@ -426,7 +444,7 @@ impl StackRule {
         dims: &ViewDims,
         bufs: &[Streamed],
     ) -> Result<Cut, EngineError> {
-        Ok(batch_stacks(stream, dims, dims.nframe, self.frames(bufs)?)?.0)
+        Ok(batch_stacks(stream, dims, dims.nframe, self.frames(bufs))?.0)
     }
 }
 
@@ -1081,18 +1099,18 @@ mod tests {
                 .iter()
                 .map(|(b, p)| Streamed::new(*b, p.clone()))
                 .collect();
-            rule.frames(&bufs).unwrap()
+            rule.frames(&bufs)
         };
         for (side, want) in [(256, [24, 12, 8, 6]), (512, [6, 3, 2, 1])] {
             let (rule, wave) = (
-                StackRule::new(None, L2, 1, &dims(side)),
+                StackRule::new(None, L2, 1, &dims(side)).unwrap(),
                 wave_bytes(&dims(side)),
             );
             let k_sets = |k| frames(rule, &vec![(wave, 0..=1); k]);
             assert_eq!([1, 2, 3, 4].map(k_sets), want);
         }
         let (rule, wave) = (
-            StackRule::new(None, L2, 1, &dims(256)),
+            StackRule::new(None, L2, 1, &dims(256)).unwrap(),
             wave_bytes(&dims(256)),
         );
         assert_eq!(frames(rule, &[(wave, 0..=2), (wave, 1..=1)]), 24);
@@ -1101,17 +1119,17 @@ mod tests {
         assert_eq!(frames(rule, &[(wave, 0..=1), (wave / 2, 0..=1)]), 16);
         let big = [(wave_bytes(&dims(512)), 0..=1)];
         assert_eq!(
-            frames(StackRule::new(None, 4 << 20, 1, &dims(512)), &big),
+            frames(StackRule::new(None, 4 << 20, 1, &dims(512)).unwrap(), &big),
             1
         );
         let floored = [128, 256, 512].map(|side| {
-            let rule = StackRule::new(None, L2, 153600, &dims(side));
+            let rule = StackRule::new(None, L2, 153600, &dims(side)).unwrap();
             frames(rule, &vec![(wave_bytes(&dims(side)), 0..=1); 4])
         });
         assert_eq!(floored, [32, 8, 2]);
-        let rule = StackRule::new(None, L2, 153600, &dims(128));
+        let rule = StackRule::new(None, L2, 153600, &dims(128)).unwrap();
         assert_eq!(frames(rule, &[(wave_bytes(&dims(128)), 0..=1)]), 96);
-        let given = StackRule::new(Some(16), L2, 153600, &dims(512));
+        let given = StackRule::new(Some(16), L2, 153600, &dims(512)).unwrap();
         assert_eq!(frames(given, &big), 16);
     }
 
@@ -1122,12 +1140,12 @@ mod tests {
     #[test]
     fn a_fixed_entry_binds_where_frames_are_live_beside_it() {
         const MIB: usize = 1 << 20;
-        let rule = StackRule::new(None, 64 * MIB, 1, &dims(256));
+        let rule = StackRule::new(None, 64 * MIB, 1, &dims(256)).unwrap();
         let wave = wave_bytes(&dims(256));
         assert_eq!(wave, MIB);
         let sets = [0..=1, 2..=3, 2..=3].map(|p| Streamed::new(wave, p));
-        let with = |fixed: Streamed| rule.frames(&[sets.as_slice(), &[fixed]].concat()).unwrap();
-        assert_eq!(rule.frames(&sets).unwrap(), 12);
+        let with = |fixed: Streamed| rule.frames(&[sets.as_slice(), &[fixed]].concat());
+        assert_eq!(rule.frames(&sets), 12);
         assert_eq!(with(Streamed::fixed(8 * MIB, 0..=3)), 8);
         assert_eq!(with(Streamed::fixed(8 * MIB, 2..=3)), 8);
         assert_eq!(with(Streamed::fixed(8 * MIB, 0..=1)), 12);
@@ -1140,9 +1158,9 @@ mod tests {
     #[test]
     fn a_chunked_call_holds_its_bytes_beside_the_planes_it_reads_and_writes() {
         const MIB: usize = 1 << 20;
-        let rule = StackRule::new(None, 64 * MIB, 1, &dims(256));
+        let rule = StackRule::new(None, 64 * MIB, 1, &dims(256)).unwrap();
         let wave = wave_bytes(&dims(256));
-        let frames = |call: Vec<Streamed>| rule.frames(&call).unwrap();
+        let frames = |call: Vec<Streamed>| rule.frames(&call);
         assert_eq!(
             frames(Streamed::chunked(23 * MIB, 0..=2, &[(wave, 3)], &[])),
             1
@@ -1171,11 +1189,35 @@ mod tests {
             Streamed::fixed(32 * MIB, 0..=1),
         ];
         let frames = |size, threads| {
-            let rule = StackRule::new(size, 64 * MIB, threads, &dims(256));
-            rule.frames(&bufs).unwrap()
+            let rule = StackRule::new(size, 64 * MIB, threads, &dims(256)).unwrap();
+            rule.frames(&bufs)
         };
         assert_eq!(frames(None, 153600), 8);
         assert_eq!(frames(None, 1), 1);
         assert_eq!(frames(Some(16), 153600), 16);
+    }
+
+    /// At 256x256 and one mode a stack of 65535 frames' exit waves fits u32, one of 65536
+    /// does not: a size of 65536 is refused for a scan of 65537 frames, which the passes cut
+    /// in two but a batch of 65536 would not, and taken for one of 65535, as any size past
+    /// the scan's frames is. Unsized, a fit past it stops at the most that do.
+    #[test]
+    fn a_stack_size_past_u32_is_refused_by_the_rule() {
+        let rule = |size, nframe| {
+            let dims = ViewDims {
+                nframe,
+                nmode: 1,
+                ..dims(256)
+            };
+            StackRule::new(size, 64 << 20, 1, &dims)
+        };
+        let r = rule(Some(65536), 65537);
+        assert!(matches!(r, Err(EngineError::Invalid(_))), "{r:?}");
+        assert_eq!(rule(Some(65535), 65537).unwrap().frames(&[]), 65535);
+        assert_eq!(rule(Some(1 << 40), 65535).unwrap().frames(&[]), 65535);
+        let r = rule(Some(1 << 40), 65536);
+        assert!(matches!(r, Err(EngineError::Invalid(_))), "{r:?}");
+        let byte = [Streamed::new(1, 0..=1)];
+        assert_eq!(rule(None, 70000).unwrap().frames(&byte), 65535);
     }
 }

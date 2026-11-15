@@ -460,7 +460,7 @@ impl LsqmlState {
                 s
             }
         };
-        let frames = rule.frames(&streamed)?;
+        let frames = rule.frames(&streamed);
         let frames = match scratch {
             Some(MovedScratch {
                 frames: shared,

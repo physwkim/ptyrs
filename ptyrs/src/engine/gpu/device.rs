@@ -2250,7 +2250,7 @@ impl BhState {
                 s
             }
         };
-        let frames = rule.frames(&streamed)?;
+        let frames = rule.frames(&streamed);
         // Only the shift's sums borrow the shared scratch.
         let frames = match scratch {
             Some(
