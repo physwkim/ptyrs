@@ -10,6 +10,7 @@ use cubecl_runtime::config::{CubeClRuntimeConfig, RuntimeConfig};
 pub mod conv;
 pub mod data;
 pub mod dip;
+mod grid;
 pub mod interop;
 pub mod live;
 pub mod metric;

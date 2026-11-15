@@ -20,6 +20,8 @@ use burn_cubecl::kernel::into_contiguous;
 use burn_cubecl::ops::numeric::empty_device_contiguous_dtype;
 use burn_cubecl::tensor::CubeTensor;
 
+use crate::nn::grid::grid;
+
 /// `relu(n.forward(x))` for channels-last `x`, whose last axis is `n`'s channels. It runs on the
 /// `[rows, channels]` view of `x`, which costs none of the transposing copy a channels-first view
 /// does.
@@ -152,7 +154,7 @@ impl<C: CheckpointStrategy> NormReluOps for Autodiff<CubeBackend, C> {
 /// Threads per cube, `tx` channels by `UNITS / tx` rows.
 const UNITS: usize = 256;
 
-/// How the `[rows, cols]` activation splits over cubes: cube `(g, b)` takes channels
+/// How the `[rows, cols]` activation splits over cubes: cube `g + groups·b` takes channels
 /// `b·tx .. b·tx + tx` of rows `g·chunk .. (g + 1)·chunk`, and its partial sums are row `g` of a
 /// `[groups, cols]` tensor. About 512 cubes fill the GPU once; each reduction over the partials
 /// runs in a fixed order, so every cube that totals them gets the same value.
@@ -161,6 +163,7 @@ struct Grid {
     cols: usize,
     chunk: usize,
     groups: usize,
+    cubes: usize,
     count: CubeCount,
     dim: CubeDim,
 }
@@ -173,19 +176,21 @@ impl Grid {
         let blocks = cols.div_ceil(tx);
         let chunk = rows.div_ceil((512 / blocks).max(1)).max(ty * 8);
         let groups = rows.div_ceil(chunk);
+        let cubes = groups * blocks;
         Self {
             rows,
             cols,
             chunk,
             groups,
-            count: CubeCount::new_2d(groups as u32, blocks as u32),
+            cubes,
+            count: grid(&x.client, cubes),
             dim: CubeDim::new_2d(tx as u32, ty as u32),
         }
     }
 
-    /// `rows`, `cols`, `chunk` and `groups` as the kernels take them.
-    fn sizes(&self) -> [u32; 4] {
-        [self.rows, self.cols, self.chunk, self.groups]
+    /// `rows`, `cols`, `chunk`, `groups` and `cubes` as the kernels take them.
+    fn sizes(&self) -> [u32; 5] {
+        [self.rows, self.cols, self.chunk, self.groups, self.cubes]
             .map(|n| u32::try_from(n).expect("a norm_relu activation of fewer than 2³² rows"))
     }
 
@@ -218,7 +223,7 @@ fn forward(
     let y = g.empty(&x, [g.rows, g.cols]);
     let mean = g.empty(&x, [g.cols]);
     let var = g.empty(&x, [g.cols]);
-    let [rows, cols, chunk, groups] = g.sizes();
+    let [rows, cols, chunk, groups, cubes] = g.sizes();
     // SAFETY: every index the kernels form is below its tensor's length: rows and channels are
     // masked against `rows` and `cols`, partial rows against `groups`.
     unsafe {
@@ -231,6 +236,8 @@ fn forward(
             rows,
             cols,
             chunk,
+            groups,
+            cubes,
             UNITS,
             dtype,
         );
@@ -245,6 +252,7 @@ fn forward(
             cols,
             chunk,
             groups,
+            cubes,
             UNITS,
             dtype,
         );
@@ -264,6 +272,7 @@ fn forward(
             cols,
             chunk,
             groups,
+            cubes,
             InputScalar::new(epsilon, dtype),
             UNITS,
             dtype,
@@ -294,7 +303,7 @@ fn backward(
     let dx = g.empty(&x, [g.rows, g.cols]);
     let dgamma = g.empty(&x, [g.cols]);
     let dbeta = g.empty(&x, [g.cols]);
-    let [rows, cols, chunk, groups] = g.sizes();
+    let [rows, cols, chunk, groups, cubes] = g.sizes();
     let eps = InputScalar::new(epsilon, dtype);
     // SAFETY: as in `forward`; `y`, `mean` and `var` are the packed tensors it wrote.
     unsafe {
@@ -312,6 +321,8 @@ fn backward(
             rows,
             cols,
             chunk,
+            groups,
+            cubes,
             eps,
             UNITS,
             dtype,
@@ -335,6 +346,7 @@ fn backward(
             cols,
             chunk,
             groups,
+            cubes,
             eps,
             UNITS,
             dtype,
@@ -347,16 +359,22 @@ mod kernel {
     use burn_cubecl::cubecl;
     use cubecl::prelude::*;
 
+    /// This cube's group of rows.
+    #[cube]
+    fn group(groups: u32) -> usize {
+        CUBE_POS % groups as usize
+    }
+
     /// This unit's channel, or `cols` and beyond for a lane past the last one.
     #[cube]
-    fn channel() -> usize {
-        CUBE_POS_Y as usize * CUBE_DIM_X as usize + UNIT_POS_X as usize
+    fn channel(groups: u32) -> usize {
+        CUBE_POS / groups as usize * CUBE_DIM_X as usize + UNIT_POS_X as usize
     }
 
     /// This cube's rows, `start..end`.
     #[cube]
-    fn span(rows: u32, chunk: u32) -> (usize, usize) {
-        let start = CUBE_POS_X as usize * chunk as usize;
+    fn span(rows: u32, chunk: u32, groups: u32) -> (usize, usize) {
+        let start = group(groups) * chunk as usize;
         let mut end = start + chunk as usize;
         if end > rows as usize {
             end = rows as usize;
@@ -424,12 +442,17 @@ mod kernel {
         rows: u32,
         cols: u32,
         chunk: u32,
+        groups: u32,
+        cubes: u32,
         #[comptime] units: usize,
         #[define(F)] _dtype: ElemType,
     ) {
+        if CUBE_POS >= cubes as usize {
+            terminate!();
+        }
         let mut shared = Shared::new_slice(units);
-        let c = channel();
-        let (start, end) = span(rows, chunk);
+        let c = channel(groups);
+        let (start, end) = span(rows, chunk, groups);
         let mut acc = F::new(0.0_f32);
         if c < cols as usize {
             let mut r = start + UNIT_POS_Y as usize;
@@ -440,7 +463,7 @@ mod kernel {
         }
         let s = sum_y::<F>(&mut shared, acc);
         if c < cols as usize && UNIT_POS_Y == 0 {
-            sums[CUBE_POS_X as usize * cols as usize + c] = s;
+            sums[group(groups) * cols as usize + c] = s;
         }
     }
 
@@ -453,12 +476,16 @@ mod kernel {
         cols: u32,
         chunk: u32,
         groups: u32,
+        cubes: u32,
         #[comptime] units: usize,
         #[define(F)] _dtype: ElemType,
     ) {
+        if CUBE_POS >= cubes as usize {
+            terminate!();
+        }
         let mut shared = Shared::new_slice(units);
-        let c = channel();
-        let (start, end) = span(rows, chunk);
+        let c = channel(groups);
+        let (start, end) = span(rows, chunk, groups);
         let mean = total::<F>(&mut shared, sums, c, cols, groups) / F::cast_from(rows);
         let mut acc = F::new(0.0_f32);
         if c < cols as usize {
@@ -471,7 +498,7 @@ mod kernel {
         }
         let s = sum_y::<F>(&mut shared, acc);
         if c < cols as usize && UNIT_POS_Y == 0 {
-            squares[CUBE_POS_X as usize * cols as usize + c] = s;
+            squares[group(groups) * cols as usize + c] = s;
         }
     }
 
@@ -489,13 +516,17 @@ mod kernel {
         cols: u32,
         chunk: u32,
         groups: u32,
+        cubes: u32,
         eps: InputScalar,
         #[comptime] units: usize,
         #[define(F)] _dtype: ElemType,
     ) {
+        if CUBE_POS >= cubes as usize {
+            terminate!();
+        }
         let mut shared = Shared::new_slice(units);
-        let c = channel();
-        let (start, end) = span(rows, chunk);
+        let c = channel(groups);
+        let (start, end) = span(rows, chunk, groups);
         let n = F::cast_from(rows);
         let mean = total::<F>(&mut shared, sums, c, cols, groups) / n;
         let var = total::<F>(&mut shared, squares, c, cols, groups) / n;
@@ -510,7 +541,7 @@ mod kernel {
                 y[i] = relu::<F>(z);
                 r += CUBE_DIM_Y as usize;
             }
-            if CUBE_POS_X == 0 && UNIT_POS_Y == 0 {
+            if group(groups) == 0 && UNIT_POS_Y == 0 {
                 mean_out[c] = mean;
                 var_out[c] = var;
             }
@@ -530,13 +561,18 @@ mod kernel {
         rows: u32,
         cols: u32,
         chunk: u32,
+        groups: u32,
+        cubes: u32,
         eps: InputScalar,
         #[comptime] units: usize,
         #[define(F)] _dtype: ElemType,
     ) {
+        if CUBE_POS >= cubes as usize {
+            terminate!();
+        }
         let mut shared = Shared::new_slice(units);
-        let c = channel();
-        let (start, end) = span(rows, chunk);
+        let c = channel(groups);
+        let (start, end) = span(rows, chunk, groups);
         let mut db = F::new(0.0_f32);
         let mut dg = F::new(0.0_f32);
         if c < cols as usize {
@@ -554,7 +590,7 @@ mod kernel {
         let db = sum_y::<F>(&mut shared, db);
         let dg = sum_y::<F>(&mut shared, dg);
         if c < cols as usize && UNIT_POS_Y == 0 {
-            let at = CUBE_POS_X as usize * cols as usize + c;
+            let at = group(groups) * cols as usize + c;
             shifts[at] = db;
             scales[at] = dg;
         }
@@ -579,13 +615,17 @@ mod kernel {
         cols: u32,
         chunk: u32,
         groups: u32,
+        cubes: u32,
         eps: InputScalar,
         #[comptime] units: usize,
         #[define(F)] _dtype: ElemType,
     ) {
+        if CUBE_POS >= cubes as usize {
+            terminate!();
+        }
         let mut shared = Shared::new_slice(units);
-        let c = channel();
-        let (start, end) = span(rows, chunk);
+        let c = channel(groups);
+        let (start, end) = span(rows, chunk, groups);
         let db = total::<F>(&mut shared, shifts, c, cols, groups);
         let dg = total::<F>(&mut shared, scales, c, cols, groups);
         if c < cols as usize {
@@ -602,7 +642,7 @@ mod kernel {
                 dx[i] = scale * (dz - mean_db - xhat * mean_dg);
                 r += CUBE_DIM_Y as usize;
             }
-            if CUBE_POS_X == 0 && UNIT_POS_Y == 0 {
+            if group(groups) == 0 && UNIT_POS_Y == 0 {
                 dgamma[c] = dg;
                 dbeta[c] = db;
             }
@@ -732,6 +772,13 @@ mod tests {
         for (rows, cols) in [(1013, 24), (1013, 40), (37, 3), (70_001, 8)] {
             agrees(rows, cols, DType::F32, 2e-5, false);
         }
+    }
+
+    /// 2097121 channels are 65536 blocks of 32, past the 65535 cubes CUDA launches along a grid's
+    /// Y.
+    #[test]
+    fn fused_matches_burn_past_65535_channel_blocks() {
+        agrees(2, 32 * 65_535 + 1, DType::F32, 2e-5, false);
     }
 
     #[test]

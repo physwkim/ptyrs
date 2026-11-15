@@ -24,10 +24,12 @@ use burn::nn::{BatchNorm, PaddingConfig2d};
 use burn::prelude::*;
 use burn::tensor::ops::ConvOptions;
 use burn_cubecl::CubeBackend;
-use burn_cubecl::cubecl::prelude::{CubeCount, CubeDim};
+use burn_cubecl::cubecl::prelude::CubeDim;
 use burn_cubecl::kernel::into_contiguous;
 use burn_cubecl::ops::numeric::empty_device_contiguous_dtype;
 use burn_cubecl::tensor::CubeTensor;
+
+use crate::nn::grid::grid;
 
 /// A convolution of the networks, whose only forward is [`Conv::forward`]. Its record is the
 /// [`Conv2d`]'s it wraps, field for field, so saved networks read the same.
@@ -328,10 +330,10 @@ const CUBES: usize = 512;
 /// The weight gradient `[co, ci, 3, 3]` of a 3×3 same-padded convolution of stride 1 from its
 /// channels-last input `x`, `[n, h, w, ci]`, and output gradient `dy`, `[n, h, w, co]`.
 ///
-/// Cube `(a, s, b)` sums input channels `a·LANES ..` against output channels `b·PER·WARPS ..` over
-/// band `s`, `TILE` columns of a run of rows of one image, into row `s` of a `[bands, co·ci·9]`
-/// tensor, and a second kernel adds the bands in order, so the result does not depend on
-/// scheduling.
+/// Cube `a + across·(s + bands·b)` sums input channels `a·LANES ..` against output channels
+/// `b·PER·WARPS ..` over band `s`, `TILE` columns of a run of rows of one image, into row `s` of a
+/// `[bands, co·ci·9]` tensor, and a second kernel adds the bands in order, so the result does not
+/// depend on scheduling.
 fn weight_grad(x: CubeTensor, dy: CubeTensor) -> CubeTensor {
     let (x, dy) = (into_contiguous(x), into_contiguous(dy));
     let [n, h, w, ci] = x.meta.shape().dims();
@@ -341,6 +343,7 @@ fn weight_grad(x: CubeTensor, dy: CubeTensor) -> CubeTensor {
     let rows = h.div_ceil((CUBES / (across * down * n * strips)).clamp(1, h));
     let blocks = h.div_ceil(rows);
     let bands = n * blocks * strips;
+    let cubes = across * bands * down;
     let len = co * ci * 9;
     let dtype = dtype_to_storage_type(x.dtype);
     let client = x.client.clone();
@@ -356,7 +359,7 @@ fn weight_grad(x: CubeTensor, dy: CubeTensor) -> CubeTensor {
     unsafe {
         kernel::weight_parts::launch_unchecked(
             &client,
-            CubeCount::new_3d(u(across), u(bands), u(down)),
+            grid(&client, cubes),
             CubeDim::new_2d(LANES as u32, WARPS as u32),
             x.into_tensor_arg(),
             dy.into_tensor_arg(),
@@ -368,6 +371,9 @@ fn weight_grad(x: CubeTensor, dy: CubeTensor) -> CubeTensor {
             u(rows),
             u(blocks),
             u(strips),
+            u(across),
+            u(bands),
+            u(cubes),
             TILE,
             LANES,
             WARPS,
@@ -377,7 +383,7 @@ fn weight_grad(x: CubeTensor, dy: CubeTensor) -> CubeTensor {
         );
         kernel::sum_bands::launch_unchecked(
             &client,
-            CubeCount::new_1d(u(len.div_ceil(256))),
+            grid(&client, len.div_ceil(256)),
             CubeDim::new_1d(256),
             parts.into_tensor_arg(),
             out.clone().into_tensor_arg(),
@@ -411,6 +417,9 @@ mod kernel {
         rows: u32,
         blocks: u32,
         strips: u32,
+        across: u32,
+        bands: u32,
+        cubes: u32,
         #[comptime] tile: usize,
         #[comptime] lanes: usize,
         #[comptime] warps: usize,
@@ -418,6 +427,9 @@ mod kernel {
         #[comptime] unroll: usize,
         #[define(F)] _dtype: ElemType,
     ) {
+        if CUBE_POS >= cubes as usize {
+            terminate!();
+        }
         let (h, w, ci, co) = (h as usize, w as usize, ci as usize, co as usize);
         let units = comptime!(lanes * warps);
         let outs = comptime!(per * warps);
@@ -437,9 +449,10 @@ mod kernel {
         let mut gv = Array::<F>::new(per);
         let (l, k0) = (UNIT_POS_X as usize, UNIT_POS_Y as usize * per);
         let unit = UNIT_POS as usize;
-        let ci0 = CUBE_POS_X as usize * lanes;
-        let co0 = CUBE_POS_Z as usize * outs;
-        let band = CUBE_POS_Y as usize;
+        let (across, bands) = (across as usize, bands as usize);
+        let ci0 = CUBE_POS % across * lanes;
+        let band = CUBE_POS / across % bands;
+        let co0 = CUBE_POS / across / bands * outs;
         let (strips, blocks) = (strips as usize, blocks as usize);
         let x0 = (band % strips) * tile;
         let image = band / strips / blocks;
@@ -732,6 +745,18 @@ mod tests {
             x_grad: false,
             ..case(2, 301, 7, 4, 4)
         });
+    }
+
+    /// 65536 one-pixel images are as many bands, and 4194241 output channels 65536 blocks of 64,
+    /// each count past the 65535 cubes CUDA launches along a grid's Y or Z.
+    #[test]
+    fn more_than_65535_bands_or_channel_blocks() {
+        f32_weight_gradient(case(65_536, 1, 1, 1, 1), 2e-5);
+        let c = Case {
+            x_grad: false,
+            ..case(1, 1, 1, 1, PER * WARPS * 65_535 + 1)
+        };
+        f32_weight_gradient(c, 2e-5);
     }
 
     #[test]
