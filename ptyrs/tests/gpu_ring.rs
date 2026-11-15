@@ -4,9 +4,10 @@
 //! a stamp error, and one with a frame never counted is an uncounted error. A record counts
 //! exactly when its advance is enqueued, eagerly or by a graph's replay: a call that fails
 //! before it counts nothing and its number is voided, so a retry reads only its own frames.
-//! A poll returns the records whose copies have completed without waiting for the rest. Each
-//! detector pixel's frame count holds the counted frames unmasked there, each once, in any
-//! layout and order of counted ranges.
+//! A begin that fails counts the void it enqueued and nothing else. A poll returns the
+//! records whose copies have completed without waiting for the rest. Each detector pixel's
+//! frame count holds the counted frames unmasked there, each once, in any layout and order of
+//! counted ranges.
 
 use std::ffi::c_void;
 use std::sync::Arc;
@@ -499,6 +500,56 @@ fn a_dirty_number_is_voided_by_the_next_begin() {
             assert_eq!(bits(&t.sums), bits(&want), "nslot {nslot}, record {r}");
         }
     }
+}
+
+/// A begin that fails before its record leaves the retry its number, and the retry reads only
+/// its own totals: one whose void of a dropped record's number fails leaves the number dirty
+/// for the retry to void, and one whose copy of the record before it fails leaves that record
+/// for the retry to copy.
+#[test]
+fn a_begin_failing_before_its_void_or_copy_leaves_them_to_the_retry() {
+    let mut f = fixture(1);
+    let foreign = f.foreign();
+    let dropped = Record {
+        push: [true; 3],
+        end: false,
+        nframe: NFRAME,
+    };
+    f.enqueue(0, &[WHOLE, dropped]);
+    let Err(e) = f.ring.record(&foreign, 2, NFRAME) else {
+        panic!("a begin whose void failed began");
+    };
+    assert!(matches!(e, RingError::Gpu(Error::ContextMismatch)), "{e}");
+    f.enqueue(2, &[WHOLE]);
+    check_whole(&f.flush().unwrap(), [0, 2]);
+
+    f.enqueue(3, &[WHOLE]);
+    let Err(e) = f.ring.record(&foreign, 4, NFRAME) else {
+        panic!("a begin whose copy failed began");
+    };
+    assert!(matches!(e, RingError::Gpu(Error::ContextMismatch)), "{e}");
+    f.enqueue(4, &[WHOLE]);
+    check_whole(&f.flush().unwrap(), [3, 4]);
+}
+
+/// A begin whose void is enqueued, then whose copy of the record before it reads that
+/// record's stamp error, keeps the void counted: the retry is the number after it and reads
+/// only its own totals, and the void shows in no flush.
+#[test]
+fn a_void_before_a_failed_copy_stays_counted() {
+    let mut f = fixture(1);
+    let dropped = Record {
+        push: [true; 3],
+        end: false,
+        nframe: NFRAME,
+    };
+    f.enqueue(0, &[first([true, true, false], NFRAME), dropped]);
+    let Err(e) = f.ring.record(&f.ctx, 2, NFRAME) else {
+        panic!("a begin whose copy read a stamp error began");
+    };
+    assert_eq!(stamp(e), (0, 8, u64::MAX));
+    f.enqueue(2, &[WHOLE]);
+    check_whole(&f.flush().unwrap(), [2]);
 }
 
 /// `n` replays of a captured record count `n` records, each with the capture's partials,
