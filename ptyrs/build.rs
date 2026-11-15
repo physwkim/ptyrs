@@ -142,9 +142,10 @@ fn run(toolkit: &Toolkit) -> Res<()> {
         .unwrap_or_else(|_| "sm_89".to_string())
         .parse()?;
     let out = PathBuf::from(env::var("OUT_DIR")?);
-    let target_dir = env::var_os("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| workspace.join("target"));
+    // Relative to the workspace root, not ptyrs/ where this script runs, so the lock and the
+    // nested builds name one directory.
+    let target_dir =
+        workspace.join(env::var_os("CARGO_TARGET_DIR").unwrap_or_else(|| "target".into()));
 
     let (ir, options) = build_device_crate(workspace, toolkit, &target_dir, &arch)?;
 
