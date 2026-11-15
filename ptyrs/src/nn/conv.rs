@@ -50,11 +50,11 @@ impl Conv {
     /// The convolution on channels-last `x`, `[batch, h, w, channels]`.
     ///
     /// A 3×3 convolution of stride 1, dilation 1, one group and one pixel of padding on every
-    /// side, in f32 or f64, takes its output and input gradient from `conv3x3`, its weight
-    /// gradient from `weight_grad` and its bias gradient from burn; those kernels sum in the
-    /// activation's float type, too narrow in f16 or bf16. Anything else is `Conv2d::forward` on
-    /// the channels-first view, permuted back; burn's CUDA convolutions run channels-last and take
-    /// and give that memory as a permuted view, so neither permutation copies.
+    /// side, in f32 or f64, takes its output and input gradient from `conv3x3` and its weight and
+    /// bias gradients from `weight_grad`; those kernels sum in the activation's float type, too
+    /// narrow in f16 or bf16. Anything else is `Conv2d::forward` on the channels-first view,
+    /// permuted back; burn's CUDA convolutions run channels-last and take and give that memory as
+    /// a permuted view, so neither permutation copies.
     pub fn forward(&self, x: Tensor<4>) -> Tensor<4> {
         let c = &self.0;
         let wide = matches!(x.dtype(), DType::F32 | DType::F64);
