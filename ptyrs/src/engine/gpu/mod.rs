@@ -942,8 +942,8 @@ impl Bufs<'_> {
 
     /// PyNX `ObjNorm` / `ProbeNorm` from the accumulated sums, consuming them, for the arrays
     /// that have an inertia; the object only on the tiles some view reaches, or under
-    /// [`crate::engine::Sampling::FullObject`] everywhere with the illumination map of the
-    /// current probe for its denominator.
+    /// [`crate::engine::Sampling::FullObject`] everywhere by the normal equations of the
+    /// current probe's windows ([`device::FeaturesMut::solve_obj`]).
     fn apply_sums(
         &mut self,
         ctx: &ExecutionContext,
@@ -951,21 +951,9 @@ impl Bufs<'_> {
         probe: Option<f64>,
     ) -> Result<(), GpuError> {
         if let Some(inertia) = obj {
-            let den = &mut self.obj_sums.den;
-            if self
-                .features
-                .illumination(ctx, self.views, self.probe, den)?
-            {
-                let (sums, n) = (&mut *self.obj_sums, self.obj_len);
-                (self.kernels).update_from_sums(ctx, self.obj, sums, n, inertia as f32)?;
-            } else {
-                self.kernels.update_obj_from_sums(
-                    ctx,
-                    self.views,
-                    self.obj,
-                    self.obj_sums,
-                    inertia as f32,
-                )?;
+            let (sums, inertia) = (&mut *self.obj_sums, inertia as f32);
+            if !(self.features).solve_obj(ctx, self.views, self.probe, self.obj, sums, inertia)? {
+                (self.kernels).update_obj_from_sums(ctx, self.views, self.obj, sums, inertia)?;
             }
         }
         if let Some(inertia) = probe {

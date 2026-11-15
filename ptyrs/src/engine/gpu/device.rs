@@ -12,7 +12,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use crate::fft::Plan2d;
-use crate::gpu::sampling::{Modes, ObjectSampler, StackPoints, WindowBlock, window_views};
+use crate::gpu::sampling::{Modes, Normal, ObjectSampler, StackPoints, WindowBlock, window_views};
 use crate::gpu::{
     BH_STEP, BackgroundSums, BhKernels, C32, CG_BLOCKS, Ended, EpochOrder, Error as GpuError,
     ExitPass, ExitStage, FarSums, FrameWaves, FusedBufs, FusedInputs, GammaStacks, GradKernels,
@@ -37,6 +37,7 @@ use super::{
 };
 use crate::engine::features::{POSITION_LIMIT, POSITION_STEP};
 use crate::engine::ptycho::Algorithm;
+use crate::engine::sampling::OBJ_PCG;
 use crate::engine::{
     ApParams, BhParams, BhStep, DmParams, EngineError, Features, LsqmlParams, LsqmlStep, MlParams,
     PlaneStage, RaarParams, RpieParams, Sampling,
@@ -1120,23 +1121,31 @@ impl FeaturesMut<'_> {
         Ok(())
     }
 
-    /// Under [`Sampling::FullObject`], pty-chi's illumination map of `probe` over the scan's
-    /// `views` at the offsets into `out` `[nobj, nyo, nxo]` ([`ObjectSampler::illumination`]),
-    /// the object update's denominator: `true` then, `false` with nothing written otherwise.
-    pub fn illumination(
+    /// Under [`Sampling::FullObject`], the object update of `obj` from `sums` by the normal
+    /// equations of `probe`'s windows over the scan's `views` at the offsets
+    /// ([`ObjectSampler::solve`], [`OBJ_PCG`] steps), the slice spectra its scratch: `true`
+    /// then, `false` with nothing touched otherwise.
+    pub fn solve_obj(
         &mut self,
         ctx: &ExecutionContext,
         views: &Views,
         probe: &DeviceBuffer<C32>,
-        out: &mut DeviceBuffer<f32>,
+        obj: &mut DeviceBuffer<C32>,
+        sums: &mut UpdateSums,
+        inertia: f32,
     ) -> Result<bool, GpuError> {
         let Some(p) = &mut self.position else {
             return Ok(false);
         };
-        let Mover::Object { sampler, .. } = &mut *p.mover else {
+        let Mover::Object { sampler, spectra } = &mut *p.mover else {
             return Ok(false);
         };
-        sampler.illumination(ctx, views, p.offsets, probe, out)?;
+        let a = Normal {
+            views,
+            offsets: p.offsets,
+            probe,
+        };
+        sampler.solve::<OBJ_PCG>(ctx, a, obj, &mut spectra[0], sums, inertia)?;
         Ok(true)
     }
 

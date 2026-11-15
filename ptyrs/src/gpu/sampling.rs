@@ -21,17 +21,23 @@
 //! Each pass transforms `chunk` groups in a scratch of `chunk` object planes; a stack takes
 //! `ceil(nf_max * modes / chunk)` passes whatever its `nf`, so the launches can be captured
 //! once for every stack.
+//!
+//! [`ObjectSampler::solve`] updates an object from its placed sums by the normal equations
+//! of its windows over the whole scan, the passes of one stack of every frame weighting each
+//! window by the probe's power in place of a window buffer.
 
 use std::ops::Range;
+use std::slice;
 
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig};
-use ptyrs_kernels::pixel::StackGeom;
-use ptyrs_kernels::sampling::{SamplePass, sampling_kernels};
+use ptyrs_kernels::pixel::{PIXEL_THREADS, StackGeom};
+use ptyrs_kernels::sampling::{PCG_PAP, PCG_RZ, PCG_SCALARS, Pcg, SamplePass, sampling_kernels};
 
 use crate::fft::Plan2d;
 use crate::gpu::{
-    C32, Error, Kernels, StackCtl, StackRef, ViewAddr, ViewDims, Views, check_len, dptr,
+    C32, CG_BLOCKS, Error, Kernels, StackCtl, StackRef, StackTable, UpdateSums, ViewAddr, ViewDims,
+    Views, check_len, dptr,
 };
 
 /// `buf`'s device address `at` complex values in, as the kernels take it.
@@ -44,6 +50,15 @@ fn elems(total: usize) -> Result<(u32, LaunchConfig), Error> {
     let n = u32::try_from(total)
         .map_err(|_| Error::Shape(format!("{total} elements exceed a 1D launch")))?;
     Ok((n, LaunchConfig::for_num_elems(n)))
+}
+
+/// `blocks` blocks of `threads`.
+fn blocks(blocks: u32, threads: u32) -> LaunchConfig {
+    LaunchConfig {
+        grid_dim: (blocks, 1, 1),
+        block_dim: (threads, 1, 1),
+        shared_mem_bytes: 0,
+    }
 }
 
 /// The views over a stack's windows where each view samples the object at its offset: an
@@ -107,6 +122,15 @@ pub struct StackPoints<'a> {
     pub offsets: &'a DeviceBuffer<f32>,
 }
 
+/// What [`ObjectSampler::solve`]'s `AᴴA` reads: the scan's views, every frame's offset
+/// `(dy, dx)`, `[nframe, 2]`, and the probe `[nprobe, ny, nx]`.
+#[derive(Clone, Copy)]
+pub struct Normal<'a> {
+    pub views: &'a Views,
+    pub offsets: &'a DeviceBuffer<f32>,
+    pub probe: &'a DeviceBuffer<C32>,
+}
+
 /// The object modes of a frame that [`ObjectSampler::windows`] reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Modes {
@@ -145,6 +169,23 @@ pub struct ObjectSampler {
     /// The placed spectra, then the illumination, `[nobj, nyo, nxo]`.
     acc: DeviceBuffer<C32>,
     chunk: u32,
+    /// The scan as one stack, which [`Self::solve`]'s `AᴴA` passes over.
+    whole: StackTable,
+    /// [`Self::solve`]'s direction, `[nobj, nyo, nxo]`.
+    dir: DeviceBuffer<C32>,
+    /// [`Self::solve`]'s block sums, `CG_BLOCKS`.
+    parts: DeviceBuffer<f32>,
+    /// [`Self::solve`]'s scalars, [`Pcg`]'s `s`.
+    scalars: DeviceBuffer<f32>,
+}
+
+/// What [`ObjectSampler::spread`] sums over the frames.
+#[derive(Clone, Copy)]
+enum Spread {
+    /// Each frame's conjugate sampling phase: `W^H` of the probe's power.
+    Illumination,
+    /// The spectrum of each frame's squared sampling kernel: `AᴴA`'s diagonal.
+    Diagonal,
 }
 
 impl ObjectSampler {
@@ -177,6 +218,10 @@ impl ObjectSampler {
             scratch: DeviceBuffer::zeroed(stream, chunk as usize * plane)?,
             acc: DeviceBuffer::zeroed(stream, dims.obj_len())?,
             chunk,
+            whole: StackTable::new(stream, &dims, slice::from_ref(&(0..dims.nframe)))?,
+            dir: DeviceBuffer::zeroed(stream, dims.obj_len())?,
+            parts: DeviceBuffer::zeroed(stream, CG_BLOCKS as usize)?,
+            scalars: DeviceBuffer::zeroed(stream, PCG_SCALARS)?,
         })
     }
 
@@ -395,6 +440,239 @@ impl ObjectSampler {
         probe: &DeviceBuffer<C32>,
         out: &mut DeviceBuffer<f32>,
     ) -> Result<(), Error> {
+        let at = Normal {
+            views,
+            offsets,
+            probe,
+        };
+        self.spread(ctx, at, out, Spread::Illumination)
+    }
+
+    /// Updates the object `obj` `[nobj, nyo, nxo]` from its sums, `sums.num` the placed
+    /// `W^H` of `conj(P) psi` over every view, to `min ‖psi − A O'‖² + reg ‖O' − O‖²`, `A`
+    /// the windows weighted by the probe and `reg = inertia max D`: `STEPS` conjugate-gradient
+    /// steps on `(AᴴA + reg) O' = num + reg O` from `O`, preconditioned by `D + reg`, `D`
+    /// `AᴴA`'s diagonal into `sums.den`. A step along a direction of no positive curvature,
+    /// or after a residual of no positive norm, is 0. Every scalar stays on the device, so the
+    /// launches capture; `spectra`, one object of them, is scratch. Zeroes `sums.num` and
+    /// `sums.den`, which it consumed.
+    pub fn solve<const STEPS: usize>(
+        &mut self,
+        ctx: &ExecutionContext,
+        a: Normal<'_>,
+        obj: &mut DeviceBuffer<C32>,
+        spectra: &mut DeviceBuffer<C32>,
+        sums: &mut UpdateSums,
+        inertia: f32,
+    ) -> Result<(), Error> {
+        let len = self.dims.obj_len();
+        check_len("obj", obj, len)?;
+        check_len("spectra", spectra, len)?;
+        sums.check(len)?;
+        let (n, config) = elems(len)?;
+        self.spread(ctx, a, &mut sums.den, Spread::Diagonal)?;
+        let UpdateSums { num, den, max_bits } = sums;
+        crate::gpu::zero(ctx, max_bits)?;
+        let max = blocks(config.grid_dim.0.min(1024), PIXEL_THREADS);
+        let m = &self.base.module;
+        self.base
+            .launch(ctx, &[den.storage()], &[max_bits.storage()], |stream| {
+                // SAFETY: `den` holds `n` floats, `max_bits` one zeroed u32.
+                unsafe { m.max_nonneg_f32(stream, max, dptr(den), n, dptr(max_bits)) }
+            })?;
+        let pcg = Pcg {
+            x: dptr(obj),
+            res: dptr(num),
+            dir: dptr(&self.dir),
+            ap: dptr(&self.acc),
+            den: dptr(den),
+            part: dptr(&self.parts),
+            s: dptr(&self.scalars),
+            scale: 1.0 / self.plane() as f32,
+            n,
+        };
+        let reads = [max_bits.storage()];
+        self.base
+            .launch(ctx, &reads, &[self.scalars.storage()], |stream| {
+                // SAFETY: `max_bits` holds one word, `pcg` as `Pcg` says.
+                unsafe { (self.module).pcg_reg(stream, blocks(1, 1), dptr(max_bits), inertia, pcg) }
+            })?;
+        let (cg, sum) = (blocks(CG_BLOCKS, PIXEL_THREADS), blocks(1, PIXEL_THREADS));
+        // `num - AᴴA O` in `num`, the residual from here on.
+        self.planes.forward(ctx, obj, spectra)?;
+        self.normal(ctx, a, spectra)?;
+        let reads = [self.acc.storage(), den.storage()];
+        let writes = [
+            num.storage(),
+            self.dir.storage(),
+            self.parts.storage(),
+            self.scalars.storage(),
+        ];
+        self.base.launch(ctx, &reads, &writes, |stream| {
+            // SAFETY: `pcg` as `Pcg` says, `parts` `CG_BLOCKS`.
+            unsafe { self.module.pcg_start(stream, cg, pcg) }
+        })?;
+        self.sum(ctx, sum, PCG_RZ[0])?;
+        for step in 0..STEPS {
+            let (rz, next) = (PCG_RZ[step % 2], PCG_RZ[(step + 1) % 2]);
+            self.planes.forward(ctx, &self.dir, spectra)?;
+            self.normal(ctx, a, spectra)?;
+            let reads = [self.dir.storage()];
+            let writes = [
+                self.acc.storage(),
+                self.parts.storage(),
+                self.scalars.storage(),
+            ];
+            self.base.launch(ctx, &reads, &writes, |stream| {
+                // SAFETY: as `pcg_start`.
+                unsafe { self.module.pcg_curv(stream, cg, pcg) }
+            })?;
+            self.sum(ctx, sum, PCG_PAP)?;
+            let reads = [self.dir.storage(), self.acc.storage(), den.storage()];
+            let writes = [
+                obj.storage(),
+                num.storage(),
+                self.parts.storage(),
+                self.scalars.storage(),
+            ];
+            self.base.launch(ctx, &reads, &writes, |stream| {
+                // SAFETY: as `pcg_start`, `rz` a slot of `PCG_RZ`.
+                unsafe { self.module.pcg_step(stream, cg, pcg, rz) }
+            })?;
+            if step + 1 == STEPS {
+                break;
+            }
+            self.sum(ctx, sum, next)?;
+            let reads = [num.storage(), den.storage(), self.scalars.storage()];
+            self.base
+                .launch(ctx, &reads, &[self.dir.storage()], |stream| {
+                    // SAFETY: as `pcg_start`, `rz` and `next` slots of `PCG_RZ`.
+                    unsafe { (self.module).pcg_dir(stream, cg, pcg, rz, next) }
+                })?;
+        }
+        crate::gpu::zero(ctx, num)?;
+        crate::gpu::zero(ctx, den)
+    }
+
+    /// The scalar at `slot` of `scalars`, the sum of the block sums.
+    fn sum(
+        &mut self,
+        ctx: &ExecutionContext,
+        config: LaunchConfig,
+        slot: u32,
+    ) -> Result<(), Error> {
+        let out = dptr::<f32, f32>(&self.scalars).wrapping_add(slot as usize);
+        let reads = [self.parts.storage()];
+        self.base
+            .launch(ctx, &reads, &[self.scalars.storage()], |stream| {
+                // SAFETY: `parts` holds `CG_BLOCKS` floats, `scalars` `slot`.
+                unsafe { (self.module).pcg_sum(stream, config, dptr(&self.parts), CG_BLOCKS, out) }
+            })
+    }
+
+    /// `acc = plane AᴴA x` of `x` `[nobj, nyo, nxo]`, `spectra` its [`Self::spectra`]: each
+    /// frame's window on each object mode, as [`Self::windows`] samples it, weighted by
+    /// `sum_p |P_p|^2` and placed back as [`Self::place`] does, over the scan as one stack.
+    fn normal(
+        &mut self,
+        ctx: &ExecutionContext,
+        a: Normal<'_>,
+        spectra: &DeviceBuffer<C32>,
+    ) -> Result<(), Error> {
+        let stack = self.whole.at(0);
+        let g = self.dims.geom(stack)?;
+        check_len("probe", a.probe, self.dims.nprobe as usize * self.dims.n())?;
+        crate::gpu::zero(ctx, &mut self.acc)?;
+        for s in self.passes(g, self.dims.nobj) {
+            let (_, config) = elems(s.npass as usize * self.plane())?;
+            let reads = [
+                a.views.addr().storage(),
+                a.offsets.storage(),
+                spectra.storage(),
+                stack.storage(),
+            ];
+            self.base
+                .launch(ctx, &reads, &[self.scratch.storage()], |stream| {
+                    // SAFETY: `solve` checked the lengths; `Views::new` checked every view's
+                    // modes.
+                    unsafe {
+                        self.module.sample_shift(
+                            stream,
+                            config,
+                            dptr(spectra),
+                            dptr::<ViewAddr, ViewAddr>(a.views.addr()),
+                            dptr(a.offsets),
+                            dptr(&self.scratch),
+                            stack.ctl() as *const StackCtl,
+                            g,
+                            s,
+                        )
+                    }
+                })?;
+            self.pass.inverse_inplace(ctx, &mut self.scratch)?;
+            self.base.launch(
+                ctx,
+                &[a.probe.storage()],
+                &[self.scratch.storage()],
+                |stream| {
+                    // SAFETY: `probe` holds `nprobe` frames, `scratch` `npass` planes.
+                    unsafe {
+                        (self.module).normal_mask(
+                            stream,
+                            config,
+                            dptr(a.probe),
+                            dptr(&self.scratch),
+                            g,
+                            s,
+                        )
+                    }
+                },
+            )?;
+            self.pass.forward_inplace(ctx, &mut self.scratch)?;
+            let (_, config) = elems(self.dims.obj_len())?;
+            let reads = [
+                self.scratch.storage(),
+                a.views.addr().storage(),
+                a.offsets.storage(),
+                stack.storage(),
+            ];
+            self.base
+                .launch(ctx, &reads, &[self.acc.storage()], |stream| {
+                    // SAFETY: as `sample_shift`; `acc` holds `nobj` planes.
+                    unsafe {
+                        self.module.place_accumulate(
+                            stream,
+                            config,
+                            dptr(&self.scratch),
+                            dptr::<ViewAddr, ViewAddr>(a.views.addr()),
+                            dptr(a.offsets),
+                            dptr(&self.acc),
+                            stack.ctl() as *const StackCtl,
+                            g,
+                            s,
+                        )
+                    }
+                })?;
+        }
+        Ok(self.planes.inverse_inplace(ctx, &mut self.acc)?)
+    }
+
+    /// [`Spread::Illumination`] or [`Spread::Diagonal`] of the probe's power over the scan's
+    /// views at the offsets into `out` `[nobj, nyo, nxo]`: the embedded `sum_p |P_p|^2`
+    /// transformed, times the frames' phases summed, transformed back, its real part floored
+    /// at 0.
+    fn spread(
+        &mut self,
+        ctx: &ExecutionContext,
+        a: Normal<'_>,
+        out: &mut DeviceBuffer<f32>,
+        kind: Spread,
+    ) -> Result<(), Error> {
+        let Normal {
+            views,
+            offsets,
+            probe,
+        } = a;
         self.check_views(views, offsets)?;
         let d = self.dims;
         let g = d.scan_geom();
@@ -415,17 +693,18 @@ impl ObjectSampler {
         let reads = [views.addr().storage(), offsets.storage()];
         self.base
             .launch(ctx, &reads, &[self.acc.storage()], |stream| {
+                let (addr, offsets) = (dptr::<ViewAddr, ViewAddr>(views.addr()), dptr(offsets));
+                let acc = dptr(&self.acc);
                 // SAFETY: lengths checked above; `Views::new` checked every view's modes.
                 unsafe {
-                    self.module.illum_phase(
-                        stream,
-                        config,
-                        dptr::<ViewAddr, ViewAddr>(views.addr()),
-                        dptr(offsets),
-                        dptr(&self.acc),
-                        g,
-                        d.nobj,
-                    )
+                    match kind {
+                        Spread::Illumination => {
+                            (self.module).illum_phase(stream, config, addr, offsets, acc, g, d.nobj)
+                        }
+                        Spread::Diagonal => {
+                            (self.module).diag_phase(stream, config, addr, offsets, acc, g, d.nobj)
+                        }
+                    }
                 }
             })?;
         self.planes.inverse_inplace(ctx, &mut self.acc)?;

@@ -10,7 +10,7 @@
 //! p0 + npass` of the points, each in its `[nyo, nxo]` plane of a scratch buffer; the points
 //! of frames from `nf` on are skipped.
 
-use cuda_device::device;
+use cuda_device::{device, thread};
 use cuda_host::cuda_module;
 
 use crate::pixel::{StackGeom, ViewAddr, cmul, freq};
@@ -29,6 +29,31 @@ pub struct SamplePass {
 
 // SAFETY: repr(C) of five u32, no padding; every bit pattern is a valid value.
 unsafe impl cuda_core::DeviceCopy for SamplePass {}
+
+/// The object solve's buffers, at addresses fixed for the solve: `n` complex values each of
+/// the object `x`, the residual `res`, the direction `dir` and `ap`, a pass of the normal
+/// operator times `1 / scale`; `n` floats of `AᴴA`'s diagonal `den`; a block sum per block
+/// `part`; and the scalars `s` at [`PCG_REG`], [`PCG_RZ`] and [`PCG_PAP`].
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct Pcg {
+    pub x: *mut f32,
+    pub res: *mut f32,
+    pub dir: *mut f32,
+    pub ap: *mut f32,
+    pub den: *const f32,
+    pub part: *mut f32,
+    pub s: *mut f32,
+    pub scale: f32,
+    pub n: u32,
+}
+
+/// [`Pcg`]'s scalar slots: the regularization, the residual's preconditioned power before
+/// alternate steps, and the curvature along the direction; [`PCG_SCALARS`] of them.
+pub const PCG_REG: u32 = 0;
+pub const PCG_RZ: [u32; 2] = [1, 2];
+pub const PCG_PAP: u32 = 3;
+pub const PCG_SCALARS: usize = 4;
 
 /// Where a point samples its plane on one axis: whole pixels `c` plus `d` in `[0, 1)`.
 #[derive(Clone, Copy)]
@@ -75,9 +100,60 @@ unsafe fn point(
 /// split of [`freq`]) at `t = a.c + a.d`, the whole pixels reduced mod `n` exactly.
 #[device]
 fn cycles(j: u32, n: u32, a: Axis) -> f32 {
-    let k = j as i64 - if j < n.div_ceil(2) { 0 } else { n as i64 };
+    turns(
+        j as i64 - if j < n.div_ceil(2) { 0 } else { n as i64 },
+        n,
+        a,
+    )
+}
+
+/// Cycles of `exp(+2 pi i k t / n)` for bin `k` at `t = a.c + a.d`, the whole pixels reduced
+/// mod `n` exactly.
+#[device]
+fn turns(k: i64, n: u32, a: Axis) -> f32 {
     let whole = (k * a.c).rem_euclid(n as i64) as f32;
     (whole + k as f32 * a.d) / n as f32
+}
+
+/// The spectrum of `|h_t[-v]|^2` at index `m` of an axis of `n`, `h_t` the one-axis kernel
+/// that samples at `t`: `(1 - m/n) exp(-2 pi i t m/n) + (m/n) exp(-2 pi i t (m - n)/n)`, the
+/// pairs of bins `k - k'` that are `m` and `m - n`.
+#[device]
+fn square(m: u32, n: u32, a: Axis) -> (f32, f32) {
+    let w = m as f32 / n as f32;
+    let (mut s0, mut c0, mut s1, mut c1) = (0.0, 0.0, 0.0, 0.0);
+    // SAFETY: libdevice function of one f32, writing only the two locals.
+    unsafe {
+        __nv_sincospif(2.0 * turns(m as i64, n, a), &mut s0, &mut c0);
+        __nv_sincospif(2.0 * turns(m as i64 - n as i64, n, a), &mut s1, &mut c1);
+    }
+    ((1.0 - w) * c0 + w * c1, -((1.0 - w) * s0 + w * s1))
+}
+
+/// The preconditioner of the object solve at a pixel of `AᴴA`'s diagonal `d`: `max(d + reg,
+/// 1e-12)`.
+#[device]
+fn pre(d: f32, reg: f32) -> f32 {
+    let v = d + reg;
+    if v > 1e-12 { v } else { 1e-12 }
+}
+
+/// The block's sum of each thread's `v`, which thread 0 writes to `*out`. Every thread of the
+/// block must call it.
+///
+/// # Safety
+///
+/// `s` holds `PIXEL_THREADS` shared floats, `out` one float; block `(PIXEL_THREADS, 1, 1)`.
+#[device]
+unsafe fn store_sum(s: *mut f32, v: f32, out: *mut f32) {
+    let t = thread::threadIdx_x() as usize;
+    unsafe {
+        *s.add(t) = v;
+        crate::block_sum::<1>(s);
+        if t == 0 {
+            *out = *s;
+        }
+    }
 }
 
 /// The sampling phase of spectrum index `j` of an `[nyo, nxo]` plane at `(y, x)`, times
@@ -115,9 +191,10 @@ unsafe extern "C" {
 
 #[cuda_module]
 pub mod sampling_kernels {
-    use super::{SamplePass, phase, point};
+    use super::{PCG_PAP, PCG_REG, Pcg, SamplePass, phase, point, pre, square, store_sum};
     use crate::pixel::*;
     use crate::*;
+    use cuda_device::{SharedArray, thread};
 
     /// `scratch[i] = spectra[o] * phase(q) / (nyo * nxo)` for every pass point `q = p0 + i`
     /// of a frame below `nf`, `o` its object mode, `phase` its sampling phase of the pass's
@@ -363,5 +440,225 @@ pub mod sampling_kernels {
         }
         let v = unsafe { load_c(acc, t).0 } * scale;
         unsafe { *out.add(t) = if v > 0.0 { v } else { 0.0 } };
+    }
+
+    /// `acc[o, j] *= sum_f M_f(j)` for every object mode `o`, `M_f` the spectrum of
+    /// `|h_t[-v]|^2` of frame `f`'s position `t` over the whole scan, the product of its axes'
+    /// [`square`], in ascending `f`: with `acc` the transformed [`illum_embed`], an inverse
+    /// transform leaves the diagonal of `AᴴA`. One thread per element of `[nyo, nxo]`.
+    ///
+    /// # Safety
+    ///
+    /// As [`illum_phase`].
+    ///
+    /// [`illum_embed`]: LoadedModule::illum_embed
+    /// [`illum_phase`]: LoadedModule::illum_phase
+    #[kernel]
+    pub unsafe fn diag_phase(
+        views: *const ViewAddr,
+        offsets: *const f32,
+        acc: *mut f32,
+        g: StackGeom,
+        nobj: u32,
+    ) {
+        let n = g.nyo as usize * g.nxo as usize;
+        let t = global_index();
+        if t >= n {
+            return;
+        }
+        let (jy, jx) = ((t / g.nxo as usize) as u32, (t % g.nxo as usize) as u32);
+        let mut sum = (0.0, 0.0);
+        for f in 0..g.nframe {
+            unsafe {
+                let (_, y, x) = point(views, offsets, 0, f, g);
+                let e = cmul(square(jy, g.nyo, y), square(jx, g.nxo, x));
+                sum = (sum.0 + e.0, sum.1 + e.1);
+            }
+        }
+        for o in 0..nobj as usize {
+            unsafe {
+                let v = load_c(acc, o * n + t);
+                store_c(acc, o * n + t, cmul(v, sum));
+            }
+        }
+    }
+
+    /// The pass's planes interpolated in `scratch` weighted on their windows by the probe's
+    /// power and zeroed past them: `scratch[i, y, x] *= sum_p |probe[p, y, x]|^2` over `(y, x)`
+    /// in `[ny, nx]`, else 0, `A`'s windows then `Aᴴ`'s patches embedded at the origin. One
+    /// thread per element of `[npass, nyo, nxo]`.
+    ///
+    /// # Safety
+    ///
+    /// `probe` `[nprobe, ny, nx]`, `scratch` `[npass, nyo, nxo]`.
+    #[kernel]
+    pub unsafe fn normal_mask(probe: *const f32, scratch: *mut f32, g: StackGeom, s: SamplePass) {
+        let n = g.nyo as usize * g.nxo as usize;
+        let t = global_index();
+        if t >= s.npass as usize * n {
+            return;
+        }
+        let j = t % n;
+        let (y, x) = ((j / g.nxo as usize) as u32, (j % g.nxo as usize) as u32);
+        let mut v = (0.0, 0.0);
+        if y < g.ny && x < g.nx {
+            let nw = g.ny as usize * g.nx as usize;
+            let mut w = 0.0;
+            for p in 0..g.nprobe as usize {
+                let q = unsafe { load_c(probe, p * nw + (y * g.nx + x) as usize) };
+                w += q.0 * q.0 + q.1 * q.1;
+            }
+            let a = unsafe { load_c(scratch, t) };
+            v = (a.0 * w, a.1 * w);
+        }
+        unsafe { store_c(scratch, t, v) };
+    }
+
+    /// `s[PCG_REG] = inertia * f32::from_bits(*max_bits)`, the object solve's regularization
+    /// from the bits of `max(D)`. One thread.
+    ///
+    /// # Safety
+    ///
+    /// `max_bits` one word, `pcg` as [`Pcg`] says.
+    #[kernel]
+    pub unsafe fn pcg_reg(max_bits: *const u32, inertia: f32, pcg: Pcg) {
+        if global_index() == 0 {
+            unsafe { *pcg.s.add(PCG_REG as usize) = inertia * f32::from_bits(*max_bits) };
+        }
+    }
+
+    /// The object solve's start from `ap = AᴴA x / scale`: `res = res - scale ap`, `dir = res
+    /// / pre`, `pre` [`pre`] of `den` and the regularization, and block `b`'s `sum |res|^2 /
+    /// pre` over the elements `i ≡ b * PIXEL_THREADS + t (mod gridDim * PIXEL_THREADS)` into
+    /// `part[b]`.
+    ///
+    /// # Safety
+    ///
+    /// `pcg` as [`Pcg`] says, `part` `gridDim.x` floats; block `(PIXEL_THREADS, 1, 1)`.
+    #[kernel]
+    pub unsafe fn pcg_start(pcg: Pcg) {
+        static mut RED: SharedArray<f32, 256> = SharedArray::UNINIT;
+        let stride = thread::gridDim_x() as usize * PIXEL_THREADS as usize;
+        let reg = unsafe { *pcg.s.add(PCG_REG as usize) };
+        let mut sum = 0.0;
+        let mut i = global_index();
+        while i < pcg.n as usize {
+            unsafe {
+                let (b, a) = (load_c(pcg.res, i), load_c(pcg.ap, i));
+                let r = (b.0 - a.0 * pcg.scale, b.1 - a.1 * pcg.scale);
+                let m = pre(*pcg.den.add(i), reg);
+                store_c(pcg.res, i, r);
+                store_c(pcg.dir, i, (r.0 / m, r.1 / m));
+                sum += (r.0 * r.0 + r.1 * r.1) / m;
+            }
+            i += stride;
+        }
+        let out = unsafe { pcg.part.add(thread::blockIdx_x() as usize) };
+        unsafe { store_sum((&raw mut RED).cast::<f32>(), sum, out) }
+    }
+
+    /// `*out = sum part[0 .. npart]`, in a fixed order.
+    ///
+    /// # Safety
+    ///
+    /// `part` holds `npart` floats, `out` one; grid `(1, 1, 1)`, block `(PIXEL_THREADS, 1,
+    /// 1)`.
+    #[kernel]
+    pub unsafe fn pcg_sum(part: *const f32, npart: u32, out: *mut f32) {
+        static mut RED: SharedArray<f32, 256> = SharedArray::UNINIT;
+        let mut sum = 0.0;
+        let mut b = thread::threadIdx_x() as usize;
+        while b < npart as usize {
+            sum += unsafe { *part.add(b) };
+            b += PIXEL_THREADS as usize;
+        }
+        unsafe { store_sum((&raw mut RED).cast::<f32>(), sum, out) }
+    }
+
+    /// The curvature along the object solve's direction from `ap = AᴴA dir / scale`: `ap =
+    /// scale ap + reg dir`, and block `b`'s `sum Re(conj(dir) ap)` into `part[b]`, over the
+    /// elements of [`pcg_start`].
+    ///
+    /// # Safety
+    ///
+    /// As [`pcg_start`].
+    ///
+    /// [`pcg_start`]: LoadedModule::pcg_start
+    #[kernel]
+    pub unsafe fn pcg_curv(pcg: Pcg) {
+        static mut RED: SharedArray<f32, 256> = SharedArray::UNINIT;
+        let stride = thread::gridDim_x() as usize * PIXEL_THREADS as usize;
+        let reg = unsafe { *pcg.s.add(PCG_REG as usize) };
+        let mut sum = 0.0;
+        let mut i = global_index();
+        while i < pcg.n as usize {
+            unsafe {
+                let (a, p) = (load_c(pcg.ap, i), load_c(pcg.dir, i));
+                let v = (a.0 * pcg.scale + reg * p.0, a.1 * pcg.scale + reg * p.1);
+                store_c(pcg.ap, i, v);
+                sum += p.0 * v.0 + p.1 * v.1;
+            }
+            i += stride;
+        }
+        let out = unsafe { pcg.part.add(thread::blockIdx_x() as usize) };
+        unsafe { store_sum((&raw mut RED).cast::<f32>(), sum, out) }
+    }
+
+    /// The object solve's step along `dir`: `alpha = s[rz] / s[PCG_PAP]` if the curvature is
+    /// positive, else 0; `x += alpha dir`, `res -= alpha ap`, and block `b`'s `sum |res|^2 /
+    /// pre` into `part[b]`, over the elements of [`pcg_start`].
+    ///
+    /// # Safety
+    ///
+    /// As [`pcg_start`], `rz` a slot of [`PCG_RZ`](super::PCG_RZ).
+    ///
+    /// [`pcg_start`]: LoadedModule::pcg_start
+    #[kernel]
+    pub unsafe fn pcg_step(pcg: Pcg, rz: u32) {
+        static mut RED: SharedArray<f32, 256> = SharedArray::UNINIT;
+        let stride = thread::gridDim_x() as usize * PIXEL_THREADS as usize;
+        let at = |slot: u32| pcg.s.wrapping_add(slot as usize);
+        let (reg, rz, pap) = unsafe { (*at(PCG_REG), *at(rz), *at(PCG_PAP)) };
+        let alpha = if pap > 0.0 { rz / pap } else { 0.0 };
+        let mut sum = 0.0;
+        let mut i = global_index();
+        while i < pcg.n as usize {
+            unsafe {
+                let (v, p) = (load_c(pcg.x, i), load_c(pcg.dir, i));
+                let (a, r) = (load_c(pcg.ap, i), load_c(pcg.res, i));
+                store_c(pcg.x, i, (v.0 + alpha * p.0, v.1 + alpha * p.1));
+                let r = (r.0 - alpha * a.0, r.1 - alpha * a.1);
+                store_c(pcg.res, i, r);
+                sum += (r.0 * r.0 + r.1 * r.1) / pre(*pcg.den.add(i), reg);
+            }
+            i += stride;
+        }
+        let out = unsafe { pcg.part.add(thread::blockIdx_x() as usize) };
+        unsafe { store_sum((&raw mut RED).cast::<f32>(), sum, out) }
+    }
+
+    /// The object solve's next direction: `beta = s[next] / s[rz]` if `s[rz] > 0`, else 0;
+    /// `dir = res / pre + beta dir`, over the elements of [`pcg_start`].
+    ///
+    /// # Safety
+    ///
+    /// As [`pcg_start`], `rz` and `next` slots of [`PCG_RZ`](super::PCG_RZ).
+    ///
+    /// [`pcg_start`]: LoadedModule::pcg_start
+    #[kernel]
+    pub unsafe fn pcg_dir(pcg: Pcg, rz: u32, next: u32) {
+        let stride = thread::gridDim_x() as usize * PIXEL_THREADS as usize;
+        let at = |slot: u32| pcg.s.wrapping_add(slot as usize);
+        let (reg, rz, next) = unsafe { (*at(PCG_REG), *at(rz), *at(next)) };
+        let beta = if rz > 0.0 { next / rz } else { 0.0 };
+        let mut i = global_index();
+        while i < pcg.n as usize {
+            unsafe {
+                let (r, p) = (load_c(pcg.res, i), load_c(pcg.dir, i));
+                let m = pre(*pcg.den.add(i), reg);
+                store_c(pcg.dir, i, (r.0 / m + beta * p.0, r.1 / m + beta * p.1));
+            }
+            i += stride;
+        }
     }
 }

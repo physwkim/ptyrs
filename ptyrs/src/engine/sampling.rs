@@ -142,12 +142,26 @@ impl Sampler {
     /// The adjoint of [`Self::windows`] without derivative: `patches` (one natural-layout
     /// window per view) placed onto `nobj` object planes.
     pub(crate) fn place(&self, patches: &[C64], nobj: usize) -> Stack<C64> {
+        self.convolve(patches, nobj, |t, m| {
+            (m.iter_mut().enumerate()).for_each(|(j, m)| *m = self.phase(j, t, &[]).conj())
+        })
+    }
+
+    /// Per view point, `patches` summed at the plane's origin and circularly convolved by the
+    /// kernel whose spectrum `kernel(t, spectrum)` writes, summed onto `nobj` object planes.
+    fn convolve(
+        &self,
+        patches: &[C64],
+        nobj: usize,
+        kernel: impl Fn([f64; 2], &mut [C64]),
+    ) -> Stack<C64> {
         let [nyo, nxo] = self.fft.shape();
         let n = nyo * nxo;
         let [py, px] = self.window;
         assert_eq!(patches.len(), self.points.len() * py * px);
         let mut out = Stack::filled([nobj, nyo, nxo], C64::default());
         let mut plane = vec![C64::default(); n];
+        let mut spectrum = vec![C64::default(); n];
         let mut start = 0;
         for group in self.points.chunk_by(|a, b| a == b) {
             let (obj, t) = group[0];
@@ -160,8 +174,9 @@ impl Sampler {
             }
             start = end;
             self.fft.forward(&mut plane);
-            for (j, (o, p)) in out.plane_mut(obj).iter_mut().zip(&plane).enumerate() {
-                *o += p * self.phase(j, t, &[]).conj();
+            kernel(t, &mut spectrum);
+            for ((o, p), m) in out.plane_mut(obj).iter_mut().zip(&plane).zip(&spectrum) {
+                *o += p * m;
             }
         }
         self.fft.inverse(out.as_mut_slice());
@@ -172,10 +187,45 @@ impl Sampler {
     /// squared moduli, pty-chi's illumination map.
     pub(crate) fn place_norm(&self, patches: &[f64], nobj: usize) -> Stack<f64> {
         let patches: Vec<C64> = patches.iter().map(|&p| C64::new(p, 0.0)).collect();
-        let placed = self.place(&patches, nobj);
-        let data = placed.as_slice().iter().map(|c| c.re.max(0.0)).collect();
-        Stack::from_vec(placed.dims(), data).unwrap()
+        floored(self.place(&patches, nobj))
     }
+
+    /// The diagonal of `AᴴA`, `A` the views' windows each weighted by a `W` with `|W|²` the
+    /// real `patches` (natural layout), its real part floored at 0: per object pixel `i`,
+    /// `Σ_views Σ_u |W[u]|²·|h_t[u − i]|²` with `h_t` the kernel that samples a window at `t`.
+    /// The spectrum of `|h_t[−·]|²` is [`square_spectrum`]'s per axis, which at a whole-pixel
+    /// `t` is [`Self::place`]'s conjugate phase, where this is [`Self::place_norm`].
+    pub(crate) fn diag(&self, patches: &[f64], nobj: usize) -> Stack<f64> {
+        let nxo = self.fft.shape()[1];
+        let patches: Vec<C64> = patches.iter().map(|&p| C64::new(p, 0.0)).collect();
+        floored(self.convolve(&patches, nobj, |t, m| {
+            let [my, mx] = [0, 1].map(|a| square_spectrum(t[a], self.fft.shape()[a]));
+            (m.iter_mut().enumerate()).for_each(|(j, m)| *m = my[j / nxo] * mx[j % nxo])
+        }))
+    }
+}
+
+/// The steps of [`Sampling::FullObject`]'s object solve in AP, DM and RAAR.
+pub(crate) const OBJ_PCG: usize = 10;
+
+/// The spectrum over `n` points of `|h_t[−v]|²`, `h_t[v] = (1/n)·Σ_k exp(2πi k (t + v)/n)`
+/// over numpy's `fftfreq` bins `k` the one-axis kernel that samples at `t`: at index
+/// `m < n`, `(1 − m/n)·exp(−2πi t m/n) + (m/n)·exp(−2πi t (m − n)/n)`, the bin pairs
+/// `k − k'` of `m` and `m − n`.
+fn square_spectrum(t: f64, n: usize) -> Vec<C64> {
+    (0..n)
+        .map(|m| {
+            let a = m as f64 / n as f64;
+            C64::from_polar(1.0 - a, -2.0 * PI * t * a)
+                + C64::from_polar(a, -2.0 * PI * t * (a - 1.0))
+        })
+        .collect()
+}
+
+/// The real part of `placed`, floored at 0.
+fn floored(placed: Stack<C64>) -> Stack<f64> {
+    let data = placed.as_slice().iter().map(|c| c.re.max(0.0)).collect();
+    Stack::from_vec(placed.dims(), data).unwrap()
 }
 
 #[cfg(test)]
@@ -298,6 +348,42 @@ mod tests {
             (lhs - rhs).norm() < 1e-14 * lhs.norm(),
             "{lhs} against {rhs}"
         );
+    }
+
+    /// `diag` against `Σ_views Σ_u |W[u]|²·|windows(e_i)[u]|²` per unit object `e_i`, at
+    /// fractional offsets and at whole-pixel ones, where it is also `place_norm`.
+    #[test]
+    fn diag_is_the_diagonal_of_the_normal_operator() {
+        let [nyo, nxo] = OBJ;
+        let n = nyo * nxo;
+        let views = views();
+        let power: Vec<f64> = (noise(4 * WINDOW[0] * WINDOW[1], 4).iter())
+            .map(|c| c.norm_sqr())
+            .collect();
+        let whole = OFFSETS.map(|d| d.map(f64::round));
+        for offsets in [OFFSETS, whole] {
+            let sm = Sampler::new(OBJ, WINDOW, &views, offsets);
+            let got = sm.diag(&power, 2);
+            let mut unit = Object::new(Stack::filled([2, nyo, nxo], C64::default()));
+            let want: Vec<f64> = (0..2 * n)
+                .map(|i| {
+                    unit.as_mut_slice()[i] = C64::new(1.0, 0.0);
+                    let w = sm.windows(&unit, &[]);
+                    unit.as_mut_slice()[i] = C64::default();
+                    let o = w.as_slice().iter().zip(&power);
+                    o.map(|(w, p)| p * w.norm_sqr()).sum()
+                })
+                .collect();
+            let scale = want.iter().copied().fold(0.0, f64::max);
+            let err = worst_of((got.as_slice().iter().zip(&want)).map(|(g, w)| (g - w).abs()));
+            assert!(err < 1e-14 * scale, "{offsets:?}: {err:.3e} of {scale:.3e}");
+            if offsets == whole {
+                let norm = sm.place_norm(&power, 2);
+                let it = got.as_slice().iter().zip(norm.as_slice());
+                let err = worst_of(it.map(|(g, w)| (g - w).abs()));
+                assert!(err < 1e-14 * scale, "place_norm: {err:.3e} of {scale:.3e}");
+            }
+        }
     }
 
     /// At zero offsets the placed `|P|²` is the illumination map summed on the windows.
