@@ -34,7 +34,7 @@ use super::{
 };
 use crate::engine::features::{POSITION_LIMIT, POSITION_STEP};
 use crate::engine::ptycho::{Algorithm, llk_due};
-use crate::engine::{Cost, EngineError, LsqmlParams, LsqmlStep, random_batches};
+use crate::engine::{Cost, EngineError, LsqmlParams, LsqmlStep, Sampling, random_batches};
 
 /// What an epoch does to the object preconditioner before its batches, on
 /// [`crate::engine::Lsqml::epoch`]'s schedule: the first epoch of a call builds it, epochs 1–9 and
@@ -486,9 +486,13 @@ impl LsqmlState {
         self.size
     }
 
-    /// Whether the state is the position model's.
-    pub(super) fn moved(&self) -> bool {
-        !matches!(self.reading, Reading::Patch)
+    /// The sampling its views read the object under, if the state is the position model's.
+    pub(super) fn reads(&self) -> Option<Sampling> {
+        match self.reading {
+            Reading::Patch => None,
+            Reading::Moved(_) => Some(Sampling::Patch),
+            Reading::Windows { .. } => Some(Sampling::FullObject),
+        }
     }
 
     /// Sets the epoch's frame order: `order` holds the scan frame at each epoch position.
