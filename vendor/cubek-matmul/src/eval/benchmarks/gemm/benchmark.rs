@@ -1,0 +1,176 @@
+use cubecl::{
+    benchmark::{Benchmark, ProfileDuration, TimingMethod},
+    client::Client,
+    future,
+    prelude::*,
+    std::tensor::TensorHandle,
+    zspace::Shape,
+};
+use cubek_std::{InputBinding, MatrixLayout};
+use cubek_test_utils::{RunSamples, TestInput};
+
+use crate::{
+    definition::{MatmulElems, MatmulPrecision},
+    eval::benchmarks::gemm::problem::{GemmProblem, Precision},
+    launch::launch_ref,
+    strategy::Strategy,
+};
+
+pub fn bench(
+    strategy: &Strategy,
+    problem: &GemmProblem,
+    num_samples: usize,
+) -> Result<RunSamples, String> {
+    match problem.precision {
+        Precision::F32 => bench_with::<f32>(problem, strategy, num_samples),
+        Precision::F16 => bench_with::<half::f16>(problem, strategy, num_samples),
+    }
+}
+
+fn bench_with<MP: MatmulPrecision>(
+    problem: &GemmProblem,
+    strategy: &Strategy,
+    num_samples: usize,
+) -> Result<RunSamples, String> {
+    let device = cubecl::test_device();
+    let client = device.client();
+    let elems = MatmulElems::new_deprecated::<MP>();
+
+    let bench = GemmBench {
+        b: problem.b,
+        m: problem.m,
+        n: problem.n,
+        k: problem.k,
+        lhs_layout: problem.lhs_layout,
+        rhs_layout: problem.rhs_layout,
+        strategy: strategy.clone(),
+        client: client.clone(),
+        device,
+        dtypes: elems.clone(),
+        samples: num_samples,
+    };
+
+    let durations = bench
+        .run(cubek_test_utils::timing_method(TimingMethod::System))
+        .map_err(|e| format!("benchmark failed: {e}"))?
+        .durations;
+
+    Ok(RunSamples::new(durations))
+}
+
+struct GemmBench {
+    b: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+    lhs_layout: MatrixLayout,
+    rhs_layout: MatrixLayout,
+    strategy: Strategy,
+    device: cubecl::Device,
+    client: Client,
+    dtypes: MatmulElems,
+    samples: usize,
+}
+
+fn make_uniform(
+    client: &Client,
+    shape: [usize; 3],
+    dtype: ElemType,
+    seed: u64,
+    lo: f32,
+    hi: f32,
+) -> TensorHandle {
+    TestInput::builder(client.clone(), Shape::new(shape))
+        .dtype(dtype)
+        .uniform(seed, lo, hi)
+        .generate_without_host_data()
+}
+
+impl Benchmark for GemmBench {
+    type Input = (TensorHandle, TensorHandle);
+    type Output = ();
+
+    fn prepare(&self) -> Self::Input {
+        let client = self.device.client();
+        let tl = matches!(self.lhs_layout, MatrixLayout::ColMajor);
+        let tr = matches!(self.rhs_layout, MatrixLayout::ColMajor);
+
+        let mut lhs = make_uniform(
+            &client,
+            [self.b, self.m, self.k],
+            self.dtypes.lhs_global,
+            0,
+            0.0,
+            1.0,
+        );
+        if tl {
+            let len = lhs.metadata.rank();
+            lhs.metadata.strides_mut().swap(len - 2, len - 1);
+        }
+
+        let mut rhs = make_uniform(
+            &client,
+            [self.b, self.k, self.n],
+            self.dtypes.rhs_global,
+            1,
+            0.0,
+            1.1,
+        );
+        if tr {
+            let len = rhs.metadata.rank();
+            rhs.metadata.strides_mut().swap(len - 2, len - 1);
+        }
+
+        (lhs, rhs)
+    }
+
+    fn execute(&self, (lhs, rhs): Self::Input) -> Result<Self::Output, String> {
+        let client = self.device.client();
+        let out = TensorHandle::empty(
+            &client,
+            vec![self.b, self.m, self.n],
+            self.dtypes.acc_global,
+        );
+
+        launch_ref(
+            &self.strategy,
+            &self.client,
+            InputBinding::Normal(lhs.binding(), self.dtypes.lhs_global),
+            InputBinding::Normal(rhs.binding(), self.dtypes.lhs_global),
+            out.clone().binding(),
+            &mut self.dtypes.clone(),
+        )
+        .map_err(|err| format!("{err:?}"))?;
+        Ok(())
+    }
+
+    fn num_samples(&self) -> usize {
+        self.samples
+    }
+
+    fn name(&self) -> String {
+        let client = self.device.client();
+        format!(
+            "{}-matmul-Lhs<{}-{}-{}>-Rhs<{}-{}-{}>-{}-{}-{}",
+            client.name(),
+            self.dtypes.lhs_global,
+            self.dtypes.lhs_stage,
+            self.dtypes.lhs_register,
+            self.dtypes.rhs_global,
+            self.dtypes.rhs_stage,
+            self.dtypes.rhs_register,
+            self.dtypes.acc_register,
+            self.dtypes.acc_global,
+            self.strategy,
+        )
+        .to_lowercase()
+    }
+
+    fn sync(&self) {
+        future::block_on(self.client.sync()).unwrap()
+    }
+
+    fn profile(&self, args: Self::Input) -> Result<ProfileDuration, String> {
+        cubek_test_utils::profile_launch(&self.client, "matmul-bench", || self.execute(args))
+    }
+}
