@@ -29,6 +29,16 @@ fn rel_l2(a: &Stack<C64>, b: &Stack<C64>) -> f64 {
     (e / t).sqrt()
 }
 
+/// [`rel_l2`] with each pixel's squares weighted by `weight`'s.
+fn weighted_l2(a: &Stack<C64>, b: &Stack<C64>, weight: &Stack<f64>) -> f64 {
+    let (mut e, mut t) = (0.0, 0.0);
+    for ((x, y), w) in (a.as_slice().iter().zip(b.as_slice())).zip(weight.as_slice()) {
+        e += w * (x - y).norm_sqr();
+        t += w * y.norm_sqr();
+    }
+    (e / t).sqrt()
+}
+
 const RPIE: RpieParams = RpieParams {
     obj_step: Some(1.0),
     probe_step: Some(1.0),
@@ -278,21 +288,14 @@ impl Ended {
         let offsets = (self.features.position.as_ref()).map(|p| p.values.as_slice());
         Sampling::FullObject.illumination(views, self.object.dims(), &self.probe, offsets)
     }
+}
 
-    /// This run with its object times `√weight`, so that [`assert_close`] of two such weighs
-    /// the object's distance by `weight`.
-    fn lit(&self, weight: &Stack<f64>) -> Self {
-        let object = (self.object.as_slice().iter())
-            .zip(weight.as_slice())
-            .map(|(o, w)| o * w.sqrt())
-            .collect();
-        Self {
-            llk: self.llk.clone(),
-            object: Object::new(Stack::from_vec(self.object.dims(), object).unwrap()),
-            probe: self.probe.clone(),
-            features: self.features.clone(),
-        }
-    }
+/// `got`'s object within `tol` of `want`'s, weighted by `lit`, an [`Ended::illumination`]: the
+/// band the counts see, which [`assert_close`]'s whole plane leaves to the dark band's errors.
+fn assert_lit(what: &str, got: &Ended, want: &Ended, lit: &Stack<f64>, tol: f64) {
+    let e = weighted_l2(&got.object, &want.object, lit);
+    eprintln!("{what}: lit object {e:.2e}");
+    assert!(e < tol, "{what} lit object: {e:e}");
 }
 
 /// `got`'s records, object, probe, scale and background, and offsets (over the largest)
@@ -376,18 +379,20 @@ fn full_object_projections_match_cpu_under_fresnel_back() {
 /// and with a scale and a background, against the CPU's under `Sampling::FullObject`,
 /// eagerly and from graphs, over stacks of 8 frames and a last of 6, as
 /// [`projections_match_cpu_under_every_propagator`] holds them; DM's and RAAR's carried exit
-/// waves in f16 against f32 over two cycles, from graphs. The object's distance is weighted
-/// by [`Ended::illumination`] of the run compared against. A test per propagator, so the
-/// three run side by side: the CPU's object solve is most of each.
+/// waves in f16 against f32 over two cycles, from graphs. The object over the whole plane and
+/// weighted by [`Ended::illumination`] of the run compared against. A test per propagator, so
+/// the three run side by side: the CPU's object solve is most of each.
 fn full_object_projections_match_cpu(c: &Case) {
     const NCYCLE: usize = 8;
-    // Measured worst: LLK 6.2e-6, object 1.9e-6, probe 1.9e-6, features 1.1e-5, offsets
-    // 5.8e-7; the object's whole plane 1.2e-5, the dark band's.
-    const TOL: [f64; 5] = [1.9e-5, 5.6e-6, 5.7e-6, 3.4e-5, 1.8e-6];
+    // Measured worst: LLK 6.2e-6, object 1.2e-5 over the whole plane (most of it the dark
+    // band's) and 1.9e-6 weighted, probe 1.9e-6, features 1.1e-5, offsets 5.8e-7.
+    const TOL: [f64; 5] = [1.9e-5, 3.7e-5, 5.7e-6, 3.4e-5, 1.8e-6];
+    const TOL_LIT: f64 = 5.6e-6;
     const NCYCLE_F16: usize = 2;
-    // Measured worst: LLK 2.6e-5, object 1.8e-4, probe 5.7e-5, features 7.4e-5, offsets
-    // 5.5e-5.
-    const TOL_F16: [f64; 5] = [7.9e-5, 5.4e-4, 1.8e-4, 2.3e-4, 1.7e-4];
+    // Measured worst: LLK 2.6e-5, object 1.2e-4 over the whole plane and 1.8e-4 weighted,
+    // probe 5.7e-5, features 7.4e-5, offsets 5.5e-5.
+    const TOL_F16: [f64; 5] = [7.9e-5, 3.6e-4, 1.8e-4, 2.3e-4, 1.7e-4];
+    const TOL_F16_LIT: f64 = 5.4e-4;
     let frame = FUSED_SIDES[0] as usize;
     let moved = Features {
         position: Some(Feature::refined(drawn_offsets())),
@@ -427,15 +432,17 @@ fn full_object_projections_match_cpu(c: &Case) {
             let lit = want.illumination(c.addr.views());
             for graph in [false, true] {
                 let what = format!("{name} {} {label} graph {graph}", c.name);
-                let got = run(graph, false, NCYCLE).lit(&lit);
-                assert_close(&what, &got, &want.lit(&lit), TOL);
+                let got = run(graph, false, NCYCLE);
+                assert_close(&what, &got, &want, TOL);
+                assert_lit(&what, &got, &want, &lit, TOL_LIT);
             }
             if name != "AP" {
                 let what = format!("{name} {} {label} f16 against f32", c.name);
                 let want = run(true, false, NCYCLE_F16);
+                let got = run(true, true, NCYCLE_F16);
+                assert_close(&what, &got, &want, TOL_F16);
                 let lit = want.illumination(c.addr.views());
-                let got = run(true, true, NCYCLE_F16).lit(&lit);
-                assert_close(&what, &got, &want.lit(&lit), TOL_F16);
+                assert_lit(&what, &got, &want, &lit, TOL_F16_LIT);
             }
         }
     }
