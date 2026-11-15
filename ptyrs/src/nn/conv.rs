@@ -3,8 +3,9 @@
 //! matmul whose output, `co × 9·ci` (64 × 576 at a U-Net's top level), is a few dozen cubes at
 //! most while its inner dimension is every pixel of the batch, so most of the GPU idles; here each
 //! cube sums its own band and one more kernel adds the bands. The kernel takes deep levels too,
-//! where burn's matmul is faster, because burn 0.22.1's f32 weight gradient is wrong for some
-//! shapes (2 to 64 channels on 8 × 8 pixels, for one).
+//! where burn's matmul is faster, because burn 0.22.1 takes the f32 weight gradient on TF32
+//! tensor cores, whose rounding puts it 1e-4 off and whose kernels, for some shapes (2 to 64
+//! channels on 8 × 8 pixels, for one), put it off by most of its magnitude.
 
 use burn::backend::autodiff::checkpoint::base::Checkpointer;
 use burn::backend::autodiff::checkpoint::strategy::CheckpointStrategy;
@@ -574,10 +575,12 @@ mod tests {
     use super::*;
     use burn::module::Param;
     use burn::nn::conv::Conv2dConfig;
+    use burn::tensor::ops::PadMode;
     use burn::tensor::{DType, Distribution};
 
-    /// A convolution's sizes: batch, height, width, input and output channels, and whether it has
-    /// a bias, whether its input asks for a gradient and whether that input is a strided view.
+    /// A convolution's sizes: batch, height, width, input and output channels, kernel side, and
+    /// whether it has a bias, whether its input asks for a gradient and whether that input is a
+    /// strided view.
     #[derive(Clone, Copy, Debug)]
     struct Case {
         n: usize,
@@ -585,6 +588,7 @@ mod tests {
         w: usize,
         ci: usize,
         co: usize,
+        k: usize,
         bias: bool,
         x_grad: bool,
         strided: bool,
@@ -597,6 +601,7 @@ mod tests {
             w,
             ci,
             co,
+            k: 3,
             bias: true,
             x_grad: true,
             strided: false,
@@ -615,7 +620,7 @@ mod tests {
         let f32 = |t: Tensor<4>| t.cast(DType::F32).detach();
         [
             f32(Tensor::random(x, normal, device)),
-            f32(Tensor::random([c.co, c.ci, 3, 3], normal, device)),
+            f32(Tensor::random([c.co, c.ci, c.k, c.k], normal, device)),
             f32(Tensor::random([1, 1, 1, c.co], normal, device)),
             f32(Tensor::random([c.n, c.h, c.w, c.co], normal, device)),
         ]
@@ -633,7 +638,7 @@ mod tests {
     /// gradient not asked for is empty.
     fn run(c: Case, inputs: &[Tensor<4>; 4], dtype: DType, fused: bool) -> [Vec<f64>; 4] {
         let [x, weight, bias, g] = inputs.clone().map(|t| t.cast(dtype));
-        let mut conv2d = Conv2dConfig::new([c.ci, c.co], [3, 3])
+        let mut conv2d = Conv2dConfig::new([c.ci, c.co], [c.k, c.k])
             .with_padding(PaddingConfig2d::Same)
             .with_bias(c.bias)
             .init(&x.device());
@@ -736,11 +741,140 @@ mod tests {
         });
     }
 
-    /// Every convolution PtychoNN runs at its defaults.
+    /// The f64 weight gradient of `Σ y·g`, `y` the `k × k` same convolution of the channels-last
+    /// `x`: for each kernel offset, `gᵀ` times `x` shifted by it, a product per image row summed
+    /// over rows. burn's f64 convolution would unfold `x` nine-fold, 6.7 GB on pty-chi's 852²
+    /// 128-channel one.
+    fn weight_gradient(c: Case, x: Tensor<4>, g: Tensor<4>) -> Vec<f64> {
+        let p = c.k / 2;
+        let rows = c.n * c.h;
+        let x = x
+            .cast(DType::F64)
+            .pad([(p, p), (p, p), (0, 0)], PadMode::Constant(0.0));
+        let gt = g
+            .cast(DType::F64)
+            .reshape([rows, c.w, c.co])
+            .swap_dims(1, 2);
+        let offsets = (0..c.k * c.k)
+            .map(|o| {
+                let (ky, kx) = (o / c.k, o % c.k);
+                let shifted = x
+                    .clone()
+                    .slice([0..c.n, ky..ky + c.h, kx..kx + c.w])
+                    .reshape([rows, c.w, c.ci]);
+                gt.clone().matmul(shifted).sum_dim(0).reshape([c.co, c.ci])
+            })
+            .collect();
+        host(Tensor::<2>::stack::<3>(offsets, 2))
+    }
+
+    /// The f32 weight gradient through [`Conv::forward`] against the f64 one, to `tol` of its
+    /// largest magnitude.
+    fn f32_weight_gradient(c: Case, tol: f64) {
+        let device = crate::nn::cuda(0).autodiff();
+        let inputs = inputs(c, &device);
+        let reference = weight_gradient(c, inputs[0].clone(), inputs[3].clone());
+        let [_, _, dw, _] = run(c, &inputs, DType::F32, true);
+        let (err, scale) = max_error(&dw, &reference);
+        assert!(
+            err <= tol * scale,
+            "{c:?}: f32 weight gradient off by {err:e} of {scale:e}"
+        );
+    }
+
+    /// The `[side, in, out]` of each distinct convolution of a PtychoNN on `side`² images of
+    /// `images` channels, as `PtychoNN::new` builds it: two per encoder stage, two per decoder
+    /// stage, then the output's.
+    fn ptychonn(images: usize, width: usize, depth: usize, side: usize) -> Vec<[usize; 3]> {
+        let mut convs = Vec::new();
+        let mut s = side;
+        for k in 0..depth {
+            let cin = if k == 0 { images } else { width << (k - 1) };
+            convs.extend([[s, cin, width << k], [s, width << k, width << k]]);
+            s /= 2;
+        }
+        let top = width << (depth - 1);
+        for k in 0..depth {
+            let (cin, cout) = (top >> k, (top >> k) / 2);
+            convs.extend([[s, cin, cout], [s, cout, cout]]);
+            s *= 2;
+        }
+        convs.push([side, top >> depth, 1]);
+        convs.sort();
+        convs.dedup();
+        convs
+    }
+
+    /// The same for a DIP U-Net on a `side`² image, as `DipNet::new` builds it.
+    fn dip(code: usize, width: usize, depth: usize, side: usize) -> Vec<[usize; 3]> {
+        let w = |k: usize| width << k;
+        let top = w(depth - 1);
+        let mut convs = vec![[side >> depth, top, top], [side, w(0), 2]];
+        for k in 0..depth {
+            let s = side >> k;
+            let deeper = if k + 1 == depth { top } else { w(k + 1) };
+            let cin = if k == 0 { code } else { w(k - 1) };
+            convs.extend([[s, cin, w(k)], [s, deeper + w(k), w(k)], [s, w(k), w(k)]]);
+        }
+        convs.sort();
+        convs.dedup();
+        convs
+    }
+
+    /// Every convolution PtychoNN runs as `nn_train_ptychonn` trains it: one or two 64² images
+    /// (256² frames binned by 4), width 32, depth 3, batches of 32.
     #[test]
     fn ptychonn_convolutions() {
-        // The decoders' output convolution, whose f32 weight gradient from burn is off by 4.8e-5.
-        agrees(case(32, 64, 64, 16, 1));
+        let mut convs = [ptychonn(1, 32, 3, 64), ptychonn(2, 32, 3, 64)].concat();
+        convs.sort();
+        convs.dedup();
+        for [side, ci, co] in convs {
+            f32_weight_gradient(case(32, side, side, ci, co), 2e-5);
+        }
+    }
+
+    /// Every convolution a DIP runs at its defaults (width 16, depth 4, code 8) on a 320² image.
+    #[test]
+    fn dip_convolutions() {
+        for [side, ci, co] in dip(8, 16, 4, 320) {
+            f32_weight_gradient(case(1, side, side, ci, co), 2e-5);
+        }
+    }
+
+    /// Every convolution of pty-chi's U-Net as `nn_dip_ptychi` runs it on the 852² comparison
+    /// object from 32 code channels; its 3×3 convolutions have no bias. The 1×1 output
+    /// convolution is burn's throughout, in TF32: 4.4e-4 off, and 4.2e-6 with TF32 off.
+    #[test]
+    fn ptychi_unet_convolutions() {
+        for [side, ci, co] in [
+            [852, 32, 64],
+            [852, 64, 64],
+            [426, 64, 128],
+            [426, 128, 128],
+            [213, 128, 256],
+            [213, 256, 256],
+            [106, 256, 512],
+            [106, 512, 512],
+            [53, 512, 512],
+            [106, 1024, 512],
+            [106, 512, 256],
+            [213, 512, 256],
+            [213, 256, 128],
+            [426, 256, 128],
+            [426, 128, 64],
+            [852, 128, 64],
+        ] {
+            let c = Case {
+                bias: false,
+                ..case(1, side, side, ci, co)
+            };
+            f32_weight_gradient(c, 2e-5);
+        }
+        let outc = Case {
+            k: 1,
+            ..case(1, 852, 852, 64, 2)
+        };
+        f32_weight_gradient(outc, 2e-3);
     }
 
     #[test]
