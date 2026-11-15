@@ -435,8 +435,10 @@ fn dots_on_own_modes_match_each_frame_alone() {
     );
 }
 
-/// [`LsqmlKernels::frame_dirs`] of the batch, `[NB, n]` each, over [`STACKS`] after a stack
-/// at positions before the batch, which writes nothing; every plane starts as NaN.
+/// [`LsqmlKernels::frame_dirs`] of the batch, `[NB, n]` each, over a full and a short batch
+/// stack and then a stack straddling the batch start and one before it, whose frames outside
+/// the batch must write nothing: launched last so no batch stack can overwrite a stray
+/// plane. Every plane starts as NaN.
 fn frame_dirs(g: &Gpu, x: &Inputs) -> (Vec<C32>, Vec<f32>) {
     let nan = C32 {
         re: f32::NAN,
@@ -444,13 +446,14 @@ fn frame_dirs(g: &Gpu, x: &Inputs) -> (Vec<C32>, Vec<f32>) {
     };
     let mut d = DeviceBuffer::from_host(&g.stream, &vec![nan; NB * N]).unwrap();
     let mut vv = DeviceBuffer::from_host(&g.stream, &vec![f32::NAN; NB * N]).unwrap();
-    let before = 0..BATCH.start;
-    let stacks: Vec<Range<u32>> = [before.clone()].into_iter().chain(STACKS).collect();
+    let stacks = [3..6, 6..7, 1..3, 0..BATCH.start];
     let table = StackTable::new(&g.stream, &dims(), &stacks).unwrap();
-    let chi = [noise(NF_MAX * NMODE * N, 30)]
-        .into_iter()
-        .chain(x.chi.iter().cloned());
-    for (s, chi) in chi.enumerate() {
+    let m = NMODE * N;
+    for (s, r) in stacks.iter().enumerate() {
+        let mut chi = noise(NF_MAX * m, 30 + s as u64);
+        for (fl, p) in r.clone().enumerate().filter(|(_, p)| BATCH.contains(p)) {
+            chi[fl * m..(fl + 1) * m].copy_from_slice(x.frame_chi(p));
+        }
         let out = FrameDirs {
             d: &mut d,
             vv: &mut vv,
