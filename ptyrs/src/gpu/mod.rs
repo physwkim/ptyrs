@@ -71,7 +71,7 @@ pub use optics::{
     BandCarry, BandedTransfer, ExitPass, ExitStage, FrameWaves, OpticsKernels, SlicePhase,
     SliceSource,
 };
-pub use position::{PositionKernels, PositionRule, Positions, Solve};
+pub use position::{PositionKernels, PositionRule, PositionStep, Positions, Solve};
 pub use psi::{HalfWaves, Waves, half_scale};
 pub use ring::{Ended, FrameLlk, LlkRing, LlkTotals, RecordWriter, RingDevice, RingError};
 pub use rpie::{POWER_CHUNK, PowerMax, RpieKernels, Weight};

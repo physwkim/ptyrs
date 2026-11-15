@@ -18,15 +18,15 @@ use crate::gpu::sampling::{Modes, ObjectSampler, StackPoints, WindowBlock, windo
 use crate::gpu::{
     BhScan, C32, EpochOrder, Error as GpuError, FrameWaves, FusedInputs, Kernels, LSQML_REC,
     LsqmlAt, LsqmlChi, LsqmlKernels, LsqmlNoise, LsqmlScan, LsqmlVar, Model, PositionRule,
-    Positions, PsiSums, ShiftProbe, SliceSource, SliceSteps, Solve, StackRef, StackTable,
-    UpdateSums, ViewDims, Views,
+    PositionStep, Positions, PsiSums, ShiftProbe, SliceSource, SliceSteps, Solve, StackRef,
+    StackTable, UpdateSums, ViewDims, Views,
 };
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaStream, DeviceBuffer};
 
 use super::device::{
-    Moved, MovedLent, MovedSampling, MovedScratch, PassesMut, PositionLent, moved_inputs,
-    moved_shift, slice_phase,
+    FeaturesMut, Moved, MovedLent, MovedSampling, MovedScratch, PassesMut, PositionLent,
+    moved_inputs, moved_shift, slice_phase,
 };
 use super::{
     Bufs, Cut, Frames, GpuPtycho, StackRule, Streamed, batch_stacks, plane_bytes, plane_len,
@@ -123,30 +123,48 @@ pub(super) struct LsqmlState {
     sliced: Option<SliceBufs>,
 }
 
-/// What an LSQML state's views read of the object.
+/// What an LSQML state's views read of the object; under the position model with the
+/// offsets' step, if the position is refined.
 enum Reading {
     /// Each view's patch at its corner.
     Patch,
     /// The patches through the probe moved by each frame's modelled offset
     /// ([`crate::engine::Sampling::Patch`]).
-    Moved(Box<Moved>),
+    Moved {
+        moved: Box<Moved>,
+        step: Option<PositionStep>,
+    },
     /// Each view's window of the object at its corner and modelled offset
     /// ([`crate::engine::Sampling::FullObject`]).
     Windows {
         moved: Box<Moved>,
         windows: Box<Windows>,
+        step: Option<PositionStep>,
     },
 }
 
+/// [`Reading::split`]: the position model's state, the windows' and the offsets' step.
+type ReadingSplit<'r> = (
+    Option<&'r mut Moved>,
+    Option<&'r mut Windows>,
+    Option<&'r mut PositionStep>,
+);
+
 impl Reading {
-    /// The position model's state and, under [`crate::engine::Sampling::FullObject`], the
-    /// windows'.
-    fn split(&mut self) -> (Option<&mut Moved>, Option<&mut Windows>) {
-        match self {
-            Self::Patch => (None, None),
-            Self::Moved(moved) => (Some(&mut **moved), None),
-            Self::Windows { moved, windows } => (Some(&mut **moved), Some(&mut **windows)),
-        }
+    /// The position model's state, under [`crate::engine::Sampling::FullObject`] the windows',
+    /// and the offsets' step as `features` refine the position: an error when the state was
+    /// built for the other.
+    fn split(&mut self, features: &FeaturesMut<'_>) -> Result<ReadingSplit<'_>, GpuError> {
+        let (moved, windows, step) = match self {
+            Self::Patch => (None, None, None),
+            Self::Moved { moved, step } => (Some(&mut **moved), None, step.as_mut()),
+            Self::Windows {
+                moved,
+                windows,
+                step,
+            } => (Some(&mut **moved), Some(&mut **windows), step.as_mut()),
+        };
+        Ok((moved, windows, features.own_step(step)?))
     }
 }
 
@@ -163,23 +181,18 @@ struct Windows {
     sums: UpdateSums,
     /// A stack's windows of an object direction.
     dir: DeviceBuffer<C32>,
-    /// A stack's window derivatives along `y` then `x`, object mode 0, which the position
-    /// sums take.
-    deriv: DeviceBuffer<C32>,
     /// The illumination map the preconditioner takes.
     illum: DeviceBuffer<f32>,
 }
 
 impl Windows {
-    /// For `stacks` of views of `dims`, `slots` per batch of up to `nf_max` frames each,
-    /// through `nslice` slices.
+    /// For `stacks` of views of `dims`, `slots` per batch, through `nslice` slices.
     fn new(
         stream: &Arc<CudaStream>,
         kernels: &Kernels,
         dims: &ViewDims,
         stacks: &[Frames],
         slots: usize,
-        nf_max: u32,
         nslice: usize,
     ) -> Result<Self, EngineError> {
         let ranges: Vec<Range<u32>> = stacks.iter().map(|f| f.range.clone()).collect();
@@ -197,7 +210,6 @@ impl Windows {
             win,
             sums: UpdateSums::zeroed(stream, len)?,
             dir: DeviceBuffer::zeroed(stream, len)?,
-            deriv: DeviceBuffer::zeroed(stream, 2 * nf_max as usize * plane_len(dims))?,
             illum: DeviceBuffer::zeroed(stream, dims.obj_len())?,
             views,
         })
@@ -249,12 +261,13 @@ impl Windows {
     }
 
     /// The derivatives along `y` then `x` of the stack's windows at `at` of object mode 0
-    /// of the slice whose spectra `spectra` holds, into `deriv`.
+    /// of the slice whose spectra `spectra` holds, into `step`'s slopes.
     fn derivatives(
-        &mut self,
+        &self,
         ctx: &ExecutionContext,
         (sampler, spectra): (&mut ObjectSampler, &DeviceBuffer<C32>),
         at: StackPoints<'_>,
+        step: &mut PositionStep,
     ) -> Result<(), GpuError> {
         for (block, order) in [[1, 0], [0, 1]].into_iter().enumerate() {
             let block = WindowBlock {
@@ -263,7 +276,7 @@ impl Windows {
                 modes: Modes::First,
                 block: block as u32,
             };
-            sampler.windows(ctx, at, spectra, block, &mut self.deriv)?;
+            sampler.windows(ctx, at, spectra, block, step.slopes_mut())?;
         }
         Ok(())
     }
@@ -400,6 +413,7 @@ impl LsqmlState {
             Some(MovedScratch {
                 frames: shared,
                 sampling: MovedSampling::Patch,
+                ..
             }) => frames.min(shared),
             _ => frames,
         };
@@ -429,8 +443,11 @@ impl LsqmlState {
                     slots,
                     s.sampling.into(),
                 )?);
+                let step = (s.refined)
+                    .then(|| PositionStep::zeroed(stream, dims, nf_max))
+                    .transpose()?;
                 match s.sampling {
-                    MovedSampling::Patch => Reading::Moved(moved),
+                    MovedSampling::Patch => Reading::Moved { moved, step },
                     MovedSampling::FullObject { .. } => Reading::Windows {
                         moved,
                         windows: Box::new(Windows::new(
@@ -439,9 +456,9 @@ impl LsqmlState {
                             dims,
                             &stacks,
                             slots,
-                            nf_max,
                             deeper + 1,
                         )?),
+                        step,
                     },
                 }
             }
@@ -490,8 +507,17 @@ impl LsqmlState {
     pub(super) fn reads(&self) -> Option<Sampling> {
         match self.reading {
             Reading::Patch => None,
-            Reading::Moved(_) => Some(Sampling::Patch),
+            Reading::Moved { .. } => Some(Sampling::Patch),
             Reading::Windows { .. } => Some(Sampling::FullObject),
+        }
+    }
+
+    /// The position's [`crate::base::Feature::refine`] the state was built for, none without
+    /// the position model.
+    pub(super) fn position(&self) -> Option<bool> {
+        match &self.reading {
+            Reading::Patch => None,
+            Reading::Moved { step, .. } | Reading::Windows { step, .. } => Some(step.is_some()),
         }
     }
 
@@ -588,7 +614,7 @@ impl<'a> Bufs<'a> {
         // Each frame is in one batch, stepped after its batch's passes: the offsets the
         // epoch starts from serve every pass, and the windows' illumination.
         {
-            let (moved, windows) = l.reading.split();
+            let (moved, windows, _) = l.reading.split(&self.features)?;
             let moved = moved.map(|m| (m, ()));
             let mut lent = PositionLent::lend(moved, passes.fused(), &mut self.features)?;
             if let Some(m) = &mut lent {
@@ -651,8 +677,8 @@ impl<'a> Bufs<'a> {
             counts: self.counts,
         };
         let views = l.order.views();
-        let moved = l.reading.split().0.map(|m| (m, ()));
-        let moved = MovedLent::lend(moved, passes.fused(), &mut self.features)?;
+        let (moved, _, mut step) = l.reading.split(&self.features)?;
+        let moved = MovedLent::lend(moved.map(|m| (m, ())), passes.fused(), &mut self.features)?;
         let mut moved =
             (moved.map(|m| m.batch(ctx, self.kernels, views.dims(), self.probe))).transpose()?;
         let base = FusedInputs {
@@ -765,21 +791,20 @@ impl<'a> Bufs<'a> {
                 },
             };
             l.kernels.dots(ctx, views, stack, at, c, l.scan)?;
-            if let Some(m) = moved.as_mut().filter(|m| m.offsets.refine) {
+            if let (Some(m), Some(step)) = (&moved, step.as_deref_mut()) {
                 // The slopes of the object the batch started from.
                 let at = (chi, FrameWaves::Probes(&m.w[k]));
-                m.kernels.sums(ctx, views, stack, self.obj, at, m.pos)?;
+                m.kernels.sums(ctx, views, stack, self.obj, at, step)?;
             }
         }
         l.kernels
             .step(ctx, positions.clone(), l.scan, self.exit.scale)?;
         // Before the update, as the batch's spectra borrow the probe; the step reads neither.
-        if let Some(mut m) = moved
-            && let Some(offsets) = m.offsets.stepped()
-        {
+        if let (Some(m), Some(step)) = (moved, step) {
             let solve = position_solve(self.exit.scale);
+            let offsets = m.offsets.values;
             m.kernels
-                .step(ctx, positions, l.order, offsets, solve, m.pos)?;
+                .step(ctx, positions, l.order, offsets, solve, step)?;
         }
         let obj = LsqmlVar {
             x: &mut *self.obj,
@@ -812,9 +837,9 @@ impl<'a> Bufs<'a> {
         };
         let (views, table) = (l.order.views(), l.table);
         let d = views.dims();
-        let (moved, w) = l.reading.split();
+        let (moved, w, mut step) = l.reading.split(&self.features)?;
         let lent = PositionLent::lend(moved.map(|m| (m, ())), None, &mut self.features)?;
-        let (Some(PositionLent::FullObject(mut p)), Some(w)) = (lent, w) else {
+        let (Some(PositionLent::FullObject(p)), Some(w)) = (lent, w) else {
             return Err(another_reading());
         };
         let (lk, exit) = (l.kernels, self.exit);
@@ -856,11 +881,16 @@ impl<'a> Bufs<'a> {
                 &w.win[k][0],
                 self.probe_sums,
             )?;
-            if p.offsets.refine {
+            if let Some(step) = step.as_deref_mut() {
                 // The slopes of the windows the batch started from.
-                w.derivatives(ctx, (p.sampler, p.spectra), points(views, stack, p.pos))?;
+                w.derivatives(
+                    ctx,
+                    (p.sampler, p.spectra),
+                    points(views, stack, p.pos),
+                    step,
+                )?;
                 let at = (work, SliceSource::Probe(self.probe));
-                (p.kernels).derivative_sums(ctx, views, stack, &w.deriv, at, p.pos)?;
+                (p.kernels).derivative_sums(ctx, views, stack, at, step)?;
             }
             let at = points(views, stack, p.pos);
             w.place(ctx, p.sampler, at, work, self.probe, &mut self.obj_sums.num)?;
@@ -881,9 +911,10 @@ impl<'a> Bufs<'a> {
             lk.dots(ctx, &w.views, stack, at, chi, l.scan)?;
         }
         lk.step(ctx, positions.clone(), l.scan, self.exit.scale)?;
-        if let Some(offsets) = p.offsets.stepped() {
+        if let Some(step) = step {
             let solve = position_solve(self.exit.scale);
-            (p.kernels).step(ctx, positions, l.order, offsets, solve, p.pos)?;
+            let offsets = p.offsets.values;
+            (p.kernels).step(ctx, positions, l.order, offsets, solve, step)?;
         }
         let obj = LsqmlVar {
             x: &mut *self.obj,
@@ -916,8 +947,8 @@ impl<'a> Bufs<'a> {
         };
         let views = l.order.views();
         let d = views.dims();
-        let moved = l.reading.split().0.map(|m| (m, ()));
-        let moved = MovedLent::lend(moved, passes.fused(), &mut self.features)?;
+        let (moved, _, mut step) = l.reading.split(&self.features)?;
+        let moved = MovedLent::lend(moved.map(|m| (m, ())), passes.fused(), &mut self.features)?;
         let mut moved = (moved.map(|m| m.batch(ctx, self.kernels, d, self.probe))).transpose()?;
         let base = FusedInputs {
             views,
@@ -997,11 +1028,11 @@ impl<'a> Bufs<'a> {
                 ok.slice_adjoint(ctx, views, stack, &self.deeper[i], src, dst)?;
                 ok.gap(ctx, d, stack, &sl.gaps[i], dst, true)?;
             }
-            if let Some(m) = moved.as_mut().filter(|m| m.offsets.refine) {
+            if let (Some(m), Some(step)) = (&moved, step.as_deref_mut()) {
                 let c = chi.get(pivot).unwrap_or(&*work);
                 let at = (c, FrameWaves::Views(&w.incident[k][pivot - 1]));
                 m.kernels
-                    .sums(ctx, views, stack, &self.deeper[pivot - 1], at, m.pos)?;
+                    .sums(ctx, views, stack, &self.deeper[pivot - 1], at, step)?;
             }
         }
         for i in (1..=last).rev() {
@@ -1085,12 +1116,11 @@ impl<'a> Bufs<'a> {
         }
         lk.step(ctx, positions.clone(), l.scan, self.exit.scale)?;
         lk.share(ctx, positions.clone(), l.scan, share)?;
-        if let Some(mut m) = moved
-            && let Some(offsets) = m.offsets.stepped()
-        {
+        if let (Some(m), Some(step)) = (moved, step) {
             let solve = position_solve(self.exit.scale);
+            let offsets = m.offsets.values;
             m.kernels
-                .step(ctx, positions, l.order, offsets, solve, m.pos)?;
+                .step(ctx, positions, l.order, offsets, solve, step)?;
         }
         let obj = LsqmlVar {
             x: &mut *self.obj,
@@ -1123,9 +1153,9 @@ impl<'a> Bufs<'a> {
         let (views, table) = (l.order.views(), l.table);
         let d = views.dims();
         let (lk, exit, ok) = (l.kernels, self.exit, self.exit.kernels);
-        let (moved, w) = l.reading.split();
+        let (moved, w, mut step) = l.reading.split(&self.features)?;
         let lent = PositionLent::lend(moved.map(|m| (m, ())), None, &mut self.features)?;
-        let (Some(PositionLent::FullObject(mut p)), Some(w)) = (lent, w) else {
+        let (Some(PositionLent::FullObject(p)), Some(w)) = (lent, w) else {
             return Err(another_reading());
         };
         let (Some(sl), Some(sw)) = (self.slices.as_mut(), l.sliced.as_deref_mut()) else {
@@ -1189,14 +1219,19 @@ impl<'a> Bufs<'a> {
                 ok.slice_adjoint(ctx, &w.views, stack, &w.win[k][i + 1], src, dst)?;
                 ok.gap(ctx, d, stack, &sl.gaps[i], dst, true)?;
             }
-            if p.offsets.refine {
-                w.derivatives(ctx, (p.sampler, p.spectra), points(views, stack, p.pos))?;
+            if let Some(step) = step.as_deref_mut() {
+                w.derivatives(
+                    ctx,
+                    (p.sampler, p.spectra),
+                    points(views, stack, p.pos),
+                    step,
+                )?;
                 let c = chi.get(pivot).unwrap_or(&*work);
                 let at = (
                     c,
                     SliceSource::Waves(FrameWaves::Views(&sw.incident[k][pivot - 1])),
                 );
-                (p.kernels).derivative_sums(ctx, views, stack, &w.deriv, at, p.pos)?;
+                (p.kernels).derivative_sums(ctx, views, stack, at, step)?;
             }
         }
         for i in (1..=last).rev() {
@@ -1277,9 +1312,10 @@ impl<'a> Bufs<'a> {
         }
         lk.step(ctx, positions.clone(), l.scan, self.exit.scale)?;
         lk.share(ctx, positions.clone(), l.scan, share)?;
-        if let Some(offsets) = p.offsets.stepped() {
+        if let Some(step) = step {
             let solve = position_solve(self.exit.scale);
-            (p.kernels).step(ctx, positions, l.order, offsets, solve, p.pos)?;
+            let offsets = p.offsets.values;
+            (p.kernels).step(ctx, positions, l.order, offsets, solve, step)?;
         }
         let obj = LsqmlVar {
             x: &mut *self.obj,

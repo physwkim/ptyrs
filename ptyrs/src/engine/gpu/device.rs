@@ -19,10 +19,10 @@ use crate::gpu::{
     BH_STEP, BackgroundSums, BhKernels, BhParts, C32, CG_BLOCKS, Ended, EpochOrder,
     Error as GpuError, ExitPass, ExitStage, FarSums, FrameWaves, FusedBufs, FusedInputs,
     GammaStacks, GradKernels, HalfWaves, Kernels, LlkPartial, LlkRing, LlkScratch, LlkTotals,
-    MASKED, Model, OpticsKernels, PositionKernels, PositionPartial, Positions, PowerMax,
-    ProbeSpectrum, PsiSums, RingDevice, RpieKernels, ScalePartial, Shift, ShiftProbe, ShiftSums,
-    ShiftedProbeSums, SlicePhase, SliceSource, SpectrumBuf, StackRef, StackTable, StackWindows,
-    UpdateSums, ViewAddr, ViewDims, Views, Waves, half_scale,
+    MASKED, Model, OpticsKernels, PositionKernels, PositionPartial, PositionStep, Positions,
+    PowerMax, ProbeSpectrum, PsiSums, RingDevice, RpieKernels, ScalePartial, Shift, ShiftProbe,
+    ShiftSums, ShiftedProbeSums, SlicePhase, SliceSource, SpectrumBuf, StackRef, StackTable,
+    StackWindows, UpdateSums, ViewAddr, ViewDims, Views, Waves, half_scale,
 };
 use crate::tile::TileDots;
 use cuda_async::cuda_graph::CudaGraph;
@@ -519,7 +519,7 @@ impl Moved {
     ) -> Result<Self, EngineError> {
         let wlen = nf_max as usize * dims.nprobe as usize * plane_len(dims);
         Ok(Self {
-            pos: Positions::zeroed(stream, dims, nf_max)?,
+            pos: Positions::zeroed(stream, dims)?,
             kernels: PositionKernels::load(kernels)?,
             probes: match sampling {
                 Sampling::Patch => MovedProbes::Patch(
@@ -534,11 +534,13 @@ impl Moved {
 }
 
 /// What a cycle that runs its own passes under the position model builds by: the frames per
-/// stack of the shared scratch and the device's [`Sampling`].
+/// stack of the shared scratch, the device's [`Sampling`] and whether the position is
+/// refined, for the cycle's own step of the offsets.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct MovedScratch {
     pub frames: u32,
     pub sampling: MovedSampling,
+    pub refined: bool,
 }
 
 /// The device's [`Sampling`] as [`MovedScratch`] holds it: under [`Sampling::FullObject`],
@@ -1117,6 +1119,18 @@ impl FeaturesMut<'_> {
     /// Whether the position is modelled and refined.
     pub fn position_refined(&self) -> bool {
         (self.position.as_ref()).is_some_and(|p| p.partials.is_some())
+    }
+
+    /// `step`, a cycle's own [`PositionStep`], as the position's refine asks for it: an error
+    /// when the cycle's state was built for the other, a step without it or none with it.
+    pub fn own_step<'s>(
+        &self,
+        step: Option<&'s mut PositionStep>,
+    ) -> Result<Option<&'s mut PositionStep>, GpuError> {
+        match step.is_some() == self.position_refined() {
+            true => Ok(step),
+            false => Err(another_model()),
+        }
     }
 
     /// Whether the position model moves the probe, as [`Modelled::shifted`] of a lend.
@@ -2179,14 +2193,14 @@ pub(super) struct RpieBufs<'a> {
 }
 
 impl RpieScratch {
-    /// For `views` in `params`' batches, `moved` the sampling of a position model.
+    /// For `views` in `params`' batches, under a position model by `moved`.
     fn new(
         stream: &Arc<CudaStream>,
         kernels: &Kernels,
         views: &Views,
         params: &RpieParams,
         nprobe_values: usize,
-        moved: Option<Sampling>,
+        moved: Option<MovedScratch>,
     ) -> Result<Self, EngineError> {
         let dims = views.dims();
         let batch = to_u32("batch_size", params.batch_size)?;
@@ -2961,7 +2975,7 @@ impl Device {
                 Cycle::Raar { params, first }
             }
             Epoch::Rpie(p) => {
-                let moved = self.features.positioned().then_some(self.sampling);
+                let moved = self.features.positioned().then(|| self.moved_scratch());
                 let scratch = RpieScratch::new(
                     &self.stream,
                     &self.kernels,
@@ -3052,15 +3066,18 @@ impl Device {
         Ok(())
     }
 
-    /// Builds the [`LsqmlState`] for `params`' batch size, the position model and its sampling
-    /// unless it is built, replaced as [`Self::build_bh`] replaces BH's.
+    /// Builds the [`LsqmlState`] for `params`' batch size, the position model, refined or
+    /// held, and its sampling unless it is built, replaced as [`Self::build_bh`] replaces BH's.
     fn build_lsqml(&mut self, params: &LsqmlParams) -> Result<(), EngineError> {
         let size = to_u32(
             "batch_size",
             params.batch_size.min(self.dims().nframe as usize),
         )?;
         let reads = self.features.positioned().then_some(self.sampling);
-        if (self.lsqml.as_ref()).is_none_or(|s| s.size() != size || s.reads() != reads) {
+        let [.., position] = self.features.refine();
+        if (self.lsqml.as_ref())
+            .is_none_or(|s| s.size() != size || s.reads() != reads || s.position() != position)
+        {
             let state = LsqmlState::new(
                 &self.stream,
                 &self.kernels,
@@ -3088,6 +3105,7 @@ impl Device {
         MovedScratch {
             frames: self.shared.cut.table.nf_max(),
             sampling,
+            refined: self.features.refine()[2] == Some(true),
         }
     }
 
