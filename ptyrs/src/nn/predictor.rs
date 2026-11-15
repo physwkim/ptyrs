@@ -69,9 +69,9 @@ impl PredictorConfig {
 
     fn check(&self) -> Result<(), NnError> {
         let granule = self.bin << self.depth;
-        if self.bin == 0 || self.frame.iter().any(|n| n % granule != 0) {
+        if self.bin == 0 || self.frame.iter().any(|&n| n == 0 || n % granule != 0) {
             return Err(NnError::Invalid(format!(
-                "frame {:?} is not a multiple of bin {} × 2^depth {}",
+                "frame {:?} is not a positive multiple of bin {} × 2^depth {}",
                 self.frame, self.bin, self.depth
             )));
         }
@@ -179,9 +179,9 @@ impl InputScale {
         bin: usize,
         norm: f64,
     ) -> Result<Self, NnError> {
-        if bin == 0 || ny % bin != 0 || nx % bin != 0 {
+        if bin == 0 || ny == 0 || nx == 0 || ny % bin != 0 || nx % bin != 0 {
             return Err(NnError::Invalid(format!(
-                "frame [{ny}, {nx}] is not a multiple of bin {bin}"
+                "frame [{ny}, {nx}] is not a positive multiple of bin {bin}"
             )));
         }
         if norm.is_nan() || norm <= 0.0 {
@@ -965,6 +965,16 @@ impl Predictor {
 mod tests {
     use super::*;
     use crate::base::{MASKED, Positions};
+
+    /// A frame with a side of no pixels is refused rather than divided by.
+    #[test]
+    fn a_frame_of_no_pixels_is_refused() {
+        let counts = Counts::from_raw([3, 0, 4], vec![]).unwrap();
+        let input = diffraction_input(&counts, Input::Binned, 1, 1.0);
+        assert!(matches!(input, Err(NnError::Invalid(_))), "{input:?}");
+        let net = PredictorConfig::new([0, 16], 1).init(&crate::nn::cuda(0));
+        assert!(matches!(net, Err(NnError::Invalid(_))));
+    }
 
     #[test]
     fn diffraction_input_bins_fills_masked_and_normalises() {
