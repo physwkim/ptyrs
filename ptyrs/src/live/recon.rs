@@ -28,6 +28,7 @@ use std::num::NonZeroU32;
 use std::ops::Range;
 use std::sync::Arc;
 
+use crate::base::Frame;
 use crate::gpu::{
     C32, Ended, Exit, FarSums, FusedBufs, FusedInputs, FusedSums, Kernels, LlkPartial, LlkRing,
     Model, RecordWriter, ViewAddr,
@@ -401,11 +402,11 @@ impl ViewPlacement {
     /// Rows and columns of the bounding box of the window centres of frames
     /// of `frame` pixels at `positions`, `(x, y)` m: the scanned region the
     /// [`Clock`](crate::live::converge::Clock) compares. Empty for no position.
-    pub fn scanned(&self, positions: &[(f64, f64)], frame: [u32; 2]) -> [Range<usize>; 2] {
+    pub fn scanned(&self, positions: &[(f64, f64)], frame: Frame) -> [Range<usize>; 2] {
         [0, 1].map(|a| {
             let c = positions
                 .iter()
-                .map(|&p| self.corner(p)[a] + f64::from(frame[a] / 2));
+                .map(|&p| self.corner(p)[a] + (frame[a] / 2) as f64);
             let lo = c.clone().fold(f64::INFINITY, f64::min);
             let hi = c.fold(f64::NEG_INFINITY, f64::max);
             if lo > hi {
@@ -525,8 +526,9 @@ mod tests {
                 assert_eq!((w.oy, w.ox, w.probe, w.obj), (oy, ox, m as u32, 0), "{k}");
             }
         }
-        assert_eq!(place.scanned(&pos, [32, 32]), [16..ny - 15, 16..nx - 15]);
-        assert_eq!(place.scanned(&[], [32, 32]), [0..0, 0..0]);
+        let frame = Frame::new([32, 32]).unwrap();
+        assert_eq!(place.scanned(&pos, frame), [16..ny - 15, 16..nx - 15]);
+        assert_eq!(place.scanned(&[], frame), [0..0, 0..0]);
         v.clear();
         place.views((pos[0].0 - dx, pos[0].1), 1, 1, &mut v);
         assert_eq!((v[0].oy, v[0].ox), (0, u32::MAX));
@@ -601,15 +603,7 @@ mod tests {
             };
 
             let st = ctx.new_stream().unwrap();
-            let shape = ScanShape {
-                nframe: p.points() as u32,
-                nmode: 2,
-                nprobe: 2,
-                nobj: 1,
-                frame: [n as u32; 2],
-                reach,
-                quad_phase,
-            };
+            let shape = ScanShape::new(p.points() as u32, 2, 1, [n; 2], reach, quad_phase).unwrap();
             let dev = DeviceBuffer::from_host(&st, &counts).unwrap();
             let cfg = ApConfig {
                 stacks: NonZeroU32::new(stacks).unwrap(),
@@ -665,16 +659,9 @@ mod tests {
         for &q in &pos {
             place.views(q, 2, 1, &mut views);
         }
-        let shape = ScanShape {
-            nframe: p.points() as u32,
-            nmode: 2,
-            nprobe: 2,
-            nobj: 1,
-            frame: [p.spec().n as u32; 2],
-            reach,
-            quad_phase: 0.0,
-        };
-        (views, shape, place.scanned(&pos, shape.frame))
+        let frame = [p.spec().n; 2];
+        let shape = ScanShape::new(p.points() as u32, 2, 1, frame, reach, 0.0).unwrap();
+        (views, shape, place.scanned(&pos, shape.frame()))
     }
 
     /// Frames of two columns of 250 rows, an object of three 2 MiB chunks,

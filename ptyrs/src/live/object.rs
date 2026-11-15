@@ -37,6 +37,8 @@ struct Layout {
     nobj: usize,
     /// `[nyo, nxo]`.
     shape: [usize; 2],
+    /// `nobj · nyo · nxo` pixels.
+    len: usize,
     /// `[nty, ntx]`.
     tiles: [usize; 2],
     /// Tile `t`'s slab is slots `start[t]..start[t + 1]` of `tile_views`.
@@ -44,6 +46,24 @@ struct Layout {
 }
 
 impl Layout {
+    /// The pixel count of `nobj` planes of `shape`, their tiles per axis and
+    /// the tile count. The pixels' bytes fit `usize` and the tile ids `u32`;
+    /// the plane is formed first, so with no planes it still bounds the
+    /// tiles.
+    fn grid(nobj: usize, shape: [usize; 2]) -> Result<(usize, [usize; 2], u32), GrowError> {
+        let bad = |m: String| GrowError::from(crate::gpu::Error::Shape(m));
+        let [nyo, nxo] = shape;
+        let len = nyo
+            .checked_mul(nxo)
+            .and_then(|plane| plane.checked_mul(nobj))
+            .filter(|len| len.checked_mul(8).is_some())
+            .ok_or_else(|| bad(format!("{nobj} planes of {shape:?} pass usize bytes")))?;
+        let tiles = shape.map(|n| n.div_ceil(OBJ_TILE as usize));
+        let ntiles = u32::try_from(tiles[0] * tiles[1])
+            .map_err(|_| bad(format!("tiles {tiles:?} pass u32 ids")))?;
+        Ok((len, tiles, ntiles))
+    }
+
     /// Tile `t` as indices, if it is in the object.
     fn tile(&self, t: [u32; 2]) -> Result<[usize; 2], GrowError> {
         let [y, x] = t.map(|i| i as usize);
@@ -162,8 +182,8 @@ impl LiveObject {
         fill: [f32; 2],
         chunk: usize,
     ) -> Result<Self, GrowError> {
-        let [nty, ntx] = shape.map(|n| n.div_ceil(OBJ_TILE as usize));
-        let all: Vec<u32> = (0..(nty * ntx) as u32).collect();
+        let (_, _, ntiles) = Layout::grid(nobj, shape)?;
+        let all: Vec<u32> = (0..ntiles).collect();
         Self::owned(stream, nobj, shape, cap, fill, chunk, &all)
     }
 
@@ -181,13 +201,10 @@ impl LiveObject {
         own: &[u32],
     ) -> Result<Self, GrowError> {
         let ctx = stream.context();
-        let [nyo, nxo] = shape;
-        let t = OBJ_TILE as usize;
-        let tiles = [nyo.div_ceil(t), nxo.div_ceil(t)];
-        let ntiles = tiles[0] * tiles[1];
+        let (len, tiles, ntiles) = Layout::grid(nobj, shape)?;
         let bad = |m: String| GrowError::from(crate::gpu::Error::Shape(m));
         let (mut owned, mut start) = (own.iter().peekable(), vec![0u32]);
-        for t in 0..ntiles as u32 {
+        for t in 0..ntiles {
             let slab = if owned.next_if_eq(&&t).is_some() {
                 cap
             } else {
@@ -207,7 +224,6 @@ impl LiveObject {
                 "own tiles {own:?} are not ascending ids under {ntiles}"
             )));
         }
-        let len = nobj * nyo * nxo;
         let obj = GrowBuf::new(ctx, len * 8, chunk)?;
         let num = GrowBuf::new(ctx, len * 8, chunk)?;
         let den = GrowBuf::new(ctx, len * 4, chunk)?;
@@ -222,10 +238,11 @@ impl LiveObject {
             num,
             den,
             sums,
-            tile_views: GrowBuf::new(ctx, start[ntiles] as usize * 4, chunk)?,
+            tile_views: GrowBuf::new(ctx, start[ntiles as usize] as usize * 4, chunk)?,
             layout: Layout {
                 nobj,
                 shape,
+                len,
                 tiles,
                 start: start.into(),
             },
@@ -592,9 +609,8 @@ impl Snapshot {
     pub fn new(o: &LiveObject) -> Result<Self, DriverError> {
         let ctx = o.stream.context();
         let l = &o.layout;
-        let [nyo, nxo] = l.shape;
         Ok(Self {
-            buf: PinnedHostBuffer::zeroed(ctx, l.nobj * nyo * nxo)?,
+            buf: PinnedHostBuffer::zeroed(ctx, l.len)?,
             done: sleeping_event(ctx)?,
             copied: Vec::new(),
             fill: o.fill,
@@ -640,6 +656,24 @@ mod tests {
 
     use super::*;
     use crate::live::fill::PatchFill;
+
+    /// Each product past its range, with no planes for the plane's own case:
+    /// a wrapped count would size a smaller object than its tiles index.
+    #[test]
+    fn grid_refuses_object_past_its_ranges() {
+        let side = 1 << (usize::BITS / 2);
+        let tiles = OBJ_TILE as usize * (1 << 16);
+        for (nobj, shape, want) in [
+            (0, [side, side], "pass usize bytes"),
+            (1 << 8, [side / 4, side / 4], "pass usize bytes"),
+            (1, [side / 2, side / 2], "pass usize bytes"),
+            (0, [tiles, tiles], "pass u32 ids"),
+        ] {
+            let e = Layout::grid(nobj, shape).unwrap_err().to_string();
+            assert!(e.contains(want), "{nobj} x {shape:?}: {e}");
+        }
+        assert_eq!(Layout::grid(2, [17, 32]).unwrap().0, 2 * 17 * 32);
+    }
 
     /// Holds `s` behind a gate until the returned sender is used or
     /// dropped, or 10 s passed, so a call that waits on the stream fails

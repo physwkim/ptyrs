@@ -538,7 +538,7 @@ impl DistLiveAp {
     /// they are the frames of the batches it sent.
     pub fn push(&mut self, views: &[ViewAddr]) -> Result<u32, DistError> {
         self.gpus.check()?;
-        let nmode = self.plan.regions()[0].shape.nmode as usize;
+        let nmode = self.plan.regions()[0].shape.nmode() as usize;
         let mut shares = vec![Share::default(); self.plan.nregion()];
         let took = self.plan.split(views, &mut shares)?;
         self.lost += (views.len() / nmode) as u64 - u64::from(took);
@@ -684,14 +684,14 @@ impl DistLiveAp {
     /// Pixels of the object, `nobj * nyo * nxo`.
     fn pixels(&self) -> usize {
         let [nyo, nxo] = self.shape();
-        self.plan.regions()[0].shape.nobj as usize * nyo * nxo
+        self.plan.regions()[0].shape.nobj() as usize * nyo * nxo
     }
 
     /// Copies each tile from its owner's window in `wins`, by region, into `out`.
     fn stitch(&self, wins: &[Vec<[f32; 2]>], out: &mut [[f32; 2]]) {
         let grid = self.plan.partition().grid();
         let ([nyo, nxo], tile) = (grid.obj(), grid.tile());
-        let nobj = self.plan.regions()[0].shape.nobj as usize;
+        let nobj = self.plan.regions()[0].shape.nobj() as usize;
         for (t, &o) in self.plan.partition().owner().iter().enumerate() {
             let [ty, tx] = grid.coords(t);
             let (x0, x1) = (tx * tile, ((tx + 1) * tile).min(nxo));
@@ -828,15 +828,8 @@ mod tests {
             place.views(q, 2, 1, &mut v);
             v
         };
-        let mut shape = ScanShape {
-            nframe: 0,
-            nmode: 2,
-            nprobe: 2,
-            nobj: 1,
-            frame: [p.spec().n as u32; 2],
-            reach,
-            quad_phase: 0.0,
-        };
+        let frame = [p.spec().n; 2];
+        let shape = ScanShape::new(p.points() as u32, 2, 1, frame, reach, 0.0).unwrap();
         let dims = shape.dims();
         let half = p.points() / 2;
         // Each frame's position and the simulated frame its counts are.
@@ -853,7 +846,7 @@ mod tests {
         let pos: Vec<(f64, f64)> = order.iter().map(|&(q, _)| q).collect();
         let views: Vec<ViewAddr> = pos.iter().flat_map(|&q| views_at(q)).collect();
         let counts = order.iter().flat_map(|&(_, k)| p.frame(k)).collect();
-        shape.nframe = order.len() as u32;
+        let shape = shape.with_nframe(order.len() as u32).unwrap();
         let cfg = ApConfig {
             shape,
             nf_max: NonZeroU32::new(8).unwrap(),
@@ -888,7 +881,7 @@ mod tests {
             out.push(at..at + len);
             at += len;
         }
-        let nframe = c.cfg.shape.nframe as usize;
+        let nframe = c.cfg.shape.nframe() as usize;
         while at < nframe {
             out.push(at..(at + 17).min(nframe));
             at += 17;
@@ -988,7 +981,7 @@ mod tests {
         ] {
             let c = case(&sim(path, points));
             let batches = batches(&c);
-            let nmode = c.cfg.shape.nmode as usize;
+            let nmode = c.cfg.shape.nmode() as usize;
             let views = |b: &Range<usize>| &c.views[b.start * nmode..b.end * nmode];
             let st = ctx.new_stream().unwrap();
             let dev = DeviceBuffer::from_host(&st, &c.counts).unwrap();
@@ -1039,7 +1032,7 @@ mod tests {
                 let up = feed.finish();
                 assert_eq!(
                     (up.frames, up.pos_missing),
-                    (u64::from(c.cfg.shape.nframe), 0)
+                    (u64::from(c.cfg.shape.nframe()), 0)
                 );
                 let placed: Vec<u64> = up.regions.iter().map(|r| r.frames).collect();
                 let landed: Vec<u64> = ap.landed().iter().map(|&l| u64::from(l)).collect();
@@ -1064,7 +1057,7 @@ mod tests {
         let ctx = Context::new(0).expect("GPU 0");
         let c = case(&sim(ScanPath::Raster { cols: 12 }, 240));
         let batches = batches(&c);
-        let (nmode, n) = (c.cfg.shape.nmode as usize, 64 * 64);
+        let (nmode, n) = (c.cfg.shape.nmode() as usize, 64 * 64);
         let views = |b: &Range<usize>| &c.views[b.start * nmode..b.end * nmode];
         let obj = c.cfg.shape.dims().obj.map(|n| n as usize);
         let most = batches.iter().map(Range::len).max().unwrap();
@@ -1165,7 +1158,7 @@ mod tests {
         let ctx = Context::new(0).expect("GPU 0");
         let c = case(&sim(ScanPath::Raster { cols: 12 }, 240));
         let batches = batches(&c);
-        let (nmode, n) = (c.cfg.shape.nmode as usize, 64 * 64);
+        let (nmode, n) = (c.cfg.shape.nmode() as usize, 64 * 64);
         let views = |b: &Range<usize>| &c.views[b.start * nmode..b.end * nmode];
         let st = ctx.new_stream().unwrap();
         let dev = DeviceBuffer::from_host(&st, &c.counts).unwrap();
@@ -1181,7 +1174,7 @@ mod tests {
             want.push(bits(snap.wait().unwrap()));
         }
 
-        let (nframe, planned) = (c.cfg.shape.nframe as usize, &c.views[..c.planned * nmode]);
+        let (nframe, planned) = (c.cfg.shape.nframe() as usize, &c.views[..c.planned * nmode]);
         for ngpu in [1, 2, 4] {
             let plan =
                 LivePlan::new(&c.cfg.shape, planned, Scheme::Strips, ngpu, c.cfg.cap).unwrap();
@@ -1234,7 +1227,7 @@ mod tests {
     fn an_epoch_failing_after_its_record_aborts_the_run() {
         let ctx = Context::new(0).expect("GPU 0");
         let c = case(&sim(ScanPath::Raster { cols: 12 }, 240));
-        let planned = &c.views[..c.planned * c.cfg.shape.nmode as usize];
+        let planned = &c.views[..c.planned * c.cfg.shape.nmode() as usize];
         let mut ap =
             DistLiveAp::new(&[0, 0], &c.cfg, planned, Scheme::Strips, &c.probe, true).unwrap();
         let feed = Feed::new(&ctx, &c, &ap).land(&c, &(0..c.planned));
@@ -1268,7 +1261,7 @@ mod tests {
     fn a_failed_run_still_drains() {
         let ctx = Context::new(0).expect("GPU 0");
         let c = case(&sim(ScanPath::Raster { cols: 12 }, 240));
-        let planned = &c.views[..c.planned * c.cfg.shape.nmode as usize];
+        let planned = &c.views[..c.planned * c.cfg.shape.nmode() as usize];
         let mut ap =
             DistLiveAp::new(&[0, 0], &c.cfg, planned, Scheme::Strips, &c.probe, false).unwrap();
         let feed = Feed::new(&ctx, &c, &ap).land(&c, &(0..c.planned));
@@ -1302,7 +1295,7 @@ mod tests {
     fn a_snapshot_failing_on_one_gpu_aborts_the_run() {
         let ctx = Context::new(0).expect("GPU 0");
         let c = case(&sim(ScanPath::Raster { cols: 12 }, 240));
-        let planned = &c.views[..c.planned * c.cfg.shape.nmode as usize];
+        let planned = &c.views[..c.planned * c.cfg.shape.nmode() as usize];
         let mut ap =
             DistLiveAp::new(&[0, 0], &c.cfg, planned, Scheme::Strips, &c.probe, false).unwrap();
         let feed = Feed::new(&ctx, &c, &ap).land(&c, &(0..c.planned));
@@ -1331,7 +1324,7 @@ mod tests {
     fn an_llk_read_failing_on_one_gpu_aborts_the_run() {
         let ctx = Context::new(0).expect("GPU 0");
         let c = case(&sim(ScanPath::Raster { cols: 12 }, 240));
-        let planned = &c.views[..c.planned * c.cfg.shape.nmode as usize];
+        let planned = &c.views[..c.planned * c.cfg.shape.nmode() as usize];
         let mut ap =
             DistLiveAp::new(&[0, 0], &c.cfg, planned, Scheme::Strips, &c.probe, true).unwrap();
         let feed = Feed::new(&ctx, &c, &ap).land(&c, &(0..c.planned));

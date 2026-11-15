@@ -420,7 +420,7 @@ fn follow_cfg(cfg: &RecvCfg, model: &Model, rc: &ReconCfg) -> Result<FollowCfg, 
         .ok()
         .and_then(NonZeroU32::new)
         .ok_or_else(|| refuse(format!("{} frames", cfg.frames)))?;
-    Ok(FollowCfg::plan(p, nframe, rc))
+    FollowCfg::plan(p, nframe, rc).map_err(|e| refuse(e.to_string()))
 }
 
 /// The GPUs the run lands frames on, region `r` on the `r`-th, and how a
@@ -531,7 +531,9 @@ fn recon_line(
     threads: usize,
 ) -> Result<(String, bool), RecvError> {
     let [ny, nx] = rep.shape;
-    let region = follow.place.scanned(&rep.positions, follow.ap.shape.frame);
+    let region = follow
+        .place
+        .scanned(&rep.positions, follow.ap.shape.frame());
     let [rows, cols] = &region;
     let scan_epochs = rep.scan_epochs.unwrap_or(0);
     let mut l = format!(
@@ -757,9 +759,9 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
                 PvaServer::start(Arc::new(source), config).map_err(fail("PV server"))?
             };
             eprintln!("recv pv listening={}", server.tcp_addr());
-            let n = f.ap.shape.frame[0] as usize;
+            let n = f.ap.shape.frame()[0];
             let px: Vec<[f32; 2]> = f.probe.iter().map(|c| [c.re, c.im]).collect();
-            let probe = AmpPhase::new(&px, f.ap.shape.nprobe as usize, [n, n], 1);
+            let probe = AmpPhase::new(&px, f.ap.shape.nprobe() as usize, [n, n], 1);
             let (tx, rx) = crossbeam_channel::bounded(1);
             let (llk, llk_rx) = crossbeam_channel::unbounded();
             let (bin, place) = (pc.bin, place.clone());
@@ -1816,7 +1818,10 @@ mod tests {
         };
         let model = ok.model.build();
         let f = follow_cfg(&ok, &model, &rc).unwrap();
-        assert_eq!((f.ap.shape.nframe, f.ap.shape.frame), (20, [64, 64]));
+        assert_eq!(
+            (f.ap.shape.nframe(), f.ap.shape.frame().sides()),
+            (20, [64, 64])
+        );
         let centred = RecvCfg {
             cx: Some(32),
             cy: Some(32),
