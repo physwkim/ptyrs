@@ -110,10 +110,10 @@ fn mode_amplitude(o: usize) -> f64 {
 
 struct Case {
     scan: Scan,
-    /// Object mode `o` the test object times [`mode_amplitude`], conjugated when `o` is odd.
+    /// Object mode `o` is the test object times [`mode_amplitude`], conjugated when `o` is odd.
     truth: (Object, Probe),
-    /// Each object mode at its truth's amplitude with a random phase in -1/4..1/4 rad, the
-    /// truth probe's defocus cut by a third.
+    /// Each object mode at [`mode_amplitude`] with a random phase in -1/4..1/4 rad, the truth
+    /// probe's defocus cut by a third.
     start: (Object, Probe),
 }
 
