@@ -10,10 +10,10 @@
 //! moves once, in its batch. Per stack, [`PositionKernels::shift_w`] turns the probe rows
 //! [`Kernels::shifted_probe`] left into the moved probe `W`; with the stack's `chi`,
 //! [`PositionKernels::sums`] takes the object slopes and the stack's position sums against
-//! the object the batch started from. After the batch's update, [`PositionKernels::step`]
-//! steps its frames' offsets. Where each view samples its object at its offset instead and
-//! the probe stays put, [`PositionKernels::derivative_sums`] takes the sums from the sampled
-//! windows' derivatives.
+//! the object the batch started from into a [`PositionStep`]. After the batch's update,
+//! [`PositionKernels::step`] steps its frames' offsets. Where each view samples its object at
+//! its offset instead and the probe stays put, [`PositionKernels::derivative_sums`] takes the
+//! sums from the sampled windows' derivatives. A held position's epoch runs the gather alone.
 
 use std::ops::Range;
 
@@ -51,32 +51,49 @@ pub struct PositionKernels {
     module: position_kernels::LoadedModule,
 }
 
-/// The position state over one scan, sized by its dims and the stacks' `nf_max`: the offsets
-/// `[nframe, 2]` by epoch position, every position's [`POSITION_SUMS`] per chunk, and one
-/// stack's object slopes `[2, nf_max, ny, nx]`.
+/// The offsets `[nframe, 2]` by epoch position over one scan of its dims.
 pub struct Positions {
     dims: ViewDims,
     offsets: DeviceBuffer<f32>,
-    sums: DeviceBuffer<f32>,
-    slopes: DeviceBuffer<C32>,
 }
 
 impl Positions {
-    /// Zeroed state for a scan of `dims` in stacks of up to `nf_max` frames.
-    pub fn zeroed(stream: &CudaStream, dims: &ViewDims, nf_max: u32) -> Result<Self, Error> {
+    /// Zeroed offsets for a scan of `dims`.
+    pub fn zeroed(stream: &CudaStream, dims: &ViewDims) -> Result<Self, Error> {
         dims.check()?;
-        let nframe = dims.nframe as usize;
         Ok(Self {
             dims: *dims,
-            offsets: DeviceBuffer::zeroed(stream, 2 * nframe)?,
-            sums: DeviceBuffer::zeroed(stream, POSITION_SUMS as usize * nframe * chunks(dims.n()))?,
-            slopes: DeviceBuffer::zeroed(stream, 2 * nf_max as usize * dims.n())?,
+            offsets: DeviceBuffer::zeroed(stream, 2 * dims.nframe as usize)?,
         })
     }
 
     /// The offsets by epoch position, as [`PositionKernels::gather`] set them.
     pub fn offsets(&self) -> &DeviceBuffer<f32> {
         &self.offsets
+    }
+}
+
+/// What [`PositionKernels::step`] reads over one scan, sized by its dims and the stacks'
+/// `nf_max`: every position's [`POSITION_SUMS`] per chunk, and one stack's derivatives of the
+/// object at its frames' views along `y` then `x`, `[2, nf_max, ny, nx]`.
+pub struct PositionStep {
+    dims: ViewDims,
+    sums: DeviceBuffer<f32>,
+    slopes: DeviceBuffer<C32>,
+}
+
+impl PositionStep {
+    /// Zeroed state for a scan of `dims` in stacks of up to `nf_max` frames.
+    pub fn zeroed(stream: &CudaStream, dims: &ViewDims, nf_max: u32) -> Result<Self, Error> {
+        dims.check()?;
+        Ok(Self {
+            dims: *dims,
+            sums: DeviceBuffer::zeroed(
+                stream,
+                POSITION_SUMS as usize * dims.nframe as usize * chunks(dims.n()),
+            )?,
+            slopes: DeviceBuffer::zeroed(stream, 2 * nf_max as usize * dims.n())?,
+        })
     }
 }
 
@@ -188,11 +205,11 @@ impl PositionKernels {
             })
     }
 
-    /// The position sums of the stack's frames into `pos`: each frame's first view (mode 0)
+    /// The position sums of the stack's frames into `step`: each frame's first view (mode 0)
     /// of its exit-wave update `chi`, `[nf_max * nmode, ny, nx]`, against `u = ∂O W`, the
-    /// slopes of `obj` at that view times its wave of `w`: the moved probe ([`Self::shift_w`]),
-    /// or a multislice object's wave entering the slice `obj`; `chi` at the exit wave's
-    /// stored pixels, `views` in epoch order.
+    /// slopes of `obj` at that view, which it writes to `step`'s, times its wave of `w`: the
+    /// moved probe ([`Self::shift_w`]), or a multislice object's wave entering the slice
+    /// `obj`; `chi` at the exit wave's stored pixels, `views` in epoch order.
     pub fn sums(
         &self,
         ctx: &ExecutionContext,
@@ -200,44 +217,51 @@ impl PositionKernels {
         stack: StackRef<'_>,
         obj: &DeviceBuffer<C32>,
         (chi, w): (&DeviceBuffer<C32>, FrameWaves<'_>),
-        pos: &mut Positions,
+        step: &mut PositionStep,
     ) -> Result<(), Error> {
         let d = views.dims();
-        same_dims(&pos.dims, d)?;
         check_len("obj", obj, d.obj_len())?;
-        check_len(
-            "slopes",
-            &pos.slopes,
-            2 * d.geom(stack)?.nf_max as usize * d.n(),
-        )?;
-        self.slopes(ctx, views, stack, obj, &mut pos.slopes)?;
+        self.check_slopes(views, stack, step)?;
+        self.slopes(ctx, views, stack, obj, &mut step.slopes)?;
         let w = SliceSource::Waves(w);
-        self.launch_sums(ctx, views, stack, &pos.slopes, (chi, w), &mut pos.sums)
+        self.launch_sums(ctx, views, stack, &step.slopes, (chi, w), &mut step.sums)
     }
 
-    /// The position sums of the stack's frames into `pos` where each view samples its object
-    /// at its offset and the probe stays put: [`Self::sums`] with the slopes replaced by
-    /// `deriv`, the derivatives along `y` then `x` of each frame's sampled window (object
-    /// mode 0), `[2, nf_max, ny, nx]` in the natural layout. `w` is the wave entering the
-    /// slice: with [`SliceSource::Probe`] probe mode 0 times the exit's quadratic phase.
+    /// The position sums of the stack's frames into `step` where each view samples its object
+    /// at its offset and the probe stays put: [`Self::sums`] against the slopes `derivatives`
+    /// writes for this stack into `step`'s, the derivatives along `y` then `x` of each
+    /// frame's sampled window (object mode 0) in the natural layout. `w` is the wave entering
+    /// the slice: with [`SliceSource::Probe`] probe mode 0 times the exit's quadratic phase.
     pub fn derivative_sums(
         &self,
         ctx: &ExecutionContext,
         views: &Views,
         stack: StackRef<'_>,
-        deriv: &DeviceBuffer<C32>,
+        derivatives: impl FnOnce(&mut DeviceBuffer<C32>) -> Result<(), Error>,
         (chi, w): (&DeviceBuffer<C32>, SliceSource<'_>),
-        pos: &mut Positions,
+        step: &mut PositionStep,
+    ) -> Result<(), Error> {
+        self.check_slopes(views, stack, step)?;
+        derivatives(&mut step.slopes)?;
+        self.launch_sums(ctx, views, stack, &step.slopes, (chi, w), &mut step.sums)
+    }
+
+    /// Errors unless `step` serves `views` and has room for the stack's slopes.
+    fn check_slopes(
+        &self,
+        views: &Views,
+        stack: StackRef<'_>,
+        step: &PositionStep,
     ) -> Result<(), Error> {
         let d = views.dims();
-        same_dims(&pos.dims, d)?;
-        check_len("deriv", deriv, 2 * d.geom(stack)?.nf_max as usize * d.n())?;
-        self.launch_sums(ctx, views, stack, deriv, (chi, w), &mut pos.sums)
+        same_dims(&step.dims, d)?;
+        let len = 2 * d.geom(stack)?.nf_max as usize * d.n();
+        check_len("slopes", &step.slopes, len)
     }
 
     /// [`position_kernels::LoadedModule::position_sums`] of the stack against `slopes`, `[2,
-    /// nf_max, ny, nx]` checked by the caller, into `sums`, sized by [`Positions::zeroed`] for
-    /// `views`' dims.
+    /// nf_max, ny, nx]` checked by the caller, into `sums`, sized by [`PositionStep::zeroed`]
+    /// for `views`' dims.
     fn launch_sums(
         &self,
         ctx: &ExecutionContext,
@@ -377,8 +401,9 @@ impl PositionKernels {
     }
 
     /// pty-chi's position step of the batch's epoch positions `batch` from the [`Self::sums`]
-    /// of all its stacks, into `offsets`, `[nframe, 2]` by frame through `order`; `solve`
-    /// how the shift is solved and taken. `pos`' own offsets stay as gathered: the epoch moves each frame once.
+    /// of all its stacks in `step`, into `offsets`, `[nframe, 2]` by frame through `order`;
+    /// `solve` how the shift is solved and taken. The [`Positions`] the epoch gathered stay:
+    /// the epoch moves each frame once.
     pub fn step(
         &self,
         ctx: &ExecutionContext,
@@ -386,22 +411,22 @@ impl PositionKernels {
         order: &EpochOrder,
         offsets: &mut DeviceBuffer<f32>,
         solve: Solve,
-        pos: &mut Positions,
+        step: &mut PositionStep,
     ) -> Result<(), Error> {
-        let span = span(&pos.dims, &batch)?;
-        same_dims(&pos.dims, order.views().dims())?;
-        let nframe = pos.dims.nframe;
+        let span = span(&step.dims, &batch)?;
+        same_dims(&step.dims, order.views().dims())?;
+        let nframe = step.dims.nframe;
         check_len("offsets", offsets, 2 * nframe as usize)?;
         let ids = order.ids();
-        let writes = [pos.sums.storage(), offsets.storage()];
+        let writes = [step.sums.storage(), offsets.storage()];
         self.base.launch(ctx, &[ids.storage()], &writes, |stream| {
-            // SAFETY: `span` lies in the scan's positions, `pos.sums` sized for every
+            // SAFETY: `span` lies in the scan's positions, `step.sums` sized for every
             // position's chunks, `offsets` checked above; one block.
             unsafe {
                 self.module.position_step(
                     stream,
                     ONE_BLOCK,
-                    dptr(&pos.sums),
+                    dptr(&step.sums),
                     span,
                     dptr::<u32, u32>(ids).cast_const(),
                     dptr(offsets),

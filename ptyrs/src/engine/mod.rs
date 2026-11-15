@@ -35,6 +35,7 @@ mod ptycho;
 mod sampling;
 pub mod sim;
 
+pub use crate::base::Feature;
 pub use batch::random_batches;
 pub use bh::{Bh, BhBatch, BhParams, BhStep, BhVector};
 pub use features::{

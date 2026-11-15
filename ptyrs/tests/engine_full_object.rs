@@ -1,7 +1,7 @@
 //! AP's, DM's and RAAR's object update under `Sampling::FullObject`, which solves the normal
-//! equations of the object's windows, on counts made through that model at drawn fractional
-//! offsets; at zero and whole-pixel offsets it is the blend of the update without offsets.
-//! One propagator: the solve is in the object plane.
+//! equations of the object's windows, and rPIE's, on counts made through that model at drawn
+//! fractional offsets, held or refined; at zero and whole-pixel offsets, held, it is the blend
+//! of the update without offsets. One propagator: the solve is in the object plane.
 
 use std::slice;
 use std::sync::Arc;
@@ -12,8 +12,8 @@ use ptyrs::base::{
     sim,
 };
 use ptyrs::engine::{
-    ApParams, DmParams, Features, GpuOptions, GpuPtycho, Optics, Ptycho, RaarParams, Sampling,
-    SliceWaves, Wavefield, shift,
+    ApParams, DmParams, Feature, Features, GpuOptions, GpuPtycho, Optics, Ptycho, RaarParams,
+    RpieParams, Sampling, SliceWaves, Wavefield, shift,
 };
 use ptyrs::gpu::FUSED_SIDES;
 
@@ -47,6 +47,16 @@ const RAAR: RaarParams = RaarParams {
     loop_obj_probe: 1,
     calc_llk: 1,
     zero_phase_ramp: false,
+};
+/// Four frames a step: with eight or more, rPIE diverges on these counts, with or without
+/// offsets.
+const RPIE: RpieParams = RpieParams {
+    obj_step: Some(1.0),
+    probe_step: Some(1.0),
+    obj_alpha: 0.5,
+    probe_alpha: 0.5,
+    batch_size: 4,
+    calc_llk: 1,
 };
 
 fn frame() -> usize {
@@ -83,11 +93,21 @@ fn whole_offsets() -> Vec<[f64; 2]> {
     (0..NPOS).map(|f| k[f % 3]).collect()
 }
 
-fn positioned(offsets: &[[f64; 2]]) -> Features {
+fn positioned(offsets: &[[f64; 2]], refine: bool) -> Features {
     Features {
-        position: Some(offsets.to_vec()),
+        position: Some(Feature {
+            values: offsets.to_vec(),
+            refine,
+        }),
         ..Features::default()
     }
+}
+
+/// `offsets` as the GPU keeps them, in f32.
+fn in_f32(offsets: &[[f64; 2]]) -> Vec<[f64; 2]> {
+    (offsets.iter())
+        .map(|o| o.map(|v| v as f32 as f64))
+        .collect()
 }
 
 /// The smallest object holding every window of each of `raws`.
@@ -110,10 +130,10 @@ fn mode_amplitude(o: usize) -> f64 {
 
 struct Case {
     scan: Scan,
-    /// Object mode `o` the test object times [`mode_amplitude`], conjugated when `o` is odd.
+    /// Object mode `o` is the test object times [`mode_amplitude`], conjugated when `o` is odd.
     truth: (Object, Probe),
-    /// Each object mode at its truth's amplitude with a random phase in -1/4..1/4 rad, the
-    /// truth probe's defocus cut by a third.
+    /// Each object mode at [`mode_amplitude`] with a random phase in -1/4..1/4 rad, the truth
+    /// probe's defocus cut by a third.
     start: (Object, Probe),
 }
 
@@ -220,23 +240,14 @@ struct Ended {
     offsets: Option<Vec<[f64; 2]>>,
 }
 
-/// AP, DM and RAAR on the CPU or the GPU.
+/// AP, DM, RAAR and rPIE on the CPU or the GPU.
 trait Engine {
     fn run(&mut self, algorithm: &str, ncycle: usize);
-    fn hold(&mut self, features: &Features);
     fn ended(&mut self) -> Ended;
 
-    /// `ncycle` cycles of `algorithm`, or with `held` that many calls of one cycle, each
-    /// after setting `held`: every call starts from the held offsets, and DM and RAAR from the
-    /// estimate's exit waves.
-    fn cycles(&mut self, algorithm: &str, ncycle: usize, held: Option<&Features>) -> Ended {
-        match held {
-            None => self.run(algorithm, ncycle),
-            Some(f) => (0..ncycle).for_each(|_| {
-                self.hold(f);
-                self.run(algorithm, 1)
-            }),
-        }
+    /// `ncycle` cycles of `algorithm`, epochs of rPIE, in one call.
+    fn cycles(&mut self, algorithm: &str, ncycle: usize) -> Ended {
+        self.run(algorithm, ncycle);
         self.ended()
     }
 }
@@ -247,12 +258,9 @@ impl Engine for Ptycho {
             "AP" => self.ap(&AP, ncycle),
             "DM" => self.dm(&DM, ncycle),
             "RAAR" => self.raar(&RAAR, ncycle),
+            "rPIE" => self.rpie(&RPIE, ncycle).unwrap(),
             a => panic!("{a}"),
         }
-    }
-
-    fn hold(&mut self, features: &Features) {
-        self.set_features(features.clone()).unwrap();
     }
 
     fn ended(&mut self) -> Ended {
@@ -261,7 +269,7 @@ impl Engine for Ptycho {
             end: self.llk().poisson,
             object: self.object().clone(),
             probe: self.probe().clone(),
-            offsets: self.features().position.clone(),
+            offsets: self.features().position.clone().map(|p| p.values),
         }
     }
 }
@@ -272,13 +280,10 @@ impl Engine for GpuPtycho {
             "AP" => self.ap(&AP, ncycle),
             "DM" => self.dm(&DM, ncycle),
             "RAAR" => self.raar(&RAAR, ncycle),
+            "rPIE" => self.rpie(&RPIE, ncycle),
             a => panic!("{a}"),
         }
         .unwrap()
-    }
-
-    fn hold(&mut self, features: &Features) {
-        self.set_features(features).unwrap();
     }
 
     fn ended(&mut self) -> Ended {
@@ -287,7 +292,7 @@ impl Engine for GpuPtycho {
             end: self.llk().unwrap().poisson,
             object: self.object().unwrap(),
             probe: self.probe().unwrap(),
-            offsets: self.features().unwrap().position,
+            offsets: self.features().unwrap().position.map(|p| p.values),
         }
     }
 }
@@ -302,19 +307,20 @@ fn rel_l2(a: &Stack<C64>, b: &Stack<C64>) -> f64 {
 }
 
 impl Ended {
-    /// From the truth (AP, RAAR), every LLK within 2% of the truth's `floor`; from the start
-    /// (DM), every record below the last and the end a tenth of the first.
-    fn check(&self, what: &str, from_truth: bool, floor: f64) {
+    /// From the truth, whose LLK is `floor`, every LLK within 2% of it; from the start, every
+    /// record below the last, the end not above the last record, which for rPIE's epochs is
+    /// the end's, and a tenth of the first.
+    fn check(&self, what: &str, floor: Option<f64>) {
         eprintln!(
-            "{what}: floor {floor:.4}, records {:.4?}, end {:.4}",
+            "{what}: floor {floor:.4?}, records {:.4?}, end {:.4}",
             self.records, self.end
         );
-        let all = || self.records.iter().chain([&self.end]);
-        if from_truth {
-            let worst = all().fold(0.0f64, |m, &v| m.max(v));
+        if let Some(floor) = floor {
+            let all = self.records.iter().chain([&self.end]);
+            let worst = all.fold(0.0f64, |m, &v| m.max(v));
             assert!(worst < 1.02 * floor, "{what}: {worst} over {floor}");
         } else {
-            for (i, w) in all().collect::<Vec<_>>().windows(2).enumerate() {
+            for (i, w) in self.records.windows(2).enumerate() {
                 assert!(
                     w[1] < w[0],
                     "{what} after cycle {i}: {} from {}",
@@ -322,7 +328,8 @@ impl Ended {
                     w[0]
                 );
             }
-            let first = self.records[0];
+            let (first, last) = (self.records[0], self.records[self.records.len() - 1]);
+            assert!(self.end <= last, "{what}: {} from {last}", self.end);
             assert!(self.end < first / 10.0, "{what}: {} from {first}", self.end);
         }
     }
@@ -366,6 +373,41 @@ fn assert_close(what: &str, errs: [f64; 5], tol: [Option<f64>; 5]) {
     }
 }
 
+/// `ncycle` cycles of `algorithm` on `c` under `features`, from the truth, whose LLK is
+/// `floor`, or without from the start, on the CPU and on the GPU eagerly and with graphs: each
+/// passes [`Ended::check`], held offsets keep their values, the graphs replay the eager run
+/// bit for bit and the GPU agrees with the CPU.
+fn on_cpu_and_gpu(
+    c: &Case,
+    ctx: &Arc<CudaContext>,
+    (algorithm, ncycle): (&str, usize),
+    features: &Features,
+    floor: Option<f64>,
+) {
+    const TOL: [Option<f64>; 5] = [Some(1e-5), Some(1e-5), Some(1e-4), Some(1e-5), Some(3e-6)];
+    let position = features.position.as_ref().unwrap();
+    let nobj = c.truth.0.dims()[0];
+    let what = format!("{algorithm} nobj {nobj} refine {}", position.refine);
+    let from = if floor.is_some() { &c.truth } else { &c.start };
+    let want = Case::cpu(&c.scan, from, features).cycles(algorithm, ncycle);
+    let [eager, graphs] = [false, true]
+        .map(|graph| Case::gpu(ctx, &c.scan, from, features, graph).cycles(algorithm, ncycle));
+    if !position.refine {
+        let kept = Some(&position.values);
+        assert_eq!(
+            want.offsets.as_ref(),
+            kept,
+            "{what}: the CPU keeps the offsets"
+        );
+        let kept = Some(in_f32(&position.values));
+        assert_eq!(eager.offsets, kept, "{what}: the GPU keeps the offsets");
+    }
+    want.check(&format!("{what} CPU"), floor);
+    assert!(graphs == eager, "{what}: graphs replay the eager run");
+    eager.check(&format!("{what} GPU"), floor);
+    assert_close(&format!("{what} GPU against CPU"), eager.errors(&want), TOL);
+}
+
 /// [`solve_keeps_the_truth_and_descends`] in one object mode.
 #[test]
 fn solve_keeps_the_truth_and_descends_in_one_object_mode() {
@@ -378,51 +420,67 @@ fn solve_keeps_the_truth_and_descends_in_two_object_modes() {
     solve_keeps_the_truth_and_descends(2);
 }
 
-/// On counts of the model at drawn offsets, in `nobj` object modes: AP from the truth with the
-/// offsets held and RAAR from the truth stay at the truth's LLK, and DM from the start
-/// descends, on the CPU and the GPU; the GPU's graphs replay its eager run bit for bit and
-/// agree with the CPU. Each frame's views cover every probe mode on every object mode, where
-/// the GPU's weight of a frame, `Σ_p |P_p|²`, is the CPU's `|W|²` of each of its views. A test
-/// per `nobj`, so the two run side by side: the CPU's object solve is most of each.
+/// On counts of the model at drawn offsets, in `nobj` object modes: AP and RAAR from the
+/// truth stay at the truth's LLK and DM from the start descends, with the offsets held and
+/// RAAR's and DM's also refined, by [`on_cpu_and_gpu`]. Each frame's views cover every probe
+/// mode on every object mode, where the GPU's weight of a frame, `Σ_p |P_p|²`, is the CPU's
+/// `|W|²` of each of its views. A test per `nobj`, so the two run side by side: the CPU's
+/// object solve is most of each.
 fn solve_keeps_the_truth_and_descends(nobj: usize) {
     const NCYCLE: usize = 8;
-    const TOL: [Option<f64>; 5] = [Some(1e-5), Some(1e-5), Some(1e-4), Some(1e-5), Some(3e-6)];
     let (raw, offsets) = (fermat(), drawn_offsets());
-    let drawn = positioned(&offsets);
     let ctx = CudaContext::new(0).unwrap();
     let shape = object_shape(&[&raw]);
     let c = Case::new(raw, shape, &offsets, nobj);
-    let floor = Case::cpu(&c.scan, &c.truth, &drawn).llk().poisson;
-    // DM and RAAR carry their exit waves across cycles, which a held call restarts.
-    for (algorithm, from_truth, held) in [
-        ("AP", true, true),
+    let floor = Case::cpu(&c.scan, &c.truth, &positioned(&offsets, false))
+        .llk()
+        .poisson;
+    for (algorithm, from_truth, refine) in [
+        ("AP", true, false),
         ("RAAR", true, false),
+        ("RAAR", true, true),
         ("DM", false, false),
+        ("DM", false, true),
     ] {
-        let what = format!("{algorithm} nobj {nobj}");
-        let from = [&c.start, &c.truth][usize::from(from_truth)];
-        let held = held.then_some(&drawn);
-        let want = Case::cpu(&c.scan, from, &drawn).cycles(algorithm, NCYCLE, held);
-        want.check(&format!("{what} CPU"), from_truth, floor);
-        let [eager, graphs] = [false, true].map(|graph| {
-            let mut gpu = Case::gpu(&ctx, &c.scan, from, &drawn, graph);
-            gpu.cycles(algorithm, NCYCLE, held)
-        });
-        assert!(graphs == eager, "{what}: graphs replay the eager run");
-        eager.check(&format!("{what} GPU"), from_truth, floor);
-        assert_close(&format!("{what} GPU against CPU"), eager.errors(&want), TOL);
+        let features = positioned(&offsets, refine);
+        on_cpu_and_gpu(
+            &c,
+            &ctx,
+            (algorithm, NCYCLE),
+            &features,
+            from_truth.then_some(floor),
+        );
     }
+}
+
+/// On the counts of [`solve_keeps_the_truth_and_descends`] in one object mode, the only one
+/// rPIE models: rPIE from the start descends with the offsets held, by [`on_cpu_and_gpu`],
+/// in twice DM's cycles.
+#[test]
+fn rpie_descends_with_the_offsets_held() {
+    const NEPOCH: usize = 16;
+    let (raw, offsets) = (fermat(), drawn_offsets());
+    let ctx = CudaContext::new(0).unwrap();
+    let shape = object_shape(&[&raw]);
+    let c = Case::new(raw, shape, &offsets, 1);
+    on_cpu_and_gpu(
+        &c,
+        &ctx,
+        ("rPIE", NEPOCH),
+        &positioned(&offsets, false),
+        None,
+    );
 }
 
 /// At zero offsets and at whole-pixel offsets from corners that many pixels back, held, the
 /// update is the blend of the same counts without offsets at the moved corners: every LLK
-/// record, the object and the probe, on the CPU and the GPU. The end LLK is not: the last
-/// call's position step moves the offsets.
+/// record, the end LLK, the object and the probe, on the CPU and the GPU, which keep the
+/// offsets.
 #[test]
 fn whole_pixel_offsets_are_the_blend() {
     const NCYCLE: usize = 3;
-    const TOL_CPU: [Option<f64>; 5] = [Some(1e-12), None, Some(1e-12), Some(1e-12), None];
-    const TOL_GPU: [Option<f64>; 5] = [Some(1e-5), None, Some(1e-4), Some(1e-5), None];
+    const TOL_CPU: [Option<f64>; 5] = [Some(1e-12), Some(1e-12), Some(1e-12), Some(1e-12), None];
+    const TOL_GPU: [Option<f64>; 5] = [Some(1e-5), Some(1e-5), Some(1e-4), Some(1e-5), None];
     let (raw, whole) = (fermat(), whole_offsets());
     let moved = |a: usize, v: &[f64]| -> Vec<f64> {
         (v.iter().zip(&whole))
@@ -443,26 +501,112 @@ fn whole_pixel_offsets_are_the_blend() {
     let c = Case::new(raw, shape, &whole, 1);
     let at = Scan::new(c.scan.geometry, at, c.scan.counts.clone()).unwrap();
     let none = Features::default();
-    let runs = [
-        ("zero", &at, positioned(&[[0.0; 2]; NPOS])),
-        ("whole", &c.scan, positioned(&whole)),
-    ];
+    let zero = [[0.0; 2]; NPOS];
+    let runs = [("zero", &at, &zero[..]), ("whole", &c.scan, &whole[..])];
     let ctx = CudaContext::new(0).unwrap();
-    for algorithm in ["AP", "DM", "RAAR"] {
-        let blend = Case::cpu(&at, &c.start, &none).cycles(algorithm, NCYCLE, Some(&none));
-        let blend_gpu =
-            Case::gpu(&ctx, &at, &c.start, &none, true).cycles(algorithm, NCYCLE, Some(&none));
-        for (label, scan, features) in &runs {
-            let got = Case::cpu(scan, &c.start, features).cycles(algorithm, NCYCLE, Some(features));
+    for algorithm in ["AP", "DM", "RAAR", "rPIE"] {
+        let blend = Case::cpu(&at, &c.start, &none).cycles(algorithm, NCYCLE);
+        let blend_gpu = Case::gpu(&ctx, &at, &c.start, &none, true).cycles(algorithm, NCYCLE);
+        for (label, scan, offsets) in runs {
+            let held = positioned(offsets, false);
+            let got = Case::cpu(scan, &c.start, &held).cycles(algorithm, NCYCLE);
             let what = format!("{algorithm} CPU {label}");
-            assert_close(&what, got.errors(&blend), TOL_CPU);
-            let got = Case::gpu(&ctx, scan, &c.start, features, true).cycles(
-                algorithm,
-                NCYCLE,
-                Some(features),
+            assert_eq!(
+                got.offsets.as_deref(),
+                Some(offsets),
+                "{what} keeps the offsets"
             );
+            assert_close(&what, got.errors(&blend), TOL_CPU);
+            let got = Case::gpu(&ctx, scan, &c.start, &held, true).cycles(algorithm, NCYCLE);
             let what = format!("{algorithm} GPU {label}");
+            assert_eq!(
+                got.offsets.as_deref(),
+                Some(offsets),
+                "{what} keeps the offsets"
+            );
             assert_close(&what, got.errors(&blend_gpu), TOL_GPU);
+        }
+    }
+}
+
+/// With no object inertia and the offsets held, AP, DM and RAAR on the CPU and the GPU keep
+/// the offsets; at zero and whole-pixel offsets they leave every pixel outside the windows at
+/// its start, the GPU's at the start rounded to `f32`; at drawn offsets, whose windows sample
+/// every pixel, every pixel stays finite. No LLK is due, so DM and RAAR balance nothing.
+#[test]
+fn zero_object_inertia_holds_the_unseen_pixels() {
+    const NCYCLE: usize = 2;
+    const AP0: ApParams = ApParams {
+        obj_inertia: Some(0.0),
+        calc_llk: 0,
+        ..AP
+    };
+    const DM0: DmParams = DmParams {
+        obj_inertia: Some(0.0),
+        calc_llk: 0,
+        ..DM
+    };
+    const RAAR0: RaarParams = RaarParams {
+        obj_inertia: Some(0.0),
+        calc_llk: 0,
+        ..RAAR
+    };
+    let raw = fermat();
+    let shape = object_shape(&[&raw]);
+    let views = addr(&raw, shape, 1).views().to_vec();
+    let ctx = CudaContext::new(0).unwrap();
+    for (label, offsets, whole) in [
+        ("zero", vec![[0.0; 2]; NPOS], true),
+        ("whole", whole_offsets(), true),
+        ("drawn", drawn_offsets(), false),
+    ] {
+        let mut seen = vec![false; shape[0] * shape[1]];
+        for v in views.iter().filter(|_| whole) {
+            let [dy, dx] = offsets[v.frame as usize].map(|d| d as i64);
+            let (y0, x0) = (v.oy as i64 + dy, v.ox as i64 + dx);
+            assert!(y0 >= 0 && x0 >= 0, "{label} view {v:?}");
+            let (y0, x0) = (y0 as usize, x0 as usize);
+            for y in y0..y0 + frame() {
+                let row = &mut seen[y * shape[1]..(y + 1) * shape[1]];
+                row[x0..x0 + frame()].fill(true);
+            }
+        }
+        let c = Case::new(fermat(), shape, &offsets, 1);
+        let held = positioned(&offsets, false);
+        let check = |what: &str, got: &Object, start: &Object| {
+            let it = got.as_slice().iter().zip(start.as_slice()).zip(&seen);
+            for (j, ((g, s), &seen)) in it.enumerate() {
+                assert!(
+                    g.re.is_finite() && g.im.is_finite(),
+                    "{what} pixel {j}: {g}"
+                );
+                assert!(!whole || seen || g == s, "{what} pixel {j}: {g} from {s}");
+            }
+        };
+        let start = &c.start.0;
+        let start32 = start.as_slice().iter().map(|v| {
+            let [re, im] = [v.re, v.im].map(|x| f64::from(x as f32));
+            C64::new(re, im)
+        });
+        let start32 = Object::new(Stack::from_vec(start.dims(), start32.collect()).unwrap());
+        for algorithm in ["AP", "DM", "RAAR"] {
+            let mut cpu = Case::cpu(&c.scan, &c.start, &held);
+            let mut gpu = Case::gpu(&ctx, &c.scan, &c.start, &held, true);
+            match algorithm {
+                "AP" => (cpu.ap(&AP0, NCYCLE), gpu.ap(&AP0, NCYCLE)),
+                "DM" => (cpu.dm(&DM0, NCYCLE), gpu.dm(&DM0, NCYCLE)),
+                _ => (cpu.raar(&RAAR0, NCYCLE), gpu.raar(&RAAR0, NCYCLE)),
+            }
+            .1
+            .unwrap();
+            let what = format!("{algorithm} CPU {label}");
+            let kept = cpu.features().position.as_ref().map(|p| &p.values);
+            assert_eq!(kept, Some(&offsets), "{what} keeps the offsets");
+            check(&what, cpu.object(), start);
+            let what = format!("{algorithm} GPU {label}");
+            let kept = gpu.features().unwrap().position.map(|p| p.values);
+            assert_eq!(kept, Some(in_f32(&offsets)), "{what} keeps the offsets");
+            check(&what, &gpu.object().unwrap(), &start32);
         }
     }
 }

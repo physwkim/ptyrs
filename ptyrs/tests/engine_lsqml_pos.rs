@@ -8,7 +8,8 @@ use std::slice;
 
 use ptyrs::base::{C64, Stack, View};
 use ptyrs::engine::{
-    Cost, Features, Lsqml, LsqmlParams, LsqmlStep, Optics, ProbeVariation, Ptycho, illumination,
+    Cost, Feature, Features, Lsqml, LsqmlParams, LsqmlStep, Optics, ProbeVariation, Ptycho,
+    illumination,
 };
 
 #[path = "common/engine/mod.rs"]
@@ -68,7 +69,7 @@ fn offsets(rows: &[Vec<f64>], c: usize) -> Vec<[f64; 2]> {
 /// `run` refining the positions from `start`.
 fn with_positions(run: Lsqml, start: &[[f64; 2]]) -> Lsqml {
     run.with_features(Features {
-        position: Some(start.to_vec()),
+        position: Some(Feature::refined(start.to_vec())),
         ..Features::default()
     })
     .unwrap()
@@ -83,7 +84,7 @@ fn assert_close(what: &str, got: &[f64], want: &[f64], tol: f64) {
 /// The offset changes `run` made from `start` against the reference's columns `c, c + 1`.
 fn assert_offsets(what: &str, run: &Lsqml, rows: &[Vec<f64>], c: usize, tol: f64) {
     let (start, want) = (offsets(rows, 1), offsets(rows, c));
-    let got = run.features().position.as_ref().unwrap();
+    let got = &run.features().position.as_ref().unwrap().values;
     let delta = |d: &[[f64; 2]]| -> Vec<f64> {
         d.iter()
             .zip(&start)
@@ -154,7 +155,7 @@ fn assert_step_ref(cost: Cost, noise: usize, opr: bool) {
     let frames: Vec<usize> = rows.iter().map(|r| r[0] as usize).collect();
     let mut var = if opr {
         let (u, w) = variation(3, 1);
-        ProbeVariation::new(u, w)
+        ProbeVariation::new(u, Feature::refined(w))
     } else {
         ProbeVariation::none([32, 32])
     };
@@ -189,7 +190,7 @@ fn assert_step_ref(cost: Cost, noise: usize, opr: bool) {
         let moved = |x: &[f64]| x.iter().zip(&w0).map(|(x, w)| x - w).collect::<Vec<_>>();
         assert_close(
             &format!("{what} weight change"),
-            &moved(var.weights()),
+            &moved(&var.weights().values),
             &moved(&w),
             1e-13,
         );
@@ -286,15 +287,15 @@ fn with_features_refuses_what_ptychi_lsqml_lacks() {
     };
     let refused = [
         Features {
-            scale: Some(vec![1.0; 40]),
+            scale: Some(Feature::refined(vec![1.0; 40])),
             ..Features::default()
         },
         Features {
-            background: Some(vec![0.0; 32 * 32]),
+            background: Some(Feature::refined(vec![0.0; 32 * 32])),
             ..Features::default()
         },
         Features {
-            position: Some(vec![[0.0, f64::NAN]; 40]),
+            position: Some(Feature::refined(vec![[0.0, f64::NAN]; 40])),
             ..Features::default()
         },
     ];
@@ -302,7 +303,7 @@ fn with_features_refuses_what_ptychi_lsqml_lacks() {
         assert!(run().with_features(f.clone()).is_err(), "{f:?}");
     }
     let f = Features {
-        position: Some(vec![[0.25, -0.25]; 40]),
+        position: Some(Feature::refined(vec![[0.25, -0.25]; 40])),
         ..Features::default()
     };
     assert_eq!(run().with_features(f.clone()).unwrap().features(), &f);

@@ -20,8 +20,8 @@ use std::time::Instant;
 
 use cuda_core::CudaContext;
 use ptyrs::engine::{
-    ApParams, BhParams, Cost, DmParams, EngineError, Features, GpuOptions, GpuPtycho, LsqmlParams,
-    MlParams, Ptycho, RpieParams,
+    ApParams, BhParams, Cost, DmParams, EngineError, Feature, Features, GpuOptions, GpuPtycho,
+    LsqmlParams, MlParams, Ptycho, RpieParams,
 };
 
 #[path = "../tests/common/engine/mod.rs"]
@@ -66,11 +66,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for f in features.split(',') {
         match f {
             "none" => {}
-            "scale" => want.scale = Some(vec![1.0; npos]),
-            "background" => want.background = Some(vec![1.0; frame * frame]),
+            "scale" => want.scale = Some(Feature::refined(vec![1.0; npos])),
+            "background" => want.background = Some(Feature::refined(vec![1.0; frame * frame])),
             "position" => {
                 let d = |f: usize| if f.is_multiple_of(2) { 0.1 } else { -0.1 };
-                want.position = Some((0..npos).map(|f| [d(f), -d(f)]).collect());
+                want.position = Some(Feature::refined((0..npos).map(|f| [d(f), -d(f)]).collect()));
             }
             _ => return Err(usage.into()),
         }

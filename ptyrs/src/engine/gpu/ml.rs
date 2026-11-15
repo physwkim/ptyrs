@@ -180,7 +180,7 @@ impl Bufs<'_> {
             _ => None,
         };
         if let PassesMut::Fused(f) = passes
-            && self.features.positioned()
+            && self.features.position_refined()
         {
             self.projected_position_sums(ctx, f)?;
         }

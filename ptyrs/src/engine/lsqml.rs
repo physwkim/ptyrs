@@ -122,8 +122,8 @@ impl<'a> LsqmlBatch<'a> {
             })
             .collect();
         let (uviews, mut uprobe) = var.unique(views, probe);
-        let offsets = (run.features.position.as_ref())
-            .map(|d| frames.iter().map(|&f| d[f]).collect::<Vec<_>>());
+        let offsets =
+            (run.features.offsets()).map(|d| frames.iter().map(|&f| d[f]).collect::<Vec<_>>());
         let sampling = (run.sampling).unwrap_or_else(|| {
             Sampling::auto(optics, objects[0].plane_shape(), probe.plane_shape())
         });
@@ -470,16 +470,17 @@ impl Lsqml {
         })
     }
 
-    /// This run modelling and refining `features`, which hold one entry per frame of the scan
-    /// it runs on. pty-chi's LSQML refines the positions alone; it has neither a per-frame
-    /// intensity scale nor a detector background, and those are refused.
+    /// This run modelling `features`, refining those set to, which hold one entry per frame
+    /// of the scan it runs on. pty-chi's LSQML models the positions alone; it has neither a
+    /// per-frame intensity scale nor a detector background, and those are refused, held or
+    /// not.
     pub fn with_features(self, features: Features) -> Result<Self, EngineError> {
         if features.scale.is_some() || features.background.is_some() {
             return Err(EngineError::Invalid(
-                "LSQML refines no intensity scale or background, as pty-chi's".into(),
+                "LSQML models no intensity scale or background, as pty-chi's".into(),
             ));
         }
-        if let Some(d) = &features.position
+        if let Some(d) = features.offsets()
             && !d.iter().flatten().all(|d| d.is_finite())
         {
             return Err(EngineError::Invalid(
@@ -515,8 +516,8 @@ impl Lsqml {
     /// `P += mean(a_probe)·dP` and `var`'s eigenmodes and batch weights by [`ProbeVariation`]'s
     /// OPR step on slice 0, all from the state on entry; the frames' [`Self::a_far`] become the
     /// batch's. With [`Features::position`], `dP` is the mean of the adjoint-moved frame
-    /// directions ([`LsqmlBatch::adjoint_move`]), and the offsets take pty-chi's position step
-    /// after the object and probe ([`Features::position`]). The first step fixes the run's
+    /// directions ([`LsqmlBatch::adjoint_move`]), and refined offsets take pty-chi's position
+    /// step after the object and probe ([`Features::position`]). The first step fixes the run's
     /// sampling ([`Self::with_sampling`]).
     pub fn step(
         &mut self,
@@ -549,11 +550,7 @@ impl Lsqml {
         let moved = b.adjoint_move(&d);
         let d_probe = Probe::new(frame_mean(&moved, np));
         let (a_obj, a_probe) = b.step_sizes(&d_obj, &d_probe);
-        let d_pos = self
-            .features
-            .position
-            .as_ref()
-            .map(|_| b.position_directions());
+        let d_pos = (self.features.position_refined()).then(|| b.position_directions());
         let (a_far, frames) = (b.a_far().to_vec(), b.frames().to_vec());
         for (&f, &a) in frames.iter().zip(&a_far) {
             if self.a_far.len() <= f {
@@ -575,7 +572,7 @@ impl Lsqml {
             .iter_mut()
             .zip(d_probe.as_slice())
             .for_each(|(x, d)| *x += sp * d);
-        if let (Some(d), Some(delta)) = (&mut self.features.position, d_pos) {
+        if let (Some(d), Some(delta)) = (self.features.refined_offsets(), d_pos) {
             batch_position_step(d, &frames, &delta);
         }
         LsqmlStep {
@@ -614,12 +611,12 @@ impl Lsqml {
         var: &mut ProbeVariation,
     ) -> Vec<LsqmlStep> {
         let (nframe, nmode) = (addr.nframe(), addr.nmode());
-        if let Some(d) = &self.features.position {
+        if let Some(d) = self.features.offsets() {
             assert_eq!(d.len(), nframe, "one position offset per frame");
         }
         let sampling = self.sampling(optics, &objects[0], probe);
         if self.epochs < 10 || self.epochs.is_multiple_of(10) {
-            let offsets = self.features.position.as_deref();
+            let offsets = self.features.offsets();
             let illum = sampling.illumination(addr.views(), objects[0].dims(), probe, offsets);
             let pre = self.preconditioner.take().unwrap_or_else(|| {
                 let n = probe.plane_len() as f64;

@@ -17,7 +17,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use ptyrs::base::{C64, sim};
-use ptyrs::engine::{DmParams, Features, Ptycho, RaarParams, Sampling};
+use ptyrs::engine::{DmParams, Feature, Features, Ptycho, RaarParams, Sampling};
 
 #[path = "../tests/common/near_cases.rs"]
 mod near;
@@ -103,7 +103,7 @@ fn main() {
                     cpu.set_sampling(Sampling::FullObject);
                     if label == "position" {
                         let f = Features {
-                            position: Some(near::drawn_offsets()),
+                            position: Some(Feature::refined(near::drawn_offsets())),
                             ..Features::default()
                         };
                         cpu.set_features(f).unwrap();
@@ -133,7 +133,7 @@ fn main() {
                         .features()
                         .position
                         .clone()
-                        .unwrap_or(vec![[0.0; 2]; nframe]);
+                        .map_or(vec![[0.0; 2]; nframe], |p| p.values);
                     put(
                         &dir.join(format!("{stem}_offsets.f64")),
                         d.into_iter().flatten(),

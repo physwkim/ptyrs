@@ -11,7 +11,7 @@ use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 use ptyrs::base::C64;
 use ptyrs::gpu::{
-    C32, EpochOrder, FrameWaves, Kernels, PositionKernels, PositionRule, Positions, SliceSource,
+    C32, EpochOrder, FrameWaves, Kernels, PositionKernels, PositionRule, PositionStep, SliceSource,
     Solve, StackTable, ViewAddr, ViewDims, Views,
 };
 
@@ -83,15 +83,17 @@ fn noise(len: usize, seed: u64) -> Vec<C64> {
     (0..len).map(|_| C64::new(next(), next())).collect()
 }
 
-fn up(stream: &CudaStream, v: &[C64]) -> DeviceBuffer<C32> {
-    let host: Vec<C32> = v
-        .iter()
+fn c32s(v: &[C64]) -> Vec<C32> {
+    v.iter()
         .map(|c| C32 {
             re: c.re as f32,
             im: c.im as f32,
         })
-        .collect();
-    DeviceBuffer::from_host(stream, &host).unwrap()
+        .collect()
+}
+
+fn up(stream: &CudaStream, v: &[C64]) -> DeviceBuffer<C32> {
+    DeviceBuffer::from_host(stream, &c32s(v)).unwrap()
 }
 
 /// The exit wave's stored index of natural pixel `i`.
@@ -207,7 +209,7 @@ fn run(src: Source, quad_phase: f32) -> (Vec<f64>, Vec<f64>) {
     let views = Views::new(&stream, d, &addr).unwrap();
     let table = StackTable::new(&stream, &d, &STACKS).unwrap();
     let order = EpochOrder::new(&kernels, &stream, &views).unwrap();
-    let mut pos = Positions::zeroed(&stream, &d, NF_MAX as u32).unwrap();
+    let mut state = PositionStep::zeroed(&stream, &d, NF_MAX as u32).unwrap();
     let obj = noise(d.obj[0] as usize * nxo, 3);
     let probe = noise(NMODE * N, 5);
     let dev_obj = up(&stream, &obj);
@@ -218,21 +220,25 @@ fn run(src: Source, quad_phase: f32) -> (Vec<f64>, Vec<f64>) {
         let chi = noise(NF_MAX * NMODE * N, seed + 7);
         let waves = noise(NF_MAX * NMODE * N, seed + 9);
         let deriv = noise(2 * NF_MAX * N, seed + 11);
-        let (dev_chi, dev_waves, dev_deriv) =
-            (up(&stream, &chi), up(&stream, &waves), up(&stream, &deriv));
+        let (dev_chi, dev_waves) = (up(&stream, &chi), up(&stream, &waves));
         let at = table.at(s);
+        // The stack's derivatives, written by the call that reads them.
+        let derivatives = |slopes: &mut DeviceBuffer<C32>| {
+            slopes.copy_from_host(&stream, &c32s(&deriv))?;
+            Ok(())
+        };
         match src {
             Source::Slopes => {
                 let w = FrameWaves::Probes(&dev_waves);
-                k.sums(&ctx, &views, at, &dev_obj, (&dev_chi, w), &mut pos)
+                k.sums(&ctx, &views, at, &dev_obj, (&dev_chi, w), &mut state)
             }
             Source::Waves => {
                 let w = SliceSource::Waves(FrameWaves::Views(&dev_waves));
-                k.derivative_sums(&ctx, &views, at, &dev_deriv, (&dev_chi, w), &mut pos)
+                k.derivative_sums(&ctx, &views, at, derivatives, (&dev_chi, w), &mut state)
             }
             Source::Probe => {
                 let w = SliceSource::Probe(&dev_probe);
-                k.derivative_sums(&ctx, &views, at, &dev_deriv, (&dev_chi, w), &mut pos)
+                k.derivative_sums(&ctx, &views, at, derivatives, (&dev_chi, w), &mut state)
             }
         }
         .unwrap();
@@ -267,7 +273,7 @@ fn run(src: Source, quad_phase: f32) -> (Vec<f64>, Vec<f64>) {
         scale: 1.0,
     };
     let batch = 0..NFRAME as u32;
-    k.step(&ctx, batch, &order, &mut offsets, solve, &mut pos)
+    k.step(&ctx, batch, &order, &mut offsets, solve, &mut state)
         .unwrap();
     let got = offsets.to_host_vec(&stream).unwrap();
     (got.iter().map(|&v| v as f64).collect(), step(&want))

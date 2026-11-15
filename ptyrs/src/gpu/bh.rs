@@ -25,6 +25,16 @@
 //! [`BhKernels::pos_near`], forward FFTs, [`BhKernels::obj_conj`] and its forward FFT, and
 //! [`BhKernels::pos_far`]. After the step, [`BhKernels::pos_update`].
 //!
+//! # With the offsets held
+//!
+//! The probes stay moved by the offsets, which the step does not take: no
+//! [`BhKernels::obj_conj`], [`BhKernels::pos_grad`], [`BhKernels::pos_dots`] or
+//! [`BhKernels::pos_update`]. Per stack of the Hessian pass, [`BhKernels::moved_spec`] in place
+//! of [`BhKernels::pos_spec`] and [`BhKernels::moved_far`] in place of
+//! [`BhKernels::pos_far`]; under full-object sampling, [`BhKernels::win_obj_grad`] in place of
+//! [`BhKernels::win_grad`], no second windows and no [`BhKernels::win_lift`] or
+//! [`BhKernels::win_hess`].
+//!
 //! # Under full-object sampling
 //!
 //! The views read windows of the object at their offsets (`crate::gpu::sampling`), the
@@ -44,8 +54,8 @@ use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaStream, DeviceBuffer, Event, LaunchConfig, PinnedHostBuffer, RawDeviceBuffer};
 pub use ptyrs_kernels::bh::{BH_HESS, BH_STEP};
 use ptyrs_kernels::bh::{
-    BhDirs, BhFar, BhFields, BhMovedFar, BhMoves, BhNear, BhObs, BhPartials, BhPosDirs, BhSecond,
-    BhSliceIn, BhTangents, BhWinDerivs, BhWinFields, bh_kernels,
+    BhDirs, BhFar, BhFields, BhMovedFar, BhMovedProbes, BhMoves, BhNear, BhObs, BhPartials,
+    BhPosDirs, BhSecond, BhSliceIn, BhTangents, BhWinDerivs, BhWinFields, bh_kernels,
 };
 use ptyrs_kernels::grad::{CG_BLOCKS, GAMMA_CHUNK, ObjProbePtrs};
 use ptyrs_kernels::pixel::{PIXEL_THREADS, StackGeom, SumPtrs};
@@ -423,6 +433,75 @@ impl<'a> BhMovesRef<'a> {
     }
 }
 
+/// What the Hessian of a step along a [`BhDisp`] reads of the moved probes with the offsets
+/// held: the spectra of the displacement's probe parts, `u`'s unscaled and with CG `v`'s; the
+/// offsets of the exit waves by epoch position (a [`Shift`]'s); and `order`, the epoch's.
+pub struct BhMovedRef<'a> {
+    order: &'a EpochOrder,
+    offsets: &'a DeviceBuffer<f32>,
+    au: &'a DeviceBuffer<C32>,
+    av: Option<&'a DeviceBuffer<C32>>,
+    /// `d.u_scale`, `u`'s probe part over `au`.
+    probe_scale: f32,
+}
+
+impl<'a> BhMovedRef<'a> {
+    /// For a step along `d`: `au` the spectra of `d.u`'s probe part (unscaled) and `av` those
+    /// of `d.v`'s, given exactly when `d.v` is.
+    pub fn new(
+        d: &BhDisp<'_>,
+        order: &'a EpochOrder,
+        offsets: &'a DeviceBuffer<f32>,
+        au: ProbeSpectrum<'a>,
+        av: Option<ProbeSpectrum<'a>>,
+    ) -> Result<Self, Error> {
+        if av.is_some() != d.v.is_some() {
+            return Err(Error::Shape(
+                "v's probe spectra are given exactly with v".into(),
+            ));
+        }
+        Ok(Self {
+            order,
+            offsets,
+            au: au.spectra(),
+            av: av.map(|s| s.spectra()),
+            probe_scale: d.u_scale,
+        })
+    }
+
+    fn check(&self) -> Result<&ViewDims, Error> {
+        let dims = self.order.views.dims();
+        let len = dims.nprobe as usize * dims.n();
+        check_len("u spectra", self.au, len)?;
+        if let Some(av) = self.av {
+            check_len("v spectra", av, len)?;
+        }
+        check_len("offsets", self.offsets, 2 * dims.nframe as usize)?;
+        Ok(dims)
+    }
+
+    fn storages(&self) -> Vec<&RawDeviceBuffer> {
+        let mut s = vec![
+            self.offsets.storage(),
+            self.au.storage(),
+            self.order.views.addr().storage(),
+        ];
+        s.extend(self.av.map(|b| b.storage()));
+        s
+    }
+
+    /// Without `av`, `au` stands in for it; the kernel never reads it.
+    fn ptrs(&self) -> BhMovedProbes {
+        BhMovedProbes {
+            au: dptr(self.au),
+            av: dptr(self.av.unwrap_or(self.au)),
+            offsets: dptr(self.offsets),
+            probe_scale: self.probe_scale,
+            cg: self.av.is_some().into(),
+        }
+    }
+}
+
 /// One stack under the position model as [`BhKernels::pos_near`] reads it, each in
 /// [`Kernels::obj_probe_to_psi`]'s layout: the object, the moved probes `w` (`[nf_max *
 /// nprobe, ny, nx]`, as `crate::gpu::PositionKernels::shift_w` leaves them), the residual
@@ -443,6 +522,16 @@ pub struct BhMovedFarRef<'a> {
     pub lu: &'a DeviceBuffer<C32>,
     pub lv: &'a DeviceBuffer<C32>,
     pub y: &'a DeviceBuffer<C32>,
+}
+
+/// One stack's far fields [`BhKernels::moved_far`] reads, each of `nf_max * nmode` planes:
+/// the forward-FFT'd exit waves and the forward-FFT'd [`BhKernels::pos_near`] `lu` and, with
+/// CG, `lv`. Without `lv` the step is steepest descent.
+#[derive(Clone, Copy)]
+pub struct BhFarRef<'a> {
+    pub psi: &'a DeviceBuffer<C32>,
+    pub lu: &'a DeviceBuffer<C32>,
+    pub lv: Option<&'a DeviceBuffer<C32>>,
 }
 
 /// One stack under full-object sampling as [`BhKernels::win_grad`] and
@@ -1369,6 +1458,100 @@ impl BhKernels {
             })
     }
 
+    /// [`Self::pos_spec`] with the offsets held: `l[0] = e s Au_p` and with CG `l[1] = e
+    /// Av_p` (else `l[1]` is left as it is), `e` each frame's ramp of `mv`'s offsets.
+    pub fn moved_spec(
+        &self,
+        ctx: &ExecutionContext,
+        stack: StackRef<'_>,
+        mv: &BhMovedRef<'_>,
+        l: [&mut DeviceBuffer<C32>; 2],
+    ) -> Result<(), Error> {
+        let dims = mv.check()?;
+        let g = dims.geom(stack)?;
+        let len = g.nf_max as usize * dims.nmode as usize * dims.n();
+        let [lu, lv] = l;
+        check_len("lu", lu, len)?;
+        check_len("lv", lv, len)?;
+        let config = grid_1d(len)?;
+        let mut reads = mv.storages();
+        reads.push(stack.storage());
+        let views = mv.order.views.addr();
+        self.base
+            .launch(ctx, &reads, &[lu.storage(), lv.storage()], |stream| {
+                // SAFETY: lengths checked above; `Views::new` checked every view's probe mode.
+                unsafe {
+                    self.module.bh_moved_spec(
+                        stream,
+                        config,
+                        mv.ptrs(),
+                        dptr::<ViewAddr, ViewAddr>(views),
+                        dptr(lu),
+                        dptr(lv),
+                        stack.ctl() as *const StackCtl,
+                        g,
+                    )
+                }
+            })
+    }
+
+    /// [`Self::pos_far`] with the offsets held: adds to the stack's frames' triples
+    /// [`Self::pos_near`] left only the far terms, from the stack's far fields `f`, the last
+    /// two of each triple without `f.lv` left as they are.
+    pub fn moved_far(
+        &self,
+        ctx: &ExecutionContext,
+        scan: BhScan<'_>,
+        stack: StackRef<'_>,
+        f: &BhFarRef<'_>,
+        parts: &mut BhParts,
+    ) -> Result<(), Error> {
+        let dims = scan.check()?;
+        let g = dims.geom(stack)?;
+        let n = dims.n();
+        let len = g.nf_max as usize * dims.nmode as usize * n;
+        for (what, b) in [("psi", Some(f.psi)), ("lu", Some(f.lu)), ("lv", f.lv)] {
+            if let Some(b) = b {
+                check_len(what, b, len)?;
+            }
+        }
+        parts.check(dims)?;
+        let config = chunk_grid(&g, n)?;
+        let mut reads = vec![
+            scan.counts.storage(),
+            scan.order.ids.order().storage(),
+            f.psi.storage(),
+            f.lu.storage(),
+            stack.storage(),
+        ];
+        reads.extend(f.lv.map(|b| b.storage()));
+        let far = BhFar {
+            psi: dptr(f.psi),
+            lu: dptr(f.lu),
+            // Without `lv`, `lu` stands in; the kernel never reads it.
+            lv: dptr(f.lv.unwrap_or(f.lu)),
+        };
+        let cg = f.lv.is_some().into();
+        let out = parts.ptr(parts.hess(0));
+        self.base
+            .launch(ctx, &reads, &[parts.buf.storage()], |stream| {
+                // SAFETY: lengths checked above; one block of PIXEL_THREADS per chunk and frame;
+                // `EpochOrder` holds frame ids below `nframe`.
+                unsafe {
+                    self.module.bh_moved_far(
+                        stream,
+                        config,
+                        far,
+                        cg,
+                        scan.obs(),
+                        out,
+                        stack.ctl() as *const StackCtl,
+                        g,
+                    )
+                }
+            })
+    }
+
     /// The offsets' update of `batch` from its record of `steps`: per frame `f` of the batch
     /// `D = β prev − u_d`, `offsets[f] += off.step α D` and `prev = D`; `offsets` `[nframe,
     /// 2]` by scan frame.
@@ -1459,6 +1642,38 @@ impl BhKernels {
                         slice: slice as u32,
                         nslice: nslice as u32,
                     },
+                    stack.ctl() as *const StackCtl,
+                    g,
+                )
+            }
+        })
+    }
+
+    /// [`Self::win_grad`]'s object gradient patches alone, for the offsets held: per frame and
+    /// object mode, `G = Σ_p conj(q P_p) r` on the window into `patch`; other frames' patches
+    /// are left as they are. `dims` are the scan's.
+    pub fn win_obj_grad(
+        &self,
+        ctx: &ExecutionContext,
+        dims: &ViewDims,
+        stack: StackRef<'_>,
+        f: BhWinRef<'_>,
+        patch: &mut DeviceBuffer<C32>,
+    ) -> Result<(), Error> {
+        let g = dims.geom(stack)?;
+        let blk = window_block(dims, &g);
+        f.check(dims, &g)?;
+        check_len("patch", patch, blk)?;
+        let config = grid_1d(blk)?;
+        let reads = [f.r.storage(), f.probe.storage(), stack.storage()];
+        self.base.launch(ctx, &reads, &[patch.storage()], |stream| {
+            // SAFETY: lengths checked above.
+            unsafe {
+                self.module.bh_win_obj_grad(
+                    stream,
+                    config,
+                    f.ptrs(),
+                    dptr(patch),
                     stack.ctl() as *const StackCtl,
                     g,
                 )

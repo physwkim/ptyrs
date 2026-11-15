@@ -2,7 +2,8 @@
 start, `examples/engine_reference.rs`' `opr.h5`: after every epoch the object, probe,
 eigenmodes, weights, main-mode weights and steps, exactly, as one CPU f64 engine runs both;
 eigenmodes and weights alone with the amplitude cost, and with main-mode weights with Poisson;
-over `Ptycho.views` and over views built from the far field and preprocessed positions."""
+over `Ptycho.views` and over views built from the far field and preprocessed positions. Held
+weights and main-mode weights kept while the eigenmodes move; the refusals."""
 
 import os
 
@@ -100,3 +101,32 @@ def test_lsqml_opr_refusals(ref):
     with pytest.raises(ValueError, match=r"of \[32, 32\] probe planes"):
         small.epoch(p, o, pr)
     np.testing.assert_array_equal(short.weights, w[1:])
+    # `hold` names a given value
+    for kw, hold in ((dict(), ("weights",)), (dict(), ("intensity",)),
+                     (dict(opr=(e, w, None)), ("intensity",)),
+                     (dict(opr=(e, w, c)), ("position",)),
+                     (dict(opr=(e, w, c)), ("eigenmodes",))):
+        with pytest.raises(ValueError, match="hold"):
+            ptyrs.Lsqml(4, "poisson", 7, hold=hold, **kw)
+    with pytest.raises(TypeError):
+        ptyrs.Lsqml(4, "poisson", 7, opr=(e, w, c), hold="weights")
+    assert plain.hold == () and ptyrs.Lsqml(4, "poisson", 7, opr=(e, w, c)).hold == ()
+
+
+@pytest.mark.parametrize("hold", [("weights",), ("intensity",), ("weights", "intensity")])
+def test_lsqml_opr_hold(ref, hold):
+    """Two epochs of the main-mode run's start: the held values stay exactly, the eigenmodes
+    and the refined values move."""
+    g = ref["intensity"]
+    start = variation(g)
+    lsqml = ptyrs.Lsqml(int(g.attrs["batch_size"]), g.attrs["cost"], int(g.attrs["seed"]),
+                        opr=(start["eigenmodes"], start["weights"], start["intensity"]),
+                        hold=hold)
+    assert lsqml.hold == hold
+    o, pr = ref["object"][()][None], ref["probe"][()]
+    for _ in range(2):
+        o, pr, _ = lsqml.epoch(state(ref).views, o, pr)
+    assert np.isfinite(o).all() and np.isfinite(pr).all()
+    assert not np.array_equal(lsqml.eigenmodes, start["eigenmodes"])
+    for k in ("weights", "intensity"):
+        assert np.array_equal(getattr(lsqml, k), start[k]) == (k in hold), k

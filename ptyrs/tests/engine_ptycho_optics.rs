@@ -6,8 +6,8 @@
 
 use ptyrs::base::{C64, Counts, Geometry, Object, Probe, Scan, Stack, required_obj_shape, sim};
 use ptyrs::engine::{
-    ApParams, DmParams, Features, MlParams, Optics, Propagator, Ptycho, RaarParams, RpieParams,
-    Wavefield, obj_probe_shift_to_psi, shift,
+    ApParams, DmParams, Feature, Features, MlParams, Optics, Propagator, Ptycho, RaarParams,
+    RpieParams, Wavefield, obj_probe_shift_to_psi, shift,
 };
 
 #[path = "common/worst.rs"]
@@ -162,18 +162,18 @@ fn case(kind: Kind, extra: Extra) -> Case {
         Extra::None => (Features::default(), Features::default()),
         Extra::Still => {
             let still = Features {
-                position: Some(offsets),
+                position: Some(Feature::refined(offsets)),
                 ..Features::default()
             };
             (still.clone(), still)
         }
         Extra::Position => (
             Features {
-                position: Some(offsets),
+                position: Some(Feature::refined(offsets)),
                 ..Features::default()
             },
             Features {
-                position: Some(vec![[0.0; 2]; nframe]),
+                position: Some(Feature::refined(vec![[0.0; 2]; nframe])),
                 ..Features::default()
             },
         ),
@@ -193,13 +193,13 @@ fn case(kind: Kind, extra: Extra) -> Case {
             }
             (
                 Features {
-                    scale: Some(scale),
-                    background: Some(background),
+                    scale: Some(Feature::refined(scale)),
+                    background: Some(Feature::refined(background)),
                     ..Features::default()
                 },
                 Features {
-                    scale: Some(vec![1.0; nframe]),
-                    background: Some(vec![150.0; N]),
+                    scale: Some(Feature::refined(vec![1.0; nframe])),
+                    background: Some(Feature::refined(vec![150.0; N])),
                     ..Features::default()
                 },
             )
@@ -279,9 +279,14 @@ fn drift(c: &Case, algo: Algo, n: usize) -> f64 {
     run(&mut p, algo, n);
     let of = |f: &Features| -> [Vec<f64>; 3] {
         [
-            f.position.iter().flatten().flatten().copied().collect(),
-            f.scale.clone().unwrap_or_default(),
-            f.background.clone().unwrap_or_default(),
+            f.position
+                .iter()
+                .flat_map(|d| &d.values)
+                .flatten()
+                .copied()
+                .collect(),
+            f.scale.clone().map(|d| d.values).unwrap_or_default(),
+            f.background.clone().map(|d| d.values).unwrap_or_default(),
         ]
     };
     let (got, want) = (of(p.features()), of(&c.truth));

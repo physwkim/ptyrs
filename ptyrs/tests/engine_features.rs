@@ -6,8 +6,9 @@
 
 use ptyrs::base::{C64, Scan};
 use ptyrs::engine::{
-    ApParams, Cost, DmParams, Features, Fft2, Ptycho, Sampling, background_cost, background_grad,
-    intensity_grad, llk, obj_probe_shift_to_psi, obj_probe_to_psi, position_grad, scale_psi, shift,
+    ApParams, Cost, DmParams, Feature, Features, Fft2, Ptycho, Sampling, background_cost,
+    background_grad, intensity_grad, llk, obj_probe_shift_to_psi, obj_probe_to_psi, position_grad,
+    scale_psi, shift,
 };
 
 #[path = "common/engine/mod.rs"]
@@ -274,7 +275,7 @@ fn position_refines_toward_the_drawn_positions() {
     for algo in ["ap", "dm"] {
         let mut p = Ptycho::new(&sim.scan, object.clone(), probe.clone()).unwrap();
         p.set_features(Features {
-            position: Some(d0.clone()),
+            position: Some(Feature::refined(d0.clone())),
             ..Features::default()
         })
         .unwrap();
@@ -286,7 +287,7 @@ fn position_refines_toward_the_drawn_positions() {
                 "ap" => p.ap(&ApParams::default(), 10),
                 _ => p.dm(&DmParams::default(), 10),
             }
-            let r = rms(p.features().position.as_deref().unwrap());
+            let r = rms(&p.features().position.as_ref().unwrap().values);
             println!("{algo} cycle {}: rms offset {r:.4}", p.cycle());
             assert!(
                 r < last,
@@ -295,7 +296,7 @@ fn position_refines_toward_the_drawn_positions() {
             );
             last = r;
         }
-        let d = p.features().position.as_deref().unwrap();
+        let d = &p.features().position.as_ref().unwrap().values;
         let mean = [0, 1].map(|a| d.iter().map(|d| d[a]).sum::<f64>() / nframe as f64);
         assert!(
             mean.iter().all(|m| m.abs() < 1e-12),

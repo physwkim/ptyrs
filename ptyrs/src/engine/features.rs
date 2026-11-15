@@ -6,13 +6,15 @@
 use std::f64::consts::PI;
 use std::ops::Range;
 
-use crate::base::{C64, Object, Probe, Stack, View};
+use crate::base::{C64, Feature, Object, Probe, Stack, View};
 
 use crate::engine::ops::{blend, natural};
-use crate::engine::sampling::{OBJ_PCG, Sampler};
+use crate::engine::sampling::{OBJ_HELD, OBJ_PCG, Sampler};
 use crate::engine::{EngineError, Fft2, Observed, Ptycho, Sampling, shift};
 
-/// The features of a reconstruction's model intensity, each modelled and refined while set;
+/// The features of a reconstruction's model intensity, each modelled while set and refined
+/// while its [`Feature::refine`] is: a held feature's values enter the model as a refined
+/// one's do, and its step, with the sums and derivatives only the step reads, is left out.
 /// `Default` sets none and leaves every loop's arithmetic as it is without features.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Features {
@@ -23,14 +25,14 @@ pub struct Features {
     /// where `Σ I` is 0), then `s /= mean(s)`: the object and probe carry the mean flux. The
     /// cycle's LLK record is under the scale before the step, the rest of it models the
     /// stepped scale.
-    pub scale: Option<Vec<f64>>,
+    pub scale: Option<Feature<Vec<f64>>>,
     /// Detector background `b`, `[ny, nx]` in the detector order of the counts, the same for
     /// every frame: the model intensity is `s[f]·I + b`. Each cycle's step, from the estimate
     /// and model the scale's takes, is also the EM step `b[j] *= Σ_f iobs / max(icalc, 1e-12)
     /// / nobs[j]` over the `nobs[j]` frames where pixel `j` is unmasked (kept where there is
     /// none); a pixel at 0 stays at 0. ML's [`Ptycho::scale_obj_probe`] leaves the
     /// background's photons out of both sums.
-    pub background: Option<Vec<f64>>,
+    pub background: Option<Feature<Vec<f64>>>,
     /// Per-frame position offsets `d`, `[nframe]` of `[dy, dx]` object pixels from each frame's
     /// view corner, entering the exit waves `O·W` of [`obj_probe_shift_to_psi`] as the
     /// engine's [`Sampling`] models them: under [`Sampling::Patch`] the probe modes `W = P·q`
@@ -52,13 +54,13 @@ pub struct Features {
     /// at the others, each axis clipped to `min(10·mean_f |dx − mean dx|, 0.1)` over all
     /// frames, with no mean subtracted. [`Sampling::Patch`] is pty-chi's while every
     /// `|d| ≤ 1/2`, past which pty-chi moves the window to the nearest pixel.
-    pub position: Option<Vec<[f64; 2]>>,
+    pub position: Option<Feature<Vec<[f64; 2]>>>,
 }
 
 impl Features {
     /// Checks the features against a scan of `nframe` frames of `frame` (`[ny, nx]`) pixels.
     pub(crate) fn check(&self, nframe: usize, frame: [usize; 2]) -> Result<(), EngineError> {
-        if let Some(s) = &self.scale {
+        if let Some(Feature { values: s, .. }) = &self.scale {
             if s.len() != nframe {
                 return Err(EngineError::Invalid(format!(
                     "{} intensity scales for {nframe} frames",
@@ -71,7 +73,7 @@ impl Features {
                 ));
             }
         }
-        if let Some(b) = &self.background {
+        if let Some(Feature { values: b, .. }) = &self.background {
             if b.len() != frame[0] * frame[1] {
                 return Err(EngineError::Invalid(format!(
                     "a background of {} pixels for {frame:?} frames",
@@ -84,7 +86,7 @@ impl Features {
                 ));
             }
         }
-        if let Some(d) = &self.position {
+        if let Some(Feature { values: d, .. }) = &self.position {
             if d.len() != nframe {
                 return Err(EngineError::Invalid(format!(
                     "{} position offsets for {nframe} frames",
@@ -100,24 +102,44 @@ impl Features {
         Ok(())
     }
 
-    /// Whether some feature takes a step before each cycle.
+    /// Whether some feature takes a step before each cycle: a refined scale or background.
     pub(crate) fn stepped(&self) -> bool {
-        self.scale.is_some() || self.background.is_some()
+        let refined = |f: &Option<Feature<_>>| f.as_ref().is_some_and(|f| f.refine);
+        refined(&self.scale) || refined(&self.background)
     }
 
-    /// Every feature's step before a cycle models it, from the far field `psi` of the
+    /// The position offsets, refined or held; none without a position.
+    pub(crate) fn offsets(&self) -> Option<&[[f64; 2]]> {
+        self.position.as_ref().map(|d| &d.values[..])
+    }
+
+    /// The position offsets to step: some while a position is refined.
+    pub(crate) fn refined_offsets(&mut self) -> Option<&mut Vec<[f64; 2]>> {
+        self.position.as_mut().and_then(Feature::stepped)
+    }
+
+    /// Whether a position is refined.
+    pub(crate) fn position_refined(&self) -> bool {
+        self.position.as_ref().is_some_and(|d| d.refine)
+    }
+
+    /// Every refined feature's step before a cycle models it, from the far field `psi` of the
     /// estimate the cycle starts from (all frames, as [`scale_sums`] takes it) under the
-    /// current model: [`scale_step`] of the scale and [`background_step`] of the background,
-    /// both from sums taken before either steps.
+    /// current model, held features' values included: [`scale_step`] of the scale and
+    /// [`background_step`] of the background, both from sums taken before either steps.
     pub(crate) fn step(&mut self, obs: &Observed, nmode: usize, psi: &[C64]) {
         let model = Model::of(self, obs);
-        let scale = (self.scale.as_ref()).map(|s| scale_sums(obs, 0..s.len(), nmode, psi, model));
-        let background =
-            (self.background.as_ref()).map(|_| background_sums(obs, nmode, psi, model));
-        if let (Some(scale), Some(sums)) = (&mut self.scale, scale) {
+        let scale = (self.scale.as_ref().filter(|s| s.refine))
+            .map(|s| scale_sums(obs, 0..s.values.len(), nmode, psi, model));
+        let background = (self.background.as_ref().filter(|b| b.refine))
+            .map(|_| background_sums(obs, nmode, psi, model));
+        if let (Some(scale), Some(sums)) = (self.scale.as_mut().and_then(Feature::stepped), scale) {
             scale_step(scale, &sums);
         }
-        if let (Some(b), Some(sums)) = (&mut self.background, background) {
+        if let (Some(b), Some(sums)) = (
+            self.background.as_mut().and_then(Feature::stepped),
+            background,
+        ) {
             background_step(b, &sums);
         }
     }
@@ -125,7 +147,7 @@ impl Features {
     /// The background's photons over the unmasked pixels of `obs`, `Σ_j b[j]·nobs[j]`; 0
     /// without one.
     pub(crate) fn background_photons(&self, obs: &Observed) -> f64 {
-        let Some(b) = &self.background else {
+        let Some(Feature { values: b, .. }) = &self.background else {
             return 0.0;
         };
         let [_, ny, nx] = obs.dims();
@@ -150,8 +172,8 @@ impl<'a> Model<'a> {
     pub(crate) fn of(features: &'a Features, obs: &Observed) -> Self {
         let [_, ny, nx] = obs.dims();
         Self {
-            scale: features.scale.as_deref(),
-            background: features.background.as_deref().map(|b| (b, [ny, nx])),
+            scale: features.scale.as_ref().map(|s| &s.values[..]),
+            background: (features.background.as_ref()).map(|b| (&b.values[..], [ny, nx])),
         }
     }
 
@@ -696,11 +718,12 @@ impl Shifted {
     /// Under [`Sampling::FullObject`], the object of `min ‖psi − A·O'‖² + reg·‖O' − O‖²` with
     /// `A` [`Self::to_psi`] of the object: [`OBJ_PCG`] conjugate-gradient steps on
     /// `(AᴴA + reg)·O' = Aᴴ·psi + reg·O` from `O`, preconditioned by `D + reg`, `D` the exact
-    /// diagonal of `AᴴA` ([`Sampler::diag`]) and `reg = inertia·max D`. A step along a
-    /// direction of no positive curvature, or after a residual of no positive norm, is 0.
-    /// Where the sampling moves nothing `AᴴA = D`, the first step is `blend` and the rest move
-    /// it within rounding; at sub-pixel positions `AᴴA` couples the pixels, and `blend` with
-    /// the placed `|W|²` for `AᴴA`'s diagonal diverges.
+    /// diagonal of `AᴴA` ([`Sampler::diag`]) and `reg = inertia·max D`, holding at `O` every
+    /// pixel whose `D + reg` is at most [`OBJ_HELD`]`·max D`. A step along a direction of no
+    /// positive curvature, or after a residual of no positive norm, is 0. Where the sampling
+    /// moves nothing `AᴴA = D`, the first step is `blend` on the pixels it does not hold and
+    /// the rest move it within rounding; at sub-pixel positions `AᴴA` couples the pixels, and
+    /// `blend` with the placed `|W|²` for `AᴴA`'s diagonal diverges.
     fn solve_obj(
         &self,
         views: &[View],
@@ -711,8 +734,14 @@ impl Shifted {
     ) {
         let dims = object.dims();
         let d = s.diag(&self.natural_power(), dims[0]);
-        let reg = d.as_slice().iter().fold(0.0, |a: f64, &b| a.max(b)) * inertia;
-        let pre: Vec<f64> = d.as_slice().iter().map(|d| (d + reg).max(1e-12)).collect();
+        let max = d.as_slice().iter().fold(0.0, |a: f64, &b| a.max(b));
+        let reg = max * inertia;
+        // A held pixel's infinite preconditioner zeroes its share of every step.
+        let held = OBJ_HELD * max;
+        let pre: Vec<f64> = (d.as_slice().iter())
+            .map(|d| d + reg)
+            .map(|v| if v > held { v } else { f64::INFINITY })
+            .collect();
         let mut buf = vec![C64::default(); psi.len()];
         // `AᴴA·x` of an object-shaped `x`.
         let mut normal = |x: &Object| {
