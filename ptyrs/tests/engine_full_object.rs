@@ -358,6 +358,31 @@ impl Ended {
             offsets,
         ]
     }
+
+    /// `Σ |P|²` of the probe this run ends on, over `scan`'s views at the offsets it ends on:
+    /// the weight the counts put on each object pixel. Away from the views only the inertia
+    /// holds the object, where the solve's `f32` errors grow a hundredfold.
+    fn illumination(&self, scan: &Scan) -> Stack<f64> {
+        let dims @ [nobj, ny, nx] = self.object.dims();
+        let addr = addr(&scan.positions, [ny, nx], nobj);
+        Sampling::FullObject.illumination(addr.views(), dims, &self.probe, self.offsets.as_deref())
+    }
+
+    /// This run with its object times `√weight`, so that [`Self::errors`] of two such weighs
+    /// the object's distance by `weight`.
+    fn lit(&self, weight: &Stack<f64>) -> Self {
+        let object = (self.object.as_slice().iter())
+            .zip(weight.as_slice())
+            .map(|(o, w)| o * w.sqrt())
+            .collect();
+        Self {
+            records: self.records.clone(),
+            end: self.end,
+            object: Object::new(Stack::from_vec(self.object.dims(), object).unwrap()),
+            probe: self.probe.clone(),
+            offsets: self.offsets.clone(),
+        }
+    }
 }
 
 const ERRORS: [&str; 5] = ["llk", "end", "object", "probe", "offsets"];
@@ -376,7 +401,7 @@ fn assert_close(what: &str, errs: [f64; 5], tol: [Option<f64>; 5]) {
 /// `ncycle` cycles of `algorithm` on `c` under `features`, from the truth, whose LLK is
 /// `floor`, or without from the start, on the CPU and on the GPU eagerly and with graphs: each
 /// passes [`Ended::check`], held offsets keep their values, the graphs replay the eager run
-/// bit for bit and the GPU agrees with the CPU.
+/// bit for bit and the GPU agrees with the CPU, the object weighted by [`Ended::illumination`].
 fn on_cpu_and_gpu(
     c: &Case,
     ctx: &Arc<CudaContext>,
@@ -384,7 +409,9 @@ fn on_cpu_and_gpu(
     features: &Features,
     floor: Option<f64>,
 ) {
-    const TOL: [Option<f64>; 5] = [Some(1e-5), Some(1e-5), Some(1e-4), Some(1e-5), Some(3e-6)];
+    // The object's worst, weighted by the CPU's illumination, 1.5e-6 (RAAR's refined in two
+    // object modes); its whole plane's 1.3e-5 is the dark band's.
+    const TOL: [Option<f64>; 5] = [Some(1e-5), Some(1e-5), Some(4.5e-6), Some(1e-5), Some(3e-6)];
     let position = features.position.as_ref().unwrap();
     let nobj = c.truth.0.dims()[0];
     let what = format!("{algorithm} nobj {nobj} refine {}", position.refine);
@@ -405,7 +432,9 @@ fn on_cpu_and_gpu(
     want.check(&format!("{what} CPU"), floor);
     assert!(graphs == eager, "{what}: graphs replay the eager run");
     eager.check(&format!("{what} GPU"), floor);
-    assert_close(&format!("{what} GPU against CPU"), eager.errors(&want), TOL);
+    let lit = want.illumination(&c.scan);
+    let errors = eager.lit(&lit).errors(&want.lit(&lit));
+    assert_close(&format!("{what} GPU against CPU"), errors, TOL);
 }
 
 /// [`solve_keeps_the_truth_and_descends`] in one object mode.
@@ -475,12 +504,13 @@ fn rpie_descends_with_the_offsets_held() {
 /// At zero offsets and at whole-pixel offsets from corners that many pixels back, held, the
 /// update is the blend of the same counts without offsets at the moved corners: every LLK
 /// record, the end LLK, the object and the probe, on the CPU and the GPU, which keep the
-/// offsets.
+/// offsets; the GPU's object weighted by [`Ended::illumination`].
 #[test]
 fn whole_pixel_offsets_are_the_blend() {
     const NCYCLE: usize = 3;
     const TOL_CPU: [Option<f64>; 5] = [Some(1e-12), Some(1e-12), Some(1e-12), Some(1e-12), None];
-    const TOL_GPU: [Option<f64>; 5] = [Some(1e-5), Some(1e-5), Some(1e-4), Some(1e-5), None];
+    // The GPU object's worst, weighted by the blend's illumination, 1.0e-6 (DM's).
+    const TOL_GPU: [Option<f64>; 5] = [Some(1e-5), Some(1e-5), Some(3e-6), Some(1e-5), None];
     let (raw, whole) = (fermat(), whole_offsets());
     let moved = |a: usize, v: &[f64]| -> Vec<f64> {
         (v.iter().zip(&whole))
@@ -507,6 +537,8 @@ fn whole_pixel_offsets_are_the_blend() {
     for algorithm in ["AP", "DM", "RAAR", "rPIE"] {
         let blend = Case::cpu(&at, &c.start, &none).cycles(algorithm, NCYCLE);
         let blend_gpu = Case::gpu(&ctx, &at, &c.start, &none, true).cycles(algorithm, NCYCLE);
+        let lit = blend_gpu.illumination(&at);
+        let blend_lit = blend_gpu.lit(&lit);
         for (label, scan, offsets) in runs {
             let held = positioned(offsets, false);
             let got = Case::cpu(scan, &c.start, &held).cycles(algorithm, NCYCLE);
@@ -524,7 +556,7 @@ fn whole_pixel_offsets_are_the_blend() {
                 Some(offsets),
                 "{what} keeps the offsets"
             );
-            assert_close(&what, got.errors(&blend_gpu), TOL_GPU);
+            assert_close(&what, got.lit(&lit).errors(&blend_lit), TOL_GPU);
         }
     }
 }

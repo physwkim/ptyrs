@@ -3,7 +3,9 @@
 //! offsets enter by.
 
 use cuda_core::CudaContext;
-use ptyrs::base::{C64, Counts, Geometry, Object, Probe, Scan, Stack, required_obj_shape, sim};
+use ptyrs::base::{
+    C64, Counts, Geometry, Object, Probe, Scan, Stack, View, required_obj_shape, sim,
+};
 use ptyrs::engine::{
     ApParams, BhParams, Cost, DmParams, Feature, Features, GpuOptions, GpuPtycho, LsqmlParams,
     MlParams, Optics, Ptycho, RaarParams, RpieParams, Sampling,
@@ -268,6 +270,29 @@ impl Ended {
             features: g.features().unwrap(),
         }
     }
+
+    /// `Σ |P|²` of the probe this run ends on, over `views` at the offsets it ends on: the
+    /// weight the counts put on each object pixel. Away from the views only the inertia holds
+    /// `Sampling::FullObject`'s object, where the solve's `f32` errors grow a hundredfold.
+    fn illumination(&self, views: &[View]) -> Stack<f64> {
+        let offsets = (self.features.position.as_ref()).map(|p| p.values.as_slice());
+        Sampling::FullObject.illumination(views, self.object.dims(), &self.probe, offsets)
+    }
+
+    /// This run with its object times `√weight`, so that [`assert_close`] of two such weighs
+    /// the object's distance by `weight`.
+    fn lit(&self, weight: &Stack<f64>) -> Self {
+        let object = (self.object.as_slice().iter())
+            .zip(weight.as_slice())
+            .map(|(o, w)| o * w.sqrt())
+            .collect();
+        Self {
+            llk: self.llk.clone(),
+            object: Object::new(Stack::from_vec(self.object.dims(), object).unwrap()),
+            probe: self.probe.clone(),
+            features: self.features.clone(),
+        }
+    }
 }
 
 /// `got`'s records, object, probe, scale and background, and offsets (over the largest)
@@ -351,16 +376,17 @@ fn full_object_projections_match_cpu_under_fresnel_back() {
 /// and with a scale and a background, against the CPU's under `Sampling::FullObject`,
 /// eagerly and from graphs, over stacks of 8 frames and a last of 6, as
 /// [`projections_match_cpu_under_every_propagator`] holds them; DM's and RAAR's carried exit
-/// waves in f16 against f32 over two cycles, from graphs. A test per propagator, so the
+/// waves in f16 against f32 over two cycles, from graphs. The object's distance is weighted
+/// by [`Ended::illumination`] of the run compared against. A test per propagator, so the
 /// three run side by side: the CPU's object solve is most of each.
 fn full_object_projections_match_cpu(c: &Case) {
     const NCYCLE: usize = 8;
-    // Measured worst: LLK 1.8e-5, object 2.0e-3, probe 5.8e-4, features 1.5e-5, offsets
-    // 8.0e-6, from DM's drawn offsets under Fresnel, whose LLK rises on the CPU too.
-    const TOL: [f64; 5] = [6e-5, 6e-3, 2e-3, 5e-5, 2.5e-5];
+    // Measured worst: LLK 6.2e-6, object 1.9e-6, probe 1.9e-6, features 1.1e-5, offsets
+    // 5.8e-7; the object's whole plane 1.2e-5, the dark band's.
+    const TOL: [f64; 5] = [2e-5, 6e-6, 6e-6, 3.5e-5, 1.8e-6];
     const NCYCLE_F16: usize = 2;
-    // Measured worst: LLK 3.6e-4, object 2.0e-3, probe 4.0e-4, features 1.9e-4, offsets
-    // 1.4e-4.
+    // Measured worst: LLK 2.6e-5, object 1.8e-4, probe 5.7e-5, features 7.4e-5, offsets
+    // 5.5e-5.
     const TOL_F16: [f64; 5] = [1.2e-3, 6e-3, 1.2e-3, 6e-4, 4.5e-4];
     let frame = FUSED_SIDES[0] as usize;
     let moved = Features {
@@ -398,14 +424,18 @@ fn full_object_projections_match_cpu(c: &Case) {
             on_cpu(&mut cpu, NCYCLE);
             assert_eq!(cpu.history().len(), NCYCLE);
             let want = Ended::cpu(&cpu);
+            let lit = want.illumination(c.addr.views());
             for graph in [false, true] {
                 let what = format!("{name} {} {label} graph {graph}", c.name);
-                assert_close(&what, &run(graph, false, NCYCLE), &want, TOL);
+                let got = run(graph, false, NCYCLE).lit(&lit);
+                assert_close(&what, &got, &want.lit(&lit), TOL);
             }
             if name != "AP" {
                 let what = format!("{name} {} {label} f16 against f32", c.name);
                 let want = run(true, false, NCYCLE_F16);
-                assert_close(&what, &run(true, true, NCYCLE_F16), &want, TOL_F16);
+                let lit = want.illumination(c.addr.views());
+                let got = run(true, true, NCYCLE_F16).lit(&lit);
+                assert_close(&what, &got, &want.lit(&lit), TOL_F16);
             }
         }
     }
