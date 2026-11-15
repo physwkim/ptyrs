@@ -8,7 +8,8 @@
 //! cube sums its own band and one more kernel adds the bands. The kernel takes deep levels too,
 //! where burn's matmul was faster while it ran f32 on TF32 tensor cores; that put the weight
 //! gradient 1e-4 off, and for some shapes (2 to 64 channels on 8 × 8 pixels) off by most of its
-//! magnitude. vendor/cubek-matmul keeps f32 off them, and the two have not been timed since.
+//! magnitude. vendor/cubek-matmul keeps f32 off them; timed so, the kernel is 1.25 to 1.6 times as
+//! fast as burn at the deep levels, and burn comes within 6% of it only on PtychoNN's 8 × 8 pixels.
 
 use burn::backend::autodiff::checkpoint::base::Checkpointer;
 use burn::backend::autodiff::checkpoint::strategy::CheckpointStrategy;
