@@ -58,19 +58,13 @@ impl LivePredictor {
     }
 }
 
-/// The network input of `counts`, whole frames of `fsz` values, into `input`: one task per frame
-/// on `pool`.
-fn par_input(
-    pool: &rayon::ThreadPool,
-    scale: &InputScale,
-    fsz: usize,
-    counts: &[u16],
-    input: &mut [f32],
-) {
+/// The network input of `counts`, whole frames of `scale`'s, into `input`: one task per frame on
+/// `pool`.
+fn par_input(pool: &rayon::ThreadPool, scale: &InputScale, counts: &[u16], input: &mut [f32]) {
     pool.install(|| {
         input
             .par_chunks_exact_mut(scale.len())
-            .zip(counts.par_chunks_exact(fsz))
+            .zip(counts.par_chunks_exact(scale.area()))
             .with_max_len(1)
             .for_each(|(o, f)| scale.frame(f, o))
     });
@@ -90,7 +84,7 @@ impl PatchPredictor for LivePredictor {
         self.predictor
             .check_frames(counts, frame)
             .map_err(|e| e.to_string())?;
-        let n = counts.len() / (frame[0] * frame[1]);
+        let n = counts.len() / self.scale.area();
         let batch = self.input.len() / self.scale.len();
         if n > batch {
             return Err(format!("{n} frames for a batch of {batch}"));
@@ -106,7 +100,6 @@ impl PatchPredictor for LivePredictor {
         par_input(
             &self.pool,
             &self.scale,
-            frame[0] * frame[1],
             counts,
             &mut self.input[..n * self.scale.len()],
         );
@@ -168,7 +161,7 @@ mod tests {
             .build()
             .unwrap();
         let mut got = vec![f32::NAN; want.len()];
-        par_input(&pool, &scale, ny * nx, &data, &mut got);
+        par_input(&pool, &scale, &data, &mut got);
         assert_eq!(
             got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
             want.iter().map(|v| v.to_bits()).collect::<Vec<_>>()

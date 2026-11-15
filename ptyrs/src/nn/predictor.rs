@@ -97,13 +97,17 @@ impl PredictorConfig {
                 "frame {frame:?} is not a positive multiple of bin {bin} × 2^depth {depth}"
             ));
         }
-        match PtychoNN::activations(self.input.images(), width, depth, self.patch()) {
-            Some(act) if act.largest <= u128::from(u32::MAX) => Ok(act),
-            _ => invalid(format!(
-                "width {width} over patch {:?} makes an activation of 2³² elements or more",
-                self.patch()
-            )),
-        }
+        let act = match PtychoNN::activations(self.input.images(), width, depth, self.patch()) {
+            Some(act) if act.largest <= u128::from(u32::MAX) => act,
+            _ => {
+                return invalid(format!(
+                    "width {width} over patch {:?} makes an activation of 2³² elements or more",
+                    self.patch()
+                ));
+            }
+        };
+        frame_area(frame)?;
+        Ok(act)
     }
 
     /// Frames one `pass` on `device` holds: each tensor under 2³² elements, the nn kernels'
@@ -248,9 +252,9 @@ fn frames_input(
     norm: f64,
 ) -> Result<Vec<f32>, NnError> {
     let scale = InputScale::new(frame, input, bin, norm)?;
-    let mut out = vec![0.0; frames.len() / (frame[0] * frame[1]) * scale.len()];
+    let mut out = vec![0.0; frames.len() / scale.area() * scale.len()];
     for (f, o) in frames
-        .chunks_exact(frame[0] * frame[1])
+        .chunks_exact(scale.area())
         .zip(out.chunks_exact_mut(scale.len()))
     {
         scale.frame(f, o);
@@ -258,12 +262,21 @@ fn frames_input(
     Ok(out)
 }
 
+/// The pixels of a `[ny, nx]` frame; fails past `usize`, where the product wrapped. A frame's
+/// area is formed here alone.
+fn frame_area([ny, nx]: [usize; 2]) -> Result<usize, NnError> {
+    ny.checked_mul(nx)
+        .ok_or_else(|| NnError::Invalid(format!("frame [{ny}, {nx}] of pixels past usize")))
+}
+
 /// [`diffraction_input`] one frame at a time, for frames of one shape, input, binning and norm.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct InputScale {
     frame: [usize; 2],
-    input: Input,
     bin: usize,
+    /// [`frame_area`] of `frame`.
+    area: usize,
+    len: usize,
     scale: f64,
     fine: f64,
 }
@@ -283,18 +296,32 @@ impl InputScale {
         if norm.is_nan() || norm <= 0.0 {
             return Err(NnError::Invalid(format!("norm {norm} must be positive")));
         }
+        let area = frame_area([ny, nx])?;
+        // At most `area`.
+        let binned = (ny / bin) * (nx / bin);
+        let len = input.images().checked_mul(binned).ok_or_else(|| {
+            NnError::Invalid(format!(
+                "{input:?} of frame [{ny}, {nx}] at bin {bin} has values past usize"
+            ))
+        })?;
         Ok(Self {
             frame: [ny, nx],
-            input,
             bin,
-            scale: ((ny / bin) * (nx / bin)) as f64 / norm,
-            fine: (ny * nx) as f64 / norm,
+            area,
+            len,
+            scale: binned as f64 / norm,
+            fine: area as f64 / norm,
         })
+    }
+
+    /// Pixels per frame.
+    pub(crate) fn area(&self) -> usize {
+        self.area
     }
 
     /// Input values per frame.
     pub(crate) fn len(&self) -> usize {
-        self.input.images() * (self.frame[0] / self.bin) * (self.frame[1] / self.bin)
+        self.len
     }
 
     /// The input of one frame into `out`, [`len`](Self::len) values.
@@ -1043,7 +1070,7 @@ impl Predictor {
 
     /// Fails unless `frames` is whole frames of this predictor's `frame`.
     pub(crate) fn check_frames(&self, frames: &[u16], frame: [usize; 2]) -> Result<(), NnError> {
-        if frame != self.config.frame || !frames.len().is_multiple_of(frame[0] * frame[1]) {
+        if frame != self.config.frame || !frames.len().is_multiple_of(frame_area(frame)?) {
             return Err(NnError::Invalid(format!(
                 "{} counts of frame {frame:?} for predictor frame {:?}",
                 frames.len(),
@@ -1314,6 +1341,21 @@ pub(crate) mod tests {
                 matches!(config.check(), Err(NnError::Invalid(_))),
                 "{config:?}"
             );
+        }
+    }
+
+    /// A frame of 2⁶⁶ pixels binned to a patch of 4 is refused by the config's check and by
+    /// `diffraction_input`, and so is a frame whose two input images pass `usize`: unchecked,
+    /// the area passed the check, then overflowed in `InputScale::new` or, wrapped to 0 in
+    /// release, divided by zero.
+    #[test]
+    fn a_frame_area_past_usize_is_refused() {
+        let config = PredictorConfig::new([1 << 33, 1 << 33], 1 << 32).with_depth(1);
+        assert!(matches!(config.check(), Err(NnError::Invalid(_))));
+        for (frame, bin) in [(config.frame, config.bin), ([1 << 32, (1 << 31) + 1], 1)] {
+            let counts = Counts::from_raw([0, frame[0], frame[1]], Vec::new()).unwrap();
+            let got = diffraction_input(&counts, Input::BinnedCentre, bin, 1.0);
+            assert!(matches!(got, Err(NnError::Invalid(_))), "{frame:?}");
         }
     }
 
