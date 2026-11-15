@@ -34,7 +34,7 @@ use ptyrs_kernels::grad::ObjProbePtrs;
 pub use ptyrs_kernels::lsqml::LSQML_REC;
 use ptyrs_kernels::lsqml::{
     LSQML_CHI, LSQML_DOTS, LSQML_ICALC, LSQML_POISSON, LSQML_XI, LsqmlCols, LsqmlDots, LsqmlFar,
-    LsqmlPre, LsqmlRule, lsqml_kernels,
+    LsqmlFrameDirs, LsqmlPre, LsqmlRule, lsqml_kernels,
 };
 use ptyrs_kernels::pixel::PIXEL_THREADS;
 
@@ -200,6 +200,15 @@ pub enum LsqmlChi<'a> {
         chi: &'a DeviceBuffer<C32>,
         own: OwnModes<'a>,
     },
+}
+
+/// Each frame's probe mode-0 direction `d` and `vv` under OPR, [`crate::gpu::OprPlanes`]'s,
+/// as [`LsqmlKernels::frame_dirs`] writes them: `[nb, n]`, plane `b` the frame at epoch
+/// position `positions.start + b`.
+pub struct FrameDirs<'a> {
+    pub d: &'a mut DeviceBuffer<C32>,
+    pub vv: &'a mut DeviceBuffer<f32>,
+    pub positions: Range<u32>,
 }
 
 /// Values of the object and of the probe.
@@ -704,6 +713,54 @@ impl LsqmlKernels {
                         .lsqml_dots_shifted(stream, config, p, waves, ctl, g, DOTS)
                 }
             })
+    }
+
+    /// The stack's frames' probe mode-0 directions under OPR into `out` from its exit-wave
+    /// update `chi` on the object `obj`, `views` in epoch order: per frame, over its views on
+    /// probe 0 in ascending order, [`Kernels::psi_to_probe`]'s sums of mode 0. A frame outside
+    /// `out.positions` writes nothing; a frame of it, every pixel of its planes.
+    pub fn frame_dirs(
+        &self,
+        ctx: &ExecutionContext,
+        views: &Views,
+        stack: StackRef<'_>,
+        obj: &DeviceBuffer<C32>,
+        chi: &DeviceBuffer<C32>,
+        out: FrameDirs<'_>,
+    ) -> Result<(), Error> {
+        let d = views.dims();
+        let g = d.geom(stack)?;
+        let n = d.n();
+        let span = span(d, &out.positions)?;
+        check_len("chi", chi, g.nf_max as usize * d.nmode as usize * n)?;
+        check_len("obj", obj, d.obj_len())?;
+        let planes = span.nb as usize * n;
+        check_len("d", out.d, planes)?;
+        check_len("vv", out.vv, planes)?;
+        let config = grid_1d(g.nf_max as usize * n)?;
+        let reads = [
+            chi.storage(),
+            obj.storage(),
+            views.addr().storage(),
+            stack.storage(),
+        ];
+        let p = LsqmlFrameDirs {
+            chi: dptr::<C32, f32>(chi).cast_const(),
+            obj: dptr::<C32, f32>(obj).cast_const(),
+            views: dptr::<ViewAddr, ViewAddr>(views.addr()).cast_const(),
+            d: dptr(out.d),
+            vv: dptr(out.vv),
+        };
+        let ctl = stack.ctl() as *const StackCtl;
+        let writes = [out.d.storage(), out.vv.storage()];
+        self.base.launch(ctx, &reads, &writes, |stream| {
+            // SAFETY: lengths checked above, `out` sized for the span's frames; `Views::new`
+            // checked the views are inside the object.
+            unsafe {
+                self.module
+                    .lsqml_frame_dirs(stream, config, p, span, ctl, g)
+            }
+        })
     }
 
     /// The step sizes of the batch's epoch positions `batch` from the [`Self::dots`] sums of

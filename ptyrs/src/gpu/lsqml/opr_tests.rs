@@ -1,8 +1,11 @@
-//! The LSQML launchers on each frame's own probe mode 0, [`OprKernels::unique`]'s planes as
-//! [`OwnModes`], against the same launchers on the shared-probe path one frame at a time, each
-//! frame on its own probe as `ProbeVariation::unique` gives it: both read the same values in
-//! the same order, so they agree bit for bit. The batch starts past position 0 of an epoch
-//! order that is not the scan's, with two probe and two object modes in stacks of 3 and 2.
+//! The LSQML launchers under OPR. The dots on each frame's own probe mode 0,
+//! [`OprKernels::unique`]'s planes as [`OwnModes`], against the same launchers on the
+//! shared-probe path one frame at a time, each frame on its own probe as
+//! `ProbeVariation::unique` gives it: both read the same values in the same order, so they
+//! agree bit for bit. Each frame's probe direction against the CPU's over those views, and bit
+//! for bit against [`Kernels::psi_to_probe`] one frame at a time. The batch starts past
+//! position 0 of an epoch order that is not the scan's, with two probe and two object modes in
+//! stacks of 3 and 2.
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -10,12 +13,12 @@ use std::sync::Arc;
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 
-use super::{LsqmlAt, LsqmlChi, LsqmlKernels, LsqmlScan};
-use crate::base::{C64, Feature, Probe, Stack, View};
-use crate::engine::ProbeVariation;
+use super::{FrameDirs, LsqmlAt, LsqmlChi, LsqmlKernels, LsqmlScan};
+use crate::base::{C64, Feature, Object, Probe, Stack, View};
+use crate::engine::{ProbeVariation, accumulate_probe};
 use crate::gpu::opr::OwnModes;
 use crate::gpu::{
-    C32, EpochOrder, Kernels, Opr, OprKernels, StackTable, ViewAddr, ViewDims, Views,
+    C32, EpochOrder, Kernels, Opr, OprKernels, StackTable, UpdateSums, ViewAddr, ViewDims, Views,
 };
 use crate::worst::worst_of;
 
@@ -35,10 +38,12 @@ const NF_MAX: usize = 3;
 const SHAPE: [usize; 2] = [64, 64];
 const N: usize = SHAPE[0] * SHAPE[1];
 const OBJ: [usize; 2] = [96, 100];
+const QUAD: f32 = 2e-3;
 
 struct Gpu {
     stream: Arc<CudaStream>,
     ctx: ExecutionContext,
+    kernels: Kernels,
     lsqml: LsqmlKernels,
     opr: OprKernels,
     /// The scan's views in [`ORDER`].
@@ -58,6 +63,7 @@ fn gpu() -> Gpu {
     Gpu {
         lsqml: LsqmlKernels::load(&kernels).unwrap(),
         opr: OprKernels::load(&kernels).unwrap(),
+        kernels,
         stream,
         ctx,
         order,
@@ -73,7 +79,7 @@ fn dims() -> ViewDims {
         nobj: NOBJ as u32,
         frame: SHAPE.map(|n| n as u32),
         obj: OBJ.map(|n| n as u32),
-        quad_phase: 2e-3,
+        quad_phase: QUAD,
     }
 }
 
@@ -127,6 +133,30 @@ fn bits(v: &[f32]) -> Vec<u32> {
     v.iter().map(|x| x.to_bits()).collect()
 }
 
+/// The largest difference over the largest magnitude of `want`.
+fn rel(got: impl Iterator<Item = C64>, want: &[C64]) -> f64 {
+    let scale = worst_of(want.iter().map(|w| w.norm()));
+    worst_of(got.zip(want).map(|(g, w)| (g - w).norm())) / scale
+}
+
+/// The views of the batch's frames in epoch order.
+fn batch_views() -> Vec<View> {
+    BATCH
+        .flat_map(|p| {
+            let f = ORDER[p as usize];
+            let [oy, ox] = corner(f);
+            (0..NMODE as u32).map(move |m| View {
+                frame: f,
+                mode: m,
+                probe: m % NP as u32,
+                obj: m / NP as u32,
+                oy,
+                ox,
+            })
+        })
+        .collect()
+}
+
 /// The scan's variation and shared probe, the variation's main-mode weights near 1 and its
 /// eigenmode weights near ±0.1.
 fn variation() -> (ProbeVariation, Probe) {
@@ -160,21 +190,7 @@ fn own_planes(g: &Gpu, var: &ProbeVariation, probe: &Probe) -> DeviceBuffer<C32>
     g.opr
         .unique(&g.ctx, &opr, &g.order, BATCH, &shared, &mut planes)
         .unwrap();
-    let cpu_views: Vec<View> = BATCH
-        .flat_map(|p| {
-            let f = ORDER[p as usize];
-            let [oy, ox] = corner(f);
-            (0..NMODE as u32).map(move |m| View {
-                frame: f,
-                mode: m,
-                probe: m % NP as u32,
-                obj: m / NP as u32,
-                oy,
-                ox,
-            })
-        })
-        .collect();
-    let (cpu_views, cpu_probe) = var.unique(&cpu_views, probe);
+    let (cpu_views, cpu_probe) = var.unique(&batch_views(), probe);
     for (k, v) in cpu_views.iter().enumerate() {
         let plane = k / NMODE * NP + k % NMODE % NP;
         assert_eq!(v.probe, plane as u32, "CPU view {k}'s probe plane");
@@ -183,12 +199,10 @@ fn own_planes(g: &Gpu, var: &ProbeVariation, probe: &Probe) -> DeviceBuffer<C32>
     let want: Vec<C64> = (0..NB)
         .flat_map(|b| cpu_probe.plane(b * NP).iter().copied())
         .collect();
-    let scale = worst_of(want.iter().map(|w| w.norm()));
-    let diff = got
-        .iter()
-        .zip(&want)
-        .map(|(g, w)| (C64::new(g.re as f64, g.im as f64) - w).norm());
-    let err = worst_of(diff) / scale;
+    let err = rel(
+        got.iter().map(|g| C64::new(g.re as f64, g.im as f64)),
+        &want,
+    );
     assert!(err <= 5e-7, "own planes against the CPU's: {err:e}");
     planes
 }
@@ -202,15 +216,29 @@ struct Inputs {
     chi: Vec<Vec<C64>>,
 }
 
+/// The object, `[NOBJ, OBJ]`.
+fn obj() -> Vec<C64> {
+    noise(NOBJ * OBJ[0] * OBJ[1], 1)
+}
+
 fn inputs(stream: &CudaStream) -> Inputs {
     let plane = OBJ[0] * OBJ[1];
     Inputs {
-        obj: up(stream, &noise(NOBJ * plane, 1)),
+        obj: up(stream, &obj()),
         d_obj: up(stream, &noise(NOBJ * plane, 2)),
         d_probe: up(stream, &noise(NP * N, 3)),
         chi: (0..STACKS.len())
             .map(|s| noise(NF_MAX * NMODE * N, 20 + s as u64))
             .collect(),
+    }
+}
+
+impl Inputs {
+    /// The `chi` of the frame at epoch position `p` of the batch, `[NMODE, n]`.
+    fn frame_chi(&self, p: u32) -> &[C64] {
+        let s = STACKS.iter().position(|r| r.contains(&p)).unwrap();
+        let fl = (p - STACKS[s].start) as usize;
+        &self.chi[s][fl * NMODE * N..(fl + 1) * NMODE * N]
     }
 }
 
@@ -263,9 +291,7 @@ fn frames(g: &Gpu, x: &Inputs, probe: &Probe, own: &DeviceBuffer<C32>) -> [Vec<u
     let table = StackTable::new(&g.stream, &dims(), &single).unwrap();
     dots(g, |st| {
         for (b, p) in BATCH.enumerate() {
-            let s = STACKS.iter().position(|r| r.contains(&p)).unwrap();
-            let fl = (p - STACKS[s].start) as usize;
-            let chi = up(&g.stream, &x.chi[s][fl * NMODE * N..(fl + 1) * NMODE * N]);
+            let chi = up(&g.stream, x.frame_chi(p));
             let mode0 = &own[b * N..(b + 1) * N];
             let probe: Vec<C32> = mode0.iter().chain(&shared[N..]).copied().collect();
             let probe = DeviceBuffer::from_host(&g.stream, &probe).unwrap();
@@ -297,4 +323,93 @@ fn dots_on_own_modes_match_each_frame_alone() {
         plain[0], own[0],
         "the own modes left the sums as on the shared probe"
     );
+}
+
+/// [`LsqmlKernels::frame_dirs`] of the batch, `[NB, n]` each, over [`STACKS`] after a stack
+/// at positions before the batch, which writes nothing; every plane starts as NaN.
+fn frame_dirs(g: &Gpu, x: &Inputs) -> (Vec<C32>, Vec<f32>) {
+    let nan = C32 {
+        re: f32::NAN,
+        im: f32::NAN,
+    };
+    let mut d = DeviceBuffer::from_host(&g.stream, &vec![nan; NB * N]).unwrap();
+    let mut vv = DeviceBuffer::from_host(&g.stream, &vec![f32::NAN; NB * N]).unwrap();
+    let before = 0..BATCH.start;
+    let stacks: Vec<Range<u32>> = [before.clone()].into_iter().chain(STACKS).collect();
+    let table = StackTable::new(&g.stream, &dims(), &stacks).unwrap();
+    let chi = [noise(NF_MAX * NMODE * N, 30)]
+        .into_iter()
+        .chain(x.chi.iter().cloned());
+    for (s, chi) in chi.enumerate() {
+        let out = FrameDirs {
+            d: &mut d,
+            vv: &mut vv,
+            positions: BATCH,
+        };
+        let chi = up(&g.stream, &chi);
+        let views = g.order.views();
+        g.lsqml
+            .frame_dirs(&g.ctx, views, table.at(s), &x.obj, &chi, out)
+            .unwrap();
+    }
+    (
+        d.to_host_vec(&g.stream).unwrap(),
+        vv.to_host_vec(&g.stream).unwrap(),
+    )
+}
+
+#[test]
+fn frame_dirs_match_the_cpu_and_psi_to_probe_frame_by_frame() {
+    let g = gpu();
+    let (var, probe) = variation();
+    let x = inputs(&g.stream);
+    let (d, vv) = frame_dirs(&g, &x);
+    let (views, _) = var.unique(&batch_views(), &probe);
+    let object = Object::new(Stack::from_vec([NOBJ, OBJ[0], OBJ[1]], obj()).unwrap());
+    let half = SHAPE.map(|n| (n / 2) as f64);
+    let quad: Vec<C64> = (0..N)
+        .map(|i| {
+            let (y, x) = (
+                (i / SHAPE[1]) as f64 - half[0],
+                (i % SHAPE[1]) as f64 - half[1],
+            );
+            C64::from_polar(1.0, QUAD as f64 * (y * y + x * x))
+        })
+        .collect();
+    let psi: Vec<C64> = BATCH.flat_map(|p| x.frame_chi(p).to_vec()).collect();
+    let (num, norm) = accumulate_probe(&views, &object, [NB * NP, SHAPE[0], SHAPE[1]], &quad, &psi);
+    let want: Vec<C64> = (0..NB).flat_map(|b| num.plane(b * NP).to_vec()).collect();
+    let err = rel(d.iter().map(|d| C64::new(d.re as f64, d.im as f64)), &want);
+    assert!(err <= 1e-6, "d against the CPU's: {err:e}");
+    let want: Vec<C64> = (0..NB)
+        .flat_map(|b| norm.plane(b * NP).iter().map(|&v| C64::new(v, 0.0)))
+        .collect();
+    let err = rel(vv.iter().map(|&v| C64::new(v as f64, 0.0)), &want);
+    assert!(err <= 2e-7, "vv against the CPU's: {err:e}");
+    let single: Vec<Range<u32>> = BATCH.map(|p| p..p + 1).collect();
+    let table = StackTable::new(&g.stream, &dims(), &single).unwrap();
+    for (b, p) in BATCH.enumerate() {
+        let mut sums = UpdateSums::zeroed(&g.stream, NP * N).unwrap();
+        let chi = up(&g.stream, x.frame_chi(p));
+        g.kernels
+            .psi_to_probe(
+                &g.ctx,
+                g.order.views(),
+                table.at(b),
+                &chi,
+                &x.obj,
+                &mut sums,
+            )
+            .unwrap();
+        let num = sums.num.to_host_vec(&g.stream).unwrap();
+        let den = sums.den.to_host_vec(&g.stream).unwrap();
+        let plane = b * N..(b + 1) * N;
+        let parts = |v: &[C32]| bits(&v.iter().flat_map(|c| [c.re, c.im]).collect::<Vec<_>>());
+        assert_eq!(
+            parts(&d[plane.clone()]),
+            parts(&num[..N]),
+            "d at position {p}"
+        );
+        assert_eq!(bits(&vv[plane]), bits(&den[..N]), "vv at position {p}");
+    }
 }
