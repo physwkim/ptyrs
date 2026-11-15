@@ -729,10 +729,11 @@ mod tests {
             };
             let grads = (y.clone() * w.clone()).sum().backward();
             let flat = |t: Tensor<2>| t.reshape([rows * cols]);
+            // `value` would give the running state from before this thread's update.
             [
                 host(flat(y.inner())),
-                host(n.running_mean.value()),
-                host(n.running_var.value()),
+                host(n.running_mean.value_sync()),
+                host(n.running_var.value_sync()),
                 host(flat(x.grad(&grads).unwrap())),
                 host(n.gamma.val().grad(&grads).unwrap()),
                 host(n.beta.val().grad(&grads).unwrap()),
