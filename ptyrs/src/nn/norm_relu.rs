@@ -382,6 +382,18 @@ mod kernel {
         out
     }
 
+    /// burn's ReLU: 0 where `z <= 0`, else `z`, so a NaN stays NaN.
+    #[cube]
+    fn relu<F: Float>(z: F) -> F {
+        select(z <= F::new(0.0_f32), F::new(0.0_f32), z)
+    }
+
+    /// burn's ReLU backward: 0 where the output `y <= 0`, else `dy`, so a NaN output passes `dy`.
+    #[cube]
+    fn relu_grad<F: Float>(y: F, dy: F) -> F {
+        select(y <= F::new(0.0_f32), F::new(0.0_f32), dy)
+    }
+
     /// Channel `c`'s total of the `[groups, cols]` partials.
     #[cube]
     fn total<F: Float>(
@@ -492,7 +504,7 @@ mod kernel {
             while r < end {
                 let i = r * cols as usize + c;
                 let z = (x[i] - mean) / std * g + b;
-                y[i] = select(z > F::new(0.0_f32), z, F::new(0.0_f32));
+                y[i] = relu::<F>(z);
                 r += CUBE_DIM_Y as usize;
             }
             if CUBE_POS_X == 0 && UNIT_POS_Y == 0 {
@@ -530,7 +542,7 @@ mod kernel {
             let mut r = start + UNIT_POS_Y as usize;
             while r < end {
                 let i = r * cols as usize + c;
-                let dz = select(y[i] > F::new(0.0_f32), dy[i], F::new(0.0_f32));
+                let dz = relu_grad::<F>(y[i], dy[i]);
                 db += dz;
                 dg += dz * ((x[i] - m) * rstd);
                 r += CUBE_DIM_Y as usize;
@@ -582,7 +594,7 @@ mod kernel {
             let mut r = start + UNIT_POS_Y as usize;
             while r < end {
                 let i = r * cols as usize + c;
-                let dz = select(y[i] > F::new(0.0_f32), dy[i], F::new(0.0_f32));
+                let dz = relu_grad::<F>(y[i], dy[i]);
                 let xhat = (x[i] - m) * rstd;
                 dx[i] = scale * (dz - mean_db - xhat * mean_dg);
                 r += CUBE_DIM_Y as usize;
@@ -625,10 +637,15 @@ mod tests {
         n
     }
 
-    /// The fused path against `relu(n.forward(x))`: output, running statistics and the gradients
-    /// of `Σ y·w` with respect to `x`, γ and β, each to `tol` of its largest magnitude. A
-    /// `transposed` input is a strided view rather than packed rows.
-    fn agrees(rows: usize, cols: usize, dtype: DType, tol: f64, transposed: bool) {
+    /// Batch-norm parameters and running state over `cols` channels, an input `x` and the weights
+    /// `w` of the loss `Σ y·w`, seeded by the sizes. A `transposed` input is a strided view rather
+    /// than packed rows.
+    fn inputs(
+        rows: usize,
+        cols: usize,
+        dtype: DType,
+        transposed: bool,
+    ) -> ([Tensor<1>; 4], Tensor<2>, Tensor<2>) {
         let device = crate::nn::cuda(0).autodiff();
         device.seed(rows as u64 * 31 + cols as u64);
         let p = [
@@ -647,9 +664,16 @@ mod tests {
         let w = Tensor::<2>::random([rows, cols], Distribution::Uniform(-1.0, 1.0), &device)
             .cast(dtype)
             .detach();
+        (p, x, w)
+    }
 
+    /// The fused path against `relu(n.forward(x))`: output, running statistics and the gradients
+    /// of `Σ y·w` with respect to `x`, γ and β, each NaN where burn's is and otherwise within
+    /// `tol` of its largest magnitude.
+    fn compare(p: &[Tensor<1>; 4], x: &Tensor<2>, w: &Tensor<2>, tol: f64) {
+        let [rows, cols] = x.dims();
         let run = |fused: bool| {
-            let n = batch_norm(cols, &p);
+            let n = batch_norm(cols, p);
             let x = x.clone().require_grad();
             let y = if fused {
                 norm_relu(&n, x.clone())
@@ -674,12 +698,22 @@ mod tests {
             let err = a
                 .iter()
                 .zip(b)
-                .fold(0.0_f64, |m, (a, b)| m.max((a - b).abs()));
+                .fold(0.0_f64, |m, (a, b)| match (a.is_nan(), b.is_nan()) {
+                    (false, false) => m.max((a - b).abs()),
+                    (true, true) => m,
+                    _ => f64::INFINITY,
+                });
             assert!(
                 err <= tol * scale,
-                "{name} ({rows}×{cols}, {dtype:?}): max error {err:e} of {scale:e}"
+                "{name} ({rows}×{cols}, {:?}): max error {err:e} of {scale:e}",
+                x.dtype()
             );
         }
+    }
+
+    fn agrees(rows: usize, cols: usize, dtype: DType, tol: f64, transposed: bool) {
+        let (p, x, w) = inputs(rows, cols, dtype, transposed);
+        compare(&p, &x, &w, tol);
     }
 
     #[test]
@@ -700,6 +734,21 @@ mod tests {
     #[test]
     fn fused_matches_burn_on_a_strided_input() {
         agrees(1013, 8, DType::F64, 1e-12, true);
+    }
+
+    /// A NaN activation stays NaN and passes its gradient, as through burn's ReLU: a NaN in β
+    /// makes one channel's activations NaN on finite statistics, one in `x` its channel's
+    /// statistics too.
+    #[test]
+    fn nan_activations_pass_as_through_burn() {
+        for (dtype, tol) in [(DType::F64, 1e-12), (DType::F32, 2e-5)] {
+            let (mut p, x, w) = inputs(1013, 24, dtype, false);
+            let device = x.device();
+            let nan = Tensor::<1>::full([1], f64::NAN, &device).cast(dtype);
+            p[1] = p[1].clone().slice_assign(1..2, nan.clone());
+            let x = x.slice_assign([5..6, 3..4], nan.reshape([1, 1]));
+            compare(&p, &x, &w, tol);
+        }
     }
 
     #[test]
