@@ -10,8 +10,8 @@ use crate::base::{C64, Stack};
 use crate::gpu::sampling::{Modes, WindowBlock, window_views};
 use crate::gpu::{
     C32, CG_BLOCKS, Error as GpuError, Exit, FarSums, FusedBufs, FusedInputs, FusedSums,
-    GammaCounts, Kernels, Model, PositionKernels, RecordWriter, Shift, ShiftedNumSums,
-    ShiftedProbes, SpectrumBuf, ViewDims, Views,
+    GammaCounts, Kernels, Model, PositionKernels, RecordWriter, Shift, ShiftProbe, ShiftedNumSums,
+    SpectrumBuf, ViewDims, Views,
 };
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaStream, DeviceBuffer};
@@ -427,9 +427,16 @@ impl Bufs<'_> {
         one: OneSlice,
     ) -> Result<(), GpuError> {
         let dims = *self.views.dims();
-        let mut m = (self.features)
-            .lend(ctx, self.kernels, &dims, self.obj, self.probe, self.exit)?
-            .one_slice(one);
+        let (m, shifted_sums) = (self.features).lend_shifted::<ShiftedNumSums>(
+            ctx,
+            self.kernels,
+            &dims,
+            self.obj,
+            self.probe,
+            self.exit,
+        )?;
+        let mut m = m.one_slice(one);
+        let mut shifted_sums = shifted_sums.filter(|_| update[1]);
         for s in 0..self.scratch.len() {
             fault::at(fault::Exit::MlStack)?;
             let stack = self.scratch.at(s);
@@ -477,7 +484,7 @@ impl Bufs<'_> {
             let sums = FusedSums {
                 obj: update[0].then_some(&mut self.obj_sums.num),
                 probe: (update[1] && !shifted).then_some(&mut self.probe_sums.num),
-                shift: m.shift_sums(update[1].then_some(ShiftedProbes::num as _), false),
+                shift: m.shift_sums(shifted_sums.as_deref_mut().map(ShiftProbe::Num), false),
             };
             self.kernels
                 .fused_project(ctx, &inputs, stack, exit, f, sums)?;
@@ -485,8 +492,8 @@ impl Bufs<'_> {
                 rec.push(ctx, &dims, stack, self.llk)?;
             }
         }
-        if update[1] {
-            m.probe_sums::<ShiftedNumSums>(ctx, self.kernels, &dims, &mut self.probe_sums.num)?;
+        if let Some(sums) = shifted_sums {
+            (self.kernels).shifted_probe_sums(ctx, &dims, sums, &mut self.probe_sums.num)?;
         }
         Ok(())
     }

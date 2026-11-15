@@ -21,7 +21,7 @@ use crate::gpu::{
     Error as GpuError, ExitPass, ExitStage, FarSums, FrameWaves, FusedBufs, FusedInputs,
     GammaStacks, GradKernels, HalfWaves, Kernels, LlkPartial, LlkRing, LlkScratch, LlkTotals,
     MASKED, Model, OpticsKernels, PositionKernels, PositionPartial, Positions, PowerMax,
-    ProbeSpectrum, PsiSums, RecordWriter, RpieKernels, ScalePartial, Shift, ShiftProbe, ShiftSums,
+    ProbeSpectrum, RecordWriter, RpieKernels, ScalePartial, Shift, ShiftProbe, ShiftSums,
     ShiftedNumSums, ShiftedProbes, ShiftedSums, SlicePhase, SliceSource, SpectrumBuf, StackRef,
     StackTable, StackWindows, SumTarget, UpdateSums, ViewAddr, ViewDims, Views, Waves, half_scale,
 };
@@ -894,11 +894,10 @@ pub(super) enum Moves<'b> {
     Object,
 }
 
-/// The sums of the position model, lent by [`Modelled`]: the shifted probe's under
-/// [`Sampling::Patch`] alone, which moves the probe, and each frame's position sums while
-/// the offsets are refined.
+/// The sums of the position model lent by [`Modelled`]: each frame's position sums while
+/// the offsets are refined. The shifted probe's sums are lent beside it, by
+/// [`FeaturesMut::lend_shifted`].
 struct PositionSums<'b> {
-    probe: Option<&'b mut ShiftedProbes>,
     partials: Option<&'b mut PositionPartials>,
 }
 
@@ -1175,67 +1174,31 @@ impl<K> Modelled<'_, K> {
         }
     }
 
-    /// A fused pass's sums of the position model: with `probe` the shifted probe's update
-    /// sums of that kind if the model moves the probe, with `position` each frame's position
-    /// sums if the offsets are refined; none without a position. Position sums without a
-    /// moved probe fail the pass, which takes them from the shift alone.
+    /// A fused pass's sums of the position model: `probe`, the shifted probe's sums
+    /// [`FeaturesMut::lend_shifted`] lent, and with `position` each frame's position sums if
+    /// the offsets are refined. Position sums without a moved probe fail the pass, which takes
+    /// them from the shift alone.
     pub fn shift_sums<'c>(
         &'c mut self,
-        probe: Option<fn(&'c mut ShiftedProbes) -> ShiftProbe<'c>>,
+        probe: Option<ShiftProbe<'c>>,
         position: bool,
     ) -> ShiftSums<'c> {
-        match &mut self.position {
-            Some(p) => {
-                let (num, den) = match p.partials.as_deref_mut().filter(|_| position) {
-                    Some(q) => (Some(&mut q.num), Some(&mut q.den)),
-                    None => (None, None),
-                };
-                ShiftSums {
-                    probe: (p.probe.as_deref_mut()).zip(probe).map(|(s, kind)| kind(s)),
-                    position: num,
-                    position_den: den,
-                }
-            }
-            None => ShiftSums::default(),
+        let partials = (self.position.as_mut()).and_then(|p| p.partials.as_deref_mut());
+        let (num, den) = match partials.filter(|_| position) {
+            Some(q) => (Some(&mut q.num), Some(&mut q.den)),
+            None => (None, None),
+        };
+        ShiftSums {
+            probe,
+            position: num,
+            position_den: den,
         }
     }
 
-    /// Whether the model moves the probe, whose update sums then come from
-    /// [`Self::shift_sums`] or [`Self::psi_sums`], and [`Self::probe_sums`].
+    /// Whether the model moves the probe, whose update sums
+    /// [`FeaturesMut::lend_shifted`] then lends.
     pub fn shifted(&self) -> bool {
         self.model.shift.is_some()
-    }
-
-    /// The update sums of stored waves under the position model: `obj`, and with `probe`
-    /// the shifted probe's of that kind; the shifted probe's are none unless the model moves
-    /// the probe.
-    pub fn psi_sums<'c>(
-        &'c mut self,
-        obj: Option<&'c mut dyn SumTarget>,
-        probe: Option<fn(&'c mut ShiftedProbes) -> ShiftProbe<'c>>,
-    ) -> PsiSums<'c> {
-        PsiSums {
-            obj,
-            probe: (self.position.as_mut())
-                .and_then(|p| p.probe.as_deref_mut())
-                .zip(probe)
-                .map(|(s, kind)| kind(s)),
-        }
-    }
-
-    /// Adds the shifted probe's sums of kind `S` the projections added into `out`,
-    /// consuming them; nothing unless the model moves the probe.
-    pub fn probe_sums<S: ShiftedSums>(
-        &mut self,
-        ctx: &ExecutionContext,
-        kernels: &Kernels,
-        dims: &ViewDims,
-        out: &mut S::Out,
-    ) -> Result<(), GpuError> {
-        if let Some(sums) = (self.position.as_mut()).and_then(|p| p.probe.as_deref_mut()) {
-            kernels.shifted_probe_sums(ctx, dims, sums.get::<S>(), out)?;
-        }
-        Ok(())
     }
 }
 
@@ -1291,6 +1254,34 @@ impl FeaturesMut<'_> {
         probe: &'b DeviceBuffer<C32>,
         exit: ExitPass<'b>,
     ) -> Result<Modelled<'b, AnySlices>, GpuError> {
+        Ok(self.lend_sums(ctx, kernels, dims, obj, probe, exit)?.0)
+    }
+
+    /// [`Self::lend`] with the shifted probe's sums of kind `S` if the model moves the probe:
+    /// the one accumulator the passes add to and [`Kernels::shifted_probe_sums`] consumes.
+    pub fn lend_shifted<'b, S: ShiftedSums>(
+        &'b mut self,
+        ctx: &ExecutionContext,
+        kernels: &Kernels,
+        dims: &ViewDims,
+        obj: &DeviceBuffer<C32>,
+        probe: &'b DeviceBuffer<C32>,
+        exit: ExitPass<'b>,
+    ) -> Result<(Modelled<'b, AnySlices>, Option<&'b mut S>), GpuError> {
+        let (m, sums) = self.lend_sums(ctx, kernels, dims, obj, probe, exit)?;
+        Ok((m, sums.map(ShiftedProbes::get::<S>)))
+    }
+
+    /// [`Self::lend`] with the shifted probe's sums of every kind.
+    fn lend_sums<'b>(
+        &'b mut self,
+        ctx: &ExecutionContext,
+        kernels: &Kernels,
+        dims: &ViewDims,
+        obj: &DeviceBuffer<C32>,
+        probe: &'b DeviceBuffer<C32>,
+        exit: ExitPass<'b>,
+    ) -> Result<(Modelled<'b, AnySlices>, Option<&'b mut ShiftedProbes>), GpuError> {
         let (scale, scale_sums) = match &mut self.scale {
             Some(s) => (Some(&*s.values), s.sums.as_deref_mut()),
             None => (None, None),
@@ -1299,7 +1290,7 @@ impl FeaturesMut<'_> {
             Some(b) => (Some(&*b.values), b.sums.as_deref_mut()),
             None => (None, None),
         };
-        let (shift, sampled, position) = match &mut self.position {
+        let (shift, sampled, position, probe_sums) = match &mut self.position {
             Some(p) => {
                 let (shift, sampled, sums) = match &mut *p.mover {
                     Mover::Probe {
@@ -1324,15 +1315,12 @@ impl FeaturesMut<'_> {
                         (None, Some(sampled), None)
                     }
                 };
-                let sums = PositionSums {
-                    probe: sums,
-                    partials: p.partials.as_deref_mut(),
-                };
-                (shift, sampled, Some(sums))
+                let partials = p.partials.as_deref_mut();
+                (shift, sampled, Some(PositionSums { partials }), sums)
             }
-            None => (None, None, None),
+            None => (None, None, None, None),
         };
-        Ok(Modelled {
+        let m = Modelled {
             model: Model {
                 scale,
                 background,
@@ -1344,7 +1332,8 @@ impl FeaturesMut<'_> {
             background: background_sums,
             position,
             slices: PhantomData,
-        })
+        };
+        Ok((m, probe_sums))
     }
 
     /// Every refined feature's step from the far sums [`Modelled::far`] lent the passes
