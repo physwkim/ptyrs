@@ -326,7 +326,8 @@ fn phase_grad_is_zeros_without_the_phase() {
 }
 
 /// A tangent's length: [`FIELD`], or one value for a CG-only one (`lv`, `muv`, `mvv`)
-/// without CG, which a launch takes only when it neither checks nor touches it.
+/// without CG, which a launch takes only when it neither checks nor touches it. The kernel
+/// then gets `lu`'s or `muu`'s pointer in its place, so a stray write shows on those.
 fn tangent_len(cg_only: bool, cg: bool) -> usize {
     if cg_only && !cg { 1 } else { FIELD }
 }
@@ -334,8 +335,8 @@ fn tangent_len(cg_only: bool, cg: bool) -> usize {
 /// `phase_tangent` at `quad`, per entry kind, against the derivatives of `exp(i (t S_u + τ
 /// S_v)) (X + t l_u + τ l_v + t² m_uu / 2 + t τ m_uv + τ² m_vv / 2)` at 0 by central
 /// differences in f64: `Φ ψ` dephased, `S_u`, `S_v` the phase's angle along `u`'s and `v`'s
-/// offsets of the measured rates. Planes past the stack's frames, and without CG `lv`, `muv`
-/// and `mvv` ([`tangent_len`]), stay as they were.
+/// offsets of the measured rates. Planes past the stack's frames stay as they were; without
+/// CG `lv`, `muv` and `mvv` go unchecked ([`tangent_len`]).
 fn phase_tangent_case(quad: f32, cg: bool) {
     let fx = fixture();
     let rates = phase_rates(&fx);
@@ -422,7 +423,6 @@ fn phase_tangent_case(quad: f32, cg: bool) {
             for b in 0..5 {
                 let what = format!("kind {kind} stack {s} {}", names[b]);
                 if !(b == 0 || b == 2 || cg) {
-                    assert!(got[b] == fields[b].1, "{what} touched");
                     continue;
                 }
                 if quad != 0.0 {
@@ -541,8 +541,8 @@ fn spec_at(
 
 /// `pos_second` against central differences of `pos_spec` along each direction: the moved
 /// probes' spectra `e(o + t d) (A + t a)` change to first order as `pos_spec` writes, so its
-/// change along `(t_u, t_v)` is their second order. Without CG `muv` and `mvv`
-/// ([`tangent_len`]) stay as they were, as the planes past the stack's frames do.
+/// change along `(t_u, t_v)` is their second order. The planes past the stack's frames stay
+/// as they were; without CG `muv` and `mvv` go unchecked ([`tangent_len`]).
 fn pos_second_case(cg: bool) {
     let fx = fixture();
     let mv = moves(&fx);
@@ -625,7 +625,6 @@ fn pos_second_case(cg: bool) {
         for (b, name) in ["muu", "muv", "mvv"].into_iter().enumerate() {
             let what = format!("stack {s} {name}");
             let Some(w) = &want[b] else {
-                assert!(got[b] == fields[b].1, "{what} written");
                 continue;
             };
             close(&what, &got[b][..written], &w[..written], 1e-3);
