@@ -22,7 +22,6 @@ use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig};
 use ptyrs_kernels::fft_ept;
 use ptyrs_kernels::fused::FUSED_COLS;
 use ptyrs_kernels::grad::GAMMA_CHUNK;
-use ptyrs_kernels::optics::WavePlanes;
 use ptyrs_kernels::pixel::PIXEL_THREADS;
 pub use ptyrs_kernels::position::PositionRule;
 use ptyrs_kernels::position::{BatchSpan, POSITION_SUMS, PositionSums, position_kernels};
@@ -231,7 +230,8 @@ impl PositionKernels {
     /// at its offset and the probe stays put: [`Self::sums`] against the slopes `derivatives`
     /// writes for this stack into `step`'s, the derivatives along `y` then `x` of each
     /// frame's sampled window (object mode 0) in the natural layout. `w` is the wave entering
-    /// the slice: with [`SliceSource::Probe`] probe mode 0 times the exit's quadratic phase.
+    /// the slice: with [`SliceSource::Probe`] probe mode 0 times the exit's quadratic phase,
+    /// with [`SliceSource::OwnProbe`] each frame's own mode 0.
     pub fn derivative_sums(
         &self,
         ctx: &ExecutionContext,
@@ -274,31 +274,12 @@ impl PositionKernels {
         let d = views.dims();
         let g = d.geom(stack)?;
         check_len("chi", chi, g.nf_max as usize * d.nmode as usize * d.n())?;
-        let (w, waves, probe) = match w {
-            SliceSource::Probe(p) => {
-                check_len("probe", p, d.nprobe as usize * d.n())?;
-                let waves = WavePlanes {
-                    w: dptr::<C32, f32>(p).cast_const(),
-                    nw: d.nprobe,
-                };
-                (p, waves, 1)
-            }
-            SliceSource::Waves(w) => {
-                let (w, waves) = w.planes(d, g.nf_max)?;
-                (w, waves, 0)
-            }
-        };
+        let (w, mut reads) = w.src(d, g.nf_max)?;
         let config = chunk_grid(&g, d.n())?;
-        let reads = [
-            chi.storage(),
-            w.storage(),
-            slopes.storage(),
-            stack.storage(),
-        ];
+        reads.extend([chi.storage(), slopes.storage(), stack.storage()]);
         let p = PositionSums {
             chi: dptr::<C32, f32>(chi).cast_const(),
-            w: waves,
-            probe,
+            w,
             slopes: dptr::<C32, f32>(slopes).cast_const(),
             sums: dptr(sums),
         };

@@ -5,8 +5,11 @@
 //! agree bit for bit. Each frame's probe direction against the CPU's over those views, and bit
 //! for bit against [`Kernels::psi_to_probe`] one frame at a time. The shifted probe on each
 //! frame's own spectra against the same launcher one frame at a time on its own probe, and
-//! against the CPU's move of that probe. The batch starts past position 0 of an epoch order
-//! that is not the scan's, with two probe and two object modes in stacks of 3 and 2.
+//! against the CPU's move of that probe. The slice product and the position step on each
+//! frame's own mode 0 against the CPU's over those views, [`SliceWaves`]' wave entering the
+//! slice, and bit for bit against each frame alone. The batch starts past position 0 of an
+//! epoch order that is not the scan's, with two probe and two object modes in stacks of 3
+//! and 2.
 
 use std::f64::consts::PI;
 use std::ops::Range;
@@ -20,14 +23,15 @@ use super::{FrameDirs, LsqmlAt, LsqmlChi, LsqmlKernels, LsqmlScan};
 use crate::base::{C64, Counts, Feature, Geometry, Object, Probe, Stack, View};
 use crate::engine::{
     Cost, Features, Lsqml, LsqmlBatch, LsqmlParams, Observed, Optics, ProbeVariation, Sampling,
-    accumulate_probe,
+    SliceWaves, accumulate_probe, obj_probe_to_psi,
 };
 use crate::gpu::fused::{FrameMoves, OwnSpectrumBuf};
 use crate::gpu::opr::{FrameProbe, OwnModes};
 use crate::gpu::{
     C32, EpochOrder, Exit, FarSums, FusedBufs, FusedInputs, FusedSums, Kernels, Model, Opr,
-    OprKernels, ProbeSpectrum, PsiSums, Shift, ShiftProbe, ShiftSums, ShiftedProbeSums,
-    SpectrumBuf, StackTable, UpdateSums, ViewAddr, ViewDims, Views,
+    OprKernels, OpticsKernels, PositionKernels, PositionRule, PositionStep, ProbeSpectrum, PsiSums,
+    Shift, ShiftProbe, ShiftSums, ShiftedProbeSums, SliceSource, Solve, SpectrumBuf, StackTable,
+    UpdateSums, ViewAddr, ViewDims, Views,
 };
 use crate::worst::worst_of;
 
@@ -581,9 +585,14 @@ fn cpu_move_back(x: &Stack<C64>, offsets: [[f64; 2]; NFRAME]) -> Stack<C64> {
     LsqmlBatch::new(&run, &views, &obs, &optics, objects, &probe, &var).adjoint_move(x)
 }
 
-/// `q·w` of natural-layout planes `w` in the exit waves' layout, origin at `[0, 0]`.
-fn exit_layout(w: &[C64], q: &[C64]) -> Vec<C64> {
+/// The exit waves' stored pixel of natural pixel `i`, origin at `[0, 0]`.
+fn stored(i: usize) -> usize {
     let [ny, nx] = SHAPE;
+    (i / nx + ny / 2) % ny * nx + (i % nx + nx / 2) % nx
+}
+
+/// `q·w` of natural-layout planes `w` in the exit waves' layout.
+fn exit_layout(w: &[C64], q: &[C64]) -> Vec<C64> {
     let mut out = vec![C64::default(); w.len()];
     for (o, w) in out
         .as_chunks_mut::<N>()
@@ -592,7 +601,7 @@ fn exit_layout(w: &[C64], q: &[C64]) -> Vec<C64> {
         .zip(w.as_chunks::<N>().0)
     {
         for (i, (&w, &q)) in w.iter().zip(q).enumerate() {
-            o[(i / nx + ny / 2) % ny * nx + (i % nx + nx / 2) % nx] = q * w;
+            o[stored(i)] = q * w;
         }
     }
     out
@@ -848,4 +857,202 @@ fn projected_frame_moves_sum_to_the_probe_sums() {
     let err = rel(got, &want);
     eprintln!("summed moves against the probe sums: {err:.3e}");
     assert!(err <= 2e-6, "summed moves against the probe sums: {err:e}");
+}
+
+/// [`OpticsKernels::slice_mul`] of the object, stack `s` of `stacks` on `sources[s]`: the
+/// batch's products, `[NB NMODE, n]` at the exit waves' stored pixels.
+fn slice_products(
+    g: &Gpu,
+    x: &Inputs,
+    stacks: &[Range<u32>],
+    sources: &[SliceSource<'_>],
+) -> Vec<C32> {
+    let optics = OpticsKernels::load(&g.kernels).unwrap();
+    let table = StackTable::new(&g.stream, &dims(), stacks).unwrap();
+    let len = table.nf_max() as usize * NMODE * N;
+    let mut dst = DeviceBuffer::<C32>::zeroed(&g.stream, len).unwrap();
+    let mut out = Vec::new();
+    for (s, (r, &src)) in stacks.iter().zip(sources).enumerate() {
+        let views = g.order.views();
+        optics
+            .slice_mul(&g.ctx, views, table.at(s), &x.obj, src, &mut dst)
+            .unwrap();
+        out.extend_from_slice(&dst.to_host_vec(&g.stream).unwrap()[..r.len() * NMODE * N]);
+    }
+    out
+}
+
+/// The slice product on each frame's own probe mode 0: the CPU's product over
+/// [`ProbeVariation::unique`]'s views and planes.
+#[test]
+fn slice_product_on_own_modes_matches_the_cpu_and_each_frame_alone() {
+    let g = gpu();
+    let (var, probe) = variation();
+    let planes = own_planes(&g, &var, &probe);
+    let x = inputs(&g.stream);
+    let shared = up(&g.stream, probe.as_slice());
+    let own = OwnModes {
+        planes: &planes,
+        positions: BATCH,
+    };
+    let got = slice_products(&g, &x, &STACKS, &[SliceSource::OwnProbe(&shared, &own); 2]);
+    let probes = frame_probes(&g, &probe, &planes);
+    let alone: Vec<_> = probes.iter().map(SliceSource::Probe).collect();
+    let want = slice_products(&g, &x, &single(), &alone);
+    assert_eq!(c_bits(&got), c_bits(&want), "each frame alone");
+    let plain = slice_products(&g, &x, &STACKS, &[SliceSource::Probe(&shared); 2]);
+    assert_ne!(
+        c_bits(&plain),
+        c_bits(&got),
+        "the own modes left the products"
+    );
+    let (views, uprobe) = var.unique(&batch_views(), &probe);
+    let object = Object::new(Stack::from_vec([NOBJ, OBJ[0], OBJ[1]], obj()).unwrap());
+    let mut want = vec![C64::default(); NB * NMODE * N];
+    obj_probe_to_psi(
+        &views,
+        &object,
+        &uprobe,
+        &[C64::new(1.0, 0.0); N],
+        &mut want,
+    );
+    let err = rel(
+        got.iter().map(|z| C64::new(z.re.into(), z.im.into())),
+        &want,
+    );
+    eprintln!("products against the CPU's: {err:.3e}");
+    assert!(err <= 2e-6, "products against the CPU's: {err:e}");
+}
+
+/// How the position tests solve and take the step: pty-chi's.
+const SOLVE: Solve = Solve {
+    rule: PositionRule {
+        step: 0.3,
+        limit: 0.1,
+    },
+    scale: 1.0,
+};
+
+/// [`PositionKernels::step`] from zero offsets, by frame, of the batch after
+/// [`PositionKernels::derivative_sums`] of stack `s` of `stacks` on `sources[s]`, each batch
+/// frame `b`'s derivatives `deriv[b]` along `y` and `x` in the natural layout, its `chi`
+/// from `x`.
+fn position_offsets(
+    g: &Gpu,
+    x: &Inputs,
+    deriv: &[[Vec<C64>; 2]],
+    stacks: &[Range<u32>],
+    sources: &[SliceSource<'_>],
+) -> Vec<f32> {
+    let position = PositionKernels::load(&g.kernels).unwrap();
+    let table = StackTable::new(&g.stream, &dims(), stacks).unwrap();
+    let mut step = PositionStep::zeroed(&g.stream, &dims(), table.nf_max()).unwrap();
+    let nf_max = table.nf_max() as usize;
+    for (s, (r, &src)) in stacks.iter().zip(sources).enumerate() {
+        let mut chi: Vec<C64> = r.clone().flat_map(|p| x.frame_chi(p).to_vec()).collect();
+        chi.resize(nf_max * NMODE * N, C64::default());
+        let chi = up(&g.stream, &chi);
+        let mut slopes = vec![C64::default(); 2 * nf_max * N];
+        for (fl, p) in r.clone().enumerate() {
+            for (ax, d) in deriv[(p - BATCH.start) as usize].iter().enumerate() {
+                slopes[(ax * nf_max + fl) * N..][..N].copy_from_slice(d);
+            }
+        }
+        let slopes = c32(&slopes);
+        let derivatives = |t: &mut DeviceBuffer<C32>| Ok(t.copy_from_host(&g.stream, &slopes)?);
+        let views = g.order.views();
+        (position)
+            .derivative_sums(
+                &g.ctx,
+                views,
+                table.at(s),
+                derivatives,
+                (&chi, src),
+                &mut step,
+            )
+            .unwrap();
+    }
+    let mut offsets = DeviceBuffer::<f32>::zeroed(&g.stream, 2 * NFRAME).unwrap();
+    (position)
+        .step(&g.ctx, BATCH, &g.order, &mut offsets, SOLVE, &mut step)
+        .unwrap();
+    offsets.to_host_vec(&g.stream).unwrap()
+}
+
+/// pty-chi's step under [`SOLVE`] from zero offsets, by frame, from the batch frames'
+/// `[num, den]` sums: `0.3 num / (den + max(max den, 1e-6))` per axis, 0 at the scan's other
+/// frames, clamped to `±min(10 mean |dx − mean dx|, 0.1)` over the scan's frames.
+fn cpu_step(sums: &[[[f64; 2]; 2]]) -> Vec<f64> {
+    let (rule, n) = (SOLVE.rule, NFRAME as f64);
+    let eps = 1e-6 * SOLVE.scale as f64;
+    let max = [0, 1].map(|ax| sums.iter().map(|s| s[1][ax]).fold(eps, f64::max));
+    let mut dx = [[0.0; 2]; NFRAME];
+    for (p, [num, den]) in BATCH.zip(sums) {
+        dx[ORDER[p as usize] as usize] =
+            [0, 1].map(|ax| rule.step as f64 * num[ax] / (den[ax] + max[ax]));
+    }
+    let lim = [0, 1].map(|ax| {
+        let mean = dx.iter().map(|d| d[ax]).sum::<f64>() / n;
+        let mad = dx.iter().map(|d| (d[ax] - mean).abs()).sum::<f64>() / n;
+        (10.0 * mad).min(rule.limit as f64)
+    });
+    (dx.iter())
+        .flat_map(|d| [0, 1].map(|ax| d[ax].clamp(-lim[ax], lim[ax])))
+        .collect()
+}
+
+/// The position step from the sums on each frame's own probe mode 0: the CPU's from the
+/// wave [`SliceWaves`] enters the slice with over [`ProbeVariation::unique`]'s views and
+/// planes, times its phase, as `LsqmlBatch::position_directions` reads it.
+#[test]
+fn position_step_on_own_modes_matches_the_cpu_and_each_frame_alone() {
+    let g = gpu();
+    let (var, probe) = variation();
+    let planes = own_planes(&g, &var, &probe);
+    let x = inputs(&g.stream);
+    let deriv: Vec<[Vec<C64>; 2]> = (0..NB as u64)
+        .map(|b| [0, 1].map(|ax| noise(N, 50 + 2 * b + ax)))
+        .collect();
+    let shared = up(&g.stream, probe.as_slice());
+    let own = OwnModes {
+        planes: &planes,
+        positions: BATCH,
+    };
+    let src = [SliceSource::OwnProbe(&shared, &own); 2];
+    let got = position_offsets(&g, &x, &deriv, &STACKS, &src);
+    let probes = frame_probes(&g, &probe, &planes);
+    let alone: Vec<_> = probes.iter().map(SliceSource::Probe).collect();
+    let want = position_offsets(&g, &x, &deriv, &single(), &alone);
+    assert_eq!(bits(&got), bits(&want), "each frame alone");
+    let plain = [SliceSource::Probe(&shared); 2];
+    let plain = position_offsets(&g, &x, &deriv, &STACKS, &plain);
+    assert_ne!(bits(&plain), bits(&got), "the own modes left the step");
+    let (views, uprobe) = var.unique(&batch_views(), &probe);
+    let object = Object::new(Stack::from_vec([NOBJ, OBJ[0], OBJ[1]], obj()).unwrap());
+    let optics = optics();
+    let waves = SliceWaves::new(&optics, &views, slice::from_ref(&object), &uprobe, None);
+    let sums: Vec<[[f64; 2]; 2]> = (BATCH.zip(&deriv).enumerate())
+        .map(|(b, (p, d))| {
+            let k = b * NMODE;
+            let (w, q) = (waves.incident(0).plane(k), waves.quad(0, k));
+            let chi = x.frame_chi(p);
+            let mut s = [[0.0; 2]; 2];
+            for i in 0..N {
+                for ax in 0..2 {
+                    let u = d[ax][i] * w[i] * q[i];
+                    s[0][ax] += (u.conj() * chi[stored(i)]).re;
+                    s[1][ax] += u.norm_sqr();
+                }
+            }
+            s
+        })
+        .collect();
+    let want = cpu_step(&sums);
+    let scale = worst_of(want.iter().map(|w| w.abs()));
+    let err = worst_of(got.iter().zip(&want).map(|(&g, w)| (g as f64 - w).abs())) / scale;
+    eprintln!("offsets against the CPU's: {err:.3e}");
+    assert!(
+        err <= 1e-4,
+        "offsets {got:?} against the CPU's {want:?}: {err:e}"
+    );
 }

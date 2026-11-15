@@ -29,7 +29,7 @@
 use cuda_device::{device, shared::DynamicSharedArray, thread};
 use cuda_host::cuda_module;
 
-use crate::fused::block_fft;
+use crate::fused::{ProbeSrc, block_fft, load_probe, shared_probe};
 use crate::pixel::{StackCtl, StackGeom, cmul, cmul_conj, load_c, stack_frames, store_c};
 use crate::{FFT_EPT_MAX, fft_ept};
 
@@ -75,9 +75,6 @@ pub struct Band {
 /// [`optics_slice_mul`]: optics_kernels::LoadedModule::optics_slice_mul
 /// [`optics_slice_phase`]: optics_kernels::LoadedModule::optics_slice_phase
 pub const SLICE_CONJ: u32 = 1;
-/// [`optics_kernels::LoadedModule::optics_slice_mul`]: `src` is the probe, `[nprobe, ny,
-/// nx]` in the natural layout, each view reading its mode; without it the stack's waves.
-pub const SLICE_PROBE: u32 = 2;
 /// [`optics_kernels::LoadedModule::optics_slice_phase`]: each frame's phase is displaced
 /// by its offset.
 pub const SLICE_OFFSET: u32 = 2;
@@ -97,6 +94,46 @@ pub struct WavePlanes {
 pub fn wave_plane(w: WavePlanes, fl: usize, m: usize) -> usize {
     let nw = w.nw as usize;
     fl * nw + m % nw
+}
+
+/// The wave entering a slice, as [`optics_slice_mul`] multiplies it and
+/// [`position_sums`] reads it: with `from_probe` set the probe as `probe` says, `[nprobe, ny,
+/// nx]` in the natural layout, each view reading its mode at its frame's epoch position;
+/// else the stack's `waves`. [`probe_slice`] and [`wave_slice`] build it, the other arm
+/// null.
+///
+/// [`optics_slice_mul`]: optics_kernels::LoadedModule::optics_slice_mul
+/// [`position_sums`]: crate::position::position_kernels::LoadedModule::position_sums
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct SliceSrc {
+    pub probe: ProbeSrc,
+    pub waves: WavePlanes,
+    pub from_probe: u32,
+}
+
+/// The probe as a [`SliceSrc`].
+#[device]
+pub fn probe_slice(probe: ProbeSrc) -> SliceSrc {
+    let waves = WavePlanes {
+        w: core::ptr::null(),
+        nw: 0,
+    };
+    SliceSrc {
+        probe,
+        waves,
+        from_probe: 1,
+    }
+}
+
+/// A stack's waves as a [`SliceSrc`].
+#[device]
+pub fn wave_slice(waves: WavePlanes) -> SliceSrc {
+    SliceSrc {
+        probe: shared_probe(core::ptr::null()),
+        waves,
+        from_probe: 0,
+    }
 }
 
 /// One line pass in place over the stack's planes of `buf`, `[nf_max * nmode, ny, nx]`: per
@@ -209,7 +246,7 @@ pub unsafe fn stage<const N: u32>(
 
 #[cuda_module]
 pub mod optics_kernels {
-    use super::{Band, SLICE_CONJ, SLICE_OFFSET, SLICE_PROBE, WavePlanes, stage, wave_plane};
+    use super::{Band, SLICE_CONJ, SLICE_OFFSET, SliceSrc, load_probe, stage, wave_plane};
     use crate::pixel::*;
     use crate::*;
 
@@ -315,19 +352,18 @@ pub mod optics_kernels {
 
     /// A slice's product over the stack's views: `dst`'s plane of view `k` is `obj`'s
     /// bilinear window of that view times `src` (under `SLICE_CONJ` the window's conjugate
-    /// times it), `src.w` the probe under `SLICE_PROBE` (`src.nw` unread), else the stack's
-    /// waves. `dst` is `[nf_max * nmode, ny, nx]` at the exit wave's stored pixels, `views`
-    /// in epoch order. One thread per value of `dst`.
+    /// times it). `dst` is `[nf_max * nmode, ny, nx]` at the exit wave's stored pixels,
+    /// `views` in epoch order. One thread per value of `dst`.
     ///
     /// # Safety
     ///
-    /// `dst` and `src` hold their shapes for `g`, `src.nw` `nmode` or `nprobe` unless under
-    /// `SLICE_PROBE`, `obj` `[nobj, nyo, nxo]`, `views` the scan's, each window inside the
-    /// object; `ctl` one entry.
+    /// `dst` and `src` hold their shapes for `g`, `src.waves.nw` `nmode` or `nprobe` unless
+    /// `src.from_probe`, `obj` `[nobj, nyo, nxo]`, `views` the scan's, each window inside
+    /// the object; `ctl` one entry.
     #[kernel]
     pub unsafe fn optics_slice_mul(
         dst: *mut f32,
-        src: WavePlanes,
+        src: SliceSrc,
         obj: *const f32,
         views: *const ViewAddr,
         ctl: *const StackCtl,
@@ -346,11 +382,14 @@ pub mod optics_kernels {
         unsafe {
             let v = *views.add(f0 as usize * g.nmode as usize + kl);
             let o = sample_obj(obj, v, y, x, g.nyo, g.nxo);
-            let w = if flags & SLICE_PROBE != 0 {
-                load_c(src.w, v.probe as usize * n + j)
+            let nmode = g.nmode as usize;
+            let w = if src.from_probe != 0 {
+                load_probe(src.probe, v.probe, f0 + (kl / nmode) as u32, n, j)
             } else {
-                let nmode = g.nmode as usize;
-                load_c(src.w, wave_plane(src, kl / nmode, kl % nmode) * n + s)
+                load_c(
+                    src.waves.w,
+                    wave_plane(src.waves, kl / nmode, kl % nmode) * n + s,
+                )
             };
             let w = if flags & SLICE_CONJ != 0 {
                 cmul_conj(o, w)
