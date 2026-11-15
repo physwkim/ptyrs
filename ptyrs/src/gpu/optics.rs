@@ -7,6 +7,11 @@
 //! it, as the adjoint, the correction's back; the far field and a forward Fresnel transform
 //! have no stage and launch nothing.
 //!
+//! Angular spectrum with an evanescent band, where the transfer function is 0, has `Uᴴ U`
+//! the projection off the band rather than 1. [`OpticsKernels::exit_banded`] keeps the band
+//! of the forward stage's waves `w` in a carry and hands it back in the adjoint, so that a
+//! correction `Uᴴ Δ` comes back as pty-chi's `Uᴴ (U w + Δ) - w`.
+//!
 //! A multislice object's waves never pass the fused row pass, which multiplies one object
 //! by the probe: [`OpticsKernels::slice_mul`] is a slice's product and its adjoint,
 //! [`OpticsKernels::slice_phase`] the exit plane's phase, [`OpticsKernels::rows`] the row
@@ -14,10 +19,11 @@
 //! adjoint's integrand.
 
 use cuda_async::device_operation::ExecutionContext;
-use cuda_core::{DeviceBuffer, LaunchConfig};
+use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig};
 use ptyrs_kernels::optics::{
-    SLICE_CONJ, SLICE_OFFSET, SLICE_PROBE, STAGE_COLS, STAGE_CONJ, STAGE_MUL, STAGE_POST_FWD,
-    STAGE_POST_INV, STAGE_PRE_FWD, STAGE_PRE_INV, WavePlanes, optics_kernels,
+    Band, OFF_BAND, SLICE_CONJ, SLICE_OFFSET, SLICE_PROBE, STAGE_COLS, STAGE_CONJ, STAGE_MUL,
+    STAGE_POST_FWD, STAGE_POST_INV, STAGE_PRE_FWD, STAGE_PRE_INV, STAGE_RESTORE, STAGE_SAVE,
+    WavePlanes, optics_kernels,
 };
 
 use crate::gpu::fused::Side;
@@ -37,6 +43,53 @@ pub enum ExitStage {
     /// `V = F⁻¹ F⁻¹ T F`, angular spectrum of the transfer function `T`, `[ny, nx]` on the
     /// unshifted frequency grid and even in both frequencies.
     Transfer(DeviceBuffer<C32>),
+}
+
+/// [`ExitStage::Transfer`] of a transfer function with an evanescent band, the pixels where
+/// it is 0, and each band pixel's slot in a plane's carry.
+pub struct BandedTransfer {
+    tf: DeviceBuffer<C32>,
+    /// `[ny, nx]`: the pixel's slot, [`OFF_BAND`] off the band.
+    slots: DeviceBuffer<u32>,
+    nband: u32,
+}
+
+impl BandedTransfer {
+    /// The stage of `tf`, `[ny, nx]` on the unshifted frequency grid and even in both
+    /// frequencies, so that its band is too: the adjoint finds the band in the bins the
+    /// forward saved it from.
+    pub fn new(stream: &CudaStream, tf: &[C32]) -> Result<Self, Error> {
+        let mut nband = 0;
+        let slots: Vec<u32> = tf
+            .iter()
+            .map(|&t| {
+                if t != C32::default() {
+                    return OFF_BAND;
+                }
+                nband += 1;
+                nband - 1
+            })
+            .collect();
+        Ok(Self {
+            tf: DeviceBuffer::from_host(stream, tf)?,
+            slots: DeviceBuffer::from_host(stream, &slots)?,
+            nband,
+        })
+    }
+
+    /// The values a stack's carry holds, `[nf_max * nmode, nband]`.
+    pub fn carry_len(&self, d: &ViewDims, nf_max: u32) -> usize {
+        nf_max as usize * d.nmode as usize * self.nband as usize
+    }
+}
+
+/// A stack's carry for a [`BandedTransfer`], [`BandedTransfer::carry_len`] values, as an
+/// [`OpticsKernels::exit_banded`] uses it.
+pub enum BandCarry<'a> {
+    /// The forward stage, saving the band of the stack's waves.
+    Save(&'a mut DeviceBuffer<C32>),
+    /// The adjoint, handing back what the forward of the same stack saved.
+    Restore(&'a DeviceBuffer<C32>),
 }
 
 /// A stack's waves at the exit wave's stored pixels, by what each frame's planes hold: view
@@ -168,12 +221,50 @@ impl OpticsKernels {
             ExitStage::Transfer(tf) if adjoint => {
                 self.stage(ctx, &l, stack, work, None, STAGE_PRE_FWD)?;
                 let flags = STAGE_COLS | STAGE_MUL | STAGE_CONJ | STAGE_POST_FWD;
-                self.stage(ctx, &l, stack, work, Some((tf, scale)), flags)
+                self.stage(ctx, &l, stack, work, Some(Mul::plain(tf, scale)), flags)
             }
             ExitStage::Transfer(tf) => {
                 let flags = STAGE_COLS | STAGE_PRE_INV | STAGE_MUL;
-                self.stage(ctx, &l, stack, work, Some((tf, scale)), flags)?;
+                self.stage(ctx, &l, stack, work, Some(Mul::plain(tf, scale)), flags)?;
                 self.stage(ctx, &l, stack, work, None, STAGE_PRE_INV)
+            }
+        }
+    }
+
+    /// [`Self::exit`] of `stage` as [`ExitStage::Transfer`], the band carried: under
+    /// [`BandCarry::Save`] the forward, saving the band, and under [`BandCarry::Restore`]
+    /// the adjoint, giving the row transforms of `Vᴴ c - E w`, `E` the projection onto the
+    /// band and `w` the waves whose forward saved the carry.
+    pub fn exit_banded(
+        &self,
+        ctx: &ExecutionContext,
+        d: &ViewDims,
+        stack: StackRef<'_>,
+        stage: &BandedTransfer,
+        work: &mut DeviceBuffer<C32>,
+        carry: BandCarry<'_>,
+    ) -> Result<(), Error> {
+        let l = Launch::new(d, stack, work)?;
+        let scale = 1.0 / (d.n() as f32).sqrt();
+        let mul = |carried| Mul {
+            plane: &stage.tf,
+            scale,
+            band: Some((stage, carried)),
+        };
+        match carry {
+            BandCarry::Save(c) => {
+                let flags = STAGE_COLS | STAGE_PRE_INV | STAGE_MUL;
+                self.stage(ctx, &l, stack, work, Some(mul(Carried::Save(c))), flags)?;
+                self.stage(ctx, &l, stack, work, None, STAGE_PRE_INV)
+            }
+            BandCarry::Restore(c) => {
+                self.stage(ctx, &l, stack, work, None, STAGE_PRE_FWD)?;
+                // Less `E w`'s row transforms, `F_y⁻¹ M F_y` of `w`'s with `M` the band's
+                // indicator: ahead of the unnormalized column FFT, `M / ny` times the saved
+                // unnormalized `F_y⁻¹`, in the bins it was saved from as `M` is even.
+                let restore = Carried::Restore(c, -1.0 / d.frame[0] as f32);
+                let flags = STAGE_COLS | STAGE_MUL | STAGE_CONJ | STAGE_POST_FWD;
+                self.stage(ctx, &l, stack, work, Some(mul(restore)), flags)
             }
         }
     }
@@ -194,7 +285,14 @@ impl OpticsKernels {
         let conj = if adjoint { STAGE_CONJ } else { 0 };
         let flags = STAGE_COLS | STAGE_PRE_FWD | STAGE_MUL | conj | STAGE_POST_INV;
         self.stage(ctx, &l, stack, waves, None, STAGE_PRE_FWD)?;
-        self.stage(ctx, &l, stack, waves, Some((tf, 1.0 / d.n() as f32)), flags)?;
+        self.stage(
+            ctx,
+            &l,
+            stack,
+            waves,
+            Some(Mul::plain(tf, 1.0 / d.n() as f32)),
+            flags,
+        )?;
         self.stage(ctx, &l, stack, waves, None, STAGE_PRE_INV)
     }
 
@@ -367,47 +465,105 @@ impl OpticsKernels {
         })
     }
 
-    /// One line pass of `flags` over `buf`, multiplying by `mul`'s plane times its scale.
+    /// One line pass of `flags` over `buf`, multiplying by `mul`.
     fn stage(
         &self,
         ctx: &ExecutionContext,
         l: &Launch,
         stack: StackRef<'_>,
         buf: &DeviceBuffer<C32>,
-        mul: Option<(&DeviceBuffer<C32>, f32)>,
+        mul: Option<Mul<'_>>,
         flags: u32,
     ) -> Result<(), Error> {
         let cols = flags & STAGE_COLS != 0;
         let (side, config) = if cols { l.cols } else { l.rows };
-        let (plane, scale) = match mul {
-            Some((tf, scale)) => {
-                check_len("transfer function", tf, l.n)?;
-                (dptr(tf) as *const f32, scale)
-            }
-            None => (std::ptr::null(), 0.0),
-        };
-        let (m, p, ctl, g) = (&self.module, dptr(buf), l.ctl, l.g);
+        let mut flags = flags;
         let mut reads = vec![stack.storage()];
-        reads.extend(mul.map(|(tf, _)| tf.storage()));
-        self.base.launch(ctx, &reads, &[buf.storage()], |stream| {
+        let mut writes = vec![buf.storage()];
+        let (mut plane, mut scale) = (std::ptr::null(), 0.0);
+        let mut band = Band {
+            slots: std::ptr::null(),
+            carry: std::ptr::null_mut(),
+            nband: 0,
+            scale: 0.0,
+        };
+        if let Some(mul) = mul {
+            check_len("transfer function", mul.plane, l.n)?;
+            reads.push(mul.plane.storage());
+            (plane, scale) = (dptr::<C32, f32>(mul.plane).cast_const(), mul.scale);
+            if let Some((b, carried)) = mul.band {
+                let (carry, restore) = match carried {
+                    Carried::Save(c) => {
+                        writes.push(c.storage());
+                        flags |= STAGE_SAVE;
+                        (c, 0.0)
+                    }
+                    Carried::Restore(c, k) => {
+                        reads.push(c.storage());
+                        flags |= STAGE_RESTORE;
+                        (c, k)
+                    }
+                };
+                check_len("band carry", carry, l.planes * b.nband as usize)?;
+                reads.push(b.slots.storage());
+                band = Band {
+                    slots: dptr::<u32, u32>(&b.slots).cast_const(),
+                    carry: dptr(carry),
+                    nband: b.nband,
+                    scale: restore,
+                };
+            }
+        }
+        let (m, p, ctl, g) = (&self.module, dptr(buf), l.ctl, l.g);
+        self.base.launch(ctx, &reads, &writes, |stream| {
             // SAFETY: `Launch::new` checked `buf` for `g` and the side's FFT and shared
-            // memory; `mul` holds a plane wherever `flags` name it.
+            // memory; `mul` holds a plane wherever `flags` name it, and its band, the only
+            // source of `STAGE_SAVE` and `STAGE_RESTORE`, a carry of the stack's planes and,
+            // as `BandedTransfer::new` built it, a plane of slots below `nband`.
             unsafe {
                 match side {
-                    Side::N64 => m.optics_stage_64(stream, config, p, plane, scale, ctl, g, flags),
+                    Side::N64 => {
+                        m.optics_stage_64(stream, config, p, plane, scale, ctl, g, flags, band)
+                    }
                     Side::N128 => {
-                        m.optics_stage_128(stream, config, p, plane, scale, ctl, g, flags)
+                        m.optics_stage_128(stream, config, p, plane, scale, ctl, g, flags, band)
                     }
                     Side::N256 => {
-                        m.optics_stage_256(stream, config, p, plane, scale, ctl, g, flags)
+                        m.optics_stage_256(stream, config, p, plane, scale, ctl, g, flags, band)
                     }
                     Side::N512 => {
-                        m.optics_stage_512(stream, config, p, plane, scale, ctl, g, flags)
+                        m.optics_stage_512(stream, config, p, plane, scale, ctl, g, flags, band)
                     }
                 }
             }
         })
     }
+}
+
+/// A line pass's multiplication by `plane` times `scale`, and the band carried around it.
+#[derive(Clone, Copy)]
+struct Mul<'a> {
+    plane: &'a DeviceBuffer<C32>,
+    scale: f32,
+    band: Option<(&'a BandedTransfer, Carried<'a>)>,
+}
+
+impl<'a> Mul<'a> {
+    fn plain(plane: &'a DeviceBuffer<C32>, scale: f32) -> Self {
+        Self {
+            plane,
+            scale,
+            band: None,
+        }
+    }
+}
+
+/// A band's carry in a line pass: saved into ahead of the multiplication, or restored from
+/// after it times the factor.
+#[derive(Clone, Copy)]
+enum Carried<'a> {
+    Save(&'a DeviceBuffer<C32>),
+    Restore(&'a DeviceBuffer<C32>, f32),
 }
 
 /// The launches of the stages on one stack's planes.

@@ -10,6 +10,11 @@
 //! transforms; the in-object propagation of a multislice gap is the same line pass three
 //! times over plain planes.
 //!
+//! Angular spectrum with an evanescent band, where `T` is 0, has `Vᴴ V` the projection off
+//! the band. A line pass under [`STAGE_SAVE`] keeps the band's values on their way into the
+//! forward multiplication in a [`Band`]'s carry, and one under [`STAGE_RESTORE`] writes
+//! them, scaled, over the adjoint multiplication's in the same bins.
+//!
 //! A multislice object is a product per slice with that gap between: [`optics_slice_mul`]
 //! is a slice's product and its adjoint, [`optics_slice_phase`] the exit plane's phase,
 //! which the fused row pass applies only to a single slice, and [`optics_slice_pair`] the
@@ -42,6 +47,27 @@ pub const STAGE_CONJ: u32 = 16;
 pub const STAGE_POST_FWD: u32 = 32;
 /// An inverse FFT of each line after the multiplication; never with `STAGE_POST_FWD`.
 pub const STAGE_POST_INV: u32 = 64;
+/// Ahead of the multiplication, each value on the [`Band`] into its slot of the carry.
+pub const STAGE_SAVE: u32 = 128;
+/// After the multiplication, each value on the [`Band`] replaced by its slot of the carry
+/// times `band.scale`.
+pub const STAGE_RESTORE: u32 = 256;
+
+/// [`Band::slots`] of a pixel off the band.
+pub const OFF_BAND: u32 = u32::MAX;
+
+/// The pixels of a `[ny, nx]` plane a line pass carries, and the carry: pixel `j`'s slot is
+/// `slots[j]`, [`OFF_BAND`] for none, and slot `s` of the stack's plane `p` is `carry[p *
+/// nband + s]`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct Band {
+    pub slots: *const u32,
+    pub carry: *mut f32,
+    pub nband: u32,
+    /// [`STAGE_RESTORE`]'s factor.
+    pub scale: f32,
+}
 
 /// [`optics_slice_mul`], [`optics_slice_phase`]: by the conjugate of the object window or
 /// of the phase.
@@ -75,14 +101,16 @@ pub fn wave_plane(w: WavePlanes, fl: usize, m: usize) -> usize {
 
 /// One line pass in place over the stack's planes of `buf`, `[nf_max * nmode, ny, nx]`: per
 /// line of `N` points the `flags`' FFT (unnormalized, forward `exp(-2 pi i jk / N)`), the
-/// multiplication by the `[ny, nx]` plane `mul`, and their second FFT. Block `(N /
-/// fft_ept(N), bpb)`, grid x `ceil(nf_max * nmode * lines / bpb)` with `lines` the lines of
-/// a plane, dynamic shared memory `bpb` FFTs.
+/// multiplication by the `[ny, nx]` plane `mul` with `band`'s save before it and restore
+/// after, and their second FFT. Block `(N / fft_ept(N), bpb)`, grid x `ceil(nf_max * nmode
+/// * lines / bpb)` with `lines` the lines of a plane, dynamic shared memory `bpb` FFTs.
 ///
 /// # Safety
 ///
 /// `N` is the line length `flags` name in `g`; `buf` holds its shape for `g`, `mul` one
-/// plane under `STAGE_MUL`; `ctl` one entry; launch as above.
+/// plane under `STAGE_MUL`; under `STAGE_SAVE` or `STAGE_RESTORE` `band.slots` one plane of
+/// slots, each [`OFF_BAND`] or below `band.nband`, and `band.carry` `nband` values per
+/// plane of `buf`; `ctl` one entry; launch as above.
 #[device]
 pub unsafe fn stage<const N: u32>(
     buf: *mut f32,
@@ -91,6 +119,7 @@ pub unsafe fn stage<const N: u32>(
     ctl: *const StackCtl,
     g: StackGeom,
     flags: u32,
+    band: Band,
 ) {
     let (_, nf) = unsafe { stack_frames(ctl, g) };
     let cols = flags & STAGE_COLS != 0;
@@ -105,7 +134,8 @@ pub unsafe fn stage<const N: u32>(
     let l = first + thread::threadIdx_y() as u64;
     let live = l < nline;
     let n = g.ny as usize * g.nx as usize;
-    let (plane, i) = ((l / per) as usize * n, (l % per) as usize);
+    let (p, i) = ((l / per) as usize, (l % per) as usize);
+    let plane = p * n;
     let (base, stride) = if cols {
         (i, g.nx as usize)
     } else {
@@ -115,6 +145,11 @@ pub unsafe fn stage<const N: u32>(
     let tpf = N / ept;
     let (b, f) = (thread::threadIdx_y(), thread::threadIdx_x());
     let at = |e: u32| base + (f + e * tpf) as usize * stride;
+    // Value `e`'s index in `band.carry`, on the band.
+    let carried = |e: u32| {
+        let s = unsafe { *band.slots.add(at(e)) };
+        (s != OFF_BAND).then(|| p * band.nband as usize + s as usize)
+    };
     let mut r = [0.0f32; 2 * FFT_EPT_MAX as usize];
     unsafe {
         let smem = DynamicSharedArray::<u8, 16>::get();
@@ -129,6 +164,14 @@ pub unsafe fn stage<const N: u32>(
         } else if flags & STAGE_PRE_INV != 0 {
             block_fft::<N, true>(&mut r, smem, b, f, bpb);
         }
+        if live && flags & STAGE_SAVE != 0 {
+            for e in 0..ept {
+                if let Some(c) = carried(e) {
+                    let k = 2 * e as usize;
+                    store_c(band.carry, c, (r[k], r[k + 1]));
+                }
+            }
+        }
         if live && flags & STAGE_MUL != 0 {
             for e in 0..ept {
                 let k = 2 * e as usize;
@@ -139,6 +182,15 @@ pub unsafe fn stage<const N: u32>(
                 } else {
                     cmul(m, (r[k], r[k + 1]))
                 };
+            }
+        }
+        if live && flags & STAGE_RESTORE != 0 {
+            for e in 0..ept {
+                if let Some(c) = carried(e) {
+                    let k = 2 * e as usize;
+                    let v = load_c(band.carry, c);
+                    (r[k], r[k + 1]) = (band.scale * v.0, band.scale * v.1);
+                }
             }
         }
         if flags & STAGE_POST_FWD != 0 {
@@ -157,7 +209,7 @@ pub unsafe fn stage<const N: u32>(
 
 #[cuda_module]
 pub mod optics_kernels {
-    use super::{SLICE_CONJ, SLICE_OFFSET, SLICE_PROBE, WavePlanes, stage, wave_plane};
+    use super::{Band, SLICE_CONJ, SLICE_OFFSET, SLICE_PROBE, WavePlanes, stage, wave_plane};
     use crate::pixel::*;
     use crate::*;
 
@@ -174,8 +226,9 @@ pub mod optics_kernels {
         ctl: *const StackCtl,
         g: StackGeom,
         flags: u32,
+        band: Band,
     ) {
-        unsafe { stage::<64>(buf, mul, scale, ctl, g, flags) }
+        unsafe { stage::<64>(buf, mul, scale, ctl, g, flags, band) }
     }
 
     /// [`super::stage`] for 128-point lines.
@@ -191,8 +244,9 @@ pub mod optics_kernels {
         ctl: *const StackCtl,
         g: StackGeom,
         flags: u32,
+        band: Band,
     ) {
-        unsafe { stage::<128>(buf, mul, scale, ctl, g, flags) }
+        unsafe { stage::<128>(buf, mul, scale, ctl, g, flags, band) }
     }
 
     /// [`super::stage`] for 256-point lines.
@@ -208,8 +262,9 @@ pub mod optics_kernels {
         ctl: *const StackCtl,
         g: StackGeom,
         flags: u32,
+        band: Band,
     ) {
-        unsafe { stage::<256>(buf, mul, scale, ctl, g, flags) }
+        unsafe { stage::<256>(buf, mul, scale, ctl, g, flags, band) }
     }
 
     /// [`super::stage`] for 512-point lines.
@@ -225,8 +280,9 @@ pub mod optics_kernels {
         ctl: *const StackCtl,
         g: StackGeom,
         flags: u32,
+        band: Band,
     ) {
-        unsafe { stage::<512>(buf, mul, scale, ctl, g, flags) }
+        unsafe { stage::<512>(buf, mul, scale, ctl, g, flags, band) }
     }
 
     /// The index reversal of each of the stack's planes of `buf`, `[nf_max * nmode, ny, nx]`,

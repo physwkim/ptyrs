@@ -3,8 +3,10 @@
 //! intensities and, back through its adjoint, `Uᴴ·w·U` for real detector weights; the
 //! in-object propagation gives angular spectrum and its adjoint. The slice launches give a
 //! multislice object's products, their adjoint, the displaced plane phase of the CPU's
-//! `Optics::moved_quad` and the row transforms. Frames of two modes in stacks of 3 and 2,
-//! the shorter leaving the last frame's planes as they were.
+//! `Optics::moved_quad` and the row transforms. Angular spectrum with an evanescent band
+//! carries the band from the forward stage into its adjoint, which then gives the CPU's
+//! `Uᴴ w U - E`. Frames of two modes in stacks of 3 and 2, the shorter leaving the last
+//! frame's planes, and their carry, as they were.
 
 use std::f64::consts::PI;
 use std::sync::Arc;
@@ -14,8 +16,8 @@ use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 use ptyrs::base::C64;
 use ptyrs::engine::{Optics, PlaneStage, Propagator, Wavefield, shift};
 use ptyrs::gpu::{
-    C32, ExitStage, FrameWaves, Kernels, OpticsKernels, SlicePhase, SliceSource, StackTable,
-    ViewAddr, ViewDims, Views,
+    BandCarry, BandedTransfer, C32, ExitStage, FrameWaves, Kernels, OpticsKernels, SlicePhase,
+    SliceSource, StackTable, ViewAddr, ViewDims, Views,
 };
 
 #[path = "common/worst.rs"]
@@ -80,15 +82,17 @@ fn dft(planes: &[C64], [ny, nx]: [usize; 2], rows: bool, inverse: bool) -> Vec<C
     out
 }
 
-fn up(stream: &CudaStream, v: &[C64]) -> DeviceBuffer<C32> {
-    let host: Vec<C32> = v
-        .iter()
+fn c32(v: &[C64]) -> Vec<C32> {
+    v.iter()
         .map(|c| C32 {
             re: c.re as f32,
             im: c.im as f32,
         })
-        .collect();
-    DeviceBuffer::from_host(stream, &host).unwrap()
+        .collect()
+}
+
+fn up(stream: &CudaStream, v: &[C64]) -> DeviceBuffer<C32> {
+    DeviceBuffer::from_host(stream, &c32(v)).unwrap()
 }
 
 fn down(stream: &CudaStream, b: &DeviceBuffer<C32>) -> Vec<C64> {
@@ -232,6 +236,99 @@ fn exit_stages_give_the_propagators_intensities_and_gram() {
             );
             let err = max_rel(&got[..live * n], &gram[..live * n]);
             assert!(err < 2e-5, "{name}, stack {s}: gram {err:.3e}");
+        }
+    }
+}
+
+#[test]
+fn banded_stage_carries_the_band_into_the_adjoint() {
+    let (stream, ctx, k) = setup();
+    for (shape, z) in [
+        ([64, 64], 1.5e-6),
+        ([64, 128], -1.5e-6),
+        ([128, 64], 1.5e-6),
+    ] {
+        let [ny, nx] = shape;
+        let n = ny * nx;
+        let d = dims(shape);
+        let table = StackTable::new(&stream, &d, &[0..3, 3..5]).unwrap();
+        let w = Wavefield::new(shape, 5e-7, [3e-7, 3e-7], z).unwrap();
+        let p = Propagator::angular_spectrum(&w).unwrap();
+        assert!(!p.adjoint_inverts(), "{shape:?}: no band");
+        let tf = p.transfer().unwrap();
+        let banded = BandedTransfer::new(&stream, &c32(tf)).unwrap();
+        let plain = ExitStage::Transfer(up(&stream, tf));
+        let x = noise(NPLANE * n, 11);
+        let rows = dft(&x, shape, true, false);
+
+        // CPU: U x, and Uᴴ w U x - E x with `E = 1 - Uᴴ U` the projection onto the band.
+        let weight: Vec<f64> = noise(n, 13).iter().map(|c| 1.0 + 0.5 * c.re).collect();
+        let mut det = x.clone();
+        p.forward(&mut det);
+        let mut gram: Vec<C64> = det
+            .iter()
+            .enumerate()
+            .map(|(i, v)| v * weight[i % n])
+            .collect();
+        p.adjoint(&mut gram);
+        let mut kept = det.clone();
+        p.adjoint(&mut kept);
+        let want: Vec<C64> = (gram.iter().zip(&x).zip(&kept))
+            .map(|((g, x), k)| g - (x - k))
+            .collect();
+        let band = max_rel(&gram, &want);
+        assert!(band > 1e-2, "{shape:?}: band {band:.3e} too weak to test");
+
+        let carry0 = noise(banded.carry_len(&d, table.nf_max()), 17);
+        for (s, live) in [(0, NPLANE), (1, 2 * NMODE)] {
+            let mut carry = up(&stream, &carry0);
+            let mut work = up(&stream, &rows);
+            let save = BandCarry::Save(&mut carry);
+            k.exit_banded(&ctx, &d, table.at(s), &banded, &mut work, save)
+                .unwrap();
+            let staged = down(&stream, &work);
+            let mut alone = up(&stream, &rows);
+            k.exit(&ctx, &d, table.at(s), &plain, &mut alone, false)
+                .unwrap();
+            assert_eq!(staged, down(&stream, &alone), "{shape:?}, stack {s}");
+            let past = banded.carry_len(&d, (live / NMODE) as u32);
+            assert_eq!(
+                down(&stream, &carry)[past..],
+                down(&stream, &up(&stream, &carry0))[past..],
+                "{shape:?}, stack {s}: carry past the stack"
+            );
+            let far = scaled(&dft(&staged, shape, false, false), 1.0 / (n as f64).sqrt());
+            let power = |v: &[C64]| -> Vec<C64> {
+                v[..live * n]
+                    .iter()
+                    .map(|c| C64::new(c.norm_sqr(), 0.0))
+                    .collect()
+            };
+            let err = max_rel(&power(&far), &power(&det));
+            assert!(err < 2e-5, "{shape:?}, stack {s}: intensity {err:.3e}");
+
+            let back: Vec<C64> = far
+                .iter()
+                .enumerate()
+                .map(|(i, v)| v * weight[i % n])
+                .collect();
+            let back = scaled(
+                &dft(&back, shape, false, true),
+                (nx as f64 / ny as f64).sqrt(),
+            );
+            let mut work = up(&stream, &back);
+            let restore = BandCarry::Restore(&carry);
+            k.exit_banded(&ctx, &d, table.at(s), &banded, &mut work, restore)
+                .unwrap();
+            let out = down(&stream, &work);
+            assert_eq!(
+                out[live * n..],
+                down(&stream, &up(&stream, &back))[live * n..],
+                "{shape:?}, stack {s}: planes past the stack"
+            );
+            let got = scaled(&dft(&out, shape, true, true), 1.0 / nx as f64);
+            let err = max_rel(&got[..live * n], &want[..live * n]);
+            assert!(err < 2e-5, "{shape:?}, stack {s}: adjoint {err:.3e}");
         }
     }
 }
