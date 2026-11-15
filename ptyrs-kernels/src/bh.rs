@@ -15,6 +15,12 @@
 //! the offsets held (moved, not stepped) `bh_moved_spec` and `bh_moved_far` stand in for
 //! `bh_pos_spec` and `bh_pos_far`, their terms at `a_u = a_v = 0`.
 //!
+//! Through a multislice object under the position model the moved probes enter the first
+//! slice (`BH_ENTRY_MOVED`), changing to second order by `IDFT` of `bh_pos_second`, and the
+//! last slice's plane phase moves with the offsets: `bh_phase_grad` adds its gradient to the
+//! offsets' as a second segment of each frame's partials, `bh_phase_tangent` its terms to
+//! the exit waves' derivatives.
+//!
 //! Under full-object sampling (`ptyrs::engine::Sampling::FullObject`) the exit waves are
 //! `W(O) P`, `W` a view's window of the object at its offsets (`crate::sampling`), read as
 //! blocks `[nobj, nf_max, ny, nx]`, plane `o * nf_max + fl`, through views whose mode `m`
@@ -28,7 +34,7 @@ use cuda_device::{device, thread};
 use cuda_host::cuda_module;
 
 use crate::grad::{GAMMA_CHUNK, ObjProbePtrs};
-use crate::pixel::{PIXEL_THREADS, cmul, fma, freq, ramp, zdiv};
+use crate::pixel::{PIXEL_THREADS, StackGeom, ViewAddr, cmul, fma, freq, load_c, ramp, zdiv};
 
 /// pty-chi's offset on the modelled amplitude `A`.
 pub const BH_EPS: f32 = 1e-8;
@@ -151,14 +157,14 @@ pub struct BhWinFields {
     pub probe: *const f32,
 }
 
-/// The offsets' gradient partials of one slice: `out` `2 * nframe * nslice * nchunk` floats,
-/// a frame's row `nslice` segments of `nchunk` pairs, of which `slice < nslice` writes its own.
+/// The offsets' gradient partials of one segment: `out` `2 * nframe * nseg * nchunk` floats,
+/// a frame's row `nseg` segments of `nchunk` pairs, of which `seg < nseg` writes its own.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct BhPartials {
     pub out: *mut f32,
-    pub slice: u32,
-    pub nslice: u32,
+    pub seg: u32,
+    pub nseg: u32,
 }
 
 /// The windows [`bh_kernels::LoadedModule::bh_win_hess`] reads, each three blocks `[nobj,
@@ -187,15 +193,24 @@ pub struct BhTangents {
     pub mvv: *mut f32,
 }
 
-/// A slice of a multislice object and what enters it: with `probe != 0` the probe array,
-/// each view's wave its probe, else one wave per view as [`BhTangents`]'.
+/// A slice of a multislice object and the waves `entry` entering it, laid out as `kind`
+/// says: [`BH_ENTRY_WAVES`], [`BH_ENTRY_PROBE`] or [`BH_ENTRY_MOVED`].
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct BhSliceIn {
     pub slice: *const f32,
     pub entry: *const f32,
-    pub probe: u32,
+    pub kind: u32,
 }
+
+/// [`BhSliceIn::kind`]: one wave per view, `[nf_max * nmode, ny, nx]` as [`BhTangents`]'.
+pub const BH_ENTRY_WAVES: u32 = 0;
+/// [`BhSliceIn::kind`]: the probe `[nprobe, ny, nx]` in the natural layout, each view's wave
+/// its probe.
+pub const BH_ENTRY_PROBE: u32 = 1;
+/// [`BhSliceIn::kind`]: the moved probes `[nf_max * nprobe, ny, nx]` in `obj_probe_to_psi`'s
+/// layout, plane `fl * nprobe + p`, each view's wave its probe moved with its frame.
+pub const BH_ENTRY_MOVED: u32 = 2;
 
 /// The exit waves' second derivatives along `(u, u)`, `(u, v)` and `(v, v)` that
 /// [`bh_kernels::LoadedModule::bh_sliced_hess_frames`] reads, laid out as [`BhTangents`]';
@@ -217,10 +232,10 @@ pub const BH_STEP: u32 = 4;
 #[cuda_module]
 pub mod bh_kernels {
     use super::{
-        BH_EPS, BH_HESS, BH_STEP, BhDirs, BhFar, BhFields, BhMovedFar, BhMovedProbes, BhMoves,
-        BhNear, BhObs, BhPartials, BhPosDirs, BhSecond, BhSliceIn, BhTangents, BhWinDerivs,
-        BhWinFields, CHUNK_PIXELS, add_im, add_patch, add_re, far_add, far_tail, near_prod,
-        near_sum, ramp_at, rates, re_conj, unramp,
+        BH_ENTRY_PROBE, BH_EPS, BH_HESS, BH_STEP, BhDirs, BhFar, BhFields, BhMovedFar,
+        BhMovedProbes, BhMoves, BhNear, BhObs, BhPartials, BhPosDirs, BhSecond, BhSliceIn,
+        BhTangents, BhWinDerivs, BhWinFields, CHUNK_PIXELS, add_im, add_patch, add_re, entry_wave,
+        far_add, far_tail, near_prod, near_sum, partials_at, ramp_at, rates, re_conj, unramp,
     };
     use crate::grad::{GAMMA_CHUNK, ObjProbePtrs};
     use crate::pixel::*;
@@ -426,17 +441,16 @@ pub mod bh_kernels {
     /// the slice's exit `S w` of the wave `w` entering it changes along `u` by `S l_u + u_S w`
     /// and to second order along `(u, v)` by `S m_uv + u_S l_v + v_S l_u`, with `l_u`, `l_v`,
     /// `m_uv` those of `w` and `u_S`, `v_S` the bilinear windows of `dirs.u.obj`, `dirs.v.obj`
-    /// for view `views[f0 * nmode + kl]`, `S` `s.slice`. With `s.probe != 0` the slice is the
-    /// first, `w` the view's probe of `s.entry`, `l_u = u_scale * dirs.u.probe`, `l_v =
-    /// dirs.v.probe` and `m = 0`, and `t` is only written; else `w` is `s.entry`'s value and
-    /// the rest `t`'s. One thread per element of `[nf_max * nmode, ny, nx]`.
+    /// for view `views[f0 * nmode + kl]`, `S` `s.slice` and `w` the view's wave of `s.entry`.
+    /// Entered by the probe (`BH_ENTRY_PROBE`) the slice is the first, `l_u = u_scale *
+    /// dirs.u.probe`, `l_v = dirs.v.probe` and `m = 0`, and `t` is only written; else the rest
+    /// are `t`'s. One thread per element of `[nf_max * nmode, ny, nx]`.
     ///
     /// # Safety
     ///
-    /// `s.slice` `[nobj, nyo, nxo]`, `dirs` as [`BhDirs`] says (its probe parts unread without
-    /// `s.probe`), `s.entry` `[nprobe, ny, nx]` with `s.probe` else as `t`'s, `t` as
-    /// [`BhTangents`] says, `views` `nframe * nmode` records in range for those shapes, `ctl`
-    /// one entry.
+    /// `s.slice` `[nobj, nyo, nxo]`, `s.entry` as its kind says, `dirs` as [`BhDirs`] says (its
+    /// probe parts unread unless entered by the probe), `t` as [`BhTangents`] says, `views`
+    /// `nframe * nmode` records in range for those shapes, `ctl` one entry.
     #[kernel]
     pub unsafe fn bh_slice_tangent(
         s: BhSliceIn,
@@ -454,7 +468,8 @@ pub mod bh_kernels {
         }
         let (kl, d) = (i / n, i % n);
         let (py, px) = ((d / g.nx as usize) as u32, (d % g.nx as usize) as u32);
-        let j = kl * n + psi_index(py, px, g.ny, g.nx);
+        let at = psi_index(py, px, g.ny, g.nx);
+        let j = kl * n + at;
         let cg = dirs.cg != 0;
         let add = |a: (f32, f32), b: (f32, f32)| (a.0 + b.0, a.1 + b.1);
         let zero = (0.0, 0.0);
@@ -467,18 +482,19 @@ pub mod bh_kernels {
             } else {
                 zero
             };
-            let (e, lu, lv, [muu, muv, mvv]) = if s.probe != 0 {
-                let at = w.probe as usize * n + d;
-                let up = load_c(dirs.u.probe, at);
-                let lv = if cg { load_c(dirs.v.probe, at) } else { zero };
+            let e = entry_wave(s, w, kl, d, at, g);
+            let (lu, lv, [muu, muv, mvv]) = if s.kind == BH_ENTRY_PROBE {
+                let pa = w.probe as usize * n + d;
+                let up = load_c(dirs.u.probe, pa);
+                let lv = if cg { load_c(dirs.v.probe, pa) } else { zero };
                 let lu = (dirs.u_scale * up.0, dirs.u_scale * up.1);
-                (load_c(s.entry, at), lu, lv, [zero; 3])
+                (lu, lv, [zero; 3])
             } else if cg {
                 let m = [load_c(t.muu, j), load_c(t.muv, j), load_c(t.mvv, j)];
-                (load_c(s.entry, j), load_c(t.lu, j), load_c(t.lv, j), m)
+                (load_c(t.lu, j), load_c(t.lv, j), m)
             } else {
                 let m = [load_c(t.muu, j), zero, zero];
-                (load_c(s.entry, j), load_c(t.lu, j), zero, m)
+                (load_c(t.lu, j), zero, m)
             };
             let twice = |a: (f32, f32)| (2.0 * a.0, 2.0 * a.1);
             store_c(t.lu, j, add(cmul(x, lu), cmul(us, e)));
@@ -571,6 +587,153 @@ pub mod bh_kernels {
         }
         let o = unsafe { out.add(BH_HESS as usize * (pos * n.div_ceil(chunk) + c)) };
         unsafe { super::store_sums::<3>((&raw mut RED).cast::<f32>(), acc, o) }
+    }
+
+    /// The offsets' gradient partials of chunk `c = blockIdx.x` of frame `f0 + fl`, `fl =
+    /// blockIdx.y`, through the plane phase of a multislice object's last slice displaced
+    /// with the probe (`optics_slice_phase` under `SLICE_OFFSET`), whose angle at stored pixel
+    /// `(ky, kx)` moves by `−2 quad ρ_a` per pixel of offset `a`, `ρ = (ny freq(ky, ny), nx
+    /// freq(kx, nx))`: with `X = S w` the slice's exit before the phase, `S` `s.slice` and
+    /// `w` the view's wave of `s.entry`, and `r` the residual after its inverse FFT and the
+    /// phase's adjoint, chunk `c`'s pair of the frame's segment `part.seg` `= Σ (quad / π)
+    /// ρ_a Im(conj(r) X)` over the chunk's probe pixels and the frame's views. `2π` times it
+    /// is the phase's part of `∂F/∂d` ([`bh_pos_dots`]).
+    ///
+    /// # Safety
+    ///
+    /// `s.slice` `[nobj, nyo, nxo]`, `s.entry` as its kind says, `r` `[nf_max * nmode, ny,
+    /// nx]`, `views` `nframe * nmode` records in range for those shapes, `part` as
+    /// [`BhPartials`] says, `ctl` one entry; grid `(nchunk, nf_max, 1)`, block
+    /// `(PIXEL_THREADS, 1, 1)`.
+    ///
+    /// [`bh_pos_dots`]: LoadedModule::bh_pos_dots
+    #[kernel]
+    pub unsafe fn bh_phase_grad(
+        s: BhSliceIn,
+        r: *const f32,
+        views: *const ViewAddr,
+        quad: f32,
+        part: BhPartials,
+        ctl: *const StackCtl,
+        g: StackGeom,
+    ) {
+        static mut RED: SharedArray<f32, 512> = SharedArray::UNINIT;
+        let (f0, nf) = unsafe { stack_frames(ctl, g) };
+        let (ny, nx, nmode) = (g.ny, g.nx, g.nmode as usize);
+        let n = ny as usize * nx as usize;
+        let fl = thread::blockIdx_y() as usize;
+        // The whole block leaves together, before its first barrier.
+        if fl >= nf as usize {
+            return;
+        }
+        let c = thread::blockIdx_x() as usize;
+        let chunk = GAMMA_CHUNK as usize;
+        let end = n.min((c + 1) * chunk);
+        let pos = f0 as usize + fl;
+        let mut acc = [0.0f32; 2];
+        let mut d = c * chunk + thread::threadIdx_x() as usize;
+        while d < end {
+            let (py, px) = ((d / nx as usize) as u32, (d % nx as usize) as u32);
+            let (ky, kx) = ((py + ny / 2) % ny, (px + nx / 2) % nx);
+            let at = psi_index(py, px, ny, nx);
+            let mut im = 0.0f32;
+            for m in 0..nmode {
+                let kl = fl * nmode + m;
+                unsafe {
+                    let v = *views.add(pos * nmode + m);
+                    let o = sample_obj(s.slice, v, py, px, g.nyo, g.nxo);
+                    let x = cmul(o, entry_wave(s, v, kl, d, at, g));
+                    im += cmul_conj(load_c(r, kl * n + at), x).1;
+                }
+            }
+            acc[0] += ny as f32 * freq(ky, ny) * im;
+            acc[1] += nx as f32 * freq(kx, nx) * im;
+            d += PIXEL_THREADS as usize;
+        }
+        let q = quad * core::f32::consts::FRAC_1_PI;
+        let o = unsafe { partials_at(part, pos, n.div_ceil(chunk), c) };
+        let acc = [q * acc[0], q * acc[1]];
+        unsafe { super::store_sums::<2>((&raw mut RED).cast::<f32>(), acc, o) }
+    }
+
+    /// The exit waves' derivatives `t` through the plane phase `Φ` of a multislice object's
+    /// last slice displaced with the probe, in place and with `Φ` itself left out: of `ψ =
+    /// Φ X`, `X = S w` the slice's exit before it ([`bh_phase_grad`]'s) with `t` its
+    /// derivatives ([`bh_slice_tangent`]'s), the angle of `Φ` moving along `u` by `S_u = −2
+    /// quad Σ_a ρ_a dirs.ud[2 pos + a]` and with `dirs.cg` along `v` by `S_v`, likewise of
+    /// `dirs.prev[2 order[pos] + a]`, `pos = f0 + kl / nmode`: `m_uu += 2i S_u l_u − S_u² X`,
+    /// with `cg` `m_uv += i S_v l_u + i S_u l_v − S_u S_v X` and `m_vv += 2i S_v l_v − S_v²
+    /// X`, then `l_u += i S_u X` and with `cg` `l_v += i S_v X`. `Φ` comes back with the
+    /// phase on `l_u`, `l_v` and its adjoint on `r`. One thread per element of `[nf_max *
+    /// nmode, ny, nx]`.
+    ///
+    /// # Safety
+    ///
+    /// As [`bh_phase_grad`] for `s` and `views`, `dirs` as [`BhPosDirs`] says, `t` as
+    /// [`BhTangents`] says (`lv`, `muv`, `mvv` unread without `cg`), `ctl` one entry.
+    ///
+    /// [`bh_phase_grad`]: LoadedModule::bh_phase_grad
+    /// [`bh_slice_tangent`]: LoadedModule::bh_slice_tangent
+    #[kernel]
+    pub unsafe fn bh_phase_tangent(
+        s: BhSliceIn,
+        dirs: BhPosDirs,
+        t: BhTangents,
+        views: *const ViewAddr,
+        quad: f32,
+        ctl: *const StackCtl,
+        g: StackGeom,
+    ) {
+        let (f0, nf) = unsafe { stack_frames(ctl, g) };
+        let (ny, nx, nmode) = (g.ny, g.nx, g.nmode as usize);
+        let n = ny as usize * nx as usize;
+        let i = global_index();
+        if i >= nf as usize * nmode * n {
+            return;
+        }
+        let (kl, d) = (i / n, i % n);
+        let (py, px) = ((d / nx as usize) as u32, (d % nx as usize) as u32);
+        let (ky, kx) = ((py + ny / 2) % ny, (px + nx / 2) % nx);
+        let at = psi_index(py, px, ny, nx);
+        let j = kl * n + at;
+        let pos = f0 as usize + kl / nmode;
+        let cg = dirs.cg != 0;
+        // The angle's rates per pixel of offset.
+        let (sy, sx) = (
+            -2.0 * quad * (ny as f32 * freq(ky, ny)),
+            -2.0 * quad * (nx as f32 * freq(kx, nx)),
+        );
+        let add = |a: (f32, f32), b: (f32, f32)| (a.0 + b.0, a.1 + b.1);
+        // `i a z + b x` of the rates `a`, `b`.
+        let turn =
+            |a: f32, z: (f32, f32), b: f32, x: (f32, f32)| (b * x.0 - a * z.1, b * x.1 + a * z.0);
+        unsafe {
+            let v = *views.add(f0 as usize * nmode + kl);
+            let o = sample_obj(s.slice, v, py, px, g.nyo, g.nxo);
+            let x = cmul(o, entry_wave(s, v, kl, d, at, g));
+            let ud = dirs.ud.add(2 * pos);
+            let su = *ud * sy + *ud.add(1) * sx;
+            let lu = load_c(t.lu, j);
+            store_c(
+                t.muu,
+                j,
+                add(load_c(t.muu, j), turn(2.0 * su, lu, -su * su, x)),
+            );
+            if cg {
+                let prev = dirs.prev.add(2 * *dirs.order.add(pos) as usize);
+                let sv = *prev * sy + *prev.add(1) * sx;
+                let lv = load_c(t.lv, j);
+                let cross = add(turn(sv, lu, -su * sv, x), turn(su, lv, 0.0, x));
+                store_c(t.muv, j, add(load_c(t.muv, j), cross));
+                store_c(
+                    t.mvv,
+                    j,
+                    add(load_c(t.mvv, j), turn(2.0 * sv, lv, -sv * sv, x)),
+                );
+                store_c(t.lv, j, add(lv, turn(sv, x, 0.0, x)));
+            }
+            store_c(t.lu, j, add(lu, turn(su, x, 0.0, x)));
+        }
     }
 
     /// One batch's step from the `ndots` pairs of `dots` (`ptyrs_tile::TileDots::dots`: `(⟨g,
@@ -748,14 +911,14 @@ pub mod bh_kernels {
     /// blockIdx.y`: with `Y` the forward-FFT'd [`bh_obj_conj`] of the stack, `e` and `(fy,
     /// fx)` the frame's ramp and frequencies at FFT index `k` (`ramp_at`) and `A_p`
     /// view `v`'s probe spectrum, `im = Σ_v Im(conj(Y_v) e A_p)` over the frame's views and
-    /// `out[2p .. 2p + 2] = Σ_k (fy im, fx im)` over `k` in `c * GAMMA_CHUNK .. min((c + 1) *
-    /// GAMMA_CHUNK, n)`, `p = (f0 + fl) * nchunk + c`. `2π` times their sum over `c` is
-    /// `∂F/∂d` ([`bh_pos_dots`]).
+    /// chunk `c`'s pair of the frame's segment `part.seg` `= Σ_k (fy im, fx im)` over `k` in
+    /// `c * GAMMA_CHUNK .. min((c + 1) * GAMMA_CHUNK, n)`. `2π` times the sum of the frame's
+    /// row is `∂F/∂d` ([`bh_pos_dots`]).
     ///
     /// # Safety
     ///
     /// `y` `[nf_max * nmode, ny, nx]`, `a` `[nprobe, ny, nx]`, `offsets` `[nframe, 2]` by epoch
-    /// position, `views` the epoch's, `out` `2 * nframe * nchunk` floats, `ctl` one entry; grid
+    /// position, `views` the epoch's, `part` as [`BhPartials`] says, `ctl` one entry; grid
     /// `(nchunk, nf_max, 1)`, block `(PIXEL_THREADS, 1, 1)`.
     ///
     /// [`bh_obj_conj`]: LoadedModule::bh_obj_conj
@@ -766,7 +929,7 @@ pub mod bh_kernels {
         a: *const f32,
         offsets: *const f32,
         views: *const ViewAddr,
-        out: *mut f32,
+        part: BhPartials,
         ctl: *const StackCtl,
         g: StackGeom,
     ) {
@@ -828,12 +991,13 @@ pub mod bh_kernels {
                 }
             }
         }
-        let o = unsafe { out.add(2 * (pos * n.div_ceil(chunk) + c)) };
+        let o = unsafe { partials_at(part, pos, n.div_ceil(chunk), c) };
         unsafe { super::store_sums::<2>((&raw mut RED).cast::<f32>(), acc, o) }
     }
 
     /// The offsets' part of one batch's displacement and dots: per position `p` of `span` and
-    /// axis `a`, `g = 2π Σ_c grads[2 (p nchunk + c) + a]` ([`bh_pos_grad`]), `d.ud[2p + a] =
+    /// axis `a`, `g = 2π Σ_c grads[2 (p nchunk + c) + a]` ([`bh_pos_grad`]; `span.nchunk` the
+    /// chunks of all of a frame's segments), `d.ud[2p + a] =
     /// scale g` and the pair `out[0..2] = (Σ g ud, Σ g prev[2 order[p] + a])`, the second 0
     /// without `d.cg`: the offsets' terms of `(⟨g, Pg⟩, ⟨g, D′⟩)`.
     ///
@@ -918,6 +1082,57 @@ pub mod bh_kernels {
             if mv.dirs.cg != 0 {
                 let av = load_c(mv.av, p);
                 store_c(lv, t, near_prod(e, (av.0 - a_v * a.1, av.1 + a_v * a.0)));
+            }
+        }
+    }
+
+    /// The spectra of the moved probes' second-order changes along `(u, u)` and with `cg`
+    /// `(u, v)` and `(v, v)`, as [`bh_pos_spec`] lays out and names the first-order ones:
+    /// `muu = e (2i a_u s Au_p − a_u² A_p)`, `muv = e (i a_v s Au_p + i a_u Av_p − a_u a_v
+    /// A_p)` and `mvv = e (2i a_v Av_p − a_v² A_p)`, the last two only with `cg`. One thread
+    /// per element of `[nf_max * nmode, ny, nx]`.
+    ///
+    /// # Safety
+    ///
+    /// As [`bh_pos_spec`], `muu`, `muv`, `mvv` as its `lu`.
+    ///
+    /// [`bh_pos_spec`]: LoadedModule::bh_pos_spec
+    #[kernel]
+    pub unsafe fn bh_pos_second(
+        mv: BhMoves,
+        views: *const ViewAddr,
+        muu: *mut f32,
+        muv: *mut f32,
+        mvv: *mut f32,
+        ctl: *const StackCtl,
+        g: StackGeom,
+    ) {
+        let (f0, nf) = unsafe { stack_frames(ctl, g) };
+        let (ny, nx, nmode) = (g.ny, g.nx, g.nmode as usize);
+        let n = ny as usize * nx as usize;
+        let t = global_index();
+        if t >= nf as usize * nmode * n {
+            return;
+        }
+        let (kl, k) = (t / n, t % n);
+        let pos = f0 as usize + kl / nmode;
+        // `i a z + b x` of the rates `a`, `b`.
+        let turn =
+            |a: f32, z: (f32, f32), b: f32, x: (f32, f32)| (b * x.0 - a * z.1, b * x.1 + a * z.0);
+        unsafe {
+            let p = (*views.add(f0 as usize * nmode + kl)).probe as usize * n + k;
+            let (e, fr) = ramp_at(mv.offsets, pos, k, ny, nx);
+            let (a_u, a_v) = rates(mv.dirs, pos, fr);
+            let (a, au) = (load_c(mv.a, p), load_c(mv.au, p));
+            let s = mv.probe_scale;
+            let su = (s * au.0, s * au.1);
+            store_c(muu, t, cmul(e, turn(2.0 * a_u, su, -a_u * a_u, a)));
+            if mv.dirs.cg != 0 {
+                let av = load_c(mv.av, p);
+                let z = turn(a_v, su, -a_u * a_v, a);
+                let z = (z.0 - a_u * av.1, z.1 + a_u * av.0);
+                store_c(muv, t, cmul(e, z));
+                store_c(mvv, t, cmul(e, turn(2.0 * a_v, av, -a_v * a_v, a)));
             }
         }
     }
@@ -1274,14 +1489,13 @@ pub mod bh_kernels {
     }
 
     /// The object gradient's patches and the offsets' gradient partials of chunk `c =
-    /// blockIdx.x` of frame `f0 + fl`, `fl = blockIdx.y`, under full-object sampling, for
-    /// slice `part.slice`: at probe pixel `d` of the chunk and per object mode `o`, `G = Σ_p
-    /// conj(q P_p) r_m`, `m = o nprobe + p`, into `patch[k]`, `k = (o nf_max + fl) n + d`, and
-    /// `part.out[2p .. 2p + 2] = Σ Re(conj(G) win[(1 + a) blk + k]) / 2π` over the chunk's
-    /// pixels and the object modes, `blk` a block's values, `p = ((f0 + fl) part.nslice +
-    /// part.slice) nchunk + c`: the slice's segment of the frame's row, which [`bh_pos_dots`]
-    /// sums with the other slices' to `∂F/∂d`. Patches of frames outside the stack are not
-    /// written.
+    /// blockIdx.x` of frame `f0 + fl`, `fl = blockIdx.y`, under full-object sampling, for a
+    /// slice whose segment is `part.seg`: at probe pixel `d` of the chunk and per object mode
+    /// `o`, `G = Σ_p conj(q P_p) r_m`, `m = o nprobe + p`, into `patch[k]`, `k = (o nf_max +
+    /// fl) n + d`, and chunk `c`'s pair of the frame's segment `= Σ Re(conj(G) win[(1 + a) blk
+    /// + k]) / 2π` over the chunk's pixels and the object modes, `blk` a block's values, which
+    /// [`bh_pos_dots`] sums with the other segments' to `∂F/∂d`. Patches of frames outside the
+    /// stack are not written.
     ///
     /// # Safety
     ///
@@ -1336,8 +1550,7 @@ pub mod bh_kernels {
             d += PIXEL_THREADS as usize;
         }
         let s = 0.5 * core::f32::consts::FRAC_1_PI;
-        let row = pos * part.nslice as usize + part.slice as usize;
-        let o = unsafe { part.out.add(2 * (row * n.div_ceil(chunk) + c)) };
+        let o = unsafe { partials_at(part, pos, n.div_ceil(chunk), c) };
         let acc = [s * acc[0], s * acc[1]];
         unsafe { super::store_sums::<2>((&raw mut RED).cast::<f32>(), acc, o) }
     }
@@ -1617,6 +1830,41 @@ pub(crate) unsafe fn ramp_at(
     let (dy, dx) = unsafe { (*offsets.add(2 * pos), *offsets.add(2 * pos + 1)) };
     let e = cmul(ramp(dy, ky, ny), ramp(dx, kx, nx));
     (e, (freq(ky, ny), freq(kx, nx)))
+}
+
+/// Chunk `c`'s pair in `part.out` of position `pos`'s segment `part.seg`, of `nchunk` pairs.
+///
+/// # Safety
+///
+/// `part` as [`BhPartials`] says, `pos` an epoch position, `c < nchunk`.
+#[device]
+unsafe fn partials_at(part: BhPartials, pos: usize, nchunk: usize, c: usize) -> *mut f32 {
+    let row = pos * part.nseg as usize + part.seg as usize;
+    unsafe { part.out.add(2 * (row * nchunk + c)) }
+}
+
+/// The wave of view `v`, plane `kl` of the stack, entering slice `s` at natural pixel `d`,
+/// stored at `at`, its `psi_index`.
+///
+/// # Safety
+///
+/// `s.entry` as its kind says for `g`, `v` in range for it.
+#[device]
+unsafe fn entry_wave(
+    s: BhSliceIn,
+    v: ViewAddr,
+    kl: usize,
+    d: usize,
+    at: usize,
+    g: StackGeom,
+) -> (f32, f32) {
+    let n = g.ny as usize * g.nx as usize;
+    let i = match s.kind {
+        BH_ENTRY_PROBE => v.probe as usize * n + d,
+        BH_ENTRY_MOVED => (kl / g.nmode as usize * g.nprobe as usize + v.probe as usize) * n + at,
+        _ => kl * n + at,
+    };
+    unsafe { load_c(s.entry, i) }
 }
 
 /// The rates `(a_u, a_v)` of position `pos` at frequencies `(fy, fx)`: `a = −2π (d_y fy +

@@ -247,6 +247,19 @@ fn rpie_matches_cpu() {
     }
 }
 
+/// A batch past u32 frames is the whole scan, as the CPU's.
+#[test]
+fn rpie_batch_past_u32_matches_cpu() {
+    let params = RpieParams {
+        batch_size: 1 << 32,
+        ..ptychi::RPIE
+    };
+    check(
+        compare(M1, 2, true, Params::Rpie(params), 10),
+        [1e-4, 1e-4, 1e-4],
+    );
+}
+
 /// ML's gradients of the same estimate, in `f32` against `f64`, by M1's launches and by the
 /// fused passes, these also modelling a position.
 #[test]

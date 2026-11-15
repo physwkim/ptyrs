@@ -348,6 +348,11 @@ impl<T> LlkRing<T> {
         &mut self.dev
     }
 
+    /// [`RingDevice::pixel_frames`], read without the device half's lend.
+    pub fn pixel_frames(&self) -> &DeviceBuffer<u32> {
+        self.dev.pixel_frames()
+    }
+
     /// Begins the next record, of frames `0 .. nframe` under `tag`, for the launches enqueued
     /// on `ctx`'s stream from here; its [`RecordWriter::end`] counts it, and a writer dropped
     /// unended counts nothing.

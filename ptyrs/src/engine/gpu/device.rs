@@ -1,9 +1,9 @@
 //! The device state a captured cycle addresses, and the graph captured from it, under one
 //! owner. Nothing outside this module can reach a field of [`Device`] or of a stack's
 //! buffers, and nothing here replaces one after [`Device::new`] but
-//! [`Device::set_features`], which drops every graph before and recaptures the LLK pass's
-//! after: a graph replays on the buffers the eager cycle would use, and other buffers mean
-//! another `Device`, or other features, which start with no graph. The device also owns the
+//! [`Device::set_features`] and [`Device::set_sampling`], which drop every graph, the LLK
+//! pass's recaptured at its next pass: a graph replays on the buffers the eager cycle would
+//! use, and other buffers mean another `Device`, or other features, which start with no graph. The device also owns the
 //! LLK ring, which counts a record once per enqueued run of a cycle or pass that ends one:
 //! an eager run through [`LlkRing::record`], a graph's replay through [`LlkRing::replay`]
 //! with the [`Ended`] its capture left.
@@ -30,13 +30,13 @@ use cuda_async::cuda_graph::CudaGraph;
 use cuda_async::device_operation::{DeviceOp, ExecutionContext};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 
-use super::bh::{BhMoved, BhSliced};
+use super::bh::{BhMoved, BhSliced, update_sums};
 use super::lsqml::{LsqmlBufs, LsqmlState, Pre};
 use super::ml::{MlMoved, MlPosition, MlWindows};
 use super::rpie::RpieMoved;
 use super::{
-    Cut, Epoch, Frames, GpuOptions, StackRule, Streamed, Tag, batch_stacks, plane_bytes, plane_len,
-    to_c32, to_u32, wave_bytes,
+    Cut, Epoch, Frames, GpuOptions, StackRule, Streamed, Tag, batch_frames, batch_stacks,
+    plane_bytes, plane_len, to_c32, to_u32, wave_bytes,
 };
 use crate::engine::features::{POSITION_LIMIT, POSITION_STEP};
 use crate::engine::sampling::{OBJ_HELD, OBJ_PCG};
@@ -44,6 +44,7 @@ use crate::engine::{
     ApParams, BhParams, BhStep, DmParams, EngineError, Feature, Features, LsqmlParams, LsqmlStep,
     MlParams, PlaneStage, RaarParams, RpieParams, Sampling,
 };
+use crate::fault;
 
 /// What [`Device::new`] uploads: the propagator's stage, the views' addresses, the counts
 /// and the starting arrays.
@@ -71,7 +72,7 @@ pub(super) struct SliceUploads {
 }
 
 /// A multislice object's device state past its first slice, which is [`Device::obj`]; only
-/// LSQML, BH and the LLK pass run it, and [`Device::one_slice`] gates every other pass.
+/// LSQML, BH and the LLK pass run it; every other call checks [`Device::one_unitary`] first.
 struct Slices {
     deeper: Vec<DeviceBuffer<C32>>,
     gaps: Vec<DeviceBuffer<C32>>,
@@ -194,11 +195,9 @@ pub(super) struct Device {
     half: Option<f32>,
     norms: NormBufs,
     ring: LlkRing<Tag>,
-    use_graph: bool,
+    graphs: Graphs,
     /// The epochs run since the parameters last changed, all of one [`Epoch::run`].
     runs: Vec<EpochRun>,
-    /// With graphs, the LLK pass's graph.
-    llk_graph: Option<Captured>,
     /// ML's state, built by the first ML call and replaced only for another position model.
     ml: Option<Box<MlState>>,
     /// BH's state, built by the first BH call and replaced for another batch size, and for
@@ -419,6 +418,26 @@ struct Reshared {
     waves: Option<[DeviceBuffer<C32>; 2]>,
 }
 
+/// What [`Device::set_features`] models, built by [`Device::build_features`].
+pub(super) struct NewFeatures(FeaturesUpdate);
+
+enum FeaturesUpdate {
+    /// The values of the features already set, refined or held as they are: scale,
+    /// background, position.
+    InPlace([Option<Vec<f32>>; 3]),
+    /// The buffers of other features, or another refine, with the shared passes their position
+    /// takes unless the current ones serve it.
+    Replace(Box<(FeatureBufs, Option<Reshared>)>),
+}
+
+/// What [`Device::set_sampling`] enters, built by [`Device::build_sampling`].
+pub(super) struct NewSampling {
+    sampling: Sampling,
+    /// Of another sampling while a position is modelled, what its offsets move under it, with
+    /// the shared passes it takes unless the current ones serve it.
+    moved: Option<(Mover, Option<Reshared>)>,
+}
+
 /// A per-frame intensity scale `[nframe]` and, refined, its far sums `[nframe]`.
 struct ScaleBufs {
     values: DeviceBuffer<f32>,
@@ -430,7 +449,7 @@ struct ScaleBufs {
 struct BackgroundBufs {
     values: DeviceBuffer<f32>,
     sums: Option<BackgroundSums>,
-    /// A copy of the ring's [`RingDevice::pixel_frames`], final once [`Device::new`] has
+    /// A copy of the ring's [`LlkRing::pixel_frames`], final once [`Device::new`] has
     /// counted every frame.
     nobs: DeviceBuffer<u32>,
     /// `[1]`, written by [`FeaturesMut::background_photons`].
@@ -833,7 +852,7 @@ pub(super) struct AnySlices;
 /// sums the passes write; `K`, [`OneSlice`] or [`AnySlices`], is what the lend may read of
 /// the object.
 pub(super) struct Modelled<'b, K> {
-    pub model: Model<'b>,
+    model: Model<'b>,
     sampled: Option<Sampled<'b>>,
     scale: Option<&'b mut DeviceBuffer<ScalePartial>>,
     background: Option<&'b mut BackgroundSums>,
@@ -864,6 +883,17 @@ struct Sampled<'b> {
     sampler: &'b mut ObjectSampler,
     spectra: &'b DeviceBuffer<C32>,
     offsets: &'b DeviceBuffer<f32>,
+}
+
+/// What a [`Modelled`] lend's position model moves, by [`Modelled::moves`].
+#[derive(Clone, Copy)]
+pub(super) enum Moves<'b> {
+    /// Nothing: no position.
+    Nothing,
+    /// The probe, by its shift ([`Mover::Probe`]).
+    Probe(Shift<'b>),
+    /// The object, sampled at the offsets ([`Mover::Object`]).
+    Object,
 }
 
 /// The sums of the position model, lent by [`Modelled`]: the shifted probe's under
@@ -1082,6 +1112,24 @@ impl<'b> Modelled<'b, AnySlices> {
                 deeper,
             },
         ))
+    }
+}
+
+impl<'b, K> Modelled<'b, K> {
+    /// The model the passes that compare with the counts read, its shift none while the
+    /// lend samples the object ([`Self::moves`]).
+    pub fn model(&self) -> Model<'b> {
+        self.model
+    }
+
+    /// What the lend's position model moves, as [`FeaturesMut::lend`] took it from one
+    /// [`Mover`], which gives the shift or the sampler, never both.
+    pub fn moves(&self) -> Moves<'b> {
+        match (self.model.shift, &self.sampled) {
+            (Some(shift), _) => Moves::Probe(shift),
+            (None, Some(_)) => Moves::Object,
+            (None, None) => Moves::Nothing,
+        }
     }
 }
 
@@ -1443,7 +1491,7 @@ pub(super) struct M1Bufs<'a> {
 struct Shared {
     /// The scratch's buffers.
     streamed: Vec<Streamed>,
-    /// AP's, the LLK pass's, ML's gradient's and opening scale's stacks.
+    /// AP's, the LLK pass's, and ML's gradient's, position sums' and opening scale's stacks.
     cut: Cut,
     passes: Passes,
     /// One stack's LLK partials, on their way into the ring.
@@ -1477,11 +1525,11 @@ impl Shared {
         // refined, their derivatives over `y` (3 to 5) and `x` (6 to 8); two memsets zero the
         // window sums (9, 10), which the fused passes (11 to 14) add to; a refined position's sums
         // (15) read the work planes and the three blocks, the probe sums (16) the work planes and
-        // the windows; placing the window sums back takes six launches (17 to 22). The LLK pass
-        // and DM's and RAAR's updates run a subset. Of a multislice object, the two waves its
-        // slices pass on, numbered after; under the windows, as the LLK pass runs a stack, the
-        // sampler's calls write each slice's windows in turn (from 23), which the slice passes
-        // after them read beside the waves.
+        // the windows; placing the window sums back takes six launches (17 to 22). The LLK pass,
+        // ML's gradient and position sums and DM's and RAAR's updates run a subset. Of a
+        // multislice object, the two waves its slices pass on, numbered after; under the
+        // windows, as the LLK pass runs a stack, the sampler's calls write each slice's windows
+        // in turn (from 23), which the slice passes after them read beside the waves.
         let shift = matches!(scratch, PositionScratch::Shift { .. });
         let wave = wave_bytes(dims);
         let mut streamed = match scratch {
@@ -1746,6 +1794,45 @@ struct EpochRun {
 struct Captured {
     graph: CudaGraph<()>,
     ended: Option<Ended>,
+}
+
+impl Captured {
+    /// Enqueues the graph on `ctx`'s stream, counting the record it ends, if any, in `ring`
+    /// under `tag`.
+    fn replay(
+        &self,
+        ring: &mut LlkRing<Tag>,
+        ctx: &ExecutionContext,
+        nframe: u32,
+        tag: Tag,
+    ) -> Result<(), EngineError> {
+        // SAFETY: the context holds the replay's leases on every captured buffer until the
+        // stream has run it, so no other stream can touch them meanwhile.
+        let launch = || Ok(unsafe { self.graph.launch().execute(ctx) }.map_err(GpuError::from)?);
+        match &self.ended {
+            Some(ended) => ring.replay(ctx, ended, tag, nframe, launch),
+            None => launch(),
+        }
+    }
+}
+
+/// Whether the passes replay captured graphs ([`GpuOptions::graph`]).
+enum Graphs {
+    /// Every pass runs eagerly.
+    Off,
+    /// Every pass replays a graph. The LLK pass's lives with the device state: none only while
+    /// its capture is pending, from a replacement of the buffers it binds until the next LLK
+    /// pass captures it.
+    On { llk: Option<Captured> },
+}
+
+impl Graphs {
+    /// Leaves the LLK pass's capture pending, as the buffers its graph binds are replaced.
+    fn pend_llk(&mut self) {
+        if let Self::On { llk } = self {
+            *llk = None;
+        }
+    }
 }
 
 /// A cycle's [`Epoch`] and the buffers only it uses, built together, so a graph captured
@@ -2045,177 +2132,7 @@ impl BhState {
         scratch: Option<MovedScratch>,
     ) -> Result<Self, EngineError> {
         let dims = views.dims();
-        // The batch's two loops in turn. Without the position: psi (`obj_probe_to_psi` 0, the
-        // transform, the residual 2), r (the adjoint, the sums 4), lu and lv (`far` 5, the
-        // transforms, `hess_frames` 8). With it: the moved probes (`shifted_probe` 0,
-        // `shift_w`, `obj_wave_to_psi` 2), psi (the transform, the residual 4), r (the
-        // adjoint, `shifted_psi_sums` from 6, `obj_conj` 11), y (the transform, `pos_grad`
-        // 13); then lu and lv (`pos_spec` 14, the inverses, `pos_near`, the transforms,
-        // `pos_far` 22), r (`pos_near` 17, `obj_conj` 20) and y (the transform, `pos_far`).
-        // Under full-object sampling: the estimate's windows (three sampler calls from 0, 3, 6
-        // writing blocks 0 to 2), psi (`obj_probe_to_psi` 9, the transform, the residual 11),
-        // r (the adjoint, `psi_to_probe` 13, `win_grad` 14, which reads blocks 1 and 2), the
-        // patches (`win_grad`, `place` 15 to 20: zeroing, a chunk's embed 16, transform and
-        // accumulate 18, the inverse and the add); then the windows of `u_O` and `v_O` (six
-        // sampler calls from 21), `win_lift` 39, lu and lv (`far` 40, the transforms,
-        // `hess_frames` 43), the second derivatives (three sampler calls from 44) and r and
-        // the derivatives' windows to `win_hess` 53. Through a multislice object the first
-        // loop hands on two waves per pass boundary, the second lu, lv and the three second
-        // derivatives of the exit waves from slice to slice. Under full-object sampling as
-        // well, through two slices: a slice's window (sampler call 0, 5) ahead of its wave
-        // (`slice_mul` 3, 8; the gap 4), psi (the transform, the residual 10), r (the adjoint,
-        // `slice_pair` 12, `slice_adjoint` 26), then per slice from the last its derivatives'
-        // windows (13 and 16, 29 and 32) to `win_grad` (19, 35), whose patches `place` takes
-        // (20, 36), and the work wave from `slice_pair` to `win_grad` and from `slice_adjoint`
-        // 26 to the first slice's `psi_to_probe` 28 and `win_grad`; then per slice the windows
-        // of `u_O` and `v_O` (42 and 45, 55 and 58) to `win_lift` and `slice_tangent` (49,
-        // 62), the second's window and entering wave read there again by `slice_adjoint` 89
-        // and `slice_pair` 66, lu, lv and the three second derivatives from 49 to
-        // `sliced_hess_frames` 65, and per slice from the last its derivatives' windows (four
-        // calls from 67, 91) and second derivatives (three from 79, 103) to `win_hess` (88,
-        // 112), r to `slice_adjoint` 89, the work wave from `slice_pair` 66 and from it to the
-        // first slice's `win_hess`. A slice past the second repeats the second's passes,
-        // booked once. Held, the offsets' passes drop out and the others keep their numbers:
-        // r ends at `shifted_psi_sums`' 7, and lu and lv at `moved_far`, in `pos_far`'s place
-        // right after their transforms (20); under full-object sampling only block 0's windows
-        // are sampled, `win_obj_grad` takes `win_grad`'s place, and `win_lift`, the second
-        // derivatives and `win_hess` drop out, through a multislice object everything from 66.
-        let wave = wave_bytes(dims);
-        let refined = scratch.is_some_and(|s| s.refined);
-        let streamed = match scratch.map(|s| s.sampling) {
-            None => {
-                let mut s = vec![
-                    Streamed::new(wave, 0..=2),
-                    Streamed::new(wave, 2..=4),
-                    Streamed::new(wave, 5..=8),
-                    Streamed::new(wave, 5..=8),
-                ];
-                if deeper > 0 {
-                    s.extend([Streamed::new(wave, 5..=8); 3]);
-                }
-                s
-            }
-            Some(MovedSampling::FullObject { held, scratch, acc }) if deeper > 0 => {
-                let win = Windows::bytes(dims);
-                let calls: &[_] = if refined {
-                    &[
-                        (0, 28),
-                        (5, 26),
-                        (13, 19),
-                        (16, 19),
-                        (29, 35),
-                        (32, 35),
-                        (42, 49),
-                        (45, 49),
-                        (55, 62),
-                        (58, 62),
-                        (67, 88),
-                        (70, 88),
-                        (73, 88),
-                        (76, 88),
-                        (79, 88),
-                        (82, 88),
-                        (85, 88),
-                        (91, 112),
-                        (94, 112),
-                        (97, 112),
-                        (100, 112),
-                        (103, 112),
-                        (106, 112),
-                        (109, 112),
-                    ]
-                } else {
-                    &[(0, 28), (5, 26), (42, 49), (45, 49), (55, 62), (58, 62)]
-                };
-                let mut s: Vec<_> = (calls.iter())
-                    .flat_map(|&(p, read)| Streamed::chunked(held, p..=p + 2, &[(win, read)], &[]))
-                    .collect();
-                for p in [20, 36] {
-                    s.extend(Streamed::chunked(acc, p..=p + 5, &[], &[(win, p - 1)]));
-                    s.push(Streamed::fixed(scratch, p + 1..=p + 3));
-                }
-                s.extend([
-                    Streamed::new(wave, 3..=12),
-                    Streamed::new(wave, 8..=10),
-                    Streamed::new(wave, 10..=26),
-                    Streamed::new(wave, 12..=19),
-                    Streamed::new(wave, 26..=35),
-                ]);
-                if refined {
-                    s.extend([
-                        Streamed::new(win, 62..=89),
-                        Streamed::new(wave, 62..=66),
-                        Streamed::new(wave, 65..=89),
-                        Streamed::new(wave, 66..=88),
-                        Streamed::new(wave, 89..=112),
-                    ]);
-                }
-                s.extend([Streamed::new(wave, 49..=65); 5]);
-                s
-            }
-            Some(MovedSampling::FullObject { held, scratch, acc }) => {
-                let win = Windows::bytes(dims);
-                // Each sampler call's first pass, and the last to read the block it writes.
-                let calls: &[_] = if refined {
-                    &[
-                        (0, 13),
-                        (3, 14),
-                        (6, 14),
-                        (21, 43),
-                        (24, 53),
-                        (27, 53),
-                        (30, 43),
-                        (33, 53),
-                        (36, 53),
-                        (44, 53),
-                        (47, 53),
-                        (50, 53),
-                    ]
-                } else {
-                    &[(0, 13), (21, 43), (30, 43)]
-                };
-                let mut s: Vec<_> = (calls.iter())
-                    .flat_map(|&(p, read)| Streamed::chunked(held, p..=p + 2, &[(win, read)], &[]))
-                    .collect();
-                s.extend(Streamed::chunked(acc, 15..=20, &[], &[(win, 14)]));
-                s.extend([
-                    Streamed::fixed(scratch, 16..=18),
-                    Streamed::new(wave, 9..=11),
-                    Streamed::new(wave, 11..=14),
-                    Streamed::new(wave, 40..=43),
-                    Streamed::new(wave, 40..=43),
-                ]);
-                if refined {
-                    s.push(Streamed::new(wave, 43..=53));
-                }
-                s
-            }
-            Some(MovedSampling::Patch) => {
-                let mut s = vec![
-                    Streamed::new(plane_bytes::<C32>(dims, dims.nprobe), 0..=2),
-                    Streamed::new(wave, 2..=4),
-                ];
-                if refined {
-                    s.extend([
-                        Streamed::new(wave, 4..=11),
-                        Streamed::new(wave, 11..=13),
-                        Streamed::new(wave, 14..=22),
-                        Streamed::new(wave, 14..=22),
-                        Streamed::new(wave, 17..=20),
-                        Streamed::new(wave, 20..=22),
-                    ]);
-                } else {
-                    s.extend([
-                        Streamed::new(wave, 4..=7),
-                        Streamed::new(wave, 14..=20),
-                        Streamed::new(wave, 14..=20),
-                    ]);
-                }
-                s.extend(Streamed::shifted_psi_sums(dims, 6));
-                s
-            }
-        };
-        let frames = rule.frames(&streamed)?;
+        let frames = rule.frames(&Self::streamed(dims, deeper, scratch));
         // Only the shift's sums borrow the shared scratch.
         let frames = match scratch {
             Some(
@@ -2262,6 +2179,235 @@ impl BhState {
             moved,
             sliced,
         })
+    }
+
+    /// The buffers of a stack's two loops through an object of `deeper` slices past the first,
+    /// under `scratch`'s position model if any, by the passes that touch them.
+    fn streamed(dims: &ViewDims, deeper: usize, scratch: Option<MovedScratch>) -> Vec<Streamed> {
+        // The batch's two loops in turn. Without the position: psi (`obj_probe_to_psi` 0, the
+        // transform, the residual 2), r (the adjoint, the sums 4), lu and lv (`far` 5, the
+        // transforms, `hess_frames` 8). With it: the moved probes (`shifted_probe` 0,
+        // `shift_w`, `obj_wave_to_psi` 2), psi (the transform, the residual 4), r (the
+        // adjoint, `shifted_psi_sums` from 6, `obj_conj` 11), y (the transform, `pos_grad`
+        // 13); then lu and lv (`pos_spec` 14, the inverses, `pos_near`, the transforms,
+        // `pos_far` 22), r (`pos_near` 17, `obj_conj` 20) and y (the transform, `pos_far`).
+        // Under full-object sampling: the estimate's windows (three sampler calls from 0, 3, 6
+        // writing blocks 0 to 2), psi (`obj_probe_to_psi` 9, the transform, the residual 11),
+        // r (the adjoint, `psi_to_probe` 13, `win_grad` 14, which reads blocks 1 and 2), the
+        // patches (`win_grad`, `place` 15 to 20: zeroing, a chunk's embed 16, transform and
+        // accumulate 18, the inverse and the add); then the windows of `u_O` and `v_O` (six
+        // sampler calls from 21), `win_lift` 39, lu and lv (`far` 40, the transforms,
+        // `hess_frames` 43), the second derivatives (three sampler calls from 44) and r and
+        // the derivatives' windows to `win_hess` 53. Through a multislice object, two slices: the
+        // wave entering the second (`slice_mul` 0, the gap, `slice_mul` 2, `slice_pair` 8), psi
+        // (the phase, the transform, the residual 5), r (the adjoint, the phase's, `slice_pair`,
+        // `slice_adjoint` 10), the work wave from `slice_pair` to `psi_to_obj` 9 and from
+        // `slice_adjoint` (the gap) to `psi_to_obj` and `psi_to_probe` 13; then lu, lv and the
+        // three second derivatives from `slice_tangent` 14 through the gaps and the second's
+        // `slice_tangent` 20, the phases and the transforms to `sliced_hess_frames` 25. Under
+        // full-object sampling as well, through two slices: a slice's window (sampler call 0, 5)
+        // ahead of its wave (`slice_mul` 3, 8; the gap 4), psi (the transform, the residual 10), r
+        // (the adjoint, `slice_pair` 12, `slice_adjoint` 26), then per slice from the last its
+        // derivatives' windows (13 and 16, 29 and 32) to `win_grad` (19, 35), whose patches
+        // `place` takes (20, 36), and the work wave from `slice_pair` to `win_grad` and from
+        // `slice_adjoint` 26 to the first slice's `psi_to_probe` 28 and `win_grad`; then per slice
+        // the windows of `u_O` and `v_O` (42 and 45, 55 and 58) to `win_lift` and `slice_tangent`
+        // (49, 62), the second's window and entering wave read there again by `slice_adjoint` 89
+        // and `slice_pair` 66, lu, lv and the three second derivatives from 49 to
+        // `sliced_hess_frames` 65, and per slice from the last its derivatives' windows (four
+        // calls from 67, 91) and second derivatives (three from 79, 103) to `win_hess` (88,
+        // 112), r to `slice_adjoint` 89, the work wave from `slice_pair` 66 and from it to the
+        // first slice's `win_hess`. With the moved probes through two slices: the moved probes
+        // (`shifted_probe` 0, `shift_w`, `slice_mul` 2), the wave entering the second slice
+        // (the gap 3, `slice_mul` 4, `phase_grad` 10, `slice_pair` 11), psi (the phase 5, the
+        // transform, the residual 7), r (the adjoint, the phase's, `phase_grad`, `slice_pair`,
+        // `slice_adjoint` 13), the work wave from `slice_pair` to `psi_to_obj` 12 and from
+        // `slice_adjoint` (the gap) to `shifted_psi_sums` from 15 and `obj_conj` 20, y (the
+        // transform, `pos_grad` 22); then lu and lv (`pos_spec` 23, the inverses, the
+        // slices' `slice_tangent` 30 and 36 with the gaps between, `phase_tangent` 37, the
+        // phase, the transforms, `sliced_hess_frames` 42), the three second derivatives alike
+        // from `pos_second` 24, and the entering wave again from 36 to 37. A slice past the
+        // second repeats the second's passes and holds its entering wave, and under full-object
+        // sampling its window, to the backward sweep: each is booked across the second's passes
+        // from its first forward one to past its last backward one (1 to 12; with the moved probes
+        // 3 to 15; under full-object sampling 4 to 28 and, refined, through the second loop's 50 to
+        // 91), so a boundary books the most that any slice's turn at it holds. Held, the offsets'
+        // passes drop out and the others keep their numbers: r ends at `shifted_psi_sums`' 7, and
+        // lu and lv at `moved_far`, in `pos_far`'s place right after their transforms (20); under
+        // full-object sampling only block 0's windows are sampled, `win_obj_grad` takes
+        // `win_grad`'s place, and `win_lift`, the second derivatives and `win_hess` drop out,
+        // through a multislice object everything from 66; with the moved probes through a
+        // multislice object the work wave ends at `shifted_psi_sums`' 16, `moved_spec` and the
+        // second derivatives' zeroing take `pos_spec`'s and `pos_second`'s places, and the
+        // entering wave is not read again.
+        let wave = wave_bytes(dims);
+        let refined = scratch.is_some_and(|s| s.refined);
+        // The slices past the second.
+        let more = deeper.saturating_sub(1);
+        match scratch.map(|s| s.sampling) {
+            None if deeper > 0 => {
+                let mut s = vec![
+                    Streamed::new(wave, 0..=8),
+                    Streamed::new(wave, 2..=5),
+                    Streamed::new(wave, 5..=10),
+                    Streamed::new(wave, 8..=9),
+                    Streamed::new(wave, 10..=13),
+                ];
+                s.extend(vec![Streamed::new(wave, 1..=12); more]);
+                s.extend([Streamed::new(wave, 14..=25); 5]);
+                s
+            }
+            None => vec![
+                Streamed::new(wave, 0..=2),
+                Streamed::new(wave, 2..=4),
+                Streamed::new(wave, 5..=8),
+                Streamed::new(wave, 5..=8),
+            ],
+            Some(MovedSampling::FullObject { held, scratch, acc }) if deeper > 0 => {
+                let win = Windows::bytes(dims);
+                let calls: &[_] = if refined {
+                    &[
+                        (0, 28),
+                        (5, 26),
+                        (13, 19),
+                        (16, 19),
+                        (29, 35),
+                        (32, 35),
+                        (42, 49),
+                        (45, 49),
+                        (55, 62),
+                        (58, 62),
+                        (67, 88),
+                        (70, 88),
+                        (73, 88),
+                        (76, 88),
+                        (79, 88),
+                        (82, 88),
+                        (85, 88),
+                        (91, 112),
+                        (94, 112),
+                        (97, 112),
+                        (100, 112),
+                        (103, 112),
+                        (106, 112),
+                        (109, 112),
+                    ]
+                } else {
+                    &[(0, 28), (5, 26), (42, 49), (45, 49), (55, 62), (58, 62)]
+                };
+                let mut s: Vec<_> = (calls.iter())
+                    .flat_map(|&(p, read)| Streamed::chunked(held, p..=p + 2, &[(win, read)], &[]))
+                    .collect();
+                for p in [20, 36] {
+                    s.extend(Streamed::chunked(acc, p..=p + 5, &[], &[(win, p - 1)]));
+                    s.push(Streamed::fixed(scratch, p + 1..=p + 3));
+                }
+                s.extend([
+                    Streamed::new(wave, 3..=12),
+                    Streamed::new(wave, 8..=10),
+                    Streamed::new(wave, 10..=26),
+                    Streamed::new(wave, 12..=19),
+                    Streamed::new(wave, 26..=35),
+                ]);
+                s.extend(vec![Streamed::new(wave + win, 4..=28); more]);
+                if refined {
+                    s.extend([
+                        Streamed::new(win, 62..=89),
+                        Streamed::new(wave, 62..=66),
+                        Streamed::new(wave, 65..=89),
+                        Streamed::new(wave, 66..=88),
+                        Streamed::new(wave, 89..=112),
+                    ]);
+                    s.extend(vec![Streamed::new(wave + win, 50..=91); more]);
+                }
+                s.extend([Streamed::new(wave, 49..=65); 5]);
+                s
+            }
+            Some(MovedSampling::FullObject { held, scratch, acc }) => {
+                let win = Windows::bytes(dims);
+                // Each sampler call's first pass, and the last to read the block it writes.
+                let calls: &[_] = if refined {
+                    &[
+                        (0, 13),
+                        (3, 14),
+                        (6, 14),
+                        (21, 43),
+                        (24, 53),
+                        (27, 53),
+                        (30, 43),
+                        (33, 53),
+                        (36, 53),
+                        (44, 53),
+                        (47, 53),
+                        (50, 53),
+                    ]
+                } else {
+                    &[(0, 13), (21, 43), (30, 43)]
+                };
+                let mut s: Vec<_> = (calls.iter())
+                    .flat_map(|&(p, read)| Streamed::chunked(held, p..=p + 2, &[(win, read)], &[]))
+                    .collect();
+                s.extend(Streamed::chunked(acc, 15..=20, &[], &[(win, 14)]));
+                s.extend([
+                    Streamed::fixed(scratch, 16..=18),
+                    Streamed::new(wave, 9..=11),
+                    Streamed::new(wave, 11..=14),
+                    Streamed::new(wave, 40..=43),
+                    Streamed::new(wave, 40..=43),
+                ]);
+                if refined {
+                    s.push(Streamed::new(wave, 43..=53));
+                }
+                s
+            }
+            Some(MovedSampling::Patch) if deeper > 0 => {
+                let mut s = vec![
+                    Streamed::new(plane_bytes::<C32>(dims, dims.nprobe), 0..=2),
+                    Streamed::new(wave, 2..=11),
+                    Streamed::new(wave, 4..=7),
+                    Streamed::new(wave, 7..=13),
+                    Streamed::new(wave, 11..=12),
+                ];
+                s.extend(vec![Streamed::new(wave, 3..=15); more]);
+                if refined {
+                    s.extend([
+                        Streamed::new(wave, 13..=20),
+                        Streamed::new(wave, 20..=22),
+                        Streamed::new(wave, 36..=37),
+                    ]);
+                } else {
+                    s.push(Streamed::new(wave, 13..=16));
+                }
+                s.extend(Streamed::shifted_psi_sums(dims, 15));
+                s.extend([Streamed::new(wave, 23..=42); 2]);
+                s.extend([Streamed::new(wave, 24..=42); 3]);
+                s
+            }
+            Some(MovedSampling::Patch) => {
+                let mut s = vec![
+                    Streamed::new(plane_bytes::<C32>(dims, dims.nprobe), 0..=2),
+                    Streamed::new(wave, 2..=4),
+                ];
+                if refined {
+                    s.extend([
+                        Streamed::new(wave, 4..=11),
+                        Streamed::new(wave, 11..=13),
+                        Streamed::new(wave, 14..=22),
+                        Streamed::new(wave, 14..=22),
+                        Streamed::new(wave, 17..=20),
+                        Streamed::new(wave, 20..=22),
+                    ]);
+                } else {
+                    s.extend([
+                        Streamed::new(wave, 4..=7),
+                        Streamed::new(wave, 14..=20),
+                        Streamed::new(wave, 14..=20),
+                    ]);
+                }
+                s.extend(Streamed::shifted_psi_sums(dims, 6));
+                s
+            }
+        }
     }
 
     /// The sampling its views read the object under, if the state is the position model's.
@@ -2352,7 +2498,7 @@ impl RpieScratch {
         one: OneSlice,
     ) -> Result<Self, EngineError> {
         let dims = views.dims();
-        let batch = to_u32("batch_size", params.batch_size)?;
+        let batch = batch_frames(dims, params.batch_size);
         let (cut, _) = batch_stacks(stream, dims, batch, batch)?;
         let len = cut.wave_len(dims);
         let plans = cut.plans(stream, dims)?;
@@ -2575,9 +2721,12 @@ impl Device {
             shared,
             carried: None,
             half,
-            use_graph: options.graph,
+            graphs: if options.graph {
+                Graphs::On { llk: None }
+            } else {
+                Graphs::Off
+            },
             runs: Vec::new(),
-            llk_graph: None,
             ml: None,
             bh_state: None,
             lsqml: None,
@@ -2588,32 +2737,29 @@ impl Device {
         };
         let ctx = dev.context();
         dev.ring.device().count(&ctx, 0..dims.nframe, &dev.counts)?;
-        dev.capture_llk()?;
+        if let Graphs::On { llk: None } = dev.graphs {
+            dev.graphs = Graphs::On {
+                llk: Some(dev.capture_llk()?),
+            };
+        }
         Ok(dev)
     }
 
-    /// With graphs, captures the LLK pass's graph.
-    fn capture_llk(&mut self) -> Result<(), EngineError> {
-        if self.use_graph {
-            self.llk_graph = Some(self.capture(|bufs, passes, ring, ended, ctx| {
-                bufs.forward_llk(ctx, passes, ring.capture(ended))
-            })?);
-        }
-        Ok(())
+    /// Captures the LLK pass's graph.
+    fn capture_llk(&mut self) -> Result<Captured, EngineError> {
+        self.capture(|bufs, passes, ring, ended, ctx| {
+            bufs.forward_llk(ctx, passes, ring.capture(ended))
+        })
     }
 
-    /// Models `features`, which the caller checked against the scan, from here on: the
-    /// values of the features already set, refined or held as they are, are written in
-    /// place; other features, or another refine, replace the buffers, and so first drop
-    /// every graph, which addresses them, and then recapture the LLK pass's. Only the fused
-    /// passes model features; a position also takes their scratch ([`PositionScratch`]), by
-    /// what its offsets move and whether they are refined, so a position added, dropped or
-    /// switched between refined and held recuts the stacks that stream that scratch and drops
-    /// the states cut against it ([`Self::reshare`]). Nothing changes if a buffer cannot be
-    /// built; if the recapture fails, `features` stay modelled and [`Self::llk_pass`] runs
-    /// eagerly until a later recapture; a failed write in place may leave the values before it
-    /// written.
-    pub fn set_features(&mut self, features: &Features) -> Result<(), EngineError> {
+    /// The buffers [`Self::set_features`] models `features` with, which the caller checked
+    /// against the scan; fails, building nothing, unless these passes model them (only the
+    /// fused ones model any) and every buffer is built. The values of the features already set,
+    /// refined or held as they are, are kept to write in place; other features, or another
+    /// refine, take buffers of their own, and a position also takes the fused passes' scratch
+    /// ([`PositionScratch`]), by what its offsets move and whether they are refined, so one
+    /// added, dropped or switched between refined and held takes the stacks recut for it.
+    pub fn build_features(&self, features: &Features) -> Result<NewFeatures, EngineError> {
         if matches!(self.shared.passes, Passes::M1 { .. }) && *features != Features::default() {
             return Err(EngineError::Invalid(
                 "features need GpuOptions { fused: true, .. }".into(),
@@ -2628,18 +2774,9 @@ impl Device {
                 .map(|d| d.iter().flatten().map(|&x| x as f32).collect())
         });
         let refine = |f: &Option<Feature<Vec<f32>>>| f.as_ref().map(|f| f.refine);
-        let have = &mut self.features;
-        if have.refine() == [refine(&scale), refine(&background), refine(&position)] {
-            if let (Some(b), Some(v)) = (&mut have.scale, scale) {
-                b.values.copy_from_host(&self.stream, &v.values)?;
-            }
-            if let (Some(b), Some(v)) = (&mut have.background, background) {
-                b.values.copy_from_host(&self.stream, &v.values)?;
-            }
-            if let (Some(b), Some(v)) = (&mut have.position, position) {
-                b.offsets.copy_from_host(&self.stream, &v.values)?;
-            }
-            return Ok(());
+        if self.features.refine() == [refine(&scale), refine(&background), refine(&position)] {
+            let values = [scale, background, position].map(|f| f.map(|f| f.values));
+            return Ok(NewFeatures(FeaturesUpdate::InPlace(values)));
         }
         let stream = &self.stream;
         let dims = self.views.dims();
@@ -2667,7 +2804,7 @@ impl Device {
             .transpose()?;
         let background = background
             .map(|v| {
-                let pixel_frames = self.ring.device().pixel_frames();
+                let pixel_frames = self.ring.pixel_frames();
                 let mut nobs = DeviceBuffer::zeroed(stream, pixel_frames.len())?;
                 nobs.copy_from_device_async(pixel_frames, stream)?;
                 let sums = (v.refine)
@@ -2699,17 +2836,45 @@ impl Device {
                 })
             })
             .transpose()?;
-        self.runs.clear();
-        self.llk_graph = None;
-        self.features = FeatureBufs {
+        let built = FeatureBufs {
             scale,
             background,
             position,
         };
-        if let Some(r) = shared {
-            self.reshare(r);
+        Ok(NewFeatures(FeaturesUpdate::Replace(Box::new((
+            built, shared,
+        )))))
+    }
+
+    /// Models the features `new` was built for from here on: the values of the features
+    /// already set are written in place; other features' buffers replace the current ones, and
+    /// so drop every graph, which addresses them, with the shared passes they take
+    /// ([`Self::reshare`]). A failed write in place may leave the values before it written.
+    pub fn set_features(&mut self, new: NewFeatures) -> Result<(), EngineError> {
+        match new.0 {
+            FeaturesUpdate::InPlace([scale, background, position]) => {
+                let have = &mut self.features;
+                if let (Some(b), Some(v)) = (&mut have.scale, scale) {
+                    b.values.copy_from_host(&self.stream, &v)?;
+                }
+                fault::at(fault::Exit::FeatureCopy)?;
+                if let (Some(b), Some(v)) = (&mut have.background, background) {
+                    b.values.copy_from_host(&self.stream, &v)?;
+                }
+                if let (Some(b), Some(v)) = (&mut have.position, position) {
+                    b.offsets.copy_from_host(&self.stream, &v)?;
+                }
+            }
+            FeaturesUpdate::Replace(built) => {
+                let (features, shared) = *built;
+                self.runs.clear();
+                self.graphs.pend_llk();
+                self.features = features;
+                if let Some(r) = shared {
+                    self.reshare(r);
+                }
+            }
         }
-        self.capture_llk()?;
         Ok(())
     }
 
@@ -2731,6 +2896,7 @@ impl Device {
         let waves = (self.slices.as_ref())
             .map(|_| Slices::waves(stream, &shared.cut, dims))
             .transpose()?;
+        fault::at(fault::Exit::Reshare)?;
         Ok(Some(Reshared { shared, waves }))
     }
 
@@ -2788,39 +2954,43 @@ impl Device {
         self.sampling
     }
 
-    /// Enters a position's offsets as `sampling` from here on. Another sampling drops ML's,
-    /// BH's and LSQML's states built under a position model, which the next call of their
-    /// algorithm rebuilds under it, and, while a position is modelled, replaces what its
-    /// offsets move, with the shared passes as [`Self::set_features`] does, and every run,
-    /// whose graphs bind them; then it recaptures the LLK pass's graph. Nothing changes if a
-    /// buffer cannot be built; if the recapture fails, `sampling` stays entered with all of
-    /// the above, and [`Self::llk_pass`] runs eagerly until a later recapture.
-    pub fn set_sampling(&mut self, sampling: Sampling) -> Result<(), EngineError> {
-        if sampling == self.sampling {
-            return Ok(());
-        }
-        let mover = (self.features.position.as_ref())
+    /// What [`Self::set_sampling`] enters `sampling` with: of another sampling while a
+    /// position is modelled, what its offsets move under it, with the shared passes as
+    /// [`Self::build_features`] builds them; fails, building nothing, if a buffer cannot be
+    /// built.
+    pub fn build_sampling(&self, sampling: Sampling) -> Result<NewSampling, EngineError> {
+        let moved = (self.features.position.as_ref())
+            .filter(|_| sampling != self.sampling)
             .map(|_| {
-                let dims = self.views.dims();
-                Mover::new(&self.stream, &self.kernels, dims, sampling)
+                let mover = Mover::new(&self.stream, &self.kernels, self.views.dims(), sampling)?;
+                let shared = self.reshared(Some(&mover), self.features.position_refined())?;
+                Ok::<_, EngineError>((mover, shared))
             })
             .transpose()?;
-        let refined = self.features.position_refined();
-        let shared = self.reshared(mover.as_ref(), refined)?;
-        self.sampling = sampling;
+        Ok(NewSampling { sampling, moved })
+    }
+
+    /// Enters a position's offsets as `new`'s sampling from here on. Another sampling drops
+    /// ML's, BH's and LSQML's states built under a position model, which the next call of
+    /// their algorithm rebuilds under it, and, while a position is modelled, replaces what its
+    /// offsets move, with the shared passes as [`Self::set_features`] does, and every run,
+    /// whose graphs bind them.
+    pub fn set_sampling(&mut self, new: NewSampling) {
+        if new.sampling == self.sampling {
+            return;
+        }
+        self.sampling = new.sampling;
         if self.ml.as_ref().is_some_and(|s| s.position.is_some()) {
             self.ml = None;
         }
-        if let Some((p, mover)) = self.features.position.as_mut().zip(mover) {
+        if let Some((p, (mover, shared))) = self.features.position.as_mut().zip(new.moved) {
             p.mover = mover;
             self.runs.clear();
-            self.llk_graph = None;
+            self.graphs.pend_llk();
             if let Some(r) = shared {
                 self.reshare(r);
             }
-            self.capture_llk()?;
         }
-        Ok(())
     }
 
     /// Whether an intensity scale or a detector background is modelled, refined or held.
@@ -2887,6 +3057,13 @@ impl Device {
         }
     }
 
+    /// [`Self::one_slice`] and [`Self::unitary`] for `what`: checked before every call that
+    /// enqueues a pass but LSQML's, BH's and the LLK pass changes anything.
+    pub fn one_unitary(&self, what: &str) -> Result<(), EngineError> {
+        self.one_slice(what)?;
+        self.unitary(what)
+    }
+
     /// Overwrites the object in place, so every captured graph reads the new values.
     pub fn write_object(&mut self, obj: &[C32]) -> Result<(), EngineError> {
         Ok(self.obj.copy_from_host(&self.stream, obj)?)
@@ -2901,8 +3078,8 @@ impl Device {
 
     /// Overwrites the object and probe in place.
     pub fn write_arrays(&mut self, obj: &[C32], probe: &[C32]) -> Result<(), EngineError> {
-        self.one_slice("the phase ramp's removal")?;
         self.write_object(obj)?;
+        fault::at(fault::Exit::RampWrite)?;
         self.probe.copy_from_host(&self.stream, probe)?;
         Ok(())
     }
@@ -3086,18 +3263,21 @@ impl Device {
         };
         let done = at.and_then(|at| {
             stage(self)?;
+            fault::at(fault::Exit::Launch)?;
             let run = &mut runs[at];
             let tag = Some((cycle, epoch.algorithm()));
-            self.summing(|dev| match &run.graph {
-                Some(c) => dev.replay(c, tag),
-                None => {
-                    let (ctx, nframe) = (dev.context(), dev.dims().nframe);
-                    let records = run.cycle.records();
-                    let (mut bufs, mut passes, ring) = dev.lend();
-                    let llk = records
-                        .then(|| ring.record(&ctx, tag, nframe))
-                        .transpose()?;
-                    Ok(bufs.cycle(&ctx, &mut passes, llk, &mut run.cycle)?)
+            self.summing(|dev| {
+                let (ctx, nframe) = (dev.context(), dev.dims().nframe);
+                match &run.graph {
+                    Some(c) => c.replay(&mut dev.ring, &ctx, nframe, tag),
+                    None => {
+                        let records = run.cycle.records();
+                        let (mut bufs, mut passes, ring) = dev.lend();
+                        let llk = records
+                            .then(|| ring.record(&ctx, tag, nframe))
+                            .transpose()?;
+                        Ok(bufs.cycle(&ctx, &mut passes, llk, &mut run.cycle)?)
+                    }
                 }
             })
         });
@@ -3105,22 +3285,26 @@ impl Device {
         done
     }
 
-    /// Enqueues the LLK record of the current estimate under `tag`, from the graph captured
-    /// in [`Self::new`] or eagerly without graphs.
+    /// Enqueues the LLK record of the current estimate under `tag`: with graphs, from the
+    /// LLK pass's graph, captured first while its capture is pending, which a failed capture
+    /// leaves pending; eagerly without.
     pub fn llk_pass(&mut self, tag: Tag) -> Result<(), EngineError> {
-        let graph = self.llk_graph.take();
-        let done = match &graph {
-            Some(c) => self.replay(c, tag),
-            None => {
-                let (ctx, nframe) = (self.context(), self.dims().nframe);
+        let (ctx, nframe) = (self.context(), self.dims().nframe);
+        match &self.graphs {
+            Graphs::Off => {
                 let (mut bufs, mut passes, ring) = self.lend();
                 ring.record(&ctx, tag, nframe)
                     .map_err(EngineError::from)
                     .and_then(|rec| Ok(bufs.forward_llk(&ctx, &mut passes, rec)?))
             }
-        };
-        self.llk_graph = graph;
-        done
+            Graphs::On { llk: Some(c) } => c.replay(&mut self.ring, &ctx, nframe, tag),
+            Graphs::On { llk: None } => {
+                let c = self.capture_llk()?;
+                let done = c.replay(&mut self.ring, &ctx, nframe, tag);
+                self.graphs = Graphs::On { llk: Some(c) };
+                done
+            }
+        }
     }
 
     /// The LLK records counted since the last flush, in order; waits for their copies.
@@ -3130,6 +3314,7 @@ impl Device {
 
     /// The buffers of `epoch`'s cycle, and with graphs its graph, captured from them.
     fn new_run(&mut self, epoch: Epoch) -> Result<EpochRun, EngineError> {
+        fault::at(fault::Exit::RunBuild)?;
         let what = format!("{:?}", epoch.algorithm());
         let mut cycle = match epoch {
             Epoch::Ap { params, llk } => {
@@ -3182,13 +3367,12 @@ impl Device {
                 Cycle::Lsqml { params, pre }
             }
         };
-        let graph = if self.use_graph {
-            Some(self.capture(|bufs, passes, ring, ended, ctx| {
+        let graph = match self.graphs {
+            Graphs::On { .. } => Some(self.capture(|bufs, passes, ring, ended, ctx| {
                 let llk = cycle.records().then(|| ring.capture(ended));
                 bufs.cycle(ctx, passes, llk, &mut cycle)
-            })?)
-        } else {
-            None
+            })?),
+            Graphs::Off => None,
         };
         Ok(EpochRun { cycle, graph })
     }
@@ -3228,16 +3412,10 @@ impl Device {
     /// those of another sampling, so no graph captured from it survives.
     fn build_bh(&mut self, params: &BhParams) -> Result<(), EngineError> {
         let dims = self.dims();
-        let size = to_u32("batch_size", params.batch_size.min(dims.nframe as usize))?;
+        let size = batch_frames(&dims, params.batch_size);
         let reads = self.features.positioned().then_some(self.sampling);
         let [.., position] = self.features.refine();
         let deeper = self.deeper().len();
-        if reads == Some(Sampling::Patch) && deeper > 0 {
-            return Err(EngineError::Invalid(format!(
-                "BH with the position model under Sampling::Patch runs one object slice, got {}",
-                deeper + 1
-            )));
-        }
         if (self.bh_state.as_ref())
             .is_none_or(|s| s.size != size || s.reads() != reads || s.position() != position)
         {
@@ -3258,10 +3436,7 @@ impl Device {
     /// Builds the [`LsqmlState`] for `params`' batch size, the position model, refined or
     /// held, and its sampling unless it is built, replaced as [`Self::build_bh`] replaces BH's.
     fn build_lsqml(&mut self, params: &LsqmlParams) -> Result<(), EngineError> {
-        let size = to_u32(
-            "batch_size",
-            params.batch_size.min(self.dims().nframe as usize),
-        )?;
+        let size = batch_frames(&self.dims(), params.batch_size);
         let reads = self.features.positioned().then_some(self.sampling);
         let [.., position] = self.features.refine();
         if (self.lsqml.as_ref())
@@ -3311,7 +3486,6 @@ impl Device {
     /// PyNX `ScaleObjProbe(absolute=False)` enqueued eagerly: `Σ|O|` and `Σ|P|` balanced,
     /// `O P` unchanged.
     pub fn balance_obj_probe(&mut self) -> Result<(), EngineError> {
-        self.one_slice("the object and probe balance")?;
         let ctx = self.context();
         let (mut bufs, _, _) = self.lend();
         Ok(bufs.scale_obj_probe(&ctx, None)?)
@@ -3378,8 +3552,11 @@ impl Device {
         Ok(r)
     }
 
+    /// Zeroes [`update_sums`].
     fn zero_sums(&mut self, ctx: &ExecutionContext) -> Result<(), GpuError> {
-        for sums in [&mut self.obj_sums, &mut self.probe_sums] {
+        let sliced = self.bh_state.as_deref_mut().and_then(|s| s.sliced.as_mut());
+        let grads = sliced.map_or(&mut [][..], BhSliced::grads);
+        for sums in update_sums(&mut self.obj_sums, &mut self.probe_sums, grads) {
             crate::gpu::zero(ctx, &mut sums.num)?;
             crate::gpu::zero(ctx, &mut sums.den)?;
         }
@@ -3400,24 +3577,13 @@ impl Device {
         ) -> Result<(), GpuError>
         + Send,
     ) -> Result<Captured, EngineError> {
+        fault::at(fault::Exit::Capture)?;
         let side = self.kernels.context().new_stream()?;
         let (mut bufs, mut passes, ring) = self.lend();
         let mut ended = None;
         let op = crate::gpu::record(|ctx| f(&mut bufs, &mut passes, ring, &mut ended, ctx));
         let graph = CudaGraph::capture(side, op).map_err(GpuError::from)?;
         Ok(Captured { graph, ended })
-    }
-
-    /// Enqueues `c`'s graph on the stream, counting the record it ends, if any, under `tag`.
-    fn replay(&mut self, c: &Captured, tag: Tag) -> Result<(), EngineError> {
-        let (ctx, nframe) = (self.context(), self.dims().nframe);
-        // SAFETY: the context holds the replay's leases on every captured buffer until the
-        // stream has run it, so no other stream can touch them meanwhile.
-        let launch = || Ok(unsafe { c.graph.launch().execute(&ctx) }.map_err(GpuError::from)?);
-        match &c.ended {
-            Some(ended) => self.ring.replay(&ctx, ended, tag, nframe, launch),
-            None => launch(),
-        }
     }
 }
 
@@ -3487,17 +3653,23 @@ impl<'a> Bufs<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cuda_async::error::DeviceError;
 
     use crate::base::required_obj_shape;
     use crate::base::{C64, Counts, Geometry, Object, Positions, Probe, Scan, Stack};
-    use crate::engine::{Backend, Feature, Features, GpuPtycho, MlParams, Params, Step};
-    use crate::fault::{self, Exit};
+    use crate::engine::{
+        Backend, BhParams, Feature, Features, GpuPtycho, Optics, Params, Step, Wavefield,
+    };
     use crate::live::farfield::{Ptycho, PtychoSpec, ScanPath};
 
     /// An engine on a simulated raster of 36 points, its object flat: 32-pixel frames, or the
     /// fused passes' smallest, 64.
     fn engine(ctx: &Arc<CudaContext>, graph: bool, fused: bool) -> GpuPtycho {
+        let (scan, object, probe, options) = start(graph, fused);
+        GpuPtycho::new(ctx, &scan, object, probe, options).unwrap()
+    }
+
+    /// [`engine`]'s scan, object, probe and options.
+    fn start(graph: bool, fused: bool) -> (Scan, Object, Probe, GpuOptions) {
         let n = if fused { 64 } else { 32 };
         let p = Ptycho::new(PtychoSpec {
             n,
@@ -3532,7 +3704,7 @@ mod tests {
             fused,
             psi_f16: false,
         };
-        GpuPtycho::new(ctx, &scan, object, probe, options).unwrap()
+        (scan, object, probe, options)
     }
 
     /// What a call through [`Device::summing`] added to the update sums before failing never
@@ -3564,7 +3736,7 @@ mod tests {
                 }
                 e
             });
-            let r = failed.dev.summing(|dev| {
+            let r = failed.dev.ungated().summing(|dev| {
                 for sums in [&mut dev.obj_sums, &mut dev.probe_sums] {
                     let num = vec![C32 { re: 1.0, im: 1.0 }; sums.num.len()];
                     sums.num.copy_from_host(&dev.stream, &num)?;
@@ -3617,241 +3789,161 @@ mod tests {
         }
     }
 
-    /// A call failing at an exit after its record's advance keeps that record under its
-    /// cycle's tag, and its retry records the cycle again: AP's cycle before and after its
-    /// update sums are applied, ML's gradient pass and the features' step. The failed
-    /// engine's history is the failed record, then those of an engine that applied what the
-    /// failed call did (the cycle after its sums are applied; ML's photon scaling, which every
-    /// ML call starts with) and ran the retry, whose arrays it ends with bit for bit. Under
-    /// graphs the exits run only in the capture, which fails and counts nothing.
+    /// What a failed call through [`Device::summing`] added to BH's sums of a multislice
+    /// object's slices past the first never reaches the next: a BH epoch after it, launched or
+    /// replayed, is bit for bit that of an engine it never ran on.
     #[test]
-    fn a_call_failing_after_its_advance_keeps_its_record() {
+    fn a_failed_summing_call_leaves_bh_no_slice_sums() {
         let ctx = CudaContext::new(0).expect("GPU 0");
-        let ap = ApParams {
-            obj_inertia: Some(0.01),
-            probe_inertia: Some(0.01),
-            calc_llk: 1,
-            zero_phase_ramp: false,
+        let params = BhParams {
+            batch_size: 12,
+            probe_rho: 0.01,
+            position_rho: 0.1,
+            seed: 7,
         };
-        let ml = MlParams {
-            update_object: true,
-            update_probe: true,
-            calc_llk: 1,
-            zero_phase_ramp: false,
-        };
-        let background = Features {
-            background: Some(Feature::refined(vec![1.0; 64 * 64])),
-            ..Features::default()
-        };
-        let run = |e: &mut GpuPtycho, exit: Exit, ncycle: usize| match exit {
-            Exit::MlGrad => e.ml(&ml, ncycle),
-            _ => e.ap(&ap, ncycle),
-        };
-        let bits = |e: &GpuPtycho| {
-            let (o, p) = (e.object().unwrap(), e.probe().unwrap());
-            let px = o.as_slice().iter().chain(p.as_slice());
-            px.flat_map(|c| [c.re.to_bits(), c.im.to_bits()])
-                .collect::<Vec<_>>()
-        };
-        let llk = |e: &GpuPtycho| -> Vec<u64> {
-            let h = e.history().iter();
-            h.map(|r| r.llk.poisson.to_bits()).collect()
-        };
-        for exit in [Exit::ApSums, Exit::ApPositions, Exit::MlGrad, Exit::Feature] {
-            for graph in [false, true] {
-                let what = format!("{exit:?}, graph {graph}");
-                let [mut failed, mut clean, mut first] = [(); 3].map(|()| {
-                    // The features step only in the fused passes.
-                    let mut e = engine(&ctx, graph, exit == Exit::Feature);
-                    if exit == Exit::Feature {
-                        e.set_features(&background).unwrap();
-                    }
-                    e
-                });
-                let armed = fault::arm(exit, 0);
-                let r = run(&mut failed, exit, 2);
-                assert!(armed.fired(), "{what}");
-                // A capture returns its closure's error as the device operation's.
-                let refused = match &r {
-                    Err(EngineError::Gpu(
-                        GpuError::Driver(d) | GpuError::Device(DeviceError::Driver(d)),
-                    )) => *d == fault::REFUSAL,
-                    _ => false,
-                };
-                assert!(refused, "{what}: {r:?}");
-                drop(armed);
-                run(&mut failed, exit, 2).unwrap();
-
-                // The cycles the failed call applied, each recording, as a call of its own.
-                let applied = match exit {
-                    Exit::ApPositions if !graph => Some(1),
-                    Exit::MlGrad => Some(0),
-                    _ => None,
-                };
-                if let Some(n) = applied {
-                    run(&mut clean, exit, n).unwrap();
-                }
-                run(&mut clean, exit, 2).unwrap();
-                let mut want = llk(&clean).split_off(applied.unwrap_or(0));
-                if !graph {
-                    run(&mut first, exit, 1).unwrap();
-                    want.insert(0, llk(&first)[0]);
-                }
-                let tags: Vec<usize> = failed.history().iter().map(|r| r.cycle).collect();
-                assert_eq!(
-                    tags,
-                    if graph { vec![0, 1] } else { vec![0, 0, 1] },
-                    "{what}"
-                );
-                assert_eq!(llk(&failed), want, "{what}: LLK");
-                assert!(bits(&failed) == bits(&clean), "{what}: the arrays");
-            }
-        }
-    }
-
-    /// A DM call failing between two stacks of its second cycle's projection keeps that
-    /// cycle's record, and its retry's cycle 0 overwrites the waves the failure left part
-    /// projected: the failed engine's history is the failed call's records, then the retry's,
-    /// and its LLKs and arrays are finite and bit for bit those of an engine that ran the
-    /// failed call's first cycle as a call of its own. Launched or replayed, M1's projection
-    /// and the fused one.
-    #[test]
-    fn a_dm_call_failing_between_stacks_is_retried_from_its_record() {
-        let ctx = CudaContext::new(0).expect("GPU 0");
-        let dm = DmParams {
-            calc_llk: 1,
-            zero_phase_ramp: false,
-            ..DmParams::default()
-        };
-        let bits = |e: &GpuPtycho| {
-            let (o, p) = (e.object().unwrap(), e.probe().unwrap());
-            let px = o.as_slice().iter().chain(p.as_slice());
-            px.flat_map(|c| [c.re, c.im]).collect::<Vec<_>>()
-        };
-        let llk = |e: &GpuPtycho| -> Vec<(usize, f64)> {
-            let h = e.history().iter();
-            h.map(|r| (r.cycle, r.llk.poisson)).collect()
-        };
-        for (graph, fused) in [(false, false), (true, false), (false, true), (true, true)] {
-            let what = format!("graph {graph}, fused {fused}");
-            let [mut failed, mut clean] = [(); 2].map(|()| engine(&ctx, graph, fused));
-            clean.dm(&dm, 1).unwrap();
-            let carried = clean.dev.carried.as_ref();
-            let nstack = carried.expect("DM built its stacks").cut.len();
-            assert!(nstack > 1, "{what}: one stack has no stack after it");
-            // Cycle 0's stacks, launched or captured, then the second of cycle 1's.
-            let armed = fault::arm(Exit::DmStack, nstack + 1);
-            let r = failed.dm(&dm, 2);
-            assert!(armed.fired(), "{what}");
-            let refused = match &r {
-                Err(EngineError::Gpu(
-                    GpuError::Driver(d) | GpuError::Device(DeviceError::Driver(d)),
-                )) => *d == fault::REFUSAL,
-                _ => false,
-            };
-            assert!(refused, "{what}: {r:?}");
-            drop(armed);
-            failed.dm(&dm, 2).unwrap();
-            clean.dm(&dm, 2).unwrap();
-
-            let (f, c) = (llk(&failed), llk(&clean));
-            assert_eq!(
-                c.iter().map(|r| r.0).collect::<Vec<_>>(),
-                [0, 1, 2],
-                "{what}"
-            );
-            let want = [c[0], c[1], c[1], c[2]].map(|(k, v)| (k, v.to_bits()));
-            let got: Vec<_> = f.iter().map(|&(k, v)| (k, v.to_bits())).collect();
-            assert_eq!(got, want, "{what}: the records");
-            assert!(f.iter().all(|r| r.1.is_finite()), "{what}: {f:?}");
-            let (f, c) = (bits(&failed), bits(&clean));
-            assert!(
-                f.iter().all(|v| v.is_finite()),
-                "{what}: the arrays are not finite"
-            );
-            let same = f
-                .iter()
-                .map(|v| v.to_bits())
-                .eq(c.iter().map(|v| v.to_bits()));
-            assert!(same, "{what}: the arrays");
-        }
-    }
-
-    /// An AP call failing in its full-object object solve keeps its records, and its retry
-    /// reads nothing the failed call left but its arrays, not the sums the solve part
-    /// consumed: failing before the first cycle's first step, after its third, or after the
-    /// third of the next cycle's, the first complete. The failed engine's history is its
-    /// complete cycles' records and the failed one's, then those of an engine that ran its
-    /// complete cycles as a call of its own, was given its object and probe (the probe steps
-    /// before the solve, the offsets after it) and ran the retry, whose arrays and offsets it
-    /// ends with bit for bit. Under graphs the exit runs only in the capture, which fails and
-    /// counts nothing.
-    #[test]
-    fn an_ap_call_failing_in_its_object_solve_is_retried_from_its_arrays() {
-        let ctx = CudaContext::new(0).expect("GPU 0");
-        let ap = ApParams {
-            obj_inertia: Some(0.01),
-            probe_inertia: Some(0.01),
-            calc_llk: 1,
-            zero_phase_ramp: false,
-        };
-        let offsets = (0..36).map(|f| [0.1 * (f % 3) as f64 - 0.1, 0.05]);
-        let position = Features {
-            position: Some(Feature::refined(offsets.collect())),
-            ..Features::default()
-        };
-        let bits = |e: &GpuPtycho| {
-            let (o, p) = (e.object().unwrap(), e.probe().unwrap());
-            let px = o.as_slice().iter().chain(p.as_slice());
-            let px = px.flat_map(|c| [c.re.to_bits(), c.im.to_bits()]);
-            let f = e.features().unwrap();
-            let pos = f.position.map(|p| p.values).into_iter().flatten().flatten();
-            px.chain(pos.map(f64::to_bits)).collect::<Vec<_>>()
-        };
-        let llk = |e: &GpuPtycho| -> Vec<(usize, u64)> {
-            let h = e.history().iter();
-            h.map(|r| (r.cycle, r.llk.poisson.to_bits())).collect()
-        };
-        for (graph, pass) in [(false, 0), (false, 3), (false, OBJ_PCG + 3), (true, 0)] {
-            let what = format!("graph {graph}, pass {pass}");
-            // The cycles the failed call completed, each one solve of `OBJ_PCG` steps.
-            let done = pass / OBJ_PCG;
+        for graph in [false, true] {
             let [mut failed, mut clean] = [(); 2].map(|()| {
-                let mut e = engine(&ctx, graph, true);
-                e.set_sampling(Sampling::FullObject).unwrap();
-                e.set_features(&position).unwrap();
+                // The slices' propagator stage has in-kernel FFTs of the fused passes' sides alone.
+                let (scan, object, probe, options) = start(graph, true);
+                let g = scan.geometry;
+                let gap = Wavefield::new(g.frame, g.wavelength, g.pixel_size_object(), 2e-5);
+                let optics = Optics::far_field(&g).with_slices(&[gap.unwrap()]);
+                let objects = [object.clone(), object];
+                let mut e =
+                    GpuPtycho::with_slices(&ctx, &scan, &optics.unwrap(), &objects, probe, options)
+                        .unwrap();
+                e.bh(&params, 1, 1).unwrap();
                 e
             });
-            let armed = fault::arm(Exit::Solve, pass);
-            let r = failed.ap(&ap, done + 2);
-            assert!(armed.fired(), "{what}");
-            let refused = match &r {
-                Err(EngineError::Gpu(
-                    GpuError::Driver(d) | GpuError::Device(DeviceError::Driver(d)),
-                )) => *d == fault::REFUSAL,
-                _ => false,
-            };
-            assert!(refused, "{what}: {r:?}");
-            drop(armed);
-            if done > 0 {
-                clean.ap(&ap, done).unwrap();
-            }
-            let dev = &failed.dev;
-            let obj = dev.obj.to_host_vec(&dev.stream).unwrap();
-            let probe = dev.probe.to_host_vec(&dev.stream).unwrap();
-            clean.dev.write_arrays(&obj, &probe).unwrap();
-            assert!(bits(&failed) == bits(&clean), "{what}: the arrays left");
+            let r = failed.dev.ungated().summing(|dev| {
+                let bh = dev.bh_state.as_deref_mut().expect("BH's state");
+                let g = &mut bh.sliced.as_mut().expect("two slices").grads()[0];
+                let num = vec![C32 { re: 1.0, im: 1.0 }; g.num.len()];
+                g.num.copy_from_host(&dev.stream, &num)?;
+                g.den.copy_from_host(&dev.stream, &vec![1.0; g.den.len()])?;
+                Err::<(), _>(EngineError::Invalid("injected".into()))
+            });
+            assert!(matches!(r, Err(EngineError::Invalid(_))), "graph {graph}");
             for e in [&mut failed, &mut clean] {
-                e.ap(&ap, 2).unwrap();
+                e.bh(&params, 1, 1).unwrap();
             }
+            let bits = |e: &GpuPtycho| -> Vec<Vec<u64>> {
+                let (o, p) = (e.objects().unwrap(), e.probe().unwrap());
+                let px = |s: &[C64]| -> Vec<u64> {
+                    s.iter()
+                        .flat_map(|c| [c.re.to_bits(), c.im.to_bits()])
+                        .collect()
+                };
+                let llk = e.history().iter().map(|r| r.llk.poisson.to_bits());
+                let arrays = o.iter().map(|o| px(o.as_slice()));
+                arrays.chain([px(p.as_slice()), llk.collect()]).collect()
+            };
+            let (f, c) = (bits(&failed), bits(&clean));
+            assert_eq!((f.len(), f[3].len()), (4, 2), "graph {graph}");
+            for (what, (f, c)) in ["slice 0", "slice 1", "the probe", "the LLK"]
+                .iter()
+                .zip(f.iter().zip(&c))
+            {
+                assert!(f == c, "graph {graph}: {what} differs from a clean run's");
+            }
+        }
+    }
 
-            let (f, c) = (llk(&failed), llk(&clean));
-            let kept = if graph { 0 } else { done + 1 };
-            assert_eq!(f.len(), kept + 2, "{what}: {f:?}");
-            assert_eq!(f[..done], c[..done], "{what}: the complete cycles' records");
-            assert_eq!(f[done].0, done, "{what}");
-            assert_eq!(f[kept..], c[done..], "{what}: the retry's records");
-            assert!(bits(&failed) == bits(&clean), "{what}: the arrays");
+    /// ML's line search refuses a lend that samples the object to a state built for no
+    /// position, which [`Device::build_ml`]'s rebuild alone kept out: the state is swapped in
+    /// after it.
+    #[test]
+    fn ml_refuses_windows_lent_to_a_fixed_line() {
+        let ctx = CudaContext::new(0).expect("GPU 0");
+        let mut e = engine(&ctx, false, true);
+        e.set_sampling(Sampling::FullObject).unwrap();
+        let position = Features {
+            position: Some(Feature::held(vec![[0.1, -0.1]; 36])),
+            ..Features::default()
+        };
+        e.set_features(&position).unwrap();
+        let epoch = Epoch::Ml {
+            params: MlParams::default(),
+            first: true,
+            llk: false,
+        };
+        let r = e.dev.ungated().steady_with(epoch, 0, |dev| {
+            let (lens, dims) = ([dev.obj.len(), dev.probe.len()], dev.dims());
+            let one = dev.one_slice("ML")?;
+            let none = PositionScratch::None;
+            let fixed = MlState::new(&dev.stream, &dev.kernels, &dims, dev.rule, lens, none, one)?;
+            dev.ml = Some(Box::new(fixed));
+            Ok(())
+        });
+        assert!(
+            matches!(&r, Err(EngineError::Gpu(GpuError::Shape(s)))
+                if s == "ML state built for another position model"),
+            "{r:?}"
+        );
+    }
+
+    /// A stack's first loop through `n` slices holds the wave entering each slice past the
+    /// first and the last one's exit wave to the backward sweep, `n` waves, and under
+    /// full-object sampling each slice's window beside its wave: 1 MiB and 0.5 MiB a frame at
+    /// 256x256 against a 24 MiB budget. Whatever the position model, held or refined, the
+    /// stack [`BhState`] books holds them through 10 slices; without full-object sampling it
+    /// books them exactly from 7, where the first loop outweighs the second. Refined under
+    /// full-object sampling, the second loop holds five waves besides the wave and window of
+    /// each slice past the first, and the stack holds those too.
+    #[test]
+    fn bh_books_a_held_wave_per_slice() {
+        let dims = ViewDims {
+            nframe: 400,
+            nmode: 2,
+            nprobe: 2,
+            nobj: 1,
+            frame: [256; 2],
+            obj: [1024; 2],
+            quad_phase: 0.0,
+        };
+        let rule = StackRule::new(None, 64 << 20, 1, &dims).unwrap();
+        let (wave, win) = (wave_bytes(&dims), Windows::bytes(&dims));
+        let full = MovedSampling::FullObject {
+            held: 0,
+            scratch: 0,
+            acc: 0,
+        };
+        let moved = |sampling, refined| {
+            Some(MovedScratch {
+                frames: dims.nframe,
+                sampling,
+                refined,
+            })
+        };
+        let patch = MovedSampling::Patch;
+        let arms = [
+            ("unmoved", None, wave, false),
+            ("held patch", moved(patch, false), wave, false),
+            ("refined patch", moved(patch, true), wave, false),
+            ("held full object", moved(full, false), wave + win, false),
+            ("refined full object", moved(full, true), wave + win, true),
+        ];
+        for (name, scratch, per_slice, sliced_second) in arms {
+            for n in 2..=10 {
+                let frames = rule.frames(&BhState::streamed(&dims, n - 1, scratch)) as usize;
+                let held = n * per_slice;
+                assert!(
+                    frames * held <= rule.budget,
+                    "{name}, {n} slices: {frames} frames hold {} bytes",
+                    frames * held
+                );
+                if n >= 7 && per_slice == wave {
+                    assert_eq!(frames, rule.budget / held, "{name}, {n} slices");
+                }
+                if sliced_second {
+                    let second = 5 * wave + (n - 1) * per_slice;
+                    assert!(
+                        frames * second <= rule.budget,
+                        "{name}, {n} slices: {frames} frames hold {} bytes in the second loop",
+                        frames * second
+                    );
+                }
+            }
         }
     }
 }

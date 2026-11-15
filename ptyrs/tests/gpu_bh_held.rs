@@ -174,7 +174,7 @@ fn disp(fx: &Fixture) -> Disp {
     }
 }
 
-/// `pos_spec` and `moved_spec` per stack; without `cg` `lv` stays as it was.
+/// `pos_spec` and `moved_spec` per stack, with `cg` on `lv` too.
 fn moved_spec_case(cg: bool) {
     let fx = fixture();
     let mut dp = disp(&fx);
@@ -204,15 +204,21 @@ fn moved_spec_case(cg: bool) {
         let fill = || [fx.c32(FIELD, seed + 1), fx.c32(FIELD, seed + 2)];
         let (mut want, mut got, was) = (fill(), fill(), fill());
         let [wu, wv] = &mut want;
-        fx.bh.pos_spec(ctx, at, &pos, [wu, wv]).unwrap();
+        fx.bh
+            .pos_spec(ctx, at, &pos, (wu, cg.then_some(wv)))
+            .unwrap();
         let [gu, gv] = &mut got;
-        fx.bh.moved_spec(ctx, at, &held, [gu, gv]).unwrap();
+        fx.bh
+            .moved_spec(ctx, at, &held, (gu, cg.then_some(gv)))
+            .unwrap();
         let [wu, wv, gu, gv, lu0, lv0] =
             [&want[0], &want[1], &got[0], &got[1], &was[0], &was[1]].map(|b| fx.floats(b));
         same(&format!("stack {s} lu"), &gu, &wu);
-        same(&format!("stack {s} lv"), &gv, &wv);
         assert_ne!(gu, lu0, "stack {s}: lu not written");
-        assert_eq!(gv != lv0, cg, "stack {s}: lv written exactly with cg");
+        if cg {
+            same(&format!("stack {s} lv"), &gv, &wv);
+            assert_ne!(gv, lv0, "stack {s}: lv not written");
+        }
     }
 }
 
@@ -267,7 +273,7 @@ fn moved_far_case(cg: bool) {
         let f = BhMovedFarRef {
             psi: &psi,
             lu: &lu,
-            lv: &lv,
+            lv: cg.then_some(&lv),
             y: &y,
         };
         fx.bh
