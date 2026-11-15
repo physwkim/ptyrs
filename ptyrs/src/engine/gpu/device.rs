@@ -12,14 +12,15 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use crate::fft::Plan2d;
+use crate::gpu::sampling::{Modes, ObjectSampler, StackPoints, WindowBlock, window_views};
 use crate::gpu::{
     BH_STEP, BackgroundSums, BhKernels, C32, CG_BLOCKS, Ended, EpochOrder, Error as GpuError,
     ExitPass, ExitStage, FarSums, FrameWaves, FusedBufs, FusedInputs, GammaStacks, GradKernels,
     HalfWaves, Kernels, LlkPartial, LlkRing, LlkScratch, LlkTotals, MASKED, Model, OpticsKernels,
     PositionKernels, PositionPartial, Positions, PowerMax, ProbeSpectrum, PsiSums, RingDevice,
     RpieKernels, ScalePartial, Shift, ShiftProbe, ShiftSums, ShiftedProbeSums, SlicePhase,
-    SliceSource, SpectrumBuf, StackRef, StackTable, UpdateSums, ViewAddr, ViewDims, Views, Waves,
-    half_scale,
+    SliceSource, SpectrumBuf, StackRef, StackTable, StackWindows, UpdateSums, ViewAddr, ViewDims,
+    Views, Waves, half_scale,
 };
 use crate::tile::TileDots;
 use cuda_async::cuda_graph::CudaGraph;
@@ -28,7 +29,7 @@ use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 
 use super::bh::BhMoved;
 use super::lsqml::{LsqmlBufs, LsqmlState, Pre};
-use super::ml::MlMoved;
+use super::ml::{MlMoved, MlPosition, MlWindows};
 use super::rpie::RpieMoved;
 use super::{
     Cut, Epoch, Frames, GpuOptions, StackRule, Streamed, Tag, batch_stacks, plane_bytes, plane_len,
@@ -37,7 +38,7 @@ use super::{
 use crate::engine::features::{POSITION_LIMIT, POSITION_STEP};
 use crate::engine::{
     ApParams, BhParams, BhStep, DmParams, EngineError, Features, LsqmlParams, LsqmlStep, MlParams,
-    PlaneStage, RaarParams, RpieParams,
+    PlaneStage, RaarParams, RpieParams, Sampling,
 };
 
 /// What [`Device::new`] uploads: the propagator's stage, the views' addresses, the counts
@@ -93,9 +94,8 @@ impl Slices {
     }
 }
 
-/// [`Slices`] lent to a cycle.
+/// [`Slices`] lent to a cycle, but for the slices, which [`Bufs::deeper`] lends.
 pub(super) struct SlicesMut<'a> {
-    pub deeper: &'a mut [DeviceBuffer<C32>],
     pub gaps: &'a [DeviceBuffer<C32>],
     pub ones: &'a DeviceBuffer<C32>,
     pub quad: f32,
@@ -115,13 +115,15 @@ pub(super) fn slice_phase(
 impl SlicesMut<'_> {
     /// `stack`'s waves leaving the last slice, its plane phase on them, in a scratch stack's
     /// buffer: of `inputs` the views, the first slice as its object, and the probe, moved
-    /// under a [`Model::shift`] by its offsets.
+    /// under a [`Model::shift`] by its offsets, and `deeper`, the slices past the first as
+    /// those views read them ([`Modelled::slices`]).
     pub fn exit_waves(
         &mut self,
         ctx: &ExecutionContext,
         kernels: &Kernels,
         optics: &OpticsKernels,
         inputs: &FusedInputs<'_>,
+        deeper: &[DeviceBuffer<C32>],
         stack: StackRef<'_>,
     ) -> Result<&mut DeviceBuffer<C32>, GpuError> {
         let (views, d) = (inputs.views, inputs.views.dims());
@@ -141,7 +143,7 @@ impl SlicesMut<'_> {
             }
         };
         let (mut src, mut dst) = (a, b);
-        for (obj, gap) in self.deeper.iter().zip(self.gaps) {
+        for (obj, gap) in deeper.iter().zip(self.gaps) {
             optics.gap(ctx, d, stack, gap, src, false)?;
             let waves = SliceSource::Waves(FrameWaves::Views(src));
             optics.slice_mul(ctx, views, stack, obj, waves, dst)?;
@@ -200,6 +202,9 @@ pub(super) struct Device {
     /// LSQML's state, built by the first LSQML call and replaced only for another batch size.
     lsqml: Option<Box<LsqmlState>>,
     features: FeatureBufs,
+    /// How a position's offsets enter the exit waves. Every state and graph built under a
+    /// position model was built under it: [`Self::set_sampling`] drops the others.
+    sampling: Sampling,
 }
 
 /// The features' device state as [`Device::set_features`] last set it: each modelled
@@ -209,6 +214,138 @@ struct FeatureBufs {
     scale: Option<ScaleBufs>,
     background: Option<BackgroundBufs>,
     position: Option<PositionBufs>,
+}
+
+impl FeatureBufs {
+    fn positioned(&self) -> bool {
+        self.position.is_some()
+    }
+
+    /// What the position model adds to the shared passes.
+    fn scratch(&self) -> PositionScratch {
+        PositionScratch::of(self.position.as_ref().map(|p| &p.mover))
+    }
+}
+
+/// What the position model adds to the passes over a cut, by what its offsets move.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PositionScratch {
+    /// No position.
+    None,
+    /// [`Mover::Probe`]: the fused passes' scratch of a shift.
+    Shift,
+    /// [`Mover::Object`]: the cut's [`Windows`], beside the bytes the sampler keeps across a
+    /// sampling, `sample` ([`ObjectSampler::windows_held`]), and across a placing, `place`
+    /// (its scratch and accumulator).
+    Windows { sample: usize, place: usize },
+}
+
+impl PositionScratch {
+    fn of(mover: Option<&Mover>) -> Self {
+        match mover {
+            None => Self::None,
+            Some(Mover::Probe { .. }) => Self::Shift,
+            Some(Mover::Object { sampler, .. }) => Self::Windows {
+                sample: sampler.windows_held(),
+                place: sampler.scratch_bytes() + sampler.acc_bytes(),
+            },
+        }
+    }
+}
+
+/// Groups [`ObjectSampler`] interpolates per pass.
+const SAMPLER_CHUNK: u32 = 4;
+
+/// A cut's windows under [`Sampling::FullObject`]: the views that read a stack's windows, the
+/// blocks [`ObjectSampler::windows`] writes them to, every object mode, and the object update
+/// sums over them.
+pub(super) struct Windows {
+    views: Views,
+    /// Three blocks `[nobj, nf_max, ny, nx]`, each the views' object: the windows and their
+    /// derivatives over the position's `y` and `x`.
+    blocks: DeviceBuffer<C32>,
+    /// A multislice object's windows of each slice past the first, a block each.
+    deeper: Vec<DeviceBuffer<C32>>,
+    /// `[nobj, nyo, nxo]`, the spectra of each slice past the first, which
+    /// [`Modelled::sliced`] takes for its windows.
+    spectra: Vec<DeviceBuffer<C32>>,
+    /// `[nobj, nf_max, ny, nx]`.
+    sums: UpdateSums,
+}
+
+impl Windows {
+    /// For `cut`'s stacks of the views of `dims` into an object of `slices` slices.
+    fn new(
+        stream: &Arc<CudaStream>,
+        dims: &ViewDims,
+        cut: &Cut,
+        slices: usize,
+    ) -> Result<Self, EngineError> {
+        let stacks: Vec<_> = cut.frames.iter().map(|f| f.range.clone()).collect();
+        let views = window_views(stream, dims, &stacks)?;
+        let len = views.dims().obj_len();
+        Ok(Self {
+            views,
+            blocks: DeviceBuffer::zeroed(stream, 3 * len)?,
+            deeper: (1..slices)
+                .map(|_| DeviceBuffer::zeroed(stream, len))
+                .collect::<Result<_, _>>()?,
+            spectra: (1..slices)
+                .map(|_| DeviceBuffer::zeroed(stream, dims.obj_len()))
+                .collect::<Result<_, _>>()?,
+            sums: UpdateSums::zeroed(stream, len)?,
+        })
+    }
+
+    /// Bytes per frame of a stack's block.
+    fn bytes(dims: &ViewDims) -> usize {
+        plane_bytes::<C32>(dims, dims.nobj)
+    }
+
+    /// Bytes per frame of a stack's update sums.
+    fn sums_bytes(dims: &ViewDims) -> usize {
+        plane_bytes::<C32>(dims, dims.nobj) + plane_bytes::<f32>(dims, dims.nobj)
+    }
+}
+
+/// What [`Modelled::windows`] samples of a stack's windows.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum Sample {
+    /// Nothing: the passes read the views alone.
+    Views,
+    /// The windows, block 0.
+    Windows,
+    /// The windows and their derivatives over the position's `y` and `x`, blocks 0 to 2.
+    Derivatives,
+}
+
+/// [`Windows`] lent to one stack's passes by [`Modelled::windows`]: the views and the blocks
+/// they read, and the update sums.
+pub(super) struct WindowsMut<'w> {
+    pub read: StackWindows<'w>,
+    sums: &'w mut UpdateSums,
+}
+
+impl WindowsMut<'_> {
+    /// The update sums over the windows, zeroed for the passes to add to (two memsets).
+    pub fn zeroed_sums(&mut self, ctx: &ExecutionContext) -> Result<&mut UpdateSums, GpuError> {
+        crate::gpu::zero(ctx, &mut self.sums.num)?;
+        crate::gpu::zero(ctx, &mut self.sums.den)?;
+        Ok(self.sums)
+    }
+
+    /// The object sums the passes added since [`Self::zeroed_sums`], which
+    /// [`Modelled::place`] places.
+    pub fn patches(&self) -> &DeviceBuffer<C32> {
+        &self.sums.num
+    }
+}
+
+/// [`Shared`] rebuilt for another position model, with a multislice object's waves cut by
+/// it.
+struct Reshared {
+    shared: Shared,
+    waves: Option<[DeviceBuffer<C32>; 2]>,
 }
 
 /// A per-frame intensity scale `[nframe]` and its far sums `[nframe]`.
@@ -229,14 +366,60 @@ struct BackgroundBufs {
     photons: DeviceBuffer<f32>,
 }
 
-/// Per-frame offsets `[nframe, 2]` of the position model, the spectra of the probe they
-/// move, the shifted probe's update sums and each frame's position sums `[nframe]`.
+/// Per-frame offsets `[nframe, 2]` of the position model, each frame's position sums
+/// `[nframe]` and what the offsets move.
 struct PositionBufs {
     offsets: DeviceBuffer<f32>,
-    spectrum: SpectrumBuf,
-    probe_sums: ShiftedProbeSums,
     num: DeviceBuffer<PositionPartial>,
     den: DeviceBuffer<PositionPartial>,
+    mover: Mover,
+}
+
+/// What a position's offsets move, by the device's [`Sampling`].
+enum Mover {
+    /// [`Sampling::Patch`]: the probe, by the spectra of the probe it moves, with the shifted
+    /// probe's update sums.
+    Probe {
+        spectrum: SpectrumBuf,
+        probe_sums: Box<ShiftedProbeSums>,
+    },
+    /// [`Sampling::FullObject`]: the object's windows, which the passes sample from the
+    /// spectra of the object they read; the probe stays.
+    Object {
+        sampler: Box<ObjectSampler>,
+        /// `[nobj, nyo, nxo]`.
+        spectra: DeviceBuffer<C32>,
+    },
+}
+
+impl Mover {
+    fn new(
+        stream: &Arc<CudaStream>,
+        kernels: &Kernels,
+        dims: &ViewDims,
+        sampling: Sampling,
+    ) -> Result<Self, EngineError> {
+        Ok(match sampling {
+            Sampling::Patch => Self::Probe {
+                spectrum: SpectrumBuf::zeroed(stream, dims)?,
+                probe_sums: Box::new(ShiftedProbeSums::zeroed(stream, dims)?),
+            },
+            Sampling::FullObject => Self::Object {
+                sampler: Box::new(ObjectSampler::new(
+                    kernels,
+                    stream,
+                    *dims,
+                    1,
+                    SAMPLER_CHUNK,
+                )?),
+                spectra: DeviceBuffer::zeroed(stream, dims.obj_len())?,
+            },
+        })
+    }
+
+    fn moves_probe(&self) -> bool {
+        matches!(self, Self::Probe { .. })
+    }
 }
 
 /// [`FeatureBufs`] lent to a cycle.
@@ -263,43 +446,205 @@ struct BackgroundMut<'a> {
 /// [`PositionBufs`] lent to a cycle.
 struct PositionMut<'a> {
     offsets: &'a mut DeviceBuffer<f32>,
-    spectrum: &'a mut SpectrumBuf,
-    probe_sums: &'a mut ShiftedProbeSums,
     num: &'a mut DeviceBuffer<PositionPartial>,
     den: &'a mut DeviceBuffer<PositionPartial>,
+    mover: &'a mut Mover,
 }
 
-/// The position model's state a cycle that runs its own passes owns: per batch slot the moved
-/// probes `[nf_max * nprobe, ny, nx]`, the offsets by epoch position and their kernels.
+/// The position model's state a cycle that runs its own passes owns: the offsets by epoch
+/// position, their kernels and the moved probes, by the device's [`Sampling`].
 pub(super) struct Moved {
-    w: Vec<DeviceBuffer<C32>>,
     pos: Positions,
     kernels: PositionKernels,
+    probes: MovedProbes,
+}
+
+/// A cycle's moved probes.
+enum MovedProbes {
+    /// [`Sampling::Patch`]: per batch slot, `[nf_max * nprobe, ny, nx]`.
+    Patch(Vec<DeviceBuffer<C32>>),
+    /// [`Sampling::FullObject`]: none, the probe stays.
+    FullObject,
 }
 
 impl Moved {
-    /// For frames of `dims` in `slots` stacks per batch of up to `nf_max` frames each.
+    /// For frames of `dims` in `slots` stacks per batch of up to `nf_max` frames each, under
+    /// `sampling`.
     pub fn new(
         stream: &Arc<CudaStream>,
         kernels: &Kernels,
         dims: &ViewDims,
         nf_max: u32,
         slots: usize,
+        sampling: Sampling,
     ) -> Result<Self, EngineError> {
         let wlen = nf_max as usize * dims.nprobe as usize * plane_len(dims);
         Ok(Self {
-            w: (0..slots)
-                .map(|_| DeviceBuffer::zeroed(stream, wlen))
-                .collect::<Result<_, _>>()?,
             pos: Positions::zeroed(stream, dims, nf_max)?,
             kernels: PositionKernels::load(kernels)?,
+            probes: match sampling {
+                Sampling::Patch => MovedProbes::Patch(
+                    (0..slots)
+                        .map(|_| DeviceBuffer::zeroed(stream, wlen))
+                        .collect::<Result<_, _>>()?,
+                ),
+                Sampling::FullObject => MovedProbes::FullObject,
+            },
         })
     }
 }
 
-/// A cycle's [`Moved`] lent with the device's position buffers: the offsets by frame, the
-/// probe spectra and the shifted probe's sums; `own` the cycle's other buffers of the model,
-/// `fused` the scratch of the shifted sums over its stacks.
+/// What a cycle that runs its own passes under the position model builds by: the frames per
+/// stack of the shared scratch and the device's [`Sampling`].
+#[derive(Clone, Copy, Debug)]
+pub(super) struct MovedScratch {
+    pub frames: u32,
+    pub sampling: MovedSampling,
+}
+
+/// The device's [`Sampling`] as [`MovedScratch`] holds it: under [`Sampling::FullObject`],
+/// the bytes the device's sampler keeps across its calls.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum MovedSampling {
+    Patch,
+    FullObject {
+        /// [`ObjectSampler::windows_held`].
+        held: usize,
+        /// [`ObjectSampler::scratch_bytes`].
+        scratch: usize,
+        /// [`ObjectSampler::acc_bytes`].
+        acc: usize,
+    },
+}
+
+impl From<MovedSampling> for Sampling {
+    fn from(s: MovedSampling) -> Self {
+        match s {
+            MovedSampling::Patch => Self::Patch,
+            MovedSampling::FullObject { .. } => Self::FullObject,
+        }
+    }
+}
+
+/// A cycle's [`Moved`] lent with the device's position buffers, by the device's [`Sampling`]:
+/// a cycle with both paths matches it.
+pub(super) enum PositionLent<'m, X> {
+    Patch(MovedLent<'m, X>),
+    FullObject(SampledLent<'m, X>),
+}
+
+impl<'m, X> PositionLent<'m, X> {
+    /// `moved` with `features`' position buffers and, under [`Sampling::Patch`], `fused`:
+    /// none without a position, an error when they disagree, as for a cycle's state built
+    /// for another position model.
+    pub fn lend(
+        moved: Option<(&'m mut Moved, X)>,
+        fused: Option<&'m mut FusedBufs>,
+        features: &'m mut FeaturesMut<'_>,
+    ) -> Result<Option<Self>, GpuError> {
+        let (m, own, p) = match (moved, features.position.as_mut()) {
+            (None, None) => return Ok(None),
+            (Some((m, own)), Some(p)) => (m, own, p),
+            _ => return Err(another_model()),
+        };
+        let Moved {
+            pos,
+            kernels,
+            probes,
+        } = m;
+        match (probes, &mut *p.mover, fused) {
+            (
+                MovedProbes::Patch(w),
+                Mover::Probe {
+                    spectrum,
+                    probe_sums,
+                },
+                Some(fused),
+            ) => Ok(Some(Self::Patch(MovedLent {
+                own,
+                fused,
+                w,
+                pos,
+                kernels,
+                offsets: &mut *p.offsets,
+                spectrum,
+                probe_sums,
+            }))),
+            (MovedProbes::FullObject, Mover::Object { sampler, spectra }, _) => {
+                Ok(Some(Self::FullObject(SampledLent {
+                    own,
+                    pos,
+                    kernels,
+                    offsets: &mut *p.offsets,
+                    sampler,
+                    spectra,
+                })))
+            }
+            _ => Err(another_model()),
+        }
+    }
+
+    /// The cycle's other buffers of the model.
+    pub fn own(&self) -> &X {
+        match self {
+            Self::Patch(m) => &m.own,
+            Self::FullObject(s) => &s.own,
+        }
+    }
+
+    /// The offsets by epoch position from the device's, through `order`, the epoch's.
+    pub fn gather(&mut self, ctx: &ExecutionContext, order: &EpochOrder) -> Result<(), GpuError> {
+        match self {
+            Self::Patch(m) => m.gather(ctx, order),
+            Self::FullObject(s) => s.gather(ctx, order),
+        }
+    }
+}
+
+pub(super) fn another_model() -> GpuError {
+    GpuError::Shape("cycle state built for another position model".into())
+}
+
+impl<'m, X> TryFrom<PositionLent<'m, X>> for MovedLent<'m, X> {
+    type Error = GpuError;
+
+    /// The Patch lend; an error under [`Sampling::FullObject`], which keeps the probe.
+    fn try_from(lent: PositionLent<'m, X>) -> Result<Self, GpuError> {
+        match lent {
+            PositionLent::Patch(m) => Ok(m),
+            PositionLent::FullObject(_) => Err(GpuError::Shape(
+                "this cycle moves the probe by the offsets, which sample the object under \
+                 Sampling::FullObject; Sampling::Patch runs it"
+                    .into(),
+            )),
+        }
+    }
+}
+
+/// [`PositionLent::FullObject`]: a cycle's [`Moved`] lent with the device's offsets by frame,
+/// which sample the object's windows, and its sampler; `own` the cycle's other buffers of the
+/// model.
+pub(super) struct SampledLent<'m, X> {
+    pub own: X,
+    pub pos: &'m mut Positions,
+    pub kernels: &'m PositionKernels,
+    /// By frame: the device's offsets, which the cycle steps.
+    pub offsets: &'m mut DeviceBuffer<f32>,
+    pub sampler: &'m mut ObjectSampler,
+    /// `[nobj, nyo, nxo]`, the spectra [`ObjectSampler::windows`] reads.
+    pub spectra: &'m mut DeviceBuffer<C32>,
+}
+
+impl<X> SampledLent<'_, X> {
+    /// The offsets by epoch position from the device's, through `order`, the epoch's.
+    pub fn gather(&mut self, ctx: &ExecutionContext, order: &EpochOrder) -> Result<(), GpuError> {
+        self.kernels.gather(ctx, order, self.offsets, self.pos)
+    }
+}
+
+/// [`PositionLent::Patch`]: a cycle's [`Moved`] lent with the device's position buffers: the
+/// offsets by frame, the probe spectra and the shifted probe's sums; `own` the cycle's other
+/// buffers of the model, `fused` the scratch of the shifted sums over its stacks.
 pub(super) struct MovedLent<'m, X> {
     pub own: X,
     fused: &'m mut FusedBufs,
@@ -312,29 +657,16 @@ pub(super) struct MovedLent<'m, X> {
 }
 
 impl<'m, X> MovedLent<'m, X> {
-    /// `moved` with `fused` and `features`' position buffers: none without a position, an
-    /// error when they disagree, as for a cycle's state built for another position model.
+    /// [`PositionLent::lend`] for a cycle with the [`Sampling::Patch`] path alone: an error
+    /// under [`Sampling::FullObject`], which keeps the probe this path moves.
     pub fn lend(
         moved: Option<(&'m mut Moved, X)>,
         fused: Option<&'m mut FusedBufs>,
         features: &'m mut FeaturesMut<'_>,
     ) -> Result<Option<Self>, GpuError> {
-        match (moved, features.position.as_mut(), fused) {
-            (None, None, _) => Ok(None),
-            (Some((m, own)), Some(p), Some(fused)) => Ok(Some(Self {
-                own,
-                fused,
-                w: &mut m.w,
-                pos: &mut m.pos,
-                kernels: &m.kernels,
-                offsets: &mut *p.offsets,
-                spectrum: &mut *p.spectrum,
-                probe_sums: &mut *p.probe_sums,
-            })),
-            _ => Err(GpuError::Shape(
-                "cycle state built for another position model".into(),
-            )),
-        }
+        (PositionLent::lend(moved, fused, features)?)
+            .map(Self::try_from)
+            .transpose()
     }
 
     /// The offsets by epoch position from the device's, through `order`, the epoch's.
@@ -399,22 +731,252 @@ pub(super) fn moved_inputs<'a>(base: &FusedInputs<'a>, shift: Shift<'a>) -> Fuse
 }
 
 /// The features lent to the passes of one cycle body by [`FeaturesMut::lend`]: the model
-/// every pass that compares with the counts reads, and the sums the passes write.
+/// every pass that compares with the counts reads, what samples the object it reads, and the
+/// sums the passes write.
 pub(super) struct Modelled<'b> {
     pub model: Model<'b>,
+    sampled: Option<Sampled<'b>>,
     scale: Option<&'b mut DeviceBuffer<ScalePartial>>,
     background: Option<&'b mut BackgroundSums>,
     position: Option<PositionSums<'b>>,
 }
 
-/// The sums of the position model, lent by [`Modelled`].
+/// An object's first slice and the slices past it, none of one slice.
+#[derive(Clone, Copy)]
+pub(super) struct Sliced<'a> {
+    pub first: &'a DeviceBuffer<C32>,
+    pub deeper: &'a [DeviceBuffer<C32>],
+}
+
+/// What the passes over each stack of a cut read of a multislice object, by
+/// [`Modelled::sliced`].
+pub(super) enum SlicedRead<'w> {
+    /// The scan's views and the object's slices.
+    Base(&'w Views, Sliced<'w>),
+    /// Under [`Sampling::FullObject`], the scan's views and the cut's windows, beside whose
+    /// deeper windows the spectra of the slices past the first are taken.
+    Windows(&'w Views, &'w mut Windows),
+}
+
+/// [`Mover::Object`] lent by [`Modelled`]: the sampler, the spectra of the object the passes
+/// read and the offsets by frame they sample it at.
+struct Sampled<'b> {
+    sampler: &'b mut ObjectSampler,
+    spectra: &'b DeviceBuffer<C32>,
+    offsets: &'b DeviceBuffer<f32>,
+}
+
+/// The sums of the position model, lent by [`Modelled`]: the shifted probe's under
+/// [`Sampling::Patch`] alone, which moves the probe.
 struct PositionSums<'b> {
-    probe: &'b mut ShiftedProbeSums,
+    probe: Option<&'b mut ShiftedProbeSums>,
     num: &'b mut DeviceBuffer<PositionPartial>,
     den: &'b mut DeviceBuffer<PositionPartial>,
 }
 
 impl Modelled<'_> {
+    /// The views and object a fused pass over `stack` reads, of `base`, the scan's views and
+    /// the object the lend took: `base`, or under [`Sampling::FullObject`] the stack's windows
+    /// sampled into `windows`, its cut's, by [`Self::windows`].
+    pub fn object<'w>(
+        &mut self,
+        ctx: &ExecutionContext,
+        base: (&'w Views, &'w DeviceBuffer<C32>),
+        stack: StackRef<'_>,
+        windows: Option<&'w mut Windows>,
+    ) -> Result<(&'w Views, &'w DeviceBuffer<C32>), GpuError> {
+        Ok(
+            match self.windows(ctx, base.0, stack, windows, Sample::Windows)? {
+                None => base,
+                Some(w) => (w.read.views, w.read.blocks),
+            },
+        )
+    }
+
+    /// What the passes over each stack read of `base`, the scan's views and the object's
+    /// slices, the first the one the lend took: `base`, or under [`Sampling::FullObject`]
+    /// `windows`, its cut's, after the spectra of each slice past the first beside their
+    /// windows ([`Self::spectra_of`], one transform a slice). Their disagreement is an error,
+    /// as for a cut built under another position model, and so are windows of another slice
+    /// count.
+    pub fn sliced<'w>(
+        &mut self,
+        ctx: &ExecutionContext,
+        base: (&'w Views, Sliced<'w>),
+        windows: Option<&'w mut Windows>,
+    ) -> Result<SlicedRead<'w>, GpuError> {
+        let (views, obj) = base;
+        let w = match (&self.sampled, windows) {
+            (None, None) => return Ok(SlicedRead::Base(views, obj)),
+            (Some(_), Some(w)) => w,
+            _ => return Err(another_model()),
+        };
+        if w.deeper.len() != obj.deeper.len() {
+            return Err(GpuError::Shape(format!(
+                "windows of {} slices for an object of {}",
+                1 + w.deeper.len(),
+                1 + obj.deeper.len()
+            )));
+        }
+        for (slice, spectra) in obj.deeper.iter().zip(&mut w.spectra) {
+            self.spectra_of(ctx, slice, spectra)?;
+        }
+        Ok(SlicedRead::Windows(views, w))
+    }
+
+    /// The views and every slice the passes over `stack` read of `read`: its base, or each
+    /// slice's windows of the stack sampled into its windows, three launches per
+    /// [`SAMPLER_CHUNK`] groups a slice ([`Self::windows_of`]).
+    pub fn slices<'r>(
+        &mut self,
+        ctx: &ExecutionContext,
+        read: &'r mut SlicedRead<'_>,
+        stack: StackRef<'_>,
+    ) -> Result<(&'r Views, Sliced<'r>), GpuError> {
+        let (views, w) = match read {
+            SlicedRead::Base(views, obj) => return Ok((*views, *obj)),
+            SlicedRead::Windows(views, w) => (*views, &mut **w),
+        };
+        let block = WindowBlock {
+            slice: 0,
+            order: [0, 0],
+            modes: Modes::All,
+            block: 0,
+        };
+        self.windows_of(ctx, views, stack, None, block, &mut w.blocks)?;
+        for (spectra, win) in w.spectra.iter().zip(&mut w.deeper) {
+            self.windows_of(ctx, views, stack, Some(spectra), block, win)?;
+        }
+        let deeper = &w.deeper;
+        Ok((
+            &w.views,
+            Sliced {
+                first: &w.blocks,
+                deeper,
+            },
+        ))
+    }
+
+    /// Under [`Sampling::FullObject`], `stack`'s windows over the scan's `views` lent from
+    /// `w`, its cut's, after sampling what `sample` names from the spectra of the object the
+    /// lend took, three launches per [`SAMPLER_CHUNK`] groups a block; none without either.
+    /// Their disagreement is an error, as for a cut built under another position model.
+    pub fn windows<'w>(
+        &mut self,
+        ctx: &ExecutionContext,
+        views: &Views,
+        stack: StackRef<'_>,
+        w: Option<&'w mut Windows>,
+        sample: Sample,
+    ) -> Result<Option<WindowsMut<'w>>, GpuError> {
+        let (s, w) = match (&mut self.sampled, w) {
+            (None, None) => return Ok(None),
+            (Some(s), Some(w)) => (s, w),
+            _ => return Err(another_model()),
+        };
+        let at = StackPoints {
+            views,
+            stack,
+            offsets: s.offsets,
+        };
+        let orders: &[[u32; 2]] = match sample {
+            Sample::Views => &[],
+            Sample::Windows => &[[0, 0]],
+            Sample::Derivatives => &[[0, 0], [1, 0], [0, 1]],
+        };
+        for (block, &order) in (0..).zip(orders) {
+            let block = WindowBlock {
+                slice: 0,
+                order,
+                modes: Modes::All,
+                block,
+            };
+            s.sampler
+                .windows(ctx, at, s.spectra, block, &mut w.blocks)?;
+        }
+        Ok(Some(WindowsMut {
+            read: StackWindows {
+                views: &w.views,
+                blocks: &w.blocks,
+            },
+            sums: &mut w.sums,
+        }))
+    }
+
+    /// Under [`Sampling::FullObject`], adds `patches`, a stack's object sums over its windows
+    /// ([`WindowsMut::patches`]), placed back at the stack's offsets over the scan's `views`
+    /// to `out` `[nobj, nyo, nxo]` ([`ObjectSampler::place`]); an error otherwise.
+    pub fn place(
+        &mut self,
+        ctx: &ExecutionContext,
+        views: &Views,
+        stack: StackRef<'_>,
+        patches: &DeviceBuffer<C32>,
+        out: &mut DeviceBuffer<C32>,
+    ) -> Result<(), GpuError> {
+        let s = self.sampled.as_mut().ok_or_else(another_model)?;
+        let at = StackPoints {
+            views,
+            stack,
+            offsets: s.offsets,
+        };
+        s.sampler.place(ctx, at, patches, 0, out)
+    }
+
+    /// Under [`Sampling::FullObject`], the spectra of the object planes `obj` into `out`,
+    /// which [`Self::windows_of`] samples from, by the lend's sampler
+    /// ([`ObjectSampler::spectra`], one transform); an error otherwise.
+    pub fn spectra_of(
+        &mut self,
+        ctx: &ExecutionContext,
+        obj: &DeviceBuffer<C32>,
+        out: &mut DeviceBuffer<C32>,
+    ) -> Result<(), GpuError> {
+        let s = self.sampled.as_mut().ok_or_else(another_model)?;
+        s.sampler.spectra(ctx, obj, out)
+    }
+
+    /// Under [`Sampling::FullObject`], `block` of `stack`'s windows over the scan's `views`
+    /// into `out`, sampled at the stack's offsets from `spectra` ([`Self::spectra_of`]), or
+    /// without, from those of the object the lend took ([`ObjectSampler::windows`], three
+    /// launches per [`SAMPLER_CHUNK`] groups); an error otherwise.
+    pub fn windows_of(
+        &mut self,
+        ctx: &ExecutionContext,
+        views: &Views,
+        stack: StackRef<'_>,
+        spectra: Option<&DeviceBuffer<C32>>,
+        block: WindowBlock,
+        out: &mut DeviceBuffer<C32>,
+    ) -> Result<(), GpuError> {
+        let s = self.sampled.as_mut().ok_or_else(another_model)?;
+        let at = StackPoints {
+            views,
+            stack,
+            offsets: s.offsets,
+        };
+        s.sampler
+            .windows(ctx, at, spectra.unwrap_or(s.spectra), block, out)
+    }
+
+    /// Under [`Sampling::FullObject`], each of `stack`'s frames' position sums of `psi`
+    /// against its windows `w`, sampled with their derivatives
+    /// ([`GradKernels::window_position_sums`]); an error otherwise.
+    pub fn window_position_sums(
+        &mut self,
+        ctx: &ExecutionContext,
+        grad: &GradKernels,
+        w: StackWindows<'_>,
+        stack: StackRef<'_>,
+        psi: &dyn Waves,
+        probe: &DeviceBuffer<C32>,
+    ) -> Result<(), GpuError> {
+        let (Some(_), Some(p)) = (&self.sampled, &mut self.position) else {
+            return Err(another_model());
+        };
+        grad.window_position_sums(ctx, w, stack, psi, probe, [&mut *p.num, &mut *p.den])
+    }
+
     /// The far sums of `llk` and of every stepped feature.
     pub fn far<'c>(&'c mut self, llk: Option<&'c mut DeviceBuffer<LlkPartial>>) -> FarSums<'c> {
         FarSums {
@@ -425,8 +987,9 @@ impl Modelled<'_> {
     }
 
     /// A fused pass's sums of the position model: with `probe` the shifted probe's update
-    /// sums of that kind, with `position` each frame's position sums; none without a
-    /// position.
+    /// sums of that kind if the model moves the probe, with `position` each frame's position
+    /// sums; none without a position. Position sums without a moved probe fail the pass,
+    /// which takes them from the shift alone.
     pub fn shift_sums<'c>(
         &'c mut self,
         probe: Option<fn(&'c mut ShiftedProbeSums) -> ShiftProbe<'c>>,
@@ -434,7 +997,7 @@ impl Modelled<'_> {
     ) -> ShiftSums<'c> {
         match &mut self.position {
             Some(p) => ShiftSums {
-                probe: probe.map(|kind| kind(&mut *p.probe)),
+                probe: (p.probe.as_deref_mut()).zip(probe).map(|(s, kind)| kind(s)),
                 position: position.then_some(&mut *p.num),
                 position_den: position.then_some(&mut *p.den),
             },
@@ -445,11 +1008,12 @@ impl Modelled<'_> {
     /// Whether the model moves the probe, whose update sums then come from
     /// [`Self::shift_sums`] or [`Self::psi_sums`], and [`Self::probe_sums`].
     pub fn shifted(&self) -> bool {
-        self.position.is_some()
+        self.model.shift.is_some()
     }
 
     /// The update sums of stored waves under the position model: `obj`, and with `probe`
-    /// the shifted probe's of that kind; the shifted probe's are none without a position.
+    /// the shifted probe's of that kind; the shifted probe's are none unless the model moves
+    /// the probe.
     pub fn psi_sums<'c>(
         &'c mut self,
         obj: Option<&'c mut UpdateSums>,
@@ -458,13 +1022,14 @@ impl Modelled<'_> {
         PsiSums {
             obj,
             probe: (self.position.as_mut())
+                .and_then(|p| p.probe.as_deref_mut())
                 .zip(probe)
-                .map(|(p, kind)| kind(&mut *p.probe)),
+                .map(|(s, kind)| kind(s)),
         }
     }
 
     /// Adds the shifted probe's update sums the projections added into `out`, consuming
-    /// them; nothing without a position.
+    /// them; nothing unless the model moves the probe.
     pub fn probe_sums(
         &mut self,
         ctx: &ExecutionContext,
@@ -472,8 +1037,8 @@ impl Modelled<'_> {
         dims: &ViewDims,
         out: &mut UpdateSums,
     ) -> Result<(), GpuError> {
-        if let Some(p) = &mut self.position {
-            kernels.shifted_probe_sums(ctx, dims, p.probe, out)?;
+        if let Some(sums) = (self.position.as_mut()).and_then(|p| p.probe.as_deref_mut()) {
+            kernels.shifted_probe_sums(ctx, dims, sums, out)?;
         }
         Ok(())
     }
@@ -485,9 +1050,19 @@ impl FeaturesMut<'_> {
         self.scale.is_some() || self.background.is_some()
     }
 
-    /// Whether the position is modelled, as [`Modelled::shifted`] of a lend.
-    pub fn shifted(&self) -> bool {
+    /// Whether the position is modelled.
+    pub fn positioned(&self) -> bool {
         self.position.is_some()
+    }
+
+    /// Whether the position model moves the probe, as [`Modelled::shifted`] of a lend.
+    pub fn shifted(&self) -> bool {
+        (self.position.as_ref()).is_some_and(|p| p.mover.moves_probe())
+    }
+
+    /// Whether the position model samples the object's windows ([`Sampling::FullObject`]).
+    pub fn samples_object(&self) -> bool {
+        (self.position.as_ref()).is_some_and(|p| matches!(*p.mover, Mover::Object { .. }))
     }
 
     /// The per-frame intensity scale, if modelled.
@@ -495,14 +1070,17 @@ impl FeaturesMut<'_> {
         self.scale.as_ref().map(|s| &*s.values)
     }
 
-    /// The features lent to the passes of one cycle body over `probe`, which cannot change
-    /// while they are: the model of every feature set, the position's after the spectra of
-    /// `probe` it moves (two launches) and the propagator's stage `exit`, and the sums.
+    /// The features lent to the passes of one cycle body over `obj` and `probe`, which
+    /// cannot change while they are: the model of every feature set, the position's shift
+    /// after the spectra of `probe` it moves (two launches) if it moves the probe, or the
+    /// sampler after the spectra of `obj` (one transform) if it samples the object, and the
+    /// propagator's stage `exit`, and the sums.
     pub fn lend<'b>(
         &'b mut self,
         ctx: &ExecutionContext,
         kernels: &Kernels,
         dims: &ViewDims,
+        obj: &DeviceBuffer<C32>,
         probe: &'b DeviceBuffer<C32>,
         exit: ExitPass<'b>,
     ) -> Result<Modelled<'b>, GpuError> {
@@ -514,20 +1092,37 @@ impl FeaturesMut<'_> {
             Some(b) => (Some(&*b.values), Some(&mut *b.sums)),
             None => (None, None),
         };
-        let (shift, position) = match &mut self.position {
+        let (shift, sampled, position) = match &mut self.position {
             Some(p) => {
-                let shift = Shift {
-                    offsets: &*p.offsets,
-                    spectrum: kernels.probe_spectrum(ctx, dims, probe, p.spectrum)?,
+                let (shift, sampled, sums) = match &mut *p.mover {
+                    Mover::Probe {
+                        spectrum,
+                        probe_sums,
+                    } => {
+                        let shift = Shift {
+                            offsets: &*p.offsets,
+                            spectrum: kernels.probe_spectrum(ctx, dims, probe, spectrum)?,
+                        };
+                        (Some(shift), None, Some(&mut **probe_sums))
+                    }
+                    Mover::Object { sampler, spectra } => {
+                        sampler.spectra(ctx, obj, spectra)?;
+                        let sampled = Sampled {
+                            sampler,
+                            spectra: &*spectra,
+                            offsets: &*p.offsets,
+                        };
+                        (None, Some(sampled), None)
+                    }
                 };
                 let sums = PositionSums {
-                    probe: &mut *p.probe_sums,
+                    probe: sums,
                     num: &mut *p.num,
                     den: &mut *p.den,
                 };
-                (Some(shift), Some(sums))
+                (shift, sampled, Some(sums))
             }
-            None => (None, None),
+            None => (None, None, None),
         };
         Ok(Modelled {
             model: Model {
@@ -536,6 +1131,7 @@ impl FeaturesMut<'_> {
                 shift,
                 exit: Some(exit),
             },
+            sampled,
             scale: scale_sums,
             background: background_sums,
             position,
@@ -557,6 +1153,26 @@ impl FeaturesMut<'_> {
             kernels.background_ap(ctx, b.values, b.sums, b.nobs)?;
         }
         Ok(())
+    }
+
+    /// Under [`Sampling::FullObject`], pty-chi's illumination map of `probe` over the scan's
+    /// `views` at the offsets into `out` `[nobj, nyo, nxo]` ([`ObjectSampler::illumination`]),
+    /// the object update's denominator: `true` then, `false` with nothing written otherwise.
+    pub fn illumination(
+        &mut self,
+        ctx: &ExecutionContext,
+        views: &Views,
+        probe: &DeviceBuffer<C32>,
+        out: &mut DeviceBuffer<f32>,
+    ) -> Result<bool, GpuError> {
+        let Some(p) = &mut self.position else {
+            return Ok(false);
+        };
+        let Mover::Object { sampler, .. } = &mut *p.mover else {
+            return Ok(false);
+        };
+        sampler.illumination(ctx, views, p.offsets, probe, out)?;
+        Ok(true)
     }
 
     /// The position step from the position sums the AP projections wrote, after the
@@ -638,41 +1254,84 @@ struct Shared {
     llk: DeviceBuffer<LlkPartial>,
     /// The chunk sums M1's [`Kernels::llk`] reduces a stack's frames through.
     llk_scratch: LlkScratch,
+    /// The windows of the cut's stacks under [`PositionScratch::Windows`].
+    windows: Option<Windows>,
 }
 
 impl Shared {
-    /// M2's fused passes (with `shift`, the position model's) or M1's scratch, `fused`
-    /// picking, cut by `rule` with, if `sliced`, a multislice object's [`Slices::waves`].
+    /// M2's fused passes (with [`PositionScratch::Shift`], the position model's) or M1's
+    /// scratch, `fused` picking, cut by `rule` with `scratch` and, past one of `slices`, a
+    /// multislice object's [`Slices::waves`] and under [`PositionScratch::Windows`] its
+    /// windows.
     fn new(
         stream: &Arc<CudaStream>,
         dims: &ViewDims,
         rule: StackRule,
         fused: bool,
-        shift: bool,
-        sliced: bool,
+        scratch: PositionScratch,
+        slices: usize,
     ) -> Result<Self, EngineError> {
         // M1's scratch: `obj_probe_to_psi` (0), the transforms and `apply_amplitude` (to 3);
-        // the fused work planes: the row (0), column and inverse row passes and the sums over
-        // the waves (3). Under the position `shift_pre` writes `T`, and `T_y` into the adjoint
-        // planes, first (0); the inverse row pass (3) reads both and writes the adjoint, object
-        // planes and power, `shift_post` and the probe sums take the adjoint (4),
-        // `gather_shifted` the rest (5). Of a multislice object, the two waves its slices pass
-        // on, numbered after.
+        // the fused work planes, first: the row (0), column and inverse row passes and the sums
+        // over the waves (3). Under the position's shift `shift_pre` writes `T`, and `T_y` into
+        // the adjoint planes, first (0); the inverse row pass (3) reads both and writes the
+        // adjoint, object planes and power, `shift_post` and the probe sums take the adjoint
+        // (4), `gather_shifted` the rest (5). Under its windows, as AP runs a stack: the
+        // sampler's calls, three launches each, write the windows (0 to 2) and their
+        // derivatives over `y` (3 to 5) and `x` (6 to 8); two memsets zero the window sums
+        // (9, 10), which the fused passes (11 to 14) add to; the position sums (15) read the
+        // work planes and the three blocks, the probe sums (16) the work planes and the
+        // windows; placing the window sums back takes six launches (17 to 22). The LLK pass
+        // and DM's and RAAR's updates run a subset. Of a multislice object, the two waves its
+        // slices pass on, numbered after; under the windows, as the LLK pass runs a stack, the
+        // sampler's calls write each slice's windows in turn (from 23), which the slice passes
+        // after them read beside the waves.
+        let shift = scratch == PositionScratch::Shift;
         let wave = wave_bytes(dims);
-        let mut streamed = vec![Streamed::new(wave, if shift { 1..=3 } else { 0..=3 })];
-        if shift {
-            let probe = plane_bytes::<C32>(dims, dims.nprobe);
-            let obj = plane_bytes::<C32>(dims, dims.nobj) + plane_bytes::<f32>(dims, 1);
-            streamed.extend([
-                Streamed::new(probe, 0..=3),
-                Streamed::new(probe, 0..=4),
-                Streamed::new(obj, 3..=5),
-            ]);
-        }
-        if sliced {
-            streamed.extend([Streamed::new(wave, 6..=7); 2]);
+        let mut streamed = match scratch {
+            PositionScratch::None => vec![Streamed::new(wave, 0..=3)],
+            PositionScratch::Shift => {
+                let probe = plane_bytes::<C32>(dims, dims.nprobe);
+                let obj = plane_bytes::<C32>(dims, dims.nobj) + plane_bytes::<f32>(dims, 1);
+                vec![
+                    Streamed::new(wave, 1..=3),
+                    Streamed::new(probe, 0..=3),
+                    Streamed::new(probe, 0..=4),
+                    Streamed::new(obj, 3..=5),
+                ]
+            }
+            PositionScratch::Windows { sample, place } => {
+                let (block, sums) = (Windows::bytes(dims), Windows::sums_bytes(dims));
+                [
+                    vec![Streamed::new(wave, 11..=16)],
+                    Streamed::chunked(sample, 0..=2, &[(block, 16)], &[]),
+                    Streamed::chunked(sample, 3..=5, &[(block, 15)], &[]),
+                    Streamed::chunked(sample, 6..=8, &[(block, 15)], &[]),
+                    Streamed::chunked(place, 17..=22, &[], &[(sums, 9)]),
+                ]
+                .concat()
+            }
+        };
+        if slices > 1 {
+            streamed.extend(match scratch {
+                PositionScratch::Windows { sample, .. } => {
+                    let (block, n) = (Windows::bytes(dims), to_u32("slices", slices)?);
+                    let pass = 23 + 3 * n;
+                    let sampled = (0..n).flat_map(|k| {
+                        let call = 23 + 3 * k..=25 + 3 * k;
+                        Streamed::chunked(sample, call, &[(block, pass + 1)], &[])
+                    });
+                    (sampled.chain([Streamed::new(wave, pass..=pass + 1); 2])).collect()
+                }
+                PositionScratch::None | PositionScratch::Shift => {
+                    vec![Streamed::new(wave, 6..=7); 2]
+                }
+            });
         }
         let cut = rule.cut(stream, dims, &streamed)?;
+        let windows = matches!(scratch, PositionScratch::Windows { .. })
+            .then(|| Windows::new(stream, dims, &cut, slices))
+            .transpose()?;
         let nf_max = cut.table.nf_max();
         let passes = if fused {
             let f = match shift {
@@ -699,6 +1358,7 @@ impl Shared {
             llk_scratch: LlkScratch::new(stream, dims, nf_max)?,
             cut,
             passes,
+            windows,
         })
     }
 }
@@ -706,10 +1366,11 @@ impl Shared {
 /// DM's or RAAR's stacks and the exit waves each carries across cycles, with RAAR's iterate,
 /// cut by the carried exit waves and the shared scratch; the iterate, which one pass reads and
 /// writes, does not count. Cycle 0 of a call overwrites both sets, so nothing is carried from
-/// one call to the next.
+/// one call to the next. Under [`PositionScratch::Windows`], the windows of its stacks.
 struct CarriedBufs {
     cut: Cut,
     sets: Sets,
+    windows: Option<Windows>,
 }
 
 /// One stack's carried waves for the fused passes, in either format.
@@ -787,7 +1448,10 @@ impl CarriedBufs {
                 }
             }
         };
-        Ok(Self { cut, sets })
+        let windows = (shared.windows.as_ref())
+            .map(|w| Windows::new(stream, dims, &cut, 1 + w.deeper.len()))
+            .transpose()?;
+        Ok(Self { cut, sets, windows })
     }
 
     /// Whether these are the buffers `epoch`'s cycle binds.
@@ -807,6 +1471,7 @@ impl CarriedBufs {
         CarriedMut {
             cut: &self.cut,
             sets: &mut self.sets,
+            windows: self.windows.as_mut(),
         }
     }
 }
@@ -815,6 +1480,7 @@ impl CarriedBufs {
 pub(super) struct CarriedMut<'a> {
     pub cut: &'a Cut,
     sets: &'a mut Sets,
+    windows: Option<&'a mut Windows>,
 }
 
 impl CarriedMut<'_> {
@@ -826,14 +1492,19 @@ impl CarriedMut<'_> {
         }
     }
 
-    /// The fused passes' exit waves of stack `s`, and RAAR's iterate if the sets are RAAR's.
-    pub fn fused(&mut self, s: usize) -> (&mut dyn Waves, Option<&mut dyn Waves>) {
+    /// The fused passes' exit waves of stack `s`, RAAR's iterate if the sets are RAAR's, and
+    /// the cut's windows under [`PositionScratch::Windows`].
+    pub fn fused(
+        &mut self,
+        s: usize,
+    ) -> (&mut dyn Waves, Option<&mut dyn Waves>, Option<&mut Windows>) {
         let Sets::Fused { psi, iterate } = &mut *self.sets else {
             unreachable!("CarriedBufs::new builds the fused passes' sets for theirs");
         };
         (
             &mut *psi[s],
             iterate.as_mut().map(|i| &mut *i[s] as &mut dyn Waves),
+            self.windows.as_deref_mut(),
         )
     }
 
@@ -946,8 +1617,8 @@ struct MlState {
     /// Their sum over the scan.
     icalc: DeviceBuffer<f32>,
     fields: GammaStacks,
-    /// The line search's moved probes, once an ML call has run under the position model.
-    moved: Option<MlMoved>,
+    /// What the line search adds under the position model it was built for.
+    position: Option<MlPosition>,
 }
 
 /// An [`MlState`] lent to an epoch.
@@ -963,28 +1634,30 @@ pub(super) struct MlBufs<'a> {
     pub photons: &'a mut DeviceBuffer<f32>,
     pub icalc: &'a mut DeviceBuffer<f32>,
     pub fields: &'a mut GammaStacks,
-    pub moved: Option<&'a mut MlMoved>,
+    pub position: Option<&'a mut MlPosition>,
 }
 
 impl MlState {
-    /// For frames of `dims` cut by `rule`, arrays of `lens = [object, probe]` values and with
-    /// `moved` the position model.
+    /// For frames of `dims` cut by `rule`, arrays of `lens = [object, probe]` values and what
+    /// `position`, the position model's, adds to the line search.
     fn new(
         stream: &Arc<CudaStream>,
         kernels: &Kernels,
         dims: &ViewDims,
         rule: StackRule,
         lens: [usize; 2],
-        moved: bool,
+        position: PositionScratch,
     ) -> Result<Self, EngineError> {
         // The fields po, a, b: `gamma_fields` (0), the transforms, `gamma_frames` (4). Under
-        // the position the moved probes of P and dP (`shifted_probe` 0 and 2, `shift_w` 1 and
-        // 3) give po, a (4, 5) and b (6, and 8 after `add_c32` 7) by `obj_wave_to_psi`, then
-        // the transforms (9 to 11) and `gamma_frames` (12).
+        // the moved probe those of P and dP (`shifted_probe` 0 and 2, `shift_w` 1 and 3) give
+        // po, a (4, 5) and b (6, and 8 after `add_c32` 7) by `obj_wave_to_psi`, then the
+        // transforms (9 to 11) and `gamma_frames` (12). Under the windows those of O (0 to 2,
+        // from the lend's spectra) and of dO (3 to 5, from dO's) give the fields by
+        // `gamma_fields` (6), then the transforms (7 to 9) and `gamma_frames` (10).
         let wave = wave_bytes(dims);
-        let streamed = match moved {
-            false => vec![Streamed::new(wave, 0..=4); 3],
-            true => {
+        let streamed = match position {
+            PositionScratch::None => vec![Streamed::new(wave, 0..=4); 3],
+            PositionScratch::Shift => {
                 let probe = plane_bytes::<C32>(dims, dims.nprobe);
                 vec![
                     Streamed::new(probe, 0..=5),
@@ -994,8 +1667,27 @@ impl MlState {
                     Streamed::new(wave, 6..=12),
                 ]
             }
+            PositionScratch::Windows { sample, .. } => {
+                let block = plane_bytes::<C32>(dims, dims.nobj);
+                let mut streamed = Streamed::chunked(sample, 0..=2, &[(block, 6)], &[]);
+                streamed.extend(Streamed::chunked(sample, 3..=5, &[(block, 6)], &[]));
+                streamed.extend([Streamed::new(wave, 6..=10); 3]);
+                streamed
+            }
         };
         let cut = rule.cut(stream, dims, &streamed)?;
+        let position = match position {
+            PositionScratch::None => None,
+            PositionScratch::Shift => Some(MlPosition::Moved(Box::new(MlMoved::new(
+                stream,
+                kernels,
+                dims,
+                cut.table.nf_max(),
+            )?))),
+            PositionScratch::Windows { .. } => Some(MlPosition::Sampled(Box::new(MlWindows::new(
+                stream, dims, &cut, lens[0],
+            )?))),
+        };
         let zeroed = |len| DeviceBuffer::<C32>::zeroed(stream, len);
         let pair = || DeviceBuffer::<f32>::zeroed(stream, 2);
         Ok(Self {
@@ -1009,8 +1701,7 @@ impl MlState {
             photons: DeviceBuffer::zeroed(stream, dims.nframe as usize)?,
             icalc: DeviceBuffer::zeroed(stream, 1)?,
             fields: GammaStacks::zeroed(stream, cut.wave_len(dims))?,
-            moved: (moved.then(|| MlMoved::new(stream, kernels, dims, cut.table.nf_max())))
-                .transpose()?,
+            position,
             cut,
         })
     }
@@ -1028,8 +1719,21 @@ impl MlState {
             photons: &mut self.photons,
             icalc: &mut self.icalc,
             fields: &mut self.fields,
-            moved: self.moved.as_mut(),
+            position: self.position.as_mut(),
         }
+    }
+
+    /// Whether what the line search adds is `position`'s.
+    fn fits(&self, position: PositionScratch) -> bool {
+        matches!(
+            (&self.position, position),
+            (None, PositionScratch::None)
+                | (Some(MlPosition::Moved(_)), PositionScratch::Shift)
+                | (
+                    Some(MlPosition::Sampled(_)),
+                    PositionScratch::Windows { .. }
+                )
+        )
     }
 }
 
@@ -1104,7 +1808,7 @@ impl BhState {
     /// For `views` in batches of `size` frames, each cut into stacks by `rule`, and arrays of
     /// `lens = [object, probe]` values; under the position model, `scratch` holds the frames
     /// per stack of the shared scratch, whose shift planes its sums borrow, which caps its
-    /// stacks. The epoch order is the scan's.
+    /// stacks, and the device's sampling. The epoch order is the scan's.
     fn new(
         stream: &Arc<CudaStream>,
         kernels: &Kernels,
@@ -1112,7 +1816,7 @@ impl BhState {
         size: u32,
         rule: StackRule,
         lens: [usize; 2],
-        scratch: Option<u32>,
+        scratch: Option<MovedScratch>,
     ) -> Result<Self, EngineError> {
         let dims = views.dims();
         // The batch's two loops in turn. Without the position: psi (`obj_probe_to_psi` 0, the
@@ -1122,15 +1826,53 @@ impl BhState {
         // adjoint, `shifted_psi_sums` from 6, `obj_conj` 11), y (the transform, `pos_grad`
         // 13); then lu and lv (`pos_spec` 14, the inverses, `pos_near`, the transforms,
         // `pos_far` 22), r (`pos_near` 17, `obj_conj` 20) and y (the transform, `pos_far`).
+        // Under full-object sampling: the estimate's windows (three sampler calls from 0, 3, 6
+        // writing blocks 0 to 2), psi (`obj_probe_to_psi` 9, the transform, the residual 11),
+        // r (the adjoint, `psi_to_probe` 13, `win_grad` 14, which reads blocks 1 and 2), the
+        // patches (`win_grad`, `place` 15 to 20: zeroing, a chunk's embed 16, transform and
+        // accumulate 18, the inverse and the add); then the windows of `u_O` and `v_O` (six
+        // sampler calls from 21), `win_lift` 39, lu and lv (`far` 40, the transforms,
+        // `hess_frames` 43), the second derivatives (three sampler calls from 44) and r and
+        // the derivatives' windows to `win_hess` 53.
         let wave = wave_bytes(dims);
-        let streamed = match scratch {
+        let streamed = match scratch.map(|s| s.sampling) {
             None => vec![
                 Streamed::new(wave, 0..=2),
                 Streamed::new(wave, 2..=4),
                 Streamed::new(wave, 5..=8),
                 Streamed::new(wave, 5..=8),
             ],
-            Some(_) => {
+            Some(MovedSampling::FullObject { held, scratch, acc }) => {
+                let win = Windows::bytes(dims);
+                let calls = [0, 3, 6, 21, 24, 27, 30, 33, 36, 44, 47, 50];
+                let mut s: Vec<_> = (calls.into_iter())
+                    .map(|p| Streamed::fixed(held, p..=p + 2))
+                    .collect();
+                s.extend([
+                    Streamed::new(win, 2..=13),
+                    Streamed::new(win, 5..=14),
+                    Streamed::new(win, 8..=14),
+                    Streamed::new(wave, 9..=11),
+                    Streamed::new(wave, 11..=14),
+                    Streamed::new(win, 14..=16),
+                    Streamed::fixed(scratch, 16..=18),
+                    Streamed::fixed(acc, 15..=20),
+                    Streamed::new(win, 23..=43),
+                    Streamed::new(win, 26..=53),
+                    Streamed::new(win, 29..=53),
+                    Streamed::new(win, 32..=43),
+                    Streamed::new(win, 35..=53),
+                    Streamed::new(win, 38..=53),
+                    Streamed::new(wave, 40..=43),
+                    Streamed::new(wave, 40..=43),
+                    Streamed::new(wave, 43..=53),
+                    Streamed::new(win, 46..=53),
+                    Streamed::new(win, 49..=53),
+                    Streamed::new(win, 52..=53),
+                ]);
+                s
+            }
+            Some(MovedSampling::Patch) => {
                 let mut s = vec![
                     Streamed::new(plane_bytes::<C32>(dims, dims.nprobe), 0..=2),
                     Streamed::new(wave, 2..=4),
@@ -1146,20 +1888,28 @@ impl BhState {
             }
         };
         let frames = rule.frames(&streamed)?;
-        let frames = scratch.map_or(frames, |s| frames.min(s));
+        // Only the shift's sums borrow the shared scratch.
+        let frames = match scratch {
+            Some(
+                s @ MovedScratch {
+                    sampling: MovedSampling::Patch,
+                    ..
+                },
+            ) => frames.min(s.frames),
+            _ => frames,
+        };
         let (cut, batches) = batch_stacks(stream, dims, size, frames)?;
         let len = cut.wave_len(dims);
         let plans = cut.plans(stream, dims)?;
+        let slots = batches.iter().map(|b| b.len()).max().unwrap_or(0);
+        let moved = (scratch.map(|s| BhMoved::new(stream, kernels, dims, &cut, slots, s.sampling)))
+            .transpose()?;
         let Cut {
             frames: stacks,
             table,
             ..
         } = cut;
-        let slots = batches.iter().map(|b| b.len()).max().unwrap_or(0);
         let zeroed = |len| DeviceBuffer::<C32>::zeroed(stream, len);
-        let moved = (scratch.is_some())
-            .then(|| BhMoved::new(stream, kernels, dims, table.nf_max(), slots, len))
-            .transpose()?;
         Ok(Self {
             size,
             plans,
@@ -1238,24 +1988,24 @@ pub(super) struct RpieBufs<'a> {
     pub pmax: &'a mut DeviceBuffer<f32>,
     /// A probe of ones, so `obj_probe_to_psi` yields the object windows.
     pub ones: &'a DeviceBuffer<C32>,
-    pub moved: Option<&'a mut RpieMoved>,
 }
 
 impl RpieScratch {
-    /// For `views` in `params`' batches, `moved` under the position model.
+    /// For `views` in `params`' batches, `moved` the sampling of a position model.
     fn new(
         stream: &Arc<CudaStream>,
         kernels: &Kernels,
         views: &Views,
         params: &RpieParams,
         nprobe_values: usize,
-        moved: bool,
+        moved: Option<Sampling>,
     ) -> Result<Self, EngineError> {
         let dims = views.dims();
         let batch = to_u32("batch_size", params.batch_size)?;
         let (cut, _) = batch_stacks(stream, dims, batch, batch)?;
         let len = cut.wave_len(dims);
         let plans = cut.plans(stream, dims)?;
+        let moved = (moved.map(|s| RpieMoved::new(stream, kernels, views, &cut, s))).transpose()?;
         let Cut {
             frames: batches,
             table,
@@ -1279,14 +2029,14 @@ impl RpieScratch {
             ptilde: DeviceBuffer::zeroed(stream, nprobe_values)?,
             pmax: DeviceBuffer::zeroed(stream, 1)?,
             ones: DeviceBuffer::from_host(stream, &vec![C32 { re: 1.0, im: 0.0 }; nprobe_values])?,
-            moved: (moved.then(|| RpieMoved::new(stream, kernels, views, table.nf_max())))
-                .transpose()?,
+            moved,
             table,
         })
     }
 
-    fn lend(&mut self) -> RpieBufs<'_> {
-        RpieBufs {
+    /// Its buffers, and apart the position model's state.
+    fn lend(&mut self) -> (RpieBufs<'_>, Option<&mut RpieMoved>) {
+        let bufs = RpieBufs {
             batches: &self.batches,
             n: self.n,
             table: &self.table,
@@ -1298,8 +2048,8 @@ impl RpieScratch {
             ptilde: &mut self.ptilde,
             pmax: &mut self.pmax,
             ones: &self.ones,
-            moved: self.moved.as_mut(),
-        }
+        };
+        (bufs, self.moved.as_mut())
     }
 }
 
@@ -1316,7 +2066,9 @@ pub(super) struct Bufs<'a> {
     pub counts: &'a DeviceBuffer<u16>,
     pub obj: &'a mut DeviceBuffer<C32>,
     pub probe: &'a mut DeviceBuffer<C32>,
-    /// A multislice object's slices past `obj`.
+    /// The object's slices past `obj`; none of one slice.
+    pub deeper: &'a mut [DeviceBuffer<C32>],
+    /// A multislice object's [`Slices`] but for `deeper`.
     pub slices: Option<SlicesMut<'a>>,
     pub obj_sums: &'a mut UpdateSums,
     pub probe_sums: &'a mut UpdateSums,
@@ -1324,6 +2076,8 @@ pub(super) struct Bufs<'a> {
     pub probe_len: u32,
     /// The stacks of the passes that stream the shared scratch alone.
     pub scratch: &'a Cut,
+    /// The windows of `scratch`'s stacks while the position samples the object.
+    pub windows: Option<&'a mut Windows>,
     /// DM's or RAAR's carried stacks, once a run of either has built them.
     pub carried: Option<CarriedMut<'a>>,
     /// A stack's LLK partials, which [`crate::gpu::RecordWriter::push`] then copies into the
@@ -1355,12 +2109,14 @@ impl Device {
     /// `ctx`; every pass cuts `0 .. nframe` by the [`StackRule`] of `ctx`'s L2, the LLK ring
     /// holds `options.llk_slots` records of every frame, its unmasked pixels counted here, and
     /// `options.fused` picks the [`Passes`], of which only the fused run a propagator's stage
-    /// or hold the carried waves in f16 ([`GpuOptions::psi_f16`]).
+    /// or hold the carried waves in f16 ([`GpuOptions::psi_f16`]); a position model's offsets
+    /// enter as `sampling`.
     pub fn new(
         ctx: &Arc<CudaContext>,
         dims: ViewDims,
         uploads: Uploads<'_>,
         options: GpuOptions,
+        sampling: Sampling,
     ) -> Result<Self, EngineError> {
         let Uploads {
             stage,
@@ -1410,7 +2166,14 @@ impl Device {
         let views = Views::new(&stream, dims, addrs)?;
         let tile = TileDots::new(&stream, &dims)?;
         let rule = StackRule::on(options.stack_size, ctx, &dims)?;
-        let shared = Shared::new(&stream, &dims, rule, options.fused, false, slices.is_some())?;
+        let shared = Shared::new(
+            &stream,
+            &dims,
+            rule,
+            options.fused,
+            PositionScratch::None,
+            slices.as_ref().map_or(1, |s| 1 + s.deeper.len()),
+        )?;
         let slices = slices
             .map(|s| {
                 let upload = |v: &[Vec<C32>]| {
@@ -1465,6 +2228,7 @@ impl Device {
             bh_state: None,
             lsqml: None,
             features: FeatureBufs::default(),
+            sampling,
             stream,
         };
         let ctx = dev.context();
@@ -1486,9 +2250,12 @@ impl Device {
     /// Models `features`, which the caller checked against the scan, from here on: the
     /// values of the features already set are written in place; other features replace the
     /// buffers, and so first drop every graph, which addresses them, and then recapture the
-    /// LLK pass's. Only the fused passes model features; a position also takes their
-    /// scratch of a shift, which they drop again with it, and so recuts the stacks that
-    /// stream that scratch and drops DM's or RAAR's carried stacks, cut against it.
+    /// LLK pass's. Only the fused passes model features; a position that moves the probe
+    /// ([`Sampling::Patch`]) also takes their scratch of a shift, which they drop again with
+    /// it, and so recuts the stacks that stream that scratch and drops DM's or RAAR's
+    /// carried stacks, cut against it. Nothing changes if a buffer cannot be built; if the
+    /// recapture fails, `features` stay modelled and [`Self::llk_pass`] runs eagerly until a
+    /// later recapture; a failed write in place may leave the values before it written.
     pub fn set_features(&mut self, features: &Features) -> Result<(), EngineError> {
         if matches!(self.shared.passes, Passes::M1 { .. }) && *features != Features::default() {
             return Err(EngineError::Invalid(
@@ -1518,20 +2285,13 @@ impl Device {
         }
         let stream = &self.stream;
         let dims = self.views.dims();
-        // A new cut resizes the slices' waves with it.
-        let shared = (have.position.is_some() != position.is_some())
-            .then(|| {
-                let (moved, sliced) = (position.is_some(), self.slices.is_some());
-                let shared = Shared::new(stream, dims, self.rule, true, moved, sliced)?;
-                let waves = (self.slices.as_ref())
-                    .map(|_| Slices::waves(stream, &shared.cut, dims))
-                    .transpose()?;
-                Ok::<_, EngineError>((shared, waves))
-            })
+        let mover = (position.as_ref())
+            .map(|_| Mover::new(stream, &self.kernels, dims, self.sampling))
             .transpose()?;
+        let shared = self.reshared(mover.as_ref())?;
         let nf_max = shared
             .as_ref()
-            .map_or(&self.shared, |s| &s.0)
+            .map_or(&self.shared, |s| &s.shared)
             .cut
             .table
             .nf_max();
@@ -1557,13 +2317,13 @@ impl Device {
             })
             .transpose()?;
         let position = position
-            .map(|v| {
+            .zip(mover)
+            .map(|(v, mover)| {
                 Ok::<_, EngineError>(PositionBufs {
                     offsets: DeviceBuffer::from_host(stream, &v)?,
-                    spectrum: SpectrumBuf::zeroed(stream, dims)?,
-                    probe_sums: ShiftedProbeSums::zeroed(stream, dims)?,
                     num: DeviceBuffer::zeroed(stream, dims.nframe as usize)?,
                     den: DeviceBuffer::zeroed(stream, dims.nframe as usize)?,
+                    mover,
                 })
             })
             .transpose()?;
@@ -1574,15 +2334,38 @@ impl Device {
             background,
             position,
         };
-        if let Some((shared, waves)) = shared {
-            self.shared = shared;
-            if let Some((s, waves)) = self.slices.as_mut().zip(waves) {
-                s.waves = waves;
-            }
-            self.carried = None;
+        if let Some(r) = shared {
+            self.reshare(r);
         }
         self.capture_llk()?;
         Ok(())
+    }
+
+    /// The shared passes, with a multislice object's waves, for a position that moves as
+    /// `mover` (none without a position): `None` if the current ones serve it, as they do
+    /// whenever both take the same [`PositionScratch`].
+    fn reshared(&self, mover: Option<&Mover>) -> Result<Option<Reshared>, EngineError> {
+        let scratch = PositionScratch::of(mover);
+        if scratch == self.features.scratch() {
+            return Ok(None);
+        }
+        let (stream, dims) = (&self.stream, self.views.dims());
+        let shared = Shared::new(stream, dims, self.rule, true, scratch, self.nslice())?;
+        // A new cut resizes the slices' waves with it.
+        let waves = (self.slices.as_ref())
+            .map(|_| Slices::waves(stream, &shared.cut, dims))
+            .transpose()?;
+        Ok(Some(Reshared { shared, waves }))
+    }
+
+    /// Installs `r`, dropping DM's or RAAR's carried stacks, cut against the shared passes it
+    /// replaces. The caller has dropped every graph, which binds them.
+    fn reshare(&mut self, r: Reshared) {
+        self.shared = r.shared;
+        if let Some((s, waves)) = self.slices.as_mut().zip(r.waves) {
+            s.waves = waves;
+        }
+        self.carried = None;
     }
 
     /// The modelled features, read back.
@@ -1603,6 +2386,50 @@ impl Device {
                 })
                 .transpose()?,
         })
+    }
+
+    pub fn sampling(&self) -> Sampling {
+        self.sampling
+    }
+
+    /// Enters a position's offsets as `sampling` from here on. Another sampling drops ML's,
+    /// BH's and LSQML's states built under a position model, which the next call of their
+    /// algorithm rebuilds under it, and, while a position is modelled, replaces what its
+    /// offsets move, with the shared passes as [`Self::set_features`] does, and every run,
+    /// whose graphs bind them; then it recaptures the LLK pass's graph. Nothing changes if a
+    /// buffer cannot be built; if the recapture fails, `sampling` stays entered with all of
+    /// the above, and [`Self::llk_pass`] runs eagerly until a later recapture.
+    pub fn set_sampling(&mut self, sampling: Sampling) -> Result<(), EngineError> {
+        if sampling == self.sampling {
+            return Ok(());
+        }
+        let mover = (self.features.position.as_ref())
+            .map(|_| {
+                let dims = self.views.dims();
+                Mover::new(&self.stream, &self.kernels, dims, sampling)
+            })
+            .transpose()?;
+        let shared = self.reshared(mover.as_ref())?;
+        self.sampling = sampling;
+        if self.ml.as_ref().is_some_and(|s| s.position.is_some()) {
+            self.ml = None;
+        }
+        if self.bh_state.as_ref().is_some_and(|s| s.moved.is_some()) {
+            self.bh_state = None;
+        }
+        if self.lsqml.as_ref().is_some_and(|s| s.reads().is_some()) {
+            self.lsqml = None;
+        }
+        if let Some((p, mover)) = self.features.position.as_mut().zip(mover) {
+            p.mover = mover;
+            self.runs.clear();
+            self.llk_graph = None;
+            if let Some(r) = shared {
+                self.reshare(r);
+            }
+            self.capture_llk()?;
+        }
+        Ok(())
     }
 
     /// Whether some feature takes a step from far sums: the scale or the background.
@@ -1635,6 +2462,11 @@ impl Device {
     /// A multislice object's slices past [`Self::obj`]; empty of one slice.
     pub fn deeper(&self) -> &[DeviceBuffer<C32>] {
         self.slices.as_ref().map_or(&[], |s| &s.deeper)
+    }
+
+    /// The object's slices.
+    fn nslice(&self) -> usize {
+        1 + self.deeper().len()
     }
 
     /// Fails on a multislice object for `what`, which models one slice: every pass but
@@ -1673,6 +2505,19 @@ impl Device {
     /// Lends every buffer, and apart the passes' own and the ring the cycle writes its records
     /// through.
     fn lend(&mut self) -> (Bufs<'_>, PassesMut<'_>, &mut RingDevice) {
+        let (deeper, slices) = match self.slices.as_mut() {
+            Some(s) => {
+                let slices = SlicesMut {
+                    gaps: &s.gaps,
+                    ones: &s.ones,
+                    quad: s.quad,
+                    position: &s.position,
+                    waves: &mut s.waves,
+                };
+                (&mut s.deeper[..], Some(slices))
+            }
+            None => (&mut [][..], None),
+        };
         let bufs = Bufs {
             kernels: &self.kernels,
             rpie: &self.rpie,
@@ -1688,19 +2533,14 @@ impl Device {
             counts: &self.counts,
             obj: &mut self.obj,
             probe: &mut self.probe,
-            slices: self.slices.as_mut().map(|s| SlicesMut {
-                deeper: &mut s.deeper,
-                gaps: &s.gaps,
-                ones: &s.ones,
-                quad: s.quad,
-                position: &s.position,
-                waves: &mut s.waves,
-            }),
+            deeper,
+            slices,
             obj_sums: &mut self.obj_sums,
             probe_sums: &mut self.probe_sums,
             obj_len: self.obj_len,
             probe_len: self.probe_len,
             scratch: &self.shared.cut,
+            windows: self.shared.windows.as_mut(),
             carried: self.carried.as_deref_mut().map(CarriedBufs::lend),
             llk: &mut self.shared.llk,
             llk_scratch: &mut self.shared.llk_scratch,
@@ -1721,10 +2561,9 @@ impl Device {
                 }),
                 position: self.features.position.as_mut().map(|p| PositionMut {
                     offsets: &mut p.offsets,
-                    spectrum: &mut p.spectrum,
-                    probe_sums: &mut p.probe_sums,
                     num: &mut p.num,
                     den: &mut p.den,
+                    mover: &mut p.mover,
                 }),
             },
         };
@@ -1887,8 +2726,9 @@ impl Device {
 
     /// The buffers of `epoch`'s cycle, and with graphs its graph, captured from them.
     fn new_run(&mut self, epoch: Epoch) -> Result<EpochRun, EngineError> {
+        let what = format!("{:?}", epoch.algorithm());
         if !matches!(epoch, Epoch::Lsqml { .. }) {
-            self.one_slice(&format!("{:?}", epoch.algorithm()))?;
+            self.one_slice(&what)?;
         }
         let mut cycle = match epoch {
             Epoch::Ap { params, llk } => Cycle::Ap { params, llk },
@@ -1901,7 +2741,7 @@ impl Device {
                 Cycle::Raar { params, first }
             }
             Epoch::Rpie(p) => {
-                let moved = self.features.position.is_some();
+                let moved = self.features.positioned().then_some(self.sampling);
                 let scratch = RpieScratch::new(
                     &self.stream,
                     &self.kernels,
@@ -1945,15 +2785,17 @@ impl Device {
         Ok(())
     }
 
-    /// Builds the [`MlState`] for the position model unless it is built. One of the other
-    /// model is replaced only after [`Self::set_features`] has dropped every run, so no
-    /// graph captured from it survives.
+    /// Builds the [`MlState`] for the position model unless it is built: with the line
+    /// search's moved probes if it moves the probe, its windows if it samples the object.
+    /// One of another model is replaced only after [`Self::set_features`] or
+    /// [`Self::set_sampling`] has dropped every run, so no graph captured from it survives.
     fn build_ml(&mut self) -> Result<(), EngineError> {
-        let moved = self.features.position.is_some();
-        if (self.ml.as_ref()).is_none_or(|ml| ml.moved.is_some() != moved) {
+        let position = self.features.scratch();
+        if !(self.ml.as_ref()).is_some_and(|ml| ml.fits(position)) {
             let lens = [self.obj.len(), self.probe.len()];
             let dims = self.dims();
-            let state = MlState::new(&self.stream, &self.kernels, &dims, self.rule, lens, moved)?;
+            let (stream, kernels) = (&self.stream, &self.kernels);
+            let state = MlState::new(stream, kernels, &dims, self.rule, lens, position)?;
             self.ml = Some(Box::new(state));
         }
         Ok(())
@@ -1966,7 +2808,7 @@ impl Device {
     fn build_bh(&mut self, params: &BhParams) -> Result<(), EngineError> {
         let dims = self.dims();
         let size = to_u32("batch_size", params.batch_size.min(dims.nframe as usize))?;
-        let moved = self.features.position.is_some();
+        let moved = self.features.positioned();
         if (self.bh_state.as_ref()).is_none_or(|s| s.size != size || s.moved.is_some() != moved) {
             let lens = [self.obj.len(), self.probe.len()];
             let state = BhState::new(
@@ -1976,34 +2818,50 @@ impl Device {
                 size,
                 self.rule,
                 lens,
-                moved.then(|| self.shared.cut.table.nf_max()),
+                moved.then(|| self.moved_scratch()),
             )?;
             self.bh_state = Some(Box::new(state));
         }
         Ok(())
     }
 
-    /// Builds the [`LsqmlState`] for `params`' batch size and the position model unless it is
-    /// built, replaced as [`Self::build_bh`] replaces BH's.
+    /// Builds the [`LsqmlState`] for `params`' batch size, the position model and its sampling
+    /// unless it is built, replaced as [`Self::build_bh`] replaces BH's.
     fn build_lsqml(&mut self, params: &LsqmlParams) -> Result<(), EngineError> {
         let size = to_u32(
             "batch_size",
             params.batch_size.min(self.dims().nframe as usize),
         )?;
-        let moved = self.features.position.is_some();
-        if (self.lsqml.as_ref()).is_none_or(|s| s.size() != size || s.moved() != moved) {
+        let reads = self.features.positioned().then_some(self.sampling);
+        if (self.lsqml.as_ref()).is_none_or(|s| s.size() != size || s.reads() != reads) {
             let state = LsqmlState::new(
                 &self.stream,
                 &self.kernels,
                 &self.views,
                 size,
                 self.rule,
-                moved.then(|| self.shared.cut.table.nf_max()),
+                reads.map(|_| self.moved_scratch()),
                 self.deeper().len(),
             )?;
             self.lsqml = Some(Box::new(state));
         }
         Ok(())
+    }
+
+    /// The position model's [`MovedScratch`] for a cycle that runs its own passes.
+    fn moved_scratch(&self) -> MovedScratch {
+        let sampling = match self.features.position.as_ref().map(|p| &p.mover) {
+            Some(Mover::Object { sampler, .. }) => MovedSampling::FullObject {
+                held: sampler.windows_held(),
+                scratch: sampler.scratch_bytes(),
+                acc: sampler.acc_bytes(),
+            },
+            _ => MovedSampling::Patch,
+        };
+        MovedScratch {
+            frames: self.shared.cut.table.nf_max(),
+            sampling,
+        }
     }
 
     /// [`Bufs::scale_to_photons`] enqueued eagerly, with `total` the unmasked observed photons.
@@ -2166,7 +3024,10 @@ impl<'a> Bufs<'a> {
             Cycle::Raar { params, first } => self
                 .with_carried(|b, c| b.raar_cycle(ctx, passes, c, params, *first))
                 .map(|()| None),
-            Cycle::Rpie(p, scratch) => self.rpie_epoch(ctx, p, &mut scratch.lend()).map(|()| None),
+            Cycle::Rpie(p, scratch) => {
+                let (mut rb, moved) = scratch.lend();
+                self.rpie_epoch(ctx, p, &mut rb, moved).map(|()| None)
+            }
             Cycle::Ml { params, first, llk } => self.with_ml(|b, ml| {
                 b.ml_epoch(ctx, passes, ml, params, *first, llk.then(|| ring.record()))
             }),

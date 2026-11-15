@@ -42,18 +42,20 @@ mod position;
 mod psi;
 mod ring;
 mod rpie;
+pub mod sampling;
 
 pub use crate::fft::C32;
 pub use bh::{
     BH_HESS, BH_STEP, BhBatch, BhDisp, BhFieldsRef, BhKernels, BhMovedFarRef, BhMovesRef,
-    BhNearMut, BhOffsets, BhPositions, BhScan, BhVar, EpochOrder, bh_parts,
+    BhNearMut, BhOffsets, BhPositions, BhScan, BhVar, BhWinRef, BhWinSecond, EpochOrder, bh_parts,
 };
 pub use fused::{
     BackgroundSums, Exit, FUSED_SIDES, FarSums, FusedBufs, FusedInputs, FusedSums, Model,
     ProbeSpectrum, PsiSums, Shift, ShiftProbe, ShiftSums, ShiftedProbeSums, SpectrumBuf,
 };
 pub use grad::{
-    CG_BLOCKS, GAMMA_CHUNK, GammaCounts, GammaStacks, GradKernels, ObjProbeScale, gamma_parts,
+    CG_BLOCKS, GAMMA_CHUNK, GammaCounts, GammaStacks, GradKernels, ObjProbeScale, StackWindows,
+    gamma_parts,
 };
 pub use lsqml::{
     LSQML_REC, LsqmlAt, LsqmlChi, LsqmlKernels, LsqmlNoise, LsqmlScan, LsqmlVar, SliceSteps,
@@ -64,7 +66,10 @@ pub use ops::{
     PositionPartial, ScalePartial, StackCtl, StackGeom, StackRef, StackTable, UpdateSums, ViewAddr,
     ViewDims, Views, view_tiles,
 };
-pub use optics::{ExitPass, ExitStage, FrameWaves, OpticsKernels, SlicePhase, SliceSource};
+pub use optics::{
+    BandCarry, BandedTransfer, ExitPass, ExitStage, FrameWaves, OpticsKernels, SlicePhase,
+    SliceSource,
+};
 pub use position::{PositionKernels, PositionRule, Positions, Solve};
 pub use psi::{HalfWaves, Waves, half_scale};
 pub use ring::{Ended, FrameLlk, LlkRing, LlkTotals, RecordWriter, RingDevice, RingError};

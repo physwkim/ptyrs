@@ -3,7 +3,7 @@
 use crate::gpu::{Error as GpuError, Exit, FusedBufs, FusedInputs, FusedSums, ShiftProbe};
 use cuda_async::device_operation::ExecutionContext;
 
-use super::device::{CarriedMut, M1Bufs, PassesMut};
+use super::device::{CarriedMut, M1Bufs, PassesMut, Sample, another_model};
 use super::{Bufs, Epoch, GpuPtycho};
 use crate::engine::ptycho::llk_due;
 use crate::engine::{DmParams, EngineError};
@@ -22,7 +22,9 @@ impl GpuPtycho {
     /// models the probe moved by each frame's offsets, the projection also takes each frame's
     /// position sums of the waves it leaves against the arrays it read, the later updates
     /// take their sums of the carried waves by `shifted_psi_sums`, and the offsets step after
-    /// the updates.
+    /// the updates; under [`crate::engine::Sampling::FullObject`] every pass reads each
+    /// stack's windows of the object sampled at the offsets instead, the object sums are
+    /// placed back from them, and each object update divides by the illumination map.
     pub fn dm(&mut self, params: &DmParams, ncycle: usize) -> Result<(), EngineError> {
         let epoch = |first| Epoch::Dm {
             params: *params,
@@ -127,25 +129,67 @@ impl Bufs<'_> {
                     let _ = self.step_features(ctx, f, None)?;
                 }
                 let dims = *self.views.dims();
-                let mut m = self
-                    .features
-                    .lend(ctx, self.kernels, &dims, self.probe, self.exit)?;
+                let mut m = self.features.lend(
+                    ctx,
+                    self.kernels,
+                    &dims,
+                    self.obj,
+                    self.probe,
+                    self.exit,
+                )?;
                 for s in 0..w.cut.len() {
                     let stack = w.cut.at(s);
-                    let (psi, iterate) = w.fused(s);
+                    let (psi, iterate, windows) = w.fused(s);
                     let exit = match c.mix {
                         Mix::Dm { alpha } => match c.first {
-                            true => Exit::DmFirst { psi },
-                            false => Exit::Dm { psi, alpha },
+                            true => Exit::DmFirst { psi: &mut *psi },
+                            false => Exit::Dm {
+                                psi: &mut *psi,
+                                alpha,
+                            },
                         },
                         Mix::Raar { beta } => {
                             let iterate = iterate.expect("Device::new_run built the RAAR iterate");
                             match c.first {
-                                true => Exit::RaarFirst { psi, iterate },
-                                false => Exit::Raar { psi, iterate, beta },
+                                true => Exit::RaarFirst {
+                                    psi: &mut *psi,
+                                    iterate,
+                                },
+                                false => Exit::Raar {
+                                    psi: &mut *psi,
+                                    iterate,
+                                    beta,
+                                },
                             }
                         }
                     };
+                    let sampled = Sample::Derivatives;
+                    if let Some(mut win) = m.windows(ctx, self.views, stack, windows, sampled)? {
+                        let read = win.read;
+                        let inputs = FusedInputs {
+                            views: read.views,
+                            counts: self.counts,
+                            obj: read.blocks,
+                            probe: self.probe,
+                            model: m.model,
+                        };
+                        let sums = FusedSums {
+                            obj: summed.then(|| win.zeroed_sums(ctx)).transpose()?,
+                            ..FusedSums::default()
+                        };
+                        (self.kernels).fused_project(ctx, &inputs, stack, exit, f, sums)?;
+                        m.window_position_sums(ctx, self.grad, read, stack, &*psi, self.probe)?;
+                        if summed {
+                            m.place(
+                                ctx,
+                                self.views,
+                                stack,
+                                win.patches(),
+                                &mut self.obj_sums.num,
+                            )?;
+                        }
+                        continue;
+                    }
                     let inputs = FusedInputs {
                         views: self.views,
                         counts: self.counts,
@@ -174,6 +218,9 @@ impl Bufs<'_> {
                         PassesMut::Fused(f) if self.features.shifted() => {
                             // The probe's step is taken there.
                             self.shifted_sums(ctx, f, w, o.is_some(), p.take())?;
+                        }
+                        PassesMut::Fused(_) if self.features.samples_object() => {
+                            self.windowed_sums(ctx, w, o.is_some(), p.is_some())?;
                         }
                         _ => {
                             for s in 0..w.cut.len() {
@@ -204,9 +251,9 @@ impl Bufs<'_> {
         probe: Option<f64>,
     ) -> Result<(), GpuError> {
         let dims = *self.views.dims();
-        let mut m = self
-            .features
-            .lend(ctx, self.kernels, &dims, self.probe, self.exit)?;
+        let mut m =
+            self.features
+                .lend(ctx, self.kernels, &dims, self.obj, self.probe, self.exit)?;
         for s in 0..w.cut.len() {
             let inputs = FusedInputs {
                 views: self.views,
@@ -248,6 +295,51 @@ impl Bufs<'_> {
             .probe_step(ctx, &inputs, stacks, f, step, sums, inertia as f32)?;
         self.kernels
             .probe_step_add(ctx, self.probe, self.probe_sums)
+    }
+
+    /// The update sums of every stack's carried exit waves in `w` under
+    /// [`crate::engine::Sampling::FullObject`], against the stack's windows of the current
+    /// arrays, sampled anew since an update may have changed the object: with `obj` the
+    /// object's, placed back from the windows, with `probe` the probe's.
+    fn windowed_sums(
+        &mut self,
+        ctx: &ExecutionContext,
+        w: &mut CarriedMut<'_>,
+        obj: bool,
+        probe: bool,
+    ) -> Result<(), GpuError> {
+        let dims = *self.views.dims();
+        let mut m =
+            self.features
+                .lend(ctx, self.kernels, &dims, self.obj, self.probe, self.exit)?;
+        // The object's sums read the views and the probe alone.
+        let sample = match probe {
+            true => Sample::Windows,
+            false => Sample::Views,
+        };
+        for s in 0..w.cut.len() {
+            let stack = w.cut.at(s);
+            let (psi, _, windows) = w.fused(s);
+            let win = m.windows(ctx, self.views, stack, windows, sample)?;
+            let mut win = win.ok_or_else(another_model)?;
+            let read = win.read;
+            if obj {
+                let sums = win.zeroed_sums(ctx)?;
+                (self.kernels).psi_to_obj(ctx, read.views, stack, &*psi, self.probe, sums)?;
+                m.place(
+                    ctx,
+                    self.views,
+                    stack,
+                    win.patches(),
+                    &mut self.obj_sums.num,
+                )?;
+            }
+            if probe {
+                let sums = &mut *self.probe_sums;
+                (self.kernels).psi_to_probe(ctx, read.views, stack, &*psi, read.blocks, sums)?;
+            }
+        }
+        Ok(())
     }
 
     /// `w`'s stack `s`'s DM exit waves by M1's launches, `PO` through the shared scratch.

@@ -3,14 +3,18 @@
 //! `tests/data`. Its cases share the start object, probe and corners and differ in geometry
 //! and counts: 0 an angular-spectrum propagator, 1 a Fresnel transform, 2 an angular spectrum
 //! with an evanescent band, 3 a Fresnel transform back. Every frame sits at a whole-pixel
-//! corner, so pty-chi's PATCH extraction and the engine's views read the same pixels.
+//! corner, so pty-chi's PATCH extraction and the engine's views read the same pixels, except
+//! in `refs/f64/lsqml_near_pos.py`'s steps on cases 0 and 2, which move each frame by a
+//! [`Features::position`] offset and refine it under pty-chi's PATCH
+//! (`lsqml_near_pos_*_f64.txt`) and FULL_OBJECT (`lsqml_near_pos_full_*_f64.txt`) shift
+//! operators.
 
 use std::slice;
 
 use ptyrs::base::{AddrTable, C64, Counts, Object, Positions, Probe, Stack, View};
 use ptyrs::engine::{
-    Cost, Lsqml, LsqmlBatch, LsqmlParams, LsqmlStep, Observed, Optics, ProbeVariation, Propagator,
-    Wavefield, illumination, llk, obj_probe_to_psi, shift,
+    Cost, Features, Lsqml, LsqmlBatch, LsqmlParams, LsqmlStep, Observed, Optics, ProbeVariation,
+    Propagator, Sampling, Wavefield, illumination, llk, obj_probe_to_psi, shift,
 };
 
 #[path = "common/worst.rs"]
@@ -344,6 +348,105 @@ fn step_matches_ptychi() {
             include_str!("engine/data/lsqml_near_step_probe_f64.txt"),
         );
     }
+}
+
+/// `lsqml_near_pos.py`'s files of one shift operator: the steps, the offsets and the object
+/// and probe changes.
+struct PosRefs {
+    steps: &'static str,
+    offsets: &'static str,
+    obj: &'static str,
+    probe: &'static str,
+}
+
+/// [`step_matches_ptychi`] from the truth object with every frame moved by
+/// `lsqml_near_pos.py`'s offset and the positions refined under `sampling`, against `refs`
+/// on every case they hold: the step, the changes and the offset changes. Returns how many
+/// cases it checked.
+fn assert_positions_step(sampling: Sampling, refs: PosRefs) -> usize {
+    let mut s = state();
+    s.object = Object::new(stack(
+        [1, OBJ[0], OBJ[1]],
+        &table(include_str!("engine/data/lsqml_near_pos_start_f64.txt")),
+        2,
+    ));
+    let (rows, offsets) = (table(refs.steps), table(refs.offsets));
+    let views = &s.addr.views()[..BATCH * s.addr.nmode()];
+    let mut checked = 0;
+    for (k, c) in s.cases.iter().enumerate() {
+        let offsets: Vec<_> = offsets.iter().filter(|r| r[0] == k as f64).collect();
+        if offsets.is_empty() {
+            continue;
+        }
+        checked += 1;
+        let at = |col: usize| -> Vec<[f64; 2]> {
+            offsets.iter().map(|r| [r[col], r[col + 1]]).collect()
+        };
+        let (d0, want) = (at(2), at(4));
+        let (mut object, mut probe) = (s.object.clone(), s.probe.clone());
+        let pre = sampling.illumination(s.addr.views(), object.dims(), &probe, Some(&d0));
+        let mut var = ProbeVariation::none(probe.plane_shape());
+        let mut run = Lsqml::new(LsqmlParams {
+            batch_size: BATCH,
+            cost: Cost::Poisson,
+            seed: 0,
+        })
+        .unwrap()
+        .with_sampling(sampling)
+        .with_preconditioner(pre)
+        .with_features(Features {
+            position: Some(d0.clone()),
+            ..Features::default()
+        })
+        .unwrap();
+        let step = run.step(
+            views,
+            &c.obs,
+            &c.optics,
+            slice::from_mut(&mut object),
+            &mut probe,
+            &mut var,
+        );
+        let want_steps: Vec<_> = rows.iter().filter(|r| r[0] == k as f64).collect();
+        let what = format!("case {k} {sampling:?}");
+        assert_step(&format!("{what} positions"), &step, &want_steps, 1);
+        assert_changes(&s, k, &object, &probe, refs.obj, refs.probe);
+        let change = |d: &[[f64; 2]]| -> Vec<f64> {
+            d.iter()
+                .zip(&d0)
+                .flat_map(|(d, s)| [d[0] - s[0], d[1] - s[1]])
+                .collect()
+        };
+        let got = run.features().position.as_ref().unwrap();
+        let err = max_rel(&change(got), &change(&want));
+        eprintln!("{what} offsets: max rel {err:.3e}");
+        assert!(err < 1e-11, "{what} offsets: max rel {err:.3e}");
+    }
+    checked
+}
+
+/// [`assert_positions_step`] under PATCH.
+#[test]
+fn step_with_positions_matches_ptychi() {
+    let refs = PosRefs {
+        steps: include_str!("engine/data/lsqml_near_pos_steps_f64.txt"),
+        offsets: include_str!("engine/data/lsqml_near_pos_offsets_f64.txt"),
+        obj: include_str!("engine/data/lsqml_near_pos_obj_f64.txt"),
+        probe: include_str!("engine/data/lsqml_near_pos_probe_f64.txt"),
+    };
+    assert_eq!(assert_positions_step(Sampling::Patch, refs), 2);
+}
+
+/// [`assert_positions_step`] under FULL_OBJECT.
+#[test]
+fn step_with_full_object_positions_matches_ptychi() {
+    let refs = PosRefs {
+        steps: include_str!("engine/data/lsqml_near_pos_full_steps_f64.txt"),
+        offsets: include_str!("engine/data/lsqml_near_pos_full_offsets_f64.txt"),
+        obj: include_str!("engine/data/lsqml_near_pos_full_obj_f64.txt"),
+        probe: include_str!("engine/data/lsqml_near_pos_full_probe_f64.txt"),
+    };
+    assert_eq!(assert_positions_step(Sampling::FullObject, refs), 2);
 }
 
 /// The reconstruction: [`Lsqml::epoch`]s of batches of 8 (seed 7) from the start against

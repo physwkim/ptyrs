@@ -6,7 +6,7 @@ use crate::gpu::{
 };
 use cuda_async::device_operation::ExecutionContext;
 
-use super::device::PassesMut;
+use super::device::{PassesMut, Sample};
 use super::{Bufs, Epoch, GpuPtycho};
 use crate::engine::ptycho::llk_due;
 use crate::engine::{ApParams, EngineError};
@@ -20,7 +20,10 @@ impl GpuPtycho {
     /// values. With a position, every pass models the probe moved by each frame's offsets,
     /// the projection also takes each frame's position sums against the arrays it read, the
     /// probe takes the step of [`crate::gpu::Kernels::probe_step`] against the old object,
-    /// and the offsets step after the updates.
+    /// and the offsets step after the updates; under [`crate::engine::Sampling::FullObject`]
+    /// the passes read each stack's windows of the object sampled at the offsets instead, the
+    /// object sums are placed back from them, and the object update divides by the
+    /// illumination map.
     pub fn ap(&mut self, params: &ApParams, ncycle: usize) -> Result<(), EngineError> {
         for ic in 0..ncycle {
             let epoch = Epoch::Ap {
@@ -84,7 +87,9 @@ impl Bufs<'_> {
     /// leaves in `f`. With a position, the projection adds the shifted probe's sums and each
     /// frame's position sums instead, and after the last stack the shifted probe's become the
     /// probe's step, which it takes here against the object the projection read: `true` then,
-    /// with no probe sums left to apply.
+    /// with no probe sums left to apply. Under its windows, the stack's windows and their
+    /// derivatives are sampled first; the projection reads the windows and adds the object
+    /// sums over them, which are placed back after the position and probe sums.
     fn fused_ap(
         &mut self,
         ctx: &ExecutionContext,
@@ -95,11 +100,49 @@ impl Bufs<'_> {
     ) -> Result<bool, GpuError> {
         let probe = probe_inertia.is_some();
         let dims = *self.views.dims();
-        let mut m = self
-            .features
-            .lend(ctx, self.kernels, &dims, self.probe, self.exit)?;
+        let mut m =
+            self.features
+                .lend(ctx, self.kernels, &dims, self.obj, self.probe, self.exit)?;
         for s in 0..self.scratch.len() {
             let stack = self.scratch.at(s);
+            let windows = self.windows.as_deref_mut();
+            if let Some(mut w) = m.windows(ctx, self.views, stack, windows, Sample::Derivatives)? {
+                let read = w.read;
+                let inputs = FusedInputs {
+                    views: read.views,
+                    counts: self.counts,
+                    obj: read.blocks,
+                    probe: self.probe,
+                    model: m.model,
+                };
+                let far = FarSums {
+                    llk: llk.is_some().then_some(&mut *self.llk),
+                    ..FarSums::default()
+                };
+                let sums = FusedSums {
+                    obj: obj.then(|| w.zeroed_sums(ctx)).transpose()?,
+                    ..FusedSums::default()
+                };
+                (self.kernels).fused_project(ctx, &inputs, stack, Exit::Ap { far }, f, sums)?;
+                if let Some(rec) = &mut llk {
+                    rec.push(ctx, &dims, stack, self.llk)?;
+                }
+                m.window_position_sums(ctx, self.grad, read, stack, f.work(), self.probe)?;
+                if probe {
+                    (self.kernels).psi_to_probe(
+                        ctx,
+                        read.views,
+                        stack,
+                        f.work(),
+                        read.blocks,
+                        self.probe_sums,
+                    )?;
+                }
+                if obj {
+                    m.place(ctx, self.views, stack, w.patches(), &mut self.obj_sums.num)?;
+                }
+                continue;
+            }
             let inputs = FusedInputs {
                 views: self.views,
                 counts: self.counts,

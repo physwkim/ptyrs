@@ -38,16 +38,18 @@ pub struct PositionRule {
 }
 
 /// What [`position_kernels::LoadedModule::position_sums`] reads and writes: `chi` the
-/// stack's exit-wave update `[nf_max * nmode, ny, nx]` and `w` its waves as [`WavePlanes`]
-/// says (the moved probe, or a multislice object's wave entering a slice), both at the exit
-/// wave's stored pixels, `slopes` its frames' object slopes `[nf_max, 2, ny, nx]`
-/// ([`slopes`]), and `sums` the [`POSITION_SUMS`] of every frame's chunks by epoch
-/// position.
+/// stack's exit-wave update `[nf_max * nmode, ny, nx]` at the exit wave's stored pixels,
+/// `w` its waves as [`WavePlanes`] says (the moved probe, or a multislice object's wave
+/// entering a slice) at the same pixels, or with `probe` set the unmoved probe `[nprobe, ny,
+/// nx]` in the natural layout, `slopes` its frames' object slopes `[2, nf_max, ny, nx]` in
+/// the natural layout ([`slopes`], or the sampled windows' derivatives), and `sums` the
+/// [`POSITION_SUMS`] of every frame's chunks by epoch position.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct PositionSums {
     pub chi: *const f32,
     pub w: WavePlanes,
+    pub probe: u32,
     pub slopes: *const f32,
     pub sums: *mut f32,
 }
@@ -95,7 +97,7 @@ pub unsafe fn shift_w<const NX: u32>(t: *mut f32, ctl: *const StackCtl, g: Stack
 /// pty-chi's object slope along `axis` (0 `y`, 1 `x`) of each frame `fl = blockIdx.y` of the
 /// stack: with `v` the frame's first view, the patch `O[v.obj, v.oy + y, v.ox + x]` (`fy` and
 /// `fx` not read), Fourier-differentiated as periodic, `IDFT(DFT(patch) i 2π freq(k, N)) /
-/// N` along the axis, into `out[fl, axis]` at natural `(y, x)`. Line `l = blockIdx.x *
+/// N` along the axis, into `out[axis, fl]` at natural `(y, x)`. Line `l = blockIdx.x *
 /// FUSED_COLS + b` across the axis; thread `f * FUSED_COLS + b` along `y`, `b * tpf + f`
 /// along `x` (`tpf = N / fft_ept(N)`), so either reads its rows in order. Grid `(m /
 /// FUSED_COLS, nf_max)`, `m` the side across the axis, block `FUSED_COLS * tpf`, dynamic shared
@@ -104,7 +106,7 @@ pub unsafe fn shift_w<const NX: u32>(t: *mut f32, ctl: *const StackCtl, g: Stack
 /// # Safety
 ///
 /// `N` is `g.ny` along `y`, `g.nx` along `x`; `obj` holds `[nobj, nyo, nxo]` with every
-/// frame's first view's window inside, `views` the epoch's views, `out` `[nf_max, 2, ny,
+/// frame's first view's window inside, `views` the epoch's views, `out` `[2, nf_max, ny,
 /// nx]`; `ctl` one entry; launch as above.
 #[device]
 pub unsafe fn slopes<const N: u32>(
@@ -131,7 +133,7 @@ pub unsafe fn slopes<const N: u32>(
     let l = thread::blockIdx_x() * FUSED_COLS + b;
     let at = |e: u32| if axis == 0 { (e, l) } else { (l, e) };
     let n = g.ny as usize * g.nx as usize;
-    let dst = (2 * fl + axis) as usize * n;
+    let dst = (axis * g.nf_max + fl) as usize * n;
     let tau = 2.0 * core::f32::consts::PI / N as f32;
     let mut r = [0.0f32; 2 * FFT_EPT_MAX as usize];
     unsafe {
@@ -288,8 +290,10 @@ pub mod position_kernels {
     /// The position sums of chunk `c = blockIdx.x` of frame `f0 + fl`, `fl = blockIdx.y`,
     /// over the pixels `i` in `c * GAMMA_CHUNK .. min((c + 1) * GAMMA_CHUNK, n)` of its first
     /// view `v` (mode 0): with `u_ax = slope_ax W_v` (the slope at `i`, `W_v` the view's wave
-    /// of `w`, it and `chi` at the exit-wave index of `i`), `sums[4p .. 4p + 4]` gets the
-    /// [`POSITION_SUMS`], `p = (f0 + fl) * nchunk + c`.
+    /// of `w`, it and `chi` at the exit-wave index of `i`; with `p.probe` set, `W_v` probe
+    /// plane 0 at `i` times `quad_phase(g.quad)`, plane 0 being mode 0's by the views'
+    /// canonical modes), `sums[4p .. 4p + 4]` gets the [`POSITION_SUMS`], `p = (f0 + fl) *
+    /// nchunk + c`.
     ///
     /// # Safety
     ///
@@ -301,11 +305,12 @@ pub mod position_kernels {
         let PositionSums {
             chi,
             w,
+            probe,
             slopes,
             sums,
         } = p;
         let (f0, nf) = unsafe { stack_frames(ctl, g) };
-        let (ny, nx, nmode) = (g.ny, g.nx, g.nmode as usize);
+        let (ny, nx, nmode, nf_max) = (g.ny, g.nx, g.nmode as usize, g.nf_max as usize);
         let n = ny as usize * nx as usize;
         let fl = thread::blockIdx_y() as usize;
         // The whole block leaves together, before its first barrier.
@@ -316,7 +321,8 @@ pub mod position_kernels {
         let chunk = GAMMA_CHUNK as usize;
         let end = n.min((c + 1) * chunk);
         let pos = f0 as usize + fl;
-        let wp = wave_plane(w, fl, 0) * n;
+        let probe = probe != 0;
+        let wp = if probe { 0 } else { wave_plane(w, fl, 0) * n };
         let mut acc = [0.0f32; POSITION_SUMS as usize];
         let base = c * chunk + thread::threadIdx_x() as usize;
         // Every load of a group is issued before its sums, which keep the pixel order.
@@ -333,10 +339,10 @@ pub mod position_kernels {
                     let at = psi_index(i as u32 / nx, i as u32 % nx, ny, nx);
                     ld[j] = unsafe {
                         [
-                            load_c(w.w, wp + at),
+                            load_c(w.w, wp + if probe { i } else { at }),
                             load_c(chi, fl * nmode * n + at),
-                            load_c(slopes, 2 * fl * n + i),
-                            load_c(slopes, (2 * fl + 1) * n + i),
+                            load_c(slopes, fl * n + i),
+                            load_c(slopes, (nf_max + fl) * n + i),
                         ]
                     };
                 }
@@ -346,7 +352,11 @@ pub mod position_kernels {
                 let j = j as usize;
                 let i = i0 + j * PIXEL_THREADS as usize;
                 if i < end {
-                    let [ws, ch, ..] = ld[j];
+                    let [mut ws, ch, ..] = ld[j];
+                    if probe {
+                        let q = quad_phase(g.quad, i as u32 / nx, i as u32 % nx, ny, nx);
+                        ws = cmul(ws, q);
+                    }
                     #[unroll]
                     for ax in 0..2 {
                         let gu = cmul(ld[j][2 + ax], ws);

@@ -4,20 +4,22 @@
 //! epochs. Through several slices, which pty-chi's BH rejects, the object variable is every
 //! slice of [`SliceWaves`].
 //!
-//! With [`Features::position`] the offsets join the variables on the engine's position model:
-//! frame `b`'s probe is moved by its offset `d_b` as [`crate::engine::Lsqml`] moves it, where
-//! pty-chi's BH translates the object patch. A Fourier translation or derivative factors over
-//! a product only when the product is unaliased, which a view's probe times object window in
-//! general is not, so the two costs, gradients and steps differ (by 30–80% on
-//! `refs/f64/bh_pos.py`'s scan); they agree at zero offsets on a band-limited state, where the
-//! model checks its signs and units against pty-chi.
+//! With [`Features::position`] the offsets join the variables on the run's [`Sampling`]
+//! ([`Bh::with_sampling`]). Under [`Sampling::FullObject`] frame `b`'s views read every slice
+//! sampled at their corners plus its offset `d_b`, pty-chi's `FULL_OBJECT`. Under
+//! [`Sampling::Patch`] frame `b`'s probe is moved by `d_b` as [`crate::engine::Lsqml`] moves
+//! it, where pty-chi's `PATCH` translates the object patch. A Fourier translation or
+//! derivative factors over a product only when the product is unaliased, which a view's probe
+//! times object window in general is not, so the two costs, gradients and steps differ (by
+//! 30–80% on `refs/f64/bh_pos.py`'s scan); they agree at zero offsets on a band-limited state,
+//! where the model checks its signs and units against pty-chi.
 
 use crate::base::{AddrTable, C64, Object, Probe, Stack, View};
 
 use crate::engine::features::{POSITION_STEP, move_derivative, move_planes};
 use crate::engine::linop::FarJacobian;
 use crate::engine::{
-    EngineError, Features, Fft2, LinearOp, Observed, Optics, ProbeVariation, SliceJacobian,
+    EngineError, Features, Fft2, Observed, Optics, ProbeVariation, Sampling, SliceJacobian,
     SliceWaves, random_batches,
 };
 
@@ -87,6 +89,19 @@ impl BhVector {
     }
 }
 
+/// How the batch frames' offsets enter the waves, by the [`Sampling`].
+enum Position {
+    /// [`Sampling::Patch`]: the frames' probe moves.
+    Probe(Moves),
+    /// [`Sampling::FullObject`]: per slice, the derivatives over the offsets of what the views
+    /// read, `∂_a S(O_s)` per axis `a` and `∂_a ∂_c S(O_s)` at index `a + c`, `S` the views'
+    /// sampling.
+    Object {
+        first: Vec<[Object; 2]>,
+        second: Vec<[Object; 3]>,
+    },
+}
+
 /// The batch frames' probe moves: frame `b`'s copy of the probe is `M_b(P)`, [`move_planes`]
 /// by its offset `d_b`, with these first and second derivatives over `d_b`.
 struct Moves {
@@ -103,8 +118,10 @@ struct Moves {
 /// `psi` the exit waves of [`SliceWaves`] at frame `b`'s probe `M_b(P)` and `U` the
 /// [`Optics::exit`]. `views` are whole frames of an [`AddrTable`], each frame's views in
 /// its order. Every frame reads its own copy of the probe, the probe moved by the frame's
-/// offset (`M_b` the identity without offsets), and the derivatives over the probe and the
-/// offsets go through those copies.
+/// offset under [`Sampling::Patch`] (`M_b` the identity without offsets or under
+/// [`Sampling::FullObject`]), and the derivatives over the probe go through those copies;
+/// those over the offsets go through the copies or, under [`Sampling::FullObject`], through
+/// what the views read of the slices.
 pub struct BhBatch<'a> {
     optics: &'a Optics,
     waves: SliceWaves<'a>,
@@ -113,7 +130,7 @@ pub struct BhBatch<'a> {
     /// The copies' dims, `nprobe` planes per frame.
     copy_dims: [usize; 3],
     nmode: usize,
-    moves: Option<Moves>,
+    position: Option<Position>,
     /// `U psi`, one shifted plane per view.
     psi: Vec<C64>,
     /// `A + EPS` and `√iobs` (`None` where masked) per frame and shifted pixel.
@@ -126,7 +143,8 @@ pub struct BhBatch<'a> {
 
 impl<'a> BhBatch<'a> {
     /// `objects` holds one object per slice of `optics`; `offsets`, one `[dy, dx]` per frame of
-    /// `views` in its order, the frames' [`Features::position`] (`None` for none).
+    /// `views` in its order, the frames' [`Features::position`] (`None` for none), modelled as
+    /// [`Sampling::auto`] of the optics, slices and probe says.
     pub fn new(
         views: &[View],
         obs: &Observed,
@@ -134,6 +152,20 @@ impl<'a> BhBatch<'a> {
         objects: &'a [Object],
         probe: &Probe,
         offsets: Option<&[[f64; 2]]>,
+    ) -> Self {
+        let sampling = Sampling::auto(optics, objects[0].plane_shape(), probe.plane_shape());
+        Self::with_sampling(views, obs, optics, objects, probe, offsets, sampling)
+    }
+
+    /// [`Self::new`] with `offsets` modelled as `sampling` does.
+    pub fn with_sampling(
+        views: &[View],
+        obs: &Observed,
+        optics: &'a Optics,
+        objects: &'a [Object],
+        probe: &Probe,
+        offsets: Option<&[[f64; 2]]>,
+        sampling: Sampling,
     ) -> Self {
         let n = probe.plane_len();
         let nmode = views
@@ -143,31 +175,47 @@ impl<'a> BhBatch<'a> {
         assert_eq!(views.len() % nmode, 0, "views must be whole frames");
         let nb = views.len() / nmode;
         let (uviews, mut copies) = ProbeVariation::none(probe.plane_shape()).unique(views, probe);
-        let moves = offsets.map(|offsets| {
+        if let Some(offsets) = offsets {
             assert_eq!(offsets.len(), nb, "one offset per frame of the batch");
-            let fft = Fft2::new(probe.plane_shape());
-            let q = optics.slice_quad(0);
-            let block = probe.as_slice().len();
-            let each = |axes: &[usize]| {
-                let mut out = copies.as_slice().to_vec();
-                for (p, &d) in out.chunks_exact_mut(block).zip(offsets) {
-                    move_derivative(p, q, d, axes, &fft);
+        }
+        let moves = offsets
+            .filter(|_| sampling == Sampling::Patch)
+            .map(|offsets| {
+                let fft = Fft2::new(probe.plane_shape());
+                let q = optics.slice_quad(0);
+                let block = probe.as_slice().len();
+                let each = |axes: &[usize]| {
+                    let mut out = copies.as_slice().to_vec();
+                    for (p, &d) in out.chunks_exact_mut(block).zip(offsets) {
+                        move_derivative(p, q, d, axes, &fft);
+                    }
+                    out
+                };
+                let first = [each(&[0]), each(&[1])];
+                let second = [each(&[0, 0]), each(&[0, 1]), each(&[1, 1])];
+                for (p, &d) in copies.as_mut_slice().chunks_exact_mut(block).zip(offsets) {
+                    move_planes(p, q, d, &fft);
                 }
-                out
-            };
-            let first = [each(&[0]), each(&[1])];
-            let second = [each(&[0, 0]), each(&[0, 1]), each(&[1, 1])];
-            for (p, &d) in copies.as_mut_slice().chunks_exact_mut(block).zip(offsets) {
-                move_planes(p, q, d, &fft);
-            }
-            Moves {
-                offsets: offsets.to_vec(),
-                fft,
-                first,
-                second,
-            }
-        });
-        let waves = SliceWaves::new(optics, &uviews, objects, &copies, offsets);
+                Moves {
+                    offsets: offsets.to_vec(),
+                    fft,
+                    first,
+                    second,
+                }
+            });
+        let waves = SliceWaves::with_sampling(optics, &uviews, objects, &copies, offsets, sampling);
+        let position = match (moves, waves.sampler()) {
+            (Some(m), _) => Some(Position::Probe(m)),
+            (None, Some(sm)) => Some(Position::Object {
+                first: (objects.iter())
+                    .map(|o| [[0], [1]].map(|a| sm.windows(o, &a)))
+                    .collect(),
+                second: (objects.iter())
+                    .map(|o| [[0, 0], [0, 1], [1, 1]].map(|a| sm.windows(o, &a)))
+                    .collect(),
+            }),
+            (None, None) => None,
+        };
         let mut psi = waves.psi().to_vec();
         optics.exit().forward(&mut psi);
         let mut td = psi.clone();
@@ -198,7 +246,7 @@ impl<'a> BhBatch<'a> {
             probe_dims: probe.dims(),
             copy_dims: copies.dims(),
             nmode,
-            moves,
+            position,
             psi,
             amp,
             root,
@@ -230,7 +278,7 @@ impl<'a> BhBatch<'a> {
     /// offsets negated, `M_bᴴ`.
     fn moved(&self, p: &[C64], axes: &[usize], sign: f64, b: usize) -> Vec<C64> {
         let mut out = p.to_vec();
-        if let Some(m) = &self.moves {
+        if let Some(Position::Probe(m)) = &self.position {
             let q = self.optics.slice_quad(0);
             let d = m.offsets[b].map(|d| sign * d);
             move_derivative(&mut out, q, d, axes, &m.fft);
@@ -244,18 +292,31 @@ impl<'a> BhBatch<'a> {
     /// derivative of `F` along the displacement `u`: `Jᴴ·Uᴴ` of `2·td` gives `g_b` per frame
     /// copy, the probe's is `Σ_b M_bᴴ g_b` and frame `b`'s offsets' `Re⟨g_b, ∂_a M_b(P)⟩` plus,
     /// where the last slice's phase moves with them ([`SliceWaves::phase_derivative`]),
-    /// `Re⟨2·td, U·∂_a q/q·psi⟩`.
+    /// `Re⟨2·td, U·∂_a q/q·psi⟩`. Under [`Sampling::FullObject`] the offsets' is instead
+    /// `Σ_s Σ_k Re⟨G_s,k, ∂_a S(O_s)_k⟩` over frame `b`'s views `k`, `G_s` that adjoint onto
+    /// what the views read of slice `s` (`SliceWaves::window_adjoint`), placed onto the slice
+    /// for its gradient.
     pub fn grads(&self) -> BhVector {
-        let op = self.jacobian();
         let y: Vec<C64> = self.td.iter().map(|t| 2.0 * t).collect();
-        let mut x = vec![C64::default(); op.domain_len()];
-        op.adjoint(&y, &mut x);
-        let copies = x.split_off(self.split());
+        let (windows, copies) = self.jacobian().window_adjoint(&y);
+        let copies = copies.as_slice();
         let block = self.probe_dims.iter().product::<usize>();
-        let mut d: Vec<[f64; 2]> = match &self.moves {
-            Some(m) => (copies.chunks_exact(block).enumerate())
+        let mut d: Vec<[f64; 2]> = match &self.position {
+            Some(Position::Probe(m)) => (copies.chunks_exact(block).enumerate())
                 .map(|(b, g)| [0, 1].map(|a| dot(g, &m.first[a][b * block..][..block])))
                 .collect(),
+            Some(Position::Object { first, .. }) => {
+                let n = self.probe_dims[1] * self.probe_dims[2];
+                let mut d = vec![[0.0; 2]; self.copy_dims[0] / self.probe_dims[0]];
+                for (g, first) in windows.iter().zip(first) {
+                    for (k, g) in g.as_slice().chunks_exact(n).enumerate() {
+                        for (a, first) in first.iter().enumerate() {
+                            d[k / self.nmode][a] += dot(g, first.plane(k));
+                        }
+                    }
+                }
+                d
+            }
             None => Vec::new(),
         };
         // the offsets' part through the last slice's phase
@@ -270,6 +331,9 @@ impl<'a> BhBatch<'a> {
                 d[a] += dot(y, t);
             }
         }
+        let mut x: Vec<C64> = (windows.into_iter())
+            .flat_map(|g| self.waves.place(g).into_vec())
+            .collect();
         let mut probe = vec![C64::default(); block];
         for (b, g) in copies.chunks_exact(block).enumerate() {
             let g = self.moved(g, &[], -1.0, b);
@@ -279,19 +343,50 @@ impl<'a> BhBatch<'a> {
         BhVector { x, d }
     }
 
-    /// `u` on the slices and the frames' probe copies: the copies' first-order change
-    /// `M_b(u_P) + Σ_a u_da·∂_a M_b(P)`.
+    /// Every slice of the slices' part of `x` as the views read it, or with `axes` its
+    /// derivative over their offsets: the slices themselves under [`Sampling::Patch`], their
+    /// [`crate::engine::sampling::Sampler::windows`] under [`Sampling::FullObject`].
+    fn read(&self, x: &[C64], axes: &[usize]) -> Vec<Object> {
+        let len = self.obj_dims.iter().product::<usize>();
+        let objects = (x[..self.split()].chunks_exact(len))
+            .map(|o| Object::new(Stack::from_vec(self.obj_dims, o.to_vec()).unwrap()));
+        match self.waves.sampler() {
+            Some(sm) => objects.map(|o| sm.windows(&o, axes)).collect(),
+            None => {
+                assert!(axes.is_empty(), "no sampling to differentiate");
+                objects.collect()
+            }
+        }
+    }
+
+    /// `out += t(b)·w` on each view's plane, `b` the view's frame in the batch.
+    fn add_by_frame(&self, out: &mut Object, w: &Object, t: impl Fn(usize) -> f64) {
+        let n = self.probe_dims[1] * self.probe_dims[2];
+        let planes = out.as_mut_slice().chunks_exact_mut(n);
+        for (k, (o, w)) in planes.zip(w.as_slice().chunks_exact(n)).enumerate() {
+            let t = t(k / self.nmode);
+            o.iter_mut().zip(w).for_each(|(o, w)| *o += t * w);
+        }
+    }
+
+    /// `u` on what the views read of the slices and on the frames' probe copies: the reads'
+    /// first-order change, `u_O` itself or under [`Sampling::FullObject`]
+    /// `S(u_O) + Σ_a u_da·∂_a S(O)`, and the copies' `M_b(u_P) + Σ_a u_da·∂_a M_b(P)`.
     fn lift(&self, u: &BhVector) -> (Vec<Object>, Probe) {
         let split = self.split();
         let block = self.probe_dims.iter().product::<usize>();
-        let len = self.obj_dims.iter().product::<usize>();
-        let objects = (u.x[..split].chunks_exact(len))
-            .map(|o| Object::new(Stack::from_vec(self.obj_dims, o.to_vec()).unwrap()))
-            .collect();
+        let mut objects = self.read(&u.x, &[]);
+        if let Some(Position::Object { first, .. }) = &self.position {
+            for (o, first) in objects.iter_mut().zip(first) {
+                for (a, f) in first.iter().enumerate() {
+                    self.add_by_frame(o, f, |b| u.d[b][a]);
+                }
+            }
+        }
         let mut copies = Vec::with_capacity(self.copy_dims.iter().product());
         for b in 0..self.copy_dims[0] / self.probe_dims[0] {
             let mut p = self.moved(&u.x[split..], &[], 1.0, b);
-            if let Some(m) = &self.moves {
+            if let Some(Position::Probe(m)) = &self.position {
                 for (a, first) in m.first.iter().enumerate() {
                     let t = u.d[b][a];
                     (p.iter_mut().zip(&first[b * block..][..block])).for_each(|(p, f)| *p += t * f);
@@ -366,25 +461,51 @@ impl<'a> BhBatch<'a> {
     /// The second derivative of `F` along the displacements `u` and `v`, pty-chi's bilinear
     /// Hessian with `A + EPS` in place of `A`:
     /// `Σ Re(conj(2·td)·L_uv) + 2 Σ_unmasked [(1 − d/A)·Σ_m Re(conj(L_u)·L_v) + (d/A)·c_u·c_v]`
-    /// with `L_u = U·J u′`, `u′` the slices' and the copies' first-order change along `u`,
-    /// `L_uv = U·(J″(u′, v′) + J(0, p″))` ([`SliceWaves::second_order`]) with `p″` the copies'
-    /// second-order change, both with the offsets' `phase_terms`,
-    /// `c_u = Σ_m Re(conj(U psi/A)·L_u)` and `d = √iobs`.
+    /// with `L_u = U·J u′`, `u′` the reads' and the copies' first-order change along `u`,
+    /// `L_uv = U·(J″(u′, v′) + J(o″, p″))` ([`SliceWaves::second_order`]) with `o″` and `p″`
+    /// the reads' and the copies' second-order change, both with the offsets' `phase_terms`,
+    /// `c_u = Σ_m Re(conj(U psi/A)·L_u)` and `d = √iobs`. Under [`Sampling::FullObject`]
+    /// `o″ = Σ_a (v_da·∂_a S(u_O) + u_da·∂_a S(v_O)) + Σ_ac u_da·v_dc·∂_a ∂_c S(O)`; otherwise
+    /// it is 0.
     pub fn hessian(&self, u: &BhVector, v: &BhVector) -> f64 {
         let n = self.probe_dims[1] * self.probe_dims[2];
         let (uo, up) = self.lift(u);
         let (vo, vp) = self.lift(v);
-        let [mut lu, mut lv, mut luv] = self.waves.second_order((&uo, &up), (&vo, &vp));
-        if let Some(m) = &self.moves {
-            let len = self.obj_dims.iter().product::<usize>();
-            let zero: Vec<Object> = (0..uo.len())
-                .map(|_| {
-                    Object::new(Stack::from_vec(self.obj_dims, vec![C64::default(); len]).unwrap())
-                })
-                .collect();
-            let t = self.waves.tangent(&zero, &self.second(m, u, v));
-            luv.iter_mut().zip(&t).for_each(|(l, t)| *l += t);
-            self.phase_terms(u, v, [&mut lu, &mut lv, &mut luv]);
+        let [mut lu, mut lv, mut luv] = self.waves.second_order_windows((&uo, &up), (&vo, &vp));
+        match &self.position {
+            Some(Position::Probe(m)) => {
+                let len = self.obj_dims.iter().product::<usize>();
+                let zero: Vec<Object> = (0..uo.len())
+                    .map(|_| {
+                        let z = vec![C64::default(); len];
+                        Object::new(Stack::from_vec(self.obj_dims, z).unwrap())
+                    })
+                    .collect();
+                let t = self.waves.tangent(&zero, &self.second(m, u, v));
+                luv.iter_mut().zip(&t).for_each(|(l, t)| *l += t);
+                self.phase_terms(u, v, [&mut lu, &mut lv, &mut luv]);
+            }
+            Some(Position::Object { second, .. }) => {
+                let [du, dv] = [u, v].map(|w| [0, 1].map(|a| self.read(&w.x, &[a])));
+                let o2: Vec<Object> = (second.iter().enumerate())
+                    .map(|(s, second)| {
+                        let mut o = Object::new(Stack::filled(second[0].dims(), C64::default()));
+                        for a in 0..2 {
+                            self.add_by_frame(&mut o, &du[a][s], |b| v.d[b][a]);
+                            self.add_by_frame(&mut o, &dv[a][s], |b| u.d[b][a]);
+                            for c in 0..2 {
+                                let t = |b: usize| u.d[b][a] * v.d[b][c];
+                                self.add_by_frame(&mut o, &second[a + c], t);
+                            }
+                        }
+                        o
+                    })
+                    .collect();
+                let zero = Probe::new(Stack::filled(self.copy_dims, C64::default()));
+                let t = self.waves.tangent_windows(&o2, &zero);
+                luv.iter_mut().zip(&t).for_each(|(l, t)| *l += t);
+            }
+            None => {}
         }
         let exit = self.optics.exit();
         for l in [&mut lu, &mut lv, &mut luv] {
@@ -427,6 +548,9 @@ pub struct Bh {
     /// The last direction's `x` and its offsets' part by frame of the scan, empty without
     /// positions.
     prev: Option<(Vec<C64>, Vec<[f64; 2]>)>,
+    /// How [`Features::position`] enters the waves; `None` takes [`Sampling::auto`] at the
+    /// first epoch and keeps it.
+    sampling: Option<Sampling>,
 }
 
 impl Bh {
@@ -438,7 +562,17 @@ impl Bh {
             features: Features::default(),
             epochs: 0,
             prev: None,
+            sampling: None,
         })
+    }
+
+    /// This run with [`Features::position`] modelled as `sampling` does, in place of
+    /// [`Sampling::auto`] of the optics, slices and probe of its first epoch.
+    pub fn with_sampling(self, sampling: Sampling) -> Self {
+        Self {
+            sampling: Some(sampling),
+            ..self
+        }
     }
 
     /// This run modelling and refining `features`, which hold one entry per frame of the scan
@@ -474,6 +608,7 @@ impl Bh {
     /// [`BhParams::position_rho`]`²`: `D = −Pg`, or with one batch per epoch, after the first
     /// epoch, `D = −Pg + β·D′` with `β = H(Pg, D′) / H(D′, D′)` and `D′` the previous epoch's
     /// direction; `α = −⟨g, D⟩ / H(D, D) · count / batch_size` with `count` the batch's frames.
+    /// The first epoch fixes the run's sampling ([`Self::with_sampling`]).
     pub fn epoch(
         &mut self,
         addr: &AddrTable,
@@ -486,6 +621,9 @@ impl Bh {
         if let Some(d) = &self.features.position {
             assert_eq!(d.len(), nframe, "one position offset per frame");
         }
+        let sampling = *(self.sampling).get_or_insert_with(|| {
+            Sampling::auto(optics, objects[0].plane_shape(), probe.plane_shape())
+        });
         let size = self.params.batch_size.min(nframe);
         let full = size == nframe;
         let rho2 = self.params.probe_rho.powi(2) * optics.exit().intensity_scale();
@@ -504,7 +642,15 @@ impl Bh {
             let count = frames.len();
             let offsets: Option<Vec<[f64; 2]>> =
                 (self.features.position.as_ref()).map(|d| frames.iter().map(|&f| d[f]).collect());
-            let b = BhBatch::new(&views, obs, optics, objects, probe, offsets.as_deref());
+            let b = BhBatch::with_sampling(
+                &views,
+                obs,
+                optics,
+                objects,
+                probe,
+                offsets.as_deref(),
+                sampling,
+            );
             let g = b.grads();
             let mut pg = g.clone();
             pg.x[split..].iter_mut().for_each(|c| *c *= rho2);
@@ -632,26 +778,36 @@ mod tests {
     /// Offsets of the three frames.
     const OFFSETS: [[f64; 2]; 3] = [[0.3, -0.2], [-0.45, 0.1], [0.2, 0.4]];
 
-    /// `U psi` of every view, frame `f`'s probe moved by `offsets[f]` ([`move_planes`]).
+    /// Without offsets, and with them under either sampling.
+    const CASES: [(bool, Sampling); 3] = [
+        (false, Sampling::Patch),
+        (true, Sampling::Patch),
+        (true, Sampling::FullObject),
+    ];
+
+    /// `U psi` of every view at `offsets` under `sampling`: under [`Sampling::Patch`] frame
+    /// `f`'s probe moved by `offsets[f]` ([`move_planes`]).
     fn far(
         optics: &Optics,
         addr: &AddrTable,
         objects: &[Object],
         probe: &Probe,
         offsets: Option<&[[f64; 2]]>,
+        sampling: Sampling,
     ) -> Vec<C64> {
         let shape = probe.plane_shape();
         let (views, mut copies) = ProbeVariation::none(shape).unique(addr.views(), probe);
-        if let Some(offsets) = offsets {
+        if let Some(offsets) = offsets.filter(|_| sampling == Sampling::Patch) {
             let fft = Fft2::new(shape);
             let block = probe.as_slice().len();
             for (p, &d) in copies.as_mut_slice().chunks_exact_mut(block).zip(offsets) {
                 move_planes(p, optics.slice_quad(0), d, &fft);
             }
         }
-        let mut psi = SliceWaves::new(optics, &views, objects, &copies, offsets)
-            .psi()
-            .to_vec();
+        let mut psi =
+            SliceWaves::with_sampling(optics, &views, objects, &copies, offsets, sampling)
+                .psi()
+                .to_vec();
         optics.exit().forward(&mut psi);
         psi
     }
@@ -659,7 +815,7 @@ mod tests {
     /// Counts of the state's intensities times a factor in `[0.7, 1.3)`, one pixel masked.
     fn observed(optics: &Optics, addr: &AddrTable, objects: &[Object], probe: &Probe) -> Observed {
         let (n, nmode) = (probe.plane_len(), addr.nmode());
-        let psi = far(optics, addr, objects, probe, None);
+        let psi = far(optics, addr, objects, probe, None, Sampling::Patch);
         let jitter = noise(addr.nframe() * n, 77);
         let mut values = vec![0.0; addr.nframe() * n];
         for (f, block) in psi.chunks_exact(nmode * n).enumerate() {
@@ -681,11 +837,12 @@ mod tests {
         optics: &Optics,
         addr: &AddrTable,
         obs: &Observed,
+        sampling: Sampling,
         (x, offsets): &(Vec<C64>, Option<Vec<[f64; 2]>>),
     ) -> f64 {
         let (objects, probe) = split(x);
         let (n, nmode) = (probe.plane_len(), addr.nmode());
-        let psi = far(optics, addr, &objects, &probe, offsets.as_deref());
+        let psi = far(optics, addr, &objects, &probe, offsets.as_deref(), sampling);
         let mut f = 0.0;
         for (frame, block) in psi.chunks_exact(nmode * n).enumerate() {
             for (j, iobs) in obs.frames(frame..frame + 1).iter().enumerate() {
@@ -740,21 +897,24 @@ mod tests {
         (moved(x, t, &w.x), d)
     }
 
-    /// [`BhBatch::grads`] at the state `(x, offsets)`.
+    /// [`BhBatch::grads`] at the state `(x, offsets)` under `sampling`.
     fn grads_at(
         optics: &Optics,
         addr: &AddrTable,
         obs: &Observed,
+        sampling: Sampling,
         (x, offsets): &(Vec<C64>, Option<Vec<[f64; 2]>>),
     ) -> BhVector {
         let (objects, probe) = split(x);
-        BhBatch::new(
+        let offsets = offsets.as_deref();
+        BhBatch::with_sampling(
             addr.views(),
             obs,
             optics,
             &objects,
             &probe,
-            offsets.as_deref(),
+            offsets,
+            sampling,
         )
         .grads()
     }
@@ -770,8 +930,12 @@ mod tests {
         for optics in &optics() {
             let (objects, probe) = state(optics.nslice());
             let obs = observed(optics, &addr, &objects, &probe);
-            for offsets in [None, Some(&OFFSETS[..])] {
-                let b = BhBatch::new(addr.views(), &obs, optics, &objects, &probe, offsets);
+            for (has, sampling) in CASES {
+                let offsets = has.then_some(&OFFSETS[..]);
+                let views = addr.views();
+                let b = BhBatch::with_sampling(
+                    views, &obs, optics, &objects, &probe, offsets, sampling,
+                );
                 let err = dot_error(&b.jacobian());
                 assert!(err < 1e-14, "dot test error {err:.3e}");
                 register(b.jacobian()).unwrap();
@@ -787,17 +951,13 @@ mod tests {
         for (k, optics) in optics().iter().enumerate() {
             let (objects, probe) = state(optics.nslice());
             let obs = observed(optics, &addr, &objects, &probe);
-            for offsets in [None, Some(OFFSETS.to_vec())] {
-                let has = offsets.is_some();
-                let x0 = (flat(&objects, &probe), offsets);
-                let b = BhBatch::new(
-                    addr.views(),
-                    &obs,
-                    optics,
-                    &objects,
-                    &probe,
-                    x0.1.as_deref(),
+            for (has, sampling) in CASES {
+                let x0 = (flat(&objects, &probe), has.then_some(OFFSETS.to_vec()));
+                let (views, offsets) = (addr.views(), x0.1.as_deref());
+                let b = BhBatch::with_sampling(
+                    views, &obs, optics, &objects, &probe, offsets, sampling,
                 );
+                let has = format!("offsets {has} {sampling:?}");
                 let [w, u, v] = [21, 22, 23].map(|seed| BhVector {
                     x: noise(x0.0.len(), seed),
                     d: (x0.1.as_ref())
@@ -806,24 +966,29 @@ mod tests {
                         .map(|c| [c.re, c.im])
                         .collect(),
                 });
-                let fd = slope(|t| cost(optics, &addr, &obs, &at(&x0, t, &w)), 1e-3);
+                let fd = slope(
+                    |t| cost(optics, &addr, &obs, sampling, &at(&x0, t, &w)),
+                    1e-3,
+                );
                 let g = b.grads().dot(&w);
                 let err = (g - fd).abs() / fd.abs();
                 assert!(
                     err < 1e-8,
-                    "optics {k} offsets {has}: gradient {g} differences {fd}, {err:.3e}"
+                    "optics {k} {has}: gradient {g} differences {fd}, {err:.3e}"
                 );
                 let (h_uv, h_vu) = (b.hessian(&u, &v), b.hessian(&v, &u));
                 assert!(
                     (h_uv - h_vu).abs() < 1e-13 * h_uv.abs(),
-                    "optics {k} offsets {has}: H(u, v) {h_uv} H(v, u) {h_vu}"
+                    "optics {k} {has}: H(u, v) {h_uv} H(v, u) {h_vu}"
                 );
-                let du = |t: f64| grads_at(optics, &addr, &obs, &at(&x0, t, &v)).dot(&u);
+                let du = |t: f64| grads_at(optics, &addr, &obs, sampling, &at(&x0, t, &v)).dot(&u);
                 let fd = slope(du, 1e-3);
                 let err = (h_uv - fd).abs() / fd.abs();
+                // Measured worst 1.3e-8 (near multislice under FullObject): `A + EPS` in the
+                // Hessian leaves up to 8.4e-9 as the step vanishes, 3e-11 at EPS = 1e-11.
                 assert!(
-                    err < 1e-8,
-                    "optics {k} offsets {has}: H {h_uv} differences {fd}, {err:.3e}"
+                    err < 2e-8,
+                    "optics {k} {has}: H {h_uv} differences {fd}, {err:.3e}"
                 );
             }
         }
