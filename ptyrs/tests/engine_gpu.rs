@@ -12,7 +12,8 @@ use ptyrs::base::{C64, Counts, MASKED, Object, Probe, Scan, Stack};
 use ptyrs::engine::{
     Algorithm, ApParams, Backend, Bh, BhParams, BhStep, Cost, DmParams, EngineError, Feature,
     Features, GpuOptions, GpuPtycho, Llk, LlkRecord, Lsqml, LsqmlParams, MlParams, Observed,
-    Optics, Params, Ptycho, RaarParams, RpieParams, Step, llk, obj_probe_shift_to_psi, shift,
+    Optics, Params, Ptycho, RaarParams, RpieParams, Sampling, Step, llk, obj_probe_shift_to_psi,
+    shift,
 };
 use ptyrs::gpu::{
     C32, FUSED_SIDES, Kernels, LlkPartial, LlkRing, LlkScratch, StackTable, ViewDims,
@@ -1741,6 +1742,67 @@ fn position_is_bit_identical_across_stack_splits() {
         assert!(
             other.features == eight.features,
             "stacks of {stack_size}: offsets differ"
+        );
+    }
+}
+
+/// DM, ML and LSQML holding a position, then switched to refining it, give the bits of a fresh
+/// start from the arrays they left, refining it from the outset, under either sampling: the
+/// object, the probe, the offsets and the LLK records after the switch. The switch drops what
+/// was cut for the held position: the shared passes' scratch, DM's carried stacks and LSQML's
+/// state.
+#[test]
+fn held_to_refined_position_gives_a_fresh_runs_bits() {
+    let (scan, object, probe) = featured_start(2, false, false);
+    let position = |refine| Features {
+        position: Some(Feature {
+            values: drawn_offsets(),
+            refine,
+        }),
+        ..Features::default()
+    };
+    let (held, refined) = (position(false), position(true));
+    let [_, dm, ml] = feature_cycles(2);
+    let lsqml = LsqmlParams {
+        batch_size: 12,
+        cost: Cost::Poisson,
+        seed: 7,
+    };
+    let run = |g: &mut GpuPtycho| {
+        dm.gpu(g, 2);
+        ml.gpu(g, 2);
+        g.lsqml(&lsqml, 2, 1).unwrap();
+    };
+    for sampling in [Sampling::Patch, Sampling::FullObject] {
+        let new = |object, probe| {
+            let mut g = GpuPtycho::new(&ctx(), &scan, object, probe, FUSED.options).unwrap();
+            g.set_sampling(sampling).unwrap();
+            g
+        };
+        let mut switched = new(object.clone(), probe.clone());
+        switched.set_features(&held).unwrap();
+        run(&mut switched);
+        let before = switched.history().len();
+        let mut fresh = new(switched.object().unwrap(), switched.probe().unwrap());
+        for g in [&mut switched, &mut fresh] {
+            g.set_features(&refined).unwrap();
+            run(g);
+        }
+        let (switched, fresh) = (bit_state(&mut switched), bit_state(&mut fresh));
+        let llk = |r: &[(RecordTag, [u64; 4])]| r.iter().map(|r| r.1).collect::<Vec<_>>();
+        assert_eq!(fresh.llk.len(), 2 + 2 + 2 + 1);
+        assert!(
+            llk(&switched.llk[before..]) == llk(&fresh.llk),
+            "{sampling:?}: LLK records differ"
+        );
+        assert!(
+            switched.object == fresh.object,
+            "{sampling:?}: object differs"
+        );
+        assert!(switched.probe == fresh.probe, "{sampling:?}: probe differs");
+        assert!(
+            switched.features == fresh.features,
+            "{sampling:?}: offsets differ"
         );
     }
 }

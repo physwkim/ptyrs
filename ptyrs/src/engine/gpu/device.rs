@@ -239,7 +239,8 @@ impl FeatureBufs {
 
     /// What the position model adds to the shared passes.
     fn scratch(&self) -> PositionScratch {
-        PositionScratch::of(self.position.as_ref().map(|p| &p.mover))
+        let refined = self.refine()[2] == Some(true);
+        PositionScratch::of(self.position.as_ref().map(|p| &p.mover), refined)
     }
 
     /// Builds [`Mover::Object`]'s solve unless built, before AP's, DM's or RAAR's graph
@@ -257,27 +258,33 @@ impl FeatureBufs {
     }
 }
 
-/// What the position model adds to the passes over a cut, by what its offsets move.
+/// What the position model adds to the passes over a cut, by what its offsets move and
+/// whether they are `refined`: only the position sums read what a refined position adds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PositionScratch {
     /// No position.
     None,
     /// [`Mover::Probe`]: the fused passes' scratch of a shift.
-    Shift,
+    Shift { refined: bool },
     /// [`Mover::Object`]: the cut's [`Windows`], beside the bytes the sampler keeps across a
     /// sampling, `sample` ([`ObjectSampler::windows_held`]), and across a placing, `place`
     /// (its scratch and accumulator).
-    Windows { sample: usize, place: usize },
+    Windows {
+        sample: usize,
+        place: usize,
+        refined: bool,
+    },
 }
 
 impl PositionScratch {
-    fn of(mover: Option<&Mover>) -> Self {
+    fn of(mover: Option<&Mover>, refined: bool) -> Self {
         match mover {
             None => Self::None,
-            Some(Mover::Probe { .. }) => Self::Shift,
+            Some(Mover::Probe { .. }) => Self::Shift { refined },
             Some(Mover::Object { sampler, .. }) => Self::Windows {
                 sample: sampler.windows_held(),
                 place: sampler.scratch_bytes() + sampler.acc_bytes(),
+                refined,
             },
         }
     }
@@ -291,8 +298,8 @@ const SAMPLER_CHUNK: u32 = 4;
 /// sums over them.
 pub(super) struct Windows {
     views: Views,
-    /// Three blocks `[nobj, nf_max, ny, nx]`, each the views' object: the windows and their
-    /// derivatives over the position's `y` and `x`.
+    /// Blocks `[nobj, nf_max, ny, nx]`, each the views' object: the windows, and for the
+    /// position sums of a refined position their derivatives over its `y` and `x`.
     blocks: DeviceBuffer<C32>,
     /// A multislice object's windows of each slice past the first, a block each.
     deeper: Vec<DeviceBuffer<C32>>,
@@ -304,19 +311,22 @@ pub(super) struct Windows {
 }
 
 impl Windows {
-    /// For `cut`'s stacks of the views of `dims` into an object of `slices` slices.
+    /// For `cut`'s stacks of the views of `dims` into an object of `slices` slices, with the
+    /// `derivatives` blocks or without.
     fn new(
         stream: &Arc<CudaStream>,
         dims: &ViewDims,
         cut: &Cut,
         slices: usize,
+        derivatives: bool,
     ) -> Result<Self, EngineError> {
         let stacks: Vec<_> = cut.frames.iter().map(|f| f.range.clone()).collect();
         let views = window_views(stream, dims, &stacks)?;
         let len = views.dims().obj_len();
+        let blocks = if derivatives { 3 } else { 1 };
         Ok(Self {
             views,
-            blocks: DeviceBuffer::zeroed(stream, 3 * len)?,
+            blocks: DeviceBuffer::zeroed(stream, blocks * len)?,
             deeper: (1..slices)
                 .map(|_| DeviceBuffer::zeroed(stream, len))
                 .collect::<Result<_, _>>()?,
@@ -325,6 +335,11 @@ impl Windows {
                 .collect::<Result<_, _>>()?,
             sums: UpdateSums::zeroed(stream, len)?,
         })
+    }
+
+    /// Whether the blocks hold the derivatives.
+    fn derivatives(&self) -> bool {
+        self.blocks.len() > self.views.dims().obj_len()
     }
 
     /// Bytes per frame of a stack's block.
@@ -1385,40 +1400,47 @@ impl Shared {
     ) -> Result<Self, EngineError> {
         // M1's scratch: `obj_probe_to_psi` (0), the transforms and `apply_amplitude` (to 3);
         // the fused work planes, first: the row (0), column and inverse row passes and the sums
-        // over the waves (3). Under the position's shift `shift_pre` writes `T`, and `T_y` into
-        // the adjoint planes, first (0); the inverse row pass (3) reads both and writes the
-        // adjoint, object planes and power, `shift_post` and the probe sums take the adjoint
-        // (4), `gather_shifted` the rest (5). Under its windows, as AP runs a stack: the
-        // sampler's calls, three launches each, write the windows (0 to 2) and their
-        // derivatives over `y` (3 to 5) and `x` (6 to 8); two memsets zero the window sums
-        // (9, 10), which the fused passes (11 to 14) add to; the position sums (15) read the
-        // work planes and the three blocks, the probe sums (16) the work planes and the
-        // windows; placing the window sums back takes six launches (17 to 22). The LLK pass
+        // over the waves (3). Under the position's shift `shift_pre` writes `T`, and for a refined
+        // position's sums `T_y` into the adjoint planes, first (0); the inverse row pass (3) reads
+        // both and writes the adjoint, object planes and power, `shift_post` and the probe sums
+        // take the adjoint (4), `gather_shifted` the rest (5). Under its windows, as AP runs a
+        // stack: the sampler's calls, three launches each, write the windows (0 to 2) and,
+        // refined, their derivatives over `y` (3 to 5) and `x` (6 to 8); two memsets zero the
+        // window sums (9, 10), which the fused passes (11 to 14) add to; a refined position's sums
+        // (15) read the work planes and the three blocks, the probe sums (16) the work planes and
+        // the windows; placing the window sums back takes six launches (17 to 22). The LLK pass
         // and DM's and RAAR's updates run a subset. Of a multislice object, the two waves its
         // slices pass on, numbered after; under the windows, as the LLK pass runs a stack, the
         // sampler's calls write each slice's windows in turn (from 23), which the slice passes
         // after them read beside the waves.
-        let shift = scratch == PositionScratch::Shift;
+        let shift = matches!(scratch, PositionScratch::Shift { .. });
         let wave = wave_bytes(dims);
         let mut streamed = match scratch {
             PositionScratch::None => vec![Streamed::new(wave, 0..=3)],
-            PositionScratch::Shift => {
+            PositionScratch::Shift { refined } => {
                 let probe = plane_bytes::<C32>(dims, dims.nprobe);
                 let obj = plane_bytes::<C32>(dims, dims.nobj) + plane_bytes::<f32>(dims, 1);
+                let adjoint = if refined { 0 } else { 3 };
                 vec![
                     Streamed::new(wave, 1..=3),
                     Streamed::new(probe, 0..=3),
-                    Streamed::new(probe, 0..=4),
+                    Streamed::new(probe, adjoint..=4),
                     Streamed::new(obj, 3..=5),
                 ]
             }
-            PositionScratch::Windows { sample, place } => {
+            PositionScratch::Windows {
+                sample,
+                place,
+                refined,
+            } => {
                 let (block, sums) = (Windows::bytes(dims), Windows::sums_bytes(dims));
+                let calls: &[_] = if refined { &[3..=5, 6..=8] } else { &[] };
+                let derivatives = (calls.iter())
+                    .flat_map(|c| Streamed::chunked(sample, c.clone(), &[(block, 15)], &[]));
                 [
                     vec![Streamed::new(wave, 11..=16)],
                     Streamed::chunked(sample, 0..=2, &[(block, 16)], &[]),
-                    Streamed::chunked(sample, 3..=5, &[(block, 15)], &[]),
-                    Streamed::chunked(sample, 6..=8, &[(block, 15)], &[]),
+                    derivatives.collect(),
                     Streamed::chunked(place, 17..=22, &[], &[(sums, 9)]),
                 ]
                 .concat()
@@ -1435,15 +1457,18 @@ impl Shared {
                     });
                     (sampled.chain([Streamed::new(wave, pass..=pass + 1); 2])).collect()
                 }
-                PositionScratch::None | PositionScratch::Shift => {
+                PositionScratch::None | PositionScratch::Shift { .. } => {
                     vec![Streamed::new(wave, 6..=7); 2]
                 }
             });
         }
         let cut = rule.cut(stream, dims, &streamed)?;
-        let windows = matches!(scratch, PositionScratch::Windows { .. })
-            .then(|| Windows::new(stream, dims, &cut, slices))
-            .transpose()?;
+        let windows = match scratch {
+            PositionScratch::Windows { refined, .. } => {
+                Some(Windows::new(stream, dims, &cut, slices, refined)?)
+            }
+            PositionScratch::None | PositionScratch::Shift { .. } => None,
+        };
         let nf_max = cut.table.nf_max();
         let passes = if fused {
             let f = match shift {
@@ -1561,7 +1586,7 @@ impl CarriedBufs {
             }
         };
         let windows = (shared.windows.as_ref())
-            .map(|w| Windows::new(stream, dims, &cut, 1 + w.deeper.len()))
+            .map(|w| Windows::new(stream, dims, &cut, 1 + w.deeper.len(), w.derivatives()))
             .transpose()?;
         Ok(Self { cut, sets, windows })
     }
@@ -1769,7 +1794,7 @@ impl MlState {
         let wave = wave_bytes(dims);
         let streamed = match position {
             PositionScratch::None => vec![Streamed::new(wave, 0..=4); 3],
-            PositionScratch::Shift => {
+            PositionScratch::Shift { .. } => {
                 let probe = plane_bytes::<C32>(dims, dims.nprobe);
                 vec![
                     Streamed::new(probe, 0..=5),
@@ -1790,7 +1815,7 @@ impl MlState {
         let cut = rule.cut(stream, dims, &streamed)?;
         let position = match position {
             PositionScratch::None => None,
-            PositionScratch::Shift => Some(MlPosition::Moved(Box::new(MlMoved::new(
+            PositionScratch::Shift { .. } => Some(MlPosition::Moved(Box::new(MlMoved::new(
                 stream,
                 kernels,
                 dims,
@@ -1840,7 +1865,7 @@ impl MlState {
         matches!(
             (&self.position, position),
             (None, PositionScratch::None)
-                | (Some(MlPosition::Moved(_)), PositionScratch::Shift)
+                | (Some(MlPosition::Moved(_)), PositionScratch::Shift { .. })
                 | (
                     Some(MlPosition::Sampled(_)),
                     PositionScratch::Windows { .. }
@@ -2453,12 +2478,13 @@ impl Device {
     /// values of the features already set, refined or held as they are, are written in
     /// place; other features, or another refine, replace the buffers, and so first drop
     /// every graph, which addresses them, and then recapture the LLK pass's. Only the fused
-    /// passes model features; a position that moves the probe ([`Sampling::Patch`]) also
-    /// takes their scratch of a shift, which they drop again with it, and so recuts the
-    /// stacks that stream that scratch and drops DM's or RAAR's carried stacks, cut against
-    /// it. Nothing changes if a buffer cannot be built; if the
-    /// recapture fails, `features` stay modelled and [`Self::llk_pass`] runs eagerly until a
-    /// later recapture; a failed write in place may leave the values before it written.
+    /// passes model features; a position also takes their scratch ([`PositionScratch`]), by
+    /// what its offsets move and whether they are refined, so a position added, dropped or
+    /// switched between refined and held recuts the stacks that stream that scratch and drops
+    /// the states cut against it ([`Self::reshare`]). Nothing changes if a buffer cannot be
+    /// built; if the recapture fails, `features` stay modelled and [`Self::llk_pass`] runs
+    /// eagerly until a later recapture; a failed write in place may leave the values before it
+    /// written.
     pub fn set_features(&mut self, features: &Features) -> Result<(), EngineError> {
         if matches!(self.shared.passes, Passes::M1 { .. }) && *features != Features::default() {
             return Err(EngineError::Invalid(
@@ -2492,7 +2518,8 @@ impl Device {
         let mover = (position.as_ref())
             .map(|_| Mover::new(stream, &self.kernels, dims, self.sampling))
             .transpose()?;
-        let shared = self.reshared(mover.as_ref())?;
+        let refined = position.as_ref().is_some_and(|p| p.refine);
+        let shared = self.reshared(mover.as_ref(), refined)?;
         let nf_max = shared
             .as_ref()
             .map_or(&self.shared, |s| &s.shared)
@@ -2559,10 +2586,14 @@ impl Device {
     }
 
     /// The shared passes, with a multislice object's waves, for a position that moves as
-    /// `mover` (none without a position): `None` if the current ones serve it, as they do
-    /// whenever both take the same [`PositionScratch`].
-    fn reshared(&self, mover: Option<&Mover>) -> Result<Option<Reshared>, EngineError> {
-        let scratch = PositionScratch::of(mover);
+    /// `mover` (none without a position), `refined` or held: `None` if the current ones serve
+    /// it, as they do whenever both take the same [`PositionScratch`].
+    fn reshared(
+        &self,
+        mover: Option<&Mover>,
+        refined: bool,
+    ) -> Result<Option<Reshared>, EngineError> {
+        let scratch = PositionScratch::of(mover, refined);
         if scratch == self.features.scratch() {
             return Ok(None);
         }
@@ -2575,14 +2606,21 @@ impl Device {
         Ok(Some(Reshared { shared, waves }))
     }
 
-    /// Installs `r`, dropping DM's or RAAR's carried stacks, cut against the shared passes it
-    /// replaces. The caller has dropped every graph, which binds them.
+    /// Installs `r`, dropping the states cut against the shared passes it replaces: DM's or
+    /// RAAR's carried stacks, and BH's and LSQML's built under a position model, whose stacks
+    /// their frames cap. The caller has dropped every graph, which binds them.
     fn reshare(&mut self, r: Reshared) {
         self.shared = r.shared;
         if let Some((s, waves)) = self.slices.as_mut().zip(r.waves) {
             s.waves = waves;
         }
         self.carried = None;
+        if self.bh_state.as_ref().is_some_and(|s| s.reads().is_some()) {
+            self.bh_state = None;
+        }
+        if self.lsqml.as_ref().is_some_and(|s| s.reads().is_some()) {
+            self.lsqml = None;
+        }
     }
 
     /// The modelled features, read back, each refined while it keeps its sums.
@@ -2639,16 +2677,11 @@ impl Device {
                 Mover::new(&self.stream, &self.kernels, dims, sampling)
             })
             .transpose()?;
-        let shared = self.reshared(mover.as_ref())?;
+        let refined = self.features.refine()[2] == Some(true);
+        let shared = self.reshared(mover.as_ref(), refined)?;
         self.sampling = sampling;
         if self.ml.as_ref().is_some_and(|s| s.position.is_some()) {
             self.ml = None;
-        }
-        if self.bh_state.as_ref().is_some_and(|s| s.reads().is_some()) {
-            self.bh_state = None;
-        }
-        if self.lsqml.as_ref().is_some_and(|s| s.reads().is_some()) {
-            self.lsqml = None;
         }
         if let Some((p, mover)) = self.features.position.as_mut().zip(mover) {
             p.mover = mover;

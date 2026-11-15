@@ -362,50 +362,53 @@ impl LsqmlState {
         // work: the forward pass (0), the exit wave, `chi`, the adjoint exit and back pass (4),
         // then `psi_to_obj` and `psi_to_probe` (5, 6); icalc, which `far` reads batch-wide,
         // streams. Under the position: work from `shifted_rows_fwd` (0, with the moved probes
-        // to `shift_w`) to the back pass (5), `shifted_psi_sums` from 6, then `dots` and the
-        // position sums (11, 12) read work and the moved probes again. The multislice loops
-        // hand on one wave per pass boundary, two under the position: no more than these.
-        // Under windows, every slice's: a loop of sampler calls (0 to 2) writes the windows;
-        // the waves' loop (3 to 7) hands on one wave as above. Then work from `psi_to_probe`
-        // (8) to `psi_to_obj` (18): between them the derivatives over `y` and `x` (two sampler
+        // to `shift_w`) to the back pass (5), `shifted_psi_sums` from 6, then `dots` and a refined
+        // position's sums (11, 12) read work and the moved probes again. The multislice loops hand
+        // on one wave per pass boundary, two under the position: no more than these. Under
+        // windows, every slice's: a loop of sampler calls (0 to 2) writes the windows; the waves'
+        // loop (3 to 7) hands on one wave as above. Then work from `psi_to_probe` (8) to
+        // `psi_to_obj` (18): between them, refined, the derivatives over `y` and `x` (two sampler
         // calls, 9 to 14) for the position sums (15), the window sums zeroed (16, 17); then
         // `place` zeroes its accumulator (19), runs a sampler call (20 to 22), transforms the
-        // accumulator and adds it (23, 24); a slice past the first takes its pair (8) instead.
-        // A sampler call (25 to 27) writes the direction's windows for `dots` (28).
+        // accumulator and adds it (23, 24); a slice past the first takes its pair (8) instead. A
+        // sampler call (25 to 27) writes the direction's windows for `dots` (28).
         let wave = wave_bytes(dims);
         let streamed = match scratch {
             None => vec![Streamed::new(wave, 0..=4), Streamed::new(wave, 5..=6)],
             Some(MovedScratch {
                 sampling: MovedSampling::Patch,
+                refined,
                 ..
             }) => {
                 let probes = plane_bytes::<C32>(dims, dims.nprobe);
-                let mut s = vec![
-                    Streamed::new(wave, 0..=5),
-                    Streamed::new(probes, 0..=1),
-                    Streamed::new(wave, 11..=12),
-                    Streamed::new(probes, 11..=12),
-                ];
+                let mut s = vec![Streamed::new(wave, 0..=5), Streamed::new(probes, 0..=1)];
+                if refined {
+                    s.extend([Streamed::new(wave, 11..=12), Streamed::new(probes, 11..=12)]);
+                }
                 s.extend(Streamed::shifted_psi_sums(dims, 6));
                 s
             }
             Some(MovedScratch {
                 sampling: MovedSampling::FullObject { held, scratch, acc },
+                refined,
                 ..
             }) => {
                 let plane1 = plane_bytes::<C32>(dims, 1);
                 let win = plane_bytes::<C32>(dims, dims.nobj);
                 let den = plane_bytes::<f32>(dims, dims.nobj);
-                [
+                let mut s = [
                     Streamed::chunked(held, 0..=2, &[(win, 2)], &[]),
                     vec![Streamed::new(wave, 3..=7), Streamed::new(wave, 8..=18)],
-                    Streamed::chunked(held, 9..=11, &[(plane1, 15)], &[]),
-                    Streamed::chunked(held, 12..=14, &[(plane1, 15)], &[]),
                     vec![Streamed::new(den, 16..=18), Streamed::fixed(acc, 19..=24)],
                     Streamed::chunked(scratch, 20..=22, &[], &[(win, 17)]),
                     Streamed::chunked(held, 25..=27, &[(win, 28)], &[]),
                 ]
-                .concat()
+                .concat();
+                if refined {
+                    s.extend(Streamed::chunked(held, 9..=11, &[(plane1, 15)], &[]));
+                    s.extend(Streamed::chunked(held, 12..=14, &[(plane1, 15)], &[]));
+                }
+                s
             }
         };
         let frames = rule.frames(&streamed)?;
