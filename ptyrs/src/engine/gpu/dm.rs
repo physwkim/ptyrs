@@ -43,23 +43,26 @@ impl GpuPtycho {
         zero_phase_ramp: bool,
         epoch: impl Fn(bool) -> Epoch,
     ) -> Result<(), EngineError> {
-        for ic in 0..ncycle {
-            let epoch = epoch(ic == 0);
-            let llk = llk_due(calc_llk, ic, ncycle);
-            if llk {
-                self.dev.llk_pass(Some((self.cycle, epoch.algorithm())))?;
-            }
-            self.dev.steady(epoch, self.cycle)?;
-            if llk {
-                self.dev.balance_obj_probe()?;
-            }
-            self.cycle += 1;
-        }
-        self.collect()?;
-        if zero_phase_ramp {
-            self.zero_phase_ramp()?;
-        }
-        Ok(())
+        let what = format!("{:?}", epoch(true).algorithm());
+        self.call(
+            zero_phase_ramp,
+            |dev| dev.one_unitary(&what),
+            |dev, cycle| {
+                for ic in 0..ncycle {
+                    let epoch = epoch(ic == 0);
+                    let llk = llk_due(calc_llk, ic, ncycle);
+                    if llk {
+                        dev.llk_pass(Some((*cycle, epoch.algorithm())))?;
+                    }
+                    dev.steady(epoch, *cycle)?;
+                    if llk {
+                        dev.balance_obj_probe()?;
+                    }
+                    *cycle += 1;
+                }
+                Ok(())
+            },
+        )
     }
 }
 

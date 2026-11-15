@@ -18,7 +18,7 @@ use cuda_core::{CudaStream, DeviceBuffer};
 
 use super::device::{M1Bufs, MlBufs, OneSlice, PassesMut, Sample};
 use super::propagate::Propagate;
-use super::{Bufs, Cut, Epoch, GpuPtycho, Tag, plane_len};
+use super::{Bufs, Cut, Device, Epoch, GpuPtycho, Tag, object_fits, plane_len};
 use crate::engine::ptycho::llk_due;
 use crate::engine::{EngineError, MlParams};
 use crate::fault;
@@ -36,27 +36,32 @@ impl GpuPtycho {
     /// windows of the object sampled at the offsets instead, the object's gradient is placed
     /// back from them, and the line search samples those of the direction too.
     pub fn ml(&mut self, params: &MlParams, ncycle: usize) -> Result<(), EngineError> {
-        self.dev.scale_to_photons(self.total_obs as f32)?;
-        for ic in 0..ncycle {
-            let epoch = Epoch::Ml {
-                params: *params,
-                first: ic == 0,
-                llk: llk_due(params.calc_llk, ic, ncycle),
-            };
-            self.dev.steady(epoch, self.cycle)?;
-            self.cycle += 1;
-        }
-        self.collect()?;
-        if params.zero_phase_ramp {
-            self.zero_phase_ramp()?;
-        }
-        Ok(())
+        let total_obs = self.total_obs as f32;
+        self.call(
+            params.zero_phase_ramp,
+            |dev| dev.one_unitary("ML's scaling"),
+            |dev, cycle| {
+                dev.scale_to_photons(total_obs)?;
+                for ic in 0..ncycle {
+                    let epoch = Epoch::Ml {
+                        params: *params,
+                        first: ic == 0,
+                        llk: llk_due(params.calc_llk, ic, ncycle),
+                    };
+                    dev.steady(epoch, *cycle)?;
+                    *cycle += 1;
+                }
+                Ok(())
+            },
+        )
     }
 
     /// The ML gradients of the current estimate in `f32`, object then probe, as
     /// [`crate::engine::Ptycho::obj_grad`] and [`crate::engine::Ptycho::probe_grad`] give them.
     pub fn ml_grads(&mut self) -> Result<[Stack<C64>; 2], EngineError> {
-        let [obj, probe] = self.dev.ml_grads()?;
+        let [obj, probe] = self
+            .dev
+            .read(|dev| dev.one_unitary("ML's gradient"), |dev| dev.ml_grads())?;
         let widen = |v: Vec<_>, dims| {
             let v = v
                 .into_iter()
@@ -69,8 +74,12 @@ impl GpuPtycho {
     /// [`Self::ml_grads`]' object gradient alone, into `dst`, a buffer of the object's length in
     /// this reconstruction's context; waited for, so another stream may read `dst` on return.
     pub fn ml_obj_grad_into(&mut self, dst: &mut DeviceBuffer<C32>) -> Result<(), EngineError> {
-        self.object_fits(self.obj_dims, dst.len())?;
-        self.dev.ml_obj_grad_into(dst)
+        let (have, len) = (self.obj_dims, dst.len());
+        let check = |dev: &Device| {
+            object_fits(have, have, len)?;
+            dev.one_unitary("ML's gradient")
+        };
+        self.dev.read(check, |dev| dev.ml_obj_grad_into(dst))
     }
 }
 
@@ -391,6 +400,7 @@ impl Bufs<'_> {
             PassesMut::Fused(f) => self.fused_grad(ctx, f, update, llk.as_mut(), one)?,
             PassesMut::M1(m1) => {
                 for s in 0..self.scratch.len() {
+                    fault::at(fault::Exit::MlStack)?;
                     self.m1_grad(ctx, m1, s, update, llk.as_mut())?;
                 }
             }
@@ -418,6 +428,7 @@ impl Bufs<'_> {
             .lend(ctx, self.kernels, &dims, self.obj, self.probe, self.exit)?
             .one_slice(one);
         for s in 0..self.scratch.len() {
+            fault::at(fault::Exit::MlStack)?;
             let stack = self.scratch.at(s);
             let windows = self.windows.as_deref_mut();
             if let Some(mut w) = m.windows(ctx, self.views, stack, windows, Sample::Windows)? {

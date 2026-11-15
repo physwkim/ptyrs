@@ -17,7 +17,7 @@ use super::device::{
     moved_inputs, moved_shift,
 };
 use super::propagate::Propagate;
-use super::{Bufs, Cut, Epoch, GpuPtycho};
+use super::{Bufs, Cut, Device, Epoch, GpuPtycho, stack_len, to_u32};
 use crate::engine::features::{POSITION_LIMIT, POSITION_STEP};
 use crate::engine::ptycho::{Algorithm, llk_due};
 use crate::engine::{EngineError, RpieParams};
@@ -28,26 +28,34 @@ impl GpuPtycho {
     /// [`crate::engine::Features::position`] its frames' offsets; one LLK record after every
     /// due epoch.
     pub fn rpie(&mut self, params: &RpieParams, nepoch: usize) -> Result<(), EngineError> {
-        if self.dev.dims().nobj != 1 {
-            return Err(EngineError::Invalid(
-                "rPIE needs exactly one object mode".into(),
-            ));
-        }
-        params.validate()?;
-        if self.dev.models_scale_or_background() {
-            return Err(EngineError::Invalid(
-                "rPIE models no intensity scale or background".into(),
-            ));
-        }
-        for ic in 0..nepoch {
-            self.dev.steady(Epoch::Rpie(*params), self.cycle)?;
-            if llk_due(params.calc_llk, ic, nepoch) {
-                self.dev.llk_pass(Some((self.cycle, Algorithm::Rpie)))?;
+        let check = |dev: &Device| {
+            let dims = dev.dims();
+            if dims.nobj != 1 {
+                return Err(EngineError::Invalid(
+                    "rPIE needs exactly one object mode".into(),
+                ));
             }
-            self.cycle += 1;
-        }
-        self.collect()?;
-        Ok(())
+            params.validate()?;
+            if dev.models_scale_or_background() {
+                return Err(EngineError::Invalid(
+                    "rPIE models no intensity scale or background".into(),
+                ));
+            }
+            dev.one_unitary("Rpie")?;
+            to_u32("batch_size", params.batch_size)?;
+            stack_len(&dims, params.batch_size.min(dims.nframe as usize))?;
+            Ok(())
+        };
+        self.call(false, check, |dev, cycle| {
+            for ic in 0..nepoch {
+                dev.steady(Epoch::Rpie(*params), *cycle)?;
+                if llk_due(params.calc_llk, ic, nepoch) {
+                    dev.llk_pass(Some((*cycle, Algorithm::Rpie)))?;
+                }
+                *cycle += 1;
+            }
+            Ok(())
+        })
     }
 }
 

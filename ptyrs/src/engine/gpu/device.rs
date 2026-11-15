@@ -44,6 +44,7 @@ use crate::engine::{
     ApParams, BhParams, BhStep, DmParams, EngineError, Feature, Features, LsqmlParams, LsqmlStep,
     MlParams, PlaneStage, RaarParams, RpieParams, Sampling,
 };
+use crate::fault;
 
 /// What [`Device::new`] uploads: the propagator's stage, the views' addresses, the counts
 /// and the starting arrays.
@@ -71,7 +72,7 @@ pub(super) struct SliceUploads {
 }
 
 /// A multislice object's device state past its first slice, which is [`Device::obj`]; only
-/// LSQML, BH and the LLK pass run it, and [`Device::one_slice`] gates every other pass.
+/// LSQML, BH and the LLK pass run it; every other call checks [`Device::one_unitary`] first.
 struct Slices {
     deeper: Vec<DeviceBuffer<C32>>,
     gaps: Vec<DeviceBuffer<C32>>,
@@ -2637,8 +2638,18 @@ impl Device {
         Ok(())
     }
 
-    /// Models `features`, which the caller checked against the scan, from here on: the
-    /// values of the features already set, refined or held as they are, are written in
+    /// Fails unless these passes model `features`: only the fused ones model any.
+    pub fn check_features(&self, features: &Features) -> Result<(), EngineError> {
+        if matches!(self.shared.passes, Passes::M1 { .. }) && *features != Features::default() {
+            return Err(EngineError::Invalid(
+                "features need GpuOptions { fused: true, .. }".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Models `features`, which the caller checked against the scan and by
+    /// [`Self::check_features`], from here on: the values of the features already set, refined or held as they are, are written in
     /// place; other features, or another refine, replace the buffers, and so first drop
     /// every graph, which addresses them, and then recapture the LLK pass's. Only the fused
     /// passes model features; a position also takes their scratch ([`PositionScratch`]), by
@@ -2649,11 +2660,6 @@ impl Device {
     /// eagerly until a later recapture; a failed write in place may leave the values before it
     /// written.
     pub fn set_features(&mut self, features: &Features) -> Result<(), EngineError> {
-        if matches!(self.shared.passes, Passes::M1 { .. }) && *features != Features::default() {
-            return Err(EngineError::Invalid(
-                "features need GpuOptions { fused: true, .. }".into(),
-            ));
-        }
         let f32s = |v: &Option<Feature<Vec<f64>>>| -> Option<Feature<Vec<f32>>> {
             (v.as_ref()).map(|v| v.as_ref().map(|v| v.iter().map(|&x| x as f32).collect()))
         };
@@ -2668,6 +2674,7 @@ impl Device {
             if let (Some(b), Some(v)) = (&mut have.scale, scale) {
                 b.values.copy_from_host(&self.stream, &v.values)?;
             }
+            fault::at(fault::Exit::FeatureCopy)?;
             if let (Some(b), Some(v)) = (&mut have.background, background) {
                 b.values.copy_from_host(&self.stream, &v.values)?;
             }
@@ -2922,6 +2929,13 @@ impl Device {
         }
     }
 
+    /// [`Self::one_slice`] and [`Self::unitary`] for `what`: checked before every call that
+    /// enqueues a pass but LSQML's, BH's and the LLK pass changes anything.
+    pub fn one_unitary(&self, what: &str) -> Result<(), EngineError> {
+        self.one_slice(what)?;
+        self.unitary(what)
+    }
+
     /// Overwrites the object in place, so every captured graph reads the new values.
     pub fn write_object(&mut self, obj: &[C32]) -> Result<(), EngineError> {
         Ok(self.obj.copy_from_host(&self.stream, obj)?)
@@ -2936,8 +2950,8 @@ impl Device {
 
     /// Overwrites the object and probe in place.
     pub fn write_arrays(&mut self, obj: &[C32], probe: &[C32]) -> Result<(), EngineError> {
-        self.one_slice("the phase ramp's removal")?;
         self.write_object(obj)?;
+        fault::at(fault::Exit::RampWrite)?;
         self.probe.copy_from_host(&self.stream, probe)?;
         Ok(())
     }
@@ -3121,6 +3135,7 @@ impl Device {
         };
         let done = at.and_then(|at| {
             stage(self)?;
+            fault::at(fault::Exit::Launch)?;
             let run = &mut runs[at];
             let tag = Some((cycle, epoch.algorithm()));
             self.summing(|dev| match &run.graph {
@@ -3165,6 +3180,7 @@ impl Device {
 
     /// The buffers of `epoch`'s cycle, and with graphs its graph, captured from them.
     fn new_run(&mut self, epoch: Epoch) -> Result<EpochRun, EngineError> {
+        fault::at(fault::Exit::RunBuild)?;
         let what = format!("{:?}", epoch.algorithm());
         let mut cycle = match epoch {
             Epoch::Ap { params, llk } => {
@@ -3340,7 +3356,6 @@ impl Device {
     /// PyNX `ScaleObjProbe(absolute=False)` enqueued eagerly: `Σ|O|` and `Σ|P|` balanced,
     /// `O P` unchanged.
     pub fn balance_obj_probe(&mut self) -> Result<(), EngineError> {
-        self.one_slice("the object and probe balance")?;
         let ctx = self.context();
         let (mut bufs, _, _) = self.lend();
         Ok(bufs.scale_obj_probe(&ctx, None)?)
@@ -3519,14 +3534,12 @@ impl<'a> Bufs<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cuda_async::error::DeviceError;
 
     use crate::base::required_obj_shape;
     use crate::base::{C64, Counts, Geometry, Object, Positions, Probe, Scan, Stack};
     use crate::engine::{
-        Backend, BhParams, Feature, Features, GpuPtycho, MlParams, Optics, Params, Step, Wavefield,
+        Backend, BhParams, Feature, Features, GpuPtycho, Optics, Params, Step, Wavefield,
     };
-    use crate::fault::{self, Exit};
     use crate::live::farfield::{Ptycho, PtychoSpec, ScanPath};
 
     /// An engine on a simulated raster of 36 points, its object flat: 32-pixel frames, or the
@@ -3604,7 +3617,7 @@ mod tests {
                 }
                 e
             });
-            let r = failed.dev.summing(|dev| {
+            let r = failed.dev.dev.summing(|dev| {
                 for sums in [&mut dev.obj_sums, &mut dev.probe_sums] {
                     let num = vec![C32 { re: 1.0, im: 1.0 }; sums.num.len()];
                     sums.num.copy_from_host(&dev.stream, &num)?;
@@ -3683,7 +3696,7 @@ mod tests {
                 e.bh(&params, 1, 1).unwrap();
                 e
             });
-            let r = failed.dev.summing(|dev| {
+            let r = failed.dev.dev.summing(|dev| {
                 let bh = dev.bh_state.as_deref_mut().expect("BH's state");
                 let g = &mut bh.sliced.as_mut().expect("two slices").grads()[0];
                 let num = vec![C32 { re: 1.0, im: 1.0 }; g.num.len()];
@@ -3714,244 +3727,6 @@ mod tests {
             {
                 assert!(f == c, "graph {graph}: {what} differs from a clean run's");
             }
-        }
-    }
-
-    /// A call failing at an exit after its record's advance keeps that record under its
-    /// cycle's tag, and its retry records the cycle again: AP's cycle before and after its
-    /// update sums are applied, ML's gradient pass and the features' step. The failed
-    /// engine's history is the failed record, then those of an engine that applied what the
-    /// failed call did (the cycle after its sums are applied; ML's photon scaling, which every
-    /// ML call starts with) and ran the retry, whose arrays it ends with bit for bit. Under
-    /// graphs the exits run only in the capture, which fails and counts nothing.
-    #[test]
-    fn a_call_failing_after_its_advance_keeps_its_record() {
-        let ctx = CudaContext::new(0).expect("GPU 0");
-        let ap = ApParams {
-            obj_inertia: Some(0.01),
-            probe_inertia: Some(0.01),
-            calc_llk: 1,
-            zero_phase_ramp: false,
-        };
-        let ml = MlParams {
-            update_object: true,
-            update_probe: true,
-            calc_llk: 1,
-            zero_phase_ramp: false,
-        };
-        let background = Features {
-            background: Some(Feature::refined(vec![1.0; 64 * 64])),
-            ..Features::default()
-        };
-        let run = |e: &mut GpuPtycho, exit: Exit, ncycle: usize| match exit {
-            Exit::MlGrad => e.ml(&ml, ncycle),
-            _ => e.ap(&ap, ncycle),
-        };
-        let bits = |e: &GpuPtycho| {
-            let (o, p) = (e.object().unwrap(), e.probe().unwrap());
-            let px = o.as_slice().iter().chain(p.as_slice());
-            px.flat_map(|c| [c.re.to_bits(), c.im.to_bits()])
-                .collect::<Vec<_>>()
-        };
-        let llk = |e: &GpuPtycho| -> Vec<u64> {
-            let h = e.history().iter();
-            h.map(|r| r.llk.poisson.to_bits()).collect()
-        };
-        for exit in [Exit::ApSums, Exit::ApPositions, Exit::MlGrad, Exit::Feature] {
-            for graph in [false, true] {
-                let what = format!("{exit:?}, graph {graph}");
-                let [mut failed, mut clean, mut first] = [(); 3].map(|()| {
-                    // The features step only in the fused passes.
-                    let mut e = engine(&ctx, graph, exit == Exit::Feature);
-                    if exit == Exit::Feature {
-                        e.set_features(&background).unwrap();
-                    }
-                    e
-                });
-                let armed = fault::arm(exit, 0);
-                let r = run(&mut failed, exit, 2);
-                assert!(armed.fired(), "{what}");
-                // A capture returns its closure's error as the device operation's.
-                let refused = match &r {
-                    Err(EngineError::Gpu(
-                        GpuError::Driver(d) | GpuError::Device(DeviceError::Driver(d)),
-                    )) => *d == fault::REFUSAL,
-                    _ => false,
-                };
-                assert!(refused, "{what}: {r:?}");
-                drop(armed);
-                run(&mut failed, exit, 2).unwrap();
-
-                // The cycles the failed call applied, each recording, as a call of its own.
-                let applied = match exit {
-                    Exit::ApPositions if !graph => Some(1),
-                    Exit::MlGrad => Some(0),
-                    _ => None,
-                };
-                if let Some(n) = applied {
-                    run(&mut clean, exit, n).unwrap();
-                }
-                run(&mut clean, exit, 2).unwrap();
-                let mut want = llk(&clean).split_off(applied.unwrap_or(0));
-                if !graph {
-                    run(&mut first, exit, 1).unwrap();
-                    want.insert(0, llk(&first)[0]);
-                }
-                let tags: Vec<usize> = failed.history().iter().map(|r| r.cycle).collect();
-                assert_eq!(
-                    tags,
-                    if graph { vec![0, 1] } else { vec![0, 0, 1] },
-                    "{what}"
-                );
-                assert_eq!(llk(&failed), want, "{what}: LLK");
-                assert!(bits(&failed) == bits(&clean), "{what}: the arrays");
-            }
-        }
-    }
-
-    /// A DM call failing between two stacks of its second cycle's projection keeps that
-    /// cycle's record, and its retry's cycle 0 overwrites the waves the failure left part
-    /// projected: the failed engine's history is the failed call's records, then the retry's,
-    /// and its LLKs and arrays are finite and bit for bit those of an engine that ran the
-    /// failed call's first cycle as a call of its own. Launched or replayed, M1's projection
-    /// and the fused one.
-    #[test]
-    fn a_dm_call_failing_between_stacks_is_retried_from_its_record() {
-        let ctx = CudaContext::new(0).expect("GPU 0");
-        let dm = DmParams {
-            calc_llk: 1,
-            zero_phase_ramp: false,
-            ..DmParams::default()
-        };
-        let bits = |e: &GpuPtycho| {
-            let (o, p) = (e.object().unwrap(), e.probe().unwrap());
-            let px = o.as_slice().iter().chain(p.as_slice());
-            px.flat_map(|c| [c.re, c.im]).collect::<Vec<_>>()
-        };
-        let llk = |e: &GpuPtycho| -> Vec<(usize, f64)> {
-            let h = e.history().iter();
-            h.map(|r| (r.cycle, r.llk.poisson)).collect()
-        };
-        for (graph, fused) in [(false, false), (true, false), (false, true), (true, true)] {
-            let what = format!("graph {graph}, fused {fused}");
-            let [mut failed, mut clean] = [(); 2].map(|()| engine(&ctx, graph, fused));
-            clean.dm(&dm, 1).unwrap();
-            let carried = clean.dev.carried.as_ref();
-            let nstack = carried.expect("DM built its stacks").cut.len();
-            assert!(nstack > 1, "{what}: one stack has no stack after it");
-            // Cycle 0's stacks, launched or captured, then the second of cycle 1's.
-            let armed = fault::arm(Exit::DmStack, nstack + 1);
-            let r = failed.dm(&dm, 2);
-            assert!(armed.fired(), "{what}");
-            let refused = match &r {
-                Err(EngineError::Gpu(
-                    GpuError::Driver(d) | GpuError::Device(DeviceError::Driver(d)),
-                )) => *d == fault::REFUSAL,
-                _ => false,
-            };
-            assert!(refused, "{what}: {r:?}");
-            drop(armed);
-            failed.dm(&dm, 2).unwrap();
-            clean.dm(&dm, 2).unwrap();
-
-            let (f, c) = (llk(&failed), llk(&clean));
-            assert_eq!(
-                c.iter().map(|r| r.0).collect::<Vec<_>>(),
-                [0, 1, 2],
-                "{what}"
-            );
-            let want = [c[0], c[1], c[1], c[2]].map(|(k, v)| (k, v.to_bits()));
-            let got: Vec<_> = f.iter().map(|&(k, v)| (k, v.to_bits())).collect();
-            assert_eq!(got, want, "{what}: the records");
-            assert!(f.iter().all(|r| r.1.is_finite()), "{what}: {f:?}");
-            let (f, c) = (bits(&failed), bits(&clean));
-            assert!(
-                f.iter().all(|v| v.is_finite()),
-                "{what}: the arrays are not finite"
-            );
-            let same = f
-                .iter()
-                .map(|v| v.to_bits())
-                .eq(c.iter().map(|v| v.to_bits()));
-            assert!(same, "{what}: the arrays");
-        }
-    }
-
-    /// An AP call failing in its full-object object solve keeps its records, and its retry
-    /// reads nothing the failed call left but its arrays, not the sums the solve part
-    /// consumed: failing before the first cycle's first step, after its third, or after the
-    /// third of the next cycle's, the first complete. The failed engine's history is its
-    /// complete cycles' records and the failed one's, then those of an engine that ran its
-    /// complete cycles as a call of its own, was given its object and probe (the probe steps
-    /// before the solve, the offsets after it) and ran the retry, whose arrays and offsets it
-    /// ends with bit for bit. Under graphs the exit runs only in the capture, which fails and
-    /// counts nothing.
-    #[test]
-    fn an_ap_call_failing_in_its_object_solve_is_retried_from_its_arrays() {
-        let ctx = CudaContext::new(0).expect("GPU 0");
-        let ap = ApParams {
-            obj_inertia: Some(0.01),
-            probe_inertia: Some(0.01),
-            calc_llk: 1,
-            zero_phase_ramp: false,
-        };
-        let offsets = (0..36).map(|f| [0.1 * (f % 3) as f64 - 0.1, 0.05]);
-        let position = Features {
-            position: Some(Feature::refined(offsets.collect())),
-            ..Features::default()
-        };
-        let bits = |e: &GpuPtycho| {
-            let (o, p) = (e.object().unwrap(), e.probe().unwrap());
-            let px = o.as_slice().iter().chain(p.as_slice());
-            let px = px.flat_map(|c| [c.re.to_bits(), c.im.to_bits()]);
-            let f = e.features().unwrap();
-            let pos = f.position.map(|p| p.values).into_iter().flatten().flatten();
-            px.chain(pos.map(f64::to_bits)).collect::<Vec<_>>()
-        };
-        let llk = |e: &GpuPtycho| -> Vec<(usize, u64)> {
-            let h = e.history().iter();
-            h.map(|r| (r.cycle, r.llk.poisson.to_bits())).collect()
-        };
-        for (graph, pass) in [(false, 0), (false, 3), (false, OBJ_PCG + 3), (true, 0)] {
-            let what = format!("graph {graph}, pass {pass}");
-            // The cycles the failed call completed, each one solve of `OBJ_PCG` steps.
-            let done = pass / OBJ_PCG;
-            let [mut failed, mut clean] = [(); 2].map(|()| {
-                let mut e = engine(&ctx, graph, true);
-                e.set_sampling(Sampling::FullObject).unwrap();
-                e.set_features(&position).unwrap();
-                e
-            });
-            let armed = fault::arm(Exit::Solve, pass);
-            let r = failed.ap(&ap, done + 2);
-            assert!(armed.fired(), "{what}");
-            let refused = match &r {
-                Err(EngineError::Gpu(
-                    GpuError::Driver(d) | GpuError::Device(DeviceError::Driver(d)),
-                )) => *d == fault::REFUSAL,
-                _ => false,
-            };
-            assert!(refused, "{what}: {r:?}");
-            drop(armed);
-            if done > 0 {
-                clean.ap(&ap, done).unwrap();
-            }
-            let dev = &failed.dev;
-            let obj = dev.obj.to_host_vec(&dev.stream).unwrap();
-            let probe = dev.probe.to_host_vec(&dev.stream).unwrap();
-            clean.dev.write_arrays(&obj, &probe).unwrap();
-            assert!(bits(&failed) == bits(&clean), "{what}: the arrays left");
-            for e in [&mut failed, &mut clean] {
-                e.ap(&ap, 2).unwrap();
-            }
-
-            let (f, c) = (llk(&failed), llk(&clean));
-            let kept = if graph { 0 } else { done + 1 };
-            assert_eq!(f.len(), kept + 2, "{what}: {f:?}");
-            assert_eq!(f[..done], c[..done], "{what}: the complete cycles' records");
-            assert_eq!(f[done].0, done, "{what}");
-            assert_eq!(f[kept..], c[done..], "{what}: the retry's records");
-            assert!(bits(&failed) == bits(&clean), "{what}: the arrays");
         }
     }
 }

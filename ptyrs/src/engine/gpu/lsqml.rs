@@ -29,8 +29,8 @@ use super::device::{
     moved_inputs, moved_shift, slice_phase,
 };
 use super::{
-    Bufs, Cut, Frames, GpuPtycho, StackRule, Streamed, batch_stacks, plane_bytes, plane_len,
-    wave_bytes,
+    Bufs, Cut, Device, Frames, GpuPtycho, StackRule, Streamed, batch_stacks, plane_bytes,
+    plane_len, wave_bytes,
 };
 use crate::engine::features::{POSITION_LIMIT, POSITION_STEP};
 use crate::engine::ptycho::{Algorithm, llk_due};
@@ -66,35 +66,38 @@ impl GpuPtycho {
         nepoch: usize,
         calc_llk: usize,
     ) -> Result<(), EngineError> {
-        params.validate()?;
-        if self.dev.models_scale_or_background() {
-            return Err(EngineError::Invalid(
-                "LSQML models no intensity scale or background, as pty-chi's".into(),
-            ));
-        }
-        let nframe = self.dev.dims().nframe as usize;
-        let size = params.batch_size.min(nframe);
-        for ic in 0..nepoch {
-            let order: Vec<u32> = random_batches(nframe, size, params.seed, ic as u64)
-                .concat()
-                .into_iter()
-                .map(|f| f as u32)
-                .collect();
-            self.dev
-                .lsqml_epoch(*params, Pre::of(ic), self.cycle, &order)?;
-            if llk_due(calc_llk, ic, nepoch) {
-                self.dev.llk_pass(Some((self.cycle, Algorithm::Lsqml)))?;
+        let check = |dev: &Device| {
+            params.validate()?;
+            if dev.models_scale_or_background() {
+                return Err(EngineError::Invalid(
+                    "LSQML models no intensity scale or background, as pty-chi's".into(),
+                ));
             }
-            self.cycle += 1;
-        }
-        self.collect()?;
-        Ok(())
+            Ok(())
+        };
+        self.call(false, check, |dev, cycle| {
+            let nframe = dev.dims().nframe as usize;
+            let size = params.batch_size.min(nframe);
+            for ic in 0..nepoch {
+                let order: Vec<u32> = random_batches(nframe, size, params.seed, ic as u64)
+                    .concat()
+                    .into_iter()
+                    .map(|f| f as u32)
+                    .collect();
+                dev.lsqml_epoch(*params, Pre::of(ic), *cycle, &order)?;
+                if llk_due(calc_llk, ic, nepoch) {
+                    dev.llk_pass(Some((*cycle, Algorithm::Lsqml)))?;
+                }
+                *cycle += 1;
+            }
+            Ok(())
+        })
     }
 
     /// The steps of the last LSQML epoch, as [`crate::engine::Lsqml::epoch`] returns them, read back
     /// from the device; none before an LSQML call.
     pub fn lsqml_steps(&self) -> Result<Vec<LsqmlStep>, EngineError> {
-        self.dev.lsqml_steps()
+        self.dev.checked()?.lsqml_steps()
     }
 }
 
