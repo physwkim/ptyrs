@@ -46,8 +46,9 @@ pub mod sampling;
 
 pub use crate::fft::C32;
 pub use bh::{
-    BH_HESS, BH_STEP, BhBatch, BhDisp, BhFieldsRef, BhKernels, BhMovedFarRef, BhMovesRef,
-    BhNearMut, BhOffsets, BhPositions, BhScan, BhVar, BhWinRef, BhWinSecond, EpochOrder, bh_parts,
+    BH_HESS, BH_STEP, BhArray, BhBatch, BhDisp, BhEntry, BhFieldsRef, BhKernels, BhMovedFarRef,
+    BhMovesRef, BhNearMut, BhOffsets, BhParts, BhPositions, BhScan, BhSecondRef, BhTangentsMut,
+    BhVar, BhWinRef, BhWinSecond, EpochOrder,
 };
 pub use fused::{
     BackgroundSums, Exit, FUSED_SIDES, FarSums, FusedBufs, FusedInputs, FusedSums, Model,

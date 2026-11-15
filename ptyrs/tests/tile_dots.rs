@@ -8,7 +8,7 @@ use std::sync::Arc;
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, DeviceCopy};
 use cutile::tile_kernel::jit_compile_count;
-use ptyrs::gpu::{BhDisp, C32, CG_BLOCKS, GradKernels, Kernels, ViewDims, gamma_parts};
+use ptyrs::gpu::{BhDisp, BhParts, C32, CG_BLOCKS, GradKernels, Kernels, ViewDims, gamma_parts};
 use ptyrs::tile::{TileCgDots, TileDots};
 
 /// Deterministic values in `[-scale, scale)`.
@@ -167,9 +167,11 @@ fn bh_dots_match_f64_host_sums() {
             u_scale: scale[1],
             v: cg.then(|| [&vd[0], &vd[1]]),
         };
-        let mut parts = up(s, &vec![f32::NAN; 4 * CG_BLOCKS as usize]);
+        let mut parts = BhParts::zeroed(s, &g.dims, 0).unwrap();
+        let nan = vec![f32::NAN; parts.buf().len()];
+        parts.buf_mut().copy_from_host(s, &nan).unwrap();
         tile.dots(&g.ex, &d, &mut parts).unwrap();
-        let got = down(s, &parts);
+        let got = down(s, parts.buf());
         for (i, n) in g.lens.map(|n| n as usize).into_iter().enumerate() {
             let depth = 2 * n.div_ceil(stride) + 255 + 1;
             let tol = |abs: f64| depth as f64 * f64::from(f32::EPSILON) / 2.0 * abs;

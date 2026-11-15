@@ -15,8 +15,8 @@ use ptyrs::base::{
     AddrTable, C64, Counts, Geometry, Object, Probe, Scan, Stack, required_obj_shape,
 };
 use ptyrs::engine::{
-    ApParams, BhParams, Cost, Features, Fft2, GpuOptions, GpuPtycho, Llk, Lsqml, LsqmlParams,
-    LsqmlStep, Observed, Optics, ProbeVariation, Sampling, SliceWaves, Wavefield, llk, shift,
+    ApParams, Cost, Features, Fft2, GpuOptions, GpuPtycho, Llk, Lsqml, LsqmlParams, LsqmlStep,
+    Observed, Optics, ProbeVariation, Sampling, SliceWaves, Wavefield, llk, shift,
 };
 use ptyrs::gpu::FUSED_SIDES;
 
@@ -760,13 +760,7 @@ fn gpu_refuses_what_it_cannot_run_on_slices() {
     let mut gpu = case(optics("far field", 3), NPOS, 1).gpu(OPTIONS);
     let before: Vec<_> = gpu.objects().unwrap().iter().map(|o| bits(o)).collect();
     let probe = bits(&gpu.probe().unwrap());
-    let bh = BhParams {
-        batch_size: 12,
-        probe_rho: 0.01,
-        position_rho: 0.1,
-        seed: 7,
-    };
-    let only = "only LSQML and the LLK pass run a multislice object";
+    let only = "only LSQML, BH and the LLK pass run a multislice object";
     let e = gpu.ap(&ApParams::default(), 1).unwrap_err().to_string();
     assert!(
         e.contains("Ap runs one object slice, got 3") && e.contains(only),
@@ -777,8 +771,6 @@ fn gpu_refuses_what_it_cannot_run_on_slices() {
     let e = gpu.raar(&Default::default(), 1).unwrap_err().to_string();
     assert!(e.contains(only), "{e}");
     let e = gpu.rpie(&Default::default(), 1).unwrap_err().to_string();
-    assert!(e.contains(only), "{e}");
-    let e = gpu.bh(&bh, 1, 0).unwrap_err().to_string();
     assert!(e.contains(only), "{e}");
     let e = gpu.ml(&Default::default(), 1).unwrap_err().to_string();
     assert!(e.contains(only), "{e}");
