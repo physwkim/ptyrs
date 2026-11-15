@@ -88,12 +88,12 @@ fn draw(
     let addr = AddrTable::new(
         &positions.pynx_preprocess(pixel),
         pixel,
-        geometry.frame,
+        geometry.frame.sides(),
         object.plane_shape(),
         probe.nmode(),
         object.nmode(),
     )?;
-    let [ny, nx] = geometry.frame;
+    let [ny, nx] = geometry.frame.sides();
     let n = ny * nx;
     let mut psi = vec![C64::default(); addr.views().len() * n];
     crate::engine::obj_probe_to_psi(
@@ -103,7 +103,7 @@ fn draw(
         &crate::engine::quad_phase(&geometry),
         &mut psi,
     );
-    Fft2::new(geometry.frame).forward(&mut psi);
+    Fft2::new(geometry.frame.sides()).forward(&mut psi);
     let (nframe, nmode) = (addr.nframe(), addr.nmode());
     // detector order: natural pixel i is shifted pixel shift(i)
     let mut intensity = vec![0.0; nframe * n];
@@ -137,9 +137,10 @@ mod tests {
         let g = Geometry::new(1.5e-10, 1.0, 75e-6, [16, 16]).unwrap();
         let pixel = g.pixel_size_object();
         let positions = crate::base::sim::fermat(5, 3.0 * pixel[1]);
-        let shape = required_obj_shape(&positions.pynx_preprocess(pixel), pixel, g.frame, 0);
+        let shape =
+            required_obj_shape(&positions.pynx_preprocess(pixel), pixel, g.frame.sides(), 0);
         let object = crate::base::sim::object(shape);
-        let probe = crate::base::sim::probe(g.frame, 2).unwrap();
+        let probe = crate::base::sim::probe(g.frame.sides(), 2).unwrap();
         let photons = 2e3;
         let sim =
             |mask| simulate_truth(g, positions.clone(), &object, &probe, photons, mask, 3).unwrap();

@@ -752,12 +752,13 @@ mod tests {
         let g = Geometry::new(1.5e-10, 1.0, 75e-6, [16, 16]).unwrap();
         let pixel = g.pixel_size_object();
         let positions = ptyrs::base::sim::fermat(5, 3.0 * pixel[1]);
-        let shape = required_obj_shape(&positions.pynx_preprocess(pixel), pixel, g.frame, 0);
+        let shape =
+            required_obj_shape(&positions.pynx_preprocess(pixel), pixel, g.frame.sides(), 0);
         let object = ptyrs::base::sim::object(shape);
-        let probe = ptyrs::base::sim::probe(g.frame, 2).unwrap();
+        let probe = ptyrs::base::sim::probe(g.frame.sides(), 2).unwrap();
         let scan =
             ptyrs::engine::sim::simulate(g, positions, &object, &probe, 2e3, None, 3).unwrap();
-        let w = ptyrs::engine::Wavefield::new(g.frame, g.wavelength, pixel, 1e-4).unwrap();
+        let w = ptyrs::engine::Wavefield::new(g.frame.sides(), g.wavelength, pixel, 1e-4).unwrap();
         for exit in [Exit::FarField(g), Exit::FreeSpace(w)] {
             let (o, pr) = (object.clone(), probe.clone());
             let p = ptyrs::engine::Ptycho::with_optics(&scan, exit.optics(), o, pr).unwrap();

@@ -255,17 +255,17 @@ impl Ptycho {
         let addr = AddrTable::new(
             &positions,
             pixel,
-            g.frame,
+            g.frame.sides(),
             object.plane_shape(),
             probe.nmode(),
             object.nmode(),
         )?;
         let psi = vec![C64::default(); addr.views().len() * probe.plane_len()];
-        let sampling = Sampling::auto(&optics, object.plane_shape(), g.frame);
+        let sampling = Sampling::auto(&optics, object.plane_shape(), g.frame.sides());
         Ok(Self {
             optics,
             obs: Observed::from_counts(&scan.counts),
-            fft: Fft2::new(g.frame),
+            fft: Fft2::new(g.frame.sides()),
             addr,
             object,
             probe,
@@ -294,8 +294,7 @@ impl Ptycho {
     /// Models `features` from here on, refining those set to; an error leaves the current
     /// ones.
     pub fn set_features(&mut self, features: Features) -> Result<(), EngineError> {
-        let [nframe, ny, nx] = self.obs.dims();
-        features.check(nframe, [ny, nx])?;
+        features.check(self.obs.nframe(), self.obs.frame())?;
         self.features = features;
         Ok(())
     }
@@ -889,7 +888,7 @@ impl Ptycho {
 
     fn rpie_batch(&mut self, params: &RpieParams, frames: Range<usize>) {
         let [ny, nx] = self.probe.plane_shape();
-        let n = ny * nx;
+        let n = self.probe.plane_len();
         let nmode = self.addr.nmode();
         let nxo = self.object.plane_shape()[1];
         let nbatch = frames.len();
@@ -1077,7 +1076,7 @@ impl Ptycho {
 /// downloads.
 pub(crate) fn zero_phase_ramp(fft: &Fft2, object: &mut Object, probe: &mut Probe) {
     let [ny, nx] = probe.plane_shape();
-    let n = ny * nx;
+    let n = probe.plane_len();
     let mut far = vec![C64::default(); probe.as_slice().len()];
     for (m, out) in far.chunks_exact_mut(n).enumerate() {
         let p = probe.plane(m);
@@ -1159,12 +1158,13 @@ mod tests {
     /// [`grad_start`]'s positions, truth, probe and detector mask over object pixels `pixel`.
     fn truth(g: &Geometry, pixel: [f64; 2]) -> (Positions, Object, Probe, Vec<bool>) {
         let positions = crate::base::sim::fermat(5, 3.0 * pixel[1]);
-        let shape = required_obj_shape(&positions.pynx_preprocess(pixel), pixel, g.frame, 0);
+        let shape =
+            required_obj_shape(&positions.pynx_preprocess(pixel), pixel, g.frame.sides(), 0);
         let one = crate::base::sim::object(shape);
         let second = one.as_slice().iter().map(|v| v.conj() * 0.3);
         let truth: Vec<C64> = one.as_slice().iter().copied().chain(second).collect();
         let truth = Object::new(Stack::from_vec([2, shape[0], shape[1]], truth).unwrap());
-        let probe = crate::base::sim::probe(g.frame, 2).unwrap();
+        let probe = crate::base::sim::probe(g.frame.sides(), 2).unwrap();
         let mut mask = vec![false; 256];
         mask[8 * 16 + 9] = true;
         mask[3 * 16 + 5] = true;
@@ -1390,14 +1390,15 @@ mod tests {
             (seed >> 11) as f64 / (1u64 << 53) as f64
         };
         let positions = crate::base::sim::fermat(5, 3.0 * pixel[1]);
-        let shape = required_obj_shape(&positions.pynx_preprocess(pixel), pixel, g.frame, 0);
+        let shape =
+            required_obj_shape(&positions.pynx_preprocess(pixel), pixel, g.frame.sides(), 0);
         let mut object = crate::base::sim::object(shape);
         if let Some(modulus) = modulus {
             for v in object.as_mut_slice() {
                 *v = C64::from_polar(modulus(uniform()), 2.0 * PI * uniform());
             }
         }
-        let probe = crate::base::sim::probe(g.frame, 2).unwrap();
+        let probe = crate::base::sim::probe(g.frame.sides(), 2).unwrap();
         let dims = [positions.len(), 16, 16];
         let blank = Counts::from_raw(dims, vec![0; dims.iter().product()]).unwrap();
         let blank = Scan::new(g, positions, blank).unwrap();

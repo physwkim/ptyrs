@@ -3806,7 +3806,8 @@ mod tests {
                 // The slices' propagator stage has in-kernel FFTs of the fused passes' sides alone.
                 let (scan, object, probe, options) = start(graph, true);
                 let g = scan.geometry;
-                let gap = Wavefield::new(g.frame, g.wavelength, g.pixel_size_object(), 2e-5);
+                let gap =
+                    Wavefield::new(g.frame.sides(), g.wavelength, g.pixel_size_object(), 2e-5);
                 let optics = Optics::far_field(&g).with_slices(&[gap.unwrap()]);
                 let objects = [object.clone(), object];
                 let mut e =

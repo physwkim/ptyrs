@@ -141,12 +141,12 @@ fn opr(path: &Path) -> Result<(), Box<dyn Error>> {
     let g = Geometry::new(1.5e-10, 1.0, 75e-6, [32, 32])?;
     let pixel = g.pixel_size_object();
     let positions = fermat(20, 4.0 * pixel[1]);
-    let shape = required_obj_shape(&positions.pynx_preprocess(pixel), pixel, g.frame, 0);
+    let shape = required_obj_shape(&positions.pynx_preprocess(pixel), pixel, g.frame.sides(), 0);
     let scan = simulate(
         g,
         positions,
         &object(shape),
-        &probe(g.frame, 2)?,
+        &probe(g.frame.sides(), 2)?,
         2e5,
         None,
         3,
@@ -155,7 +155,7 @@ fn opr(path: &Path) -> Result<(), Box<dyn Error>> {
         [1, shape[0], shape[1]],
         vec![C64::new(1.0, 0.0); shape[0] * shape[1]],
     )?);
-    let mut p = Ptycho::new(&scan, flat, probe(g.frame, 2)?)?;
+    let mut p = Ptycho::new(&scan, flat, probe(g.frame.sides(), 2)?)?;
     p.scale_obj_probe();
     let optics = Optics::far_field(&g);
     let nframe = p.addr().nframe();
@@ -198,7 +198,7 @@ fn opr(path: &Path) -> Result<(), Box<dyn Error>> {
         group.set_attr_numeric("batch_size", &(params.batch_size as u64))?;
         group.set_attr_numeric("seed", &params.seed)?;
         let (mut object, mut probe) = (p.object().clone(), p.probe().clone());
-        let mut var = variation(probe.plane(0), g.frame, nframe, intensity);
+        let mut var = variation(probe.plane(0), g.frame.sides(), nframe, intensity);
         write_variation(&group, &var)?;
         let mut lsqml = Lsqml::new(params)?;
         let llk = |lsqml: &Lsqml, object: &Object, probe: &Probe, var: &ProbeVariation| {

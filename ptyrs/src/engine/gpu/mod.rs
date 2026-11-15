@@ -36,7 +36,7 @@ mod rpie;
 use std::ops::Range;
 use std::sync::Arc;
 
-use crate::base::{AddrTable, C64, Object, Probe, Scan, Stack};
+use crate::base::{AddrTable, C64, Frame, Object, Probe, Scan, Stack};
 use crate::fault;
 use crate::fft::Plan2d;
 use crate::gpu::{
@@ -512,6 +512,7 @@ pub struct GpuPtycho {
     dev: Gated,
     obj_dims: [usize; 3],
     probe_dims: [usize; 3],
+    frame: Frame,
     /// Sum of the unmasked observed counts, for ML's [`crate::engine::Ptycho::scale_obj_probe`].
     total_obs: f64,
     /// The probe-frame FFT of [`zero_phase_ramp`], which runs on the host.
@@ -631,7 +632,7 @@ impl GpuPtycho {
             )));
         }
         let g = scan.geometry;
-        let [ny, nx] = g.frame;
+        let [ny, nx] = g.frame.sides();
         if optics.exit().shape() != g.frame {
             return Err(EngineError::Invalid(format!(
                 "propagator plane {:?} differs from frame {:?}",
@@ -665,7 +666,7 @@ impl GpuPtycho {
         let addr = AddrTable::new(
             &positions,
             pixel,
-            g.frame,
+            g.frame.sides(),
             object.plane_shape(),
             probe.nmode(),
             object.nmode(),
@@ -720,14 +721,15 @@ impl GpuPtycho {
             probe: &to_c32(probe.as_slice()),
             slices,
         };
-        let sampling = Sampling::auto(optics, object.plane_shape(), g.frame);
+        let sampling = Sampling::auto(optics, object.plane_shape(), g.frame.sides());
         let dev = Device::new(ctx, dims, uploads, options, sampling)?;
         Ok(Self {
             dev: Gated::new(dev),
             obj_dims: object.dims(),
             probe_dims: probe.dims(),
+            frame: g.frame,
             total_obs: scan.counts.total(),
-            fft: Fft2::new(g.frame),
+            fft: Fft2::new(g.frame.sides()),
             cycle: 0,
             history: Vec::new(),
         })
@@ -820,11 +822,10 @@ impl GpuPtycho {
     /// Models and refines `features` from here on, as [`crate::engine::Ptycho::set_features`], in
     /// `f32` on the device; with [`GpuOptions::fused`] only.
     pub fn set_features(&mut self, features: &Features) -> Result<(), EngineError> {
+        let frame = self.frame;
         self.dev.change(
             |dev| {
-                let dims = dev.dims();
-                let [ny, nx] = dims.frame.map(|n| n as usize);
-                features.check(dims.nframe as usize, [ny, nx])?;
+                features.check(dev.dims().nframe as usize, frame)?;
                 dev.build_features(features)
             },
             |dev, new| dev.set_features(new),

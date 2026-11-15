@@ -896,9 +896,9 @@ mod tests {
         let g = Geometry::new(1.5e-10, 1.0, 75e-6, [frame, frame]).unwrap();
         let pixel = g.pixel_size_object();
         let pos = positions(pixel[1]);
-        let shape = required_obj_shape(&pos.pynx_preprocess(pixel), pixel, g.frame, 4);
+        let shape = required_obj_shape(&pos.pynx_preprocess(pixel), pixel, g.frame.sides(), 4);
         let object = sim::object(shape);
-        let probe = sim::probe(g.frame, nmode).unwrap();
+        let probe = sim::probe(g.frame.sides(), nmode).unwrap();
         let scan = crate::engine::sim::simulate(g, pos, &object, &probe, PHOTONS, None, 7).unwrap();
         let mut x = 0x9e37_79b9_7f4a_7c15_u64;
         let phase: Vec<C64> = (0..object.as_slice().len())

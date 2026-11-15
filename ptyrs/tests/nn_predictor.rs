@@ -32,9 +32,9 @@ fn scan(probe: &Probe, seed: u64) -> (Scan, Object, AddrTable) {
     let pixel = g.pixel_size_object();
     let positions = sim::fermat(40, 4.0 * pixel[1]);
     let pre = positions.pynx_preprocess(pixel);
-    let shape = required_obj_shape(&pre, pixel, g.frame, 8);
+    let shape = required_obj_shape(&pre, pixel, g.frame.sides(), 8);
     let object = random_object(shape, seed);
-    let addr = AddrTable::new(&pre, pixel, g.frame, shape, 1, 1).unwrap();
+    let addr = AddrTable::new(&pre, pixel, g.frame.sides(), shape, 1, 1).unwrap();
     let scan = ptyrs::engine::sim::simulate(g, positions, &object, probe, 1e5, None, seed).unwrap();
     (scan, object, addr)
 }

@@ -19,7 +19,12 @@ fn positions(g: &Geometry) -> Positions {
 pub fn object_shape(frame: usize) -> [usize; 2] {
     let g = geometry(frame);
     let pixel = g.pixel_size_object();
-    required_obj_shape(&positions(&g).pynx_preprocess(pixel), pixel, g.frame, 8)
+    required_obj_shape(
+        &positions(&g).pynx_preprocess(pixel),
+        pixel,
+        g.frame.sides(),
+        8,
+    )
 }
 
 /// A 100-point Fermat scan, 4 object pixels apart, of `object` (random when `None`).
@@ -34,7 +39,7 @@ pub fn scan(
     let positions = positions(&g);
     let pre = positions.pynx_preprocess(pixel);
     let object = object.unwrap_or_else(|| random_object(object_shape(frame), seed));
-    let addr = AddrTable::new(&pre, pixel, g.frame, object.plane_shape(), 1, 1).unwrap();
+    let addr = AddrTable::new(&pre, pixel, g.frame.sides(), object.plane_shape(), 1, 1).unwrap();
     let scan = ptyrs::engine::sim::simulate(g, positions, &object, probe, 1e6, None, seed).unwrap();
     (scan, object, addr)
 }

@@ -15,7 +15,7 @@ use crate::engine::{Observed, shift};
 /// PyNX `calc_quadratic_phase_factor` uses `px` on both axes and rounds `π/(λz)` and `px` to
 /// f32; the two agree on square frames.
 pub fn quad_phase(geometry: &Geometry) -> Vec<C64> {
-    let [ny, nx] = geometry.frame;
+    let [ny, nx] = geometry.frame.sides();
     let [py, px] = geometry.pixel_size_object();
     let f = PI / (geometry.wavelength * geometry.distance);
     let mut q = Vec::with_capacity(ny * nx);

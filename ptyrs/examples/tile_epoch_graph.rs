@@ -94,8 +94,8 @@ fn scan() -> (ViewDims, Vec<ViewAddr>) {
     let pos = Positions::new(round(f.y()), round(f.x()))
         .unwrap()
         .pynx_preprocess(pixel);
-    let obj = required_obj_shape(&pos, pixel, g.frame, 16);
-    let addr = AddrTable::new(&pos, pixel, g.frame, obj, 2, 1).unwrap();
+    let obj = required_obj_shape(&pos, pixel, g.frame.sides(), 16);
+    let addr = AddrTable::new(&pos, pixel, g.frame.sides(), obj, 2, 1).unwrap();
     let d = ViewDims {
         nframe: NPOS,
         nmode: 2,

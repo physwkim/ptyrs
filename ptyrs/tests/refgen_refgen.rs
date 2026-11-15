@@ -17,7 +17,7 @@ fn lcg(seed: &mut u64) -> f64 {
 #[test]
 fn far_matches_centred_dft() {
     let g = Geometry::new(1e-10, 0.5, 55e-6, [6, 8]).unwrap();
-    let [ny, nx] = g.frame;
+    let [ny, nx] = g.frame.sides();
     let (nyo, nxo) = (9, 11);
     let mut s = 7;
     let mut c =
@@ -61,8 +61,8 @@ fn far_matches_centred_dft() {
 /// PyNX formulas term by term; the masked pixel is skipped and not counted in `nb_obs`.
 #[test]
 fn llk_skips_masked_and_normalises() {
-    let counts = Counts::from_raw([1, 1, 3], vec![4, 0, MASKED]).unwrap();
-    let icalc = [2.0, 0.5, 9.0];
+    let counts = Counts::from_raw([1, 2, 2], vec![4, 0, MASKED, MASKED]).unwrap();
+    let icalc = [2.0, 0.5, 9.0, 9.0];
     let l = llk(&icalc, &counts);
     assert_eq!(l.nb_obs, 2);
     let p = (2.0 - 4.0 + 4.0 * (4.0f64 / 2.0).ln()) + 0.5;

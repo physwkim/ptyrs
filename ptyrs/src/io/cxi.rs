@@ -28,7 +28,7 @@ const MASK: &str = "entry_1/instrument_1/detector_1/mask";
 pub fn write_cxi(path: impl AsRef<Path>, scan: &Scan) -> Result<(), IoError> {
     let counts = &scan.counts;
     let [nframe, ny, nx] = counts.dims();
-    let plane = ny * nx;
+    let plane = counts.frame_shape().area();
     let mask = counts.detector_mask();
     if let Some(i) = counts
         .as_slice()
@@ -193,8 +193,9 @@ pub fn read_cxi(path: impl AsRef<Path>) -> Result<Scan, IoError> {
     let counts = if is_u16(&data)? {
         let mut raw = data.read_numeric_as::<u16>()?;
         if let Some(m) = &mask {
+            let plane = geometry.frame.area();
             for (i, v) in raw.iter_mut().enumerate() {
-                if m[i % (ny * nx)] {
+                if m[i % plane] {
                     *v = MASKED;
                 }
             }
