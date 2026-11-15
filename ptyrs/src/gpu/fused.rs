@@ -1916,7 +1916,6 @@ impl<'a> Run<'a> {
         reads.extend(sets);
         writes.push(bufs.work.storage());
         let (ctl, g, half) = (self.ctl(), self.g, carried.half());
-        let probe = shared_probe(p.probe);
         self.k.launch(self.ctx, &reads, &writes, |stream| {
             let m = &self.k.module;
             // SAFETY: `Run::new` and the caller checked every buffer the flags name;
@@ -1924,30 +1923,14 @@ impl<'a> Run<'a> {
             // launch is the one `rows_fwd` documents.
             unsafe {
                 match (self.sh.nx, half) {
-                    (Side::N64, false) => {
-                        m.fused_rows_fwd_64(stream, config, p, probe, ctl, g, cfg)
-                    }
-                    (Side::N128, false) => {
-                        m.fused_rows_fwd_128(stream, config, p, probe, ctl, g, cfg)
-                    }
-                    (Side::N256, false) => {
-                        m.fused_rows_fwd_256(stream, config, p, probe, ctl, g, cfg)
-                    }
-                    (Side::N512, false) => {
-                        m.fused_rows_fwd_512(stream, config, p, probe, ctl, g, cfg)
-                    }
-                    (Side::N64, true) => {
-                        m.fused_rows_fwd_f16_64(stream, config, p, probe, ctl, g, cfg)
-                    }
-                    (Side::N128, true) => {
-                        m.fused_rows_fwd_f16_128(stream, config, p, probe, ctl, g, cfg)
-                    }
-                    (Side::N256, true) => {
-                        m.fused_rows_fwd_f16_256(stream, config, p, probe, ctl, g, cfg)
-                    }
-                    (Side::N512, true) => {
-                        m.fused_rows_fwd_f16_512(stream, config, p, probe, ctl, g, cfg)
-                    }
+                    (Side::N64, false) => m.fused_rows_fwd_64(stream, config, p, ctl, g, cfg),
+                    (Side::N128, false) => m.fused_rows_fwd_128(stream, config, p, ctl, g, cfg),
+                    (Side::N256, false) => m.fused_rows_fwd_256(stream, config, p, ctl, g, cfg),
+                    (Side::N512, false) => m.fused_rows_fwd_512(stream, config, p, ctl, g, cfg),
+                    (Side::N64, true) => m.fused_rows_fwd_f16_64(stream, config, p, ctl, g, cfg),
+                    (Side::N128, true) => m.fused_rows_fwd_f16_128(stream, config, p, ctl, g, cfg),
+                    (Side::N256, true) => m.fused_rows_fwd_f16_256(stream, config, p, ctl, g, cfg),
+                    (Side::N512, true) => m.fused_rows_fwd_f16_512(stream, config, p, ctl, g, cfg),
                 }
             }
         })

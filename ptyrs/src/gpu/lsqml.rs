@@ -417,9 +417,13 @@ impl LsqmlKernels {
         let config = sh.rows(&g, true)?;
         let mut reads = vec![obj.storage(), views.addr().storage(), stack.storage()];
         reads.extend(probe.storages());
-        let probe = probe.src(d.n())?;
+        let own = match probe {
+            FrameProbe::Shared(_) => None,
+            FrameProbe::Own(p, own) => Some(own.src(p, d.n())?),
+        };
         let p = FusedPtrs {
             obj: dptr::<C32, f32>(obj).cast_const(),
+            probe: dptr::<C32, f32>(probe.probe()).cast_const(),
             views: dptr::<ViewAddr, ViewAddr>(views.addr()).cast_const(),
             work: dptr(work),
             ..null_ptrs()
@@ -435,11 +439,23 @@ impl LsqmlKernels {
             // SAFETY: lengths checked above; `Shape::of` checked the side's kernels and shared
             // memory; `Views::new` checked the views are inside the object.
             unsafe {
-                match sh.nx {
-                    Side::N64 => m.fused_rows_fwd_64(stream, config, p, probe, ctl, g, cfg),
-                    Side::N128 => m.fused_rows_fwd_128(stream, config, p, probe, ctl, g, cfg),
-                    Side::N256 => m.fused_rows_fwd_256(stream, config, p, probe, ctl, g, cfg),
-                    Side::N512 => m.fused_rows_fwd_512(stream, config, p, probe, ctl, g, cfg),
+                match (sh.nx, own) {
+                    (Side::N64, None) => m.fused_rows_fwd_64(stream, config, p, ctl, g, cfg),
+                    (Side::N128, None) => m.fused_rows_fwd_128(stream, config, p, ctl, g, cfg),
+                    (Side::N256, None) => m.fused_rows_fwd_256(stream, config, p, ctl, g, cfg),
+                    (Side::N512, None) => m.fused_rows_fwd_512(stream, config, p, ctl, g, cfg),
+                    (Side::N64, Some(own)) => {
+                        m.fused_rows_fwd_own_64(stream, config, p, own, ctl, g, cfg)
+                    }
+                    (Side::N128, Some(own)) => {
+                        m.fused_rows_fwd_own_128(stream, config, p, own, ctl, g, cfg)
+                    }
+                    (Side::N256, Some(own)) => {
+                        m.fused_rows_fwd_own_256(stream, config, p, own, ctl, g, cfg)
+                    }
+                    (Side::N512, Some(own)) => {
+                        m.fused_rows_fwd_own_512(stream, config, p, own, ctl, g, cfg)
+                    }
                 }
             }
         })
