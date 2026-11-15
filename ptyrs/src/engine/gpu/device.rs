@@ -2439,7 +2439,7 @@ impl Device {
         if self.ml.as_ref().is_some_and(|s| s.position.is_some()) {
             self.ml = None;
         }
-        if self.bh_state.as_ref().is_some_and(|s| s.moved.is_some()) {
+        if self.bh_state.as_ref().is_some_and(|s| s.reads().is_some()) {
             self.bh_state = None;
         }
         if self.lsqml.as_ref().is_some_and(|s| s.reads().is_some()) {
