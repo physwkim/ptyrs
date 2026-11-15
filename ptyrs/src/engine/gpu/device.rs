@@ -1843,31 +1843,32 @@ impl BhState {
             }
             Some(MovedSampling::FullObject { held, scratch, acc }) => {
                 let win = Windows::bytes(dims);
-                let calls = [0, 3, 6, 21, 24, 27, 30, 33, 36, 44, 47, 50];
+                // Each sampler call's first pass, and the last to read the block it writes.
+                let calls = [
+                    (0, 13),
+                    (3, 14),
+                    (6, 14),
+                    (21, 43),
+                    (24, 53),
+                    (27, 53),
+                    (30, 43),
+                    (33, 53),
+                    (36, 53),
+                    (44, 53),
+                    (47, 53),
+                    (50, 53),
+                ];
                 let mut s: Vec<_> = (calls.into_iter())
-                    .map(|p| Streamed::fixed(held, p..=p + 2))
+                    .flat_map(|(p, read)| Streamed::chunked(held, p..=p + 2, &[(win, read)], &[]))
                     .collect();
+                s.extend(Streamed::chunked(acc, 15..=20, &[], &[(win, 14)]));
                 s.extend([
-                    Streamed::new(win, 2..=13),
-                    Streamed::new(win, 5..=14),
-                    Streamed::new(win, 8..=14),
+                    Streamed::fixed(scratch, 16..=18),
                     Streamed::new(wave, 9..=11),
                     Streamed::new(wave, 11..=14),
-                    Streamed::new(win, 14..=16),
-                    Streamed::fixed(scratch, 16..=18),
-                    Streamed::fixed(acc, 15..=20),
-                    Streamed::new(win, 23..=43),
-                    Streamed::new(win, 26..=53),
-                    Streamed::new(win, 29..=53),
-                    Streamed::new(win, 32..=43),
-                    Streamed::new(win, 35..=53),
-                    Streamed::new(win, 38..=53),
                     Streamed::new(wave, 40..=43),
                     Streamed::new(wave, 40..=43),
                     Streamed::new(wave, 43..=53),
-                    Streamed::new(win, 46..=53),
-                    Streamed::new(win, 49..=53),
-                    Streamed::new(win, 52..=53),
                 ]);
                 s
             }
