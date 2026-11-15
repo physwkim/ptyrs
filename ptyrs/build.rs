@@ -3,7 +3,7 @@
 //! comes from the one root that CUDA_TOOLKIT_PATH, else CUDA_HOME, names; see [`Toolkit`].
 //!
 //! 1. A nested `cargo oxide build --emit-nvvm-ir` compiles ptyrs-kernels with the cuda-oxide
-//!    backend into `<target>/oxide-device`; the backend embeds the IR, its target and its
+//!    backend into `<target>/oxide-device/<sm>`; the backend embeds the IR, its target and its
 //!    compile options in the crate's rlib, where they are read. cargo-oxide is built into
 //!    `<target>/oxide-cli` from the cuda-rust checkout `cuda-device` resolves to, the one its
 //!    backend is built from.
@@ -235,10 +235,12 @@ fn build_device_crate(
     arch: &CudaArch,
 ) -> Res<PathBuf> {
     let cargo_oxide = cargo_oxide_manifest(workspace, toolkit)?;
-    let device_dir = target_dir.join("oxide-device");
-    let mut cmd = nested_cargo(workspace, toolkit);
-    // Fixed, as cargo-oxide fingerprints it: one per OUT_DIR rebuilt the device crate and its
+    // One per arch, so every rlib in it is of this arch: in a shared one a build of another
+    // arch can replace the rlib between this nested build and its read. Fixed otherwise, as
+    // cargo-oxide fingerprints it: one per OUT_DIR rebuilt the device crate and its
     // dependencies for every profile and feature set of ptyrs.
+    let device_dir = target_dir.join("oxide-device").join(arch.sm());
+    let mut cmd = nested_cargo(workspace, toolkit);
     cmd.env("CUDA_OXIDE_PTX_DIR", device_dir.join("emit"))
         .args(["run", "--quiet", "--locked", "--manifest-path"])
         .arg(&cargo_oxide)
