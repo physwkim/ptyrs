@@ -12,6 +12,7 @@ pub mod dip;
 pub mod interop;
 pub mod live;
 pub mod metric;
+pub mod norm_relu;
 pub mod predictor;
 pub mod ptychonn;
 

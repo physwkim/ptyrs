@@ -11,6 +11,8 @@ use burn::tensor::activation::{relu, sigmoid, tanh};
 use burn::tensor::module::{interpolate, max_pool2d};
 use burn::tensor::ops::{InterpolateMode, InterpolateOptions, MaxPoolOptions};
 
+use crate::nn::norm_relu::norm_relu;
+
 /// Two 3×3 same-padded convolutions, each followed by batch normalisation and ReLU, on
 /// channels-last `[batch, h, w, channels]`. Without the normalisation training sits for tens of
 /// epochs at the mean patch: the object shows only as a small modulation of the probe's far field.
@@ -38,8 +40,8 @@ impl Block {
     }
 
     pub(crate) fn forward(&self, x: Tensor<4>) -> Tensor<4> {
-        let x = relu(norm(&self.na, conv(&self.a, x)));
-        relu(norm(&self.nb, conv(&self.b, x)))
+        let x = norm_relu(&self.na, conv(&self.a, x));
+        norm_relu(&self.nb, conv(&self.b, x))
     }
 
     fn fold(&self) -> [Conv2d; 2] {
@@ -56,13 +58,6 @@ pub(crate) fn channels_first(x: Tensor<4>, f: impl FnOnce(Tensor<4>) -> Tensor<4
 
 fn conv(c: &Conv2d, x: Tensor<4>) -> Tensor<4> {
     channels_first(x, |x| c.forward(x))
-}
-
-/// `n` on channels-last `x` as its `[batch·h·w, channels]` rows, whose channel axis burn
-/// normalises without the transposing copy a `[batch, channels, h, w]` view of them costs.
-fn norm(n: &BatchNorm, x: Tensor<4>) -> Tensor<4> {
-    let [b, h, w, c] = x.dims();
-    n.forward(x.reshape([b * h * w, c])).reshape([b, h, w, c])
 }
 
 /// `c` followed by `n` at its running statistics as one convolution.

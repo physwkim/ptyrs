@@ -26,7 +26,6 @@ use burn::nn::{BatchNorm, BatchNormConfig, PaddingConfig2d};
 use burn::optim::AdamConfig;
 use burn::prelude::*;
 use burn::tensor::DType;
-use burn::tensor::activation::relu;
 use burn::tensor::module::max_pool2d;
 use burn::tensor::ops::MaxPoolOptions;
 use cuda_core::CudaContext;
@@ -34,6 +33,7 @@ use ptyrs::base::{C64, Object, Probe, Scan, Stack};
 use ptyrs::engine::{GpuOptions, Ptycho};
 use ptyrs::io::{read_cxi, read_modes, write_modes};
 use ptyrs::nn::dip::{Dip, GpuLoss, LossError, ObjectLoss, Prior};
+use ptyrs::nn::norm_relu::norm_relu;
 use rust_hdf5::H5File;
 
 /// pty-chi's `DoubleConv`: (3×3 convolution without bias, batch normalisation, ReLU) twice, on
@@ -49,8 +49,8 @@ struct DoubleConv {
 
 impl DoubleConv {
     fn forward(&self, x: Tensor<4>) -> Tensor<4> {
-        let x = relu(norm(&self.n1, conv(&self.c0, x)));
-        relu(norm(&self.n4, conv(&self.c3, x)))
+        let x = norm_relu(&self.n1, conv(&self.c0, x));
+        norm_relu(&self.n4, conv(&self.c3, x))
     }
 }
 
@@ -63,13 +63,6 @@ fn channels_first(x: Tensor<4>, f: impl FnOnce(Tensor<4>) -> Tensor<4>) -> Tenso
 
 fn conv(c: &Conv2d, x: Tensor<4>) -> Tensor<4> {
     channels_first(x, |x| c.forward(x))
-}
-
-/// `n` on channels-last `x` as its `[batch·h·w, channels]` rows, whose channel axis burn
-/// normalises without the transposing copy a `[batch, channels, h, w]` view of them costs.
-fn norm(n: &BatchNorm, x: Tensor<4>) -> Tensor<4> {
-    let [b, h, w, c] = x.dims();
-    n.forward(x.reshape([b * h * w, c])).reshape([b, h, w, c])
 }
 
 /// pty-chi's `UNet` (`reconstructors/nn/models/unet.py`) at its defaults, bilinear upsampling
