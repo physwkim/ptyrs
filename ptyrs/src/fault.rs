@@ -96,9 +96,18 @@ mod armed {
     }
 
     /// Arms `exit` to fail its hit after `pass` others, once, until the guard drops. Armed
-    /// for the process, since dist's exits run on its workers' threads: nextest runs each
-    /// test in a process of its own.
+    /// for the process, since dist's exits run on its workers' threads, so it panics unless
+    /// nextest runs this test in a process of its own: under `cargo test` the exit would fire
+    /// in whichever concurrent test hits it.
     pub(crate) fn arm(exit: Exit, pass: usize) -> Armed {
+        assert!(
+            matches!(
+                std::env::var("NEXTEST_EXECUTION_MODE").as_deref(),
+                Ok("process-per-test")
+            ),
+            "fault::arm arms every thread of the process, so it needs a process of the \
+             arming test's own: run it under cargo nextest"
+        );
         let hold = ARMING.lock().unwrap_or_else(PoisonError::into_inner);
         *armed() = Some((exit, pass, false));
         Armed { _hold: hold }
