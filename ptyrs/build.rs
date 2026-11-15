@@ -256,6 +256,10 @@ fn build_device_crate(
         // Release: the legacy NVVM IR dialect for pre-Blackwell targets cannot carry the
         // debug metadata a dev-profile build attaches.
         .args(["--", "-p", DEVICE_PACKAGE, "--lib", "--release"])
+        // Fresh by content: every checkout using this target dir builds into the device dir,
+        // and by mtime its sources counted fresh against another checkout's newer build, whose
+        // IR this read. cargo-oxide runs this cargo with RUSTC_BOOTSTRAP for its backend.
+        .arg("-Zchecksum-freshness")
         .arg("--message-format=json-render-diagnostics");
     let stdout = output_ok(cmd, &format!("`cargo oxide build` of {DEVICE_PACKAGE}"))?;
     // cargo-oxide's banner precedes cargo's JSON messages.
