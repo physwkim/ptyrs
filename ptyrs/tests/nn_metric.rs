@@ -15,9 +15,9 @@ fn scan() -> (Scan, Object, AddrTable, Probe) {
     let pixel = g.pixel_size_object();
     let positions = sim::fermat(40, 4.0 * pixel[1]);
     let pre = positions.pynx_preprocess(pixel);
-    let shape = required_obj_shape(&pre, pixel, g.frame, 8);
+    let shape = required_obj_shape(&pre, pixel, g.frame.sides(), 8);
     let object = random_object(shape, 11);
-    let addr = AddrTable::new(&pre, pixel, g.frame, shape, 1, 1).unwrap();
+    let addr = AddrTable::new(&pre, pixel, g.frame.sides(), shape, 1, 1).unwrap();
     let mut probe = sim::probe([FRAME, FRAME], 1).unwrap();
     let scan = ptyrs::engine::sim::simulate(g, positions, &object, &probe, 1e5, None, 11).unwrap();
     // The simulator scales the intensity to the photon count; the probe has to follow.

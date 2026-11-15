@@ -11,25 +11,38 @@ pub struct Stack<T> {
     data: Vec<T>,
 }
 
+/// Element count of `dims`, the plane first: with `n = 0` an overflowing plane still fails, so
+/// [`Stack::plane_len`] is in range for every stack.
+fn element_count(dims: [usize; 3]) -> Option<usize> {
+    dims[1].checked_mul(dims[2])?.checked_mul(dims[0])
+}
+
 impl<T: Clone> Stack<T> {
+    /// # Panics
+    ///
+    /// If the element count passes `usize`, as `vec!` does when the allocation size does.
     pub fn filled(dims: [usize; 3], value: T) -> Self {
+        let len = element_count(dims)
+            .unwrap_or_else(|| panic!("stack {dims:?} has more than usize elements"));
         Self {
             dims,
-            data: vec![value; dims.iter().product()],
+            data: vec![value; len],
         }
     }
 }
 
 impl<T> Stack<T> {
     pub fn from_vec(dims: [usize; 3], data: Vec<T>) -> Result<Self, CoreError> {
-        let want: usize = dims.iter().product();
-        if data.len() != want {
-            return Err(CoreError::Shape(format!(
+        match element_count(dims) {
+            Some(want) if want == data.len() => Ok(Self { dims, data }),
+            Some(want) => Err(CoreError::Shape(format!(
                 "stack {dims:?} needs {want} elements, got {}",
                 data.len()
-            )));
+            ))),
+            None => Err(CoreError::Shape(format!(
+                "stack {dims:?} needs more than usize elements"
+            ))),
         }
-        Ok(Self { dims, data })
     }
 
     pub fn dims(&self) -> [usize; 3] {
@@ -119,3 +132,26 @@ complex_stack!(
     /// [`crate::base::view_corner`]).
     Object
 );
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A wrapped product would match the empty buffer: `[0, 2^32, 2^32]` and `[2^62, 2, 2]`.
+    #[test]
+    fn from_vec_rejects_element_count_past_usize() {
+        let side = 1 << (usize::BITS / 2);
+        for dims in [[0, side, side], [1 << (usize::BITS - 2), 2, 2]] {
+            let e = Stack::<u8>::from_vec(dims, Vec::new()).unwrap_err();
+            assert!(e.to_string().contains("more than usize"), "{dims:?}: {e}");
+        }
+        assert!(Stack::<u8>::from_vec([0, 3, 5], Vec::new()).is_ok());
+    }
+
+    #[test]
+    #[should_panic(expected = "more than usize elements")]
+    fn filled_panics_on_element_count_past_usize() {
+        let side = 1 << (usize::BITS / 2);
+        Stack::filled([0, side, side], 0u8);
+    }
+}

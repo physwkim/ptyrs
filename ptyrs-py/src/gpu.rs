@@ -64,7 +64,7 @@ impl GpuPtycho {
             ptyrs::engine::GpuPtycho::with_slices(&ctx, &scan.0, optics, &objects, probe, options);
         Ok(Self(
             engine.map_err(Error::from)?,
-            scan.0.counts.frame_shape(),
+            scan.0.counts.frame_shape().sides(),
         ))
     }
 

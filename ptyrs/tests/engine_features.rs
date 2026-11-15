@@ -73,7 +73,7 @@ fn position_matches_pos_grad_ref() {
         })
         .collect();
     let views = p.addr().views();
-    let fft = Fft2::new(scan.geometry.frame);
+    let fft = Fft2::new(scan.geometry.frame.sides());
     let mut psi = vec![C64::default(); views.len() * p.probe().plane_len()];
 
     // zero offsets: the unshifted operator
@@ -119,7 +119,7 @@ fn position_grad_matches_central_differences() {
     let w: Vec<[f64; 2]> = (0..offsets.len())
         .map(|f| [(1.3 * f as f64 + 0.2).sin(), (0.7 * f as f64).cos()])
         .collect();
-    let fft = Fft2::new(scan.geometry.frame);
+    let fft = Fft2::new(scan.geometry.frame.sides());
     // Measured worst 7.2e-10 here, 1.7e-9 within 7% of it: the sums' rounding and the h⁶ term.
     let h = 1e-3;
     for sampling in [Sampling::Patch, Sampling::FullObject] {
@@ -165,7 +165,7 @@ fn far_field(scan: &Scan, p: &Ptycho) -> Vec<C64> {
     let views = p.addr().views();
     let mut psi = vec![C64::default(); views.len() * p.probe().plane_len()];
     obj_probe_to_psi(views, p.object(), p.probe(), p.quad(), &mut psi);
-    Fft2::new(scan.geometry.frame).forward(&mut psi);
+    Fft2::new(scan.geometry.frame.sides()).forward(&mut psi);
     psi
 }
 
@@ -213,7 +213,7 @@ fn intensity_matches_intensity_step_ref() {
 fn background_matches_background_step_ref() {
     let (scan, p) = state();
     let rows = table(include_str!("engine/data/background_f64.txt"));
-    let [ny, nx] = scan.geometry.frame;
+    let [ny, nx] = scan.geometry.frame.sides();
     assert_eq!(rows.len(), ny * nx);
     assert!(
         rows.iter()

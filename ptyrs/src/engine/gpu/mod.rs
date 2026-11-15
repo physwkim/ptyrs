@@ -631,7 +631,7 @@ impl GpuPtycho {
             )));
         }
         let g = scan.geometry;
-        let [ny, nx] = g.frame;
+        let [ny, nx] = g.frame.sides();
         if optics.exit().shape() != g.frame {
             return Err(EngineError::Invalid(format!(
                 "propagator plane {:?} differs from frame {:?}",
@@ -665,7 +665,7 @@ impl GpuPtycho {
         let addr = AddrTable::new(
             &positions,
             pixel,
-            g.frame,
+            g.frame.sides(),
             object.plane_shape(),
             probe.nmode(),
             object.nmode(),
@@ -720,14 +720,14 @@ impl GpuPtycho {
             probe: &to_c32(probe.as_slice()),
             slices,
         };
-        let sampling = Sampling::auto(optics, object.plane_shape(), g.frame);
+        let sampling = Sampling::auto(optics, object.plane_shape(), g.frame.sides());
         let dev = Device::new(ctx, dims, uploads, options, sampling)?;
         Ok(Self {
             dev: Gated::new(dev),
             obj_dims: object.dims(),
             probe_dims: probe.dims(),
             total_obs: scan.counts.total(),
-            fft: Fft2::new(g.frame),
+            fft: Fft2::new(g.frame.sides()),
             cycle: 0,
             history: Vec::new(),
         })

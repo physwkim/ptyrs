@@ -1,4 +1,4 @@
-use crate::base::CoreError;
+use crate::base::{CoreError, Frame};
 
 /// Mask sentinel in [`Counts`] (DESIGN §5 invariant 3). It is also the bad-pixel value 16-bit
 /// Eiger/Jungfrau streams use, so raw detector `u16` data maps onto it unchanged.
@@ -12,21 +12,35 @@ pub const MAX_COUNT: u16 = u16::MAX - 1;
 /// change once a scan is built (invariant 3). A pixel is masked iff it holds [`MASKED`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Counts {
-    dims: [usize; 3],
+    nframe: usize,
+    frame: Frame,
     data: Vec<u16>,
+}
+
+/// `[nframe, ny, nx]` as a frame count and a [`Frame`] whose `nframe · area` is `len`.
+fn checked_shape(dims: [usize; 3], len: usize) -> Result<(usize, Frame), CoreError> {
+    let [nframe, ny, nx] = dims;
+    let frame = Frame::new([ny, nx])?;
+    match nframe.checked_mul(frame.area()) {
+        Some(want) if want == len => Ok((nframe, frame)),
+        Some(want) => Err(CoreError::Shape(format!(
+            "counts {dims:?} need {want} values, got {len}"
+        ))),
+        None => Err(CoreError::Shape(format!(
+            "counts {dims:?} need more than usize values"
+        ))),
+    }
 }
 
 impl Counts {
     /// Takes raw `u16` counts; every [`MASKED`] value is a masked pixel.
     pub fn from_raw(dims: [usize; 3], data: Vec<u16>) -> Result<Self, CoreError> {
-        let want: usize = dims.iter().product();
-        if data.len() != want {
-            return Err(CoreError::Shape(format!(
-                "counts {dims:?} need {want} values, got {}",
-                data.len()
-            )));
-        }
-        Ok(Self { dims, data })
+        let (nframe, frame) = checked_shape(dims, data.len())?;
+        Ok(Self {
+            nframe,
+            frame,
+            data,
+        })
     }
 
     /// Converts PyNX-style intensities: a negative value is masked (PyNX `iobs < 0`), every
@@ -37,14 +51,8 @@ impl Counts {
         values: &[f64],
         detector_mask: Option<&[bool]>,
     ) -> Result<Self, CoreError> {
-        let want: usize = dims.iter().product();
-        let plane = dims[1] * dims[2];
-        if values.len() != want {
-            return Err(CoreError::Shape(format!(
-                "counts {dims:?} need {want} values, got {}",
-                values.len()
-            )));
-        }
+        let (nframe, frame) = checked_shape(dims, values.len())?;
+        let plane = frame.area();
         if let Some(m) = detector_mask
             && m.len() != plane
         {
@@ -53,7 +61,7 @@ impl Counts {
                 m.len()
             )));
         }
-        let mut data = Vec::with_capacity(want);
+        let mut data = Vec::with_capacity(values.len());
         for (index, &value) in values.iter().enumerate() {
             let masked = detector_mask.is_some_and(|m| m[index % plane]);
             data.push(if masked || value < 0.0 {
@@ -70,7 +78,11 @@ impl Counts {
                 value as u16
             });
         }
-        Ok(Self { dims, data })
+        Ok(Self {
+            nframe,
+            frame,
+            data,
+        })
     }
 
     /// Observed intensity of one stored value, `None` when masked.
@@ -80,19 +92,19 @@ impl Counts {
     }
 
     pub fn dims(&self) -> [usize; 3] {
-        self.dims
+        [self.nframe, self.frame[0], self.frame[1]]
     }
 
     pub fn nframe(&self) -> usize {
-        self.dims[0]
+        self.nframe
     }
 
-    pub fn frame_shape(&self) -> [usize; 2] {
-        [self.dims[1], self.dims[2]]
+    pub fn frame_shape(&self) -> Frame {
+        self.frame
     }
 
     pub fn frame(&self, i: usize) -> &[u16] {
-        let n = self.dims[1] * self.dims[2];
+        let n = self.frame.area();
         &self.data[i * n..(i + 1) * n]
     }
 
@@ -118,9 +130,9 @@ impl Counts {
 
     /// `[ny, nx]` pixels masked in every frame (the part a CXI `detector_1/mask` can carry).
     pub fn detector_mask(&self) -> Vec<bool> {
-        let plane = self.dims[1] * self.dims[2];
+        let plane = self.frame.area();
         (0..plane)
-            .map(|p| (0..self.dims[0]).all(|f| self.data[f * plane + p] == MASKED))
+            .map(|p| (0..self.nframe).all(|f| self.data[f * plane + p] == MASKED))
             .collect()
     }
 }
@@ -143,15 +155,45 @@ mod tests {
 
     #[test]
     fn from_f64_rejects_values_outside_u16_path() {
+        let frame = |v: f64| [v, 0.0, 0.0, 0.0];
         assert!(matches!(
-            Counts::from_f64([1, 1, 1], &[65535.0], None),
+            Counts::from_f64([1, 2, 2], &frame(65535.0), None),
             Err(CoreError::CountOutOfRange { .. })
         ));
         assert!(matches!(
-            Counts::from_f64([1, 1, 1], &[1.5], None),
+            Counts::from_f64([1, 2, 2], &frame(1.5), None),
             Err(CoreError::NonInteger { .. })
         ));
-        assert!(Counts::from_f64([1, 1, 1], &[f64::NAN], None).is_err());
-        assert!(Counts::from_f64([1, 1, 1], &[65534.0], None).is_ok());
+        assert!(Counts::from_f64([1, 2, 2], &frame(f64::NAN), None).is_err());
+        assert!(Counts::from_f64([1, 2, 2], &frame(65534.0), None).is_ok());
+    }
+
+    /// No frame is formed without a valid [`Frame`], even with no frames to hold.
+    #[test]
+    fn rejects_frame_shape() {
+        for frame in [[1, 2], [2, 0]] {
+            assert!(Counts::from_raw([0, frame[0], frame[1]], Vec::new()).is_err());
+            assert!(Counts::from_f64([0, frame[0], frame[1]], &[], None).is_err());
+        }
+        let side = 1 << (usize::BITS / 2);
+        assert!(Counts::from_raw([0, side, side], Vec::new()).is_err());
+    }
+
+    /// `nframe · area` past usize, reached with an empty buffer that a wrapped product would
+    /// accept.
+    #[test]
+    fn rejects_frame_count_past_usize() {
+        let nframe = 1 << (usize::BITS - 2);
+        let e = Counts::from_raw([nframe, 2, 2], Vec::new()).unwrap_err();
+        assert!(e.to_string().contains("more than usize"), "{e}");
+        assert!(Counts::from_f64([nframe, 2, 2], &[], None).is_err());
+    }
+
+    #[test]
+    fn rejects_data_unequal_to_shape() {
+        let e = Counts::from_raw([2, 2, 2], vec![0; 7]).unwrap_err();
+        assert!(e.to_string().contains("need 8 values, got 7"), "{e}");
+        assert!(Counts::from_f64([2, 2, 2], &[0.0; 9], None).is_err());
+        assert_eq!(Counts::from_raw([0, 2, 2], Vec::new()).unwrap().nframe(), 0);
     }
 }

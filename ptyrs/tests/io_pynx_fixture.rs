@@ -20,7 +20,7 @@ fn reads_pynx_written_cxi() {
     }
     let g = scan.geometry;
     assert_eq!(
-        (g.distance, g.detector_pixel, g.frame),
+        (g.distance, g.detector_pixel, g.frame.sides()),
         (1.2, 75e-6, [4, 6])
     );
     assert!(

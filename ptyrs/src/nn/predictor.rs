@@ -240,7 +240,13 @@ pub fn diffraction_input(
     bin: usize,
     norm: f64,
 ) -> Result<Vec<f32>, NnError> {
-    frames_input(frames.as_slice(), frames.frame_shape(), input, bin, norm)
+    frames_input(
+        frames.as_slice(),
+        frames.frame_shape().sides(),
+        input,
+        bin,
+        norm,
+    )
 }
 
 /// [`diffraction_input`] of whole `[ny, nx]` frames in one slice.
@@ -1046,7 +1052,7 @@ impl Predictor {
     /// Patches `[nframe, py, px]` for detector-order `frames` of a scan whose
     /// [`mean_frame_total`] is `norm`.
     pub fn predict(&self, frames: &Counts, norm: f64) -> Result<Patches, NnError> {
-        self.predict_raw(frames.as_slice(), frames.frame_shape(), norm)
+        self.predict_raw(frames.as_slice(), frames.frame_shape().sides(), norm)
     }
 
     /// [`predict`](Self::predict) for whole `frame`-shaped frames in one slice, a masked pixel
@@ -1286,9 +1292,7 @@ pub(crate) mod tests {
     /// A frame with a side of no pixels is refused rather than divided by.
     #[test]
     fn a_frame_of_no_pixels_is_refused() {
-        let counts = Counts::from_raw([3, 0, 4], vec![]).unwrap();
-        let input = diffraction_input(&counts, Input::Binned, 1, 1.0);
-        assert!(matches!(input, Err(NnError::Invalid(_))), "{input:?}");
+        assert!(Counts::from_raw([3, 0, 4], vec![]).is_err());
         let net = PredictorConfig::new([0, 16], 1).init(&crate::nn::cuda(0));
         assert!(matches!(net, Err(NnError::Invalid(_))));
     }
@@ -1345,18 +1349,17 @@ pub(crate) mod tests {
     }
 
     /// A frame of 2⁶⁶ pixels binned to a patch of 4 is refused by the config's check and by
-    /// `diffraction_input`, and so is a frame whose two input images pass `usize`: unchecked,
-    /// the area passed the check, then overflowed in `InputScale::new` or, wrapped to 0 in
-    /// release, divided by zero.
+    /// `Counts`, and a frame whose two input images pass `usize` by `diffraction_input`:
+    /// unchecked, the area passed the check, then overflowed in `InputScale::new` or, wrapped
+    /// to 0 in release, divided by zero.
     #[test]
     fn a_frame_area_past_usize_is_refused() {
         let config = PredictorConfig::new([1 << 33, 1 << 33], 1 << 32).with_depth(1);
         assert!(matches!(config.check(), Err(NnError::Invalid(_))));
-        for (frame, bin) in [(config.frame, config.bin), ([1 << 32, (1 << 31) + 1], 1)] {
-            let counts = Counts::from_raw([0, frame[0], frame[1]], Vec::new()).unwrap();
-            let got = diffraction_input(&counts, Input::BinnedCentre, bin, 1.0);
-            assert!(matches!(got, Err(NnError::Invalid(_))), "{frame:?}");
-        }
+        assert!(Counts::from_raw([0, config.frame[0], config.frame[1]], Vec::new()).is_err());
+        let counts = Counts::from_raw([0, 1 << 32, 1 << 31], Vec::new()).unwrap();
+        let got = diffraction_input(&counts, Input::BinnedCentre, 1, 1.0);
+        assert!(matches!(got, Err(NnError::Invalid(_))), "{got:?}");
     }
 
     #[test]
@@ -1571,7 +1574,7 @@ pub(crate) mod tests {
 
     #[test]
     fn mean_frame_total_skips_masked() {
-        let counts = Counts::from_raw([2, 1, 2], vec![3, MASKED, 4, 5]).unwrap();
+        let counts = Counts::from_raw([2, 2, 2], vec![3, MASKED, 0, 0, 4, 5, 0, 0]).unwrap();
         assert_eq!(mean_frame_total(&counts), 6.0);
     }
 
