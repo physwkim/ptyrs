@@ -353,19 +353,54 @@ pub fn stitch(patches: &Patches, addr: &AddrTable) -> Result<Object, NnError> {
     Ok(Object::new(Stack::from_vec([1, nyo, nxo], data)?))
 }
 
-/// Training pairs: network inputs `[n, input.images(), py, px]` and the true patches.
+/// Training pairs: network inputs `[n, kind.images(), py, px]` of the [`Input`] `kind` and the
+/// true patches. The kind and patch are those of the config the samples were made for, and every
+/// predictor that reads them must have the same.
 #[derive(Clone, Debug)]
 pub struct Samples {
-    pub input: Vec<f32>,
-    pub target: Patches,
+    kind: Input,
+    input: Vec<f32>,
+    target: Patches,
 }
 
 impl Samples {
     pub fn new(config: &PredictorConfig) -> Self {
         Self {
+            kind: config.input,
             input: Vec::new(),
             target: Patches::empty(config.patch()),
         }
+    }
+
+    pub fn kind(&self) -> Input {
+        self.kind
+    }
+
+    /// The network inputs, `[n, kind.images(), py, px]`.
+    pub fn input(&self) -> &[f32] {
+        &self.input
+    }
+
+    pub fn target(&self) -> &Patches {
+        &self.target
+    }
+
+    /// Fails unless a predictor of `kind` and `patch` reads these samples.
+    fn check(&self, kind: Input, patch: [usize; 2]) -> Result<(), NnError> {
+        let own = self.target.dims;
+        if kind != self.kind || patch != [own[1], own[2]] {
+            return Err(NnError::Invalid(format!(
+                "samples of {:?} and patch {:?} for {kind:?} and patch {patch:?}",
+                self.kind,
+                &own[1..]
+            )));
+        }
+        Ok(())
+    }
+
+    /// [`check`](Self::check) against `config`.
+    fn check_config(&self, config: &PredictorConfig) -> Result<(), NnError> {
+        self.check(config.input, config.patch())
     }
 
     /// The pairs of one simulated scan: `frames` normalised by their own [`mean_frame_total`],
@@ -377,6 +412,7 @@ impl Samples {
         object: &Object,
         addr: &AddrTable,
     ) -> Result<(), NnError> {
+        self.check_config(config)?;
         if frames.frame_shape() != config.frame || addr.frame_shape() != config.frame {
             return Err(NnError::Invalid(format!(
                 "scan frame {:?} differs from predictor frame {:?}",
@@ -391,17 +427,46 @@ impl Samples {
                 addr.nframe()
             )));
         }
-        let input = diffraction_input(frames, config.input, config.bin, mean_frame_total(frames))?;
+        let input = diffraction_input(frames, self.kind, config.bin, mean_frame_total(frames))?;
         self.input.extend(input);
         self.target
             .append(object_patches(object, addr, config.patch()));
         Ok(())
     }
 
-    /// Appends `other`'s pairs.
-    pub fn extend(&mut self, other: Samples) {
+    /// Appends `other`'s pairs, which must be of the same kind and patch.
+    pub fn extend(&mut self, other: Samples) -> Result<(), NnError> {
+        let dims = other.target.dims;
+        self.check(other.kind, [dims[1], dims[2]])?;
         self.input.extend(other.input);
         self.target.append(other.target);
+        Ok(())
+    }
+
+    /// The pairs `picks`, in that order.
+    ///
+    /// # Panics
+    ///
+    /// If a pick is not below [`len`](Self::len).
+    pub fn select(&self, picks: &[usize]) -> Samples {
+        let [_, py, px] = self.target.dims;
+        let plane = py * px;
+        let gather = |v: &[f32], size: usize| -> Vec<f32> {
+            picks
+                .iter()
+                .flat_map(|&i| &v[i * size..(i + 1) * size])
+                .copied()
+                .collect()
+        };
+        Samples {
+            kind: self.kind,
+            input: gather(&self.input, self.kind.images() * plane),
+            target: Patches {
+                dims: [picks.len(), py, px],
+                amp: gather(&self.target.amp, plane),
+                phase: gather(&self.target.phase, plane),
+            },
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -622,10 +687,10 @@ impl Model {
     }
 }
 
-/// Per-pixel mean of `samples`' inputs of `images` images and each image's inverse RMS spread
-/// about it.
-fn input_stats(samples: &Samples, images: usize) -> Result<(Vec<f32>, Vec<f32>), NnError> {
+/// Per-pixel mean of `samples`' inputs and each image's inverse RMS spread about it.
+fn input_stats(samples: &Samples) -> Result<(Vec<f32>, Vec<f32>), NnError> {
     let [n, py, px] = samples.target.dims;
+    let images = samples.kind.images();
     let plane = py * px;
     let mut mean = vec![0.0f64; images * plane];
     for frame in samples.input.chunks(mean.len()) {
@@ -665,7 +730,7 @@ fn l1(a: Tensor<4>, p: Tensor<4>, amp: Tensor<4>, phase: Tensor<4>) -> Tensor<1>
 /// Trains a fresh network of `config` with Adam on L1 loss, reporting each epoch to `log`, or
 /// resumes the run in `options.checkpoint`. `options.seed` seeds the device's generator for the
 /// initial weights and the shuffle of each epoch. `device` is a plain device; autodiff is enabled
-/// on it here.
+/// on it here. `train` and `valid` must be samples of `config`'s input and patch.
 pub fn train(
     config: &PredictorConfig,
     options: &TrainOptions,
@@ -677,9 +742,13 @@ pub fn train(
     if train.is_empty() || options.batch == 0 {
         return Err(NnError::Invalid("no training samples or zero batch".into()));
     }
+    train.check_config(config)?;
+    if let Some(v) = valid {
+        v.check_config(config)?;
+    }
     let ad = device.clone().autodiff();
     ad.seed(options.seed);
-    let (mean, inv_spread) = input_stats(train, config.input.images())?;
+    let (mean, inv_spread) = input_stats(train)?;
     let mut model = Model::new(config, mean, inv_spread, &ad)?;
     let mut optim = AdamConfig::new().init();
     let mut checkpoint = Checkpoint {
@@ -694,7 +763,7 @@ pub fn train(
         (start, model, optim) = checkpoint.resume(dir, model, optim)?;
     }
     let dims = train.target.dims;
-    let x = tensor(&train.input, config.input.images(), dims, &ad);
+    let x = tensor(&train.input, train.kind.images(), dims, &ad);
     let amp = tensor(&train.target.amp, 1, dims, &ad);
     let phase = tensor(&train.target.phase, 1, dims, &ad);
     let mut rng = ChaCha8Rng::seed_from_u64(options.seed);
@@ -831,12 +900,14 @@ impl Predictor {
         stitch(&self.predict(frames, norm)?, addr)
     }
 
-    /// Mean L1 loss over `samples`, the training loss.
+    /// Mean L1 loss over `samples`, the training loss; they must be of this predictor's input
+    /// and patch.
     pub fn loss(&self, samples: &Samples) -> Result<f64, NnError> {
+        samples.check_config(&self.config)?;
         let device = self.device();
         let [n, py, px] = samples.target.dims;
         let plane = py * px;
-        let images = self.config.input.images();
+        let images = samples.kind.images();
         let mut sum = 0.0;
         for start in (0..n).step_by(CHUNK) {
             let m = CHUNK.min(n - start);
@@ -921,6 +992,93 @@ mod tests {
         assert_eq!(binned, want[..4]);
         assert!(diffraction_input(&counts, Input::BinnedCentre, 3, norm).is_err());
         assert!(diffraction_input(&counts, Input::BinnedCentre, 2, 0.0).is_err());
+    }
+
+    /// A small predictor of `input` and the samples of one three-frame scan it reads.
+    fn small(input: Input) -> (PredictorConfig, Samples) {
+        let config = PredictorConfig::new([16, 16], 2)
+            .with_input(input)
+            .with_width(4);
+        let positions = Positions::new(vec![0.0, 0.0, 3.0], vec![-3.0, 3.0, 0.0]).unwrap();
+        let addr = AddrTable::new(&positions, [1.0, 1.0], [16, 16], [32, 32], 1, 1).unwrap();
+        let object = crate::nn::data::random_object([32, 32], 4);
+        let counts = (0..3 * 256).map(|i| (i * 7 % 50) as u16).collect();
+        let counts = Counts::from_raw([3, 16, 16], counts).unwrap();
+        let mut samples = Samples::new(&config);
+        samples.push_scan(&config, &counts, &object, &addr).unwrap();
+        (config, samples)
+    }
+
+    fn options() -> TrainOptions {
+        TrainOptions {
+            epochs: 1,
+            batch: 2,
+            lr: 1e-3,
+            seed: 1,
+            checkpoint: None,
+        }
+    }
+
+    /// Validation samples of the other input gave a wrong loss of one image per frame read as
+    /// two, or a slice past the end of two read as one.
+    #[test]
+    fn train_refuses_validation_samples_of_another_input() {
+        let device = crate::nn::cuda(0);
+        let (one, ones) = small(Input::Binned);
+        let (two, twos) = small(Input::BinnedCentre);
+        assert!(train(&one, &options(), &ones, Some(&twos), &device, |_| {}).is_err());
+        assert!(train(&two, &options(), &twos, Some(&ones), &device, |_| {}).is_err());
+    }
+
+    /// Training samples of the other input gave wrong input statistics, then a panic.
+    #[test]
+    fn train_refuses_training_samples_of_another_input() {
+        let device = crate::nn::cuda(0);
+        let (one, ones) = small(Input::Binned);
+        let (two, twos) = small(Input::BinnedCentre);
+        assert!(train(&two, &options(), &ones, None, &device, |_| {}).is_err());
+        assert!(train(&one, &options(), &twos, None, &device, |_| {}).is_err());
+    }
+
+    #[test]
+    fn loss_refuses_samples_of_another_input() {
+        let device = crate::nn::cuda(0);
+        let (one, ones) = small(Input::Binned);
+        let (_, twos) = small(Input::BinnedCentre);
+        let predictor = train(&one, &options(), &ones, None, &device, |_| {}).unwrap();
+        assert!(predictor.loss(&ones).is_ok());
+        assert!(predictor.loss(&twos).is_err());
+    }
+
+    /// Neither a scan read by a predictor of the other input nor samples of it join the samples.
+    #[test]
+    fn samples_refuse_scans_and_samples_of_another_input() {
+        let (_, mut ones) = small(Input::Binned);
+        let (two, twos) = small(Input::BinnedCentre);
+        let object = crate::nn::data::random_object([32, 32], 4);
+        let positions = Positions::new(vec![0.0, 0.0, 3.0], vec![-3.0, 3.0, 0.0]).unwrap();
+        let addr = AddrTable::new(&positions, [1.0, 1.0], [16, 16], [32, 32], 1, 1).unwrap();
+        let counts = Counts::from_raw([3, 16, 16], vec![1; 3 * 256]).unwrap();
+        assert!(ones.push_scan(&two, &counts, &object, &addr).is_err());
+        assert!(ones.extend(twos).is_err());
+        assert_eq!((ones.len(), ones.input().len()), (3, 3 * 64));
+        let (_, more) = small(Input::Binned);
+        ones.extend(more).unwrap();
+        assert_eq!((ones.len(), ones.input().len()), (6, 6 * 64));
+    }
+
+    #[test]
+    fn select_takes_whole_pairs_in_order() {
+        let (_, twos) = small(Input::BinnedCentre);
+        let picked = twos.select(&[2, 0]);
+        let frame = |s: &Samples, i: usize| s.input()[i * 128..(i + 1) * 128].to_vec();
+        let patch = |s: &Samples, i: usize| s.target().amp[i * 64..(i + 1) * 64].to_vec();
+        assert_eq!(picked.target().dims, [2, 8, 8]);
+        assert_eq!(picked.input().len(), 2 * 128);
+        for (k, i) in [(0, 2), (1, 0)] {
+            assert_eq!(frame(&picked, k), frame(&twos, i));
+            assert_eq!(patch(&picked, k), patch(&twos, i));
+        }
     }
 
     #[test]
