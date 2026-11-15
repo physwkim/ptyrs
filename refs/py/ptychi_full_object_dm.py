@@ -28,7 +28,7 @@ for alg `dm` (near.rs's DM: inertia 0.01 and 0.001, alpha 0.02) and `raar` (beta
 drawn offsets, held) from the start object and probe on counts.f64, and `truth_drawn` and
 `truth_whole` (offsets0 and offsets_whole, held) from the truth on counts_truth_<x>.f64, and n
 the cycles of each run, the largest of them taken as the long run. The engine runs without its
-closing zero_phase_ramp, which under `position` changes the LLK of the state it ends on
+closing zero_phase_ramp, which with offsets changes the LLK of the state it ends on
 (Ptycho::zero_phase_ramp), so the 8-cycle run must end on the long run's first 9 records.
 
 pty-chi runs its own DM (Thibault 2009 Eq. 9, exit-wave relaxation 1) and RAAR (Marchesini 2016
