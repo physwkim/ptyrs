@@ -627,7 +627,7 @@ impl<'a> Bufs<'a> {
                 let init = pre == Pre::Init;
                 match (windows, &mut lent) {
                     (Some(w), Some(PositionLent::FullObject(s))) => {
-                        let offsets = &*s.offsets.values;
+                        let offsets = &*s.offsets;
                         (s.sampler).illumination(
                             ctx,
                             self.views,
@@ -805,7 +805,7 @@ impl<'a> Bufs<'a> {
         // Before the update, as the batch's spectra borrow the probe; the step reads neither.
         if let (Some(m), Some(step)) = (moved, step) {
             let solve = position_solve(self.exit.scale);
-            let offsets = m.offsets.values;
+            let offsets = m.offsets;
             m.kernels
                 .step(ctx, positions, l.order, offsets, solve, step)?;
         }
@@ -916,7 +916,7 @@ impl<'a> Bufs<'a> {
         lk.step(ctx, positions.clone(), l.scan, self.exit.scale)?;
         if let Some(step) = step {
             let solve = position_solve(self.exit.scale);
-            let offsets = p.offsets.values;
+            let offsets = p.offsets;
             (p.kernels).step(ctx, positions, l.order, offsets, solve, step)?;
         }
         let obj = LsqmlVar {
@@ -1121,7 +1121,7 @@ impl<'a> Bufs<'a> {
         lk.share(ctx, positions.clone(), l.scan, share)?;
         if let (Some(m), Some(step)) = (moved, step) {
             let solve = position_solve(self.exit.scale);
-            let offsets = m.offsets.values;
+            let offsets = m.offsets;
             m.kernels
                 .step(ctx, positions, l.order, offsets, solve, step)?;
         }
@@ -1317,7 +1317,7 @@ impl<'a> Bufs<'a> {
         lk.share(ctx, positions.clone(), l.scan, share)?;
         if let Some(step) = step {
             let solve = position_solve(self.exit.scale);
-            let offsets = p.offsets.values;
+            let offsets = p.offsets;
             (p.kernels).step(ctx, positions, l.order, offsets, solve, step)?;
         }
         let obj = LsqmlVar {

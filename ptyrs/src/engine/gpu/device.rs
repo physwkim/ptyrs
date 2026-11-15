@@ -19,10 +19,10 @@ use crate::gpu::{
     BH_STEP, BackgroundSums, BhKernels, BhParts, C32, CG_BLOCKS, Ended, EpochOrder,
     Error as GpuError, ExitPass, ExitStage, FarSums, FrameWaves, FusedBufs, FusedInputs,
     GammaStacks, GradKernels, HalfWaves, Kernels, LlkPartial, LlkRing, LlkScratch, LlkTotals,
-    MASKED, Model, OpticsKernels, PositionKernels, PositionPartial, PositionStep, Positions,
-    PowerMax, ProbeSpectrum, PsiSums, RingDevice, RpieKernels, ScalePartial, Shift, ShiftProbe,
-    ShiftSums, ShiftedProbeSums, SlicePhase, SliceSource, SpectrumBuf, StackRef, StackTable,
-    StackWindows, UpdateSums, ViewAddr, ViewDims, Views, Waves, half_scale,
+    MASKED, Model, OpticsKernels, PositionKernels, PositionPartial, Positions, PowerMax,
+    ProbeSpectrum, PsiSums, RingDevice, RpieKernels, ScalePartial, Shift, ShiftProbe, ShiftSums,
+    ShiftedProbeSums, SlicePhase, SliceSource, SpectrumBuf, StackRef, StackTable, StackWindows,
+    UpdateSums, ViewAddr, ViewDims, Views, Waves, half_scale,
 };
 use crate::tile::TileDots;
 use cuda_async::cuda_graph::CudaGraph;
@@ -592,8 +592,8 @@ pub(super) enum PositionLent<'m, X> {
 impl<'m, X> PositionLent<'m, X> {
     /// `moved` with `features`' position buffers and, under [`Sampling::Patch`], `fused`:
     /// none without a position, an error when they disagree, as for a cycle's state built
-    /// for another position model. A held position lends its offsets held: the cycle moves
-    /// by them and leaves them, with the sums only their step reads.
+    /// for another position model. The offsets are lent alike refined or held: only the
+    /// cycle's own step, which [`FeaturesMut::own_step`] pairs with the refine, moves them.
     pub fn lend(
         moved: Option<(&'m mut Moved, X)>,
         fused: Option<&'m mut FusedBufs>,
@@ -623,10 +623,7 @@ impl<'m, X> PositionLent<'m, X> {
                 w,
                 pos,
                 kernels,
-                offsets: Feature {
-                    values: &mut *p.offsets,
-                    refine: p.partials.is_some(),
-                },
+                offsets: &mut *p.offsets,
                 spectrum,
                 probe_sums,
             }))),
@@ -640,10 +637,7 @@ impl<'m, X> PositionLent<'m, X> {
                 own,
                 pos,
                 kernels,
-                offsets: Feature {
-                    values: &mut *p.offsets,
-                    refine: p.partials.is_some(),
-                },
+                offsets: &mut *p.offsets,
                 sampler,
                 spectra,
             }))),
@@ -695,8 +689,9 @@ pub(super) struct SampledLent<'m, X> {
     pub own: X,
     pub pos: &'m mut Positions,
     pub kernels: &'m PositionKernels,
-    /// By frame: the device's offsets, which the cycle steps while they are refined.
-    pub offsets: Feature<&'m mut DeviceBuffer<f32>>,
+    /// By frame: the device's offsets, which only the cycle's own step moves
+    /// ([`FeaturesMut::own_step`]).
+    pub offsets: &'m mut DeviceBuffer<f32>,
     pub sampler: &'m mut ObjectSampler,
     /// `[nobj, nyo, nxo]`, the spectra [`ObjectSampler::windows`] reads.
     pub spectra: &'m mut DeviceBuffer<C32>,
@@ -705,8 +700,7 @@ pub(super) struct SampledLent<'m, X> {
 impl<X> SampledLent<'_, X> {
     /// The offsets by epoch position from the device's, through `order`, the epoch's.
     pub fn gather(&mut self, ctx: &ExecutionContext, order: &EpochOrder) -> Result<(), GpuError> {
-        self.kernels
-            .gather(ctx, order, self.offsets.values, self.pos)
+        self.kernels.gather(ctx, order, self.offsets, self.pos)
     }
 }
 
@@ -719,7 +713,7 @@ pub(super) struct MovedLent<'m, X> {
     w: &'m mut [DeviceBuffer<C32>],
     pos: &'m mut Positions,
     kernels: &'m PositionKernels,
-    offsets: Feature<&'m mut DeviceBuffer<f32>>,
+    offsets: &'m mut DeviceBuffer<f32>,
     spectrum: &'m mut SpectrumBuf,
     probe_sums: &'m mut ShiftedProbeSums,
 }
@@ -739,8 +733,7 @@ impl<'m, X> MovedLent<'m, X> {
 
     /// The offsets by epoch position from the device's, through `order`, the epoch's.
     pub fn gather(&mut self, ctx: &ExecutionContext, order: &EpochOrder) -> Result<(), GpuError> {
-        self.kernels
-            .gather(ctx, order, self.offsets.values, self.pos)
+        self.kernels.gather(ctx, order, self.offsets, self.pos)
     }
 
     /// The lend for one batch, with the spectra of `probe` it starts from (two launches).
@@ -772,8 +765,9 @@ pub(super) struct MovedBatch<'m, X> {
     pub w: &'m mut [DeviceBuffer<C32>],
     pub pos: &'m mut Positions,
     pub kernels: &'m PositionKernels,
-    /// By frame: the device's offsets, which the batch steps while they are refined.
-    pub offsets: Feature<&'m mut DeviceBuffer<f32>>,
+    /// By frame: the device's offsets, which only the cycle's own step moves
+    /// ([`FeaturesMut::own_step`]).
+    pub offsets: &'m mut DeviceBuffer<f32>,
     pub probe_sums: &'m mut ShiftedProbeSums,
     pub spectrum: ProbeSpectrum<'m>,
 }
@@ -1136,12 +1130,10 @@ impl FeaturesMut<'_> {
         (self.position.as_ref()).is_some_and(|p| p.partials.is_some())
     }
 
-    /// `step`, a cycle's own [`PositionStep`], as the position's refine asks for it: an error
-    /// when the cycle's state was built for the other, a step without it or none with it.
-    pub fn own_step<'s>(
-        &self,
-        step: Option<&'s mut PositionStep>,
-    ) -> Result<Option<&'s mut PositionStep>, GpuError> {
+    /// `step`, a cycle's own buffers of the offsets' step, as the position's refine asks for
+    /// it: an error when the cycle's state was built for the other, a step without it or none
+    /// with it.
+    pub fn own_step<'s, T>(&self, step: Option<&'s mut T>) -> Result<Option<&'s mut T>, GpuError> {
         match step.is_some() == self.position_refined() {
             true => Ok(step),
             false => Err(another_model()),
@@ -1948,7 +1940,8 @@ impl BhState {
     /// For `views` in batches of `size` frames, each cut into stacks by `rule`, through an
     /// object of `deeper` slices past the first; under the position model, `scratch` holds
     /// the frames per stack of the shared scratch, whose shift planes its sums borrow, which
-    /// caps its stacks, and the device's sampling. The epoch order is the scan's.
+    /// caps its stacks, the device's sampling and whether the offsets are refined. The epoch
+    /// order is the scan's.
     fn new(
         stream: &Arc<CudaStream>,
         kernels: &Kernels,
@@ -2116,7 +2109,7 @@ impl BhState {
         let plans = cut.plans(stream, dims)?;
         let slots = batches.iter().map(|b| b.len()).max().unwrap_or(0);
         let moved = (scratch
-            .map(|s| BhMoved::new(stream, kernels, dims, &cut, slots, (s.sampling, deeper))))
+            .map(|s| BhMoved::new(stream, kernels, dims, &cut, slots, (s, deeper))))
         .transpose()?;
         let sliced = (deeper > 0)
             .then(|| BhSliced::new(stream, dims, len, slots, deeper))
@@ -2152,6 +2145,12 @@ impl BhState {
     /// The sampling its views read the object under, if the state is the position model's.
     fn reads(&self) -> Option<Sampling> {
         self.moved.as_ref().map(BhMoved::reads)
+    }
+
+    /// The position's [`crate::base::Feature::refine`] the state was built for, none without
+    /// the position model.
+    fn position(&self) -> Option<bool> {
+        self.moved.as_ref().map(BhMoved::refined)
     }
 
     fn lend(&mut self) -> BhBufs<'_> {
@@ -3068,15 +3067,16 @@ impl Device {
         Ok(())
     }
 
-    /// Builds the [`BhState`] for `params`' batch size, the position model and its sampling
-    /// unless it is built. A state of another size, model or sampling is replaced only here,
-    /// when [`Self::steady`] has already dropped the runs of other parameters,
-    /// [`Self::set_features`] those of other features and [`Self::set_sampling`] those of
-    /// another sampling, so no graph captured from it survives.
+    /// Builds the [`BhState`] for `params`' batch size, the position model, refined or held,
+    /// and its sampling unless it is built. A state of another size, model or sampling is
+    /// replaced only here, when [`Self::steady`] has already dropped the runs of other
+    /// parameters, [`Self::set_features`] those of other features and [`Self::set_sampling`]
+    /// those of another sampling, so no graph captured from it survives.
     fn build_bh(&mut self, params: &BhParams) -> Result<(), EngineError> {
         let dims = self.dims();
         let size = to_u32("batch_size", params.batch_size.min(dims.nframe as usize))?;
         let reads = self.features.positioned().then_some(self.sampling);
+        let [.., position] = self.features.refine();
         let deeper = self.deeper().len();
         if reads == Some(Sampling::Patch) && deeper > 0 {
             return Err(EngineError::Invalid(format!(
@@ -3084,7 +3084,9 @@ impl Device {
                 deeper + 1
             )));
         }
-        if (self.bh_state.as_ref()).is_none_or(|s| s.size != size || s.reads() != reads) {
+        if (self.bh_state.as_ref())
+            .is_none_or(|s| s.size != size || s.reads() != reads || s.position() != position)
+        {
             let state = BhState::new(
                 &self.stream,
                 &self.kernels,

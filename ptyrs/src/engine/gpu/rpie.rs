@@ -326,7 +326,7 @@ impl<'a> Bufs<'a> {
         if let (Some(m), Some(step)) = (moved, step) {
             let batch = frames.range.clone();
             let solve = solve(self.exit.scale);
-            let offsets = m.offsets.values;
+            let offsets = m.offsets;
             m.kernels.step(ctx, batch, m.own, offsets, solve, step)?;
         }
         self.rpie_steps(ctx, params, frames.nf())
@@ -393,7 +393,7 @@ impl<'a> Bufs<'a> {
         }
         if let Some(step) = step {
             let solve = solve(self.exit.scale);
-            let offsets = s.offsets.values;
+            let offsets = s.offsets;
             (s.kernels).step(ctx, frames.range.clone(), s.own, offsets, solve, step)?;
         }
         self.rpie_steps(ctx, params, frames.nf())
