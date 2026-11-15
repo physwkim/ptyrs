@@ -15,6 +15,9 @@ use crate::base::{C64, Probe, Stack, View};
 use crate::engine::ProbeVariation;
 use crate::gpu::{C32, EpochOrder, Kernels, Opr, OprKernels, OprPlanes, ViewAddr, ViewDims, Views};
 use crate::worst::worst_of;
+use ptyrs_kernels::opr::OPR_SUMS;
+
+use super::{Shared, SumsOf};
 
 const NFRAME: usize = 9;
 /// The scan frame at each epoch position.
@@ -426,5 +429,87 @@ fn opr_unique_matches_cpu() {
                 assert!(err <= 5e-7, "{what}: unique {err:e}");
             }
         }
+    }
+}
+
+/// The deflation's coefficients are the residue sums of `opr_frame_sums` totalled in chunk
+/// order and over `n²`, bit for bit, on planes of three chunks.
+#[test]
+fn opr_deflate_coef_totals_chunks_in_order() {
+    let g = gpu();
+    let case = Case {
+        ny: 45,
+        nx: 101,
+        k: 2,
+        intensity: Main::Absent,
+    };
+    let mut noise = Noise::new(31);
+    let s = case.start(&mut noise);
+    let (mut opr, _) = case.upload(&g, &s);
+    let p = 2..7;
+    let span = opr.span(&g.order, &p).unwrap();
+    let (n, nb, nchunk) = (s.n, span.nb as usize, span.nchunk as usize);
+    assert_eq!(nchunk, 3);
+    let sums = f32s(&noise.range(opr.sums.len(), -1.0, 1.0));
+    opr.sums = DeviceBuffer::from_host(&g.stream, &sums).unwrap();
+    let moved = noise.stack([nb, case.ny, case.nx], 1.0);
+    let mut moved = DeviceBuffer::from_host(&g.stream, &c32(moved.as_slice())).unwrap();
+    g.opr.deflate(&g.ctx, &opr, span, 0, &mut moved).unwrap();
+    let coef = opr.deflate_coef.to_host_vec(&g.stream).unwrap();
+    let nn = n as f32 * n as f32;
+    for b in 0..nb {
+        for (h, j) in [(0, 2), (1, 3)] {
+            let k = OPR_SUMS as usize;
+            let total = (0..nchunk).fold(0.0f32, |t, c| t + sums[k * (b * nchunk + c) + j]);
+            assert_eq!(coef[2 * b + h], total / nn, "frame {b}, part {h}");
+        }
+    }
+}
+
+/// The deflation's residue sums (slots 2 and 3) and coefficients, bit for bit, whether the
+/// weights' `d` and `vv` are summed with them (refined weights) or left out (held).
+#[test]
+fn opr_deflation_is_bit_identical_held_and_refined() {
+    let g = gpu();
+    for (ny, nx) in [(45, 101), (64, 64), (7, 9)] {
+        let case = Case {
+            ny,
+            nx,
+            k: 2,
+            intensity: Main::Absent,
+        };
+        let mut noise = Noise::new(77);
+        let s = case.start(&mut noise);
+        let (opr, _) = case.upload(&g, &s);
+        let span = opr.span(&g.order, &(2..7)).unwrap();
+        let (n, nb) = (s.n, span.nb as usize);
+        let live = OPR_SUMS as usize * nb * span.nchunk as usize;
+        let r = noise.stack([nb, ny, nx], 1.0);
+        let r = DeviceBuffer::from_host(&g.stream, &c32(r.as_slice())).unwrap();
+        let d = noise.stack([nb, ny, nx], 1.0);
+        let d = DeviceBuffer::from_host(&g.stream, &c32(d.as_slice())).unwrap();
+        let vv = f32s(&noise.range(nb * n, 0.0, 2.0));
+        let vv = DeviceBuffer::from_host(&g.stream, &vv).unwrap();
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        let [refined, held] = [Some((&d, &vv)), None].map(|dv| {
+            let of = SumsOf {
+                a: Shared::Eigenmode(0),
+                dv,
+                r: Some(&r),
+            };
+            g.opr.frame_sums(&g.ctx, &opr, span, of).unwrap();
+            let sums = opr.sums.to_host_vec(&g.stream).unwrap();
+            let mut moved = DeviceBuffer::<C32>::zeroed(&g.stream, nb * n).unwrap();
+            g.opr.deflate(&g.ctx, &opr, span, 0, &mut moved).unwrap();
+            let coef = opr.deflate_coef.to_host_vec(&g.stream).unwrap();
+            let (per_chunk, _) = sums[..live].as_chunks::<{ OPR_SUMS as usize }>();
+            let weights = per_chunk.iter().any(|c| c[0] != 0.0 || c[1] != 0.0);
+            let slots: Vec<f32> = per_chunk.iter().flat_map(|c| [c[2], c[3]]).collect();
+            (weights, bits(&slots), bits(&coef[..2 * nb]))
+        });
+        let what = format!("{ny}x{nx}");
+        assert!(refined.0 && !held.0, "{what}: the weights' sums");
+        assert_eq!(refined.1, held.1, "{what}: slots 2 and 3");
+        assert_eq!(refined.2, held.2, "{what}: deflation coefficients");
     }
 }

@@ -33,8 +33,7 @@ pub struct OprKernels {
 /// The OPR state of one scan: `k ≥ 1` eigenmodes `[k, n]`, their weights `w_fi` at `f k + i`
 /// and, when modelled, the main mode's weights `c_f` at `f`, refined or held, both by scan
 /// frame, with the scratch of [`OprKernels::step`] for batches of up to `nb_max` frames.
-/// The weights are refined; holding them waits for the deflation coefficients to leave
-/// `opr_weights`.
+/// The weights are always refined.
 pub struct Opr {
     n: usize,
     k: u32,
@@ -48,8 +47,12 @@ pub struct Opr {
     /// Two plane sums, per chunk.
     part: DeviceBuffer<f32>,
     e: DeviceBuffer<C32>,
-    /// A real or complex coefficient per batch frame.
+    /// Eigenmode `i`'s update coefficient per batch frame: `opr_coef` writes it, `opr_e` reads
+    /// it.
     coef: DeviceBuffer<f32>,
+    /// The deflation's complex coefficient per batch frame: `opr_deflate_coef` writes it,
+    /// `opr_deflate` reads it.
+    deflate_coef: DeviceBuffer<f32>,
 }
 
 impl Opr {
@@ -107,7 +110,8 @@ impl Opr {
             sums: DeviceBuffer::zeroed(stream, OPR_SUMS as usize * nb * chunks(n))?,
             part: DeviceBuffer::zeroed(stream, 2 * chunks(n))?,
             e: DeviceBuffer::zeroed(stream, n)?,
-            coef: DeviceBuffer::zeroed(stream, 2 * nb)?,
+            coef: DeviceBuffer::zeroed(stream, nb)?,
+            deflate_coef: DeviceBuffer::zeroed(stream, 2 * nb)?,
         })
     }
 
@@ -386,44 +390,74 @@ impl OprKernels {
             };
             self.frame_sums(ctx, opr, span, of)?;
             let reads = [opr.sums.storage(), ids.storage()];
-            let writes = [opr.weights.storage(), opr.coef.storage()];
-            self.base.launch(ctx, &reads, &writes, |stream| {
-                // SAFETY: `span` lies in the scan's positions, `i < k`, the state sized by
-                // `Opr::new`; one block.
-                unsafe {
-                    self.module.opr_weights(
-                        stream,
-                        ONE_BLOCK,
-                        dptr::<f32, f32>(&opr.sums).cast_const(),
-                        span,
-                        scan,
-                        i,
-                        nu,
-                        deflate as u32,
-                        dptr(&opr.coef),
-                    )
-                }
-            })?;
+            self.base
+                .launch(ctx, &reads, &[opr.weights.storage()], |stream| {
+                    // SAFETY: `span` lies in the scan's positions, `i < k`, the state sized by
+                    // `Opr::new`; one block.
+                    unsafe {
+                        self.module.opr_weights(
+                            stream,
+                            ONE_BLOCK,
+                            dptr::<f32, f32>(&opr.sums).cast_const(),
+                            span,
+                            scan,
+                            i,
+                        )
+                    }
+                })?;
             if deflate {
-                let reads = [opr.eigenmodes.storage(), opr.coef.storage()];
-                self.base
-                    .launch(ctx, &reads, &[moved.storage()], |stream| {
-                        // SAFETY: `moved` holds `nb n` values, eigenmode `i` `n`, `coef` `2 nb`.
-                        unsafe {
-                            self.module.opr_deflate(
-                                stream,
-                                line,
-                                r,
-                                u.cast_const(),
-                                dptr::<f32, f32>(&opr.coef).cast_const(),
-                                span.nb,
-                                nu,
-                            )
-                        }
-                    })?;
+                self.deflate(ctx, opr, span, i, moved)?;
             }
         }
         Ok(())
+    }
+
+    /// `r_b −= coef_b U″` for every batch frame `b` of `moved`, `U″` eigenmode `i` and
+    /// `coef_b = Σ conj(U″) r_b / n²` from the [`OPR_SUMS`] in `opr`'s sums.
+    fn deflate(
+        &self,
+        ctx: &ExecutionContext,
+        opr: &Opr,
+        span: BatchSpan,
+        i: u32,
+        moved: &mut DeviceBuffer<C32>,
+    ) -> Result<(), Error> {
+        let (nu, per_frame, line) = (opr.n as u32, grid_1d(span.nb as usize)?, grid_1d(opr.n)?);
+        self.base.launch(
+            ctx,
+            &[opr.sums.storage()],
+            &[opr.deflate_coef.storage()],
+            |stream| {
+                // SAFETY: `span.nb ≤ nb_max`, `sums` and `deflate_coef` sized by `Opr::new` for
+                // it.
+                unsafe {
+                    self.module.opr_deflate_coef(
+                        stream,
+                        per_frame,
+                        dptr::<f32, f32>(&opr.sums).cast_const(),
+                        span,
+                        nu,
+                        dptr(&opr.deflate_coef),
+                    )
+                }
+            },
+        )?;
+        let reads = [opr.eigenmodes.storage(), opr.deflate_coef.storage()];
+        let (r, u) = (dptr::<C32, f32>(moved), opr.eigenmode(i).cast_const());
+        self.base.launch(ctx, &reads, &[moved.storage()], |stream| {
+            // SAFETY: `moved` holds `nb n` values, eigenmode `i` `n`, `deflate_coef` `2 nb`.
+            unsafe {
+                self.module.opr_deflate(
+                    stream,
+                    line,
+                    r,
+                    u,
+                    dptr::<f32, f32>(&opr.deflate_coef).cast_const(),
+                    span.nb,
+                    nu,
+                )
+            }
+        })
     }
 
     /// The [`OPR_SUMS`] of `of` per chunk of each batch frame into `opr`'s sums.
