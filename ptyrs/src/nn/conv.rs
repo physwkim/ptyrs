@@ -344,7 +344,7 @@ fn weight_grad(x: CubeTensor, dy: CubeTensor, bias: bool) -> (CubeTensor, Option
     // The cubes of `a = 0` sum the bias gradient, so they are there even for no input channels.
     let (across, down) = (ci.div_ceil(LANES).max(1), co.div_ceil(PER * WARPS));
     let strips = w.div_ceil(LANES);
-    // A band holds at least one row; no pixels or no channels make no bands or no cubes.
+    // A band holds at least one row; no pixels make no bands, and no output channels no cubes.
     let split = (CUBES / (across * down * n * strips).max(1)).clamp(1, h.max(1));
     let rows = h.div_ceil(split).max(1);
     let blocks = h.div_ceil(rows);
