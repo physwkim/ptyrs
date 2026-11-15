@@ -1,9 +1,9 @@
 //! The device state a captured cycle addresses, and the graph captured from it, under one
 //! owner. Nothing outside this module can reach a field of [`Device`] or of a stack's
 //! buffers, and nothing here replaces one after [`Device::new`] but
-//! [`Device::set_features`], which drops every graph before and recaptures the LLK pass's
-//! after: a graph replays on the buffers the eager cycle would use, and other buffers mean
-//! another `Device`, or other features, which start with no graph. The device also owns the
+//! [`Device::set_features`] and [`Device::set_sampling`], which drop every graph, the LLK
+//! pass's recaptured at its next pass: a graph replays on the buffers the eager cycle would
+//! use, and other buffers mean another `Device`, or other features, which start with no graph. The device also owns the
 //! LLK ring, which counts a record once per enqueued run of a cycle or pass that ends one:
 //! an eager run through [`LlkRing::record`], a graph's replay through [`LlkRing::replay`]
 //! with the [`Ended`] its capture left.
@@ -198,7 +198,8 @@ pub(super) struct Device {
     use_graph: bool,
     /// The epochs run since the parameters last changed, all of one [`Epoch::run`].
     runs: Vec<EpochRun>,
-    /// With graphs, the LLK pass's graph.
+    /// With graphs, the LLK pass's graph; none once its buffers are replaced, until the next
+    /// pass captures it.
     llk_graph: Option<Captured>,
     /// ML's state, built by the first ML call and replaced only for another position model.
     ml: Option<Box<MlState>>,
@@ -418,6 +419,26 @@ impl WindowsMut<'_> {
 struct Reshared {
     shared: Shared,
     waves: Option<[DeviceBuffer<C32>; 2]>,
+}
+
+/// What [`Device::set_features`] models, built by [`Device::build_features`].
+pub(super) struct NewFeatures(FeaturesUpdate);
+
+enum FeaturesUpdate {
+    /// The values of the features already set, refined or held as they are: scale,
+    /// background, position.
+    InPlace([Option<Vec<f32>>; 3]),
+    /// The buffers of other features, or another refine, with the shared passes their position
+    /// takes unless the current ones serve it.
+    Replace(Box<(FeatureBufs, Option<Reshared>)>),
+}
+
+/// What [`Device::set_sampling`] enters, built by [`Device::build_sampling`].
+pub(super) struct NewSampling {
+    sampling: Sampling,
+    /// Of another sampling while a position is modelled, what its offsets move under it, with
+    /// the shared passes it takes unless the current ones serve it.
+    moved: Option<(Mover, Option<Reshared>)>,
 }
 
 /// A per-frame intensity scale `[nframe]` and, refined, its far sums `[nframe]`.
@@ -2638,28 +2659,19 @@ impl Device {
         Ok(())
     }
 
-    /// Fails unless these passes model `features`: only the fused ones model any.
-    pub fn check_features(&self, features: &Features) -> Result<(), EngineError> {
+    /// The buffers [`Self::set_features`] models `features` with, which the caller checked
+    /// against the scan; fails, building nothing, unless these passes model them (only the
+    /// fused ones model any) and every buffer is built. The values of the features already set,
+    /// refined or held as they are, are kept to write in place; other features, or another
+    /// refine, take buffers of their own, and a position also takes the fused passes' scratch
+    /// ([`PositionScratch`]), by what its offsets move and whether they are refined, so one
+    /// added, dropped or switched between refined and held takes the stacks recut for it.
+    pub fn build_features(&self, features: &Features) -> Result<NewFeatures, EngineError> {
         if matches!(self.shared.passes, Passes::M1 { .. }) && *features != Features::default() {
             return Err(EngineError::Invalid(
                 "features need GpuOptions { fused: true, .. }".into(),
             ));
         }
-        Ok(())
-    }
-
-    /// Models `features`, which the caller checked against the scan and by
-    /// [`Self::check_features`], from here on: the values of the features already set, refined or held as they are, are written in
-    /// place; other features, or another refine, replace the buffers, and so first drop
-    /// every graph, which addresses them, and then recapture the LLK pass's. Only the fused
-    /// passes model features; a position also takes their scratch ([`PositionScratch`]), by
-    /// what its offsets move and whether they are refined, so a position added, dropped or
-    /// switched between refined and held recuts the stacks that stream that scratch and drops
-    /// the states cut against it ([`Self::reshare`]). Nothing changes if a buffer cannot be
-    /// built; if the recapture fails, `features` stay modelled and [`Self::llk_pass`] runs
-    /// eagerly until a later recapture; a failed write in place may leave the values before it
-    /// written.
-    pub fn set_features(&mut self, features: &Features) -> Result<(), EngineError> {
         let f32s = |v: &Option<Feature<Vec<f64>>>| -> Option<Feature<Vec<f32>>> {
             (v.as_ref()).map(|v| v.as_ref().map(|v| v.iter().map(|&x| x as f32).collect()))
         };
@@ -2669,19 +2681,9 @@ impl Device {
                 .map(|d| d.iter().flatten().map(|&x| x as f32).collect())
         });
         let refine = |f: &Option<Feature<Vec<f32>>>| f.as_ref().map(|f| f.refine);
-        let have = &mut self.features;
-        if have.refine() == [refine(&scale), refine(&background), refine(&position)] {
-            if let (Some(b), Some(v)) = (&mut have.scale, scale) {
-                b.values.copy_from_host(&self.stream, &v.values)?;
-            }
-            fault::at(fault::Exit::FeatureCopy)?;
-            if let (Some(b), Some(v)) = (&mut have.background, background) {
-                b.values.copy_from_host(&self.stream, &v.values)?;
-            }
-            if let (Some(b), Some(v)) = (&mut have.position, position) {
-                b.offsets.copy_from_host(&self.stream, &v.values)?;
-            }
-            return Ok(());
+        if self.features.refine() == [refine(&scale), refine(&background), refine(&position)] {
+            let values = [scale, background, position].map(|f| f.map(|f| f.values));
+            return Ok(NewFeatures(FeaturesUpdate::InPlace(values)));
         }
         let stream = &self.stream;
         let dims = self.views.dims();
@@ -2709,7 +2711,7 @@ impl Device {
             .transpose()?;
         let background = background
             .map(|v| {
-                let pixel_frames = self.ring.device().pixel_frames();
+                let pixel_frames = self.ring.pixel_frames();
                 let mut nobs = DeviceBuffer::zeroed(stream, pixel_frames.len())?;
                 nobs.copy_from_device_async(pixel_frames, stream)?;
                 let sums = (v.refine)
@@ -2741,17 +2743,45 @@ impl Device {
                 })
             })
             .transpose()?;
-        self.runs.clear();
-        self.llk_graph = None;
-        self.features = FeatureBufs {
+        let built = FeatureBufs {
             scale,
             background,
             position,
         };
-        if let Some(r) = shared {
-            self.reshare(r);
+        Ok(NewFeatures(FeaturesUpdate::Replace(Box::new((
+            built, shared,
+        )))))
+    }
+
+    /// Models the features `new` was built for from here on: the values of the features
+    /// already set are written in place; other features' buffers replace the current ones, and
+    /// so drop every graph, which addresses them, with the shared passes they take
+    /// ([`Self::reshare`]). A failed write in place may leave the values before it written.
+    pub fn set_features(&mut self, new: NewFeatures) -> Result<(), EngineError> {
+        match new.0 {
+            FeaturesUpdate::InPlace([scale, background, position]) => {
+                let have = &mut self.features;
+                if let (Some(b), Some(v)) = (&mut have.scale, scale) {
+                    b.values.copy_from_host(&self.stream, &v)?;
+                }
+                fault::at(fault::Exit::FeatureCopy)?;
+                if let (Some(b), Some(v)) = (&mut have.background, background) {
+                    b.values.copy_from_host(&self.stream, &v)?;
+                }
+                if let (Some(b), Some(v)) = (&mut have.position, position) {
+                    b.offsets.copy_from_host(&self.stream, &v)?;
+                }
+            }
+            FeaturesUpdate::Replace(built) => {
+                let (features, shared) = *built;
+                self.runs.clear();
+                self.llk_graph = None;
+                self.features = features;
+                if let Some(r) = shared {
+                    self.reshare(r);
+                }
+            }
         }
-        self.capture_llk()?;
         Ok(())
     }
 
@@ -2773,6 +2803,7 @@ impl Device {
         let waves = (self.slices.as_ref())
             .map(|_| Slices::waves(stream, &shared.cut, dims))
             .transpose()?;
+        fault::at(fault::Exit::Reshare)?;
         Ok(Some(Reshared { shared, waves }))
     }
 
@@ -2830,39 +2861,43 @@ impl Device {
         self.sampling
     }
 
-    /// Enters a position's offsets as `sampling` from here on. Another sampling drops ML's,
-    /// BH's and LSQML's states built under a position model, which the next call of their
-    /// algorithm rebuilds under it, and, while a position is modelled, replaces what its
-    /// offsets move, with the shared passes as [`Self::set_features`] does, and every run,
-    /// whose graphs bind them; then it recaptures the LLK pass's graph. Nothing changes if a
-    /// buffer cannot be built; if the recapture fails, `sampling` stays entered with all of
-    /// the above, and [`Self::llk_pass`] runs eagerly until a later recapture.
-    pub fn set_sampling(&mut self, sampling: Sampling) -> Result<(), EngineError> {
-        if sampling == self.sampling {
-            return Ok(());
-        }
-        let mover = (self.features.position.as_ref())
+    /// What [`Self::set_sampling`] enters `sampling` with: of another sampling while a
+    /// position is modelled, what its offsets move under it, with the shared passes as
+    /// [`Self::build_features`] builds them; fails, building nothing, if a buffer cannot be
+    /// built.
+    pub fn build_sampling(&self, sampling: Sampling) -> Result<NewSampling, EngineError> {
+        let moved = (self.features.position.as_ref())
+            .filter(|_| sampling != self.sampling)
             .map(|_| {
-                let dims = self.views.dims();
-                Mover::new(&self.stream, &self.kernels, dims, sampling)
+                let mover = Mover::new(&self.stream, &self.kernels, self.views.dims(), sampling)?;
+                let shared = self.reshared(Some(&mover), self.features.position_refined())?;
+                Ok::<_, EngineError>((mover, shared))
             })
             .transpose()?;
-        let refined = self.features.position_refined();
-        let shared = self.reshared(mover.as_ref(), refined)?;
-        self.sampling = sampling;
+        Ok(NewSampling { sampling, moved })
+    }
+
+    /// Enters a position's offsets as `new`'s sampling from here on. Another sampling drops
+    /// ML's, BH's and LSQML's states built under a position model, which the next call of
+    /// their algorithm rebuilds under it, and, while a position is modelled, replaces what its
+    /// offsets move, with the shared passes as [`Self::set_features`] does, and every run,
+    /// whose graphs bind them.
+    pub fn set_sampling(&mut self, new: NewSampling) {
+        if new.sampling == self.sampling {
+            return;
+        }
+        self.sampling = new.sampling;
         if self.ml.as_ref().is_some_and(|s| s.position.is_some()) {
             self.ml = None;
         }
-        if let Some((p, mover)) = self.features.position.as_mut().zip(mover) {
+        if let Some((p, (mover, shared))) = self.features.position.as_mut().zip(new.moved) {
             p.mover = mover;
             self.runs.clear();
             self.llk_graph = None;
             if let Some(r) = shared {
                 self.reshare(r);
             }
-            self.capture_llk()?;
         }
-        Ok(())
     }
 
     /// Whether an intensity scale or a detector background is modelled, refined or held.
@@ -3155,9 +3190,12 @@ impl Device {
         done
     }
 
-    /// Enqueues the LLK record of the current estimate under `tag`, from the graph captured
-    /// in [`Self::new`] or eagerly without graphs.
+    /// Enqueues the LLK record of the current estimate under `tag`: with graphs, from the
+    /// LLK pass's graph, captured first if its buffers were replaced since; eagerly without.
     pub fn llk_pass(&mut self, tag: Tag) -> Result<(), EngineError> {
+        if self.llk_graph.is_none() {
+            self.capture_llk()?;
+        }
         let graph = self.llk_graph.take();
         let done = match &graph {
             Some(c) => self.replay(c, tag),

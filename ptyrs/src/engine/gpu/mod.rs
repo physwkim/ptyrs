@@ -511,25 +511,25 @@ pub struct GpuPtycho {
 }
 
 /// The [`Device`] behind the gate of [`GpuPtycho`]'s calls: aborted from the first failure
-/// of a call through [`Self::change`] on. A call's checks run through the gate too, after
-/// its refusal, so an aborted engine answers [`EngineError::Aborted`] whatever the
-/// arguments.
+/// of a call through [`Self::change`] on. A call's checks, with what it builds before it
+/// changes anything, run through the gate too, after its refusal, so an aborted engine
+/// answers [`EngineError::Aborted`] whatever the arguments.
 struct Gated {
     dev: Device,
     aborted: bool,
 }
 
 impl Gated {
-    /// `f`, which may leave the device part-changed when it fails, after `check`: aborted
-    /// while `f` runs, so its failure leaves the gate aborted.
-    fn change<R>(
+    /// `f`, which may leave the device part-changed when it fails, on what `check` built:
+    /// aborted while `f` runs, so its failure leaves the gate aborted.
+    fn change<T, R>(
         &mut self,
-        check: impl FnOnce(&Device) -> Result<(), EngineError>,
-        f: impl FnOnce(&mut Device) -> Result<R, EngineError>,
+        check: impl FnOnce(&Device) -> Result<T, EngineError>,
+        f: impl FnOnce(&mut Device, T) -> Result<R, EngineError>,
     ) -> Result<R, EngineError> {
-        check(self.checked()?)?;
+        let built = check(self.checked()?)?;
         self.aborted = true;
-        let r = f(&mut self.dev)?;
+        let r = f(&mut self.dev, built)?;
         self.aborted = false;
         Ok(r)
     }
@@ -801,7 +801,7 @@ impl GpuPtycho {
         let (have, len) = (self.obj_dims, object.as_slice().len());
         self.dev.change(
             |_| object_fits(have, object.dims(), len),
-            |dev| dev.write_object(&to_c32(object.as_slice())),
+            |dev, ()| dev.write_object(&to_c32(object.as_slice())),
         )
     }
 
@@ -816,7 +816,7 @@ impl GpuPtycho {
         let have = self.obj_dims;
         self.dev.change(
             |_| object_fits(have, dims, src.len()),
-            |dev| dev.copy_object(src),
+            |dev, ()| dev.copy_object(src),
         )
     }
 
@@ -850,8 +850,13 @@ impl GpuPtycho {
     /// Enters [`Features::position`] as `sampling` in every call from here on, as
     /// [`crate::engine::Ptycho::set_sampling`].
     pub fn set_sampling(&mut self, sampling: Sampling) -> Result<(), EngineError> {
-        self.dev
-            .change(|_| Ok(()), |dev| dev.set_sampling(sampling))
+        self.dev.change(
+            |dev| dev.build_sampling(sampling),
+            |dev, new| {
+                dev.set_sampling(new);
+                Ok(())
+            },
+        )
     }
 
     /// Models and refines `features` from here on, as [`crate::engine::Ptycho::set_features`], in
@@ -862,9 +867,9 @@ impl GpuPtycho {
                 let dims = dev.dims();
                 let [ny, nx] = dims.frame.map(|n| n as usize);
                 features.check(dims.nframe as usize, [ny, nx])?;
-                dev.check_features(features)
+                dev.build_features(features)
             },
-            |dev| dev.set_features(features),
+            |dev, new| dev.set_features(new),
         )
     }
 
@@ -911,7 +916,7 @@ impl GpuPtycho {
             history,
             ..
         } = self;
-        let records = dev.change(check, |dev| {
+        let records = dev.change(check, |dev, ()| {
             f(dev, cycle)?;
             let (records, _) = collect(dev)?;
             if ramp {
@@ -1582,6 +1587,64 @@ mod tests {
             aborted(&mut e, "FeatureCopy");
             let written = e.features().unwrap().scale.map(|s| s.values);
             assert_eq!(written, Some(vec![2.0; 36]));
+        }
+
+        /// A position, then another sampling, whose shared passes fail to build leave the
+        /// engine open on what it modelled before: LLK and AP after each are bit for bit those
+        /// of an engine never asked, and so after both are entered.
+        #[test]
+        fn a_build_failing_leaves_the_engine_open() {
+            let ctx = ctx();
+            let [mut e, mut fresh] = [(); 2].map(|()| engine(&ctx, true, true));
+            let offsets = (0..36).map(|f| [0.1 * (f % 3) as f64 - 0.1, 0.05]);
+            let position = Features {
+                position: Some(Feature::refined(offsets.collect())),
+                ..Features::default()
+            };
+            let other = match e.sampling() {
+                Sampling::Patch => Sampling::FullObject,
+                Sampling::FullObject => Sampling::Patch,
+            };
+            let llk = |e: &mut GpuPtycho| {
+                let l = e.llk().unwrap();
+                [l.poisson, l.gaussian, l.euclidian, l.nb_photons_calc].map(f64::to_bits)
+            };
+            let same = |e: &mut GpuPtycho, fresh: &mut GpuPtycho, what: &str| {
+                assert_eq!(llk(e), llk(fresh), "{what}: the LLK");
+                for e in [&mut *e, &mut *fresh] {
+                    e.ap(&ap(false), 1).unwrap();
+                }
+                assert!(arrays(e) == arrays(fresh), "{what}: the arrays");
+                let h = |e: &GpuPtycho| {
+                    let h = e.history().iter();
+                    h.map(|r| r.llk.poisson.to_bits()).collect::<Vec<_>>()
+                };
+                assert_eq!(h(e), h(fresh), "{what}: the records");
+            };
+            for e in [&mut e, &mut fresh] {
+                e.ap(&ap(false), 1).unwrap();
+            }
+            let armed = fault::arm(Exit::Reshare, 0);
+            let r = e.set_features(&position);
+            assert!(armed.fired());
+            assert!(refused(&r), "{r:?}");
+            drop(armed);
+            assert!(e.features().unwrap() == Features::default(), "the features");
+            same(&mut e, &mut fresh, "set_features");
+            for e in [&mut e, &mut fresh] {
+                e.set_features(&position).unwrap();
+            }
+            let armed = fault::arm(Exit::Reshare, 0);
+            let r = e.set_sampling(other);
+            assert!(armed.fired());
+            assert!(refused(&r), "{r:?}");
+            drop(armed);
+            assert!(e.sampling() != other, "the sampling");
+            same(&mut e, &mut fresh, "set_sampling");
+            for e in [&mut e, &mut fresh] {
+                e.set_sampling(other).unwrap();
+            }
+            same(&mut e, &mut fresh, "both");
         }
 
         /// A call failing past its checks aborts wherever it fails, launched or captured: AP
