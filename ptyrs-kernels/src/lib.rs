@@ -1101,6 +1101,29 @@ pub mod kernels {
         unsafe { normalize_at(x, sums, px, inertia, f32::from_bits(*max_bits)) }
     }
 
+    /// The sums [`normalize_tiles`] leaves, without its update: zeroes the sums of the
+    /// object tiles with a non-empty run and touches no other. Grid and block as
+    /// [`normalize_tiles`].
+    ///
+    /// # Safety
+    ///
+    /// `sums` hold `[nobj, nyo, nxo]` values, `tile_len` `ntx * nty` entries.
+    ///
+    /// [`normalize_tiles`]: LoadedModule::normalize_tiles
+    #[kernel]
+    pub unsafe fn clear_tiles(sums: SumPtrs, tile_len: *const u32, nyo: u32, nxo: u32) {
+        let (tile, y, xo) = tile_and_pixel();
+        if xo >= nxo || y >= nyo || unsafe { *tile_len.add(tile) } == 0 {
+            return;
+        }
+        let px = (thread::blockIdx_z() as usize * nyo as usize + y as usize) * nxo as usize
+            + xo as usize;
+        unsafe {
+            pixel::store_c(sums.num, px, (0.0, 0.0));
+            *sums.den.add(px) = 0.0;
+        }
+    }
+
     /// DM reflection (PyNX `DM1` and the copy `DM2` reads): with `psi1 = (2 - alpha) po -
     /// (1 - alpha) psi`, sets `psi = psi1` and `po = (1 - alpha) (po - psi1)`, for `n`
     /// elements.

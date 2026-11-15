@@ -412,7 +412,7 @@ impl<'a> ProbeSpectrum<'a> {
 /// The probe sums of a shifted probe over a scan's frames, kept in the spectral domain so
 /// that the split into stacks does not change a bit: [`Kernels::fused_project`] adds a
 /// stack's frames in ascending order and [`Kernels::shifted_probe_sums`] turns what was added
-/// into probe sums and zeroes them; the only other reset is construction.
+/// into probe sums and zeroes them, as [`Self::clear`] does.
 pub struct ShiftedProbeSums {
     /// `sum_f conj(e_f) DFT(Y_f)`, `[nprobe, ny, nx]`, FFT order.
     num: DeviceBuffer<C32>,
@@ -443,6 +443,18 @@ impl ShiftedProbeSums {
             chunks: DeviceBuffer::zeroed(stream, nprobe * FUSED_STEP_CHUNKS as usize)?,
             alpha: DeviceBuffer::zeroed(stream, nprobe)?,
         })
+    }
+
+    /// Zeroes the sums, discarding what was added.
+    pub fn clear(&mut self, ctx: &ExecutionContext) -> Result<(), Error> {
+        crate::gpu::zero(ctx, &mut self.num)?;
+        crate::gpu::zero(ctx, &mut self.den)
+    }
+
+    /// The sums [`Self::clear`] zeroes, for a test to fill as a failed call leaves them.
+    #[cfg(test)]
+    pub(crate) fn sums_mut(&mut self) -> (&mut DeviceBuffer<C32>, &mut DeviceBuffer<f32>) {
+        (&mut self.num, &mut self.den)
     }
 
     /// `norm`'s floats per probe mode.
@@ -548,7 +560,7 @@ impl FarSums<'_> {
 /// [`Kernels::fused_project`] and [`Kernels::fused_llk`] add a stack at a time in ascending
 /// frame order, so that the split into stacks does not change a bit. They hold what was
 /// added since the last [`Kernels::background_ap`] or [`Kernels::background_grad`] consumed
-/// them; the only other reset is construction.
+/// them or [`Self::clear`] zeroed them.
 pub struct BackgroundSums {
     /// `[ny, nx]`, detector order.
     pub sum: DeviceBuffer<f32>,
@@ -564,6 +576,11 @@ impl BackgroundSums {
             sum: DeviceBuffer::zeroed(stream, n)?,
             ratio: DeviceBuffer::zeroed(stream, nf_max as usize * n)?,
         })
+    }
+
+    /// Zeroes the sum, discarding what was added.
+    pub fn clear(&mut self, ctx: &ExecutionContext) -> Result<(), Error> {
+        crate::gpu::zero(ctx, &mut self.sum)
     }
 
     fn check(&self, n: usize, nf_max: u32) -> Result<(), Error> {

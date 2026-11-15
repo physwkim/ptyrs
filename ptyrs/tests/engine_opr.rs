@@ -5,15 +5,16 @@
 //! 40 4`, i.e. `common::dm_scenario(32, 40, 2, 2e5, 4.0)` after `scale_obj_probe`, with the
 //! references' eigenmodes and weights. They write `<dir>/opr_{eigen,weights,values}_f64.txt`,
 //! `<dir>/lsqml_opr_{eigen,weights,obj,probe,steps,values}_f64.txt` and the same
-//! `lsqml_opr_int_` files, saved to `tests/engine/data`.
+//! `lsqml_opr_int_` files, saved to `tests/engine/data`. [`Lsqml::llk`] is also held against
+//! [`Ptycho::llk`] at a per-frame intensity scale.
 
 use std::ops::Range;
 use std::slice;
 
 use ptyrs::base::{C64, Stack, View};
 use ptyrs::engine::{
-    Cost, Feature, Fft2, Llk, Lsqml, LsqmlParams, LsqmlStep, Optics, ProbeVariation, Ptycho,
-    illumination, llk, obj_probe_to_psi, opr_weight_grad,
+    Cost, Feature, Features, Fft2, Llk, Lsqml, LsqmlParams, LsqmlStep, Optics, ProbeVariation,
+    Ptycho, Sampling, illumination, llk, obj_probe_to_psi, opr_weight_grad,
 };
 
 #[path = "common/engine/mod.rs"]
@@ -199,6 +200,104 @@ fn costs_match_opr_refs() {
             "{}: L {el:.3e} F {ef:.3e}",
             r.name
         );
+    }
+}
+
+/// [`Lsqml::llk`] of each reference's variation against its `L` and `F` over every frame: the
+/// LLK of LSQML's model reads each frame's own probe.
+#[test]
+fn lsqml_llk_matches_opr_refs() {
+    let (p, optics) = state();
+    let run = Lsqml::new(LsqmlParams {
+        batch_size: 40,
+        cost: Cost::Poisson,
+        seed: 0,
+    })
+    .unwrap();
+    let objects = slice::from_ref(p.object());
+    for r in [&OPR, &LSQML_OPR, &LSQML_OPR_INT] {
+        let ref_ = table(r.values)[0].clone();
+        let var = r.variation();
+        let got = run.llk(p.addr(), p.observed(), &optics, objects, p.probe(), &var);
+        let nb_obs = ref_[0];
+        let el = rel(got.poisson * nb_obs, ref_[1]);
+        let ef = rel(got.euclidian * nb_obs / 4.0, ref_[2]);
+        assert!(
+            el < 1e-13 && ef < 1e-13,
+            "{}: L {el:.3e} F {ef:.3e}",
+            r.name
+        );
+    }
+}
+
+/// [`Lsqml::llk`] of held offsets under each sampling against [`Ptycho::llk`]. With one probe
+/// mode and one eigenmode `U = P`, frame `f`'s own probe `c_f·P + w_f·U` is `P` at the
+/// intensity scale `(c_f + w_f)²`, which `Ptycho` models; without a variation it is `Ptycho`'s
+/// LLK as it is.
+#[test]
+fn lsqml_llk_matches_ptycho_at_each_frames_scale() {
+    let (scan, object, probe) = common::dm_scenario(32, 40, 1, 2e5, 4.0);
+    let mut p = Ptycho::new(&scan, object, probe).unwrap();
+    p.scale_obj_probe();
+    let (object, probe) = (p.object().clone(), p.probe().clone());
+    let nframe = p.addr().nframe();
+    let d: Vec<[f64; 2]> = (0..nframe)
+        .map(|f| [0.4 * (0.7 * f as f64).sin(), 0.4 * (1.3 * f as f64).cos()])
+        .collect();
+    let [_, ny, nx] = object.dims();
+    let inside = p.addr().views().iter().all(|v| {
+        let at = d[v.frame as usize];
+        let at = [v.oy as f64 + at[0], v.ox as f64 + at[1]];
+        (0.0..=(ny - 32) as f64).contains(&at[0]) && (0.0..=(nx - 32) as f64).contains(&at[1])
+    });
+    assert!(inside, "a view reads past the object's edge");
+    let c: Vec<f64> = (0..nframe).map(|f| 1.0 + 0.05 * (f % 3) as f64).collect();
+    let w: Vec<f64> = (0..nframe).map(|f| 0.1 * (f % 5) as f64 - 0.2).collect();
+    let scale = c.iter().zip(&w).map(|(c, w)| (c + w).powi(2)).collect();
+    let u = Stack::from_vec([1, 32, 32], probe.plane(0).to_vec()).unwrap();
+    let var = ProbeVariation::new(u, Feature::held(w)).with_intensity(Feature::held(c));
+    let none = ProbeVariation::none([32, 32]);
+    let runs = [
+        ("none", &none, None),
+        ("scaled", &var, Some(Feature::held(scale))),
+    ];
+    let position = Some(Feature::held(d));
+    for sampling in [Sampling::Patch, Sampling::FullObject] {
+        let run = Lsqml::new(LsqmlParams {
+            batch_size: nframe,
+            cost: Cost::Poisson,
+            seed: 0,
+        })
+        .unwrap()
+        .with_sampling(sampling)
+        .with_features(Features {
+            position: position.clone(),
+            ..Features::default()
+        })
+        .unwrap();
+        p.set_sampling(sampling);
+        for (named, var, scale) in runs.clone() {
+            let objects = slice::from_ref(&object);
+            let got = run.llk(p.addr(), p.observed(), p.optics(), objects, &probe, var);
+            p.set_features(Features {
+                position: position.clone(),
+                scale,
+                ..Features::default()
+            })
+            .unwrap();
+            let want = p.llk();
+            let err = worst_of(
+                [
+                    (got.poisson, want.poisson),
+                    (got.gaussian, want.gaussian),
+                    (got.euclidian, want.euclidian),
+                    (got.nb_photons_calc, want.nb_photons_calc),
+                ]
+                .map(|(g, w)| rel(g, w)),
+            );
+            eprintln!("{sampling:?} {named}: max rel {err:.3e}");
+            assert!(err < 1e-12, "{sampling:?} {named}: max rel {err:.3e}");
+        }
     }
 }
 

@@ -36,15 +36,16 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use crate::base::{AddrTable, C64, Object, Probe, Scan, Stack};
+use crate::fault;
 use crate::fft::Plan2d;
 use crate::gpu::{
-    C32, CG_BLOCKS, Ended, Error as GpuError, FarSums, FusedBufs, FusedInputs, Model,
-    ObjProbeScale, RecordWriter, StackRef, StackTable, ViewAddr, ViewDims, Waves,
+    C32, CG_BLOCKS, Error as GpuError, FarSums, FusedBufs, FusedInputs, Model, ObjProbeScale,
+    RecordWriter, StackRef, StackTable, ViewAddr, ViewDims, Waves,
 };
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 
-use device::{Bufs, Device, NormBufs, PassesMut, SliceUploads, Sliced, Uploads};
+use device::{Bufs, Device, NormBufs, OneSlice, PassesMut, SliceUploads, Sliced, Uploads};
 
 use crate::engine::ptycho::{Algorithm, LlkRecord, zero_phase_ramp};
 use crate::engine::{
@@ -504,7 +505,8 @@ impl GpuPtycho {
     /// exit waves' plane phase and the propagator in place of the scan geometry's far field;
     /// of the geometry only the frame is read. Fails on optics without a
     /// [`Optics::fourier_form`], and on more than one object slice, which
-    /// [`Self::with_slices`] takes.
+    /// [`Self::with_slices`] takes. Angular spectrum with an evanescent band runs LSQML, BH
+    /// and the LLK pass alone, as the CPU's: every other algorithm fails on it.
     pub fn with_optics(
         ctx: &Arc<CudaContext>,
         scan: &Scan,
@@ -802,8 +804,8 @@ impl Bufs<'_> {
         &mut self,
         ctx: &ExecutionContext,
         passes: &mut PassesMut<'_>,
-        mut rec: RecordWriter<'_>,
-    ) -> Result<Ended, GpuError> {
+        mut rec: RecordWriter<'_, Tag>,
+    ) -> Result<(), GpuError> {
         let dims = *self.views.dims();
         match passes {
             PassesMut::M1(m1) => {
@@ -888,12 +890,13 @@ impl Bufs<'_> {
         &mut self,
         ctx: &ExecutionContext,
         f: &mut FusedBufs,
-        mut llk: Option<RecordWriter<'_>>,
-    ) -> Result<Option<Ended>, GpuError> {
+        mut llk: Option<RecordWriter<'_, Tag>>,
+        one: OneSlice,
+    ) -> Result<(), GpuError> {
         let dims = *self.views.dims();
-        let mut m =
-            self.features
-                .lend(ctx, self.kernels, &dims, self.obj, self.probe, self.exit)?;
+        let mut m = (self.features)
+            .lend(ctx, self.kernels, &dims, self.obj, self.probe, self.exit)?
+            .one_slice(one);
         for s in 0..self.scratch.len() {
             let stack = self.scratch.at(s);
             let windows = self.windows.as_deref_mut();
@@ -911,9 +914,12 @@ impl Bufs<'_> {
                 rec.push(ctx, &dims, stack, self.llk)?;
             }
         }
-        let ended = llk.map(|w| w.end(ctx)).transpose()?;
+        if let Some(w) = llk {
+            w.end(ctx)?;
+        }
+        fault::at(fault::Exit::Feature)?;
         self.features.step(ctx, self.kernels, self.grad)?;
-        Ok(ended)
+        Ok(())
     }
 
     /// M1 Fourier-modulus projection of `stack`'s exit waves `psi` in place by `plan`, its
@@ -925,7 +931,7 @@ impl Bufs<'_> {
         stack: StackRef<'_>,
         plan: &mut Plan2d,
         psi: &mut DeviceBuffer<C32>,
-        llk: Option<&mut RecordWriter<'_>>,
+        llk: Option<&mut RecordWriter<'_, Tag>>,
     ) -> Result<(), GpuError> {
         let dims = *self.views.dims();
         plan.forward_inplace(ctx, psi)?;

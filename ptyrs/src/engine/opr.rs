@@ -8,7 +8,7 @@
 //! [`ProbeVariation::unique`] gives every frame of a batch its own probe planes, so the
 //! operators of [`crate::engine::ops`] and [`crate::engine::LsqmlBatch`] run on per-frame probes unchanged;
 //! [`crate::engine::Lsqml::step`] moves the eigenmodes, and the weights and `c_f` refined, with the
-//! object and probe.
+//! object and probe, and [`crate::engine::Lsqml::llk`] is the LLK of those per-frame probes.
 
 use crate::base::{C64, Feature, Object, Probe, Stack, View};
 

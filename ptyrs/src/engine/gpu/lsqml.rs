@@ -16,10 +16,10 @@ use std::sync::Arc;
 
 use crate::gpu::sampling::{Modes, ObjectSampler, StackPoints, WindowBlock, window_views};
 use crate::gpu::{
-    BhScan, C32, EpochOrder, Error as GpuError, FrameWaves, FusedInputs, Kernels, LSQML_REC,
-    LsqmlAt, LsqmlChi, LsqmlKernels, LsqmlNoise, LsqmlScan, LsqmlVar, Model, PositionRule,
-    PositionStep, Positions, PsiSums, ShiftProbe, SliceSource, SliceSteps, Solve, StackRef,
-    StackTable, UpdateSums, ViewDims, Views,
+    BandCarry, BhScan, C32, EpochOrder, Error as GpuError, ExitPass, ExitStage, FrameWaves,
+    FusedInputs, Kernels, LSQML_REC, LsqmlAt, LsqmlChi, LsqmlKernels, LsqmlNoise, LsqmlScan,
+    LsqmlVar, Model, PositionRule, PositionStep, Positions, PsiSums, ShiftProbe, SliceSource,
+    SliceSteps, Solve, StackRef, StackTable, UpdateSums, ViewDims, Views,
 };
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaStream, DeviceBuffer};
@@ -112,6 +112,9 @@ pub(super) struct LsqmlState {
     table: StackTable,
     /// A batch's row transforms, then exit-wave updates, one per stack of a batch.
     work: Vec<DeviceBuffer<C32>>,
+    /// Under an [`ExitStage::Banded`] stage, the band of each stack's waves, one per stack of
+    /// a batch, from its forward stage to its adjoint ([`exit_stage`]); none under another.
+    band: Vec<DeviceBuffer<C32>>,
     /// A batch's model intensities, one per stack, for the Poisson `a_far`.
     icalc: Vec<DeviceBuffer<f32>>,
     /// The scan frame at each epoch position, and the views in that order.
@@ -315,6 +318,31 @@ fn another_reading() -> GpuError {
     GpuError::Shape("LSQML state built for another position model".into())
 }
 
+/// `exit`'s stage on `stack`'s row transforms in `work`, forward or with `adjoint` back. A
+/// banded stage's forward saves the band of the waves `w` into the stack's `band` and its
+/// adjoint takes it back: a correction `Δ` then comes back as pty-chi's `Uᴴ (U w + Δ) - w`,
+/// not `Uᴴ Δ`.
+fn exit_stage(
+    ctx: &ExecutionContext,
+    exit: ExitPass<'_>,
+    d: &ViewDims,
+    stack: StackRef<'_>,
+    work: &mut DeviceBuffer<C32>,
+    band: Option<&mut DeviceBuffer<C32>>,
+    adjoint: bool,
+) -> Result<(), GpuError> {
+    let ExitStage::Banded(stage) = exit.stage else {
+        return (exit.kernels).exit(ctx, d, stack, exit.stage, work, adjoint);
+    };
+    let band =
+        band.ok_or_else(|| GpuError::Shape("LSQML state built for another exit stage".into()))?;
+    let carry = match adjoint {
+        false => BandCarry::Save(band),
+        true => BandCarry::Restore(band),
+    };
+    (exit.kernels).exit_banded(ctx, d, stack, stage, work, carry)
+}
+
 /// The waves of a batch through a multislice object of `n` slices, and the steps of its
 /// slices past the first.
 struct SliceBufs {
@@ -336,6 +364,7 @@ pub(super) struct LsqmlBufs<'a> {
     stacks: &'a [Frames],
     table: &'a StackTable,
     work: &'a mut [DeviceBuffer<C32>],
+    band: &'a mut [DeviceBuffer<C32>],
     icalc: &'a mut [DeviceBuffer<f32>],
     order: &'a EpochOrder,
     scan: &'a mut LsqmlScan,
@@ -348,7 +377,8 @@ impl LsqmlState {
     /// position model, `scratch` holds the frames per stack of the shared scratch and the
     /// device's sampling: under [`crate::engine::Sampling::Patch`] the moved probe's sums
     /// borrow its shift planes, which caps the state's stacks. `deeper` counts the object's
-    /// slices past the first. The epoch order is the scan's.
+    /// slices past the first, and `stage` is the device's exit stage. The epoch order is the
+    /// scan's.
     pub(super) fn new(
         stream: &Arc<CudaStream>,
         kernels: &Kernels,
@@ -356,7 +386,7 @@ impl LsqmlState {
         size: u32,
         rule: StackRule,
         scratch: Option<MovedScratch>,
-        deeper: usize,
+        (deeper, stage): (usize, &ExitStage),
     ) -> Result<Self, EngineError> {
         let dims = views.dims();
         // work: the forward pass (0), the exit wave, `chi`, the adjoint exit and back pass (4),
@@ -370,18 +400,33 @@ impl LsqmlState {
         // `psi_to_obj` (18): between them, refined, the derivatives over `y` and `x` (two sampler
         // calls, 9 to 14) for the position sums (15), the window sums zeroed (16, 17); then
         // `place` zeroes its accumulator (19), runs a sampler call (20 to 22), transforms the
-        // accumulator and adds it (23, 24); a slice past the first takes its pair (8) instead. A
-        // sampler call (25 to 27) writes the direction's windows for `dots` (28).
+        // accumulator and adds it (23, 24); a slice past the first takes its pair (8) instead.
+        // A sampler call (25 to 27) writes the direction's windows for `dots` (28). A banded
+        // stage's band goes from the exit to the adjoint exit: 1 to 3, 2 to 4 under the
+        // position, 4 to 6 under windows.
         let wave = wave_bytes(dims);
+        let band = match stage {
+            ExitStage::Banded(b) => Some(b),
+            _ => None,
+        };
+        let band_bytes = band.map_or(0, |b| b.carry_len(dims, 1) * size_of::<C32>());
         let streamed = match scratch {
-            None => vec![Streamed::new(wave, 0..=4), Streamed::new(wave, 5..=6)],
+            None => vec![
+                Streamed::new(wave, 0..=4),
+                Streamed::new(wave, 5..=6),
+                Streamed::new(band_bytes, 1..=3),
+            ],
             Some(MovedScratch {
                 sampling: MovedSampling::Patch,
                 refined,
                 ..
             }) => {
                 let probes = plane_bytes::<C32>(dims, dims.nprobe);
-                let mut s = vec![Streamed::new(wave, 0..=5), Streamed::new(probes, 0..=1)];
+                let mut s = vec![
+                    Streamed::new(wave, 0..=5),
+                    Streamed::new(probes, 0..=1),
+                    Streamed::new(band_bytes, 2..=4),
+                ];
                 if refined {
                     s.extend([Streamed::new(wave, 11..=12), Streamed::new(probes, 11..=12)]);
                 }
@@ -398,7 +443,11 @@ impl LsqmlState {
                 let den = plane_bytes::<f32>(dims, dims.nobj);
                 let mut s = [
                     Streamed::chunked(held, 0..=2, &[(win, 2)], &[]),
-                    vec![Streamed::new(wave, 3..=7), Streamed::new(wave, 8..=18)],
+                    vec![
+                        Streamed::new(wave, 3..=7),
+                        Streamed::new(band_bytes, 4..=6),
+                        Streamed::new(wave, 8..=18),
+                    ],
                     vec![Streamed::new(den, 16..=18), Streamed::fixed(acc, 19..=24)],
                     Streamed::chunked(scratch, 20..=22, &[], &[(win, 17)]),
                     Streamed::chunked(held, 25..=27, &[(win, 28)], &[]),
@@ -489,6 +538,10 @@ impl LsqmlState {
             kernels: LsqmlKernels::load(kernels)?,
             size,
             work: bufs(len)?,
+            band: match band {
+                Some(b) => bufs(b.carry_len(dims, nf_max))?,
+                None => Vec::new(),
+            },
             icalc: (0..slots)
                 .map(|_| DeviceBuffer::zeroed(stream, icalc_len))
                 .collect::<Result<_, _>>()?,
@@ -542,6 +595,7 @@ impl LsqmlState {
             stacks: &self.stacks,
             table: &self.table,
             work: &mut self.work,
+            band: &mut self.band,
             icalc: &mut self.icalc,
             order: &self.order,
             scan: &mut self.scan,
@@ -694,10 +748,12 @@ impl<'a> Bufs<'a> {
         // Row transforms at the detector plane into `chi`: the column pass, the propagator's
         // adjoint stage and the inverse row pass.
         let (lk, exit) = (l.kernels, self.exit);
-        let chi = |st: &LsqmlScan, stack: StackRef<'_>, work: &mut DeviceBuffer<C32>| {
+        let chi = |st: &LsqmlScan,
+                   stack: StackRef<'_>,
+                   work: &mut DeviceBuffer<C32>,
+                   band: Option<&mut DeviceBuffer<C32>>| {
             lk.chi(ctx, scan, stack, noise, st, work)?;
-            exit.kernels
-                .exit(ctx, views.dims(), stack, exit.stage, work, true)?;
+            exit_stage(ctx, exit, views.dims(), stack, work, band, true)?;
             lk.back(ctx, views, stack, work)
         };
         for (k, s) in batch.clone().enumerate() {
@@ -715,10 +771,17 @@ impl<'a> Bufs<'a> {
                     m.kernels.shift_w(ctx, views.dims(), stack, w)?;
                 }
             }
-            exit.kernels
-                .exit(ctx, views.dims(), stack, exit.stage, work, false)?;
+            exit_stage(
+                ctx,
+                exit,
+                views.dims(),
+                stack,
+                work,
+                l.band.get_mut(k),
+                false,
+            )?;
             match noise {
-                LsqmlNoise::Gaussian => chi(l.scan, stack, work)?,
+                LsqmlNoise::Gaussian => chi(l.scan, stack, work, l.band.get_mut(k))?,
                 LsqmlNoise::Poisson => l.kernels.icalc(ctx, scan, stack, work, &mut l.icalc[k])?,
             }
         }
@@ -731,7 +794,7 @@ impl<'a> Bufs<'a> {
             l.kernels
                 .far(ctx, scan, &icalc, positions.clone(), l.scan)?;
             for (k, s) in batch.clone().enumerate() {
-                chi(l.scan, l.table.at(s), &mut l.work[k])?;
+                chi(l.scan, l.table.at(s), &mut l.work[k], l.band.get_mut(k))?;
             }
         }
 
@@ -849,17 +912,20 @@ impl<'a> Bufs<'a> {
         let at = batch.clone().map(|s| points(views, table.at(s), &*p.pos));
         w.sample(ctx, (p.sampler, p.spectra), at, self.obj, 0)?;
         let wv = &w.views;
-        let chi = |st: &LsqmlScan, stack: StackRef<'_>, work: &mut DeviceBuffer<C32>| {
+        let chi = |st: &LsqmlScan,
+                   stack: StackRef<'_>,
+                   work: &mut DeviceBuffer<C32>,
+                   band: Option<&mut DeviceBuffer<C32>>| {
             lk.chi(ctx, scan, stack, noise, st, work)?;
-            exit.kernels.exit(ctx, d, stack, exit.stage, work, true)?;
+            exit_stage(ctx, exit, d, stack, work, band, true)?;
             lk.back(ctx, wv, stack, work)
         };
         for (k, s) in batch.clone().enumerate() {
             let (stack, work) = (table.at(s), &mut l.work[k]);
             lk.forward(ctx, wv, stack, &w.win[k][0], self.probe, work)?;
-            exit.kernels.exit(ctx, d, stack, exit.stage, work, false)?;
+            exit_stage(ctx, exit, d, stack, work, l.band.get_mut(k), false)?;
             match noise {
-                LsqmlNoise::Gaussian => chi(l.scan, stack, work)?,
+                LsqmlNoise::Gaussian => chi(l.scan, stack, work, l.band.get_mut(k))?,
                 LsqmlNoise::Poisson => lk.icalc(ctx, scan, stack, work, &mut l.icalc[k])?,
             }
         }
@@ -871,7 +937,7 @@ impl<'a> Bufs<'a> {
                 .collect();
             lk.far(ctx, scan, &icalc, positions.clone(), l.scan)?;
             for (k, s) in batch.clone().enumerate() {
-                chi(l.scan, table.at(s), &mut l.work[k])?;
+                chi(l.scan, table.at(s), &mut l.work[k], l.band.get_mut(k))?;
             }
         }
         for (k, s) in batch.clone().enumerate() {
@@ -997,7 +1063,7 @@ impl<'a> Bufs<'a> {
                 ok.slice_phase(ctx, d, stack, p, work, false)?;
             }
             ok.rows(ctx, d, stack, work, false)?;
-            ok.exit(ctx, d, stack, exit.stage, work, false)?;
+            exit_stage(ctx, exit, d, stack, work, l.band.get_mut(k), false)?;
             if noise == LsqmlNoise::Poisson {
                 lk.icalc(ctx, scan, stack, work, &mut l.icalc[k])?;
             }
@@ -1017,7 +1083,7 @@ impl<'a> Bufs<'a> {
         for (k, s) in batch.clone().enumerate() {
             let (stack, work, chi) = (l.table.at(s), &mut l.work[k], &mut w.chi[k]);
             lk.chi(ctx, scan, stack, noise, l.scan, work)?;
-            ok.exit(ctx, d, stack, exit.stage, work, true)?;
+            exit_stage(ctx, exit, d, stack, work, l.band.get_mut(k), true)?;
             lk.back(ctx, views, stack, work)?;
             let offsets = moved.as_ref().map(|m| m.pos.offsets());
             if let Some(p) = slice_phase(quad, offsets) {
@@ -1193,7 +1259,7 @@ impl<'a> Bufs<'a> {
                 ok.slice_phase(ctx, d, stack, phase, work, false)?;
             }
             ok.rows(ctx, d, stack, work, false)?;
-            ok.exit(ctx, d, stack, exit.stage, work, false)?;
+            exit_stage(ctx, exit, d, stack, work, l.band.get_mut(k), false)?;
             if noise == LsqmlNoise::Poisson {
                 lk.icalc(ctx, scan, stack, work, &mut l.icalc[k])?;
             }
@@ -1209,7 +1275,7 @@ impl<'a> Bufs<'a> {
         for (k, s) in batch.clone().enumerate() {
             let (stack, work, chi) = (table.at(s), &mut l.work[k], &mut sw.chi[k]);
             lk.chi(ctx, scan, stack, noise, l.scan, work)?;
-            ok.exit(ctx, d, stack, exit.stage, work, true)?;
+            exit_stage(ctx, exit, d, stack, work, l.band.get_mut(k), true)?;
             lk.back(ctx, &w.views, stack, work)?;
             if let Some(phase) = slice_phase(quad, None) {
                 ok.slice_phase(ctx, d, stack, phase, work, true)?;

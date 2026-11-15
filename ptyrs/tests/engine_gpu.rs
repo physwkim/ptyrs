@@ -828,7 +828,7 @@ fn ring_record_of_the_first_frames_matches_the_cpu_llk() {
         let end = stacks[*landed.last().unwrap()].end;
         ring.device().count(&ex, counted..end, &dev_counts).unwrap();
         counted = end;
-        let mut rec = ring.device().record();
+        let mut rec = ring.record(&ex, r, n).unwrap();
         for &s in &landed {
             let stack = table.at(s);
             kernels
@@ -843,8 +843,7 @@ fn ring_record_of_the_first_frames_matches_the_cpu_llk() {
                 .unwrap();
             rec.push(&ex, &dims, stack, &partials).unwrap();
         }
-        let ended = rec.end(&ex).unwrap();
-        ring.enqueued(&ex, &ended, r, n).unwrap();
+        rec.end(&ex).unwrap();
     }
 
     let obs = Observed::from_counts(&counts);
