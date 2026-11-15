@@ -1693,5 +1693,68 @@ mod tests {
                 );
             }
         }
+
+        /// An engine with graphs and a held position, whose buffers left the LLK pass's
+        /// capture pending.
+        fn pending(ctx: &Arc<CudaContext>) -> GpuPtycho {
+            let offsets = (0..36).map(|f| [0.1 * (f % 3) as f64 - 0.1, 0.05]);
+            let held = Features {
+                position: Some(Feature::held(offsets.collect())),
+                ..Features::default()
+            };
+            let mut e = engine(ctx, true, true);
+            e.set_features(&held).unwrap();
+            e
+        }
+
+        /// An LLK read failing its pending capture leaves the engine open: the next captures
+        /// it, which the one after replays, and LLK and AP after it are bit for bit a fresh
+        /// engine's.
+        #[test]
+        fn an_llk_read_failing_its_capture_leaves_the_engine_open() {
+            let ctx = ctx();
+            let [mut e, mut fresh] = [(); 2].map(|()| pending(&ctx));
+            let armed = fault::arm(Exit::Capture, 0);
+            let r = e.llk();
+            assert!(armed.fired());
+            assert!(refused(&r), "{r:?}");
+            drop(armed);
+            let llk = |e: &mut GpuPtycho| {
+                let l = e.llk().unwrap();
+                [l.poisson, l.gaussian, l.euclidian, l.nb_photons_calc].map(f64::to_bits)
+            };
+            assert_eq!(llk(&mut e), llk(&mut fresh), "the LLK");
+            let armed = fault::arm(Exit::Capture, 0);
+            assert_eq!(llk(&mut e), llk(&mut fresh), "the replayed LLK");
+            assert!(!armed.fired(), "the LLK pass captured again");
+            drop(armed);
+            for e in [&mut e, &mut fresh] {
+                e.ap(&ap(false), 1).unwrap();
+            }
+            assert!(arrays(&e) == arrays(&fresh), "the arrays");
+        }
+
+        /// An algorithm call failing a capture aborts: AP at its run's, rPIE at its LLK
+        /// pass's, pending, after its run's.
+        #[test]
+        fn a_call_failing_its_capture_aborts() {
+            let ctx = ctx();
+            let rpie = RpieParams {
+                calc_llk: 1,
+                ..RpieParams::default()
+            };
+            for (what, pass) in [("ap", 0), ("rpie", 1)] {
+                let mut e = pending(&ctx);
+                let armed = fault::arm(Exit::Capture, pass);
+                let r = match what {
+                    "ap" => e.ap(&ap(false), 1),
+                    _ => e.rpie(&rpie, 1),
+                };
+                assert!(armed.fired(), "{what}");
+                assert!(refused(&r), "{what}: {r:?}");
+                drop(armed);
+                aborted(&mut e, what);
+            }
+        }
     }
 }

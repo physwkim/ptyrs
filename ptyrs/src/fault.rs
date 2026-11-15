@@ -45,6 +45,8 @@ pub(crate) enum Exit {
     FeatureCopy,
     /// The shared passes' rebuild for another position model's, after they are built.
     Reshare,
+    /// A graph's capture's, before it begins.
+    Capture,
 }
 
 #[cfg(not(test))]
