@@ -1707,9 +1707,9 @@ mod tests {
             e
         }
 
-        /// An LLK read failing its pending capture leaves the engine open: the next captures
-        /// it, which the one after replays, and LLK and AP after it are bit for bit a fresh
-        /// engine's.
+        /// An LLK read failing its pending capture leaves the engine open and the capture
+        /// pending: the next read tries it again, the one that captures it is replayed by the
+        /// one after, and LLK and AP after it are bit for bit a fresh engine's.
         #[test]
         fn an_llk_read_failing_its_capture_leaves_the_engine_open() {
             let ctx = ctx();
@@ -1718,6 +1718,13 @@ mod tests {
             let r = e.llk();
             assert!(armed.fired());
             assert!(refused(&r), "{r:?}");
+            drop(armed);
+            let armed = fault::arm(Exit::Capture, 0);
+            let r = e.llk();
+            assert!(
+                armed.fired() && refused(&r),
+                "the capture stayed pending: {r:?}"
+            );
             drop(armed);
             let llk = |e: &mut GpuPtycho| {
                 let l = e.llk().unwrap();
