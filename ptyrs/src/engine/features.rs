@@ -9,7 +9,7 @@ use std::ops::Range;
 use crate::base::{C64, Object, Probe, Stack, View};
 
 use crate::engine::ops::{blend, natural};
-use crate::engine::sampling::Sampler;
+use crate::engine::sampling::{OBJ_PCG, Sampler};
 use crate::engine::{EngineError, Fft2, Observed, Ptycho, Sampling, shift};
 
 /// The features of a reconstruction's model intensity, each modelled and refined while set;
@@ -629,7 +629,8 @@ impl Shifted {
     /// preconditioned by `D = Σ|O|² + reg`: `P += α·s`, `s = g / D`, `g = A^H(psi − A·P)`,
     /// `α = <g, s> / (‖A·s‖² + reg·‖s‖²)`. The overlap error `‖psi − A·P‖²` cannot rise, the
     /// fixed points are `g = 0`, and with no move (no offsets, or [`Sampling::FullObject`])
-    /// `α = 1` and this is `blend`. The object takes `blend` of its sums under either model.
+    /// `α = 1` and this is `blend`. The object takes `blend` of its sums under
+    /// [`Sampling::Patch`] and [`Self::solve_obj`] under [`Sampling::FullObject`].
     pub(crate) fn psi_to_obj_probe(
         &self,
         views: &[View],
@@ -639,7 +640,6 @@ impl Shifted {
         [obj_inertia, probe_inertia]: [Option<f64>; 2],
         fft: &Fft2,
     ) {
-        let obj_acc = obj_inertia.map(|_| self.accumulate_obj(views, object.dims(), psi));
         if let Some(inertia) = probe_inertia {
             let n = self.shape[0] * self.shape[1];
             let mut residual = vec![C64::default(); psi.len()];
@@ -681,8 +681,77 @@ impl Shifted {
                 }
             }
         }
-        if let (Some(inertia), Some((num, norm))) = (obj_inertia, obj_acc) {
-            blend(object, &num, &norm, inertia);
+        // The object's sums read `psi` and `self`'s waves, which the probe step leaves.
+        if let Some(inertia) = obj_inertia {
+            match &self.mover {
+                Mover::Probe(_) => {
+                    let (num, norm) = self.accumulate_obj(views, object.dims(), psi);
+                    blend(object, &num, &norm, inertia);
+                }
+                Mover::Object(s) => self.solve_obj(views, s, psi, object, inertia),
+            }
+        }
+    }
+
+    /// Under [`Sampling::FullObject`], the object of `min ‖psi − A·O'‖² + reg·‖O' − O‖²` with
+    /// `A` [`Self::to_psi`] of the object: [`OBJ_PCG`] conjugate-gradient steps on
+    /// `(AᴴA + reg)·O' = Aᴴ·psi + reg·O` from `O`, preconditioned by `D + reg`, `D` the exact
+    /// diagonal of `AᴴA` ([`Sampler::diag`]) and `reg = inertia·max D`. A step along a
+    /// direction of no positive curvature, or after a residual of no positive norm, is 0.
+    /// Where the sampling moves nothing `AᴴA = D`, the first step is `blend` and the rest move
+    /// it within rounding; at sub-pixel positions `AᴴA` couples the pixels, and `blend` with
+    /// the placed `|W|²` for `AᴴA`'s diagonal diverges.
+    fn solve_obj(
+        &self,
+        views: &[View],
+        s: &Sampler,
+        psi: &[C64],
+        object: &mut Object,
+        inertia: f64,
+    ) {
+        let dims = object.dims();
+        let d = s.diag(&self.natural_power(), dims[0]);
+        let reg = d.as_slice().iter().fold(0.0, |a: f64, &b| a.max(b)) * inertia;
+        let pre: Vec<f64> = d.as_slice().iter().map(|d| (d + reg).max(1e-12)).collect();
+        let mut buf = vec![C64::default(); psi.len()];
+        // `AᴴA·x` of an object-shaped `x`.
+        let mut normal = |x: &Object| {
+            self.to_psi(views, x, &mut buf);
+            s.place(&self.natural_num(&buf), dims[0])
+        };
+        let mut r = s.place(&self.natural_num(psi), dims[0]);
+        let ax = normal(object);
+        r.as_mut_slice()
+            .iter_mut()
+            .zip(ax.as_slice())
+            .for_each(|(r, a)| *r -= a);
+        let r = r.as_mut_slice();
+        let mut rz: f64 = r.iter().zip(&pre).map(|(r, m)| r.norm_sqr() / m).sum();
+        let data = r.iter().zip(&pre).map(|(r, m)| r / m).collect();
+        let mut p = Object::new(Stack::from_vec(dims, data).unwrap());
+        for step in 0..OBJ_PCG {
+            let mut ap = normal(&p);
+            let ap = ap.as_mut_slice();
+            ap.iter_mut()
+                .zip(p.as_slice())
+                .for_each(|(a, p)| *a += p * reg);
+            let pap: f64 = p
+                .as_slice()
+                .iter()
+                .zip(&*ap)
+                .map(|(p, a)| (p.conj() * a).re)
+                .sum();
+            let alpha = if pap > 0.0 { rz / pap } else { 0.0 };
+            let x = object.as_mut_slice().iter_mut().zip(p.as_slice());
+            x.for_each(|(x, p)| *x += p * alpha);
+            r.iter_mut().zip(&*ap).for_each(|(r, a)| *r -= a * alpha);
+            if step + 1 < OBJ_PCG {
+                let next: f64 = r.iter().zip(&pre).map(|(r, m)| r.norm_sqr() / m).sum();
+                let beta = if rz > 0.0 { next / rz } else { 0.0 };
+                let it = p.as_mut_slice().iter_mut().zip(&*r).zip(&pre);
+                it.for_each(|((p, r), m)| *p = r / m + *p * beta);
+                rz = next;
+            }
         }
     }
 
@@ -712,9 +781,40 @@ impl Shifted {
         }
     }
 
+    /// Per view, `psi·conj(W)` in the natural layout of [`Sampler::place`]'s patches.
+    fn natural_num(&self, psi: &[C64]) -> Vec<C64> {
+        let [ny, nx] = self.shape;
+        let n = ny * nx;
+        let mut num = vec![C64::default(); psi.len()];
+        for (k, (x, w)) in psi
+            .chunks_exact(n)
+            .zip(self.waves.chunks_exact(n))
+            .enumerate()
+        {
+            for (j, (x, w)) in x.iter().zip(w).enumerate() {
+                num[k * n + shift(j, ny, nx)] = x * w.conj();
+            }
+        }
+        num
+    }
+
+    /// Per view, `|W|²` in the natural layout of [`Sampler::place`]'s patches.
+    fn natural_power(&self) -> Vec<f64> {
+        let [ny, nx] = self.shape;
+        let n = ny * nx;
+        let mut norm = vec![0.0; self.waves.len()];
+        for (k, w) in self.waves.chunks_exact(n).enumerate() {
+            for (j, w) in w.iter().enumerate() {
+                norm[k * n + shift(j, ny, nx)] = w.norm_sqr();
+            }
+        }
+        norm
+    }
+
     /// [`crate::engine::accumulate_obj`] with `W` in place of `q·P`: `num += psi·conj(W)`,
     /// `norm += |W|²` on each view's window, under [`Sampling::FullObject`] placed by the
-    /// sampling's adjoint with `norm`'s real part floored at 0.
+    /// sampling's adjoint with `norm`'s real part floored at 0 (pty-chi's illumination map,
+    /// not `AᴴA`'s diagonal, which [`Sampler::diag`] is).
     pub(crate) fn accumulate_obj(
         &self,
         views: &[View],
@@ -726,20 +826,8 @@ impl Shifted {
         let nxo = obj_dims[2];
         assert_eq!(psi.len(), views.len() * n);
         if let Mover::Object(s) = &self.mover {
-            let mut num = vec![C64::default(); psi.len()];
-            let mut norm = vec![0.0; psi.len()];
-            for (k, (x, w)) in psi
-                .chunks_exact(n)
-                .zip(self.waves.chunks_exact(n))
-                .enumerate()
-            {
-                for (j, (x, w)) in x.iter().zip(w).enumerate() {
-                    let i = k * n + shift(j, ny, nx);
-                    num[i] = x * w.conj();
-                    norm[i] = w.norm_sqr();
-                }
-            }
-            return (s.place(&num, obj_dims[0]), s.place_norm(&norm, obj_dims[0]));
+            let num = s.place(&self.natural_num(psi), obj_dims[0]);
+            return (num, s.place_norm(&self.natural_power(), obj_dims[0]));
         }
         let mut num = Stack::filled(obj_dims, C64::default());
         let mut norm = Stack::filled(obj_dims, 0.0);

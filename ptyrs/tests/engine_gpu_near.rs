@@ -12,7 +12,7 @@ use ptyrs::gpu::FUSED_SIDES;
 
 #[path = "common/near.rs"]
 mod near;
-use near::{NPOS, OPTIONS, PIXEL, WAVELENGTH, cases, drawn_offsets};
+use near::{Case, NPOS, OPTIONS, PIXEL, WAVELENGTH, cases, drawn_offsets};
 
 #[path = "common/worst.rs"]
 mod worst;
@@ -320,13 +320,31 @@ fn assert_close(what: &str, got: &Ended, want: &Ended, tol: [f64; 5]) {
     }
 }
 
-/// AP, DM and RAAR under each propagator with drawn offsets that sample the object, alone
+/// [`full_object_projections_match_cpu`] under the angular-spectrum propagator.
+#[test]
+fn full_object_projections_match_cpu_under_angular_spectrum() {
+    full_object_projections_match_cpu(&cases()[0]);
+}
+
+/// [`full_object_projections_match_cpu`] under the Fresnel transform.
+#[test]
+fn full_object_projections_match_cpu_under_fresnel() {
+    full_object_projections_match_cpu(&cases()[1]);
+}
+
+/// [`full_object_projections_match_cpu`] under the Fresnel transform back.
+#[test]
+fn full_object_projections_match_cpu_under_fresnel_back() {
+    full_object_projections_match_cpu(&cases()[2]);
+}
+
+/// AP, DM and RAAR under `c`'s propagator with drawn offsets that sample the object, alone
 /// and with a scale and a background, against the CPU's under `Sampling::FullObject`,
 /// eagerly and from graphs, over stacks of 8 frames and a last of 6, as
 /// [`projections_match_cpu_under_every_propagator`] holds them; DM's and RAAR's carried exit
-/// waves in f16 against f32 over two cycles, from graphs.
-#[test]
-fn full_object_projections_match_cpu_under_every_propagator() {
+/// waves in f16 against f32 over two cycles, from graphs. A test per propagator, so the
+/// three run side by side: the CPU's object solve is most of each.
+fn full_object_projections_match_cpu(c: &Case) {
     const NCYCLE: usize = 8;
     // Measured worst: LLK 1.8e-5, object 2.0e-3, probe 5.8e-4, features 1.5e-5, offsets
     // 8.0e-6, from DM's drawn offsets under Fresnel, whose LLK rises on the CPU too.
@@ -346,40 +364,37 @@ fn full_object_projections_match_cpu_under_every_propagator() {
         ..moved.clone()
     };
     let ctx = CudaContext::new(0).unwrap();
-    for c in cases() {
-        for (name, on_cpu, on_gpu) in PROJECTIONS {
-            for (label, features) in [("position", &moved), ("modelled", &modelled)] {
-                let run = |graph, psi_f16, ncycle| {
-                    let options = GpuOptions {
-                        graph,
-                        psi_f16,
-                        ..OPTIONS
-                    };
-                    let (object, probe, optics) = (c.object.clone(), c.probe.clone(), c.optics());
-                    let mut gpu =
-                        GpuPtycho::with_optics(&ctx, &c.scan, &optics, object, probe, options)
-                            .unwrap();
-                    gpu.set_sampling(Sampling::FullObject).unwrap();
-                    gpu.set_features(features).unwrap();
-                    on_gpu(&mut gpu, ncycle);
-                    Ended::gpu(&gpu)
+    for (name, on_cpu, on_gpu) in PROJECTIONS {
+        for (label, features) in [("position", &moved), ("modelled", &modelled)] {
+            let run = |graph, psi_f16, ncycle| {
+                let options = GpuOptions {
+                    graph,
+                    psi_f16,
+                    ..OPTIONS
                 };
-                let (object, probe) = (c.object.clone(), c.probe.clone());
-                let mut cpu = Ptycho::with_optics(&c.scan, c.optics(), object, probe).unwrap();
-                cpu.set_sampling(Sampling::FullObject);
-                cpu.set_features(features.clone()).unwrap();
-                on_cpu(&mut cpu, NCYCLE);
-                assert_eq!(cpu.history().len(), NCYCLE);
-                let want = Ended::cpu(&cpu);
-                for graph in [false, true] {
-                    let what = format!("{name} {} {label} graph {graph}", c.name);
-                    assert_close(&what, &run(graph, false, NCYCLE), &want, TOL);
-                }
-                if name != "AP" {
-                    let what = format!("{name} {} {label} f16 against f32", c.name);
-                    let want = run(true, false, NCYCLE_F16);
-                    assert_close(&what, &run(true, true, NCYCLE_F16), &want, TOL_F16);
-                }
+                let (object, probe, optics) = (c.object.clone(), c.probe.clone(), c.optics());
+                let mut gpu =
+                    GpuPtycho::with_optics(&ctx, &c.scan, &optics, object, probe, options).unwrap();
+                gpu.set_sampling(Sampling::FullObject).unwrap();
+                gpu.set_features(features).unwrap();
+                on_gpu(&mut gpu, ncycle);
+                Ended::gpu(&gpu)
+            };
+            let (object, probe) = (c.object.clone(), c.probe.clone());
+            let mut cpu = Ptycho::with_optics(&c.scan, c.optics(), object, probe).unwrap();
+            cpu.set_sampling(Sampling::FullObject);
+            cpu.set_features(features.clone()).unwrap();
+            on_cpu(&mut cpu, NCYCLE);
+            assert_eq!(cpu.history().len(), NCYCLE);
+            let want = Ended::cpu(&cpu);
+            for graph in [false, true] {
+                let what = format!("{name} {} {label} graph {graph}", c.name);
+                assert_close(&what, &run(graph, false, NCYCLE), &want, TOL);
+            }
+            if name != "AP" {
+                let what = format!("{name} {} {label} f16 against f32", c.name);
+                let want = run(true, false, NCYCLE_F16);
+                assert_close(&what, &run(true, true, NCYCLE_F16), &want, TOL_F16);
             }
         }
     }
