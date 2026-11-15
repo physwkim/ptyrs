@@ -25,6 +25,7 @@ use rand_chacha::ChaCha8Rng;
 use crate::base::{C64, Object, Probe, Scan, Stack};
 use crate::engine::{EngineError, GpuOptions, GpuPtycho};
 use crate::nn::NnError;
+use crate::nn::conv::conv;
 use crate::nn::interop::{lend_complex, lend_out_complex};
 use crate::nn::ptychonn::{Block, channels_first};
 
@@ -112,7 +113,7 @@ impl DipNet {
             });
             x = b.forward(Tensor::cat(vec![x_up, s], 3));
         }
-        channels_first(x, |x| self.out.forward(x))
+        conv(&self.out, x)
     }
 }
 

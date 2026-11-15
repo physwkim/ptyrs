@@ -7,6 +7,7 @@ use burn::prelude::Device;
 use cubecl_runtime::config::cache::CacheConfig;
 use cubecl_runtime::config::{CubeClRuntimeConfig, RuntimeConfig};
 
+pub mod conv;
 pub mod data;
 pub mod dip;
 pub mod interop;

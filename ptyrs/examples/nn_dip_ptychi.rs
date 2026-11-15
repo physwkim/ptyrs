@@ -32,6 +32,7 @@ use cuda_core::CudaContext;
 use ptyrs::base::{C64, Object, Probe, Scan, Stack};
 use ptyrs::engine::{GpuOptions, Ptycho};
 use ptyrs::io::{read_cxi, read_modes, write_modes};
+use ptyrs::nn::conv::conv;
 use ptyrs::nn::dip::{Dip, GpuLoss, LossError, ObjectLoss, Prior};
 use ptyrs::nn::norm_relu::norm_relu;
 use rust_hdf5::H5File;
@@ -59,10 +60,6 @@ impl DoubleConv {
 /// neither permutation copies.
 fn channels_first(x: Tensor<4>, f: impl FnOnce(Tensor<4>) -> Tensor<4>) -> Tensor<4> {
     f(x.permute([0, 3, 1, 2])).permute([0, 2, 3, 1])
-}
-
-fn conv(c: &Conv2d, x: Tensor<4>) -> Tensor<4> {
-    channels_first(x, |x| c.forward(x))
 }
 
 /// pty-chi's `UNet` (`reconstructors/nn/models/unet.py`) at its defaults, bilinear upsampling

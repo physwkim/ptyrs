@@ -11,6 +11,7 @@ use burn::tensor::activation::{relu, sigmoid, tanh};
 use burn::tensor::module::{interpolate, max_pool2d};
 use burn::tensor::ops::{InterpolateMode, InterpolateOptions, MaxPoolOptions};
 
+use crate::nn::conv::conv;
 use crate::nn::norm_relu::norm_relu;
 
 /// Two 3×3 same-padded convolutions, each followed by batch normalisation and ReLU, on
@@ -54,10 +55,6 @@ impl Block {
 /// permuted view, so neither permutation copies.
 pub(crate) fn channels_first(x: Tensor<4>, f: impl FnOnce(Tensor<4>) -> Tensor<4>) -> Tensor<4> {
     f(x.permute([0, 3, 1, 2])).permute([0, 2, 3, 1])
-}
-
-fn conv(c: &Conv2d, x: Tensor<4>) -> Tensor<4> {
-    channels_first(x, |x| c.forward(x))
 }
 
 /// `c` followed by `n` at its running statistics as one convolution.
