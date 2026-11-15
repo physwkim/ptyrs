@@ -164,22 +164,29 @@ impl PtychoNN {
     }
 
     /// The [`Activations`] of one frame through a network of [`new`](Self::new)'s `channels`,
-    /// `width` and `depth` on a `[py, px]` image, each side a multiple of `2^depth`.
+    /// `width` and `depth` on a `[py, px]` image, each side a multiple of `2^depth`, or None past
+    /// `u128`.
     pub(crate) fn activations(
         channels: usize,
         width: usize,
         depth: usize,
         [py, px]: [usize; 2],
-    ) -> Activations {
-        let mut act = Activations {
+    ) -> Option<Activations> {
+        let mut act = Some(Activations {
             largest: 0,
             total: 0,
-        };
+        });
         // `tensors` of `channels` over the image halved `k` times.
         let mut add = |tensors: u128, channels: usize, k: usize| {
-            let elements = channels as u128 * ((py >> k) * (px >> k)) as u128;
-            act.largest = act.largest.max(elements);
-            act.total += tensors * elements;
+            act = act.and_then(|a| {
+                let elements = [channels, py >> k, px >> k]
+                    .into_iter()
+                    .try_fold(1u128, |p, n| p.checked_mul(n as u128))?;
+                Some(Activations {
+                    largest: a.largest.max(elements),
+                    total: a.total.checked_add(tensors.checked_mul(elements)?)?,
+                })
+            });
         };
         // The input, then its standardisation's difference and product.
         add(3, channels, 0);
@@ -300,10 +307,10 @@ mod tests {
         let total = 192 + (1024 + 192) + (512 + 96) + 2 * (64 + 64 + 128 + 128 + 192);
         assert_eq!(
             act,
-            Activations {
+            Some(Activations {
                 largest: 4 * 64,
                 total
-            }
+            })
         );
     }
 

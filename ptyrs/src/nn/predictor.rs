@@ -69,8 +69,9 @@ impl PredictorConfig {
         self.frame.map(|n| n / self.bin)
     }
 
-    /// Fails unless [`init`](Self::init) builds a network the nn kernels run on one frame.
-    fn check(&self) -> Result<(), NnError> {
+    /// Fails unless [`init`](Self::init) builds a network the nn kernels run on one frame; that
+    /// frame's activations otherwise.
+    fn check(&self) -> Result<Activations, NnError> {
         let Self {
             frame,
             bin,
@@ -96,26 +97,22 @@ impl PredictorConfig {
                 "frame {frame:?} is not a positive multiple of bin {bin} × 2^depth {depth}"
             ));
         }
-        if self.activations().largest > u128::from(u32::MAX) {
-            return invalid(format!(
+        match PtychoNN::activations(self.input.images(), width, depth, self.patch()) {
+            Some(act) if act.largest <= u128::from(u32::MAX) => Ok(act),
+            _ => invalid(format!(
                 "width {width} over patch {:?} makes an activation of 2³² elements or more",
                 self.patch()
-            ));
+            )),
         }
-        Ok(())
-    }
-
-    fn activations(&self) -> Activations {
-        PtychoNN::activations(self.input.images(), self.width, self.depth, self.patch())
     }
 
     /// Frames one `pass` on `device` holds: each tensor under 2³² elements, the nn kernels'
     /// bound, and within one of cubecl's buffers, and all the pass's tensors within half the
     /// device's memory. Fails unless the config passes its check and one frame fits.
     fn frames_per_call(&self, device: &Device, pass: Pass) -> Result<usize, NnError> {
-        self.check()?;
+        let act = self.check()?;
         let (buffer, memory) = capacity(device)?;
-        match most_frames(self.activations(), pass, buffer, memory) {
+        match most_frames(act, pass, buffer, memory) {
             0 => Err(NnError::Invalid(format!(
                 "one frame of {self:?} does not fit a device of {memory} bytes"
             ))),
@@ -1304,6 +1301,20 @@ pub(crate) mod tests {
             at([65536, 32768], 2).check(),
             Err(NnError::Invalid(_))
         ));
+    }
+
+    /// A patch whose area passes `usize`, or whose activation count passes `u128`, is refused:
+    /// wrapped, it counted no elements, which passed the check and divided by zero in
+    /// `most_frames`.
+    #[test]
+    fn an_activation_past_usize_is_refused() {
+        for (side, depth) in [(1usize << 33, 1), (1 << 36, 3), (1 << 63, 1)] {
+            let config = PredictorConfig::new([side, side], 1).with_depth(depth);
+            assert!(
+                matches!(config.check(), Err(NnError::Invalid(_))),
+                "{config:?}"
+            );
+        }
     }
 
     #[test]
