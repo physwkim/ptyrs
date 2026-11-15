@@ -234,7 +234,9 @@ impl OpticsKernels {
     /// [`Self::exit`] of `stage` as [`ExitStage::Transfer`], the band carried: under
     /// [`BandCarry::Save`] the forward, saving the band, and under [`BandCarry::Restore`]
     /// the adjoint, giving the row transforms of `Vᴴ c - E w`, `E` the projection onto the
-    /// band and `w` the waves whose forward saved the carry.
+    /// band and `w` the waves whose forward saved the carry. `c` comes as the engines'
+    /// far-field passes hand it over, `1 / n` taken ahead of the unnormalized inverse column
+    /// FFT, so an unnormalized inverse row FFT ends the adjoint.
     pub fn exit_banded(
         &self,
         ctx: &ExecutionContext,
@@ -259,10 +261,11 @@ impl OpticsKernels {
             }
             BandCarry::Restore(c) => {
                 self.stage(ctx, &l, stack, work, None, STAGE_PRE_FWD)?;
-                // Less `E w`'s row transforms, `F_y⁻¹ M F_y` of `w`'s with `M` the band's
-                // indicator: ahead of the unnormalized column FFT, `M / ny` times the saved
-                // unnormalized `F_y⁻¹`, in the bins it was saved from as `M` is even.
-                let restore = Carried::Restore(c, -1.0 / d.frame[0] as f32);
+                // Less `E w`'s row transforms at `c`'s scale, `F_y⁻¹ M F_y / nx` of `w`'s
+                // with `M` the band's indicator: ahead of the unnormalized column FFT, `M / n`
+                // times the saved unnormalized `F_y⁻¹`, in the bins it was saved from as `M`
+                // is even.
+                let restore = Carried::Restore(c, -1.0 / d.n() as f32);
                 let flags = STAGE_COLS | STAGE_MUL | STAGE_CONJ | STAGE_POST_FWD;
                 self.stage(ctx, &l, stack, work, Some(mul(restore)), flags)
             }
