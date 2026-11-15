@@ -613,7 +613,7 @@ impl Bh {
     /// pty-chi's BH models the positions alone; it has neither a per-frame intensity scale
     /// nor a detector background, and those are refused, held or not.
     pub fn with_features(self, features: Features) -> Result<Self, EngineError> {
-        if features.scale.is_some() || features.background.is_some() {
+        if features.models_scale_or_background() {
             return Err(EngineError::Invalid(
                 "BH models no intensity scale or background, as pty-chi's".into(),
             ));

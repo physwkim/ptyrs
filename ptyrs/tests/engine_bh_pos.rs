@@ -196,3 +196,41 @@ fn full_object_mini_batch_matches_ptychi() {
         include_str!("engine/data/bh_full_object_mini_offsets_f64.txt"),
     );
 }
+
+/// pty-chi's BH has no per-frame intensity scale or detector background, held or refined.
+#[test]
+fn with_features_refuses_a_scale_or_background() {
+    let params = BhParams {
+        batch_size: 4,
+        probe_rho: 0.01,
+        position_rho: 2.0,
+        seed: 7,
+    };
+    for f in [
+        Features {
+            scale: Some(Feature::refined(vec![1.0; 40])),
+            ..Features::default()
+        },
+        Features {
+            background: Some(Feature::refined(vec![0.0; 32 * 32])),
+            ..Features::default()
+        },
+        Features {
+            scale: Some(Feature::held(vec![1.0; 40])),
+            ..Features::default()
+        },
+        Features {
+            background: Some(Feature::held(vec![0.0; 32 * 32])),
+            ..Features::default()
+        },
+    ] {
+        let Err(e) = Bh::new(params).unwrap().with_features(f.clone()) else {
+            panic!("{f:?} accepted");
+        };
+        let e = e.to_string();
+        assert!(
+            e.contains("BH models no intensity scale or background"),
+            "{f:?}: {e}"
+        );
+    }
+}

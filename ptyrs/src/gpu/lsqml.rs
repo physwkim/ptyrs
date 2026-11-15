@@ -29,22 +29,26 @@ use std::ops::Range;
 
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig, RawDeviceBuffer};
-use ptyrs_kernels::fused::{FUSED_COLS, FUSED_DOWN, FusedCfg, FusedPtrs};
+use ptyrs_kernels::fused::{FUSED_COLS, FUSED_DOWN, FusedCfg, FusedPtrs, shared_probe};
 use ptyrs_kernels::grad::ObjProbePtrs;
 pub use ptyrs_kernels::lsqml::LSQML_REC;
 use ptyrs_kernels::lsqml::{
     LSQML_CHI, LSQML_DOTS, LSQML_ICALC, LSQML_POISSON, LSQML_XI, LsqmlCols, LsqmlDots, LsqmlFar,
-    LsqmlPre, LsqmlRule, lsqml_kernels,
+    LsqmlFrameDirs, LsqmlPre, LsqmlRule, lsqml_kernels,
 };
 use ptyrs_kernels::pixel::PIXEL_THREADS;
 
 use crate::gpu::fused::{GRID_Y_MAX, Shape, Side, no_psi};
+use crate::gpu::opr::{FrameProbe, OwnModes, shared_src};
 use crate::gpu::ops::grid_1d;
 use crate::gpu::position::{ONE_BLOCK, chunk_grid, chunks, same_dims, span};
 use crate::gpu::{
     BhScan, C32, Error, FrameWaves, Kernels, StackCtl, StackGeom, StackRef, UpdateSums, ViewAddr,
     ViewDims, Views, check_len, dptr,
 };
+
+#[cfg(test)]
+mod opr_tests;
 
 /// The walks of the frame passes over a stack, [`FUSED_DOWN`] or 0, each against the pass
 /// before it in the module doc's order, so it starts on the frames that one touched last,
@@ -185,13 +189,26 @@ fn trim(nb: u32) -> u32 {
 /// A stack's exit-wave update `chi` ([`LsqmlKernels::chi`]) for [`LsqmlKernels::dots`]; with
 /// the waves `w` that stand for each view's `P q`: under the position model the stack's
 /// moved probe ([`crate::gpu::PositionKernels::shift_w`]), on a multislice object's deeper
-/// slice the wave entering it.
+/// slice the wave entering it; or with `own`, each frame's own probe mode 0 under OPR.
 pub enum LsqmlChi<'a> {
     Unmoved(&'a DeviceBuffer<C32>),
     Moved {
         chi: &'a DeviceBuffer<C32>,
         w: FrameWaves<'a>,
     },
+    Own {
+        chi: &'a DeviceBuffer<C32>,
+        own: OwnModes<'a>,
+    },
+}
+
+/// Each frame's probe mode-0 direction `d` and `vv` under OPR, [`crate::gpu::OprPlanes`]'s,
+/// as [`LsqmlKernels::frame_dirs`] writes them: `[nb, n]`, plane `b` the frame at epoch
+/// position `positions.start + b`.
+pub struct FrameDirs<'a> {
+    pub d: &'a mut DeviceBuffer<C32>,
+    pub vv: &'a mut DeviceBuffer<f32>,
+    pub positions: Range<u32>,
 }
 
 /// Values of the object and of the probe.
@@ -377,26 +394,36 @@ impl LsqmlKernels {
         probe: &DeviceBuffer<C32>,
         work: &mut DeviceBuffer<C32>,
     ) -> Result<(), Error> {
+        let probe = FrameProbe::Shared(probe);
+        self.forward_frames(ctx, views, stack, obj, probe, work)
+    }
+
+    /// [`Self::forward`] with the frames' probe from `probe`.
+    pub fn forward_frames(
+        &self,
+        ctx: &ExecutionContext,
+        views: &Views,
+        stack: StackRef<'_>,
+        obj: &DeviceBuffer<C32>,
+        probe: FrameProbe<'_>,
+        work: &mut DeviceBuffer<C32>,
+    ) -> Result<(), Error> {
         let d = views.dims();
         let (sh, g) = (Shape::of(d)?, d.geom(stack)?);
         let [no, np] = lens(d);
         check_len("obj", obj, no)?;
-        check_len("probe", probe, np)?;
+        check_len("probe", probe.probe(), np)?;
         check_len("work", work, g.nf_max as usize * d.nmode as usize * d.n())?;
         let config = sh.rows(&g, true)?;
+        let mut reads = vec![obj.storage(), views.addr().storage(), stack.storage()];
+        reads.extend(probe.storages());
+        let probe = probe.src(d.n())?;
         let p = FusedPtrs {
             obj: dptr::<C32, f32>(obj).cast_const(),
-            probe: dptr::<C32, f32>(probe).cast_const(),
             views: dptr::<ViewAddr, ViewAddr>(views.addr()).cast_const(),
             work: dptr(work),
             ..null_ptrs()
         };
-        let reads = [
-            obj.storage(),
-            probe.storage(),
-            views.addr().storage(),
-            stack.storage(),
-        ];
         let ctl = stack.ctl() as *const StackCtl;
         let cfg = FusedCfg {
             flags: FORWARD,
@@ -409,10 +436,10 @@ impl LsqmlKernels {
             // memory; `Views::new` checked the views are inside the object.
             unsafe {
                 match sh.nx {
-                    Side::N64 => m.fused_rows_fwd_64(stream, config, p, ctl, g, cfg),
-                    Side::N128 => m.fused_rows_fwd_128(stream, config, p, ctl, g, cfg),
-                    Side::N256 => m.fused_rows_fwd_256(stream, config, p, ctl, g, cfg),
-                    Side::N512 => m.fused_rows_fwd_512(stream, config, p, ctl, g, cfg),
+                    Side::N64 => m.fused_rows_fwd_64(stream, config, p, probe, ctl, g, cfg),
+                    Side::N128 => m.fused_rows_fwd_128(stream, config, p, probe, ctl, g, cfg),
+                    Side::N256 => m.fused_rows_fwd_256(stream, config, p, probe, ctl, g, cfg),
+                    Side::N512 => m.fused_rows_fwd_512(stream, config, p, probe, ctl, g, cfg),
                 }
             }
         })
@@ -627,7 +654,9 @@ impl LsqmlKernels {
 
     /// The step-size sums of the stack's frames into `st` from its exit-wave update `chi`;
     /// `views` in epoch order, the scan's or [`window_views`] with `at`'s objects the stack's
-    /// windows. Under [`LsqmlChi::Moved`] the object direction's waves take its `w`.
+    /// windows. Under [`LsqmlChi::Moved`] the object direction's waves take its `w`, under
+    /// [`LsqmlChi::Own`] its probe mode 0 each frame's own; the probe direction's stay on the
+    /// shared probe.
     ///
     /// [`window_views`]: crate::gpu::sampling::window_views
     pub fn dots(
@@ -643,7 +672,9 @@ impl LsqmlKernels {
         st.check_frames(d)?;
         let g = d.geom(stack)?;
         let c = match &chi {
-            LsqmlChi::Unmoved(c) | LsqmlChi::Moved { chi: c, .. } => *c,
+            LsqmlChi::Unmoved(c)
+            | LsqmlChi::Moved { chi: c, .. }
+            | LsqmlChi::Own { chi: c, .. } => *c,
         };
         check_len("chi", c, g.nf_max as usize * d.nmode as usize * d.n())?;
         for (pair, what) in [(at.x, ["obj", "probe"]), (at.d, ["d_obj", "d_probe"])] {
@@ -654,14 +685,21 @@ impl LsqmlKernels {
         let config = chunk_grid(&g, d.n())?;
         let mut reads = vec![c.storage(), views.addr().storage(), stack.storage()];
         reads.extend(at.x.into_iter().chain(at.d).map(|b| b.storage()));
-        let pair = |p: [&DeviceBuffer<C32>; 2]| ObjProbePtrs {
-            obj: dptr::<C32, f32>(p[0]).cast_const(),
-            probe: dptr::<C32, f32>(p[1]).cast_const(),
+        let probe = match &chi {
+            LsqmlChi::Own { own, .. } => {
+                reads.push(own.planes.storage());
+                own.src(at.x[1], d.n())?
+            }
+            _ => shared_src(at.x[1]),
         };
         let p = LsqmlDots {
             chi: dptr::<C32, f32>(c).cast_const(),
-            x: pair(at.x),
-            d: pair(at.d),
+            obj: dptr::<C32, f32>(at.x[0]).cast_const(),
+            probe,
+            d: ObjProbePtrs {
+                obj: dptr::<C32, f32>(at.d[0]).cast_const(),
+                probe: dptr::<C32, f32>(at.d[1]).cast_const(),
+            },
             views: dptr::<ViewAddr, ViewAddr>(views.addr()).cast_const(),
             out: dptr(&st.dots),
         };
@@ -685,6 +723,54 @@ impl LsqmlKernels {
                         .lsqml_dots_shifted(stream, config, p, waves, ctl, g, DOTS)
                 }
             })
+    }
+
+    /// The stack's frames' probe mode-0 directions under OPR into `out` from its exit-wave
+    /// update `chi` on the object `obj`, `views` in epoch order: per frame, over its views on
+    /// probe 0 in ascending order, [`Kernels::psi_to_probe`]'s sums of mode 0. A frame outside
+    /// `out.positions` writes nothing; a frame of it, every pixel of its planes.
+    pub fn frame_dirs(
+        &self,
+        ctx: &ExecutionContext,
+        views: &Views,
+        stack: StackRef<'_>,
+        obj: &DeviceBuffer<C32>,
+        chi: &DeviceBuffer<C32>,
+        out: FrameDirs<'_>,
+    ) -> Result<(), Error> {
+        let d = views.dims();
+        let g = d.geom(stack)?;
+        let n = d.n();
+        let span = span(d, &out.positions)?;
+        check_len("chi", chi, g.nf_max as usize * d.nmode as usize * n)?;
+        check_len("obj", obj, d.obj_len())?;
+        let planes = span.nb as usize * n;
+        check_len("d", out.d, planes)?;
+        check_len("vv", out.vv, planes)?;
+        let config = grid_1d(g.nf_max as usize * n)?;
+        let reads = [
+            chi.storage(),
+            obj.storage(),
+            views.addr().storage(),
+            stack.storage(),
+        ];
+        let p = LsqmlFrameDirs {
+            chi: dptr::<C32, f32>(chi).cast_const(),
+            obj: dptr::<C32, f32>(obj).cast_const(),
+            views: dptr::<ViewAddr, ViewAddr>(views.addr()).cast_const(),
+            d: dptr(out.d),
+            vv: dptr(out.vv),
+        };
+        let ctl = stack.ctl() as *const StackCtl;
+        let writes = [out.d.storage(), out.vv.storage()];
+        self.base.launch(ctx, &reads, &writes, |stream| {
+            // SAFETY: lengths checked above, `out` sized for the span's frames; `Views::new`
+            // checked the views are inside the object.
+            unsafe {
+                self.module
+                    .lsqml_frame_dirs(stream, config, p, span, ctl, g)
+            }
+        })
     }
 
     /// The step sizes of the batch's epoch positions `batch` from the [`Self::dots`] sums of
@@ -916,7 +1002,7 @@ fn null_ptrs() -> FusedPtrs {
         background: std::ptr::null(),
         background_ratio: std::ptr::null_mut(),
         offsets: std::ptr::null(),
-        spectrum: std::ptr::null(),
+        spectrum: shared_probe(std::ptr::null()),
         shift: std::ptr::null_mut(),
         shift_obj: std::ptr::null_mut(),
         shift_power: std::ptr::null_mut(),

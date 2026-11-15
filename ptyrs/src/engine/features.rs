@@ -123,6 +123,11 @@ impl Features {
         self.position.as_ref().is_some_and(|d| d.refine)
     }
 
+    /// Whether an intensity scale or a detector background is modelled, refined or held.
+    pub(crate) fn models_scale_or_background(&self) -> bool {
+        self.scale.is_some() || self.background.is_some()
+    }
+
     /// Every refined feature's step before a cycle models it, from the far field `psi` of the
     /// estimate the cycle starts from (all frames, as [`scale_sums`] takes it) under the
     /// current model, held features' values included: [`scale_step`] of the scale and
