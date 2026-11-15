@@ -523,9 +523,9 @@ impl Samples {
             )));
         }
         let input = diffraction_input(frames, self.kind, config.bin, mean_frame_total(frames))?;
+        let target = object_patches(object, addr, config.patch())?;
         self.input.extend(input);
-        self.target
-            .append(object_patches(object, addr, config.patch())?);
+        self.target.append(target);
         Ok(())
     }
 
@@ -1207,6 +1207,19 @@ mod tests {
         let (_, more) = small(Input::Binned);
         ones.extend(more).unwrap();
         assert_eq!((ones.len(), ones.input().len()), (6, 6 * 64));
+    }
+
+    /// A scan refused part way leaves no inputs without their targets.
+    #[test]
+    fn a_scan_of_another_object_leaves_the_samples_whole() {
+        let (config, mut samples) = small(Input::Binned);
+        let positions = Positions::new(vec![0.0, 0.0, 3.0], vec![-3.0, 3.0, 0.0]).unwrap();
+        let addr = AddrTable::new(&positions, [1.0, 1.0], [16, 16], [32, 32], 1, 1).unwrap();
+        let object = crate::nn::data::random_object([32, 33], 4);
+        let counts = Counts::from_raw([3, 16, 16], vec![1; 3 * 256]).unwrap();
+        let got = samples.push_scan(&config, &counts, &object, &addr);
+        assert!(matches!(got, Err(NnError::Invalid(_))));
+        assert_eq!((samples.len(), samples.input().len()), (3, 3 * 64));
     }
 
     #[test]
