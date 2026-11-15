@@ -29,7 +29,7 @@ use std::ops::Range;
 
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig, RawDeviceBuffer};
-use ptyrs_kernels::fused::{FUSED_COLS, FUSED_DOWN, FusedCfg, FusedPtrs};
+use ptyrs_kernels::fused::{FUSED_COLS, FUSED_DOWN, FusedCfg, FusedPtrs, shared_probe};
 use ptyrs_kernels::grad::ObjProbePtrs;
 pub use ptyrs_kernels::lsqml::LSQML_REC;
 use ptyrs_kernels::lsqml::{
@@ -1002,7 +1002,7 @@ fn null_ptrs() -> FusedPtrs {
         background: std::ptr::null(),
         background_ratio: std::ptr::null_mut(),
         offsets: std::ptr::null(),
-        spectrum: std::ptr::null(),
+        spectrum: shared_probe(std::ptr::null()),
         shift: std::ptr::null_mut(),
         shift_obj: std::ptr::null_mut(),
         shift_power: std::ptr::null_mut(),

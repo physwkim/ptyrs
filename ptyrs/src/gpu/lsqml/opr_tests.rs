@@ -3,22 +3,30 @@
 //! shared-probe path one frame at a time, each frame on its own probe as
 //! `ProbeVariation::unique` gives it: both read the same values in the same order, so they
 //! agree bit for bit. Each frame's probe direction against the CPU's over those views, and bit
-//! for bit against [`Kernels::psi_to_probe`] one frame at a time. The batch starts past
-//! position 0 of an epoch order that is not the scan's, with two probe and two object modes in
-//! stacks of 3 and 2.
+//! for bit against [`Kernels::psi_to_probe`] one frame at a time. The shifted probe on each
+//! frame's own spectra against the same launcher one frame at a time on its own probe, and
+//! against the CPU's move of that probe. The batch starts past position 0 of an epoch order
+//! that is not the scan's, with two probe and two object modes in stacks of 3 and 2.
 
+use std::f64::consts::PI;
 use std::ops::Range;
+use std::slice;
 use std::sync::Arc;
 
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 
 use super::{FrameDirs, LsqmlAt, LsqmlChi, LsqmlKernels, LsqmlScan};
-use crate::base::{C64, Feature, Object, Probe, Stack, View};
-use crate::engine::{ProbeVariation, accumulate_probe};
+use crate::base::{C64, Counts, Feature, Geometry, Object, Probe, Stack, View};
+use crate::engine::{
+    Cost, Features, Lsqml, LsqmlBatch, LsqmlParams, Observed, Optics, ProbeVariation, Sampling,
+    accumulate_probe,
+};
+use crate::gpu::fused::OwnSpectrumBuf;
 use crate::gpu::opr::{FrameProbe, OwnModes};
 use crate::gpu::{
-    C32, EpochOrder, Kernels, Opr, OprKernels, StackTable, UpdateSums, ViewAddr, ViewDims, Views,
+    C32, EpochOrder, FusedInputs, Kernels, Model, Opr, OprKernels, ProbeSpectrum, Shift,
+    SpectrumBuf, StackTable, UpdateSums, ViewAddr, ViewDims, Views,
 };
 use crate::worst::worst_of;
 
@@ -39,6 +47,16 @@ const SHAPE: [usize; 2] = [64, 64];
 const N: usize = SHAPE[0] * SHAPE[1];
 const OBJ: [usize; 2] = [96, 100];
 const QUAD: f32 = 2e-3;
+/// Each epoch position's offsets `(dy, dx)` in pixels, one at zero.
+const OFFSETS: [[f32; 2]; NFRAME] = [
+    [0.3, -1.7],
+    [2.25, 0.5],
+    [-0.6, 3.4],
+    [0.0, 0.0],
+    [-2.1, -0.35],
+    [1.15, 2.6],
+    [-3.3, 0.8],
+];
 
 struct Gpu {
     stream: Arc<CudaStream>,
@@ -523,4 +541,158 @@ fn frame_dirs_match_the_cpu_and_psi_to_probe_frame_by_frame() {
         );
         assert_eq!(bits(&vv[plane]), bits(&den[..N]), "vv at position {p}");
     }
+}
+
+/// The far field whose plane phase is the GPU's `exp(i QUAD r²)`: `π/(λz)·px²` with `px =
+/// λz/(ny d)` is `QUAD`.
+fn optics() -> Optics {
+    let (wavelength, distance) = (1e-10, 1.0);
+    let d = PI * wavelength * distance / (QUAD as f64 * (SHAPE[0] * SHAPE[0]) as f64);
+    Optics::far_field(&Geometry::new(wavelength, distance, d.sqrt(), SHAPE).unwrap())
+}
+
+/// [`LsqmlBatch::adjoint_move`] of `x`, `[NB NP, n]` by batch frame, under a Patch batch whose
+/// frame at epoch position `p` sits at `offsets[p]`: each frame's planes `move_planes` by
+/// `−offsets[p]`.
+fn cpu_move_back(x: &Stack<C64>, offsets: [[f64; 2]; NFRAME]) -> Stack<C64> {
+    let (var, probe) = variation();
+    let mut by_frame = vec![[0.0; 2]; NFRAME];
+    for (&f, &d) in ORDER.iter().zip(&offsets) {
+        by_frame[f as usize] = d;
+    }
+    let params = LsqmlParams {
+        batch_size: NB,
+        cost: Cost::Amplitude,
+        seed: 0,
+    };
+    let features = Features {
+        position: Some(Feature::refined(by_frame)),
+        ..Features::default()
+    };
+    let run = (Lsqml::new(params).unwrap().with_sampling(Sampling::Patch))
+        .with_features(features)
+        .unwrap();
+    let counts = Counts::from_raw([NFRAME, SHAPE[0], SHAPE[1]], vec![0; NFRAME * N]).unwrap();
+    let obs = Observed::from_counts(&counts);
+    let object = Object::new(Stack::from_vec([NOBJ, OBJ[0], OBJ[1]], obj()).unwrap());
+    let (views, optics) = (batch_views(), optics());
+    let objects = slice::from_ref(&object);
+    LsqmlBatch::new(&run, &views, &obs, &optics, objects, &probe, &var).adjoint_move(x)
+}
+
+/// `q·w` of natural-layout planes `w` in the exit waves' layout, origin at `[0, 0]`.
+fn exit_layout(w: &[C64], q: &[C64]) -> Vec<C64> {
+    let [ny, nx] = SHAPE;
+    let mut out = vec![C64::default(); w.len()];
+    for (o, w) in out
+        .as_chunks_mut::<N>()
+        .0
+        .iter_mut()
+        .zip(w.as_chunks::<N>().0)
+    {
+        for (i, (&w, &q)) in w.iter().zip(q).enumerate() {
+            o[(i / nx + ny / 2) % ny * nx + (i % nx + nx / 2) % nx] = q * w;
+        }
+    }
+    out
+}
+
+/// The unnormalized inverse DFT of each row of `t`: [`Shift`]'s `W` of the column transforms
+/// `T` [`Kernels::shifted_probe`] leaves.
+fn rows_inverse(t: &[C32]) -> Vec<C64> {
+    let nx = SHAPE[1];
+    let e: Vec<C64> = (0..nx)
+        .map(|k| C64::from_polar(1.0, 2.0 * PI * k as f64 / nx as f64))
+        .collect();
+    t.chunks_exact(nx)
+        .flat_map(|row| {
+            let e = &e;
+            (0..nx).map(move |x| {
+                (row.iter().enumerate())
+                    .map(|(k, t)| C64::new(t.re as f64, t.im as f64) * e[k * x % nx])
+                    .sum::<C64>()
+            })
+        })
+        .collect()
+}
+
+/// The batch's `T` of [`Kernels::shifted_probe`] at [`OFFSETS`], `[NB NP, n]`: stack `s` of
+/// `stacks` on `probes[s]` and its spectra.
+fn shifted(
+    g: &Gpu,
+    stacks: &[Range<u32>],
+    probes: &[(&DeviceBuffer<C32>, ProbeSpectrum<'_>)],
+) -> Vec<C32> {
+    let table = StackTable::new(&g.stream, &dims(), stacks).unwrap();
+    let nf_max = stacks.iter().map(|r| r.len()).max().unwrap();
+    let mut t = DeviceBuffer::<C32>::zeroed(&g.stream, nf_max * NP * N).unwrap();
+    let counts = DeviceBuffer::<u16>::zeroed(&g.stream, NFRAME * N).unwrap();
+    let obj = up(&g.stream, &obj());
+    let offsets = DeviceBuffer::from_host(&g.stream, OFFSETS.as_flattened()).unwrap();
+    let mut out = Vec::new();
+    for (s, (r, &(probe, spectrum))) in stacks.iter().zip(probes).enumerate() {
+        let inputs = FusedInputs {
+            views: g.order.views(),
+            counts: &counts,
+            obj: &obj,
+            probe,
+            model: Model {
+                shift: Some(Shift {
+                    offsets: &offsets,
+                    spectrum,
+                }),
+                ..Model::default()
+            },
+        };
+        (g.kernels)
+            .shifted_probe(&g.ctx, &inputs, table.at(s), &mut t)
+            .unwrap();
+        out.extend_from_slice(&t.to_host_vec(&g.stream).unwrap()[..r.len() * NP * N]);
+    }
+    out
+}
+
+/// The shifted probe on [`Kernels::own_spectrum`]'s spectra of each frame's own mode 0: the
+/// CPU's move of the frame's own probe, `move_planes` at its offsets
+/// ([`LsqmlBatch::adjoint_move`] at their negatives).
+#[test]
+fn shifted_probe_on_own_spectra_matches_the_cpu_and_each_frame_alone() {
+    let g = gpu();
+    let d = dims();
+    let (var, probe) = variation();
+    let planes = own_planes(&g, &var, &probe);
+    let shared = up(&g.stream, probe.as_slice());
+    let own = OwnModes {
+        planes: &planes,
+        positions: BATCH,
+    };
+    let mut buf = SpectrumBuf::zeroed(&g.stream, &d).unwrap();
+    let spectrum = (g.kernels)
+        .probe_spectrum(&g.ctx, &d, &shared, &mut buf)
+        .unwrap();
+    let mut own_buf = OwnSpectrumBuf::zeroed(&g.stream, &d, NB as u32).unwrap();
+    let own_spectrum = (g.kernels)
+        .own_spectrum(&g.ctx, &d, spectrum, &own, &mut own_buf)
+        .unwrap();
+    let got = shifted(&g, &STACKS, &[(&shared, own_spectrum); 2]);
+    let probes = frame_probes(&g, &probe, &planes);
+    let mut bufs: Vec<_> = (probes.iter())
+        .map(|_| SpectrumBuf::zeroed(&g.stream, &d).unwrap())
+        .collect();
+    let alone: Vec<_> = (probes.iter().zip(&mut bufs))
+        .map(|(p, b)| (p, g.kernels.probe_spectrum(&g.ctx, &d, p, b).unwrap()))
+        .collect();
+    assert_eq!(c_bits(&got), c_bits(&shifted(&g, &single(), &alone)));
+    let (_, uprobe) = var.unique(&batch_views(), &probe);
+    let moved = cpu_move_back(&uprobe, OFFSETS.map(|o| o.map(|o| -f64::from(o))));
+    let want = exit_layout(moved.as_slice(), optics().quad());
+    let err = rel(rows_inverse(&got).into_iter(), &want);
+    eprintln!("W against the CPU's: {err:.3e}");
+    assert!(err <= 2e-6, "W against the CPU's: {err:e}");
+    let plain = shifted(&g, &STACKS, &[(&shared, spectrum); 2]);
+    assert_ne!(
+        c_bits(&plain),
+        c_bits(&got),
+        "the own spectra left T as on the shared spectra"
+    );
 }
