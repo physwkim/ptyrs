@@ -165,8 +165,12 @@ mod tests {
     #[test]
     fn set_fair_changes_only_the_fields_it_is_given() {
         std::thread::spawn(|| {
+            // At or above the inherited nice (suites run under `nice`), since an
+            // unprivileged thread cannot raise its priority; non-zero, so a reset
+            // to 0 shows.
+            let nice = get_attr().unwrap().nice.max(5);
             // SAFETY: lowers the calling thread's own priority.
-            let r = unsafe { libc::setpriority(libc::PRIO_PROCESS, libc::gettid() as u32, 5) };
+            let r = unsafe { libc::setpriority(libc::PRIO_PROCESS, libc::gettid() as u32, nice) };
             assert_eq!(r, 0);
             let base = get_attr().unwrap();
             let fields = |a: SchedAttr| (a.policy, a.nice, a.runtime, a.util_min);
@@ -177,14 +181,17 @@ mod tests {
             .unwrap();
             assert_eq!(
                 fields(get_attr().unwrap()),
-                (base.policy, 5, base.runtime, 512)
+                (base.policy, nice, base.runtime, 512)
             );
             set_fair(FairSched {
                 util_min: 0,
                 slice_ns: 200_000,
             })
             .unwrap();
-            assert_eq!(fields(get_attr().unwrap()), (base.policy, 5, 200_000, 512));
+            assert_eq!(
+                fields(get_attr().unwrap()),
+                (base.policy, nice, 200_000, 512)
+            );
         })
         .join()
         .unwrap();
