@@ -185,13 +185,8 @@ impl Grid {
         if cols == 0 {
             return None;
         }
-        let tx = cols.next_power_of_two().min(32);
-        let ty = UNITS / tx;
-        let blocks = cols.div_ceil(tx);
-        let chunk = rows.div_ceil((512 / blocks.max(1)).max(1)).max(ty * 8);
-        // Group 0 writes each channel's statistics and its dγ and dβ, so it exists over no rows.
-        let groups = rows.div_ceil(chunk).max(1);
-        let cubes = groups * blocks;
+        let (tx, chunk, groups) = layout(rows, cols);
+        let cubes = groups * cols.div_ceil(tx);
         Some(Self {
             rows,
             cols,
@@ -199,7 +194,7 @@ impl Grid {
             groups,
             cubes,
             count: grid(&x.client, cubes),
-            dim: CubeDim::new_2d(tx as u32, ty as u32),
+            dim: CubeDim::new_2d(tx as u32, (UNITS / tx) as u32),
         })
     }
 
@@ -210,6 +205,19 @@ impl Grid {
         [self.rows, self.cols, self.chunk, self.groups, self.cubes]
             .map(|n| u32::try_from(n).expect("a norm_relu size below 2³²"))
     }
+}
+
+/// A [`Grid`] over `[rows, cols]`, `cols` at least 1: its cubes' width `tx` in channels, and its
+/// `chunk` and `groups`.
+fn layout(rows: usize, cols: usize) -> (usize, usize, usize) {
+    let tx = cols.next_power_of_two().min(32);
+    let blocks = cols.div_ceil(tx);
+    let chunk = rows
+        .div_ceil((512 / blocks.max(1)).max(1))
+        .max(UNITS / tx * 8);
+    // Group 0 writes each channel's statistics and its dγ and dβ, so it exists over no rows.
+    let groups = rows.div_ceil(chunk).max(1);
+    (tx, chunk, groups)
 }
 
 /// An uninitialised tensor of `shape` on `like`'s device, in its float type.
@@ -399,21 +407,37 @@ mod kernel {
         CUBE_POS % groups as usize
     }
 
-    /// This unit's channel, or `cols` and beyond for a lane past the last one.
+    // Sizes are 32 bits, so an index past its bound may wrap below it: the helpers below add to
+    // an index at most the distance to its bound.
+
+    /// This unit's channel, or `cols` for a lane past the last one.
     #[cube]
-    fn channel(groups: u32) -> usize {
-        CUBE_POS / groups as usize * CUBE_DIM_X as usize + UNIT_POS_X as usize
+    fn channel(cols: u32, groups: u32) -> usize {
+        let cols = cols as usize;
+        // The cube's first channel, below `cols`.
+        let first = CUBE_POS / groups as usize * CUBE_DIM_X as usize;
+        first + (UNIT_POS_X as usize).min(cols - first)
     }
 
     /// This cube's rows, `start..end`.
     #[cube]
     fn span(rows: u32, chunk: u32, groups: u32) -> (usize, usize) {
+        let rows = rows as usize;
+        // At most `rows`, which it equals only over no rows.
         let start = group(groups) * chunk as usize;
-        let mut end = start + chunk as usize;
-        if end > rows as usize {
-            end = rows as usize;
-        }
-        (start, end)
+        (start, start + (chunk as usize).min(rows - start))
+    }
+
+    /// This unit's first row of `start..end`, or `end`.
+    #[cube]
+    fn first_row(start: usize, end: usize) -> usize {
+        start + (UNIT_POS_Y as usize).min(end - start)
+    }
+
+    /// This unit's row after `r`, of `..end`, or `end`.
+    #[cube]
+    fn next_row(r: usize, end: usize) -> usize {
+        r + (CUBE_DIM_Y as usize).min(end - r)
     }
 
     /// The sum of `v` over the cube's rows of units, given to every unit of the column.
@@ -460,10 +484,10 @@ mod kernel {
     ) -> F {
         let mut acc = F::new(0.0_f32);
         if c < cols as usize {
-            let mut g = UNIT_POS_Y as usize;
+            let mut g = first_row(0, groups as usize);
             while g < groups as usize {
                 acc += parts[g * cols as usize + c];
-                g += CUBE_DIM_Y as usize;
+                g = next_row(g, groups as usize);
             }
         }
         sum_y::<F>(shared, acc)
@@ -485,14 +509,14 @@ mod kernel {
             terminate!();
         }
         let mut shared = Shared::new_slice(units);
-        let c = channel(groups);
+        let c = channel(cols, groups);
         let (start, end) = span(rows, chunk, groups);
         let mut acc = F::new(0.0_f32);
         if c < cols as usize {
-            let mut r = start + UNIT_POS_Y as usize;
+            let mut r = first_row(start, end);
             while r < end {
                 acc += x[r * cols as usize + c];
-                r += CUBE_DIM_Y as usize;
+                r = next_row(r, end);
             }
         }
         let s = sum_y::<F>(&mut shared, acc);
@@ -518,16 +542,16 @@ mod kernel {
             terminate!();
         }
         let mut shared = Shared::new_slice(units);
-        let c = channel(groups);
+        let c = channel(cols, groups);
         let (start, end) = span(rows, chunk, groups);
         let mean = total::<F>(&mut shared, sums, c, cols, groups) / F::cast_from(rows);
         let mut acc = F::new(0.0_f32);
         if c < cols as usize {
-            let mut r = start + UNIT_POS_Y as usize;
+            let mut r = first_row(start, end);
             while r < end {
                 let d = x[r * cols as usize + c] - mean;
                 acc += d * d;
-                r += CUBE_DIM_Y as usize;
+                r = next_row(r, end);
             }
         }
         let s = sum_y::<F>(&mut shared, acc);
@@ -559,7 +583,7 @@ mod kernel {
             terminate!();
         }
         let mut shared = Shared::new_slice(units);
-        let c = channel(groups);
+        let c = channel(cols, groups);
         let (start, end) = span(rows, chunk, groups);
         let n = F::cast_from(rows);
         let mean = total::<F>(&mut shared, sums, c, cols, groups) / n;
@@ -568,12 +592,12 @@ mod kernel {
             // burn's order: ((x - mean) / std) * gamma + beta.
             let std = F::sqrt(var + eps.get::<F>());
             let (g, b) = (gamma[c], beta[c]);
-            let mut r = start + UNIT_POS_Y as usize;
+            let mut r = first_row(start, end);
             while r < end {
                 let i = r * cols as usize + c;
                 let z = (x[i] - mean) / std * g + b;
                 y[i] = relu::<F>(z);
-                r += CUBE_DIM_Y as usize;
+                r = next_row(r, end);
             }
             if group(groups) == 0 && UNIT_POS_Y == 0 {
                 mean_out[c] = mean;
@@ -605,20 +629,20 @@ mod kernel {
             terminate!();
         }
         let mut shared = Shared::new_slice(units);
-        let c = channel(groups);
+        let c = channel(cols, groups);
         let (start, end) = span(rows, chunk, groups);
         let mut db = F::new(0.0_f32);
         let mut dg = F::new(0.0_f32);
         if c < cols as usize {
             let m = mean[c];
             let rstd = F::new(1.0_f32) / F::sqrt(var[c] + eps.get::<F>());
-            let mut r = start + UNIT_POS_Y as usize;
+            let mut r = first_row(start, end);
             while r < end {
                 let i = r * cols as usize + c;
                 let dz = relu_grad::<F>(y[i], dy[i]);
                 db += dz;
                 dg += dz * ((x[i] - m) * rstd);
-                r += CUBE_DIM_Y as usize;
+                r = next_row(r, end);
             }
         }
         let db = sum_y::<F>(&mut shared, db);
@@ -658,7 +682,7 @@ mod kernel {
             terminate!();
         }
         let mut shared = Shared::new_slice(units);
-        let c = channel(groups);
+        let c = channel(cols, groups);
         let (start, end) = span(rows, chunk, groups);
         let db = total::<F>(&mut shared, shifts, c, cols, groups);
         let dg = total::<F>(&mut shared, scales, c, cols, groups);
@@ -668,13 +692,13 @@ mod kernel {
             let rstd = F::new(1.0_f32) / F::sqrt(var[c] + eps.get::<F>());
             let (mean_db, mean_dg) = (db / n, dg / n);
             let scale = gamma[c] * rstd;
-            let mut r = start + UNIT_POS_Y as usize;
+            let mut r = first_row(start, end);
             while r < end {
                 let i = r * cols as usize + c;
                 let dz = relu_grad::<F>(y[i], dy[i]);
                 let xhat = (x[i] - m) * rstd;
                 dx[i] = scale * (dz - mean_db - xhat * mean_dg);
-                r += CUBE_DIM_Y as usize;
+                r = next_row(r, end);
             }
             if group(groups) == 0 && UNIT_POS_Y == 0 {
                 dgamma[c] = dg;
@@ -897,6 +921,54 @@ mod tests {
             .try_into_primitive::<CubeBackend>()
             .unwrap();
         forward(x, broadcast([1 << 32]), broadcast([1 << 32]), 1e-5);
+    }
+
+    /// The kernels' `span` of group `g`, in 32 bits with every operation checked.
+    fn span(rows: u32, chunk: u32, g: u32) -> (u32, u32) {
+        let start = g.checked_mul(chunk).unwrap();
+        let end = start.checked_add(chunk.min(rows.checked_sub(start).unwrap()));
+        (start, end.unwrap())
+    }
+
+    /// The kernels' `next_row`, and their `first_row` for unit `step`, checked as [`span`] is.
+    fn next_row(r: u32, end: u32, step: u32) -> u32 {
+        r.checked_add(step.min(end.checked_sub(r).unwrap()))
+            .unwrap()
+    }
+
+    /// One channel of 2³² - 511, 2³² - 255 and 2³² - 1 rows, where the last group's `start + chunk`
+    /// and, from 2³² - 255, a unit's step past its last row wrapped past 2³². The kernels' row
+    /// arithmetic is run here on the host: no f16 tensor of that many elements fits the 8190 MiB a
+    /// buffer may take on the GPUs here. Each group's span follows the last, and the last group's
+    /// units visit its rows once each and stop at its end.
+    #[test]
+    fn rows_near_2_32_stay_in_32_bits() {
+        for rows in [u32::MAX - 510, u32::MAX - 254, u32::MAX] {
+            let (tx, chunk, groups) = layout(rows as usize, 1);
+            let ty = (UNITS / tx) as u32;
+            let [chunk, groups] = [chunk, groups].map(|v| u32::try_from(v).unwrap());
+            let mut next = 0;
+            for g in 0..groups {
+                let (start, end) = span(rows, chunk, g);
+                assert_eq!(start, next);
+                next = end;
+            }
+            assert_eq!(next, rows);
+            let (start, end) = span(rows, chunk, groups - 1);
+            assert_eq!(start.checked_add(chunk), None);
+            let (mut seen, mut wrapped) = (0, false);
+            for y in 0..ty {
+                let mut r = next_row(start, end, y);
+                while r < end {
+                    seen += 1;
+                    wrapped |= r.checked_add(ty).is_none();
+                    r = next_row(r, end, ty);
+                }
+                assert_eq!(r, end);
+            }
+            assert_eq!(seen, end - start);
+            assert_eq!(wrapped, rows > u32::MAX - 256);
+        }
     }
 
     /// Through `norm_relu`, an activation of no channels stays empty, and over no rows the running

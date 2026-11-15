@@ -363,11 +363,7 @@ fn weight_grad(x: CubeTensor, dy: CubeTensor, bias: bool) -> (CubeTensor, Option
     // bounds `ci`; `across · down` is at most `len`, so `[bands, len]` bounds the rest.
     // The cubes of `a = 0` sum the bias gradient, so they are there even for no input channels.
     let (across, down) = (ci.div_ceil(LANES).max(1), co.div_ceil(PER * WARPS));
-    let strips = w.div_ceil(LANES);
-    // A band holds at least one row.
-    let split = (CUBES / (across * down * n * strips)).clamp(1, h);
-    let rows = h.div_ceil(split);
-    let blocks = h.div_ceil(rows);
+    let [strips, rows, blocks] = bands_of(n, h, w, across * down);
     let bands = n * blocks * strips;
     let cubes = across * bands * down;
     check_elements(&[&[bands, len]]);
@@ -419,6 +415,17 @@ fn weight_grad(x: CubeTensor, dy: CubeTensor, bias: bool) -> (CubeTensor, Option
         );
     }
     (dw, db)
+}
+
+/// How [`weight_grad`] bands `[n, h, w]`, each of `n`, `h` and `w` at least 1, against `pairs`
+/// blocks of input and output channels: into `strips` columns of `LANES` pixels by `blocks` runs
+/// of `rows` rows of each image.
+fn bands_of(n: usize, h: usize, w: usize, pairs: usize) -> [usize; 3] {
+    let strips = w.div_ceil(LANES);
+    // A band holds at least one row.
+    let split = (CUBES / (pairs * n * strips)).clamp(1, h);
+    let rows = h.div_ceil(split);
+    [strips, rows, h.div_ceil(rows)]
 }
 
 /// Pixel rows a cube of `conv3x3` takes.
@@ -545,6 +552,13 @@ mod kernel {
     use burn_cubecl::cubecl;
     use cubecl::prelude::*;
 
+    /// Whether pixel `origin + offset - 1` lies in `0..extent`, `origin` at most `extent`, found
+    /// without forming it: sizes are 32 bits, so past `extent` it could wrap below it.
+    #[cube]
+    fn bordered(origin: usize, offset: usize, extent: usize) -> bool {
+        (offset >= 1 || origin >= 1) && offset <= extent - origin
+    }
+
     /// One band's partial weight gradient. For each row of its band the cube stages the strip of
     /// `dy` for its output channels, and keeps the strip of `x` for its input channels, one pixel
     /// wider on each side, for that row and the rows above and below in a ring of three, so each
@@ -611,12 +625,12 @@ mod kernel {
         let (strips, blocks) = (strips as usize, blocks as usize);
         let x0 = (band % strips) * tile;
         let image = band / strips / blocks;
+        // Sizes are 32 bits, so an index past its bound may wrap below it: offsets are bounded by
+        // what is left past the origins `x0`, `y0`, `ci0` and `co0`, at most `w`, `h`, `ci` and `co`.
         let y0 = (band / strips % blocks) * rows as usize;
-        let mut y1 = y0 + rows as usize;
-        if y1 > h {
-            y1 = h;
-        }
-        // Rows of `x` are counted from one above the image, so row `s` is the image's `s - 1`.
+        let y1 = y0 + (rows as usize).min(h - y0);
+        // Rows of `x` are counted from one above the image, so row `y0 + u` is the image's
+        // `y0 + u - 1`, and is staged in slot `u % 3`.
         let first = image * h;
         let reads = y1 - y0 + 2;
         // Step `t` stages the row of `x` read at step `t - 1` and, from the fourth, the row of
@@ -625,7 +639,7 @@ mod kernel {
         let mut t = 0;
         while t <= reads {
             if t >= 1 {
-                let slot = ((y0 + t - 1) % 3) * xrow;
+                let slot = ((t - 1) % 3) * xrow;
                 #[unroll]
                 for i in 0..xloads {
                     let e = unit + i * units;
@@ -645,14 +659,15 @@ mod kernel {
             }
             sync_cube();
             if t < reads {
-                let s = y0 + t;
+                // Whether row `y0 + t` of `x` is one of the image's.
+                let inside = bordered(y0, t, h);
                 #[unroll]
                 for i in 0..xloads {
                     let e = unit + i * units;
                     let (j, c) = (e / lanes, e % lanes);
                     let mut v = F::new(0.0_f32);
-                    if e < xrow && s >= 1 && s <= h && x0 + j >= 1 && x0 + j <= w && ci0 + c < ci {
-                        v = x[((first + s - 1) * w + x0 + j - 1) * ci + ci0 + c];
+                    if e < xrow && inside && bordered(x0, j, w) && c < ci - ci0 {
+                        v = x[((first + y0 + t - 1) * w + x0 + j - 1) * ci + ci0 + c];
                     }
                     xr[i] = v;
                 }
@@ -663,7 +678,7 @@ mod kernel {
                         let e = unit + i * units;
                         let (p, o) = (e / outs, e % outs);
                         let mut v = F::new(0.0_f32);
-                        if e < gsize && x0 + p < w && co0 + o < co {
+                        if e < gsize && p < w - x0 && o < co - co0 {
                             v = dy[(row * w + x0 + p) * co + co0 + o];
                         }
                         gr[i] = v;
@@ -689,7 +704,7 @@ mod kernel {
                         }
                         #[unroll]
                         for ky in 0..3 {
-                            let base = ((y0 + t - 3 + ky) % 3) * xrow + l;
+                            let base = ((t + ky) % 3) * xrow + l;
                             #[unroll]
                             for kx in 0..3 {
                                 let v = xs[base + (p + kx) * lanes];
@@ -714,7 +729,7 @@ mod kernel {
                 gs[l * outs + k0 + k] = bacc[k];
             }
             sync_cube();
-            if ci0 == 0 && unit < outs && co0 + unit < co {
+            if ci0 == 0 && unit < outs && unit < co - co0 {
                 let mut sum = F::new(0.0_f32);
                 #[unroll]
                 for j in 0..lanes {
@@ -723,12 +738,12 @@ mod kernel {
                 parts[at + co * ci * 9 + co0 + unit] = sum;
             }
         }
-        let c = ci0 + l;
-        if c < ci {
+        if l < ci - ci0 {
+            let c = ci0 + l;
             #[unroll]
             for k in 0..per {
-                let o = co0 + k0 + k;
-                if o < co {
+                if k0 + k < co - co0 {
+                    let o = co0 + k0 + k;
                     #[unroll]
                     for t in 0..9 {
                         parts[at + (o * ci + c) * 9 + t] = acc[k * 9 + t];
@@ -858,13 +873,10 @@ mod kernel {
                     // Pixel `(r, s)` of the bordered tile is the image's `(y0 + r - 1, x0 + s - 1)`.
                     let (r, s) = (q / span, q % span);
                     let mut v = F::new(0.0_f32);
-                    if e < xsize
-                        && y0 + r >= 1
-                        && y0 + r <= h
-                        && x0 + s >= 1
-                        && x0 + s <= w
-                        && c0 + c < a
-                    {
+                    // Sizes are 32 bits, so an index past its bound may wrap below it: offsets are
+                    // bounded by what is left past the origins `y0`, `x0`, `c0` and `o0`, at most
+                    // `h`, `w`, `a` and `b`.
+                    if e < xsize && bordered(y0, r, h) && bordered(x0, s, w) && c < a - c0 {
                         v = x[((image * h + y0 + r - 1) * w + x0 + s - 1) * a + c0 + c];
                     }
                     xr[i] = v;
@@ -874,7 +886,7 @@ mod kernel {
                     let e = unit + i * units;
                     let (c, tap, o) = (e / comptime!(9 * outs), e / outs % 9, e % outs);
                     let mut v = F::new(0.0_f32);
-                    if e < wsize && c0 + c < a && o0 + o < b {
+                    if e < wsize && c < a - c0 && o < b - o0 {
                         v = wk[((c0 + c) * 9 + tap) * b + o0 + o];
                     }
                     wr[i] = v;
@@ -910,17 +922,16 @@ mod kernel {
             sync_cube();
             t += 1;
         }
-        let col = x0 + j;
-        if col < w {
+        // Bounded as the reads are.
+        if j < w - x0 {
             #[unroll]
             for r in 0..rows {
-                let row = y0 + r;
-                if row < h {
-                    let at = ((image * h + row) * w + col) * b;
+                if r < h - y0 {
+                    let at = ((image * h + y0 + r) * w + x0 + j) * b;
                     #[unroll]
                     for k in 0..per {
-                        let o = o0 + k0 + k;
-                        if o < b {
+                        if k0 + k < b - o0 {
+                            let o = o0 + k0 + k;
                             let v = acc[r * per + k];
                             #[comptime]
                             let v = match bias {
@@ -1471,6 +1482,64 @@ mod tests {
     #[should_panic(expected = "a launch of fewer than 2³² elements per tensor")]
     fn arranged_weight_of_more_than_2_32_elements() {
         arrange(broadcast([1 << 16, 7282, 3, 3]), false);
+    }
+
+    /// The kernels' `bordered`, in 32 bits with every operation checked.
+    fn bordered(origin: u32, offset: u32, extent: u32) -> bool {
+        (offset >= 1 || origin >= 1) && offset <= extent.checked_sub(origin).unwrap()
+    }
+
+    /// The bordered last tile of `conv3x3`'s rows and columns and `weight_parts`' columns over
+    /// extents within a tile of 2³², where the pixels past it wrapped past 2³²: `bordered` takes
+    /// those of the extent. The kernels' arithmetic is run here on the host: no f16 tensor of that
+    /// many elements fits the 8190 MiB a buffer may take on the GPUs here.
+    #[test]
+    fn borders_near_2_32_stay_in_32_bits() {
+        let mut wrapped = false;
+        for tile in [ROWS, COLS, LANES] {
+            for extent in u32::MAX - tile as u32 - 1..=u32::MAX {
+                let origin = (u64::from(extent).div_ceil(tile as u64) - 1) * tile as u64;
+                for offset in 0..tile as u64 + 2 {
+                    let pixel = origin + offset;
+                    let inside = (1..=u64::from(extent)).contains(&pixel);
+                    let at = [origin, offset].map(|v| u32::try_from(v).unwrap());
+                    assert_eq!(bordered(at[0], at[1], extent), inside);
+                    wrapped |= pixel > u64::from(u32::MAX);
+                }
+            }
+        }
+        assert!(wrapped);
+    }
+
+    /// `weight_parts`' rows over one column and channel of one image of 2³² - 511 and 2³² - 1 rows,
+    /// where its last band's `y0 + rows` wrapped past 2³² and, at 2³² - 1, so did the row below
+    /// its last. Run on the host as [`borders_near_2_32_stay_in_32_bits`] is: the last band ends
+    /// at the image's, and reads each row of `x` from the one above it once and each row of `dy`
+    /// in it once.
+    #[test]
+    fn weight_gradient_rows_near_2_32_stay_in_32_bits() {
+        for h in [u32::MAX - 510, u32::MAX] {
+            let [_, rows, blocks] =
+                bands_of(1, h as usize, 1, 1).map(|v| u32::try_from(v).unwrap());
+            let y0 = (blocks - 1).checked_mul(rows).unwrap();
+            assert_eq!(y0.checked_add(rows), None);
+            let y1 = y0.checked_add(rows.min(h - y0)).unwrap();
+            assert_eq!(y1, h);
+            let reads = (y1 - y0).checked_add(2).unwrap();
+            let (mut xs, mut dys) = (0, 0);
+            for t in 0..reads {
+                if bordered(y0, t, h) {
+                    assert!(y0.checked_add(t).unwrap() - 1 < h);
+                    xs += 1;
+                }
+                if t >= 2 {
+                    assert!(y0.checked_add(t - 2).unwrap() < h);
+                    dys += 1;
+                }
+            }
+            assert_eq!([xs, dys], [h - y0 + 1, h - y0]);
+            assert_eq!(y0.checked_add(reads - 1).is_none(), h == u32::MAX);
+        }
     }
 
     /// f16 and bf16 take burn's path, which sums wider than the activation, so they match it bit
