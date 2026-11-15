@@ -2437,7 +2437,7 @@ impl Device {
         if self.bh_state.as_ref().is_some_and(|s| s.moved.is_some()) {
             self.bh_state = None;
         }
-        if self.lsqml.as_ref().is_some_and(|s| s.moved()) {
+        if self.lsqml.as_ref().is_some_and(|s| s.reads().is_some()) {
             self.lsqml = None;
         }
         if let Some((p, mover)) = self.features.position.as_mut().zip(mover) {
@@ -2848,22 +2848,22 @@ impl Device {
         Ok(())
     }
 
-    /// Builds the [`LsqmlState`] for `params`' batch size and the position model unless it is
-    /// built, replaced as [`Self::build_bh`] replaces BH's.
+    /// Builds the [`LsqmlState`] for `params`' batch size, the position model and its sampling
+    /// unless it is built, replaced as [`Self::build_bh`] replaces BH's.
     fn build_lsqml(&mut self, params: &LsqmlParams) -> Result<(), EngineError> {
         let size = to_u32(
             "batch_size",
             params.batch_size.min(self.dims().nframe as usize),
         )?;
-        let moved = self.features.positioned();
-        if (self.lsqml.as_ref()).is_none_or(|s| s.size() != size || s.moved() != moved) {
+        let reads = self.features.positioned().then_some(self.sampling);
+        if (self.lsqml.as_ref()).is_none_or(|s| s.size() != size || s.reads() != reads) {
             let state = LsqmlState::new(
                 &self.stream,
                 &self.kernels,
                 &self.views,
                 size,
                 self.rule,
-                moved.then(|| self.moved_scratch()),
+                reads.map(|_| self.moved_scratch()),
                 self.deeper().len(),
             )?;
             self.lsqml = Some(Box::new(state));

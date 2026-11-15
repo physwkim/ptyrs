@@ -34,7 +34,7 @@ use super::{
 };
 use crate::engine::features::{POSITION_LIMIT, POSITION_STEP};
 use crate::engine::ptycho::{Algorithm, llk_due};
-use crate::engine::{Cost, EngineError, LsqmlParams, LsqmlStep, random_batches};
+use crate::engine::{Cost, EngineError, LsqmlParams, LsqmlStep, Sampling, random_batches};
 
 /// What an epoch does to the object preconditioner before its batches, on
 /// [`crate::engine::Lsqml::epoch`]'s schedule: the first epoch of a call builds it, epochs 1–9 and
@@ -383,21 +383,16 @@ impl LsqmlState {
                 let plane1 = plane_bytes::<C32>(dims, 1);
                 let win = plane_bytes::<C32>(dims, dims.nobj);
                 let den = plane_bytes::<f32>(dims, dims.nobj);
-                vec![
-                    Streamed::fixed(held, 0..=2),
-                    Streamed::new(wave, 3..=7),
-                    Streamed::new(wave, 8..=18),
-                    Streamed::fixed(held, 9..=11),
-                    Streamed::fixed(held, 12..=14),
-                    Streamed::new(plane1, 11..=15),
-                    Streamed::new(plane1, 14..=15),
-                    Streamed::new(den, 16..=18),
-                    Streamed::new(win, 17..=20),
-                    Streamed::fixed(acc, 19..=24),
-                    Streamed::fixed(scratch, 20..=22),
-                    Streamed::fixed(held, 25..=27),
-                    Streamed::new(win, 27..=28),
+                [
+                    Streamed::chunked(held, 0..=2, &[(win, 2)], &[]),
+                    vec![Streamed::new(wave, 3..=7), Streamed::new(wave, 8..=18)],
+                    Streamed::chunked(held, 9..=11, &[(plane1, 15)], &[]),
+                    Streamed::chunked(held, 12..=14, &[(plane1, 15)], &[]),
+                    vec![Streamed::new(den, 16..=18), Streamed::fixed(acc, 19..=24)],
+                    Streamed::chunked(scratch, 20..=22, &[], &[(win, 17)]),
+                    Streamed::chunked(held, 25..=27, &[(win, 28)], &[]),
                 ]
+                .concat()
             }
         };
         let frames = rule.frames(&streamed)?;
@@ -491,9 +486,13 @@ impl LsqmlState {
         self.size
     }
 
-    /// Whether the state is the position model's.
-    pub(super) fn moved(&self) -> bool {
-        !matches!(self.reading, Reading::Patch)
+    /// The sampling its views read the object under, if the state is the position model's.
+    pub(super) fn reads(&self) -> Option<Sampling> {
+        match self.reading {
+            Reading::Patch => None,
+            Reading::Moved(_) => Some(Sampling::Patch),
+            Reading::Windows { .. } => Some(Sampling::FullObject),
+        }
     }
 
     /// Sets the epoch's frame order: `order` holds the scan frame at each epoch position.
