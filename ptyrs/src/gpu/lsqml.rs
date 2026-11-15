@@ -39,12 +39,16 @@ use ptyrs_kernels::lsqml::{
 use ptyrs_kernels::pixel::PIXEL_THREADS;
 
 use crate::gpu::fused::{GRID_Y_MAX, Shape, Side, no_psi};
+use crate::gpu::opr::{OwnModes, shared_src};
 use crate::gpu::ops::grid_1d;
 use crate::gpu::position::{ONE_BLOCK, chunk_grid, chunks, same_dims, span};
 use crate::gpu::{
     BhScan, C32, Error, FrameWaves, Kernels, StackCtl, StackGeom, StackRef, UpdateSums, ViewAddr,
     ViewDims, Views, check_len, dptr,
 };
+
+#[cfg(test)]
+mod opr_tests;
 
 /// The walks of the frame passes over a stack, [`FUSED_DOWN`] or 0, each against the pass
 /// before it in the module doc's order, so it starts on the frames that one touched last,
@@ -185,12 +189,16 @@ fn trim(nb: u32) -> u32 {
 /// A stack's exit-wave update `chi` ([`LsqmlKernels::chi`]) for [`LsqmlKernels::dots`]; with
 /// the waves `w` that stand for each view's `P q`: under the position model the stack's
 /// moved probe ([`crate::gpu::PositionKernels::shift_w`]), on a multislice object's deeper
-/// slice the wave entering it.
+/// slice the wave entering it; or with `own`, each frame's own probe mode 0 under OPR.
 pub enum LsqmlChi<'a> {
     Unmoved(&'a DeviceBuffer<C32>),
     Moved {
         chi: &'a DeviceBuffer<C32>,
         w: FrameWaves<'a>,
+    },
+    Own {
+        chi: &'a DeviceBuffer<C32>,
+        own: OwnModes<'a>,
     },
 }
 
@@ -627,7 +635,9 @@ impl LsqmlKernels {
 
     /// The step-size sums of the stack's frames into `st` from its exit-wave update `chi`;
     /// `views` in epoch order, the scan's or [`window_views`] with `at`'s objects the stack's
-    /// windows. Under [`LsqmlChi::Moved`] the object direction's waves take its `w`.
+    /// windows. Under [`LsqmlChi::Moved`] the object direction's waves take its `w`, under
+    /// [`LsqmlChi::Own`] its probe mode 0 each frame's own; the probe direction's stay on the
+    /// shared probe.
     ///
     /// [`window_views`]: crate::gpu::sampling::window_views
     pub fn dots(
@@ -643,7 +653,9 @@ impl LsqmlKernels {
         st.check_frames(d)?;
         let g = d.geom(stack)?;
         let c = match &chi {
-            LsqmlChi::Unmoved(c) | LsqmlChi::Moved { chi: c, .. } => *c,
+            LsqmlChi::Unmoved(c)
+            | LsqmlChi::Moved { chi: c, .. }
+            | LsqmlChi::Own { chi: c, .. } => *c,
         };
         check_len("chi", c, g.nf_max as usize * d.nmode as usize * d.n())?;
         for (pair, what) in [(at.x, ["obj", "probe"]), (at.d, ["d_obj", "d_probe"])] {
@@ -654,14 +666,21 @@ impl LsqmlKernels {
         let config = chunk_grid(&g, d.n())?;
         let mut reads = vec![c.storage(), views.addr().storage(), stack.storage()];
         reads.extend(at.x.into_iter().chain(at.d).map(|b| b.storage()));
-        let pair = |p: [&DeviceBuffer<C32>; 2]| ObjProbePtrs {
-            obj: dptr::<C32, f32>(p[0]).cast_const(),
-            probe: dptr::<C32, f32>(p[1]).cast_const(),
+        let probe = match &chi {
+            LsqmlChi::Own { own, .. } => {
+                reads.push(own.planes.storage());
+                own.src(at.x[1], d.n())?
+            }
+            _ => shared_src(at.x[1]),
         };
         let p = LsqmlDots {
             chi: dptr::<C32, f32>(c).cast_const(),
-            x: pair(at.x),
-            d: pair(at.d),
+            obj: dptr::<C32, f32>(at.x[0]).cast_const(),
+            probe,
+            d: ObjProbePtrs {
+                obj: dptr::<C32, f32>(at.d[0]).cast_const(),
+                probe: dptr::<C32, f32>(at.d[1]).cast_const(),
+            },
             views: dptr::<ViewAddr, ViewAddr>(views.addr()).cast_const(),
             out: dptr(&st.dots),
         };

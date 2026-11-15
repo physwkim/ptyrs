@@ -10,6 +10,7 @@ use std::ptr;
 
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig};
+use ptyrs_kernels::fused::ProbeSrc;
 use ptyrs_kernels::opr::{OPR_SUMS, OprFrames, OprScan, opr_kernels};
 use ptyrs_kernels::pixel::PIXEL_THREADS;
 use ptyrs_kernels::position::BatchSpan;
@@ -171,6 +172,45 @@ impl Opr {
     fn eigenmode(&self, i: u32) -> *mut f32 {
         // In bounds: `i < k` and the buffer holds `k n` values.
         dptr::<C32, f32>(&self.eigenmodes).wrapping_add(2 * i as usize * self.n)
+    }
+}
+
+/// Mode 0 of each frame's own probe over a run of epoch positions: [`OprKernels::unique`]'s
+/// `planes`, `[nb, n]`, plane `b` at position `positions.start + b`.
+#[derive(Clone)]
+pub struct OwnModes<'a> {
+    pub planes: &'a DeviceBuffer<C32>,
+    pub positions: Range<u32>,
+}
+
+impl OwnModes<'_> {
+    /// `probe` with these planes of `n` pixels for its mode 0, as a kernel reads it.
+    pub(super) fn src(&self, probe: &DeviceBuffer<C32>, n: usize) -> Result<ProbeSrc, Error> {
+        let nb = self.positions.len();
+        if nb == 0 {
+            let p = &self.positions;
+            return Err(Error::Shape(format!(
+                "own probe modes at no positions, {p:?}"
+            )));
+        }
+        check_len("own probe modes", self.planes, nb * n)?;
+        Ok(ProbeSrc {
+            probe: dptr::<C32, f32>(probe).cast_const(),
+            mode0: dptr::<C32, f32>(self.planes).cast_const(),
+            p0: self.positions.start,
+            nb: nb as u32,
+        })
+    }
+}
+
+/// `probe` shared by every frame, as a kernel reads it.
+pub(super) fn shared_src(probe: &DeviceBuffer<C32>) -> ProbeSrc {
+    let p = dptr::<C32, f32>(probe).cast_const();
+    ProbeSrc {
+        probe: p,
+        mode0: p,
+        p0: 0,
+        nb: 1,
     }
 }
 

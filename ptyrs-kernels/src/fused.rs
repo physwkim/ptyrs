@@ -218,6 +218,36 @@ pub struct FusedPtrs {
     pub shift_den: *mut PositionPartial,
 }
 
+/// A probe `[nprobe, ny, nx]` whose mode 0 is each frame's own: plane `b` of `mode0` `[nb,
+/// ny, nx]` at epoch position `p0 + b`. The shared probe is `mode0 = probe`, `p0 = 0`, `nb =
+/// 1`. A position outside the run reads its last plane, since a device-side [`StackCtl`] may
+/// place a stack anywhere in the scan.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ProbeSrc {
+    pub probe: *const f32,
+    pub mode0: *const f32,
+    pub p0: u32,
+    pub nb: u32,
+}
+
+/// Pixel `i` of `src`'s mode `m` at epoch position `pos`, planes of `n` pixels.
+///
+/// # Safety
+///
+/// `src` as [`ProbeSrc`] says, `nb ≥ 1`, `m < nprobe`, `i < n`.
+#[device]
+pub unsafe fn load_probe(src: ProbeSrc, m: u32, pos: u32, n: usize, i: usize) -> (f32, f32) {
+    unsafe {
+        if m == 0 {
+            let b = pos.wrapping_sub(src.p0).min(src.nb - 1);
+            load_c(src.mode0, b as usize * n + i)
+        } else {
+            load_c(src.probe, m as usize * n + i)
+        }
+    }
+}
+
 /// Bytes of [`cols`]' reduction slots under `flags` for columns of `ny`: a row of
 /// `FUSED_COLS * ny / fft_ept(ny)` f32 per LLK term, and per scale sum under `FUSED_SCALE_SUMS`.
 #[device]

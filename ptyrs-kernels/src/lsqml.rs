@@ -14,7 +14,7 @@ use cuda_device::{async_copy, device, shared::DynamicSharedArray, thread};
 use cuda_host::cuda_module;
 
 use crate::bh::{BhObs, store_sums};
-use crate::fused::{FUSED_COLS, col_fft, walk_slot};
+use crate::fused::{FUSED_COLS, ProbeSrc, col_fft, load_probe, walk_slot};
 use crate::grad::{GAMMA_CHUNK, ObjProbePtrs};
 use crate::optics::{WavePlanes, wave_plane};
 use crate::pixel::{
@@ -74,13 +74,15 @@ pub struct LsqmlFar {
 }
 
 /// What [`lsqml_kernels::LoadedModule::lsqml_dots`] reads and writes: `chi` `[nf_max * nmode,
-/// ny, nx]`, the object and probe `x` and their directions `d`, the epoch's `views`, and
-/// `out` the [`LSQML_DOTS`] sums of every frame's chunks by epoch position.
+/// ny, nx]`, the object `obj` and probe `probe`, their directions `d` (the shared probe's), the
+/// epoch's `views`, and `out` the [`LSQML_DOTS`] sums of every frame's chunks by epoch
+/// position.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct LsqmlDots {
     pub chi: *const f32,
-    pub x: ObjProbePtrs,
+    pub obj: *const f32,
+    pub probe: ProbeSrc,
     pub d: ObjProbePtrs,
     pub views: *const ViewAddr,
     pub out: *mut f32,
@@ -248,7 +250,8 @@ unsafe fn dots<const SHIFT: bool>(
 ) {
     let LsqmlDots {
         chi,
-        x,
+        obj,
+        probe,
         d,
         views,
         out,
@@ -275,14 +278,15 @@ unsafe fn dots<const SHIFT: bool>(
             unsafe {
                 let w = *views.add(pos * nmode + m);
                 let pa = w.probe as usize * n + i;
-                let o = sample_obj(x.obj, w, py, px, g.nyo, g.nxo);
+                let o = sample_obj(obj, w, py, px, g.nyo, g.nxo);
                 let d_o = sample_obj(d.obj, w, py, px, g.nyo, g.nxo);
                 let ch = load_c(chi, (fl * nmode + m) * n + at);
                 let u = if SHIFT {
                     let ws = load_c(w_in.w, wave_plane(w_in, fl, m) * n + at);
                     cmul(d_o, ws)
                 } else {
-                    cmul(cmul(d_o, load_c(x.probe, pa)), q)
+                    let pr = load_probe(probe, w.probe, pos as u32, n, i);
+                    cmul(cmul(d_o, pr), q)
                 };
                 let v = cmul(cmul(o, load_c(d.probe, pa)), q);
                 let uv = cmul_conj(u, v);
@@ -667,8 +671,9 @@ pub mod lsqml_kernels {
     /// The step-size sums of chunk `c = blockIdx.x` of frame `f0 + fl`, `fl` `walk_slot` of
     /// `flags`, over its modes and the pixels `d` in `c * GAMMA_CHUNK .. min((c + 1) *
     /// GAMMA_CHUNK, n)`: with view `w = views[(f0 + fl) * nmode + m]` and `q = exp(i quad
-    /// r²)`, `u = dO_w P_w q` and `v = O_w dP_w q` (`x` the object and probe, `d` their
-    /// directions) and `chi` at the exit-wave index of `d`, `out[6p .. 6p + 6]` gets the
+    /// r²)`, `u = dO_w P_w q` and `v = O_w dP_w q` (`P_w` the view's mode of `p.probe` at
+    /// position `f0 + fl`, `dP_w` of the shared direction) and `chi` at the exit-wave index
+    /// of `d`, `out[6p .. 6p + 6]` gets the
     /// [`LSQML_DOTS`] sums, `p = (f0 + fl) * nchunk + c`.
     ///
     /// # Safety
