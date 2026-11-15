@@ -3,9 +3,9 @@
 //! matmul whose output, `co × 9·ci` (64 × 576 at a U-Net's top level), is a few dozen cubes at
 //! most while its inner dimension is every pixel of the batch, so most of the GPU idles; here each
 //! cube sums its own band and one more kernel adds the bands. The kernel takes deep levels too,
-//! where burn's matmul is faster, because burn 0.22.1 takes the f32 weight gradient on TF32
-//! tensor cores, whose rounding puts it 1e-4 off and whose kernels, for some shapes (2 to 64
-//! channels on 8 × 8 pixels, for one), put it off by most of its magnitude.
+//! where burn's matmul was faster while it ran f32 on TF32 tensor cores; that put the weight
+//! gradient 1e-4 off, and for some shapes (2 to 64 channels on 8 × 8 pixels) off by most of its
+//! magnitude. vendor/cubek-matmul keeps f32 off them, and the two have not been timed since.
 
 use burn::backend::autodiff::checkpoint::base::Checkpointer;
 use burn::backend::autodiff::checkpoint::strategy::CheckpointStrategy;
@@ -709,7 +709,8 @@ mod tests {
     fn small_images_and_channels() {
         // Narrower than a tile, fewer channels than a cube's lanes and output channels.
         agrees(case(2, 9, 13, 3, 5));
-        // burn 0.22.1's own f32 weight gradient here is off by most of its magnitude.
+        // On TF32 tensor cores burn 0.22.1's own f32 weight gradient here was off by most of its
+        // magnitude.
         agrees(case(1, 8, 8, 2, 64));
         agrees(case(2, 1, 1, 1, 1));
         agrees(Case {
@@ -842,8 +843,8 @@ mod tests {
     }
 
     /// Every convolution of pty-chi's U-Net as `nn_dip_ptychi` runs it on the 852² comparison
-    /// object from 32 code channels; its 3×3 convolutions have no bias. The 1×1 output
-    /// convolution is burn's throughout, in TF32: 4.4e-4 off, and 4.2e-6 with TF32 off.
+    /// object from 32 code channels; its 3×3 convolutions have no bias, and its 1×1 output
+    /// convolution is burn's throughout.
     #[test]
     fn ptychi_unet_convolutions() {
         for [side, ci, co] in [
@@ -874,7 +875,7 @@ mod tests {
             k: 1,
             ..case(1, 852, 852, 64, 2)
         };
-        f32_weight_gradient(outc, 2e-3);
+        f32_weight_gradient(outc, 2e-5);
     }
 
     #[test]

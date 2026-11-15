@@ -294,8 +294,7 @@ mod tests {
     fn folded_network_gives_the_networks_output() {
         let device = crate::nn::cuda(0);
         device.seed(1);
-        // In f64, not f32: there autotune may pick tensor-core convolutions, which round
-        // operands to TF32, and the two networks part by up to 6e-3 depending on its picks.
+        // In f64, so the two networks part by the folding's algebra and not by f32 rounding.
         let net = normalised_net(&device).map(&mut ToF64);
         let x = Tensor::<4>::random([3, 2, 16, 16], Distribution::Normal(0.0, 1.0), &device)
             .cast(DType::F64);

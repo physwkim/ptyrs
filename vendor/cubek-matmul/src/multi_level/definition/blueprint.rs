@@ -1,4 +1,4 @@
-use cubecl::{CubeDim, client::Client, flex32, prelude::Scalar, tf32};
+use cubecl::{CubeDim, client::Client, flex32, prelude::Scalar};
 use cubek_std::{
     MatrixLayout,
     cube_count::{Count3d, CubeCountPlan, HypercubeBlueprint},
@@ -86,30 +86,22 @@ impl Blueprint for BatchMatmulBlueprint {
 }
 
 /// Modifies the given matmul element types based on the kind of accelerator the kernel is run on.
+///
+/// f32 operands stay f32, so no accelerated tile takes them: ptyrs vendors this crate to drop
+/// their promotion to tf32, whose rounding put a DIP's f32 gradients 9e-2 off f64's.
 pub fn adjust_dtypes(client: &Client, dtypes: &mut MatmulElems, requires_accelerator: bool) {
-    let f32_dtype = f32::elem_type_native();
     let flex_dtype = flex32::elem_type_native();
-    let tf32_dtype = tf32::elem_type_native();
     let f16_dtype = half::f16::elem_type_native();
 
-    if requires_accelerator {
-        if dtypes.lhs_global == f32_dtype
-            && dtypes.rhs_global == f32_dtype
-            && client.properties().supports_type(tf32_dtype)
-        {
-            dtypes.lhs_stage = tf32_dtype;
-            dtypes.rhs_stage = tf32_dtype;
-            dtypes.lhs_register = tf32_dtype;
-            dtypes.rhs_register = tf32_dtype;
-        } else if dtypes.lhs_global == flex_dtype
-            && dtypes.rhs_global == flex_dtype
-            && client.properties().supports_type(f16_dtype)
-        {
-            dtypes.lhs_stage = f16_dtype;
-            dtypes.rhs_stage = f16_dtype;
-            dtypes.lhs_register = f16_dtype;
-            dtypes.rhs_register = f16_dtype;
-        }
+    if requires_accelerator
+        && dtypes.lhs_global == flex_dtype
+        && dtypes.rhs_global == flex_dtype
+        && client.properties().supports_type(f16_dtype)
+    {
+        dtypes.lhs_stage = f16_dtype;
+        dtypes.rhs_stage = f16_dtype;
+        dtypes.lhs_register = f16_dtype;
+        dtypes.rhs_register = f16_dtype;
     }
 }
 
