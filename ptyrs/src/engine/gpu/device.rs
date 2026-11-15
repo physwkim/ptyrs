@@ -197,9 +197,11 @@ pub(super) struct Device {
     llk_graph: Option<Captured>,
     /// ML's state, built by the first ML call and replaced only for another position model.
     ml: Option<Box<MlState>>,
-    /// BH's state, built by the first BH call and replaced only for another batch size.
+    /// BH's state, built by the first BH call and replaced for another batch size, and for
+    /// another reading of the object: with or without the position model, and its sampling.
     bh_state: Option<Box<BhState>>,
-    /// LSQML's state, built by the first LSQML call and replaced only for another batch size.
+    /// LSQML's state, built by the first LSQML call and replaced for another batch size, and for
+    /// another reading of the object: with or without the position model, and its sampling.
     lsqml: Option<Box<LsqmlState>>,
     features: FeatureBufs,
     /// How a position's offsets enter the exit waves. Every state and graph built under a
