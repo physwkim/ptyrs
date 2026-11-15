@@ -266,6 +266,9 @@ pub(super) struct Windows {
     blocks: DeviceBuffer<C32>,
     /// A multislice object's windows of each slice past the first, a block each.
     deeper: Vec<DeviceBuffer<C32>>,
+    /// `[nobj, nyo, nxo]`, the spectra of each slice past the first, which
+    /// [`Modelled::sliced`] takes for its windows.
+    spectra: Vec<DeviceBuffer<C32>>,
     /// `[nobj, nf_max, ny, nx]`.
     sums: UpdateSums,
 }
@@ -286,6 +289,9 @@ impl Windows {
             blocks: DeviceBuffer::zeroed(stream, 3 * len)?,
             deeper: (1..slices)
                 .map(|_| DeviceBuffer::zeroed(stream, len))
+                .collect::<Result<_, _>>()?,
+            spectra: (1..slices)
+                .map(|_| DeviceBuffer::zeroed(stream, dims.obj_len()))
                 .collect::<Result<_, _>>()?,
             sums: UpdateSums::zeroed(stream, len)?,
         })
@@ -314,10 +320,9 @@ pub(super) enum Sample {
 }
 
 /// [`Windows`] lent to one stack's passes by [`Modelled::windows`]: the views and the blocks
-/// they read, the deeper slices' windows, and the update sums.
+/// they read, and the update sums.
 pub(super) struct WindowsMut<'w> {
     pub read: StackWindows<'w>,
-    deeper: &'w [DeviceBuffer<C32>],
     sums: &'w mut UpdateSums,
 }
 
@@ -382,19 +387,17 @@ enum Mover {
     /// spectra of the object they read; the probe stays.
     Object {
         sampler: Box<ObjectSampler>,
-        /// `[nobj, nyo, nxo]`, one per slice.
-        spectra: Vec<DeviceBuffer<C32>>,
+        /// `[nobj, nyo, nxo]`.
+        spectra: DeviceBuffer<C32>,
     },
 }
 
 impl Mover {
-    /// For an object of `slices` slices.
     fn new(
         stream: &Arc<CudaStream>,
         kernels: &Kernels,
         dims: &ViewDims,
         sampling: Sampling,
-        slices: usize,
     ) -> Result<Self, EngineError> {
         Ok(match sampling {
             Sampling::Patch => Self::Probe {
@@ -409,9 +412,7 @@ impl Mover {
                     1,
                     SAMPLER_CHUNK,
                 )?),
-                spectra: (0..slices)
-                    .map(|_| DeviceBuffer::zeroed(stream, dims.obj_len()))
-                    .collect::<Result<_, _>>()?,
+                spectra: DeviceBuffer::zeroed(stream, dims.obj_len())?,
             },
         })
     }
@@ -576,7 +577,7 @@ impl<'m, X> PositionLent<'m, X> {
                     kernels,
                     offsets: &mut *p.offsets,
                     sampler,
-                    spectra: &mut spectra[0],
+                    spectra,
                 })))
             }
             _ => Err(another_model()),
@@ -740,11 +741,6 @@ pub(super) struct Modelled<'b> {
     position: Option<PositionSums<'b>>,
 }
 
-/// An object the passes read, by its slices.
-pub(super) trait AsSlices {
-    fn slices(&self) -> Sliced<'_>;
-}
-
 /// An object's first slice and the slices past it, none of one slice.
 #[derive(Clone, Copy)]
 pub(super) struct Sliced<'a> {
@@ -752,26 +748,21 @@ pub(super) struct Sliced<'a> {
     pub deeper: &'a [DeviceBuffer<C32>],
 }
 
-impl AsSlices for DeviceBuffer<C32> {
-    fn slices(&self) -> Sliced<'_> {
-        Sliced {
-            first: self,
-            deeper: &[],
-        }
-    }
+/// What the passes over each stack of a cut read of a multislice object, by
+/// [`Modelled::sliced`].
+pub(super) enum SlicedRead<'w> {
+    /// The scan's views and the object's slices.
+    Base(&'w Views, Sliced<'w>),
+    /// Under [`Sampling::FullObject`], the scan's views and the cut's windows, beside whose
+    /// deeper windows the spectra of the slices past the first are taken.
+    Windows(&'w Views, &'w mut Windows),
 }
 
-impl AsSlices for Sliced<'_> {
-    fn slices(&self) -> Sliced<'_> {
-        *self
-    }
-}
-
-/// [`Mover::Object`] lent by [`Modelled`]: the sampler, the spectra of each slice of the
-/// object the passes read and the offsets by frame they sample it at.
+/// [`Mover::Object`] lent by [`Modelled`]: the sampler, the spectra of the object the passes
+/// read and the offsets by frame they sample it at.
 struct Sampled<'b> {
     sampler: &'b mut ObjectSampler,
-    spectra: &'b [DeviceBuffer<C32>],
+    spectra: &'b DeviceBuffer<C32>,
     offsets: &'b DeviceBuffer<f32>,
 }
 
@@ -785,7 +776,8 @@ struct PositionSums<'b> {
 
 impl Modelled<'_> {
     /// The views and object a fused pass over `stack` reads, of `base`, the scan's views and
-    /// the object the lend took, of one slice: [`Self::slices`]' first.
+    /// the object the lend took: `base`, or under [`Sampling::FullObject`] the stack's windows
+    /// sampled into `windows`, its cut's, by [`Self::windows`].
     pub fn object<'w>(
         &mut self,
         ctx: &ExecutionContext,
@@ -793,38 +785,82 @@ impl Modelled<'_> {
         stack: StackRef<'_>,
         windows: Option<&'w mut Windows>,
     ) -> Result<(&'w Views, &'w DeviceBuffer<C32>), GpuError> {
-        let (views, obj) = self.slices(ctx, (base.0, base.1.slices()), stack, windows)?;
-        Ok((views, obj.first))
-    }
-
-    /// The views and every slice of the object the passes over `stack` read, of `base`, the
-    /// scan's views and the object the lend took: `base`, or under [`Sampling::FullObject`]
-    /// each slice's windows of the stack sampled into `windows`, its cut's, by
-    /// [`Self::windows`].
-    pub fn slices<'w>(
-        &mut self,
-        ctx: &ExecutionContext,
-        base: (&'w Views, Sliced<'w>),
-        stack: StackRef<'_>,
-        windows: Option<&'w mut Windows>,
-    ) -> Result<(&'w Views, Sliced<'w>), GpuError> {
         Ok(
             match self.windows(ctx, base.0, stack, windows, Sample::Windows)? {
                 None => base,
-                Some(w) => {
-                    let (first, deeper) = (w.read.blocks, w.deeper);
-                    (w.read.views, Sliced { first, deeper })
-                }
+                Some(w) => (w.read.views, w.read.blocks),
             },
         )
     }
 
+    /// What the passes over each stack read of `base`, the scan's views and the object's
+    /// slices, the first the one the lend took: `base`, or under [`Sampling::FullObject`]
+    /// `windows`, its cut's, after the spectra of each slice past the first beside their
+    /// windows ([`Self::spectra_of`], one transform a slice). Their disagreement is an error,
+    /// as for a cut built under another position model, and so are windows of another slice
+    /// count.
+    pub fn sliced<'w>(
+        &mut self,
+        ctx: &ExecutionContext,
+        base: (&'w Views, Sliced<'w>),
+        windows: Option<&'w mut Windows>,
+    ) -> Result<SlicedRead<'w>, GpuError> {
+        let (views, obj) = base;
+        let w = match (&self.sampled, windows) {
+            (None, None) => return Ok(SlicedRead::Base(views, obj)),
+            (Some(_), Some(w)) => w,
+            _ => return Err(another_model()),
+        };
+        if w.deeper.len() != obj.deeper.len() {
+            return Err(GpuError::Shape(format!(
+                "windows of {} slices for an object of {}",
+                1 + w.deeper.len(),
+                1 + obj.deeper.len()
+            )));
+        }
+        for (slice, spectra) in obj.deeper.iter().zip(&mut w.spectra) {
+            self.spectra_of(ctx, slice, spectra)?;
+        }
+        Ok(SlicedRead::Windows(views, w))
+    }
+
+    /// The views and every slice the passes over `stack` read of `read`: its base, or each
+    /// slice's windows of the stack sampled into its windows, three launches per
+    /// [`SAMPLER_CHUNK`] groups a slice ([`Self::windows_of`]).
+    pub fn slices<'r>(
+        &mut self,
+        ctx: &ExecutionContext,
+        read: &'r mut SlicedRead<'_>,
+        stack: StackRef<'_>,
+    ) -> Result<(&'r Views, Sliced<'r>), GpuError> {
+        let (views, w) = match read {
+            SlicedRead::Base(views, obj) => return Ok((*views, *obj)),
+            SlicedRead::Windows(views, w) => (*views, &mut **w),
+        };
+        let block = WindowBlock {
+            slice: 0,
+            order: [0, 0],
+            modes: Modes::All,
+            block: 0,
+        };
+        self.windows_of(ctx, views, stack, None, block, &mut w.blocks)?;
+        for (spectra, win) in w.spectra.iter().zip(&mut w.deeper) {
+            self.windows_of(ctx, views, stack, Some(spectra), block, win)?;
+        }
+        let deeper = &w.deeper;
+        Ok((
+            &w.views,
+            Sliced {
+                first: &w.blocks,
+                deeper,
+            },
+        ))
+    }
+
     /// Under [`Sampling::FullObject`], `stack`'s windows over the scan's `views` lent from
     /// `w`, its cut's, after sampling what `sample` names from the spectra of the object the
-    /// lend took, three launches per [`SAMPLER_CHUNK`] groups a block: the first slice's,
-    /// then, beside its windows, each deeper slice's windows; none without either. Their
-    /// disagreement is an error, as for a cut built under another position model, and so are
-    /// windows of another slice count.
+    /// lend took, three launches per [`SAMPLER_CHUNK`] groups a block; none without either.
+    /// Their disagreement is an error, as for a cut built under another position model.
     pub fn windows<'w>(
         &mut self,
         ctx: &ExecutionContext,
@@ -838,13 +874,6 @@ impl Modelled<'_> {
             (Some(s), Some(w)) => (s, w),
             _ => return Err(another_model()),
         };
-        if s.spectra.len() != 1 + w.deeper.len() {
-            return Err(GpuError::Shape(format!(
-                "windows of {} slices for an object of {}",
-                1 + w.deeper.len(),
-                s.spectra.len()
-            )));
-        }
         let at = StackPoints {
             views,
             stack,
@@ -855,26 +884,21 @@ impl Modelled<'_> {
             Sample::Windows => &[[0, 0]],
             Sample::Derivatives => &[[0, 0], [1, 0], [0, 1]],
         };
-        let block = |order, block| WindowBlock {
-            slice: 0,
-            order,
-            modes: Modes::All,
-            block,
-        };
-        for (b, &order) in (0..).zip(orders) {
-            (s.sampler).windows(ctx, at, &s.spectra[0], block(order, b), &mut w.blocks)?;
-        }
-        if !orders.is_empty() {
-            for (spectra, win) in s.spectra[1..].iter().zip(&mut w.deeper) {
-                s.sampler.windows(ctx, at, spectra, block([0, 0], 0), win)?;
-            }
+        for (block, &order) in (0..).zip(orders) {
+            let block = WindowBlock {
+                slice: 0,
+                order,
+                modes: Modes::All,
+                block,
+            };
+            s.sampler
+                .windows(ctx, at, s.spectra, block, &mut w.blocks)?;
         }
         Ok(Some(WindowsMut {
             read: StackWindows {
                 views: &w.views,
                 blocks: &w.blocks,
             },
-            deeper: &w.deeper,
             sums: &mut w.sums,
         }))
     }
@@ -932,7 +956,7 @@ impl Modelled<'_> {
             offsets: s.offsets,
         };
         s.sampler
-            .windows(ctx, at, spectra.unwrap_or(&s.spectra[0]), block, out)
+            .windows(ctx, at, spectra.unwrap_or(s.spectra), block, out)
     }
 
     /// Under [`Sampling::FullObject`], each of `stack`'s frames' position sums of `psi`
@@ -1046,18 +1070,17 @@ impl FeaturesMut<'_> {
         self.scale.as_ref().map(|s| &*s.values)
     }
 
-    /// The features lent to the passes of one cycle body over `obj`, every slice of the
-    /// object, and `probe`, which cannot change while they are: the model of every feature
-    /// set, the position's shift after the spectra of `probe` it moves (two launches) if it
-    /// moves the probe, or the sampler after the spectra of each slice of `obj` (one
-    /// transform a slice) if it samples the object, and the propagator's stage `exit`, and
-    /// the sums.
+    /// The features lent to the passes of one cycle body over `obj` and `probe`, which
+    /// cannot change while they are: the model of every feature set, the position's shift
+    /// after the spectra of `probe` it moves (two launches) if it moves the probe, or the
+    /// sampler after the spectra of `obj` (one transform) if it samples the object, and the
+    /// propagator's stage `exit`, and the sums.
     pub fn lend<'b>(
         &'b mut self,
         ctx: &ExecutionContext,
         kernels: &Kernels,
         dims: &ViewDims,
-        obj: &(impl AsSlices + ?Sized),
+        obj: &DeviceBuffer<C32>,
         probe: &'b DeviceBuffer<C32>,
         exit: ExitPass<'b>,
     ) -> Result<Modelled<'b>, GpuError> {
@@ -1083,18 +1106,7 @@ impl FeaturesMut<'_> {
                         (Some(shift), None, Some(&mut **probe_sums))
                     }
                     Mover::Object { sampler, spectra } => {
-                        let obj = obj.slices();
-                        if spectra.len() != 1 + obj.deeper.len() {
-                            return Err(GpuError::Shape(format!(
-                                "an object of {} slices lent to spectra of {}",
-                                1 + obj.deeper.len(),
-                                spectra.len()
-                            )));
-                        }
-                        let slices = std::iter::once(obj.first).chain(obj.deeper);
-                        for (slice, spectra) in slices.zip(spectra.iter_mut()) {
-                            sampler.spectra(ctx, slice, spectra)?;
-                        }
+                        sampler.spectra(ctx, obj, spectra)?;
                         let sampled = Sampled {
                             sampler,
                             spectra: &*spectra,
@@ -2274,7 +2286,7 @@ impl Device {
         let stream = &self.stream;
         let dims = self.views.dims();
         let mover = (position.as_ref())
-            .map(|_| Mover::new(stream, &self.kernels, dims, self.sampling, self.nslice()))
+            .map(|_| Mover::new(stream, &self.kernels, dims, self.sampling))
             .transpose()?;
         let shared = self.reshared(mover.as_ref())?;
         let nf_max = shared
@@ -2394,7 +2406,7 @@ impl Device {
         let mover = (self.features.position.as_ref())
             .map(|_| {
                 let dims = self.views.dims();
-                Mover::new(&self.stream, &self.kernels, dims, sampling, self.nslice())
+                Mover::new(&self.stream, &self.kernels, dims, sampling)
             })
             .transpose()?;
         let shared = self.reshared(mover.as_ref())?;

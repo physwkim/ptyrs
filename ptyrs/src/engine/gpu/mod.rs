@@ -823,14 +823,15 @@ impl Bufs<'_> {
                     ctx,
                     self.kernels,
                     &dims,
-                    &whole,
+                    self.obj,
                     self.probe,
                     self.exit,
                 )?;
+                let windows = self.windows.as_deref_mut();
+                let mut read = m.sliced(ctx, (self.views, whole), windows)?;
                 for s in 0..self.scratch.len() {
                     let stack = self.scratch.at(s);
-                    let windows = self.windows.as_deref_mut();
-                    let (views, obj) = m.slices(ctx, (self.views, whole), stack, windows)?;
+                    let (views, obj) = m.slices(ctx, &mut read, stack)?;
                     let inputs = FusedInputs {
                         views,
                         counts: self.counts,
