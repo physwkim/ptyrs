@@ -855,18 +855,24 @@ fn moved_entry_is_the_waves_holding_it_cg() {
     moved_entry_case(true);
 }
 
-/// `launch(cg, given)` with and without CG, its CG-only buffers given and not: refused
-/// unless they are given exactly with CG.
-fn lv_given_exactly_with_cg(mut launch: impl FnMut(bool, bool) -> Result<(), Error>) {
+/// `launch(cg, given)` with and without CG, its CG-only buffers `names` given and not:
+/// refused unless they are given exactly with CG.
+fn given_exactly_with_cg(names: &str, mut launch: impl FnMut(bool, bool) -> Result<(), Error>) {
+    let refused = format!("{names} given exactly with CG");
     for cg in [false, true] {
         for given in [false, true] {
             match launch(cg, given) {
                 Ok(()) if given == cg => {}
-                Err(Error::Shape(m)) if given != cg && m == "lv given exactly with CG" => {}
+                Err(Error::Shape(m)) if given != cg && m == refused => {}
                 e => panic!("cg {cg}, given {given}: {e:?}"),
             }
         }
     }
+}
+
+/// [`given_exactly_with_cg`] of a launch whose first CG-only buffer is `lv`.
+fn lv_given_exactly_with_cg(launch: impl FnMut(bool, bool) -> Result<(), Error>) {
+    given_exactly_with_cg("lv", launch)
 }
 
 /// The step along the object and probe parts `u`, and with `cg` `v`.
@@ -989,6 +995,151 @@ fn moved_far_takes_lv_exactly_with_cg() {
         };
         fx.bh
             .pos_far(ctx, &counts, fx.table.at(0), &f, &mv, &mut parts)
+    });
+}
+
+#[test]
+fn far_takes_lv_exactly_with_cg() {
+    let fx = fixture();
+    let [u, v] = parts_uv(&fx);
+    let obj = fx.field(fx.dims.obj_len(), 5).0;
+    let probe = fx.field(NPROBE * N, 6).0;
+    let [mut lu, mut lv] = [7, 8].map(|s| fx.field(FIELD, s).0);
+    lv_given_exactly_with_cg(|cg, given| {
+        let (views, at) = (fx.order.views(), fx.table.at(0));
+        let l = (&mut lu, given.then_some(&mut lv));
+        (fx.bh).far(&fx.ctx, views, at, [&obj, &probe], &disp(&u, &v, cg), l)
+    });
+}
+
+/// [`given_exactly_with_cg`] of `names` for `launch(given, mv)`, `mv` the moved probes of a
+/// step along `disp(u, v, cg)`, their `v` spectra given exactly with CG.
+fn moves_given_exactly_with_cg(
+    fx: &Fixture,
+    names: &str,
+    mut launch: impl FnMut(bool, &BhMovesRef<'_>) -> Result<(), Error>,
+) {
+    let (ctx, dims) = (&fx.ctx, &fx.dims);
+    let [u, v] = parts_uv(fx);
+    let mut bufs = BhPositions::zeroed(&fx.stream, dims, 1).unwrap();
+    let off = BhOffsets {
+        bufs: &mut bufs,
+        order: &fx.order,
+        scale: 1.0,
+        step: 1.0,
+    };
+    let probe = fx.field(NPROBE * N, 5).0;
+    let mut spectra = [0; 3].map(|_| SpectrumBuf::zeroed(&fx.stream, dims).unwrap());
+    let [ba, bu, bv] = &mut spectra;
+    let a = fx.kernels.probe_spectrum(ctx, dims, &probe, ba).unwrap();
+    let au = fx.kernels.probe_spectrum(ctx, dims, &u[1], bu).unwrap();
+    let av = fx.kernels.probe_spectrum(ctx, dims, &v[1], bv).unwrap();
+    let offsets = fx.offsets(&[0.0; 2 * NFRAME]);
+    let shift = Shift {
+        offsets: &offsets,
+        spectrum: a,
+    };
+    given_exactly_with_cg(names, |cg, given| {
+        let d = disp(&u, &v, cg);
+        let mv = BhMovesRef::new(&d, shift, au, cg.then_some(av), &off).unwrap();
+        launch(given, &mv)
+    });
+}
+
+#[test]
+fn pos_spec_takes_lv_exactly_with_cg() {
+    let fx = fixture();
+    let [mut lu, mut lv] = [7, 8].map(|s| fx.field(FIELD, s).0);
+    moves_given_exactly_with_cg(&fx, "lv", |given, mv| {
+        let l = (&mut lu, given.then_some(&mut lv));
+        fx.bh.pos_spec(&fx.ctx, fx.table.at(0), mv, l)
+    });
+}
+
+#[test]
+fn pos_second_takes_muv_mvv_exactly_with_cg() {
+    let fx = fixture();
+    let [mut muu, mut muv, mut mvv] = [7, 8, 9].map(|s| fx.field(FIELD, s).0);
+    moves_given_exactly_with_cg(&fx, "muv, mvv", |given, mv| {
+        let m = (&mut muu, given.then_some([&mut muv, &mut mvv]));
+        fx.bh.pos_second(&fx.ctx, fx.table.at(0), mv, m)
+    });
+}
+
+#[test]
+fn moved_spec_takes_lv_exactly_with_cg() {
+    let fx = fixture();
+    let (ctx, dims) = (&fx.ctx, &fx.dims);
+    let [u, v] = parts_uv(&fx);
+    let mut spectra = [0; 2].map(|_| SpectrumBuf::zeroed(&fx.stream, dims).unwrap());
+    let [bu, bv] = &mut spectra;
+    let au = fx.kernels.probe_spectrum(ctx, dims, &u[1], bu).unwrap();
+    let av = fx.kernels.probe_spectrum(ctx, dims, &v[1], bv).unwrap();
+    let offsets = fx.offsets(&[0.0; 2 * NFRAME]);
+    let [mut lu, mut lv] = [7, 8].map(|s| fx.field(FIELD, s).0);
+    lv_given_exactly_with_cg(|cg, given| {
+        let d = disp(&u, &v, cg);
+        let mv = BhMovedRef::new(&d, &fx.order, &offsets, au, cg.then_some(av)).unwrap();
+        let l = (&mut lu, given.then_some(&mut lv));
+        fx.bh.moved_spec(ctx, fx.table.at(0), &mv, l)
+    });
+}
+
+#[test]
+fn phase_tangent_takes_lv_muv_mvv_exactly_with_cg() {
+    let fx = fixture();
+    let [u, v] = parts_uv(&fx);
+    let mut bufs = BhPositions::zeroed(&fx.stream, &fx.dims, 1).unwrap();
+    let off = BhOffsets {
+        bufs: &mut bufs,
+        order: &fx.order,
+        scale: 1.0,
+        step: 1.0,
+    };
+    let slice = fx.field(fx.dims.obj_len(), 5).0;
+    let probe = fx.field(NPROBE * N, 6).0;
+    let [mut lu, mut muu, mut lv, mut muv, mut mvv] =
+        [7, 8, 9, 10, 11].map(|s| fx.field(FIELD, s).0);
+    lv_given_exactly_with_cg(|cg, given| {
+        let mut t = BhTangentsMut {
+            lu: &mut lu,
+            muu: &mut muu,
+            cg: given.then_some([&mut lv, &mut muv, &mut mvv]),
+        };
+        let last = BhLastSlice {
+            slice: &slice,
+            entry: BhEntry::Probe(&probe),
+            quad: QUAD,
+        };
+        let (d, at) = (disp(&u, &v, cg), fx.table.at(0));
+        (fx.bh).phase_tangent(&fx.ctx, at, last, &off, &d, &mut t)
+    });
+}
+
+/// `f.lv` against the second derivatives' CG; theirs are given with it by construction.
+#[test]
+fn sliced_hess_frames_takes_lv_exactly_with_cg() {
+    let fx = fixture();
+    let counts = DeviceBuffer::<u16>::zeroed(&fx.stream, NFRAME * N).unwrap();
+    let scan = BhScan {
+        order: &fx.order,
+        counts: &counts,
+    };
+    let mut parts = BhParts::zeroed(&fx.stream, &fx.dims, 0).unwrap();
+    let [psi, r, lu, lv, muu, muv, mvv] = [5, 6, 7, 8, 9, 10, 11].map(|s| fx.field(FIELD, s).0);
+    lv_given_exactly_with_cg(|cg, given| {
+        let f = BhFieldsRef {
+            views: fx.order.views(),
+            psi: &psi,
+            r: &r,
+            lu: &lu,
+            lv: given.then_some(&lv),
+        };
+        let m = BhSecondRef {
+            uu: &muu,
+            cg: cg.then_some([&muv, &mvv]),
+        };
+        (fx.bh).sliced_hess_frames(&fx.ctx, scan, fx.table.at(0), &f, &m, &mut parts)
     });
 }
 
