@@ -12,14 +12,16 @@ mod cpu;
 mod gpu;
 
 use ::ptyrs::base::{C64, CoreError, Counts, Geometry, Object, Positions, Stack};
-use ::ptyrs::engine::{BhStep, Cost, EngineError, Features, Llk, LlkRecord, LsqmlStep, Sampling};
+use ::ptyrs::engine::{
+    BhStep, Cost, EngineError, Feature, Features, Llk, LlkRecord, LsqmlStep, Sampling,
+};
 use numpy::{
     Element, PyArray1, PyArray2, PyArray3, PyArray4, PyArrayMethods, PyReadonlyArray1,
     PyReadonlyArray2, PyReadonlyArray3, PyReadonlyArray4,
 };
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
+use pyo3::types::{PyDict, PyList, PyTuple};
 
 /// Engine errors as Python exceptions: bad input is a `ValueError`, a GPU failure a
 /// `RuntimeError`.
@@ -245,16 +247,66 @@ fn bh_steps<'py>(py: Python<'py>, steps: &[BhStep]) -> PyResult<Bound<'py, PyLis
     PyList::new(py, steps.collect::<PyResult<Vec<_>>>()?)
 }
 
+/// Which of `names` a `hold` keyword holds: each held name is one of `names` and `given`.
+fn held<const N: usize>(
+    hold: &[String],
+    names: [&str; N],
+    given: [bool; N],
+) -> PyResult<[bool; N]> {
+    let mut held = [false; N];
+    for h in hold {
+        match names.iter().position(|n| n == h) {
+            Some(i) if given[i] => held[i] = true,
+            Some(_) => {
+                return Err(PyValueError::new_err(format!(
+                    "hold {h:?} but no {h} given"
+                )));
+            }
+            None => {
+                return Err(PyValueError::new_err(format!(
+                    "hold {h:?} is not one of {names:?}"
+                )));
+            }
+        }
+    }
+    Ok(held)
+}
+
+/// The names of `features`' held quantities, as `hold` takes them.
+fn hold_out<'py>(
+    py: Python<'py>,
+    features: impl IntoIterator<Item = (&'static str, Option<bool>)>,
+) -> PyResult<Bound<'py, PyTuple>> {
+    let held = features
+        .into_iter()
+        .filter(|(_, refine)| *refine == Some(false));
+    PyTuple::new(py, held.map(|(name, _)| name).collect::<Vec<_>>())
+}
+
+/// `values`, refined unless `held`.
+fn feature<T>(values: T, held: bool) -> Feature<T> {
+    Feature {
+        values,
+        refine: !held,
+    }
+}
+
+/// The names of [`Features`]' quantities, as `hold` takes them.
+const FEATURES: [&str; 3] = ["scale", "background", "position"];
+
 /// [`Features`] of `set_features`' keywords on `frame` (`[ny, nx]`) detector frames: `scale`
 /// `[nframe]`, `background` `[ny, nx]` in the counts' detector order and `position`
-/// `[nframe, 2]` offsets `[dy, dx]` in object pixels; each left out is not modelled. The
-/// engine checks the frame count and the values.
+/// `[nframe, 2]` offsets `[dy, dx]` in object pixels, each held if `hold` names it; each left
+/// out is not modelled. The engine checks the frame count and the values.
 fn features_in(
     scale: Option<PyReadonlyArray1<'_, f64>>,
     background: Option<PyReadonlyArray2<'_, f64>>,
     position: Option<PyReadonlyArray2<'_, f64>>,
+    hold: &[String],
     frame: [usize; 2],
 ) -> PyResult<Features> {
+    let given = [scale.is_some(), background.is_some(), position.is_some()];
+    let [hs, hb, hp] = held(hold, FEATURES, given)?;
     let background = background
         .map(|b| {
             let b = b.as_array();
@@ -264,17 +316,19 @@ fn features_in(
                     b.shape()
                 )));
             }
-            Ok(b.iter().copied().collect())
+            Ok(feature(b.iter().copied().collect(), hb))
         })
         .transpose()?;
     Ok(Features {
-        scale: scale.map(|s| s.as_array().to_vec()),
+        scale: scale.map(|s| feature(s.as_array().to_vec(), hs)),
         background,
-        position: position.map(position_in).transpose()?,
+        position: position
+            .map(|d| Ok::<_, PyErr>(feature(position_in(d)?, hp)))
+            .transpose()?,
     })
 }
 
-/// `[nframe, 2]` offsets `[dy, dx]` as the engine's [`Features::position`].
+/// `[nframe, 2]` offsets `[dy, dx]` as the values of the engine's [`Features::position`].
 fn position_in(d: PyReadonlyArray2<'_, f64>) -> PyResult<Vec<[f64; 2]>> {
     let d = d.as_array();
     if d.ncols() != 2 {
@@ -286,26 +340,32 @@ fn position_in(d: PyReadonlyArray2<'_, f64>) -> PyResult<Vec<[f64; 2]>> {
     Ok(d.rows().into_iter().map(|r| [r[0], r[1]]).collect())
 }
 
-/// [`Features::position`] as [`position_in`] takes it.
+/// The values of [`Features::position`] as [`position_in`] takes them.
 fn position_out<'py>(py: Python<'py>, d: Vec<[f64; 2]>) -> PyResult<Bound<'py, PyArray2<f64>>> {
     PyArray1::from_vec(py, d.concat()).reshape([d.len(), 2])
 }
 
 /// `features` as a dict of `scale`, `background` and `position` in [`features_in`]'s shapes,
-/// `None` for each not modelled.
+/// `None` for each not modelled, and `hold`, the names of those held.
 fn features_out<'py>(
     py: Python<'py>,
     f: Features,
     frame: [usize; 2],
 ) -> PyResult<Bound<'py, PyDict>> {
+    let refine = [
+        f.scale.as_ref().map(|s| s.refine),
+        f.background.as_ref().map(|b| b.refine),
+        f.position.as_ref().map(|p| p.refine),
+    ];
     let d = PyDict::new(py);
-    d.set_item("scale", f.scale.map(|s| PyArray1::from_vec(py, s)))?;
+    d.set_item("scale", f.scale.map(|s| PyArray1::from_vec(py, s.values)))?;
     let background = f
         .background
-        .map(|b| PyArray1::from_vec(py, b).reshape(frame));
+        .map(|b| PyArray1::from_vec(py, b.values).reshape(frame));
     d.set_item("background", background.transpose()?)?;
-    let position = f.position.map(|p| position_out(py, p));
+    let position = f.position.map(|p| position_out(py, p.values));
     d.set_item("position", position.transpose()?)?;
+    d.set_item("hold", hold_out(py, FEATURES.into_iter().zip(refine))?)?;
     Ok(d)
 }
 

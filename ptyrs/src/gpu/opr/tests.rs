@@ -10,6 +10,7 @@ use std::sync::Arc;
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 
+use crate::base::Feature;
 use crate::base::{C64, Probe, Stack, View};
 use crate::engine::ProbeVariation;
 use crate::gpu::{C32, EpochOrder, Kernels, Opr, OprKernels, OprPlanes, ViewAddr, ViewDims, Views};
@@ -137,13 +138,22 @@ fn rel_c(got: &[C32], want: &[C64]) -> f64 {
     worst_of(diff) / scale
 }
 
-/// A scan of [`NFRAME`] frames with `k` eigenmodes of `ny × nx` planes, with main-mode
-/// weights when `intensity`.
+/// A case's main-mode weights.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Main {
+    Absent,
+    Refined,
+    Held,
+}
+
+/// A scan of [`NFRAME`] frames with `k` eigenmodes of `ny × nx` planes and main-mode weights
+/// as `intensity`.
+#[derive(Clone, Copy)]
 struct Case {
     ny: usize,
     nx: usize,
     k: usize,
-    intensity: bool,
+    intensity: Main,
 }
 
 struct Start {
@@ -164,9 +174,12 @@ impl Case {
             .zip(signs)
             .map(|(w, s)| w.copysign(s))
             .collect();
-        let mut var = ProbeVariation::new(eigen, weights);
-        if self.intensity {
-            var = var.with_intensity(noise.range(NFRAME, 0.9, 1.1));
+        let mut var = ProbeVariation::new(eigen, Feature::refined(weights));
+        if self.intensity != Main::Absent {
+            var = var.with_intensity(Feature {
+                values: noise.range(NFRAME, 0.9, 1.1),
+                refine: self.intensity == Main::Refined,
+            });
         }
         Start {
             n,
@@ -177,12 +190,13 @@ impl Case {
 
     fn upload(&self, g: &Gpu, s: &Start) -> (Opr, DeviceBuffer<C32>) {
         let v = &s.var;
+        let c = v.intensity().map(|c| c.as_ref().map(|c| f32s(c)));
         let opr = Opr::new(
             &g.stream,
             s.n,
             &c32(v.eigenmodes().as_slice()),
-            &f32s(v.weights()),
-            v.intensity().map(f32s).as_deref(),
+            &f32s(&v.weights().values),
+            c.as_ref().map(|c| c.as_ref().map(Vec::as_slice)),
             NFRAME as u32,
         )
         .unwrap();
@@ -207,7 +221,7 @@ fn download(g: &Gpu, opr: &Opr) -> After {
     (
         opr.eigenmodes().to_host_vec(s).unwrap(),
         opr.weights().to_host_vec(s).unwrap(),
-        opr.intensity().map(|c| c.to_host_vec(s).unwrap()),
+        opr.intensity().map(|c| c.values.to_host_vec(s).unwrap()),
     )
 }
 
@@ -253,11 +267,13 @@ fn errors(cpu: &ProbeVariation, gpu: &After, start: &ProbeVariation) -> [f64; 3]
     };
     let (u, w, c) = gpu;
     let dw = rel(
-        delta32(w, start.weights()),
-        &delta(cpu.weights(), start.weights()),
+        delta32(w, &start.weights().values),
+        &delta(&cpu.weights().values, &start.weights().values),
     );
     let dc = match (c, cpu.intensity(), start.intensity()) {
-        (Some(c), Some(cpu), Some(was)) => rel(delta32(c, was), &delta(cpu, was)),
+        (Some(c), Some(cpu), Some(was)) => {
+            rel(delta32(c, &was.values), &delta(&cpu.values, &was.values))
+        }
         (None, None, None) => 0.0,
         _ => panic!("main-mode weights on one side only"),
     };
@@ -270,7 +286,7 @@ fn opr_step_matches_cpu() {
     let mut seed = 1;
     for (ny, nx) in [(8, 8), (7, 9)] {
         for k in [1, 2] {
-            for intensity in [false, true] {
+            for intensity in [Main::Absent, Main::Refined] {
                 let case = Case {
                     ny,
                     nx,
@@ -280,7 +296,7 @@ fn opr_step_matches_cpu() {
                 // Five frames from position 2: the order's frames 0, 2, 8, 1, 5.
                 let (cpu, gpu, start) = step(&g, &case, 2..7, seed);
                 seed += 1;
-                let what = format!("{ny}x{nx}, k = {k}, intensity {intensity}");
+                let what = format!("{ny}x{nx}, k = {k}, intensity {intensity:?}");
                 let [u, w, c] = errors(&cpu, &gpu[0], &start.var);
                 println!("{what}: eigenmodes {u:.3e}, weight steps {w:.3e}, main {c:.3e}");
                 assert!(u <= 1e-6, "{what}: eigenmodes {u:e}");
@@ -295,7 +311,7 @@ fn opr_step_matches_cpu() {
 #[test]
 fn opr_one_frame_batch_moves_only_the_main_mode() {
     let g = gpu();
-    for intensity in [false, true] {
+    for intensity in [Main::Absent, Main::Refined] {
         let case = Case {
             ny: 7,
             nx: 9,
@@ -308,13 +324,62 @@ fn opr_one_frame_batch_moves_only_the_main_mode() {
         assert_eq!(cpu.weights(), v.weights());
         let (u, w, c) = &gpu[0];
         assert_eq!(*u, c32(v.eigenmodes().as_slice()), "eigenmodes moved");
-        assert_eq!(*w, f32s(v.weights()), "weights moved");
+        assert_eq!(*w, f32s(&v.weights().values), "weights moved");
         let [_, _, dc] = errors(&cpu, &gpu[0], v);
-        println!("intensity {intensity}: main {dc:.3e}");
+        println!("intensity {intensity:?}: main {dc:.3e}");
         assert!(dc <= 5e-5, "main-mode weight step {dc:e}");
         if let (Some(c), Some(was)) = (c, v.intensity()) {
-            assert_ne!(*c, f32s(was), "main-mode weights did not move");
+            assert_ne!(*c, f32s(&was.values), "main-mode weights did not move");
         }
+    }
+}
+
+/// Held main-mode weights keep their values on the device as on the CPU, and the eigenmodes
+/// and weights step as with them refined.
+#[test]
+fn opr_held_main_mode_matches_cpu() {
+    let g = gpu();
+    for k in [1, 2] {
+        let held = Case {
+            ny: 7,
+            nx: 9,
+            k,
+            intensity: Main::Held,
+        };
+        let refined = Case {
+            intensity: Main::Refined,
+            ..held
+        };
+        let (cpu, gpu, start) = step(&g, &held, 2..7, 31);
+        let (cpu_r, gpu_r, _) = step(&g, &refined, 2..7, 31);
+        let was = start.var.intensity().unwrap();
+        assert!(!was.refine);
+        assert_eq!(
+            cpu.intensity(),
+            Some(was),
+            "k = {k}: CPU main-mode weights moved"
+        );
+        let (u, w, c) = &gpu[0];
+        assert_eq!(
+            *c,
+            Some(f32s(&was.values)),
+            "k = {k}: device main-mode weights moved"
+        );
+        assert_ne!(
+            gpu_r[0].2, *c,
+            "k = {k}: refined main-mode weights did not move"
+        );
+        assert_eq!(
+            (cpu.eigenmodes(), cpu.weights().values.as_slice()),
+            (cpu_r.eigenmodes(), cpu_r.weights().values.as_slice()),
+            "k = {k}: CPU"
+        );
+        assert_eq!((u, w), (&gpu_r[0].0, &gpu_r[0].1), "k = {k}: device");
+        let [du, dw, _] = errors(&cpu, &gpu[0], &start.var);
+        println!("k = {k} held: eigenmodes {du:.3e}, weight steps {dw:.3e}");
+        assert!(du <= 1e-6, "k = {k}: eigenmodes {du:e}");
+        assert!(dw <= 5e-6, "k = {k}: weight steps {dw:e}");
+        assert_eq!(gpu[0], gpu[1], "k = {k}: two runs differ");
     }
 }
 
@@ -324,7 +389,7 @@ fn opr_unique_matches_cpu() {
     let mut seed = 21;
     for (ny, nx) in [(8, 8), (7, 9)] {
         for k in [1, 2] {
-            for intensity in [false, true] {
+            for intensity in [Main::Absent, Main::Refined] {
                 let case = Case {
                     ny,
                     nx,
@@ -356,7 +421,7 @@ fn opr_unique_matches_cpu() {
                     .unwrap();
                 let got = out.to_host_vec(&g.stream).unwrap();
                 let err = rel_c(&got, &want);
-                let what = format!("{ny}x{nx}, k = {k}, intensity {intensity}");
+                let what = format!("{ny}x{nx}, k = {k}, intensity {intensity:?}");
                 println!("{what}: unique {err:.3e}");
                 assert!(err <= 5e-7, "{what}: unique {err:e}");
             }

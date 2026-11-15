@@ -1,9 +1,10 @@
-"""Ptycho and GpuPtycho features: the scale, background and position features refined by AP,
-DM, RAAR, ML and rPIE on the GPU's fused passes against the CPU binding's f64, as the
+"""Ptycho and GpuPtycho features: the scale, background and position features refined or held
+by AP, DM, RAAR, ML and rPIE on the GPU's fused passes against the CPU binding's f64, as the
 engine's own `tests/engine_gpu.rs` `features_match_cpu` compares them, to its 1e-4 (offsets
-to 1e-4 pixels); the background's detector order against the truth's, the offsets' axes
-against the binding's own forward model; the LLK of given arrays under the features against
-numpy's; the round trip and the refusals."""
+to 1e-4 pixels), and a held one kept exactly; features set again between calls, with the
+same refine and another; the background's detector order against the truth's, the offsets'
+axes against the binding's own forward model; the LLK of given arrays under the features
+against numpy's; the round trip and the refusals."""
 
 import numpy as np
 import pytest
@@ -53,8 +54,8 @@ def featured():
 
 
 def features_match_cpu(start, algorithm, params, ncycle, **features):
-    """`ncycle` of `algorithm` from `start` modelling `features` on the GPU and the CPU: every
-    LLK record, the object, the probe and the features within 1e-4. Returns the CPU state."""
+    """`ncycle` of `algorithm` from `start` modelling `features` on the GPU and the CPU, as
+    `states_match`. Returns the CPU and GPU states."""
     scan, obj, probe = start
     cpu = ptyrs.Ptycho(scan, obj, probe)
     gpu = ptyrs.GpuPtycho(scan, obj, probe, DEVICE, **FUSED)
@@ -62,7 +63,16 @@ def features_match_cpu(start, algorithm, params, ncycle, **features):
     gpu.set_features(**features)
     getattr(cpu, algorithm)(ncycle, **params)
     getattr(gpu, algorithm)(ncycle, **params)
-    assert gpu.cycle == cpu.cycle
+    states_match(gpu, cpu, ncycle)
+    for key in ("scale", "background", "position"):
+        assert (features.get(key) is None) == (cpu.features[key] is None), key
+    return cpu, gpu
+
+
+def states_match(gpu, cpu, ncycle):
+    """`ncycle` cycles on each, every LLK record, the object, the probe and the features
+    within 1e-4, the same features modelled and held."""
+    assert gpu.cycle == cpu.cycle == ncycle
     hg, hc = gpu.history, cpu.history
     assert list(hg["cycle"]) == list(hc["cycle"]) and hg["algorithm"] == hc["algorithm"]
     assert len(hc["cycle"]) == ncycle
@@ -72,8 +82,9 @@ def features_match_cpu(start, algorithm, params, ncycle, **features):
     assert rel_l2(gpu.object, cpu.object) < TOL
     assert rel_l2(gpu.probe, cpu.probe) < TOL
     fg, fc = gpu.features, cpu.features
+    assert fg["hold"] == fc["hold"]
     for key in ("scale", "background", "position"):
-        assert (fg[key] is None) == (features.get(key) is None) == (fc[key] is None), key
+        assert (fg[key] is None) == (fc[key] is None), key
     for key in ("scale", "background"):
         if fc[key] is not None:
             err = rel(fg[key], fc[key]).max()
@@ -81,7 +92,6 @@ def features_match_cpu(start, algorithm, params, ncycle, **features):
     if fc["position"] is not None:
         err = np.abs(fg["position"] - fc["position"]).max()
         assert err < TOL, f"position: {err:.2e} pixels"
-    return cpu
 
 
 CYCLES = {
@@ -107,7 +117,7 @@ def test_scale_and_background_match_cpu(featured, algorithm):
     """Both stepped features from a scale of 1 and a flat background of 1 on a scan with a
     flux and a background; on the CPU the background nears the truth's in detector order."""
     flat = np.ones((N, N))
-    cpu = features_match_cpu(featured(True, True), algorithm, CYCLES[algorithm], NCYCLE,
+    cpu, _ = features_match_cpu(featured(True, True), algorithm, CYCLES[algorithm], NCYCLE,
                              scale=np.ones(NPOS), background=flat)
     assert off_truth_background(cpu.features["background"]) < 0.7 * off_truth_background(flat)
 
@@ -119,8 +129,54 @@ def test_position_matches_cpu(featured, algorithm):
     params = CYCLES.get(algorithm, dict(obj_alpha=0.5, probe_alpha=0.5, batch_size=4,
                                         calc_llk=1))
     d0 = drawn_offsets(NPOS)
-    cpu = features_match_cpu(featured(False, False), algorithm, params, NCYCLE, position=d0)
+    cpu, _ = features_match_cpu(featured(False, False), algorithm, params, NCYCLE,
+                                position=d0)
     assert (cpu.features["position"] ** 2).mean() < (d0 ** 2).mean()
+
+
+HELD = ([("scale", a) for a in CYCLES] + [("background", a) for a in CYCLES]
+        + [("position", a) for a in [*CYCLES, "rpie"]])
+
+
+@pytest.mark.parametrize("key, algorithm", HELD)
+def test_held_feature_matches_cpu(featured, key, algorithm):
+    """A held feature: the scale or the background beside the other refined, from a scale of
+    1 and a flat background of 1, or the offsets alone at `drawn_offsets`. Both backends keep
+    its values (the device their f32) while the refined one moves, and match."""
+    if key == "position":
+        start, features = featured(False, False), dict(position=drawn_offsets(NPOS))
+        params = CYCLES.get(algorithm, dict(obj_alpha=0.5, probe_alpha=0.5, batch_size=4,
+                                            calc_llk=1))
+    else:
+        start, features = featured(True, True), dict(scale=np.ones(NPOS),
+                                                      background=np.ones((N, N)))
+        params = CYCLES[algorithm]
+    cpu, gpu = features_match_cpu(start, algorithm, params, NCYCLE, hold=(key,), **features)
+    assert cpu.features["hold"] == (key,)
+    for k, v in features.items():
+        assert np.array_equal(cpu.features[k], v) == (k == key), k
+        assert np.array_equal(gpu.features[k], v.astype(np.float32)) == (k == key), k
+
+
+def test_refine_change_between_calls(featured):
+    """AP calls between which each backend's features are set again from its own: held scale
+    (another refine: the device rebuilds its buffers and graphs), new values at that refine
+    (written in place), then refined again (rebuilt). The held scale keeps the values it is
+    set to, the refined one moves, and the GPU matches the CPU after every call."""
+    scan, obj, probe = featured(True, True)
+    cpu = ptyrs.Ptycho(scan, obj, probe)
+    gpu = ptyrs.GpuPtycho(scan, obj, probe, DEVICE, **FUSED)
+    ncycle, ones = 5, np.ones(NPOS)
+    steps = [dict(scale=ones, background=np.ones((N, N))), dict(hold=("scale",)),
+             dict(scale=np.full(NPOS, 0.9)), dict(hold=())]
+    for call, step in enumerate(steps, 1):
+        for p in (cpu, gpu):
+            p.set_features(**{**p.features, **step})
+            set_to = p.features["scale"]
+            p.ap(ncycle, **CYCLES["ap"])
+            held = p.features["hold"] == ("scale",)
+            assert np.array_equal(p.features["scale"], set_to) == held, call
+        states_match(gpu, cpu, call * ncycle)
 
 
 def object_plane_phase(p, obj, probe):
@@ -193,7 +249,7 @@ def test_features_round_trip_and_refusals(featured):
     gpu = ptyrs.GpuPtycho(scan, obj, probe, DEVICE, **FUSED)
     m1 = ptyrs.GpuPtycho(scan, obj, probe, DEVICE, stack_size=7, fused=False)
     for p in (cpu, gpu, m1):
-        assert p.features == dict(scale=None, background=None, position=None)
+        assert p.features == dict(scale=None, background=None, position=None, hold=())
     with pytest.raises(ValueError, match="fused: true"):
         m1.set_features(scale=np.ones(NPOS))
     m1.set_features()
@@ -206,6 +262,18 @@ def test_features_round_trip_and_refusals(featured):
         assert np.array_equal(cpu.features[key], v), key
         # the device keeps f32
         assert np.array_equal(gpu.features[key], v.astype(np.float32)), key
+    for p in (cpu, gpu):
+        assert p.features["hold"] == ()
+        # in the order of the features, whatever the order asked
+        p.set_features(**half, hold=("position", "scale"))
+        f = p.features
+        assert f["hold"] == ("scale", "position")
+        p.set_features(**f)
+        assert all(np.array_equal(p.features[k], v) for k, v in f.items() if k != "hold")
+        assert p.features["hold"] == ("scale", "position")
+        with pytest.raises(TypeError):
+            p.set_features(**half, hold="scale")
+        p.set_features(**half)
 
     def one_bad(v, bad):
         v = v.copy()
@@ -219,12 +287,15 @@ def test_features_round_trip_and_refusals(featured):
     bad += [dict(scale=one_bad(ones, v)) for v in (0, -1, np.nan, np.inf)]
     bad += [dict(background=one_bad(bg, v)) for v in (-1, np.nan, np.inf)]
     bad += [dict(position=one_bad(np.zeros((NPOS, 2)), v)) for v in (np.nan, np.inf)]
+    bad += [dict(hold=("probe",)), dict(scale=None, hold=("scale",)),
+            dict(background=None, hold=("background", "position"))]
     for b in bad:
         for p in (cpu, gpu):
             with pytest.raises(ValueError):
                 p.set_features(**{**half, **b})
             for key, v in half.items():
                 assert np.allclose(p.features[key], v), key
+            assert p.features["hold"] == ()
     with pytest.raises(ValueError):
         cpu.rpie(1, batch_size=4)
     with pytest.raises(ValueError):

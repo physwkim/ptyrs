@@ -14,6 +14,7 @@ use ptyrs_kernels::opr::{OPR_SUMS, OprFrames, OprScan, opr_kernels};
 use ptyrs_kernels::pixel::PIXEL_THREADS;
 use ptyrs_kernels::position::BatchSpan;
 
+use crate::base::Feature;
 use crate::gpu::fused::GRID_Y_MAX;
 use crate::gpu::ops::grid_1d;
 use crate::gpu::position::{ONE_BLOCK, chunks};
@@ -30,8 +31,10 @@ pub struct OprKernels {
 }
 
 /// The OPR state of one scan: `k ≥ 1` eigenmodes `[k, n]`, their weights `w_fi` at `f k + i`
-/// and, when refined, the main mode's weights `c_f` at `f`, both by scan frame, with the
-/// scratch of [`OprKernels::step`] for batches of up to `nb_max` frames.
+/// and, when modelled, the main mode's weights `c_f` at `f`, refined or held, both by scan
+/// frame, with the scratch of [`OprKernels::step`] for batches of up to `nb_max` frames.
+/// The weights are refined; holding them waits for the deflation coefficients to leave
+/// `opr_weights`.
 pub struct Opr {
     n: usize,
     k: u32,
@@ -39,7 +42,7 @@ pub struct Opr {
     nb_max: u32,
     eigenmodes: DeviceBuffer<C32>,
     weights: DeviceBuffer<f32>,
-    intensity: Option<DeviceBuffer<f32>>,
+    intensity: Option<Feature<DeviceBuffer<f32>>>,
     /// [`OPR_SUMS`] per chunk of each batch frame.
     sums: DeviceBuffer<f32>,
     /// Two plane sums, per chunk.
@@ -51,14 +54,14 @@ pub struct Opr {
 
 impl Opr {
     /// Uploads `eigenmodes` (`k n` values, `k ≥ 1`), `weights` (`k` per scan frame) and, when
-    /// refined, `intensity` (one per scan frame), for planes of `n` pixels and batches of up
+    /// modelled, `intensity` (one per scan frame), for planes of `n` pixels and batches of up
     /// to `nb_max` frames.
     pub fn new(
         stream: &CudaStream,
         n: usize,
         eigenmodes: &[C32],
         weights: &[f32],
-        intensity: Option<&[f32]>,
+        intensity: Option<Feature<&[f32]>>,
         nb_max: u32,
     ) -> Result<Self, Error> {
         let bad = |what: String| Err(Error::Shape(what));
@@ -74,9 +77,10 @@ impl Opr {
         }
         let nframe = weights.len() / k;
         if let Some(c) = intensity
-            && c.len() != nframe
+            && c.values.len() != nframe
         {
-            return bad(format!("{} main-mode weights for {nframe} frames", c.len()));
+            let have = c.values.len();
+            return bad(format!("{have} main-mode weights for {nframe} frames"));
         }
         if nb_max == 0 || nb_max as usize > nframe || nb_max as u64 > GRID_Y_MAX {
             return bad(format!("batches of {nb_max} of {nframe} frames"));
@@ -93,9 +97,13 @@ impl Opr {
             nb_max,
             eigenmodes: DeviceBuffer::from_host(stream, eigenmodes)?,
             weights: DeviceBuffer::from_host(stream, weights)?,
-            intensity: intensity
-                .map(|c| DeviceBuffer::from_host(stream, c))
-                .transpose()?,
+            intensity: match intensity {
+                Some(c) => Some(Feature {
+                    values: DeviceBuffer::from_host(stream, c.values)?,
+                    refine: c.refine,
+                }),
+                None => None,
+            },
             sums: DeviceBuffer::zeroed(stream, OPR_SUMS as usize * nb * chunks(n))?,
             part: DeviceBuffer::zeroed(stream, 2 * chunks(n))?,
             e: DeviceBuffer::zeroed(stream, n)?,
@@ -113,8 +121,8 @@ impl Opr {
         &self.weights
     }
 
-    /// `c_f` by scan frame, when refined.
-    pub fn intensity(&self) -> Option<&DeviceBuffer<f32>> {
+    /// `c_f` by scan frame, when modelled.
+    pub fn intensity(&self) -> Option<&Feature<DeviceBuffer<f32>>> {
         self.intensity.as_ref()
     }
 
@@ -145,7 +153,10 @@ impl Opr {
         OprScan {
             order: dptr::<u32, u32>(ids).cast_const(),
             weights: dptr(&self.weights),
-            intensity: self.intensity.as_ref().map_or(ptr::null_mut(), dptr),
+            intensity: self
+                .intensity
+                .as_ref()
+                .map_or(ptr::null_mut(), |c| dptr(&c.values)),
             k: self.k,
         }
     }
@@ -202,7 +213,7 @@ impl OprKernels {
             opr.weights.storage(),
             ids.storage(),
         ];
-        reads.extend(opr.intensity.as_ref().map(|c| c.storage()));
+        reads.extend(opr.intensity.as_ref().map(|c| c.values.storage()));
         let scan = opr.scan(ids);
         self.base.launch(ctx, &reads, &[out.storage()], |stream| {
             // SAFETY: `span` lies in the scan's positions and `order` maps them to its
@@ -223,10 +234,10 @@ impl OprKernels {
     }
 
     /// `ProbeVariation::step` on the batch of epoch positions `batch` through `order`, from
-    /// its [`OprPlanes`] and `P_0`, the first `n` values of `probe`: the main-mode weights
-    /// first, then, for two frames or more, each eigenmode and its weights in turn. Every sum
-    /// over a frame's pixels is totalled in chunk order and every sum over the batch in frame
-    /// order; `Σ |U″|²` is its normalization's `n²`.
+    /// its [`OprPlanes`] and `P_0`, the first `n` values of `probe`: the refined main-mode
+    /// weights first, then, for two frames or more, each eigenmode and its weights in turn.
+    /// Every sum over a frame's pixels is totalled in chunk order and every sum over the batch
+    /// in frame order; `Σ |U″|²` is its normalization's `n²`.
     pub fn step(
         &self,
         ctx: &ExecutionContext,
@@ -252,7 +263,7 @@ impl OprKernels {
         let ids = order.ids();
         let scan = opr.scan(ids);
         let (nu, k, line) = (n as u32, opr.k, grid_1d(n)?);
-        if let Some(c) = &opr.intensity {
+        if let Some(c) = opr.intensity.as_ref().filter(|c| c.refine) {
             let of = SumsOf {
                 a: Shared::Probe(probe),
                 dv: Some((d, vv)),
@@ -260,19 +271,20 @@ impl OprKernels {
             };
             self.frame_sums(ctx, opr, span, of)?;
             let reads = [opr.sums.storage(), ids.storage()];
-            self.base.launch(ctx, &reads, &[c.storage()], |stream| {
-                // SAFETY: `span` lies in the scan's positions, `sums` and `c` sized by
-                // `Opr::new`; one block.
-                unsafe {
-                    self.module.opr_intensity(
-                        stream,
-                        ONE_BLOCK,
-                        dptr::<f32, f32>(&opr.sums).cast_const(),
-                        span,
-                        scan,
-                    )
-                }
-            })?;
+            self.base
+                .launch(ctx, &reads, &[c.values.storage()], |stream| {
+                    // SAFETY: `span` lies in the scan's positions, `sums` and `c` sized by
+                    // `Opr::new`; one block.
+                    unsafe {
+                        self.module.opr_intensity(
+                            stream,
+                            ONE_BLOCK,
+                            dptr::<f32, f32>(&opr.sums).cast_const(),
+                            span,
+                            scan,
+                        )
+                    }
+                })?;
         }
         if nb < 2 {
             return Ok(());

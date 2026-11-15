@@ -308,6 +308,12 @@ impl Bufs<'_> {
         params: &BhParams,
         cg: bool,
     ) -> Result<(), GpuError> {
+        // K1–K3 go here: a held position's batches without the offsets' partials.
+        if bh.moved.is_some() && !self.features.position_refined() {
+            return Err(GpuError::Shape(
+                "GPU BH does not hold the position yet".into(),
+            ));
+        }
         // Each frame is in one batch, stepped after its batch's passes: the offsets the epoch
         // starts from serve every batch.
         let moved = (bh.moved.as_deref_mut()).map(|m| (&mut m.probes, ()));
@@ -483,7 +489,7 @@ impl Bufs<'_> {
         }) = moved
         {
             self.bh
-                .pos_update(ctx, &step, &mut off, offsets, bh.steps)?;
+                .pos_update(ctx, &step, &mut off, offsets.values, bh.steps)?;
         }
         self.bh_update(ctx, bh, rho2, step.record)
     }
@@ -629,7 +635,7 @@ impl Bufs<'_> {
         }
         self.bh.step(ctx, &dims, bh.parts, &d, &step, bh.steps)?;
         self.bh
-            .pos_update(ctx, &step, &mut off, offsets, bh.steps)?;
+            .pos_update(ctx, &step, &mut off, offsets.values, bh.steps)?;
         self.bh_update(ctx, bh, rho2, step.record)
     }
 
@@ -900,7 +906,7 @@ impl Bufs<'_> {
         }
         self.bh.step(ctx, &dims, bh.parts, &d, &step, bh.steps)?;
         self.bh
-            .pos_update(ctx, &step, &mut off, offsets, bh.steps)?;
+            .pos_update(ctx, &step, &mut off, offsets.values, bh.steps)?;
         self.bh_update(ctx, bh, rho2, step.record)
     }
 

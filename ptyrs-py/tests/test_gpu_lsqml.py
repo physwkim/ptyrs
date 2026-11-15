@@ -2,7 +2,7 @@
 as the engine's own `tests/engine_gpu_lsqml.rs` compares them, to its 1e-4: each epoch's LLK
 record and the final arrays of 12 epochs, and after a fresh GPU run of each of the first 3,
 the last epoch's steps and the arrays; M1 and fused passes, and the fused ones modelling
-`drawn_offsets`, whose changes are compared too. Each batch's step sizes are compared as a
+`drawn_offsets`, whose changes are compared too, or held, which both keep. Each batch's step sizes are compared as a
 vector, to its largest: a frame's `a_probe` can be 1e-3 of the others' (its probe direction
 nearly orthogonal to its residual), and there the GPU's `f32` rounding of their size is
 1e-4 of its own."""
@@ -78,6 +78,35 @@ def test_lsqml_matches_cpu(scenario, cost, batch, fused, moved):
 
 
 @COSTS
+def test_lsqml_held_position_matches_cpu(scenario, cost):
+    """`drawn_offsets` held on both: as `test_lsqml_matches_cpu`, and the offsets kept (the
+    device's f32 of them)."""
+    scan, obj, probe, d0 = start(scenario, True)
+    state = ptyrs.Ptycho(scan, obj, probe)
+    cpu = ptyrs.Lsqml(12, cost, 7, position=d0, hold=("position",))
+    assert cpu.hold == ("position",)
+    state.set_features(position=d0)
+    o, p = obj[None], probe
+    want = []
+    for _ in range(NEPOCH):
+        o, p, _ = cpu.epoch(state.views, o, p)
+        want.append(state.llk(o[0], p))
+    np.testing.assert_array_equal(cpu.position, d0)
+
+    gpu = ptyrs.GpuPtycho(scan, obj, probe, DEVICE, stack_size=7, llk_slots=3, fused=True)
+    gpu.set_features(position=d0, hold=("position",))
+    gpu.lsqml(NEPOCH, 1, 12, cost, 7)
+    h = gpu.history
+    for key in ("poisson", "gaussian", "euclidian", "nb_photons_calc"):
+        err = rel(h[key], [w[key] for w in want]).max()
+        assert err < TOL, f"llk {key}: {err:.2e}"
+    assert rel_l2(gpu.object, o[0]) < TOL
+    assert rel_l2(gpu.probe, p) < TOL
+    assert gpu.features["hold"] == ("position",)
+    np.testing.assert_array_equal(gpu.features["position"], d0.astype(np.float32))
+
+
+@COSTS
 @BATCHES
 @RUNS
 def test_lsqml_steps_match_cpu(scenario, cost, batch, fused, moved):
@@ -115,6 +144,8 @@ def test_lsqml_rejects(scenario):
         ptyrs.Lsqml(8, "poisson", 7, position=np.zeros((npos, 3)))
     with pytest.raises(ValueError, match="finite"):
         ptyrs.Lsqml(8, "poisson", 7, position=np.full((npos, 2), np.nan))
+    with pytest.raises(ValueError, match="hold"):
+        ptyrs.Lsqml(8, "poisson", 7, hold=("position",))
     short = ptyrs.Lsqml(8, "poisson", 7, position=np.zeros((npos - 1, 2)))
     with pytest.raises(ValueError, match=f"{npos - 1} position offsets for {npos} frames"):
         short.epoch(ptyrs.Ptycho(scan, obj, probe).views, obj[None], probe)

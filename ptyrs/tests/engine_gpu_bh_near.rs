@@ -4,7 +4,7 @@
 use std::slice;
 
 use ptyrs::base::{C64, Stack};
-use ptyrs::engine::{Bh, BhParams, BhStep, Features, Ptycho, Sampling};
+use ptyrs::engine::{Bh, BhParams, BhStep, Feature, Features, Ptycho, Sampling};
 
 #[path = "common/near.rs"]
 mod near;
@@ -121,7 +121,7 @@ fn bh_steps_match_cpu_under_every_propagator() {
 fn bh_position_matches_cpu_under_every_propagator() {
     const NEPOCH: usize = 4;
     let moved = Features {
-        position: Some(drawn_offsets()),
+        position: Some(Feature::refined(drawn_offsets())),
         ..Features::default()
     };
     for c in cases() {
@@ -139,13 +139,13 @@ fn bh_position_matches_cpu_under_every_propagator() {
                     &mut pr,
                 );
             }
-            let want = bh.features().position.clone().unwrap();
+            let want = bh.features().position.clone().unwrap().values;
             let scale = want.iter().flatten().fold(0.0f64, |m, v| m.max(v.abs()));
             for graph in [false, true] {
                 let mut gpu = c.gpu(graph);
                 gpu.set_features(&moved).unwrap();
                 gpu.bh(&p, NEPOCH, 0).unwrap();
-                let got = gpu.features().unwrap().position.unwrap();
+                let got = gpu.features().unwrap().position.unwrap().values;
                 let offset = worst_of(
                     (got.iter().flatten().zip(want.iter().flatten())).map(|(g, w)| (g - w).abs()),
                 ) / scale;
@@ -174,7 +174,7 @@ fn bh_position_matches_cpu_under_every_propagator() {
 fn bh_full_object_matches_cpu_under_every_propagator() {
     const NEPOCH: usize = 4;
     let moved = Features {
-        position: Some(drawn_offsets()),
+        position: Some(Feature::refined(drawn_offsets())),
         ..Features::default()
     };
     for c in cases() {
@@ -203,14 +203,19 @@ fn bh_full_object_matches_cpu_under_every_propagator() {
                 cpu.set_sampling(Sampling::FullObject);
                 cpu.set_features(want.clone()).unwrap();
                 let llk = cpu.llk().poisson;
-                let want = want.position.unwrap_or_default();
+                let want = want.position.map(|d| d.values).unwrap_or_default();
                 let scale = want.iter().flatten().fold(0.0f64, |m, v| m.max(v.abs()));
                 for graph in [false, true] {
                     let mut gpu = c.gpu(graph);
                     gpu.set_sampling(Sampling::FullObject).unwrap();
                     gpu.set_features(&features).unwrap();
                     gpu.bh(&p, NEPOCH, 1).unwrap();
-                    let got = gpu.features().unwrap().position.unwrap_or_default();
+                    let got = gpu
+                        .features()
+                        .unwrap()
+                        .position
+                        .map(|d| d.values)
+                        .unwrap_or_default();
                     assert_eq!(got.len(), want.len());
                     let offset = worst_of(
                         (got.iter().flatten().zip(want.iter().flatten()))

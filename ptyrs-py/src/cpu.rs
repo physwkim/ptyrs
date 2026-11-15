@@ -10,14 +10,15 @@ use ptyrs::base::{AddrTable, C64, Geometry, Object, Positions, Probe};
 use ptyrs::engine::{Features, Observed, ProbeVariation, obj_probe_to_psi};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
+use pyo3::types::{PyDict, PyList, PyTuple};
 
 use crate::{Error, Scan, history, llk_dict, objects_in, objects_out, stack_in, stack_out};
 
-/// The features of `position`'s offsets alone, as LSQML and BH refine.
-fn position_only(position: Option<PyReadonlyArray2<'_, f64>>) -> PyResult<Features> {
+/// The features of `position`'s offsets alone, as LSQML and BH model them, held if `held`.
+fn position_only(position: Option<PyReadonlyArray2<'_, f64>>, held: bool) -> PyResult<Features> {
+    let position = position.map(|d| Ok::<_, PyErr>(crate::feature(crate::position_in(d)?, held)));
     Ok(Features {
-        position: position.map(crate::position_in).transpose()?,
+        position: position.transpose()?,
         ..Features::default()
     })
 }
@@ -25,9 +26,9 @@ fn position_only(position: Option<PyReadonlyArray2<'_, f64>>) -> PyResult<Featur
 /// An error unless `features` hold one offset per frame of `nframe`, if any.
 fn offsets_fit(features: &Features, nframe: usize) -> PyResult<()> {
     match &features.position {
-        Some(d) if d.len() != nframe => Err(PyValueError::new_err(format!(
+        Some(d) if d.values.len() != nframe => Err(PyValueError::new_err(format!(
             "{} position offsets for {nframe} frames",
-            d.len()
+            d.values.len()
         ))),
         _ => Ok(()),
     }
@@ -352,23 +353,26 @@ impl Ptycho {
             .map_err(Error::from)?)
     }
 
-    /// Models and refines these features from here on, in place of the current ones:
-    /// `scale` `[nframe]`, `background` `[ny, nx]` in the counts' detector order and
-    /// `position` `[nframe, 2]` offsets `[dy, dx]` in object pixels from each view's corner;
-    /// each left out is not modelled. An error leaves the current ones.
-    #[pyo3(signature = (*, scale = None, background = None, position = None))]
+    /// Models these features from here on, in place of the current ones: `scale` `[nframe]`,
+    /// `background` `[ny, nx]` in the counts' detector order and `position` `[nframe, 2]`
+    /// offsets `[dy, dx]` in object pixels from each view's corner; each left out is not
+    /// modelled. Each is refined unless `hold` names it, held at its values otherwise; `hold`
+    /// naming one not given is a `ValueError`. An error leaves the current ones.
+    #[pyo3(signature = (*, scale = None, background = None, position = None, hold = Vec::new()))]
     fn set_features(
         &mut self,
         scale: Option<PyReadonlyArray1<'_, f64>>,
         background: Option<PyReadonlyArray2<'_, f64>>,
         position: Option<PyReadonlyArray2<'_, f64>>,
+        hold: Vec<String>,
     ) -> PyResult<()> {
         let frame = self.inner.addr().frame_shape();
-        let features = crate::features_in(scale, background, position, frame)?;
+        let features = crate::features_in(scale, background, position, &hold, frame)?;
         Ok(self.inner.set_features(features).map_err(Error::from)?)
     }
 
-    /// The features modelled as `set_features` takes them, `None` for each not modelled.
+    /// The features modelled as `set_features` takes them, `None` for each not modelled, with
+    /// `hold` naming those held.
     #[getter]
     fn features<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let frame = self.inner.addr().frame_shape();
@@ -448,6 +452,9 @@ impl Ptycho {
     }
 }
 
+/// The names of `Lsqml`'s refined quantities, as `hold` takes them.
+const LSQML: [&str; 3] = ["position", "weights", "intensity"];
+
 /// `Lsqml`'s `opr`: eigenmodes, weights and main-mode weights.
 type Opr<'py> = (
     PyReadonlyArray3<'py, C64>,
@@ -456,8 +463,11 @@ type Opr<'py> = (
 );
 
 /// `eigenmodes` `[k, ny, nx]` (k ≥ 1), `weights` `[nframe, k]` and `intensity` `[nframe]` as
-/// the engine's [`ProbeVariation`].
-fn variation((eigenmodes, weights, intensity): Opr<'_>) -> PyResult<ProbeVariation> {
+/// the engine's [`ProbeVariation`], the weights and the intensity held as `held` says.
+fn variation(
+    (eigenmodes, weights, intensity): Opr<'_>,
+    [hold_weights, hold_intensity]: [bool; 2],
+) -> PyResult<ProbeVariation> {
     let eigenmodes = stack_in(eigenmodes)?;
     let k = eigenmodes.len();
     let w = weights.as_array();
@@ -467,7 +477,8 @@ fn variation((eigenmodes, weights, intensity): Opr<'_>) -> PyResult<ProbeVariati
             w.shape()
         )));
     }
-    let var = ProbeVariation::new(eigenmodes, w.iter().copied().collect());
+    let weights = crate::feature(w.iter().copied().collect(), hold_weights);
+    let var = ProbeVariation::new(eigenmodes, weights);
     let Some(c) = intensity else {
         return Ok(var);
     };
@@ -479,13 +490,13 @@ fn variation((eigenmodes, weights, intensity): Opr<'_>) -> PyResult<ProbeVariati
             w.nrows()
         )));
     }
-    Ok(var.with_intensity(c))
+    Ok(var.with_intensity(crate::feature(c, hold_intensity)))
 }
 
 /// An error unless `var` holds weights for every frame of `nframe` and eigenmodes of `plane`.
 fn variation_fits(var: &ProbeVariation, nframe: usize, plane: [usize; 2]) -> PyResult<()> {
     let e = var.eigenmodes();
-    let rows = var.weights().len() / e.len();
+    let rows = var.weights().values.len() / e.len();
     if rows != nframe || e.plane_shape() != plane {
         return Err(PyValueError::new_err(format!(
             "eigenmodes {:?} and {rows} weight rows for {nframe} frames of {plane:?} probe planes",
@@ -497,13 +508,14 @@ fn variation_fits(var: &ProbeVariation, nframe: usize, plane: [usize; 2]) -> PyR
 
 /// LSQML across epochs (`ptyrs::engine::Lsqml`); `cost` is `"amplitude"` or `"poisson"`.
 /// With `position`, `[nframe, 2]` offsets as `Ptycho.set_features` takes them, every epoch
-/// models and refines them. With `opr`, `(eigenmodes, weights, intensity)` of eigenmodes `U_i`
+/// models them. With `opr`, `(eigenmodes, weights, intensity)` of eigenmodes `U_i`
 /// `[k, ny, nx]`, weights `w_fi` `[nframe, k]` and main-mode weights `c_f` `[nframe]` or
-/// `None`, it models and refines OPR of probe mode 0, frame `f` seeing
-/// `c_f·P_0 + Σ_i w_fi·U_i`, and `c_f` too unless `None` (1 then); `Ptycho.llk` does not
-/// model it. The offsets enter as `sampling`, `"patch"` or `"full_object"` as
-/// `Ptycho.set_sampling` takes it, and without, as `Sampling::auto` of the optics, object and
-/// probe of the first epoch.
+/// `None`, it models OPR of probe mode 0, frame `f` seeing `c_f·P_0 + Σ_i w_fi·U_i`, `c_f` 1
+/// when `None`; `Ptycho.llk` does not model it. The eigenmodes move with the probe; the
+/// offsets, the weights and `c_f` are each refined unless `hold` names it, `"position"`,
+/// `"weights"` or `"intensity"`, and `hold` naming one not given is a `ValueError`. The
+/// offsets enter as `sampling`, `"patch"` or `"full_object"` as `Ptycho.set_sampling` takes
+/// it, and without, as `Sampling::auto` of the optics, object and probe of the first epoch.
 #[pyclass]
 pub(crate) struct Lsqml {
     inner: ptyrs::engine::Lsqml,
@@ -513,7 +525,8 @@ pub(crate) struct Lsqml {
 #[pymethods]
 impl Lsqml {
     #[new]
-    #[pyo3(signature = (batch_size, cost, seed, *, position = None, opr = None, sampling = None))]
+    #[pyo3(signature = (batch_size, cost, seed, *, position = None, opr = None, sampling = None,
+                        hold = Vec::new()))]
     fn new(
         batch_size: usize,
         cost: &str,
@@ -521,7 +534,14 @@ impl Lsqml {
         position: Option<PyReadonlyArray2<'_, f64>>,
         opr: Option<Opr<'_>>,
         sampling: Option<&str>,
+        hold: Vec<String>,
     ) -> PyResult<Self> {
+        let given = [
+            position.is_some(),
+            opr.is_some(),
+            opr.as_ref().is_some_and(|o| o.2.is_some()),
+        ];
+        let [hold_position, hold_weights, hold_intensity] = crate::held(&hold, LSQML, given)?;
         let lsqml = ptyrs::engine::Lsqml::new(ptyrs::engine::LsqmlParams {
             batch_size,
             cost: crate::cost(cost)?,
@@ -532,18 +552,31 @@ impl Lsqml {
             Some(s) => lsqml.with_sampling(s),
             None => lsqml,
         };
-        let features = position_only(position)?;
+        let features = position_only(position, hold_position)?;
+        let var = opr.map(|o| variation(o, [hold_weights, hold_intensity]));
         Ok(Self {
             inner: lsqml.with_features(features).map_err(Error::from)?,
-            var: opr.map(variation).transpose()?,
+            var: var.transpose()?,
         })
+    }
+
+    /// The names of the quantities held, as `hold` takes them.
+    #[getter]
+    fn hold<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
+        let v = self.var.as_ref();
+        let refine = [
+            self.inner.features().position.as_ref().map(|d| d.refine),
+            v.map(|v| v.weights().refine),
+            v.and_then(|v| v.intensity()).map(|c| c.refine),
+        ];
+        crate::hold_out(py, LSQML.into_iter().zip(refine))
     }
 
     /// The offsets as the last epoch left them, `None` without a position.
     #[getter]
     fn position<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyArray2<f64>>>> {
         let d = self.inner.features().position.clone();
-        d.map(|d| crate::position_out(py, d)).transpose()
+        d.map(|d| crate::position_out(py, d.values)).transpose()
     }
 
     /// The eigenmodes as the last epoch left them, `None` without OPR.
@@ -557,17 +590,17 @@ impl Lsqml {
     #[getter]
     fn weights<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyArray2<f64>>>> {
         let w = self.var.as_ref().map(|v| {
-            let (w, k) = (v.weights(), v.eigenmodes().len());
+            let (w, k) = (&v.weights().values, v.eigenmodes().len());
             PyArray1::from_slice(py, w).reshape([w.len() / k, k])
         });
         w.transpose()
     }
 
-    /// The main-mode weights as the last epoch left them, `None` unless refined.
+    /// The main-mode weights as the last epoch left them, `None` unless given.
     #[getter]
     fn intensity<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyArray1<f64>>> {
         let c = self.var.as_ref().and_then(|v| v.intensity());
-        c.map(|c| PyArray1::from_slice(py, c))
+        c.map(|c| PyArray1::from_slice(py, &c.values))
     }
 
     /// One epoch over `views` from `object` `[nslice, nobj, nyo, nxo]` and `probe`; returns
@@ -600,8 +633,8 @@ impl Lsqml {
 }
 
 /// BH across epochs (`ptyrs::engine::Bh`). With `position`, offsets as `Lsqml` takes them,
-/// every epoch models and refines them, their gradient weighted by `position_rho`², entered
-/// as `sampling` as `Lsqml` takes it.
+/// every epoch models them, entered as `sampling` as `Lsqml` takes it, and refines them
+/// unless `hold` is `("position",)`, their gradient weighted by `position_rho`².
 #[pyclass]
 pub(crate) struct Bh(ptyrs::engine::Bh);
 
@@ -609,7 +642,7 @@ pub(crate) struct Bh(ptyrs::engine::Bh);
 impl Bh {
     #[new]
     #[pyo3(signature = (batch_size, probe_rho, seed, *, position = None,
-                        position_rho = crate::POSITION_RHO, sampling = None))]
+                        position_rho = crate::POSITION_RHO, sampling = None, hold = Vec::new()))]
     fn new(
         batch_size: usize,
         probe_rho: f64,
@@ -617,7 +650,9 @@ impl Bh {
         position: Option<PyReadonlyArray2<'_, f64>>,
         position_rho: f64,
         sampling: Option<&str>,
+        hold: Vec<String>,
     ) -> PyResult<Self> {
+        let [hold_position] = crate::held(&hold, ["position"], [position.is_some()])?;
         let bh = ptyrs::engine::Bh::new(ptyrs::engine::BhParams {
             batch_size,
             probe_rho,
@@ -629,15 +664,22 @@ impl Bh {
             Some(s) => bh.with_sampling(s),
             None => bh,
         };
-        let features = position_only(position)?;
+        let features = position_only(position, hold_position)?;
         Ok(Self(bh.with_features(features).map_err(Error::from)?))
+    }
+
+    /// `("position",)` while the offsets are held, `()` otherwise.
+    #[getter]
+    fn hold<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
+        let refine = self.0.features().position.as_ref().map(|d| d.refine);
+        crate::hold_out(py, [("position", refine)])
     }
 
     /// The offsets as the last epoch left them, `None` without a position.
     #[getter]
     fn position<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyArray2<f64>>>> {
         let d = self.0.features().position.clone();
-        d.map(|d| crate::position_out(py, d)).transpose()
+        d.map(|d| crate::position_out(py, d.values)).transpose()
     }
 
     /// One epoch over `views` from `object` `[nslice, nobj, nyo, nxo]` and `probe`; returns

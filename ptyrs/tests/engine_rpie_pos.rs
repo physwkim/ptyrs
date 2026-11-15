@@ -8,7 +8,7 @@
 //! `tests/engine/data`, with one on an odd-sided object plane.
 
 use ptyrs::base::{C64, Object, Stack};
-use ptyrs::engine::{Features, Ptycho, RpieParams, Sampling};
+use ptyrs::engine::{Feature, Features, Ptycho, RpieParams, Sampling};
 
 #[path = "common/engine/mod.rs"]
 mod common;
@@ -82,7 +82,7 @@ fn assert_run(
     let rows = table(files[2]);
     let start = offsets(&rows, 1);
     p.set_features(Features {
-        position: Some(start.clone()),
+        position: Some(Feature::refined(start.clone())),
         ..Features::default()
     })
     .unwrap();
@@ -105,7 +105,7 @@ fn assert_run(
             .flat_map(|(d, s)| [d[0] - s[0], d[1] - s[1]])
             .collect()
     };
-    let got = p.features().position.as_ref().unwrap();
+    let got = &p.features().position.as_ref().unwrap().values;
     let want = offsets(&rows, 3);
     assert_close(
         &format!("{what} offsets"),

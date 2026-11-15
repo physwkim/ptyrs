@@ -12,8 +12,8 @@ use ptyrs::engine::{GpuOptions, GpuPtycho};
 
 use ptyrs::base::{AddrTable, C64, Counts, Object, Probe, Stack, required_obj_shape};
 use ptyrs::engine::{
-    Cost, Features, Lsqml, LsqmlParams, LsqmlStep, Observed, Optics, ProbeVariation, SliceWaves,
-    Wavefield, llk, shift,
+    Cost, Feature, Features, Lsqml, LsqmlParams, LsqmlStep, Observed, Optics, ProbeVariation,
+    SliceWaves, Wavefield, llk, shift,
 };
 use ptyrs::gpu::FUSED_SIDES;
 
@@ -330,7 +330,7 @@ fn gpu_lsqml_matches_cpu_under_every_propagator() {
                 seed: 7,
             };
             let features = Features {
-                position: position.then(drawn_offsets),
+                position: position.then(|| Feature::refined(drawn_offsets())),
                 ..Features::default()
             };
             let (mut objects, mut probe) = (c.objects.clone(), c.probe.clone());
@@ -375,14 +375,14 @@ fn gpu_lsqml_matches_cpu_under_every_propagator() {
             };
             let offsets = match (&features.position, cpu.features().position.as_ref()) {
                 (Some(start), Some(want)) => {
-                    let got = gpu.features().unwrap().position.unwrap();
+                    let got = gpu.features().unwrap().position.unwrap().values;
                     let delta = |d: &[[f64; 2]]| -> Vec<f64> {
                         d.iter()
-                            .zip(start)
+                            .zip(&start.values)
                             .flat_map(|(d, s)| [d[0] - s[0], d[1] - s[1]])
                             .collect()
                     };
-                    let (a, b) = (delta(&got), delta(want));
+                    let (a, b) = (delta(&got), delta(&want.values));
                     let d = a.iter().zip(&b).map(|(a, b)| (a - b).abs());
                     worst_of(d) / b.iter().map(|b| b.abs()).fold(0.0, f64::max)
                 }

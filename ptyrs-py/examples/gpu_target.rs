@@ -19,7 +19,7 @@ use std::time::Instant;
 
 use cuda_core::CudaContext;
 use ptyrs::engine::{
-    BhParams, Cost, EngineError, Features, GpuOptions, GpuPtycho, LsqmlParams, RpieParams,
+    BhParams, Cost, EngineError, Feature, Features, GpuOptions, GpuPtycho, LsqmlParams, RpieParams,
 };
 
 const USAGE: &str = "usage: gpu_target <cxi> <init.h5> <nepoch> <target|-> \
@@ -77,7 +77,7 @@ impl Method {
     fn start(&self, g: &mut GpuPtycho, nframe: usize) -> Result<(), EngineError> {
         match self {
             Self::Lsqml(_, true) => g.set_features(&Features {
-                position: Some(vec![[0.0; 2]; nframe]),
+                position: Some(Feature::refined(vec![[0.0; 2]; nframe])),
                 ..Features::default()
             }),
             _ => Ok(()),

@@ -12,8 +12,8 @@ use ptyrs::base::{
     sim,
 };
 use ptyrs::engine::{
-    ApParams, DmParams, Features, GpuOptions, GpuPtycho, Optics, Ptycho, RaarParams, Sampling,
-    SliceWaves, Wavefield, shift,
+    ApParams, DmParams, Feature, Features, GpuOptions, GpuPtycho, Optics, Ptycho, RaarParams,
+    Sampling, SliceWaves, Wavefield, shift,
 };
 use ptyrs::gpu::FUSED_SIDES;
 
@@ -85,7 +85,7 @@ fn whole_offsets() -> Vec<[f64; 2]> {
 
 fn positioned(offsets: &[[f64; 2]]) -> Features {
     Features {
-        position: Some(offsets.to_vec()),
+        position: Some(Feature::refined(offsets.to_vec())),
         ..Features::default()
     }
 }
@@ -261,7 +261,7 @@ impl Engine for Ptycho {
             end: self.llk().poisson,
             object: self.object().clone(),
             probe: self.probe().clone(),
-            offsets: self.features().position.clone(),
+            offsets: self.features().position.clone().map(|p| p.values),
         }
     }
 }
@@ -287,7 +287,7 @@ impl Engine for GpuPtycho {
             end: self.llk().unwrap().poisson,
             object: self.object().unwrap(),
             probe: self.probe().unwrap(),
-            offsets: self.features().unwrap().position,
+            offsets: self.features().unwrap().position.map(|p| p.values),
         }
     }
 }

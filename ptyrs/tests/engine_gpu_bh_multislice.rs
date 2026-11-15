@@ -12,8 +12,8 @@ use ptyrs::base::{
     AddrTable, C64, Counts, Geometry, Object, Probe, Scan, Stack, required_obj_shape,
 };
 use ptyrs::engine::{
-    Bh, BhParams, BhStep, Features, GpuOptions, GpuPtycho, Observed, Optics, Sampling, SliceWaves,
-    Wavefield, llk, shift,
+    Bh, BhParams, BhStep, Feature, Features, GpuOptions, GpuPtycho, Observed, Optics, Sampling,
+    SliceWaves, Wavefield, llk, shift,
 };
 use ptyrs::gpu::FUSED_SIDES;
 
@@ -264,11 +264,11 @@ fn offsets_rel(a: &Features, b: &Features, start: &Features) -> f64 {
     };
     let delta = |d: &[[f64; 2]]| -> Vec<f64> {
         d.iter()
-            .zip(s)
+            .zip(&s.values)
             .flat_map(|(d, s)| [d[0] - s[0], d[1] - s[1]])
             .collect()
     };
-    let (a, b) = (delta(a), delta(b));
+    let (a, b) = (delta(&a.values), delta(&b.values));
     let d = worst_of(a.iter().zip(&b).map(|(a, b)| (a - b).abs()));
     d / b.iter().map(|b| b.abs()).fold(0.0, f64::max)
 }
@@ -281,7 +281,7 @@ fn offsets_rel(a: &Features, b: &Features, start: &Features) -> f64 {
 fn matches_cpu(propagator: &str, nslices: &[usize], nobj: usize, position: bool) {
     const NEPOCH: usize = 3;
     let features = Features {
-        position: position.then(|| drawn_offsets(NPOS)),
+        position: position.then(|| Feature::refined(drawn_offsets(NPOS))),
         ..Features::default()
     };
     for &nslice in nslices {
@@ -294,12 +294,20 @@ fn matches_cpu(propagator: &str, nslices: &[usize], nobj: usize, position: bool)
                 .with_features(features.clone())
                 .unwrap();
             let (mut objects, mut probe) = (c.objects.clone(), c.probe.clone());
-            let start = c.llk(&objects, &probe, features.position.as_deref());
+            let start = c.llk(
+                &objects,
+                &probe,
+                features.position.as_ref().map(|d| &d.values[..]),
+            );
             let mut steps = Vec::new();
             for _ in 0..NEPOCH {
                 steps = bh.epoch(&c.addr, &c.obs, &c.optics, &mut objects, &mut probe);
             }
-            let llk = c.llk(&objects, &probe, bh.features().position.as_deref());
+            let llk = c.llk(
+                &objects,
+                &probe,
+                bh.features().position.as_ref().map(|d| &d.values[..]),
+            );
             for graph in [false, true] {
                 let mut gpu = c.gpu(GpuOptions { graph, ..OPTIONS });
                 if position {
@@ -421,7 +429,7 @@ fn sliced_bh_refuses_the_position_model() {
     let before: Vec<_> = gpu.objects().unwrap().iter().map(|o| bits(o)).collect();
     let probe = bits(&gpu.probe().unwrap());
     let moved = Features {
-        position: Some(drawn_offsets(NPOS)),
+        position: Some(Feature::refined(drawn_offsets(NPOS))),
         ..Features::default()
     };
     gpu.set_features(&moved).unwrap();

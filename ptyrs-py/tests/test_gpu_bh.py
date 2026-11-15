@@ -72,8 +72,24 @@ def test_bh_position_rho_and_refusals(scenario):
         ptyrs.Bh(0, 0.01, 7)
     with pytest.raises(ValueError, match=r"\[nframe, 2\]"):
         ptyrs.Bh(4, 0.01, 7, position=np.zeros((npos, 3)))
+    for kw, hold in ((dict(), ("position",)), (dict(position=d0), ("weights",))):
+        with pytest.raises(ValueError, match="hold"):
+            ptyrs.Bh(4, 0.01, 7, hold=hold, **kw)
     with pytest.raises(ValueError, match="finite"):
         ptyrs.Bh(4, 0.01, 7, position=np.full((npos, 2), np.inf))
     short = ptyrs.Bh(4, 0.01, 7, position=np.zeros((npos + 1, 2)))
     with pytest.raises(ValueError, match=f"{npos + 1} position offsets for {npos} frames"):
         short.epoch(state.views, obj[None], probe)
+
+
+def test_cpu_bh_held_position(scenario):
+    """Held offsets stay through CPU BH epochs while the object moves; refined ones move."""
+    scan, obj, probe, npos = scenario
+    views = ptyrs.Ptycho(scan, obj, probe).views
+    d0 = drawn_offsets(npos)
+    for hold in ((), ("position",)):
+        bh = ptyrs.Bh(4, 0.01, 7, position=d0, hold=hold)
+        assert bh.hold == hold
+        o, _, _ = bh.epoch(views, obj[None], probe)
+        assert not np.array_equal(o[0], obj)
+        assert np.array_equal(bh.position, d0) == (hold != ())

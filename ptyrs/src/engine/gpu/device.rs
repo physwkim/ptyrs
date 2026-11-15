@@ -40,8 +40,8 @@ use super::{
 use crate::engine::features::{POSITION_LIMIT, POSITION_STEP};
 use crate::engine::sampling::{OBJ_HELD, OBJ_PCG};
 use crate::engine::{
-    ApParams, BhParams, BhStep, DmParams, EngineError, Features, LsqmlParams, LsqmlStep, MlParams,
-    PlaneStage, RaarParams, RpieParams, Sampling,
+    ApParams, BhParams, BhStep, DmParams, EngineError, Feature, Features, LsqmlParams, LsqmlStep,
+    MlParams, PlaneStage, RaarParams, RpieParams, Sampling,
 };
 
 /// What [`Device::new`] uploads: the propagator's stage, the views' addresses, the counts
@@ -213,7 +213,8 @@ pub(super) struct Device {
 }
 
 /// The features' device state as [`Device::set_features`] last set it: each modelled
-/// feature's values and the far sums its step reads.
+/// feature's values and, refined, the sums its step reads, whose presence is its
+/// [`Feature::refine`].
 #[derive(Default)]
 struct FeatureBufs {
     scale: Option<ScaleBufs>,
@@ -224,6 +225,16 @@ struct FeatureBufs {
 impl FeatureBufs {
     fn positioned(&self) -> bool {
         self.position.is_some()
+    }
+
+    /// The scale's, background's and position's [`Feature::refine`], none for one not
+    /// modelled.
+    fn refine(&self) -> [Option<bool>; 3] {
+        [
+            self.scale.as_ref().map(|s| s.sums.is_some()),
+            self.background.as_ref().map(|b| b.sums.is_some()),
+            self.position.as_ref().map(|p| p.partials.is_some()),
+        ]
     }
 
     /// What the position model adds to the shared passes.
@@ -334,7 +345,8 @@ pub(super) enum Sample {
     Views,
     /// The windows, block 0.
     Windows,
-    /// The windows and their derivatives over the position's `y` and `x`, blocks 0 to 2.
+    /// The windows and their derivatives over the position's `y` and `x`, blocks 0 to 2; the
+    /// windows alone while the position is held, as only its sums read the derivatives.
     Derivatives,
 }
 
@@ -367,17 +379,17 @@ struct Reshared {
     waves: Option<[DeviceBuffer<C32>; 2]>,
 }
 
-/// A per-frame intensity scale `[nframe]` and its far sums `[nframe]`.
+/// A per-frame intensity scale `[nframe]` and, refined, its far sums `[nframe]`.
 struct ScaleBufs {
     values: DeviceBuffer<f32>,
-    sums: DeviceBuffer<ScalePartial>,
+    sums: Option<DeviceBuffer<ScalePartial>>,
 }
 
-/// A detector background `[ny, nx]` in the counts' order, its far sums, each detector
-/// pixel's unmasked frames and the background's photons over them.
+/// A detector background `[ny, nx]` in the counts' order, refined its far sums, each
+/// detector pixel's unmasked frames and the background's photons over them.
 struct BackgroundBufs {
     values: DeviceBuffer<f32>,
-    sums: BackgroundSums,
+    sums: Option<BackgroundSums>,
     /// A copy of the ring's [`RingDevice::pixel_frames`], final once [`Device::new`] has
     /// counted every frame.
     nobs: DeviceBuffer<u32>,
@@ -385,13 +397,19 @@ struct BackgroundBufs {
     photons: DeviceBuffer<f32>,
 }
 
-/// Per-frame offsets `[nframe, 2]` of the position model, each frame's position sums
-/// `[nframe]` and what the offsets move.
+/// Per-frame offsets `[nframe, 2]` of the position model, refined each frame's position
+/// sums, and what the offsets move.
 struct PositionBufs {
     offsets: DeviceBuffer<f32>,
+    partials: Option<PositionPartials>,
+    mover: Mover,
+}
+
+/// Each frame's position sums `[nframe]`, which the fused passes write and the position step
+/// reads.
+struct PositionPartials {
     num: DeviceBuffer<PositionPartial>,
     den: DeviceBuffer<PositionPartial>,
-    mover: Mover,
 }
 
 /// What a position's offsets move, by the device's [`Sampling`].
@@ -454,13 +472,13 @@ pub(super) struct FeaturesMut<'a> {
 /// [`ScaleBufs`] lent to a cycle.
 struct ScaleMut<'a> {
     values: &'a mut DeviceBuffer<f32>,
-    sums: &'a mut DeviceBuffer<ScalePartial>,
+    sums: Option<&'a mut DeviceBuffer<ScalePartial>>,
 }
 
 /// [`BackgroundBufs`] lent to a cycle.
 struct BackgroundMut<'a> {
     values: &'a mut DeviceBuffer<f32>,
-    sums: &'a mut BackgroundSums,
+    sums: Option<&'a mut BackgroundSums>,
     nobs: &'a DeviceBuffer<u32>,
     photons: &'a mut DeviceBuffer<f32>,
 }
@@ -468,8 +486,7 @@ struct BackgroundMut<'a> {
 /// [`PositionBufs`] lent to a cycle.
 struct PositionMut<'a> {
     offsets: &'a mut DeviceBuffer<f32>,
-    num: &'a mut DeviceBuffer<PositionPartial>,
-    den: &'a mut DeviceBuffer<PositionPartial>,
+    partials: Option<&'a mut PositionPartials>,
     mover: &'a mut Mover,
 }
 
@@ -558,7 +575,8 @@ pub(super) enum PositionLent<'m, X> {
 impl<'m, X> PositionLent<'m, X> {
     /// `moved` with `features`' position buffers and, under [`Sampling::Patch`], `fused`:
     /// none without a position, an error when they disagree, as for a cycle's state built
-    /// for another position model.
+    /// for another position model. A held position lends its offsets held: the cycle moves
+    /// by them and leaves them, with the sums only their step reads.
     pub fn lend(
         moved: Option<(&'m mut Moved, X)>,
         fused: Option<&'m mut FusedBufs>,
@@ -588,7 +606,10 @@ impl<'m, X> PositionLent<'m, X> {
                 w,
                 pos,
                 kernels,
-                offsets: &mut *p.offsets,
+                offsets: Feature {
+                    values: &mut *p.offsets,
+                    refine: p.partials.is_some(),
+                },
                 spectrum,
                 probe_sums,
             }))),
@@ -602,7 +623,10 @@ impl<'m, X> PositionLent<'m, X> {
                 own,
                 pos,
                 kernels,
-                offsets: &mut *p.offsets,
+                offsets: Feature {
+                    values: &mut *p.offsets,
+                    refine: p.partials.is_some(),
+                },
                 sampler,
                 spectra,
             }))),
@@ -654,8 +678,8 @@ pub(super) struct SampledLent<'m, X> {
     pub own: X,
     pub pos: &'m mut Positions,
     pub kernels: &'m PositionKernels,
-    /// By frame: the device's offsets, which the cycle steps.
-    pub offsets: &'m mut DeviceBuffer<f32>,
+    /// By frame: the device's offsets, which the cycle steps while they are refined.
+    pub offsets: Feature<&'m mut DeviceBuffer<f32>>,
     pub sampler: &'m mut ObjectSampler,
     /// `[nobj, nyo, nxo]`, the spectra [`ObjectSampler::windows`] reads.
     pub spectra: &'m mut DeviceBuffer<C32>,
@@ -664,7 +688,8 @@ pub(super) struct SampledLent<'m, X> {
 impl<X> SampledLent<'_, X> {
     /// The offsets by epoch position from the device's, through `order`, the epoch's.
     pub fn gather(&mut self, ctx: &ExecutionContext, order: &EpochOrder) -> Result<(), GpuError> {
-        self.kernels.gather(ctx, order, self.offsets, self.pos)
+        self.kernels
+            .gather(ctx, order, self.offsets.values, self.pos)
     }
 }
 
@@ -677,7 +702,7 @@ pub(super) struct MovedLent<'m, X> {
     w: &'m mut [DeviceBuffer<C32>],
     pos: &'m mut Positions,
     kernels: &'m PositionKernels,
-    offsets: &'m mut DeviceBuffer<f32>,
+    offsets: Feature<&'m mut DeviceBuffer<f32>>,
     spectrum: &'m mut SpectrumBuf,
     probe_sums: &'m mut ShiftedProbeSums,
 }
@@ -697,7 +722,8 @@ impl<'m, X> MovedLent<'m, X> {
 
     /// The offsets by epoch position from the device's, through `order`, the epoch's.
     pub fn gather(&mut self, ctx: &ExecutionContext, order: &EpochOrder) -> Result<(), GpuError> {
-        self.kernels.gather(ctx, order, self.offsets, self.pos)
+        self.kernels
+            .gather(ctx, order, self.offsets.values, self.pos)
     }
 
     /// The lend for one batch, with the spectra of `probe` it starts from (two launches).
@@ -729,8 +755,8 @@ pub(super) struct MovedBatch<'m, X> {
     pub w: &'m mut [DeviceBuffer<C32>],
     pub pos: &'m mut Positions,
     pub kernels: &'m PositionKernels,
-    /// By frame: the device's offsets, which the batch steps.
-    pub offsets: &'m mut DeviceBuffer<f32>,
+    /// By frame: the device's offsets, which the batch steps while they are refined.
+    pub offsets: Feature<&'m mut DeviceBuffer<f32>>,
     pub probe_sums: &'m mut ShiftedProbeSums,
     pub spectrum: ProbeSpectrum<'m>,
 }
@@ -793,11 +819,11 @@ struct Sampled<'b> {
 }
 
 /// The sums of the position model, lent by [`Modelled`]: the shifted probe's under
-/// [`Sampling::Patch`] alone, which moves the probe.
+/// [`Sampling::Patch`] alone, which moves the probe, and each frame's position sums while
+/// the offsets are refined.
 struct PositionSums<'b> {
     probe: Option<&'b mut ShiftedProbeSums>,
-    num: &'b mut DeviceBuffer<PositionPartial>,
-    den: &'b mut DeviceBuffer<PositionPartial>,
+    partials: Option<&'b mut PositionPartials>,
 }
 
 impl Modelled<'_> {
@@ -905,10 +931,11 @@ impl Modelled<'_> {
             stack,
             offsets: s.offsets,
         };
+        let refined = (self.position.as_ref()).is_some_and(|p| p.partials.is_some());
         let orders: &[[u32; 2]] = match sample {
             Sample::Views => &[],
-            Sample::Windows => &[[0, 0]],
-            Sample::Derivatives => &[[0, 0], [1, 0], [0, 1]],
+            Sample::Derivatives if refined => &[[0, 0], [1, 0], [0, 1]],
+            Sample::Windows | Sample::Derivatives => &[[0, 0]],
         };
         for (block, &order) in (0..).zip(orders) {
             let block = WindowBlock {
@@ -987,7 +1014,8 @@ impl Modelled<'_> {
 
     /// Under [`Sampling::FullObject`], each of `stack`'s frames' position sums of `psi`
     /// against its windows `w`, sampled with their derivatives
-    /// ([`GradKernels::window_position_sums`]); an error otherwise.
+    /// ([`GradKernels::window_position_sums`]), nothing while the position is held; an error
+    /// otherwise.
     pub fn window_position_sums(
         &mut self,
         ctx: &ExecutionContext,
@@ -1000,7 +1028,10 @@ impl Modelled<'_> {
         let (Some(_), Some(p)) = (&self.sampled, &mut self.position) else {
             return Err(another_model());
         };
-        grad.window_position_sums(ctx, w, stack, psi, probe, [&mut *p.num, &mut *p.den])
+        let Some(q) = p.partials.as_deref_mut() else {
+            return Ok(());
+        };
+        grad.window_position_sums(ctx, w, stack, psi, probe, [&mut q.num, &mut q.den])
     }
 
     /// The far sums of `llk` and of every stepped feature.
@@ -1014,19 +1045,25 @@ impl Modelled<'_> {
 
     /// A fused pass's sums of the position model: with `probe` the shifted probe's update
     /// sums of that kind if the model moves the probe, with `position` each frame's position
-    /// sums; none without a position. Position sums without a moved probe fail the pass,
-    /// which takes them from the shift alone.
+    /// sums if the offsets are refined; none without a position. Position sums without a
+    /// moved probe fail the pass, which takes them from the shift alone.
     pub fn shift_sums<'c>(
         &'c mut self,
         probe: Option<fn(&'c mut ShiftedProbeSums) -> ShiftProbe<'c>>,
         position: bool,
     ) -> ShiftSums<'c> {
         match &mut self.position {
-            Some(p) => ShiftSums {
-                probe: (p.probe.as_deref_mut()).zip(probe).map(|(s, kind)| kind(s)),
-                position: position.then_some(&mut *p.num),
-                position_den: position.then_some(&mut *p.den),
-            },
+            Some(p) => {
+                let (num, den) = match p.partials.as_deref_mut().filter(|_| position) {
+                    Some(q) => (Some(&mut q.num), Some(&mut q.den)),
+                    None => (None, None),
+                };
+                ShiftSums {
+                    probe: (p.probe.as_deref_mut()).zip(probe).map(|(s, kind)| kind(s)),
+                    position: num,
+                    position_den: den,
+                }
+            }
             None => ShiftSums::default(),
         }
     }
@@ -1071,14 +1108,15 @@ impl Modelled<'_> {
 }
 
 impl FeaturesMut<'_> {
-    /// Whether some feature takes a step from far sums.
+    /// Whether some refined feature takes a step from far sums.
     pub fn stepped(&self) -> bool {
-        self.scale.is_some() || self.background.is_some()
+        (self.scale.as_ref()).is_some_and(|s| s.sums.is_some())
+            || (self.background.as_ref()).is_some_and(|b| b.sums.is_some())
     }
 
-    /// Whether the position is modelled.
-    pub fn positioned(&self) -> bool {
-        self.position.is_some()
+    /// Whether the position is modelled and refined.
+    pub fn position_refined(&self) -> bool {
+        (self.position.as_ref()).is_some_and(|p| p.partials.is_some())
     }
 
     /// Whether the position model moves the probe, as [`Modelled::shifted`] of a lend.
@@ -1111,11 +1149,11 @@ impl FeaturesMut<'_> {
         exit: ExitPass<'b>,
     ) -> Result<Modelled<'b>, GpuError> {
         let (scale, scale_sums) = match &mut self.scale {
-            Some(s) => (Some(&*s.values), Some(&mut *s.sums)),
+            Some(s) => (Some(&*s.values), s.sums.as_deref_mut()),
             None => (None, None),
         };
         let (background, background_sums) = match &mut self.background {
-            Some(b) => (Some(&*b.values), Some(&mut *b.sums)),
+            Some(b) => (Some(&*b.values), b.sums.as_deref_mut()),
             None => (None, None),
         };
         let (shift, sampled, position) = match &mut self.position {
@@ -1145,8 +1183,7 @@ impl FeaturesMut<'_> {
                 };
                 let sums = PositionSums {
                     probe: sums,
-                    num: &mut *p.num,
-                    den: &mut *p.den,
+                    partials: p.partials.as_deref_mut(),
                 };
                 (shift, sampled, Some(sums))
             }
@@ -1166,7 +1203,7 @@ impl FeaturesMut<'_> {
         })
     }
 
-    /// Every stepped feature's step from the far sums [`Modelled::far`] lent the passes
+    /// Every refined feature's step from the far sums [`Modelled::far`] lent the passes
     /// before.
     pub fn step(
         &mut self,
@@ -1174,11 +1211,21 @@ impl FeaturesMut<'_> {
         kernels: &Kernels,
         grad: &GradKernels,
     ) -> Result<(), GpuError> {
-        if let Some(s) = &mut self.scale {
-            grad.scale_step(ctx, s.values, s.sums)?;
+        if let Some(ScaleMut {
+            values,
+            sums: Some(sums),
+        }) = &mut self.scale
+        {
+            grad.scale_step(ctx, values, sums)?;
         }
-        if let Some(b) = &mut self.background {
-            kernels.background_ap(ctx, b.values, b.sums, b.nobs)?;
+        if let Some(BackgroundMut {
+            values,
+            sums: Some(sums),
+            nobs,
+            ..
+        }) = &mut self.background
+        {
+            kernels.background_ap(ctx, values, sums, nobs)?;
         }
         Ok(())
     }
@@ -1222,15 +1269,20 @@ impl FeaturesMut<'_> {
     }
 
     /// The position step from the position sums the AP projections wrote, after the
-    /// updates; nothing without a position.
+    /// updates; nothing without a refined position.
     pub fn position_step(
         &mut self,
         ctx: &ExecutionContext,
         grad: &GradKernels,
     ) -> Result<(), GpuError> {
-        if let Some(p) = &mut self.position {
+        if let Some(PositionMut {
+            offsets,
+            partials: Some(q),
+            ..
+        }) = &mut self.position
+        {
             let limits = [POSITION_STEP as f32, POSITION_LIMIT as f32];
-            grad.position_step(ctx, p.offsets, [&*p.num, &*p.den], limits)?;
+            grad.position_step(ctx, offsets, [&q.num, &q.den], limits)?;
         }
         Ok(())
     }
@@ -2384,12 +2436,13 @@ impl Device {
     }
 
     /// Models `features`, which the caller checked against the scan, from here on: the
-    /// values of the features already set are written in place; other features replace the
-    /// buffers, and so first drop every graph, which addresses them, and then recapture the
-    /// LLK pass's. Only the fused passes model features; a position that moves the probe
-    /// ([`Sampling::Patch`]) also takes their scratch of a shift, which they drop again with
-    /// it, and so recuts the stacks that stream that scratch and drops DM's or RAAR's
-    /// carried stacks, cut against it. Nothing changes if a buffer cannot be built; if the
+    /// values of the features already set, refined or held as they are, are written in
+    /// place; other features, or another refine, replace the buffers, and so first drop
+    /// every graph, which addresses them, and then recapture the LLK pass's. Only the fused
+    /// passes model features; a position that moves the probe ([`Sampling::Patch`]) also
+    /// takes their scratch of a shift, which they drop again with it, and so recuts the
+    /// stacks that stream that scratch and drops DM's or RAAR's carried stacks, cut against
+    /// it. Nothing changes if a buffer cannot be built; if the
     /// recapture fails, `features` stay modelled and [`Self::llk_pass`] runs eagerly until a
     /// later recapture; a failed write in place may leave the values before it written.
     pub fn set_features(&mut self, features: &Features) -> Result<(), EngineError> {
@@ -2398,24 +2451,25 @@ impl Device {
                 "features need GpuOptions { fused: true, .. }".into(),
             ));
         }
-        let f32s = |v: &Option<Vec<f64>>| v.as_ref().map(|v| v.iter().map(|&x| x as f32).collect());
-        let (scale, background): (Option<Vec<f32>>, Option<Vec<f32>>) =
-            (f32s(&features.scale), f32s(&features.background));
-        let position: Option<Vec<f32>> =
-            (features.position.as_ref()).map(|d| d.iter().flatten().map(|&x| x as f32).collect());
+        let f32s = |v: &Option<Feature<Vec<f64>>>| -> Option<Feature<Vec<f32>>> {
+            (v.as_ref()).map(|v| v.as_ref().map(|v| v.iter().map(|&x| x as f32).collect()))
+        };
+        let (scale, background) = (f32s(&features.scale), f32s(&features.background));
+        let position: Option<Feature<Vec<f32>>> = (features.position.as_ref()).map(|d| {
+            d.as_ref()
+                .map(|d| d.iter().flatten().map(|&x| x as f32).collect())
+        });
+        let refine = |f: &Option<Feature<Vec<f32>>>| f.as_ref().map(|f| f.refine);
         let have = &mut self.features;
-        if have.scale.is_some() == scale.is_some()
-            && have.background.is_some() == background.is_some()
-            && have.position.is_some() == position.is_some()
-        {
+        if have.refine() == [refine(&scale), refine(&background), refine(&position)] {
             if let (Some(b), Some(v)) = (&mut have.scale, scale) {
-                b.values.copy_from_host(&self.stream, &v)?;
+                b.values.copy_from_host(&self.stream, &v.values)?;
             }
             if let (Some(b), Some(v)) = (&mut have.background, background) {
-                b.values.copy_from_host(&self.stream, &v)?;
+                b.values.copy_from_host(&self.stream, &v.values)?;
             }
             if let (Some(b), Some(v)) = (&mut have.position, position) {
-                b.offsets.copy_from_host(&self.stream, &v)?;
+                b.offsets.copy_from_host(&self.stream, &v.values)?;
             }
             return Ok(());
         }
@@ -2433,9 +2487,12 @@ impl Device {
             .nf_max();
         let scale = scale
             .map(|v| {
+                let sums = (v.refine)
+                    .then(|| DeviceBuffer::zeroed(stream, v.values.len()))
+                    .transpose()?;
                 Ok::<_, EngineError>(ScaleBufs {
-                    values: DeviceBuffer::from_host(stream, &v)?,
-                    sums: DeviceBuffer::zeroed(stream, v.len())?,
+                    values: DeviceBuffer::from_host(stream, &v.values)?,
+                    sums,
                 })
             })
             .transpose()?;
@@ -2444,9 +2501,12 @@ impl Device {
                 let pixel_frames = self.ring.device().pixel_frames();
                 let mut nobs = DeviceBuffer::zeroed(stream, pixel_frames.len())?;
                 nobs.copy_from_device_async(pixel_frames, stream)?;
+                let sums = (v.refine)
+                    .then(|| BackgroundSums::zeroed(stream, dims, nf_max))
+                    .transpose()?;
                 Ok::<_, EngineError>(BackgroundBufs {
-                    values: DeviceBuffer::from_host(stream, &v)?,
-                    sums: BackgroundSums::zeroed(stream, dims, nf_max)?,
+                    values: DeviceBuffer::from_host(stream, &v.values)?,
+                    sums,
                     nobs,
                     photons: DeviceBuffer::zeroed(stream, 1)?,
                 })
@@ -2455,10 +2515,17 @@ impl Device {
         let position = position
             .zip(mover)
             .map(|(v, mover)| {
+                let partials = (v.refine)
+                    .then(|| {
+                        Ok::<_, EngineError>(PositionPartials {
+                            num: DeviceBuffer::zeroed(stream, dims.nframe as usize)?,
+                            den: DeviceBuffer::zeroed(stream, dims.nframe as usize)?,
+                        })
+                    })
+                    .transpose()?;
                 Ok::<_, EngineError>(PositionBufs {
-                    offsets: DeviceBuffer::from_host(stream, &v)?,
-                    num: DeviceBuffer::zeroed(stream, dims.nframe as usize)?,
-                    den: DeviceBuffer::zeroed(stream, dims.nframe as usize)?,
+                    offsets: DeviceBuffer::from_host(stream, &v.values)?,
+                    partials,
                     mover,
                 })
             })
@@ -2504,21 +2571,34 @@ impl Device {
         self.carried = None;
     }
 
-    /// The modelled features, read back.
+    /// The modelled features, read back, each refined while it keeps its sums.
     pub fn features(&self) -> Result<Features, EngineError> {
-        let f64s = |b: Option<&DeviceBuffer<f32>>| {
-            b.map(|b| Ok::<_, EngineError>(b.to_host_vec(&self.stream)?))
+        let [scale, background, position] = self.features.refine();
+        let f64s = |b: Option<&DeviceBuffer<f32>>, refine: Option<bool>| {
+            (b.zip(refine))
+                .map(|(b, refine)| {
+                    let values = b.to_host_vec(&self.stream)?;
+                    Ok::<_, EngineError>(Feature {
+                        values: values.into_iter().map(f64::from).collect(),
+                        refine,
+                    })
+                })
                 .transpose()
-                .map(|v| v.map(|v| v.into_iter().map(f64::from).collect()))
         };
         Ok(Features {
-            scale: f64s(self.features.scale.as_ref().map(|b| &b.values))?,
-            background: f64s(self.features.background.as_ref().map(|b| &b.values))?,
-            position: (self.features.position.as_ref())
-                .map(|p| {
+            scale: f64s(self.features.scale.as_ref().map(|b| &b.values), scale)?,
+            background: f64s(
+                self.features.background.as_ref().map(|b| &b.values),
+                background,
+            )?,
+            position: (self.features.position.as_ref().zip(position))
+                .map(|(p, refine)| {
                     let d = p.offsets.to_host_vec(&self.stream)?;
                     let d = d.as_chunks::<2>().0.iter();
-                    Ok::<_, EngineError>(d.map(|o| o.map(f64::from)).collect())
+                    Ok::<_, EngineError>(Feature {
+                        values: d.map(|o| o.map(f64::from)).collect(),
+                        refine,
+                    })
                 })
                 .transpose()?,
         })
@@ -2687,18 +2767,17 @@ impl Device {
             features: FeaturesMut {
                 scale: self.features.scale.as_mut().map(|s| ScaleMut {
                     values: &mut s.values,
-                    sums: &mut s.sums,
+                    sums: s.sums.as_mut(),
                 }),
                 background: self.features.background.as_mut().map(|b| BackgroundMut {
                     values: &mut b.values,
-                    sums: &mut b.sums,
+                    sums: b.sums.as_mut(),
                     nobs: &b.nobs,
                     photons: &mut b.photons,
                 }),
                 position: self.features.position.as_mut().map(|p| PositionMut {
                     offsets: &mut p.offsets,
-                    num: &mut p.num,
-                    den: &mut p.den,
+                    partials: p.partials.as_mut(),
                     mover: &mut p.mover,
                 }),
             },

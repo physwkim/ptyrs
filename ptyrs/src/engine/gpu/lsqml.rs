@@ -598,7 +598,7 @@ impl<'a> Bufs<'a> {
                 let init = pre == Pre::Init;
                 match (windows, &mut lent) {
                     (Some(w), Some(PositionLent::FullObject(s))) => {
-                        let offsets = &*s.offsets;
+                        let offsets = &*s.offsets.values;
                         (s.sampler).illumination(
                             ctx,
                             self.views,
@@ -765,7 +765,7 @@ impl<'a> Bufs<'a> {
                 },
             };
             l.kernels.dots(ctx, views, stack, at, c, l.scan)?;
-            if let Some(m) = &mut moved {
+            if let Some(m) = moved.as_mut().filter(|m| m.offsets.refine) {
                 // The slopes of the object the batch started from.
                 let at = (chi, FrameWaves::Probes(&m.w[k]));
                 m.kernels.sums(ctx, views, stack, self.obj, at, m.pos)?;
@@ -774,10 +774,12 @@ impl<'a> Bufs<'a> {
         l.kernels
             .step(ctx, positions.clone(), l.scan, self.exit.scale)?;
         // Before the update, as the batch's spectra borrow the probe; the step reads neither.
-        if let Some(m) = moved {
+        if let Some(mut m) = moved
+            && let Some(offsets) = m.offsets.stepped()
+        {
             let solve = position_solve(self.exit.scale);
             m.kernels
-                .step(ctx, positions, l.order, m.offsets, solve, m.pos)?;
+                .step(ctx, positions, l.order, offsets, solve, m.pos)?;
         }
         let obj = LsqmlVar {
             x: &mut *self.obj,
@@ -812,7 +814,7 @@ impl<'a> Bufs<'a> {
         let d = views.dims();
         let (moved, w) = l.reading.split();
         let lent = PositionLent::lend(moved.map(|m| (m, ())), None, &mut self.features)?;
-        let (Some(PositionLent::FullObject(p)), Some(w)) = (lent, w) else {
+        let (Some(PositionLent::FullObject(mut p)), Some(w)) = (lent, w) else {
             return Err(another_reading());
         };
         let (lk, exit) = (l.kernels, self.exit);
@@ -854,10 +856,12 @@ impl<'a> Bufs<'a> {
                 &w.win[k][0],
                 self.probe_sums,
             )?;
-            // The slopes of the windows the batch started from.
-            w.derivatives(ctx, (p.sampler, p.spectra), points(views, stack, p.pos))?;
-            let at = (work, SliceSource::Probe(self.probe));
-            (p.kernels).derivative_sums(ctx, views, stack, &w.deriv, at, p.pos)?;
+            if p.offsets.refine {
+                // The slopes of the windows the batch started from.
+                w.derivatives(ctx, (p.sampler, p.spectra), points(views, stack, p.pos))?;
+                let at = (work, SliceSource::Probe(self.probe));
+                (p.kernels).derivative_sums(ctx, views, stack, &w.deriv, at, p.pos)?;
+            }
             let at = points(views, stack, p.pos);
             w.place(ctx, p.sampler, at, work, self.probe, &mut self.obj_sums.num)?;
         }
@@ -877,8 +881,10 @@ impl<'a> Bufs<'a> {
             lk.dots(ctx, &w.views, stack, at, chi, l.scan)?;
         }
         lk.step(ctx, positions.clone(), l.scan, self.exit.scale)?;
-        let solve = position_solve(self.exit.scale);
-        (p.kernels).step(ctx, positions, l.order, p.offsets, solve, p.pos)?;
+        if let Some(offsets) = p.offsets.stepped() {
+            let solve = position_solve(self.exit.scale);
+            (p.kernels).step(ctx, positions, l.order, offsets, solve, p.pos)?;
+        }
         let obj = LsqmlVar {
             x: &mut *self.obj,
             sums: &mut *self.obj_sums,
@@ -991,7 +997,7 @@ impl<'a> Bufs<'a> {
                 ok.slice_adjoint(ctx, views, stack, &self.deeper[i], src, dst)?;
                 ok.gap(ctx, d, stack, &sl.gaps[i], dst, true)?;
             }
-            if let Some(m) = &mut moved {
+            if let Some(m) = moved.as_mut().filter(|m| m.offsets.refine) {
                 let c = chi.get(pivot).unwrap_or(&*work);
                 let at = (c, FrameWaves::Views(&w.incident[k][pivot - 1]));
                 m.kernels
@@ -1079,10 +1085,12 @@ impl<'a> Bufs<'a> {
         }
         lk.step(ctx, positions.clone(), l.scan, self.exit.scale)?;
         lk.share(ctx, positions.clone(), l.scan, share)?;
-        if let Some(m) = moved {
+        if let Some(mut m) = moved
+            && let Some(offsets) = m.offsets.stepped()
+        {
             let solve = position_solve(self.exit.scale);
             m.kernels
-                .step(ctx, positions, l.order, m.offsets, solve, m.pos)?;
+                .step(ctx, positions, l.order, offsets, solve, m.pos)?;
         }
         let obj = LsqmlVar {
             x: &mut *self.obj,
@@ -1117,7 +1125,7 @@ impl<'a> Bufs<'a> {
         let (lk, exit, ok) = (l.kernels, self.exit, self.exit.kernels);
         let (moved, w) = l.reading.split();
         let lent = PositionLent::lend(moved.map(|m| (m, ())), None, &mut self.features)?;
-        let (Some(PositionLent::FullObject(p)), Some(w)) = (lent, w) else {
+        let (Some(PositionLent::FullObject(mut p)), Some(w)) = (lent, w) else {
             return Err(another_reading());
         };
         let (Some(sl), Some(sw)) = (self.slices.as_mut(), l.sliced.as_deref_mut()) else {
@@ -1181,13 +1189,15 @@ impl<'a> Bufs<'a> {
                 ok.slice_adjoint(ctx, &w.views, stack, &w.win[k][i + 1], src, dst)?;
                 ok.gap(ctx, d, stack, &sl.gaps[i], dst, true)?;
             }
-            w.derivatives(ctx, (p.sampler, p.spectra), points(views, stack, p.pos))?;
-            let c = chi.get(pivot).unwrap_or(&*work);
-            let at = (
-                c,
-                SliceSource::Waves(FrameWaves::Views(&sw.incident[k][pivot - 1])),
-            );
-            (p.kernels).derivative_sums(ctx, views, stack, &w.deriv, at, p.pos)?;
+            if p.offsets.refine {
+                w.derivatives(ctx, (p.sampler, p.spectra), points(views, stack, p.pos))?;
+                let c = chi.get(pivot).unwrap_or(&*work);
+                let at = (
+                    c,
+                    SliceSource::Waves(FrameWaves::Views(&sw.incident[k][pivot - 1])),
+                );
+                (p.kernels).derivative_sums(ctx, views, stack, &w.deriv, at, p.pos)?;
+            }
         }
         for i in (1..=last).rev() {
             for (k, s) in batch.clone().enumerate() {
@@ -1267,8 +1277,10 @@ impl<'a> Bufs<'a> {
         }
         lk.step(ctx, positions.clone(), l.scan, self.exit.scale)?;
         lk.share(ctx, positions.clone(), l.scan, share)?;
-        let solve = position_solve(self.exit.scale);
-        (p.kernels).step(ctx, positions, l.order, p.offsets, solve, p.pos)?;
+        if let Some(offsets) = p.offsets.stepped() {
+            let solve = position_solve(self.exit.scale);
+            (p.kernels).step(ctx, positions, l.order, offsets, solve, p.pos)?;
+        }
         let obj = LsqmlVar {
             x: &mut *self.obj,
             sums: &mut *self.obj_sums,

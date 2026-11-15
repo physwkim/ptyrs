@@ -5,8 +5,8 @@
 use cuda_core::CudaContext;
 use ptyrs::base::{C64, Counts, Geometry, Object, Probe, Scan, Stack, required_obj_shape, sim};
 use ptyrs::engine::{
-    ApParams, BhParams, Cost, DmParams, Features, GpuOptions, GpuPtycho, LsqmlParams, MlParams,
-    Optics, Ptycho, RaarParams, RpieParams, Sampling,
+    ApParams, BhParams, Cost, DmParams, Feature, Features, GpuOptions, GpuPtycho, LsqmlParams,
+    MlParams, Optics, Ptycho, RaarParams, RpieParams, Sampling,
 };
 use ptyrs::gpu::FUSED_SIDES;
 
@@ -43,7 +43,7 @@ const RPIE: RpieParams = RpieParams {
 fn rpie_descends_and_replays_under_every_propagator() {
     const NEPOCH: usize = 6;
     let moved = Features {
-        position: Some(drawn_offsets()),
+        position: Some(Feature::refined(drawn_offsets())),
         ..Features::default()
     };
     for c in cases() {
@@ -92,7 +92,7 @@ fn rpie_matches_cpu_under_every_propagator() {
     // Measured worst: LLK 3.7e-6, object 3.4e-7, probe 4.6e-6, offsets 3.1e-7.
     const TOL: [f64; 4] = [2e-5, 2e-6, 2.5e-5, 2e-6];
     let moved = Features {
-        position: Some(drawn_offsets()),
+        position: Some(Feature::refined(drawn_offsets())),
         ..Features::default()
     };
     for c in cases() {
@@ -116,8 +116,8 @@ fn rpie_matches_cpu_under_every_propagator() {
                 assert_eq!(got.len(), NEPOCH, "{what}");
                 let offset = match &cpu.features().position {
                     Some(want) => {
-                        let got = gpu.features().unwrap().position.unwrap();
-                        let pairs = || got.iter().flatten().zip(want.iter().flatten());
+                        let got = gpu.features().unwrap().position.unwrap().values;
+                        let pairs = || got.iter().flatten().zip(want.values.iter().flatten());
                         worst_of(pairs().map(|(g, w)| (g - w).abs()))
                             / worst_of(pairs().map(|(_, w)| w.abs()))
                     }
@@ -203,12 +203,12 @@ fn projections_match_cpu_under_every_propagator() {
     // 7.3e-7.
     const TOL: [f64; 5] = [4e-5, 1e-5, 1.5e-5, 1e-4, 4e-6];
     let stepped = |frame: usize| Features {
-        scale: Some(vec![1.0; NPOS]),
-        background: Some(vec![1.0; frame * frame]),
+        scale: Some(Feature::refined(vec![1.0; NPOS])),
+        background: Some(Feature::refined(vec![1.0; frame * frame])),
         position: None,
     };
     let moved = Features {
-        position: Some(drawn_offsets()),
+        position: Some(Feature::refined(drawn_offsets())),
         ..Features::default()
     };
     for c in cases() {
@@ -275,11 +275,20 @@ impl Ended {
 fn assert_close(what: &str, got: &Ended, want: &Ended, tol: [f64; 5]) {
     assert_eq!(got.llk.len(), want.llk.len(), "{what}");
     let scaled = |f: &Features| -> Vec<f64> {
-        let (s, b) = (f.scale.iter().flatten(), f.background.iter().flatten());
+        let (s, b) = (
+            f.scale.iter().flat_map(|d| &d.values),
+            f.background.iter().flat_map(|d| &d.values),
+        );
         s.chain(b).copied().collect()
     };
-    let moved =
-        |f: &Features| -> Vec<f64> { f.position.iter().flatten().flatten().copied().collect() };
+    let moved = |f: &Features| -> Vec<f64> {
+        f.position
+            .iter()
+            .flat_map(|d| &d.values)
+            .flatten()
+            .copied()
+            .collect()
+    };
     let worst = |g: Vec<f64>, w: Vec<f64>| match w.is_empty() {
         true => 0.0,
         false => {
@@ -355,12 +364,14 @@ fn full_object_projections_match_cpu(c: &Case) {
     const TOL_F16: [f64; 5] = [1.2e-3, 6e-3, 1.2e-3, 6e-4, 4.5e-4];
     let frame = FUSED_SIDES[0] as usize;
     let moved = Features {
-        position: Some(drawn_offsets()),
+        position: Some(Feature::refined(drawn_offsets())),
         ..Features::default()
     };
     let modelled = Features {
-        scale: Some((0..NPOS).map(|f| 1.0 + 0.05 * (f as f64).sin()).collect()),
-        background: Some(vec![0.3; frame * frame]),
+        scale: Some(Feature::refined(
+            (0..NPOS).map(|f| 1.0 + 0.05 * (f as f64).sin()).collect(),
+        )),
+        background: Some(Feature::refined(vec![0.3; frame * frame])),
         ..moved.clone()
     };
     let ctx = CudaContext::new(0).unwrap();
@@ -411,12 +422,14 @@ const ML: MlParams = MlParams {
 /// frames of `frame` pixels a side.
 fn full_object_models(frame: usize) -> [(&'static str, Features); 2] {
     let moved = Features {
-        position: Some(drawn_offsets()),
+        position: Some(Feature::refined(drawn_offsets())),
         ..Features::default()
     };
     let modelled = Features {
-        scale: Some((0..NPOS).map(|f| 1.0 + 0.05 * (f as f64).sin()).collect()),
-        background: Some(vec![0.3; frame * frame]),
+        scale: Some(Feature::refined(
+            (0..NPOS).map(|f| 1.0 + 0.05 * (f as f64).sin()).collect(),
+        )),
+        background: Some(Feature::refined(vec![0.3; frame * frame])),
         ..moved.clone()
     };
     [("position", moved), ("modelled", modelled)]
@@ -507,7 +520,7 @@ fn full_object_rpie_matches_cpu_under_every_propagator() {
     // scale or background.
     const TOL: [f64; 5] = [1e-5, 2e-6, 2.5e-5, f64::MIN_POSITIVE, 2e-6];
     let moved = Features {
-        position: Some(drawn_offsets()),
+        position: Some(Feature::refined(drawn_offsets())),
         ..Features::default()
     };
     for c in cases() {
@@ -614,12 +627,14 @@ fn full_object_llk_matches_cpu_under_every_propagator() {
     const TOL: f64 = 5e-6;
     let frame = FUSED_SIDES[0] as usize;
     let moved = Features {
-        position: Some(drawn_offsets()),
+        position: Some(Feature::refined(drawn_offsets())),
         ..Features::default()
     };
     let modelled = Features {
-        scale: Some((0..NPOS).map(|f| 1.0 + 0.05 * (f as f64).sin()).collect()),
-        background: Some(vec![0.3; frame * frame]),
+        scale: Some(Feature::refined(
+            (0..NPOS).map(|f| 1.0 + 0.05 * (f as f64).sin()).collect(),
+        )),
+        background: Some(Feature::refined(vec![0.3; frame * frame])),
         ..moved.clone()
     };
     for c in cases() {
@@ -655,7 +670,7 @@ fn full_object_llk_matches_cpu_under_every_propagator() {
 fn sampling_round_trip_rebuilds_the_same_run() {
     let c = &cases()[0];
     let moved = Features {
-        position: Some(drawn_offsets()),
+        position: Some(Feature::refined(drawn_offsets())),
         ..Features::default()
     };
     let bh = BhParams {

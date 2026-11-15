@@ -242,7 +242,7 @@ impl<'a> Bufs<'a> {
             None => k.obj_probe_to_psi(ctx, self.views, stack, self.obj, self.probe, rb.psi)?,
         }
         rb.delta(ctx, l, b)?;
-        if let Some(m) = &mut moved {
+        if let Some(m) = moved.as_mut().filter(|m| m.offsets.refine) {
             // The slopes of the object the batch started from, against Δ before the probe
             // step weights it.
             let chi_w = (&*rb.dlt, FrameWaves::Probes(&m.w[0]));
@@ -300,10 +300,12 @@ impl<'a> Bufs<'a> {
         }
         // The offsets' step reads neither array, so it may precede their steps, which end
         // the borrow of the batch-start probe.
-        if let Some(m) = moved {
+        if let Some(mut m) = moved
+            && let Some(offsets) = m.offsets.stepped()
+        {
             let batch = frames.range.clone();
             let solve = solve(self.exit.scale);
-            m.kernels.step(ctx, batch, m.own, m.offsets, solve, m.pos)?;
+            m.kernels.step(ctx, batch, m.own, offsets, solve, m.pos)?;
         }
         self.rpie_steps(ctx, params, frames.nf())
     }
@@ -323,6 +325,7 @@ impl<'a> Bufs<'a> {
         let l = self.launch();
         let (frames, stack) = (&rb.batches[b], rb.table.at(b));
         let dims = l.prop.dims;
+        let refined = self.features.position_refined();
         let mut m = (self.features).lend(ctx, l.k, &dims, self.obj, self.probe, self.exit)?;
         let block = |order, modes, block| WindowBlock {
             slice: 0,
@@ -338,7 +341,7 @@ impl<'a> Bufs<'a> {
             block([0, 0], Modes::All, 0),
             &mut w.win,
         )?;
-        for (axis, order) in (0..).zip([[1, 0], [0, 1]]) {
+        for (axis, order) in (0..).zip([[1, 0], [0, 1]]).filter(|_| refined) {
             let at = block(order, Modes::First, axis);
             m.windows_of(ctx, self.views, stack, None, at, &mut w.deriv)?;
         }
@@ -351,19 +354,23 @@ impl<'a> Bufs<'a> {
             (l.k).psi_to_obj(ctx, &w.views, stack, rb.dlt, rb.ptilde, &mut w.sums)?;
             m.place(ctx, self.views, stack, &w.sums.num, &mut self.obj_sums.num)?;
         }
-        let Some(PositionLent::FullObject(s)) = lend.lend(&mut self.features)? else {
+        let Some(PositionLent::FullObject(mut s)) = lend.lend(&mut self.features)? else {
             return Err(another_model());
         };
-        // The slopes of the windows the batch started from, against Δ before the probe step
-        // weights it.
-        let at = (&*rb.dlt, SliceSource::Probe(self.probe));
-        (s.kernels).derivative_sums(ctx, self.views, stack, &w.deriv, at, s.pos)?;
+        if s.offsets.refine {
+            // The slopes of the windows the batch started from, against Δ before the probe
+            // step weights it.
+            let at = (&*rb.dlt, SliceSource::Probe(self.probe));
+            (s.kernels).derivative_sums(ctx, self.views, stack, &w.deriv, at, s.pos)?;
+        }
         if params.probe_step.is_some() {
             rb.probe_weight(ctx, l, b, (&w.views, &w.win), params.probe_alpha)?;
             (l.k).psi_to_probe(ctx, &w.views, stack, rb.dlt, &w.win, self.probe_sums)?;
         }
-        let solve = solve(self.exit.scale);
-        (s.kernels).step(ctx, frames.range.clone(), s.own, s.offsets, solve, s.pos)?;
+        if let Some(offsets) = s.offsets.stepped() {
+            let solve = solve(self.exit.scale);
+            (s.kernels).step(ctx, frames.range.clone(), s.own, offsets, solve, s.pos)?;
+        }
         self.rpie_steps(ctx, params, frames.nf())
     }
 
