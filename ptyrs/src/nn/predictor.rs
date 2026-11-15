@@ -26,7 +26,7 @@ use rand::SeedableRng;
 use rand::seq::SliceRandom;
 use rand_chacha::ChaCha8Rng;
 
-use crate::nn::grid::fits;
+use crate::nn::grid::{check_operands, fits};
 use crate::nn::ptychonn::{Activations, Folded, PtychoNN};
 use crate::nn::{NnError, burn_err};
 
@@ -800,8 +800,21 @@ impl Model {
     }
 
     fn forward(&self, x: Tensor<4>) -> (Tensor<4>, Tensor<4>) {
-        self.net
-            .forward((x - self.mean.val()) * self.inv_spread.val())
+        self.net.forward(self.standardise(x))
+    }
+
+    /// `x`, `[batch, images, py, px]`, less the mean input, times each image's inverse spread.
+    fn standardise(&self, x: Tensor<4>) -> Tensor<4> {
+        let (mean, inv_spread) = (self.mean.val(), self.inv_spread.val());
+        let [_, images, py, px] = x.dims();
+        check_operands(
+            &x,
+            &[
+                (&mean, &[1, images, py, px]),
+                (&inv_spread, &[1, images, 1, 1]),
+            ],
+        );
+        (x - mean) * inv_spread
     }
 }
 
@@ -1003,8 +1016,7 @@ impl Predictor {
 
     /// The model's output for raw input `x`.
     fn forward(&self, x: Tensor<4>) -> (Tensor<4>, Tensor<4>) {
-        self.net
-            .forward((x - self.model.mean.val()) * self.model.inv_spread.val())
+        self.net.forward(self.model.standardise(x))
     }
 
     /// Patches `[nframe, py, px]` for detector-order `frames` of a scan whose
@@ -1142,6 +1154,7 @@ impl Predictor {
 pub(crate) mod tests {
     use super::*;
     use crate::base::{MASKED, Positions};
+    use burn::tensor::DType;
 
     /// A predictor of `config` at its initial weights, standardising nothing.
     pub(crate) fn untrained(config: &PredictorConfig, device: &Device) -> Predictor {
@@ -1442,6 +1455,20 @@ pub(crate) mod tests {
         );
         let predictor = train(&config, &options(), &samples, None, &device, |_| {}).unwrap();
         assert!(predictor.loss(&halves).is_err());
+    }
+
+    /// burn's elementwise ops launch in the input's float type, so they read an f16 mean as f32.
+    #[test]
+    #[should_panic(expected = "an operand in the input's float type")]
+    fn a_mean_of_another_float_type() {
+        let device = crate::nn::cuda(0);
+        let (config, _) = small(Input::Binned);
+        let mut predictor = untrained(&config, &device);
+        let mean = predictor.model.mean.val().cast(DType::F16);
+        predictor.model.mean = Param::from_tensor(mean);
+        let [py, px] = config.patch();
+        let shape = [1, config.input.images(), py, px];
+        predictor.forward(Tensor::zeros(shape, (&device, DType::F32)));
     }
 
     #[test]

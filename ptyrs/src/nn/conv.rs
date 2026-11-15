@@ -33,7 +33,7 @@ use burn_cubecl::kernel::into_contiguous;
 use burn_cubecl::ops::numeric::{empty_device_contiguous_dtype, zeros_client};
 use burn_cubecl::tensor::CubeTensor;
 
-use crate::nn::grid::{check_elements, check_operands, grid};
+use crate::nn::grid::{Operand, check_elements, check_operands, grid};
 
 /// A convolution of the networks, whose only forward is [`Conv::forward`]. Its record is the
 /// [`Conv2d`]'s it wraps, field for field, so saved networks read the same.
@@ -55,16 +55,25 @@ impl Conv {
     /// narrow in f16 or bf16. Anything else is `Conv2d::forward` on the channels-first view,
     /// permuted back; burn's CUDA convolutions run channels-last and take and give that memory as
     /// a permuted view, so neither permutation copies.
+    ///
+    /// Either way the weight and bias must be in `x`'s float type and of the shape the
+    /// configuration reads, `[co, channels / groups, kh, kw]` and `[co]`.
     pub fn forward(&self, x: Tensor<4>) -> Tensor<4> {
         let c = &self.0;
+        let (weight, bias) = (c.weight.val(), c.bias.as_ref().map(Param::val));
+        let ([co, ..], [.., channels], [kh, kw]) = (weight.dims(), x.dims(), c.kernel_size);
+        let (weight_shape, bias_shape) = ([co, channels / c.groups, kh, kw], [co]);
+        let mut operands: Vec<(&dyn Operand, &[usize])> = vec![(&weight, &weight_shape)];
+        operands.extend(bias.as_ref().map(|b| (b as &dyn Operand, &bias_shape[..])));
+        check_operands(&x, &operands);
         let wide = matches!(x.dtype(), DType::F32 | DType::F64);
         if !(is_3x3_same(c) && wide) {
             return c.forward(x.permute([0, 3, 1, 2])).permute([0, 2, 3, 1]);
         }
-        let (x, weight) = (x.into_dispatch(), c.weight.val().into_dispatch());
-        Tensor::<4>::from_dispatch(match &c.bias {
+        let (x, weight) = (x.into_dispatch(), weight.into_dispatch());
+        Tensor::<4>::from_dispatch(match bias {
             None => <Dispatch as ConvOps>::conv3x3(x, weight),
-            Some(b) => <Dispatch as ConvOps>::conv3x3_bias(x, weight, b.val().into_dispatch()),
+            Some(b) => <Dispatch as ConvOps>::conv3x3_bias(x, weight, b.into_dispatch()),
         })
     }
 
@@ -80,17 +89,29 @@ impl Conv {
     /// This convolution followed by `n` at its running statistics as one convolution.
     pub(crate) fn fold(&self, n: &BatchNorm) -> Self {
         let c = &self.0;
-        let [co] = n.gamma.shape().dims();
-        let s = n.gamma.val() / (n.running_var.value() + n.epsilon).sqrt();
+        let weight = c.weight.val();
         let bias = c
             .bias
             .as_ref()
-            .expect("a folded convolution carries a bias");
+            .expect("a folded convolution carries a bias")
+            .val();
+        let (gamma, beta) = (n.gamma.val(), n.beta.val());
+        let (mean, var) = (n.running_mean.value(), n.running_var.value());
+        let [co, ..] = weight.dims();
+        check_operands(
+            &weight,
+            &[
+                (&bias, &[co]),
+                (&gamma, &[co]),
+                (&beta, &[co]),
+                (&mean, &[co]),
+                (&var, &[co]),
+            ],
+        );
+        let s = gamma / (var + n.epsilon).sqrt();
         Self(Conv2d {
-            weight: Param::from_tensor(c.weight.val() * s.clone().reshape([co, 1, 1, 1])),
-            bias: Some(Param::from_tensor(
-                (bias.val() - n.running_mean.value()) * s + n.beta.val(),
-            )),
+            weight: Param::from_tensor(weight * s.clone().reshape([co, 1, 1, 1])),
+            bias: Some(Param::from_tensor((bias - mean) * s + beta)),
             ..c.clone()
         })
     }
@@ -448,13 +469,12 @@ const GROUPS: usize = 8;
 fn conv3x3(x: CubeTensor, wk: CubeTensor, bias: Option<CubeTensor>) -> CubeTensor {
     let [n, h, w, a] = x.meta.shape().dims();
     let [.., b] = wk.meta.shape().dims::<3>();
-    // The kernel reads `wk` and `bias` at `x`'s channels.
-    let (wk_shape, bias_shape) = ([a, 9, b], [b]);
-    let mut operands = vec![(&wk, &wk_shape[..])];
-    operands.extend(bias.as_ref().map(|t| (t, &bias_shape[..])));
-    check_operands(&x, &operands);
-    // `wk` is `arrange`'s, which checked it.
+    // The kernel reads `wk` at `x`'s channels; for the input gradient `x` is `dy`, which
+    // `Conv::forward` did not see. It checked `bias`.
+    check_operands(&x, &[(&wk, &[a, 9, b])]);
+    let bias_shape = [b];
     let bias_shape = if bias.is_some() { &bias_shape[..] } else { &[] };
+    // `wk` is `arrange`'s, which checked it.
     check_elements(&[x.meta.shape(), bias_shape, &[n, h, w, b]]);
     let client = x.client.clone();
     let y = empty_device_contiguous_dtype(
@@ -507,8 +527,7 @@ fn conv3x3(x: CubeTensor, wk: CubeTensor, bias: Option<CubeTensor>) -> CubeTenso
 /// `weight`, `[co, ci, 3, 3]`, as the `[ci, 9, co]` `conv3x3` reads for the forward, or, `flip`ped,
 /// as the `[co, 9, ci]` of the input gradient, whose tap `t` is the forward's `8 - t`.
 fn arrange(weight: CubeTensor, flip: bool) -> CubeTensor {
-    let [co, ci, kh, kw] = weight.meta.shape().dims();
-    assert_eq!([kh, kw], [3, 3], "a 3×3 weight");
+    let [co, ci, ..] = weight.meta.shape().dims::<4>();
     // `wk` holds as many elements.
     check_elements(&[weight.meta.shape()]);
     let shape = if flip { [co, 9, ci] } else { [ci, 9, co] };
@@ -525,7 +544,8 @@ fn arrange(weight: CubeTensor, flip: bool) -> CubeTensor {
     }
     let weight = into_contiguous(weight);
     let dtype = dtype_to_storage_type(weight.dtype);
-    // SAFETY: the kernel reads and writes element `i < len` of tensors of `len` elements.
+    // SAFETY: the kernel reads and writes element `i < len` of tensors of `len` elements, the
+    // weight's because `Conv::forward` checked it 3×3.
     unsafe {
         kernel::arrange::launch_unchecked(
             &client,
@@ -975,6 +995,7 @@ mod kernel {
 mod tests {
     use super::*;
     use burn::module::Param;
+    use burn::nn::BatchNormConfig;
     use burn::nn::conv::Conv2dConfig;
     use burn::tensor::ops::PadMode;
     use burn::tensor::{DType, Distribution, TensorData};
@@ -1442,9 +1463,43 @@ mod tests {
         Conv(c).forward(ones([1, 8, 8, 1], &device));
     }
 
+    /// A 1×1 convolution of `ci` to `co` channels with a bias, which is burn's.
+    fn conv_1x1(ci: usize, co: usize, device: &Device) -> Conv2d {
+        Conv2dConfig::new([ci, co], [1, 1]).init(device)
+    }
+
+    /// burn's convolution launches in the input's float type, so it read an f16 weight as f32.
+    #[test]
+    #[should_panic(expected = "an operand in the input's float type")]
+    fn a_weight_of_another_float_type_on_burns_path() {
+        let device = crate::nn::cuda(0);
+        let mut c = conv_1x1(1, 4, &device);
+        c.weight = Param::from_tensor(c.weight.val().cast(DType::F16));
+        Conv(c).forward(ones([1, 8, 8, 1], &device));
+    }
+
+    #[test]
+    #[should_panic(expected = "an operand in the input's float type")]
+    fn a_bias_of_another_float_type_on_burns_path() {
+        let device = crate::nn::cuda(0);
+        let mut c = conv_1x1(1, 4, &device);
+        c.bias = Some(Param::from_tensor(ones([4], &device).cast(DType::F16)));
+        Conv(c).forward(ones([1, 8, 8, 1], &device));
+    }
+
+    /// burn's elementwise ops read the f16 γ as the weight's f32.
+    #[test]
+    #[should_panic(expected = "an operand in the input's float type")]
+    fn a_fold_of_another_float_type() {
+        let device = crate::nn::cuda(0);
+        let mut n = BatchNormConfig::new(4).init(&device);
+        n.gamma = Param::from_tensor(ones([4], &device).cast(DType::F16));
+        Conv(conv(1, 4, &device)).fold(&n);
+    }
+
     /// A record whose weight is not 3×3 under a 3×3 configuration.
     #[test]
-    #[should_panic(expected = "a 3×3 weight")]
+    #[should_panic(expected = "an operand of the shape its kernels index")]
     fn a_weight_of_other_taps() {
         let device = crate::nn::cuda(0);
         let mut c = conv(1, 4, &device);

@@ -30,17 +30,29 @@ use crate::nn::grid::{check_elements, check_operands, grid};
 /// On an autodiff device with `n` training and `x` in f32 or f64, the batch statistics, the
 /// running-statistics update and the gradients are burn's; elsewhere this is burn's own path. The
 /// kernels sum in the activation's float type, which in f16 or bf16 loses the batch sums.
+///
+/// Either way γ, β and the running statistics must be in `x`'s float type, one per channel.
 pub fn norm_relu<const D: usize>(n: &BatchNorm, x: Tensor<D>) -> Tensor<D> {
     let dims = x.dims();
     let cols = dims[D - 1];
+    let (gamma, beta) = (n.gamma.val(), n.beta.val());
+    check_operands(
+        &x,
+        &[
+            (&gamma, &[cols]),
+            (&beta, &[cols]),
+            (&n.running_mean.value(), &[cols]),
+            (&n.running_var.value(), &[cols]),
+        ],
+    );
     let x = x.reshape([dims[..D - 1].iter().product(), cols]);
     let device = x.device();
     let wide = matches!(x.dtype(), DType::F32 | DType::F64);
     let y = if device.is_autodiff() && n.training.is_enabled() && wide {
         let (y, mean, var) = <Dispatch as NormReluOps>::norm_relu(
             x.into_dispatch(),
-            n.gamma.val().into_dispatch(),
-            n.beta.val().into_dispatch(),
+            gamma.into_dispatch(),
+            beta.into_dispatch(),
             n.epsilon,
         );
         let update = |state: &burn::module::RunningState<Tensor<1>>, stat| {
@@ -228,9 +240,8 @@ fn empty(like: &CubeTensor, shape: impl Into<Shape>) -> CubeTensor {
 }
 
 fn forward(x: CubeTensor, gamma: CubeTensor, beta: CubeTensor, epsilon: f64) -> Saved {
-    let [rows, cols] = x.meta.shape().dims();
-    // The kernels read γ and β at every channel.
-    check_operands(&x, &[(&gamma, &[cols]), (&beta, &[cols])]);
+    let [rows, _] = x.meta.shape().dims();
+    // The kernels read γ and β at every channel, as `norm_relu` checked them.
     let Some(g) = Grid::new(&x, &[&gamma, &beta]) else {
         let (y, mean, var) = (empty(&x, [rows, 0]), empty(&x, [0]), empty(&x, [0]));
         return Saved {
@@ -1059,6 +1070,28 @@ mod tests {
         let device = crate::nn::cuda(0).autodiff();
         let mut n = BatchNormConfig::new(16).init(&device);
         n.beta = Param::from_tensor(Tensor::zeros([16], (&device, DType::F64)));
+        norm_relu(&n, Tensor::<2>::ones([8, 16], (&device, DType::F32)));
+    }
+
+    /// burn's batch norm, here at the running statistics, launches in the input's float type, so
+    /// it read an f16 γ and β as f32.
+    #[test]
+    #[should_panic(expected = "an operand in the input's float type")]
+    fn refuses_a_gamma_and_beta_of_another_float_type_in_inference() {
+        let device = crate::nn::cuda(0);
+        let mut n = BatchNormConfig::new(16).init(&device);
+        n.gamma = Param::from_tensor(Tensor::ones([16], (&device, DType::F16)));
+        n.beta = Param::from_tensor(Tensor::zeros([16], (&device, DType::F16)));
+        norm_relu(&n, Tensor::<2>::ones([8, 16], (&device, DType::F32)));
+    }
+
+    /// The running-statistics update adds the kernels' f32 batch mean to the f16 running mean.
+    #[test]
+    #[should_panic(expected = "an operand in the input's float type")]
+    fn refuses_a_running_mean_of_another_float_type() {
+        let device = crate::nn::cuda(0).autodiff();
+        let mut n = BatchNormConfig::new(16).init(&device);
+        n.running_mean = RunningState::new(Tensor::zeros([16], (&device, DType::F16)));
         norm_relu(&n, Tensor::<2>::ones([8, 16], (&device, DType::F32)));
     }
 

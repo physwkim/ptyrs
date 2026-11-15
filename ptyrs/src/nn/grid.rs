@@ -3,6 +3,8 @@
 //! 65535. An nn kernel names its cube by the linear `CUBE_POS` alone and is launched on [`grid`],
 //! which may hold more cubes than asked; a cube past those asked for leaves at once.
 
+use burn::prelude::Tensor;
+use burn::tensor::DType;
 use burn_cubecl::cubecl::client::Client;
 use burn_cubecl::cubecl::prelude::CubeCount;
 use burn_cubecl::tensor::CubeTensor;
@@ -23,17 +25,50 @@ pub(super) fn fits(shape: &[usize]) -> bool {
     len.is_some_and(|len| u32::try_from(len).is_ok())
 }
 
-/// Panics unless each of `operands`, every tensor a launch reads besides `x` and does not make
-/// itself, has the shape paired with it and `x`'s float type: the kernels index an operand as of
-/// that shape and read it as `x`'s float type.
-pub(super) fn check_operands(x: &CubeTensor, operands: &[(&CubeTensor, &[usize])]) {
+/// A tensor as [`check_operands`] reads it.
+pub(super) trait Operand {
+    fn shape(&self) -> Vec<usize>;
+    fn float(&self) -> DType;
+}
+
+impl Operand for CubeTensor {
+    fn shape(&self) -> Vec<usize> {
+        self.meta.shape().to_vec()
+    }
+
+    fn float(&self) -> DType {
+        self.dtype
+    }
+}
+
+impl<const D: usize> Operand for Tensor<D> {
+    fn shape(&self) -> Vec<usize> {
+        self.dims().to_vec()
+    }
+
+    fn float(&self) -> DType {
+        self.dtype()
+    }
+}
+
+/// Panics unless each of `operands`, every tensor read with `x` that `x` does not make, has the
+/// shape paired with it and `x`'s float type. The kernels index an operand as of that shape and
+/// read it as `x`'s float type; burn's elementwise ops and convolutions launch in their first
+/// operand's float type without checking the others', and its elementwise ops broadcast a size-1
+/// axis. A module's operands are checked at its entry, before it picks a kernel or burn:
+/// [`Conv::forward`], [`Conv::fold`], [`norm_relu`] and the predictor's standardisation.
+///
+/// [`Conv::forward`]: crate::nn::conv::Conv::forward
+/// [`Conv::fold`]: crate::nn::conv::Conv::fold
+/// [`norm_relu`]: crate::nn::norm_relu::norm_relu
+pub(super) fn check_operands(x: &dyn Operand, operands: &[(&dyn Operand, &[usize])]) {
     for &(t, shape) in operands {
         assert_eq!(
-            &t.meta.shape()[..],
+            t.shape(),
             shape,
             "an operand of the shape its kernels index"
         );
-        assert_eq!(t.dtype, x.dtype, "an operand in the input's float type");
+        assert_eq!(t.float(), x.float(), "an operand in the input's float type");
     }
 }
 
