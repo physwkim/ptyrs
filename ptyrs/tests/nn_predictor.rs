@@ -15,6 +15,10 @@ use ptyrs::nn::predictor::{
 };
 use ptyrs::nn::ptychonn::PtychoNN;
 
+#[path = "common/worst.rs"]
+mod worst;
+use worst::worst_of;
+
 const FRAME: usize = 64;
 
 fn geometry() -> Geometry {
@@ -159,7 +163,7 @@ fn trained_predictor_keeps_its_fit_at_inference_and_after_reload() {
         .unwrap();
     for (i, o) in out.iter().enumerate() {
         let (a, p) = (patches.amp[i], patches.phase[i]);
-        let d = (o[0] - a * p.cos()).abs().max((o[1] - a * p.sin()).abs());
+        let d = worst_of([o[0] - a * p.cos(), o[1] - a * p.sin()].map(|e| f64::from(e.abs())));
         assert!(d < 1e-4, "value {i}: {o:?} vs {a} at {p}");
     }
     assert!(live.predict(raw, [FRAME, FRAME], &mut out[1..]).is_err());

@@ -657,6 +657,8 @@ mod tests {
     use burn::nn::BatchNormConfig;
     use burn::tensor::{DType, Distribution, TensorData};
 
+    use crate::worst::worst_of;
+
     fn values(n: usize, lo: f64, hi: f64, device: &Device, dtype: DType) -> Tensor<1> {
         Tensor::<1>::random([n], Distribution::Uniform(lo, hi), device)
             .cast(dtype)
@@ -738,14 +740,14 @@ mod tests {
         let names = ["y", "running mean", "running var", "dx", "dgamma", "dbeta"];
         for ((name, a), b) in names.iter().zip(&fused).zip(&reference) {
             let scale = b.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
-            let err = a
-                .iter()
-                .zip(b)
-                .fold(0.0_f64, |m, (a, b)| match (a.is_nan(), b.is_nan()) {
-                    (false, false) => m.max((a - b).abs()),
-                    (true, true) => m,
-                    _ => f64::INFINITY,
-                });
+            let err = worst_of(
+                a.iter()
+                    .zip(b)
+                    .map(|(a, b)| match a.is_nan() && b.is_nan() {
+                        true => 0.0,
+                        false => (a - b).abs(),
+                    }),
+            );
             assert!(
                 err <= tol * scale,
                 "{name} ({rows}×{cols}, {:?}): max error {err:e} of {scale:e}",

@@ -216,6 +216,8 @@ mod tests {
     use burn::module::{Param, RunningState};
     use burn::tensor::{DType, Distribution};
 
+    use crate::worst::worst_of;
+
     /// A small network whose batch normalisations hold drawn statistics, not the identity they
     /// start at. The shifts lean positive: at beta and mean both in (-1, 1) the ReLUs close on
     /// one output in 3 of 10 draws, leaving it flat.
@@ -303,7 +305,8 @@ mod tests {
         for (want, got) in [(a, fa), (p, fp)] {
             let spread = (want.clone().max() - want.clone().min()).into_scalar::<f64>();
             assert!(spread > 1e-3, "flat output, spread {spread}");
-            let d = (want - got).abs().max().into_scalar::<f64>();
+            let d = (want - got).abs().into_data().convert::<f64>();
+            let d = worst_of(d.try_into_vec::<f64>().unwrap());
             // burn takes sigmoid in f32, so the amplitudes differ by up to 1.2e-7.
             assert!(d < 1e-6, "folded output differs by {d}");
         }

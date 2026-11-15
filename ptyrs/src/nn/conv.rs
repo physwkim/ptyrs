@@ -591,6 +591,8 @@ mod tests {
     use burn::tensor::ops::PadMode;
     use burn::tensor::{DType, Distribution};
 
+    use crate::worst::worst_of;
+
     /// A convolution's sizes: batch, height, width, input and output channels, kernel side, and
     /// whether it has a bias, whether its input asks for a gradient and whether that input is a
     /// strided view.
@@ -683,11 +685,15 @@ mod tests {
     fn max_error(a: &[f64], b: &[f64]) -> (f64, f64) {
         assert_eq!(a.len(), b.len());
         let scale = b.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
-        let err = a
-            .iter()
-            .zip(b)
-            .fold(0.0_f64, |m, (a, b)| m.max((a - b).abs()));
+        let err = worst_of(a.iter().zip(b).map(|(a, b)| (a - b).abs()));
         (err, scale)
+    }
+
+    /// A NaN gradient is off by NaN, which no tolerance passes.
+    #[test]
+    fn a_nan_is_the_worst_error() {
+        let (err, scale) = max_error(&[1.0, f64::NAN, 3.0], &[1.0, 2.0, 3.0]);
+        assert!(err.is_nan(), "{err:e} of {scale:e}");
     }
 
     /// [`Conv::forward`] against burn's path: the output and the input and bias gradients are the
