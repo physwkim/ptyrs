@@ -451,6 +451,12 @@ impl ShiftedProbeSums {
         crate::gpu::zero(ctx, &mut self.den)
     }
 
+    /// The sums [`Self::clear`] zeroes, for a test to fill as a failed call leaves them.
+    #[cfg(test)]
+    pub(crate) fn sums_mut(&mut self) -> (&mut DeviceBuffer<C32>, &mut DeviceBuffer<f32>) {
+        (&mut self.num, &mut self.den)
+    }
+
     /// `norm`'s floats per probe mode.
     fn norm_len(d: &ViewDims) -> Result<usize, Error> {
         Ok(d.nframe as usize * (d.frame[0] / Shape::of(d)?.rows) as usize)

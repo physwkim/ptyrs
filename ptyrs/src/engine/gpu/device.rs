@@ -3537,7 +3537,8 @@ mod tests {
 
     /// What a call through [`Device::summing`] added to the update sums before failing never
     /// reaches the next: AP cycles after it, launched or replayed, are bit for bit those of
-    /// an engine it never ran on.
+    /// an engine it never ran on, also with the features whose sums the fused passes add to
+    /// across stacks, the background's and a position's shifted probe's.
     #[test]
     fn a_failed_summing_call_leaves_its_retry_no_sums() {
         let ctx = CudaContext::new(0).expect("GPU 0");
@@ -3550,8 +3551,19 @@ mod tests {
             }),
             count: 2,
         };
-        for graph in [false, true] {
-            let [mut failed, mut clean] = [(); 2].map(|()| engine(&ctx, graph, false));
+        let summed = Features {
+            background: Some(Feature::refined(vec![1.0; 64 * 64])),
+            position: Some(Feature::refined(vec![[0.1, -0.1]; 36])),
+            ..Features::default()
+        };
+        for (graph, fused) in [(false, false), (true, false), (false, true), (true, true)] {
+            let [mut failed, mut clean] = [(); 2].map(|()| {
+                let mut e = engine(&ctx, graph, fused);
+                if fused {
+                    e.set_features(&summed).unwrap();
+                }
+                e
+            });
             let r = failed.dev.summing(|dev| {
                 for sums in [&mut dev.obj_sums, &mut dev.probe_sums] {
                     let num = vec![C32 { re: 1.0, im: 1.0 }; sums.num.len()];
@@ -3559,9 +3571,26 @@ mod tests {
                     sums.den
                         .copy_from_host(&dev.stream, &vec![1.0; sums.den.len()])?;
                 }
+                if let Some(BackgroundBufs {
+                    sums: Some(sums), ..
+                }) = &mut dev.features.background
+                {
+                    let sum = &mut sums.sum;
+                    sum.copy_from_host(&dev.stream, &vec![1.0; sum.len()])?;
+                }
+                if let Some(PositionBufs {
+                    mover: Mover::Probe { probe_sums, .. },
+                    ..
+                }) = &mut dev.features.position
+                {
+                    let (num, den) = probe_sums.sums_mut();
+                    num.copy_from_host(&dev.stream, &vec![C32 { re: 1.0, im: 1.0 }; num.len()])?;
+                    den.copy_from_host(&dev.stream, &vec![1.0; den.len()])?;
+                }
                 Err::<(), _>(EngineError::Invalid("injected".into()))
             });
-            assert!(matches!(r, Err(EngineError::Invalid(_))), "{graph}");
+            let what = format!("graph {graph}, fused {fused}");
+            assert!(matches!(r, Err(EngineError::Invalid(_))), "{what}");
             for e in [&mut failed, &mut clean] {
                 e.run(&step).unwrap();
             }
@@ -3573,8 +3602,18 @@ mod tests {
                 (px.collect::<Vec<_>>(), llk.collect::<Vec<_>>())
             };
             let (f, c) = (bits(&failed), bits(&clean));
-            assert_eq!(f.1.len(), 2, "{graph}");
-            assert!(f == c, "graph {graph}: the retry differs from a clean run");
+            assert_eq!(f.1.len(), 2, "{what}");
+            assert!(f == c, "{what}: the retry differs from a clean run");
+            let features = |e: &GpuPtycho| {
+                let f = e.features().unwrap();
+                let pos = f.position.map(|p| p.values).into_iter().flatten().flatten();
+                let px = (f.background.map(|b| b.values).into_iter().flatten()).chain(pos);
+                px.map(f64::to_bits).collect::<Vec<_>>()
+            };
+            assert!(
+                features(&failed) == features(&clean),
+                "{what}: the retry's features differ from a clean run's"
+            );
         }
     }
 
