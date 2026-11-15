@@ -47,12 +47,12 @@ fn samples(
             .chunks(seeds.len().div_ceil(threads).max(1))
             .map(|chunk| {
                 s.spawn(move || {
-                    let mut part = Samples::new(config);
+                    let mut part = Samples::new(config).unwrap();
                     for &seed in chunk {
                         let (scan, object, addr) =
                             scan(config.frame[0], probe, seed, Some(draw(shape, seed)));
-                        let mut all = Samples::new(config);
-                        all.push_scan(config, &scan.counts, &object, &addr).unwrap();
+                        let mut all = Samples::new(config).unwrap();
+                        all.push_scan(&scan.counts, &object, &addr).unwrap();
                         part.extend(pick(all, per_scan, seed)).unwrap();
                     }
                     part
@@ -61,7 +61,7 @@ fn samples(
             .collect();
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
-    let mut all = Samples::new(config);
+    let mut all = Samples::new(config).unwrap();
     for p in parts {
         all.extend(p).unwrap();
     }

@@ -107,6 +107,14 @@ impl PredictorConfig {
         Ok(())
     }
 
+    fn geometry(&self) -> InputGeometry {
+        InputGeometry {
+            frame: self.frame,
+            bin: self.bin,
+            input: self.input,
+        }
+    }
+
     pub fn init(&self, device: &Device) -> Result<PtychoNN, NnError> {
         self.check()?;
         Ok(PtychoNN::new(
@@ -447,27 +455,38 @@ pub fn stitch(patches: &Patches, addr: &AddrTable) -> Result<Object, NnError> {
     Ok(Object::new(Stack::from_vec([1, nyo, nxo], data)?))
 }
 
+/// What a config makes of a frame: the frame, binning and [`Input`] that [`Samples`] are made
+/// with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct InputGeometry {
+    frame: [usize; 2],
+    bin: usize,
+    input: Input,
+}
+
 /// Training pairs: network inputs `[n, kind.images(), py, px]` of the [`Input`] `kind` and the
-/// true patches. The kind and patch are those of the config the samples were made for, and every
-/// predictor that reads them must have the same.
+/// true patches. The frame, binning and kind are those of the config the samples were made for,
+/// and every predictor that reads them must have the same.
 #[derive(Clone, Debug)]
 pub struct Samples {
-    kind: Input,
+    geometry: InputGeometry,
     input: Vec<f32>,
     target: Patches,
 }
 
 impl Samples {
-    pub fn new(config: &PredictorConfig) -> Self {
-        Self {
-            kind: config.input,
+    /// Fails unless `config` passes its check.
+    pub fn new(config: &PredictorConfig) -> Result<Self, NnError> {
+        config.check()?;
+        Ok(Self {
+            geometry: config.geometry(),
             input: Vec::new(),
             target: Patches::empty(config.patch()),
-        }
+        })
     }
 
     pub fn kind(&self) -> Input {
-        self.kind
+        self.geometry.input
     }
 
     /// The network inputs, `[n, kind.images(), py, px]`.
@@ -479,40 +498,35 @@ impl Samples {
         &self.target
     }
 
-    /// Fails unless a predictor of `kind` and `patch` reads these samples.
-    fn check(&self, kind: Input, patch: [usize; 2]) -> Result<(), NnError> {
-        let own = self.target.dims;
-        if kind != self.kind || patch != [own[1], own[2]] {
+    /// Fails unless samples of `geometry` are these samples'.
+    fn check(&self, geometry: InputGeometry) -> Result<(), NnError> {
+        if geometry != self.geometry {
             return Err(NnError::Invalid(format!(
-                "samples of {:?} and patch {:?} for {kind:?} and patch {patch:?}",
-                self.kind,
-                &own[1..]
+                "samples of {:?} for {geometry:?}",
+                self.geometry
             )));
         }
         Ok(())
     }
 
-    /// [`check`](Self::check) against `config`, which must pass its own check.
+    /// Fails unless a predictor of `config` reads these samples.
     fn check_config(&self, config: &PredictorConfig) -> Result<(), NnError> {
-        config.check()?;
-        self.check(config.input, config.patch())
+        self.check(config.geometry())
     }
 
     /// The pairs of one simulated scan: `frames` normalised by their own [`mean_frame_total`],
     /// targets from `object` through `addr`, the scan's address table.
     pub fn push_scan(
         &mut self,
-        config: &PredictorConfig,
         frames: &Counts,
         object: &Object,
         addr: &AddrTable,
     ) -> Result<(), NnError> {
-        self.check_config(config)?;
-        if frames.frame_shape() != config.frame || addr.frame_shape() != config.frame {
+        let InputGeometry { frame, bin, input } = self.geometry;
+        if frames.frame_shape() != frame || addr.frame_shape() != frame {
             return Err(NnError::Invalid(format!(
-                "scan frame {:?} differs from predictor frame {:?}",
+                "scan frame {:?} differs from samples' frame {frame:?}",
                 frames.frame_shape(),
-                config.frame
             )));
         }
         if frames.nframe() != addr.nframe() {
@@ -522,17 +536,17 @@ impl Samples {
                 addr.nframe()
             )));
         }
-        let input = diffraction_input(frames, self.kind, config.bin, mean_frame_total(frames))?;
-        let target = object_patches(object, addr, config.patch())?;
+        let input = diffraction_input(frames, input, bin, mean_frame_total(frames))?;
+        let [_, py, px] = self.target.dims;
+        let target = object_patches(object, addr, [py, px])?;
         self.input.extend(input);
         self.target.append(target);
         Ok(())
     }
 
-    /// Appends `other`'s pairs, which must be of the same kind and patch.
+    /// Appends `other`'s pairs, which must be of the same frame, binning and kind.
     pub fn extend(&mut self, other: Samples) -> Result<(), NnError> {
-        let dims = other.target.dims;
-        self.check(other.kind, [dims[1], dims[2]])?;
+        self.check(other.geometry)?;
         self.input.extend(other.input);
         self.target.append(other.target);
         Ok(())
@@ -546,8 +560,8 @@ impl Samples {
     pub fn select(&self, picks: &[usize]) -> Samples {
         let [_, py, px] = self.target.dims;
         Samples {
-            kind: self.kind,
-            input: gather(&self.input, picks, self.kind.images() * py * px),
+            geometry: self.geometry,
+            input: gather(&self.input, picks, self.kind().images() * py * px),
             target: self.target.select(picks),
         }
     }
@@ -778,7 +792,7 @@ impl Model {
 /// Per-pixel mean of `samples`' inputs and each image's inverse RMS spread about it.
 fn input_stats(samples: &Samples) -> Result<(Vec<f32>, Vec<f32>), NnError> {
     let [n, py, px] = samples.target.dims;
-    let images = samples.kind.images();
+    let images = samples.kind().images();
     let plane = py * px;
     let mut mean = vec![0.0f64; images * plane];
     for frame in samples.input.chunks(mean.len()) {
@@ -851,7 +865,7 @@ pub fn train(
         (start, model, optim) = checkpoint.resume(dir, model, optim)?;
     }
     let dims = train.target.dims;
-    let x = tensor(&train.input, train.kind.images(), dims, &ad);
+    let x = tensor(&train.input, train.kind().images(), dims, &ad);
     let amp = tensor(&train.target.amp, 1, dims, &ad);
     let phase = tensor(&train.target.phase, 1, dims, &ad);
     let mut rng = ChaCha8Rng::seed_from_u64(options.seed);
@@ -991,7 +1005,7 @@ impl Predictor {
         let device = self.device();
         let [n, py, px] = samples.target.dims;
         let plane = py * px;
-        let images = samples.kind.images();
+        let images = samples.kind().images();
         let mut sum = 0.0;
         for start in (0..n).step_by(CHUNK) {
             let m = CHUNK.min(n - start);
@@ -1136,8 +1150,8 @@ mod tests {
         let object = crate::nn::data::random_object([32, 32], 4);
         let counts = (0..3 * 256).map(|i| (i * 7 % 50) as u16).collect();
         let counts = Counts::from_raw([3, 16, 16], counts).unwrap();
-        let mut samples = Samples::new(&config);
-        samples.push_scan(&config, &counts, &object, &addr).unwrap();
+        let mut samples = Samples::new(&config).unwrap();
+        samples.push_scan(&counts, &object, &addr).unwrap();
         (config, samples)
     }
 
@@ -1192,32 +1206,78 @@ mod tests {
         assert!(predictor.loss(&twos).is_err());
     }
 
-    /// Neither a scan read by a predictor of the other input nor samples of it join the samples.
-    #[test]
-    fn samples_refuse_scans_and_samples_of_another_input() {
-        let (_, mut ones) = small(Input::Binned);
-        let (two, twos) = small(Input::BinnedCentre);
-        let object = crate::nn::data::random_object([32, 32], 4);
+    /// Samples of the unbinned half frame, whose patch is the same `[8, 8]` as `small`'s.
+    fn unbinned_half_frame() -> (PredictorConfig, Samples) {
+        let config = PredictorConfig::new([8, 8], 1)
+            .with_input(Input::Binned)
+            .with_width(4);
         let positions = Positions::new(vec![0.0, 0.0, 3.0], vec![-3.0, 3.0, 0.0]).unwrap();
-        let addr = AddrTable::new(&positions, [1.0, 1.0], [16, 16], [32, 32], 1, 1).unwrap();
-        let counts = Counts::from_raw([3, 16, 16], vec![1; 3 * 256]).unwrap();
-        assert!(ones.push_scan(&two, &counts, &object, &addr).is_err());
+        let addr = AddrTable::new(&positions, [1.0, 1.0], [8, 8], [16, 16], 1, 1).unwrap();
+        let object = crate::nn::data::random_object([16, 16], 4);
+        let counts = Counts::from_raw([3, 8, 8], vec![1; 3 * 64]).unwrap();
+        let mut samples = Samples::new(&config).unwrap();
+        samples.push_scan(&counts, &object, &addr).unwrap();
+        (config, samples)
+    }
+
+    /// Neither a scan of another frame nor samples of another input, or of another frame and
+    /// binning to the same patch, join the samples.
+    #[test]
+    fn samples_refuse_scans_and_samples_of_another_geometry() {
+        let (_, mut ones) = small(Input::Binned);
+        let (_, twos) = small(Input::BinnedCentre);
+        let (_, halves) = unbinned_half_frame();
+        let object = crate::nn::data::random_object([16, 16], 4);
+        let positions = Positions::new(vec![0.0, 0.0, 3.0], vec![-3.0, 3.0, 0.0]).unwrap();
+        let addr = AddrTable::new(&positions, [1.0, 1.0], [8, 8], [16, 16], 1, 1).unwrap();
+        let counts = Counts::from_raw([3, 8, 8], vec![1; 3 * 64]).unwrap();
+        assert!(ones.push_scan(&counts, &object, &addr).is_err());
         assert!(ones.extend(twos).is_err());
+        assert!(ones.extend(halves).is_err());
         assert_eq!((ones.len(), ones.input().len()), (3, 3 * 64));
         let (_, more) = small(Input::Binned);
         ones.extend(more).unwrap();
         assert_eq!((ones.len(), ones.input().len()), (6, 6 * 64));
     }
 
+    /// Samples of `small`'s patch and input but another frame and binning gave a predictor of one
+    /// binning inputs of another.
+    #[test]
+    fn train_and_loss_refuse_samples_of_another_frame_and_binning() {
+        let device = crate::nn::cuda(0);
+        let (config, samples) = small(Input::Binned);
+        let (half, halves) = unbinned_half_frame();
+        assert!(train(&half, &options(), &samples, None, &device, |_| {}).is_err());
+        assert!(
+            train(
+                &config,
+                &options(),
+                &samples,
+                Some(&halves),
+                &device,
+                |_| {}
+            )
+            .is_err()
+        );
+        let predictor = train(&config, &options(), &samples, None, &device, |_| {}).unwrap();
+        assert!(predictor.loss(&halves).is_err());
+    }
+
+    #[test]
+    fn samples_of_a_config_it_cannot_build_are_refused() {
+        let config = PredictorConfig::new([16, 16], 0).with_width(4);
+        assert!(matches!(Samples::new(&config), Err(NnError::Invalid(_))));
+    }
+
     /// A scan refused part way leaves no inputs without their targets.
     #[test]
     fn a_scan_of_another_object_leaves_the_samples_whole() {
-        let (config, mut samples) = small(Input::Binned);
+        let (_, mut samples) = small(Input::Binned);
         let positions = Positions::new(vec![0.0, 0.0, 3.0], vec![-3.0, 3.0, 0.0]).unwrap();
         let addr = AddrTable::new(&positions, [1.0, 1.0], [16, 16], [32, 32], 1, 1).unwrap();
         let object = crate::nn::data::random_object([32, 33], 4);
         let counts = Counts::from_raw([3, 16, 16], vec![1; 3 * 256]).unwrap();
-        let got = samples.push_scan(&config, &counts, &object, &addr);
+        let got = samples.push_scan(&counts, &object, &addr);
         assert!(matches!(got, Err(NnError::Invalid(_))));
         assert_eq!((samples.len(), samples.input().len()), (3, 3 * 64));
     }

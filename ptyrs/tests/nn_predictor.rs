@@ -44,10 +44,10 @@ fn config() -> PredictorConfig {
 }
 
 fn samples(config: &PredictorConfig, probe: &Probe, seeds: std::ops::Range<u64>) -> Samples {
-    let mut s = Samples::new(config);
+    let mut s = Samples::new(config).unwrap();
     for seed in seeds {
         let (scan, object, addr) = scan(probe, seed);
-        s.push_scan(config, &scan.counts, &object, &addr).unwrap();
+        s.push_scan(&scan.counts, &object, &addr).unwrap();
     }
     s
 }
