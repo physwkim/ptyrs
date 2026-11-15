@@ -1,7 +1,8 @@
 //! The launch grid of every nn kernel. CUDA launches at most 65535 cubes along a grid's Y and Z, so
 //! a kernel that laid a dimension of its own on Y or Z failed at launch once that dimension passed
 //! 65535. An nn kernel names its cube by the linear `CUBE_POS` alone and is launched on [`grid`],
-//! which may hold more cubes than asked; a cube past those asked for leaves at once.
+//! which may hold a few more cubes than asked but none past 2³², so the 32-bit `CUBE_POS` names
+//! each cube once and a cube past those asked for leaves at once.
 
 use burn::prelude::Tensor;
 use burn::tensor::DType;
@@ -9,13 +10,20 @@ use burn_cubecl::cubecl::client::Client;
 use burn_cubecl::cubecl::prelude::CubeCount;
 use burn_cubecl::tensor::CubeTensor;
 
-/// A grid of at least `cubes` cubes within the limits of `client`'s device, filling X first.
+/// A grid of at least `cubes` cubes within the limits of `client`'s device, spread evenly over the
+/// fewest rows along X.
 pub(super) fn grid(client: &Client, cubes: usize) -> CubeCount {
     let (most_x, most_y, _) = client.properties().hardware.max_cube_count;
     let cubes = u32::try_from(cubes).expect("a launch of fewer than 2³² cubes");
-    // CUDA's X takes 2³¹ - 1 cubes, so `rows` is at most 3 and the grid one deep.
-    let rows = cubes.div_ceil(most_x);
-    CubeCount::Static(cubes.min(most_x), rows.min(most_y), rows.div_ceil(most_y))
+    // CUDA's X takes 2³¹ - 1 cubes, so `rows` is at most 3 and the grid one deep. Spread evenly
+    // over the rows, the cubes pass `cubes` by fewer than `rows`, so none is past 2³²: 3 rows
+    // come only of 2³² - 1 cubes, which 3 divides.
+    let rows = cubes.div_ceil(most_x).max(1);
+    CubeCount::Static(
+        cubes.div_ceil(rows),
+        rows.min(most_y),
+        rows.div_ceil(most_y),
+    )
 }
 
 /// Whether a tensor of `shape` holds fewer than 2³² elements: the kernels index tensors with 32
@@ -83,7 +91,40 @@ pub(super) fn check_elements(shapes: &[&[usize]]) {
 
 #[cfg(test)]
 mod tests {
+    use burn_cubecl::CubeBackend;
+
     use super::*;
+
+    /// Up to 2³² - 1 cubes the grid holds fewer more than asked than it has rows, and none past
+    /// 2³², so the 32-bit `CUBE_POS` names each cube once. Three rows of 2³¹ - 1 cubes for
+    /// 2³² - 1 named cubes 0 .. 2³¹ - 3 twice.
+    #[test]
+    fn each_cube_position_names_one_cube() {
+        let client = Tensor::<1>::empty([1], &crate::nn::cuda(0))
+            .try_into_primitive::<CubeBackend>()
+            .unwrap()
+            .client;
+        let most_x = u64::from(client.properties().hardware.max_cube_count.0);
+        let tops = [
+            1,
+            most_x - 1,
+            most_x,
+            most_x + 1,
+            2 * most_x,
+            2 * most_x + 1,
+        ];
+        for cubes in tops.into_iter().filter(|&c| c <= u64::from(u32::MAX)) {
+            let CubeCount::Static(x, y, z) = grid(&client, cubes as usize) else {
+                unreachable!("a static grid");
+            };
+            let held = u64::from(x) * u64::from(y) * u64::from(z);
+            let past = held.checked_sub(cubes);
+            assert!(
+                past.is_some_and(|p| p < u64::from(y * z)) && held <= 1 << 32,
+                "{cubes} cubes on {x}×{y}×{z}"
+            );
+        }
+    }
 
     #[test]
     fn just_under_2_32_elements_fit() {
