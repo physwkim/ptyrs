@@ -127,7 +127,10 @@ fn run(toolkit: &Toolkit) -> Res<()> {
 
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
     let workspace = manifest.parent().ok_or("ptyrs has no parent directory")?;
-    let kernels = workspace.join(DEVICE_PACKAGE);
+    // Relative, so cargo resolves them against the checkout it builds. Checkouts sharing a
+    // target dir share this script's run, and an absolute path keeps naming the one that last
+    // ran it: another's edits did not rerun it, and its cubin missed their kernels.
+    let kernels = Path::new("..").join(DEVICE_PACKAGE);
     println!("cargo:rerun-if-changed={}", kernels.join("src").display());
     println!(
         "cargo:rerun-if-changed={}",
