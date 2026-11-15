@@ -9,9 +9,7 @@ use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 use ptyrs::base::C64;
 use ptyrs::gpu::sampling::ObjectSampler;
-use ptyrs::gpu::{
-    C32, Kernels, LsqmlKernels, LsqmlScan, MASKED, UpdateSums, ViewAddr, ViewDims, Views,
-};
+use ptyrs::gpu::{C32, Kernels, LsqmlKernels, LsqmlScan, MASKED, ViewAddr, ViewDims, Views};
 
 #[path = "common/worst.rs"]
 mod worst;
@@ -130,10 +128,9 @@ fn direction(
     k: &LsqmlKernels,
     st: &LsqmlScan,
 ) -> Vec<f64> {
-    let mut sums = UpdateSums::zeroed(stream, LEN).unwrap();
-    sums.num = up(stream, &vec![C64::new(1.0, 0.0); LEN]);
-    k.dir_obj(ctx, st, &mut sums).unwrap();
-    let got = sums.num.to_host_vec(stream).unwrap();
+    let mut num = up(stream, &vec![C64::new(1.0, 0.0); LEN]);
+    k.dir_obj(ctx, st, &mut num).unwrap();
+    let got = num.to_host_vec(stream).unwrap();
     got.iter().map(|c| c.re as f64).collect()
 }
 

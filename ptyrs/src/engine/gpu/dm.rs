@@ -1,6 +1,9 @@
 //! PyNX DM on the GPU, and the cycle it shares with RAAR.
 
-use crate::gpu::{Error as GpuError, Exit, FusedBufs, FusedInputs, FusedSums, ShiftProbe};
+use crate::gpu::{
+    Error as GpuError, Exit, FusedBufs, FusedInputs, FusedSums, ShiftProbe, ShiftedProbes,
+    ShiftedStepSums,
+};
 use cuda_async::device_operation::ExecutionContext;
 
 use super::device::{CarriedMut, M1Bufs, OneSlice, PassesMut, Sample, another_model};
@@ -177,7 +180,7 @@ impl Bufs<'_> {
                             model: m.model(),
                         };
                         let sums = FusedSums {
-                            obj: summed.then(|| win.zeroed_sums(ctx)).transpose()?,
+                            obj: summed.then(|| win.zeroed_patches(ctx)).transpose()?,
                             ..FusedSums::default()
                         };
                         (self.kernels).fused_project(ctx, &inputs, stack, exit, f, sums)?;
@@ -273,7 +276,7 @@ impl Bufs<'_> {
                     .shifted_psi_sums(ctx, &inputs, stack, psi, f, sums)?;
             }
             if probe.is_some() {
-                let sums = m.psi_sums(None, Some(ShiftProbe::Step));
+                let sums = m.psi_sums(None, Some(ShiftedProbes::step));
                 self.kernels
                     .shifted_psi_sums(ctx, &inputs, stack, psi, f, sums)?;
             }
@@ -281,9 +284,10 @@ impl Bufs<'_> {
         let Some(inertia) = probe else {
             return Ok(());
         };
-        m.probe_sums(ctx, self.kernels, &dims, self.probe_sums)?;
+        m.probe_sums::<ShiftedStepSums>(ctx, self.kernels, &dims, self.probe_sums)?;
         let model = m.model();
-        let Some(ShiftProbe::Step(step)) = m.shift_sums(Some(ShiftProbe::Step), false).probe else {
+        let Some(ShiftProbe::Step(step)) = m.shift_sums(Some(ShiftedProbes::step), false).probe
+        else {
             return Ok(());
         };
         let inputs = FusedInputs {
@@ -329,7 +333,7 @@ impl Bufs<'_> {
             let mut win = win.ok_or_else(another_model)?;
             let read = win.read;
             if obj {
-                let sums = win.zeroed_sums(ctx)?;
+                let sums = win.zeroed_patches(ctx)?;
                 (self.kernels).psi_to_obj(ctx, read.views, stack, &*psi, self.probe, sums)?;
                 m.place(
                     ctx,

@@ -5,8 +5,8 @@ use std::sync::Arc;
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, DeviceCopy};
 use ptyrs::gpu::{
-    C32, Kernels, MASKED, POWER_CHUNK, PowerMax, RpieKernels, StackTable, UpdateSums, ViewAddr,
-    ViewDims, Views, Weight,
+    C32, Kernels, MASKED, POWER_CHUNK, PowerMax, RpieKernels, StackTable, ViewAddr, ViewDims,
+    Views, Weight,
 };
 
 #[path = "common/worst.rs"]
@@ -294,14 +294,13 @@ fn obj_wave_to_psi_matches_f64() {
     );
 }
 
-/// Bit for bit `x + s * num` with the product and the sum rounded separately, and the sums
+/// Bit for bit `x + s * num` with the product and the sum rounded separately, and `num`
 /// left zero.
 #[test]
 fn step_adds_and_consumes_sums() {
     let (stream, ctx, k) = setup();
     let n = 1000usize;
     let (x, num) = (noise(n, 7, 2.0), noise(n, 11, 3.0));
-    let den: Vec<f32> = noise(n, 13, 1.0).iter().map(|c| c.re).collect();
     let s = 0.37f32;
     let want: Vec<C32> = x
         .iter()
@@ -312,24 +311,16 @@ fn step_adds_and_consumes_sums() {
         })
         .collect();
     let mut dx = up(&stream, &x);
-    let mut sums = UpdateSums::new(up(&stream, &num), up(&stream, &den), &stream).unwrap();
-    k.step(&ctx, &mut dx, &mut sums, n as u32, s).unwrap();
+    let mut num = up(&stream, &num);
+    k.step(&ctx, &mut dx, &mut num, n as u32, s).unwrap();
     assert_eq!(dx.to_host_vec(&stream).unwrap(), want);
     assert!(
-        sums.num
-            .to_host_vec(&stream)
+        num.to_host_vec(&stream)
             .unwrap()
             .iter()
             .all(|c| *c == C32::default())
     );
-    assert!(
-        sums.den
-            .to_host_vec(&stream)
-            .unwrap()
-            .iter()
-            .all(|d| *d == 0.0)
-    );
-    assert!(k.step(&ctx, &mut dx, &mut sums, n as u32 + 1, s).is_err());
+    assert!(k.step(&ctx, &mut dx, &mut num, n as u32 + 1, s).is_err());
 }
 
 #[test]

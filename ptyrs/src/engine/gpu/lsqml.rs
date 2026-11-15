@@ -19,7 +19,7 @@ use crate::gpu::{
     BandCarry, BhScan, C32, EpochOrder, Error as GpuError, ExitPass, ExitStage, FrameWaves,
     FusedInputs, Kernels, LSQML_REC, LsqmlAt, LsqmlChi, LsqmlKernels, LsqmlNoise, LsqmlScan,
     LsqmlVar, Model, PositionRule, PositionStep, Positions, PsiSums, ShiftProbe, SliceSource,
-    SliceSteps, Solve, StackRef, StackTable, UpdateSums, ViewDims, Views,
+    SliceSteps, Solve, StackRef, StackTable, ViewDims, Views,
 };
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaStream, DeviceBuffer};
@@ -183,8 +183,8 @@ struct Windows {
     views: Views,
     /// Per stack of a batch, every slice's windows.
     win: Vec<Vec<DeviceBuffer<C32>>>,
-    /// A stack's object sums on its windows, which the sampler places on the object.
-    sums: UpdateSums,
+    /// A stack's object numerator on its windows, which the sampler places on the object.
+    patches: DeviceBuffer<C32>,
     /// A stack's windows of an object direction.
     dir: DeviceBuffer<C32>,
     /// The illumination map the preconditioner takes.
@@ -214,7 +214,7 @@ impl Windows {
         Ok(Self {
             kernels: kernels.clone(),
             win,
-            sums: UpdateSums::zeroed(stream, len)?,
+            patches: DeviceBuffer::zeroed(stream, len)?,
             dir: DeviceBuffer::zeroed(stream, len)?,
             illum: DeviceBuffer::zeroed(stream, dims.obj_len())?,
             views,
@@ -249,10 +249,9 @@ impl Windows {
         probe: &DeviceBuffer<C32>,
         num: &mut DeviceBuffer<C32>,
     ) -> Result<(), GpuError> {
-        crate::gpu::zero(ctx, &mut self.sums.den)?;
-        crate::gpu::zero(ctx, &mut self.sums.num)?;
-        (self.kernels).psi_to_obj(ctx, &self.views, at.stack, psi, probe, &mut self.sums)?;
-        sampler.place(ctx, at, &self.sums.num, 0, num)
+        crate::gpu::zero(ctx, &mut self.patches)?;
+        (self.kernels).psi_to_obj(ctx, &self.views, at.stack, psi, probe, &mut self.patches)?;
+        sampler.place(ctx, at, &self.patches, 0, num)
     }
 
     /// The stack's windows at `at` of the object direction whose spectra `spectra` holds,
@@ -811,7 +810,7 @@ impl<'a> Bufs<'a> {
                         stack,
                         &l.work[k],
                         self.probe,
-                        self.obj_sums,
+                        &mut self.obj_sums.num,
                     )?;
                     self.kernels.psi_to_probe(
                         ctx,
@@ -819,7 +818,7 @@ impl<'a> Bufs<'a> {
                         stack,
                         &l.work[k],
                         self.obj,
-                        self.probe_sums,
+                        &mut self.probe_sums.num,
                     )?;
                 }
             }
@@ -827,8 +826,8 @@ impl<'a> Bufs<'a> {
                 for (k, s) in batch.clone().enumerate() {
                     let inputs = moved_inputs(&base, moved_shift(m.pos, m.spectrum));
                     let sums = PsiSums {
-                        obj: Some(&mut *self.obj_sums),
-                        probe: Some(ShiftProbe::Sums(&mut *m.probe_sums)),
+                        obj: Some(&mut self.obj_sums.num),
+                        probe: Some(ShiftProbe::Num(&mut *m.probe_sums)),
                     };
                     let stack = l.table.at(s);
                     self.kernels
@@ -838,11 +837,11 @@ impl<'a> Bufs<'a> {
                     ctx,
                     views.dims(),
                     m.probe_sums,
-                    self.probe_sums,
+                    &mut self.probe_sums.num,
                 )?;
             }
         }
-        l.kernels.dir_obj(ctx, l.scan, self.obj_sums)?;
+        l.kernels.dir_obj(ctx, l.scan, &mut self.obj_sums.num)?;
         let nb = positions.len() as f32;
         self.kernels
             .scale_c32(ctx, &mut self.probe_sums.num, self.probe_len, 1.0 / nb)?;
@@ -877,11 +876,11 @@ impl<'a> Bufs<'a> {
         }
         let obj = LsqmlVar {
             x: &mut *self.obj,
-            sums: &mut *self.obj_sums,
+            num: &mut self.obj_sums.num,
         };
         let probe = LsqmlVar {
             x: &mut *self.probe,
-            sums: &mut *self.probe_sums,
+            num: &mut self.probe_sums.num,
         };
         l.kernels.update(ctx, l.scan, obj, probe)?;
         Ok(())
@@ -951,7 +950,7 @@ impl<'a> Bufs<'a> {
                 stack,
                 work,
                 &w.win[k][0],
-                self.probe_sums,
+                &mut self.probe_sums.num,
             )?;
             if let Some(step) = step.as_deref_mut() {
                 // The slopes of the windows the batch started from.
@@ -965,7 +964,7 @@ impl<'a> Bufs<'a> {
             let at = points(views, stack, p.pos);
             w.place(ctx, p.sampler, at, work, self.probe, &mut self.obj_sums.num)?;
         }
-        lk.dir_obj(ctx, l.scan, self.obj_sums)?;
+        lk.dir_obj(ctx, l.scan, &mut self.obj_sums.num)?;
         let nb = positions.len() as f32;
         self.kernels
             .scale_c32(ctx, &mut self.probe_sums.num, self.probe_len, 1.0 / nb)?;
@@ -988,11 +987,11 @@ impl<'a> Bufs<'a> {
         }
         let obj = LsqmlVar {
             x: &mut *self.obj,
-            sums: &mut *self.obj_sums,
+            num: &mut self.obj_sums.num,
         };
         let probe = LsqmlVar {
             x: &mut *self.probe,
-            sums: &mut *self.probe_sums,
+            num: &mut self.probe_sums.num,
         };
         lk.update(ctx, l.scan, obj, probe)
     }
@@ -1110,10 +1109,16 @@ impl<'a> Bufs<'a> {
                 let stack = l.table.at(s);
                 let pair = [&w.incident[k][i - 1], w.chi[k].get(i).unwrap_or(&l.work[k])];
                 ok.slice_pair(ctx, d, stack, pair, &mut w.pair)?;
-                self.kernels
-                    .psi_to_obj(ctx, views, stack, &w.pair, sl.ones, self.obj_sums)?;
+                self.kernels.psi_to_obj(
+                    ctx,
+                    views,
+                    stack,
+                    &w.pair,
+                    sl.ones,
+                    &mut self.obj_sums.num,
+                )?;
             }
-            lk.dir_obj(ctx, l.scan, self.obj_sums)?;
+            lk.dir_obj(ctx, l.scan, &mut self.obj_sums.num)?;
             for (k, s) in batch.clone().enumerate() {
                 let at = LsqmlAt {
                     x: [&self.deeper[i - 1], &*self.probe],
@@ -1135,7 +1140,7 @@ impl<'a> Bufs<'a> {
             )?;
             let obj = LsqmlVar {
                 x: &mut self.deeper[i - 1],
-                sums: &mut *self.obj_sums,
+                num: &mut self.obj_sums.num,
             };
             lk.update_alone(ctx, l.scan, obj, steps)?;
         }
@@ -1144,28 +1149,40 @@ impl<'a> Bufs<'a> {
             None => {
                 for (k, s) in batch.clone().enumerate() {
                     let (stack, chi) = (l.table.at(s), &w.chi[k][0]);
-                    self.kernels
-                        .psi_to_obj(ctx, views, stack, chi, self.probe, self.obj_sums)?;
-                    self.kernels
-                        .psi_to_probe(ctx, views, stack, chi, self.obj, self.probe_sums)?;
+                    self.kernels.psi_to_obj(
+                        ctx,
+                        views,
+                        stack,
+                        chi,
+                        self.probe,
+                        &mut self.obj_sums.num,
+                    )?;
+                    self.kernels.psi_to_probe(
+                        ctx,
+                        views,
+                        stack,
+                        chi,
+                        self.obj,
+                        &mut self.probe_sums.num,
+                    )?;
                 }
             }
             Some(m) => {
                 for (k, s) in batch.clone().enumerate() {
                     let inputs = moved_inputs(&base, moved_shift(m.pos, m.spectrum));
                     let sums = PsiSums {
-                        obj: Some(&mut *self.obj_sums),
-                        probe: Some(ShiftProbe::Sums(&mut *m.probe_sums)),
+                        obj: Some(&mut self.obj_sums.num),
+                        probe: Some(ShiftProbe::Num(&mut *m.probe_sums)),
                     };
                     let (stack, chi) = (l.table.at(s), &w.chi[k][0]);
                     self.kernels
                         .shifted_psi_sums(ctx, &inputs, stack, chi, m.fused, sums)?;
                 }
                 self.kernels
-                    .shifted_probe_sums(ctx, d, m.probe_sums, self.probe_sums)?;
+                    .shifted_probe_sums(ctx, d, m.probe_sums, &mut self.probe_sums.num)?;
             }
         }
-        lk.dir_obj(ctx, l.scan, self.obj_sums)?;
+        lk.dir_obj(ctx, l.scan, &mut self.obj_sums.num)?;
         let nb = positions.len() as f32;
         self.kernels
             .scale_c32(ctx, &mut self.probe_sums.num, self.probe_len, 1.0 / nb)?;
@@ -1194,11 +1211,11 @@ impl<'a> Bufs<'a> {
         }
         let obj = LsqmlVar {
             x: &mut *self.obj,
-            sums: &mut *self.obj_sums,
+            num: &mut self.obj_sums.num,
         };
         let probe = LsqmlVar {
             x: &mut *self.probe,
-            sums: &mut *self.probe_sums,
+            num: &mut self.probe_sums.num,
         };
         lk.update(ctx, l.scan, obj, probe)
     }
@@ -1320,7 +1337,7 @@ impl<'a> Bufs<'a> {
                     &mut self.obj_sums.num,
                 )?;
             }
-            lk.dir_obj(ctx, l.scan, self.obj_sums)?;
+            lk.dir_obj(ctx, l.scan, &mut self.obj_sums.num)?;
             p.sampler.spectra(ctx, &self.obj_sums.num, p.spectra)?;
             for (k, s) in batch.clone().enumerate() {
                 let stack = table.at(s);
@@ -1345,7 +1362,7 @@ impl<'a> Bufs<'a> {
             )?;
             let obj = LsqmlVar {
                 x: &mut self.deeper[i - 1],
-                sums: &mut *self.obj_sums,
+                num: &mut self.obj_sums.num,
             };
             lk.update_alone(ctx, l.scan, obj, steps)?;
         }
@@ -1358,12 +1375,12 @@ impl<'a> Bufs<'a> {
                 stack,
                 chi,
                 &w.win[k][0],
-                self.probe_sums,
+                &mut self.probe_sums.num,
             )?;
             let at = points(views, stack, p.pos);
             w.place(ctx, p.sampler, at, chi, self.probe, &mut self.obj_sums.num)?;
         }
-        lk.dir_obj(ctx, l.scan, self.obj_sums)?;
+        lk.dir_obj(ctx, l.scan, &mut self.obj_sums.num)?;
         let nb = positions.len() as f32;
         self.kernels
             .scale_c32(ctx, &mut self.probe_sums.num, self.probe_len, 1.0 / nb)?;
@@ -1387,11 +1404,11 @@ impl<'a> Bufs<'a> {
         }
         let obj = LsqmlVar {
             x: &mut *self.obj,
-            sums: &mut *self.obj_sums,
+            num: &mut self.obj_sums.num,
         };
         let probe = LsqmlVar {
             x: &mut *self.probe,
-            sums: &mut *self.probe_sums,
+            num: &mut self.probe_sums.num,
         };
         lk.update(ctx, l.scan, obj, probe)
     }

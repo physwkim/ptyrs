@@ -26,7 +26,7 @@ use std::sync::Arc;
 use crate::base::AddrTable;
 use crate::gpu::{
     C32, Exit, FarSums, FusedBufs, FusedInputs, FusedSums, Kernels, LlkPartial, LlkSums, Model,
-    StackTable, UpdateSums, ViewAddr, ViewDims, Views, view_tiles,
+    StackTable, SumTarget, UpdateSums, ViewAddr, ViewDims, Views, view_tiles,
 };
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{Context, DeviceBuffer, Stream};
@@ -628,8 +628,10 @@ impl State {
                 _ => None,
             };
             let sums = FusedSums {
-                obj: obj_sums.as_mut(),
-                probe: mine.and_then(|_| leaf_sums.get_mut(st.leaf - r * plan.k)),
+                obj: obj_sums.as_mut().map(|s| s as &mut dyn SumTarget),
+                probe: mine
+                    .and_then(|_| leaf_sums.get_mut(st.leaf - r * plan.k))
+                    .map(|s| s as &mut dyn SumTarget),
                 ..Default::default()
             };
             let far = FarSums {

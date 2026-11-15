@@ -275,8 +275,8 @@ pub(super) struct BhSliced {
     /// Three of a stack's waves: two carry the residual back through the slices, then all
     /// three the second derivatives of its exit waves over `(u, u)`, `(u, v)` and `(v, v)`.
     work: [DeviceBuffer<C32>; 3],
-    /// The gradient sums and the last direction of slices `1 .. n`.
-    grads: Vec<UpdateSums>,
+    /// The gradient and the last direction of slices `1 .. n`.
+    grads: Vec<DeviceBuffer<C32>>,
     prev: Vec<DeviceBuffer<C32>>,
 }
 
@@ -300,7 +300,7 @@ impl BhSliced {
             incident: (0..slots).map(|_| waves()).collect::<Result<_, _>>()?,
             work: [zeroed(len)?, zeroed(len)?, zeroed(len)?],
             grads: (0..deeper)
-                .map(|_| UpdateSums::zeroed(stream, dims.obj_len()))
+                .map(|_| zeroed(dims.obj_len()))
                 .collect::<Result<_, _>>()?,
             prev: (0..deeper)
                 .map(|_| zeroed(dims.obj_len()))
@@ -308,22 +308,22 @@ impl BhSliced {
         })
     }
 
-    /// The slices' gradient sums, the tail of [`update_sums`].
-    pub(super) fn grads(&mut self) -> &mut [UpdateSums] {
+    /// The slices' gradients, the tail of [`update_nums`].
+    pub(super) fn grads(&mut self) -> &mut [DeviceBuffer<C32>] {
         &mut self.grads
     }
 }
 
-/// Every sum an update consumes, which the passes add to across stacks: the object's, the
-/// probe's, then `grads`, a multislice object's slices' past the first under BH, in the order
-/// of BH's variables. `Device::summing`'s discard zeroes the same list, so no sum a failed
-/// call began reaches its retry.
-pub(super) fn update_sums<'s>(
+/// Every numerator an update consumes, which the passes add to across stacks: the object's,
+/// the probe's, then `grads`, a multislice object's slices' past the first under BH, in the
+/// order of BH's variables. `Device::summing`'s discard zeroes the same list and the two
+/// denominators, so no sum a failed call began reaches its retry.
+pub(super) fn update_nums<'s>(
     obj: &'s mut UpdateSums,
     probe: &'s mut UpdateSums,
-    grads: &'s mut [UpdateSums],
-) -> impl Iterator<Item = &'s mut UpdateSums> {
-    [obj, probe].into_iter().chain(grads)
+    grads: &'s mut [DeviceBuffer<C32>],
+) -> impl Iterator<Item = &'s mut DeviceBuffer<C32>> {
+    [&mut obj.num, &mut probe.num].into_iter().chain(grads)
 }
 
 /// [`BhMoved`]'s buffers besides its [`Moved`] under [`crate::engine::Sampling::Patch`], lent
@@ -482,8 +482,8 @@ impl Bufs<'_> {
                     let shift = moved_shift(m.pos, m.spectrum);
                     let inputs = moved_inputs(&base, shift);
                     let sums = PsiSums {
-                        obj: Some(&mut *self.obj_sums),
-                        probe: Some(ShiftProbe::Sums(&mut *m.probe_sums)),
+                        obj: Some(&mut self.obj_sums.num),
+                        probe: Some(ShiftProbe::Num(&mut *m.probe_sums)),
                     };
                     k.shifted_psi_sums(ctx, &inputs, stack, r, m.fused, sums)?;
                     if let Some(BhShiftOwn { off, y }) = &mut m.own.step {
@@ -493,13 +493,13 @@ impl Bufs<'_> {
                     }
                 }
                 None => {
-                    k.psi_to_obj(ctx, views, stack, r, self.probe, self.obj_sums)?;
-                    k.psi_to_probe(ctx, views, stack, r, self.obj, self.probe_sums)?;
+                    k.psi_to_obj(ctx, views, stack, r, self.probe, &mut self.obj_sums.num)?;
+                    k.psi_to_probe(ctx, views, stack, r, self.obj, &mut self.probe_sums.num)?;
                 }
             }
         }
         if let Some(m) = &mut moved {
-            k.shifted_probe_sums(ctx, &dims, m.probe_sums, self.probe_sums)?;
+            k.shifted_probe_sums(ctx, &dims, m.probe_sums, &mut self.probe_sums.num)?;
         }
 
         let d = BhDisp {
@@ -683,7 +683,7 @@ impl Bufs<'_> {
             prop.forward(ctx, plan, stack, psi)?;
             self.bh.residual(ctx, scan, stack, psi, r)?;
             prop.adjoint(ctx, plan, stack, r)?;
-            k.psi_to_probe(ctx, wv, stack, r, win, self.probe_sums)?;
+            k.psi_to_probe(ctx, wv, stack, r, win, &mut self.probe_sums.num)?;
             let f = BhWinRef {
                 r,
                 probe: self.probe,
@@ -899,12 +899,12 @@ impl Bufs<'_> {
                     }
                     None => self.bh.win_obj_grad(ctx, &dims, stack, f, patch)?,
                 }
-                sampler.place(ctx, at(stack), patch, 0, &mut grads[j].num)?;
+                sampler.place(ctx, at(stack), patch, 0, &mut grads[j])?;
                 ok.slice_adjoint(ctx, wv, stack, sw, c, x)?;
                 ok.gap(ctx, &dims, stack, &sl.gaps[j], x, true)?;
             }
             let c = &work[(deeper - 1) % 2];
-            k.psi_to_probe(ctx, wv, stack, c, &win[0], self.probe_sums)?;
+            k.psi_to_probe(ctx, wv, stack, c, &win[0], &mut self.probe_sums.num)?;
             let f = BhWinRef {
                 r: c,
                 probe: self.probe,
@@ -928,13 +928,13 @@ impl Bufs<'_> {
         };
         self.tile.dots(ctx, &d, bh.parts)?;
         for (j, (g, v)) in grads.iter().zip(&*prev).enumerate() {
-            (self.tile).slice_dots(ctx, j, &g.num, cg.then_some(v), bh.parts)?;
+            (self.tile).slice_dots(ctx, j, g, cg.then_some(v), bh.parts)?;
         }
         if let Some(o) = &mut own {
             self.bh.pos_dots(ctx, &step, &d, &mut o.off, bh.parts)?;
         }
         // Slice `s`'s spectra of its parts of `u` and `v`.
-        let us = std::iter::once(d.u[0]).chain(grads.iter().map(|g| &g.num));
+        let us = std::iter::once(d.u[0]).chain(grads.iter());
         for ([su, _], u) in sp.iter_mut().zip(us) {
             sampler.spectra(ctx, u, su)?;
         }
@@ -1168,8 +1168,8 @@ impl Bufs<'_> {
                     let shift = moved_shift(m.pos, m.spectrum);
                     let inputs = moved_inputs(&base, shift);
                     let sums = PsiSums {
-                        obj: Some(&mut *self.obj_sums),
-                        probe: Some(ShiftProbe::Sums(&mut *m.probe_sums)),
+                        obj: Some(&mut self.obj_sums.num),
+                        probe: Some(ShiftProbe::Num(&mut *m.probe_sums)),
                     };
                     k.shifted_psi_sums(ctx, &inputs, stack, c, m.fused, sums)?;
                     // Segment 0, the probe move.
@@ -1180,13 +1180,13 @@ impl Bufs<'_> {
                     }
                 }
                 None => {
-                    k.psi_to_obj(ctx, views, stack, c, self.probe, self.obj_sums)?;
-                    k.psi_to_probe(ctx, views, stack, c, self.obj, self.probe_sums)?;
+                    k.psi_to_obj(ctx, views, stack, c, self.probe, &mut self.obj_sums.num)?;
+                    k.psi_to_probe(ctx, views, stack, c, self.obj, &mut self.probe_sums.num)?;
                 }
             }
         }
         if let Some(m) = &mut moved {
-            k.shifted_probe_sums(ctx, &dims, m.probe_sums, self.probe_sums)?;
+            k.shifted_probe_sums(ctx, &dims, m.probe_sums, &mut self.probe_sums.num)?;
         }
 
         let d = BhDisp {
@@ -1196,7 +1196,7 @@ impl Bufs<'_> {
         };
         self.tile.dots(ctx, &d, bh.parts)?;
         for (j, (g, v)) in grads.iter().zip(&*prev).enumerate() {
-            (self.tile).slice_dots(ctx, j, &g.num, cg.then_some(v), bh.parts)?;
+            (self.tile).slice_dots(ctx, j, g, cg.then_some(v), bh.parts)?;
         }
         let mut hess = None;
         if let Some(m) = &mut moved {
@@ -1261,7 +1261,7 @@ impl Bufs<'_> {
                     ok.gap(ctx, &dims, stack, gap, x, false)?;
                 }
                 let dj = BhDisp {
-                    u: [&grads[j].num, d.u[1]],
+                    u: [&grads[j], d.u[1]],
                     v: d.v.map(|v| [&prev[j], v[1]]),
                     ..d
                 };
@@ -1314,7 +1314,7 @@ impl Bufs<'_> {
     }
 
     /// The batch's updates of the object, the probe and a multislice object's slices past the
-    /// first by its step record `record`, which consume [`update_sums`].
+    /// first by its step record `record`, which consume [`update_nums`].
     fn bh_update(
         &mut self,
         ctx: &ExecutionContext,
@@ -1333,7 +1333,7 @@ impl Bufs<'_> {
             (&mut *self.probe, prev_probe, probe_len, rho2),
         ];
         let slices = (self.deeper.iter_mut().zip(prevs)).map(|(x, prev)| (x, prev, obj_len, 1.0));
-        let sums = update_sums(self.obj_sums, self.probe_sums, grads);
+        let sums = update_nums(self.obj_sums, self.probe_sums, grads);
         for ((x, prev, n, scale), g) in vars.into_iter().chain(slices).zip(sums) {
             let var = BhVar {
                 x,

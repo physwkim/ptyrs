@@ -281,13 +281,13 @@ pub mod grad_kernels {
 
     /// PyNX `cu_linear_comb_fcfc_beta`: `d = beta d - g` with `beta = beta_pair[0] /
     /// beta_pair[1]`, or 0 where that is negative or not finite (a reset to `-g`); then the
-    /// consumed gradient sums are zero.
+    /// consumed gradient `g` is zero.
     ///
     /// # Safety
     ///
-    /// `d`, `g.num` hold `n` complex values, `g.den` `n` floats, `beta_pair` two.
+    /// `d`, `g` hold `n` complex values, `beta_pair` two.
     #[kernel]
-    pub unsafe fn cg_direction(d: *mut f32, g: SumPtrs, n: u32, beta_pair: *const f32) {
+    pub unsafe fn cg_direction(d: *mut f32, g: *mut f32, n: u32, beta_pair: *const f32) {
         let i = global_index();
         if i >= n as usize {
             return;
@@ -295,10 +295,9 @@ pub mod grad_kernels {
         unsafe {
             let b = *beta_pair / *beta_pair.add(1);
             let b = if b.is_finite() && b >= 0.0 { b } else { 0.0 };
-            let (dv, gv) = (load_c(d, i), load_c(g.num, i));
+            let (dv, gv) = (load_c(d, i), load_c(g, i));
             store_c(d, i, (b * dv.0 - gv.0, b * dv.1 - gv.1));
-            store_c(g.num, i, (0.0, 0.0));
-            *g.den.add(i) = 0.0;
+            store_c(g, i, (0.0, 0.0));
         }
     }
 

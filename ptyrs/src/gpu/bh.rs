@@ -59,14 +59,14 @@ use ptyrs_kernels::bh::{
 };
 pub use ptyrs_kernels::bh::{BH_HESS, BH_STEP};
 use ptyrs_kernels::grad::{CG_BLOCKS, GAMMA_CHUNK, ObjProbePtrs};
-use ptyrs_kernels::pixel::{PIXEL_THREADS, StackGeom, SumPtrs};
+use ptyrs_kernels::pixel::{PIXEL_THREADS, StackGeom};
 use ptyrs_kernels::position::BatchSpan;
 
 use crate::gpu::ops::grid_1d;
 use crate::gpu::position::{ONE_BLOCK, chunk_grid, same_dims, span};
 use crate::gpu::{
-    C32, Error, Kernels, Permutation, ProbeSpectrum, Shift, StackCtl, StackRef, UpdateSums,
-    ViewAddr, ViewDims, Views, check_len, dptr,
+    C32, Error, Kernels, Permutation, ProbeSpectrum, Shift, StackCtl, StackRef, ViewAddr, ViewDims,
+    Views, check_len, dptr,
 };
 
 /// The BH kernels, bound to the module a [`Kernels`] loaded.
@@ -675,12 +675,12 @@ pub struct BhWinSecond<'a> {
     pub v: Option<&'a DeviceBuffer<C32>>,
 }
 
-/// One array BH updates, of `n` values: the estimate, the last direction and the gradient
-/// sums, the gradient scaled by `scale` (the probe's `ρ²`).
+/// One array BH updates, of `n` values: the estimate, the last direction and the gradient,
+/// scaled by `scale` (the probe's `ρ²`).
 pub struct BhVar<'a> {
     pub x: &'a mut DeviceBuffer<C32>,
     pub prev: &'a mut DeviceBuffer<C32>,
-    pub g: &'a mut UpdateSums,
+    pub g: &'a mut DeviceBuffer<C32>,
     pub n: u32,
     pub scale: f32,
 }
@@ -1152,7 +1152,7 @@ impl BhKernels {
     }
 
     /// `var`'s step from record `record` of `steps`: `D = β prev − scale g`, `x += α D`,
-    /// `prev = D`; consumes the gradient sums (zero after).
+    /// `prev = D`; consumes the gradient (zero after).
     pub fn update(
         &self,
         ctx: &ExecutionContext,
@@ -1163,25 +1163,16 @@ impl BhKernels {
         let n = var.n as usize;
         check_len("x", var.x, n)?;
         check_len("prev", var.prev, n)?;
-        var.g.check(n)?;
+        check_len("g", var.g, n)?;
         check_len("steps", steps, step_len(record))?;
         if n == 0 {
             return Ok(());
         }
         let config = LaunchConfig::for_num_elems(var.n);
         let step = dptr::<f32, f32>(steps).wrapping_add(step_len(record) - BH_STEP as usize);
-        let writes = [
-            var.x.storage(),
-            var.prev.storage(),
-            var.g.num.storage(),
-            var.g.den.storage(),
-        ];
+        let writes = [var.x.storage(), var.prev.storage(), var.g.storage()];
         self.base
             .launch(ctx, &[steps.storage()], &writes, |stream| {
-                let g = SumPtrs {
-                    num: dptr(&var.g.num),
-                    den: dptr(&var.g.den),
-                };
                 // SAFETY: lengths checked above.
                 unsafe {
                     self.module.bh_update(
@@ -1189,7 +1180,7 @@ impl BhKernels {
                         config,
                         dptr(var.x),
                         dptr(var.prev),
-                        g,
+                        dptr(var.g),
                         var.n,
                         var.scale,
                         step,

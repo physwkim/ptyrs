@@ -21,14 +21,12 @@
 
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{DeviceBuffer, LaunchConfig};
-use ptyrs_kernels::pixel::{PIXEL_THREADS, SumPtrs};
+use ptyrs_kernels::pixel::PIXEL_THREADS;
 use ptyrs_kernels::rpie::{WeightGeom, rpie_kernels};
 
 pub use ptyrs_kernels::rpie::POWER_CHUNK;
 
-use crate::gpu::{
-    C32, Error, Kernels, StackCtl, StackRef, UpdateSums, ViewDims, Views, check_len, dptr,
-};
+use crate::gpu::{C32, Error, Kernels, StackCtl, StackRef, ViewDims, Views, check_len, dptr};
 
 /// The rPIE kernels, bound to the module a [`Kernels`] loaded.
 #[derive(Clone, Debug)]
@@ -246,31 +244,29 @@ impl RpieKernels {
         self.launch_weight(ctx, spec, ptrs, &reads, &[x.storage()])
     }
 
-    /// The rPIE step of the `n` values of `x` from `sums`, consuming them: `x += s * num`,
-    /// then `num` and `den` are zero.
+    /// The rPIE step of the `n` values of `x` from the numerator `num`, consuming it:
+    /// `x += s * num`, then `num` is zero.
     pub fn step(
         &self,
         ctx: &ExecutionContext,
         x: &mut DeviceBuffer<C32>,
-        sums: &mut UpdateSums,
+        num: &mut DeviceBuffer<C32>,
         n: u32,
         s: f32,
     ) -> Result<(), Error> {
         check_len("x", x, n as usize)?;
-        check_len("sums.num", &sums.num, n as usize)?;
-        check_len("sums.den", &sums.den, n as usize)?;
+        check_len("num", num, n as usize)?;
         if n == 0 {
             return Ok(());
         }
         let (_, config) = elems(n as usize)?;
-        let writes = [x.storage(), sums.num.storage(), sums.den.storage()];
+        let writes = [x.storage(), num.storage()];
         self.base.launch(ctx, &[], &writes, |stream| {
-            let sums = SumPtrs {
-                num: dptr(&sums.num),
-                den: dptr(&sums.den),
-            };
             // SAFETY: lengths checked above.
-            unsafe { self.module.rpie_step(stream, config, dptr(x), sums, n, s) }
+            unsafe {
+                self.module
+                    .rpie_step(stream, config, dptr(x), dptr(num), n, s)
+            }
         })
     }
 

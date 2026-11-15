@@ -985,23 +985,22 @@ pub mod lsqml_kernels {
         }
     }
 
-    /// `x += step[0] num`, and the consumed sums are zero, for `n` elements.
+    /// `x += step[0] num`, and the consumed `num` is zero, for `n` elements.
     ///
     /// # Safety
     ///
-    /// `x`, `sums.num` hold `n` complex values, `sums.den` `n` floats, `step` one float.
+    /// `x`, `num` hold `n` complex values, `step` one float.
     #[kernel]
-    pub unsafe fn lsqml_update(x: *mut f32, sums: SumPtrs, n: u32, step: *const f32) {
+    pub unsafe fn lsqml_update(x: *mut f32, num: *mut f32, n: u32, step: *const f32) {
         let i = global_index();
         if i >= n as usize {
             return;
         }
         unsafe {
             let s = *step;
-            let (d, v) = (load_c(sums.num, i), load_c(x, i));
+            let (d, v) = (load_c(num, i), load_c(x, i));
             store_c(x, i, (v.0 + s * d.0, v.1 + s * d.1));
-            store_c(sums.num, i, (0.0, 0.0));
-            *sums.den.add(i) = 0.0;
+            store_c(num, i, (0.0, 0.0));
         }
     }
 }

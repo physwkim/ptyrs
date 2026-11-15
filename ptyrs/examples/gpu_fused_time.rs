@@ -25,7 +25,7 @@ use ptyrs::base::{AddrTable, Geometry, Positions, required_obj_shape};
 use ptyrs::fft::Plan2d;
 use ptyrs::gpu::{
     C32, Error, Exit, FarSums, FusedBufs, FusedInputs, FusedSums, Kernels, Model, PositionPartial,
-    Shift, ShiftProbe, ShiftSums, ShiftedProbeSums, SpectrumBuf, StackTable, UpdateSums, ViewAddr,
+    Shift, ShiftProbe, ShiftSums, ShiftedStepSums, SpectrumBuf, StackTable, UpdateSums, ViewAddr,
     ViewDims, Views, record,
 };
 
@@ -77,7 +77,7 @@ struct Run {
     obj_sums: UpdateSums,
     probe_sums: UpdateSums,
     spectrum: SpectrumBuf,
-    shifted: ShiftedProbeSums,
+    shifted: ShiftedStepSums,
     position: DeviceBuffer<PositionPartial>,
     position_den: DeviceBuffer<PositionPartial>,
 }
@@ -134,7 +134,7 @@ impl Run {
             obj_sums: UpdateSums::zeroed(stream, obj.len())?,
             probe_sums: UpdateSums::zeroed(stream, probe.len())?,
             spectrum: SpectrumBuf::zeroed(stream, d)?,
-            shifted: ShiftedProbeSums::zeroed(stream, d)?,
+            shifted: ShiftedStepSums::zeroed(stream, d)?,
             position: DeviceBuffer::zeroed(stream, d.nframe as usize)?,
             position_den: DeviceBuffer::zeroed(stream, d.nframe as usize)?,
             table,
@@ -209,7 +209,7 @@ impl Run {
                 obj: Some(&mut self.obj_sums),
                 probe: None,
                 shift: ShiftSums {
-                    probe: Some(ShiftProbe::Sums(&mut self.shifted)),
+                    probe: Some(ShiftProbe::Step(&mut self.shifted)),
                     position: Some(&mut self.position),
                     position_den: Some(&mut self.position_den),
                 },
