@@ -1642,6 +1642,41 @@ mod tests {
         }
     }
 
+    /// `weight_parts`' step from a cube's band to its next, checked.
+    fn next_band(band: u32, bins: u32, bands: u32) -> u32 {
+        band.checked_add(bins.min(bands.checked_sub(band).unwrap()))
+            .unwrap()
+    }
+
+    /// `weight_parts`' last bands over batches of 2³² - 512, 2³² - 511 and 2³² - 1 images of one
+    /// pixel, where from 2³² - 511 on a cube's step of `bins` past its last band wrapped past 2³²
+    /// and it summed its bands again without end. Run on the host as
+    /// [`borders_near_2_32_stay_in_32_bits`] is: each step of the cubes' last rounds is forward and
+    /// they sum each band once.
+    #[test]
+    fn weight_gradient_bands_near_2_32_stay_in_32_bits() {
+        for n in [u32::MAX - 511, u32::MAX - 510, u32::MAX] {
+            let [strips, _, blocks] = bands_of(n as usize, 1, 1, 1);
+            let bands = u32::try_from(n as usize * blocks * strips).unwrap();
+            let bins = bands.min(CUBES as u32);
+            // The first band of the last round all cubes take.
+            let from = (bands / bins - 1).checked_mul(bins).unwrap();
+            let (mut seen, mut wrapped) = (vec![0; (bands - from) as usize], false);
+            for bin in 0..bins {
+                let mut band = from + bin;
+                while band < bands {
+                    seen[(band - from) as usize] += 1;
+                    wrapped |= band.checked_add(bins).is_none();
+                    let next = next_band(band, bins, bands);
+                    assert!(next > band, "{n} images, band {band} steps to {next}");
+                    band = next;
+                }
+            }
+            assert!(seen.iter().all(|&s| s == 1));
+            assert_eq!(wrapped, n > u32::MAX - 511);
+        }
+    }
+
     /// f16 and bf16 take burn's path, which sums wider than the activation, so they match it bit
     /// for bit.
     #[test]
