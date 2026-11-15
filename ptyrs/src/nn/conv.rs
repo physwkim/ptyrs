@@ -5,11 +5,12 @@
 //! weight and bias gradients are one kernel split over bands of image rows. burn takes the first as a
 //! matmul whose output, `co × 9·ci` (64 × 576 at a U-Net's top level), is a few dozen cubes at
 //! most while its inner dimension is every pixel of the batch, so most of the GPU idles; here each
-//! cube sums its own band and one more kernel adds the bands. The kernel takes deep levels too,
-//! where burn's matmul was faster while it ran f32 on TF32 tensor cores; that put the weight
-//! gradient 1e-4 off, and for some shapes (2 to 64 channels on 8 × 8 pixels) off by most of its
-//! magnitude. vendor/cubek-matmul keeps f32 off them; timed so, the kernel is 1.25 to 1.6 times as
-//! fast as burn at the deep levels, and burn comes within 6% of it only on PtychoNN's 8 × 8 pixels.
+//! cube sums a band of its own, or several once they pass 512 cubes, and one more kernel adds the
+//! cubes' sums. The kernel takes deep levels too, where burn's matmul was faster while it ran f32
+//! on TF32 tensor cores; that put the weight gradient 1e-4 off, and for some shapes (2 to 64
+//! channels on 8 × 8 pixels) off by most of its magnitude. vendor/cubek-matmul keeps f32 off them;
+//! timed so, the kernel is 1.25 to 1.6 times as fast as burn at the deep levels, and burn comes
+//! within 6% of it only on PtychoNN's 8 × 8 pixels.
 
 use burn::backend::autodiff::checkpoint::base::Checkpointer;
 use burn::backend::autodiff::checkpoint::strategy::CheckpointStrategy;
@@ -314,17 +315,20 @@ const WARPS: usize = 8;
 const PER: usize = 8;
 /// Pixels whose sums one pass of a unit's loop unrolls.
 const UNROLL: usize = 4;
-/// At most how many cubes one weight gradient spreads over.
+/// At most how many cubes one weight gradient spreads over, or one per pair of input and output
+/// channel blocks if those are more.
 const CUBES: usize = 512;
 
 /// The weight gradient `[co, ci, 3, 3]` of a 3×3 same-padded convolution of stride 1 from its
 /// channels-last input `x`, `[n, h, w, ci]`, and output gradient `dy`, `[n, h, w, co]`, and, if
 /// `bias`, the bias gradient `[co]`.
 ///
-/// Cube `a + across·(s + bands·b)` sums input channels `a·LANES ..` against output channels
-/// `b·PER·WARPS ..` over band `s`, `LANES` columns of a run of rows of one image, into row `s` of a
-/// `[bands, co·ci·9]` tensor, followed by the band's sums of `dy` from the cubes of `a = 0` if
-/// `bias`; a second kernel adds the bands in order, so the result does not depend on scheduling.
+/// Cube `a + across·(s + bins·b)` sums input channels `a·LANES ..` against output channels
+/// `b·PER·WARPS ..` over bands `s, s + bins, ..`, each `LANES` columns of a run of rows of one
+/// image, into row `s` of a `[bins, co·ci·9]` tensor, followed by their sums of `dy` from the
+/// cubes of `a = 0` if `bias`; a second kernel adds the bins in order, so the result does not
+/// depend on scheduling. `bins` is at most `max(1, CUBES / (across·down))`, whatever the batch and
+/// width.
 fn weight_grad(x: CubeTensor, dy: CubeTensor, bias: bool) -> (CubeTensor, Option<CubeTensor>) {
     let [n, h, w, ci] = x.meta.shape().dims();
     let [dn, dh, dw, co] = dy.meta.shape().dims();
@@ -359,17 +363,22 @@ fn weight_grad(x: CubeTensor, dy: CubeTensor, bias: bool) -> (CubeTensor, Option
             bias.then(|| zeros([co].into())),
         );
     }
-    // Past here `len` ≥ 1 needs `co` ≥ 1, so `dy` bounds `n`, `h`, `w` and `co`, and `[co, ci, 9]`
-    // bounds `ci`; `across · down` is at most `len`, so `[bands, len]` bounds the rest.
+    // Past here `len` ≥ 1 needs `co` ≥ 1, so `dy` bounds `n`, `h`, `w`, `co` and `bands`, and
+    // `[co, ci, 9]` bounds `ci`; `across · down` is at most `len`, so `[bins, len]` bounds the
+    // rest.
     // The cubes of `a = 0` sum the bias gradient, so they are there even for no input channels.
     let (across, down) = (ci.div_ceil(LANES).max(1), co.div_ceil(PER * WARPS));
     let [strips, rows, blocks] = bands_of(n, h, w, across * down);
     let bands = n * blocks * strips;
-    let cubes = across * bands * down;
-    check_elements(&[&[bands, len]]);
+    // Past `CUBES` cubes a cube sums several bands, so the partials grow with neither the batch
+    // nor the width: a pair of channel blocks holds at most 9·LANES·PER·WARPS + PER·WARPS of
+    // `len`, so `bins · len` is at most `CUBES` times that, or `len` at one bin.
+    let bins = bands.min((CUBES / (across * down)).max(1));
+    let cubes = across * bins * down;
+    check_elements(&[&[bins, len]]);
     let (x, dy) = (into_contiguous(x), into_contiguous(dy));
     let dtype = dtype_to_storage_type(float);
-    let parts = empty([bands, len].into());
+    let parts = empty([bins, len].into());
     let dw = empty([co, ci, 3, 3].into());
     let db = bias.then(|| empty([co].into()));
     // SAFETY: every index the kernels form is below its tensor's length: pixels are masked against
@@ -393,6 +402,7 @@ fn weight_grad(x: CubeTensor, dy: CubeTensor, bias: bool) -> (CubeTensor, Option
             u(strips),
             u(across),
             u(bands),
+            u(bins),
             u(cubes),
             LANES,
             WARPS,
@@ -401,7 +411,7 @@ fn weight_grad(x: CubeTensor, dy: CubeTensor, bias: bool) -> (CubeTensor, Option
             bias,
             dtype,
         );
-        kernel::sum_bands::launch_unchecked(
+        kernel::sum_bins::launch_unchecked(
             &client,
             grid(&client, len.div_ceil(256)),
             CubeDim::new_1d(256),
@@ -410,7 +420,7 @@ fn weight_grad(x: CubeTensor, dy: CubeTensor, bias: bool) -> (CubeTensor, Option
             db.clone().map(|t| t.into_tensor_arg()).into(),
             u(lw),
             u(len),
-            u(bands),
+            u(bins),
             dtype,
         );
     }
@@ -559,13 +569,13 @@ mod kernel {
         (offset >= 1 || origin >= 1) && offset <= extent - origin
     }
 
-    /// One band's partial weight gradient. For each row of its band the cube stages the strip of
-    /// `dy` for its output channels, and keeps the strip of `x` for its input channels, one pixel
-    /// wider on each side, for that row and the rows above and below in a ring of three, so each
-    /// row of `x` is read once. Unit `(l, k)` holds input channel `l` against `per` output
-    /// channels at all nine taps, and, if `bias` and the cube's input channels are the first, the
-    /// sum of `dy` at pixel `l` of the strip for them. Reads for the next row go to registers
-    /// before the current row's sums, so they overlap.
+    /// One bin's partial weight gradient, the sum over its bands. For each row of a band the cube
+    /// stages the strip of `dy` for its output channels, and keeps the strip of `x` for its input
+    /// channels, one pixel wider on each side, for that row and the rows above and below in a ring
+    /// of three, so each row of `x` is read once. Unit `(l, k)` holds input channel `l` against
+    /// `per` output channels at all nine taps, and, if `bias` and the cube's input channels are the
+    /// first, the sum of `dy` at pixel `l` of the strip for them. Reads for the next row go to
+    /// registers before the current row's sums, so they overlap.
     #[cube(launch_unchecked)]
     pub fn weight_parts<F: Float>(
         x: &Tensor<F>,
@@ -581,6 +591,7 @@ mod kernel {
         strips: u32,
         across: u32,
         bands: u32,
+        bins: u32,
         cubes: u32,
         #[comptime] lanes: usize,
         #[comptime] warps: usize,
@@ -618,110 +629,115 @@ mod kernel {
         let mut gv = Array::<F>::new(per);
         let (l, k0) = (UNIT_POS_X as usize, UNIT_POS_Y as usize * per);
         let unit = UNIT_POS as usize;
-        let (across, bands) = (across as usize, bands as usize);
+        let (across, bins) = (across as usize, bins as usize);
         let ci0 = CUBE_POS % across * lanes;
-        let band = CUBE_POS / across % bands;
-        let co0 = CUBE_POS / across / bands * outs;
-        let (strips, blocks) = (strips as usize, blocks as usize);
-        let x0 = (band % strips) * tile;
-        let image = band / strips / blocks;
+        let bin = CUBE_POS / across % bins;
+        let co0 = CUBE_POS / across / bins * outs;
+        let (strips, blocks, bands) = (strips as usize, blocks as usize, bands as usize);
         // Sizes are 32 bits, so an index past its bound may wrap below it: offsets are bounded by
-        // what is left past the origins `x0`, `y0`, `ci0` and `co0`, at most `w`, `h`, `ci` and `co`.
-        let y0 = (band / strips % blocks) * rows as usize;
-        let y1 = y0 + (rows as usize).min(h - y0);
-        // Rows of `x` are counted from one above the image, so row `y0 + u` is the image's
-        // `y0 + u - 1`, and is staged in slot `u % 3`.
-        let first = image * h;
-        let reads = y1 - y0 + 2;
-        // Step `t` stages the row of `x` read at step `t - 1` and, from the fourth, the row of
-        // `dy` read with it; reads row `y0 + t` of `x` and, from the third, image row `y0 + t - 2`
-        // of `dy`; and, from the fourth, sums image row `y0 + t - 3`.
-        let mut t = 0;
-        while t <= reads {
-            if t >= 1 {
-                let slot = ((t - 1) % 3) * xrow;
-                #[unroll]
-                for i in 0..xloads {
-                    let e = unit + i * units;
-                    if e < xrow {
-                        xs[slot + e] = xr[i];
+        // what is left past the origins `band`, `x0`, `y0`, `ci0` and `co0`, at most `bands`, `w`,
+        // `h`, `ci` and `co`.
+        let mut band = bin;
+        while band < bands {
+            let x0 = (band % strips) * tile;
+            let image = band / strips / blocks;
+            let y0 = (band / strips % blocks) * rows as usize;
+            let y1 = y0 + (rows as usize).min(h - y0);
+            // Rows of `x` are counted from one above the image, so row `y0 + u` is the image's
+            // `y0 + u - 1`, and is staged in slot `u % 3`.
+            let first = image * h;
+            let reads = y1 - y0 + 2;
+            // Step `t` stages the row of `x` read at step `t - 1` and, from the fourth, the row
+            // of `dy` read with it; reads row `y0 + t` of `x` and, from the third, image row
+            // `y0 + t - 2` of `dy`; and, from the fourth, sums image row `y0 + t - 3`.
+            let mut t = 0;
+            while t <= reads {
+                if t >= 1 {
+                    let slot = ((t - 1) % 3) * xrow;
+                    #[unroll]
+                    for i in 0..xloads {
+                        let e = unit + i * units;
+                        if e < xrow {
+                            xs[slot + e] = xr[i];
+                        }
                     }
                 }
-            }
-            if t >= 3 {
-                #[unroll]
-                for i in 0..gloads {
-                    let e = unit + i * units;
-                    if e < gsize {
-                        gs[e] = gr[i];
-                    }
-                }
-            }
-            sync_cube();
-            if t < reads {
-                // Whether row `y0 + t` of `x` is one of the image's.
-                let inside = bordered(y0, t, h);
-                #[unroll]
-                for i in 0..xloads {
-                    let e = unit + i * units;
-                    let (j, c) = (e / lanes, e % lanes);
-                    let mut v = F::new(0.0_f32);
-                    if e < xrow && inside && bordered(x0, j, w) && c < ci - ci0 {
-                        v = x[((first + y0 + t - 1) * w + x0 + j - 1) * ci + ci0 + c];
-                    }
-                    xr[i] = v;
-                }
-                if t >= 2 {
-                    let row = first + y0 + t - 2;
+                if t >= 3 {
                     #[unroll]
                     for i in 0..gloads {
                         let e = unit + i * units;
-                        let (p, o) = (e / outs, e % outs);
-                        let mut v = F::new(0.0_f32);
-                        if e < gsize && p < w - x0 && o < co - co0 {
-                            v = dy[(row * w + x0 + p) * co + co0 + o];
+                        if e < gsize {
+                            gs[e] = gr[i];
                         }
-                        gr[i] = v;
                     }
                 }
-            }
-            if t >= 3 {
-                if bias {
+                sync_cube();
+                if t < reads {
+                    // Whether row `y0 + t` of `x` is one of the image's.
+                    let inside = bordered(y0, t, h);
                     #[unroll]
-                    for k in 0..per {
-                        bacc[k] += gs[l * outs + k0 + k];
+                    for i in 0..xloads {
+                        let e = unit + i * units;
+                        let (j, c) = (e / lanes, e % lanes);
+                        let mut v = F::new(0.0_f32);
+                        if e < xrow && inside && bordered(x0, j, w) && c < ci - ci0 {
+                            v = x[((first + y0 + t - 1) * w + x0 + j - 1) * ci + ci0 + c];
+                        }
+                        xr[i] = v;
+                    }
+                    if t >= 2 {
+                        let row = first + y0 + t - 2;
+                        #[unroll]
+                        for i in 0..gloads {
+                            let e = unit + i * units;
+                            let (p, o) = (e / outs, e % outs);
+                            let mut v = F::new(0.0_f32);
+                            if e < gsize && p < w - x0 && o < co - co0 {
+                                v = dy[(row * w + x0 + p) * co + co0 + o];
+                            }
+                            gr[i] = v;
+                        }
                     }
                 }
-                // Pixels past the row's end have a zero gradient, so they add exact zeros.
-                let mut pb = 0;
-                while pb < tile {
-                    #[unroll]
-                    for q in 0..unroll {
-                        let p = pb + q;
+                if t >= 3 {
+                    if bias {
                         #[unroll]
                         for k in 0..per {
-                            gv[k] = gs[p * outs + k0 + k];
+                            bacc[k] += gs[l * outs + k0 + k];
                         }
+                    }
+                    // Pixels past the row's end have a zero gradient, so they add exact zeros.
+                    let mut pb = 0;
+                    while pb < tile {
                         #[unroll]
-                        for ky in 0..3 {
-                            let base = ((t + ky) % 3) * xrow + l;
+                        for q in 0..unroll {
+                            let p = pb + q;
                             #[unroll]
-                            for kx in 0..3 {
-                                let v = xs[base + (p + kx) * lanes];
+                            for k in 0..per {
+                                gv[k] = gs[p * outs + k0 + k];
+                            }
+                            #[unroll]
+                            for ky in 0..3 {
+                                let base = ((t + ky) % 3) * xrow + l;
                                 #[unroll]
-                                for k in 0..per {
-                                    acc[k * 9 + ky * 3 + kx] += gv[k] * v;
+                                for kx in 0..3 {
+                                    let v = xs[base + (p + kx) * lanes];
+                                    #[unroll]
+                                    for k in 0..per {
+                                        acc[k * 9 + ky * 3 + kx] += gv[k] * v;
+                                    }
                                 }
                             }
                         }
+                        pb += unroll;
                     }
-                    pb += unroll;
                 }
+                sync_cube();
+                t += 1;
             }
-            sync_cube();
-            t += 1;
+            band += bins.min(bands - band);
         }
-        let at = band * len as usize;
+        let at = bin * len as usize;
         // Every cube sums `dy`; those of the first input channels store the sums.
         if bias {
             #[unroll]
@@ -753,23 +769,23 @@ mod kernel {
         }
     }
 
-    /// The sum of column `i` of the `[bands, len]` partials in band order, into `dw[i]` for the
+    /// The sum of column `i` of the `[bins, len]` partials in bin order, into `dw[i]` for the
     /// first `lw` columns and into `db` for the rest.
     #[cube(launch_unchecked)]
-    pub fn sum_bands<F: Float>(
+    pub fn sum_bins<F: Float>(
         parts: &Tensor<F>,
         dw: &mut Tensor<F>,
         db: ComptimeOption<&mut Tensor<F>>,
         lw: u32,
         len: u32,
-        bands: u32,
+        bins: u32,
         #[define(F)] _dtype: ElemType,
     ) {
         let i = ABSOLUTE_POS;
         if i < len as usize {
             let mut acc = F::new(0.0_f32);
             let mut s = 0;
-            while s < bands as usize {
+            while s < bins as usize {
                 acc += parts[s * len as usize + i];
                 s += 1;
             }
@@ -1468,13 +1484,21 @@ mod tests {
         weight_grad(broadcast([1, 1, 2, 1]), broadcast([1, 1, 1, 1]), false);
     }
 
-    /// 9·2²⁸ weights over two bands of 32 columns: the input, output gradient and weight gradient
-    /// fit, the partials do not.
+    /// 600 images of two strips are 1200 bands for one pair of channel blocks, so 512 cubes sum
+    /// two or three bands each.
     #[test]
-    #[should_panic(expected = "a launch of fewer than 2³² elements per tensor")]
-    fn weight_gradient_partials_of_more_than_2_32_elements() {
-        let side = [1, 1, 64, 1 << 14];
-        weight_grad(broadcast(side), broadcast(side), false);
+    fn more_bands_than_cubes() {
+        agrees(case(600, 3, 40, 3, 5));
+    }
+
+    /// 128 bands of 2048 by 2048 channels, 9·2²² weights each: as many partials as bands would
+    /// pass 2³² elements, one per pair of channel blocks does not.
+    #[test]
+    fn wide_channels_over_many_bands() {
+        f32_against_f64(Case {
+            x_grad: false,
+            ..case(1, 2, 4096, 2048, 2048)
+        });
     }
 
     /// 2¹⁶ · 7282 · 9 weights, just past 2³².
