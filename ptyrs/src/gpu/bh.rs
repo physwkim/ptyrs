@@ -52,11 +52,12 @@ use std::sync::Arc;
 
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaStream, DeviceBuffer, Event, LaunchConfig, PinnedHostBuffer, RawDeviceBuffer};
-pub use ptyrs_kernels::bh::{BH_HESS, BH_STEP};
 use ptyrs_kernels::bh::{
-    BhDirs, BhFar, BhFields, BhMovedFar, BhMovedProbes, BhMoves, BhNear, BhObs, BhPartials,
-    BhPosDirs, BhSecond, BhSliceIn, BhTangents, BhWinDerivs, BhWinFields, bh_kernels,
+    BH_ENTRY_MOVED, BH_ENTRY_PROBE, BH_ENTRY_WAVES, BhDirs, BhFar, BhFields, BhMovedFar,
+    BhMovedProbes, BhMoves, BhNear, BhObs, BhPartials, BhPosDirs, BhSecond, BhSliceIn, BhTangents,
+    BhWinDerivs, BhWinFields, bh_kernels,
 };
+pub use ptyrs_kernels::bh::{BH_HESS, BH_STEP};
 use ptyrs_kernels::grad::{CG_BLOCKS, GAMMA_CHUNK, ObjProbePtrs};
 use ptyrs_kernels::pixel::{PIXEL_THREADS, StackGeom, SumPtrs};
 use ptyrs_kernels::position::BatchSpan;
@@ -253,9 +254,53 @@ pub struct BhFieldsRef<'a> {
 pub enum BhEntry<'a> {
     /// The first slice's, the probe `[nprobe, ny, nx]`.
     Probe(&'a DeviceBuffer<C32>),
+    /// The first slice's under the position model, the stack's moved probes of `nf_max *
+    /// nprobe` planes (`crate::gpu::PositionKernels::shift_w`).
+    Moved(&'a DeviceBuffer<C32>),
     /// A later slice's, the stack's waves that entered it, of `nf_max * nmode` planes like
     /// its `psi`.
     Waves(&'a DeviceBuffer<C32>),
+}
+
+impl<'a> BhEntry<'a> {
+    /// Slice `x` entered by `self` as the kernels read them, checked for `g` under `dims`,
+    /// with the two buffers' storages.
+    fn slice_in(
+        self,
+        x: &'a DeviceBuffer<C32>,
+        dims: &ViewDims,
+        g: &StackGeom,
+    ) -> Result<(BhSliceIn, [&'a RawDeviceBuffer; 2]), Error> {
+        let nf_max = g.nf_max as usize;
+        let (what, e, planes, kind) = match self {
+            Self::Probe(p) => ("probe", p, dims.nprobe as usize, BH_ENTRY_PROBE),
+            Self::Moved(w) => (
+                "moved probes",
+                w,
+                nf_max * dims.nprobe as usize,
+                BH_ENTRY_MOVED,
+            ),
+            Self::Waves(w) => ("waves", w, nf_max * dims.nmode as usize, BH_ENTRY_WAVES),
+        };
+        check_len("slice", x, dims.obj_len())?;
+        check_len(what, e, planes * dims.n())?;
+        let s = BhSliceIn {
+            slice: dptr(x),
+            entry: dptr(e),
+            kind,
+        };
+        Ok((s, [x.storage(), e.storage()]))
+    }
+}
+
+/// A multislice object's last slice under the position model, whose exit plane's phase moves
+/// with the offsets ([`crate::gpu::SlicePhase::offsets`]): `slice`, the wave `entry` entering
+/// it, and `quad`, the phase's ([`crate::gpu::SlicePhase::quad`]).
+#[derive(Clone, Copy)]
+pub struct BhLastSlice<'a> {
+    pub slice: &'a DeviceBuffer<C32>,
+    pub entry: BhEntry<'a>,
+    pub quad: f32,
 }
 
 /// One stack's derivatives through a multislice object, each of `nf_max * nmode` planes
@@ -298,14 +343,15 @@ impl BhBatch {
     }
 }
 
-/// The offsets' buffers of BH under the position model for a scan of `dims` through an object
-/// of `nslice` slices: the partials of [`BhKernels::pos_grad`] or [`BhKernels::win_grad`],
-/// `u`'s offsets by epoch position, and the last direction's by scan frame, which with CG are
-/// `v`'s.
+/// The offsets' buffers of BH under the position model for a scan of `dims`: the gradient
+/// partials in `nseg` segments of each frame's row, each written by one of
+/// [`BhKernels::pos_grad`], [`BhKernels::win_grad`] (a segment per slice) or
+/// [`BhKernels::phase_grad`], `u`'s offsets by epoch position, and the last direction's by
+/// scan frame, which with CG are `v`'s.
 pub struct BhPositions {
     dims: ViewDims,
-    nslice: usize,
-    /// `[nframe, nslice, nchunk, 2]` by epoch position, a segment of a frame's row per slice.
+    nseg: usize,
+    /// `[nframe, nseg, nchunk, 2]` by epoch position.
     grads: DeviceBuffer<f32>,
     /// `[nframe, 2]` by epoch position.
     ud: DeviceBuffer<f32>,
@@ -314,18 +360,30 @@ pub struct BhPositions {
 }
 
 impl BhPositions {
-    pub fn zeroed(stream: &CudaStream, dims: &ViewDims, nslice: usize) -> Result<Self, Error> {
+    pub fn zeroed(stream: &CudaStream, dims: &ViewDims, nseg: usize) -> Result<Self, Error> {
         dims.check()?;
-        if nslice == 0 {
-            return Err(Error::Shape("no object slice".into()));
+        if nseg == 0 {
+            return Err(Error::Shape("no gradient segment".into()));
         }
         let nframe = dims.nframe as usize;
         Ok(Self {
             dims: *dims,
-            nslice,
-            grads: DeviceBuffer::zeroed(stream, 2 * nframe * nslice * chunks(dims.n()))?,
+            nseg,
+            grads: DeviceBuffer::zeroed(stream, 2 * nframe * nseg * chunks(dims.n()))?,
             ud: DeviceBuffer::zeroed(stream, 2 * nframe)?,
             prev: DeviceBuffer::zeroed(stream, 2 * nframe)?,
+        })
+    }
+
+    /// Segment `seg` of the partials, as the kernels write it.
+    fn partials(&self, seg: usize) -> Result<BhPartials, Error> {
+        if seg >= self.nseg {
+            return Err(Error::Shape(format!("segment {seg} of {}", self.nseg)));
+        }
+        Ok(BhPartials {
+            out: dptr(&self.grads),
+            seg: seg as u32,
+            nseg: self.nseg as u32,
         })
     }
 }
@@ -878,7 +936,8 @@ impl BhKernels {
     /// u_x l_v + v_x l_u`, `u_x` and `v_x` the slice's parts `d.u[0]`, `d.v[0]` through
     /// `views`. Entered by the probe, `l_u` and `l_v` are `d`'s probe parts (`u`'s times
     /// `d.u_scale`), `m` is 0 and `t` only written; else `t` holds `w`'s and `d`'s probe parts
-    /// are unread. Without `d.v` only `t.lu` and `t.m[0]`.
+    /// are unread (entered by the moved probes, `t` holds theirs: the inverse FFTs of
+    /// [`Self::pos_spec`] and [`Self::pos_second`]). Without `d.v` only `t.lu` and `t.m[0]`.
     pub fn slice_tangent(
         &self,
         ctx: &ExecutionContext,
@@ -891,13 +950,8 @@ impl BhKernels {
         let dims = views.dims();
         let g = dims.geom(stack)?;
         let len = g.nf_max as usize * dims.nmode as usize * dims.n();
-        let [obj_len, probe_len] = lens(dims).map(|n| n as usize);
-        check_len("slice", x, obj_len)?;
+        let (s, entered) = entry.slice_in(x, dims, &g)?;
         d.check(dims)?;
-        let (e, probe) = match entry {
-            BhEntry::Probe(p) => (check_len("probe", p, probe_len).map(|_| p)?, 1),
-            BhEntry::Waves(w) => (check_len("waves", w, len).map(|_| w)?, 0),
-        };
         let [muu, muv, mvv] = &mut *t.m;
         let waves = [
             ("lu", &*t.lu),
@@ -909,12 +963,8 @@ impl BhKernels {
             check_len(what, b, len)?;
         }
         let config = grid_1d(len)?;
-        let mut reads = vec![
-            views.addr().storage(),
-            stack.storage(),
-            x.storage(),
-            e.storage(),
-        ];
+        let mut reads = vec![views.addr().storage(), stack.storage()];
+        reads.extend(entered);
         reads.extend(d.storages());
         let writes = [
             t.lu.storage(),
@@ -937,11 +987,7 @@ impl BhKernels {
                 self.module.bh_slice_tangent(
                     stream,
                     config,
-                    BhSliceIn {
-                        slice: dptr(x),
-                        entry: dptr(e),
-                        probe,
-                    },
+                    s,
                     d.ptrs(),
                     t,
                     dptr::<ViewAddr, ViewAddr>(views.addr()),
@@ -1204,19 +1250,21 @@ impl BhKernels {
         })
     }
 
-    /// The offsets' gradient partials of the stack's frames into `off`, from `y` the
-    /// forward-FFT'd [`Self::obj_conj`] of its residual and `shift` the estimate's moved
-    /// probes: per chunk of [`GAMMA_CHUNK`] pixels of each frame, the pair [`Self::pos_dots`]
-    /// sums to `∂F/∂d`; other frames' partials are left as they are.
+    /// The offsets' gradient partials of the stack's frames into segment `seg` of `off`'s,
+    /// from `y` the forward-FFT'd [`Self::obj_conj`] of its residual and `shift` the
+    /// estimate's moved probes: per chunk of [`GAMMA_CHUNK`] pixels of each frame, the pair
+    /// [`Self::pos_dots`] sums with the other segments' to `∂F/∂d`; other frames' partials,
+    /// and other segments', are left as they are.
     pub fn pos_grad(
         &self,
         ctx: &ExecutionContext,
         stack: StackRef<'_>,
         y: &DeviceBuffer<C32>,
         shift: &Shift<'_>,
-        off: &mut BhOffsets<'_>,
+        (off, seg): (&mut BhOffsets<'_>, usize),
     ) -> Result<(), Error> {
         let dims = off.check()?;
+        let part = off.bufs.partials(seg)?;
         let g = dims.geom(stack)?;
         let n = dims.n();
         check_len("y", y, g.nf_max as usize * dims.nmode as usize * n)?;
@@ -1235,7 +1283,8 @@ impl BhKernels {
         let grads = &off.bufs.grads;
         self.base.launch(ctx, &reads, &[grads.storage()], |stream| {
             // SAFETY: lengths checked above; `BhPositions::zeroed` sized `grads` for every
-            // epoch position's chunks; one block of PIXEL_THREADS per chunk and frame.
+            // epoch position's chunks of every segment, of which `part` is one; one block of
+            // PIXEL_THREADS per chunk and frame.
             unsafe {
                 self.module.bh_pos_grad(
                     stream,
@@ -1244,7 +1293,7 @@ impl BhKernels {
                     dptr(a),
                     dptr(shift.offsets),
                     dptr::<ViewAddr, ViewAddr>(views),
-                    dptr(grads),
+                    part,
                     stack.ctl() as *const StackCtl,
                     g,
                 )
@@ -1266,9 +1315,9 @@ impl BhKernels {
         batch.positions()?;
         let dims = off.check()?;
         let span = span(dims, &batch.frames)?;
-        // A frame's row of partials holds every slice's chunks.
+        // A frame's row of partials holds every segment's chunks.
         let span = BatchSpan {
-            nchunk: span.nchunk * off.bufs.nslice as u32,
+            nchunk: span.nchunk * off.bufs.nseg as u32,
             ..span
         };
         parts.check(dims)?;
@@ -1334,6 +1383,46 @@ impl BhKernels {
                     )
                 }
             })
+    }
+
+    /// The spectra of the stack's moved probes' second-order changes along the step's `(u,
+    /// u)` into `m[0]` and with CG `(u, v)`, `(v, v)` into `m[1]`, `m[2]` (else left as they
+    /// are), laid out as [`Self::pos_spec`]'s and ready for their inverse FFT.
+    pub fn pos_second(
+        &self,
+        ctx: &ExecutionContext,
+        stack: StackRef<'_>,
+        mv: &BhMovesRef<'_>,
+        m: &mut [DeviceBuffer<C32>; 3],
+    ) -> Result<(), Error> {
+        let dims = mv.check()?;
+        let g = dims.geom(stack)?;
+        let len = g.nf_max as usize * dims.nmode as usize * dims.n();
+        for (what, b) in ["muu", "muv", "mvv"].into_iter().zip(m.iter()) {
+            check_len(what, b, len)?;
+        }
+        let config = grid_1d(len)?;
+        let mut reads = mv.storages();
+        reads.push(stack.storage());
+        let views = mv.off.order.views.addr();
+        let [muu, muv, mvv] = m;
+        let writes = [muu.storage(), muv.storage(), mvv.storage()];
+        self.base.launch(ctx, &reads, &writes, |stream| {
+            // SAFETY: lengths checked above; `Views::new` checked every view's probe mode.
+            unsafe {
+                self.module.bh_pos_second(
+                    stream,
+                    config,
+                    mv.ptrs(),
+                    dptr::<ViewAddr, ViewAddr>(views),
+                    dptr(muu),
+                    dptr(muv),
+                    dptr(mvv),
+                    stack.ctl() as *const StackCtl,
+                    g,
+                )
+            }
+        })
     }
 
     /// The near Hessian triples along `d` of the stack's frames under the position model
@@ -1590,20 +1679,19 @@ impl BhKernels {
     }
 
     /// Under full-object sampling, the stack's object gradient patches into `patch` and its
-    /// offsets' gradient partials into `off`, from `f` and `win`, the estimate's windows of
-    /// `slice` and their derivatives over `y` and `x` in blocks 0 to 2: per frame and object
-    /// mode, `G = Σ_p conj(q P_p) r` on the window, which
+    /// offsets' gradient partials into segment `seg` of `off`'s, from `f` and `win`, the
+    /// estimate's windows of a slice and their derivatives over `y` and `x` in blocks 0 to 2:
+    /// per frame and object mode, `G = Σ_p conj(q P_p) r` on the window, which
     /// [`crate::gpu::sampling::ObjectSampler::place`] adds to the slice as
     /// [`Kernels::psi_to_obj`] would, and per chunk of [`GAMMA_CHUNK`] pixels of each frame
-    /// the pair [`Self::pos_dots`] sums to `∂F/∂d`, in the slice's own segment of the frame's
-    /// partials; other frames' patches and partials, and other slices' partials, are left as
-    /// they are.
+    /// the pair [`Self::pos_dots`] sums with the other segments' to `∂F/∂d`; other frames'
+    /// patches and partials, and other segments' partials, are left as they are.
     pub fn win_grad(
         &self,
         ctx: &ExecutionContext,
         stack: StackRef<'_>,
         f: BhWinRef<'_>,
-        (win, slice): (&DeviceBuffer<C32>, usize),
+        (win, seg): (&DeviceBuffer<C32>, usize),
         patch: &mut DeviceBuffer<C32>,
         off: &mut BhOffsets<'_>,
     ) -> Result<(), Error> {
@@ -1611,10 +1699,7 @@ impl BhKernels {
         let g = dims.geom(stack)?;
         let blk = window_block(dims, &g);
         f.check(dims, &g)?;
-        let nslice = off.bufs.nslice;
-        if slice >= nslice {
-            return Err(Error::Shape(format!("slice {slice} of {nslice}")));
-        }
+        let part = off.bufs.partials(seg)?;
         check_len("win", win, 3 * blk)?;
         check_len("patch", patch, blk)?;
         let config = chunk_grid(&g, dims.n())?;
@@ -1627,9 +1712,9 @@ impl BhKernels {
         let grads = &off.bufs.grads;
         let writes = [patch.storage(), grads.storage()];
         self.base.launch(ctx, &reads, &writes, |stream| {
-            // SAFETY: lengths and the slice checked above; `BhPositions::zeroed` sized `grads`
-            // for every epoch position's chunks of every slice; one block of PIXEL_THREADS per
-            // chunk and frame.
+            // SAFETY: lengths checked above; `BhPositions::zeroed` sized `grads` for every
+            // epoch position's chunks of every segment, of which `part` is one; one block of
+            // PIXEL_THREADS per chunk and frame.
             unsafe {
                 self.module.bh_win_grad(
                     stream,
@@ -1637,11 +1722,126 @@ impl BhKernels {
                     f.ptrs(),
                     dptr(win),
                     dptr(patch),
-                    BhPartials {
-                        out: dptr(grads),
-                        slice: slice as u32,
-                        nslice: nslice as u32,
-                    },
+                    part,
+                    stack.ctl() as *const StackCtl,
+                    g,
+                )
+            }
+        })
+    }
+
+    /// The stack's offsets' gradient partials of `last`'s plane phase into segment `seg` of
+    /// `off`'s, from `r` the residual after its inverse FFT and the phase's adjoint: per
+    /// chunk of [`GAMMA_CHUNK`] pixels of each frame the pair [`Self::pos_dots`] sums with
+    /// the other segments' to `∂F/∂d`; other frames' partials, and other segments', are left
+    /// as they are. `off`'s views are those the slice is read through.
+    pub fn phase_grad(
+        &self,
+        ctx: &ExecutionContext,
+        stack: StackRef<'_>,
+        last: BhLastSlice<'_>,
+        r: &DeviceBuffer<C32>,
+        (off, seg): (&mut BhOffsets<'_>, usize),
+    ) -> Result<(), Error> {
+        let dims = off.check()?;
+        let g = dims.geom(stack)?;
+        let n = dims.n();
+        let (s, entered) = last.entry.slice_in(last.slice, dims, &g)?;
+        check_len("r", r, g.nf_max as usize * dims.nmode as usize * n)?;
+        let part = off.bufs.partials(seg)?;
+        let config = chunk_grid(&g, n)?;
+        let views = off.order.views.addr();
+        let mut reads = vec![r.storage(), views.storage(), stack.storage()];
+        reads.extend(entered);
+        let grads = &off.bufs.grads;
+        self.base.launch(ctx, &reads, &[grads.storage()], |stream| {
+            // SAFETY: lengths checked above; `Views::new` checked every view lies inside the
+            // object with valid mode indices; `BhPositions::zeroed` sized `grads` for every
+            // epoch position's chunks of every segment, of which `part` is one; one block of
+            // PIXEL_THREADS per chunk and frame.
+            unsafe {
+                self.module.bh_phase_grad(
+                    stream,
+                    config,
+                    s,
+                    dptr(r),
+                    dptr::<ViewAddr, ViewAddr>(views),
+                    last.quad,
+                    part,
+                    stack.ctl() as *const StackCtl,
+                    g,
+                )
+            }
+        })
+    }
+
+    /// The stack's derivatives `t` along `d` through `last`'s plane phase, in place with the
+    /// phase itself left out: on entry those of the slice's exit ([`Self::slice_tangent`]),
+    /// after it those of the exit waves once [`crate::gpu::OpticsKernels::slice_phase`] puts
+    /// the phase on `t.lu` and `t.lv` and its adjoint is on the residual, as
+    /// [`Self::sliced_hess_frames`] reads them. Of `d` only whether it has `v` is read; without
+    /// it only `t.lu` and `t.m[0]`. `off`'s views are those the slice is read through.
+    pub fn phase_tangent(
+        &self,
+        ctx: &ExecutionContext,
+        stack: StackRef<'_>,
+        last: BhLastSlice<'_>,
+        off: &BhOffsets<'_>,
+        d: &BhDisp<'_>,
+        t: &mut BhTangentsMut<'_>,
+    ) -> Result<(), Error> {
+        let dims = off.check()?;
+        let g = dims.geom(stack)?;
+        let len = g.nf_max as usize * dims.nmode as usize * dims.n();
+        let (s, entered) = last.entry.slice_in(last.slice, dims, &g)?;
+        let [muu, muv, mvv] = &mut *t.m;
+        let waves = [
+            ("lu", &*t.lu),
+            ("lv", &*t.lv),
+            ("muu", &*muu),
+            ("muv", &*muv),
+        ];
+        for (what, b) in waves.into_iter().chain([("mvv", &*mvv)]) {
+            check_len(what, b, len)?;
+        }
+        let config = grid_1d(len)?;
+        let b = &off.bufs;
+        let views = off.order.views.addr();
+        let mut reads = vec![
+            views.storage(),
+            stack.storage(),
+            b.ud.storage(),
+            b.prev.storage(),
+            off.order.ids.order().storage(),
+        ];
+        reads.extend(entered);
+        let writes = [
+            t.lu.storage(),
+            t.lv.storage(),
+            muu.storage(),
+            muv.storage(),
+            mvv.storage(),
+        ];
+        let dirs = off.dirs(d.v.is_some());
+        self.base.launch(ctx, &reads, &writes, |stream| {
+            let t = BhTangents {
+                lu: dptr(t.lu),
+                lv: dptr(t.lv),
+                muu: dptr(muu),
+                muv: dptr(muv),
+                mvv: dptr(mvv),
+            };
+            // SAFETY: lengths checked above; `Views::new` checked every view lies inside the
+            // object with valid mode indices; `EpochOrder` holds frame ids below `nframe`.
+            unsafe {
+                self.module.bh_phase_tangent(
+                    stream,
+                    config,
+                    s,
+                    dirs,
+                    t,
+                    dptr::<ViewAddr, ViewAddr>(views),
+                    last.quad,
                     stack.ctl() as *const StackCtl,
                     g,
                 )
@@ -1820,3 +2020,6 @@ impl BhWinRef<'_> {
 fn step_len(record: u32) -> usize {
     BH_STEP as usize * (record as usize + 1)
 }
+
+#[cfg(test)]
+mod tests;

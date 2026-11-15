@@ -466,7 +466,7 @@ impl Bufs<'_> {
                     if let Some(BhShiftOwn { off, y }) = &mut m.own.step {
                         self.bh.obj_conj(ctx, views, stack, self.obj, r, y)?;
                         plan.forward_inplace(ctx, y)?;
-                        self.bh.pos_grad(ctx, stack, y, &shift, off)?;
+                        self.bh.pos_grad(ctx, stack, y, &shift, (off, 0))?;
                     }
                 }
                 None => {
