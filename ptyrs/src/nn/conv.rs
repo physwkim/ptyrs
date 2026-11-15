@@ -573,6 +573,34 @@ mod kernel {
         (offset >= 1 || origin >= 1) && offset <= extent - origin
     }
 
+    /// The steps of `weight_parts` over a band of `rows` rows from row `y0` of `h`, `y0` below
+    /// `h`: one a row of the band, which ends at `h`, and two for the rows above and below it.
+    #[cube]
+    fn band_reads(y0: usize, rows: usize, h: usize) -> usize {
+        rows.min(h - y0) + 2
+    }
+
+    /// The slot of the ring of three rows of `x` that `weight_parts`' step `t`, at least 1,
+    /// stages the row read at step `t - 1` in. Counted from the band's first row, as `t` is, so
+    /// it stays below the band's steps; counted from the image's, it wrapped past 2³².
+    #[cube]
+    fn staged(t: usize) -> usize {
+        (t - 1) % 3
+    }
+
+    /// The slot tap `ky` of `weight_parts`' step `t`, at least 3, reads: that of the row read at
+    /// step `t - 3 + ky`.
+    #[cube]
+    fn tapped(t: usize, ky: usize) -> usize {
+        (t + ky) % 3
+    }
+
+    /// The band a cube of `weight_parts` takes after `band`, `bins` on, or `bands` past its last.
+    #[cube]
+    fn next_band(band: usize, bins: usize, bands: usize) -> usize {
+        band + bins.min(bands - band)
+    }
+
     /// One bin's partial weight gradient, the sum over its bands. For each row of a band the cube
     /// stages the strip of `dy` for its output channels, and keeps the strip of `x` for its input
     /// channels, one pixel wider on each side, for that row and the rows above and below in a ring
@@ -646,18 +674,17 @@ mod kernel {
             let x0 = (band % strips) * tile;
             let image = band / strips / blocks;
             let y0 = (band / strips % blocks) * rows as usize;
-            let y1 = y0 + (rows as usize).min(h - y0);
             // Rows of `x` are counted from one above the image, so row `y0 + u` is the image's
             // `y0 + u - 1`, and is staged in slot `u % 3`.
             let first = image * h;
-            let reads = y1 - y0 + 2;
+            let reads = band_reads(y0, rows as usize, h);
             // Step `t` stages the row of `x` read at step `t - 1` and, from the fourth, the row
             // of `dy` read with it; reads row `y0 + t` of `x` and, from the third, image row
             // `y0 + t - 2` of `dy`; and, from the fourth, sums image row `y0 + t - 3`.
             let mut t = 0;
             while t <= reads {
                 if t >= 1 {
-                    let slot = ((t - 1) % 3) * xrow;
+                    let slot = staged(t) * xrow;
                     #[unroll]
                     for i in 0..xloads {
                         let e = unit + i * units;
@@ -722,7 +749,7 @@ mod kernel {
                             }
                             #[unroll]
                             for ky in 0..3 {
-                                let base = ((t + ky) % 3) * xrow + l;
+                                let base = tapped(t, ky) * xrow + l;
                                 #[unroll]
                                 for kx in 0..3 {
                                     let v = xs[base + (p + kx) * lanes];
@@ -739,7 +766,7 @@ mod kernel {
                 sync_cube();
                 t += 1;
             }
-            band += bins.min(bands - band);
+            band = next_band(band, bins, bands);
         }
         let at = bin * len as usize;
         // Every cube sums `dy`; those of the first input channels store the sums.
@@ -989,6 +1016,31 @@ mod kernel {
             }
         }
     }
+
+    /// For the tests, which reach extents near 2³² that no tensor here holds, as a buffer takes
+    /// at most 8190 MiB: every helper above on each `[a, b, c]` of the `n` in `args`, in the
+    /// kernels' 32-bit sizes, into its five of `out`: `bordered(a, b, c)` as 1 or 0,
+    /// `band_reads(a, b, c)`, `staged(a)`, `tapped(a, b)` and `next_band(a, b, c)`. Past a
+    /// helper's domain its value is what its arithmetic wraps to.
+    #[cfg(test)]
+    #[cube(launch)]
+    pub fn probe(args: &[u32], out: &mut [u32], n: u32) {
+        let i = ABSOLUTE_POS;
+        if i < n as usize {
+            let a = args[3 * i] as usize;
+            let b = args[3 * i + 1] as usize;
+            let c = args[3 * i + 2] as usize;
+            let mut inside = 0u32;
+            if bordered(a, b, c) {
+                inside = 1u32;
+            }
+            out[5 * i] = inside;
+            out[5 * i + 1] = band_reads(a, b, c) as u32;
+            out[5 * i + 2] = staged(a) as u32;
+            out[5 * i + 3] = tapped(a, b) as u32;
+            out[5 * i + 4] = next_band(a, b, c) as u32;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -999,7 +1051,9 @@ mod tests {
     use burn::nn::conv::Conv2dConfig;
     use burn::tensor::ops::PadMode;
     use burn::tensor::{DType, Distribution, TensorData};
+    use burn_cubecl::cubecl::prelude::{BufferArg, CubeCount, CubeElement};
 
+    use crate::nn::grid::run_probe;
     use crate::worst::worst_of;
 
     /// A convolution's sizes: batch, height, width, input and output channels, kernel side, and
@@ -1547,38 +1601,53 @@ mod tests {
         arrange(broadcast([1 << 16, 7282, 3, 3]), false);
     }
 
-    /// The kernels' `bordered`, in 32 bits with every operation checked.
-    fn bordered(origin: u32, offset: u32, extent: u32) -> bool {
-        (offset >= 1 || origin >= 1) && offset <= extent.checked_sub(origin).unwrap()
+    /// [`kernel::probe`]'s five helpers on each of `args`.
+    fn helpers(args: &[[u32; 3]]) -> Vec<[u32; 5]> {
+        let n = args.len();
+        let out = run_probe(5 * n, |client, out| {
+            let args = client.create_from_slice(u32::as_bytes(args.as_flattened()));
+            kernel::probe::launch(
+                client,
+                CubeCount::Static(u(n.div_ceil(256)), 1, 1),
+                CubeDim::new_1d(256),
+                // SAFETY: `args` holds `n` triples.
+                unsafe { BufferArg::from_raw_parts(args, 3 * n) },
+                out,
+                u(n),
+            );
+        });
+        out.as_chunks::<5>().0.to_vec()
     }
 
     /// The bordered last tile of `conv3x3`'s rows and columns and `weight_parts`' columns over
     /// extents within a tile of 2³², where the pixels past it wrapped past 2³²: `bordered` takes
-    /// those of the extent. The kernels' arithmetic is run here on the host: no f16 tensor of that
-    /// many elements fits the 8190 MiB a buffer may take on the GPUs here.
+    /// those of the extent.
     #[test]
     fn borders_near_2_32_stay_in_32_bits() {
-        let mut wrapped = false;
+        let (mut args, mut want, mut wrapped) = (Vec::new(), Vec::new(), false);
         for tile in [ROWS, COLS, LANES] {
             for extent in u32::MAX - tile as u32 - 1..=u32::MAX {
                 let origin = (u64::from(extent).div_ceil(tile as u64) - 1) * tile as u64;
                 for offset in 0..tile as u64 + 2 {
                     let pixel = origin + offset;
-                    let inside = (1..=u64::from(extent)).contains(&pixel);
-                    let at = [origin, offset].map(|v| u32::try_from(v).unwrap());
-                    assert_eq!(bordered(at[0], at[1], extent), inside);
+                    let [origin, offset] = [origin, offset].map(|v| u32::try_from(v).unwrap());
+                    args.push([origin, offset, extent]);
+                    want.push(u32::from((1..=u64::from(extent)).contains(&pixel)));
                     wrapped |= pixel > u64::from(u32::MAX);
                 }
             }
         }
         assert!(wrapped);
+        let got: Vec<u32> = helpers(&args).iter().map(|h| h[0]).collect();
+        assert_eq!(got, want);
     }
 
-    /// `weight_parts`' rows over one column and channel of one image of 2³² - 511 and 2³² - 1 rows,
-    /// where its last band's `y0 + rows` wrapped past 2³² and, at 2³² - 1, so did the row below
-    /// its last. Run on the host as [`borders_near_2_32_stay_in_32_bits`] is: the last band ends
-    /// at the image's, and reads each row of `x` from the one above it once and each row of `dy`
-    /// in it once.
+    /// `weight_parts`' last band of one column and channel of one image of 2³² - 511 and 2³² - 1
+    /// rows, where its `y0 + rows` wrapped past 2³², and at 2³² - 1 so did the row below its last
+    /// and the ring's slots counted from the image's first row: as 2³² ≡ 1 (mod 3), the last
+    /// step's middle tap read the zero row below the image in place of its last. The band ends at
+    /// the image's, its first and last steps read rows of `x` that are the image's, and each of
+    /// their taps reads the row it sums.
     #[test]
     fn weight_gradient_rows_near_2_32_stay_in_32_bits() {
         for h in [u32::MAX - 510, u32::MAX] {
@@ -1586,73 +1655,47 @@ mod tests {
                 bands_of(1, h as usize, 1, 1).map(|v| u32::try_from(v).unwrap());
             let y0 = (blocks - 1).checked_mul(rows).unwrap();
             assert_eq!(y0.checked_add(rows), None);
-            let y1 = y0.checked_add(rows.min(h - y0)).unwrap();
-            assert_eq!(y1, h);
-            let reads = (y1 - y0).checked_add(2).unwrap();
-            let (mut xs, mut dys) = (0, 0);
-            for t in 0..reads {
-                if bordered(y0, t, h) {
-                    assert!(y0.checked_add(t).unwrap() - 1 < h);
-                    xs += 1;
-                }
-                if t >= 2 {
-                    assert!(y0.checked_add(t - 2).unwrap() < h);
-                    dys += 1;
-                }
-            }
-            assert_eq!([xs, dys], [h - y0 + 1, h - y0]);
+            let reads = helpers(&[[y0, rows, h]])[0][1];
+            assert_eq!(reads, h - y0 + 2);
             assert_eq!(y0.checked_add(reads - 1).is_none(), h == u32::MAX);
-        }
-    }
-
-    /// The slot `weight_parts`' step `t` stages the row of `x` read at step `t - 1` in.
-    fn staged(t: u32) -> usize {
-        ((t - 1) % 3) as usize
-    }
-
-    /// The slot `weight_parts`' tap `ky` reads at step `t`.
-    fn tapped(t: u32, ky: u32) -> usize {
-        (t.checked_add(ky).unwrap() % 3) as usize
-    }
-
-    /// `weight_parts`' ring of three rows of `x` over the last band of the images of
-    /// [`weight_gradient_rows_near_2_32_stay_in_32_bits`]: each tap reads the row it sums. Slots
-    /// counted from the image's first row wrapped past 2³² at 2³² - 1 rows, where 2³² ≡ 1 (mod 3),
-    /// and the last step's middle tap read the zero row below the image in place of its last.
-    #[test]
-    fn weight_gradient_ring_near_2_32_rows() {
-        for h in [u32::MAX - 510, u32::MAX] {
-            let [_, rows, blocks] =
-                bands_of(1, h as usize, 1, 1).map(|v| u32::try_from(v).unwrap());
-            let y0 = (blocks - 1).checked_mul(rows).unwrap();
-            let reads = (h - y0).checked_add(2).unwrap();
-            // The row of `x`, counted from the band's first, that each slot holds.
-            let mut ring = [None; 3];
-            for t in 0..=reads {
-                if t >= 1 {
-                    ring[staged(t)] = Some(t - 1);
+            for steps in [0..=8, reads - 8..=reads] {
+                let reading = steps.clone().filter(|&t| t < reads);
+                let args: Vec<_> = reading.clone().map(|t| [y0, t, h]).collect();
+                for (t, got) in reading.zip(helpers(&args)) {
+                    let row = u64::from(y0) + u64::from(t);
+                    let inside = (1..=u64::from(h)).contains(&row);
+                    assert_eq!(got[0], u32::from(inside), "{h} rows, step {t}");
                 }
-                if t >= 3 {
-                    for ky in 0..3 {
-                        let want = Some(t - 3 + ky);
-                        assert_eq!(ring[tapped(t, ky)], want, "{h} rows, step {t}, tap {ky}");
+                // The row of `x`, counted from the band's first, each slot holds. A tap is
+                // checked once the window staged all three of its rows.
+                let mut ring = [None; 3];
+                let args: Vec<_> = steps
+                    .clone()
+                    .flat_map(|t| (0..3).map(move |ky| [t, ky, 0]))
+                    .collect();
+                let got = helpers(&args);
+                for (t, slots) in steps.clone().zip(got.as_chunks::<3>().0) {
+                    if t >= 1 {
+                        ring[slots[0][2] as usize] = Some(t - 1);
+                    }
+                    if t >= 3 && t >= steps.start() + 2 {
+                        for (ky, slot) in (0..3).zip(slots) {
+                            let want = Some(t - 3 + ky);
+                            assert_eq!(
+                                ring[slot[3] as usize], want,
+                                "{h} rows, step {t}, tap {ky}"
+                            );
+                        }
                     }
                 }
             }
         }
     }
 
-    /// `weight_parts`' step from a cube's band to its next, checked.
-    fn next_band(band: u32, bins: u32, bands: u32) -> u32 {
-        band.checked_add(bins.min(bands.checked_sub(band).unwrap()))
-            .unwrap()
-    }
-
     /// `weight_parts`' last bands over batches of 2³² - 512, 2³² - 511 and 2³² - 1 images of one
     /// pixel, where from 2³² - 511 on a cube's step of `bins` past its last band wrapped past 2³²
-    /// and it summed its bands again without end. Run on the host as
-    /// [`borders_near_2_32_stay_in_32_bits`] is: each step of the cubes' last rounds is forward and
-    /// they sum each band once.
+    /// and it summed its bands again without end: each step of the cubes' last rounds is forward
+    /// and they sum each band once.
     #[test]
     fn weight_gradient_bands_near_2_32_stay_in_32_bits() {
         for n in [u32::MAX - 511, u32::MAX - 510, u32::MAX] {
@@ -1661,19 +1704,24 @@ mod tests {
             let bins = bands.min(CUBES as u32);
             // The first band of the last round all cubes take.
             let from = (bands / bins - 1).checked_mul(bins).unwrap();
-            let (mut seen, mut wrapped) = (vec![0; (bands - from) as usize], false);
+            let args: Vec<_> = (from..bands).map(|band| [band, bins, bands]).collect();
+            let next: Vec<u32> = helpers(&args).iter().map(|h| h[4]).collect();
+            let mut seen = vec![0; (bands - from) as usize];
             for bin in 0..bins {
                 let mut band = from + bin;
                 while band < bands {
                     seen[(band - from) as usize] += 1;
-                    wrapped |= band.checked_add(bins).is_none();
-                    let next = next_band(band, bins, bands);
+                    let next = next[(band - from) as usize];
                     assert!(next > band, "{n} images, band {band} steps to {next}");
                     band = next;
                 }
+                assert_eq!(band, bands);
             }
             assert!(seen.iter().all(|&s| s == 1));
-            assert_eq!(wrapped, n > u32::MAX - 511);
+            assert_eq!(
+                u64::from(bands - 1) + u64::from(bins) > u64::from(u32::MAX),
+                n > u32::MAX - 511
+            );
         }
     }
 

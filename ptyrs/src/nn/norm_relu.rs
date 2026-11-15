@@ -717,6 +717,33 @@ mod kernel {
             }
         }
     }
+
+    /// For the tests, which reach rows near 2³² that no tensor here holds, as a buffer takes at
+    /// most 8190 MiB: the row helpers as the kernels run them, on `groups` cubes of one channel.
+    /// Each cube's unit 0 writes its span, `start` and `end`, to its two of `out`, and each unit
+    /// of the last cube steps through its rows of that span, at most `limit` steps, and writes how
+    /// many it took and the row it stopped at to its two past the spans.
+    #[cfg(test)]
+    #[cube(launch)]
+    pub fn probe(out: &mut [u32], rows: u32, chunk: u32, groups: u32, limit: u32) {
+        let g = group(groups);
+        let (start, end) = span(rows, chunk, groups);
+        if UNIT_POS_Y == 0 {
+            out[2 * g] = start as u32;
+            out[2 * g + 1] = end as u32;
+        }
+        if g == groups as usize - 1 {
+            let at = 2 * (groups as usize + UNIT_POS_Y as usize);
+            let mut r = first_row(start, end);
+            let mut taken = 0u32;
+            while r < end && taken < limit {
+                taken += 1;
+                r = next_row(r, end);
+            }
+            out[at] = taken;
+            out[at + 1] = r as u32;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -726,6 +753,7 @@ mod tests {
     use burn::nn::BatchNormConfig;
     use burn::tensor::{DType, Distribution, TensorData};
 
+    use crate::nn::grid::run_probe;
     use crate::worst::worst_of;
 
     fn values(n: usize, lo: f64, hi: f64, device: &Device, dtype: DType) -> Tensor<1> {
@@ -941,51 +969,46 @@ mod tests {
         forward(x, broadcast([1 << 32]), broadcast([1 << 32]), 1e-5);
     }
 
-    /// The kernels' `span` of group `g`, in 32 bits with every operation checked.
-    fn span(rows: u32, chunk: u32, g: u32) -> (u32, u32) {
-        let start = g.checked_mul(chunk).unwrap();
-        let end = start.checked_add(chunk.min(rows.checked_sub(start).unwrap()));
-        (start, end.unwrap())
-    }
-
-    /// The kernels' `next_row`, and their `first_row` for unit `step`, checked as [`span`] is.
-    fn next_row(r: u32, end: u32, step: u32) -> u32 {
-        r.checked_add(step.min(end.checked_sub(r).unwrap()))
-            .unwrap()
-    }
-
     /// One channel of 2³² - 511, 2³² - 255 and 2³² - 1 rows, where the last group's `start + chunk`
-    /// and, from 2³² - 255, a unit's step past its last row wrapped past 2³². The kernels' row
-    /// arithmetic is run here on the host: no f16 tensor of that many elements fits the 8190 MiB a
-    /// buffer may take on the GPUs here. Each group's span follows the last, and the last group's
-    /// units visit its rows once each and stop at its end.
+    /// and, from 2³² - 255, a unit's step past its last row wrapped past 2³². Each group's span
+    /// follows the last, and the last group's units visit its rows once each and stop at its end.
     #[test]
     fn rows_near_2_32_stay_in_32_bits() {
         for rows in [u32::MAX - 510, u32::MAX - 254, u32::MAX] {
             let (tx, chunk, groups) = layout(rows as usize, 1);
             let ty = (UNITS / tx) as u32;
             let [chunk, groups] = [chunk, groups].map(|v| u32::try_from(v).unwrap());
+            // A unit takes at most `chunk / ty` rows, rounded up; one that wrapped took more.
+            let limit = chunk.div_ceil(ty) + 1;
+            let out = run_probe(2 * (groups + ty) as usize, |client, out| {
+                kernel::probe::launch(
+                    client,
+                    CubeCount::Static(groups, 1, 1),
+                    CubeDim::new_2d(tx as u32, ty),
+                    out,
+                    rows,
+                    chunk,
+                    groups,
+                    limit,
+                );
+            });
+            let (spans, walks) = out.split_at(2 * groups as usize);
             let mut next = 0;
-            for g in 0..groups {
-                let (start, end) = span(rows, chunk, g);
-                assert_eq!(start, next);
+            for &[start, end] in spans.as_chunks::<2>().0 {
+                assert_eq!(start, next, "{rows} rows");
                 next = end;
             }
             assert_eq!(next, rows);
-            let (start, end) = span(rows, chunk, groups - 1);
-            assert_eq!(start.checked_add(chunk), None);
-            let (mut seen, mut wrapped) = (0, false);
-            for y in 0..ty {
-                let mut r = next_row(start, end, y);
-                while r < end {
-                    seen += 1;
-                    wrapped |= r.checked_add(ty).is_none();
-                    r = next_row(r, end, ty);
-                }
-                assert_eq!(r, end);
+            let [start, end]: [u32; 2] = spans[spans.len() - 2..].try_into().unwrap();
+            assert!(u64::from(start) + u64::from(chunk) > u64::from(u32::MAX));
+            for (y, &walk) in walks.as_chunks::<2>().0.iter().enumerate() {
+                let want = (end - start).saturating_sub(y as u32).div_ceil(ty);
+                assert_eq!(walk, [want, end], "{rows} rows, unit {y}");
             }
-            assert_eq!(seen, end - start);
-            assert_eq!(wrapped, rows > u32::MAX - 256);
+            assert_eq!(
+                u64::from(end - 1) + u64::from(ty) > u64::from(u32::MAX),
+                rows > u32::MAX - 255
+            );
         }
     }
 

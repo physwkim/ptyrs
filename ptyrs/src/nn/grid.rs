@@ -89,10 +89,34 @@ pub(super) fn check_elements(shapes: &[&[usize]]) {
     );
 }
 
+/// The client of the GPU the tests run on.
+#[cfg(test)]
+pub(super) fn client() -> Client {
+    Tensor::<1>::empty([1], &crate::nn::cuda(0))
+        .try_into_primitive::<burn_cubecl::CubeBackend>()
+        .unwrap()
+        .client
+}
+
+/// Runs `launch`, a test's launch of a module's probe of its kernel helpers, with an output
+/// buffer of `len` values on [`client`]'s GPU, and reads them back.
+#[cfg(test)]
+pub(super) fn run_probe(
+    len: usize,
+    launch: impl FnOnce(&Client, burn_cubecl::cubecl::prelude::BufferArg),
+) -> Vec<u32> {
+    use burn_cubecl::cubecl::prelude::{BufferArg, CubeElement};
+    let client = client();
+    let out = client.empty(len * size_of::<u32>());
+    // SAFETY: the buffer holds `len` values.
+    launch(&client, unsafe {
+        BufferArg::from_raw_parts(out.clone(), len)
+    });
+    u32::from_bytes(&client.read_one(out).unwrap()).to_vec()
+}
+
 #[cfg(test)]
 mod tests {
-    use burn_cubecl::CubeBackend;
-
     use super::*;
 
     /// Up to 2³² - 1 cubes the grid holds fewer more than asked than it has rows, and none past
@@ -100,10 +124,7 @@ mod tests {
     /// 2³² - 1 named cubes 0 .. 2³¹ - 3 twice.
     #[test]
     fn each_cube_position_names_one_cube() {
-        let client = Tensor::<1>::empty([1], &crate::nn::cuda(0))
-            .try_into_primitive::<CubeBackend>()
-            .unwrap()
-            .client;
+        let client = client();
         let most_x = u64::from(client.properties().hardware.max_cube_count.0);
         let tops = [
             1,
