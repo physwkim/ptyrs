@@ -2,8 +2,9 @@
 //! references in f64: [`BhKernels::phase_grad`] and [`BhKernels::phase_tangent`] against the
 //! derivatives of the plane phase `OpticsKernels::slice_phase` puts on the exit waves, its
 //! rates measured from that kernel; [`BhKernels::pos_second`] against central differences of
-//! [`BhKernels::pos_spec`]; the probes `PositionKernels::shift_w` moved, as the entry, against
-//! waves holding the probes moved on the host; and the partials' segments.
+//! [`BhKernels::pos_spec`]; [`BhKernels::slice_tangent`] against the slice's exit derivatives
+//! in f64, and the probes `PositionKernels::shift_w` moved, as its entry, against waves holding
+//! the probes moved on the host; and the partials' segments.
 
 use std::f64::consts::TAU;
 
@@ -644,6 +645,105 @@ fn pos_second_is_the_change_of_pos_spec() {
 #[test]
 fn pos_second_is_the_change_of_pos_spec_cg() {
     pos_second_case(true);
+}
+
+/// `slice_tangent` per entry kind against the slice's exit derivatives in f64, the host's
+/// [`exit`] sampling each term: `l_u ← x l_u + u_x w`, `m_uu ← x m_uu + 2 u_x l_u` and with CG
+/// `l_v ← x l_v + v_x w`, `m_uv ← x m_uv + u_x l_v + v_x l_u`, `m_vv ← x m_vv + 2 v_x l_v`;
+/// entered by the probe `l_u` is `U_SCALE` times `u`'s probe part, `l_v` `v`'s and `m` 0.
+/// Planes past the stack's frames stay as they were; without CG `lv`, `muv` and `mvv` go
+/// unchecked ([`tangent_len`]).
+fn slice_tangent_case(cg: bool) {
+    let fx = fixture();
+    let obj = fx.dims.obj_len();
+    let (slice, slice_h) = fx.field(obj, 1);
+    let [u, v] = [2, 4].map(|s| [fx.field(obj, s), fx.field(NPROBE * N, s + 1)]);
+    let d = BhDisp {
+        u: [&u[0].0, &u[1].0],
+        u_scale: U_SCALE,
+        v: cg.then_some([&v[0].0, &v[1].0]),
+    };
+    let scaled: Vec<C64> = u[1].1.iter().map(|&c| c * f64::from(U_SCALE)).collect();
+    // `a + c b`.
+    let add = |a: &[C64], b: &[C64], c: f64| -> Vec<C64> {
+        a.iter().zip(b).map(|(a, b)| a + b * c).collect()
+    };
+    for (k, kind) in KINDS.into_iter().enumerate() {
+        for (s, frames) in STACKS.iter().enumerate() {
+            let seed = 100 * k as u64 + 10 * s as u64 + 10;
+            let (e, e_h) = fx.field(entry_len(kind), seed);
+            let fields =
+                [1, 2, 3, 4, 5].map(|i| fx.field(tangent_len(i == 2 || i > 3, cg), seed + i));
+            let [mut lu, mut lv, muu, muv, mvv] = fields.each_ref().map(|f| f.0.clone_on(&fx));
+            let mut m = [muu, muv, mvv];
+            let mut t = BhTangentsMut {
+                lu: &mut lu,
+                lv: &mut lv,
+                m: &mut m,
+            };
+            let entered = (&slice, entry(kind, &e));
+            fx.bh
+                .slice_tangent(
+                    &fx.ctx,
+                    fx.order.views(),
+                    fx.table.at(s),
+                    entered,
+                    &d,
+                    &mut t,
+                )
+                .unwrap();
+            let written = frames.len() * NMODE * N;
+            // `o a` for `a` a wave of `a_kind`.
+            let by = |o: &[C64], (a, a_kind): (&[C64], u32)| exit(&fx, frames, o, a, a_kind);
+            let probe = kind == BH_ENTRY_PROBE;
+            let held = |b: usize| (&fields[b].1[..], BH_ENTRY_WAVES);
+            let xm = |b: usize| {
+                if probe {
+                    vec![C64::default(); written]
+                } else {
+                    by(&slice_h, held(b))
+                }
+            };
+            let w = (&e_h[..], kind);
+            let lu_in = if probe { (&scaled[..], kind) } else { held(0) };
+            let mut want = [
+                Some(add(&by(&slice_h, lu_in), &by(&u[0].1, w), 1.0)),
+                None,
+                Some(add(&xm(2), &by(&u[0].1, lu_in), 2.0)),
+                None,
+                None,
+            ];
+            if cg {
+                let lv_in = if probe { (&v[1].1[..], kind) } else { held(1) };
+                let cross = add(&by(&u[0].1, lv_in), &by(&v[0].1, lu_in), 1.0);
+                want[1] = Some(add(&by(&slice_h, lv_in), &by(&v[0].1, w), 1.0));
+                want[3] = Some(add(&xm(3), &cross, 1.0));
+                want[4] = Some(add(&xm(4), &by(&v[0].1, lv_in), 2.0));
+            }
+            let got = [&lu, &lv, &m[0], &m[1], &m[2]].map(|b| fx.host(b));
+            for (b, name) in ["lu", "lv", "muu", "muv", "mvv"].into_iter().enumerate() {
+                let Some(w) = &want[b] else {
+                    continue;
+                };
+                let what = format!("kind {kind} stack {s} {name}");
+                close(&what, &got[b][..written], w, 1e-5);
+                assert!(
+                    got[b][written..] == fields[b].1[written..],
+                    "{what}: past the frames"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn slice_tangent_is_the_exit_derivative() {
+    slice_tangent_case(false);
+}
+
+#[test]
+fn slice_tangent_is_the_exit_derivative_cg() {
+    slice_tangent_case(true);
 }
 
 /// Whole-pixel offsets `(dy, dx)` by epoch position, a different one for each frame: the
