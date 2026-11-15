@@ -280,7 +280,7 @@ M6 측정(GPU2, 스택 16): 물체 갱신은 Tile 24–26 µs, SIMT 10–11 µs�
 | sim::object | DM 프로브 갱신 | 185 | 미도달 (미도달) | 미도달 (미도달) | 99 | 134–164 (159) | 163–165 (164) |
 
 - DIP 가중치 기울기는 엔진 GPU 물체 기울기를 거쳐도 CPU f64 LLK의 중심 차분과 기울기 대비 2.6e-6 이내(허용 2e-5)로 맞습니다(`ptyrs/src/nn/dip.rs`의 `weight_gradients_from_the_engine_gpu_gradient_match_finite_differences`, 16×16 물체·25프레임, 매개변수 텐서 42개 전부, CPU 기울기로는 1.3e-7).
-- pty-chi(0605630) `DIPPlanarObject`의 기본 UNet을 burn으로 다시 지어 torch가 내보낸 가중치·입력 코드에서 `Dip::with_prior`로 학습하면(852² fermat_clean, 참 프로브 고정, Adam lr 1e-3, pty-chi 쪽은 바꿔 넣은 로그 없는 Poisson 손실), f64 LLK는 pty-chi와 100회 중 최대 1.6e-2 차이이고, 같은 시작에서 다시 돌린 pty-chi는 2.8e-11 이내이므로 이 차이는 두 구현의 반올림 차이입니다. GPU2 f32 반복당 시간은 ptyrs 0.321 s, pty-chi 0.414 s(cuDNN 기본 TF32)로 ptyrs가 1.29배 빠르고, 최대 메모리(nvidia-smi)는 6.8 대 14.1 GiB이며, ptyrs 첫 반복은 `~/.cache/cubecl`에 autotune 결과가 없으면 97 s, 있으면 3.1 s입니다(`ptyrs/examples/nn_dip_ptychi.rs`, `refs/py/compare_dip_ptychi.py`).
+- pty-chi(0605630) `DIPPlanarObject`의 기본 UNet을 burn으로 다시 지어 torch가 내보낸 가중치·입력 코드에서 `Dip::with_prior`로 학습하면(852² fermat_clean, 참 프로브 고정, Adam lr 1e-3, pty-chi 쪽은 바꿔 넣은 로그 없는 Poisson 손실), f64 LLK는 pty-chi와 100회 중 최대 1.6e-2 차이이고, 같은 시작에서 다시 돌린 pty-chi는 2.8e-11 이내이므로 이 차이는 두 구현의 반올림 차이입니다. GPU2 f32 반복당 시간은 ptyrs 1.05 s(TF32로는 0.154 s)로 cuDNN 기본 TF32인 pty-chi 0.413 s의 2.5배이고, 최대 메모리(nvidia-smi)는 6.2 대 14.1 GiB이며, 첫 반복은 `~/.cache/cubecl`에 autotune 결과가 없으면 49 s, 있으면 5.0 s입니다(`ptyrs/examples/nn_dip_ptychi.rs`, `refs/py/compare_dip_ptychi.py`).
 
 ---
 
