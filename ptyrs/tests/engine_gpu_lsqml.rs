@@ -355,7 +355,7 @@ fn steps_rel(got: &[LsqmlStep], want: &[LsqmlStep]) -> f64 {
 /// fresh CPU run from the arrays it starts at, after another LSQML call (whose graphs it
 /// replays), after a BH call (which drops them), after modelling a position and after
 /// modelling none again (each of which rebuilds the LSQML state). A zero batch size, a
-/// modelled scale or background and frames off the fused sides fail.
+/// modelled scale or background, held or refined, and frames off the fused sides fail.
 #[test]
 fn lsqml_restarts_and_rejects() {
     let frame = FUSED_SIDES[0] as usize;
@@ -431,6 +431,14 @@ fn lsqml_restarts_and_rejects() {
         },
         Features {
             background: Some(Feature::refined(vec![1.0; frame * frame])),
+            ..Features::default()
+        },
+        Features {
+            scale: Some(Feature::held(vec![1.0; NPOS])),
+            ..Features::default()
+        },
+        Features {
+            background: Some(Feature::held(vec![1.0; frame * frame])),
             ..Features::default()
         },
     ] {

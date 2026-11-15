@@ -61,6 +61,7 @@ pub use ptyrs_kernels::pixel::{
     LlkPartial, MASKED, OBJ_TILE, PositionPartial, ScalePartial, StackCtl, StackGeom, ViewAddr,
 };
 
+use crate::gpu::opr::FrameProbe;
 use crate::gpu::psi::check_waves;
 use crate::gpu::{C32, Error, Kernels, Waves, check_len, dptr, lease};
 
@@ -1079,28 +1080,42 @@ impl Kernels {
         probe: &DeviceBuffer<C32>,
         sums: &mut UpdateSums,
     ) -> Result<(), Error> {
+        let probe = FrameProbe::Shared(probe);
+        self.psi_to_obj_frames(ctx, views, stack, psi, probe, sums)
+    }
+
+    /// [`Self::psi_to_obj`] with the frames' probe from `probe`.
+    pub fn psi_to_obj_frames(
+        &self,
+        ctx: &ExecutionContext,
+        views: &Views,
+        stack: StackRef<'_>,
+        psi: &dyn Waves,
+        probe: FrameProbe<'_>,
+        sums: &mut UpdateSums,
+    ) -> Result<(), Error> {
         let d = &views.dims;
         let g = d.geom(stack)?;
         let n = d.n();
         check_waves("psi", psi, g.nf_max as usize * d.nmode as usize * n)?;
-        check_len("probe", probe, d.nprobe as usize * n)?;
+        check_len("probe", probe.probe(), d.nprobe as usize * n)?;
         sums.check(d.obj_len())?;
         let config = d.stack_tile_grid(g.nf_max)?;
         let [start, len, list] = views.tile_storages();
-        let reads = [
+        let mut reads = vec![
             psi.raw(),
-            probe.storage(),
             views.addr.storage(),
             start,
             len,
             list,
             stack.storage(),
         ];
+        reads.extend(probe.storages());
+        let probe = probe.src(n)?;
         self.launch(ctx, &reads, &sums.storages(), |stream| {
             // SAFETY: lengths checked above; the tile lists were built from these views.
             unsafe {
-                let (m, ptr, probe, addr) =
-                    (&self.module, psi.ptr(), dptr(probe), dptr(&views.addr));
+                let (m, ptr, addr) = (&self.module, psi.ptr(), dptr(&views.addr));
                 let (tiles, sums, ctl) = (
                     views.tile_ptrs(),
                     sums.ptrs(),

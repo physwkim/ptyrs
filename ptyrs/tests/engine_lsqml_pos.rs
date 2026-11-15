@@ -273,8 +273,8 @@ fn poisson_epochs_match_ptychi_with_positions() {
     assert_epochs_ref(Cost::Poisson, 1);
 }
 
-/// pty-chi's LSQML has no per-frame intensity scale or detector background; offsets must be
-/// finite.
+/// pty-chi's LSQML has no per-frame intensity scale or detector background, held or refined;
+/// offsets must be finite.
 #[test]
 fn with_features_refuses_what_ptychi_lsqml_lacks() {
     let run = || {
@@ -292,6 +292,14 @@ fn with_features_refuses_what_ptychi_lsqml_lacks() {
         },
         Features {
             background: Some(Feature::refined(vec![0.0; 32 * 32])),
+            ..Features::default()
+        },
+        Features {
+            scale: Some(Feature::held(vec![1.0; 40])),
+            ..Features::default()
+        },
+        Features {
+            background: Some(Feature::held(vec![0.0; 32 * 32])),
             ..Features::default()
         },
         Features {

@@ -14,7 +14,7 @@ use cuda_device::{async_copy, device, shared::DynamicSharedArray, thread};
 use cuda_host::cuda_module;
 
 use crate::bh::{BhObs, store_sums};
-use crate::fused::{FUSED_COLS, col_fft, walk_slot};
+use crate::fused::{FUSED_COLS, ProbeSrc, col_fft, load_probe, walk_slot};
 use crate::grad::{GAMMA_CHUNK, ObjProbePtrs};
 use crate::optics::{WavePlanes, wave_plane};
 use crate::pixel::{
@@ -74,16 +74,31 @@ pub struct LsqmlFar {
 }
 
 /// What [`lsqml_kernels::LoadedModule::lsqml_dots`] reads and writes: `chi` `[nf_max * nmode,
-/// ny, nx]`, the object and probe `x` and their directions `d`, the epoch's `views`, and
-/// `out` the [`LSQML_DOTS`] sums of every frame's chunks by epoch position.
+/// ny, nx]`, the object `obj` and probe `probe`, their directions `d` (the shared probe's), the
+/// epoch's `views`, and `out` the [`LSQML_DOTS`] sums of every frame's chunks by epoch
+/// position.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct LsqmlDots {
     pub chi: *const f32,
-    pub x: ObjProbePtrs,
+    pub obj: *const f32,
+    pub probe: ProbeSrc,
     pub d: ObjProbePtrs,
     pub views: *const ViewAddr,
     pub out: *mut f32,
+}
+
+/// What [`lsqml_kernels::LoadedModule::lsqml_frame_dirs`] reads and writes: `chi` `[nf_max *
+/// nmode, ny, nx]`, the object `obj`, the epoch's `views`, and `d` `[nb, ny, nx]` complex and
+/// `vv` as many floats by batch frame.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct LsqmlFrameDirs {
+    pub chi: *const f32,
+    pub obj: *const f32,
+    pub views: *const ViewAddr,
+    pub d: *mut f32,
+    pub vv: *mut f32,
 }
 
 /// [`lsqml_step`]'s constants: the `trim` step sizes its mean leaves out at each end, the
@@ -248,7 +263,8 @@ unsafe fn dots<const SHIFT: bool>(
 ) {
     let LsqmlDots {
         chi,
-        x,
+        obj,
+        probe,
         d,
         views,
         out,
@@ -275,14 +291,15 @@ unsafe fn dots<const SHIFT: bool>(
             unsafe {
                 let w = *views.add(pos * nmode + m);
                 let pa = w.probe as usize * n + i;
-                let o = sample_obj(x.obj, w, py, px, g.nyo, g.nxo);
+                let o = sample_obj(obj, w, py, px, g.nyo, g.nxo);
                 let d_o = sample_obj(d.obj, w, py, px, g.nyo, g.nxo);
                 let ch = load_c(chi, (fl * nmode + m) * n + at);
                 let u = if SHIFT {
                     let ws = load_c(w_in.w, wave_plane(w_in, fl, m) * n + at);
                     cmul(d_o, ws)
                 } else {
-                    cmul(cmul(d_o, load_c(x.probe, pa)), q)
+                    let pr = load_probe(probe, w.probe, pos as u32, n, i);
+                    cmul(cmul(d_o, pr), q)
                 };
                 let v = cmul(cmul(o, load_c(d.probe, pa)), q);
                 let uv = cmul_conj(u, v);
@@ -323,8 +340,9 @@ unsafe fn pre_update(pre: LsqmlPre, px: usize, illum: f32, init: u32, scale: f32
 #[cuda_module]
 pub mod lsqml_kernels {
     use super::{
-        EPS_XI, LAMBDA0, LSQML_DOTS, LSQML_REC, LSQML_XI, LsqmlCols, LsqmlDots, LsqmlFar, LsqmlPre,
-        LsqmlRule, WavePlanes, cols, dots, pre_update, store_sums, walk_slot,
+        EPS_XI, LAMBDA0, LSQML_DOTS, LSQML_REC, LSQML_XI, LsqmlCols, LsqmlDots, LsqmlFar,
+        LsqmlFrameDirs, LsqmlPre, LsqmlRule, WavePlanes, cols, dots, pre_update, store_sums,
+        walk_slot,
     };
     use crate::bh::{BhObs, CHUNK_PIXELS};
     use crate::grad::GAMMA_CHUNK;
@@ -667,8 +685,9 @@ pub mod lsqml_kernels {
     /// The step-size sums of chunk `c = blockIdx.x` of frame `f0 + fl`, `fl` `walk_slot` of
     /// `flags`, over its modes and the pixels `d` in `c * GAMMA_CHUNK .. min((c + 1) *
     /// GAMMA_CHUNK, n)`: with view `w = views[(f0 + fl) * nmode + m]` and `q = exp(i quad
-    /// r²)`, `u = dO_w P_w q` and `v = O_w dP_w q` (`x` the object and probe, `d` their
-    /// directions) and `chi` at the exit-wave index of `d`, `out[6p .. 6p + 6]` gets the
+    /// r²)`, `u = dO_w P_w q` and `v = O_w dP_w q` (`P_w` the view's mode of `p.probe` at
+    /// position `f0 + fl`, `dP_w` of the shared direction) and `chi` at the exit-wave index
+    /// of `d`, `out[6p .. 6p + 6]` gets the
     /// [`LSQML_DOTS`] sums, `p = (f0 + fl) * nchunk + c`.
     ///
     /// # Safety
@@ -706,6 +725,57 @@ pub mod lsqml_kernels {
     ) {
         static mut RED: SharedArray<f32, 1536> = SharedArray::UNINIT;
         unsafe { dots::<true>(p, waves, ctl, g, flags, (&raw mut RED).cast::<f32>()) }
+    }
+
+    /// Each frame's probe mode-0 direction under OPR: for frame `fl` of the stack, batch
+    /// frame `b = f0 + fl − span.p0`, over its views `v` on probe 0 in ascending order and
+    /// with `q = exp(i quad r²)`, `d[b, i] = Σ conj(O_v q) chi_v` with `chi_v` at the
+    /// exit-wave index of pixel `i`, and `vv[b, i] = Σ |O_v|²`: `psi_to_probe`'s sums of mode
+    /// 0, frame by frame. A frame outside the span writes nothing. One thread per element of
+    /// `[nf_max, ny, nx]`.
+    ///
+    /// # Safety
+    ///
+    /// `p` as [`LsqmlFrameDirs`] says with `nb = span.nb`, `views` `nframe * nmode` records in
+    /// range, `ctl` one entry.
+    #[kernel]
+    pub unsafe fn lsqml_frame_dirs(
+        p: LsqmlFrameDirs,
+        span: BatchSpan,
+        ctl: *const StackCtl,
+        g: StackGeom,
+    ) {
+        let (f0, nf) = unsafe { stack_frames(ctl, g) };
+        let n = g.ny as usize * g.nx as usize;
+        let t = global_index();
+        if t >= nf as usize * n {
+            return;
+        }
+        let (fl, i) = (t / n, t % n);
+        let b = (f0 + fl as u32).wrapping_sub(span.p0);
+        if b >= span.nb {
+            return;
+        }
+        let (y, x) = ((i / g.nx as usize) as u32, (i % g.nx as usize) as u32);
+        let q = quad_phase(g.quad, y, x, g.ny, g.nx);
+        let at = psi_index(y, x, g.ny, g.nx);
+        let nmode = g.nmode as usize;
+        let (mut acc, mut norm) = ((0.0f32, 0.0f32), 0.0f32);
+        unsafe {
+            for k in fl * nmode..(fl + 1) * nmode {
+                let v = *p.views.add(f0 as usize * nmode + k);
+                if v.probe != 0 {
+                    continue;
+                }
+                let o = sample_obj(p.obj, v, y, x, g.nyo, g.nxo);
+                let u = cmul_conj(cmul(o, q), load_c(p.chi, k * n + at));
+                acc = (acc.0 + u.0, acc.1 + u.1);
+                norm += o.0 * o.0 + o.1 * o.1;
+            }
+            let at = b as usize * n + i;
+            store_c(p.d, at, acc);
+            *p.vv.add(at) = norm;
+        }
     }
 
     /// One batch's step sizes over its positions `p` from the [`lsqml_dots`] sums, each

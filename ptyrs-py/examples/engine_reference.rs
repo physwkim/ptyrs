@@ -8,9 +8,11 @@
 //! its start `object` and `probe` (`Ptycho::scale_obj_probe` of a flat object and the
 //! simulation's probe) and one group per LSQML run with probe variation, its `cost`,
 //! `batch_size` and `seed` as attributes: the start `eigenmodes`, `weights` and (`intensity`
-//! run) `intensity`, then for each epoch `e` of `NEPOCH` a group `epoch<e>` of the arrays it
-//! left (`object` `[nslice, nobj, nyo, nxo]`) and its steps, every batch's `frames`, `a_far`, `a_obj` (`[nslice, nframe]`) and
-//! `a_probe` concatenated and `batch_len`.
+//! run) `intensity` and their [`Lsqml::llk`] `llk` (`poisson`, `gaussian`, `euclidian`,
+//! `nb_photons_calc`), then for each epoch `e` of `NEPOCH` a group `epoch<e>` of the arrays it
+//! left (`object` `[nslice, nobj, nyo, nxo]`) and their `llk`, and its steps, every batch's
+//! `frames`, `a_far`, `a_obj` (`[nslice, nframe]`) and `a_probe` concatenated and
+//! `batch_len`.
 //!
 //! `near.h5` holds a scan simulated through pty-chi's planar near field ([`Optics::free_space`]
 //! of the `wavelength`, `wave_pixel` and `distance` it names, `exit` `"free_space"`): its
@@ -199,6 +201,12 @@ fn opr(path: &Path) -> Result<(), Box<dyn Error>> {
         let mut var = variation(probe.plane(0), g.frame, nframe, intensity);
         write_variation(&group, &var)?;
         let mut lsqml = Lsqml::new(params)?;
+        let llk = |lsqml: &Lsqml, object: &Object, probe: &Probe, var: &ProbeVariation| {
+            let objects = slice::from_ref(object);
+            let l = lsqml.llk(p.addr(), p.observed(), &optics, objects, probe, var);
+            [l.poisson, l.gaussian, l.euclidian, l.nb_photons_calc]
+        };
+        write(&group, "llk", &[4], &llk(&lsqml, &object, &probe, &var))?;
         for e in 1..=NEPOCH {
             let objects = slice::from_mut(&mut object);
             let steps = lsqml.epoch(
@@ -213,6 +221,7 @@ fn opr(path: &Path) -> Result<(), Box<dyn Error>> {
             write_objects(&at, "object", slice::from_ref(&object))?;
             write_stack(&at, "probe", &probe.0)?;
             write_variation(&at, &var)?;
+            write(&at, "llk", &[4], &llk(&lsqml, &object, &probe, &var))?;
             let cat = |f: fn(&ptyrs::engine::LsqmlStep) -> &[f64]| -> Vec<f64> {
                 steps.iter().flat_map(|s| f(s).iter().copied()).collect()
             };

@@ -120,7 +120,7 @@ impl Bufs<'_> {
                     counts: self.counts,
                     obj: read.blocks,
                     probe: self.probe,
-                    model: m.model,
+                    model: m.model(),
                 };
                 let far = FarSums {
                     llk: llk.is_some().then_some(&mut *self.llk),
@@ -155,7 +155,7 @@ impl Bufs<'_> {
                 counts: self.counts,
                 obj: self.obj,
                 probe: self.probe,
-                model: m.model,
+                model: m.model(),
             };
             let far = FarSums {
                 llk: llk.is_some().then_some(&mut *self.llk),
@@ -187,7 +187,7 @@ impl Bufs<'_> {
             return Ok(false);
         };
         m.probe_sums(ctx, self.kernels, &dims, self.probe_sums)?;
-        let model = m.model;
+        let model = m.model();
         let Some(ShiftProbe::Step(step)) = m.shift_sums(Some(ShiftProbe::Step), false).probe else {
             return Ok(false);
         };

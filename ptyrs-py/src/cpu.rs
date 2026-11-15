@@ -1,6 +1,7 @@
 //! The CPU f64 engine: [`ptyrs::engine::Ptycho`] (AP, DM, RAAR, ML, rPIE) and the forward model
-//! and LLK of given arrays over its scan, under far-field or near-field optics, and LSQML and
-//! BH epochs over the views of a scan through far-field, near-field or multislice optics.
+//! and LLK of given arrays over its scan, under far-field or near-field optics, and LSQML
+//! epochs and the LLK of their model, and BH epochs, over the views of a scan through
+//! far-field, near-field or multislice optics.
 
 use numpy::{
     PyArray1, PyArray2, PyArray3, PyArray4, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2,
@@ -511,15 +512,34 @@ fn variation_fits(var: &ProbeVariation, nframe: usize, plane: [usize; 2]) -> PyR
 /// models them. With `opr`, `(eigenmodes, weights, intensity)` of eigenmodes `U_i`
 /// `[k, ny, nx]`, weights `w_fi` `[nframe, k]` and main-mode weights `c_f` `[nframe]` or
 /// `None`, it models OPR of probe mode 0, frame `f` seeing `c_f·P_0 + Σ_i w_fi·U_i`, `c_f` 1
-/// when `None`; `Ptycho.llk` does not model it. The eigenmodes move with the probe; the
-/// offsets, the weights and `c_f` are each refined unless `hold` names it, `"position"`,
-/// `"weights"` or `"intensity"`, and `hold` naming one not given is a `ValueError`. The
-/// offsets enter as `sampling`, `"patch"` or `"full_object"` as `Ptycho.set_sampling` takes
-/// it, and without, as `Sampling::auto` of the optics, object and probe of the first epoch.
+/// when `None`. The eigenmodes move with the probe; the offsets, the weights and `c_f` are
+/// each refined unless `hold` names it, `"position"`, `"weights"` or `"intensity"`, and
+/// `hold` naming one not given is a `ValueError`. The offsets enter as `sampling`, `"patch"`
+/// or `"full_object"` as `Ptycho.set_sampling` takes it, and without, as `Sampling::auto` of
+/// the optics, object and probe of the first epoch.
 #[pyclass]
 pub(crate) struct Lsqml {
     inner: ptyrs::engine::Lsqml,
     var: Option<ProbeVariation>,
+}
+
+impl Lsqml {
+    /// `object` and `probe` as `views` take them, an error unless the offsets and the
+    /// variation are of `views`' frames and the probe's planes.
+    fn modes(
+        &self,
+        views: &Views,
+        object: PyReadonlyArray4<'_, C64>,
+        probe: PyReadonlyArray3<'_, C64>,
+    ) -> PyResult<(Vec<Object>, Probe)> {
+        let (objects, probe) = views.modes(object, probe)?;
+        let nframe = views.addr.nframe();
+        offsets_fit(self.inner.features(), nframe)?;
+        if let Some(v) = &self.var {
+            variation_fits(v, nframe, probe.plane_shape())?;
+        }
+        Ok((objects, probe))
+    }
 }
 
 #[pymethods]
@@ -612,13 +632,8 @@ impl Lsqml {
         object: PyReadonlyArray4<'_, C64>,
         probe: PyReadonlyArray3<'_, C64>,
     ) -> PyResult<Epoch<'py>> {
-        let (mut objects, mut probe) = views.modes(object, probe)?;
-        let (nframe, plane) = (views.addr.nframe(), probe.plane_shape());
-        offsets_fit(self.inner.features(), nframe)?;
-        if let Some(v) = &self.var {
-            variation_fits(v, nframe, plane)?;
-        }
-        let mut none = ProbeVariation::none(plane);
+        let (mut objects, mut probe) = self.modes(views, object, probe)?;
+        let mut none = ProbeVariation::none(probe.plane_shape());
         let steps = self.inner.epoch(
             &views.addr,
             &views.obs,
@@ -629,6 +644,27 @@ impl Lsqml {
         );
         let steps = crate::lsqml_steps(py, &steps)?;
         Ok((objects_out(py, objects)?, stack_out(py, probe.0)?, steps))
+    }
+
+    /// Normalised PyNX LLK of `object` `[nslice, nobj, nyo, nxo]` and `probe` over every frame
+    /// of `views`, of the model the epochs step: each frame's own probe under `opr`, at its
+    /// offset as the epochs enter it; without `opr`, `Ptycho.llk`'s of the same arrays,
+    /// offsets and sampling.
+    fn llk<'py>(
+        &self,
+        py: Python<'py>,
+        views: &Views,
+        object: PyReadonlyArray4<'_, C64>,
+        probe: PyReadonlyArray3<'_, C64>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let (objects, probe) = self.modes(views, object, probe)?;
+        let none = ProbeVariation::none(probe.plane_shape());
+        let var = self.var.as_ref().unwrap_or(&none);
+        let (addr, obs) = (&views.addr, &views.obs);
+        let llk = self
+            .inner
+            .llk(addr, obs, views.optics(), &objects, &probe, var);
+        llk_dict(py, &llk)
     }
 }
 

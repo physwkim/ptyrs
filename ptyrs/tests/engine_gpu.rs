@@ -2016,8 +2016,8 @@ fn empty_batches_are_refused_on_both_backends() {
     assert_eq!(gpu.cycle(), 0);
 }
 
-/// rPIE models neither a scale nor a background and BH none, refused before they touch
-/// anything; a refused set leaves the features modelled.
+/// rPIE models neither a scale nor a background and BH none, held or refined, refused before
+/// they touch anything; a refused set leaves the features modelled.
 #[test]
 fn features_are_refused_where_they_cannot_run() {
     let (scan, object, probe) = start(M1.frame, 1, false);
@@ -2109,6 +2109,29 @@ fn features_are_refused_where_they_cannot_run() {
         seed: 7,
     };
     assert!(gpu.bh(&bh, 1, 1).is_err());
+    for held in [
+        Features {
+            scale: Some(Feature::held(vec![1.0; NPOS])),
+            ..Features::default()
+        },
+        Features {
+            background: Some(Feature::held(flat.clone())),
+            ..Features::default()
+        },
+    ] {
+        cpu.set_features(held.clone()).unwrap();
+        gpu.set_features(&held).unwrap();
+        let rpie = "rPIE models no intensity scale or background";
+        let e = cpu.rpie(&ptychi::RPIE, 1).unwrap_err().to_string();
+        assert!(e.contains(rpie), "CPU {held:?}: {e}");
+        let e = gpu.rpie(&ptychi::RPIE, 1).unwrap_err().to_string();
+        assert!(e.contains(rpie), "GPU {held:?}: {e}");
+        let e = gpu.bh(&bh, 1, 1).unwrap_err().to_string();
+        assert!(
+            e.contains("BH models no intensity scale or background"),
+            "{held:?}: {e}"
+        );
+    }
 
     let moved = Features {
         position: Some(Feature::refined(vec![[0.25, -0.25]; NPOS])),

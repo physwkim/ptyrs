@@ -195,12 +195,9 @@ pub(super) struct Device {
     half: Option<f32>,
     norms: NormBufs,
     ring: LlkRing<Tag>,
-    use_graph: bool,
+    graphs: Graphs,
     /// The epochs run since the parameters last changed, all of one [`Epoch::run`].
     runs: Vec<EpochRun>,
-    /// With graphs, the LLK pass's graph; none once its buffers are replaced, until the next
-    /// pass captures it.
-    llk_graph: Option<Captured>,
     /// ML's state, built by the first ML call and replaced only for another position model.
     ml: Option<Box<MlState>>,
     /// BH's state, built by the first BH call and replaced for another batch size, and for
@@ -855,7 +852,7 @@ pub(super) struct AnySlices;
 /// sums the passes write; `K`, [`OneSlice`] or [`AnySlices`], is what the lend may read of
 /// the object.
 pub(super) struct Modelled<'b, K> {
-    pub model: Model<'b>,
+    model: Model<'b>,
     sampled: Option<Sampled<'b>>,
     scale: Option<&'b mut DeviceBuffer<ScalePartial>>,
     background: Option<&'b mut BackgroundSums>,
@@ -1119,6 +1116,12 @@ impl<'b> Modelled<'b, AnySlices> {
 }
 
 impl<'b, K> Modelled<'b, K> {
+    /// The model the passes that compare with the counts read, its shift none while the
+    /// lend samples the object ([`Self::moves`]).
+    pub fn model(&self) -> Model<'b> {
+        self.model
+    }
+
     /// What the lend's position model moves, as [`FeaturesMut::lend`] took it from one
     /// [`Mover`], which gives the shift or the sampler, never both.
     pub fn moves(&self) -> Moves<'b> {
@@ -1791,6 +1794,45 @@ struct EpochRun {
 struct Captured {
     graph: CudaGraph<()>,
     ended: Option<Ended>,
+}
+
+impl Captured {
+    /// Enqueues the graph on `ctx`'s stream, counting the record it ends, if any, in `ring`
+    /// under `tag`.
+    fn replay(
+        &self,
+        ring: &mut LlkRing<Tag>,
+        ctx: &ExecutionContext,
+        nframe: u32,
+        tag: Tag,
+    ) -> Result<(), EngineError> {
+        // SAFETY: the context holds the replay's leases on every captured buffer until the
+        // stream has run it, so no other stream can touch them meanwhile.
+        let launch = || Ok(unsafe { self.graph.launch().execute(ctx) }.map_err(GpuError::from)?);
+        match &self.ended {
+            Some(ended) => ring.replay(ctx, ended, tag, nframe, launch),
+            None => launch(),
+        }
+    }
+}
+
+/// Whether the passes replay captured graphs ([`GpuOptions::graph`]).
+enum Graphs {
+    /// Every pass runs eagerly.
+    Off,
+    /// Every pass replays a graph. The LLK pass's lives with the device state: none only while
+    /// its capture is pending, from a replacement of the buffers it binds until the next LLK
+    /// pass captures it.
+    On { llk: Option<Captured> },
+}
+
+impl Graphs {
+    /// Leaves the LLK pass's capture pending, as the buffers its graph binds are replaced.
+    fn pend_llk(&mut self) {
+        if let Self::On { llk } = self {
+            *llk = None;
+        }
+    }
 }
 
 /// A cycle's [`Epoch`] and the buffers only it uses, built together, so a graph captured
@@ -2655,9 +2697,12 @@ impl Device {
             shared,
             carried: None,
             half,
-            use_graph: options.graph,
+            graphs: if options.graph {
+                Graphs::On { llk: None }
+            } else {
+                Graphs::Off
+            },
             runs: Vec::new(),
-            llk_graph: None,
             ml: None,
             bh_state: None,
             lsqml: None,
@@ -2668,18 +2713,19 @@ impl Device {
         };
         let ctx = dev.context();
         dev.ring.device().count(&ctx, 0..dims.nframe, &dev.counts)?;
-        dev.capture_llk()?;
+        if let Graphs::On { llk: None } = dev.graphs {
+            dev.graphs = Graphs::On {
+                llk: Some(dev.capture_llk()?),
+            };
+        }
         Ok(dev)
     }
 
-    /// With graphs, captures the LLK pass's graph.
-    fn capture_llk(&mut self) -> Result<(), EngineError> {
-        if self.use_graph {
-            self.llk_graph = Some(self.capture(|bufs, passes, ring, ended, ctx| {
-                bufs.forward_llk(ctx, passes, ring.capture(ended))
-            })?);
-        }
-        Ok(())
+    /// Captures the LLK pass's graph.
+    fn capture_llk(&mut self) -> Result<Captured, EngineError> {
+        self.capture(|bufs, passes, ring, ended, ctx| {
+            bufs.forward_llk(ctx, passes, ring.capture(ended))
+        })
     }
 
     /// The buffers [`Self::set_features`] models `features` with, which the caller checked
@@ -2798,7 +2844,7 @@ impl Device {
             FeaturesUpdate::Replace(built) => {
                 let (features, shared) = *built;
                 self.runs.clear();
-                self.llk_graph = None;
+                self.graphs.pend_llk();
                 self.features = features;
                 if let Some(r) = shared {
                     self.reshare(r);
@@ -2916,7 +2962,7 @@ impl Device {
         if let Some((p, (mover, shared))) = self.features.position.as_mut().zip(new.moved) {
             p.mover = mover;
             self.runs.clear();
-            self.llk_graph = None;
+            self.graphs.pend_llk();
             if let Some(r) = shared {
                 self.reshare(r);
             }
@@ -3196,16 +3242,18 @@ impl Device {
             fault::at(fault::Exit::Launch)?;
             let run = &mut runs[at];
             let tag = Some((cycle, epoch.algorithm()));
-            self.summing(|dev| match &run.graph {
-                Some(c) => dev.replay(c, tag),
-                None => {
-                    let (ctx, nframe) = (dev.context(), dev.dims().nframe);
-                    let records = run.cycle.records();
-                    let (mut bufs, mut passes, ring) = dev.lend();
-                    let llk = records
-                        .then(|| ring.record(&ctx, tag, nframe))
-                        .transpose()?;
-                    Ok(bufs.cycle(&ctx, &mut passes, llk, &mut run.cycle)?)
+            self.summing(|dev| {
+                let (ctx, nframe) = (dev.context(), dev.dims().nframe);
+                match &run.graph {
+                    Some(c) => c.replay(&mut dev.ring, &ctx, nframe, tag),
+                    None => {
+                        let records = run.cycle.records();
+                        let (mut bufs, mut passes, ring) = dev.lend();
+                        let llk = records
+                            .then(|| ring.record(&ctx, tag, nframe))
+                            .transpose()?;
+                        Ok(bufs.cycle(&ctx, &mut passes, llk, &mut run.cycle)?)
+                    }
                 }
             })
         });
@@ -3214,24 +3262,25 @@ impl Device {
     }
 
     /// Enqueues the LLK record of the current estimate under `tag`: with graphs, from the
-    /// LLK pass's graph, captured first if its buffers were replaced since; eagerly without.
+    /// LLK pass's graph, captured first while its capture is pending, which a failed capture
+    /// leaves pending; eagerly without.
     pub fn llk_pass(&mut self, tag: Tag) -> Result<(), EngineError> {
-        if self.llk_graph.is_none() {
-            self.capture_llk()?;
-        }
-        let graph = self.llk_graph.take();
-        let done = match &graph {
-            Some(c) => self.replay(c, tag),
-            None => {
-                let (ctx, nframe) = (self.context(), self.dims().nframe);
+        let (ctx, nframe) = (self.context(), self.dims().nframe);
+        match &self.graphs {
+            Graphs::Off => {
                 let (mut bufs, mut passes, ring) = self.lend();
                 ring.record(&ctx, tag, nframe)
                     .map_err(EngineError::from)
                     .and_then(|rec| Ok(bufs.forward_llk(&ctx, &mut passes, rec)?))
             }
-        };
-        self.llk_graph = graph;
-        done
+            Graphs::On { llk: Some(c) } => c.replay(&mut self.ring, &ctx, nframe, tag),
+            Graphs::On { llk: None } => {
+                let c = self.capture_llk()?;
+                let done = c.replay(&mut self.ring, &ctx, nframe, tag);
+                self.graphs = Graphs::On { llk: Some(c) };
+                done
+            }
+        }
     }
 
     /// The LLK records counted since the last flush, in order; waits for their copies.
@@ -3294,13 +3343,12 @@ impl Device {
                 Cycle::Lsqml { params, pre }
             }
         };
-        let graph = if self.use_graph {
-            Some(self.capture(|bufs, passes, ring, ended, ctx| {
+        let graph = match self.graphs {
+            Graphs::On { .. } => Some(self.capture(|bufs, passes, ring, ended, ctx| {
                 let llk = cycle.records().then(|| ring.capture(ended));
                 bufs.cycle(ctx, passes, llk, &mut cycle)
-            })?)
-        } else {
-            None
+            })?),
+            Graphs::Off => None,
         };
         Ok(EpochRun { cycle, graph })
     }
@@ -3505,24 +3553,13 @@ impl Device {
         ) -> Result<(), GpuError>
         + Send,
     ) -> Result<Captured, EngineError> {
+        fault::at(fault::Exit::Capture)?;
         let side = self.kernels.context().new_stream()?;
         let (mut bufs, mut passes, ring) = self.lend();
         let mut ended = None;
         let op = crate::gpu::record(|ctx| f(&mut bufs, &mut passes, ring, &mut ended, ctx));
         let graph = CudaGraph::capture(side, op).map_err(GpuError::from)?;
         Ok(Captured { graph, ended })
-    }
-
-    /// Enqueues `c`'s graph on the stream, counting the record it ends, if any, under `tag`.
-    fn replay(&mut self, c: &Captured, tag: Tag) -> Result<(), EngineError> {
-        let (ctx, nframe) = (self.context(), self.dims().nframe);
-        // SAFETY: the context holds the replay's leases on every captured buffer until the
-        // stream has run it, so no other stream can touch them meanwhile.
-        let launch = || Ok(unsafe { c.graph.launch().execute(&ctx) }.map_err(GpuError::from)?);
-        match &c.ended {
-            Some(ended) => self.ring.replay(&ctx, ended, tag, nframe, launch),
-            None => launch(),
-        }
     }
 }
 
@@ -3675,7 +3712,7 @@ mod tests {
                 }
                 e
             });
-            let r = failed.dev.dev.summing(|dev| {
+            let r = failed.dev.ungated().summing(|dev| {
                 for sums in [&mut dev.obj_sums, &mut dev.probe_sums] {
                     let num = vec![C32 { re: 1.0, im: 1.0 }; sums.num.len()];
                     sums.num.copy_from_host(&dev.stream, &num)?;
@@ -3754,7 +3791,7 @@ mod tests {
                 e.bh(&params, 1, 1).unwrap();
                 e
             });
-            let r = failed.dev.dev.summing(|dev| {
+            let r = failed.dev.ungated().summing(|dev| {
                 let bh = dev.bh_state.as_deref_mut().expect("BH's state");
                 let g = &mut bh.sliced.as_mut().expect("two slices").grads()[0];
                 let num = vec![C32 { re: 1.0, im: 1.0 }; g.num.len()];
@@ -3806,7 +3843,7 @@ mod tests {
             first: true,
             llk: false,
         };
-        let r = e.dev.dev.steady_with(epoch, 0, |dev| {
+        let r = e.dev.ungated().steady_with(epoch, 0, |dev| {
             let (lens, dims) = ([dev.obj.len(), dev.probe.len()], dev.dims());
             let one = dev.one_slice("ML")?;
             let none = PositionScratch::None;

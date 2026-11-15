@@ -26,6 +26,7 @@ mod ap;
 mod bh;
 mod device;
 mod dm;
+mod gate;
 mod lsqml;
 mod ml;
 mod propagate;
@@ -46,6 +47,7 @@ use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 
 use device::{Bufs, Device, NormBufs, OneSlice, PassesMut, SliceUploads, Sliced, Uploads};
+use gate::Gated;
 
 use crate::engine::ptycho::{Algorithm, LlkRecord, zero_phase_ramp};
 use crate::engine::{
@@ -518,55 +520,6 @@ pub struct GpuPtycho {
     history: Vec<LlkRecord>,
 }
 
-/// The [`Device`] behind the gate of [`GpuPtycho`]'s calls: aborted from the first failure
-/// of a call through [`Self::change`] on. A call's checks, with what it builds before it
-/// changes anything, run through the gate too, after its refusal, so an aborted engine
-/// answers [`EngineError::Aborted`] whatever the arguments.
-struct Gated {
-    dev: Device,
-    aborted: bool,
-}
-
-impl Gated {
-    /// `f`, which may leave the device part-changed when it fails, on what `check` built:
-    /// aborted while `f` runs, so its failure leaves the gate aborted.
-    fn change<T, R>(
-        &mut self,
-        check: impl FnOnce(&Device) -> Result<T, EngineError>,
-        f: impl FnOnce(&mut Device, T) -> Result<R, EngineError>,
-    ) -> Result<R, EngineError> {
-        let built = check(self.checked()?)?;
-        self.aborted = true;
-        let r = f(&mut self.dev, built)?;
-        self.aborted = false;
-        Ok(r)
-    }
-
-    /// `f`, which leaves the device's state as it found it, failed or not, after `check`: it
-    /// never aborts.
-    fn read<R>(
-        &mut self,
-        check: impl FnOnce(&Device) -> Result<(), EngineError>,
-        f: impl FnOnce(&mut Device) -> Result<R, EngineError>,
-    ) -> Result<R, EngineError> {
-        check(self.checked()?)?;
-        f(&mut self.dev)
-    }
-
-    /// The device, refused once a call through [`Self::change`] has failed.
-    fn checked(&self) -> Result<&Device, EngineError> {
-        if self.aborted {
-            return Err(EngineError::Aborted);
-        }
-        Ok(&self.dev)
-    }
-
-    /// The device unchecked, for a read-back, which also runs once aborted.
-    fn unchecked(&self) -> &Device {
-        &self.dev
-    }
-}
-
 /// Fails unless an object of `dims` held in `len` values is the shape `have` of the current
 /// object.
 fn object_fits(have: [usize; 3], dims: [usize; 3], len: usize) -> Result<(), EngineError> {
@@ -770,10 +723,7 @@ impl GpuPtycho {
         let sampling = Sampling::auto(optics, object.plane_shape(), g.frame);
         let dev = Device::new(ctx, dims, uploads, options, sampling)?;
         Ok(Self {
-            dev: Gated {
-                dev,
-                aborted: false,
-            },
+            dev: Gated::new(dev),
             obj_dims: object.dims(),
             probe_dims: probe.dims(),
             total_obs: scan.counts.total(),
@@ -999,7 +949,7 @@ impl Bufs<'_> {
                         counts: self.counts,
                         obj: obj.first,
                         probe: self.probe,
-                        model: m.model,
+                        model: m.model(),
                     };
                     let far = FarSums {
                         llk: Some(&mut *self.llk),
@@ -1046,7 +996,7 @@ impl Bufs<'_> {
                 counts: self.counts,
                 obj,
                 probe: self.probe,
-                model: m.model,
+                model: m.model(),
             };
             let far = m.far(llk.is_some().then_some(&mut *self.llk));
             self.kernels.fused_llk(ctx, &inputs, stack, f, far)?;
@@ -1741,6 +1691,76 @@ mod tests {
                     grads(&mut e) == grads(&mut fresh),
                     "fused {fused}: the gradients"
                 );
+            }
+        }
+
+        /// An engine with graphs and a held position, whose buffers left the LLK pass's
+        /// capture pending.
+        fn pending(ctx: &Arc<CudaContext>) -> GpuPtycho {
+            let offsets = (0..36).map(|f| [0.1 * (f % 3) as f64 - 0.1, 0.05]);
+            let held = Features {
+                position: Some(Feature::held(offsets.collect())),
+                ..Features::default()
+            };
+            let mut e = engine(ctx, true, true);
+            e.set_features(&held).unwrap();
+            e
+        }
+
+        /// An LLK read failing its pending capture leaves the engine open and the capture
+        /// pending: the next read tries it again, the one that captures it is replayed by the
+        /// one after, and LLK and AP after it are bit for bit a fresh engine's.
+        #[test]
+        fn an_llk_read_failing_its_capture_leaves_the_engine_open() {
+            let ctx = ctx();
+            let [mut e, mut fresh] = [(); 2].map(|()| pending(&ctx));
+            let armed = fault::arm(Exit::Capture, 0);
+            let r = e.llk();
+            assert!(armed.fired());
+            assert!(refused(&r), "{r:?}");
+            drop(armed);
+            let armed = fault::arm(Exit::Capture, 0);
+            let r = e.llk();
+            assert!(
+                armed.fired() && refused(&r),
+                "the capture stayed pending: {r:?}"
+            );
+            drop(armed);
+            let llk = |e: &mut GpuPtycho| {
+                let l = e.llk().unwrap();
+                [l.poisson, l.gaussian, l.euclidian, l.nb_photons_calc].map(f64::to_bits)
+            };
+            assert_eq!(llk(&mut e), llk(&mut fresh), "the LLK");
+            let armed = fault::arm(Exit::Capture, 0);
+            assert_eq!(llk(&mut e), llk(&mut fresh), "the replayed LLK");
+            assert!(!armed.fired(), "the LLK pass captured again");
+            drop(armed);
+            for e in [&mut e, &mut fresh] {
+                e.ap(&ap(false), 1).unwrap();
+            }
+            assert!(arrays(&e) == arrays(&fresh), "the arrays");
+        }
+
+        /// An algorithm call failing a capture aborts: AP at its run's, rPIE at its LLK
+        /// pass's, pending, after its run's.
+        #[test]
+        fn a_call_failing_its_capture_aborts() {
+            let ctx = ctx();
+            let rpie = RpieParams {
+                calc_llk: 1,
+                ..RpieParams::default()
+            };
+            for (what, pass) in [("ap", 0), ("rpie", 1)] {
+                let mut e = pending(&ctx);
+                let armed = fault::arm(Exit::Capture, pass);
+                let r = match what {
+                    "ap" => e.ap(&ap(false), 1),
+                    _ => e.rpie(&rpie, 1),
+                };
+                assert!(armed.fired(), "{what}");
+                assert!(refused(&r), "{what}: {r:?}");
+                drop(armed);
+                aborted(&mut e, what);
             }
         }
     }
