@@ -449,7 +449,7 @@ fn conv3x3(x: CubeTensor, wk: CubeTensor, bias: Option<CubeTensor>) -> CubeTenso
     if [n, h, w, b].contains(&0) {
         return y;
     }
-    let x = into_contiguous(x);
+    let (x, bias) = (into_contiguous(x), bias.map(into_contiguous));
     let groups = b.div_ceil(PER).next_power_of_two().min(GROUPS);
     let chunk = groups.min(32 / x.dtype.size());
     let (across, down) = (w.div_ceil(COLS), h.div_ceil(ROWS));
@@ -947,7 +947,7 @@ mod tests {
     use burn::module::Param;
     use burn::nn::conv::Conv2dConfig;
     use burn::tensor::ops::PadMode;
-    use burn::tensor::{DType, Distribution};
+    use burn::tensor::{DType, Distribution, TensorData};
 
     use crate::worst::worst_of;
 
@@ -1256,6 +1256,23 @@ mod tests {
         Tensor::<D>::empty(shape, (&crate::nn::cuda(0), DType::F32))
             .try_into_primitive::<CubeBackend>()
             .unwrap()
+    }
+
+    /// The kernel reads the bias by channel from its buffer, so a bias that is a view, here one
+    /// element of three seen twice, is packed first.
+    #[test]
+    fn bias_seen_through_strides() {
+        let device = crate::nn::cuda(0);
+        let bias = Tensor::<1>::from_data(TensorData::new(vec![5.0f32, 7.0, 0.0], [3]), &device)
+            .narrow(0, 0, 1)
+            .expand([2])
+            .try_into_primitive::<CubeBackend>()
+            .unwrap();
+        let y = forward(broadcast([1, 1, 1, 1]), broadcast([2, 1, 3, 3]), Some(bias));
+        assert_eq!(
+            host(Tensor::<4>::from_primitive::<CubeBackend>(y)),
+            [6.0, 6.0]
+        );
     }
 
     /// A launch with nothing to write does not launch, so an empty tensor with a dimension of 2³²
