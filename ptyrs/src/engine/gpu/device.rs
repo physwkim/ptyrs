@@ -2723,8 +2723,8 @@ impl Device {
         Ok(())
     }
 
-    /// Whether some feature takes a step from far sums: the scale or the background.
-    pub fn has_stepped(&self) -> bool {
+    /// Whether an intensity scale or a detector background is modelled, refined or held.
+    pub fn models_scale_or_background(&self) -> bool {
         let f = &self.features;
         f.scale.is_some() || f.background.is_some()
     }

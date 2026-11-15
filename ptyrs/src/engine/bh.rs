@@ -615,7 +615,7 @@ impl Bh {
     pub fn with_features(self, features: Features) -> Result<Self, EngineError> {
         if features.scale.is_some() || features.background.is_some() {
             return Err(EngineError::Invalid(
-                "BH refines no intensity scale or background, as pty-chi's".into(),
+                "BH models no intensity scale or background, as pty-chi's".into(),
             ));
         }
         if let Some(d) = features.offsets()

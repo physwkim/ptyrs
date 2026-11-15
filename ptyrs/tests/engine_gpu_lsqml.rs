@@ -437,7 +437,7 @@ fn lsqml_restarts_and_rejects() {
         gpu.set_features(&features).unwrap();
         let err = gpu.lsqml(&params, 1, 0).unwrap_err().to_string();
         assert!(
-            err.contains("LSQML refines no intensity scale or background"),
+            err.contains("LSQML models no intensity scale or background"),
             "{features:?}: {err}"
         );
     }

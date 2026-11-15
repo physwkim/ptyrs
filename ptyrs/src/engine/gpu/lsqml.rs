@@ -67,9 +67,9 @@ impl GpuPtycho {
         calc_llk: usize,
     ) -> Result<(), EngineError> {
         params.validate()?;
-        if self.dev.has_stepped() {
+        if self.dev.models_scale_or_background() {
             return Err(EngineError::Invalid(
-                "LSQML refines no intensity scale or background, as pty-chi's".into(),
+                "LSQML models no intensity scale or background, as pty-chi's".into(),
             ));
         }
         let nframe = self.dev.dims().nframe as usize;

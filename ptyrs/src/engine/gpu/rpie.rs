@@ -34,7 +34,7 @@ impl GpuPtycho {
             ));
         }
         params.validate()?;
-        if self.dev.has_stepped() {
+        if self.dev.models_scale_or_background() {
             return Err(EngineError::Invalid(
                 "rPIE models no intensity scale or background".into(),
             ));
