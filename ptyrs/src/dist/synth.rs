@@ -159,7 +159,6 @@ struct Dev {
     partials: DeviceBuffer<f64>,
     scratch: DeviceBuffer<f64>,
     scalars: DeviceBuffer<f64>,
-    tables: Option<Tables>,
 }
 
 impl Dev {
@@ -206,7 +205,6 @@ impl Dev {
             partials: DeviceBuffer::zeroed(s, 2 * lay.nown())?,
             scratch: DeviceBuffer::zeroed(s, tree_scratch_len(grid.len(), 2))?,
             scalars: DeviceBuffer::zeroed(s, 2 * ITERS)?,
-            tables: None,
         })
     }
 
@@ -215,6 +213,7 @@ impl Dev {
         &self,
         g: &mut crate::dist::Gpu,
         part: &Partition,
+        tabs: &Tables,
         pull: impl Fn(usize) -> bool,
     ) -> Result<(Vec<f32>, Vec<f64>), DistError> {
         let s = g.stream().clone();
@@ -223,7 +222,6 @@ impl Dev {
         let tt = tile * tile;
         let [fy, fx] = part.frame().map(|v| v as u32);
         let ntx = grid.dims()[1] as u32;
-        let tabs = self.tables.as_ref().ok_or(DistError::Aborted)?;
         for it in 0..ITERS {
             if pull(it) {
                 let dst = self.obj.cu_deviceptr() + (self.nown as u64) * u64::from(tt) * 4;
@@ -329,17 +327,19 @@ fn device(
     let frames = Arc::new(frame_sources(part, &lay, &base(1), (fy * fx * 4) as u64));
     let leaves = Arc::new(tile_sources(part, &lay, &base(2), 16));
     let halo: Arc<Vec<Vec<u64>>> = Arc::new(lay.iter().map(|l| l.halo_sources(&tiles)).collect());
-    w.run(move |g, d| {
+    let p = part.clone();
+    let out = w.run(move |g, d| {
         let s = g.stream();
-        d.tables = Some(Tables {
+        let tabs = Tables {
             halo: DeviceBuffer::from_host(s, &halo[g.region()])?,
             frames: DeviceBuffer::from_host(s, &frames)?,
             leaves: DeviceBuffer::from_host(s, &leaves)?,
-        });
-        Ok(())
+        };
+        let out = d.iterate(g, &p, &tabs, pull);
+        // The kernels read `tabs` by raw pointer: drain them, failed or not, before it drops.
+        let drained = g.synchronize();
+        out.and_then(|o| drained.map(|()| o))
     })?;
-    let p = part.clone();
-    let out = w.run(move |g, d| d.iterate(g, &p, pull))?;
     let grid = part.grid();
     let tt = tt as usize;
     let mut obj = vec![0u32; grid.len() * tt];
