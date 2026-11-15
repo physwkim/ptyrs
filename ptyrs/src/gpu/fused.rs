@@ -33,7 +33,7 @@ use ptyrs_kernels::fused::{
 use ptyrs_kernels::pixel::{PIXEL_THREADS, PsiPtr, SumPtrs, psi_f32};
 use ptyrs_kernels::position::BatchSpan;
 
-use crate::gpu::opr::OwnModes;
+use crate::gpu::opr::{FrameProbe, OwnModes};
 use crate::gpu::ops::grid_1d;
 use crate::gpu::position::span;
 use crate::gpu::psi::check_waves;
@@ -949,7 +949,7 @@ impl Kernels {
                 if obj_sums.is_some() {
                     run.probe_terms(bufs, p)?;
                 }
-                run.rows_fwd(bufs, carried, p, fwd)?;
+                run.rows_fwd(bufs, FrameProbe::Shared(run.inputs.probe), carried, p, fwd)?;
             }
         }
         run.stage(&bufs.work, false)?;
@@ -1119,12 +1119,44 @@ impl Kernels {
         bufs: &mut FusedBufs,
         far: FarSums<'_>,
     ) -> Result<(), Error> {
+        self.llk_on(ctx, inputs, None, stack, bufs, far)
+    }
+
+    /// [`Self::fused_llk`] with each frame's mode 0 its plane of `own` (the LLK of the probe
+    /// variation's model). Refuses a [`Model::shift`], whose spectrum is then the frames'
+    /// only probe source: [`Self::own_spectrum`] gives it their own modes.
+    pub fn fused_llk_own(
+        &self,
+        ctx: &ExecutionContext,
+        inputs: &FusedInputs<'_>,
+        own: &OwnModes<'_>,
+        stack: StackRef<'_>,
+        bufs: &mut FusedBufs,
+        far: FarSums<'_>,
+    ) -> Result<(), Error> {
+        self.llk_on(ctx, inputs, Some(own), stack, bufs, far)
+    }
+
+    fn llk_on(
+        &self,
+        ctx: &ExecutionContext,
+        inputs: &FusedInputs<'_>,
+        own: Option<&OwnModes<'_>>,
+        stack: StackRef<'_>,
+        bufs: &mut FusedBufs,
+        far: FarSums<'_>,
+    ) -> Result<(), Error> {
         let bufs = &*bufs;
         let (run, shift) = Run::new(self, ctx, *inputs, stack, bufs)?;
         run.check_far(&far)?;
         let p = run.ptrs(bufs, &far);
-        match &shift {
-            Some(sh) => {
+        match (&shift, own) {
+            (Some(_), Some(_)) => {
+                return Err(Error::Shape(
+                    "own probe modes under a Model::shift: its spectrum carries them".into(),
+                ));
+            }
+            (Some(sh), None) => {
                 run.shift_pre(&sh.model, &sh.model.spectrum, &sh.scratch.t, None, p)?;
                 run.shift_rows_fwd(
                     &sh.scratch.t,
@@ -1134,7 +1166,13 @@ impl Kernels {
                     FusedCfg::default(),
                 )?;
             }
-            None => run.rows_fwd(bufs, Carried::default(), p, FusedCfg::default())?,
+            (None, own) => {
+                let probe = match own {
+                    None => FrameProbe::Shared(inputs.probe),
+                    Some(own) => FrameProbe::Own(inputs.probe, own),
+                };
+                run.rows_fwd(bufs, probe, Carried::default(), p, FusedCfg::default())?;
+            }
         }
         run.stage(&bufs.work, false)?;
         run.rows_llk(&bufs.work, bufs, far, p)
@@ -1790,10 +1828,11 @@ impl<'a> Run<'a> {
         })
     }
 
-    /// Pass A into `bufs.work`; reads and writes the `carried` sets `cfg` names.
+    /// Pass A into `bufs.work` on `probe`; reads and writes the `carried` sets `cfg` names.
     fn rows_fwd(
         &self,
         bufs: &FusedBufs,
+        probe: FrameProbe<'_>,
         carried: Carried<'_>,
         p: FusedPtrs,
         cfg: FusedCfg,
@@ -1803,14 +1842,14 @@ impl<'a> Run<'a> {
         let (sets, mut writes) = carried.fwd_access(cfg.flags);
         let mut reads = vec![
             self.inputs.obj.storage(),
-            self.inputs.probe.storage(),
             self.inputs.views.addr().storage(),
             self.stack.storage(),
         ];
+        reads.extend(probe.storages());
         reads.extend(sets);
         writes.push(bufs.work.storage());
         let (ctl, g, half) = (self.ctl(), self.g, carried.half());
-        let probe = shared_probe(p.probe);
+        let probe = probe.src(self.inputs.views.dims().n())?;
         self.k.launch(self.ctx, &reads, &writes, |stream| {
             let m = &self.k.module;
             // SAFETY: `Run::new` and the caller checked every buffer the flags name;
