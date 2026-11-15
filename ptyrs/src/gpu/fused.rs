@@ -1070,7 +1070,7 @@ impl Kernels {
                 if obj_sums.is_some() {
                     run.probe_terms(bufs, p)?;
                 }
-                run.rows_fwd(bufs, FrameProbe::Shared(run.inputs.probe), carried, p, fwd)?;
+                run.rows_fwd(bufs, carried, p, fwd)?;
             }
         }
         run.stage(&bufs.work, false)?;
@@ -1289,13 +1289,8 @@ impl Kernels {
                     FusedCfg::default(),
                 )?;
             }
-            (None, own) => {
-                let probe = match own {
-                    None => FrameProbe::Shared(inputs.probe),
-                    Some(own) => FrameProbe::Own(inputs.probe, own),
-                };
-                run.rows_fwd(bufs, probe, Carried::default(), p, FusedCfg::default())?;
-            }
+            (None, None) => run.rows_fwd(bufs, Carried::default(), p, FusedCfg::default())?,
+            (None, Some(own)) => run.rows_fwd_own(bufs, own, p)?,
         }
         run.stage(&bufs.work, false)?;
         run.rows_llk(&bufs.work, bufs, far, p)
@@ -1995,11 +1990,10 @@ impl<'a> Run<'a> {
         })
     }
 
-    /// Pass A into `bufs.work` on `probe`; reads and writes the `carried` sets `cfg` names.
+    /// Pass A into `bufs.work`; reads and writes the `carried` sets `cfg` names.
     fn rows_fwd(
         &self,
         bufs: &FusedBufs,
-        probe: FrameProbe<'_>,
         carried: Carried<'_>,
         p: FusedPtrs,
         cfg: FusedCfg,
@@ -2009,14 +2003,13 @@ impl<'a> Run<'a> {
         let (sets, mut writes) = carried.fwd_access(cfg.flags);
         let mut reads = vec![
             self.inputs.obj.storage(),
+            self.inputs.probe.storage(),
             self.inputs.views.addr().storage(),
             self.stack.storage(),
         ];
-        reads.extend(probe.storages());
         reads.extend(sets);
         writes.push(bufs.work.storage());
         let (ctl, g, half) = (self.ctl(), self.g, carried.half());
-        let probe = probe.src(self.inputs.views.dims().n())?;
         self.k.launch(self.ctx, &reads, &writes, |stream| {
             let m = &self.k.module;
             // SAFETY: `Run::new` and the caller checked every buffer the flags name;
@@ -2024,30 +2017,48 @@ impl<'a> Run<'a> {
             // launch is the one `rows_fwd` documents.
             unsafe {
                 match (self.sh.nx, half) {
-                    (Side::N64, false) => {
-                        m.fused_rows_fwd_64(stream, config, p, probe, ctl, g, cfg)
-                    }
-                    (Side::N128, false) => {
-                        m.fused_rows_fwd_128(stream, config, p, probe, ctl, g, cfg)
-                    }
-                    (Side::N256, false) => {
-                        m.fused_rows_fwd_256(stream, config, p, probe, ctl, g, cfg)
-                    }
-                    (Side::N512, false) => {
-                        m.fused_rows_fwd_512(stream, config, p, probe, ctl, g, cfg)
-                    }
-                    (Side::N64, true) => {
-                        m.fused_rows_fwd_f16_64(stream, config, p, probe, ctl, g, cfg)
-                    }
-                    (Side::N128, true) => {
-                        m.fused_rows_fwd_f16_128(stream, config, p, probe, ctl, g, cfg)
-                    }
-                    (Side::N256, true) => {
-                        m.fused_rows_fwd_f16_256(stream, config, p, probe, ctl, g, cfg)
-                    }
-                    (Side::N512, true) => {
-                        m.fused_rows_fwd_f16_512(stream, config, p, probe, ctl, g, cfg)
-                    }
+                    (Side::N64, false) => m.fused_rows_fwd_64(stream, config, p, ctl, g, cfg),
+                    (Side::N128, false) => m.fused_rows_fwd_128(stream, config, p, ctl, g, cfg),
+                    (Side::N256, false) => m.fused_rows_fwd_256(stream, config, p, ctl, g, cfg),
+                    (Side::N512, false) => m.fused_rows_fwd_512(stream, config, p, ctl, g, cfg),
+                    (Side::N64, true) => m.fused_rows_fwd_f16_64(stream, config, p, ctl, g, cfg),
+                    (Side::N128, true) => m.fused_rows_fwd_f16_128(stream, config, p, ctl, g, cfg),
+                    (Side::N256, true) => m.fused_rows_fwd_f16_256(stream, config, p, ctl, g, cfg),
+                    (Side::N512, true) => m.fused_rows_fwd_f16_512(stream, config, p, ctl, g, cfg),
+                }
+            }
+        })
+    }
+
+    /// Pass A into `bufs.work` with each frame's mode 0 its plane of `own`: no carried
+    /// waves, and f32 alone, the only build of the own source.
+    fn rows_fwd_own(
+        &self,
+        bufs: &FusedBufs,
+        own: &OwnModes<'_>,
+        p: FusedPtrs,
+    ) -> Result<(), Error> {
+        let cfg = self.walk(FusedCfg::default());
+        let config = self.sh.rows(&self.g, true)?;
+        let probe = FrameProbe::Own(self.inputs.probe, own);
+        let mut reads = vec![
+            self.inputs.obj.storage(),
+            self.inputs.views.addr().storage(),
+            self.stack.storage(),
+        ];
+        reads.extend(probe.storages());
+        let writes = [bufs.work.storage()];
+        let src = own.src(self.inputs.probe, self.inputs.views.dims().n())?;
+        let (ctl, g) = (self.ctl(), self.g);
+        self.k.launch(self.ctx, &reads, &writes, |stream| {
+            let m = &self.k.module;
+            // SAFETY: as in `rows_fwd`; `OwnModes::src` checked `own` holds `nb ≥ 1` planes.
+            unsafe {
+                match self.sh.nx {
+                    Side::N64 => m.fused_rows_fwd_own_64(stream, config, p, src, ctl, g, cfg),
+                    Side::N128 => m.fused_rows_fwd_own_128(stream, config, p, src, ctl, g, cfg),
+                    Side::N256 => m.fused_rows_fwd_own_256(stream, config, p, src, ctl, g, cfg),
+                    Side::N512 => m.fused_rows_fwd_own_512(stream, config, p, src, ctl, g, cfg),
                 }
             }
         })

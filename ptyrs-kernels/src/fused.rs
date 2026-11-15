@@ -271,6 +271,35 @@ pub unsafe fn load_probe(src: ProbeSrc, m: u32, pos: u32, n: usize, i: usize) ->
     unsafe { load_c(probe_plane(src, m, pos, n), i) }
 }
 
+/// The probe source of a [`rows_fwd`] build. A type parameter rather than a [`ProbeSrc`] for
+/// every build: the shared probe's read must stay one indexed load, since the per-frame
+/// address of [`load_probe`] costs the f16 row kernels registers and blocks per SM.
+pub trait RowProbe: Copy {
+    /// Pixel `i` of mode `m` at the epoch position `pos()`, planes of `n` pixels. A source
+    /// the frame does not change never calls `pos`, so its build keeps no trace of it.
+    ///
+    /// # Safety
+    ///
+    /// The source holds mode `m`, at `pos()`, and `i < n`.
+    unsafe fn load(self, m: u32, pos: impl FnOnce() -> u32, n: usize, i: usize) -> (f32, f32);
+}
+
+/// A probe `[nprobe, ny, nx]` every frame shares.
+#[derive(Clone, Copy, Debug)]
+pub struct SharedProbe(pub *const f32);
+
+impl RowProbe for SharedProbe {
+    unsafe fn load(self, m: u32, _: impl FnOnce() -> u32, n: usize, i: usize) -> (f32, f32) {
+        unsafe { load_c(self.0, m as usize * n + i) }
+    }
+}
+
+impl RowProbe for ProbeSrc {
+    unsafe fn load(self, m: u32, pos: impl FnOnce() -> u32, n: usize, i: usize) -> (f32, f32) {
+        unsafe { load_probe(self, m, pos(), n, i) }
+    }
+}
+
 /// Bytes of [`cols`]' reduction slots under `flags` for columns of `ny`: a row of
 /// `FUSED_COLS * ny / fft_ept(ny)` f32 per LLK term, and per scale sum under `FUSED_SCALE_SUMS`.
 #[device]
@@ -408,17 +437,17 @@ unsafe fn row_fft_at<const NX: u32, const INV: bool>(
 ///
 /// # Safety
 ///
-/// `NX == g.nx`; the buffers it reads and writes hold their shapes for `g`, `probe` as
-/// [`ProbeSrc`] says; `ctl` one entry; launch as above.
+/// `NX == g.nx`; the buffers it reads and writes hold their shapes for `g`, `probe` the
+/// stack's frames' modes; `ctl` one entry; launch as above.
 #[device]
-pub unsafe fn rows_fwd<const NX: u32, const HALF: bool>(
+pub unsafe fn rows_fwd<const NX: u32, const HALF: bool, P: RowProbe>(
     p: FusedPtrs,
-    probe: ProbeSrc,
+    probe: P,
     ctl: *const StackCtl,
     g: StackGeom,
     cfg: FusedCfg,
 ) {
-    unsafe { rows_fwd_with::<NX, HALF>(p, Some(probe), ctl, g, cfg) }
+    unsafe { rows_fwd_with::<NX, false, HALF, P>(p, probe, ctl, g, cfg) }
 }
 
 /// [`rows_fwd`] with the shifted probe: `W_p = IDFT_x(T)` of the stored row of plane `fl *
@@ -436,14 +465,16 @@ pub unsafe fn shift_rows_fwd<const NX: u32, const HALF: bool>(
     g: StackGeom,
     cfg: FusedCfg,
 ) {
-    unsafe { rows_fwd_with::<NX, HALF>(p, None, ctl, g, cfg) }
+    let probe = SharedProbe(core::ptr::null());
+    unsafe { rows_fwd_with::<NX, true, HALF, SharedProbe>(p, probe, ctl, g, cfg) }
 }
 
-/// [`rows_fwd`] with `P q` from `probe`, or with `None` [`shift_rows_fwd`].
+/// [`rows_fwd`] with `P q` from `probe`, or under `SHIFT` [`shift_rows_fwd`], which reads no
+/// `probe`.
 #[device]
-unsafe fn rows_fwd_with<const NX: u32, const HALF: bool>(
+unsafe fn rows_fwd_with<const NX: u32, const SHIFT: bool, const HALF: bool, P: RowProbe>(
     p: FusedPtrs,
-    probe: Option<ProbeSrc>,
+    probe: P,
     ctl: *const StackCtl,
     g: StackGeom,
     cfg: FusedCfg,
@@ -467,7 +498,7 @@ unsafe fn rows_fwd_with<const NX: u32, const HALF: bool>(
     let mut r = [0.0f32; 2 * FFT_EPT_MAX as usize];
     unsafe {
         let v = *p.views.add((f0 * g.nmode + kl) as usize);
-        if probe.is_none() {
+        if SHIFT {
             let plane = (kl / g.nmode * g.nprobe + v.probe) as usize * n;
             #[unroll]
             for i in 0..ept {
@@ -483,13 +514,12 @@ unsafe fn rows_fwd_with<const NX: u32, const HALF: bool>(
             let xs = t + i * tpf;
             let x = (xs + nx / 2) % nx;
             let o = sample_obj(p.obj, v, y, x, g.nyo, g.nxo);
-            let mut w = match probe {
-                None => cmul(o, (r[2 * i as usize], r[2 * i as usize + 1])),
-                Some(probe) => {
-                    let at = (y * nx + x) as usize;
-                    let pr = load_probe(probe, v.probe, f0 + kl / g.nmode, n, at);
-                    cmul(cmul(o, pr), quad_phase(g.quad, y, x, ny, nx))
-                }
+            let mut w = if SHIFT {
+                cmul(o, (r[2 * i as usize], r[2 * i as usize + 1]))
+            } else {
+                let at = (y * nx + x) as usize;
+                let pr = probe.load(v.probe, || f0 + kl / g.nmode, n, at);
+                cmul(cmul(o, pr), quad_phase(g.quad, y, x, ny, nx))
             };
             if dm {
                 let s = load_psi::<HALF>(p.psi, row + xs as usize);
