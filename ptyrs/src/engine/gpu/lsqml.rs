@@ -19,7 +19,7 @@ use crate::gpu::{
     BhScan, C32, EpochOrder, Error as GpuError, FrameWaves, FusedInputs, Kernels, LSQML_REC,
     LsqmlAt, LsqmlChi, LsqmlKernels, LsqmlNoise, LsqmlScan, LsqmlVar, Model, PositionRule,
     Positions, PsiSums, ShiftProbe, SliceSource, SliceSteps, Solve, StackRef, StackTable,
-    UpdateSums, Views,
+    UpdateSums, ViewDims, Views,
 };
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaStream, DeviceBuffer};
@@ -150,14 +150,13 @@ impl Reading {
     }
 }
 
-/// [`Reading::Windows`]' sampler, the views on its windows and what a batch samples.
+/// [`Reading::Windows`]' views on its windows and what a batch samples through the
+/// device's sampler, which takes the spectra it lends of one slice at the batch's start,
+/// then of each object direction.
 struct Windows {
     kernels: Kernels,
-    sampler: ObjectSampler,
     /// [`window_views`] of the stacks, which read `win`.
     views: Views,
-    /// The spectra of one slice at the batch's start, then of each object direction.
-    spectra: DeviceBuffer<C32>,
     /// Per stack of a batch, every slice's windows.
     win: Vec<Vec<DeviceBuffer<C32>>>,
     /// A stack's object sums on its windows, which the sampler places on the object.
@@ -171,24 +170,20 @@ struct Windows {
     illum: DeviceBuffer<f32>,
 }
 
-/// Object planes per sampler pass.
-const CHUNK: u32 = 4;
-
 impl Windows {
-    /// For `stacks` of the views `sampler` samples for, `slots` per batch of up to `nf_max`
-    /// frames each, through `nslice` slices.
+    /// For `stacks` of views of `dims`, `slots` per batch of up to `nf_max` frames each,
+    /// through `nslice` slices.
     fn new(
         stream: &Arc<CudaStream>,
         kernels: &Kernels,
-        sampler: ObjectSampler,
+        dims: &ViewDims,
         stacks: &[Frames],
         slots: usize,
         nf_max: u32,
         nslice: usize,
     ) -> Result<Self, EngineError> {
-        let dims = *sampler.dims();
         let ranges: Vec<Range<u32>> = stacks.iter().map(|f| f.range.clone()).collect();
-        let views = window_views(stream, &dims, &ranges)?;
+        let views = window_views(stream, dims, &ranges)?;
         let len = views.dims().obj_len();
         let win = (0..slots)
             .map(|_| {
@@ -199,29 +194,28 @@ impl Windows {
             .collect::<Result<_, _>>()?;
         Ok(Self {
             kernels: kernels.clone(),
-            sampler,
-            spectra: DeviceBuffer::zeroed(stream, dims.obj_len())?,
             win,
             sums: UpdateSums::zeroed(stream, len)?,
             dir: DeviceBuffer::zeroed(stream, len)?,
-            deriv: DeviceBuffer::zeroed(stream, 2 * nf_max as usize * plane_len(&dims))?,
+            deriv: DeviceBuffer::zeroed(stream, 2 * nf_max as usize * plane_len(dims))?,
             illum: DeviceBuffer::zeroed(stream, dims.obj_len())?,
             views,
         })
     }
 
     /// The windows of `obj` as slice `i`'s, at each of a batch's stacks `at` in turn, the
-    /// object's spectra taken once for the batch.
+    /// object's spectra taken once for the batch into `spectra`.
     fn sample<'b>(
         &mut self,
         ctx: &ExecutionContext,
+        (sampler, spectra): (&mut ObjectSampler, &mut DeviceBuffer<C32>),
         at: impl IntoIterator<Item = StackPoints<'b>>,
         obj: &DeviceBuffer<C32>,
         i: usize,
     ) -> Result<(), GpuError> {
-        self.sampler.spectra(ctx, obj, &mut self.spectra)?;
+        sampler.spectra(ctx, obj, spectra)?;
         for (k, at) in at.into_iter().enumerate() {
-            (self.sampler).windows(ctx, at, &self.spectra, WINDOWS, &mut self.win[k][i])?;
+            sampler.windows(ctx, at, spectra, WINDOWS, &mut self.win[k][i])?;
         }
         Ok(())
     }
@@ -231,6 +225,7 @@ impl Windows {
     fn place(
         &mut self,
         ctx: &ExecutionContext,
+        sampler: &mut ObjectSampler,
         at: StackPoints<'_>,
         psi: &DeviceBuffer<C32>,
         probe: &DeviceBuffer<C32>,
@@ -239,18 +234,28 @@ impl Windows {
         crate::gpu::zero(ctx, &mut self.sums.den)?;
         crate::gpu::zero(ctx, &mut self.sums.num)?;
         (self.kernels).psi_to_obj(ctx, &self.views, at.stack, psi, probe, &mut self.sums)?;
-        self.sampler.place(ctx, at, &self.sums.num, 0, num)
+        sampler.place(ctx, at, &self.sums.num, 0, num)
     }
 
     /// The stack's windows at `at` of the object direction whose spectra `spectra` holds,
     /// into `dir`.
-    fn direction(&mut self, ctx: &ExecutionContext, at: StackPoints<'_>) -> Result<(), GpuError> {
-        (self.sampler).windows(ctx, at, &self.spectra, WINDOWS, &mut self.dir)
+    fn direction(
+        &mut self,
+        ctx: &ExecutionContext,
+        (sampler, spectra): (&mut ObjectSampler, &DeviceBuffer<C32>),
+        at: StackPoints<'_>,
+    ) -> Result<(), GpuError> {
+        sampler.windows(ctx, at, spectra, WINDOWS, &mut self.dir)
     }
 
     /// The derivatives along `y` then `x` of the stack's windows at `at` of object mode 0
     /// of the slice whose spectra `spectra` holds, into `deriv`.
-    fn derivatives(&mut self, ctx: &ExecutionContext, at: StackPoints<'_>) -> Result<(), GpuError> {
+    fn derivatives(
+        &mut self,
+        ctx: &ExecutionContext,
+        (sampler, spectra): (&mut ObjectSampler, &DeviceBuffer<C32>),
+        at: StackPoints<'_>,
+    ) -> Result<(), GpuError> {
         for (block, order) in [[1, 0], [0, 1]].into_iter().enumerate() {
             let block = WindowBlock {
                 slice: 0,
@@ -258,7 +263,7 @@ impl Windows {
                 modes: Modes::First,
                 block: block as u32,
             };
-            (self.sampler).windows(ctx, at, &self.spectra, block, &mut self.deriv)?;
+            sampler.windows(ctx, at, spectra, block, &mut self.deriv)?;
         }
         Ok(())
     }
@@ -355,8 +360,6 @@ impl LsqmlState {
         // accumulator and adds it (23, 24); a slice past the first takes its pair (8) instead.
         // A sampler call (25 to 27) writes the direction's windows for `dots` (28).
         let wave = wave_bytes(dims);
-        // The sampler, if any, before the rule: its calls hold the bytes it states.
-        let mut sampler = None;
         let streamed = match scratch {
             None => vec![Streamed::new(wave, 0..=4), Streamed::new(wave, 5..=6)],
             Some(MovedScratch {
@@ -374,14 +377,12 @@ impl LsqmlState {
                 s
             }
             Some(MovedScratch {
-                sampling: MovedSampling::FullObject { .. },
+                sampling: MovedSampling::FullObject { held, scratch, acc },
                 ..
             }) => {
                 let plane1 = plane_bytes::<C32>(dims, 1);
                 let win = plane_bytes::<C32>(dims, dims.nobj);
                 let den = plane_bytes::<f32>(dims, dims.nobj);
-                let s = sampler.insert(ObjectSampler::new(kernels, stream, *dims, 1, CHUNK)?);
-                let held = s.windows_held();
                 vec![
                     Streamed::fixed(held, 0..=2),
                     Streamed::new(wave, 3..=7),
@@ -392,8 +393,8 @@ impl LsqmlState {
                     Streamed::new(plane1, 14..=15),
                     Streamed::new(den, 16..=18),
                     Streamed::new(win, 17..=20),
-                    Streamed::fixed(s.acc_bytes(), 19..=24),
-                    Streamed::fixed(s.scratch_bytes(), 20..=22),
+                    Streamed::fixed(acc, 19..=24),
+                    Streamed::fixed(scratch, 20..=22),
                     Streamed::fixed(held, 25..=27),
                     Streamed::new(win, 27..=28),
                 ]
@@ -433,14 +434,14 @@ impl LsqmlState {
                     slots,
                     s.sampling.into(),
                 )?);
-                match sampler {
-                    None => Reading::Moved(moved),
-                    Some(sampler) => Reading::Windows {
+                match s.sampling {
+                    MovedSampling::Patch => Reading::Moved(moved),
+                    MovedSampling::FullObject { .. } => Reading::Windows {
                         moved,
                         windows: Box::new(Windows::new(
                             stream,
                             kernels,
-                            sampler,
+                            dims,
                             &stacks,
                             slots,
                             nf_max,
@@ -596,10 +597,10 @@ impl<'a> Bufs<'a> {
             }
             if pre != Pre::Keep {
                 let init = pre == Pre::Init;
-                match (windows, &lent) {
+                match (windows, &mut lent) {
                     (Some(w), Some(PositionLent::FullObject(s))) => {
                         let offsets = &*s.offsets;
-                        (w.sampler).illumination(
+                        (s.sampler).illumination(
                             ctx,
                             self.views,
                             offsets,
@@ -817,7 +818,7 @@ impl<'a> Bufs<'a> {
         };
         let (lk, exit) = (l.kernels, self.exit);
         let at = batch.clone().map(|s| points(views, table.at(s), &*p.pos));
-        w.sample(ctx, at, self.obj, 0)?;
+        w.sample(ctx, (p.sampler, p.spectra), at, self.obj, 0)?;
         let wv = &w.views;
         let chi = |st: &LsqmlScan, stack: StackRef<'_>, work: &mut DeviceBuffer<C32>| {
             lk.chi(ctx, scan, stack, noise, st, work)?;
@@ -855,20 +856,20 @@ impl<'a> Bufs<'a> {
                 self.probe_sums,
             )?;
             // The slopes of the windows the batch started from.
-            w.derivatives(ctx, points(views, stack, p.pos))?;
+            w.derivatives(ctx, (p.sampler, p.spectra), points(views, stack, p.pos))?;
             let at = (work, SliceSource::Probe(self.probe));
             (p.kernels).derivative_sums(ctx, views, stack, &w.deriv, at, p.pos)?;
             let at = points(views, stack, p.pos);
-            w.place(ctx, at, work, self.probe, &mut self.obj_sums.num)?;
+            w.place(ctx, p.sampler, at, work, self.probe, &mut self.obj_sums.num)?;
         }
         lk.dir_obj(ctx, l.scan, self.obj_sums)?;
         let nb = positions.len() as f32;
         self.kernels
             .scale_c32(ctx, &mut self.probe_sums.num, self.probe_len, 1.0 / nb)?;
-        w.sampler.spectra(ctx, &self.obj_sums.num, &mut w.spectra)?;
+        p.sampler.spectra(ctx, &self.obj_sums.num, p.spectra)?;
         for (k, s) in batch.enumerate() {
             let stack = table.at(s);
-            w.direction(ctx, points(views, stack, p.pos))?;
+            w.direction(ctx, (p.sampler, p.spectra), points(views, stack, p.pos))?;
             let at = LsqmlAt {
                 x: [&w.win[k][0], &*self.probe],
                 d: [&w.dir, &self.probe_sums.num],
@@ -1136,7 +1137,7 @@ impl<'a> Bufs<'a> {
                 i => &self.deeper[i - 1],
             };
             let at = batch.clone().map(|s| points(views, table.at(s), &*p.pos));
-            w.sample(ctx, at, obj, i)?;
+            w.sample(ctx, (p.sampler, p.spectra), at, obj, i)?;
         }
         for (k, s) in batch.clone().enumerate() {
             let (stack, work, inc, wk) =
@@ -1181,7 +1182,7 @@ impl<'a> Bufs<'a> {
                 ok.slice_adjoint(ctx, &w.views, stack, &w.win[k][i + 1], src, dst)?;
                 ok.gap(ctx, d, stack, &sl.gaps[i], dst, true)?;
             }
-            w.derivatives(ctx, points(views, stack, p.pos))?;
+            w.derivatives(ctx, (p.sampler, p.spectra), points(views, stack, p.pos))?;
             let c = chi.get(pivot).unwrap_or(&*work);
             let at = (
                 c,
@@ -1198,13 +1199,20 @@ impl<'a> Bufs<'a> {
                 ];
                 ok.slice_pair(ctx, d, stack, pair, &mut sw.pair)?;
                 let at = points(views, stack, p.pos);
-                w.place(ctx, at, &sw.pair, sl.ones, &mut self.obj_sums.num)?;
+                w.place(
+                    ctx,
+                    p.sampler,
+                    at,
+                    &sw.pair,
+                    sl.ones,
+                    &mut self.obj_sums.num,
+                )?;
             }
             lk.dir_obj(ctx, l.scan, self.obj_sums)?;
-            w.sampler.spectra(ctx, &self.obj_sums.num, &mut w.spectra)?;
+            p.sampler.spectra(ctx, &self.obj_sums.num, p.spectra)?;
             for (k, s) in batch.clone().enumerate() {
                 let stack = table.at(s);
-                w.direction(ctx, points(views, stack, p.pos))?;
+                w.direction(ctx, (p.sampler, p.spectra), points(views, stack, p.pos))?;
                 let at = LsqmlAt {
                     x: [&w.win[k][i], &*self.probe],
                     d: [&w.dir, &self.probe_sums.num],
@@ -1241,16 +1249,16 @@ impl<'a> Bufs<'a> {
                 self.probe_sums,
             )?;
             let at = points(views, stack, p.pos);
-            w.place(ctx, at, chi, self.probe, &mut self.obj_sums.num)?;
+            w.place(ctx, p.sampler, at, chi, self.probe, &mut self.obj_sums.num)?;
         }
         lk.dir_obj(ctx, l.scan, self.obj_sums)?;
         let nb = positions.len() as f32;
         self.kernels
             .scale_c32(ctx, &mut self.probe_sums.num, self.probe_len, 1.0 / nb)?;
-        w.sampler.spectra(ctx, &self.obj_sums.num, &mut w.spectra)?;
+        p.sampler.spectra(ctx, &self.obj_sums.num, p.spectra)?;
         for (k, s) in batch.enumerate() {
             let stack = table.at(s);
-            w.direction(ctx, points(views, stack, p.pos))?;
+            w.direction(ctx, (p.sampler, p.spectra), points(views, stack, p.pos))?;
             let at = LsqmlAt {
                 x: [&w.win[k][0], &*self.probe],
                 d: [&w.dir, &self.probe_sums.num],
