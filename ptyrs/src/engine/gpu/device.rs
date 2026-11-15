@@ -3708,4 +3708,72 @@ mod tests {
             }
         }
     }
+
+    /// A DM call failing between two stacks of its second cycle's projection keeps that
+    /// cycle's record, and its retry's cycle 0 overwrites the waves the failure left part
+    /// projected: the failed engine's history is the failed call's records, then the retry's,
+    /// and its LLKs and arrays are finite and bit for bit those of an engine that ran the
+    /// failed call's first cycle as a call of its own. Launched or replayed, M1's projection
+    /// and the fused one.
+    #[test]
+    fn a_dm_call_failing_between_stacks_is_retried_from_its_record() {
+        let ctx = CudaContext::new(0).expect("GPU 0");
+        let dm = DmParams {
+            calc_llk: 1,
+            zero_phase_ramp: false,
+            ..DmParams::default()
+        };
+        let bits = |e: &GpuPtycho| {
+            let (o, p) = (e.object().unwrap(), e.probe().unwrap());
+            let px = o.as_slice().iter().chain(p.as_slice());
+            px.flat_map(|c| [c.re, c.im]).collect::<Vec<_>>()
+        };
+        let llk = |e: &GpuPtycho| -> Vec<(usize, f64)> {
+            let h = e.history().iter();
+            h.map(|r| (r.cycle, r.llk.poisson)).collect()
+        };
+        for (graph, fused) in [(false, false), (true, false), (false, true), (true, true)] {
+            let what = format!("graph {graph}, fused {fused}");
+            let [mut failed, mut clean] = [(); 2].map(|()| engine(&ctx, graph, fused));
+            clean.dm(&dm, 1).unwrap();
+            let carried = clean.dev.carried.as_ref();
+            let nstack = carried.expect("DM built its stacks").cut.len();
+            assert!(nstack > 1, "{what}: one stack has no stack after it");
+            // Cycle 0's stacks, launched or captured, then the second of cycle 1's.
+            let armed = fault::arm(Exit::DmStack, nstack + 1);
+            let r = failed.dm(&dm, 2);
+            assert!(armed.fired(), "{what}");
+            let refused = match &r {
+                Err(EngineError::Gpu(
+                    GpuError::Driver(d) | GpuError::Device(DeviceError::Driver(d)),
+                )) => *d == fault::REFUSAL,
+                _ => false,
+            };
+            assert!(refused, "{what}: {r:?}");
+            drop(armed);
+            failed.dm(&dm, 2).unwrap();
+            clean.dm(&dm, 2).unwrap();
+
+            let (f, c) = (llk(&failed), llk(&clean));
+            assert_eq!(
+                c.iter().map(|r| r.0).collect::<Vec<_>>(),
+                [0, 1, 2],
+                "{what}"
+            );
+            let want = [c[0], c[1], c[1], c[2]].map(|(k, v)| (k, v.to_bits()));
+            let got: Vec<_> = f.iter().map(|&(k, v)| (k, v.to_bits())).collect();
+            assert_eq!(got, want, "{what}: the records");
+            assert!(f.iter().all(|r| r.1.is_finite()), "{what}: {f:?}");
+            let (f, c) = (bits(&failed), bits(&clean));
+            assert!(
+                f.iter().all(|v| v.is_finite()),
+                "{what}: the arrays are not finite"
+            );
+            let same = f
+                .iter()
+                .map(|v| v.to_bits())
+                .eq(c.iter().map(|v| v.to_bits()));
+            assert!(same, "{what}: the arrays");
+        }
+    }
 }
