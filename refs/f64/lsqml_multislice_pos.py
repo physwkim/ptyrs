@@ -6,7 +6,7 @@ numpy default_rng(SEED), every case, under each of pty-chi's two shift operators
 
     micromamba run -n ptyrs-ref python -I refs/f64/lsqml_multislice_pos.py <dir>
 
-<dir> holds lsqml_multislice.py's files (refs/f64 or ptyrs/tests/engine/data), whose start
+<dir> holds lsqml_multislice.py's files (ptyrs/tests/engine/data), whose start
 probe, corners, cases and counts are read here; its truth object is made again by its
 make_state. pty-chi's PATCH model keeps the windows at the corners
 and moves the probe entering slice 0 by d (|d| < 1/2), and corrects the positions on slice

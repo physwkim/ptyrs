@@ -2,10 +2,13 @@
 //! positions optimizable, `refs/f64/rpie_pos.py`, run on the state it reads: `cargo run
 //! --release -p ptyrs --example engine_llk_trace -- <dir> dm 1 2 32 40 4`, i.e.
 //! `common::dm_scenario(32, 40, 2, 2e5, 4.0)` after `scale_obj_probe`, with the reference's
-//! offsets. It writes `<dir>/rpie_pos_*_f64.txt`, saved to `tests/data`.
+//! offsets. It writes `<dir>/rpie_pos_*_f64.txt`, saved to `tests/data`. The same cases under
+//! pty-chi's FULL_OBJECT shift operator, [`Sampling::FullObject`] here, are
+//! `refs/py/ptychi_full_object.py`'s `<out>/rpie_full_object_*_f64.txt`, saved to
+//! `tests/engine/data`, with one on an odd-sided object plane.
 
-use ptyrs::base::{C64, Stack};
-use ptyrs::engine::{Features, Ptycho, RpieParams};
+use ptyrs::base::{C64, Object, Stack};
+use ptyrs::engine::{Features, Ptycho, RpieParams, Sampling};
 
 #[path = "common/engine/mod.rs"]
 mod common;
@@ -46,12 +49,36 @@ fn assert_close(what: &str, got: &[f64], want: &[f64], tol: f64) {
     assert!(err < tol, "{what}: max rel {err:.3e}");
 }
 
-/// `nepoch` epochs of `params` from the reference's starting offsets against its object,
-/// probe and offset changes, `files` its obj, probe and offsets tables.
-fn assert_run(what: &str, params: RpieParams, nepoch: usize, files: [&str; 3]) {
+/// The scenario after `scale_obj_probe`; with `odd`, on its 76 x 80 object plane less the first
+/// row and column, both sides odd, every window one pixel nearer the origin and so on the same
+/// pixels.
+fn scenario(odd: bool) -> Ptycho {
     let (scan, object, probe) = common::dm_scenario(32, 40, 2, 2e5, 4.0);
     let mut p = Ptycho::new(&scan, object, probe).unwrap();
     p.scale_obj_probe();
+    if !odd {
+        return p;
+    }
+    let [_, ny, nx] = p.object().dims();
+    let plane = (p.object().plane(0).chunks(nx).skip(1))
+        .flat_map(|row| &row[1..])
+        .copied()
+        .collect();
+    let object = Object::new(Stack::from_vec([1, ny - 1, nx - 1], plane).unwrap());
+    Ptycho::new(&scan, object, p.probe().clone()).unwrap()
+}
+
+/// `nepoch` epochs of `params` on `p` under `sampling` from the reference's starting offsets
+/// against its object, probe and offset changes, `files` its obj, probe and offsets tables.
+fn assert_run(
+    what: &str,
+    mut p: Ptycho,
+    sampling: Sampling,
+    params: RpieParams,
+    nepoch: usize,
+    files: [&str; 3],
+) {
+    p.set_sampling(sampling);
     let rows = table(files[2]);
     let start = offsets(&rows, 1);
     p.set_features(Features {
@@ -84,24 +111,40 @@ fn assert_run(what: &str, params: RpieParams, nepoch: usize, files: [&str; 3]) {
         &format!("{what} offsets"),
         &delta(got),
         &delta(&want),
-        1e-12,
+        // 5x the worst measured, the PATCH step's (5.1e-13): pty-chi's absolute positions cost
+        // the change digits
+        3e-12,
     );
 }
 
 /// One epoch of two batches of 20 from offsets within 0.4.
+const STEP: RpieParams = RpieParams {
+    obj_step: Some(0.9),
+    probe_step: Some(0.8),
+    obj_alpha: 0.3,
+    probe_alpha: 0.2,
+    batch_size: 20,
+    calc_llk: 1,
+};
+
+/// Three epochs of ten batches of 4 from offsets within 0.15.
+const EPOCHS: RpieParams = RpieParams {
+    obj_step: Some(1.0),
+    probe_step: Some(1.0),
+    obj_alpha: 0.5,
+    probe_alpha: 0.5,
+    batch_size: 4,
+    calc_llk: 1,
+};
+
+/// [`STEP`] under PATCH.
 #[test]
 fn rpie_positions_step_matches_ptychi() {
-    let params = RpieParams {
-        obj_step: Some(0.9),
-        probe_step: Some(0.8),
-        obj_alpha: 0.3,
-        probe_alpha: 0.2,
-        batch_size: 20,
-        calc_llk: 1,
-    };
     assert_run(
         "step",
-        params,
+        scenario(false),
+        Sampling::Patch,
+        STEP,
         1,
         [
             include_str!("engine/data/rpie_pos_step_obj_f64.txt"),
@@ -111,25 +154,70 @@ fn rpie_positions_step_matches_ptychi() {
     );
 }
 
-/// Three epochs of ten batches of 4 from offsets within 0.15.
+/// [`EPOCHS`] under PATCH.
 #[test]
 fn rpie_positions_epochs_match_ptychi() {
-    let params = RpieParams {
-        obj_step: Some(1.0),
-        probe_step: Some(1.0),
-        obj_alpha: 0.5,
-        probe_alpha: 0.5,
-        batch_size: 4,
-        calc_llk: 1,
-    };
     assert_run(
         "epochs",
-        params,
+        scenario(false),
+        Sampling::Patch,
+        EPOCHS,
         3,
         [
             include_str!("engine/data/rpie_pos_epochs_obj_f64.txt"),
             include_str!("engine/data/rpie_pos_epochs_probe_f64.txt"),
             include_str!("engine/data/rpie_pos_epochs_offsets_f64.txt"),
+        ],
+    );
+}
+
+/// [`STEP`] under FULL_OBJECT.
+#[test]
+fn rpie_full_object_positions_step_matches_ptychi() {
+    assert_run(
+        "full-object step",
+        scenario(false),
+        Sampling::FullObject,
+        STEP,
+        1,
+        [
+            include_str!("engine/data/rpie_full_object_step_obj_f64.txt"),
+            include_str!("engine/data/rpie_full_object_step_probe_f64.txt"),
+            include_str!("engine/data/rpie_full_object_step_offsets_f64.txt"),
+        ],
+    );
+}
+
+/// [`EPOCHS`] under FULL_OBJECT.
+#[test]
+fn rpie_full_object_positions_epochs_match_ptychi() {
+    assert_run(
+        "full-object epochs",
+        scenario(false),
+        Sampling::FullObject,
+        EPOCHS,
+        3,
+        [
+            include_str!("engine/data/rpie_full_object_epochs_obj_f64.txt"),
+            include_str!("engine/data/rpie_full_object_epochs_probe_f64.txt"),
+            include_str!("engine/data/rpie_full_object_epochs_offsets_f64.txt"),
+        ],
+    );
+}
+
+/// [`STEP`] under FULL_OBJECT on the 75 x 79 plane, whose middle frequencies are positive.
+#[test]
+fn rpie_full_object_odd_plane_matches_ptychi() {
+    assert_run(
+        "full-object odd plane",
+        scenario(true),
+        Sampling::FullObject,
+        STEP,
+        1,
+        [
+            include_str!("engine/data/rpie_full_object_odd_obj_f64.txt"),
+            include_str!("engine/data/rpie_full_object_odd_probe_f64.txt"),
+            include_str!("engine/data/rpie_full_object_odd_offsets_f64.txt"),
         ],
     );
 }

@@ -3,12 +3,14 @@
 //! the state it reads: `cargo run --release -p ptyrs --example engine_llk_trace -- <dir> dm 1
 //! 2 32 40 4`, i.e. `common::dm_scenario(32, 40, 2, 2e5, 4.0)` after `scale_obj_probe`, with
 //! the model's offsets. It writes `<dir>/bh_pos_{full,mini}_*_f64.txt`, saved to
-//! `tests/engine/data`.
+//! `tests/engine/data`. Under pty-chi's FULL_OBJECT shift operator, [`Sampling::FullObject`]
+//! here, its BH samples the object as this one does: `refs/py/ptychi_full_object.py` runs the
+//! same cases there, `<out>/bh_full_object_{full,mini}_*_f64.txt`, saved to `tests/engine/data`.
 
 use std::slice;
 
 use ptyrs::base::C64;
-use ptyrs::engine::{Bh, BhParams, Features, Optics, Ptycho};
+use ptyrs::engine::{Bh, BhParams, Features, Optics, Ptycho, Sampling};
 
 #[path = "common/engine/mod.rs"]
 mod common;
@@ -33,6 +35,9 @@ fn max_rel(a: &[f64], b: &[f64], scale: f64) -> f64 {
     worst_of(d) / scale
 }
 
+/// 5x the worst measured, the FULL_OBJECT mini batch's offsets (5.5e-13).
+const TOL: f64 = 3e-12;
+
 fn rel(a: f64, b: f64) -> f64 {
     (a - b).abs() / b.abs()
 }
@@ -55,10 +60,18 @@ fn assert_close(what: &str, got: &[f64], want: &[f64], scale: f64, tol: f64) {
     assert!(err < tol, "{what}: max rel {err:.3e}");
 }
 
-/// Two epochs of [`Bh::epoch`] with seed 7, probe rho 0.01 and position rho 2 from the
-/// model's offsets: its per-step `step epoch count beta alpha top bottom frames..`, the
-/// object (`iy ix re im`) and probe (`m iy ix re im`) changes and the offsets after.
-fn assert_model(batch_size: usize, steps: &str, obj: &str, probe: &str, table_offsets: &str) {
+/// Two epochs of [`Bh::epoch`] under `sampling` with seed 7, probe rho 0.01 and position rho 2
+/// from the reference's offsets: its per-step `step epoch count beta alpha top bottom
+/// frames..`, the object (`iy ix re im`) and probe (`m iy ix re im`) changes and the offsets
+/// after.
+fn assert_model(
+    sampling: Sampling,
+    batch_size: usize,
+    steps: &str,
+    obj: &str,
+    probe: &str,
+    table_offsets: &str,
+) {
     let (scan, object, probe0) = common::dm_scenario(32, 40, 2, 2e5, 4.0);
     let mut p = Ptycho::new(&scan, object, probe0).unwrap();
     p.scale_obj_probe();
@@ -75,7 +88,9 @@ fn assert_model(batch_size: usize, steps: &str, obj: &str, probe: &str, table_of
         position_rho: 2.0,
         seed: 7,
     };
-    let mut bh = Bh::new(params).unwrap().with_features(features).unwrap();
+    let mut bh = (Bh::new(params).unwrap().with_sampling(sampling))
+        .with_features(features)
+        .unwrap();
     let (o0, p0) = (p.object().clone(), p.probe().clone());
     let (mut object, mut pr) = (o0.clone(), p0.clone());
     let mut got = Vec::new();
@@ -103,7 +118,7 @@ fn assert_model(batch_size: usize, steps: &str, obj: &str, probe: &str, table_of
             if want != 0.0 {
                 let err = rel(got, want);
                 eprintln!("step {k} {name}: rel {err:.3e}");
-                assert!(err < 1e-12, "step {k}: {name} {got} model {want}");
+                assert!(err < TOL, "step {k}: {name} {got} model {want}");
             }
         }
     }
@@ -116,7 +131,7 @@ fn assert_model(batch_size: usize, steps: &str, obj: &str, probe: &str, table_of
             .flat_map(|r| [r[lead], r[lead + 1]])
             .collect();
         let start: Vec<f64> = x0.iter().flat_map(|c| [c.re, c.im]).collect();
-        assert_close(name, &change(x, x0), &want, max_abs(&start), 1e-12);
+        assert_close(name, &change(x, x0), &want, max_abs(&start), TOL);
     }
     let delta = |d: &[[f64; 2]]| -> Vec<f64> {
         d.iter()
@@ -126,7 +141,7 @@ fn assert_model(batch_size: usize, steps: &str, obj: &str, probe: &str, table_of
     };
     let got = bh.features().position.as_ref().unwrap();
     let want = delta(&offsets(&rows, 3));
-    assert_close("offsets", &delta(got), &want, max_abs(&want), 1e-12);
+    assert_close("offsets", &delta(got), &want, max_abs(&want), TOL);
 }
 
 /// One batch of every frame: CG across the two epochs, the offsets' part of the direction
@@ -134,6 +149,7 @@ fn assert_model(batch_size: usize, steps: &str, obj: &str, probe: &str, table_of
 #[test]
 fn full_batch_matches_the_model() {
     assert_model(
+        Sampling::Patch,
         40,
         include_str!("engine/data/bh_pos_full_steps_f64.txt"),
         include_str!("engine/data/bh_pos_full_obj_f64.txt"),
@@ -146,10 +162,37 @@ fn full_batch_matches_the_model() {
 #[test]
 fn mini_batch_matches_the_model() {
     assert_model(
+        Sampling::Patch,
         16,
         include_str!("engine/data/bh_pos_mini_steps_f64.txt"),
         include_str!("engine/data/bh_pos_mini_obj_f64.txt"),
         include_str!("engine/data/bh_pos_mini_probe_f64.txt"),
         include_str!("engine/data/bh_pos_mini_offsets_f64.txt"),
+    );
+}
+
+/// [`full_batch_matches_the_model`]'s run under FULL_OBJECT against pty-chi's.
+#[test]
+fn full_object_full_batch_matches_ptychi() {
+    assert_model(
+        Sampling::FullObject,
+        40,
+        include_str!("engine/data/bh_full_object_full_steps_f64.txt"),
+        include_str!("engine/data/bh_full_object_full_obj_f64.txt"),
+        include_str!("engine/data/bh_full_object_full_probe_f64.txt"),
+        include_str!("engine/data/bh_full_object_full_offsets_f64.txt"),
+    );
+}
+
+/// [`mini_batch_matches_the_model`]'s run under FULL_OBJECT against pty-chi's.
+#[test]
+fn full_object_mini_batch_matches_ptychi() {
+    assert_model(
+        Sampling::FullObject,
+        16,
+        include_str!("engine/data/bh_full_object_mini_steps_f64.txt"),
+        include_str!("engine/data/bh_full_object_mini_obj_f64.txt"),
+        include_str!("engine/data/bh_full_object_mini_probe_f64.txt"),
+        include_str!("engine/data/bh_full_object_mini_offsets_f64.txt"),
     );
 }
