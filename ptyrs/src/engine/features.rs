@@ -102,6 +102,11 @@ impl Features {
         Ok(())
     }
 
+    /// Whether an intensity scale or a detector background is modelled, refined or held.
+    pub(crate) fn models_scale_or_background(&self) -> bool {
+        self.scale.is_some() || self.background.is_some()
+    }
+
     /// Whether some feature takes a step before each cycle: a refined scale or background.
     pub(crate) fn stepped(&self) -> bool {
         let refined = |f: &Option<Feature<_>>| f.as_ref().is_some_and(|f| f.refine);
@@ -1203,7 +1208,31 @@ pub fn background_grad(
 
 #[cfg(test)]
 mod tests {
-    use super::freq;
+    use super::{Feature, Features, freq};
+
+    /// A scale or a background, refined or held, is what BH, LSQML and rPIE refuse; a
+    /// position alone is not.
+    #[test]
+    fn scale_or_background_is_either_refined_or_held() {
+        for f in [Feature::refined(vec![1.0]), Feature::held(vec![1.0])] {
+            let scale = Features {
+                scale: Some(f.clone()),
+                ..Features::default()
+            };
+            let background = Features {
+                background: Some(f),
+                ..Features::default()
+            };
+            assert!(scale.models_scale_or_background());
+            assert!(background.models_scale_or_background());
+        }
+        let position = Features {
+            position: Some(Feature::refined(vec![[0.0; 2]])),
+            ..Features::default()
+        };
+        assert!(!position.models_scale_or_background());
+        assert!(!Features::default().models_scale_or_background());
+    }
 
     /// The device's `freq` puts the split where this one does, on odd sides too.
     #[test]

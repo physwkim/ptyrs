@@ -865,7 +865,7 @@ impl Ptycho {
             ));
         }
         params.validate()?;
-        if self.features.scale.is_some() || self.features.background.is_some() {
+        if self.features.models_scale_or_background() {
             return Err(EngineError::Invalid(
                 "rPIE models no intensity scale or background".into(),
             ));
