@@ -1947,6 +1947,11 @@ impl BhState {
         })
     }
 
+    /// The sampling its views read the object under, if the state is the position model's.
+    fn reads(&self) -> Option<Sampling> {
+        self.moved.as_ref().map(BhMoved::reads)
+    }
+
     fn lend(&mut self) -> BhBufs<'_> {
         BhBufs {
             size: self.size,
@@ -2814,26 +2819,27 @@ impl Device {
         Ok(())
     }
 
-    /// Builds the [`BhState`] for `params`' batch size and the position model unless it is
-    /// built. A state of another size or model is replaced only here, when [`Self::steady`]
-    /// has already dropped the runs of other parameters and [`Self::set_features`] those of
-    /// other features, so no graph captured from it survives.
+    /// Builds the [`BhState`] for `params`' batch size, the position model and its sampling
+    /// unless it is built. A state of another size, model or sampling is replaced only here,
+    /// when [`Self::steady`] has already dropped the runs of other parameters,
+    /// [`Self::set_features`] those of other features and [`Self::set_sampling`] those of
+    /// another sampling, so no graph captured from it survives.
     fn build_bh(&mut self, params: &BhParams) -> Result<(), EngineError> {
         let dims = self.dims();
         let size = to_u32("batch_size", params.batch_size.min(dims.nframe as usize))?;
-        let moved = self.features.positioned();
+        let reads = self.features.positioned().then_some(self.sampling);
         let deeper = self.deeper().len();
-        if moved && deeper > 0 {
-            let what = match self.moved_scratch().sampling {
-                MovedSampling::FullObject { .. } => "under Sampling::FullObject",
-                MovedSampling::Patch => "with the position model under Sampling::Patch",
+        if let Some(sampling) = reads.filter(|_| deeper > 0) {
+            let what = match sampling {
+                Sampling::FullObject => "under Sampling::FullObject",
+                Sampling::Patch => "with the position model under Sampling::Patch",
             };
             return Err(EngineError::Invalid(format!(
                 "BH {what} runs one object slice, got {}",
                 deeper + 1
             )));
         }
-        if (self.bh_state.as_ref()).is_none_or(|s| s.size != size || s.moved.is_some() != moved) {
+        if (self.bh_state.as_ref()).is_none_or(|s| s.size != size || s.reads() != reads) {
             let state = BhState::new(
                 &self.stream,
                 &self.kernels,
@@ -2841,7 +2847,7 @@ impl Device {
                 size,
                 self.rule,
                 deeper,
-                moved.then(|| self.moved_scratch()),
+                reads.map(|_| self.moved_scratch()),
             )?;
             self.bh_state = Some(Box::new(state));
         }

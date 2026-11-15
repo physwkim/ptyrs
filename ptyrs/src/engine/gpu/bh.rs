@@ -23,7 +23,7 @@ use super::propagate::Propagate;
 use super::{Bufs, Cut, GpuPtycho};
 use crate::engine::features::POSITION_STEP;
 use crate::engine::ptycho::{Algorithm, llk_due};
-use crate::engine::{BhParams, BhStep, EngineError, random_batches};
+use crate::engine::{BhParams, BhStep, EngineError, Sampling, random_batches};
 
 impl GpuPtycho {
     /// [`crate::engine::Bh::epoch`] `nepoch` times from a fresh [`crate::engine::Bh`], over the same
@@ -150,8 +150,12 @@ impl BhMoved {
         })
     }
 
-    fn samples_object(&self) -> bool {
-        matches!(self.by, BhBy::Windows(_))
+    /// The sampling it reads the object under.
+    pub(super) fn reads(&self) -> Sampling {
+        match self.by {
+            BhBy::Shift { .. } => Sampling::Patch,
+            BhBy::Windows(_) => Sampling::FullObject,
+        }
     }
 
     /// Its [`Moved`], what the offsets move and the offsets, a variable of the step over
@@ -296,7 +300,7 @@ impl Bufs<'_> {
         if let Some(mut m) = PositionLent::lend(moved, passes.fused(), &mut self.features)? {
             m.gather(ctx, bh.order)?;
         }
-        let sampled = (bh.moved.as_deref()).is_some_and(BhMoved::samples_object);
+        let sampled = (bh.moved.as_deref()).map(BhMoved::reads) == Some(Sampling::FullObject);
         for b in 0..bh.batches.len() {
             match (sampled, bh.sliced.is_some()) {
                 (true, _) => self.bh_sampled_batch(ctx, bh, params, b, cg)?,
