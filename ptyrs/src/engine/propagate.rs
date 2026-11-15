@@ -344,6 +344,9 @@ pub enum PlaneStage<'a> {
     /// `Fft2⁻¹·Fft2⁻¹·T·Fft2` of this transfer function `T`, on the unshifted `fftfreq`
     /// grid and even in both frequencies.
     Transfer(&'a [C64]),
+    /// [`Self::Transfer`] of a `T` with an evanescent band, where it is 0: `Vᴴ·V` is the
+    /// projection off the band, not the identity, which a user of `Vᴴ` carries itself.
+    Banded(&'a [C64]),
 }
 
 impl Propagator {
@@ -454,19 +457,14 @@ impl Propagator {
     }
 
     /// This propagator through one [`Fft2`]. A Fresnel transform over pixels that are not
-    /// square has no such form, its plane phase being no `quad`, nor angular spectrum with an
-    /// evanescent band, where `Vᴴ·V` is not the identity the form's users take it for.
+    /// square has no such form, its plane phase being no `quad`.
     pub fn fourier_form(&self) -> Result<FourierForm<'_>, EngineError> {
         let (quad, stage) = match self {
             Self::Fourier(_) => (0.0, PlaneStage::None),
-            Self::AngularSpectrum(p) => {
-                if !self.adjoint_inverts() {
-                    return Err(EngineError::Invalid(
-                        "angular spectrum with an evanescent band has no one-transform form".into(),
-                    ));
-                }
+            Self::AngularSpectrum(p) if self.adjoint_inverts() => {
                 (0.0, PlaneStage::Transfer(&p.tf))
             }
+            Self::AngularSpectrum(p) => (0.0, PlaneStage::Banded(&p.tf)),
             Self::Fresnel(p) => {
                 let [cy, cx] = p.plane_quad;
                 let quad = (cy == cx).then_some(cx).ok_or_else(|| {

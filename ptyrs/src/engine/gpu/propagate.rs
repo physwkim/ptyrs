@@ -2,7 +2,9 @@
 //! through its cuFFT plan: BH's, rPIE's and unfused ML's.
 
 use crate::fft::Plan2d;
-use crate::gpu::{BhKernels, C32, Error as GpuError, ExitStage, StackRef, ViewDims};
+use crate::gpu::{
+    BandedTransfer, BhKernels, C32, Error as GpuError, ExitStage, StackRef, ViewDims,
+};
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::DeviceBuffer;
 
@@ -39,7 +41,7 @@ impl Propagate<'_> {
         match self.stage {
             ExitStage::None => plan.forward(ctx, src, dst)?,
             ExitStage::Reverse => plan.inverse(ctx, src, dst)?,
-            ExitStage::Transfer(tf) => {
+            ExitStage::Transfer(tf) | ExitStage::Banded(BandedTransfer { tf, .. }) => {
                 plan.forward(ctx, src, dst)?;
                 self.kernels
                     .transfer(ctx, &self.dims, stack, tf, dst, false)?;
@@ -73,7 +75,7 @@ impl Propagate<'_> {
             ExitStage::None if !adjoint => plan.forward_inplace(ctx, buf)?,
             ExitStage::Reverse if adjoint => plan.forward_inplace(ctx, buf)?,
             ExitStage::None | ExitStage::Reverse => plan.inverse_inplace(ctx, buf)?,
-            ExitStage::Transfer(tf) => {
+            ExitStage::Transfer(tf) | ExitStage::Banded(BandedTransfer { tf, .. }) => {
                 plan.forward_inplace(ctx, buf)?;
                 self.kernels
                     .transfer(ctx, &self.dims, stack, tf, buf, adjoint)?;

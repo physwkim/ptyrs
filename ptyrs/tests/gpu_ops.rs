@@ -630,6 +630,57 @@ fn object_update_skips_tiles_without_views() {
     assert!(moved > nlit / 2, "only {moved} of {nlit} pixels updated");
 }
 
+/// `clear_obj_sums` leaves the sums `update_obj_from_sums` leaves, bit for bit: zero on the
+/// tiles with views and untouched, poison included, on the others, with the object as it was.
+#[test]
+fn object_sum_clear_is_the_update_s_clear() {
+    let (stream, ex, k) = setup();
+    let s = scan_in([80, 96]);
+    let len = s.obj.len();
+    let views = Views::new(&stream, s.d, &s.views).unwrap();
+    let all = one_stack(&stream, &s.d, 0..5);
+    let probe = up(&stream, &s.probe);
+    let psi = up(&stream, &noise(s.nk(&(0..5)) * s.n(), 3, 1.0));
+    let [nyo, nxo] = s.d.obj.map(|v| v as usize);
+    let (t, ntx) = (OBJ_TILE as usize, nxo.div_ceil(OBJ_TILE as usize));
+    let tile_len = views.tile_len().to_host_vec(&stream).unwrap();
+    let lit = |i: usize| tile_len[(i / nxo % nyo) / t * ntx + i % nxo / t] != 0;
+    let nan = C32 {
+        re: f32::NAN,
+        im: f32::NAN,
+    };
+    let num0 = (0..len)
+        .map(|i| if lit(i) { C32::default() } else { nan })
+        .collect();
+    let den0: Vec<f32> = (0..len).map(|i| if lit(i) { 0.0 } else { 1e30 }).collect();
+    let start = (num0, den0);
+
+    let left = |clear: &dyn Fn(&mut UpdateSums, &mut DeviceBuffer<C32>)| {
+        let mut sums = sums(&stream, &start);
+        k.psi_to_obj(&ex, &views, all.at(0), &psi, &probe, &mut sums)
+            .unwrap();
+        let mut obj = up(&stream, &s.obj);
+        clear(&mut sums, &mut obj);
+        (
+            c32_bits(&sums.num.to_host_vec(&stream).unwrap()),
+            sums.den
+                .to_host_vec(&stream)
+                .unwrap()
+                .into_iter()
+                .map(f32::to_bits)
+                .collect::<Vec<_>>(),
+            c32_bits(&obj.to_host_vec(&stream).unwrap()),
+        )
+    };
+    let (num, den, obj) = left(&|sums, _| k.clear_obj_sums(&ex, &views, sums).unwrap());
+    let (num_u, den_u, _) = left(&|sums, obj| {
+        k.update_obj_from_sums(&ex, &views, obj, sums, 0.01)
+            .unwrap()
+    });
+    assert_eq!((num, den), (num_u, den_u));
+    assert_eq!(obj, c32_bits(&s.obj));
+}
+
 /// `obj_den_max` writes the max of `den` over the tiles with views; `normalize_obj` with that
 /// word gives the bits of `update_obj_from_sums`, and with a larger word from elsewhere (the
 /// max another device holds) the plain f32 formula at that max, on the tiles with views only.

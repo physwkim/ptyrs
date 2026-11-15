@@ -34,6 +34,7 @@ use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig};
 use ptyrs_kernels::pixel::{PIXEL_THREADS, StackGeom};
 use ptyrs_kernels::sampling::{PCG_PAP, PCG_RZ, PCG_SCALARS, Pcg, SamplePass, sampling_kernels};
 
+use crate::fault;
 use crate::fft::Plan2d;
 use crate::gpu::{
     C32, CG_BLOCKS, Error, Kernels, StackCtl, StackRef, StackTable, UpdateSums, ViewAddr, ViewDims,
@@ -540,6 +541,7 @@ impl ObjectSampler {
         })?;
         self.sum(ctx, state, sum, PCG_RZ[0])?;
         for step in 0..STEPS {
+            fault::at(fault::Exit::Solve)?;
             let (rz, next) = (PCG_RZ[step % 2], PCG_RZ[(step + 1) % 2]);
             self.planes.forward(ctx, &state.dir, spectra)?;
             self.normal(ctx, a, stack, spectra)?;

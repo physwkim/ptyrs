@@ -22,6 +22,8 @@ pub struct Case {
     pub scan: Scan,
     pub addr: AddrTable,
     pub obs: Observed,
+    /// In metres.
+    wavelength: f64,
     /// From the object to the detector, in metres.
     distance: f64,
     pub object: Object,
@@ -51,16 +53,16 @@ pub fn rounded_counts(psi: &[C64], nmode: usize, [nframe, ny, nx]: [usize; 3]) -
     Counts::from_f64([nframe, ny, nx], &counts, None).unwrap()
 }
 
-fn free_space(distance: f64) -> Optics {
+fn free_space(wavelength: f64, distance: f64) -> Optics {
     let frame = FUSED_SIDES[0] as usize;
-    let field = Wavefield::new([frame, frame], WAVELENGTH, [PIXEL, PIXEL], distance).unwrap();
+    let field = Wavefield::new([frame, frame], wavelength, [PIXEL, PIXEL], distance).unwrap();
     Optics::free_space(&field)
 }
 
-pub fn case(name: &'static str, distance: f64) -> Case {
+pub fn case(name: &'static str, wavelength: f64, distance: f64) -> Case {
     let frame = FUSED_SIDES[0] as usize;
     let pixel = [PIXEL, PIXEL];
-    let optics = free_space(distance);
+    let optics = free_space(wavelength, distance);
     let raw = ptyrs::base::sim::fermat(NPOS, frame as f64 / 8.0 * PIXEL);
     let positions = raw.pynx_preprocess(pixel);
     let shape = required_obj_shape(&positions, pixel, [frame, frame], 16);
@@ -96,12 +98,13 @@ pub fn case(name: &'static str, distance: f64) -> Case {
             *v *= C64::from_polar(1.0, -0.5 * (u * u + w * w));
         }
     }
-    let geometry = Geometry::new(WAVELENGTH, 1.0, PIXEL, [frame, frame]).unwrap();
+    let geometry = Geometry::new(wavelength, 1.0, PIXEL, [frame, frame]).unwrap();
     Case {
         name,
         addr,
         obs: Observed::from_counts(&counts),
         scan: Scan::new(geometry, raw, counts).unwrap(),
+        wavelength,
         distance,
         object,
         probe,
@@ -110,17 +113,17 @@ pub fn case(name: &'static str, distance: f64) -> Case {
 
 pub fn cases() -> [Case; 3] {
     [
-        case("angular spectrum", 1e-4),
-        case("Fresnel", 5e-3),
+        case("angular spectrum", WAVELENGTH, 1e-4),
+        case("Fresnel", WAVELENGTH, 5e-3),
         // Not nearer: at -5e-3 and -2e-3 the CPU's second CG step has H(D, D) < 0, after
         // which its own steps from an f32 start are 2e-6 to 2e-5 off and the GPU's 15x that.
-        case("Fresnel back", -1e-2),
+        case("Fresnel back", WAVELENGTH, -1e-2),
     ]
 }
 
 impl Case {
     pub fn optics(&self) -> Optics {
-        free_space(self.distance)
+        free_space(self.wavelength, self.distance)
     }
 }
 

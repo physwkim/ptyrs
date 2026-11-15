@@ -43,12 +43,14 @@ pub enum ExitStage {
     /// `V = F⁻¹ F⁻¹ T F`, angular spectrum of the transfer function `T`, `[ny, nx]` on the
     /// unshifted frequency grid and even in both frequencies.
     Transfer(DeviceBuffer<C32>),
+    /// [`Self::Transfer`] of a `T` with an evanescent band.
+    Banded(BandedTransfer),
 }
 
 /// [`ExitStage::Transfer`] of a transfer function with an evanescent band, the pixels where
 /// it is 0, and each band pixel's slot in a plane's carry.
 pub struct BandedTransfer {
-    tf: DeviceBuffer<C32>,
+    pub(crate) tf: DeviceBuffer<C32>,
     /// `[ny, nx]`: the pixel's slot, [`OFF_BAND`] off the band.
     slots: DeviceBuffer<u32>,
     nband: u32,
@@ -177,7 +179,8 @@ impl OpticsKernels {
 
     /// `stage` on `stack`'s row transforms in `work`, `[nf_max * nmode, ny, nx]`: the row
     /// transforms of `V w` from those of the exit waves `w`, or with `adjoint` those of
-    /// `Vᴴ c` from the correction's.
+    /// `Vᴴ c` from the correction's. [`ExitStage::Banded`] runs as its transfer function
+    /// alone; [`Self::exit_banded`] carries its band.
     pub fn exit(
         &self,
         ctx: &ExecutionContext,
@@ -218,12 +221,12 @@ impl OpticsKernels {
                     })
             }
             // `F_x V w = F_x⁻¹ T F_y⁻¹ (F_x w)`, `T` being even, and its adjoint.
-            ExitStage::Transfer(tf) if adjoint => {
+            ExitStage::Transfer(tf) | ExitStage::Banded(BandedTransfer { tf, .. }) if adjoint => {
                 self.stage(ctx, &l, stack, work, None, STAGE_PRE_FWD)?;
                 let flags = STAGE_COLS | STAGE_MUL | STAGE_CONJ | STAGE_POST_FWD;
                 self.stage(ctx, &l, stack, work, Some(Mul::plain(tf, scale)), flags)
             }
-            ExitStage::Transfer(tf) => {
+            ExitStage::Transfer(tf) | ExitStage::Banded(BandedTransfer { tf, .. }) => {
                 let flags = STAGE_COLS | STAGE_PRE_INV | STAGE_MUL;
                 self.stage(ctx, &l, stack, work, Some(Mul::plain(tf, scale)), flags)?;
                 self.stage(ctx, &l, stack, work, None, STAGE_PRE_INV)
@@ -234,7 +237,9 @@ impl OpticsKernels {
     /// [`Self::exit`] of `stage` as [`ExitStage::Transfer`], the band carried: under
     /// [`BandCarry::Save`] the forward, saving the band, and under [`BandCarry::Restore`]
     /// the adjoint, giving the row transforms of `Vᴴ c - E w`, `E` the projection onto the
-    /// band and `w` the waves whose forward saved the carry.
+    /// band and `w` the waves whose forward saved the carry. `c` comes as the engines'
+    /// far-field passes hand it over, `1 / n` taken ahead of the unnormalized inverse column
+    /// FFT, so an unnormalized inverse row FFT ends the adjoint.
     pub fn exit_banded(
         &self,
         ctx: &ExecutionContext,
@@ -259,10 +264,11 @@ impl OpticsKernels {
             }
             BandCarry::Restore(c) => {
                 self.stage(ctx, &l, stack, work, None, STAGE_PRE_FWD)?;
-                // Less `E w`'s row transforms, `F_y⁻¹ M F_y` of `w`'s with `M` the band's
-                // indicator: ahead of the unnormalized column FFT, `M / ny` times the saved
-                // unnormalized `F_y⁻¹`, in the bins it was saved from as `M` is even.
-                let restore = Carried::Restore(c, -1.0 / d.frame[0] as f32);
+                // Less `E w`'s row transforms at `c`'s scale, `F_y⁻¹ M F_y / nx` of `w`'s
+                // with `M` the band's indicator: ahead of the unnormalized column FFT, `M / n`
+                // times the saved unnormalized `F_y⁻¹`, in the bins it was saved from as `M`
+                // is even.
+                let restore = Carried::Restore(c, -1.0 / d.n() as f32);
                 let flags = STAGE_COLS | STAGE_MUL | STAGE_CONJ | STAGE_POST_FWD;
                 self.stage(ctx, &l, stack, work, Some(mul(restore)), flags)
             }

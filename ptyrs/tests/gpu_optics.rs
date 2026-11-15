@@ -163,6 +163,7 @@ fn exit_stages_give_the_propagators_intensities_and_gram() {
             PlaneStage::None => ExitStage::None,
             PlaneStage::Reverse => ExitStage::Reverse,
             PlaneStage::Transfer(tf) => ExitStage::Transfer(up(&stream, tf)),
+            PlaneStage::Banded(_) => panic!("{name}: the Gram check needs a unitary stage"),
         };
         // The plane phase, shifted layout.
         let q: Vec<C64> = (0..n)
@@ -248,8 +249,7 @@ fn banded_stage_carries_the_band_into_the_adjoint() {
         ([64, 128], -1.5e-6),
         ([128, 64], 1.5e-6),
     ] {
-        let [ny, nx] = shape;
-        let n = ny * nx;
+        let n = shape[0] * shape[1];
         let d = dims(shape);
         let table = StackTable::new(&stream, &d, &[0..3, 3..5]).unwrap();
         let w = Wavefield::new(shape, 5e-7, [3e-7, 3e-7], z).unwrap();
@@ -312,10 +312,8 @@ fn banded_stage_carries_the_band_into_the_adjoint() {
                 .enumerate()
                 .map(|(i, v)| v * weight[i % n])
                 .collect();
-            let back = scaled(
-                &dft(&back, shape, false, true),
-                (nx as f64 / ny as f64).sqrt(),
-            );
+            // As the engines hand it over: the detector's unnormalized field over `n`.
+            let back = scaled(&dft(&back, shape, false, true), 1.0 / (n as f64).sqrt());
             let mut work = up(&stream, &back);
             let restore = BandCarry::Restore(&carry);
             k.exit_banded(&ctx, &d, table.at(s), &banded, &mut work, restore)
@@ -326,7 +324,7 @@ fn banded_stage_carries_the_band_into_the_adjoint() {
                 down(&stream, &up(&stream, &back))[live * n..],
                 "{shape:?}, stack {s}: planes past the stack"
             );
-            let got = scaled(&dft(&out, shape, true, true), 1.0 / nx as f64);
+            let got = dft(&out, shape, true, true);
             let err = max_rel(&got[..live * n], &want[..live * n]);
             assert!(err < 2e-5, "{shape:?}, stack {s}: adjoint {err:.3e}");
         }

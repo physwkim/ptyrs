@@ -3,19 +3,25 @@
 //!
 //! A record is one LLK of frames `0 .. n` of the scan, written through one [`RecordWriter`]:
 //! per stack, [`Kernels::llk`] into a staging buffer and [`RecordWriter::push`] of it, then
-//! [`RecordWriter::end`], the only advance of the cursor, which consumes the writer and
-//! returns the [`Ended`] the host count takes. These are ordinary launches, legal in a
-//! capture. The host counts each record with [`LlkRing::enqueued`], giving its `n`, once its
-//! launches, or the graph holding them, are enqueued. [`LlkRing::flush`] waits for and returns
-//! the [`LlkTotals`] of every record counted since the last read, in order, and
-//! [`LlkRing::poll`], without waiting, those of them whose copies have completed; each from
-//! [`LlkSums::from_partials`] over its frames with their unmasked pixels, which
-//! [`RingDevice::count`] counts once per frame. The same count adds each frame to the frame
-//! counts of its unmasked pixels, [`RingDevice::pixel_frames`], in integer adds, so they come
-//! out the same in any frame order. Every frame of record `k` must carry stamp
-//! `k`: a frame not pushed, a record ended but not counted or counted but not ended, or a
-//! slot overwritten before its copy, is a [`RingError::Stamp`], not a value; a frame pushed
-//! before it was counted is a [`RingError::Uncounted`].
+//! [`RecordWriter::end`], which consumes the writer and enqueues the record's one advance of
+//! the cursor. These are ordinary launches, legal in a capture. The ring counts a record,
+//! under its tag and `n`, exactly when its advance is enqueued, so its count is the cursor's:
+//! [`LlkRing::record`] begins an eager record that its end counts; [`LlkRing::capture`] lends
+//! the writer to launches captured into a graph, whose end only leaves the graph its
+//! [`Ended`]; [`LlkRing::replay`] counts one record per replay that enqueued. A call that
+//! fails before its advance counts nothing and may leave frames stamped with the number it
+//! began, which the next begin voids with an advance of its own, so no later record reads
+//! them; a call that fails after its advance keeps its record, so a retry can show one cycle
+//! twice.
+//!
+//! [`LlkRing::flush`] waits for and returns the [`LlkTotals`] of every record counted since
+//! the last read, in order, and [`LlkRing::poll`], without waiting, those of them whose copies
+//! have completed; each from [`LlkSums::from_partials`] over its frames with their unmasked
+//! pixels, which [`RingDevice::count`] counts once per frame. The same count adds each frame
+//! to the frame counts of its unmasked pixels, [`RingDevice::pixel_frames`], in integer adds,
+//! so they come out the same in any frame order. Every frame of record `k` must carry stamp
+//! `k`: a frame not pushed, or a slot overwritten before its copy, is a [`RingError::Stamp`],
+//! not a value; a frame pushed before it was counted is a [`RingError::Uncounted`].
 
 use std::collections::VecDeque;
 use std::ops::Range;
@@ -32,8 +38,9 @@ use crate::gpu::{
 
 /// The ring's device half, what a cycle launches on: `nslot` records of `nframe` stamped
 /// partials, the cursor numbering the current record, each frame's unmasked pixels and each
-/// detector pixel's unmasked frames. Only [`LlkRing::new`] builds one, and only a
-/// [`RecordWriter`] writes its records.
+/// detector pixel's unmasked frames. Only [`LlkRing::new`] builds one, only a
+/// [`RecordWriter`] writes its records, and only the writer's end or its ring's void of a
+/// number advances its cursor.
 pub struct RingDevice {
     base: Kernels,
     module: ring_kernels::LoadedModule,
@@ -52,11 +59,6 @@ pub struct RingDevice {
 }
 
 impl RingDevice {
-    /// Starts writing the current record.
-    pub fn record(&mut self) -> RecordWriter<'_> {
-        RecordWriter { dev: self }
-    }
-
     /// Counts the unmasked pixels of frames `frames` in `counts` (`nframe` frames of the
     /// scan), which every later push of those frames carries, and adds each frame to
     /// [`Self::pixel_frames`] of its unmasked pixels; after the frames' counts are in place
@@ -188,11 +190,20 @@ impl RingDevice {
 /// The current record being written: its pushes, then its one advance by [`Self::end`]. The
 /// writer holds the ring for the whole record, so no other record interleaves with it.
 #[must_use = "a record ends only through RecordWriter::end"]
-pub struct RecordWriter<'r> {
-    dev: &'r mut RingDevice,
+pub struct RecordWriter<'r, T> {
+    ring: &'r mut LlkRing<T>,
+    end: End<'r, T>,
 }
 
-impl RecordWriter<'_> {
+/// What [`RecordWriter::end`] does once the advance is enqueued.
+enum End<'r, T> {
+    /// Counts the eager record of [`LlkRing::record`] under its tag, of its frames.
+    Count(T, u32),
+    /// Leaves the graph being captured its [`Ended`]; nothing ran, so nothing is counted.
+    Capture(&'r mut Option<Ended>),
+}
+
+impl<T> RecordWriter<'_, T> {
     /// Copies the stack's partials, as [`Kernels::llk`] writes them (`nf_max` records), into
     /// the record with each frame's unmasked pixels, stamped with it.
     pub fn push(
@@ -202,13 +213,19 @@ impl RecordWriter<'_> {
         stack: StackRef<'_>,
         partials: &DeviceBuffer<LlkPartial>,
     ) -> Result<(), Error> {
-        self.dev.push(ctx, dims, stack, partials)
+        self.ring.dev.push(ctx, dims, stack, partials)
     }
 
-    /// Ends the record: the cursor numbers the next.
-    pub fn end(self, ctx: &ExecutionContext) -> Result<Ended, Error> {
-        self.dev.advance(ctx)?;
-        Ok(Ended(()))
+    /// Ends the record: enqueues the advance after which the cursor numbers the next, then
+    /// counts an eager record or leaves a capture its [`Ended`]. An error enqueued no advance
+    /// and counts nothing.
+    pub fn end(self, ctx: &ExecutionContext) -> Result<(), Error> {
+        self.ring.dev.advance(ctx)?;
+        match self.end {
+            End::Count(tag, nframe) => self.ring.counted(Some(tag), nframe),
+            End::Capture(ended) => *ended = Some(Ended(())),
+        }
+        Ok(())
     }
 }
 
@@ -240,16 +257,15 @@ pub struct FrameLlk {
     pub nobs: u32,
 }
 
-/// What [`RecordWriter::end`] returns: the launches that wrote it end one record each time
-/// they run, eagerly or as a graph captured from them, and [`LlkRing::enqueued`] counts one
-/// record per run.
+/// A captured graph's mark that it ends one record each time it runs: the capture's
+/// [`RecordWriter::end`] leaves it, and [`LlkRing::replay`] takes it to count one record per
+/// replay.
 #[derive(Debug)]
-#[must_use = "a record ended is counted with LlkRing::enqueued"]
 pub struct Ended(());
 
 /// An LLK ring of `nslot` records: the [`RingDevice`] the epochs write and its pinned host
-/// mirror, read in record order. The copy of record `k` is enqueued at most
-/// `max(nslot / 2, 1)` records after it, or by an earlier [`Self::poll`], and the host waits
+/// mirror, read in record order. The copy of record `k` is enqueued by the begin of record
+/// `k + max(nslot / 2, 1)` at the latest, or by an earlier [`Self::poll`], and the host waits
 /// for it only when it would otherwise overwrite `k`'s host slot, `nslot` records on, or on
 /// [`Self::flush`]; until then epochs keep enqueueing while earlier records download. `T` is
 /// the caller's tag of a record.
@@ -258,13 +274,16 @@ pub struct LlkRing<T> {
     /// Slot `k % nslot` holds record `k` once its copy has completed.
     host: PinnedHostBuffer<RingRecord>,
     /// Records counted, copied (the copy enqueued) and read: `read <= copied <= next`, and
-    /// `next - copied < max(nslot / 2, 1)` between calls, so the slot the next record
-    /// overwrites has been copied.
+    /// `next - copied < max(nslot / 2, 1)` once a record begins, so the slot it overwrites
+    /// has been copied. `next` is the advances enqueued, so the cursor numbers record `next`.
     next: u64,
     copied: u64,
     read: u64,
-    /// The tags and frame counts of records `read .. next`.
-    tags: VecDeque<(T, u32)>,
+    /// Whether frames stamped `next` may exist: a record begun and not counted, whose number
+    /// the next begin voids.
+    dirty: bool,
+    /// The tags and frame counts of records `read .. next`; a void record has neither.
+    tags: VecDeque<(Option<T>, u32)>,
     /// The copies not yet read, oldest first: each one's end record and the event after it;
     /// their ranges tile `read .. copied`.
     copies: VecDeque<(u64, Event)>,
@@ -317,6 +336,7 @@ impl<T> LlkRing<T> {
             next: 0,
             copied: 0,
             read: 0,
+            dirty: false,
             tags: VecDeque::new(),
             copies: VecDeque::new(),
             done: Vec::new(),
@@ -328,16 +348,54 @@ impl<T> LlkRing<T> {
         &mut self.dev
     }
 
-    /// Counts the next record, of frames `0 .. nframe`, under `tag`, once per run of the
-    /// launches that returned `ended`, after that run is enqueued on `ctx`'s stream; enqueues
-    /// the copy of the records not yet copied when they make a batch.
-    pub fn enqueued(
+    /// Begins the next record, of frames `0 .. nframe` under `tag`, for the launches enqueued
+    /// on `ctx`'s stream from here; its [`RecordWriter::end`] counts it, and a writer dropped
+    /// unended counts nothing.
+    pub fn record(
+        &mut self,
+        ctx: &ExecutionContext,
+        tag: T,
+        nframe: u32,
+    ) -> Result<RecordWriter<'_, T>, RingError> {
+        self.begin(ctx, nframe)?;
+        Ok(RecordWriter {
+            ring: self,
+            end: End::Count(tag, nframe),
+        })
+    }
+
+    /// The writer of launches being captured into a graph: nothing runs and nothing is
+    /// counted, and its end leaves `ended` the [`Ended`] each [`Self::replay`] of the graph
+    /// takes.
+    pub fn capture<'r>(&'r mut self, ended: &'r mut Option<Ended>) -> RecordWriter<'r, T> {
+        RecordWriter {
+            ring: self,
+            end: End::Capture(ended),
+        }
+    }
+
+    /// Begins the next record, of frames `0 .. nframe` under `tag`, enqueues it by `launch`
+    /// on `ctx`'s stream, and counts it if `launch` returns Ok. `launch` replays the graphs
+    /// whose capture left `ended`, the one holding the end last: Ok when it enqueued that
+    /// graph, so the advance once, an error when it enqueued no advance.
+    pub fn replay<E: From<RingError>>(
         &mut self,
         ctx: &ExecutionContext,
         _ended: &Ended,
         tag: T,
         nframe: u32,
-    ) -> Result<(), RingError> {
+        launch: impl FnOnce() -> Result<(), E>,
+    ) -> Result<(), E> {
+        self.begin(ctx, nframe)?;
+        launch()?;
+        self.counted(Some(tag), nframe);
+        Ok(())
+    }
+
+    /// Readies the cursor's number for a record of frames `0 .. nframe`: voids it first if a
+    /// record begun under it was not counted, then enqueues the copy of the records not yet
+    /// copied if they make a batch, so the slot the record overwrites has been copied.
+    fn begin(&mut self, ctx: &ExecutionContext, nframe: u32) -> Result<(), RingError> {
         if nframe > self.dev.nframe {
             return Err(Error::Shape(format!(
                 "a record of {nframe} frames, the ring holds {}",
@@ -345,12 +403,23 @@ impl<T> LlkRing<T> {
             ))
             .into());
         }
-        self.next += 1;
-        self.tags.push_back((tag, nframe));
+        if self.dirty {
+            self.dev.advance(ctx)?;
+            self.counted(None, 0);
+        }
         if self.next - self.copied >= self.batch() {
             self.copy_out(ctx)?;
         }
+        self.dirty = true;
         Ok(())
+    }
+
+    /// Counts the record whose advance was just enqueued: `tag`'s, of frames `0 .. nframe`,
+    /// or with no tag a void one.
+    fn counted(&mut self, tag: Option<T>, nframe: u32) {
+        self.next += 1;
+        self.tags.push_back((tag, nframe));
+        self.dirty = false;
     }
 
     /// The tags and totals of every record counted since the last flush or poll, in order:
@@ -446,8 +515,9 @@ impl<T> LlkRing<T> {
         let (end, _) = self.copies.pop_front().expect("a copy not read");
         let first = self.read;
         self.read = end;
-        let tags: Vec<(T, u32)> = self.tags.drain(..(end - first) as usize).collect();
+        let tags: Vec<(Option<T>, u32)> = self.tags.drain(..(end - first) as usize).collect();
         for (k, (tag, nframe)) in (first..end).zip(tags) {
+            let Some(tag) = tag else { continue };
             match self.parse(k, nframe) {
                 Ok(frames) => self.done.push((tag, frames)),
                 Err(e) => {
@@ -506,8 +576,7 @@ impl<T> Drop for LlkRing<T> {
 pub enum RingError {
     Gpu(Error),
     /// Frame `frame` of record `record` holds stamp `found`, not `record`: a frame not pushed
-    /// for it, a record ended but not counted or counted but not ended, or a slot overwritten
-    /// before its copy.
+    /// for it, or a slot overwritten before its copy.
     Stamp {
         record: u64,
         frame: usize,
@@ -665,7 +734,8 @@ mod tests {
             ..RingRecord::default()
         };
         ring.host.as_mut_slice().fill(old);
-        ring.enqueued(&ctx, &Ended(()), (), 4).unwrap();
+        ring.record(&ctx, (), 4).unwrap().end(&ctx).unwrap();
+        ring.copy_out(&ctx).unwrap();
         stream.synchronize().unwrap();
         let seqs: Vec<u64> = ring.host.as_slice().iter().map(|r| r.seq).collect();
         assert_eq!(

@@ -3,10 +3,11 @@
 use crate::gpu::{Error as GpuError, Exit, FusedBufs, FusedInputs, FusedSums, ShiftProbe};
 use cuda_async::device_operation::ExecutionContext;
 
-use super::device::{CarriedMut, M1Bufs, PassesMut, Sample, another_model};
+use super::device::{CarriedMut, M1Bufs, OneSlice, PassesMut, Sample, another_model};
 use super::{Bufs, Epoch, GpuPtycho};
 use crate::engine::ptycho::llk_due;
 use crate::engine::{DmParams, EngineError};
+use crate::fault;
 
 impl GpuPtycho {
     /// [`crate::engine::Ptycho::dm`]. Cycle 0 of a call projects `PO` itself (the reflection maps
@@ -72,12 +73,13 @@ pub(super) enum Mix {
 }
 
 /// A DM or RAAR cycle: its [`Mix`], `first` for cycle 0 of a call, and `loops` object-only
-/// then probe-only updates with `inertia` (object, probe).
+/// then probe-only updates with `inertia` (object, probe), on an object of `one` slice.
 pub(super) struct Carried {
     pub mix: Mix,
     pub first: bool,
     pub inertia: [Option<f64>; 2],
     pub loops: usize,
+    pub one: OneSlice,
 }
 
 impl Bufs<'_> {
@@ -89,6 +91,7 @@ impl Bufs<'_> {
         w: &mut CarriedMut<'_>,
         params: &DmParams,
         first: bool,
+        one: OneSlice,
     ) -> Result<(), GpuError> {
         let c = Carried {
             mix: Mix::Dm {
@@ -97,6 +100,7 @@ impl Bufs<'_> {
             first,
             inertia: [params.obj_inertia, params.probe_inertia],
             loops: params.loop_obj_probe,
+            one,
         };
         self.carried_cycle(ctx, passes, w, &c)
     }
@@ -116,6 +120,7 @@ impl Bufs<'_> {
         match passes {
             PassesMut::M1(m1) => {
                 for s in 0..w.cut.len() {
+                    fault::at(fault::Exit::DmStack)?;
                     match c.mix {
                         Mix::Dm { alpha } => self.dm_m1(ctx, m1, w, s, alpha, c.first)?,
                         Mix::Raar { beta } => self.raar_m1(ctx, m1, w, s, beta, c.first)?,
@@ -125,19 +130,14 @@ impl Bufs<'_> {
             PassesMut::Fused(f) => {
                 summed = c.loops > 0 && obj_inertia.is_some();
                 if self.features.stepped() {
-                    // No record, so nothing ended.
-                    let _ = self.step_features(ctx, f, None)?;
+                    self.step_features(ctx, f, None, c.one)?;
                 }
                 let dims = *self.views.dims();
-                let mut m = self.features.lend(
-                    ctx,
-                    self.kernels,
-                    &dims,
-                    self.obj,
-                    self.probe,
-                    self.exit,
-                )?;
+                let mut m = (self.features)
+                    .lend(ctx, self.kernels, &dims, self.obj, self.probe, self.exit)?
+                    .one_slice(c.one);
                 for s in 0..w.cut.len() {
+                    fault::at(fault::Exit::DmStack)?;
                     let stack = w.cut.at(s);
                     let (psi, iterate, windows) = w.fused(s);
                     let exit = match c.mix {
@@ -217,10 +217,10 @@ impl Bufs<'_> {
                     match passes {
                         PassesMut::Fused(f) if self.features.shifted() => {
                             // The probe's step is taken there.
-                            self.shifted_sums(ctx, f, w, o.is_some(), p.take())?;
+                            self.shifted_sums(ctx, f, w, o.is_some(), p.take(), c.one)?;
                         }
                         PassesMut::Fused(_) if self.features.samples_object() => {
-                            self.windowed_sums(ctx, w, o.is_some(), p.is_some())?;
+                            self.windowed_sums(ctx, w, o.is_some(), p.is_some(), c.one)?;
                         }
                         _ => {
                             for s in 0..w.cut.len() {
@@ -249,11 +249,12 @@ impl Bufs<'_> {
         w: &CarriedMut<'_>,
         obj: bool,
         probe: Option<f64>,
+        one: OneSlice,
     ) -> Result<(), GpuError> {
         let dims = *self.views.dims();
-        let mut m =
-            self.features
-                .lend(ctx, self.kernels, &dims, self.obj, self.probe, self.exit)?;
+        let mut m = (self.features)
+            .lend(ctx, self.kernels, &dims, self.obj, self.probe, self.exit)?
+            .one_slice(one);
         for s in 0..w.cut.len() {
             let inputs = FusedInputs {
                 views: self.views,
@@ -307,11 +308,12 @@ impl Bufs<'_> {
         w: &mut CarriedMut<'_>,
         obj: bool,
         probe: bool,
+        one: OneSlice,
     ) -> Result<(), GpuError> {
         let dims = *self.views.dims();
-        let mut m =
-            self.features
-                .lend(ctx, self.kernels, &dims, self.obj, self.probe, self.exit)?;
+        let mut m = (self.features)
+            .lend(ctx, self.kernels, &dims, self.obj, self.probe, self.exit)?
+            .one_slice(one);
         // The object's sums read the views and the probe alone.
         let sample = match probe {
             true => Sample::Windows,

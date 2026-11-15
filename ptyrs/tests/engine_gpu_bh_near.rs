@@ -1,20 +1,51 @@
 //! GPU BH under the propagators with a plane stage against the CPU's `f64` [`Bh`] from the
-//! same start, on the cases of `common/near.rs`.
+//! same start, on the cases of `common/near.rs` and on angular spectrum with an evanescent
+//! band, which BH carries as the CPU's does.
 
 use std::slice;
 
-use ptyrs::base::{C64, Stack};
-use ptyrs::engine::{Bh, BhParams, BhStep, Feature, Features, Ptycho, Sampling};
+use ptyrs::base::{C64, Object, Probe, Stack};
+use ptyrs::engine::{Bh, BhParams, BhStep, Feature, Features, Sampling, SliceWaves, llk};
 
 #[path = "common/near.rs"]
 mod near;
-use near::{NPOS, cases, drawn_offsets};
+use near::{Case, NPOS, PIXEL, cases, drawn_offsets};
 #[path = "common/worst.rs"]
 mod worst;
 use worst::worst_of;
 
 /// The far-field GPU-against-CPU BH tests' bound on steps, arrays and LLK.
 const TOL: f64 = 1e-4;
+/// A wavelength whose angular spectrum over [`PIXEL`] drops the corners of the frequency
+/// grid, `λ / pixel` the CPU's near case's 5/3.
+const BAND_WAVELENGTH: f64 = PIXEL / 0.6;
+
+/// [`cases`] and angular spectrum with an evanescent band.
+fn bh_cases() -> impl Iterator<Item = Case> {
+    let band = near::case("evanescent band", BAND_WAVELENGTH, 6.0 * BAND_WAVELENGTH);
+    cases().into_iter().chain([band])
+}
+
+/// The CPU's normalised Poisson LLK of `object` and `probe` under `Sampling::FullObject`, the
+/// object read at each view's corner plus its frame's entry of `offsets`.
+fn full_object_llk(c: &Case, object: &Object, probe: &Probe, offsets: &[[f64; 2]]) -> f64 {
+    let (optics, views) = (c.optics(), c.addr.views());
+    let offsets = (!offsets.is_empty()).then_some(offsets);
+    let objects = slice::from_ref(object);
+    let waves = SliceWaves::with_sampling(
+        &optics,
+        views,
+        objects,
+        probe,
+        offsets,
+        Sampling::FullObject,
+    );
+    let mut psi = waves.psi().to_vec();
+    optics.exit().forward(&mut psi);
+    llk(&c.obs, 0..c.addr.nframe(), c.addr.nmode(), &psi)
+        .normalised(c.obs.nb_obs())
+        .poisson
+}
 
 fn params(batch_size: usize) -> BhParams {
     BhParams {
@@ -70,7 +101,7 @@ fn check(what: &str, names: &[&str], errs: &[f64]) {
 #[test]
 fn bh_steps_match_cpu_under_every_propagator() {
     const NEPOCH: usize = 3;
-    for c in cases() {
+    for c in bh_cases() {
         for batch_size in [NPOS, 4] {
             let p = params(batch_size);
             let mut bh = Bh::new(p).unwrap();
@@ -122,7 +153,7 @@ fn bh_steps_match_cpu_under_every_propagator() {
 fn bh_position_matches_cpu_under_every_propagator() {
     const NEPOCH: usize = 4;
     let d0 = drawn_offsets();
-    for c in cases() {
+    for c in bh_cases() {
         for position in [Feature::refined(d0.clone()), Feature::held(d0.clone())] {
             let named = if position.refine { "refined" } else { "held" };
             let moved = Features {
@@ -193,7 +224,7 @@ fn bh_full_object_matches_cpu_under_every_propagator() {
         ("positions", moved(Feature::refined(d0.clone()))),
         ("held", moved(Feature::held(d0))),
     ];
-    for c in cases() {
+    for c in bh_cases() {
         for (named, features) in runs.clone() {
             for batch_size in [NPOS, 4] {
                 let p = params(batch_size);
@@ -213,13 +244,9 @@ fn bh_full_object_matches_cpu_under_every_propagator() {
                         &mut pr,
                     );
                 }
-                let want = bh.features().clone();
-                let mut cpu =
-                    Ptycho::with_optics(&c.scan, c.optics(), o.clone(), pr.clone()).unwrap();
-                cpu.set_sampling(Sampling::FullObject);
-                cpu.set_features(want.clone()).unwrap();
-                let llk = cpu.llk().poisson;
-                let want = want.position.map(|d| d.values).unwrap_or_default();
+                let want = bh.features().position.clone();
+                let want = want.map(|d| d.values).unwrap_or_default();
+                let llk = full_object_llk(&c, &o, &pr, &want);
                 let scale = want.iter().flatten().fold(0.0f64, |m, v| m.max(v.abs()));
                 for graph in [false, true] {
                     let mut gpu = c.gpu(graph);
