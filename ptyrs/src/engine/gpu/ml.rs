@@ -227,7 +227,7 @@ impl Bufs<'_> {
             counts: self.counts,
             model: Model {
                 shift: None,
-                ..m.model
+                ..m.model()
             },
         };
         let mut line = match (m.moves(), ml.position.as_deref_mut()) {
@@ -299,7 +299,7 @@ impl Bufs<'_> {
                             probe,
                             model: Model {
                                 shift: Some(shift),
-                                ..m.model
+                                ..m.model()
                             },
                         };
                         self.kernels.shifted_probe(ctx, &inputs, stack, w)?;
@@ -360,7 +360,7 @@ impl Bufs<'_> {
                     counts: self.counts,
                     obj: read.blocks,
                     probe: self.probe,
-                    model: m.model,
+                    model: m.model(),
                 };
                 let sums = FusedSums::default();
                 (self.kernels).fused_project(ctx, &inputs, stack, exit, f, sums)?;
@@ -372,7 +372,7 @@ impl Bufs<'_> {
                 counts: self.counts,
                 obj: self.obj,
                 probe: self.probe,
-                model: m.model,
+                model: m.model(),
             };
             let sums = FusedSums {
                 shift: m.shift_sums(None, true),
@@ -438,7 +438,7 @@ impl Bufs<'_> {
                     counts: self.counts,
                     obj: read.blocks,
                     probe: self.probe,
-                    model: m.model,
+                    model: m.model(),
                 };
                 let far = FarSums {
                     llk: llk.is_some().then_some(&mut *self.llk),
@@ -463,7 +463,7 @@ impl Bufs<'_> {
                 counts: self.counts,
                 obj: self.obj,
                 probe: self.probe,
-                model: m.model,
+                model: m.model(),
             };
             let far = FarSums {
                 llk: llk.is_some().then_some(&mut *self.llk),
@@ -565,7 +565,7 @@ impl Bufs<'_> {
                 let model = Model {
                     scale: None,
                     background: None,
-                    ..m.model
+                    ..m.model()
                 };
                 for s in 0..self.scratch.len() {
                     let stack = self.scratch.at(s);
@@ -588,7 +588,7 @@ impl Bufs<'_> {
                         &dims,
                         stack,
                         self.llk,
-                        m.model.scale,
+                        m.model().scale,
                         ml.photons,
                     )?;
                 }

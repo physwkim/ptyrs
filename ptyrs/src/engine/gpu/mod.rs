@@ -949,7 +949,7 @@ impl Bufs<'_> {
                         counts: self.counts,
                         obj: obj.first,
                         probe: self.probe,
-                        model: m.model,
+                        model: m.model(),
                     };
                     let far = FarSums {
                         llk: Some(&mut *self.llk),
@@ -996,7 +996,7 @@ impl Bufs<'_> {
                 counts: self.counts,
                 obj,
                 probe: self.probe,
-                model: m.model,
+                model: m.model(),
             };
             let far = m.far(llk.is_some().then_some(&mut *self.llk));
             self.kernels.fused_llk(ctx, &inputs, stack, f, far)?;

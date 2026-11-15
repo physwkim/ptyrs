@@ -174,7 +174,7 @@ impl Bufs<'_> {
                             counts: self.counts,
                             obj: read.blocks,
                             probe: self.probe,
-                            model: m.model,
+                            model: m.model(),
                         };
                         let sums = FusedSums {
                             obj: summed.then(|| win.zeroed_sums(ctx)).transpose()?,
@@ -198,7 +198,7 @@ impl Bufs<'_> {
                         counts: self.counts,
                         obj: self.obj,
                         probe: self.probe,
-                        model: m.model,
+                        model: m.model(),
                     };
                     let sums = FusedSums {
                         obj: summed.then_some(&mut *self.obj_sums),
@@ -264,7 +264,7 @@ impl Bufs<'_> {
                 counts: self.counts,
                 obj: self.obj,
                 probe: self.probe,
-                model: m.model,
+                model: m.model(),
             };
             let (stack, psi) = (w.cut.at(s), w.psi(s));
             if obj {
@@ -282,7 +282,7 @@ impl Bufs<'_> {
             return Ok(());
         };
         m.probe_sums(ctx, self.kernels, &dims, self.probe_sums)?;
-        let model = m.model;
+        let model = m.model();
         let Some(ShiftProbe::Step(step)) = m.shift_sums(Some(ShiftProbe::Step), false).probe else {
             return Ok(());
         };

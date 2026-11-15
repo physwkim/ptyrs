@@ -852,7 +852,7 @@ pub(super) struct AnySlices;
 /// sums the passes write; `K`, [`OneSlice`] or [`AnySlices`], is what the lend may read of
 /// the object.
 pub(super) struct Modelled<'b, K> {
-    pub model: Model<'b>,
+    model: Model<'b>,
     sampled: Option<Sampled<'b>>,
     scale: Option<&'b mut DeviceBuffer<ScalePartial>>,
     background: Option<&'b mut BackgroundSums>,
@@ -1116,6 +1116,12 @@ impl<'b> Modelled<'b, AnySlices> {
 }
 
 impl<'b, K> Modelled<'b, K> {
+    /// The model the passes that compare with the counts read, its shift none while the
+    /// lend samples the object ([`Self::moves`]).
+    pub fn model(&self) -> Model<'b> {
+        self.model
+    }
+
     /// What the lend's position model moves, as [`FeaturesMut::lend`] took it from one
     /// [`Mover`], which gives the shift or the sampler, never both.
     pub fn moves(&self) -> Moves<'b> {
