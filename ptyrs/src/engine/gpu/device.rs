@@ -2132,6 +2132,58 @@ impl BhState {
         scratch: Option<MovedScratch>,
     ) -> Result<Self, EngineError> {
         let dims = views.dims();
+        let frames = rule.frames(&Self::streamed(dims, deeper, scratch));
+        // Only the shift's sums borrow the shared scratch.
+        let frames = match scratch {
+            Some(
+                s @ MovedScratch {
+                    sampling: MovedSampling::Patch,
+                    ..
+                },
+            ) => frames.min(s.frames),
+            _ => frames,
+        };
+        let (cut, batches) = batch_stacks(stream, dims, size, frames)?;
+        let len = cut.wave_len(dims);
+        let plans = cut.plans(stream, dims)?;
+        let slots = batches.iter().map(|b| b.len()).max().unwrap_or(0);
+        let moved = (scratch
+            .map(|s| BhMoved::new(stream, kernels, dims, &cut, slots, (s, deeper))))
+        .transpose()?;
+        let sliced = (deeper > 0)
+            .then(|| BhSliced::new(stream, dims, len, slots, deeper))
+            .transpose()?;
+        let Cut {
+            frames: stacks,
+            table,
+            ..
+        } = cut;
+        let zeroed = |len| DeviceBuffer::<C32>::zeroed(stream, len);
+        Ok(Self {
+            size,
+            plans,
+            psi: (0..slots).map(|_| zeroed(len)).collect::<Result<_, _>>()?,
+            r: (0..slots).map(|_| zeroed(len)).collect::<Result<_, _>>()?,
+            lu: zeroed(len)?,
+            lv: zeroed(len)?,
+            prev: [
+                zeroed(dims.obj_len())?,
+                zeroed(dims.nprobe as usize * dims.n())?,
+            ],
+            order: EpochOrder::new(kernels, stream, views)?,
+            parts: BhParts::zeroed(stream, dims, deeper)?,
+            steps: DeviceBuffer::zeroed(stream, BH_STEP as usize * batches.len())?,
+            batches,
+            stacks,
+            table,
+            moved,
+            sliced,
+        })
+    }
+
+    /// The buffers of a stack's two loops through an object of `deeper` slices past the first,
+    /// under `scratch`'s position model if any, by the passes that touch them.
+    fn streamed(dims: &ViewDims, deeper: usize, scratch: Option<MovedScratch>) -> Vec<Streamed> {
         // The batch's two loops in turn. Without the position: psi (`obj_probe_to_psi` 0, the
         // transform, the residual 2), r (the adjoint, the sums 4), lu and lv (`far` 5, the
         // transforms, `hess_frames` 8). With it: the moved probes (`shifted_probe` 0,
@@ -2146,17 +2198,21 @@ impl BhState {
         // accumulate 18, the inverse and the add); then the windows of `u_O` and `v_O` (six
         // sampler calls from 21), `win_lift` 39, lu and lv (`far` 40, the transforms,
         // `hess_frames` 43), the second derivatives (three sampler calls from 44) and r and
-        // the derivatives' windows to `win_hess` 53. Through a multislice object the first
-        // loop hands on two waves per pass boundary, the second lu, lv and the three second
-        // derivatives of the exit waves from slice to slice. Under full-object sampling as
-        // well, through two slices: a slice's window (sampler call 0, 5) ahead of its wave
-        // (`slice_mul` 3, 8; the gap 4), psi (the transform, the residual 10), r (the adjoint,
-        // `slice_pair` 12, `slice_adjoint` 26), then per slice from the last its derivatives'
-        // windows (13 and 16, 29 and 32) to `win_grad` (19, 35), whose patches `place` takes
-        // (20, 36), and the work wave from `slice_pair` to `win_grad` and from `slice_adjoint`
-        // 26 to the first slice's `psi_to_probe` 28 and `win_grad`; then per slice the windows
-        // of `u_O` and `v_O` (42 and 45, 55 and 58) to `win_lift` and `slice_tangent` (49,
-        // 62), the second's window and entering wave read there again by `slice_adjoint` 89
+        // the derivatives' windows to `win_hess` 53. Through a multislice object, two slices: the
+        // wave entering the second (`slice_mul` 0, the gap, `slice_mul` 2, `slice_pair` 8), psi
+        // (the phase, the transform, the residual 5), r (the adjoint, the phase's, `slice_pair`,
+        // `slice_adjoint` 10), the work wave from `slice_pair` to `psi_to_obj` 9 and from
+        // `slice_adjoint` (the gap) to `psi_to_obj` and `psi_to_probe` 13; then lu, lv and the
+        // three second derivatives from `slice_tangent` 14 through the gaps and the second's
+        // `slice_tangent` 20, the phases and the transforms to `sliced_hess_frames` 25. Under
+        // full-object sampling as well, through two slices: a slice's window (sampler call 0, 5)
+        // ahead of its wave (`slice_mul` 3, 8; the gap 4), psi (the transform, the residual 10), r
+        // (the adjoint, `slice_pair` 12, `slice_adjoint` 26), then per slice from the last its
+        // derivatives' windows (13 and 16, 29 and 32) to `win_grad` (19, 35), whose patches
+        // `place` takes (20, 36), and the work wave from `slice_pair` to `win_grad` and from
+        // `slice_adjoint` 26 to the first slice's `psi_to_probe` 28 and `win_grad`; then per slice
+        // the windows of `u_O` and `v_O` (42 and 45, 55 and 58) to `win_lift` and `slice_tangent`
+        // (49, 62), the second's window and entering wave read there again by `slice_adjoint` 89
         // and `slice_pair` 66, lu, lv and the three second derivatives from 49 to
         // `sliced_hess_frames` 65, and per slice from the last its derivatives' windows (four
         // calls from 67, 91) and second derivatives (three from 79, 103) to `win_hess` (88,
@@ -2171,9 +2227,13 @@ impl BhState {
         // slices' `slice_tangent` 30 and 36 with the gaps between, `phase_tangent` 37, the
         // phase, the transforms, `sliced_hess_frames` 42), the three second derivatives alike
         // from `pos_second` 24, and the entering wave again from 36 to 37. A slice past the
-        // second repeats the second's passes, booked once. Held, the offsets' passes drop out
-        // and the others keep their numbers: r ends at `shifted_psi_sums`' 7, and lu and lv
-        // at `moved_far`, in `pos_far`'s place right after their transforms (20); under
+        // second repeats the second's passes and holds its entering wave, and under full-object
+        // sampling its window, to the backward sweep: each is booked across the second's passes
+        // from its first forward one to past its last backward one (1 to 12; with the moved probes
+        // 3 to 15; under full-object sampling 4 to 28 and, refined, through the second loop's 50 to
+        // 91), so a boundary books the most that any slice's turn at it holds. Held, the offsets'
+        // passes drop out and the others keep their numbers: r ends at `shifted_psi_sums`' 7, and
+        // lu and lv at `moved_far`, in `pos_far`'s place right after their transforms (20); under
         // full-object sampling only block 0's windows are sampled, `win_obj_grad` takes
         // `win_grad`'s place, and `win_lift`, the second derivatives and `win_hess` drop out,
         // through a multislice object everything from 66; with the moved probes through a
@@ -2182,19 +2242,27 @@ impl BhState {
         // entering wave is not read again.
         let wave = wave_bytes(dims);
         let refined = scratch.is_some_and(|s| s.refined);
-        let streamed = match scratch.map(|s| s.sampling) {
-            None => {
+        // The slices past the second.
+        let more = deeper.saturating_sub(1);
+        match scratch.map(|s| s.sampling) {
+            None if deeper > 0 => {
                 let mut s = vec![
-                    Streamed::new(wave, 0..=2),
-                    Streamed::new(wave, 2..=4),
-                    Streamed::new(wave, 5..=8),
-                    Streamed::new(wave, 5..=8),
+                    Streamed::new(wave, 0..=8),
+                    Streamed::new(wave, 2..=5),
+                    Streamed::new(wave, 5..=10),
+                    Streamed::new(wave, 8..=9),
+                    Streamed::new(wave, 10..=13),
                 ];
-                if deeper > 0 {
-                    s.extend([Streamed::new(wave, 5..=8); 3]);
-                }
+                s.extend(vec![Streamed::new(wave, 1..=12); more]);
+                s.extend([Streamed::new(wave, 14..=25); 5]);
                 s
             }
+            None => vec![
+                Streamed::new(wave, 0..=2),
+                Streamed::new(wave, 2..=4),
+                Streamed::new(wave, 5..=8),
+                Streamed::new(wave, 5..=8),
+            ],
             Some(MovedSampling::FullObject { held, scratch, acc }) if deeper > 0 => {
                 let win = Windows::bytes(dims);
                 let calls: &[_] = if refined {
@@ -2241,6 +2309,7 @@ impl BhState {
                     Streamed::new(wave, 12..=19),
                     Streamed::new(wave, 26..=35),
                 ]);
+                s.extend(vec![Streamed::new(wave + win, 4..=28); more]);
                 if refined {
                     s.extend([
                         Streamed::new(win, 62..=89),
@@ -2249,6 +2318,7 @@ impl BhState {
                         Streamed::new(wave, 66..=88),
                         Streamed::new(wave, 89..=112),
                     ]);
+                    s.extend(vec![Streamed::new(wave + win, 50..=91); more]);
                 }
                 s.extend([Streamed::new(wave, 49..=65); 5]);
                 s
@@ -2298,6 +2368,7 @@ impl BhState {
                     Streamed::new(wave, 7..=13),
                     Streamed::new(wave, 11..=12),
                 ];
+                s.extend(vec![Streamed::new(wave, 3..=15); more]);
                 if refined {
                     s.extend([
                         Streamed::new(wave, 13..=20),
@@ -2336,54 +2407,7 @@ impl BhState {
                 s.extend(Streamed::shifted_psi_sums(dims, 6));
                 s
             }
-        };
-        let frames = rule.frames(&streamed);
-        // Only the shift's sums borrow the shared scratch.
-        let frames = match scratch {
-            Some(
-                s @ MovedScratch {
-                    sampling: MovedSampling::Patch,
-                    ..
-                },
-            ) => frames.min(s.frames),
-            _ => frames,
-        };
-        let (cut, batches) = batch_stacks(stream, dims, size, frames)?;
-        let len = cut.wave_len(dims);
-        let plans = cut.plans(stream, dims)?;
-        let slots = batches.iter().map(|b| b.len()).max().unwrap_or(0);
-        let moved = (scratch
-            .map(|s| BhMoved::new(stream, kernels, dims, &cut, slots, (s, deeper))))
-        .transpose()?;
-        let sliced = (deeper > 0)
-            .then(|| BhSliced::new(stream, dims, len, slots, deeper))
-            .transpose()?;
-        let Cut {
-            frames: stacks,
-            table,
-            ..
-        } = cut;
-        let zeroed = |len| DeviceBuffer::<C32>::zeroed(stream, len);
-        Ok(Self {
-            size,
-            plans,
-            psi: (0..slots).map(|_| zeroed(len)).collect::<Result<_, _>>()?,
-            r: (0..slots).map(|_| zeroed(len)).collect::<Result<_, _>>()?,
-            lu: zeroed(len)?,
-            lv: zeroed(len)?,
-            prev: [
-                zeroed(dims.obj_len())?,
-                zeroed(dims.nprobe as usize * dims.n())?,
-            ],
-            order: EpochOrder::new(kernels, stream, views)?,
-            parts: BhParts::zeroed(stream, dims, deeper)?,
-            steps: DeviceBuffer::zeroed(stream, BH_STEP as usize * batches.len())?,
-            batches,
-            stacks,
-            table,
-            moved,
-            sliced,
-        })
+        }
     }
 
     /// The sampling its views read the object under, if the state is the position model's.
@@ -3856,5 +3880,59 @@ mod tests {
                 if s == "ML state built for another position model"),
             "{r:?}"
         );
+    }
+
+    /// A stack's first loop through `n` slices holds the wave entering each slice past the
+    /// first and the last one's exit wave to the backward sweep, `n` waves, and under
+    /// full-object sampling each slice's window beside its wave: 1 MiB and 0.5 MiB a frame at
+    /// 256x256 against a 24 MiB budget. Whatever the position model, held or refined, the
+    /// stack [`BhState`] books holds them through 10 slices; without full-object sampling it
+    /// books them exactly from 7, where the first loop outweighs the second.
+    #[test]
+    fn bh_books_a_held_wave_per_slice() {
+        let dims = ViewDims {
+            nframe: 400,
+            nmode: 2,
+            nprobe: 2,
+            nobj: 1,
+            frame: [256; 2],
+            obj: [1024; 2],
+            quad_phase: 0.0,
+        };
+        let rule = StackRule::new(None, 64 << 20, 1, &dims).unwrap();
+        let (wave, win) = (wave_bytes(&dims), Windows::bytes(&dims));
+        let full = MovedSampling::FullObject {
+            held: 0,
+            scratch: 0,
+            acc: 0,
+        };
+        let moved = |sampling, refined| {
+            Some(MovedScratch {
+                frames: dims.nframe,
+                sampling,
+                refined,
+            })
+        };
+        let arms = [
+            ("unmoved", None, wave),
+            ("held patch", moved(MovedSampling::Patch, false), wave),
+            ("refined patch", moved(MovedSampling::Patch, true), wave),
+            ("held full object", moved(full, false), wave + win),
+            ("refined full object", moved(full, true), wave + win),
+        ];
+        for (name, scratch, per_slice) in arms {
+            for n in 2..=10 {
+                let frames = rule.frames(&BhState::streamed(&dims, n - 1, scratch)) as usize;
+                let held = n * per_slice;
+                assert!(
+                    frames * held <= rule.budget,
+                    "{name}, {n} slices: {frames} frames hold {} bytes",
+                    frames * held
+                );
+                if n >= 7 && per_slice == wave {
+                    assert_eq!(frames, rule.budget / held, "{name}, {n} slices");
+                }
+            }
+        }
     }
 }
