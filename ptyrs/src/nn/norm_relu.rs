@@ -99,8 +99,8 @@ impl NormReluOps for CubeBackend {
     }
 }
 
-/// What the backward reads: the input and γ as the forward packed them, the output (ReLU's mask)
-/// and the statistics.
+/// What [`backward`] reads, as only [`forward`] makes it: the input and γ as it checked and packed
+/// them, the output (ReLU's mask) and the statistics.
 #[derive(Clone, Debug)]
 struct Saved {
     x: CubeTensor,
@@ -120,8 +120,7 @@ impl Backward<CubeBackend, 3> for NormReluBackward {
     fn backward(self, ops: Ops<Saved, 3>, grads: &mut Gradients, _: &mut Checkpointer) {
         let [px, pg, pb] = ops.parents;
         let dy = grads.consume::<CubeBackend>(&ops.node);
-        let s = ops.state;
-        let [dx, dg, db] = backward(s.x, s.gamma, s.y, s.mean, s.var, s.epsilon, dy);
+        let [dx, dg, db] = backward(ops.state, dy);
         for (parent, grad) in [(px, dx), (pg, dg), (pb, db)] {
             if let Some(node) = parent {
                 grads.register::<CubeBackend>(node.id, grad);
@@ -330,19 +329,19 @@ fn forward(x: CubeTensor, gamma: CubeTensor, beta: CubeTensor, epsilon: f64) -> 
     }
 }
 
-fn backward(
-    x: CubeTensor,
-    gamma: CubeTensor,
-    y: CubeTensor,
-    mean: CubeTensor,
-    var: CubeTensor,
-    epsilon: f64,
-    dy: CubeTensor,
-) -> [CubeTensor; 3] {
-    // The rest are `forward`'s.
+fn backward(s: Saved, dy: CubeTensor) -> [CubeTensor; 3] {
+    let Saved {
+        x,
+        gamma,
+        y,
+        mean,
+        var,
+        epsilon,
+    } = s;
+    // `forward` checked or made the rest.
     let [rows, cols] = x.meta.shape().dims();
     check_operands(&x, &[(&dy, &[rows, cols])]);
-    let Some(g) = Grid::new(&x, &[&gamma, &y, &mean, &var, &dy]) else {
+    let Some(g) = Grid::new(&x, &[&dy]) else {
         return [empty(&x, [rows, 0]), empty(&x, [0]), empty(&x, [0])];
     };
     let (x, gamma, dy) = (
@@ -881,8 +880,7 @@ mod tests {
             let gamma = cube([cols], &device);
             let s = forward(x, gamma, cube([cols], &device), 1e-5);
             let (y, mean, var) = (s.y.clone(), s.mean.clone(), s.var.clone());
-            let dy = cube([rows, cols], &device);
-            let [dx, dgamma, dbeta] = backward(s.x, s.gamma, s.y, s.mean, s.var, 1e-5, dy);
+            let [dx, dgamma, dbeta] = backward(s, cube([rows, cols], &device));
             let at = format!("{rows}×{cols}");
             let nan = |v: Vec<f64>| v.len() == cols && v.iter().all(|v| v.is_nan());
             assert_eq!(read::<2>(y).len(), rows * cols, "{at}: y");
@@ -916,13 +914,21 @@ mod tests {
         );
     }
 
-    /// The backward checks its tensors too, before it packs `x`, γ or `dy`.
+    /// The backward checks `x` and `dy` too, before it packs them. Only here does it meet an `x`
+    /// that `forward` did not check.
     #[test]
     #[should_panic(expected = "a launch of fewer than 2³² elements per tensor")]
     fn an_activation_gradient_of_2_32_elements() {
-        let (side, a) = (1 << 16, broadcast([1 << 16, 1 << 16]));
-        let c = || broadcast([side]);
-        backward(a.clone(), c(), a.clone(), c(), c(), 1e-5, a);
+        let (a, c) = (broadcast([1 << 16, 1 << 16]), || broadcast([1 << 16]));
+        let s = Saved {
+            x: a.clone(),
+            gamma: c(),
+            y: a.clone(),
+            mean: c(),
+            var: c(),
+            epsilon: 1e-5,
+        };
+        backward(s, a);
     }
 
     /// 2³² channels over no rows: only γ, β and the statistics are over.
@@ -1101,8 +1107,8 @@ mod tests {
         let dy = Tensor::<2>::ones([8, 16], (&crate::nn::cuda(0), DType::F64))
             .try_into_primitive::<CubeBackend>()
             .unwrap();
-        let (a, c) = (broadcast([8, 16]), || broadcast([16]));
-        backward(a.clone(), c(), a, c(), c(), 1e-5, dy);
+        let s = forward(broadcast([8, 16]), broadcast([16]), broadcast([16]), 1e-5);
+        backward(s, dy);
     }
 
     #[test]
