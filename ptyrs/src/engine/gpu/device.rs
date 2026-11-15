@@ -3675,7 +3675,7 @@ mod tests {
                 }
                 e
             });
-            let r = failed.dev.dev.summing(|dev| {
+            let r = failed.dev.ungated().summing(|dev| {
                 for sums in [&mut dev.obj_sums, &mut dev.probe_sums] {
                     let num = vec![C32 { re: 1.0, im: 1.0 }; sums.num.len()];
                     sums.num.copy_from_host(&dev.stream, &num)?;
@@ -3754,7 +3754,7 @@ mod tests {
                 e.bh(&params, 1, 1).unwrap();
                 e
             });
-            let r = failed.dev.dev.summing(|dev| {
+            let r = failed.dev.ungated().summing(|dev| {
                 let bh = dev.bh_state.as_deref_mut().expect("BH's state");
                 let g = &mut bh.sliced.as_mut().expect("two slices").grads()[0];
                 let num = vec![C32 { re: 1.0, im: 1.0 }; g.num.len()];
@@ -3806,7 +3806,7 @@ mod tests {
             first: true,
             llk: false,
         };
-        let r = e.dev.dev.steady_with(epoch, 0, |dev| {
+        let r = e.dev.ungated().steady_with(epoch, 0, |dev| {
             let (lens, dims) = ([dev.obj.len(), dev.probe.len()], dev.dims());
             let one = dev.one_slice("ML")?;
             let none = PositionScratch::None;

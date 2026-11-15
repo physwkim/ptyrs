@@ -26,6 +26,7 @@ mod ap;
 mod bh;
 mod device;
 mod dm;
+mod gate;
 mod lsqml;
 mod ml;
 mod propagate;
@@ -46,6 +47,7 @@ use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 
 use device::{Bufs, Device, NormBufs, OneSlice, PassesMut, SliceUploads, Sliced, Uploads};
+use gate::Gated;
 
 use crate::engine::ptycho::{Algorithm, LlkRecord, zero_phase_ramp};
 use crate::engine::{
@@ -518,55 +520,6 @@ pub struct GpuPtycho {
     history: Vec<LlkRecord>,
 }
 
-/// The [`Device`] behind the gate of [`GpuPtycho`]'s calls: aborted from the first failure
-/// of a call through [`Self::change`] on. A call's checks, with what it builds before it
-/// changes anything, run through the gate too, after its refusal, so an aborted engine
-/// answers [`EngineError::Aborted`] whatever the arguments.
-struct Gated {
-    dev: Device,
-    aborted: bool,
-}
-
-impl Gated {
-    /// `f`, which may leave the device part-changed when it fails, on what `check` built:
-    /// aborted while `f` runs, so its failure leaves the gate aborted.
-    fn change<T, R>(
-        &mut self,
-        check: impl FnOnce(&Device) -> Result<T, EngineError>,
-        f: impl FnOnce(&mut Device, T) -> Result<R, EngineError>,
-    ) -> Result<R, EngineError> {
-        let built = check(self.checked()?)?;
-        self.aborted = true;
-        let r = f(&mut self.dev, built)?;
-        self.aborted = false;
-        Ok(r)
-    }
-
-    /// `f`, which leaves the device's state as it found it, failed or not, after `check`: it
-    /// never aborts.
-    fn read<R>(
-        &mut self,
-        check: impl FnOnce(&Device) -> Result<(), EngineError>,
-        f: impl FnOnce(&mut Device) -> Result<R, EngineError>,
-    ) -> Result<R, EngineError> {
-        check(self.checked()?)?;
-        f(&mut self.dev)
-    }
-
-    /// The device, refused once a call through [`Self::change`] has failed.
-    fn checked(&self) -> Result<&Device, EngineError> {
-        if self.aborted {
-            return Err(EngineError::Aborted);
-        }
-        Ok(&self.dev)
-    }
-
-    /// The device unchecked, for a read-back, which also runs once aborted.
-    fn unchecked(&self) -> &Device {
-        &self.dev
-    }
-}
-
 /// Fails unless an object of `dims` held in `len` values is the shape `have` of the current
 /// object.
 fn object_fits(have: [usize; 3], dims: [usize; 3], len: usize) -> Result<(), EngineError> {
@@ -770,10 +723,7 @@ impl GpuPtycho {
         let sampling = Sampling::auto(optics, object.plane_shape(), g.frame);
         let dev = Device::new(ctx, dims, uploads, options, sampling)?;
         Ok(Self {
-            dev: Gated {
-                dev,
-                aborted: false,
-            },
+            dev: Gated::new(dev),
             obj_dims: object.dims(),
             probe_dims: probe.dims(),
             total_obs: scan.counts.total(),
