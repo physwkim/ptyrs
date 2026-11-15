@@ -30,7 +30,7 @@ use cuda_async::cuda_graph::CudaGraph;
 use cuda_async::device_operation::{DeviceOp, ExecutionContext};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 
-use super::bh::{BhMoved, BhSliced};
+use super::bh::{BhMoved, BhSliced, update_sums};
 use super::lsqml::{LsqmlBufs, LsqmlState, Pre};
 use super::ml::{MlMoved, MlPosition, MlWindows};
 use super::rpie::RpieMoved;
@@ -3407,8 +3407,11 @@ impl Device {
         Ok(r)
     }
 
+    /// Zeroes [`update_sums`].
     fn zero_sums(&mut self, ctx: &ExecutionContext) -> Result<(), GpuError> {
-        for sums in [&mut self.obj_sums, &mut self.probe_sums] {
+        let sliced = self.bh_state.as_deref_mut().and_then(|s| s.sliced.as_mut());
+        let grads = sliced.map_or(&mut [][..], BhSliced::grads);
+        for sums in update_sums(&mut self.obj_sums, &mut self.probe_sums, grads) {
             crate::gpu::zero(ctx, &mut sums.num)?;
             crate::gpu::zero(ctx, &mut sums.den)?;
         }
@@ -3520,13 +3523,21 @@ mod tests {
 
     use crate::base::required_obj_shape;
     use crate::base::{C64, Counts, Geometry, Object, Positions, Probe, Scan, Stack};
-    use crate::engine::{Backend, Feature, Features, GpuPtycho, MlParams, Params, Step};
+    use crate::engine::{
+        Backend, BhParams, Feature, Features, GpuPtycho, MlParams, Optics, Params, Step, Wavefield,
+    };
     use crate::fault::{self, Exit};
     use crate::live::farfield::{Ptycho, PtychoSpec, ScanPath};
 
     /// An engine on a simulated raster of 36 points, its object flat: 32-pixel frames, or the
     /// fused passes' smallest, 64.
     fn engine(ctx: &Arc<CudaContext>, graph: bool, fused: bool) -> GpuPtycho {
+        let (scan, object, probe, options) = start(graph, fused);
+        GpuPtycho::new(ctx, &scan, object, probe, options).unwrap()
+    }
+
+    /// [`engine`]'s scan, object, probe and options.
+    fn start(graph: bool, fused: bool) -> (Scan, Object, Probe, GpuOptions) {
         let n = if fused { 64 } else { 32 };
         let p = Ptycho::new(PtychoSpec {
             n,
@@ -3561,7 +3572,7 @@ mod tests {
             fused,
             psi_f16: false,
         };
-        GpuPtycho::new(ctx, &scan, object, probe, options).unwrap()
+        (scan, object, probe, options)
     }
 
     /// What a call through [`Device::summing`] added to the update sums before failing never
@@ -3643,6 +3654,66 @@ mod tests {
                 features(&failed) == features(&clean),
                 "{what}: the retry's features differ from a clean run's"
             );
+        }
+    }
+
+    /// What a failed call through [`Device::summing`] added to BH's sums of a multislice
+    /// object's slices past the first never reaches the next: a BH epoch after it, launched or
+    /// replayed, is bit for bit that of an engine it never ran on.
+    #[test]
+    fn a_failed_summing_call_leaves_bh_no_slice_sums() {
+        let ctx = CudaContext::new(0).expect("GPU 0");
+        let params = BhParams {
+            batch_size: 12,
+            probe_rho: 0.01,
+            position_rho: 0.1,
+            seed: 7,
+        };
+        for graph in [false, true] {
+            let [mut failed, mut clean] = [(); 2].map(|()| {
+                // The slices' propagator stage has in-kernel FFTs of the fused passes' sides alone.
+                let (scan, object, probe, options) = start(graph, true);
+                let g = scan.geometry;
+                let gap = Wavefield::new(g.frame, g.wavelength, g.pixel_size_object(), 2e-5);
+                let optics = Optics::far_field(&g).with_slices(&[gap.unwrap()]);
+                let objects = [object.clone(), object];
+                let mut e =
+                    GpuPtycho::with_slices(&ctx, &scan, &optics.unwrap(), &objects, probe, options)
+                        .unwrap();
+                e.bh(&params, 1, 1).unwrap();
+                e
+            });
+            let r = failed.dev.summing(|dev| {
+                let bh = dev.bh_state.as_deref_mut().expect("BH's state");
+                let g = &mut bh.sliced.as_mut().expect("two slices").grads()[0];
+                let num = vec![C32 { re: 1.0, im: 1.0 }; g.num.len()];
+                g.num.copy_from_host(&dev.stream, &num)?;
+                g.den.copy_from_host(&dev.stream, &vec![1.0; g.den.len()])?;
+                Err::<(), _>(EngineError::Invalid("injected".into()))
+            });
+            assert!(matches!(r, Err(EngineError::Invalid(_))), "graph {graph}");
+            for e in [&mut failed, &mut clean] {
+                e.bh(&params, 1, 1).unwrap();
+            }
+            let bits = |e: &GpuPtycho| -> Vec<Vec<u64>> {
+                let (o, p) = (e.objects().unwrap(), e.probe().unwrap());
+                let px = |s: &[C64]| -> Vec<u64> {
+                    s.iter()
+                        .flat_map(|c| [c.re.to_bits(), c.im.to_bits()])
+                        .collect()
+                };
+                let llk = e.history().iter().map(|r| r.llk.poisson.to_bits());
+                let arrays = o.iter().map(|o| px(o.as_slice()));
+                arrays.chain([px(p.as_slice()), llk.collect()]).collect()
+            };
+            let (f, c) = (bits(&failed), bits(&clean));
+            assert_eq!((f.len(), f[3].len()), (4, 2), "graph {graph}");
+            for (what, (f, c)) in ["slice 0", "slice 1", "the probe", "the LLK"]
+                .iter()
+                .zip(f.iter().zip(&c))
+            {
+                assert!(f == c, "graph {graph}: {what} differs from a clean run's");
+            }
         }
     }
 

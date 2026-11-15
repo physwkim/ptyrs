@@ -303,6 +303,23 @@ impl BhSliced {
                 .collect::<Result<_, _>>()?,
         })
     }
+
+    /// The slices' gradient sums, the tail of [`update_sums`].
+    pub(super) fn grads(&mut self) -> &mut [UpdateSums] {
+        &mut self.grads
+    }
+}
+
+/// Every sum an update consumes, which the passes add to across stacks: the object's, the
+/// probe's, then `grads`, a multislice object's slices' past the first under BH, in the order
+/// of BH's variables. `Device::summing`'s discard zeroes the same list, so no sum a failed
+/// call began reaches its retry.
+pub(super) fn update_sums<'s>(
+    obj: &'s mut UpdateSums,
+    probe: &'s mut UpdateSums,
+    grads: &'s mut [UpdateSums],
+) -> impl Iterator<Item = &'s mut UpdateSums> {
+    [obj, probe].into_iter().chain(grads)
 }
 
 /// [`BhMoved`]'s buffers besides its [`Moved`] under [`crate::engine::Sampling::Patch`], lent
@@ -1301,7 +1318,7 @@ impl Bufs<'_> {
     }
 
     /// The batch's updates of the object, the probe and a multislice object's slices past the
-    /// first by its step record `record`, which consume the gradient sums.
+    /// first by its step record `record`, which consume [`update_sums`].
     fn bh_update(
         &mut self,
         ctx: &ExecutionContext,
@@ -1310,33 +1327,25 @@ impl Bufs<'_> {
         record: u32,
     ) -> Result<(), GpuError> {
         let [prev_obj, prev_probe] = &mut *bh.prev;
-        let mut vars = vec![
-            BhVar {
-                x: self.obj,
-                prev: prev_obj,
-                g: self.obj_sums,
-                n: self.obj_len,
-                scale: 1.0,
-            },
-            BhVar {
-                x: self.probe,
-                prev: prev_probe,
-                g: self.probe_sums,
-                n: self.probe_len,
-                scale: rho2,
-            },
+        let (prevs, grads) = match bh.sliced.as_deref_mut() {
+            Some(w) => (&mut w.prev[..], &mut w.grads[..]),
+            None => (&mut [][..], &mut [][..]),
+        };
+        let (obj_len, probe_len) = (self.obj_len, self.probe_len);
+        let vars = [
+            (&mut *self.obj, prev_obj, obj_len, 1.0),
+            (&mut *self.probe, prev_probe, probe_len, rho2),
         ];
-        if let Some(w) = bh.sliced.as_deref_mut() {
-            let slices = (self.deeper.iter_mut().zip(&mut w.prev)).zip(&mut w.grads);
-            vars.extend(slices.map(|((x, prev), g)| BhVar {
+        let slices = (self.deeper.iter_mut().zip(prevs)).map(|(x, prev)| (x, prev, obj_len, 1.0));
+        let sums = update_sums(self.obj_sums, self.probe_sums, grads);
+        for ((x, prev, n, scale), g) in vars.into_iter().chain(slices).zip(sums) {
+            let var = BhVar {
                 x,
                 prev,
                 g,
-                n: self.obj_len,
-                scale: 1.0,
-            }));
-        }
-        for var in vars {
+                n,
+                scale,
+            };
             self.bh.update(ctx, var, bh.steps, record)?;
         }
         Ok(())
