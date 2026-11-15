@@ -17,7 +17,7 @@ use super::device::{
     moved_inputs, moved_shift,
 };
 use super::propagate::Propagate;
-use super::{Bufs, Cut, Device, Epoch, GpuPtycho, stack_len, to_u32};
+use super::{Bufs, Cut, Device, Epoch, GpuPtycho, batch_frames, stack_len};
 use crate::engine::features::{POSITION_LIMIT, POSITION_STEP};
 use crate::engine::ptycho::{Algorithm, llk_due};
 use crate::engine::{EngineError, RpieParams};
@@ -42,8 +42,7 @@ impl GpuPtycho {
                 ));
             }
             dev.one_unitary("Rpie")?;
-            to_u32("batch_size", params.batch_size)?;
-            stack_len(&dims, params.batch_size.min(dims.nframe as usize))?;
+            stack_len(&dims, batch_frames(&dims, params.batch_size) as usize)?;
             Ok(())
         };
         self.call(false, check, |dev, cycle| {

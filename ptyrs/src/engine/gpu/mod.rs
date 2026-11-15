@@ -300,6 +300,12 @@ fn stack_len(dims: &ViewDims, nf: usize) -> Result<u32, EngineError> {
     to_u32("stack length", nf * dims.nmode as usize * plane_len(dims))
 }
 
+/// A batch's frames, `batch_size` but at most the scan's, as the CPU's batches take them;
+/// clamped before it is narrowed, so any size fits u32.
+fn batch_frames(dims: &ViewDims, batch_size: usize) -> u32 {
+    u32::try_from(batch_size).map_or(dims.nframe, |b| b.min(dims.nframe))
+}
+
 /// A buffer of a loop over stacks: its bytes per frame, its bytes whatever the stack's frames,
 /// and the first and last of the passes over one stack (launches, numbered in order) that touch
 /// it. A call that transforms in chunks counts as the launches of one chunk, however many it
@@ -1476,7 +1482,7 @@ mod tests {
                 ..Features::default()
             };
             let rpie = RpieParams {
-                batch_size: 1 << 32,
+                batch_size: 0,
                 ..RpieParams::default()
             };
             let other = Object::new(Stack::filled([1, 2, 2], C64::new(1.0, 0.0)));

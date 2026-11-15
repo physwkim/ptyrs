@@ -35,8 +35,8 @@ use super::lsqml::{LsqmlBufs, LsqmlState, Pre};
 use super::ml::{MlMoved, MlPosition, MlWindows};
 use super::rpie::RpieMoved;
 use super::{
-    Cut, Epoch, Frames, GpuOptions, StackRule, Streamed, Tag, batch_stacks, plane_bytes, plane_len,
-    to_c32, to_u32, wave_bytes,
+    Cut, Epoch, Frames, GpuOptions, StackRule, Streamed, Tag, batch_frames, batch_stacks,
+    plane_bytes, plane_len, to_c32, to_u32, wave_bytes,
 };
 use crate::engine::features::{POSITION_LIMIT, POSITION_STEP};
 use crate::engine::sampling::{OBJ_HELD, OBJ_PCG};
@@ -2409,7 +2409,7 @@ impl RpieScratch {
         one: OneSlice,
     ) -> Result<Self, EngineError> {
         let dims = views.dims();
-        let batch = to_u32("batch_size", params.batch_size)?;
+        let batch = batch_frames(dims, params.batch_size);
         let (cut, _) = batch_stacks(stream, dims, batch, batch)?;
         let len = cut.wave_len(dims);
         let plans = cut.plans(stream, dims)?;
@@ -3317,7 +3317,7 @@ impl Device {
     /// those of another sampling, so no graph captured from it survives.
     fn build_bh(&mut self, params: &BhParams) -> Result<(), EngineError> {
         let dims = self.dims();
-        let size = to_u32("batch_size", params.batch_size.min(dims.nframe as usize))?;
+        let size = batch_frames(&dims, params.batch_size);
         let reads = self.features.positioned().then_some(self.sampling);
         let [.., position] = self.features.refine();
         let deeper = self.deeper().len();
@@ -3341,10 +3341,7 @@ impl Device {
     /// Builds the [`LsqmlState`] for `params`' batch size, the position model, refined or
     /// held, and its sampling unless it is built, replaced as [`Self::build_bh`] replaces BH's.
     fn build_lsqml(&mut self, params: &LsqmlParams) -> Result<(), EngineError> {
-        let size = to_u32(
-            "batch_size",
-            params.batch_size.min(self.dims().nframe as usize),
-        )?;
+        let size = batch_frames(&self.dims(), params.batch_size);
         let reads = self.features.positioned().then_some(self.sampling);
         let [.., position] = self.features.refine();
         if (self.lsqml.as_ref())
