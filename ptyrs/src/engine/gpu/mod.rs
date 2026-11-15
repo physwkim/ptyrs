@@ -36,7 +36,7 @@ mod rpie;
 use std::ops::Range;
 use std::sync::Arc;
 
-use crate::base::{AddrTable, C64, Object, Probe, Scan, Stack};
+use crate::base::{AddrTable, C64, Frame, Object, Probe, Scan, Stack};
 use crate::fault;
 use crate::fft::Plan2d;
 use crate::gpu::{
@@ -512,6 +512,7 @@ pub struct GpuPtycho {
     dev: Gated,
     obj_dims: [usize; 3],
     probe_dims: [usize; 3],
+    frame: Frame,
     /// Sum of the unmasked observed counts, for ML's [`crate::engine::Ptycho::scale_obj_probe`].
     total_obs: f64,
     /// The probe-frame FFT of [`zero_phase_ramp`], which runs on the host.
@@ -726,6 +727,7 @@ impl GpuPtycho {
             dev: Gated::new(dev),
             obj_dims: object.dims(),
             probe_dims: probe.dims(),
+            frame: g.frame,
             total_obs: scan.counts.total(),
             fft: Fft2::new(g.frame.sides()),
             cycle: 0,
@@ -820,11 +822,10 @@ impl GpuPtycho {
     /// Models and refines `features` from here on, as [`crate::engine::Ptycho::set_features`], in
     /// `f32` on the device; with [`GpuOptions::fused`] only.
     pub fn set_features(&mut self, features: &Features) -> Result<(), EngineError> {
+        let frame = self.frame;
         self.dev.change(
             |dev| {
-                let dims = dev.dims();
-                let [ny, nx] = dims.frame.map(|n| n as usize);
-                features.check(dims.nframe as usize, [ny, nx])?;
+                features.check(dev.dims().nframe as usize, frame)?;
                 dev.build_features(features)
             },
             |dev, new| dev.set_features(new),

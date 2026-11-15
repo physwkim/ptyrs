@@ -6,7 +6,7 @@
 use std::f64::consts::PI;
 use std::ops::Range;
 
-use crate::base::{C64, Feature, Object, Probe, Stack, View};
+use crate::base::{C64, Feature, Frame, Object, Probe, Stack, View};
 
 use crate::engine::ops::{blend, natural};
 use crate::engine::sampling::{OBJ_HELD, OBJ_PCG, Sampler};
@@ -59,7 +59,7 @@ pub struct Features {
 
 impl Features {
     /// Checks the features against a scan of `nframe` frames of `frame` (`[ny, nx]`) pixels.
-    pub(crate) fn check(&self, nframe: usize, frame: [usize; 2]) -> Result<(), EngineError> {
+    pub(crate) fn check(&self, nframe: usize, frame: Frame) -> Result<(), EngineError> {
         if let Some(Feature { values: s, .. }) = &self.scale {
             if s.len() != nframe {
                 return Err(EngineError::Invalid(format!(
@@ -74,7 +74,7 @@ impl Features {
             }
         }
         if let Some(Feature { values: b, .. }) = &self.background {
-            if b.len() != frame[0] * frame[1] {
+            if b.len() != frame.area() {
                 return Err(EngineError::Invalid(format!(
                     "a background of {} pixels for {frame:?} frames",
                     b.len()
@@ -271,7 +271,7 @@ pub(crate) fn background_sums(
     model: Model<'_>,
 ) -> Vec<[f64; 2]> {
     let [nframe, ny, nx] = obs.dims();
-    let n = ny * nx;
+    let n = obs.plane_len();
     assert_eq!(psi.len(), nframe * nmode * n);
     let mut sums = vec![[0.0; 2]; n];
     for (f, (o, block)) in (obs.frames(0..nframe).chunks_exact(n))
@@ -346,7 +346,7 @@ pub(crate) fn freq(k: usize, n: usize) -> f64 {
 /// `DFT(fftshift(P[m]·q))` of every probe mode, one plane per mode.
 fn probe_spectra(probe: &Probe, quad: &[C64], fft: &Fft2) -> Vec<C64> {
     let [ny, nx] = probe.plane_shape();
-    let n = ny * nx;
+    let n = probe.plane_len();
     let mut a = vec![C64::default(); probe.as_slice().len()];
     for (m, out) in a.chunks_exact_mut(n).enumerate() {
         let p = probe.plane(m);
@@ -405,7 +405,7 @@ pub(crate) fn move_derivative(
     fft: &Fft2,
 ) {
     let shape = fft.shape();
-    let n = shape[0] * shape[1];
+    let n = fft.plane_len();
     let phase = |p: &mut [C64], conj: bool| {
         if let Some(q) = quad {
             for plane in p.chunks_exact_mut(n) {
@@ -557,6 +557,8 @@ impl Windows<'_> {
 /// sampled at the corner plus the offset.
 pub(crate) struct Shifted {
     shape: [usize; 2],
+    /// `ny · nx` of `shape`, the probe's plane length.
+    plane: usize,
     offsets: Vec<[f64; 2]>,
     /// The quadratic phase `q` of the waves.
     quad: Vec<C64>,
@@ -596,7 +598,7 @@ impl Shifted {
         fft: &Fft2,
     ) -> Self {
         let shape = probe.plane_shape();
-        let n = shape[0] * shape[1];
+        let n = probe.plane_len();
         let mut waves = Vec::with_capacity(views.len() * n);
         for v in views {
             match &mover {
@@ -615,6 +617,7 @@ impl Shifted {
         }
         Self {
             shape,
+            plane: n,
             offsets: offsets.to_vec(),
             quad: quad.to_vec(),
             mover,
@@ -668,7 +671,7 @@ impl Shifted {
         fft: &Fft2,
     ) {
         if let Some(inertia) = probe_inertia {
-            let n = self.shape[0] * self.shape[1];
+            let n = self.plane;
             let mut residual = vec![C64::default(); psi.len()];
             self.to_psi(views, object, &mut residual);
             for (r, x) in residual.iter_mut().zip(psi) {
@@ -791,14 +794,14 @@ impl Shifted {
 
     /// `W` of the `k`th view of the views `self` was made for, in exit-wave layout.
     pub(crate) fn wave(&self, k: usize) -> &[C64] {
-        let n = self.shape[0] * self.shape[1];
+        let n = self.plane;
         &self.waves[k * n..(k + 1) * n]
     }
 
     /// [`crate::engine::obj_probe_to_psi`] with `W` in place of `q·P` and the model's windows:
     /// `psi[k] = W[k]·O[win_k]`.
     pub(crate) fn to_psi(&self, views: &[View], object: &Object, psi: &mut [C64]) {
-        let n = self.shape[0] * self.shape[1];
+        let n = self.plane;
         assert_eq!(
             psi.len(),
             views.len() * n,
@@ -818,7 +821,7 @@ impl Shifted {
     /// Per view, `psi·conj(W)` in the natural layout of [`Sampler::place`]'s patches.
     fn natural_num(&self, psi: &[C64]) -> Vec<C64> {
         let [ny, nx] = self.shape;
-        let n = ny * nx;
+        let n = self.plane;
         let mut num = vec![C64::default(); psi.len()];
         for (k, (x, w)) in psi
             .chunks_exact(n)
@@ -835,7 +838,7 @@ impl Shifted {
     /// Per view, `|W|²` in the natural layout of [`Sampler::place`]'s patches.
     fn natural_power(&self) -> Vec<f64> {
         let [ny, nx] = self.shape;
-        let n = ny * nx;
+        let n = self.plane;
         let mut norm = vec![0.0; self.waves.len()];
         for (k, w) in self.waves.chunks_exact(n).enumerate() {
             for (j, w) in w.iter().enumerate() {
@@ -856,7 +859,7 @@ impl Shifted {
         psi: &[C64],
     ) -> (Stack<C64>, Stack<f64>) {
         let [ny, nx] = self.shape;
-        let n = ny * nx;
+        let n = self.plane;
         let nxo = obj_dims[2];
         assert_eq!(psi.len(), views.len() * n);
         if let Mover::Object(s) = &self.mover {
@@ -900,7 +903,7 @@ impl Shifted {
         fft: &Fft2,
     ) -> (Stack<C64>, Stack<f64>) {
         let [_, ny, nx] = probe_dims;
-        let n = ny * nx;
+        let n = self.plane;
         assert_eq!(psi.len(), views.len() * n);
         let win = self.windows(object);
         let moves = matches!(self.mover, Mover::Probe(_));
@@ -960,7 +963,7 @@ impl Shifted {
     /// sampled window's derivative under [`Sampling::FullObject`].
     fn derivatives(&self, views: &[View], object: &Object, axis: usize, fft: &Fft2) -> Vec<C64> {
         let [ny, nx] = self.shape;
-        let n = ny * nx;
+        let n = self.plane;
         let mut out = Vec::with_capacity(views.len() * n);
         match &self.mover {
             Mover::Probe(spectra) => {
@@ -997,7 +1000,7 @@ impl Shifted {
         psi: &[C64],
         fft: &Fft2,
     ) -> Vec<[[f64; 2]; 2]> {
-        let n = self.shape[0] * self.shape[1];
+        let n = self.plane;
         assert_eq!(psi.len(), views.len() * n);
         let win = self.windows(object);
         let dpsi = [0, 1].map(|axis| self.derivatives(views, object, axis, fft));
@@ -1057,7 +1060,7 @@ pub fn position_grad(
 ) -> Vec<[f64; 2]> {
     let (object, probe, obs) = (p.object(), p.probe(), p.observed());
     let [ny, nx] = probe.plane_shape();
-    let n = ny * nx;
+    let n = probe.plane_len();
     let fft = &Fft2::new([ny, nx]);
     let shifted = p.shifted_views(views, probe, offsets);
     let mut g = vec![C64::default(); views.len() * n];

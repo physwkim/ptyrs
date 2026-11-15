@@ -294,8 +294,7 @@ impl Ptycho {
     /// Models `features` from here on, refining those set to; an error leaves the current
     /// ones.
     pub fn set_features(&mut self, features: Features) -> Result<(), EngineError> {
-        let [nframe, ny, nx] = self.obs.dims();
-        features.check(nframe, [ny, nx])?;
+        features.check(self.obs.nframe(), self.obs.frame())?;
         self.features = features;
         Ok(())
     }
@@ -889,7 +888,7 @@ impl Ptycho {
 
     fn rpie_batch(&mut self, params: &RpieParams, frames: Range<usize>) {
         let [ny, nx] = self.probe.plane_shape();
-        let n = ny * nx;
+        let n = self.probe.plane_len();
         let nmode = self.addr.nmode();
         let nxo = self.object.plane_shape()[1];
         let nbatch = frames.len();
@@ -1077,7 +1076,7 @@ impl Ptycho {
 /// downloads.
 pub(crate) fn zero_phase_ramp(fft: &Fft2, object: &mut Object, probe: &mut Probe) {
     let [ny, nx] = probe.plane_shape();
-    let n = ny * nx;
+    let n = probe.plane_len();
     let mut far = vec![C64::default(); probe.as_slice().len()];
     for (m, out) in far.chunks_exact_mut(n).enumerate() {
         let p = probe.plane(m);
