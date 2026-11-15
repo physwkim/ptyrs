@@ -98,27 +98,40 @@ fn object_shape(raws: &[&Positions]) -> [usize; 2] {
         .fold([0, 0], |a, s| [a[0].max(s[0]), a[1].max(s[1])])
 }
 
-fn addr(raw: &Positions, shape: [usize; 2]) -> AddrTable {
+fn addr(raw: &Positions, shape: [usize; 2], nobj: usize) -> AddrTable {
     let (pixel, positions) = ([PIXEL; 2], raw.pynx_preprocess([PIXEL; 2]));
-    AddrTable::new(&positions, pixel, [frame(); 2], shape, NPROBE, 1).unwrap()
+    AddrTable::new(&positions, pixel, [frame(); 2], shape, NPROBE, nobj).unwrap()
+}
+
+/// Object mode `o`'s amplitude.
+fn mode_amplitude(o: usize) -> f64 {
+    0.5f64.powi(o as i32)
 }
 
 struct Case {
     scan: Scan,
+    /// Object mode `o` the test object times [`mode_amplitude`], conjugated when `o` is odd.
     truth: (Object, Probe),
-    /// Unit modulus and a random phase in -1/4..1/4 rad, the truth probe's defocus cut by a
-    /// third.
+    /// Each object mode at its truth's amplitude with a random phase in -1/4..1/4 rad, the
+    /// truth probe's defocus cut by a third.
     start: (Object, Probe),
 }
 
 impl Case {
     /// Counts rounded from the truth's intensities under `Sampling::FullObject`, the windows
-    /// at `offsets` from the corners of `raw`, in an object of `shape`.
-    fn new(raw: Positions, shape: [usize; 2], offsets: &[[f64; 2]]) -> Self {
+    /// at `offsets` from the corners of `raw`, in an object of `nobj` modes of `shape`.
+    fn new(raw: Positions, shape: [usize; 2], offsets: &[[f64; 2]], nobj: usize) -> Self {
         let frame = frame();
         let optics = free_space();
-        let addr = addr(&raw, shape);
-        let truth = sim::object(shape);
+        let addr = addr(&raw, shape, nobj);
+        let first = sim::object(shape);
+        let data = (0..nobj)
+            .flat_map(|o| {
+                let (a, conj) = (mode_amplitude(o), o % 2 == 1);
+                (first.as_slice().iter()).map(move |&c| a * if conj { c.conj() } else { c })
+            })
+            .collect();
+        let truth = Object::new(Stack::from_vec([nobj, shape[0], shape[1]], data).unwrap());
         let mut probe = sim::probe([frame; 2], NPROBE).unwrap();
         (probe.as_mut_slice().iter_mut()).for_each(|v| *v *= PHOTONS.sqrt());
         let (objects, full) = (slice::from_ref(&truth), Sampling::FullObject);
@@ -136,13 +149,14 @@ impl Case {
         }
         let counts = Counts::from_f64([nframe, frame, frame], &counts, None).unwrap();
         let mut state = 0x9e37_79b9_7f4a_7c15_u64;
-        let data = (truth.as_slice().iter())
-            .map(|_| {
+        let data = (0..truth.as_slice().len())
+            .map(|i| {
                 state ^= state << 13;
                 state ^= state >> 7;
                 state ^= state << 17;
                 let u = (state >> 11) as f64 / (1u64 << 53) as f64;
-                C64::from_polar(1.0, 0.5 * (u - 0.5))
+                let a = mode_amplitude(i / (shape[0] * shape[1]));
+                C64::from_polar(a, 0.5 * (u - 0.5))
             })
             .collect();
         let object = Object::new(Stack::from_vec(truth.dims(), data).unwrap());
@@ -352,39 +366,51 @@ fn assert_close(what: &str, errs: [f64; 5], tol: [Option<f64>; 5]) {
     }
 }
 
-/// On counts of the model at drawn offsets: AP from the truth with the offsets held and RAAR
-/// from the truth stay at the truth's LLK, and DM from the start descends, on the CPU and the
-/// GPU; the GPU's graphs replay its eager run bit for bit and agree with the CPU.
+/// [`solve_keeps_the_truth_and_descends`] in one object mode.
 #[test]
-fn solve_keeps_the_truth_and_descends() {
+fn solve_keeps_the_truth_and_descends_in_one_object_mode() {
+    solve_keeps_the_truth_and_descends(1);
+}
+
+/// [`solve_keeps_the_truth_and_descends`] in two object modes.
+#[test]
+fn solve_keeps_the_truth_and_descends_in_two_object_modes() {
+    solve_keeps_the_truth_and_descends(2);
+}
+
+/// On counts of the model at drawn offsets, in `nobj` object modes: AP from the truth with the
+/// offsets held and RAAR from the truth stay at the truth's LLK, and DM from the start
+/// descends, on the CPU and the GPU; the GPU's graphs replay its eager run bit for bit and
+/// agree with the CPU. Each frame's views cover every probe mode on every object mode, where
+/// the GPU's weight of a frame, `Σ_p |P_p|²`, is the CPU's `|W|²` of each of its views. A test
+/// per `nobj`, so the two run side by side: the CPU's object solve is most of each.
+fn solve_keeps_the_truth_and_descends(nobj: usize) {
     const NCYCLE: usize = 8;
     const TOL: [Option<f64>; 5] = [Some(1e-5), Some(1e-5), Some(1e-4), Some(1e-5), Some(3e-6)];
     let (raw, offsets) = (fermat(), drawn_offsets());
-    let c = Case::new(raw.clone(), object_shape(&[&raw]), &offsets);
     let drawn = positioned(&offsets);
-    let floor = Case::cpu(&c.scan, &c.truth, &drawn).llk().poisson;
     let ctx = CudaContext::new(0).unwrap();
+    let shape = object_shape(&[&raw]);
+    let c = Case::new(raw, shape, &offsets, nobj);
+    let floor = Case::cpu(&c.scan, &c.truth, &drawn).llk().poisson;
     // DM and RAAR carry their exit waves across cycles, which a held call restarts.
     for (algorithm, from_truth, held) in [
         ("AP", true, true),
         ("RAAR", true, false),
         ("DM", false, false),
     ] {
+        let what = format!("{algorithm} nobj {nobj}");
         let from = [&c.start, &c.truth][usize::from(from_truth)];
         let held = held.then_some(&drawn);
         let want = Case::cpu(&c.scan, from, &drawn).cycles(algorithm, NCYCLE, held);
-        want.check(&format!("{algorithm} CPU"), from_truth, floor);
+        want.check(&format!("{what} CPU"), from_truth, floor);
         let [eager, graphs] = [false, true].map(|graph| {
             let mut gpu = Case::gpu(&ctx, &c.scan, from, &drawn, graph);
             gpu.cycles(algorithm, NCYCLE, held)
         });
-        assert!(graphs == eager, "{algorithm}: graphs replay the eager run");
-        eager.check(&format!("{algorithm} GPU"), from_truth, floor);
-        assert_close(
-            &format!("{algorithm} GPU against CPU"),
-            eager.errors(&want),
-            TOL,
-        );
+        assert!(graphs == eager, "{what}: graphs replay the eager run");
+        eager.check(&format!("{what} GPU"), from_truth, floor);
+        assert_close(&format!("{what} GPU against CPU"), eager.errors(&want), TOL);
     }
 }
 
@@ -405,16 +431,16 @@ fn whole_pixel_offsets_are_the_blend() {
     };
     let at = Positions::new(moved(0, raw.y()), moved(1, raw.x())).unwrap();
     let shape = object_shape(&[&raw, &at]);
-    for (v, w) in addr(&raw, shape)
+    for (v, w) in addr(&raw, shape, 1)
         .views()
         .iter()
-        .zip(addr(&at, shape).views())
+        .zip(addr(&at, shape, 1).views())
     {
         let k = whole[v.frame as usize];
         let corner = [v.oy as f64 + k[0], v.ox as f64 + k[1]];
         assert_eq!(corner, [w.oy as f64, w.ox as f64], "view {v:?}");
     }
-    let c = Case::new(raw, shape, &whole);
+    let c = Case::new(raw, shape, &whole, 1);
     let at = Scan::new(c.scan.geometry, at, c.scan.counts.clone()).unwrap();
     let none = Features::default();
     let runs = [
