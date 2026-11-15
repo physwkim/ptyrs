@@ -169,14 +169,34 @@ pub struct ObjectSampler {
     /// The placed spectra, then the illumination, `[nobj, nyo, nxo]`.
     acc: DeviceBuffer<C32>,
     chunk: u32,
-    /// The scan as one stack, which [`Self::solve`]'s `AᴴA` passes over.
+}
+
+/// [`ObjectSampler::solve`]'s buffers beyond the sampler's, which only a solving caller
+/// builds.
+pub struct ObjectSolve {
+    dims: ViewDims,
+    /// The scan as one stack, which the solve's `AᴴA` passes over.
     whole: StackTable,
-    /// [`Self::solve`]'s direction, `[nobj, nyo, nxo]`.
+    /// The direction, `[nobj, nyo, nxo]`.
     dir: DeviceBuffer<C32>,
-    /// [`Self::solve`]'s block sums, `CG_BLOCKS`.
+    /// The block sums, `CG_BLOCKS`.
     parts: DeviceBuffer<f32>,
-    /// [`Self::solve`]'s scalars, [`Pcg`]'s `s`.
+    /// The scalars, [`Pcg`]'s `s`.
     scalars: DeviceBuffer<f32>,
+}
+
+impl ObjectSolve {
+    /// The buffers of [`ObjectSampler::solve`] by `sampler` on `stream`.
+    pub fn new(stream: &CudaStream, sampler: &ObjectSampler) -> Result<Self, Error> {
+        let dims = sampler.dims;
+        Ok(Self {
+            dims,
+            whole: StackTable::new(stream, &dims, slice::from_ref(&(0..dims.nframe)))?,
+            dir: DeviceBuffer::zeroed(stream, dims.obj_len())?,
+            parts: DeviceBuffer::zeroed(stream, CG_BLOCKS as usize)?,
+            scalars: DeviceBuffer::zeroed(stream, PCG_SCALARS)?,
+        })
+    }
 }
 
 /// What [`ObjectSampler::spread`] sums over the frames.
@@ -218,10 +238,6 @@ impl ObjectSampler {
             scratch: DeviceBuffer::zeroed(stream, chunk as usize * plane)?,
             acc: DeviceBuffer::zeroed(stream, dims.obj_len())?,
             chunk,
-            whole: StackTable::new(stream, &dims, slice::from_ref(&(0..dims.nframe)))?,
-            dir: DeviceBuffer::zeroed(stream, dims.obj_len())?,
-            parts: DeviceBuffer::zeroed(stream, CG_BLOCKS as usize)?,
-            scalars: DeviceBuffer::zeroed(stream, PCG_SCALARS)?,
         })
     }
 
@@ -454,21 +470,28 @@ impl ObjectSampler {
     /// steps on `(AᴴA + reg) O' = num + reg O` from `O`, preconditioned by `D + reg`, `D`
     /// `AᴴA`'s diagonal into `sums.den`. A step along a direction of no positive curvature,
     /// or after a residual of no positive norm, is 0. Every scalar stays on the device, so the
-    /// launches capture; `spectra`, one object of them, is scratch. Zeroes `sums.num` and
-    /// `sums.den`, which it consumed.
+    /// launches capture; `state`, built by this sampler, and `spectra`, one object of them,
+    /// are scratch. Zeroes `sums.num` and `sums.den`, which it consumed.
     pub fn solve<const STEPS: usize>(
         &mut self,
         ctx: &ExecutionContext,
+        (state, spectra): (&mut ObjectSolve, &mut DeviceBuffer<C32>),
         a: Normal<'_>,
         obj: &mut DeviceBuffer<C32>,
-        spectra: &mut DeviceBuffer<C32>,
         sums: &mut UpdateSums,
         inertia: f32,
     ) -> Result<(), Error> {
+        if state.dims != self.dims {
+            return Err(Error::Shape(format!(
+                "solve of {:?}, sampler of {:?}",
+                state.dims, self.dims
+            )));
+        }
         let len = self.dims.obj_len();
         check_len("obj", obj, len)?;
         check_len("spectra", spectra, len)?;
         sums.check(len)?;
+        let stack = state.whole.at(0);
         let (n, config) = elems(len)?;
         self.spread(ctx, a, &mut sums.den, Spread::Diagonal)?;
         let UpdateSums { num, den, max_bits } = sums;
@@ -483,57 +506,57 @@ impl ObjectSampler {
         let pcg = Pcg {
             x: dptr(obj),
             res: dptr(num),
-            dir: dptr(&self.dir),
+            dir: dptr(&state.dir),
             ap: dptr(&self.acc),
             den: dptr(den),
-            part: dptr(&self.parts),
-            s: dptr(&self.scalars),
+            part: dptr(&state.parts),
+            s: dptr(&state.scalars),
             scale: 1.0 / self.plane() as f32,
             n,
         };
         let reads = [max_bits.storage()];
         self.base
-            .launch(ctx, &reads, &[self.scalars.storage()], |stream| {
+            .launch(ctx, &reads, &[state.scalars.storage()], |stream| {
                 // SAFETY: `max_bits` holds one word, `pcg` as `Pcg` says.
                 unsafe { (self.module).pcg_reg(stream, blocks(1, 1), dptr(max_bits), inertia, pcg) }
             })?;
         let (cg, sum) = (blocks(CG_BLOCKS, PIXEL_THREADS), blocks(1, PIXEL_THREADS));
         // `num - AᴴA O` in `num`, the residual from here on.
         self.planes.forward(ctx, obj, spectra)?;
-        self.normal(ctx, a, spectra)?;
+        self.normal(ctx, a, stack, spectra)?;
         let reads = [self.acc.storage(), den.storage()];
         let writes = [
             num.storage(),
-            self.dir.storage(),
-            self.parts.storage(),
-            self.scalars.storage(),
+            state.dir.storage(),
+            state.parts.storage(),
+            state.scalars.storage(),
         ];
         self.base.launch(ctx, &reads, &writes, |stream| {
             // SAFETY: `pcg` as `Pcg` says, `parts` `CG_BLOCKS`.
             unsafe { self.module.pcg_start(stream, cg, pcg) }
         })?;
-        self.sum(ctx, sum, PCG_RZ[0])?;
+        self.sum(ctx, state, sum, PCG_RZ[0])?;
         for step in 0..STEPS {
             let (rz, next) = (PCG_RZ[step % 2], PCG_RZ[(step + 1) % 2]);
-            self.planes.forward(ctx, &self.dir, spectra)?;
-            self.normal(ctx, a, spectra)?;
-            let reads = [self.dir.storage()];
+            self.planes.forward(ctx, &state.dir, spectra)?;
+            self.normal(ctx, a, stack, spectra)?;
+            let reads = [state.dir.storage()];
             let writes = [
                 self.acc.storage(),
-                self.parts.storage(),
-                self.scalars.storage(),
+                state.parts.storage(),
+                state.scalars.storage(),
             ];
             self.base.launch(ctx, &reads, &writes, |stream| {
                 // SAFETY: as `pcg_start`.
                 unsafe { self.module.pcg_curv(stream, cg, pcg) }
             })?;
-            self.sum(ctx, sum, PCG_PAP)?;
-            let reads = [self.dir.storage(), self.acc.storage(), den.storage()];
+            self.sum(ctx, state, sum, PCG_PAP)?;
+            let reads = [state.dir.storage(), self.acc.storage(), den.storage()];
             let writes = [
                 obj.storage(),
                 num.storage(),
-                self.parts.storage(),
-                self.scalars.storage(),
+                state.parts.storage(),
+                state.scalars.storage(),
             ];
             self.base.launch(ctx, &reads, &writes, |stream| {
                 // SAFETY: as `pcg_start`, `rz` a slot of `PCG_RZ`.
@@ -542,10 +565,10 @@ impl ObjectSampler {
             if step + 1 == STEPS {
                 break;
             }
-            self.sum(ctx, sum, next)?;
-            let reads = [num.storage(), den.storage(), self.scalars.storage()];
+            self.sum(ctx, state, sum, next)?;
+            let reads = [num.storage(), den.storage(), state.scalars.storage()];
             self.base
-                .launch(ctx, &reads, &[self.dir.storage()], |stream| {
+                .launch(ctx, &reads, &[state.dir.storage()], |stream| {
                     // SAFETY: as `pcg_start`, `rz` and `next` slots of `PCG_RZ`.
                     unsafe { (self.module).pcg_dir(stream, cg, pcg, rz, next) }
                 })?;
@@ -554,32 +577,34 @@ impl ObjectSampler {
         crate::gpu::zero(ctx, den)
     }
 
-    /// The scalar at `slot` of `scalars`, the sum of the block sums.
+    /// The scalar at `slot` of `state.scalars`, the sum of the block sums.
     fn sum(
         &mut self,
         ctx: &ExecutionContext,
+        state: &ObjectSolve,
         config: LaunchConfig,
         slot: u32,
     ) -> Result<(), Error> {
-        let out = dptr::<f32, f32>(&self.scalars).wrapping_add(slot as usize);
-        let reads = [self.parts.storage()];
+        let out = dptr::<f32, f32>(&state.scalars).wrapping_add(slot as usize);
+        let reads = [state.parts.storage()];
         self.base
-            .launch(ctx, &reads, &[self.scalars.storage()], |stream| {
+            .launch(ctx, &reads, &[state.scalars.storage()], |stream| {
                 // SAFETY: `parts` holds `CG_BLOCKS` floats, `scalars` `slot`.
-                unsafe { (self.module).pcg_sum(stream, config, dptr(&self.parts), CG_BLOCKS, out) }
+                unsafe { (self.module).pcg_sum(stream, config, dptr(&state.parts), CG_BLOCKS, out) }
             })
     }
 
     /// `acc = plane AᴴA x` of `x` `[nobj, nyo, nxo]`, `spectra` its [`Self::spectra`]: each
     /// frame's window on each object mode, as [`Self::windows`] samples it, weighted by
-    /// `sum_p |P_p|^2` and placed back as [`Self::place`] does, over the scan as one stack.
+    /// `sum_p |P_p|^2` and placed back as [`Self::place`] does, over `stack`, the scan as one
+    /// stack.
     fn normal(
         &mut self,
         ctx: &ExecutionContext,
         a: Normal<'_>,
+        stack: StackRef<'_>,
         spectra: &DeviceBuffer<C32>,
     ) -> Result<(), Error> {
-        let stack = self.whole.at(0);
         let g = self.dims.geom(stack)?;
         check_len("probe", a.probe, self.dims.nprobe as usize * self.dims.n())?;
         crate::gpu::zero(ctx, &mut self.acc)?;

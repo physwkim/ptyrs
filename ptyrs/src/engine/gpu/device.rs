@@ -12,7 +12,9 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use crate::fft::Plan2d;
-use crate::gpu::sampling::{Modes, Normal, ObjectSampler, StackPoints, WindowBlock, window_views};
+use crate::gpu::sampling::{
+    Modes, Normal, ObjectSampler, ObjectSolve, StackPoints, WindowBlock, window_views,
+};
 use crate::gpu::{
     BH_STEP, BackgroundSums, BhKernels, C32, CG_BLOCKS, Ended, EpochOrder, Error as GpuError,
     ExitPass, ExitStage, FarSums, FrameWaves, FusedBufs, FusedInputs, GammaStacks, GradKernels,
@@ -226,6 +228,20 @@ impl FeatureBufs {
     fn scratch(&self) -> PositionScratch {
         PositionScratch::of(self.position.as_ref().map(|p| &p.mover))
     }
+
+    /// Builds [`Mover::Object`]'s solve unless built, before AP's, DM's or RAAR's graph
+    /// captures [`FeaturesMut::solve_obj`].
+    fn build_solve(&mut self, stream: &CudaStream) -> Result<(), EngineError> {
+        if let Some(PositionBufs {
+            mover: Mover::Object { sampler, solve, .. },
+            ..
+        }) = &mut self.position
+            && solve.is_none()
+        {
+            *solve = Some(Box::new(ObjectSolve::new(stream, sampler)?));
+        }
+        Ok(())
+    }
 }
 
 /// What the position model adds to the passes over a cut, by what its offsets move.
@@ -390,6 +406,8 @@ enum Mover {
         sampler: Box<ObjectSampler>,
         /// `[nobj, nyo, nxo]`.
         spectra: DeviceBuffer<C32>,
+        /// [`ObjectSampler::solve`]'s buffers, which only [`FeatureBufs::build_solve`] builds.
+        solve: Option<Box<ObjectSolve>>,
     },
 }
 
@@ -414,6 +432,7 @@ impl Mover {
                     SAMPLER_CHUNK,
                 )?),
                 spectra: DeviceBuffer::zeroed(stream, dims.obj_len())?,
+                solve: None,
             },
         })
     }
@@ -571,16 +590,20 @@ impl<'m, X> PositionLent<'m, X> {
                 spectrum,
                 probe_sums,
             }))),
-            (MovedProbes::FullObject, Mover::Object { sampler, spectra }, _) => {
-                Ok(Some(Self::FullObject(SampledLent {
-                    own,
-                    pos,
-                    kernels,
-                    offsets: &mut *p.offsets,
-                    sampler,
-                    spectra,
-                })))
-            }
+            (
+                MovedProbes::FullObject,
+                Mover::Object {
+                    sampler, spectra, ..
+                },
+                _,
+            ) => Ok(Some(Self::FullObject(SampledLent {
+                own,
+                pos,
+                kernels,
+                offsets: &mut *p.offsets,
+                sampler,
+                spectra,
+            }))),
             _ => Err(another_model()),
         }
     }
@@ -1106,7 +1129,9 @@ impl FeaturesMut<'_> {
                         };
                         (Some(shift), None, Some(&mut **probe_sums))
                     }
-                    Mover::Object { sampler, spectra } => {
+                    Mover::Object {
+                        sampler, spectra, ..
+                    } => {
                         sampler.spectra(ctx, obj, spectra)?;
                         let sampled = Sampled {
                             sampler,
@@ -1159,7 +1184,8 @@ impl FeaturesMut<'_> {
     /// Under [`Sampling::FullObject`], the object update of `obj` from `sums` by the normal
     /// equations of `probe`'s windows over the scan's `views` at the offsets
     /// ([`ObjectSampler::solve`], [`OBJ_PCG`] steps), the object's spectra its scratch: `true`
-    /// then, `false` with nothing touched otherwise.
+    /// then, `false` with nothing touched otherwise; an error if [`FeatureBufs::build_solve`]
+    /// has not built the solve.
     pub fn solve_obj(
         &mut self,
         ctx: &ExecutionContext,
@@ -1172,15 +1198,23 @@ impl FeaturesMut<'_> {
         let Some(p) = &mut self.position else {
             return Ok(false);
         };
-        let Mover::Object { sampler, spectra } = &mut *p.mover else {
+        let Mover::Object {
+            sampler,
+            spectra,
+            solve,
+        } = &mut *p.mover
+        else {
             return Ok(false);
+        };
+        let Some(solve) = solve else {
+            return Err(GpuError::Shape("object solve not built".into()));
         };
         let a = Normal {
             views,
             offsets: p.offsets,
             probe,
         };
-        sampler.solve::<OBJ_PCG>(ctx, a, obj, spectra, sums, inertia)?;
+        sampler.solve::<OBJ_PCG>(ctx, (solve, spectra), a, obj, sums, inertia)?;
         Ok(true)
     }
 
@@ -2733,13 +2767,18 @@ impl Device {
             self.one_slice(&what)?;
         }
         let mut cycle = match epoch {
-            Epoch::Ap { params, llk } => Cycle::Ap { params, llk },
+            Epoch::Ap { params, llk } => {
+                self.features.build_solve(&self.stream)?;
+                Cycle::Ap { params, llk }
+            }
             Epoch::Dm { params, first } => {
                 self.build_carried(false)?;
+                self.features.build_solve(&self.stream)?;
                 Cycle::Dm { params, first }
             }
             Epoch::Raar { params, first } => {
                 self.build_carried(true)?;
+                self.features.build_solve(&self.stream)?;
                 Cycle::Raar { params, first }
             }
             Epoch::Rpie(p) => {
