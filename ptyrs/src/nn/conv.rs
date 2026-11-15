@@ -340,7 +340,9 @@ fn weight_grad(x: CubeTensor, dy: CubeTensor) -> CubeTensor {
     let [_, _, _, co] = dy.meta.shape().dims();
     let (across, down) = (ci.div_ceil(LANES), co.div_ceil(PER * WARPS));
     let strips = w.div_ceil(TILE);
-    let rows = h.div_ceil((CUBES / (across * down * n * strips)).clamp(1, h));
+    // A band holds at least one row; no pixels or no channels make no bands or no cubes.
+    let split = (CUBES / (across * down * n * strips).max(1)).clamp(1, h.max(1));
+    let rows = h.div_ceil(split).max(1);
     let blocks = h.div_ceil(rows);
     let bands = n * blocks * strips;
     let cubes = across * bands * down;
@@ -763,6 +765,30 @@ mod tests {
             ..case(1, 1, 1, 1, PER * WARPS * 65_535 + 1)
         };
         f32_weight_gradient(c, 2e-5);
+    }
+
+    /// The weight gradient over no pixels is zero, and over no channels empty. burn's own
+    /// convolution backward fails at these sizes, so `weight_grad` is called directly.
+    #[test]
+    fn weight_gradient_at_zero_sizes() {
+        let device = crate::nn::cuda(0);
+        let cube = |shape: [usize; 4]| {
+            Tensor::<4>::ones(shape, (&device, DType::F32))
+                .try_into_primitive::<CubeBackend>()
+                .unwrap()
+        };
+        for [n, h, w, ci, co] in [
+            [0, 5, 6, 2, 3],
+            [2, 0, 6, 2, 3],
+            [2, 5, 0, 2, 3],
+            [2, 5, 6, 0, 3],
+            [2, 5, 6, 2, 0],
+        ] {
+            let dw = weight_grad(cube([n, h, w, ci]), cube([n, h, w, co]));
+            let dw = Tensor::<4>::from_primitive::<CubeBackend>(dw);
+            assert_eq!(dw.dims(), [co, ci, 3, 3]);
+            assert_eq!(host(dw), vec![0.0; co * ci * 9], "{:?}", [n, h, w, ci, co]);
+        }
     }
 
     #[test]

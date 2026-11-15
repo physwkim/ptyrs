@@ -32,7 +32,7 @@ use crate::nn::grid::grid;
 pub fn norm_relu<const D: usize>(n: &BatchNorm, x: Tensor<D>) -> Tensor<D> {
     let dims = x.dims();
     let cols = dims[D - 1];
-    let x = x.reshape([dims.iter().product::<usize>() / cols, cols]);
+    let x = x.reshape([dims[..D - 1].iter().product(), cols]);
     let device = x.device();
     let y = if device.is_autodiff() && n.training.is_enabled() {
         // burn's batch_norm_train checks; the kernels read γ and β at every channel.
@@ -174,8 +174,9 @@ impl Grid {
         let tx = cols.next_power_of_two().min(32);
         let ty = UNITS / tx;
         let blocks = cols.div_ceil(tx);
-        let chunk = rows.div_ceil((512 / blocks).max(1)).max(ty * 8);
-        let groups = rows.div_ceil(chunk);
+        let chunk = rows.div_ceil((512 / blocks.max(1)).max(1)).max(ty * 8);
+        // Group 0 writes each channel's statistics and its dγ and dβ, so it exists over no rows.
+        let groups = rows.div_ceil(chunk).max(1);
         let cubes = groups * blocks;
         Self {
             rows,
@@ -672,9 +673,10 @@ mod tests {
             .unwrap()
     }
 
-    /// A training batch norm over `cols` channels with the given parameters and running state.
-    fn batch_norm(cols: usize, p: &[Tensor<1>; 4]) -> BatchNorm {
-        let mut n = BatchNormConfig::new(cols).init(&p[0].device());
+    /// A training batch norm with the given parameters and running state, over as many channels.
+    fn batch_norm(p: &[Tensor<1>; 4]) -> BatchNorm {
+        // burn's config takes no zero channels; every tensor it makes is replaced.
+        let mut n = BatchNormConfig::new(1).init(&p[0].device());
         n.gamma = Param::from_tensor(p[0].clone());
         n.beta = Param::from_tensor(p[1].clone());
         n.running_mean = RunningState::new(p[2].clone());
@@ -718,7 +720,7 @@ mod tests {
     fn compare(p: &[Tensor<1>; 4], x: &Tensor<2>, w: &Tensor<2>, tol: f64) {
         let [rows, cols] = x.dims();
         let run = |fused: bool| {
-            let n = batch_norm(cols, p);
+            let n = batch_norm(p);
             let x = x.clone().require_grad();
             let y = if fused {
                 norm_relu(&n, x.clone())
@@ -783,6 +785,62 @@ mod tests {
         agrees(2, 32 * 65_535 + 1, DType::F32, 2e-5, false);
     }
 
+    fn cube<const D: usize>(shape: [usize; D], device: &Device) -> CubeTensor {
+        Tensor::<D>::ones(shape, (device, DType::F64))
+            .try_into_primitive::<CubeBackend>()
+            .unwrap()
+    }
+
+    fn read<const D: usize>(t: CubeTensor) -> Vec<f64> {
+        let t = Tensor::<D>::from_primitive::<CubeBackend>(t);
+        t.into_data()
+            .convert::<f64>()
+            .try_into_vec::<f64>()
+            .unwrap()
+    }
+
+    /// The kernels at zero sizes: over no rows each channel's mean and variance are 0/0, NaN as
+    /// burn's, and its dγ and dβ zero; over no channels every output is empty. burn's own
+    /// elementwise kernels fail on an empty matrix, so the kernels are called directly.
+    #[test]
+    fn kernels_at_zero_sizes() {
+        let device = crate::nn::cuda(0);
+        for (rows, cols) in [(0, 8), (8, 0), (0, 0)] {
+            let x = cube([rows, cols], &device);
+            let gamma = cube([cols], &device);
+            let (y, mean, var) = forward(x.clone(), gamma.clone(), cube([cols], &device), 1e-5);
+            let dy = cube([rows, cols], &device);
+            let [dx, dgamma, dbeta] =
+                backward(x, gamma, y.clone(), mean.clone(), var.clone(), 1e-5, dy);
+            let at = format!("{rows}×{cols}");
+            let nan = |v: Vec<f64>| v.len() == cols && v.iter().all(|v| v.is_nan());
+            assert_eq!(read::<2>(y).len(), rows * cols, "{at}: y");
+            assert_eq!(read::<2>(dx).len(), rows * cols, "{at}: dx");
+            assert!(nan(read::<1>(mean)), "{at}: mean");
+            assert!(nan(read::<1>(var)), "{at}: var");
+            assert_eq!(read::<1>(dgamma), vec![0.0; cols], "{at}: dgamma");
+            assert_eq!(read::<1>(dbeta), vec![0.0; cols], "{at}: dbeta");
+        }
+    }
+
+    /// Through `norm_relu`, an activation of no channels stays empty, and over no rows the running
+    /// statistics take the NaN batch statistics.
+    #[test]
+    fn norm_relu_at_zero_sizes() {
+        let device = crate::nn::cuda(0).autodiff();
+        for (rows, cols) in [(4, 0), (0, 8)] {
+            let ones = || Tensor::<1>::ones([cols], (&device, DType::F64));
+            let n = batch_norm(&[ones(), ones(), ones(), ones()]);
+            let y = norm_relu(&n, Tensor::<2>::ones([rows, cols], (&device, DType::F64)));
+            assert_eq!(y.dims(), [rows, cols]);
+            let mean = host(n.running_mean.value_sync());
+            assert!(
+                mean.len() == cols && mean.iter().all(|v| v.is_nan()),
+                "{mean:?}"
+            );
+        }
+    }
+
     #[test]
     fn fused_matches_burn_on_a_strided_input() {
         agrees(1013, 8, DType::F64, 1e-12, true);
@@ -832,7 +890,7 @@ mod tests {
             values(5, -1.0, 1.0, &device, dtype),
             values(5, 0.5, 2.0, &device, dtype),
         ];
-        let n = batch_norm(5, &p);
+        let n = batch_norm(&p);
         let x = Tensor::<4>::random([2, 3, 4, 5], Distribution::Normal(0.0, 1.0), &device);
         let a = norm_relu(&n, x.clone());
         let b = relu(n.forward(x.reshape([24, 5]))).reshape([2, 3, 4, 5]);
