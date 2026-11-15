@@ -17,7 +17,7 @@ use crate::gpu::sampling::{
     Modes, Normal, ObjectSampler, ObjectSolve, StackPoints, WindowBlock, window_views,
 };
 use crate::gpu::{
-    BH_STEP, BackgroundSums, BhKernels, BhParts, C32, CG_BLOCKS, Ended, EpochOrder,
+    BH_STEP, BackgroundSums, BandedTransfer, BhKernels, BhParts, C32, CG_BLOCKS, Ended, EpochOrder,
     Error as GpuError, ExitPass, ExitStage, FarSums, FrameWaves, FusedBufs, FusedInputs,
     GammaStacks, GradKernels, HalfWaves, Kernels, LlkPartial, LlkRing, LlkScratch, LlkTotals,
     MASKED, Model, OpticsKernels, PositionKernels, PositionPartial, Positions, PowerMax,
@@ -2470,6 +2470,7 @@ impl Device {
             PlaneStage::Transfer(tf) => {
                 ExitStage::Transfer(DeviceBuffer::from_host(&stream, &to_c32(tf))?)
             }
+            PlaneStage::Banded(tf) => ExitStage::Banded(BandedTransfer::new(&stream, &to_c32(tf))?),
         };
         let half = match (options.psi_f16, options.fused) {
             (false, _) => None,
@@ -2845,6 +2846,19 @@ impl Device {
         }
     }
 
+    /// Fails on a propagator that drops an evanescent band, for `what` of an algorithm that takes
+    /// its adjoint for its inverse: only LSQML, which carries the band, BH, whose gradients take
+    /// the adjoint as such, and the LLK pass, forward alone, run it.
+    fn unitary(&self, what: &str) -> Result<(), EngineError> {
+        match self.exit {
+            ExitStage::Banded(_) => Err(EngineError::Invalid(format!(
+                "{what} needs a unitary propagator; this one drops an evanescent band: only \
+                 LSQML, BH and the LLK pass run it"
+            ))),
+            _ => Ok(()),
+        }
+    }
+
     /// Overwrites the object in place, so every captured graph reads the new values.
     pub fn write_object(&mut self, obj: &[C32]) -> Result<(), EngineError> {
         Ok(self.obj.copy_from_host(&self.stream, obj)?)
@@ -3092,23 +3106,27 @@ impl Device {
         let mut cycle = match epoch {
             Epoch::Ap { params, llk } => {
                 let one = self.one_slice(&what)?;
+                self.unitary(&what)?;
                 self.features.build_solve(&self.stream)?;
                 Cycle::Ap { params, llk, one }
             }
             Epoch::Dm { params, first } => {
                 let one = self.one_slice(&what)?;
+                self.unitary(&what)?;
                 self.build_carried(false)?;
                 self.features.build_solve(&self.stream)?;
                 Cycle::Dm { params, first, one }
             }
             Epoch::Raar { params, first } => {
                 let one = self.one_slice(&what)?;
+                self.unitary(&what)?;
                 self.build_carried(true)?;
                 self.features.build_solve(&self.stream)?;
                 Cycle::Raar { params, first, one }
             }
             Epoch::Rpie(p) => {
                 let one = self.one_slice(&what)?;
+                self.unitary(&what)?;
                 let moved = self.features.positioned().then(|| self.moved_scratch());
                 let scratch = RpieScratch::new(
                     &self.stream,
@@ -3123,6 +3141,7 @@ impl Device {
             }
             Epoch::Ml { params, first, llk } => {
                 let one = self.one_slice(&what)?;
+                self.unitary(&what)?;
                 self.build_ml(one)?;
                 Cycle::Ml { params, first, llk }
             }
@@ -3224,7 +3243,7 @@ impl Device {
                 size,
                 self.rule,
                 reads.map(|_| self.moved_scratch()),
-                self.deeper().len(),
+                (self.deeper().len(), &self.exit),
             )?;
             self.lsqml = Some(Box::new(state));
         }
@@ -3251,6 +3270,7 @@ impl Device {
     /// [`Bufs::scale_to_photons`] enqueued eagerly, with `total` the unmasked observed photons.
     pub fn scale_to_photons(&mut self, total: f32) -> Result<(), EngineError> {
         let one = self.one_slice("ML's scaling")?;
+        self.unitary("ML's scaling")?;
         self.build_ml(one)?;
         let ctx = self.context();
         let (mut bufs, mut passes, _) = self.lend();
@@ -3295,6 +3315,7 @@ impl Device {
         read: impl FnOnce(&Arc<CudaStream>, [&DeviceBuffer<C32>; 2]) -> Result<R, EngineError>,
     ) -> Result<R, EngineError> {
         let one = self.one_slice("ML's gradient")?;
+        self.unitary("ML's gradient")?;
         let ran = {
             let ctx = self.context();
             let (mut bufs, mut passes, _) = self.lend();

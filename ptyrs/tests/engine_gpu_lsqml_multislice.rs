@@ -1,8 +1,8 @@
 //! GPU LSQML through a multislice object against the CPU's `f64` [`Lsqml`] from the same
-//! start: two and three slices under each of the far field, the angular spectrum and the
-//! Fresnel transform forward and back, without and with a modelled position, which moves the
-//! probe or samples the object, for both costs; and the LLK pass through the slices against
-//! the CPU's LLK of the same arrays.
+//! start: two and three slices under each of the far field, the angular spectrum without and
+//! with an evanescent band and the Fresnel transform forward and back, without and with a
+//! modelled position, which moves the probe or samples the object, for both costs; and the
+//! LLK pass through the slices against the CPU's LLK of the same arrays.
 //! Frames are on the fused passes' smallest side, two incoherent probe modes, 30 Fermat
 //! positions in stacks of at most 8, so a batch of 12 ends in a stack of 4; 300 positions in
 //! stacks the device sizes take the waves a position recuts.
@@ -31,7 +31,16 @@ const PIXEL: f64 = 50e-9;
 /// Photons the probe sends through a frame.
 const PHOTONS: f64 = 2e5;
 const FRAME: usize = FUSED_SIDES[0] as usize;
-const PROPAGATORS: [&str; 4] = ["far field", "angular spectrum", "Fresnel", "Fresnel back"];
+/// A wavelength whose angular spectrum over [`PIXEL`] drops the corners of the frequency
+/// grid, `λ / pixel` the CPU's near case's 5/3.
+const BAND_WAVELENGTH: f64 = PIXEL / 0.6;
+const PROPAGATORS: [&str; 5] = [
+    "far field",
+    "angular spectrum",
+    "Fresnel",
+    "Fresnel back",
+    "evanescent band",
+];
 
 const OPTIONS: GpuOptions = GpuOptions {
     stack_size: Some(8),
@@ -55,13 +64,25 @@ fn wavefield(distance: f64) -> Wavefield {
     Wavefield::new([FRAME, FRAME], WAVELENGTH, [PIXEL, PIXEL], distance).unwrap()
 }
 
-/// `propagator` after `nslice` slices 20 µm, then 30 µm apart.
+/// `propagator` after `nslice` slices 20 µm, then 30 µm apart; the gaps at [`WAVELENGTH`]
+/// under every one, so an evanescent band is the exit's alone.
 fn optics(propagator: &str, nslice: usize) -> Optics {
+    let band = || {
+        let pixel = [PIXEL, PIXEL];
+        Wavefield::new(
+            [FRAME, FRAME],
+            BAND_WAVELENGTH,
+            pixel,
+            6.0 * BAND_WAVELENGTH,
+        )
+        .unwrap()
+    };
     let exit = match propagator {
         "far field" => Optics::far_field(&geometry()),
         "angular spectrum" => Optics::free_space(&wavefield(1e-4)),
         "Fresnel" => Optics::free_space(&wavefield(5e-3)),
         "Fresnel back" => Optics::free_space(&wavefield(-5e-3)),
+        "evanescent band" => Optics::free_space(&band()),
         other => panic!("no propagator {other}"),
     };
     let gaps = [wavefield(2e-5), wavefield(3e-5)];
@@ -420,7 +441,7 @@ fn matches_cpu(propagator: &str, nslices: &[usize], nobj: usize, sampling: Sampl
                  offsets {:.2e}",
                 errs[0], errs[1], errs[2], errs[3], errs[4], errs[5]
             );
-            // Each bound is 5 times the worst of the 72 runs or more: `a_far` 2.8e-5 and the
+            // Each bound is 5 times the worst of the 90 runs or more: `a_far` 2.8e-5 and the
             // offsets 1.9e-5 under the Fresnel transform back, three slices, Poisson, a position
             // that moves the probe; of one that samples the object, `a_far` 1.2e-5 there.
             let bounds = [
@@ -458,6 +479,11 @@ fn sliced_lsqml_matches_cpu_under_fresnel_back() {
     matches_cpu(PROPAGATORS[3], &[2, 3], 1, Sampling::Patch);
 }
 
+#[test]
+fn sliced_lsqml_matches_cpu_under_an_evanescent_band() {
+    matches_cpu(PROPAGATORS[4], &[2, 3], 1, Sampling::Patch);
+}
+
 /// Two object modes through three slices, each view's wave its own through every slice.
 #[test]
 fn sliced_lsqml_with_object_modes_matches_cpu_in_the_far_field() {
@@ -477,6 +503,11 @@ fn sliced_lsqml_with_object_modes_matches_cpu_under_fresnel() {
 #[test]
 fn sliced_lsqml_with_object_modes_matches_cpu_under_fresnel_back() {
     matches_cpu(PROPAGATORS[3], &[3], 2, Sampling::Patch);
+}
+
+#[test]
+fn sliced_lsqml_with_object_modes_matches_cpu_under_an_evanescent_band() {
+    matches_cpu(PROPAGATORS[4], &[3], 2, Sampling::Patch);
 }
 
 /// A position that samples the object: every slice's windows, under each propagator.

@@ -504,7 +504,8 @@ impl GpuPtycho {
     /// exit waves' plane phase and the propagator in place of the scan geometry's far field;
     /// of the geometry only the frame is read. Fails on optics without a
     /// [`Optics::fourier_form`], and on more than one object slice, which
-    /// [`Self::with_slices`] takes.
+    /// [`Self::with_slices`] takes. Angular spectrum with an evanescent band runs LSQML, BH
+    /// and the LLK pass alone, as the CPU's: every other algorithm fails on it.
     pub fn with_optics(
         ctx: &Arc<CudaContext>,
         scan: &Scan,
