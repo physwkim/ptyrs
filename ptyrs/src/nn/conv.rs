@@ -2,7 +2,7 @@
 //! its own: `conv3x3` gives its output, and its input gradient as the convolution of the output
 //! gradient by the weight `arrange` flips and transposes; a cube of it holds 8 × 32 pixels against
 //! up to 64 output channels, staging the input a few channels at a time with a border of one. Its
-//! weight gradient is one kernel split over bands of image rows. burn takes that gradient as a
+//! weight and bias gradients are one kernel split over bands of image rows. burn takes the first as a
 //! matmul whose output, `co × 9·ci` (64 × 576 at a U-Net's top level), is a few dozen cubes at
 //! most while its inner dimension is every pixel of the batch, so most of the GPU idles; here each
 //! cube sums its own band and one more kernel adds the bands. The kernel takes deep levels too,
@@ -16,7 +16,6 @@ use burn::backend::autodiff::checkpoint::strategy::CheckpointStrategy;
 use burn::backend::autodiff::grads::Gradients;
 use burn::backend::autodiff::ops::{Backward, Ops, OpsKind};
 use burn::backend::cubecl::dtype_to_storage_type;
-use burn::backend::ops::{FloatTensorOps, ModuleOps};
 use burn::backend::tensor::FloatTensor;
 use burn::backend::{Autodiff, Backend, Dispatch, backend_extension};
 use burn::module::{
@@ -189,11 +188,6 @@ impl ConvOps for CubeBackend {
     }
 }
 
-/// `x` `[n, h, w, c]` as the `[n, c, h, w]` view burn's convolutions take.
-fn first(x: CubeTensor) -> CubeTensor {
-    CubeBackend::float_permute(x, &[0, 3, 1, 2])
-}
-
 /// The convolution of `x`, `[n, h, w, ci]`, by `weight`, `[co, ci, 3, 3]`, plus `bias`.
 fn forward(x: CubeTensor, weight: CubeTensor, bias: Option<CubeTensor>) -> CubeTensor {
     conv3x3(x, arrange(weight, false), bias)
@@ -205,33 +199,30 @@ fn input_grad(dy: CubeTensor, weight: CubeTensor) -> CubeTensor {
     conv3x3(dy, arrange(weight, true), None)
 }
 
-/// What the backward reads: the input as the forward took it, the weight and the bias.
+/// What the backward reads: the input as the forward took it, and the weight.
 #[derive(Clone, Debug)]
 struct Saved {
     x: CubeTensor,
     weight: CubeTensor,
-    bias: Option<CubeTensor>,
 }
 
 impl Saved {
     /// The convolution's output, and what its backward keeps.
     fn forward(x: CubeTensor, weight: CubeTensor, bias: Option<CubeTensor>) -> (Self, CubeTensor) {
-        let y = forward(x.clone(), weight.clone(), bias.clone());
-        (Self { x, weight, bias }, y)
+        let y = forward(x.clone(), weight.clone(), bias);
+        (Self { x, weight }, y)
     }
 
     /// The gradients of the input, weight and bias the parents ask for, from the output's `dy`.
+    /// The bias gradient comes from the weight gradient's kernel, so it alone costs both.
     fn backward(self, dy: CubeTensor, want: [bool; 3]) -> [Option<CubeTensor>; 3] {
         let dx = want[0].then(|| input_grad(dy.clone(), self.weight));
-        let db = match (want[2], self.bias) {
-            (true, Some(b)) => Some(CubeBackend::conv2d_bias_backward(
-                first(self.x.clone()),
-                b,
-                first(dy.clone()),
-            )),
-            _ => None,
+        let (dw, db) = if want[1] || want[2] {
+            let (dw, db) = weight_grad(self.x, dy, want[2]);
+            (want[1].then_some(dw), db)
+        } else {
+            (None, None)
         };
-        let dw = want[1].then(|| weight_grad(self.x, dy));
         [dx, dw, db]
     }
 }
@@ -315,44 +306,46 @@ const LANES: usize = 32;
 const WARPS: usize = 8;
 /// Output channels per unit, so a cube takes `PER · WARPS` of them.
 const PER: usize = 8;
-/// Pixels of a row a cube takes.
-const TILE: usize = 32;
 /// Pixels whose sums one pass of a unit's loop unrolls.
 const UNROLL: usize = 4;
 /// At most how many cubes one weight gradient spreads over.
 const CUBES: usize = 512;
 
 /// The weight gradient `[co, ci, 3, 3]` of a 3×3 same-padded convolution of stride 1 from its
-/// channels-last input `x`, `[n, h, w, ci]`, and output gradient `dy`, `[n, h, w, co]`.
+/// channels-last input `x`, `[n, h, w, ci]`, and output gradient `dy`, `[n, h, w, co]`, and, if
+/// `bias`, the bias gradient `[co]`.
 ///
 /// Cube `a + across·(s + bands·b)` sums input channels `a·LANES ..` against output channels
-/// `b·PER·WARPS ..` over band `s`, `TILE` columns of a run of rows of one image, into row `s` of a
-/// `[bands, co·ci·9]` tensor, and a second kernel adds the bands in order, so the result does not
-/// depend on scheduling.
-fn weight_grad(x: CubeTensor, dy: CubeTensor) -> CubeTensor {
+/// `b·PER·WARPS ..` over band `s`, `LANES` columns of a run of rows of one image, into row `s` of a
+/// `[bands, co·ci·9]` tensor, followed by the band's sums of `dy` from the cubes of `a = 0` if
+/// `bias`; a second kernel adds the bands in order, so the result does not depend on scheduling.
+fn weight_grad(x: CubeTensor, dy: CubeTensor, bias: bool) -> (CubeTensor, Option<CubeTensor>) {
     let (x, dy) = (into_contiguous(x), into_contiguous(dy));
     let [n, h, w, ci] = x.meta.shape().dims();
     let [_, _, _, co] = dy.meta.shape().dims();
-    let (across, down) = (ci.div_ceil(LANES), co.div_ceil(PER * WARPS));
-    let strips = w.div_ceil(TILE);
+    // The cubes of `a = 0` sum the bias gradient, so they are there even for no input channels.
+    let (across, down) = (ci.div_ceil(LANES).max(1), co.div_ceil(PER * WARPS));
+    let strips = w.div_ceil(LANES);
     // A band holds at least one row; no pixels or no channels make no bands or no cubes.
     let split = (CUBES / (across * down * n * strips).max(1)).clamp(1, h.max(1));
     let rows = h.div_ceil(split).max(1);
     let blocks = h.div_ceil(rows);
     let bands = n * blocks * strips;
     let cubes = across * bands * down;
-    let len = co * ci * 9;
+    let lw = co * ci * 9;
+    let len = lw + if bias { co } else { 0 };
     let dtype = dtype_to_storage_type(x.dtype);
     let client = x.client.clone();
     let empty = |shape: Shape| {
         empty_device_contiguous_dtype(client.clone(), x.device.clone(), shape, x.dtype)
     };
     let parts = empty([bands, len].into());
-    let out = empty([co, ci, 3, 3].into());
+    let dw = empty([co, ci, 3, 3].into());
+    let db = bias.then(|| empty([co].into()));
     let u = |v: usize| u32::try_from(v).expect("a weight gradient of fewer than 2³² elements");
     // SAFETY: every index the kernels form is below its tensor's length: pixels are masked against
     // the image, channels against `ci` and `co`, bands against `n` images and elements against
-    // `len`.
+    // `lw` and `len`.
     unsafe {
         kernel::weight_parts::launch_unchecked(
             &client,
@@ -365,17 +358,18 @@ fn weight_grad(x: CubeTensor, dy: CubeTensor) -> CubeTensor {
             u(w),
             u(ci),
             u(co),
+            u(len),
             u(rows),
             u(blocks),
             u(strips),
             u(across),
             u(bands),
             u(cubes),
-            TILE,
             LANES,
             WARPS,
             PER,
             UNROLL,
+            bias,
             dtype,
         );
         kernel::sum_bands::launch_unchecked(
@@ -383,13 +377,15 @@ fn weight_grad(x: CubeTensor, dy: CubeTensor) -> CubeTensor {
             grid(&client, len.div_ceil(256)),
             CubeDim::new_1d(256),
             parts.into_tensor_arg(),
-            out.clone().into_tensor_arg(),
+            dw.clone().into_tensor_arg(),
+            db.clone().map(|t| t.into_tensor_arg()).into(),
+            u(lw),
             u(len),
             u(bands),
             dtype,
         );
     }
-    out
+    (dw, db)
 }
 
 /// Pixel rows a cube of `conv3x3` takes.
@@ -496,8 +492,9 @@ mod kernel {
     /// `dy` for its output channels, and keeps the strip of `x` for its input channels, one pixel
     /// wider on each side, for that row and the rows above and below in a ring of three, so each
     /// row of `x` is read once. Unit `(l, k)` holds input channel `l` against `per` output
-    /// channels at all nine taps. Reads for the next row go to registers before the current row's
-    /// sums, so they overlap.
+    /// channels at all nine taps, and, if `bias` and the cube's input channels are the first, the
+    /// sum of `dy` at pixel `l` of the strip for them. Reads for the next row go to registers
+    /// before the current row's sums, so they overlap.
     #[cube(launch_unchecked)]
     pub fn weight_parts<F: Float>(
         x: &Tensor<F>,
@@ -507,17 +504,18 @@ mod kernel {
         w: u32,
         ci: u32,
         co: u32,
+        len: u32,
         rows: u32,
         blocks: u32,
         strips: u32,
         across: u32,
         bands: u32,
         cubes: u32,
-        #[comptime] tile: usize,
         #[comptime] lanes: usize,
         #[comptime] warps: usize,
         #[comptime] per: usize,
         #[comptime] unroll: usize,
+        #[comptime] bias: bool,
         #[define(F)] _dtype: ElemType,
     ) {
         if CUBE_POS >= cubes as usize {
@@ -526,6 +524,8 @@ mod kernel {
         let (h, w, ci, co) = (h as usize, w as usize, ci as usize, co as usize);
         let units = comptime!(lanes * warps);
         let outs = comptime!(per * warps);
+        // A strip is as wide as a warp.
+        let tile = lanes;
         let xrow = comptime!((tile + 2) * lanes);
         let gsize = comptime!(tile * outs);
         let xloads = comptime!(xrow.div_ceil(units));
@@ -536,6 +536,11 @@ mod kernel {
         #[unroll]
         for k in 0..comptime!(per * 9) {
             acc[k] = F::new(0.0_f32);
+        }
+        let mut bacc = Array::<F>::new(per);
+        #[unroll]
+        for k in 0..per {
+            bacc[k] = F::new(0.0_f32);
         }
         let mut xr = Array::<F>::new(xloads);
         let mut gr = Array::<F>::new(gloads);
@@ -609,6 +614,12 @@ mod kernel {
                 }
             }
             if t >= 3 {
+                if bias {
+                    #[unroll]
+                    for k in 0..per {
+                        bacc[k] += gs[l * outs + k0 + k];
+                    }
+                }
                 // Pixels past the row's end have a zero gradient, so they add exact zeros.
                 let mut pb = 0;
                 while pb < tile {
@@ -638,9 +649,25 @@ mod kernel {
             sync_cube();
             t += 1;
         }
+        let at = band * len as usize;
+        // Every cube sums `dy`; those of the first input channels store the sums.
+        if bias {
+            #[unroll]
+            for k in 0..per {
+                gs[l * outs + k0 + k] = bacc[k];
+            }
+            sync_cube();
+            if ci0 == 0 && unit < outs && co0 + unit < co {
+                let mut sum = F::new(0.0_f32);
+                #[unroll]
+                for j in 0..lanes {
+                    sum += gs[j * outs + unit];
+                }
+                parts[at + co * ci * 9 + co0 + unit] = sum;
+            }
+        }
         let c = ci0 + l;
         if c < ci {
-            let at = band * co * ci * 9;
             #[unroll]
             for k in 0..per {
                 let o = co0 + k0 + k;
@@ -654,11 +681,14 @@ mod kernel {
         }
     }
 
-    /// `out[i]`, the sum of column `i` of the `[bands, len]` partials in band order.
+    /// The sum of column `i` of the `[bands, len]` partials in band order, into `dw[i]` for the
+    /// first `lw` columns and into `db` for the rest.
     #[cube(launch_unchecked)]
     pub fn sum_bands<F: Float>(
         parts: &Tensor<F>,
-        out: &mut Tensor<F>,
+        dw: &mut Tensor<F>,
+        db: ComptimeOption<&mut Tensor<F>>,
+        lw: u32,
         len: u32,
         bands: u32,
         #[define(F)] _dtype: ElemType,
@@ -671,7 +701,15 @@ mod kernel {
                 acc += parts[s * len as usize + i];
                 s += 1;
             }
-            out[i] = acc;
+            let lw = lw as usize;
+            if i < lw {
+                dw[i] = acc;
+            } else {
+                #[comptime]
+                if let ComptimeOption::Some(db) = db {
+                    db[i - lw] = acc;
+                }
+            }
         }
     }
 
@@ -991,11 +1029,11 @@ mod tests {
         assert!(err <= tol * scale, "{what} off by {err:e} of {scale:e}");
     }
 
-    /// The f64 output and input gradient of `Σ y·g`, `y` the `k × k` same convolution of
-    /// `inputs`: per kernel offset, the input shifted by it times that offset's weights
-    /// transposed, plus the bias, and `g` shifted the other way times the weights. The input
-    /// gradient is laid out as the input is.
-    fn reference(c: Case, inputs: &[Tensor<4>; 4]) -> [Vec<f64>; 2] {
+    /// The f64 output, input gradient and bias gradient of `Σ y·g`, `y` the `k × k` same
+    /// convolution of `inputs`: per kernel offset, the input shifted by it times that offset's
+    /// weights transposed, plus the bias; `g` shifted the other way times the weights; and `g`
+    /// summed over pixels. The input gradient is laid out as the input is.
+    fn reference(c: Case, inputs: &[Tensor<4>; 4]) -> [Vec<f64>; 3] {
         let [x, weight, bias, g] = inputs.clone().map(|t| t.cast(DType::F64));
         let x = if c.strided {
             x.permute([0, 2, 3, 1])
@@ -1003,6 +1041,7 @@ mod tests {
             x
         };
         let (p, pixels) = (c.k / 2, c.n * c.h * c.w);
+        let db = host(g.clone().reshape([pixels, c.co]).sum_dim(0));
         let pad = |t: Tensor<4>| t.pad([(p, p), (p, p), (0, 0)], PadMode::Constant(0.0));
         let (x, g) = (pad(x), pad(g));
         let shifted = |t: &Tensor<4>, ky: usize, kx: usize| {
@@ -1038,26 +1077,26 @@ mod tests {
         } else {
             dx
         };
-        [host(y), host(dx)]
+        [host(y), host(dx), db]
     }
 
     /// The largest error of an f32 output or gradient against the f64 one, relative to the f64
     /// one's largest magnitude.
     const F32: f64 = 2e-5;
 
-    /// [`Conv::forward`] against [`reference`] and against burn's path: the output and input
-    /// gradient to `1e-12` of their largest magnitude in f64 and to [`F32`] in f32; the weight
-    /// gradient to `1e-12` of burn's in f64 and to [`F32`] of burn's f64 one in f32; and the bias
-    /// gradient, the same burn call, bit for bit.
+    /// [`Conv::forward`] against [`reference`] and against burn's path: the output, input
+    /// gradient and bias gradient to `1e-12` of their largest magnitude in f64 and to [`F32`] in
+    /// f32, and the weight gradient to `1e-12` of burn's in f64 and to [`F32`] of burn's f64 one
+    /// in f32.
     fn agrees(c: Case) {
         let device = crate::nn::cuda(0).autodiff();
         let inputs = inputs(c, &device);
-        let [ry, rdx] = reference(c, &inputs);
+        let [ry, rdx, rdb] = reference(c, &inputs);
         for dtype in [DType::F64, DType::F32] {
             // burn's autotune may pick its kernel on the first call of a shape; pick it first.
             run(c, &inputs, dtype, false);
             let [y, dx, dw, db] = run(c, &inputs, dtype, true);
-            let [_, _, rdw, rdb] = run(c, &inputs, dtype, false);
+            let [_, _, rdw, _] = run(c, &inputs, dtype, false);
             let tol = match dtype {
                 DType::F64 => 1e-12,
                 _ => F32,
@@ -1067,8 +1106,10 @@ mod tests {
             if c.x_grad {
                 close(&dx, &rdx, tol, format!("{c:?} {dtype:?}: input gradient"));
             }
-            assert_eq!(db, rdb, "{c:?} {dtype:?}: bias gradient");
             assert_eq!(db.is_empty(), !c.bias);
+            if c.bias {
+                close(&db, &rdb, tol, format!("{c:?} {dtype:?}: bias gradient"));
+            }
             let reference = match dtype {
                 DType::F64 => rdw,
                 _ => run(c, &inputs, DType::F64, false)[2].clone(),
@@ -1134,8 +1175,9 @@ mod tests {
         });
     }
 
-    /// The weight gradient over no pixels is zero, and over no channels empty. burn's own
-    /// convolution backward fails at these sizes, so `weight_grad` is called directly.
+    /// The weight gradient over no pixels is zero, and over no channels empty; the bias gradient
+    /// is the sum of `dy` over pixels whatever the input channels. burn's own convolution backward
+    /// fails at these sizes, so `weight_grad` is called directly.
     #[test]
     fn weight_gradient_at_zero_sizes() {
         let device = crate::nn::cuda(0);
@@ -1151,10 +1193,13 @@ mod tests {
             [2, 5, 6, 0, 3],
             [2, 5, 6, 2, 0],
         ] {
-            let dw = weight_grad(cube([n, h, w, ci]), cube([n, h, w, co]));
+            let (dw, db) = weight_grad(cube([n, h, w, ci]), cube([n, h, w, co]), true);
             let dw = Tensor::<4>::from_primitive::<CubeBackend>(dw);
+            let db = Tensor::<1>::from_primitive::<CubeBackend>(db.unwrap());
             assert_eq!(dw.dims(), [co, ci, 3, 3]);
             assert_eq!(host(dw), vec![0.0; co * ci * 9], "{:?}", [n, h, w, ci, co]);
+            let pixels = (n * h * w) as f64;
+            assert_eq!(host(db), vec![pixels; co], "{:?}", [n, h, w, ci, co]);
         }
     }
 
@@ -1210,16 +1255,19 @@ mod tests {
         host(Tensor::<2>::stack::<3>(offsets, 2))
     }
 
-    /// The f32 output and input and weight gradients through [`Conv::forward`] against the f64
-    /// ones, each to [`F32`] of its largest magnitude.
+    /// The f32 output and input, weight and bias gradients through [`Conv::forward`] against the
+    /// f64 ones, each to [`F32`] of its largest magnitude.
     fn f32_against_f64(c: Case) {
         let device = crate::nn::cuda(0).autodiff();
         let inputs = inputs(c, &device);
-        let [y, dx, dw, _] = run(c, &inputs, DType::F32, true);
-        let [ry, rdx] = reference(c, &inputs);
+        let [y, dx, dw, db] = run(c, &inputs, DType::F32, true);
+        let [ry, rdx, rdb] = reference(c, &inputs);
         close(&y, &ry, F32, format!("{c:?}: f32 output"));
         if c.x_grad {
             close(&dx, &rdx, F32, format!("{c:?}: f32 input gradient"));
+        }
+        if c.bias {
+            close(&db, &rdb, F32, format!("{c:?}: f32 bias gradient"));
         }
         let rdw = weight_gradient(c, inputs[0].clone(), inputs[3].clone());
         close(&dw, &rdw, F32, format!("{c:?}: f32 weight gradient"));
