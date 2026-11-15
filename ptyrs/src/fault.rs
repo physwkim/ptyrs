@@ -1,8 +1,9 @@
-//! The exits a call can fail at part-way: after its LLK record's advance is enqueued, or
-//! before it counts its frames for one, which a retry must start from, or on one GPU of a
-//! distributed run, which every later call must refuse. [`at`] is a no-op outside
-//! `cfg(test)`; a unit test arms one exit with [`arm`] to make it fail once, so the failure
-//! runs through the call's own wrapper.
+//! The exits a call can fail at part-way, which a retry must start from: after its LLK
+//! record's advance is enqueued, before it counts its frames for one, or mid-update, between
+//! a DM or RAAR projection's stacks or an object solve's steps, leaving its waves or object
+//! part updated; or on one GPU of a distributed run, which every later call must refuse.
+//! [`at`] is a no-op outside `cfg(test)`; a unit test arms one exit with [`arm`] to make it
+//! fail once, so the failure runs through the call's own wrapper.
 
 /// A point [`at`] marks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -29,6 +30,8 @@ pub(crate) enum Exit {
     DmStack,
     /// A live AP epoch's, before its ring counts the frames landed since its last count.
     LiveCount,
+    /// The full-object object solve's, before each conjugate-gradient step.
+    Solve,
 }
 
 #[cfg(not(test))]

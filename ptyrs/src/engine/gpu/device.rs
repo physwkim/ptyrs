@@ -3776,4 +3776,82 @@ mod tests {
             assert!(same, "{what}: the arrays");
         }
     }
+
+    /// An AP call failing in its full-object object solve keeps its records, and its retry
+    /// reads nothing the failed call left but its arrays, not the sums the solve part
+    /// consumed: failing before the first cycle's first step, after its third, or after the
+    /// third of the next cycle's, the first complete. The failed engine's history is its
+    /// complete cycles' records and the failed one's, then those of an engine that ran its
+    /// complete cycles as a call of its own, was given its object and probe (the probe steps
+    /// before the solve, the offsets after it) and ran the retry, whose arrays and offsets it
+    /// ends with bit for bit. Under graphs the exit runs only in the capture, which fails and
+    /// counts nothing.
+    #[test]
+    fn an_ap_call_failing_in_its_object_solve_is_retried_from_its_arrays() {
+        let ctx = CudaContext::new(0).expect("GPU 0");
+        let ap = ApParams {
+            obj_inertia: Some(0.01),
+            probe_inertia: Some(0.01),
+            calc_llk: 1,
+            zero_phase_ramp: false,
+        };
+        let offsets = (0..36).map(|f| [0.1 * (f % 3) as f64 - 0.1, 0.05]);
+        let position = Features {
+            position: Some(Feature::refined(offsets.collect())),
+            ..Features::default()
+        };
+        let bits = |e: &GpuPtycho| {
+            let (o, p) = (e.object().unwrap(), e.probe().unwrap());
+            let px = o.as_slice().iter().chain(p.as_slice());
+            let px = px.flat_map(|c| [c.re.to_bits(), c.im.to_bits()]);
+            let f = e.features().unwrap();
+            let pos = f.position.map(|p| p.values).into_iter().flatten().flatten();
+            px.chain(pos.map(f64::to_bits)).collect::<Vec<_>>()
+        };
+        let llk = |e: &GpuPtycho| -> Vec<(usize, u64)> {
+            let h = e.history().iter();
+            h.map(|r| (r.cycle, r.llk.poisson.to_bits())).collect()
+        };
+        for (graph, pass) in [(false, 0), (false, 3), (false, OBJ_PCG + 3), (true, 0)] {
+            let what = format!("graph {graph}, pass {pass}");
+            // The cycles the failed call completed, each one solve of `OBJ_PCG` steps.
+            let done = pass / OBJ_PCG;
+            let [mut failed, mut clean] = [(); 2].map(|()| {
+                let mut e = engine(&ctx, graph, true);
+                e.set_sampling(Sampling::FullObject).unwrap();
+                e.set_features(&position).unwrap();
+                e
+            });
+            let armed = fault::arm(Exit::Solve, pass);
+            let r = failed.ap(&ap, done + 2);
+            assert!(armed.fired(), "{what}");
+            let refused = match &r {
+                Err(EngineError::Gpu(
+                    GpuError::Driver(d) | GpuError::Device(DeviceError::Driver(d)),
+                )) => *d == fault::REFUSAL,
+                _ => false,
+            };
+            assert!(refused, "{what}: {r:?}");
+            drop(armed);
+            if done > 0 {
+                clean.ap(&ap, done).unwrap();
+            }
+            let dev = &failed.dev;
+            let obj = dev.obj.to_host_vec(&dev.stream).unwrap();
+            let probe = dev.probe.to_host_vec(&dev.stream).unwrap();
+            clean.dev.write_arrays(&obj, &probe).unwrap();
+            assert!(bits(&failed) == bits(&clean), "{what}: the arrays left");
+            for e in [&mut failed, &mut clean] {
+                e.ap(&ap, 2).unwrap();
+            }
+
+            let (f, c) = (llk(&failed), llk(&clean));
+            let kept = if graph { 0 } else { done + 1 };
+            assert_eq!(f.len(), kept + 2, "{what}: {f:?}");
+            assert_eq!(f[..done], c[..done], "{what}: the complete cycles' records");
+            assert_eq!(f[done].0, done, "{what}");
+            assert_eq!(f[kept..], c[done..], "{what}: the retry's records");
+            assert!(bits(&failed) == bits(&clean), "{what}: the arrays");
+        }
+    }
 }
