@@ -5,7 +5,7 @@
 //! offsets. It writes `<dir>/ml_pos_*_f64.txt`, saved to `tests/engine/data`.
 
 use ptyrs::base::C64;
-use ptyrs::engine::{Features, MlParams, Ptycho};
+use ptyrs::engine::{Feature, Features, MlParams, Ptycho};
 
 #[path = "common/engine/mod.rs"]
 mod common;
@@ -57,7 +57,7 @@ fn ml_positions_match_the_model() {
     let rows = table(include_str!("engine/data/ml_pos_offsets_f64.txt"));
     let start = offsets(&rows, 1);
     p.set_features(Features {
-        position: Some(start.clone()),
+        position: Some(Feature::refined(start.clone())),
         ..Features::default()
     })
     .unwrap();
@@ -101,7 +101,10 @@ fn ml_positions_match_the_model() {
             .flat_map(|(d, s)| [d[0] - s[0], d[1] - s[1]])
             .collect()
     };
-    let (got, want) = (p.features().position.as_ref().unwrap(), offsets(&rows, 3));
+    let (got, want) = (
+        &p.features().position.as_ref().unwrap().values,
+        offsets(&rows, 3),
+    );
     let want = delta(&want);
     assert_close("offsets", &delta(got), &want, max_abs(&want), 1e-12);
 }

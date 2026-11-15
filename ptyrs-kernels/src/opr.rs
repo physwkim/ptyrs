@@ -354,27 +354,17 @@ pub mod opr_kernels {
     /// Eigenmode `i`'s weights from the [`opr_frame_sums`] of `U″` against `d`, `vv` and the
     /// residues: with `den_b = Σ |U″|² vv_b`, `w_bi += Σ Re(conj(U″) d_b) / (den_b + 0.1
     /// mean_b den_b)` at the scan frame at epoch position `p0 + b`, the mean summed in frame
-    /// order; under
-    /// `deflate != 0` also `coef[2b .. 2b + 2] = Σ conj(U″) r_b / n²` (`Σ |U″|² = n²` by its
-    /// normalization).
+    /// order.
     ///
     /// # Safety
     ///
     /// `sums` holds `OPR_SUMS span.nchunk` floats per batch frame, `scan` as [`OprScan`]
-    /// says over the span's positions with `i < k`, `coef` `2 nb` floats; grid `(1, 1, 1)`,
-    /// block `(PIXEL_THREADS, 1, 1)`.
+    /// says over the span's positions with `i < k`; grid `(1, 1, 1)`, block `(PIXEL_THREADS,
+    /// 1, 1)`.
     ///
     /// [`opr_frame_sums`]: LoadedModule::opr_frame_sums
     #[kernel]
-    pub unsafe fn opr_weights(
-        sums: *const f32,
-        span: BatchSpan,
-        scan: OprScan,
-        i: u32,
-        n: u32,
-        deflate: u32,
-        coef: *mut f32,
-    ) {
+    pub unsafe fn opr_weights(sums: *const f32, span: BatchSpan, scan: OprScan, i: u32) {
         static mut RED: SharedArray<f32, 256> = SharedArray::UNINIT;
         let t = thread::threadIdx_x() as usize;
         let (nb, nchunk) = (span.nb as usize, span.nchunk as usize);
@@ -390,7 +380,6 @@ pub mod opr_kernels {
             crate::block_sum::<1>(s);
             0.1 * *s / nb as f32
         };
-        let nn = n as f32 * n as f32;
         let mut b = t;
         while b < nb {
             unsafe {
@@ -398,12 +387,31 @@ pub mod opr_kernels {
                 let den = frame_total(sums, b, nchunk, 1);
                 let f = *scan.order.add(span.p0 as usize + b) as usize;
                 *scan.weights.add(f * scan.k as usize + i as usize) += num / (den + reg);
-                if deflate != 0 {
-                    *coef.add(2 * b) = frame_total(sums, b, nchunk, 2) / nn;
-                    *coef.add(2 * b + 1) = frame_total(sums, b, nchunk, 3) / nn;
-                }
             }
             b += PIXEL_THREADS as usize;
+        }
+    }
+
+    /// The deflation coefficients from the [`opr_frame_sums`] of `U″` against the residues:
+    /// `coef[2b .. 2b + 2] = Σ conj(U″) r_b / n²` (`Σ |U″|² = n²` by its normalization), with
+    /// the weights refined or held.
+    ///
+    /// # Safety
+    ///
+    /// `sums` holds `OPR_SUMS span.nchunk` floats per batch frame, `coef` `2 nb` floats; 1D
+    /// grid over `span.nb`.
+    ///
+    /// [`opr_frame_sums`]: LoadedModule::opr_frame_sums
+    #[kernel]
+    pub unsafe fn opr_deflate_coef(sums: *const f32, span: BatchSpan, n: u32, coef: *mut f32) {
+        let b = global_index();
+        if b >= span.nb as usize {
+            return;
+        }
+        let (nn, nchunk) = (n as f32 * n as f32, span.nchunk as usize);
+        unsafe {
+            *coef.add(2 * b) = frame_total(sums, b, nchunk, 2) / nn;
+            *coef.add(2 * b + 1) = frame_total(sums, b, nchunk, 3) / nn;
         }
     }
 

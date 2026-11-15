@@ -3,7 +3,7 @@ of the first epochs, every epoch's LLK record, the last epoch's steps and the ar
 engine's own `tests/engine_gpu.rs` `bh_steps_match_cpu` and `bh_position_matches_cpu`
 compare them, to its 1e-4 (offsets to 1e-4 pixels). One batch of every frame (CG from the
 second epoch) and batches of 4, the last of 2; M1 and fused passes, and the fused ones
-modelling `drawn_offsets` at the default and another `position_rho`."""
+modelling `drawn_offsets` at the default and another `position_rho`, or held."""
 
 import numpy as np
 import pytest
@@ -55,6 +55,33 @@ def test_bh_steps_match_cpu(scenario, batch, fused, moved, rho):
         assert (cpu.position ** 2).mean() < (d0 ** 2).mean()
 
 
+def test_bh_held_position_matches_cpu(scenario):
+    """`drawn_offsets` held on both: as `test_bh_steps_match_cpu`'s LLK records and arrays in
+    batches of 4, and the offsets kept (the device's f32 of them)."""
+    scan, obj, probe, npos = scenario
+    d0 = drawn_offsets(npos)
+    state = ptyrs.Ptycho(scan, obj, probe)
+    state.set_features(position=d0)
+    cpu = ptyrs.Bh(4, 0.01, 7, position=d0, hold=("position",))
+    o, p = obj[None], probe
+    want = []
+    for _ in range(NEPOCH):
+        o, p, _ = cpu.epoch(state.views, o, p)
+        want.append(state.llk(o[0], p))
+    np.testing.assert_array_equal(cpu.position, d0)
+
+    gpu = ptyrs.GpuPtycho(scan, obj, probe, DEVICE, stack_size=7, llk_slots=3, fused=True)
+    gpu.set_features(position=d0, hold=("position",))
+    gpu.bh(NEPOCH, 1, 4, 0.01, 7)
+    for key in LLK:
+        err = rel(gpu.history[key], [w[key] for w in want]).max()
+        assert err < TOL, f"llk {key}: {err:.2e}"
+    assert rel_l2(gpu.object, o[0]) < TOL
+    assert rel_l2(gpu.probe, p) < TOL
+    assert gpu.features["hold"] == ("position",)
+    np.testing.assert_array_equal(gpu.features["position"], d0.astype(np.float32))
+
+
 def test_bh_position_rho_and_refusals(scenario):
     """`position_rho` reaches the offsets' step, and Bh refuses empty batches and offsets as Lsqml
     does."""
@@ -72,8 +99,24 @@ def test_bh_position_rho_and_refusals(scenario):
         ptyrs.Bh(0, 0.01, 7)
     with pytest.raises(ValueError, match=r"\[nframe, 2\]"):
         ptyrs.Bh(4, 0.01, 7, position=np.zeros((npos, 3)))
+    for kw, hold in ((dict(), ("position",)), (dict(position=d0), ("weights",))):
+        with pytest.raises(ValueError, match="hold"):
+            ptyrs.Bh(4, 0.01, 7, hold=hold, **kw)
     with pytest.raises(ValueError, match="finite"):
         ptyrs.Bh(4, 0.01, 7, position=np.full((npos, 2), np.inf))
     short = ptyrs.Bh(4, 0.01, 7, position=np.zeros((npos + 1, 2)))
     with pytest.raises(ValueError, match=f"{npos + 1} position offsets for {npos} frames"):
         short.epoch(state.views, obj[None], probe)
+
+
+def test_cpu_bh_held_position(scenario):
+    """Held offsets stay through CPU BH epochs while the object moves; refined ones move."""
+    scan, obj, probe, npos = scenario
+    views = ptyrs.Ptycho(scan, obj, probe).views
+    d0 = drawn_offsets(npos)
+    for hold in ((), ("position",)):
+        bh = ptyrs.Bh(4, 0.01, 7, position=d0, hold=hold)
+        assert bh.hold == hold
+        o, _, _ = bh.epoch(views, obj[None], probe)
+        assert not np.array_equal(o[0], obj)
+        assert np.array_equal(bh.position, d0) == (hold != ())

@@ -2,7 +2,7 @@
 //! `common/near.rs`.
 
 use ptyrs::base::{C64, Stack};
-use ptyrs::engine::{Features, MlParams, Ptycho};
+use ptyrs::engine::{Feature, Features, MlParams, Ptycho};
 
 #[path = "common/near.rs"]
 mod near;
@@ -31,12 +31,12 @@ const ML: MlParams = MlParams {
 /// No feature, a stepped scale and background, and refined drawn offsets.
 fn models(frame: usize) -> [(&'static str, Features); 3] {
     let stepped = Features {
-        scale: Some(vec![1.0; NPOS]),
-        background: Some(vec![1.0; frame * frame]),
+        scale: Some(Feature::refined(vec![1.0; NPOS])),
+        background: Some(Feature::refined(vec![1.0; frame * frame])),
         position: None,
     };
     let moved = Features {
-        position: Some(drawn_offsets()),
+        position: Some(Feature::refined(drawn_offsets())),
         ..Features::default()
     };
     [
@@ -124,8 +124,11 @@ fn ml_matches_cpu_under_every_propagator() {
                 let got: Vec<f64> = gpu.history().iter().map(|r| r.llk.poisson).collect();
                 assert_eq!(got.len(), NCYCLE, "{what}");
                 let flat = |f: &Features| -> Vec<f64> {
-                    let (s, b) = (f.scale.iter().flatten(), f.background.iter().flatten());
-                    let p = f.position.iter().flatten().flatten();
+                    let (s, b) = (
+                        f.scale.iter().flat_map(|d| &d.values),
+                        f.background.iter().flat_map(|d| &d.values),
+                    );
+                    let p = f.position.iter().flat_map(|d| &d.values).flatten();
                     s.chain(b).chain(p).copied().collect()
                 };
                 let (gf, cf) = (flat(&gpu.features().unwrap()), flat(cpu.features()));

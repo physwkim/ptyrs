@@ -291,7 +291,8 @@ impl Ptycho {
         &self.features
     }
 
-    /// Models and refines `features` from here on; an error leaves the current ones.
+    /// Models `features` from here on, refining those set to; an error leaves the current
+    /// ones.
     pub fn set_features(&mut self, features: Features) -> Result<(), EngineError> {
         let [nframe, ny, nx] = self.obs.dims();
         features.check(nframe, [ny, nx])?;
@@ -365,7 +366,7 @@ impl Ptycho {
     /// [`Features::position`]'s model of every view under [`Self::sampling`], if one is set.
     fn shifted(&self) -> Option<Shifted> {
         let views = self.addr.views();
-        (self.features.position.as_deref()).map(|d| self.shifted_views(views, &self.probe, d))
+        (self.features.offsets()).map(|d| self.shifted_views(views, &self.probe, d))
     }
 
     /// `probe` under the offsets `d` (by frame) on `views` of the object, as
@@ -513,7 +514,7 @@ impl Ptycho {
         let mut po = self.calc_psi();
         let mut a = vec![C64::default(); po.len()];
         let mut b = a.clone();
-        match self.features.position.as_deref() {
+        match self.features.offsets() {
             Some(d) => {
                 let probe = self.shifted_views(views, &self.probe, d);
                 let d_probe = self.shifted_views(views, &d_probe, d);
@@ -615,10 +616,12 @@ impl Ptycho {
             let model = Model::of(&self.features, &self.obs);
             apply_amplitude_with(&self.obs, 0..nframe, nmode, &mut self.psi, model);
             Self::to_exit(&self.optics, 0..nframe, &mut self.psi);
-            let sums = (shifted.as_ref())
-                .map(|s| s.position_sums(self.addr.views(), &self.object, &self.psi, &self.fft));
+            let sums = (shifted
+                .as_ref()
+                .filter(|_| self.features.position_refined()))
+            .map(|s| s.position_sums(self.addr.views(), &self.object, &self.psi, &self.fft));
             self.update_from_psi(params.obj_inertia, params.probe_inertia);
-            if let (Some(d), Some(sums)) = (&mut self.features.position, sums) {
+            if let (Some(d), Some(sums)) = (self.features.refined_offsets(), sums) {
                 position_step(d, &sums);
             }
             if let Some(l) = l {
@@ -722,17 +725,17 @@ impl Ptycho {
     }
 
     /// DM's and RAAR's update from the exit waves `self.psi`: their position sums under
-    /// `shifted`, `loops` times an object-only then a probe-only [`psi_to_obj_probe`] with
-    /// `inertia` (object, probe), so the probe update sees the new object, then the step of
-    /// [`Features::position`].
+    /// `shifted` while the position is refined, `loops` times an object-only then a
+    /// probe-only [`psi_to_obj_probe`] with `inertia` (object, probe), so the probe update
+    /// sees the new object, then the step of [`Features::position`].
     fn update_obj_probe(
         &mut self,
         shifted: Option<&Shifted>,
         inertia: [Option<f64>; 2],
         loops: usize,
     ) {
-        let sums =
-            shifted.map(|s| s.position_sums(self.addr.views(), &self.object, &self.psi, &self.fft));
+        let sums = (shifted.filter(|_| self.features.position_refined()))
+            .map(|s| s.position_sums(self.addr.views(), &self.object, &self.psi, &self.fft));
         for _ in 0..loops {
             for (o, p) in [(inertia[0], None), (None, inertia[1])] {
                 if o.is_some() || p.is_some() {
@@ -740,7 +743,7 @@ impl Ptycho {
                 }
             }
         }
-        if let (Some(d), Some(sums)) = (&mut self.features.position, sums) {
+        if let (Some(d), Some(sums)) = (self.features.refined_offsets(), sums) {
             position_step(d, &sums);
         }
     }
@@ -774,7 +777,8 @@ impl Ptycho {
         for ic in 0..ncycle {
             let l = llk_due(params.calc_llk, ic, ncycle).then(|| self.llk());
             self.step_features();
-            let sums = self.shifted().map(|s| self.projected_position_sums(&s));
+            let sums = (self.shifted().filter(|_| self.features.position_refined()))
+                .map(|s| self.projected_position_sums(&s));
             let g = self.grads(uo, up);
             let beta = match &last {
                 None => 0.0,
@@ -818,7 +822,7 @@ impl Ptycho {
                 }
             }
             last = Some(g);
-            if let (Some(d), Some(sums)) = (&mut self.features.position, sums) {
+            if let (Some(d), Some(sums)) = (self.features.refined_offsets(), sums) {
                 position_step(d, &sums);
             }
             if let Some(l) = l {
@@ -890,7 +894,7 @@ impl Ptycho {
         let nxo = self.object.plane_shape()[1];
         let nbatch = frames.len();
         let views = &self.addr.views()[frames.start * nmode..frames.end * nmode];
-        let offsets = self.features.position.as_deref();
+        let offsets = self.features.offsets();
         let shifted = offsets.map(|d| self.shifted_views(views, &self.probe, d));
         let sampler = shifted.as_ref().and_then(Shifted::sampler);
         // The offsets the probe moves by, under [`Sampling::Patch`].
@@ -1024,7 +1028,10 @@ impl Ptycho {
                 }
             }
         }
-        let d_pos = shifted.as_ref().map(|s| {
+        let d_pos = (shifted
+            .as_ref()
+            .filter(|_| self.features.position_refined()))
+        .map(|s| {
             let derivatives = sampler.map(|s| [0, 1].map(|a| s.windows(&self.object, &[a])));
             let sums: Vec<[[f64; 2]; 2]> = (0..nbatch)
                 .map(|b| {
@@ -1059,7 +1066,7 @@ impl Ptycho {
                 *p += d * s;
             }
         }
-        if let (Some(d), Some(delta)) = (&mut self.features.position, d_pos) {
+        if let (Some(d), Some(delta)) = (self.features.refined_offsets(), d_pos) {
             let frames: Vec<usize> = frames.collect();
             batch_position_step(d, &frames, &delta);
         }
@@ -1122,7 +1129,7 @@ mod tests {
     use crate::base::{Counts, Geometry, Positions, required_obj_shape};
 
     use super::*;
-    use crate::engine::{Propagator, Wavefield, llk};
+    use crate::engine::{Feature, Propagator, Wavefield, llk};
     use crate::worst::worst_of;
 
     fn poisson_sum(p: &Ptycho) -> f64 {
@@ -1229,7 +1236,7 @@ mod tests {
                         .collect();
                     p.set_sampling(sampling);
                     p.set_features(Features {
-                        position: Some(d),
+                        position: Some(Feature::refined(d)),
                         ..Features::default()
                     })
                     .unwrap();
@@ -1399,7 +1406,7 @@ mod tests {
         p.set_sampling(sampling);
         if let Some(offsets) = offsets {
             p.set_features(Features {
-                position: Some((0..dims[0]).map(offsets).collect()),
+                position: Some(Feature::refined((0..dims[0]).map(offsets).collect())),
                 ..Features::default()
             })
             .unwrap();

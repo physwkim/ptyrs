@@ -14,7 +14,9 @@ use std::time::Instant;
 
 use cuda_core::CudaContext;
 use ptyrs::base::view_corner;
-use ptyrs::engine::{BhParams, DmParams, EngineError, Features, GpuOptions, GpuPtycho, MlParams};
+use ptyrs::engine::{
+    BhParams, DmParams, EngineError, Feature, Features, GpuOptions, GpuPtycho, MlParams,
+};
 
 fn pairs(v: &serde_json::Value) -> Vec<[f64; 2]> {
     let rows = v.as_array().expect("[n, 2] array");
@@ -93,7 +95,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ctx = CudaContext::new(0).map_err(EngineError::from)?;
     let mut g = GpuPtycho::new(&ctx, &scan, object, probe, GpuOptions::default())?;
     let features = Features {
-        position: Some(d0),
+        position: Some(Feature::refined(d0)),
         ..Features::default()
     };
     g.set_features(&features)?;
@@ -133,7 +135,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if algo.ends_with("off") {
             g.set_features(&kept)?;
         }
-        let d = g.features()?.position.expect("positions");
+        let d = g.features()?.position.expect("positions").values;
         let llk = g.llk()?;
         println!(
             "{algo}:{n} -> cycle {} rms {:.4} px, llk {:.6e}, {s:.2} s",
@@ -143,7 +145,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     if let Some(out) = out {
-        let d = g.features()?.position.expect("positions");
+        let d = g.features()?.position.expect("positions").values;
         let rows: Vec<String> = (modelled(&d).iter().zip(&truth))
             .map(|(m, t)| format!("{:.9} {:.9} {:.9} {:.9}", m[0], m[1], t[0], t[1]))
             .collect();

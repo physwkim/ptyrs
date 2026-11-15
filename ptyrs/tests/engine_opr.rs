@@ -12,8 +12,8 @@ use std::slice;
 
 use ptyrs::base::{C64, Stack, View};
 use ptyrs::engine::{
-    Cost, Fft2, Llk, Lsqml, LsqmlParams, LsqmlStep, Optics, ProbeVariation, Ptycho, illumination,
-    llk, obj_probe_to_psi, opr_weight_grad,
+    Cost, Feature, Fft2, Llk, Lsqml, LsqmlParams, LsqmlStep, Optics, ProbeVariation, Ptycho,
+    illumination, llk, obj_probe_to_psi, opr_weight_grad,
 };
 
 #[path = "common/engine/mod.rs"]
@@ -154,9 +154,9 @@ impl Ref {
 
     /// The reference's eigenmodes `U` and main-mode weights `c` with eigenmode weights `w`.
     fn variation_with(&self, w: Vec<f64>) -> ProbeVariation {
-        let var = ProbeVariation::new(self.eigenmodes(self.u[0]), w);
+        let var = ProbeVariation::new(self.eigenmodes(self.u[0]), Feature::refined(w));
         match self.c {
-            Some([c, ..]) => var.with_intensity(self.column(c)),
+            Some([c, ..]) => var.with_intensity(Feature::refined(self.column(c))),
             None => var,
         }
     }
@@ -236,6 +236,7 @@ fn weight_grad_matches_refs_and_central_differences() {
             let shifted = |i: usize, t: f64| {
                 let w = var
                     .weights()
+                    .values
                     .iter()
                     .enumerate()
                     .map(|(j, w)| if j % r.k == i { w + t } else { *w })
@@ -328,11 +329,18 @@ fn assert_variation(r: &Ref, var: &ProbeVariation, frames: &[usize], noise: usiz
     assert!(err < 1e-13, "{} eigenmodes: max rel {err:.3e}", r.name);
     let (start, want) = (r.weights(r.w[0]), r.weights(r.w[3 + noise]));
     let name = format!("{} w", r.name);
-    assert_change(&name, var.weights(), &start, &want, r.k, frames);
+    assert_change(&name, &var.weights().values, &start, &want, r.k, frames);
     match (r.c, var.intensity()) {
         (Some(c), Some(got)) => {
             let (start, want) = (r.column(c[0]), r.column(c[1 + noise]));
-            assert_change(&format!("{} c", r.name), got, &start, &want, 1, frames);
+            assert_change(
+                &format!("{} c", r.name),
+                &got.values,
+                &start,
+                &want,
+                1,
+                frames,
+            );
         }
         (c, got) => assert_eq!(c.is_some(), got.is_some(), "{} c", r.name),
     }
@@ -427,9 +435,46 @@ fn single_frame_batch_moves_only_main_mode_weights() {
             Some([c, cg, _]) => {
                 let got = var.intensity().unwrap();
                 let name = format!("{} c", r.name);
-                assert_change(&name, got, &r.column(c), &r.column(cg), 1, &[3]);
+                assert_change(&name, &got.values, &r.column(c), &r.column(cg), 1, &[3]);
             }
             None => assert_eq!(var, start, "{}", r.name),
         }
+    }
+}
+
+/// Held weights or main-mode weights keep their values through a step; the rest of it, the
+/// eigenmodes' move from the held weights among it, is the step with them refined, bit for
+/// bit.
+#[test]
+fn held_weights_and_intensity_keep_their_values() {
+    let (p, optics) = state();
+    let r = &LSQML_OPR_INT;
+    let rows = table(LSQML_OPR_INT_STEP[0]);
+    let frames: Vec<usize> = rows.iter().map(|r| r[0] as usize).collect();
+    let start = r.variation();
+    let mut refined = start.clone();
+    let want = step(&p, &optics, Cost::Poisson, &frames, &mut refined);
+    let (w, c) = (start.weights(), start.intensity().unwrap());
+    assert_ne!(refined.weights().values, w.values);
+    assert_ne!(refined.intensity().unwrap().values, c.values);
+    assert_ne!(refined.eigenmodes(), start.eigenmodes());
+    for [hold_w, hold_c] in [[true, false], [false, true], [true, true]] {
+        let name = format!("hold weights {hold_w}, intensity {hold_c}");
+        let feature = |f: &Feature<Vec<f64>>, hold: bool| Feature {
+            values: f.values.clone(),
+            refine: !hold,
+        };
+        let var = ProbeVariation::new(start.eigenmodes().clone(), feature(w, hold_w));
+        let mut var = var.with_intensity(feature(c, hold_c));
+        let got = step(&p, &optics, Cost::Poisson, &frames, &mut var);
+        assert_eq!(got, want, "{name}: step, object and probe");
+        assert_eq!(var.eigenmodes(), refined.eigenmodes(), "{name}: eigenmodes");
+        let kept = |hold: bool, start: &Feature<Vec<f64>>, moved: &Feature<Vec<f64>>| {
+            feature(if hold { start } else { moved }, hold)
+        };
+        let want_w = kept(hold_w, w, refined.weights());
+        assert_eq!(*var.weights(), want_w, "{name}: weights");
+        let want_c = kept(hold_c, c, refined.intensity().unwrap());
+        assert_eq!(var.intensity(), Some(&want_c), "{name}: main-mode weights");
     }
 }

@@ -48,9 +48,9 @@ use ptyrs::base::sim::{fermat, object, poisson, probe};
 use ptyrs::base::{AddrTable, C64, Counts, Geometry, Object, Positions, Probe, Scan, Stack};
 use ptyrs::engine::sim::simulate;
 use ptyrs::engine::{
-    ApParams, Bh, BhParams, Cost, DmParams, EngineError, GpuOptions, GpuPtycho, Lsqml, LsqmlParams,
-    MlParams, Observed, Optics, ProbeVariation, Ptycho, RaarParams, RpieParams, SliceWaves,
-    Wavefield, shift,
+    ApParams, Bh, BhParams, Cost, DmParams, EngineError, Feature, GpuOptions, GpuPtycho, Lsqml,
+    LsqmlParams, MlParams, Observed, Optics, ProbeVariation, Ptycho, RaarParams, RpieParams,
+    SliceWaves, Wavefield, shift,
 };
 use ptyrs::gpu::FUSED_SIDES;
 use rust_hdf5::{Complex64, H5File, H5Group, H5Type};
@@ -80,11 +80,11 @@ fn write_stack(g: &H5Group, name: &str, s: &Stack<C64>) -> Result<(), Box<dyn Er
 }
 
 fn write_variation(g: &H5Group, var: &ProbeVariation) -> Result<(), Box<dyn Error>> {
-    let (e, w) = (var.eigenmodes(), var.weights());
+    let (e, w) = (var.eigenmodes(), &var.weights().values);
     write_stack(g, "eigenmodes", e)?;
     write(g, "weights", &[w.len() / e.len(), e.len()], w)?;
     if let Some(c) = var.intensity() {
-        write(g, "intensity", &[c.len()], c)?;
+        write(g, "intensity", &[c.values.len()], &c.values)?;
     }
     Ok(())
 }
@@ -124,15 +124,15 @@ fn variation(p0: &[C64], frame: [usize; 2], nframe: usize, intensity: bool) -> P
     let weights = (0..nframe * k)
         .map(|j| w0 * (0.7 * (j / k + 1) as f64 * (j % k + 1) as f64).sin())
         .collect();
-    let var = ProbeVariation::new(eigenmodes, weights);
+    let var = ProbeVariation::new(eigenmodes, Feature::refined(weights));
     if !intensity {
         return var;
     }
-    var.with_intensity(
+    var.with_intensity(Feature::refined(
         (0..nframe)
             .map(|f| 1.0 + 0.02 * (1.3 * f as f64).cos())
             .collect(),
-    )
+    ))
 }
 
 fn opr(path: &Path) -> Result<(), Box<dyn Error>> {

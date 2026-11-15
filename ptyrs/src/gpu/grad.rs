@@ -36,10 +36,10 @@ pub struct GammaStacks {
     pub b: DeviceBuffer<C32>,
 }
 
-/// A stack's object windows and the views that read them: `blocks` holds three blocks
-/// `[nobj, nf_max, ny, nx]` of [`crate::gpu::sampling::ObjectSampler::windows`], the windows
-/// and their derivatives over the position's `y` and `x`, and `views`
-/// ([`crate::gpu::sampling::window_views`]) read each block as their object.
+/// A stack's object windows and the views that read them: `blocks` holds blocks `[nobj,
+/// nf_max, ny, nx]` of [`crate::gpu::sampling::ObjectSampler::windows`], the windows and, for
+/// [`GradKernels::window_position_sums`], their derivatives over the position's `y` and `x`,
+/// and `views` ([`crate::gpu::sampling::window_views`]) read each block as their object.
 #[derive(Clone, Copy)]
 pub struct StackWindows<'a> {
     pub views: &'a Views,

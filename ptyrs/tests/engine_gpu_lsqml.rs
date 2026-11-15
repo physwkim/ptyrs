@@ -13,8 +13,8 @@ use std::sync::Arc;
 use cuda_core::CudaContext;
 use ptyrs::base::{C64, Counts, MASKED, Object, Probe, Scan, Stack};
 use ptyrs::engine::{
-    Algorithm, BhParams, Cost, Features, GpuOptions, GpuPtycho, LlkRecord, Lsqml, LsqmlParams,
-    LsqmlStep, Optics, ProbeVariation, Ptycho, Sampling,
+    Algorithm, BhParams, Cost, Feature, Features, GpuOptions, GpuPtycho, LlkRecord, Lsqml,
+    LsqmlParams, LsqmlStep, Optics, ProbeVariation, Ptycho, Sampling,
 };
 use ptyrs::gpu::FUSED_SIDES;
 
@@ -106,7 +106,7 @@ fn drawn_offsets() -> Vec<[f64; 2]> {
 /// The features modelling `position`, or none.
 fn moved(position: Option<Vec<[f64; 2]>>) -> Features {
     Features {
-        position,
+        position: position.map(Feature::refined),
         ..Features::default()
     }
 }
@@ -119,11 +119,11 @@ fn offsets_rel(a: &Features, b: &Features, start: &Features) -> f64 {
     };
     let delta = |d: &[[f64; 2]]| -> Vec<f64> {
         d.iter()
-            .zip(s)
+            .zip(&s.values)
             .flat_map(|(d, s)| [d[0] - s[0], d[1] - s[1]])
             .collect()
     };
-    let (a, b) = (delta(a), delta(b));
+    let (a, b) = (delta(&a.values), delta(&b.values));
     let d = worst_of(a.iter().zip(&b).map(|(a, b)| (a - b).abs()));
     d / b.iter().map(|b| b.abs()).fold(0.0, f64::max)
 }
@@ -426,18 +426,18 @@ fn lsqml_restarts_and_rejects() {
     assert!(gpu.lsqml(&zero, 1, 1).is_err());
     for features in [
         Features {
-            scale: Some(vec![1.0; NPOS]),
+            scale: Some(Feature::refined(vec![1.0; NPOS])),
             ..Features::default()
         },
         Features {
-            background: Some(vec![1.0; frame * frame]),
+            background: Some(Feature::refined(vec![1.0; frame * frame])),
             ..Features::default()
         },
     ] {
         gpu.set_features(&features).unwrap();
         let err = gpu.lsqml(&params, 1, 0).unwrap_err().to_string();
         assert!(
-            err.contains("LSQML refines no intensity scale or background"),
+            err.contains("LSQML models no intensity scale or background"),
             "{features:?}: {err}"
         );
     }
@@ -474,7 +474,7 @@ fn run_bits(g: &GpuPtycho) -> RunBits {
     RunBits {
         object: bits(&g.object().unwrap()),
         probe: bits(&g.probe().unwrap()),
-        offsets: f64s(&g.features().unwrap().position.unwrap().concat()),
+        offsets: f64s(&g.features().unwrap().position.unwrap().values.concat()),
         steps: g
             .lsqml_steps()
             .unwrap()
