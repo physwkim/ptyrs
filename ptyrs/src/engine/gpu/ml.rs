@@ -10,8 +10,8 @@ use crate::base::{C64, Stack};
 use crate::gpu::sampling::{Modes, WindowBlock, window_views};
 use crate::gpu::{
     C32, CG_BLOCKS, Error as GpuError, Exit, FarSums, FusedBufs, FusedInputs, FusedSums,
-    GammaCounts, Kernels, Model, PositionKernels, RecordWriter, Shift, ShiftProbe, SpectrumBuf,
-    ViewDims, Views,
+    GammaCounts, Kernels, Model, PositionKernels, RecordWriter, Shift, ShiftedNumSums,
+    ShiftedProbes, SpectrumBuf, ViewDims, Views,
 };
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaStream, DeviceBuffer};
@@ -198,15 +198,18 @@ impl Bufs<'_> {
         // β from the gradients in the sums and the last ones in h (then h = g), and d.
         let lens = [self.obj_len, self.probe_len];
         crate::gpu::zero(ctx, ml.parts)?;
-        for (i, g) in [&*self.obj_sums, &*self.probe_sums].into_iter().enumerate() {
+        for (i, g) in [&self.obj_sums.num, &self.probe_sums.num]
+            .into_iter()
+            .enumerate()
+        {
             if update[i] {
                 let first_pair = i as u32 * CG_BLOCKS;
                 self.grad
-                    .beta_parts(ctx, &g.num, &mut ml.h[i], lens[i], ml.parts, first_pair)?;
+                    .beta_parts(ctx, g, &mut ml.h[i], lens[i], ml.parts, first_pair)?;
             }
         }
         self.grad.sum_parts(ctx, ml.parts, 2 * CG_BLOCKS, ml.beta)?;
-        for (i, g) in [&mut *self.obj_sums, &mut *self.probe_sums]
+        for (i, g) in [&mut self.obj_sums.num, &mut self.probe_sums.num]
             .into_iter()
             .enumerate()
         {
@@ -445,8 +448,8 @@ impl Bufs<'_> {
                     ..FarSums::default()
                 };
                 let sums = FusedSums {
-                    obj: update[0].then(|| w.zeroed_sums(ctx)).transpose()?,
-                    probe: update[1].then_some(&mut *self.probe_sums),
+                    obj: update[0].then(|| w.zeroed_patches(ctx)).transpose()?,
+                    probe: update[1].then_some(&mut self.probe_sums.num),
                     ..FusedSums::default()
                 };
                 (self.kernels).fused_project(ctx, &inputs, stack, Exit::Grad { far }, f, sums)?;
@@ -472,9 +475,9 @@ impl Bufs<'_> {
             let exit = Exit::Grad { far };
             let shifted = m.shifted();
             let sums = FusedSums {
-                obj: update[0].then_some(&mut *self.obj_sums),
-                probe: (update[1] && !shifted).then_some(&mut *self.probe_sums),
-                shift: m.shift_sums(update[1].then_some(ShiftProbe::Sums as _), false),
+                obj: update[0].then_some(&mut self.obj_sums.num),
+                probe: (update[1] && !shifted).then_some(&mut self.probe_sums.num),
+                shift: m.shift_sums(update[1].then_some(ShiftedProbes::num as _), false),
             };
             self.kernels
                 .fused_project(ctx, &inputs, stack, exit, f, sums)?;
@@ -483,7 +486,7 @@ impl Bufs<'_> {
             }
         }
         if update[1] {
-            m.probe_sums(ctx, self.kernels, &dims, self.probe_sums)?;
+            m.probe_sums::<ShiftedNumSums>(ctx, self.kernels, &dims, &mut self.probe_sums.num)?;
         }
         Ok(())
     }
@@ -515,12 +518,24 @@ impl Bufs<'_> {
             .poisson_grad(ctx, &dims, stack, self.counts, psi)?;
         plan.inverse_inplace(ctx, psi)?;
         if update[0] {
-            self.kernels
-                .psi_to_obj(ctx, self.views, stack, psi, self.probe, self.obj_sums)?;
+            self.kernels.psi_to_obj(
+                ctx,
+                self.views,
+                stack,
+                psi,
+                self.probe,
+                &mut self.obj_sums.num,
+            )?;
         }
         if update[1] {
-            self.kernels
-                .psi_to_probe(ctx, self.views, stack, psi, self.obj, self.probe_sums)?;
+            self.kernels.psi_to_probe(
+                ctx,
+                self.views,
+                stack,
+                psi,
+                self.obj,
+                &mut self.probe_sums.num,
+            )?;
         }
         Ok(())
     }

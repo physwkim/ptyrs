@@ -1067,10 +1067,10 @@ impl Kernels {
 
     /// Adds the stack's object-update sums (PyNX `Psi2Obj`) to `sums` `[nobj, nyo, nxo]`:
     /// into `num` the exact adjoint of [`Self::obj_probe_to_psi`] applied to `psi`, into
-    /// `den` the same bilinear spread of `|P_v|^2`. Each object pixel adds its views in
-    /// ascending view order, so splitting the frames into stacks does not change a bit of
-    /// the result. Only the pixels of tiles whose run holds a view of the stack are read and
-    /// written.
+    /// `den`, if `sums` has one, the same bilinear spread of `|P_v|^2`. Each object pixel adds
+    /// its views in ascending view order, so splitting the frames into stacks does not change a
+    /// bit of the result. Only the pixels of tiles whose run holds a view of the stack are read
+    /// and written.
     pub fn psi_to_obj(
         &self,
         ctx: &ExecutionContext,
@@ -1078,7 +1078,7 @@ impl Kernels {
         stack: StackRef<'_>,
         psi: &dyn Waves,
         probe: &DeviceBuffer<C32>,
-        sums: &mut UpdateSums,
+        sums: &mut dyn SumTarget,
     ) -> Result<(), Error> {
         let probe = FrameProbe::Shared(probe);
         self.psi_to_obj_frames(ctx, views, stack, psi, probe, sums)
@@ -1092,8 +1092,9 @@ impl Kernels {
         stack: StackRef<'_>,
         psi: &dyn Waves,
         probe: FrameProbe<'_>,
-        sums: &mut UpdateSums,
+        sums: &mut dyn SumTarget,
     ) -> Result<(), Error> {
+        let sums = sums.target();
         let d = &views.dims;
         let g = d.geom(stack)?;
         let n = d.n();
@@ -1116,24 +1117,37 @@ impl Kernels {
             // SAFETY: lengths checked above; the tile lists were built from these views.
             unsafe {
                 let (m, ptr, addr) = (&self.module, psi.ptr(), dptr(&views.addr));
-                let (tiles, sums, ctl) = (
-                    views.tile_ptrs(),
-                    sums.ptrs(),
-                    stack.ctl() as *const StackCtl,
-                );
-                if psi.half() {
-                    m.psi_to_obj_f16(stream, config, ptr, probe, addr, tiles, sums, ctl, g)
-                } else {
-                    m.psi_to_obj(stream, config, ptr, probe, addr, tiles, sums, ctl, g)
+                let (tiles, ctl) = (views.tile_ptrs(), stack.ctl() as *const StackCtl);
+                match (&sums, psi.half()) {
+                    (Sums::Update(s), false) => {
+                        m.psi_to_obj(stream, config, ptr, probe, addr, tiles, s.ptrs(), ctl, g)
+                    }
+                    (Sums::Update(s), true) => {
+                        m.psi_to_obj_f16(stream, config, ptr, probe, addr, tiles, s.ptrs(), ctl, g)
+                    }
+                    (Sums::Num(n), false) => {
+                        m.psi_to_obj_num(stream, config, ptr, probe, addr, tiles, dptr(n), ctl, g)
+                    }
+                    (Sums::Num(n), true) => m.psi_to_obj_num_f16(
+                        stream,
+                        config,
+                        ptr,
+                        probe,
+                        addr,
+                        tiles,
+                        dptr(n),
+                        ctl,
+                        g,
+                    ),
                 }
             }
         })
     }
 
     /// Adds the stack's probe-update sums (PyNX `Psi2Probe`) to `sums` `[nprobe, ny, nx]`:
-    /// `num += conj(O_v exp(i quad r^2)) psi_v` and `den += |O_v|^2` over the views of each
-    /// probe mode, in ascending view order (stack-split invariant); a mode without a view in
-    /// the stack is not written.
+    /// `num += conj(O_v exp(i quad r^2)) psi_v` and, if `sums` has one, `den += |O_v|^2` over
+    /// the views of each probe mode, in ascending view order (stack-split invariant); a mode
+    /// without a view in the stack is not written.
     pub fn psi_to_probe(
         &self,
         ctx: &ExecutionContext,
@@ -1141,8 +1155,9 @@ impl Kernels {
         stack: StackRef<'_>,
         psi: &dyn Waves,
         obj: &DeviceBuffer<C32>,
-        sums: &mut UpdateSums,
+        sums: &mut dyn SumTarget,
     ) -> Result<(), Error> {
+        let sums = sums.target();
         let d = &views.dims;
         let g = d.geom(stack)?;
         let n = d.n();
@@ -1160,11 +1175,20 @@ impl Kernels {
             // SAFETY: lengths checked above; `Views::new` checked every view.
             unsafe {
                 let (m, ptr, obj, addr) = (&self.module, psi.ptr(), dptr(obj), dptr(&views.addr));
-                let (sums, ctl) = (sums.ptrs(), stack.ctl() as *const StackCtl);
-                if psi.half() {
-                    m.psi_to_probe_f16(stream, config, ptr, obj, addr, sums, ctl, g)
-                } else {
-                    m.psi_to_probe(stream, config, ptr, obj, addr, sums, ctl, g)
+                let ctl = stack.ctl() as *const StackCtl;
+                match (&sums, psi.half()) {
+                    (Sums::Update(s), false) => {
+                        m.psi_to_probe(stream, config, ptr, obj, addr, s.ptrs(), ctl, g)
+                    }
+                    (Sums::Update(s), true) => {
+                        m.psi_to_probe_f16(stream, config, ptr, obj, addr, s.ptrs(), ctl, g)
+                    }
+                    (Sums::Num(n), false) => {
+                        m.psi_to_probe_num(stream, config, ptr, obj, addr, dptr(n), ctl, g)
+                    }
+                    (Sums::Num(n), true) => {
+                        m.psi_to_probe_num_f16(stream, config, ptr, obj, addr, dptr(n), ctl, g)
+                    }
                 }
             }
         })
@@ -1503,5 +1527,49 @@ impl UpdateSums {
             num: dptr(&self.num),
             den: dptr(&self.den),
         }
+    }
+}
+
+/// The object or probe sums a pass adds to: a denominator exists only where an update
+/// divides by it.
+pub enum Sums<'a> {
+    /// The sums an update divides, `den` the update's diagonal (AP, DM, RAAR).
+    Update(&'a mut UpdateSums),
+    /// A numerator alone: the gradient or step that rPIE, ML, LSQML and BH take, or a
+    /// window's, which `ObjectSampler::place` adds to the full numerator.
+    Num(&'a mut DeviceBuffer<C32>),
+}
+
+impl Sums<'_> {
+    pub(crate) fn check(&self, need: usize) -> Result<(), Error> {
+        match self {
+            Self::Update(s) => s.check(need),
+            Self::Num(n) => check_len("sums.num", n, need),
+        }
+    }
+
+    pub(crate) fn storages(&self) -> Vec<&cuda_core::RawDeviceBuffer> {
+        match self {
+            Self::Update(s) => s.storages().to_vec(),
+            Self::Num(n) => vec![n.storage()],
+        }
+    }
+}
+
+/// What a pass's sums go into: [`UpdateSums`] or a numerator alone (`DeviceBuffer<C32>`),
+/// either of which coerces to `&mut dyn SumTarget`.
+pub trait SumTarget: Send {
+    fn target(&mut self) -> Sums<'_>;
+}
+
+impl SumTarget for UpdateSums {
+    fn target(&mut self) -> Sums<'_> {
+        Sums::Update(self)
+    }
+}
+
+impl SumTarget for DeviceBuffer<C32> {
+    fn target(&mut self) -> Sums<'_> {
+        Sums::Num(self)
     }
 }

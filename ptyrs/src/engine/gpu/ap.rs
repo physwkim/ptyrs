@@ -2,6 +2,7 @@
 
 use crate::gpu::{
     Error as GpuError, Exit, FarSums, FusedBufs, FusedInputs, FusedSums, RecordWriter, ShiftProbe,
+    ShiftedProbes, ShiftedStepSums,
 };
 use cuda_async::device_operation::ExecutionContext;
 
@@ -127,7 +128,7 @@ impl Bufs<'_> {
                     ..FarSums::default()
                 };
                 let sums = FusedSums {
-                    obj: obj.then(|| w.zeroed_sums(ctx)).transpose()?,
+                    obj: obj.then(|| w.zeroed_patches(ctx)).transpose()?,
                     ..FusedSums::default()
                 };
                 (self.kernels).fused_project(ctx, &inputs, stack, Exit::Ap { far }, f, sums)?;
@@ -164,7 +165,7 @@ impl Bufs<'_> {
             let exit = Exit::Ap { far };
             let sums = FusedSums {
                 obj: obj.then_some(&mut *self.obj_sums),
-                shift: m.shift_sums(probe.then_some(ShiftProbe::Step as _), true),
+                shift: m.shift_sums(probe.then_some(ShiftedProbes::step as _), true),
                 ..FusedSums::default()
             };
             self.kernels
@@ -186,9 +187,10 @@ impl Bufs<'_> {
         let Some(inertia) = probe_inertia else {
             return Ok(false);
         };
-        m.probe_sums(ctx, self.kernels, &dims, self.probe_sums)?;
+        m.probe_sums::<ShiftedStepSums>(ctx, self.kernels, &dims, self.probe_sums)?;
         let model = m.model();
-        let Some(ShiftProbe::Step(step)) = m.shift_sums(Some(ShiftProbe::Step), false).probe else {
+        let Some(ShiftProbe::Step(step)) = m.shift_sums(Some(ShiftedProbes::step), false).probe
+        else {
             return Ok(false);
         };
         let inputs = FusedInputs {

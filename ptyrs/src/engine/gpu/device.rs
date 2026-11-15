@@ -22,15 +22,15 @@ use crate::gpu::{
     GammaStacks, GradKernels, HalfWaves, Kernels, LlkPartial, LlkRing, LlkScratch, LlkTotals,
     MASKED, Model, OpticsKernels, PositionKernels, PositionPartial, Positions, PowerMax,
     ProbeSpectrum, PsiSums, RecordWriter, RpieKernels, ScalePartial, Shift, ShiftProbe, ShiftSums,
-    ShiftedProbeSums, SlicePhase, SliceSource, SpectrumBuf, StackRef, StackTable, StackWindows,
-    UpdateSums, ViewAddr, ViewDims, Views, Waves, half_scale,
+    ShiftedNumSums, ShiftedProbes, ShiftedSums, SlicePhase, SliceSource, SpectrumBuf, StackRef,
+    StackTable, StackWindows, SumTarget, UpdateSums, ViewAddr, ViewDims, Views, Waves, half_scale,
 };
 use crate::tile::TileDots;
 use cuda_async::cuda_graph::CudaGraph;
 use cuda_async::device_operation::{DeviceOp, ExecutionContext};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 
-use super::bh::{BhMoved, BhSliced, update_sums};
+use super::bh::{BhMoved, BhSliced, update_nums};
 use super::lsqml::{LsqmlBufs, LsqmlState, Pre};
 use super::ml::{MlMoved, MlPosition, MlWindows};
 use super::rpie::RpieMoved;
@@ -319,7 +319,7 @@ const SAMPLER_CHUNK: u32 = 4;
 
 /// A cut's windows under [`Sampling::FullObject`]: the views that read a stack's windows, the
 /// blocks [`ObjectSampler::windows`] writes them to, every object mode, and the object update
-/// sums over them.
+/// numerator over them.
 pub(super) struct Windows {
     views: Views,
     /// Blocks `[nobj, nf_max, ny, nx]`, each the views' object: the windows, and for the
@@ -330,8 +330,9 @@ pub(super) struct Windows {
     /// `[nobj, nyo, nxo]`, the spectra of each slice past the first, which
     /// [`Modelled::sliced`] takes for its windows.
     spectra: Vec<DeviceBuffer<C32>>,
-    /// `[nobj, nf_max, ny, nx]`.
-    sums: UpdateSums,
+    /// `[nobj, nf_max, ny, nx]`, the numerator alone: the full sums' `den` is the sampler's
+    /// diagonal, which [`ObjectSampler::solve`] spreads itself.
+    patches: DeviceBuffer<C32>,
 }
 
 impl Windows {
@@ -357,7 +358,7 @@ impl Windows {
             spectra: (1..slices)
                 .map(|_| DeviceBuffer::zeroed(stream, dims.obj_len()))
                 .collect::<Result<_, _>>()?,
-            sums: UpdateSums::zeroed(stream, len)?,
+            patches: DeviceBuffer::zeroed(stream, len)?,
         })
     }
 
@@ -366,14 +367,9 @@ impl Windows {
         self.blocks.len() > self.views.dims().obj_len()
     }
 
-    /// Bytes per frame of a stack's block.
+    /// Bytes per frame of a stack's block, and of its patches.
     fn bytes(dims: &ViewDims) -> usize {
         plane_bytes::<C32>(dims, dims.nobj)
-    }
-
-    /// Bytes per frame of a stack's update sums.
-    fn sums_bytes(dims: &ViewDims) -> usize {
-        plane_bytes::<C32>(dims, dims.nobj) + plane_bytes::<f32>(dims, dims.nobj)
     }
 }
 
@@ -390,24 +386,26 @@ pub(super) enum Sample {
 }
 
 /// [`Windows`] lent to one stack's passes by [`Modelled::windows`]: the views and the blocks
-/// they read, and the update sums.
+/// they read, and the update numerator.
 pub(super) struct WindowsMut<'w> {
     pub read: StackWindows<'w>,
-    sums: &'w mut UpdateSums,
+    patches: &'w mut DeviceBuffer<C32>,
 }
 
 impl WindowsMut<'_> {
-    /// The update sums over the windows, zeroed for the passes to add to (two memsets).
-    pub fn zeroed_sums(&mut self, ctx: &ExecutionContext) -> Result<&mut UpdateSums, GpuError> {
-        crate::gpu::zero(ctx, &mut self.sums.num)?;
-        crate::gpu::zero(ctx, &mut self.sums.den)?;
-        Ok(self.sums)
+    /// The update numerator over the windows, zeroed for the passes to add to.
+    pub fn zeroed_patches(
+        &mut self,
+        ctx: &ExecutionContext,
+    ) -> Result<&mut dyn SumTarget, GpuError> {
+        crate::gpu::zero(ctx, self.patches)?;
+        Ok(self.patches)
     }
 
-    /// The object sums the passes added since [`Self::zeroed_sums`], which
+    /// The numerator the passes added since [`Self::zeroed_patches`], which
     /// [`Modelled::place`] places.
     pub fn patches(&self) -> &DeviceBuffer<C32> {
-        &self.sums.num
+        self.patches
     }
 }
 
@@ -477,7 +475,7 @@ enum Mover {
     /// probe's update sums.
     Probe {
         spectrum: SpectrumBuf,
-        probe_sums: Box<ShiftedProbeSums>,
+        probe_sums: Box<ShiftedProbes>,
     },
     /// [`Sampling::FullObject`]: the object's windows, which the passes sample from the
     /// spectra of the object they read; the probe stays.
@@ -500,7 +498,7 @@ impl Mover {
         Ok(match sampling {
             Sampling::Patch => Self::Probe {
                 spectrum: SpectrumBuf::zeroed(stream, dims)?,
-                probe_sums: Box::new(ShiftedProbeSums::zeroed(stream, dims)?),
+                probe_sums: Box::new(ShiftedProbes::zeroed(stream, dims)?),
             },
             Sampling::FullObject => Self::Object {
                 sampler: Box::new(ObjectSampler::new(
@@ -669,7 +667,7 @@ impl<'m, X> PositionLent<'m, X> {
                 kernels,
                 offsets: &mut *p.offsets,
                 spectrum,
-                probe_sums,
+                probe_sums: probe_sums.get(),
             }))),
             (
                 MovedProbes::FullObject,
@@ -759,7 +757,7 @@ pub(super) struct MovedLent<'m, X> {
     kernels: &'m PositionKernels,
     offsets: &'m mut DeviceBuffer<f32>,
     spectrum: &'m mut SpectrumBuf,
-    probe_sums: &'m mut ShiftedProbeSums,
+    probe_sums: &'m mut ShiftedNumSums,
 }
 
 impl<'m, X> MovedLent<'m, X> {
@@ -812,7 +810,7 @@ pub(super) struct MovedBatch<'m, X> {
     /// By frame: the device's offsets, which only the cycle's own step moves
     /// ([`FeaturesMut::own_step`]).
     pub offsets: &'m mut DeviceBuffer<f32>,
-    pub probe_sums: &'m mut ShiftedProbeSums,
+    pub probe_sums: &'m mut ShiftedNumSums,
     pub spectrum: ProbeSpectrum<'m>,
 }
 
@@ -900,7 +898,7 @@ pub(super) enum Moves<'b> {
 /// [`Sampling::Patch`] alone, which moves the probe, and each frame's position sums while
 /// the offsets are refined.
 struct PositionSums<'b> {
-    probe: Option<&'b mut ShiftedProbeSums>,
+    probe: Option<&'b mut ShiftedProbes>,
     partials: Option<&'b mut PositionPartials>,
 }
 
@@ -966,7 +964,7 @@ impl Modelled<'_, OneSlice> {
                 views: &w.views,
                 blocks: &w.blocks,
             },
-            sums: &mut w.sums,
+            patches: &mut w.patches,
         }))
     }
 
@@ -1183,7 +1181,7 @@ impl<K> Modelled<'_, K> {
     /// moved probe fail the pass, which takes them from the shift alone.
     pub fn shift_sums<'c>(
         &'c mut self,
-        probe: Option<fn(&'c mut ShiftedProbeSums) -> ShiftProbe<'c>>,
+        probe: Option<fn(&'c mut ShiftedProbes) -> ShiftProbe<'c>>,
         position: bool,
     ) -> ShiftSums<'c> {
         match &mut self.position {
@@ -1213,8 +1211,8 @@ impl<K> Modelled<'_, K> {
     /// the probe.
     pub fn psi_sums<'c>(
         &'c mut self,
-        obj: Option<&'c mut UpdateSums>,
-        probe: Option<fn(&'c mut ShiftedProbeSums) -> ShiftProbe<'c>>,
+        obj: Option<&'c mut dyn SumTarget>,
+        probe: Option<fn(&'c mut ShiftedProbes) -> ShiftProbe<'c>>,
     ) -> PsiSums<'c> {
         PsiSums {
             obj,
@@ -1225,17 +1223,17 @@ impl<K> Modelled<'_, K> {
         }
     }
 
-    /// Adds the shifted probe's update sums the projections added into `out`, consuming
-    /// them; nothing unless the model moves the probe.
-    pub fn probe_sums(
+    /// Adds the shifted probe's sums of kind `S` the projections added into `out`,
+    /// consuming them; nothing unless the model moves the probe.
+    pub fn probe_sums<S: ShiftedSums>(
         &mut self,
         ctx: &ExecutionContext,
         kernels: &Kernels,
         dims: &ViewDims,
-        out: &mut UpdateSums,
+        out: &mut S::Out,
     ) -> Result<(), GpuError> {
         if let Some(sums) = (self.position.as_mut()).and_then(|p| p.probe.as_deref_mut()) {
-            kernels.shifted_probe_sums(ctx, dims, sums, out)?;
+            kernels.shifted_probe_sums(ctx, dims, sums.get::<S>(), out)?;
         }
         Ok(())
     }
@@ -1522,14 +1520,15 @@ impl Shared {
         // both and writes the adjoint, object planes and power, `shift_post` and the probe sums
         // take the adjoint (4), `gather_shifted` the rest (5). Under its windows, as AP runs a
         // stack: the sampler's calls, three launches each, write the windows (0 to 2) and,
-        // refined, their derivatives over `y` (3 to 5) and `x` (6 to 8); two memsets zero the
-        // window sums (9, 10), which the fused passes (11 to 14) add to; a refined position's sums
-        // (15) read the work planes and the three blocks, the probe sums (16) the work planes and
-        // the windows; placing the window sums back takes six launches (17 to 22). The LLK pass,
-        // ML's gradient and position sums and DM's and RAAR's updates run a subset. Of a
-        // multislice object, the two waves its slices pass on, numbered after; under the
-        // windows, as the LLK pass runs a stack, the sampler's calls write each slice's windows
-        // in turn (from 23), which the slice passes after them read beside the waves.
+        // refined, their derivatives over `y` (3 to 5) and `x` (6 to 8); a memset zeroes the
+        // window numerator (9), a block's size, which the fused passes (10 to 13) add to; a
+        // refined position's sums (14) read the work planes and the three blocks, the probe sums
+        // (15) the work planes and the windows; placing the numerator back takes six launches
+        // (16 to 21). The LLK pass, ML's gradient and position sums and DM's and RAAR's updates
+        // run a subset. Of a multislice object, the two waves its slices pass on, numbered
+        // after; under the windows, as the LLK pass runs a stack, the sampler's calls write each
+        // slice's windows in turn (from 22), which the slice passes after them read beside the
+        // waves.
         let shift = matches!(scratch, PositionScratch::Shift { .. });
         let wave = wave_bytes(dims);
         let mut streamed = match scratch {
@@ -1550,15 +1549,15 @@ impl Shared {
                 place,
                 refined,
             } => {
-                let (block, sums) = (Windows::bytes(dims), Windows::sums_bytes(dims));
+                let block = Windows::bytes(dims);
                 let calls: &[_] = if refined { &[3..=5, 6..=8] } else { &[] };
                 let derivatives = (calls.iter())
-                    .flat_map(|c| Streamed::chunked(sample, c.clone(), &[(block, 15)], &[]));
+                    .flat_map(|c| Streamed::chunked(sample, c.clone(), &[(block, 14)], &[]));
                 [
-                    vec![Streamed::new(wave, 11..=16)],
-                    Streamed::chunked(sample, 0..=2, &[(block, 16)], &[]),
+                    vec![Streamed::new(wave, 10..=15)],
+                    Streamed::chunked(sample, 0..=2, &[(block, 15)], &[]),
                     derivatives.collect(),
-                    Streamed::chunked(place, 17..=22, &[], &[(sums, 9)]),
+                    Streamed::chunked(place, 16..=21, &[], &[(block, 9)]),
                 ]
                 .concat()
             }
@@ -1567,9 +1566,9 @@ impl Shared {
             streamed.extend(match scratch {
                 PositionScratch::Windows { sample, .. } => {
                     let (block, n) = (Windows::bytes(dims), to_u32("slices", slices)?);
-                    let pass = 23 + 3 * n;
+                    let pass = 22 + 3 * n;
                     let sampled = (0..n).flat_map(|k| {
-                        let call = 23 + 3 * k..=25 + 3 * k;
+                        let call = 22 + 3 * k..=24 + 3 * k;
                         Streamed::chunked(sample, call, &[(block, pass + 1)], &[])
                     });
                     (sampled.chain([Streamed::new(wave, pass..=pass + 1); 2])).collect()
@@ -3552,13 +3551,14 @@ impl Device {
         Ok(r)
     }
 
-    /// Zeroes [`update_sums`].
+    /// Zeroes [`update_nums`] and the two denominators.
     fn zero_sums(&mut self, ctx: &ExecutionContext) -> Result<(), GpuError> {
+        crate::gpu::zero(ctx, &mut self.obj_sums.den)?;
+        crate::gpu::zero(ctx, &mut self.probe_sums.den)?;
         let sliced = self.bh_state.as_deref_mut().and_then(|s| s.sliced.as_mut());
         let grads = sliced.map_or(&mut [][..], BhSliced::grads);
-        for sums in update_sums(&mut self.obj_sums, &mut self.probe_sums, grads) {
-            crate::gpu::zero(ctx, &mut sums.num)?;
-            crate::gpu::zero(ctx, &mut sums.den)?;
+        for num in update_nums(&mut self.obj_sums, &mut self.probe_sums, grads) {
+            crate::gpu::zero(ctx, num)?;
         }
         Ok(())
     }
@@ -3755,8 +3755,11 @@ mod tests {
                     ..
                 }) = &mut dev.features.position
                 {
-                    let (num, den) = probe_sums.sums_mut();
-                    num.copy_from_host(&dev.stream, &vec![C32 { re: 1.0, im: 1.0 }; num.len()])?;
+                    let (nums, den) = probe_sums.sums_mut();
+                    for num in nums {
+                        let ones = vec![C32 { re: 1.0, im: 1.0 }; num.len()];
+                        num.copy_from_host(&dev.stream, &ones)?;
+                    }
                     den.copy_from_host(&dev.stream, &vec![1.0; den.len()])?;
                 }
                 Err::<(), _>(EngineError::Invalid("injected".into()))
@@ -3819,9 +3822,7 @@ mod tests {
             let r = failed.dev.ungated().summing(|dev| {
                 let bh = dev.bh_state.as_deref_mut().expect("BH's state");
                 let g = &mut bh.sliced.as_mut().expect("two slices").grads()[0];
-                let num = vec![C32 { re: 1.0, im: 1.0 }; g.num.len()];
-                g.num.copy_from_host(&dev.stream, &num)?;
-                g.den.copy_from_host(&dev.stream, &vec![1.0; g.den.len()])?;
+                g.copy_from_host(&dev.stream, &vec![C32 { re: 1.0, im: 1.0 }; g.len()])?;
                 Err::<(), _>(EngineError::Invalid("injected".into()))
             });
             assert!(matches!(r, Err(EngineError::Invalid(_))), "graph {graph}");
@@ -3846,6 +3847,102 @@ mod tests {
                 .zip(f.iter().zip(&c))
             {
                 assert!(f == c, "graph {graph}: {what} differs from a clean run's");
+            }
+        }
+    }
+
+    /// rPIE, ML, LSQML and BH divide by no denominator, so their passes add to the numerators
+    /// alone: a sentinel in every denominator, the update sums' and a moved probe's, survives
+    /// their cycles under either sampling, with no position and with one held or refined.
+    #[test]
+    fn numerator_updates_leave_every_denominator() {
+        const SENTINEL: f32 = 7.0;
+        let ctx = CudaContext::new(0).expect("GPU 0");
+        fn dens(dev: &mut Device) -> Vec<&mut DeviceBuffer<f32>> {
+            let mut dens = vec![&mut dev.obj_sums.den, &mut dev.probe_sums.den];
+            if let Some(PositionBufs {
+                mover: Mover::Probe { probe_sums, .. },
+                ..
+            }) = &mut dev.features.position
+            {
+                dens.push(probe_sums.sums_mut().1);
+            }
+            dens
+        }
+        let run = |e: &mut GpuPtycho, algo| match algo {
+            "rpie" => e.rpie(
+                &RpieParams {
+                    obj_step: Some(1.0),
+                    probe_step: Some(1.0),
+                    obj_alpha: 0.5,
+                    probe_alpha: 0.5,
+                    batch_size: 12,
+                    calc_llk: 1,
+                },
+                1,
+            ),
+            "ml" => e.ml(
+                &MlParams {
+                    update_object: true,
+                    update_probe: true,
+                    calc_llk: 1,
+                    zero_phase_ramp: false,
+                },
+                2,
+            ),
+            "lsqml" => e.lsqml(
+                &LsqmlParams {
+                    batch_size: 12,
+                    cost: crate::engine::Cost::Poisson,
+                    seed: 7,
+                },
+                1,
+                1,
+            ),
+            _ => e.bh(
+                &BhParams {
+                    batch_size: 12,
+                    probe_rho: 0.01,
+                    position_rho: 0.1,
+                    seed: 7,
+                },
+                2,
+                1,
+            ),
+        };
+        let offsets = vec![[0.1, -0.1]; 36];
+        let positions = [
+            None,
+            Some(Feature::held(offsets.clone())),
+            Some(Feature::refined(offsets)),
+        ];
+        for sampling in [Sampling::Patch, Sampling::FullObject] {
+            for position in &positions {
+                for algo in ["rpie", "ml", "lsqml", "bh"] {
+                    let mut e = engine(&ctx, true, true);
+                    e.set_sampling(sampling).unwrap();
+                    let features = Features {
+                        position: position.clone(),
+                        ..Features::default()
+                    };
+                    e.set_features(&features).unwrap();
+                    let what = format!("{algo} {sampling:?} position {position:?}");
+                    run(&mut e, algo).unwrap_or_else(|err| panic!("{what}: {err}"));
+                    let dev = e.dev.ungated();
+                    let stream = Arc::clone(&dev.stream);
+                    for den in dens(dev) {
+                        den.copy_from_host(&stream, &vec![SENTINEL; den.len()])
+                            .unwrap();
+                    }
+                    run(&mut e, algo).unwrap_or_else(|err| panic!("{what}: {err}"));
+                    for (k, den) in dens(e.dev.ungated()).into_iter().enumerate() {
+                        let kept = den.to_host_vec(&stream).unwrap();
+                        assert!(
+                            kept.iter().all(|&d| d == SENTINEL),
+                            "{what}: denominator {k} changed"
+                        );
+                    }
+                }
             }
         }
     }
