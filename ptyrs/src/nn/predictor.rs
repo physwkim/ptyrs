@@ -25,6 +25,7 @@ use rand::SeedableRng;
 use rand::seq::SliceRandom;
 use rand_chacha::ChaCha8Rng;
 
+use crate::nn::grid::fits;
 use crate::nn::ptychonn::{Folded, PtychoNN};
 use crate::nn::{NnError, burn_err};
 
@@ -67,13 +68,41 @@ impl PredictorConfig {
         self.frame.map(|n| n / self.bin)
     }
 
+    /// Fails unless [`init`](Self::init) builds a network the nn kernels run on one frame.
     fn check(&self) -> Result<(), NnError> {
-        let granule = self.bin << self.depth;
-        if self.bin == 0 || self.frame.iter().any(|&n| n == 0 || n % granule != 0) {
-            return Err(NnError::Invalid(format!(
-                "frame {:?} is not a positive multiple of bin {} × 2^depth {}",
-                self.frame, self.bin, self.depth
-            )));
+        let Self {
+            frame,
+            bin,
+            width,
+            depth,
+            ..
+        } = *self;
+        let invalid = |what: String| Err(NnError::Invalid(what));
+        if width < 2 || depth == 0 {
+            return invalid(format!("width {width} below 2 or depth {depth} below 1"));
+        }
+        // `n · 2^k`, none past `usize`.
+        let scaled = |n: usize, k: usize| n.checked_mul(1usize.checked_shl(k.try_into().ok()?)?);
+        // The widest weight, the last encoder stage's `[top, top, 3, 3]`.
+        if !scaled(width, depth - 1).is_some_and(|top| fits(&[top, top, 3, 3])) {
+            return invalid(format!(
+                "width {width} × 2^(depth {depth} - 1) makes a weight of 2³² elements or more"
+            ));
+        }
+        let granule = scaled(bin, depth).filter(|&g| g > 0);
+        if !granule.is_some_and(|g| frame.iter().all(|&n| n > 0 && n % g == 0)) {
+            return invalid(format!(
+                "frame {frame:?} is not a positive multiple of bin {bin} × 2^depth {depth}"
+            ));
+        }
+        // The widest activation, the first stage's, over one frame; `width` bounds the input's
+        // images.
+        let [py, px] = self.patch();
+        if !fits(&[width, py, px]) {
+            return invalid(format!(
+                "width {width} over patch {:?} makes an activation of 2³² elements or more",
+                [py, px]
+            ));
         }
         Ok(())
     }
@@ -398,8 +427,9 @@ impl Samples {
         Ok(())
     }
 
-    /// [`check`](Self::check) against `config`.
+    /// [`check`](Self::check) against `config`, which must pass its own check.
     fn check_config(&self, config: &PredictorConfig) -> Result<(), NnError> {
+        config.check()?;
         self.check(config.input, config.patch())
     }
 
@@ -672,6 +702,7 @@ impl Model {
         inv_spread: Vec<f32>,
         device: &Device,
     ) -> Result<Self, NnError> {
+        let net = config.init(device)?;
         let [py, px] = config.patch();
         let images = config.input.images();
         let fixed = |values: Vec<f32>, shape: [usize; 4]| {
@@ -679,7 +710,7 @@ impl Model {
                 .set_require_grad(false)
         };
         Ok(Self {
-            net: config.init(device)?,
+            net,
             mean: fixed(mean, [1, images, py, px]),
             inv_spread: fixed(inv_spread, [1, images, 1, 1]),
         })
@@ -951,6 +982,7 @@ impl Predictor {
         let mut json = read_json(&dir.join("predictor.json"))?;
         settle_input(&mut json, &weights)?;
         let config: PredictorConfig = serde_json::from_value(json).map_err(burn_err)?;
+        config.check()?;
         let [py, px] = config.patch();
         let images = config.input.images();
         let model = Model::new(
@@ -978,6 +1010,43 @@ mod tests {
         assert!(matches!(input, Err(NnError::Invalid(_))), "{input:?}");
         let net = PredictorConfig::new([0, 16], 1).init(&crate::nn::cuda(0));
         assert!(matches!(net, Err(NnError::Invalid(_))));
+    }
+
+    /// A config `PtychoNN::new` panicked on, or `check` itself overflowed on, is refused.
+    #[test]
+    fn a_network_too_narrow_or_shallow_is_refused() {
+        let device = crate::nn::cuda(0);
+        let at = |width, depth| {
+            PredictorConfig::new([16, 16], 2)
+                .with_width(width)
+                .with_depth(depth)
+        };
+        for config in [at(1, 3), at(32, 0), at(32, 64), at(1 << 62, 3)] {
+            let net = config.init(&device);
+            assert!(matches!(net, Err(NnError::Invalid(_))), "{config:?}");
+        }
+    }
+
+    /// A weight or a one-frame activation of 2³² elements, which the nn kernels refuse, is
+    /// refused with its config.
+    #[test]
+    fn a_network_past_the_kernels_is_refused() {
+        let at = |frame, width| {
+            PredictorConfig::new(frame, 1)
+                .with_width(width)
+                .with_depth(1)
+        };
+        // 9 · 21845² and 2 · 65534 · 32768 are below 2³², 9 · 21846² and 2 · 65536 · 32768 not.
+        assert!(at([2, 2], 21845).check().is_ok());
+        assert!(matches!(
+            at([2, 2], 21846).check(),
+            Err(NnError::Invalid(_))
+        ));
+        assert!(at([65534, 32768], 2).check().is_ok());
+        assert!(matches!(
+            at([65536, 32768], 2).check(),
+            Err(NnError::Invalid(_))
+        ));
     }
 
     #[test]
@@ -1042,6 +1111,16 @@ mod tests {
         let (two, twos) = small(Input::BinnedCentre);
         assert!(train(&one, &options(), &ones, Some(&twos), &device, |_| {}).is_err());
         assert!(train(&two, &options(), &twos, Some(&ones), &device, |_| {}).is_err());
+    }
+
+    /// A config of bin 0 divided by zero before `train` reached its network.
+    #[test]
+    fn train_refuses_a_config_it_cannot_build() {
+        let device = crate::nn::cuda(0);
+        let (config, samples) = small(Input::Binned);
+        let config = PredictorConfig { bin: 0, ..config };
+        let got = train(&config, &options(), &samples, None, &device, |_| {});
+        assert!(matches!(got, Err(NnError::Invalid(_))));
     }
 
     /// Training samples of the other input gave wrong input statistics, then a panic.

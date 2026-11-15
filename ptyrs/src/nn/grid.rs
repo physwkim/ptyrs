@@ -15,16 +15,18 @@ pub(super) fn grid(client: &Client, cubes: usize) -> CubeCount {
     CubeCount::Static(cubes.min(most_x), rows.min(most_y), rows.div_ceil(most_y))
 }
 
+/// Whether a tensor of `shape` holds fewer than 2³² elements: the kernels index tensors with 32
+/// bits, and cubecl's launch panics with no message past that.
+pub(super) fn fits(shape: &[usize]) -> bool {
+    let len = shape.iter().try_fold(1usize, |p, &d| p.checked_mul(d));
+    len.is_some_and(|len| u32::try_from(len).is_ok())
+}
+
 /// Panics unless each tensor of `shapes`, the shapes of every tensor a launch reads or writes,
-/// holds fewer than 2³² elements: the kernels index them with 32 bits, and cubecl's launch panics
-/// with no message past that. A launch site calls it before it packs or allocates anything.
+/// [`fits`]. A launch site calls it before it packs or allocates anything.
 pub(super) fn check_elements(shapes: &[&[usize]]) {
-    let fits = |shape: &&[usize]| {
-        let len = shape.iter().try_fold(1usize, |p, &d| p.checked_mul(d));
-        len.is_some_and(|len| u32::try_from(len).is_ok())
-    };
     assert!(
-        shapes.iter().all(fits),
+        shapes.iter().all(|s| fits(s)),
         "a launch of fewer than 2³² elements per tensor"
     );
 }

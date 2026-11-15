@@ -304,3 +304,18 @@ fn an_input_mean_of_under_two_axes_is_refused() {
         );
     }
 }
+
+/// A saved config whose network `PtychoNN::new` panicked on is refused before its weights are
+/// read.
+#[test]
+fn a_saved_config_of_width_1_is_refused() {
+    let device = ptyrs::nn::cuda(0);
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ptyrs-nn-predictor-width-1");
+    std::fs::create_dir_all(&dir).unwrap();
+    config()
+        .with_width(1)
+        .save(dir.join("predictor.json"))
+        .unwrap();
+    let got = Predictor::load(&dir, &device);
+    assert!(matches!(got, Err(NnError::Invalid(_))));
+}
