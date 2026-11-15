@@ -1250,13 +1250,13 @@ mod tests {
             matches!(r, Err(DistError::Gpu(crate::gpu::Error::Driver(d))) if d == fault::REFUSAL),
             "{r:?}"
         );
-        assert!(matches!(ap.epoch(), Err(DistError::Aborted)));
-        assert!(matches!(ap.llk(), Err(DistError::Aborted)));
-        assert!(matches!(ap.object(), Err(DistError::Aborted)));
-        assert!(matches!(ap.end_of(0), Err(DistError::Aborted)));
-        assert!(matches!(ap.wait(&mut snap), Err(DistError::Aborted)));
-        assert!(matches!(ap.mapped_bytes(), Err(DistError::Aborted)));
-        assert!(matches!(ap.plan_time(), Err(DistError::Aborted)));
+        assert!(matches!(ap.epoch(), Err(DistError::Poisoned)));
+        assert!(matches!(ap.llk(), Err(DistError::Poisoned)));
+        assert!(matches!(ap.object(), Err(DistError::Poisoned)));
+        assert!(matches!(ap.end_of(0), Err(DistError::Poisoned)));
+        assert!(matches!(ap.wait(&mut snap), Err(DistError::Poisoned)));
+        assert!(matches!(ap.mapped_bytes(), Err(DistError::Poisoned)));
+        assert!(matches!(ap.plan_time(), Err(DistError::Poisoned)));
         feed.finish();
     }
 
@@ -1287,7 +1287,7 @@ mod tests {
         assert!(ap.epoch().is_err());
         assert!(armed.fired());
         drop(armed);
-        assert!(matches!(ap.object(), Err(DistError::Aborted)));
+        assert!(matches!(ap.object(), Err(DistError::Poisoned)));
         ap.synchronize().unwrap();
         for (r, s) in streams.iter().enumerate() {
             let idle = [s[0].query().unwrap(), s[1].query().unwrap()];
@@ -1319,7 +1319,7 @@ mod tests {
             matches!(r, Err(DistError::Gpu(crate::gpu::Error::Driver(d))) if d == fault::REFUSAL),
             "{r:?}"
         );
-        assert!(matches!(ap.wait(&mut snap), Err(DistError::Aborted)));
+        assert!(matches!(ap.wait(&mut snap), Err(DistError::Poisoned)));
         ap.synchronize().unwrap();
         feed.finish();
     }
@@ -1345,9 +1345,9 @@ mod tests {
             matches!(r, Err(DistError::Gpu(crate::gpu::Error::Driver(d))) if d == fault::REFUSAL),
             "{r:?}"
         );
-        assert!(matches!(ap.llk(), Err(DistError::Aborted)));
-        assert!(matches!(ap.epoch(), Err(DistError::Aborted)));
-        assert!(matches!(ap.new_snapshot(), Err(DistError::Aborted)));
+        assert!(matches!(ap.llk(), Err(DistError::Poisoned)));
+        assert!(matches!(ap.epoch(), Err(DistError::Poisoned)));
+        assert!(matches!(ap.new_snapshot(), Err(DistError::Poisoned)));
         feed.finish();
     }
 

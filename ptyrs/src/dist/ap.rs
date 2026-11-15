@@ -442,7 +442,7 @@ struct Data {
 }
 
 impl State {
-    fn new(gpu: &mut Gpu, plan: &Plan, data: &Data) -> Result<Self, DistError> {
+    fn new(gpu: &Gpu, plan: &Plan, data: &Data) -> Result<Self, DistError> {
         let rp = &plan.regions[gpu.region()];
         let stream = gpu.stream();
         let n = plan.n();
@@ -1254,8 +1254,8 @@ mod tests {
             matches!(r, Err(DistError::Gpu(crate::gpu::Error::Driver(d))) if d == fault::REFUSAL),
             "{r:?}"
         );
-        assert!(matches!(ap.run(1), Err(DistError::Aborted)));
-        assert!(matches!(ap.object(), Err(DistError::Aborted)));
-        assert!(matches!(ap.probe(), Err(DistError::Aborted)));
+        assert!(matches!(ap.run(1), Err(DistError::Poisoned)));
+        assert!(matches!(ap.object(), Err(DistError::Poisoned)));
+        assert!(matches!(ap.probe(), Err(DistError::Poisoned)));
     }
 }
