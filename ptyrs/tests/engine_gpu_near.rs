@@ -383,11 +383,11 @@ fn full_object_projections_match_cpu(c: &Case) {
     const NCYCLE: usize = 8;
     // Measured worst: LLK 6.2e-6, object 1.9e-6, probe 1.9e-6, features 1.1e-5, offsets
     // 5.8e-7; the object's whole plane 1.2e-5, the dark band's.
-    const TOL: [f64; 5] = [2e-5, 6e-6, 6e-6, 3.5e-5, 1.8e-6];
+    const TOL: [f64; 5] = [1.9e-5, 5.6e-6, 5.7e-6, 3.4e-5, 1.8e-6];
     const NCYCLE_F16: usize = 2;
     // Measured worst: LLK 2.6e-5, object 1.8e-4, probe 5.7e-5, features 7.4e-5, offsets
     // 5.5e-5.
-    const TOL_F16: [f64; 5] = [1.2e-3, 6e-3, 1.2e-3, 6e-4, 4.5e-4];
+    const TOL_F16: [f64; 5] = [7.9e-5, 5.4e-4, 1.8e-4, 2.3e-4, 1.7e-4];
     let frame = FUSED_SIDES[0] as usize;
     let moved = Features {
         position: Some(Feature::refined(drawn_offsets())),
@@ -472,7 +472,7 @@ fn full_object_models(frame: usize) -> [(&'static str, Features); 2] {
 fn full_object_ml_scale_and_grads_match_cpu_under_every_propagator() {
     // Measured worst: object 6.2e-8, probe 9.3e-8, object gradient 1.7e-6, probe gradient
     // 4.0e-6.
-    const TOL: [f64; 4] = [2.5e-7, 4e-7, 6e-6, 1.5e-5];
+    const TOL: [f64; 4] = [1.9e-7, 2.8e-7, 5e-6, 1.2e-5];
     let frame = FUSED_SIDES[0] as usize;
     for c in cases() {
         for (label, features) in full_object_models(frame) {
@@ -517,7 +517,7 @@ fn full_object_ml_matches_cpu_under_every_propagator() {
     // Measured worst: LLK 1.4e-5, object 2.9e-6, probe 1.5e-7, features 4.9e-6, offsets
     // 1.9e-6, each but the features' under the Fresnel transform back with a scale and a
     // background.
-    const TOL: [f64; 5] = [5e-5, 1.2e-5, 6e-7, 2e-5, 8e-6];
+    const TOL: [f64; 5] = [4.2e-5, 8.9e-6, 4.6e-7, 1.5e-5, 5.6e-6];
     let frame = FUSED_SIDES[0] as usize;
     for c in cases() {
         for (label, features) in full_object_models(frame) {
@@ -548,7 +548,7 @@ fn full_object_rpie_matches_cpu_under_every_propagator() {
     const NEPOCH: usize = 6;
     // Measured worst: LLK 1.8e-6, object 3.6e-7, probe 4.7e-6, offsets 3.6e-7; rPIE models no
     // scale or background.
-    const TOL: [f64; 5] = [1e-5, 2e-6, 2.5e-5, f64::MIN_POSITIVE, 2e-6];
+    const TOL: [f64; 5] = [5.5e-6, 1.1e-6, 1.5e-5, f64::MIN_POSITIVE, 1.1e-6];
     let moved = Features {
         position: Some(Feature::refined(drawn_offsets())),
         ..Features::default()
@@ -654,7 +654,7 @@ fn sampling_is_the_cpus_auto_until_set() {
 #[test]
 fn full_object_llk_matches_cpu_under_every_propagator() {
     // Worst measured 8.7e-7 (angular spectrum, position alone).
-    const TOL: f64 = 5e-6;
+    const TOL: f64 = 2.7e-6;
     let frame = FUSED_SIDES[0] as usize;
     let moved = Features {
         position: Some(Feature::refined(drawn_offsets())),

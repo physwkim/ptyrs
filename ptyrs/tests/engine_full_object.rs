@@ -409,9 +409,16 @@ fn on_cpu_and_gpu(
     features: &Features,
     floor: Option<f64>,
 ) {
-    // The object's worst, weighted by the CPU's illumination, 1.5e-6 (RAAR's refined in two
-    // object modes); its whole plane's 1.3e-5 is the dark band's.
-    const TOL: [Option<f64>; 5] = [Some(1e-5), Some(1e-5), Some(4.5e-6), Some(1e-5), Some(3e-6)];
+    // Measured worst: LLK 1.7e-6, end 7.3e-7, object 1.5e-6 weighted by the CPU's illumination
+    // (RAAR's refined in two object modes), probe 2.4e-6, offsets 2.4e-7; the object's whole
+    // plane's 1.3e-5 is the dark band's.
+    const TOL: [Option<f64>; 5] = [
+        Some(5.1e-6),
+        Some(2.2e-6),
+        Some(4.4e-6),
+        Some(7.3e-6),
+        Some(7.4e-7),
+    ];
     let position = features.position.as_ref().unwrap();
     let nobj = c.truth.0.dims()[0];
     let what = format!("{algorithm} nobj {nobj} refine {}", position.refine);
@@ -509,8 +516,10 @@ fn rpie_descends_with_the_offsets_held() {
 fn whole_pixel_offsets_are_the_blend() {
     const NCYCLE: usize = 3;
     const TOL_CPU: [Option<f64>; 5] = [Some(1e-12), Some(1e-12), Some(1e-12), Some(1e-12), None];
-    // The GPU object's worst, weighted by the blend's illumination, 1.0e-6 (DM's).
-    const TOL_GPU: [Option<f64>; 5] = [Some(1e-5), Some(1e-5), Some(3e-6), Some(1e-5), None];
+    // The GPU's measured worst: LLK 9.7e-7, end 8.7e-7, object 1.0e-6 weighted by the blend's
+    // illumination (DM's), probe 9.4e-7.
+    const TOL_GPU: [Option<f64>; 5] =
+        [Some(2.9e-6), Some(2.6e-6), Some(3.1e-6), Some(2.9e-6), None];
     let (raw, whole) = (fermat(), whole_offsets());
     let moved = |a: usize, v: &[f64]| -> Vec<f64> {
         (v.iter().zip(&whole))
