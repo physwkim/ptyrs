@@ -16,10 +16,10 @@ use ptyrs_kernels::pixel::PIXEL_THREADS;
 use ptyrs_kernels::position::BatchSpan;
 
 use crate::base::Feature;
-use crate::gpu::fused::GRID_Y_MAX;
+use crate::gpu::fused::{GRID_Y_MAX, OwnSpectra};
 use crate::gpu::ops::grid_1d;
 use crate::gpu::position::{ONE_BLOCK, chunks};
-use crate::gpu::{C32, EpochOrder, Error, Kernels, check_len, dptr};
+use crate::gpu::{C32, EpochOrder, Error, Kernels, ViewDims, check_len, dptr};
 
 #[cfg(test)]
 mod tests;
@@ -176,16 +176,67 @@ impl Opr {
 }
 
 /// Mode 0 of each frame's own probe over a run of epoch positions: [`OprKernels::unique`]'s
-/// `planes`, `[nb, n]`, plane `b` at position `positions.start + b`.
+/// `planes`, `[nb, n]`, plane `b` at position `positions.start + b`; from
+/// [`Kernels::own_spectrum`], with their spectra, which the shifted passes read instead.
 #[derive(Clone)]
 pub struct OwnModes<'a> {
-    pub planes: &'a DeviceBuffer<C32>,
-    pub positions: Range<u32>,
+    planes: &'a DeviceBuffer<C32>,
+    positions: Range<u32>,
+    spectra: Option<OwnSpectra<'a>>,
 }
 
-impl OwnModes<'_> {
+impl<'a> OwnModes<'a> {
+    pub fn new(planes: &'a DeviceBuffer<C32>, positions: Range<u32>) -> Self {
+        Self {
+            planes,
+            positions,
+            spectra: None,
+        }
+    }
+
+    /// These modes with `spectra`, the spectra of their planes.
+    pub(super) fn with_spectra(&self, spectra: OwnSpectra<'a>) -> Self {
+        Self {
+            spectra: Some(spectra),
+            ..self.clone()
+        }
+    }
+
+    pub(super) fn planes(&self) -> &'a DeviceBuffer<C32> {
+        self.planes
+    }
+
     /// `probe` with these planes of `n` pixels for its mode 0, as a kernel reads it.
     pub(super) fn src(&self, probe: &DeviceBuffer<C32>, n: usize) -> Result<ProbeSrc, Error> {
+        self.src_of(probe, self.planes, n)
+    }
+
+    /// The spectra `spectrum` of the shared probe with those of these planes for its mode 0,
+    /// as the shifted passes of `d` read them, and the buffers they address.
+    pub(super) fn spectrum_src<'b>(
+        &'b self,
+        spectrum: &'b DeviceBuffer<C32>,
+        d: &ViewDims,
+    ) -> Result<(ProbeSrc, [&'b RawDeviceBuffer; 2]), Error> {
+        let Some(own) = &self.spectra else {
+            return Err(Error::Shape(
+                "own probe modes under a Model::shift need their spectra, from \
+                 Kernels::own_spectrum"
+                    .into(),
+            ));
+        };
+        let a = own.of(d)?;
+        let src = self.src_of(spectrum, a, d.n())?;
+        Ok((src, [spectrum.storage(), a.storage()]))
+    }
+
+    /// The number of planes, checked against `self`'s.
+    pub(super) fn nb(&self, n: usize) -> Result<u32, Error> {
+        self.checked_nb(self.planes, n)
+    }
+
+    /// The number of positions, refused for none or a `mode0` short of their planes.
+    fn checked_nb(&self, mode0: &DeviceBuffer<C32>, n: usize) -> Result<u32, Error> {
         let nb = self.positions.len();
         if nb == 0 {
             let p = &self.positions;
@@ -193,12 +244,22 @@ impl OwnModes<'_> {
                 "own probe modes at no positions, {p:?}"
             )));
         }
-        check_len("own probe modes", self.planes, nb * n)?;
+        check_len("own probe modes", mode0, nb * n)?;
+        Ok(nb as u32)
+    }
+
+    fn src_of(
+        &self,
+        probe: &DeviceBuffer<C32>,
+        mode0: &DeviceBuffer<C32>,
+        n: usize,
+    ) -> Result<ProbeSrc, Error> {
+        let nb = self.checked_nb(mode0, n)?;
         Ok(ProbeSrc {
             probe: dptr::<C32, f32>(probe).cast_const(),
-            mode0: dptr::<C32, f32>(self.planes).cast_const(),
+            mode0: dptr::<C32, f32>(mode0).cast_const(),
             p0: self.positions.start,
-            nb: nb as u32,
+            nb,
         })
     }
 }

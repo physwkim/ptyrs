@@ -10,7 +10,8 @@
 //! slice, and bit for bit against each frame alone. The batch starts past position 0 of an
 //! epoch order that is not the scan's, with two probe and two object modes in stacks of 3
 //! and 2. The LLK record's pass on each frame's own mode 0 runs over the whole scan by frame
-//! instead, against [`Lsqml::llk`] of the variation and bit for bit against each frame alone.
+//! instead, against [`Lsqml::llk`] of the variation and bit for bit against each frame alone,
+//! and under a shift against [`Lsqml::llk`] at the offsets.
 
 use std::f64::consts::PI;
 use std::ops::Range;
@@ -25,13 +26,13 @@ use crate::base::{
     AddrTable, C64, Counts, Feature, Geometry, MASKED, Object, Positions, Probe, Stack, View,
 };
 use crate::engine::{
-    Cost, Features, Lsqml, LsqmlBatch, LsqmlParams, Observed, Optics, ProbeVariation, Sampling,
-    SliceWaves, accumulate_probe, obj_probe_to_psi,
+    Cost, Features, Llk, Lsqml, LsqmlBatch, LsqmlParams, Observed, Optics, ProbeVariation,
+    Sampling, SliceWaves, accumulate_probe, obj_probe_to_psi,
 };
 use crate::gpu::fused::{FrameMoves, OwnSpectrumBuf};
 use crate::gpu::opr::{FrameProbe, OwnModes};
 use crate::gpu::{
-    C32, EpochOrder, Error, Exit, FarSums, FusedBufs, FusedInputs, FusedSums, Kernels, LlkPartial,
+    C32, EpochOrder, Exit, FarSums, FusedBufs, FusedInputs, FusedSums, Kernels, LlkPartial,
     LlkSums, Model, Opr, OprKernels, OpticsKernels, PositionKernels, PositionRule, PositionStep,
     ProbeSpectrum, PsiSums, Shift, ShiftProbe, ShiftSums, ShiftedNumSums, SliceSource, Solve,
     SpectrumBuf, StackTable, UpdateSums, ViewAddr, ViewDims, Views,
@@ -303,10 +304,7 @@ fn stacks(
             let chi = match own {
                 Some(planes) => LsqmlChi::Own {
                     chi: &chi,
-                    own: OwnModes {
-                        planes,
-                        positions: BATCH,
-                    },
+                    own: OwnModes::new(planes, BATCH),
                 },
                 None => LsqmlChi::Unmoved(&chi),
             };
@@ -383,10 +381,7 @@ fn forward_on_own_modes_matches_each_frame_alone() {
     let planes = own_planes(&g, &var, &probe);
     let x = inputs(&g.stream);
     let shared = up(&g.stream, probe.as_slice());
-    let own = OwnModes {
-        planes: &planes,
-        positions: BATCH,
-    };
+    let own = OwnModes::new(&planes, BATCH);
     let got = exit_waves(&g, &x, &STACKS, &[FrameProbe::Own(&shared, &own); 2]);
     let probes = frame_probes(&g, &probe, &planes);
     let alone: Vec<_> = probes.iter().map(FrameProbe::Shared).collect();
@@ -430,10 +425,7 @@ fn psi_to_obj_on_own_modes_matches_each_frame_alone() {
     let planes = own_planes(&g, &var, &probe);
     let x = inputs(&g.stream);
     let shared = up(&g.stream, probe.as_slice());
-    let own = OwnModes {
-        planes: &planes,
-        positions: BATCH,
-    };
+    let own = OwnModes::new(&planes, BATCH);
     let got = obj_sums(&g, &x.chi, &STACKS, &[FrameProbe::Own(&shared, &own); 2]);
     let probes = frame_probes(&g, &probe, &planes);
     let alone: Vec<_> = probes.iter().map(FrameProbe::Shared).collect();
@@ -639,7 +631,7 @@ fn rows_inverse(t: &[C32]) -> Vec<C64> {
 fn shifted(
     g: &Gpu,
     stacks: &[Range<u32>],
-    probes: &[(&DeviceBuffer<C32>, ProbeSpectrum<'_>)],
+    probes: &[(FrameProbe<'_>, ProbeSpectrum<'_>)],
 ) -> Vec<C32> {
     let table = StackTable::new(&g.stream, &dims(), stacks).unwrap();
     let nf_max = stacks.iter().map(|r| r.len()).max().unwrap();
@@ -653,7 +645,7 @@ fn shifted(
             views: g.order.views(),
             counts: &counts,
             obj: &obj,
-            probe,
+            probe: probe.probe(),
             model: Model {
                 shift: Some(Shift {
                     offsets: &offsets,
@@ -662,9 +654,12 @@ fn shifted(
                 ..Model::default()
             },
         };
-        (g.kernels)
-            .shifted_probe(&g.ctx, &inputs, table.at(s), &mut t)
-            .unwrap();
+        let (k, stack) = (&g.kernels, table.at(s));
+        match probe {
+            FrameProbe::Shared(_) => k.shifted_probe(&g.ctx, &inputs, stack, &mut t),
+            FrameProbe::Own(_, own) => k.shifted_probe_own(&g.ctx, &inputs, own, stack, &mut t),
+        }
+        .unwrap();
         out.extend_from_slice(&t.to_host_vec(&g.stream).unwrap()[..r.len() * NP * N]);
     }
     out
@@ -680,25 +675,29 @@ fn shifted_probe_on_own_spectra_matches_the_cpu_and_each_frame_alone() {
     let (var, probe) = variation();
     let planes = own_planes(&g, &var, &probe);
     let shared = up(&g.stream, probe.as_slice());
-    let own = OwnModes {
-        planes: &planes,
-        positions: BATCH,
-    };
+    let own = OwnModes::new(&planes, BATCH);
     let mut buf = SpectrumBuf::zeroed(&g.stream, &d).unwrap();
     let spectrum = (g.kernels)
         .probe_spectrum(&g.ctx, &d, &shared, &mut buf)
         .unwrap();
     let mut own_buf = OwnSpectrumBuf::zeroed(&g.stream, &d, NB as u32).unwrap();
-    let own_spectrum = (g.kernels)
-        .own_spectrum(&g.ctx, &d, spectrum, &own, &mut own_buf)
+    let own = (g.kernels)
+        .own_spectrum(&g.ctx, &d, &own, &mut own_buf)
         .unwrap();
-    let got = shifted(&g, &STACKS, &[(&shared, own_spectrum); 2]);
+    let got = shifted(
+        &g,
+        &STACKS,
+        &[(FrameProbe::Own(&shared, &own), spectrum); 2],
+    );
     let probes = frame_probes(&g, &probe, &planes);
     let mut bufs: Vec<_> = (probes.iter())
         .map(|_| SpectrumBuf::zeroed(&g.stream, &d).unwrap())
         .collect();
     let alone: Vec<_> = (probes.iter().zip(&mut bufs))
-        .map(|(p, b)| (p, g.kernels.probe_spectrum(&g.ctx, &d, p, b).unwrap()))
+        .map(|(p, b)| {
+            let spectrum = g.kernels.probe_spectrum(&g.ctx, &d, p, b).unwrap();
+            (FrameProbe::Shared(p), spectrum)
+        })
         .collect();
     assert_eq!(c_bits(&got), c_bits(&shifted(&g, &single(), &alone)));
     let (_, uprobe) = var.unique(&batch_views(), &probe);
@@ -707,7 +706,7 @@ fn shifted_probe_on_own_spectra_matches_the_cpu_and_each_frame_alone() {
     let err = rel(rows_inverse(&got).into_iter(), &want);
     eprintln!("W against the CPU's: {err:.3e}");
     assert!(err <= 2e-6, "W against the CPU's: {err:e}");
-    let plain = shifted(&g, &STACKS, &[(&shared, spectrum); 2]);
+    let plain = shifted(&g, &STACKS, &[(FrameProbe::Shared(&shared), spectrum); 2]);
     assert_ne!(
         c_bits(&plain),
         c_bits(&got),
@@ -896,10 +895,7 @@ fn slice_product_on_own_modes_matches_the_cpu_and_each_frame_alone() {
     let planes = own_planes(&g, &var, &probe);
     let x = inputs(&g.stream);
     let shared = up(&g.stream, probe.as_slice());
-    let own = OwnModes {
-        planes: &planes,
-        positions: BATCH,
-    };
+    let own = OwnModes::new(&planes, BATCH);
     let got = slice_products(&g, &x, &STACKS, &[SliceSource::OwnProbe(&shared, &own); 2]);
     let probes = frame_probes(&g, &probe, &planes);
     let alone: Vec<_> = probes.iter().map(SliceSource::Probe).collect();
@@ -1019,10 +1015,7 @@ fn position_step_on_own_modes_matches_the_cpu_and_each_frame_alone() {
         .map(|b| [0, 1].map(|ax| noise(N, 50 + 2 * b + ax)))
         .collect();
     let shared = up(&g.stream, probe.as_slice());
-    let own = OwnModes {
-        planes: &planes,
-        positions: BATCH,
-    };
+    let own = OwnModes::new(&planes, BATCH);
     let src = [SliceSource::OwnProbe(&shared, &own); 2];
     let got = position_offsets(&g, &x, &deriv, &STACKS, &src);
     let probes = frame_probes(&g, &probe, &planes);
@@ -1104,10 +1097,15 @@ fn llk_partials(
     counts: &DeviceBuffer<u16>,
     stacks: &[Range<u32>],
     probes: &[FrameProbe<'_>],
+    model: Model<'_>,
 ) -> Vec<LlkPartial> {
     let table = StackTable::new(&g.stream, &dims(), stacks).unwrap();
     let nf_max = table.nf_max();
-    let mut bufs = FusedBufs::new(&g.stream, &dims(), nf_max).unwrap();
+    let mut bufs = match model.shift {
+        Some(_) => FusedBufs::with_shift(&g.stream, &dims(), nf_max),
+        None => FusedBufs::new(&g.stream, &dims(), nf_max),
+    }
+    .unwrap();
     let mut llk = DeviceBuffer::<LlkPartial>::zeroed(&g.stream, nf_max as usize).unwrap();
     let mut out = Vec::new();
     for (s, (r, &probe)) in stacks.iter().zip(probes).enumerate() {
@@ -1116,7 +1114,7 @@ fn llk_partials(
             counts,
             obj: &x.obj,
             probe: probe.probe(),
-            model: Model::default(),
+            model,
         };
         let far = FarSums {
             llk: Some(&mut llk),
@@ -1135,7 +1133,8 @@ fn llk_partials(
 
 /// The LLK record's pass on each frame's own probe mode 0: [`Lsqml::llk`] of the variation,
 /// and each frame alone on its own probe; on own modes that are the shared mode 0, the shared
-/// probe's. A [`Model::shift`] beside own modes is refused.
+/// probe's. Under a [`Model::shift`], through [`Kernels::own_spectrum`]'s spectra,
+/// [`Lsqml::llk`] at [`OFFSETS`] by frame, and on the shared mode 0 the shared probe's.
 #[test]
 fn fused_llk_on_own_modes_matches_lsqml_llk_and_each_frame_alone() {
     let g = gpu();
@@ -1145,10 +1144,7 @@ fn fused_llk_on_own_modes_matches_lsqml_llk_and_each_frame_alone() {
     let shared = up(&g.stream, probe.as_slice());
     let planes = scan_planes(&g, &var, &shared);
     let all = 0..NFRAME as u32;
-    let own = OwnModes {
-        planes: &planes,
-        positions: all.clone(),
-    };
+    let own = OwnModes::new(&planes, all.clone());
     let host = counts();
     let counts = DeviceBuffer::from_host(&g.stream, host.as_slice()).unwrap();
     let stacks = [0..4, 4..NFRAME as u32];
@@ -1158,14 +1154,15 @@ fn fused_llk_on_own_modes_matches_lsqml_llk_and_each_frame_alone() {
         &counts,
         &stacks,
         &[FrameProbe::Own(&shared, &own); 2],
+        Model::default(),
     );
     let probes = frame_probes(&g, &probe, &planes);
     let alone: Vec<_> = probes.iter().map(FrameProbe::Shared).collect();
     let singles: Vec<_> = all.clone().map(|f| f..f + 1).collect();
-    let want = llk_partials(&g, &x, &counts, &singles, &alone);
+    let want = llk_partials(&g, &x, &counts, &singles, &alone, Model::default());
     assert_eq!(llk_bits(&got), llk_bits(&want), "each frame alone");
     let plain = [FrameProbe::Shared(&shared); 2];
-    let plain = llk_partials(&g, &x, &counts, &stacks, &plain);
+    let plain = llk_partials(&g, &x, &counts, &stacks, &plain, Model::default());
     assert_ne!(
         llk_bits(&plain),
         llk_bits(&got),
@@ -1173,16 +1170,14 @@ fn fused_llk_on_own_modes_matches_lsqml_llk_and_each_frame_alone() {
     );
     let mode0 = c32(probe.as_slice())[..N].repeat(NFRAME);
     let mode0 = DeviceBuffer::from_host(&g.stream, &mode0).unwrap();
-    let same = OwnModes {
-        planes: &mode0,
-        positions: all.clone(),
-    };
+    let same = OwnModes::new(&mode0, all.clone());
     let on_same = llk_partials(
         &g,
         &x,
         &counts,
         &stacks,
         &[FrameProbe::Own(&shared, &same); 2],
+        Model::default(),
     );
     assert_eq!(llk_bits(&on_same), llk_bits(&plain), "the shared probe's");
 
@@ -1193,65 +1188,86 @@ fn fused_llk_on_own_modes_matches_lsqml_llk_and_each_frame_alone() {
     for v in addr.views() {
         assert_eq!([v.oy, v.ox], corner(v.frame), "frame {}'s corner", v.frame);
     }
-    let params = LsqmlParams {
-        batch_size: NB,
-        cost: Cost::Amplitude,
-        seed: 0,
-    };
-    let object = Object::new(Stack::from_vec([NOBJ, OBJ[0], OBJ[1]], obj()).unwrap());
-    let objects = slice::from_ref(&object);
     let obs = Observed::from_counts(&host);
-    let want = Lsqml::new(params)
-        .unwrap()
-        .llk(&addr, &obs, &optics(), objects, &probe, &var);
-    let sums = LlkSums::from_partials(&got);
-    let nb_obs = host.nb_obs() as f64;
-    for (what, got, want) in [
-        ("poisson", sums.poisson / nb_obs, want.poisson),
-        ("gaussian", sums.gaussian / nb_obs, want.gaussian),
-        ("euclidean", sums.euclidean / nb_obs, want.euclidian),
-        ("icalc", sums.icalc, want.nb_photons_calc),
-    ] {
-        let err = (got - want).abs() / want.abs();
-        eprintln!("{what} against Lsqml::llk: {err:.3e}");
-        assert!(
-            err <= 1e-5,
-            "{what} {got} against Lsqml::llk's {want}: {err:e}"
-        );
-    }
+    let lsqml_llk = |features: Features| {
+        let params = LsqmlParams {
+            batch_size: NB,
+            cost: Cost::Amplitude,
+            seed: 0,
+        };
+        let object = Object::new(Stack::from_vec([NOBJ, OBJ[0], OBJ[1]], obj()).unwrap());
+        (Lsqml::new(params).unwrap().with_sampling(Sampling::Patch))
+            .with_features(features)
+            .unwrap()
+            .llk(
+                &addr,
+                &obs,
+                &optics(),
+                slice::from_ref(&object),
+                &probe,
+                &var,
+            )
+    };
+    let against = |got: &[LlkPartial], want: Llk, what: &str| {
+        let sums = LlkSums::from_partials(got);
+        let nb_obs = host.nb_obs() as f64;
+        for (term, got, want) in [
+            ("poisson", sums.poisson / nb_obs, want.poisson),
+            ("gaussian", sums.gaussian / nb_obs, want.gaussian),
+            ("euclidean", sums.euclidean / nb_obs, want.euclidian),
+            ("icalc", sums.icalc, want.nb_photons_calc),
+        ] {
+            let err = (got - want).abs() / want.abs();
+            eprintln!("{what}{term} against Lsqml::llk: {err:.3e}");
+            assert!(
+                err <= 1e-5,
+                "{what}{term} {got} against Lsqml::llk's {want}: {err:e}"
+            );
+        }
+    };
+    against(&got, lsqml_llk(Features::default()), "");
 
     let mut buf = SpectrumBuf::zeroed(&g.stream, &d).unwrap();
     let spectrum = (g.kernels)
         .probe_spectrum(&g.ctx, &d, &shared, &mut buf)
         .unwrap();
-    let mut own_buf = OwnSpectrumBuf::zeroed(&g.stream, &d, NFRAME as u32).unwrap();
-    let spectrum = (g.kernels)
-        .own_spectrum(&g.ctx, &d, spectrum, &own, &mut own_buf)
-        .unwrap();
     let offsets = DeviceBuffer::from_host(&g.stream, OFFSETS.as_flattened()).unwrap();
-    let inputs = FusedInputs {
-        views: &g.views,
-        counts: &counts,
-        obj: &x.obj,
-        probe: &shared,
-        model: Model {
-            shift: Some(Shift {
-                offsets: &offsets,
-                spectrum,
-            }),
-            ..Model::default()
-        },
+    let model = Model {
+        shift: Some(Shift {
+            offsets: &offsets,
+            spectrum,
+        }),
+        ..Model::default()
     };
-    let table = StackTable::new(&g.stream, &d, &stacks).unwrap();
-    let mut bufs = FusedBufs::with_shift(&g.stream, &d, table.nf_max()).unwrap();
-    let mut llk = DeviceBuffer::<LlkPartial>::zeroed(&g.stream, table.nf_max() as usize).unwrap();
-    let far = FarSums {
-        llk: Some(&mut llk),
-        ..FarSums::default()
+    let spectra = |own: &OwnModes<'_>| {
+        let mut buf = OwnSpectrumBuf::zeroed(&g.stream, &d, NFRAME as u32).unwrap();
+        let own = g.kernels.own_spectrum(&g.ctx, &d, own, &mut buf).unwrap();
+        llk_partials(
+            &g,
+            &x,
+            &counts,
+            &stacks,
+            &[FrameProbe::Own(&shared, &own); 2],
+            model,
+        )
     };
-    let r = (g.kernels).fused_llk_own(&g.ctx, &inputs, &own, table.at(0), &mut bufs, far);
-    assert!(
-        matches!(&r, Err(Error::Shape(m)) if m.contains("Model::shift")),
-        "own modes beside a shift: {r:?}"
+    let got = spectra(&own);
+    let plain = [FrameProbe::Shared(&shared); 2];
+    let plain = llk_partials(&g, &x, &counts, &stacks, &plain, model);
+    assert_ne!(
+        llk_bits(&plain),
+        llk_bits(&got),
+        "the own modes left the shifted LLK"
     );
+    assert_eq!(
+        llk_bits(&spectra(&same)),
+        llk_bits(&plain),
+        "the shared probe's, shifted"
+    );
+    let by_frame = OFFSETS.map(|o| o.map(f64::from)).to_vec();
+    let features = Features {
+        position: Some(Feature::refined(by_frame)),
+        ..Features::default()
+    };
+    against(&got, lsqml_llk(features), "shifted ");
 }

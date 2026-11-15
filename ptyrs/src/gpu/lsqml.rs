@@ -702,7 +702,7 @@ impl LsqmlKernels {
         reads.extend(at.x.into_iter().chain(at.d).map(|b| b.storage()));
         let probe = match &chi {
             LsqmlChi::Own { own, .. } => {
-                reads.push(own.planes.storage());
+                reads.push(own.planes().storage());
                 own.src(at.x[1], d.n())?
             }
             _ => shared_src(at.x[1]),

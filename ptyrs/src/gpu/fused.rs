@@ -27,8 +27,7 @@ use ptyrs_kernels::fused::{
     FUSED_GRAD, FUSED_ITERATE, FUSED_LLK, FUSED_MODEL_TERMS, FUSED_PROJECT, FUSED_RAAR,
     FUSED_ROW_THREADS, FUSED_SCALE, FUSED_SCALE_SUMS, FUSED_SHIFT_DEN, FUSED_SHIFT_OBJ,
     FUSED_SHIFT_POSITION, FUSED_SHIFT_PROBE, FUSED_SHIFT_STEP, FUSED_STEP_CHUNKS, FUSED_TO_PSI,
-    FusedCfg, FusedPtrs, ProbeSrc, col_slot_bytes, fused_col_threads, shared_probe,
-    shift_stage_bytes,
+    FusedCfg, FusedPtrs, col_slot_bytes, fused_col_threads, shared_probe, shift_stage_bytes,
 };
 use ptyrs_kernels::pixel::{PIXEL_THREADS, PsiPtr, SumPtrs, psi_f32};
 use ptyrs_kernels::position::BatchSpan;
@@ -368,8 +367,7 @@ pub struct Model<'a> {
 pub struct Shift<'a> {
     /// `(dy, dx)` per frame, `[nframe, 2]`.
     pub offsets: &'a DeviceBuffer<f32>,
-    /// The spectra of [`FusedInputs::probe`], mode 0 each frame's own from
-    /// [`Kernels::own_spectrum`].
+    /// The spectra of [`FusedInputs::probe`].
     pub spectrum: ProbeSpectrum<'a>,
 }
 
@@ -407,46 +405,40 @@ impl OwnSpectrumBuf {
 #[derive(Clone, Copy)]
 pub struct ProbeSpectrum<'a> {
     a: &'a DeviceBuffer<C32>,
-    /// Each frame's own mode-0 spectrum, read in place of `a`'s mode 0.
-    own: Option<OwnSpectra<'a>>,
     probe: &'a DeviceBuffer<C32>,
     /// `[ny, nx, nprobe, quad_phase bits]`.
     key: [u32; 4],
 }
 
-/// Mode-0 spectra `[nb, ny, nx]`, plane `b` that of the frame at epoch position `p0 + b`.
+/// The mode-0 spectra of [`OwnModes`]' planes, `[nb, ny, nx]`, FFT order, from
+/// [`Kernels::own_spectrum`] for the frame geometry `key` names.
 #[derive(Clone, Copy)]
-struct OwnSpectra<'a> {
-    planes: &'a DeviceBuffer<C32>,
-    p0: u32,
-    nb: u32,
+pub(super) struct OwnSpectra<'a> {
+    a: &'a DeviceBuffer<C32>,
+    /// `[ny, nx, quad_phase bits]`.
+    key: [u32; 3],
+}
+
+impl<'a> OwnSpectra<'a> {
+    /// The spectra, refused for any frame geometry but the one they were computed for.
+    pub(super) fn of(&self, d: &ViewDims) -> Result<&'a DeviceBuffer<C32>, Error> {
+        if self.key != Self::key(d) {
+            return Err(Error::Shape(
+                "the own probe spectra are not of this frame geometry".into(),
+            ));
+        }
+        Ok(self.a)
+    }
+
+    fn key(d: &ViewDims) -> [u32; 3] {
+        [d.frame[0], d.frame[1], d.quad_phase.to_bits()]
+    }
 }
 
 impl<'a> ProbeSpectrum<'a> {
-    /// The spectra `A_p` of the shared probe, `[nprobe, ny, nx]`, FFT order: mode 0 is no
-    /// frame's under [`Kernels::own_spectrum`]'s own modes.
+    /// The spectra `A_p` of the shared probe, `[nprobe, ny, nx]`, FFT order.
     pub(crate) fn spectra(&self) -> &'a DeviceBuffer<C32> {
         self.a
-    }
-
-    /// The spectra as `shift_pre` reads them.
-    fn src(&self) -> ProbeSrc {
-        let a = dptr::<C32, f32>(self.a).cast_const();
-        match self.own {
-            None => shared_probe(a),
-            Some(own) => ProbeSrc {
-                probe: a,
-                mode0: dptr::<C32, f32>(own.planes).cast_const(),
-                p0: own.p0,
-                nb: own.nb,
-            },
-        }
-    }
-
-    /// The buffers [`Self::src`] addresses.
-    fn storages(&self) -> impl Iterator<Item = &'a RawDeviceBuffer> {
-        let own = self.own.map(|o| o.planes.storage());
-        std::iter::once(self.a.storage()).chain(own)
     }
 
     fn key(d: &ViewDims) -> [u32; 4] {
@@ -1063,7 +1055,7 @@ impl Kernels {
             Some(sh) => {
                 let slopes = FUSED_SHIFT_DEN | FUSED_SHIFT_POSITION;
                 let t_dy = (shift_flags & slopes != 0).then_some(&sh.scratch.adj);
-                run.shift_pre(&sh.model, &sh.model.spectrum, &sh.scratch.t, t_dy, p)?;
+                run.shift_pre(&sh.model, &sh.model.spectrum, None, &sh.scratch.t, t_dy, p)?;
                 run.shift_rows_fwd(&sh.scratch.t, &bufs.work, carried, p, fwd)?;
             }
             None => {
@@ -1172,7 +1164,7 @@ impl Kernels {
             alpha: 0.0,
             beta: 0.0,
         };
-        run.shift_pre(&sh.model, &sh.model.spectrum, &sh.scratch.t, None, p)?;
+        run.shift_pre(&sh.model, &sh.model.spectrum, None, &sh.scratch.t, None, p)?;
         run.shift_sums(sh, psi, p, cfg)?;
         if let Some(sums) = probe {
             run.shift_post(sh, p)?;
@@ -1210,7 +1202,7 @@ impl Kernels {
         )?;
         let p = FusedPtrs {
             work: dptr(work),
-            ..run.shifted_probe(t)?
+            ..run.shifted_probe(None, t)?
         };
         run.shift_rows_fwd(t, work, Carried::default(), p, FusedCfg::default())
     }
@@ -1225,7 +1217,22 @@ impl Kernels {
         t: &mut DeviceBuffer<C32>,
     ) -> Result<(), Error> {
         Run::checked(self, ctx, *inputs, stack)?
-            .shifted_probe(t)
+            .shifted_probe(None, t)
+            .map(drop)
+    }
+
+    /// [`Self::shifted_probe`] with each frame's mode 0 its plane of `own`, read through its
+    /// spectra from [`Self::own_spectrum`].
+    pub fn shifted_probe_own(
+        &self,
+        ctx: &ExecutionContext,
+        inputs: &FusedInputs<'_>,
+        own: &OwnModes<'_>,
+        stack: StackRef<'_>,
+        t: &mut DeviceBuffer<C32>,
+    ) -> Result<(), Error> {
+        Run::checked(self, ctx, *inputs, stack)?
+            .shifted_probe(Some(own), t)
             .map(drop)
     }
 
@@ -1246,8 +1253,8 @@ impl Kernels {
     }
 
     /// [`Self::fused_llk`] with each frame's mode 0 its plane of `own` (the LLK of the probe
-    /// variation's model). Refuses a [`Model::shift`], whose spectrum is then the frames'
-    /// only probe source: [`Self::own_spectrum`] gives it their own modes.
+    /// variation's model); under a [`Model::shift`], read through the spectra of `own` from
+    /// [`Self::own_spectrum`].
     pub fn fused_llk_own(
         &self,
         ctx: &ExecutionContext,
@@ -1274,13 +1281,8 @@ impl Kernels {
         run.check_far(&far)?;
         let p = run.ptrs(bufs, &far);
         match (&shift, own) {
-            (Some(_), Some(_)) => {
-                return Err(Error::Shape(
-                    "own probe modes under a Model::shift: its spectrum carries them".into(),
-                ));
-            }
-            (Some(sh), None) => {
-                run.shift_pre(&sh.model, &sh.model.spectrum, &sh.scratch.t, None, p)?;
+            (Some(sh), own) => {
+                run.shift_pre(&sh.model, &sh.model.spectrum, own, &sh.scratch.t, None, p)?;
                 run.shift_rows_fwd(
                     &sh.scratch.t,
                     &bufs.work,
@@ -1408,41 +1410,29 @@ impl Kernels {
         self.spectrum_of(ctx, dims, probe, &buf.0, dims.nprobe)?;
         Ok(ProbeSpectrum {
             a: &buf.0,
-            own: None,
             probe,
             key: ProbeSpectrum::key(dims),
         })
     }
 
-    /// `spectrum` with each frame's own mode 0 of `own`, whose probe it is the spectra of: the
-    /// spectra of `own`'s planes into `buf`, which the shifted passes read for mode 0 of the
-    /// frame at each of `own`'s epoch positions, in place of any own modes `spectrum` had.
-    /// Two launches.
+    /// `own` with the spectra of its planes for frames of `dims` into `buf`, which the shifted
+    /// passes given `own` read for mode 0 of the frame at each of its epoch positions. Two
+    /// launches.
     pub fn own_spectrum<'a>(
         &self,
         ctx: &ExecutionContext,
         dims: &ViewDims,
-        spectrum: ProbeSpectrum<'a>,
-        own: &OwnModes<'_>,
+        own: &OwnModes<'a>,
         buf: &'a mut OwnSpectrumBuf,
-    ) -> Result<ProbeSpectrum<'a>, Error> {
-        if spectrum.key != ProbeSpectrum::key(dims) {
-            return Err(Error::Shape(
-                "the probe spectrum is not of this frame geometry".into(),
-            ));
-        }
+    ) -> Result<OwnModes<'a>, Error> {
         let n = dims.n();
-        let src = own.src(spectrum.probe, n)?;
-        check_len("own spectra", &buf.0, src.nb as usize * n)?;
-        self.spectrum_of(ctx, dims, own.planes, &buf.0, src.nb)?;
-        Ok(ProbeSpectrum {
-            own: Some(OwnSpectra {
-                planes: &buf.0,
-                p0: src.p0,
-                nb: src.nb,
-            }),
-            ..spectrum
-        })
+        let nb = own.nb(n)?;
+        check_len("own spectra", &buf.0, nb as usize * n)?;
+        self.spectrum_of(ctx, dims, own.planes(), &buf.0, nb)?;
+        Ok(own.with_spectra(OwnSpectra {
+            a: &buf.0,
+            key: OwnSpectra::key(dims),
+        }))
     }
 
     /// `a = DFT(probe q) / n` of `nplane` planes `[ny, nx]`, checked by the callers: the
@@ -1634,7 +1624,6 @@ impl Kernels {
         self.spectrum_of(ctx, dims, num, &step.step, dims.nprobe)?;
         let dir = ProbeSpectrum {
             a: &step.step,
-            own: None,
             probe: num,
             key: ProbeSpectrum::key(dims),
         };
@@ -1733,7 +1722,7 @@ impl Kernels {
             return Err(Error::Shape("probe_step needs a Model::shift".into()));
         };
         let p = run.ptrs(bufs, &FarSums::default());
-        run.shift_pre(&sh.model, dir, &sh.scratch.t, None, p)?;
+        run.shift_pre(&sh.model, dir, None, &sh.scratch.t, None, p)?;
         run.shift_norm(sh, p, norm)
     }
 
@@ -2064,9 +2053,13 @@ impl<'a> Run<'a> {
         })
     }
 
-    /// `T` of the stack's frames into `t` from the inputs' [`Model::shift`], and the
-    /// addresses of the launch, `t` at `shift`.
-    fn shifted_probe(&self, t: &DeviceBuffer<C32>) -> Result<FusedPtrs, Error> {
+    /// `T` of the stack's frames into `t` from the inputs' [`Model::shift`], each frame's mode
+    /// 0 its plane of `own`, and the addresses of the launch, `t` at `shift`.
+    fn shifted_probe(
+        &self,
+        own: Option<&OwnModes<'_>>,
+        t: &DeviceBuffer<C32>,
+    ) -> Result<FusedPtrs, Error> {
         let Some(model) = self.inputs.model.shift else {
             return Err(Error::Shape(
                 "the shifted probe needs a Model::shift".into(),
@@ -2078,7 +2071,7 @@ impl<'a> Run<'a> {
             shift: dptr(t),
             ..self.input_ptrs()
         };
-        self.shift_pre(&model, &model.spectrum, t, None, p)?;
+        self.shift_pre(&model, &model.spectrum, own, t, None, p)?;
         Ok(p)
     }
 
@@ -2297,22 +2290,32 @@ impl<'a> Run<'a> {
     }
 
     /// `T` of the stack's frames into `t`, at `p.shift`, and with `t_dy` `T_y` into it, at
-    /// `p.shift_adj`, from `spectrum` at `model`'s offsets.
+    /// `p.shift_adj`, from `spectrum` at `model`'s offsets, each frame's mode 0 its spectrum
+    /// of `own`.
     fn shift_pre(
         &self,
         model: &Shift<'_>,
         spectrum: &ProbeSpectrum<'_>,
+        own: Option<&OwnModes<'_>>,
         t: &DeviceBuffer<C32>,
         t_dy: Option<&DeviceBuffer<C32>>,
         p: FusedPtrs,
     ) -> Result<(), Error> {
         let config = self.sh.shift_cols(self.g.nprobe, self.g.nf_max)?;
-        let p = FusedPtrs {
-            spectrum: spectrum.src(),
-            ..p
+        let a = spectrum.spectra();
+        let (src, spectra) = match own {
+            None => (
+                shared_probe(dptr::<C32, f32>(a).cast_const()),
+                vec![a.storage()],
+            ),
+            Some(own) => {
+                let (src, s) = own.spectrum_src(a, self.inputs.views.dims())?;
+                (src, s.to_vec())
+            }
         };
+        let p = FusedPtrs { spectrum: src, ..p };
         let mut reads = vec![model.offsets.storage(), self.stack.storage()];
-        reads.extend(spectrum.storages());
+        reads.extend(spectra);
         let mut writes = vec![t.storage()];
         writes.extend(t_dy.map(|b| b.storage()));
         let flags = match t_dy {
