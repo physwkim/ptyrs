@@ -33,6 +33,9 @@ pub fn norm_relu<const D: usize>(n: &BatchNorm, x: Tensor<D>) -> Tensor<D> {
     let x = x.reshape([dims.iter().product::<usize>() / cols, cols]);
     let device = x.device();
     let y = if device.is_autodiff() && n.training.is_enabled() {
+        // burn's batch_norm_train checks; the kernels read γ and β at every channel.
+        assert_eq!(n.gamma.dims(), [cols], "invalid batch norm gamma shape");
+        assert_eq!(n.beta.dims(), [cols], "invalid batch norm beta shape");
         let (y, mean, var) = <Dispatch as NormReluOps>::norm_relu(
             x.into_dispatch(),
             n.gamma.val().into_dispatch(),
@@ -749,6 +752,25 @@ mod tests {
             let x = x.slice_assign([5..6, 3..4], nan.reshape([1, 1]));
             compare(&p, &x, &w, tol);
         }
+    }
+
+    /// A γ or β of another width than `x`'s channels is refused as burn refuses it, before the
+    /// kernels read past it and the running statistics take `x`'s width.
+    #[test]
+    #[should_panic(expected = "invalid batch norm gamma shape")]
+    fn refuses_a_gamma_of_another_width() {
+        let device = crate::nn::cuda(0).autodiff();
+        let n = BatchNormConfig::new(1).init(&device);
+        norm_relu(&n, Tensor::<2>::ones([8, 16], &device));
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid batch norm beta shape")]
+    fn refuses_a_beta_of_another_width() {
+        let device = crate::nn::cuda(0).autodiff();
+        let mut n = BatchNormConfig::new(16).init(&device);
+        n.beta = Param::from_tensor(Tensor::<1>::zeros([1], &device));
+        norm_relu(&n, Tensor::<2>::ones([8, 16], &device));
     }
 
     #[test]
