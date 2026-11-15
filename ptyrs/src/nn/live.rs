@@ -32,11 +32,13 @@ pub struct LivePredictor {
 }
 
 impl LivePredictor {
-    /// Tunes and warms the network on `batch` frames before it returns, which takes seconds.
+    /// Tunes and warms the network on `batch` frames before it returns, which takes seconds;
+    /// fails unless one network call holds them.
     pub fn new(predictor: Predictor, norm: f64, batch: usize) -> Result<Self, NnError> {
         if batch == 0 {
             return Err(NnError::Invalid("batch of 0 frames".into()));
         }
+        predictor.check_call(batch)?;
         let config = predictor.config();
         let scale = InputScale::new(config.frame, config.input, config.bin, norm)?;
         let pool = rayon::ThreadPoolBuilder::new()
@@ -126,7 +128,17 @@ impl PatchPredictor for LivePredictor {
 mod tests {
     use super::*;
     use crate::base::{Counts, MASKED};
+    use crate::nn::predictor::tests::{untrained, wide_frames};
     use crate::nn::predictor::{Input, diffraction_input};
+
+    /// A batch past the frames one network call holds is refused before its input is made; it
+    /// ran in one call that failed past cubecl's buffer or the kernels' 2³² elements.
+    #[test]
+    fn a_batch_past_one_call_is_refused() {
+        let predictor = untrained(&wide_frames(), &crate::nn::cuda(0));
+        let got = LivePredictor::new(predictor, 1e6, 512);
+        assert!(matches!(got, Err(NnError::Invalid(_))));
+    }
 
     #[test]
     fn par_input_is_diffraction_input() {

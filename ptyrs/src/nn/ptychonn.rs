@@ -163,6 +163,44 @@ impl PtychoNN {
         }
     }
 
+    /// The [`Activations`] of one frame through a network of [`new`](Self::new)'s `channels`,
+    /// `width` and `depth` on a `[py, px]` image, each side a multiple of `2^depth`.
+    pub(crate) fn activations(
+        channels: usize,
+        width: usize,
+        depth: usize,
+        [py, px]: [usize; 2],
+    ) -> Activations {
+        let mut act = Activations {
+            largest: 0,
+            total: 0,
+        };
+        // `tensors` of `channels` over the image halved `k` times.
+        let mut add = |tensors: u128, channels: usize, k: usize| {
+            let elements = channels as u128 * ((py >> k) * (px >> k)) as u128;
+            act.largest = act.largest.max(elements);
+            act.total += tensors * elements;
+        };
+        // The input, then its standardisation's difference and product.
+        add(3, channels, 0);
+        for k in 0..depth {
+            // Two convolutions, each normalised or rectified.
+            add(4, width << k, k);
+            // The pool's output and its indices, as wide as two floats.
+            add(3, width << k, k + 1);
+        }
+        let top = width << (depth - 1);
+        for _ in 0..2 {
+            for k in 0..depth {
+                add(4, (top >> k) / 2, depth - k);
+                add(1, (top >> k) / 2, depth - k - 1);
+            }
+            // The output convolution and its range map's two steps.
+            add(3, 1, 0);
+        }
+        act
+    }
+
     /// The image side must be a multiple of this.
     pub fn granule(&self) -> usize {
         1 << self.encoder.len()
@@ -185,6 +223,14 @@ impl PtychoNN {
             phase: self.phase.fold(),
         }
     }
+}
+
+/// Elements of one frame's tensors in [`PtychoNN::forward`], the input's and its
+/// standardisation's included: the largest tensor, and all of them as though none were freed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Activations {
+    pub(crate) largest: u128,
+    pub(crate) total: u128,
 }
 
 /// [`PtychoNN`] at inference, each batch normalisation folded into the convolution before it.
@@ -243,6 +289,22 @@ mod tests {
 
     fn h<const D: usize>(t: Tensor<D>) -> Vec<f64> {
         host(t).unwrap().into_iter().map(f64::from).collect()
+    }
+
+    /// Every tensor of a two-stage network on an 8² image of one channel, counted by hand.
+    #[test]
+    fn activations_count_every_tensor() {
+        let act = PtychoNN::activations(1, 4, 2, [8, 8]);
+        // Input 3 · 64; encoder 4 · 4 · 64 + 3 · 4 · 16 and 4 · 8 · 16 + 3 · 8 · 4; each
+        // decoder 4 · 4 · 4 + 4 · 16, 4 · 2 · 16 + 2 · 64 and 3 · 64.
+        let total = 192 + (1024 + 192) + (512 + 96) + 2 * (64 + 64 + 128 + 128 + 192);
+        assert_eq!(
+            act,
+            Activations {
+                largest: 4 * 64,
+                total
+            }
+        );
     }
 
     #[test]

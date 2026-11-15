@@ -21,12 +21,13 @@ use crate::base::{AddrTable, C64, Counts, Object, Stack};
 use burn::module::{Module, Param};
 use burn::optim::{AdamConfig, GradientsParams, ModuleOptimizer};
 use burn::prelude::*;
+use burn_cubecl::Cube;
 use rand::SeedableRng;
 use rand::seq::SliceRandom;
 use rand_chacha::ChaCha8Rng;
 
 use crate::nn::grid::fits;
-use crate::nn::ptychonn::{Folded, PtychoNN};
+use crate::nn::ptychonn::{Activations, Folded, PtychoNN};
 use crate::nn::{NnError, burn_err};
 
 /// The images [`diffraction_input`] makes of each frame.
@@ -95,16 +96,31 @@ impl PredictorConfig {
                 "frame {frame:?} is not a positive multiple of bin {bin} × 2^depth {depth}"
             ));
         }
-        // The widest activation, the first stage's, over one frame; `width` bounds the input's
-        // images.
-        let [py, px] = self.patch();
-        if !fits(&[width, py, px]) {
+        if self.activations().largest > u128::from(u32::MAX) {
             return invalid(format!(
                 "width {width} over patch {:?} makes an activation of 2³² elements or more",
-                [py, px]
+                self.patch()
             ));
         }
         Ok(())
+    }
+
+    fn activations(&self) -> Activations {
+        PtychoNN::activations(self.input.images(), self.width, self.depth, self.patch())
+    }
+
+    /// Frames one `pass` on `device` holds: each tensor under 2³² elements, the nn kernels'
+    /// bound, and within one of cubecl's buffers, and all the pass's tensors within half the
+    /// device's memory. Fails unless the config passes its check and one frame fits.
+    fn frames_per_call(&self, device: &Device, pass: Pass) -> Result<usize, NnError> {
+        self.check()?;
+        let (buffer, memory) = capacity(device)?;
+        match most_frames(self.activations(), pass, buffer, memory) {
+            0 => Err(NnError::Invalid(format!(
+                "one frame of {self:?} does not fit a device of {memory} bytes"
+            ))),
+            frames => Ok(frames),
+        }
     }
 
     fn geometry(&self) -> InputGeometry {
@@ -832,7 +848,8 @@ fn l1(a: Tensor<4>, p: Tensor<4>, amp: Tensor<4>, phase: Tensor<4>) -> Tensor<1>
 /// Trains a fresh network of `config` with Adam on L1 loss, reporting each epoch to `log`, or
 /// resumes the run in `options.checkpoint`. `options.seed` seeds the device's generator for the
 /// initial weights and the shuffle of each epoch. `device` is a plain device; autodiff is enabled
-/// on it here. `train` and `valid` must be samples of `config`'s input and patch.
+/// on it here. `train` and `valid` must be samples of `config`'s input and patch, and one
+/// training step on `device` must hold a batch, or every sample when there are fewer.
 pub fn train(
     config: &PredictorConfig,
     options: &TrainOptions,
@@ -847,6 +864,14 @@ pub fn train(
     train.check_config(config)?;
     if let Some(v) = valid {
         v.check_config(config)?;
+    }
+    let frames = config.frames_per_call(device, Pass::Train)?;
+    let batch = options.batch.min(train.len());
+    if batch > frames {
+        return Err(NnError::Invalid(format!(
+            "a batch of {batch} frames past the {frames} one training step holds: a split batch \
+             would change its batch-norm statistics"
+        )));
     }
     let ad = device.clone().autodiff();
     ad.seed(options.seed);
@@ -864,12 +889,8 @@ pub fn train(
     if let Some(dir) = &options.checkpoint {
         (start, model, optim) = checkpoint.resume(dir, model, optim)?;
     }
-    let dims = train.target.dims;
-    let x = tensor(&train.input, train.kind().images(), dims, &ad);
-    let amp = tensor(&train.target.amp, 1, dims, &ad);
-    let phase = tensor(&train.target.phase, 1, dims, &ad);
     let mut rng = ChaCha8Rng::seed_from_u64(options.seed);
-    let mut order: Vec<i64> = (0..dims[0] as i64).collect();
+    let mut order: Vec<usize> = (0..train.len()).collect();
     // Each epoch shuffles the previous order: replay the finished ones.
     for _ in 0..start {
         order.shuffle(&mut rng);
@@ -878,23 +899,24 @@ pub fn train(
         order.shuffle(&mut rng);
         let mut sum = Tensor::<1>::zeros([1], &device.clone().inner());
         for batch in order.chunks(options.batch) {
-            let idx =
-                Tensor::<1, Int>::from_data(TensorData::new(batch.to_vec(), [batch.len()]), &ad);
-            let (a, p) = model.forward(x.clone().select(0, idx.clone()));
+            // Uploaded batch by batch: a tensor of every sample would escape the batch's bound.
+            let picked = train.select(batch);
+            let dims = picked.target.dims;
+            let (a, p) = model.forward(tensor(&picked.input, train.kind().images(), dims, &ad));
             let loss = l1(
                 a,
                 p,
-                amp.clone().select(0, idx.clone()),
-                phase.clone().select(0, idx),
+                tensor(&picked.target.amp, 1, dims, &ad),
+                tensor(&picked.target.phase, 1, dims, &ad),
             );
             sum = sum + loss.clone().detach().inner() * batch.len() as f64;
             let grads = GradientsParams::from_grads(loss.backward(), &model);
             model = optim.step(options.lr, model, grads);
         }
         let train_loss =
-            f64::from(sum.try_into_scalar::<f32>().map_err(burn_err)?) / dims[0] as f64;
+            f64::from(sum.try_into_scalar::<f32>().map_err(burn_err)?) / train.len() as f64;
         let valid_loss = valid
-            .map(|v| Predictor::new(config.clone(), model.valid()).loss(v))
+            .map(|v| Predictor::new(config.clone(), model.valid())?.loss(v))
             .transpose()?;
         if let Some(dir) = &options.checkpoint {
             checkpoint.epochs = epoch + 1;
@@ -906,7 +928,45 @@ pub fn train(
             valid: valid_loss,
         });
     }
-    Ok(Predictor::new(config.clone(), model.valid()))
+    Predictor::new(config.clone(), model.valid())
+}
+
+/// What one network call runs.
+#[derive(Clone, Copy, Debug)]
+enum Pass {
+    /// The folded network's forward pass.
+    Predict,
+    /// A training step, whose forward pass keeps every tensor for the backward pass, which
+    /// gives each a gradient.
+    Train,
+}
+
+/// Bytes on `device` of cubecl's largest buffer and of the device's memory.
+fn capacity(device: &Device) -> Result<(u64, u64), NnError> {
+    let probe = Tensor::<1>::empty([1], device)
+        .inner()
+        .try_into_primitive::<Cube>()
+        .map_err(burn_err)?;
+    let memory = &probe.client.properties().memory;
+    let total = memory
+        .max_memory()
+        .ok_or_else(|| NnError::Invalid("a device that states no memory".into()))?;
+    Ok((memory.max_page_size, total))
+}
+
+/// Frames of `act` one `pass` holds with each tensor under 2³² elements and `buffer` bytes, and
+/// all of them within half of `memory` bytes: the other half holds the weights, Adam's moments,
+/// the memory pool's slack and whatever else shares the device.
+fn most_frames(act: Activations, pass: Pass, buffer: u64, memory: u64) -> usize {
+    let copies = match pass {
+        Pass::Predict => 1,
+        Pass::Train => 2,
+    };
+    let bytes = size_of::<f32>() as u128;
+    let frames = (u128::from(u32::MAX) / act.largest)
+        .min(u128::from(buffer) / (bytes * act.largest))
+        .min(u128::from(memory) / 2 / (copies * bytes * act.total));
+    usize::try_from(frames).unwrap_or(usize::MAX)
 }
 
 /// Frames in, object patches out.
@@ -917,15 +977,20 @@ pub struct Predictor {
     model: Model,
     /// What predicts: `model`'s network folded.
     net: Folded,
+    /// Frames one network call holds, [`Pass::Predict`]'s on the model's device.
+    frames: usize,
 }
 
-/// Frames per network call.
-const CHUNK: usize = 512;
-
 impl Predictor {
-    fn new(config: PredictorConfig, model: Model) -> Self {
+    fn new(config: PredictorConfig, model: Model) -> Result<Self, NnError> {
+        let frames = config.frames_per_call(&model.devices()[0], Pass::Predict)?;
         let net = model.net.fold();
-        Self { config, model, net }
+        Ok(Self {
+            config,
+            model,
+            net,
+            frames,
+        })
     }
 
     pub fn config(&self) -> &PredictorConfig {
@@ -961,7 +1026,7 @@ impl Predictor {
         let input = frames_input(frames, frame, config.input, config.bin, norm)?;
         let plane = config.patch().iter().product::<usize>();
         let mut out = Patches::empty(config.patch());
-        for chunk in input.chunks(CHUNK * config.input.images() * plane) {
+        for chunk in input.chunks(self.frames * config.input.images() * plane) {
             out.append(self.network(chunk)?);
         }
         Ok(out)
@@ -979,11 +1044,24 @@ impl Predictor {
         Ok(())
     }
 
-    /// The patches of `input`, whole frames of [`diffraction_input`], in one network call.
+    /// Fails unless one network call holds `n` frames.
+    pub(crate) fn check_call(&self, n: usize) -> Result<(), NnError> {
+        if n > self.frames {
+            return Err(NnError::Invalid(format!(
+                "{n} frames past the {} one network call holds",
+                self.frames
+            )));
+        }
+        Ok(())
+    }
+
+    /// The patches of `input`, whole frames of [`diffraction_input`], in one network call, which
+    /// must hold them ([`check_call`](Self::check_call)).
     pub(crate) fn network(&self, input: &[f32]) -> Result<Patches, NnError> {
         let [py, px] = self.config.patch();
         let images = self.config.input.images();
         let n = input.len() / (images * py * px);
+        self.check_call(n)?;
         let (a, p) = self.forward(tensor(input, images, [n, py, px], &self.device()));
         Patches::new([n, py, px], host(a)?, host(p)?)
     }
@@ -1007,8 +1085,8 @@ impl Predictor {
         let plane = py * px;
         let images = samples.kind().images();
         let mut sum = 0.0;
-        for start in (0..n).step_by(CHUNK) {
-            let m = CHUNK.min(n - start);
+        for start in (0..n).step_by(self.frames) {
+            let m = self.frames.min(n - start);
             let r = start * plane..(start + m) * plane;
             let dims = [m, py, px];
             let (a, p) = self.forward(tensor(
@@ -1056,14 +1134,117 @@ impl Predictor {
         )?
         .try_load_file(weights)
         .map_err(burn_err)?;
-        Ok(Self::new(config, model))
+        Self::new(config, model)
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::base::{MASKED, Positions};
+
+    /// A predictor of `config` at its initial weights, standardising nothing.
+    pub(crate) fn untrained(config: &PredictorConfig, device: &Device) -> Predictor {
+        let [py, px] = config.patch();
+        let images = config.input.images();
+        let model = Model::new(
+            config,
+            vec![0.0; images * py * px],
+            vec![1.0; images],
+            device,
+        );
+        Predictor::new(config.clone(), model.unwrap()).unwrap()
+    }
+
+    /// py's probe: a 1024² detector at bin 2 with the default width and depth.
+    pub(crate) fn wide_frames() -> PredictorConfig {
+        PredictorConfig::new([1024, 1024], 2)
+    }
+
+    /// Frames per call stop at the first of the 2³² element, buffer and memory bounds, and a
+    /// training step's at half the memory's.
+    #[test]
+    fn frames_per_call_stop_at_the_tightest_bound() {
+        let act = |largest, total| Activations { largest, total };
+        let ample = u64::MAX;
+        // py's widest activation: width 32 over a 512² patch, 2²³ elements a frame.
+        let wide = act(1 << 23, 1 << 23);
+        // 511 · 2²³ elements are below 2³², 512 · 2²³ not.
+        assert_eq!(most_frames(wide, Pass::Predict, ample, ample), 511);
+        // 8190 MiB holds 255 frames of 32 MiB, 8192 MiB 256.
+        assert_eq!(most_frames(wide, Pass::Predict, 8190 << 20, ample), 255);
+        assert_eq!(most_frames(wide, Pass::Predict, 8192 << 20, ample), 256);
+        // Half of 32 GiB holds 512 frames of 32 MiB of tensors, a byte less 511; of a training
+        // step's tensors and their gradients, 256.
+        let many = act(1, 1 << 23);
+        assert_eq!(most_frames(many, Pass::Predict, ample, 32 << 30), 512);
+        assert_eq!(most_frames(many, Pass::Predict, ample, (32 << 30) - 1), 511);
+        assert_eq!(most_frames(many, Pass::Train, ample, 32 << 30), 256);
+    }
+
+    /// py's probe: 256 frames of [`wide_frames`] in one call passed cubecl's 8190 MiB buffer and
+    /// 512 the kernels' 2³² elements. They run in calls of the frames one holds, and a frame's
+    /// patch is the one it gets alone.
+    #[test]
+    fn predict_splits_frames_past_one_call() {
+        let device = crate::nn::cuda(0);
+        let config = wide_frames();
+        let predictor = untrained(&config, &device);
+        assert!(predictor.frames < 256, "{}", predictor.frames);
+        let frame = 1024 * 1024;
+        let counts: Vec<u16> = (0..512 * frame).map(|i| (i % 97) as u16).collect();
+        let norm = 48.0 * frame as f64;
+        let some = predictor.predict_raw(&counts[..256 * frame], config.frame, norm);
+        assert_eq!(some.unwrap().dims, [256, 512, 512]);
+        let all = predictor.predict_raw(&counts, config.frame, norm).unwrap();
+        assert_eq!(all.dims, [512, 512, 512]);
+        let last = predictor
+            .predict_raw(&counts[511 * frame..], config.frame, norm)
+            .unwrap();
+        let plane = 512 * 512;
+        assert_eq!(all.amp[511 * plane..], last.amp[..]);
+        assert_eq!(all.phase[511 * plane..], last.phase[..]);
+    }
+
+    /// One network call runs the frames it holds and refuses one more.
+    #[test]
+    fn a_call_past_its_frames_is_refused() {
+        let device = crate::nn::cuda(0);
+        let config = wide_frames();
+        let predictor = untrained(&config, &device);
+        let len = config.input.images() * 512 * 512;
+        let input = vec![0.0; (predictor.frames + 1) * len];
+        let got = predictor.network(&input);
+        assert!(matches!(got, Err(NnError::Invalid(_))), "{got:?}");
+        assert!(predictor.network(&input[len..]).is_ok());
+    }
+
+    /// py's probe: a batch of 512 at width 2048 on 64² patches passed the check, then panicked
+    /// past 2³² elements. Split, it would train on other batch-norm statistics, so it is refused.
+    #[test]
+    fn train_refuses_a_batch_one_step_cannot_hold() {
+        let device = crate::nn::cuda(0);
+        let config = PredictorConfig::new([64, 64], 1)
+            .with_width(2048)
+            .with_depth(1);
+        let (n, plane) = (512, 64 * 64);
+        let samples = Samples {
+            geometry: config.geometry(),
+            input: (0..n * config.input.images() * plane)
+                .map(|i| (i % 13) as f32)
+                .collect(),
+            target: Patches::new([n, 64, 64], vec![1.0; n * plane], vec![0.0; n * plane]).unwrap(),
+        };
+        let options = TrainOptions {
+            batch: n,
+            ..options()
+        };
+        let got = train(&config, &options, &samples, None, &device, |_| {});
+        assert!(
+            matches!(&got, Err(NnError::Invalid(m)) if m.contains("batch-norm")),
+            "{got:?}"
+        );
+    }
 
     /// A frame with a side of no pixels is refused rather than divided by.
     #[test]
