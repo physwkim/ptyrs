@@ -11,9 +11,9 @@ use burn::tensor::activation::{relu, sigmoid, tanh};
 use burn::tensor::module::{interpolate, max_pool2d};
 use burn::tensor::ops::{InterpolateMode, InterpolateOptions, MaxPoolOptions};
 
-/// Two 3×3 same-padded convolutions, each followed by batch normalisation and ReLU. Without the
-/// normalisation training sits for tens of epochs at the mean patch: the object shows only as a
-/// small modulation of the probe's far field.
+/// Two 3×3 same-padded convolutions, each followed by batch normalisation and ReLU, on
+/// channels-last `[batch, h, w, channels]`. Without the normalisation training sits for tens of
+/// epochs at the mean patch: the object shows only as a small modulation of the probe's far field.
 #[derive(Module, Debug)]
 pub(crate) struct Block {
     a: Conv2d,
@@ -38,13 +38,31 @@ impl Block {
     }
 
     pub(crate) fn forward(&self, x: Tensor<4>) -> Tensor<4> {
-        let x = relu(self.na.forward(self.a.forward(x)));
-        relu(self.nb.forward(self.b.forward(x)))
+        let x = relu(norm(&self.na, conv(&self.a, x)));
+        relu(norm(&self.nb, conv(&self.b, x)))
     }
 
     fn fold(&self) -> [Conv2d; 2] {
         [fold(&self.a, &self.na), fold(&self.b, &self.nb)]
     }
+}
+
+/// `f`, an operation on `[batch, channels, h, w]`, on channels-last `x`. burn's CUDA
+/// convolutions, pools and interpolation run channels-last and take and give that memory as a
+/// permuted view, so neither permutation copies.
+pub(crate) fn channels_first(x: Tensor<4>, f: impl FnOnce(Tensor<4>) -> Tensor<4>) -> Tensor<4> {
+    f(x.permute([0, 3, 1, 2])).permute([0, 2, 3, 1])
+}
+
+fn conv(c: &Conv2d, x: Tensor<4>) -> Tensor<4> {
+    channels_first(x, |x| c.forward(x))
+}
+
+/// `n` on channels-last `x` as its `[batch·h·w, channels]` rows, whose channel axis burn
+/// normalises without the transposing copy a `[batch, channels, h, w]` view of them costs.
+fn norm(n: &BatchNorm, x: Tensor<4>) -> Tensor<4> {
+    let [b, h, w, c] = x.dims();
+    n.forward(x.reshape([b * h * w, c])).reshape([b, h, w, c])
 }
 
 /// `c` followed by `n` at its running statistics as one convolution.
@@ -74,32 +92,36 @@ impl Stage for Block {
 
 impl Stage for [Conv2d; 2] {
     fn forward(&self, x: Tensor<4>) -> Tensor<4> {
-        relu(self[1].forward(relu(self[0].forward(x))))
+        relu(conv(&self[1], relu(conv(&self[0], x))))
     }
 }
 
-/// The decoder's stages, each followed by a nearest 2× upsampling, then its output convolution.
+/// The decoder's stages on channels-last `x`, each followed by a nearest 2× upsampling, then its
+/// output convolution to `[batch, 1, h, w]`.
 fn decode<S: Stage>(stages: &[S], out: &Conv2d, mut x: Tensor<4>) -> Tensor<4> {
     for s in stages {
-        let [_, _, h, w] = x.dims();
-        x = interpolate(
-            s.forward(x),
-            InterpolateOptions::new(InterpolateMode::Nearest).with_output_size([2 * h, 2 * w]),
-        );
+        let [_, h, w, _] = x.dims();
+        x = channels_first(s.forward(x), |x| {
+            interpolate(
+                x,
+                InterpolateOptions::new(InterpolateMode::Nearest).with_output_size([2 * h, 2 * w]),
+            )
+        });
     }
-    out.forward(x)
+    out.forward(x.permute([0, 3, 1, 2]))
 }
 
 /// The network over its stages: the encoder's, each followed by a 2× max pool, then each
-/// decoder's with its output convolution and range map.
+/// decoder's with its output convolution and range map. The stages run channels-last.
 fn run<S: Stage>(
     encoder: &[S],
     amp: (&[S], &Conv2d),
     phase: (&[S], &Conv2d),
-    mut x: Tensor<4>,
+    x: Tensor<4>,
 ) -> (Tensor<4>, Tensor<4>) {
+    let mut x = x.permute([0, 2, 3, 1]);
     for s in encoder {
-        x = max_pool2d(s.forward(x), MaxPoolOptions::new([2, 2]));
+        x = channels_first(s.forward(x), |x| max_pool2d(x, MaxPoolOptions::new([2, 2])));
     }
     let a = sigmoid(decode(amp.0, amp.1, x.clone())) * 2.0;
     let p = tanh(decode(phase.0, phase.1, x)) * PI;

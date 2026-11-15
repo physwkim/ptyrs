@@ -36,8 +36,9 @@ use ptyrs::io::{read_cxi, read_modes, write_modes};
 use ptyrs::nn::dip::{Dip, GpuLoss, LossError, ObjectLoss, Prior};
 use rust_hdf5::H5File;
 
-/// pty-chi's `DoubleConv`: (3×3 convolution without bias, batch normalisation, ReLU) twice. On
-/// an autodiff device the normalisation takes the batch statistics, as torch's in train mode.
+/// pty-chi's `DoubleConv`: (3×3 convolution without bias, batch normalisation, ReLU) twice, on
+/// channels-last `[1, h, w, channels]`. On an autodiff device the normalisation takes the batch
+/// statistics, as torch's in train mode.
 #[derive(Module, Debug)]
 struct DoubleConv {
     c0: Conv2d,
@@ -48,14 +49,32 @@ struct DoubleConv {
 
 impl DoubleConv {
     fn forward(&self, x: Tensor<4>) -> Tensor<4> {
-        let x = relu(self.n1.forward(self.c0.forward(x)));
-        relu(self.n4.forward(self.c3.forward(x)))
+        let x = relu(norm(&self.n1, conv(&self.c0, x)));
+        relu(norm(&self.n4, conv(&self.c3, x)))
     }
+}
+
+/// `f`, an operation on `[batch, channels, h, w]`, on channels-last `x`. burn's CUDA
+/// convolutions and pools run channels-last and take and give that memory as a permuted view, so
+/// neither permutation copies.
+fn channels_first(x: Tensor<4>, f: impl FnOnce(Tensor<4>) -> Tensor<4>) -> Tensor<4> {
+    f(x.permute([0, 3, 1, 2])).permute([0, 2, 3, 1])
+}
+
+fn conv(c: &Conv2d, x: Tensor<4>) -> Tensor<4> {
+    channels_first(x, |x| c.forward(x))
+}
+
+/// `n` on channels-last `x` as its `[batch·h·w, channels]` rows, whose channel axis burn
+/// normalises without the transposing copy a `[batch, channels, h, w]` view of them costs.
+fn norm(n: &BatchNorm, x: Tensor<4>) -> Tensor<4> {
+    let [b, h, w, c] = x.dims();
+    n.forward(x.reshape([b * h * w, c])).reshape([b, h, w, c])
 }
 
 /// pty-chi's `UNet` (`reconstructors/nn/models/unet.py`) at its defaults, bilinear upsampling
 /// and skip connections: `inc`, `down1..4` (2× max pool then a [`DoubleConv`]), `up1..4`
-/// ([`upsample`] beside the skip, then a [`DoubleConv`]) and the 1×1 `outc`.
+/// ([`upsample`] beside the skip, then a [`DoubleConv`]) and the 1×1 `outc`, run channels-last.
 #[derive(Module, Debug)]
 struct UNet {
     inc: DoubleConv,
@@ -65,19 +84,21 @@ struct UNet {
 }
 
 impl UNet {
-    fn raw(&self, x: Tensor<4>) -> Tensor<4> {
-        let mut skips = vec![self.inc.forward(x)];
+    /// The raw channels-last `[1, h, w, 2]` of `code`, `[1, channels, h, w]`.
+    fn raw(&self, code: Tensor<4>) -> Tensor<4> {
+        let mut skips = vec![self.inc.forward(code.permute([0, 2, 3, 1]))];
         for d in &self.down {
             let last = skips.last().expect("inc's output").clone();
-            skips.push(d.forward(max_pool2d(last, MaxPoolOptions::new([2, 2]))));
+            let x = channels_first(last, |x| max_pool2d(x, MaxPoolOptions::new([2, 2])));
+            skips.push(d.forward(x));
         }
         let mut x = skips.pop().expect("down4's output");
         for (u, s) in self.up.iter().zip(skips.into_iter().rev()) {
-            let [_, _, h, w] = s.dims();
-            let x_up = upsample(upsample(x, 3, w), 2, h);
-            x = u.forward(Tensor::cat(vec![s, x_up], 1));
+            let [_, h, w, _] = s.dims();
+            let x_up = upsample(upsample(x, 2, w), 1, h);
+            x = u.forward(Tensor::cat(vec![s, x_up], 3));
         }
-        self.outc.forward(x)
+        conv(&self.outc, x)
     }
 }
 
@@ -86,9 +107,9 @@ impl UNet {
 impl Prior for UNet {
     fn object(&self, code: Tensor<4>) -> Tensor<3> {
         let raw = self.raw(code);
-        let [_, _, ny, nx] = raw.dims();
-        let amp = raw.clone().narrow(1, 0, 1).reshape([ny, nx]);
-        let phase = raw.narrow(1, 1, 1).reshape([ny, nx]);
+        let [_, ny, nx, _] = raw.dims();
+        let amp = raw.clone().narrow(3, 0, 1).reshape([ny, nx]);
+        let phase = raw.narrow(3, 1, 1).reshape([ny, nx]);
         Tensor::stack(
             vec![amp.clone() * phase.clone().cos(), amp * phase.sin()],
             2,
