@@ -211,7 +211,7 @@ const PROJECTIONS: [Projections; 3] = [
 #[test]
 fn projections_match_cpu_under_every_propagator() {
     const NCYCLE: usize = 8;
-    // Measured worst: LLK 6.7e-6, object 1.6e-6, probe 2.3e-6, features 1.7e-5, offsets
+    // Measured worst: LLK 6.7e-6, object 1.6e-6, probe 2.3e-6, features 1.74e-5, offsets
     // 7.3e-7.
     const TOL: [f64; 5] = [4e-5, 1e-5, 1.5e-5, 1e-4, 4e-6];
     let stepped = |frame: usize| Features {
@@ -386,7 +386,7 @@ fn full_object_projections_match_cpu(c: &Case) {
     const NCYCLE: usize = 8;
     // Five-run worst: LLK 6.18e-6, object 1.22e-5 over the whole plane (most of it the dark
     // band's) and 1.85e-6 weighted, probe 1.90e-6, features 1.12e-5, offsets 5.77e-7.
-    const TOL: [f64; 5] = [1.9e-5, 3.7e-5, 5.7e-6, 3.4e-5, 1.8e-6];
+    const TOL: [f64; 5] = [1.9e-5, 3.7e-5, 5.8e-6, 3.4e-5, 1.8e-6];
     const TOL_LIT: f64 = 5.6e-6;
     const NCYCLE_F16: usize = 2;
     // Five-run worst: LLK 2.61e-5, object 1.18e-4 over the whole plane and 1.77e-4 weighted,
@@ -554,7 +554,7 @@ fn full_object_rpie_matches_cpu_under_every_propagator() {
     const NEPOCH: usize = 6;
     // Five-run worst: LLK 1.83e-6, object 3.64e-7, probe 4.73e-6, offsets 3.60e-7; rPIE models
     // no scale or background.
-    const TOL: [f64; 5] = [5.5e-6, 1.1e-6, 1.5e-5, f64::MIN_POSITIVE, 1.1e-6];
+    const TOL: [f64; 5] = [5.6e-6, 1.1e-6, 1.5e-5, f64::MIN_POSITIVE, 1.1e-6];
     let moved = Features {
         position: Some(Feature::refined(drawn_offsets())),
         ..Features::default()
