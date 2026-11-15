@@ -1488,7 +1488,7 @@ pub(super) struct M1Bufs<'a> {
 struct Shared {
     /// The scratch's buffers.
     streamed: Vec<Streamed>,
-    /// AP's, the LLK pass's, ML's gradient's and opening scale's stacks.
+    /// AP's, the LLK pass's, and ML's gradient's, position sums' and opening scale's stacks.
     cut: Cut,
     passes: Passes,
     /// One stack's LLK partials, on their way into the ring.
@@ -1522,11 +1522,11 @@ impl Shared {
         // refined, their derivatives over `y` (3 to 5) and `x` (6 to 8); two memsets zero the
         // window sums (9, 10), which the fused passes (11 to 14) add to; a refined position's sums
         // (15) read the work planes and the three blocks, the probe sums (16) the work planes and
-        // the windows; placing the window sums back takes six launches (17 to 22). The LLK pass
-        // and DM's and RAAR's updates run a subset. Of a multislice object, the two waves its
-        // slices pass on, numbered after; under the windows, as the LLK pass runs a stack, the
-        // sampler's calls write each slice's windows in turn (from 23), which the slice passes
-        // after them read beside the waves.
+        // the windows; placing the window sums back takes six launches (17 to 22). The LLK pass,
+        // ML's gradient and position sums and DM's and RAAR's updates run a subset. Of a
+        // multislice object, the two waves its slices pass on, numbered after; under the
+        // windows, as the LLK pass runs a stack, the sampler's calls write each slice's windows
+        // in turn (from 23), which the slice passes after them read beside the waves.
         let shift = matches!(scratch, PositionScratch::Shift { .. });
         let wave = wave_bytes(dims);
         let mut streamed = match scratch {
