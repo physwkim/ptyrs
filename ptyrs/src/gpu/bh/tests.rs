@@ -325,11 +325,17 @@ fn phase_grad_is_zeros_without_the_phase() {
     phase_grad_case(0.0);
 }
 
+/// A tangent's length: [`FIELD`], or one value for a CG-only one (`lv`, `muv`, `mvv`)
+/// without CG, which a launch takes only when it neither checks nor touches it.
+fn tangent_len(cg_only: bool, cg: bool) -> usize {
+    if cg_only && !cg { 1 } else { FIELD }
+}
+
 /// `phase_tangent` at `quad`, per entry kind, against the derivatives of `exp(i (t S_u + τ
 /// S_v)) (X + t l_u + τ l_v + t² m_uu / 2 + t τ m_uv + τ² m_vv / 2)` at 0 by central
 /// differences in f64: `Φ ψ` dephased, `S_u`, `S_v` the phase's angle along `u`'s and `v`'s
 /// offsets of the measured rates. Planes past the stack's frames, and without CG `lv`, `muv`
-/// and `mvv`, stay as they were.
+/// and `mvv` ([`tangent_len`]), stay as they were.
 fn phase_tangent_case(quad: f32, cg: bool) {
     let fx = fixture();
     let rates = phase_rates(&fx);
@@ -356,7 +362,8 @@ fn phase_tangent_case(quad: f32, cg: bool) {
         for (s, frames) in STACKS.iter().enumerate() {
             let seed = 100 * k as u64 + 10 * s as u64 + 10;
             let (e, e_h) = fx.field(entry_len(kind), seed);
-            let fields = [1, 2, 3, 4, 5].map(|i| fx.field(FIELD, seed + i));
+            let fields =
+                [1, 2, 3, 4, 5].map(|i| fx.field(tangent_len(i == 2 || i > 3, cg), seed + i));
             let [mut lu, mut lv, muu, muv, mvv] = fields.each_ref().map(|f| f.0.clone_on(&fx));
             let mut m = [muu, muv, mvv];
             let last = BhLastSlice {
@@ -386,13 +393,16 @@ fn phase_tangent_case(quad: f32, cg: bool) {
                 };
                 let su = angle(&ud, pos);
                 let sv = if cg { angle(&prev, frame) } else { 0.0 };
+                // Without CG `v`'s terms are 0.
+                let [lv, muv, mvv] =
+                    [lv0, muv0, mvv0].map(|b| if cg { b[j] } else { C64::default() });
                 let psi = |t: f64, w: f64| {
                     let taylor = x[j]
                         + lu0[j] * t
-                        + lv0[j] * w
+                        + lv * w
                         + muu0[j] * (t * t / 2.0)
-                        + muv0[j] * (t * w)
-                        + mvv0[j] * (w * w / 2.0);
+                        + muv * (t * w)
+                        + mvv * (w * w / 2.0);
                     C64::from_polar(1.0, t * su + w * sv) * taylor
                 };
                 let h = 1e-3;
@@ -411,8 +421,11 @@ fn phase_tangent_case(quad: f32, cg: bool) {
             let written = frames.len() * NMODE * N;
             for b in 0..5 {
                 let what = format!("kind {kind} stack {s} {}", names[b]);
-                let moved = b == 0 || b == 2 || cg;
-                if moved && quad != 0.0 {
+                if !(b == 0 || b == 2 || cg) {
+                    assert!(got[b] == fields[b].1, "{what} touched");
+                    continue;
+                }
+                if quad != 0.0 {
                     close(&what, &got[b][..written], &want[b][..written], 1e-5);
                 } else {
                     assert!(got[b][..written] == fields[b].1[..written], "{what} moved");
@@ -519,7 +532,7 @@ fn spec_at(
         spectrum: a,
     };
     let mvr = BhMovesRef::new(&d, shift, au, cg.then_some(av), &off).unwrap();
-    let [mut lu, mut lv] = [0; 2].map(|_| fx.field(FIELD, 9).0);
+    let [mut lu, mut lv] = [false, true].map(|cg_only| fx.field(tangent_len(cg_only, cg), 9).0);
     fx.bh
         .pos_spec(ctx, fx.table.at(s), &mvr, [&mut lu, &mut lv])
         .unwrap();
@@ -528,8 +541,8 @@ fn spec_at(
 
 /// `pos_second` against central differences of `pos_spec` along each direction: the moved
 /// probes' spectra `e(o + t d) (A + t a)` change to first order as `pos_spec` writes, so its
-/// change along `(t_u, t_v)` is their second order. Without CG `muv` and `mvv` stay as they
-/// were, as the planes past the stack's frames do.
+/// change along `(t_u, t_v)` is their second order. Without CG `muv` and `mvv`
+/// ([`tangent_len`]) stay as they were, as the planes past the stack's frames do.
 fn pos_second_case(cg: bool) {
     let fx = fixture();
     let mv = moves(&fx);
@@ -599,7 +612,7 @@ fn pos_second_case(cg: bool) {
     };
     let mvr = BhMovesRef::new(&d, shift, au, cg.then_some(av), &off).unwrap();
     for (s, frames) in STACKS.iter().enumerate() {
-        let fields = [1, 2, 3].map(|i| fx.field(FIELD, 20 + 10 * s as u64 + i));
+        let fields = [1, 2, 3].map(|i| fx.field(tangent_len(i > 1, cg), 20 + 10 * s as u64 + i));
         let mut m = fields.each_ref().map(|f| f.0.clone_on(&fx));
         fx.bh.pos_second(ctx, fx.table.at(s), &mvr, &mut m).unwrap();
         let got = m.each_ref().map(|b| fx.host(b));
@@ -611,13 +624,11 @@ fn pos_second_case(cg: bool) {
         ];
         for (b, name) in ["muu", "muv", "mvv"].into_iter().enumerate() {
             let what = format!("stack {s} {name}");
-            match &want[b] {
-                Some(w) => close(&what, &got[b][..written], &w[..written], 1e-3),
-                None => assert!(
-                    got[b][..written] == fields[b].1[..written],
-                    "{what} written"
-                ),
-            }
+            let Some(w) = &want[b] else {
+                assert!(got[b] == fields[b].1, "{what} written");
+                continue;
+            };
+            close(&what, &got[b][..written], &w[..written], 1e-3);
             assert!(
                 got[b][written..] == fields[b].1[written..],
                 "{what}: past the frames"
@@ -712,7 +723,8 @@ fn moved_entry_case(cg: bool) {
             }
         }
         let waves = DeviceBuffer::from_host(&fx.stream, &waves).unwrap();
-        let fields = [1, 2, 3, 4, 5].map(|i| fx.field(FIELD, seed + i).0);
+        let fields =
+            [1, 2, 3, 4, 5].map(|i| fx.field(tangent_len(i == 2 || i > 3, cg), seed + i).0);
         let run = |e: &DeviceBuffer<C32>, kind: u32| {
             let [mut lu, mut lv, muu, muv, mvv] = fields.each_ref().map(|f| f.clone_on(&fx));
             let mut m = [muu, muv, mvv];

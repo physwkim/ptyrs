@@ -249,6 +249,26 @@ pub struct BhFieldsRef<'a> {
     pub lv: &'a DeviceBuffer<C32>,
 }
 
+impl BhFieldsRef<'_> {
+    /// The fields a Hessian launch reads, each checked as `len` long, `lv` only with `cg`
+    /// ([`touched`]): their storages and pointers.
+    fn read(&self, cg: bool, len: usize) -> Result<(Vec<&RawDeviceBuffer>, BhFields), Error> {
+        for (what, b) in [("psi", self.psi), ("r", self.r)] {
+            check_len(what, b, len)?;
+        }
+        let (l, [lu, lv]) = touched([("lu", self.lu), ("lv", self.lv)], cg, len)?;
+        let mut storages = vec![self.psi.storage(), self.r.storage()];
+        storages.extend(l);
+        let far = BhFar {
+            psi: dptr(self.psi),
+            lu,
+            lv,
+        };
+        let r = dptr(self.r);
+        Ok((storages, BhFields { far, r }))
+    }
+}
+
 /// The wave entering a slice of [`BhKernels::slice_tangent`].
 #[derive(Clone, Copy)]
 pub enum BhEntry<'a> {
@@ -305,11 +325,33 @@ pub struct BhLastSlice<'a> {
 
 /// One stack's derivatives through a multislice object, each of `nf_max * nmode` planes
 /// like its `psi`: `lu`, `lv` along `u` and `v`, `m` the second derivatives along `(u, u)`,
-/// `(u, v)` and `(v, v)`.
+/// `(u, v)` and `(v, v)`; without CG `lv`, `m[1]` and `m[2]` are neither checked nor touched.
 pub struct BhTangentsMut<'a> {
     pub lu: &'a mut DeviceBuffer<C32>,
     pub lv: &'a mut DeviceBuffer<C32>,
     pub m: &'a mut [DeviceBuffer<C32>; 3],
+}
+
+impl BhTangentsMut<'_> {
+    /// The tangents a launch along a step touches, each checked as `len` long: `lu` and
+    /// `m[0]`, and only with `cg` `lv`, `m[1]` and `m[2]` ([`touched`]); their storages and
+    /// pointers.
+    fn touched(&self, cg: bool, len: usize) -> Result<(Vec<&RawDeviceBuffer>, BhTangents), Error> {
+        let [muu, muv, mvv] = &*self.m;
+        let (mut s, [lu, lv]) = touched([("lu", &*self.lu), ("lv", &*self.lv)], cg, len)?;
+        let (m, [muu, muv, mvv]) = touched([("muu", muu), ("muv", muv), ("mvv", mvv)], cg, len)?;
+        s.extend(m);
+        Ok((
+            s,
+            BhTangents {
+                lu,
+                lv,
+                muu,
+                muv,
+                mvv,
+            },
+        ))
+    }
 }
 
 /// The exit waves' second derivatives [`BhKernels::sliced_hess_frames`] reads, each of
@@ -563,7 +605,8 @@ impl<'a> BhMovedRef<'a> {
 /// One stack under the position model as [`BhKernels::pos_near`] reads it, each in
 /// [`Kernels::obj_probe_to_psi`]'s layout: the object, the moved probes `w` (`[nf_max *
 /// nprobe, ny, nx]`, as `crate::gpu::PositionKernels::shift_w` leaves them), the residual
-/// after its inverse FFT, and `lu`, `lv` the inverse-FFT'd [`BhKernels::pos_spec`].
+/// after its inverse FFT, and `lu`, `lv` the inverse-FFT'd [`BhKernels::pos_spec`] (`lv`
+/// neither checked nor touched without CG).
 pub struct BhNearMut<'a> {
     pub obj: &'a DeviceBuffer<C32>,
     pub w: &'a DeviceBuffer<C32>,
@@ -747,6 +790,27 @@ fn window_block(dims: &ViewDims, g: &StackGeom) -> usize {
     dims.nobj as usize * g.nf_max as usize * dims.n()
 }
 
+/// Of a launch's `bufs` along a step, those its kernel touches: the first, and the rest,
+/// which every BH kernel touches only with CG, exactly with `cg`. Each touched one is checked
+/// as `len` long under its name; returns their storages, to lease, and every buffer's
+/// pointer, the first's standing in for the rest without `cg`.
+fn touched<'b, const N: usize>(
+    bufs: [(&str, &'b DeviceBuffer<C32>); N],
+    cg: bool,
+    len: usize,
+) -> Result<(Vec<&'b RawDeviceBuffer>, [*mut f32; N]), Error> {
+    let listed = &bufs[..if cg { N } else { 1 }];
+    for &(what, b) in listed {
+        check_len(what, b, len)?;
+    }
+    let storages = listed.iter().map(|&(_, b)| b.storage()).collect();
+    let first = bufs[0].1;
+    Ok((
+        storages,
+        bufs.map(|(_, b)| dptr(if cg { b } else { first })),
+    ))
+}
+
 /// Values of the object and of the probe.
 fn lens(dims: &ViewDims) -> [u32; 2] {
     // `Views::new` checked both fit the kernels' u32 indices.
@@ -826,13 +890,11 @@ impl BhKernels {
         }
         d.check(dims)?;
         let [lu, lv] = l;
-        check_len("lu", lu, len)?;
-        check_len("lv", lv, len)?;
+        let (writes, lp) = touched([("lu", &*lu), ("lv", &*lv)], d.v.is_some(), len)?;
         let config = grid_1d(len)?;
         let mut reads = vec![views.addr().storage(), stack.storage()];
         reads.extend(x.iter().map(|b| b.storage()));
         reads.extend(d.storages());
-        let writes = [lu.storage(), lv.storage()];
         self.base.launch(ctx, &reads, &writes, |stream| {
             let x = ObjProbePtrs {
                 obj: dptr(x[0]),
@@ -847,8 +909,8 @@ impl BhKernels {
                     x,
                     d.ptrs(),
                     dptr::<ViewAddr, ViewAddr>(views.addr()),
-                    dptr(lu),
-                    dptr(lv),
+                    lp[0],
+                    lp[1],
                     stack.ctl() as *const StackCtl,
                     g,
                 )
@@ -884,9 +946,7 @@ impl BhKernels {
         let g = dims.geom(stack)?;
         let n = dims.n();
         let len = g.nf_max as usize * dims.nmode as usize * n;
-        for (what, b) in [("psi", f.psi), ("r", f.r), ("lu", f.lu), ("lv", f.lv)] {
-            check_len(what, b, len)?;
-        }
+        let (read, fields) = f.read(d.v.is_some(), len)?;
         d.check(dims)?;
         parts.check(dims)?;
         let config = hess_grid(g.nf_max, n)?;
@@ -894,24 +954,13 @@ impl BhKernels {
             f.views.addr().storage(),
             scan.counts.storage(),
             scan.order.ids.order().storage(),
-            f.psi.storage(),
-            f.r.storage(),
-            f.lu.storage(),
-            f.lv.storage(),
             stack.storage(),
         ];
+        reads.extend(read);
         reads.extend(d.storages());
         let out = parts.ptr(parts.hess(0));
         self.base
             .launch(ctx, &reads, &[parts.buf.storage()], |stream| {
-                let fields = BhFields {
-                    far: BhFar {
-                        psi: dptr(f.psi),
-                        lu: dptr(f.lu),
-                        lv: dptr(f.lv),
-                    },
-                    r: dptr(f.r),
-                };
                 // SAFETY: lengths checked above; one block of PIXEL_THREADS per chunk and frame;
                 // `EpochOrder` holds frame ids below `nframe`.
                 unsafe {
@@ -937,7 +986,8 @@ impl BhKernels {
     /// `views`. Entered by the probe, `l_u` and `l_v` are `d`'s probe parts (`u`'s times
     /// `d.u_scale`), `m` is 0 and `t` only written; else `t` holds `w`'s and `d`'s probe parts
     /// are unread (entered by the moved probes, `t` holds theirs: the inverse FFTs of
-    /// [`Self::pos_spec`] and [`Self::pos_second`]). Without `d.v` only `t.lu` and `t.m[0]`.
+    /// [`Self::pos_spec`] and [`Self::pos_second`]). Without `d.v` only `t.lu` and `t.m[0]`
+    /// are checked and touched.
     pub fn slice_tangent(
         &self,
         ctx: &ExecutionContext,
@@ -952,35 +1002,12 @@ impl BhKernels {
         let len = g.nf_max as usize * dims.nmode as usize * dims.n();
         let (s, entered) = entry.slice_in(x, dims, &g)?;
         d.check(dims)?;
-        let [muu, muv, mvv] = &mut *t.m;
-        let waves = [
-            ("lu", &*t.lu),
-            ("lv", &*t.lv),
-            ("muu", &*muu),
-            ("muv", &*muv),
-        ];
-        for (what, b) in waves.into_iter().chain([("mvv", &*mvv)]) {
-            check_len(what, b, len)?;
-        }
+        let (writes, t) = t.touched(d.v.is_some(), len)?;
         let config = grid_1d(len)?;
         let mut reads = vec![views.addr().storage(), stack.storage()];
         reads.extend(entered);
         reads.extend(d.storages());
-        let writes = [
-            t.lu.storage(),
-            t.lv.storage(),
-            muu.storage(),
-            muv.storage(),
-            mvv.storage(),
-        ];
         self.base.launch(ctx, &reads, &writes, |stream| {
-            let t = BhTangents {
-                lu: dptr(t.lu),
-                lv: dptr(t.lv),
-                muu: dptr(muu),
-                muv: dptr(muv),
-                mvv: dptr(mvv),
-            };
             // SAFETY: lengths checked above; `Views::new` checked every view lies inside the
             // object with valid mode indices.
             unsafe {
@@ -1015,42 +1042,23 @@ impl BhKernels {
         let g = dims.geom(stack)?;
         let n = dims.n();
         let len = g.nf_max as usize * dims.nmode as usize * n;
+        let cg = m.cg.is_some();
+        let (read, fields) = f.read(cg, len)?;
         let [uv, vv] = m.cg.unwrap_or([m.uu; 2]);
-        let fields = [("psi", f.psi), ("r", f.r), ("lu", f.lu), ("lv", f.lv)];
-        let second = [("muu", m.uu), ("muv", uv), ("mvv", vv)];
-        for (what, b) in fields.into_iter().chain(second) {
-            check_len(what, b, len)?;
-        }
+        let (second, [uu, uv, vv]) = touched([("muu", m.uu), ("muv", uv), ("mvv", vv)], cg, len)?;
         parts.check(dims)?;
         let config = hess_grid(g.nf_max, n)?;
-        let reads = [
+        let mut reads = vec![
             scan.counts.storage(),
             scan.order.ids.order().storage(),
-            f.psi.storage(),
-            f.r.storage(),
-            f.lu.storage(),
-            f.lv.storage(),
-            m.uu.storage(),
-            uv.storage(),
-            vv.storage(),
             stack.storage(),
         ];
+        reads.extend(read);
+        reads.extend(second);
+        let second = BhSecond { uu, uv, vv };
         let out = parts.ptr(parts.hess(0));
         self.base
             .launch(ctx, &reads, &[parts.buf.storage()], |stream| {
-                let fields = BhFields {
-                    far: BhFar {
-                        psi: dptr(f.psi),
-                        lu: dptr(f.lu),
-                        lv: dptr(f.lv),
-                    },
-                    r: dptr(f.r),
-                };
-                let second = BhSecond {
-                    uu: dptr(m.uu),
-                    uv: dptr(uv),
-                    vv: dptr(vv),
-                };
                 // SAFETY: lengths checked above; one block of PIXEL_THREADS per chunk and frame;
                 // `EpochOrder` holds frame ids below `nframe`.
                 unsafe {
@@ -1059,7 +1067,7 @@ impl BhKernels {
                         config,
                         fields,
                         second,
-                        m.cg.is_some().into(),
+                        cg.into(),
                         scan.obs(),
                         out,
                         stack.ctl() as *const StackCtl,
@@ -1361,28 +1369,26 @@ impl BhKernels {
         let g = dims.geom(stack)?;
         let len = g.nf_max as usize * dims.nmode as usize * dims.n();
         let [lu, lv] = l;
-        check_len("lu", lu, len)?;
-        check_len("lv", lv, len)?;
+        let (writes, lp) = touched([("lu", &*lu), ("lv", &*lv)], mv.av.is_some(), len)?;
         let config = grid_1d(len)?;
         let mut reads = mv.storages();
         reads.push(stack.storage());
         let views = mv.off.order.views.addr();
-        self.base
-            .launch(ctx, &reads, &[lu.storage(), lv.storage()], |stream| {
-                // SAFETY: lengths checked above; `Views::new` checked every view's probe mode.
-                unsafe {
-                    self.module.bh_pos_spec(
-                        stream,
-                        config,
-                        mv.ptrs(),
-                        dptr::<ViewAddr, ViewAddr>(views),
-                        dptr(lu),
-                        dptr(lv),
-                        stack.ctl() as *const StackCtl,
-                        g,
-                    )
-                }
-            })
+        self.base.launch(ctx, &reads, &writes, |stream| {
+            // SAFETY: lengths checked above; `Views::new` checked every view's probe mode.
+            unsafe {
+                self.module.bh_pos_spec(
+                    stream,
+                    config,
+                    mv.ptrs(),
+                    dptr::<ViewAddr, ViewAddr>(views),
+                    lp[0],
+                    lp[1],
+                    stack.ctl() as *const StackCtl,
+                    g,
+                )
+            }
+        })
     }
 
     /// The spectra of the stack's moved probes' second-order changes along the step's `(u,
@@ -1398,15 +1404,13 @@ impl BhKernels {
         let dims = mv.check()?;
         let g = dims.geom(stack)?;
         let len = g.nf_max as usize * dims.nmode as usize * dims.n();
-        for (what, b) in ["muu", "muv", "mvv"].into_iter().zip(m.iter()) {
-            check_len(what, b, len)?;
-        }
+        let [muu, muv, mvv] = &*m;
+        let second = [("muu", muu), ("muv", muv), ("mvv", mvv)];
+        let (writes, mp) = touched(second, mv.av.is_some(), len)?;
         let config = grid_1d(len)?;
         let mut reads = mv.storages();
         reads.push(stack.storage());
         let views = mv.off.order.views.addr();
-        let [muu, muv, mvv] = m;
-        let writes = [muu.storage(), muv.storage(), mvv.storage()];
         self.base.launch(ctx, &reads, &writes, |stream| {
             // SAFETY: lengths checked above; `Views::new` checked every view's probe mode.
             unsafe {
@@ -1415,9 +1419,9 @@ impl BhKernels {
                     config,
                     mv.ptrs(),
                     dptr::<ViewAddr, ViewAddr>(views),
-                    dptr(muu),
-                    dptr(muv),
-                    dptr(mvv),
+                    mp[0],
+                    mp[1],
+                    mp[2],
                     stack.ctl() as *const StackCtl,
                     g,
                 )
@@ -1445,9 +1449,8 @@ impl BhKernels {
         let len = g.nf_max as usize * dims.nmode as usize * n;
         check_len("obj", f.obj, dims.obj_len())?;
         check_len("w", f.w, g.nf_max as usize * dims.nprobe as usize * n)?;
-        for (what, b) in [("r", f.r), ("lu", &*f.lu), ("lv", &*f.lv)] {
-            check_len(what, b, len)?;
-        }
+        check_len("r", f.r, len)?;
+        let (mut writes, [lu, lv]) = touched([("lu", &*f.lu), ("lv", &*f.lv)], d.v.is_some(), len)?;
         d.check(dims)?;
         parts.check(dims)?;
         let config = chunk_grid(&g, n)?;
@@ -1459,15 +1462,15 @@ impl BhKernels {
             stack.storage(),
         ];
         reads.extend(d.storages());
-        let writes = [f.lu.storage(), f.lv.storage(), parts.buf.storage()];
+        writes.push(parts.buf.storage());
         let out = parts.ptr(parts.hess(0));
         self.base.launch(ctx, &reads, &writes, |stream| {
             let near = BhNear {
                 obj: dptr(f.obj),
                 w: dptr(f.w),
                 r: dptr(f.r),
-                lu: dptr(&*f.lu),
-                lv: dptr(&*f.lv),
+                lu,
+                lv,
             };
             // SAFETY: lengths checked above; one block of PIXEL_THREADS per chunk and frame;
             // `Views::new` checked every view lies inside the object with valid modes.
@@ -1503,32 +1506,32 @@ impl BhKernels {
         let n = dims.n();
         check_len("counts", counts, dims.nframe as usize * n)?;
         let len = g.nf_max as usize * dims.nmode as usize * n;
-        for (what, b) in [("psi", f.psi), ("lu", f.lu), ("lv", f.lv), ("y", f.y)] {
+        for (what, b) in [("psi", f.psi), ("y", f.y)] {
             check_len(what, b, len)?;
         }
+        let (l, [lu, lv]) = touched([("lu", f.lu), ("lv", f.lv)], mv.av.is_some(), len)?;
         parts.check(dims)?;
         let config = chunk_grid(&g, n)?;
         let mut reads = mv.storages();
         reads.extend([
             counts.storage(),
             f.psi.storage(),
-            f.lu.storage(),
-            f.lv.storage(),
             f.y.storage(),
             stack.storage(),
         ]);
+        reads.extend(l);
+        let far = BhMovedFar {
+            far: BhFar {
+                psi: dptr(f.psi),
+                lu,
+                lv,
+            },
+            y: dptr(f.y),
+        };
         let views = mv.off.order.views.addr();
         let out = parts.ptr(parts.hess(0));
         self.base
             .launch(ctx, &reads, &[parts.buf.storage()], |stream| {
-                let far = BhMovedFar {
-                    far: BhFar {
-                        psi: dptr(f.psi),
-                        lu: dptr(f.lu),
-                        lv: dptr(f.lv),
-                    },
-                    y: dptr(f.y),
-                };
                 // SAFETY: lengths checked above; one block of PIXEL_THREADS per chunk and frame;
                 // `EpochOrder` holds frame ids below `nframe`.
                 unsafe {
@@ -1560,28 +1563,26 @@ impl BhKernels {
         let g = dims.geom(stack)?;
         let len = g.nf_max as usize * dims.nmode as usize * dims.n();
         let [lu, lv] = l;
-        check_len("lu", lu, len)?;
-        check_len("lv", lv, len)?;
+        let (writes, lp) = touched([("lu", &*lu), ("lv", &*lv)], mv.av.is_some(), len)?;
         let config = grid_1d(len)?;
         let mut reads = mv.storages();
         reads.push(stack.storage());
         let views = mv.order.views.addr();
-        self.base
-            .launch(ctx, &reads, &[lu.storage(), lv.storage()], |stream| {
-                // SAFETY: lengths checked above; `Views::new` checked every view's probe mode.
-                unsafe {
-                    self.module.bh_moved_spec(
-                        stream,
-                        config,
-                        mv.ptrs(),
-                        dptr::<ViewAddr, ViewAddr>(views),
-                        dptr(lu),
-                        dptr(lv),
-                        stack.ctl() as *const StackCtl,
-                        g,
-                    )
-                }
-            })
+        self.base.launch(ctx, &reads, &writes, |stream| {
+            // SAFETY: lengths checked above; `Views::new` checked every view's probe mode.
+            unsafe {
+                self.module.bh_moved_spec(
+                    stream,
+                    config,
+                    mv.ptrs(),
+                    dptr::<ViewAddr, ViewAddr>(views),
+                    lp[0],
+                    lp[1],
+                    stack.ctl() as *const StackCtl,
+                    g,
+                )
+            }
+        })
     }
 
     /// [`Self::pos_far`] with the offsets held: adds to the stack's frames' triples
@@ -1780,7 +1781,8 @@ impl BhKernels {
     /// after it those of the exit waves once [`crate::gpu::OpticsKernels::slice_phase`] puts
     /// the phase on `t.lu` and `t.lv` and its adjoint is on the residual, as
     /// [`Self::sliced_hess_frames`] reads them. Of `d` only whether it has `v` is read; without
-    /// it only `t.lu` and `t.m[0]`. `off`'s views are those the slice is read through.
+    /// it only `t.lu` and `t.m[0]` are checked and touched. `off`'s views are those the slice
+    /// is read through.
     pub fn phase_tangent(
         &self,
         ctx: &ExecutionContext,
@@ -1794,16 +1796,7 @@ impl BhKernels {
         let g = dims.geom(stack)?;
         let len = g.nf_max as usize * dims.nmode as usize * dims.n();
         let (s, entered) = last.entry.slice_in(last.slice, dims, &g)?;
-        let [muu, muv, mvv] = &mut *t.m;
-        let waves = [
-            ("lu", &*t.lu),
-            ("lv", &*t.lv),
-            ("muu", &*muu),
-            ("muv", &*muv),
-        ];
-        for (what, b) in waves.into_iter().chain([("mvv", &*mvv)]) {
-            check_len(what, b, len)?;
-        }
+        let (writes, t) = t.touched(d.v.is_some(), len)?;
         let config = grid_1d(len)?;
         let b = &off.bufs;
         let views = off.order.views.addr();
@@ -1815,22 +1808,8 @@ impl BhKernels {
             off.order.ids.order().storage(),
         ];
         reads.extend(entered);
-        let writes = [
-            t.lu.storage(),
-            t.lv.storage(),
-            muu.storage(),
-            muv.storage(),
-            mvv.storage(),
-        ];
         let dirs = off.dirs(d.v.is_some());
         self.base.launch(ctx, &reads, &writes, |stream| {
-            let t = BhTangents {
-                lu: dptr(t.lu),
-                lv: dptr(t.lv),
-                muu: dptr(muu),
-                muv: dptr(muv),
-                mvv: dptr(mvv),
-            };
             // SAFETY: lengths checked above; `Views::new` checked every view lies inside the
             // object with valid mode indices; `EpochOrder` holds frame ids below `nframe`.
             unsafe {
