@@ -1,5 +1,5 @@
-//! The LSQML launchers under OPR. The forward row pass and the dots on each frame's own probe
-//! mode 0, [`OprKernels::unique`]'s planes as [`OwnModes`], against the same launchers on the
+//! The LSQML launchers under OPR. The forward row pass, the object sums and the dots on each
+//! frame's own probe mode 0, [`OprKernels::unique`]'s planes as [`OwnModes`], against the same launchers on the
 //! shared-probe path one frame at a time, each frame on its own probe as
 //! `ProbeVariation::unique` gives it: both read the same values in the same order, so they
 //! agree bit for bit. Each frame's probe direction against the CPU's over those views, and bit
@@ -366,6 +366,54 @@ fn forward_on_own_modes_matches_each_frame_alone() {
         c_bits(&plain),
         c_bits(&got),
         "the own modes left the waves as on the shared probe"
+    );
+}
+
+/// [`Kernels::psi_to_obj_frames`] of `chi` as the waves, stack `s` of `stacks` on
+/// `probes[s]`, into sums that start at zero.
+fn obj_sums(
+    g: &Gpu,
+    chi: &[Vec<C64>],
+    stacks: &[Range<u32>],
+    probes: &[FrameProbe<'_>],
+) -> [Vec<u32>; 2] {
+    let table = StackTable::new(&g.stream, &dims(), stacks).unwrap();
+    let mut sums = UpdateSums::zeroed(&g.stream, NOBJ * OBJ[0] * OBJ[1]).unwrap();
+    for (s, (chi, &probe)) in chi.iter().zip(probes).enumerate() {
+        let psi = up(&g.stream, chi);
+        let views = g.order.views();
+        g.kernels
+            .psi_to_obj_frames(&g.ctx, views, table.at(s), &psi, probe, &mut sums)
+            .unwrap();
+    }
+    [
+        c_bits(&sums.num.to_host_vec(&g.stream).unwrap()),
+        bits(&sums.den.to_host_vec(&g.stream).unwrap()),
+    ]
+}
+
+#[test]
+fn psi_to_obj_on_own_modes_matches_each_frame_alone() {
+    let g = gpu();
+    let (var, probe) = variation();
+    let planes = own_planes(&g, &var, &probe);
+    let x = inputs(&g.stream);
+    let shared = up(&g.stream, probe.as_slice());
+    let own = OwnModes {
+        planes: &planes,
+        positions: BATCH,
+    };
+    let got = obj_sums(&g, &x.chi, &STACKS, &[FrameProbe::Own(&shared, &own); 2]);
+    let probes = frame_probes(&g, &probe, &planes);
+    let alone: Vec<_> = probes.iter().map(FrameProbe::Shared).collect();
+    let chi: Vec<_> = BATCH.map(|p| x.frame_chi(p).to_vec()).collect();
+    let want = obj_sums(&g, &chi, &single(), &alone);
+    assert_eq!(got[0], want[0], "num");
+    assert_eq!(got[1], want[1], "den");
+    let plain = obj_sums(&g, &x.chi, &STACKS, &[FrameProbe::Shared(&shared); 2]);
+    assert_ne!(
+        plain[1], got[1],
+        "the own modes left the sums as on the shared probe"
     );
 }
 

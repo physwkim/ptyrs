@@ -387,7 +387,7 @@ unsafe fn bin_tile_views(
 #[device]
 unsafe fn psi_to_obj_pixel<const HALF: bool>(
     psi: pixel::PsiPtr,
-    probe: *const f32,
+    probe: fused::ProbeSrc,
     views: *const pixel::ViewAddr,
     tiles: pixel::TilePtrs,
     sums: pixel::SumPtrs,
@@ -419,7 +419,8 @@ unsafe fn psi_to_obj_pixel<const HALF: bool>(
             }
             let plane = i as usize * n;
             pixel::obj_pixel_sources(v, y, x, g.ny, g.nx, |pry, prx, w| {
-                let p = pixel::load_c(probe, v.probe as usize * n + (pry * g.nx + prx) as usize);
+                let at = (pry * g.nx + prx) as usize;
+                let p = fused::load_probe(probe, v.probe, k / g.nmode, n, at);
                 let q = pixel::quad_phase(g.quad, pry, prx, g.ny, g.nx);
                 let ps =
                     pixel::load_psi::<HALF>(psi, plane + pixel::psi_index(pry, prx, g.ny, g.nx));
@@ -483,7 +484,7 @@ unsafe fn psi_to_probe<const HALF: bool>(
 #[cuda_module]
 pub mod kernels {
     use super::*;
-    use crate::fused::{FusedCfg, FusedPtrs, raar_mix};
+    use crate::fused::{FusedCfg, FusedPtrs, ProbeSrc, raar_mix};
     use crate::pixel::*;
     use cuda_device::SharedArray;
 
@@ -892,22 +893,23 @@ pub mod kernels {
     /// Adds the stack's object-update sums to `sums` `[nobj, nyo, nxo]`: the exact
     /// transpose of [`obj_probe_to_psi`] applied to `psi`, `num += sum_v B_v^T (conj(P_v q)
     /// psi_v)`, and `den += sum_v B_v^T |P_v|^2` with `B_v` the bilinear sampling of view
-    /// `v`. Each object pixel is owned by one thread, which adds its views in ascending `k`
-    /// from the tile's run: the result does not depend on how frames are split into stacks.
-    /// A pixel's sums are read and written only if its tile's run holds a view of the stack.
-    /// A stack-tile launch (`for_each_stack_tile`): its blocks cover the tiles the stack's
-    /// frames sample, not the whole object.
+    /// `v` and `P_v` its probe mode at its frame's epoch position ([`ProbeSrc`]). Each object
+    /// pixel is owned by one thread, which adds its views in ascending `k` from the tile's
+    /// run: the result does not depend on how frames are split into stacks. A pixel's sums
+    /// are read and written only if its tile's run holds a view of the stack. A stack-tile
+    /// launch (`for_each_stack_tile`): its blocks cover the tiles the stack's frames sample,
+    /// not the whole object.
     ///
     /// # Safety
     ///
-    /// As [`obj_probe_to_psi`] with `psi` read and canonical views; `sums` hold `[nobj,
-    /// nyo, nxo]`; `tiles` as `for_each_stack_tile` needs.
+    /// As [`obj_probe_to_psi`] with `psi` read, canonical views and `probe` as [`ProbeSrc`]
+    /// says; `sums` hold `[nobj, nyo, nxo]`; `tiles` as `for_each_stack_tile` needs.
     ///
     /// [`obj_probe_to_psi`]: LoadedModule::obj_probe_to_psi
     #[kernel]
     pub unsafe fn psi_to_obj(
         psi: PsiPtr,
-        probe: *const f32,
+        probe: ProbeSrc,
         views: *const ViewAddr,
         tiles: TilePtrs,
         sums: SumPtrs,
@@ -932,7 +934,7 @@ pub mod kernels {
     #[kernel]
     pub unsafe fn psi_to_obj_f16(
         psi: PsiPtr,
-        probe: *const f32,
+        probe: ProbeSrc,
         views: *const ViewAddr,
         tiles: TilePtrs,
         sums: SumPtrs,
