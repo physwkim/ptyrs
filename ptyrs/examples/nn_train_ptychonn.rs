@@ -164,15 +164,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for (name, _, scan, truth, addr, _) in common::held_out(frame, &probe) {
         let patches = predictor.predict(&scan.counts, mean_frame_total(&scan.counts))?;
-        let want = object_patches(&truth, &addr, config.patch());
-        let ones = vec![1.0; want.amp.len()];
-        let zeros = vec![0.0; want.amp.len()];
+        let want = object_patches(&truth, &addr, config.patch())?;
+        let ones = vec![1.0; want.amp().len()];
+        let zeros = vec![0.0; want.amp().len()];
         println!(
             "{name:12} amp L1 pred {:.4} flat {:.4}   phase L1 pred {:.4} flat {:.4}",
-            l1(&patches.amp, &want.amp),
-            l1(&ones, &want.amp),
-            l1(&patches.phase, &want.phase),
-            l1(&zeros, &want.phase)
+            l1(patches.amp(), want.amp()),
+            l1(&ones, want.amp()),
+            l1(patches.phase(), want.phase()),
+            l1(&zeros, want.phase())
         );
     }
     Ok(())

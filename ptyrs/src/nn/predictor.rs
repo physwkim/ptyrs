@@ -118,21 +118,48 @@ impl PredictorConfig {
     }
 }
 
-/// Object patches `[n, py, px]` as amplitude and phase detail ([`phase_detail`]).
+/// Object patches `[n, py, px]` as amplitude and phase detail ([`phase_detail`]), `n · py · px`
+/// values each.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Patches {
-    pub dims: [usize; 3],
-    pub amp: Vec<f32>,
-    pub phase: Vec<f32>,
+    dims: [usize; 3],
+    amp: Vec<f32>,
+    phase: Vec<f32>,
 }
 
 impl Patches {
+    /// Fails unless `amp` and `phase` each hold the `n · py · px` values of `dims`.
+    pub fn new(dims: [usize; 3], amp: Vec<f32>, phase: Vec<f32>) -> Result<Self, NnError> {
+        let len = dims.iter().try_fold(1usize, |p, &d| p.checked_mul(d));
+        if len != Some(amp.len()) || len != Some(phase.len()) {
+            return Err(NnError::Invalid(format!(
+                "{} amplitudes and {} phases for patches {dims:?}",
+                amp.len(),
+                phase.len()
+            )));
+        }
+        Ok(Self { dims, amp, phase })
+    }
+
     fn empty(patch: [usize; 2]) -> Self {
         Self {
             dims: [0, patch[0], patch[1]],
             amp: Vec::new(),
             phase: Vec::new(),
         }
+    }
+
+    /// `[n, py, px]`.
+    pub fn dims(&self) -> [usize; 3] {
+        self.dims
+    }
+
+    pub fn amp(&self) -> &[f32] {
+        &self.amp
+    }
+
+    pub fn phase(&self) -> &[f32] {
+        &self.phase
     }
 
     pub fn len(&self) -> usize {
@@ -149,6 +176,25 @@ impl Patches {
         self.amp.extend(other.amp);
         self.phase.extend(other.phase);
     }
+
+    /// The patches `picks`, in that order; panics if a pick is not below [`len`](Self::len).
+    fn select(&self, picks: &[usize]) -> Self {
+        let [_, py, px] = self.dims;
+        Self {
+            dims: [picks.len(), py, px],
+            amp: gather(&self.amp, picks, py * px),
+            phase: gather(&self.phase, picks, py * px),
+        }
+    }
+}
+
+/// The runs `picks` of `size` values of `values`, in that order.
+fn gather(values: &[f32], picks: &[usize], size: usize) -> Vec<f32> {
+    picks
+        .iter()
+        .flat_map(|&i| &values[i * size..(i + 1) * size])
+        .copied()
+        .collect()
 }
 
 /// Mean over frames of the unmasked counts per frame: the scale [`diffraction_input`] divides
@@ -263,14 +309,23 @@ impl InputScale {
     }
 }
 
-/// Top-left corner in the object of frame `f`'s patch: the centre `patch` of its view window.
-fn patch_corner(addr: &AddrTable, f: usize, patch: [usize; 2]) -> [usize; 2] {
-    let v = addr.frame_views(f)[0];
+/// Top-left corner in the object of each frame's patch: the centre `patch` of its view window.
+/// Fails unless `patch` fits in `addr`'s frame.
+fn patch_corners(addr: &AddrTable, patch: [usize; 2]) -> Result<Vec<[usize; 2]>, NnError> {
     let frame = addr.frame_shape();
-    [
-        v.oy as usize + (frame[0] - patch[0]) / 2,
-        v.ox as usize + (frame[1] - patch[1]) / 2,
-    ]
+    if patch[0] > frame[0] || patch[1] > frame[1] {
+        return Err(NnError::Invalid(format!(
+            "patch {patch:?} wider than frame {frame:?}"
+        )));
+    }
+    let corner = |f| {
+        let v = addr.frame_views(f)[0];
+        [
+            v.oy as usize + (frame[0] - patch[0]) / 2,
+            v.ox as usize + (frame[1] - patch[1]) / 2,
+        ]
+    };
+    Ok((0..addr.nframe()).map(corner).collect())
 }
 
 /// Sigma of the blur [`phase_detail`] removes, as a fraction of the patch side: at bin 4 the
@@ -315,24 +370,34 @@ pub fn phase_detail(object: &Object, sigma: f64) -> Vec<f32> {
 }
 
 /// The true patches of object mode 0 at every frame of `addr`: the predictor's training target.
-/// The detail is taken on the whole object before the patches are cut.
-pub fn object_patches(object: &Object, addr: &AddrTable, patch: [usize; 2]) -> Patches {
+/// The detail is taken on the whole object before the patches are cut. Fails unless `object` is
+/// of `addr`'s object shape and `patch` fits in its frame.
+pub fn object_patches(
+    object: &Object,
+    addr: &AddrTable,
+    patch: [usize; 2],
+) -> Result<Patches, NnError> {
+    let corners = patch_corners(addr, patch)?;
+    if object.plane_shape() != addr.obj_shape() {
+        return Err(NnError::Invalid(format!(
+            "object {:?} for addressed object {:?}",
+            object.plane_shape(),
+            addr.obj_shape()
+        )));
+    }
     let nxo = object.plane_shape()[1];
     let plane = object.plane(0);
     let sigma = DETAIL_SIGMA * patch[0].min(patch[1]) as f64;
     let detail = phase_detail(object, sigma);
-    let mut out = Patches::empty(patch);
-    for f in 0..addr.nframe() {
-        let [cy, cx] = patch_corner(addr, f, patch);
+    let (mut amp, mut phase) = (Vec::new(), Vec::new());
+    for [cy, cx] in corners {
         for y in 0..patch[0] {
             let row = (cy + y) * nxo + cx;
-            out.amp
-                .extend(plane[row..][..patch[1]].iter().map(|c| c.norm() as f32));
-            out.phase.extend(&detail[row..][..patch[1]]);
+            amp.extend(plane[row..][..patch[1]].iter().map(|c| c.norm() as f32));
+            phase.extend(&detail[row..][..patch[1]]);
         }
     }
-    out.dims[0] = addr.nframe();
-    out
+    Patches::new([addr.nframe(), patch[0], patch[1]], amp, phase)
 }
 
 const FLAT: C64 = C64::new(1.0, 0.0);
@@ -355,14 +420,14 @@ pub fn stitch(patches: &Patches, addr: &AddrTable) -> Result<Object, NnError> {
             addr.nframe()
         )));
     }
+    let corners = patch_corners(addr, [py, px])?;
     let [nyo, nxo] = addr.obj_shape();
     let taper = |i: usize, len: usize| (PI * (i as f64 + 0.5) / len as f64).sin().powi(2);
     let wy: Vec<f64> = (0..py).map(|i| taper(i, py)).collect();
     let wx: Vec<f64> = (0..px).map(|i| taper(i, px)).collect();
     let mut sum = vec![C64::default(); nyo * nxo];
     let mut weight = vec![0.0; nyo * nxo];
-    for f in 0..n {
-        let [cy, cx] = patch_corner(addr, f, [py, px]);
+    for (f, [cy, cx]) in corners.into_iter().enumerate() {
         for (y, wy) in wy.iter().enumerate() {
             for (x, wx) in wx.iter().enumerate() {
                 let k = (f * py + y) * px + x;
@@ -460,7 +525,7 @@ impl Samples {
         let input = diffraction_input(frames, self.kind, config.bin, mean_frame_total(frames))?;
         self.input.extend(input);
         self.target
-            .append(object_patches(object, addr, config.patch()));
+            .append(object_patches(object, addr, config.patch())?);
         Ok(())
     }
 
@@ -480,22 +545,10 @@ impl Samples {
     /// If a pick is not below [`len`](Self::len).
     pub fn select(&self, picks: &[usize]) -> Samples {
         let [_, py, px] = self.target.dims;
-        let plane = py * px;
-        let gather = |v: &[f32], size: usize| -> Vec<f32> {
-            picks
-                .iter()
-                .flat_map(|&i| &v[i * size..(i + 1) * size])
-                .copied()
-                .collect()
-        };
         Samples {
             kind: self.kind,
-            input: gather(&self.input, self.kind.images() * plane),
-            target: Patches {
-                dims: [picks.len(), py, px],
-                amp: gather(&self.target.amp, plane),
-                phase: gather(&self.target.phase, plane),
-            },
+            input: gather(&self.input, picks, self.kind.images() * py * px),
+            target: self.target.select(picks),
         }
     }
 
@@ -918,11 +971,7 @@ impl Predictor {
         let images = self.config.input.images();
         let n = input.len() / (images * py * px);
         let (a, p) = self.forward(tensor(input, images, [n, py, px], &self.device()));
-        Ok(Patches {
-            dims: [n, py, px],
-            amp: host(a)?,
-            phase: host(p)?,
-        })
+        Patches::new([n, py, px], host(a)?, host(p)?)
     }
 
     /// The object initial value for a scan: [`predict`](Self::predict) then [`stitch`].
@@ -1198,13 +1247,12 @@ mod tests {
         let positions = Positions::new(vec![0.0, 0.0, 3.0], vec![-3.0, 3.0, 0.0]).unwrap();
         let addr = AddrTable::new(&positions, [1.0, 1.0], frame, [32, 32], 1, 1).unwrap();
         let object = crate::nn::data::random_object([32, 32], 4);
-        let patches = object_patches(&object, &addr, [8, 8]);
+        let patches = object_patches(&object, &addr, [8, 8]).unwrap();
         assert_eq!(patches.dims, [3, 8, 8]);
         let detail = phase_detail(&object, DETAIL_SIGMA * 8.0);
         let back = stitch(&patches, &addr).unwrap();
         let mut covered = vec![false; 32 * 32];
-        for f in 0..3 {
-            let [cy, cx] = patch_corner(&addr, f, [8, 8]);
+        for [cy, cx] in patch_corners(&addr, [8, 8]).unwrap() {
             for y in cy..cy + 8 {
                 covered[y * 32 + cx..][..8].fill(true);
             }
@@ -1218,11 +1266,38 @@ mod tests {
             };
             assert!((b - want).norm() < 1e-6, "pixel {i}: {b} vs {want}");
         }
-        let short = Patches {
-            dims: [2, 8, 8],
-            amp: patches.amp[..128].to_vec(),
-            phase: patches.phase[..128].to_vec(),
+    }
+
+    /// Patches of too few values, of other than one per frame, wider than the frame or of
+    /// another object are refused rather than indexed past.
+    #[test]
+    fn patches_that_do_not_fit_the_scan_are_refused() {
+        let positions = Positions::new(vec![0.0, 0.0, 3.0], vec![-3.0, 3.0, 0.0]).unwrap();
+        let addr = AddrTable::new(&positions, [1.0, 1.0], [16, 16], [32, 32], 1, 1).unwrap();
+        let object = crate::nn::data::random_object([32, 32], 4);
+        let patches = object_patches(&object, &addr, [8, 8]).unwrap();
+        fn invalid<T>(r: Result<T, NnError>) -> bool {
+            matches!(r, Err(NnError::Invalid(_)))
+        }
+        let cut = |dims: [usize; 3], len: usize| {
+            Patches::new(
+                dims,
+                patches.amp[..len].to_vec(),
+                patches.phase[..len].to_vec(),
+            )
         };
-        assert!(stitch(&short, &addr).is_err());
+        assert!(invalid(cut([3, 8, 8], 128)));
+        assert!(invalid(Patches::new(
+            [3, 8, 8],
+            patches.amp.clone(),
+            vec![]
+        )));
+        assert!(invalid(stitch(&cut([2, 8, 8], 128).unwrap(), &addr)));
+        let wide = Patches::new([3, 32, 32], vec![1.0; 3 << 10], vec![0.0; 3 << 10]).unwrap();
+        assert!(invalid(stitch(&wide, &addr)));
+        assert!(invalid(object_patches(&object, &addr, [32, 32])));
+        assert!(invalid(object_patches(&object, &addr, [8, 17])));
+        let other = crate::nn::data::random_object([32, 33], 4);
+        assert!(invalid(object_patches(&other, &addr, [8, 8])));
     }
 }

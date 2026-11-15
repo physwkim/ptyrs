@@ -112,7 +112,10 @@ impl PatchPredictor for LivePredictor {
             .predictor
             .network(&self.input)
             .map_err(|e| e.to_string())?;
-        for (o, (a, p)) in out.iter_mut().zip(patches.amp.iter().zip(&patches.phase)) {
+        for (o, (a, p)) in out
+            .iter_mut()
+            .zip(patches.amp().iter().zip(patches.phase()))
+        {
             *o = [a * p.cos(), a * p.sin()];
         }
         Ok(())
