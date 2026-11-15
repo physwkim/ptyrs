@@ -413,9 +413,9 @@ fn on_cpu_and_gpu(
     features: &Features,
     floor: Option<f64>,
 ) {
-    // Measured worst: LLK 1.7e-6, end 7.3e-7, object 1.3e-5 over the whole plane (AP's in two
-    // object modes; most of it the dark band's) and 1.5e-6 weighted by the CPU's illumination
-    // (RAAR's refined in two object modes), probe 2.4e-6, offsets 2.4e-7.
+    // Five-run worst: LLK 1.68e-6, end 7.28e-7, object 1.27e-5 over the whole plane (AP's in
+    // two object modes; most of it the dark band's) and 1.46e-6 weighted by the CPU's
+    // illumination (RAAR's refined in two object modes), probe 2.42e-6, offsets 2.44e-7.
     const TOL: [Option<f64>; 5] = [
         Some(5.1e-6),
         Some(2.2e-6),
@@ -521,10 +521,9 @@ fn rpie_descends_with_the_offsets_held() {
 fn whole_pixel_offsets_are_the_blend() {
     const NCYCLE: usize = 3;
     const TOL_CPU: [Option<f64>; 5] = [Some(1e-12), Some(1e-12), Some(1e-12), Some(1e-12), None];
-    // The GPU's measured worst: LLK 9.7e-7, end 8.7e-7, object 7.1e-6 over the whole plane
-    // (RAAR's) and 1.0e-6 weighted by the blend's illumination (DM's), probe 9.4e-7.
-    const TOL_GPU: [Option<f64>; 5] =
-        [Some(2.9e-6), Some(2.6e-6), Some(2.2e-5), Some(2.9e-6), None];
+    // The GPU's five-run worst: LLK 9.67e-7, end 8.65e-7, object 7.08e-6 over the whole plane
+    // (RAAR's) and 1.02e-6 weighted by the blend's illumination (DM's), probe 9.43e-7.
+    const TOL_GPU: [Option<f64>; 5] = [Some(3e-6), Some(2.6e-6), Some(2.2e-5), Some(2.9e-6), None];
     const TOL_GPU_LIT: f64 = 3.1e-6;
     let (raw, whole) = (fermat(), whole_offsets());
     let moved = |a: usize, v: &[f64]| -> Vec<f64> {
