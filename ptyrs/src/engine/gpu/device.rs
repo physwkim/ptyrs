@@ -38,7 +38,7 @@ use super::{
     to_c32, to_u32, wave_bytes,
 };
 use crate::engine::features::{POSITION_LIMIT, POSITION_STEP};
-use crate::engine::sampling::{OBJ_PCG, OBJ_UNSEEN};
+use crate::engine::sampling::{OBJ_HELD, OBJ_PCG};
 use crate::engine::{
     ApParams, BhParams, BhStep, DmParams, EngineError, Features, LsqmlParams, LsqmlStep, MlParams,
     PlaneStage, RaarParams, RpieParams, Sampling,
@@ -1214,7 +1214,7 @@ impl FeaturesMut<'_> {
             offsets: p.offsets,
             probe,
         };
-        let held = (inertia, OBJ_UNSEEN as f32);
+        let held = (inertia, OBJ_HELD as f32);
         sampler.solve::<OBJ_PCG>(ctx, (solve, spectra), a, obj, sums, held)?;
         Ok(true)
     }

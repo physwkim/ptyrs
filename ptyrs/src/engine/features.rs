@@ -9,7 +9,7 @@ use std::ops::Range;
 use crate::base::{C64, Object, Probe, Stack, View};
 
 use crate::engine::ops::{blend, natural};
-use crate::engine::sampling::{OBJ_PCG, OBJ_UNSEEN, Sampler};
+use crate::engine::sampling::{OBJ_HELD, OBJ_PCG, Sampler};
 use crate::engine::{EngineError, Fft2, Observed, Ptycho, Sampling, shift};
 
 /// The features of a reconstruction's model intensity, each modelled and refined while set;
@@ -697,7 +697,7 @@ impl Shifted {
     /// `A` [`Self::to_psi`] of the object: [`OBJ_PCG`] conjugate-gradient steps on
     /// `(AᴴA + reg)·O' = Aᴴ·psi + reg·O` from `O`, preconditioned by `D + reg`, `D` the exact
     /// diagonal of `AᴴA` ([`Sampler::diag`]) and `reg = inertia·max D`, holding at `O` every
-    /// pixel whose `D + reg` is at most [`OBJ_UNSEEN`]`·max D`. A step along a direction of no
+    /// pixel whose `D + reg` is at most [`OBJ_HELD`]`·max D`. A step along a direction of no
     /// positive curvature, or after a residual of no positive norm, is 0. Where the sampling
     /// moves nothing `AᴴA = D`, the first step is `blend` on the pixels it does not hold and
     /// the rest move it within rounding; at sub-pixel positions `AᴴA` couples the pixels, and
@@ -715,7 +715,7 @@ impl Shifted {
         let max = d.as_slice().iter().fold(0.0, |a: f64, &b| a.max(b));
         let reg = max * inertia;
         // A held pixel's infinite preconditioner zeroes its share of every step.
-        let held = OBJ_UNSEEN * max;
+        let held = OBJ_HELD * max;
         let pre: Vec<f64> = (d.as_slice().iter())
             .map(|d| d + reg)
             .map(|v| if v > held { v } else { f64::INFINITY })

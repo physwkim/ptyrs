@@ -469,7 +469,7 @@ impl ObjectSampler {
     /// the windows weighted by the probe and `reg = inertia max D`: `STEPS` conjugate-gradient
     /// steps on `(AᴴA + reg) O' = num + reg O` from `O`, preconditioned by `D + reg`, `D`
     /// `AᴴA`'s diagonal into `sums.den`, holding at `O` every pixel whose `D + reg` is at most
-    /// `unseen max D`. A step along a direction of no positive curvature, or after a residual
+    /// `held max D`. A step along a direction of no positive curvature, or after a residual
     /// of no positive norm, is 0. Every scalar stays on the device, so the launches capture;
     /// `state`, built by this sampler, and `spectra`, one object of them, are scratch. Zeroes
     /// `sums.num` and `sums.den`, which it consumed.
@@ -480,7 +480,7 @@ impl ObjectSampler {
         a: Normal<'_>,
         obj: &mut DeviceBuffer<C32>,
         sums: &mut UpdateSums,
-        (inertia, unseen): (f32, f32),
+        (inertia, held): (f32, f32),
     ) -> Result<(), Error> {
         if state.dims != self.dims {
             return Err(Error::Shape(format!(
@@ -520,14 +520,7 @@ impl ObjectSampler {
             .launch(ctx, &reads, &[state.scalars.storage()], |stream| {
                 // SAFETY: `max_bits` holds one word, `pcg` as `Pcg` says.
                 unsafe {
-                    (self.module).pcg_reg(
-                        stream,
-                        blocks(1, 1),
-                        dptr(max_bits),
-                        inertia,
-                        unseen,
-                        pcg,
-                    )
+                    (self.module).pcg_reg(stream, blocks(1, 1), dptr(max_bits), inertia, held, pcg)
                 }
             })?;
         let (cg, sum) = (blocks(CG_BLOCKS, PIXEL_THREADS), blocks(1, PIXEL_THREADS));

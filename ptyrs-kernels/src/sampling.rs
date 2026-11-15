@@ -518,7 +518,7 @@ pub mod sampling_kernels {
         unsafe { store_c(scratch, t, v) };
     }
 
-    /// `s[PCG_REG] = inertia * max` and `s[PCG_HELD] = unseen * max`, the object solve's
+    /// `s[PCG_REG] = inertia * max` and `s[PCG_HELD] = held * max`, the object solve's
     /// regularization and held threshold, `max = f32::from_bits(*max_bits)` the bits of
     /// `max(D)`. One thread.
     ///
@@ -526,11 +526,11 @@ pub mod sampling_kernels {
     ///
     /// `max_bits` one word, `pcg` as [`Pcg`] says.
     #[kernel]
-    pub unsafe fn pcg_reg(max_bits: *const u32, inertia: f32, unseen: f32, pcg: Pcg) {
+    pub unsafe fn pcg_reg(max_bits: *const u32, inertia: f32, held: f32, pcg: Pcg) {
         if global_index() == 0 {
             let max = unsafe { f32::from_bits(*max_bits) };
             unsafe { *pcg.s.add(PCG_REG as usize) = inertia * max };
-            unsafe { *pcg.s.add(PCG_HELD as usize) = unseen * max };
+            unsafe { *pcg.s.add(PCG_HELD as usize) = held * max };
         }
     }
 
