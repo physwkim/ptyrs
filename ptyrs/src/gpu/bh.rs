@@ -239,24 +239,25 @@ impl BhDisp<'_> {
 
 /// One stack's fields the Hessian reads, each of `nf_max * nmode` planes like a stack's
 /// `psi`: the forward-FFT'd exit waves, the residual after its inverse FFT, and the
-/// forward-FFT'd derivatives along `u` and `v` (`lv` unread without `v`); and `views`, those
-/// the object is read through: the epoch's, or under full-object sampling the windows'.
+/// forward-FFT'd derivatives along `u` and, with CG, `v`; and `views`, those the object is
+/// read through: the epoch's, or under full-object sampling the windows'.
 pub struct BhFieldsRef<'a> {
     pub views: &'a Views,
     pub psi: &'a DeviceBuffer<C32>,
     pub r: &'a DeviceBuffer<C32>,
     pub lu: &'a DeviceBuffer<C32>,
-    pub lv: &'a DeviceBuffer<C32>,
+    pub lv: Option<&'a DeviceBuffer<C32>>,
 }
 
 impl BhFieldsRef<'_> {
-    /// The fields a Hessian launch reads, each checked as `len` long, `lv` only with `cg`
+    /// The fields a Hessian launch with `cg` or without reads, each checked as `len` long
     /// ([`touched`]): their storages and pointers.
     fn read(&self, cg: bool, len: usize) -> Result<(Vec<&RawDeviceBuffer>, BhFields), Error> {
         for (what, b) in [("psi", self.psi), ("r", self.r)] {
             check_len(what, b, len)?;
         }
-        let (l, [lu, lv]) = touched([("lu", self.lu), ("lv", self.lv)], cg, len)?;
+        let lv = (["lv"], self.lv.map(|b| [b]));
+        let (l, lu, [lv]) = touched(("lu", self.lu), lv, cg, len)?;
         let mut storages = vec![self.psi.storage(), self.r.storage()];
         storages.extend(l);
         let far = BhFar {
@@ -324,22 +325,42 @@ pub struct BhLastSlice<'a> {
 }
 
 /// One stack's derivatives through a multislice object, each of `nf_max * nmode` planes
-/// like its `psi`: `lu`, `lv` along `u` and `v`, `m` the second derivatives along `(u, u)`,
-/// `(u, v)` and `(v, v)`; without CG `lv`, `m[1]` and `m[2]` are neither checked nor touched.
+/// like its `psi`: `lu` along `u`, `muu` the second along `(u, u)`, and with CG `cg`: `lv`
+/// along `v` and the second along `(u, v)` and `(v, v)`.
 pub struct BhTangentsMut<'a> {
     pub lu: &'a mut DeviceBuffer<C32>,
-    pub lv: &'a mut DeviceBuffer<C32>,
-    pub m: &'a mut [DeviceBuffer<C32>; 3],
+    pub muu: &'a mut DeviceBuffer<C32>,
+    pub cg: Option<[&'a mut DeviceBuffer<C32>; 3]>,
 }
 
 impl BhTangentsMut<'_> {
-    /// The tangents a launch along a step touches, each checked as `len` long: `lu` and
-    /// `m[0]`, and only with `cg` `lv`, `m[1]` and `m[2]` ([`touched`]); their storages and
-    /// pointers.
+    /// `lu` and with CG `lv`, as [`BhKernels::pos_spec`] writes them.
+    pub fn first(&mut self) -> (&mut DeviceBuffer<C32>, Option<&mut DeviceBuffer<C32>>) {
+        (&mut *self.lu, self.cg.as_mut().map(|[lv, ..]| &mut **lv))
+    }
+
+    /// `muu` and with CG the second derivatives along `(u, v)` and `(v, v)`, as
+    /// [`BhKernels::pos_second`] writes them.
+    pub fn second(&mut self) -> (&mut DeviceBuffer<C32>, Option<[&mut DeviceBuffer<C32>; 2]>) {
+        let m = self.cg.as_mut().map(|[_, uv, vv]| [&mut **uv, &mut **vv]);
+        (&mut *self.muu, m)
+    }
+
+    /// The second derivatives as [`BhKernels::sliced_hess_frames`] reads them.
+    pub fn second_ref(&self) -> BhSecondRef<'_> {
+        BhSecondRef {
+            uu: self.muu,
+            cg: self.cg.as_ref().map(|[_, uv, vv]| [&**uv, &**vv]),
+        }
+    }
+
+    /// The tangents a launch with `cg` or without touches, each checked as `len` long
+    /// ([`touched`]); their storages and pointers.
     fn touched(&self, cg: bool, len: usize) -> Result<(Vec<&RawDeviceBuffer>, BhTangents), Error> {
-        let [muu, muv, mvv] = &*self.m;
-        let (mut s, [lu, lv]) = touched([("lu", &*self.lu), ("lv", &*self.lv)], cg, len)?;
-        let (m, [muu, muv, mvv]) = touched([("muu", muu), ("muv", muv), ("mvv", mvv)], cg, len)?;
+        let lv = (["lv"], self.cg.as_ref().map(|[lv, ..]| [&**lv]));
+        let (mut s, lu, [lv]) = touched(("lu", &*self.lu), lv, cg, len)?;
+        let m = self.second_ref();
+        let (m, muu, [muv, mvv]) = touched(("muu", m.uu), (["muv", "mvv"], m.cg), cg, len)?;
         s.extend(m);
         Ok((
             s,
@@ -605,23 +626,22 @@ impl<'a> BhMovedRef<'a> {
 /// One stack under the position model as [`BhKernels::pos_near`] reads it, each in
 /// [`Kernels::obj_probe_to_psi`]'s layout: the object, the moved probes `w` (`[nf_max *
 /// nprobe, ny, nx]`, as `crate::gpu::PositionKernels::shift_w` leaves them), the residual
-/// after its inverse FFT, and `lu`, `lv` the inverse-FFT'd [`BhKernels::pos_spec`] (`lv`
-/// neither checked nor touched without CG).
+/// after its inverse FFT, and `lu` and with CG `lv` the inverse-FFT'd [`BhKernels::pos_spec`].
 pub struct BhNearMut<'a> {
     pub obj: &'a DeviceBuffer<C32>,
     pub w: &'a DeviceBuffer<C32>,
     pub r: &'a DeviceBuffer<C32>,
     pub lu: &'a mut DeviceBuffer<C32>,
-    pub lv: &'a mut DeviceBuffer<C32>,
+    pub lv: Option<&'a mut DeviceBuffer<C32>>,
 }
 
 /// One stack's far fields [`BhKernels::pos_far`] reads, each of `nf_max * nmode` planes: the
-/// forward-FFT'd exit waves, the forward-FFT'd [`BhKernels::pos_near`] `lu` and `lv` (`lv`
-/// unread without CG), and the forward-FFT'd [`BhKernels::obj_conj`] of the residual.
+/// forward-FFT'd exit waves, the forward-FFT'd [`BhKernels::pos_near`] `lu` and with CG `lv`,
+/// and the forward-FFT'd [`BhKernels::obj_conj`] of the residual.
 pub struct BhMovedFarRef<'a> {
     pub psi: &'a DeviceBuffer<C32>,
     pub lu: &'a DeviceBuffer<C32>,
-    pub lv: &'a DeviceBuffer<C32>,
+    pub lv: Option<&'a DeviceBuffer<C32>>,
     pub y: &'a DeviceBuffer<C32>,
 }
 
@@ -790,25 +810,28 @@ fn window_block(dims: &ViewDims, g: &StackGeom) -> usize {
     dims.nobj as usize * g.nf_max as usize * dims.n()
 }
 
-/// Of a launch's `bufs` along a step, those its kernel touches: the first, and the rest,
-/// which every BH kernel touches only with CG, exactly with `cg`. Each touched one is checked
-/// as `len` long under its name; returns their storages, to lease, and every buffer's
-/// pointer, the first's standing in for the rest without `cg`.
+/// A launch's buffers along a step, `cg` its CG: `first`, and `with_cg`, named, which every BH
+/// kernel touches only with CG and a launch takes exactly with it. Each is checked as `len`
+/// long under its name; returns their storages, to lease, and their pointers, `first`'s
+/// standing in for `with_cg`'s without CG, which the kernels never read.
 fn touched<'b, const N: usize>(
-    bufs: [(&str, &'b DeviceBuffer<C32>); N],
+    first: (&str, &'b DeviceBuffer<C32>),
+    (names, with_cg): ([&str; N], Option<[&'b DeviceBuffer<C32>; N]>),
     cg: bool,
     len: usize,
-) -> Result<(Vec<&'b RawDeviceBuffer>, [*mut f32; N]), Error> {
-    let listed = &bufs[..if cg { N } else { 1 }];
-    for &(what, b) in listed {
-        check_len(what, b, len)?;
+) -> Result<(Vec<&'b RawDeviceBuffer>, *mut f32, [*mut f32; N]), Error> {
+    if with_cg.is_some() != cg {
+        let names = names.join(", ");
+        return Err(Error::Shape(format!("{names} given exactly with CG")));
     }
-    let storages = listed.iter().map(|&(_, b)| b.storage()).collect();
-    let first = bufs[0].1;
-    Ok((
-        storages,
-        bufs.map(|(_, b)| dptr(if cg { b } else { first })),
-    ))
+    let named = with_cg.map(|b| names.into_iter().zip(b));
+    let mut storages = Vec::with_capacity(1 + N);
+    for (what, b) in std::iter::once(first).chain(named.into_iter().flatten()) {
+        check_len(what, b, len)?;
+        storages.push(b.storage());
+    }
+    let ptrs = with_cg.map_or([dptr(first.1); N], |b| b.map(dptr));
+    Ok((storages, dptr(first.1), ptrs))
 }
 
 /// Values of the object and of the probe.
@@ -871,8 +894,8 @@ impl BhKernels {
     }
 
     /// The stack's far-field derivatives before their forward FFT, in
-    /// [`Kernels::obj_probe_to_psi`]'s layout, at `x = [O, P]`: `l[0] = q (u_P O + P u_O)` and,
-    /// with `d.v`, `l[1]` likewise along `v` (else `l[1]` is left as it is).
+    /// [`Kernels::obj_probe_to_psi`]'s layout, at `x = [O, P]`: `lu = q (u_P O + P u_O)` and,
+    /// with `d.v`, `lv` likewise along `v`.
     pub fn far(
         &self,
         ctx: &ExecutionContext,
@@ -880,7 +903,7 @@ impl BhKernels {
         stack: StackRef<'_>,
         x: [&DeviceBuffer<C32>; 2],
         d: &BhDisp<'_>,
-        l: [&mut DeviceBuffer<C32>; 2],
+        (lu, lv): (&mut DeviceBuffer<C32>, Option<&mut DeviceBuffer<C32>>),
     ) -> Result<(), Error> {
         let dims = views.dims();
         let g = dims.geom(stack)?;
@@ -889,8 +912,8 @@ impl BhKernels {
             check_len(what, b, n as usize)?;
         }
         d.check(dims)?;
-        let [lu, lv] = l;
-        let (writes, lp) = touched([("lu", &*lu), ("lv", &*lv)], d.v.is_some(), len)?;
+        let lv = (["lv"], lv.as_deref().map(|b| [b]));
+        let (writes, lu, [lv]) = touched(("lu", &*lu), lv, d.v.is_some(), len)?;
         let config = grid_1d(len)?;
         let mut reads = vec![views.addr().storage(), stack.storage()];
         reads.extend(x.iter().map(|b| b.storage()));
@@ -909,8 +932,8 @@ impl BhKernels {
                     x,
                     d.ptrs(),
                     dptr::<ViewAddr, ViewAddr>(views.addr()),
-                    lp[0],
-                    lp[1],
+                    lu,
+                    lv,
                     stack.ctl() as *const StackCtl,
                     g,
                 )
@@ -986,8 +1009,7 @@ impl BhKernels {
     /// `views`. Entered by the probe, `l_u` and `l_v` are `d`'s probe parts (`u`'s times
     /// `d.u_scale`), `m` is 0 and `t` only written; else `t` holds `w`'s and `d`'s probe parts
     /// are unread (entered by the moved probes, `t` holds theirs: the inverse FFTs of
-    /// [`Self::pos_spec`] and [`Self::pos_second`]). Without `d.v` only `t.lu` and `t.m[0]`
-    /// are checked and touched.
+    /// [`Self::pos_spec`] and [`Self::pos_second`]). `t.cg` is given exactly with `d.v`.
     pub fn slice_tangent(
         &self,
         ctx: &ExecutionContext,
@@ -1027,8 +1049,8 @@ impl BhKernels {
 
     /// [`Self::hess_frames`] through a multislice object: the near term from `m`, the exit
     /// waves' second derivatives of [`Self::slice_tangent`], and `f.r` with the adjoint of
-    /// the last slice's plane phase already on it, as on `f.lu` and `f.lv` its phase; with
-    /// `m.cg` it reads `f.lv`.
+    /// the last slice's plane phase already on it, as on `f.lu` and `f.lv` its phase; `f.lv`
+    /// is given exactly with `m.cg`.
     pub fn sliced_hess_frames(
         &self,
         ctx: &ExecutionContext,
@@ -1044,8 +1066,7 @@ impl BhKernels {
         let len = g.nf_max as usize * dims.nmode as usize * n;
         let cg = m.cg.is_some();
         let (read, fields) = f.read(cg, len)?;
-        let [uv, vv] = m.cg.unwrap_or([m.uu; 2]);
-        let (second, [uu, uv, vv]) = touched([("muu", m.uu), ("muv", uv), ("mvv", vv)], cg, len)?;
+        let (second, uu, [uv, vv]) = touched(("muu", m.uu), (["muv", "mvv"], m.cg), cg, len)?;
         parts.check(dims)?;
         let config = hess_grid(g.nf_max, n)?;
         let mut reads = vec![
@@ -1356,20 +1377,20 @@ impl BhKernels {
     }
 
     /// The spectra of the stack's moved probes' first-order changes along the step's `u`
-    /// into `l[0]` and with CG `v` into `l[1]` (else `l[1]` is left as it is), one per view in
-    /// [`Kernels::obj_probe_to_psi`]'s layout, ready for their inverse FFT.
+    /// into `lu` and with CG `v` into `lv`, one per view in [`Kernels::obj_probe_to_psi`]'s
+    /// layout, ready for their inverse FFT.
     pub fn pos_spec(
         &self,
         ctx: &ExecutionContext,
         stack: StackRef<'_>,
         mv: &BhMovesRef<'_>,
-        l: [&mut DeviceBuffer<C32>; 2],
+        (lu, lv): (&mut DeviceBuffer<C32>, Option<&mut DeviceBuffer<C32>>),
     ) -> Result<(), Error> {
         let dims = mv.check()?;
         let g = dims.geom(stack)?;
         let len = g.nf_max as usize * dims.nmode as usize * dims.n();
-        let [lu, lv] = l;
-        let (writes, lp) = touched([("lu", &*lu), ("lv", &*lv)], mv.av.is_some(), len)?;
+        let lv = (["lv"], lv.as_deref().map(|b| [b]));
+        let (writes, lu, [lv]) = touched(("lu", &*lu), lv, mv.av.is_some(), len)?;
         let config = grid_1d(len)?;
         let mut reads = mv.storages();
         reads.push(stack.storage());
@@ -1382,8 +1403,8 @@ impl BhKernels {
                     config,
                     mv.ptrs(),
                     dptr::<ViewAddr, ViewAddr>(views),
-                    lp[0],
-                    lp[1],
+                    lu,
+                    lv,
                     stack.ctl() as *const StackCtl,
                     g,
                 )
@@ -1392,21 +1413,20 @@ impl BhKernels {
     }
 
     /// The spectra of the stack's moved probes' second-order changes along the step's `(u,
-    /// u)` into `m[0]` and with CG `(u, v)`, `(v, v)` into `m[1]`, `m[2]` (else left as they
-    /// are), laid out as [`Self::pos_spec`]'s and ready for their inverse FFT.
+    /// u)` into `muu` and with CG `(u, v)`, `(v, v)` into `m`'s two, laid out as
+    /// [`Self::pos_spec`]'s and ready for their inverse FFT.
     pub fn pos_second(
         &self,
         ctx: &ExecutionContext,
         stack: StackRef<'_>,
         mv: &BhMovesRef<'_>,
-        m: &mut [DeviceBuffer<C32>; 3],
+        (muu, m): (&mut DeviceBuffer<C32>, Option<[&mut DeviceBuffer<C32>; 2]>),
     ) -> Result<(), Error> {
         let dims = mv.check()?;
         let g = dims.geom(stack)?;
         let len = g.nf_max as usize * dims.nmode as usize * dims.n();
-        let [muu, muv, mvv] = &*m;
-        let second = [("muu", muu), ("muv", muv), ("mvv", mvv)];
-        let (writes, mp) = touched(second, mv.av.is_some(), len)?;
+        let m = (["muv", "mvv"], m.as_ref().map(|[uv, vv]| [&**uv, &**vv]));
+        let (writes, muu, [muv, mvv]) = touched(("muu", &*muu), m, mv.av.is_some(), len)?;
         let config = grid_1d(len)?;
         let mut reads = mv.storages();
         reads.push(stack.storage());
@@ -1419,9 +1439,9 @@ impl BhKernels {
                     config,
                     mv.ptrs(),
                     dptr::<ViewAddr, ViewAddr>(views),
-                    mp[0],
-                    mp[1],
-                    mp[2],
+                    muu,
+                    muv,
+                    mvv,
                     stack.ctl() as *const StackCtl,
                     g,
                 )
@@ -1430,9 +1450,9 @@ impl BhKernels {
     }
 
     /// The near Hessian triples along `d` of the stack's frames under the position model
-    /// into those of [`BhParts`], as [`Self::hess_frames`] places them, from `f.lu`, `f.lv`
-    /// the inverse-FFT'd [`Self::pos_spec`]; then in place the exit waves' first-order
-    /// changes `lu = u_O W + O δ_u W` and with `d.v` `lv` likewise, ready for their forward
+    /// into those of [`BhParts`], as [`Self::hess_frames`] places them, from `f.lu` and with
+    /// `d.v` `f.lv`, the inverse-FFT'd [`Self::pos_spec`]; then in place the exit waves'
+    /// first-order changes `lu = u_O W + O δ_u W` and `lv` likewise, ready for their forward
     /// FFT. `views` are the epoch's.
     pub fn pos_near(
         &self,
@@ -1450,7 +1470,8 @@ impl BhKernels {
         check_len("obj", f.obj, dims.obj_len())?;
         check_len("w", f.w, g.nf_max as usize * dims.nprobe as usize * n)?;
         check_len("r", f.r, len)?;
-        let (mut writes, [lu, lv]) = touched([("lu", &*f.lu), ("lv", &*f.lv)], d.v.is_some(), len)?;
+        let lv = (["lv"], f.lv.as_deref().map(|b| [b]));
+        let (mut writes, lu, [lv]) = touched(("lu", &*f.lu), lv, d.v.is_some(), len)?;
         d.check(dims)?;
         parts.check(dims)?;
         let config = chunk_grid(&g, n)?;
@@ -1509,7 +1530,8 @@ impl BhKernels {
         for (what, b) in [("psi", f.psi), ("y", f.y)] {
             check_len(what, b, len)?;
         }
-        let (l, [lu, lv]) = touched([("lu", f.lu), ("lv", f.lv)], mv.av.is_some(), len)?;
+        let lv = (["lv"], f.lv.map(|b| [b]));
+        let (l, lu, [lv]) = touched(("lu", f.lu), lv, mv.av.is_some(), len)?;
         parts.check(dims)?;
         let config = chunk_grid(&g, n)?;
         let mut reads = mv.storages();
@@ -1550,20 +1572,20 @@ impl BhKernels {
             })
     }
 
-    /// [`Self::pos_spec`] with the offsets held: `l[0] = e s Au_p` and with CG `l[1] = e
-    /// Av_p` (else `l[1]` is left as it is), `e` each frame's ramp of `mv`'s offsets.
+    /// [`Self::pos_spec`] with the offsets held: `lu = e s Au_p` and with CG `lv = e Av_p`, `e`
+    /// each frame's ramp of `mv`'s offsets.
     pub fn moved_spec(
         &self,
         ctx: &ExecutionContext,
         stack: StackRef<'_>,
         mv: &BhMovedRef<'_>,
-        l: [&mut DeviceBuffer<C32>; 2],
+        (lu, lv): (&mut DeviceBuffer<C32>, Option<&mut DeviceBuffer<C32>>),
     ) -> Result<(), Error> {
         let dims = mv.check()?;
         let g = dims.geom(stack)?;
         let len = g.nf_max as usize * dims.nmode as usize * dims.n();
-        let [lu, lv] = l;
-        let (writes, lp) = touched([("lu", &*lu), ("lv", &*lv)], mv.av.is_some(), len)?;
+        let lv = (["lv"], lv.as_deref().map(|b| [b]));
+        let (writes, lu, [lv]) = touched(("lu", &*lu), lv, mv.av.is_some(), len)?;
         let config = grid_1d(len)?;
         let mut reads = mv.storages();
         reads.push(stack.storage());
@@ -1576,8 +1598,8 @@ impl BhKernels {
                     config,
                     mv.ptrs(),
                     dptr::<ViewAddr, ViewAddr>(views),
-                    lp[0],
-                    lp[1],
+                    lu,
+                    lv,
                     stack.ctl() as *const StackCtl,
                     g,
                 )
@@ -1779,10 +1801,9 @@ impl BhKernels {
     /// The stack's derivatives `t` along `d` through `last`'s plane phase, in place with the
     /// phase itself left out: on entry those of the slice's exit ([`Self::slice_tangent`]),
     /// after it those of the exit waves once [`crate::gpu::OpticsKernels::slice_phase`] puts
-    /// the phase on `t.lu` and `t.lv` and its adjoint is on the residual, as
-    /// [`Self::sliced_hess_frames`] reads them. Of `d` only whether it has `v` is read; without
-    /// it only `t.lu` and `t.m[0]` are checked and touched. `off`'s views are those the slice
-    /// is read through.
+    /// the phase on `t.lu` and its `lv` and its adjoint is on the residual, as
+    /// [`Self::sliced_hess_frames`] reads them. Of `d` only whether it has `v` is read, and
+    /// `t.cg` is given exactly with it. `off`'s views are those the slice is read through.
     pub fn phase_tangent(
         &self,
         ctx: &ExecutionContext,

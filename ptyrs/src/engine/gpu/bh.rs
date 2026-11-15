@@ -9,9 +9,9 @@ use std::sync::Arc;
 use crate::gpu::sampling::{Modes, StackPoints, WindowBlock, window_views};
 use crate::gpu::{
     BhBatch, BhDisp, BhEntry, BhFarRef, BhFieldsRef, BhLastSlice, BhMovedFarRef, BhMovedRef,
-    BhMovesRef, BhNearMut, BhOffsets, BhPositions, BhScan, BhSecondRef, BhTangentsMut, BhVar,
-    BhWinRef, BhWinSecond, C32, EpochOrder, Error as GpuError, FrameWaves, FusedInputs, Kernels,
-    Model, PsiSums, ShiftProbe, SliceSource, SpectrumBuf, UpdateSums, ViewDims, Views,
+    BhMovesRef, BhNearMut, BhOffsets, BhPositions, BhScan, BhTangentsMut, BhVar, BhWinRef,
+    BhWinSecond, C32, EpochOrder, Error as GpuError, FrameWaves, FusedInputs, Kernels, Model,
+    PsiSums, ShiftProbe, SliceSource, SpectrumBuf, UpdateSums, ViewDims, Views,
 };
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaStream, DeviceBuffer, DriverError};
@@ -532,8 +532,8 @@ impl Bufs<'_> {
             match &mut hess {
                 None => {
                     let x = [&*self.obj, &*self.probe];
-                    self.bh
-                        .far(ctx, views, stack, x, &d, [&mut *bh.lu, &mut *bh.lv])?;
+                    let l = (&mut *bh.lu, cg.then_some(&mut *bh.lv));
+                    self.bh.far(ctx, views, stack, x, &d, l)?;
                     prop.forward(ctx, plan, stack, bh.lu)?;
                     if cg {
                         prop.forward(ctx, plan, stack, bh.lv)?;
@@ -543,12 +543,12 @@ impl Bufs<'_> {
                         psi: &bh.psi[i],
                         r: &bh.r[i],
                         lu: bh.lu,
-                        lv: bh.lv,
+                        lv: cg.then_some(&*bh.lv),
                     };
                     self.bh.hess_frames(ctx, scan, stack, &f, &d, bh.parts)?;
                 }
                 Some((mh, w)) => {
-                    let l = [&mut *bh.lu, &mut *bh.lv];
+                    let l = (&mut *bh.lu, cg.then_some(&mut *bh.lv));
                     match mh {
                         MovedHess::Stepped(mv, _) => self.bh.pos_spec(ctx, stack, mv, l)?,
                         MovedHess::Held(mv) => self.bh.moved_spec(ctx, stack, mv, l)?,
@@ -562,7 +562,7 @@ impl Bufs<'_> {
                         w: &w[i],
                         r: &bh.r[i],
                         lu: bh.lu,
-                        lv: bh.lv,
+                        lv: cg.then_some(&mut *bh.lv),
                     };
                     self.bh.pos_near(ctx, views, stack, near, &d, bh.parts)?;
                     prop.forward(ctx, plan, stack, bh.lu)?;
@@ -576,7 +576,7 @@ impl Bufs<'_> {
                             let f = BhMovedFarRef {
                                 psi: &bh.psi[i],
                                 lu: bh.lu,
-                                lv: bh.lv,
+                                lv: cg.then_some(&*bh.lv),
                                 y,
                             };
                             self.bh.pos_far(ctx, self.counts, stack, &f, mv, bh.parts)?;
@@ -731,8 +731,8 @@ impl Bufs<'_> {
                 ..d
             };
             let x = [win, &*self.probe];
-            self.bh
-                .far(ctx, wv, stack, x, &lifted, [&mut *bh.lu, &mut *bh.lv])?;
+            let l = (&mut *bh.lu, cg.then_some(&mut *bh.lv));
+            self.bh.far(ctx, wv, stack, x, &lifted, l)?;
             prop.forward(ctx, plan, stack, bh.lu)?;
             if cg {
                 prop.forward(ctx, plan, stack, bh.lv)?;
@@ -742,7 +742,7 @@ impl Bufs<'_> {
                 psi: &bh.psi[i],
                 r: &bh.r[i],
                 lu: bh.lu,
-                lv: bh.lv,
+                lv: cg.then_some(&*bh.lv),
             };
             self.bh
                 .hess_frames(ctx, scan, stack, &f, &lifted, bh.parts)?;
@@ -948,19 +948,18 @@ impl Bufs<'_> {
             let stack = bh.table.at(s);
             let plan = bh.plans.get(bh.stacks[s].plan);
             let (inc, win) = (&incident[i], &wins[i]);
+            let [muu, muv, mvv] = &mut *work;
             let mut t = BhTangentsMut {
                 lu: bh.lu,
-                lv: bh.lv,
-                m: work,
+                muu,
+                cg: cg.then_some([&mut *bh.lv, muv, mvv]),
             };
             for (l, [su, sv]) in sp.iter().enumerate() {
                 if let Some(gap) = l.checked_sub(1).map(|j| &sl.gaps[j]) {
                     ok.gap(ctx, &dims, stack, gap, t.lu, false)?;
-                    ok.gap(ctx, &dims, stack, gap, &mut t.m[0], false)?;
-                    if cg {
-                        ok.gap(ctx, &dims, stack, gap, t.lv, false)?;
-                        ok.gap(ctx, &dims, stack, gap, &mut t.m[1], false)?;
-                        ok.gap(ctx, &dims, stack, gap, &mut t.m[2], false)?;
+                    ok.gap(ctx, &dims, stack, gap, t.muu, false)?;
+                    for x in t.cg.iter_mut().flatten() {
+                        ok.gap(ctx, &dims, stack, gap, x, false)?;
                     }
                 }
                 for block in blocks(FIRST).take(1) {
@@ -987,25 +986,22 @@ impl Bufs<'_> {
             }
             if let Some(p) = phase {
                 ok.slice_phase(ctx, &dims, stack, p, t.lu, false)?;
-                if cg {
-                    ok.slice_phase(ctx, &dims, stack, p, t.lv, false)?;
+                if let Some([lv, ..]) = &mut t.cg {
+                    ok.slice_phase(ctx, &dims, stack, p, lv, false)?;
                 }
             }
             prop.forward(ctx, plan, stack, t.lu)?;
-            if cg {
-                prop.forward(ctx, plan, stack, t.lv)?;
+            if let Some([lv, ..]) = &mut t.cg {
+                prop.forward(ctx, plan, stack, lv)?;
             }
             let f = BhFieldsRef {
                 views: wv,
                 psi: &bh.psi[i],
                 r: &bh.r[i],
                 lu: t.lu,
-                lv: t.lv,
+                lv: t.cg.as_ref().map(|[lv, ..]| &**lv),
             };
-            let m = BhSecondRef {
-                uu: &t.m[0],
-                cg: cg.then(|| [&t.m[1], &t.m[2]]),
-            };
+            let m = t.second_ref();
             (self.bh).sliced_hess_frames(ctx, scan, stack, &f, &m, bh.parts)?;
             let Some(BhWinStepOwn { off, second }) = &mut own else {
                 continue;
@@ -1224,29 +1220,30 @@ impl Bufs<'_> {
         for (i, s) in batch.clone().enumerate() {
             let stack = bh.table.at(s);
             let plan = bh.plans.get(bh.stacks[s].plan);
+            let [muu, muv, mvv] = &mut *work;
             let mut t = BhTangentsMut {
                 lu: bh.lu,
-                lv: bh.lv,
-                m: work,
+                muu,
+                cg: cg.then_some([&mut *bh.lv, muv, mvv]),
             };
             // The first slice's entry: the probe, or the moved probes with their changes
             // along the step in `t` (none of the second order with the offsets held).
             let entry = match &hess {
                 None => BhEntry::Probe(self.probe),
                 Some((mh, w, _)) => {
-                    let l = [&mut *t.lu, &mut *t.lv];
                     match mh {
                         MovedHess::Stepped(mv, _) => {
-                            self.bh.pos_spec(ctx, stack, mv, l)?;
-                            self.bh.pos_second(ctx, stack, mv, t.m)?;
+                            self.bh.pos_spec(ctx, stack, mv, t.first())?;
+                            self.bh.pos_second(ctx, stack, mv, t.second())?;
                         }
-                        MovedHess::Held(mv) => self.bh.moved_spec(ctx, stack, mv, l)?,
+                        MovedHess::Held(mv) => self.bh.moved_spec(ctx, stack, mv, t.first())?,
                     }
                     plan.inverse_inplace(ctx, t.lu)?;
-                    if cg {
-                        plan.inverse_inplace(ctx, t.lv)?;
+                    if let Some([lv, ..]) = &mut t.cg {
+                        plan.inverse_inplace(ctx, lv)?;
                     }
-                    for x in t.m.iter_mut().take(if cg { 3 } else { 1 }) {
+                    let (muu, m) = t.second();
+                    for x in std::iter::once(muu).chain(m.into_iter().flatten()) {
                         match mh {
                             MovedHess::Stepped(..) => plan.inverse_inplace(ctx, x)?,
                             MovedHess::Held(_) => crate::gpu::zero(ctx, x)?,
@@ -1259,11 +1256,9 @@ impl Bufs<'_> {
             for j in 0..deeper {
                 let gap = &sl.gaps[j];
                 ok.gap(ctx, &dims, stack, gap, t.lu, false)?;
-                ok.gap(ctx, &dims, stack, gap, &mut t.m[0], false)?;
-                if cg {
-                    ok.gap(ctx, &dims, stack, gap, t.lv, false)?;
-                    ok.gap(ctx, &dims, stack, gap, &mut t.m[1], false)?;
-                    ok.gap(ctx, &dims, stack, gap, &mut t.m[2], false)?;
+                ok.gap(ctx, &dims, stack, gap, t.muu, false)?;
+                for x in t.cg.iter_mut().flatten() {
+                    ok.gap(ctx, &dims, stack, gap, x, false)?;
                 }
                 let dj = BhDisp {
                     u: [&grads[j].num, d.u[1]],
@@ -1283,25 +1278,22 @@ impl Bufs<'_> {
             }
             if let Some(p) = slice_phase(sl.quad, hess.as_ref().map(|h| h.2)) {
                 ok.slice_phase(ctx, &dims, stack, p, t.lu, false)?;
-                if cg {
-                    ok.slice_phase(ctx, &dims, stack, p, t.lv, false)?;
+                if let Some([lv, ..]) = &mut t.cg {
+                    ok.slice_phase(ctx, &dims, stack, p, lv, false)?;
                 }
             }
             prop.forward(ctx, plan, stack, t.lu)?;
-            if cg {
-                prop.forward(ctx, plan, stack, t.lv)?;
+            if let Some([lv, ..]) = &mut t.cg {
+                prop.forward(ctx, plan, stack, lv)?;
             }
             let f = BhFieldsRef {
                 views,
                 psi: &bh.psi[i],
                 r: &bh.r[i],
                 lu: t.lu,
-                lv: t.lv,
+                lv: t.cg.as_ref().map(|[lv, ..]| &**lv),
             };
-            let m = BhSecondRef {
-                uu: &t.m[0],
-                cg: cg.then(|| [&t.m[1], &t.m[2]]),
-            };
+            let m = t.second_ref();
             (self.bh).sliced_hess_frames(ctx, scan, stack, &f, &m, bh.parts)?;
         }
         self.bh.step(ctx, &dims, bh.parts, &d, &step, bh.steps)?;

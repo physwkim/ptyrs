@@ -4,7 +4,8 @@
 //! rates measured from that kernel; [`BhKernels::pos_second`] against central differences of
 //! [`BhKernels::pos_spec`]; [`BhKernels::slice_tangent`] against the slice's exit derivatives
 //! in f64, and the probes `PositionKernels::shift_w` moved, as its entry, against waves holding
-//! the probes moved on the host; and the partials' segments.
+//! the probes moved on the host; the partials' segments; and that each launch's CG-only
+//! buffers are given exactly with CG.
 
 use std::f64::consts::TAU;
 
@@ -326,18 +327,11 @@ fn phase_grad_is_zeros_without_the_phase() {
     phase_grad_case(0.0);
 }
 
-/// A tangent's length: [`FIELD`], or one value for a CG-only one (`lv`, `muv`, `mvv`)
-/// without CG, which a launch takes only when it neither checks nor touches it. The kernel
-/// then gets `lu`'s or `muu`'s pointer in its place, so a stray write shows on those.
-fn tangent_len(cg_only: bool, cg: bool) -> usize {
-    if cg_only && !cg { 1 } else { FIELD }
-}
-
 /// `phase_tangent` at `quad`, per entry kind, against the derivatives of `exp(i (t S_u + τ
 /// S_v)) (X + t l_u + τ l_v + t² m_uu / 2 + t τ m_uv + τ² m_vv / 2)` at 0 by central
 /// differences in f64: `Φ ψ` dephased, `S_u`, `S_v` the phase's angle along `u`'s and `v`'s
-/// offsets of the measured rates. Planes past the stack's frames stay as they were; without
-/// CG `lv`, `muv` and `mvv` go unchecked ([`tangent_len`]).
+/// offsets of the measured rates. Planes past the stack's frames stay as they were; `lv`,
+/// `muv` and `mvv` are given exactly with CG.
 fn phase_tangent_case(quad: f32, cg: bool) {
     let fx = fixture();
     let rates = phase_rates(&fx);
@@ -364,10 +358,9 @@ fn phase_tangent_case(quad: f32, cg: bool) {
         for (s, frames) in STACKS.iter().enumerate() {
             let seed = 100 * k as u64 + 10 * s as u64 + 10;
             let (e, e_h) = fx.field(entry_len(kind), seed);
-            let fields =
-                [1, 2, 3, 4, 5].map(|i| fx.field(tangent_len(i == 2 || i > 3, cg), seed + i));
-            let [mut lu, mut lv, muu, muv, mvv] = fields.each_ref().map(|f| f.0.clone_on(&fx));
-            let mut m = [muu, muv, mvv];
+            let fields = [1, 2, 3, 4, 5].map(|i| fx.field(FIELD, seed + i));
+            let [mut lu, mut lv, mut muu, mut muv, mut mvv] =
+                fields.each_ref().map(|f| f.0.clone_on(&fx));
             let last = BhLastSlice {
                 slice: &slice,
                 entry: entry(kind, &e),
@@ -375,8 +368,8 @@ fn phase_tangent_case(quad: f32, cg: bool) {
             };
             let mut t = BhTangentsMut {
                 lu: &mut lu,
-                lv: &mut lv,
-                m: &mut m,
+                muu: &mut muu,
+                cg: cg.then_some([&mut lv, &mut muv, &mut mvv]),
             };
             let at = fx.table.at(s);
             fx.bh
@@ -418,7 +411,7 @@ fn phase_tangent_case(quad: f32, cg: bool) {
                     want[4][j] = (psi(0.0, h) - 2.0 * p0 + psi(0.0, -h)) / (h * h);
                 }
             }
-            let got = [&lu, &lv, &m[0], &m[1], &m[2]].map(|b| fx.host(b));
+            let got = [&lu, &lv, &muu, &muv, &mvv].map(|b| fx.host(b));
             let names = ["lu", "lv", "muu", "muv", "mvv"];
             let written = frames.len() * NMODE * N;
             for b in 0..5 {
@@ -496,8 +489,8 @@ fn moves(fx: &Fixture) -> Moves {
     }
 }
 
-/// `pos_spec`'s `(lu, lv)` of stack `s` along `mv`'s displacement, for the probes moved by
-/// `offsets` (by epoch position) of the estimate's `probe`.
+/// `pos_spec`'s `lu` and with CG `lv` of stack `s` along `mv`'s displacement, for the probes
+/// moved by `offsets` (by epoch position) of the estimate's `probe`.
 fn spec_at(
     fx: &Fixture,
     mv: &Moves,
@@ -505,7 +498,7 @@ fn spec_at(
     s: usize,
     offsets: &[f32],
     probe: &[C32],
-) -> [Vec<C64>; 2] {
+) -> Vec<Vec<C64>> {
     let mut bufs = BhPositions::zeroed(&fx.stream, &fx.dims, 1).unwrap();
     bufs.ud.copy_from_host(&fx.stream, &mv.ud).unwrap();
     bufs.prev.copy_from_host(&fx.stream, &mv.prev).unwrap();
@@ -533,17 +526,21 @@ fn spec_at(
         spectrum: a,
     };
     let mvr = BhMovesRef::new(&d, shift, au, cg.then_some(av), &off).unwrap();
-    let [mut lu, mut lv] = [false, true].map(|cg_only| fx.field(tangent_len(cg_only, cg), 9).0);
+    let mut lu = fx.field(FIELD, 9).0;
+    let mut lv = cg.then(|| fx.field(FIELD, 9).0);
     fx.bh
-        .pos_spec(ctx, fx.table.at(s), &mvr, [&mut lu, &mut lv])
+        .pos_spec(ctx, fx.table.at(s), &mvr, (&mut lu, lv.as_mut()))
         .unwrap();
-    [fx.host(&lu), fx.host(&lv)]
+    std::iter::once(&lu)
+        .chain(&lv)
+        .map(|b| fx.host(b))
+        .collect()
 }
 
 /// `pos_second` against central differences of `pos_spec` along each direction: the moved
 /// probes' spectra `e(o + t d) (A + t a)` change to first order as `pos_spec` writes, so its
 /// change along `(t_u, t_v)` is their second order. The planes past the stack's frames stay
-/// as they were; without CG `muv` and `mvv` go unchecked ([`tangent_len`]).
+/// as they were; `muv` and `mvv` are given exactly with CG.
 fn pos_second_case(cg: bool) {
     let fx = fixture();
     let mv = moves(&fx);
@@ -613,10 +610,11 @@ fn pos_second_case(cg: bool) {
     };
     let mvr = BhMovesRef::new(&d, shift, au, cg.then_some(av), &off).unwrap();
     for (s, frames) in STACKS.iter().enumerate() {
-        let fields = [1, 2, 3].map(|i| fx.field(tangent_len(i > 1, cg), 20 + 10 * s as u64 + i));
-        let mut m = fields.each_ref().map(|f| f.0.clone_on(&fx));
-        fx.bh.pos_second(ctx, fx.table.at(s), &mvr, &mut m).unwrap();
-        let got = m.each_ref().map(|b| fx.host(b));
+        let fields = [1, 2, 3].map(|i| fx.field(FIELD, 20 + 10 * s as u64 + i));
+        let [mut muu, mut muv, mut mvv] = fields.each_ref().map(|f| f.0.clone_on(&fx));
+        let m = (&mut muu, cg.then_some([&mut muv, &mut mvv]));
+        fx.bh.pos_second(ctx, fx.table.at(s), &mvr, m).unwrap();
+        let got = [&muu, &muv, &mvv].map(|b| fx.host(b));
         let written = frames.len() * NMODE * N;
         let want = [
             Some(diff(&mv.ud, &scaled, s, 0)),
@@ -651,8 +649,8 @@ fn pos_second_is_the_change_of_pos_spec_cg() {
 /// [`exit`] sampling each term: `l_u ← x l_u + u_x w`, `m_uu ← x m_uu + 2 u_x l_u` and with CG
 /// `l_v ← x l_v + v_x w`, `m_uv ← x m_uv + u_x l_v + v_x l_u`, `m_vv ← x m_vv + 2 v_x l_v`;
 /// entered by the probe `l_u` is `U_SCALE` times `u`'s probe part, `l_v` `v`'s and `m` 0.
-/// Planes past the stack's frames stay as they were; without CG `lv`, `muv` and `mvv` go
-/// unchecked ([`tangent_len`]).
+/// Planes past the stack's frames stay as they were; `lv`, `muv` and `mvv` are given exactly
+/// with CG.
 fn slice_tangent_case(cg: bool) {
     let fx = fixture();
     let obj = fx.dims.obj_len();
@@ -672,14 +670,13 @@ fn slice_tangent_case(cg: bool) {
         for (s, frames) in STACKS.iter().enumerate() {
             let seed = 100 * k as u64 + 10 * s as u64 + 10;
             let (e, e_h) = fx.field(entry_len(kind), seed);
-            let fields =
-                [1, 2, 3, 4, 5].map(|i| fx.field(tangent_len(i == 2 || i > 3, cg), seed + i));
-            let [mut lu, mut lv, muu, muv, mvv] = fields.each_ref().map(|f| f.0.clone_on(&fx));
-            let mut m = [muu, muv, mvv];
+            let fields = [1, 2, 3, 4, 5].map(|i| fx.field(FIELD, seed + i));
+            let [mut lu, mut lv, mut muu, mut muv, mut mvv] =
+                fields.each_ref().map(|f| f.0.clone_on(&fx));
             let mut t = BhTangentsMut {
                 lu: &mut lu,
-                lv: &mut lv,
-                m: &mut m,
+                muu: &mut muu,
+                cg: cg.then_some([&mut lv, &mut muv, &mut mvv]),
             };
             let entered = (&slice, entry(kind, &e));
             fx.bh
@@ -720,7 +717,7 @@ fn slice_tangent_case(cg: bool) {
                 want[3] = Some(add(&xm(3), &cross, 1.0));
                 want[4] = Some(add(&xm(4), &by(&v[0].1, lv_in), 2.0));
             }
-            let got = [&lu, &lv, &m[0], &m[1], &m[2]].map(|b| fx.host(b));
+            let got = [&lu, &lv, &muu, &muv, &mvv].map(|b| fx.host(b));
             for (b, name) in ["lu", "lv", "muu", "muv", "mvv"].into_iter().enumerate() {
                 let Some(w) = &want[b] else {
                     continue;
@@ -822,25 +819,27 @@ fn moved_entry_case(cg: bool) {
             }
         }
         let waves = DeviceBuffer::from_host(&fx.stream, &waves).unwrap();
-        let fields =
-            [1, 2, 3, 4, 5].map(|i| fx.field(tangent_len(i == 2 || i > 3, cg), seed + i).0);
+        let fields = [1, 2, 3, 4, 5].map(|i| fx.field(FIELD, seed + i).0);
+        // `lu`, `muu` and with CG `lv`, `muv`, `mvv`, as written.
         let run = |e: &DeviceBuffer<C32>, kind: u32| {
-            let [mut lu, mut lv, muu, muv, mvv] = fields.each_ref().map(|f| f.clone_on(&fx));
-            let mut m = [muu, muv, mvv];
+            let [mut lu, mut muu, mut lv, mut muv, mut mvv] =
+                fields.each_ref().map(|f| f.clone_on(&fx));
             let mut t = BhTangentsMut {
                 lu: &mut lu,
-                lv: &mut lv,
-                m: &mut m,
+                muu: &mut muu,
+                cg: cg.then_some([&mut lv, &mut muv, &mut mvv]),
             };
             let views = fx.order.views();
             fx.bh
                 .slice_tangent(ctx, views, stack, (&slice, entry(kind, e)), &d, &mut t)
                 .unwrap();
-            [&lu, &lv, &m[0], &m[1], &m[2]].map(|b| fx.host(b))
+            let given = if cg { 5 } else { 2 };
+            let all = [&lu, &muu, &lv, &muv, &mvv];
+            all[..given].iter().map(|b| fx.host(b)).collect::<Vec<_>>()
         };
         let (got, want) = (run(&moved, BH_ENTRY_MOVED), run(&waves, BH_ENTRY_WAVES));
-        for (b, name) in ["lu", "lv", "muu", "muv", "mvv"].into_iter().enumerate() {
-            close(&format!("stack {s} {name}"), &got[b], &want[b], 1e-5);
+        for ((g, w), name) in got.iter().zip(&want).zip(["lu", "muu", "lv", "muv", "mvv"]) {
+            close(&format!("stack {s} {name}"), g, w, 1e-5);
         }
         assert_ne!(got[0], fx.host(&fields[0]), "stack {s}: lu not written");
     }
@@ -854,6 +853,143 @@ fn moved_entry_is_the_waves_holding_it() {
 #[test]
 fn moved_entry_is_the_waves_holding_it_cg() {
     moved_entry_case(true);
+}
+
+/// `launch(cg, given)` with and without CG, its CG-only buffers given and not: refused
+/// unless they are given exactly with CG.
+fn lv_given_exactly_with_cg(mut launch: impl FnMut(bool, bool) -> Result<(), Error>) {
+    for cg in [false, true] {
+        for given in [false, true] {
+            match launch(cg, given) {
+                Ok(()) if given == cg => {}
+                Err(Error::Shape(m)) if given != cg && m == "lv given exactly with CG" => {}
+                e => panic!("cg {cg}, given {given}: {e:?}"),
+            }
+        }
+    }
+}
+
+/// The step along the object and probe parts `u`, and with `cg` `v`.
+fn disp<'a>(u: &'a [DeviceBuffer<C32>; 2], v: &'a [DeviceBuffer<C32>; 2], cg: bool) -> BhDisp<'a> {
+    BhDisp {
+        u: [&u[0], &u[1]],
+        u_scale: U_SCALE,
+        v: cg.then_some([&v[0], &v[1]]),
+    }
+}
+
+fn parts_uv(fx: &Fixture) -> [[DeviceBuffer<C32>; 2]; 2] {
+    [1, 3].map(|s| {
+        [
+            fx.field(fx.dims.obj_len(), s).0,
+            fx.field(NPROBE * N, s + 1).0,
+        ]
+    })
+}
+
+#[test]
+fn tangents_take_lv_muv_mvv_exactly_with_cg() {
+    let fx = fixture();
+    let [u, v] = parts_uv(&fx);
+    let slice = fx.field(fx.dims.obj_len(), 5).0;
+    let probe = fx.field(NPROBE * N, 6).0;
+    let [mut lu, mut muu, mut lv, mut muv, mut mvv] =
+        [7, 8, 9, 10, 11].map(|s| fx.field(FIELD, s).0);
+    lv_given_exactly_with_cg(|cg, given| {
+        let mut t = BhTangentsMut {
+            lu: &mut lu,
+            muu: &mut muu,
+            cg: given.then_some([&mut lv, &mut muv, &mut mvv]),
+        };
+        let entered = (&slice, BhEntry::Probe(&probe));
+        let (views, at) = (fx.order.views(), fx.table.at(0));
+        (fx.bh).slice_tangent(&fx.ctx, views, at, entered, &disp(&u, &v, cg), &mut t)
+    });
+}
+
+#[test]
+fn fields_take_lv_exactly_with_cg() {
+    let fx = fixture();
+    let [u, v] = parts_uv(&fx);
+    let counts = DeviceBuffer::<u16>::zeroed(&fx.stream, NFRAME * N).unwrap();
+    let scan = BhScan {
+        order: &fx.order,
+        counts: &counts,
+    };
+    let mut parts = BhParts::zeroed(&fx.stream, &fx.dims, 0).unwrap();
+    let [psi, r, lu, lv] = [5, 6, 7, 8].map(|s| fx.field(FIELD, s).0);
+    lv_given_exactly_with_cg(|cg, given| {
+        let f = BhFieldsRef {
+            views: fx.order.views(),
+            psi: &psi,
+            r: &r,
+            lu: &lu,
+            lv: given.then_some(&lv),
+        };
+        let (d, at) = (disp(&u, &v, cg), fx.table.at(0));
+        fx.bh.hess_frames(&fx.ctx, scan, at, &f, &d, &mut parts)
+    });
+}
+
+#[test]
+fn near_takes_lv_exactly_with_cg() {
+    let fx = fixture();
+    let [u, v] = parts_uv(&fx);
+    let mut parts = BhParts::zeroed(&fx.stream, &fx.dims, 0).unwrap();
+    let obj = fx.field(fx.dims.obj_len(), 5).0;
+    let w = fx.field(NF_MAX * NPROBE * N, 6).0;
+    let [r, mut lu, mut lv] = [7, 8, 9].map(|s| fx.field(FIELD, s).0);
+    lv_given_exactly_with_cg(|cg, given| {
+        let f = BhNearMut {
+            obj: &obj,
+            w: &w,
+            r: &r,
+            lu: &mut lu,
+            lv: given.then_some(&mut lv),
+        };
+        let (d, at) = (disp(&u, &v, cg), fx.table.at(0));
+        (fx.bh).pos_near(&fx.ctx, fx.order.views(), at, f, &d, &mut parts)
+    });
+}
+
+#[test]
+fn moved_far_takes_lv_exactly_with_cg() {
+    let fx = fixture();
+    let (ctx, dims) = (&fx.ctx, &fx.dims);
+    let [u, v] = parts_uv(&fx);
+    let mut bufs = BhPositions::zeroed(&fx.stream, dims, 1).unwrap();
+    let off = BhOffsets {
+        bufs: &mut bufs,
+        order: &fx.order,
+        scale: 1.0,
+        step: 1.0,
+    };
+    let probe = fx.field(NPROBE * N, 5).0;
+    let mut spectra = [0; 3].map(|_| SpectrumBuf::zeroed(&fx.stream, dims).unwrap());
+    let [ba, bu, bv] = &mut spectra;
+    let a = fx.kernels.probe_spectrum(ctx, dims, &probe, ba).unwrap();
+    let au = fx.kernels.probe_spectrum(ctx, dims, &u[1], bu).unwrap();
+    let av = fx.kernels.probe_spectrum(ctx, dims, &v[1], bv).unwrap();
+    let offsets = fx.offsets(&[0.0; 2 * NFRAME]);
+    let shift = Shift {
+        offsets: &offsets,
+        spectrum: a,
+    };
+    let counts = DeviceBuffer::<u16>::zeroed(&fx.stream, NFRAME * N).unwrap();
+    let mut parts = BhParts::zeroed(&fx.stream, dims, 0).unwrap();
+    let [psi, lu, lv, y] = [6, 7, 8, 9].map(|s| fx.field(FIELD, s).0);
+    lv_given_exactly_with_cg(|cg, given| {
+        let d = disp(&u, &v, cg);
+        let mv = BhMovesRef::new(&d, shift, au, cg.then_some(av), &off).unwrap();
+        let f = BhMovedFarRef {
+            psi: &psi,
+            lu: &lu,
+            lv: given.then_some(&lv),
+            y: &y,
+        };
+        fx.bh
+            .pos_far(ctx, &counts, fx.table.at(0), &f, &mv, &mut parts)
+    });
 }
 
 /// A segment past the partials' last is refused, by `partials` and by each kernel that
