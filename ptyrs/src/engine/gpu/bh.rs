@@ -651,7 +651,7 @@ impl Bufs<'_> {
             grads,
             prev,
         } = w;
-        let deeper = sl.deeper.len();
+        let deeper = self.deeper.len();
         let phase = slice_phase(sl.quad, None);
 
         for (i, s) in batch.clone().enumerate() {
@@ -665,7 +665,7 @@ impl Bufs<'_> {
                 let (src, rest) = inc[j..].split_first_mut().expect("j < deeper");
                 let dst = rest.first_mut().unwrap_or(&mut *psi);
                 let src = SliceSource::Waves(FrameWaves::Views(src));
-                ok.slice_mul(ctx, views, stack, &sl.deeper[j], src, dst)?;
+                ok.slice_mul(ctx, views, stack, &self.deeper[j], src, dst)?;
             }
             if let Some(p) = phase {
                 ok.slice_phase(ctx, &dims, stack, p, psi, false)?;
@@ -684,7 +684,7 @@ impl Bufs<'_> {
                 let c = if t == 0 { &*r } else { held };
                 ok.slice_pair(ctx, &dims, stack, [&inc[j], c], x)?;
                 k.psi_to_obj(ctx, views, stack, x, sl.ones, &mut grads[j])?;
-                ok.slice_adjoint(ctx, views, stack, &sl.deeper[j], c, x)?;
+                ok.slice_adjoint(ctx, views, stack, &self.deeper[j], c, x)?;
                 ok.gap(ctx, &dims, stack, &sl.gaps[j], x, true)?;
             }
             let c = &work[(deeper - 1) % 2];
@@ -726,7 +726,7 @@ impl Bufs<'_> {
                     v: d.v.map(|v| [&prev[j], v[1]]),
                     ..d
                 };
-                let at = (&sl.deeper[j], BhEntry::Waves(&incident[i][j]));
+                let at = (&self.deeper[j], BhEntry::Waves(&incident[i][j]));
                 self.bh.slice_tangent(ctx, views, stack, at, &dj, &mut t)?;
             }
             if let Some(p) = phase {
@@ -782,8 +782,8 @@ impl Bufs<'_> {
                 scale: rho2,
             },
         ];
-        if let (Some(sl), Some(w)) = (self.slices.as_mut(), bh.sliced.as_deref_mut()) {
-            let slices = (sl.deeper.iter_mut().zip(&mut w.prev)).zip(&mut w.grads);
+        if let Some(w) = bh.sliced.as_deref_mut() {
+            let slices = (self.deeper.iter_mut().zip(&mut w.prev)).zip(&mut w.grads);
             vars.extend(slices.map(|((x, prev), g)| BhVar {
                 x,
                 prev,

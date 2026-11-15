@@ -29,16 +29,7 @@ pub struct ThroughputCache {
 impl ThroughputCache {
     /// Gets or creates the global `ThroughputCache` for one device.
     pub fn get_for_device(runtime: &str, properties: &DeviceProperties) -> Arc<Mutex<Self>> {
-        let hardware = &properties.hardware;
-        let name = device_key(
-            runtime,
-            &properties.identity,
-            properties.memory.max_page_size,
-            hardware
-                .num_cpu_cores
-                .or(hardware.num_streaming_multiprocessors)
-                .unwrap_or(0),
-        );
+        let name = part_key(runtime, properties);
         let mut cache_map = GLOBAL_CACHE.lock();
         let cache_map = cache_map.get_or_insert_with(HashMap::new);
 
@@ -106,6 +97,20 @@ fn device_key(runtime: &str, identity: &DeviceIdentity, capacity: u64, paralleli
         segment(runtime),
         segment(fingerprint),
         segment(name)
+    )
+}
+
+/// The [`device_key`] every persistent per-device cache, throughput and autotune, is stored under.
+pub(crate) fn part_key(runtime: &str, properties: &DeviceProperties) -> String {
+    let hardware = &properties.hardware;
+    device_key(
+        runtime,
+        &properties.identity,
+        properties.memory.max_page_size,
+        hardware
+            .num_cpu_cores
+            .or(hardware.num_streaming_multiprocessors)
+            .unwrap_or(0),
     )
 }
 

@@ -2,6 +2,7 @@ use super::{AutotuneKey, AutotuneOutput, TunableSet, TuneInputs, Tuner};
 #[cfg(feature = "autotune-checks")]
 use crate::tune::AutotuneLoggerExt;
 use crate::{client::Client, tune::TuneCacheResult};
+#[cfg(feature = "autotune-checks")]
 use alloc::string::ToString;
 use alloc::sync::Arc;
 use core::{
@@ -26,14 +27,21 @@ pub struct LocalTuner<AK: AutotuneKey, ID> {
     sets: Sets<ID>,
 }
 
-/// Create a local tuner with the provided name.
+/// Create a local tuner with the provided name. The name carries the declaring crate's version, so
+/// results persisted under one version of its candidates are never served to another.
 #[macro_export]
 macro_rules! local_tuner {
     ($name:expr) => {
-        LocalTuner::new(concat!(module_path!(), "-", $name))
+        LocalTuner::new(concat!(
+            module_path!(),
+            "@",
+            env!("CARGO_PKG_VERSION"),
+            "-",
+            $name
+        ))
     };
     () => {
-        LocalTuner::new(module_path!());
+        LocalTuner::new(concat!(module_path!(), "@", env!("CARGO_PKG_VERSION")));
     };
 }
 
@@ -186,7 +194,9 @@ where
                 .entry(id.clone())
                 .or_insert_with(move || {
                     let name = self.name.replace("::", "-");
-                    Arc::new(Tuner::new(&name, &id.to_string()))
+                    // The part, never `id`, whose index is whichever card was made visible first.
+                    let part = crate::throughput::part_key(client.name(), client.properties());
+                    Arc::new(Tuner::new(&name, &part))
                 })
                 .clone()
         };

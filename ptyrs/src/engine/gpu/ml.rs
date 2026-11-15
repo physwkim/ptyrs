@@ -1,22 +1,24 @@
 //! PyNX ML (Poisson conjugate gradient) on the GPU. The opening scale and the gradient pass
 //! run as AP's projection does ([`super::GpuOptions::fused`]); the line search always by
 //! M1's launches through [`Propagate`], under a position by the moved probes of
-//! [`Kernels::shifted_probe`].
+//! [`Kernels::shifted_probe`], or under [`crate::engine::Sampling::FullObject`] by the windows
+//! of the object and of its direction.
 
 use std::sync::Arc;
 
 use crate::base::{C64, Stack};
+use crate::gpu::sampling::{Modes, WindowBlock, window_views};
 use crate::gpu::{
     C32, CG_BLOCKS, Ended, Error as GpuError, Exit, FarSums, FusedBufs, FusedInputs, FusedSums,
     GammaCounts, Kernels, Model, PositionKernels, RecordWriter, Shift, ShiftProbe, SpectrumBuf,
-    ViewDims,
+    ViewDims, Views,
 };
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaStream, DeviceBuffer};
 
-use super::device::{M1Bufs, MlBufs, PassesMut};
+use super::device::{M1Bufs, MlBufs, PassesMut, Sample};
 use super::propagate::Propagate;
-use super::{Bufs, Epoch, GpuPtycho, plane_len};
+use super::{Bufs, Cut, Epoch, GpuPtycho, plane_len};
 use crate::engine::ptycho::llk_due;
 use crate::engine::{EngineError, MlParams};
 
@@ -29,7 +31,9 @@ impl GpuPtycho {
     /// model and steps them, and the cycle models the stepped values. With a position, every
     /// pass models the probe moved by each frame's offsets, an AP projection of the estimate
     /// takes each frame's position sums after the features' step, and the offsets step after
-    /// the update.
+    /// the update; under [`crate::engine::Sampling::FullObject`] the passes read each stack's
+    /// windows of the object sampled at the offsets instead, the object's gradient is placed
+    /// back from them, and the line search samples those of the direction too.
     pub fn ml(&mut self, params: &MlParams, ncycle: usize) -> Result<(), EngineError> {
         self.dev.scale_to_photons(self.total_obs as f32)?;
         for ic in 0..ncycle {
@@ -62,6 +66,14 @@ impl GpuPtycho {
     }
 }
 
+/// What the line search adds under a position model, by what its offsets move.
+pub(super) enum MlPosition {
+    /// The probe: its moved probes.
+    Moved(Box<MlMoved>),
+    /// The object: its windows.
+    Sampled(Box<MlWindows>),
+}
+
 /// The line search's moved probes under the position model, per stack: `w[0]` the
 /// estimate's and `w[1]` the probe direction's, `[nf_max * nprobe, ny, nx]` each as
 /// [`PositionKernels::shift_w`] leaves them, and the probe direction's spectra.
@@ -89,6 +101,51 @@ impl MlMoved {
             kernels: PositionKernels::load(kernels)?,
         })
     }
+}
+
+/// The line search's windows under [`crate::engine::Sampling::FullObject`]: the views over
+/// its cut's stacks' windows, a stack's windows of the estimate's object and of its direction
+/// `[nobj, nf_max, ny, nx]`, the views' object each, and the direction's spectra.
+pub(super) struct MlWindows {
+    views: Views,
+    win: [DeviceBuffer<C32>; 2],
+    spectra: DeviceBuffer<C32>,
+}
+
+impl MlWindows {
+    /// For `cut`'s stacks of the views of `dims` and an object of `obj_len` values.
+    pub(super) fn new(
+        stream: &Arc<CudaStream>,
+        dims: &ViewDims,
+        cut: &Cut,
+        obj_len: usize,
+    ) -> Result<Self, EngineError> {
+        let stacks: Vec<_> = cut.frames.iter().map(|f| f.range.clone()).collect();
+        let views = window_views(stream, dims, &stacks)?;
+        let len = views.dims().obj_len();
+        Ok(Self {
+            views,
+            win: [
+                DeviceBuffer::zeroed(stream, len)?,
+                DeviceBuffer::zeroed(stream, len)?,
+            ],
+            spectra: DeviceBuffer::zeroed(stream, obj_len)?,
+        })
+    }
+}
+
+/// The line search's position state over one cycle's stacks.
+enum Line<'a> {
+    /// No position.
+    Fixed,
+    /// The moved probes' buffers and kernels, and the shifts of P and of dP.
+    Moved(
+        &'a mut [DeviceBuffer<C32>; 2],
+        &'a PositionKernels,
+        [Shift<'a>; 2],
+    ),
+    /// The windows, the direction's spectra taken.
+    Sampled(&'a mut MlWindows),
 }
 
 impl Bufs<'_> {
@@ -143,12 +200,13 @@ impl Bufs<'_> {
             }
         }
 
-        // γ along d, then the step. Under a position, the fields are those of the moved
-        // probes W of P and W' of dP: po = O W, a = dO W + O W', b = dO W'.
+        // γ along d, then the step. Under a moved probe, the fields are those of the moved
+        // probes W of P and W' of dP: po = O W, a = dO W + O W', b = dO W'; under the windows,
+        // those of the windows of O and dO.
         let dims = *self.views.dims();
-        let m = self
-            .features
-            .lend(ctx, self.kernels, &dims, self.obj, self.probe, self.exit)?;
+        let mut m =
+            self.features
+                .lend(ctx, self.kernels, &dims, self.obj, self.probe, self.exit)?;
         let obs = GammaCounts {
             counts: self.counts,
             model: Model {
@@ -156,23 +214,27 @@ impl Bufs<'_> {
                 ..m.model
             },
         };
-        let mut moved = match (m.model.shift, ml.moved.as_deref_mut()) {
-            (None, _) => None,
-            (Some(shift), Some(mv)) => {
+        let mut line = match (m.model.shift, ml.position.as_deref_mut()) {
+            (None, None) => Line::Fixed,
+            (Some(shift), Some(MlPosition::Moved(mv))) => {
                 let MlMoved {
                     w,
                     spectrum,
                     kernels,
-                } = mv;
+                } = &mut **mv;
                 let dshift = Shift {
                     spectrum: self
                         .kernels
                         .probe_spectrum(ctx, &dims, &ml.d[1], spectrum)?,
                     ..shift
                 };
-                Some((w, kernels, [shift, dshift]))
+                Line::Moved(w, kernels, [shift, dshift])
             }
-            (Some(_), None) => {
+            (None, Some(MlPosition::Sampled(sw))) => {
+                m.spectra_of(ctx, &ml.d[0], &mut sw.spectra)?;
+                Line::Sampled(sw)
+            }
+            _ => {
                 return Err(GpuError::Shape(
                     "ML state built for another position model".into(),
                 ));
@@ -186,13 +248,30 @@ impl Bufs<'_> {
         for s in 0..ml.cut.len() {
             let (stack, frames) = (ml.cut.at(s), &ml.cut.frames[s]);
             let d = [&ml.d[0], &ml.d[1]];
-            match &mut moved {
-                None => {
+            match &mut line {
+                Line::Fixed => {
                     let x = [&*self.obj, &*self.probe];
                     self.grad
                         .gamma_fields(ctx, self.views, stack, x, d, ml.fields)?;
                 }
-                Some((w, kernels, shifts)) => {
+                Line::Sampled(sw) => {
+                    let MlWindows {
+                        views,
+                        win: [o, d_obj],
+                        spectra,
+                    } = &mut **sw;
+                    let block = WindowBlock {
+                        slice: 0,
+                        order: [0, 0],
+                        modes: Modes::All,
+                        block: 0,
+                    };
+                    m.windows_of(ctx, self.views, stack, None, block, o)?;
+                    m.windows_of(ctx, self.views, stack, Some(spectra), block, d_obj)?;
+                    let (x, d) = ([&*o, &*self.probe], [&*d_obj, d[1]]);
+                    self.grad.gamma_fields(ctx, views, stack, x, d, ml.fields)?;
+                }
+                Line::Moved(w, kernels, shifts) => {
                     let [w0, w1] = &mut **w;
                     for (w, probe, shift) in
                         [(&mut *w0, &*self.probe, shifts[0]), (w1, d[1], shifts[1])]
@@ -239,7 +318,9 @@ impl Bufs<'_> {
     }
 
     /// Each frame's position sums of the estimate under the model, from the AP projection of
-    /// its exit waves, stack by stack; the pass writes nothing else the cycle reads.
+    /// its exit waves, stack by stack; the pass writes nothing else the cycle reads. Under
+    /// its windows, the projection reads the stack's windows, sampled with their
+    /// derivatives, and the sums are taken against them.
     fn projected_position_sums(
         &mut self,
         ctx: &ExecutionContext,
@@ -250,6 +331,25 @@ impl Bufs<'_> {
             self.features
                 .lend(ctx, self.kernels, &dims, self.obj, self.probe, self.exit)?;
         for s in 0..self.scratch.len() {
+            let stack = self.scratch.at(s);
+            let exit = Exit::Ap {
+                far: FarSums::default(),
+            };
+            let windows = self.windows.as_deref_mut();
+            if let Some(w) = m.windows(ctx, self.views, stack, windows, Sample::Derivatives)? {
+                let read = w.read;
+                let inputs = FusedInputs {
+                    views: read.views,
+                    counts: self.counts,
+                    obj: read.blocks,
+                    probe: self.probe,
+                    model: m.model,
+                };
+                let sums = FusedSums::default();
+                (self.kernels).fused_project(ctx, &inputs, stack, exit, f, sums)?;
+                m.window_position_sums(ctx, self.grad, read, stack, f.work(), self.probe)?;
+                continue;
+            }
             let inputs = FusedInputs {
                 views: self.views,
                 counts: self.counts,
@@ -257,15 +357,12 @@ impl Bufs<'_> {
                 probe: self.probe,
                 model: m.model,
             };
-            let exit = Exit::Ap {
-                far: FarSums::default(),
-            };
             let sums = FusedSums {
                 shift: m.shift_sums(None, true),
                 ..FusedSums::default()
             };
             self.kernels
-                .fused_project(ctx, &inputs, self.scratch.at(s), exit, f, sums)?;
+                .fused_project(ctx, &inputs, stack, exit, f, sums)?;
         }
         Ok(())
     }
@@ -293,7 +390,9 @@ impl Bufs<'_> {
     }
 
     /// The stacks of [`Self::ml_grad`] by one fused pass each; with a position, the shifted
-    /// probe's sums become the probe's after the last stack.
+    /// probe's sums become the probe's after the last stack. Under its windows, the pass
+    /// reads the stack's windows and adds the object's gradient over them, placed back after
+    /// it.
     fn fused_grad(
         &mut self,
         ctx: &ExecutionContext,
@@ -307,6 +406,34 @@ impl Bufs<'_> {
                 .lend(ctx, self.kernels, &dims, self.obj, self.probe, self.exit)?;
         for s in 0..self.scratch.len() {
             let stack = self.scratch.at(s);
+            let windows = self.windows.as_deref_mut();
+            if let Some(mut w) = m.windows(ctx, self.views, stack, windows, Sample::Windows)? {
+                let read = w.read;
+                let inputs = FusedInputs {
+                    views: read.views,
+                    counts: self.counts,
+                    obj: read.blocks,
+                    probe: self.probe,
+                    model: m.model,
+                };
+                let far = FarSums {
+                    llk: llk.is_some().then_some(&mut *self.llk),
+                    ..FarSums::default()
+                };
+                let sums = FusedSums {
+                    obj: update[0].then(|| w.zeroed_sums(ctx)).transpose()?,
+                    probe: update[1].then_some(&mut *self.probe_sums),
+                    ..FusedSums::default()
+                };
+                (self.kernels).fused_project(ctx, &inputs, stack, Exit::Grad { far }, f, sums)?;
+                if let Some(rec) = &mut llk {
+                    rec.push(ctx, &dims, stack, self.llk)?;
+                }
+                if update[0] {
+                    m.place(ctx, self.views, stack, w.patches(), &mut self.obj_sums.num)?;
+                }
+                continue;
+            }
             let inputs = FusedInputs {
                 views: self.views,
                 counts: self.counts,
@@ -377,7 +504,8 @@ impl Bufs<'_> {
     /// [`crate::engine::Ptycho::scale_obj_probe`] on the device, `total` being the unmasked observed
     /// photons: the calculated photons of the exit waves over the same unmasked pixels, each
     /// frame's times its intensity scale (stack by stack, by the LLK pass `passes` hold, the
-    /// fused one under the position model) and summed in frame order, then
+    /// fused one under the position model, over the stack's windows under its windows) and
+    /// summed in frame order, then
     /// [`Bufs::scale_obj_probe`], all without a host sync.
     pub(super) fn scale_to_photons(
         &mut self,
@@ -405,7 +533,7 @@ impl Bufs<'_> {
                 }
             }
             PassesMut::Fused(f) => {
-                let m = self.features.lend(
+                let mut m = self.features.lend(
                     ctx,
                     self.kernels,
                     &dims,
@@ -422,10 +550,12 @@ impl Bufs<'_> {
                 };
                 for s in 0..self.scratch.len() {
                     let stack = self.scratch.at(s);
+                    let windows = self.windows.as_deref_mut();
+                    let (views, obj) = m.object(ctx, (self.views, self.obj), stack, windows)?;
                     let inputs = FusedInputs {
-                        views: self.views,
+                        views,
                         counts: self.counts,
-                        obj: self.obj,
+                        obj,
                         probe: self.probe,
                         model,
                     };

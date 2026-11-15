@@ -11,7 +11,9 @@
 //! [`Kernels::shifted_probe`] left into the moved probe `W`; with the stack's `chi`,
 //! [`PositionKernels::sums`] takes the object slopes and the stack's position sums against
 //! the object the batch started from. After the batch's update, [`PositionKernels::step`]
-//! steps its frames' offsets.
+//! steps its frames' offsets. Where each view samples its object at its offset instead and
+//! the probe stays put, [`PositionKernels::derivative_sums`] takes the sums from the sampled
+//! windows' derivatives.
 
 use std::ops::Range;
 
@@ -20,6 +22,7 @@ use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig};
 use ptyrs_kernels::fft_ept;
 use ptyrs_kernels::fused::FUSED_COLS;
 use ptyrs_kernels::grad::GAMMA_CHUNK;
+use ptyrs_kernels::optics::WavePlanes;
 use ptyrs_kernels::pixel::PIXEL_THREADS;
 pub use ptyrs_kernels::position::PositionRule;
 use ptyrs_kernels::position::{BatchSpan, POSITION_SUMS, PositionSums, position_kernels};
@@ -27,8 +30,8 @@ use ptyrs_kernels::position::{BatchSpan, POSITION_SUMS, PositionSums, position_k
 use crate::gpu::fused::{GRID_Y_MAX, SMEM_MAX, Shape, Side};
 use crate::gpu::ops::grid_1d;
 use crate::gpu::{
-    C32, EpochOrder, Error, FrameWaves, Kernels, StackCtl, StackGeom, StackRef, ViewAddr, ViewDims,
-    Views, check_len, dptr,
+    C32, EpochOrder, Error, FrameWaves, Kernels, SliceSource, StackCtl, StackGeom, StackRef,
+    ViewAddr, ViewDims, Views, check_len, dptr,
 };
 
 /// How [`PositionKernels::step`] solves and takes a shift.
@@ -50,7 +53,7 @@ pub struct PositionKernels {
 
 /// The position state over one scan, sized by its dims and the stacks' `nf_max`: the offsets
 /// `[nframe, 2]` by epoch position, every position's [`POSITION_SUMS`] per chunk, and one
-/// stack's object slopes `[nf_max, 2, ny, nx]`.
+/// stack's object slopes `[2, nf_max, ny, nx]`.
 pub struct Positions {
     dims: ViewDims,
     offsets: DeviceBuffer<f32>,
@@ -201,37 +204,90 @@ impl PositionKernels {
     ) -> Result<(), Error> {
         let d = views.dims();
         same_dims(&pos.dims, d)?;
-        let g = d.geom(stack)?;
-        let nf = g.nf_max as usize;
         check_len("obj", obj, d.obj_len())?;
-        check_len("chi", chi, nf * d.nmode as usize * d.n())?;
-        let (w, waves) = w.planes(d, g.nf_max)?;
-        check_len("slopes", &pos.slopes, 2 * nf * d.n())?;
+        check_len(
+            "slopes",
+            &pos.slopes,
+            2 * d.geom(stack)?.nf_max as usize * d.n(),
+        )?;
         self.slopes(ctx, views, stack, obj, &mut pos.slopes)?;
+        let w = SliceSource::Waves(w);
+        self.launch_sums(ctx, views, stack, &pos.slopes, (chi, w), &mut pos.sums)
+    }
+
+    /// The position sums of the stack's frames into `pos` where each view samples its object
+    /// at its offset and the probe stays put: [`Self::sums`] with the slopes replaced by
+    /// `deriv`, the derivatives along `y` then `x` of each frame's sampled window (object
+    /// mode 0), `[2, nf_max, ny, nx]` in the natural layout. `w` is the wave entering the
+    /// slice: with [`SliceSource::Probe`] probe mode 0 times the exit's quadratic phase.
+    pub fn derivative_sums(
+        &self,
+        ctx: &ExecutionContext,
+        views: &Views,
+        stack: StackRef<'_>,
+        deriv: &DeviceBuffer<C32>,
+        (chi, w): (&DeviceBuffer<C32>, SliceSource<'_>),
+        pos: &mut Positions,
+    ) -> Result<(), Error> {
+        let d = views.dims();
+        same_dims(&pos.dims, d)?;
+        check_len("deriv", deriv, 2 * d.geom(stack)?.nf_max as usize * d.n())?;
+        self.launch_sums(ctx, views, stack, deriv, (chi, w), &mut pos.sums)
+    }
+
+    /// [`position_kernels::LoadedModule::position_sums`] of the stack against `slopes`, `[2,
+    /// nf_max, ny, nx]` checked by the caller, into `sums`, sized by [`Positions::zeroed`] for
+    /// `views`' dims.
+    fn launch_sums(
+        &self,
+        ctx: &ExecutionContext,
+        views: &Views,
+        stack: StackRef<'_>,
+        slopes: &DeviceBuffer<C32>,
+        (chi, w): (&DeviceBuffer<C32>, SliceSource<'_>),
+        sums: &mut DeviceBuffer<f32>,
+    ) -> Result<(), Error> {
+        let d = views.dims();
+        let g = d.geom(stack)?;
+        check_len("chi", chi, g.nf_max as usize * d.nmode as usize * d.n())?;
+        let (w, waves, probe) = match w {
+            SliceSource::Probe(p) => {
+                check_len("probe", p, d.nprobe as usize * d.n())?;
+                let waves = WavePlanes {
+                    w: dptr::<C32, f32>(p).cast_const(),
+                    nw: d.nprobe,
+                };
+                (p, waves, 1)
+            }
+            SliceSource::Waves(w) => {
+                let (w, waves) = w.planes(d, g.nf_max)?;
+                (w, waves, 0)
+            }
+        };
         let config = chunk_grid(&g, d.n())?;
         let reads = [
             chi.storage(),
             w.storage(),
-            pos.slopes.storage(),
+            slopes.storage(),
             stack.storage(),
         ];
         let p = PositionSums {
             chi: dptr::<C32, f32>(chi).cast_const(),
             w: waves,
-            slopes: dptr::<C32, f32>(&pos.slopes).cast_const(),
-            sums: dptr(&pos.sums),
+            probe,
+            slopes: dptr::<C32, f32>(slopes).cast_const(),
+            sums: dptr(sums),
         };
         let ctl = stack.ctl() as *const StackCtl;
-        self.base
-            .launch(ctx, &reads, &[pos.sums.storage()], |stream| {
-                // SAFETY: lengths checked above, `pos.sums` sized for every position's
-                // chunks.
-                unsafe { self.module.position_sums(stream, config, p, ctl, g) }
-            })
+        self.base.launch(ctx, &reads, &[sums.storage()], |stream| {
+            // SAFETY: lengths checked above and by the caller, `sums` sized for every
+            // position's chunks.
+            unsafe { self.module.position_sums(stream, config, p, ctl, g) }
+        })
     }
 
     /// The object slopes of each of the stack's frames, at its first view's window of `obj`,
-    /// into `slopes` `[nf_max, 2, ny, nx]`; `views` in epoch order.
+    /// into `slopes` `[2, nf_max, ny, nx]`; `views` in epoch order.
     fn slopes(
         &self,
         ctx: &ExecutionContext,

@@ -3,9 +3,9 @@
 //! offsets enter by.
 
 use cuda_core::CudaContext;
-use ptyrs::base::{C64, Counts, Geometry, Scan, Stack, required_obj_shape, sim};
+use ptyrs::base::{C64, Counts, Geometry, Object, Probe, Scan, Stack, required_obj_shape, sim};
 use ptyrs::engine::{
-    ApParams, BhParams, Cost, DmParams, EngineError, Features, GpuPtycho, LsqmlParams, MlParams,
+    ApParams, BhParams, Cost, DmParams, Features, GpuOptions, GpuPtycho, LsqmlParams, MlParams,
     Optics, Ptycho, RaarParams, RpieParams, Sampling,
 };
 use ptyrs::gpu::FUSED_SIDES;
@@ -226,8 +226,8 @@ fn projections_match_cpu_under_every_propagator() {
                     cpu.set_features(f.clone()).unwrap();
                 }
                 on_cpu(&mut cpu, NCYCLE);
-                let want: Vec<f64> = cpu.history().iter().map(|r| r.llk.poisson).collect();
-                assert_eq!(want.len(), NCYCLE);
+                assert_eq!(cpu.history().len(), NCYCLE);
+                let want = Ended::cpu(&cpu);
                 for graph in [false, true] {
                     let what = format!("{name} {} features {label} graph {graph}", c.name);
                     let mut gpu = c.gpu(graph);
@@ -235,51 +235,299 @@ fn projections_match_cpu_under_every_propagator() {
                         gpu.set_features(f).unwrap();
                     }
                     on_gpu(&mut gpu, NCYCLE);
-                    let got: Vec<f64> = gpu.history().iter().map(|r| r.llk.poisson).collect();
-                    assert_eq!(got.len(), NCYCLE, "{what}");
-                    let (gf, cf) = (gpu.features().unwrap(), cpu.features());
-                    let scaled = |f: &Features| -> Vec<f64> {
-                        let (s, b) = (f.scale.iter().flatten(), f.background.iter().flatten());
-                        s.chain(b).copied().collect()
-                    };
-                    let moved = |f: &Features| -> Vec<f64> {
-                        f.position.iter().flatten().flatten().copied().collect()
-                    };
-                    let worst = |g: Vec<f64>, w: Vec<f64>| match w.is_empty() {
-                        true => 0.0,
-                        false => {
-                            assert_eq!(g.len(), w.len(), "{what}");
-                            worst_of(g.iter().zip(&w).map(|(g, w)| (g - w).abs()))
-                                / worst_of(w.iter().map(|w| w.abs()))
-                        }
-                    };
-                    let errs = [
-                        worst_of(got.iter().zip(&want).map(|(g, w)| (g - w).abs() / w)),
-                        rel_l2(&gpu.object().unwrap(), cpu.object()),
-                        rel_l2(&gpu.probe().unwrap(), cpu.probe()),
-                        worst(scaled(&gf), scaled(cf)),
-                        worst(moved(&gf), moved(cf)),
-                    ];
-                    eprintln!(
-                        "{what}: llk {:.2e} object {:.2e} probe {:.2e} features {:.2e} offsets {:.2e}, llk {:.4e} -> {:.4e}",
-                        errs[0],
-                        errs[1],
-                        errs[2],
-                        errs[3],
-                        errs[4],
-                        want[0],
-                        want[NCYCLE - 1]
-                    );
-                    for ((name, e), tol) in ["llk", "object", "probe", "features", "offsets"]
-                        .iter()
-                        .zip(errs)
-                        .zip(TOL)
-                    {
-                        assert!(e < tol, "{what} {name}: {e:e}");
-                    }
+                    assert_close(&what, &Ended::gpu(&gpu), &want, TOL);
                 }
             }
         }
+    }
+}
+
+/// A run's LLK records, object, probe and features after its calls.
+struct Ended {
+    llk: Vec<f64>,
+    object: Object,
+    probe: Probe,
+    features: Features,
+}
+
+impl Ended {
+    fn cpu(p: &Ptycho) -> Self {
+        Self {
+            llk: p.history().iter().map(|r| r.llk.poisson).collect(),
+            object: p.object().clone(),
+            probe: p.probe().clone(),
+            features: p.features().clone(),
+        }
+    }
+
+    fn gpu(g: &GpuPtycho) -> Self {
+        Self {
+            llk: g.history().iter().map(|r| r.llk.poisson).collect(),
+            object: g.object().unwrap(),
+            probe: g.probe().unwrap(),
+            features: g.features().unwrap(),
+        }
+    }
+}
+
+/// `got`'s records, object, probe, scale and background, and offsets (over the largest)
+/// against `want`'s, each within its `tol`.
+fn assert_close(what: &str, got: &Ended, want: &Ended, tol: [f64; 5]) {
+    assert_eq!(got.llk.len(), want.llk.len(), "{what}");
+    let scaled = |f: &Features| -> Vec<f64> {
+        let (s, b) = (f.scale.iter().flatten(), f.background.iter().flatten());
+        s.chain(b).copied().collect()
+    };
+    let moved =
+        |f: &Features| -> Vec<f64> { f.position.iter().flatten().flatten().copied().collect() };
+    let worst = |g: Vec<f64>, w: Vec<f64>| match w.is_empty() {
+        true => 0.0,
+        false => {
+            assert_eq!(g.len(), w.len(), "{what}");
+            worst_of(g.iter().zip(&w).map(|(g, w)| (g - w).abs()))
+                / worst_of(w.iter().map(|w| w.abs()))
+        }
+    };
+    let (gf, wf) = (&got.features, &want.features);
+    let errs = [
+        worst_of(
+            got.llk
+                .iter()
+                .zip(&want.llk)
+                .map(|(g, w)| (g - w).abs() / w),
+        ),
+        rel_l2(&got.object, &want.object),
+        rel_l2(&got.probe, &want.probe),
+        worst(scaled(gf), scaled(wf)),
+        worst(moved(gf), moved(wf)),
+    ];
+    eprintln!(
+        "{what}: llk {:.2e} object {:.2e} probe {:.2e} features {:.2e} offsets {:.2e}, llk {:.4e} -> {:.4e}",
+        errs[0],
+        errs[1],
+        errs[2],
+        errs[3],
+        errs[4],
+        want.llk[0],
+        want.llk[want.llk.len() - 1]
+    );
+    for ((name, e), tol) in ["llk", "object", "probe", "features", "offsets"]
+        .iter()
+        .zip(errs)
+        .zip(tol)
+    {
+        assert!(e < tol, "{what} {name}: {e:e}");
+    }
+}
+
+/// AP, DM and RAAR under each propagator with drawn offsets that sample the object, alone
+/// and with a scale and a background, against the CPU's under `Sampling::FullObject`,
+/// eagerly and from graphs, over stacks of 8 frames and a last of 6, as
+/// [`projections_match_cpu_under_every_propagator`] holds them; DM's and RAAR's carried exit
+/// waves in f16 against f32 over two cycles, from graphs.
+#[test]
+fn full_object_projections_match_cpu_under_every_propagator() {
+    const NCYCLE: usize = 8;
+    // Measured worst: LLK 1.8e-5, object 2.0e-3, probe 5.8e-4, features 1.5e-5, offsets
+    // 8.0e-6, from DM's drawn offsets under Fresnel, whose LLK rises on the CPU too.
+    const TOL: [f64; 5] = [6e-5, 6e-3, 2e-3, 5e-5, 2.5e-5];
+    const NCYCLE_F16: usize = 2;
+    // Measured worst: LLK 3.6e-4, object 2.0e-3, probe 4.0e-4, features 1.9e-4, offsets
+    // 1.4e-4.
+    const TOL_F16: [f64; 5] = [1.2e-3, 6e-3, 1.2e-3, 6e-4, 4.5e-4];
+    let frame = FUSED_SIDES[0] as usize;
+    let moved = Features {
+        position: Some(drawn_offsets()),
+        ..Features::default()
+    };
+    let modelled = Features {
+        scale: Some((0..NPOS).map(|f| 1.0 + 0.05 * (f as f64).sin()).collect()),
+        background: Some(vec![0.3; frame * frame]),
+        ..moved.clone()
+    };
+    let ctx = CudaContext::new(0).unwrap();
+    for c in cases() {
+        for (name, on_cpu, on_gpu) in PROJECTIONS {
+            for (label, features) in [("position", &moved), ("modelled", &modelled)] {
+                let run = |graph, psi_f16, ncycle| {
+                    let options = GpuOptions {
+                        graph,
+                        psi_f16,
+                        ..OPTIONS
+                    };
+                    let (object, probe, optics) = (c.object.clone(), c.probe.clone(), c.optics());
+                    let mut gpu =
+                        GpuPtycho::with_optics(&ctx, &c.scan, &optics, object, probe, options)
+                            .unwrap();
+                    gpu.set_sampling(Sampling::FullObject).unwrap();
+                    gpu.set_features(features).unwrap();
+                    on_gpu(&mut gpu, ncycle);
+                    Ended::gpu(&gpu)
+                };
+                let (object, probe) = (c.object.clone(), c.probe.clone());
+                let mut cpu = Ptycho::with_optics(&c.scan, c.optics(), object, probe).unwrap();
+                cpu.set_sampling(Sampling::FullObject);
+                cpu.set_features(features.clone()).unwrap();
+                on_cpu(&mut cpu, NCYCLE);
+                assert_eq!(cpu.history().len(), NCYCLE);
+                let want = Ended::cpu(&cpu);
+                for graph in [false, true] {
+                    let what = format!("{name} {} {label} graph {graph}", c.name);
+                    assert_close(&what, &run(graph, false, NCYCLE), &want, TOL);
+                }
+                if name != "AP" {
+                    let what = format!("{name} {} {label} f16 against f32", c.name);
+                    let want = run(true, false, NCYCLE_F16);
+                    assert_close(&what, &run(true, true, NCYCLE_F16), &want, TOL_F16);
+                }
+            }
+        }
+    }
+}
+
+const ML: MlParams = MlParams {
+    update_object: true,
+    update_probe: true,
+    calc_llk: 1,
+    zero_phase_ramp: false,
+};
+
+/// Drawn offsets that sample the object, alone and with a scale and a background, over
+/// frames of `frame` pixels a side.
+fn full_object_models(frame: usize) -> [(&'static str, Features); 2] {
+    let moved = Features {
+        position: Some(drawn_offsets()),
+        ..Features::default()
+    };
+    let modelled = Features {
+        scale: Some((0..NPOS).map(|f| 1.0 + 0.05 * (f as f64).sin()).collect()),
+        background: Some(vec![0.3; frame * frame]),
+        ..moved.clone()
+    };
+    [("position", moved), ("modelled", modelled)]
+}
+
+/// ML's opening scale (a call of no cycle), then the gradients of the scaled estimate, under
+/// each propagator and [`full_object_models`], against the CPU's under
+/// `Sampling::FullObject`.
+#[test]
+fn full_object_ml_scale_and_grads_match_cpu_under_every_propagator() {
+    // Measured worst: object 6.2e-8, probe 9.3e-8, object gradient 1.7e-6, probe gradient
+    // 4.0e-6.
+    const TOL: [f64; 4] = [2.5e-7, 4e-7, 6e-6, 1.5e-5];
+    let frame = FUSED_SIDES[0] as usize;
+    for c in cases() {
+        for (label, features) in full_object_models(frame) {
+            let what = format!("{} {label}", c.name);
+            let (object, probe) = (c.object.clone(), c.probe.clone());
+            let mut cpu = Ptycho::with_optics(&c.scan, c.optics(), object, probe).unwrap();
+            cpu.set_sampling(Sampling::FullObject);
+            cpu.set_features(features.clone()).unwrap();
+            cpu.ml(&ML, 0);
+            let mut gpu = c.gpu(true);
+            gpu.set_sampling(Sampling::FullObject).unwrap();
+            gpu.set_features(&features).unwrap();
+            gpu.ml(&ML, 0).unwrap();
+            let [go, gp] = gpu.ml_grads().unwrap();
+            let errs = [
+                rel_l2(&gpu.object().unwrap(), cpu.object()),
+                rel_l2(&gpu.probe().unwrap(), cpu.probe()),
+                rel_l2(&go, &cpu.obj_grad()),
+                rel_l2(&gp, &cpu.probe_grad()),
+            ];
+            eprintln!(
+                "{what}: object {:.2e} probe {:.2e} object grad {:.2e} probe grad {:.2e}",
+                errs[0], errs[1], errs[2], errs[3]
+            );
+            for ((name, e), tol) in ["object", "probe", "object grad", "probe grad"]
+                .iter()
+                .zip(errs)
+                .zip(TOL)
+            {
+                assert!(e < tol, "{what} {name}: {e:e}");
+            }
+        }
+    }
+}
+
+/// ML cycles under each propagator and [`full_object_models`] against the CPU's under
+/// `Sampling::FullObject`, eagerly and from graphs: each recorded LLK, and the object, the
+/// probe and the features after the last cycle.
+#[test]
+fn full_object_ml_matches_cpu_under_every_propagator() {
+    const NCYCLE: usize = 8;
+    // Measured worst: LLK 1.4e-5, object 2.9e-6, probe 1.5e-7, features 4.9e-6, offsets
+    // 1.9e-6, each but the features' under the Fresnel transform back with a scale and a
+    // background.
+    const TOL: [f64; 5] = [5e-5, 1.2e-5, 6e-7, 2e-5, 8e-6];
+    let frame = FUSED_SIDES[0] as usize;
+    for c in cases() {
+        for (label, features) in full_object_models(frame) {
+            let (object, probe) = (c.object.clone(), c.probe.clone());
+            let mut cpu = Ptycho::with_optics(&c.scan, c.optics(), object, probe).unwrap();
+            cpu.set_sampling(Sampling::FullObject);
+            cpu.set_features(features.clone()).unwrap();
+            cpu.ml(&ML, NCYCLE);
+            assert_eq!(cpu.history().len(), NCYCLE);
+            let want = Ended::cpu(&cpu);
+            for graph in [false, true] {
+                let what = format!("ML {} {label} graph {graph}", c.name);
+                let mut gpu = c.gpu(graph);
+                gpu.set_sampling(Sampling::FullObject).unwrap();
+                gpu.set_features(&features).unwrap();
+                gpu.ml(&ML, NCYCLE).unwrap();
+                assert_close(&what, &Ended::gpu(&gpu), &want, TOL);
+            }
+        }
+    }
+}
+
+/// rPIE under each propagator with drawn offsets that sample the object, against the CPU's
+/// under `Sampling::FullObject`: each epoch's recorded LLK, and the object, the probe and the
+/// offsets after the last; the graphs replay the eager run bit for bit.
+#[test]
+fn full_object_rpie_matches_cpu_under_every_propagator() {
+    const NEPOCH: usize = 6;
+    // Measured worst: LLK 1.8e-6, object 3.6e-7, probe 4.7e-6, offsets 3.6e-7; rPIE models no
+    // scale or background.
+    const TOL: [f64; 5] = [1e-5, 2e-6, 2.5e-5, f64::MIN_POSITIVE, 2e-6];
+    let moved = Features {
+        position: Some(drawn_offsets()),
+        ..Features::default()
+    };
+    for c in cases() {
+        let (object, probe) = (c.object.clone(), c.probe.clone());
+        let mut cpu = Ptycho::with_optics(&c.scan, c.optics(), object, probe).unwrap();
+        cpu.set_sampling(Sampling::FullObject);
+        cpu.set_features(moved.clone()).unwrap();
+        cpu.rpie(&RPIE, NEPOCH).unwrap();
+        assert_eq!(cpu.history().len(), NEPOCH);
+        let want = Ended::cpu(&cpu);
+        let run = |graph| {
+            let mut gpu = c.gpu(graph);
+            gpu.set_sampling(Sampling::FullObject).unwrap();
+            gpu.set_features(&moved).unwrap();
+            gpu.rpie(&RPIE, NEPOCH).unwrap();
+            Ended::gpu(&gpu)
+        };
+        let (eager, graphs) = (run(false), run(true));
+        assert_close(&format!("rPIE {}", c.name), &eager, &want, TOL);
+        let what = format!("rPIE {} graph", c.name);
+        assert_eq!(graphs.llk, eager.llk, "{what}: LLK");
+        assert_eq!(
+            graphs.object.as_slice(),
+            eager.object.as_slice(),
+            "{what}: object"
+        );
+        assert_eq!(
+            graphs.probe.as_slice(),
+            eager.probe.as_slice(),
+            "{what}: probe"
+        );
+        assert_eq!(
+            graphs.features.position, eager.features.position,
+            "{what}: offsets"
+        );
     }
 }
 
@@ -430,89 +678,4 @@ fn sampling_round_trip_rebuilds_the_same_run() {
     assert_eq!(toggled.1.0.as_slice(), kept.1.0.as_slice(), "object");
     assert_eq!(toggled.1.1.as_slice(), kept.1.1.as_slice(), "probe");
     assert_eq!(toggled.2, kept.2, "offsets");
-}
-
-/// While a position samples the object, which of the GPU passes only the LLK pass models
-/// yet, every algorithm and ML's gradients fail and change nothing, after a call of each,
-/// which built its run: switched to `Sampling::FullObject` after calls under `Patch` with the
-/// position, or the position set after calls under `FullObject` without one. Back under
-/// `Patch` the same calls give the records, arrays, gradients and offsets of a run never
-/// switched, bit for bit.
-#[test]
-fn full_object_position_fails_every_pass_until_patch() {
-    let c = &cases()[0];
-    let moved = Features {
-        position: Some(drawn_offsets()),
-        ..Features::default()
-    };
-    let lsqml = LsqmlParams {
-        batch_size: 8,
-        cost: Cost::Poisson,
-        seed: 7,
-    };
-    type Call<'a> = &'a dyn Fn(&mut GpuPtycho) -> Result<Vec<f64>, EngineError>;
-    let calls: [(&str, Call); 7] = [
-        ("AP", &|g| g.ap(&AP, 1).map(|()| Vec::new())),
-        ("DM", &|g| g.dm(&DM, 1).map(|()| Vec::new())),
-        ("RAAR", &|g| g.raar(&RAAR, 1).map(|()| Vec::new())),
-        ("rPIE", &|g| g.rpie(&RPIE, 1).map(|()| Vec::new())),
-        ("ML", &|g| {
-            g.ml(&MlParams::default(), 1).map(|()| Vec::new())
-        }),
-        ("LSQML", &|g| g.lsqml(&lsqml, 1, 1).map(|()| Vec::new())),
-        ("ML gradients", &|g| {
-            let grads = g.ml_grads()?;
-            let parts = grads.iter().flat_map(|s| s.as_slice().iter());
-            Ok(parts.flat_map(|z| [z.re, z.im]).collect())
-        }),
-    ];
-    let run = |full_object_first: bool, switched: bool| {
-        let mut gpu = c.gpu(true);
-        let sampling = match switched {
-            true => Sampling::FullObject,
-            false => Sampling::Patch,
-        };
-        match full_object_first {
-            true => gpu.set_sampling(sampling).unwrap(),
-            false => gpu.set_features(&moved).unwrap(),
-        }
-        for (what, call) in calls {
-            call(&mut gpu).unwrap_or_else(|e| panic!("{what} before: {e}"));
-        }
-        match full_object_first {
-            true => gpu.set_features(&moved).unwrap(),
-            false => gpu.set_sampling(sampling).unwrap(),
-        }
-        if switched {
-            let start = (gpu.object().unwrap(), gpu.probe().unwrap());
-            let records = gpu.history().len();
-            for (what, call) in calls {
-                let e = call(&mut gpu).unwrap_err().to_string();
-                assert!(e.contains("Sampling::FullObject"), "{what}: {e}");
-            }
-            assert_eq!(gpu.history().len(), records, "records");
-            assert_eq!(gpu.object().unwrap().as_slice(), start.0.as_slice());
-            assert_eq!(gpu.probe().unwrap().as_slice(), start.1.as_slice());
-            gpu.set_sampling(Sampling::Patch).unwrap();
-        }
-        let values: Vec<Vec<f64>> = calls
-            .iter()
-            .map(|(_, call)| call(&mut gpu).unwrap())
-            .collect();
-        let records: Vec<f64> = gpu.history().iter().map(|r| r.llk.poisson).collect();
-        let arrays = (gpu.object().unwrap(), gpu.probe().unwrap());
-        (values, records, arrays, gpu.features().unwrap().position)
-    };
-    for full_object_first in [false, true] {
-        let first = ["Patch", "FullObject"][usize::from(full_object_first)];
-        let (kept, switched) = (run(full_object_first, false), run(full_object_first, true));
-        for ((what, _), (s, k)) in calls.iter().zip(switched.0.iter().zip(&kept.0)) {
-            assert_eq!(s, k, "{first} first: {what}");
-        }
-        assert_eq!(switched.1, kept.1, "{first} first: records");
-        let (s, k) = (&switched.2, &kept.2);
-        assert_eq!(s.0.as_slice(), k.0.as_slice(), "{first} first: object");
-        assert_eq!(s.1.as_slice(), k.1.as_slice(), "{first} first: probe");
-        assert_eq!(switched.3, kept.3, "{first} first: offsets");
-    }
 }

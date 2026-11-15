@@ -1,6 +1,6 @@
-"""ptyrs GPU against PyNX CUDA DM, ML and RAAR, pty-chi LSQML, BH and rPIE and PtyPy RAAR on
-measured data, CXIDB entry 65 (ALS 5.3.2, gold balls, 1 keV, 800 frames of 621x621 pixels,
-CC0), every side from one start, through the `ptyrs` module.
+"""ptyrs GPU against PyNX CUDA DM, ML and RAAR, pty-chi LSQML, BH and rPIE and PtyPy DM and
+RAAR on measured data, CXIDB entry 65 (ALS 5.3.2, gold balls, 1 keV, 800 frames of 621x621
+pixels, CC0), every side from one start, through the `ptyrs` module.
 
     python -I compare_cxidb.py prepare RAW OUT [--device 0] [--module DIR]
     python -I compare_cxidb.py dm OUT [--cycles 200] [--device 0] [--module DIR]
@@ -12,6 +12,8 @@ CC0), every side from one start, through the `ptyrs` module.
     python -I compare_cxidb.py rpie OUT [--epochs 20] [--batch 100] [--object-step 0.03]
         [--seed 7] [--device 0] [--module DIR]
     python -I compare_cxidb.py raar OUT [--cycles 200] [--ptypy DIR] [--device 0] [--module DIR]
+    python -I compare_cxidb.py ptypy-dm OUT [--cycles 200] [--ptypy DIR] [--device 0]
+        [--module DIR]
 
 RAW is the entry's AuBalls_700ms_30nmStep_3_full.cxi, read with h5py alone. ptyrs::io::read_cxi
 refuses it (its 621-pixel frames are odd, its translation is [N, 3] where read_cxi takes [3, N]),
@@ -55,6 +57,13 @@ files in OUT/raar_ptypy, its output in OUT/raar_ptypy.log), as examples/ptypy_co
 LLK record of the estimate each cycle starts from (the CPU f64 Ptycho.llk for the last) against
 the CPU f64 Ptycho.llk of PtyPy's state after each iteration. PtyPy's RAAR is not PyNX's for any
 beta (compare_ptypy.py), so its curve is side by side.
+ptypy-dm: raar's PtyPy side for DM, its files in OUT/ptypy_dm_ptypy: GpuPtycho.dm at alpha 0
+with no phase-ramp removal against PtyPy's DM at alpha 1, the same iterate (ptypy_compare.rs);
+dm runs PyNX's default alpha, 0.02. ptyrs balances sum |O| and sum |P| after every LLK cycle
+(PyNX's ScaleObjProbe), PtyPy does not; the update commutes with that rescaling, so the final
+object's scale (rel L2's k) is not 1. ptyrs's CPU f64 DM (side cpu_f64, OUT/ptypy_dm_cpu_f64.h5)
+is the same iterate in PtyPy's precision; PtyPy's LLK against it every tenth cycle shows where
+DM's amplification of the two magnitude guards' difference (compare_ptypy.py) takes over.
 
 Exits 1 if the starts differ (the LLK record of the start; pty-chi's start far field and its LLK
 of the start; PtyPy's start, which is init.h5's to the bit), 2 if a side diverges
@@ -603,8 +612,9 @@ def ptypy_state(path, start, pixel):
     return obj, probe
 
 
-def run_raar(args):
-    """`raar`: GpuPtycho against PyNX CUDA RAAR and PtyPy's CPU f64 RAAR from one start."""
+def run_ptypy(args):
+    """`raar` and `ptypy-dm`: GpuPtycho against PtyPy's CPU f64 RAAR or DM (`raar`: and PyNX
+    CUDA RAAR) from one start."""
     import time
 
     import h5py
@@ -616,30 +626,50 @@ def run_raar(args):
     obj, probe = data.obj, data.probe
     cpu = ptyrs.Ptycho(scan, obj, probe)
     n = args.cycles
-    print(f"raar: {len(data.counts)} frames, {n} cycles, beta {RAAR_BETA} ({load_avg()})",
-          flush=True)
+    stem = args.cmd.replace("-", "_")
+    if args.cmd == "raar":
+        what, line = f"beta {RAAR_BETA}", f"raar {RAAR_BETA}"
+        steps = lambda e: e.raar(n, beta=RAAR_BETA, calc_llk=1, zero_phase_ramp=False)
+    else:
+        what, line = "ptyrs alpha 0, PtyPy alpha 1", "dm 1"
+        steps = lambda e: e.dm(n, alpha=0.0, calc_llk=1, zero_phase_ramp=False)
+    print(f"{args.cmd}: {len(data.counts)} frames, {n} cycles, {what} ({load_avg()})", flush=True)
     gpu = ptyrs.GpuPtycho(scan, obj, probe, args.device)
-    gpu.raar(n, beta=RAAR_BETA, calc_llk=1, zero_phase_ramp=False)
+    steps(gpu)
     go, gp = gpu.object, gpu.probe
     last = cpu.llk(go, gp)
     ours = np.vstack([history(gpu, n), [last[k] for k in KEYS]])
     del gpu
-    write_modes(f"{args.out}/raar_ptyrs.h5", go, gp, llk=ours)
-    run_pynx(args, "raar")
-    with h5py.File(f"{args.out}/raar_pynx.h5", "r") as f:
-        sides = {"pynx": (f["llk"][()], f["object"][()], f["probe"][()])}
+    write_modes(f"{args.out}/{stem}_ptyrs.h5", go, gp, llk=ours)
+    sides = {}
+    if args.cmd == "raar":
+        run_pynx(args, "raar")
+        with h5py.File(f"{args.out}/raar_pynx.h5", "r") as f:
+            sides["pynx"] = f["llk"][()], f["object"][()], f["probe"][()]
+    else:
+        f64 = ptyrs.Ptycho(scan, obj, probe)
+        wall = time.perf_counter()
+        steps(f64)
+        o, p = f64.object, f64.probe
+        last = cpu.llk(o, p)
+        sides["cpu_f64"] = np.vstack([history(f64, n), [last[k] for k in KEYS]]), o, p
+        del f64
+        write_modes(f"{args.out}/{stem}_cpu_f64.h5", *sides["cpu_f64"][1:],
+                    llk=sides["cpu_f64"][0])
+        print(f"ptyrs CPU f64: {(time.perf_counter() - wall) / max(n, 1):.1f} s/cycle "
+              f"({load_avg()})", flush=True)
 
-    d = f"{args.out}/raar_ptypy"
+    d = f"{args.out}/{stem}_ptypy"
     os.makedirs(d, exist_ok=True)
     for name in ("scan.cxi", "init.h5"):
         if not os.path.lexists(f"{d}/{name}"):
             os.symlink(f"../{name}", f"{d}/{name}")
     np.savetxt(f"{d}/views.txt", corners(data), fmt="%d")
     with open(f"{d}/algo.txt", "w") as f:
-        f.write(f"raar {RAAR_BETA}\n")
+        f.write(f"{line}\n")
     cmd = [sys.executable, "-P", os.path.join(ROOT, "ptyrs/scripts/engine/compare_ptypy.py"), d,
            str(n)]
-    log = f"{args.out}/raar_ptypy.log"
+    log = f"{d}.log"
     wall = time.perf_counter()
     with open(log, "w") as f:
         rc = subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT,
@@ -649,8 +679,8 @@ def run_raar(args):
     if rc:
         print("\n".join(lines[-20:]))
         raise subprocess.CalledProcessError(rc, cmd)
-    print(f"PtyPy RAAR: {(time.perf_counter() - wall) / max(n, 1):.1f} s/iteration ({load_avg()}); "
-          + next(x for x in lines if x.startswith("offset")), flush=True)
+    print(f"PtyPy {line}: {(time.perf_counter() - wall) / max(n, 1):.1f} s/iteration "
+          f"({load_avg()}); " + next(x for x in lines if x.startswith("offset")), flush=True)
 
     pixel = data.wavelength * data.distance / (FRAME * data.pixel)
     theirs = []
@@ -662,11 +692,12 @@ def run_raar(args):
         l = cpu.llk(o, p)
         theirs.append([l[k] for k in KEYS])
     theirs = np.array(theirs)
-    write_modes(f"{args.out}/raar_ptypy.h5", o, p, llk=theirs)
+    write_modes(f"{d}.h5", o, p, llk=theirs)
     sides["ptypy"] = theirs, o, p
     print("ptyrs: the GPU's record of the estimate each cycle starts from, the CPU f64 llk of "
-          "the last; PyNX: its record of the same; PtyPy: the CPU f64 llk of its state after "
-          "each iteration")
+          "the last; " + ("PyNX: its record of the same; " if "pynx" in sides else "")
+          + ("cpu_f64: ptyrs's CPU f64 record of the same; " if "cpu_f64" in sides else "")
+          + "PtyPy: the CPU f64 llk of its state after each iteration")
     starts = []
     for side, (llk, o, p) in sides.items():
         starts.append(compare(side, ours[:len(llk)], llk))
@@ -676,7 +707,16 @@ def run_raar(args):
     print(f"FRC of the final objects, ptyrs against each ({load_avg()}):")
     region = centres_region(data)
     for side in sides:
-        frc(args.out, region, "raar_ptyrs", f"raar_{side}")
+        frc(args.out, region, f"{stem}_ptyrs", f"{stem}_{side}")
+    if "cpu_f64" in sides:
+        (a, ao, ap), (b, bo, bp) = sides["cpu_f64"], sides["ptypy"]
+        r = np.abs(b / a - 1)
+        print(f"PtyPy against ptyrs CPU f64: LLK max rel diff {r.max():.3e}, Poisson by cycle "
+              + " ".join(f"{c}:{r[c, 0]:.1e}" for c in range(0, n + 1, 10)))
+        (eo, ko), (ep, kp) = rel_l2(ao, bo), rel_l2(ap, bp)
+        print(f"  final object rel L2 {eo:.3e} (scale {ko:.6f})  probe rel L2 {ep:.3e} "
+              f"(scale {kp:.6f})")
+        frc(args.out, region, f"{stem}_cpu_f64", f"{stem}_ptypy")
     col = KEYS.index("gaussian")
     m3ref.exit_unless_converging(
         {"ptyrs": ours[:, col], **{side: v[0][:, col] for side, v in sides.items()}})
@@ -702,11 +742,12 @@ def main():
         q.add_argument("--batch", type=int, default=batch)
         q.add_argument("--seed", type=int, default=7)
     q.add_argument("--object-step", type=float, default=0.03)
-    q = sub.add_parser("raar")
-    q.add_argument("out")
-    q.add_argument("--cycles", type=int, default=200)
-    q.add_argument("--ptypy", default=os.path.expanduser("~/work/ptycho/ptypy"))
-    q.set_defaults(fix_gamma=False)
+    for name in ("raar", "ptypy-dm"):
+        q = sub.add_parser(name)
+        q.add_argument("out")
+        q.add_argument("--cycles", type=int, default=200)
+        q.add_argument("--ptypy", default=os.path.expanduser("~/work/ptycho/ptypy"))
+        q.set_defaults(fix_gamma=False)
     q = sub.add_parser("pynx")
     q.add_argument("out")
     q.add_argument("algo", choices=("dm", "ml", "raar"))
@@ -721,7 +762,8 @@ def main():
     elif args.cmd == "pynx":
         pynx(args)
     else:
-        run = {"raar": run_raar, "lsqml": run_ptychi, "bh": run_ptychi, "rpie": run_ptychi}
+        run = {"raar": run_ptypy, "ptypy-dm": run_ptypy, "lsqml": run_ptychi, "bh": run_ptychi,
+               "rpie": run_ptychi}
         if not (run[args.cmd](args) if args.cmd in run else run_cuda(args, args.cmd)):
             sys.exit(1)
 

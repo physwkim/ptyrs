@@ -211,7 +211,7 @@ impl FillCfg {
         frame: [usize; 2],
         batch: usize,
     ) -> Result<FillHook, NnError> {
-        let p = Predictor::load(&self.predictor, &burn::prelude::Device::cuda(ordinal))?;
+        let p = Predictor::load(&self.predictor, &crate::nn::cuda(ordinal))?;
         // Otherwise every call fails, and the run goes on unfilled.
         if p.config().frame != frame {
             return Err(NnError::Invalid(format!(

@@ -210,12 +210,14 @@ impl Folded {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::nn::dip::tests::ToF64;
     use crate::nn::predictor::host;
     use burn::module::RunningState;
-    use burn::tensor::Distribution;
+    use burn::tensor::{DType, Distribution};
 
     /// A small network whose batch normalisations hold drawn statistics, not the identity they
-    /// start at.
+    /// start at. The shifts lean positive: at beta and mean both in (-1, 1) the ReLUs close on
+    /// one output in 3 of 10 draws, leaving it flat.
     fn normalised_net(device: &Device) -> PtychoNN {
         let mut net = PtychoNN::new(2, 4, 2, device);
         let draw = |n, lo, hi| Tensor::<1>::random([n], Distribution::Uniform(lo, hi), device);
@@ -228,8 +230,8 @@ mod tests {
             for n in [&mut b.na, &mut b.nb] {
                 let [c] = n.gamma.shape().dims();
                 n.gamma = Param::from_tensor(draw(c, 0.5, 2.0));
-                n.beta = Param::from_tensor(draw(c, -1.0, 1.0));
-                n.running_mean = RunningState::new(draw(c, -1.0, 1.0));
+                n.beta = Param::from_tensor(draw(c, 0.1, 1.0));
+                n.running_mean = RunningState::new(draw(c, -0.25, 0.25));
                 n.running_var = RunningState::new(draw(c, 0.2, 3.0));
             }
         }
@@ -242,7 +244,7 @@ mod tests {
 
     #[test]
     fn folding_scales_each_weight_and_shifts_each_bias() {
-        let device = Device::cuda(0);
+        let device = crate::nn::cuda(0);
         let net = normalised_net(&device);
         let folded = net.fold();
         let blocks = net
@@ -289,16 +291,21 @@ mod tests {
     /// convolutions.
     #[test]
     fn folded_network_gives_the_networks_output() {
-        let device = Device::cuda(0);
-        let net = normalised_net(&device);
-        let x = Tensor::<4>::random([3, 2, 16, 16], Distribution::Normal(0.0, 1.0), &device);
+        let device = crate::nn::cuda(0);
+        device.seed(1);
+        // In f64, not f32: there autotune may pick tensor-core convolutions, which round
+        // operands to TF32, and the two networks part by up to 6e-3 depending on its picks.
+        let net = normalised_net(&device).map(&mut ToF64);
+        let x = Tensor::<4>::random([3, 2, 16, 16], Distribution::Normal(0.0, 1.0), &device)
+            .cast(DType::F64);
         let (a, p) = net.forward(x.clone());
         let (fa, fp) = net.fold().forward(x);
         for (want, got) in [(a, fa), (p, fp)] {
-            let d = (want - got).abs().max().into_scalar::<f32>();
-            // Autotune may pick tensor-core convolutions, which round f32 operands to TF32's
-            // 11-bit significand, so the scaled weights round apart from the unscaled ones.
-            assert!(d < 2e-3, "folded output differs by {d}");
+            let spread = (want.clone().max() - want.clone().min()).into_scalar::<f64>();
+            assert!(spread > 1e-3, "flat output, spread {spread}");
+            let d = (want - got).abs().max().into_scalar::<f64>();
+            // burn takes sigmoid in f32, so the amplitudes differ by up to 1.2e-7.
+            assert!(d < 1e-6, "folded output differs by {d}");
         }
     }
 }

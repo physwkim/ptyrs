@@ -1,11 +1,11 @@
 //! GPU LSQML against the CPU's `f64` [`Lsqml`] from the same scaled start, with no probe
-//! variation, without and with a modelled position (drawn offsets): each epoch's steps, the
-//! arrays and the offsets' changes after the first epochs, eagerly and from graphs, and the
-//! LLK after each of enough epochs to reach a kept preconditioner; Gaussian and Poisson costs,
-//! one batch of every frame, batches of 12 (two stacks each but the last) and of 4 (the last
-//! of 2). With a position, the run is bit-identical across stack splits and eager or from
-//! graphs. Frames are on the fused passes' smallest side, two incoherent probe modes, one
-//! masked row and column.
+//! variation, without and with a modelled position (drawn offsets), which moves the probe
+//! or samples the object: each epoch's steps, the arrays and the offsets' changes after the
+//! first epochs, eagerly and from graphs, and the LLK after each of enough epochs to reach
+//! a kept preconditioner; Gaussian and Poisson costs, one batch of every frame, batches of
+//! 12 (two stacks each but the last) and of 4 (the last of 2). With a position, the run is
+//! bit-identical across stack splits and eager or from graphs. Frames are on the fused
+//! passes' smallest side, two incoherent probe modes, one masked row and column.
 
 use std::slice;
 use std::sync::Arc;
@@ -14,7 +14,7 @@ use cuda_core::CudaContext;
 use ptyrs::base::{C64, Counts, MASKED, Object, Probe, Scan, Stack};
 use ptyrs::engine::{
     Algorithm, BhParams, Cost, Features, GpuOptions, GpuPtycho, LlkRecord, Lsqml, LsqmlParams,
-    LsqmlStep, Optics, ProbeVariation, Ptycho,
+    LsqmlStep, Optics, ProbeVariation, Ptycho, Sampling,
 };
 use ptyrs::gpu::FUSED_SIDES;
 
@@ -130,18 +130,23 @@ fn offsets_rel(a: &Features, b: &Features, start: &Features) -> f64 {
 
 #[test]
 fn lsqml_steps_match_cpu() {
-    steps_match_cpu(None);
+    steps_match_cpu(None, Sampling::Patch);
 }
 
 #[test]
 fn lsqml_position_steps_match_cpu() {
-    steps_match_cpu(Some(drawn_offsets()));
+    steps_match_cpu(Some(drawn_offsets()), Sampling::Patch);
+}
+
+#[test]
+fn lsqml_full_object_position_steps_match_cpu() {
+    steps_match_cpu(Some(drawn_offsets()), Sampling::FullObject);
 }
 
 /// After a fresh GPU run of each of the first epochs (the preconditioner built, then
 /// updated), the last epoch's steps (frames, `a_far`, `a_obj`, `a_probe`), the arrays and the
-/// offsets' changes.
-fn steps_match_cpu(position: Option<Vec<[f64; 2]>>) {
+/// offsets' changes, the position entered as `sampling`.
+fn steps_match_cpu(position: Option<Vec<[f64; 2]>>, sampling: Sampling) {
     const NEPOCH: usize = 3;
     let features = moved(position);
     let frame = FUSED_SIDES[0] as usize;
@@ -163,7 +168,8 @@ fn steps_match_cpu(position: Option<Vec<[f64; 2]>>) {
         let mut cpu = Lsqml::new(params)
             .unwrap()
             .with_features(features.clone())
-            .unwrap();
+            .unwrap()
+            .with_sampling(sampling);
         let mut worst = [0.0f64; 6];
         for nepoch in 1..=NEPOCH {
             let want = cpu.epoch(
@@ -177,6 +183,7 @@ fn steps_match_cpu(position: Option<Vec<[f64; 2]>>) {
             let mut gpu =
                 GpuPtycho::new(&ctx(), &scan, object.clone(), probe.clone(), options).unwrap();
             gpu.set_features(&features).unwrap();
+            gpu.set_sampling(sampling).unwrap();
             gpu.lsqml(&params, nepoch, 0).unwrap();
             let got = gpu.lsqml_steps().unwrap();
             let frames = |s: &[LsqmlStep]| -> Vec<Vec<usize>> {
@@ -203,8 +210,8 @@ fn steps_match_cpu(position: Option<Vec<[f64; 2]>>) {
             worst[5] = worst_of([worst[5], offsets]);
         }
         eprintln!(
-            "lsqml steps {cost:?} graph {graph} batch {batch_size} position {}: a_far {:.2e} \
-             a_obj {:.2e} a_probe {:.2e} object {:.2e} probe {:.2e} offsets {:.2e}",
+            "lsqml steps {cost:?} graph {graph} batch {batch_size} position {} {sampling:?}: \
+             a_far {:.2e} a_obj {:.2e} a_probe {:.2e} object {:.2e} probe {:.2e} offsets {:.2e}",
             features.position.is_some(),
             worst[0],
             worst[1],
@@ -217,7 +224,7 @@ fn steps_match_cpu(position: Option<Vec<[f64; 2]>>) {
         for (what, e) in names.into_iter().zip(worst) {
             assert!(
                 e < 1e-4,
-                "{cost:?} graph {graph} batch {batch_size} {what}: {e:e}"
+                "{cost:?} graph {graph} batch {batch_size} {sampling:?} {what}: {e:e}"
             );
         }
     }
@@ -225,17 +232,22 @@ fn steps_match_cpu(position: Option<Vec<[f64; 2]>>) {
 
 #[test]
 fn lsqml_matches_cpu() {
-    matches_cpu(None);
+    matches_cpu(None, Sampling::Patch);
 }
 
 #[test]
 fn lsqml_position_matches_cpu() {
-    matches_cpu(Some(drawn_offsets()));
+    matches_cpu(Some(drawn_offsets()), Sampling::Patch);
+}
+
+#[test]
+fn lsqml_full_object_position_matches_cpu() {
+    matches_cpu(Some(drawn_offsets()), Sampling::FullObject);
 }
 
 /// The LLK after each of 12 epochs, tagged LSQML (epoch 11 keeps the preconditioner of
-/// epoch 10), the final arrays and the offsets' changes.
-fn matches_cpu(position: Option<Vec<[f64; 2]>>) {
+/// epoch 10), the final arrays and the offsets' changes, the position entered as `sampling`.
+fn matches_cpu(position: Option<Vec<[f64; 2]>>, sampling: Sampling) {
     const NEPOCH: usize = 12;
     let features = moved(position);
     let frame = FUSED_SIDES[0] as usize;
@@ -253,7 +265,8 @@ fn matches_cpu(position: Option<Vec<[f64; 2]>>) {
         let mut cpu = Lsqml::new(params)
             .unwrap()
             .with_features(features.clone())
-            .unwrap();
+            .unwrap()
+            .with_sampling(sampling);
         let want: Vec<_> = (0..NEPOCH)
             .map(|cycle| {
                 cpu.epoch(
@@ -266,6 +279,7 @@ fn matches_cpu(position: Option<Vec<[f64; 2]>>) {
                 );
                 let mut now = Ptycho::new(&scan, o.clone(), p.clone()).unwrap();
                 now.set_features(cpu.features().clone()).unwrap();
+                now.set_sampling(sampling);
                 let llk = now.llk();
                 LlkRecord {
                     cycle,
@@ -276,6 +290,7 @@ fn matches_cpu(position: Option<Vec<[f64; 2]>>) {
             .collect();
         let mut gpu = GpuPtycho::new(&ctx(), &scan, object, probe, OPTIONS).unwrap();
         gpu.set_features(&features).unwrap();
+        gpu.set_sampling(sampling).unwrap();
         gpu.lsqml(&params, NEPOCH, 1).unwrap();
         let got = gpu.history();
         assert_eq!(got.len(), want.len());
@@ -298,8 +313,8 @@ fn matches_cpu(position: Option<Vec<[f64; 2]>>) {
             offsets_rel(&gpu.features().unwrap(), cpu.features(), &features),
         ];
         eprintln!(
-            "lsqml {cost:?} batch {batch_size} position {}: llk {:.2e} object {:.2e} probe \
-             {:.2e} offsets {:.2e}, poisson llk {:.4e} -> {:.4e}",
+            "lsqml {cost:?} batch {batch_size} position {} {sampling:?}: llk {:.2e} object \
+             {:.2e} probe {:.2e} offsets {:.2e}, poisson llk {:.4e} -> {:.4e}",
             features.position.is_some(),
             errs[0],
             errs[1],
@@ -309,7 +324,10 @@ fn matches_cpu(position: Option<Vec<[f64; 2]>>) {
             want[NEPOCH - 1].llk.poisson
         );
         for (what, e) in ["llk", "object", "probe", "offsets"].into_iter().zip(errs) {
-            assert!(e < 1e-4, "{cost:?} batch {batch_size} {what}: {e:e}");
+            assert!(
+                e < 1e-4,
+                "{cost:?} batch {batch_size} {sampling:?} {what}: {e:e}"
+            );
         }
     }
 }

@@ -197,9 +197,9 @@ impl<K: AutotuneKey> Tuner<K> {
     /// Create a tuner. Its cache is seeded from the persistent cache when
     /// persistence is available (feature `persistence`: a file natively,
     /// OPFS in the browser).
-    pub fn new(name: &str, device_id: &str) -> Self {
+    pub fn new(name: &str, part: &str) -> Self {
         Self {
-            cache: Arc::new(Mutex::new(TuneCache::new(name, device_id))),
+            cache: Arc::new(Mutex::new(TuneCache::new(name, part))),
             logger: Arc::new(Mutex::new(Logger::new())),
         }
     }
