@@ -2,8 +2,10 @@
 start, `examples/engine_reference.rs`' `opr.h5`: after every epoch the object, probe,
 eigenmodes, weights, main-mode weights and steps, exactly, as one CPU f64 engine runs both;
 eigenmodes and weights alone with the amplitude cost, and with main-mode weights with Poisson;
-over `Ptycho.views` and over views built from the far field and preprocessed positions. Held
-weights and main-mode weights kept while the eigenmodes move; the refusals."""
+over `Ptycho.views` and over views built from the far field and preprocessed positions, with
+`Lsqml.llk`, the engine's `Lsqml::llk`, at the start and after every epoch. Without OPR,
+`Lsqml.llk` is `Ptycho.llk`. Held weights and main-mode weights kept while the eigenmodes move;
+the refusals."""
 
 import os
 
@@ -12,7 +14,9 @@ import numpy as np
 import pytest
 
 import ptyrs
-from conftest import MODULE_DIR
+from conftest import MODULE_DIR, drawn_offsets, rel
+
+LLK = ("poisson", "gaussian", "euclidian", "nb_photons_calc")
 
 
 @pytest.fixture(scope="module")
@@ -44,6 +48,12 @@ def variation(g):
     return {k: g[k][()] if k in g else None for k in ("eigenmodes", "weights", "intensity")}
 
 
+def llk(lsqml, views, o, pr):
+    """`lsqml.llk` as the references lay it out."""
+    d = lsqml.llk(views, o, pr)
+    return [d[k] for k in LLK]
+
+
 @pytest.mark.parametrize("views", ["ptycho", "built"])
 @pytest.mark.parametrize("run", ["opr", "intensity"])
 def test_lsqml_opr_matches_engine(ref, run, views):
@@ -56,11 +66,13 @@ def test_lsqml_opr_matches_engine(ref, run, views):
     o, pr = ref["object"][()][None], ref["probe"][()]
     epochs = sorted((k for k in g if k.startswith("epoch")), key=lambda k: int(k[5:]))
     assert len(epochs) == 3
+    np.testing.assert_array_equal(llk(lsqml, over, o, pr), g["llk"][()])
     for e in epochs:
         o, pr, steps = lsqml.epoch(over, o, pr)
         want = g[e]
         np.testing.assert_array_equal(o, want["object"][()])
         np.testing.assert_array_equal(pr, want["probe"][()])
+        np.testing.assert_array_equal(llk(lsqml, over, o, pr), want["llk"][()], err_msg=e)
         got = dict(eigenmodes=lsqml.eigenmodes, weights=lsqml.weights, intensity=lsqml.intensity)
         for k, v in variation(want).items():
             if v is None:
@@ -95,11 +107,12 @@ def test_lsqml_opr_refusals(ref):
     with pytest.raises(ValueError, match=f"{nframe - 1} main-mode weights for {nframe}"):
         ptyrs.Lsqml(4, "poisson", 7, opr=(e, w, c[1:]))
     short = ptyrs.Lsqml(4, "poisson", 7, opr=(e, w[1:], None))
-    with pytest.raises(ValueError, match=f"{nframe - 1} weight rows for {nframe} frames"):
-        short.epoch(p, o, pr)
     small = ptyrs.Lsqml(4, "poisson", 7, opr=(e[:, 1:, 1:], w, None))
-    with pytest.raises(ValueError, match=r"of \[32, 32\] probe planes"):
-        small.epoch(p, o, pr)
+    for run in ("epoch", "llk"):
+        with pytest.raises(ValueError, match=f"{nframe - 1} weight rows for {nframe} frames"):
+            getattr(short, run)(p, o, pr)
+        with pytest.raises(ValueError, match=r"of \[32, 32\] probe planes"):
+            getattr(small, run)(p, o, pr)
     np.testing.assert_array_equal(short.weights, w[1:])
     # `hold` names a given value
     for kw, hold in ((dict(), ("weights",)), (dict(), ("intensity",)),
@@ -130,3 +143,21 @@ def test_lsqml_opr_hold(ref, hold):
     assert not np.array_equal(lsqml.eigenmodes, start["eigenmodes"])
     for k in ("weights", "intensity"):
         assert np.array_equal(getattr(lsqml, k), start[k]) == (k in hold), k
+
+
+@pytest.mark.parametrize("offsets, sampling", [(False, None), (True, None), (True, "patch"),
+                                               (True, "full_object")])
+def test_lsqml_llk_without_opr_is_ptycho_llk(scenario, offsets, sampling):
+    """Without `opr`, `Lsqml.llk` is `Ptycho.llk` of the same arrays, offsets and sampling,
+    `Sampling::auto` on both when it is not set; with offsets the two order their sums apart,
+    so they agree to 1e-12, the engine's bound, not bit for bit."""
+    scan, obj, probe, npos = scenario
+    d = drawn_offsets(npos) if offsets else None
+    state = ptyrs.Ptycho(scan, obj, probe)
+    state.set_features(position=d)
+    if sampling is not None:
+        state.set_sampling(sampling)
+    lsqml = ptyrs.Lsqml(4, "poisson", 7, position=d, sampling=sampling)
+    got, want = lsqml.llk(state.views, obj[None], probe), state.llk(obj, probe)
+    for k in LLK:
+        assert rel(got[k], want[k]) < 1e-12, k
