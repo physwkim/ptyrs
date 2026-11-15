@@ -1,8 +1,8 @@
 //! The OPR kernels against the CPU `ProbeVariation` on the same inputs, rounded to f32 for
 //! both: `unique`'s mode-0 planes and `step`'s eigenmodes, weights and main-mode weights, on
-//! even and odd plane sides with one and two eigenmodes, and a one-frame batch. The CPU runs
-//! two probe modes, of which the device takes mode 0's planes. Every worst difference goes
-//! through `worst_of`, so a NaN fails its bound.
+//! even and odd plane sides with one and two eigenmodes, a one-frame batch, and the weights
+//! or the main-mode weights held. The CPU runs two probe modes, of which the device takes
+//! mode 0's planes. Every worst difference goes through `worst_of`, so a NaN fails its bound.
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -149,13 +149,14 @@ enum Main {
     Held,
 }
 
-/// A scan of [`NFRAME`] frames with `k` eigenmodes of `ny × nx` planes and main-mode weights
-/// as `intensity`.
+/// A scan of [`NFRAME`] frames with `k` eigenmodes of `ny × nx` planes, their weights refined
+/// unless `held_weights`, and main-mode weights as `intensity`.
 #[derive(Clone, Copy)]
 struct Case {
     ny: usize,
     nx: usize,
     k: usize,
+    held_weights: bool,
     intensity: Main,
 }
 
@@ -177,7 +178,11 @@ impl Case {
             .zip(signs)
             .map(|(w, s)| w.copysign(s))
             .collect();
-        let mut var = ProbeVariation::new(eigen, Feature::refined(weights));
+        let weights = Feature {
+            values: weights,
+            refine: !self.held_weights,
+        };
+        let mut var = ProbeVariation::new(eigen, weights);
         if self.intensity != Main::Absent {
             var = var.with_intensity(Feature {
                 values: noise.range(NFRAME, 0.9, 1.1),
@@ -193,12 +198,13 @@ impl Case {
 
     fn upload(&self, g: &Gpu, s: &Start) -> (Opr, DeviceBuffer<C32>) {
         let v = &s.var;
+        let w = v.weights().as_ref().map(|w| f32s(w));
         let c = v.intensity().map(|c| c.as_ref().map(|c| f32s(c)));
         let opr = Opr::new(
             &g.stream,
             s.n,
             &c32(v.eigenmodes().as_slice()),
-            &f32s(&v.weights().values),
+            w.as_ref().map(Vec::as_slice),
             c.as_ref().map(|c| c.as_ref().map(Vec::as_slice)),
             NFRAME as u32,
         )
@@ -223,7 +229,7 @@ fn download(g: &Gpu, opr: &Opr) -> After {
     let s = &g.stream;
     (
         opr.eigenmodes().to_host_vec(s).unwrap(),
-        opr.weights().to_host_vec(s).unwrap(),
+        opr.weights().values.to_host_vec(s).unwrap(),
         opr.intensity().map(|c| c.values.to_host_vec(s).unwrap()),
     )
 }
@@ -294,6 +300,7 @@ fn opr_step_matches_cpu() {
                     ny,
                     nx,
                     k,
+                    held_weights: false,
                     intensity,
                 };
                 // Five frames from position 2: the order's frames 0, 2, 8, 1, 5.
@@ -319,6 +326,7 @@ fn opr_one_frame_batch_moves_only_the_main_mode() {
             ny: 7,
             nx: 9,
             k: 2,
+            held_weights: false,
             intensity,
         };
         let (cpu, gpu, start) = step(&g, &case, 4..5, 11);
@@ -347,6 +355,7 @@ fn opr_held_main_mode_matches_cpu() {
             ny: 7,
             nx: 9,
             k,
+            held_weights: false,
             intensity: Main::Held,
         };
         let refined = Case {
@@ -386,6 +395,44 @@ fn opr_held_main_mode_matches_cpu() {
     }
 }
 
+/// Held weights keep their values on the device as on the CPU, and the eigenmodes step bit
+/// for bit as with them refined: the weights' step comes after each eigenmode's move and the
+/// deflation sums alike either way.
+#[test]
+fn opr_held_weights_match_cpu() {
+    let g = gpu();
+    for k in [1, 2] {
+        for intensity in [Main::Absent, Main::Refined] {
+            let held = Case {
+                ny: 7,
+                nx: 9,
+                k,
+                held_weights: true,
+                intensity,
+            };
+            let refined = Case {
+                held_weights: false,
+                ..held
+            };
+            let what = format!("k = {k}, intensity {intensity:?}");
+            let (cpu, gpu, start) = step(&g, &held, 2..7, 41);
+            let (_, gpu_r, _) = step(&g, &refined, 2..7, 41);
+            let was = start.var.weights();
+            assert!(!was.refine);
+            assert_eq!(cpu.weights(), was, "{what}: CPU weights moved");
+            let (u, w, c) = &gpu[0];
+            assert_eq!(*w, f32s(&was.values), "{what}: device weights moved");
+            assert_ne!(gpu_r[0].1, *w, "{what}: refined weights did not move");
+            assert_eq!((u, c), (&gpu_r[0].0, &gpu_r[0].2), "{what}: device");
+            let [du, _, dc] = errors(&cpu, &gpu[0], &start.var);
+            println!("{what} held weights: eigenmodes {du:.3e}, main {dc:.3e}");
+            assert!(du <= 1e-6, "{what}: eigenmodes {du:e}");
+            assert!(dc <= 5e-5, "{what}: main-mode weight steps {dc:e}");
+            assert_eq!(gpu[0], gpu[1], "{what}: two runs differ");
+        }
+    }
+}
+
 #[test]
 fn opr_unique_matches_cpu() {
     let g = gpu();
@@ -397,6 +444,7 @@ fn opr_unique_matches_cpu() {
                     ny,
                     nx,
                     k,
+                    held_weights: false,
                     intensity,
                 };
                 let s = case.start(&mut Noise::new(seed));
@@ -441,6 +489,7 @@ fn opr_deflate_coef_totals_chunks_in_order() {
         ny: 45,
         nx: 101,
         k: 2,
+        held_weights: false,
         intensity: Main::Absent,
     };
     let mut noise = Noise::new(31);
@@ -476,6 +525,7 @@ fn opr_deflation_is_bit_identical_held_and_refined() {
             ny,
             nx,
             k: 2,
+            held_weights: false,
             intensity: Main::Absent,
         };
         let mut noise = Noise::new(77);

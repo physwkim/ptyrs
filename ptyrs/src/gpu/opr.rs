@@ -1,9 +1,9 @@
 //! Checked launches of the OPR kernels (`ptyrs_kernels::opr`): pty-chi's orthogonal probe
 //! relaxation of probe mode 0 as `engine::opr`'s `ProbeVariation` defines it, in f32 on the
 //! device. [`OprKernels::unique`] gives a run of epoch positions their own mode-0 planes;
-//! [`OprKernels::step`] moves the eigenmodes, weights and main-mode weights from a batch's
-//! per-frame planes. Every plane is `n` pixels in the probe's own layout, the operations
-//! pixelwise or sums over the pixels, so any layout serves that every plane shares.
+//! [`OprKernels::step`] moves the eigenmodes and the refined weights and main-mode weights
+//! from a batch's per-frame planes. Every plane is `n` pixels in the probe's own layout, the
+//! operations pixelwise or sums over the pixels, so any layout serves that every plane shares.
 
 use std::ops::Range;
 use std::ptr;
@@ -31,16 +31,15 @@ pub struct OprKernels {
 }
 
 /// The OPR state of one scan: `k ≥ 1` eigenmodes `[k, n]`, their weights `w_fi` at `f k + i`
-/// and, when modelled, the main mode's weights `c_f` at `f`, refined or held, both by scan
-/// frame, with the scratch of [`OprKernels::step`] for batches of up to `nb_max` frames.
-/// The weights are always refined.
+/// and, when modelled, the main mode's weights `c_f` at `f`, each refined or held, both by
+/// scan frame, with the scratch of [`OprKernels::step`] for batches of up to `nb_max` frames.
 pub struct Opr {
     n: usize,
     k: u32,
     nframe: u32,
     nb_max: u32,
     eigenmodes: DeviceBuffer<C32>,
-    weights: DeviceBuffer<f32>,
+    weights: Feature<DeviceBuffer<f32>>,
     intensity: Option<Feature<DeviceBuffer<f32>>>,
     /// [`OPR_SUMS`] per chunk of each batch frame.
     sums: DeviceBuffer<f32>,
@@ -63,7 +62,7 @@ impl Opr {
         stream: &CudaStream,
         n: usize,
         eigenmodes: &[C32],
-        weights: &[f32],
+        weights: Feature<&[f32]>,
         intensity: Option<Feature<&[f32]>>,
         nb_max: u32,
     ) -> Result<Self, Error> {
@@ -74,11 +73,11 @@ impl Opr {
                 eigenmodes.len()
             ));
         }
-        let k = eigenmodes.len() / n;
-        if k == 0 || !weights.len().is_multiple_of(k) || weights.is_empty() {
-            return bad(format!("{} weights for {k} eigenmodes", weights.len()));
+        let (k, w) = (eigenmodes.len() / n, weights.values);
+        if k == 0 || !w.len().is_multiple_of(k) || w.is_empty() {
+            return bad(format!("{} weights for {k} eigenmodes", w.len()));
         }
-        let nframe = weights.len() / k;
+        let nframe = w.len() / k;
         if let Some(c) = intensity
             && c.values.len() != nframe
         {
@@ -99,7 +98,10 @@ impl Opr {
             nframe,
             nb_max,
             eigenmodes: DeviceBuffer::from_host(stream, eigenmodes)?,
-            weights: DeviceBuffer::from_host(stream, weights)?,
+            weights: Feature {
+                values: DeviceBuffer::from_host(stream, w)?,
+                refine: weights.refine,
+            },
             intensity: match intensity {
                 Some(c) => Some(Feature {
                     values: DeviceBuffer::from_host(stream, c.values)?,
@@ -121,7 +123,7 @@ impl Opr {
     }
 
     /// `w_fi` at `f k + i`, by scan frame.
-    pub fn weights(&self) -> &DeviceBuffer<f32> {
+    pub fn weights(&self) -> &Feature<DeviceBuffer<f32>> {
         &self.weights
     }
 
@@ -156,7 +158,7 @@ impl Opr {
     fn scan(&self, ids: &DeviceBuffer<u32>) -> OprScan {
         OprScan {
             order: dptr::<u32, u32>(ids).cast_const(),
-            weights: dptr(&self.weights),
+            weights: dptr(&self.weights.values),
             intensity: self
                 .intensity
                 .as_ref()
@@ -214,7 +216,7 @@ impl OprKernels {
         let mut reads = vec![
             probe.storage(),
             opr.eigenmodes.storage(),
-            opr.weights.storage(),
+            opr.weights.values.storage(),
             ids.storage(),
         ];
         reads.extend(opr.intensity.as_ref().map(|c| c.values.storage()));
@@ -239,9 +241,9 @@ impl OprKernels {
 
     /// `ProbeVariation::step` on the batch of epoch positions `batch` through `order`, from
     /// its [`OprPlanes`] and `P_0`, the first `n` values of `probe`: the refined main-mode
-    /// weights first, then, for two frames or more, each eigenmode and its weights in turn.
-    /// Every sum over a frame's pixels is totalled in chunk order and every sum over the batch
-    /// in frame order; `Σ |U″|²` is its normalization's `n²`.
+    /// weights first, then, for two frames or more, each eigenmode and its refined weights in
+    /// turn. Every sum over a frame's pixels is totalled in chunk order and every sum over the
+    /// batch in frame order; `Σ |U″|²` is its normalization's `n²`.
     pub fn step(
         &self,
         ctx: &ExecutionContext,
@@ -312,7 +314,11 @@ impl OprKernels {
                 r: Some(moved),
             };
             self.frame_sums(ctx, opr, span, of)?;
-            let reads = [opr.sums.storage(), ids.storage(), opr.weights.storage()];
+            let reads = [
+                opr.sums.storage(),
+                ids.storage(),
+                opr.weights.values.storage(),
+            ];
             self.base
                 .launch(ctx, &reads, &[opr.coef.storage()], |stream| {
                     // SAFETY: `span` lies in the scan's positions, `i < k`, the state sized by
@@ -382,16 +388,20 @@ impl OprKernels {
                     }
                 },
             )?;
-            let deflate = i + 1 < k;
+            let (refine, deflate) = (opr.weights.refine, i + 1 < k);
+            if !(refine || deflate) {
+                continue;
+            }
             let of = SumsOf {
                 a: Shared::Eigenmode(i),
-                dv: Some((d, vv)),
+                dv: refine.then_some((d, vv)),
                 r: deflate.then_some(&*moved),
             };
             self.frame_sums(ctx, opr, span, of)?;
-            let reads = [opr.sums.storage(), ids.storage()];
-            self.base
-                .launch(ctx, &reads, &[opr.weights.storage()], |stream| {
+            if refine {
+                let reads = [opr.sums.storage(), ids.storage()];
+                let writes = [opr.weights.values.storage()];
+                self.base.launch(ctx, &reads, &writes, |stream| {
                     // SAFETY: `span` lies in the scan's positions, `i < k`, the state sized by
                     // `Opr::new`; one block.
                     unsafe {
@@ -405,6 +415,7 @@ impl OprKernels {
                         )
                     }
                 })?;
+            }
             if deflate {
                 self.deflate(ctx, opr, span, i, moved)?;
             }
