@@ -50,7 +50,9 @@ rayon = { version = "1.12", optional = true }
 [build-dependencies]
 cuda-artifact-finalizer.workspace = true
 nvjitlink-sys.workspace = true
-oxide-artifacts = "0.2.1"
+oxide-artifacts = { version = "0.2.1", features = ["object-read"] }
+# The rlib archive the device IR is read from; the version oxide-artifacts reads objects with.
+object = { version = "0.36", default-features = false, features = ["read"] }
 libloading = "0.8"
 serde_json = "1"
 cudarc = { version = "0.19.10", default-features = false, features = ["cuda-13040"], optional = true }

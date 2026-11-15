@@ -3,9 +3,10 @@
 //! comes from the one root that CUDA_TOOLKIT_PATH, else CUDA_HOME, names; see [`Toolkit`].
 //!
 //! 1. A nested `cargo oxide build --emit-nvvm-ir` compiles ptyrs-kernels with the cuda-oxide
-//!    backend into `<target>/oxide-device`, writing `ptyrs_kernels.{ll,options,target}` to
-//!    `$OUT_DIR/device`. cargo-oxide is built into `<target>/oxide-cli` from the cuda-rust
-//!    checkout `cuda-device` resolves to, the one its backend is built from.
+//!    backend into `<target>/oxide-device`; the backend embeds the IR, its target and its
+//!    compile options in the crate's rlib, where they are read. cargo-oxide is built into
+//!    `<target>/oxide-cli` from the cuda-rust checkout `cuda-device` resolves to, the one its
+//!    backend is built from.
 //! 2. Every `ptyrs_cufft_c2c_f32_n{N}_e{EPT}_{fwd|inv}` the device code declares is defined in
 //!    the IR as a call to the libcufft device-API function with those traits. Its ID and the
 //!    API version come from libcufft's database string, not from constants here.
@@ -26,7 +27,8 @@ use std::process::Command;
 use cuda_artifact_finalizer::{CudaArch, FinalizationOptions, NvvmCompiler};
 use libloading::Library;
 use nvjitlink_sys::{InputType, LibNvJitLink, Linker};
-use oxide_artifacts::{ArtifactCompileOptions, ArtifactDebugPolicy};
+use object::read::archive::ArchiveFile;
+use oxide_artifacts::{ArtifactDebugPolicy, ArtifactPayloadKind};
 
 type Res<T> = Result<T, Box<dyn Error>>;
 
@@ -137,14 +139,12 @@ fn run(toolkit: &Toolkit) -> Res<()> {
         .unwrap_or_else(|_| "sm_89".to_string())
         .parse()?;
     let out = PathBuf::from(env::var("OUT_DIR")?);
-    let nvvm_dir = out.join("device");
-    fs::create_dir_all(&nvvm_dir)?;
     let target_dir = env::var_os("CARGO_TARGET_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| workspace.join("target"));
 
-    build_device_crate(workspace, toolkit, &target_dir, &nvvm_dir, &arch)?;
-    let (ir, options) = read_device_artifact(&nvvm_dir, &arch)?;
+    let rlib = build_device_crate(workspace, toolkit, &target_dir, &arch)?;
+    let (ir, options) = read_device_artifact(&rlib, &arch)?;
 
     let cufft = CufftDevice::load(&libcufft)?;
     let (ir, ffts) = define_block_ffts(&ir, &cufft, arch.capability())?;
@@ -225,20 +225,21 @@ fn cargo_oxide_manifest(workspace: &Path, toolkit: &Toolkit) -> Res<PathBuf> {
     Ok(crates.join("cargo-oxide").join("Cargo.toml"))
 }
 
-/// Runs `cargo oxide build` on the device crate. The backend's options are part of the
-/// device crate's Cargo fingerprint (cargo-oxide hashes every `CUDA_OXIDE_*` variable,
-/// `CUDA_OXIDE_PTX_DIR` included), so a no-op build means `nvvm_dir` already holds the IR
-/// of the current sources for this architecture.
+/// Runs `cargo oxide build` on the device crate and returns its rlib. The IR is read from the
+/// rlib, the output a no-op build verifies, not from the files the backend also writes:
+/// those can be gone while the build counts itself fresh.
 fn build_device_crate(
     workspace: &Path,
     toolkit: &Toolkit,
     target_dir: &Path,
-    nvvm_dir: &Path,
     arch: &CudaArch,
-) -> Res<()> {
+) -> Res<PathBuf> {
     let cargo_oxide = cargo_oxide_manifest(workspace, toolkit)?;
+    let device_dir = target_dir.join("oxide-device");
     let mut cmd = nested_cargo(workspace, toolkit);
-    cmd.env("CUDA_OXIDE_PTX_DIR", nvvm_dir)
+    // Fixed, as cargo-oxide fingerprints it: one per OUT_DIR rebuilt the device crate and its
+    // dependencies for every profile and feature set of ptyrs.
+    cmd.env("CUDA_OXIDE_PTX_DIR", device_dir.join("emit"))
         .args(["run", "--quiet", "--locked", "--manifest-path"])
         .arg(&cargo_oxide)
         .arg("--target-dir")
@@ -246,34 +247,67 @@ fn build_device_crate(
         .args(["--", "build", "--emit-nvvm-ir", "--arch"])
         .arg(arch.sm())
         .args(["--device-codegen-crate", DEVICE_CRATE, "--cargo-target-dir"])
-        .arg(target_dir.join("oxide-device"))
+        .arg(&device_dir)
         // Release: the legacy NVVM IR dialect for pre-Blackwell targets cannot carry the
         // debug metadata a dev-profile build attaches.
-        .args(["--", "-p", DEVICE_PACKAGE, "--lib", "--release"]);
-    output_ok(cmd, &format!("`cargo oxide build` of {DEVICE_PACKAGE}"))?;
-    Ok(())
+        .args(["--", "-p", DEVICE_PACKAGE, "--lib", "--release"])
+        .arg("--message-format=json-render-diagnostics");
+    let stdout = output_ok(cmd, &format!("`cargo oxide build` of {DEVICE_PACKAGE}"))?;
+    // cargo-oxide's banner precedes cargo's JSON messages.
+    for line in stdout
+        .split(|&b| b == b'\n')
+        .filter(|l| l.starts_with(b"{"))
+    {
+        let message: serde_json::Value = serde_json::from_slice(line)?;
+        if message["reason"] != "compiler-artifact" || message["target"]["name"] != DEVICE_CRATE {
+            continue;
+        }
+        let files = message["filenames"].as_array().into_iter().flatten();
+        if let Some(rlib) = files
+            .filter_map(|f| f.as_str())
+            .find(|f| f.ends_with(".rlib"))
+        {
+            return Ok(rlib.into());
+        }
+    }
+    Err(format!("the nested build reports no rlib of {DEVICE_PACKAGE}").into())
 }
 
-/// Reads the IR and its compile options, checking the backend built it for `arch`.
-fn read_device_artifact(dir: &Path, arch: &CudaArch) -> Res<(String, FinalizationOptions)> {
-    let target = fs::read_to_string(dir.join(format!("{DEVICE_CRATE}.target")))?;
-    let built = target.lines().next().unwrap_or_default();
-    if built != arch.sm() {
+/// Reads the IR and its compile options from the artifact bundle the backend embedded in
+/// `rlib`, checking it was built for `arch`.
+fn read_device_artifact(rlib: &Path, arch: &CudaArch) -> Res<(String, FinalizationOptions)> {
+    let bytes = fs::read(rlib)?;
+    let mut bundles = Vec::new();
+    for member in ArchiveFile::parse(&*bytes)?.members() {
+        let member = member?;
+        if member.name().ends_with(b".o") {
+            bundles.extend(oxide_artifacts::read_artifact_bundles_from_object_bytes(
+                member.data(&*bytes)?,
+            )?);
+        }
+    }
+    let bundle = bundles
+        .into_iter()
+        .find(|b| b.name == DEVICE_PACKAGE)
+        .ok_or_else(|| format!("{} embeds no {DEVICE_PACKAGE} artifact", rlib.display()))?;
+    if bundle.target != arch.sm() {
         return Err(format!(
-            "device IR was built for `{built}`, expected `{}`",
+            "device IR was built for `{}`, expected `{}`",
+            bundle.target,
             arch.sm()
         )
         .into());
     }
-    let sidecar = fs::read_to_string(dir.join(format!("{DEVICE_CRATE}.options")))?;
-    let compile = ArtifactCompileOptions::from_sidecar_text(&sidecar)?;
+    let compile = bundle.compile_options;
     if compile.debug_policy() != ArtifactDebugPolicy::None {
         return Err("device debug info is not carried through the cuFFT link".into());
     }
     let options = FinalizationOptions::new(arch.clone())
         .with_fma_contraction(compile.fma_contraction_enabled());
-    let ir = fs::read_to_string(dir.join(format!("{DEVICE_CRATE}.ll")))?;
-    Ok((ir, options))
+    let ir = bundle
+        .payload(ArtifactPayloadKind::NvvmIr)
+        .ok_or("the device artifact has no NVVM IR payload")?;
+    Ok((String::from_utf8(ir.to_vec())?, options))
 }
 
 /// One block FFT the device code calls.

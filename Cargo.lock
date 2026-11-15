@@ -5705,6 +5705,7 @@ dependencies = [
  "lz4_flex",
  "num-complex",
  "nvjitlink-sys",
+ "object 0.36.7",
  "oxide-artifacts",
  "ptyrs-kernels",
  "rand 0.8.8",
