@@ -1218,11 +1218,12 @@ pub mod kernels {
     #[kernel]
     pub unsafe fn fused_rows_fwd_64(
         p: FusedPtrs,
+        probe: ProbeSrc,
         ctl: *const StackCtl,
         g: StackGeom,
         cfg: FusedCfg,
     ) {
-        unsafe { crate::fused::rows_fwd::<64, false>(p, ctl, g, cfg) }
+        unsafe { crate::fused::rows_fwd::<64, false>(p, probe, ctl, g, cfg) }
     }
     /// [`crate::fused::rows_fwd`] for 64-point rows, of f16 waves.
     ///
@@ -1232,11 +1233,12 @@ pub mod kernels {
     #[kernel]
     pub unsafe fn fused_rows_fwd_f16_64(
         p: FusedPtrs,
+        probe: ProbeSrc,
         ctl: *const StackCtl,
         g: StackGeom,
         cfg: FusedCfg,
     ) {
-        unsafe { crate::fused::rows_fwd::<64, true>(p, ctl, g, cfg) }
+        unsafe { crate::fused::rows_fwd::<64, true>(p, probe, ctl, g, cfg) }
     }
 
     /// [`crate::fused::rows_fwd`] for 128-point rows.
@@ -1247,11 +1249,12 @@ pub mod kernels {
     #[kernel]
     pub unsafe fn fused_rows_fwd_128(
         p: FusedPtrs,
+        probe: ProbeSrc,
         ctl: *const StackCtl,
         g: StackGeom,
         cfg: FusedCfg,
     ) {
-        unsafe { crate::fused::rows_fwd::<128, false>(p, ctl, g, cfg) }
+        unsafe { crate::fused::rows_fwd::<128, false>(p, probe, ctl, g, cfg) }
     }
     /// [`crate::fused::rows_fwd`] for 128-point rows, of f16 waves.
     ///
@@ -1261,11 +1264,12 @@ pub mod kernels {
     #[kernel]
     pub unsafe fn fused_rows_fwd_f16_128(
         p: FusedPtrs,
+        probe: ProbeSrc,
         ctl: *const StackCtl,
         g: StackGeom,
         cfg: FusedCfg,
     ) {
-        unsafe { crate::fused::rows_fwd::<128, true>(p, ctl, g, cfg) }
+        unsafe { crate::fused::rows_fwd::<128, true>(p, probe, ctl, g, cfg) }
     }
 
     /// [`crate::fused::rows_fwd`] for 256-point rows.
@@ -1276,11 +1280,12 @@ pub mod kernels {
     #[kernel]
     pub unsafe fn fused_rows_fwd_256(
         p: FusedPtrs,
+        probe: ProbeSrc,
         ctl: *const StackCtl,
         g: StackGeom,
         cfg: FusedCfg,
     ) {
-        unsafe { crate::fused::rows_fwd::<256, false>(p, ctl, g, cfg) }
+        unsafe { crate::fused::rows_fwd::<256, false>(p, probe, ctl, g, cfg) }
     }
     /// [`crate::fused::rows_fwd`] for 256-point rows, of f16 waves.
     ///
@@ -1290,11 +1295,12 @@ pub mod kernels {
     #[kernel]
     pub unsafe fn fused_rows_fwd_f16_256(
         p: FusedPtrs,
+        probe: ProbeSrc,
         ctl: *const StackCtl,
         g: StackGeom,
         cfg: FusedCfg,
     ) {
-        unsafe { crate::fused::rows_fwd::<256, true>(p, ctl, g, cfg) }
+        unsafe { crate::fused::rows_fwd::<256, true>(p, probe, ctl, g, cfg) }
     }
 
     /// [`crate::fused::rows_fwd`] for 512-point rows.
@@ -1305,11 +1311,12 @@ pub mod kernels {
     #[kernel]
     pub unsafe fn fused_rows_fwd_512(
         p: FusedPtrs,
+        probe: ProbeSrc,
         ctl: *const StackCtl,
         g: StackGeom,
         cfg: FusedCfg,
     ) {
-        unsafe { crate::fused::rows_fwd::<512, false>(p, ctl, g, cfg) }
+        unsafe { crate::fused::rows_fwd::<512, false>(p, probe, ctl, g, cfg) }
     }
     /// [`crate::fused::rows_fwd`] for 512-point rows, of f16 waves.
     ///
@@ -1319,11 +1326,12 @@ pub mod kernels {
     #[kernel]
     pub unsafe fn fused_rows_fwd_f16_512(
         p: FusedPtrs,
+        probe: ProbeSrc,
         ctl: *const StackCtl,
         g: StackGeom,
         cfg: FusedCfg,
     ) {
-        unsafe { crate::fused::rows_fwd::<512, true>(p, ctl, g, cfg) }
+        unsafe { crate::fused::rows_fwd::<512, true>(p, probe, ctl, g, cfg) }
     }
 
     /// [`crate::fused::cols`] for 64-point columns, without the model terms.

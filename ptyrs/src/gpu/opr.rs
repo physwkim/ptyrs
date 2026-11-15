@@ -10,7 +10,7 @@ use std::ptr;
 
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig, RawDeviceBuffer};
-use ptyrs_kernels::fused::ProbeSrc;
+use ptyrs_kernels::fused::{ProbeSrc, shared_probe};
 use ptyrs_kernels::opr::{OPR_SUMS, OprFrames, OprScan, opr_kernels};
 use ptyrs_kernels::pixel::PIXEL_THREADS;
 use ptyrs_kernels::position::BatchSpan;
@@ -239,13 +239,7 @@ impl<'a> FrameProbe<'a> {
 
 /// `probe` shared by every frame, as a kernel reads it.
 pub(super) fn shared_src(probe: &DeviceBuffer<C32>) -> ProbeSrc {
-    let p = dptr::<C32, f32>(probe).cast_const();
-    ProbeSrc {
-        probe: p,
-        mode0: p,
-        p0: 0,
-        nb: 1,
-    }
+    shared_probe(dptr::<C32, f32>(probe).cast_const())
 }
 
 /// A batch's per-frame mode-0 planes for [`OprKernels::step`], each `[nb, n]` by batch frame

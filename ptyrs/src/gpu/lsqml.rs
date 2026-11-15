@@ -29,7 +29,7 @@ use std::ops::Range;
 
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig, RawDeviceBuffer};
-use ptyrs_kernels::fused::{FUSED_COLS, FUSED_DOWN, FusedCfg, FusedPtrs, ProbeSrc};
+use ptyrs_kernels::fused::{FUSED_COLS, FUSED_DOWN, FusedCfg, FusedPtrs};
 use ptyrs_kernels::grad::ObjProbePtrs;
 pub use ptyrs_kernels::lsqml::LSQML_REC;
 use ptyrs_kernels::lsqml::{
@@ -417,9 +417,9 @@ impl LsqmlKernels {
         let config = sh.rows(&g, true)?;
         let mut reads = vec![obj.storage(), views.addr().storage(), stack.storage()];
         reads.extend(probe.storages());
+        let probe = probe.src(d.n())?;
         let p = FusedPtrs {
             obj: dptr::<C32, f32>(obj).cast_const(),
-            probe: probe.src(d.n())?,
             views: dptr::<ViewAddr, ViewAddr>(views.addr()).cast_const(),
             work: dptr(work),
             ..null_ptrs()
@@ -436,10 +436,10 @@ impl LsqmlKernels {
             // memory; `Views::new` checked the views are inside the object.
             unsafe {
                 match sh.nx {
-                    Side::N64 => m.fused_rows_fwd_64(stream, config, p, ctl, g, cfg),
-                    Side::N128 => m.fused_rows_fwd_128(stream, config, p, ctl, g, cfg),
-                    Side::N256 => m.fused_rows_fwd_256(stream, config, p, ctl, g, cfg),
-                    Side::N512 => m.fused_rows_fwd_512(stream, config, p, ctl, g, cfg),
+                    Side::N64 => m.fused_rows_fwd_64(stream, config, p, probe, ctl, g, cfg),
+                    Side::N128 => m.fused_rows_fwd_128(stream, config, p, probe, ctl, g, cfg),
+                    Side::N256 => m.fused_rows_fwd_256(stream, config, p, probe, ctl, g, cfg),
+                    Side::N512 => m.fused_rows_fwd_512(stream, config, p, probe, ctl, g, cfg),
                 }
             }
         })
@@ -988,12 +988,7 @@ impl ColsLaunch {
 fn null_ptrs() -> FusedPtrs {
     FusedPtrs {
         obj: std::ptr::null(),
-        probe: ProbeSrc {
-            probe: std::ptr::null(),
-            mode0: std::ptr::null(),
-            p0: 0,
-            nb: 1,
-        },
+        probe: std::ptr::null(),
         views: std::ptr::null(),
         counts: std::ptr::null(),
         psi: no_psi(),
