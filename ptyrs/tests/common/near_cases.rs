@@ -39,6 +39,20 @@ pub fn propagated(addr: &AddrTable, optics: &Optics, object: &Object, probe: &Pr
     psi
 }
 
+/// The counts `[nframe, ny, nx]` of detector-plane waves `psi` (`nmode` planes per frame, as
+/// [`propagated`] gives them): each pixel's intensity summed over modes and rounded.
+pub fn rounded_counts(psi: &[C64], nmode: usize, [nframe, ny, nx]: [usize; 3]) -> Counts {
+    let n = ny * nx;
+    let mut counts = vec![0.0; nframe * n];
+    for (f, block) in psi.chunks_exact(nmode * n).enumerate() {
+        for j in 0..n {
+            let icalc: f64 = (0..nmode).map(|m| block[m * n + j].norm_sqr()).sum();
+            counts[f * n + shift(j, ny, nx)] = icalc.round();
+        }
+    }
+    Counts::from_f64([nframe, ny, nx], &counts, None).unwrap()
+}
+
 fn free_space(wavelength: f64, distance: f64) -> Optics {
     let frame = FUSED_SIDES[0] as usize;
     let field = Wavefield::new([frame, frame], wavelength, [PIXEL, PIXEL], distance).unwrap();
@@ -61,15 +75,7 @@ pub fn case(name: &'static str, wavelength: f64, distance: f64) -> Case {
         .for_each(|v| *v *= PHOTONS.sqrt());
 
     let psi = propagated(&addr, &optics, &truth, &probe);
-    let (n, nmode, nframe) = (frame * frame, addr.nmode(), addr.nframe());
-    let mut counts = vec![0.0; nframe * n];
-    for (f, block) in psi.chunks_exact(nmode * n).enumerate() {
-        for j in 0..n {
-            let icalc: f64 = (0..nmode).map(|m| block[m * n + j].norm_sqr()).sum();
-            counts[f * n + shift(j, frame, frame)] = icalc.round();
-        }
-    }
-    let counts = Counts::from_f64([nframe, frame, frame], &counts, None).unwrap();
+    let counts = rounded_counts(&psi, addr.nmode(), [addr.nframe(), frame, frame]);
 
     // The start: unit modulus and a random phase in -1/4..1/4 rad, the probe's defocus cut
     // by a third.

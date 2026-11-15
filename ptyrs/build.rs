@@ -3,7 +3,7 @@
 //! comes from the one root that CUDA_TOOLKIT_PATH, else CUDA_HOME, names; see [`Toolkit`].
 //!
 //! 1. A nested `cargo oxide build --emit-nvvm-ir` compiles ptyrs-kernels with the cuda-oxide
-//!    backend into `<target>/oxide-device`; the backend embeds the IR, its target and its
+//!    backend into `<target>/oxide-device/<sm>`; the backend embeds the IR, its target and its
 //!    compile options in the crate's rlib, where they are read. cargo-oxide is built into
 //!    `<target>/oxide-cli` from the cuda-rust checkout `cuda-device` resolves to, the one its
 //!    backend is built from.
@@ -127,7 +127,10 @@ fn run(toolkit: &Toolkit) -> Res<()> {
 
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
     let workspace = manifest.parent().ok_or("ptyrs has no parent directory")?;
-    let kernels = workspace.join(DEVICE_PACKAGE);
+    // Relative, so cargo resolves them against the checkout it builds. Checkouts sharing a
+    // target dir share this script's run, and an absolute path keeps naming the one that last
+    // ran it: another's edits did not rerun it, and its cubin missed their kernels.
+    let kernels = Path::new("..").join(DEVICE_PACKAGE);
     println!("cargo:rerun-if-changed={}", kernels.join("src").display());
     println!(
         "cargo:rerun-if-changed={}",
@@ -139,12 +142,12 @@ fn run(toolkit: &Toolkit) -> Res<()> {
         .unwrap_or_else(|_| "sm_89".to_string())
         .parse()?;
     let out = PathBuf::from(env::var("OUT_DIR")?);
-    let target_dir = env::var_os("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| workspace.join("target"));
+    // Relative to the workspace root, not ptyrs/ where this script runs, so the lock and the
+    // nested builds name one directory.
+    let target_dir =
+        workspace.join(env::var_os("CARGO_TARGET_DIR").unwrap_or_else(|| "target".into()));
 
-    let rlib = build_device_crate(workspace, toolkit, &target_dir, &arch)?;
-    let (ir, options) = read_device_artifact(&rlib, &arch)?;
+    let (ir, options) = build_device_crate(workspace, toolkit, &target_dir, &arch)?;
 
     let cufft = CufftDevice::load(&libcufft)?;
     let (ir, ffts) = define_block_ffts(&ir, &cufft, arch.capability())?;
@@ -225,20 +228,27 @@ fn cargo_oxide_manifest(workspace: &Path, toolkit: &Toolkit) -> Res<PathBuf> {
     Ok(crates.join("cargo-oxide").join("Cargo.toml"))
 }
 
-/// Runs `cargo oxide build` on the device crate and returns its rlib. The IR is read from the
-/// rlib, the output a no-op build verifies, not from the files the backend also writes:
-/// those can be gone while the build counts itself fresh.
+/// Runs `cargo oxide build` on the device crate and returns the IR and compile options it
+/// embedded in its rlib. The IR is read from the rlib, the output a no-op build verifies, not
+/// from the files the backend also writes: those can be gone while the build counts itself
+/// fresh.
 fn build_device_crate(
     workspace: &Path,
     toolkit: &Toolkit,
     target_dir: &Path,
     arch: &CudaArch,
-) -> Res<PathBuf> {
+) -> Res<(String, FinalizationOptions)> {
     let cargo_oxide = cargo_oxide_manifest(workspace, toolkit)?;
-    let device_dir = target_dir.join("oxide-device");
+    // One per arch, so every rlib in it is of this arch and a switch of arch keeps the other's
+    // build. Fixed otherwise, as cargo-oxide fingerprints it: one per OUT_DIR rebuilt the
+    // device crate and its dependencies for every profile and feature set of ptyrs.
+    let device_dir = target_dir.join("oxide-device").join(arch.sm());
+    fs::create_dir_all(&device_dir)?;
+    // Held through the read: once this nested build exits, cargo lets a build of other sources
+    // (another checkout, or an edit since) replace the rlib.
+    let lock = fs::File::create(device_dir.join("ptyrs.lock"))?;
+    lock.lock()?;
     let mut cmd = nested_cargo(workspace, toolkit);
-    // Fixed, as cargo-oxide fingerprints it: one per OUT_DIR rebuilt the device crate and its
-    // dependencies for every profile and feature set of ptyrs.
     cmd.env("CUDA_OXIDE_PTX_DIR", device_dir.join("emit"))
         .args(["run", "--quiet", "--locked", "--manifest-path"])
         .arg(&cargo_oxide)
@@ -251,6 +261,10 @@ fn build_device_crate(
         // Release: the legacy NVVM IR dialect for pre-Blackwell targets cannot carry the
         // debug metadata a dev-profile build attaches.
         .args(["--", "-p", DEVICE_PACKAGE, "--lib", "--release"])
+        // Fresh by content: every checkout using this target dir builds into the device dir,
+        // and by mtime its sources counted fresh against another checkout's newer build, whose
+        // IR this read. cargo-oxide runs this cargo with RUSTC_BOOTSTRAP for its backend.
+        .arg("-Zchecksum-freshness")
         .arg("--message-format=json-render-diagnostics");
     let stdout = output_ok(cmd, &format!("`cargo oxide build` of {DEVICE_PACKAGE}"))?;
     // cargo-oxide's banner precedes cargo's JSON messages.
@@ -267,7 +281,7 @@ fn build_device_crate(
             .filter_map(|f| f.as_str())
             .find(|f| f.ends_with(".rlib"))
         {
-            return Ok(rlib.into());
+            return read_device_artifact(Path::new(rlib), arch);
         }
     }
     Err(format!("the nested build reports no rlib of {DEVICE_PACKAGE}").into())
