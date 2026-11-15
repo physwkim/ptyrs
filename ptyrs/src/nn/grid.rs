@@ -14,3 +14,39 @@ pub(super) fn grid(client: &Client, cubes: usize) -> CubeCount {
     let rows = cubes.div_ceil(most_x);
     CubeCount::Static(cubes.min(most_x), rows.min(most_y), rows.div_ceil(most_y))
 }
+
+/// Panics unless each tensor of `shapes`, the shapes of every tensor a launch reads or writes,
+/// holds fewer than 2³² elements: the kernels index them with 32 bits, and cubecl's launch panics
+/// with no message past that. A launch site calls it before it packs or allocates anything.
+pub(super) fn check_elements(shapes: &[&[usize]]) {
+    let fits = |shape: &&[usize]| {
+        let len = shape.iter().try_fold(1usize, |p, &d| p.checked_mul(d));
+        len.is_some_and(|len| u32::try_from(len).is_ok())
+    };
+    assert!(
+        shapes.iter().all(fits),
+        "a launch of fewer than 2³² elements per tensor"
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn just_under_2_32_elements_fit() {
+        check_elements(&[&[65535, 65537]]);
+    }
+
+    #[test]
+    #[should_panic(expected = "a launch of fewer than 2³² elements per tensor")]
+    fn exactly_2_32_elements_do_not() {
+        check_elements(&[&[65535, 65537], &[1 << 16, 1 << 16]]);
+    }
+
+    #[test]
+    #[should_panic(expected = "a launch of fewer than 2³² elements per tensor")]
+    fn an_element_count_past_usize_does_not_fit() {
+        check_elements(&[&[1 << 32, 1 << 32]]);
+    }
+}

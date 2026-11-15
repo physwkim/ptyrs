@@ -32,7 +32,7 @@ use burn_cubecl::kernel::into_contiguous;
 use burn_cubecl::ops::numeric::empty_device_contiguous_dtype;
 use burn_cubecl::tensor::CubeTensor;
 
-use crate::nn::grid::grid;
+use crate::nn::grid::{check_elements, grid};
 
 /// A convolution of the networks, whose only forward is [`Conv::forward`]. Its record is the
 /// [`Conv2d`]'s it wraps, field for field, so saved networks read the same.
@@ -300,20 +300,6 @@ impl<C: CheckpointStrategy> ConvOps for Autodiff<CubeBackend, C> {
     }
 }
 
-/// Panics unless each tensor of `shapes`, the shapes of every tensor a launch reads or writes,
-/// holds fewer than 2³² elements: the kernels index them with 32 bits, and cubecl's launch panics
-/// with no message past that.
-fn check_elements(shapes: &[&[usize]]) {
-    let fits = |shape: &&[usize]| {
-        let len = shape.iter().try_fold(1usize, |p, &d| p.checked_mul(d));
-        len.is_some_and(|len| u32::try_from(len).is_ok())
-    };
-    assert!(
-        shapes.iter().all(fits),
-        "a convolution of fewer than 2³² elements per tensor"
-    );
-}
-
 /// A kernel's size argument. Past [`check_elements`] it is below 2³² unless a tensor is empty.
 fn u(v: usize) -> u32 {
     u32::try_from(v).expect("a convolution size below 2³²")
@@ -340,7 +326,15 @@ const CUBES: usize = 512;
 /// `bias`; a second kernel adds the bands in order, so the result does not depend on scheduling.
 fn weight_grad(x: CubeTensor, dy: CubeTensor, bias: bool) -> (CubeTensor, Option<CubeTensor>) {
     let [n, h, w, ci] = x.meta.shape().dims();
-    let [_, _, _, co] = dy.meta.shape().dims();
+    let [dn, dh, dw, co] = dy.meta.shape().dims();
+    // The kernel reads `dy` at `x`'s pixels.
+    assert_eq!(
+        [dn, dh, dw],
+        [n, h, w],
+        "an output gradient over the input's pixels"
+    );
+    // `dw` and `db`, checked before their counts are multiplied out.
+    check_elements(&[x.meta.shape(), dy.meta.shape(), &[co, ci, 9], &[co]]);
     // The cubes of `a = 0` sum the bias gradient, so they are there even for no input channels.
     let (across, down) = (ci.div_ceil(LANES).max(1), co.div_ceil(PER * WARPS));
     let strips = w.div_ceil(LANES);
@@ -352,13 +346,7 @@ fn weight_grad(x: CubeTensor, dy: CubeTensor, bias: bool) -> (CubeTensor, Option
     let cubes = across * bands * down;
     let lw = co * ci * 9;
     let len = lw + if bias { co } else { 0 };
-    check_elements(&[
-        &[n, h, w, ci],
-        &[n, h, w, co],
-        &[bands, len],
-        &[co, ci, 9],
-        &[co],
-    ]);
+    check_elements(&[&[bands, len]]);
     let (x, dy) = (into_contiguous(x), into_contiguous(dy));
     let dtype = dtype_to_storage_type(x.dtype);
     let client = x.client.clone();
@@ -431,7 +419,9 @@ const GROUPS: usize = 8;
 fn conv3x3(x: CubeTensor, wk: CubeTensor, bias: Option<CubeTensor>) -> CubeTensor {
     let [n, h, w, a] = x.meta.shape().dims();
     let [_, _, b] = wk.meta.shape().dims();
-    check_elements(&[&[n, h, w, a], &[a, 9, b], &[b], &[n, h, w, b]]);
+    // `wk` is `arrange`'s, which checked it.
+    let bias_shape = bias.as_ref().map_or(&[][..], |t| &t.meta.shape()[..]);
+    check_elements(&[x.meta.shape(), bias_shape, &[n, h, w, b]]);
     let x = into_contiguous(x);
     let groups = b.div_ceil(PER).next_power_of_two().min(GROUPS);
     let chunk = groups.min(32 / x.dtype.size());
@@ -480,7 +470,7 @@ fn conv3x3(x: CubeTensor, wk: CubeTensor, bias: Option<CubeTensor>) -> CubeTenso
 /// as the `[co, 9, ci]` of the input gradient, whose tap `t` is the forward's `8 - t`.
 fn arrange(weight: CubeTensor, flip: bool) -> CubeTensor {
     let [co, ci, _, _] = weight.meta.shape().dims();
-    check_elements(&[&[co, ci, 9]]);
+    check_elements(&[weight.meta.shape(), &[co, ci, 9]]);
     let weight = into_contiguous(weight);
     let shape = if flip { [co, 9, ci] } else { [ci, 9, co] };
     let client = weight.client.clone();
@@ -1228,34 +1218,24 @@ mod tests {
         }
     }
 
-    #[test]
-    fn just_under_2_32_elements_fit() {
-        check_elements(&[&[65535, 65537]]);
-    }
-
-    #[test]
-    #[should_panic(expected = "a convolution of fewer than 2³² elements per tensor")]
-    fn exactly_2_32_elements_do_not() {
-        check_elements(&[&[65535, 65537], &[1 << 16, 1 << 16]]);
-    }
-
-    #[test]
-    #[should_panic(expected = "a convolution of fewer than 2³² elements per tensor")]
-    fn an_element_count_past_usize_does_not_fit() {
-        check_elements(&[&[1 << 32, 1 << 32]]);
-    }
-
     /// A tensor of `shape` that is one element seen through zero strides, so a launch site's check
     /// meets it at its size without allocating it.
-    fn broadcast(shape: [usize; 4]) -> CubeTensor {
-        Tensor::<4>::ones([1, 1, 1, 1], (&crate::nn::cuda(0), DType::F32))
+    fn broadcast<const D: usize>(shape: [usize; D]) -> CubeTensor {
+        Tensor::<D>::ones([1; D], (&crate::nn::cuda(0), DType::F32))
             .expand(shape)
             .try_into_primitive::<CubeBackend>()
             .unwrap()
     }
 
+    /// A tensor of `shape`, which holds no elements.
+    fn empty<const D: usize>(shape: [usize; D]) -> CubeTensor {
+        Tensor::<D>::empty(shape, (&crate::nn::cuda(0), DType::F32))
+            .try_into_primitive::<CubeBackend>()
+            .unwrap()
+    }
+
     #[test]
-    #[should_panic(expected = "a convolution of fewer than 2³² elements per tensor")]
+    #[should_panic(expected = "a launch of fewer than 2³² elements per tensor")]
     fn convolution_input_of_2_32_elements() {
         forward(
             broadcast([1, 1 << 15, 1 << 16, 2]),
@@ -1265,7 +1245,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "a convolution of fewer than 2³² elements per tensor")]
+    #[should_panic(expected = "a launch of fewer than 2³² elements per tensor")]
     fn convolution_output_of_2_32_elements() {
         forward(
             broadcast([1, 1 << 15, 1 << 16, 1]),
@@ -1274,10 +1254,65 @@ mod tests {
         );
     }
 
+    /// Over no pixels and no input channels only the bias of 2³² channels is over.
+    #[test]
+    #[should_panic(expected = "a launch of fewer than 2³² elements per tensor")]
+    fn convolution_bias_of_2_32_elements() {
+        conv3x3(
+            empty([0, 1, 1, 0]),
+            empty([0, 9, 1 << 32]),
+            Some(broadcast([1 << 32])),
+        );
+    }
+
+    /// 2²⁶ input channels on 64 pixels: the output gradient, weight gradient and partials fit.
+    #[test]
+    #[should_panic(expected = "a launch of fewer than 2³² elements per tensor")]
+    fn weight_gradient_input_of_2_32_elements() {
+        weight_grad(
+            broadcast([1, 1, 64, 1 << 26]),
+            broadcast([1, 1, 64, 1]),
+            false,
+        );
+    }
+
+    /// 2²⁶ output channels on 64 pixels: the input, weight and bias gradients and partials fit.
+    #[test]
+    #[should_panic(expected = "a launch of fewer than 2³² elements per tensor")]
+    fn weight_gradient_output_gradient_of_2_32_elements() {
+        weight_grad(
+            broadcast([1, 1, 64, 1]),
+            broadcast([1, 1, 64, 1 << 26]),
+            true,
+        );
+    }
+
+    /// 2¹⁶ by 2¹⁶ channels over no pixels: only the weight gradient is over, and its count is
+    /// checked before it is multiplied out.
+    #[test]
+    #[should_panic(expected = "a launch of fewer than 2³² elements per tensor")]
+    fn weight_gradient_of_more_than_2_32_elements() {
+        weight_grad(empty([0, 1, 1, 1 << 16]), empty([0, 1, 1, 1 << 16]), false);
+    }
+
+    /// 2³² output channels from no input channels over no pixels: only the bias gradient is over.
+    #[test]
+    #[should_panic(expected = "a launch of fewer than 2³² elements per tensor")]
+    fn bias_gradient_of_2_32_elements() {
+        weight_grad(empty([0, 1, 1, 0]), empty([0, 1, 1, 1 << 32]), true);
+    }
+
+    /// The kernel reads the output gradient at the input's pixels, so it refuses one over others.
+    #[test]
+    #[should_panic(expected = "an output gradient over the input's pixels")]
+    fn weight_gradient_over_other_pixels() {
+        weight_grad(broadcast([1, 1, 2, 1]), broadcast([1, 1, 1, 1]), false);
+    }
+
     /// 9·2²⁸ weights over two bands of 32 columns: the input, output gradient and weight gradient
     /// fit, the partials do not.
     #[test]
-    #[should_panic(expected = "a convolution of fewer than 2³² elements per tensor")]
+    #[should_panic(expected = "a launch of fewer than 2³² elements per tensor")]
     fn weight_gradient_partials_of_more_than_2_32_elements() {
         let side = [1, 1, 64, 1 << 14];
         weight_grad(broadcast(side), broadcast(side), false);
@@ -1285,7 +1320,7 @@ mod tests {
 
     /// 2¹⁶ · 7282 · 9 weights, just past 2³².
     #[test]
-    #[should_panic(expected = "a convolution of fewer than 2³² elements per tensor")]
+    #[should_panic(expected = "a launch of fewer than 2³² elements per tensor")]
     fn arranged_weight_of_more_than_2_32_elements() {
         arrange(broadcast([1 << 16, 7282, 3, 3]), false);
     }

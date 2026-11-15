@@ -21,7 +21,7 @@ use burn_cubecl::kernel::into_contiguous;
 use burn_cubecl::ops::numeric::empty_device_contiguous_dtype;
 use burn_cubecl::tensor::CubeTensor;
 
-use crate::nn::grid::grid;
+use crate::nn::grid::{check_elements, grid};
 
 /// `relu(n.forward(x))` for channels-last `x`, whose last axis is `n`'s channels. It runs on the
 /// `[rows, channels]` view of `x`, which costs none of the transposing copy a channels-first view
@@ -85,11 +85,13 @@ impl NormReluOps for CubeBackend {
         beta: CubeTensor,
         epsilon: f64,
     ) -> (CubeTensor, CubeTensor, CubeTensor) {
-        forward(x, gamma, beta, epsilon)
+        let s = forward(x, gamma, beta, epsilon);
+        (s.y, s.mean, s.var)
     }
 }
 
-/// What the backward reads: the input, the output (ReLU's mask) and the statistics.
+/// What the backward reads: the input and γ as the forward packed them, the output (ReLU's mask)
+/// and the statistics.
 #[derive(Clone, Debug)]
 struct Saved {
     x: CubeTensor,
@@ -127,26 +129,20 @@ impl<C: CheckpointStrategy> NormReluOps for Autodiff<CubeBackend, C> {
         epsilon: f64,
     ) -> (FloatTensor<Self>, FloatTensor<Self>, FloatTensor<Self>) {
         let guards = [x.node(), gamma.node(), beta.node()];
-        // Packed once here, so `forward` and `backward` find them packed and copy nothing.
-        let x = into_contiguous(x.into_primitive());
-        let gamma = into_contiguous(gamma.into_primitive());
-        let (y, mean, var) = forward(x.clone(), gamma.clone(), beta.into_primitive(), epsilon);
+        // `backward` finds x and γ as `forward` packed them, so it copies nothing.
+        let s = forward(
+            x.into_primitive(),
+            gamma.into_primitive(),
+            beta.into_primitive(),
+            epsilon,
+        );
+        let (y, mean, var) = (s.y.clone(), s.mean.clone(), s.var.clone());
         let y = match NormReluBackward
             .prepare::<C>(guards)
             .compute_bound()
             .stateful()
         {
-            OpsKind::Tracked(prep) => {
-                let state = Saved {
-                    x,
-                    gamma,
-                    y: y.clone(),
-                    mean: mean.clone(),
-                    var: var.clone(),
-                    epsilon,
-                };
-                prep.finish(state, y)
-            }
+            OpsKind::Tracked(prep) => prep.finish(s, y),
             OpsKind::UnTracked(prep) => prep.finish(y),
         };
         (y, Self::from_inner(mean), Self::from_inner(var))
@@ -171,8 +167,20 @@ struct Grid {
 }
 
 impl Grid {
-    fn new(x: &CubeTensor) -> Self {
+    /// The grid over `x`, `[rows, cols]`, for launches that also read `inputs`, once
+    /// [`check_elements`] passed every tensor they read or write: `x`, `inputs`, the `[rows, cols]`
+    /// output and the `[cols]` statistics. The `[groups, cols]` partials need no check of their
+    /// own: `groups` is at most `rows`, or 1 over no rows.
+    fn new(x: &CubeTensor, inputs: &[&CubeTensor]) -> Self {
         let [rows, cols] = x.meta.shape().dims();
+        let (out, stats) = ([rows, cols], [cols]);
+        let shapes: Vec<&[usize]> = [x]
+            .into_iter()
+            .chain(inputs.iter().copied())
+            .map(|t| &t.meta.shape()[..])
+            .chain([&out[..], &stats[..]])
+            .collect();
+        check_elements(&shapes);
         let tx = cols.next_power_of_two().min(32);
         let ty = UNITS / tx;
         let blocks = cols.div_ceil(tx);
@@ -207,18 +215,13 @@ impl Grid {
     }
 }
 
-fn forward(
-    x: CubeTensor,
-    gamma: CubeTensor,
-    beta: CubeTensor,
-    epsilon: f64,
-) -> (CubeTensor, CubeTensor, CubeTensor) {
+fn forward(x: CubeTensor, gamma: CubeTensor, beta: CubeTensor, epsilon: f64) -> Saved {
+    let g = Grid::new(&x, &[&gamma, &beta]);
     let (x, gamma, beta) = (
         into_contiguous(x),
         into_contiguous(gamma),
         into_contiguous(beta),
     );
-    let g = Grid::new(&x);
     let dtype = dtype_to_storage_type(x.dtype);
     let client = x.client.clone();
     let sums = g.empty(&x, [g.groups, g.cols]);
@@ -263,8 +266,8 @@ fn forward(
             &client,
             g.count,
             g.dim,
-            x.into_tensor_arg(),
-            gamma.into_tensor_arg(),
+            x.clone().into_tensor_arg(),
+            gamma.clone().into_tensor_arg(),
             beta.into_tensor_arg(),
             sums.into_tensor_arg(),
             squares.into_tensor_arg(),
@@ -281,7 +284,14 @@ fn forward(
             dtype,
         );
     }
-    (y, mean, var)
+    Saved {
+        x,
+        gamma,
+        y,
+        mean,
+        var,
+        epsilon,
+    }
 }
 
 fn backward(
@@ -293,12 +303,12 @@ fn backward(
     epsilon: f64,
     dy: CubeTensor,
 ) -> [CubeTensor; 3] {
+    let g = Grid::new(&x, &[&gamma, &y, &mean, &var, &dy]);
     let (x, gamma, dy) = (
         into_contiguous(x),
         into_contiguous(gamma),
         into_contiguous(dy),
     );
-    let g = Grid::new(&x);
     let dtype = dtype_to_storage_type(x.dtype);
     let client = x.client.clone();
     let shifts = g.empty(&x, [g.groups, g.cols]);
@@ -811,10 +821,10 @@ mod tests {
         for (rows, cols) in [(0, 8), (8, 0), (0, 0)] {
             let x = cube([rows, cols], &device);
             let gamma = cube([cols], &device);
-            let (y, mean, var) = forward(x.clone(), gamma.clone(), cube([cols], &device), 1e-5);
+            let s = forward(x, gamma, cube([cols], &device), 1e-5);
+            let (y, mean, var) = (s.y.clone(), s.mean.clone(), s.var.clone());
             let dy = cube([rows, cols], &device);
-            let [dx, dgamma, dbeta] =
-                backward(x, gamma, y.clone(), mean.clone(), var.clone(), 1e-5, dy);
+            let [dx, dgamma, dbeta] = backward(s.x, s.gamma, s.y, s.mean, s.var, 1e-5, dy);
             let at = format!("{rows}×{cols}");
             let nan = |v: Vec<f64>| v.len() == cols && v.iter().all(|v| v.is_nan());
             assert_eq!(read::<2>(y).len(), rows * cols, "{at}: y");
@@ -824,6 +834,47 @@ mod tests {
             assert_eq!(read::<1>(dgamma), vec![0.0; cols], "{at}: dgamma");
             assert_eq!(read::<1>(dbeta), vec![0.0; cols], "{at}: dbeta");
         }
+    }
+
+    /// A tensor of `shape` that is one element seen through zero strides, so the launch check
+    /// meets it at its size without allocating it.
+    fn broadcast<const D: usize>(shape: [usize; D]) -> CubeTensor {
+        Tensor::<D>::ones([1; D], (&crate::nn::cuda(0), DType::F32))
+            .expand(shape)
+            .try_into_primitive::<CubeBackend>()
+            .unwrap()
+    }
+
+    /// An activation of 2³² elements, refused before it is packed; γ and β fit.
+    #[test]
+    #[should_panic(expected = "a launch of fewer than 2³² elements per tensor")]
+    fn an_activation_of_2_32_elements() {
+        let side = 1 << 16;
+        forward(
+            broadcast([side, side]),
+            broadcast([side]),
+            broadcast([side]),
+            1e-5,
+        );
+    }
+
+    /// The backward checks its tensors too, before it packs `x`, γ or `dy`.
+    #[test]
+    #[should_panic(expected = "a launch of fewer than 2³² elements per tensor")]
+    fn an_activation_gradient_of_2_32_elements() {
+        let (side, a) = (1 << 16, broadcast([1 << 16, 1 << 16]));
+        let c = || broadcast([side]);
+        backward(a.clone(), c(), a.clone(), c(), c(), 1e-5, a);
+    }
+
+    /// 2³² channels over no rows: only γ, β and the statistics are over.
+    #[test]
+    #[should_panic(expected = "a launch of fewer than 2³² elements per tensor")]
+    fn statistics_of_2_32_channels() {
+        let x = Tensor::<2>::empty([0, 1usize << 32], (&crate::nn::cuda(0), DType::F32))
+            .try_into_primitive::<CubeBackend>()
+            .unwrap();
+        forward(x, broadcast([1 << 32]), broadcast([1 << 32]), 1e-5);
     }
 
     /// Through `norm_relu`, an activation of no channels stays empty, and over no rows the running
