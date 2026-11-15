@@ -444,7 +444,7 @@ pub mod sampling_kernels {
 
     /// `acc[o, j] *= sum_f M_f(j)` for every object mode `o`, `M_f` the spectrum of
     /// `|h_t[-v]|^2` of frame `f`'s position `t` over the whole scan, the product of its axes'
-    /// [`square`], in ascending `f`: with `acc` the transformed [`illum_embed`], an inverse
+    /// `square`, in ascending `f`: with `acc` the transformed [`illum_embed`], an inverse
     /// transform leaves the diagonal of `AᴴA`. One thread per element of `[nyo, nxo]`.
     ///
     /// # Safety
@@ -528,9 +528,9 @@ pub mod sampling_kernels {
     }
 
     /// The object solve's start from `ap = AᴴA x / scale`: `res = res - scale ap`, `dir = res
-    /// / pre`, `pre` [`pre`] of `den` and the regularization, and block `b`'s `sum |res|^2 /
-    /// pre` over the elements `i ≡ b * PIXEL_THREADS + t (mod gridDim * PIXEL_THREADS)` into
-    /// `part[b]`.
+    /// / pre`, `pre = max(den + reg, 1e-12)` of the regularization `reg`, and block `b`'s
+    /// `sum |res|^2 / pre` over the elements `i ≡ b * PIXEL_THREADS + t (mod gridDim *
+    /// PIXEL_THREADS)` into `part[b]`.
     ///
     /// # Safety
     ///
