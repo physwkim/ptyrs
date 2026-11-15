@@ -16,7 +16,7 @@ use crate::gpu::{
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaStream, DeviceBuffer};
 
-use super::device::{M1Bufs, MlBufs, OneSlice, PassesMut, Sample};
+use super::device::{M1Bufs, MlBufs, Moves, OneSlice, PassesMut, Sample};
 use super::propagate::Propagate;
 use super::{Bufs, Cut, Device, Epoch, GpuPtycho, Tag, object_fits, plane_len};
 use crate::engine::ptycho::llk_due;
@@ -230,9 +230,9 @@ impl Bufs<'_> {
                 ..m.model
             },
         };
-        let mut line = match (m.model.shift, ml.position.as_deref_mut()) {
-            (None, None) => Line::Fixed,
-            (Some(shift), Some(MlPosition::Moved(mv))) => {
+        let mut line = match (m.moves(), ml.position.as_deref_mut()) {
+            (Moves::Nothing, None) => Line::Fixed,
+            (Moves::Probe(shift), Some(MlPosition::Moved(mv))) => {
                 let MlMoved {
                     w,
                     spectrum,
@@ -246,7 +246,7 @@ impl Bufs<'_> {
                 };
                 Line::Moved(w, kernels, [shift, dshift])
             }
-            (None, Some(MlPosition::Sampled(sw))) => {
+            (Moves::Object, Some(MlPosition::Sampled(sw))) => {
                 m.spectra_of(ctx, &ml.d[0], &mut sw.spectra)?;
                 Line::Sampled(sw)
             }

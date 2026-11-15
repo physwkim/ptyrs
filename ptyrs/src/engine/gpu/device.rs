@@ -888,6 +888,17 @@ struct Sampled<'b> {
     offsets: &'b DeviceBuffer<f32>,
 }
 
+/// What a [`Modelled`] lend's position model moves, by [`Modelled::moves`].
+#[derive(Clone, Copy)]
+pub(super) enum Moves<'b> {
+    /// Nothing: no position.
+    Nothing,
+    /// The probe, by its shift ([`Mover::Probe`]).
+    Probe(Shift<'b>),
+    /// The object, sampled at the offsets ([`Mover::Object`]).
+    Object,
+}
+
 /// The sums of the position model, lent by [`Modelled`]: the shifted probe's under
 /// [`Sampling::Patch`] alone, which moves the probe, and each frame's position sums while
 /// the offsets are refined.
@@ -1104,6 +1115,18 @@ impl<'b> Modelled<'b, AnySlices> {
                 deeper,
             },
         ))
+    }
+}
+
+impl<'b, K> Modelled<'b, K> {
+    /// What the lend's position model moves, as [`FeaturesMut::lend`] took it from one
+    /// [`Mover`], which gives the shift or the sampler, never both.
+    pub fn moves(&self) -> Moves<'b> {
+        match (self.model.shift, &self.sampled) {
+            (Some(shift), _) => Moves::Probe(shift),
+            (None, Some(_)) => Moves::Object,
+            (None, None) => Moves::Nothing,
+        }
     }
 }
 
@@ -3763,5 +3786,38 @@ mod tests {
                 assert!(f == c, "graph {graph}: {what} differs from a clean run's");
             }
         }
+    }
+
+    /// ML's line search refuses a lend that samples the object to a state built for no
+    /// position, which [`Device::build_ml`]'s rebuild alone kept out: the state is swapped in
+    /// after it.
+    #[test]
+    fn ml_refuses_windows_lent_to_a_fixed_line() {
+        let ctx = CudaContext::new(0).expect("GPU 0");
+        let mut e = engine(&ctx, false, true);
+        e.set_sampling(Sampling::FullObject).unwrap();
+        let position = Features {
+            position: Some(Feature::held(vec![[0.1, -0.1]; 36])),
+            ..Features::default()
+        };
+        e.set_features(&position).unwrap();
+        let epoch = Epoch::Ml {
+            params: MlParams::default(),
+            first: true,
+            llk: false,
+        };
+        let r = e.dev.dev.steady_with(epoch, 0, |dev| {
+            let (lens, dims) = ([dev.obj.len(), dev.probe.len()], dev.dims());
+            let one = dev.one_slice("ML")?;
+            let none = PositionScratch::None;
+            let fixed = MlState::new(&dev.stream, &dev.kernels, &dims, dev.rule, lens, none, one)?;
+            dev.ml = Some(Box::new(fixed));
+            Ok(())
+        });
+        assert!(
+            matches!(&r, Err(EngineError::Gpu(GpuError::Shape(s)))
+                if s == "ML state built for another position model"),
+            "{r:?}"
+        );
     }
 }
