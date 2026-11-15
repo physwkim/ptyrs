@@ -1,5 +1,6 @@
-//! The exits a call can fail at after its LLK record's advance is enqueued, which a retry must
-//! start from. [`at`] is a no-op outside `cfg(test)`; a unit test arms one exit with [`arm`] to
+//! The exits a call can fail at part-way: after its LLK record's advance is enqueued, which a
+//! retry must start from, or on one GPU of a distributed run, which every later call must
+//! refuse. [`at`] is a no-op outside `cfg(test)`; a unit test arms one exit with [`arm`] to
 //! make it fail once, so the failure runs through the call's own wrapper.
 
 /// A point [`at`] marks.
@@ -16,6 +17,13 @@ pub(crate) enum Exit {
     /// A distributed live AP epoch's, after its record's replay and before its parity's
     /// event.
     DistFence,
+    /// A distributed live AP run's LLK read's, on each GPU before its ring's flush.
+    DistLlk,
+    /// A distributed AP cycle's, on each GPU after its object update and before its probe
+    /// update.
+    DistUpdate,
+    /// A distributed live AP run's snapshot's, on each GPU before its copy is queued.
+    DistSnapshot,
     /// A DM or RAAR cycle's projection's, before each stack.
     DmStack,
 }

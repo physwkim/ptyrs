@@ -37,6 +37,7 @@ use crate::live::stats::wall_ns;
 
 use crate::dist::exchange::{self, Exchange, Pull};
 use crate::dist::halo::{HaloBacker, HaloBufs, peers};
+use crate::dist::worker::Gated;
 use crate::dist::{DistError, Gpu, LivePlan, LiveRegion, LiveRoute, Scheme, Share, Workers};
 
 /// One region's GPU.
@@ -407,6 +408,7 @@ impl State {
     fn llk(&mut self) -> Result<Vec<(u64, Vec<FrameLlk>)>, DistError> {
         let l = self.llk.as_mut().expect("the run records LLK on every GPU");
         let ctx = ExecutionContext::new(self.scan.stream().clone());
+        fault::at(fault::Exit::DistLlk)?;
         Ok(l.ring.flush_frames(&ctx).map_err(GrowError::from)?)
     }
 }
@@ -420,7 +422,7 @@ pub struct DistSnapshot {
 
 /// A live AP run over one GPU per region of a [`LivePlan`].
 pub struct DistLiveAp {
-    workers: Workers<State>,
+    gpus: Gated<State>,
     plan: LivePlan,
     /// Per region: the counts of its frames.
     stores: Vec<Arc<DeviceStore>>,
@@ -434,8 +436,6 @@ pub struct DistLiveAp {
     clock_ns: i64,
     /// With LLK recording.
     llk: Option<Counted>,
-    /// A push or epoch failed part-way: the GPUs may disagree, so every later call fails.
-    failed: bool,
 }
 
 impl DistLiveAp {
@@ -483,11 +483,11 @@ impl DistLiveAp {
         let plan = LivePlan::new(&cfg.shape, planned, scheme, ordinals.len(), cfg.cap)?;
         let regions: Arc<Vec<LiveRegion>> = Arc::new(plan.regions().to_vec());
         let (cfg, probe) = (*cfg, Arc::new(probe.to_vec()));
-        let workers = Workers::spawn(ordinals, move |gpu| {
+        let mut gpus = Gated::new(Workers::spawn(ordinals, move |gpu| {
             let store = stores.as_ref().map(|s| s[gpu.region()].clone());
             State::new(gpu, &regions[gpu.region()], &cfg, &probe, store, llk)
-        })?;
-        let ptrs = workers.run(|gpu, st| Ok(st.ptrs(gpu)))?;
+        })?);
+        let ptrs = gpus.read(|gpu, st| Ok(st.ptrs(gpu)))?;
         let halo: Vec<Vec<Pull>> = (0..ptrs.len())
             .map(|r| {
                 plan.halo_pulls(r, ptrs[r].halo[1], |o| {
@@ -496,15 +496,15 @@ impl DistLiveAp {
             })
             .collect();
         let (ptrs, halo) = (Arc::new(ptrs), Arc::new(halo));
-        workers.run(move |gpu, st| {
+        gpus.change(move |gpu, st| {
             st.links = Some(st.links(gpu, &ptrs, halo[gpu.region()].clone())?);
             Ok(())
         })?;
-        let stores = workers.run(|_, st| Ok(st.store.clone()))?;
-        let clock_ns = workers.run(|gpu, st| st.anchor(gpu))?.into_iter().max();
+        let stores = gpus.read(|_, st| Ok(st.store.clone()))?;
+        let clock_ns = gpus.change(|gpu, st| st.anchor(gpu))?.into_iter().max();
         let nregion = plan.nregion();
         Ok(Self {
-            workers,
+            gpus,
             plan,
             stores,
             landed: vec![0; nregion],
@@ -517,15 +517,7 @@ impl DistLiveAp {
                 frames: vec![Vec::new(); nregion],
                 queued: Vec::new(),
             }),
-            failed: false,
         })
-    }
-
-    fn check(&self) -> Result<(), DistError> {
-        if self.failed {
-            return Err(DistError::Aborted);
-        }
-        Ok(())
     }
 
     /// Per region, the store of its frames' counts, for the uploader.
@@ -545,7 +537,7 @@ impl DistLiveAp {
     /// landed their counts in [`Self::stores`], in this order and with no frame left out:
     /// they are the frames of the batches it sent.
     pub fn push(&mut self, views: &[ViewAddr]) -> Result<u32, DistError> {
-        self.check()?;
+        self.gpus.check()?;
         let nmode = self.plan.regions()[0].shape.nmode as usize;
         let mut shares = vec![Share::default(); self.plan.nregion()];
         let took = self.plan.split(views, &mut shares)?;
@@ -561,9 +553,7 @@ impl DistLiveAp {
             }
         }
         self.taken += u64::from(took);
-        self.failed = true;
-        let got = self.workers.run(|gpu, st| st.push(&shares[gpu.region()]))?;
-        self.failed = false;
+        let got = self.gpus.change(|gpu, st| st.push(&shares[gpu.region()]))?;
         for (r, (landed, rows)) in got.into_iter().enumerate() {
             self.landed[r] = landed;
             self.halo_rows[r] = rows;
@@ -578,25 +568,20 @@ impl DistLiveAp {
     /// readied on its owner. Each GPU queues an epoch whole within one [`Self::epoch`], on
     /// the stream its fills are queued on, so a fill never lands inside one.
     pub fn fill(&mut self, fill: Fill) -> Result<usize, DistError> {
-        self.check()?;
+        self.gpus.check()?;
         let regions = self.plan.regions();
         one_object_mode(&regions[0].shape.dims())?;
-        self.failed = true;
-        let skipped = self.workers.run(|gpu, st| {
+        let skipped = self.gpus.change(|gpu, st| {
             let origin = regions[gpu.region()].window.at;
             Ok(st.scan.fill(fill.clone(), origin)?)
         })?;
-        self.failed = false;
         Ok(skipped.into_iter().sum())
     }
 
     /// Queues one epoch over every frame landed so far on every GPU, without waiting for it.
     pub fn epoch(&mut self) -> Result<(), DistError> {
-        self.check()?;
-        self.failed = true;
         let epoch = self.epochs;
-        self.workers.run(|gpu, st| st.epoch(gpu, epoch))?;
-        self.failed = false;
+        self.gpus.change(|gpu, st| st.epoch(gpu, epoch))?;
         if let Some(c) = &mut self.llk {
             c.queued.push((epoch, self.taken as u32));
         }
@@ -608,11 +593,11 @@ impl DistLiveAp {
     /// [`LiveAp::llk`](crate::live::recon::LiveAp::llk) gives them on one GPU, bit for
     /// bit. Waits for those epochs. `None` unless the run was asked to record it.
     pub fn llk(&mut self) -> Result<Option<Vec<(u64, f64)>>, DistError> {
-        self.check()?;
+        self.gpus.check()?;
         if self.llk.is_none() {
             return Ok(None);
         }
-        let recs = self.workers.run(|_, st| st.llk())?;
+        let recs = self.gpus.change(|_, st| st.llk())?;
         let c = self.llk.as_mut().expect("checked above");
         let none = FrameLlk {
             llk: LlkPartial::default(),
@@ -638,7 +623,7 @@ impl DistLiveAp {
     pub fn end_of(&self, epoch: u64) -> Result<i64, DistError> {
         assert!(epoch < self.epochs && epoch + 2 >= self.epochs);
         let parity = (epoch % 2) as usize;
-        let ends = self.workers.run(|_, st| st.end_of(parity))?;
+        let ends = self.gpus.read(|_, st| st.end_of(parity))?;
         Ok(ends.into_iter().max().expect("a run has a GPU"))
     }
 
@@ -647,17 +632,15 @@ impl DistLiveAp {
         self.clock_ns
     }
 
-    /// Waits for every epoch queued so far.
+    /// Waits for every epoch queued so far, after a failed call too.
     pub fn synchronize(&self) -> Result<(), DistError> {
-        self.workers.run(|gpu, _| gpu.synchronize())?;
-        Ok(())
+        self.gpus.drain()
     }
 
     /// The object `[nobj, nyo, nxo]` of the one-GPU scan after the epochs queued so far, each
     /// tile from its owner; waits for them.
     pub fn object(&self) -> Result<Vec<[f32; 2]>, DistError> {
-        self.check()?;
-        let wins = self.workers.run(|_, st| {
+        let wins = self.gpus.read(|_, st| {
             st.scan.obj().snapshot(&mut st.snap)?;
             Ok(st.snap.wait()?.to_vec())
         })?;
@@ -668,7 +651,7 @@ impl DistLiveAp {
 
     /// A host copy to queue with [`Self::snapshot`].
     pub fn new_snapshot(&mut self) -> Result<DistSnapshot, DistError> {
-        let ids = self.workers.run(|_, st| {
+        let ids = self.gpus.change(|_, st| {
             st.snaps.push(Snapshot::new(st.scan.obj())?);
             Ok(st.snaps.len() - 1)
         })?;
@@ -680,11 +663,12 @@ impl DistLiveAp {
 
     /// Queues a copy of the object after the epochs queued so far into `snap`, without
     /// waiting for it.
-    pub fn snapshot(&self, snap: &mut DistSnapshot) -> Result<(), DistError> {
-        self.check()?;
+    pub fn snapshot(&mut self, snap: &mut DistSnapshot) -> Result<(), DistError> {
         let id = snap.id;
-        self.workers
-            .run(|_, st| Ok(st.scan.obj().snapshot(&mut st.snaps[id])?))?;
+        self.gpus.change(|_, st| {
+            fault::at(fault::Exit::DistSnapshot)?;
+            Ok(st.scan.obj().snapshot(&mut st.snaps[id])?)
+        })?;
         Ok(())
     }
 
@@ -692,9 +676,7 @@ impl DistLiveAp {
     /// one-GPU scan, each tile from its owner.
     pub fn wait<'a>(&self, snap: &'a mut DistSnapshot) -> Result<&'a [[f32; 2]], DistError> {
         let id = snap.id;
-        let wins = self
-            .workers
-            .run(|_, st| Ok(st.snaps[id].wait()?.to_vec()))?;
+        let wins = self.gpus.read(|_, st| Ok(st.snaps[id].wait()?.to_vec()))?;
         self.stitch(&wins, &mut snap.pixels);
         Ok(&snap.pixels)
     }
@@ -731,19 +713,19 @@ impl DistLiveAp {
 
     /// Object bytes mapped over every GPU, halos included.
     pub fn mapped_bytes(&self) -> Result<usize, DistError> {
-        let b = self.workers.run(|_, st| Ok(st.scan.obj().mapped_bytes()))?;
+        let b = self.gpus.read(|_, st| Ok(st.scan.obj().mapped_bytes()))?;
         Ok(b.into_iter().sum())
     }
 
     /// How long backing the planned views took, summed over the GPUs, as
     /// [`Self::mapped_bytes`] sums their bytes; they back theirs at once.
     pub fn plan_time(&self) -> Result<Duration, DistError> {
-        let t = self.workers.run(|_, st| Ok(st.plan_time))?;
+        let t = self.gpus.read(|_, st| Ok(st.plan_time))?;
         Ok(t.into_iter().sum())
     }
 
     pub fn ngpu(&self) -> usize {
-        self.workers.len()
+        self.gpus.len()
     }
 
     pub fn plan(&self) -> &LivePlan {
@@ -1246,8 +1228,8 @@ mod tests {
 
     /// An epoch failing on one GPU after its record's replay, before its fence event, returns
     /// that GPU's error, with no wait on the other and no fence mismatch, and the run refuses
-    /// every later call, as the GPUs may disagree. Two regions on one GPU, so the one-GPU
-    /// suite runs it.
+    /// every later call, reads too, as the GPUs may disagree. Two regions on one GPU, so the
+    /// one-GPU suite runs it.
     #[test]
     fn an_epoch_failing_after_its_record_aborts_the_run() {
         let ctx = Context::new(0).expect("GPU 0");
@@ -1258,6 +1240,8 @@ mod tests {
         let feed = Feed::new(&ctx, &c, &ap).land(&c, &(0..c.planned));
         assert_eq!(ap.push(planned).unwrap() as usize, c.planned);
         ap.epoch().unwrap();
+        let mut snap = ap.new_snapshot().unwrap();
+        ap.snapshot(&mut snap).unwrap();
         let armed = fault::arm(fault::Exit::DistFence, 0);
         let r = ap.epoch();
         assert!(armed.fired());
@@ -1269,6 +1253,101 @@ mod tests {
         assert!(matches!(ap.epoch(), Err(DistError::Aborted)));
         assert!(matches!(ap.llk(), Err(DistError::Aborted)));
         assert!(matches!(ap.object(), Err(DistError::Aborted)));
+        assert!(matches!(ap.end_of(0), Err(DistError::Aborted)));
+        assert!(matches!(ap.wait(&mut snap), Err(DistError::Aborted)));
+        assert!(matches!(ap.mapped_bytes(), Err(DistError::Aborted)));
+        assert!(matches!(ap.plan_time(), Err(DistError::Aborted)));
+        feed.finish();
+    }
+
+    /// A failed run still waits for the work its GPUs queued, as its consumer must before the
+    /// stores go, while it refuses every other call: both streams of every GPU are idle once
+    /// it returns. A host function queued ahead of the failed epoch holds each GPU's streams
+    /// busy for longer than the test takes to reach that check without a wait.
+    #[test]
+    fn a_failed_run_still_drains() {
+        let ctx = Context::new(0).expect("GPU 0");
+        let c = case(&sim(ScanPath::Raster { cols: 12 }, 240));
+        let planned = &c.views[..c.planned * c.cfg.shape.nmode as usize];
+        let mut ap =
+            DistLiveAp::new(&[0, 0], &c.cfg, planned, Scheme::Strips, &c.probe, false).unwrap();
+        let feed = Feed::new(&ctx, &c, &ap).land(&c, &(0..c.planned));
+        assert_eq!(ap.push(planned).unwrap() as usize, c.planned);
+        ap.epoch().unwrap();
+        let streams = ap
+            .gpus
+            .change(|gpu, _| {
+                let hold = || std::thread::sleep(Duration::from_millis(500));
+                gpu.stream().launch_host_function(hold)?;
+                let side = gpu.side(|s| Ok(s.clone()))?;
+                Ok([gpu.stream().clone(), side])
+            })
+            .unwrap();
+        let armed = fault::arm(fault::Exit::DistFence, 0);
+        assert!(ap.epoch().is_err());
+        assert!(armed.fired());
+        drop(armed);
+        assert!(matches!(ap.object(), Err(DistError::Aborted)));
+        ap.synchronize().unwrap();
+        for (r, s) in streams.iter().enumerate() {
+            let idle = [s[0].query().unwrap(), s[1].query().unwrap()];
+            assert_eq!(idle, [true; 2], "region {r}: [main, side] idle");
+        }
+        feed.finish();
+    }
+
+    /// A snapshot failing on one GPU before its copy is queued, so that the GPUs' copies come
+    /// from different calls, aborts the run: the next wait is refused, not stitched.
+    #[test]
+    fn a_snapshot_failing_on_one_gpu_aborts_the_run() {
+        let ctx = Context::new(0).expect("GPU 0");
+        let c = case(&sim(ScanPath::Raster { cols: 12 }, 240));
+        let planned = &c.views[..c.planned * c.cfg.shape.nmode as usize];
+        let mut ap =
+            DistLiveAp::new(&[0, 0], &c.cfg, planned, Scheme::Strips, &c.probe, false).unwrap();
+        let feed = Feed::new(&ctx, &c, &ap).land(&c, &(0..c.planned));
+        assert_eq!(ap.push(planned).unwrap() as usize, c.planned);
+        let mut snap = ap.new_snapshot().unwrap();
+        ap.snapshot(&mut snap).unwrap();
+        ap.wait(&mut snap).unwrap();
+        ap.epoch().unwrap();
+        let armed = fault::arm(fault::Exit::DistSnapshot, 0);
+        let r = ap.snapshot(&mut snap);
+        assert!(armed.fired());
+        drop(armed);
+        assert!(
+            matches!(r, Err(DistError::Gpu(crate::gpu::Error::Driver(d))) if d == fault::REFUSAL),
+            "{r:?}"
+        );
+        assert!(matches!(ap.wait(&mut snap), Err(DistError::Aborted)));
+        ap.synchronize().unwrap();
+        feed.finish();
+    }
+
+    /// An LLK read failing on one GPU before its ring's flush, so that the GPUs disagree on
+    /// the records read, aborts the run as a failed epoch does: every later call is refused,
+    /// a new snapshot's too.
+    #[test]
+    fn an_llk_read_failing_on_one_gpu_aborts_the_run() {
+        let ctx = Context::new(0).expect("GPU 0");
+        let c = case(&sim(ScanPath::Raster { cols: 12 }, 240));
+        let planned = &c.views[..c.planned * c.cfg.shape.nmode as usize];
+        let mut ap =
+            DistLiveAp::new(&[0, 0], &c.cfg, planned, Scheme::Strips, &c.probe, true).unwrap();
+        let feed = Feed::new(&ctx, &c, &ap).land(&c, &(0..c.planned));
+        assert_eq!(ap.push(planned).unwrap() as usize, c.planned);
+        ap.epoch().unwrap();
+        let armed = fault::arm(fault::Exit::DistLlk, 1);
+        let r = ap.llk();
+        assert!(armed.fired());
+        drop(armed);
+        assert!(
+            matches!(r, Err(DistError::Gpu(crate::gpu::Error::Driver(d))) if d == fault::REFUSAL),
+            "{r:?}"
+        );
+        assert!(matches!(ap.llk(), Err(DistError::Aborted)));
+        assert!(matches!(ap.epoch(), Err(DistError::Aborted)));
+        assert!(matches!(ap.new_snapshot(), Err(DistError::Aborted)));
         feed.finish();
     }
 
