@@ -147,7 +147,7 @@ impl State {
             &region.own,
         )?;
         let d = *scan.dims();
-        let n = (d.frame[0] * d.frame[1]) as usize;
+        let n = region.shape.frame().area();
         let mut scan_backer = scan.backer();
         let t = Instant::now();
         scan_backer.plan(&region.planned)?;
@@ -430,6 +430,8 @@ pub struct DistLiveAp {
     landed: Vec<u32>,
     /// Per region: halo rows listed, `[pack, unpack]`.
     halo_rows: Vec<[usize; 2]>,
+    /// Pixels of the object, `nobj · nyo · nxo`.
+    pixels: usize,
     lost: u64,
     taken: u64,
     epochs: u64,
@@ -509,6 +511,7 @@ impl DistLiveAp {
             stores,
             landed: vec![0; nregion],
             halo_rows: vec![[0; 2]; nregion],
+            pixels: cfg.shape.pixels(),
             lost: 0,
             taken: 0,
             epochs: 0,
@@ -644,7 +647,7 @@ impl DistLiveAp {
             st.scan.obj().snapshot(&mut st.snap)?;
             Ok(st.snap.wait()?.to_vec())
         })?;
-        let mut out = vec![[0.0; 2]; self.pixels()];
+        let mut out = vec![[0.0; 2]; self.pixels];
         self.stitch(&wins, &mut out);
         Ok(out)
     }
@@ -657,7 +660,7 @@ impl DistLiveAp {
         })?;
         Ok(DistSnapshot {
             id: ids[0],
-            pixels: vec![[0.0; 2]; self.pixels()],
+            pixels: vec![[0.0; 2]; self.pixels],
         })
     }
 
@@ -679,12 +682,6 @@ impl DistLiveAp {
         let wins = self.gpus.read(|_, st| Ok(st.snaps[id].wait()?.to_vec()))?;
         self.stitch(&wins, &mut snap.pixels);
         Ok(&snap.pixels)
-    }
-
-    /// Pixels of the object, `nobj * nyo * nxo`.
-    fn pixels(&self) -> usize {
-        let [nyo, nxo] = self.shape();
-        self.plan.regions()[0].shape.nobj() as usize * nyo * nxo
     }
 
     /// Copies each tile from its owner's window in `wins`, by region, into `out`.
