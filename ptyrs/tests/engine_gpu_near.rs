@@ -5,8 +5,8 @@
 use cuda_core::CudaContext;
 use ptyrs::base::{C64, Counts, Geometry, Object, Probe, Scan, Stack, required_obj_shape, sim};
 use ptyrs::engine::{
-    ApParams, BhParams, Cost, DmParams, EngineError, Features, GpuOptions, GpuPtycho, LsqmlParams,
-    MlParams, Optics, Ptycho, RaarParams, RpieParams, Sampling,
+    ApParams, BhParams, Cost, DmParams, Features, GpuOptions, GpuPtycho, LsqmlParams, MlParams,
+    Optics, Ptycho, RaarParams, RpieParams, Sampling,
 };
 use ptyrs::gpu::FUSED_SIDES;
 
@@ -482,6 +482,55 @@ fn full_object_ml_matches_cpu_under_every_propagator() {
     }
 }
 
+/// rPIE under each propagator with drawn offsets that sample the object, against the CPU's
+/// under `Sampling::FullObject`: each epoch's recorded LLK, and the object, the probe and the
+/// offsets after the last; the graphs replay the eager run bit for bit.
+#[test]
+fn full_object_rpie_matches_cpu_under_every_propagator() {
+    const NEPOCH: usize = 6;
+    // Measured worst: LLK 1.8e-6, object 3.6e-7, probe 4.7e-6, offsets 3.6e-7; rPIE models no
+    // scale or background.
+    const TOL: [f64; 5] = [1e-5, 2e-6, 2.5e-5, f64::MIN_POSITIVE, 2e-6];
+    let moved = Features {
+        position: Some(drawn_offsets()),
+        ..Features::default()
+    };
+    for c in cases() {
+        let (object, probe) = (c.object.clone(), c.probe.clone());
+        let mut cpu = Ptycho::with_optics(&c.scan, c.optics(), object, probe).unwrap();
+        cpu.set_sampling(Sampling::FullObject);
+        cpu.set_features(moved.clone()).unwrap();
+        cpu.rpie(&RPIE, NEPOCH).unwrap();
+        assert_eq!(cpu.history().len(), NEPOCH);
+        let want = Ended::cpu(&cpu);
+        let run = |graph| {
+            let mut gpu = c.gpu(graph);
+            gpu.set_sampling(Sampling::FullObject).unwrap();
+            gpu.set_features(&moved).unwrap();
+            gpu.rpie(&RPIE, NEPOCH).unwrap();
+            Ended::gpu(&gpu)
+        };
+        let (eager, graphs) = (run(false), run(true));
+        assert_close(&format!("rPIE {}", c.name), &eager, &want, TOL);
+        let what = format!("rPIE {} graph", c.name);
+        assert_eq!(graphs.llk, eager.llk, "{what}: LLK");
+        assert_eq!(
+            graphs.object.as_slice(),
+            eager.object.as_slice(),
+            "{what}: object"
+        );
+        assert_eq!(
+            graphs.probe.as_slice(),
+            eager.probe.as_slice(),
+            "{what}: probe"
+        );
+        assert_eq!(
+            graphs.features.position, eager.features.position,
+            "{what}: offsets"
+        );
+    }
+}
+
 /// The sampling is the CPU's [`Sampling::auto`] at build: `FullObject` of a near-field scan
 /// whose object is under 5/4 of the frame, `Patch` of the same scan in the far field and of
 /// a case's wider scan; `set_sampling` overrides it either way and back.
@@ -629,78 +678,4 @@ fn sampling_round_trip_rebuilds_the_same_run() {
     assert_eq!(toggled.1.0.as_slice(), kept.1.0.as_slice(), "object");
     assert_eq!(toggled.1.1.as_slice(), kept.1.1.as_slice(), "probe");
     assert_eq!(toggled.2, kept.2, "offsets");
-}
-
-/// While a position samples the object, the calls whose GPU passes do not model it yet fail
-/// and change nothing, after a call of each, which built its run: switched to
-/// `Sampling::FullObject` after calls under `Patch` with the position, or the position set
-/// after calls under `FullObject` without one. Back under `Patch` the same calls give the
-/// records, arrays and offsets of a run never switched, bit for bit.
-#[test]
-fn full_object_position_fails_every_pass_until_patch() {
-    let c = &cases()[0];
-    let moved = Features {
-        position: Some(drawn_offsets()),
-        ..Features::default()
-    };
-    let bh = BhParams {
-        batch_size: 8,
-        probe_rho: 0.01,
-        position_rho: 0.1,
-        seed: 7,
-    };
-    type Call<'a> = &'a dyn Fn(&mut GpuPtycho) -> Result<Vec<f64>, EngineError>;
-    let calls: &[(&str, Call)] = &[
-        ("rPIE", &|g| g.rpie(&RPIE, 1).map(|()| Vec::new())),
-        ("BH", &|g| g.bh(&bh, 1, 1).map(|()| Vec::new())),
-    ];
-    let run = |full_object_first: bool, switched: bool| {
-        let mut gpu = c.gpu(true);
-        let sampling = match switched {
-            true => Sampling::FullObject,
-            false => Sampling::Patch,
-        };
-        match full_object_first {
-            true => gpu.set_sampling(sampling).unwrap(),
-            false => gpu.set_features(&moved).unwrap(),
-        }
-        for (what, call) in calls {
-            call(&mut gpu).unwrap_or_else(|e| panic!("{what} before: {e}"));
-        }
-        match full_object_first {
-            true => gpu.set_features(&moved).unwrap(),
-            false => gpu.set_sampling(sampling).unwrap(),
-        }
-        if switched {
-            let start = (gpu.object().unwrap(), gpu.probe().unwrap());
-            let records = gpu.history().len();
-            for (what, call) in calls {
-                let e = call(&mut gpu).unwrap_err().to_string();
-                assert!(e.contains("Sampling::FullObject"), "{what}: {e}");
-            }
-            assert_eq!(gpu.history().len(), records, "records");
-            assert_eq!(gpu.object().unwrap().as_slice(), start.0.as_slice());
-            assert_eq!(gpu.probe().unwrap().as_slice(), start.1.as_slice());
-            gpu.set_sampling(Sampling::Patch).unwrap();
-        }
-        let values: Vec<Vec<f64>> = calls
-            .iter()
-            .map(|(_, call)| call(&mut gpu).unwrap())
-            .collect();
-        let records: Vec<f64> = gpu.history().iter().map(|r| r.llk.poisson).collect();
-        let arrays = (gpu.object().unwrap(), gpu.probe().unwrap());
-        (values, records, arrays, gpu.features().unwrap().position)
-    };
-    for full_object_first in [false, true] {
-        let first = ["Patch", "FullObject"][usize::from(full_object_first)];
-        let (kept, switched) = (run(full_object_first, false), run(full_object_first, true));
-        for ((what, _), (s, k)) in calls.iter().zip(switched.0.iter().zip(&kept.0)) {
-            assert_eq!(s, k, "{first} first: {what}");
-        }
-        assert_eq!(switched.1, kept.1, "{first} first: records");
-        let (s, k) = (&switched.2, &kept.2);
-        assert_eq!(s.0.as_slice(), k.0.as_slice(), "{first} first: object");
-        assert_eq!(s.1.as_slice(), k.1.as_slice(), "{first} first: probe");
-        assert_eq!(switched.3, kept.3, "{first} first: offsets");
-    }
 }

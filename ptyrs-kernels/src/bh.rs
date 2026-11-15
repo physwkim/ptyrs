@@ -12,6 +12,14 @@
 //! `A` the probe's spectra and `e` the frame's ramp, so along a probe change `Au` and an
 //! offsets change `u_d` it changes by `δ_u W = IDFT(e (Au + i a_u A))`, `a_u = −2π (u_y fy +
 //! u_x fx)`. The `bh_pos_*` kernels take the offsets as a third variable of the step.
+//!
+//! Under full-object sampling (`ptyrs::engine::Sampling::FullObject`) the exit waves are
+//! `W(O) P`, `W` a view's window of the object at its offsets (`crate::sampling`), read as
+//! blocks `[nobj, nf_max, ny, nx]`, plane `o * nf_max + fl`, through views whose mode `m`
+//! reads probe `m % nprobe` and object mode `m / nprobe` (`ptyrs::gpu::window_views`). Along
+//! `u` the windows change by `S(u_O) + Σ_a u_da ∂_a S(O)` and to second order by `Σ_a (v_da
+//! ∂_a S(u_O) + u_da ∂_a S(v_O)) + Σ_ac u_da v_dc ∂_a ∂_c S(O)`; the `bh_win_*` kernels
+//! take the offsets on these.
 
 use cuda_device::{device, thread};
 use cuda_host::cuda_module;
@@ -116,6 +124,28 @@ pub struct BhDirs {
     pub cg: u32,
 }
 
+/// One stack under full-object sampling as the `bh_win_*` kernels read it: `r` the residual
+/// after its inverse FFT, `[nf_max * nmode, ny, nx]` in `obj_probe_to_psi`'s layout, and
+/// `probe` `[nprobe, ny, nx]`, the estimate's.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct BhWinFields {
+    pub r: *const f32,
+    pub probe: *const f32,
+}
+
+/// The windows [`bh_kernels::LoadedModule::bh_win_hess`] reads, each three blocks `[nobj,
+/// nf_max, ny, nx]`: `second` the estimate's second derivatives over `(y, y)`, `(y, x)` and
+/// `(x, x)`; `du` and with `cg` `dv` those of `u_O` and `v_O`, blocks 1 and 2 their
+/// derivatives over `y` and `x` (block 0 unread; `dv` unread without `cg`).
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct BhWinDerivs {
+    pub second: *const f32,
+    pub du: *const f32,
+    pub dv: *const f32,
+}
+
 /// Floats a [`bh_kernels::LoadedModule::bh_hess_frames`] block writes: the partial `H(u, u)`,
 /// `H(u, v)`, `H(v, v)`.
 pub const BH_HESS: u32 = 3;
@@ -126,8 +156,8 @@ pub const BH_STEP: u32 = 4;
 pub mod bh_kernels {
     use super::{
         BH_EPS, BH_HESS, BH_STEP, BhDirs, BhFields, BhMovedFar, BhMoves, BhNear, BhObs, BhPosDirs,
-        CHUNK_PIXELS, add_im, add_re, far_add, far_tail, near_prod, near_sum, ramp_at, rates,
-        re_conj, unramp,
+        BhWinDerivs, BhWinFields, CHUNK_PIXELS, add_im, add_re, far_add, far_tail, near_prod,
+        near_sum, ramp_at, rates, re_conj, unramp,
     };
     use crate::grad::{GAMMA_CHUNK, ObjProbePtrs};
     use crate::pixel::*;
@@ -915,6 +945,206 @@ pub mod bh_kernels {
             *offsets.add(at) += step_size * alpha * dv;
             *d.prev.add(at) = dv;
         }
+    }
+
+    /// The object gradient's patches and the offsets' gradient partials of chunk `c =
+    /// blockIdx.x` of frame `f0 + fl`, `fl = blockIdx.y`, under full-object sampling: at probe
+    /// pixel `d` of the chunk and per object mode `o`, `G = Σ_p conj(q P_p) r_m`, `m = o
+    /// nprobe + p`, into `patch[k]`, `k = (o nf_max + fl) n + d`, and `out[2p .. 2p + 2] = Σ
+    /// Re(conj(G) win[(1 + a) blk + k]) / 2π` over the chunk's pixels and the object modes,
+    /// `blk` a block's values, `p = (f0 + fl) * nchunk + c`: the partials [`bh_pos_dots`] sums
+    /// to `∂F/∂d`. Patches of frames outside the stack are not written.
+    ///
+    /// # Safety
+    ///
+    /// `f` as [`BhWinFields`] says, `win` three blocks `[nobj, nf_max, ny, nx]` (block 0
+    /// unread), `patch` one, `out` `2 * nframe * nchunk` floats, `ctl` one entry; grid
+    /// `(nchunk, nf_max, 1)`, block `(PIXEL_THREADS, 1, 1)`.
+    ///
+    /// [`bh_pos_dots`]: LoadedModule::bh_pos_dots
+    #[kernel]
+    pub unsafe fn bh_win_grad(
+        f: BhWinFields,
+        win: *const f32,
+        patch: *mut f32,
+        out: *mut f32,
+        ctl: *const StackCtl,
+        g: StackGeom,
+    ) {
+        static mut RED: SharedArray<f32, 512> = SharedArray::UNINIT;
+        let (f0, nf) = unsafe { stack_frames(ctl, g) };
+        let (ny, nx, nmode, nprobe) = (g.ny, g.nx, g.nmode as usize, g.nprobe as usize);
+        let n = ny as usize * nx as usize;
+        let fl = thread::blockIdx_y() as usize;
+        // The whole block leaves together, before its first barrier.
+        if fl >= nf as usize {
+            return;
+        }
+        let blk = nmode / nprobe * g.nf_max as usize * n;
+        let c = thread::blockIdx_x() as usize;
+        let chunk = GAMMA_CHUNK as usize;
+        let end = n.min((c + 1) * chunk);
+        let pos = f0 as usize + fl;
+        let mut acc = [0.0f32; 2];
+        let mut d = c * chunk + thread::threadIdx_x() as usize;
+        while d < end {
+            let (py, px) = ((d / nx as usize) as u32, (d % nx as usize) as u32);
+            let at = psi_index(py, px, ny, nx);
+            let q = quad_phase(g.quad, py, px, ny, nx);
+            for o in 0..nmode / nprobe {
+                let mut gs = (0.0f32, 0.0f32);
+                for p in 0..nprobe {
+                    let j = (fl * nmode + o * nprobe + p) * n + at;
+                    let (pv, r) = unsafe { (load_c(f.probe, p * n + d), load_c(f.r, j)) };
+                    let u = cmul_conj(cmul(pv, q), r);
+                    gs = (gs.0 + u.0, gs.1 + u.1);
+                }
+                let k = (o * g.nf_max as usize + fl) * n + d;
+                unsafe {
+                    store_c(patch, k, gs);
+                    acc[0] += re_conj(gs, load_c(win, blk + k));
+                    acc[1] += re_conj(gs, load_c(win, 2 * blk + k));
+                }
+            }
+            d += PIXEL_THREADS as usize;
+        }
+        let s = 0.5 * core::f32::consts::FRAC_1_PI;
+        let o = unsafe { out.add(2 * (pos * n.div_ceil(chunk) + c)) };
+        let acc = [s * acc[0], s * acc[1]];
+        unsafe { super::store_sums::<2>((&raw mut RED).cast::<f32>(), acc, o) }
+    }
+
+    /// The windows' first-order changes under full-object sampling, from `S(u_O)` in block 0
+    /// of `hu` and with `dirs.cg` `S(v_O)` in block 0 of `hv`: per value `t` of a block
+    /// `[nobj, nf_max, ny, nx]` of a frame `f0 + fl` of the stack, `hu[t] += Σ_a ud[2 (f0 +
+    /// fl) + a] win[(1 + a) blk + t]` and with `cg` `hv[t] += Σ_a prev[2 order[f0 + fl] + a]
+    /// win[(1 + a) blk + t]` (else `hv` is not written), `blk` a block's values. One thread
+    /// per value of a block.
+    ///
+    /// # Safety
+    ///
+    /// `win` three blocks `[nobj, nf_max, ny, nx]` (block 0 unread), `hu` and with `cg` `hv`
+    /// one, `dirs` as [`BhPosDirs`] says, `ctl` one entry.
+    #[kernel]
+    pub unsafe fn bh_win_lift(
+        win: *const f32,
+        hu: *mut f32,
+        hv: *mut f32,
+        dirs: BhPosDirs,
+        ctl: *const StackCtl,
+        g: StackGeom,
+    ) {
+        let (f0, nf) = unsafe { stack_frames(ctl, g) };
+        let n = g.ny as usize * g.nx as usize;
+        let blk = g.nmode as usize / g.nprobe as usize * g.nf_max as usize * n;
+        let t = global_index();
+        if t >= blk {
+            return;
+        }
+        let fl = t / n % g.nf_max as usize;
+        if fl >= nf as usize {
+            return;
+        }
+        let pos = f0 as usize + fl;
+        unsafe {
+            let (wy, wx) = (load_c(win, blk + t), load_c(win, 2 * blk + t));
+            let add = |h: *mut f32, d: *const f32| {
+                let (dy, dx) = (*d, *d.add(1));
+                let v = load_c(h, t);
+                let v = (v.0 + dy * wy.0 + dx * wx.0, v.1 + dy * wy.1 + dx * wx.1);
+                store_c(h, t, v);
+            };
+            add(hu, dirs.ud.add(2 * pos));
+            if dirs.cg != 0 {
+                add(hv, dirs.prev.add(2 * *dirs.order.add(pos) as usize));
+            }
+        }
+    }
+
+    /// The windows' second-order Hessian partials of chunk `c = blockIdx.x` of frame `f0 +
+    /// fl`, `fl = blockIdx.y`, under full-object sampling, added to `out[3p .. 3p + 3]`, `p =
+    /// (f0 + fl) * nchunk + c`: with `s = Σ_p conj(r_m) q P_p` at probe pixel `d` per object
+    /// mode `o` (`m = o nprobe + p`) and `o″(u, v) = Σ_a (v_da ∂_a S(u_O) + u_da ∂_a S(v_O))
+    /// + Σ_ac u_da v_dc ∂_a ∂_c S(O)` there, `(Σ Re(s o″(u, u)), Σ Re(s o″(u, v)), Σ Re(s
+    /// o″(v, v)))` over the chunk's pixels and the object modes, the last two not added
+    /// without `dirs.cg`; `u_d` from `dirs.ud`, `v_d` from `dirs.prev`.
+    ///
+    /// # Safety
+    ///
+    /// `f` as [`BhWinFields`] says, `w` as [`BhWinDerivs`] says, `dirs` as [`BhPosDirs`]
+    /// says, `out` `3 * nframe * nchunk` floats, `ctl` one entry; grid `(nchunk, nf_max, 1)`,
+    /// block `(PIXEL_THREADS, 1, 1)`.
+    #[kernel]
+    pub unsafe fn bh_win_hess(
+        f: BhWinFields,
+        w: BhWinDerivs,
+        dirs: BhPosDirs,
+        out: *mut f32,
+        ctl: *const StackCtl,
+        g: StackGeom,
+    ) {
+        static mut RED: SharedArray<f32, 768> = SharedArray::UNINIT;
+        let (f0, nf) = unsafe { stack_frames(ctl, g) };
+        let (ny, nx, nmode, nprobe) = (g.ny, g.nx, g.nmode as usize, g.nprobe as usize);
+        let n = ny as usize * nx as usize;
+        let fl = thread::blockIdx_y() as usize;
+        // The whole block leaves together, before its first barrier.
+        if fl >= nf as usize {
+            return;
+        }
+        let cg = dirs.cg != 0;
+        let blk = nmode / nprobe * g.nf_max as usize * n;
+        let c = thread::blockIdx_x() as usize;
+        let chunk = GAMMA_CHUNK as usize;
+        let end = n.min((c + 1) * chunk);
+        let pos = f0 as usize + fl;
+        let (uy, ux) = unsafe { (*dirs.ud.add(2 * pos), *dirs.ud.add(2 * pos + 1)) };
+        let (mut vy, mut vx) = (0.0f32, 0.0f32);
+        if cg {
+            unsafe {
+                let at = 2 * *dirs.order.add(pos) as usize;
+                (vy, vx) = (*dirs.prev.add(at), *dirs.prev.add(at + 1));
+            }
+        }
+        let mut acc = [0.0f32; BH_HESS as usize];
+        let mut d = c * chunk + thread::threadIdx_x() as usize;
+        while d < end {
+            let (py, px) = ((d / nx as usize) as u32, (d % nx as usize) as u32);
+            let at = psi_index(py, px, ny, nx);
+            let q = quad_phase(g.quad, py, px, ny, nx);
+            for o in 0..nmode / nprobe {
+                let mut s = (0.0f32, 0.0f32);
+                for p in 0..nprobe {
+                    let j = (fl * nmode + o * nprobe + p) * n + at;
+                    let (pv, r) = unsafe { (load_c(f.probe, p * n + d), load_c(f.r, j)) };
+                    let t = cmul(cmul_conj(r, q), pv);
+                    s = (s.0 + t.0, s.1 + t.1);
+                }
+                let k = (o * g.nf_max as usize + fl) * n + d;
+                let re = |x: *const f32, b: usize| cmul(s, unsafe { load_c(x, b * blk + k) }).0;
+                let (wyy, wxy, wxx) = (re(w.second, 0), re(w.second, 1), re(w.second, 2));
+                let (ry, rx) = (re(w.du, 1), re(w.du, 2));
+                acc[0] +=
+                    2.0 * (uy * ry + ux * rx) + uy * uy * wyy + 2.0 * uy * ux * wxy + ux * ux * wxx;
+                if cg {
+                    let (sy, sx) = (re(w.dv, 1), re(w.dv, 2));
+                    acc[1] += vy * ry
+                        + vx * rx
+                        + uy * sy
+                        + ux * sx
+                        + uy * vy * wyy
+                        + (uy * vx + ux * vy) * wxy
+                        + ux * vx * wxx;
+                    acc[2] += 2.0 * (vy * sy + vx * sx)
+                        + vy * vy * wyy
+                        + 2.0 * vy * vx * wxy
+                        + vx * vx * wxx;
+                }
+            }
+            d += PIXEL_THREADS as usize;
+        }
+        let o = unsafe { out.add(BH_HESS as usize * (pos * n.div_ceil(chunk) + c)) };
+        unsafe { super::add_sums::<3>((&raw mut RED).cast::<f32>(), acc, o) }
     }
 }
 

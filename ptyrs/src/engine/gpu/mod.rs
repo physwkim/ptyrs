@@ -703,7 +703,9 @@ impl GpuPtycho {
     }
 
     /// Enters [`Features::position`] as `sampling` in every call from here on, as
-    /// [`crate::engine::Ptycho::set_sampling`].
+    /// [`crate::engine::Ptycho::set_sampling`]. Nothing changes if a device buffer cannot be
+    /// built; if the LLK pass's graph cannot be recaptured, the new sampling stays and the LLK
+    /// pass runs without its graph until a later recapture.
     pub fn set_sampling(&mut self, sampling: Sampling) -> Result<(), EngineError> {
         self.dev.set_sampling(sampling)
     }
@@ -823,14 +825,15 @@ impl Bufs<'_> {
                     ctx,
                     self.kernels,
                     &dims,
-                    &whole,
+                    self.obj,
                     self.probe,
                     self.exit,
                 )?;
+                let windows = self.windows.as_deref_mut();
+                let mut read = m.sliced(ctx, (self.views, whole), windows)?;
                 for s in 0..self.scratch.len() {
                     let stack = self.scratch.at(s);
-                    let windows = self.windows.as_deref_mut();
-                    let (views, obj) = m.slices(ctx, (self.views, whole), stack, windows)?;
+                    let (views, obj) = m.slices(ctx, &mut read, stack)?;
                     let inputs = FusedInputs {
                         views,
                         counts: self.counts,
