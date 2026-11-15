@@ -312,10 +312,10 @@ fn train(
     Ok(last)
 }
 
-/// Largest start-object difference from pty-chi's, relative to its largest modulus: pty-chi's
-/// f32 convolutions round operands to TF32 (cuDNN's default).
+/// Largest start-object difference from pty-chi's, relative to its largest modulus. pty-chi's
+/// start object is f64, so in f32 the difference is ptyrs's own rounding.
 fn start_tol(dtype: DType) -> f64 {
-    if dtype == DType::F64 { 1e-10 } else { 1e-2 }
+    if dtype == DType::F64 { 1e-10 } else { 1e-4 }
 }
 
 fn main() -> Result<(), LossError> {
