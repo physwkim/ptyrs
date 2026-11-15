@@ -33,7 +33,7 @@ unsafe impl cuda_core::DeviceCopy for SamplePass {}
 /// The object solve's buffers, at addresses fixed for the solve: `n` complex values each of
 /// the object `x`, the residual `res`, the direction `dir` and `ap`, a pass of the normal
 /// operator times `1 / scale`; `n` floats of `AᴴA`'s diagonal `den`; a block sum per block
-/// `part`; and the scalars `s` at [`PCG_REG`], [`PCG_RZ`] and [`PCG_PAP`].
+/// `part`; and the scalars `s` at [`PCG_REG`], [`PCG_RZ`], [`PCG_PAP`] and [`PCG_HELD`].
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct Pcg {
@@ -49,11 +49,13 @@ pub struct Pcg {
 }
 
 /// [`Pcg`]'s scalar slots: the regularization, the residual's preconditioned power before
-/// alternate steps, and the curvature along the direction; [`PCG_SCALARS`] of them.
+/// alternate steps, the curvature along the direction, and the `den + reg` at or under which
+/// a pixel is held; [`PCG_SCALARS`] of them.
 pub const PCG_REG: u32 = 0;
 pub const PCG_RZ: [u32; 2] = [1, 2];
 pub const PCG_PAP: u32 = 3;
-pub const PCG_SCALARS: usize = 4;
+pub const PCG_HELD: u32 = 4;
+pub const PCG_SCALARS: usize = 5;
 
 /// Where a point samples its plane on one axis: whole pixels `c` plus `d` in `[0, 1)`.
 #[derive(Clone, Copy)]
@@ -130,12 +132,12 @@ fn square(m: u32, n: u32, a: Axis) -> (f32, f32) {
     ((1.0 - w) * c0 + w * c1, -((1.0 - w) * s0 + w * s1))
 }
 
-/// The preconditioner of the object solve at a pixel of `AᴴA`'s diagonal `d`: `max(d + reg,
-/// 1e-12)`.
+/// The preconditioner of the object solve at a pixel of `AᴴA`'s diagonal `d`: `d + reg`, or
+/// infinite at most `held`, which holds the pixel.
 #[device]
-fn pre(d: f32, reg: f32) -> f32 {
+fn pre(d: f32, reg: f32, held: f32) -> f32 {
     let v = d + reg;
-    if v > 1e-12 { v } else { 1e-12 }
+    if v > held { v } else { f32::INFINITY }
 }
 
 /// The block's sum of each thread's `v`, which thread 0 writes to `*out`. Every thread of the
@@ -191,7 +193,9 @@ unsafe extern "C" {
 
 #[cuda_module]
 pub mod sampling_kernels {
-    use super::{PCG_PAP, PCG_REG, Pcg, SamplePass, phase, point, pre, square, store_sum};
+    use super::{
+        PCG_HELD, PCG_PAP, PCG_REG, Pcg, SamplePass, phase, point, pre, square, store_sum,
+    };
     use crate::pixel::*;
     use crate::*;
     use cuda_device::{SharedArray, thread};
@@ -514,23 +518,26 @@ pub mod sampling_kernels {
         unsafe { store_c(scratch, t, v) };
     }
 
-    /// `s[PCG_REG] = inertia * f32::from_bits(*max_bits)`, the object solve's regularization
-    /// from the bits of `max(D)`. One thread.
+    /// `s[PCG_REG] = inertia * max` and `s[PCG_HELD] = unseen * max`, the object solve's
+    /// regularization and held threshold, `max = f32::from_bits(*max_bits)` the bits of
+    /// `max(D)`. One thread.
     ///
     /// # Safety
     ///
     /// `max_bits` one word, `pcg` as [`Pcg`] says.
     #[kernel]
-    pub unsafe fn pcg_reg(max_bits: *const u32, inertia: f32, pcg: Pcg) {
+    pub unsafe fn pcg_reg(max_bits: *const u32, inertia: f32, unseen: f32, pcg: Pcg) {
         if global_index() == 0 {
-            unsafe { *pcg.s.add(PCG_REG as usize) = inertia * f32::from_bits(*max_bits) };
+            let max = unsafe { f32::from_bits(*max_bits) };
+            unsafe { *pcg.s.add(PCG_REG as usize) = inertia * max };
+            unsafe { *pcg.s.add(PCG_HELD as usize) = unseen * max };
         }
     }
 
     /// The object solve's start from `ap = AᴴA x / scale`: `res = res - scale ap`, `dir = res
-    /// / pre`, `pre = max(den + reg, 1e-12)` of the regularization `reg`, and block `b`'s
-    /// `sum |res|^2 / pre` over the elements `i ≡ b * PIXEL_THREADS + t (mod gridDim *
-    /// PIXEL_THREADS)` into `part[b]`.
+    /// / pre`, `pre = den + reg` of the regularization `reg`, infinite at most `s[PCG_HELD]`
+    /// so a held pixel's `dir` is 0, and block `b`'s `sum |res|^2 / pre` over the elements
+    /// `i ≡ b * PIXEL_THREADS + t (mod gridDim * PIXEL_THREADS)` into `part[b]`.
     ///
     /// # Safety
     ///
@@ -539,14 +546,14 @@ pub mod sampling_kernels {
     pub unsafe fn pcg_start(pcg: Pcg) {
         static mut RED: SharedArray<f32, 256> = SharedArray::UNINIT;
         let stride = thread::gridDim_x() as usize * PIXEL_THREADS as usize;
-        let reg = unsafe { *pcg.s.add(PCG_REG as usize) };
+        let (reg, held) = unsafe { (*pcg.s.add(PCG_REG as usize), *pcg.s.add(PCG_HELD as usize)) };
         let mut sum = 0.0;
         let mut i = global_index();
         while i < pcg.n as usize {
             unsafe {
                 let (b, a) = (load_c(pcg.res, i), load_c(pcg.ap, i));
                 let r = (b.0 - a.0 * pcg.scale, b.1 - a.1 * pcg.scale);
-                let m = pre(*pcg.den.add(i), reg);
+                let m = pre(*pcg.den.add(i), reg, held);
                 store_c(pcg.res, i, r);
                 store_c(pcg.dir, i, (r.0 / m, r.1 / m));
                 sum += (r.0 * r.0 + r.1 * r.1) / m;
@@ -618,7 +625,7 @@ pub mod sampling_kernels {
         static mut RED: SharedArray<f32, 256> = SharedArray::UNINIT;
         let stride = thread::gridDim_x() as usize * PIXEL_THREADS as usize;
         let at = |slot: u32| pcg.s.wrapping_add(slot as usize);
-        let (reg, rz, pap) = unsafe { (*at(PCG_REG), *at(rz), *at(PCG_PAP)) };
+        let (reg, held, rz, pap) = unsafe { (*at(PCG_REG), *at(PCG_HELD), *at(rz), *at(PCG_PAP)) };
         let alpha = if pap > 0.0 { rz / pap } else { 0.0 };
         let mut sum = 0.0;
         let mut i = global_index();
@@ -629,7 +636,7 @@ pub mod sampling_kernels {
                 store_c(pcg.x, i, (v.0 + alpha * p.0, v.1 + alpha * p.1));
                 let r = (r.0 - alpha * a.0, r.1 - alpha * a.1);
                 store_c(pcg.res, i, r);
-                sum += (r.0 * r.0 + r.1 * r.1) / pre(*pcg.den.add(i), reg);
+                sum += (r.0 * r.0 + r.1 * r.1) / pre(*pcg.den.add(i), reg, held);
             }
             i += stride;
         }
@@ -649,13 +656,13 @@ pub mod sampling_kernels {
     pub unsafe fn pcg_dir(pcg: Pcg, rz: u32, next: u32) {
         let stride = thread::gridDim_x() as usize * PIXEL_THREADS as usize;
         let at = |slot: u32| pcg.s.wrapping_add(slot as usize);
-        let (reg, rz, next) = unsafe { (*at(PCG_REG), *at(rz), *at(next)) };
+        let (reg, held, rz, next) = unsafe { (*at(PCG_REG), *at(PCG_HELD), *at(rz), *at(next)) };
         let beta = if rz > 0.0 { next / rz } else { 0.0 };
         let mut i = global_index();
         while i < pcg.n as usize {
             unsafe {
                 let (r, p) = (load_c(pcg.res, i), load_c(pcg.dir, i));
-                let m = pre(*pcg.den.add(i), reg);
+                let m = pre(*pcg.den.add(i), reg, held);
                 store_c(pcg.dir, i, (r.0 / m + beta * p.0, r.1 / m + beta * p.1));
             }
             i += stride;

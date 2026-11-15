@@ -208,6 +208,11 @@ impl Sampler {
 /// The steps of [`Sampling::FullObject`]'s object solve in AP, DM and RAAR.
 pub(crate) const OBJ_PCG: usize = 10;
 
+/// The object solve holds a pixel whose `D + reg` is at most this times `max D`. A pixel no
+/// window samples has the transforms' rounding for `D` and its residual, in `f32` up to
+/// `1e-6·max D`, which a floor on `D + reg` would divide into the steps.
+pub(crate) const OBJ_UNSEEN: f64 = 1e-5;
+
 /// The spectrum over `n` points of `|h_t[−v]|²`, `h_t[v] = (1/n)·Σ_k exp(2πi k (t + v)/n)`
 /// over numpy's `fftfreq` bins `k` the one-axis kernel that samples at `t`: at index
 /// `m < n`, `(1 − m/n)·exp(−2πi t m/n) + (m/n)·exp(−2πi t (m − n)/n)`, the bin pairs
