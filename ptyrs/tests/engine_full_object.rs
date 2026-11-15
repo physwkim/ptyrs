@@ -466,3 +466,84 @@ fn whole_pixel_offsets_are_the_blend() {
         }
     }
 }
+
+/// With no object inertia, at zero offsets and at whole-pixel offsets, held, AP, DM and RAAR
+/// on the CPU and the GPU leave every pixel outside the windows at its start, the GPU's at
+/// the start rounded to `f32`; at drawn offsets, whose windows sample every pixel, every pixel
+/// stays finite. No LLK is due, so DM and RAAR balance nothing.
+#[test]
+fn zero_object_inertia_holds_the_unseen_pixels() {
+    const NCYCLE: usize = 2;
+    const AP0: ApParams = ApParams {
+        obj_inertia: Some(0.0),
+        calc_llk: 0,
+        ..AP
+    };
+    const DM0: DmParams = DmParams {
+        obj_inertia: Some(0.0),
+        calc_llk: 0,
+        ..DM
+    };
+    const RAAR0: RaarParams = RaarParams {
+        obj_inertia: Some(0.0),
+        calc_llk: 0,
+        ..RAAR
+    };
+    let raw = fermat();
+    let shape = object_shape(&[&raw]);
+    let views = addr(&raw, shape, 1).views().to_vec();
+    let ctx = CudaContext::new(0).unwrap();
+    for (label, offsets, whole) in [
+        ("zero", vec![[0.0; 2]; NPOS], true),
+        ("whole", whole_offsets(), true),
+        ("drawn", drawn_offsets(), false),
+    ] {
+        let mut seen = vec![false; shape[0] * shape[1]];
+        for v in views.iter().filter(|_| whole) {
+            let [dy, dx] = offsets[v.frame as usize].map(|d| d as i64);
+            let (y0, x0) = (v.oy as i64 + dy, v.ox as i64 + dx);
+            assert!(y0 >= 0 && x0 >= 0, "{label} view {v:?}");
+            let (y0, x0) = (y0 as usize, x0 as usize);
+            for y in y0..y0 + frame() {
+                let row = &mut seen[y * shape[1]..(y + 1) * shape[1]];
+                row[x0..x0 + frame()].fill(true);
+            }
+        }
+        let c = Case::new(fermat(), shape, &offsets, 1);
+        let held = positioned(&offsets);
+        let check = |what: &str, got: &Object, start: &Object| {
+            let it = got.as_slice().iter().zip(start.as_slice()).zip(&seen);
+            for (j, ((g, s), &seen)) in it.enumerate() {
+                assert!(
+                    g.re.is_finite() && g.im.is_finite(),
+                    "{what} pixel {j}: {g}"
+                );
+                assert!(!whole || seen || g == s, "{what} pixel {j}: {g} from {s}");
+            }
+        };
+        let start = &c.start.0;
+        let start32 = start.as_slice().iter().map(|v| {
+            let [re, im] = [v.re, v.im].map(|x| f64::from(x as f32));
+            C64::new(re, im)
+        });
+        let start32 = Object::new(Stack::from_vec(start.dims(), start32.collect()).unwrap());
+        for algorithm in ["AP", "DM", "RAAR"] {
+            let mut cpu = Case::cpu(&c.scan, &c.start, &held);
+            let mut gpu = Case::gpu(&ctx, &c.scan, &c.start, &held, true);
+            for _ in 0..NCYCLE {
+                cpu.set_features(held.clone()).unwrap();
+                gpu.set_features(&held).unwrap();
+                match algorithm {
+                    "AP" => (cpu.ap(&AP0, 1), gpu.ap(&AP0, 1)),
+                    "DM" => (cpu.dm(&DM0, 1), gpu.dm(&DM0, 1)),
+                    _ => (cpu.raar(&RAAR0, 1), gpu.raar(&RAAR0, 1)),
+                }
+                .1
+                .unwrap();
+            }
+            check(&format!("{algorithm} CPU {label}"), cpu.object(), start);
+            let what = format!("{algorithm} GPU {label}");
+            check(&what, &gpu.object().unwrap(), &start32);
+        }
+    }
+}
