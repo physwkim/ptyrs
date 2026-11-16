@@ -31,8 +31,10 @@ rustfft = "6"
 rust-hdf5 = "0.7.13"
 
 [patch.crates-io]
-# Handle::can_mut counting only handle clones, autotune results persisted per device part and
-# tuner crate version, and pool pages freed by the cleanup that releases them; goes once cubecl
-# ships all three.
+# Handle::can_mut counting only handle clones, autotune results persisted per device part, tuner
+# crate version and vendored kernel change, pool pages freed by the cleanup that releases them,
+# and f32 matmuls kept off tf32 (cubek 0.3.1 has no switch for it); each goes once cubecl or cubek
+# ships it.
 cubecl-runtime = { path = "vendor/cubecl-runtime" }
 cubecl-server = { path = "vendor/cubecl-server" }
+cubek-matmul = { path = "vendor/cubek-matmul" }

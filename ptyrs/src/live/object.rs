@@ -19,7 +19,6 @@
 //!
 //! Every access goes through the storage's lease, on the object's stream.
 
-use std::collections::VecDeque;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -28,7 +27,6 @@ use cuda_async::device_operation::ExecutionContext;
 use cuda_bindings::{self as sys, CUdeviceptr};
 use cuda_core::{Context, DeviceBuffer, DriverError, Event, IntoResult, PinnedHostBuffer, Stream};
 
-use crate::live::fill::Fill;
 use crate::live::grow::{Backer, GrowBuf, GrowError};
 
 /// Where a [`LiveObject`]'s tiles sit in its buffers.
@@ -37,6 +35,8 @@ struct Layout {
     nobj: usize,
     /// `[nyo, nxo]`.
     shape: [usize; 2],
+    /// `nobj · nyo · nxo` pixels.
+    len: usize,
     /// `[nty, ntx]`.
     tiles: [usize; 2],
     /// Tile `t`'s slab is slots `start[t]..start[t + 1]` of `tile_views`.
@@ -44,6 +44,24 @@ struct Layout {
 }
 
 impl Layout {
+    /// The pixel count of `nobj` planes of `shape`, their tiles per axis and
+    /// the tile count. The pixels' bytes fit `usize` and the tile ids `u32`;
+    /// the plane is formed first, so with no planes it still bounds the
+    /// tiles.
+    fn grid(nobj: usize, shape: [usize; 2]) -> Result<(usize, [usize; 2], u32), GrowError> {
+        let bad = |m: String| GrowError::from(crate::gpu::Error::Shape(m));
+        let [nyo, nxo] = shape;
+        let len = nyo
+            .checked_mul(nxo)
+            .and_then(|plane| plane.checked_mul(nobj))
+            .filter(|len| len.checked_mul(8).is_some())
+            .ok_or_else(|| bad(format!("{nobj} planes of {shape:?} pass usize bytes")))?;
+        let tiles = shape.map(|n| n.div_ceil(OBJ_TILE as usize));
+        let ntiles = u32::try_from(tiles[0] * tiles[1])
+            .map_err(|_| bad(format!("tiles {tiles:?} pass u32 ids")))?;
+        Ok((len, tiles, ntiles))
+    }
+
     /// Tile `t` as indices, if it is in the object.
     fn tile(&self, t: [u32; 2]) -> Result<[usize; 2], GrowError> {
         let [y, x] = t.map(|i| i as usize);
@@ -61,15 +79,6 @@ impl Layout {
         let ([nyo, nxo], t) = (self.shape, OBJ_TILE as usize);
         let rows = ty * t..((ty + 1) * t).min(nyo);
         (0..self.nobj).map(move |z| (z * nyo + rows.start) * nxo..(z * nyo + rows.end) * nxo)
-    }
-
-    /// How many of the pixels `xs` of row `y` lie on tiles with a slab.
-    fn binned(&self, y: usize, xs: &Range<usize>) -> usize {
-        let t = OBJ_TILE as usize;
-        (xs.start / t..=(xs.end - 1) / t)
-            .filter(|&tx| !self.slab([y / t, tx]).is_empty())
-            .map(|tx| xs.end.min((tx + 1) * t) - xs.start.max(tx * t))
-            .sum()
     }
 
     /// The bytes of tile `[ty, tx]`'s slab in `tile_views`, empty for a tile
@@ -131,25 +140,7 @@ pub struct LiveObject {
     tile_views: GrowBuf,
     layout: Layout,
     fill: [f32; 2],
-    /// Fills whose copies are queued, oldest first. One leaves only through
-    /// [`Self::release_fills`], once its event passed, or through `Drop`
-    /// behind a stream synchronize: its buffer is never back in the pool
-    /// while a copy may still read it.
-    held: VecDeque<HeldFill>,
-    /// Events of fills that left, for the next ones.
-    spare: Vec<Event>,
-    fill_copies: u64,
     stream: Arc<Stream>,
-}
-
-/// A fill the stream may still be copying from.
-struct HeldFill {
-    fill: Fill,
-    /// Recorded on the stream behind the fill's copies.
-    done: Event,
-    /// False until `done` is recorded: an event never recorded reads as
-    /// passed.
-    recorded: bool,
 }
 
 impl LiveObject {
@@ -162,8 +153,8 @@ impl LiveObject {
         fill: [f32; 2],
         chunk: usize,
     ) -> Result<Self, GrowError> {
-        let [nty, ntx] = shape.map(|n| n.div_ceil(OBJ_TILE as usize));
-        let all: Vec<u32> = (0..(nty * ntx) as u32).collect();
+        let (_, _, ntiles) = Layout::grid(nobj, shape)?;
+        let all: Vec<u32> = (0..ntiles).collect();
         Self::owned(stream, nobj, shape, cap, fill, chunk, &all)
     }
 
@@ -181,13 +172,10 @@ impl LiveObject {
         own: &[u32],
     ) -> Result<Self, GrowError> {
         let ctx = stream.context();
-        let [nyo, nxo] = shape;
-        let t = OBJ_TILE as usize;
-        let tiles = [nyo.div_ceil(t), nxo.div_ceil(t)];
-        let ntiles = tiles[0] * tiles[1];
+        let (len, tiles, ntiles) = Layout::grid(nobj, shape)?;
         let bad = |m: String| GrowError::from(crate::gpu::Error::Shape(m));
         let (mut owned, mut start) = (own.iter().peekable(), vec![0u32]);
-        for t in 0..ntiles as u32 {
+        for t in 0..ntiles {
             let slab = if owned.next_if_eq(&&t).is_some() {
                 cap
             } else {
@@ -207,7 +195,6 @@ impl LiveObject {
                 "own tiles {own:?} are not ascending ids under {ntiles}"
             )));
         }
-        let len = nobj * nyo * nxo;
         let obj = GrowBuf::new(ctx, len * 8, chunk)?;
         let num = GrowBuf::new(ctx, len * 8, chunk)?;
         let den = GrowBuf::new(ctx, len * 4, chunk)?;
@@ -222,17 +209,15 @@ impl LiveObject {
             num,
             den,
             sums,
-            tile_views: GrowBuf::new(ctx, start[ntiles] as usize * 4, chunk)?,
+            tile_views: GrowBuf::new(ctx, start[ntiles as usize] as usize * 4, chunk)?,
             layout: Layout {
                 nobj,
                 shape,
+                len,
                 tiles,
                 start: start.into(),
             },
             fill,
-            held: VecDeque::new(),
-            spare: Vec::new(),
-            fill_copies: 0,
             stream: stream.clone(),
         })
     }
@@ -321,9 +306,6 @@ impl LiveObject {
         &mut self,
         tiles: impl IntoIterator<Item = [u32; 2]>,
     ) -> Result<(), GrowError> {
-        // Every batch passes here, so a fill is back within one batch of
-        // its copies, with or without a next fill.
-        self.release_fills();
         self.stream.context().bind_to_thread()?;
         let s = self.stream.cu_stream();
         let [re, im] = self.fill.map(f32::to_bits);
@@ -378,120 +360,6 @@ impl LiveObject {
                 .init_with(self.layout.slab([y, x]), |_| Ok(()))?;
         }
         Ok(())
-    }
-
-    /// Queues `fill` onto mode 0 on the stream, behind the work already
-    /// queued there, so kernels queued afterwards read the predictions:
-    /// call it for a batch after its tiles are readied and before its
-    /// first epoch. `origin` is the object pixel `[y, x]` of this object's
-    /// pixel `(0, 0)`, `[0, 0]` unless the object is a window of a larger
-    /// one; what `fill` holds outside the window is another object's.
-    /// Rows not ready are skipped, never backed, and start flat when they
-    /// are readied; returned are the skipped pixels on the tiles this
-    /// object bins, so over the windows of a split object each skipped
-    /// pixel counts once, at its owner. The object has one mode:
-    /// [`LiveScan::fill`](crate::live::scan::LiveScan::fill) refuses any
-    /// other.
-    ///
-    /// The object keeps `fill` until an event behind its copies passed, so
-    /// its buffer cannot be reused under a pending copy, whatever this
-    /// call returns.
-    pub fn write_fill(&mut self, fill: Fill, origin: [usize; 2]) -> Result<usize, GrowError> {
-        self.release_fills();
-        self.stream.context().bind_to_thread()?;
-        let done = match self.spare.pop() {
-            Some(e) => e,
-            None => sleeping_event(self.stream.context())?,
-        };
-        // Held before the first copy is queued.
-        self.held.push_back(HeldFill {
-            fill,
-            done,
-            recorded: false,
-        });
-        let queued = self.queue_fill(origin);
-        // Also after a failure: copies queued before it are pending.
-        let held = self.held.back_mut().expect("pushed above");
-        held.done.record(&self.stream)?;
-        held.recorded = true;
-        queued
-    }
-
-    /// Host-to-device copies [`Self::write_fill`] has queued so far.
-    pub fn fill_copies(&self) -> u64 {
-        self.fill_copies
-    }
-
-    /// Hands back the fills whose copies ran.
-    fn release_fills(&mut self) {
-        while let Some(h) = self.held.front() {
-            if !(h.recorded && matches!(h.done.query(), Ok(true))) {
-                break;
-            }
-            let h = self.held.pop_front().expect("front exists");
-            self.spare.push(h.done);
-        }
-    }
-
-    /// Queues the copies of the newest held fill; returns the pixels on
-    /// rows not ready of tiles with a slab.
-    fn queue_fill(&mut self, [oy, ox]: [usize; 2]) -> Result<usize, GrowError> {
-        let fill = &self.held.back().expect("write_fill holds one").fill;
-        let [nyo, nxo] = self.layout.shape;
-        let (s, src) = (self.stream.cu_stream(), fill.values().as_ptr());
-        let mut lease: Option<ExecutionContext> = None;
-        let (mut skipped, mut copies) = (0, 0);
-        for r in fill.rects() {
-            // The rectangle inside this object, in its own pixels.
-            let clip = |at: u32, len: u32, o: usize, n: usize| {
-                let (a, b) = (at as usize, (at + len) as usize);
-                a.max(o).min(o + n) - o..b.max(o).min(o + n) - o
-            };
-            let (ys, xs) = (clip(r.y, r.h, oy, nyo), clip(r.x, r.w, ox, nxo));
-            if ys.is_empty() || xs.is_empty() {
-                continue;
-            }
-            let ready = |y: usize| {
-                self.obj
-                    .is_ready((y * nxo + xs.start) * 8..(y * nxo + xs.end) * 8)
-            };
-            let mut y = ys.start;
-            while y < ys.end {
-                if !ready(y) {
-                    skipped += self.layout.binned(y, &xs);
-                    y += 1;
-                    continue;
-                }
-                let band = y..(y + 1..ys.end).find(|&y| !ready(y)).unwrap_or(ys.end);
-                y = band.end;
-                if lease.is_none() {
-                    let c = ExecutionContext::new(self.stream.clone());
-                    crate::gpu::lease(&c, &[], &[self.pixels.storage()])?;
-                    lease = Some(c);
-                }
-                let first =
-                    (band.start + oy - r.y as usize) * r.w as usize + xs.start + ox - r.x as usize;
-                // SAFETY: integers and raw pointers, zero is a value of
-                // each; the fields left zero are the unused ones.
-                let mut copy: sys::CUDA_MEMCPY2D = unsafe { std::mem::zeroed() };
-                copy.srcMemoryType = sys::CUmemorytype_enum_CU_MEMORYTYPE_HOST;
-                // SAFETY: inside the fill's values, by `Rect`.
-                copy.srcHost = unsafe { src.add(r.at + first) }.cast();
-                copy.srcPitch = r.w as usize * 8;
-                copy.dstMemoryType = sys::CUmemorytype_enum_CU_MEMORYTYPE_DEVICE;
-                copy.dstDevice = self.obj.ptr() + ((band.start * nxo + xs.start) * 8) as u64;
-                copy.dstPitch = nxo * 8;
-                copy.WidthInBytes = xs.len() * 8;
-                copy.Height = band.len();
-                // SAFETY: the rows are ready and stay so while `self`
-                // lives; the source is pinned and held in `self.held`
-                // until an event behind this copy passed.
-                unsafe { sys::cuMemcpy2DAsync_v2(&copy, s) }.result()?;
-                copies += 1;
-            }
-        }
-        self.fill_copies += copies;
-        Ok(skipped)
     }
 
     /// Queues a copy of every ready object row into `snap` on the stream,
@@ -550,12 +418,8 @@ impl LiveObject {
 impl Drop for LiveObject {
     fn drop(&mut self) {
         // Queued fills and snapshot copies use the mappings the fields'
-        // drops release, and held fills' buffers.
-        if self.stream.synchronize().is_err() {
-            // Their copies may be pending for good: the buffers stay out
-            // of the pool.
-            self.held.drain(..).for_each(std::mem::forget);
-        }
+        // drops release.
+        let _ = self.stream.synchronize();
     }
 }
 
@@ -592,9 +456,8 @@ impl Snapshot {
     pub fn new(o: &LiveObject) -> Result<Self, DriverError> {
         let ctx = o.stream.context();
         let l = &o.layout;
-        let [nyo, nxo] = l.shape;
         Ok(Self {
-            buf: PinnedHostBuffer::zeroed(ctx, l.nobj * nyo * nxo)?,
+            buf: PinnedHostBuffer::zeroed(ctx, l.len)?,
             done: sleeping_event(ctx)?,
             copied: Vec::new(),
             fill: o.fill,
@@ -639,184 +502,23 @@ mod tests {
     use cuda_core::Context;
 
     use super::*;
-    use crate::live::fill::PatchFill;
 
-    /// Holds `s` behind a gate until the returned sender is used or
-    /// dropped, or 10 s passed, so a call that waits on the stream fails
-    /// its check instead of hanging. Join the handle before `gate` drops.
-    fn hold(
-        s: &Stream,
-        gate: &mut PinnedHostBuffer<u32>,
-    ) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
-        // SAFETY: the caller keeps `gate` until the stream passed it.
-        unsafe {
-            sys::cuStreamWaitValue32_v2(
-                s.cu_stream(),
-                gate.as_ptr() as u64,
-                1,
-                sys::CUstreamWaitValue_flags_enum_CU_STREAM_WAIT_VALUE_GEQ,
-            )
+    /// Each product past its range, with no planes for the plane's own case:
+    /// a wrapped count would size a smaller object than its tiles index.
+    #[test]
+    fn grid_refuses_object_past_its_ranges() {
+        let side = 1 << (usize::BITS / 2);
+        let tiles = OBJ_TILE as usize * (1 << 16);
+        for (nobj, shape, want) in [
+            (0, [side, side], "pass usize bytes"),
+            (1 << 8, [side / 4, side / 4], "pass usize bytes"),
+            (1, [side / 2, side / 2], "pass usize bytes"),
+            (0, [tiles, tiles], "pass u32 ids"),
+        ] {
+            let e = Layout::grid(nobj, shape).unwrap_err().to_string();
+            assert!(e.contains(want), "{nobj} x {shape:?}: {e}");
         }
-        .result()
-        .unwrap();
-        let (release, rx) = std::sync::mpsc::channel::<()>();
-        let g = gate.as_mut_ptr() as usize;
-        let watchdog = std::thread::spawn(move || {
-            let _ = rx.recv_timeout(std::time::Duration::from_secs(10));
-            // SAFETY: `gate` outlives the thread, which the caller joins.
-            unsafe { (g as *mut u32).write_volatile(1) };
-        });
-        (release, watchdog)
-    }
-
-    const PATCH: [usize; 2] = [8, 8];
-
-    /// Every tile of a 64-pixel object.
-    fn all_tiles() -> impl Iterator<Item = [u32; 2]> {
-        (0..4).flat_map(|ty| (0..4).map(move |tx| [ty, tx]))
-    }
-
-    /// Fills reach the object as stitched: a pixel in one patch takes its
-    /// value, one in two patches of a batch their taper mean, one a later
-    /// batch covers again keeps the first value and one never covered what
-    /// it had; on a ready object nothing is skipped.
-    #[test]
-    fn write_fill_writes_each_pixel_its_first_prediction() {
-        let ctx = Context::new(0).expect("GPU 0");
-        let s = ctx.new_stream().unwrap();
-        let (n, flat) = (64usize, [1.0f32, 0.5]);
-        let mut o = LiveObject::new(&s, 1, [n, n], 4, flat, 1).unwrap();
-        grow(&mut o, all_tiles());
-        let mut pf = PatchFill::new(&ctx, [n, n], PATCH, 4, 2).unwrap();
-        let patch = |v: [f32; 2]| vec![v; 64];
-        let (a, b, c) = ([2.0f32, 1.0], [4.0f32, -3.0], [9.0f32, 9.0]);
-        let first = pf
-            .stitch(&[[30, 20], [30, 23]], &[patch(a), patch(b)].concat())
-            .unwrap();
-        let mean = first.values()[5];
-        assert!(mean != a && mean != b);
-        assert_eq!(o.write_fill(first, [0, 0]).unwrap(), 0);
-        // Over the first batch's patches and 4 rows below them.
-        let later = pf.stitch(&[[34, 21]], &patch(c)).unwrap();
-        assert_eq!(o.write_fill(later, [0, 0]).unwrap(), 0);
-        assert_eq!(o.fill_copies(), 2);
-        let mut snap = Snapshot::new(&o).unwrap();
-        o.snapshot(&mut snap).unwrap();
-        let px = snap.wait().unwrap();
-        let at = |y: usize, x: usize| px[y * n + x];
-        assert_eq!(at(31, 21), a);
-        assert_eq!(at(31, 29), b);
-        assert_eq!(at(33, 25), mean);
-        assert_eq!(at(36, 25), mean, "a later batch replaced a prediction");
-        assert_eq!(at(40, 25), c);
-        let covered = |y: usize, x: usize| {
-            ((30..38).contains(&y) && (20..31).contains(&x))
-                || ((38..42).contains(&y) && (21..29).contains(&x))
-        };
-        let moved = (0..n * n)
-            .filter(|i| !covered(i / n, i % n) && px[*i] != flat)
-            .count();
-        assert_eq!(moved, 0);
-    }
-
-    /// A fill over rows not ready writes the ready ones, reports the
-    /// pixels of the others and backs nothing; in a window it writes its
-    /// part of the fill at the window's own pixels.
-    #[test]
-    fn write_fill_skips_rows_not_ready_and_clips_to_the_window() {
-        let ctx = Context::new(0).expect("GPU 0");
-        let s = ctx.new_stream().unwrap();
-        let (n, flat) = (1024usize, [1.0f32, 0.5]);
-        let mut o = LiveObject::new(&s, 1, [n, n], 4, flat, 1).unwrap();
-        // 2 MiB chunks back rows 256..512.
-        grow(&mut o, [[300 / 16, 2]].into_iter());
-        let mapped = o.mapped_bytes();
-        let mut pf = PatchFill::new(&ctx, [2 * n, 2 * n], PATCH, 4, 4).unwrap();
-        let v = [3.0f32, -2.0];
-        // Rows 508..516 of the object: 4 ready, 4 not.
-        let fill = pf.stitch(&[[508, 40]], &vec![v; 64]).unwrap();
-        assert_eq!(o.write_fill(fill, [0, 0]).unwrap(), 4 * 8);
-        assert_eq!(o.mapped_bytes(), mapped);
-        // A window at [100, 1020] holds columns 1020..2044: 4 of the 8.
-        let fill = pf.stitch(&[[400, 1016]], &vec![v; 64]).unwrap();
-        assert_eq!(o.write_fill(fill, [100, 1020]).unwrap(), 0);
-        // Wholly outside the window.
-        let fill = pf.stitch(&[[2000, 0]], &vec![v; 64]).unwrap();
-        assert_eq!(o.write_fill(fill, [100, 1020]).unwrap(), 0);
-        assert_eq!(o.fill_copies(), 2);
-        // An object binning tile column 1 only: of 8 pixels a row over
-        // columns 12..20 not ready, the 4 on its tile count.
-        let own: Vec<u32> = (0..64).map(|ty| ty * 64 + 1).collect();
-        let mut part = LiveObject::owned(&s, 1, [n, n], 4, flat, 1, &own).unwrap();
-        let fill = pf.stitch(&[[600, 12]], &vec![v; 64]).unwrap();
-        assert_eq!(part.write_fill(fill, [0, 0]).unwrap(), 8 * 4);
-        let mut snap = Snapshot::new(&o).unwrap();
-        o.snapshot(&mut snap).unwrap();
-        let px = snap.wait().unwrap();
-        let filled = |y: usize, x: usize| {
-            ((508..512).contains(&y) && (40..48).contains(&x)) || ((300..308).contains(&y) && x < 4)
-        };
-        let bad = (0..n * n)
-            .filter(|i| px[*i] != if filled(i / n, i % n) { v } else { flat })
-            .count();
-        assert_eq!(bad, 0);
-    }
-
-    /// A fill's buffer is out of the pool while the stream has not run its
-    /// copies: through the call that queued them, a later call and the
-    /// object's drop, and back once they ran.
-    #[test]
-    fn write_fill_keeps_the_buffer_until_its_copies_ran() {
-        let ctx = Context::new(0).expect("GPU 0");
-        let s = ctx.new_stream().unwrap();
-        let n = 64usize;
-        let mut o = LiveObject::new(&s, 1, [n, n], 4, [1.0, 0.5], 1).unwrap();
-        grow(&mut o, all_tiles());
-        s.synchronize().unwrap();
-        let mut pf = PatchFill::new(&ctx, [n, n], PATCH, 4, 2).unwrap();
-        let patch = vec![[2.0f32, 2.0]; 64];
-        let mut gate = PinnedHostBuffer::<u32>::zeroed(&ctx, 1).unwrap();
-        let (release, watchdog) = hold(&s, &mut gate);
-        let fill = pf.stitch(&[[0, 0]], &patch).unwrap();
-        o.write_fill(fill, [0, 0]).unwrap();
-        // The second call finds the first one's copies pending.
-        let fill = pf.stitch(&[[8, 0]], &patch).unwrap();
-        o.write_fill(fill, [0, 0]).unwrap();
-        let pending = o.held.iter().all(|h| !h.done.query().unwrap());
-        let held = (o.held.len(), pf.stitch(&[[16, 0]], &patch).is_none());
-        release.send(()).unwrap();
-        watchdog.join().unwrap();
-        assert!(pending, "write_fill waited for the stream");
-        assert_eq!(held, (2, true), "a buffer was back before its copies ran");
-        s.synchronize().unwrap();
-        // The copies ran: readying a tile hands both back.
-        o.init_tiles([[0, 0]]).unwrap();
-        assert_eq!((o.held.len(), o.spare.len()), (0, 2));
-
-        // Dropped behind a held stream, the object keeps its fills until
-        // the stream is through.
-        let (release, watchdog) = {
-            gate.as_mut_slice()[0] = 0;
-            hold(&s, &mut gate)
-        };
-        let fill = pf.stitch(&[[24, 0]], &patch).unwrap();
-        o.write_fill(fill, [0, 0]).unwrap();
-        let fill = pf.stitch(&[[32, 0]], &patch).unwrap();
-        o.write_fill(fill, [0, 0]).unwrap();
-        let (dropped, done) = std::sync::mpsc::channel::<()>();
-        let dropper = std::thread::spawn(move || {
-            drop(o);
-            let _ = dropped.send(());
-        });
-        let waited = done
-            .recv_timeout(std::time::Duration::from_millis(200))
-            .is_err();
-        let kept = pf.stitch(&[[40, 0]], &patch).is_none();
-        release.send(()).unwrap();
-        watchdog.join().unwrap();
-        dropper.join().unwrap();
-        assert!(waited && kept, "the drop handed a buffer back early");
-        assert!(pf.stitch(&[[40, 0]], &patch).is_some());
+        assert_eq!(Layout::grid(2, [17, 32]).unwrap().0, 2 * 17 * 32);
     }
 
     /// Backs `tiles` from another thread, as a mapper would, then readies

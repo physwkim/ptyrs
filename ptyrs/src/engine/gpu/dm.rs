@@ -1,6 +1,9 @@
 //! PyNX DM on the GPU, and the cycle it shares with RAAR.
 
-use crate::gpu::{Error as GpuError, Exit, FusedBufs, FusedInputs, FusedSums, ShiftProbe};
+use crate::gpu::{
+    Error as GpuError, Exit, FusedBufs, FusedInputs, FusedSums, PsiSums, ShiftProbe,
+    ShiftedStepSums,
+};
 use cuda_async::device_operation::ExecutionContext;
 
 use super::device::{CarriedMut, M1Bufs, OneSlice, PassesMut, Sample, another_model};
@@ -177,7 +180,7 @@ impl Bufs<'_> {
                             model: m.model(),
                         };
                         let sums = FusedSums {
-                            obj: summed.then(|| win.zeroed_sums(ctx)).transpose()?,
+                            obj: summed.then(|| win.zeroed_patches(ctx)).transpose()?,
                             ..FusedSums::default()
                         };
                         (self.kernels).fused_project(ctx, &inputs, stack, exit, f, sums)?;
@@ -255,9 +258,16 @@ impl Bufs<'_> {
         one: OneSlice,
     ) -> Result<(), GpuError> {
         let dims = *self.views.dims();
-        let mut m = (self.features)
-            .lend(ctx, self.kernels, &dims, self.obj, self.probe, self.exit)?
-            .one_slice(one);
+        let (m, step) = (self.features).lend_shifted::<ShiftedStepSums>(
+            ctx,
+            self.kernels,
+            &dims,
+            self.obj,
+            self.probe,
+            self.exit,
+        )?;
+        let m = m.one_slice(one);
+        let mut step = step.filter(|_| probe.is_some());
         for s in 0..w.cut.len() {
             let inputs = FusedInputs {
                 views: self.views,
@@ -268,30 +278,32 @@ impl Bufs<'_> {
             };
             let (stack, psi) = (w.cut.at(s), w.psi(s));
             if obj {
-                let sums = m.psi_sums(Some(&mut *self.obj_sums), None);
+                let sums = PsiSums {
+                    obj: Some(&mut *self.obj_sums),
+                    probe: None,
+                };
                 self.kernels
                     .shifted_psi_sums(ctx, &inputs, stack, psi, f, sums)?;
             }
-            if probe.is_some() {
-                let sums = m.psi_sums(None, Some(ShiftProbe::Step));
+            if let Some(step) = step.as_deref_mut() {
+                let sums = PsiSums {
+                    obj: None,
+                    probe: Some(ShiftProbe::Step(step)),
+                };
                 self.kernels
                     .shifted_psi_sums(ctx, &inputs, stack, psi, f, sums)?;
             }
         }
-        let Some(inertia) = probe else {
+        let (Some(inertia), Some(step)) = (probe, step) else {
             return Ok(());
         };
-        m.probe_sums(ctx, self.kernels, &dims, self.probe_sums)?;
-        let model = m.model();
-        let Some(ShiftProbe::Step(step)) = m.shift_sums(Some(ShiftProbe::Step), false).probe else {
-            return Ok(());
-        };
+        (self.kernels).shifted_probe_sums(ctx, &dims, &mut *step, self.probe_sums)?;
         let inputs = FusedInputs {
             views: self.views,
             counts: self.counts,
             obj: self.obj,
             probe: self.probe,
-            model,
+            model: m.model(),
         };
         let stacks = (0..w.cut.len()).map(|s| w.cut.at(s));
         let sums = &mut *self.probe_sums;
@@ -329,7 +341,7 @@ impl Bufs<'_> {
             let mut win = win.ok_or_else(another_model)?;
             let read = win.read;
             if obj {
-                let sums = win.zeroed_sums(ctx)?;
+                let sums = win.zeroed_patches(ctx)?;
                 (self.kernels).psi_to_obj(ctx, read.views, stack, &*psi, self.probe, sums)?;
                 m.place(
                     ctx,

@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use cuda_bindings as sys;
 use cuda_core::{Context, IntoResult, PinnedHostBuffer};
 use epics_pva_rs::server_native::{PvaServer, PvaServerConfig, SharedSource};
-use ptyrs::live::args::Args;
+use ptyrs::live::args::cli;
 use ptyrs::live::object::{LiveObject, Snapshot};
 use ptyrs::live::pv_out::{AmpPhase, PvOut};
 
@@ -39,20 +39,49 @@ fn probe(m: usize, y: usize, x: usize, np: usize, u: i32) -> [f32; 2] {
     )
 }
 
+struct Flags {
+    port: u16,
+    prefix: String,
+    gpu: usize,
+    n: usize,
+    rows: (usize, usize),
+    bin: usize,
+    np: usize,
+    posts: i32,
+    period: Duration,
+    wait_s: u64,
+    linger: Duration,
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() {
-    let a = Args::parse();
-    let port: u16 = a.get("port", 15175);
-    let prefix = a.str("prefix", "PTYOUT:");
-    let gpu: usize = a.get("gpu", 0);
-    let n: usize = a.get("n", 1024);
-    let (row0, row1): (usize, usize) = (a.get("row0", 300), a.get("row1", 460));
-    let bin: usize = a.get("bin", 4);
-    let np: usize = a.get("probe", 128);
-    let posts: i32 = a.get("posts", 5);
-    let period = Duration::from_millis(a.get("period-ms", 200));
-    let wait_s: u64 = a.get("wait-s", 30);
-    let linger = Duration::from_millis(a.get("linger-ms", 2000));
+    let Flags {
+        port,
+        prefix,
+        gpu,
+        n,
+        rows: (row0, row1),
+        bin,
+        np,
+        posts,
+        period,
+        wait_s,
+        linger,
+    } = cli("live_pv_out_demo", |a| {
+        Ok(Flags {
+            port: a.get("port", 15175)?,
+            prefix: a.str("prefix", "PTYOUT:"),
+            gpu: a.get("gpu", 0)?,
+            n: a.get("n", 1024)?,
+            rows: (a.get("row0", 300)?, a.get("row1", 460)?),
+            bin: a.get("bin", 4)?,
+            np: a.get("probe", 128)?,
+            posts: a.get("posts", 5)?,
+            period: Duration::from_millis(a.get("period-ms", 200)?),
+            wait_s: a.get("wait-s", 30)?,
+            linger: Duration::from_millis(a.get("linger-ms", 2000)?),
+        })
+    });
 
     let ctx = Context::new(gpu).expect("CUDA context");
     let s = ctx.new_stream().expect("stream");

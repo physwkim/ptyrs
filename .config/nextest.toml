@@ -11,8 +11,6 @@ not (package(ptyrs) & (
   | test(=dist::live::tests::every_gpu_copies_from_the_ring_in_place)
   | test(=dist::live::tests::gpus_exchange_the_halo_as_it_grows)
   | test(=dist::live::tests::the_uploader_fills_each_store_in_the_order_the_plan_numbers_its_frames)
-  | test(=dist::live_ap::tests::fills_on_2_gpus_give_the_one_gpu_object)
-  | test(=dist::live_ap::tests::fills_on_4_gpus_give_the_one_gpu_object)
   | test(=dist::live_ap::tests::gpus_iterate_a_live_scan_as_one_gpu)
   | test(=dist::live_ap::tests::stores_that_grow_mid_scan_give_the_one_gpu_object)
   | test(=dist::p2p::tests::bench_times_every_ordered_pair_and_checks_the_data)
@@ -27,8 +25,6 @@ not (package(ptyrs) & (
   | test(=dist::worker::tests::fence_orders_side_stream_work)
   | test(=dist::worker::tests::init_failure_is_reported)
   | test(=dist::worker::tests::run_returns_after_every_worker_is_done_with_its_borrows)
-  | test(=live::fill::wired::a_filling_run_on_four_gpus_is_one_gpus_replay)
-  | test(=live::follow::tests::a_filling_run_on_two_gpus_is_one_gpus_replay)
   | test(=live::follow::tests::gpus_follow_a_stream_as_one_gpu_replays_its_landings)
 ))
 '''

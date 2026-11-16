@@ -29,7 +29,7 @@ use std::ops::Range;
 
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig, RawDeviceBuffer};
-use ptyrs_kernels::fused::{FUSED_COLS, FUSED_DOWN, FusedCfg, FusedPtrs};
+use ptyrs_kernels::fused::{FUSED_COLS, FUSED_DOWN, FusedCfg, FusedPtrs, shared_probe};
 use ptyrs_kernels::grad::ObjProbePtrs;
 pub use ptyrs_kernels::lsqml::LSQML_REC;
 use ptyrs_kernels::lsqml::{
@@ -43,8 +43,8 @@ use crate::gpu::opr::{FrameProbe, OwnModes, shared_src};
 use crate::gpu::ops::grid_1d;
 use crate::gpu::position::{ONE_BLOCK, chunk_grid, chunks, same_dims, span};
 use crate::gpu::{
-    BhScan, C32, Error, FrameWaves, Kernels, StackCtl, StackGeom, StackRef, UpdateSums, ViewAddr,
-    ViewDims, Views, check_len, dptr,
+    BhScan, C32, Error, FrameWaves, Kernels, StackCtl, StackGeom, StackRef, ViewAddr, ViewDims,
+    Views, check_len, dptr,
 };
 
 #[cfg(test)]
@@ -229,10 +229,10 @@ pub struct LsqmlAt<'a> {
     pub d: [&'a DeviceBuffer<C32>; 2],
 }
 
-/// An array LSQML updates: the estimate and its update sums, whose `num` holds the direction.
+/// An array LSQML updates: the estimate and its direction, the numerator of its sums.
 pub struct LsqmlVar<'a> {
     pub x: &'a mut DeviceBuffer<C32>,
-    pub sums: &'a mut UpdateSums,
+    pub num: &'a mut DeviceBuffer<C32>,
 }
 
 impl LsqmlKernels {
@@ -417,9 +417,13 @@ impl LsqmlKernels {
         let config = sh.rows(&g, true)?;
         let mut reads = vec![obj.storage(), views.addr().storage(), stack.storage()];
         reads.extend(probe.storages());
-        let probe = probe.src(d.n())?;
+        let own = match probe {
+            FrameProbe::Shared(_) => None,
+            FrameProbe::Own(p, own) => Some(own.src(p, stack, d.n())?),
+        };
         let p = FusedPtrs {
             obj: dptr::<C32, f32>(obj).cast_const(),
+            probe: dptr::<C32, f32>(probe.probe()).cast_const(),
             views: dptr::<ViewAddr, ViewAddr>(views.addr()).cast_const(),
             work: dptr(work),
             ..null_ptrs()
@@ -435,11 +439,23 @@ impl LsqmlKernels {
             // SAFETY: lengths checked above; `Shape::of` checked the side's kernels and shared
             // memory; `Views::new` checked the views are inside the object.
             unsafe {
-                match sh.nx {
-                    Side::N64 => m.fused_rows_fwd_64(stream, config, p, probe, ctl, g, cfg),
-                    Side::N128 => m.fused_rows_fwd_128(stream, config, p, probe, ctl, g, cfg),
-                    Side::N256 => m.fused_rows_fwd_256(stream, config, p, probe, ctl, g, cfg),
-                    Side::N512 => m.fused_rows_fwd_512(stream, config, p, probe, ctl, g, cfg),
+                match (sh.nx, own) {
+                    (Side::N64, None) => m.fused_rows_fwd_64(stream, config, p, ctl, g, cfg),
+                    (Side::N128, None) => m.fused_rows_fwd_128(stream, config, p, ctl, g, cfg),
+                    (Side::N256, None) => m.fused_rows_fwd_256(stream, config, p, ctl, g, cfg),
+                    (Side::N512, None) => m.fused_rows_fwd_512(stream, config, p, ctl, g, cfg),
+                    (Side::N64, Some(own)) => {
+                        m.fused_rows_fwd_own_64(stream, config, p, own, ctl, g, cfg)
+                    }
+                    (Side::N128, Some(own)) => {
+                        m.fused_rows_fwd_own_128(stream, config, p, own, ctl, g, cfg)
+                    }
+                    (Side::N256, Some(own)) => {
+                        m.fused_rows_fwd_own_256(stream, config, p, own, ctl, g, cfg)
+                    }
+                    (Side::N512, Some(own)) => {
+                        m.fused_rows_fwd_own_512(stream, config, p, own, ctl, g, cfg)
+                    }
                 }
             }
         })
@@ -623,33 +639,32 @@ impl LsqmlKernels {
         Ok(())
     }
 
-    /// The preconditioned object direction in `sums.num`: divided by `√(pre² + (0.1 max
+    /// The preconditioned object direction in `num`: divided by `√(pre² + (0.1 max
     /// pre)²)` at `st`'s last [`Self::precondition`].
     pub fn dir_obj(
         &self,
         ctx: &ExecutionContext,
         st: &LsqmlScan,
-        sums: &mut UpdateSums,
+        num: &mut DeviceBuffer<C32>,
     ) -> Result<(), Error> {
         let n = st.dims.obj_len();
-        sums.check(n)?;
+        check_len("num", num, n)?;
         let config = grid_1d(n)?;
         let n = to_u32(n)?;
         let reads = [st.pre.storage(), st.pre_max.storage()];
-        self.base
-            .launch(ctx, &reads, &[sums.num.storage()], |stream| {
-                // SAFETY: `sums` and `st.pre` hold the object's `n` values.
-                unsafe {
-                    self.module.lsqml_dir_obj(
-                        stream,
-                        config,
-                        dptr(&sums.num),
-                        dptr::<f32, f32>(&st.pre).cast_const(),
-                        dptr::<u32, u32>(&st.pre_max).cast_const(),
-                        n,
-                    )
-                }
-            })
+        self.base.launch(ctx, &reads, &[num.storage()], |stream| {
+            // SAFETY: `num` and `st.pre` hold the object's `n` values.
+            unsafe {
+                self.module.lsqml_dir_obj(
+                    stream,
+                    config,
+                    dptr(num),
+                    dptr::<f32, f32>(&st.pre).cast_const(),
+                    dptr::<u32, u32>(&st.pre_max).cast_const(),
+                    n,
+                )
+            }
+        })
     }
 
     /// The step-size sums of the stack's frames into `st` from its exit-wave update `chi`;
@@ -687,8 +702,8 @@ impl LsqmlKernels {
         reads.extend(at.x.into_iter().chain(at.d).map(|b| b.storage()));
         let probe = match &chi {
             LsqmlChi::Own { own, .. } => {
-                reads.push(own.planes.storage());
-                own.src(at.x[1], d.n())?
+                reads.push(own.planes().storage());
+                own.src(at.x[1], stack, d.n())?
             }
             _ => shared_src(at.x[1]),
         };
@@ -896,7 +911,7 @@ impl LsqmlKernels {
         self.apply(ctx, obj, lens(&st.dims)[0], (&steps.step, 0))
     }
 
-    /// `x += s num` over `var`'s `n` values, `s` the float `at` of `step`; consumes the sums.
+    /// `x += s num` over `var`'s `n` values, `s` the float `at` of `step`; consumes `num`.
     fn apply(
         &self,
         ctx: &ExecutionContext,
@@ -905,20 +920,16 @@ impl LsqmlKernels {
         (step, at): (&DeviceBuffer<f32>, usize),
     ) -> Result<(), Error> {
         check_len("x", var.x, n)?;
-        var.sums.check(n)?;
+        check_len("num", var.num, n)?;
         let config = grid_1d(n)?;
         let n = to_u32(n)?;
         let s = dptr::<f32, f32>(step).wrapping_add(at).cast_const();
-        let writes = [
-            var.x.storage(),
-            var.sums.num.storage(),
-            var.sums.den.storage(),
-        ];
+        let writes = [var.x.storage(), var.num.storage()];
         self.base.launch(ctx, &[step.storage()], &writes, |stream| {
             // SAFETY: lengths checked above; `step` holds more than `at` floats.
             unsafe {
                 self.module
-                    .lsqml_update(stream, config, dptr(var.x), var.sums.ptrs(), n, s)
+                    .lsqml_update(stream, config, dptr(var.x), dptr(var.num), n, s)
             }
         })
     }
@@ -1002,7 +1013,7 @@ fn null_ptrs() -> FusedPtrs {
         background: std::ptr::null(),
         background_ratio: std::ptr::null_mut(),
         offsets: std::ptr::null(),
-        spectrum: std::ptr::null(),
+        spectrum: shared_probe(std::ptr::null()),
         shift: std::ptr::null_mut(),
         shift_obj: std::ptr::null_mut(),
         shift_power: std::ptr::null_mut(),

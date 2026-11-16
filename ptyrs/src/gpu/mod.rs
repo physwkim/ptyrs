@@ -51,21 +51,23 @@ pub use bh::{
     BhScan, BhSecondRef, BhTangentsMut, BhVar, BhWinRef, BhWinSecond, EpochOrder,
 };
 pub use fused::{
-    BackgroundSums, Exit, FUSED_SIDES, FarSums, FusedBufs, FusedInputs, FusedSums, Model,
-    ProbeSpectrum, PsiSums, Shift, ShiftProbe, ShiftSums, ShiftedProbeSums, SpectrumBuf,
+    BackgroundSums, Exit, FUSED_SIDES, FarSums, FrameMoves, FusedBufs, FusedInputs, FusedSums,
+    Model, OwnSpectrumBuf, ProbeSpectrum, PsiSums, Shift, ShiftProbe, ShiftSums, ShiftedNumSums,
+    ShiftedProbes, ShiftedStepSums, ShiftedSums, SpectrumBuf,
 };
 pub use grad::{
     CG_BLOCKS, GAMMA_CHUNK, GammaCounts, GammaStacks, GradKernels, ObjProbeScale, StackWindows,
     gamma_parts,
 };
 pub use lsqml::{
-    LSQML_REC, LsqmlAt, LsqmlChi, LsqmlKernels, LsqmlNoise, LsqmlScan, LsqmlVar, SliceSteps,
+    FrameDirs, LSQML_REC, LsqmlAt, LsqmlChi, LsqmlKernels, LsqmlNoise, LsqmlScan, LsqmlVar,
+    SliceSteps,
 };
-pub use opr::{Opr, OprKernels, OprPlanes};
+pub use opr::{FrameProbe, Opr, OprKernels, OprPlanes, OprShape, OwnModes};
 pub use ops::{
-    LLK_TREE_LEAVES, LlkPartial, LlkScratch, LlkSums, MASKED, OBJ_TILE, Permutation,
-    PositionPartial, ScalePartial, StackCtl, StackGeom, StackRef, StackTable, UpdateSums, ViewAddr,
-    ViewDims, Views, view_tiles,
+    DeviceStackTable, LLK_TREE_LEAVES, LlkPartial, LlkScratch, LlkSums, MASKED, OBJ_TILE,
+    Permutation, PositionPartial, ScalePartial, StackCtl, StackGeom, StackRef, StackTable,
+    SumTarget, Sums, UpdateSums, ViewAddr, ViewDims, Views, view_tiles,
 };
 pub use optics::{
     BandCarry, BandedTransfer, ExitPass, ExitStage, FrameWaves, OpticsKernels, SlicePhase,
@@ -191,6 +193,38 @@ pub fn lease(
     writes: &[&RawDeviceBuffer],
 ) -> Result<(), Error> {
     Ok(crate::fft::lease(ctx, reads, writes)?)
+}
+
+/// Copies `src` into `dst`, of the same length, on `ctx`'s stream (a memcpy node under
+/// capture), leased like a launch.
+pub fn copy<T: DeviceCopy>(
+    ctx: &ExecutionContext,
+    src: &DeviceBuffer<T>,
+    dst: &mut DeviceBuffer<T>,
+) -> Result<(), Error> {
+    if src.len() != dst.len() {
+        return Err(Error::Shape(format!(
+            "a copy of {} values into {}",
+            src.len(),
+            dst.len()
+        )));
+    }
+    if src.num_bytes() == 0 {
+        return Ok(());
+    }
+    lease(ctx, &[src.storage()], &[dst.storage()])?;
+    ctx.context().bind_to_thread()?;
+    // SAFETY: both ranges are whole allocations of equal size, `src` leased for reading and
+    // `dst`, a distinct buffer as `&mut` makes it, for writing on this stream.
+    unsafe {
+        cuda_core::memory::memcpy_dtod_async(
+            dst.cu_deviceptr(),
+            src.cu_deviceptr(),
+            src.num_bytes(),
+            ctx.get_cuda_stream().cu_stream(),
+        )?
+    };
+    Ok(())
 }
 
 /// Zeroes `buf` on `ctx`'s stream (a memset node under capture), leased like a launch.

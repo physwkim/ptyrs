@@ -39,7 +39,7 @@ fn positions(pattern: &str) -> Result<Positions, Box<dyn Error>> {
 fn obj_shape(pos: &Positions) -> [usize; 2] {
     let g = geometry();
     let pixel = g.pixel_size_object();
-    required_obj_shape(&pos.pynx_preprocess(pixel), pixel, g.frame, 4)
+    required_obj_shape(&pos.pynx_preprocess(pixel), pixel, g.frame.sides(), 4)
 }
 
 fn counts_path(dir: &Path, pattern: &str) -> PathBuf {
@@ -93,7 +93,14 @@ fn run(dir: &Path, pattern: &str, args: &[String]) -> Result<(), Box<dyn Error>>
     let pixel = g.pixel_size_object();
     let pos = positions(pattern)?;
     let shape = obj_shape(&pos);
-    let addr = AddrTable::new(&pos.pynx_preprocess(pixel), pixel, g.frame, shape, NMODE, 1)?;
+    let addr = AddrTable::new(
+        &pos.pynx_preprocess(pixel),
+        pixel,
+        g.frame.sides(),
+        shape,
+        NMODE,
+        1,
+    )?;
     let counts: Vec<u16> = std::fs::read(counts_path(dir, pattern))?
         .as_chunks::<2>()
         .0
@@ -101,7 +108,7 @@ fn run(dir: &Path, pattern: &str, args: &[String]) -> Result<(), Box<dyn Error>>
         .map(|b| u16::from_le_bytes(*b))
         .collect();
     // Flat object; truth probe scaled so the calculated photons match the observed.
-    let probe = sim::probe(g.frame, NMODE)?;
+    let probe = sim::probe(g.frame.sides(), NMODE)?;
     let p2: f64 = probe.as_slice().iter().map(C64::norm_sqr).sum();
     let total: f64 = counts.iter().map(|&c| f64::from(c)).sum();
     let s = (total / (addr.nframe() as f64 * p2)).sqrt();

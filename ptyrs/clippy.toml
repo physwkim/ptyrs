@@ -1,6 +1,7 @@
 # In live, every graph is captured through ptyrs::live::graph::LiveGraph::capture,
 # which counts it: a capture during a measurement breaks it (DESIGN.md §5 inv. 9).
 # Burn's CUDA devices come from ptyrs::nn::cuda, which roots cubecl's caches first.
+# nn's kernels launch on ptyrs::nn::grid::grid, which keeps a grid within the device's limits.
 # Cargo.toml allows the lint; the live and nn modules and their binaries, examples
 # and tests warn on it again.
 disallowed-methods = [
@@ -13,4 +14,7 @@ disallowed-methods = [
     { path = "cuda_bindings::cuGraphInstantiateWithFlags", reason = "capture through LiveGraph::capture, which counts it" },
     { path = "cuda_bindings::cuGraphInstantiateWithParams", reason = "capture through LiveGraph::capture, which counts it" },
     { path = "burn_tensor::Device::cuda", reason = "name CUDA devices through ptyrs::nn::cuda, which roots cubecl's caches first" },
+    { path = "cubecl_runtime::server::CubeCount::new_1d", reason = "launch nn kernels on ptyrs::nn::grid::grid, which keeps the grid within the device's limits" },
+    { path = "cubecl_runtime::server::CubeCount::new_2d", reason = "launch nn kernels on ptyrs::nn::grid::grid, which keeps the grid within the device's limits" },
+    { path = "cubecl_runtime::server::CubeCount::new_3d", reason = "launch nn kernels on ptyrs::nn::grid::grid, which keeps the grid within the device's limits" },
 ]

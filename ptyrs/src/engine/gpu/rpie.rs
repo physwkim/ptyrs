@@ -7,7 +7,7 @@ use crate::gpu::sampling::{Modes, StackPoints, WindowBlock, window_views};
 use crate::gpu::{
     C32, EpochOrder, Error as GpuError, FrameWaves, FusedBufs, FusedInputs, Kernels, Model,
     PositionRule, PositionStep, PowerMax, PsiSums, RpieKernels, ShiftProbe, SliceSource, Solve,
-    UpdateSums, Views, Weight,
+    Views, Weight,
 };
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaStream, DeviceBuffer};
@@ -79,12 +79,12 @@ enum RpieRead {
 }
 
 /// rPIE's windows under [`Sampling::FullObject`]: the views over its batches' windows, a
-/// batch's windows `[nobj, nf_max, ny, nx]`, the views' object, and the object's sums over the
-/// windows.
+/// batch's windows `[nobj, nf_max, ny, nx]`, the views' object, and the object's numerator
+/// over the windows.
 struct RpieWindows {
     views: Views,
     win: DeviceBuffer<C32>,
-    sums: UpdateSums,
+    patches: DeviceBuffer<C32>,
 }
 
 impl RpieMoved {
@@ -109,7 +109,7 @@ impl RpieMoved {
                 let len = views.dims().obj_len();
                 RpieRead::FullObject(Box::new(RpieWindows {
                     win: DeviceBuffer::zeroed(stream, len)?,
-                    sums: UpdateSums::zeroed(stream, len)?,
+                    patches: DeviceBuffer::zeroed(stream, len)?,
                     views,
                 }))
             }
@@ -298,7 +298,7 @@ impl<'a> Bufs<'a> {
                     };
                     rk.weight(ctx, rb.dlt, &m.w[0], rb.pmax, rb.psi, spec)?;
                     let sums = PsiSums {
-                        obj: Some(&mut *self.obj_sums),
+                        obj: Some(&mut self.obj_sums.num),
                         probe: None,
                     };
                     let inputs = moved_inputs(&base, moved_shift(m.pos, m.spectrum));
@@ -306,7 +306,14 @@ impl<'a> Bufs<'a> {
                 }
                 None => {
                     rb.ptilde(ctx, l, self.probe, params.obj_alpha)?;
-                    k.psi_to_obj(ctx, self.views, stack, rb.dlt, rb.ptilde, self.obj_sums)?;
+                    k.psi_to_obj(
+                        ctx,
+                        self.views,
+                        stack,
+                        rb.dlt,
+                        rb.ptilde,
+                        &mut self.obj_sums.num,
+                    )?;
                 }
             }
         }
@@ -317,15 +324,20 @@ impl<'a> Bufs<'a> {
                 Some(m) => {
                     let sums = PsiSums {
                         obj: None,
-                        probe: Some(ShiftProbe::Sums(&mut *m.probe_sums)),
+                        probe: Some(ShiftProbe::Num(&mut *m.probe_sums)),
                     };
                     let inputs = moved_inputs(&base, moved_shift(m.pos, m.spectrum));
                     k.shifted_psi_sums(ctx, &inputs, stack, rb.dlt, m.fused, sums)?;
-                    k.shifted_probe_sums(ctx, &dims, m.probe_sums, self.probe_sums)?;
+                    k.shifted_probe_sums(ctx, &dims, m.probe_sums, &mut self.probe_sums.num)?;
                 }
-                None => {
-                    k.psi_to_probe(ctx, self.views, stack, rb.dlt, self.obj, self.probe_sums)?
-                }
+                None => k.psi_to_probe(
+                    ctx,
+                    self.views,
+                    stack,
+                    rb.dlt,
+                    self.obj,
+                    &mut self.probe_sums.num,
+                )?,
             }
         }
         // The offsets' step reads neither array, so it may precede their steps, which end
@@ -376,10 +388,9 @@ impl<'a> Bufs<'a> {
         rb.delta(ctx, l, b)?;
         if params.obj_step.is_some() {
             rb.ptilde(ctx, l, self.probe, params.obj_alpha)?;
-            crate::gpu::zero(ctx, &mut w.sums.num)?;
-            crate::gpu::zero(ctx, &mut w.sums.den)?;
-            (l.k).psi_to_obj(ctx, &w.views, stack, rb.dlt, rb.ptilde, &mut w.sums)?;
-            m.place(ctx, self.views, stack, &w.sums.num, &mut self.obj_sums.num)?;
+            crate::gpu::zero(ctx, &mut w.patches)?;
+            (l.k).psi_to_obj(ctx, &w.views, stack, rb.dlt, rb.ptilde, &mut w.patches)?;
+            m.place(ctx, self.views, stack, &w.patches, &mut self.obj_sums.num)?;
         }
         let Some(PositionLent::FullObject(s)) = lend.lend(&mut self.features)? else {
             return Err(another_model());
@@ -404,7 +415,14 @@ impl<'a> Bufs<'a> {
         }
         if params.probe_step.is_some() {
             rb.probe_weight(ctx, l, b, (&w.views, &w.win), params.probe_alpha)?;
-            (l.k).psi_to_probe(ctx, &w.views, stack, rb.dlt, &w.win, self.probe_sums)?;
+            (l.k).psi_to_probe(
+                ctx,
+                &w.views,
+                stack,
+                rb.dlt,
+                &w.win,
+                &mut self.probe_sums.num,
+            )?;
         }
         if let Some(step) = step {
             let solve = solve(self.exit.scale);
@@ -424,11 +442,17 @@ impl<'a> Bufs<'a> {
     ) -> Result<(), GpuError> {
         let rk = self.rpie;
         if let Some(step) = params.obj_step {
-            rk.step(ctx, self.obj, self.obj_sums, self.obj_len, step as f32)?;
+            rk.step(
+                ctx,
+                self.obj,
+                &mut self.obj_sums.num,
+                self.obj_len,
+                step as f32,
+            )?;
         }
         if let Some(step) = params.probe_step {
             let s = (step / nf as f64) as f32;
-            rk.step(ctx, self.probe, self.probe_sums, self.probe_len, s)?;
+            rk.step(ctx, self.probe, &mut self.probe_sums.num, self.probe_len, s)?;
         }
         Ok(())
     }

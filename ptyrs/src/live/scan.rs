@@ -19,44 +19,125 @@
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
+use crate::base::Frame;
 use crate::gpu::{C32, Kernels, StackRef, UpdateSums, ViewAddr, ViewDims, Views, view_tiles};
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{DeviceBuffer, Stream};
 
-use crate::live::fill::Fill;
 use crate::live::grow::{Backer, GrowError, GrowTable};
 use crate::live::object::{LiveObject, ObjectBacker};
 use crate::live::stack::LiveFrames;
 
-/// A scan's geometry with the object sized from the largest view offset.
+/// A scan's geometry with the object sized from the largest view offset,
+/// made by [`Self::new`] only, so its [`Self::dims`] pass
+/// `ViewDims::check`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ScanShape {
-    pub nframe: u32,
-    /// Views per frame.
-    pub nmode: u32,
-    pub nprobe: u32,
-    pub nobj: u32,
-    /// `[ny, nx]`, both even.
-    pub frame: [u32; 2],
-    /// The largest `[oy, ox]` a view may have.
-    pub reach: [u32; 2],
-    pub quad_phase: f32,
+    frame: Frame,
+    reach: [u32; 2],
+    dims: ViewDims,
 }
 
 impl ScanShape {
-    /// The views' geometry. The object ends one pixel past the farthest
-    /// frame, so a view at `reach` with a fractional offset still reads
-    /// inside it and no view wraps.
+    /// `nframe` frames of `nprobe · nobj` views each over a `frame` that
+    /// [`Frame::new`] takes, the largest view offset `[oy, ox]` being
+    /// `reach`. The object ends one pixel past the farthest frame, so a view
+    /// at `reach` with a fractional offset still reads inside it and no view
+    /// wraps. Refuses what `ViewDims::check` does, a mode count or object
+    /// side past `u32` and an object whose pixels pass `usize` bytes.
+    pub fn new(
+        nframe: u32,
+        nprobe: u32,
+        nobj: u32,
+        frame: [usize; 2],
+        reach: [u32; 2],
+        quad_phase: f32,
+    ) -> Result<Self, crate::gpu::Error> {
+        let frame = Frame::new(frame).map_err(|e| crate::gpu::Error::Shape(e.to_string()))?;
+        let past = || {
+            crate::gpu::Error::Shape(format!(
+                "{nprobe} x {nobj} modes, frame {frame:?} or reach {reach:?} pass u32"
+            ))
+        };
+        let side = |a: usize| u32::try_from(frame[a]).map_err(|_| past());
+        let frame32 = [side(0)?, side(1)?];
+        let obj = |a: usize| {
+            (reach[a].checked_add(frame32[a]))
+                .and_then(|n| n.checked_add(1))
+                .ok_or_else(past)
+        };
+        let dims = ViewDims {
+            nframe,
+            nmode: nprobe.checked_mul(nobj).ok_or_else(past)?,
+            nprobe,
+            nobj,
+            frame: frame32,
+            obj: [obj(0)?, obj(1)?],
+            quad_phase,
+        };
+        dims.check()?;
+        let [nyo, nxo] = dims.obj.map(|n| n as usize);
+        (nyo.checked_mul(nxo))
+            .and_then(|plane| plane.checked_mul(nobj as usize))
+            .and_then(|len| len.checked_mul(size_of::<C32>()))
+            .ok_or_else(|| {
+                crate::gpu::Error::Shape(format!(
+                    "{nobj} object planes of {:?} pass usize bytes",
+                    dims.obj
+                ))
+            })?;
+        Ok(Self { frame, reach, dims })
+    }
+
+    /// `self` over `nframe` frames.
+    pub fn with_nframe(&self, nframe: u32) -> Result<Self, crate::gpu::Error> {
+        let d = self.dims;
+        let frame = self.frame.sides();
+        Self::new(nframe, d.nprobe, d.nobj, frame, self.reach, d.quad_phase)
+    }
+
+    /// `self` with the largest view offset `reach`.
+    pub fn with_reach(&self, reach: [u32; 2]) -> Result<Self, crate::gpu::Error> {
+        let d = self.dims;
+        let frame = self.frame.sides();
+        Self::new(d.nframe, d.nprobe, d.nobj, frame, reach, d.quad_phase)
+    }
+
+    pub fn nframe(&self) -> u32 {
+        self.dims.nframe
+    }
+
+    /// Views per frame.
+    pub fn nmode(&self) -> u32 {
+        self.dims.nmode
+    }
+
+    pub fn nprobe(&self) -> u32 {
+        self.dims.nprobe
+    }
+
+    pub fn nobj(&self) -> u32 {
+        self.dims.nobj
+    }
+
+    pub fn frame(&self) -> Frame {
+        self.frame
+    }
+
+    /// The largest `[oy, ox]` a view may have.
+    pub fn reach(&self) -> [u32; 2] {
+        self.reach
+    }
+
+    /// The views' geometry.
     pub fn dims(&self) -> ViewDims {
-        ViewDims {
-            nframe: self.nframe,
-            nmode: self.nmode,
-            nprobe: self.nprobe,
-            nobj: self.nobj,
-            frame: self.frame,
-            obj: [0, 1].map(|a| self.reach[a] + self.frame[a] + 1),
-            quad_phase: self.quad_phase,
-        }
+        self.dims
+    }
+
+    /// Pixels of the object, `nobj · nyo · nxo`, in range by construction.
+    pub fn pixels(&self) -> usize {
+        let [nyo, nxo] = self.dims.obj.map(|n| n as usize);
+        self.dims.nobj as usize * nyo * nxo
     }
 
     /// The most of `views` that touch one object tile: the smallest slab
@@ -193,18 +274,6 @@ pub(crate) fn off_view(d: &ViewDims, frame: &[ViewAddr]) -> Option<ViewAddr> {
         d.check_view(v).is_err() || v.probe != m % np || v.obj != m / np || at(v) != at(&frame[0])
     };
     (0..).zip(frame).find(off).map(|(_, &view)| view)
-}
-
-/// Whether a [`Fill`] can be written to an object of `d`: it has one mode.
-pub(crate) fn one_object_mode(d: &ViewDims) -> Result<(), GrowError> {
-    if d.nobj != 1 {
-        return Err(crate::gpu::Error::Shape(format!(
-            "a fill holds one object mode, the object has {}",
-            d.nobj
-        ))
-        .into());
-    }
-    Ok(())
 }
 
 /// Backs a [`LiveScan`]'s memory for frames ahead of [`LiveScan::push`],
@@ -404,18 +473,6 @@ impl LiveScan {
         landed
     }
 
-    /// Queues `fill` onto the object on the scan's stream
-    /// ([`LiveObject::write_fill`]), `origin` the object pixel of the scan's
-    /// pixel `(0, 0)`, `[0, 0]` unless the scan is a window of a larger
-    /// one; returns the fill's pixels on this scan's own tiles that were
-    /// not ready, 0 for the fill of a batch [`Self::push`] has landed
-    /// whole. A fill holds one object mode's values, so a scan of more is
-    /// refused untouched.
-    pub fn fill(&mut self, fill: Fill, origin: [usize; 2]) -> Result<usize, GrowError> {
-        one_object_mode(&self.dims)?;
-        self.obj.write_fill(fill, origin)
-    }
-
     /// Queues on `ctx`'s stream, or records into its capture, the step of
     /// the stack entry onto the next landed frames and the binning of their
     /// views; the stack kernels recorded after it take [`Self::stack`].
@@ -497,15 +554,29 @@ mod tests {
     use crate::live::graph::LiveGraph;
 
     fn shape(nframe: u32, reach: [u32; 2]) -> ScanShape {
-        ScanShape {
-            nframe,
-            nmode: 2,
-            nprobe: 2,
-            nobj: 1,
-            frame: [8, 8],
-            reach,
-            quad_phase: 0.0,
+        modes(nframe, 1, reach)
+    }
+
+    /// [`shape`] with `nobj` object modes.
+    fn modes(nframe: u32, nobj: u32, reach: [u32; 2]) -> ScanShape {
+        ScanShape::new(nframe, 2, nobj, [8, 8], reach, 0.0).unwrap()
+    }
+
+    /// One shape per range `new` checks past what [`ViewDims::check`] does.
+    #[test]
+    fn new_refuses_sizes_past_their_ranges() {
+        let tall = 65535 * OBJ_TILE - 3;
+        for ((nprobe, nobj, frame, reach), want) in [
+            ((1, 1, [7, 8], [0, 0]), "must be even"),
+            ((1, 1, [1 << 33, 2], [0, 0]), "pass u32"),
+            ((1, 1, [8, 8], [u32::MAX - 8, 0]), "pass u32"),
+            ((1 << 16, 1 << 16, [8, 8], [0, 0]), "pass u32"),
+            ((1, 65535, [2, 2], [tall, u32::MAX - 3]), "pass usize bytes"),
+        ] {
+            let e = ScanShape::new(1, nprobe, nobj, frame, reach, 0.0).unwrap_err();
+            assert!(e.to_string().contains(want), "{frame:?} {reach:?}: {e}");
         }
+        assert_eq!(modes(1, 2, [0, 3]).pixels(), 2 * 9 * 12);
     }
 
     /// Both probe modes of frame `f` at one raster position, with
@@ -828,46 +899,6 @@ mod tests {
             assert_eq!(scan.closed(), Some(Refusal::View { frame: 1, view }));
             assert_eq!((scan.landed(), scan.lost()), (1, 2));
         }
-    }
-
-    /// A fill holds one object mode: a scan of two refuses it, and its
-    /// pixels stay what they were.
-    #[test]
-    fn a_scan_of_two_object_modes_refuses_a_fill() {
-        use crate::live::fill::PatchFill;
-        use crate::live::object::Snapshot;
-
-        let ctx = Context::new(0).expect("GPU 0");
-        let s = ctx.new_stream().unwrap();
-        let one = NonZeroU32::new(1).unwrap();
-        let (flat, v) = ([0.75f32, -0.5], [3.0f32, 2.0]);
-        let run = |nobj: u32| {
-            let sh = ScanShape {
-                nmode: 2 * nobj,
-                nobj,
-                ..shape(3, [16, 16])
-            };
-            let mut scan = LiveScan::new(&s, &sh, one, 64, flat, 1).unwrap();
-            let [a, b] = raster(0, [16, 16]);
-            let frame: Vec<ViewAddr> = (0..nobj)
-                .flat_map(|obj| [ViewAddr { obj, ..a }, ViewAddr { obj, ..b }])
-                .collect();
-            let mut backer = scan.backer();
-            assert_eq!(push(&mut scan, &mut backer, &frame).unwrap(), 1);
-            let [ny, nx] = scan.dims().obj.map(|n| n as usize);
-            let mut pf = PatchFill::new(&ctx, [ny, nx], [4, 4], 1, 1).unwrap();
-            let fill = pf.stitch(&[[a.oy + 2, a.ox + 2]], &[v; 16]).unwrap();
-            let got = scan.fill(fill, [0, 0]);
-            let mut snap = Snapshot::new(scan.obj()).unwrap();
-            scan.obj().snapshot(&mut snap).unwrap();
-            let moved = snap.wait().unwrap().iter().filter(|&&p| p != flat).count();
-            (got, moved, scan.obj().fill_copies())
-        };
-        let (got, moved, copies) = run(2);
-        assert!(matches!(got, Err(GrowError::Gpu(_))), "{got:?}");
-        assert_eq!((moved, copies), (0, 0));
-        let (got, moved, copies) = run(1);
-        assert_eq!((got.unwrap(), moved, copies), (0, 16, 1));
     }
 
     /// A plan backed before the first frame maps what backing its frames as

@@ -11,7 +11,7 @@ use std::f64::consts::PI;
 use std::sync::Arc;
 
 use burn::nn::PaddingConfig2d;
-use burn::nn::conv::{Conv2d, Conv2dConfig};
+use burn::nn::conv::Conv2dConfig;
 use burn::optim::{AdamConfig, GradientsParams, ModuleOptimizer};
 use burn::prelude::*;
 use burn::tensor::DType;
@@ -25,8 +25,9 @@ use rand_chacha::ChaCha8Rng;
 use crate::base::{C64, Object, Probe, Scan, Stack};
 use crate::engine::{EngineError, GpuOptions, GpuPtycho};
 use crate::nn::NnError;
+use crate::nn::conv::Conv;
 use crate::nn::interop::{lend_complex, lend_out_complex};
-use crate::nn::ptychonn::Block;
+use crate::nn::ptychonn::{Block, channels_first};
 
 /// Shape of a DIP network.
 #[derive(Config, Debug)]
@@ -62,7 +63,7 @@ pub struct DipNet {
     down: Vec<Block>,
     bottom: Block,
     up: Vec<Block>,
-    out: Conv2d,
+    out: Conv,
     shape: [usize; 2],
 }
 
@@ -82,7 +83,8 @@ impl DipNet {
             .collect();
         let out = Conv2dConfig::new([w(0), 2], [3, 3])
             .with_padding(PaddingConfig2d::Same)
-            .init(device);
+            .init(device)
+            .into();
         Self {
             down,
             bottom: Block::new(top, top, device),
@@ -92,21 +94,25 @@ impl DipNet {
         }
     }
 
-    fn raw(&self, mut x: Tensor<4>) -> Tensor<4> {
+    /// The raw channels-last `[1, h, w, 2]` of `code`, `[1, channels, h, w]`.
+    fn raw(&self, code: Tensor<4>) -> Tensor<4> {
+        let mut x = code.permute([0, 2, 3, 1]);
         let mut skips = Vec::with_capacity(self.down.len());
         for b in &self.down {
             let s = b.forward(x);
-            x = max_pool2d(s.clone(), MaxPoolOptions::new([2, 2]));
+            x = channels_first(s.clone(), |s| max_pool2d(s, MaxPoolOptions::new([2, 2])));
             skips.push(s);
         }
         x = self.bottom.forward(x);
         for (b, s) in self.up.iter().zip(skips).rev() {
-            let [_, _, h, w] = s.dims();
-            let x_up = interpolate(
-                x,
-                InterpolateOptions::new(InterpolateMode::Nearest).with_output_size([h, w]),
-            );
-            x = b.forward(Tensor::cat(vec![x_up, s], 1));
+            let [_, h, w, _] = s.dims();
+            let x_up = channels_first(x, |x| {
+                interpolate(
+                    x,
+                    InterpolateOptions::new(InterpolateMode::Nearest).with_output_size([h, w]),
+                )
+            });
+            x = b.forward(Tensor::cat(vec![x_up, s], 3));
         }
         self.out.forward(x)
     }
@@ -119,11 +125,11 @@ impl Prior for DipNet {
         // 2·sigmoid(x), as 1 + tanh(x/2): burn's sigmoid computes in f32 whatever the dtype.
         let amp = tanh(
             raw.clone()
-                .slice([0..1, 0..1, 0..ny, 0..nx])
+                .slice([0..1, 0..ny, 0..nx, 0..1])
                 .reshape([ny, nx])
                 * 0.5,
         ) + 1.0;
-        let phase = tanh(raw.slice([0..1, 1..2, 0..ny, 0..nx]).reshape([ny, nx])) * PI;
+        let phase = tanh(raw.slice([0..1, 0..ny, 0..nx, 1..2]).reshape([ny, nx])) * PI;
         Tensor::stack(
             vec![amp.clone() * phase.clone().cos(), amp * phase.sin()],
             2,

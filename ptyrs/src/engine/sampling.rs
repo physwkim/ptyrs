@@ -23,6 +23,11 @@ use crate::engine::{Fft2, Optics};
 /// `fftfreq` of the object plane, a sample past the plane's edge wrapping. Its adjoint embeds
 /// a patch at the plane's origin, applies the conjugate phase in the spectrum and sums over
 /// the views before one inverse transform per plane.
+///
+/// The transforms run at the object's exact shape: a side with a prime factor above 7 takes
+/// the slow prime-size FFT (a GPU DM cycle at 404² costs 1.7 times one at 420²), so a caller
+/// who picks the shape should take sides whose prime factors are all at most 7. Padding the
+/// transform instead would turn the wrap above into a zero seam and change the model.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Sampling {
     #[default]

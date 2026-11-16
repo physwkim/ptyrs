@@ -10,8 +10,8 @@ use crate::base::{C64, Stack};
 use crate::gpu::sampling::{Modes, WindowBlock, window_views};
 use crate::gpu::{
     C32, CG_BLOCKS, Error as GpuError, Exit, FarSums, FusedBufs, FusedInputs, FusedSums,
-    GammaCounts, Kernels, Model, PositionKernels, RecordWriter, Shift, ShiftProbe, SpectrumBuf,
-    ViewDims, Views,
+    GammaCounts, Kernels, Model, PositionKernels, RecordWriter, Shift, ShiftProbe, ShiftedNumSums,
+    SpectrumBuf, ViewDims, Views,
 };
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaStream, DeviceBuffer};
@@ -198,15 +198,18 @@ impl Bufs<'_> {
         // β from the gradients in the sums and the last ones in h (then h = g), and d.
         let lens = [self.obj_len, self.probe_len];
         crate::gpu::zero(ctx, ml.parts)?;
-        for (i, g) in [&*self.obj_sums, &*self.probe_sums].into_iter().enumerate() {
+        for (i, g) in [&self.obj_sums.num, &self.probe_sums.num]
+            .into_iter()
+            .enumerate()
+        {
             if update[i] {
                 let first_pair = i as u32 * CG_BLOCKS;
                 self.grad
-                    .beta_parts(ctx, &g.num, &mut ml.h[i], lens[i], ml.parts, first_pair)?;
+                    .beta_parts(ctx, g, &mut ml.h[i], lens[i], ml.parts, first_pair)?;
             }
         }
         self.grad.sum_parts(ctx, ml.parts, 2 * CG_BLOCKS, ml.beta)?;
-        for (i, g) in [&mut *self.obj_sums, &mut *self.probe_sums]
+        for (i, g) in [&mut self.obj_sums.num, &mut self.probe_sums.num]
             .into_iter()
             .enumerate()
         {
@@ -424,9 +427,16 @@ impl Bufs<'_> {
         one: OneSlice,
     ) -> Result<(), GpuError> {
         let dims = *self.views.dims();
-        let mut m = (self.features)
-            .lend(ctx, self.kernels, &dims, self.obj, self.probe, self.exit)?
-            .one_slice(one);
+        let (m, shifted_sums) = (self.features).lend_shifted::<ShiftedNumSums>(
+            ctx,
+            self.kernels,
+            &dims,
+            self.obj,
+            self.probe,
+            self.exit,
+        )?;
+        let mut m = m.one_slice(one);
+        let mut shifted_sums = shifted_sums.filter(|_| update[1]);
         for s in 0..self.scratch.len() {
             fault::at(fault::Exit::MlStack)?;
             let stack = self.scratch.at(s);
@@ -445,8 +455,8 @@ impl Bufs<'_> {
                     ..FarSums::default()
                 };
                 let sums = FusedSums {
-                    obj: update[0].then(|| w.zeroed_sums(ctx)).transpose()?,
-                    probe: update[1].then_some(&mut *self.probe_sums),
+                    obj: update[0].then(|| w.zeroed_patches(ctx)).transpose()?,
+                    probe: update[1].then_some(&mut self.probe_sums.num),
                     ..FusedSums::default()
                 };
                 (self.kernels).fused_project(ctx, &inputs, stack, Exit::Grad { far }, f, sums)?;
@@ -472,9 +482,9 @@ impl Bufs<'_> {
             let exit = Exit::Grad { far };
             let shifted = m.shifted();
             let sums = FusedSums {
-                obj: update[0].then_some(&mut *self.obj_sums),
-                probe: (update[1] && !shifted).then_some(&mut *self.probe_sums),
-                shift: m.shift_sums(update[1].then_some(ShiftProbe::Sums as _), false),
+                obj: update[0].then_some(&mut self.obj_sums.num),
+                probe: (update[1] && !shifted).then_some(&mut self.probe_sums.num),
+                shift: m.shift_sums(shifted_sums.as_deref_mut().map(ShiftProbe::Num), false),
             };
             self.kernels
                 .fused_project(ctx, &inputs, stack, exit, f, sums)?;
@@ -482,8 +492,8 @@ impl Bufs<'_> {
                 rec.push(ctx, &dims, stack, self.llk)?;
             }
         }
-        if update[1] {
-            m.probe_sums(ctx, self.kernels, &dims, self.probe_sums)?;
+        if let Some(sums) = shifted_sums {
+            (self.kernels).shifted_probe_sums(ctx, &dims, sums, &mut self.probe_sums.num)?;
         }
         Ok(())
     }
@@ -515,12 +525,24 @@ impl Bufs<'_> {
             .poisson_grad(ctx, &dims, stack, self.counts, psi)?;
         plan.inverse_inplace(ctx, psi)?;
         if update[0] {
-            self.kernels
-                .psi_to_obj(ctx, self.views, stack, psi, self.probe, self.obj_sums)?;
+            self.kernels.psi_to_obj(
+                ctx,
+                self.views,
+                stack,
+                psi,
+                self.probe,
+                &mut self.obj_sums.num,
+            )?;
         }
         if update[1] {
-            self.kernels
-                .psi_to_probe(ctx, self.views, stack, psi, self.obj, self.probe_sums)?;
+            self.kernels.psi_to_probe(
+                ctx,
+                self.views,
+                stack,
+                psi,
+                self.obj,
+                &mut self.probe_sums.num,
+            )?;
         }
         Ok(())
     }

@@ -31,6 +31,7 @@ use crate::pixel::{
     psi_f32, psi_index, quad_phase, ramp, sample_obj, stack_frames, store_c, store_psi, zdiv,
     zsqrt,
 };
+use crate::position::BatchSpan;
 use crate::{FFT_EPT_MAX, fft_ept};
 
 /// [`rows_fwd`] builds the DM reflection `R = (2 - alpha) PO - (1 - alpha) psi` instead of
@@ -199,8 +200,9 @@ pub struct FusedPtrs {
     pub background_ratio: *mut f32,
     /// Each frame's probe shift `(dy, dx)` in pixels, `[nframe, 2]`.
     pub offsets: *const f32,
-    /// The probe spectra `A_p = DFT(stored(P_p q)) / n`, `[nprobe, ny, nx]`, FFT order.
-    pub spectrum: *const f32,
+    /// The probe spectra `A_p = DFT(stored(P_p q)) / n`, `[nprobe, ny, nx]`, FFT order, mode 0
+    /// by frame as [`ProbeSrc`] says.
+    pub spectrum: ProbeSrc,
     /// One plane per frame and probe mode, `fl * nprobe + p`, `[nf_max * nprobe, ny, nx]`:
     /// `T` of the shift passes.
     pub shift: *mut f32,
@@ -218,17 +220,16 @@ pub struct FusedPtrs {
     pub shift_den: *mut PositionPartial,
 }
 
-/// A probe `[nprobe, ny, nx]` whose mode 0 is each frame's own: plane `b` of `mode0` `[nb,
-/// ny, nx]` at epoch position `p0 + b`; [`shared_probe`] is the probe every frame shares. A
-/// position outside the run reads its last plane, since a device-side [`StackCtl`] may
-/// place a stack anywhere in the scan.
+/// A probe `[nprobe, ny, nx]` whose mode 0 is each frame's own: with `step` 1, plane `b` of
+/// `mode0` `[nb, ny, nx]` at epoch position `p0 + b`; [`shared_probe`] is the probe every
+/// frame shares, `step` 0.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct ProbeSrc {
     pub probe: *const f32,
     pub mode0: *const f32,
     pub p0: u32,
-    pub nb: u32,
+    pub step: u32,
 }
 
 /// `probe` shared by every frame, as [`ProbeSrc`].
@@ -238,7 +239,24 @@ pub fn shared_probe(probe: *const f32) -> ProbeSrc {
         probe,
         mode0: probe,
         p0: 0,
-        nb: 1,
+        step: 0,
+    }
+}
+
+/// The plane of `src`'s mode `m` at epoch position `pos`, planes of `n` pixels.
+///
+/// # Safety
+///
+/// `src` as [`ProbeSrc`] says, `m < nprobe`, and with `step` 1 `pos` in `p0 .. p0 + nb`.
+#[device]
+pub unsafe fn probe_plane(src: ProbeSrc, m: u32, pos: u32, n: usize) -> *const f32 {
+    unsafe {
+        if m == 0 {
+            let b = (pos - src.p0) * src.step;
+            src.mode0.add(2 * b as usize * n)
+        } else {
+            src.probe.add(2 * m as usize * n)
+        }
     }
 }
 
@@ -246,16 +264,38 @@ pub fn shared_probe(probe: *const f32) -> ProbeSrc {
 ///
 /// # Safety
 ///
-/// `src` as [`ProbeSrc`] says, `nb ≥ 1`, `m < nprobe`, `i < n`.
+/// As [`probe_plane`], and `i < n`.
 #[device]
 pub unsafe fn load_probe(src: ProbeSrc, m: u32, pos: u32, n: usize, i: usize) -> (f32, f32) {
-    unsafe {
-        if m == 0 {
-            let b = pos.wrapping_sub(src.p0).min(src.nb - 1);
-            load_c(src.mode0, b as usize * n + i)
-        } else {
-            load_c(src.probe, m as usize * n + i)
-        }
+    unsafe { load_c(probe_plane(src, m, pos, n), i) }
+}
+
+/// The probe source of a [`rows_fwd`] build. A type parameter rather than a [`ProbeSrc`] for
+/// every build: the shared probe's read must stay one indexed load, since the per-frame
+/// address of [`load_probe`] costs the f16 row kernels registers and blocks per SM.
+pub trait RowProbe: Copy {
+    /// Pixel `i` of mode `m` at the epoch position `pos()`, planes of `n` pixels. A source
+    /// the frame does not change never calls `pos`, so its build keeps no trace of it.
+    ///
+    /// # Safety
+    ///
+    /// The source holds mode `m`, at `pos()`, and `i < n`.
+    unsafe fn load(self, m: u32, pos: impl FnOnce() -> u32, n: usize, i: usize) -> (f32, f32);
+}
+
+/// A probe `[nprobe, ny, nx]` every frame shares.
+#[derive(Clone, Copy, Debug)]
+pub struct SharedProbe(pub *const f32);
+
+impl RowProbe for SharedProbe {
+    unsafe fn load(self, m: u32, _: impl FnOnce() -> u32, n: usize, i: usize) -> (f32, f32) {
+        unsafe { load_c(self.0, m as usize * n + i) }
+    }
+}
+
+impl RowProbe for ProbeSrc {
+    unsafe fn load(self, m: u32, pos: impl FnOnce() -> u32, n: usize, i: usize) -> (f32, f32) {
+        unsafe { load_probe(self, m, pos(), n, i) }
     }
 }
 
@@ -396,17 +436,17 @@ unsafe fn row_fft_at<const NX: u32, const INV: bool>(
 ///
 /// # Safety
 ///
-/// `NX == g.nx`; the buffers it reads and writes hold their shapes for `g`, `probe` as
-/// [`ProbeSrc`] says; `ctl` one entry; launch as above.
+/// `NX == g.nx`; the buffers it reads and writes hold their shapes for `g`, `probe` the
+/// stack's frames' modes; `ctl` one entry; launch as above.
 #[device]
-pub unsafe fn rows_fwd<const NX: u32, const HALF: bool>(
+pub unsafe fn rows_fwd<const NX: u32, const HALF: bool, P: RowProbe>(
     p: FusedPtrs,
-    probe: ProbeSrc,
+    probe: P,
     ctl: *const StackCtl,
     g: StackGeom,
     cfg: FusedCfg,
 ) {
-    unsafe { rows_fwd_with::<NX, false, HALF>(p, probe, ctl, g, cfg) }
+    unsafe { rows_fwd_with::<NX, false, HALF, P>(p, probe, ctl, g, cfg) }
 }
 
 /// [`rows_fwd`] with the shifted probe: `W_p = IDFT_x(T)` of the stored row of plane `fl *
@@ -424,13 +464,16 @@ pub unsafe fn shift_rows_fwd<const NX: u32, const HALF: bool>(
     g: StackGeom,
     cfg: FusedCfg,
 ) {
-    unsafe { rows_fwd_with::<NX, true, HALF>(p, shared_probe(p.probe), ctl, g, cfg) }
+    let probe = SharedProbe(core::ptr::null());
+    unsafe { rows_fwd_with::<NX, true, HALF, SharedProbe>(p, probe, ctl, g, cfg) }
 }
 
+/// [`rows_fwd`] with `P q` from `probe`, or under `SHIFT` [`shift_rows_fwd`], which reads no
+/// `probe`.
 #[device]
-unsafe fn rows_fwd_with<const NX: u32, const SHIFT: bool, const HALF: bool>(
+unsafe fn rows_fwd_with<const NX: u32, const SHIFT: bool, const HALF: bool, P: RowProbe>(
     p: FusedPtrs,
-    probe: ProbeSrc,
+    probe: P,
     ctl: *const StackCtl,
     g: StackGeom,
     cfg: FusedCfg,
@@ -474,7 +517,7 @@ unsafe fn rows_fwd_with<const NX: u32, const SHIFT: bool, const HALF: bool>(
                 cmul(o, (r[2 * i as usize], r[2 * i as usize + 1]))
             } else {
                 let at = (y * nx + x) as usize;
-                let pr = load_probe(probe, v.probe, f0 + kl / g.nmode, n, at);
+                let pr = probe.load(v.probe, || f0 + kl / g.nmode, n, at);
                 cmul(cmul(o, pr), quad_phase(g.quad, y, x, ny, nx))
             };
             if dm {
@@ -849,8 +892,8 @@ pub unsafe fn probe_terms(p: FusedPtrs, g: StackGeom) {
 /// `o * nprobe`). Each object pixel is owned by one thread, which reads and writes its sums
 /// only if its tile's run holds a view of the stack, as `kernels::psi_to_obj`; so the
 /// result does not depend on how frames are split into stacks. Reads the new waves,
-/// `probe_q`, `probe_power`, `views`; writes `sums`. A stack-tile launch, as
-/// `kernels::psi_to_obj`.
+/// `probe_q`, `probe_power`, `views`; writes `sums`, without `DEN` only `sums.num`. A
+/// stack-tile launch, as `kernels::psi_to_obj`.
 ///
 /// # Safety
 ///
@@ -858,7 +901,7 @@ pub unsafe fn probe_terms(p: FusedPtrs, g: StackGeom) {
 /// `probe_power` as [`probe_terms`] wrote them for this probe in place of `probe`; `shared`
 /// as `for_each_stack_tile` needs.
 #[device]
-pub unsafe fn gather<const HALF: bool>(
+pub unsafe fn gather<const HALF: bool, const DEN: bool>(
     p: FusedPtrs,
     tiles: TilePtrs,
     sums: SumPtrs,
@@ -867,7 +910,7 @@ pub unsafe fn gather<const HALF: bool>(
     g: StackGeom,
     cfg: FusedCfg,
 ) {
-    unsafe { gather_with::<false, HALF>(p, tiles, sums, shared, ctl, g, cfg) }
+    unsafe { gather_with::<false, HALF, DEN>(p, tiles, sums, shared, ctl, g, cfg) }
 }
 
 /// [`gather`] with the shifted probe: `c_(f, o)` is read from `shift_obj` and the
@@ -879,7 +922,7 @@ pub unsafe fn gather<const HALF: bool>(
 /// As [`gather`], with `shift_obj` and `shift_power` written for this stack in place of the
 /// new waves, `probe_q` and `probe_power`.
 #[device]
-pub unsafe fn gather_shifted(
+pub unsafe fn gather_shifted<const DEN: bool>(
     p: FusedPtrs,
     tiles: TilePtrs,
     sums: SumPtrs,
@@ -888,11 +931,11 @@ pub unsafe fn gather_shifted(
     g: StackGeom,
     cfg: FusedCfg,
 ) {
-    unsafe { gather_with::<true, false>(p, tiles, sums, shared, ctl, g, cfg) }
+    unsafe { gather_with::<true, false, DEN>(p, tiles, sums, shared, ctl, g, cfg) }
 }
 
 #[device]
-unsafe fn gather_with<const SHIFT: bool, const HALF: bool>(
+unsafe fn gather_with<const SHIFT: bool, const HALF: bool, const DEN: bool>(
     p: FusedPtrs,
     tiles: TilePtrs,
     sums: SumPtrs,
@@ -912,7 +955,7 @@ unsafe fn gather_with<const SHIFT: bool, const HALF: bool>(
         }
         let px = (iobj as usize * g.nyo as usize + y as usize) * g.nxo as usize + x as usize;
         let mut acc = load_c(sums.num, px);
-        let mut norm = *sums.den.add(px);
+        let mut norm = if DEN { *sums.den.add(px) } else { 0.0 };
         for j in lo..end {
             let k = *tiles.views.add(j as usize);
             let i = k.wrapping_sub(k0);
@@ -950,7 +993,9 @@ unsafe fn gather_with<const SHIFT: bool, const HALF: bool>(
             });
         }
         store_c(sums.num, px, acc);
-        *sums.den.add(px) = norm;
+        if DEN {
+            *sums.den.add(px) = norm;
+        }
     };
     unsafe { crate::for_each_stack_tile(p.views, tiles, shared, ctl, g, pixel) }
 }
@@ -969,8 +1014,8 @@ unsafe fn gather_with<const SHIFT: bool, const HALF: bool>(
 /// Each frame's column half of the shifted probe: `T[fl * nprobe + p, ys, kx] =
 /// IDFT_y(A_p e_f)` over `ky` for `f = f0 + fl` of grid row `blockIdx.y` ([`FUSED_DOWN`]),
 /// and under `FUSED_SHIFT_DEN` or `FUSED_SHIFT_POSITION` `T_y` the same of `A_p e_f (-2 pi
-/// i freq(ky, ny))` into `shift_adj`. Reads `offsets` and `spectrum`; writes `shift`, and
-/// `shift_adj` under those flags.
+/// i freq(ky, ny))` into `shift_adj`. Reads `offsets` and `spectrum`, mode 0 of frame `f`
+/// as [`ProbeSrc`] says; writes `shift`, and `shift_adj` under those flags.
 ///
 /// One 1D block of `nprobe * FUSED_COLS * tpf` threads mapped as [`cols`] maps modes, with
 /// probe modes for modes; grid `(nx / FUSED_COLS, nf_max)`; dynamic shared memory `8 * ny`
@@ -978,8 +1023,8 @@ unsafe fn gather_with<const SHIFT: bool, const HALF: bool>(
 ///
 /// # Safety
 ///
-/// `NY == g.ny`; `offsets`, `spectrum`, `shift` and under those flags `shift_adj` hold their
-/// shapes for `g`; `ctl` one entry; launch as above.
+/// `NY == g.ny`; `offsets`, `shift` and under those flags `shift_adj` hold their shapes for
+/// `g`, `spectrum` as [`ProbeSrc`] says; `ctl` one entry; launch as above.
 #[device]
 pub unsafe fn shift_pre<const NY: u32>(
     p: FusedPtrs,
@@ -1003,9 +1048,9 @@ pub unsafe fn shift_pre<const NY: u32>(
     let (b, bpb) = (pm * FUSED_COLS + c, g.nprobe * FUSED_COLS);
     let kx = thread::blockIdx_x() * FUSED_COLS + c;
     let plane = (fl * g.nprobe + pm) as usize * n;
-    let spectrum = pm as usize * n;
     let mut r = [0.0f32; 2 * FFT_EPT_MAX as usize];
     unsafe {
+        let spectrum = probe_plane(p.spectrum, pm, f0 + fl, n);
         let smem = DynamicSharedArray::<u8, 16>::get();
         let ey = smem.cast::<f32>();
         let fft_smem = smem.add(8 * ny as usize);
@@ -1024,7 +1069,7 @@ pub unsafe fn shift_pre<const NY: u32>(
             for i in 0..ept {
                 let ky = f + i * tpf;
                 let e = cmul(load_c(ey, ky as usize), ex);
-                let a = cmul(load_c(p.spectrum, spectrum + (ky * nx + kx) as usize), e);
+                let a = cmul(load_c(spectrum, (ky * nx + kx) as usize), e);
                 // `a (-i w)` with `w = 2 pi freq`.
                 let w = tau * freq(ky, ny);
                 r[2 * i as usize] = a.1 * w;
@@ -1043,7 +1088,7 @@ pub unsafe fn shift_pre<const NY: u32>(
         for i in 0..ept {
             let ky = f + i * tpf;
             let e = cmul(load_c(ey, ky as usize), ex);
-            let a = cmul(load_c(p.spectrum, spectrum + (ky * nx + kx) as usize), e);
+            let a = cmul(load_c(spectrum, (ky * nx + kx) as usize), e);
             r[2 * i as usize] = a.0;
             r[2 * i as usize + 1] = a.1;
         }
@@ -1553,15 +1598,20 @@ pub unsafe fn shift_post<const NY: u32>(
 /// and `sums.den[p, i] += |O_o(i)|^2` for natural pixel `i`, over the stack's frames `fl` in
 /// ascending order and, for the denominator, object modes `o` ascending within a frame, so
 /// that stacks taken in scan order give every pixel one sum whatever the split. Reads
-/// `shift_adj`, `views` and `obj`; writes `sums`. One thread per pixel of `[nprobe, ny,
-/// nx]`.
+/// `shift_adj`, `views` and `obj`; writes `sums`, without `DEN` only `sums.num`. One thread
+/// per pixel of `[nprobe, ny, nx]`.
 ///
 /// # Safety
 ///
 /// `shift_adj` holds [`shift_post`]'s `G` of this stack; `sums` `[nprobe, ny, nx]`; `views` and
 /// `obj` their shapes for `g`; `ctl` one entry.
 #[device]
-pub unsafe fn shift_probe_sums(p: FusedPtrs, sums: SumPtrs, ctl: *const StackCtl, g: StackGeom) {
+pub unsafe fn shift_probe_sums<const DEN: bool>(
+    p: FusedPtrs,
+    sums: SumPtrs,
+    ctl: *const StackCtl,
+    g: StackGeom,
+) {
     let (f0, nf) = unsafe { stack_frames(ctl, g) };
     let n = g.ny as usize * g.nx as usize;
     let t = crate::global_index();
@@ -1573,29 +1623,34 @@ pub unsafe fn shift_probe_sums(p: FusedPtrs, sums: SumPtrs, ctl: *const StackCtl
     let nprobe = g.nprobe as usize;
     unsafe {
         let mut a = load_c(sums.num, t);
-        let mut d = *sums.den.add(t);
+        let mut d = if DEN { *sums.den.add(t) } else { 0.0 };
         for fl in 0..nf {
             let u = load_c(p.shift_adj, (fl as usize * nprobe + pm as usize) * n + i);
             a = (a.0 + u.0, a.1 + u.1);
-            for o in 0..g.nmode / g.nprobe {
-                let v = *p
-                    .views
-                    .add(((f0 + fl) * g.nmode + o * g.nprobe + pm) as usize);
-                let vo = sample_obj(p.obj, v, y, x, g.nyo, g.nxo);
-                d += vo.0 * vo.0 + vo.1 * vo.1;
+            if DEN {
+                for o in 0..g.nmode / g.nprobe {
+                    let v = *p
+                        .views
+                        .add(((f0 + fl) * g.nmode + o * g.nprobe + pm) as usize);
+                    let vo = sample_obj(p.obj, v, y, x, g.nyo, g.nxo);
+                    d += vo.0 * vo.0 + vo.1 * vo.1;
+                }
             }
         }
         store_c(sums.num, t, a);
-        *sums.den.add(t) = d;
+        if DEN {
+            *sums.den.add(t) = d;
+        }
     }
 }
 
 /// The row half of the probe spectra: `spectrum[p, ys, :] = DFT_x(stored(P_p q)[ys, :])` for
-/// `p = blockIdx.y`. Grid `(ny / rows, nprobe)`, block and shared memory as [`rows_fwd`].
+/// plane `p = blockIdx.y` of `nplane`. Grid `(ny / rows, nplane)`, block and shared memory
+/// as [`rows_fwd`].
 ///
 /// # Safety
 ///
-/// `NX` is the frame's `nx`; `probe` and `spectrum` hold `[nprobe, ny, nx]`; launch as above.
+/// `NX` is the frame's `nx`; `probe` and `spectrum` hold `[nplane, ny, nx]`; launch as above.
 #[device]
 pub unsafe fn spectrum_rows<const NX: u32>(
     probe: *const f32,
@@ -1678,14 +1733,19 @@ pub unsafe fn shift_cols<const NY: u32>(buf: *mut f32, nx: u32, inverse: u32, sc
 /// The probe update from shifted sums whose `num` [`shift_cols`] has inverse-transformed
 /// along `y`: with `v = IDFT_x` of row `ys` of plane `p = blockIdx.y`, `out.num[p, y, x] +=
 /// conj(q) v / n` and `out.den[p, y, x] += sums.den[p, y, x]` at the natural pixel of stored
-/// `(ys, xs)`; then `sums` is zeroed there, consumed. Grid `(ny / rows, nprobe)`, block and
-/// shared memory as [`rows_fwd`].
+/// `(ys, xs)`; then `sums` is zeroed there, consumed. Without `DEN` neither `den` is read or
+/// written. Grid `(ny / rows, nprobe)`, block and shared memory as [`rows_fwd`].
 ///
 /// # Safety
 ///
 /// `NX` is the frame's `nx`; `sums` and `out` hold `[nprobe, ny, nx]`; launch as above.
 #[device]
-pub unsafe fn shift_probe_rows<const NX: u32>(sums: SumPtrs, out: SumPtrs, ny: u32, quad: f32) {
+pub unsafe fn shift_probe_rows<const NX: u32, const DEN: bool>(
+    sums: SumPtrs,
+    out: SumPtrs,
+    ny: u32,
+    quad: f32,
+) {
     let nx = NX;
     let n = ny as usize * nx as usize;
     let lane = row_lane::<NX>();
@@ -1714,9 +1774,128 @@ pub unsafe fn shift_probe_rows<const NX: u32>(sums: SumPtrs, out: SumPtrs, ny: u
             let u = cmul_conj(quad_phase(quad, y, x, ny, nx), (r[k], r[k + 1]));
             let a = load_c(out.num, nat);
             store_c(out.num, nat, (a.0 + u.0 * inv_n, a.1 + u.1 * inv_n));
-            *out.den.add(nat) += *sums.den.add(nat);
             store_c(sums.num, plane + (ys * nx + xs) as usize, (0.0, 0.0));
-            *sums.den.add(nat) = 0.0;
+            if DEN {
+                *out.den.add(nat) += *sums.den.add(nat);
+                *sums.den.add(nat) = 0.0;
+            }
+        }
+    }
+}
+
+/// The batch frame of stack slot `fl`, `f0 + fl - span.p0`, if in the span.
+#[device]
+fn span_frame(span: BatchSpan, f0: u32, fl: u32) -> Option<u32> {
+    let b = (f0 + fl).wrapping_sub(span.p0);
+    (b < span.nb).then_some(b)
+}
+
+/// The column half of each frame's own [`shift_probe_sums`] addend of probe mode 0 taken back
+/// alone, for OPR: `moved[b, y, kx] = IDFT_y(G[fl * nprobe])[ys, kx]` at natural row `y =
+/// (ys + ny / 2) % ny`, for frame `fl = blockIdx.y` of the stack and batch frame `b = f0 + fl
+/// - span.p0`; a frame outside the span writes nothing. Reads `shift_adj`; writes `moved`.
+/// Block and shared memory as [`shift_cols`]; grid `(nx / FUSED_COLS, nf_max)`.
+///
+/// # Safety
+///
+/// `NY` is the frame's `ny`; `shift_adj` holds [`shift_post`]'s `G` of this stack, `moved`
+/// `[span.nb, ny, nx]`; `ctl` one entry; launch as above.
+#[device]
+pub unsafe fn shift_moved_cols<const NY: u32>(
+    p: FusedPtrs,
+    moved: *mut f32,
+    span: BatchSpan,
+    ctl: *const StackCtl,
+    g: StackGeom,
+) {
+    let (f0, nf) = unsafe { stack_frames(ctl, g) };
+    let Some(fl) = walk_slot(0, nf) else {
+        return;
+    };
+    let Some(b) = span_frame(span, f0, fl) else {
+        return;
+    };
+    let (ny, nx) = (NY, g.nx);
+    let n = ny as usize * nx as usize;
+    let ept = const { fft_ept(NY) };
+    let tpf = ny / ept;
+    let tid = thread::threadIdx_x();
+    let (c, f) = (tid % FUSED_COLS, tid / FUSED_COLS);
+    let kx = thread::blockIdx_x() * FUSED_COLS + c;
+    let (src, dst) = ((fl * g.nprobe) as usize * n, b as usize * n);
+    let mut r = [0.0f32; 2 * FFT_EPT_MAX as usize];
+    unsafe {
+        let smem = DynamicSharedArray::<u8, 16>::get();
+        #[unroll]
+        for i in 0..ept {
+            let v = load_c(p.shift_adj, src + ((f + i * tpf) * nx + kx) as usize);
+            r[2 * i as usize] = v.0;
+            r[2 * i as usize + 1] = v.1;
+        }
+        col_fft::<NY, true>(&mut r, smem, c, f, FUSED_COLS);
+        #[unroll]
+        for i in 0..ept {
+            let k = 2 * i as usize;
+            let y = (f + i * tpf + ny / 2) % ny;
+            store_c(moved, dst + (y * nx + kx) as usize, (r[k], r[k + 1]));
+        }
+    }
+}
+
+/// The row half of [`shift_moved_cols`], in place: row `y` of batch frame `b` (as there)
+/// becomes `conj(q) IDFT_x(row) / n` in the natural layout, [`shift_probe_rows`]' update of
+/// that one addend. Grid `(ny / rows, nf_max)`, block and shared memory as [`rows_fwd`].
+///
+/// # Safety
+///
+/// `NX` is the frame's `nx`; `moved` holds `[span.nb, ny, nx]`, its stack's rows as
+/// [`shift_moved_cols`] left them; `ctl` one entry; launch as above.
+#[device]
+pub unsafe fn shift_moved_rows<const NX: u32>(
+    moved: *mut f32,
+    span: BatchSpan,
+    ctl: *const StackCtl,
+    g: StackGeom,
+) {
+    let (f0, nf) = unsafe { stack_frames(ctl, g) };
+    let Some(fl) = walk_slot(0, nf) else {
+        return;
+    };
+    let Some(b) = span_frame(span, f0, fl) else {
+        return;
+    };
+    let nx = NX;
+    let n = g.ny as usize * nx as usize;
+    let lane = row_lane::<NX>();
+    let y = lane.ys;
+    let plane = b as usize * n;
+    let t = lane.f;
+    let ept = const { fft_ept(NX) };
+    let tpf = nx / ept;
+    let inv_n = 1.0 / n as f32;
+    let mut r = [0.0f32; 2 * FFT_EPT_MAX as usize];
+    unsafe {
+        #[unroll]
+        for i in 0..ept {
+            let x = t + i * tpf;
+            let v = load_c(moved, plane + (y * nx + x) as usize);
+            // Times `(-1)^x`, the transform lands each output at its natural column, the
+            // one this thread loaded.
+            let s = if x.is_multiple_of(2) { 1.0 } else { -1.0 };
+            r[2 * i as usize] = s * v.0;
+            r[2 * i as usize + 1] = s * v.1;
+        }
+        row_fft::<NX, true>(&mut r, lane);
+        #[unroll]
+        for i in 0..ept {
+            let k = 2 * i as usize;
+            let x = t + i * tpf;
+            let u = cmul_conj(quad_phase(g.quad, y, x, g.ny, nx), (r[k], r[k + 1]));
+            store_c(
+                moved,
+                plane + (y * nx + x) as usize,
+                (u.0 * inv_n, u.1 * inv_n),
+            );
         }
     }
 }

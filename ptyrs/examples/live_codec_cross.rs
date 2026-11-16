@@ -5,9 +5,9 @@
 
 #![warn(clippy::disallowed_methods)]
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use ptyrs::live::args::Args;
+use ptyrs::live::args::{ArgError, cli};
 use ptyrs::live::codec::{
     Bslz4Scratch, bslz4_compress_u16, bslz4_decompress_into_u16, bslz4_decompress_range_u16,
     bytemuck_u16, bytemuck_u16_mut, lz4_compress, lz4_decompress_into,
@@ -41,28 +41,39 @@ fn read_u16(p: &Path) -> Vec<u16> {
 }
 
 fn main() {
-    let a = Args::parse();
-    let (dump, check) = (a.str("dump", ""), a.str("check", ""));
-    if !dump.is_empty() {
-        let dir = Path::new(&dump);
-        std::fs::create_dir_all(dir).unwrap();
-        let mut list = String::new();
-        for (name, s, n) in cases() {
-            list += &format!("{name} {} {} {n}\n", s.width, s.height);
-            for i in 0..n {
-                let raw = s.frame(i);
-                let f = |ext: &str| dir.join(format!("{name}_{i}.{ext}"));
-                std::fs::write(f("raw"), bytemuck_u16(&raw)).unwrap();
-                std::fs::write(f("rs.lz4"), lz4_compress(bytemuck_u16(&raw))).unwrap();
-                std::fs::write(f("rs.bslz4"), bslz4_compress_u16(&raw)).unwrap();
-            }
-        }
-        std::fs::write(dir.join("cases.txt"), list).unwrap();
-        println!("codec_cross dumped {}", dir.display());
-        return;
+    enum Run {
+        Dump(PathBuf),
+        Check(PathBuf),
     }
-    assert!(!check.is_empty(), "--dump DIR or --check DIR");
-    let dir = Path::new(&check);
+    let run = cli("live_codec_cross", |a| match a.opt("dump")? {
+        Some(d) => Ok(Run::Dump(d)),
+        None => a
+            .opt("check")?
+            .map(Run::Check)
+            .ok_or_else(|| ArgError::new("--dump DIR or --check DIR".into())),
+    });
+    let check = match run {
+        Run::Dump(dump) => {
+            let dir = dump.as_path();
+            std::fs::create_dir_all(dir).unwrap();
+            let mut list = String::new();
+            for (name, s, n) in cases() {
+                list += &format!("{name} {} {} {n}\n", s.width, s.height);
+                for i in 0..n {
+                    let raw = s.frame(i);
+                    let f = |ext: &str| dir.join(format!("{name}_{i}.{ext}"));
+                    std::fs::write(f("raw"), bytemuck_u16(&raw)).unwrap();
+                    std::fs::write(f("rs.lz4"), lz4_compress(bytemuck_u16(&raw))).unwrap();
+                    std::fs::write(f("rs.bslz4"), bslz4_compress_u16(&raw)).unwrap();
+                }
+            }
+            std::fs::write(dir.join("cases.txt"), list).unwrap();
+            println!("codec_cross dumped {}", dir.display());
+            return;
+        }
+        Run::Check(check) => check,
+    };
+    let dir = check.as_path();
     let (mut ok, mut bad) = (0u32, 0u32);
     let mut sc = Bslz4Scratch::default();
     for (name, s, n) in cases() {

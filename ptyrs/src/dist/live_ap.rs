@@ -26,13 +26,12 @@ use crate::fault;
 use crate::gpu::{
     C32, Ended, FrameLlk, FusedBufs, Kernels, LlkPartial, LlkRing, LlkTotals, RingError, ViewAddr,
 };
-use crate::live::fill::Fill;
 use crate::live::graph::LiveGraph;
 use crate::live::grow::GrowError;
 use crate::live::object::{Snapshot, timed_sleeping_event};
 use crate::live::recon::{ApConfig, LLK_SLOTS, ViewPlacement, capture_sweep};
 use crate::live::ring::{DeviceStore, STORE_LEAD};
-use crate::live::scan::{LiveScan, Refusal, ScanBacker, one_object_mode};
+use crate::live::scan::{LiveScan, Refusal, ScanBacker};
 use crate::live::stats::wall_ns;
 
 use crate::dist::exchange::{self, Exchange, Pull};
@@ -147,7 +146,7 @@ impl State {
             &region.own,
         )?;
         let d = *scan.dims();
-        let n = (d.frame[0] * d.frame[1]) as usize;
+        let n = region.shape.frame().area();
         let mut scan_backer = scan.backer();
         let t = Instant::now();
         scan_backer.plan(&region.planned)?;
@@ -430,6 +429,8 @@ pub struct DistLiveAp {
     landed: Vec<u32>,
     /// Per region: halo rows listed, `[pack, unpack]`.
     halo_rows: Vec<[usize; 2]>,
+    /// Pixels of the object, `nobj · nyo · nxo`.
+    pixels: usize,
     lost: u64,
     taken: u64,
     epochs: u64,
@@ -509,6 +510,7 @@ impl DistLiveAp {
             stores,
             landed: vec![0; nregion],
             halo_rows: vec![[0; 2]; nregion],
+            pixels: cfg.shape.pixels(),
             lost: 0,
             taken: 0,
             epochs: 0,
@@ -538,7 +540,7 @@ impl DistLiveAp {
     /// they are the frames of the batches it sent.
     pub fn push(&mut self, views: &[ViewAddr]) -> Result<u32, DistError> {
         self.gpus.check()?;
-        let nmode = self.plan.regions()[0].shape.nmode as usize;
+        let nmode = self.plan.regions()[0].shape.nmode() as usize;
         let mut shares = vec![Share::default(); self.plan.nregion()];
         let took = self.plan.split(views, &mut shares)?;
         self.lost += (views.len() / nmode) as u64 - u64::from(took);
@@ -559,23 +561,6 @@ impl DistLiveAp {
             self.halo_rows[r] = rows;
         }
         Ok(took)
-    }
-
-    /// Queues `fill` onto every GPU's window behind the epochs queued so far
-    /// ([`LiveScan::fill`]), halo tiles included, so the next epoch starts from it on every
-    /// GPU; returns the fill's pixels their owner's GPU had not ready, each once: 0 for the
-    /// fill of a batch [`Self::push`] has landed whole, as every tile a frame touches is
-    /// readied on its owner. Each GPU queues an epoch whole within one [`Self::epoch`], on
-    /// the stream its fills are queued on, so a fill never lands inside one.
-    pub fn fill(&mut self, fill: Fill) -> Result<usize, DistError> {
-        self.gpus.check()?;
-        let regions = self.plan.regions();
-        one_object_mode(&regions[0].shape.dims())?;
-        let skipped = self.gpus.change(|gpu, st| {
-            let origin = regions[gpu.region()].window.at;
-            Ok(st.scan.fill(fill.clone(), origin)?)
-        })?;
-        Ok(skipped.into_iter().sum())
     }
 
     /// Queues one epoch over every frame landed so far on every GPU, without waiting for it.
@@ -644,7 +629,7 @@ impl DistLiveAp {
             st.scan.obj().snapshot(&mut st.snap)?;
             Ok(st.snap.wait()?.to_vec())
         })?;
-        let mut out = vec![[0.0; 2]; self.pixels()];
+        let mut out = vec![[0.0; 2]; self.pixels];
         self.stitch(&wins, &mut out);
         Ok(out)
     }
@@ -657,7 +642,7 @@ impl DistLiveAp {
         })?;
         Ok(DistSnapshot {
             id: ids[0],
-            pixels: vec![[0.0; 2]; self.pixels()],
+            pixels: vec![[0.0; 2]; self.pixels],
         })
     }
 
@@ -681,17 +666,11 @@ impl DistLiveAp {
         Ok(&snap.pixels)
     }
 
-    /// Pixels of the object, `nobj * nyo * nxo`.
-    fn pixels(&self) -> usize {
-        let [nyo, nxo] = self.shape();
-        self.plan.regions()[0].shape.nobj as usize * nyo * nxo
-    }
-
     /// Copies each tile from its owner's window in `wins`, by region, into `out`.
     fn stitch(&self, wins: &[Vec<[f32; 2]>], out: &mut [[f32; 2]]) {
         let grid = self.plan.partition().grid();
         let ([nyo, nxo], tile) = (grid.obj(), grid.tile());
-        let nobj = self.plan.regions()[0].shape.nobj as usize;
+        let nobj = self.plan.regions()[0].shape.nobj() as usize;
         for (t, &o) in self.plan.partition().owner().iter().enumerate() {
             let [ty, tx] = grid.coords(t);
             let (x0, x1) = (tx * tile, ((tx + 1) * tile).min(nxo));
@@ -777,8 +756,6 @@ mod tests {
     use super::*;
     use crate::dist::worker::tests::gpus;
     use crate::live::farfield::{Ptycho, PtychoSpec, ScanPath};
-    use crate::live::fill::standin::{Wrong, batch_fill};
-    use crate::live::fill::{Fill, PatchFill};
     use crate::live::graph::WarmUp;
     use crate::live::grow::GrowError;
     use crate::live::pos::{Pos, PosTable};
@@ -828,15 +805,8 @@ mod tests {
             place.views(q, 2, 1, &mut v);
             v
         };
-        let mut shape = ScanShape {
-            nframe: 0,
-            nmode: 2,
-            nprobe: 2,
-            nobj: 1,
-            frame: [p.spec().n as u32; 2],
-            reach,
-            quad_phase: 0.0,
-        };
+        let frame = [p.spec().n; 2];
+        let shape = ScanShape::new(p.points() as u32, 2, 1, frame, reach, 0.0).unwrap();
         let dims = shape.dims();
         let half = p.points() / 2;
         // Each frame's position and the simulated frame its counts are.
@@ -853,7 +823,7 @@ mod tests {
         let pos: Vec<(f64, f64)> = order.iter().map(|&(q, _)| q).collect();
         let views: Vec<ViewAddr> = pos.iter().flat_map(|&q| views_at(q)).collect();
         let counts = order.iter().flat_map(|&(_, k)| p.frame(k)).collect();
-        shape.nframe = order.len() as u32;
+        let shape = shape.with_nframe(order.len() as u32).unwrap();
         let cfg = ApConfig {
             shape,
             nf_max: NonZeroU32::new(8).unwrap(),
@@ -888,7 +858,7 @@ mod tests {
             out.push(at..at + len);
             at += len;
         }
-        let nframe = c.cfg.shape.nframe as usize;
+        let nframe = c.cfg.shape.nframe() as usize;
         while at < nframe {
             out.push(at..(at + 17).min(nframe));
             at += 17;
@@ -988,7 +958,7 @@ mod tests {
         ] {
             let c = case(&sim(path, points));
             let batches = batches(&c);
-            let nmode = c.cfg.shape.nmode as usize;
+            let nmode = c.cfg.shape.nmode() as usize;
             let views = |b: &Range<usize>| &c.views[b.start * nmode..b.end * nmode];
             let st = ctx.new_stream().unwrap();
             let dev = DeviceBuffer::from_host(&st, &c.counts).unwrap();
@@ -1039,7 +1009,7 @@ mod tests {
                 let up = feed.finish();
                 assert_eq!(
                     (up.frames, up.pos_missing),
-                    (u64::from(c.cfg.shape.nframe), 0)
+                    (u64::from(c.cfg.shape.nframe()), 0)
                 );
                 let placed: Vec<u64> = up.regions.iter().map(|r| r.frames).collect();
                 let landed: Vec<u64> = ap.landed().iter().map(|&l| u64::from(l)).collect();
@@ -1056,105 +1026,6 @@ mod tests {
         }
     }
 
-    /// A raster in strips with a fill after each batch's push and two epochs after it: on
-    /// `ngpu` GPUs the fill skips no pixel, and the object is one GPU's bit for bit both
-    /// before the batch's first epoch and after its epochs, with fills that lie over tiles
-    /// of two GPUs.
-    fn fills_give_the_one_gpu_object(ngpu: usize) {
-        let ctx = Context::new(0).expect("GPU 0");
-        let c = case(&sim(ScanPath::Raster { cols: 12 }, 240));
-        let batches = batches(&c);
-        let (nmode, n) = (c.cfg.shape.nmode as usize, 64 * 64);
-        let views = |b: &Range<usize>| &c.views[b.start * nmode..b.end * nmode];
-        let obj = c.cfg.shape.dims().obj.map(|n| n as usize);
-        let most = batches.iter().map(Range::len).max().unwrap();
-        // Every fill stays out for both runs.
-        let mut pf = PatchFill::new(&ctx, obj, [32, 32], most, batches.len()).unwrap();
-        let mut wrong = Wrong {
-            patch: [32, 32],
-            issued: 0,
-        };
-        let fills: Vec<Fill> = batches
-            .iter()
-            .map(|b| {
-                let counts = &c.counts[b.start * n..b.end * n];
-                batch_fill(&mut pf, &mut wrong, counts, views(b), nmode, [64, 64])
-            })
-            .collect();
-
-        let st = ctx.new_stream().unwrap();
-        let dev = DeviceBuffer::from_host(&st, &c.counts).unwrap();
-        let mut one = LiveAp::new(&st, &c.cfg, &c.probe, dev, false).unwrap();
-        let (mut snap, mut backer) = (one.new_snapshot().unwrap(), one.backer());
-        let mut want = Vec::new();
-        for (b, fill) in batches.iter().zip(&fills) {
-            let v = views(b);
-            backer.back(v).unwrap();
-            assert_eq!(one.push(v).unwrap() as usize, b.len());
-            assert_eq!(one.fill(fill.clone()).unwrap(), 0);
-            one.snapshot(&mut snap).unwrap();
-            let filled = bits(snap.wait().unwrap());
-            for _ in 0..2 {
-                one.epoch().unwrap();
-            }
-            one.snapshot(&mut snap).unwrap();
-            want.push([filled, bits(snap.wait().unwrap())]);
-        }
-
-        let planned = &c.views[..c.planned * nmode];
-        let mut ap = DistLiveAp::new(
-            &gpus(ngpu),
-            &c.cfg,
-            planned,
-            Scheme::Strips,
-            &c.probe,
-            false,
-        )
-        .unwrap();
-        let grid = ap.plan().partition().grid();
-        let (tile, ntx) = (grid.tile(), grid.obj()[1].div_ceil(grid.tile()));
-        let owner = ap.plan().partition().owner().to_vec();
-        // Fills with pixels on tiles of more than one GPU.
-        let across = fills
-            .iter()
-            .filter(|f| {
-                let owners = |r: &crate::live::fill::Rect| {
-                    let (y, x) = (r.y as usize, r.x as usize);
-                    let corners = [[y, x], [y + r.h as usize - 1, x + r.w as usize - 1]];
-                    corners.map(|[y, x]| owner[y / tile * ntx + x / tile])
-                };
-                let mut seen = f.rects().iter().flat_map(owners);
-                seen.next().is_some_and(|o| seen.any(|p| p != o))
-            })
-            .count();
-        assert!(across > 0, "no fill lies over two GPUs' tiles");
-        let mut feed = Feed::new(&ctx, &c, &ap);
-        for (k, ((b, fill), want)) in batches.iter().zip(fills).zip(&want).enumerate() {
-            feed = feed.land(&c, b);
-            assert_eq!(ap.push(views(b)).unwrap() as usize, b.len());
-            assert_eq!(ap.fill(fill).unwrap(), 0, "batch {k}");
-            let unlike = |ap: &DistLiveAp, want: &[[u32; 2]]| {
-                let got = bits(&ap.object().unwrap());
-                got.iter().zip(want).filter(|(g, w)| g != w).count()
-            };
-            assert_eq!(
-                unlike(&ap, &want[0]),
-                0,
-                "batch {k}: unlike one GPU's when filled"
-            );
-            for _ in 0..2 {
-                ap.epoch().unwrap();
-            }
-            assert_eq!(
-                unlike(&ap, &want[1]),
-                0,
-                "batch {k}: unlike one GPU's after epochs"
-            );
-        }
-        feed.finish();
-        assert_eq!((ap.lost(), ap.closed()), (0, None));
-    }
-
     /// The raster of [`gpus_iterate_a_live_scan_as_one_gpu`] on stores that back their
     /// planned frames and one more before the first frame lands, then a chunk at a time as
     /// the uploader reaches the edge: on 1, 2 and 4 GPUs the stores grow while the scan
@@ -1165,7 +1036,7 @@ mod tests {
         let ctx = Context::new(0).expect("GPU 0");
         let c = case(&sim(ScanPath::Raster { cols: 12 }, 240));
         let batches = batches(&c);
-        let (nmode, n) = (c.cfg.shape.nmode as usize, 64 * 64);
+        let (nmode, n) = (c.cfg.shape.nmode() as usize, 64 * 64);
         let views = |b: &Range<usize>| &c.views[b.start * nmode..b.end * nmode];
         let st = ctx.new_stream().unwrap();
         let dev = DeviceBuffer::from_host(&st, &c.counts).unwrap();
@@ -1181,7 +1052,7 @@ mod tests {
             want.push(bits(snap.wait().unwrap()));
         }
 
-        let (nframe, planned) = (c.cfg.shape.nframe as usize, &c.views[..c.planned * nmode]);
+        let (nframe, planned) = (c.cfg.shape.nframe() as usize, &c.views[..c.planned * nmode]);
         for ngpu in [1, 2, 4] {
             let plan =
                 LivePlan::new(&c.cfg.shape, planned, Scheme::Strips, ngpu, c.cfg.cap).unwrap();
@@ -1234,7 +1105,7 @@ mod tests {
     fn an_epoch_failing_after_its_record_aborts_the_run() {
         let ctx = Context::new(0).expect("GPU 0");
         let c = case(&sim(ScanPath::Raster { cols: 12 }, 240));
-        let planned = &c.views[..c.planned * c.cfg.shape.nmode as usize];
+        let planned = &c.views[..c.planned * c.cfg.shape.nmode() as usize];
         let mut ap =
             DistLiveAp::new(&[0, 0], &c.cfg, planned, Scheme::Strips, &c.probe, true).unwrap();
         let feed = Feed::new(&ctx, &c, &ap).land(&c, &(0..c.planned));
@@ -1250,13 +1121,13 @@ mod tests {
             matches!(r, Err(DistError::Gpu(crate::gpu::Error::Driver(d))) if d == fault::REFUSAL),
             "{r:?}"
         );
-        assert!(matches!(ap.epoch(), Err(DistError::Aborted)));
-        assert!(matches!(ap.llk(), Err(DistError::Aborted)));
-        assert!(matches!(ap.object(), Err(DistError::Aborted)));
-        assert!(matches!(ap.end_of(0), Err(DistError::Aborted)));
-        assert!(matches!(ap.wait(&mut snap), Err(DistError::Aborted)));
-        assert!(matches!(ap.mapped_bytes(), Err(DistError::Aborted)));
-        assert!(matches!(ap.plan_time(), Err(DistError::Aborted)));
+        assert!(matches!(ap.epoch(), Err(DistError::Poisoned)));
+        assert!(matches!(ap.llk(), Err(DistError::Poisoned)));
+        assert!(matches!(ap.object(), Err(DistError::Poisoned)));
+        assert!(matches!(ap.end_of(0), Err(DistError::Poisoned)));
+        assert!(matches!(ap.wait(&mut snap), Err(DistError::Poisoned)));
+        assert!(matches!(ap.mapped_bytes(), Err(DistError::Poisoned)));
+        assert!(matches!(ap.plan_time(), Err(DistError::Poisoned)));
         feed.finish();
     }
 
@@ -1268,7 +1139,7 @@ mod tests {
     fn a_failed_run_still_drains() {
         let ctx = Context::new(0).expect("GPU 0");
         let c = case(&sim(ScanPath::Raster { cols: 12 }, 240));
-        let planned = &c.views[..c.planned * c.cfg.shape.nmode as usize];
+        let planned = &c.views[..c.planned * c.cfg.shape.nmode() as usize];
         let mut ap =
             DistLiveAp::new(&[0, 0], &c.cfg, planned, Scheme::Strips, &c.probe, false).unwrap();
         let feed = Feed::new(&ctx, &c, &ap).land(&c, &(0..c.planned));
@@ -1287,7 +1158,7 @@ mod tests {
         assert!(ap.epoch().is_err());
         assert!(armed.fired());
         drop(armed);
-        assert!(matches!(ap.object(), Err(DistError::Aborted)));
+        assert!(matches!(ap.object(), Err(DistError::Poisoned)));
         ap.synchronize().unwrap();
         for (r, s) in streams.iter().enumerate() {
             let idle = [s[0].query().unwrap(), s[1].query().unwrap()];
@@ -1302,7 +1173,7 @@ mod tests {
     fn a_snapshot_failing_on_one_gpu_aborts_the_run() {
         let ctx = Context::new(0).expect("GPU 0");
         let c = case(&sim(ScanPath::Raster { cols: 12 }, 240));
-        let planned = &c.views[..c.planned * c.cfg.shape.nmode as usize];
+        let planned = &c.views[..c.planned * c.cfg.shape.nmode() as usize];
         let mut ap =
             DistLiveAp::new(&[0, 0], &c.cfg, planned, Scheme::Strips, &c.probe, false).unwrap();
         let feed = Feed::new(&ctx, &c, &ap).land(&c, &(0..c.planned));
@@ -1319,7 +1190,7 @@ mod tests {
             matches!(r, Err(DistError::Gpu(crate::gpu::Error::Driver(d))) if d == fault::REFUSAL),
             "{r:?}"
         );
-        assert!(matches!(ap.wait(&mut snap), Err(DistError::Aborted)));
+        assert!(matches!(ap.wait(&mut snap), Err(DistError::Poisoned)));
         ap.synchronize().unwrap();
         feed.finish();
     }
@@ -1331,7 +1202,7 @@ mod tests {
     fn an_llk_read_failing_on_one_gpu_aborts_the_run() {
         let ctx = Context::new(0).expect("GPU 0");
         let c = case(&sim(ScanPath::Raster { cols: 12 }, 240));
-        let planned = &c.views[..c.planned * c.cfg.shape.nmode as usize];
+        let planned = &c.views[..c.planned * c.cfg.shape.nmode() as usize];
         let mut ap =
             DistLiveAp::new(&[0, 0], &c.cfg, planned, Scheme::Strips, &c.probe, true).unwrap();
         let feed = Feed::new(&ctx, &c, &ap).land(&c, &(0..c.planned));
@@ -1345,19 +1216,9 @@ mod tests {
             matches!(r, Err(DistError::Gpu(crate::gpu::Error::Driver(d))) if d == fault::REFUSAL),
             "{r:?}"
         );
-        assert!(matches!(ap.llk(), Err(DistError::Aborted)));
-        assert!(matches!(ap.epoch(), Err(DistError::Aborted)));
-        assert!(matches!(ap.new_snapshot(), Err(DistError::Aborted)));
+        assert!(matches!(ap.llk(), Err(DistError::Poisoned)));
+        assert!(matches!(ap.epoch(), Err(DistError::Poisoned)));
+        assert!(matches!(ap.new_snapshot(), Err(DistError::Poisoned)));
         feed.finish();
-    }
-
-    #[test]
-    fn fills_on_2_gpus_give_the_one_gpu_object() {
-        fills_give_the_one_gpu_object(2);
-    }
-
-    #[test]
-    fn fills_on_4_gpus_give_the_one_gpu_object() {
-        fills_give_the_one_gpu_object(4);
     }
 }

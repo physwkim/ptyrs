@@ -5,7 +5,7 @@
 
 use serde::Deserialize;
 
-use crate::live::args::Args;
+use crate::live::args::{ArgError, Args};
 use crate::live::farfield::{Ptycho, PtychoSpec, ScanPath};
 use crate::live::pipeline::Truth;
 use crate::live::synth::{Region, Synth};
@@ -30,21 +30,26 @@ impl Default for ModelCfg {
 
 impl ModelCfg {
     /// `--model` and the flags of that model.
-    pub fn from_args(a: &Args) -> Self {
-        match a.str("model", "synth").as_str() {
-            "synth" => {
+    pub fn from_args(a: &Args) -> Result<Self, ArgError> {
+        #[derive(Clone, Copy)]
+        enum Kind {
+            Synth,
+            Ptycho,
+        }
+        let of = [("synth", Kind::Synth), ("ptycho", Kind::Ptycho)];
+        Ok(match a.choice("model", &of)? {
+            Kind::Synth => {
                 let d = Synth::default();
                 ModelCfg::Synth(Synth {
-                    width: a.get("width", d.width),
-                    height: a.get("height", d.height),
-                    seed: a.get("seed", d.seed),
-                    flux: a.get("flux", d.flux),
-                    pool: a.get("pool", d.pool),
+                    width: a.get("width", d.width)?,
+                    height: a.get("height", d.height)?,
+                    seed: a.get("seed", d.seed)?,
+                    flux: a.get("flux", d.flux)?,
+                    pool: a.get("pool", d.pool)?,
                 })
             }
-            "ptycho" => ModelCfg::Ptycho(PtychoCfg::from_args(a)),
-            m => panic!("--model {m}: expected synth or ptycho"),
-        }
+            Kind::Ptycho => ModelCfg::Ptycho(PtychoCfg::from_args(a)?),
+        })
     }
 
     pub fn build(&self) -> Model {
@@ -60,6 +65,15 @@ impl ModelCfg {
 pub enum PathKind {
     Raster,
     Fermat,
+}
+
+impl std::fmt::Display for PathKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            PathKind::Raster => "raster",
+            PathKind::Fermat => "fermat",
+        })
+    }
 }
 
 impl std::str::FromStr for PathKind {
@@ -112,20 +126,20 @@ impl Default for PtychoCfg {
 impl PtychoCfg {
     /// `--n --path --points --cols --step-px --photons --seed --wavelength-m
     /// --distance-m --det-pixel-m`.
-    pub fn from_args(a: &Args) -> Self {
+    pub fn from_args(a: &Args) -> Result<Self, ArgError> {
         let d = Self::default();
-        Self {
-            n: a.get("n", d.n),
-            path: a.get("path", d.path),
-            points: a.get("points", d.points),
-            cols: a.opt("cols"),
-            step_px: a.get("step-px", d.step_px),
-            photons: a.get("photons", d.photons),
-            seed: a.get("seed", d.seed),
-            wavelength_m: a.get("wavelength-m", d.wavelength_m),
-            distance_m: a.get("distance-m", d.distance_m),
-            det_pixel_m: a.get("det-pixel-m", d.det_pixel_m),
-        }
+        Ok(Self {
+            n: a.get("n", d.n)?,
+            path: a.get("path", d.path)?,
+            points: a.get("points", d.points)?,
+            cols: a.opt("cols")?,
+            step_px: a.get("step-px", d.step_px)?,
+            photons: a.get("photons", d.photons)?,
+            seed: a.get("seed", d.seed)?,
+            wavelength_m: a.get("wavelength-m", d.wavelength_m)?,
+            distance_m: a.get("distance-m", d.distance_m)?,
+            det_pixel_m: a.get("det-pixel-m", d.det_pixel_m)?,
+        })
     }
 
     pub fn build(&self) -> Ptycho {

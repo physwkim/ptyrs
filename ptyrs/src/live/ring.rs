@@ -28,17 +28,12 @@
 //! from the ring straight into each of those regions' stores, at the
 //! region's next place: no GPU holds another's frames. One store taking
 //! every frame ([`Whole`]) is the one-region case of the same loop.
-//!
-//! A consumer that predicts from the counts gets them with each batch: the
-//! uploader copies a landed batch's frames out of the ring into a buffer of
-//! the consumer's [`Tap`] before it releases their slots. A batch that finds
-//! every buffer lent goes without; the uploader never waits for one.
 
 use std::collections::VecDeque;
 use std::num::NonZeroUsize;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -538,104 +533,21 @@ pub struct FrameBatch {
     /// `(x, y)` of each frame, m, read from the ring before its slots were
     /// released: the host's copy of what the store holds on the device.
     pub positions: Vec<(f64, f64)>,
-    /// The frames' counts, if the uploader has a [`Tap`] and a buffer of it
-    /// was free.
-    pub counts: Option<Counts>,
 }
 
-type CountsPool = Mutex<Vec<Vec<u16>>>;
-
-/// One batch's counts on the host, its frames in landing order: a buffer
-/// of the uploader's [`Tap`], back in it when the last clone drops.
-#[derive(Clone)]
-pub struct Counts(Arc<LentCounts>);
-
-struct LentCounts {
-    counts: Vec<u16>,
-    pool: Arc<CountsPool>,
-}
-
-impl Drop for LentCounts {
-    fn drop(&mut self) {
-        let c = std::mem::take(&mut self.counts);
-        self.pool
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(c);
-    }
-}
-
-impl Counts {
-    pub fn as_slice(&self) -> &[u16] {
-        &self.0.counts
-    }
-}
-
-impl PartialEq for Counts {
-    fn eq(&self, other: &Self) -> bool {
-        self.as_slice() == other.as_slice()
-    }
-}
-
-impl std::fmt::Debug for Counts {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Counts({} values)", self.as_slice().len())
-    }
-}
-
-/// `buffers` host buffers of `batch` frames of `elems` pixels, written
-/// here so that no copy into one pays for first touching its pages.
-fn tap_pool(tap: Tap, elems: usize) -> Arc<CountsPool> {
-    let len = tap.batch * elems;
-    let buffers = (0..tap.buffers)
-        .map(|_| {
-            // calloc's zeros may be pages never touched.
-            let mut b = vec![0; len];
-            b.fill(std::hint::black_box(0));
-            b
-        })
-        .collect();
-    Arc::new(Mutex::new(buffers))
-}
-
-/// `src` copied into a free buffer of `pool`, which holds it; `None` if
-/// every buffer is lent.
-fn lend(pool: &Arc<CountsPool>, src: &[u16]) -> Option<Counts> {
-    let mut counts = pool.lock().unwrap_or_else(PoisonError::into_inner).pop()?;
-    counts.clear();
-    counts.extend_from_slice(src);
-    Some(Counts(Arc::new(LentCounts {
-        counts,
-        pool: pool.clone(),
-    })))
-}
-
-/// Host buffers the uploader copies each landed batch's counts into before
-/// it releases the batch's slots, sent as [`FrameBatch::counts`]: `buffers`
-/// of `batch` frames. A batch that finds every buffer lent goes without
-/// ([`UploadReport::counts_dry`]).
-#[derive(Debug, Clone, Copy)]
-pub struct Tap {
-    pub buffers: usize,
-    /// At least the uploader's [`UploaderConfig::batch`].
-    pub batch: usize,
-}
-
-/// What a consumer hands its uploader: each region's store, the route that
-/// lands frames on them and, if it predicts from the counts, its tap.
+/// What a consumer hands its uploader: each region's store and the route
+/// that lands frames on them.
 pub struct Landing {
     pub stores: Vec<Arc<DeviceStore>>,
     pub route: Box<dyn Route>,
-    pub tap: Option<Tap>,
 }
 
 impl Landing {
-    /// `stores` taking frames by `route`, without a tap.
+    /// `stores` taking frames by `route`.
     pub fn new(stores: Vec<Arc<DeviceStore>>, route: impl Route + 'static) -> Self {
         Self {
             stores,
             route: Box::new(route),
-            tap: None,
         }
     }
 }
@@ -678,12 +590,6 @@ pub struct UploadReport {
     pub store_waits: u64,
     pub bytes: u64,
     pub max_inflight: usize,
-    /// Batches sent without counts because every buffer of the [`Tap`]
-    /// was lent.
-    pub counts_dry: u64,
-    /// Time the uploader spent copying one batch's counts into the tap: the
-    /// tap's own cost.
-    pub counts_copy: Histogram,
     /// Monitor callback → H2D completion seen by the uploader, on the last
     /// of the frame's regions.
     pub rx_to_gpu: Histogram,
@@ -831,8 +737,7 @@ pub fn run_uploader(
 /// unbounded: a full channel stalls the uploader. Frames land in sequence
 /// order, each once its position is in `pos`, in `landing.stores[r]` for
 /// every region `r` that `landing.route` gives its position, and a batch is
-/// sent once all of them hold it, with its counts if `landing` has a tap.
-/// Waits for its copies on every exit.
+/// sent once all of them hold it. Waits for its copies on every exit.
 pub fn run_region_uploader(
     ring: Arc<Ring>,
     landing: Landing,
@@ -841,32 +746,15 @@ pub fn run_region_uploader(
     stop: Arc<AtomicBool>,
     batches: Option<Sender<FrameBatch>>,
 ) -> Result<UploadReport, GrowError> {
-    let Landing {
-        stores,
-        mut route,
-        tap,
-    } = landing;
+    let Landing { stores, mut route } = landing;
     assert_eq!(stores.len(), route.nregion());
     assert!((1..=32).contains(&stores.len()));
-    if let Some(t) = tap
-        && t.batch < cfg.batch.get()
-    {
-        return Err(crate::gpu::Error::Shape(format!(
-            "a tap of {}-frame buffers under batches of {}",
-            t.batch, cfg.batch
-        ))
-        .into());
-    }
     let mut lanes = Vec::with_capacity(stores.len());
     for store in stores {
         assert_eq!(store.frame_elems, ring.slot_elems);
         lanes.push(Lane::new(store, cfg.events)?);
     }
-    let sink = batches.map(|tx| Out {
-        tx,
-        tap: tap.map(|t| tap_pool(t, ring.slot_elems)),
-    });
-    let out = upload(&ring, &mut lanes, &mut route, &pos, cfg, &stop, sink);
+    let out = upload(&ring, &mut lanes, &mut route, &pos, cfg, &stop, batches);
     // The copies read the ring and write the stores: neither may go before them.
     let drained = lanes.iter().try_for_each(|l| {
         l.store.ctx.bind_to_thread()?;
@@ -878,12 +766,6 @@ pub fn run_region_uploader(
     Ok(rep)
 }
 
-/// Where landed batches go, with their counts if there is a tap.
-struct Out {
-    tx: Sender<FrameBatch>,
-    tap: Option<Arc<CountsPool>>,
-}
-
 fn upload(
     ring: &Ring,
     lanes: &mut [Lane],
@@ -891,7 +773,7 @@ fn upload(
     pos: &PosTable,
     cfg: UploaderConfig,
     stop: &AtomicBool,
-    out: Option<Out>,
+    batches: Option<Sender<FrameBatch>>,
 ) -> Result<UploadReport, GrowError> {
     let slots = ring.slots;
     let se = ring.slot_elems;
@@ -911,8 +793,6 @@ fn upload(
         store_waits: 0,
         bytes: 0,
         max_inflight: 0,
-        counts_dry: 0,
-        counts_copy: Histogram::new(200_000),
         rx_to_gpu: Histogram::new(200_000),
         rx_to_commit: Histogram::new(200_000),
         pub_to_gpu: Histogram::new(200_000),
@@ -1112,7 +992,7 @@ fn upload(
             let seqs = f.seq0..f.seq0 + f.n;
             // Every region that takes the batch holds it.
             let t = wall_ns();
-            let positions = match out {
+            let positions = match batches {
                 // SAFETY: the slots are committed and not yet released, so
                 // no worker writes them (see `Ring`).
                 Some(_) => seqs
@@ -1137,31 +1017,13 @@ fn upload(
                 rep.routes.push(routes[at(seq)]);
             }
             rep.frames += f.n;
-            let counts = out.as_ref().and_then(|o| o.tap.as_ref()).and_then(|pool| {
-                let t = wall_ns();
-                // SAFETY: as for the positions; a batch's slots run from
-                // `at(seq0)` without wrapping.
-                let src = unsafe {
-                    std::slice::from_raw_parts(
-                        ring.frames_ptr.add(at(f.seq0) * se),
-                        f.n as usize * se,
-                    )
-                };
-                let c = lend(pool, src);
-                match c {
-                    Some(_) => rep.counts_copy.record(wall_ns() - t),
-                    None => rep.counts_dry += 1,
-                }
-                c
-            });
             ring.released.store(f.release, Ordering::Release);
-            if let Some(o) = &out {
+            if let Some(tx) = &batches {
                 // A consumer that has gone away does not stop the input.
-                let _ = o.tx.send(FrameBatch {
+                let _ = tx.send(FrameBatch {
                     f0: f.f0,
                     n: f.n,
                     positions,
-                    counts,
                 });
             }
             free.push(f.ev);
@@ -1675,8 +1537,7 @@ mod tests {
                     .result()?;
                 }
                 let mut route = ByUid(2, |_| 0b11);
-                let sink = Some(Out { tx, tap: None });
-                let out = upload(&ring, &mut lanes, &mut route, &pos, cfg(), &stop, sink);
+                let out = upload(&ring, &mut lanes, &mut route, &pos, cfg(), &stop, Some(tx));
                 lanes.iter().try_for_each(|l| l.stream.synchronize())?;
                 out
             })
@@ -1950,85 +1811,6 @@ mod tests {
         }
         // The uploader dropped the store with batches still queued.
         ctx.synchronize().expect("a queued copy faulted");
-    }
-
-    /// Batches of five, one at a time: each carries its frames' counts while
-    /// a tap buffer is free; with both held the next goes without and is
-    /// counted, and the buffers are lent again once the batches drop.
-    #[test]
-    fn the_tap_lends_each_batch_its_counts_and_a_dry_tap_sends_none() {
-        let ctx = Context::new(0).expect("GPU 0");
-        let se = 4096;
-        // Batches start at slots 0, 5, 10, 15: none is cut by the wrap.
-        let ring = Arc::new(Ring::new(&ctx, 20, se).unwrap());
-        let store = Arc::new(DeviceStore::new(&ctx, 40, se).unwrap());
-        let pos = Arc::new(PosTable::new(256));
-        let stop = Arc::new(AtomicBool::new(false));
-        let (tx, rx) = crossbeam_channel::unbounded();
-        // A batch smaller than five waits for the rest of its frames.
-        let cfg = UploaderConfig {
-            flush_ns: 1_000_000_000,
-            ..cfg()
-        };
-        let up = {
-            let (ring, store, pos, stop) = (ring.clone(), store.clone(), pos.clone(), stop.clone());
-            std::thread::spawn(move || {
-                let landing = Landing {
-                    tap: Some(Tap {
-                        buffers: 2,
-                        batch: 5,
-                    }),
-                    ..Landing::new(vec![store], Whole)
-                };
-                run_region_uploader(ring, landing, pos, cfg, stop, Some(tx))
-            })
-        };
-        let mut held = Vec::new();
-        for (k, lent) in [true, true, false, true, true].into_iter().enumerate() {
-            if k == 3 {
-                held.clear();
-            }
-            produce(&ring, &pos, 5);
-            let b = rx.recv_timeout(Duration::from_secs(60)).expect("a batch");
-            assert_eq!((b.f0, b.n), (5 * k as u64, 5));
-            assert_eq!(b.counts.is_some(), lent, "batch {k}");
-            if let Some(c) = &b.counts {
-                let want: Vec<u16> = (b.f0..b.f0 + 5)
-                    .flat_map(|f| (0..se).map(move |j| pixel(1000 + f as i32, j)))
-                    .collect();
-                assert!(c.as_slice() == want, "batch {k}");
-            }
-            held.push(b);
-        }
-        stop.store(true, Ordering::Release);
-        let rep = up.join().unwrap().unwrap();
-        assert_eq!((rep.frames, rep.batches, rep.counts_dry), (25, 5, 1));
-        assert_eq!(rep.counts_copy.count(), 4);
-    }
-
-    /// A tap whose buffers hold fewer frames than a batch is refused before
-    /// anything starts.
-    #[test]
-    fn a_tap_smaller_than_the_batch_is_refused() {
-        let ctx = Context::new(0).expect("GPU 0");
-        let ring = Arc::new(Ring::new(&ctx, 8, 64).unwrap());
-        let store = Arc::new(DeviceStore::new(&ctx, 8, 64).unwrap());
-        let landing = Landing {
-            tap: Some(Tap {
-                buffers: 2,
-                batch: 4,
-            }),
-            ..Landing::new(vec![store], Whole)
-        };
-        let (pos, stop) = (Arc::new(PosTable::new(64)), Arc::new(AtomicBool::new(true)));
-        let (tx, _rx) = crossbeam_channel::unbounded();
-        let err = run_region_uploader(ring, landing, pos, cfg(), stop, Some(tx))
-            .err()
-            .expect("refused");
-        assert!(
-            matches!(&err, GrowError::Gpu(crate::gpu::Error::Shape(m)) if m.contains("4-frame")),
-            "{err:?}"
-        );
     }
 
     /// The uploader's own copy, held behind a gate while the ring and the store

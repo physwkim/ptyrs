@@ -2,16 +2,24 @@
 
 use cuda_core::CudaContext;
 use numpy::{
-    PyArray3, PyArray4, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArray3, PyReadonlyArray4,
+    PyArray1, PyArray2, PyArray3, PyArray4, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2,
+    PyReadonlyArray3, PyReadonlyArray4,
 };
 use ptyrs::base::{C64, Object, Probe};
-use ptyrs::engine::{BhParams, GpuOptions, LsqmlParams};
+use ptyrs::engine::{BhParams, GpuOptions, LsqmlParams, ProbeVariation};
 use pyo3::exceptions::PyTypeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
-use crate::cpu::Optics;
+use crate::cpu::{LSQML, Opr, Optics, variation};
 use crate::{Error, Scan, history, llk_dict, objects_in, objects_out, params, stack_in, stack_out};
+
+/// LSQML's OPR as `GpuPtycho.lsqml` returns it: eigenmodes, weights and main-mode weights.
+type OprOut<'py> = (
+    Bound<'py, PyArray3<C64>>,
+    Bound<'py, PyArray2<f64>>,
+    Option<Bound<'py, PyArray1<f64>>>,
+);
 
 /// The GPU reconstruction state of a scan on CUDA device `device`, under `optics` in place of
 /// the far field of the scan's geometry if given; keywords are `GpuOptions` fields. `object`
@@ -64,7 +72,7 @@ impl GpuPtycho {
             ptyrs::engine::GpuPtycho::with_slices(&ctx, &scan.0, optics, &objects, probe, options);
         Ok(Self(
             engine.map_err(Error::from)?,
-            scan.0.counts.frame_shape(),
+            scan.0.counts.frame_shape().sides(),
         ))
     }
 
@@ -141,24 +149,46 @@ impl GpuPtycho {
     }
 
     /// `nepoch` LSQML epochs from a fresh LSQML (`cost` `"amplitude"` or `"poisson"`), an LLK
-    /// record every `calc_llk` epochs and after the last.
-    fn lsqml(
+    /// record every `calc_llk` epochs and after the last. With the keywords `opr` and `hold`
+    /// as `Lsqml` takes them (`hold` of `"weights"` and `"intensity"`), the epochs model that
+    /// OPR of probe mode 0 and return its `(eigenmodes, weights, intensity)` as they leave
+    /// them; `None` without `opr`.
+    #[pyo3(signature = (nepoch, calc_llk, batch_size, cost, seed, **kw))]
+    fn lsqml<'py>(
         &mut self,
         nepoch: usize,
         calc_llk: usize,
         batch_size: usize,
         cost: &str,
         seed: u64,
-    ) -> PyResult<()> {
+        kw: Option<&Bound<'py, PyDict>>,
+    ) -> PyResult<Option<OprOut<'py>>> {
         let params = LsqmlParams {
             batch_size,
             cost: crate::cost(cost)?,
             seed,
         };
-        Ok(self
-            .0
-            .lsqml(&params, nepoch, calc_llk)
-            .map_err(Error::from)?)
+        let (mut opr, mut hold): (Option<Opr<'py>>, Vec<String>) = (None, Vec::new());
+        let k = crate::Kwargs::new(kw)?;
+        k.set("opr", &mut opr)?;
+        k.set("hold", &mut hold)?;
+        k.finish()?;
+        let [_, weights, intensity] = LSQML;
+        let given = [opr.is_some(), opr.as_ref().is_some_and(|o| o.2.is_some())];
+        let held = crate::held(&hold, [weights, intensity], given)?;
+        let py = opr.as_ref().map(|o| o.0.py());
+        let var = opr.map(|o| variation(o, held)).transpose()?;
+        let mut v = var.unwrap_or_else(|| ProbeVariation::none(self.1));
+        (self.0.lsqml(&params, &mut v, nepoch, calc_llk)).map_err(Error::from)?;
+        let Some(py) = py else {
+            return Ok(None);
+        };
+        let (w, k) = (&v.weights().values, v.eigenmodes().len());
+        Ok(Some((
+            stack_out(py, v.eigenmodes().clone())?,
+            PyArray1::from_slice(py, w).reshape([w.len() / k, k])?,
+            v.intensity().map(|c| PyArray1::from_slice(py, &c.values)),
+        )))
     }
 
     /// The last LSQML epoch's steps as `Lsqml.epoch` returns them; none before an LSQML call.

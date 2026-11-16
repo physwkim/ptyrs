@@ -50,7 +50,7 @@ impl Optics {
             pixel,
             quad: quad_phase(g),
             plane_quad: pixel.map(|p| PI * p * p / (g.wavelength * g.distance)),
-            propagator: Propagator::Fourier(Fft2::new(g.frame)),
+            propagator: Propagator::Fourier(Fft2::new(g.frame.sides())),
             gaps: Vec::new(),
         }
     }

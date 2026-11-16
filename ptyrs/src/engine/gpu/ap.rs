@@ -2,6 +2,7 @@
 
 use crate::gpu::{
     Error as GpuError, Exit, FarSums, FusedBufs, FusedInputs, FusedSums, RecordWriter, ShiftProbe,
+    ShiftedStepSums,
 };
 use cuda_async::device_operation::ExecutionContext;
 
@@ -107,9 +108,16 @@ impl Bufs<'_> {
     ) -> Result<bool, GpuError> {
         let probe = probe_inertia.is_some();
         let dims = *self.views.dims();
-        let mut m = (self.features)
-            .lend(ctx, self.kernels, &dims, self.obj, self.probe, self.exit)?
-            .one_slice(one);
+        let (m, step) = (self.features).lend_shifted::<ShiftedStepSums>(
+            ctx,
+            self.kernels,
+            &dims,
+            self.obj,
+            self.probe,
+            self.exit,
+        )?;
+        let mut m = m.one_slice(one);
+        let mut step = step.filter(|_| probe);
         for s in 0..self.scratch.len() {
             let stack = self.scratch.at(s);
             let windows = self.windows.as_deref_mut();
@@ -127,7 +135,7 @@ impl Bufs<'_> {
                     ..FarSums::default()
                 };
                 let sums = FusedSums {
-                    obj: obj.then(|| w.zeroed_sums(ctx)).transpose()?,
+                    obj: obj.then(|| w.zeroed_patches(ctx)).transpose()?,
                     ..FusedSums::default()
                 };
                 (self.kernels).fused_project(ctx, &inputs, stack, Exit::Ap { far }, f, sums)?;
@@ -164,7 +172,7 @@ impl Bufs<'_> {
             let exit = Exit::Ap { far };
             let sums = FusedSums {
                 obj: obj.then_some(&mut *self.obj_sums),
-                shift: m.shift_sums(probe.then_some(ShiftProbe::Step as _), true),
+                shift: m.shift_sums(step.as_deref_mut().map(ShiftProbe::Step), true),
                 ..FusedSums::default()
             };
             self.kernels
@@ -183,20 +191,16 @@ impl Bufs<'_> {
                 )?;
             }
         }
-        let Some(inertia) = probe_inertia else {
+        let (Some(inertia), Some(step)) = (probe_inertia, step) else {
             return Ok(false);
         };
-        m.probe_sums(ctx, self.kernels, &dims, self.probe_sums)?;
-        let model = m.model();
-        let Some(ShiftProbe::Step(step)) = m.shift_sums(Some(ShiftProbe::Step), false).probe else {
-            return Ok(false);
-        };
+        (self.kernels).shifted_probe_sums(ctx, &dims, &mut *step, self.probe_sums)?;
         let inputs = FusedInputs {
             views: self.views,
             counts: self.counts,
             obj: self.obj,
             probe: self.probe,
-            model,
+            model: m.model(),
         };
         let stacks = (0..self.scratch.len()).map(|s| self.scratch.at(s));
         let sums = &mut *self.probe_sums;

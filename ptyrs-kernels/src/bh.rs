@@ -809,19 +809,19 @@ pub mod bh_kernels {
     }
 
     /// One array's step from `step = (β, α, ..)` of [`bh_step`]: `D = β prev − scale g`,
-    /// `x += α D`, `prev = D`, and the consumed gradient sums are zero. Outside CG `β = 0`,
+    /// `x += α D`, `prev = D`, and the consumed gradient `g` is zero. Outside CG `β = 0`,
     /// so a finite `prev` drops out exactly.
     ///
     /// # Safety
     ///
-    /// `x`, `prev`, `g.num` hold `n` complex values, `g.den` `n` floats, `step` two.
+    /// `x`, `prev`, `g` hold `n` complex values, `step` two.
     ///
     /// [`bh_step`]: LoadedModule::bh_step
     #[kernel]
     pub unsafe fn bh_update(
         x: *mut f32,
         prev: *mut f32,
-        g: SumPtrs,
+        g: *mut f32,
         n: u32,
         scale: f32,
         step: *const f32,
@@ -832,13 +832,12 @@ pub mod bh_kernels {
         }
         unsafe {
             let (beta, alpha) = (*step, *step.add(1));
-            let (gv, pv) = (load_c(g.num, i), load_c(prev, i));
+            let (gv, pv) = (load_c(g, i), load_c(prev, i));
             let dv = (beta * pv.0 - scale * gv.0, beta * pv.1 - scale * gv.1);
             let xv = load_c(x, i);
             store_c(x, i, (xv.0 + alpha * dv.0, xv.1 + alpha * dv.1));
             store_c(prev, i, dv);
-            store_c(g.num, i, (0.0, 0.0));
-            *g.den.add(i) = 0.0;
+            store_c(g, i, (0.0, 0.0));
         }
     }
 

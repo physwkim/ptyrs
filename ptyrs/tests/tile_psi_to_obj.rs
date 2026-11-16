@@ -10,7 +10,8 @@ use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, DeviceCopy};
 use cutile::tile_kernel::jit_compile_count;
 use ptyrs::gpu::{
-    C32, Kernels, OBJ_TILE, StackCtl, StackTable, UpdateSums, ViewAddr, ViewDims, Views, view_tiles,
+    C32, DeviceStackTable, Kernels, OBJ_TILE, StackCtl, StackTable, UpdateSums, ViewAddr, ViewDims,
+    Views, view_tiles,
 };
 use ptyrs::tile::TileKernels;
 
@@ -139,7 +140,7 @@ fn stack_psi(all: &[C32], fsize: usize, f: Range<u32>, nf_max: u32) -> Vec<C32> 
 }
 
 /// Writes `{ f0, nf }` to the one entry of `table`.
-fn set_entry(k: &Kernels, stream: &CudaStream, table: &StackTable, f0: u32, nf: u32) {
+fn set_entry(k: &Kernels, stream: &CudaStream, table: &DeviceStackTable, f0: u32, nf: u32) {
     stream.synchronize().unwrap();
     let ctl = [StackCtl { f0, nf }];
     k.context().bind_to_thread().unwrap();
@@ -398,8 +399,10 @@ fn psi_to_obj_follows_the_device_entry() {
     let fx = Fixture::new();
     let (stream, ex, views) = (&fx.stream, &fx.ex, &fx.views);
     let fsize = Fixture::fsize(&fx.d);
-    let dev = StackTable::device(stream, &fx.d, 3).unwrap();
-    let tk = TileKernels::new(stream, views, &dev).unwrap();
+    let dev = DeviceStackTable::new(stream, &fx.d, 3).unwrap();
+    // Kernels compiled for a table serve every table of its `nf_max`.
+    let same_nf_max = StackTable::new(stream, &fx.d, std::slice::from_ref(&(0..3))).unwrap();
+    let tk = TileKernels::new(stream, views, &same_nf_max).unwrap();
     let jit = jit_compile_count();
     let nframe = fx.d.nframe;
     let entries = [
@@ -423,10 +426,10 @@ fn psi_to_obj_follows_the_device_entry() {
         );
         set_entry(&fx.k, stream, &dev, f0, nf);
         let mut simt = fx.start();
-        fx.k.psi_to_obj(ex, views, dev.at(0), &psi, &fx.probe, &mut simt)
+        fx.k.psi_to_obj(ex, views, dev.stack(), &psi, &fx.probe, &mut simt)
             .unwrap();
         let mut tile = fx.start();
-        tk.psi_to_obj(ex, dev.at(0), &psi, &fx.probe, &mut tile)
+        tk.psi_to_obj(ex, dev.stack(), &psi, &fx.probe, &mut tile)
             .unwrap();
         let what = format!("psi_to_obj entry {{ f0: {f0}, nf: {nf} }} = frames {f:?}");
         let (simt, tile) = (host(stream, &simt), host(stream, &tile));

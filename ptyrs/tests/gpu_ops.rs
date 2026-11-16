@@ -11,12 +11,12 @@ use cuda_async::error::DeviceError;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, DeviceCopy, DriverError};
 use ptyrs::fft::{FftError, Plan2d};
 use ptyrs::gpu::{
-    BackgroundSums, C32, Error, Exit, ExitPass, ExitStage, FUSED_SIDES, FarSums, FusedBufs,
-    FusedInputs, FusedSums, HalfWaves, Kernels, Lines, LlkPartial, LlkScratch, LlkSums, MASKED,
-    Model, OBJ_TILE, OpticsKernels, Permutation, PositionPartial, ProbeSpectrum, PsiSums,
-    ScalePartial, Shift, ShiftProbe, ShiftSums, ShiftedProbeSums, SpectrumBuf, StackCtl, StackRef,
-    StackTable, UpdateSums, ViewAddr, ViewDims, Views, Waves, half_scale, lease, record,
-    view_tiles,
+    BackgroundSums, C32, DeviceStackTable, Error, Exit, ExitPass, ExitStage, FUSED_SIDES, FarSums,
+    FusedBufs, FusedInputs, FusedSums, HalfWaves, Kernels, Lines, LlkPartial, LlkScratch, LlkSums,
+    MASKED, Model, OBJ_TILE, OpticsKernels, Permutation, PositionPartial, ProbeSpectrum, PsiSums,
+    ScalePartial, Shift, ShiftProbe, ShiftSums, ShiftedNumSums, ShiftedProbes, ShiftedStepSums,
+    SpectrumBuf, StackCtl, StackRef, StackTable, UpdateSums, ViewAddr, ViewDims, Views, Waves,
+    half_scale, lease, record, view_tiles,
 };
 
 #[path = "common/worst.rs"]
@@ -57,7 +57,7 @@ fn up<T: DeviceCopy>(stream: &CudaStream, host: &[T]) -> DeviceBuffer<T> {
 
 /// Writes `table`'s one entry on `stream`, leased like a launch. A replay that reads it must
 /// run on the same stream: a non-blocking stream does not wait for another stream's write.
-fn set_entry(stream: &Arc<CudaStream>, table: &StackTable, f0: u32, nf: u32) {
+fn set_entry(stream: &Arc<CudaStream>, table: &DeviceStackTable, f0: u32, nf: u32) {
     let ctl = [StackCtl { f0, nf }];
     record(|ctx| {
         lease(ctx, &[], &[table.storage()])?;
@@ -886,7 +886,7 @@ fn owned_views_update_only_the_owned_tiles() {
                 obj: Some(&mut *shift),
                 probe: None,
                 shift: ShiftSums {
-                    probe: Some(ShiftProbe::Sums(&mut sh.probe)),
+                    probe: Some(sh.probe.num()),
                     position: Some(&mut sh.pos),
                     position_den: Some(&mut sh.den),
                 },
@@ -897,9 +897,7 @@ fn owned_views_update_only_the_owned_tiles() {
             waves[2].extend(c32_bits(&work[..s.nk(frames) * n]));
         }
         // `sh.obj` stays zero; the shifted gather went to `shift`.
-        let mut side = sh.bits(&stream, s, |p, u| {
-            k.shifted_probe_sums(&ex, &s.d, p, u).unwrap()
-        });
+        let mut side = sh.bits(&stream, s, |mut t| t.run(&k, &ex, &s.d).unwrap());
         let num = c32_bits(&probe.num.to_host_vec(&stream).unwrap());
         side.extend(num.into_iter().flat_map(|(re, im)| [re, im]));
         side.extend(f32_bits(&probe.den.to_host_vec(&stream).unwrap()));
@@ -1706,7 +1704,10 @@ fn views_and_frame_ranges_are_checked() {
     }
     for nf_max in [0, 6] {
         assert!(
-            table_err(StackTable::device(&stream, &s.d, nf_max)),
+            matches!(
+                DeviceStackTable::new(&stream, &s.d, nf_max),
+                Err(Error::Shape(_))
+            ),
             "nf_max {nf_max}"
         );
     }
@@ -1949,12 +1950,12 @@ fn one_graph_runs_whichever_stack_its_entry_holds() {
     record(|ctx| eager.clear(ctx)).sync_on(&stream).unwrap();
     want.push(eager.bits(&stream));
 
-    let dev = StackTable::device(&stream, &s.d, 3).unwrap();
+    let dev = DeviceStackTable::new(&stream, &s.d, 3).unwrap();
     let mut it = StackRun::new(&stream, &s, dev.nf_max());
     let side = k.context().new_stream().unwrap();
     let graph = CudaGraph::capture(
         side.clone(),
-        record(|ctx| it.run(ctx, &k, &views, dev.at(0), &counts)),
+        record(|ctx| it.run(ctx, &k, &views, dev.stack(), &counts)),
     )
     .unwrap();
     let entries = [(0, 3), (3, 2), (1, 3), (4, 3), (9, 2)];
@@ -1976,13 +1977,13 @@ fn empty_stack_replay_writes_nothing() {
     let s = scan();
     let views = Views::new(&stream, s.d, &s.views).unwrap();
     let counts = up(&stream, &counts(s.d.nframe as usize * s.n()));
-    let dev = StackTable::device(&stream, &s.d, 3).unwrap();
+    let dev = DeviceStackTable::new(&stream, &s.d, 3).unwrap();
     let mut it = StackRun::new(&stream, &s, dev.nf_max());
     it.fill_noise(&stream);
     let side = k.context().new_stream().unwrap();
     let graph = CudaGraph::capture(
         side.clone(),
-        record(|ctx| it.ops(ctx, &k, &views, dev.at(0), &counts)),
+        record(|ctx| it.ops(ctx, &k, &views, dev.stack(), &counts)),
     )
     .unwrap();
     let start = it.bits(&stream);
@@ -2041,7 +2042,7 @@ fn bin_views_appends_each_stack_to_the_tile_slabs() {
     let plist = packed.tile_views().to_host_vec(&stream).unwrap();
     let ntiles = plen.len();
     let full = *plen.iter().max().unwrap();
-    let dev = StackTable::device(&stream, &d, 9).unwrap();
+    let dev = DeviceStackTable::new(&stream, &d, 9).unwrap();
     let side = k.context().new_stream().unwrap();
     for cap in [full, full - 1] {
         let unset = vec![u32::MAX; ntiles * cap as usize];
@@ -2053,7 +2054,7 @@ fn bin_views_appends_each_stack_to_the_tile_slabs() {
         let mut overflow = up(&stream, &[0u32]);
         let graph = CudaGraph::capture(
             side.clone(),
-            record(|ctx| k.bin_views(ctx, &mut views, dev.at(0), &mut overflow)),
+            record(|ctx| k.bin_views(ctx, &mut views, dev.stack(), &mut overflow)),
         )
         .unwrap();
         let state = |views: &Views, overflow: &DeviceBuffer<u32>| {
@@ -3320,7 +3321,7 @@ fn fused_empty_stack_replay_writes_nothing() {
     let (stream, _, k) = setup();
     let fs = FusedScan::new(&stream, [256, 128], [2, 2]);
     let (s, n) = (&fs.s, fs.s.n());
-    let dev = StackTable::device(&stream, &s.d, 3).unwrap();
+    let dev = DeviceStackTable::new(&stream, &s.d, 3).unwrap();
     let mut bufs = FusedBufs::new(&stream, &s.d, 3).unwrap();
     let mut psi = up(&stream, &noise(s.nk(&(0..3)) * n, 70, 1.0));
     let mut raar_psi = up(&stream, &noise(s.nk(&(0..3)) * n, 81, 1.0));
@@ -3376,7 +3377,7 @@ fn fused_empty_stack_replay_writes_nothing() {
                 probe: Some(&mut ap_probe),
                 ..Default::default()
             };
-            k.fused_project(ctx, &inputs, dev.at(0), ap, &mut bufs, sums)?;
+            k.fused_project(ctx, &inputs, dev.stack(), ap, &mut bufs, sums)?;
             let dm = Exit::Dm {
                 psi: &mut psi,
                 alpha: 0.02,
@@ -3386,7 +3387,7 @@ fn fused_empty_stack_replay_writes_nothing() {
                 probe: Some(&mut dm_probe),
                 ..Default::default()
             };
-            k.fused_project(ctx, &inputs, dev.at(0), dm, &mut bufs, sums)?;
+            k.fused_project(ctx, &inputs, dev.stack(), dm, &mut bufs, sums)?;
             let raar = Exit::Raar {
                 psi: &mut raar_psi,
                 iterate: &mut iterate,
@@ -3395,7 +3396,7 @@ fn fused_empty_stack_replay_writes_nothing() {
             k.fused_project(
                 ctx,
                 &inputs,
-                dev.at(0),
+                dev.stack(),
                 raar,
                 &mut bufs,
                 FusedSums::default(),
@@ -4295,47 +4296,85 @@ fn shift_f64_reference_is_self_consistent() {
     }
 }
 
+/// The shifted probe's sums of one kind, with what [`Kernels::shifted_probe_sums`] turns them
+/// into.
+enum Turn<'a> {
+    Num(&'a mut ShiftedNumSums, &'a mut DeviceBuffer<C32>),
+    Step(&'a mut ShiftedStepSums, &'a mut UpdateSums),
+}
+
+impl Turn<'_> {
+    /// [`Kernels::shifted_probe_sums`] of these sums on `ctx`.
+    fn run(&mut self, k: &Kernels, ctx: &ExecutionContext, d: &ViewDims) -> Result<(), Error> {
+        match self {
+            Self::Num(sums, out) => k.shifted_probe_sums(ctx, d, *sums, *out),
+            Self::Step(sums, out) => k.shifted_probe_sums(ctx, d, *sums, *out),
+        }
+    }
+}
+
 /// A shifted run's sums on the device.
 struct ShiftOut {
     obj: UpdateSums,
-    probe: ShiftedProbeSums,
+    probe: ShiftedProbes,
     pos: DeviceBuffer<PositionPartial>,
     den: DeviceBuffer<PositionPartial>,
+    /// The probe's sums are added as [`ShiftProbe::Step`], with the denominator, which under
+    /// [`Exit::Grad`] are `x`'s; else as [`ShiftProbe::Num`].
+    step: bool,
 }
 
 impl ShiftOut {
+    /// The probe's sums added as [`ShiftProbe::Num`].
     fn zeroed(stream: &CudaStream, s: &Scan) -> Self {
         let nf = s.d.nframe as usize;
         Self {
             obj: UpdateSums::zeroed(stream, s.obj.len()).unwrap(),
-            probe: ShiftedProbeSums::zeroed(stream, &s.d).unwrap(),
+            probe: ShiftedProbes::zeroed(stream, &s.d).unwrap(),
             pos: DeviceBuffer::zeroed(stream, nf).unwrap(),
             den: DeviceBuffer::zeroed(stream, nf).unwrap(),
+            step: false,
+        }
+    }
+
+    /// The probe's sums added as [`ShiftProbe::Step`].
+    fn stepped(stream: &CudaStream, s: &Scan) -> Self {
+        Self {
+            step: true,
+            ..Self::zeroed(stream, s)
         }
     }
 
     /// All of them, `position_den` only if `den`.
     fn sums(&mut self, den: bool) -> FusedSums<'_> {
+        let probe = match self.step {
+            true => self.probe.step(),
+            false => self.probe.num(),
+        };
         FusedSums {
             obj: Some(&mut self.obj),
             probe: None,
             shift: ShiftSums {
-                probe: Some(ShiftProbe::Sums(&mut self.probe)),
+                probe: Some(probe),
                 position: Some(&mut self.pos),
                 position_den: den.then_some(&mut self.den),
             },
         }
     }
 
-    /// The probe's update sums from `shifted_probe_sums`, which `run` launches.
+    /// The probe's update sums from `shifted_probe_sums`, which `run` launches: their
+    /// numerator alone, the denominator left zero, unless [`Self::step`].
     fn probe_sums(
         &mut self,
         stream: &CudaStream,
         s: &Scan,
-        run: impl FnOnce(&mut ShiftedProbeSums, &mut UpdateSums),
+        run: impl FnOnce(Turn<'_>),
     ) -> UpdateSums {
         let mut out = UpdateSums::zeroed(stream, s.probe.len()).unwrap();
-        run(&mut self.probe, &mut out);
+        match self.step {
+            true => run(Turn::Step(self.probe.get(), &mut out)),
+            false => run(Turn::Num(self.probe.get(), &mut out.num)),
+        }
         out
     }
 
@@ -4348,16 +4387,18 @@ impl ShiftOut {
         s: &Scan,
         r: &ShiftRef,
         den: bool,
-        run: impl Fn(&mut ShiftedProbeSums, &mut UpdateSums),
+        run: impl Fn(Turn<'_>),
     ) {
         let probe = self.probe_sums(stream, s, &run);
         let pnum = shift_adjoint(s, &r.spec);
         for (who, sums, num, den) in [
-            ("object", &self.obj, &r.num, &r.den),
-            ("probe", &probe, &pnum, &r.pden),
+            ("object", &self.obj, &r.num, Some(&r.den)),
+            ("probe", &probe, &pnum, self.step.then_some(&r.pden)),
         ] {
             let en = rel_l2(&sums.num.to_host_vec(stream).unwrap(), num);
-            let ed = rel_l2_re(&sums.den.to_host_vec(stream).unwrap(), den);
+            let ed = den.map_or(0.0, |den| {
+                rel_l2_re(&sums.den.to_host_vec(stream).unwrap(), den)
+            });
             println!("{what} {who} sums: num rel L2 {en:.2e}, den {ed:.2e}");
             assert!(en < 1e-5 && ed < 1e-5, "{what} {who}: {en:.2e}, {ed:.2e}");
         }
@@ -4404,7 +4445,7 @@ impl ShiftOut {
         &mut self,
         stream: &CudaStream,
         s: &Scan,
-        run: impl FnOnce(&mut ShiftedProbeSums, &mut UpdateSums),
+        run: impl FnOnce(Turn<'_>),
     ) -> [Vec<u32>; 2] {
         let probe = self.probe_sums(stream, s, run);
         [&self.obj, &probe].map(|u| {
@@ -4418,12 +4459,7 @@ impl ShiftOut {
     }
 
     /// The bits of every sum, the probe's turned into update sums by `run`.
-    fn bits(
-        &mut self,
-        stream: &CudaStream,
-        s: &Scan,
-        run: impl FnOnce(&mut ShiftedProbeSums, &mut UpdateSums),
-    ) -> Vec<u32> {
+    fn bits(&mut self, stream: &CudaStream, s: &Scan, run: impl FnOnce(Turn<'_>)) -> Vec<u32> {
         let mut out = self.update_bits(stream, s, run).concat();
         for p in [&self.pos, &self.den] {
             let p = p.to_host_vec(stream).unwrap();
@@ -4452,7 +4488,8 @@ fn fused_shift_matches_f64() {
         let stacks = [0..3, 3..5];
         let table = StackTable::new(&stream, &s.d, &stacks).unwrap();
         let mut bufs = FusedBufs::with_shift(&stream, &s.d, table.nf_max()).unwrap();
-        let [mut ap, mut grad, mut dm, mut raar] = [(); 4].map(|_| ShiftOut::zeroed(&stream, s));
+        let [mut ap, mut dm, mut raar] = [(); 3].map(|_| ShiftOut::zeroed(&stream, s));
+        let mut grad = ShiftOut::stepped(&stream, s);
         let [mut ap_ref, mut grad_ref, mut dm_ref, mut raar_ref] =
             [(); 4].map(|_| ShiftRef::new(s));
         let mut llk = DeviceBuffer::<LlkPartial>::zeroed(&stream, 3).unwrap();
@@ -4590,8 +4627,8 @@ fn fused_shift_matches_f64() {
             ("shifted DM", &mut dm, &dm_ref, true),
             ("shifted RAAR", &mut raar, &raar_ref, true),
         ] {
-            out.check(&format!("{what} {frame:?}"), &stream, s, r, den, |p, u| {
-                k.shifted_probe_sums(&ex, &s.d, p, u).unwrap()
+            out.check(&format!("{what} {frame:?}"), &stream, s, r, den, |mut t| {
+                t.run(&k, &ex, &s.d).unwrap()
             });
         }
     }
@@ -4622,7 +4659,11 @@ fn fused_shift_results_do_not_depend_on_the_stack_split() {
     let mut results = vec![];
     for split in &splits {
         let table = StackTable::new(&stream, &s.d, split).unwrap();
-        let mut outs = [(); 3].map(|_| ShiftOut::zeroed(&stream, s));
+        let mut outs = [
+            ShiftOut::zeroed(&stream, s),
+            ShiftOut::stepped(&stream, s),
+            ShiftOut::zeroed(&stream, s),
+        ];
         let [ap, grad, dm] = &mut outs;
         let mut llk = DeviceBuffer::<LlkPartial>::zeroed(&stream, 5).unwrap();
         let (mut waves, mut partials) = ([(); 3].map(|_| vec![]), vec![]);
@@ -4656,11 +4697,9 @@ fn fused_shift_results_do_not_depend_on_the_stack_split() {
                 .unwrap();
             waves[2].extend(c32_bits(&psi.to_host_vec(&stream).unwrap()[..len]));
         }
-        let sums = outs.each_mut().map(|o| {
-            o.bits(&stream, s, |sums, out| {
-                k.shifted_probe_sums(&ex, &s.d, sums, out).unwrap()
-            })
-        });
+        let sums = outs
+            .each_mut()
+            .map(|o| o.bits(&stream, s, |mut t| t.run(&k, &ex, &s.d).unwrap()));
         results.push((waves, partials, sums));
     }
     for (split, r) in splits.iter().zip(&results).skip(1) {
@@ -4710,7 +4749,7 @@ fn shifted_psi_sums_match_fused_project() {
                 .collect();
             let table = StackTable::new(&stream, &s.d, &split).unwrap();
             let [mut dm, mut both, mut obj, mut probe] =
-                [(); 4].map(|_| ShiftOut::zeroed(&stream, s));
+                [(); 4].map(|_| ShiftOut::stepped(&stream, s));
             for (i, frames) in split.iter().enumerate() {
                 let stack = table.at(i);
                 let at = frames.start as usize * nm * n;
@@ -4728,17 +4767,14 @@ fn shifted_psi_sums_match_fused_project() {
                 ] {
                     let sums = PsiSums {
                         obj: o.then_some(&mut out.obj),
-                        probe: p.then_some(ShiftProbe::Sums(&mut out.probe)),
+                        probe: p.then_some(out.probe.step()),
                     };
                     k.shifted_psi_sums(&ex, &inputs, stack, &psi, &mut bufs, sums)
                         .unwrap();
                 }
             }
-            let bits = |o: &mut ShiftOut| {
-                o.update_bits(&stream, s, |sums, out| {
-                    k.shifted_probe_sums(&ex, &s.d, sums, out).unwrap()
-                })
-            };
+            let bits =
+                |o: &mut ShiftOut| o.update_bits(&stream, s, |mut t| t.run(&k, &ex, &s.d).unwrap());
             let want = bits(&mut dm);
             let [both, obj, probe] = [&mut both, &mut obj, &mut probe].map(bits);
             for (who, i) in [("object", 0), ("probe", 1)] {
@@ -5029,20 +5065,17 @@ fn fused_f16_waves_round_the_f32_ones() {
         assert_half_rounded(&what("shifted DM"), &shifted, &host(&f), scale);
         drop(go);
         let same = up(&stream, &shifted);
-        let (mut ho, mut fo) = (ShiftOut::zeroed(&stream, s), ShiftOut::zeroed(&stream, s));
+        let (mut ho, mut fo) = (ShiftOut::stepped(&stream, s), ShiftOut::stepped(&stream, s));
         for (out, waves) in [(&mut ho, &h as &dyn Waves), (&mut fo, &same)] {
             let sums = PsiSums {
                 obj: Some(&mut out.obj),
-                probe: Some(ShiftProbe::Sums(&mut out.probe)),
+                probe: Some(out.probe.step()),
             };
             k.shifted_psi_sums(&ex, &inputs, stack, waves, &mut bufs, sums)
                 .unwrap();
         }
-        let bits = |o: &mut ShiftOut| {
-            o.update_bits(&stream, s, |sums, out| {
-                k.shifted_probe_sums(&ex, &s.d, sums, out).unwrap()
-            })
-        };
+        let bits =
+            |o: &mut ShiftOut| o.update_bits(&stream, s, |mut t| t.run(&k, &ex, &s.d).unwrap());
         assert!(
             bits(&mut ho) == bits(&mut fo),
             "{}",
@@ -5315,7 +5348,7 @@ fn fused_shift_empty_stack_replay_writes_nothing() {
     let (stream, _, k) = setup();
     let fs = FusedScan::new(&stream, [256, 128], [2, 2]);
     let (s, n) = (&fs.s, fs.s.n());
-    let dev = StackTable::device(&stream, &s.d, 3).unwrap();
+    let dev = DeviceStackTable::new(&stream, &s.d, 3).unwrap();
     let mut bufs = FusedBufs::with_shift(&stream, &s.d, 3).unwrap();
     let offsets = up(&stream, SHIFTS.as_flattened());
     let side = k.context().new_stream().unwrap();
@@ -5338,7 +5371,7 @@ fn fused_shift_empty_stack_replay_writes_nothing() {
         .collect();
     let mut llk = up(&stream, &llk_start);
     // Noise in every sum but the shifted probe's, which only shifted_probe_sums reads.
-    let noisy = |seed| {
+    let noisy = |seed, step| {
         let den: Vec<f32> = noise(s.obj.len(), seed + 1, 1.0)
             .iter()
             .map(|c| c.re)
@@ -5357,12 +5390,13 @@ fn fused_shift_empty_stack_replay_writes_nothing() {
                 &stream,
             )
             .unwrap(),
-            probe: ShiftedProbeSums::zeroed(&stream, &s.d).unwrap(),
+            probe: ShiftedProbes::zeroed(&stream, &s.d).unwrap(),
             pos: pos(seed + 2),
             den: pos(seed + 3),
+            step,
         }
     };
-    let (mut ap, mut dm) = (noisy(72), noisy(76));
+    let (mut ap, mut dm) = (noisy(72, true), noisy(76, false));
     let graph = CudaGraph::capture(
         side.clone(),
         record(|ctx| {
@@ -5372,12 +5406,12 @@ fn fused_shift_empty_stack_replay_writes_nothing() {
                     ..FarSums::default()
                 },
             };
-            k.fused_project(ctx, &inputs, dev.at(0), exit, &mut bufs, ap.sums(true))?;
+            k.fused_project(ctx, &inputs, dev.stack(), exit, &mut bufs, ap.sums(true))?;
             let exit = Exit::Dm {
                 psi: &mut psi,
                 alpha: 0.02,
             };
-            k.fused_project(ctx, &inputs, dev.at(0), exit, &mut bufs, dm.sums(true))
+            k.fused_project(ctx, &inputs, dev.stack(), exit, &mut bufs, dm.sums(true))
         }),
     )
     .unwrap();
@@ -5388,10 +5422,8 @@ fn fused_shift_empty_stack_replay_writes_nothing() {
             .collect();
         out.extend(llk_bits(&llk.to_host_vec(&stream).unwrap()).concat());
         for o in [&mut ap, &mut dm] {
-            out.extend(o.bits(&stream, s, |sums, out| {
-                record(|ctx| k.shifted_probe_sums(ctx, &s.d, sums, out))
-                    .sync_on(&side)
-                    .unwrap()
+            out.extend(o.bits(&stream, s, |mut t| {
+                record(|ctx| t.run(&k, ctx, &s.d)).sync_on(&side).unwrap()
             }));
         }
         out
@@ -5512,7 +5544,7 @@ fn fused_shift_combinations_are_checked() {
         (
             "shifted probe sums",
             ShiftSums {
-                probe: Some(ShiftProbe::Sums(&mut *sp)),
+                probe: Some(sp.num()),
                 ..ShiftSums::default()
             },
         ),
@@ -5557,24 +5589,49 @@ fn fused_shift_combinations_are_checked() {
         let r = k.fused_project(&ex, &inputs, stack, ap(), &mut bufs, sums);
         refused(&format!("position sums of 4 frames (den {den})"), r);
     }
-    let mut short_sums = ShiftedProbeSums::zeroed(&stream, &one_probe).unwrap();
-    let sums = FusedSums {
-        shift: ShiftSums {
-            probe: Some(ShiftProbe::Sums(&mut short_sums)),
-            ..ShiftSums::default()
-        },
-        ..Default::default()
-    };
-    let r = k.fused_project(&ex, &inputs, stack, ap(), &mut bufs, sums);
-    refused("shifted probe sums of one probe", r);
+    let mut short_num = ShiftedNumSums::zeroed(&stream, &one_probe).unwrap();
+    let mut short_step = ShiftedStepSums::zeroed(&stream, &one_probe).unwrap();
+    fn short_kinds<'a>(
+        num: &'a mut ShiftedNumSums,
+        step: &'a mut ShiftedStepSums,
+    ) -> [(&'static str, ShiftProbe<'a>); 2] {
+        [
+            ("num", ShiftProbe::Num(num)),
+            ("step", ShiftProbe::Step(step)),
+        ]
+    }
+    for (kind, probe) in short_kinds(&mut short_num, &mut short_step) {
+        let sums = FusedSums {
+            shift: ShiftSums {
+                probe: Some(probe),
+                ..ShiftSums::default()
+            },
+            ..Default::default()
+        };
+        let r = k.fused_project(&ex, &inputs, stack, ap(), &mut bufs, sums);
+        refused(&format!("shifted {kind} sums of one probe"), r);
+    }
     let mut short_out = UpdateSums::zeroed(&stream, s.probe.len() - 1).unwrap();
     refused(
-        "shifted_probe_sums, short sums",
-        k.shifted_probe_sums(&ex, &d, &mut short_sums, &mut probe),
+        "shifted_probe_sums, short num sums",
+        k.shifted_probe_sums(&ex, &d, &mut short_num, &mut probe.num),
+    );
+    refused(
+        "shifted_probe_sums, short step sums",
+        k.shifted_probe_sums(&ex, &d, &mut short_step, &mut probe),
+    );
+    refused(
+        "shifted_probe_sums, short num out",
+        k.shifted_probe_sums(
+            &ex,
+            &d,
+            out.probe.get::<ShiftedNumSums>(),
+            &mut short_out.num,
+        ),
     );
     refused(
         "shifted_probe_sums, short out",
-        k.shifted_probe_sums(&ex, &d, &mut out.probe, &mut short_out),
+        k.shifted_probe_sums(&ex, &d, out.probe.get::<ShiftedStepSums>(), &mut short_out),
     );
 
     let len = 3 * d.nmode as usize * s.n();
@@ -5593,29 +5650,30 @@ fn fused_shift_combinations_are_checked() {
         };
         let sums = PsiSums {
             obj: Some(&mut out.obj),
-            probe: Some(ShiftProbe::Sums(&mut out.probe)),
+            probe: Some(out.probe.num()),
         };
         let r = k.shifted_psi_sums(&ex, inputs, stack, psi, bufs, sums);
         refused(&format!("shifted_psi_sums, {what}"), r);
     }
-    for (what, sums) in [
-        (
-            "short object sums",
-            PsiSums {
-                obj: Some(&mut short_obj),
-                probe: None,
-            },
-        ),
-        (
-            "probe sums of one probe",
-            PsiSums {
-                obj: None,
-                probe: Some(ShiftProbe::Sums(&mut short_sums)),
-            },
-        ),
-    ] {
+    let r = k.shifted_psi_sums(
+        &ex,
+        &inputs,
+        stack,
+        &psi,
+        &mut bufs,
+        PsiSums {
+            obj: Some(&mut short_obj),
+            probe: None,
+        },
+    );
+    refused("shifted_psi_sums, short object sums", r);
+    for (kind, probe) in short_kinds(&mut short_num, &mut short_step) {
+        let sums = PsiSums {
+            obj: None,
+            probe: Some(probe),
+        };
         let r = k.shifted_psi_sums(&ex, &inputs, stack, &psi, &mut bufs, sums);
-        refused(&format!("shifted_psi_sums, {what}"), r);
+        refused(&format!("shifted_psi_sums, {kind} sums of one probe"), r);
     }
 
     let (np, n) = (d.nprobe as usize, s.n());

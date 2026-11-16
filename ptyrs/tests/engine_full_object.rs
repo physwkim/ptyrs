@@ -17,6 +17,10 @@ use ptyrs::engine::{
 };
 use ptyrs::gpu::FUSED_SIDES;
 
+#[path = "common/worst.rs"]
+mod worst;
+use worst::worst_of;
+
 const NPOS: usize = 30;
 const NPROBE: usize = 2;
 const WAVELENGTH: f64 = 1e-10;
@@ -306,6 +310,16 @@ fn rel_l2(a: &Stack<C64>, b: &Stack<C64>) -> f64 {
     (e / t).sqrt()
 }
 
+/// [`rel_l2`] with each pixel's squares weighted by `weight`'s.
+fn weighted_l2(a: &Stack<C64>, b: &Stack<C64>, weight: &Stack<f64>) -> f64 {
+    let (mut e, mut t) = (0.0, 0.0);
+    for ((x, y), w) in (a.as_slice().iter().zip(b.as_slice())).zip(weight.as_slice()) {
+        e += w * (x - y).norm_sqr();
+        t += w * y.norm_sqr();
+    }
+    (e / t).sqrt()
+}
+
 impl Ended {
     /// From the truth, whose LLK is `floor`, every LLK within 2% of it; from the start, every
     /// record below the last, the end not above the last record, which for rPIE's epochs is
@@ -316,8 +330,7 @@ impl Ended {
             self.records, self.end
         );
         if let Some(floor) = floor {
-            let all = self.records.iter().chain([&self.end]);
-            let worst = all.fold(0.0f64, |m, &v| m.max(v));
+            let worst = worst_of(self.records.iter().chain([&self.end]).copied());
             assert!(worst < 1.02 * floor, "{what}: {worst} over {floor}");
         } else {
             for (i, w) in self.records.windows(2).enumerate() {
@@ -339,14 +352,12 @@ impl Ended {
     fn errors(&self, want: &Ended) -> [f64; 5] {
         assert_eq!(self.records.len(), want.records.len());
         let rel = |g: f64, w: f64| (g - w).abs() / w;
-        let llk = (self.records.iter())
-            .zip(&want.records)
-            .fold(0.0f64, |m, (&g, &w)| m.max(rel(g, w)));
+        let llk = worst_of((self.records.iter().zip(&want.records)).map(|(&g, &w)| rel(g, w)));
         let offsets = match (&self.offsets, &want.offsets) {
             (Some(g), Some(w)) => {
                 let pairs = || g.iter().flatten().zip(w.iter().flatten());
-                let worst = pairs().fold(0.0f64, |m, (g, w)| m.max((g - w).abs()));
-                worst / w.iter().flatten().fold(0.0f64, |m, w| m.max(w.abs()))
+                worst_of(pairs().map(|(g, w)| (g - w).abs()))
+                    / worst_of(pairs().map(|(_, w)| w.abs()))
             }
             _ => 0.0,
         };
@@ -357,6 +368,15 @@ impl Ended {
             rel_l2(&self.probe, &want.probe),
             offsets,
         ]
+    }
+
+    /// `Σ |P|²` of the probe this run ends on, over `scan`'s views at the offsets it ends on:
+    /// the weight the counts put on each object pixel. Away from the views only the inertia
+    /// holds the object, where the solve's `f32` errors grow a hundredfold.
+    fn illumination(&self, scan: &Scan) -> Stack<f64> {
+        let dims @ [nobj, ny, nx] = self.object.dims();
+        let addr = addr(&scan.positions, [ny, nx], nobj);
+        Sampling::FullObject.illumination(addr.views(), dims, &self.probe, self.offsets.as_deref())
     }
 }
 
@@ -373,10 +393,19 @@ fn assert_close(what: &str, errs: [f64; 5], tol: [Option<f64>; 5]) {
     }
 }
 
+/// `got`'s object within `tol` of `want`'s, weighted by `lit`, an [`Ended::illumination`]: the
+/// band the counts see, which [`Ended::errors`]' whole plane leaves to the dark band's errors.
+fn assert_lit(what: &str, got: &Ended, want: &Ended, lit: &Stack<f64>, tol: f64) {
+    let e = weighted_l2(&got.object, &want.object, lit);
+    eprintln!("{what}: lit object {e:.2e}");
+    assert!(e < tol, "{what} lit object: {e:e}");
+}
+
 /// `ncycle` cycles of `algorithm` on `c` under `features`, from the truth, whose LLK is
 /// `floor`, or without from the start, on the CPU and on the GPU eagerly and with graphs: each
 /// passes [`Ended::check`], held offsets keep their values, the graphs replay the eager run
-/// bit for bit and the GPU agrees with the CPU.
+/// bit for bit and the GPU agrees with the CPU, the object over the whole plane and weighted by
+/// [`Ended::illumination`].
 fn on_cpu_and_gpu(
     c: &Case,
     ctx: &Arc<CudaContext>,
@@ -384,7 +413,17 @@ fn on_cpu_and_gpu(
     features: &Features,
     floor: Option<f64>,
 ) {
-    const TOL: [Option<f64>; 5] = [Some(1e-5), Some(1e-5), Some(1e-4), Some(1e-5), Some(3e-6)];
+    // Five-run worst: LLK 1.68e-6, end 7.28e-7, object 1.27e-5 over the whole plane (AP's in
+    // two object modes; most of it the dark band's) and 1.46e-6 weighted by the CPU's
+    // illumination (RAAR's refined in two object modes), probe 2.42e-6, offsets 2.44e-7.
+    const TOL: [Option<f64>; 5] = [
+        Some(5.1e-6),
+        Some(2.2e-6),
+        Some(3.9e-5),
+        Some(7.3e-6),
+        Some(7.4e-7),
+    ];
+    const TOL_LIT: f64 = 4.4e-6;
     let position = features.position.as_ref().unwrap();
     let nobj = c.truth.0.dims()[0];
     let what = format!("{algorithm} nobj {nobj} refine {}", position.refine);
@@ -405,7 +444,9 @@ fn on_cpu_and_gpu(
     want.check(&format!("{what} CPU"), floor);
     assert!(graphs == eager, "{what}: graphs replay the eager run");
     eager.check(&format!("{what} GPU"), floor);
-    assert_close(&format!("{what} GPU against CPU"), eager.errors(&want), TOL);
+    let what = format!("{what} GPU against CPU");
+    assert_close(&what, eager.errors(&want), TOL);
+    assert_lit(&what, &eager, &want, &want.illumination(&c.scan), TOL_LIT);
 }
 
 /// [`solve_keeps_the_truth_and_descends`] in one object mode.
@@ -475,12 +516,15 @@ fn rpie_descends_with_the_offsets_held() {
 /// At zero offsets and at whole-pixel offsets from corners that many pixels back, held, the
 /// update is the blend of the same counts without offsets at the moved corners: every LLK
 /// record, the end LLK, the object and the probe, on the CPU and the GPU, which keep the
-/// offsets.
+/// offsets; the GPU's object also weighted by [`Ended::illumination`].
 #[test]
 fn whole_pixel_offsets_are_the_blend() {
     const NCYCLE: usize = 3;
     const TOL_CPU: [Option<f64>; 5] = [Some(1e-12), Some(1e-12), Some(1e-12), Some(1e-12), None];
-    const TOL_GPU: [Option<f64>; 5] = [Some(1e-5), Some(1e-5), Some(1e-4), Some(1e-5), None];
+    // The GPU's five-run worst: LLK 9.67e-7, end 8.65e-7, object 7.08e-6 over the whole plane
+    // (RAAR's) and 1.02e-6 weighted by the blend's illumination (DM's), probe 9.43e-7.
+    const TOL_GPU: [Option<f64>; 5] = [Some(3e-6), Some(2.6e-6), Some(2.2e-5), Some(2.9e-6), None];
+    const TOL_GPU_LIT: f64 = 3.1e-6;
     let (raw, whole) = (fermat(), whole_offsets());
     let moved = |a: usize, v: &[f64]| -> Vec<f64> {
         (v.iter().zip(&whole))
@@ -507,6 +551,7 @@ fn whole_pixel_offsets_are_the_blend() {
     for algorithm in ["AP", "DM", "RAAR", "rPIE"] {
         let blend = Case::cpu(&at, &c.start, &none).cycles(algorithm, NCYCLE);
         let blend_gpu = Case::gpu(&ctx, &at, &c.start, &none, true).cycles(algorithm, NCYCLE);
+        let lit = blend_gpu.illumination(&at);
         for (label, scan, offsets) in runs {
             let held = positioned(offsets, false);
             let got = Case::cpu(scan, &c.start, &held).cycles(algorithm, NCYCLE);
@@ -525,6 +570,7 @@ fn whole_pixel_offsets_are_the_blend() {
                 "{what} keeps the offsets"
             );
             assert_close(&what, got.errors(&blend_gpu), TOL_GPU);
+            assert_lit(&what, &got, &blend_gpu, &lit, TOL_GPU_LIT);
         }
     }
 }

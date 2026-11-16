@@ -43,6 +43,8 @@ pub enum DistError {
     Panic { region: usize, msg: String },
     #[error("another worker failed")]
     Aborted,
+    #[error("an earlier call failed part-way, so the GPUs may disagree")]
+    Poisoned,
     #[error("workers met a different number of fences")]
     FenceMismatch,
     #[error("angle {angle}: {source}")]

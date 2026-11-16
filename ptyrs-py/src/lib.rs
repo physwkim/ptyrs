@@ -64,7 +64,7 @@ impl<'py> Kwargs<'py> {
         if let Some(d) = &self.0
             && let Some(v) = d.get_item(key)?
         {
-            *field = v.extract()?;
+            *field = v.extract().map_err(|e| keyword_error(d.py(), key, e))?;
             d.del_item(key)?;
         }
         Ok(())
@@ -78,6 +78,20 @@ impl<'py> Kwargs<'py> {
             ))),
             _ => Ok(()),
         }
+    }
+}
+
+/// `e`, raised by the value of keyword `key`, as an exception of `e`'s type whose message names
+/// `key`, with `e` as its `__cause__`. A type that cannot be built from one message raises `e`.
+fn keyword_error(py: Python<'_>, key: &str, e: PyErr) -> PyErr {
+    let message = format!("keyword '{key}': {}", e.value(py));
+    match e.get_type(py).call1((message,)) {
+        Ok(named) => {
+            let named = PyErr::from_value(named);
+            named.set_cause(py, Some(e));
+            named
+        }
+        Err(_) => e,
     }
 }
 
@@ -431,8 +445,13 @@ impl Scan {
         detector_pixel: f64,
     ) -> PyResult<Self> {
         let counts = counts_in(counts)?;
-        let geometry = Geometry::new(wavelength, distance, detector_pixel, counts.frame_shape())
-            .map_err(Error::from)?;
+        let geometry = Geometry::new(
+            wavelength,
+            distance,
+            detector_pixel,
+            counts.frame_shape().sides(),
+        )
+        .map_err(Error::from)?;
         let positions =
             Positions::new(y.as_array().to_vec(), x.as_array().to_vec()).map_err(Error::from)?;
         Ok(Self(

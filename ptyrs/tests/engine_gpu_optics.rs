@@ -325,32 +325,43 @@ fn drawn_offsets() -> Vec<[f64; 2]> {
 /// GPU LSQML under every one-slice propagator against the CPU's from the same start, as
 /// `engine_gpu_lsqml` holds the far field: the steps of each of the first epochs from a fresh
 /// run without graphs, and with them the LLK after every epoch, the arrays and, modelling
-/// the position, the offsets' changes. A position enters as [`Sampling::Patch`], and once
-/// as [`Sampling::FullObject`].
+/// the position, the offsets' changes if refined, or that both keep them if held. A position,
+/// refined or held, enters as [`Sampling::Patch`], and once as [`Sampling::FullObject`].
 #[test]
 fn gpu_lsqml_matches_cpu_under_every_propagator() {
     const NEPOCH: usize = 12;
     const NSTEPS: usize = 3;
     for c in cases().iter().filter(|c| c.optics.nslice() == 1) {
+        let refined = || Some(Feature::refined(drawn_offsets()));
+        let held = || Some(Feature::held(drawn_offsets()));
         for (cost, batch_size, position, sampling) in [
-            (Cost::Amplitude, 12, false, Sampling::Patch),
-            (Cost::Poisson, 12, false, Sampling::Patch),
-            (Cost::Poisson, NPOS, false, Sampling::Patch),
-            (Cost::Amplitude, 4, true, Sampling::Patch),
-            (Cost::Poisson, 12, true, Sampling::Patch),
-            (Cost::Poisson, 12, true, Sampling::FullObject),
+            (Cost::Amplitude, 12, None, Sampling::Patch),
+            (Cost::Poisson, 12, None, Sampling::Patch),
+            (Cost::Poisson, NPOS, None, Sampling::Patch),
+            (Cost::Amplitude, 4, refined(), Sampling::Patch),
+            (Cost::Poisson, 12, refined(), Sampling::Patch),
+            (Cost::Poisson, 12, refined(), Sampling::FullObject),
+            (Cost::Amplitude, 4, held(), Sampling::Patch),
+            (Cost::Poisson, 12, held(), Sampling::Patch),
+            (Cost::Poisson, 12, held(), Sampling::FullObject),
         ] {
             let params = LsqmlParams {
                 batch_size,
                 cost,
                 seed: 7,
             };
+            let model = match &position {
+                None => "none",
+                Some(p) if p.refine => "refined",
+                Some(_) => "held",
+            };
             let features = Features {
-                position: position.then(|| Feature::refined(drawn_offsets())),
+                position,
                 ..Features::default()
             };
             let (mut objects, mut probe) = (c.objects.clone(), c.probe.clone());
-            let mut var = ProbeVariation::none(probe.plane_shape());
+            let none = ProbeVariation::none(probe.plane_shape());
+            let mut var = none.clone();
             let mut cpu = Lsqml::new(params)
                 .unwrap()
                 .with_features(features.clone())
@@ -375,7 +386,7 @@ fn gpu_lsqml_matches_cpu_under_every_propagator() {
                     let mut gpu = c.gpu(&c.optics, options).unwrap();
                     gpu.set_features(&features).unwrap();
                     gpu.set_sampling(sampling).unwrap();
-                    gpu.lsqml(&params, epoch + 1, 0).unwrap();
+                    gpu.lsqml(&params, &mut none.clone(), epoch + 1, 0).unwrap();
                     steps = worst_of([steps, steps_rel(&gpu.lsqml_steps().unwrap(), &want)]);
                 }
             }
@@ -383,16 +394,30 @@ fn gpu_lsqml_matches_cpu_under_every_propagator() {
             let mut gpu = c.gpu(&c.optics, OPTIONS).unwrap();
             gpu.set_features(&features).unwrap();
             gpu.set_sampling(sampling).unwrap();
-            gpu.lsqml(&params, NEPOCH, 1).unwrap();
+            gpu.lsqml(&params, &mut none.clone(), NEPOCH, 1).unwrap();
             // The CPU's LLK here is the unmoved probe's.
-            let llk = if position {
+            let llk = if features.position.is_some() {
                 0.0
             } else {
                 let got = gpu.history().iter().map(|r| r.llk.poisson);
                 assert_eq!(got.len(), NEPOCH);
                 worst_of(got.zip(&trace).map(|(g, w)| (g - w).abs() / w))
             };
+            let label = format!(
+                "{} {cost:?} batch {batch_size} position {model} {sampling:?}",
+                c.name
+            );
             let offsets = match (&features.position, cpu.features().position.as_ref()) {
+                (Some(start), Some(want)) if !start.refine => {
+                    // The GPU's are the start's in `f32`.
+                    let kept = start
+                        .as_ref()
+                        .map(|d| d.iter().map(|d| d.map(|x| f64::from(x as f32))).collect());
+                    assert_eq!(want, start, "{label}: the CPU moved held offsets");
+                    let got = gpu.features().unwrap().position;
+                    assert_eq!(got, Some(kept), "{label}: the GPU moved held offsets");
+                    0.0
+                }
                 (Some(start), Some(want)) => {
                     let got = gpu.features().unwrap().position.unwrap().values;
                     let delta = |d: &[[f64; 2]]| -> Vec<f64> {
@@ -415,10 +440,8 @@ fn gpu_lsqml_matches_cpu_under_every_propagator() {
                 offsets,
             ];
             eprintln!(
-                "{} {cost:?} batch {batch_size} position {position} {sampling:?}: llk {:.2e} \
-                 object {:.2e} probe {:.2e} steps {:.2e} offsets {:.2e}, poisson llk {:.4e} -> \
-                 {:.4e}",
-                c.name,
+                "{label}: llk {:.2e} object {:.2e} probe {:.2e} steps {:.2e} offsets {:.2e}, \
+                 poisson llk {:.4e} -> {:.4e}",
                 errs[0],
                 errs[1],
                 errs[2],
@@ -431,12 +454,7 @@ fn gpu_lsqml_matches_cpu_under_every_propagator() {
                 .into_iter()
                 .zip(errs)
             {
-                assert!(
-                    e < 1e-4,
-                    "{} {cost:?} batch {batch_size} position {position} {sampling:?} {what}: \
-                     {e:e}",
-                    c.name
-                );
+                assert!(e < 1e-4, "{label} {what}: {e:e}");
             }
         }
     }

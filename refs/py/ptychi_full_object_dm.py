@@ -15,13 +15,20 @@ engine's runs from it, little-endian f64, complex as `re im` pairs:
     probe0.c128       [nmode, ny, nx], the start probe; probe_truth.c128 the probe the counts
                       are of
     offsets0.f64      [nframe, 2], near.rs's drawn_offsets
+    offsets_whole.f64 [nframe, 2], whole-pixel offsets: round(1.4 sin(1.7f + 0.3)),
+                      round(1.4 cos(2.3f)), mean kept
+    counts_truth_<drawn|whole>.f64  [nframe, ny, nx], the engine's FULL_OBJECT intensities of
+                      the truth at the corners plus offsets0 or offsets_whole, rounded half
+                      away from zero
     <alg>_<label>_<n>_llk.f64     the engine's LLK history over n cycles (each cycle's start),
                                   then the normalised Poisson LLK of the arrays it ends on
     <alg>_<label>_<n>_{obj,probe}.c128, _offsets.f64   what the run ends on
 for alg `dm` (near.rs's DM: inertia 0.01 and 0.001, alpha 0.02) and `raar` (beta 0.9), label
-`fixed` (no features, every offset 0) and `position` (the drawn offsets, refined), and n the
-cycles of each run, the largest of them taken as the long run. The engine runs without its
-closing zero_phase_ramp, which under `position` changes the LLK of the state it ends on
+`fixed` (no features, every offset 0), `position` (the drawn offsets, refined) and `held` (the
+drawn offsets, held) from the start object and probe on counts.f64, and `truth_drawn` and
+`truth_whole` (offsets0 and offsets_whole, held) from the truth on counts_truth_<x>.f64, and n
+the cycles of each run, the largest of them taken as the long run. The engine runs without its
+closing zero_phase_ramp, which with offsets changes the LLK of the state it ends on
 (Ptycho::zero_phase_ramp), so the 8-cycle run must end on the long run's first 9 records.
 
 pty-chi runs its own DM (Thibault 2009 Eq. 9, exit-wave relaxation 1) and RAAR (Marchesini 2016
@@ -35,22 +42,20 @@ probe (over sqrt(k), lsqml_near.py's convention) and corners plus offsets, mode 
 and the object-probe ambiguity removal off. Its normalised Poisson LLK is the engine's (ops::llk)
 of its forward model's intensities, after each epoch.
 
-At the start both sides must agree on the LLK of the fixed and the drawn-offsets estimate (same
-data, sampling and convention) to START_BOUND, or the script exits non-zero. Then, per case,
-algorithm and label, it prints the LLK after MARKS cycles (7 is the last the engine records in
-an 8-cycle run, engine_gpu_near.rs's) and at the end of the long run, its minimum and where, and
-pty-chi's alone from the drawn offsets held (not refined); after 8 cycles and the long run, the
-object of each side against the truth and against each other over the illuminated pixels (start
+At the start both sides must agree on the LLK of every label's start (same data, sampling and
+convention) to START_BOUND, or the script exits non-zero; for the truth starts it also prints
+where pty-chi's own forward model, rounded, would give other counts than the engine's. Then,
+per case, algorithm and label, it prints the LLK after MARKS cycles (7 is the last the engine
+records in an 8-cycle run, engine_gpu_near.rs's) and at the end of the long run, its minimum
+and where, and its maximum over its first point; after 8 cycles and the long run, the object
+of each side against the truth and against each other over the illuminated pixels (start
 probe's illumination at the corners at least ILLUM of its maximum): |c a e^(i g.r) - b| / |b|
 with c and the phase ramp g fitted (a ramp on O with the opposite on P changes no frame's
 intensity), and the offsets' rms about their mean and the mean. Writes
 <state>/ptychi_full_object_dm.json with the curves of every run.
 
-First, the truth-start control: counts made by pty-chi's FULL_OBJECT forward model from the
-truth at the corners plus the drawn offsets (fractional) or plus whole-pixel ones
-(round(1.4 sin(1.7f + 0.3)), round(1.4 cos(2.3f)), mean kept), rounded half away from zero;
-then DM and RAAR from the truth with those offsets held. Where the truth is stable the LLK stays
-at the truth's (the curve's first point), or a little below it from the counts' rounding.
+The truth starts are the control: where the truth is stable the LLK stays at the truth's (the
+curve's first point), or a little below it from the counts' rounding.
 """
 import importlib.util
 import json
@@ -105,6 +110,9 @@ class Case:
         self.probe0 = read(d / "probe0.c128", (nm, ny, nx), True)
         self.probe_truth = read(d / "probe_truth.c128", (nm, ny, nx), True)
         self.offsets0 = read(d / "offsets0.f64", (nf, 2))
+        self.offsets_whole = read(d / "offsets_whole.f64", (nf, 2))
+        self.counts_truth = {x: read(d / f"counts_truth_{x}.f64", (nf, ny, nx))
+                             for x in ("drawn", "whole")}
         prop = pp.free_space((ny, nx), self.wavelength, self.pixel, self.pixel, self.distance)
         self.kind = type(prop).__name__
         self.k = float(pp.get_intensity_scaling_factor(prop, (ny, nx)))
@@ -116,6 +124,16 @@ class Case:
         runs = sorted({int(p.name.split("_")[2]) for p in d.glob("dm_fixed_*_llk.f64")})
         self.long = runs[-1]
         assert SHORT in runs, runs
+
+    def runs(self):
+        """Each label's counts, start object and probe, offsets and whether they refine."""
+        start = (self.counts, self.obj0, self.probe0)
+        truth = lambda x: (self.counts_truth[x], self.truth, self.probe_truth)
+        return {"fixed": (*start, 0 * self.offsets0, False),
+                "position": (*start, self.offsets0, True),
+                "held": (*start, self.offsets0, False),
+                "truth_drawn": (*truth("drawn"), self.offsets0, False),
+                "truth_whole": (*truth("whole"), self.offsets_whole, False)}
 
     def engine(self, alg, label, n):
         stem = self.dir / f"{alg}_{label}_{n}"
@@ -192,35 +210,16 @@ def ended(t, c):
                 offsets=t.get_data_to_cpu("probe_positions", as_numpy=True) - c.corners)
 
 
-def ptychi(c, alg, offsets, moved):
+def ptychi(c, alg, counts, obj, probe, offsets, moved):
     """pty-chi over the long run: the LLK curve and the arrays after SHORT and after all."""
-    t = task(c, alg, c.counts, c.obj0, c.probe0, offsets, moved)
-    curve, short = [llk(t, c.counts)], None
+    t = task(c, alg, counts, obj, probe, offsets, moved)
+    curve, short = [llk(t, counts)], None
     for e in range(c.long):
         t.run(1)
-        curve.append(llk(t, c.counts))
+        curve.append(llk(t, counts))
         if e + 1 == SHORT:
             short = ended(t, c)
     return np.array(curve), short, ended(t, c)
-
-
-def whole_offsets(n):
-    f = np.arange(n)
-    d = np.stack([1.4 * np.sin(1.7 * f + 0.3), 1.4 * np.cos(2.3 * f)], 1)
-    return np.copysign(np.floor(np.abs(d) + 0.5), d)
-
-
-def truth_start(c, alg, offsets):
-    """pty-chi's LLK curve from the truth, offsets held, on counts made through FULL_OBJECT
-    from the truth at the corners plus offsets."""
-    y = forward(task(c, alg, c.counts, c.truth, c.probe_truth, offsets, False))
-    counts = np.floor(y + 0.5)
-    t = task(c, alg, counts, c.truth, c.probe_truth, offsets, False)
-    curve = [llk(t, counts)]
-    for _ in range(c.long):
-        t.run(1)
-        curve.append(llk(t, counts))
-    return np.array(curve)
 
 
 def obj_err(a, b, region):
@@ -254,7 +253,7 @@ def compare(c, tag, eng, chi):
 def marks(curve):
     i = int(np.nanargmin(curve))
     return (" ".join(f"{curve[m]:9.4g}" for m in MARKS) + f" | end {curve[-1]:9.4g}, min "
-            f"{curve[i]:.4g} at {i}")
+            f"{curve[i]:.4g} at {i}, max/first {np.nanmax(curve) / curve[0]:.3g}")
 
 
 def main():
@@ -267,42 +266,35 @@ def main():
     cases = [Case(state / name) for name in CASES]
     worst = 0.0
     for c in cases:
-        for label, d in (("fixed", 0 * c.offsets0), ("position", c.offsets0)):
+        for label, (counts, obj, probe, d, _) in c.runs().items():
             want = c.engine("dm", label, SHORT)["llk"][0]
-            got = llk(task(c, "dm", c.counts, c.obj0, c.probe0, d, False), c.counts)
+            t = task(c, "dm", counts, obj, probe, d, False)
+            got = llk(t, counts)
             err = abs(got - want) / want
             print(f"{c.name} {label}: start LLK engine {want:.12e} pty-chi {got:.12e}, {err:.1e}")
             worst = max(worst, err)
+            if label.startswith("truth"):
+                y = forward(t)
+                print(f"  pty-chi's rounded intensities differ from the engine's counts at "
+                      f"{int((np.floor(y + 0.5) != counts).sum())} of {counts.size}")
     if not worst <= START_BOUND:
         sys.exit(f"start LLK differs: {worst:.2e} > {START_BOUND:.0e}")
 
     out = {}
-    print(f"--- truth-start control: LLK after cycles {MARKS}")
-    for c in cases:
-        for name, d in (("drawn", c.offsets0), ("whole", whole_offsets(len(c.corners)))):
-            for alg in ("dm", "raar"):
-                curve = truth_start(c, alg, d)
-                print(f"  {c.name} {name} {alg}: {marks(curve)}, max/first "
-                      f"{np.nanmax(curve) / curve[0]:.3g}")
-                out[f"{c.name}/{alg}/truth_{name}"] = dict(ptychi=curve.tolist())
     for c in cases:
         print(f"--- {c.name}: {c.kind}, distance {c.distance:g} m, long run {c.long} cycles; "
               f"LLK after cycles {MARKS}")
         for alg in ("dm", "raar"):
-            for label in ("fixed", "position"):
+            for label, run in c.runs().items():
                 eng_short, eng_long = c.engine(alg, label, SHORT), c.engine(alg, label, c.long)
                 assert np.array_equal(eng_short["llk"], eng_long["llk"][:SHORT + 1]), label
-                moved = label == "position"
-                curve, chi_short, chi_long = ptychi(c, alg, c.offsets0 * moved, moved)
+                curve, chi_short, chi_long = ptychi(c, alg, *run)
                 print(f"  {alg} {label}\n    engine  {marks(eng_long['llk'])}\n"
                       f"    pty-chi {marks(curve)}")
                 out[f"{c.name}/{alg}/{label}"] = dict(
                     engine=eng_long["llk"].tolist(), ptychi=curve.tolist(),
                     short=compare(c, f"after {SHORT}", eng_short, chi_short),
                     long=compare(c, f"after {c.long}", eng_long, chi_long))
-            curve = ptychi(c, alg, c.offsets0, False)[0]
-            print(f"  {alg} held\n    pty-chi {marks(curve)}")
-            out[f"{c.name}/{alg}/held"] = dict(ptychi=curve.tolist())
     path = state / "ptychi_full_object_dm.json"
     path.write_text(json.dumps(out))
     print(f"wrote {path}")

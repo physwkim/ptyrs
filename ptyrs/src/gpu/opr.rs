@@ -16,10 +16,10 @@ use ptyrs_kernels::pixel::PIXEL_THREADS;
 use ptyrs_kernels::position::BatchSpan;
 
 use crate::base::Feature;
-use crate::gpu::fused::GRID_Y_MAX;
+use crate::gpu::fused::{GRID_Y_MAX, OwnSpectra};
 use crate::gpu::ops::grid_1d;
 use crate::gpu::position::{ONE_BLOCK, chunks};
-use crate::gpu::{C32, EpochOrder, Error, Kernels, check_len, dptr};
+use crate::gpu::{C32, EpochOrder, Error, Kernels, StackRef, ViewDims, check_len, dptr};
 
 #[cfg(test)]
 mod tests;
@@ -55,6 +55,17 @@ pub struct Opr {
     deflate_coef: DeviceBuffer<f32>,
 }
 
+/// What decides an [`Opr`]'s buffers and the launches of its step: its eigenmode count and
+/// which weights it refines.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OprShape {
+    /// `k ≥ 1`.
+    pub k: u32,
+    pub refine_weights: bool,
+    /// The main mode's weights' `refine`, when modelled.
+    pub intensity: Option<bool>,
+}
+
 impl Opr {
     /// Uploads `eigenmodes` (`k n` values, `k ≥ 1`), `weights` (`k` per scan frame) and, when
     /// modelled, `intensity` (one per scan frame), for planes of `n` pixels and batches of up
@@ -68,7 +79,7 @@ impl Opr {
         nb_max: u32,
     ) -> Result<Self, Error> {
         let bad = |what: String| Err(Error::Shape(what));
-        if n == 0 || u32::try_from(n).is_err() || !eigenmodes.len().is_multiple_of(n) {
+        if n == 0 || !eigenmodes.len().is_multiple_of(n) {
             return bad(format!(
                 "{} eigenmode values in planes of {n}",
                 eigenmodes.len()
@@ -78,44 +89,103 @@ impl Opr {
         if k == 0 || !w.len().is_multiple_of(k) || w.is_empty() {
             return bad(format!("{} weights for {k} eigenmodes", w.len()));
         }
+        let shape = OprShape {
+            k: u32::try_from(k).map_err(|_| Error::Shape(format!("{k} eigenmodes")))?,
+            refine_weights: weights.refine,
+            intensity: intensity.as_ref().map(|c| c.refine),
+        };
         let nframe = w.len() / k;
-        if let Some(c) = intensity
-            && c.values.len() != nframe
-        {
-            let have = c.values.len();
-            return bad(format!("{have} main-mode weights for {nframe} frames"));
+        let nframe = u32::try_from(nframe).map_err(|_| Error::Shape(format!("{nframe} frames")))?;
+        let mut opr = Self::zeroed(stream, n, nframe, shape, nb_max)?;
+        opr.upload(stream, eigenmodes, w, intensity.map(|c| c.values))?;
+        Ok(opr)
+    }
+
+    /// The state of `shape` for planes of `n` pixels, `nframe` scan frames and batches of up
+    /// to `nb_max` frames, every value zero until [`Self::upload`].
+    pub fn zeroed(
+        stream: &CudaStream,
+        n: usize,
+        nframe: u32,
+        shape: OprShape,
+        nb_max: u32,
+    ) -> Result<Self, Error> {
+        let bad = |what: String| Err(Error::Shape(what));
+        if n == 0 || u32::try_from(n).is_err() || shape.k == 0 {
+            return bad(format!("{} eigenmodes in planes of {n}", shape.k));
         }
-        if nb_max == 0 || nb_max as usize > nframe || nb_max as u64 > GRID_Y_MAX {
+        if nb_max == 0 || nb_max > nframe || nb_max as u64 > GRID_Y_MAX {
             return bad(format!("batches of {nb_max} of {nframe} frames"));
         }
-        let (k, nframe, nb) = (
-            u32::try_from(k).map_err(|_| Error::Shape(format!("{k} eigenmodes")))?,
-            u32::try_from(nframe).map_err(|_| Error::Shape(format!("{nframe} frames")))?,
-            nb_max as usize,
-        );
+        let (k, nf, nb) = (shape.k as usize, nframe as usize, nb_max as usize);
+        let values = |refine: bool, len: usize| -> Result<_, Error> {
+            Ok(Feature {
+                values: DeviceBuffer::zeroed(stream, len)?,
+                refine,
+            })
+        };
         Ok(Self {
             n,
-            k,
+            k: shape.k,
             nframe,
             nb_max,
-            eigenmodes: DeviceBuffer::from_host(stream, eigenmodes)?,
-            weights: Feature {
-                values: DeviceBuffer::from_host(stream, w)?,
-                refine: weights.refine,
-            },
-            intensity: match intensity {
-                Some(c) => Some(Feature {
-                    values: DeviceBuffer::from_host(stream, c.values)?,
-                    refine: c.refine,
-                }),
-                None => None,
-            },
+            eigenmodes: DeviceBuffer::zeroed(stream, k * n)?,
+            weights: values(shape.refine_weights, k * nf)?,
+            intensity: shape.intensity.map(|r| values(r, nf)).transpose()?,
             sums: DeviceBuffer::zeroed(stream, OPR_SUMS as usize * nb * chunks(n))?,
             part: DeviceBuffer::zeroed(stream, 2 * chunks(n))?,
             e: DeviceBuffer::zeroed(stream, n)?,
             coef: DeviceBuffer::zeroed(stream, nb)?,
             deflate_coef: DeviceBuffer::zeroed(stream, 2 * nb)?,
         })
+    }
+
+    /// Copies `eigenmodes` (`k n` values), `weights` (`k` per scan frame) and, exactly when
+    /// the state models them, the main mode's weights `intensity` (one per scan frame) onto
+    /// the device, ordered on `stream` and waited for.
+    pub fn upload(
+        &mut self,
+        stream: &CudaStream,
+        eigenmodes: &[C32],
+        weights: &[f32],
+        intensity: Option<&[f32]>,
+    ) -> Result<(), Error> {
+        let (k, nf) = (self.k as usize, self.nframe as usize);
+        let fits = eigenmodes.len() == k * self.n
+            && weights.len() == k * nf
+            && match (intensity, &self.intensity) {
+                (Some(c), Some(_)) => c.len() == nf,
+                (None, None) => true,
+                _ => false,
+            };
+        if !fits {
+            return Err(Error::Shape(format!(
+                "{} eigenmode values, {} weights and {:?} main-mode weights for an OPR of \
+                 {k} eigenmodes of {} pixels over {nf} frames{}",
+                eigenmodes.len(),
+                weights.len(),
+                intensity.map(<[f32]>::len),
+                self.n,
+                match self.intensity {
+                    Some(_) => " with main-mode weights",
+                    None => "",
+                },
+            )));
+        }
+        self.eigenmodes.copy_from_host(stream, eigenmodes)?;
+        self.weights.values.copy_from_host(stream, weights)?;
+        if let (Some(c), Some(dst)) = (intensity, &mut self.intensity) {
+            dst.values.copy_from_host(stream, c)?;
+        }
+        Ok(())
+    }
+
+    pub fn shape(&self) -> OprShape {
+        OprShape {
+            k: self.k,
+            refine_weights: self.weights.refine,
+            intensity: self.intensity.as_ref().map(|c| c.refine),
+        }
     }
 
     /// The eigenmodes `[k, n]`.
@@ -176,16 +246,75 @@ impl Opr {
 }
 
 /// Mode 0 of each frame's own probe over a run of epoch positions: [`OprKernels::unique`]'s
-/// `planes`, `[nb, n]`, plane `b` at position `positions.start + b`.
+/// `planes`, `[nb, n]`, plane `b` at position `positions.start + b`; from
+/// [`Kernels::own_spectrum`], with their spectra, which the shifted passes read instead.
 #[derive(Clone)]
 pub struct OwnModes<'a> {
-    pub planes: &'a DeviceBuffer<C32>,
-    pub positions: Range<u32>,
+    planes: &'a DeviceBuffer<C32>,
+    positions: Range<u32>,
+    spectra: Option<OwnSpectra<'a>>,
 }
 
-impl OwnModes<'_> {
-    /// `probe` with these planes of `n` pixels for its mode 0, as a kernel reads it.
-    pub(super) fn src(&self, probe: &DeviceBuffer<C32>, n: usize) -> Result<ProbeSrc, Error> {
+impl<'a> OwnModes<'a> {
+    pub fn new(planes: &'a DeviceBuffer<C32>, positions: Range<u32>) -> Self {
+        Self {
+            planes,
+            positions,
+            spectra: None,
+        }
+    }
+
+    /// These modes with `spectra`, the spectra of their planes.
+    pub(super) fn with_spectra(&self, spectra: OwnSpectra<'a>) -> Self {
+        Self {
+            spectra: Some(spectra),
+            ..self.clone()
+        }
+    }
+
+    pub(super) fn planes(&self) -> &'a DeviceBuffer<C32> {
+        self.planes
+    }
+
+    /// `probe` with these planes of `n` pixels for its mode 0, as a kernel reads it for the
+    /// frames of `stack`.
+    pub(super) fn src(
+        &self,
+        probe: &DeviceBuffer<C32>,
+        stack: StackRef<'_>,
+        n: usize,
+    ) -> Result<ProbeSrc, Error> {
+        self.src_of(probe, self.planes, stack, n)
+    }
+
+    /// The spectra `spectrum` of the shared probe with those of these planes for its mode 0,
+    /// as the shifted passes of `d` read them for the frames of `stack`, and the buffers they
+    /// address.
+    pub(super) fn spectrum_src<'b>(
+        &'b self,
+        spectrum: &'b DeviceBuffer<C32>,
+        stack: StackRef<'_>,
+        d: &ViewDims,
+    ) -> Result<(ProbeSrc, [&'b RawDeviceBuffer; 2]), Error> {
+        let Some(own) = &self.spectra else {
+            return Err(Error::Shape(
+                "own probe modes under a Model::shift need their spectra, from \
+                 Kernels::own_spectrum"
+                    .into(),
+            ));
+        };
+        let a = own.of(d)?;
+        let src = self.src_of(spectrum, a, stack, d.n())?;
+        Ok((src, [spectrum.storage(), a.storage()]))
+    }
+
+    /// The number of planes, checked against `self`'s.
+    pub(super) fn nb(&self, n: usize) -> Result<u32, Error> {
+        self.checked_nb(self.planes, n)
+    }
+
+    /// The number of positions, refused for none or a `mode0` short of their planes.
+    fn checked_nb(&self, mode0: &DeviceBuffer<C32>, n: usize) -> Result<u32, Error> {
         let nb = self.positions.len();
         if nb == 0 {
             let p = &self.positions;
@@ -193,12 +322,39 @@ impl OwnModes<'_> {
                 "own probe modes at no positions, {p:?}"
             )));
         }
-        check_len("own probe modes", self.planes, nb * n)?;
+        check_len("own probe modes", mode0, nb * n)?;
+        Ok(nb as u32)
+    }
+
+    /// The kernels read plane `pos - p0` at every position `pos` of the stack they run on, so
+    /// the stack's frames must be known to the host and lie in `self.positions`.
+    fn src_of(
+        &self,
+        probe: &DeviceBuffer<C32>,
+        mode0: &DeviceBuffer<C32>,
+        stack: StackRef<'_>,
+        n: usize,
+    ) -> Result<ProbeSrc, Error> {
+        self.checked_nb(mode0, n)?;
+        let p = &self.positions;
+        match stack.frames() {
+            Some(f) if p.start <= f.start && f.end <= p.end => {}
+            Some(f) => {
+                return Err(Error::Shape(format!(
+                    "stack {f:?} outside the own probe modes' positions {p:?}"
+                )));
+            }
+            None => {
+                return Err(Error::Shape(
+                    "own probe modes need a StackTable entry, whose frames the host knows".into(),
+                ));
+            }
+        }
         Ok(ProbeSrc {
             probe: dptr::<C32, f32>(probe).cast_const(),
-            mode0: dptr::<C32, f32>(self.planes).cast_const(),
-            p0: self.positions.start,
-            nb: nb as u32,
+            mode0: dptr::<C32, f32>(mode0).cast_const(),
+            p0: p.start,
+            step: 1,
         })
     }
 }
@@ -228,11 +384,11 @@ impl<'a> FrameProbe<'a> {
         std::iter::once(self.probe().storage()).chain(own)
     }
 
-    /// The probe of planes of `n` pixels as a kernel reads it.
-    pub(super) fn src(self, n: usize) -> Result<ProbeSrc, Error> {
+    /// The probe of planes of `n` pixels as a kernel reads it for the frames of `stack`.
+    pub(super) fn src(self, stack: StackRef<'_>, n: usize) -> Result<ProbeSrc, Error> {
         match self {
             Self::Shared(p) => Ok(shared_src(p)),
-            Self::Own(p, own) => own.src(p, n),
+            Self::Own(p, own) => own.src(p, stack, n),
         }
     }
 }
