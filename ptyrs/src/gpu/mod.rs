@@ -50,6 +50,7 @@ pub use bh::{
     BhLastSlice, BhMovedFarRef, BhMovedRef, BhMovesRef, BhNearMut, BhOffsets, BhParts, BhPositions,
     BhScan, BhSecondRef, BhTangentsMut, BhVar, BhWinRef, BhWinSecond, EpochOrder,
 };
+pub(crate) use fused::Shape;
 pub use fused::{
     BackgroundSums, Exit, FUSED_SIDES, FarSums, FrameMoves, FusedBufs, FusedInputs, FusedSums,
     Model, OwnSpectrumBuf, ProbeSpectrum, PsiSums, Shift, ShiftProbe, ShiftSums, ShiftedNumSums,
@@ -69,6 +70,7 @@ pub use ops::{
     Permutation, PositionPartial, ScalePartial, StackCtl, StackGeom, StackRef, StackTable,
     SumTarget, Sums, UpdateSums, ViewAddr, ViewDims, Views, view_tiles,
 };
+pub(crate) use optics::stage_fft;
 pub use optics::{
     BandCarry, BandedTransfer, ExitPass, ExitStage, FrameWaves, OpticsKernels, SlicePhase,
     SliceSource,

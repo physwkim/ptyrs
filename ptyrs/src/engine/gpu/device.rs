@@ -21,9 +21,10 @@ use crate::gpu::{
     Error as GpuError, ExitPass, ExitStage, FarSums, FrameWaves, FusedBufs, FusedInputs,
     GammaStacks, GradKernels, HalfWaves, Kernels, LlkPartial, LlkRing, LlkScratch, LlkTotals,
     MASKED, Model, OprShape, OpticsKernels, OwnModes, PositionKernels, PositionPartial, Positions,
-    PowerMax, ProbeSpectrum, RecordWriter, RpieKernels, ScalePartial, Shift, ShiftProbe, ShiftSums,
-    ShiftedNumSums, ShiftedProbes, ShiftedSums, SlicePhase, SliceSource, SpectrumBuf, StackRef,
-    StackTable, StackWindows, SumTarget, UpdateSums, ViewAddr, ViewDims, Views, Waves, half_scale,
+    PowerMax, ProbeSpectrum, RecordWriter, RpieKernels, ScalePartial, Shape, Shift, ShiftProbe,
+    ShiftSums, ShiftedNumSums, ShiftedProbes, ShiftedSums, SlicePhase, SliceSource, SpectrumBuf,
+    StackRef, StackTable, StackWindows, SumTarget, UpdateSums, ViewAddr, ViewDims, Views, Waves,
+    half_scale, stage_fft,
 };
 use crate::tile::TileDots;
 use cuda_async::cuda_graph::CudaGraph;
@@ -1589,7 +1590,8 @@ impl Shared {
             let f = f.map_err(|e| match e {
                 GpuError::Shape(m) if shift => EngineError::Invalid(format!("position model: {m}")),
                 GpuError::Shape(m) => EngineError::Invalid(format!(
-                    "{m}; GpuOptions {{ fused: false, .. }} runs M1's launches instead"
+                    "{m}; GpuOptions {{ fused: false, .. }} runs every algorithm but LSQML by \
+                     M1's launches instead"
                 )),
                 e => e.into(),
             })?;
@@ -2598,6 +2600,15 @@ impl Plans<'_> {
     }
 }
 
+/// `e` as [`EngineError::Invalid`] if it is a launch shape `what` cannot take, for a check
+/// that runs the launches' own shape rule before they run.
+fn shape_refused(what: &str, e: GpuError) -> EngineError {
+    match e {
+        GpuError::Shape(m) => EngineError::Invalid(format!("{what}: {m}")),
+        e => e.into(),
+    }
+}
+
 impl Device {
     /// Loads the kernels and uploads the views, counts and starting arrays on a new stream of
     /// `ctx`; every pass cuts `0 .. nframe` by the [`StackRule`] of `ctx`'s L2, the LLK ring
@@ -2658,6 +2669,12 @@ impl Device {
                 Some(half_scale(frames.map(unmasked).max().unwrap_or(0)))
             }
         };
+        // a multislice object's gaps run the propagator stage whatever `options.fused` says
+        if slices.is_some() {
+            for n in dims.frame {
+                stage_fft(&dims, n).map_err(|e| shape_refused("a multislice object", e))?;
+            }
+        }
         let views = Views::new(&stream, dims, addrs)?;
         let tile = TileDots::new(&stream, &dims)?;
         let rule = StackRule::on(options.stack_size, ctx, &dims)?;
@@ -2986,6 +3003,20 @@ impl Device {
                 self.reshare(r);
             }
         }
+    }
+
+    /// Fails unless LSQML runs here: its fused row and column passes run whatever
+    /// [`GpuOptions::fused`] says, so take the fused passes' launch shapes alone, and the LLK
+    /// of each frame's own probe under a probe variation (`varied`) runs on the fused passes
+    /// alone.
+    pub fn lsqml_runs(&self, varied: bool) -> Result<(), EngineError> {
+        Shape::of(&self.dims()).map_err(|e| shape_refused("LSQML", e))?;
+        if varied && matches!(self.shared.passes, Passes::M1 { .. }) {
+            return Err(EngineError::Invalid(
+                "LSQML's probe variation needs GpuOptions { fused: true, .. }".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Whether an intensity scale or a detector background is modelled, refined or held.

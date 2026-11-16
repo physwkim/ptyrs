@@ -12,7 +12,7 @@ use ptyrs::base::{C64, Counts, MASKED, Object, Probe, Scan, Stack};
 use ptyrs::engine::{
     Algorithm, ApParams, Backend, Bh, BhParams, BhStep, Cost, DmParams, EngineError, Feature,
     Features, GpuOptions, GpuPtycho, Llk, LlkRecord, Lsqml, LsqmlParams, MlParams, Observed,
-    Optics, Params, ProbeVariation, Ptycho, RaarParams, RpieParams, Sampling, Step, llk,
+    Optics, Params, ProbeVariation, Ptycho, RaarParams, RpieParams, Sampling, Step, Wavefield, llk,
     obj_probe_shift_to_psi, shift,
 };
 use ptyrs::gpu::{
@@ -661,6 +661,13 @@ fn gpu_rejects_what_it_cannot_run() {
     // the fused passes have no 32-point FFT; the error says which sides they take and how
     // to run without them
     assert!(!FUSED_SIDES.contains(&(M1.frame as u32)));
+    // nor have a multislice object's gaps, whatever `fused` says
+    let far = Optics::far_field(&scan.geometry);
+    let gap = Wavefield::new([M1.frame; 2], scan.geometry.wavelength, far.pixel(), 2e-5).unwrap();
+    let sliced = far.with_slices(&[gap]).unwrap();
+    let slices = [object.clone(), object.clone()];
+    let r = GpuPtycho::with_slices(&ctx(), &scan, &sliced, &slices, probe.clone(), M1.options);
+    assert!(matches!(r, Err(EngineError::Invalid(_))), "{:?}", r.err());
     let err = GpuPtycho::new(&ctx(), &scan, object, probe, FUSED.options)
         .err()
         .unwrap()

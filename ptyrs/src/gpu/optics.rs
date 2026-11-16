@@ -30,8 +30,8 @@ use crate::gpu::fused::Side;
 use crate::gpu::opr::{FrameProbe, OwnModes};
 use crate::gpu::ops::grid_1d;
 use crate::gpu::{
-    C32, Error, Kernels, StackCtl, StackGeom, StackRef, ViewAddr, ViewDims, Views, block_fft,
-    check_len, dptr,
+    BlockFft, C32, Error, Kernels, StackCtl, StackGeom, StackRef, ViewAddr, ViewDims, Views,
+    block_fft, check_len, dptr,
 };
 
 /// What a propagator applies to the exit-wave plane ahead of the fused transform `F`, the
@@ -589,6 +589,18 @@ enum Carried<'a> {
     Restore(&'a DeviceBuffer<C32>, f32),
 }
 
+/// The stages' kernel for lines of `n` points of frames of `d`: its side and its forward and
+/// inverse in-kernel FFTs.
+pub(crate) fn stage_fft(d: &ViewDims, n: u32) -> Result<(Side, BlockFft, BlockFft), Error> {
+    let side = Side::ALL.iter().copied().find(|&s| s as u32 == n);
+    match (side, block_fft(n, false), block_fft(n, true)) {
+        (Some(side), Some(f), Some(i)) => Ok((side, f, i)),
+        _ => Err(Error::Shape(format!(
+            "propagator stage, {d:?}: no in-kernel FFT for side {n}"
+        ))),
+    }
+}
+
 /// The launches of the stages on one stack's planes.
 struct Launch {
     /// The row and column line passes: a side's kernel and its launch shape.
@@ -609,13 +621,9 @@ impl Launch {
         check_len("planes", buf, planes * d.n())?;
         let [ny, nx] = d.frame;
         // Lines of `n` points, `per` to a plane.
-        let pass = |n: u32, per: u32| {
+        let pass = |n: u32, per: u32| -> Result<_, Error> {
+            let (side, f, i) = stage_fft(d, n)?;
             let bad = |what: &str| Error::Shape(format!("propagator stage, {d:?}: {what} {n}"));
-            let side = Side::ALL.iter().copied().find(|&s| s as u32 == n);
-            let (Some(side), Some(f), Some(i)) = (side, block_fft(n, false), block_fft(n, true))
-            else {
-                return Err(bad("no in-kernel FFT for side"));
-            };
             let bpb = f.suggested_ffts_per_block.min(i.suggested_ffts_per_block);
             let blocks = (planes as u64 * per as u64).div_ceil(bpb as u64);
             let blocks = u32::try_from(blocks)
