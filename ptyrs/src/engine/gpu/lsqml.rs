@@ -69,8 +69,9 @@ impl GpuPtycho {
     /// passes whatever [`super::GpuOptions::fused`] says, so frames or modes they cannot take
     /// ([`crate::gpu::FUSED_SIDES`]) are [`EngineError::Invalid`]; so is another variation
     /// without `GpuOptions { fused: true, .. }`, even under `calc_llk` 0, since only the fused
-    /// passes take the LLK of each frame's own probe, and a variation of other probe planes or
-    /// of weight rows other than the frames.
+    /// passes take the LLK of each frame's own probe, a variation's batches of more frames than
+    /// its launches' grid y takes, 65535, and a variation of other probe planes or of weight
+    /// rows other than the frames.
     pub fn lsqml(
         &mut self,
         params: &LsqmlParams,
@@ -84,7 +85,7 @@ impl GpuPtycho {
         let varied = opr.is_some();
         let check = |dev: &Device| {
             params.validate()?;
-            dev.lsqml_runs(varied)?;
+            dev.lsqml_runs(params.batch_size, varied)?;
             if dev.models_scale_or_background() {
                 return Err(EngineError::Invalid(
                     "LSQML models no intensity scale or background, as pty-chi's".into(),

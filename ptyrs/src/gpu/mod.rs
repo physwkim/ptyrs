@@ -64,6 +64,7 @@ pub use lsqml::{
     FrameDirs, LSQML_REC, LsqmlAt, LsqmlChi, LsqmlKernels, LsqmlNoise, LsqmlScan, LsqmlVar,
     SliceSteps,
 };
+pub(crate) use opr::variation_batch;
 pub use opr::{FrameProbe, Opr, OprKernels, OprPlanes, OprShape, OwnModes};
 pub use ops::{
     DeviceStackTable, LLK_TREE_LEAVES, LlkPartial, LlkScratch, LlkSums, MASKED, OBJ_TILE,

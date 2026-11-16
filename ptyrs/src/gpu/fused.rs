@@ -32,7 +32,7 @@ use ptyrs_kernels::fused::{
 use ptyrs_kernels::pixel::{PIXEL_THREADS, PsiPtr, SumPtrs, psi_f32};
 use ptyrs_kernels::position::BatchSpan;
 
-use crate::gpu::opr::{FrameProbe, OwnModes};
+use crate::gpu::opr::{FrameProbe, OwnModes, variation_batch};
 use crate::gpu::ops::grid_1d;
 use crate::gpu::position::span;
 use crate::gpu::psi::check_waves;
@@ -389,9 +389,7 @@ pub struct OwnSpectrumBuf(DeviceBuffer<C32>);
 
 impl OwnSpectrumBuf {
     pub fn zeroed(stream: &CudaStream, dims: &ViewDims, nb_max: u32) -> Result<Self, Error> {
-        if nb_max == 0 || nb_max as u64 > GRID_Y_MAX {
-            return Err(Error::Shape(format!("own spectra of {nb_max} frames")));
-        }
+        variation_batch(nb_max)?;
         Ok(Self(DeviceBuffer::zeroed(
             stream,
             nb_max as usize * dims.n(),
