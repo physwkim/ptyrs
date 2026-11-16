@@ -8,7 +8,7 @@ use ptyrs::base::{
 };
 use ptyrs::engine::{
     ApParams, BhParams, Cost, DmParams, Feature, Features, GpuOptions, GpuPtycho, LsqmlParams,
-    MlParams, Optics, Ptycho, RaarParams, RpieParams, Sampling,
+    MlParams, Optics, ProbeVariation, Ptycho, RaarParams, RpieParams, Sampling,
 };
 use ptyrs::gpu::FUSED_SIDES;
 
@@ -720,6 +720,7 @@ fn sampling_round_trip_rebuilds_the_same_run() {
         cost: Cost::Poisson,
         seed: 7,
     };
+    let none = ProbeVariation::none(c.probe.plane_shape());
     let run = |toggle: bool| {
         let mut gpu = c.gpu(true);
         gpu.set_features(&moved).unwrap();
@@ -728,7 +729,7 @@ fn sampling_round_trip_rebuilds_the_same_run() {
             gpu.dm(&DmParams::default(), 2).unwrap();
             gpu.ml(&MlParams::default(), 2).unwrap();
             gpu.bh(&bh, 1, 1).unwrap();
-            gpu.lsqml(&lsqml, 1, 1).unwrap();
+            gpu.lsqml(&lsqml, &mut none.clone(), 1, 1).unwrap();
             if toggle {
                 gpu.set_sampling(Sampling::FullObject).unwrap();
                 gpu.set_sampling(Sampling::Patch).unwrap();

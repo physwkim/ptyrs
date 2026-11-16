@@ -41,7 +41,7 @@ use crate::fault;
 use crate::fft::Plan2d;
 use crate::gpu::{
     C32, CG_BLOCKS, Error as GpuError, FarSums, FusedBufs, FusedInputs, Model, ObjProbeScale,
-    RecordWriter, StackRef, StackTable, ViewAddr, ViewDims, Waves,
+    OprShape, RecordWriter, StackRef, StackTable, ViewAddr, ViewDims, Waves,
 };
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
@@ -123,10 +123,12 @@ enum Epoch {
     },
     /// A BH epoch; with `cg` it continues the last epoch's direction.
     Bh { params: BhParams, cg: bool },
-    /// An LSQML epoch; `pre` says what it does to the preconditioner.
+    /// An LSQML epoch; `pre` says what it does to the preconditioner, `opr` the shape of its
+    /// probe variation, if it runs one.
     Lsqml {
         params: LsqmlParams,
         pre: lsqml::Pre,
+        opr: Option<OprShape>,
     },
 }
 
@@ -162,9 +164,10 @@ impl Epoch {
                 llk: false,
             },
             Self::Bh { params, .. } => Self::Bh { params, cg: false },
-            Self::Lsqml { params, .. } => Self::Lsqml {
+            Self::Lsqml { params, opr, .. } => Self::Lsqml {
                 params,
                 pre: lsqml::Pre::Keep,
+                opr,
             },
         }
     }
@@ -890,15 +893,23 @@ impl GpuPtycho {
 
 /// The per-stack steps of every algorithm, on the lent device state.
 impl Bufs<'_> {
-    /// The LLK record of the current estimate through `rec`: M1's by the scratch stack.
+    /// The LLK record of the current estimate through `rec`: M1's by the scratch stack. With
+    /// `opr`, each frame's probe is its own of that variation ([`crate::engine::Lsqml::llk`]),
+    /// which only the fused passes read.
     fn forward_llk(
         &mut self,
         ctx: &ExecutionContext,
         passes: &mut PassesMut<'_>,
         mut rec: RecordWriter<'_, Tag>,
+        mut opr: Option<&mut lsqml::OprBufs>,
     ) -> Result<(), GpuError> {
         let dims = *self.views.dims();
         match passes {
+            PassesMut::M1(_) if opr.is_some() => {
+                return Err(GpuError::Shape(
+                    "own probe modes need the fused passes".into(),
+                ));
+            }
             PassesMut::M1(m1) => {
                 let (k, optics) = (self.kernels, self.exit.kernels);
                 for s in 0..self.scratch.len() {
@@ -918,7 +929,7 @@ impl Bufs<'_> {
                                 probe: self.probe,
                                 model: Model::default(),
                             };
-                            sl.exit_waves(ctx, k, optics, &inputs, self.deeper, stack)?
+                            sl.exit_waves(ctx, k, optics, &inputs, self.deeper, (None, stack))?
                         }
                     };
                     let plan = self.scratch.frames[s].plan;
@@ -956,12 +967,20 @@ impl Bufs<'_> {
                         llk: Some(&mut *self.llk),
                         ..FarSums::default()
                     };
-                    match &mut self.slices {
-                        None => self.kernels.fused_llk(ctx, &inputs, stack, f, far)?,
-                        Some(sl) => {
+                    let shift = inputs.model.shift.is_some();
+                    let own = (opr.as_deref_mut())
+                        .map(|o| o.scan_modes(ctx, self.kernels, stack, self.probe, shift))
+                        .transpose()?;
+                    match (&mut self.slices, &own) {
+                        (None, None) => self.kernels.fused_llk(ctx, &inputs, stack, f, far)?,
+                        (None, Some(own)) => {
+                            (self.kernels).fused_llk_own(ctx, &inputs, own, stack, f, far)?
+                        }
+                        (Some(sl), own) => {
                             let (k, exit) = (self.kernels, self.exit);
+                            let at = (own.as_ref(), stack);
                             let rows =
-                                sl.exit_waves(ctx, k, exit.kernels, &inputs, obj.deeper, stack)?;
+                                sl.exit_waves(ctx, k, exit.kernels, &inputs, obj.deeper, at)?;
                             exit.kernels.rows(ctx, &dims, stack, rows, false)?;
                             (exit.kernels).exit(ctx, &dims, stack, exit.stage, rows, false)?;
                             k.rows_llk(ctx, &inputs, stack, rows, f, far)?;
@@ -1345,7 +1364,7 @@ mod tests {
 
         use super::super::*;
         use super::engine;
-        use crate::engine::{Cost, Feature};
+        use crate::engine::{Cost, Feature, ProbeVariation};
         use crate::fault::Exit;
 
         fn ctx() -> Arc<CudaContext> {
@@ -1393,6 +1412,7 @@ mod tests {
                 cost: Cost::Poisson,
                 seed: 0,
             };
+            let mut none = ProbeVariation::none([e.probe_dims[1], e.probe_dims[2]]);
             let calls = [
                 ("llk", e.llk().map(drop)),
                 ("ap", e.ap(&ap(false), 1)),
@@ -1401,7 +1421,7 @@ mod tests {
                 ("rpie", e.rpie(&RpieParams::default(), 1)),
                 ("ml", e.ml(&MlParams::default(), 1)),
                 ("bh", e.bh(&bh, 1, 1)),
-                ("lsqml", e.lsqml(&lsqml, 1, 1)),
+                ("lsqml", e.lsqml(&lsqml, &mut none, 1, 1)),
                 ("ml_grads", e.ml_grads().map(drop)),
                 ("ml_obj_grad_into", e.ml_obj_grad_into(&mut buf)),
                 ("bh_steps", e.bh_steps().map(drop)),

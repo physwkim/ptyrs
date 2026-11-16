@@ -23,8 +23,8 @@ use ptyrs::base::{
     AddrTable, C64, Geometry, Object, Positions, Probe, Scan, Stack, required_obj_shape,
 };
 use ptyrs::engine::{
-    Cost, EngineError, GpuOptions, GpuPtycho, Llk, LsqmlParams, Observed, Optics, SliceWaves,
-    Wavefield, llk, shift,
+    Cost, EngineError, GpuOptions, GpuPtycho, Llk, LsqmlParams, Observed, Optics, ProbeVariation,
+    SliceWaves, Wavefield, llk, shift,
 };
 
 const FRAME: usize = 256;
@@ -320,6 +320,11 @@ fn load(dir: &Path, case: &str) -> Result<Case, Box<dyn Error>> {
 }
 
 impl Case {
+    /// The shared probe's variation: none.
+    fn none(&self) -> ProbeVariation {
+        ProbeVariation::none(self.probe.plane_shape())
+    }
+
     fn gpu(&self, ctx: &std::sync::Arc<CudaContext>) -> Result<GpuPtycho, EngineError> {
         let options = GpuOptions::default();
         GpuPtycho::with_slices(
@@ -354,7 +359,7 @@ fn count(dir: &Path, case: &str, nepoch: usize, batches: &[usize]) -> Result<(),
     for &batch in batches {
         let mut g = c.gpu(&ctx)?;
         let first = g.llk()?.poisson;
-        g.lsqml(&params(batch), nepoch, 1)?;
+        g.lsqml(&params(batch), &mut c.none(), nepoch, 1)?;
         let curve: Vec<f64> = g.history().iter().map(|r| r.llk.poisson).collect();
         let hit = curve
             .iter()
@@ -381,13 +386,13 @@ fn time(dir: &Path, case: &str, runs: &[(usize, usize)]) -> Result<(), Box<dyn E
     let ctx = CudaContext::new(0).map_err(EngineError::from)?;
     for &(batch, nepoch) in runs {
         let mut warm = c.gpu(&ctx)?;
-        warm.lsqml(&params(batch), WARMUP, 0)?;
+        warm.lsqml(&params(batch), &mut c.none(), WARMUP, 0)?;
         warm.synchronize()?;
         drop(warm);
         let load = load_average();
         let mut g = c.gpu(&ctx)?;
         let t = Instant::now();
-        g.lsqml(&params(batch), nepoch, 0)?;
+        g.lsqml(&params(batch), &mut c.none(), nepoch, 0)?;
         g.synchronize()?;
         let s = t.elapsed().as_secs_f64();
         let end = g.llk()?.poisson / c.truth;

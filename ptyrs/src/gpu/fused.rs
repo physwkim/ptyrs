@@ -17,6 +17,7 @@
 //! carries across stacks until [`Kernels::shifted_probe_sums`] turns them into probe sums.
 
 use std::cell::Cell;
+use std::ops::Range;
 
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig, RawDeviceBuffer};
@@ -26,13 +27,14 @@ use ptyrs_kernels::fused::{
     FUSED_GRAD, FUSED_ITERATE, FUSED_LLK, FUSED_MODEL_TERMS, FUSED_PROJECT, FUSED_RAAR,
     FUSED_ROW_THREADS, FUSED_SCALE, FUSED_SCALE_SUMS, FUSED_SHIFT_DEN, FUSED_SHIFT_OBJ,
     FUSED_SHIFT_POSITION, FUSED_SHIFT_PROBE, FUSED_SHIFT_STEP, FUSED_STEP_CHUNKS, FUSED_TO_PSI,
-    FusedCfg, FusedPtrs, ProbeSrc, col_slot_bytes, fused_col_threads, shared_probe,
-    shift_stage_bytes,
+    FusedCfg, FusedPtrs, col_slot_bytes, fused_col_threads, shared_probe, shift_stage_bytes,
 };
 use ptyrs_kernels::pixel::{PIXEL_THREADS, PsiPtr, SumPtrs, psi_f32};
+use ptyrs_kernels::position::BatchSpan;
 
-use crate::gpu::opr::OwnModes;
+use crate::gpu::opr::{FrameProbe, OwnModes};
 use crate::gpu::ops::grid_1d;
+use crate::gpu::position::span;
 use crate::gpu::psi::check_waves;
 use crate::gpu::{
     C32, Error, ExitPass, Kernels, LlkPartial, PositionPartial, ScalePartial, StackCtl, StackGeom,
@@ -146,7 +148,7 @@ impl Shape {
         (shift_stage_bytes(flags, self.nx as u32) + self.row_smem).max(16 * FUSED_ROW_THREADS)
     }
 
-    /// `rows_fwd` (one block row per view) or `rows_inv` (per frame).
+    /// `rows_fwd` (one block row per view), or `rows_inv` or `shift_moved_rows` (per frame).
     pub(crate) fn rows(&self, g: &StackGeom, per_view: bool) -> Result<LaunchConfig, Error> {
         let planes = g.nf_max as u64 * if per_view { g.nmode as u64 } else { 1 };
         if planes > GRID_Y_MAX {
@@ -200,7 +202,8 @@ impl Shape {
         }
     }
 
-    /// `shift_cols` over `nplane` planes `[ny, nx]`.
+    /// `shift_cols` over `nplane` planes `[ny, nx]`, or `shift_moved_cols` over `nplane`
+    /// frames.
     fn plane_cols(&self, nplane: u32) -> LaunchConfig {
         let (ny, nx) = (self.ny as u32, self.nx as u32);
         LaunchConfig {
@@ -364,8 +367,7 @@ pub struct Model<'a> {
 pub struct Shift<'a> {
     /// `(dy, dx)` per frame, `[nframe, 2]`.
     pub offsets: &'a DeviceBuffer<f32>,
-    /// The spectra of [`FusedInputs::probe`], mode 0 each frame's own from
-    /// [`Kernels::own_spectrum`].
+    /// The spectra of [`FusedInputs::probe`].
     pub spectrum: ProbeSpectrum<'a>,
 }
 
@@ -403,46 +405,40 @@ impl OwnSpectrumBuf {
 #[derive(Clone, Copy)]
 pub struct ProbeSpectrum<'a> {
     a: &'a DeviceBuffer<C32>,
-    /// Each frame's own mode-0 spectrum, read in place of `a`'s mode 0.
-    own: Option<OwnSpectra<'a>>,
     probe: &'a DeviceBuffer<C32>,
     /// `[ny, nx, nprobe, quad_phase bits]`.
     key: [u32; 4],
 }
 
-/// Mode-0 spectra `[nb, ny, nx]`, plane `b` that of the frame at epoch position `p0 + b`.
+/// The mode-0 spectra of [`OwnModes`]' planes, `[nb, ny, nx]`, FFT order, from
+/// [`Kernels::own_spectrum`] for the frame geometry `key` names.
 #[derive(Clone, Copy)]
-struct OwnSpectra<'a> {
-    planes: &'a DeviceBuffer<C32>,
-    p0: u32,
-    nb: u32,
+pub(super) struct OwnSpectra<'a> {
+    a: &'a DeviceBuffer<C32>,
+    /// `[ny, nx, quad_phase bits]`.
+    key: [u32; 3],
+}
+
+impl<'a> OwnSpectra<'a> {
+    /// The spectra, refused for any frame geometry but the one they were computed for.
+    pub(super) fn of(&self, d: &ViewDims) -> Result<&'a DeviceBuffer<C32>, Error> {
+        if self.key != Self::key(d) {
+            return Err(Error::Shape(
+                "the own probe spectra are not of this frame geometry".into(),
+            ));
+        }
+        Ok(self.a)
+    }
+
+    fn key(d: &ViewDims) -> [u32; 3] {
+        [d.frame[0], d.frame[1], d.quad_phase.to_bits()]
+    }
 }
 
 impl<'a> ProbeSpectrum<'a> {
-    /// The spectra `A_p` of the shared probe, `[nprobe, ny, nx]`, FFT order: mode 0 is no
-    /// frame's under [`Kernels::own_spectrum`]'s own modes.
+    /// The spectra `A_p` of the shared probe, `[nprobe, ny, nx]`, FFT order.
     pub(crate) fn spectra(&self) -> &'a DeviceBuffer<C32> {
         self.a
-    }
-
-    /// The spectra as `shift_pre` reads them.
-    fn src(&self) -> ProbeSrc {
-        let a = dptr::<C32, f32>(self.a).cast_const();
-        match self.own {
-            None => shared_probe(a),
-            Some(own) => ProbeSrc {
-                probe: a,
-                mode0: dptr::<C32, f32>(own.planes).cast_const(),
-                p0: own.p0,
-                nb: own.nb,
-            },
-        }
-    }
-
-    /// The buffers [`Self::src`] addresses.
-    fn storages(&self) -> impl Iterator<Item = &'a RawDeviceBuffer> {
-        let own = self.own.map(|o| o.planes.storage());
-        std::iter::once(self.a.storage()).chain(own)
     }
 
     fn key(d: &ViewDims) -> [u32; 4] {
@@ -672,9 +668,32 @@ pub enum ShiftProbe<'a> {
     /// arrays read, with the denominator, for [`Kernels::shifted_probe_sums`] into
     /// [`UpdateSums`] and then [`Kernels::probe_step`]; under [`Exit::Grad`] `c = x`.
     Step(&'a mut ShiftedStepSums),
+    /// Of `x` as [`Self::Num`], and each frame's own addend of probe mode 0 into `moved`.
+    Frames {
+        sums: &'a mut ShiftedNumSums,
+        moved: FrameMoves<'a>,
+    },
 }
 
-impl ShiftProbe<'_> {
+impl<'a> ShiftProbe<'a> {
+    /// The sums of `probe`, if any, and its frames' moves.
+    fn split(probe: Option<Self>) -> (Option<ShiftKind<'a>>, Option<FrameMoves<'a>>) {
+        match probe {
+            None => (None, None),
+            Some(Self::Num(sums)) => (Some(ShiftKind::Num(sums)), None),
+            Some(Self::Step(sums)) => (Some(ShiftKind::Step(sums)), None),
+            Some(Self::Frames { sums, moved }) => (Some(ShiftKind::Num(sums)), Some(moved)),
+        }
+    }
+}
+
+/// A [`ShiftProbe`]'s sums, of their kind.
+enum ShiftKind<'a> {
+    Num(&'a mut ShiftedNumSums),
+    Step(&'a mut ShiftedStepSums),
+}
+
+impl ShiftKind<'_> {
     /// The shift flags that write these sums.
     fn flags(&self) -> u32 {
         match self {
@@ -688,6 +707,24 @@ impl ShiftProbe<'_> {
             Self::Num(sums) => sums.check(d),
             Self::Step(sums) => sums.check(d),
         }
+    }
+}
+
+/// Each frame's own addend of probe mode 0 to [`ShiftProbe::Frames`]' sums, taken back alone
+/// as [`Kernels::shifted_probe_sums`] takes back their sum, for OPR: `planes`, `[nb, n]` in
+/// the natural layout, plane `b` the frame at epoch position `positions.start + b`, gets
+/// `conj(q) IDFT(G) / n` of that frame's `G`. A frame outside `positions` writes nothing.
+pub struct FrameMoves<'a> {
+    pub planes: &'a mut DeviceBuffer<C32>,
+    pub positions: Range<u32>,
+}
+
+impl FrameMoves<'_> {
+    /// The batch of `positions`, errors unless `planes` holds it for `d`.
+    fn span(&self, d: &ViewDims) -> Result<BatchSpan, Error> {
+        let span = span(d, &self.positions)?;
+        check_len("frame moves", self.planes, span.nb as usize * d.n())?;
+        Ok(span)
     }
 }
 
@@ -889,8 +926,9 @@ impl Kernels {
     /// [`Model::shift`], the shifted probe takes the place of `P_p q` and `sums.shift` gets
     /// its sums. Under a [`Model::exit`] the projection is at the detector of the propagator
     /// `D F V`: its stage ahead of the column pass and the adjoint after it, so DM's and
-    /// RAAR's mixes stay in the exit plane. Up to nine launches, twelve with a shift, and the
-    /// stage's; a stack with `nf == 0` writes nothing but `bufs`.
+    /// RAAR's mixes stay in the exit plane. Up to nine launches, twelve with a shift and
+    /// fourteen under [`ShiftProbe::Frames`], and the stage's; a stack with `nf == 0` writes
+    /// nothing but `bufs`.
     pub fn fused_project(
         &self,
         ctx: &ExecutionContext,
@@ -961,7 +999,11 @@ impl Kernels {
                     position_den,
                 },
         } = sums;
-        let probe_flags = shift_probe.as_ref().map_or(0, ShiftProbe::flags);
+        let (shift_probe, moved) = ShiftProbe::split(shift_probe);
+        let probe_flags = shift_probe.as_ref().map_or(0, ShiftKind::flags);
+        let moved = moved
+            .map(|m| m.span(d).map(|s| (s, m.planes)))
+            .transpose()?;
         let obj_sums = obj_sums.map(|s| s.target());
         if let Some(sums) = &obj_sums {
             sums.check(d.obj_len())?;
@@ -1013,7 +1055,7 @@ impl Kernels {
             Some(sh) => {
                 let slopes = FUSED_SHIFT_DEN | FUSED_SHIFT_POSITION;
                 let t_dy = (shift_flags & slopes != 0).then_some(&sh.scratch.adj);
-                run.shift_pre(&sh.model, &sh.model.spectrum, &sh.scratch.t, t_dy, p)?;
+                run.shift_pre(&sh.model, &sh.model.spectrum, None, &sh.scratch.t, t_dy, p)?;
                 run.shift_rows_fwd(&sh.scratch.t, &bufs.work, carried, p, fwd)?;
             }
             None => {
@@ -1055,6 +1097,9 @@ impl Kernels {
                 if let Some(sums) = shift_probe {
                     run.shift_probe_sums(sh, p, sums)?;
                 }
+                if let Some((span, planes)) = moved {
+                    run.shift_moves(sh, p, span, planes)?;
+                }
                 if let Some(sums) = obj_sums {
                     run.gather_shifted(sh, p, out.cfg(cfg), sums)?;
                 }
@@ -1078,12 +1123,40 @@ impl Kernels {
     /// what [`Self::fused_project`] adds to [`FusedSums::obj`] and [`ShiftSums::probe`] from
     /// the waves it leaves, in its order, so that the split into stacks does not change a
     /// bit. Another kernel build: the sums match `fused_project`'s to rounding, not bit for
-    /// bit. Up to five launches; writes nothing but `sums` and `bufs`.
+    /// bit. Up to five launches, seven under [`ShiftProbe::Frames`]; writes nothing but `sums`
+    /// and `bufs`.
     pub fn shifted_psi_sums(
         &self,
         ctx: &ExecutionContext,
         inputs: &FusedInputs<'_>,
         stack: StackRef<'_>,
+        psi: &dyn Waves,
+        bufs: &mut FusedBufs,
+        sums: PsiSums<'_>,
+    ) -> Result<(), Error> {
+        self.psi_sums_on(ctx, inputs, (None, stack), psi, bufs, sums)
+    }
+
+    /// [`Self::shifted_psi_sums`] with each frame's mode 0 its plane of `own`, read through
+    /// its spectra from [`Self::own_spectrum`]: the object sums of the probe variation's
+    /// model. The probe sums and moves do not read the probe, so they are the shared ones.
+    pub fn shifted_psi_sums_own(
+        &self,
+        ctx: &ExecutionContext,
+        inputs: &FusedInputs<'_>,
+        (own, stack): (&OwnModes<'_>, StackRef<'_>),
+        psi: &dyn Waves,
+        bufs: &mut FusedBufs,
+        sums: PsiSums<'_>,
+    ) -> Result<(), Error> {
+        self.psi_sums_on(ctx, inputs, (Some(own), stack), psi, bufs, sums)
+    }
+
+    fn psi_sums_on(
+        &self,
+        ctx: &ExecutionContext,
+        inputs: &FusedInputs<'_>,
+        (own, stack): (Option<&OwnModes<'_>>, StackRef<'_>),
         psi: &dyn Waves,
         bufs: &mut FusedBufs,
         sums: PsiSums<'_>,
@@ -1096,7 +1169,11 @@ impl Kernels {
         let d = inputs.views.dims();
         check_waves("psi", psi, run.g.nf_max as usize * d.nmode as usize * d.n())?;
         let PsiSums { obj, probe } = sums;
-        let probe_flags = probe.as_ref().map_or(0, ShiftProbe::flags);
+        let (probe, moved) = ShiftProbe::split(probe);
+        let probe_flags = probe.as_ref().map_or(0, ShiftKind::flags);
+        let moved = moved
+            .map(|m| m.span(d).map(|s| (s, m.planes)))
+            .transpose()?;
         let obj = obj.map(|s| s.target());
         if let Some(sums) = &obj {
             sums.check(d.obj_len())?;
@@ -1114,11 +1191,14 @@ impl Kernels {
             alpha: 0.0,
             beta: 0.0,
         };
-        run.shift_pre(&sh.model, &sh.model.spectrum, &sh.scratch.t, None, p)?;
+        run.shift_pre(&sh.model, &sh.model.spectrum, own, &sh.scratch.t, None, p)?;
         run.shift_sums(sh, psi, p, cfg)?;
         if let Some(sums) = probe {
             run.shift_post(sh, p)?;
             run.shift_probe_sums(sh, p, sums)?;
+        }
+        if let Some((span, planes)) = moved {
+            run.shift_moves(sh, p, span, planes)?;
         }
         if let Some(sums) = obj {
             run.gather_shifted(sh, p, cfg, sums)?;
@@ -1140,6 +1220,32 @@ impl Kernels {
         t: &mut DeviceBuffer<C32>,
         work: &mut DeviceBuffer<C32>,
     ) -> Result<(), Error> {
+        self.rows_fwd_on(ctx, inputs, None, stack, t, work)
+    }
+
+    /// [`Self::shifted_rows_fwd`] with each frame's mode 0 its plane of `own`, read through
+    /// its spectra from [`Self::own_spectrum`].
+    pub fn shifted_rows_fwd_own(
+        &self,
+        ctx: &ExecutionContext,
+        inputs: &FusedInputs<'_>,
+        own: &OwnModes<'_>,
+        stack: StackRef<'_>,
+        t: &mut DeviceBuffer<C32>,
+        work: &mut DeviceBuffer<C32>,
+    ) -> Result<(), Error> {
+        self.rows_fwd_on(ctx, inputs, Some(own), stack, t, work)
+    }
+
+    fn rows_fwd_on(
+        &self,
+        ctx: &ExecutionContext,
+        inputs: &FusedInputs<'_>,
+        own: Option<&OwnModes<'_>>,
+        stack: StackRef<'_>,
+        t: &mut DeviceBuffer<C32>,
+        work: &mut DeviceBuffer<C32>,
+    ) -> Result<(), Error> {
         let run = Run::checked(self, ctx, *inputs, stack)?;
         let d = inputs.views.dims();
         check_len(
@@ -1149,7 +1255,7 @@ impl Kernels {
         )?;
         let p = FusedPtrs {
             work: dptr(work),
-            ..run.shifted_probe(t)?
+            ..run.shifted_probe(own, t)?
         };
         run.shift_rows_fwd(t, work, Carried::default(), p, FusedCfg::default())
     }
@@ -1164,7 +1270,22 @@ impl Kernels {
         t: &mut DeviceBuffer<C32>,
     ) -> Result<(), Error> {
         Run::checked(self, ctx, *inputs, stack)?
-            .shifted_probe(t)
+            .shifted_probe(None, t)
+            .map(drop)
+    }
+
+    /// [`Self::shifted_probe`] with each frame's mode 0 its plane of `own`, read through its
+    /// spectra from [`Self::own_spectrum`].
+    pub fn shifted_probe_own(
+        &self,
+        ctx: &ExecutionContext,
+        inputs: &FusedInputs<'_>,
+        own: &OwnModes<'_>,
+        stack: StackRef<'_>,
+        t: &mut DeviceBuffer<C32>,
+    ) -> Result<(), Error> {
+        Run::checked(self, ctx, *inputs, stack)?
+            .shifted_probe(Some(own), t)
             .map(drop)
     }
 
@@ -1181,13 +1302,40 @@ impl Kernels {
         bufs: &mut FusedBufs,
         far: FarSums<'_>,
     ) -> Result<(), Error> {
+        self.llk_on(ctx, inputs, None, stack, bufs, far)
+    }
+
+    /// [`Self::fused_llk`] with each frame's mode 0 its plane of `own` (the LLK of the probe
+    /// variation's model); under a [`Model::shift`], read through the spectra of `own` from
+    /// [`Self::own_spectrum`].
+    pub fn fused_llk_own(
+        &self,
+        ctx: &ExecutionContext,
+        inputs: &FusedInputs<'_>,
+        own: &OwnModes<'_>,
+        stack: StackRef<'_>,
+        bufs: &mut FusedBufs,
+        far: FarSums<'_>,
+    ) -> Result<(), Error> {
+        self.llk_on(ctx, inputs, Some(own), stack, bufs, far)
+    }
+
+    fn llk_on(
+        &self,
+        ctx: &ExecutionContext,
+        inputs: &FusedInputs<'_>,
+        own: Option<&OwnModes<'_>>,
+        stack: StackRef<'_>,
+        bufs: &mut FusedBufs,
+        far: FarSums<'_>,
+    ) -> Result<(), Error> {
         let bufs = &*bufs;
         let (run, shift) = Run::new(self, ctx, *inputs, stack, bufs)?;
         run.check_far(&far)?;
         let p = run.ptrs(bufs, &far);
-        match &shift {
-            Some(sh) => {
-                run.shift_pre(&sh.model, &sh.model.spectrum, &sh.scratch.t, None, p)?;
+        match (&shift, own) {
+            (Some(sh), own) => {
+                run.shift_pre(&sh.model, &sh.model.spectrum, own, &sh.scratch.t, None, p)?;
                 run.shift_rows_fwd(
                     &sh.scratch.t,
                     &bufs.work,
@@ -1196,7 +1344,8 @@ impl Kernels {
                     FusedCfg::default(),
                 )?;
             }
-            None => run.rows_fwd(bufs, Carried::default(), p, FusedCfg::default())?,
+            (None, None) => run.rows_fwd(bufs, Carried::default(), p, FusedCfg::default())?,
+            (None, Some(own)) => run.rows_fwd_own(bufs, own, p)?,
         }
         run.stage(&bufs.work, false)?;
         run.rows_llk(&bufs.work, bufs, far, p)
@@ -1314,41 +1463,29 @@ impl Kernels {
         self.spectrum_of(ctx, dims, probe, &buf.0, dims.nprobe)?;
         Ok(ProbeSpectrum {
             a: &buf.0,
-            own: None,
             probe,
             key: ProbeSpectrum::key(dims),
         })
     }
 
-    /// `spectrum` with each frame's own mode 0 of `own`, whose probe it is the spectra of: the
-    /// spectra of `own`'s planes into `buf`, which the shifted passes read for mode 0 of the
-    /// frame at each of `own`'s epoch positions, in place of any own modes `spectrum` had.
-    /// Two launches.
+    /// `own` with the spectra of its planes for frames of `dims` into `buf`, which the shifted
+    /// passes given `own` read for mode 0 of the frame at each of its epoch positions. Two
+    /// launches.
     pub fn own_spectrum<'a>(
         &self,
         ctx: &ExecutionContext,
         dims: &ViewDims,
-        spectrum: ProbeSpectrum<'a>,
-        own: &OwnModes<'_>,
+        own: &OwnModes<'a>,
         buf: &'a mut OwnSpectrumBuf,
-    ) -> Result<ProbeSpectrum<'a>, Error> {
-        if spectrum.key != ProbeSpectrum::key(dims) {
-            return Err(Error::Shape(
-                "the probe spectrum is not of this frame geometry".into(),
-            ));
-        }
+    ) -> Result<OwnModes<'a>, Error> {
         let n = dims.n();
-        let src = own.src(spectrum.probe, n)?;
-        check_len("own spectra", &buf.0, src.nb as usize * n)?;
-        self.spectrum_of(ctx, dims, own.planes, &buf.0, src.nb)?;
-        Ok(ProbeSpectrum {
-            own: Some(OwnSpectra {
-                planes: &buf.0,
-                p0: src.p0,
-                nb: src.nb,
-            }),
-            ..spectrum
-        })
+        let nb = own.nb(n)?;
+        check_len("own spectra", &buf.0, nb as usize * n)?;
+        self.spectrum_of(ctx, dims, own.planes(), &buf.0, nb)?;
+        Ok(own.with_spectra(OwnSpectra {
+            a: &buf.0,
+            key: OwnSpectra::key(dims),
+        }))
     }
 
     /// `a = DFT(probe q) / n` of `nplane` planes `[ny, nx]`, checked by the callers: the
@@ -1540,7 +1677,6 @@ impl Kernels {
         self.spectrum_of(ctx, dims, num, &step.step, dims.nprobe)?;
         let dir = ProbeSpectrum {
             a: &step.step,
-            own: None,
             probe: num,
             key: ProbeSpectrum::key(dims),
         };
@@ -1639,7 +1775,7 @@ impl Kernels {
             return Err(Error::Shape("probe_step needs a Model::shift".into()));
         };
         let p = run.ptrs(bufs, &FarSums::default());
-        run.shift_pre(&sh.model, dir, &sh.scratch.t, None, p)?;
+        run.shift_pre(&sh.model, dir, None, &sh.scratch.t, None, p)?;
         run.shift_norm(sh, p, norm)
     }
 
@@ -1936,9 +2072,48 @@ impl<'a> Run<'a> {
         })
     }
 
-    /// `T` of the stack's frames into `t` from the inputs' [`Model::shift`], and the
-    /// addresses of the launch, `t` at `shift`.
-    fn shifted_probe(&self, t: &DeviceBuffer<C32>) -> Result<FusedPtrs, Error> {
+    /// Pass A into `bufs.work` with each frame's mode 0 its plane of `own`: no carried
+    /// waves, and f32 alone, the only build of the own source.
+    fn rows_fwd_own(
+        &self,
+        bufs: &FusedBufs,
+        own: &OwnModes<'_>,
+        p: FusedPtrs,
+    ) -> Result<(), Error> {
+        let cfg = self.walk(FusedCfg::default());
+        let config = self.sh.rows(&self.g, true)?;
+        let probe = FrameProbe::Own(self.inputs.probe, own);
+        let mut reads = vec![
+            self.inputs.obj.storage(),
+            self.inputs.views.addr().storage(),
+            self.stack.storage(),
+        ];
+        reads.extend(probe.storages());
+        let writes = [bufs.work.storage()];
+        let src = own.src(self.inputs.probe, self.stack, self.inputs.views.dims().n())?;
+        let (ctl, g) = (self.ctl(), self.g);
+        self.k.launch(self.ctx, &reads, &writes, |stream| {
+            let m = &self.k.module;
+            // SAFETY: as in `rows_fwd`; `OwnModes::src` checked `own` has a plane per frame of
+            // the stack.
+            unsafe {
+                match self.sh.nx {
+                    Side::N64 => m.fused_rows_fwd_own_64(stream, config, p, src, ctl, g, cfg),
+                    Side::N128 => m.fused_rows_fwd_own_128(stream, config, p, src, ctl, g, cfg),
+                    Side::N256 => m.fused_rows_fwd_own_256(stream, config, p, src, ctl, g, cfg),
+                    Side::N512 => m.fused_rows_fwd_own_512(stream, config, p, src, ctl, g, cfg),
+                }
+            }
+        })
+    }
+
+    /// `T` of the stack's frames into `t` from the inputs' [`Model::shift`], each frame's mode
+    /// 0 its plane of `own`, and the addresses of the launch, `t` at `shift`.
+    fn shifted_probe(
+        &self,
+        own: Option<&OwnModes<'_>>,
+        t: &DeviceBuffer<C32>,
+    ) -> Result<FusedPtrs, Error> {
         let Some(model) = self.inputs.model.shift else {
             return Err(Error::Shape(
                 "the shifted probe needs a Model::shift".into(),
@@ -1950,7 +2125,7 @@ impl<'a> Run<'a> {
             shift: dptr(t),
             ..self.input_ptrs()
         };
-        self.shift_pre(&model, &model.spectrum, t, None, p)?;
+        self.shift_pre(&model, &model.spectrum, own, t, None, p)?;
         Ok(p)
     }
 
@@ -2169,22 +2344,32 @@ impl<'a> Run<'a> {
     }
 
     /// `T` of the stack's frames into `t`, at `p.shift`, and with `t_dy` `T_y` into it, at
-    /// `p.shift_adj`, from `spectrum` at `model`'s offsets.
+    /// `p.shift_adj`, from `spectrum` at `model`'s offsets, each frame's mode 0 its spectrum
+    /// of `own`.
     fn shift_pre(
         &self,
         model: &Shift<'_>,
         spectrum: &ProbeSpectrum<'_>,
+        own: Option<&OwnModes<'_>>,
         t: &DeviceBuffer<C32>,
         t_dy: Option<&DeviceBuffer<C32>>,
         p: FusedPtrs,
     ) -> Result<(), Error> {
         let config = self.sh.shift_cols(self.g.nprobe, self.g.nf_max)?;
-        let p = FusedPtrs {
-            spectrum: spectrum.src(),
-            ..p
+        let a = spectrum.spectra();
+        let (src, spectra) = match own {
+            None => (
+                shared_probe(dptr::<C32, f32>(a).cast_const()),
+                vec![a.storage()],
+            ),
+            Some(own) => {
+                let (src, s) = own.spectrum_src(a, self.stack, self.inputs.views.dims())?;
+                (src, s.to_vec())
+            }
         };
+        let p = FusedPtrs { spectrum: src, ..p };
         let mut reads = vec![model.offsets.storage(), self.stack.storage()];
-        reads.extend(spectrum.storages());
+        reads.extend(spectra);
         let mut writes = vec![t.storage()];
         writes.extend(t_dy.map(|b| b.storage()));
         let flags = match t_dy {
@@ -2507,7 +2692,7 @@ impl<'a> Run<'a> {
         &self,
         sh: &Shifted<'_>,
         p: FusedPtrs,
-        sums: ShiftProbe<'_>,
+        sums: ShiftKind<'_>,
     ) -> Result<(), Error> {
         debug_assert!(self.walked_down(), "shift_probe_sums after an up walk");
         let config = grid_1d(self.g.nprobe as usize * self.inputs.views.dims().n())?;
@@ -2518,8 +2703,8 @@ impl<'a> Run<'a> {
             self.stack.storage(),
         ];
         let writes = match &sums {
-            ShiftProbe::Num(s) => vec![s.num.storage()],
-            ShiftProbe::Step(s) => s.storages().to_vec(),
+            ShiftKind::Num(s) => vec![s.num.storage()],
+            ShiftKind::Step(s) => s.storages().to_vec(),
         };
         let (ctl, g) = (self.ctl(), self.g);
         self.k.launch(self.ctx, &reads, &writes, |stream| {
@@ -2527,15 +2712,72 @@ impl<'a> Run<'a> {
             unsafe {
                 let m = &self.k.module;
                 match &sums {
-                    ShiftProbe::Step(s) => {
+                    ShiftKind::Step(s) => {
                         m.fused_shift_probe_sums(stream, config, p, s.ptrs(), ctl, g)
                     }
-                    ShiftProbe::Num(s) => {
+                    ShiftKind::Num(s) => {
                         m.fused_shift_probe_sums_num(stream, config, p, dptr(&s.num), ctl, g)
                     }
                 }
             }
         })
+    }
+
+    /// Each of the stack's frames in `span` takes its `G` of probe mode 0 back into
+    /// `planes`, [`FrameMoves::planes`].
+    fn shift_moves(
+        &self,
+        sh: &Shifted<'_>,
+        p: FusedPtrs,
+        span: BatchSpan,
+        planes: &mut DeviceBuffer<C32>,
+    ) -> Result<(), Error> {
+        let rows = self.sh.rows(&self.g, false)?;
+        let cols = self.sh.plane_cols(self.g.nf_max);
+        let (moved, ctl, g) = (dptr(planes), self.ctl(), self.g);
+        let reads = [sh.scratch.adj.storage(), self.stack.storage()];
+        let m = &self.k.module;
+        self.k
+            .launch(self.ctx, &reads, &[planes.storage()], |stream| {
+                // SAFETY: `shift_post` wrote `G` of this stack, `FrameMoves::span` checked
+                // `planes`; the launch is the one `shift_moved_cols` documents.
+                unsafe {
+                    match self.sh.ny {
+                        Side::N64 => {
+                            m.fused_shift_moved_cols_64(stream, cols, p, moved, span, ctl, g)
+                        }
+                        Side::N128 => {
+                            m.fused_shift_moved_cols_128(stream, cols, p, moved, span, ctl, g)
+                        }
+                        Side::N256 => {
+                            m.fused_shift_moved_cols_256(stream, cols, p, moved, span, ctl, g)
+                        }
+                        Side::N512 => {
+                            m.fused_shift_moved_cols_512(stream, cols, p, moved, span, ctl, g)
+                        }
+                    }
+                }
+            })?;
+        let reads = [self.stack.storage()];
+        self.k
+            .launch(self.ctx, &reads, &[planes.storage()], |stream| {
+                // SAFETY: as above, `shift_moved_cols` wrote the stack's planes; the launch is the
+                // one `shift_moved_rows` documents.
+                unsafe {
+                    match self.sh.nx {
+                        Side::N64 => m.fused_shift_moved_rows_64(stream, rows, moved, span, ctl, g),
+                        Side::N128 => {
+                            m.fused_shift_moved_rows_128(stream, rows, moved, span, ctl, g)
+                        }
+                        Side::N256 => {
+                            m.fused_shift_moved_rows_256(stream, rows, moved, span, ctl, g)
+                        }
+                        Side::N512 => {
+                            m.fused_shift_moved_rows_512(stream, rows, moved, span, ctl, g)
+                        }
+                    }
+                }
+            })
     }
 
     /// The object sums from the shift terms of [`Self::shift_rows_inv`].

@@ -14,12 +14,14 @@
 use std::ops::Range;
 use std::sync::Arc;
 
+use crate::base::{C64, Feature, Stack};
 use crate::gpu::sampling::{Modes, ObjectSampler, StackPoints, WindowBlock, window_views};
 use crate::gpu::{
-    BandCarry, BhScan, C32, EpochOrder, Error as GpuError, ExitPass, ExitStage, FrameWaves,
-    FusedInputs, Kernels, LSQML_REC, LsqmlAt, LsqmlChi, LsqmlKernels, LsqmlNoise, LsqmlScan,
-    LsqmlVar, Model, PositionRule, PositionStep, Positions, PsiSums, ShiftProbe, SliceSource,
-    SliceSteps, Solve, StackRef, StackTable, ViewDims, Views,
+    BandCarry, BhScan, C32, EpochOrder, Error as GpuError, ExitPass, ExitStage, FrameDirs,
+    FrameMoves, FrameProbe, FrameWaves, FusedInputs, Kernels, LSQML_REC, LsqmlAt, LsqmlChi,
+    LsqmlKernels, LsqmlNoise, LsqmlScan, LsqmlVar, Model, Opr, OprKernels, OprPlanes, OprShape,
+    OwnModes, OwnSpectrumBuf, PositionRule, PositionStep, Positions, PsiSums, ShiftProbe,
+    SliceSource, SliceSteps, Solve, StackRef, StackTable, ViewDims, Views,
 };
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaStream, DeviceBuffer};
@@ -34,7 +36,9 @@ use super::{
 };
 use crate::engine::features::{POSITION_LIMIT, POSITION_STEP};
 use crate::engine::ptycho::{Algorithm, llk_due};
-use crate::engine::{Cost, EngineError, LsqmlParams, LsqmlStep, Sampling, random_batches};
+use crate::engine::{
+    Cost, EngineError, LsqmlParams, LsqmlStep, ProbeVariation, Sampling, random_batches,
+};
 
 /// What an epoch does to the object preconditioner before its batches, on
 /// [`crate::engine::Lsqml::epoch`]'s schedule: the first epoch of a call builds it, epochs 1–9 and
@@ -57,15 +61,22 @@ impl Pre {
 }
 
 impl GpuPtycho {
-    /// [`crate::engine::Lsqml::epoch`] `nepoch` times from a fresh [`crate::engine::Lsqml`] with no probe
-    /// variation, refining the modelled position, over the same [`random_batches`]; one LLK
-    /// record after every due epoch.
+    /// [`crate::engine::Lsqml::epoch`] `nepoch` times from a fresh [`crate::engine::Lsqml`]
+    /// with the probe variation `var`, refining the modelled position, over the same
+    /// [`random_batches`]; one LLK record after every due epoch, of each frame's own probe as
+    /// [`crate::engine::Lsqml::llk`]'s. `var` comes back stepped with the object and probe;
+    /// [`ProbeVariation::none`] runs the shared probe alone. A variation of other probe planes
+    /// or of weight rows other than the frames is [`EngineError::Invalid`].
     pub fn lsqml(
         &mut self,
         params: &LsqmlParams,
+        var: &mut ProbeVariation,
         nepoch: usize,
         calc_llk: usize,
     ) -> Result<(), EngineError> {
+        let nframe = self.dev.checked()?.dims().nframe as usize;
+        let [_, ny, nx] = self.probe_dims;
+        let mut opr = OprValues::of(var, [ny, nx], nframe)?;
         let check = |dev: &Device| {
             params.validate()?;
             if dev.models_scale_or_background() {
@@ -76,7 +87,6 @@ impl GpuPtycho {
             Ok(())
         };
         self.call(false, check, |dev, cycle| {
-            let nframe = dev.dims().nframe as usize;
             let size = params.batch_size.min(nframe);
             for ic in 0..nepoch {
                 let order: Vec<u32> = random_batches(nframe, size, params.seed, ic as u64)
@@ -84,14 +94,21 @@ impl GpuPtycho {
                     .into_iter()
                     .map(|f| f as u32)
                     .collect();
-                dev.lsqml_epoch(*params, Pre::of(ic), *cycle, &order)?;
+                dev.lsqml_epoch(*params, Pre::of(ic), opr.as_ref(), *cycle, &order)?;
                 if llk_due(calc_llk, ic, nepoch) {
-                    dev.llk_pass(Some((*cycle, Algorithm::Lsqml)))?;
+                    dev.lsqml_llk(Some((*cycle, Algorithm::Lsqml)))?;
                 }
                 *cycle += 1;
             }
-            Ok(())
-        })
+            match opr.as_mut() {
+                Some(v) if nepoch > 0 => dev.lsqml_read_opr(v),
+                _ => Ok(()),
+            }
+        })?;
+        if let Some(v) = opr.filter(|_| nepoch > 0) {
+            *var = v.variation();
+        }
+        Ok(())
     }
 
     /// The steps of the last LSQML epoch, as [`crate::engine::Lsqml::epoch`] returns them, read back
@@ -125,6 +142,8 @@ pub(super) struct LsqmlState {
     scan: LsqmlScan,
     /// What the views read of the object.
     reading: Reading,
+    /// The probe variation's state, if the epochs run one.
+    opr: Option<OprBufs>,
     /// A multislice object's waves, if the device's has more than one slice.
     sliced: Option<SliceBufs>,
 }
@@ -246,11 +265,12 @@ impl Windows {
         sampler: &mut ObjectSampler,
         at: StackPoints<'_>,
         psi: &DeviceBuffer<C32>,
-        probe: &DeviceBuffer<C32>,
+        probe: FrameProbe<'_>,
         num: &mut DeviceBuffer<C32>,
     ) -> Result<(), GpuError> {
         crate::gpu::zero(ctx, &mut self.patches)?;
-        (self.kernels).psi_to_obj(ctx, &self.views, at.stack, psi, probe, &mut self.patches)?;
+        let (views, patches) = (&self.views, &mut self.patches);
+        (self.kernels).psi_to_obj_frames(ctx, views, at.stack, psi, probe, patches)?;
         sampler.place(ctx, at, &self.patches, 0, num)
     }
 
@@ -371,6 +391,7 @@ pub(super) struct LsqmlBufs<'a> {
     order: &'a EpochOrder,
     scan: &'a mut LsqmlScan,
     reading: &'a mut Reading,
+    pub(super) opr: Option<&'a mut OprBufs>,
     sliced: Option<&'a mut SliceBufs>,
 }
 
@@ -550,6 +571,7 @@ impl LsqmlState {
             order: EpochOrder::new(kernels, stream, views)?,
             scan: LsqmlScan::zeroed(stream, dims)?,
             reading,
+            opr: None,
             sliced,
             batches,
             stacks,
@@ -590,6 +612,62 @@ impl LsqmlState {
         self.order.set(ctx, kernels, views, order)
     }
 
+    /// Builds the probe variation's state for `shape` unless it is built, none without one;
+    /// an LLK stack holds up to `llk_frames` frames.
+    pub(super) fn fit_opr(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        kernels: &Kernels,
+        views: &Views,
+        shape: Option<OprShape>,
+        llk_frames: u32,
+    ) -> Result<(), GpuError> {
+        if self.opr.as_ref().map(|o| o.opr.shape()) != shape {
+            self.opr = None;
+            let shift = matches!(self.reading, Reading::Moved { .. });
+            self.opr = (shape
+                .map(|s| OprBufs::new(stream, kernels, views, s, self.size, llk_frames, shift)))
+            .transpose()?;
+        }
+        Ok(())
+    }
+
+    /// Uploads `v` into the probe variation's state, which is built for its shape.
+    pub(super) fn upload_opr(
+        &mut self,
+        stream: &CudaStream,
+        v: &OprValues,
+    ) -> Result<(), GpuError> {
+        let o = self
+            .opr
+            .as_mut()
+            .expect("Device::build_lsqml fitted the OPR state");
+        o.opr
+            .upload(stream, &v.eigenmodes, &v.weights, v.intensity.as_deref())
+    }
+
+    /// Reads the probe variation's state back into `v`, of its shape.
+    pub(super) fn read_opr(
+        &self,
+        stream: &CudaStream,
+        v: &mut OprValues,
+    ) -> Result<(), EngineError> {
+        let o = self
+            .opr
+            .as_ref()
+            .expect("Device::build_lsqml fitted the OPR state");
+        v.eigenmodes = o.opr.eigenmodes().to_host_vec(stream)?;
+        v.weights = o.opr.weights().values.to_host_vec(stream)?;
+        if let (Some(c), Some(dev)) = (v.intensity.as_mut(), o.opr.intensity()) {
+            *c = dev.values.to_host_vec(stream)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn has_opr(&self) -> bool {
+        self.opr.is_some()
+    }
+
     pub(super) fn lend(&mut self) -> LsqmlBufs<'_> {
         LsqmlBufs {
             kernels: &self.kernels,
@@ -602,6 +680,7 @@ impl LsqmlState {
             order: &self.order,
             scan: &mut self.scan,
             reading: &mut self.reading,
+            opr: self.opr.as_mut(),
             sliced: self.sliced.as_mut(),
         }
     }
@@ -636,6 +715,259 @@ impl LsqmlState {
                 }
             })
             .collect())
+    }
+}
+
+/// A [`ProbeVariation`] of eigenmodes as the device holds it: `f32`, its shape the key of
+/// the LSQML runs.
+pub(super) struct OprValues {
+    pub(super) shape: OprShape,
+    plane: [usize; 2],
+    eigenmodes: Vec<C32>,
+    weights: Vec<f32>,
+    intensity: Option<Vec<f32>>,
+}
+
+impl OprValues {
+    /// `var` for a probe of planes `plane` over `nframe` frames; none for a variation of no
+    /// eigenmodes, which runs the shared probe alone. [`EngineError::Invalid`] for planes of
+    /// another shape or weight rows other than the frames, which
+    /// [`crate::engine::Lsqml::epoch`] refuses too.
+    pub(super) fn of(
+        var: &ProbeVariation,
+        plane: [usize; 2],
+        nframe: usize,
+    ) -> Result<Option<Self>, EngineError> {
+        let modes = var.eigenmodes();
+        if modes.plane_shape() != plane {
+            return Err(EngineError::Invalid(format!(
+                "probe variation of {:?} planes on a probe of {plane:?}",
+                modes.plane_shape()
+            )));
+        }
+        let k = modes.len();
+        if k == 0 {
+            return Ok(None);
+        }
+        let w = var.weights();
+        if w.values.len() != nframe * k {
+            return Err(EngineError::Invalid(format!(
+                "{} OPR weights for {k} eigenmodes over {nframe} frames",
+                w.values.len()
+            )));
+        }
+        let f32s = |v: &[f64]| v.iter().map(|&x| x as f32).collect();
+        Ok(Some(Self {
+            shape: OprShape {
+                k: super::to_u32("eigenmodes", k)?,
+                refine_weights: w.refine,
+                intensity: var.intensity().map(|c| c.refine),
+            },
+            plane,
+            eigenmodes: super::to_c32(modes.as_slice()),
+            weights: f32s(&w.values),
+            intensity: var.intensity().map(|c| f32s(&c.values)),
+        }))
+    }
+
+    /// The variation these values hold.
+    pub(super) fn variation(self) -> ProbeVariation {
+        let [ny, nx] = self.plane;
+        let f64s = |v: Vec<f32>| v.into_iter().map(f64::from).collect();
+        let modes = self.eigenmodes.into_iter();
+        let modes = modes.map(|c| C64::new(c.re.into(), c.im.into())).collect();
+        let modes = Stack::from_vec([self.shape.k as usize, ny, nx], modes)
+            .expect("OprValues::of took k planes of the probe's");
+        let weights = Feature {
+            values: f64s(self.weights),
+            refine: self.shape.refine_weights,
+        };
+        let var = ProbeVariation::new(modes, weights);
+        match (self.intensity, self.shape.intensity) {
+            (Some(values), Some(refine)) => var.with_intensity(Feature {
+                values: f64s(values),
+                refine,
+            }),
+            _ => var,
+        }
+    }
+}
+
+/// LSQML's probe variation on the device, and the planes its batches and LLK stacks take.
+pub(super) struct OprBufs {
+    kernels: OprKernels,
+    opr: Opr,
+    /// The own mode-0 planes of a batch or of an LLK stack.
+    planes: DeviceBuffer<C32>,
+    /// Their spectra, which the moved probe reads.
+    spectra: Option<OwnSpectrumBuf>,
+    /// A batch's [`OprPlanes`].
+    d: DeviceBuffer<C32>,
+    vv: DeviceBuffer<f32>,
+    moved: DeviceBuffer<C32>,
+    /// The scan's order, which the LLK's stacks follow.
+    scan: EpochOrder,
+}
+
+impl OprBufs {
+    /// For batches of up to `size` frames and LLK stacks of up to `llk_frames`; with `shift`
+    /// the planes' spectra too.
+    fn new(
+        stream: &Arc<CudaStream>,
+        kernels: &Kernels,
+        views: &Views,
+        shape: OprShape,
+        size: u32,
+        llk_frames: u32,
+        shift: bool,
+    ) -> Result<Self, GpuError> {
+        let dims = views.dims();
+        let n = dims.n();
+        let nb = size.max(llk_frames);
+        let batch = size as usize * n;
+        Ok(Self {
+            kernels: OprKernels::load(kernels)?,
+            opr: Opr::zeroed(stream, n, dims.nframe, shape, size)?,
+            planes: DeviceBuffer::zeroed(stream, nb as usize * n)?,
+            spectra: shift
+                .then(|| OwnSpectrumBuf::zeroed(stream, dims, nb))
+                .transpose()?,
+            d: DeviceBuffer::zeroed(stream, batch)?,
+            vv: DeviceBuffer::zeroed(stream, batch)?,
+            moved: DeviceBuffer::zeroed(stream, batch)?,
+            scan: EpochOrder::new(kernels, stream, views)?,
+        })
+    }
+
+    /// The own modes of the frames at the epoch `positions` of `order`, each frame's
+    /// [`ProbeVariation::unique`] mode 0 of `probe`, with their spectra under `shift`.
+    fn modes<'o>(
+        planes: &'o mut DeviceBuffer<C32>,
+        spectra: &'o mut Option<OwnSpectrumBuf>,
+        (ctx, kernels, opr): (&ExecutionContext, (&Kernels, &OprKernels), &Opr),
+        (order, positions): (&EpochOrder, Range<u32>),
+        probe: &DeviceBuffer<C32>,
+        shift: bool,
+    ) -> Result<OwnModes<'o>, GpuError> {
+        let (k, ok) = kernels;
+        ok.unique(ctx, opr, order, positions.clone(), probe, planes)?;
+        let own = OwnModes::new(planes, positions);
+        match (spectra, shift) {
+            (_, false) => Ok(own),
+            (Some(buf), true) => Ok(k.own_spectrum(ctx, order.views().dims(), &own, buf)?),
+            (None, true) => Err(GpuError::Shape(
+                "OPR state built without the moved probe's spectra".into(),
+            )),
+        }
+    }
+
+    /// The batch at the epoch `positions` of `order` from `probe`, the shared probe it starts
+    /// from; `shift` when its probe moves.
+    fn batch(
+        &mut self,
+        ctx: &ExecutionContext,
+        kernels: &Kernels,
+        order: &EpochOrder,
+        positions: Range<u32>,
+        probe: &DeviceBuffer<C32>,
+        shift: bool,
+    ) -> Result<BatchOpr<'_>, GpuError> {
+        let Self {
+            kernels: ok,
+            opr,
+            planes,
+            spectra,
+            d,
+            vv,
+            moved,
+            ..
+        } = self;
+        let at = (ctx, (kernels, &*ok), &*opr);
+        let own = Self::modes(planes, spectra, at, (order, positions), probe, shift)?;
+        Ok(BatchOpr {
+            own,
+            kernels: ok,
+            opr,
+            d,
+            vv,
+            moved,
+        })
+    }
+
+    /// The own modes of the LLK stack `stack` of the scan, as [`Self::batch`]'s.
+    pub(super) fn scan_modes(
+        &mut self,
+        ctx: &ExecutionContext,
+        kernels: &Kernels,
+        stack: StackRef<'_>,
+        probe: &DeviceBuffer<C32>,
+        shift: bool,
+    ) -> Result<OwnModes<'_>, GpuError> {
+        let frames = stack.frames().ok_or_else(|| {
+            GpuError::Shape("the LLK's own probe modes need a StackTable entry".into())
+        })?;
+        let Self {
+            kernels: ok,
+            opr,
+            planes,
+            spectra,
+            scan,
+            ..
+        } = self;
+        let at = (ctx, (kernels, &*ok), &*opr);
+        Self::modes(planes, spectra, at, (&*scan, frames), probe, shift)
+    }
+}
+
+/// A batch's probe variation: its frames' own probe modes, then its step from their
+/// directions.
+struct BatchOpr<'o> {
+    own: OwnModes<'o>,
+    kernels: &'o OprKernels,
+    opr: &'o mut Opr,
+    d: &'o mut DeviceBuffer<C32>,
+    vv: &'o mut DeviceBuffer<f32>,
+    moved: &'o mut DeviceBuffer<C32>,
+}
+
+impl BatchOpr<'_> {
+    /// Where [`LsqmlKernels::frame_dirs`] writes the frames at the epoch `positions`.
+    fn dirs(&mut self, positions: Range<u32>) -> FrameDirs<'_> {
+        FrameDirs {
+            d: self.d,
+            vv: self.vv,
+            positions,
+        }
+    }
+
+    /// The step of the variation at the epoch `positions`, from the shared `probe` the batch
+    /// started from. A probe that does not move takes its directions back unmoved, as
+    /// [`crate::engine::LsqmlBatch::adjoint_move`] does; a moved one has had them taken back
+    /// into `moved` by [`ShiftProbe::Frames`].
+    fn step(
+        self,
+        ctx: &ExecutionContext,
+        (order, positions): (&EpochOrder, Range<u32>),
+        probe: &DeviceBuffer<C32>,
+        moved: bool,
+    ) -> Result<(), GpuError> {
+        if !moved {
+            crate::gpu::copy(ctx, self.d, self.moved)?;
+        }
+        let planes = OprPlanes {
+            d: self.d,
+            vv: self.vv,
+            moved: self.moved,
+        };
+        (self.kernels).step(ctx, self.opr, order, positions, probe, planes)
+    }
+}
+
+/// `probe` as the frames read it: with `opr`, each frame's own mode 0.
+fn frame_probe<'p>(probe: &'p DeviceBuffer<C32>, opr: Option<&'p BatchOpr<'_>>) -> FrameProbe<'p> {
+    match opr {
+        None => FrameProbe::Shared(probe),
+        Some(o) => FrameProbe::Own(probe, &o.own),
     }
 }
 
@@ -740,6 +1072,19 @@ impl<'a> Bufs<'a> {
         let moved = MovedLent::lend(moved.map(|m| (m, ())), passes.fused(), &mut self.features)?;
         let mut moved =
             (moved.map(|m| m.batch(ctx, self.kernels, views.dims(), self.probe))).transpose()?;
+        let shift = moved.is_some();
+        let mut opr = (l.opr.as_deref_mut())
+            .map(|o| {
+                o.batch(
+                    ctx,
+                    self.kernels,
+                    l.order,
+                    positions.clone(),
+                    self.probe,
+                    shift,
+                )
+            })
+            .transpose()?;
         let base = FusedInputs {
             views,
             counts: self.counts,
@@ -761,15 +1106,19 @@ impl<'a> Bufs<'a> {
         for (k, s) in batch.clone().enumerate() {
             let (stack, work) = (l.table.at(s), &mut l.work[k]);
             match &mut moved {
-                None => l
-                    .kernels
-                    .forward(ctx, views, stack, self.obj, self.probe, work)?,
+                None => {
+                    let probe = frame_probe(self.probe, opr.as_ref());
+                    (l.kernels).forward_frames(ctx, views, stack, self.obj, probe, work)?
+                }
                 Some(m) => {
                     let inputs = moved_inputs(&base, moved_shift(m.pos, m.spectrum));
                     let w = &mut m.w[k];
                     // Its row pass is the stack's forward pass: `exit` goes on from `work`.
-                    self.kernels
-                        .shifted_rows_fwd(ctx, &inputs, stack, w, work)?;
+                    match &opr {
+                        None => (self.kernels).shifted_rows_fwd(ctx, &inputs, stack, w, work)?,
+                        Some(o) => (self.kernels)
+                            .shifted_rows_fwd_own(ctx, &inputs, &o.own, stack, w, work)?,
+                    }
                     m.kernels.shift_w(ctx, views.dims(), stack, w)?;
                 }
             }
@@ -804,12 +1153,12 @@ impl<'a> Bufs<'a> {
             None => {
                 for (k, s) in batch.clone().enumerate() {
                     let stack = l.table.at(s);
-                    self.kernels.psi_to_obj(
+                    self.kernels.psi_to_obj_frames(
                         ctx,
                         views,
                         stack,
                         &l.work[k],
-                        self.probe,
+                        frame_probe(self.probe, opr.as_ref()),
                         &mut self.obj_sums.num,
                     )?;
                     self.kernels.psi_to_probe(
@@ -825,13 +1174,34 @@ impl<'a> Bufs<'a> {
             Some(m) => {
                 for (k, s) in batch.clone().enumerate() {
                     let inputs = moved_inputs(&base, moved_shift(m.pos, m.spectrum));
-                    let sums = PsiSums {
-                        obj: Some(&mut self.obj_sums.num),
-                        probe: Some(ShiftProbe::Num(&mut *m.probe_sums)),
-                    };
-                    let stack = l.table.at(s);
-                    self.kernels
-                        .shifted_psi_sums(ctx, &inputs, stack, &l.work[k], m.fused, sums)?;
+                    let (stack, psi) = (l.table.at(s), &l.work[k]);
+                    match &mut opr {
+                        None => {
+                            let probe = Some(ShiftProbe::Num(&mut *m.probe_sums));
+                            let sums = PsiSums {
+                                obj: Some(&mut self.obj_sums.num),
+                                probe,
+                            };
+                            (self.kernels)
+                                .shifted_psi_sums(ctx, &inputs, stack, psi, m.fused, sums)?
+                        }
+                        Some(o) => {
+                            let probe = Some(ShiftProbe::Frames {
+                                sums: &mut *m.probe_sums,
+                                moved: FrameMoves {
+                                    planes: &mut *o.moved,
+                                    positions: positions.clone(),
+                                },
+                            });
+                            let sums = PsiSums {
+                                obj: Some(&mut self.obj_sums.num),
+                                probe,
+                            };
+                            let at = (&o.own, stack);
+                            (self.kernels)
+                                .shifted_psi_sums_own(ctx, &inputs, at, psi, m.fused, sums)?
+                        }
+                    }
                 }
                 self.kernels.shifted_probe_sums(
                     ctx,
@@ -851,9 +1221,13 @@ impl<'a> Bufs<'a> {
                 x: [&*self.obj, &*self.probe],
                 d: [&self.obj_sums.num, &self.probe_sums.num],
             };
-            let c = match &moved {
-                None => LsqmlChi::Unmoved(chi),
-                Some(m) => LsqmlChi::Moved {
+            let c = match (&moved, &opr) {
+                (None, None) => LsqmlChi::Unmoved(chi),
+                (None, Some(o)) => LsqmlChi::Own {
+                    chi,
+                    own: o.own.clone(),
+                },
+                (Some(m), _) => LsqmlChi::Moved {
                     chi,
                     w: FrameWaves::Probes(&m.w[k]),
                 },
@@ -864,6 +1238,11 @@ impl<'a> Bufs<'a> {
                 let at = (chi, FrameWaves::Probes(&m.w[k]));
                 m.kernels.sums(ctx, views, stack, self.obj, at, step)?;
             }
+            if let Some(o) = &mut opr {
+                let dirs = o.dirs(positions.clone());
+                l.kernels
+                    .frame_dirs(ctx, views, stack, self.obj, chi, dirs)?;
+            }
         }
         l.kernels
             .step(ctx, positions.clone(), l.scan, self.exit.scale)?;
@@ -872,7 +1251,10 @@ impl<'a> Bufs<'a> {
             let solve = position_solve(self.exit.scale);
             let offsets = m.offsets;
             m.kernels
-                .step(ctx, positions, l.order, offsets, solve, step)?;
+                .step(ctx, positions.clone(), l.order, offsets, solve, step)?;
+        }
+        if let Some(o) = opr {
+            o.step(ctx, (l.order, positions), self.probe, shift)?;
         }
         let obj = LsqmlVar {
             x: &mut *self.obj,
@@ -911,6 +1293,18 @@ impl<'a> Bufs<'a> {
             return Err(another_reading());
         };
         let (lk, exit) = (l.kernels, self.exit);
+        let mut opr = (l.opr.as_deref_mut())
+            .map(|o| {
+                o.batch(
+                    ctx,
+                    self.kernels,
+                    l.order,
+                    positions.clone(),
+                    self.probe,
+                    false,
+                )
+            })
+            .transpose()?;
         let at = batch.clone().map(|s| points(views, table.at(s), &*p.pos));
         w.sample(ctx, (p.sampler, p.spectra), at, self.obj, 0)?;
         let wv = &w.views;
@@ -924,7 +1318,8 @@ impl<'a> Bufs<'a> {
         };
         for (k, s) in batch.clone().enumerate() {
             let (stack, work) = (table.at(s), &mut l.work[k]);
-            lk.forward(ctx, wv, stack, &w.win[k][0], self.probe, work)?;
+            let probe = frame_probe(self.probe, opr.as_ref());
+            lk.forward_frames(ctx, wv, stack, &w.win[k][0], probe, work)?;
             exit_stage(ctx, exit, d, stack, work, l.band.get_mut(k), false)?;
             match noise {
                 LsqmlNoise::Gaussian => chi(l.scan, stack, work, l.band.get_mut(k))?,
@@ -944,6 +1339,7 @@ impl<'a> Bufs<'a> {
         }
         for (k, s) in batch.clone().enumerate() {
             let (stack, work) = (table.at(s), &l.work[k]);
+            let probe = frame_probe(self.probe, opr.as_ref());
             (self.kernels).psi_to_probe(
                 ctx,
                 &w.views,
@@ -958,11 +1354,11 @@ impl<'a> Bufs<'a> {
                     let at = points(views, stack, p.pos);
                     w.derivatives(ctx, (p.sampler, p.spectra), at, out)
                 };
-                let at = (work, SliceSource::Probe(self.probe));
+                let at = (work, SliceSource::from(probe));
                 (p.kernels).derivative_sums(ctx, views, stack, derivatives, at, step)?;
             }
             let at = points(views, stack, p.pos);
-            w.place(ctx, p.sampler, at, work, self.probe, &mut self.obj_sums.num)?;
+            w.place(ctx, p.sampler, at, work, probe, &mut self.obj_sums.num)?;
         }
         lk.dir_obj(ctx, l.scan, &mut self.obj_sums.num)?;
         let nb = positions.len() as f32;
@@ -976,14 +1372,28 @@ impl<'a> Bufs<'a> {
                 x: [&w.win[k][0], &*self.probe],
                 d: [&w.dir, &self.probe_sums.num],
             };
-            let chi = LsqmlChi::Unmoved(&l.work[k]);
-            lk.dots(ctx, &w.views, stack, at, chi, l.scan)?;
+            let chi = &l.work[k];
+            let c = match &opr {
+                None => LsqmlChi::Unmoved(chi),
+                Some(o) => LsqmlChi::Own {
+                    chi,
+                    own: o.own.clone(),
+                },
+            };
+            lk.dots(ctx, &w.views, stack, at, c, l.scan)?;
+            if let Some(o) = &mut opr {
+                let dirs = o.dirs(positions.clone());
+                lk.frame_dirs(ctx, &w.views, stack, &w.win[k][0], chi, dirs)?;
+            }
         }
         lk.step(ctx, positions.clone(), l.scan, self.exit.scale)?;
         if let Some(step) = step {
             let solve = position_solve(self.exit.scale);
             let offsets = p.offsets;
-            (p.kernels).step(ctx, positions, l.order, offsets, solve, step)?;
+            (p.kernels).step(ctx, positions.clone(), l.order, offsets, solve, step)?;
+        }
+        if let Some(o) = opr {
+            o.step(ctx, (l.order, positions), self.probe, false)?;
         }
         let obj = LsqmlVar {
             x: &mut *self.obj,
@@ -1019,6 +1429,19 @@ impl<'a> Bufs<'a> {
         let (moved, _, mut step) = l.reading.split(&self.features)?;
         let moved = MovedLent::lend(moved.map(|m| (m, ())), passes.fused(), &mut self.features)?;
         let mut moved = (moved.map(|m| m.batch(ctx, self.kernels, d, self.probe))).transpose()?;
+        let shift = moved.is_some();
+        let mut opr = (l.opr.as_deref_mut())
+            .map(|o| {
+                o.batch(
+                    ctx,
+                    self.kernels,
+                    l.order,
+                    positions.clone(),
+                    self.probe,
+                    shift,
+                )
+            })
+            .transpose()?;
         let base = FusedInputs {
             views,
             counts: self.counts,
@@ -1040,14 +1463,19 @@ impl<'a> Bufs<'a> {
             let (stack, work, inc) = (l.table.at(s), &mut l.work[k], &mut w.incident[k]);
             let offsets = match &mut moved {
                 None => {
-                    let probe = SliceSource::Probe(self.probe);
+                    let probe = SliceSource::from(frame_probe(self.probe, opr.as_ref()));
                     ok.slice_mul(ctx, views, stack, self.obj, probe, &mut inc[0])?;
                     None
                 }
                 Some(m) => {
                     let inputs = moved_inputs(&base, moved_shift(m.pos, m.spectrum));
                     let pw = &mut m.w[k];
-                    self.kernels.shifted_probe(ctx, &inputs, stack, pw)?;
+                    match &opr {
+                        None => self.kernels.shifted_probe(ctx, &inputs, stack, pw)?,
+                        Some(o) => {
+                            (self.kernels).shifted_probe_own(ctx, &inputs, &o.own, stack, pw)?
+                        }
+                    }
                     m.kernels.shift_w(ctx, d, stack, pw)?;
                     let probe = SliceSource::Waves(FrameWaves::Probes(pw));
                     ok.slice_mul(ctx, views, stack, self.obj, probe, &mut inc[0])?;
@@ -1149,12 +1577,12 @@ impl<'a> Bufs<'a> {
             None => {
                 for (k, s) in batch.clone().enumerate() {
                     let (stack, chi) = (l.table.at(s), &w.chi[k][0]);
-                    self.kernels.psi_to_obj(
+                    self.kernels.psi_to_obj_frames(
                         ctx,
                         views,
                         stack,
                         chi,
-                        self.probe,
+                        frame_probe(self.probe, opr.as_ref()),
                         &mut self.obj_sums.num,
                     )?;
                     self.kernels.psi_to_probe(
@@ -1170,13 +1598,34 @@ impl<'a> Bufs<'a> {
             Some(m) => {
                 for (k, s) in batch.clone().enumerate() {
                     let inputs = moved_inputs(&base, moved_shift(m.pos, m.spectrum));
-                    let sums = PsiSums {
-                        obj: Some(&mut self.obj_sums.num),
-                        probe: Some(ShiftProbe::Num(&mut *m.probe_sums)),
-                    };
                     let (stack, chi) = (l.table.at(s), &w.chi[k][0]);
-                    self.kernels
-                        .shifted_psi_sums(ctx, &inputs, stack, chi, m.fused, sums)?;
+                    match &mut opr {
+                        None => {
+                            let probe = Some(ShiftProbe::Num(&mut *m.probe_sums));
+                            let sums = PsiSums {
+                                obj: Some(&mut self.obj_sums.num),
+                                probe,
+                            };
+                            (self.kernels)
+                                .shifted_psi_sums(ctx, &inputs, stack, chi, m.fused, sums)?
+                        }
+                        Some(o) => {
+                            let probe = Some(ShiftProbe::Frames {
+                                sums: &mut *m.probe_sums,
+                                moved: FrameMoves {
+                                    planes: &mut *o.moved,
+                                    positions: positions.clone(),
+                                },
+                            });
+                            let sums = PsiSums {
+                                obj: Some(&mut self.obj_sums.num),
+                                probe,
+                            };
+                            let at = (&o.own, stack);
+                            (self.kernels)
+                                .shifted_psi_sums_own(ctx, &inputs, at, chi, m.fused, sums)?
+                        }
+                    }
                 }
                 self.kernels
                     .shifted_probe_sums(ctx, d, m.probe_sums, &mut self.probe_sums.num)?;
@@ -1191,15 +1640,23 @@ impl<'a> Bufs<'a> {
                 x: [&*self.obj, &*self.probe],
                 d: [&self.obj_sums.num, &self.probe_sums.num],
             };
-            let chi = &w.chi[k][0];
-            let c = match &moved {
-                None => LsqmlChi::Unmoved(chi),
-                Some(m) => LsqmlChi::Moved {
+            let (stack, chi) = (l.table.at(s), &w.chi[k][0]);
+            let c = match (&moved, &opr) {
+                (None, None) => LsqmlChi::Unmoved(chi),
+                (None, Some(o)) => LsqmlChi::Own {
+                    chi,
+                    own: o.own.clone(),
+                },
+                (Some(m), _) => LsqmlChi::Moved {
                     chi,
                     w: FrameWaves::Probes(&m.w[k]),
                 },
             };
-            lk.dots(ctx, views, l.table.at(s), at, c, l.scan)?;
+            lk.dots(ctx, views, stack, at, c, l.scan)?;
+            if let Some(o) = &mut opr {
+                let dirs = o.dirs(positions.clone());
+                lk.frame_dirs(ctx, views, stack, self.obj, chi, dirs)?;
+            }
         }
         lk.step(ctx, positions.clone(), l.scan, self.exit.scale)?;
         lk.share(ctx, positions.clone(), l.scan, share)?;
@@ -1207,7 +1664,10 @@ impl<'a> Bufs<'a> {
             let solve = position_solve(self.exit.scale);
             let offsets = m.offsets;
             m.kernels
-                .step(ctx, positions, l.order, offsets, solve, step)?;
+                .step(ctx, positions.clone(), l.order, offsets, solve, step)?;
+        }
+        if let Some(o) = opr {
+            o.step(ctx, (l.order, positions), self.probe, shift)?;
         }
         let obj = LsqmlVar {
             x: &mut *self.obj,
@@ -1250,6 +1710,18 @@ impl<'a> Bufs<'a> {
                 "LSQML state built for another slice count".into(),
             ));
         };
+        let mut opr = (l.opr.as_deref_mut())
+            .map(|o| {
+                o.batch(
+                    ctx,
+                    self.kernels,
+                    l.order,
+                    positions.clone(),
+                    self.probe,
+                    false,
+                )
+            })
+            .transpose()?;
         let last = self.deeper.len();
         let share = (last + 1) as f32;
         let quad = sl.quad;
@@ -1266,7 +1738,7 @@ impl<'a> Bufs<'a> {
         for (k, s) in batch.clone().enumerate() {
             let (stack, work, inc, wk) =
                 (table.at(s), &mut l.work[k], &mut sw.incident[k], &w.win[k]);
-            let probe = SliceSource::Probe(self.probe);
+            let probe = SliceSource::from(frame_probe(self.probe, opr.as_ref()));
             ok.slice_mul(ctx, &w.views, stack, &wk[0], probe, &mut inc[0])?;
             for i in 1..=last {
                 ok.gap(ctx, d, stack, &sl.gaps[i - 1], &mut inc[i - 1], false)?;
@@ -1333,7 +1805,7 @@ impl<'a> Bufs<'a> {
                     p.sampler,
                     at,
                     &sw.pair,
-                    sl.ones,
+                    FrameProbe::Shared(sl.ones),
                     &mut self.obj_sums.num,
                 )?;
             }
@@ -1378,7 +1850,8 @@ impl<'a> Bufs<'a> {
                 &mut self.probe_sums.num,
             )?;
             let at = points(views, stack, p.pos);
-            w.place(ctx, p.sampler, at, chi, self.probe, &mut self.obj_sums.num)?;
+            let probe = frame_probe(self.probe, opr.as_ref());
+            w.place(ctx, p.sampler, at, chi, probe, &mut self.obj_sums.num)?;
         }
         lk.dir_obj(ctx, l.scan, &mut self.obj_sums.num)?;
         let nb = positions.len() as f32;
@@ -1392,15 +1865,29 @@ impl<'a> Bufs<'a> {
                 x: [&w.win[k][0], &*self.probe],
                 d: [&w.dir, &self.probe_sums.num],
             };
-            let chi = LsqmlChi::Unmoved(&sw.chi[k][0]);
-            lk.dots(ctx, &w.views, stack, at, chi, l.scan)?;
+            let chi = &sw.chi[k][0];
+            let c = match &opr {
+                None => LsqmlChi::Unmoved(chi),
+                Some(o) => LsqmlChi::Own {
+                    chi,
+                    own: o.own.clone(),
+                },
+            };
+            lk.dots(ctx, &w.views, stack, at, c, l.scan)?;
+            if let Some(o) = &mut opr {
+                let dirs = o.dirs(positions.clone());
+                lk.frame_dirs(ctx, &w.views, stack, &w.win[k][0], chi, dirs)?;
+            }
         }
         lk.step(ctx, positions.clone(), l.scan, self.exit.scale)?;
         lk.share(ctx, positions.clone(), l.scan, share)?;
         if let Some(step) = step {
             let solve = position_solve(self.exit.scale);
             let offsets = p.offsets;
-            (p.kernels).step(ctx, positions, l.order, offsets, solve, step)?;
+            (p.kernels).step(ctx, positions.clone(), l.order, offsets, solve, step)?;
+        }
+        if let Some(o) = opr {
+            o.step(ctx, (l.order, positions), self.probe, false)?;
         }
         let obj = LsqmlVar {
             x: &mut *self.obj,

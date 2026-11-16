@@ -12,8 +12,8 @@ use ptyrs::base::{C64, Counts, MASKED, Object, Probe, Scan, Stack};
 use ptyrs::engine::{
     Algorithm, ApParams, Backend, Bh, BhParams, BhStep, Cost, DmParams, EngineError, Feature,
     Features, GpuOptions, GpuPtycho, Llk, LlkRecord, Lsqml, LsqmlParams, MlParams, Observed,
-    Optics, Params, Ptycho, RaarParams, RpieParams, Sampling, Step, llk, obj_probe_shift_to_psi,
-    shift,
+    Optics, Params, ProbeVariation, Ptycho, RaarParams, RpieParams, Sampling, Step, llk,
+    obj_probe_shift_to_psi, shift,
 };
 use ptyrs::gpu::{
     C32, FUSED_SIDES, Kernels, LlkPartial, LlkRing, LlkScratch, StackTable, ViewDims,
@@ -1767,6 +1767,7 @@ fn position_is_bit_identical_across_stack_splits() {
 #[test]
 fn position_refine_switch_gives_a_fresh_runs_bits() {
     let (scan, object, probe) = featured_start(2, false, false);
+    let none = ProbeVariation::none(probe.plane_shape());
     let position = |refine| Features {
         position: Some(Feature {
             values: drawn_offsets(),
@@ -1791,7 +1792,7 @@ fn position_refine_switch_gives_a_fresh_runs_bits() {
         dm.gpu(g, 2);
         ml.gpu(g, 2);
         g.bh(&bh, 2, 1).unwrap();
-        g.lsqml(&lsqml, 2, 1).unwrap();
+        g.lsqml(&lsqml, &mut none.clone(), 2, 1).unwrap();
     };
     let switches = [
         ("held to refined", &held, &refined),
@@ -1871,6 +1872,7 @@ fn ml_is_bit_identical_across_stack_splits() {
 #[test]
 fn default_stacks_give_the_bits_of_explicit_stacks() {
     let (scan, object, probe) = start(256, 2, false);
+    let none = ProbeVariation::none(probe.plane_shape());
     let position = Some(Feature::refined(drawn_offsets()));
     let scaled = Features {
         scale: Some(Feature::refined(vec![1.0; NPOS])),
@@ -1913,7 +1915,7 @@ fn default_stacks_give_the_bits_of_explicit_stacks() {
         Cycles::Raar(raar).gpu(&mut cycles, 4);
         let mut epochs = new(stack_size, &moved);
         epochs.bh(&bh, 3, 1).unwrap();
-        epochs.lsqml(&lsqml, 3, 1).unwrap();
+        epochs.lsqml(&lsqml, &mut none.clone(), 3, 1).unwrap();
         [bit_state(&mut cycles), bit_state(&mut epochs)]
     };
     let (eight, default) = (run(Some(8)), run(None));
@@ -2009,9 +2011,10 @@ fn empty_batches_are_refused_on_both_backends() {
     let mut cpu = Ptycho::new(&scan, object.clone(), probe.clone()).unwrap();
     assert!(invalid(cpu.rpie(&rpie, 1)));
     assert_eq!(cpu.cycle(), 0);
+    let mut none = ProbeVariation::none(probe.plane_shape());
     let mut gpu = GpuPtycho::new(&ctx(), &scan, object, probe, FUSED.options).unwrap();
     assert!(invalid(gpu.bh(&bh, 1, 1)));
-    assert!(invalid(gpu.lsqml(&lsqml, 1, 1)));
+    assert!(invalid(gpu.lsqml(&lsqml, &mut none, 1, 1)));
     assert!(invalid(gpu.rpie(&rpie, 1)));
     assert_eq!(gpu.cycle(), 0);
 }

@@ -31,6 +31,7 @@ use crate::pixel::{
     psi_f32, psi_index, quad_phase, ramp, sample_obj, stack_frames, store_c, store_psi, zdiv,
     zsqrt,
 };
+use crate::position::BatchSpan;
 use crate::{FFT_EPT_MAX, fft_ept};
 
 /// [`rows_fwd`] builds the DM reflection `R = (2 - alpha) PO - (1 - alpha) psi` instead of
@@ -219,17 +220,16 @@ pub struct FusedPtrs {
     pub shift_den: *mut PositionPartial,
 }
 
-/// A probe `[nprobe, ny, nx]` whose mode 0 is each frame's own: plane `b` of `mode0` `[nb,
-/// ny, nx]` at epoch position `p0 + b`; [`shared_probe`] is the probe every frame shares. A
-/// position outside the run reads its last plane, since a device-side [`StackCtl`] may
-/// place a stack anywhere in the scan.
+/// A probe `[nprobe, ny, nx]` whose mode 0 is each frame's own: with `step` 1, plane `b` of
+/// `mode0` `[nb, ny, nx]` at epoch position `p0 + b`; [`shared_probe`] is the probe every
+/// frame shares, `step` 0.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct ProbeSrc {
     pub probe: *const f32,
     pub mode0: *const f32,
     pub p0: u32,
-    pub nb: u32,
+    pub step: u32,
 }
 
 /// `probe` shared by every frame, as [`ProbeSrc`].
@@ -239,7 +239,7 @@ pub fn shared_probe(probe: *const f32) -> ProbeSrc {
         probe,
         mode0: probe,
         p0: 0,
-        nb: 1,
+        step: 0,
     }
 }
 
@@ -247,12 +247,12 @@ pub fn shared_probe(probe: *const f32) -> ProbeSrc {
 ///
 /// # Safety
 ///
-/// `src` as [`ProbeSrc`] says, `nb ≥ 1`, `m < nprobe`.
+/// `src` as [`ProbeSrc`] says, `m < nprobe`, and with `step` 1 `pos` in `p0 .. p0 + nb`.
 #[device]
 pub unsafe fn probe_plane(src: ProbeSrc, m: u32, pos: u32, n: usize) -> *const f32 {
     unsafe {
         if m == 0 {
-            let b = pos.wrapping_sub(src.p0).min(src.nb - 1);
+            let b = (pos - src.p0) * src.step;
             src.mode0.add(2 * b as usize * n)
         } else {
             src.probe.add(2 * m as usize * n)
@@ -1779,6 +1779,123 @@ pub unsafe fn shift_probe_rows<const NX: u32, const DEN: bool>(
                 *out.den.add(nat) += *sums.den.add(nat);
                 *sums.den.add(nat) = 0.0;
             }
+        }
+    }
+}
+
+/// The batch frame of stack slot `fl`, `f0 + fl - span.p0`, if in the span.
+#[device]
+fn span_frame(span: BatchSpan, f0: u32, fl: u32) -> Option<u32> {
+    let b = (f0 + fl).wrapping_sub(span.p0);
+    (b < span.nb).then_some(b)
+}
+
+/// The column half of each frame's own [`shift_probe_sums`] addend of probe mode 0 taken back
+/// alone, for OPR: `moved[b, y, kx] = IDFT_y(G[fl * nprobe])[ys, kx]` at natural row `y =
+/// (ys + ny / 2) % ny`, for frame `fl = blockIdx.y` of the stack and batch frame `b = f0 + fl
+/// - span.p0`; a frame outside the span writes nothing. Reads `shift_adj`; writes `moved`.
+/// Block and shared memory as [`shift_cols`]; grid `(nx / FUSED_COLS, nf_max)`.
+///
+/// # Safety
+///
+/// `NY` is the frame's `ny`; `shift_adj` holds [`shift_post`]'s `G` of this stack, `moved`
+/// `[span.nb, ny, nx]`; `ctl` one entry; launch as above.
+#[device]
+pub unsafe fn shift_moved_cols<const NY: u32>(
+    p: FusedPtrs,
+    moved: *mut f32,
+    span: BatchSpan,
+    ctl: *const StackCtl,
+    g: StackGeom,
+) {
+    let (f0, nf) = unsafe { stack_frames(ctl, g) };
+    let Some(fl) = walk_slot(0, nf) else {
+        return;
+    };
+    let Some(b) = span_frame(span, f0, fl) else {
+        return;
+    };
+    let (ny, nx) = (NY, g.nx);
+    let n = ny as usize * nx as usize;
+    let ept = const { fft_ept(NY) };
+    let tpf = ny / ept;
+    let tid = thread::threadIdx_x();
+    let (c, f) = (tid % FUSED_COLS, tid / FUSED_COLS);
+    let kx = thread::blockIdx_x() * FUSED_COLS + c;
+    let (src, dst) = ((fl * g.nprobe) as usize * n, b as usize * n);
+    let mut r = [0.0f32; 2 * FFT_EPT_MAX as usize];
+    unsafe {
+        let smem = DynamicSharedArray::<u8, 16>::get();
+        #[unroll]
+        for i in 0..ept {
+            let v = load_c(p.shift_adj, src + ((f + i * tpf) * nx + kx) as usize);
+            r[2 * i as usize] = v.0;
+            r[2 * i as usize + 1] = v.1;
+        }
+        col_fft::<NY, true>(&mut r, smem, c, f, FUSED_COLS);
+        #[unroll]
+        for i in 0..ept {
+            let k = 2 * i as usize;
+            let y = (f + i * tpf + ny / 2) % ny;
+            store_c(moved, dst + (y * nx + kx) as usize, (r[k], r[k + 1]));
+        }
+    }
+}
+
+/// The row half of [`shift_moved_cols`], in place: row `y` of batch frame `b` (as there)
+/// becomes `conj(q) IDFT_x(row) / n` in the natural layout, [`shift_probe_rows`]' update of
+/// that one addend. Grid `(ny / rows, nf_max)`, block and shared memory as [`rows_fwd`].
+///
+/// # Safety
+///
+/// `NX` is the frame's `nx`; `moved` holds `[span.nb, ny, nx]`, its stack's rows as
+/// [`shift_moved_cols`] left them; `ctl` one entry; launch as above.
+#[device]
+pub unsafe fn shift_moved_rows<const NX: u32>(
+    moved: *mut f32,
+    span: BatchSpan,
+    ctl: *const StackCtl,
+    g: StackGeom,
+) {
+    let (f0, nf) = unsafe { stack_frames(ctl, g) };
+    let Some(fl) = walk_slot(0, nf) else {
+        return;
+    };
+    let Some(b) = span_frame(span, f0, fl) else {
+        return;
+    };
+    let nx = NX;
+    let n = g.ny as usize * nx as usize;
+    let lane = row_lane::<NX>();
+    let y = lane.ys;
+    let plane = b as usize * n;
+    let t = lane.f;
+    let ept = const { fft_ept(NX) };
+    let tpf = nx / ept;
+    let inv_n = 1.0 / n as f32;
+    let mut r = [0.0f32; 2 * FFT_EPT_MAX as usize];
+    unsafe {
+        #[unroll]
+        for i in 0..ept {
+            let x = t + i * tpf;
+            let v = load_c(moved, plane + (y * nx + x) as usize);
+            // Times `(-1)^x`, the transform lands each output at its natural column, the
+            // one this thread loaded.
+            let s = if x.is_multiple_of(2) { 1.0 } else { -1.0 };
+            r[2 * i as usize] = s * v.0;
+            r[2 * i as usize + 1] = s * v.1;
+        }
+        row_fft::<NX, true>(&mut r, lane);
+        #[unroll]
+        for i in 0..ept {
+            let k = 2 * i as usize;
+            let x = t + i * tpf;
+            let u = cmul_conj(quad_phase(g.quad, y, x, g.ny, nx), (r[k], r[k + 1]));
+            store_c(
+                moved,
+                plane + (y * nx + x) as usize,
+                (u.0 * inv_n, u.1 * inv_n),
+            );
         }
     }
 }

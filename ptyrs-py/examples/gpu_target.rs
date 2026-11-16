@@ -19,7 +19,8 @@ use std::time::Instant;
 
 use cuda_core::CudaContext;
 use ptyrs::engine::{
-    BhParams, Cost, EngineError, Feature, Features, GpuOptions, GpuPtycho, LsqmlParams, RpieParams,
+    BhParams, Cost, EngineError, Feature, Features, GpuOptions, GpuPtycho, LsqmlParams,
+    ProbeVariation, RpieParams,
 };
 
 const USAGE: &str = "usage: gpu_target <cxi> <init.h5> <nepoch> <target|-> \
@@ -85,12 +86,18 @@ impl Method {
     }
 
     /// `nepoch` epochs in one call: BH restarts its CG direction at every call, LSQML its
-    /// preconditioner and Poisson `a_far`.
-    fn run(&self, g: &mut GpuPtycho, nepoch: usize, calc_llk: usize) -> Result<(), EngineError> {
+    /// preconditioner and Poisson `a_far`; `plane` is the probe's.
+    fn run(
+        &self,
+        g: &mut GpuPtycho,
+        plane: [usize; 2],
+        nepoch: usize,
+        calc_llk: usize,
+    ) -> Result<(), EngineError> {
         match self {
             Self::Bh(p) => g.bh(p, nepoch, calc_llk),
             Self::Rpie(p) => g.rpie(&RpieParams { calc_llk, ..*p }, nepoch),
-            Self::Lsqml(p, _) => g.lsqml(p, nepoch, calc_llk),
+            Self::Lsqml(p, _) => g.lsqml(p, &mut ProbeVariation::none(plane), nepoch, calc_llk),
         }
     }
 }
@@ -111,6 +118,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let t = Instant::now();
     let scan = ptyrs::io::read_cxi(cxi)?;
     let (object, probe) = ptyrs::io::read_modes(init)?;
+    let plane = probe.plane_shape();
     println!("read_s {}", t.elapsed().as_secs_f64());
     let ctx = CudaContext::new(0).map_err(EngineError::from)?;
     println!("context_s {}", t.elapsed().as_secs_f64());
@@ -121,7 +129,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("setup_s {}", t.elapsed().as_secs_f64());
 
     let start = g.llk()?.gaussian;
-    method.run(&mut g, nepoch, 1)?;
+    method.run(&mut g, plane, nepoch, 1)?;
     let curve: Vec<f64> = once(start)
         .chain(g.history().iter().map(|r| r.llk.gaussian))
         .collect();
@@ -142,7 +150,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     method.start(&mut g, nframe)?;
     g.synchronize()?;
     let t = Instant::now();
-    method.run(&mut g, epochs, 0)?;
+    method.run(&mut g, plane, epochs, 0)?;
     g.synchronize()?;
     println!("wall_s {}", t.elapsed().as_secs_f64());
     println!("end_llk {}", g.llk()?.gaussian);

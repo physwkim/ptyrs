@@ -19,14 +19,15 @@
 //! adjoint's integrand.
 
 use cuda_async::device_operation::ExecutionContext;
-use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig};
+use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig, RawDeviceBuffer};
 use ptyrs_kernels::optics::{
-    Band, OFF_BAND, SLICE_CONJ, SLICE_OFFSET, SLICE_PROBE, STAGE_COLS, STAGE_CONJ, STAGE_MUL,
-    STAGE_POST_FWD, STAGE_POST_INV, STAGE_PRE_FWD, STAGE_PRE_INV, STAGE_RESTORE, STAGE_SAVE,
-    WavePlanes, optics_kernels,
+    Band, OFF_BAND, SLICE_CONJ, SLICE_OFFSET, STAGE_COLS, STAGE_CONJ, STAGE_MUL, STAGE_POST_FWD,
+    STAGE_POST_INV, STAGE_PRE_FWD, STAGE_PRE_INV, STAGE_RESTORE, STAGE_SAVE, SliceSrc, WavePlanes,
+    optics_kernels, probe_slice, wave_slice,
 };
 
 use crate::gpu::fused::Side;
+use crate::gpu::opr::{FrameProbe, OwnModes};
 use crate::gpu::ops::grid_1d;
 use crate::gpu::{
     C32, Error, Kernels, StackCtl, StackGeom, StackRef, ViewAddr, ViewDims, Views, block_fft,
@@ -133,8 +134,43 @@ impl<'a> FrameWaves<'a> {
 pub enum SliceSource<'a> {
     /// The probe, `[nprobe, ny, nx]` in the natural layout; each view reads its mode.
     Probe(&'a DeviceBuffer<C32>),
+    /// [`Self::Probe`] with each frame's mode 0 its own plane under OPR.
+    OwnProbe(&'a DeviceBuffer<C32>, &'a OwnModes<'a>),
     /// The stack's waves.
     Waves(FrameWaves<'a>),
+}
+
+impl<'a> From<FrameProbe<'a>> for SliceSource<'a> {
+    fn from(probe: FrameProbe<'a>) -> Self {
+        match probe {
+            FrameProbe::Shared(p) => Self::Probe(p),
+            FrameProbe::Own(p, own) => Self::OwnProbe(p, own),
+        }
+    }
+}
+
+impl<'a> SliceSource<'a> {
+    /// The source as a kernel reads it for the frames of `stack` and the buffers it
+    /// addresses, checked to hold `stack`'s `nf_max` frames under `d`.
+    pub(super) fn src(
+        self,
+        d: &ViewDims,
+        stack: StackRef<'_>,
+    ) -> Result<(SliceSrc, Vec<&'a RawDeviceBuffer>), Error> {
+        let probe = match self {
+            Self::Probe(p) => FrameProbe::Shared(p),
+            Self::OwnProbe(p, own) => FrameProbe::Own(p, own),
+            Self::Waves(w) => {
+                let (w, planes) = w.planes(d, stack.nf_max())?;
+                return Ok((wave_slice(planes), vec![w.storage()]));
+            }
+        };
+        check_len("probe", probe.probe(), d.nprobe as usize * d.n())?;
+        Ok((
+            probe_slice(probe.src(stack, d.n())?),
+            probe.storages().collect(),
+        ))
+    }
 }
 
 /// The exit plane's phase of a multislice object's last slice: `exp(i quad |r|²)`, `r` the
@@ -365,28 +401,9 @@ impl OpticsKernels {
         let len = g.nf_max as usize * d.nmode as usize * d.n();
         check_len("obj", obj, d.obj_len())?;
         check_len("dst", dst, len)?;
-        let (buf, src, probe) = match src {
-            SliceSource::Probe(p) => {
-                check_len("probe", p, d.nprobe as usize * d.n())?;
-                let src = WavePlanes {
-                    w: dptr::<C32, f32>(p).cast_const(),
-                    nw: d.nprobe,
-                };
-                (p, src, SLICE_PROBE)
-            }
-            SliceSource::Waves(w) => {
-                let (w, src) = w.planes(d, g.nf_max)?;
-                (w, src, 0)
-            }
-        };
-        let flags = probe | conj;
+        let (src, mut reads) = src.src(d, stack)?;
         let config = grid_1d(len)?;
-        let reads = [
-            buf.storage(),
-            obj.storage(),
-            views.addr().storage(),
-            stack.storage(),
-        ];
+        reads.extend([obj.storage(), views.addr().storage(), stack.storage()]);
         let (m, ctl) = (&self.module, stack.ctl() as *const StackCtl);
         self.base.launch(ctx, &reads, &[dst.storage()], |stream| {
             // SAFETY: the lengths checked above; `Views` checked each window.
@@ -400,7 +417,7 @@ impl OpticsKernels {
                     dptr::<ViewAddr, ViewAddr>(views.addr()).cast_const(),
                     ctl,
                     g,
-                    flags,
+                    conj,
                 )
             }
         })

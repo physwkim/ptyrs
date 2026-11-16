@@ -454,10 +454,10 @@ impl Ptycho {
 }
 
 /// The names of `Lsqml`'s refined quantities, as `hold` takes them.
-const LSQML: [&str; 3] = ["position", "weights", "intensity"];
+pub(crate) const LSQML: [&str; 3] = ["position", "weights", "intensity"];
 
 /// `Lsqml`'s `opr`: eigenmodes, weights and main-mode weights.
-type Opr<'py> = (
+pub(crate) type Opr<'py> = (
     PyReadonlyArray3<'py, C64>,
     PyReadonlyArray2<'py, f64>,
     Option<PyReadonlyArray1<'py, f64>>,
@@ -465,7 +465,7 @@ type Opr<'py> = (
 
 /// `eigenmodes` `[k, ny, nx]` (k ≥ 1), `weights` `[nframe, k]` and `intensity` `[nframe]` as
 /// the engine's [`ProbeVariation`], the weights and the intensity held as `held` says.
-fn variation(
+pub(crate) fn variation(
     (eigenmodes, weights, intensity): Opr<'_>,
     [hold_weights, hold_intensity]: [bool; 2],
 ) -> PyResult<ProbeVariation> {

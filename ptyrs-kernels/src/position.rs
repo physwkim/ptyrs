@@ -8,8 +8,8 @@
 use cuda_device::{device, shared::DynamicSharedArray, thread};
 use cuda_host::cuda_module;
 
-use crate::fused::{FUSED_COLS, col_fft};
-use crate::optics::WavePlanes;
+use crate::fused::{FUSED_COLS, col_fft, probe_plane};
+use crate::optics::SliceSrc;
 use crate::pixel::{StackCtl, StackGeom, ViewAddr, freq, load_c, stack_frames, store_c};
 use crate::{FFT_EPT_MAX, fft_ept};
 
@@ -39,17 +39,15 @@ pub struct PositionRule {
 
 /// What [`position_kernels::LoadedModule::position_sums`] reads and writes: `chi` the
 /// stack's exit-wave update `[nf_max * nmode, ny, nx]` at the exit wave's stored pixels,
-/// `w` its waves as [`WavePlanes`] says (the moved probe, or a multislice object's wave
-/// entering a slice) at the same pixels, or with `probe` set the unmoved probe `[nprobe, ny,
-/// nx]` in the natural layout, `slopes` its frames' object slopes `[2, nf_max, ny, nx]` in
-/// the natural layout ([`slopes`], or the sampled windows' derivatives), and `sums` the
-/// [`POSITION_SUMS`] of every frame's chunks by epoch position.
+/// `w` its waves as [`SliceSrc`] says (the moved probe, or a multislice object's wave
+/// entering a slice) at the same pixels, or the unmoved probe, `slopes` its frames' object
+/// slopes `[2, nf_max, ny, nx]` in the natural layout ([`slopes`], or the sampled windows'
+/// derivatives), and `sums` the [`POSITION_SUMS`] of every frame's chunks by epoch position.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct PositionSums {
     pub chi: *const f32,
-    pub w: WavePlanes,
-    pub probe: u32,
+    pub w: SliceSrc,
     pub slopes: *const f32,
     pub sums: *mut f32,
 }
@@ -170,7 +168,8 @@ pub unsafe fn slopes<const N: u32>(
 #[cuda_module]
 pub mod position_kernels {
     use super::{
-        BatchSpan, EPS_POSITION, POSITION_SUMS, PositionRule, PositionSums, shift_w, slopes,
+        BatchSpan, EPS_POSITION, POSITION_SUMS, PositionRule, PositionSums, probe_plane, shift_w,
+        slopes,
     };
     use crate::bh::{CHUNK_PIXELS, store_sums};
     use crate::grad::{GAMMA_CHUNK, block_max};
@@ -290,10 +289,10 @@ pub mod position_kernels {
     /// The position sums of chunk `c = blockIdx.x` of frame `f0 + fl`, `fl = blockIdx.y`,
     /// over the pixels `i` in `c * GAMMA_CHUNK .. min((c + 1) * GAMMA_CHUNK, n)` of its first
     /// view `v` (mode 0): with `u_ax = slope_ax W_v` (the slope at `i`, `W_v` the view's wave
-    /// of `w`, it and `chi` at the exit-wave index of `i`; with `p.probe` set, `W_v` probe
-    /// plane 0 at `i` times `quad_phase(g.quad)`, plane 0 being mode 0's by the views'
-    /// canonical modes), `sums[4p .. 4p + 4]` gets the [`POSITION_SUMS`], `p = (f0 + fl) *
-    /// nchunk + c`.
+    /// of `w`, it and `chi` at the exit-wave index of `i`; under `p.w.from_probe`, `W_v` the
+    /// frame's probe mode 0 at `i` times `quad_phase(g.quad)`, mode 0 being the view's by the
+    /// views' canonical modes), `sums[4p .. 4p + 4]` gets the [`POSITION_SUMS`], `p = (f0 +
+    /// fl) * nchunk + c`.
     ///
     /// # Safety
     ///
@@ -305,7 +304,6 @@ pub mod position_kernels {
         let PositionSums {
             chi,
             w,
-            probe,
             slopes,
             sums,
         } = p;
@@ -321,8 +319,12 @@ pub mod position_kernels {
         let chunk = GAMMA_CHUNK as usize;
         let end = n.min((c + 1) * chunk);
         let pos = f0 as usize + fl;
-        let probe = probe != 0;
-        let wp = if probe { 0 } else { wave_plane(w, fl, 0) * n };
+        let probe = w.from_probe != 0;
+        let (wb, wp) = if probe {
+            (unsafe { probe_plane(w.probe, 0, pos as u32, n) }, 0)
+        } else {
+            (w.waves.w, wave_plane(w.waves, fl, 0) * n)
+        };
         let mut acc = [0.0f32; POSITION_SUMS as usize];
         let base = c * chunk + thread::threadIdx_x() as usize;
         // Every load of a group is issued before its sums, which keep the pixel order.
@@ -339,7 +341,7 @@ pub mod position_kernels {
                     let at = psi_index(i as u32 / nx, i as u32 % nx, ny, nx);
                     ld[j] = unsafe {
                         [
-                            load_c(w.w, wp + if probe { i } else { at }),
+                            load_c(wb, wp + if probe { i } else { at }),
                             load_c(chi, fl * nmode * n + at),
                             load_c(slopes, fl * n + i),
                             load_c(slopes, (nf_max + fl) * n + i),
