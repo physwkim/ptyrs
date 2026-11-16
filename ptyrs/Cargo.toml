@@ -6,7 +6,7 @@ description = "ptyrs: GPU ptychography on cuda-rust, one host library plus the `
 
 [features]
 # ptyrs::nn on burn. Off by default, so burn and cubecl build only on request.
-nn = ["dep:burn", "dep:burn-cubecl", "dep:burn-pack", "dep:cudarc", "dep:cubecl-runtime", "dep:rayon"]
+nn = ["dep:burn", "dep:burn-cubecl", "dep:burn-pack", "dep:cudarc", "dep:cubecl-runtime"]
 
 [dependencies]
 ptyrs-kernels = { path = "../ptyrs-kernels" }
@@ -47,7 +47,6 @@ burn-pack = { version = "0.22.1", default-features = false, features = ["std"], 
 cudarc = { version = "0.19.10", default-features = false, features = ["cuda-13040"], optional = true }
 # For the `Runtime` trait that names cubecl's CUDA server; cubecl does not re-export it.
 cubecl-runtime = { version = "0.11.4", default-features = false, optional = true }
-rayon = { version = "1.12", optional = true }
 
 [build-dependencies]
 cuda-artifact-finalizer.workspace = true

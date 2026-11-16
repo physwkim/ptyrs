@@ -26,13 +26,12 @@ use crate::fault;
 use crate::gpu::{
     C32, Ended, FrameLlk, FusedBufs, Kernels, LlkPartial, LlkRing, LlkTotals, RingError, ViewAddr,
 };
-use crate::live::fill::Fill;
 use crate::live::graph::LiveGraph;
 use crate::live::grow::GrowError;
 use crate::live::object::{Snapshot, timed_sleeping_event};
 use crate::live::recon::{ApConfig, LLK_SLOTS, ViewPlacement, capture_sweep};
 use crate::live::ring::{DeviceStore, STORE_LEAD};
-use crate::live::scan::{LiveScan, Refusal, ScanBacker, one_object_mode};
+use crate::live::scan::{LiveScan, Refusal, ScanBacker};
 use crate::live::stats::wall_ns;
 
 use crate::dist::exchange::{self, Exchange, Pull};
@@ -564,23 +563,6 @@ impl DistLiveAp {
         Ok(took)
     }
 
-    /// Queues `fill` onto every GPU's window behind the epochs queued so far
-    /// ([`LiveScan::fill`]), halo tiles included, so the next epoch starts from it on every
-    /// GPU; returns the fill's pixels their owner's GPU had not ready, each once: 0 for the
-    /// fill of a batch [`Self::push`] has landed whole, as every tile a frame touches is
-    /// readied on its owner. Each GPU queues an epoch whole within one [`Self::epoch`], on
-    /// the stream its fills are queued on, so a fill never lands inside one.
-    pub fn fill(&mut self, fill: Fill) -> Result<usize, DistError> {
-        self.gpus.check()?;
-        let regions = self.plan.regions();
-        one_object_mode(&regions[0].shape.dims())?;
-        let skipped = self.gpus.change(|gpu, st| {
-            let origin = regions[gpu.region()].window.at;
-            Ok(st.scan.fill(fill.clone(), origin)?)
-        })?;
-        Ok(skipped.into_iter().sum())
-    }
-
     /// Queues one epoch over every frame landed so far on every GPU, without waiting for it.
     pub fn epoch(&mut self) -> Result<(), DistError> {
         let epoch = self.epochs;
@@ -774,8 +756,6 @@ mod tests {
     use super::*;
     use crate::dist::worker::tests::gpus;
     use crate::live::farfield::{Ptycho, PtychoSpec, ScanPath};
-    use crate::live::fill::standin::{Wrong, batch_fill};
-    use crate::live::fill::{Fill, PatchFill};
     use crate::live::graph::WarmUp;
     use crate::live::grow::GrowError;
     use crate::live::pos::{Pos, PosTable};
@@ -1046,105 +1026,6 @@ mod tests {
         }
     }
 
-    /// A raster in strips with a fill after each batch's push and two epochs after it: on
-    /// `ngpu` GPUs the fill skips no pixel, and the object is one GPU's bit for bit both
-    /// before the batch's first epoch and after its epochs, with fills that lie over tiles
-    /// of two GPUs.
-    fn fills_give_the_one_gpu_object(ngpu: usize) {
-        let ctx = Context::new(0).expect("GPU 0");
-        let c = case(&sim(ScanPath::Raster { cols: 12 }, 240));
-        let batches = batches(&c);
-        let (nmode, n) = (c.cfg.shape.nmode() as usize, 64 * 64);
-        let views = |b: &Range<usize>| &c.views[b.start * nmode..b.end * nmode];
-        let obj = c.cfg.shape.dims().obj.map(|n| n as usize);
-        let most = batches.iter().map(Range::len).max().unwrap();
-        // Every fill stays out for both runs.
-        let mut pf = PatchFill::new(&ctx, obj, [32, 32], most, batches.len()).unwrap();
-        let mut wrong = Wrong {
-            patch: [32, 32],
-            issued: 0,
-        };
-        let fills: Vec<Fill> = batches
-            .iter()
-            .map(|b| {
-                let counts = &c.counts[b.start * n..b.end * n];
-                batch_fill(&mut pf, &mut wrong, counts, views(b), nmode, [64, 64])
-            })
-            .collect();
-
-        let st = ctx.new_stream().unwrap();
-        let dev = DeviceBuffer::from_host(&st, &c.counts).unwrap();
-        let mut one = LiveAp::new(&st, &c.cfg, &c.probe, dev, false).unwrap();
-        let (mut snap, mut backer) = (one.new_snapshot().unwrap(), one.backer());
-        let mut want = Vec::new();
-        for (b, fill) in batches.iter().zip(&fills) {
-            let v = views(b);
-            backer.back(v).unwrap();
-            assert_eq!(one.push(v).unwrap() as usize, b.len());
-            assert_eq!(one.fill(fill.clone()).unwrap(), 0);
-            one.snapshot(&mut snap).unwrap();
-            let filled = bits(snap.wait().unwrap());
-            for _ in 0..2 {
-                one.epoch().unwrap();
-            }
-            one.snapshot(&mut snap).unwrap();
-            want.push([filled, bits(snap.wait().unwrap())]);
-        }
-
-        let planned = &c.views[..c.planned * nmode];
-        let mut ap = DistLiveAp::new(
-            &gpus(ngpu),
-            &c.cfg,
-            planned,
-            Scheme::Strips,
-            &c.probe,
-            false,
-        )
-        .unwrap();
-        let grid = ap.plan().partition().grid();
-        let (tile, ntx) = (grid.tile(), grid.obj()[1].div_ceil(grid.tile()));
-        let owner = ap.plan().partition().owner().to_vec();
-        // Fills with pixels on tiles of more than one GPU.
-        let across = fills
-            .iter()
-            .filter(|f| {
-                let owners = |r: &crate::live::fill::Rect| {
-                    let (y, x) = (r.y as usize, r.x as usize);
-                    let corners = [[y, x], [y + r.h as usize - 1, x + r.w as usize - 1]];
-                    corners.map(|[y, x]| owner[y / tile * ntx + x / tile])
-                };
-                let mut seen = f.rects().iter().flat_map(owners);
-                seen.next().is_some_and(|o| seen.any(|p| p != o))
-            })
-            .count();
-        assert!(across > 0, "no fill lies over two GPUs' tiles");
-        let mut feed = Feed::new(&ctx, &c, &ap);
-        for (k, ((b, fill), want)) in batches.iter().zip(fills).zip(&want).enumerate() {
-            feed = feed.land(&c, b);
-            assert_eq!(ap.push(views(b)).unwrap() as usize, b.len());
-            assert_eq!(ap.fill(fill).unwrap(), 0, "batch {k}");
-            let unlike = |ap: &DistLiveAp, want: &[[u32; 2]]| {
-                let got = bits(&ap.object().unwrap());
-                got.iter().zip(want).filter(|(g, w)| g != w).count()
-            };
-            assert_eq!(
-                unlike(&ap, &want[0]),
-                0,
-                "batch {k}: unlike one GPU's when filled"
-            );
-            for _ in 0..2 {
-                ap.epoch().unwrap();
-            }
-            assert_eq!(
-                unlike(&ap, &want[1]),
-                0,
-                "batch {k}: unlike one GPU's after epochs"
-            );
-        }
-        feed.finish();
-        assert_eq!((ap.lost(), ap.closed()), (0, None));
-    }
-
     /// The raster of [`gpus_iterate_a_live_scan_as_one_gpu`] on stores that back their
     /// planned frames and one more before the first frame lands, then a chunk at a time as
     /// the uploader reaches the edge: on 1, 2 and 4 GPUs the stores grow while the scan
@@ -1339,15 +1220,5 @@ mod tests {
         assert!(matches!(ap.epoch(), Err(DistError::Poisoned)));
         assert!(matches!(ap.new_snapshot(), Err(DistError::Poisoned)));
         feed.finish();
-    }
-
-    #[test]
-    fn fills_on_2_gpus_give_the_one_gpu_object() {
-        fills_give_the_one_gpu_object(2);
-    }
-
-    #[test]
-    fn fills_on_4_gpus_give_the_one_gpu_object() {
-        fills_give_the_one_gpu_object(4);
     }
 }

@@ -4,7 +4,7 @@
 
 #![warn(clippy::disallowed_methods)]
 
-use ptyrs::live::args::Args;
+use ptyrs::live::args::cli;
 use ptyrs::live::codec::{
     Bslz4Scratch, Codec, bslz4_compress_u16, bslz4_decompress_into_u16, bslz4_decompress_range_u16,
     bytemuck_u16, bytemuck_u16_mut, lz4_compress, lz4_decompress_into,
@@ -64,16 +64,21 @@ fn run(
 }
 
 fn main() {
-    let a = Args::parse();
-    let threads: usize = a.get("threads", 12);
-    let secs: f64 = a.get("secs", 2.0);
-    let gap_us: u64 = a.get("gap-us", 0);
-    let util_min: u32 = a.get("util-min", 0);
+    let (threads, secs, gap_us, util_min, flux): (usize, f64, u64, u32, f64) =
+        cli("live_codec_bench", |a| {
+            Ok((
+                a.get("threads", 12)?,
+                a.get("secs", 2.0)?,
+                a.get("gap-us", 0)?,
+                a.get("util-min", 0)?,
+                a.get("flux", 1.0)?,
+            ))
+        });
     let s = Synth {
         width: 1028,
         height: 1062,
         seed: 1,
-        flux: a.get("flux", 1.0),
+        flux,
         pool: 64,
     };
     let raw: Vec<Vec<u16>> = (0..s.pool as u64).map(|i| s.frame(i)).collect();

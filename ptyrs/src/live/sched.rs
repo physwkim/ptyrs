@@ -2,6 +2,36 @@
 //! of threads that idle between frames.
 
 use std::io;
+use std::str::FromStr;
+
+use serde::Deserialize;
+
+/// A CPU list such as `0-11,48-59`, read as [`parse_cpu_list`] reads it.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "String")]
+pub struct CpuList(Vec<usize>);
+
+impl CpuList {
+    pub fn cpus(&self) -> &[usize] {
+        &self.0
+    }
+}
+
+impl FromStr for CpuList {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        parse_cpu_list(s).map(Self)
+    }
+}
+
+impl TryFrom<String> for CpuList {
+    type Error = String;
+
+    fn try_from(s: String) -> Result<Self, String> {
+        s.parse()
+    }
+}
 
 /// Parse a CPU list such as `0-11,48-59`.
 pub fn parse_cpu_list(s: &str) -> Result<Vec<usize>, String> {

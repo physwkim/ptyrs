@@ -28,13 +28,13 @@ use epics_pva_rs::server_native::{PvaServer, PvaServerConfig, SharedSource};
 use serde::Deserialize;
 
 use crate::dist::{Scheme, topo};
-use crate::live::args::Args;
+use crate::live::args::{ArgError, Args};
 use crate::live::consumer::{ConsumerReport, checksum, run_checksum_consumer};
 use crate::live::eiger::{EigerFrames, Progress, PullReport, connect_pull, run_pull};
 use crate::live::farfield::ScanPath;
 use crate::live::follow::{
-    Fate, FillHook, FollowCfg, FollowReport, Preview, ReconCfg, first_converged, offline_dist,
-    plane, run_dist_consumer,
+    FollowCfg, FollowReport, Preview, ReconCfg, first_converged, offline_dist, plane,
+    run_dist_consumer,
 };
 use crate::live::graph::WarmUp;
 use crate::live::handoff::work_queue;
@@ -46,7 +46,7 @@ use crate::live::pos::PosTable;
 use crate::live::pv_out::{AmpPhase, PvOut, publish};
 use crate::live::pva_source::{NtndFrames, PosStats, monitor_positions};
 use crate::live::ring::{DeviceStore, Landing, Ring, UploaderConfig, Whole, run_region_uploader};
-use crate::live::sched::FairSched;
+use crate::live::sched::{CpuList, FairSched};
 use crate::live::stats::{Histogram, mono_ns, process_cpu_ns, wall_ns};
 use crate::live::swmr::{SwmrCfg, SwmrReport, run_swmr};
 use crate::live::synth::Region;
@@ -100,7 +100,7 @@ pub struct RecvCfg {
     pub graph_batch: NonZeroU32,
     pub rt_threads: usize,
     /// CPU list (`2-23,48-71`) the threads are pinned to; unpinned when unset.
-    pub cpus: Option<String>,
+    pub cpus: Option<CpuList>,
     pub util_min: u32,
     /// EEVDF slice of the placed threads; 0 keeps the kernel's.
     pub slice_us: u64,
@@ -225,65 +225,71 @@ impl RecvCfg {
     /// zmq --zmq ENDPOINT --rcvhwm N`, `--source h5 --h5 PATH --h5-readers
     /// --h5-poll-us --h5-queue`, `--crop-decode 0|1`, [`ModelCfg::from_args`]
     /// and [`ReconCfg::from_args`].
-    pub fn from_args(a: &Args) -> Self {
+    pub fn from_args(a: &Args) -> Result<Self, ArgError> {
         let d = Self::default();
-        let source = match a.str("source", "pva").as_str() {
-            "pva" => SourceCfg::Pva,
-            "zmq" => {
+        #[derive(Clone, Copy)]
+        enum Kind {
+            Pva,
+            Zmq,
+            H5,
+        }
+        let of = [("pva", Kind::Pva), ("zmq", Kind::Zmq), ("h5", Kind::H5)];
+        let source = match a.choice("source", &of)? {
+            Kind::Pva => SourceCfg::Pva,
+            Kind::Zmq => {
                 let z = ZmqCfg::default();
                 SourceCfg::Zmq(ZmqCfg {
                     endpoint: a.str("zmq", &z.endpoint),
-                    rcvhwm: a.get("rcvhwm", z.rcvhwm),
+                    rcvhwm: a.get("rcvhwm", z.rcvhwm)?,
                 })
             }
-            "h5" => {
+            Kind::H5 => {
                 let path: PathBuf = a
-                    .opt("h5")
-                    .unwrap_or_else(|| panic!("--source h5 needs --h5 PATH"));
+                    .opt("h5")?
+                    .ok_or_else(|| ArgError::new("--source h5 needs --h5 PATH".into()))?;
                 let h = H5Cfg::new(path);
                 SourceCfg::H5(H5Cfg {
-                    readers: a.get("h5-readers", h.readers),
-                    poll_us: a.get("h5-poll-us", h.poll_us),
-                    queue: a.get("h5-queue", h.queue),
+                    readers: a.get("h5-readers", h.readers)?,
+                    poll_us: a.get("h5-poll-us", h.poll_us)?,
+                    queue: a.get("h5-queue", h.queue)?,
                     ..h
                 })
             }
-            s => panic!("--source {s}: expected pva, zmq or h5"),
         };
-        Self {
-            frames: a.get("frames", d.frames),
-            gpu: a.get("gpu", d.gpu),
-            gpus: a.get("gpus", d.gpus),
+        Ok(Self {
+            frames: a.get("frames", d.frames)?,
+            gpu: a.get("gpu", d.gpu)?,
+            gpus: a.get("gpus", d.gpus)?,
             source,
-            addr: a.get("addr", d.addr),
+            addr: a.get("addr", d.addr)?,
             prefix: a.str("prefix", &d.prefix),
-            pipeline: a.get("pipeline", d.pipeline),
-            pos_queue: a.get("pos-queue", d.pos_queue),
-            model: ModelCfg::from_args(a),
-            crop: a.get("crop", d.crop),
-            cx: a.opt("cx"),
-            cy: a.opt("cy"),
-            crop_decode: a.get::<u8>("crop-decode", d.crop_decode.into()) != 0,
+            pipeline: a.get("pipeline", d.pipeline)?,
+            pos_queue: a.get("pos-queue", d.pos_queue)?,
+            model: ModelCfg::from_args(a)?,
+            crop: a.get("crop", d.crop)?,
+            cx: a.opt("cx")?,
+            cy: a.opt("cy")?,
+            crop_decode: a.get::<u8>("crop-decode", d.crop_decode.into())? != 0,
             // With no worker every queued frame is dropped, so 0 fails here.
-            workers: a.get("workers", d.workers),
-            queue: a.get("queue", d.queue),
-            verify_every: a.get("verify-every", d.verify_every),
-            pos_wait_ms: a.get("pos-wait-ms", d.pos_wait_ms),
-            batch: a.get("batch", d.batch),
-            flush_us: a.get("flush-us", d.flush_us),
-            idle_us: a.get("idle-us", d.idle_us),
-            ring_slots: a.get("ring-slots", d.ring_slots),
-            store_frames: a.opt("store-frames"),
-            graph_batch: a.get("graph-batch", d.graph_batch),
-            rt_threads: a.get("rt-threads", d.rt_threads),
-            cpus: a.opt("cpus"),
-            util_min: a.get("util-min", d.util_min),
-            slice_us: a.get("slice-us", d.slice_us),
-            h2d_rtprio: a.get("h2d-rtprio", d.h2d_rtprio),
-            idle_ms: a.get("idle-ms", d.idle_ms),
-            connect_timeout_s: a.get("connect-timeout-s", d.connect_timeout_s),
-            recon: ReconCfg::from_args(a),
-        }
+            workers: a.get("workers", d.workers)?,
+            queue: a.get("queue", d.queue)?,
+            verify_every: a.get("verify-every", d.verify_every)?,
+            pos_wait_ms: a.get("pos-wait-ms", d.pos_wait_ms)?,
+            batch: a.get("batch", d.batch)?,
+            flush_us: a.get("flush-us", d.flush_us)?,
+            idle_us: a.get("idle-us", d.idle_us)?,
+            ring_slots: a.get("ring-slots", d.ring_slots)?,
+            store_frames: a.opt("store-frames")?,
+            graph_batch: a.get("graph-batch", d.graph_batch)?,
+            rt_threads: a.get("rt-threads", d.rt_threads)?,
+            cpus: a.opt("cpus")?,
+            util_min: a.get("util-min", d.util_min)?,
+            slice_us: a.get("slice-us", d.slice_us)?,
+            h2d_rtprio: a.get("h2d-rtprio", d.h2d_rtprio)?,
+            idle_ms: a.get("idle-ms", d.idle_ms)?,
+            connect_timeout_s: a.get("connect-timeout-s", d.connect_timeout_s)?,
+            recon: ReconCfg::from_args(a)?,
+        })
     }
 }
 
@@ -301,31 +307,6 @@ impl fmt::Display for RecvError {
 }
 
 impl std::error::Error for RecvError {}
-
-/// The fill of a `--recon-fill` run: its predictor on `gpu`, the first
-/// region's, warmed on its calls' frames.
-#[cfg(feature = "nn")]
-fn fill_hook(cfg: &RecvCfg, gpu: usize) -> Result<Option<FillHook>, RecvError> {
-    let Some(fc) = cfg.recon.as_ref().and_then(|rc| rc.fill.as_ref()) else {
-        return Ok(None);
-    };
-    let t = std::time::Instant::now();
-    let hook = fc
-        .hook(gpu, [cfg.crop; 2], cfg.batch.get())
-        .map_err(fail("fill predictor"))?;
-    eprintln!(
-        "recv fill predictor={} norm={} pack={} counts={} fills={} batch={} gpu={gpu} \
-         load_ms={:.0}",
-        fc.predictor.display(),
-        fc.norm,
-        hook.pack,
-        fc.counts,
-        fc.fills,
-        hook.batch,
-        t.elapsed().as_secs_f64() * 1e3
-    );
-    Ok(Some(hook))
-}
 
 fn fail<E: fmt::Display>(what: &'static str) -> impl FnOnce(E) -> RecvError {
     move |e| RecvError {
@@ -613,17 +594,6 @@ fn recon_line(
 
 /// Frame arrival (`t_rx`, by store place) → end of the first epoch that
 /// took the frame; and [`FollowReport::epochs_after_scan`].
-/// `n`, p50, p90 and max of `v`.
-fn spread(v: impl Iterator<Item = u64>) -> String {
-    let mut v: Vec<u64> = v.collect();
-    v.sort_unstable();
-    let q = |q: f64| v[((q * v.len() as f64).ceil() as usize).clamp(1, v.len()) - 1];
-    match v.last() {
-        None => "n=0".into(),
-        Some(max) => format!("n={} p50={} p90={} max={max}", v.len(), q(0.5), q(0.9)),
-    }
-}
-
 fn epoch_latency(rep: &FollowReport, t_rx: &[i64]) -> (Histogram, Histogram) {
     let (mut to_epoch, mut epoch) = (Histogram::new(1_000_000), Histogram::new(1_000_000));
     let mut f0 = 0;
@@ -692,7 +662,7 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
         _ => 0,
     };
     let place = Arc::new(Placement::new(
-        cfg.cpus.as_deref().unwrap_or(""),
+        cfg.cpus.as_ref().map(CpuList::cpus),
         cfg.rt_threads,
         workers,
         h5_readers,
@@ -705,10 +675,6 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
     // Its input threads take this thread's CPUs: the whole list, not the
     // runtime's.
     place.enter(place.all.as_deref());
-    #[cfg(feature = "nn")]
-    let fill = fill_hook(cfg, ordinals[0])?;
-    #[cfg(not(feature = "nn"))]
-    let fill: Option<FillHook> = None;
     // The calling thread only polls for completion; it shares the runtime CPUs.
     place.enter(place.rt.as_deref());
     // Before the GPU setup, which takes seconds, so that a bad source stops
@@ -815,7 +781,7 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
                         .map_err(|e| e.to_string()),
                     Job::Recon(follow, settle_max) => {
                         let f = follow.clone();
-                        run_dist_consumer(&ordinals, scheme, f, brx, ready_tx, preview, fill)
+                        run_dist_consumer(&ordinals, scheme, f, brx, ready_tx, preview)
                             .map(|rep| {
                                 Consumed::Recon(Box::new(Recon {
                                     rep,
@@ -1233,11 +1199,6 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
         ),
     ));
     line(format_args!("recv rx_to_gpu {}", up.rx_to_gpu.summary()));
-    line(format_args!(
-        "recv counts_copy counts_dry={} {}",
-        up.counts_dry,
-        up.counts_copy.summary()
-    ));
     for (r, (reg, gpu)) in up.regions.iter().zip(&ordinals).enumerate() {
         line(format_args!(
             "recv region{r}_rx_to_gpu gpu={gpu} frames={} MiB={} {}",
@@ -1291,32 +1252,6 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
             line(format_args!(
                 "recv recon_store frames_bad={sum_bad} recaptures={recaptures}"
             ));
-            if let Some(f) = &r.rep.fill {
-                let (written, covered) = f.of(Fate::Written);
-                line(format_args!(
-                    "recv fill batches={} covered={covered} no_counts={} calls={} \
-                     written={written} failed={} no_buffer={} dropped={} not_ready={} error={:?}",
-                    r.rep.landings.len(),
-                    f.no_counts,
-                    f.calls.len(),
-                    f.of(Fate::Failed).0,
-                    f.of(Fate::NoBuffer).0,
-                    f.of(Fate::Dropped).0,
-                    f.not_ready,
-                    f.error
-                ));
-                let frames = f.calls.iter().map(|c| u64::from(c.frames));
-                line(format_args!("recv fill_call_frames {}", spread(frames)));
-                // Epochs queued between a call's last batch landing and its fill.
-                let lag = f.calls.iter().filter_map(|c| {
-                    let i = r.rep.landings.partition_point(|l| l.1 < c.upto);
-                    r.rep.landings.get(i).map(|l| c.epochs - l.0)
-                });
-                line(format_args!("recv fill_lag_epochs {}", spread(lag)));
-                line(format_args!("recv fill_copy {}", f.copy.summary()));
-                line(format_args!("recv fill_predict {}", f.predict.summary()));
-                line(format_args!("recv fill_stitch {}", f.stitch.summary()));
-            }
             let (to_epoch, epoch) = epoch_latency(&r.rep, &up.t_rx);
             line(format_args!("recv frame_to_epoch {}", to_epoch.summary()));
             line(format_args!(
@@ -1362,15 +1297,25 @@ pub fn run(cfg: &RecvCfg) -> Result<RecvReport, RecvError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::live::args::{self, Parsed};
     use crate::live::follow::Algo;
-    #[cfg(feature = "nn")]
-    use crate::live::follow::FillCfg;
     use crate::live::model::{PathKind, PtychoCfg};
     use crate::live::pv_out::PvCfg;
     use crate::live::synth::Synth;
 
+    fn read(f: &[&str]) -> Result<Parsed<RecvCfg>, String> {
+        args::read(f.iter().map(|s| s.to_string()), RecvCfg::from_args).map_err(|e| e.to_string())
+    }
+
     fn flags(f: &[&str]) -> RecvCfg {
-        RecvCfg::from_args(&f.iter().map(|s| s.to_string()).collect())
+        match read(f) {
+            Ok(Parsed::Run(c)) => c,
+            r => panic!("{f:?}: {r:?}"),
+        }
+    }
+
+    fn refused(f: &[&str]) -> String {
+        read(f).unwrap_err()
     }
 
     fn toml(t: &str) -> RecvCfg {
@@ -1397,33 +1342,70 @@ mod tests {
         };
         assert_eq!(flags(&["--recon", "ap", "--recon-pv", "X:"]), pv);
         assert_eq!(toml("[recon.pv]\nprefix = \"X:\""), pv);
-        #[cfg(feature = "nn")]
-        {
-            let fill = RecvCfg {
-                recon: Some(ReconCfg {
-                    fill: Some(FillCfg::new("/p".into(), 2.0)),
-                    ..ReconCfg::default()
-                }),
-                ..RecvCfg::default()
-            };
-            let f = [
-                "--recon",
-                "ap",
-                "--recon-fill",
-                "/p",
-                "--recon-fill-norm",
-                "2",
-            ];
-            assert_eq!(flags(&f), fill);
-            assert_eq!(toml("[recon.fill]\npredictor = \"/p\"\nnorm = 2.0"), fill);
-        }
     }
 
-    #[cfg(not(feature = "nn"))]
     #[test]
-    #[should_panic(expected = "--recon-fill needs the nn feature")]
-    fn a_fill_flag_without_the_nn_feature_is_refused() {
-        flags(&["--recon", "ap", "--recon-fill", "/p"]);
+    fn a_flag_not_read_with_the_others_is_refused() {
+        let unread = |f: &[&str]| refused(f).split(" (").next().unwrap().to_string();
+        let e = |k: &str| format!("not read with the flags given: {k}");
+        assert_eq!(unread(&["--frame", "5"]), e("--frame"));
+        assert_eq!(unread(&["--h5", "/x/scan.h5"]), e("--h5"));
+        assert_eq!(
+            unread(&["--recon-stacks", "2", "--zmq", "tcp://a:1"]),
+            e("--recon-stacks, --zmq")
+        );
+        assert_eq!(
+            unread(&["--recon", "ap", "--recon-pv-bin", "2"]),
+            e("--recon-pv-bin")
+        );
+        assert_eq!(unread(&["--model", "ptycho", "--flux", "2"]), e("--flux"));
+    }
+
+    #[test]
+    fn a_value_a_reader_refuses_is_named_with_its_flag() {
+        assert_eq!(
+            refused(&["--source", "x"]),
+            "--source x: expected one of pva, zmq, h5"
+        );
+        assert_eq!(refused(&["--source", "h5"]), "--source h5 needs --h5 PATH");
+        assert_eq!(
+            refused(&["--model", "y"]),
+            "--model y: expected one of synth, ptycho"
+        );
+        assert_eq!(
+            refused(&["--path", "spiral", "--model", "ptycho"]),
+            "--path spiral: expected raster or fermat"
+        );
+        assert!(refused(&["--cpus", "3-1"]).starts_with("--cpus 3-1: "));
+        assert!(refused(&["--recon", "pie"]).starts_with("--recon pie: "));
+        assert_eq!(flags(&["--cpus", "2-3,8"]).cpus.unwrap().cpus(), [2, 3, 8]);
+    }
+
+    #[test]
+    fn help_lists_the_flags_read_with_those_given() {
+        let help = |f: &[&str]| match read(f) {
+            Ok(Parsed::Help(u)) => u,
+            r => panic!("{f:?}: {r:?}"),
+        };
+        let u = help(&["--help"]);
+        assert!(
+            u.contains("\n  --source pva|zmq|h5\n") && u.contains("\n  --frames 30000\n"),
+            "{u}"
+        );
+        assert!(
+            !u.contains("--h5-readers") && !u.contains("--recon-stacks"),
+            "{u}"
+        );
+        let u = help(&["--source", "h5", "--h5", "/x", "--recon", "ap", "--help"]);
+        assert!(
+            u.contains("\n  --h5-readers ") && u.contains("\n  --recon-stacks "),
+            "{u}"
+        );
+        let u = help(&["--help", "--source", "h5"]);
+        assert!(
+            u.ends_with("stopped at: --source h5 needs --h5 PATH\n"),
+            "{u}"
+        );
     }
 
     #[test]
@@ -1470,7 +1452,7 @@ mod tests {
             store_frames: Some(2000),
             graph_batch: NonZeroU32::new(8).unwrap(),
             rt_threads: 2,
-            cpus: Some("2-5".into()),
+            cpus: Some("2-5".parse().unwrap()),
             util_min: 0,
             slice_us: 200,
             h2d_rtprio: 5,
@@ -1491,17 +1473,9 @@ mod tests {
                     period_ms: 100,
                     llk_period_ms: 700,
                 }),
-                #[cfg(feature = "nn")]
-                fill: Some(FillCfg {
-                    predictor: "/x/pred".into(),
-                    norm: 1234.5,
-                    pack: 24,
-                    counts: 4,
-                    fills: 64,
-                }),
             }),
         };
-        let f = [
+        let f = flags(&[
             "--frames",
             "1234",
             "--gpu",
@@ -1614,26 +1588,8 @@ mod tests {
             "100",
             "--recon-pv-llk-period-ms",
             "700",
-        ];
-        let fill_flags = [
-            "--recon-fill",
-            "/x/pred",
-            "--recon-fill-norm",
-            "1234.5",
-            "--recon-fill-pack",
-            "24",
-            "--recon-fill-counts",
-            "4",
-            "--recon-fill-fills",
-            "64",
-        ];
-        let fill_flags: &[&str] = if cfg!(feature = "nn") {
-            &fill_flags
-        } else {
-            &[]
-        };
-        let f = flags(&[&f[..], fill_flags].concat());
-        let t = String::from(
+        ]);
+        let t = toml(
             r#"
             frames = 1234
             gpu = 1
@@ -1699,16 +1655,6 @@ mod tests {
             llk-period-ms = 700
             "#,
         );
-        let fill_toml = r#"
-            [recon.fill]
-            predictor = "/x/pred"
-            norm = 1234.5
-            pack = 24
-            counts = 4
-            fills = 64
-            "#;
-        let fill_toml = if cfg!(feature = "nn") { fill_toml } else { "" };
-        let t = toml(&(t + fill_toml));
         assert_eq!(f, want);
         assert_eq!(t, want);
     }
