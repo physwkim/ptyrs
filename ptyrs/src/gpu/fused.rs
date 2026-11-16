@@ -1134,6 +1134,33 @@ impl Kernels {
         bufs: &mut FusedBufs,
         sums: PsiSums<'_>,
     ) -> Result<(), Error> {
+        self.psi_sums_on(ctx, inputs, (None, stack), psi, bufs, sums)
+    }
+
+    /// [`Self::shifted_psi_sums`] with each frame's mode 0 its plane of `own`, read through
+    /// its spectra from [`Self::own_spectrum`]: the object sums of the probe variation's
+    /// model. The probe sums and moves do not read the probe, so they are the shared ones.
+    pub fn shifted_psi_sums_own(
+        &self,
+        ctx: &ExecutionContext,
+        inputs: &FusedInputs<'_>,
+        (own, stack): (&OwnModes<'_>, StackRef<'_>),
+        psi: &dyn Waves,
+        bufs: &mut FusedBufs,
+        sums: PsiSums<'_>,
+    ) -> Result<(), Error> {
+        self.psi_sums_on(ctx, inputs, (Some(own), stack), psi, bufs, sums)
+    }
+
+    fn psi_sums_on(
+        &self,
+        ctx: &ExecutionContext,
+        inputs: &FusedInputs<'_>,
+        (own, stack): (Option<&OwnModes<'_>>, StackRef<'_>),
+        psi: &dyn Waves,
+        bufs: &mut FusedBufs,
+        sums: PsiSums<'_>,
+    ) -> Result<(), Error> {
         let bufs = &*bufs;
         let (run, shift) = Run::new(self, ctx, *inputs, stack, bufs)?;
         let Some(sh) = &shift else {
@@ -1164,7 +1191,7 @@ impl Kernels {
             alpha: 0.0,
             beta: 0.0,
         };
-        run.shift_pre(&sh.model, &sh.model.spectrum, None, &sh.scratch.t, None, p)?;
+        run.shift_pre(&sh.model, &sh.model.spectrum, own, &sh.scratch.t, None, p)?;
         run.shift_sums(sh, psi, p, cfg)?;
         if let Some(sums) = probe {
             run.shift_post(sh, p)?;
@@ -1193,6 +1220,32 @@ impl Kernels {
         t: &mut DeviceBuffer<C32>,
         work: &mut DeviceBuffer<C32>,
     ) -> Result<(), Error> {
+        self.rows_fwd_on(ctx, inputs, None, stack, t, work)
+    }
+
+    /// [`Self::shifted_rows_fwd`] with each frame's mode 0 its plane of `own`, read through
+    /// its spectra from [`Self::own_spectrum`].
+    pub fn shifted_rows_fwd_own(
+        &self,
+        ctx: &ExecutionContext,
+        inputs: &FusedInputs<'_>,
+        own: &OwnModes<'_>,
+        stack: StackRef<'_>,
+        t: &mut DeviceBuffer<C32>,
+        work: &mut DeviceBuffer<C32>,
+    ) -> Result<(), Error> {
+        self.rows_fwd_on(ctx, inputs, Some(own), stack, t, work)
+    }
+
+    fn rows_fwd_on(
+        &self,
+        ctx: &ExecutionContext,
+        inputs: &FusedInputs<'_>,
+        own: Option<&OwnModes<'_>>,
+        stack: StackRef<'_>,
+        t: &mut DeviceBuffer<C32>,
+        work: &mut DeviceBuffer<C32>,
+    ) -> Result<(), Error> {
         let run = Run::checked(self, ctx, *inputs, stack)?;
         let d = inputs.views.dims();
         check_len(
@@ -1202,7 +1255,7 @@ impl Kernels {
         )?;
         let p = FusedPtrs {
             work: dptr(work),
-            ..run.shifted_probe(None, t)?
+            ..run.shifted_probe(own, t)?
         };
         run.shift_rows_fwd(t, work, Carried::default(), p, FusedCfg::default())
     }

@@ -21,7 +21,7 @@ use std::time::Instant;
 use cuda_core::CudaContext;
 use ptyrs::engine::{
     ApParams, BhParams, Cost, DmParams, EngineError, Feature, Features, GpuOptions, GpuPtycho,
-    LsqmlParams, MlParams, Ptycho, RpieParams,
+    LsqmlParams, MlParams, ProbeVariation, Ptycho, RpieParams,
 };
 
 #[path = "../tests/common/engine/mod.rs"]
@@ -128,6 +128,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             fused,
             ..GpuOptions::default()
         };
+        let none = ProbeVariation::none(probe.plane_shape());
         let mut g = GpuPtycho::new(&ctx, &scan, object.clone(), probe.clone(), options)?;
         g.set_features(&want)?;
         let rpie = RpieParams {
@@ -141,7 +142,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "ap" => g.ap(&ap, n),
                 "ml" => g.ml(&ml, n),
                 "bh" => g.bh(&bh, n, calc_llk),
-                "lsqml" => g.lsqml(&lsqml, n, calc_llk),
+                "lsqml" => g.lsqml(&lsqml, &mut none.clone(), n, calc_llk),
                 _ => g.rpie(&rpie, n),
             }
         };

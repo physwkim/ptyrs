@@ -463,54 +463,54 @@ fn multislice(path: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// One GPU algorithm call of `NEPOCH` cycles or epochs.
-type GpuRun = fn(&mut GpuPtycho) -> Result<(), EngineError>;
+/// One GPU algorithm call of `NEPOCH` cycles or epochs, of a probe of the plane it takes.
+type GpuRun = fn(&mut GpuPtycho, [usize; 2]) -> Result<(), EngineError>;
 
 const GPU_RUNS: [(&str, GpuRun); 7] = [
-    ("ap", |g| {
+    ("ap", |g, _| {
         let params = ApParams {
             calc_llk: 1,
             ..Default::default()
         };
         g.ap(&params, NEPOCH)
     }),
-    ("dm", |g| {
+    ("dm", |g, _| {
         let params = DmParams {
             calc_llk: 1,
             ..Default::default()
         };
         g.dm(&params, NEPOCH)
     }),
-    ("raar", |g| {
+    ("raar", |g, _| {
         let params = RaarParams {
             calc_llk: 1,
             ..Default::default()
         };
         g.raar(&params, NEPOCH)
     }),
-    ("ml", |g| {
+    ("ml", |g, _| {
         let params = MlParams {
             calc_llk: 1,
             ..Default::default()
         };
         g.ml(&params, NEPOCH)
     }),
-    ("rpie", |g| {
+    ("rpie", |g, _| {
         let params = RpieParams {
             calc_llk: 1,
             ..Default::default()
         };
         g.rpie(&params, NEPOCH)
     }),
-    ("lsqml", |g| {
+    ("lsqml", |g, plane| {
         let params = LsqmlParams {
             batch_size: 5,
             cost: Cost::Poisson,
             seed: 7,
         };
-        g.lsqml(&params, NEPOCH, 1)
+        g.lsqml(&params, &mut ProbeVariation::none(plane), NEPOCH, 1)
     }),
-    ("bh", |g| {
+    ("bh", |g, _| {
         let params = BhParams {
             batch_size: 5,
             probe_rho: 0.01,
@@ -683,7 +683,7 @@ fn gpu_optics(path: &Path) -> Result<(), Box<dyn Error>> {
         for (algorithm, run, options) in runs {
             let mut gpu =
                 GpuPtycho::with_optics(&ctx, &scan, &optics, flat.clone(), p0.clone(), options)?;
-            run(&mut gpu)?;
+            run(&mut gpu, frame)?;
             let at = root.create_group(&algorithm)?;
             write_stack(&at, "object", &gpu.object()?.0)?;
             write_stack(&at, "probe", &gpu.probe()?.0)?;
@@ -700,7 +700,7 @@ fn gpu_optics(path: &Path) -> Result<(), Box<dyn Error>> {
             cost: Cost::Poisson,
             seed: 7,
         };
-        gpu.lsqml(&params, NEPOCH, 1)?;
+        gpu.lsqml(&params, &mut ProbeVariation::none(frame), NEPOCH, 1)?;
         let at = root.create_group("lsqml_sliced")?;
         write_objects(&at, "objects", &gpu.objects()?)?;
         write_stack(&at, "probe", &gpu.probe()?.0)?;

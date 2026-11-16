@@ -20,8 +20,8 @@ use crate::gpu::{
     BH_STEP, BackgroundSums, BandedTransfer, BhKernels, BhParts, C32, CG_BLOCKS, Ended, EpochOrder,
     Error as GpuError, ExitPass, ExitStage, FarSums, FrameWaves, FusedBufs, FusedInputs,
     GammaStacks, GradKernels, HalfWaves, Kernels, LlkPartial, LlkRing, LlkScratch, LlkTotals,
-    MASKED, Model, OpticsKernels, PositionKernels, PositionPartial, Positions, PowerMax,
-    ProbeSpectrum, RecordWriter, RpieKernels, ScalePartial, Shift, ShiftProbe, ShiftSums,
+    MASKED, Model, OprShape, OpticsKernels, OwnModes, PositionKernels, PositionPartial, Positions,
+    PowerMax, ProbeSpectrum, RecordWriter, RpieKernels, ScalePartial, Shift, ShiftProbe, ShiftSums,
     ShiftedNumSums, ShiftedProbes, ShiftedSums, SlicePhase, SliceSource, SpectrumBuf, StackRef,
     StackTable, StackWindows, SumTarget, UpdateSums, ViewAddr, ViewDims, Views, Waves, half_scale,
 };
@@ -31,7 +31,7 @@ use cuda_async::device_operation::{DeviceOp, ExecutionContext};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 
 use super::bh::{BhMoved, BhSliced, update_nums};
-use super::lsqml::{LsqmlBufs, LsqmlState, Pre};
+use super::lsqml::{LsqmlBufs, LsqmlState, OprValues, Pre};
 use super::ml::{MlMoved, MlPosition, MlWindows};
 use super::rpie::RpieMoved;
 use super::{
@@ -119,9 +119,9 @@ pub(super) fn slice_phase(
 
 impl SlicesMut<'_> {
     /// `stack`'s waves leaving the last slice, its plane phase on them, in a scratch stack's
-    /// buffer: of `inputs` the views, the first slice as its object, and the probe, moved
-    /// under a [`Model::shift`] by its offsets, and `deeper`, the slices past the first as
-    /// those views read them ([`Modelled::slices`]).
+    /// buffer: of `inputs` the views, the first slice as its object, and the probe, with
+    /// `own` each frame's own mode 0, moved under a [`Model::shift`] by its offsets, and
+    /// `deeper`, the slices past the first as those views read them ([`Modelled::slices`]).
     pub fn exit_waves(
         &mut self,
         ctx: &ExecutionContext,
@@ -129,18 +129,24 @@ impl SlicesMut<'_> {
         optics: &OpticsKernels,
         inputs: &FusedInputs<'_>,
         deeper: &[DeviceBuffer<C32>],
-        stack: StackRef<'_>,
+        (own, stack): (Option<&OwnModes<'_>>, StackRef<'_>),
     ) -> Result<&mut DeviceBuffer<C32>, GpuError> {
         let (views, d) = (inputs.views, inputs.views.dims());
         let [a, b] = &mut *self.waves;
         let offsets = match inputs.model.shift {
             None => {
-                let probe = SliceSource::Probe(inputs.probe);
+                let probe = match own {
+                    None => SliceSource::Probe(inputs.probe),
+                    Some(own) => SliceSource::OwnProbe(inputs.probe, own),
+                };
                 optics.slice_mul(ctx, views, stack, inputs.obj, probe, a)?;
                 None
             }
             Some(shift) => {
-                kernels.shifted_probe(ctx, inputs, stack, b)?;
+                match own {
+                    None => kernels.shifted_probe(ctx, inputs, stack, b)?,
+                    Some(own) => kernels.shifted_probe_own(ctx, inputs, own, stack, b)?,
+                }
                 self.position.shift_w(ctx, d, stack, b)?;
                 let probe = SliceSource::Waves(FrameWaves::Probes(b));
                 optics.slice_mul(ctx, views, stack, inputs.obj, probe, a)?;
@@ -1861,6 +1867,7 @@ enum Cycle {
     Lsqml {
         params: LsqmlParams,
         pre: Pre,
+        opr: Option<OprShape>,
     },
 }
 
@@ -1881,7 +1888,7 @@ impl Cycle {
             Self::Rpie(p, _) => Epoch::Rpie(p),
             Self::Ml { params, first, llk } => Epoch::Ml { params, first, llk },
             Self::Bh { params, cg } => Epoch::Bh { params, cg },
-            Self::Lsqml { params, pre } => Epoch::Lsqml { params, pre },
+            Self::Lsqml { params, pre, opr } => Epoch::Lsqml { params, pre, opr },
         }
     }
 }
@@ -2736,7 +2743,7 @@ impl Device {
     /// Captures the LLK pass's graph.
     fn capture_llk(&mut self) -> Result<Captured, EngineError> {
         self.capture(|bufs, passes, ring, ended, ctx| {
-            bufs.forward_llk(ctx, passes, ring.capture(ended))
+            bufs.forward_llk(ctx, passes, ring.capture(ended), None)
         })
     }
 
@@ -3202,22 +3209,53 @@ impl Device {
     }
 
     /// One LSQML epoch as [`Self::steady`] enqueues it, after setting its frame order:
-    /// `order` holds the scan frame at each epoch position.
+    /// `order` holds the scan frame at each epoch position. With `opr` the epoch runs that
+    /// probe variation, which the first epoch of a call ([`Pre::Init`]) uploads.
     pub fn lsqml_epoch(
         &mut self,
         params: LsqmlParams,
         pre: Pre,
+        opr: Option<&OprValues>,
         cycle: usize,
         order: &[u32],
     ) -> Result<(), EngineError> {
-        self.steady_with(Epoch::Lsqml { params, pre }, cycle, |dev| {
+        let epoch = Epoch::Lsqml {
+            params,
+            pre,
+            opr: opr.map(|v| v.shape),
+        };
+        self.steady_with(epoch, cycle, |dev| {
             let ctx = dev.context();
             let l = dev
                 .lsqml
                 .as_deref_mut()
                 .expect("new_run built the LSQML state");
-            Ok(l.set_order(&ctx, &dev.kernels, &dev.views, order)?)
+            l.set_order(&ctx, &dev.kernels, &dev.views, order)?;
+            if let (Some(v), Pre::Init) = (opr, pre) {
+                l.upload_opr(&dev.stream, v)?;
+            }
+            Ok(())
         })
+    }
+
+    /// Reads the probe variation the LSQML epochs stepped back into `v`, of their shape.
+    pub fn lsqml_read_opr(&self, v: &mut OprValues) -> Result<(), EngineError> {
+        let l = (self.lsqml.as_deref()).expect("new_run built the LSQML state");
+        l.read_opr(&self.stream, v)
+    }
+
+    /// The LLK record of the current estimate under `tag` as [`crate::engine::Lsqml::llk`]
+    /// takes it: under the LSQML state's probe variation, if it has one, by an eager pass of
+    /// each frame's own probe; otherwise [`Self::llk_pass`].
+    pub fn lsqml_llk(&mut self, tag: Tag) -> Result<(), EngineError> {
+        if !self.lsqml.as_ref().is_some_and(|l| l.has_opr()) {
+            return self.llk_pass(tag);
+        }
+        let (ctx, nframe) = (self.context(), self.dims().nframe);
+        let (mut bufs, mut passes, ring) = self.lend();
+        let rec = ring.record(&ctx, tag, nframe)?;
+        let opr = bufs.lsqml.as_mut().and_then(|l| l.opr.take());
+        Ok(bufs.forward_llk(&ctx, &mut passes, rec, opr)?)
     }
 
     /// The last LSQML epoch's steps, one per batch; none before an LSQML call.
@@ -3283,7 +3321,7 @@ impl Device {
                 let (mut bufs, mut passes, ring) = self.lend();
                 ring.record(&ctx, tag, nframe)
                     .map_err(EngineError::from)
-                    .and_then(|rec| Ok(bufs.forward_llk(&ctx, &mut passes, rec)?))
+                    .and_then(|rec| Ok(bufs.forward_llk(&ctx, &mut passes, rec, None)?))
             }
             Graphs::On { llk: Some(c) } => c.replay(&mut self.ring, &ctx, nframe, tag),
             Graphs::On { llk: None } => {
@@ -3350,9 +3388,9 @@ impl Device {
                 self.build_bh(&params)?;
                 Cycle::Bh { params, cg }
             }
-            Epoch::Lsqml { params, pre } => {
-                self.build_lsqml(&params)?;
-                Cycle::Lsqml { params, pre }
+            Epoch::Lsqml { params, pre, opr } => {
+                self.build_lsqml(&params, opr)?;
+                Cycle::Lsqml { params, pre, opr }
             }
         };
         let graph = match self.graphs {
@@ -3422,8 +3460,13 @@ impl Device {
     }
 
     /// Builds the [`LsqmlState`] for `params`' batch size, the position model, refined or
-    /// held, and its sampling unless it is built, replaced as [`Self::build_bh`] replaces BH's.
-    fn build_lsqml(&mut self, params: &LsqmlParams) -> Result<(), EngineError> {
+    /// held, its sampling and the probe variation of shape `opr` unless it is built, replaced
+    /// as [`Self::build_bh`] replaces BH's.
+    fn build_lsqml(
+        &mut self,
+        params: &LsqmlParams,
+        opr: Option<OprShape>,
+    ) -> Result<(), EngineError> {
         let size = batch_frames(&self.dims(), params.batch_size);
         let reads = self.features.positioned().then_some(self.sampling);
         let [.., position] = self.features.refine();
@@ -3441,7 +3484,9 @@ impl Device {
             )?;
             self.lsqml = Some(Box::new(state));
         }
-        Ok(())
+        let l = self.lsqml.as_deref_mut().expect("built above");
+        let llk_frames = self.shared.cut.table.nf_max();
+        Ok(l.fit_opr(&self.stream, &self.kernels, &self.views, opr, llk_frames)?)
     }
 
     /// The position model's [`MovedScratch`] for a cycle that runs its own passes.
@@ -3634,7 +3679,7 @@ impl<'a> Bufs<'a> {
             Cycle::Bh { params, cg } => {
                 self.with_bh(|b, bh| b.bh_epoch(ctx, passes, bh, params, *cg))
             }
-            Cycle::Lsqml { params, pre } => self.lsqml_epoch(ctx, passes, params, *pre),
+            Cycle::Lsqml { params, pre, .. } => self.lsqml_epoch(ctx, passes, params, *pre),
         }
     }
 }
@@ -3646,7 +3691,8 @@ mod tests {
     use crate::base::required_obj_shape;
     use crate::base::{C64, Counts, Geometry, Object, Positions, Probe, Scan, Stack};
     use crate::engine::{
-        Backend, BhParams, Feature, Features, GpuPtycho, Optics, Params, Step, Wavefield,
+        Backend, BhParams, Feature, Features, GpuPtycho, Optics, Params, ProbeVariation, Step,
+        Wavefield,
     };
     use crate::live::farfield::{Ptycho, PtychoSpec, ScanPath};
 
@@ -3885,6 +3931,7 @@ mod tests {
                     cost: crate::engine::Cost::Poisson,
                     seed: 7,
                 },
+                &mut ProbeVariation::none([e.probe_dims[1], e.probe_dims[2]]),
                 1,
                 1,
             ),

@@ -1,8 +1,9 @@
 //! GPU LSQML through a multislice object against the CPU's `f64` [`Lsqml`] from the same
 //! start: two and three slices under each of the far field, the angular spectrum without and
 //! with an evanescent band and the Fresnel transform forward and back, without and with a
-//! modelled position, which moves the probe or samples the object, for both costs; and the
-//! LLK pass through the slices against the CPU's LLK of the same arrays.
+//! modelled position, which moves the probe or samples the object, for both costs, without
+//! and with a probe variation (OPR); and the LLK pass through the slices against the CPU's
+//! LLK of the same arrays.
 //! Frames are on the fused passes' smallest side, two incoherent probe modes, 30 Fermat
 //! positions in stacks of at most 8, so a batch of 12 ends in a stack of 4; 300 positions in
 //! stacks the device sizes take the waves a position recuts.
@@ -20,8 +21,11 @@ use ptyrs::engine::{
 };
 use ptyrs::gpu::FUSED_SIDES;
 
+#[path = "common/opr.rs"]
+mod opr;
 #[path = "common/worst.rs"]
 mod worst;
+use opr::{Refined, variation, variation_rel};
 use worst::worst_of;
 
 const NPOS: usize = 30;
@@ -376,11 +380,18 @@ fn offsets_rel(a: &Features, b: &Features, start: &Features) -> f64 {
     d / b.iter().map(|b| b.abs()).fold(0.0, f64::max)
 }
 
-/// After [`NEPOCH`] epochs (the preconditioner built, then updated) in batches of 12, the
-/// last epoch's steps, every slice, the probe and the offsets' changes are the CPU's, for
-/// `propagator` after each of `nslices` slices of `nobj` modes, for both costs: without and
-/// with a position entered as [`Sampling::Patch`], or with one entered as `sampling`.
-fn matches_cpu(propagator: &str, nslices: &[usize], nobj: usize, sampling: Sampling) {
+/// After [`NEPOCH`] epochs (the preconditioner built, then updated) in batches of 12, each
+/// epoch's LLK, the last epoch's steps, every slice, the probe, the offsets' and the
+/// variation's changes are the CPU's, for `propagator` after each of `nslices` slices of `nobj`
+/// modes, for both costs: without and with a position entered as [`Sampling::Patch`], or with
+/// one entered as `sampling`; the probe varied by `opr`'s eigenmodes and refined weights.
+fn matches_cpu(
+    propagator: &str,
+    nslices: &[usize],
+    nobj: usize,
+    sampling: Sampling,
+    opr: Option<(usize, Refined)>,
+) {
     const NEPOCH: usize = 2;
     // Without a position the sampling changes nothing.
     let positions: &[bool] = match sampling {
@@ -399,13 +410,18 @@ fn matches_cpu(propagator: &str, nslices: &[usize], nobj: usize, sampling: Sampl
             };
             let features = moved(position);
             let (mut objects, mut probe) = (c.objects.clone(), c.probe.clone());
-            let mut var = ProbeVariation::none(probe.plane_shape());
+            let start = match opr {
+                Some((k, refined)) => variation(&probe, NPOS, k, refined),
+                None => ProbeVariation::none(probe.plane_shape()),
+            };
+            let mut var = start.clone();
             let mut cpu = Lsqml::new(params)
                 .unwrap()
                 .with_features(features.clone())
                 .unwrap()
                 .with_sampling(sampling);
             let mut want = Vec::new();
+            let mut want_llk = Vec::new();
             for _ in 0..NEPOCH {
                 want = cpu.epoch(
                     &c.addr,
@@ -415,15 +431,24 @@ fn matches_cpu(propagator: &str, nslices: &[usize], nobj: usize, sampling: Sampl
                     &mut probe,
                     &mut var,
                 );
+                want_llk.push(cpu.llk(&c.addr, &c.obs, &c.optics, &objects, &probe, &var));
             }
             let mut gpu = c.gpu(OPTIONS);
             gpu.set_features(&features).unwrap();
             gpu.set_sampling(sampling).unwrap();
-            gpu.lsqml(&params, NEPOCH, 0).unwrap();
+            let mut gvar = start.clone();
+            gpu.lsqml(&params, &mut gvar, NEPOCH, 1).unwrap();
             let got = gpu.objects().unwrap();
             assert_eq!(got.len(), nslice);
             let slices = got.iter().zip(&objects).map(|(g, w)| rel_l2(g, w));
             let [a_far, a_probe, a_obj] = steps_rel(&gpu.lsqml_steps().unwrap(), &want);
+            let history = gpu.history();
+            assert_eq!(history.len(), NEPOCH);
+            let llk = history
+                .iter()
+                .zip(&want_llk)
+                .map(|(g, w)| llk_rel(&g.llk, w));
+            let [eigenmodes, weights, intensity] = variation_rel(&gvar, &var, &start);
             let errs = [
                 a_far,
                 a_probe,
@@ -431,19 +456,34 @@ fn matches_cpu(propagator: &str, nslices: &[usize], nobj: usize, sampling: Sampl
                 worst_of(slices),
                 rel_l2(&gpu.probe().unwrap(), &probe),
                 offsets_rel(&gpu.features().unwrap(), cpu.features(), &features),
+                worst_of(llk),
+                eigenmodes,
+                weights,
+                intensity,
             ];
             let what = format!(
                 "{propagator} {nslice} slices {nobj} modes {cost:?} position {position} \
-                 {sampling:?}"
+                 {sampling:?} opr {opr:?}"
             );
             eprintln!(
                 "{what}: a_far {:.2e} a_probe {:.2e} a_obj {:.2e} objects {:.2e} probe {:.2e} \
-                 offsets {:.2e}",
-                errs[0], errs[1], errs[2], errs[3], errs[4], errs[5]
+                 offsets {:.2e} llk {:.2e} eigenmodes {:.2e} weights {:.2e} intensity {:.2e}",
+                errs[0],
+                errs[1],
+                errs[2],
+                errs[3],
+                errs[4],
+                errs[5],
+                errs[6],
+                errs[7],
+                errs[8],
+                errs[9]
             );
-            // Each bound is 5 times the worst of the 90 runs or more: `a_far` 2.8e-5 and the
+            // Each bound is 5 times the worst of the 100 runs or more: `a_far` 2.8e-5 and the
             // offsets 1.9e-5 under the Fresnel transform back, three slices, Poisson, a position
-            // that moves the probe; of one that samples the object, `a_far` 1.2e-5 there.
+            // that moves the probe; of one that samples the object, `a_far` 1.2e-5 there; the
+            // LLK 1.4e-5 under the Fresnel transform, three slices, Poisson, a variation, where
+            // the CPU alone from its start in `f32` moves it 8.8e-7 (8e-9 without one).
             let bounds = [
                 ("a_far", 2e-4),
                 ("a_probe", 5e-5),
@@ -451,6 +491,10 @@ fn matches_cpu(propagator: &str, nslices: &[usize], nobj: usize, sampling: Sampl
                 ("objects", 2e-6),
                 ("probe", 5e-5),
                 ("offsets", 2e-4),
+                ("llk", 1e-4),
+                ("eigenmodes", 1e-4),
+                ("weights", 1e-4),
+                ("intensity", 1e-4),
             ];
             for ((name, bound), e) in bounds.into_iter().zip(errs) {
                 assert!(e < bound, "{what} {name}: {e:e}");
@@ -461,60 +505,78 @@ fn matches_cpu(propagator: &str, nslices: &[usize], nobj: usize, sampling: Sampl
 
 #[test]
 fn sliced_lsqml_matches_cpu_in_the_far_field() {
-    matches_cpu(PROPAGATORS[0], &[2, 3], 1, Sampling::Patch);
+    matches_cpu(PROPAGATORS[0], &[2, 3], 1, Sampling::Patch, None);
 }
 
 #[test]
 fn sliced_lsqml_matches_cpu_under_angular_spectrum() {
-    matches_cpu(PROPAGATORS[1], &[2, 3], 1, Sampling::Patch);
+    matches_cpu(PROPAGATORS[1], &[2, 3], 1, Sampling::Patch, None);
 }
 
 #[test]
 fn sliced_lsqml_matches_cpu_under_fresnel() {
-    matches_cpu(PROPAGATORS[2], &[2, 3], 1, Sampling::Patch);
+    matches_cpu(PROPAGATORS[2], &[2, 3], 1, Sampling::Patch, None);
 }
 
 #[test]
 fn sliced_lsqml_matches_cpu_under_fresnel_back() {
-    matches_cpu(PROPAGATORS[3], &[2, 3], 1, Sampling::Patch);
+    matches_cpu(PROPAGATORS[3], &[2, 3], 1, Sampling::Patch, None);
 }
 
 #[test]
 fn sliced_lsqml_matches_cpu_under_an_evanescent_band() {
-    matches_cpu(PROPAGATORS[4], &[2, 3], 1, Sampling::Patch);
+    matches_cpu(PROPAGATORS[4], &[2, 3], 1, Sampling::Patch, None);
 }
 
 /// Two object modes through three slices, each view's wave its own through every slice.
 #[test]
 fn sliced_lsqml_with_object_modes_matches_cpu_in_the_far_field() {
-    matches_cpu(PROPAGATORS[0], &[3], 2, Sampling::Patch);
+    matches_cpu(PROPAGATORS[0], &[3], 2, Sampling::Patch, None);
 }
 
 #[test]
 fn sliced_lsqml_with_object_modes_matches_cpu_under_angular_spectrum() {
-    matches_cpu(PROPAGATORS[1], &[3], 2, Sampling::Patch);
+    matches_cpu(PROPAGATORS[1], &[3], 2, Sampling::Patch, None);
 }
 
 #[test]
 fn sliced_lsqml_with_object_modes_matches_cpu_under_fresnel() {
-    matches_cpu(PROPAGATORS[2], &[3], 2, Sampling::Patch);
+    matches_cpu(PROPAGATORS[2], &[3], 2, Sampling::Patch, None);
 }
 
 #[test]
 fn sliced_lsqml_with_object_modes_matches_cpu_under_fresnel_back() {
-    matches_cpu(PROPAGATORS[3], &[3], 2, Sampling::Patch);
+    matches_cpu(PROPAGATORS[3], &[3], 2, Sampling::Patch, None);
 }
 
 #[test]
 fn sliced_lsqml_with_object_modes_matches_cpu_under_an_evanescent_band() {
-    matches_cpu(PROPAGATORS[4], &[3], 2, Sampling::Patch);
+    matches_cpu(PROPAGATORS[4], &[3], 2, Sampling::Patch, None);
+}
+
+/// A probe variation through two and three slices under the Fresnel transform, without and
+/// with a position that moves the probe: the eigenmodes, their weights and the main mode's
+/// refined.
+#[test]
+fn sliced_opr_lsqml_matches_cpu() {
+    let opr = Some((3, Refined::Both));
+    matches_cpu(PROPAGATORS[2], &[2, 3], 1, Sampling::Patch, opr);
+}
+
+/// A probe variation through three slices of two object modes under the angular spectrum,
+/// with a position that samples the object: the main mode's weights refined, the eigenmodes'
+/// held.
+#[test]
+fn sliced_full_object_opr_lsqml_matches_cpu() {
+    let opr = Some((2, Refined::Intensity));
+    matches_cpu(PROPAGATORS[1], &[3], 2, Sampling::FullObject, opr);
 }
 
 /// A position that samples the object: every slice's windows, under each propagator.
 #[test]
 fn sliced_full_object_lsqml_matches_cpu() {
     for propagator in PROPAGATORS {
-        matches_cpu(propagator, &[2, 3], 1, Sampling::FullObject);
+        matches_cpu(propagator, &[2, 3], 1, Sampling::FullObject, None);
     }
 }
 
@@ -522,7 +584,7 @@ fn sliced_full_object_lsqml_matches_cpu() {
 #[test]
 fn sliced_full_object_lsqml_with_object_modes_matches_cpu() {
     for propagator in PROPAGATORS {
-        matches_cpu(propagator, &[3], 2, Sampling::FullObject);
+        matches_cpu(propagator, &[3], 2, Sampling::FullObject, None);
     }
 }
 
@@ -593,7 +655,13 @@ fn llk_matches_cpu(nslices: &[usize], nobj: usize, sampling: Sampling) {
             gpu.set_features(&features).unwrap();
             gpu.set_sampling(sampling).unwrap();
             let start = gpu.llk().unwrap();
-            gpu.lsqml(&params, 2, 1).unwrap();
+            gpu.lsqml(
+                &params,
+                &mut ProbeVariation::none(c.probe.plane_shape()),
+                2,
+                1,
+            )
+            .unwrap();
             let records: Vec<Llk> = gpu.history().iter().map(|r| r.llk).collect();
             assert_eq!(records.len(), 2);
             let end = gpu.llk().unwrap();
@@ -674,13 +742,15 @@ fn bits(s: &Stack<C64>) -> Vec<[u64; 2]> {
         .collect()
 }
 
-/// Three slices with a position leave the same bits from graphs and eagerly, in batches
-/// whose last stack is short (12 in stacks of 8) and whose every stack is (4 in stacks of 8).
+/// Three slices with a position, without and with a probe variation, leave the same bits from
+/// graphs and eagerly, in batches whose last stack is short (12 in stacks of 8) and whose
+/// every stack is (4 in stacks of 8).
 #[test]
 fn sliced_lsqml_is_bit_identical_with_graphs_and_without() {
     let c = case(optics("angular spectrum", 3), NPOS, 1);
     let features = moved(true);
-    for batch_size in [12, 4] {
+    let opr = [None, Some((3, Refined::Weights))];
+    for (opr, batch_size) in opr.into_iter().flat_map(|o| [12, 4].map(|b| (o, b))) {
         let params = LsqmlParams {
             batch_size,
             cost: Cost::Poisson,
@@ -689,7 +759,11 @@ fn sliced_lsqml_is_bit_identical_with_graphs_and_without() {
         let run = |graph| {
             let mut g = c.gpu(GpuOptions { graph, ..OPTIONS });
             g.set_features(&features).unwrap();
-            g.lsqml(&params, 3, 0).unwrap();
+            let mut var = match opr {
+                Some((k, refined)) => variation(&c.probe, NPOS, k, refined),
+                None => ProbeVariation::none(c.probe.plane_shape()),
+            };
+            g.lsqml(&params, &mut var, 3, 0).unwrap();
             let f64s = |v: &[f64]| v.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
             let steps: Vec<_> = g
                 .lsqml_steps()
@@ -702,13 +776,15 @@ fn sliced_lsqml_is_bit_identical_with_graphs_and_without() {
                 .collect();
             let objects: Vec<_> = g.objects().unwrap().iter().map(|o| bits(o)).collect();
             let offsets = f64s(&g.features().unwrap().position.unwrap().values.concat());
-            (steps, objects, bits(&g.probe().unwrap()), offsets)
+            (steps, objects, bits(&g.probe().unwrap()), offsets, var)
         };
         let (graphs, eager) = (run(true), run(false));
-        assert!(graphs.0 == eager.0, "batch {batch_size}: steps differ");
-        assert!(graphs.1 == eager.1, "batch {batch_size}: objects differ");
-        assert!(graphs.2 == eager.2, "batch {batch_size}: probe differs");
-        assert!(graphs.3 == eager.3, "batch {batch_size}: offsets differ");
+        let what = format!("batch {batch_size} opr {opr:?}");
+        assert!(graphs.0 == eager.0, "{what}: steps differ");
+        assert!(graphs.1 == eager.1, "{what}: objects differ");
+        assert!(graphs.2 == eager.2, "{what}: probe differs");
+        assert!(graphs.3 == eager.3, "{what}: offsets differ");
+        assert!(graphs.4 == eager.4, "{what}: variation differs");
     }
 }
 
@@ -740,7 +816,13 @@ fn sliced_llk_follows_the_stacks_a_position_recuts() {
     let mut gpu = c.gpu(options);
     gpu.set_features(&features).unwrap();
     let start = gpu.llk().unwrap();
-    gpu.lsqml(&params, 1, 0).unwrap();
+    gpu.lsqml(
+        &params,
+        &mut ProbeVariation::none(c.probe.plane_shape()),
+        1,
+        0,
+    )
+    .unwrap();
     let (objects, probe) = (gpu.objects().unwrap(), gpu.probe().unwrap());
     let offsets = gpu.features().unwrap().position.unwrap().values;
     let stepped = gpu.llk().unwrap();

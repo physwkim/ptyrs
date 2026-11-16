@@ -68,6 +68,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if gpu { "gpu" } else { "cpu" }
     );
     let at = Ptycho::new(&scan, object.clone(), probe.clone())?;
+    let none = ProbeVariation::none(probe.plane_shape());
     let mut curve = vec![kinds(&at.llk())];
     print_epoch(0, &curve[0]);
     let mut ms = None;
@@ -79,12 +80,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         let mut g = GpuPtycho::new(&ctx, &scan, object.clone(), probe.clone(), options)?;
         let t = Instant::now();
-        g.lsqml(&params, WARMUP, 0)?;
+        g.lsqml(&params, &mut none.clone(), WARMUP, 0)?;
         g.synchronize()?;
         let warm = t.elapsed().as_secs_f64();
         let mut g = GpuPtycho::new(&ctx, &scan, object.clone(), probe.clone(), options)?;
         let t = Instant::now();
-        g.lsqml(&params, nepoch, 0)?;
+        g.lsqml(&params, &mut none.clone(), nepoch, 0)?;
         g.synchronize()?;
         let per = 1e3 * t.elapsed().as_secs_f64() / nepoch as f64;
         println!(
@@ -94,7 +95,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ms = Some(per);
 
         let mut g = GpuPtycho::new(&ctx, &scan, object, probe, options)?;
-        g.lsqml(&params, nepoch, 1)?;
+        g.lsqml(&params, &mut none.clone(), nepoch, 1)?;
         for (e, r) in g.history().iter().enumerate() {
             curve.push(kinds(&r.llk));
             print_epoch(e + 1, &curve[e + 1]);

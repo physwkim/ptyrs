@@ -18,14 +18,14 @@ use std::time::Instant;
 use cuda_core::CudaContext;
 use ptyrs::engine::{
     ApParams, BhParams, Cost, DmParams, EngineError, Feature, Features, GpuOptions, GpuPtycho,
-    LsqmlParams, MlParams, RaarParams,
+    LsqmlParams, MlParams, ProbeVariation, RaarParams,
 };
 use ptyrs::io::{read_cxi, read_modes};
 
 const WARMUP: usize = 5;
 const BATCH: usize = 96;
 
-fn cycles(g: &mut GpuPtycho, algo: &str, n: usize) -> Result<(), EngineError> {
+fn cycles(g: &mut GpuPtycho, algo: &str, plane: [usize; 2], n: usize) -> Result<(), EngineError> {
     match algo {
         "ap" => g.ap(
             &ApParams {
@@ -77,6 +77,7 @@ fn cycles(g: &mut GpuPtycho, algo: &str, n: usize) -> Result<(), EngineError> {
                 cost: Cost::Poisson,
                 seed: 7,
             },
+            &mut ProbeVariation::none(plane),
             n,
             0,
         ),
@@ -125,12 +126,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                     ..Features::default()
                 })?;
             }
-            cycles(&mut g, algo, WARMUP)?;
+            cycles(&mut g, algo, probe.plane_shape(), WARMUP)?;
             g.synchronize()?;
             let mut ms = Vec::new();
             for _ in 0..repeats {
                 let t = Instant::now();
-                cycles(&mut g, algo, ncycle)?;
+                cycles(&mut g, algo, probe.plane_shape(), ncycle)?;
                 g.synchronize()?;
                 ms.push(1e3 * t.elapsed().as_secs_f64() / ncycle as f64);
             }

@@ -140,6 +140,15 @@ pub enum SliceSource<'a> {
     Waves(FrameWaves<'a>),
 }
 
+impl<'a> From<FrameProbe<'a>> for SliceSource<'a> {
+    fn from(probe: FrameProbe<'a>) -> Self {
+        match probe {
+            FrameProbe::Shared(p) => Self::Probe(p),
+            FrameProbe::Own(p, own) => Self::OwnProbe(p, own),
+        }
+    }
+}
+
 impl<'a> SliceSource<'a> {
     /// The source as a kernel reads it for the frames of `stack` and the buffers it
     /// addresses, checked to hold `stack`'s `nf_max` frames under `d`.

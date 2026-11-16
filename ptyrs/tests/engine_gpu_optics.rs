@@ -360,7 +360,8 @@ fn gpu_lsqml_matches_cpu_under_every_propagator() {
                 ..Features::default()
             };
             let (mut objects, mut probe) = (c.objects.clone(), c.probe.clone());
-            let mut var = ProbeVariation::none(probe.plane_shape());
+            let none = ProbeVariation::none(probe.plane_shape());
+            let mut var = none.clone();
             let mut cpu = Lsqml::new(params)
                 .unwrap()
                 .with_features(features.clone())
@@ -385,7 +386,7 @@ fn gpu_lsqml_matches_cpu_under_every_propagator() {
                     let mut gpu = c.gpu(&c.optics, options).unwrap();
                     gpu.set_features(&features).unwrap();
                     gpu.set_sampling(sampling).unwrap();
-                    gpu.lsqml(&params, epoch + 1, 0).unwrap();
+                    gpu.lsqml(&params, &mut none.clone(), epoch + 1, 0).unwrap();
                     steps = worst_of([steps, steps_rel(&gpu.lsqml_steps().unwrap(), &want)]);
                 }
             }
@@ -393,7 +394,7 @@ fn gpu_lsqml_matches_cpu_under_every_propagator() {
             let mut gpu = c.gpu(&c.optics, OPTIONS).unwrap();
             gpu.set_features(&features).unwrap();
             gpu.set_sampling(sampling).unwrap();
-            gpu.lsqml(&params, NEPOCH, 1).unwrap();
+            gpu.lsqml(&params, &mut none.clone(), NEPOCH, 1).unwrap();
             // The CPU's LLK here is the unmoved probe's.
             let llk = if features.position.is_some() {
                 0.0
