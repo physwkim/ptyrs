@@ -14,7 +14,9 @@
 use std::time::Instant;
 
 use cuda_core::CudaContext;
-use ptyrs::engine::{BhParams, Cost, EngineError, GpuOptions, GpuPtycho, LsqmlParams};
+use ptyrs::engine::{
+    BhParams, Cost, EngineError, GpuOptions, GpuPtycho, LsqmlParams, ProbeVariation,
+};
 
 #[link(name = "cuda")]
 unsafe extern "C" {
@@ -36,9 +38,10 @@ impl Algo {
         }
     }
 
-    fn run(&self, g: &mut GpuPtycho, nepoch: usize) -> Result<(), EngineError> {
+    /// `plane` is the probe's.
+    fn run(&self, g: &mut GpuPtycho, plane: [usize; 2], nepoch: usize) -> Result<(), EngineError> {
         match self {
-            Self::Lsqml(p) => g.lsqml(p, nepoch, 0)?,
+            Self::Lsqml(p) => g.lsqml(p, &mut ProbeVariation::none(plane), nepoch, 0)?,
             Self::Bh(p) => g.bh(p, nepoch, 0)?,
         }
         g.synchronize()
@@ -85,6 +88,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let scan = ptyrs::io::read_cxi(cxi)?;
     let (object, probe) = ptyrs::io::read_modes(init)?;
+    let plane = probe.plane_shape();
     let ctx = CudaContext::new(0).map_err(EngineError::from)?;
     let options = GpuOptions {
         stack_size: Some(stack_size),
@@ -95,7 +99,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("setup_s {}", start.elapsed().as_secs_f64());
 
     let t = Instant::now();
-    algo.run(&mut g, algo.warmup())?;
+    algo.run(&mut g, plane, algo.warmup())?;
     println!(
         "warmup_s {} epochs {}",
         t.elapsed().as_secs_f64(),
@@ -103,13 +107,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     for n in calls {
         let t = Instant::now();
-        algo.run(&mut g, n)?;
+        algo.run(&mut g, plane, n)?;
         println!("call_s {} epochs {n}", t.elapsed().as_secs_f64());
     }
     if nprof > 0 {
         // SAFETY: plain driver calls on the current context; an error only means no profiler.
         unsafe { cuProfilerStart() };
-        algo.run(&mut g, nprof)?;
+        algo.run(&mut g, plane, nprof)?;
         // SAFETY: as above.
         unsafe { cuProfilerStop() };
         println!("profiled epochs {nprof}");
