@@ -12,7 +12,6 @@ pub mod data;
 pub mod dip;
 mod grid;
 pub mod interop;
-pub mod live;
 pub mod metric;
 pub mod norm_relu;
 pub mod predictor;

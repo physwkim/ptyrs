@@ -177,7 +177,7 @@ d90c553부터 1장이 0.5 ms 느려진 것은 77287b3의 `fused_cols_256`이 스
 - 입력 경로: 프레임은 압축된 채로 받고(areaDetector NDCodec, Eiger 스트림의 bslz4·lz4), Rust 작업 스레드들이 해제 → 위치 매칭(트리거 카운트, APS 방식) → 크롭 → u16 변환을 해 pinned 링버퍼에 바로 씁니다. 프레임 수에 비례해 도는 Python 코드가 없습니다.
 - 물체 버퍼는 VMM으로 큰 가상 주소를 먼저 예약하고, 스캔 계획 범위의 물리 메모리는 첫 프레임 전에 매핑합니다(M5 측정: 3.9 GB 물체에 약 0.5초). 스캔이 계획 밖의 새 영역에 닿을 때만 매핑 스레드가 물리 메모리를 추가 매핑합니다. 스캔 중 매핑은 드라이버 잠금으로 재구성 스레드를 멈추게 할 수 있기 때문입니다(M5 측정: 1e6 프레임 스캔에서 최대 230 ms). PtyPy는 새 데이터마다 물체·프로브를 통째로 재업로드하는데, ptyrs는 기존 메모리를 건드리지 않습니다.
 - 새 프레임은 주소표와 공간 bin에 추가만 되고, graph는 다시 캡처하지 않습니다(B2).
-- 스캔이 새로 닿은 물체 영역의 초기값은 평평한 값이 기본이고, 선택 기능으로 ptyrs-nn의 신경망 예측(PtychoNN 방식)으로 채웁니다. 예측은 출발점일 뿐이고 최종 값은 반복 재구성이 정합니다.
+- 스캔이 새로 닿은 물체 영역은 평평한 초기값에서 출발합니다. 그 영역을 신경망 예측(PtychoNN 방식)으로 채우는 라이브 기능은 만들어 측정한 뒤 지웠습니다(2026-11-16). 3 kHz 단일 GPU 측정에서 채운 실행은 GPU2 시간 측정 4회와 GPU1 ABBA 4회 모두 스캔 후 1000 에폭 안에 오프라인 결과와의 FRC가 가장 낮은 고리에서 0.99에 닿지 못했고(마지막 0.951–0.978), 채우지 않은 실행은 20–140 에폭에 닿았습니다. 프레임 하나씩 예측한 조각을 이미 있는 물체에 위상을 맞추지 않고 써서 스캔 크기의 위상 오차가 생깁니다. 참 물체 대비 저주파 위상 RMS가 스캔 후 5 에폭에 0.179 rad(채우지 않으면 0.049), 1000 에폭에 0.106 rad(0.026)였습니다. 예측의 세부만 쓰고 물체의 넓은 위상을 지키는 변형도 같은 비용의 대조군보다 나빴습니다(5 에폭 0.215 대 0.178 rad). 예측이 재구성과 GPU를 나눠 써 스캔 중 에폭도 약 3분의 1 줄었습니다(192 대 292). 신경망 예측은 오프라인 출발점으로 남습니다(§4 신경망 경계).
 - 출력: 재구성 물체(위상/진폭 미리보기)·프로브·LLK를 PVA PV(NTNDArray)로 게시 → Phoebus, ImageJ EPICS NTNDArray 뷰어, Ptychodus(pvaPy), Bluesky, 피드백 루프가 그대로 구독합니다.
 - 차별점: 측정 중 재구성과 PVA 입력 자체는 이미 있습니다(§2). ptyrs의 차이는 (1) 신경망 추정이 아니라 정식 반복 재구성이 검출기 속도를 따라가는 것, (2) Python 없는 단일 바이너리 상시 서비스라 IOC처럼 운영할 수 있는 것입니다.
 
@@ -220,7 +220,7 @@ ptyrs/                  작업공간: 패키지 3개
 │   ├── src/io      CXI/HDF5 입출력(PyNX CXI 배치와 호환), PtyPy .ptyr 읽기
 │   ├── src/live    PVA / ZMQ / SWMR 입력(해제·위치 매칭·크롭 작업 스레드 → pinned 링버퍼), VMM 성장형 물체, PV 출력.
 │   │               바이너리 pty-recv, pty-sim은 src/bin
-│   ├── src/nn      (선택, feature `nn`일 때만 burn 빌드) burn 신경망: 라이브 초기값 예측, DIP·PINN.
+│   ├── src/nn      (선택, feature `nn`일 때만 burn 빌드) burn 신경망: 오프라인 초기값 예측, DIP·PINN.
 │   │               본체와는 배열·기울기 전달로만 연결
 │   ├── src/refgen  M3 참조 데이터셋 시뮬레이션(위치 오차, 세기 변화, 배경, 플라이 스캔, OPR)
 │   └── src/main.rs 단일 바이너리 ptyrs(옛 ptyrs-cli), TOML 설정
@@ -258,7 +258,7 @@ M6 측정(GPU2, 스택 16): 물체 갱신은 Tile 24–26 µs, SIMT 10–11 µs�
 
 ### 신경망 경계 (ptyrs::nn)
 
-- 예측: 새 프레임 묶음 → burn CNN → 물체 조각 → 해당 영역 초기값. 프레임 묶음마다 한 번 넘깁니다.
+- 예측: 스캔의 프레임 → burn CNN → 프레임마다 물체 조각 → 이어 붙인 출발 물체(`Predictor::initial_object`). 재구성 전에 한 번 넘기며, 라이브 재구성은 쓰지 않습니다(§3 B6).
 - 학습(DIP·PINN): 신경망이 물체를 진폭·위상(실수)으로 출력 → ptyrs 순·역방향 연산자로 물체 기울기 g 계산 → burn에서 손실을 ⟨출력, g⟩(g는 상수 취급)로 두고 역전파하면 신경망 가중치의 기울기가 정확히 나옵니다. burn에 복소수·FFT가 필요 없습니다.
 - DIP·PINN 모드는 반복마다 경계를 건너므로, 에폭 단위 graph(불변식 1)는 ptyrs 쪽 구간에만 적용됩니다.
 - 메모리는 burn → cuda-rust 방향만 복사 없이 넘어갑니다(`ptyrs/src/nn/interop.rs`). burn 텐서의 버퍼는 `lend`가 cuda-rust `DeviceBuffer<f32>`로 그대로 빌려줍니다. 반대 방향은 안 됩니다. cubecl CUDA 저장소는 자기가 할당한 포인터만 내주고 해제하며(cubecl-cuda 0.11.4 `compute/storage/gpu.rs:232`, 표에 넣는 곳이 `alloc` 하나), 외부 포인터를 받아들이는 API가 없습니다. 그래서 엔진이 가진 버퍼는 `copy_in`이 장치 간 복사 한 번으로 새 burn 텐서에 옮기며, 크기는 프레임 묶음 또는 물체 배열 하나입니다. 경계 버퍼를 burn이 가지면 복사가 없습니다. `ptyrs/tests/nn_interop.rs`의 `lend_aliases_burn_memory`(빌린 버퍼에 cuda-rust가 쓴 값이 burn 텐서에 보임)와 `copy_in_copies_engine_memory`(뒤이은 엔진 쓰기가 burn 텐서를 바꾸지 않음)가 두 방향을 확인합니다.
@@ -321,7 +321,7 @@ M6 측정(GPU2, 스택 16): 물체 갱신은 Tile 24–26 µs, SIMT 10–11 µs�
 | M3 2차 방법·X선 필수 기능 | ML-CG, LSQML, BH-CG, 위치 보정, 프로브 모드, OPR, 플라이 스캔, 강도 변동, 배경 | pty-chi LSQML/BH와 LLK 곡선 비교, 목표 LLK 도달 시간 측정. 최적 배치 크기 측정 |
 | M4 멀티 GPU | 공간 분할 + P2P halo(라이브 띠·부채꼴 분할 포함), 각도 병렬 ptycho-tomography | 1→2→4 GPU 강확장 효율. 1·2·4 GPU 결과 비트 일치. 라이브 분할에서 측정 중 GPU별 새 프레임 수 차이. 4장 초당 프레임-반복을 A100 또는 H100 1장 위 PyNX·pty-chi와 비교(§0 접는 조건 3) |
 | M5 라이브 | PVA/ZMQ 입력, VMM 성장형 물체, PV 출력 | 시뮬레이터 3 kHz 스트림(256², 모드 2개)을 프레임 손실 없이 따라잡으며 재구성, 측정 중 graph 재캡처 0회. 스캔 종료부터 수렴 결과(같은 알고리즘 오프라인 결과와 FRC 일치)까지 시간 — 대표 수치(§0 접는 조건 4) |
-| M6 확장 | 다층(multislice), 근접장, PyO3(검증용), Tile 전환(§4 커널 배치의 Tile 후보), 신경망 연동(ptyrs-nn: 라이브 초기값 예측, DIP) | 기능별 기존 패키지 대비 비교. Tile 전환 커널은 SIMT 판과 허용오차 내 일치, 반복당 시간 같거나 짧음, 에폭이 graph 1개로 캡처됨. 예측 초기값 출발 시 평평한 초기값 대비 목표 LLK 도달 반복 수 비교. DIP 기울기 전달은 유한차분과 일치 |
+| M6 확장 | 다층(multislice), 근접장, PyO3(검증용), Tile 전환(§4 커널 배치의 Tile 후보), 신경망 연동(ptyrs-nn: 오프라인 초기값 예측, DIP) | 기능별 기존 패키지 대비 비교. Tile 전환 커널은 SIMT 판과 허용오차 내 일치, 반복당 시간 같거나 짧음, 에폭이 graph 1개로 캡처됨. 예측 초기값 출발 시 평평한 초기값 대비 목표 LLK 도달 반복 수 비교. DIP 기울기 전달은 유한차분과 일치 |
 
 M6 다층·근접장 비교(CPU f64 엔진 대 pty-chi LSQML Poisson f64, 같은 시작값과 배치 순서: 24² 프로브 모드 2, 40² 물체, 프레임 16장, 배치 8, 30 에폭): 근접장은 angular spectrum(λ 0.1 nm, 화소 50 nm, 0.5 mm)과 Fresnel 변환(2 mm) 두 경우에서 에폭별 LLK의 상대오차가 최대 1.2e-15, 최종 물체·프로브가 최대 1.9e-14이고 참값 LLK에 닿는 에폭(29, 23)도 같습니다(`refs/f64/lsqml_near.py`, `ptyrs/tests/engine_lsqml_near.rs`; BH는 `engine_bh_near.rs`에서 2 에폭 스텝마다 1e-13 이내). 다층(3층, 간격 40·60 µm, pty-chi `multislice_solve_obj_prb_step_size_jointly=True`)은 출구 전파가 angular spectrum·Fresnel·원거리인 세 경우에서 에폭별 LLK 최대 5.3e-15, 최종 물체·프로브 최대 5.0e-14이고 참값 도달 에폭(23, 16, 15)이 같습니다(`refs/f64/lsqml_multislice.py`, `ptyrs/tests/engine_lsqml_multislice.rs`). 최종 배열이 이만큼 같아 FRC는 따로 재지 않았습니다. GPU 목표 도달 시간(ptyrs GPU f32 graph 대 pty-chi GPU f32, 256² 프로브 모드 2, 840² 물체, 프레임 225장, Poisson, 참값 LLK의 1.01배, LLK 계산과 양쪽 첫 실행의 준비 시간 제외, GPU2 부하 평균 35–94): 다층(3층, 이차 위상 없는 Fourier 원거리 출구)은 양쪽 모두 배치 64가 가장 빨라 ptyrs 289 에폭 4.82 s(16.7 ms/에폭), pty-chi 288 에폭 45.9 s(159 ms/에폭)로 약 9.5배이고 배치 32 이하는 목표에 닿지 않습니다(ptyrs 2000 에폭, pty-chi 300–400 에폭까지). 근접장(angular spectrum 0.5 mm)은 배치 64에서 양쪽 모두 3 에폭에 닿아 ptyrs 0.020 s(6.7 ms/에폭), pty-chi 0.27–0.30 s(76–83 ms/에폭)로 13–15배이며, pty-chi는 프로세스의 첫 에폭에 0.8–1.0 s가 더 듭니다(`ptyrs/examples/engine_optics_target.rs`, `refs/ptychi/run_optics_target.py`).
 

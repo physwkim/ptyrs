@@ -6,19 +6,13 @@ use std::path::{Path, PathBuf};
 use burn::prelude::*;
 use burn::tensor::DType;
 use ptyrs::base::{AddrTable, Geometry, Object, Probe, Scan, required_obj_shape, sim};
-use ptyrs::live::fill::PatchPredictor;
 use ptyrs::nn::NnError;
 use ptyrs::nn::data::random_object;
-use ptyrs::nn::live::LivePredictor;
 use ptyrs::nn::predictor::{
     Input, Predictor, PredictorConfig, Samples, TrainOptions, mean_frame_total, object_patches,
     train,
 };
 use ptyrs::nn::ptychonn::PtychoNN;
-
-#[path = "common/worst.rs"]
-mod worst;
-use worst::worst_of;
 
 const FRAME: usize = 64;
 
@@ -147,30 +141,6 @@ fn trained_predictor_keeps_its_fit_at_inference_and_after_reload() {
     let back = Predictor::load(&dir, &device).unwrap();
     assert_eq!(back.config().frame, config.frame);
     assert_eq!(back.predict(&scan.counts, norm).unwrap(), patches);
-
-    // The live adaptor gives the same patches as [re, im] whichever batch a frame lands in:
-    // the second half of the scan first. Its batch is the scan, so that it runs the kernels
-    // `predict` was tuned to.
-    let mut live = LivePredictor::new(back, norm, patches.len()).unwrap();
-    assert_eq!(live.patch(), config.patch());
-    let (fsz, plane) = (FRAME * FRAME, patches.dims()[1] * patches.dims()[2]);
-    let half = patches.len() / 2;
-    let raw = scan.counts.as_slice();
-    let mut out = vec![[0.0f32; 2]; patches.amp().len()];
-    let (first, second) = out.split_at_mut(half * plane);
-    live.predict(&raw[half * fsz..], [FRAME, FRAME], second)
-        .unwrap();
-    live.predict(&raw[..half * fsz], [FRAME, FRAME], first)
-        .unwrap();
-    for (i, o) in out.iter().enumerate() {
-        let (a, p) = (patches.amp()[i], patches.phase()[i]);
-        let d = worst_of([o[0] - a * p.cos(), o[1] - a * p.sin()].map(|e| f64::from(e.abs())));
-        assert!(d < 1e-4, "value {i}: {o:?} vs {a} at {p}");
-    }
-    assert!(live.predict(raw, [FRAME, FRAME], &mut out[1..]).is_err());
-    let over = [raw, &raw[..fsz]].concat();
-    let mut out = vec![[0.0f32; 2]; patches.amp().len() + plane];
-    assert!(live.predict(&over, [FRAME, FRAME], &mut out).is_err());
 }
 
 #[test]

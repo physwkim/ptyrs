@@ -1026,10 +1026,6 @@ impl Predictor {
         &self.config
     }
 
-    pub(crate) fn frame(&self) -> Frame {
-        self.frame
-    }
-
     fn device(&self) -> Device {
         self.model.devices()[0].clone()
     }
