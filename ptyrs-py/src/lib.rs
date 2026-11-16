@@ -64,7 +64,7 @@ impl<'py> Kwargs<'py> {
         if let Some(d) = &self.0
             && let Some(v) = d.get_item(key)?
         {
-            *field = v.extract()?;
+            *field = v.extract().map_err(|e| keyword_error(d.py(), key, e))?;
             d.del_item(key)?;
         }
         Ok(())
@@ -78,6 +78,20 @@ impl<'py> Kwargs<'py> {
             ))),
             _ => Ok(()),
         }
+    }
+}
+
+/// `e`, raised by the value of keyword `key`, as an exception of `e`'s type whose message names
+/// `key`, with `e` as its `__cause__`. A type that cannot be built from one message raises `e`.
+fn keyword_error(py: Python<'_>, key: &str, e: PyErr) -> PyErr {
+    let message = format!("keyword '{key}': {}", e.value(py));
+    match e.get_type(py).call1((message,)) {
+        Ok(named) => {
+            let named = PyErr::from_value(named);
+            named.set_cause(py, Some(e));
+            named
+        }
+        Err(_) => e,
     }
 }
 
