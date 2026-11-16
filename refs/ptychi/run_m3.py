@@ -6,6 +6,8 @@
     run_m3.py features --batch B --bh-rho R [--only ...] [--algo A]
                                                            one run per feature and algorithm
     run_m3.py one FEATURE ALGO [--set PATH=JSON ...]       trial run into out/scratch/
+    run_m3.py bench ALGO BATCH [--noise N] [--rho R] [--epochs E] [--profile E,...]
+                                                           setup and epoch times, fermat_clean
 
 Run as CUDA_VISIBLE_DEVICES=GPU-<uuid> micromamba run -n ptyrs-ref python refs/ptychi/run_m3.py
 ...; select the GPU by UUID, since CUDA indices shift when a GPU drops off the bus.
@@ -29,6 +31,7 @@ import platform
 import subprocess
 import sys
 import threading
+import time
 
 import numpy as np
 import torch
@@ -291,6 +294,30 @@ def run(run_name, dataset, algo, batch, epochs, **kw):
     return result
 
 
+def bench(algo, batch, epochs, profile, **kw):
+    """One fermat_clean run for the comparison with ptyrs' engine_m3_bench: `setup_s` from after
+    the imports to the start of epoch 1 (reading the files, then the task on the GPU,
+    synchronised), then each epoch's synchronised wall time, one task.run each with no
+    evaluate(). Each epoch in `profile` runs in its own cudaProfilerStart/Stop range, for ncu
+    --profile-from-start off --replay-mode app-range."""
+    import pynx.ptycho.ptycho  # noqa: F401  Dataset's position preprocessing, an import
+
+    t = time.perf_counter()
+    task, _ = build_task(m3ref.Dataset("fermat_clean"), algo, batch, **kw)
+    torch.cuda.synchronize()
+    print(f"setup_s {time.perf_counter() - t}", flush=True)
+    for ep in range(1, epochs + 1):
+        if ep in profile:
+            torch.cuda.profiler.start()
+        t = time.perf_counter()
+        task.run(n_epochs=1)
+        torch.cuda.synchronize()
+        wall = time.perf_counter() - t
+        if ep in profile:
+            torch.cuda.profiler.stop()
+        print(f"epoch {ep} {wall}", flush=True)
+
+
 def main():
     logging.getLogger().setLevel(logging.WARNING)
     ap = argparse.ArgumentParser()
@@ -320,6 +347,13 @@ def main():
     one.add_argument("--noise", default="gaussian")
     one.add_argument("--set", action="append", default=[], metavar="PATH=JSON",
                      help="option override, e.g. probe_options.rho=0.01")
+    c = sub.add_parser("bench")
+    c.add_argument("algo", choices=("lsqml", "bh_cg", "bh_gd"))
+    c.add_argument("batch", type=int)
+    c.add_argument("--noise", default="gaussian", choices=("poisson", "gaussian"))
+    c.add_argument("--rho", type=float, default=None, help="BH probe rho, required for BH")
+    c.add_argument("--epochs", type=int, default=20)
+    c.add_argument("--profile", default="", help="epochs to profile, e.g. 5,6,7")
     a = ap.parse_args()
 
     if a.cmd == "sweep":
@@ -347,6 +381,14 @@ def main():
                 else:
                     run(f"{name}_bh_cg", dataset, algo, bh_batch, a.epochs,
                         overrides={"probe_options.rho": a.bh_rho}, **spec)
+    elif a.cmd == "bench":
+        if a.algo == "lsqml":
+            kw = dict(noise=a.noise)
+        elif a.rho is None:
+            ap.error("BH needs --rho")
+        else:
+            kw = dict(overrides={"probe_options.rho": a.rho})
+        bench(a.algo, a.batch, a.epochs, {int(e) for e in a.profile.split(",") if e}, **kw)
     else:
         spec = dict(FEATURES[a.feature])
         dataset = spec.pop("dataset")
