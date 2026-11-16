@@ -50,12 +50,12 @@ pub use bh::{
     BhLastSlice, BhMovedFarRef, BhMovedRef, BhMovesRef, BhNearMut, BhOffsets, BhParts, BhPositions,
     BhScan, BhSecondRef, BhTangentsMut, BhVar, BhWinRef, BhWinSecond, EpochOrder,
 };
-pub(crate) use fused::Shape;
 pub use fused::{
     BackgroundSums, Exit, FUSED_SIDES, FarSums, FrameMoves, FusedBufs, FusedInputs, FusedSums,
     Model, OwnSpectrumBuf, ProbeSpectrum, PsiSums, Shift, ShiftProbe, ShiftSums, ShiftedNumSums,
     ShiftedProbes, ShiftedStepSums, ShiftedSums, SpectrumBuf,
 };
+pub(crate) use fused::{GRID_Y_MAX, Shape};
 pub use grad::{
     CG_BLOCKS, GAMMA_CHUNK, GammaCounts, GammaStacks, GradKernels, ObjProbeScale, StackWindows,
     gamma_parts,

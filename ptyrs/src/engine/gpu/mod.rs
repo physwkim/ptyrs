@@ -43,8 +43,8 @@ use crate::base::{AddrTable, C64, Frame, Object, Probe, Scan, Stack};
 use crate::fault;
 use crate::fft::Plan2d;
 use crate::gpu::{
-    C32, CG_BLOCKS, Error as GpuError, FarSums, FusedBufs, FusedInputs, Model, ObjProbeScale,
-    OprShape, RecordWriter, StackRef, StackTable, ViewAddr, ViewDims, Waves,
+    C32, CG_BLOCKS, Error as GpuError, FarSums, FusedBufs, FusedInputs, GRID_Y_MAX, Model,
+    ObjProbeScale, OprShape, RecordWriter, StackRef, StackTable, ViewAddr, ViewDims, Waves,
 };
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
@@ -65,14 +65,15 @@ pub struct GpuOptions {
     /// each pass cuts the scan, BH and LSQML each batch, into as few stacks as that takes, of
     /// lengths within a frame of each other; PyNX's default is 16. [`GpuPtycho::new`] refuses a
     /// size whose stack, or the scan if it has fewer frames, holds more exit-wave values than
-    /// u32 indexes. `None`, the default, cuts each
-    /// pass by bytes instead: as many frames as fill 3/8 of the device's L2, the fastest share at
-    /// frame sides 256 and 512, with the most bytes that the launches over a stack leave in L2
-    /// for later ones at any one point, but no fewer than keep the device's threads busy, ~3.4
-    /// pixels each. That is the shared scratch alone in AP, the LLK pass and ML's gradient, and
-    /// with it DM's and RAAR's carried exit waves (RAAR's iterate, touched once, streams); ML's
-    /// line search, BH and LSQML count their own buffers, and under the position model BH and
-    /// LSQML the shift planes they borrow from the shared scratch, whose stacks also cap theirs.
+    /// u32 indexes or more views than a launch's grid y takes, 65535. `None`, the default, cuts
+    /// each pass by bytes instead: as many frames as fill 3/8 of the device's L2, the fastest
+    /// share at frame sides 256 and 512, with the most bytes that the launches over a stack
+    /// leave in L2 for later ones at any one point, but no fewer than keep the device's threads
+    /// busy, ~3.4 pixels each. That is the shared scratch alone in AP, the LLK pass and ML's
+    /// gradient, and with it DM's and RAAR's carried exit waves (RAAR's iterate, touched once,
+    /// streams); ML's line search, BH and LSQML count their own buffers, and under the position
+    /// model BH and LSQML the shift planes they borrow from the shared scratch, whose stacks
+    /// also cap theirs.
     pub stack_size: Option<usize>,
     /// Replay every AP, DM and ML cycle, rPIE epoch and LLK pass from a CUDA graph captured once
     /// per kind of cycle instead of launching it kernel by kernel; both give the same bits.
@@ -304,9 +305,25 @@ fn table_of(
     Ok((frames, table))
 }
 
-/// The values of a stack of `nf` frames' exit waves.
+/// The values of a stack of `nf` frames' exit waves, refused past [`stack_frames`].
 fn stack_len(dims: &ViewDims, nf: usize) -> Result<u32, EngineError> {
-    to_u32("stack length", nf * dims.nmode as usize * plane_len(dims))
+    let most = stack_frames(dims);
+    if nf > most {
+        let [ny, nx] = dims.frame;
+        return Err(EngineError::Invalid(format!(
+            "a stack of {nf} frames of {} views {ny}x{nx}: at most {most}",
+            dims.nmode
+        )));
+    }
+    Ok((nf * dims.nmode as usize * plane_len(dims)) as u32)
+}
+
+/// The most frames a stack may hold: those whose exit waves u32 indexes, and whose views fit a
+/// launch's grid y, where the fused row passes and rPIE's power max put each frame's `nmode`,
+/// the most planes per frame of any launch.
+fn stack_frames(dims: &ViewDims) -> usize {
+    let nmode = dims.nmode as usize;
+    (u32::MAX as usize / (nmode * plane_len(dims))).min(GRID_Y_MAX as usize / nmode)
 }
 
 /// A batch's frames, `batch_size` but at most the scan's, as the CPU's batches take them;
@@ -400,8 +417,7 @@ struct StackRule {
     budget: usize,
     /// The fewest frames per stack that keep the device's threads busy.
     floor: usize,
-    /// The most frames per stack: the scan's, at most those whose exit waves [`stack_len`]
-    /// indexes.
+    /// The most frames per stack: the scan's, at most [`stack_frames`].
     most: u32,
 }
 
@@ -415,7 +431,7 @@ impl StackRule {
 
     /// For `size` on a device of an `l2`-byte L2 and `threads` resident threads, and frames of
     /// `dims`; refused if a stack of `size` frames, or of one, fewer if the scan has fewer,
-    /// overflows [`stack_len`], so no stack a call cuts by it does. The floor holds ~3.4 pixels
+    /// is past [`stack_frames`], so no stack a call cuts by it is. The floor holds ~3.4 pixels
     /// per thread, where the measured fastest stacks begin: 2^19 pixels on 100 SMs of 1536
     /// threads, 32, 8 and 2 frames at 128x128, 256x256 and 512x512.
     fn new(
@@ -426,12 +442,11 @@ impl StackRule {
     ) -> Result<Self, EngineError> {
         let nframe = dims.nframe as usize;
         stack_len(dims, size.unwrap_or(1).min(nframe))?;
-        let fits = u32::MAX as usize / (dims.nmode as usize * plane_len(dims));
         Ok(Self {
             size,
             budget: l2 / 8 * 3,
             floor: (threads * 17 / 5).div_ceil(dims.n()),
-            most: dims.nframe.min(fits as u32),
+            most: dims.nframe.min(stack_frames(dims) as u32),
         })
     }
 
@@ -1317,6 +1332,43 @@ mod tests {
         assert!(matches!(r, Err(EngineError::Invalid(_))), "{r:?}");
         let byte = [Streamed::new(1, 0..=1)];
         assert_eq!(rule(None, 70000).unwrap().frames(&byte), 65535);
+    }
+
+    /// At 128x128 and 8 views a frame u32 indexes 32767 frames' exit waves but grid y takes
+    /// 8191 frames' views: on a scan of 10000 frames a size of 8192 is refused, 8191 taken, and
+    /// unsized a fit stops at 8191. rPIE's batch, one stack, of 70000 frames at 64x64 and one
+    /// view fits u32 but not grid y.
+    #[test]
+    fn a_stack_past_grid_y_is_refused_by_the_rule() {
+        let scan = ViewDims {
+            nframe: 10000,
+            nmode: 8,
+            nprobe: 8,
+            ..dims(128)
+        };
+        let rule = |size| StackRule::new(size, 64 << 20, 1, &scan);
+        for size in [8192, 10000] {
+            let r = rule(Some(size));
+            assert!(matches!(r, Err(EngineError::Invalid(_))), "{size}: {r:?}");
+        }
+        assert_eq!(rule(Some(8191)).unwrap().frames(&[]), 8191);
+        let byte = [Streamed::new(1, 0..=1)];
+        assert_eq!(rule(None).unwrap().frames(&byte), 8191);
+
+        let one = ViewDims {
+            nframe: 70000,
+            nmode: 1,
+            nprobe: 1,
+            ..dims(64)
+        };
+        let params = crate::engine::RpieParams {
+            batch_size: 70000,
+            ..Default::default()
+        };
+        // rPIE's check of its batch
+        let r = stack_len(&one, batch_frames(&one, params.batch_size) as usize);
+        assert!(matches!(r, Err(EngineError::Invalid(_))), "{r:?}");
+        assert_eq!(stack_len(&one, 65535).unwrap(), 65535 * 4096);
     }
 
     /// An engine on a simulated raster of 36 points, its object flat: 32-pixel frames, or the
