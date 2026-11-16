@@ -141,23 +141,26 @@ pub enum SliceSource<'a> {
 }
 
 impl<'a> SliceSource<'a> {
-    /// The source as a kernel reads it and the buffers it addresses, checked to hold
-    /// `nf_max` frames under `d`.
+    /// The source as a kernel reads it for the frames of `stack` and the buffers it
+    /// addresses, checked to hold `stack`'s `nf_max` frames under `d`.
     pub(super) fn src(
         self,
         d: &ViewDims,
-        nf_max: u32,
+        stack: StackRef<'_>,
     ) -> Result<(SliceSrc, Vec<&'a RawDeviceBuffer>), Error> {
         let probe = match self {
             Self::Probe(p) => FrameProbe::Shared(p),
             Self::OwnProbe(p, own) => FrameProbe::Own(p, own),
             Self::Waves(w) => {
-                let (w, planes) = w.planes(d, nf_max)?;
+                let (w, planes) = w.planes(d, stack.nf_max())?;
                 return Ok((wave_slice(planes), vec![w.storage()]));
             }
         };
         check_len("probe", probe.probe(), d.nprobe as usize * d.n())?;
-        Ok((probe_slice(probe.src(d.n())?), probe.storages().collect()))
+        Ok((
+            probe_slice(probe.src(stack, d.n())?),
+            probe.storages().collect(),
+        ))
     }
 }
 
@@ -389,7 +392,7 @@ impl OpticsKernels {
         let len = g.nf_max as usize * d.nmode as usize * d.n();
         check_len("obj", obj, d.obj_len())?;
         check_len("dst", dst, len)?;
-        let (src, mut reads) = src.src(d, g.nf_max)?;
+        let (src, mut reads) = src.src(d, stack)?;
         let config = grid_1d(len)?;
         reads.extend([obj.storage(), views.addr().storage(), stack.storage()]);
         let (m, ctl) = (&self.module, stack.ctl() as *const StackCtl);

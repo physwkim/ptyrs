@@ -32,10 +32,11 @@ use crate::engine::{
 use crate::gpu::fused::{FrameMoves, OwnSpectrumBuf};
 use crate::gpu::opr::{FrameProbe, OwnModes};
 use crate::gpu::{
-    C32, EpochOrder, Exit, FarSums, FusedBufs, FusedInputs, FusedSums, Kernels, LlkPartial,
-    LlkSums, Model, Opr, OprKernels, OpticsKernels, PositionKernels, PositionRule, PositionStep,
-    ProbeSpectrum, PsiSums, Shift, ShiftProbe, ShiftSums, ShiftedNumSums, SliceSource, Solve,
-    SpectrumBuf, StackTable, UpdateSums, ViewAddr, ViewDims, Views,
+    C32, DeviceStackTable, EpochOrder, Error, Exit, FarSums, FusedBufs, FusedInputs, FusedSums,
+    Kernels, LlkPartial, LlkSums, Model, Opr, OprKernels, OpticsKernels, PositionKernels,
+    PositionRule, PositionStep, ProbeSpectrum, PsiSums, Shift, ShiftProbe, ShiftSums,
+    ShiftedNumSums, SliceSource, Solve, SpectrumBuf, StackTable, UpdateSums, ViewAddr, ViewDims,
+    Views,
 };
 use crate::worst::worst_of;
 
@@ -392,6 +393,38 @@ fn forward_on_own_modes_matches_each_frame_alone() {
         c_bits(&plain),
         c_bits(&got),
         "the own modes left the waves as on the shared probe"
+    );
+}
+
+/// A pass on own modes runs only on a stack whose frames the host knows to lie in their
+/// positions: the kernels read the plane of every frame of the stack unchecked.
+#[test]
+fn own_modes_refuse_a_stack_outside_their_positions() {
+    let g = gpu();
+    let x = inputs(&g.stream);
+    let probe = up(&g.stream, &noise(NP * N, 3));
+    let planes = DeviceBuffer::<C32>::zeroed(&g.stream, 3 * N).unwrap();
+    let own = OwnModes::new(&planes, 2..5);
+    let probe = FrameProbe::Own(&probe, &own);
+    let mut work = DeviceBuffer::<C32>::zeroed(&g.stream, NF_MAX * NMODE * N).unwrap();
+    let mut run = |stack| {
+        g.lsqml
+            .forward_frames(&g.ctx, g.order.views(), stack, &x.obj, probe, &mut work)
+    };
+    let table = StackTable::new(&g.stream, &dims(), &[2..5, 4..6, 1..3]).unwrap();
+    run(table.at(0)).unwrap();
+    for s in [1, 2] {
+        let err = run(table.at(s)).unwrap_err();
+        assert!(
+            matches!(&err, Error::Shape(m) if m.contains("outside")),
+            "{err}"
+        );
+    }
+    let dev = DeviceStackTable::new(&g.stream, &dims(), 3).unwrap();
+    let err = run(dev.stack()).unwrap_err();
+    assert!(
+        matches!(&err, Error::Shape(m) if m.contains("StackTable")),
+        "{err}"
     );
 }
 

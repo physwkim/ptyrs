@@ -274,7 +274,7 @@ impl PositionKernels {
         let d = views.dims();
         let g = d.geom(stack)?;
         check_len("chi", chi, g.nf_max as usize * d.nmode as usize * d.n())?;
-        let (w, mut reads) = w.src(d, g.nf_max)?;
+        let (w, mut reads) = w.src(d, stack)?;
         let config = chunk_grid(&g, d.n())?;
         reads.extend([chi.storage(), slopes.storage(), stack.storage()]);
         let p = PositionSums {

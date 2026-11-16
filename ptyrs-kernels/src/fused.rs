@@ -220,17 +220,16 @@ pub struct FusedPtrs {
     pub shift_den: *mut PositionPartial,
 }
 
-/// A probe `[nprobe, ny, nx]` whose mode 0 is each frame's own: plane `b` of `mode0` `[nb,
-/// ny, nx]` at epoch position `p0 + b`; [`shared_probe`] is the probe every frame shares. A
-/// position outside the run reads its last plane, since a device-side [`StackCtl`] may
-/// place a stack anywhere in the scan.
+/// A probe `[nprobe, ny, nx]` whose mode 0 is each frame's own: with `step` 1, plane `b` of
+/// `mode0` `[nb, ny, nx]` at epoch position `p0 + b`; [`shared_probe`] is the probe every
+/// frame shares, `step` 0.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct ProbeSrc {
     pub probe: *const f32,
     pub mode0: *const f32,
     pub p0: u32,
-    pub nb: u32,
+    pub step: u32,
 }
 
 /// `probe` shared by every frame, as [`ProbeSrc`].
@@ -240,7 +239,7 @@ pub fn shared_probe(probe: *const f32) -> ProbeSrc {
         probe,
         mode0: probe,
         p0: 0,
-        nb: 1,
+        step: 0,
     }
 }
 
@@ -248,12 +247,12 @@ pub fn shared_probe(probe: *const f32) -> ProbeSrc {
 ///
 /// # Safety
 ///
-/// `src` as [`ProbeSrc`] says, `nb ≥ 1`, `m < nprobe`.
+/// `src` as [`ProbeSrc`] says, `m < nprobe`, and with `step` 1 `pos` in `p0 .. p0 + nb`.
 #[device]
 pub unsafe fn probe_plane(src: ProbeSrc, m: u32, pos: u32, n: usize) -> *const f32 {
     unsafe {
         if m == 0 {
-            let b = pos.wrapping_sub(src.p0).min(src.nb - 1);
+            let b = (pos - src.p0) * src.step;
             src.mode0.add(2 * b as usize * n)
         } else {
             src.probe.add(2 * m as usize * n)

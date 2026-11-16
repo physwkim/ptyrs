@@ -2037,11 +2037,12 @@ impl<'a> Run<'a> {
         ];
         reads.extend(probe.storages());
         let writes = [bufs.work.storage()];
-        let src = own.src(self.inputs.probe, self.inputs.views.dims().n())?;
+        let src = own.src(self.inputs.probe, self.stack, self.inputs.views.dims().n())?;
         let (ctl, g) = (self.ctl(), self.g);
         self.k.launch(self.ctx, &reads, &writes, |stream| {
             let m = &self.k.module;
-            // SAFETY: as in `rows_fwd`; `OwnModes::src` checked `own` holds `nb ≥ 1` planes.
+            // SAFETY: as in `rows_fwd`; `OwnModes::src` checked `own` has a plane per frame of
+            // the stack.
             unsafe {
                 match self.sh.nx {
                     Side::N64 => m.fused_rows_fwd_own_64(stream, config, p, src, ctl, g, cfg),
@@ -2309,7 +2310,7 @@ impl<'a> Run<'a> {
                 vec![a.storage()],
             ),
             Some(own) => {
-                let (src, s) = own.spectrum_src(a, self.inputs.views.dims())?;
+                let (src, s) = own.spectrum_src(a, self.stack, self.inputs.views.dims())?;
                 (src, s.to_vec())
             }
         };

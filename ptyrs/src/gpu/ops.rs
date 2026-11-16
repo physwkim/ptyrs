@@ -218,7 +218,11 @@ struct Entries {
 }
 
 /// Stack entries fixed when the table is made; nothing writes them afterwards.
-pub struct StackTable(Entries);
+pub struct StackTable {
+    e: Entries,
+    /// The entries as uploaded.
+    fixed: Vec<StackCtl>,
+}
 
 impl StackTable {
     /// One entry per range, each a non-empty part of `0 .. dims.nframe`; `nf_max` is the
@@ -243,29 +247,36 @@ impl StackTable {
             .map(|c| c.nf)
             .max()
             .ok_or_else(|| Error::Shape("no stacks".into()))?;
-        Ok(Self(Entries {
-            ctl: DeviceBuffer::from_host(stream, &ctl)?,
-            nframe: dims.nframe,
-            nf_max,
-        }))
+        Ok(Self {
+            e: Entries {
+                ctl: DeviceBuffer::from_host(stream, &ctl)?,
+                nframe: dims.nframe,
+                nf_max,
+            },
+            fixed: ctl,
+        })
     }
 
     pub fn len(&self) -> usize {
-        self.0.ctl.len()
+        self.fixed.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.0.ctl.is_empty()
+        self.fixed.is_empty()
     }
 
     pub fn nf_max(&self) -> u32 {
-        self.0.nf_max
+        self.e.nf_max
     }
 
     /// Entry `s`; panics if `s >= self.len()`.
     pub fn at(&self, s: usize) -> StackRef<'_> {
         assert!(s < self.len(), "stack {s} of a {}-entry table", self.len());
-        StackRef { e: &self.0, s }
+        StackRef {
+            e: &self.e,
+            s,
+            fixed: Some(self.fixed[s]),
+        }
     }
 }
 
@@ -296,7 +307,11 @@ impl DeviceStackTable {
 
     /// The entry.
     pub fn stack(&self) -> StackRef<'_> {
-        StackRef { e: &self.0, s: 0 }
+        StackRef {
+            e: &self.0,
+            s: 0,
+            fixed: None,
+        }
     }
 
     /// Device address of the entry.
@@ -316,11 +331,18 @@ impl DeviceStackTable {
 pub struct StackRef<'a> {
     e: &'a Entries,
     s: usize,
+    /// The entry of a [`StackTable`].
+    fixed: Option<StackCtl>,
 }
 
 impl StackRef<'_> {
     pub fn nf_max(&self) -> u32 {
         self.e.nf_max
+    }
+
+    /// The entry's frames, known to the host for a [`StackTable`] entry only.
+    pub(crate) fn frames(&self) -> Option<Range<u32>> {
+        self.fixed.map(|c| c.f0..c.f0 + c.nf)
     }
 
     /// Device address of this entry's [`StackCtl`], a stack kernel's `ctl` argument.
@@ -1129,7 +1151,7 @@ impl Kernels {
             stack.storage(),
         ];
         reads.extend(probe.storages());
-        let probe = probe.src(n)?;
+        let probe = probe.src(stack, n)?;
         self.launch(ctx, &reads, &sums.storages(), |stream| {
             // SAFETY: lengths checked above; the tile lists were built from these views.
             unsafe {

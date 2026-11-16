@@ -19,7 +19,7 @@ use crate::base::Feature;
 use crate::gpu::fused::{GRID_Y_MAX, OwnSpectra};
 use crate::gpu::ops::grid_1d;
 use crate::gpu::position::{ONE_BLOCK, chunks};
-use crate::gpu::{C32, EpochOrder, Error, Kernels, ViewDims, check_len, dptr};
+use crate::gpu::{C32, EpochOrder, Error, Kernels, StackRef, ViewDims, check_len, dptr};
 
 #[cfg(test)]
 mod tests;
@@ -206,16 +206,24 @@ impl<'a> OwnModes<'a> {
         self.planes
     }
 
-    /// `probe` with these planes of `n` pixels for its mode 0, as a kernel reads it.
-    pub(super) fn src(&self, probe: &DeviceBuffer<C32>, n: usize) -> Result<ProbeSrc, Error> {
-        self.src_of(probe, self.planes, n)
+    /// `probe` with these planes of `n` pixels for its mode 0, as a kernel reads it for the
+    /// frames of `stack`.
+    pub(super) fn src(
+        &self,
+        probe: &DeviceBuffer<C32>,
+        stack: StackRef<'_>,
+        n: usize,
+    ) -> Result<ProbeSrc, Error> {
+        self.src_of(probe, self.planes, stack, n)
     }
 
     /// The spectra `spectrum` of the shared probe with those of these planes for its mode 0,
-    /// as the shifted passes of `d` read them, and the buffers they address.
+    /// as the shifted passes of `d` read them for the frames of `stack`, and the buffers they
+    /// address.
     pub(super) fn spectrum_src<'b>(
         &'b self,
         spectrum: &'b DeviceBuffer<C32>,
+        stack: StackRef<'_>,
         d: &ViewDims,
     ) -> Result<(ProbeSrc, [&'b RawDeviceBuffer; 2]), Error> {
         let Some(own) = &self.spectra else {
@@ -226,7 +234,7 @@ impl<'a> OwnModes<'a> {
             ));
         };
         let a = own.of(d)?;
-        let src = self.src_of(spectrum, a, d.n())?;
+        let src = self.src_of(spectrum, a, stack, d.n())?;
         Ok((src, [spectrum.storage(), a.storage()]))
     }
 
@@ -248,18 +256,35 @@ impl<'a> OwnModes<'a> {
         Ok(nb as u32)
     }
 
+    /// The kernels read plane `pos - p0` at every position `pos` of the stack they run on, so
+    /// the stack's frames must be known to the host and lie in `self.positions`.
     fn src_of(
         &self,
         probe: &DeviceBuffer<C32>,
         mode0: &DeviceBuffer<C32>,
+        stack: StackRef<'_>,
         n: usize,
     ) -> Result<ProbeSrc, Error> {
-        let nb = self.checked_nb(mode0, n)?;
+        self.checked_nb(mode0, n)?;
+        let p = &self.positions;
+        match stack.frames() {
+            Some(f) if p.start <= f.start && f.end <= p.end => {}
+            Some(f) => {
+                return Err(Error::Shape(format!(
+                    "stack {f:?} outside the own probe modes' positions {p:?}"
+                )));
+            }
+            None => {
+                return Err(Error::Shape(
+                    "own probe modes need a StackTable entry, whose frames the host knows".into(),
+                ));
+            }
+        }
         Ok(ProbeSrc {
             probe: dptr::<C32, f32>(probe).cast_const(),
             mode0: dptr::<C32, f32>(mode0).cast_const(),
-            p0: self.positions.start,
-            nb,
+            p0: p.start,
+            step: 1,
         })
     }
 }
@@ -289,11 +314,11 @@ impl<'a> FrameProbe<'a> {
         std::iter::once(self.probe().storage()).chain(own)
     }
 
-    /// The probe of planes of `n` pixels as a kernel reads it.
-    pub(super) fn src(self, n: usize) -> Result<ProbeSrc, Error> {
+    /// The probe of planes of `n` pixels as a kernel reads it for the frames of `stack`.
+    pub(super) fn src(self, stack: StackRef<'_>, n: usize) -> Result<ProbeSrc, Error> {
         match self {
             Self::Shared(p) => Ok(shared_src(p)),
-            Self::Own(p, own) => own.src(p, n),
+            Self::Own(p, own) => own.src(p, stack, n),
         }
     }
 }
