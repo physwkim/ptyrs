@@ -14,7 +14,7 @@ use crate::live::codec::{
 };
 use crate::live::handoff::{WorkRx, WorkTx};
 use crate::live::ring::Ring;
-use crate::live::sched::{FairSched, parse_cpu_list, pin_current, set_fair, set_fifo};
+use crate::live::sched::{FairSched, pin_current, set_fair, set_fifo};
 use crate::live::stats::{Histogram, mono_ns, process_cpu_ns, thread_cpu_ns};
 use crate::live::synth::{Region, Synth, SynthScratch};
 
@@ -359,14 +359,14 @@ pub struct Placement {
 
 impl Placement {
     pub fn new(
-        cpus: &str,
+        cpus: Option<&[usize]>,
         rt_threads: usize,
         workers: usize,
         readers: usize,
         sched: FairSched,
         h2d_rtprio: u32,
     ) -> Self {
-        if cpus.is_empty() {
+        let Some(c) = cpus else {
             return Self {
                 all: None,
                 rt: None,
@@ -376,18 +376,17 @@ impl Placement {
                 sched,
                 h2d_rtprio,
             };
-        }
-        let c = parse_cpu_list(cpus).unwrap_or_else(|e| panic!("--cpus: {e}"));
+        };
         let w0 = rt_threads + 1;
         let need = w0 + workers + readers;
         assert!(
             c.len() >= need,
-            "--cpus {cpus}: {need} needed ({rt_threads} runtime, 1 h2d, {workers} workers, \
+            "--cpus {c:?}: {need} needed ({rt_threads} runtime, 1 h2d, {workers} workers, \
              {readers} readers)"
         );
         let some = |s: &[usize]| s.iter().map(|&x| Some(x)).collect();
         Self {
-            all: Some(c.clone()),
+            all: Some(c.to_vec()),
             rt: Some(c[..rt_threads].to_vec()),
             h2d: Some(c[rt_threads]),
             workers: some(&c[w0..w0 + workers]),

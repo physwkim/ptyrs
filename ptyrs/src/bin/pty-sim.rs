@@ -22,7 +22,7 @@ use epics_pva_rs::nt::nd_array::{
 };
 use epics_pva_rs::pvdata::{PvField, PvStructure, ScalarType, ScalarValue, VariantValue};
 use epics_pva_rs::server_native::{PvaServer, PvaServerConfig, SharedPV, SharedSource};
-use ptyrs::live::args::Args;
+use ptyrs::live::args::{ArgError, Args, cli};
 use ptyrs::live::codec::{Codec, bslz4_compress_u16, bytemuck_u16, lz4_compress};
 use ptyrs::live::eiger::{
     ImageMeta, SeriesConfig, blob_prefix, end_message, header_message, image_parts,
@@ -216,39 +216,96 @@ fn build_pool(m: &Model, codec: Codec, h5: bool) -> Vec<Payload> {
         .collect()
 }
 
+/// Where frames go: PVA, which with `zmq` carries only the positions while the frames
+/// go out on ZMQ (port, high-water mark), or an HDF5 file flushed every `flush` frames.
+enum Out {
+    Pva { zmq: Option<(u16, i32)> },
+    H5 { path: PathBuf, flush: u64 },
+}
+
+struct Flags {
+    codec: Codec,
+    rate: f64,
+    frames: u64,
+    model: ModelCfg,
+    port: u16,
+    queue: usize,
+    prefix: String,
+    linger_ms: u64,
+    out: Out,
+}
+
+impl Flags {
+    fn from_args(a: &Args) -> Result<Self, ArgError> {
+        #[derive(Clone, Copy)]
+        enum Kind {
+            Pva,
+            Zmq,
+            H5,
+        }
+        let codecs = [
+            ("bslz4", Codec::Bslz4),
+            ("none", Codec::None),
+            ("lz4", Codec::Lz4),
+        ];
+        let codec = a.choice("codec", &codecs)?;
+        let rate = a.get("rate", 3000.0)?;
+        let frames = a.get("frames", 30_000)?;
+        let model = ModelCfg::from_args(a)?;
+        let port = a.get("port", 15075)?;
+        let queue = a.get("server-queue", 4)?;
+        let prefix = a.str("prefix", "PTY:");
+        let linger_ms = a.get("linger-ms", 3000)?;
+        let outs = [("pva", Kind::Pva), ("zmq", Kind::Zmq), ("h5", Kind::H5)];
+        let out = match a.choice("out", &outs)? {
+            Kind::H5 => Out::H5 {
+                path: a
+                    .opt("h5")?
+                    .ok_or_else(|| ArgError::new("--out h5 needs --h5 PATH".into()))?,
+                flush: a.get("h5-flush", 16)?,
+            },
+            k => Out::Pva {
+                zmq: match k {
+                    Kind::Zmq => Some((
+                        a.get("zmq-port", ptyrs::live::eiger::PORT)?,
+                        a.get("sndhwm", 10_000)?,
+                    )),
+                    _ => None,
+                },
+            },
+        };
+        Ok(Self {
+            codec,
+            rate,
+            frames,
+            model,
+            port,
+            queue,
+            prefix,
+            linger_ms,
+            out,
+        })
+    }
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() {
-    let a = Args::parse();
-    let codec = match a.str("codec", "bslz4").as_str() {
-        "none" => Codec::None,
-        "lz4" => Codec::Lz4,
-        "bslz4" => Codec::Bslz4,
-        c => panic!("--codec {c}: expected none, lz4 or bslz4"),
-    };
-    let rate: f64 = a.get("rate", 3000.0);
-    let frames: u64 = a.get("frames", 30_000);
-    let model = Arc::new(ModelCfg::from_args(&a).build());
-    let port: u16 = a.get("port", 15075);
-    let queue: usize = a.get("server-queue", 4);
-    let prefix = a.str("prefix", "PTY:");
-    let linger_ms: u64 = a.get("linger-ms", 3000);
-    let (zmq_out, h5) = match a.str("out", "pva").as_str() {
-        "pva" => (false, None),
-        "zmq" => (true, None),
-        "h5" => {
-            let p = a.str("h5", "");
-            assert!(!p.is_empty(), "--out h5 needs --h5 PATH");
-            (false, Some(PathBuf::from(p)))
-        }
-        o => panic!("--out {o}: expected pva, zmq or h5"),
-    };
-    let h5_flush: u64 = a.get("h5-flush", 16);
-    let zmq_port: u16 = a.get("zmq-port", ptyrs::live::eiger::PORT);
-    let sndhwm: i32 = a.get("sndhwm", 10_000);
+    let Flags {
+        codec,
+        rate,
+        frames,
+        model,
+        port,
+        queue,
+        prefix,
+        linger_ms,
+        out,
+    } = cli("pty-sim", Flags::from_args);
+    let model = Arc::new(model.build());
     let (w, h) = model.frame_size();
 
     let t = mono_ns();
-    let pool = build_pool(&model, codec, h5.is_some());
+    let pool = build_pool(&model, codec, matches!(out, Out::H5 { .. }));
     let raw_bytes = (w * h * 2) as f64;
     let sizes: Vec<usize> = pool
         .iter()
@@ -290,62 +347,66 @@ async fn main() {
     pos_pv
         .open(position_desc(), init_pos.clone())
         .expect("open POS");
-    let source = SharedSource::new();
-    if !zmq_out {
-        source.add(format!("{prefix}FRAME"), frame_pv.clone());
-    }
-    source.add(format!("{prefix}POS"), pos_pv.clone());
-    let mut cfg = PvaServerConfig::isolated();
-    cfg.tcp_port = port;
-    cfg.monitor_queue_depth = queue;
-    // The file carries the positions too; no PVA then.
-    let server = if let Some(p) = &h5 {
-        println!(
-            "sim rate={rate} frames={frames} out=h5 file={} flush_every={h5_flush}",
-            p.display()
-        );
-        None
-    } else {
-        let server = PvaServer::start(Arc::new(source), cfg).expect("start PVA server");
-        println!(
-            "sim listening={} server_queue={queue} rate={rate} frames={frames} out={}",
-            server.tcp_addr(),
-            if zmq_out { "zmq" } else { "pva" }
-        );
-        // A post reports the subscriber count; re-post the uid -1
-        // placeholder (ignored by the receiver) until both monitors are
-        // attached.
-        loop {
-            let f = frame_pv.try_post(init_frame.clone());
-            let p = pos_pv.try_post(init_pos.clone());
-            if (f >= 1 || zmq_out) && p >= 1 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+    let (server, zmq) = match &out {
+        // The file carries the positions too; no PVA then.
+        Out::H5 { path, flush } => {
+            println!(
+                "sim rate={rate} frames={frames} out=h5 file={} flush_every={flush}",
+                path.display()
+            );
+            (None, None)
         }
-        Some(server)
+        Out::Pva { zmq } => {
+            let source = SharedSource::new();
+            if zmq.is_none() {
+                source.add(format!("{prefix}FRAME"), frame_pv.clone());
+            }
+            source.add(format!("{prefix}POS"), pos_pv.clone());
+            let mut cfg = PvaServerConfig::isolated();
+            cfg.tcp_port = port;
+            cfg.monitor_queue_depth = queue;
+            let server = PvaServer::start(Arc::new(source), cfg).expect("start PVA server");
+            println!(
+                "sim listening={} server_queue={queue} rate={rate} frames={frames} out={}",
+                server.tcp_addr(),
+                if zmq.is_some() { "zmq" } else { "pva" }
+            );
+            // A post reports the subscriber count; re-post the uid -1
+            // placeholder (ignored by the receiver) until both monitors are
+            // attached.
+            loop {
+                let f = frame_pv.try_post(init_frame.clone());
+                let p = pos_pv.try_post(init_pos.clone());
+                if (f >= 1 || zmq.is_some()) && p >= 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            let zmq = zmq.map(|(port, sndhwm)| {
+                let z = ZmqOut::start(port, sndhwm, &pool, codec, (w, h), frames, rate);
+                println!("sim zmq_port={port} sndhwm={sndhwm} series={}", z.series);
+                z
+            });
+            (Some(server), zmq)
+        }
     };
-    let zmq = zmq_out.then(|| {
-        let z = ZmqOut::start(zmq_port, sndhwm, &pool, codec, (w, h), frames, rate);
-        println!(
-            "sim zmq_port={zmq_port} sndhwm={sndhwm} series={}",
-            z.series
-        );
-        z
-    });
     // Time for the receiver to attach; a file reader attaches only once
     // the file exists.
     let settle = Duration::from_millis(500);
+    let h5 = match out {
+        Out::H5 { path, flush } => Some((path, flush)),
+        Out::Pva { .. } => None,
+    };
     if h5.is_none() {
         tokio::time::sleep(settle).await;
     }
 
     let publisher = std::thread::spawn(move || {
         // The writer is not Send, so it is made here.
-        let mut h5 = h5.map(|p| {
+        let mut h5 = h5.map(|(p, flush)| {
             let f = SwmrOut::create(&p, codec, (w, h)).expect("create HDF5 file");
             std::thread::sleep(settle);
-            f
+            (f, flush)
         });
         let period = 1e9 / rate;
         let mut post_ns = Histogram::new(100_000);
@@ -371,11 +432,11 @@ async fn main() {
             late += (lag as f64 > period) as u64;
             let uid = i as i32;
             let (x, y) = model.position(uid);
-            if let Some(f) = &mut h5 {
+            if let Some((f, flush)) = &mut h5 {
                 let p = &pool[(i % pool.len() as u64) as usize];
                 f.append(p.bytes(), uid, (x, y), wall_ns())
                     .expect("HDF5 append");
-                if (i + 1) % h5_flush == 0 {
+                if (i + 1) % *flush == 0 {
                     f.flush().expect("HDF5 flush");
                 }
             } else if let Some(z) = &zmq {
@@ -398,7 +459,7 @@ async fn main() {
         if let Some(z) = &zmq {
             z.end();
         }
-        if let Some(f) = h5 {
+        if let Some((f, _)) = h5 {
             f.close().expect("HDF5 close");
         }
         let wall = mono_ns() - t0;

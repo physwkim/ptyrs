@@ -38,7 +38,7 @@ use cuda_core::{Context, Event, Stream};
 use serde::Deserialize;
 
 use crate::dist::{DistError, DistLiveAp, DistSnapshot, Scheme};
-use crate::live::args::Args;
+use crate::live::args::{ArgError, Args};
 use crate::live::converge::{Clock, ClockError};
 use crate::live::farfield::Ptycho;
 use crate::live::fill::{Fill, PatchFill, PatchPredictor, patch_corner};
@@ -106,48 +106,49 @@ impl ReconCfg {
     /// --recon-fill-norm --recon-fill-pack --recon-fill-counts
     /// --recon-fill-fills`; `None`
     /// without `--recon`.
-    pub fn from_args(a: &Args) -> Option<Self> {
-        let algo = a.opt("recon")?;
-        // Flags nothing reads pass unseen; a run without its fill would look
-        // like one with it.
-        #[cfg(not(feature = "nn"))]
-        assert!(
-            a.opt::<String>("recon-fill").is_none(),
-            "--recon-fill needs the nn feature"
-        );
+    pub fn from_args(a: &Args) -> Result<Option<Self>, ArgError> {
+        let Some(algo) = a.opt("recon")? else {
+            return Ok(None);
+        };
         let d = Self::default();
-        Some(Self {
+        Ok(Some(Self {
             algo,
-            nf_max: a.get("recon-nf-max", d.nf_max),
-            stacks: a.get("recon-stacks", d.stacks),
-            inertia: a.get("recon-inertia", d.inertia),
-            chunk_mib: a.get("recon-chunk-mib", d.chunk_mib),
-            snap_every: a.get("recon-snap-every", d.snap_every),
-            snaps: a.get("recon-snaps", d.snaps),
-            settle_max: a.get("recon-settle-max", d.settle_max),
-            pv: a.opt("recon-pv").map(|prefix| {
-                let p = PvCfg::new(prefix);
-                PvCfg {
-                    bin: a.get("recon-pv-bin", p.bin),
-                    period_ms: a.get("recon-pv-period-ms", p.period_ms),
-                    llk_period_ms: a.get("recon-pv-llk-period-ms", p.llk_period_ms),
-                    ..p
+            nf_max: a.get("recon-nf-max", d.nf_max)?,
+            stacks: a.get("recon-stacks", d.stacks)?,
+            inertia: a.get("recon-inertia", d.inertia)?,
+            chunk_mib: a.get("recon-chunk-mib", d.chunk_mib)?,
+            snap_every: a.get("recon-snap-every", d.snap_every)?,
+            snaps: a.get("recon-snaps", d.snaps)?,
+            settle_max: a.get("recon-settle-max", d.settle_max)?,
+            pv: match a.opt("recon-pv")? {
+                None => None,
+                Some(prefix) => {
+                    let p = PvCfg::new(prefix);
+                    Some(PvCfg {
+                        bin: a.get("recon-pv-bin", p.bin)?,
+                        period_ms: a.get("recon-pv-period-ms", p.period_ms)?,
+                        llk_period_ms: a.get("recon-pv-llk-period-ms", p.llk_period_ms)?,
+                        ..p
+                    })
                 }
-            }),
+            },
             #[cfg(feature = "nn")]
-            fill: a.opt("recon-fill").map(|predictor| {
-                let norm = a
-                    .opt("recon-fill-norm")
-                    .unwrap_or_else(|| panic!("--recon-fill needs --recon-fill-norm"));
-                let f = FillCfg::new(predictor, norm);
-                FillCfg {
-                    pack: a.get("recon-fill-pack", f.pack),
-                    counts: a.get("recon-fill-counts", f.counts),
-                    fills: a.get("recon-fill-fills", f.fills),
-                    ..f
+            fill: match a.opt("recon-fill")? {
+                None => None,
+                Some(predictor) => {
+                    let norm = a.opt("recon-fill-norm")?.ok_or_else(|| {
+                        ArgError::new("--recon-fill needs --recon-fill-norm".into())
+                    })?;
+                    let f = FillCfg::new(predictor, norm);
+                    Some(FillCfg {
+                        pack: a.get("recon-fill-pack", f.pack)?,
+                        counts: a.get("recon-fill-counts", f.counts)?,
+                        fills: a.get("recon-fill-fills", f.fills)?,
+                        ..f
+                    })
                 }
-            }),
-        })
+            },
+        }))
     }
 }
 
