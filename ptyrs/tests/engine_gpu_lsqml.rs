@@ -690,3 +690,89 @@ fn lsqml_position_is_bit_identical_across_stack_splits() {
         }
     }
 }
+
+/// A second OPR call re-uploads the variation it is given; after a call without one and under
+/// another shape too. Each call's first epoch against a fresh CPU run from the arrays and
+/// variation it starts at, with its LLK.
+#[test]
+fn lsqml_opr_restarts_match_cpu() {
+    let frame = FUSED_SIDES[0] as usize;
+    let params = LsqmlParams {
+        batch_size: 12,
+        cost: Cost::Poisson,
+        seed: 7,
+    };
+    let (scan, object, probe) = start(frame);
+    let optics = Optics::far_field(&scan.geometry);
+    let mut gpu = GpuPtycho::new(&ctx(), &scan, object, probe.clone(), OPTIONS).unwrap();
+    let mut gvar = variation(&probe, NPOS, 3, Refined::Both);
+    gpu.lsqml(&params, &mut gvar, 2, 0).unwrap();
+    for case in [
+        "opr again",
+        "after none",
+        "other shape",
+        "other shape again",
+    ] {
+        if case == "after none" {
+            let mut none = ProbeVariation::none(probe.plane_shape());
+            gpu.lsqml(&params, &mut none, 1, 0).unwrap();
+        }
+        let (mut o, mut p) = (gpu.object().unwrap(), gpu.probe().unwrap());
+        if case == "other shape" {
+            gvar = variation(&p, NPOS, 2, Refined::Weights);
+        }
+        let start = gvar.clone();
+        let at = Ptycho::new(&scan, o.clone(), p.clone()).unwrap();
+        let mut var = start.clone();
+        let mut cpu = Lsqml::new(params).unwrap();
+        let want = cpu.epoch(
+            at.addr(),
+            at.observed(),
+            &optics,
+            slice::from_mut(&mut o),
+            &mut p,
+            &mut var,
+        );
+        let llk = cpu.llk(
+            at.addr(),
+            at.observed(),
+            &optics,
+            slice::from_ref(&o),
+            &p,
+            &var,
+        );
+        let mut g = start.clone();
+        gpu.lsqml(&params, &mut g, 1, 1).unwrap();
+        let got = gpu.history().last().unwrap().llk;
+        let [e, w, c] = variation_rel(&g, &var, &start);
+        let errs = [
+            worst_of(steps_rel(&gpu.lsqml_steps().unwrap(), &want)),
+            rel_l2(&gpu.object().unwrap(), &o),
+            rel_l2(&gpu.probe().unwrap(), &p),
+            rel(got.poisson, llk.poisson),
+            e,
+            w,
+            c,
+        ];
+        eprintln!(
+            "lsqml opr restart {case}: steps {:.2e} object {:.2e} probe {:.2e} llk {:.2e} \
+             eigenmodes {:.2e} weights {:.2e} intensity {:.2e}",
+            errs[0], errs[1], errs[2], errs[3], errs[4], errs[5], errs[6]
+        );
+        for (what, e) in [
+            "steps",
+            "object",
+            "probe",
+            "llk",
+            "eigenmodes",
+            "weights",
+            "intensity",
+        ]
+        .into_iter()
+        .zip(errs)
+        {
+            assert!(e < 1e-4, "{case} {what}: {e:e}");
+        }
+        gvar = g;
+    }
+}
