@@ -307,6 +307,106 @@ fn lsqml_opr_full_object_position_matches_cpu() {
     matches_cpu(Some(drawn_offsets()), Sampling::FullObject, opr);
 }
 
+/// 2 epochs of LSQML in batches of 4 on 9 positions of 256- and 512-pixel frames, both
+/// costs, with 5 probe modes and with 4 probe and 2 object modes, more than a column block
+/// holds at once: the LLK after each epoch and the final arrays within 1e-4 of the CPU's.
+#[test]
+fn lsqml_chunked_modes_match_cpu() {
+    const NEPOCH: usize = 2;
+    let npos = 9;
+    for frame in [256, 512] {
+        for [nprobe, nobj] in [[5, 1], [4, 2]] {
+            let (mut scan, object, probe) =
+                common::dm_scenario(frame, npos, nprobe, 2e5, frame as f64 / 8.0);
+            let dims @ [_, ny, nx] = scan.counts.dims();
+            let data = (scan.counts.as_slice().iter().enumerate())
+                .map(|(i, &c)| {
+                    let (y, x) = ((i / nx) % ny, i % nx);
+                    if y == 3 || x == 20 { MASKED } else { c }
+                })
+                .collect();
+            scan.counts = Counts::from_raw(dims, data).unwrap();
+            let [_, nyo, nxo] = object.dims();
+            let data = (0..nobj)
+                .flat_map(|k| {
+                    let a = 0.5f64.powi(k as i32);
+                    (object.as_slice().iter())
+                        .map(move |&c| a * if k % 2 == 1 { c.conj() } else { c })
+                })
+                .collect();
+            let object = Object::new(Stack::from_vec([nobj, nyo, nxo], data).unwrap());
+            let mut at = Ptycho::new(&scan, object, probe).unwrap();
+            at.scale_obj_probe();
+            let (object, probe) = at.into_modes();
+            let at = Ptycho::new(&scan, object.clone(), probe.clone()).unwrap();
+            let optics = Optics::far_field(&scan.geometry);
+            for cost in [Cost::Amplitude, Cost::Poisson] {
+                let params = LsqmlParams {
+                    batch_size: 4,
+                    cost,
+                    seed: 7,
+                };
+                let (mut o, mut p) = (object.clone(), probe.clone());
+                let mut var = ProbeVariation::none(probe.plane_shape());
+                let mut cpu = Lsqml::new(params).unwrap();
+                let (addr, obs) = (at.addr(), at.observed());
+                let want: Vec<_> = (0..NEPOCH)
+                    .map(|cycle| {
+                        cpu.epoch(
+                            addr,
+                            obs,
+                            &optics,
+                            slice::from_mut(&mut o),
+                            &mut p,
+                            &mut var,
+                        );
+                        let llk = cpu.llk(addr, obs, &optics, slice::from_ref(&o), &p, &var);
+                        LlkRecord {
+                            cycle,
+                            algorithm: Algorithm::Lsqml,
+                            llk,
+                        }
+                    })
+                    .collect();
+                let mut gvar = ProbeVariation::none(probe.plane_shape());
+                let (go, gp) = (object.clone(), probe.clone());
+                let mut gpu = GpuPtycho::new(&ctx(), &scan, go, gp, OPTIONS).unwrap();
+                gpu.lsqml(&params, &mut gvar, NEPOCH, 1).unwrap();
+                let got = gpu.history();
+                assert_eq!(got.len(), want.len());
+                let mut llk = 0.0f64;
+                for (g, w) in got.iter().zip(&want) {
+                    assert_eq!((g.cycle, g.algorithm), (w.cycle, w.algorithm));
+                    for (a, b) in [
+                        (g.llk.poisson, w.llk.poisson),
+                        (g.llk.gaussian, w.llk.gaussian),
+                        (g.llk.euclidian, w.llk.euclidian),
+                        (g.llk.nb_photons_calc, w.llk.nb_photons_calc),
+                    ] {
+                        llk = worst_of([llk, rel(a, b)]);
+                    }
+                }
+                let errs = [
+                    llk,
+                    rel_l2(&gpu.object().unwrap(), &o),
+                    rel_l2(&gpu.probe().unwrap(), &p),
+                ];
+                eprintln!(
+                    "lsqml frame {frame} modes {nprobe}x{nobj} {cost:?}: llk {:.2e} object {:.2e} \
+                     probe {:.2e}",
+                    errs[0], errs[1], errs[2]
+                );
+                for (what, e) in ["llk", "object", "probe"].into_iter().zip(errs) {
+                    assert!(
+                        e < 1e-4,
+                        "frame {frame} {nprobe}x{nobj} {cost:?} {what}: {e:e}"
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// The LLK after each of 12 epochs, tagged LSQML (epoch 11 keeps the preconditioner of
 /// epoch 10), [`Lsqml::llk`]'s at the frames' own probes, the final arrays, the offsets' and
 /// the variation's changes, the position entered as `sampling`, the probe varied by `opr`'s

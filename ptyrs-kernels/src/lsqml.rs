@@ -14,7 +14,7 @@ use cuda_device::{async_copy, device, shared::DynamicSharedArray, thread};
 use cuda_host::cuda_module;
 
 use crate::bh::{BhObs, store_sums};
-use crate::fused::{FUSED_COLS, ProbeSrc, col_fft, load_probe, walk_slot};
+use crate::fused::{FUSED_COLS, ProbeSrc, col_carry_bytes, col_fft, load_probe, walk_slot};
 use crate::grad::{GAMMA_CHUNK, ObjProbePtrs};
 use crate::optics::{WavePlanes, wave_plane};
 use crate::pixel::{
@@ -132,16 +132,22 @@ pub struct LsqmlPre {
 /// Under [`LSQML_CHI`] every mode is scaled by `−a_far[f0 + fl] c / n`, `c` the cost's
 /// residual of `obs` and `icalc`, 0 where masked, inverse column-FFT'd and stored; without it
 /// nothing is stored, so `work` keeps its row transforms. Grid `(nx / FUSED_COLS, nf_max)`,
-/// block `nmode * FUSED_COLS * ny / fft_ept(ny)`, dynamic shared memory `2 * FUSED_COLS * ny`
-/// bytes of counts, then the larger of `nmode * FUSED_COLS` column FFTs
-/// ([`crate::fused::FFT_SKEW`]) and `4 * nmode * ny * FUSED_COLS` bytes. `counts` must be
+/// block `mc * FUSED_COLS * ny / fft_ept(ny)` taking the modes in chunks of `mc` as
+/// `fused::cols` does with its `CHUNKED`, dynamic shared memory `2 * FUSED_COLS * ny` bytes
+/// of counts, `col_carry_bytes(ny, nmode, mc)`, then the larger of `mc * FUSED_COLS` column
+/// FFTs ([`crate::fused::FFT_SKEW`]) and `4 * mc * ny * FUSED_COLS` bytes. `counts` must be
 /// 16-byte aligned; it and `a_far` are read only under [`LSQML_CHI`].
 ///
 /// # Safety
 ///
 /// `NY == g.ny`; `p` as [`LsqmlCols`] says for `g`; `ctl` one entry; launch as above.
 #[device]
-pub unsafe fn cols<const NY: u32>(p: LsqmlCols, ctl: *const StackCtl, g: StackGeom, flags: u32) {
+pub unsafe fn cols<const NY: u32, const CHUNKED: bool>(
+    p: LsqmlCols,
+    ctl: *const StackCtl,
+    g: StackGeom,
+    flags: u32,
+) {
     let (f0, nf) = unsafe { stack_frames(ctl, g) };
     let Some(fl) = walk_slot(flags, nf) else {
         return;
@@ -154,19 +160,29 @@ pub unsafe fn cols<const NY: u32>(p: LsqmlCols, ctl: *const StackCtl, g: StackGe
     let tid = thread::threadIdx_x();
     let c = tid % FUSED_COLS;
     let f = (tid / FUSED_COLS) % tpf;
-    let m = tid / nslot;
-    let b = m * FUSED_COLS + c;
-    let bpb = nmode * FUSED_COLS;
+    let mc = if CHUNKED {
+        thread::blockDim_x() / nslot
+    } else {
+        nmode
+    };
+    let mj = tid / nslot;
+    let nchunk = if CHUNKED { nmode.div_ceil(mc) } else { 1 };
+    let b = mj * FUSED_COLS + c;
+    let bpb = mc * FUSED_COLS;
     let u = thread::blockIdx_x() * FUSED_COLS + c;
-    let plane = (fl * nmode + m) as usize * n;
+    let at =
+        move |m: u32, i: u32| (fl * nmode + m) as usize * n + ((f + i * tpf) * nx + u) as usize;
     let chi = flags & LSQML_CHI != 0;
     let poisson = flags & LSQML_POISSON != 0;
     let pos = (f0 + fl) as usize;
     let mut r = [0.0f32; 2 * FFT_EPT_MAX as usize];
     unsafe {
         let tile = DynamicSharedArray::<u8, 16>::get();
-        let fft_smem = tile.add(2 * (FUSED_COLS * ny) as usize);
-        // `|Psi_m(v, u)|^2` at `(m * ny + v) * FUSED_COLS + c`, over the FFTs' region.
+        // `sum_m |Psi_m(v, u)|^2` over the chunks so far at `v * FUSED_COLS + c`.
+        let carry = tile.add(2 * (FUSED_COLS * ny) as usize);
+        let fft_smem = carry.add(col_carry_bytes(ny, nmode, mc) as usize);
+        let carry = carry.cast::<f32>();
+        // `|Psi_m(v, u)|^2` at `(mj * ny + v) * FUSED_COLS + c`, over the FFTs' region.
         let power = fft_smem.cast::<f32>();
         let col0 = (thread::blockIdx_x() * FUSED_COLS + nx / 2) % nx;
         if chi {
@@ -177,68 +193,150 @@ pub unsafe fn cols<const NY: u32>(p: LsqmlCols, ctl: *const StackCtl, g: StackGe
                     tile.add(2 * (row * FUSED_COLS) as usize).cast(),
                     counts.add((row * nx + col0) as usize).cast(),
                 );
-                row += nmode * nslot;
+                row += thread::blockDim_x();
             }
             async_copy::cp_async_commit_group();
         }
-        #[unroll]
-        for i in 0..ept {
-            let v = load_c(p.work, plane + ((f + i * tpf) * nx + u) as usize);
-            r[2 * i as usize] = v.0;
-            r[2 * i as usize + 1] = v.1;
+        // Chunks as in `fused::cols`: the last stays in registers, the others' spectra wait
+        // in `work` for the inverse.
+        let mut k = 0;
+        loop {
+            let m = k * mc + mj;
+            let last = k + 1 == nchunk;
+            #[unroll]
+            for i in 0..ept {
+                let v = if !CHUNKED || m < nmode {
+                    load_c(p.work, at(m, i))
+                } else {
+                    (0.0, 0.0)
+                };
+                r[2 * i as usize] = v.0;
+                r[2 * i as usize + 1] = v.1;
+            }
+            col_fft::<NY, false>(&mut r, fft_smem, b, f, bpb);
+            if !last && chi {
+                #[unroll]
+                for i in 0..ept {
+                    let k = 2 * i as usize;
+                    store_c(p.work, at(m, i), (r[k], r[k + 1]));
+                }
+            }
+            thread::sync_threads();
+            #[unroll]
+            for i in 0..ept {
+                let (re, im) = (r[2 * i as usize], r[2 * i as usize + 1]);
+                let v = f + i * tpf;
+                *power.add(((mj * ny + v) * FUSED_COLS + c) as usize) = re * re + im * im;
+            }
+            if last {
+                async_copy::cp_async_wait_all();
+            }
+            thread::sync_threads();
+            if CHUNKED {
+                // The running sum in ascending `m`: the one-chunk sum, bit for bit.
+                if tid < nslot {
+                    let nm = (nmode - k * mc).min(mc);
+                    #[unroll]
+                    for i in 0..ept {
+                        let v = f + i * tpf;
+                        let to = carry.add((v * FUSED_COLS + c) as usize);
+                        let mut s = if k == 0 { 0.0 } else { *to };
+                        for mm in 0..nm {
+                            s += *power.add(((mm * ny + v) * FUSED_COLS + c) as usize);
+                        }
+                        *to = s;
+                    }
+                }
+                thread::sync_threads();
+            }
+            if last {
+                break;
+            }
+            k += 1;
         }
-        col_fft::<NY, false>(&mut r, fft_smem, b, f, bpb);
-        thread::sync_threads();
-        #[unroll]
-        for i in 0..ept {
-            let (re, im) = (r[2 * i as usize], r[2 * i as usize + 1]);
-            let v = f + i * tpf;
-            *power.add(((m * ny + v) * FUSED_COLS + c) as usize) = re * re + im * im;
-        }
-        async_copy::cp_async_wait_all();
-        thread::sync_threads();
         let inv_n = 1.0 / n as f32;
         let tile = tile.cast::<u16>();
         let a = if chi { *p.a_far.add(pos) } else { 0.0 };
-        #[unroll]
-        for i in 0..ept {
-            let v = f + i * tpf;
-            let mut s = 0.0f32;
-            for mm in 0..nmode {
-                s += *power.add(((mm * ny + v) * FUSED_COLS + c) as usize);
-            }
-            let icalc = s * inv_n;
+        // The `LSQML_CHI` scale at spectrum row `v` of `icalc`.
+        let scale = move |v: u32, icalc: f32| {
             let y = (v + ny / 2) % ny;
-            let j = (y * nx + col0 + c) as usize;
-            if m == 0 && flags & LSQML_ICALC != 0 {
-                *p.icalc.add(fl as usize * n + j) = icalc;
-            }
-            if chi {
-                let obs = *tile.add((y * FUSED_COLS + c) as usize);
-                let res = if obs == MASKED {
-                    0.0
-                } else if poisson {
-                    1.0 - zdiv(obs as f32, icalc + EPS_POISSON)
+            let obs = *tile.add((y * FUSED_COLS + c) as usize);
+            let res = if obs == MASKED {
+                0.0
+            } else if poisson {
+                1.0 - zdiv(obs as f32, icalc + EPS_POISSON)
+            } else {
+                2.0 * (1.0 - zdiv(zsqrt(obs as f32), icalc.sqrt() + EPS_AMPLITUDE))
+            };
+            -a * res * inv_n
+        };
+        // Under `CHUNKED` only mode 0's threads take the pixels, as in `fused::cols`.
+        if !CHUNKED || mj == 0 {
+            #[unroll]
+            for i in 0..ept {
+                let v = f + i * tpf;
+                let s = if CHUNKED {
+                    *carry.add((v * FUSED_COLS + c) as usize)
                 } else {
-                    2.0 * (1.0 - zdiv(zsqrt(obs as f32), icalc.sqrt() + EPS_AMPLITUDE))
+                    let mut s = 0.0f32;
+                    for mm in 0..nmode {
+                        s += *power.add(((mm * ny + v) * FUSED_COLS + c) as usize);
+                    }
+                    s
                 };
-                let scale = -a * res * inv_n;
-                r[2 * i as usize] *= scale;
-                r[2 * i as usize + 1] *= scale;
+                let icalc = s * inv_n;
+                let y = (v + ny / 2) % ny;
+                let j = (y * nx + col0 + c) as usize;
+                if mj == 0 && flags & LSQML_ICALC != 0 {
+                    *p.icalc.add(fl as usize * n + j) = icalc;
+                }
+                if chi {
+                    let scale = scale(v, icalc);
+                    if CHUNKED {
+                        *carry.add((v * FUSED_COLS + c) as usize) = scale;
+                    } else {
+                        r[2 * i as usize] *= scale;
+                        r[2 * i as usize + 1] *= scale;
+                    }
+                }
             }
         }
         if chi {
-            // Every power is read before the inverse FFT reuses the region.
-            thread::sync_threads();
-            col_fft::<NY, true>(&mut r, fft_smem, b, f, bpb);
-            #[unroll]
-            for i in 0..ept {
-                let k = 2 * i as usize;
-                store_c(
-                    p.work,
-                    plane + ((f + i * tpf) * nx + u) as usize,
-                    (r[k], r[k + 1]),
-                );
+            if CHUNKED {
+                thread::sync_threads();
+                #[unroll]
+                for i in 0..ept {
+                    let scale = *carry.add(((f + i * tpf) * FUSED_COLS + c) as usize);
+                    r[2 * i as usize] *= scale;
+                    r[2 * i as usize + 1] *= scale;
+                }
+            }
+            // The last chunk first, then each earlier one reloaded and scaled as it was.
+            let mut k = nchunk - 1;
+            loop {
+                let m = k * mc + mj;
+                // Every power and FFT element is read before the inverse FFT reuses the region.
+                thread::sync_threads();
+                col_fft::<NY, true>(&mut r, fft_smem, b, f, bpb);
+                if !CHUNKED || m < nmode {
+                    #[unroll]
+                    for i in 0..ept {
+                        let k = 2 * i as usize;
+                        store_c(p.work, at(m, i), (r[k], r[k + 1]));
+                    }
+                }
+                if k == 0 {
+                    break;
+                }
+                k -= 1;
+                let m = k * mc + mj;
+                #[unroll]
+                for i in 0..ept {
+                    let w = load_c(p.work, at(m, i));
+                    let scale = *carry.add(((f + i * tpf) * FUSED_COLS + c) as usize);
+                    r[2 * i as usize] = w.0 * scale;
+                    r[2 * i as usize + 1] = w.1 * scale;
+                }
             }
         }
     }
@@ -359,7 +457,23 @@ pub mod lsqml_kernels {
     #[kernel]
     #[launch_bounds(crate::fused::fused_col_threads(64))]
     pub unsafe fn lsqml_cols_64(p: LsqmlCols, ctl: *const StackCtl, g: StackGeom, flags: u32) {
-        unsafe { cols::<64>(p, ctl, g, flags) }
+        unsafe { cols::<64, false>(p, ctl, g, flags) }
+    }
+
+    /// [`super::cols`] for 64-point columns in chunks of modes.
+    ///
+    /// # Safety
+    ///
+    /// As [`super::cols`].
+    #[kernel]
+    #[launch_bounds(crate::fused::fused_col_chunk_threads(64))]
+    pub unsafe fn lsqml_cols_chunked_64(
+        p: LsqmlCols,
+        ctl: *const StackCtl,
+        g: StackGeom,
+        flags: u32,
+    ) {
+        unsafe { cols::<64, true>(p, ctl, g, flags) }
     }
 
     /// [`super::cols`] for 128-point columns.
@@ -370,7 +484,23 @@ pub mod lsqml_kernels {
     #[kernel]
     #[launch_bounds(crate::fused::fused_col_threads(128))]
     pub unsafe fn lsqml_cols_128(p: LsqmlCols, ctl: *const StackCtl, g: StackGeom, flags: u32) {
-        unsafe { cols::<128>(p, ctl, g, flags) }
+        unsafe { cols::<128, false>(p, ctl, g, flags) }
+    }
+
+    /// [`super::cols`] for 128-point columns in chunks of modes.
+    ///
+    /// # Safety
+    ///
+    /// As [`super::cols`].
+    #[kernel]
+    #[launch_bounds(crate::fused::fused_col_chunk_threads(128))]
+    pub unsafe fn lsqml_cols_chunked_128(
+        p: LsqmlCols,
+        ctl: *const StackCtl,
+        g: StackGeom,
+        flags: u32,
+    ) {
+        unsafe { cols::<128, true>(p, ctl, g, flags) }
     }
 
     /// [`super::cols`] for 256-point columns.
@@ -381,7 +511,23 @@ pub mod lsqml_kernels {
     #[kernel]
     #[launch_bounds(crate::fused::fused_col_threads(256))]
     pub unsafe fn lsqml_cols_256(p: LsqmlCols, ctl: *const StackCtl, g: StackGeom, flags: u32) {
-        unsafe { cols::<256>(p, ctl, g, flags) }
+        unsafe { cols::<256, false>(p, ctl, g, flags) }
+    }
+
+    /// [`super::cols`] for 256-point columns in chunks of modes.
+    ///
+    /// # Safety
+    ///
+    /// As [`super::cols`].
+    #[kernel]
+    #[launch_bounds(crate::fused::fused_col_chunk_threads(256))]
+    pub unsafe fn lsqml_cols_chunked_256(
+        p: LsqmlCols,
+        ctl: *const StackCtl,
+        g: StackGeom,
+        flags: u32,
+    ) {
+        unsafe { cols::<256, true>(p, ctl, g, flags) }
     }
 
     /// [`super::cols`] for 512-point columns.
@@ -392,7 +538,23 @@ pub mod lsqml_kernels {
     #[kernel]
     #[launch_bounds(crate::fused::fused_col_threads(512))]
     pub unsafe fn lsqml_cols_512(p: LsqmlCols, ctl: *const StackCtl, g: StackGeom, flags: u32) {
-        unsafe { cols::<512>(p, ctl, g, flags) }
+        unsafe { cols::<512, false>(p, ctl, g, flags) }
+    }
+
+    /// [`super::cols`] for 512-point columns in chunks of modes.
+    ///
+    /// # Safety
+    ///
+    /// As [`super::cols`].
+    #[kernel]
+    #[launch_bounds(crate::fused::fused_col_chunk_threads(512))]
+    pub unsafe fn lsqml_cols_chunked_512(
+        p: LsqmlCols,
+        ctl: *const StackCtl,
+        g: StackGeom,
+        flags: u32,
+    ) {
+        unsafe { cols::<512, true>(p, ctl, g, flags) }
     }
 
     /// `x[0..n] = 1/2`, the `a_far` of a frame never stepped.

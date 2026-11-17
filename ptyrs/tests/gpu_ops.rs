@@ -2830,14 +2830,22 @@ impl FusedScan {
 }
 
 /// Frames and `[nprobe, nobj]` modes of the f64 fused tests: every side along both axes,
-/// and every side's column block at the most modes it takes.
-const FUSED_CASES: [([u32; 2], [u32; 2]); 6] = [
+/// every side's column block at the most modes it takes at once, and on every side more,
+/// which the column passes take in chunks (the shift passes their probe modes past 8, 4
+/// and 2 at 128, 256 and 512 points).
+const FUSED_CASES: [([u32; 2], [u32; 2]); 12] = [
     ([128, 256], [2, 2]),
     ([256, 128], [2, 2]),
     ([64, 512], [2, 2]),
     ([512, 64], [2, 1]),
     ([64, 128], [16, 1]),
     ([128, 64], [8, 1]),
+    ([64, 64], [9, 2]),
+    ([128, 64], [9, 1]),
+    ([256, 64], [5, 1]),
+    ([256, 64], [4, 2]),
+    ([512, 64], [5, 1]),
+    ([512, 64], [4, 2]),
 ];
 
 /// AP: the projected exit waves, LLK partials and object and probe sums of `fused_project`,
@@ -3465,8 +3473,8 @@ fn fused_empty_stack_replay_writes_nothing() {
     }
 }
 
-/// The fused passes take frame sides of 128 or 256 and as many modes as one column block
-/// holds, and buffers for at least the table's `nf_max` frames.
+/// The fused passes take frame sides of 128 or 256 and any number of modes, past what one
+/// column block holds too, and buffers for at least the table's `nf_max` frames.
 #[test]
 fn fused_shapes_are_checked() {
     let (stream, ex, k) = setup();
@@ -3481,13 +3489,14 @@ fn fused_shapes_are_checked() {
     };
     for (frame, nprobe, ok) in [
         ([64, 128], 16, true),
-        ([64, 128], 17, false),
+        ([64, 128], 17, true),
         ([128, 128], 8, true),
-        ([128, 128], 9, false),
+        ([128, 128], 9, true),
         ([256, 128], 4, true),
-        ([256, 128], 5, false),
+        ([256, 128], 5, true),
         ([512, 128], 2, true),
-        ([512, 128], 3, false),
+        ([512, 128], 3, true),
+        ([512, 512], 40, true),
         ([128, 512], 1, true),
         ([24, 32], 1, false),
         ([1024, 128], 1, false),

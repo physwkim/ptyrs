@@ -66,7 +66,7 @@ impl GpuPtycho {
     /// [`random_batches`]; one LLK record after every due epoch, of each frame's own probe as
     /// [`crate::engine::Lsqml::llk`]'s. `var` comes back stepped with the object and probe;
     /// [`ProbeVariation::none`] runs the shared probe alone. LSQML runs fused row and column
-    /// passes whatever [`super::GpuOptions::fused`] says, so frames or modes they cannot take
+    /// passes whatever [`super::GpuOptions::fused`] says, so frames of a side they cannot take
     /// ([`crate::gpu::FUSED_SIDES`]) are [`EngineError::Invalid`]; so is another variation
     /// without `GpuOptions { fused: true, .. }`, even under `calc_llk` 0, since only the fused
     /// passes take the LLK of each frame's own probe, a variation's batches of more frames than

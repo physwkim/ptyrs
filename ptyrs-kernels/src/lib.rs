@@ -1520,7 +1520,7 @@ pub mod kernels {
     #[kernel]
     #[launch_bounds(crate::fused::fused_col_threads(64))]
     pub unsafe fn fused_cols_64(p: FusedPtrs, ctl: *const StackCtl, g: StackGeom, cfg: FusedCfg) {
-        unsafe { crate::fused::cols::<64, 0>(p, ctl, g, cfg) }
+        unsafe { crate::fused::cols::<64, 0, false>(p, ctl, g, cfg) }
     }
 
     /// [`crate::fused::cols`] for 64-point columns, with every model term.
@@ -1536,7 +1536,43 @@ pub mod kernels {
         g: StackGeom,
         cfg: FusedCfg,
     ) {
-        unsafe { crate::fused::cols::<64, { crate::fused::FUSED_MODEL_TERMS }>(p, ctl, g, cfg) }
+        unsafe {
+            crate::fused::cols::<64, { crate::fused::FUSED_MODEL_TERMS }, false>(p, ctl, g, cfg)
+        }
+    }
+
+    /// [`crate::fused::cols`] for 64-point columns in chunks of modes, without the model terms.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::cols`].
+    #[kernel]
+    #[launch_bounds(crate::fused::fused_col_chunk_threads(64))]
+    pub unsafe fn fused_cols_chunked_64(
+        p: FusedPtrs,
+        ctl: *const StackCtl,
+        g: StackGeom,
+        cfg: FusedCfg,
+    ) {
+        unsafe { crate::fused::cols::<64, 0, true>(p, ctl, g, cfg) }
+    }
+
+    /// [`crate::fused::cols`] for 64-point columns in chunks of modes, with every model term.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::cols`].
+    #[kernel]
+    #[launch_bounds(crate::fused::fused_col_chunk_threads(64))]
+    pub unsafe fn fused_cols_model_chunked_64(
+        p: FusedPtrs,
+        ctl: *const StackCtl,
+        g: StackGeom,
+        cfg: FusedCfg,
+    ) {
+        unsafe {
+            crate::fused::cols::<64, { crate::fused::FUSED_MODEL_TERMS }, true>(p, ctl, g, cfg)
+        }
     }
 
     /// [`crate::fused::cols`] for 128-point columns, without the model terms.
@@ -1547,7 +1583,7 @@ pub mod kernels {
     #[kernel]
     #[launch_bounds(crate::fused::fused_col_threads(128))]
     pub unsafe fn fused_cols_128(p: FusedPtrs, ctl: *const StackCtl, g: StackGeom, cfg: FusedCfg) {
-        unsafe { crate::fused::cols::<128, 0>(p, ctl, g, cfg) }
+        unsafe { crate::fused::cols::<128, 0, false>(p, ctl, g, cfg) }
     }
 
     /// [`crate::fused::cols`] for 128-point columns, with every model term.
@@ -1563,7 +1599,43 @@ pub mod kernels {
         g: StackGeom,
         cfg: FusedCfg,
     ) {
-        unsafe { crate::fused::cols::<128, { crate::fused::FUSED_MODEL_TERMS }>(p, ctl, g, cfg) }
+        unsafe {
+            crate::fused::cols::<128, { crate::fused::FUSED_MODEL_TERMS }, false>(p, ctl, g, cfg)
+        }
+    }
+
+    /// [`crate::fused::cols`] for 128-point columns in chunks of modes, without the model terms.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::cols`].
+    #[kernel]
+    #[launch_bounds(crate::fused::fused_col_chunk_threads(128))]
+    pub unsafe fn fused_cols_chunked_128(
+        p: FusedPtrs,
+        ctl: *const StackCtl,
+        g: StackGeom,
+        cfg: FusedCfg,
+    ) {
+        unsafe { crate::fused::cols::<128, 0, true>(p, ctl, g, cfg) }
+    }
+
+    /// [`crate::fused::cols`] for 128-point columns in chunks of modes, with every model term.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::cols`].
+    #[kernel]
+    #[launch_bounds(crate::fused::fused_col_chunk_threads(128))]
+    pub unsafe fn fused_cols_model_chunked_128(
+        p: FusedPtrs,
+        ctl: *const StackCtl,
+        g: StackGeom,
+        cfg: FusedCfg,
+    ) {
+        unsafe {
+            crate::fused::cols::<128, { crate::fused::FUSED_MODEL_TERMS }, true>(p, ctl, g, cfg)
+        }
     }
 
     /// [`crate::fused::cols`] for 256-point columns, without the model terms.
@@ -1574,7 +1646,7 @@ pub mod kernels {
     #[kernel]
     #[launch_bounds(crate::fused::fused_col_threads(256))]
     pub unsafe fn fused_cols_256(p: FusedPtrs, ctl: *const StackCtl, g: StackGeom, cfg: FusedCfg) {
-        unsafe { crate::fused::cols::<256, 0>(p, ctl, g, cfg) }
+        unsafe { crate::fused::cols::<256, 0, false>(p, ctl, g, cfg) }
     }
 
     /// [`crate::fused::cols`] for 256-point columns, with every model term.
@@ -1590,7 +1662,43 @@ pub mod kernels {
         g: StackGeom,
         cfg: FusedCfg,
     ) {
-        unsafe { crate::fused::cols::<256, { crate::fused::FUSED_MODEL_TERMS }>(p, ctl, g, cfg) }
+        unsafe {
+            crate::fused::cols::<256, { crate::fused::FUSED_MODEL_TERMS }, false>(p, ctl, g, cfg)
+        }
+    }
+
+    /// [`crate::fused::cols`] for 256-point columns in chunks of modes, without the model terms.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::cols`].
+    #[kernel]
+    #[launch_bounds(crate::fused::fused_col_chunk_threads(256))]
+    pub unsafe fn fused_cols_chunked_256(
+        p: FusedPtrs,
+        ctl: *const StackCtl,
+        g: StackGeom,
+        cfg: FusedCfg,
+    ) {
+        unsafe { crate::fused::cols::<256, 0, true>(p, ctl, g, cfg) }
+    }
+
+    /// [`crate::fused::cols`] for 256-point columns in chunks of modes, with every model term.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::cols`].
+    #[kernel]
+    #[launch_bounds(crate::fused::fused_col_chunk_threads(256))]
+    pub unsafe fn fused_cols_model_chunked_256(
+        p: FusedPtrs,
+        ctl: *const StackCtl,
+        g: StackGeom,
+        cfg: FusedCfg,
+    ) {
+        unsafe {
+            crate::fused::cols::<256, { crate::fused::FUSED_MODEL_TERMS }, true>(p, ctl, g, cfg)
+        }
     }
 
     /// [`crate::fused::cols`] for 512-point columns, without the model terms.
@@ -1601,7 +1709,7 @@ pub mod kernels {
     #[kernel]
     #[launch_bounds(crate::fused::fused_col_threads(512))]
     pub unsafe fn fused_cols_512(p: FusedPtrs, ctl: *const StackCtl, g: StackGeom, cfg: FusedCfg) {
-        unsafe { crate::fused::cols::<512, 0>(p, ctl, g, cfg) }
+        unsafe { crate::fused::cols::<512, 0, false>(p, ctl, g, cfg) }
     }
 
     /// [`crate::fused::cols`] for 512-point columns, with every model term.
@@ -1617,7 +1725,43 @@ pub mod kernels {
         g: StackGeom,
         cfg: FusedCfg,
     ) {
-        unsafe { crate::fused::cols::<512, { crate::fused::FUSED_MODEL_TERMS }>(p, ctl, g, cfg) }
+        unsafe {
+            crate::fused::cols::<512, { crate::fused::FUSED_MODEL_TERMS }, false>(p, ctl, g, cfg)
+        }
+    }
+
+    /// [`crate::fused::cols`] for 512-point columns in chunks of modes, without the model terms.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::cols`].
+    #[kernel]
+    #[launch_bounds(crate::fused::fused_col_chunk_threads(512))]
+    pub unsafe fn fused_cols_chunked_512(
+        p: FusedPtrs,
+        ctl: *const StackCtl,
+        g: StackGeom,
+        cfg: FusedCfg,
+    ) {
+        unsafe { crate::fused::cols::<512, 0, true>(p, ctl, g, cfg) }
+    }
+
+    /// [`crate::fused::cols`] for 512-point columns in chunks of modes, with every model term.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::fused::cols`].
+    #[kernel]
+    #[launch_bounds(crate::fused::fused_col_chunk_threads(512))]
+    pub unsafe fn fused_cols_model_chunked_512(
+        p: FusedPtrs,
+        ctl: *const StackCtl,
+        g: StackGeom,
+        cfg: FusedCfg,
+    ) {
+        unsafe {
+            crate::fused::cols::<512, { crate::fused::FUSED_MODEL_TERMS }, true>(p, ctl, g, cfg)
+        }
     }
 
     /// [`crate::fused::rows_inv`] for 64-point rows.
