@@ -14,7 +14,9 @@ use crate::engine::ops::{
     Llk, accumulate_obj, accumulate_probe, apply_amplitude_with, cg_poisson_gamma_with, llk_with,
     natural, obj_probe_to_psi, poisson_grad_with, psi_to_obj_probe,
 };
-use crate::engine::{EngineError, Features, Fft2, Observed, Optics, Sampling, shift};
+use crate::engine::{
+    EngineError, Features, Fft2, Observed, Optics, Sampling, random_batches, shift,
+};
 
 /// Which loop recorded an [`LlkRecord`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -139,7 +141,7 @@ impl Default for MlParams {
     }
 }
 
-/// pty-chi `RPIEReconstructor` parameters (SGD, sequential batches). A step of `None` leaves
+/// pty-chi `RPIEReconstructor` parameters (SGD over shuffled batches). A step of `None` leaves
 /// that array fixed.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RpieParams {
@@ -148,10 +150,12 @@ pub struct RpieParams {
     /// Regularisation weights `α` of the object and probe step denominators.
     pub obj_alpha: f64,
     pub probe_alpha: f64,
-    /// Frames per update; batches are consecutive frames in scan order.
+    /// Frames per update; batches are [`random_batches`].
     pub batch_size: usize,
     /// Epochs between LLK records, as `calc_llk` for AP and DM.
     pub calc_llk: usize,
+    /// The seed of every epoch's [`random_batches`].
+    pub seed: u64,
 }
 
 impl RpieParams {
@@ -174,6 +178,7 @@ impl Default for RpieParams {
             probe_alpha: 0.1,
             batch_size: 100,
             calc_llk: 0,
+            seed: 7,
         }
     }
 }
@@ -834,8 +839,9 @@ impl Ptycho {
         }
     }
 
-    /// rPIE after pty-chi `RPIEReconstructor` with SGD, on consecutive batches of
-    /// `batch_size` frames (pty-chi shuffles; this order is fixed). Needs one object mode.
+    /// rPIE after pty-chi `RPIEReconstructor` with SGD, on the [`random_batches`]
+    /// of `batch_size` frames from the params' seed and the epoch's [`Self::cycle`], so a run
+    /// split over several calls takes the batches of one call. Needs one object mode.
     /// Per batch, from the batch-start object, probe and offsets, with `W_m` the view's probe
     /// `P_m q` and `O_win` its object window under [`Features::position`] when set
     /// ([`Self::sampling`]), `Δ = IFT(ψ') − ψ`, `ψ = W·O_win` and
@@ -871,11 +877,9 @@ impl Ptycho {
         }
         let nframe = self.addr.nframe();
         for ic in 0..nepoch {
-            let mut b0 = 0;
-            while b0 < nframe {
-                let b1 = (b0 + params.batch_size).min(nframe);
-                self.rpie_batch(params, b0..b1);
-                b0 = b1;
+            let epoch = self.cycle as u64;
+            for frames in random_batches(nframe, params.batch_size, params.seed, epoch) {
+                self.rpie_batch(params, &frames);
             }
             if llk_due(params.calc_llk, ic, nepoch) {
                 let l = self.llk();
@@ -886,13 +890,18 @@ impl Ptycho {
         Ok(())
     }
 
-    fn rpie_batch(&mut self, params: &RpieParams, frames: Range<usize>) {
+    fn rpie_batch(&mut self, params: &RpieParams, frames: &[usize]) {
         let [ny, nx] = self.probe.plane_shape();
         let n = self.probe.plane_len();
         let nmode = self.addr.nmode();
         let nxo = self.object.plane_shape()[1];
         let nbatch = frames.len();
-        let views = &self.addr.views()[frames.start * nmode..frames.end * nmode];
+        let views: Vec<View> = frames
+            .iter()
+            .flat_map(|&f| &self.addr.views()[f * nmode..(f + 1) * nmode])
+            .copied()
+            .collect();
+        let views = &views[..];
         let offsets = self.features.offsets();
         let shifted = offsets.map(|d| self.shifted_views(views, &self.probe, d));
         let sampler = shifted.as_ref().and_then(Shifted::sampler);
@@ -910,13 +919,9 @@ impl Ptycho {
             ),
         }
         let mut delta = psi.clone();
-        Self::to_detector(&self.optics, frames.clone(), &mut delta);
-        for (o, block) in self
-            .obs
-            .frames(frames.clone())
-            .chunks_exact(n)
-            .zip(delta.chunks_exact_mut(nmode * n))
-        {
+        Self::to_detector(&self.optics, 0..nbatch, &mut delta);
+        for (&f, block) in frames.iter().zip(delta.chunks_exact_mut(nmode * n)) {
+            let o = self.obs.frames(f..f + 1);
             for (j, iobs) in o.iter().enumerate() {
                 let Some(iobs) = *iobs else { continue };
                 let calc = (0..nmode)
@@ -929,7 +934,7 @@ impl Ptycho {
                 }
             }
         }
-        Self::to_exit(&self.optics, frames.clone(), &mut delta);
+        Self::to_exit(&self.optics, 0..nbatch, &mut delta);
         delta.iter_mut().zip(&psi).for_each(|(d, p)| *d -= p);
 
         // View k's probe at exit-wave index j and its squared modulus.
@@ -1066,8 +1071,7 @@ impl Ptycho {
             }
         }
         if let (Some(d), Some(delta)) = (self.features.refined_offsets(), d_pos) {
-            let frames: Vec<usize> = frames.collect();
-            batch_position_step(d, &frames, &delta);
+            batch_position_step(d, frames, &delta);
         }
     }
 }

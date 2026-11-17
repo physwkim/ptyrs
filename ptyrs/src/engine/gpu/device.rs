@@ -694,14 +694,6 @@ impl<'m, X> PositionLent<'m, X> {
         }
     }
 
-    /// The cycle's other buffers of the model.
-    pub fn own(&self) -> &X {
-        match self {
-            Self::Patch(m) => &m.own,
-            Self::FullObject(s) => &s.own,
-        }
-    }
-
     /// The offsets by epoch position from the device's, through `order`, the epoch's.
     pub fn gather(&mut self, ctx: &ExecutionContext, order: &EpochOrder) -> Result<(), GpuError> {
         match self {
@@ -2439,10 +2431,12 @@ impl BhState {
     }
 }
 
-/// rPIE's batches (one table entry and plan length each) and buffers, sized for the longest
-/// batch, for an object of `one` slice.
+/// rPIE's batches (one table entry and plan length each) over the epoch positions of its
+/// order, and buffers, sized for the longest batch.
 struct RpieScratch {
     batches: Vec<Frames>,
+    /// Set by [`Device::rpie_epoch`] before each epoch.
+    order: EpochOrder,
     /// Values per frame plane.
     n: u32,
     table: StackTable,
@@ -2457,12 +2451,13 @@ struct RpieScratch {
     ones: DeviceBuffer<C32>,
     /// The position model's state, if the device models positions.
     moved: Option<RpieMoved>,
-    one: OneSlice,
 }
 
 /// An [`RpieScratch`] lent to an epoch.
 pub(super) struct RpieBufs<'a> {
     pub batches: &'a [Frames],
+    /// The epoch's order: its views and the scan frame at each position of the batches.
+    pub order: &'a EpochOrder,
     /// Values per frame plane.
     pub n: u32,
     pub table: &'a StackTable,
@@ -2480,7 +2475,6 @@ pub(super) struct RpieBufs<'a> {
     pub pmax: &'a mut DeviceBuffer<f32>,
     /// A probe of ones, so `obj_probe_to_psi` yields the object windows.
     pub ones: &'a DeviceBuffer<C32>,
-    pub one: OneSlice,
 }
 
 impl RpieScratch {
@@ -2492,7 +2486,6 @@ impl RpieScratch {
         params: &RpieParams,
         nprobe_values: usize,
         moved: Option<MovedScratch>,
-        one: OneSlice,
     ) -> Result<Self, EngineError> {
         let dims = views.dims();
         let batch = batch_frames(dims, params.batch_size);
@@ -2523,9 +2516,9 @@ impl RpieScratch {
             ptilde: DeviceBuffer::zeroed(stream, nprobe_values)?,
             pmax: DeviceBuffer::zeroed(stream, 1)?,
             ones: DeviceBuffer::from_host(stream, &vec![C32 { re: 1.0, im: 0.0 }; nprobe_values])?,
+            order: EpochOrder::new(kernels, stream, views)?,
             moved,
             table,
-            one,
         })
     }
 
@@ -2533,6 +2526,7 @@ impl RpieScratch {
     fn lend(&mut self) -> (RpieBufs<'_>, Option<&mut RpieMoved>) {
         let bufs = RpieBufs {
             batches: &self.batches,
+            order: &self.order,
             n: self.n,
             table: &self.table,
             plans: Plans(&mut self.plans),
@@ -2543,7 +2537,6 @@ impl RpieScratch {
             ptilde: &mut self.ptilde,
             pmax: &mut self.pmax,
             ones: &self.ones,
-            one: self.one,
         };
         (bufs, self.moved.as_mut())
     }
@@ -3203,7 +3196,24 @@ impl Device {
     /// epochs of one [`Epoch::run`] keep their buffers and graphs until an epoch of another
     /// run replaces them.
     pub fn steady(&mut self, epoch: Epoch, cycle: usize) -> Result<(), EngineError> {
-        self.steady_with(epoch, cycle, |_| Ok(()))
+        self.steady_with(epoch, cycle, |_, _| Ok(()))
+    }
+
+    /// One rPIE epoch as [`Self::steady`] enqueues it, after setting its frame order: `order`
+    /// holds the scan frame at each epoch position.
+    pub fn rpie_epoch(
+        &mut self,
+        params: RpieParams,
+        cycle: usize,
+        order: &[u32],
+    ) -> Result<(), EngineError> {
+        self.steady_with(Epoch::Rpie(params), cycle, |dev, run| {
+            let Cycle::Rpie(_, scratch) = run else {
+                unreachable!("an rPIE epoch's run is an rPIE cycle");
+            };
+            let ctx = dev.context();
+            Ok(scratch.order.set(&ctx, &dev.kernels, &dev.views, order)?)
+        })
     }
 
     /// One BH epoch as [`Self::steady`] enqueues it, after setting its frame order: `order`
@@ -3215,7 +3225,7 @@ impl Device {
         cycle: usize,
         order: &[u32],
     ) -> Result<(), EngineError> {
-        self.steady_with(Epoch::Bh { params, cg }, cycle, |dev| {
+        self.steady_with(Epoch::Bh { params, cg }, cycle, |dev, _| {
             let ctx = dev.context();
             let bh = dev
                 .bh_state
@@ -3269,7 +3279,7 @@ impl Device {
             pre,
             opr: opr.map(|v| v.shape),
         };
-        self.steady_with(epoch, cycle, |dev| {
+        self.steady_with(epoch, cycle, |dev, _| {
             let ctx = dev.context();
             let l = dev
                 .lsqml
@@ -3312,12 +3322,12 @@ impl Device {
     }
 
     /// [`Self::steady`] with `stage` enqueued just before the cycle, once its buffers are
-    /// built.
+    /// built, on them.
     fn steady_with(
         &mut self,
         epoch: Epoch,
         cycle: usize,
-        stage: impl FnOnce(&mut Self) -> Result<(), EngineError>,
+        stage: impl FnOnce(&mut Self, &mut Cycle) -> Result<(), EngineError>,
     ) -> Result<(), EngineError> {
         let mut runs = std::mem::take(&mut self.runs);
         runs.retain(|r| r.cycle.epoch().run() == epoch.run());
@@ -3333,9 +3343,9 @@ impl Device {
             }),
         };
         let done = at.and_then(|at| {
-            stage(self)?;
-            fault::at(fault::Exit::Launch)?;
             let run = &mut runs[at];
+            stage(self, &mut run.cycle)?;
+            fault::at(fault::Exit::Launch)?;
             let tag = Some((cycle, epoch.algorithm()));
             self.summing(|dev| {
                 let (ctx, nframe) = (dev.context(), dev.dims().nframe);
@@ -3409,7 +3419,7 @@ impl Device {
                 Cycle::Raar { params, first, one }
             }
             Epoch::Rpie(p) => {
-                let one = self.one_slice(&what)?;
+                self.one_slice(&what)?;
                 self.unitary(&what)?;
                 let moved = self.features.positioned().then(|| self.moved_scratch());
                 let scratch = RpieScratch::new(
@@ -3419,7 +3429,6 @@ impl Device {
                     &p,
                     self.probe.len(),
                     moved,
-                    one,
                 )?;
                 Cycle::Rpie(p, Box::new(scratch))
             }
@@ -3983,6 +3992,7 @@ mod tests {
                     probe_alpha: 0.5,
                     batch_size: 12,
                     calc_llk: 1,
+                    ..RpieParams::default()
                 },
                 1,
             ),
@@ -4071,7 +4081,7 @@ mod tests {
             first: true,
             llk: false,
         };
-        let r = e.dev.ungated().steady_with(epoch, 0, |dev| {
+        let r = e.dev.ungated().steady_with(epoch, 0, |dev, _| {
             let (lens, dims) = ([dev.obj.len(), dev.probe.len()], dev.dims());
             let one = dev.one_slice("ML")?;
             let none = PositionScratch::None;

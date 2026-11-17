@@ -22,6 +22,7 @@ pub struct WeightGeom {
 #[cuda_module]
 pub mod rpie_kernels {
     use super::POWER_CHUNK;
+    use crate::bh::BhObs;
     use crate::pixel::*;
     use crate::*;
     use cuda_device::SharedArray;
@@ -29,18 +30,14 @@ pub mod rpie_kernels {
     /// pty-chi's modulus constraint on the forward-FFT'd stack, with the `1 / (ny * nx)` of
     /// the unnormalized round trip folded in: each pixel's modes are scaled by
     /// `sqrt(obs + 1e-7) / (sqrt(icalc) + 1e-7) / n` with `icalc = sum_m |psi|^2 / n`, or by
-    /// `1 / n` where `obs` is `MASKED`. One thread per element of `[nf_max, ny, nx]`.
+    /// `1 / n` where `obs`, the count of the frame at the plane's epoch position, is
+    /// `MASKED`. One thread per element of `[nf_max, ny, nx]`.
     ///
     /// # Safety
     ///
-    /// `psi` `[nf_max * nmode, ny, nx]`, `counts` `[nframe, ny, nx]`, `ctl` one entry.
+    /// `psi` `[nf_max * nmode, ny, nx]`, `obs` as [`BhObs`] says, `ctl` one entry.
     #[kernel]
-    pub unsafe fn rpie_amplitude(
-        psi: *mut f32,
-        counts: *const u16,
-        ctl: *const StackCtl,
-        g: StackGeom,
-    ) {
+    pub unsafe fn rpie_amplitude(psi: *mut f32, obs: BhObs, ctl: *const StackCtl, g: StackGeom) {
         let (f0, nf) = unsafe { stack_frames(ctl, g) };
         let (ny, nx, nmode) = (g.ny, g.nx, g.nmode);
         let n = ny as usize * nx as usize;
@@ -53,7 +50,8 @@ pub mod rpie_kernels {
         let inv_n = 1.0 / n as f32;
         let plane0 = fl * nmode as usize;
         unsafe {
-            let obs = *counts.add(f0 as usize * n + t);
+            let frame = *obs.order.add(f0 as usize + fl) as usize;
+            let obs = *obs.counts.add(frame * n + d);
             let s = if obs == MASKED {
                 inv_n
             } else {

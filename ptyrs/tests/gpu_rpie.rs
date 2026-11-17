@@ -5,8 +5,8 @@ use std::sync::Arc;
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, DeviceCopy};
 use ptyrs::gpu::{
-    C32, Kernels, MASKED, POWER_CHUNK, PowerMax, RpieKernels, StackTable, ViewAddr, ViewDims,
-    Views, Weight,
+    BhScan, C32, EpochOrder, Kernels, MASKED, POWER_CHUNK, PowerMax, RpieKernels, StackTable,
+    ViewAddr, ViewDims, Views, Weight,
 };
 
 #[path = "common/worst.rs"]
@@ -58,7 +58,11 @@ fn max_rel(got: &[C32], want: &[(f64, f64)], floor: f64) -> f64 {
 
 #[test]
 fn amplitude_matches_ptychi_formula() {
-    let (stream, ctx, k) = setup();
+    let cuda = CudaContext::new(0).expect("CUDA device 0");
+    let kernels = Kernels::load(&cuda).expect("load ptyrs-gpu kernels");
+    let k = RpieKernels::load(&kernels).expect("bind the rPIE kernels");
+    let stream = cuda.default_stream();
+    let ctx = ExecutionContext::new(stream.clone());
     let (ny, nx, nmode, nframe) = (8usize, 8usize, 2usize, 3usize);
     let n = ny * nx;
     let dims = ViewDims {
@@ -79,16 +83,30 @@ fn amplitude_matches_ptychi_formula() {
             }
         })
         .collect();
-    // Entry 0 fills the `nf_max = 2` frames of `psi`; entry 1 only its first.
+    // Entry 0 fills the `nf_max = 2` frames of `psi`; entry 1 only its first. Their frames
+    // are epoch positions, which hold the scan frames `ids`.
     let table = StackTable::new(&stream, &dims, &[1..3, 0..1]).unwrap();
-    let c = up(&stream, &counts);
+    let ids = [2u32, 0, 1];
+    let addr: Vec<ViewAddr> = (0..nframe * nmode)
+        .map(|i| ViewAddr {
+            probe: (i % nmode) as u32,
+            ..ViewAddr::default()
+        })
+        .collect();
+    let views = Views::new(&stream, dims, &addr).unwrap();
+    let mut order = EpochOrder::new(&kernels, &stream, &views).unwrap();
+    order.set(&ctx, &kernels, &views, &ids).unwrap();
+    let scan = BhScan {
+        order: &order,
+        counts: &up(&stream, &counts),
+    };
     let psi = noise(2 * nmode * n, 7, 2.0);
     for (s, f0, nf) in [(0, 1usize, 2usize), (1, 0, 1)] {
         let mut want: Vec<(f64, f64)> = psi.iter().map(|v| (v.re as f64, v.im as f64)).collect();
         for fl in 0..nf {
             for d in 0..n {
                 let at = ((d / nx + ny / 2) % ny) * nx + (d % nx + nx / 2) % nx;
-                let obs = counts[(f0 + fl) * n + d];
+                let obs = counts[ids[f0 + fl] as usize * n + d];
                 let s = if obs == MASKED {
                     1.0 / n as f64
                 } else {
@@ -106,7 +124,7 @@ fn amplitude_matches_ptychi_formula() {
             }
         }
         let mut p = up(&stream, &psi);
-        k.amplitude(&ctx, &dims, table.at(s), &c, &mut p).unwrap();
+        k.amplitude(&ctx, scan, table.at(s), &mut p).unwrap();
         let got = p.to_host_vec(&stream).unwrap();
         let err = max_rel(&got, &want, 1e-6);
         assert!(err < 1e-5, "amplitude entry {s} max rel err {err:e}");

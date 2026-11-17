@@ -2,7 +2,7 @@
 init as it is, with the same rPIE parameters on both sides, PyNX LLK per epoch.
 
     python -I compare_rpie.py DATA_DIR [--name fermat_clean] [--llk gaussian|poisson|euclidian]
-        [--batch 100] [--object-step 0.03] [--epochs 20] [--rtol 1e-4] [--module DIR]
+        [--batch 100] [--object-step 0.03] [--epochs 20] [--rtol 1e-4] [--seed 7] [--module DIR]
     python -I compare_rpie.py DATA_DIR --ptychi-defaults [--seed 7] ...
 
 DATA_DIR is refgen_gen_m3's output (ptyrs::refgen), DIR holds the module ptyrs-py/scripts/build.sh
@@ -10,11 +10,11 @@ installs. Prints the start's far-field intensity difference, each epoch's LLK on
 their relative difference; exits 1 at the first epoch past rtol, 2 if a side diverges
 (m3ref.exit_unless_converging).
 
---batch and --object-step go to both sides; the other rPIE parameters are read from pty-chi's
-RPIEOptions defaults (pty-chi 0605630) and handed to Ptycho.rpie. pty-chi's own object step, 1
-times the sum over a batch of 100 frames, diverges on this data with shuffled batches and with
-the engine's consecutive ones; --ptychi-defaults shows it. The rest is matched as in
-compare_lsqml.py: pty-chi features ptyrs does not implement are off (object-probe ambiguity
+--batch, --object-step and --seed go to both sides; the other rPIE parameters are read from
+pty-chi's RPIEOptions defaults (pty-chi 0605630) and handed to Ptycho.rpie. pty-chi's own object
+step, 1 times the sum over a batch of 100 frames, diverges on this data with shuffled batches and
+with consecutive ones; --ptychi-defaults shows it. The rest is matched as in compare_lsqml.py:
+both sides over the engine's random_batches order seeded by --seed, pty-chi features ptyrs does not implement are off (object-probe ambiguity
 removal, mode orthogonalisation), PATCH shifts at integer corners. --ptychi-defaults runs pty-chi
 alone with its defaults untouched (batch and object step, shuffled batches seeded by --seed,
 ambiguity removal, orthogonalisation, AUTO shifts).
@@ -29,8 +29,9 @@ import torch
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.dont_write_bytecode = True  # no __pycache__ in the refs directories
-sys.path.insert(0, os.path.join(HERE, "..", "ptychi"))
+sys.path[:0] = [os.path.join(HERE, "..", "ptychi"), os.path.join(HERE, "..", "f64")]
 import m3ref  # noqa: E402
+from random_batches import Sampler  # noqa: E402
 
 
 def ptychi_task(ds, obj, probe, args, matched):
@@ -72,8 +73,9 @@ def ptychi_task(ds, obj, probe, args, matched):
     )
 
 
-def rpie_params(opts):
-    """Ptycho.rpie keywords equal to pty-chi's rPIE settings in `opts`."""
+def rpie_params(opts, seed):
+    """Ptycho.rpie keywords equal to pty-chi's rPIE settings in `opts` with its batches from
+    Sampler(nframe, batch_size, seed)."""
     import ptychi.api as api
 
     o, pr, r = opts.object_options, opts.probe_options, opts.reconstructor_options
@@ -89,7 +91,7 @@ def rpie_params(opts):
         "probe_alpha": pr.alpha,  # PIEProbeOptions.alpha: (1-a)|O|^2 + a max_view |O|^2
         "batch_size": r.batch_size,  # ReconstructorOptions.batch_size, the last batch shorter
         # probe update start: optimization_plan.start 0 (asserted), the engine's only schedule
-        # batch order: the engine's consecutive scan order, pty-chi's RANDOM loader replaced
+        "seed": seed,  # random_batches' seed, pty-chi's RANDOM loader replaced by Sampler
         # update rule: both from the batch-start state (pie.py compute_updates, apply_updates)
     }
 
@@ -144,9 +146,10 @@ def main():
                       g["detector_pixel_m"])
     p = ptyrs.Ptycho(scan, obj, probe)
     task = ptychi_task(ds, obj, probe, args, True)
-    params = rpie_params(task.options)
+    params = rpie_params(task.options, args.seed)
     rec = task.reconstructor
-    rec.dataloader = DataLoader(rec.dataset, batch_size=params["batch_size"], shuffle=False)
+    rec.dataloader = DataLoader(rec.dataset,
+                                batch_sampler=Sampler(ds.nframe, params["batch_size"], args.seed))
 
     ours = (np.abs(p.forward(obj, probe)) ** 2).sum(axis=1)
     theirs = ptychi_icalc(task)

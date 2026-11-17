@@ -7,8 +7,9 @@ The state is the one lsqml_pos_step.py reads (object [1, 76, 80], probe [2, 32, 
 frames) with its offsets, d_k = OFFSET or EPOCH_OFFSET times numpy default_rng(1) uniform in
 [-1, 1), every |d| below 1/2, where pty-chi's PATCH model keeps the window at the corner and
 moves the probe by d with a Fourier shift (all modes: subpixel_shift_all_probe_modes, as the
-engine moves them). The batches are consecutive in scan order. Per batch, in the engine's
-convention (lsqml_pos_step.py's T_d, F and q), all from the batch-start state:
+engine moves them). Epoch e's batches are random_batches(nframe, size, SEED, e)
+(random_batches.py), the engine's order, fed to pty-chi as its batch sampler. Per batch, in the
+engine's convention (lsqml_pos_step.py's T_d, F and q), all from the batch-start state:
 
     W_km = T_dk(P_m q),  psi_km = F(W_km V_k)
     Delta_km = F^-1(F(psi_km) sqrt(iobs + 1e-7) / (sqrt(sum_m |F psi_km|^2) + 1e-7)) - psi_km
@@ -47,6 +48,7 @@ POS_LIMIT = 0.1
 OFFSET = 0.4
 EPOCH_OFFSET = 0.15
 EPOCHS = 3
+SEED = 7  # RpieParams' default
 STEP_PARAMS = dict(obj_step=0.9, probe_step=0.8, obj_alpha=0.3, probe_alpha=0.2, batch_size=20)
 EPOCH_PARAMS = dict(obj_step=1.0, probe_step=1.0, obj_alpha=0.5, probe_alpha=0.5, batch_size=4)
 
@@ -64,6 +66,7 @@ def sibling(name):
 mg = sibling("ml_grad")
 ls = sibling("lsqml_step")
 lp = sibling("lsqml_pos_step")
+rb = sibling("random_batches")
 
 
 def batch_step(m, obj, probe, offsets, idx, prm):
@@ -105,16 +108,14 @@ def batch_step(m, obj, probe, offsets, idx, prm):
 
 
 def model(m, obj, probe, offsets, prm, nepoch):
-    nf = len(offsets)
-    for _ in range(nepoch):
-        for b0 in range(0, nf, prm["batch_size"]):
-            idx = np.arange(b0, min(b0 + prm["batch_size"], nf))
+    for epoch in range(nepoch):
+        for idx in rb.random_batches(len(offsets), prm["batch_size"], SEED, epoch):
             obj, probe, offsets = batch_step(m, obj, probe, offsets, idx, prm)
     return obj, probe, offsets
 
 
 def ptychi(m, iobs, wavelength, obj0, offsets, prm, nepoch):
-    """pty-chi RPIE for nepoch epochs of consecutive batches: (obj, probe, offsets)."""
+    """pty-chi RPIE for nepoch epochs of the engine's batches: (obj, probe, offsets)."""
     import torch
     from torch.utils.data import DataLoader
     import ptychi.api as api
@@ -157,7 +158,8 @@ def ptychi(m, iobs, wavelength, obj0, offsets, prm, nepoch):
         probe_position_x_px=pos[:, 1].copy(),
     )
     rec = task.reconstructor
-    rec.dataloader = DataLoader(rec.dataset, batch_size=prm["batch_size"], shuffle=False)
+    rec.dataloader = DataLoader(rec.dataset,
+                                batch_sampler=rb.Sampler(len(offsets), prm["batch_size"], SEED))
     peak = []
     cls = type(rec)
 

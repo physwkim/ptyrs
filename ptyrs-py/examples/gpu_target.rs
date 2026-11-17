@@ -2,7 +2,7 @@
 //! 0, for `refs/py/time_to_target.py`.
 //!
 //! `gpu_target <cxi> <init.h5> <nepoch> <target|-> bh <batch_size> <probe_rho> <seed>`
-//! `gpu_target <cxi> <init.h5> <nepoch> <target|-> rpie <obj_step> <probe_step> <obj_alpha> <probe_alpha> <batch_size>`
+//! `gpu_target <cxi> <init.h5> <nepoch> <target|-> rpie <obj_step> <probe_step> <obj_alpha> <probe_alpha> <batch_size> <seed>`
 //! `gpu_target <cxi> <init.h5> <nepoch> <target|-> lsqml <batch_size> <amplitude|poisson> <seed> <position 0|1>`
 //!
 //! LSQML with position 1 refines [`Features::position`] from 0 at every frame.
@@ -25,7 +25,7 @@ use ptyrs::engine::{
 
 const USAGE: &str = "usage: gpu_target <cxi> <init.h5> <nepoch> <target|-> \
     (bh <batch_size> <probe_rho> <seed> | \
-    rpie <obj_step> <probe_step> <obj_alpha> <probe_alpha> <batch_size> | \
+    rpie <obj_step> <probe_step> <obj_alpha> <probe_alpha> <batch_size> <seed> | \
     lsqml <batch_size> <amplitude|poisson> <seed> <position 0|1>)";
 
 enum Method {
@@ -44,7 +44,7 @@ impl Method {
                 position_rho: 0.1,
                 seed: seed.parse()?,
             }),
-            ("rpie", [obj_step, probe_step, obj_alpha, probe_alpha, batch]) => {
+            ("rpie", [obj_step, probe_step, obj_alpha, probe_alpha, batch, seed]) => {
                 Self::Rpie(RpieParams {
                     obj_step: Some(obj_step.parse()?),
                     probe_step: Some(probe_step.parse()?),
@@ -52,6 +52,7 @@ impl Method {
                     probe_alpha: probe_alpha.parse()?,
                     batch_size: batch.parse()?,
                     calc_llk: 0,
+                    seed: seed.parse()?,
                 })
             }
             ("lsqml", [batch, cost, seed, position]) => Self::Lsqml(

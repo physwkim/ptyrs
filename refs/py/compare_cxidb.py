@@ -45,8 +45,8 @@ ones.
 lsqml, bh, rpie: GpuPtycho.lsqml("amplitude"), .bh and .rpie against pty-chi CPU f64 LSQML
 Gaussian (compare_lsqml.ptychi_task), BH (refs/f64/bh_step.py's options, probe rho BH_RHO; GD
 on mini-batches, CG on one batch of every frame, as the engine) and rPIE (compare_rpie.ptychi_task
-and rpie_params: consecutive batches, its object step), the mask as pty-chi's valid_pixel_mask,
-LSQML's and BH's batches in the engine's random_batches order, with compare_gpu_multislice.py's
+and rpie_params: its object step), the mask as pty-chi's valid_pixel_mask, every method's
+batches in the engine's random_batches order, with compare_gpu_multislice.py's
 figures; every state's LLK is the CPU f64 Ptycho.llk. pty-chi shifts by PATCH at the engine's
 integer view corners, the positions the engine reconstructs on, so its FULL_OBJECT model is not
 needed. There is no truth: the figures are side against side.
@@ -502,17 +502,16 @@ def run_ptychi(args):
     obj, probe = data.obj, data.probe
     cpu = ptyrs.Ptycho(scan, obj, probe)
     algo, batch, seed = args.cmd, args.batch, args.seed
-    sampler = None
+    sampler = sibling("refs/f64", "random_batches").Sampler(len(data.counts), batch, seed)
     if algo == "rpie":
         rpie = sibling("refs/py", "compare_rpie")
         opts = SimpleNamespace(batch=batch, object_step=args.object_step, epochs=args.epochs,
                                seed=seed)
         task, ds = ptychi_task(data, obj, probe, lambda *s: rpie.ptychi_task(*s, opts, True))
-        params = dict(rpie.rpie_params(task.options), calc_llk=1)
+        params = dict(rpie.rpie_params(task.options, seed), calc_llk=1)
         steps = lambda gpu, e: gpu.rpie(e, **params)
         what = f"rPIE {params}"
     else:
-        sampler = sibling("refs/f64", "random_batches").Sampler(len(data.counts), batch, seed)
         if algo == "lsqml":
             build = lambda *s: lsqml.ptychi_task(*s, "gaussian", batch, args.epochs)
             steps = lambda gpu, e: gpu.lsqml(e, 1, batch, "amplitude", seed)
@@ -523,8 +522,7 @@ def run_ptychi(args):
             what = f"BH batch {batch} seed {seed} probe rho {BH_RHO}"
         task, ds = ptychi_task(data, obj, probe, build)
     rec = task.reconstructor
-    rec.dataloader = (DataLoader(rec.dataset, batch_size=batch, shuffle=False) if sampler is None
-                      else DataLoader(rec.dataset, batch_sampler=sampler))
+    rec.dataloader = DataLoader(rec.dataset, batch_sampler=sampler)
     if algo == "bh":
         what += f" (pty-chi {task.options.reconstructor_options.method})"
 
@@ -555,7 +553,7 @@ def run_ptychi(args):
             task.run(1)
         finally:
             torch.randn = randn
-        assert sampler is None or sampler.epoch == e, (sampler.epoch, e)
+        assert sampler.epoch == e, (sampler.epoch, e)
         o = task.get_data_to_cpu("object", as_numpy=True)
         p = ds.probe_from_ptychi(task.get_data_to_cpu("probe", as_numpy=True)[0])
         curves["pty-chi"].append(cpu.llk(o, p)[COST])

@@ -325,6 +325,10 @@ impl Schema for RpieParams {
             p.calc_llk = parse_usize(v)?;
             Ok(())
         }),
+        ("seed", |p, v| {
+            p.seed = parse_usize(v)? as u64;
+            Ok(())
+        }),
     ];
 }
 
@@ -408,7 +412,7 @@ mod tests {
                 RaarParams::OPTIONS.len(),
             ),
             (
-                "rpie(obj_step=0.5, probe_step=none, obj_alpha=0.25, probe_alpha=0.75, batch_size=4, calc_llk=7):1",
+                "rpie(obj_step=0.5, probe_step=none, obj_alpha=0.25, probe_alpha=0.75, batch_size=4, calc_llk=7, seed=3):1",
                 Params::Rpie(RpieParams {
                     obj_step: Some(0.5),
                     probe_step: None,
@@ -416,6 +420,7 @@ mod tests {
                     probe_alpha: 0.75,
                     batch_size: 4,
                     calc_llk: 7,
+                    seed: 3,
                 }),
                 RpieParams::OPTIONS.len(),
             ),

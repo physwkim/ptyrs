@@ -14,4 +14,5 @@ pub const RPIE: RpieParams = RpieParams {
     probe_alpha: 0.5,
     batch_size: 4,
     calc_llk: 1,
+    seed: 7,
 };
