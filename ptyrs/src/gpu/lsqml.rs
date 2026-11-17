@@ -946,6 +946,7 @@ impl LsqmlKernels {
     ) -> Result<(), Error> {
         let ColsLaunch {
             side,
+            chunked,
             config,
             g,
             ctl,
@@ -953,14 +954,24 @@ impl LsqmlKernels {
         let m = &self.module;
         self.base.launch(ctx, reads, writes, |stream| {
             // SAFETY: `ColsLaunch::new` checked `work` and the caller every other buffer
-            // `flags` names; `Shape::of` checked the side and that `col_tile_fft` fits;
-            // `EpochOrder` holds frame ids below `nframe`.
+            // `flags` names; `Shape::of` checked the side, sized the chunks and that
+            // `col_tile_fft` fits; `EpochOrder` holds frame ids below `nframe`.
             unsafe {
-                match side {
-                    Side::N64 => m.lsqml_cols_64(stream, config, p, ctl, g, flags),
-                    Side::N128 => m.lsqml_cols_128(stream, config, p, ctl, g, flags),
-                    Side::N256 => m.lsqml_cols_256(stream, config, p, ctl, g, flags),
-                    Side::N512 => m.lsqml_cols_512(stream, config, p, ctl, g, flags),
+                match (side, chunked) {
+                    (Side::N64, false) => m.lsqml_cols_64(stream, config, p, ctl, g, flags),
+                    (Side::N128, false) => m.lsqml_cols_128(stream, config, p, ctl, g, flags),
+                    (Side::N256, false) => m.lsqml_cols_256(stream, config, p, ctl, g, flags),
+                    (Side::N512, false) => m.lsqml_cols_512(stream, config, p, ctl, g, flags),
+                    (Side::N64, true) => m.lsqml_cols_chunked_64(stream, config, p, ctl, g, flags),
+                    (Side::N128, true) => {
+                        m.lsqml_cols_chunked_128(stream, config, p, ctl, g, flags)
+                    }
+                    (Side::N256, true) => {
+                        m.lsqml_cols_chunked_256(stream, config, p, ctl, g, flags)
+                    }
+                    (Side::N512, true) => {
+                        m.lsqml_cols_chunked_512(stream, config, p, ctl, g, flags)
+                    }
                 }
             }
         })
@@ -970,6 +981,8 @@ impl LsqmlKernels {
 /// The launch of [`LsqmlKernels`]' column pass on one stack.
 struct ColsLaunch {
     side: Side,
+    /// The `CHUNKED` build, whose modes `config`'s block takes in chunks.
+    chunked: bool,
     config: LaunchConfig,
     g: StackGeom,
     ctl: *const StackCtl,
@@ -985,6 +998,7 @@ impl ColsLaunch {
         }
         Ok(Self {
             side: sh.ny,
+            chunked: sh.col_chunked,
             config: LaunchConfig {
                 grid_dim: (g.nx / FUSED_COLS, g.nf_max, 1),
                 block_dim: (sh.col_threads, 1, 1),

@@ -27,7 +27,8 @@ use ptyrs_kernels::fused::{
     FUSED_GRAD, FUSED_ITERATE, FUSED_LLK, FUSED_MODEL_TERMS, FUSED_PROJECT, FUSED_RAAR,
     FUSED_ROW_THREADS, FUSED_SCALE, FUSED_SCALE_SUMS, FUSED_SHIFT_DEN, FUSED_SHIFT_OBJ,
     FUSED_SHIFT_POSITION, FUSED_SHIFT_PROBE, FUSED_SHIFT_STEP, FUSED_STEP_CHUNKS, FUSED_TO_PSI,
-    FusedCfg, FusedPtrs, col_slot_bytes, fused_col_threads, shared_probe, shift_stage_bytes,
+    FusedCfg, FusedPtrs, col_carry_bytes, col_slot_bytes, fused_col_chunk_threads,
+    fused_col_threads, shared_probe, shift_stage_bytes,
 };
 use ptyrs_kernels::pixel::{PIXEL_THREADS, PsiPtr, SumPtrs, psi_f32};
 use ptyrs_kernels::position::BatchSpan;
@@ -74,6 +75,12 @@ pub const FUSED_SIDES: &[u32] = &{
     out
 };
 
+/// Modes per block of `n` modes and at most `fit` a block: `n` if they fit, else the fewest
+/// equal chunks that do.
+fn chunk_modes(n: u32, fit: u32) -> u32 {
+    n.div_ceil(n.div_ceil(fit))
+}
+
 /// Launch shapes of the fused passes for one frame and mode count.
 #[derive(Clone, Copy)]
 pub(crate) struct Shape {
@@ -83,8 +90,12 @@ pub(crate) struct Shape {
     /// Rows per row-pass block, of `nx / fft_ept(nx)` threads each.
     pub(crate) rows: u32,
     pub(crate) row_smem: u32,
+    /// Threads of a column-pass block, `col_modes` modes of `FUSED_COLS` columns each.
     pub(crate) col_threads: u32,
-    /// Column-pass shared memory past the reduction slots: counts tile and FFTs.
+    /// Whether the column pass takes its modes in several chunks, its `CHUNKED` build.
+    pub(crate) col_chunked: bool,
+    /// Column-pass shared memory past the reduction slots: counts tile, carried intensity
+    /// and FFTs.
     pub(crate) col_tile_fft: u32,
     /// Shared memory of one column FFT, its skew included.
     pub(crate) col_fft: u32,
@@ -115,26 +126,36 @@ impl Shape {
         let ((side_y, sy), (side_x, sx)) = (side(ny)?, side(nx)?);
         let rows = FUSED_ROW_THREADS / (nx / fft_ept(nx));
         let nslot = FUSED_COLS * (ny / fft_ept(ny));
-        let col_threads = d.nmode as u64 * nslot as u64;
-        if col_threads > fused_col_threads(ny) as u64 {
-            return Err(bad(format!("{col_threads} threads per column block")));
-        }
-        let col_threads = col_threads as u32;
         let col_fft = sy + FFT_SKEW;
+        // Modes a column block holds beside `carry` bytes, under every flag that adds to
+        // its shared memory.
+        let mode_bytes = FUSED_COLS * col_fft.max(4 * ny);
+        let fixed = col_slot_bytes(FUSED_SCALE_SUMS, ny) + 2 * FUSED_COLS * ny;
+        let fit = |threads: u32, carry: u32| {
+            (threads / nslot).min(SMEM_MAX.saturating_sub(fixed + carry) / mode_bytes)
+        };
+        let col_modes = if d.nmode <= fit(fused_col_threads(ny), 0) {
+            d.nmode
+        } else {
+            let fit = fit(fused_col_chunk_threads(ny), col_carry_bytes(ny, d.nmode, 0));
+            if fit == 0 {
+                return Err(bad("no mode fits a column block".into()));
+            }
+            chunk_modes(d.nmode, fit)
+        };
         let s = Self {
             ny: side_y,
             nx: side_x,
             rows,
             row_smem: rows * (sx + FFT_SKEW),
-            col_threads,
+            col_threads: col_modes * nslot,
+            col_chunked: col_modes < d.nmode,
             col_tile_fft: 2 * FUSED_COLS * ny
-                + (col_threads / (ny / fft_ept(ny))) * col_fft.max(4 * ny),
+                + col_carry_bytes(ny, d.nmode, col_modes)
+                + col_modes * mode_bytes,
             col_fft,
         };
-        // The passes' most shared memory is under every flag that adds to it.
-        if s.col_smem(FUSED_SCALE_SUMS) > SMEM_MAX
-            || s.shift_row_smem(FUSED_SHIFT_DEN | FUSED_SHIFT_POSITION) > SMEM_MAX
-        {
+        if s.shift_row_smem(FUSED_SHIFT_DEN | FUSED_SHIFT_POSITION) > SMEM_MAX {
             return Err(bad("shared memory per block exceeds 48 KiB".into()));
         }
         Ok(s)
@@ -172,23 +193,29 @@ impl Shape {
         })
     }
 
-    /// `shift_pre` or `shift_post` for `nprobe` probe modes.
+    /// `shift_pre` or `shift_post` for `nprobe` probe modes, a chunk of them per grid z: the
+    /// most that fit and divide `nprobe`, so that every thread has a mode to store.
     fn shift_cols(&self, nprobe: u32, nf_max: u32) -> Result<LaunchConfig, Error> {
         let (ny, nx) = (self.ny as u32, self.nx as u32);
-        let threads = nprobe * FUSED_COLS * (ny / fft_ept(ny));
-        let smem = 8 * ny + nprobe * FUSED_COLS * self.col_fft;
-        if smem > SMEM_MAX {
+        let nslot = FUSED_COLS * (ny / fft_ept(ny));
+        let mode_bytes = FUSED_COLS * self.col_fft;
+        let fit = (fused_col_threads(ny) / nslot).min((SMEM_MAX - 8 * ny) / mode_bytes);
+        if fit == 0 {
             return Err(Error::Shape(format!(
-                "shift column pass: {smem} bytes of shared memory exceed 48 KiB"
+                "shift column pass: no probe mode of side {ny} fits a block"
             )));
         }
         if nf_max as u64 > GRID_Y_MAX {
             return Err(Error::Shape(format!("{nf_max} frames exceed grid y")));
         }
+        let modes = (1..=fit.min(nprobe))
+            .rev()
+            .find(|m| nprobe.is_multiple_of(*m))
+            .unwrap_or(1);
         Ok(LaunchConfig {
-            grid_dim: (nx / FUSED_COLS, nf_max, 1),
-            block_dim: (threads, 1, 1),
-            shared_mem_bytes: smem,
+            grid_dim: (nx / FUSED_COLS, nf_max, nprobe / modes),
+            block_dim: (modes * nslot, 1, 1),
+            shared_mem_bytes: 8 * ny + modes * mode_bytes,
         })
     }
 
@@ -261,8 +288,7 @@ impl ShiftScratch {
 }
 
 impl FusedBufs {
-    /// Scratch for `dims`, whose frame sides must be in [`FUSED_SIDES`] and whose modes must
-    /// fit one column block of [`fused_col_threads`] threads: at most `1024 / ny` of them.
+    /// Scratch for `dims`, whose frame sides must be in [`FUSED_SIDES`].
     pub fn new(stream: &CudaStream, dims: &ViewDims, nf_max: u32) -> Result<Self, Error> {
         Shape::of(dims)?;
         if nf_max == 0 {
@@ -2183,17 +2209,49 @@ impl<'a> Run<'a> {
         self.k.launch(self.ctx, &reads, &writes, |stream| {
             let m = &self.k.module;
             // SAFETY: as in `rows_fwd`; the launch is the one `cols` documents, of the build
-            // whose terms cover `cfg.flags`.
+            // whose terms cover `cfg.flags` and whose chunking `Shape::cols` sized.
             unsafe {
-                match (self.sh.ny, model) {
-                    (Side::N64, false) => m.fused_cols_64(stream, config, p, ctl, g, cfg),
-                    (Side::N128, false) => m.fused_cols_128(stream, config, p, ctl, g, cfg),
-                    (Side::N256, false) => m.fused_cols_256(stream, config, p, ctl, g, cfg),
-                    (Side::N512, false) => m.fused_cols_512(stream, config, p, ctl, g, cfg),
-                    (Side::N64, true) => m.fused_cols_model_64(stream, config, p, ctl, g, cfg),
-                    (Side::N128, true) => m.fused_cols_model_128(stream, config, p, ctl, g, cfg),
-                    (Side::N256, true) => m.fused_cols_model_256(stream, config, p, ctl, g, cfg),
-                    (Side::N512, true) => m.fused_cols_model_512(stream, config, p, ctl, g, cfg),
+                match (self.sh.ny, model, self.sh.col_chunked) {
+                    (Side::N64, false, false) => m.fused_cols_64(stream, config, p, ctl, g, cfg),
+                    (Side::N128, false, false) => m.fused_cols_128(stream, config, p, ctl, g, cfg),
+                    (Side::N256, false, false) => m.fused_cols_256(stream, config, p, ctl, g, cfg),
+                    (Side::N512, false, false) => m.fused_cols_512(stream, config, p, ctl, g, cfg),
+                    (Side::N64, true, false) => {
+                        m.fused_cols_model_64(stream, config, p, ctl, g, cfg)
+                    }
+                    (Side::N128, true, false) => {
+                        m.fused_cols_model_128(stream, config, p, ctl, g, cfg)
+                    }
+                    (Side::N256, true, false) => {
+                        m.fused_cols_model_256(stream, config, p, ctl, g, cfg)
+                    }
+                    (Side::N512, true, false) => {
+                        m.fused_cols_model_512(stream, config, p, ctl, g, cfg)
+                    }
+                    (Side::N64, false, true) => {
+                        m.fused_cols_chunked_64(stream, config, p, ctl, g, cfg)
+                    }
+                    (Side::N128, false, true) => {
+                        m.fused_cols_chunked_128(stream, config, p, ctl, g, cfg)
+                    }
+                    (Side::N256, false, true) => {
+                        m.fused_cols_chunked_256(stream, config, p, ctl, g, cfg)
+                    }
+                    (Side::N512, false, true) => {
+                        m.fused_cols_chunked_512(stream, config, p, ctl, g, cfg)
+                    }
+                    (Side::N64, true, true) => {
+                        m.fused_cols_model_chunked_64(stream, config, p, ctl, g, cfg)
+                    }
+                    (Side::N128, true, true) => {
+                        m.fused_cols_model_chunked_128(stream, config, p, ctl, g, cfg)
+                    }
+                    (Side::N256, true, true) => {
+                        m.fused_cols_model_chunked_256(stream, config, p, ctl, g, cfg)
+                    }
+                    (Side::N512, true, true) => {
+                        m.fused_cols_model_chunked_512(stream, config, p, ctl, g, cfg)
+                    }
                 }
             }
         })

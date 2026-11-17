@@ -1537,9 +1537,8 @@ mod tests {
         }
 
         /// Calls refused by their checks, the features' on M1's passes, rPIE's batch, an
-        /// object of other dims, and on M1's passes LSQML on a side or of modes its fused
-        /// passes cannot take or with a probe variation, leave LLK, DM and AP bit for bit those
-        /// of a fresh engine.
+        /// object of other dims, and on M1's passes LSQML on a side its fused passes cannot take
+        /// or with a probe variation, leave LLK, DM and AP bit for bit those of a fresh engine.
         #[test]
         fn a_call_refused_by_its_checks_changes_nothing() {
             let ctx = ctx();
@@ -1572,13 +1571,6 @@ mod tests {
             }
             assert!(arrays(&e) == arrays(&fresh), "the arrays");
             assert_eq!(e.history().len(), 1);
-
-            // a fused side, more modes than the fused column pass takes
-            let [mut e, mut fresh] = [(); 2].map(|()| engine_at(&ctx, true, false, 64, 17));
-            assert!(FUSED_SIDES.contains(&64));
-            let mut none = ProbeVariation::none([64; 2]);
-            let refusals = [("lsqml of 17 modes", e.lsqml(&lsqml, &mut none, 1, 1))];
-            as_fresh(&mut e, &mut fresh, &refusals);
 
             let [mut e, mut fresh] = [(); 2].map(|()| engine_at(&ctx, true, false, 64, 2));
             let varied = || {

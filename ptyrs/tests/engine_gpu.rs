@@ -205,6 +205,68 @@ fn dm_matches_cpu() {
     }
 }
 
+/// [`start`]'s scan masked, its probe of `nprobe` modes, and `nobj` object modes: mode `k`
+/// the scenario's object times `0.5^k`, conjugated where `k` is odd.
+fn start_modes(frame: usize, nprobe: usize, nobj: usize) -> (Scan, Object, Probe) {
+    let (scan, object, probe) = common::dm_scenario(frame, NPOS, nprobe, 2e5, frame as f64 / 8.0);
+    let scan = mask(scan, |y, x| y == 3 || x == 20);
+    let [_, ny, nx] = object.dims();
+    let data = (0..nobj)
+        .flat_map(|k| {
+            let a = 0.5f64.powi(k as i32);
+            (object.as_slice().iter()).map(move |&c| a * if k % 2 == 1 { c.conj() } else { c })
+        })
+        .collect();
+    let object = Object::new(Stack::from_vec([nobj, ny, nx], data).unwrap());
+    let mut p = Ptycho::new(&scan, object, probe).unwrap();
+    p.scale_obj_probe();
+    let (object, probe) = p.into_modes();
+    (scan, object, probe)
+}
+
+/// AP and DM updating the object and the probe on 256- and 512-pixel frames with 5 probe
+/// modes, and with 4 probe and 2 object modes: more than a column block holds at once, so
+/// the fused passes take them in chunks. Within 1e-4 of M1's launches.
+#[test]
+fn chunked_modes_match_m1() {
+    for frame in [256, 512] {
+        for [nprobe, nobj] in [[5, 1], [4, 2]] {
+            let (scan, object, probe) = start_modes(frame, nprobe, nobj);
+            let ap = ApParams {
+                obj_inertia: Some(0.01),
+                probe_inertia: Some(0.001),
+                calc_llk: 1,
+                zero_phase_ramp: true,
+            };
+            let dm = DmParams {
+                calc_llk: 1,
+                ..DmParams::default()
+            };
+            for params in [Params::Ap(ap), Params::Dm(dm)] {
+                let step = Step { params, count: 10 };
+                let run = |options| {
+                    let (o, p) = (object.clone(), probe.clone());
+                    let mut g = GpuPtycho::new(&ctx(), &scan, o, p, options).unwrap();
+                    g.run(&step).unwrap();
+                    g
+                };
+                let (m1, fused) = (run(M1.options), run(FUSED.options));
+                let errs = [
+                    llk_rel(fused.history(), m1.history()),
+                    rel_l2(&fused.object().unwrap(), &m1.object().unwrap()),
+                    rel_l2(&fused.probe().unwrap(), &m1.probe().unwrap()),
+                ];
+                eprintln!(
+                    "frame {frame} modes {nprobe}x{nobj} {params:?}: llk {:.2e} object {:.2e} \
+                     probe {:.2e}",
+                    errs[0], errs[1], errs[2]
+                );
+                check(errs, [1e-4, 1e-4, 1e-4]);
+            }
+        }
+    }
+}
+
 #[test]
 fn raar_matches_cpu() {
     for setup in [M1, FUSED] {

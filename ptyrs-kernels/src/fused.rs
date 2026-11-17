@@ -94,11 +94,24 @@ const _: () = assert!(
     "a cols counts row is one 16-byte async copy"
 );
 /// Most threads of a [`cols`], [`shift_pre`] or [`shift_post`] block over columns of `ny`,
-/// `nmode * FUSED_COLS * ny / fft_ept(ny)`, and their kernels' launch bound, so registers cannot
-/// cap a block below it: 1024 needs a thread in 64 registers, which holds at most 8 elements.
+/// `mc * FUSED_COLS * ny / fft_ept(ny)` for `mc` modes a chunk, and their kernels' launch
+/// bound, so registers cannot cap a block below it: 1024 needs a thread in 64 registers,
+/// which holds at most 8 elements.
 #[device]
 pub const fn fused_col_threads(ny: u32) -> u32 {
     if fft_ept(ny) <= 8 { 1024 } else { 512 }
+}
+/// Most threads of a `CHUNKED` [`cols`] block over columns of `ny`, and its launch bound:
+/// the chunk loops' state spills from the 64 registers a thread of 1024 has.
+#[device]
+pub const fn fused_col_chunk_threads(ny: u32) -> u32 {
+    if fft_ept(ny) <= 8 { 768 } else { 256 }
+}
+/// Bytes of the intensity a [`cols`] block over columns of `ny` carries across its chunks of
+/// `mc` of `nmode` modes, `[ny, FUSED_COLS]` f32, and none when one chunk holds every mode.
+#[device]
+pub fn col_carry_bytes(ny: u32, nmode: u32, mc: u32) -> u32 {
+    if nmode > mc { 4 * FUSED_COLS * ny } else { 0 }
 }
 /// Threads of a [`rows_fwd`] or [`rows_inv`] block: `FUSED_ROW_THREADS / tpf` rows of `tpf =
 /// nx / fft_ept(nx)` threads each.
@@ -564,13 +577,17 @@ unsafe fn rows_fwd_with<const NX: u32, const SHIFT: bool, const HALF: bool, P: R
 /// `scale` and `background` under their flags; writes `work`, and `groups`, `scale_groups`
 /// and `background_ratio` under theirs.
 ///
-/// One 1D block of `nmode * FUSED_COLS * tpf` threads (`tpf = ny / fft_ept(ny)`): thread `tid`
-/// is thread `f = (tid / FUSED_COLS) % tpf` of FFT `m * FUSED_COLS + c`, `c = tid %
-/// FUSED_COLS`, `m = tid / (FUSED_COLS * tpf)`, so a warp's loads and stores cover whole
-/// row segments. Grid `(nx / FUSED_COLS, nf_max)`; dynamic shared memory
+/// One 1D block of `mc * FUSED_COLS * tpf` threads (`tpf = ny / fft_ept(ny)`) takes the
+/// modes in chunks of `mc`, `nmode` unless `CHUNKED` (a build of its own: the chunk loops'
+/// state spilled the one-chunk pass), with `1 <= mc` then: thread `tid` is thread `f = (tid
+/// / FUSED_COLS) % tpf` of FFT `mj * FUSED_COLS + c`, `c = tid % FUSED_COLS`, mode `k * mc +
+/// mj` of chunk `k`, `mj = tid / (FUSED_COLS * tpf)`, so a warp's loads and stores cover
+/// whole row segments.
+/// Under the inverting flags, every chunk but the last stores its spectra to `work` and
+/// reloads them for the inverse. Grid `(nx / FUSED_COLS, nf_max)`; dynamic shared memory
 /// `col_slot_bytes(flags, ny)` bytes of reduction slots, `2 * FUSED_COLS * ny` bytes of
-/// counts, then the larger of `nmode * FUSED_COLS` column FFTs ([`FFT_SKEW`]) and
-/// `4 * nmode * ny * FUSED_COLS` bytes.
+/// counts, `col_carry_bytes(ny, nmode, mc)`, then the larger of `mc * FUSED_COLS` column FFTs
+/// ([`FFT_SKEW`]) and `4 * mc * ny * FUSED_COLS` bytes.
 /// `counts` must be 16-byte aligned. Of the [`FUSED_MODEL_TERMS`], the build honours those
 /// in `TERMS` and ignores the rest of `cfg.flags`.
 ///
@@ -579,7 +596,7 @@ unsafe fn rows_fwd_with<const NX: u32, const SHIFT: bool, const HALF: bool, P: R
 /// `NY == g.ny`; `work`, `counts` and the buffers the flags name hold their shapes for `g`;
 /// `ctl` one entry; launch as above.
 #[device]
-pub unsafe fn cols<const NY: u32, const TERMS: u32>(
+pub unsafe fn cols<const NY: u32, const TERMS: u32, const CHUNKED: bool>(
     p: FusedPtrs,
     ctl: *const StackCtl,
     g: StackGeom,
@@ -598,11 +615,20 @@ pub unsafe fn cols<const NY: u32, const TERMS: u32>(
     let tid = thread::threadIdx_x();
     let c = tid % FUSED_COLS;
     let f = (tid / FUSED_COLS) % tpf;
-    let m = tid / nslot;
-    let b = m * FUSED_COLS + c;
-    let bpb = nmode * FUSED_COLS;
+    // Modes per chunk, and this thread's mode of a chunk.
+    let mc = if CHUNKED {
+        thread::blockDim_x() / nslot
+    } else {
+        nmode
+    };
+    let mj = tid / nslot;
+    let nchunk = if CHUNKED { nmode.div_ceil(mc) } else { 1 };
+    let b = mj * FUSED_COLS + c;
+    let bpb = mc * FUSED_COLS;
     let u = thread::blockIdx_x() * FUSED_COLS + c;
-    let plane = (fl * nmode + m) as usize * n;
+    // This thread's element `i` of mode `m`'s column in `work`.
+    let at =
+        move |m: u32, i: u32| (fl * nmode + m) as usize * n + ((f + i * tpf) * nx + u) as usize;
     // A constant mask: a term outside `TERMS` folds away with its per-pixel work.
     let flags = cfg.flags & (TERMS | !FUSED_MODEL_TERMS);
     let llk = flags & FUSED_LLK != 0;
@@ -618,8 +644,11 @@ pub unsafe fn cols<const NY: u32, const TERMS: u32>(
         // The frame's counts under this block's columns, by stored row, copied while the
         // forward FFT runs: read per pixel after it, they stalled the pass.
         let tile = smem.add(col_slot_bytes(flags, ny) as usize);
-        let fft_smem = tile.add(2 * (FUSED_COLS * ny) as usize);
-        // `|Psi_m(v, u)|^2` at `(m * ny + v) * FUSED_COLS + c`, over the FFTs' region.
+        // `sum_m |Psi_m(v, u)|^2` over the chunks so far at `v * FUSED_COLS + c`.
+        let carry = tile.add(2 * (FUSED_COLS * ny) as usize);
+        let fft_smem = carry.add(col_carry_bytes(ny, nmode, mc) as usize);
+        let carry = carry.cast::<f32>();
+        // `|Psi_m(v, u)|^2` at `(mj * ny + v) * FUSED_COLS + c`, over the FFTs' region.
         let power = fft_smem.cast::<f32>();
         let counts = p.counts.add((f0 + fl) as usize * n);
         // The block's columns stay contiguous under the shift: `nx / 2` is a multiple of 8.
@@ -630,25 +659,66 @@ pub unsafe fn cols<const NY: u32, const TERMS: u32>(
                 tile.add(2 * (row * FUSED_COLS) as usize).cast(),
                 counts.add((row * nx + col0) as usize).cast(),
             );
-            row += nmode * nslot;
+            row += thread::blockDim_x();
         }
         async_copy::cp_async_commit_group();
-        #[unroll]
-        for i in 0..ept {
-            let v = load_c(p.work, plane + ((f + i * tpf) * nx + u) as usize);
-            r[2 * i as usize] = v.0;
-            r[2 * i as usize + 1] = v.1;
+        // Chunk `k` holds modes `k * mc..`; the last stays in registers, the others' spectra
+        // wait in `work` for the inverse.
+        let mut k = 0;
+        loop {
+            let m = k * mc + mj;
+            let last = k + 1 == nchunk;
+            #[unroll]
+            for i in 0..ept {
+                let v = if !CHUNKED || m < nmode {
+                    load_c(p.work, at(m, i))
+                } else {
+                    (0.0, 0.0)
+                };
+                r[2 * i as usize] = v.0;
+                r[2 * i as usize + 1] = v.1;
+            }
+            col_fft::<NY, false>(&mut r, fft_smem, b, f, bpb);
+            if !last && (project || grad) {
+                #[unroll]
+                for i in 0..ept {
+                    let k = 2 * i as usize;
+                    store_c(p.work, at(m, i), (r[k], r[k + 1]));
+                }
+            }
+            thread::sync_threads();
+            #[unroll]
+            for i in 0..ept {
+                let (re, im) = (r[2 * i as usize], r[2 * i as usize + 1]);
+                let v = f + i * tpf;
+                *power.add(((mj * ny + v) * FUSED_COLS + c) as usize) = re * re + im * im;
+            }
+            if last {
+                async_copy::cp_async_wait_all();
+            }
+            thread::sync_threads();
+            if CHUNKED {
+                // The running sum in ascending `m`: the one-chunk sum, bit for bit.
+                if tid < nslot {
+                    let nm = (nmode - k * mc).min(mc);
+                    #[unroll]
+                    for i in 0..ept {
+                        let v = f + i * tpf;
+                        let to = carry.add((v * FUSED_COLS + c) as usize);
+                        let mut s = if k == 0 { 0.0 } else { *to };
+                        for mm in 0..nm {
+                            s += *power.add(((mm * ny + v) * FUSED_COLS + c) as usize);
+                        }
+                        *to = s;
+                    }
+                }
+                thread::sync_threads();
+            }
+            if last {
+                break;
+            }
+            k += 1;
         }
-        col_fft::<NY, false>(&mut r, fft_smem, b, f, bpb);
-        thread::sync_threads();
-        #[unroll]
-        for i in 0..ept {
-            let (re, im) = (r[2 * i as usize], r[2 * i as usize + 1]);
-            let v = f + i * tpf;
-            *power.add(((m * ny + v) * FUSED_COLS + c) as usize) = re * re + im * im;
-        }
-        async_copy::cp_async_wait_all();
-        thread::sync_threads();
         let inv_n = 1.0 / n as f32;
         let tile = tile.cast::<u16>();
         // `1 * I == I`: without `FUSED_SCALE` every result is the unscaled pass's, bit for bit.
@@ -657,69 +727,87 @@ pub unsafe fn cols<const NY: u32, const TERMS: u32>(
         } else {
             1.0
         };
-        let mut acc = LlkPartial::default();
-        let mut sacc = ScalePartial::default();
-        #[unroll]
-        for i in 0..ept {
-            let v = f + i * tpf;
-            let mut s = 0.0f32;
-            for mm in 0..nmode {
-                s += *power.add(((mm * ny + v) * FUSED_COLS + c) as usize);
-            }
-            let intensity = s * inv_n;
+        // Detector pixel `j`, `calc` and counts at spectrum row `v` of mode power sum `s`.
+        let pixel = move |v: u32, s: f32| {
             let y = (v + ny / 2) % ny;
-            // Detector pixel: `col0 + c` is `(u + nx / 2) % nx`.
+            // `col0 + c` is `(u + nx / 2) % nx`.
             let j = (y * nx + col0 + c) as usize;
-            let mut calc = sf * intensity;
+            let mut calc = sf * (s * inv_n);
             if background {
                 calc += *p.background.add(j);
             }
-            let obs = *tile.add((y * FUSED_COLS + c) as usize);
-            if m == 0 && bg_ratio {
-                *p.background_ratio.add(fl as usize * n + j) = if obs == MASKED {
-                    0.0
-                } else {
-                    zdiv(obs as f32, calc.max(1e-12))
-                };
-            }
-            if m == 0 && obs != MASKED {
-                let obs = obs as f32;
-                if llk {
-                    llk_add(&mut acc, obs, calc.max(0.0));
-                }
-                if sums {
-                    sacc.intensity += intensity;
-                    sacc.ratio += zdiv(obs * intensity, calc.max(1e-12));
-                    sacc.amplitude += zsqrt(obs * intensity);
-                }
-            }
+            (j, calc, *tile.add((y * FUSED_COLS + c) as usize))
+        };
+        // The `FUSED_PROJECT` or the `FUSED_GRAD` scale of `calc` and `obs`, never both.
+        let scale = move |calc: f32, obs: u16| {
             if project {
-                let scale = if obs == MASKED {
+                if obs == MASKED {
                     inv_n
                 } else {
                     zsqrt(zdiv(obs as f32, calc.max(1e-12))) * inv_n
-                };
-                r[2 * i as usize] *= scale;
-                r[2 * i as usize + 1] *= scale;
+                }
+            } else if obs == MASKED {
+                0.0
+            } else {
+                2.0 * sf * (1.0 - zdiv(obs as f32, calc.max(1e-12))) * inv_n
             }
-            if grad {
-                let scale = if obs == MASKED {
-                    0.0
+        };
+        let mut acc = LlkPartial::default();
+        let mut sacc = ScalePartial::default();
+        // Under `CHUNKED` only mode 0's threads take the pixels, and each carried sum becomes
+        // its pixel's scale for every chunk's spectra to read.
+        if !CHUNKED || mj == 0 {
+            #[unroll]
+            for i in 0..ept {
+                let v = f + i * tpf;
+                let s = if CHUNKED {
+                    *carry.add((v * FUSED_COLS + c) as usize)
                 } else {
-                    2.0 * sf * (1.0 - zdiv(obs as f32, calc.max(1e-12))) * inv_n
+                    let mut s = 0.0f32;
+                    for mm in 0..nmode {
+                        s += *power.add(((mm * ny + v) * FUSED_COLS + c) as usize);
+                    }
+                    s
                 };
-                r[2 * i as usize] *= scale;
-                r[2 * i as usize + 1] *= scale;
+                let intensity = s * inv_n;
+                let (j, calc, obs) = pixel(v, s);
+                if mj == 0 && bg_ratio {
+                    *p.background_ratio.add(fl as usize * n + j) = if obs == MASKED {
+                        0.0
+                    } else {
+                        zdiv(obs as f32, calc.max(1e-12))
+                    };
+                }
+                if mj == 0 && obs != MASKED {
+                    let obs = obs as f32;
+                    if llk {
+                        llk_add(&mut acc, obs, calc.max(0.0));
+                    }
+                    if sums {
+                        sacc.intensity += intensity;
+                        sacc.ratio += zdiv(obs * intensity, calc.max(1e-12));
+                        sacc.amplitude += zsqrt(obs * intensity);
+                    }
+                }
+                if project || grad {
+                    let scale = scale(calc, obs);
+                    if CHUNKED {
+                        *carry.add((v * FUSED_COLS + c) as usize) = scale;
+                    } else {
+                        r[2 * i as usize] *= scale;
+                        r[2 * i as usize + 1] *= scale;
+                    }
+                }
             }
         }
         if llk || sums {
-            // Mode 0's threads are `tid < nslot`; a fixed tree over them per term reduced,
-            // rows `lo..hi` of the slots `[7][nslot]`: the LLK terms 0 to 3, the scale sums
-            // 4 to 6.
+            // A chunk's mode-0 threads are `tid < nslot`; a fixed tree over them per term
+            // reduced, rows `lo..hi` of the slots `[7][nslot]`: the LLK terms 0 to 3, the
+            // scale sums 4 to 6.
             let lo = if llk { 0 } else { 4 };
             let hi = if sums { 7 } else { 4 };
             let ns = nslot as usize;
-            if m == 0 {
+            if mj == 0 {
                 // One store per term: an array indexed by the runtime `lo..hi` lives in
                 // local memory.
                 let s = slots.add(tid as usize);
@@ -767,14 +855,41 @@ pub unsafe fn cols<const NY: u32, const TERMS: u32>(
             }
         }
         if project || grad {
-            // Every power is read before the inverse FFT reuses the region.
-            thread::sync_threads();
-            col_fft::<NY, true>(&mut r, fft_smem, b, f, bpb);
-            #[unroll]
-            for i in 0..ept {
-                let k = 2 * i as usize;
-                let at = plane + ((f + i * tpf) * nx + u) as usize;
-                store_c(p.work, at, (r[k], r[k + 1]));
+            if CHUNKED {
+                thread::sync_threads();
+                #[unroll]
+                for i in 0..ept {
+                    let scale = *carry.add(((f + i * tpf) * FUSED_COLS + c) as usize);
+                    r[2 * i as usize] *= scale;
+                    r[2 * i as usize + 1] *= scale;
+                }
+            }
+            // The last chunk first, then each earlier one reloaded and scaled as it was.
+            let mut k = nchunk - 1;
+            loop {
+                let m = k * mc + mj;
+                // Every power and FFT element is read before the inverse FFT reuses the region.
+                thread::sync_threads();
+                col_fft::<NY, true>(&mut r, fft_smem, b, f, bpb);
+                if !CHUNKED || m < nmode {
+                    #[unroll]
+                    for i in 0..ept {
+                        let k = 2 * i as usize;
+                        store_c(p.work, at(m, i), (r[k], r[k + 1]));
+                    }
+                }
+                if k == 0 {
+                    break;
+                }
+                k -= 1;
+                let m = k * mc + mj;
+                #[unroll]
+                for i in 0..ept {
+                    let w = load_c(p.work, at(m, i));
+                    let scale = *carry.add(((f + i * tpf) * FUSED_COLS + c) as usize);
+                    r[2 * i as usize] = w.0 * scale;
+                    r[2 * i as usize + 1] = w.1 * scale;
+                }
             }
         }
     }
@@ -1017,9 +1132,10 @@ unsafe fn gather_with<const SHIFT: bool, const HALF: bool, const DEN: bool>(
 /// i freq(ky, ny))` into `shift_adj`. Reads `offsets` and `spectrum`, mode 0 of frame `f`
 /// as [`ProbeSrc`] says; writes `shift`, and `shift_adj` under those flags.
 ///
-/// One 1D block of `nprobe * FUSED_COLS * tpf` threads mapped as [`cols`] maps modes, with
-/// probe modes for modes; grid `(nx / FUSED_COLS, nf_max)`; dynamic shared memory `8 * ny`
-/// bytes of `e_y`, then `nprobe * FUSED_COLS` column FFTs ([`FFT_SKEW`]).
+/// One 1D block of `mcs * FUSED_COLS * tpf` threads (`mcs` divides `nprobe`) mapped as
+/// [`cols`] maps a chunk's modes, with probe modes `blockIdx.z * mcs + mj` for modes; grid
+/// `(nx / FUSED_COLS, nf_max, nprobe / mcs)`; dynamic shared memory `8 * ny` bytes of `e_y`,
+/// then `mcs * FUSED_COLS` column FFTs ([`FFT_SKEW`]).
 ///
 /// # Safety
 ///
@@ -1044,8 +1160,10 @@ pub unsafe fn shift_pre<const NY: u32>(
     let tid = thread::threadIdx_x();
     let c = tid % FUSED_COLS;
     let f = (tid / FUSED_COLS) % tpf;
-    let pm = tid / nslot;
-    let (b, bpb) = (pm * FUSED_COLS + c, g.nprobe * FUSED_COLS);
+    let mcs = thread::blockDim_x() / nslot;
+    let mj = tid / nslot;
+    let pm = thread::blockIdx_z() * mcs + mj;
+    let (b, bpb) = (mj * FUSED_COLS + c, mcs * FUSED_COLS);
     let kx = thread::blockIdx_x() * FUSED_COLS + c;
     let plane = (fl * g.nprobe + pm) as usize * n;
     let mut r = [0.0f32; 2 * FFT_EPT_MAX as usize];
@@ -1059,7 +1177,7 @@ pub unsafe fn shift_pre<const NY: u32>(
         let mut k = tid;
         while k < ny {
             store_c(ey, k as usize, ramp(dy, k, ny));
-            k += g.nprobe * nslot;
+            k += thread::blockDim_x();
         }
         thread::sync_threads();
         let ex = ramp(dx, kx, nx);
@@ -1531,7 +1649,7 @@ pub unsafe fn shift_norm<const NX: u32>(
 /// probe adjoint's `G = conj(e_f) H`. Reads `offsets` and `shift_adj`; writes `shift_adj`.
 ///
 /// Block and grid as [`shift_pre`]; dynamic shared memory `8 * ny` bytes of `e_y`, then
-/// `nprobe * FUSED_COLS` column FFTs ([`FFT_SKEW`]).
+/// `mcs * FUSED_COLS` column FFTs ([`FFT_SKEW`]).
 ///
 /// # Safety
 ///
@@ -1555,8 +1673,10 @@ pub unsafe fn shift_post<const NY: u32>(
     let tid = thread::threadIdx_x();
     let c = tid % FUSED_COLS;
     let f = (tid / FUSED_COLS) % tpf;
-    let pm = tid / nslot;
-    let (b, bpb) = (pm * FUSED_COLS + c, g.nprobe * FUSED_COLS);
+    let mcs = thread::blockDim_x() / nslot;
+    let mj = tid / nslot;
+    let pm = thread::blockIdx_z() * mcs + mj;
+    let (b, bpb) = (mj * FUSED_COLS + c, mcs * FUSED_COLS);
     let kx = thread::blockIdx_x() * FUSED_COLS + c;
     let plane = (fl * g.nprobe + pm) as usize * n;
     let mut r = [0.0f32; 2 * FFT_EPT_MAX as usize];
@@ -1569,7 +1689,7 @@ pub unsafe fn shift_post<const NY: u32>(
         let mut k = tid;
         while k < ny {
             store_c(ey, k as usize, ramp(dy, k, ny));
-            k += g.nprobe * nslot;
+            k += thread::blockDim_x();
         }
         thread::sync_threads();
         #[unroll]
