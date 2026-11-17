@@ -31,6 +31,17 @@ pub struct OprKernels {
     module: opr_kernels::LoadedModule,
 }
 
+/// Fails unless a probe variation's batches may hold `nb` frames: its launches over a batch,
+/// [`Opr`]'s and the own spectra's, put one plane per frame along grid y.
+pub(crate) fn variation_batch(nb: u32) -> Result<(), Error> {
+    if nb == 0 || nb as u64 > GRID_Y_MAX {
+        return Err(Error::Shape(format!(
+            "a probe variation's batch of {nb} frames: 1 to {GRID_Y_MAX}"
+        )));
+    }
+    Ok(())
+}
+
 /// The OPR state of one scan: `k ≥ 1` eigenmodes `[k, n]`, their weights `w_fi` at `f k + i`
 /// and, when modelled, the main mode's weights `c_f` at `f`, each refined or held, both by
 /// scan frame, with the scratch of [`OprKernels::step`] for batches of up to `nb_max` frames.
@@ -114,7 +125,8 @@ impl Opr {
         if n == 0 || u32::try_from(n).is_err() || shape.k == 0 {
             return bad(format!("{} eigenmodes in planes of {n}", shape.k));
         }
-        if nb_max == 0 || nb_max > nframe || nb_max as u64 > GRID_Y_MAX {
+        variation_batch(nb_max)?;
+        if nb_max > nframe {
             return bad(format!("batches of {nb_max} of {nframe} frames"));
         }
         let (k, nf, nb) = (shape.k as usize, nframe as usize, nb_max as usize);

@@ -11,7 +11,10 @@
 //! takes a stack's gradient, and the LLK pass takes its partials, either by M2's fused passes
 //! over one scratch set or by the M1 launch sequence ([`GpuOptions::fused`]), whose one scratch
 //! stack serves all and whose stacks of one length share a cuFFT plan, which transforms only
-//! their frames; rPIE, BH and ML's line search always run M1's launches. Each cycle enqueues through its own `ExecutionContext`, dropped when the cycle
+//! their frames; rPIE, BH and ML's line search always run M1's launches, and LSQML always its
+//! own fused passes, which take the fused passes' frame sides ([`crate::gpu::FUSED_SIDES`])
+//! and mode counts alone, as a multislice object's gaps take those sides alone.
+//! Each cycle enqueues through its own `ExecutionContext`, dropped when the cycle
 //! has been enqueued. Nothing in a cycle
 //! reads back to the host: an LLK record goes, stack by stack, into the device's
 //! [`crate::gpu::LlkRing`], whose copies download while later cycles run, and the host reads
@@ -40,8 +43,8 @@ use crate::base::{AddrTable, C64, Frame, Object, Probe, Scan, Stack};
 use crate::fault;
 use crate::fft::Plan2d;
 use crate::gpu::{
-    C32, CG_BLOCKS, Error as GpuError, FarSums, FusedBufs, FusedInputs, Model, ObjProbeScale,
-    OprShape, RecordWriter, StackRef, StackTable, ViewAddr, ViewDims, Waves,
+    C32, CG_BLOCKS, Error as GpuError, FarSums, FusedBufs, FusedInputs, GRID_Y_MAX, Model,
+    ObjProbeScale, OprShape, RecordWriter, StackRef, StackTable, ViewAddr, ViewDims, Waves,
 };
 use cuda_async::device_operation::ExecutionContext;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
@@ -62,14 +65,15 @@ pub struct GpuOptions {
     /// each pass cuts the scan, BH and LSQML each batch, into as few stacks as that takes, of
     /// lengths within a frame of each other; PyNX's default is 16. [`GpuPtycho::new`] refuses a
     /// size whose stack, or the scan if it has fewer frames, holds more exit-wave values than
-    /// u32 indexes. `None`, the default, cuts each
-    /// pass by bytes instead: as many frames as fill 3/8 of the device's L2, the fastest share at
-    /// frame sides 256 and 512, with the most bytes that the launches over a stack leave in L2
-    /// for later ones at any one point, but no fewer than keep the device's threads busy, ~3.4
-    /// pixels each. That is the shared scratch alone in AP, the LLK pass and ML's gradient, and
-    /// with it DM's and RAAR's carried exit waves (RAAR's iterate, touched once, streams); ML's
-    /// line search, BH and LSQML count their own buffers, and under the position model BH and
-    /// LSQML the shift planes they borrow from the shared scratch, whose stacks also cap theirs.
+    /// u32 indexes or more views than a launch's grid y takes, 65535. `None`, the default, cuts
+    /// each pass by bytes instead: as many frames as fill 3/8 of the device's L2, the fastest
+    /// share at frame sides 256 and 512, with the most bytes that the launches over a stack
+    /// leave in L2 for later ones at any one point, but no fewer than keep the device's threads
+    /// busy, ~3.4 pixels each. That is the shared scratch alone in AP, the LLK pass and ML's
+    /// gradient, and with it DM's and RAAR's carried exit waves (RAAR's iterate, touched once,
+    /// streams); ML's line search, BH and LSQML count their own buffers, and under the position
+    /// model BH and LSQML the shift planes they borrow from the shared scratch, whose stacks
+    /// also cap theirs.
     pub stack_size: Option<usize>,
     /// Replay every AP, DM and ML cycle, rPIE epoch and LLK pass from a CUDA graph captured once
     /// per kind of cycle instead of launching it kernel by kernel; both give the same bits.
@@ -81,7 +85,8 @@ pub struct GpuOptions {
     /// Project AP and DM stacks, take ML's gradients and the LLK pass's partials by M2's fused
     /// passes ([`crate::gpu::Kernels::fused_project`]; frame sides in
     /// [`crate::gpu::FUSED_SIDES`], and [`GpuPtycho::new`] fails on others) instead of M1's
-    /// launch sequence. The two agree to rounding, not bit for bit.
+    /// launch sequence. The two agree to rounding, not bit for bit. LSQML runs fused passes of
+    /// its own either way, and its probe variation needs these ([`GpuPtycho::lsqml`]).
     pub fused: bool,
     /// Hold DM's and RAAR's carried exit waves and RAAR's iterate as f16 pairs, each value
     /// times one power of two fixed from the counts at upload (DESIGN B5), and cut their
@@ -300,9 +305,25 @@ fn table_of(
     Ok((frames, table))
 }
 
-/// The values of a stack of `nf` frames' exit waves.
+/// The values of a stack of `nf` frames' exit waves, refused past [`stack_frames`].
 fn stack_len(dims: &ViewDims, nf: usize) -> Result<u32, EngineError> {
-    to_u32("stack length", nf * dims.nmode as usize * plane_len(dims))
+    let most = stack_frames(dims);
+    if nf > most {
+        let [ny, nx] = dims.frame;
+        return Err(EngineError::Invalid(format!(
+            "a stack of {nf} frames of {} views {ny}x{nx}: at most {most}",
+            dims.nmode
+        )));
+    }
+    Ok((nf * dims.nmode as usize * plane_len(dims)) as u32)
+}
+
+/// The most frames a stack may hold: those whose exit waves u32 indexes, and whose views fit a
+/// launch's grid y, where the fused row passes and rPIE's power max put each frame's `nmode`,
+/// the most planes per frame of any launch.
+fn stack_frames(dims: &ViewDims) -> usize {
+    let nmode = dims.nmode as usize;
+    (u32::MAX as usize / (nmode * plane_len(dims))).min(GRID_Y_MAX as usize / nmode)
 }
 
 /// A batch's frames, `batch_size` but at most the scan's, as the CPU's batches take them;
@@ -396,8 +417,7 @@ struct StackRule {
     budget: usize,
     /// The fewest frames per stack that keep the device's threads busy.
     floor: usize,
-    /// The most frames per stack: the scan's, at most those whose exit waves [`stack_len`]
-    /// indexes.
+    /// The most frames per stack: the scan's, at most [`stack_frames`].
     most: u32,
 }
 
@@ -411,7 +431,7 @@ impl StackRule {
 
     /// For `size` on a device of an `l2`-byte L2 and `threads` resident threads, and frames of
     /// `dims`; refused if a stack of `size` frames, or of one, fewer if the scan has fewer,
-    /// overflows [`stack_len`], so no stack a call cuts by it does. The floor holds ~3.4 pixels
+    /// is past [`stack_frames`], so no stack a call cuts by it is. The floor holds ~3.4 pixels
     /// per thread, where the measured fastest stacks begin: 2^19 pixels on 100 SMs of 1536
     /// threads, 32, 8 and 2 frames at 128x128, 256x256 and 512x512.
     fn new(
@@ -422,12 +442,11 @@ impl StackRule {
     ) -> Result<Self, EngineError> {
         let nframe = dims.nframe as usize;
         stack_len(dims, size.unwrap_or(1).min(nframe))?;
-        let fits = u32::MAX as usize / (dims.nmode as usize * plane_len(dims));
         Ok(Self {
             size,
             budget: l2 / 8 * 3,
             floor: (threads * 17 / 5).div_ceil(dims.n()),
-            most: dims.nframe.min(fits as u32),
+            most: dims.nframe.min(stack_frames(dims) as u32),
         })
     }
 
@@ -610,7 +629,9 @@ impl GpuPtycho {
     /// [`Self::with_optics`] on a multislice object, `objects` its slices in the order the
     /// wave crosses them, one per slice of `optics` and all of one shape. More than one
     /// slice runs LSQML ([`Self::lsqml`]) and BH ([`Self::bh`]) alone, BH's position model
-    /// only under [`crate::engine::Sampling::FullObject`]: every other algorithm fails on it.
+    /// only under [`crate::engine::Sampling::FullObject`]: every other algorithm fails on it;
+    /// and only on frame sides in [`crate::gpu::FUSED_SIDES`], whatever
+    /// [`GpuOptions::fused`] says.
     pub fn with_slices(
         ctx: &Arc<CudaContext>,
         scan: &Scan,
@@ -1313,13 +1334,60 @@ mod tests {
         assert_eq!(rule(None, 70000).unwrap().frames(&byte), 65535);
     }
 
+    /// At 128x128 and 8 views a frame u32 indexes 32767 frames' exit waves but grid y takes
+    /// 8191 frames' views: on a scan of 10000 frames a size of 8192 is refused, 8191 taken, and
+    /// unsized a fit stops at 8191. rPIE's batch, one stack, of 70000 frames at 64x64 and one
+    /// view fits u32 but not grid y.
+    #[test]
+    fn a_stack_past_grid_y_is_refused_by_the_rule() {
+        let scan = ViewDims {
+            nframe: 10000,
+            nmode: 8,
+            nprobe: 8,
+            ..dims(128)
+        };
+        let rule = |size| StackRule::new(size, 64 << 20, 1, &scan);
+        for size in [8192, 10000] {
+            let r = rule(Some(size));
+            assert!(matches!(r, Err(EngineError::Invalid(_))), "{size}: {r:?}");
+        }
+        assert_eq!(rule(Some(8191)).unwrap().frames(&[]), 8191);
+        let byte = [Streamed::new(1, 0..=1)];
+        assert_eq!(rule(None).unwrap().frames(&byte), 8191);
+
+        let one = ViewDims {
+            nframe: 70000,
+            nmode: 1,
+            nprobe: 1,
+            ..dims(64)
+        };
+        let params = crate::engine::RpieParams {
+            batch_size: 70000,
+            ..Default::default()
+        };
+        // rPIE's check of its batch
+        let r = stack_len(&one, batch_frames(&one, params.batch_size) as usize);
+        assert!(matches!(r, Err(EngineError::Invalid(_))), "{r:?}");
+        assert_eq!(stack_len(&one, 65535).unwrap(), 65535 * 4096);
+    }
+
     /// An engine on a simulated raster of 36 points, its object flat: 32-pixel frames, or the
     /// fused passes' smallest, 64.
     pub(super) fn engine(ctx: &Arc<CudaContext>, graph: bool, fused: bool) -> GpuPtycho {
+        engine_at(ctx, graph, fused, if fused { 64 } else { 32 }, 2)
+    }
+
+    /// [`engine`] of `n`-point frames and `nprobe` probe modes, the two simulated ones in turn.
+    fn engine_at(
+        ctx: &Arc<CudaContext>,
+        graph: bool,
+        fused: bool,
+        n: usize,
+        nprobe: usize,
+    ) -> GpuPtycho {
         use crate::base::{Counts, Geometry, Positions, required_obj_shape};
         use crate::live::farfield::{Ptycho, PtychoSpec, ScanPath};
 
-        let n = if fused { 64 } else { 32 };
         let p = Ptycho::new(PtychoSpec {
             n,
             path: ScanPath::Raster { cols: 6 },
@@ -1345,7 +1413,8 @@ mod tests {
         let obj = required_obj_shape(&scan.positions.pynx_preprocess(pixel), pixel, [n, n], 0);
         let object = Object::new(Stack::filled([1, obj[0], obj[1]], C64::new(1.0, 0.0)));
         let probe = p.probe().iter().map(|c| C64::new(c.re.into(), c.im.into()));
-        let probe = Probe::new(Stack::from_vec([2, n, n], probe.collect()).unwrap());
+        let probe = probe.cycle().take(nprobe * n * n).collect();
+        let probe = Probe::new(Stack::from_vec([nprobe, n, n], probe).unwrap());
         let options = GpuOptions {
             stack_size: Some(8),
             graph,
@@ -1363,9 +1432,10 @@ mod tests {
         use cuda_async::error::DeviceError;
 
         use super::super::*;
-        use super::engine;
+        use super::{engine, engine_at};
         use crate::engine::{Cost, Feature, ProbeVariation};
         use crate::fault::Exit;
+        use crate::gpu::FUSED_SIDES;
 
         fn ctx() -> Arc<CudaContext> {
             CudaContext::new(0).expect("GPU 0")
@@ -1444,11 +1514,40 @@ mod tests {
             e.synchronize().unwrap();
         }
 
-        /// Calls refused by their checks, the features' on M1's passes, rPIE's batch and an
-        /// object of other dims, leave LLK and AP bit for bit those of a fresh engine.
+        /// Asserts each of `refusals` [`EngineError::Invalid`], then that `e` takes LLK and runs
+        /// DM bit for bit as `fresh`.
+        fn as_fresh(
+            e: &mut GpuPtycho,
+            fresh: &mut GpuPtycho,
+            refusals: &[(&str, Result<(), EngineError>)],
+        ) {
+            for (call, r) in refusals {
+                assert!(matches!(r, Err(EngineError::Invalid(_))), "{call}: {r:?}");
+            }
+            let llk = |e: &mut GpuPtycho| {
+                let l = e.llk().unwrap();
+                [l.poisson, l.gaussian, l.euclidian, l.nb_photons_calc].map(f64::to_bits)
+            };
+            assert_eq!(llk(e), llk(fresh));
+            for e in [&mut *e, &mut *fresh] {
+                e.dm(&DmParams::default(), 1).unwrap();
+            }
+            assert!(arrays(e) == arrays(fresh), "DM's arrays");
+            assert_eq!(llk(e), llk(fresh));
+        }
+
+        /// Calls refused by their checks, the features' on M1's passes, rPIE's batch, an
+        /// object of other dims, and on M1's passes LSQML on a side or of modes its fused
+        /// passes cannot take or with a probe variation, leave LLK, DM and AP bit for bit those
+        /// of a fresh engine.
         #[test]
         fn a_call_refused_by_its_checks_changes_nothing() {
             let ctx = ctx();
+            let lsqml = LsqmlParams {
+                batch_size: 36,
+                cost: Cost::Poisson,
+                seed: 0,
+            };
             let [mut e, mut fresh] = [(); 2].map(|()| engine(&ctx, true, false));
             let scale = Features {
                 scale: Some(Feature::refined(vec![1.0; 36])),
@@ -1459,24 +1558,38 @@ mod tests {
                 ..RpieParams::default()
             };
             let other = Object::new(Stack::filled([1, 2, 2], C64::new(1.0, 0.0)));
+            let mut none = ProbeVariation::none([e.probe_dims[1], e.probe_dims[2]]);
+            assert!(!FUSED_SIDES.contains(&(e.probe_dims[1] as u32)));
             let refusals = [
                 ("set_features", e.set_features(&scale)),
                 ("rpie", e.rpie(&rpie, 1)),
                 ("set_object", e.set_object(&other)),
+                ("lsqml", e.lsqml(&lsqml, &mut none, 1, 1)),
             ];
-            for (call, r) in refusals {
-                assert!(matches!(r, Err(EngineError::Invalid(_))), "{call}: {r:?}");
-            }
-            let llk = |e: &mut GpuPtycho| {
-                let l = e.llk().unwrap();
-                [l.poisson, l.gaussian, l.euclidian, l.nb_photons_calc].map(f64::to_bits)
-            };
-            assert_eq!(llk(&mut e), llk(&mut fresh));
+            as_fresh(&mut e, &mut fresh, &refusals);
             for e in [&mut e, &mut fresh] {
                 e.ap(&ap(false), 1).unwrap();
             }
             assert!(arrays(&e) == arrays(&fresh), "the arrays");
             assert_eq!(e.history().len(), 1);
+
+            // a fused side, more modes than the fused column pass takes
+            let [mut e, mut fresh] = [(); 2].map(|()| engine_at(&ctx, true, false, 64, 17));
+            assert!(FUSED_SIDES.contains(&64));
+            let mut none = ProbeVariation::none([64; 2]);
+            let refusals = [("lsqml of 17 modes", e.lsqml(&lsqml, &mut none, 1, 1))];
+            as_fresh(&mut e, &mut fresh, &refusals);
+
+            let [mut e, mut fresh] = [(); 2].map(|()| engine_at(&ctx, true, false, 64, 2));
+            let varied = || {
+                let modes = Stack::filled([1, 64, 64], C64::new(0.01, 0.0));
+                ProbeVariation::new(modes, Feature::refined(vec![0.5; 36]))
+            };
+            let refusals = [
+                ("lsqml varied", e.lsqml(&lsqml, &mut varied(), 1, 1)),
+                ("lsqml varied, no LLK", e.lsqml(&lsqml, &mut varied(), 1, 0)),
+            ];
+            as_fresh(&mut e, &mut fresh, &refusals);
         }
 
         /// A call failing before it enqueues anything still aborts, its arrays as they were.

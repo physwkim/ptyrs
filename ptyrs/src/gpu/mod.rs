@@ -55,6 +55,7 @@ pub use fused::{
     Model, OwnSpectrumBuf, ProbeSpectrum, PsiSums, Shift, ShiftProbe, ShiftSums, ShiftedNumSums,
     ShiftedProbes, ShiftedStepSums, ShiftedSums, SpectrumBuf,
 };
+pub(crate) use fused::{GRID_Y_MAX, Shape};
 pub use grad::{
     CG_BLOCKS, GAMMA_CHUNK, GammaCounts, GammaStacks, GradKernels, ObjProbeScale, StackWindows,
     gamma_parts,
@@ -63,12 +64,14 @@ pub use lsqml::{
     FrameDirs, LSQML_REC, LsqmlAt, LsqmlChi, LsqmlKernels, LsqmlNoise, LsqmlScan, LsqmlVar,
     SliceSteps,
 };
+pub(crate) use opr::variation_batch;
 pub use opr::{FrameProbe, Opr, OprKernels, OprPlanes, OprShape, OwnModes};
 pub use ops::{
     DeviceStackTable, LLK_TREE_LEAVES, LlkPartial, LlkScratch, LlkSums, MASKED, OBJ_TILE,
     Permutation, PositionPartial, ScalePartial, StackCtl, StackGeom, StackRef, StackTable,
     SumTarget, Sums, UpdateSums, ViewAddr, ViewDims, Views, view_tiles,
 };
+pub(crate) use optics::stage_fft;
 pub use optics::{
     BandCarry, BandedTransfer, ExitPass, ExitStage, FrameWaves, OpticsKernels, SlicePhase,
     SliceSource,

@@ -21,9 +21,10 @@ use crate::gpu::{
     Error as GpuError, ExitPass, ExitStage, FarSums, FrameWaves, FusedBufs, FusedInputs,
     GammaStacks, GradKernels, HalfWaves, Kernels, LlkPartial, LlkRing, LlkScratch, LlkTotals,
     MASKED, Model, OprShape, OpticsKernels, OwnModes, PositionKernels, PositionPartial, Positions,
-    PowerMax, ProbeSpectrum, RecordWriter, RpieKernels, ScalePartial, Shift, ShiftProbe, ShiftSums,
-    ShiftedNumSums, ShiftedProbes, ShiftedSums, SlicePhase, SliceSource, SpectrumBuf, StackRef,
-    StackTable, StackWindows, SumTarget, UpdateSums, ViewAddr, ViewDims, Views, Waves, half_scale,
+    PowerMax, ProbeSpectrum, RecordWriter, RpieKernels, ScalePartial, Shape, Shift, ShiftProbe,
+    ShiftSums, ShiftedNumSums, ShiftedProbes, ShiftedSums, SlicePhase, SliceSource, SpectrumBuf,
+    StackRef, StackTable, StackWindows, SumTarget, UpdateSums, ViewAddr, ViewDims, Views, Waves,
+    half_scale, stage_fft, variation_batch,
 };
 use crate::tile::TileDots;
 use cuda_async::cuda_graph::CudaGraph;
@@ -1589,7 +1590,8 @@ impl Shared {
             let f = f.map_err(|e| match e {
                 GpuError::Shape(m) if shift => EngineError::Invalid(format!("position model: {m}")),
                 GpuError::Shape(m) => EngineError::Invalid(format!(
-                    "{m}; GpuOptions {{ fused: false, .. }} runs M1's launches instead"
+                    "{m}; GpuOptions {{ fused: false, .. }} runs every algorithm but LSQML by \
+                     M1's launches instead"
                 )),
                 e => e.into(),
             })?;
@@ -2598,6 +2600,37 @@ impl Plans<'_> {
     }
 }
 
+/// Fails unless LSQML runs on frames of `dims`, by the fused passes if `fused`, in batches of
+/// `batch_size`: its fused row and column passes run whatever [`GpuOptions::fused`] says, so
+/// take the fused passes' launch shapes alone, and under a probe variation (`varied`) the LLK
+/// of each frame's own probe runs on the fused passes alone and a batch is the variation's.
+fn lsqml_runs(
+    dims: &ViewDims,
+    fused: bool,
+    batch_size: usize,
+    varied: bool,
+) -> Result<(), EngineError> {
+    Shape::of(dims).map_err(|e| shape_refused("LSQML", e))?;
+    if varied {
+        if !fused {
+            return Err(EngineError::Invalid(
+                "LSQML's probe variation needs GpuOptions { fused: true, .. }".into(),
+            ));
+        }
+        variation_batch(batch_frames(dims, batch_size)).map_err(|e| shape_refused("LSQML", e))?;
+    }
+    Ok(())
+}
+
+/// `e` as [`EngineError::Invalid`] if it is a launch shape `what` cannot take, for a check
+/// that runs the launches' own shape rule before they run.
+fn shape_refused(what: &str, e: GpuError) -> EngineError {
+    match e {
+        GpuError::Shape(m) => EngineError::Invalid(format!("{what}: {m}")),
+        e => e.into(),
+    }
+}
+
 impl Device {
     /// Loads the kernels and uploads the views, counts and starting arrays on a new stream of
     /// `ctx`; every pass cuts `0 .. nframe` by the [`StackRule`] of `ctx`'s L2, the LLK ring
@@ -2658,6 +2691,12 @@ impl Device {
                 Some(half_scale(frames.map(unmasked).max().unwrap_or(0)))
             }
         };
+        // a multislice object's gaps run the propagator stage whatever `options.fused` says
+        if slices.is_some() {
+            for n in dims.frame {
+                stage_fft(&dims, n).map_err(|e| shape_refused("a multislice object", e))?;
+            }
+        }
         let views = Views::new(&stream, dims, addrs)?;
         let tile = TileDots::new(&stream, &dims)?;
         let rule = StackRule::on(options.stack_size, ctx, &dims)?;
@@ -2986,6 +3025,12 @@ impl Device {
                 self.reshare(r);
             }
         }
+    }
+
+    /// Fails unless LSQML runs here in batches of `batch_size`, by [`lsqml_runs`].
+    pub fn lsqml_runs(&self, batch_size: usize, varied: bool) -> Result<(), EngineError> {
+        let fused = matches!(self.shared.passes, Passes::Fused(_));
+        lsqml_runs(&self.dims(), fused, batch_size, varied)
     }
 
     /// Whether an intensity scale or a detector background is modelled, refined or held.
@@ -3695,6 +3740,31 @@ mod tests {
         Wavefield,
     };
     use crate::live::farfield::{Ptycho, PtychoSpec, ScanPath};
+
+    /// LSQML's probe variation takes a batch of 65535 frames, one plane each along grid y, and
+    /// refuses 65536, or a batch size past a scan of 70000 frames; unvaried, the batch is cut
+    /// into stacks and runs.
+    #[test]
+    fn lsqml_refuses_a_variation_batch_past_grid_y() {
+        let dims = ViewDims {
+            nframe: 70000,
+            nmode: 1,
+            nprobe: 1,
+            nobj: 1,
+            frame: [64; 2],
+            obj: [1024; 2],
+            quad_phase: 0.0,
+        };
+        for batch_size in [65536, usize::MAX] {
+            let r = lsqml_runs(&dims, true, batch_size, true);
+            assert!(
+                matches!(r, Err(EngineError::Invalid(_))),
+                "{batch_size}: {r:?}"
+            );
+        }
+        lsqml_runs(&dims, true, 65535, true).unwrap();
+        lsqml_runs(&dims, true, 70000, false).unwrap();
+    }
 
     /// An engine on a simulated raster of 36 points, its object flat: 32-pixel frames, or the
     /// fused passes' smallest, 64.
