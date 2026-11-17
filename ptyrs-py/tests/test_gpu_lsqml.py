@@ -248,5 +248,5 @@ def test_lsqml_opr_rejects(scenario):
     np.testing.assert_array_equal(gpu.object, o)
     np.testing.assert_array_equal(gpu.probe, p)
     m1 = gpu_at(scan, obj, probe, False, None)
-    with pytest.raises(RuntimeError, match="fused"):
+    with pytest.raises(ValueError, match="fused"):
         m1.lsqml(1, 1, 4, "poisson", 7, opr=(e, w, c))
