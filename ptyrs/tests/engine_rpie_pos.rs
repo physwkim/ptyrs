@@ -125,6 +125,7 @@ const STEP: RpieParams = RpieParams {
     probe_alpha: 0.2,
     batch_size: 20,
     calc_llk: 1,
+    seed: 7,
 };
 
 /// Three epochs of ten batches of 4 from offsets within 0.15.
@@ -135,6 +136,7 @@ const EPOCHS: RpieParams = RpieParams {
     probe_alpha: 0.5,
     batch_size: 4,
     calc_llk: 1,
+    seed: 7,
 };
 
 /// [`STEP`] under PATCH.

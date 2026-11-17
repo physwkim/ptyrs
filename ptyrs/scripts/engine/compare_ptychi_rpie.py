@@ -5,11 +5,12 @@ Usage: python -I compare_ptychi_rpie.py <dir> [--gpu]
 Maps the Rust start onto pty-chi's model: the same object; the probe times the quadratic
 phase and 1/sqrt(ny*nx), since pty-chi has no quadratic phase and an unnormalised FFT; and
 positions whose integer windows start at the Rust window corners (views.txt). Runs
-RPIEReconstructor in f64 with SGD and the parameters in rpie.txt, on consecutive unshuffled
-batches, with every constraint pty-chi enables by default switched off. After each epoch the
-state is mapped back and its normalised LLK computed by PyNX cpu_operator promoted to f64,
-the LLK the Rust history records; prints per-epoch relative differences against
-llk_rust.txt, writes llk_ptychi.txt, and compares the final arrays with final_rust.h5.
+RPIEReconstructor in f64 with SGD and the parameters in rpie.txt, on the engine's random_batches
+from rpie.txt's seed (refs/f64/random_batches.py), with every constraint pty-chi enables by
+default switched off. After each epoch the state is mapped back and its normalised LLK
+computed by PyNX cpu_operator promoted to f64, the LLK the Rust history records; prints
+per-epoch relative differences against llk_rust.txt, writes llk_ptychi.txt, and compares the
+final arrays with final_rust.h5.
 """
 import importlib.util
 import pathlib
@@ -24,17 +25,18 @@ import ptychi.api as api
 from ptychi.api.task import PtychographyTask
 
 
-def sibling(name):
-    """Import a script next to this one (python -I keeps its directory off sys.path)."""
+def script(path):
+    """Import a script by path (python -I keeps its directory off sys.path)."""
     sys.dont_write_bytecode = True  # no __pycache__ in the source tree
-    path = pathlib.Path(__file__).with_name(f"{name}.py")
-    spec = importlib.util.spec_from_file_location(name, path)
+    spec = importlib.util.spec_from_file_location(path.stem, path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
 
 
-pynx = sibling("compare_pynx")
+HERE = pathlib.Path(__file__).parent
+pynx = script(HERE / "compare_pynx.py")
+rb = script(HERE.parents[2] / "refs" / "f64" / "random_batches.py")
 
 
 def main():
@@ -100,8 +102,8 @@ def main():
         probe_position_x_px=views[:, 1].astype(np.float64),
     )
     rec = task.reconstructor
-    # pty-chi shuffles; the Rust batches are consecutive frames in scan order
-    rec.dataloader = DataLoader(rec.dataset, batch_size=batch, shuffle=False)
+    rec.dataloader = DataLoader(rec.dataset,
+                                batch_sampler=rb.Sampler(len(views), batch, int(params["seed"])))
 
     def state():
         obj = task.get_data_to_cpu("object", as_numpy=True).astype(np.complex128)

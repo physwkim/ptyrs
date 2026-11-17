@@ -165,7 +165,8 @@ fn rpie_params(kw: Option<&Bound<'_, PyDict>>) -> PyResult<::ptyrs::engine::Rpie
         obj_alpha,
         probe_alpha,
         batch_size,
-        calc_llk
+        calc_llk,
+        seed
     ))
 }
 

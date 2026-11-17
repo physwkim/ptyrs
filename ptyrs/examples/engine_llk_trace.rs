@@ -97,8 +97,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::fs::write(
             out.join("rpie.txt"),
             format!(
-                "obj_step {os}\nprobe_step {ps}\nobj_alpha {}\nprobe_alpha {}\nbatch_size {}\n",
-                RPIE.obj_alpha, RPIE.probe_alpha, RPIE.batch_size
+                "obj_step {os}\nprobe_step {ps}\nobj_alpha {}\nprobe_alpha {}\nbatch_size {}\nseed {}\n",
+                RPIE.obj_alpha, RPIE.probe_alpha, RPIE.batch_size, RPIE.seed
             ),
         )?;
     }

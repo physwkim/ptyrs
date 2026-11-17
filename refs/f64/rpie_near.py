@@ -8,7 +8,8 @@ engine's PyNX position preprocessing leaves them alone. GEOMETRIES (wavelength, 
 distance) give an angular-spectrum propagator and a Fresnel transform forward and back; the
 counts are the truth's Poisson counts through each, natural (centred) layout.
 
-The batches are consecutive in scan order. Per batch, all from the batch-start state, in
+Epoch e's batches are random_batches(nframe, size, SEED, e) (random_batches.py), the engine's
+order, fed to pty-chi as its batch sampler. Per batch, all from the batch-start state, in
 lsqml_near.py's convention (U pty-chi's propagate_forward over sqrt(k), pty-chi's probe
 P / sqrt(k)):
 
@@ -45,6 +46,7 @@ import sys
 import numpy as np
 
 EPOCHS = 30
+SEED = 7  # RpieParams' default
 BATCHES = (1, 2, 4, 8, 16)
 # pty-chi's defaults but for the object step: the object change is a sum over the batch's
 # frames, so at pty-chi's 1 it diverges on both sides once a batch's frames overlap
@@ -68,6 +70,7 @@ def sibling(name):
 
 near = sibling("lsqml_near")
 ls = near.ls
+rb = near.rb
 AX = near.AX
 
 
@@ -103,16 +106,15 @@ def batch_step(g, obj, probe, corners, counts, idx, prm):
 def model(g, obj, probe, corners, counts, batch, prm):
     """EPOCHS epochs of the model: (obj, probe, LLK trace)."""
     trace = [near.llk(g, obj, probe, corners, counts)]
-    for _ in range(EPOCHS):
-        for b0 in range(0, len(corners), batch):
-            idx = np.arange(b0, min(b0 + batch, len(corners)))
+    for epoch in range(EPOCHS):
+        for idx in rb.random_batches(len(corners), batch, SEED, epoch):
             obj, probe = batch_step(g, obj, probe, corners, counts, idx, prm)
         trace.append(near.llk(g, obj, probe, corners, counts))
     return obj, probe, np.array(trace)
 
 
 def ptychi(g, obj, probe, corners, counts, batch, prm):
-    """pty-chi RPIE for EPOCHS epochs of consecutive batches: (obj, probe, LLK trace)."""
+    """pty-chi RPIE for EPOCHS epochs of the engine's batches: (obj, probe, LLK trace)."""
     import torch
     from torch.utils.data import DataLoader
     import ptychi.api as api
@@ -155,7 +157,8 @@ def ptychi(g, obj, probe, corners, counts, batch, prm):
         probe_position_x_px=corners[:, 1].astype(np.float64),
     )
     rec = t.reconstructor
-    rec.dataloader = DataLoader(rec.dataset, batch_size=batch, shuffle=False)
+    rec.dataloader = DataLoader(rec.dataset,
+                                batch_sampler=rb.Sampler(len(corners), batch, SEED))
     trace = [near.llk(g, obj, probe, corners, counts)]
     with torch.no_grad():
         for _ in range(EPOCHS):

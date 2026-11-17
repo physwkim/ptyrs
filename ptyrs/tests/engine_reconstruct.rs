@@ -219,9 +219,10 @@ fn raar_llk_matches_pynx() {
     assert_history_matches(rest, 1, include_str!("engine/data/raar_pynx_f64.txt"));
 }
 
-/// rPIE against pty-chi `RPIEReconstructor` in f64 (`scripts/compare_ptychi_rpie.py <dir>`),
-/// epochs 0-19 of `cargo run --release -p ptyrs --example engine_llk_trace -- <dir> rpie 20 1
-/// 32 40`, saved from `<dir>/llk_ptychi.txt` to `tests/data/rpie_ptychi_f64.txt`.
+/// rPIE against pty-chi `RPIEReconstructor` in f64 on the same shuffled batches, its loader
+/// fed the engine's `random_batches` (`scripts/engine/compare_ptychi_rpie.py <dir>`), epochs
+/// 0-19 of `cargo run --release -p ptyrs --example engine_llk_trace -- <dir> rpie 20 1 32 40`,
+/// saved from `<dir>/llk_ptychi.txt` to `tests/engine/data/rpie_ptychi_f64.txt`.
 #[test]
 fn rpie_llk_matches_ptychi() {
     let mut p = parity_start();

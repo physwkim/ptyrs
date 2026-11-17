@@ -20,13 +20,13 @@ apart.
 
 Matched settings as in compare_rpie.py and refs/f64/bh_step.py: pty-chi features ptyrs does not
 implement are off (object-probe ambiguity removal, mode orthogonalisation), PATCH shifts at the
-PyNX integer corners, consecutive rPIE batches, and gpu_target's parameters read from the pty-chi
-options (ptyrs_args). rPIE takes pty-chi's rPIE test settings
-(test_2d_ptycho_rpie_synthesisdictlearn.py, SDL probe off): pty-chi's defaults diverge on
-fermat_clean on both sides (compare_rpie.py --ptychi-defaults). LSQML takes pty-chi's defaults
-(batch 100, Gaussian noise, the engine's Cost::Amplitude) with compare_lsqml.py's matched config,
-both sides over the engine's random_batches order (seed 7); --positions makes the probe positions
-optimizable at pty-chi's default position correction, which ptyrs' Features::position models.
+PyNX integer corners, every method's batches in the engine's random_batches order (SEED), and
+gpu_target's parameters read from the pty-chi options (ptyrs_args). rPIE takes pty-chi's rPIE
+test settings (test_2d_ptycho_rpie_synthesisdictlearn.py, SDL probe off): pty-chi's defaults
+diverge on fermat_clean on both sides (compare_rpie.py --ptychi-defaults). LSQML takes pty-chi's
+defaults (batch 100, Gaussian noise, the engine's Cost::Amplitude) with compare_lsqml.py's matched
+config; --positions makes the probe positions optimizable at pty-chi's default position
+correction, which ptyrs' Features::position models.
 """
 
 import time
@@ -50,7 +50,7 @@ from compare_rpie import rpie_params  # noqa: E402
 from random_batches import Sampler  # noqa: E402
 
 FACTOR = 1.01
-SEED = 7  # the engine's frame order: BH's in its one batch, LSQML's batches
+SEED = 7  # the engine's frame order: BH's in its one batch, LSQML's and rPIE's batches
 SCRATCH = os.path.expanduser("~/work/ptyrs-scratch")
 KEYS = {"imports_s", "read_s", "context_s", "setup_s", "llk", "target", "wall_s", "end_llk"}
 
@@ -109,10 +109,10 @@ def ptyrs_args(method, opts):
         return ["lsqml", str(r.batch_size), "amplitude", str(SEED),
                 str(int(opts.probe_position_options.optimizable))]
     if method == "rpie":
-        p = rpie_params(opts)
+        p = rpie_params(opts, SEED)
         return ["rpie", *(repr(float(p[k])) for k in
                           ("obj_step", "probe_step", "obj_alpha", "probe_alpha")),
-                str(p["batch_size"])]
+                str(p["batch_size"]), str(p["seed"])]
     assert r.method == "CG" and pr.optimizable and opts.object_options.optimizable
     return [
         "bh",
@@ -145,11 +145,8 @@ def ptychi_task(ds, obj, probe, opts):
         probe_position_x_px=corners[:, 1],
     )
     rec = task.reconstructor
-    if isinstance(opts, api.LSQMLOptions):
-        sampler = Sampler(len(corners), rec.batch_size, SEED)
-        rec.dataloader = DataLoader(rec.dataset, batch_sampler=sampler)
-    else:
-        rec.dataloader = DataLoader(rec.dataset, batch_size=rec.batch_size, shuffle=False)
+    rec.dataloader = DataLoader(rec.dataset,
+                                batch_sampler=Sampler(len(corners), rec.batch_size, SEED))
     return task
 
 
@@ -177,7 +174,7 @@ def worker(args):
         torch.cuda.synchronize()
         wall += time.perf_counter() - t
         sampler = task.reconstructor.dataloader.batch_sampler
-        assert not isinstance(sampler, Sampler) or sampler.epoch == e, (sampler.epoch, e)
+        assert sampler.epoch == e, (sampler.epoch, e)
         if e % every and e < args.long:
             continue
         v = m3ref.evaluate(task)["gaussian"]

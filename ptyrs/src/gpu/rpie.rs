@@ -26,7 +26,7 @@ use ptyrs_kernels::rpie::{WeightGeom, rpie_kernels};
 
 pub use ptyrs_kernels::rpie::POWER_CHUNK;
 
-use crate::gpu::{C32, Error, Kernels, StackCtl, StackRef, ViewDims, Views, check_len, dptr};
+use crate::gpu::{BhScan, C32, Error, Kernels, StackCtl, StackRef, Views, check_len, dptr};
 
 /// The rPIE kernels, bound to the module a [`Kernels`] loaded.
 #[derive(Clone, Debug)]
@@ -55,29 +55,32 @@ impl RpieKernels {
     /// pty-chi's modulus constraint on the forward-FFT'd stack: each pixel's modes are
     /// scaled by `sqrt(obs + 1e-7) / (sqrt(icalc) + 1e-7) / n`, `icalc = sum_m |Psi_m|^2 /
     /// n`, or by `1 / n` where the count is `MASKED`; the unnormalized inverse FFT then
-    /// yields pty-chi's corrected exit wave. `counts` holds the whole scan.
+    /// yields pty-chi's corrected exit wave. The stack's frames are `scan`'s epoch positions.
     pub fn amplitude(
         &self,
         ctx: &ExecutionContext,
-        dims: &ViewDims,
+        scan: BhScan<'_>,
         stack: StackRef<'_>,
-        counts: &DeviceBuffer<u16>,
         psi: &mut DeviceBuffer<C32>,
     ) -> Result<(), Error> {
+        let dims = scan.check()?;
         let g = dims.geom(stack)?;
         let (n, nf_max) = (g.ny as usize * g.nx as usize, g.nf_max as usize);
-        check_len("counts", counts, dims.nframe as usize * n)?;
         check_len("psi", psi, nf_max * dims.nmode as usize * n)?;
         let (_, config) = elems(nf_max * n)?;
-        let reads = [counts.storage(), stack.storage()];
+        let reads = [
+            scan.counts.storage(),
+            scan.order.ids().storage(),
+            stack.storage(),
+        ];
         self.base.launch(ctx, &reads, &[psi.storage()], |stream| {
-            // SAFETY: lengths checked above.
+            // SAFETY: lengths checked above; the ids are a permutation of the frames.
             unsafe {
                 self.module.rpie_amplitude(
                     stream,
                     config,
                     dptr(psi),
-                    dptr(counts),
+                    scan.obs(),
                     stack.ctl() as *const StackCtl,
                     g,
                 )

@@ -40,6 +40,7 @@ const RPIE: RpieParams = RpieParams {
     probe_alpha: 0.5,
     batch_size: 4,
     calc_llk: 1,
+    seed: 7,
 };
 
 /// The scan of the weak truth at `distance`, its optics, the truth and the probe; counts the

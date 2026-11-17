@@ -126,6 +126,7 @@ fn rpie_matches_ptychi() {
             probe_alpha: r[7],
             batch_size: r[2] as usize,
             calc_llk: 1,
+            ..RpieParams::default()
         };
         let mut llks = vec![p.llk().poisson];
         p.rpie(&params, r[3] as usize).unwrap();
