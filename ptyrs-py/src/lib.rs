@@ -9,6 +9,7 @@
 //! translations in metres (CXI `translation`).
 
 mod cpu;
+mod frc;
 mod gpu;
 
 use ::ptyrs::base::{C64, CoreError, Counts, Geometry, Object, Positions, Stack};
@@ -470,5 +471,6 @@ fn ptyrs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<cpu::Lsqml>()?;
     m.add_class::<cpu::Bh>()?;
     m.add_class::<gpu::GpuPtycho>()?;
+    frc::add(m)?;
     Ok(())
 }
