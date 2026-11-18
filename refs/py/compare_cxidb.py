@@ -347,10 +347,12 @@ def centres_region(data):
 def frc(out, region, a, b):
     """examples/frc_pair.rs on OUT/<a>.h5 and OUT/<b>.h5."""
     (y0, y1), (x0, x1) = region
-    cmd = ["cargo", "run", "--release", "-q", "--manifest-path", f"{ROOT}/Cargo.toml", "-p",
-           "ptyrs", "--example", "frc_pair", "--", f"{out}/{a}.h5", f"{out}/{b}.h5",
-           str(y0), str(y1), str(x0), str(x1)]
-    line = subprocess.run(cmd, check=True, capture_output=True, text=True).stdout.strip()
+    out = os.path.abspath(out)
+    # run in ROOT: cargo reads .cargo/config.toml from its working directory, not --manifest-path
+    cmd = ["cargo", "run", "--release", "-q", "-p", "ptyrs", "--example", "frc_pair", "--",
+           f"{out}/{a}.h5", f"{out}/{b}.h5", str(y0), str(y1), str(x0), str(x1)]
+    line = subprocess.run(cmd, cwd=ROOT, check=True, capture_output=True,
+                          text=True).stdout.strip()
     print(f"  {a} vs {b}: {line}")
 
 
