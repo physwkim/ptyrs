@@ -13,11 +13,13 @@ their relative difference; exits 1 at the first epoch past rtol, 2 if a side div
 --batch, --object-step and --seed go to both sides; the other rPIE parameters are read from
 pty-chi's RPIEOptions defaults (pty-chi 0605630) and handed to Ptycho.rpie. pty-chi's own object
 step, 1 times the sum over a batch of 100 frames, diverges on this data with shuffled batches and
-with consecutive ones; --ptychi-defaults shows it. The rest is matched as in compare_lsqml.py:
-both sides over the engine's random_batches order seeded by --seed, pty-chi features ptyrs does not implement are off (object-probe ambiguity
-removal, mode orthogonalisation), PATCH shifts at integer corners. --ptychi-defaults runs pty-chi
-alone with its defaults untouched (batch and object step, shuffled batches seeded by --seed,
-ambiguity removal, orthogonalisation, AUTO shifts).
+with consecutive ones; --ptychi-defaults shows it. The matched pty-chi takes the engine's object
+step weight, normalised by the batch's overlap (refs/f64/rpie_weight.py), which at one frame per
+batch is pty-chi's own. The rest is matched as in compare_lsqml.py: both sides over the
+engine's random_batches order seeded by --seed, pty-chi features ptyrs does not implement are
+off (object-probe ambiguity removal, mode orthogonalisation), PATCH shifts at integer corners.
+--ptychi-defaults runs pty-chi alone with its defaults untouched (batch and object step,
+shuffled batches seeded by --seed, ambiguity removal, orthogonalisation, AUTO shifts).
 """
 
 import argparse
@@ -32,6 +34,7 @@ sys.dont_write_bytecode = True  # no __pycache__ in the refs directories
 sys.path[:0] = [os.path.join(HERE, "..", "ptychi"), os.path.join(HERE, "..", "f64")]
 import m3ref  # noqa: E402
 from random_batches import Sampler  # noqa: E402
+from rpie_weight import patch_ptychi  # noqa: E402
 
 
 def ptychi_task(ds, obj, probe, args, matched):
@@ -63,7 +66,7 @@ def ptychi_task(ds, obj, probe, args, matched):
         r.forward_model_options.shift_operator = api.ShiftOperators.PATCH
     # PyNX view corners, the ones the engine preprocesses the positions to.
     corners = (np.array(obj.shape[-2:]) - ds.frame) // 2 + np.round(ds.pos_px)
-    return PtychographyTask(
+    task = PtychographyTask(
         opts,
         diffraction_data=ds.counts.astype(np.float64),
         object_data=obj.copy(),
@@ -71,6 +74,9 @@ def ptychi_task(ds, obj, probe, args, matched):
         probe_position_y_px=corners[:, 0],
         probe_position_x_px=corners[:, 1],
     )
+    if matched:
+        patch_ptychi(task.reconstructor)
+    return task
 
 
 def rpie_params(opts, seed):
@@ -87,7 +93,7 @@ def rpie_params(opts, seed):
     return {
         "obj_step": o.step_size,  # ObjectOptions.step_size: O += step * sum over the batch
         "probe_step": pr.step_size,  # ProbeOptions.step_size: P += step * mean over the batch
-        "obj_alpha": o.alpha,  # PIEObjectOptions.alpha: (1-a)|P|^2 + a max_batch sum_m |P_m|^2
+        "obj_alpha": o.alpha,  # PIEObjectOptions.alpha: (1-a)D_m + a max_batch sum_m D_m
         "probe_alpha": pr.alpha,  # PIEProbeOptions.alpha: (1-a)|O|^2 + a max_view |O|^2
         "batch_size": r.batch_size,  # ReconstructorOptions.batch_size, the last batch shorter
         # probe update start: optimization_plan.start 0 (asserted), the engine's only schedule

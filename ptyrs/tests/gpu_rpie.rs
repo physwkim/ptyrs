@@ -179,31 +179,254 @@ fn power_max_and_weights_match_f64() {
         assert!((*g as f64 - w).abs() < 1e-6 * w, "{g} vs {w}");
     }
 
+    // The same maxes of the squared moduli as plain floats; `out` starts non-zero.
+    let w2: Vec<f32> = w.iter().map(|c| norm2(*c) as f32).collect();
+    let dw2 = up(&stream, &w2);
+    for (groups, want) in [
+        (all_groups, all),
+        (per_groups, per.iter().copied().fold(0.0, f64::max)),
+    ] {
+        let mut out = up(&stream, &[1e30f32]);
+        k.sum_max(&ctx, &dw2, groups, &mut out).unwrap();
+        let got = out.to_host_vec(&stream).unwrap()[0] as f64;
+        assert!(
+            (got - want).abs() < 1e-6 * want,
+            "sum_max {groups:?}: {got} vs {want}"
+        );
+    }
+
     let alpha = 0.3;
-    for (per_plane, mx) in [(false, &m_all), (true, &m_per)] {
-        let want: Vec<(f64, f64)> = (0..nk * n)
+    let spec = Weight {
+        nk: nk as u32,
+        n: n as u32,
+        alpha: alpha as f32,
+    };
+    let weighted = |m: &dyn Fn(usize) -> f64| -> Vec<(f64, f64)> {
+        (0..nk * n)
             .map(|i| {
-                let m = if per_plane { per[i / n] } else { all };
-                let d = (1.0 - alpha) * norm2(w[i]) + alpha * m;
+                let d = (1.0 - alpha) * norm2(w[i]) + alpha * m(i);
                 (x[i].re as f64 / d, x[i].im as f64 / d)
             })
+            .collect()
+    };
+    let mut got = up(&stream, &x);
+    k.weight_inplace(&ctx, &mut got, &dw, &m_per, spec).unwrap();
+    let err = max_rel(
+        &got.to_host_vec(&stream).unwrap(),
+        &weighted(&|i| per[i / n]),
+        0.0,
+    );
+    assert!(err < 1e-5, "weight_inplace: {err:e}");
+    let mut out = DeviceBuffer::<C32>::zeroed(&stream, nk * n).unwrap();
+    let inputs = (&up(&stream, &x), &dw2, &m_all);
+    k.overlap_weight(&ctx, inputs, &mut out, spec).unwrap();
+    let err = max_rel(&out.to_host_vec(&stream).unwrap(), &weighted(&|_| all), 0.0);
+    assert!(err < 1e-5, "overlap_weight: {err:e}");
+}
+
+/// `|probe[mode]|^2` repeated over every plane of the output.
+#[test]
+fn mode_power_matches_f64() {
+    let (stream, ctx, k) = setup();
+    let (n, nprobe, nout) = (64usize, 2usize, 3usize);
+    let probe = noise(nprobe * n, 13, 1.5);
+    let dp = up(&stream, &probe);
+    let mut out = DeviceBuffer::<C32>::zeroed(&stream, nout * n).unwrap();
+    for mode in 0..nprobe {
+        k.mode_power(&ctx, &dp, mode as u32, n as u32, &mut out)
+            .unwrap();
+        let want: Vec<(f64, f64)> = (0..nout * n)
+            .map(|t| (norm2(probe[mode * n + t % n]), 0.0))
             .collect();
-        let spec = Weight {
-            nk: nk as u32,
-            n: n as u32,
-            per_plane,
-            alpha: alpha as f32,
-        };
-        let dx = up(&stream, &x);
-        let mut out = DeviceBuffer::<C32>::zeroed(&stream, nk * n).unwrap();
-        k.weight(&ctx, &dx, &dw, mx, &mut out, spec).unwrap();
-        let got = out.to_host_vec(&stream).unwrap();
-        let err = max_rel(&got, &want, 0.0);
-        assert!(err < 1e-5, "weight per_plane={per_plane}: {err:e}");
-        let mut inplace = up(&stream, &x);
-        k.weight_inplace(&ctx, &mut inplace, &dw, mx, spec).unwrap();
-        assert_eq!(inplace.to_host_vec(&stream).unwrap(), got);
+        let err = max_rel(&out.to_host_vec(&stream).unwrap(), &want, 0.0);
+        assert!(err < 1e-6, "mode {mode}: {err:e}");
     }
+    // A mode past the probe, and an output not a whole number of planes.
+    assert!(k.mode_power(&ctx, &dp, 2, n as u32, &mut out).is_err());
+    let mut ragged = DeviceBuffer::<C32>::zeroed(&stream, nout * n + 1).unwrap();
+    assert!(k.mode_power(&ctx, &dp, 0, n as u32, &mut ragged).is_err());
+}
+
+/// Three frames of two probe modes on one object mode at fractional corners, as
+/// `obj_wave_to_psi_matches_f64` places them.
+fn overlap_views(stream: &CudaStream) -> (ViewDims, Vec<ViewAddr>, Views) {
+    let dims = ViewDims {
+        nframe: 3,
+        nmode: 2,
+        nprobe: 2,
+        nobj: 1,
+        frame: [8, 8],
+        obj: [16, 16],
+        quad_phase: 0.0,
+    };
+    let corners = [(3, 5, 0.25f32, 0.5f32), (0, 0, 0.0, 0.0), (7, 2, 0.75, 0.0)];
+    let addr: Vec<ViewAddr> = corners
+        .iter()
+        .flat_map(|&(oy, ox, fy, fx)| {
+            (0..2).map(move |p| ViewAddr {
+                oy,
+                ox,
+                fy,
+                fx,
+                probe: p,
+                obj: 0,
+            })
+        })
+        .collect();
+    let views = Views::new(stream, dims, &addr).unwrap();
+    (dims, addr, views)
+}
+
+/// The bilinear taps `(weight, dy, dx)` a view reads its object pixel `(y, x)` from.
+fn taps(v: &ViewAddr) -> impl Iterator<Item = (f64, usize, usize)> {
+    let (fy, fx) = (v.fy as f64, v.fx as f64);
+    [
+        ((1.0 - fy) * (1.0 - fx), 0, 0),
+        ((1.0 - fy) * fx, 0, 1),
+        (fy * (1.0 - fx), 1, 0),
+        (fy * fx, 1, 1),
+    ]
+    .into_iter()
+    .filter(|(w, ..)| *w != 0.0)
+}
+
+/// Each mode's `|P|^2` of the shared probe and of per-frame probes, placed over the views of
+/// each stack of a split as the object step places them, against the f64 scatter; the pixels
+/// no view of the stack reads keep their value or are zeroed.
+#[test]
+fn overlap_matches_f64() {
+    let (stream, ctx, k) = setup();
+    let (dims, addr, views) = overlap_views(&stream);
+    let ([ny, nx], [nyo, nxo]) = (dims.frame.map(|v| v as usize), dims.obj.map(|v| v as usize));
+    let (n, nprobe) = (ny * nx, dims.nprobe as usize);
+    let natural = |j: usize| ((j / nx + ny / 2) % ny, (j % nx + nx / 2) % nx);
+    let probe = noise(nprobe * n, 5, 1.5);
+    let dprobe = up(&stream, &probe);
+    let fill = noise(nyo * nxo, 9, 1.0);
+    let table = StackTable::new(&stream, &dims, &[1..3, 0..1]).unwrap();
+    let whole_w = noise(dims.nframe as usize * nprobe * n, 7, 1.5);
+    for (s, f0, nf) in [(0, 1usize, 2usize), (1, 0, 1)] {
+        let w = &whole_w[f0 * nprobe * n..(f0 + nf) * nprobe * n];
+        let pad = vec![C32::default(); (2 - nf) * nprobe * n];
+        let dw = up(&stream, &[w, &pad].concat());
+        let stack_views = &addr[f0 * nprobe..(f0 + nf) * nprobe];
+        let mut read = vec![false; nyo * nxo];
+        for v in stack_views {
+            for j in 0..n {
+                let (y, x) = natural(j);
+                for (_, dy, dx) in taps(v) {
+                    read[(v.oy as usize + y + dy) * nxo + v.ox as usize + x + dx] = true;
+                }
+            }
+        }
+        for mode in 0..nprobe {
+            // `|p|^2` of view `kl`'s probe at its exit-wave pixel `j`.
+            let shared = |_: usize, j: usize| {
+                let (y, x) = natural(j);
+                norm2(probe[mode * n + y * nx + x])
+            };
+            let own = |kl: usize, j: usize| norm2(w[(kl / nprobe * nprobe + mode) * n + j]);
+            for (name, p2) in [
+                ("shared", &shared as &dyn Fn(usize, usize) -> f64),
+                ("own", &own),
+            ] {
+                let mut want = vec![0.0f64; nyo * nxo];
+                for (kl, v) in stack_views.iter().enumerate() {
+                    if v.probe as usize != mode {
+                        continue;
+                    }
+                    for j in 0..n {
+                        let (y, x) = natural(j);
+                        for (t, dy, dx) in taps(v) {
+                            let at = (v.oy as usize + y + dy) * nxo + v.ox as usize + x + dx;
+                            want[at] += t * p2(kl, j);
+                        }
+                    }
+                }
+                let mut d = up(&stream, &fill);
+                if name == "shared" {
+                    k.overlap(&ctx, &views, table.at(s), &dprobe, mode as u32, &mut d)
+                } else {
+                    k.overlap_moved(&ctx, &views, table.at(s), &dw, mode as u32, &mut d)
+                }
+                .unwrap();
+                let got = d.to_host_vec(&stream).unwrap();
+                let scale = want.iter().copied().fold(0.0, f64::max);
+                for (i, g) in got.iter().enumerate() {
+                    if read[i] {
+                        let e = ((g.re as f64 - want[i]).powi(2) + (g.im as f64).powi(2)).sqrt();
+                        assert!(
+                            e < 1e-6 * scale,
+                            "{name} entry {s} mode {mode} pixel {i}: {g:?} vs {}",
+                            want[i]
+                        );
+                    } else {
+                        assert!(
+                            *g == fill[i] || *g == C32::default(),
+                            "{name} entry {s} pixel {i}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    // A mode past the probe, and per-frame probes one plane short.
+    let mut d = up(&stream, &fill);
+    assert!(
+        k.overlap(&ctx, &views, table.at(0), &dprobe, 2, &mut d)
+            .is_err()
+    );
+    let short = DeviceBuffer::<C32>::zeroed(&stream, (2 * nprobe - 1) * n).unwrap();
+    assert!(
+        k.overlap_moved(&ctx, &views, table.at(0), &short, 0, &mut d)
+            .is_err()
+    );
+}
+
+/// `max(0, Re O)` of an object with negative real parts, sampled at each view of one mode of
+/// each stack of a split; the other entries are left.
+#[test]
+fn overlap_read_matches_f64() {
+    let (stream, ctx, k) = setup();
+    let (dims, addr, views) = overlap_views(&stream);
+    let ([ny, nx], [nyo, nxo]) = (dims.frame.map(|v| v as usize), dims.obj.map(|v| v as usize));
+    let (n, nprobe) = (ny * nx, dims.nprobe as usize);
+    let obj = noise(nyo * nxo, 3, 1.0);
+    let dobj = up(&stream, &obj);
+    let fill: Vec<f32> = (0..2 * nprobe * n).map(|i| -1.0 - i as f32).collect();
+    let table = StackTable::new(&stream, &dims, &[1..3, 0..1]).unwrap();
+    for (s, f0, nf) in [(0, 1usize, 2usize), (1, 0, 1)] {
+        for mode in 0..nprobe {
+            let mut want: Vec<f64> = fill.iter().map(|&v| v as f64).collect();
+            for kl in 0..nf * nprobe {
+                let v = &addr[f0 * nprobe + kl];
+                if v.probe as usize != mode {
+                    continue;
+                }
+                for j in 0..n {
+                    let (y, x) = ((j / nx + ny / 2) % ny, (j % nx + nx / 2) % nx);
+                    let re: f64 = taps(v)
+                        .map(|(t, dy, dx)| {
+                            let at = (v.oy as usize + y + dy) * nxo + v.ox as usize + x + dx;
+                            t * obj[at].re as f64
+                        })
+                        .sum();
+                    want[kl * n + j] = re.max(0.0);
+                }
+            }
+            let mut dens = up(&stream, &fill);
+            k.overlap_read(&ctx, &views, table.at(s), &dobj, mode as u32, &mut dens)
+                .unwrap();
+            let got = dens.to_host_vec(&stream).unwrap();
+            let err = worst_of(got.iter().zip(&want).map(|(g, w)| (*g as f64 - w).abs()));
+            assert!(err < 1e-6, "entry {s} mode {mode}: max err {err:e}");
+        }
+    }
+    let mut short = DeviceBuffer::<f32>::zeroed(&stream, 2 * nprobe * n - 1).unwrap();
+    assert!(
+        k.overlap_read(&ctx, &views, table.at(0), &dobj, 0, &mut short)
+            .is_err()
+    );
 }
 
 /// The f64 formula on two stacks of a split, planes past each stack untouched, and every
@@ -350,11 +573,16 @@ fn rpie_shapes_are_checked() {
     let spec = Weight {
         nk: 2,
         n: 4,
-        per_plane: true,
         alpha: 0.1,
     };
-    // `per_plane` needs one max per plane.
-    assert!(k.weight(&ctx, &w, &w, &mx, &mut out, spec).is_err());
+    // One max per plane.
+    assert!(k.weight_inplace(&ctx, &mut out, &w, &mx, spec).is_err());
+    // As many floats in `dens` as values.
+    let dens = DeviceBuffer::<f32>::zeroed(&stream, 7).unwrap();
+    assert!(
+        k.overlap_weight(&ctx, (&w, &dens, &mx), &mut out, spec)
+            .is_err()
+    );
     let groups = PowerMax {
         ngroup: 2,
         nsum: 1,

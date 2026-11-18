@@ -2446,7 +2446,8 @@ struct RpieScratch {
     dlt: DeviceBuffer<C32>,
     max_chunks: DeviceBuffer<f32>,
     omax: DeviceBuffer<f32>,
-    ptilde: DeviceBuffer<C32>,
+    overlap: DeviceBuffer<C32>,
+    dens: DeviceBuffer<f32>,
     pmax: DeviceBuffer<f32>,
     ones: DeviceBuffer<C32>,
     /// The position model's state, if the device models positions.
@@ -2462,7 +2463,8 @@ pub(super) struct RpieBufs<'a> {
     pub n: u32,
     pub table: &'a StackTable,
     pub plans: Plans<'a>,
-    /// The batch's exit waves, then its object windows `O_v q`.
+    /// The batch's exit waves, then the object step's weighted `Δ`, then its object windows
+    /// `O_v q`.
     pub psi: &'a mut DeviceBuffer<C32>,
     /// pty-chi's `Δ`, then the probe step's weighted `Δ`.
     pub dlt: &'a mut DeviceBuffer<C32>,
@@ -2470,8 +2472,11 @@ pub(super) struct RpieBufs<'a> {
     pub max_chunks: &'a mut DeviceBuffer<f32>,
     /// Per-view `max |O_v|^2`.
     pub omax: &'a mut DeviceBuffer<f32>,
-    /// `P / ((1 - a_o) |P|^2 + a_o max_i sum_m |P_m|^2)`.
-    pub ptilde: &'a mut DeviceBuffer<C32>,
+    /// One probe mode's overlap over the batch, an object plane.
+    pub overlap: &'a mut DeviceBuffer<C32>,
+    /// The overlap each view reads back, `[nk_max, n]` in the exit waves' layout.
+    pub dens: &'a mut DeviceBuffer<f32>,
+    /// The batch's `max sum_m dens`.
     pub pmax: &'a mut DeviceBuffer<f32>,
     /// A probe of ones, so `obj_probe_to_psi` yields the object windows.
     pub ones: &'a DeviceBuffer<C32>,
@@ -2513,7 +2518,8 @@ impl RpieScratch {
             dlt: DeviceBuffer::zeroed(stream, len)?,
             max_chunks: DeviceBuffer::zeroed(stream, max_groups.chunks())?,
             omax: DeviceBuffer::zeroed(stream, nk_max)?,
-            ptilde: DeviceBuffer::zeroed(stream, nprobe_values)?,
+            overlap: DeviceBuffer::zeroed(stream, dims.obj_len())?,
+            dens: DeviceBuffer::zeroed(stream, len)?,
             pmax: DeviceBuffer::zeroed(stream, 1)?,
             ones: DeviceBuffer::from_host(stream, &vec![C32 { re: 1.0, im: 0.0 }; nprobe_values])?,
             order: EpochOrder::new(kernels, stream, views)?,
@@ -2534,7 +2540,8 @@ impl RpieScratch {
             dlt: &mut self.dlt,
             max_chunks: &mut self.max_chunks,
             omax: &mut self.omax,
-            ptilde: &mut self.ptilde,
+            overlap: &mut self.overlap,
+            dens: &mut self.dens,
             pmax: &mut self.pmax,
             ones: &self.ones,
         };

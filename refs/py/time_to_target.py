@@ -22,7 +22,8 @@ Matched settings as in compare_rpie.py and refs/f64/bh_step.py: pty-chi features
 implement are off (object-probe ambiguity removal, mode orthogonalisation), PATCH shifts at the
 PyNX integer corners, every method's batches in the engine's random_batches order (SEED), and
 gpu_target's parameters read from the pty-chi options (ptyrs_args). rPIE takes pty-chi's rPIE
-test settings (test_2d_ptycho_rpie_synthesisdictlearn.py, SDL probe off): pty-chi's defaults
+test settings (test_2d_ptycho_rpie_synthesisdictlearn.py, SDL probe off) and the engine's object
+step weight (refs/f64/rpie_weight.py): pty-chi's defaults
 diverge on fermat_clean on both sides (compare_rpie.py --ptychi-defaults). LSQML takes pty-chi's
 defaults (batch 100, Gaussian noise, the engine's Cost::Amplitude) with compare_lsqml.py's matched
 config; --positions makes the probe positions optimizable at pty-chi's default position
@@ -48,6 +49,7 @@ sys.path[:0] = [HERE, os.path.join(HERE, "..", "ptychi"), os.path.join(HERE, "..
 import m3ref  # noqa: E402
 from compare_rpie import rpie_params  # noqa: E402
 from random_batches import Sampler  # noqa: E402
+from rpie_weight import patch_ptychi  # noqa: E402
 
 FACTOR = 1.01
 SEED = 7  # the engine's frame order: BH's in its one batch, LSQML's and rPIE's batches
@@ -145,6 +147,8 @@ def ptychi_task(ds, obj, probe, opts):
         probe_position_x_px=corners[:, 1],
     )
     rec = task.reconstructor
+    if isinstance(opts, api.RPIEOptions):
+        patch_ptychi(rec)
     rec.dataloader = DataLoader(rec.dataset,
                                 batch_sampler=Sampler(len(corners), rec.batch_size, SEED))
     return task

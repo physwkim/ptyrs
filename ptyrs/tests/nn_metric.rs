@@ -27,8 +27,8 @@ fn scan() -> (Scan, Object, AddrTable, Probe) {
     (scan, object, addr, probe)
 }
 
-/// The LLK of `start` and after each of `epochs` rPIE epochs, probe fixed. Single-frame
-/// batches: the summed updates of 10 overlapping frames diverge on this scan.
+/// The LLK of `start` and after each of `epochs` rPIE epochs of single-frame batches, probe
+/// fixed.
 fn rpie(scan: &Scan, start: Object, probe: &Probe, epochs: usize) -> (f64, Vec<f64>) {
     let params = RpieParams {
         probe_step: None,

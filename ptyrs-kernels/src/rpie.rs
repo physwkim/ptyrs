@@ -1,6 +1,6 @@
 //! rPIE kernels (pty-chi `RPIEReconstructor`), on the layouts of [`crate::pixel`]. The
 //! object and probe steps reuse `psi_to_obj` / `psi_to_probe` with weighted inputs built
-//! here, so these kernels need no view addresses.
+//! here.
 
 use cuda_host::cuda_module;
 
@@ -8,15 +8,23 @@ use cuda_host::cuda_module;
 /// contiguous chunks, the last one short.
 pub const POWER_CHUNK: u32 = 2048;
 
-/// Planes and regulariser of `rpie_weight`: `nk` planes of `n` complex values; plane `k`
-/// reads its max at `mx[k * mstride]` (`mstride` 0 or 1).
+/// Planes and regulariser of `rpie_weight`: `nk` planes of `n` complex values, plane `k`
+/// against its max `mx[k]`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct WeightGeom {
     pub nk: u32,
     pub n: u32,
-    pub mstride: u32,
     pub alpha: f32,
+}
+
+/// The probe `rpie_overlap` gathers mode `mode` of: the one every frame shares (`per_frame`
+/// 0) or each frame's own.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct OverlapOf {
+    pub mode: u32,
+    pub per_frame: u32,
 }
 
 #[cuda_module]
@@ -105,6 +113,185 @@ pub mod rpie_kernels {
         }
     }
 
+    /// Probe mode `of.mode`'s overlap over the stack, placed as `psi_to_obj` places the
+    /// object step: `d[y, x] = (sum_k sum w |p_k(pry, prx)|^2, 0)` over the stack's views `k`
+    /// of that mode and the `(pry, prx, w)` of [`obj_pixel_sources`]. `p_k` is mode `v.probe`
+    /// of `p`: with `of.per_frame` 0 the probe `[nprobe, ny, nx]`, natural; else each frame's
+    /// own, `[nf_max * nprobe, ny, nx]` in the exit waves' layout as
+    /// [`rpie_obj_wave_to_psi`] reads `w`. Overwrites the pixels of the tiles it owns, which
+    /// hold every pixel a view of the stack samples, and leaves the rest. A stack-tile
+    /// launch (`for_each_stack_tile`), one object mode.
+    ///
+    /// # Safety
+    ///
+    /// As `psi_to_obj` with `p` for its probe; `d` holds `[nyo, nxo]`, the views' object
+    /// is one mode.
+    ///
+    /// [`rpie_obj_wave_to_psi`]: LoadedModule::rpie_obj_wave_to_psi
+    #[kernel]
+    pub unsafe fn rpie_overlap(
+        p: *const f32,
+        of: super::OverlapOf,
+        views: *const ViewAddr,
+        tiles: TilePtrs,
+        d: *mut f32,
+        ctl: *const StackCtl,
+        g: StackGeom,
+    ) {
+        static mut SHARED: SharedArray<u32, STACK_TILE_SHARED> = SharedArray::UNINIT;
+        let shared = (&raw mut SHARED).cast::<u32>();
+        let n = g.ny as usize * g.nx as usize;
+        let (f0, nf) = unsafe { stack_frames(ctl, g) };
+        let (k0, nk) = (f0 * g.nmode, nf * g.nmode);
+        let pixel = move |lo: u32, end: u32, y: u32, x: u32| unsafe {
+            if x >= g.nxo || y >= g.nyo {
+                return;
+            }
+            let mut s = 0.0f32;
+            let mut j = lo;
+            while j < end {
+                let k = *tiles.views.add(j as usize);
+                let i = k.wrapping_sub(k0);
+                if i >= nk {
+                    break;
+                }
+                j += 1;
+                let v = *views.add(k as usize);
+                if v.probe != of.mode {
+                    continue;
+                }
+                let plane = (i / g.nmode * g.nprobe + v.probe) as usize * n;
+                obj_pixel_sources(v, y, x, g.ny, g.nx, |pry, prx, w| {
+                    let at = if of.per_frame == 0 {
+                        (v.probe * g.ny + pry) as usize * g.nx as usize + prx as usize
+                    } else {
+                        plane + psi_index(pry, prx, g.ny, g.nx)
+                    };
+                    let a = load_c(p, at);
+                    s += w * (a.0 * a.0 + a.1 * a.1);
+                });
+            }
+            store_c(d, y as usize * g.nxo as usize + x as usize, (s, 0.0));
+        };
+        unsafe { for_each_stack_tile(views, tiles, shared, ctl, g, pixel) }
+    }
+
+    /// The overlap each view of probe mode `mode` reads back: `dens[kl, j] = max(0, Re O(y,
+    /// x))` for view `v = views[f0 * nmode + kl]` of the stack, `O` the one-mode object `d`
+    /// sampled as `sample_obj` samples `v`'s, `(y, x)` the natural pixel stored at `j`. The
+    /// other views' entries are left. One thread per element of `[nf_max * nmode, ny, nx]`.
+    ///
+    /// # Safety
+    ///
+    /// `d` `[nyo, nxo]`, `views` `nframe * nmode` records in range for that object, `dens`
+    /// `[nf_max * nmode, ny, nx]` floats, `ctl` one entry.
+    #[kernel]
+    pub unsafe fn rpie_overlap_read(
+        d: *const f32,
+        mode: u32,
+        views: *const ViewAddr,
+        dens: *mut f32,
+        ctl: *const StackCtl,
+        g: StackGeom,
+    ) {
+        let (f0, nf) = unsafe { stack_frames(ctl, g) };
+        let (ny, nx) = (g.ny, g.nx);
+        let n = ny as usize * nx as usize;
+        let t = global_index();
+        if t >= nf as usize * g.nmode as usize * n {
+            return;
+        }
+        let (kl, j) = (t / n, t % n);
+        // Natural pixel stored at `j` (the shift is its own inverse).
+        let y = ((j / nx as usize) as u32 + ny / 2) % ny;
+        let x = ((j % nx as usize) as u32 + nx / 2) % nx;
+        unsafe {
+            let mut v = *views.add(f0 as usize * g.nmode as usize + kl);
+            if v.probe != mode {
+                return;
+            }
+            v.obj = 0;
+            let o = sample_obj(d, v, y, x, g.nyo, g.nxo).0;
+            *dens.add(t) = if o > 0.0 { o } else { 0.0 };
+        }
+    }
+
+    /// `*out = max(*out, max_i sum_{m < nsum} x[(b * nsum + m) * n + i])` over `i` in chunk
+    /// `c = blockIdx.x`, `c * POWER_CHUNK .. min((c + 1) * POWER_CHUNK, n)`, of group `b =
+    /// blockIdx.y` of `nsum` planes of `n` non-negative floats; `out` holds the bits of a
+    /// non-negative float.
+    ///
+    /// # Safety
+    ///
+    /// `x` holds `gridDim.y * nsum` planes of `n` floats, `out` one `u32`; grid `(ceil(n /
+    /// POWER_CHUNK), ngroup, 1)`, block `(PIXEL_THREADS, 1, 1)`.
+    #[kernel]
+    pub unsafe fn rpie_sum_max(x: *const f32, nsum: u32, n: u32, out: *mut u32) {
+        static mut RED: SharedArray<f32, 256> = SharedArray::UNINIT;
+        let b = thread::blockIdx_y() as usize;
+        let c = thread::blockIdx_x() as usize;
+        let t = thread::threadIdx_x() as usize;
+        let chunk = POWER_CHUNK as usize;
+        let end = (n as usize).min((c + 1) * chunk);
+        let mut m = 0.0f32;
+        let mut i = c * chunk + t;
+        while i < end {
+            let mut s = 0.0f32;
+            for k in 0..nsum as usize {
+                s += unsafe { *x.add((b * nsum as usize + k) * n as usize + i) };
+            }
+            if s > m {
+                m = s;
+            }
+            i += PIXEL_THREADS as usize;
+        }
+        unsafe { block_max_into((&raw mut RED).cast::<f32>(), t, m, out) }
+    }
+
+    /// The object step's weighted `Δ`: `out[i] = x[i] / ((1 - alpha) dens[i] + alpha
+    /// mx[0])` for `i < len`. One thread per element.
+    ///
+    /// # Safety
+    ///
+    /// `x` and `out` hold `len` complex values, `dens` `len` floats, `mx` one.
+    #[kernel]
+    pub unsafe fn rpie_overlap_weight(
+        x: *const f32,
+        dens: *const f32,
+        mx: *const f32,
+        out: *mut f32,
+        len: u32,
+        alpha: f32,
+    ) {
+        let t = global_index();
+        if t >= len as usize {
+            return;
+        }
+        unsafe {
+            let d = (1.0 - alpha) * *dens.add(t) + alpha * *mx;
+            let v = load_c(x, t);
+            store_c(out, t, (zdiv(v.0, d), zdiv(v.1, d)));
+        }
+    }
+
+    /// Every frame's patch of probe mode `mode`: `out[fl, i] = (|p[mode, i]|^2, 0)` over the
+    /// `len` values of `out`, planes of `n`. One thread per element.
+    ///
+    /// # Safety
+    ///
+    /// `p` holds plane `mode` of `n` complex values, `out` `len` complex values.
+    #[kernel]
+    pub unsafe fn rpie_mode_power(p: *const f32, mode: u32, n: u32, len: u32, out: *mut f32) {
+        let t = global_index();
+        if t >= len as usize {
+            return;
+        }
+        unsafe {
+            let a = load_c(p, mode as usize * n as usize + t % n as usize);
+            store_c(out, t, (a.0 * a.0 + a.1 * a.1, 0.0));
+        }
+    }
+
     /// `chunks[b * nchunk + c] = max(0, max_i sum_{m < nsum} |x[(b * nsum + m) * n + i]|^2)`
     /// over `i` in chunk `c = blockIdx.x`, `c * POWER_CHUNK .. min((c + 1) * POWER_CHUNK,
     /// n)`, of group `b = blockIdx.y` of `nsum` planes, `nchunk = ceil(n / POWER_CHUNK)`;
@@ -174,21 +361,14 @@ pub mod rpie_kernels {
         unsafe { *out.add(b) = m };
     }
 
-    /// The rPIE step weights: `out[k, i] = x[k, i] / ((1 - alpha) |w[k, i]|^2 + alpha
-    /// mx[k * mstride])` over the `[nk, n]` of `g` (`mstride` 0 shares `mx[0]` between
-    /// planes). `out` may be `x`. One thread per element.
+    /// The probe step's weight: `x[k, i] /= (1 - alpha) |w[k, i]|^2 + alpha mx[k]` over
+    /// the `[nk, n]` of `g`. One thread per element.
     ///
     /// # Safety
     ///
-    /// `x`, `w`, `out` hold `nk * n` complex values, `mx` `(nk - 1) * mstride + 1` floats.
+    /// `x`, `w` hold `nk * n` complex values, `mx` `nk` floats.
     #[kernel]
-    pub unsafe fn rpie_weight(
-        x: *const f32,
-        w: *const f32,
-        mx: *const f32,
-        out: *mut f32,
-        g: super::WeightGeom,
-    ) {
+    pub unsafe fn rpie_weight(x: *mut f32, w: *const f32, mx: *const f32, g: super::WeightGeom) {
         let t = global_index();
         if t >= g.nk as usize * g.n as usize {
             return;
@@ -196,10 +376,9 @@ pub mod rpie_kernels {
         let k = t / g.n as usize;
         unsafe {
             let wv = load_c(w, t);
-            let m = *mx.add(k * g.mstride as usize);
-            let d = (1.0 - g.alpha) * (wv.0 * wv.0 + wv.1 * wv.1) + g.alpha * m;
+            let d = (1.0 - g.alpha) * (wv.0 * wv.0 + wv.1 * wv.1) + g.alpha * *mx.add(k);
             let v = load_c(x, t);
-            store_c(out, t, (zdiv(v.0, d), zdiv(v.1, d)));
+            store_c(x, t, (zdiv(v.0, d), zdiv(v.1, d)));
         }
     }
 

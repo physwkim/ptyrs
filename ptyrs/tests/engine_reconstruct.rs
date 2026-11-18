@@ -220,7 +220,8 @@ fn raar_llk_matches_pynx() {
 }
 
 /// rPIE against pty-chi `RPIEReconstructor` in f64 on the same shuffled batches, its loader
-/// fed the engine's `random_batches` (`scripts/engine/compare_ptychi_rpie.py <dir>`), epochs
+/// fed the engine's `random_batches` and its object step weight the engine's
+/// (`refs/f64/rpie_weight.py`) by `scripts/engine/compare_ptychi_rpie.py <dir>`, epochs
 /// 0-19 of `cargo run --release -p ptyrs --example engine_llk_trace -- <dir> rpie 20 1 32 40`,
 /// saved from `<dir>/llk_ptychi.txt` to `tests/engine/data/rpie_ptychi_f64.txt`.
 #[test]
@@ -331,12 +332,7 @@ fn rpie_converges() {
     let truth = c.truth;
     let mut p = Ptycho::new(&c.scan, flat_object(&c.object), c.probe.clone()).unwrap();
     p.scale_obj_probe();
-    // pty-chi sums overlapping updates in a batch, so the default step 1 / alpha 0.1 diverges
-    // with several overlapping frames per batch; alpha 1 is the setting pty-chi tests use
     let params = RpieParams {
-        batch_size: 4,
-        obj_alpha: 1.0,
-        probe_alpha: 1.0,
         calc_llk: 1,
         ..RpieParams::default()
     };

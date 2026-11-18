@@ -5,9 +5,10 @@ Usage: python -I compare_ptychi_rpie.py <dir> [--gpu]
 Maps the Rust start onto pty-chi's model: the same object; the probe times the quadratic
 phase and 1/sqrt(ny*nx), since pty-chi has no quadratic phase and an unnormalised FFT; and
 positions whose integer windows start at the Rust window corners (views.txt). Runs
-RPIEReconstructor in f64 with SGD and the parameters in rpie.txt, on the engine's random_batches
-from rpie.txt's seed (refs/f64/random_batches.py), with every constraint pty-chi enables by
-default switched off. After each epoch the state is mapped back and its normalised LLK
+RPIEReconstructor in f64 with SGD and the parameters in rpie.txt, its object step weight the
+engine's (refs/f64/rpie_weight.py, pty-chi's own at one frame per batch), on the engine's
+random_batches from rpie.txt's seed (refs/f64/random_batches.py), with every constraint pty-chi
+enables by default switched off. After each epoch the state is mapped back and its normalised LLK
 computed by PyNX cpu_operator promoted to f64, the LLK the Rust history records; prints
 per-epoch relative differences against llk_rust.txt, writes llk_ptychi.txt, and compares the
 final arrays with final_rust.h5.
@@ -37,6 +38,7 @@ def script(path):
 HERE = pathlib.Path(__file__).parent
 pynx = script(HERE / "compare_pynx.py")
 rb = script(HERE.parents[2] / "refs" / "f64" / "random_batches.py")
+rw = script(HERE.parents[2] / "refs" / "f64" / "rpie_weight.py")
 
 
 def main():
@@ -102,6 +104,7 @@ def main():
         probe_position_x_px=views[:, 1].astype(np.float64),
     )
     rec = task.reconstructor
+    rw.patch_ptychi(rec)
     rec.dataloader = DataLoader(rec.dataset,
                                 batch_sampler=rb.Sampler(len(views), batch, int(params["seed"])))
 

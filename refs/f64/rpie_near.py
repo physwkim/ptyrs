@@ -15,13 +15,15 @@ P / sqrt(k)):
 
     psi_km = P_m V_k,  far = U psi
     Delta_km = U^H(far_km sqrt(iobs + 1e-7) / (sqrt(sum_m |far_km|^2) + 1e-7)) - psi_km
-    O += obj_step scatter(sum_m conj(P_m) Delta_km / ((1 - a_o)|P_m|^2 + a_o Pmax)),
-        Pmax = max over the pixels of sum_m |P_m|^2, the scatter a sum over the batch's frames
+    O += obj_step scatter(sum_m conj(P_m) Delta_km / ((1 - a_o) d_km + a_o Dmax)),
+        d_km the batch's overlap sum_k |P_m|^2 scattered and read back at frame k, Dmax the
+        max over the batch's frames and pixels of sum_m d_km (rpie_weight.py), the scatter a
+        sum over the batch's frames
     P_m += probe_step mean_batch(conj(V_k) Delta_km / ((1 - a_p)|V_k|^2 + a_p max |V_k|^2))
 
 pty-chi's RPIEReconstructor (pie.py compute_updates and apply_updates) in f64 on CPU runs the
-same epochs with the object-probe ambiguity removal and the mode orthogonalisation off and the
-positions fixed. Every batch size of BATCHES at every object step of OBJ_STEPS runs EPOCHS
+same epochs with its object step weight replaced by rpie_weight.py's, the object-probe
+ambiguity removal and the mode orthogonalisation off and the positions fixed. Every batch size of BATCHES at every object step of OBJ_STEPS runs EPOCHS
 epochs on both; printed per run: the model here against pty-chi (max, L2 relative difference
 of the object and probe changes and the largest relative LLK difference) and the epochs after
 which pty-chi is at or under the truth's LLK.
@@ -48,12 +50,12 @@ import numpy as np
 EPOCHS = 30
 SEED = 7  # RpieParams' default
 BATCHES = (1, 2, 4, 8, 16)
-# pty-chi's defaults but for the object step: the object change is a sum over the batch's
-# frames, so at pty-chi's 1 it diverges on both sides once a batch's frames overlap
+# pty-chi's defaults but for the object step, swept over OBJ_STEPS: at 1 with all 16 frames in
+# one batch the LLK stalls near 40 times the truth's
 PARAMS = dict(probe_step=1.0, obj_alpha=0.1, probe_alpha=0.1)
 OBJ_STEPS = (1.0, 0.25, 0.05)
 # (batch, obj_step) saved of every case
-SAVED = ((1, 0.25), (4, 0.25), (16, 0.05))
+SAVED = ((1, 0.25), (4, 0.25), (16, 0.25))
 # (wavelength, pixel, distance): angular spectrum, Fresnel transform, Fresnel transform back
 GEOMETRIES = [(1e-10, 50e-9, 5e-4), (1e-10, 50e-9, 2e-3), (1e-10, 50e-9, -2e-3)]
 
@@ -69,6 +71,7 @@ def sibling(name):
 
 
 near = sibling("lsqml_near")
+rw = sibling("rpie_weight")
 ls = near.ls
 rb = near.rb
 AX = near.AX
@@ -92,10 +95,9 @@ def batch_step(g, obj, probe, corners, counts, idx, prm):
     r = np.sqrt(counts[idx] + 1e-7) / (np.sqrt((np.abs(far) ** 2).sum(1)) + 1e-7)
     delta = g.adj(far * r[:, None]) - psi
 
-    a = prm["obj_alpha"]
-    p2 = np.abs(probe) ** 2
-    w = np.conj(probe) / ((1 - a) * p2 + a * p2.sum(0).max())
-    d_obj = ls.scatter((w[None] * delta).sum(1), c_idx, obj.shape)
+    p = np.broadcast_to(probe, (len(idx), *probe.shape))
+    w = rw.weight(p, prm["obj_alpha"], rw.scatter_overlap(c_idx, obj.shape))
+    d_obj = ls.scatter((w * delta).sum(1), c_idx, obj.shape)
     a = prm["probe_alpha"]
     v2 = np.abs(v) ** 2
     w = np.conj(v) / ((1 - a) * v2 + a * v2.max(AX, keepdims=True))
@@ -157,6 +159,7 @@ def ptychi(g, obj, probe, corners, counts, batch, prm):
         probe_position_x_px=corners[:, 1].astype(np.float64),
     )
     rec = t.reconstructor
+    rw.patch_ptychi(rec)
     rec.dataloader = DataLoader(rec.dataset,
                                 batch_sampler=rb.Sampler(len(corners), batch, SEED))
     trace = [near.llk(g, obj, probe, corners, counts)]

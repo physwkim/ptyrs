@@ -7,12 +7,12 @@ FULL_OBJECT shift operator, on the state and offsets of refs/f64/rpie_pos.py and
 FULL_OBJECT keeps the probe unmoved and samples frame k's window at its corner plus d_k from the
 whole object's periodic Fourier interpolant; the object's update is placed by that sampling's
 adjoint, and the positions' gradient is the interpolant's derivative. rPIE runs rpie_pos.py's
-cases (`step`, `epochs`) through its `ptychi`, BH bh_pos.py's (`full`: CG on one batch of every
-frame, `mini`: GD on batches of 16, both in the engine's batch order) through `bh` here, each
-with FULL_OBJECT in place of PATCH and from that script's offsets. rPIE's `odd` is `step` on the
-76 x 80 object plane less its first row and column: both sides odd, so the interpolant has a
-middle frequency (n - 1) / (2 n) on each, and every window one pixel nearer the origin, so on
-the same pixels.
+cases (`step`, `epochs`) through its `ptychi`, the object step weight rpie_weight.py's, BH
+bh_pos.py's (`full`: CG on one batch of every frame, `mini`: GD on batches of 16, both in the
+engine's batch order) through `bh` here, each with FULL_OBJECT in place of PATCH and from that
+script's offsets. rPIE's `odd` is `step` on the 76 x 80 object plane less its first row and
+column: both sides odd, so the interpolant has a middle frequency (n - 1) / (2 n) on each, and
+every window one pixel nearer the origin, so on the same pixels.
 
 At zero offsets the two operators sample the same windows. The script runs one batch of every
 frame under each there, on both planes, FULL_OBJECT's position derivatives taken PATCH's way

@@ -13,8 +13,9 @@ engine's convention (lsqml_pos_step.py's T_d, F and q), all from the batch-start
 
     W_km = T_dk(P_m q),  psi_km = F(W_km V_k)
     Delta_km = F^-1(F(psi_km) sqrt(iobs + 1e-7) / (sqrt(sum_m |F psi_km|^2) + 1e-7)) - psi_km
-    O += obj_step scatter(sum_m conj(W_km) Delta_km / ((1 - a_o)|W_km|^2 + a_o Wmax)),
-        Wmax = max over the batch's frames and pixels of sum_m |W_km|^2
+    O += obj_step scatter(sum_m conj(W_km) Delta_km / ((1 - a_o) d_km + a_o Dmax)),
+        d_km the batch's overlap sum_k |W_km|^2 scattered and read back at frame k, Dmax the
+        max over the batch's frames and pixels of sum_m d_km (rpie_weight.py)
     P += probe_step conj(q) mean_batch T_-dk(conj(V_k) Delta_km / ((1 - a_p)|V_k|^2
         + a_p max |V_k|^2))
     dV = ifft(fft(V_k) 2 pi i f) along each axis,  g = dV W_k0
@@ -23,9 +24,10 @@ engine's convention (lsqml_pos_step.py's T_d, F and q), all from the batch-start
     d += clip(dx, -L, L) per axis, L = min(10 mean |dx - mean dx|, 0.1) over all frames
 
 pty-chi's RPIEReconstructor (pie.py compute_updates and apply_updates, PositionCorrection's
-gradient update, ProbePositions.step_optimizer) in f64 on CPU runs the same epochs with the
-object-probe ambiguity removal and the mode orthogonalisation off (compare_rpie.py's matched
-run) and the positions optimizable at their defaults.
+gradient update, ProbePositions.step_optimizer) in f64 on CPU runs the same epochs with its
+object step weight replaced by rpie_weight.py's, the object-probe ambiguity removal and the
+mode orthogonalisation off (compare_rpie.py's matched run) and the positions optimizable at
+their defaults.
 
 Writes pty-chi's run, `<case>` `step` (one epoch of two batches of 20 at STEP_PARAMS from the
 OFFSET offsets) and `epochs` (EPOCHS epochs of EPOCH_PARAMS from the EPOCH_OFFSET offsets):
@@ -67,6 +69,7 @@ mg = sibling("ml_grad")
 ls = sibling("lsqml_step")
 lp = sibling("lsqml_pos_step")
 rb = sibling("random_batches")
+rw = sibling("rpie_weight")
 
 
 def batch_step(m, obj, probe, offsets, idx, prm):
@@ -83,11 +86,8 @@ def batch_step(m, obj, probe, offsets, idx, prm):
     r = np.where(ok, np.sqrt(np.maximum(m.iobs[idx], 0) + 1e-7) / (calc + 1e-7), 1)
     delta = fftshift(ifft2(far * r[:, None], axes=AX, norm="ortho"), axes=AX) - psi
 
-    a = prm["obj_alpha"]
-    w2 = np.abs(pw) ** 2
-    wmax = w2.sum(1).max()
-    d_obj = ls.scatter((np.conj(pw) * delta / ((1 - a) * w2 + a * wmax)).sum(1), corners,
-                       obj.shape)
+    w = rw.weight(pw, prm["obj_alpha"], rw.scatter_overlap(corners, obj.shape))
+    d_obj = ls.scatter((w * delta).sum(1), corners, obj.shape)
     a = prm["probe_alpha"]
     v2 = np.abs(v) ** 2
     vmax = v2.max(AX, keepdims=True)
@@ -158,6 +158,7 @@ def ptychi(m, iobs, wavelength, obj0, offsets, prm, nepoch):
         probe_position_x_px=pos[:, 1].copy(),
     )
     rec = task.reconstructor
+    rw.patch_ptychi(rec)
     rec.dataloader = DataLoader(rec.dataset,
                                 batch_sampler=rb.Sampler(len(offsets), prm["batch_size"], SEED))
     peak = []
