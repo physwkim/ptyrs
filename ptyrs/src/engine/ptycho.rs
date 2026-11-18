@@ -14,6 +14,7 @@ use crate::engine::ops::{
     Llk, accumulate_obj, accumulate_probe, apply_amplitude_with, cg_poisson_gamma_with, llk_with,
     natural, obj_probe_to_psi, poisson_grad_with, psi_to_obj_probe,
 };
+use crate::engine::sampling::Sampler;
 use crate::engine::{
     EngineError, Features, Fft2, Observed, Optics, Sampling, random_batches, shift,
 };
@@ -141,8 +142,9 @@ impl Default for MlParams {
     }
 }
 
-/// pty-chi `RPIEReconstructor` parameters (SGD over shuffled batches). A step of `None` leaves
-/// that array fixed.
+/// rPIE parameters after pty-chi `RPIEReconstructor` (SGD over shuffled batches), the object
+/// step normalised by the batch's overlap ([`Ptycho::rpie`]). A step of `None` leaves that
+/// array fixed.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RpieParams {
     pub obj_step: Option<f64>,
@@ -847,9 +849,13 @@ impl Ptycho {
     /// ([`Self::sampling`]), `Δ = IFT(ψ') − ψ`, `ψ = W·O_win` and
     /// `ψ' = FT(ψ) / (sqrt(Σ_modes |FT ψ|²) + 1e-7) · sqrt(iobs + 1e-7)` (masked pixels keep
     /// `FT ψ`, so `Δ` is 0 there):
-    /// - object: `O[win] += obj_step · Σ_modes conj(W_m) Δ_m / ((1 − α_o)|W_m|² + α_o·max Σ_m|W_m|²)`,
-    ///   summed over the batch, the max over the batch's frames and pixels; under
-    ///   [`Sampling::FullObject`] each view's term is placed by the sampling's adjoint;
+    /// - object: `O[win] += obj_step · Σ_modes conj(W_m) Δ_m / ((1 − α_o) D_m + α_o·max Σ_m D_m)`,
+    ///   summed over the batch, `D_m = Σ_batch |W_m|²` the batch's overlap of probe mode `m`
+    ///   placed as the step places and read back at the view, the max over the batch's
+    ///   frames and pixels; under [`Sampling::FullObject`] each view's term and `D_m` are
+    ///   placed by the sampling's adjoint, `D_m` read back through its windows with the real
+    ///   part floored at 0. One frame per batch has `D_m = |W_m|²`, pty-chi's per-frame step;
+    ///   the batch sum of per-frame steps overshoots where the frames overlap;
     /// - probe: `P_m += probe_step · mean_batch conj(q)·T_{−d}(conj(O_win) Δ_m /
     ///   ((1 − α_p)|O_win|² + α_p·max|O_win|²))`, `T_{−d}` the adjoint of the probe's move by
     ///   the frame's offset (none without positions or under [`Sampling::FullObject`]);
@@ -857,12 +863,13 @@ impl Ptycho {
     ///   frame's mode-0 `W` and `Δ` (`chi`) and its object window, then its clipped SGD step.
     ///
     /// pty-chi has no `q` and an unnormalised FFT: its probe `P·q / sqrt(ny·nx)` gives the same
-    /// far-field moduli, so the `1e-7` guards act alike and the iterates correspond exactly
-    /// (`scripts/compare_ptychi_rpie.py`, and `refs/f64/rpie_pos.py` with the positions, pty-chi
-    /// moving every probe mode). Under other [`Optics`] `FT` and `IFT` are their exit transform
-    /// and its adjoint, and pty-chi's probe is `P·q / sqrt(k)`, `k` their `intensity_scale`. One
-    /// LLK record (of the estimate after the epoch) every `calc_llk` epochs and after the last.
-    /// Of the [`Features`] it models the positions alone.
+    /// far-field moduli, so the `1e-7` guards act alike and the iterates correspond exactly to
+    /// pty-chi's with its object step weight replaced by the overlap's, which at one frame per
+    /// batch is pty-chi's own (`scripts/compare_ptychi_rpie.py`, and `refs/f64/rpie_pos.py`
+    /// with the positions, pty-chi moving every probe mode). Under other [`Optics`] `FT` and
+    /// `IFT` are their exit transform and its adjoint, and pty-chi's probe is `P·q / sqrt(k)`,
+    /// `k` their `intensity_scale`. One LLK record (of the estimate after the epoch) every
+    /// `calc_llk` epochs and after the last. Of the [`Features`] it models the positions alone.
     pub fn rpie(&mut self, params: &RpieParams, nepoch: usize) -> Result<(), EngineError> {
         if self.addr.nobj() != 1 {
             return Err(EngineError::Invalid(
@@ -955,14 +962,17 @@ impl Ptycho {
             .obj_step
             .map(|_| Stack::filled(self.object.dims(), C64::default()));
         if let Some(d_obj) = &mut d_obj {
-            let pmax = (0..nbatch)
-                .flat_map(|b| (0..n).map(move |j| (b, j)))
-                .map(|(b, j)| (0..nmode).map(|m| wave(b * nmode + m, j).1).sum::<f64>())
+            let w2: Vec<f64> = (0..views.len() * n)
+                .map(|kj| wave(kj / n, kj % n).1)
+                .collect();
+            let obj = self.object.plane_shape();
+            let dens = overlap(views, &w2, [ny, nx], obj, self.probe.nmode(), sampler);
+            let pmax = (dens.chunks_exact(nmode * n))
+                .flat_map(|f| (0..n).map(move |j| (0..nmode).map(|m| f[m * n + j]).sum::<f64>()))
                 .fold(0.0, f64::max);
             let a = params.obj_alpha;
             let step = |k: usize, j: usize, dv: &C64| {
-                let (w, w2) = wave(k, j);
-                w.conj() / ((1.0 - a) * w2 + a * pmax) * dv
+                wave(k, j).0.conj() / ((1.0 - a) * dens[k * n + j] + a * pmax) * dv
             };
             match sampler {
                 Some(sampler) => {
@@ -1074,6 +1084,49 @@ impl Ptycho {
             batch_position_step(d, frames, &delta);
         }
     }
+}
+
+/// [`Ptycho::rpie`]'s overlap at every view's samples, `[views, ny·nx]` in exit layout: per
+/// probe mode `m`, `D_m` the `|W|²` `w2` of the views of mode `m` placed as the object step
+/// places them, read back at each view of mode `m`. Integer windows without `sampler`;
+/// with it, its adjoint and windows on the complex `D_m`, the real part floored at 0 after,
+/// so one view reads back its own `|W|²` up to the transforms' rounding.
+fn overlap(
+    views: &[View],
+    w2: &[f64],
+    [ny, nx]: [usize; 2],
+    [nyo, nxo]: [usize; 2],
+    nprobe: usize,
+    sampler: Option<&Sampler>,
+) -> Vec<f64> {
+    let n = ny * nx;
+    let Some(s) = sampler else {
+        let at = |v: &View, j: usize| {
+            let (_, y, x) = natural(j, ny, nx);
+            (v.probe as usize * nyo + v.oy as usize + y) * nxo + v.ox as usize + x
+        };
+        let mut d = vec![0.0; nprobe * nyo * nxo];
+        for (k, v) in views.iter().enumerate() {
+            (0..n).for_each(|j| d[at(v, j)] += w2[k * n + j]);
+        }
+        return (0..views.len() * n)
+            .map(|kj| d[at(&views[kj / n], kj % n)])
+            .collect();
+    };
+    let mut out = vec![0.0; views.len() * n];
+    for m in 0..nprobe {
+        let of_m = || (views.iter().enumerate()).filter(move |(_, v)| v.probe as usize == m);
+        let mut patches = vec![C64::default(); views.len() * n];
+        for (k, _) in of_m() {
+            (0..n).for_each(|j| patches[k * n + shift(j, ny, nx)] = C64::new(w2[k * n + j], 0.0));
+        }
+        let read = s.windows(&Object::new(s.place(&patches, 1)), &[]);
+        for (k, _) in of_m() {
+            let r = read.plane(k);
+            (0..n).for_each(|j| out[k * n + j] = r[shift(j, ny, nx)].re.max(0.0));
+        }
+    }
+    out
 }
 
 /// [`Ptycho::zero_phase_ramp`] of the given arrays, which the GPU backend also runs on its

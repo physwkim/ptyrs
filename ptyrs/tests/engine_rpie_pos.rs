@@ -1,5 +1,6 @@
 //! rPIE with [`Features::position`] against pty-chi's `RPIEReconstructor` in f64 with the
-//! positions optimizable, `refs/f64/rpie_pos.py`, run on the state it reads: `cargo run
+//! positions optimizable and the engine's object step weight (`refs/f64/rpie_weight.py`),
+//! `refs/f64/rpie_pos.py`, run on the state it reads: `cargo run
 //! --release -p ptyrs --example engine_llk_trace -- <dir> dm 1 2 32 40 4`, i.e.
 //! `common::dm_scenario(32, 40, 2, 2e5, 4.0)` after `scale_obj_probe`, with the reference's
 //! offsets. It writes `<dir>/rpie_pos_*_f64.txt`, saved to `tests/data`. The same cases under

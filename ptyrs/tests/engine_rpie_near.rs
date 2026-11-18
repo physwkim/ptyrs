@@ -1,5 +1,6 @@
 //! [`Ptycho::rpie`] under an angular-spectrum propagator and a Fresnel transform forward and
-//! back against pty-chi's `RPIEReconstructor` in f64, `refs/f64/rpie_near.py`, which generates
+//! back against pty-chi's `RPIEReconstructor` in f64 with the engine's object step weight
+//! (`refs/f64/rpie_weight.py`), `refs/f64/rpie_near.py`, which generates
 //! the state and writes `rpie_near_*_f64.txt`, saved to `tests/engine/data`. Every frame sits
 //! at a whole-pixel corner and the corners' mean is the object's centre, so the engine's
 //! position preprocessing keeps them and both sides read the same pixels.

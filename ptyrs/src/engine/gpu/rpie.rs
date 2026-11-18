@@ -1,4 +1,5 @@
-//! pty-chi rPIE on the GPU, in the call sequence of `crate::gpu::RpieKernels`.
+//! rPIE on the GPU, in the call sequence of `crate::gpu::RpieKernels`: pty-chi's, its object
+//! step normalised by the batch's overlap.
 
 use std::sync::Arc;
 
@@ -249,8 +250,6 @@ impl<'a> Bufs<'a> {
         let order = rb.order;
         let views = order.views();
         let dims = l.prop.dims;
-        let n = rb.n;
-        let nk = frames.nf() * dims.nmode;
         let moved = lend.lend(&mut self.features)?;
         let moved = (moved.map(MovedLent::try_from)).transpose()?;
         let mut moved = (moved.map(|m| m.batch(ctx, k, &dims, self.probe))).transpose()?;
@@ -282,22 +281,18 @@ impl<'a> Bufs<'a> {
         }
 
         if params.obj_step.is_some() {
+            // `conj(W) Δ / ((1 − a) d + a max Σ_m d)`, `d` each mode's `|W|²` placed over the
+            // batch and read back per view.
+            for m in 0..dims.nprobe {
+                match &moved {
+                    Some(mv) => rk.overlap_moved(ctx, views, stack, &mv.w[0], m, rb.overlap)?,
+                    None => rk.overlap(ctx, views, stack, self.probe, m, rb.overlap)?,
+                }
+                rk.overlap_read(ctx, views, stack, rb.overlap, m, rb.dens)?;
+            }
+            rb.obj_weight(ctx, l, b, params.obj_alpha)?;
             match &mut moved {
-                // `conj(W) Δ / ((1 − a) |W|² + a max Σ_m |W_m|²)`, the max over the batch.
                 Some(m) => {
-                    let groups = PowerMax {
-                        ngroup: frames.nf(),
-                        nsum: dims.nprobe,
-                        n,
-                    };
-                    rk.power_max_all(ctx, &m.w[0], groups, rb.max_chunks, rb.pmax)?;
-                    let spec = Weight {
-                        nk,
-                        n,
-                        per_plane: false,
-                        alpha: params.obj_alpha as f32,
-                    };
-                    rk.weight(ctx, rb.dlt, &m.w[0], rb.pmax, rb.psi, spec)?;
                     let sums = PsiSums {
                         obj: Some(&mut self.obj_sums.num),
                         probe: None,
@@ -305,10 +300,14 @@ impl<'a> Bufs<'a> {
                     let inputs = moved_inputs(&base, moved_shift(m.pos, m.spectrum));
                     k.shifted_psi_sums(ctx, &inputs, stack, rb.psi, m.fused, sums)?;
                 }
-                None => {
-                    rb.ptilde(ctx, l, self.probe, params.obj_alpha)?;
-                    k.psi_to_obj(ctx, views, stack, rb.dlt, rb.ptilde, &mut self.obj_sums.num)?;
-                }
+                None => k.psi_to_obj(
+                    ctx,
+                    views,
+                    stack,
+                    rb.psi,
+                    self.probe,
+                    &mut self.obj_sums.num,
+                )?,
             }
         }
         if params.probe_step.is_some() {
@@ -348,7 +347,8 @@ impl<'a> Bufs<'a> {
     /// [`Self::rpie_batch`] under [`Sampling::FullObject`], its views on `w`, the windows of the
     /// batch-start object sampled at the offsets by epoch position `lend` lends, which `step`
     /// steps: the probe stays, the object's sums are placed back from the windows, and the
-    /// position sums read their derivatives.
+    /// position sums read their derivatives. The object step's overlap is placed and read
+    /// back through the sampler.
     fn rpie_window_batch(
         &mut self,
         ctx: &ExecutionContext,
@@ -361,6 +361,7 @@ impl<'a> Bufs<'a> {
         let l = self.launch();
         let (frames, stack) = (&rb.batches[b], rb.table.at(b));
         let views = rb.order.views();
+        let (nprobe, n) = (l.prop.dims.nprobe, rb.n);
         let Some(PositionLent::FullObject(s)) = lend.lend(&mut self.features)? else {
             return Err(another_model());
         };
@@ -384,16 +385,9 @@ impl<'a> Bufs<'a> {
             block,
         };
         sampler.spectra(ctx, self.obj, spectra)?;
-        let spectra = &*spectra;
         sampler.windows(ctx, at, spectra, block([0, 0], Modes::All, 0), &mut w.win)?;
         l.k.obj_probe_to_psi(ctx, &w.views, stack, &w.win, self.probe, rb.psi)?;
         rb.delta(ctx, l, b)?;
-        if params.obj_step.is_some() {
-            rb.ptilde(ctx, l, self.probe, params.obj_alpha)?;
-            crate::gpu::zero(ctx, &mut w.patches)?;
-            (l.k).psi_to_obj(ctx, &w.views, stack, rb.dlt, rb.ptilde, &mut w.patches)?;
-            sampler.place(ctx, at, &w.patches, 0, &mut self.obj_sums.num)?;
-        }
         if let Some(step) = step.as_deref_mut() {
             // The slopes of the windows the batch started from, against Δ before the probe
             // step weights it.
@@ -406,6 +400,22 @@ impl<'a> Bufs<'a> {
             };
             let chi = (&*rb.dlt, SliceSource::Probe(self.probe));
             kernels.derivative_sums(ctx, views, stack, derivatives, chi, step)?;
+        }
+        if params.obj_step.is_some() {
+            // Each mode's `|P|²` placed over the batch and its windows read back, through
+            // `spectra`, which the object's windows no longer need.
+            for m in 0..nprobe {
+                l.rk.mode_power(ctx, self.probe, m, n, &mut w.patches)?;
+                crate::gpu::zero(ctx, rb.overlap)?;
+                sampler.place(ctx, at, &w.patches, 0, rb.overlap)?;
+                sampler.spectra(ctx, rb.overlap, spectra)?;
+                sampler.windows(ctx, at, spectra, block([0, 0], Modes::All, 0), rb.psi)?;
+                l.rk.overlap_read(ctx, &w.views, stack, rb.psi, m, rb.dens)?;
+            }
+            rb.obj_weight(ctx, l, b, params.obj_alpha)?;
+            crate::gpu::zero(ctx, &mut w.patches)?;
+            (l.k).psi_to_obj(ctx, &w.views, stack, rb.psi, self.probe, &mut w.patches)?;
+            sampler.place(ctx, at, &w.patches, 0, &mut self.obj_sums.num)?;
         }
         if params.probe_step.is_some() {
             rb.probe_weight(ctx, l, b, (&w.views, &w.win), params.probe_alpha)?;
@@ -468,29 +478,28 @@ impl RpieBufs<'_> {
         l.k.add_c32(ctx, self.dlt, self.psi, frames.len)
     }
 
-    /// `ptilde = P / ((1 − a) |P|² + a max Σ_m |P_m|²)` of `probe`, the max over its pixels:
-    /// the object step's weight where the views read the probe unmoved.
-    fn ptilde(
+    /// Batch `b`'s `Δ` in `dlt` weighted for the object step into `psi`: `Δ / ((1 − a) d + a
+    /// max Σ_m d)` per view, `d` the overlap in `dens`, the max over the batch.
+    fn obj_weight(
         &mut self,
         ctx: &ExecutionContext,
         l: Launch<'_>,
-        probe: &DeviceBuffer<C32>,
+        b: usize,
         alpha: f64,
     ) -> Result<(), GpuError> {
-        let (nprobe, n) = (l.prop.dims.nprobe, self.n);
+        let (nf, nmode, n) = (self.batches[b].nf(), l.prop.dims.nmode, self.n);
         let groups = PowerMax {
-            ngroup: 1,
-            nsum: nprobe,
+            ngroup: nf,
+            nsum: nmode,
             n,
         };
-        l.rk.power_max(ctx, probe, groups, self.max_chunks, self.pmax)?;
+        l.rk.sum_max(ctx, self.dens, groups, self.pmax)?;
         let spec = Weight {
-            nk: nprobe,
+            nk: nf * nmode,
             n,
-            per_plane: false,
             alpha: alpha as f32,
         };
-        l.rk.weight(ctx, probe, probe, self.pmax, self.ptilde, spec)
+        l.rk.overlap_weight(ctx, (self.dlt, self.dens, self.pmax), self.psi, spec)
     }
 
     /// Batch `b`'s `Δ` in `dlt` weighted for the probe step against `obj`, which `views`
@@ -514,7 +523,6 @@ impl RpieBufs<'_> {
         let spec = Weight {
             nk,
             n,
-            per_plane: true,
             alpha: alpha as f32,
         };
         l.rk.weight_inplace(ctx, self.dlt, self.psi, self.omax, spec)
